@@ -1,0 +1,255 @@
+iommu/vt-d: Make use of iova deferred flushing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [iommu] vt-d: Make use of iova deferred flushing (Jerry Snitselaar) [1519117]
+Rebuild_FUZZ: 93.02%
+commit-author Joerg Roedel <jroedel@suse.de>
+commit 13cf01744608e1dc3f13dd316c95cb7a1fdaf740
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/13cf0174.failed
+
+Remove the deferred flushing implementation in the Intel
+VT-d driver and use the one from the common iova code
+instead.
+
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 13cf01744608e1dc3f13dd316c95cb7a1fdaf740)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-iommu.c
+diff --cc drivers/iommu/intel-iommu.c
+index 260597e4a50b,d5e8b8628a1a..000000000000
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@@ -452,31 -458,6 +452,34 @@@ static LIST_HEAD(dmar_rmrr_units)
+  #define for_each_rmrr_units(rmrr) \
+  	list_for_each_entry(rmrr, &dmar_rmrr_units, list)
+  
+++<<<<<<< HEAD
+ +static void flush_unmaps_timeout(unsigned long data);
+ +
+ +struct deferred_flush_entry {
+ +	unsigned long iova_pfn;
+ +	unsigned long nrpages;
+ +	struct dmar_domain *domain;
+ +	struct page *freelist;
+ +};
+ +
+ +#define HIGH_WATER_MARK 250
+ +struct deferred_flush_table {
+ +	int next;
+ +	struct deferred_flush_entry entries[HIGH_WATER_MARK];
+ +};
+ +
+ +struct deferred_flush_data {
+ +	spinlock_t lock;
+ +	int timer_on;
+ +	struct timer_list timer;
+ +	long size;
+ +	struct deferred_flush_table *tables;
+ +};
+ +
+ +DEFINE_PER_CPU(struct deferred_flush_data, deferred_flush);
+ +
+++=======
+++>>>>>>> 13cf01744608 (iommu/vt-d: Make use of iova deferred flushing)
+  /* bitmap for indexing intel_iommus */
+  static int g_num_of_iommus;
+  
+@@@ -1534,9 -1600,29 +1544,28 @@@ static void iommu_flush_iotlb_psi(struc
+  	 * flush. However, device IOTLB doesn't need to be flushed in this case.
+  	 */
+  	if (!cap_caching_mode(iommu->cap) || !map)
+ -		iommu_flush_dev_iotlb(get_iommu_domain(iommu, did),
+ -				      addr, mask);
+ +		iommu_flush_dev_iotlb(domain, addr, mask);
+  }
+  
++ static void iommu_flush_iova(struct iova_domain *iovad)
++ {
++ 	struct dmar_domain *domain;
++ 	int idx;
++ 
++ 	domain = container_of(iovad, struct dmar_domain, iovad);
++ 
++ 	for_each_domain_iommu(idx, domain) {
++ 		struct intel_iommu *iommu = g_iommus[idx];
++ 		u16 did = domain->iommu_did[iommu->seq_id];
++ 
++ 		iommu->flush.flush_iotlb(iommu, did, 0, 0, DMA_TLB_DSI_FLUSH);
++ 
++ 		if (!cap_caching_mode(iommu->cap))
++ 			iommu_flush_dev_iotlb(get_iommu_domain(iommu, did),
++ 					      0, MAX_AGAW_PFN_WIDTH);
++ 	}
++ }
++ 
+  static void iommu_disable_protect_mem_regions(struct intel_iommu *iommu)
+  {
+  	u32 pmen;
+@@@ -3530,114 -3628,6 +3541,117 @@@ static dma_addr_t intel_map_page(struc
+  				  dir, *dev->dma_mask);
+  }
+  
+++<<<<<<< HEAD
+ +static void flush_unmaps(struct deferred_flush_data *flush_data)
+ +{
+ +	int i, j;
+ +
+ +	flush_data->timer_on = 0;
+ +
+ +	/* just flush them all */
+ +	for (i = 0; i < g_num_of_iommus; i++) {
+ +		struct intel_iommu *iommu = g_iommus[i];
+ +		struct deferred_flush_table *flush_table =
+ +				&flush_data->tables[i];
+ +		if (!iommu)
+ +			continue;
+ +
+ +		if (!flush_table->next)
+ +			continue;
+ +
+ +		/* In caching mode, global flushes turn emulation expensive */
+ +		if (!cap_caching_mode(iommu->cap))
+ +			iommu->flush.flush_iotlb(iommu, 0, 0, 0,
+ +					 DMA_TLB_GLOBAL_FLUSH);
+ +		for (j = 0; j < flush_table->next; j++) {
+ +			unsigned long mask;
+ +			struct deferred_flush_entry *entry =
+ +						&flush_table->entries[j];
+ +			unsigned long iova_pfn = entry->iova_pfn;
+ +			unsigned long nrpages = entry->nrpages;
+ +			struct dmar_domain *domain = entry->domain;
+ +			struct page *freelist = entry->freelist;
+ +
+ +			/* On real hardware multiple invalidations are expensive */
+ +			if (cap_caching_mode(iommu->cap))
+ +				iommu_flush_iotlb_psi(iommu, domain,
+ +					mm_to_dma_pfn(iova_pfn),
+ +					nrpages, !freelist, 0);
+ +			else {
+ +				mask = ilog2(nrpages);
+ +				iommu_flush_dev_iotlb(domain,
+ +						(uint64_t)iova_pfn << PAGE_SHIFT, mask);
+ +			}
+ +			free_iova_fast(&domain->iovad, iova_pfn, nrpages);
+ +			if (freelist)
+ +				dma_free_pagelist(freelist);
+ +		}
+ +		flush_table->next = 0;
+ +	}
+ +
+ +	flush_data->size = 0;
+ +}
+ +
+ +static void flush_unmaps_timeout(unsigned long cpuid)
+ +{
+ +	struct deferred_flush_data *flush_data = per_cpu_ptr(&deferred_flush, cpuid);
+ +	unsigned long flags;
+ +
+ +	spin_lock_irqsave(&flush_data->lock, flags);
+ +	flush_unmaps(flush_data);
+ +	spin_unlock_irqrestore(&flush_data->lock, flags);
+ +}
+ +
+ +static void add_unmap(struct dmar_domain *dom, unsigned long iova_pfn,
+ +		      unsigned long nrpages, struct page *freelist)
+ +{
+ +	unsigned long flags;
+ +	int entry_id, iommu_id;
+ +	struct intel_iommu *iommu;
+ +	struct deferred_flush_entry *entry;
+ +	struct deferred_flush_data *flush_data;
+ +	unsigned int cpuid;
+ +
+ +	cpuid = get_cpu();
+ +	flush_data = per_cpu_ptr(&deferred_flush, cpuid);
+ +
+ +	/* Flush all CPUs' entries to avoid deferring too much.  If
+ +	 * this becomes a bottleneck, can just flush us, and rely on
+ +	 * flush timer for the rest.
+ +	 */
+ +	if (flush_data->size == HIGH_WATER_MARK) {
+ +		int cpu;
+ +
+ +		for_each_online_cpu(cpu)
+ +			flush_unmaps_timeout(cpu);
+ +	}
+ +
+ +	spin_lock_irqsave(&flush_data->lock, flags);
+ +
+ +	iommu = domain_get_iommu(dom);
+ +	iommu_id = iommu->seq_id;
+ +
+ +	entry_id = flush_data->tables[iommu_id].next;
+ +	++(flush_data->tables[iommu_id].next);
+ +
+ +	entry = &flush_data->tables[iommu_id].entries[entry_id];
+ +	entry->domain = dom;
+ +	entry->iova_pfn = iova_pfn;
+ +	entry->nrpages = nrpages;
+ +	entry->freelist = freelist;
+ +
+ +	if (!flush_data->timer_on) {
+ +		mod_timer(&flush_data->timer, jiffies + msecs_to_jiffies(10));
+ +		flush_data->timer_on = 1;
+ +	}
+ +	flush_data->size++;
+ +	spin_unlock_irqrestore(&flush_data->lock, flags);
+ +
+ +	put_cpu();
+ +}
+ +
+++=======
+++>>>>>>> 13cf01744608 (iommu/vt-d: Make use of iova deferred flushing)
+  static void intel_unmap(struct device *dev, dma_addr_t dev_addr, size_t size)
+  {
+  	struct dmar_domain *domain;
+@@@ -4585,24 -4598,25 +4600,29 @@@ static void free_all_cpu_cached_iovas(u
+  	}
+  }
+  
+ -static int intel_iommu_cpu_dead(unsigned int cpu)
+ +static int intel_iommu_cpu_notifier(struct notifier_block *nfb,
+ +				    unsigned long action, void *v)
+  {
+++<<<<<<< HEAD
+ +	unsigned int cpu = (unsigned long)v;
+ +
+ +	switch (action) {
+ +	case CPU_DEAD:
+ +	case CPU_DEAD_FROZEN:
+ +		free_all_cpu_cached_iovas(cpu);
+ +		flush_unmaps_timeout(cpu);
+ +		break;
+ +	}
+ +	return NOTIFY_OK;
+++=======
++ 	free_all_cpu_cached_iovas(cpu);
++ 	return 0;
+++>>>>>>> 13cf01744608 (iommu/vt-d: Make use of iova deferred flushing)
+  }
+  
+ -static void intel_disable_iommus(void)
+ -{
+ -	struct intel_iommu *iommu = NULL;
+ -	struct dmar_drhd_unit *drhd;
+ -
+ -	for_each_iommu(iommu, drhd)
+ -		iommu_disable_translation(iommu);
+ -}
+ -
+ -static inline struct intel_iommu *dev_to_intel_iommu(struct device *dev)
+ -{
+ -	return container_of(dev, struct intel_iommu, iommu.dev);
+ -}
+ +static struct notifier_block intel_iommu_cpu_nb = {
+ +	.notifier_call = intel_iommu_cpu_notifier,
+ +};
+  
+  static ssize_t intel_iommu_show_version(struct device *dev,
+  					struct device_attribute *attr,
+* Unmerged path drivers/iommu/intel-iommu.c
