@@ -1,0 +1,367 @@
+mm: get rid of radix tree gfp mask for pagecache_get_page
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [mm] filemap: get rid of radix tree gfp mask for pagecache_get_page (Yasuyuki Kobayashi) [1469247]
+Rebuild_FUZZ: 94.12%
+commit-author Michal Hocko <mhocko@suse.cz>
+commit 45f87de57f8fad59302fd263dd81ffa4843b5b24
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/45f87de5.failed
+
+Commit 2457aec63745 ("mm: non-atomically mark page accessed during page
+cache allocation where possible") has added a separate parameter for
+specifying gfp mask for radix tree allocations.
+
+Not only this is less than optimal from the API point of view because it
+is error prone, it is also buggy currently because
+grab_cache_page_write_begin is using GFP_KERNEL for radix tree and if
+fgp_flags doesn't contain FGP_NOFS (mostly controlled by fs by
+AOP_FLAG_NOFS flag) but the mapping_gfp_mask has __GFP_FS cleared then
+the radix tree allocation wouldn't obey the restriction and might
+recurse into filesystem and cause deadlocks.  This is the case for most
+filesystems unfortunately because only ext4 and gfs2 are using
+AOP_FLAG_NOFS.
+
+Let's simply remove radix_gfp_mask parameter because the allocation
+context is same for both page cache and for the radix tree.  Just make
+sure that the radix tree gets only the sane subset of the mask (e.g.  do
+not pass __GFP_WRITE).
+
+Long term it is more preferable to convert remaining users of
+AOP_FLAG_NOFS to use mapping_gfp_mask instead and simplify this
+interface even further.
+
+	Reported-by: Dave Chinner <david@fromorbit.com>
+	Signed-off-by: Michal Hocko <mhocko@suse.cz>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 45f87de57f8fad59302fd263dd81ffa4843b5b24)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/pagemap.h
+#	mm/filemap.c
+diff --cc include/linux/pagemap.h
+index 8576311e4195,4b3736f7065c..000000000000
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@@ -237,14 -243,110 +237,121 @@@ pgoff_t page_cache_next_hole(struct add
+  pgoff_t page_cache_prev_hole(struct address_space *mapping,
+  			     pgoff_t index, unsigned long max_scan);
+  
+++<<<<<<< HEAD
+ +struct page *__find_get_page(struct address_space *mapping, pgoff_t offset);
+ +struct page *find_get_page(struct address_space *mapping, pgoff_t offset);
+ +struct page *__find_lock_page(struct address_space *mapping, pgoff_t offset);
+ +struct page *find_lock_page(struct address_space *mapping, pgoff_t offset);
+ +struct page *find_or_create_page(struct address_space *mapping, pgoff_t index,
+ +				 gfp_t gfp_mask);
+ +unsigned __find_get_pages(struct address_space *mapping, pgoff_t start,
+ +			  unsigned int nr_pages, struct page **pages,
+++=======
++ #define FGP_ACCESSED		0x00000001
++ #define FGP_LOCK		0x00000002
++ #define FGP_CREAT		0x00000004
++ #define FGP_WRITE		0x00000008
++ #define FGP_NOFS		0x00000010
++ #define FGP_NOWAIT		0x00000020
++ 
++ struct page *pagecache_get_page(struct address_space *mapping, pgoff_t offset,
++ 		int fgp_flags, gfp_t cache_gfp_mask);
++ 
++ /**
++  * find_get_page - find and get a page reference
++  * @mapping: the address_space to search
++  * @offset: the page index
++  *
++  * Looks up the page cache slot at @mapping & @offset.  If there is a
++  * page cache page, it is returned with an increased refcount.
++  *
++  * Otherwise, %NULL is returned.
++  */
++ static inline struct page *find_get_page(struct address_space *mapping,
++ 					pgoff_t offset)
++ {
++ 	return pagecache_get_page(mapping, offset, 0, 0);
++ }
++ 
++ static inline struct page *find_get_page_flags(struct address_space *mapping,
++ 					pgoff_t offset, int fgp_flags)
++ {
++ 	return pagecache_get_page(mapping, offset, fgp_flags, 0);
++ }
++ 
++ /**
++  * find_lock_page - locate, pin and lock a pagecache page
++  * pagecache_get_page - find and get a page reference
++  * @mapping: the address_space to search
++  * @offset: the page index
++  *
++  * Looks up the page cache slot at @mapping & @offset.  If there is a
++  * page cache page, it is returned locked and with an increased
++  * refcount.
++  *
++  * Otherwise, %NULL is returned.
++  *
++  * find_lock_page() may sleep.
++  */
++ static inline struct page *find_lock_page(struct address_space *mapping,
++ 					pgoff_t offset)
++ {
++ 	return pagecache_get_page(mapping, offset, FGP_LOCK, 0);
++ }
++ 
++ /**
++  * find_or_create_page - locate or add a pagecache page
++  * @mapping: the page's address_space
++  * @index: the page's index into the mapping
++  * @gfp_mask: page allocation mode
++  *
++  * Looks up the page cache slot at @mapping & @offset.  If there is a
++  * page cache page, it is returned locked and with an increased
++  * refcount.
++  *
++  * If the page is not present, a new page is allocated using @gfp_mask
++  * and added to the page cache and the VM's LRU list.  The page is
++  * returned locked and with an increased refcount.
++  *
++  * On memory exhaustion, %NULL is returned.
++  *
++  * find_or_create_page() may sleep, even if @gfp_flags specifies an
++  * atomic allocation!
++  */
++ static inline struct page *find_or_create_page(struct address_space *mapping,
++ 					pgoff_t offset, gfp_t gfp_mask)
++ {
++ 	return pagecache_get_page(mapping, offset,
++ 					FGP_LOCK|FGP_ACCESSED|FGP_CREAT,
++ 					gfp_mask);
++ }
++ 
++ /**
++  * grab_cache_page_nowait - returns locked page at given index in given cache
++  * @mapping: target address_space
++  * @index: the page index
++  *
++  * Same as grab_cache_page(), but do not wait if the page is unavailable.
++  * This is intended for speculative data generators, where the data can
++  * be regenerated if the page couldn't be grabbed.  This routine should
++  * be safe to call while holding the lock for another page.
++  *
++  * Clear __GFP_FS when allocating the page to avoid recursion into the fs
++  * and deadlock against the caller's locked page.
++  */
++ static inline struct page *grab_cache_page_nowait(struct address_space *mapping,
++ 				pgoff_t index)
++ {
++ 	return pagecache_get_page(mapping, index,
++ 			FGP_LOCK|FGP_CREAT|FGP_NOFS|FGP_NOWAIT,
++ 			mapping_gfp_mask(mapping));
++ }
++ 
++ struct page *find_get_entry(struct address_space *mapping, pgoff_t offset);
++ struct page *find_lock_entry(struct address_space *mapping, pgoff_t offset);
++ unsigned find_get_entries(struct address_space *mapping, pgoff_t start,
++ 			  unsigned int nr_entries, struct page **entries,
+++>>>>>>> 45f87de57f8f (mm: get rid of radix tree gfp mask for pagecache_get_page)
+  			  pgoff_t *indices);
+  unsigned find_get_pages(struct address_space *mapping, pgoff_t start,
+  			unsigned int nr_pages, struct page **pages);
+diff --cc mm/filemap.c
+index 685e2bed3093,673e4581a2e5..000000000000
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@@ -1069,69 -1039,86 +1069,137 @@@ repeat
+  	}
+  	return page;
+  }
+ -EXPORT_SYMBOL(find_lock_entry);
+ +EXPORT_SYMBOL(__find_lock_page);
+  
+  /**
+ - * pagecache_get_page - find and get a page reference
+ + * find_lock_page - locate, pin and lock a pagecache page
+   * @mapping: the address_space to search
+   * @offset: the page index
+++<<<<<<< HEAD
+++=======
++  * @fgp_flags: PCG flags
++  * @gfp_mask: gfp mask to use for the page cache data page allocation
+++>>>>>>> 45f87de57f8f (mm: get rid of radix tree gfp mask for pagecache_get_page)
+   *
+ - * Looks up the page cache slot at @mapping & @offset.
+ + * Looks up the page cache slot at @mapping & @offset.  If there is a
+ + * page cache page, it is returned locked and with an increased
+ + * refcount.
+   *
+ - * PCG flags modify how the page is returned.
+ + * Otherwise, %NULL is returned.
+   *
+++<<<<<<< HEAD
+ + * find_lock_page() may sleep.
+ + */
+ +struct page *find_lock_page(struct address_space *mapping, pgoff_t offset)
+++=======
++  * FGP_ACCESSED: the page will be marked accessed
++  * FGP_LOCK: Page is return locked
++  * FGP_CREAT: If page is not present then a new page is allocated using
++  *		@gfp_mask and added to the page cache and the VM's LRU
++  *		list. The page is returned locked and with an increased
++  *		refcount. Otherwise, %NULL is returned.
++  *
++  * If FGP_LOCK or FGP_CREAT are specified then the function may sleep even
++  * if the GFP flags specified for FGP_CREAT are atomic.
++  *
++  * If there is a page cache page, it is returned with an increased refcount.
++  */
++ struct page *pagecache_get_page(struct address_space *mapping, pgoff_t offset,
++ 	int fgp_flags, gfp_t gfp_mask)
+++>>>>>>> 45f87de57f8f (mm: get rid of radix tree gfp mask for pagecache_get_page)
+  {
+ -	struct page *page;
+ +	struct page *page = __find_lock_page(mapping, offset);
+  
+ -repeat:
+ -	page = find_get_entry(mapping, offset);
+  	if (radix_tree_exceptional_entry(page))
+  		page = NULL;
+ -	if (!page)
+ -		goto no_page;
+ +	return page;
+ +}
+ +EXPORT_SYMBOL(find_lock_page);
+  
+++<<<<<<< HEAD
+ +/**
+ + * find_or_create_page - locate or add a pagecache page
+ + * @mapping: the page's address_space
+ + * @index: the page's index into the mapping
+ + * @gfp_mask: page allocation mode
+ + *
+ + * Looks up the page cache slot at @mapping & @offset.  If there is a
+ + * page cache page, it is returned locked and with an increased
+ + * refcount.
+ + *
+ + * If the page is not present, a new page is allocated using @gfp_mask
+ + * and added to the page cache and the VM's LRU list.  The page is
+ + * returned locked and with an increased refcount.
+ + *
+ + * On memory exhaustion, %NULL is returned.
+ + *
+ + * find_or_create_page() may sleep, even if @gfp_flags specifies an
+ + * atomic allocation!
+ + */
+ +struct page *find_or_create_page(struct address_space *mapping,
+ +		pgoff_t index, gfp_t gfp_mask)
+ +{
+ +	struct page *page;
+ +	int err;
+ +repeat:
+ +	page = find_lock_page(mapping, index);
+ +	if (!page) {
+ +		page = __page_cache_alloc(gfp_mask);
+ +		if (!page)
+ +			return NULL;
+ +		/*
+ +		 * We want a regular kernel memory (not highmem or DMA etc)
+ +		 * allocation for the radix tree nodes, but we need to honour
+ +		 * the context-specific requirements the caller has asked for.
+ +		 * GFP_RECLAIM_MASK collects those requirements.
+ +		 */
+ +		err = add_to_page_cache_lru(page, mapping, index,
+ +			(gfp_mask & GFP_RECLAIM_MASK));
+++=======
++ 	if (fgp_flags & FGP_LOCK) {
++ 		if (fgp_flags & FGP_NOWAIT) {
++ 			if (!trylock_page(page)) {
++ 				page_cache_release(page);
++ 				return NULL;
++ 			}
++ 		} else {
++ 			lock_page(page);
++ 		}
++ 
++ 		/* Has the page been truncated? */
++ 		if (unlikely(page->mapping != mapping)) {
++ 			unlock_page(page);
++ 			page_cache_release(page);
++ 			goto repeat;
++ 		}
++ 		VM_BUG_ON_PAGE(page->index != offset, page);
++ 	}
++ 
++ 	if (page && (fgp_flags & FGP_ACCESSED))
++ 		mark_page_accessed(page);
++ 
++ no_page:
++ 	if (!page && (fgp_flags & FGP_CREAT)) {
++ 		int err;
++ 		if ((fgp_flags & FGP_WRITE) && mapping_cap_account_dirty(mapping))
++ 			gfp_mask |= __GFP_WRITE;
++ 		if (fgp_flags & FGP_NOFS)
++ 			gfp_mask &= ~__GFP_FS;
++ 
++ 		page = __page_cache_alloc(gfp_mask);
++ 		if (!page)
++ 			return NULL;
++ 
++ 		if (WARN_ON_ONCE(!(fgp_flags & FGP_LOCK)))
++ 			fgp_flags |= FGP_LOCK;
++ 
++ 		/* Init accessed so avoid atomic mark_page_accessed later */
++ 		if (fgp_flags & FGP_ACCESSED)
++ 			__SetPageReferenced(page);
++ 
++ 		err = add_to_page_cache_lru(page, mapping, offset,
++ 				gfp_mask & GFP_RECLAIM_MASK);
+++>>>>>>> 45f87de57f8f (mm: get rid of radix tree gfp mask for pagecache_get_page)
+  		if (unlikely(err)) {
+  			page_cache_release(page);
+  			page = NULL;
+@@@ -2908,34 -2432,17 +2976,41 @@@ EXPORT_SYMBOL(generic_file_direct_write
+  struct page *grab_cache_page_write_begin(struct address_space *mapping,
+  					pgoff_t index, unsigned flags)
+  {
+ +	int status;
+ +	gfp_t gfp_mask;
+  	struct page *page;
+ -	int fgp_flags = FGP_LOCK|FGP_ACCESSED|FGP_WRITE|FGP_CREAT;
+ +	gfp_t gfp_notmask = 0;
+  
+ +	gfp_mask = mapping_gfp_mask(mapping);
+ +	if (mapping_cap_account_dirty(mapping))
+ +		gfp_mask |= __GFP_WRITE;
+  	if (flags & AOP_FLAG_NOFS)
+++<<<<<<< HEAD
+ +		gfp_notmask = __GFP_FS;
+ +repeat:
+ +	page = find_lock_page(mapping, index);
+++=======
++ 		fgp_flags |= FGP_NOFS;
++ 
++ 	page = pagecache_get_page(mapping, index, fgp_flags,
++ 			mapping_gfp_mask(mapping));
+++>>>>>>> 45f87de57f8f (mm: get rid of radix tree gfp mask for pagecache_get_page)
+  	if (page)
+ -		wait_for_stable_page(page);
+ +		goto found;
+  
+ +	page = __page_cache_alloc(gfp_mask & ~gfp_notmask);
+ +	if (!page)
+ +		return NULL;
+ +	status = add_to_page_cache_lru(page, mapping, index,
+ +						GFP_KERNEL & ~gfp_notmask);
+ +	if (unlikely(status)) {
+ +		page_cache_release(page);
+ +		if (status == -EEXIST)
+ +			goto repeat;
+ +		return NULL;
+ +	}
+ +found:
+ +	wait_for_stable_page(page);
+  	return page;
+  }
+  EXPORT_SYMBOL(grab_cache_page_write_begin);
+* Unmerged path include/linux/pagemap.h
+* Unmerged path mm/filemap.c
