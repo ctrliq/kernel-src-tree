@@ -136,6 +136,7 @@ acpi_tb_add_table(struct acpi_table_desc *table_desc, u32 *table_index)
 	if (!table_desc->pointer) {
 		status = acpi_tb_verify_table(table_desc);
 		if (ACPI_FAILURE(status) || !table_desc->pointer) {
+			acpi_tb_invalidate_table(table_desc);
 			return_ACPI_STATUS(status);
 		}
 	}
