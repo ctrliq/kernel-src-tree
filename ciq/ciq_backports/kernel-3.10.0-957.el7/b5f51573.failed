@@ -1,0 +1,115 @@
+ext4: avoid Y2038 overflow in recently_deleted()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Andreas Dilger <adilger@dilger.ca>
+commit b5f515735bea4ae71c248aea3e049073f8852889
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b5f51573.failed
+
+Avoid a 32-bit time overflow in recently_deleted() since i_dtime
+(inode deletion time) is stored only as a 32-bit value on disk.
+Since i_dtime isn't used for much beyond a boolean value in e2fsck
+and is otherwise only used in this function in the kernel, there is
+no benefit to use more space in the inode for this field on disk.
+
+Instead, compare only the relative deletion time with the low
+32 bits of the time using the newly-added time_before32() helper,
+which is similar to time_before() and time_after() for jiffies.
+
+Increase RECENTCY_DIRTY to 300s based on Ted's comments about
+usage experience at Google.
+
+	Signed-off-by: Andreas Dilger <adilger@dilger.ca>
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+	Reviewed-by: Arnd Bergmann <arnd@arndb.de>
+(cherry picked from commit b5f515735bea4ae71c248aea3e049073f8852889)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/time.h
+diff --cc include/linux/time.h
+index 35fb08760957,3877136bbdf8..000000000000
+--- a/include/linux/time.h
++++ b/include/linux/time.h
+@@@ -216,4 -276,28 +216,31 @@@ static __always_inline void timespec_ad
+  	a->tv_nsec = ns;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool itimerspec64_valid(const struct itimerspec64 *its)
++ {
++ 	if (!timespec64_valid(&(its->it_interval)) ||
++ 		!timespec64_valid(&(its->it_value)))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ /**
++  * time_after32 - compare two 32-bit relative times
++  * @a:	the time which may be after @b
++  * @b:	the time which may be before @a
++  *
++  * time_after32(a, b) returns true if the time @a is after time @b.
++  * time_before32(b, a) returns true if the time @b is before time @a.
++  *
++  * Similar to time_after(), compare two 32-bit timestamps for relative
++  * times.  This is useful for comparing 32-bit seconds values that can't
++  * be converted to 64-bit values (e.g. due to disk format or wire protocol
++  * issues) when it is known that the times are less than 68 years apart.
++  */
++ #define time_after32(a, b)	((s32)((u32)(b) - (u32)(a)) < 0)
++ #define time_before32(b, a)	time_after32(a, b)
+++>>>>>>> b5f515735bea (ext4: avoid Y2038 overflow in recently_deleted())
+  #endif
+diff --git a/fs/ext4/ialloc.c b/fs/ext4/ialloc.c
+index cb6166abeb35..cf38ed82c187 100644
+--- a/fs/ext4/ialloc.c
++++ b/fs/ext4/ialloc.c
+@@ -660,16 +660,17 @@ static int find_group_other(struct super_block *sb, struct inode *parent,
+  * somewhat arbitrary...)
+  */
+ #define RECENTCY_MIN	5
+-#define RECENTCY_DIRTY	30
++#define RECENTCY_DIRTY	300
+ 
+ static int recently_deleted(struct super_block *sb, ext4_group_t group, int ino)
+ {
+ 	struct ext4_group_desc	*gdp;
+ 	struct ext4_inode	*raw_inode;
+ 	struct buffer_head	*bh;
+-	unsigned long		dtime, now;
+-	int	inodes_per_block = EXT4_SB(sb)->s_inodes_per_block;
+-	int	offset, ret = 0, recentcy = RECENTCY_MIN;
++	int inodes_per_block = EXT4_SB(sb)->s_inodes_per_block;
++	int offset, ret = 0;
++	int recentcy = RECENTCY_MIN;
++	u32 dtime, now;
+ 
+ 	gdp = ext4_get_group_desc(sb, group, NULL);
+ 	if (unlikely(!gdp))
+@@ -686,12 +687,18 @@ static int recently_deleted(struct super_block *sb, ext4_group_t group, int ino)
+ 
+ 	offset = (ino % inodes_per_block) * EXT4_INODE_SIZE(sb);
+ 	raw_inode = (struct ext4_inode *) (bh->b_data + offset);
++
++	/* i_dtime is only 32 bits on disk, but we only care about relative
++	 * times in the range of a few minutes (i.e. long enough to sync a
++	 * recently-deleted inode to disk), so using the low 32 bits of the
++	 * clock (a 68 year range) is enough, see time_before32() */
+ 	dtime = le32_to_cpu(raw_inode->i_dtime);
+-	now = get_seconds();
++	now = ktime_get_real_seconds();
+ 	if (buffer_dirty(bh))
+ 		recentcy += RECENTCY_DIRTY;
+ 
+-	if (dtime && (dtime < now) && (now < dtime + recentcy))
++	if (dtime && time_before32(dtime, now) &&
++	    time_before32(now, dtime + recentcy))
+ 		ret = 1;
+ out:
+ 	brelse(bh);
+* Unmerged path include/linux/time.h
