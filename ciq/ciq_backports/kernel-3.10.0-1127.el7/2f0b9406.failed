@@ -1,0 +1,111 @@
+cxgb4: Add MPS TCAM refcounting for cxgb4 change mac
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Raju Rangoju <rajur@chelsio.com>
+commit 2f0b9406f3c77491928b8c6c855ef8349eff31ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/2f0b9406.failed
+
+This patch adds TCAM reference counting
+support for cxgb4 change mac path
+
+	Signed-off-by: Raju Rangoju <rajur@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2f0b9406f3c77491928b8c6c855ef8349eff31ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_mps.c
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+index 295572f2890b,6260240743d5..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+@@@ -1880,5 -1907,40 +1880,43 @@@ int cxgb4_dcb_enabled(const struct net_
+  
+  int cxgb4_thermal_init(struct adapter *adap);
+  int cxgb4_thermal_remove(struct adapter *adap);
+++<<<<<<< HEAD
+++=======
++ int cxgb4_set_msix_aff(struct adapter *adap, unsigned short vec,
++ 		       cpumask_var_t *aff_mask, int idx);
++ void cxgb4_clear_msix_aff(unsigned short vec, cpumask_var_t aff_mask);
++ 
++ int cxgb4_change_mac(struct port_info *pi, unsigned int viid,
++ 		     int *tcam_idx, const u8 *addr,
++ 		     bool persistent, u8 *smt_idx);
++ 
++ int cxgb4_init_mps_ref_entries(struct adapter *adap);
++ void cxgb4_free_mps_ref_entries(struct adapter *adap);
++ int cxgb4_alloc_encap_mac_filt(struct adapter *adap, unsigned int viid,
++ 			       const u8 *addr, const u8 *mask,
++ 			       unsigned int vni, unsigned int vni_mask,
++ 			       u8 dip_hit, u8 lookup_type, bool sleep_ok);
++ int cxgb4_free_encap_mac_filt(struct adapter *adap, unsigned int viid,
++ 			      int idx, bool sleep_ok);
++ int cxgb4_free_raw_mac_filt(struct adapter *adap,
++ 			    unsigned int viid,
++ 			    const u8 *addr,
++ 			    const u8 *mask,
++ 			    unsigned int idx,
++ 			    u8 lookup_type,
++ 			    u8 port_id,
++ 			    bool sleep_ok);
++ int cxgb4_alloc_raw_mac_filt(struct adapter *adap,
++ 			     unsigned int viid,
++ 			     const u8 *addr,
++ 			     const u8 *mask,
++ 			     unsigned int idx,
++ 			     u8 lookup_type,
++ 			     u8 port_id,
++ 			     bool sleep_ok);
++ int cxgb4_update_mac_filt(struct port_info *pi, unsigned int viid,
++ 			  int *tcam_idx, const u8 *addr,
++ 			  bool persistent, u8 *smt_idx);
+++>>>>>>> 2f0b9406f3c7 (cxgb4: Add MPS TCAM refcounting for cxgb4 change mac)
+  
+  #endif /* __CXGB4_H__ */
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_mps.c
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index fcc54fe9426b..7c5ab928d611 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@ -450,9 +450,9 @@ static int set_rxmode(struct net_device *dev, int mtu, bool sleep_ok)
+  *	Addresses are programmed to hash region, if tcam runs out of entries.
+  *
+  */
+-static int cxgb4_change_mac(struct port_info *pi, unsigned int viid,
+-			    int *tcam_idx, const u8 *addr, bool persist,
+-			    u8 *smt_idx)
++int cxgb4_change_mac(struct port_info *pi, unsigned int viid,
++		     int *tcam_idx, const u8 *addr, bool persist,
++		     u8 *smt_idx)
+ {
+ 	struct adapter *adapter = pi->adapter;
+ 	struct hash_mac_addr *entry, *new_entry;
+@@ -506,8 +506,8 @@ static int link_start(struct net_device *dev)
+ 	ret = t4_set_rxmode(pi->adapter, mb, pi->viid, dev->mtu, -1, -1, -1,
+ 			    !!(dev->features & NETIF_F_HW_VLAN_CTAG_RX), true);
+ 	if (ret == 0)
+-		ret = cxgb4_change_mac(pi, pi->viid, &pi->xact_addr_filt,
+-				       dev->dev_addr, true, &pi->smt_idx);
++		ret = cxgb4_update_mac_filt(pi, pi->viid, &pi->xact_addr_filt,
++					    dev->dev_addr, true, &pi->smt_idx);
+ 	if (ret == 0)
+ 		ret = t4_link_l1cfg(pi->adapter, mb, pi->tx_chan,
+ 				    &pi->link_cfg);
+@@ -2927,8 +2927,8 @@ static int cxgb_set_mac_addr(struct net_device *dev, void *p)
+ 	if (!is_valid_ether_addr(addr->sa_data))
+ 		return -EADDRNOTAVAIL;
+ 
+-	ret = cxgb4_change_mac(pi, pi->viid, &pi->xact_addr_filt,
+-			       addr->sa_data, true, &pi->smt_idx);
++	ret = cxgb4_update_mac_filt(pi, pi->viid, &pi->xact_addr_filt,
++				    addr->sa_data, true, &pi->smt_idx);
+ 	if (ret < 0)
+ 		return ret;
+ 
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_mps.c
