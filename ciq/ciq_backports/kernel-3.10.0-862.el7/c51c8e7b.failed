@@ -1,0 +1,270 @@
+target: use 'se_dev_entry' when allocating UAs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] use 'se_dev_entry' when allocating UAs (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 90.48%
+commit-author Hannes Reinecke <hare@suse.de>
+commit c51c8e7bcac966f209da83630fc8ca7e6cad279b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c51c8e7b.failed
+
+We need to use 'se_dev_entry' as argument when allocating
+UAs, otherwise we'll never see any UAs for an implicit
+ALUA state transition triggered from userspace.
+
+(Add target_ua_allocate_lun() common caller - nab)
+
+	Signed-off-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit c51c8e7bcac966f209da83630fc8ca7e6cad279b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_alua.c
+#	drivers/target/target_core_transport.c
+#	drivers/target/target_core_ua.c
+#	drivers/target/target_core_ua.h
+diff --cc drivers/target/target_core_alua.c
+index a73542598e96,aa2e4b103d43..000000000000
+--- a/drivers/target/target_core_alua.c
++++ b/drivers/target/target_core_alua.c
+@@@ -993,36 -964,46 +993,65 @@@ static void core_alua_do_transition_ua(
+  		 * every I_T nexus other than the I_T nexus on which the SET
+  		 * TARGET PORT GROUPS command
+  		 */
+ -		if (!percpu_ref_tryget_live(&lun->lun_ref))
+ -			continue;
+ +		atomic_inc_mb(&mem->tg_pt_gp_mem_ref_cnt);
+  		spin_unlock(&tg_pt_gp->tg_pt_gp_lock);
+  
+++<<<<<<< HEAD
+ +		spin_lock_bh(&port->sep_alua_lock);
+ +		list_for_each_entry(se_deve, &port->sep_alua_list,
+ +					alua_port_list) {
+ +			lacl = se_deve->se_lun_acl;
+ +			/*
+ +			 * se_deve->se_lun_acl pointer may be NULL for a
+ +			 * entry created without explicit Node+MappedLUN ACLs
+ +			 */
+ +			if (!lacl)
+ +				continue;
+++=======
++ 		spin_lock_bh(&lun->lun_deve_lock);
++ 		list_for_each_entry(se_deve, &lun->lun_deve_list, lun_link) {
++ 			lacl = rcu_dereference_check(se_deve->se_lun_acl,
++ 					lockdep_is_held(&lun->lun_deve_lock));
+++>>>>>>> c51c8e7bcac9 (target: use 'se_dev_entry' when allocating UAs)
+  
++ 			/*
++ 			 * spc4r37 p.242:
++ 			 * After an explicit target port asymmetric access
++ 			 * state change, a device server shall establish a
++ 			 * unit attention condition with the additional sense
++ 			 * code set to ASYMMETRIC ACCESS STATE CHANGED for
++ 			 * the initiator port associated with every I_T nexus
++ 			 * other than the I_T nexus on which the SET TARGET
++ 			 * PORT GROUPS command was received.
++ 			 */
+  			if ((tg_pt_gp->tg_pt_gp_alua_access_status ==
+  			     ALUA_STATUS_ALTERED_BY_EXPLICIT_STPG) &&
+++<<<<<<< HEAD
+ +			   (tg_pt_gp->tg_pt_gp_alua_nacl != NULL) &&
+ +			    (tg_pt_gp->tg_pt_gp_alua_nacl == lacl->se_lun_nacl) &&
+ +			   (tg_pt_gp->tg_pt_gp_alua_port != NULL) &&
+ +			    (tg_pt_gp->tg_pt_gp_alua_port == port))
+++=======
++ 			   (tg_pt_gp->tg_pt_gp_alua_lun != NULL) &&
++ 			    (tg_pt_gp->tg_pt_gp_alua_lun == lun))
+++>>>>>>> c51c8e7bcac9 (target: use 'se_dev_entry' when allocating UAs)
++ 				continue;
++ 
++ 			/*
++ 			 * se_deve->se_lun_acl pointer may be NULL for a
++ 			 * entry created without explicit Node+MappedLUN ACLs
++ 			 */
++ 			if (lacl && (tg_pt_gp->tg_pt_gp_alua_nacl != NULL) &&
++ 			    (tg_pt_gp->tg_pt_gp_alua_nacl == lacl->se_lun_nacl))
+  				continue;
+  
+- 			core_scsi3_ua_allocate(lacl->se_lun_nacl,
+- 				se_deve->mapped_lun, 0x2A,
++ 			core_scsi3_ua_allocate(se_deve, 0x2A,
+  				ASCQ_2AH_ASYMMETRIC_ACCESS_STATE_CHANGED);
+  		}
+ -		spin_unlock_bh(&lun->lun_deve_lock);
+ +		spin_unlock_bh(&port->sep_alua_lock);
+  
+  		spin_lock(&tg_pt_gp->tg_pt_gp_lock);
+ -		percpu_ref_put(&lun->lun_ref);
+ +		atomic_dec_mb(&mem->tg_pt_gp_mem_ref_cnt);
+  	}
+  	spin_unlock(&tg_pt_gp->tg_pt_gp_lock);
+  }
+diff --cc drivers/target/target_core_transport.c
+index 9cc3afa0ef11,0364534f8d46..000000000000
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@@ -1709,14 -1677,14 +1709,19 @@@ void transport_generic_request_failure(
+  		 * See spc4r17, section 7.4.6 Control Mode Page, Table 349
+  		 */
+  		if (cmd->se_sess &&
+- 		    cmd->se_dev->dev_attrib.emulate_ua_intlck_ctrl == 2)
+- 			core_scsi3_ua_allocate(cmd->se_sess->se_node_acl,
+- 				cmd->orig_fe_lun, 0x2C,
+- 				ASCQ_2CH_PREVIOUS_RESERVATION_CONFLICT_STATUS);
+- 
++ 		    cmd->se_dev->dev_attrib.emulate_ua_intlck_ctrl == 2) {
++ 			target_ua_allocate_lun(cmd->se_sess->se_node_acl,
++ 					       cmd->orig_fe_lun, 0x2C,
++ 					ASCQ_2CH_PREVIOUS_RESERVATION_CONFLICT_STATUS);
++ 		}
+  		trace_target_cmd_complete(cmd);
+++<<<<<<< HEAD
+ +		ret = cmd->se_tfo-> queue_status(cmd);
+ +		if (ret)
+++=======
++ 		ret = cmd->se_tfo->queue_status(cmd);
++ 		if (ret == -EAGAIN || ret == -ENOMEM)
+++>>>>>>> c51c8e7bcac9 (target: use 'se_dev_entry' when allocating UAs)
+  			goto queue_full;
+  		goto check_stop;
+  	default:
+diff --cc drivers/target/target_core_ua.c
+index 1577d3feeaba,fc095aed5a88..000000000000
+--- a/drivers/target/target_core_ua.c
++++ b/drivers/target/target_core_ua.c
+@@@ -80,8 -87,7 +80,12 @@@ target_scsi3_ua_check(struct se_cmd *cm
+  }
+  
+  int core_scsi3_ua_allocate(
+++<<<<<<< HEAD
+ +	struct se_node_acl *nacl,
+ +	u32 unpacked_lun,
+++=======
++ 	struct se_dev_entry *deve,
+++>>>>>>> c51c8e7bcac9 (target: use 'se_dev_entry' when allocating UAs)
+  	u8 asc,
+  	u8 ascq)
+  {
+@@@ -103,9 -103,6 +101,12 @@@
+  	ua->ua_asc = asc;
+  	ua->ua_ascq = ascq;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irq(&nacl->device_list_lock);
+ +	deve = nacl->device_list[unpacked_lun];
+ +
+++=======
+++>>>>>>> c51c8e7bcac9 (target: use 'se_dev_entry' when allocating UAs)
+  	spin_lock(&deve->ua_lock);
+  	list_for_each_entry_safe(ua_p, ua_tmp, &deve->ua_list, ua_nacl_list) {
+  		/*
+@@@ -113,7 -110,6 +114,10 @@@
+  		 */
+  		if ((ua_p->ua_asc == asc) && (ua_p->ua_ascq == ascq)) {
+  			spin_unlock(&deve->ua_lock);
+++<<<<<<< HEAD
+ +			spin_unlock_irq(&nacl->device_list_lock);
+++=======
+++>>>>>>> c51c8e7bcac9 (target: use 'se_dev_entry' when allocating UAs)
+  			kmem_cache_free(se_ua_cache, ua);
+  			return 0;
+  		}
+@@@ -165,11 -160,9 +169,16 @@@
+  	}
+  	list_add_tail(&ua->ua_nacl_list, &deve->ua_list);
+  	spin_unlock(&deve->ua_lock);
+ +	spin_unlock_irq(&nacl->device_list_lock);
+  
+++<<<<<<< HEAD
+ +	pr_debug("[%s]: Allocated UNIT ATTENTION, mapped LUN: %u, ASC:"
+ +		" 0x%02x, ASCQ: 0x%02x\n",
+ +		nacl->se_tpg->se_tpg_tfo->get_fabric_name(), unpacked_lun,
+++=======
++ 	pr_debug("Allocated UNIT ATTENTION, mapped LUN: %llu, ASC:"
++ 		" 0x%02x, ASCQ: 0x%02x\n", deve->mapped_lun,
+++>>>>>>> c51c8e7bcac9 (target: use 'se_dev_entry' when allocating UAs)
+  		asc, ascq);
+  
+  	atomic_inc_mb(&deve->ua_count);
+diff --cc drivers/target/target_core_ua.h
+index a6b56b364e7a,96460bff490f..000000000000
+--- a/drivers/target/target_core_ua.h
++++ b/drivers/target/target_core_ua.h
+@@@ -28,7 -28,8 +28,12 @@@
+  extern struct kmem_cache *se_ua_cache;
+  
+  extern sense_reason_t target_scsi3_ua_check(struct se_cmd *);
+++<<<<<<< HEAD
+ +extern int core_scsi3_ua_allocate(struct se_node_acl *, u32, u8, u8);
+++=======
++ extern int core_scsi3_ua_allocate(struct se_dev_entry *, u8, u8);
++ extern void target_ua_allocate_lun(struct se_node_acl *, u32, u8, u8);
+++>>>>>>> c51c8e7bcac9 (target: use 'se_dev_entry' when allocating UAs)
+  extern void core_scsi3_ua_release_all(struct se_dev_entry *);
+  extern void core_scsi3_ua_for_check_condition(struct se_cmd *, u8 *, u8 *);
+  extern int core_scsi3_ua_clear_for_request_sense(struct se_cmd *,
+* Unmerged path drivers/target/target_core_alua.c
+diff --git a/drivers/target/target_core_pr.c b/drivers/target/target_core_pr.c
+index a255afc452a9..d1fbe762932b 100644
+--- a/drivers/target/target_core_pr.c
++++ b/drivers/target/target_core_pr.c
+@@ -2196,7 +2196,7 @@ core_scsi3_emulate_pro_register(struct se_cmd *cmd, u64 res_key, u64 sa_res_key,
+ 					&pr_tmpl->registration_list,
+ 					pr_reg_list) {
+ 
+-				core_scsi3_ua_allocate(
++				target_ua_allocate_lun(
+ 					pr_reg_p->pr_reg_nacl,
+ 					pr_reg_p->pr_res_mapped_lun,
+ 					0x2A,
+@@ -2623,7 +2623,7 @@ core_scsi3_emulate_pro_release(struct se_cmd *cmd, int type, int scope,
+ 		if (pr_reg_p == pr_reg)
+ 			continue;
+ 
+-		core_scsi3_ua_allocate(pr_reg_p->pr_reg_nacl,
++		target_ua_allocate_lun(pr_reg_p->pr_reg_nacl,
+ 				pr_reg_p->pr_res_mapped_lun,
+ 				0x2A, ASCQ_2AH_RESERVATIONS_RELEASED);
+ 	}
+@@ -2708,7 +2708,7 @@ core_scsi3_emulate_pro_clear(struct se_cmd *cmd, u64 res_key)
+ 		 *    additional sense code set to RESERVATIONS PREEMPTED.
+ 		 */
+ 		if (!calling_it_nexus)
+-			core_scsi3_ua_allocate(pr_reg_nacl, pr_res_mapped_lun,
++			target_ua_allocate_lun(pr_reg_nacl, pr_res_mapped_lun,
+ 				0x2A, ASCQ_2AH_RESERVATIONS_PREEMPTED);
+ 	}
+ 	spin_unlock(&pr_tmpl->registration_lock);
+@@ -2917,7 +2917,7 @@ core_scsi3_pro_preempt(struct se_cmd *cmd, int type, int scope, u64 res_key,
+ 						NULL, 0);
+ 			}
+ 			if (!calling_it_nexus)
+-				core_scsi3_ua_allocate(pr_reg_nacl,
++				target_ua_allocate_lun(pr_reg_nacl,
+ 					pr_res_mapped_lun, 0x2A,
+ 					ASCQ_2AH_REGISTRATIONS_PREEMPTED);
+ 		}
+@@ -3023,7 +3023,7 @@ core_scsi3_pro_preempt(struct se_cmd *cmd, int type, int scope, u64 res_key,
+ 		 *    persistent reservation and/or registration, with the
+ 		 *    additional sense code set to REGISTRATIONS PREEMPTED;
+ 		 */
+-		core_scsi3_ua_allocate(pr_reg_nacl, pr_res_mapped_lun, 0x2A,
++		target_ua_allocate_lun(pr_reg_nacl, pr_res_mapped_lun, 0x2A,
+ 				ASCQ_2AH_REGISTRATIONS_PREEMPTED);
+ 	}
+ 	spin_unlock(&pr_tmpl->registration_lock);
+@@ -3056,7 +3056,7 @@ core_scsi3_pro_preempt(struct se_cmd *cmd, int type, int scope, u64 res_key,
+ 			if (calling_it_nexus)
+ 				continue;
+ 
+-			core_scsi3_ua_allocate(pr_reg->pr_reg_nacl,
++			target_ua_allocate_lun(pr_reg->pr_reg_nacl,
+ 					pr_reg->pr_res_mapped_lun, 0x2A,
+ 					ASCQ_2AH_RESERVATIONS_RELEASED);
+ 		}
+* Unmerged path drivers/target/target_core_transport.c
+* Unmerged path drivers/target/target_core_ua.c
+* Unmerged path drivers/target/target_core_ua.h
