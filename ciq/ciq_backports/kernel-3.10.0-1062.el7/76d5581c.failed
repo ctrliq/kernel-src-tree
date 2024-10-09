@@ -1,0 +1,122 @@
+net/mlx5: Fix use-after-free in self-healing flow
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: Fix use-after-free in self-healing flow (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 95.74%
+commit-author Jack Morgenstein <jackm@dev.mellanox.co.il>
+commit 76d5581c870454be5f1f1a106c57985902e7ea20
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/76d5581c.failed
+
+When the mlx5 health mechanism detects a problem while the driver
+is in the middle of init_one or remove_one, the driver needs to prevent
+the health mechanism from scheduling future work; if future work
+is scheduled, there is a problem with use-after-free: the system WQ
+tries to run the work item (which has been freed) at the scheduled
+future time.
+
+Prevent this by disabling work item scheduling in the health mechanism
+when the driver is in the middle of init_one() or remove_one().
+
+Fixes: e126ba97dba9 ("mlx5: Add driver for Mellanox Connect-IB adapters")
+	Signed-off-by: Jack Morgenstein <jackm@dev.mellanox.co.il>
+	Reviewed-by: Feras Daoud <ferasda@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 76d5581c870454be5f1f1a106c57985902e7ea20)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/main.c
+index 706907fd69d6,739aad0a0b35..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@@ -1615,6 -1590,46 +1615,49 @@@ static const struct pci_error_handlers 
+  	.resume		= mlx5_pci_resume
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int mlx5_try_fast_unload(struct mlx5_core_dev *dev)
++ {
++ 	int ret;
++ 
++ 	if (!MLX5_CAP_GEN(dev, force_teardown)) {
++ 		mlx5_core_dbg(dev, "force teardown is not supported in the firmware\n");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	if (dev->state == MLX5_DEVICE_STATE_INTERNAL_ERROR) {
++ 		mlx5_core_dbg(dev, "Device in internal error state, giving up\n");
++ 		return -EAGAIN;
++ 	}
++ 
++ 	/* Panic tear down fw command will stop the PCI bus communication
++ 	 * with the HCA, so the health polll is no longer needed.
++ 	 */
++ 	mlx5_drain_health_wq(dev);
++ 	mlx5_stop_health_poll(dev, false);
++ 
++ 	ret = mlx5_cmd_force_teardown_hca(dev);
++ 	if (ret) {
++ 		mlx5_core_dbg(dev, "Firmware couldn't do fast unload error: %d\n", ret);
++ 		mlx5_start_health_poll(dev);
++ 		return ret;
++ 	}
++ 
++ 	mlx5_enter_error_state(dev, true);
++ 
++ 	/* Some platforms requiring freeing the IRQ's in the shutdown
++ 	 * flow. If they aren't freed they can't be allocated after
++ 	 * kexec. There is no need to cleanup the mlx5_core software
++ 	 * contexts.
++ 	 */
++ 	mlx5_irq_clear_affinity_hints(dev);
++ 	mlx5_core_eq_free_irqs(dev);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 76d5581c8704 (net/mlx5: Fix use-after-free in self-healing flow)
+  static void shutdown(struct pci_dev *pdev)
+  {
+  	struct mlx5_core_dev *dev  = pci_get_drvdata(pdev);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/health.c b/drivers/net/ethernet/mellanox/mlx5/core/health.c
+index b565dc1876d3..7b610d7b4ed4 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/health.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/health.c
+@@ -331,9 +331,17 @@ void mlx5_start_health_poll(struct mlx5_core_dev *dev)
+ 	add_timer(&health->timer);
+ }
+ 
+-void mlx5_stop_health_poll(struct mlx5_core_dev *dev)
++void mlx5_stop_health_poll(struct mlx5_core_dev *dev, bool disable_health)
+ {
+ 	struct mlx5_core_health *health = &dev->priv.health;
++	unsigned long flags;
++
++	if (disable_health) {
++		spin_lock_irqsave(&health->wq_lock, flags);
++		set_bit(MLX5_DROP_NEW_HEALTH_WORK, &health->flags);
++		set_bit(MLX5_DROP_NEW_RECOVERY_WORK, &health->flags);
++		spin_unlock_irqrestore(&health->wq_lock, flags);
++	}
+ 
+ 	del_timer_sync(&health->timer);
+ }
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/main.c
+diff --git a/include/linux/mlx5/driver.h b/include/linux/mlx5/driver.h
+index 35545005ad03..b4bec2b45f43 100644
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -1020,7 +1020,7 @@ int mlx5_cmd_free_uar(struct mlx5_core_dev *dev, u32 uarn);
+ void mlx5_health_cleanup(struct mlx5_core_dev *dev);
+ int mlx5_health_init(struct mlx5_core_dev *dev);
+ void mlx5_start_health_poll(struct mlx5_core_dev *dev);
+-void mlx5_stop_health_poll(struct mlx5_core_dev *dev);
++void mlx5_stop_health_poll(struct mlx5_core_dev *dev, bool disable_health);
+ void mlx5_drain_health_wq(struct mlx5_core_dev *dev);
+ void mlx5_trigger_health_work(struct mlx5_core_dev *dev);
+ void mlx5_drain_health_recovery(struct mlx5_core_dev *dev);
