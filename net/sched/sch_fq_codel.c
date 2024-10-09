@@ -234,6 +234,7 @@ static struct sk_buff *dequeue(struct codel_vars *vars, struct Qdisc *sch)
 	if (flow->head) {
 		skb = dequeue_head(flow);
 		q->backlogs[flow - q->flows] -= qdisc_pkt_len(skb);
+		q->memory_usage -= skb->truesize;
 		sch->q.qlen--;
 	}
 	return skb;
@@ -313,6 +314,7 @@ static void fq_codel_reset(struct Qdisc *sch)
 	}
 	memset(q->backlogs, 0, q->flows_cnt * sizeof(u32));
 	sch->q.qlen = 0;
+	q->memory_usage = 0;
 }
 
 static const struct nla_policy fq_codel_policy[TCA_FQ_CODEL_MAX + 1] = {
