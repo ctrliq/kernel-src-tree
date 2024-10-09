@@ -1,0 +1,130 @@
+locking/rtmutex: Implement lockless top-waiter wakeup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Davidlohr Bueso <dave@stgolabs.net>
+commit 45ab4effc3bee6f8a5cb05652b7bb895ec5b6a7a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/45ab4eff.failed
+
+Mark the task for later wakeup after the wait_lock has been released.
+This way, once the next task is awoken, it will have a better chance
+to of finding the wait_lock free when continuing executing in
+__rt_mutex_slowlock() when trying to acquire the rtmutex, calling
+try_to_take_rt_mutex(). Upon contended scenarios, other tasks attempting
+take the lock may acquire it first, right after the wait_lock is released,
+but (a) this can also occur with the current code, as it relies on the
+spinlock fairness, and (b) we are dealing with the top-waiter anyway,
+so it will always take the lock next.
+
+	Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Mike Galbraith <umgwanakikbuti@gmail.com>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Cc: Davidlohr Bueso <dave@stgolabs.net>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1432056298-18738-2-git-send-email-dave@stgolabs.net
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 45ab4effc3bee6f8a5cb05652b7bb895ec5b6a7a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/rtmutex.c
+diff --cc kernel/rtmutex.c
+index 65e24e63fb4e,44ee8f85a78b..000000000000
+--- a/kernel/rtmutex.c
++++ b/kernel/rtmutex.c
+@@@ -555,9 -955,8 +555,14 @@@ static int task_blocks_on_rt_mutex(stru
+  }
+  
+  /*
+++<<<<<<< HEAD:kernel/rtmutex.c
+ + * Wake up the next waiter on the lock.
+ + *
+ + * Remove the top waiter from the current tasks waiter list and wake it up.
+++=======
++  * Remove the top waiter from the current tasks pi waiter list and
++  * queue it up.
+++>>>>>>> 45ab4effc3be (locking/rtmutex: Implement lockless top-waiter wakeup):kernel/locking/rtmutex.c
+   *
+   * Called with lock->wait_lock held.
+   */
+@@@ -582,7 -990,7 +588,11 @@@ static void mark_wakeup_next_waiter(str
+  
+  	raw_spin_unlock_irqrestore(&current->pi_lock, flags);
+  
+++<<<<<<< HEAD:kernel/rtmutex.c
+ +	wake_up_process(waiter->task);
+++=======
++ 	wake_q_add(wake_q, waiter->task);
+++>>>>>>> 45ab4effc3be (locking/rtmutex: Implement lockless top-waiter wakeup):kernel/locking/rtmutex.c
+  }
+  
+  /*
+@@@ -808,15 -1260,55 +820,26 @@@ rt_mutex_slowunlock(struct rt_mutex *lo
+  
+  	rt_mutex_deadlock_account_unlock(current);
+  
+ -	/*
+ -	 * We must be careful here if the fast path is enabled. If we
+ -	 * have no waiters queued we cannot set owner to NULL here
+ -	 * because of:
+ -	 *
+ -	 * foo->lock->owner = NULL;
+ -	 *			rtmutex_lock(foo->lock);   <- fast path
+ -	 *			free = atomic_dec_and_test(foo->refcnt);
+ -	 *			rtmutex_unlock(foo->lock); <- fast path
+ -	 *			if (free)
+ -	 *				kfree(foo);
+ -	 * raw_spin_unlock(foo->lock->wait_lock);
+ -	 *
+ -	 * So for the fastpath enabled kernel:
+ -	 *
+ -	 * Nothing can set the waiters bit as long as we hold
+ -	 * lock->wait_lock. So we do the following sequence:
+ -	 *
+ -	 *	owner = rt_mutex_owner(lock);
+ -	 *	clear_rt_mutex_waiters(lock);
+ -	 *	raw_spin_unlock(&lock->wait_lock);
+ -	 *	if (cmpxchg(&lock->owner, owner, 0) == owner)
+ -	 *		return;
+ -	 *	goto retry;
+ -	 *
+ -	 * The fastpath disabled variant is simple as all access to
+ -	 * lock->owner is serialized by lock->wait_lock:
+ -	 *
+ -	 *	lock->owner = NULL;
+ -	 *	raw_spin_unlock(&lock->wait_lock);
+ -	 */
+ -	while (!rt_mutex_has_waiters(lock)) {
+ -		/* Drops lock->wait_lock ! */
+ -		if (unlock_rt_mutex_safe(lock) == true)
+ -			return;
+ -		/* Relock the rtmutex and try again */
+ -		raw_spin_lock(&lock->wait_lock);
+ +	if (!rt_mutex_has_waiters(lock)) {
+ +		lock->owner = NULL;
+ +		raw_spin_unlock(&lock->wait_lock);
+ +		return;
+  	}
+  
+++<<<<<<< HEAD:kernel/rtmutex.c
+ +	wakeup_next_waiter(lock);
+++=======
++ 	/*
++ 	 * The wakeup next waiter path does not suffer from the above
++ 	 * race. See the comments there.
++ 	 *
++ 	 * Queue the next waiter for wakeup once we release the wait_lock.
++ 	 */
++ 	mark_wakeup_next_waiter(&wake_q, lock);
+++>>>>>>> 45ab4effc3be (locking/rtmutex: Implement lockless top-waiter wakeup):kernel/locking/rtmutex.c
+  
+  	raw_spin_unlock(&lock->wait_lock);
++ 	wake_up_q(&wake_q);
+  
+  	/* Undo pi boosting if necessary: */
+  	rt_mutex_adjust_prio(current);
+* Unmerged path kernel/rtmutex.c
