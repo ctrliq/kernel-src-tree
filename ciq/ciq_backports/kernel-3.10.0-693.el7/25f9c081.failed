@@ -1,0 +1,218 @@
+userns: Generalize the user namespace count into ucount
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit 25f9c0817c535a728c1088542230fa327c577c9e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/25f9c081.failed
+
+The same kind of recursive sane default limit and policy
+countrol that has been implemented for the user namespace
+is desirable for the other namespaces, so generalize
+the user namespace refernce count into a ucount.
+
+	Acked-by: Kees Cook <keescook@chromium.org>
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit 25f9c0817c535a728c1088542230fa327c577c9e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/user_namespace.h
+#	kernel/fork.c
+#	kernel/ucount.c
+#	kernel/user_namespace.c
+diff --cc include/linux/user_namespace.h
+index 9b176275291d,9b676ead35c3..000000000000
+--- a/include/linux/user_namespace.h
++++ b/include/linux/user_namespace.h
+@@@ -22,6 -22,13 +22,16 @@@ struct uid_gid_map {	/* 64 bytes -- 1 c
+  
+  #define USERNS_INIT_FLAGS USERNS_SETGROUPS_ALLOWED
+  
+++<<<<<<< HEAD
+++=======
++ struct ucounts;
++ 
++ enum ucount_type {
++ 	UCOUNT_USER_NAMESPACES,
++ 	UCOUNT_COUNTS,
++ };
++ 
+++>>>>>>> 25f9c0817c53 (userns: Generalize the user namespace count into ucount)
+  struct user_namespace {
+  	struct uid_gid_map	uid_map;
+  	struct uid_gid_map	gid_map;
+@@@ -39,12 -46,30 +49,38 @@@
+  	struct key		*persistent_keyring_register;
+  	struct rw_semaphore	persistent_keyring_register_sem;
+  #endif
+++<<<<<<< HEAD
+ +	RH_KABI_EXTEND(int level)
+ +	RH_KABI_EXTEND(unsigned long flags)
+++=======
++ 	struct work_struct	work;
++ #ifdef CONFIG_SYSCTL
++ 	struct ctl_table_set	set;
++ 	struct ctl_table_header *sysctls;
++ #endif
++ 	struct ucounts		*ucounts;
++ 	int ucount_max[UCOUNT_COUNTS];
++ };
++ 
++ struct ucounts {
++ 	struct hlist_node node;
++ 	struct user_namespace *ns;
++ 	kuid_t uid;
++ 	atomic_t count;
++ 	atomic_t ucount[UCOUNT_COUNTS];
+++>>>>>>> 25f9c0817c53 (userns: Generalize the user namespace count into ucount)
+  };
+  
+  extern struct user_namespace init_user_ns;
+  
+++<<<<<<< HEAD
+++=======
++ bool setup_userns_sysctls(struct user_namespace *ns);
++ void retire_userns_sysctls(struct user_namespace *ns);
++ struct ucounts *inc_ucount(struct user_namespace *ns, kuid_t uid, enum ucount_type type);
++ void dec_ucount(struct ucounts *ucounts, enum ucount_type type);
++ 
+++>>>>>>> 25f9c0817c53 (userns: Generalize the user namespace count into ucount)
+  #ifdef CONFIG_USER_NS
+  
+  static inline struct user_namespace *get_user_ns(struct user_namespace *ns)
+diff --cc kernel/fork.c
+index 4d1b25f88335,3cb4853a59aa..000000000000
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@@ -277,8 -272,37 +277,9 @@@ EXPORT_SYMBOL_GPL(__put_task_struct)
+  
+  void __init __weak arch_task_cache_init(void) { }
+  
+ -/*
+ - * set_max_threads
+ - */
+ -static void set_max_threads(unsigned int max_threads_suggested)
+ -{
+ -	u64 threads;
+ -
+ -	/*
+ -	 * The number of threads shall be limited such that the thread
+ -	 * structures may only consume a small part of the available memory.
+ -	 */
+ -	if (fls64(totalram_pages) + fls64(PAGE_SIZE) > 64)
+ -		threads = MAX_THREADS;
+ -	else
+ -		threads = div64_u64((u64) totalram_pages * (u64) PAGE_SIZE,
+ -				    (u64) THREAD_SIZE * 8UL);
+ -
+ -	if (threads > max_threads_suggested)
+ -		threads = max_threads_suggested;
+ -
+ -	max_threads = clamp_t(u64, threads, MIN_THREADS, MAX_THREADS);
+ -}
+ -
+ -#ifdef CONFIG_ARCH_WANTS_DYNAMIC_TASK_STRUCT
+ -/* Initialized by the architecture: */
+ -int arch_task_struct_size __read_mostly;
+ -#endif
+ -
+ -void __init fork_init(void)
+ +void __init fork_init(unsigned long mempages)
+  {
++ 	int i;
+  #ifndef CONFIG_ARCH_TASK_STRUCT_ALLOCATOR
+  #ifndef ARCH_MIN_TASKALIGN
+  #define ARCH_MIN_TASKALIGN	L1_CACHE_BYTES
+@@@ -309,9 -322,13 +310,16 @@@
+  	init_task.signal->rlim[RLIMIT_NPROC].rlim_max = max_threads/2;
+  	init_task.signal->rlim[RLIMIT_SIGPENDING] =
+  		init_task.signal->rlim[RLIMIT_NPROC];
+++<<<<<<< HEAD
+++=======
++ 
++ 	for (i = 0; i < UCOUNT_COUNTS; i++) {
++ 		init_user_ns.ucount_max[i] = max_threads/2;
++ 	}
+++>>>>>>> 25f9c0817c53 (userns: Generalize the user namespace count into ucount)
+  }
+  
+ -int __weak arch_dup_task_struct(struct task_struct *dst,
+ +int __attribute__((weak)) arch_dup_task_struct(struct task_struct *dst,
+  					       struct task_struct *src)
+  {
+  	*dst = *src;
+diff --cc kernel/user_namespace.c
+index 57f036cb8f03,0edafe305861..000000000000
+--- a/kernel/user_namespace.c
++++ b/kernel/user_namespace.c
+@@@ -30,7 -29,18 +30,17 @@@ static DEFINE_MUTEX(userns_state_mutex)
+  static bool new_idmap_permitted(const struct file *file,
+  				struct user_namespace *ns, int cap_setid,
+  				struct uid_gid_map *map);
+ -static void free_user_ns(struct work_struct *work);
+  
++ static struct ucounts *inc_user_namespaces(struct user_namespace *ns, kuid_t uid)
++ {
++ 	return inc_ucount(ns, uid, UCOUNT_USER_NAMESPACES);
++ }
++ 
++ static void dec_user_namespaces(struct ucounts *ucounts)
++ {
++ 	return dec_ucount(ucounts, UCOUNT_USER_NAMESPACES);
++ }
++ 
+  static void set_cred_user_ns(struct cred *cred, struct user_namespace *user_ns)
+  {
+  	/* Start with the same capabilities as init but useless for doing
+@@@ -68,17 -73,16 +78,22 @@@ int create_user_ns(struct cred *new
+  	struct user_namespace *ns, *parent_ns = new->user_ns;
+  	kuid_t owner = new->euid;
+  	kgid_t group = new->egid;
+++<<<<<<< HEAD
+ +	int ret;
+ +	static int __read_mostly called_mark_tech_preview = 0;
+ +
+ +	if (!enable_user_ns_creation)
+ +		return -EINVAL;
+ +
+ +	if (!called_mark_tech_preview && !xchg(&called_mark_tech_preview, 1))
+ +		mark_tech_preview("user namespace", NULL);
+++=======
++ 	struct ucounts *ucounts;
++ 	int ret, i;
+++>>>>>>> 25f9c0817c53 (userns: Generalize the user namespace count into ucount)
+  
+ -	ret = -EUSERS;
+  	if (parent_ns->level > 32)
+ -		goto fail;
+ -
+ -	ucounts = inc_user_namespaces(parent_ns, owner);
+ -	if (!ucounts)
+ -		goto fail;
+ +		return -EUSERS;
+  
+  	/*
+  	 * Verify that we can not violate the policy of which files
+@@@ -113,6 -119,11 +128,14 @@@
+  	ns->level = parent_ns->level + 1;
+  	ns->owner = owner;
+  	ns->group = group;
+++<<<<<<< HEAD
+++=======
++ 	INIT_WORK(&ns->work, free_user_ns);
++ 	for (i = 0; i < UCOUNT_COUNTS; i++) {
++ 		ns->ucount_max[i] = INT_MAX;
++ 	}
++ 	ns->ucounts = ucounts;
+++>>>>>>> 25f9c0817c53 (userns: Generalize the user namespace count into ucount)
+  
+  	/* Inherit USERNS_SETGROUPS_ALLOWED from our parent */
+  	mutex_lock(&userns_state_mutex);
+* Unmerged path kernel/ucount.c
+* Unmerged path include/linux/user_namespace.h
+* Unmerged path kernel/fork.c
+* Unmerged path kernel/ucount.c
+* Unmerged path kernel/user_namespace.c
