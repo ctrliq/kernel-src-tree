@@ -1,0 +1,295 @@
+qede: Split PF/VF ndos.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] qede: Split PF/VF ndos (Don Dutile) [1462433 1499362]
+Rebuild_FUZZ: 97.78%
+commit-author Mintz, Yuval <Yuval.Mintz@cavium.com>
+commit be47c5555778fa3354950731023deb034a9e445e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/be47c555.failed
+
+PFs and VFs share the same structure of NDOs today,
+and the VFs explicitly fails the ndo_xdp() callback stating
+it doesn't support XDP.
+
+This results in lots of:
+
+  [qede_xdp:1032(enp131s2)]VFs don't support XDP
+  ------------[ cut here ]------------
+  WARNING: CPU: 4 PID: 1426 at net/core/rtnetlink.c:1637 rtnl_dump_ifinfo+0x354/0x3c0
+  ...
+  Call Trace:
+    ? __alloc_skb+0x9b/0x1d0
+    netlink_dump+0x122/0x290
+    netlink_recvmsg+0x27d/0x430
+    sock_recvmsg+0x3d/0x50
+  ...
+
+As every dump request for the VF interface info would fail due to
+rtnl_xdp_fill() returning an error code.
+
+To resolve this, introduce a subset of the NDOs meant for the VF
+in a seperate structure and register that one instead for VFs,
+and omit the ndo_xdp initialization.
+
+Fixes: 40b8c45492ef ("qede: Prevent VFs from using XDP")
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit be47c5555778fa3354950731023deb034a9e445e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qede/qede_filter.c
+diff --cc drivers/net/ethernet/qlogic/qede/qede_filter.c
+index c4f04a5e6810,333876c19d7d..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede_filter.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_filter.c
+@@@ -428,76 -891,154 +428,88 @@@ int qede_set_features(struct net_devic
+  	return 0;
+  }
+  
+ -void qede_udp_tunnel_add(struct net_device *dev, struct udp_tunnel_info *ti)
+ +#ifdef CONFIG_QEDE_VXLAN
+ +void qede_add_vxlan_port(struct net_device *dev,
+ +			 sa_family_t sa_family, __be16 port)
+  {
+  	struct qede_dev *edev = netdev_priv(dev);
+ -	struct qed_tunn_params tunn_params;
+ -	u16 t_port = ntohs(ti->port);
+ -	int rc;
+ -
+ -	memset(&tunn_params, 0, sizeof(tunn_params));
+ -
+ -	switch (ti->type) {
+ -	case UDP_TUNNEL_TYPE_VXLAN:
+ -		if (!edev->dev_info.common.vxlan_enable)
+ -			return;
+ -
+ -		if (edev->vxlan_dst_port)
+ -			return;
+ -
+ -		tunn_params.update_vxlan_port = 1;
+ -		tunn_params.vxlan_port = t_port;
+ -
+ -		__qede_lock(edev);
+ -		rc = edev->ops->tunn_config(edev->cdev, &tunn_params);
+ -		__qede_unlock(edev);
+ -
+ -		if (!rc) {
+ -			edev->vxlan_dst_port = t_port;
+ -			DP_VERBOSE(edev, QED_MSG_DEBUG, "Added vxlan port=%d\n",
+ -				   t_port);
+ -		} else {
+ -			DP_NOTICE(edev, "Failed to add vxlan UDP port=%d\n",
+ -				  t_port);
+ -		}
+ -
+ -		break;
+ -	case UDP_TUNNEL_TYPE_GENEVE:
+ -		if (!edev->dev_info.common.geneve_enable)
+ -			return;
+ +	u16 t_port = ntohs(port);
+  
+ -		if (edev->geneve_dst_port)
+ -			return;
+ -
+ -		tunn_params.update_geneve_port = 1;
+ -		tunn_params.geneve_port = t_port;
+ +	if (edev->vxlan_dst_port)
+ +		return;
+  
+ -		__qede_lock(edev);
+ -		rc = edev->ops->tunn_config(edev->cdev, &tunn_params);
+ -		__qede_unlock(edev);
+ +	edev->vxlan_dst_port = t_port;
+  
+ -		if (!rc) {
+ -			edev->geneve_dst_port = t_port;
+ -			DP_VERBOSE(edev, QED_MSG_DEBUG,
+ -				   "Added geneve port=%d\n", t_port);
+ -		} else {
+ -			DP_NOTICE(edev, "Failed to add geneve UDP port=%d\n",
+ -				  t_port);
+ -		}
+ +	DP_VERBOSE(edev, QED_MSG_DEBUG, "Added vxlan port=%d", t_port);
+  
+ -		break;
+ -	default:
+ -		return;
+ -	}
+ +	set_bit(QEDE_SP_VXLAN_PORT_CONFIG, &edev->sp_flags);
+ +	schedule_delayed_work(&edev->sp_task, 0);
+  }
+  
+ -void qede_udp_tunnel_del(struct net_device *dev,
+ -			 struct udp_tunnel_info *ti)
+ +void qede_del_vxlan_port(struct net_device *dev,
+ +			 sa_family_t sa_family, __be16 port)
+  {
+  	struct qede_dev *edev = netdev_priv(dev);
+ -	struct qed_tunn_params tunn_params;
+ -	u16 t_port = ntohs(ti->port);
+ -
+ -	memset(&tunn_params, 0, sizeof(tunn_params));
+ -
+ -	switch (ti->type) {
+ -	case UDP_TUNNEL_TYPE_VXLAN:
+ -		if (t_port != edev->vxlan_dst_port)
+ -			return;
+ -
+ -		tunn_params.update_vxlan_port = 1;
+ -		tunn_params.vxlan_port = 0;
+ -
+ -		__qede_lock(edev);
+ -		edev->ops->tunn_config(edev->cdev, &tunn_params);
+ -		__qede_unlock(edev);
+ -
+ -		edev->vxlan_dst_port = 0;
+ -
+ -		DP_VERBOSE(edev, QED_MSG_DEBUG, "Deleted vxlan port=%d\n",
+ -			   t_port);
+ +	u16 t_port = ntohs(port);
+  
+ -		break;
+ -	case UDP_TUNNEL_TYPE_GENEVE:
+ -		if (t_port != edev->geneve_dst_port)
+ -			return;
+ -
+ -		tunn_params.update_geneve_port = 1;
+ -		tunn_params.geneve_port = 0;
+ -
+ -		__qede_lock(edev);
+ -		edev->ops->tunn_config(edev->cdev, &tunn_params);
+ -		__qede_unlock(edev);
+ -
+ -		edev->geneve_dst_port = 0;
+ -
+ -		DP_VERBOSE(edev, QED_MSG_DEBUG, "Deleted geneve port=%d\n",
+ -			   t_port);
+ -		break;
+ -	default:
+ +	if (t_port != edev->vxlan_dst_port)
+  		return;
+ -	}
+ -}
+  
+ -static void qede_xdp_reload_func(struct qede_dev *edev,
+ -				 struct qede_reload_args *args)
+ -{
+ -	struct bpf_prog *old;
+ -
+ -	old = xchg(&edev->xdp_prog, args->u.new_prog);
+ -	if (old)
+ -		bpf_prog_put(old);
+ -}
+ +	edev->vxlan_dst_port = 0;
+  
+ -static int qede_xdp_set(struct qede_dev *edev, struct bpf_prog *prog)
+ -{
+ -	struct qede_reload_args args;
+ -
+ -	/* If we're called, there was already a bpf reference increment */
+ -	args.func = &qede_xdp_reload_func;
+ -	args.u.new_prog = prog;
+ -	qede_reload(edev, &args, false);
+ +	DP_VERBOSE(edev, QED_MSG_DEBUG, "Deleted vxlan port=%d", t_port);
+  
+ -	return 0;
+ +	set_bit(QEDE_SP_VXLAN_PORT_CONFIG, &edev->sp_flags);
+ +	schedule_delayed_work(&edev->sp_task, 0);
+  }
+ +#endif
+  
+ -int qede_xdp(struct net_device *dev, struct netdev_xdp *xdp)
+ +#ifdef CONFIG_QEDE_GENEVE
+ +void qede_add_geneve_port(struct net_device *dev,
+ +			  sa_family_t sa_family, __be16 port)
+  {
+  	struct qede_dev *edev = netdev_priv(dev);
+ +	u16 t_port = ntohs(port);
+ +
+++<<<<<<< HEAD
+ +	if (edev->geneve_dst_port)
+ +		return;
+  
+ +	edev->geneve_dst_port = t_port;
+ +
+ +	DP_VERBOSE(edev, QED_MSG_DEBUG, "Added geneve port=%d", t_port);
+ +	set_bit(QEDE_SP_GENEVE_PORT_CONFIG, &edev->sp_flags);
+ +	schedule_delayed_work(&edev->sp_task, 0);
+++=======
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return qede_xdp_set(edev, xdp->prog);
++ 	case XDP_QUERY_PROG:
++ 		xdp->prog_attached = !!edev->xdp_prog;
++ 		return 0;
++ 	default:
++ 		return -EINVAL;
++ 	}
+++>>>>>>> be47c5555778 (qede: Split PF/VF ndos.)
+  }
+  
+ +void qede_del_geneve_port(struct net_device *dev,
+ +			  sa_family_t sa_family, __be16 port)
+ +{
+ +	struct qede_dev *edev = netdev_priv(dev);
+ +	u16 t_port = ntohs(port);
+ +
+ +	if (t_port != edev->geneve_dst_port)
+ +		return;
+ +
+ +	edev->geneve_dst_port = 0;
+ +
+ +	DP_VERBOSE(edev, QED_MSG_DEBUG, "Deleted geneve port=%d", t_port);
+ +	set_bit(QEDE_SP_GENEVE_PORT_CONFIG, &edev->sp_flags);
+ +	schedule_delayed_work(&edev->sp_task, 0);
+ +}
+ +#endif
+ +
+  static int qede_set_mcast_rx_mac(struct qede_dev *edev,
+  				 enum qed_filter_xcast_params_type opcode,
+  				 unsigned char *mac, int num_macs)
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_filter.c
+diff --git a/drivers/net/ethernet/qlogic/qede/qede_main.c b/drivers/net/ethernet/qlogic/qede/qede_main.c
+index ca645148d03f..f6677b989a0e 100644
+--- a/drivers/net/ethernet/qlogic/qede/qede_main.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_main.c
+@@ -556,6 +556,23 @@ static const struct net_device_ops qede_netdev_ops = {
+ 	.ndo_features_check = qede_features_check,
+ };
+ 
++static const struct net_device_ops qede_netdev_vf_ops = {
++	.ndo_open = qede_open,
++	.ndo_stop = qede_close,
++	.ndo_start_xmit = qede_start_xmit,
++	.ndo_set_rx_mode = qede_set_rx_mode,
++	.ndo_set_mac_address = qede_set_mac_addr,
++	.ndo_validate_addr = eth_validate_addr,
++	.ndo_change_mtu = qede_change_mtu,
++	.ndo_vlan_rx_add_vid = qede_vlan_rx_add_vid,
++	.ndo_vlan_rx_kill_vid = qede_vlan_rx_kill_vid,
++	.ndo_set_features = qede_set_features,
++	.ndo_get_stats64 = qede_get_stats64,
++	.ndo_udp_tunnel_add = qede_udp_tunnel_add,
++	.ndo_udp_tunnel_del = qede_udp_tunnel_del,
++	.ndo_features_check = qede_features_check,
++};
++
+ /* -------------------------------------------------------------------------
+  * START OF PROBE / REMOVE
+  * -------------------------------------------------------------------------
+@@ -614,7 +631,10 @@ static void qede_init_ndev(struct qede_dev *edev)
+ 
+ 	ndev->watchdog_timeo = TX_TIMEOUT;
+ 
+-	ndev->netdev_ops = &qede_netdev_ops;
++	if (IS_VF(edev))
++		ndev->netdev_ops = &qede_netdev_vf_ops;
++	else
++		ndev->netdev_ops = &qede_netdev_ops;
+ 
+ 	qede_set_ethtool_ops(ndev);
+ 
