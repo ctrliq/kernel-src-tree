@@ -1,0 +1,303 @@
+locking/spinlocks/mcs: Convert osq lock to atomic_t to reduce overhead
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jason Low <jason.low2@hp.com>
+commit 90631822c5d307b5410500806e8ac3e63928aa3e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/90631822.failed
+
+The cancellable MCS spinlock is currently used to queue threads that are
+doing optimistic spinning. It uses per-cpu nodes, where a thread obtaining
+the lock would access and queue the local node corresponding to the CPU that
+it's running on. Currently, the cancellable MCS lock is implemented by using
+pointers to these nodes.
+
+In this patch, instead of operating on pointers to the per-cpu nodes, we
+store the CPU numbers in which the per-cpu nodes correspond to in atomic_t.
+A similar concept is used with the qspinlock.
+
+By operating on the CPU # of the nodes using atomic_t instead of pointers
+to those nodes, this can reduce the overhead of the cancellable MCS spinlock
+by 32 bits (on 64 bit systems).
+
+	Signed-off-by: Jason Low <jason.low2@hp.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: Scott Norton <scott.norton@hp.com>
+	Cc: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Waiman Long <waiman.long@hp.com>
+	Cc: Davidlohr Bueso <davidlohr@hp.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Tim Chen <tim.c.chen@linux.intel.com>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Aswin Chandramouleeswaran <aswin@hp.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Chris Mason <clm@fb.com>
+	Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Cc: Josef Bacik <jbacik@fusionio.com>
+Link: http://lkml.kernel.org/r/1405358872-3732-3-git-send-email-jason.low2@hp.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 90631822c5d307b5410500806e8ac3e63928aa3e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mutex.h
+#	include/linux/rwsem.h
+#	kernel/mcs_spinlock.c
+#	kernel/mcs_spinlock.h
+diff --cc include/linux/mutex.h
+index ab6267e3cf9f,42aa9b9ecd5f..000000000000
+--- a/include/linux/mutex.h
++++ b/include/linux/mutex.h
+@@@ -17,8 -17,8 +17,9 @@@
+  #include <linux/lockdep.h>
+  #include <linux/atomic.h>
+  #include <asm/processor.h>
++ #include <linux/osq_lock.h>
+  
+ +#include <linux/rh_kabi.h>
+  /*
+   * Simple, straightforward mutexes with strict semantics:
+   *
+@@@ -47,7 -47,6 +48,10 @@@
+   * - detects multi-task circular deadlocks and prints out all affected
+   *   locks and tasks (and only those tasks)
+   */
+++<<<<<<< HEAD
+ +struct optimistic_spin_queue;
+++=======
+++>>>>>>> 90631822c5d3 (locking/spinlocks/mcs: Convert osq lock to atomic_t to reduce overhead)
+  struct mutex {
+  	/* 1: unlocked, 0: locked, negative: locked, possible waiters */
+  	atomic_t		count;
+@@@ -57,8 -56,7 +61,12 @@@
+  	struct task_struct	*owner;
+  #endif
+  #ifdef CONFIG_MUTEX_SPIN_ON_OWNER
+++<<<<<<< HEAD
+ +	RH_KABI_REPLACE(void			*spin_mlock,	/* Spinner MCS lock */
+ +		          struct optimistic_spin_queue	*osq)	/* Spinner MCS lock */
+++=======
++ 	struct optimistic_spin_queue osq; /* Spinner MCS lock */
+++>>>>>>> 90631822c5d3 (locking/spinlocks/mcs: Convert osq lock to atomic_t to reduce overhead)
+  #endif
+  #ifdef CONFIG_DEBUG_MUTEXES
+  	const char 		*name;
+diff --cc include/linux/rwsem.h
+index 8d79708146aa,9fdcdd03507d..000000000000
+--- a/include/linux/rwsem.h
++++ b/include/linux/rwsem.h
+@@@ -13,10 -13,9 +13,13 @@@
+  #include <linux/kernel.h>
+  #include <linux/list.h>
+  #include <linux/spinlock.h>
+- 
+  #include <linux/atomic.h>
++ #include <linux/osq_lock.h>
+  
+++<<<<<<< HEAD
+ +struct optimistic_spin_queue;
+++=======
+++>>>>>>> 90631822c5d3 (locking/spinlocks/mcs: Convert osq lock to atomic_t to reduce overhead)
+  struct rw_semaphore;
+  
+  #ifdef CONFIG_RWSEM_GENERIC_SPINLOCK
+@@@ -33,7 -32,7 +36,11 @@@ struct rw_semaphore 
+  	 * if the owner is running on the cpu.
+  	 */
+  	struct task_struct *owner;
+++<<<<<<< HEAD
+ +	struct optimistic_spin_queue *osq; /* spinner MCS lock */
+++=======
++ 	struct optimistic_spin_queue osq; /* spinner MCS lock */
+++>>>>>>> 90631822c5d3 (locking/spinlocks/mcs: Convert osq lock to atomic_t to reduce overhead)
+  #endif
+  #ifdef CONFIG_DEBUG_LOCK_ALLOC
+  	struct lockdep_map	dep_map;
+diff --cc kernel/mcs_spinlock.c
+index 13c1bbdbe694,32fc16c0a545..000000000000
+--- a/kernel/mcs_spinlock.c
++++ b/kernel/mcs_spinlock.c
+@@@ -14,21 -14,47 +14,56 @@@
+   * called from interrupt context and we have preemption disabled while
+   * spinning.
+   */
+ -static DEFINE_PER_CPU_SHARED_ALIGNED(struct optimistic_spin_node, osq_node);
+ +static DEFINE_PER_CPU_SHARED_ALIGNED(struct optimistic_spin_queue, osq_node);
+  
++ /*
++  * We use the value 0 to represent "no CPU", thus the encoded value
++  * will be the CPU number incremented by 1.
++  */
++ static inline int encode_cpu(int cpu_nr)
++ {
++ 	return cpu_nr + 1;
++ }
++ 
++ static inline struct optimistic_spin_node *decode_cpu(int encoded_cpu_val)
++ {
++ 	int cpu_nr = encoded_cpu_val - 1;
++ 
++ 	return per_cpu_ptr(&osq_node, cpu_nr);
++ }
++ 
+  /*
+   * Get a stable @node->next pointer, either for unlock() or unqueue() purposes.
+   * Can return NULL in case we were the last queued and we updated @lock instead.
+   */
+++<<<<<<< HEAD:kernel/mcs_spinlock.c
+ +static inline struct optimistic_spin_queue *
+ +osq_wait_next(struct optimistic_spin_queue **lock,
+ +	      struct optimistic_spin_queue *node,
+ +	      struct optimistic_spin_queue *prev)
+ +{
+ +	struct optimistic_spin_queue *next = NULL;
+++=======
++ static inline struct optimistic_spin_node *
++ osq_wait_next(struct optimistic_spin_queue *lock,
++ 	      struct optimistic_spin_node *node,
++ 	      struct optimistic_spin_node *prev)
++ {
++ 	struct optimistic_spin_node *next = NULL;
++ 	int curr = encode_cpu(smp_processor_id());
++ 	int old;
++ 
++ 	/*
++ 	 * If there is a prev node in queue, then the 'old' value will be
++ 	 * the prev node's CPU #, else it's set to OSQ_UNLOCKED_VAL since if
++ 	 * we're currently last in queue, then the queue will then become empty.
++ 	 */
++ 	old = prev ? prev->cpu : OSQ_UNLOCKED_VAL;
+++>>>>>>> 90631822c5d3 (locking/spinlocks/mcs: Convert osq lock to atomic_t to reduce overhead):kernel/locking/mcs_spinlock.c
+  
+  	for (;;) {
+- 		if (*lock == node && cmpxchg(lock, node, prev) == node) {
++ 		if (atomic_read(&lock->tail) == curr &&
++ 		    atomic_cmpxchg(&lock->tail, curr, old) == curr) {
+  			/*
+  			 * We were the last queued, we moved @lock back. @prev
+  			 * will now observe @lock and will complete its
+@@@ -59,10 -85,12 +94,19 @@@
+  	return next;
+  }
+  
+++<<<<<<< HEAD:kernel/mcs_spinlock.c
+ +bool osq_lock(struct optimistic_spin_queue **lock)
+ +{
+ +	struct optimistic_spin_queue *node = this_cpu_ptr(&osq_node);
+ +	struct optimistic_spin_queue *prev, *next;
+++=======
++ bool osq_lock(struct optimistic_spin_queue *lock)
++ {
++ 	struct optimistic_spin_node *node = this_cpu_ptr(&osq_node);
++ 	struct optimistic_spin_node *prev, *next;
++ 	int curr = encode_cpu(smp_processor_id());
++ 	int old;
+++>>>>>>> 90631822c5d3 (locking/spinlocks/mcs: Convert osq lock to atomic_t to reduce overhead):kernel/locking/mcs_spinlock.c
+  
+  	node->locked = 0;
+  	node->next = NULL;
+@@@ -149,10 -180,11 +196,18 @@@ unqueue
+  	return false;
+  }
+  
+++<<<<<<< HEAD:kernel/mcs_spinlock.c
+ +void osq_unlock(struct optimistic_spin_queue **lock)
+ +{
+ +	struct optimistic_spin_queue *node = this_cpu_ptr(&osq_node);
+ +	struct optimistic_spin_queue *next;
+++=======
++ void osq_unlock(struct optimistic_spin_queue *lock)
++ {
++ 	struct optimistic_spin_node *node = this_cpu_ptr(&osq_node);
++ 	struct optimistic_spin_node *next;
++ 	int curr = encode_cpu(smp_processor_id());
+++>>>>>>> 90631822c5d3 (locking/spinlocks/mcs: Convert osq lock to atomic_t to reduce overhead):kernel/locking/mcs_spinlock.c
+  
+  	/*
+  	 * Fast path for the uncontended case.
+diff --cc kernel/mcs_spinlock.h
+index 074c62536f83,74356dc0ce29..000000000000
+--- a/kernel/mcs_spinlock.h
++++ b/kernel/mcs_spinlock.h
+@@@ -115,12 -118,13 +115,18 @@@ void mcs_spin_unlock(struct mcs_spinloc
+   * mutex_lock()/rwsem_down_{read,write}() etc.
+   */
+  
+ -struct optimistic_spin_node {
+ -	struct optimistic_spin_node *next, *prev;
+ +struct optimistic_spin_queue {
+ +	struct optimistic_spin_queue *next, *prev;
+  	int locked; /* 1 if lock acquired */
++ 	int cpu; /* encoded CPU # value */
+  };
+  
+++<<<<<<< HEAD:kernel/mcs_spinlock.h
+ +extern bool osq_lock(struct optimistic_spin_queue **lock);
+ +extern void osq_unlock(struct optimistic_spin_queue **lock);
+++=======
++ extern bool osq_lock(struct optimistic_spin_queue *lock);
++ extern void osq_unlock(struct optimistic_spin_queue *lock);
+++>>>>>>> 90631822c5d3 (locking/spinlocks/mcs: Convert osq lock to atomic_t to reduce overhead):kernel/locking/mcs_spinlock.h
+  
+  #endif /* __LINUX_MCS_SPINLOCK_H */
+* Unmerged path include/linux/mutex.h
+diff --git a/include/linux/osq_lock.h b/include/linux/osq_lock.h
+new file mode 100644
+index 000000000000..b001682bf7cb
+--- /dev/null
++++ b/include/linux/osq_lock.h
+@@ -0,0 +1,19 @@
++#ifndef __LINUX_OSQ_LOCK_H
++#define __LINUX_OSQ_LOCK_H
++
++/*
++ * An MCS like lock especially tailored for optimistic spinning for sleeping
++ * lock implementations (mutex, rwsem, etc).
++ */
++
++#define OSQ_UNLOCKED_VAL (0)
++
++struct optimistic_spin_queue {
++	/*
++	 * Stores an encoded value of the CPU # of the tail node in the queue.
++	 * If the queue is empty, then it's set to OSQ_UNLOCKED_VAL.
++	 */
++	atomic_t tail;
++};
++
++#endif
+* Unmerged path include/linux/rwsem.h
+* Unmerged path kernel/mcs_spinlock.c
+* Unmerged path kernel/mcs_spinlock.h
+diff --git a/kernel/mutex.c b/kernel/mutex.c
+index d8af8cf9c6e9..15d73c9c43d0 100644
+--- a/kernel/mutex.c
++++ b/kernel/mutex.c
+@@ -60,7 +60,7 @@ __mutex_init(struct mutex *lock, const char *name, struct lock_class_key *key)
+ 	INIT_LIST_HEAD(&lock->wait_list);
+ 	mutex_clear_owner(lock);
+ #ifdef CONFIG_MUTEX_SPIN_ON_OWNER
+-	lock->osq = NULL;
++	atomic_set(&lock->osq.tail, OSQ_UNLOCKED_VAL);
+ #endif
+ 
+ 	debug_mutex_init(lock, name, key);
+diff --git a/lib/rwsem.c b/lib/rwsem.c
+index c40c7d28661d..b77a6230bbf6 100644
+--- a/lib/rwsem.c
++++ b/lib/rwsem.c
+@@ -84,7 +84,7 @@ void __init_rwsem(struct rw_semaphore *sem, const char *name,
+ 	INIT_LIST_HEAD(&sem->wait_list);
+ #ifdef CONFIG_SMP
+ 	sem->owner = NULL;
+-	sem->osq = NULL;
++	atomic_set(&sem->osq.tail, OSQ_UNLOCKED_VAL);
+ #endif
+ }
+ 
