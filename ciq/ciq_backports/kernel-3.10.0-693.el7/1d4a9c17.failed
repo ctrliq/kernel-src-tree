@@ -1,0 +1,201 @@
+PM / sleep: add configurable delay for pm_test
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Brian Norris <computersforpeace@gmail.com>
+commit 1d4a9c17d4d204a159139361e8d4db7f9f267879
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1d4a9c17.failed
+
+When CONFIG_PM_DEBUG=y, we provide a sysfs file (/sys/power/pm_test) for
+selecting one of a few suspend test modes, where rather than entering a
+full suspend state, the kernel will perform some subset of suspend
+steps, wait 5 seconds, and then resume back to normal operation.
+
+This mode is useful for (among other things) observing the state of the
+system just before entering a sleep mode, for debugging or analysis
+purposes. However, a constant 5 second wait is not sufficient for some
+sorts of analysis; for example, on an SoC, one might want to use
+external tools to probe the power states of various on-chip controllers
+or clocks.
+
+This patch turns this 5 second delay into a configurable module
+parameter, so users can determine how long to wait in this
+pseudo-suspend state before resuming the system.
+
+Example (wait 30 seconds);
+
+  # echo 30 > /sys/module/suspend/parameters/pm_test_delay
+  # echo core > /sys/power/pm_test
+  # time echo mem  > /sys/power/state
+  ...
+  [   17.583625] suspend debug: Waiting for 30 second(s).
+  ...
+  real	0m30.381s
+  user	0m0.017s
+  sys	0m0.080s
+
+	Signed-off-by: Brian Norris <computersforpeace@gmail.com>
+	Acked-by: Pavel Machek <pavel@ucw.cz>
+	Reviewed-by: Kevin Cernekee <cernekee@chromium.org>
+	Acked-by: Florian Fainelli <f.fainelli@gmail.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 1d4a9c17d4d204a159139361e8d4db7f9f267879)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/kernel-parameters.txt
+#	kernel/power/suspend.c
+diff --cc Documentation/kernel-parameters.txt
+index a90d5dc17718,8b1fa5e129ac..000000000000
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@@ -3149,7 -3462,14 +3149,18 @@@ bytes respectively. Such letter suffixe
+  			improve throughput, but will also increase the
+  			amount of memory reserved for use by the client.
+  
+++<<<<<<< HEAD
+ +	swapaccount[=0|1]
+++=======
++ 	suspend.pm_test_delay=
++ 			[SUSPEND]
++ 			Sets the number of seconds to remain in a suspend test
++ 			mode before resuming the system (see
++ 			/sys/power/pm_test). Only available when CONFIG_PM_DEBUG
++ 			is set. Default value is 5.
++ 
++ 	swapaccount=[0|1]
+++>>>>>>> 1d4a9c17d4d2 (PM / sleep: add configurable delay for pm_test)
+  			[KNL] Enable accounting of swap in memory resource
+  			controller if no parameter or 1 is given or disable
+  			it if 0 is given (See Documentation/cgroups/memory.txt)
+diff --cc kernel/power/suspend.c
+index 2f77c9728767,8d7a1ef72758..000000000000
+--- a/kernel/power/suspend.c
++++ b/kernel/power/suspend.c
+@@@ -26,6 -27,8 +26,11 @@@
+  #include <linux/syscore_ops.h>
+  #include <linux/ftrace.h>
+  #include <trace/events/power.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/compiler.h>
++ #include <linux/moduleparam.h>
+++>>>>>>> 1d4a9c17d4d2 (PM / sleep: add configurable delay for pm_test)
+  
+  #include "power.h"
+  
+@@@ -111,6 -163,84 +116,87 @@@ int suspend_valid_only_mem(suspend_stat
+  }
+  EXPORT_SYMBOL_GPL(suspend_valid_only_mem);
+  
+++<<<<<<< HEAD
+++=======
++ static bool sleep_state_supported(suspend_state_t state)
++ {
++ 	return state == PM_SUSPEND_FREEZE || (suspend_ops && suspend_ops->enter);
++ }
++ 
++ static int platform_suspend_prepare(suspend_state_t state)
++ {
++ 	return state != PM_SUSPEND_FREEZE && suspend_ops->prepare ?
++ 		suspend_ops->prepare() : 0;
++ }
++ 
++ static int platform_suspend_prepare_late(suspend_state_t state)
++ {
++ 	return state == PM_SUSPEND_FREEZE && freeze_ops && freeze_ops->prepare ?
++ 		freeze_ops->prepare() : 0;
++ }
++ 
++ static int platform_suspend_prepare_noirq(suspend_state_t state)
++ {
++ 	return state != PM_SUSPEND_FREEZE && suspend_ops->prepare_late ?
++ 		suspend_ops->prepare_late() : 0;
++ }
++ 
++ static void platform_resume_noirq(suspend_state_t state)
++ {
++ 	if (state != PM_SUSPEND_FREEZE && suspend_ops->wake)
++ 		suspend_ops->wake();
++ }
++ 
++ static void platform_resume_early(suspend_state_t state)
++ {
++ 	if (state == PM_SUSPEND_FREEZE && freeze_ops && freeze_ops->restore)
++ 		freeze_ops->restore();
++ }
++ 
++ static void platform_resume_finish(suspend_state_t state)
++ {
++ 	if (state != PM_SUSPEND_FREEZE && suspend_ops->finish)
++ 		suspend_ops->finish();
++ }
++ 
++ static int platform_suspend_begin(suspend_state_t state)
++ {
++ 	if (state == PM_SUSPEND_FREEZE && freeze_ops && freeze_ops->begin)
++ 		return freeze_ops->begin();
++ 	else if (suspend_ops->begin)
++ 		return suspend_ops->begin(state);
++ 	else
++ 		return 0;
++ }
++ 
++ static void platform_resume_end(suspend_state_t state)
++ {
++ 	if (state == PM_SUSPEND_FREEZE && freeze_ops && freeze_ops->end)
++ 		freeze_ops->end();
++ 	else if (suspend_ops->end)
++ 		suspend_ops->end();
++ }
++ 
++ static void platform_recover(suspend_state_t state)
++ {
++ 	if (state != PM_SUSPEND_FREEZE && suspend_ops->recover)
++ 		suspend_ops->recover();
++ }
++ 
++ static bool platform_suspend_again(suspend_state_t state)
++ {
++ 	return state != PM_SUSPEND_FREEZE && suspend_ops->suspend_again ?
++ 		suspend_ops->suspend_again() : false;
++ }
++ 
++ #ifdef CONFIG_PM_DEBUG
++ static unsigned int pm_test_delay = 5;
++ module_param(pm_test_delay, uint, 0644);
++ MODULE_PARM_DESC(pm_test_delay,
++ 		 "Number of seconds to wait before resuming from suspend test");
++ #endif
++ 
+++>>>>>>> 1d4a9c17d4d2 (PM / sleep: add configurable delay for pm_test)
+  static int suspend_test(int level)
+  {
+  #ifdef CONFIG_PM_DEBUG
+* Unmerged path Documentation/kernel-parameters.txt
+diff --git a/Documentation/power/basic-pm-debugging.txt b/Documentation/power/basic-pm-debugging.txt
+index 262acf56fa79..c4db8c6ecd76 100644
+--- a/Documentation/power/basic-pm-debugging.txt
++++ b/Documentation/power/basic-pm-debugging.txt
+@@ -75,12 +75,14 @@ you should do the following:
+ # echo platform > /sys/power/disk
+ # echo disk > /sys/power/state
+ 
+-Then, the kernel will try to freeze processes, suspend devices, wait 5 seconds,
+-resume devices and thaw processes.  If "platform" is written to
++Then, the kernel will try to freeze processes, suspend devices, wait a few
++seconds (5 by default, but configurable by the suspend.pm_test_delay module
++parameter), resume devices and thaw processes.  If "platform" is written to
+ /sys/power/pm_test , then after suspending devices the kernel will additionally
+ invoke the global control methods (eg. ACPI global control methods) used to
+-prepare the platform firmware for hibernation.  Next, it will wait 5 seconds and
+-invoke the platform (eg. ACPI) global methods used to cancel hibernation etc.
++prepare the platform firmware for hibernation.  Next, it will wait a
++configurable number of seconds and invoke the platform (eg. ACPI) global
++methods used to cancel hibernation etc.
+ 
+ Writing "none" to /sys/power/pm_test causes the kernel to switch to the normal
+ hibernation/suspend operations.  Also, when open for reading, /sys/power/pm_test
+* Unmerged path kernel/power/suspend.c
