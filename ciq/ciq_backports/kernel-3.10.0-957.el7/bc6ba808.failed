@@ -1,0 +1,109 @@
+nfit, address-range-scrub: rework and simplify ARS state machine
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit bc6ba8085842164f2a8dc2e78e23a7167872abbe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/bc6ba808.failed
+
+ARS is an operation that can take 10s to 100s of seconds to find media
+errors that should rarely be present. If the platform crashes due to
+media errors in persistent memory, the expectation is that the BIOS will
+report those known errors in a 'short' ARS request.
+
+A 'short' ARS request asks platform firmware to return an ARS payload
+with all known errors, but without issuing a 'long' scrub. At driver
+init a short request is issued to all PMEM ranges before registering
+regions. Then, in the background, a long ARS is scheduled for each
+region.
+
+The ARS implementation is simplified to centralize ARS completion work
+in the ars_complete() helper. The timeout is removed since there is no
+facility to cancel ARS, and this otherwise arranges for system init to
+never be blocked waiting for a 'long' ARS. The ars_state flags are used
+to coordinate ARS requests from driver init, ARS requests from
+userspace, and ARS requests in response to media error notifications.
+
+Given that there is no notification of ARS completion the implementation
+still needs to poll. It backs off exponentially to a maximum poll period
+of 30 minutes.
+
+	Suggested-by: Toshi Kani <toshi.kani@hpe.com>
+Co-developed-by: Dave Jiang <dave.jiang@intel.com>
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit bc6ba8085842164f2a8dc2e78e23a7167872abbe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/nfit/core.c
+#	drivers/acpi/nfit/nfit.h
+diff --cc drivers/acpi/nfit/core.c
+index b51217b6f576,2532294bbd68..000000000000
+--- a/drivers/acpi/nfit/core.c
++++ b/drivers/acpi/nfit/core.c
+@@@ -3228,21 -3195,32 +3165,40 @@@ int acpi_nfit_ars_rescan(struct acpi_nf
+  	}
+  
+  	list_for_each_entry(nfit_spa, &acpi_desc->spas, list) {
+- 		struct acpi_nfit_system_address *spa = nfit_spa->spa;
++ 		int type = nfit_spa_type(nfit_spa->spa);
+  
+- 		if (nfit_spa_type(spa) != NFIT_SPA_PM)
++ 		if (type != NFIT_SPA_PM && type != NFIT_SPA_VOLATILE)
++ 			continue;
++ 		if (test_bit(ARS_FAILED, &nfit_spa->ars_state))
+  			continue;
+  
+- 		set_bit(ARS_REQ, &nfit_spa->ars_state);
++ 		if (test_and_set_bit(ARS_REQ, &nfit_spa->ars_state))
++ 			busy++;
++ 		else {
++ 			if (test_bit(ARS_SHORT, &flags))
++ 				set_bit(ARS_SHORT, &nfit_spa->ars_state);
++ 			scheduled++;
++ 		}
++ 	}
++ 	if (scheduled) {
++ 		queue_delayed_work(nfit_wq, &acpi_desc->dwork, 0);
++ 		dev_dbg(dev, "ars_scan triggered\n");
+  	}
+++<<<<<<< HEAD
+ +	acpi_desc->ars_start_flags = 0;
+ +	if (test_bit(ARS_SHORT, &flags))
+ +		acpi_desc->ars_start_flags |= ND_ARS_RETURN_PREV_DATA;
+ +	queue_work(nfit_wq, &acpi_desc->work);
+ +	dev_dbg(dev, "%s: ars_scan triggered\n", __func__);
+++=======
+++>>>>>>> bc6ba8085842 (nfit, address-range-scrub: rework and simplify ARS state machine)
+  	mutex_unlock(&acpi_desc->init_mutex);
+  
+- 	return 0;
++ 	if (scheduled)
++ 		return 0;
++ 	if (busy)
++ 		return -EBUSY;
++ 	return -ENOTTY;
+  }
+  
+  void acpi_nfit_desc_init(struct acpi_nfit_desc *acpi_desc, struct device *dev)
+diff --cc drivers/acpi/nfit/nfit.h
+index a4224dcb856c,7d15856a739f..000000000000
+--- a/drivers/acpi/nfit/nfit.h
++++ b/drivers/acpi/nfit/nfit.h
+@@@ -182,7 -207,8 +182,11 @@@ struct acpi_nfit_desc 
+  	unsigned long dimm_cmd_force_en;
+  	unsigned long bus_cmd_force_en;
+  	unsigned long bus_nfit_cmd_force_en;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int platform_cap;
++ 	unsigned int scrub_tmo;
+++>>>>>>> bc6ba8085842 (nfit, address-range-scrub: rework and simplify ARS state machine)
+  	int (*blk_do_io)(struct nd_blk_region *ndbr, resource_size_t dpa,
+  			void *iobuf, u64 len, int rw);
+  };
+* Unmerged path drivers/acpi/nfit/core.c
+* Unmerged path drivers/acpi/nfit/nfit.h
