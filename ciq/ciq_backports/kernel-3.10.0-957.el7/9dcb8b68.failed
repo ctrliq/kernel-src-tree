@@ -1,0 +1,579 @@
+mm: remove per-zone hashtable of bitlock waitqueues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mm] remove per-zone hashtable of bitlock waitqueues (Jeff Moyer) [1505291]
+Rebuild_FUZZ: 95.92%
+commit-author Linus Torvalds <torvalds@linux-foundation.org>
+commit 9dcb8b685fc30813b35ab4b4bf39244430753190
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/9dcb8b68.failed
+
+The per-zone waitqueues exist because of a scalability issue with the
+page waitqueues on some NUMA machines, but it turns out that they hurt
+normal loads, and now with the vmalloced stacks they also end up
+breaking gfs2 that uses a bit_wait on a stack object:
+
+     wait_on_bit(&gh->gh_iflags, HIF_WAIT, TASK_UNINTERRUPTIBLE)
+
+where 'gh' can be a reference to the local variable 'mount_gh' on the
+stack of fill_super().
+
+The reason the per-zone hash table breaks for this case is that there is
+no "zone" for virtual allocations, and trying to look up the physical
+page to get at it will fail (with a BUG_ON()).
+
+It turns out that I actually complained to the mm people about the
+per-zone hash table for another reason just a month ago: the zone lookup
+also hurts the regular use of "unlock_page()" a lot, because the zone
+lookup ends up forcing several unnecessary cache misses and generates
+horrible code.
+
+As part of that earlier discussion, we had a much better solution for
+the NUMA scalability issue - by just making the page lock have a
+separate contention bit, the waitqueue doesn't even have to be looked at
+for the normal case.
+
+Peter Zijlstra already has a patch for that, but let's see if anybody
+even notices.  In the meantime, let's fix the actual gfs2 breakage by
+simplifying the bitlock waitqueues and removing the per-zone issue.
+
+	Reported-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Tested-by: Bob Peterson <rpeterso@redhat.com>
+	Acked-by: Mel Gorman <mgorman@techsingularity.net>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Steven Whitehouse <swhiteho@redhat.com>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 9dcb8b685fc30813b35ab4b4bf39244430753190)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mmzone.h
+#	kernel/wait.c
+#	mm/memory_hotplug.c
+#	mm/page_alloc.c
+diff --cc include/linux/mmzone.h
+index ec9595db6870,0f088f3a2fed..000000000000
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@@ -510,40 -420,85 +510,100 @@@ struct zone 
+  	 * adjust_managed_page_count() should be used instead of directly
+  	 * touching zone->managed_pages and totalram_pages.
+  	 */
+ -	unsigned long		managed_pages;
+  	unsigned long		spanned_pages;
+  	unsigned long		present_pages;
+ +	unsigned long		managed_pages;
+  
+ -	const char		*name;
+ +	/*
+ +	 * Number of MIGRATE_RESEVE page block. To maintain for just
+ +	 * optimization. Protected by zone->lock.
+ +	 */
+ +	int			nr_migrate_reserve_block;
+  
+ -#ifdef CONFIG_MEMORY_ISOLATION
+  	/*
+ -	 * Number of isolated pageblock. It is used to solve incorrect
+ -	 * freepage counting problem due to racy retrieving migratetype
+ -	 * of pageblock. Protected by zone->lock.
+ +	 * rarely used fields:
+  	 */
+ -	unsigned long		nr_isolate_pageblock;
+ -#endif
+ +	const char		*name;
+  
+ +	/* reserved for Red Hat */
+ +	RH_KABI_RESERVE(1)
+ +	RH_KABI_RESERVE(2)
+ +	RH_KABI_RESERVE(3)
+ +	RH_KABI_RESERVE(4)
+ +	RH_KABI_RESERVE(5)
+ +	RH_KABI_RESERVE(6)
+ +	RH_KABI_RESERVE(7)
+ +	RH_KABI_RESERVE(8)
+ +
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_MEMORY_HOTPLUG
++ 	/* see spanned/present_pages for more description */
++ 	seqlock_t		span_seqlock;
++ #endif
++ 
++ 	int initialized;
++ 
++ 	/* Write-intensive fields used from the page allocator */
++ 	ZONE_PADDING(_pad1_)
++ 
++ 	/* free areas of different sizes */
++ 	struct free_area	free_area[MAX_ORDER];
++ 
++ 	/* zone flags, see below */
++ 	unsigned long		flags;
++ 
++ 	/* Primarily protects free_area */
++ 	spinlock_t		lock;
++ 
++ 	/* Write-intensive fields used by compaction and vmstats. */
++ 	ZONE_PADDING(_pad2_)
++ 
++ 	/*
++ 	 * When free pages are below this point, additional steps are taken
++ 	 * when reading the number of free pages to avoid per-cpu counter
++ 	 * drift allowing watermarks to be breached
++ 	 */
++ 	unsigned long percpu_drift_mark;
++ 
++ #if defined CONFIG_COMPACTION || defined CONFIG_CMA
++ 	/* pfn where compaction free scanner should start */
++ 	unsigned long		compact_cached_free_pfn;
++ 	/* pfn where async and sync compaction migration scanner should start */
++ 	unsigned long		compact_cached_migrate_pfn[2];
++ #endif
++ 
++ #ifdef CONFIG_COMPACTION
++ 	/*
++ 	 * On compaction failure, 1<<compact_defer_shift compactions
++ 	 * are skipped before trying again. The number attempted since
++ 	 * last failure is tracked with compact_considered.
++ 	 */
++ 	unsigned int		compact_considered;
++ 	unsigned int		compact_defer_shift;
++ 	int			compact_order_failed;
++ #endif
++ 
++ #if defined CONFIG_COMPACTION || defined CONFIG_CMA
++ 	/* Set to true when the PG_migrate_skip bits should be cleared */
++ 	bool			compact_blockskip_flush;
++ #endif
++ 
++ 	bool			contiguous;
++ 
++ 	ZONE_PADDING(_pad3_)
++ 	/* Zone statistics */
++ 	atomic_long_t		vm_stat[NR_VM_ZONE_STAT_ITEMS];
+++>>>>>>> 9dcb8b685fc3 (mm: remove per-zone hashtable of bitlock waitqueues)
+  } ____cacheline_internodealigned_in_smp;
+  
+ -enum pgdat_flags {
+ -	PGDAT_CONGESTED,		/* pgdat has many dirty pages backed by
+ +typedef enum {
+ +	ZONE_RECLAIM_LOCKED,		/* prevents concurrent reclaim */
+ +	ZONE_OOM_LOCKED,		/* zone is in OOM killer zonelist */
+ +	ZONE_CONGESTED,			/* zone has many dirty pages backed by
+  					 * a congested BDI
+  					 */
+ -	PGDAT_DIRTY,			/* reclaim scanning has recently found
+ +	ZONE_TAIL_LRU_DIRTY,		/* reclaim scanning has recently found
+  					 * many dirty file pages at the tail
+  					 * of the LRU.
+  					 */
+diff --cc kernel/wait.c
+index d84f8a13e1b5,9453efe9b25a..000000000000
+--- a/kernel/wait.c
++++ b/kernel/wait.c
+@@@ -376,18 -480,6 +376,21 @@@ void wake_up_bit(void *word, int bit
+  }
+  EXPORT_SYMBOL(wake_up_bit);
+  
+++<<<<<<< HEAD:kernel/wait.c
+ +wait_queue_head_t *bit_waitqueue(void *word, int bit)
+ +{
+ +	const int shift = BITS_PER_LONG == 32 ? 5 : 6;
+ +	struct page *page = is_vmalloc_addr(word) ?
+ +		vmalloc_to_page(word) : virt_to_page(word);
+ +	const struct zone *zone = page_zone(page);
+ +	unsigned long val = (unsigned long)word << shift | bit;
+ +
+ +	return &zone->wait_table[hash_long(val, zone->wait_table_bits)];
+ +}
+ +EXPORT_SYMBOL(bit_waitqueue);
+ +
+++=======
+++>>>>>>> 9dcb8b685fc3 (mm: remove per-zone hashtable of bitlock waitqueues):kernel/sched/wait.c
+  /*
+   * Manipulate the atomic_t address to produce a better bit waitqueue table hash
+   * index (we're keying off bit -1, but that would produce a horrible hash
+diff --cc mm/memory_hotplug.c
+index 290849f05880,b18dab401be6..000000000000
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@@ -264,19 -275,6 +263,22 @@@ void register_page_bootmem_info_node(st
+  	for (i = 0; i < nr_pages; i++, page++)
+  		get_page_bootmem(node, page, NODE_INFO);
+  
+++<<<<<<< HEAD
+ +	zone = &pgdat->node_zones[0];
+ +	for (; zone < pgdat->node_zones + MAX_NR_ZONES - 1; zone++) {
+ +		if (zone->wait_table) {
+ +			nr_pages = zone->wait_table_hash_nr_entries
+ +				* sizeof(wait_queue_head_t);
+ +			nr_pages = PAGE_ALIGN(nr_pages) >> PAGE_SHIFT;
+ +			page = virt_to_page(zone->wait_table);
+ +
+ +			for (i = 0; i < nr_pages; i++, page++)
+ +				get_page_bootmem(node, page, NODE_INFO);
+ +		}
+ +	}
+ +
+++=======
+++>>>>>>> 9dcb8b685fc3 (mm: remove per-zone hashtable of bitlock waitqueues)
+  	pfn = pgdat->node_start_pfn;
+  	end_pfn = pgdat_end_pfn(pgdat);
+  
+diff --cc mm/page_alloc.c
+index 0f8b31880f9c,de7c6e43b1c9..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -4498,200 -4966,17 +4498,203 @@@ void __ref build_all_zonelists(pg_data_
+  	else
+  		page_group_by_mobility_disabled = 0;
+  
+ -	pr_info("Built %i zonelists in %s order, mobility grouping %s.  Total pages: %ld\n",
+ -		nr_online_nodes,
+ -		zonelist_order_name[current_zonelist_order],
+ -		page_group_by_mobility_disabled ? "off" : "on",
+ -		vm_total_pages);
+ -#ifdef CONFIG_NUMA
+ -	pr_info("Policy zone: %s\n", zone_names[policy_zone]);
+ -#endif
+ +	printk("Built %i zonelists in %s order, mobility grouping %s.  "
+ +		"Total pages: %ld\n",
+ +			nr_online_nodes,
+ +			zonelist_order_name[current_zonelist_order],
+ +			page_group_by_mobility_disabled ? "off" : "on",
+ +			vm_total_pages);
+ +#ifdef CONFIG_NUMA
+ +	printk("Policy zone: %s\n", zone_names[policy_zone]);
+ +#endif
+ +}
+ +
+ +/*
+++<<<<<<< HEAD
+ + * Helper functions to size the waitqueue hash table.
+ + * Essentially these want to choose hash table sizes sufficiently
+ + * large so that collisions trying to wait on pages are rare.
+ + * But in fact, the number of active page waitqueues on typical
+ + * systems is ridiculously low, less than 200. So this is even
+ + * conservative, even though it seems large.
+ + *
+ + * The constant PAGES_PER_WAITQUEUE specifies the ratio of pages to
+ + * waitqueues, i.e. the size of the waitq table given the number of pages.
+ + */
+ +#define PAGES_PER_WAITQUEUE	256
+ +
+ +#ifndef CONFIG_MEMORY_HOTPLUG
+ +static inline unsigned long wait_table_hash_nr_entries(unsigned long pages)
+ +{
+ +	unsigned long size = 1;
+ +
+ +	pages /= PAGES_PER_WAITQUEUE;
+ +
+ +	while (size < pages)
+ +		size <<= 1;
+ +
+ +	/*
+ +	 * Once we have dozens or even hundreds of threads sleeping
+ +	 * on IO we've got bigger problems than wait queue collision.
+ +	 * Limit the size of the wait table to a reasonable size.
+ +	 */
+ +	size = min(size, 4096UL);
+ +
+ +	return max(size, 4UL);
+ +}
+ +#else
+ +/*
+ + * A zone's size might be changed by hot-add, so it is not possible to determine
+ + * a suitable size for its wait_table.  So we use the maximum size now.
+ + *
+ + * The max wait table size = 4096 x sizeof(wait_queue_head_t).   ie:
+ + *
+ + *    i386 (preemption config)    : 4096 x 16 = 64Kbyte.
+ + *    ia64, x86-64 (no preemption): 4096 x 20 = 80Kbyte.
+ + *    ia64, x86-64 (preemption)   : 4096 x 24 = 96Kbyte.
+ + *
+ + * The maximum entries are prepared when a zone's memory is (512K + 256) pages
+ + * or more by the traditional way. (See above).  It equals:
+ + *
+ + *    i386, x86-64, powerpc(4K page size) : =  ( 2G + 1M)byte.
+ + *    ia64(16K page size)                 : =  ( 8G + 4M)byte.
+ + *    powerpc (64K page size)             : =  (32G +16M)byte.
+ + */
+ +static inline unsigned long wait_table_hash_nr_entries(unsigned long pages)
+ +{
+ +	return 4096UL;
+ +}
+ +#endif
+ +
+ +/*
+ + * This is an integer logarithm so that shifts can be used later
+ + * to extract the more random high bits from the multiplicative
+ + * hash function before the remainder is taken.
+ + */
+ +static inline unsigned long wait_table_bits(unsigned long size)
+ +{
+ +	return ffz(~size);
+ +}
+ +
+ +#define LONG_ALIGN(x) (((x)+(sizeof(long))-1)&~((sizeof(long))-1))
+ +
+ +/*
+ + * Check if a pageblock contains reserved pages
+ + */
+ +static int pageblock_is_reserved(unsigned long start_pfn, unsigned long end_pfn)
+ +{
+ +	unsigned long pfn;
+ +
+ +	for (pfn = start_pfn; pfn < end_pfn; pfn++) {
+ +		if (!pfn_valid_within(pfn) || PageReserved(pfn_to_page(pfn)))
+ +			return 1;
+ +	}
+ +	return 0;
+ +}
+ +
+ +/*
+ + * Mark a number of pageblocks as MIGRATE_RESERVE. The number
+ + * of blocks reserved is based on min_wmark_pages(zone). The memory within
+ + * the reserve will tend to store contiguous free pages. Setting min_free_kbytes
+ + * higher will lead to a bigger reserve which will get freed as contiguous
+ + * blocks as reclaim kicks in
+ + */
+ +static void setup_zone_migrate_reserve(struct zone *zone)
+ +{
+ +	unsigned long start_pfn, pfn, end_pfn, block_end_pfn;
+ +	struct page *page;
+ +	unsigned long block_migratetype;
+ +	int reserve;
+ +	int old_reserve;
+ +
+ +	/*
+ +	 * Get the start pfn, end pfn and the number of blocks to reserve
+ +	 * We have to be careful to be aligned to pageblock_nr_pages to
+ +	 * make sure that we always check pfn_valid for the first page in
+ +	 * the block.
+ +	 */
+ +	start_pfn = zone->zone_start_pfn;
+ +	end_pfn = zone_end_pfn(zone);
+ +	start_pfn = roundup(start_pfn, pageblock_nr_pages);
+ +	reserve = roundup(min_wmark_pages(zone), pageblock_nr_pages) >>
+ +							pageblock_order;
+ +
+ +	/*
+ +	 * Reserve blocks are generally in place to help high-order atomic
+ +	 * allocations that are short-lived. A min_free_kbytes value that
+ +	 * would result in more than 2 reserve blocks for atomic allocations
+ +	 * is assumed to be in place to help anti-fragmentation for the
+ +	 * future allocation of hugepages at runtime.
+ +	 */
+ +	reserve = min(2, reserve);
+ +	old_reserve = zone->nr_migrate_reserve_block;
+ +
+ +	/* When memory hot-add, we almost always need to do nothing */
+ +	if (reserve == old_reserve)
+ +		return;
+ +	zone->nr_migrate_reserve_block = reserve;
+ +
+ +	for (pfn = start_pfn; pfn < end_pfn; pfn += pageblock_nr_pages) {
+ +		if (!early_page_nid_uninitialised(pfn, zone_to_nid(zone)))
+ +			return;
+ +
+ +		if (!pfn_valid(pfn))
+ +			continue;
+ +		page = pfn_to_page(pfn);
+ +
+ +		/* Watch out for overlapping nodes */
+ +		if (page_to_nid(page) != zone_to_nid(zone))
+ +			continue;
+ +
+ +		block_migratetype = get_pageblock_migratetype(page);
+ +
+ +		/* Only test what is necessary when the reserves are not met */
+ +		if (reserve > 0) {
+ +			/*
+ +			 * Blocks with reserved pages will never free, skip
+ +			 * them.
+ +			 */
+ +			block_end_pfn = min(pfn + pageblock_nr_pages, end_pfn);
+ +			if (pageblock_is_reserved(pfn, block_end_pfn))
+ +				continue;
+ +
+ +			/* If this block is reserved, account for it */
+ +			if (block_migratetype == MIGRATE_RESERVE) {
+ +				reserve--;
+ +				continue;
+ +			}
+ +
+ +			/* Suitable for reserving if this block is movable */
+ +			if (block_migratetype == MIGRATE_MOVABLE) {
+ +				set_pageblock_migratetype(page,
+ +							MIGRATE_RESERVE);
+ +				move_freepages_block(zone, page,
+ +							MIGRATE_RESERVE);
+ +				reserve--;
+ +				continue;
+ +			}
+ +		} else if (!old_reserve) {
+ +			/*
+ +			 * At boot time we don't need to scan the whole zone
+ +			 * for turning off MIGRATE_RESERVE.
+ +			 */
+ +			break;
+ +		}
+ +
+ +		/*
+ +		 * If the reserve is met and this is a previous reserved block,
+ +		 * take it back
+ +		 */
+ +		if (block_migratetype == MIGRATE_RESERVE) {
+ +			set_pageblock_migratetype(page, MIGRATE_MOVABLE);
+ +			move_freepages_block(zone, page, MIGRATE_MOVABLE);
+ +		}
+ +	}
+  }
+  
+  /*
+++=======
+++>>>>>>> 9dcb8b685fc3 (mm: remove per-zone hashtable of bitlock waitqueues)
+   * Initially all pages are reserved - free ones are freed
+   * up by free_all_bootmem() once the early boot process is
+   * done. Non-atomic initialization, single-pass.
+@@@ -4980,51 -5232,12 +4983,54 @@@ void __init setup_per_cpu_pageset(void
+  
+  	for_each_populated_zone(zone)
+  		setup_zone_pageset(zone);
+ +}
+ +
+++<<<<<<< HEAD
+ +static noinline __init_refok
+ +int zone_wait_table_init(struct zone *zone, unsigned long zone_size_pages)
+ +{
+ +	int i;
+ +	struct pglist_data *pgdat = zone->zone_pgdat;
+ +	size_t alloc_size;
+ +
+ +	/*
+ +	 * The per-page waitqueue mechanism uses hashed waitqueues
+ +	 * per zone.
+ +	 */
+ +	zone->wait_table_hash_nr_entries =
+ +		 wait_table_hash_nr_entries(zone_size_pages);
+ +	zone->wait_table_bits =
+ +		wait_table_bits(zone->wait_table_hash_nr_entries);
+ +	alloc_size = zone->wait_table_hash_nr_entries
+ +					* sizeof(wait_queue_head_t);
+ +
+ +	if (!slab_is_available()) {
+ +		zone->wait_table = (wait_queue_head_t *)
+ +			alloc_bootmem_node_nopanic(pgdat, alloc_size);
+ +	} else {
+ +		/*
+ +		 * This case means that a zone whose size was 0 gets new memory
+ +		 * via memory hot-add.
+ +		 * But it may be the case that a new node was hot-added.  In
+ +		 * this case vmalloc() will not be able to use this new node's
+ +		 * memory - this wait_table must be initialized to use this new
+ +		 * node itself as well.
+ +		 * To use this new node's memory, further consideration will be
+ +		 * necessary.
+ +		 */
+ +		zone->wait_table = vmalloc(alloc_size);
+ +	}
+ +	if (!zone->wait_table)
+ +		return -ENOMEM;
+ +
+ +	for(i = 0; i < zone->wait_table_hash_nr_entries; ++i)
+ +		init_waitqueue_head(zone->wait_table + i);
+  
+ -	for_each_online_pgdat(pgdat)
+ -		pgdat->per_cpu_nodestats =
+ -			alloc_percpu(struct per_cpu_nodestat);
+ +	return 0;
+  }
+  
+++=======
+++>>>>>>> 9dcb8b685fc3 (mm: remove per-zone hashtable of bitlock waitqueues)
+  static __meminit void zone_pcp_init(struct zone *zone)
+  {
+  	/*
+@@@ -5042,22 -5255,11 +5048,27 @@@
+  
+  int __meminit init_currently_empty_zone(struct zone *zone,
+  					unsigned long zone_start_pfn,
+ -					unsigned long size)
+ +					unsigned long size,
+ +					enum memmap_context context)
+  {
+  	struct pglist_data *pgdat = zone->zone_pgdat;
+++<<<<<<< HEAD
+ +	int ret;
+ +	ret = zone_wait_table_init(zone, size);
+ +	if (ret)
+ +		return ret;
+ +	/*
+ +	 * RHEL: nr_zones is often used to index into the zone_table.
+ +	 * Since there is no array entry for ZONE_DEVICE, and because we
+ +	 * don't support allocations from ZONE_DEVICE, avoid incrementing
+ +	 * nr_zones.
+ +	 */
+ +	if (!is_dev_zone(zone))
+ +		pgdat->nr_zones = zone_idx(zone) + 1;
+++=======
++ 
++ 	pgdat->nr_zones = zone_idx(zone) + 1;
+++>>>>>>> 9dcb8b685fc3 (mm: remove per-zone hashtable of bitlock waitqueues)
+  
+  	zone->zone_start_pfn = zone_start_pfn;
+  
+* Unmerged path include/linux/mmzone.h
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 0268f967b362..d11511658bd5 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -8394,11 +8394,27 @@ LIST_HEAD(task_groups);
+ 
+ DECLARE_PER_CPU(cpumask_var_t, load_balance_mask);
+ 
++#define WAIT_TABLE_BITS 8
++#define WAIT_TABLE_SIZE (1 << WAIT_TABLE_BITS)
++static wait_queue_head_t bit_wait_table[WAIT_TABLE_SIZE] __cacheline_aligned;
++
++wait_queue_head_t *bit_waitqueue(void *word, int bit)
++{
++	const int shift = BITS_PER_LONG == 32 ? 5 : 6;
++	unsigned long val = (unsigned long)word << shift | bit;
++
++	return bit_wait_table + hash_long(val, WAIT_TABLE_BITS);
++}
++EXPORT_SYMBOL(bit_waitqueue);
++
+ void __init sched_init(void)
+ {
+ 	int i, j;
+ 	unsigned long alloc_size = 0, ptr;
+ 
++	for (i = 0; i < WAIT_TABLE_SIZE; i++)
++		init_waitqueue_head(bit_wait_table + i);
++
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 	alloc_size += 2 * nr_cpu_ids * sizeof(void **);
+ #endif
+* Unmerged path kernel/wait.c
+diff --git a/mm/filemap.c b/mm/filemap.c
+index da33af546761..d2b8e9be5285 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -715,9 +715,7 @@ EXPORT_SYMBOL(__page_cache_alloc);
+  */
+ wait_queue_head_t *page_waitqueue(struct page *page)
+ {
+-	const struct zone *zone = page_zone(page);
+-
+-	return &zone->wait_table[hash_ptr(page, zone->wait_table_bits)];
++	return bit_waitqueue(page, 0);
+ }
+ EXPORT_SYMBOL(page_waitqueue);
+ 
+* Unmerged path mm/memory_hotplug.c
+* Unmerged path mm/page_alloc.c
