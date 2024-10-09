@@ -1,0 +1,77 @@
+gfs2: fix infinite loop when checking ail item count before go_inval
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.53.1.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 33dbd1e41a1dd549eb19a29477119d4e29766210
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.53.1.el7/33dbd1e4.failed
+
+Before this patch, the rgrp_go_inval and inode_go_inval functions each
+checked if there were any items left on the ail count (by way of a
+count), and if so, did a withdraw. But the withdraw code now uses
+glocks when changing the file system to read-only status. So we can
+not have glock functions withdrawing or a hang will likely result:
+The glocks can't be serviced by the work_func if the work_func is
+busy doing its own withdraw.
+
+This patch removes the checks from the go_inval functions and adds
+a centralized check in do_xmote to warn about the problem and not
+withdraw, but flag the error so it's eventually caught when the logd
+daemon eventually runs.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Reviewed-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 33dbd1e41a1dd549eb19a29477119d4e29766210)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glops.c
+diff --cc fs/gfs2/glops.c
+index 90b93ba7dd9f,b58924482d9a..000000000000
+--- a/fs/gfs2/glops.c
++++ b/fs/gfs2/glops.c
+@@@ -185,8 -188,7 +185,12 @@@ static void rgrp_go_inval(struct gfs2_g
+  		gfs2_rgrp_brelse(rgd);
+  
+  	WARN_ON_ONCE(!(flags & DIO_METADATA));
+++<<<<<<< HEAD
+ +	gfs2_assert_withdraw(gl->gl_name.ln_sbd, !atomic_read(&gl->gl_ail_count));
+ +	truncate_inode_pages(mapping, 0);
+++=======
++ 	truncate_inode_pages_range(mapping, gl->gl_vm.start, gl->gl_vm.end);
+++>>>>>>> 33dbd1e41a1d (gfs2: fix infinite loop when checking ail item count before go_inval)
+  
+  	if (rgd)
+  		rgd->rd_flags &= ~GFS2_RDF_UPTODATE;
+diff --git a/fs/gfs2/glock.c b/fs/gfs2/glock.c
+index 2fe855e86afc..109ceeea6eff 100644
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@ -579,9 +579,22 @@ __acquires(&gl->gl_lockref.lock)
+ 	spin_unlock(&gl->gl_lockref.lock);
+ 	if (glops->go_sync)
+ 		glops->go_sync(gl);
+-	if (test_bit(GLF_INVALIDATE_IN_PROGRESS, &gl->gl_flags))
++	if (test_bit(GLF_INVALIDATE_IN_PROGRESS, &gl->gl_flags)) {
++		/*
++		 * The call to go_sync should have cleared out the ail list.
++		 * If there are still items, we have a problem. We ought to
++		 * withdraw, but we can't because the withdraw code also uses
++		 * glocks. Warn about the error, dump the glock, then fall
++		 * through and wait for logd to do the withdraw for us.
++		 */
++		if ((atomic_read(&gl->gl_ail_count) != 0) &&
++		    (!cmpxchg(&sdp->sd_log_error, 0, -EIO))) {
++			gfs2_assert_warn(sdp, !atomic_read(&gl->gl_ail_count));
++			gfs2_dump_glock(NULL, gl, true);
++		}
+ 		glops->go_inval(gl, target == LM_ST_DEFERRED ? 0 : DIO_METADATA);
+-	clear_bit(GLF_INVALIDATE_IN_PROGRESS, &gl->gl_flags);
++		clear_bit(GLF_INVALIDATE_IN_PROGRESS, &gl->gl_flags);
++	}
+ 
+ 	gfs2_glock_hold(gl);
+ 	if (sdp->sd_lockstruct.ls_ops->lm_lock)	{
+* Unmerged path fs/gfs2/glops.c
