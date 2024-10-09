@@ -2941,7 +2941,7 @@ static int hpsa_scsi_do_inquiry(struct ctlr_info *h, unsigned char *scsi3addr,
 		goto out;
 	}
 	rc = hpsa_scsi_do_simple_cmd_with_retry(h, c,
-					PCI_DMA_FROMDEVICE, DEFAULT_TIMEOUT);
+					PCI_DMA_FROMDEVICE, NO_TIMEOUT);
 	if (rc)
 		goto out;
 	ei = c->err_info;
@@ -3225,7 +3225,7 @@ static int hpsa_get_raid_map(struct ctlr_info *h,
 		return -1;
 	}
 	rc = hpsa_scsi_do_simple_cmd_with_retry(h, c,
-					PCI_DMA_FROMDEVICE, DEFAULT_TIMEOUT);
+					PCI_DMA_FROMDEVICE, NO_TIMEOUT);
 	if (rc)
 		goto out;
 	ei = c->err_info;
@@ -3268,7 +3268,7 @@ static int hpsa_bmic_sense_subsystem_information(struct ctlr_info *h,
 	c->Request.CDB[9] = (bmic_device_index >> 8) & 0xff;
 
 	rc = hpsa_scsi_do_simple_cmd_with_retry(h, c,
-				PCI_DMA_FROMDEVICE, DEFAULT_TIMEOUT);
+				PCI_DMA_FROMDEVICE, NO_TIMEOUT);
 	if (rc)
 		goto out;
 	ei = c->err_info;
@@ -3296,7 +3296,7 @@ static int hpsa_bmic_id_controller(struct ctlr_info *h,
 		goto out;
 
 	rc = hpsa_scsi_do_simple_cmd_with_retry(h, c,
-		PCI_DMA_FROMDEVICE, DEFAULT_TIMEOUT);
+		PCI_DMA_FROMDEVICE, NO_TIMEOUT);
 	if (rc)
 		goto out;
 	ei = c->err_info;
@@ -3327,7 +3327,7 @@ static int hpsa_bmic_id_physical_device(struct ctlr_info *h,
 	c->Request.CDB[9] = (bmic_device_index >> 8) & 0xff;
 
 	hpsa_scsi_do_simple_cmd_with_retry(h, c, PCI_DMA_FROMDEVICE,
-						DEFAULT_TIMEOUT);
+						NO_TIMEOUT);
 	ei = c->err_info;
 	if (ei->CommandStatus != 0 && ei->CommandStatus != CMD_DATA_UNDERRUN) {
 		hpsa_scsi_interpret_error(h, c);
@@ -3395,7 +3395,7 @@ static void hpsa_get_enclosure_info(struct ctlr_info *h,
 		c->Request.CDB[5] = 0;
 
 	rc = hpsa_scsi_do_simple_cmd_with_retry(h, c, PCI_DMA_FROMDEVICE,
-						DEFAULT_TIMEOUT);
+						NO_TIMEOUT);
 	if (rc)
 		goto out;
 
@@ -3611,7 +3611,7 @@ static int hpsa_scsi_do_report_luns(struct ctlr_info *h, int logical,
 	if (extended_response)
 		c->Request.CDB[1] = extended_response;
 	rc = hpsa_scsi_do_simple_cmd_with_retry(h, c,
-					PCI_DMA_FROMDEVICE, DEFAULT_TIMEOUT);
+					PCI_DMA_FROMDEVICE, NO_TIMEOUT);
 	if (rc)
 		goto out;
 	ei = c->err_info;
@@ -3743,7 +3743,7 @@ static unsigned char hpsa_volume_offline(struct ctlr_info *h,
 
 	(void) fill_cmd(c, TEST_UNIT_READY, h, NULL, 0, 0, scsi3addr, TYPE_CMD);
 	rc = hpsa_scsi_do_simple_cmd(h, c, DEFAULT_REPLY_QUEUE,
-					DEFAULT_TIMEOUT);
+					NO_TIMEOUT);
 	if (rc) {
 		cmd_free(h, c);
 		return HPSA_VPD_LV_STATUS_UNSUPPORTED;
@@ -9220,7 +9220,7 @@ static void hpsa_disable_rld_caching(struct ctlr_info *h)
 		goto errout;
 
 	rc = hpsa_scsi_do_simple_cmd_with_retry(h, c,
-		PCI_DMA_FROMDEVICE, DEFAULT_TIMEOUT);
+		PCI_DMA_FROMDEVICE, NO_TIMEOUT);
 	if ((rc != 0) || (c->err_info->CommandStatus != 0))
 		goto errout;
 
@@ -9232,7 +9232,7 @@ static void hpsa_disable_rld_caching(struct ctlr_info *h)
 		goto errout;
 
 	rc = hpsa_scsi_do_simple_cmd_with_retry(h, c,
-		PCI_DMA_TODEVICE, DEFAULT_TIMEOUT);
+		PCI_DMA_TODEVICE, NO_TIMEOUT);
 	if ((rc != 0)  || (c->err_info->CommandStatus != 0))
 		goto errout;
 
@@ -9242,7 +9242,7 @@ static void hpsa_disable_rld_caching(struct ctlr_info *h)
 		goto errout;
 
 	rc = hpsa_scsi_do_simple_cmd_with_retry(h, c,
-		PCI_DMA_FROMDEVICE, DEFAULT_TIMEOUT);
+		PCI_DMA_FROMDEVICE, NO_TIMEOUT);
 	if ((rc != 0)  || (c->err_info->CommandStatus != 0))
 		goto errout;
 
