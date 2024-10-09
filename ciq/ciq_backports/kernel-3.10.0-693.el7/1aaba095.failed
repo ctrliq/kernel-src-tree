@@ -1,0 +1,173 @@
+dax: don't pass buffer_head to dax_insert_mapping
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 1aaba0958ed371bd121751d74d98f2a76395edad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1aaba095.failed
+
+This way we can use this helper for the iomap based DAX implementation
+as well.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 1aaba0958ed371bd121751d74d98f2a76395edad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+diff --cc fs/dax.c
+index 3ad95e9ec809,98463bb9827c..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -566,55 -789,28 +566,66 @@@ int dax_writeback_mapping_range(struct 
+  }
+  EXPORT_SYMBOL_GPL(dax_writeback_mapping_range);
+  
+++<<<<<<< HEAD
+ +static int dax_insert_mapping(struct inode *inode, struct buffer_head *bh,
+ +			struct vm_area_struct *vma, struct vm_fault *vmf)
+ +{
+ +	unsigned long vaddr = (unsigned long)vmf->virtual_address;
+ +	struct address_space *mapping = inode->i_mapping;
+ +	struct block_device *bdev = bh->b_bdev;
+ +	struct blk_dax_ctl dax = {
+ +		.sector = to_sector(bh, inode),
+ +		.size = bh->b_size,
+++=======
++ static int dax_insert_mapping(struct address_space *mapping,
++ 		struct block_device *bdev, sector_t sector, size_t size,
++ 		void **entryp, struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	unsigned long vaddr = (unsigned long)vmf->virtual_address;
++ 	struct blk_dax_ctl dax = {
++ 		.sector = sector,
++ 		.size = size,
+++>>>>>>> 1aaba0958ed3 (dax: don't pass buffer_head to dax_insert_mapping)
+  	};
+ -	void *ret;
+ -	void *entry = *entryp;
+ +	pgoff_t size;
+ +	int error;
+  
+ -	if (dax_map_atomic(bdev, &dax) < 0)
+ -		return PTR_ERR(dax.addr);
+ +	mutex_lock(&mapping->i_mmap_mutex);
+ +
+ +	/*
+ +	 * Check truncate didn't happen while we were allocating a block.
+ +	 * If it did, this block may or may not be still allocated to the
+ +	 * file.  We can't tell the filesystem to free it because we can't
+ +	 * take i_mutex here.  In the worst case, the file still has blocks
+ +	 * allocated past the end of the file.
+ +	 */
+ +	size = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
+ +	if (unlikely(vmf->pgoff >= size)) {
+ +		error = -EIO;
+ +		goto out;
+ +	}
+ +
+ +	if (dax_map_atomic(bdev, &dax) < 0) {
+ +		error = PTR_ERR(dax.addr);
+ +		goto out;
+ +	}
+ +
+ +	if (buffer_unwritten(bh) || buffer_new(bh)) {
+ +		clear_pmem(dax.addr, PAGE_SIZE);
+ +	}
+  	dax_unmap_atomic(bdev, &dax);
+  
+ -	ret = dax_insert_mapping_entry(mapping, vmf, entry, dax.sector);
+ -	if (IS_ERR(ret))
+ -		return PTR_ERR(ret);
+ -	*entryp = ret;
+ +	error = dax_radix_entry(mapping, vmf->pgoff, dax.sector, false,
+ +			vmf->flags & FAULT_FLAG_WRITE);
+ +	if (error)
+ +		goto out;
+ +
+ +	error = vm_insert_mixed(vma, vaddr, dax.pfn);
+ +
+ + out:
+ +	mutex_unlock(&mapping->i_mmap_mutex);
+  
+ -	return vm_insert_mixed(vma, vaddr, dax.pfn);
+ +	return error;
+  }
+  
+  /**
+@@@ -701,60 -895,12 +712,69 @@@ int __dax_fault(struct vm_area_struct *
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	if (vmf->cow_page) {
+ +		struct page *new_page = vmf->cow_page;
+ +		if (buffer_written(&bh))
+ +			error = copy_user_bh(new_page, inode, &bh, vaddr);
+ +		else
+ +			clear_user_highpage(new_page, vaddr);
+ +		if (error)
+ +			goto unlock_page;
+ +		vmf->page = page;
+ +		if (!page) {
+ +			mutex_lock(&mapping->i_mmap_mutex);
+ +			/* Check we didn't race with truncate */
+ +			size = (i_size_read(inode) + PAGE_SIZE - 1) >>
+ +								PAGE_SHIFT;
+ +			if (vmf->pgoff >= size) {
+ +				mutex_unlock(&mapping->i_mmap_mutex);
+ +				error = -EIO;
+ +				goto out;
+ +			}
+ +		}
+ +		return VM_FAULT_LOCKED;
+ +	}
+ +
+ +	/* Check we didn't race with a read fault installing a new page */
+ +	if (!page && major)
+ +		page = find_lock_page(mapping, vmf->pgoff);
+ +
+ +	if (page) {
+ +		unmap_mapping_range(mapping, vmf->pgoff << PAGE_SHIFT,
+ +							PAGE_CACHE_SIZE, 0);
+ +		delete_from_page_cache(page);
+ +		unlock_page(page);
+ +		page_cache_release(page);
+ +		page = NULL;
+ +	}
+ +
+ +	/*
+ +	 * If we successfully insert the new mapping over an unwritten extent,
+ +	 * we need to ensure we convert the unwritten extent. If there is an
+ +	 * error inserting the mapping, the filesystem needs to leave it as
+ +	 * unwritten to prevent exposure of the stale underlying data to
+ +	 * userspace, but we still need to call the completion function so
+ +	 * the private resources on the mapping buffer can be released. We
+ +	 * indicate what the callback should do via the uptodate variable, same
+ +	 * as for normal BH based IO completions.
+ +	 */
+ +	error = dax_insert_mapping(inode, &bh, vma, vmf);
+ +	if (buffer_unwritten(&bh)) {
+ +		if (complete_unwritten)
+ +			complete_unwritten(&bh, !error);
+ +		else
+ +			WARN_ON_ONCE(!(vmf->flags & FAULT_FLAG_WRITE));
+ +	}
+ +
+++=======
++ 	/* Filesystem should not return unwritten buffers to us! */
++ 	WARN_ON_ONCE(buffer_unwritten(&bh) || buffer_new(&bh));
++ 	error = dax_insert_mapping(mapping, bh.b_bdev, to_sector(&bh, inode),
++ 			bh.b_size, &entry, vma, vmf);
++  unlock_entry:
++ 	put_locked_mapping_entry(mapping, vmf->pgoff, entry);
+++>>>>>>> 1aaba0958ed3 (dax: don't pass buffer_head to dax_insert_mapping)
+   out:
+  	if (error == -ENOMEM)
+  		return VM_FAULT_OOM | major;
+* Unmerged path fs/dax.c
