@@ -1,0 +1,154 @@
+mm, vmalloc: properly track vmalloc users
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [mm] vmalloc: properly track vmalloc users (Don Dutile) [1511159]
+Rebuild_FUZZ: 94.87%
+commit-author Michal Hocko <mhocko@suse.com>
+commit 1f5307b1e094bfffa83c65c40ac6e3415c108780
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1f5307b1.failed
+
+__vmalloc_node_flags used to be static inline but this has changed by
+"mm: introduce kv[mz]alloc helpers" because kvmalloc_node needs to use
+it as well and the code is outside of the vmalloc proper.  I haven't
+realized that changing this will lead to a subtle bug though.  The
+function is responsible to track the caller as well.  This caller is
+then printed by /proc/vmallocinfo.  If __vmalloc_node_flags is not
+inline then we would get only direct users of __vmalloc_node_flags as
+callers (e.g.  v[mz]alloc) which reduces usefulness of this debugging
+feature considerably.  It simply doesn't help to see that the given
+range belongs to vmalloc as a caller:
+
+  0xffffc90002c79000-0xffffc90002c7d000   16384 vmalloc+0x16/0x18 pages=3 vmalloc N0=3
+  0xffffc90002c81000-0xffffc90002c85000   16384 vmalloc+0x16/0x18 pages=3 vmalloc N1=3
+  0xffffc90002c8d000-0xffffc90002c91000   16384 vmalloc+0x16/0x18 pages=3 vmalloc N1=3
+  0xffffc90002c95000-0xffffc90002c99000   16384 vmalloc+0x16/0x18 pages=3 vmalloc N1=3
+
+We really want to catch the _caller_ of the vmalloc function.  Fix this
+issue by making __vmalloc_node_flags static inline again.
+
+Link: http://lkml.kernel.org/r/20170502134657.12381-1-mhocko@kernel.org
+	Signed-off-by: Michal Hocko <mhocko@suse.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 1f5307b1e094bfffa83c65c40ac6e3415c108780)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/vmalloc.h
+#	mm/vmalloc.c
+diff --cc include/linux/vmalloc.h
+index dd0a2c810529,0328ce003992..000000000000
+--- a/include/linux/vmalloc.h
++++ b/include/linux/vmalloc.h
+@@@ -4,7 -4,9 +4,8 @@@
+  #include <linux/spinlock.h>
+  #include <linux/init.h>
+  #include <linux/list.h>
+ -#include <linux/llist.h>
+  #include <asm/page.h>		/* pgprot_t */
++ #include <asm/pgtable.h>	/* PAGE_KERNEL */
+  #include <linux/rbtree.h>
+  
+  struct vm_area_struct;		/* vma defining user mapping in mm_types.h */
+@@@ -75,8 -79,30 +76,33 @@@ extern void *vmalloc_32_user(unsigned l
+  extern void *__vmalloc(unsigned long size, gfp_t gfp_mask, pgprot_t prot);
+  extern void *__vmalloc_node_range(unsigned long size, unsigned long align,
+  			unsigned long start, unsigned long end, gfp_t gfp_mask,
+++<<<<<<< HEAD
+ +			pgprot_t prot, int node, const void *caller);
+++=======
++ 			pgprot_t prot, unsigned long vm_flags, int node,
++ 			const void *caller);
++ #ifndef CONFIG_MMU
++ extern void *__vmalloc_node_flags(unsigned long size, int node, gfp_t flags);
++ #else
++ extern void *__vmalloc_node(unsigned long size, unsigned long align,
++ 			    gfp_t gfp_mask, pgprot_t prot,
++ 			    int node, const void *caller);
++ 
++ /*
++  * We really want to have this inlined due to caller tracking. This
++  * function is used by the highlevel vmalloc apis and so we want to track
++  * their callers and inlining will achieve that.
++  */
++ static inline void *__vmalloc_node_flags(unsigned long size,
++ 					int node, gfp_t flags)
++ {
++ 	return __vmalloc_node(size, 1, flags, PAGE_KERNEL,
++ 					node, __builtin_return_address(0));
++ }
++ #endif
++ 
+++>>>>>>> 1f5307b1e094 (mm, vmalloc: properly track vmalloc users)
+  extern void vfree(const void *addr);
+ -extern void vfree_atomic(const void *addr);
+  
+  extern void *vmap(struct page **pages, unsigned int count,
+  			unsigned long flags, pgprot_t prot);
+diff --cc mm/vmalloc.c
+index ce089619f50a,717b1e8b942c..000000000000
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@@ -1598,18 -1649,15 +1598,15 @@@ void *vmap(struct page **pages, unsigne
+  }
+  EXPORT_SYMBOL(vmap);
+  
+- static void *__vmalloc_node(unsigned long size, unsigned long align,
+- 			    gfp_t gfp_mask, pgprot_t prot,
+- 			    int node, const void *caller);
+  static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
+ -				 pgprot_t prot, int node)
+ +				 pgprot_t prot, int node, const void *caller)
+  {
+ +	const int order = 0;
+  	struct page **pages;
+  	unsigned int nr_pages, array_size, i;
+ -	const gfp_t nested_gfp = (gfp_mask & GFP_RECLAIM_MASK) | __GFP_ZERO;
+ -	const gfp_t alloc_mask = gfp_mask | __GFP_NOWARN;
+ +	gfp_t nested_gfp = (gfp_mask & GFP_RECLAIM_MASK) | __GFP_ZERO;
+  
+ -	nr_pages = get_vm_area_size(area) >> PAGE_SHIFT;
+ +	nr_pages = (area->size - PAGE_SIZE) >> PAGE_SHIFT;
+  	array_size = (nr_pages * sizeof(struct page *));
+  
+  	area->nr_pages = nr_pages;
+@@@ -1729,8 -1783,15 +1726,8 @@@ fail
+   *	Allocate enough pages to cover @size from the page level
+   *	allocator with @gfp_mask flags.  Map them into contiguous
+   *	kernel virtual space, using a pagetable protection of @prot.
+ - *
+ - *	Reclaim modifiers in @gfp_mask - __GFP_NORETRY, __GFP_REPEAT
+ - *	and __GFP_NOFAIL are not supported
+ - *
+ - *	Any use of gfp flags outside of GFP_KERNEL should be consulted
+ - *	with mm people.
+ - *
+   */
+- static void *__vmalloc_node(unsigned long size, unsigned long align,
++ void *__vmalloc_node(unsigned long size, unsigned long align,
+  			    gfp_t gfp_mask, pgprot_t prot,
+  			    int node, const void *caller)
+  {
+@@@ -1745,13 -1806,6 +1742,16 @@@ void *__vmalloc(unsigned long size, gfp
+  }
+  EXPORT_SYMBOL(__vmalloc);
+  
+++<<<<<<< HEAD
+ +static inline void *__vmalloc_node_flags(unsigned long size,
+ +					int node, gfp_t flags)
+ +{
+ +	return __vmalloc_node(size, 1, flags, PAGE_KERNEL,
+ +					node, __builtin_return_address(0));
+ +}
+ +
+++=======
+++>>>>>>> 1f5307b1e094 (mm, vmalloc: properly track vmalloc users)
+  /**
+   *	vmalloc  -  allocate virtually contiguous memory
+   *	@size:		allocation size
+* Unmerged path include/linux/vmalloc.h
+* Unmerged path mm/vmalloc.c
