@@ -1,0 +1,304 @@
+net/mlx5e: Support XDP over Striding RQ
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Support XDP over Striding RQ (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 94.59%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit 22f4539881944a8acc9c6f5afa7aa7f028898002
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/22f45398.failed
+
+Add XDP support over Striding RQ.
+Now that linear SKB is supported over Striding RQ,
+we can support XDP by setting stride size to PAGE_SIZE
+and headroom to XDP_PACKET_HEADROOM.
+
+Upon a MPWQE free, do not release pages that are being
+XDP xmit, they will be released upon completions.
+
+Striding RQ is capable of a higher packet-rate than
+conventional RQ.
+A performance gain is expected for all cases that had
+a HW packet-rate bottleneck. This is the case whenever
+using many flows that distribute to many cores.
+
+Performance testing:
+ConnectX-5, 24 rings, default MTU.
+CQE compression ON (to reduce completions BW in PCI).
+
+XDP_DROP packet rate:
+--------------------------------------------------
+| pkt size | XDP rate   | 100GbE linerate | pct% |
+--------------------------------------------------
+|   64byte | 126.2 Mpps |      148.0 Mpps |  85% |
+|  128byte |  80.0 Mpps |       84.8 Mpps |  94% |
+|  256byte |  42.7 Mpps |       42.7 Mpps | 100% |
+|  512byte |  23.4 Mpps |       23.4 Mpps | 100% |
+--------------------------------------------------
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 22f4539881944a8acc9c6f5afa7aa7f028898002)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index 95481ee556bb,1da79cab1838..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -349,73 -347,18 +349,76 @@@ mlx5e_copy_skb_header_mpwqe(struct devi
+  	}
+  }
+  
+ +static inline void mlx5e_post_umr_wqe(struct mlx5e_rq *rq, u16 ix)
+ +{
+ +	struct mlx5e_mpw_info *wi = &rq->mpwqe.info[ix];
+ +	struct mlx5e_icosq *sq = &rq->channel->icosq;
+ +	struct mlx5_wq_cyc *wq = &sq->wq;
+ +	struct mlx5e_umr_wqe *wqe;
+ +	u8 num_wqebbs = DIV_ROUND_UP(sizeof(*wqe), MLX5_SEND_WQE_BB);
+ +	u16 pi;
+ +
+ +	/* fill sq edge with nops to avoid wqe wrap around */
+ +	while ((pi = (sq->pc & wq->sz_m1)) > sq->edge) {
+ +		sq->db.ico_wqe[pi].opcode = MLX5_OPCODE_NOP;
+ +		mlx5e_post_nop(wq, sq->sqn, &sq->pc);
+ +	}
+ +
+ +	wqe = mlx5_wq_cyc_get_wqe(wq, pi);
+ +	memcpy(wqe, &wi->umr.wqe, sizeof(*wqe));
+ +	wqe->ctrl.opmod_idx_opcode =
+ +		cpu_to_be32((sq->pc << MLX5_WQE_CTRL_WQE_INDEX_SHIFT) |
+ +			    MLX5_OPCODE_UMR);
+ +
+ +	sq->db.ico_wqe[pi].opcode = MLX5_OPCODE_UMR;
+ +	sq->pc += num_wqebbs;
+ +	mlx5e_notify_hw(&sq->wq, sq->pc, sq->uar_map, &wqe->ctrl);
+ +}
+ +
+ +static int mlx5e_alloc_rx_umr_mpwqe(struct mlx5e_rq *rq,
+ +				    u16 ix)
+ +{
+ +	struct mlx5e_mpw_info *wi = &rq->mpwqe.info[ix];
+ +	int pg_strides = mlx5e_mpwqe_strides_per_page(rq);
+ +	struct mlx5e_dma_info *dma_info = &wi->umr.dma_info[0];
+ +	int err;
+ +	int i;
+ +
+ +	for (i = 0; i < MLX5_MPWRQ_PAGES_PER_WQE; i++, dma_info++) {
+ +		err = mlx5e_page_alloc_mapped(rq, dma_info);
+ +		if (unlikely(err))
+ +			goto err_unmap;
+ +		wi->umr.mtt[i] = cpu_to_be64(dma_info->addr | MLX5_EN_WR);
+ +		page_ref_add(dma_info->page, pg_strides);
+ +	}
+ +
+ +	memset(wi->skbs_frags, 0, sizeof(*wi->skbs_frags) * MLX5_MPWRQ_PAGES_PER_WQE);
+ +	wi->consumed_strides = 0;
+ +
+ +	return 0;
+ +
+ +err_unmap:
+ +	while (--i >= 0) {
+ +		dma_info--;
+ +		page_ref_sub(dma_info->page, pg_strides);
+ +		mlx5e_page_release(rq, dma_info, true);
+ +	}
+ +
+ +	return err;
+ +}
+ +
+  void mlx5e_free_rx_mpwqe(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi)
+  {
++ 	const bool no_xdp_xmit =
++ 		bitmap_empty(wi->xdp_xmit_bitmap, MLX5_MPWRQ_PAGES_PER_WQE);
+  	int pg_strides = mlx5e_mpwqe_strides_per_page(rq);
+- 	struct mlx5e_dma_info *dma_info = &wi->umr.dma_info[0];
++ 	struct mlx5e_dma_info *dma_info = wi->umr.dma_info;
+  	int i;
+  
+- 	for (i = 0; i < MLX5_MPWRQ_PAGES_PER_WQE; i++, dma_info++) {
+- 		page_ref_sub(dma_info->page, pg_strides - wi->skbs_frags[i]);
+- 		mlx5e_page_release(rq, dma_info, true);
++ 	for (i = 0; i < MLX5_MPWRQ_PAGES_PER_WQE; i++) {
++ 		page_ref_sub(dma_info[i].page, pg_strides - wi->skbs_frags[i]);
++ 		if (no_xdp_xmit || !test_bit(i, wi->xdp_xmit_bitmap))
++ 			mlx5e_page_release(rq, &dma_info[i], true);
+  	}
+  }
+  
+@@@ -436,16 -379,58 +439,34 @@@ static void mlx5e_post_rx_mpwqe(struct 
+  
+  static int mlx5e_alloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix)
+  {
+ -	struct mlx5e_mpw_info *wi = &rq->mpwqe.info[ix];
+ -	int pg_strides = mlx5e_mpwqe_strides_per_page(rq);
+ -	struct mlx5e_dma_info *dma_info = &wi->umr.dma_info[0];
+ -	struct mlx5e_icosq *sq = &rq->channel->icosq;
+ -	struct mlx5_wq_cyc *wq = &sq->wq;
+ -	struct mlx5e_umr_wqe *umr_wqe;
+ -	int cpy = offsetof(struct mlx5e_umr_wqe, inline_mtts);
+  	int err;
+ -	u16 pi;
+ -	int i;
+  
+ -	/* fill sq edge with nops to avoid wqe wrap around */
+ -	while ((pi = (sq->pc & wq->sz_m1)) > sq->edge) {
+ -		sq->db.ico_wqe[pi].opcode = MLX5_OPCODE_NOP;
+ -		mlx5e_post_nop(wq, sq->sqn, &sq->pc);
+ +	err = mlx5e_alloc_rx_umr_mpwqe(rq, ix);
+ +	if (unlikely(err)) {
+ +		rq->stats->buff_alloc_err++;
+ +		return err;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	umr_wqe = mlx5_wq_cyc_get_wqe(wq, pi);
++ 	memcpy(umr_wqe, &wi->umr.wqe, cpy);
++ 	for (i = 0; i < MLX5_MPWRQ_PAGES_PER_WQE; i++, dma_info++) {
++ 		err = mlx5e_page_alloc_mapped(rq, dma_info);
++ 		if (unlikely(err))
++ 			goto err_unmap;
++ 		umr_wqe->inline_mtts[i].ptag = cpu_to_be64(dma_info->addr | MLX5_EN_WR);
++ 		page_ref_add(dma_info->page, pg_strides);
++ 	}
++ 
++ 	memset(wi->skbs_frags, 0, sizeof(*wi->skbs_frags) * MLX5_MPWRQ_PAGES_PER_WQE);
++ 	bitmap_zero(wi->xdp_xmit_bitmap, MLX5_MPWRQ_PAGES_PER_WQE);
++ 	wi->consumed_strides = 0;
++ 
+++>>>>>>> 22f453988194 (net/mlx5e: Support XDP over Striding RQ)
+  	rq->mpwqe.umr_in_progress = true;
+ -
+ -	umr_wqe->ctrl.opmod_idx_opcode =
+ -		cpu_to_be32((sq->pc << MLX5_WQE_CTRL_WQE_INDEX_SHIFT) |
+ -			    MLX5_OPCODE_UMR);
+ -
+ -	sq->db.ico_wqe[pi].opcode = MLX5_OPCODE_UMR;
+ -	sq->pc += MLX5E_UMR_WQEBBS;
+ -	mlx5e_notify_hw(&sq->wq, sq->pc, sq->uar_map, &umr_wqe->ctrl);
+ -
+ +	mlx5e_post_umr_wqe(rq, ix);
+  	return 0;
+ -
+ -err_unmap:
+ -	while (--i >= 0) {
+ -		dma_info--;
+ -		page_ref_sub(dma_info->page, pg_strides);
+ -		mlx5e_page_release(rq, dma_info, true);
+ -	}
+ -	rq->stats.buff_alloc_err++;
+ -
+ -	return err;
+  }
+  
+  void mlx5e_dealloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix)
+@@@ -1027,6 -1022,47 +1048,50 @@@ static inline void mlx5e_mpwqe_fill_rx_
+  	/* skb linear part was allocated with headlen and aligned to long */
+  	skb->tail += headlen;
+  	skb->len  += headlen;
+++<<<<<<< HEAD
+++=======
++ 
++ 	return skb;
++ }
++ 
++ struct sk_buff *
++ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
++ 				u16 cqe_bcnt, u32 head_offset, u32 page_idx)
++ {
++ 	struct mlx5e_dma_info *di = &wi->umr.dma_info[page_idx];
++ 	u16 rx_headroom = rq->buff.headroom;
++ 	u32 cqe_bcnt32 = cqe_bcnt;
++ 	struct sk_buff *skb;
++ 	void *va, *data;
++ 	u32 frag_size;
++ 	bool consumed;
++ 
++ 	va             = page_address(di->page) + head_offset;
++ 	data           = va + rx_headroom;
++ 	frag_size      = MLX5_SKB_FRAG_SZ(rx_headroom + cqe_bcnt32);
++ 
++ 	dma_sync_single_range_for_cpu(rq->pdev, di->addr, head_offset,
++ 				      frag_size, DMA_FROM_DEVICE);
++ 	prefetch(data);
++ 
++ 	rcu_read_lock();
++ 	consumed = mlx5e_xdp_handle(rq, di, va, &rx_headroom, &cqe_bcnt32);
++ 	rcu_read_unlock();
++ 	if (consumed) {
++ 		if (__test_and_clear_bit(MLX5E_RQ_FLAG_XDP_XMIT, rq->flags))
++ 			__set_bit(page_idx, wi->xdp_xmit_bitmap); /* non-atomic */
++ 		return NULL; /* page/packet was consumed by XDP */
++ 	}
++ 
++ 	skb = mlx5e_build_linear_skb(rq, va, frag_size, rx_headroom, cqe_bcnt32);
++ 	if (unlikely(!skb))
++ 		return NULL;
++ 
++ 	/* queue up for recycling/reuse */
++ 	wi->skbs_frags[page_idx]++;
++ 
++ 	return skb;
+++>>>>>>> 22f453988194 (net/mlx5e: Support XDP over Striding RQ)
+  }
+  
+  void mlx5e_handle_rx_cqe_mpwrq(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
+@@@ -1050,18 -1090,13 +1115,26 @@@
+  		goto mpwrq_cqe_out;
+  	}
+  
+ +	skb = napi_alloc_skb(rq->cq.napi,
+ +			     ALIGN(MLX5_MPWRQ_SMALL_PACKET_THRESHOLD,
+ +				   sizeof(long)));
+ +	if (unlikely(!skb)) {
+ +		rq->stats->buff_alloc_err++;
+ +		goto mpwrq_cqe_out;
+ +	}
+ +
+ +	prefetchw(skb->data);
+  	cqe_bcnt = mpwrq_get_cqe_byte_cnt(cqe);
+  
+++<<<<<<< HEAD
+ +	mlx5e_mpwqe_fill_rx_skb(rq, cqe, wi, cqe_bcnt, skb);
+++=======
++ 	skb = rq->mpwqe.skb_from_cqe_mpwrq(rq, wi, cqe_bcnt, head_offset,
++ 					   page_idx);
++ 	if (!skb)
++ 		goto mpwrq_cqe_out;
++ 
+++>>>>>>> 22f453988194 (net/mlx5e: Support XDP over Striding RQ)
+  	mlx5e_complete_rx_cqe(rq, cqe, cqe_bcnt, skb);
+  	napi_gro_receive(rq->cq.napi, skb);
+  
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index efbd1f3dfd48..ae343f198ec6 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -464,6 +464,7 @@ struct mlx5e_mpw_info {
+ 	struct mlx5e_umr_dma_info umr;
+ 	u16 consumed_strides;
+ 	u16 skbs_frags[MLX5_MPWRQ_PAGES_PER_WQE];
++	DECLARE_BITMAP(xdp_xmit_bitmap, MLX5_MPWRQ_PAGES_PER_WQE);
+ };
+ 
+ /* a single cache unit is capable to serve one napi call (for non-striding rq)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 40f65e70ce7f..2404d1c76932 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -143,7 +143,8 @@ bool mlx5e_striding_rq_possible(struct mlx5_core_dev *mdev,
+ 				struct mlx5e_params *params)
+ {
+ 	return mlx5e_check_fragmented_striding_rq_cap(mdev) &&
+-		!params->xdp_prog && !MLX5_IPSEC_DEV(mdev);
++		!MLX5_IPSEC_DEV(mdev) &&
++		!(params->xdp_prog && !mlx5e_rx_mpwqe_is_linear_skb(mdev, params));
+ }
+ 
+ void mlx5e_set_rq_type(struct mlx5_core_dev *mdev, struct mlx5e_params *params)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
