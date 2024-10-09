@@ -1,0 +1,242 @@
+NFSD: Clean up legacy NFS WRITE argument XDR decoders
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 8154ef2776aa512a3eaa0e7db030dc4803354d61
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/8154ef27.failed
+
+Move common code in NFSD's legacy NFS WRITE decoders into a helper.
+The immediate benefit is reduction of code duplication and some nice
+micro-optimizations (see below).
+
+In the long term, this helper can perform a per-transport call-out
+to fill the rq_vec (say, using RDMA Reads).
+
+The legacy WRITE decoders and procs are changed to work like NFSv4,
+which constructs the rq_vec just before it is about to call
+vfs_writev.
+
+Why? Calling a transport call-out from the proc instead of the XDR
+decoder means that the incoming FH can be resolved to a particular
+filesystem and file. This would allow pages from the backing file to
+be presented to the transport to be filled, rather than presenting
+anonymous pages and copying or flipping them into the file's page
+cache later.
+
+I also prefer using the pages in rq_arg.pages, instead of pulling
+the data pages directly out of the rqstp::rq_pages array. This is
+currently the way the NFSv3 write decoder works, but the other two
+do not seem to take this approach. Fixing this removes the only
+reference to rq_pages found in NFSD, eliminating an NFSD assumption
+about how transports use the pages in rq_pages.
+
+Lastly, avoid setting up the first element of rq_vec as a zero-
+length buffer. This happens with an RDMA transport when a normal
+Read chunk is present because the data payload is in rq_arg's
+page list (none of it is in the head buffer).
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit 8154ef2776aa512a3eaa0e7db030dc4803354d61)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfs3xdr.c
+diff --cc fs/nfsd/nfs3xdr.c
+index 6a1a7aed90cf,e19fc5d8bcb5..000000000000
+--- a/fs/nfsd/nfs3xdr.c
++++ b/fs/nfsd/nfs3xdr.c
+@@@ -353,10 -388,10 +353,15 @@@ nfs3svc_decode_readargs(struct svc_rqs
+  }
+  
+  int
+ -nfs3svc_decode_writeargs(struct svc_rqst *rqstp, __be32 *p)
+ +nfs3svc_decode_writeargs(struct svc_rqst *rqstp, __be32 *p,
+ +					struct nfsd3_writeargs *args)
+  {
+++<<<<<<< HEAD
+ +	unsigned int len, v, hdr, dlen;
+++=======
++ 	struct nfsd3_writeargs *args = rqstp->rq_argp;
++ 	unsigned int len, hdr, dlen;
+++>>>>>>> 8154ef2776aa (NFSD: Clean up legacy NFS WRITE argument XDR decoders)
+  	u32 max_blocksize = svc_max_payload(rqstp);
+  	struct kvec *head = rqstp->rq_arg.head;
+  	struct kvec *tail = rqstp->rq_arg.tail;
+diff --git a/fs/nfsd/nfs3proc.c b/fs/nfsd/nfs3proc.c
+index 5935f296334c..cda1f56c94e9 100644
+--- a/fs/nfsd/nfs3proc.c
++++ b/fs/nfsd/nfs3proc.c
+@@ -184,6 +184,7 @@ nfsd3_proc_write(struct svc_rqst *rqstp, struct nfsd3_writeargs *argp,
+ {
+ 	__be32	nfserr;
+ 	unsigned long cnt = argp->len;
++	unsigned int nvecs;
+ 
+ 	dprintk("nfsd: WRITE(3)    %s %d bytes at %Lu%s\n",
+ 				SVCFH_fmt(&argp->fh),
+@@ -193,9 +194,12 @@ nfsd3_proc_write(struct svc_rqst *rqstp, struct nfsd3_writeargs *argp,
+ 
+ 	fh_copy(&resp->fh, &argp->fh);
+ 	resp->committed = argp->stable;
++	nvecs = svc_fill_write_vector(rqstp, &argp->first, cnt);
++	if (!nvecs)
++		RETURN_STATUS(nfserr_io);
+ 	nfserr = nfsd_write(rqstp, &resp->fh, argp->offset,
+-				rqstp->rq_vec, argp->vlen,
+-				&cnt, resp->committed);
++			    rqstp->rq_vec, nvecs, &cnt,
++			    resp->committed);
+ 	resp->count = cnt;
+ 	RETURN_STATUS(nfserr);
+ }
+* Unmerged path fs/nfsd/nfs3xdr.c
+diff --git a/fs/nfsd/nfsproc.c b/fs/nfsd/nfsproc.c
+index bf4a56f754ed..c683128a2cf0 100644
+--- a/fs/nfsd/nfsproc.c
++++ b/fs/nfsd/nfsproc.c
+@@ -207,13 +207,18 @@ nfsd_proc_write(struct svc_rqst *rqstp, struct nfsd_writeargs *argp,
+ {
+ 	__be32	nfserr;
+ 	unsigned long cnt = argp->len;
++	unsigned int nvecs;
+ 
+ 	dprintk("nfsd: WRITE    %s %d bytes at %d\n",
+ 		SVCFH_fmt(&argp->fh),
+ 		argp->len, argp->offset);
+ 
+-	nfserr = nfsd_write(rqstp, fh_copy(&resp->fh, &argp->fh), argp->offset,
+-				rqstp->rq_vec, argp->vlen, &cnt, NFS_DATA_SYNC);
++	nvecs = svc_fill_write_vector(rqstp, &argp->first, cnt);
++	if (!nvecs)
++		return nfserr_io;
++	nfserr = nfsd_write(rqstp, fh_copy(&resp->fh, &argp->fh),
++			    argp->offset, rqstp->rq_vec, nvecs,
++			    &cnt, NFS_DATA_SYNC);
+ 	return nfsd_return_attrs(nfserr, resp);
+ }
+ 
+diff --git a/fs/nfsd/nfsxdr.c b/fs/nfsd/nfsxdr.c
+index 8f7b690dd4ae..b8693b0e85c6 100644
+--- a/fs/nfsd/nfsxdr.c
++++ b/fs/nfsd/nfsxdr.c
+@@ -281,7 +281,6 @@ nfssvc_decode_writeargs(struct svc_rqst *rqstp, __be32 *p,
+ {
+ 	unsigned int len, hdr, dlen;
+ 	struct kvec *head = rqstp->rq_arg.head;
+-	int v;
+ 
+ 	p = decode_fh(p, &args->fh);
+ 	if (!p)
+@@ -317,17 +316,8 @@ nfssvc_decode_writeargs(struct svc_rqst *rqstp, __be32 *p,
+ 	if (dlen < XDR_QUADLEN(len)*4)
+ 		return 0;
+ 
+-	rqstp->rq_vec[0].iov_base = (void*)p;
+-	rqstp->rq_vec[0].iov_len = head->iov_len - hdr;
+-	v = 0;
+-	while (len > rqstp->rq_vec[v].iov_len) {
+-		len -= rqstp->rq_vec[v].iov_len;
+-		v++;
+-		rqstp->rq_vec[v].iov_base = page_address(rqstp->rq_pages[v]);
+-		rqstp->rq_vec[v].iov_len = PAGE_SIZE;
+-	}
+-	rqstp->rq_vec[v].iov_len = len;
+-	args->vlen = v + 1;
++	args->first.iov_base = (void *)p;
++	args->first.iov_len = head->iov_len - hdr;
+ 	return 1;
+ }
+ 
+diff --git a/fs/nfsd/xdr.h b/fs/nfsd/xdr.h
+index 4f0481d63804..93960593baa3 100644
+--- a/fs/nfsd/xdr.h
++++ b/fs/nfsd/xdr.h
+@@ -33,7 +33,7 @@ struct nfsd_writeargs {
+ 	svc_fh			fh;
+ 	__u32			offset;
+ 	int			len;
+-	int			vlen;
++	struct kvec		first;
+ };
+ 
+ struct nfsd_createargs {
+diff --git a/fs/nfsd/xdr3.h b/fs/nfsd/xdr3.h
+index 335e04aaf7db..9fe5cc8e779d 100644
+--- a/fs/nfsd/xdr3.h
++++ b/fs/nfsd/xdr3.h
+@@ -40,7 +40,7 @@ struct nfsd3_writeargs {
+ 	__u32			count;
+ 	int			stable;
+ 	__u32			len;
+-	int			vlen;
++	struct kvec		first;
+ };
+ 
+ struct nfsd3_createargs {
+diff --git a/include/linux/sunrpc/svc.h b/include/linux/sunrpc/svc.h
+index 14b79000d085..3e0ddf9e1e65 100644
+--- a/include/linux/sunrpc/svc.h
++++ b/include/linux/sunrpc/svc.h
+@@ -484,6 +484,8 @@ void		   svc_wake_up(struct svc_serv *);
+ void		   svc_reserve(struct svc_rqst *rqstp, int space);
+ struct svc_pool *  svc_pool_for_cpu(struct svc_serv *serv, int cpu);
+ char *		   svc_print_addr(struct svc_rqst *, char *, size_t);
++unsigned int	   svc_fill_write_vector(struct svc_rqst *rqstp,
++					 struct kvec *first, size_t total);
+ 
+ #define	RPC_MAX_ADDRBUFLEN	(63U)
+ 
+diff --git a/net/sunrpc/svc.c b/net/sunrpc/svc.c
+index f947def68af2..c8f18becf699 100644
+--- a/net/sunrpc/svc.c
++++ b/net/sunrpc/svc.c
+@@ -1438,3 +1438,45 @@ u32 svc_max_payload(const struct svc_rqst *rqstp)
+ 	return max;
+ }
+ EXPORT_SYMBOL_GPL(svc_max_payload);
++
++/**
++ * svc_fill_write_vector - Construct data argument for VFS write call
++ * @rqstp: svc_rqst to operate on
++ * @first: buffer containing first section of write payload
++ * @total: total number of bytes of write payload
++ *
++ * Returns the number of elements populated in the data argument array.
++ */
++unsigned int svc_fill_write_vector(struct svc_rqst *rqstp, struct kvec *first,
++				   size_t total)
++{
++	struct kvec *vec = rqstp->rq_vec;
++	struct page **pages;
++	unsigned int i;
++
++	/* Some types of transport can present the write payload
++	 * entirely in rq_arg.pages. In this case, @first is empty.
++	 */
++	i = 0;
++	if (first->iov_len) {
++		vec[i].iov_base = first->iov_base;
++		vec[i].iov_len = min_t(size_t, total, first->iov_len);
++		total -= vec[i].iov_len;
++		++i;
++	}
++
++	WARN_ON_ONCE(rqstp->rq_arg.page_base != 0);
++	pages = rqstp->rq_arg.pages;
++	while (total) {
++		vec[i].iov_base = page_address(*pages);
++		vec[i].iov_len = min_t(size_t, total, PAGE_SIZE);
++		total -= vec[i].iov_len;
++		++i;
++
++		++pages;
++	}
++
++	WARN_ON_ONCE(i > ARRAY_SIZE(rqstp->rq_vec));
++	return i;
++}
++EXPORT_SYMBOL_GPL(svc_fill_write_vector);
