@@ -1,0 +1,104 @@
+IB: Make ib_init_ah_attr_from_wc set sgid_attr
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Parav Pandit <parav@mellanox.com>
+commit b7403217656dcf6c51f09d0bca7a12db0de8934a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/b7403217.failed
+
+The work completion is inspected to determine what dgid table entry was
+used to receieve the packet, produces a sgid_attr that matches and sticks
+it in the ah_attr.
+
+All callers of this function are now required to release the ah_attr on
+success.
+
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+(cherry picked from commit b7403217656dcf6c51f09d0bca7a12db0de8934a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/verbs.c
+diff --cc drivers/infiniband/core/verbs.c
+index 5403b7c6d1a2,9a72b88fea80..000000000000
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@@ -689,23 -689,10 +689,27 @@@ EXPORT_SYMBOL(ib_get_gids_from_rdma_hdr
+  static int ib_resolve_unicast_gid_dmac(struct ib_device *device,
+  				       struct rdma_ah_attr *ah_attr)
+  {
+- 	struct ib_gid_attr sgid_attr;
+- 	struct ib_global_route *grh;
++ 	struct ib_global_route *grh = rdma_ah_retrieve_grh(ah_attr);
++ 	const struct ib_gid_attr *sgid_attr = grh->sgid_attr;
+  	int hop_limit = 0xff;
+++<<<<<<< HEAD
+ +	union ib_gid sgid;
+ +	int ret;
+ +
+ +	grh = rdma_ah_retrieve_grh(ah_attr);
+ +
+ +	ret = ib_query_gid(device,
+ +			   rdma_ah_get_port_num(ah_attr),
+ +			   grh->sgid_index,
+ +			   &sgid, &sgid_attr);
+ +	if (ret || !sgid_attr.ndev) {
+ +		if (!ret)
+ +			ret = -ENXIO;
+ +		return ret;
+ +	}
+++=======
++ 	int ret = 0;
+++>>>>>>> b7403217656d (IB: Make ib_init_ah_attr_from_wc set sgid_attr)
+  
+  	/* If destination is link local and source GID is RoCEv1,
+  	 * IP stack is not used.
+diff --git a/drivers/infiniband/core/cm.c b/drivers/infiniband/core/cm.c
+index b0a552391904..65a9b2ba4520 100644
+--- a/drivers/infiniband/core/cm.c
++++ b/drivers/infiniband/core/cm.c
+@@ -1091,6 +1091,9 @@ retest:
+ 	wait_for_completion(&cm_id_priv->comp);
+ 	while ((work = cm_dequeue_work(cm_id_priv)) != NULL)
+ 		cm_free_work(work);
++
++	rdma_destroy_ah_attr(&cm_id_priv->av.ah_attr);
++	rdma_destroy_ah_attr(&cm_id_priv->alt_av.ah_attr);
+ 	kfree(cm_id_priv->private_data);
+ 	kfree(cm_id_priv);
+ }
+diff --git a/drivers/infiniband/core/user_mad.c b/drivers/infiniband/core/user_mad.c
+index 9c1a619be377..711dc7580f3a 100644
+--- a/drivers/infiniband/core/user_mad.c
++++ b/drivers/infiniband/core/user_mad.c
+@@ -268,6 +268,7 @@ static void recv_handler(struct ib_mad_agent *agent,
+ 		packet->mad.hdr.traffic_class = grh->traffic_class;
+ 		memcpy(packet->mad.hdr.gid, &grh->dgid, 16);
+ 		packet->mad.hdr.flow_label = cpu_to_be32(grh->flow_label);
++		rdma_destroy_ah_attr(&ah_attr);
+ 	}
+ 
+ 	if (queue_packet(file, agent, packet))
+* Unmerged path drivers/infiniband/core/verbs.c
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index 60be4089f52a..91b8b6042ec3 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -3047,6 +3047,13 @@ int ib_get_rdma_header_version(const union rdma_network_hdr *hdr);
+  *   ignored unless the work completion indicates that the GRH is valid.
+  * @ah_attr: Returned attributes that can be used when creating an address
+  *   handle for replying to the message.
++ * When ib_init_ah_attr_from_wc() returns success,
++ * (a) for IB link layer it optionally contains a reference to SGID attribute
++ * when GRH is present for IB link layer.
++ * (b) for RoCE link layer it contains a reference to SGID attribute.
++ * User must invoke rdma_cleanup_ah_attr_gid_attr() to release reference to SGID
++ * attributes which are initialized using ib_init_ah_attr_from_wc().
++ *
+  */
+ int ib_init_ah_attr_from_wc(struct ib_device *device, u8 port_num,
+ 			    const struct ib_wc *wc, const struct ib_grh *grh,
