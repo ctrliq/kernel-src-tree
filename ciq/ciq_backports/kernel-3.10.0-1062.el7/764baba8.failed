@@ -1,0 +1,114 @@
+ovl: hash non-dir by lower inode for fsnotify
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit 764baba80168ad3adafb521d2ab483ccbc49e344
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/764baba8.failed
+
+Commit 31747eda41ef ("ovl: hash directory inodes for fsnotify")
+fixed an issue of inotify watch on directory that stops getting
+events after dropping dentry caches.
+
+A similar issue exists for non-dir non-upper files, for example:
+
+$ mkdir -p lower upper work merged
+$ touch lower/foo
+$ mount -t overlay -o
+lowerdir=lower,workdir=work,upperdir=upper none merged
+$ inotifywait merged/foo &
+$ echo 2 > /proc/sys/vm/drop_caches
+$ cat merged/foo
+
+inotifywait doesn't get the OPEN event, because ovl_lookup() called
+from 'cat' allocates a new overlay inode and does not reuse the
+watched inode.
+
+Fix this by hashing non-dir overlay inodes by lower real inode in
+the following cases that were not hashed before this change:
+ - A non-upper overlay mount
+ - A lower non-hardlink when index=off
+
+A helper ovl_hash_bylower() was added to put all the logic and
+documentation about which real inode an overlay inode is hashed by
+into one place.
+
+The issue dates back to initial version of overlayfs, but this
+patch depends on ovl_inode code that was introduced in kernel v4.13.
+
+	Cc: <stable@vger.kernel.org> #v4.13
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 764baba80168ad3adafb521d2ab483ccbc49e344)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/inode.c
+diff --cc fs/overlayfs/inode.c
+index c5e691214402,3b1bd469accd..000000000000
+--- a/fs/overlayfs/inode.c
++++ b/fs/overlayfs/inode.c
+@@@ -688,6 -651,57 +688,60 @@@ static bool ovl_verify_inode(struct ino
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct inode *ovl_lookup_inode(struct super_block *sb, struct dentry *real,
++ 			       bool is_upper)
++ {
++ 	struct inode *inode, *key = d_inode(real);
++ 
++ 	inode = ilookup5(sb, (unsigned long) key, ovl_inode_test, key);
++ 	if (!inode)
++ 		return NULL;
++ 
++ 	if (!ovl_verify_inode(inode, is_upper ? NULL : real,
++ 			      is_upper ? real : NULL, false)) {
++ 		iput(inode);
++ 		return ERR_PTR(-ESTALE);
++ 	}
++ 
++ 	return inode;
++ }
++ 
++ /*
++  * Does overlay inode need to be hashed by lower inode?
++  */
++ static bool ovl_hash_bylower(struct super_block *sb, struct dentry *upper,
++ 			     struct dentry *lower, struct dentry *index)
++ {
++ 	struct ovl_fs *ofs = sb->s_fs_info;
++ 
++ 	/* No, if pure upper */
++ 	if (!lower)
++ 		return false;
++ 
++ 	/* Yes, if already indexed */
++ 	if (index)
++ 		return true;
++ 
++ 	/* Yes, if won't be copied up */
++ 	if (!ofs->upper_mnt)
++ 		return true;
++ 
++ 	/* No, if lower hardlink is or will be broken on copy up */
++ 	if ((upper || !ovl_indexdir(sb)) &&
++ 	    !d_is_dir(lower) && d_inode(lower)->i_nlink > 1)
++ 		return false;
++ 
++ 	/* No, if non-indexed upper with NFS export */
++ 	if (sb->s_export_op && upper)
++ 		return false;
++ 
++ 	/* Otherwise, hash by lower inode for fsnotify */
++ 	return true;
++ }
++ 
+++>>>>>>> 764baba80168 (ovl: hash non-dir by lower inode for fsnotify)
+  struct inode *ovl_get_inode(struct super_block *sb, struct dentry *upperdentry,
+  			    struct dentry *lowerdentry, struct dentry *index,
+  			    unsigned int numlower)
+* Unmerged path fs/overlayfs/inode.c
