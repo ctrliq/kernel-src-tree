@@ -1,0 +1,158 @@
+scsi: qla2xxx: Use BIT_6 to acquire FAWWPN from switch
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Use BIT_6 to acquire FAWWPN from switch (Himanshu Madhani) [1460030]
+Rebuild_FUZZ: 94.12%
+commit-author Sawan Chandak <sawan.chandak@cavium.com>
+commit fcc5b5cd726c0779cd689362aea82cc9d5a61346
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fcc5b5cd.failed
+
+If FA-WWPN feature disabled on the switch side and enabled for the
+adapter, then driver would update the port name with switch port name.
+
+This patch fixes issue by checking correct BIT flag to validate.
+
+Fixes: 41dc529a4602 ("qla2xxx: Improve RSCN handling in driver")
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Sawan Chandak <sawan.chandak@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit fcc5b5cd726c0779cd689362aea82cc9d5a61346)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_mbx.c
+diff --cc drivers/scsi/qla2xxx/qla_mbx.c
+index dbf81ea6a977,6164a2c9a1f4..000000000000
+--- a/drivers/scsi/qla2xxx/qla_mbx.c
++++ b/drivers/scsi/qla2xxx/qla_mbx.c
+@@@ -3500,62 -3674,77 +3500,76 @@@ qla24xx_report_id_acquisition(scsi_qla_
+  		    rptid_entry->port_id[0]);
+  
+  		/* buffer to buffer credit flag */
+ -		vha->flags.bbcr_enable = (rptid_entry->u.f1.bbcr & 0xf) != 0;
+ +		vha->flags.bbcr_enable = (rptid_entry->bbcr & 0xf) != 0;
+  
+++<<<<<<< HEAD
+ +		/* FA-WWN is only for physical port */
+ +		if (!vp_idx) {
+ +			void *wwpn = ha->init_cb->port_name;
+++=======
++ 		if (rptid_entry->vp_idx == 0) {
++ 			if (rptid_entry->vp_status == VP_STAT_COMPL) {
++ 				/* FA-WWN is only for physical port */
++ 				if (qla_ini_mode_enabled(vha) &&
++ 				    ha->flags.fawwpn_enabled &&
++ 				    (rptid_entry->u.f1.flags &
++ 				     BIT_6)) {
++ 					memcpy(vha->port_name,
++ 					    rptid_entry->u.f1.port_name,
++ 					    WWN_SIZE);
++ 				}
+++>>>>>>> fcc5b5cd726c (scsi: qla2xxx: Use BIT_6 to acquire FAWWPN from switch)
+  
+ -				qlt_update_host_map(vha, id);
+ +			if (!MSB(stat)) {
+ +				if (rptid_entry->vp_idx_map[1] & BIT_6)
+ +					wwpn = rptid_entry->reserved_4 + 8;
+  			}
+ +			memcpy(vha->port_name, wwpn, WWN_SIZE);
+ +			fc_host_port_name(vha->host) =
+ +			    wwn_to_u64(vha->port_name);
+ +			ql_dbg(ql_dbg_mbx, vha, 0x1018,
+ +			    "FA-WWN portname %016llx (%x)\n",
+ +			    fc_host_port_name(vha->host), MSB(stat));
+ +		}
+  
+ -			set_bit(REGISTER_FC4_NEEDED, &vha->dpc_flags);
+ -			set_bit(REGISTER_FDMI_NEEDED, &vha->dpc_flags);
+ -		} else {
+ -			if (rptid_entry->vp_status != VP_STAT_COMPL &&
+ -				rptid_entry->vp_status != VP_STAT_ID_CHG) {
+ -				ql_dbg(ql_dbg_mbx, vha, 0x10ba,
+ -				    "Could not acquire ID for VP[%d].\n",
+ -				    rptid_entry->vp_idx);
+ -				return;
+ -			}
+ +		vp = vha;
+ +		if (vp_idx == 0)
+ +			goto reg_needed;
+  
+ -			found = 0;
+ -			spin_lock_irqsave(&ha->vport_slock, flags);
+ -			list_for_each_entry(vp, &ha->vp_list, list) {
+ -				if (rptid_entry->vp_idx == vp->vp_idx) {
+ -					found = 1;
+ -					break;
+ -				}
+ +		if (MSB(stat) != 0 && MSB(stat) != 2) {
+ +			ql_dbg(ql_dbg_mbx, vha, 0x10ba,
+ +			    "Could not acquire ID for VP[%d].\n", vp_idx);
+ +			return;
+ +		}
+ +
+ +		found = 0;
+ +		spin_lock_irqsave(&ha->vport_slock, flags);
+ +		list_for_each_entry(vp, &ha->vp_list, list) {
+ +			if (vp_idx == vp->vp_idx) {
+ +				found = 1;
+ +				break;
+  			}
+ -			spin_unlock_irqrestore(&ha->vport_slock, flags);
+ +		}
+ +		spin_unlock_irqrestore(&ha->vport_slock, flags);
+  
+ -			if (!found)
+ -				return;
+ +		if (!found)
+ +			return;
+  
+ -			qlt_update_host_map(vp, id);
+ +		vp->d_id.b.domain = rptid_entry->port_id[2];
+ +		vp->d_id.b.area =  rptid_entry->port_id[1];
+ +		vp->d_id.b.al_pa = rptid_entry->port_id[0];
+  
+ -			/*
+ -			 * Cannot configure here as we are still sitting on the
+ -			 * response queue. Handle it in dpc context.
+ -			 */
+ -			set_bit(VP_IDX_ACQUIRED, &vp->vp_flags);
+ -			set_bit(REGISTER_FC4_NEEDED, &vp->dpc_flags);
+ -			set_bit(REGISTER_FDMI_NEEDED, &vp->dpc_flags);
+ -		}
+ +		/*
+ +		 * Cannot configure here as we are still sitting on the
+ +		 * response queue. Handle it in dpc context.
+ +		 */
+ +		set_bit(VP_IDX_ACQUIRED, &vp->vp_flags);
+ +
+ +reg_needed:
+ +		set_bit(REGISTER_FC4_NEEDED, &vp->dpc_flags);
+ +		set_bit(REGISTER_FDMI_NEEDED, &vp->dpc_flags);
+  		set_bit(VP_DPC_NEEDED, &vha->dpc_flags);
+  		qla2xxx_wake_dpc(vha);
+ -	} else if (rptid_entry->format == 2) {
+ -		ql_dbg(ql_dbg_async, vha, 0x505f,
+ -		    "RIDA: format 2/N2N Primary port id %02x%02x%02x.\n",
+ -		    rptid_entry->port_id[2], rptid_entry->port_id[1],
+ -		    rptid_entry->port_id[0]);
+ -
+ -		ql_dbg(ql_dbg_async, vha, 0x5075,
+ -		    "N2N: Remote WWPN %8phC.\n",
+ -		    rptid_entry->u.f2.port_name);
+ -
+ -		/* N2N.  direct connect */
+ -		vha->d_id.b.domain = rptid_entry->port_id[2];
+ -		vha->d_id.b.area = rptid_entry->port_id[1];
+ -		vha->d_id.b.al_pa = rptid_entry->port_id[0];
+ -
+ -		spin_lock_irqsave(&ha->vport_slock, flags);
+ -		qlt_update_vp_map(vha, SET_AL_PA);
+ -		spin_unlock_irqrestore(&ha->vport_slock, flags);
+  	}
+  }
+  
+* Unmerged path drivers/scsi/qla2xxx/qla_mbx.c
