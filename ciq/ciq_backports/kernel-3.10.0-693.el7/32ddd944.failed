@@ -1,0 +1,152 @@
+nfsd: opt in to labeled nfs per export
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author J. Bruce Fields <bfields@redhat.com>
+commit 32ddd944a056c786f6acdd95ed29e994adc613a2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/32ddd944.failed
+
+Currently turning on NFSv4.2 results in 4.2 clients suddenly seeing the
+individual file labels as they're set on the server.  This is not what
+they've previously seen, and not appropriate in may cases.  (In
+particular, if clients have heterogenous security policies then one
+client's labels may not even make sense to another.)  Labeled NFS should
+be opted in only in those cases when the administrator knows it makes
+sense.
+
+It's helpful to be able to turn 4.2 on by default, and otherwise the
+protocol upgrade seems free of regressions.  So, default labeled NFS to
+off and provide an export flag to reenable it.
+
+Users wanting labeled NFS support on an export will henceforth need to:
+
+	- make sure 4.2 support is enabled on client and server (as
+	  before), and
+	- upgrade the server nfs-utils to a version supporting the new
+	  "security_label" export flag.
+	- set that "security_label" flag on the export.
+
+This is commit may be seen as a regression to anyone currently depending
+on security labels.  We believe those cases are currently rare.
+
+	Reported-by: tibbs@math.uh.edu
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit 32ddd944a056c786f6acdd95ed29e994adc613a2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfs4proc.c
+#	fs/nfsd/nfs4xdr.c
+diff --cc fs/nfsd/nfs4proc.c
+index 355774c4c646,171f2d7ecfdd..000000000000
+--- a/fs/nfsd/nfs4proc.c
++++ b/fs/nfsd/nfs4proc.c
+@@@ -94,34 -95,20 +94,48 @@@ check_attr_support(struct svc_rqst *rqs
+  		   u32 *bmval, u32 *writable)
+  {
+  	struct dentry *dentry = cstate->current_fh.fh_dentry;
++ 	struct svc_export *exp = cstate->current_fh.fh_export;
+  
+ -	if (!nfsd_attrs_supported(cstate->minorversion, bmval))
+ +	/*
+ +	 * Check about attributes are supported by the NFSv4 server or not.
+ +	 * According to spec, unsupported attributes return ERR_ATTRNOTSUPP.
+ +	 */
+ +	if ((bmval[0] & ~nfsd_suppattrs0(cstate->minorversion)) ||
+ +	    (bmval[1] & ~nfsd_suppattrs1(cstate->minorversion)) ||
+ +	    (bmval[2] & ~nfsd_suppattrs2(cstate->minorversion)))
+  		return nfserr_attrnotsupp;
+++<<<<<<< HEAD
+ +
+ +	/*
+ +	 * Check FATTR4_WORD0_ACL can be supported
+ +	 * in current environment or not.
+ +	 */
+ +	if (bmval[0] & FATTR4_WORD0_ACL) {
+ +		if (!IS_POSIXACL(dentry->d_inode))
+ +			return nfserr_attrnotsupp;
+ +	}
+ +
+ +	/*
+ +	 * According to spec, read-only attributes return ERR_INVAL.
+ +	 */
+ +	if (writable) {
+ +		if ((bmval[0] & ~writable[0]) || (bmval[1] & ~writable[1]) ||
+ +		    (bmval[2] & ~writable[2]))
+ +			return nfserr_inval;
+ +	}
+ +
+++=======
++ 	if ((bmval[0] & FATTR4_WORD0_ACL) && !IS_POSIXACL(d_inode(dentry)))
++ 		return nfserr_attrnotsupp;
++ 	if ((bmval[2] & FATTR4_WORD2_SECURITY_LABEL) &&
++ 			!(exp->ex_flags & NFSEXP_SECURITY_LABEL))
++ 		return nfserr_attrnotsupp;
++ 	if (writable && !bmval_is_subset(bmval, writable))
++ 		return nfserr_inval;
++ 	if (writable && (bmval[2] & FATTR4_WORD2_MODE_UMASK) &&
++ 			(bmval[1] & FATTR4_WORD1_MODE))
++ 		return nfserr_inval;
+++>>>>>>> 32ddd944a056 (nfsd: opt in to labeled nfs per export)
+  	return nfs_ok;
+  }
+  
+diff --cc fs/nfsd/nfs4xdr.c
+index 8e3154825b61,3cc190755958..000000000000
+--- a/fs/nfsd/nfs4xdr.c
++++ b/fs/nfsd/nfs4xdr.c
+@@@ -2393,8 -2417,11 +2393,15 @@@ nfsd4_encode_fattr(struct xdr_stream *x
+  #ifdef CONFIG_NFSD_V4_SECURITY_LABEL
+  	if ((bmval2 & FATTR4_WORD2_SECURITY_LABEL) ||
+  	     bmval0 & FATTR4_WORD0_SUPPORTED_ATTRS) {
+++<<<<<<< HEAD
+ +		err = security_inode_getsecctx(dentry->d_inode,
+++=======
++ 		if (exp->ex_flags & NFSEXP_SECURITY_LABEL)
++ 			err = security_inode_getsecctx(d_inode(dentry),
+++>>>>>>> 32ddd944a056 (nfsd: opt in to labeled nfs per export)
+  						&context, &contextlen);
++ 		else
++ 			err = -EOPNOTSUPP;
+  		contextsupport = (err == 0);
+  		if (bmval2 & FATTR4_WORD2_SECURITY_LABEL) {
+  			if (err == -EOPNOTSUPP)
+diff --git a/fs/nfsd/export.c b/fs/nfsd/export.c
+index 3a285c0d6b21..27459a453bb8 100644
+--- a/fs/nfsd/export.c
++++ b/fs/nfsd/export.c
+@@ -1092,6 +1092,7 @@ static struct flags {
+ 	{ NFSEXP_NOAUTHNLM, {"insecure_locks", ""}},
+ 	{ NFSEXP_V4ROOT, {"v4root", ""}},
+ 	{ NFSEXP_PNFS, {"pnfs", ""}},
++	{ NFSEXP_SECURITY_LABEL, {"security_label", ""}},
+ 	{ 0, {"", ""}}
+ };
+ 
+* Unmerged path fs/nfsd/nfs4proc.c
+* Unmerged path fs/nfsd/nfs4xdr.c
+diff --git a/include/uapi/linux/nfsd/export.h b/include/uapi/linux/nfsd/export.h
+index 0df7bd5d2fb1..c3be256107c6 100644
+--- a/include/uapi/linux/nfsd/export.h
++++ b/include/uapi/linux/nfsd/export.h
+@@ -32,7 +32,8 @@
+ #define NFSEXP_ASYNC		0x0010
+ #define NFSEXP_GATHERED_WRITES	0x0020
+ #define NFSEXP_NOREADDIRPLUS    0x0040
+-/* 80 100 currently unused */
++#define NFSEXP_SECURITY_LABEL	0x0080
++/* 0x100 currently unused */
+ #define NFSEXP_NOHIDE		0x0200
+ #define NFSEXP_NOSUBTREECHECK	0x0400
+ #define	NFSEXP_NOAUTHNLM	0x0800		/* Don't authenticate NLM requests - just trust */
+@@ -53,7 +54,7 @@
+ #define NFSEXP_PNFS		0x20000
+ 
+ /* All flags that we claim to support.  (Note we don't support NOACL.) */
+-#define NFSEXP_ALLFLAGS		0x3FE7F
++#define NFSEXP_ALLFLAGS		0x3FEFF
+ 
+ /* The flags that may vary depending on security flavor: */
+ #define NFSEXP_SECINFO_FLAGS	(NFSEXP_READONLY | NFSEXP_ROOTSQUASH \
