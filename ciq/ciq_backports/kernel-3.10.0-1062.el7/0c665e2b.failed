@@ -1,0 +1,204 @@
+nfp: flower: use the common netdev notifier
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 0c665e2bf440a59a2f5c5fe7657f13aef3fe92f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/0c665e2b.failed
+
+Use driver's common notifier for LAG and tunnel configuration.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: John Hurley <john.hurley@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0c665e2bf440a59a2f5c5fe7657f13aef3fe92f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/tunnel_conf.c
+diff --cc drivers/net/ethernet/netronome/nfp/flower/tunnel_conf.c
+index 0d978c8a0f36,fb6442d820b5..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/tunnel_conf.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/tunnel_conf.c
+@@@ -736,21 -691,7 +721,25 @@@ int nfp_tunnel_config_start(struct nfp_
+  	INIT_LIST_HEAD(&priv->nfp_neigh_off_list);
+  	priv->nfp_tun_neigh_nb.notifier_call = nfp_tun_neigh_event_handler;
+  
+++<<<<<<< HEAD
+ +	err = register_netdevice_notifier_rh(&priv->nfp_tun_mac_nb);
+ +	if (err)
+ +		goto err_free_mac_ida;
+ +
+ +	err = register_netevent_notifier(&priv->nfp_tun_neigh_nb);
+ +	if (err)
+ +		goto err_unreg_mac_nb;
+ +
+ +	return 0;
+ +
+ +err_unreg_mac_nb:
+ +	unregister_netdevice_notifier_rh(&priv->nfp_tun_mac_nb);
+ +err_free_mac_ida:
+ +	ida_destroy(&priv->nfp_mac_off_ids);
+ +	return err;
+++=======
++ 	return register_netevent_notifier(&priv->nfp_tun_neigh_nb);
+++>>>>>>> 0c665e2bf440 (nfp: flower: use the common netdev notifier)
+  }
+  
+  void nfp_tunnel_config_stop(struct nfp_app *app)
+@@@ -762,7 -703,6 +751,10 @@@
+  	struct nfp_ipv4_addr_entry *ip_entry;
+  	struct list_head *ptr, *storage;
+  
+++<<<<<<< HEAD
+ +	unregister_netdevice_notifier_rh(&priv->nfp_tun_mac_nb);
+++=======
+++>>>>>>> 0c665e2bf440 (nfp: flower: use the common netdev notifier)
+  	unregister_netevent_notifier(&priv->nfp_tun_neigh_nb);
+  
+  	/* Free any memory that may be occupied by MAC list. */
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/lag_conf.c b/drivers/net/ethernet/netronome/nfp/flower/lag_conf.c
+index 87d97e693b56..0abb7df8b5fe 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/lag_conf.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/lag_conf.c
+@@ -614,17 +614,13 @@ nfp_fl_lag_changels_event(struct nfp_fl_lag *lag, struct net_device *netdev,
+ 	schedule_delayed_work(&lag->work, NFP_FL_LAG_DELAY);
+ }
+ 
+-static int
+-nfp_fl_lag_netdev_event(struct notifier_block *nb, unsigned long event,
+-			void *ptr)
++int nfp_flower_lag_netdev_event(struct nfp_flower_priv *priv,
++				struct net_device *netdev,
++				unsigned long event, void *ptr)
+ {
+-	struct net_device *netdev;
+-	struct nfp_fl_lag *lag;
++	struct nfp_fl_lag *lag = &priv->nfp_lag;
+ 	int err;
+ 
+-	netdev = netdev_notifier_info_to_dev(ptr);
+-	lag = container_of(nb, struct nfp_fl_lag, lag_nb);
+-
+ 	switch (event) {
+ 	case NETDEV_CHANGEUPPER:
+ 		err = nfp_fl_lag_changeupper_event(lag, ptr);
+@@ -661,8 +657,6 @@ void nfp_flower_lag_init(struct nfp_fl_lag *lag)
+ 
+ 	/* 0 is a reserved batch version so increment to first valid value. */
+ 	nfp_fl_increment_version(lag);
+-
+-	lag->lag_nb.notifier_call = nfp_fl_lag_netdev_event;
+ }
+ 
+ void nfp_flower_lag_cleanup(struct nfp_fl_lag *lag)
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/main.c b/drivers/net/ethernet/netronome/nfp/flower/main.c
+index 171014032993..35011dcf1f69 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.c
+@@ -679,23 +679,30 @@ static int nfp_flower_start(struct nfp_app *app)
+ 		err = nfp_flower_lag_reset(&app_priv->nfp_lag);
+ 		if (err)
+ 			return err;
+-
+-		err = register_netdevice_notifier(&app_priv->nfp_lag.lag_nb);
+-		if (err)
+-			return err;
+ 	}
+ 
+ 	return nfp_tunnel_config_start(app);
+ }
+ 
+ static void nfp_flower_stop(struct nfp_app *app)
++{
++	nfp_tunnel_config_stop(app);
++}
++
++static int
++nfp_flower_netdev_event(struct nfp_app *app, struct net_device *netdev,
++			unsigned long event, void *ptr)
+ {
+ 	struct nfp_flower_priv *app_priv = app->priv;
++	int ret;
+ 
+-	if (app_priv->flower_ext_feats & NFP_FL_FEATS_LAG)
+-		unregister_netdevice_notifier(&app_priv->nfp_lag.lag_nb);
++	if (app_priv->flower_ext_feats & NFP_FL_FEATS_LAG) {
++		ret = nfp_flower_lag_netdev_event(app_priv, netdev, event, ptr);
++		if (ret & NOTIFY_STOP_MASK)
++			return ret;
++	}
+ 
+-	nfp_tunnel_config_stop(app);
++	return nfp_tunnel_mac_event_handler(app, netdev, event, ptr);
+ }
+ 
+ const struct nfp_app_type app_flower = {
+@@ -726,6 +733,8 @@ const struct nfp_app_type app_flower = {
+ 	.start		= nfp_flower_start,
+ 	.stop		= nfp_flower_stop,
+ 
++	.netdev_event	= nfp_flower_netdev_event,
++
+ 	.ctrl_msg_rx	= nfp_flower_cmsg_rx,
+ 
+ 	.sriov_enable	= nfp_flower_sriov_enable,
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/main.h b/drivers/net/ethernet/netronome/nfp/flower/main.h
+index 90cc96d4eae4..c201c3cd52b6 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.h
+@@ -105,7 +105,6 @@ struct nfp_mtu_conf {
+ 
+ /**
+  * struct nfp_fl_lag - Flower APP priv data for link aggregation
+- * @lag_nb:		Notifier to track master/slave events
+  * @work:		Work queue for writing configs to the HW
+  * @lock:		Lock to protect lag_group_list
+  * @group_list:		List of all master/slave groups offloaded
+@@ -118,7 +117,6 @@ struct nfp_mtu_conf {
+  *			retransmission
+  */
+ struct nfp_fl_lag {
+-	struct notifier_block lag_nb;
+ 	struct delayed_work work;
+ 	struct mutex lock;
+ 	struct list_head group_list;
+@@ -156,7 +154,6 @@ struct nfp_fl_lag {
+  * @nfp_neigh_off_lock:	Lock for the neighbour address list
+  * @nfp_mac_off_ids:	IDA to manage id assignment for offloaded macs
+  * @nfp_mac_off_count:	Number of MACs in address list
+- * @nfp_tun_mac_nb:	Notifier to monitor link state
+  * @nfp_tun_neigh_nb:	Notifier to monitor neighbour state
+  * @reify_replies:	atomically stores the number of replies received
+  *			from firmware for repr reify
+@@ -187,7 +184,6 @@ struct nfp_flower_priv {
+ 	spinlock_t nfp_neigh_off_lock;
+ 	struct ida nfp_mac_off_ids;
+ 	int nfp_mac_off_count;
+-	struct notifier_block nfp_tun_mac_nb;
+ 	struct notifier_block nfp_tun_neigh_nb;
+ 	atomic_t reify_replies;
+ 	wait_queue_head_t reify_wait_queue;
+@@ -283,6 +279,9 @@ void nfp_flower_rx_flow_stats(struct nfp_app *app, struct sk_buff *skb);
+ 
+ int nfp_tunnel_config_start(struct nfp_app *app);
+ void nfp_tunnel_config_stop(struct nfp_app *app);
++int nfp_tunnel_mac_event_handler(struct nfp_app *app,
++				 struct net_device *netdev,
++				 unsigned long event, void *ptr);
+ void nfp_tunnel_write_macs(struct nfp_app *app);
+ void nfp_tunnel_del_ipv4_off(struct nfp_app *app, __be32 ipv4);
+ void nfp_tunnel_add_ipv4_off(struct nfp_app *app, __be32 ipv4);
+@@ -293,6 +292,9 @@ int nfp_flower_setup_tc_egress_cb(enum tc_setup_type type, void *type_data,
+ void nfp_flower_lag_init(struct nfp_fl_lag *lag);
+ void nfp_flower_lag_cleanup(struct nfp_fl_lag *lag);
+ int nfp_flower_lag_reset(struct nfp_fl_lag *lag);
++int nfp_flower_lag_netdev_event(struct nfp_flower_priv *priv,
++				struct net_device *netdev,
++				unsigned long event, void *ptr);
+ bool nfp_flower_lag_unprocessed_msg(struct nfp_app *app, struct sk_buff *skb);
+ 
+ #endif
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/tunnel_conf.c
