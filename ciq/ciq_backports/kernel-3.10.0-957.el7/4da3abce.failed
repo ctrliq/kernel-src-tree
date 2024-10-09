@@ -1,0 +1,171 @@
+sched/deadline: Do not reclaim the whole CPU bandwidth
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Luca Abeni <luca.abeni@santannapisa.it>
+commit 4da3abcefe178c650033f371e94fa10e80bce167
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/4da3abce.failed
+
+Original GRUB tends to reclaim 100% of the CPU time... And this
+allows a CPU hog to starve non-deadline tasks.
+To address this issue, allow the scheduler to reclaim only a
+specified fraction of CPU time, stored in the new "bw_ratio"
+field of the dl runqueue structure.
+
+	Tested-by: Daniel Bristot de Oliveira <bristot@redhat.com>
+	Signed-off-by: Luca Abeni <luca.abeni@santannapisa.it>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Claudio Scordino <claudio@evidence.eu.com>
+	Cc: Joel Fernandes <joelaf@google.com>
+	Cc: Juri Lelli <juri.lelli@arm.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Mathieu Poirier <mathieu.poirier@linaro.org>
+	Cc: Mike Galbraith <efault@gmx.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Tommaso Cucinotta <tommaso.cucinotta@sssup.it>
+Link: http://lkml.kernel.org/r/1495138417-6203-6-git-send-email-luca.abeni@santannapisa.it
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 4da3abcefe178c650033f371e94fa10e80bce167)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/sched.h
+diff --cc kernel/sched/sched.h
+index d6fd5ead3b99,878fe757d6ad..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -1297,30 -1500,53 +1303,36 @@@ extern void init_rt_bandwidth(struct rt
+  extern struct dl_bandwidth def_dl_bandwidth;
+  extern void init_dl_bandwidth(struct dl_bandwidth *dl_b, u64 period, u64 runtime);
+  extern void init_dl_task_timer(struct sched_dl_entity *dl_se);
+++<<<<<<< HEAD
+++=======
++ extern void init_dl_inactive_task_timer(struct sched_dl_entity *dl_se);
++ extern void init_dl_rq_bw_ratio(struct dl_rq *dl_rq);
+++>>>>>>> 4da3abcefe17 (sched/deadline: Do not reclaim the whole CPU bandwidth)
+  
+  #define BW_SHIFT	20
+  #define BW_UNIT		(1 << BW_SHIFT)
++ #define RATIO_SHIFT	8
+  unsigned long to_ratio(u64 period, u64 runtime);
+  
+ -extern void init_entity_runnable_average(struct sched_entity *se);
+ -extern void post_init_entity_util_avg(struct sched_entity *se);
+ +extern void update_idle_cpu_load(struct rq *this_rq);
+  
+ -#ifdef CONFIG_NO_HZ_FULL
+ -extern bool sched_can_stop_tick(struct rq *rq);
+ +extern void init_task_runnable_average(struct task_struct *p);
+  
+ -/*
+ - * Tick may be needed by tasks in the runqueue depending on their policy and
+ - * requirements. If tick is needed, lets send the target an IPI to kick it out of
+ - * nohz mode if necessary.
+ - */
+ -static inline void sched_update_tick_dependency(struct rq *rq)
+ +#ifdef CONFIG_PARAVIRT
+ +static inline u64 steal_ticks(u64 steal)
+  {
+ -	int cpu;
+ -
+ -	if (!tick_nohz_full_enabled())
+ -		return;
+ -
+ -	cpu = cpu_of(rq);
+ -
+ -	if (!tick_nohz_full_cpu(cpu))
+ -		return;
+ +	if (unlikely(steal > NSEC_PER_SEC))
+ +		return div_u64(steal, TICK_NSEC);
+  
+ -	if (sched_can_stop_tick(rq))
+ -		tick_nohz_dep_clear_cpu(cpu, TICK_DEP_BIT_SCHED);
+ -	else
+ -		tick_nohz_dep_set_cpu(cpu, TICK_DEP_BIT_SCHED);
+ +	return __iter_div_u64_rem(steal, TICK_NSEC, &steal);
+  }
+ -#else
+ -static inline void sched_update_tick_dependency(struct rq *rq) { }
+  #endif
+  
+ -static inline void add_nr_running(struct rq *rq, unsigned count)
+ +static inline void inc_nr_running(struct rq *rq)
+  {
+ -	unsigned prev_nr = rq->nr_running;
+ -
+ -	rq->nr_running = prev_nr + count;
+ +	rq->nr_running++;
+  
+ -	if (prev_nr < 2 && rq->nr_running >= 2) {
+ +	if (rq->nr_running == 2) {
+  #ifdef CONFIG_SMP
+  		if (!rq->rd->overload)
+  			rq->rd->overload = true;
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 9a00c8258b37..af7d62e3abb1 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -9103,6 +9103,16 @@ static int sched_dl_global_validate(void)
+ 	return ret;
+ }
+ 
++void init_dl_rq_bw_ratio(struct dl_rq *dl_rq)
++{
++	if (global_rt_runtime() == RUNTIME_INF) {
++		dl_rq->bw_ratio = 1 << RATIO_SHIFT;
++	} else {
++		dl_rq->bw_ratio = to_ratio(global_rt_runtime(),
++			  global_rt_period()) >> (BW_SHIFT - RATIO_SHIFT);
++	}
++}
++
+ static void sched_dl_do_global(void)
+ {
+ 	u64 new_bw = -1;
+@@ -9128,6 +9138,7 @@ static void sched_dl_do_global(void)
+ 		raw_spin_unlock_irqrestore(&dl_b->lock, flags);
+ 
+ 		rcu_read_unlock_sched();
++		init_dl_rq_bw_ratio(&cpu_rq(cpu)->dl);
+ 	}
+ }
+ 
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index b6273f44e374..8b6252f25146 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -107,6 +107,7 @@ void init_dl_rq(struct dl_rq *dl_rq, struct rq *rq)
+ #endif
+ 
+ 	dl_rq->running_bw = 0;
++	init_dl_rq_bw_ratio(dl_rq);
+ }
+ 
+ #ifdef CONFIG_SMP
+@@ -806,11 +807,20 @@ extern bool sched_rt_bandwidth_account(struct rt_rq *rt_rq);
+  * Uact is the (per-runqueue) active utilization.
+  * Since rq->dl.running_bw contains Uact * 2^BW_SHIFT, the result
+  * has to be shifted right by BW_SHIFT.
++ * To reclaim only a fraction Umax of the CPU time, the
++ * runtime accounting rule is modified as
++ * "dq = -Uact / Umax dt"; since rq->dl.bw_ratio contains
++ * 2^RATIO_SHIFT / Umax, delta is multiplied by bw_ratio and shifted
++ * right by RATIO_SHIFT.
++ * Since delta is a 64 bit variable, to have an overflow its value
++ * should be larger than 2^(64 - 20 - 8), which is more than 64 seconds.
++ * So, overflow is not an issue here.
+  */
+ u64 grub_reclaim(u64 delta, struct rq *rq)
+ {
+ 	delta *= rq->dl.running_bw;
+-	delta >>= BW_SHIFT;
++	delta *= rq->dl.bw_ratio;
++	delta >>= BW_SHIFT + RATIO_SHIFT;
+ 
+ 	return delta;
+ }
+* Unmerged path kernel/sched/sched.h
