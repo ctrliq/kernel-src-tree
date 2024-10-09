@@ -1,0 +1,281 @@
+xprtrdma: Clean up device capability detection
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit b54054ca5590f59469437fc4a78a978edcb01c31
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/b54054ca.failed
+
+Clean up: Move device capability detection into memreg-specific
+source files.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Tested-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit b54054ca5590f59469437fc4a78a978edcb01c31)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/fmr_ops.c
+#	net/sunrpc/xprtrdma/frwr_ops.c
+#	net/sunrpc/xprtrdma/verbs.c
+diff --cc net/sunrpc/xprtrdma/fmr_ops.c
+index ecde1e1b320a,8b6ce8ebe60f..000000000000
+--- a/net/sunrpc/xprtrdma/fmr_ops.c
++++ b/net/sunrpc/xprtrdma/fmr_ops.c
+@@@ -35,28 -28,59 +35,44 @@@
+  /* Maximum scatter/gather per FMR */
+  #define RPCRDMA_MAX_FMR_SGES	(64)
+  
+ -/* Access mode of externally registered pages */
+ -enum {
+ -	RPCRDMA_FMR_ACCESS_FLAGS	= IB_ACCESS_REMOTE_WRITE |
+ -					  IB_ACCESS_REMOTE_READ,
+ -};
+ +static struct workqueue_struct *fmr_recovery_wq;
+ +
+++<<<<<<< HEAD
+ +#define FMR_RECOVERY_WQ_FLAGS		(WQ_UNBOUND)
+  
+ +int
+ +fmr_alloc_recovery_wq(void)
+++=======
++ bool
++ fmr_is_supported(struct rpcrdma_ia *ia)
++ {
++ 	if (!ia->ri_device->alloc_fmr) {
++ 		pr_info("rpcrdma: 'fmr' mode is not supported by device %s\n",
++ 			ia->ri_device->name);
++ 		return false;
++ 	}
++ 	return true;
++ }
++ 
++ static int
++ __fmr_init(struct rpcrdma_mw *mw, struct ib_pd *pd)
+++>>>>>>> b54054ca5590 (xprtrdma: Clean up device capability detection)
+  {
+ -	static struct ib_fmr_attr fmr_attr = {
+ -		.max_pages	= RPCRDMA_MAX_FMR_SGES,
+ -		.max_maps	= 1,
+ -		.page_shift	= PAGE_SHIFT
+ -	};
+ -
+ -	mw->fmr.fm_physaddrs = kcalloc(RPCRDMA_MAX_FMR_SGES,
+ -				       sizeof(u64), GFP_KERNEL);
+ -	if (!mw->fmr.fm_physaddrs)
+ -		goto out_free;
+ -
+ -	mw->mw_sg = kcalloc(RPCRDMA_MAX_FMR_SGES,
+ -			    sizeof(*mw->mw_sg), GFP_KERNEL);
+ -	if (!mw->mw_sg)
+ -		goto out_free;
+ -
+ -	sg_init_table(mw->mw_sg, RPCRDMA_MAX_FMR_SGES);
+ -
+ -	mw->fmr.fm_mr = ib_alloc_fmr(pd, RPCRDMA_FMR_ACCESS_FLAGS,
+ -				     &fmr_attr);
+ -	if (IS_ERR(mw->fmr.fm_mr))
+ -		goto out_fmr_err;
+ +	fmr_recovery_wq = alloc_workqueue("fmr_recovery", WQ_UNBOUND, 0);
+ +	return !fmr_recovery_wq ? -ENOMEM : 0;
+ +}
+  
+ -	return 0;
+ +void
+ +fmr_destroy_recovery_wq(void)
+ +{
+ +	struct workqueue_struct *wq;
+  
+ -out_fmr_err:
+ -	dprintk("RPC:       %s: ib_alloc_fmr returned %ld\n", __func__,
+ -		PTR_ERR(mw->fmr.fm_mr));
+ +	if (!fmr_recovery_wq)
+ +		return;
+  
+ -out_free:
+ -	kfree(mw->mw_sg);
+ -	kfree(mw->fmr.fm_physaddrs);
+ -	return -ENOMEM;
+ +	wq = fmr_recovery_wq;
+ +	fmr_recovery_wq = NULL;
+ +	destroy_workqueue(wq);
+  }
+  
+  static int
+diff --cc net/sunrpc/xprtrdma/frwr_ops.c
+index 144dce124c80,fc2826b3518c..000000000000
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@@ -73,72 -73,21 +73,90 @@@
+  # define RPCDBG_FACILITY	RPCDBG_TRANS
+  #endif
+  
+++<<<<<<< HEAD
+ +static struct workqueue_struct *frwr_recovery_wq;
+ +
+ +#define FRWR_RECOVERY_WQ_FLAGS		(WQ_UNBOUND | WQ_MEM_RECLAIM)
+ +
+ +int
+ +frwr_alloc_recovery_wq(void)
+ +{
+ +	frwr_recovery_wq = alloc_workqueue("frwr_recovery",
+ +					   FRWR_RECOVERY_WQ_FLAGS, 0);
+ +	return !frwr_recovery_wq ? -ENOMEM : 0;
+ +}
+ +
+ +void
+ +frwr_destroy_recovery_wq(void)
+ +{
+ +	struct workqueue_struct *wq;
+ +
+ +	if (!frwr_recovery_wq)
+ +		return;
+ +
+ +	wq = frwr_recovery_wq;
+ +	frwr_recovery_wq = NULL;
+ +	destroy_workqueue(wq);
+ +}
+ +
+ +/* Deferred reset of a single FRMR. Generate a fresh rkey by
+ + * replacing the MR.
+ + *
+ + * There's no recovery if this fails. The FRMR is abandoned, but
+ + * remains in rb_all. It will be cleaned up when the transport is
+ + * destroyed.
+ + */
+ +static void
+ +__frwr_recovery_worker(struct work_struct *work)
+ +{
+ +	struct rpcrdma_mw *r = container_of(work, struct rpcrdma_mw,
+ +					    frmr.fr_work);
+ +	struct rpcrdma_xprt *r_xprt = r->frmr.fr_xprt;
+ +	unsigned int depth = r_xprt->rx_ia.ri_max_frmr_depth;
+ +	struct ib_pd *pd = r_xprt->rx_ia.ri_pd;
+ +
+ +	if (ib_dereg_mr(r->frmr.fr_mr))
+ +		goto out_fail;
+ +
+ +	r->frmr.fr_mr = ib_alloc_mr(pd, IB_MR_TYPE_MEM_REG, depth);
+ +	if (IS_ERR(r->frmr.fr_mr))
+ +		goto out_fail;
+ +
+ +	dprintk("RPC:       %s: recovered FRMR %p\n", __func__, r);
+ +	r->frmr.fr_state = FRMR_IS_INVALID;
+ +	rpcrdma_put_mw(r_xprt, r);
+ +	return;
+ +
+ +out_fail:
+ +	pr_warn("RPC:       %s: FRMR %p unrecovered\n",
+ +		__func__, r);
+ +}
+ +
+ +/* A broken MR was discovered in a context that can't sleep.
+ + * Defer recovery to the recovery worker.
+ + */
+ +static void
+ +__frwr_queue_recovery(struct rpcrdma_mw *r)
+ +{
+ +	INIT_WORK(&r->frmr.fr_work, __frwr_recovery_worker);
+ +	queue_work(frwr_recovery_wq, &r->frmr.fr_work);
+++=======
++ bool
++ frwr_is_supported(struct rpcrdma_ia *ia)
++ {
++ 	struct ib_device_attr *attrs = &ia->ri_device->attrs;
++ 
++ 	if (!(attrs->device_cap_flags & IB_DEVICE_MEM_MGT_EXTENSIONS))
++ 		goto out_not_supported;
++ 	if (attrs->max_fast_reg_page_list_len == 0)
++ 		goto out_not_supported;
++ 	return true;
++ 
++ out_not_supported:
++ 	pr_info("rpcrdma: 'frwr' mode is not supported by device %s\n",
++ 		ia->ri_device->name);
++ 	return false;
+++>>>>>>> b54054ca5590 (xprtrdma: Clean up device capability detection)
+  }
+  
+  static int
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index 972c68288b15,cd4c5f1d554a..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -396,42 -393,25 +395,33 @@@ rpcrdma_ia_open(struct rpcrdma_xprt *xp
+  		goto out2;
+  	}
+  
+- 	if (memreg == RPCRDMA_FRMR) {
+- 		if (!(ia->ri_device->attrs.device_cap_flags &
+- 				IB_DEVICE_MEM_MGT_EXTENSIONS) ||
+- 		    (ia->ri_device->attrs.max_fast_reg_page_list_len == 0)) {
+- 			dprintk("RPC:       %s: FRMR registration "
+- 				"not supported by HCA\n", __func__);
+- 			memreg = RPCRDMA_MTHCAFMR;
+- 		}
+- 	}
+- 	if (memreg == RPCRDMA_MTHCAFMR) {
+- 		if (!ia->ri_device->alloc_fmr) {
+- 			dprintk("RPC:       %s: MTHCAFMR registration "
+- 				"not supported by HCA\n", __func__);
+- 			rc = -EINVAL;
+- 			goto out3;
+- 		}
+- 	}
+- 
+  	switch (memreg) {
+  	case RPCRDMA_FRMR:
+++<<<<<<< HEAD
+ +		ia->ri_ops = &rpcrdma_frwr_memreg_ops;
+ +		break;
+ +	case RPCRDMA_ALLPHYSICAL:
+ +		ia->ri_ops = &rpcrdma_physical_memreg_ops;
+ +		break;
+++=======
++ 		if (frwr_is_supported(ia)) {
++ 			ia->ri_ops = &rpcrdma_frwr_memreg_ops;
++ 			break;
++ 		}
++ 		/*FALLTHROUGH*/
+++>>>>>>> b54054ca5590 (xprtrdma: Clean up device capability detection)
+  	case RPCRDMA_MTHCAFMR:
+- 		ia->ri_ops = &rpcrdma_fmr_memreg_ops;
+- 		break;
++ 		if (fmr_is_supported(ia)) {
++ 			ia->ri_ops = &rpcrdma_fmr_memreg_ops;
++ 			break;
++ 		}
++ 		/*FALLTHROUGH*/
+  	default:
+- 		printk(KERN_ERR "RPC: Unsupported memory "
+- 				"registration mode: %d\n", memreg);
+- 		rc = -ENOMEM;
++ 		pr_err("rpcrdma: Unsupported memory registration mode: %d\n",
++ 		       memreg);
++ 		rc = -EINVAL;
+  		goto out3;
+  	}
+- 	dprintk("RPC:       %s: memory registration strategy is '%s'\n",
+- 		__func__, ia->ri_ops->ro_displayname);
+  
+  	return 0;
+  
+* Unmerged path net/sunrpc/xprtrdma/fmr_ops.c
+* Unmerged path net/sunrpc/xprtrdma/frwr_ops.c
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index b1a53c89aa34..5576a770e2a6 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -444,6 +444,8 @@ extern int xprt_rdma_pad_optimize;
+  */
+ int rpcrdma_ia_open(struct rpcrdma_xprt *, struct sockaddr *, int);
+ void rpcrdma_ia_close(struct rpcrdma_ia *);
++bool frwr_is_supported(struct rpcrdma_ia *);
++bool fmr_is_supported(struct rpcrdma_ia *);
+ 
+ /*
+  * Endpoint calls - xprtrdma/verbs.c
