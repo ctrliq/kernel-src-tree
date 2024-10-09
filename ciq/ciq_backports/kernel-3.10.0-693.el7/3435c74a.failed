@@ -1,0 +1,209 @@
+SUNRPC: Generalize the RPC buffer release API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 3435c74aed2d7b743ccbf34616c523ebee7be943
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/3435c74a.failed
+
+xprtrdma needs to allocate the Call and Reply buffers separately.
+TBH, the reliance on using a single buffer for the pair of XDR
+buffers is transport implementation-specific.
+
+Instead of passing just the rq_buffer into the buf_free method, pass
+the task structure and let buf_free take care of freeing both
+XDR buffers at once.
+
+There's a micro-optimization here. In the common case, both
+xprt_release and the transport's buf_free method were checking if
+rq_buffer was NULL. Now the check is done only once per RPC.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 3435c74aed2d7b743ccbf34616c523ebee7be943)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sunrpc/sched.h
+#	include/linux/sunrpc/xprt.h
+#	net/sunrpc/xprtrdma/transport.c
+diff --cc include/linux/sunrpc/sched.h
+index 9732a3135d64,7ba040c797ec..000000000000
+--- a/include/linux/sunrpc/sched.h
++++ b/include/linux/sunrpc/sched.h
+@@@ -235,8 -239,8 +235,13 @@@ struct rpc_task *rpc_wake_up_first(stru
+  					void *);
+  void		rpc_wake_up_status(struct rpc_wait_queue *, int);
+  void		rpc_delay(struct rpc_task *, unsigned long);
+++<<<<<<< HEAD
+ +void *		rpc_malloc(struct rpc_task *, size_t);
+ +void		rpc_free(void *);
+++=======
++ int		rpc_malloc(struct rpc_task *);
++ void		rpc_free(struct rpc_task *);
+++>>>>>>> 3435c74aed2d (SUNRPC: Generalize the RPC buffer release API)
+  int		rpciod_up(void);
+  void		rpciod_down(void);
+  int		__rpc_wait_for_completion_task(struct rpc_task *task, wait_bit_action_f *);
+diff --cc include/linux/sunrpc/xprt.h
+index a5425a2a0462,72c2aebc592b..000000000000
+--- a/include/linux/sunrpc/xprt.h
++++ b/include/linux/sunrpc/xprt.h
+@@@ -127,8 -127,8 +127,13 @@@ struct rpc_xprt_ops 
+  	void		(*rpcbind)(struct rpc_task *task);
+  	void		(*set_port)(struct rpc_xprt *xprt, unsigned short port);
+  	void		(*connect)(struct rpc_xprt *xprt, struct rpc_task *task);
+++<<<<<<< HEAD
+ +	void *		(*buf_alloc)(struct rpc_task *task, size_t size);
+ +	void		(*buf_free)(void *buffer);
+++=======
++ 	int		(*buf_alloc)(struct rpc_task *task);
++ 	void		(*buf_free)(struct rpc_task *task);
+++>>>>>>> 3435c74aed2d (SUNRPC: Generalize the RPC buffer release API)
+  	int		(*send_request)(struct rpc_task *task);
+  	void		(*set_retrans_timeout)(struct rpc_task *task);
+  	void		(*timer)(struct rpc_xprt *xprt, struct rpc_task *task);
+diff --cc net/sunrpc/xprtrdma/transport.c
+index 9ac979fd4b23,ebf14ba437c6..000000000000
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@@ -514,8 -523,8 +514,13 @@@ xprt_rdma_allocate(struct rpc_task *tas
+  out:
+  	dprintk("RPC:       %s: size %zd, request 0x%p\n", __func__, size, req);
+  	req->rl_connect_cookie = 0;	/* our reserved value */
+++<<<<<<< HEAD
+ +	req->rl_task = task;
+ +	return req->rl_sendbuf->rg_base;
+++=======
++ 	rqst->rq_buffer = req->rl_sendbuf->rg_base;
++ 	return 0;
+++>>>>>>> 3435c74aed2d (SUNRPC: Generalize the RPC buffer release API)
+  
+  out_rdmabuf:
+  	min_size = r_xprt->rx_data.inline_wsize;
+@@@ -558,25 -567,22 +563,23 @@@ out_sendbuf
+  
+  out_fail:
+  	rpcrdma_buffer_put(req);
+ -	return -ENOMEM;
+ +	r_xprt->rx_stats.failed_marshal_count++;
+ +	return NULL;
+  }
+  
+- /*
+-  * This function returns all RDMA resources to the pool.
++ /**
++  * xprt_rdma_free - release resources allocated by xprt_rdma_allocate
++  * @task: RPC task
++  *
++  * Caller guarantees rqst->rq_buffer is non-NULL.
+   */
+  static void
+- xprt_rdma_free(void *buffer)
++ xprt_rdma_free(struct rpc_task *task)
+  {
+- 	struct rpcrdma_req *req;
+- 	struct rpcrdma_xprt *r_xprt;
+- 	struct rpcrdma_regbuf *rb;
++ 	struct rpc_rqst *rqst = task->tk_rqstp;
++ 	struct rpcrdma_xprt *r_xprt = rpcx_to_rdmax(rqst->rq_xprt);
++ 	struct rpcrdma_req *req = rpcr_to_rdmar(rqst);
+  
+- 	if (buffer == NULL)
+- 		return;
+- 
+- 	rb = container_of(buffer, struct rpcrdma_regbuf, rg_base[0]);
+- 	req = rb->rg_owner;
+  	if (req->rl_backchannel)
+  		return;
+  
+* Unmerged path include/linux/sunrpc/sched.h
+* Unmerged path include/linux/sunrpc/xprt.h
+diff --git a/net/sunrpc/sched.c b/net/sunrpc/sched.c
+index fcfd48d263f6..fc425ee047b7 100644
+--- a/net/sunrpc/sched.c
++++ b/net/sunrpc/sched.c
+@@ -866,18 +866,16 @@ void *rpc_malloc(struct rpc_task *task, size_t size)
+ EXPORT_SYMBOL_GPL(rpc_malloc);
+ 
+ /**
+- * rpc_free - free buffer allocated via rpc_malloc
+- * @buffer: buffer to free
++ * rpc_free - free RPC buffer resources allocated via rpc_malloc
++ * @task: RPC task
+  *
+  */
+-void rpc_free(void *buffer)
++void rpc_free(struct rpc_task *task)
+ {
++	void *buffer = task->tk_rqstp->rq_buffer;
+ 	size_t size;
+ 	struct rpc_buffer *buf;
+ 
+-	if (!buffer)
+-		return;
+-
+ 	buf = container_of(buffer, struct rpc_buffer, data);
+ 	size = buf->len;
+ 
+diff --git a/net/sunrpc/xprt.c b/net/sunrpc/xprt.c
+index d07aef3ab368..0572b13ae8d6 100644
+--- a/net/sunrpc/xprt.c
++++ b/net/sunrpc/xprt.c
+@@ -1283,7 +1283,7 @@ void xprt_release(struct rpc_task *task)
+ 				xprt->last_used + xprt->idle_timeout);
+ 	spin_unlock_bh(&xprt->transport_lock);
+ 	if (req->rq_buffer)
+-		xprt->ops->buf_free(req->rq_buffer);
++		xprt->ops->buf_free(task);
+ 	xprt_inject_disconnect(xprt);
+ 	if (req->rq_cred != NULL)
+ 		put_rpccred(req->rq_cred);
+diff --git a/net/sunrpc/xprtrdma/svc_rdma_backchannel.c b/net/sunrpc/xprtrdma/svc_rdma_backchannel.c
+index 5a87ff73fd95..62a708b1fcca 100644
+--- a/net/sunrpc/xprtrdma/svc_rdma_backchannel.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_backchannel.c
+@@ -186,7 +186,7 @@ xprt_rdma_bc_allocate(struct rpc_task *task, size_t size)
+ }
+ 
+ static void
+-xprt_rdma_bc_free(void *buffer)
++xprt_rdma_bc_free(struct rpc_task *task)
+ {
+ 	/* No-op: ctxt and page have already been freed. */
+ }
+* Unmerged path net/sunrpc/xprtrdma/transport.c
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index be2bcc2ea72b..aa0fca9e4afa 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -290,7 +290,6 @@ struct rpcrdma_req {
+ 	unsigned int		rl_niovs;
+ 	unsigned int		rl_nchunks;
+ 	unsigned int		rl_connect_cookie;
+-	struct rpc_task		*rl_task;
+ 	struct rpcrdma_buffer	*rl_buffer;
+ 	struct rpcrdma_rep	*rl_reply;/* holder for reply buffer */
+ 	struct ib_sge		rl_send_iov[RPCRDMA_MAX_IOVS];
+diff --git a/net/sunrpc/xprtsock.c b/net/sunrpc/xprtsock.c
+index dcf56fea1ac0..220db25537b5 100644
+--- a/net/sunrpc/xprtsock.c
++++ b/net/sunrpc/xprtsock.c
+@@ -2524,13 +2524,11 @@ static void *bc_malloc(struct rpc_task *task, size_t size)
+ /*
+  * Free the space allocated in the bc_alloc routine
+  */
+-static void bc_free(void *buffer)
++static void bc_free(struct rpc_task *task)
+ {
++	void *buffer = task->tk_rqstp->rq_buffer;
+ 	struct rpc_buffer *buf;
+ 
+-	if (!buffer)
+-		return;
+-
+ 	buf = container_of(buffer, struct rpc_buffer, data);
+ 	free_page((unsigned long)buf);
+ }
