@@ -1,0 +1,301 @@
+block: Fix a race between the cgroup code and request queue initialization
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [block] Fix a race between the cgroup code and request queue initialization (Ming Lei) [1568817]
+Rebuild_FUZZ: 95.04%
+commit-author Bart Van Assche <bart.vanassche@wdc.com>
+commit 498f6650aec864e331cae7575fec5f07781d0bf3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/498f6650.failed
+
+Initialize the request queue lock earlier such that the following
+race can no longer occur:
+
+blk_init_queue_node()             blkcg_print_blkgs()
+  blk_alloc_queue_node (1)
+    q->queue_lock = &q->__queue_lock (2)
+    blkcg_init_queue(q) (3)
+                                    spin_lock_irq(blkg->q->queue_lock) (4)
+  q->queue_lock = lock (5)
+                                    spin_unlock_irq(blkg->q->queue_lock) (6)
+
+(1) allocate an uninitialized queue;
+(2) initialize queue_lock to its default internal lock;
+(3) initialize blkcg part of request queue, which will create blkg and
+    then insert it to blkg_list;
+(4) traverse blkg_list and find the created blkg, and then take its
+    queue lock, here it is the default *internal lock*;
+(5) *race window*, now queue_lock is overridden with *driver specified
+    lock*;
+(6) now unlock *driver specified lock*, not the locked *internal lock*,
+    unlock balance breaks.
+
+The changes in this patch are as follows:
+- Move the .queue_lock initialization from blk_init_queue_node() into
+  blk_alloc_queue_node().
+- Only override the .queue_lock pointer for legacy queues because it
+  is not useful for blk-mq queues to override this pointer.
+- For all all block drivers that initialize .queue_lock explicitly,
+  change the blk_alloc_queue() call in the driver into a
+  blk_alloc_queue_node() call and remove the explicit .queue_lock
+  initialization. Additionally, initialize the spin lock that will
+  be used as queue lock earlier if necessary.
+
+	Reported-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+	Signed-off-by: Bart Van Assche <bart.vanassche@wdc.com>
+	Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Philipp Reisner <philipp.reisner@linbit.com>
+	Cc: Ulf Hansson <ulf.hansson@linaro.org>
+	Cc: Kees Cook <keescook@chromium.org>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 498f6650aec864e331cae7575fec5f07781d0bf3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+#	drivers/block/drbd/drbd_main.c
+diff --cc block/blk-core.c
+index 3c1e8c52cafa,41c74b37be85..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -741,11 -888,23 +741,29 @@@ static void blk_rq_timed_out_timer(unsi
+  	kblockd_schedule_work(&q->timeout_work);
+  }
+  
+++<<<<<<< HEAD
+ +struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
+++=======
++ /**
++  * blk_alloc_queue_node - allocate a request queue
++  * @gfp_mask: memory allocation flags
++  * @node_id: NUMA node to allocate memory from
++  * @lock: For legacy queues, pointer to a spinlock that will be used to e.g.
++  *        serialize calls to the legacy .request_fn() callback. Ignored for
++  *	  blk-mq request queues.
++  *
++  * Note: pass the queue lock as the third argument to this function instead of
++  * setting the queue lock pointer explicitly to avoid triggering a sporadic
++  * crash in the blkcg code. This function namely calls blkcg_init_queue() and
++  * the queue lock pointer must be set before blkcg_init_queue() is called.
++  */
++ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id,
++ 					   spinlock_t *lock)
+++>>>>>>> 498f6650aec8 (block: Fix a race between the cgroup code and request queue initialization)
+  {
+  	struct request_queue *q;
+ +	struct queue_limits_aux *limits_aux = NULL;
+ +	int err;
+  
+  	q = kmem_cache_alloc_node(blk_requestq_cachep,
+  				gfp_mask | __GFP_ZERO, node_id);
+@@@ -882,15 -1039,17 +897,27 @@@ EXPORT_SYMBOL(blk_init_queue)
+  struct request_queue *
+  blk_init_queue_node(request_fn_proc *rfn, spinlock_t *lock, int node_id)
+  {
+ -	struct request_queue *q;
+ +	struct request_queue *uninit_q, *q;
+  
+++<<<<<<< HEAD
+ +	uninit_q = blk_alloc_queue_node(GFP_KERNEL, node_id);
+ +	if (!uninit_q)
+ +		return NULL;
+ +
+ +	q = blk_init_allocated_queue(uninit_q, rfn, lock);
+ +	if (!q)
+ +		blk_cleanup_queue(uninit_q);
+++=======
++ 	q = blk_alloc_queue_node(GFP_KERNEL, node_id, lock);
++ 	if (!q)
++ 		return NULL;
++ 
++ 	q->request_fn = rfn;
++ 	if (blk_init_allocated_queue(q) < 0) {
++ 		blk_cleanup_queue(q);
++ 		return NULL;
++ 	}
+++>>>>>>> 498f6650aec8 (block: Fix a race between the cgroup code and request queue initialization)
+  
+  	return q;
+  }
+diff --cc drivers/block/drbd/drbd_main.c
+index a5dca6affcbb,185f1ef00a7c..000000000000
+--- a/drivers/block/drbd/drbd_main.c
++++ b/drivers/block/drbd/drbd_main.c
+@@@ -2604,37 -2787,40 +2604,37 @@@ int init_submitter(struct drbd_conf *md
+  	return 0;
+  }
+  
+ -enum drbd_ret_code drbd_create_device(struct drbd_config_context *adm_ctx, unsigned int minor)
+ +enum drbd_ret_code conn_new_minor(struct drbd_tconn *tconn, unsigned int minor, int vnr)
+  {
+ -	struct drbd_resource *resource = adm_ctx->resource;
+ -	struct drbd_connection *connection;
+ -	struct drbd_device *device;
+ -	struct drbd_peer_device *peer_device, *tmp_peer_device;
+ +	struct drbd_conf *mdev;
+  	struct gendisk *disk;
+  	struct request_queue *q;
+ -	int id;
+ -	int vnr = adm_ctx->volume;
+ +	int vnr_got = vnr;
+ +	int minor_got = minor;
+  	enum drbd_ret_code err = ERR_NOMEM;
+  
+ -	device = minor_to_device(minor);
+ -	if (device)
+ -		return ERR_MINOR_OR_VOLUME_EXISTS;
+ +	mdev = minor_to_mdev(minor);
+ +	if (mdev)
+ +		return ERR_MINOR_EXISTS;
+  
+  	/* GFP_KERNEL, we are outside of all write-out paths */
+ -	device = kzalloc(sizeof(struct drbd_device), GFP_KERNEL);
+ -	if (!device)
+ +	mdev = kzalloc(sizeof(struct drbd_conf), GFP_KERNEL);
+ +	if (!mdev)
+  		return ERR_NOMEM;
+ -	kref_init(&device->kref);
+  
+ -	kref_get(&resource->kref);
+ -	device->resource = resource;
+ -	device->minor = minor;
+ -	device->vnr = vnr;
+ +	kref_get(&tconn->kref);
+ +	mdev->tconn = tconn;
+ +
+ +	mdev->minor = minor;
+ +	mdev->vnr = vnr;
+  
+ -	drbd_init_set_defaults(device);
+ +	drbd_init_set_defaults(mdev);
+  
+- 	q = blk_alloc_queue(GFP_KERNEL);
++ 	q = blk_alloc_queue_node(GFP_KERNEL, NUMA_NO_NODE, &resource->req_lock);
+  	if (!q)
+  		goto out_no_q;
+ -	device->rq_queue = q;
+ -	q->queuedata   = device;
+ +	mdev->rq_queue = q;
+ +	q->queuedata   = mdev;
+  
+  	disk = alloc_disk(1);
+  	if (!disk)
+@@@ -2662,40 -2848,56 +2662,43 @@@
+  	/* Setting the max_hw_sectors to an odd value of 8kibyte here
+  	   This triggers a max_bio_size message upon first attach or connect */
+  	blk_queue_max_hw_sectors(q, DRBD_MAX_BIO_SIZE_SAFE >> 8);
+ -
+ -	device->md_io.page = alloc_page(GFP_KERNEL);
+ -	if (!device->md_io.page)
+++<<<<<<< HEAD
+ +	blk_queue_bounce_limit(q, BLK_BOUNCE_ANY);
+ +	blk_queue_merge_bvec(q, drbd_merge_bvec);
+ +	q->queue_lock = &mdev->tconn->req_lock; /* needed since we use */
+++=======
+++>>>>>>> 498f6650aec8 (block: Fix a race between the cgroup code and request queue initialization)
+ +
+ +	mdev->md_io_page = alloc_page(GFP_KERNEL);
+ +	if (!mdev->md_io_page)
+  		goto out_no_io_page;
+  
+ -	if (drbd_bm_init(device))
+ +	if (drbd_bm_init(mdev))
+  		goto out_no_bitmap;
+ -	device->read_requests = RB_ROOT;
+ -	device->write_requests = RB_ROOT;
+ -
+ -	id = idr_alloc(&drbd_devices, device, minor, minor + 1, GFP_KERNEL);
+ -	if (id < 0) {
+ -		if (id == -ENOSPC)
+ -			err = ERR_MINOR_OR_VOLUME_EXISTS;
+ +	mdev->read_requests = RB_ROOT;
+ +	mdev->write_requests = RB_ROOT;
+ +
+ +	minor_got = idr_alloc(&minors, mdev, minor, minor + 1, GFP_KERNEL);
+ +	if (minor_got < 0) {
+ +		if (minor_got == -ENOSPC) {
+ +			err = ERR_MINOR_EXISTS;
+ +			drbd_msg_put_info("requested minor exists already");
+ +		}
+  		goto out_no_minor_idr;
+  	}
+ -	kref_get(&device->kref);
+  
+ -	id = idr_alloc(&resource->devices, device, vnr, vnr + 1, GFP_KERNEL);
+ -	if (id < 0) {
+ -		if (id == -ENOSPC)
+ -			err = ERR_MINOR_OR_VOLUME_EXISTS;
+ -		goto out_idr_remove_minor;
+ -	}
+ -	kref_get(&device->kref);
+ -
+ -	INIT_LIST_HEAD(&device->peer_devices);
+ -	INIT_LIST_HEAD(&device->pending_bitmap_io);
+ -	for_each_connection(connection, resource) {
+ -		peer_device = kzalloc(sizeof(struct drbd_peer_device), GFP_KERNEL);
+ -		if (!peer_device)
+ -			goto out_idr_remove_from_resource;
+ -		peer_device->connection = connection;
+ -		peer_device->device = device;
+ -
+ -		list_add(&peer_device->peer_devices, &device->peer_devices);
+ -		kref_get(&device->kref);
+ -
+ -		id = idr_alloc(&connection->peer_devices, peer_device, vnr, vnr + 1, GFP_KERNEL);
+ -		if (id < 0) {
+ -			if (id == -ENOSPC)
+ -				err = ERR_INVALID_REQUEST;
+ -			goto out_idr_remove_from_resource;
+ +	vnr_got = idr_alloc(&tconn->volumes, mdev, vnr, vnr + 1, GFP_KERNEL);
+ +	if (vnr_got < 0) {
+ +		if (vnr_got == -ENOSPC) {
+ +			err = ERR_INVALID_REQUEST;
+ +			drbd_msg_put_info("requested volume exists already");
+  		}
+ -		kref_get(&connection->kref);
+ -		INIT_WORK(&peer_device->send_acks_work, drbd_send_acks_wf);
+ +		goto out_idr_remove_minor;
+  	}
+  
+ -	if (init_submitter(device)) {
+ +	if (init_submitter(mdev)) {
+  		err = ERR_NOMEM;
+ +		drbd_msg_put_info("unable to create submit workqueue");
+  		goto out_idr_remove_vol;
+  	}
+  
+* Unmerged path block/blk-core.c
+* Unmerged path drivers/block/drbd/drbd_main.c
+diff --git a/drivers/block/umem.c b/drivers/block/umem.c
+index ad70868f8a96..8d26772c4cff 100644
+--- a/drivers/block/umem.c
++++ b/drivers/block/umem.c
+@@ -892,13 +892,14 @@ static int mm_pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
+ 	card->Active = -1;	/* no page is active */
+ 	card->bio = NULL;
+ 	card->biotail = &card->bio;
++	spin_lock_init(&card->lock);
+ 
+-	card->queue = blk_alloc_queue(GFP_KERNEL);
++	card->queue = blk_alloc_queue_node(GFP_KERNEL, NUMA_NO_NODE,
++					   &card->lock);
+ 	if (!card->queue)
+ 		goto failed_alloc;
+ 
+ 	blk_queue_make_request(card->queue, mm_make_request);
+-	card->queue->queue_lock = &card->lock;
+ 	card->queue->queuedata = card;
+ 
+ 	tasklet_init(&card->tasklet, process_page, (unsigned long)card);
+@@ -972,8 +973,6 @@ static int mm_pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
+ 	dev_printk(KERN_INFO, &card->dev->dev,
+ 		"Window size %d bytes, IRQ %d\n", data, dev->irq);
+ 
+-	spin_lock_init(&card->lock);
+-
+ 	pci_set_drvdata(dev, card);
+ 
+ 	if (pci_write_cmd != 0x0F) 	/* If not Memory Write & Invalidate */
