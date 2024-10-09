@@ -1859,6 +1859,8 @@ static void event_callback(void *context)
  */
 static void __set_size(struct mapped_device *md, sector_t size)
 {
+	lockdep_assert_held(&md->suspend_lock);
+
 	set_capacity(md->disk, size);
 
 	i_size_write(md->bdev->bd_inode, (loff_t)size << SECTOR_SHIFT);
@@ -2370,8 +2372,6 @@ static void unlock_fs(struct mapped_device *md)
  * If __dm_suspend returns 0, the device is completely quiescent
  * now. There is no request-processing activity. All new requests
  * are being added to md->deferred list.
- *
- * Caller must hold md->suspend_lock
  */
 static int __dm_suspend(struct mapped_device *md, struct dm_table *map,
 			unsigned suspend_flags, long task_state,
@@ -2586,6 +2586,8 @@ out:
 static void __dm_internal_suspend(struct mapped_device *md, unsigned suspend_flags)
 {
 	struct dm_table *map = NULL;
+
+	lockdep_assert_held(&md->suspend_lock);
 
 	if (md->internal_suspend_count++)
 		return; /* nested internal suspend */
