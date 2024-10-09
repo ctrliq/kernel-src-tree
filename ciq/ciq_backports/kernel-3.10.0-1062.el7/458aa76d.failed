@@ -1,0 +1,167 @@
+mm/thp/migration: switch from flush_tlb_range to flush_pmd_tlb_range
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [mm] thp/migration: switch from flush_tlb_range to flush_pmd_tlb_range (Andrea Arcangeli) [1636066]
+Rebuild_FUZZ: 97.74%
+commit-author Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+commit 458aa76d132dc1c3c60be0f0db99bcc0ce1767fc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/458aa76d.failed
+
+We remove one instace of flush_tlb_range here.  That was added by commit
+f714f4f20e59 ("mm: numa: call MMU notifiers on THP migration").  But the
+pmdp_huge_clear_flush_notify should have done the require flush for us.
+Hence remove the extra flush.
+
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+	Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+	Cc: Vineet Gupta <Vineet.Gupta1@synopsys.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 458aa76d132dc1c3c60be0f0db99bcc0ce1767fc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/asm-generic/pgtable.h
+#	mm/migrate.c
+#	mm/pgtable-generic.c
+diff --cc include/asm-generic/pgtable.h
+index 4cea7a5f7095,9401f4819891..000000000000
+--- a/include/asm-generic/pgtable.h
++++ b/include/asm-generic/pgtable.h
+@@@ -944,17 -783,22 +944,36 @@@ static inline int pmd_clear_huge(pmd_t 
+  }
+  #endif	/* CONFIG_HAVE_ARCH_HUGE_VMAP */
+  
+++<<<<<<< HEAD
+ +#ifndef __HAVE_ARCH_PFN_MODIFY_ALLOWED
+ +static inline bool pfn_modify_allowed(unsigned long pfn, pgprot_t prot)
+ +{
+ +	return true;
+ +}
+ +
+ +static inline bool arch_has_pfn_modify_check(void)
+ +{
+ +	return false;
+ +}
+ +#endif /* !_HAVE_ARCH_PFN_MODIFY_ALLOWED */
+++=======
++ #ifndef __HAVE_ARCH_FLUSH_PMD_TLB_RANGE
++ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
++ /*
++  * ARCHes with special requirements for evicting THP backing TLB entries can
++  * implement this. Otherwise also, it can help optimize normal TLB flush in
++  * THP regime. stock flush_tlb_range() typically has optimization to nuke the
++  * entire TLB TLB if flush span is greater than a threshold, which will
++  * likely be true for a single huge page. Thus a single thp flush will
++  * invalidate the entire TLB which is not desitable.
++  * e.g. see arch/arc: flush_pmd_tlb_range
++  */
++ #define flush_pmd_tlb_range(vma, addr, end)	flush_tlb_range(vma, addr, end)
++ #else
++ #define flush_pmd_tlb_range(vma, addr, end)	BUILD_BUG()
++ #endif
++ #endif
+++>>>>>>> 458aa76d132d (mm/thp/migration: switch from flush_tlb_range to flush_pmd_tlb_range)
+  
+  #endif /* !__ASSEMBLY__ */
+  
+diff --cc mm/migrate.c
+index dc35415df847,fdaf0818fb30..000000000000
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@@ -1812,8 -1773,11 +1812,16 @@@ int migrate_misplaced_transhuge_page(st
+  		put_page(new_page);
+  		goto out_fail;
+  	}
+++<<<<<<< HEAD
+ +
+ +	if (tlb_flush_pending(mm))
+++=======
++ 	/*
++ 	 * We are not sure a pending tlb flush here is for a huge page
++ 	 * mapping or not. Hence use the tlb range variant
++ 	 */
++ 	if (mm_tlb_flush_pending(mm))
+++>>>>>>> 458aa76d132d (mm/thp/migration: switch from flush_tlb_range to flush_pmd_tlb_range)
+  		flush_tlb_range(vma, mmun_start, mmun_end);
+  
+  	/* Prepare a page as a migration target */
+@@@ -1876,18 -1829,17 +1884,17 @@@ fail_putback
+  	 * guarantee the copy is visible before the pagetable update.
+  	 */
+  	flush_cache_range(vma, mmun_start, mmun_end);
+ -	page_add_anon_rmap(new_page, vma, mmun_start, true);
+ -	pmdp_huge_clear_flush_notify(vma, mmun_start, pmd);
+ +	page_add_new_anon_rmap(new_page, vma, mmun_start);
+ +	pmdp_clear_flush_notify(vma, mmun_start, pmd);
+  	set_pmd_at(mm, mmun_start, pmd, entry);
+- 	flush_tlb_range(vma, mmun_start, mmun_end);
+  	update_mmu_cache_pmd(vma, address, &entry);
+  
+  	if (page_count(page) != 2) {
+  		set_pmd_at(mm, mmun_start, pmd, orig_entry);
+- 		flush_tlb_range(vma, mmun_start, mmun_end);
++ 		flush_pmd_tlb_range(vma, mmun_start, mmun_end);
+  		mmu_notifier_invalidate_range(mm, mmun_start, mmun_end);
+  		update_mmu_cache_pmd(vma, address, &entry);
+ -		page_remove_rmap(new_page, true);
+ +		page_remove_rmap(new_page);
+  		goto fail_putback;
+  	}
+  
+diff --cc mm/pgtable-generic.c
+index 24a3060dfc64,71c5f9109f2a..000000000000
+--- a/mm/pgtable-generic.c
++++ b/mm/pgtable-generic.c
+@@@ -96,9 -83,38 +96,44 @@@ pte_t ptep_clear_flush(struct vm_area_s
+  #endif
+  
+  #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+++<<<<<<< HEAD
+ +#ifndef __HAVE_ARCH_PMDP_CLEAR_FLUSH
+ +pmd_t pmdp_clear_flush(struct vm_area_struct *vma, unsigned long address,
+ +		       pmd_t *pmdp)
+++=======
++ 
++ #ifndef __HAVE_ARCH_PMDP_SET_ACCESS_FLAGS
++ int pmdp_set_access_flags(struct vm_area_struct *vma,
++ 			  unsigned long address, pmd_t *pmdp,
++ 			  pmd_t entry, int dirty)
++ {
++ 	int changed = !pmd_same(*pmdp, entry);
++ 	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
++ 	if (changed) {
++ 		set_pmd_at(vma->vm_mm, address, pmdp, entry);
++ 		flush_pmd_tlb_range(vma, address, address + HPAGE_PMD_SIZE);
++ 	}
++ 	return changed;
++ }
++ #endif
++ 
++ #ifndef __HAVE_ARCH_PMDP_CLEAR_YOUNG_FLUSH
++ int pmdp_clear_flush_young(struct vm_area_struct *vma,
++ 			   unsigned long address, pmd_t *pmdp)
++ {
++ 	int young;
++ 	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
++ 	young = pmdp_test_and_clear_young(vma, address, pmdp);
++ 	if (young)
++ 		flush_pmd_tlb_range(vma, address, address + HPAGE_PMD_SIZE);
++ 	return young;
++ }
++ #endif
++ 
++ #ifndef __HAVE_ARCH_PMDP_HUGE_CLEAR_FLUSH
++ pmd_t pmdp_huge_clear_flush(struct vm_area_struct *vma, unsigned long address,
++ 			    pmd_t *pmdp)
+++>>>>>>> 458aa76d132d (mm/thp/migration: switch from flush_tlb_range to flush_pmd_tlb_range)
+  {
+  	pmd_t pmd;
+  	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
+* Unmerged path include/asm-generic/pgtable.h
+* Unmerged path mm/migrate.c
+* Unmerged path mm/pgtable-generic.c
