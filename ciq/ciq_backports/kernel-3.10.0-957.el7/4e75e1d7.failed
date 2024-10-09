@@ -1,0 +1,143 @@
+driver core: add helper to reuse a device-tree node
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Johan Hovold <johan@kernel.org>
+commit 4e75e1d7dac9d7c95c57eceb451d01f2afcc8626
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/4e75e1d7.failed
+
+Add a helper function to be used when reusing the device-tree node of
+another device.
+
+It is fairly common for drivers to reuse the device-tree node of a
+parent (or other ancestor) device when creating class or bus devices
+(e.g. gpio chips, i2c adapters, iio chips, spi masters, serdev, phys,
+usb root hubs). But reusing a device-tree node may cause problems if the
+new device is later probed as for example driver core would currently
+attempt to reinitialise an already active associated pinmux
+configuration.
+
+Other potential issues include the platform-bus code unconditionally
+dropping the device-tree node reference in its device destructor,
+reinitialisation of other bus-managed resources such as clocks, and the
+recently added DMA-setup in driver core.
+
+Note that for most examples above this is currently not an issue as the
+devices are never probed, but this is a problem for the USB bus which
+has recently gained device-tree support. This was discovered and
+worked-around in a rather ad-hoc fashion by commit dc5878abf49c ("usb:
+core: move root hub's device node assignment after it is added to bus")
+by not setting the of_node pointer until after the root-hub device has
+been registered.
+
+Instead we can allow devices to reuse a device-tree node by setting a
+flag in their struct device that can be used by core, bus and driver
+code to avoid resources from being over-allocated.
+
+Note that the helper also grabs an extra reference to the device node,
+which specifically balances the unconditional put in the platform-device
+destructor.
+
+	Signed-off-by: Johan Hovold <johan@kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 4e75e1d7dac9d7c95c57eceb451d01f2afcc8626)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/device.h
+diff --cc include/linux/device.h
+index aa228cd2d2b9,60ab00b13095..000000000000
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@@ -764,8 -874,13 +764,10 @@@ struct acpi_dev_node 
+   * @release:	Callback to free the device after all references have
+   * 		gone away. This should be set by the allocator of the
+   * 		device (i.e. the bus driver that discovered the device).
+ - * @iommu_group: IOMMU group the device belongs to.
+ - * @iommu_fwspec: IOMMU-specific properties supplied by firmware.
+ - *
+   * @offline_disabled: If set, the device is permanently online.
+   * @offline:	Set after successful invocation of bus type's .offline().
++  * @of_node_reused: Set if the device-tree node is shared with an ancestor
++  *              device.
+   *
+   * At the lowest level, every device in a Linux system is represented by an
+   * instance of struct device. The device structure contains the information
+@@@ -843,30 -967,10 +845,34 @@@ struct device 
+  
+  	bool			offline_disabled:1;
+  	bool			offline:1;
+++<<<<<<< HEAD
+ +
+ +	/* Extension to accomodate future upstream changes to this structure
+ +	 * yet maintain RHEL7 KABI.  For Red Hat internal use only!
+ +	 */
+ +	struct device_rh	*device_rh;
+++=======
++ 	bool			of_node_reused:1;
+++>>>>>>> 4e75e1d7dac9 (driver core: add helper to reuse a device-tree node)
+  };
+  
+ +/* RHEL7 specific 'struct device_rh' shadow structure to help maintain KABI
+ + * going forward.  This structure will never be under KABI restrictions.
+ + */
+ +struct device_rh {
+ +	RH_KABI_EXTEND(struct dev_pm_info_rh power)
+ +#ifdef CONFIG_PINCTRL
+ +	RH_KABI_EXTEND(struct dev_pin_info *pins)
+ +#endif
+ +	RH_KABI_EXTEND(struct fwnode_handle *fwnode)
+ +	RH_KABI_EXTEND(struct dma_map_ops *dma_ops)
+ +
+ +	/* RHEL7: due to KABI this can't go into struct class */
+ +	RH_KABI_EXTEND(int (*class_shutdown_pre)(struct device *dev))
+ +};
+ +/* allocator for device_rh */
+ +extern void device_rh_alloc(struct device *dev);
+ +
+  static inline struct device *kobj_to_dev(struct kobject *kobj)
+  {
+  	return container_of(kobj, struct device, kobj);
+@@@ -1020,7 -1147,15 +1026,8 @@@ extern int device_offline(struct devic
+  extern int device_online(struct device *dev);
+  extern void set_primary_fwnode(struct device *dev, struct fwnode_handle *fwnode);
+  extern void set_secondary_fwnode(struct device *dev, struct fwnode_handle *fwnode);
++ void device_set_of_node_from_dev(struct device *dev, const struct device *dev2);
+  
+ -static inline int dev_num_vf(struct device *dev)
+ -{
+ -	if (dev->bus && dev->bus->num_vf)
+ -		return dev->bus->num_vf(dev);
+ -	return 0;
+ -}
+ -
+  /*
+   * Root device objects for grouping under /sys/devices
+   */
+diff --git a/drivers/base/core.c b/drivers/base/core.c
+index 607c1beb7454..df667444939c 100644
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -2406,3 +2406,19 @@ void set_secondary_fwnode(struct device *dev, struct fwnode_handle *fwnode)
+ 	else
+ 		set_rh_dev_fwnode(dev, fwnode);
+ }
++
++/**
++ * device_set_of_node_from_dev - reuse device-tree node of another device
++ * @dev: device whose device-tree node is being set
++ * @dev2: device whose device-tree node is being reused
++ *
++ * Takes another reference to the new device-tree node after first dropping
++ * any reference held to the old node.
++ */
++void device_set_of_node_from_dev(struct device *dev, const struct device *dev2)
++{
++	of_node_put(dev->of_node);
++	dev->of_node = of_node_get(dev2->of_node);
++	dev->of_node_reused = true;
++}
++EXPORT_SYMBOL_GPL(device_set_of_node_from_dev);
+* Unmerged path include/linux/device.h
