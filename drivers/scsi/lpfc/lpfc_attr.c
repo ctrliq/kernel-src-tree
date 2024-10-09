@@ -6458,6 +6458,8 @@ lpfc_get_cfgparam(struct lpfc_hba *phba)
 		phba->cfg_auto_imax = 0;
 	phba->initial_imax = phba->cfg_fcp_imax;
 
+	phba->cfg_enable_pbde = 0;
+
 	/* A value of 0 means use the number of CPUs found in the system */
 	if (phba->cfg_fcp_io_channel == 0)
 		phba->cfg_fcp_io_channel = phba->sli4_hba.num_present_cpu;
