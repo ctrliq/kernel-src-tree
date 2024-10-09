@@ -1,0 +1,212 @@
+s390/cpum_cf: add support for the MT-diagnostic counter set (z13)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [s390] cpum_cf: add support for the MT-diagnostic counter set (z13) (Hendrik Brueckner) [1519345]
+Rebuild_FUZZ: 96.00%
+commit-author Hendrik Brueckner <brueckner@linux.vnet.ibm.com>
+commit ee699f329a239bc3cc8a8c336b9615166993bffc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/ee699f32.failed
+
+Complete the IBM z13 support and support counters from the
+MT-diagnostic counter set.  Note that this counter set is
+available only if SMT is enabled.
+
+	Signed-off-by: Hendrik Brueckner <brueckner@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit ee699f329a239bc3cc8a8c336b9615166993bffc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/cpu_mf.h
+diff --cc arch/s390/include/asm/cpu_mf.h
+index 9c0bdd6d9148,facdc2496c3a..000000000000
+--- a/arch/s390/include/asm/cpu_mf.h
++++ b/arch/s390/include/asm/cpu_mf.h
+@@@ -20,13 -20,11 +20,19 @@@
+  #define CPU_MF_INT_SF_PRA	(1 << 29)	/* program request alert */
+  #define CPU_MF_INT_SF_SACA	(1 << 23)	/* sampler auth. change alert */
+  #define CPU_MF_INT_SF_LSDA	(1 << 22)	/* loss of sample data alert */
++ #define CPU_MF_INT_CF_MTDA	(1 << 15)	/* loss of MT ctr. data alert */
+  #define CPU_MF_INT_CF_CACA	(1 <<  7)	/* counter auth. change alert */
+  #define CPU_MF_INT_CF_LCDA	(1 <<  6)	/* loss of counter data alert */
+++<<<<<<< HEAD
+ +#define CPU_MF_INT_RI_HALTED	(1 <<  5)	/* run-time instr. halted */
+ +#define CPU_MF_INT_RI_BUF_FULL	(1 <<  4)	/* run-time instr. program
+ +						   buffer full */
+ +
+ +#define CPU_MF_INT_CF_MASK	(CPU_MF_INT_CF_CACA|CPU_MF_INT_CF_LCDA)
+++=======
++ #define CPU_MF_INT_CF_MASK	(CPU_MF_INT_CF_MTDA|CPU_MF_INT_CF_CACA| \
++ 				 CPU_MF_INT_CF_LCDA)
+++>>>>>>> ee699f329a23 (s390/cpum_cf: add support for the MT-diagnostic counter set (z13))
+  #define CPU_MF_INT_SF_MASK	(CPU_MF_INT_SF_IAE|CPU_MF_INT_SF_ISE|	\
+  				 CPU_MF_INT_SF_PRA|CPU_MF_INT_SF_SACA|	\
+  				 CPU_MF_INT_SF_LSDA)
+* Unmerged path arch/s390/include/asm/cpu_mf.h
+diff --git a/arch/s390/kernel/perf_cpum_cf.c b/arch/s390/kernel/perf_cpum_cf.c
+index f920309d002c..41005fae1f75 100644
+--- a/arch/s390/kernel/perf_cpum_cf.c
++++ b/arch/s390/kernel/perf_cpum_cf.c
+@@ -22,19 +22,12 @@
+ #include <asm/irq.h>
+ #include <asm/cpu_mf.h>
+ 
+-/* CPU-measurement counter facility supports these CPU counter sets:
+- * For CPU counter sets:
+- *    Basic counter set:	     0-31
+- *    Problem-state counter set:    32-63
+- *    Crypto-activity counter set:  64-127
+- *    Extented counter set:	   128-159
+- */
+ enum cpumf_ctr_set {
+-	/* CPU counter sets */
+-	CPUMF_CTR_SET_BASIC   = 0,
+-	CPUMF_CTR_SET_USER    = 1,
+-	CPUMF_CTR_SET_CRYPTO  = 2,
+-	CPUMF_CTR_SET_EXT     = 3,
++	CPUMF_CTR_SET_BASIC   = 0,    /* Basic Counter Set */
++	CPUMF_CTR_SET_USER    = 1,    /* Problem-State Counter Set */
++	CPUMF_CTR_SET_CRYPTO  = 2,    /* Crypto-Activity Counter Set */
++	CPUMF_CTR_SET_EXT     = 3,    /* Extended Counter Set */
++	CPUMF_CTR_SET_MT_DIAG = 4,    /* MT-diagnostic Counter Set */
+ 
+ 	/* Maximum number of counter sets */
+ 	CPUMF_CTR_SET_MAX,
+@@ -47,6 +40,7 @@ static const u64 cpumf_state_ctl[CPUMF_CTR_SET_MAX] = {
+ 	[CPUMF_CTR_SET_USER]	= 0x04,
+ 	[CPUMF_CTR_SET_CRYPTO]	= 0x08,
+ 	[CPUMF_CTR_SET_EXT]	= 0x01,
++	[CPUMF_CTR_SET_MT_DIAG] = 0x20,
+ };
+ 
+ static void ctr_set_enable(u64 *state, int ctr_set)
+@@ -76,19 +70,20 @@ struct cpu_hw_events {
+ };
+ static DEFINE_PER_CPU(struct cpu_hw_events, cpu_hw_events) = {
+ 	.ctr_set = {
+-		[CPUMF_CTR_SET_BASIC]  = ATOMIC_INIT(0),
+-		[CPUMF_CTR_SET_USER]   = ATOMIC_INIT(0),
+-		[CPUMF_CTR_SET_CRYPTO] = ATOMIC_INIT(0),
+-		[CPUMF_CTR_SET_EXT]    = ATOMIC_INIT(0),
++		[CPUMF_CTR_SET_BASIC]	= ATOMIC_INIT(0),
++		[CPUMF_CTR_SET_USER]	= ATOMIC_INIT(0),
++		[CPUMF_CTR_SET_CRYPTO]	= ATOMIC_INIT(0),
++		[CPUMF_CTR_SET_EXT]	= ATOMIC_INIT(0),
++		[CPUMF_CTR_SET_MT_DIAG] = ATOMIC_INIT(0),
+ 	},
+ 	.state = 0,
+ 	.flags = 0,
+ 	.txn_flags = 0,
+ };
+ 
+-static int get_counter_set(u64 event)
++static enum cpumf_ctr_set get_counter_set(u64 event)
+ {
+-	int set = -1;
++	int set = CPUMF_CTR_SET_MAX;
+ 
+ 	if (event < 32)
+ 		set = CPUMF_CTR_SET_BASIC;
+@@ -98,6 +93,8 @@ static int get_counter_set(u64 event)
+ 		set = CPUMF_CTR_SET_CRYPTO;
+ 	else if (event < 256)
+ 		set = CPUMF_CTR_SET_EXT;
++	else if (event >= 448 && event < 496)
++		set = CPUMF_CTR_SET_MT_DIAG;
+ 
+ 	return set;
+ }
+@@ -126,6 +123,7 @@ static int validate_ctr_version(const struct hw_perf_event *hwc)
+ {
+ 	struct cpu_hw_events *cpuhw;
+ 	int err = 0;
++	u16 mtdiag_ctl;
+ 
+ 	cpuhw = &get_cpu_var(cpu_hw_events);
+ 
+@@ -145,6 +143,27 @@ static int validate_ctr_version(const struct hw_perf_event *hwc)
+ 		    (cpuhw->info.csvn  > 2 && hwc->config > 255))
+ 			err = -EOPNOTSUPP;
+ 		break;
++	case CPUMF_CTR_SET_MT_DIAG:
++		if (cpuhw->info.csvn <= 3)
++			err = -EOPNOTSUPP;
++		/*
++		 * MT-diagnostic counters are read-only.  The counter set
++		 * is automatically enabled and activated on all CPUs with
++		 * multithreading (SMT).  Deactivation of multithreading
++		 * also disables the counter set.  State changes are ignored
++		 * by lcctl().	Because Linux controls SMT enablement through
++		 * a kernel parameter only, the counter set is either disabled
++		 * or enabled and active.
++		 *
++		 * Thus, the counters can only be used if SMT is on and the
++		 * counter set is enabled and active.
++		 */
++		mtdiag_ctl = cpumf_state_ctl[CPUMF_CTR_SET_MT_DIAG];
++		if (!((cpuhw->info.auth_ctl & mtdiag_ctl) &&
++		      (cpuhw->info.enable_ctl & mtdiag_ctl) &&
++		      (cpuhw->info.act_ctl & mtdiag_ctl)))
++			err = -EOPNOTSUPP;
++		break;
+ 	}
+ 
+ 	put_cpu_var(cpu_hw_events);
+@@ -250,6 +269,11 @@ static void cpumf_measurement_alert(struct ext_code ext_code,
+ 	/* loss of counter data alert */
+ 	if (alert & CPU_MF_INT_CF_LCDA)
+ 		pr_err("CPU[%i] Counter data was lost\n", smp_processor_id());
++
++	/* loss of MT counter data alert */
++	if (alert & CPU_MF_INT_CF_MTDA)
++		pr_warn("CPU[%i] MT counter data was lost\n",
++			smp_processor_id());
+ }
+ 
+ #define PMC_INIT      0
+@@ -330,6 +354,7 @@ static int __hw_perf_event_init(struct perf_event *event)
+ {
+ 	struct perf_event_attr *attr = &event->attr;
+ 	struct hw_perf_event *hwc = &event->hw;
++	enum cpumf_ctr_set set;
+ 	int err;
+ 	u64 ev;
+ 
+@@ -373,13 +398,27 @@ static int __hw_perf_event_init(struct perf_event *event)
+ 	if (ev > PERF_CPUM_CF_MAX_CTR)
+ 		return -EINVAL;
+ 
+-	/* Use the hardware perf event structure to store the counter number
+-	 * in 'config' member and the counter set to which the counter belongs
+-	 * in the 'config_base'.  The counter set (config_base) is then used
+-	 * to enable/disable the counters.
+-	 */
+-	hwc->config = ev;
+-	hwc->config_base = get_counter_set(ev);
++	/* Obtain the counter set to which the specified counter belongs */
++	set = get_counter_set(ev);
++	switch (set) {
++	case CPUMF_CTR_SET_BASIC:
++	case CPUMF_CTR_SET_USER:
++	case CPUMF_CTR_SET_CRYPTO:
++	case CPUMF_CTR_SET_EXT:
++	case CPUMF_CTR_SET_MT_DIAG:
++		/*
++		 * Use the hardware perf event structure to store the
++		 * counter number in the 'config' member and the counter
++		 * set number in the 'config_base'.  The counter set number
++		 * is then later used to enable/disable the counter(s).
++		 */
++		hwc->config = ev;
++		hwc->config_base = set;
++		break;
++	case CPUMF_CTR_SET_MAX:
++		/* The counter could not be associated to a counter set */
++		return -EINVAL;
++	};
+ 
+ 	/* Validate the counter that is assigned to this event.
+ 	 * Because the counter facility can use numerous counters at the
