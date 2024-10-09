@@ -1,0 +1,242 @@
+net/sched: Add hardware specific counters to TC actions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [net] sched: Add hardware specific counters to TC actions (Eelco Chaudron) [1636891]
+Rebuild_FUZZ: 96.23%
+commit-author Eelco Chaudron <echaudro@redhat.com>
+commit 28169abadb08333eb607621faa3a1dd7109e0d45
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/28169aba.failed
+
+Add additional counters that will store the bytes/packets processed by
+hardware. These will be exported through the netlink interface for
+displaying by the iproute2 tc tool
+
+	Signed-off-by: Eelco Chaudron <echaudro@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 28169abadb08333eb607621faa3a1dd7109e0d45)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/act_api.h
+#	net/sched/act_api.c
+#	net/sched/act_gact.c
+#	net/sched/act_mirred.c
+diff --cc include/net/act_api.h
+index 42a52bb5a68b,1ddff3360592..000000000000
+--- a/include/net/act_api.h
++++ b/include/net/act_api.h
+@@@ -36,8 -36,9 +37,9 @@@ struct tc_action 
+  	struct net_rate_estimator __rcu *tcfa_rate_est;
+  	spinlock_t			tcfa_lock;
+  	struct gnet_stats_basic_cpu __percpu *cpu_bstats;
++ 	struct gnet_stats_basic_cpu __percpu *cpu_bstats_hw;
+  	struct gnet_stats_queue __percpu *cpu_qstats;
+ -	struct tc_cookie	__rcu *act_cookie;
+ +	struct tc_cookie	*act_cookie;
+  	struct tcf_chain	*goto_chain;
+  };
+  #define tcf_index	common.tcfa_index
+@@@ -84,17 -84,22 +86,25 @@@ struct tc_action_ops 
+  	size_t	size;
+  	struct module		*owner;
+  	int     (*act)(struct sk_buff *, const struct tc_action *,
+ -		       struct tcf_result *); /* called under RCU BH lock*/
+ +		       struct tcf_result *);
+  	int     (*dump)(struct sk_buff *, struct tc_action *, int, int);
+ -	void	(*cleanup)(struct tc_action *);
+ -	int     (*lookup)(struct net *net, struct tc_action **a, u32 index);
+ +	void	(*cleanup)(struct tc_action *, int bind);
+ +	int     (*lookup)(struct net *, struct tc_action **, u32);
+  	int     (*init)(struct net *net, struct nlattr *nla,
+  			struct nlattr *est, struct tc_action **act, int ovr,
+ -			int bind, bool rtnl_held,
+ -			struct netlink_ext_ack *extack);
+ +			int bind);
+  	int     (*walk)(struct net *, struct sk_buff *,
+++<<<<<<< HEAD
+ +			struct netlink_callback *, int, const struct tc_action_ops *);
+ +	void	(*stats_update)(struct tc_action *, u64, u32, u64);
+++=======
++ 			struct netlink_callback *, int,
++ 			const struct tc_action_ops *,
++ 			struct netlink_ext_ack *);
++ 	void	(*stats_update)(struct tc_action *, u64, u32, u64, bool);
++ 	size_t  (*get_fill_size)(const struct tc_action *act);
+++>>>>>>> 28169abadb08 (net/sched: Add hardware specific counters to TC actions)
+  	struct net_device *(*get_dev)(const struct tc_action *a);
+ -	void	(*put_dev)(struct net_device *dev);
+  };
+  
+  struct tc_action_net {
+diff --cc net/sched/act_api.c
+index 45c463a88ec4,3c7c23421885..000000000000
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@@ -63,12 -81,10 +63,13 @@@ static void tcf_action_goto_chain_exec(
+  static void free_tcf(struct tc_action *p)
+  {
+  	free_percpu(p->cpu_bstats);
++ 	free_percpu(p->cpu_bstats_hw);
+  	free_percpu(p->cpu_qstats);
+  
+ -	tcf_set_action_cookie(&p->act_cookie, NULL);
+ +	if (p->act_cookie) {
+ +		kfree(p->act_cookie->data);
+ +		kfree(p->act_cookie);
+ +	}
+  	if (p->goto_chain)
+  		tcf_action_goto_chain_fini(p);
+  
+@@@ -284,45 -389,17 +285,56 @@@ int tcf_idr_create(struct tc_action_ne
+  
+  	if (cpustats) {
+  		p->cpu_bstats = netdev_alloc_pcpu_stats(struct gnet_stats_basic_cpu);
+++<<<<<<< HEAD
+ +		if (!p->cpu_bstats) {
+ +err1:
+ +			kfree(p);
+ +			return err;
+ +		}
+ +		p->cpu_qstats = alloc_percpu(struct gnet_stats_queue);
+ +		if (!p->cpu_qstats) {
+ +err2:
+ +			free_percpu(p->cpu_bstats);
+ +			goto err1;
+ +		}
+++=======
++ 		if (!p->cpu_bstats)
++ 			goto err1;
++ 		p->cpu_bstats_hw = netdev_alloc_pcpu_stats(struct gnet_stats_basic_cpu);
++ 		if (!p->cpu_bstats_hw)
++ 			goto err2;
++ 		p->cpu_qstats = alloc_percpu(struct gnet_stats_queue);
++ 		if (!p->cpu_qstats)
++ 			goto err3;
+++>>>>>>> 28169abadb08 (net/sched: Add hardware specific counters to TC actions)
+  	}
+  	spin_lock_init(&p->tcfa_lock);
+ -	p->tcfa_index = index;
+ +	/* user doesn't specify an index */
+ +	if (!index) {
+ +		idr_preload(GFP_KERNEL);
+ +		spin_lock_bh(&idrinfo->lock);
+ +		err = idr_alloc_ext(idr, NULL, &idr_index, 1, 0,
+ +				    GFP_ATOMIC);
+ +		spin_unlock_bh(&idrinfo->lock);
+ +		idr_preload_end();
+ +		if (err) {
+ +err3:
+ +			free_percpu(p->cpu_qstats);
+ +			goto err2;
+ +		}
+ +		p->tcfa_index = idr_index;
+ +	} else {
+ +		idr_preload(GFP_KERNEL);
+ +		spin_lock_bh(&idrinfo->lock);
+ +		err = idr_alloc_ext(idr, NULL, NULL, index, index + 1,
+ +				    GFP_ATOMIC);
+ +		spin_unlock_bh(&idrinfo->lock);
+ +		idr_preload_end();
+ +		if (err)
+ +			goto err3;
+ +		p->tcfa_index = index;
+ +	}
+ +
+  	p->tcfa_tm.install = jiffies;
+  	p->tcfa_tm.lastuse = jiffies;
+  	p->tcfa_tm.firstuse = 0;
+@@@ -330,16 -407,23 +342,33 @@@
+  		err = gen_new_estimator(&p->tcfa_bstats, p->cpu_bstats,
+  					&p->tcfa_rate_est,
+  					&p->tcfa_lock, NULL, est);
+++<<<<<<< HEAD
+ +		if (err) {
+ +			goto err3;
+ +		}
+++=======
++ 		if (err)
++ 			goto err4;
+++>>>>>>> 28169abadb08 (net/sched: Add hardware specific counters to TC actions)
+  	}
+  
+  	p->idrinfo = idrinfo;
+  	p->ops = ops;
+ +	INIT_LIST_HEAD(&p->list);
+  	*a = p;
+  	return 0;
+++<<<<<<< HEAD
+++=======
++ err4:
++ 	free_percpu(p->cpu_qstats);
++ err3:
++ 	free_percpu(p->cpu_bstats_hw);
++ err2:
++ 	free_percpu(p->cpu_bstats);
++ err1:
++ 	kfree(p);
++ 	return err;
+++>>>>>>> 28169abadb08 (net/sched: Add hardware specific counters to TC actions)
+  }
+  EXPORT_SYMBOL(tcf_idr_create);
+  
+diff --cc net/sched/act_gact.c
+index bbe5e1d20fab,c89a7fa43d1b..000000000000
+--- a/net/sched/act_gact.c
++++ b/net/sched/act_gact.c
+@@@ -159,7 -168,11 +159,15 @@@ static void tcf_gact_stats_update(struc
+  	if (action == TC_ACT_SHOT)
+  		this_cpu_ptr(gact->common.cpu_qstats)->drops += packets;
+  
+++<<<<<<< HEAD
+ +	tm->lastuse = lastuse;
+++=======
++ 	if (hw)
++ 		_bstats_cpu_update(this_cpu_ptr(gact->common.cpu_bstats_hw),
++ 				   bytes, packets);
++ 
++ 	tm->lastuse = max_t(u64, tm->lastuse, lastuse);
+++>>>>>>> 28169abadb08 (net/sched: Add hardware specific counters to TC actions)
+  }
+  
+  static int tcf_gact_dump(struct sk_buff *skb, struct tc_action *a,
+diff --cc net/sched/act_mirred.c
+index 6dae7461a73c,1dae5f2b358f..000000000000
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@@ -236,8 -288,11 +236,16 @@@ static void tcf_stats_update(struct tc_
+  	struct tcf_mirred *m = to_mirred(a);
+  	struct tcf_t *tm = &m->tcf_tm;
+  
+++<<<<<<< HEAD
+ +	_bstats_cpu_update(this_cpu_ptr(m->common.cpu_bstats), bytes, packets);
+ +	tm->lastuse = lastuse;
+++=======
++ 	_bstats_cpu_update(this_cpu_ptr(a->cpu_bstats), bytes, packets);
++ 	if (hw)
++ 		_bstats_cpu_update(this_cpu_ptr(a->cpu_bstats_hw),
++ 				   bytes, packets);
++ 	tm->lastuse = max_t(u64, tm->lastuse, lastuse);
+++>>>>>>> 28169abadb08 (net/sched: Add hardware specific counters to TC actions)
+  }
+  
+  static int tcf_mirred_dump(struct sk_buff *skb, struct tc_action *a, int bind,
+* Unmerged path include/net/act_api.h
+diff --git a/include/net/pkt_cls.h b/include/net/pkt_cls.h
+index 4ce9437e911a..d8461e7a44ff 100644
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -311,7 +311,7 @@ tcf_exts_stats_update(const struct tcf_exts *exts,
+ 	for (i = 0; i < exts->nr_actions; i++) {
+ 		struct tc_action *a = exts->actions[i];
+ 
+-		tcf_action_stats_update(a, bytes, packets, lastuse);
++		tcf_action_stats_update(a, bytes, packets, lastuse, true);
+ 	}
+ 
+ 	preempt_enable();
+* Unmerged path net/sched/act_api.c
+* Unmerged path net/sched/act_gact.c
+* Unmerged path net/sched/act_mirred.c
