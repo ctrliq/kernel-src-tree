@@ -1,0 +1,176 @@
+scsi: smartpqi: enhance kdump
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] smartpqi: enhance kdump (Don Brace) [1441396]
+Rebuild_FUZZ: 88.46%
+commit-author Kevin Barnett <kevin.barnett@hpe.com>
+commit d727a776d72b26033161bc19441266749455115b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d727a776.failed
+
+constrain resource usage during kdump to avoid kdump failures
+
+	Reviewed-by: Scott Benesh <scott.benesh@microsemi.com>
+	Signed-off-by: Kevin Barnett <kevin.barnett@microsemi.com>
+	Signed-off-by: Don Brace <don.brace@microsemi.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit d727a776d72b26033161bc19441266749455115b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/smartpqi/smartpqi.h
+diff --cc drivers/scsi/smartpqi/smartpqi.h
+index 8d77a2d261f7,400d1fb59197..000000000000
+--- a/drivers/scsi/smartpqi/smartpqi.h
++++ b/drivers/scsi/smartpqi/smartpqi.h
+@@@ -629,8 -634,62 +629,67 @@@ struct pqi_encryption_info 
+  	u32	encrypt_tweak_upper;
+  };
+  
+++<<<<<<< HEAD
+ +#define PQI_MAX_OUTSTANDING_REQUESTS	((u32)~0)
+ +#define PQI_MAX_TRANSFER_SIZE		(4 * 1024U * 1024U)
+++=======
++ #pragma pack(1)
++ 
++ #define PQI_CONFIG_TABLE_SIGNATURE	"CFGTABLE"
++ #define PQI_CONFIG_TABLE_MAX_LENGTH	((u16)~0)
++ 
++ /* configuration table section IDs */
++ #define PQI_CONFIG_TABLE_SECTION_GENERAL_INFO		0
++ #define PQI_CONFIG_TABLE_SECTION_FIRMWARE_FEATURES	1
++ #define PQI_CONFIG_TABLE_SECTION_FIRMWARE_ERRATA	2
++ #define PQI_CONFIG_TABLE_SECTION_DEBUG			3
++ #define PQI_CONFIG_TABLE_SECTION_HEARTBEAT		4
++ 
++ struct pqi_config_table {
++ 	u8	signature[8];		/* "CFGTABLE" */
++ 	__le32	first_section_offset;	/* offset in bytes from the base */
++ 					/* address of this table to the */
++ 					/* first section */
++ };
++ 
++ struct pqi_config_table_section_header {
++ 	__le16	section_id;		/* as defined by the */
++ 					/* PQI_CONFIG_TABLE_SECTION_* */
++ 					/* manifest constants above */
++ 	__le16	next_section_offset;	/* offset in bytes from base */
++ 					/* address of the table of the */
++ 					/* next section or 0 if last entry */
++ };
++ 
++ struct pqi_config_table_general_info {
++ 	struct pqi_config_table_section_header header;
++ 	__le32	section_length;		/* size of this section in bytes */
++ 					/* including the section header */
++ 	__le32	max_outstanding_requests;	/* max. outstanding */
++ 						/* commands supported by */
++ 						/* the controller */
++ 	__le32	max_sg_size;		/* max. transfer size of a single */
++ 					/* command */
++ 	__le32	max_sg_per_request;	/* max. number of scatter-gather */
++ 					/* entries supported in a single */
++ 					/* command */
++ };
++ 
++ struct pqi_config_table_debug {
++ 	struct pqi_config_table_section_header header;
++ 	__le32	scratchpad;
++ };
++ 
++ struct pqi_config_table_heartbeat {
++ 	struct pqi_config_table_section_header header;
++ 	__le32	heartbeat_counter;
++ };
++ 
++ #define PQI_MAX_OUTSTANDING_REQUESTS		((u32)~0)
++ #define PQI_MAX_OUTSTANDING_REQUESTS_KDUMP	32
++ #define PQI_MAX_TRANSFER_SIZE			(4 * 1024U * 1024U)
++ #define PQI_MAX_TRANSFER_SIZE_KDUMP		(512 * 1024U)
+++>>>>>>> d727a776d72b (scsi: smartpqi: enhance kdump)
+  
+  #define RAID_MAP_MAX_ENTRIES		1024
+  
+* Unmerged path drivers/scsi/smartpqi/smartpqi.h
+diff --git a/drivers/scsi/smartpqi/smartpqi_init.c b/drivers/scsi/smartpqi/smartpqi_init.c
+index de3e5a2501ab..9f19bf7013f8 100644
+--- a/drivers/scsi/smartpqi/smartpqi_init.c
++++ b/drivers/scsi/smartpqi/smartpqi_init.c
+@@ -4119,8 +4119,12 @@ static void pqi_calculate_io_resources(struct pqi_ctrl_info *ctrl_info)
+ 	ctrl_info->error_buffer_length =
+ 		ctrl_info->max_io_slots * PQI_ERROR_BUFFER_ELEMENT_LENGTH;
+ 
+-	max_transfer_size =
+-		min(ctrl_info->max_transfer_size, PQI_MAX_TRANSFER_SIZE);
++	if (reset_devices)
++		max_transfer_size = min(ctrl_info->max_transfer_size,
++			PQI_MAX_TRANSFER_SIZE_KDUMP);
++	else
++		max_transfer_size = min(ctrl_info->max_transfer_size,
++			PQI_MAX_TRANSFER_SIZE);
+ 
+ 	max_sg_entries = max_transfer_size / PAGE_SIZE;
+ 
+@@ -4139,19 +4143,24 @@ static void pqi_calculate_io_resources(struct pqi_ctrl_info *ctrl_info)
+ 
+ static void pqi_calculate_queue_resources(struct pqi_ctrl_info *ctrl_info)
+ {
+-	int num_cpus;
+-	int max_queue_groups;
+ 	int num_queue_groups;
+ 	u16 num_elements_per_iq;
+ 	u16 num_elements_per_oq;
+ 
+-	max_queue_groups = min(ctrl_info->max_inbound_queues / 2,
+-		ctrl_info->max_outbound_queues - 1);
+-	max_queue_groups = min(max_queue_groups, PQI_MAX_QUEUE_GROUPS);
++	if (reset_devices) {
++		num_queue_groups = 1;
++	} else {
++		int num_cpus;
++		int max_queue_groups;
++
++		max_queue_groups = min(ctrl_info->max_inbound_queues / 2,
++			ctrl_info->max_outbound_queues - 1);
++		max_queue_groups = min(max_queue_groups, PQI_MAX_QUEUE_GROUPS);
+ 
+-	num_cpus = num_online_cpus();
+-	num_queue_groups = min(num_cpus, ctrl_info->max_msix_vectors);
+-	num_queue_groups = min(num_queue_groups, max_queue_groups);
++		num_cpus = num_online_cpus();
++		num_queue_groups = min(num_cpus, ctrl_info->max_msix_vectors);
++		num_queue_groups = min(num_queue_groups, max_queue_groups);
++	}
+ 
+ 	ctrl_info->num_queue_groups = num_queue_groups;
+ 
+@@ -5334,9 +5343,17 @@ static int pqi_ctrl_init(struct pqi_ctrl_info *ctrl_info)
+ 		return rc;
+ 	}
+ 
+-	if (ctrl_info->max_outstanding_requests > PQI_MAX_OUTSTANDING_REQUESTS)
+-		ctrl_info->max_outstanding_requests =
+-			PQI_MAX_OUTSTANDING_REQUESTS;
++	if (reset_devices) {
++		if (ctrl_info->max_outstanding_requests >
++			PQI_MAX_OUTSTANDING_REQUESTS_KDUMP)
++			ctrl_info->max_outstanding_requests =
++					PQI_MAX_OUTSTANDING_REQUESTS_KDUMP;
++	} else {
++		if (ctrl_info->max_outstanding_requests >
++			PQI_MAX_OUTSTANDING_REQUESTS)
++			ctrl_info->max_outstanding_requests =
++					PQI_MAX_OUTSTANDING_REQUESTS;
++	}
+ 
+ 	pqi_calculate_io_resources(ctrl_info);
+ 
+@@ -6313,4 +6330,6 @@ static void __attribute__((unused)) verify_structures(void)
+ 		PQI_QUEUE_ELEMENT_LENGTH_ALIGNMENT != 0);
+ 
+ 	BUILD_BUG_ON(PQI_RESERVED_IO_SLOTS >= PQI_MAX_OUTSTANDING_REQUESTS);
++	BUILD_BUG_ON(PQI_RESERVED_IO_SLOTS >=
++		PQI_MAX_OUTSTANDING_REQUESTS_KDUMP);
+ }
