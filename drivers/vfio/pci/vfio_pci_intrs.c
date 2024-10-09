@@ -529,8 +529,8 @@ static int vfio_msi_set_vector_signal(struct vfio_pci_device *vdev,
 	irq = msix ? vdev->msix[vector].vector : pdev->irq + vector;
 
 	if (vdev->ctx[vector].trigger) {
-		free_irq(irq, vdev->ctx[vector].trigger);
 		irq_bypass_unregister_producer(&vdev->ctx[vector].producer);
+		free_irq(irq, vdev->ctx[vector].trigger);
 		kfree(vdev->ctx[vector].name);
 		eventfd_ctx_put(vdev->ctx[vector].trigger);
 		vdev->ctx[vector].trigger = NULL;
