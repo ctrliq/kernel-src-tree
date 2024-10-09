@@ -1,0 +1,522 @@
+nfp: move the start/stop app callbacks back
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 9d8b17bed757a3c5edbd6c1d09e52cbff6f2cc78
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9d8b17be.failed
+
+Since representors are now created with a separate callback
+start/stop app callbacks can be moved again to their original
+location.  They are intended to app-specific init/clean up
+over the control channel.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9d8b17bed757a3c5edbd6c1d09e52cbff6f2cc78)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+index 092c7d18f2ec,5abb9ba31e7d..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+@@@ -435,91 -374,343 +435,278 @@@ nfp_net_pf_spawn_netdevs(struct nfp_pf 
+  	return 0;
+  
+  err_prev_deinit:
+ -	list_for_each_entry_continue_reverse(nn, &pf->vnics, vnic_list)
+ -		if (nfp_net_is_data_vnic(nn))
+ -			nfp_net_pf_clean_vnic(pf, nn);
+ -	return err;
+ -}
+ -
+ -static int
+ -nfp_net_pf_app_init(struct nfp_pf *pf, u8 __iomem *qc_bar, unsigned int stride)
+ -{
+ -	u8 __iomem *ctrl_bar;
+ -	int err;
+ -
+ -	pf->app = nfp_app_alloc(pf, nfp_net_pf_get_app_id(pf));
+ -	if (IS_ERR(pf->app))
+ -		return PTR_ERR(pf->app);
+ -
+ -	err = nfp_app_init(pf->app);
+ -	if (err)
+ -		goto err_free;
+ -
+ -	if (!nfp_app_needs_ctrl_vnic(pf->app))
+ -		return 0;
+ -
+ -	ctrl_bar = nfp_net_pf_map_rtsym(pf, "net.ctrl", "_pf%u_net_ctrl_bar",
+ -					NFP_PF_CSR_SLICE_SIZE,
+ -					&pf->ctrl_vnic_bar);
+ -	if (IS_ERR(ctrl_bar)) {
+ -		nfp_err(pf->cpp, "Failed to find ctrl vNIC memory symbol\n");
+ -		err = PTR_ERR(ctrl_bar);
+ -		goto err_app_clean;
+ +	list_for_each_entry_continue_reverse(nn, &pf->ports, port_list) {
+ +		nfp_net_debugfs_dir_clean(&nn->debugfs_dir);
+ +		nfp_net_netdev_clean(nn->netdev);
+  	}
+++<<<<<<< HEAD
+ +	nfp_net_irqs_disable(pf->pdev);
+ +err_vec_free:
+ +	kfree(pf->irq_entries);
+ +err_nn_free:
+ +	nfp_net_pf_free_netdevs(pf);
+++=======
++ 
++ 	pf->ctrl_vnic =	nfp_net_pf_alloc_vnic(pf, false, ctrl_bar, qc_bar,
++ 					      stride, 0);
++ 	if (IS_ERR(pf->ctrl_vnic)) {
++ 		err = PTR_ERR(pf->ctrl_vnic);
++ 		goto err_unmap;
++ 	}
++ 
++ 	return 0;
++ 
++ err_unmap:
++ 	nfp_cpp_area_release_free(pf->ctrl_vnic_bar);
++ err_app_clean:
++ 	nfp_app_clean(pf->app);
++ err_free:
++ 	nfp_app_free(pf->app);
++ 	pf->app = NULL;
++ 	return err;
++ }
++ 
++ static void nfp_net_pf_app_clean(struct nfp_pf *pf)
++ {
++ 	if (pf->ctrl_vnic) {
++ 		nfp_net_pf_free_vnic(pf, pf->ctrl_vnic);
++ 		nfp_cpp_area_release_free(pf->ctrl_vnic_bar);
++ 	}
++ 	nfp_app_clean(pf->app);
++ 	nfp_app_free(pf->app);
++ 	pf->app = NULL;
++ }
++ 
++ static int nfp_net_pf_app_start_ctrl(struct nfp_pf *pf)
++ {
++ 	int err;
++ 
++ 	if (!pf->ctrl_vnic)
++ 		return 0;
++ 	err = nfp_net_pf_init_vnic(pf, pf->ctrl_vnic, 0);
++ 	if (err)
++ 		return err;
++ 
++ 	err = nfp_ctrl_open(pf->ctrl_vnic);
++ 	if (err)
++ 		goto err_clean_ctrl;
++ 
++ 	return 0;
++ 
++ err_clean_ctrl:
++ 	nfp_net_pf_clean_vnic(pf, pf->ctrl_vnic);
++ 	return err;
++ }
++ 
++ static void nfp_net_pf_app_stop_ctrl(struct nfp_pf *pf)
++ {
++ 	if (!pf->ctrl_vnic)
++ 		return;
++ 	nfp_ctrl_close(pf->ctrl_vnic);
++ 	nfp_net_pf_clean_vnic(pf, pf->ctrl_vnic);
++ }
++ 
++ static int nfp_net_pf_app_start(struct nfp_pf *pf)
++ {
++ 	int err;
++ 
++ 	err = nfp_net_pf_app_start_ctrl(pf);
++ 	if (err)
++ 		return err;
++ 
++ 	err = nfp_app_start(pf->app, pf->ctrl_vnic);
++ 	if (err)
++ 		goto err_ctrl_stop;
++ 
++ 	if (pf->num_vfs) {
++ 		err = nfp_app_sriov_enable(pf->app, pf->num_vfs);
++ 		if (err)
++ 			goto err_app_stop;
++ 	}
++ 
++ 	return 0;
++ 
++ err_app_stop:
++ 	nfp_app_stop(pf->app);
++ err_ctrl_stop:
++ 	nfp_net_pf_app_stop_ctrl(pf);
++ 	return err;
++ }
++ 
++ static void nfp_net_pf_app_stop(struct nfp_pf *pf)
++ {
++ 	if (pf->num_vfs)
++ 		nfp_app_sriov_disable(pf->app);
++ 	nfp_app_stop(pf->app);
++ 	nfp_net_pf_app_stop_ctrl(pf);
++ }
++ 
++ static void nfp_net_pci_unmap_mem(struct nfp_pf *pf)
++ {
++ 	if (pf->vfcfg_tbl2_area)
++ 		nfp_cpp_area_release_free(pf->vfcfg_tbl2_area);
++ 	if (pf->vf_cfg_bar)
++ 		nfp_cpp_area_release_free(pf->vf_cfg_bar);
++ 	if (pf->mac_stats_bar)
++ 		nfp_cpp_area_release_free(pf->mac_stats_bar);
++ 	nfp_cpp_area_release_free(pf->qc_area);
++ 	nfp_cpp_area_release_free(pf->data_vnic_bar);
++ }
++ 
++ static int nfp_net_pci_map_mem(struct nfp_pf *pf)
++ {
++ 	u8 __iomem *mem;
++ 	u32 min_size;
++ 	int err;
++ 
++ 	min_size = pf->max_data_vnics * NFP_PF_CSR_SLICE_SIZE;
++ 	mem = nfp_net_pf_map_rtsym(pf, "net.bar0", "_pf%d_net_bar0",
++ 				   min_size, &pf->data_vnic_bar);
++ 	if (IS_ERR(mem)) {
++ 		nfp_err(pf->cpp, "Failed to find data vNIC memory symbol\n");
++ 		return PTR_ERR(mem);
++ 	}
++ 
++ 	min_size =  NFP_MAC_STATS_SIZE * (pf->eth_tbl->max_index + 1);
++ 	pf->mac_stats_mem = nfp_rtsym_map(pf->rtbl, "_mac_stats",
++ 					  "net.macstats", min_size,
++ 					  &pf->mac_stats_bar);
++ 	if (IS_ERR(pf->mac_stats_mem)) {
++ 		if (PTR_ERR(pf->mac_stats_mem) != -ENOENT) {
++ 			err = PTR_ERR(pf->mac_stats_mem);
++ 			goto err_unmap_ctrl;
++ 		}
++ 		pf->mac_stats_mem = NULL;
++ 	}
++ 
++ 	pf->vf_cfg_mem = nfp_net_pf_map_rtsym(pf, "net.vfcfg",
++ 					      "_pf%d_net_vf_bar",
++ 					      NFP_NET_CFG_BAR_SZ *
++ 					      pf->limit_vfs, &pf->vf_cfg_bar);
++ 	if (IS_ERR(pf->vf_cfg_mem)) {
++ 		if (PTR_ERR(pf->vf_cfg_mem) != -ENOENT) {
++ 			err = PTR_ERR(pf->vf_cfg_mem);
++ 			goto err_unmap_mac_stats;
++ 		}
++ 		pf->vf_cfg_mem = NULL;
++ 	}
++ 
++ 	min_size = NFP_NET_VF_CFG_SZ * pf->limit_vfs + NFP_NET_VF_CFG_MB_SZ;
++ 	pf->vfcfg_tbl2 = nfp_net_pf_map_rtsym(pf, "net.vfcfg_tbl2",
++ 					      "_pf%d_net_vf_cfg2",
++ 					      min_size, &pf->vfcfg_tbl2_area);
++ 	if (IS_ERR(pf->vfcfg_tbl2)) {
++ 		if (PTR_ERR(pf->vfcfg_tbl2) != -ENOENT) {
++ 			err = PTR_ERR(pf->vfcfg_tbl2);
++ 			goto err_unmap_vf_cfg;
++ 		}
++ 		pf->vfcfg_tbl2 = NULL;
++ 	}
++ 
++ 	mem = nfp_cpp_map_area(pf->cpp, "net.qc", 0, 0,
++ 			       NFP_PCIE_QUEUE(0), NFP_QCP_QUEUE_AREA_SZ,
++ 			       &pf->qc_area);
++ 	if (IS_ERR(mem)) {
++ 		nfp_err(pf->cpp, "Failed to map Queue Controller area.\n");
++ 		err = PTR_ERR(mem);
++ 		goto err_unmap_vfcfg_tbl2;
++ 	}
++ 
++ 	return 0;
++ 
++ err_unmap_vfcfg_tbl2:
++ 	if (pf->vfcfg_tbl2_area)
++ 		nfp_cpp_area_release_free(pf->vfcfg_tbl2_area);
++ err_unmap_vf_cfg:
++ 	if (pf->vf_cfg_bar)
++ 		nfp_cpp_area_release_free(pf->vf_cfg_bar);
++ err_unmap_mac_stats:
++ 	if (pf->mac_stats_bar)
++ 		nfp_cpp_area_release_free(pf->mac_stats_bar);
++ err_unmap_ctrl:
++ 	nfp_cpp_area_release_free(pf->data_vnic_bar);
+++>>>>>>> 9d8b17bed757 (nfp: move the start/stop app callbacks back)
+  	return err;
+  }
+  
+  static void nfp_net_pci_remove_finish(struct nfp_pf *pf)
+  {
+++<<<<<<< HEAD
+++=======
++ 	nfp_net_pf_app_stop(pf);
++ 	/* stop app first, to avoid double free of ctrl vNIC's ddir */
+++>>>>>>> 9d8b17bed757 (nfp: move the start/stop app callbacks back)
+  	nfp_net_debugfs_dir_clean(&pf->ddir);
+  
+ -	nfp_net_pf_free_irqs(pf);
+ -	nfp_net_pf_app_clean(pf);
+ -	nfp_net_pci_unmap_mem(pf);
+ -}
+ -
+ -static int
+ -nfp_net_eth_port_update(struct nfp_cpp *cpp, struct nfp_port *port,
+ -			struct nfp_eth_table *eth_table)
+ -{
+ -	struct nfp_eth_table_port *eth_port;
+ -
+ -	ASSERT_RTNL();
+ -
+ -	eth_port = nfp_net_find_port(eth_table, port->eth_id);
+ -	if (!eth_port) {
+ -		set_bit(NFP_PORT_CHANGED, &port->flags);
+ -		nfp_warn(cpp, "Warning: port #%d not present after reconfig\n",
+ -			 port->eth_id);
+ -		return -EIO;
+ -	}
+ -	if (eth_port->override_changed) {
+ -		nfp_warn(cpp, "Port #%d config changed, unregistering. Reboot required before port will be operational again.\n", port->eth_id);
+ -		port->type = NFP_PORT_INVALID;
+ -	}
+ -
+ -	memcpy(port->eth_port, eth_port, sizeof(*eth_port));
+ +	nfp_net_irqs_disable(pf->pdev);
+ +	kfree(pf->irq_entries);
+  
+ -	return 0;
+ +	nfp_cpp_area_release_free(pf->rx_area);
+ +	nfp_cpp_area_release_free(pf->tx_area);
+ +	nfp_cpp_area_release_free(pf->ctrl_area);
+  }
+  
+ -int nfp_net_refresh_port_table_sync(struct nfp_pf *pf)
+ +static void nfp_net_refresh_netdevs(struct work_struct *work)
+  {
+ -	struct nfp_eth_table *eth_table;
+ +	struct nfp_pf *pf = container_of(work, struct nfp_pf,
+ +					 port_refresh_work);
+  	struct nfp_net *nn, *next;
+ -	struct nfp_port *port;
+  
+ -	lockdep_assert_held(&pf->lock);
+ +	mutex_lock(&pf->port_lock);
+  
+  	/* Check for nfp_net_pci_remove() racing against us */
+ -	if (list_empty(&pf->vnics))
+ -		return 0;
+ -
+ -	/* Update state of all ports */
+ -	rtnl_lock();
+ -	list_for_each_entry(port, &pf->ports, port_list)
+ -		clear_bit(NFP_PORT_CHANGED, &port->flags);
+ -
+ -	eth_table = nfp_eth_read_ports(pf->cpp);
+ -	if (!eth_table) {
+ -		list_for_each_entry(port, &pf->ports, port_list)
+ -			if (__nfp_port_get_eth_port(port))
+ -				set_bit(NFP_PORT_CHANGED, &port->flags);
+ -		rtnl_unlock();
+ -		nfp_err(pf->cpp, "Error refreshing port config!\n");
+ -		return -EIO;
+ -	}
+ +	if (list_empty(&pf->ports))
+ +		goto out;
+  
+ -	list_for_each_entry(port, &pf->ports, port_list)
+ -		if (__nfp_port_get_eth_port(port))
+ -			nfp_net_eth_port_update(pf->cpp, port, eth_table);
+ -	rtnl_unlock();
+ +	list_for_each_entry_safe(nn, next, &pf->ports, port_list) {
+ +		if (!nn->eth_port) {
+ +			nfp_warn(pf->cpp, "Warning: port not present after reconfig\n");
+ +			continue;
+ +		}
+ +		if (!nn->eth_port->override_changed)
+ +			continue;
+  
+ -	kfree(eth_table);
+ +		nn_warn(nn, "Port config changed, unregistering. Reboot required before port will be operational again.\n");
+  
+ -	/* Shoot off the ports which became invalid */
+ -	list_for_each_entry_safe(nn, next, &pf->vnics, vnic_list) {
+ -		if (!nn->port || nn->port->type != NFP_PORT_INVALID)
+ -			continue;
+ +		nfp_net_debugfs_dir_clean(&nn->debugfs_dir);
+ +		nfp_net_netdev_clean(nn->dp.netdev);
+  
+ -		nfp_net_pf_clean_vnic(pf, nn);
+ -		nfp_net_pf_free_vnic(pf, nn);
+ +		list_del(&nn->port_list);
+ +		pf->num_netdevs--;
+ +		nfp_net_netdev_free(nn);
+  	}
+  
+ -	if (list_empty(&pf->vnics))
+ +	if (list_empty(&pf->ports))
+  		nfp_net_pci_remove_finish(pf);
+ -
+ -	return 0;
+ -}
+ -
+ -static void nfp_net_refresh_vnics(struct work_struct *work)
+ -{
+ -	struct nfp_pf *pf = container_of(work, struct nfp_pf,
+ -					 port_refresh_work);
+ -
+ -	mutex_lock(&pf->lock);
+ -	nfp_net_refresh_port_table_sync(pf);
+ -	mutex_unlock(&pf->lock);
+ +out:
+ +	mutex_unlock(&pf->port_lock);
+  }
+  
+ -void nfp_net_refresh_port_table(struct nfp_port *port)
+ +void nfp_net_refresh_port_config(struct nfp_net *nn)
+  {
+ -	struct nfp_pf *pf = port->app->pf;
+ +	struct nfp_pf *pf = pci_get_drvdata(nn->pdev);
+ +	struct nfp_eth_table *old_table;
+  
+ -	set_bit(NFP_PORT_CHANGED, &port->flags);
+ -
+ -	queue_work(pf->wq, &pf->port_refresh_work);
+ -}
+ +	ASSERT_RTNL();
+  
+ -int nfp_net_refresh_eth_port(struct nfp_port *port)
+ -{
+ -	struct nfp_cpp *cpp = port->app->cpp;
+ -	struct nfp_eth_table *eth_table;
+ -	int ret;
+ +	old_table = pf->eth_tbl;
+  
+ -	clear_bit(NFP_PORT_CHANGED, &port->flags);
+ +	list_for_each_entry(nn, &pf->ports, port_list)
+ +		nfp_net_link_changed_read_clear(nn);
+  
+ -	eth_table = nfp_eth_read_ports(cpp);
+ -	if (!eth_table) {
+ -		set_bit(NFP_PORT_CHANGED, &port->flags);
+ -		nfp_err(cpp, "Error refreshing port state table!\n");
+ -		return -EIO;
+ +	pf->eth_tbl = nfp_eth_read_ports(pf->cpp);
+ +	if (!pf->eth_tbl) {
+ +		pf->eth_tbl = old_table;
+ +		nfp_err(pf->cpp, "Error refreshing port config!\n");
+ +		return;
+  	}
+  
+ -	ret = nfp_net_eth_port_update(cpp, port, eth_table);
+ +	list_for_each_entry(nn, &pf->ports, port_list)
+ +		nn->eth_port = nfp_net_find_port(pf, nn->eth_port->eth_index);
+  
+ -	kfree(eth_table);
+ +	kfree(old_table);
+  
+ -	return ret;
+ +	schedule_work(&pf->port_refresh_work);
+  }
+  
+  /*
+@@@ -527,11 -718,8 +714,15 @@@
+   */
+  int nfp_net_pci_probe(struct nfp_pf *pf)
+  {
+ +	u8 __iomem *ctrl_bar, *tx_bar, *rx_bar;
+ +	u32 total_tx_qcs, total_rx_qcs;
+  	struct nfp_net_fw_version fw_ver;
+++<<<<<<< HEAD
+ +	u32 tx_area_sz, rx_area_sz;
+ +	u32 start_q;
+++=======
++ 	u8 __iomem *ctrl_bar, *qc_bar;
+++>>>>>>> 9d8b17bed757 (nfp: move the start/stop app callbacks back)
+  	int stride;
+  	int err;
+  
+@@@ -625,19 -792,36 +816,44 @@@
+  	if (err)
+  		goto err_clean_ddir;
+  
+++<<<<<<< HEAD
+ +	mutex_unlock(&pf->port_lock);
+ +
+ +	return 0;
+ +
+++=======
++ 	err = nfp_net_pf_alloc_irqs(pf);
++ 	if (err)
++ 		goto err_free_vnics;
++ 
++ 	err = nfp_net_pf_app_start(pf);
++ 	if (err)
++ 		goto err_free_irqs;
++ 
++ 	err = nfp_net_pf_init_vnics(pf);
++ 	if (err)
++ 		goto err_stop_app;
++ 
++ 	mutex_unlock(&pf->lock);
++ 
++ 	return 0;
++ 
++ err_stop_app:
++ 	nfp_net_pf_app_stop(pf);
++ err_free_irqs:
++ 	nfp_net_pf_free_irqs(pf);
++ err_free_vnics:
++ 	nfp_net_pf_free_vnics(pf);
+++>>>>>>> 9d8b17bed757 (nfp: move the start/stop app callbacks back)
+  err_clean_ddir:
+  	nfp_net_debugfs_dir_clean(&pf->ddir);
+ -	nfp_net_pf_app_clean(pf);
+ -err_unmap:
+ -	nfp_net_pci_unmap_mem(pf);
+ +	nfp_cpp_area_release_free(pf->rx_area);
+ +err_unmap_tx:
+ +	nfp_cpp_area_release_free(pf->tx_area);
+ +err_ctrl_unmap:
+ +	nfp_cpp_area_release_free(pf->ctrl_area);
+  err_unlock:
+ -	mutex_unlock(&pf->lock);
+ -	cancel_work_sync(&pf->port_refresh_work);
+ +	mutex_unlock(&pf->port_lock);
+  	return err;
+  }
+  
+@@@ -645,17 -829,15 +861,23 @@@ void nfp_net_pci_remove(struct nfp_pf *
+  {
+  	struct nfp_net *nn;
+  
+ -	mutex_lock(&pf->lock);
+ -	if (list_empty(&pf->vnics))
+ +	mutex_lock(&pf->port_lock);
+ +	if (list_empty(&pf->ports))
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(nn, &pf->ports, port_list) {
+ +		nfp_net_debugfs_dir_clean(&nn->debugfs_dir);
+ +
+ +		nfp_net_netdev_clean(nn->netdev);
+ +	}
+++=======
++ 	list_for_each_entry(nn, &pf->vnics, vnic_list)
++ 		if (nfp_net_is_data_vnic(nn))
++ 			nfp_net_pf_clean_vnic(pf, nn);
+++>>>>>>> 9d8b17bed757 (nfp: move the start/stop app callbacks back)
+  
+ -	nfp_net_pf_free_vnics(pf);
+ +	nfp_net_pf_free_netdevs(pf);
+  
+  	nfp_net_pci_remove_finish(pf);
+  out:
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_main.c
