@@ -1,0 +1,186 @@
+bpf: add lookup/update support for per-cpu hash and array maps
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Alexei Starovoitov <ast@fb.com>
+commit 15a07b33814d14ca817887dbea8530728dc0fbe4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/15a07b33.failed
+
+The functions bpf_map_lookup_elem(map, key, value) and
+bpf_map_update_elem(map, key, value, flags) need to get/set
+values from all-cpus for per-cpu hash and array maps,
+so that user space can aggregate/update them as necessary.
+
+Example of single counter aggregation in user space:
+  unsigned int nr_cpus = sysconf(_SC_NPROCESSORS_CONF);
+  long values[nr_cpus];
+  long value = 0;
+
+  bpf_lookup_elem(fd, key, values);
+  for (i = 0; i < nr_cpus; i++)
+    value += values[i];
+
+The user space must provide round_up(value_size, 8) * nr_cpus
+array to get/set values, since kernel will use 'long' copy
+of per-cpu values to try to copy good counters atomically.
+It's a best-effort, since bpf programs and user space are racing
+to access the same memory.
+
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 15a07b33814d14ca817887dbea8530728dc0fbe4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	kernel/bpf/arraymap.c
+#	kernel/bpf/hashtab.c
+#	kernel/bpf/syscall.c
+diff --cc include/linux/bpf.h
+index d4c1f9049ad3,90ee6ab24bc5..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -97,20 -125,121 +97,127 @@@ struct bpf_prog_type_list 
+  	enum bpf_prog_type type;
+  };
+  
+ +void bpf_register_prog_type(struct bpf_prog_type_list *tl);
+ +
+ +struct bpf_prog;
+ +
+  struct bpf_prog_aux {
+  	atomic_t refcnt;
+ -	u32 used_map_cnt;
+ -	const struct bpf_verifier_ops *ops;
+ +	bool is_gpl_compatible;
+ +	enum bpf_prog_type prog_type;
+ +	struct bpf_verifier_ops *ops;
+ +	u32 id;
+  	struct bpf_map **used_maps;
+ +	u32 used_map_cnt;
+  	struct bpf_prog *prog;
+ -	struct user_struct *user;
+ -	union {
+ -		struct work_struct work;
+ -		struct rcu_head	rcu;
+ -	};
+ +	struct work_struct work;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct bpf_array {
++ 	struct bpf_map map;
++ 	u32 elem_size;
++ 	/* 'ownership' of prog_array is claimed by the first program that
++ 	 * is going to use this map or by the first program which FD is stored
++ 	 * in the map to make sure that all callers and callees have the same
++ 	 * prog_type and JITed flag
++ 	 */
++ 	enum bpf_prog_type owner_prog_type;
++ 	bool owner_jited;
++ 	union {
++ 		char value[0] __aligned(8);
++ 		void *ptrs[0] __aligned(8);
++ 		void __percpu *pptrs[0] __aligned(8);
++ 	};
++ };
++ #define MAX_TAIL_CALL_CNT 32
++ 
++ u64 bpf_tail_call(u64 ctx, u64 r2, u64 index, u64 r4, u64 r5);
++ void bpf_fd_array_map_clear(struct bpf_map *map);
++ bool bpf_prog_array_compatible(struct bpf_array *array, const struct bpf_prog *fp);
++ const struct bpf_func_proto *bpf_get_trace_printk_proto(void);
++ 
++ #ifdef CONFIG_BPF_SYSCALL
++ void bpf_register_prog_type(struct bpf_prog_type_list *tl);
++ void bpf_register_map_type(struct bpf_map_type_list *tl);
++ 
++ struct bpf_prog *bpf_prog_get(u32 ufd);
++ void bpf_prog_put(struct bpf_prog *prog);
++ void bpf_prog_put_rcu(struct bpf_prog *prog);
++ 
++ struct bpf_map *bpf_map_get_with_uref(u32 ufd);
++ struct bpf_map *__bpf_map_get(struct fd f);
++ void bpf_map_inc(struct bpf_map *map, bool uref);
++ void bpf_map_put_with_uref(struct bpf_map *map);
++ void bpf_map_put(struct bpf_map *map);
++ 
++ extern int sysctl_unprivileged_bpf_disabled;
++ 
++ int bpf_map_new_fd(struct bpf_map *map);
++ int bpf_prog_new_fd(struct bpf_prog *prog);
++ 
++ int bpf_obj_pin_user(u32 ufd, const char __user *pathname);
++ int bpf_obj_get_user(const char __user *pathname);
++ 
++ int bpf_percpu_hash_copy(struct bpf_map *map, void *key, void *value);
++ int bpf_percpu_array_copy(struct bpf_map *map, void *key, void *value);
++ int bpf_percpu_hash_update(struct bpf_map *map, void *key, void *value,
++ 			   u64 flags);
++ int bpf_percpu_array_update(struct bpf_map *map, void *key, void *value,
++ 			    u64 flags);
++ 
++ /* memcpy that is used with 8-byte aligned pointers, power-of-8 size and
++  * forced to use 'long' read/writes to try to atomically copy long counters.
++  * Best-effort only.  No barriers here, since it _will_ race with concurrent
++  * updates from BPF programs. Called from bpf syscall and mostly used with
++  * size 8 or 16 bytes, so ask compiler to inline it.
++  */
++ static inline void bpf_long_memcpy(void *dst, const void *src, u32 size)
++ {
++ 	const long *lsrc = src;
++ 	long *ldst = dst;
++ 
++ 	size /= sizeof(long);
++ 	while (size--)
++ 		*ldst++ = *lsrc++;
++ }
++ 
++ /* verify correctness of eBPF program */
++ int bpf_check(struct bpf_prog **fp, union bpf_attr *attr);
++ #else
++ static inline void bpf_register_prog_type(struct bpf_prog_type_list *tl)
++ {
++ }
++ 
++ static inline struct bpf_prog *bpf_prog_get(u32 ufd)
++ {
++ 	return ERR_PTR(-EOPNOTSUPP);
++ }
++ 
++ static inline void bpf_prog_put(struct bpf_prog *prog)
++ {
++ }
++ #endif /* CONFIG_BPF_SYSCALL */
++ 
++ /* verifier prototypes for helper functions called from eBPF programs */
++ extern const struct bpf_func_proto bpf_map_lookup_elem_proto;
++ extern const struct bpf_func_proto bpf_map_update_elem_proto;
++ extern const struct bpf_func_proto bpf_map_delete_elem_proto;
++ 
++ extern const struct bpf_func_proto bpf_get_prandom_u32_proto;
++ extern const struct bpf_func_proto bpf_get_smp_processor_id_proto;
++ extern const struct bpf_func_proto bpf_tail_call_proto;
++ extern const struct bpf_func_proto bpf_ktime_get_ns_proto;
++ extern const struct bpf_func_proto bpf_get_current_pid_tgid_proto;
++ extern const struct bpf_func_proto bpf_get_current_uid_gid_proto;
++ extern const struct bpf_func_proto bpf_get_current_comm_proto;
++ extern const struct bpf_func_proto bpf_skb_vlan_push_proto;
++ extern const struct bpf_func_proto bpf_skb_vlan_pop_proto;
++ 
++ /* Shared helpers among cBPF and eBPF. */
++ void bpf_user_rnd_init_once(void);
++ u64 bpf_user_rnd_u32(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5);
++ 
+++>>>>>>> 15a07b33814d (bpf: add lookup/update support for per-cpu hash and array maps)
+  #endif /* _LINUX_BPF_H */
+* Unmerged path kernel/bpf/arraymap.c
+* Unmerged path kernel/bpf/hashtab.c
+* Unmerged path kernel/bpf/syscall.c
+* Unmerged path include/linux/bpf.h
+* Unmerged path kernel/bpf/arraymap.c
+* Unmerged path kernel/bpf/hashtab.c
+* Unmerged path kernel/bpf/syscall.c
