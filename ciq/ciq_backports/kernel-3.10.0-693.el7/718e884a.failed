@@ -1,0 +1,131 @@
+drm/i915/gvt: set ring buffer size to default for guc submission
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [drm] i915/gvt: set ring buffer size to default for guc submission (Rob Clark) [1380115]
+Rebuild_FUZZ: 96.77%
+commit-author Chuanxiao Dong <chuanxiao.dong@intel.com>
+commit 718e884a0183b09a2af8c06818df5d60f94243ce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/718e884a.failed
+
+When not using GuC submission, the ring buffer size for GVT context is
+512KB which is the max size. When switching to GuC submission, the ring
+buffer size is required to be less than 16KB. So use the GVT context
+default ring buffer size if GuC submission is enabled.
+
+	Signed-off-by: Chuanxiao Dong <chuanxiao.dong@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170216063639.GA17107@intel.com
+	Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+(cherry picked from commit 718e884a0183b09a2af8c06818df5d60f94243ce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_gem_context.c
+diff --cc drivers/gpu/drm/i915/i915_gem_context.c
+index 5dd84e148bba,99c46f4dbde6..000000000000
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@@ -311,57 -398,51 +311,85 @@@ i915_gem_create_context(struct drm_devi
+  	trace_i915_context_create(ctx);
+  
+  	return ctx;
+ +
+ +err_unpin:
+ +	if (is_global_default_ctx && ctx->legacy_hw_ctx.rcs_state)
+ +		i915_gem_object_ggtt_unpin(ctx->legacy_hw_ctx.rcs_state);
+ +err_destroy:
+ +	idr_remove(&file_priv->context_idr, ctx->user_handle);
+ +	i915_gem_context_unreference(ctx);
+ +	return ERR_PTR(ret);
+  }
+  
+ -/**
+ - * i915_gem_context_create_gvt - create a GVT GEM context
+ - * @dev: drm device *
+ - *
+ - * This function is used to create a GVT specific GEM context.
+ - *
+ - * Returns:
+ - * pointer to i915_gem_context on success, error pointer if failed
+ - *
+ - */
+ -struct i915_gem_context *
+ -i915_gem_context_create_gvt(struct drm_device *dev)
+ +static void i915_gem_context_unpin(struct intel_context *ctx,
+ +				   struct intel_engine_cs *engine)
+  {
+++<<<<<<< HEAD
+ +	if (i915.enable_execlists) {
+ +		intel_lr_context_unpin(ctx, engine);
+ +	} else {
+ +		if (engine->id == RCS && ctx->legacy_hw_ctx.rcs_state)
+ +			i915_gem_object_ggtt_unpin(ctx->legacy_hw_ctx.rcs_state);
+ +		i915_gem_context_unreference(ctx);
+ +	}
+++=======
++ 	struct i915_gem_context *ctx;
++ 	int ret;
++ 
++ 	if (!IS_ENABLED(CONFIG_DRM_I915_GVT))
++ 		return ERR_PTR(-ENODEV);
++ 
++ 	ret = i915_mutex_lock_interruptible(dev);
++ 	if (ret)
++ 		return ERR_PTR(ret);
++ 
++ 	ctx = __create_hw_context(to_i915(dev), NULL);
++ 	if (IS_ERR(ctx))
++ 		goto out;
++ 
++ 	ctx->file_priv = ERR_PTR(-EBADF);
++ 	i915_gem_context_set_closed(ctx); /* not user accessible */
++ 	i915_gem_context_clear_bannable(ctx);
++ 	i915_gem_context_set_force_single_submission(ctx);
++ 	if (!i915.enable_guc_submission)
++ 		ctx->ring_size = 512 * PAGE_SIZE; /* Max ring buffer size */
++ 
++ 	GEM_BUG_ON(i915_gem_context_is_kernel(ctx));
++ out:
++ 	mutex_unlock(&dev->struct_mutex);
++ 	return ctx;
+++>>>>>>> 718e884a0183 (drm/i915/gvt: set ring buffer size to default for guc submission)
+  }
+  
+ -int i915_gem_context_init(struct drm_i915_private *dev_priv)
+ +void i915_gem_context_reset(struct drm_device *dev)
+  {
+ -	struct i915_gem_context *ctx;
+ +	struct drm_i915_private *dev_priv = dev->dev_private;
+ +	int i;
+ +
+ +	if (i915.enable_execlists) {
+ +		struct intel_context *ctx;
+ +
+ +		list_for_each_entry(ctx, &dev_priv->context_list, link)
+ +			intel_lr_context_reset(dev, ctx);
+ +	}
+ +
+ +	for (i = 0; i < I915_NUM_RINGS; i++) {
+ +		struct intel_engine_cs *ring = &dev_priv->ring[i];
+ +
+ +		if (ring->last_context) {
+ +			i915_gem_context_unpin(ring->last_context, ring);
+ +			ring->last_context = NULL;
+ +		}
+ +	}
+ +
+ +	/* Force the GPU state to be reinitialised on enabling */
+ +	dev_priv->kernel_context->legacy_hw_ctx.initialized = false;
+ +}
+ +
+ +int i915_gem_context_init(struct drm_device *dev)
+ +{
+ +	struct drm_i915_private *dev_priv = dev->dev_private;
+ +	struct intel_context *ctx;
+  
+  	/* Init should only be called once per module load. Eventually the
+  	 * restriction on the context_disabled check can be loosened. */
+* Unmerged path drivers/gpu/drm/i915/i915_gem_context.c
