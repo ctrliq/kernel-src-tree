@@ -1,0 +1,489 @@
+sysfs, kernfs: prepare mmap path for kernfs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit fdbffaa478fc77e999cbe2ac0dcfbf609103e675
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fdbffaa4.failed
+
+We're in the process of separating out core sysfs functionality into
+kernfs which will deal with sysfs_dirents directly.  This patch
+rearranges mmap path so that the kernfs and sysfs parts are separate.
+
+sysfs_kf_bin_mmap() which handles the interaction with bin_attribute
+mmap method is factored out of sysfs_bin_mmap(), which is renamed to
+kernfs_file_mmap().  All vma ops are renamed accordingly.
+
+sysfs_bin_mmap() is updated such that it can be used for both file
+types.  This will eventually allow using the same file_operations for
+both file types, which is necessary to separate out kernfs.
+
+This patch doesn't introduce any behavior changes.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit fdbffaa478fc77e999cbe2ac0dcfbf609103e675)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/sysfs/file.c
+diff --cc fs/sysfs/file.c
+index d8887c896abc,2e24e89bd92b..000000000000
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@@ -148,60 -250,332 +148,277 @@@ out
+  }
+  
+  /**
+ - * kernfs_file_read - kernfs vfs read callback
+ - * @file: file pointer
+ - * @user_buf: data to write
+ - * @count: number of bytes
+ - * @ppos: starting offset
+ + *	fill_write_buffer - copy buffer from userspace.
+ + *	@buffer:	data buffer for file.
+ + *	@buf:		data from user.
+ + *	@count:		number of bytes in @userbuf.
+ + *
+ + *	Allocate @buffer->page if it hasn't been already, then
+ + *	copy the user-supplied buffer into it.
+   */
+ -static ssize_t kernfs_file_read(struct file *file, char __user *user_buf,
+ -				size_t count, loff_t *ppos)
+ +static int fill_write_buffer(struct sysfs_buffer * buffer,
+ +			     const char __user * buf, size_t count)
+  {
+ -	struct sysfs_open_file *of = sysfs_of(file);
+ -
+ -	if (sysfs_is_bin(of->sd))
+ -		return kernfs_file_direct_read(of, user_buf, count, ppos);
+ -	else
+ -		return seq_read(file, user_buf, count, ppos);
+ -}
+ -
+ -/* kernfs write callback for regular sysfs files */
+ -static ssize_t sysfs_kf_write(struct sysfs_open_file *of, char *buf,
+ -			      size_t count, loff_t pos)
+ -{
+ -	const struct sysfs_ops *ops = sysfs_file_ops(of->sd);
+ -	struct kobject *kobj = of->sd->s_parent->priv;
+ +	int error;
+  
+ -	if (!count)
+ -		return 0;
+ +	if (!buffer->page)
+ +		buffer->page = (char *)get_zeroed_page(GFP_KERNEL);
+ +	if (!buffer->page)
+ +		return -ENOMEM;
+  
+ -	return ops->store(kobj, of->sd->priv, buf, count);
+ +	if (count >= PAGE_SIZE)
+ +		count = PAGE_SIZE - 1;
+ +	error = copy_from_user(buffer->page,buf,count);
+ +	buffer->needs_read_fill = 1;
+ +	/* if buf is assumed to contain a string, terminate it by \0,
+ +	   so e.g. sscanf() can scan the string easily */
+ +	buffer->page[count] = 0;
+ +	return error ? -EFAULT : count;
+  }
+  
+ -/* kernfs write callback for bin sysfs files */
+ -static ssize_t sysfs_kf_bin_write(struct sysfs_open_file *of, char *buf,
+ -				  size_t count, loff_t pos)
+ -{
+ -	struct bin_attribute *battr = of->sd->priv;
+ -	struct kobject *kobj = of->sd->s_parent->priv;
+ -	loff_t size = file_inode(of->file)->i_size;
+ -
+ -	if (size) {
+ -		if (size <= pos)
+ -			return 0;
+ -		count = min_t(ssize_t, count, size - pos);
+ -	}
+ -	if (!count)
+ -		return 0;
+ -
+ -	if (!battr->write)
+ -		return -EIO;
+ -
+ -	return battr->write(of->file, kobj, battr, buf, pos, count);
+ -}
+++<<<<<<< HEAD
+  
+  /**
+ - * kernfs_file_write - kernfs vfs write callback
+ - * @file: file pointer
+ - * @user_buf: data to write
+ - * @count: number of bytes
+ - * @ppos: starting offset
+ - *
+ - * Copy data in from userland and pass it to the matching kernfs write
+ - * operation.
+ + *	flush_write_buffer - push buffer to kobject.
+ + *	@dentry:	dentry to the attribute
+ + *	@buffer:	data buffer for file.
+ + *	@count:		number of bytes
+   *
+ - * There is no easy way for us to know if userspace is only doing a partial
+ - * write, so we don't support them. We expect the entire buffer to come on
+ - * the first write.  Hint: if you're writing a value, first read the file,
+ - * modify only the the value you're changing, then write entire buffer
+ - * back.
+ + *	Get the correct pointers for the kobject and the attribute we're
+ + *	dealing with, then call the store() method for the attribute,
+ + *	passing the buffer that we acquired in fill_write_buffer().
+   */
+ -static ssize_t kernfs_file_write(struct file *file, const char __user *user_buf,
+ -				 size_t count, loff_t *ppos)
+ +static int
+ +flush_write_buffer(struct dentry * dentry, struct sysfs_buffer * buffer, size_t count)
+  {
+ -	struct sysfs_open_file *of = sysfs_of(file);
+ -	ssize_t len = min_t(size_t, count, PAGE_SIZE);
+ -	char *buf;
+ -
+ -	buf = kmalloc(len + 1, GFP_KERNEL);
+ -	if (!buf)
+ -		return -ENOMEM;
+ -
+ -	if (copy_from_user(buf, user_buf, len)) {
+ -		len = -EFAULT;
+ -		goto out_free;
+ -	}
+ -	buf[len] = '\0';	/* guarantee string termination */
+ -
+ -	/*
+ -	 * @of->mutex nests outside active ref and is just to ensure that
+ -	 * the ops aren't called concurrently for the same open file.
+ -	 */
+ -	mutex_lock(&of->mutex);
+ -	if (!sysfs_get_active(of->sd)) {
+ -		mutex_unlock(&of->mutex);
+ -		len = -ENODEV;
+ -		goto out_free;
+ -	}
+ -
+ -	if (sysfs_is_bin(of->sd))
+ -		len = sysfs_kf_bin_write(of, buf, len, *ppos);
+ -	else
+ -		len = sysfs_kf_write(of, buf, len, *ppos);
+ -
+ -	sysfs_put_active(of->sd);
+ -	mutex_unlock(&of->mutex);
+ -
+ -	if (len > 0)
+ -		*ppos += len;
+ -out_free:
+ -	kfree(buf);
+ -	return len;
+ -}
+ -
+ +	struct sysfs_dirent *attr_sd = dentry->d_fsdata;
+ +	struct kobject *kobj = attr_sd->s_parent->s_dir.kobj;
+ +	const struct sysfs_ops * ops = buffer->ops;
+++=======
++ static int sysfs_kf_bin_mmap(struct sysfs_open_file *of,
++ 			     struct vm_area_struct *vma)
++ {
++ 	struct bin_attribute *battr = of->sd->priv;
++ 	struct kobject *kobj = of->sd->s_parent->priv;
++ 
++ 	if (!battr->mmap)
++ 		return -ENODEV;
++ 
++ 	return battr->mmap(of->file, kobj, battr, vma);
++ }
++ 
++ static void kernfs_vma_open(struct vm_area_struct *vma)
++ {
++ 	struct file *file = vma->vm_file;
++ 	struct sysfs_open_file *of = sysfs_of(file);
++ 
++ 	if (!of->vm_ops)
++ 		return;
++ 
++ 	if (!sysfs_get_active(of->sd))
++ 		return;
++ 
++ 	if (of->vm_ops->open)
++ 		of->vm_ops->open(vma);
++ 
++ 	sysfs_put_active(of->sd);
++ }
++ 
++ static int kernfs_vma_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++ {
++ 	struct file *file = vma->vm_file;
++ 	struct sysfs_open_file *of = sysfs_of(file);
++ 	int ret;
++ 
++ 	if (!of->vm_ops)
++ 		return VM_FAULT_SIGBUS;
++ 
++ 	if (!sysfs_get_active(of->sd))
++ 		return VM_FAULT_SIGBUS;
++ 
++ 	ret = VM_FAULT_SIGBUS;
++ 	if (of->vm_ops->fault)
++ 		ret = of->vm_ops->fault(vma, vmf);
++ 
++ 	sysfs_put_active(of->sd);
++ 	return ret;
++ }
++ 
++ static int kernfs_vma_page_mkwrite(struct vm_area_struct *vma,
++ 				   struct vm_fault *vmf)
++ {
++ 	struct file *file = vma->vm_file;
++ 	struct sysfs_open_file *of = sysfs_of(file);
++ 	int ret;
++ 
++ 	if (!of->vm_ops)
++ 		return VM_FAULT_SIGBUS;
++ 
++ 	if (!sysfs_get_active(of->sd))
++ 		return VM_FAULT_SIGBUS;
++ 
++ 	ret = 0;
++ 	if (of->vm_ops->page_mkwrite)
++ 		ret = of->vm_ops->page_mkwrite(vma, vmf);
++ 	else
++ 		file_update_time(file);
++ 
++ 	sysfs_put_active(of->sd);
++ 	return ret;
++ }
++ 
++ static int kernfs_vma_access(struct vm_area_struct *vma, unsigned long addr,
++ 			     void *buf, int len, int write)
++ {
++ 	struct file *file = vma->vm_file;
++ 	struct sysfs_open_file *of = sysfs_of(file);
++ 	int ret;
++ 
++ 	if (!of->vm_ops)
++ 		return -EINVAL;
++ 
++ 	if (!sysfs_get_active(of->sd))
++ 		return -EINVAL;
++ 
++ 	ret = -EINVAL;
++ 	if (of->vm_ops->access)
++ 		ret = of->vm_ops->access(vma, addr, buf, len, write);
++ 
++ 	sysfs_put_active(of->sd);
++ 	return ret;
++ }
++ 
++ #ifdef CONFIG_NUMA
++ static int kernfs_vma_set_policy(struct vm_area_struct *vma,
++ 				 struct mempolicy *new)
++ {
++ 	struct file *file = vma->vm_file;
++ 	struct sysfs_open_file *of = sysfs_of(file);
++ 	int ret;
++ 
++ 	if (!of->vm_ops)
++ 		return 0;
++ 
++ 	if (!sysfs_get_active(of->sd))
++ 		return -EINVAL;
++ 
++ 	ret = 0;
++ 	if (of->vm_ops->set_policy)
++ 		ret = of->vm_ops->set_policy(vma, new);
++ 
++ 	sysfs_put_active(of->sd);
++ 	return ret;
++ }
++ 
++ static struct mempolicy *kernfs_vma_get_policy(struct vm_area_struct *vma,
++ 					       unsigned long addr)
++ {
++ 	struct file *file = vma->vm_file;
++ 	struct sysfs_open_file *of = sysfs_of(file);
++ 	struct mempolicy *pol;
++ 
++ 	if (!of->vm_ops)
++ 		return vma->vm_policy;
++ 
++ 	if (!sysfs_get_active(of->sd))
++ 		return vma->vm_policy;
++ 
++ 	pol = vma->vm_policy;
++ 	if (of->vm_ops->get_policy)
++ 		pol = of->vm_ops->get_policy(vma, addr);
++ 
++ 	sysfs_put_active(of->sd);
++ 	return pol;
++ }
++ 
++ static int kernfs_vma_migrate(struct vm_area_struct *vma,
++ 			      const nodemask_t *from, const nodemask_t *to,
++ 			      unsigned long flags)
++ {
++ 	struct file *file = vma->vm_file;
++ 	struct sysfs_open_file *of = sysfs_of(file);
++ 	int ret;
++ 
++ 	if (!of->vm_ops)
++ 		return 0;
++ 
++ 	if (!sysfs_get_active(of->sd))
++ 		return 0;
++ 
++ 	ret = 0;
++ 	if (of->vm_ops->migrate)
++ 		ret = of->vm_ops->migrate(vma, from, to, flags);
++ 
++ 	sysfs_put_active(of->sd);
++ 	return ret;
++ }
++ #endif
++ 
++ static const struct vm_operations_struct kernfs_vm_ops = {
++ 	.open		= kernfs_vma_open,
++ 	.fault		= kernfs_vma_fault,
++ 	.page_mkwrite	= kernfs_vma_page_mkwrite,
++ 	.access		= kernfs_vma_access,
++ #ifdef CONFIG_NUMA
++ 	.set_policy	= kernfs_vma_set_policy,
++ 	.get_policy	= kernfs_vma_get_policy,
++ 	.migrate	= kernfs_vma_migrate,
++ #endif
++ };
++ 
++ static int kernfs_file_mmap(struct file *file, struct vm_area_struct *vma)
++ {
++ 	struct sysfs_open_file *of = sysfs_of(file);
+++>>>>>>> fdbffaa478fc (sysfs, kernfs: prepare mmap path for kernfs)
+  	int rc;
+  
+ -	mutex_lock(&of->mutex);
+ +	/* need attr_sd for attr and ops, its parent for kobj */
+ +	if (!sysfs_get_active(attr_sd))
+ +		return -ENODEV;
+ +
+++<<<<<<< HEAD
+ +	rc = ops->store(kobj, attr_sd->s_attr.attr, buffer->page, count);
+  
+ +	sysfs_put_active(attr_sd);
+++=======
++ 	rc = -ENODEV;
++ 	if (!sysfs_get_active(of->sd))
++ 		goto out_unlock;
++ 
++ 	if (sysfs_is_bin(of->sd))
++ 		rc = sysfs_kf_bin_mmap(of, vma);
++ 	if (rc)
++ 		goto out_put;
++ 
++ 	/*
++ 	 * PowerPC's pci_mmap of legacy_mem uses shmem_zero_setup()
++ 	 * to satisfy versions of X which crash if the mmap fails: that
++ 	 * substitutes a new vm_file, and we don't then want bin_vm_ops.
++ 	 */
++ 	if (vma->vm_file != file)
++ 		goto out_put;
++ 
++ 	rc = -EINVAL;
++ 	if (of->mmapped && of->vm_ops != vma->vm_ops)
++ 		goto out_put;
++ 
++ 	/*
++ 	 * It is not possible to successfully wrap close.
++ 	 * So error if someone is trying to use close.
++ 	 */
++ 	rc = -EINVAL;
++ 	if (vma->vm_ops && vma->vm_ops->close)
++ 		goto out_put;
++ 
++ 	rc = 0;
++ 	of->mmapped = 1;
++ 	of->vm_ops = vma->vm_ops;
++ 	vma->vm_ops = &kernfs_vm_ops;
++ out_put:
++ 	sysfs_put_active(of->sd);
++ out_unlock:
++ 	mutex_unlock(&of->mutex);
+++>>>>>>> fdbffaa478fc (sysfs, kernfs: prepare mmap path for kernfs)
+  
+  	return rc;
+  }
+@@@ -484,55 -882,28 +701,68 @@@ void sysfs_notify(struct kobject *k, co
+  EXPORT_SYMBOL_GPL(sysfs_notify);
+  
+  const struct file_operations sysfs_file_operations = {
+ -	.read		= kernfs_file_read,
+ -	.write		= kernfs_file_write,
+ +	.read		= sysfs_read_file,
+ +	.write		= sysfs_write_file,
+  	.llseek		= generic_file_llseek,
++ 	.mmap		= kernfs_file_mmap,
+  	.open		= sysfs_open_file,
+  	.release	= sysfs_release,
+  	.poll		= sysfs_poll,
+  };
+  
+++<<<<<<< HEAD
+ +static int sysfs_attr_ns(struct kobject *kobj, const struct attribute *attr,
+ +			 const void **pns)
+ +{
+ +	struct sysfs_dirent *dir_sd = kobj->sd;
+ +	const struct sysfs_ops *ops;
+ +	const void *ns = NULL;
+ +	int err;
+++=======
++ const struct file_operations sysfs_bin_operations = {
++ 	.read		= kernfs_file_read,
++ 	.write		= kernfs_file_write,
++ 	.llseek		= generic_file_llseek,
++ 	.mmap		= kernfs_file_mmap,
++ 	.open		= sysfs_open_file,
++ 	.release	= sysfs_release,
++ 	.poll		= sysfs_poll,
++ };
+++>>>>>>> fdbffaa478fc (sysfs, kernfs: prepare mmap path for kernfs)
+ +
+ +	if (!dir_sd) {
+ +		WARN(1, KERN_ERR "sysfs: kobject %s without dirent\n",
+ +			kobject_name(kobj));
+ +		return -ENOENT;
+ +	}
+ +
+ +	err = 0;
+ +	if (!sysfs_ns_type(dir_sd))
+ +		goto out;
+ +
+ +	err = -EINVAL;
+ +	if (!kobj->ktype)
+ +		goto out;
+ +	ops = kobj->ktype->sysfs_ops;
+ +	if (!ops)
+ +		goto out;
+ +	if (!ops->namespace)
+ +		goto out;
+ +
+ +	err = 0;
+ +	ns = ops->namespace(kobj, attr);
+ +out:
+ +	if (err) {
+ +		WARN(1, KERN_ERR
+ +		     "missing sysfs namespace attribute operation for kobject: %s\n",
+ +		     kobject_name(kobj));
+ +	}
+ +	*pns = ns;
+ +	return err;
+ +}
+  
+ -int sysfs_add_file_mode_ns(struct sysfs_dirent *dir_sd,
+ -			   const struct attribute *attr, int type,
+ -			   umode_t amode, const void *ns)
+ +int sysfs_add_file_mode(struct sysfs_dirent *dir_sd,
+ +			const struct attribute *attr, int type, umode_t amode)
+  {
+  	umode_t mode = (amode & S_IALLUGO) | S_IFREG;
+  	struct sysfs_addrm_cxt acxt;
+* Unmerged path fs/sysfs/file.c
