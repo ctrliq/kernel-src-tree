@@ -1,0 +1,75 @@
+fix EBUSY on umount() from MNT_SHRINKABLE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 81b6b06197606b4bef4e427a197aeb808e8d89e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/81b6b061.failed
+
+We need the parents of victims alive until namespace_unlock() gets to
+dput() of the (ex-)mountpoints.  However, that screws up the "is it
+busy" checks in case when we have shrinkable mounts that need to be
+killed.  Solution: go ahead and decrement refcounts of parents right
+in umount_tree(), increment them again just before dropping rwsem in
+namespace_unlock() (and let the loop in the end of namespace_unlock()
+finally drop those references for good, as we do now).  Parents can't
+get freed until we drop rwsem - at least one reference is kept until
+then, both in case when parent is among the victims and when it is
+not.  So they'll still be around when we get to namespace_unlock().
+
+	Cc: stable@vger.kernel.org # 3.12+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 81b6b06197606b4bef4e427a197aeb808e8d89e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namespace.c
+diff --cc fs/namespace.c
+index a82db7875df0,ef42d9bee212..000000000000
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@@ -1149,12 -1214,21 +1149,23 @@@ static void namespace_unlock(void
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	list_splice_init(&unmounted, &head);
+++=======
++ 	head.first->pprev = &head.first;
++ 	INIT_HLIST_HEAD(&unmounted);
++ 
++ 	/* undo decrements we'd done in umount_tree() */
++ 	hlist_for_each_entry(mnt, &head, mnt_hash)
++ 		if (mnt->mnt_ex_mountpoint.mnt)
++ 			mntget(mnt->mnt_ex_mountpoint.mnt);
++ 
+++>>>>>>> 81b6b0619760 (fix EBUSY on umount() from MNT_SHRINKABLE)
+  	up_write(&namespace_sem);
+  
+ -	synchronize_rcu();
+ -
+ -	while (!hlist_empty(&head)) {
+ -		mnt = hlist_entry(head.first, struct mount, mnt_hash);
+ -		hlist_del_init(&mnt->mnt_hash);
+ +	while (!list_empty(&head)) {
+ +		mnt = list_first_entry(&head, struct mount, mnt_hash);
+ +		list_del_init(&mnt->mnt_hash);
+  		if (mnt->mnt_ex_mountpoint.mnt)
+  			path_put(&mnt->mnt_ex_mountpoint);
+  		mntput(&mnt->mnt);
+@@@ -1186,9 -1269,11 +1197,10 @@@ void umount_tree(struct mount *mnt, in
+  		list_del_init(&p->mnt_list);
+  		__touch_mnt_namespace(p->mnt_ns);
+  		p->mnt_ns = NULL;
+ -		if (how < 2)
+ -			p->mnt.mnt_flags |= MNT_SYNC_UMOUNT;
+ +		list_del_init(&p->mnt_child);
+  		if (mnt_has_parent(p)) {
+  			put_mountpoint(p->mnt_mp);
++ 			mnt_add_count(p->mnt_parent, -1);
+  			/* move the reference to mountpoint into ->mnt_ex_mountpoint */
+  			p->mnt_ex_mountpoint.dentry = p->mnt_mountpoint;
+  			p->mnt_ex_mountpoint.mnt = &p->mnt_parent->mnt;
+* Unmerged path fs/namespace.c
