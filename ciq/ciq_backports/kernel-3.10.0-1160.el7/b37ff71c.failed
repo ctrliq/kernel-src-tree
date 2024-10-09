@@ -1,0 +1,555 @@
+mm: hwpoison: change PageHWPoison behavior on hugetlb pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+commit b37ff71cc626a0c1b5e098ff9a0b723815f6aaeb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/b37ff71c.failed
+
+We'd like to narrow down the error region in memory error on hugetlb
+pages.  However, currently we set PageHWPoison flags on all subpages in
+the error hugepage and add # of subpages to num_hwpoison_pages, which
+doesn't fit our purpose.
+
+So this patch changes the behavior and we only set PageHWPoison on the
+head page then increase num_hwpoison_pages only by 1.  This is a
+preparation for narrow-down part which comes in later patches.
+
+Link: http://lkml.kernel.org/r/1496305019-5493-4-git-send-email-n-horiguchi@ah.jp.nec.com
+	Signed-off-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.vnet.ibm.com>
+	Cc: Anshuman Khandual <khandual@linux.vnet.ibm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit b37ff71cc626a0c1b5e098ff9a0b723815f6aaeb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/swapops.h
+#	mm/memory-failure.c
+diff --cc include/linux/swapops.h
+index b79df3ac42b7,c5ff7b217ee6..000000000000
+--- a/include/linux/swapops.h
++++ b/include/linux/swapops.h
+@@@ -249,6 -180,22 +249,25 @@@ static inline int is_hwpoison_entry(swp
+  {
+  	return swp_type(entry) == SWP_HWPOISON;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static inline bool test_set_page_hwpoison(struct page *page)
++ {
++ 	return TestSetPageHWPoison(page);
++ }
++ 
++ static inline void num_poisoned_pages_inc(void)
++ {
++ 	atomic_long_inc(&num_poisoned_pages);
++ }
++ 
++ static inline void num_poisoned_pages_dec(void)
++ {
++ 	atomic_long_dec(&num_poisoned_pages);
++ }
++ 
+++>>>>>>> b37ff71cc626 (mm: hwpoison: change PageHWPoison behavior on hugetlb pages)
+  #else
+  
+  static inline swp_entry_t make_hwpoison_entry(struct page *page)
+diff --cc mm/memory-failure.c
+index 989a662e69f7,a9ddb0e72f5b..000000000000
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@@ -1050,105 -1004,11 +1050,108 @@@ static int hwpoison_user_mappings(struc
+  	 * any accesses to the poisoned memory.
+  	 */
+  	forcekill = PageDirty(hpage) || (flags & MF_MUST_KILL);
+ -	kill_procs(&tokill, forcekill, trapno, !unmap_success, p, pfn, flags);
+ +	kill_procs(&tokill, forcekill, trapno,
+ +		      ret != SWAP_SUCCESS, pfn, flags);
+ +
+ +	return ret;
+ +}
+  
+ -	return unmap_success;
+++<<<<<<< HEAD
+ +static void set_page_hwpoison_huge_page(struct page *hpage)
+ +{
+ +	int i;
+ +	int nr_pages = 1 << compound_order(hpage);
+ +	for (i = 0; i < nr_pages; i++)
+ +		SetPageHWPoison(hpage + i);
+ +}
+ +
+ +static void clear_page_hwpoison_huge_page(struct page *hpage)
+ +{
+ +	int i;
+ +	int nr_pages = 1 << compound_order(hpage);
+ +	for (i = 0; i < nr_pages; i++)
+ +		ClearPageHWPoison(hpage + i);
+  }
+  
+ +static int memory_failure_dev_pagemap(unsigned long pfn, int trapno, int flags,
+ +		struct dev_pagemap *pgmap)
+ +{
+ +	struct page *page = pfn_to_page(pfn);
+ +	const bool unmap_success = true;
+ +	unsigned long size = 0;
+ +	struct to_kill *tk;
+ +	LIST_HEAD(tokill);
+ +	int rc = -EBUSY;
+ +	loff_t start;
+ +
+ +	/*
+ +	 * Prevent the inode from being freed while we are interrogating
+ +	 * the address_space, typically this would be handled by
+ +	 * lock_page(), but dax pages do not use the page lock. This
+ +	 * also prevents changes to the mapping of this pfn until
+ +	 * poison signaling is complete.
+ +	 */
+ +	if (!dax_lock_mapping_entry(page))
+ +		goto out;
+ +
+ +	if (hwpoison_filter(page)) {
+ +		rc = 0;
+ +		goto unlock;
+ +	}
+ +
+ +	switch (pgmap->type) {
+ +	case MEMORY_HMM:
+ +		/*
+ +		 * TODO: Handle HMM pages which may need coordination
+ +		 * with device-side memory.
+ +		 */
+ +		goto unlock;
+ +	default:
+ +		break;
+ +	}
+ +
+ +	/*
+ +	 * Use this flag as an indication that the dax page has been
+ +	 * remapped UC to prevent speculative consumption of poison.
+ +	 */
+ +	SetPageHWPoison(page);
+ +
+ +	/*
+ +	 * Unlike System-RAM there is no possibility to swap in a
+ +	 * different physical page at a given virtual address, so all
+ +	 * userspace consumption of ZONE_DEVICE memory necessitates
+ +	 * SIGBUS (i.e. MF_MUST_KILL)
+ +	 */
+ +	flags |= MF_ACTION_REQUIRED | MF_MUST_KILL;
+ +	collect_procs(page, &tokill, flags & MF_ACTION_REQUIRED);
+ +
+ +	list_for_each_entry(tk, &tokill, nd)
+ +		if (tk->size_shift)
+ +			size = max(size, 1UL << tk->size_shift);
+ +	if (size) {
+ +		/*
+ +		 * Unmap the largest mapping to avoid breaking up
+ +		 * device-dax mappings which are constant size. The
+ +		 * actual size of the mapping being torn down is
+ +		 * communicated in siginfo, see kill_proc()
+ +		 */
+ +		start = (page->index << PAGE_SHIFT) & ~(size - 1);
+ +		unmap_mapping_range(page->mapping, start, start + size, 0);
+ +	}
+ +	kill_procs(&tokill, flags & MF_MUST_KILL, trapno,
+ +		   !unmap_success, pfn, flags);
+ +	rc = 0;
+ +unlock:
+ +	dax_unlock_mapping_entry(page);
+ +out:
+ +	/* drop pgmap ref acquired in caller */
+ +	put_dev_pagemap(pgmap);
+ +	action_result(pfn, "dax page", rc ? FAILED : RECOVERED);
+ +	return rc;
+ +}
+ +
+++=======
+++>>>>>>> b37ff71cc626 (mm: hwpoison: change PageHWPoison behavior on hugetlb pages)
+  /**
+   * memory_failure - Handle memory failure of a page.
+   * @pfn: Page Number of the corrupted page
+@@@ -1173,9 -1033,7 +1176,8 @@@ int memory_failure(unsigned long pfn, i
+  	struct page *p;
+  	struct page *hpage;
+  	struct page *orig_head;
+ +	struct dev_pagemap *pgmap;
+  	int res;
+- 	unsigned int nr_pages;
+  	unsigned long page_flags;
+  
+  	if (!sysctl_memory_failure_recovery)
+@@@ -1188,30 -1045,25 +1190,44 @@@
+  		return -ENXIO;
+  	}
+  
+ +	pgmap = get_dev_pagemap(pfn, NULL);
+ +	if (pgmap)
+ +		return memory_failure_dev_pagemap(pfn, trapno, flags, pgmap);
+ +
+  	p = pfn_to_page(pfn);
+ +
+  	orig_head = hpage = compound_head(p);
++ 
++ 	/* tmporary check code, to be updated in later patches */
++ 	if (PageHuge(p)) {
++ 		if (TestSetPageHWPoison(hpage)) {
++ 			pr_err("Memory failure: %#lx: already hardware poisoned\n", pfn);
++ 			return 0;
++ 		}
++ 		goto tmp;
++ 	}
+  	if (TestSetPageHWPoison(p)) {
+ -		pr_err("Memory failure: %#lx: already hardware poisoned\n",
+ -			pfn);
+ +		printk(KERN_ERR "MCE %#lx: already hardware poisoned\n", pfn);
+  		return 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Currently errors on hugetlbfs pages are measured in hugepage units,
+ +	 * so nr_pages should be 1 << compound_order.  OTOH when errors are on
+ +	 * transparent hugepages, they are supposed to be split and error
+ +	 * measurement is done in normal page units.  So nr_pages should be one
+ +	 * in this case.
+ +	 */
+ +	if (PageHuge(p))
+ +		nr_pages = 1 << compound_order(hpage);
+ +	else /* normal page or thp */
+ +		nr_pages = 1;
+ +	atomic_long_add(nr_pages, &num_poisoned_pages);
+++=======
++ tmp:
++ 	num_poisoned_pages_inc();
+++>>>>>>> b37ff71cc626 (mm: hwpoison: change PageHWPoison behavior on hugetlb pages)
+  
+  	/*
+  	 * We need/can do nothing about count=0 pages.
+@@@ -1239,15 -1091,14 +1255,18 @@@
+  			if (PageHWPoison(hpage)) {
+  				if ((hwpoison_filter(p) && TestClearPageHWPoison(p))
+  				    || (p != hpage && TestSetPageHWPoison(hpage))) {
+++<<<<<<< HEAD
+ +					atomic_long_sub(nr_pages, &num_poisoned_pages);
+++=======
++ 					num_poisoned_pages_dec();
+++>>>>>>> b37ff71cc626 (mm: hwpoison: change PageHWPoison behavior on hugetlb pages)
+  					unlock_page(hpage);
+  					return 0;
+  				}
+  			}
+- 			set_page_hwpoison_huge_page(hpage);
+  			res = dequeue_hwpoisoned_huge_page(hpage);
+ -			action_result(pfn, MF_MSG_FREE_HUGE,
+ -				      res ? MF_IGNORED : MF_DELAYED);
+ +			action_result(pfn, "free huge",
+ +				      res ? IGNORED : DELAYED);
+  			unlock_page(hpage);
+  			return res;
+  		} else {
+@@@ -1257,24 -1108,21 +1276,29 @@@
+  	}
+  
+  	if (!PageHuge(p) && PageTransHuge(hpage)) {
+ -		lock_page(p);
+ -		if (!PageAnon(p) || unlikely(split_huge_page(p))) {
+ -			unlock_page(p);
+ -			if (!PageAnon(p))
+ -				pr_err("Memory failure: %#lx: non anonymous thp\n",
+ -					pfn);
+ -			else
+ -				pr_err("Memory failure: %#lx: thp split failed\n",
+ -					pfn);
+ +		if (!PageAnon(hpage)) {
+ +			pr_err("MCE: %#lx: non anonymous thp\n", pfn);
+  			if (TestClearPageHWPoison(p))
+++<<<<<<< HEAD
+ +				atomic_long_sub(nr_pages, &num_poisoned_pages);
+ +			put_page(p);
+ +			if (p != hpage)
+ +				put_page(hpage);
+ +			return -EBUSY;
+ +		}
+ +		if (unlikely(split_huge_page(hpage))) {
+ +			pr_err("MCE: %#lx: thp split failed\n", pfn);
+ +			if (TestClearPageHWPoison(p))
+ +				atomic_long_sub(nr_pages, &num_poisoned_pages);
+ +			put_page(p);
+ +			if (p != hpage)
+ +				put_page(hpage);
+++=======
++ 				num_poisoned_pages_dec();
++ 			put_hwpoison_page(p);
+++>>>>>>> b37ff71cc626 (mm: hwpoison: change PageHWPoison behavior on hugetlb pages)
+  			return -EBUSY;
+  		}
+ -		unlock_page(p);
+  		VM_BUG_ON_PAGE(!page_count(p), p);
+  		hpage = compound_head(p);
+  	}
+@@@ -1330,17 -1173,17 +1354,29 @@@
+  	 * unpoison always clear PG_hwpoison inside page lock
+  	 */
+  	if (!PageHWPoison(p)) {
+++<<<<<<< HEAD
+ +		printk(KERN_ERR "MCE %#lx: just unpoisoned\n", pfn);
+ +		atomic_long_sub(nr_pages, &num_poisoned_pages);
+ +		put_page(hpage);
+ +		res = 0;
+ +		goto out;
+ +	}
+ +	if (hwpoison_filter(p)) {
+ +		if (TestClearPageHWPoison(p))
+ +			atomic_long_sub(nr_pages, &num_poisoned_pages);
+++=======
++ 		pr_err("Memory failure: %#lx: just unpoisoned\n", pfn);
++ 		num_poisoned_pages_dec();
++ 		unlock_page(hpage);
++ 		put_hwpoison_page(hpage);
++ 		return 0;
++ 	}
++ 	if (hwpoison_filter(p)) {
++ 		if (TestClearPageHWPoison(p))
++ 			num_poisoned_pages_dec();
+++>>>>>>> b37ff71cc626 (mm: hwpoison: change PageHWPoison behavior on hugetlb pages)
+  		unlock_page(hpage);
+ -		put_hwpoison_page(hpage);
+ +		put_page(hpage);
+  		return 0;
+  	}
+  
+@@@ -1352,38 -1195,16 +1388,41 @@@
+  	 * on the head page to show that the hugepage is hwpoisoned
+  	 */
+  	if (PageHuge(p) && PageTail(p) && TestSetPageHWPoison(hpage)) {
+ -		action_result(pfn, MF_MSG_POISONED_HUGE, MF_IGNORED);
+ +		action_result(pfn, "hugepage already hardware poisoned",
+ +				IGNORED);
+  		unlock_page(hpage);
+ -		put_hwpoison_page(hpage);
+ +		put_page(hpage);
+  		return 0;
+  	}
+++<<<<<<< HEAD
+  
+  	/*
+ -	 * It's very difficult to mess with pages currently under IO
+ -	 * and in many cases impossible, so we just avoid it here.
+ +	 * TODO: hwpoison for pud-sized hugetlb doesn't work right now, so
+ +	 * simply disable it. In order to make it work properly, we need
+ +	 * make sure that:
+ +	 *  - conversion of a pud that maps an error hugetlb into hwpoison
+ +	 *    entry properly works, and
+ +	 *  - other mm code walking over page table is aware of pud-aligned
+ +	 *    hwpoison entries.
+  	 */
+ +	if (PageHuge(p) && huge_page_size(page_hstate(hpage)) > PMD_SIZE) {
+ +		action_result(pfn, "non-pmd-sized huge page", IGNORED);
+ +		unlock_page(hpage);
+ +		put_page(hpage);
+ +		return -EBUSY;
+ +	}
+ +
+ +	/*
+ +	 * Set PG_hwpoison on all pages in an error hugepage,
+ +	 * because containment is done in hugepage unit for now.
+ +	 * Since we have done TestSetPageHWPoison() for the head page with
+ +	 * page lock held, we can safely set PG_hwpoison bits on tail pages.
+ +	 */
+ +	if (PageHuge(p))
+ +		set_page_hwpoison_huge_page(hpage);
+++=======
+++>>>>>>> b37ff71cc626 (mm: hwpoison: change PageHWPoison behavior on hugetlb pages)
+ +
+  	wait_on_page_writeback(p);
+  
+  	/*
+@@@ -1547,7 -1370,8 +1586,12 @@@ int unpoison_memory(unsigned long pfn
+  	struct page *page;
+  	struct page *p;
+  	int freeit = 0;
+++<<<<<<< HEAD
+ +	unsigned int nr_pages;
+++=======
++ 	static DEFINE_RATELIMIT_STATE(unpoison_rs, DEFAULT_RATELIMIT_INTERVAL,
++ 					DEFAULT_RATELIMIT_BURST);
+++>>>>>>> b37ff71cc626 (mm: hwpoison: change PageHWPoison behavior on hugetlb pages)
+  
+  	if (!pfn_valid(pfn))
+  		return -ENXIO;
+@@@ -1597,11 -1441,10 +1639,15 @@@
+  	 * the free buddy page pool.
+  	 */
+  	if (TestClearPageHWPoison(page)) {
+++<<<<<<< HEAD
+ +		pr_info("MCE: Software-unpoisoned page %#lx\n", pfn);
+ +		atomic_long_sub(nr_pages, &num_poisoned_pages);
+++=======
++ 		unpoison_pr_info("Unpoison: Software-unpoisoned page %#lx\n",
++ 				 pfn, &unpoison_rs);
++ 		num_poisoned_pages_dec();
+++>>>>>>> b37ff71cc626 (mm: hwpoison: change PageHWPoison behavior on hugetlb pages)
+  		freeit = 1;
+- 		if (PageHuge(page))
+- 			clear_page_hwpoison_huge_page(page);
+  	}
+  	unlock_page(page);
+  
+@@@ -1726,20 -1576,133 +1772,146 @@@ static int soft_offline_huge_page(struc
+  			ret = -EIO;
+  	} else {
+  		/* overcommit hugetlb page will be freed to buddy */
+- 		if (PageHuge(page)) {
+- 			set_page_hwpoison_huge_page(hpage);
++ 		SetPageHWPoison(page);
++ 		if (PageHuge(page))
+  			dequeue_hwpoisoned_huge_page(hpage);
+++<<<<<<< HEAD
+ +			atomic_long_add(1 << compound_order(hpage),
+ +					&num_poisoned_pages);
+ +		} else {
+ +			SetPageHWPoison(page);
+ +			atomic_long_inc(&num_poisoned_pages);
+ +		}
+++=======
++ 		num_poisoned_pages_inc();
+++>>>>>>> b37ff71cc626 (mm: hwpoison: change PageHWPoison behavior on hugetlb pages)
+  	}
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int __soft_offline_page(struct page *page, int flags);
+++=======
++ static int __soft_offline_page(struct page *page, int flags)
++ {
++ 	int ret;
++ 	unsigned long pfn = page_to_pfn(page);
++ 
++ 	/*
++ 	 * Check PageHWPoison again inside page lock because PageHWPoison
++ 	 * is set by memory_failure() outside page lock. Note that
++ 	 * memory_failure() also double-checks PageHWPoison inside page lock,
++ 	 * so there's no race between soft_offline_page() and memory_failure().
++ 	 */
++ 	lock_page(page);
++ 	wait_on_page_writeback(page);
++ 	if (PageHWPoison(page)) {
++ 		unlock_page(page);
++ 		put_hwpoison_page(page);
++ 		pr_info("soft offline: %#lx page already poisoned\n", pfn);
++ 		return -EBUSY;
++ 	}
++ 	/*
++ 	 * Try to invalidate first. This should work for
++ 	 * non dirty unmapped page cache pages.
++ 	 */
++ 	ret = invalidate_inode_page(page);
++ 	unlock_page(page);
++ 	/*
++ 	 * RED-PEN would be better to keep it isolated here, but we
++ 	 * would need to fix isolation locking first.
++ 	 */
++ 	if (ret == 1) {
++ 		put_hwpoison_page(page);
++ 		pr_info("soft_offline: %#lx: invalidated\n", pfn);
++ 		SetPageHWPoison(page);
++ 		num_poisoned_pages_inc();
++ 		return 0;
++ 	}
++ 
++ 	/*
++ 	 * Simple invalidation didn't work.
++ 	 * Try to migrate to a new page instead. migrate.c
++ 	 * handles a large number of cases for us.
++ 	 */
++ 	if (PageLRU(page))
++ 		ret = isolate_lru_page(page);
++ 	else
++ 		ret = isolate_movable_page(page, ISOLATE_UNEVICTABLE);
++ 	/*
++ 	 * Drop page reference which is came from get_any_page()
++ 	 * successful isolate_lru_page() already took another one.
++ 	 */
++ 	put_hwpoison_page(page);
++ 	if (!ret) {
++ 		LIST_HEAD(pagelist);
++ 		/*
++ 		 * After isolated lru page, the PageLRU will be cleared,
++ 		 * so use !__PageMovable instead for LRU page's mapping
++ 		 * cannot have PAGE_MAPPING_MOVABLE.
++ 		 */
++ 		if (!__PageMovable(page))
++ 			inc_node_page_state(page, NR_ISOLATED_ANON +
++ 						page_is_file_cache(page));
++ 		list_add(&page->lru, &pagelist);
++ 		ret = migrate_pages(&pagelist, new_page, NULL, MPOL_MF_MOVE_ALL,
++ 					MIGRATE_SYNC, MR_MEMORY_FAILURE);
++ 		if (ret) {
++ 			if (!list_empty(&pagelist))
++ 				putback_movable_pages(&pagelist);
++ 
++ 			pr_info("soft offline: %#lx: migration failed %d, type %lx (%pGp)\n",
++ 				pfn, ret, page->flags, &page->flags);
++ 			if (ret > 0)
++ 				ret = -EIO;
++ 		}
++ 	} else {
++ 		pr_info("soft offline: %#lx: isolation failed: %d, page count %d, type %lx (%pGp)\n",
++ 			pfn, ret, page_count(page), page->flags, &page->flags);
++ 	}
++ 	return ret;
++ }
++ 
++ static int soft_offline_in_use_page(struct page *page, int flags)
++ {
++ 	int ret;
++ 	struct page *hpage = compound_head(page);
++ 
++ 	if (!PageHuge(page) && PageTransHuge(hpage)) {
++ 		lock_page(hpage);
++ 		if (!PageAnon(hpage) || unlikely(split_huge_page(hpage))) {
++ 			unlock_page(hpage);
++ 			if (!PageAnon(hpage))
++ 				pr_info("soft offline: %#lx: non anonymous thp\n", page_to_pfn(page));
++ 			else
++ 				pr_info("soft offline: %#lx: thp split failed\n", page_to_pfn(page));
++ 			put_hwpoison_page(hpage);
++ 			return -EBUSY;
++ 		}
++ 		unlock_page(hpage);
++ 		get_hwpoison_page(page);
++ 		put_hwpoison_page(hpage);
++ 	}
++ 
++ 	if (PageHuge(page))
++ 		ret = soft_offline_huge_page(page, flags);
++ 	else
++ 		ret = __soft_offline_page(page, flags);
++ 
++ 	return ret;
++ }
++ 
++ static void soft_offline_free_page(struct page *page)
++ {
++ 	struct page *head = compound_head(page);
++ 
++ 	if (!TestSetPageHWPoison(head)) {
++ 		num_poisoned_pages_inc();
++ 		if (PageHuge(head))
++ 			dequeue_hwpoisoned_huge_page(head);
++ 	}
++ }
+++>>>>>>> b37ff71cc626 (mm: hwpoison: change PageHWPoison behavior on hugetlb pages)
+  
+  /**
+   * soft_offline_page - Soft offline a page.
+* Unmerged path include/linux/swapops.h
+* Unmerged path mm/memory-failure.c
