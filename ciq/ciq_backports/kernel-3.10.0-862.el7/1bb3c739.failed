@@ -1,0 +1,167 @@
+ibmvnic: Move initialization of sub crqs to ibmvnic_init
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Nathan Fontenot <nfont@linux.vnet.ibm.com>
+commit 1bb3c739ad2c0030792cd527f30865accc50c460
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1bb3c739.failed
+
+The sub crq structures are initialized in interrupt context while
+handling the response to crqs when negotiating capabilities for
+the driver. The sub crqs do not need to be initialized at this point
+and can be moved to being done from ibmvnic_init. Moving the init
+of the sub crqs to ibmvnic_init also allows use to allocate the
+memory with GFP_KERNEL instead of GFP_ATOMIC.
+
+	Signed-off-by: Nathan Fontenot <nfont@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1bb3c739ad2c0030792cd527f30865accc50c460)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index 8b65bfc1f714,4fcd2f0378ba..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -1550,38 -1687,11 +1550,38 @@@ static void init_sub_crqs(struct ibmvni
+  	int more = 0;
+  	int i;
+  
+ +	if (!retry) {
+ +		/* Sub-CRQ entries are 32 byte long */
+ +		int entries_page = 4 * PAGE_SIZE / (sizeof(u64) * 4);
+ +
+ +		if (adapter->min_tx_entries_per_subcrq > entries_page ||
+ +		    adapter->min_rx_add_entries_per_subcrq > entries_page) {
+ +			dev_err(dev, "Fatal, invalid entries per sub-crq\n");
+ +			goto allqueues_failed;
+ +		}
+ +
+ +		/* Get the minimum between the queried max and the entries
+ +		 * that fit in our PAGE_SIZE
+ +		 */
+ +		adapter->req_tx_entries_per_subcrq =
+ +		    adapter->max_tx_entries_per_subcrq > entries_page ?
+ +		    entries_page : adapter->max_tx_entries_per_subcrq;
+ +		adapter->req_rx_add_entries_per_subcrq =
+ +		    adapter->max_rx_add_entries_per_subcrq > entries_page ?
+ +		    entries_page : adapter->max_rx_add_entries_per_subcrq;
+ +
+ +		adapter->req_tx_queues = adapter->opt_tx_comp_sub_queues;
+ +		adapter->req_rx_queues = adapter->opt_rx_comp_queues;
+ +		adapter->req_rx_add_queues = adapter->max_rx_add_queues;
+ +
+ +		adapter->req_mtu = adapter->max_mtu;
+ +	}
+ +
+  	total_queues = adapter->req_tx_queues + adapter->req_rx_queues;
+  
+- 	allqueues = kcalloc(total_queues, sizeof(*allqueues), GFP_ATOMIC);
++ 	allqueues = kcalloc(total_queues, sizeof(*allqueues), GFP_KERNEL);
+  	if (!allqueues)
+ -		return -1;
+ +		goto allqueues_failed;
+  
+  	for (i = 0; i < total_queues; i++) {
+  		allqueues[i] = init_sub_crq_queue(adapter);
+@@@ -1638,6 -1748,51 +1638,54 @@@
+  		adapter->rx_scrq[i]->scrq_num = i;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	kfree(allqueues);
++ 	return 0;
++ 
++ rx_failed:
++ 	kfree(adapter->tx_scrq);
++ 	adapter->tx_scrq = NULL;
++ tx_failed:
++ 	for (i = 0; i < registered_queues; i++)
++ 		release_sub_crq_queue(adapter, allqueues[i]);
++ 	kfree(allqueues);
++ 	return -1;
++ }
++ 
++ static void ibmvnic_send_req_caps(struct ibmvnic_adapter *adapter, int retry)
++ {
++ 	struct device *dev = &adapter->vdev->dev;
++ 	union ibmvnic_crq crq;
++ 
++ 	if (!retry) {
++ 		/* Sub-CRQ entries are 32 byte long */
++ 		int entries_page = 4 * PAGE_SIZE / (sizeof(u64) * 4);
++ 
++ 		if (adapter->min_tx_entries_per_subcrq > entries_page ||
++ 		    adapter->min_rx_add_entries_per_subcrq > entries_page) {
++ 			dev_err(dev, "Fatal, invalid entries per sub-crq\n");
++ 			return;
++ 		}
++ 
++ 		/* Get the minimum between the queried max and the entries
++ 		 * that fit in our PAGE_SIZE
++ 		 */
++ 		adapter->req_tx_entries_per_subcrq =
++ 		    adapter->max_tx_entries_per_subcrq > entries_page ?
++ 		    entries_page : adapter->max_tx_entries_per_subcrq;
++ 		adapter->req_rx_add_entries_per_subcrq =
++ 		    adapter->max_rx_add_entries_per_subcrq > entries_page ?
++ 		    entries_page : adapter->max_rx_add_entries_per_subcrq;
++ 
++ 		adapter->req_tx_queues = adapter->opt_tx_comp_sub_queues;
++ 		adapter->req_rx_queues = adapter->opt_rx_comp_queues;
++ 		adapter->req_rx_add_queues = adapter->max_rx_add_queues;
++ 
++ 		adapter->req_mtu = adapter->netdev->mtu + ETH_HLEN;
++ 	}
++ 
+++>>>>>>> 1bb3c739ad2c (ibmvnic: Move initialization of sub crqs to ibmvnic_init)
+  	memset(&crq, 0, sizeof(crq));
+  	crq.request_capability.first = IBMVNIC_CRQ_CMD;
+  	crq.request_capability.cmd = REQUEST_CAPABILITY;
+@@@ -3798,9 -3292,37 +3846,41 @@@ task_failed
+  	dev_err(dev, "Passive initialization was not successful\n");
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int ibmvnic_init(struct ibmvnic_adapter *adapter)
++ {
++ 	struct device *dev = &adapter->vdev->dev;
++ 	unsigned long timeout = msecs_to_jiffies(30000);
++ 	int rc;
++ 
++ 	rc = init_crq_queue(adapter);
++ 	if (rc) {
++ 		dev_err(dev, "Couldn't initialize crq. rc=%d\n", rc);
++ 		return rc;
++ 	}
++ 
++ 	init_completion(&adapter->init_done);
++ 	ibmvnic_send_crq_init(adapter);
++ 	if (!wait_for_completion_timeout(&adapter->init_done, timeout)) {
++ 		dev_err(dev, "Initialization sequence timed out\n");
++ 		release_crq_queue(adapter);
++ 		return -1;
++ 	}
++ 
++ 	rc = init_sub_crqs(adapter);
++ 	if (rc) {
++ 		dev_err(dev, "Initialization of sub crqs failed\n");
++ 		release_crq_queue(adapter);
++ 	}
++ 
++ 	return rc;
++ }
++ 
+++>>>>>>> 1bb3c739ad2c (ibmvnic: Move initialization of sub crqs to ibmvnic_init)
+  static int ibmvnic_probe(struct vio_dev *dev, const struct vio_device_id *id)
+  {
+ +	unsigned long timeout = msecs_to_jiffies(30000);
+  	struct ibmvnic_adapter *adapter;
+  	struct net_device *netdev;
+  	unsigned char *mac_addr_p;
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
