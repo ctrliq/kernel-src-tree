@@ -1,0 +1,179 @@
+mm: provide helper for finishing mkwrite faults
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [mm] provide helper for finishing mkwrite faults (Larry Woodman) [1457569 1383493 1457572]
+Rebuild_FUZZ: 95.56%
+commit-author Jan Kara <jack@suse.cz>
+commit 66a6197c118540d454913eef24d68d7491ab5d5f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/66a6197c.failed
+
+Provide a helper function for finishing write faults due to PTE being
+read-only.  The helper will be used by DAX to avoid the need of
+complicating generic MM code with DAX locking specifics.
+
+Link: http://lkml.kernel.org/r/1479460644-25076-16-git-send-email-jack@suse.cz
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 66a6197c118540d454913eef24d68d7491ab5d5f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mm.h
+#	mm/memory.c
+diff --cc include/linux/mm.h
+index a0514d1e5d91,cec967e93f95..000000000000
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@@ -599,6 -611,11 +599,14 @@@ static inline pte_t maybe_mkwrite(pte_
+  		pte = pte_mkwrite(pte);
+  	return pte;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int alloc_set_pte(struct vm_fault *vmf, struct mem_cgroup *memcg,
++ 		struct page *page);
++ int finish_fault(struct vm_fault *vmf);
++ int finish_mkwrite_fault(struct vm_fault *vmf);
+++>>>>>>> 66a6197c1185 (mm: provide helper for finishing mkwrite faults)
+  #endif
+  
+  /*
+diff --cc mm/memory.c
+index 2fc5b28b6782,bbc25da48a18..000000000000
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@@ -2276,82 -2305,56 +2308,108 @@@ int finish_mkwrite_fault(struct vm_faul
+   * Handle write page faults for VM_MIXEDMAP or VM_PFNMAP for a VM_SHARED
+   * mapping
+   */
+ -static int wp_pfn_shared(struct vm_fault *vmf)
+ -{
+ -	struct vm_area_struct *vma = vmf->vma;
+ -
+ -	if (vma->vm_ops && vma->vm_ops->pfn_mkwrite) {
+ +static int wp_pfn_shared(struct mm_struct *mm,
+ +			struct vm_area_struct *vma, unsigned long address,
+ +			pte_t *page_table, spinlock_t *ptl, pte_t orig_pte,
+ +			pmd_t *pmd)
+ +{
+ +	if (vma->vm_ops && (vma->vm_flags2 & VM_PFN_MKWRITE) && vma->vm_ops->pfn_mkwrite) {
+ +		struct vm_fault vmf = {
+ +			.page = NULL,
+ +			.pgoff = linear_page_index(vma, address),
+ +			.virtual_address = (void __user *)(address & PAGE_MASK),
+ +			.flags = FAULT_FLAG_WRITE | FAULT_FLAG_MKWRITE,
+ +		};
+  		int ret;
+  
+ -		pte_unmap_unlock(vmf->pte, vmf->ptl);
+ -		vmf->flags |= FAULT_FLAG_MKWRITE;
+ -		ret = vma->vm_ops->pfn_mkwrite(vma, vmf);
+ +		pte_unmap_unlock(page_table, ptl);
+ +		ret = vma->vm_ops->pfn_mkwrite(vma, &vmf);
+  		if (ret & VM_FAULT_ERROR)
+  			return ret;
+++<<<<<<< HEAD
+ +		page_table = pte_offset_map_lock(mm, pmd, address, &ptl);
+ +		/*
+ +		 * We might have raced with another page fault while we
+ +		 * released the pte_offset_map_lock.
+ +		 */
+ +		if (!pte_same(*page_table, orig_pte)) {
+ +			pte_unmap_unlock(page_table, ptl);
+ +			return 0;
+ +		}
+++=======
++ 		return finish_mkwrite_fault(vmf);
+++>>>>>>> 66a6197c1185 (mm: provide helper for finishing mkwrite faults)
+  	}
+ -	wp_page_reuse(vmf);
+ -	return VM_FAULT_WRITE;
+ +	return wp_page_reuse(mm, vma, address, page_table, ptl, orig_pte,
+ +			     NULL, 0, 0);
+  }
+  
+ -static int wp_page_shared(struct vm_fault *vmf)
+ -	__releases(vmf->ptl)
+ +static int wp_page_shared(struct mm_struct *mm, struct vm_area_struct *vma,
+ +			  unsigned long address, pte_t *page_table,
+ +			  pmd_t *pmd, spinlock_t *ptl, pte_t orig_pte,
+ +			  struct page *old_page)
+ +	__releases(ptl)
+  {
+++<<<<<<< HEAD
+ +	int page_mkwrite = 0;
+++=======
++ 	struct vm_area_struct *vma = vmf->vma;
+++>>>>>>> 66a6197c1185 (mm: provide helper for finishing mkwrite faults)
+  
+ -	get_page(vmf->page);
+ +	page_cache_get(old_page);
+  
+ +	/*
+ +	 * Only catch write-faults on shared writable pages,
+ +	 * read-only shared pages can get COWed by
+ +	 * get_user_pages(.write=1, .force=1).
+ +	 */
+  	if (vma->vm_ops && vma->vm_ops->page_mkwrite) {
+  		int tmp;
+  
+ -		pte_unmap_unlock(vmf->pte, vmf->ptl);
+ -		tmp = do_page_mkwrite(vmf);
+ +		pte_unmap_unlock(page_table, ptl);
+ +		tmp = do_page_mkwrite(vma, old_page, address);
+  		if (unlikely(!tmp || (tmp &
+  				      (VM_FAULT_ERROR | VM_FAULT_NOPAGE)))) {
+ -			put_page(vmf->page);
+ +			page_cache_release(old_page);
+  			return tmp;
+  		}
+++<<<<<<< HEAD
+ +		/*
+ +		 * Since we dropped the lock we need to revalidate
+ +		 * the PTE as someone else may have changed it.  If
+ +		 * they did, we just return, as we can count on the
+ +		 * MMU to tell us if they didn't also make it writable.
+ +		 */
+ +		page_table = pte_offset_map_lock(mm, pmd, address,
+ +						 &ptl);
+ +		if (!pte_same(*page_table, orig_pte)) {
+ +			unlock_page(old_page);
+ +			pte_unmap_unlock(page_table, ptl);
+ +			page_cache_release(old_page);
+ +			return 0;
+ +		}
+ +		page_mkwrite = 1;
+ +	}
+ +
+ +	return wp_page_reuse(mm, vma, address, page_table, ptl,
+ +			     orig_pte, old_page, page_mkwrite, 1);
+++=======
++ 		tmp = finish_mkwrite_fault(vmf);
++ 		if (unlikely(!tmp || (tmp &
++ 				      (VM_FAULT_ERROR | VM_FAULT_NOPAGE)))) {
++ 			unlock_page(vmf->page);
++ 			put_page(vmf->page);
++ 			return tmp;
++ 		}
++ 	} else {
++ 		wp_page_reuse(vmf);
++ 		lock_page(vmf->page);
++ 	}
++ 	fault_dirty_shared_page(vma, vmf->page);
++ 	put_page(vmf->page);
++ 
++ 	return VM_FAULT_WRITE;
+++>>>>>>> 66a6197c1185 (mm: provide helper for finishing mkwrite faults)
+  }
+  
+  /*
+* Unmerged path include/linux/mm.h
+* Unmerged path mm/memory.c
