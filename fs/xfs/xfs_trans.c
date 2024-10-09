@@ -1013,16 +1013,13 @@ xfs_trans_cancel(
  * chunk we've been working on and get a new transaction to continue.
  */
 int
-__xfs_trans_roll(
+xfs_trans_roll(
 	struct xfs_trans	**tpp,
-	struct xfs_inode	*dp,
-	int			*committed)
+	struct xfs_inode	*dp)
 {
 	struct xfs_trans	*trans;
 	struct xfs_trans_res	tres;
 	int			error;
-
-	*committed = 0;
 
 	/*
 	 * Ensure that the inode is always logged.
@@ -1049,7 +1046,6 @@ __xfs_trans_roll(
 	if (error)
 		return error;
 
-	*committed = 1;
 	trans = *tpp;
 
 	/*
@@ -1071,13 +1067,4 @@ __xfs_trans_roll(
 	if (dp)
 		xfs_trans_ijoin(trans, dp, 0);
 	return 0;
-}
-
-int
-xfs_trans_roll(
-	struct xfs_trans	**tpp,
-	struct xfs_inode	*dp)
-{
-	int			committed;
-	return __xfs_trans_roll(tpp, dp, &committed);
 }
