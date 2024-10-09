@@ -1,0 +1,270 @@
+mlxsw: spectrum_router: Initialize RIFs in a separate function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit 348b8fc3cf3059ac151c693dac992947a3daa437
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/348b8fc3.failed
+
+The router interfaces (RIFs) array is currently initialized together
+with the general router configuration. However, in a follow-up patchset
+we're going to introduce a common RIF core that will require us to
+initialize more RIF constructs, so move the RIF initialization to its
+own function.
+
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 348b8fc3cf3059ac151c693dac992947a3daa437)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+index f8e7036e3f4a,aba33268af97..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+@@@ -3241,76 -3501,80 +3241,98 @@@ err_rif_edit
+  	return err;
+  }
+  
+ -static int mlxsw_sp_port_vrf_join(struct mlxsw_sp *mlxsw_sp,
+ -				  struct net_device *l3_dev)
+ +int mlxsw_sp_vport_vrf_join(struct mlxsw_sp_port *mlxsw_sp_vport)
+  {
+ -	struct mlxsw_sp_rif *rif;
+ +	struct mlxsw_sp_fid *f = mlxsw_sp_vport_fid_get(mlxsw_sp_vport);
+ +	struct net_device *dev = mlxsw_sp_vport->dev;
+  
+ -	/* If netdev is already associated with a RIF, then we need to
+ -	 * destroy it and create a new one with the new virtual router ID.
+ +	/* In case vPort already has a RIF, then we need to drop it.
+ +	 * A new one will be created using the VRF's VR.
+  	 */
+ -	rif = mlxsw_sp_rif_find_by_dev(mlxsw_sp, l3_dev);
+ -	if (rif)
+ -		__mlxsw_sp_inetaddr_event(l3_dev, NETDEV_DOWN);
+ +	if (f && f->r)
+ +		mlxsw_sp_vport_rif_sp_leave(mlxsw_sp_vport);
+ +
+ +	return mlxsw_sp_vport_rif_sp_join(mlxsw_sp_vport, dev);
+ +}
+ +
+ +void mlxsw_sp_vport_vrf_leave(struct mlxsw_sp_port *mlxsw_sp_vport)
+ +{
+ +	mlxsw_sp_vport_rif_sp_leave(mlxsw_sp_vport);
+ +}
+ +
+ +int mlxsw_sp_port_vrf_join(struct mlxsw_sp_port *mlxsw_sp_port)
+ +{
+ +	struct mlxsw_sp_port *mlxsw_sp_vport;
+  
+ -	return __mlxsw_sp_inetaddr_event(l3_dev, NETDEV_UP);
+ +	mlxsw_sp_vport = mlxsw_sp_port_vport_find(mlxsw_sp_port, 1);
+ +	if (WARN_ON(!mlxsw_sp_vport))
+ +		return -EINVAL;
+ +
+ +	return mlxsw_sp_vport_vrf_join(mlxsw_sp_vport);
+  }
+  
+ -static void mlxsw_sp_port_vrf_leave(struct mlxsw_sp *mlxsw_sp,
+ -				    struct net_device *l3_dev)
+ +void mlxsw_sp_port_vrf_leave(struct mlxsw_sp_port *mlxsw_sp_port)
+  {
+ -	struct mlxsw_sp_rif *rif;
+ +	struct mlxsw_sp_port *mlxsw_sp_vport;
+  
+ -	rif = mlxsw_sp_rif_find_by_dev(mlxsw_sp, l3_dev);
+ -	if (!rif)
+ +	mlxsw_sp_vport = mlxsw_sp_port_vport_find(mlxsw_sp_port, 1);
+ +	if (WARN_ON(!mlxsw_sp_vport))
+  		return;
+ -	__mlxsw_sp_inetaddr_event(l3_dev, NETDEV_DOWN);
+ +
+ +	mlxsw_sp_vport_vrf_leave(mlxsw_sp_vport);
+  }
+  
+ -int mlxsw_sp_netdevice_vrf_event(struct net_device *l3_dev, unsigned long event,
+ -				 struct netdev_notifier_changeupper_info *info)
+ +int mlxsw_sp_bridge_vrf_join(struct mlxsw_sp *mlxsw_sp,
+ +			     struct net_device *l3_dev)
+  {
+ -	struct mlxsw_sp *mlxsw_sp = mlxsw_sp_lower_get(l3_dev);
+ -	int err = 0;
+ +	struct mlxsw_sp_fid *f;
+  
+ -	if (!mlxsw_sp)
+ -		return 0;
+ +	f = mlxsw_sp_bridge_fid_get(mlxsw_sp, l3_dev);
+ +	if (WARN_ON(!f))
+ +		return -EINVAL;
+  
+ -	switch (event) {
+ -	case NETDEV_PRECHANGEUPPER:
+ -		return 0;
+ -	case NETDEV_CHANGEUPPER:
+ -		if (info->linking)
+ -			err = mlxsw_sp_port_vrf_join(mlxsw_sp, l3_dev);
+ -		else
+ -			mlxsw_sp_port_vrf_leave(mlxsw_sp, l3_dev);
+ -		break;
+ -	}
+ +	if (f->r)
+ +		mlxsw_sp_rif_bridge_destroy(mlxsw_sp, f->r);
+  
+ -	return err;
+ +	return mlxsw_sp_rif_bridge_create(mlxsw_sp, l3_dev, f);
+ +}
+ +
+ +void mlxsw_sp_bridge_vrf_leave(struct mlxsw_sp *mlxsw_sp,
+ +			       struct net_device *l3_dev)
+ +{
+ +	struct mlxsw_sp_fid *f;
+ +
+ +	f = mlxsw_sp_bridge_fid_get(mlxsw_sp, l3_dev);
+ +	if (WARN_ON(!f))
+ +		return;
+ +	mlxsw_sp_rif_bridge_destroy(mlxsw_sp, f->r);
+  }
+  
++ static int mlxsw_sp_rifs_init(struct mlxsw_sp *mlxsw_sp)
++ {
++ 	u64 max_rifs = MLXSW_CORE_RES_GET(mlxsw_sp->core, MAX_RIFS);
++ 
++ 	mlxsw_sp->router->rifs = kcalloc(max_rifs,
++ 					 sizeof(struct mlxsw_sp_rif *),
++ 					 GFP_KERNEL);
++ 	if (!mlxsw_sp->router->rifs)
++ 		return -ENOMEM;
++ 	return 0;
++ }
++ 
++ static void mlxsw_sp_rifs_fini(struct mlxsw_sp *mlxsw_sp)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < MLXSW_CORE_RES_GET(mlxsw_sp->core, MAX_RIFS); i++)
++ 		WARN_ON_ONCE(mlxsw_sp->router->rifs[i]);
++ 
++ 	kfree(mlxsw_sp->router->rifs);
++ }
++ 
+  static void mlxsw_sp_router_fib_dump_flush(struct notifier_block *nb)
+  {
+ -	struct mlxsw_sp_router *router;
+ +	struct mlxsw_sp *mlxsw_sp = container_of(nb, struct mlxsw_sp, fib_nb);
+  
+  	/* Flush pending FIB notifications and then flush the device's
+  	 * table before requesting another dump. The FIB notification
+@@@ -3328,24 -3593,14 +3350,28 @@@ static int __mlxsw_sp_router_init(struc
+  
+  	if (!MLXSW_CORE_RES_VALID(mlxsw_sp->core, MAX_RIFS))
+  		return -EIO;
+- 
+  	max_rifs = MLXSW_CORE_RES_GET(mlxsw_sp->core, MAX_RIFS);
+++<<<<<<< HEAD
+ +	mlxsw_sp->rifs = kcalloc(max_rifs, sizeof(struct mlxsw_sp_rif *),
+ +				 GFP_KERNEL);
+ +	if (!mlxsw_sp->rifs)
+ +		return -ENOMEM;
+++=======
+++>>>>>>> 348b8fc3cf30 (mlxsw: spectrum_router: Initialize RIFs in a separate function)
+  
+  	mlxsw_reg_rgcr_pack(rgcr_pl, true);
+  	mlxsw_reg_rgcr_max_router_interfaces_set(rgcr_pl, max_rifs);
+  	err = mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(rgcr), rgcr_pl);
+  	if (err)
+- 		goto err_rgcr_fail;
+- 
++ 		return err;
+  	return 0;
+++<<<<<<< HEAD
+ +
+ +err_rgcr_fail:
+ +	kfree(mlxsw_sp->rifs);
+ +	return err;
+++=======
+++>>>>>>> 348b8fc3cf30 (mlxsw: spectrum_router: Initialize RIFs in a separate function)
+  }
+  
+  static void __mlxsw_sp_router_fini(struct mlxsw_sp *mlxsw_sp)
+@@@ -3354,24 -3609,29 +3380,34 @@@
+  
+  	mlxsw_reg_rgcr_pack(rgcr_pl, false);
+  	mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(rgcr), rgcr_pl);
+++<<<<<<< HEAD
+ +
+ +	for (i = 0; i < MLXSW_CORE_RES_GET(mlxsw_sp->core, MAX_RIFS); i++)
+ +		WARN_ON_ONCE(mlxsw_sp->rifs[i]);
+ +
+ +	kfree(mlxsw_sp->rifs);
+++=======
+++>>>>>>> 348b8fc3cf30 (mlxsw: spectrum_router: Initialize RIFs in a separate function)
+  }
+  
+  int mlxsw_sp_router_init(struct mlxsw_sp *mlxsw_sp)
+  {
+ -	struct mlxsw_sp_router *router;
+  	int err;
+  
+ -	router = kzalloc(sizeof(*mlxsw_sp->router), GFP_KERNEL);
+ -	if (!router)
+ -		return -ENOMEM;
+ -	mlxsw_sp->router = router;
+ -	router->mlxsw_sp = mlxsw_sp;
+ -
+ -	INIT_LIST_HEAD(&mlxsw_sp->router->nexthop_neighs_list);
+ +	INIT_LIST_HEAD(&mlxsw_sp->router.nexthop_neighs_list);
+  	err = __mlxsw_sp_router_init(mlxsw_sp);
+  	if (err)
+ -		goto err_router_init;
+ +		return err;
+  
+++<<<<<<< HEAD
+ +	err = rhashtable_init(&mlxsw_sp->router.nexthop_ht,
+++=======
++ 	err = mlxsw_sp_rifs_init(mlxsw_sp);
++ 	if (err)
++ 		goto err_rifs_init;
++ 
++ 	err = rhashtable_init(&mlxsw_sp->router->nexthop_ht,
+++>>>>>>> 348b8fc3cf30 (mlxsw: spectrum_router: Initialize RIFs in a separate function)
+  			      &mlxsw_sp_nexthop_ht_params);
+  	if (err)
+  		goto err_nexthop_ht_init;
+@@@ -3408,11 -3668,15 +3444,13 @@@ err_neigh_init
+  err_vrs_init:
+  	mlxsw_sp_lpm_fini(mlxsw_sp);
+  err_lpm_init:
+ -	rhashtable_destroy(&mlxsw_sp->router->nexthop_group_ht);
+ +	rhashtable_destroy(&mlxsw_sp->router.nexthop_group_ht);
+  err_nexthop_group_ht_init:
+ -	rhashtable_destroy(&mlxsw_sp->router->nexthop_ht);
+ +	rhashtable_destroy(&mlxsw_sp->router.nexthop_ht);
+  err_nexthop_ht_init:
++ 	mlxsw_sp_rifs_fini(mlxsw_sp);
++ err_rifs_init:
+  	__mlxsw_sp_router_fini(mlxsw_sp);
+ -err_router_init:
+ -	kfree(mlxsw_sp->router);
+  	return err;
+  }
+  
+@@@ -3422,7 -3686,9 +3460,13 @@@ void mlxsw_sp_router_fini(struct mlxsw_
+  	mlxsw_sp_neigh_fini(mlxsw_sp);
+  	mlxsw_sp_vrs_fini(mlxsw_sp);
+  	mlxsw_sp_lpm_fini(mlxsw_sp);
+++<<<<<<< HEAD
+ +	rhashtable_destroy(&mlxsw_sp->router.nexthop_group_ht);
+ +	rhashtable_destroy(&mlxsw_sp->router.nexthop_ht);
+++=======
++ 	rhashtable_destroy(&mlxsw_sp->router->nexthop_group_ht);
++ 	rhashtable_destroy(&mlxsw_sp->router->nexthop_ht);
++ 	mlxsw_sp_rifs_fini(mlxsw_sp);
+++>>>>>>> 348b8fc3cf30 (mlxsw: spectrum_router: Initialize RIFs in a separate function)
+  	__mlxsw_sp_router_fini(mlxsw_sp);
+ -	kfree(mlxsw_sp->router);
+  }
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
