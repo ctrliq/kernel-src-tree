@@ -1,0 +1,425 @@
+nfp: abm: report statistics from RED offload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit cb89cac8e705b0405872a870842c6c2a0a0e5ec2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/cb89cac8.failed
+
+Report basic and extended RED statistics back to TC.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cb89cac8e705b0405872a870842c6c2a0a0e5ec2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/abm/ctrl.c
+#	drivers/net/ethernet/netronome/nfp/abm/main.h
+diff --cc drivers/net/ethernet/netronome/nfp/abm/ctrl.c
+index e40f6f06417b,d2d9ca7a727c..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/abm/ctrl.c
++++ b/drivers/net/ethernet/netronome/nfp/abm/ctrl.c
+@@@ -40,6 -42,170 +40,173 @@@
+  #include "../nfp_net.h"
+  #include "main.h"
+  
+++<<<<<<< HEAD
+++=======
++ #define NFP_QLVL_SYM_NAME	"_abi_nfd_out_q_lvls_%u"
++ #define NFP_QLVL_STRIDE		16
++ #define NFP_QLVL_BLOG_BYTES	0
++ #define NFP_QLVL_BLOG_PKTS	4
++ #define NFP_QLVL_THRS		8
++ 
++ #define NFP_QMSTAT_SYM_NAME	"_abi_nfdqm%u_stats"
++ #define NFP_QMSTAT_STRIDE	32
++ #define NFP_QMSTAT_DROP		16
++ #define NFP_QMSTAT_ECN		24
++ 
++ static unsigned long long
++ nfp_abm_q_lvl_thrs(struct nfp_abm_link *alink, unsigned int queue)
++ {
++ 	return alink->abm->q_lvls->addr +
++ 		(alink->queue_base + queue) * NFP_QLVL_STRIDE + NFP_QLVL_THRS;
++ }
++ 
++ static int
++ nfp_abm_ctrl_stat(struct nfp_abm_link *alink, const struct nfp_rtsym *sym,
++ 		  unsigned int stride, unsigned int offset, unsigned int i,
++ 		  bool is_u64, u64 *res)
++ {
++ 	struct nfp_cpp *cpp = alink->abm->app->cpp;
++ 	u32 val32, mur;
++ 	u64 val, addr;
++ 	int err;
++ 
++ 	mur = NFP_CPP_ATOMIC_RD(sym->target, sym->domain);
++ 
++ 	addr = sym->addr + (alink->queue_base + i) * stride + offset;
++ 	if (is_u64)
++ 		err = nfp_cpp_readq(cpp, mur, addr, &val);
++ 	else
++ 		err = nfp_cpp_readl(cpp, mur, addr, &val32);
++ 	if (err) {
++ 		nfp_err(cpp,
++ 			"RED offload reading stat failed on vNIC %d queue %d\n",
++ 			alink->id, i);
++ 		return err;
++ 	}
++ 
++ 	*res = is_u64 ? val : val32;
++ 	return 0;
++ }
++ 
++ static int
++ nfp_abm_ctrl_stat_all(struct nfp_abm_link *alink, const struct nfp_rtsym *sym,
++ 		      unsigned int stride, unsigned int offset, bool is_u64,
++ 		      u64 *res)
++ {
++ 	u64 val, sum = 0;
++ 	unsigned int i;
++ 	int err;
++ 
++ 	for (i = 0; i < alink->vnic->max_rx_rings; i++) {
++ 		err = nfp_abm_ctrl_stat(alink, sym, stride, offset, i,
++ 					is_u64, &val);
++ 		if (err)
++ 			return err;
++ 		sum += val;
++ 	}
++ 
++ 	*res = sum;
++ 	return 0;
++ }
++ 
++ static int
++ nfp_abm_ctrl_set_q_lvl(struct nfp_abm_link *alink, unsigned int i, u32 val)
++ {
++ 	struct nfp_cpp *cpp = alink->abm->app->cpp;
++ 	u32 muw;
++ 	int err;
++ 
++ 	muw = NFP_CPP_ATOMIC_WR(alink->abm->q_lvls->target,
++ 				alink->abm->q_lvls->domain);
++ 
++ 	err = nfp_cpp_writel(cpp, muw, nfp_abm_q_lvl_thrs(alink, i), val);
++ 	if (err) {
++ 		nfp_err(cpp, "RED offload setting level failed on vNIC %d queue %d\n",
++ 			alink->id, i);
++ 		return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int nfp_abm_ctrl_set_all_q_lvls(struct nfp_abm_link *alink, u32 val)
++ {
++ 	int i, err;
++ 
++ 	for (i = 0; i < alink->vnic->max_rx_rings; i++) {
++ 		err = nfp_abm_ctrl_set_q_lvl(alink, i, val);
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int nfp_abm_ctrl_read_stats(struct nfp_abm_link *alink,
++ 			    struct nfp_alink_stats *stats)
++ {
++ 	u64 pkts = 0, bytes = 0;
++ 	int i, err;
++ 
++ 	for (i = 0; i < alink->vnic->max_rx_rings; i++) {
++ 		pkts += nn_readq(alink->vnic, NFP_NET_CFG_RXR_STATS(i));
++ 		bytes += nn_readq(alink->vnic, NFP_NET_CFG_RXR_STATS(i) + 8);
++ 	}
++ 	stats->tx_pkts = pkts;
++ 	stats->tx_bytes = bytes;
++ 
++ 	err = nfp_abm_ctrl_stat_all(alink, alink->abm->q_lvls,
++ 				    NFP_QLVL_STRIDE, NFP_QLVL_BLOG_BYTES,
++ 				    false, &stats->backlog_bytes);
++ 	if (err)
++ 		return err;
++ 
++ 	err = nfp_abm_ctrl_stat_all(alink, alink->abm->q_lvls,
++ 				    NFP_QLVL_STRIDE, NFP_QLVL_BLOG_PKTS,
++ 				    false, &stats->backlog_pkts);
++ 	if (err)
++ 		return err;
++ 
++ 	err = nfp_abm_ctrl_stat_all(alink, alink->abm->qm_stats,
++ 				    NFP_QMSTAT_STRIDE, NFP_QMSTAT_DROP,
++ 				    true, &stats->drops);
++ 	if (err)
++ 		return err;
++ 
++ 	return nfp_abm_ctrl_stat_all(alink, alink->abm->qm_stats,
++ 				     NFP_QMSTAT_STRIDE, NFP_QMSTAT_ECN,
++ 				     true, &stats->overlimits);
++ }
++ 
++ int nfp_abm_ctrl_read_xstats(struct nfp_abm_link *alink,
++ 			     struct nfp_alink_xstats *xstats)
++ {
++ 	int err;
++ 
++ 	err = nfp_abm_ctrl_stat_all(alink, alink->abm->qm_stats,
++ 				    NFP_QMSTAT_STRIDE, NFP_QMSTAT_DROP,
++ 				    true, &xstats->pdrop);
++ 	if (err)
++ 		return err;
++ 
++ 	return nfp_abm_ctrl_stat_all(alink, alink->abm->qm_stats,
++ 				     NFP_QMSTAT_STRIDE, NFP_QMSTAT_ECN,
++ 				     true, &xstats->ecn_marked);
++ }
++ 
++ int nfp_abm_ctrl_qm_enable(struct nfp_abm *abm)
++ {
++ 	return nfp_mbox_cmd(abm->app->pf, NFP_MBOX_PCIE_ABM_ENABLE,
++ 			    NULL, 0, NULL, 0);
++ }
++ 
++ int nfp_abm_ctrl_qm_disable(struct nfp_abm *abm)
++ {
++ 	return nfp_mbox_cmd(abm->app->pf, NFP_MBOX_PCIE_ABM_DISABLE,
++ 			    NULL, 0, NULL, 0);
++ }
++ 
+++>>>>>>> cb89cac8e705 (nfp: abm: report statistics from RED offload)
+  void nfp_abm_ctrl_read_params(struct nfp_abm_link *alink)
+  {
+  	alink->queue_base = nn_readl(alink->vnic, NFP_NET_CFG_START_RXQ);
+@@@ -54,5 -249,17 +221,20 @@@ int nfp_abm_ctrl_find_addrs(struct nfp_
+  	pf_id =	nfp_cppcore_pcie_unit(pf->cpp);
+  	abm->pf_id = pf_id;
+  
+++<<<<<<< HEAD
+++=======
++ 	snprintf(pf_symbol, sizeof(pf_symbol), NFP_QLVL_SYM_NAME, pf_id);
++ 	sym = nfp_abm_ctrl_find_q_rtsym(pf, pf_symbol, NFP_QLVL_STRIDE);
++ 	if (IS_ERR(sym))
++ 		return PTR_ERR(sym);
++ 	abm->q_lvls = sym;
++ 
++ 	snprintf(pf_symbol, sizeof(pf_symbol), NFP_QMSTAT_SYM_NAME, pf_id);
++ 	sym = nfp_abm_ctrl_find_q_rtsym(pf, pf_symbol, NFP_QMSTAT_STRIDE);
++ 	if (IS_ERR(sym))
++ 		return PTR_ERR(sym);
++ 	abm->qm_stats = sym;
++ 
+++>>>>>>> cb89cac8e705 (nfp: abm: report statistics from RED offload)
+  	return 0;
+  }
+diff --cc drivers/net/ethernet/netronome/nfp/abm/main.h
+index c120b91790e4,93a3b79cf468..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/abm/main.h
++++ b/drivers/net/ethernet/netronome/nfp/abm/main.h
+@@@ -49,11 -49,43 +49,49 @@@ struct nfp_net
+   * @pf_id:	ID of our PF link
+   * @eswitch_mode:	devlink eswitch mode, advanced functions only visible
+   *			in switchdev mode
+++<<<<<<< HEAD
+++=======
++  * @q_lvls:	queue level control area
++  * @qm_stats:	queue statistics symbol
+++>>>>>>> cb89cac8e705 (nfp: abm: report statistics from RED offload)
+   */
+  struct nfp_abm {
+  	struct nfp_app *app;
+  	unsigned int pf_id;
+  	enum devlink_eswitch_mode eswitch_mode;
+++<<<<<<< HEAD
+++=======
++ 	const struct nfp_rtsym *q_lvls;
++ 	const struct nfp_rtsym *qm_stats;
++ };
++ 
++ /**
++  * struct nfp_alink_stats - ABM NIC statistics
++  * @tx_pkts:		number of TXed packets
++  * @tx_bytes:		number of TXed bytes
++  * @backlog_pkts:	momentary backlog length (packets)
++  * @backlog_bytes:	momentary backlog length (bytes)
++  * @overlimits:		number of ECN marked TXed packets (accumulative)
++  * @drops:		number of tail-dropped packets (accumulative)
++  */
++ struct nfp_alink_stats {
++ 	u64 tx_pkts;
++ 	u64 tx_bytes;
++ 	u64 backlog_pkts;
++ 	u64 backlog_bytes;
++ 	u64 overlimits;
++ 	u64 drops;
++ };
++ 
++ /**
++  * struct nfp_alink_xstats - extended ABM NIC statistics
++  * @ecn_marked:		number of ECN marked TXed packets
++  * @pdrop:		number of hard drops due to queue limit
++  */
++ struct nfp_alink_xstats {
++ 	u64 ecn_marked;
++ 	u64 pdrop;
+++>>>>>>> cb89cac8e705 (nfp: abm: report statistics from RED offload)
+  };
+  
+  /**
+@@@ -82,4 -118,11 +124,14 @@@ struct nfp_abm_link 
+  
+  void nfp_abm_ctrl_read_params(struct nfp_abm_link *alink);
+  int nfp_abm_ctrl_find_addrs(struct nfp_abm *abm);
+++<<<<<<< HEAD
+++=======
++ int nfp_abm_ctrl_set_all_q_lvls(struct nfp_abm_link *alink, u32 val);
++ int nfp_abm_ctrl_read_stats(struct nfp_abm_link *alink,
++ 			    struct nfp_alink_stats *stats);
++ int nfp_abm_ctrl_read_xstats(struct nfp_abm_link *alink,
++ 			     struct nfp_alink_xstats *xstats);
++ int nfp_abm_ctrl_qm_enable(struct nfp_abm *abm);
++ int nfp_abm_ctrl_qm_disable(struct nfp_abm *abm);
+++>>>>>>> cb89cac8e705 (nfp: abm: report statistics from RED offload)
+  #endif
+* Unmerged path drivers/net/ethernet/netronome/nfp/abm/ctrl.c
+diff --git a/drivers/net/ethernet/netronome/nfp/abm/main.c b/drivers/net/ethernet/netronome/nfp/abm/main.c
+index 67decefc2400..e6c767d2aeb9 100644
+--- a/drivers/net/ethernet/netronome/nfp/abm/main.c
++++ b/drivers/net/ethernet/netronome/nfp/abm/main.c
+@@ -40,6 +40,7 @@
+ #include <linux/slab.h>
+ #include <net/pkt_cls.h>
+ #include <net/pkt_sched.h>
++#include <net/red.h>
+ 
+ #include "../nfpcore/nfp.h"
+ #include "../nfpcore/nfp_cpp.h"
+@@ -57,6 +58,23 @@ static u32 nfp_abm_portid(enum nfp_repr_type rtype, unsigned int id)
+ 	       FIELD_PREP(NFP_ABM_PORTID_ID, id);
+ }
+ 
++static int nfp_abm_reset_stats(struct nfp_abm_link *alink)
++{
++	int err;
++
++	err = nfp_abm_ctrl_read_stats(alink, &alink->qdiscs[0].stats);
++	if (err)
++		return err;
++	alink->qdiscs[0].stats.backlog_pkts = 0;
++	alink->qdiscs[0].stats.backlog_bytes = 0;
++
++	err = nfp_abm_ctrl_read_xstats(alink, &alink->qdiscs[0].xstats);
++	if (err)
++		return err;
++
++	return 0;
++}
++
+ static void
+ nfp_abm_red_destroy(struct net_device *netdev, struct nfp_abm_link *alink,
+ 		    u32 handle)
+@@ -88,16 +106,86 @@ nfp_abm_red_replace(struct net_device *netdev, struct nfp_abm_link *alink,
+ 	if (err)
+ 		goto err_destroy;
+ 
++	/* Reset stats only on new qdisc */
++	if (alink->qdiscs[0].handle != opt->handle) {
++		err = nfp_abm_reset_stats(alink);
++		if (err)
++			goto err_destroy;
++	}
++
+ 	alink->qdiscs[0].handle = opt->handle;
+ 	port->tc_offload_cnt = 1;
+ 
+ 	return 0;
+ err_destroy:
++	/* If the qdisc keeps on living, but we can't offload undo changes */
++	if (alink->qdiscs[0].handle == opt->handle) {
++		opt->set.qstats->qlen -= alink->qdiscs[0].stats.backlog_pkts;
++		opt->set.qstats->backlog -=
++			alink->qdiscs[0].stats.backlog_bytes;
++	}
+ 	if (alink->qdiscs[0].handle != TC_H_UNSPEC)
+ 		nfp_abm_red_destroy(netdev, alink, alink->qdiscs[0].handle);
+ 	return err;
+ }
+ 
++static void
++nfp_abm_update_stats(struct nfp_alink_stats *new, struct nfp_alink_stats *old,
++		     struct tc_qopt_offload_stats *stats)
++{
++	_bstats_update(stats->bstats, new->tx_bytes - old->tx_bytes,
++		       new->tx_pkts - old->tx_pkts);
++	stats->qstats->qlen += new->backlog_pkts - old->backlog_pkts;
++	stats->qstats->backlog += new->backlog_bytes - old->backlog_bytes;
++	stats->qstats->overlimits += new->overlimits - old->overlimits;
++	stats->qstats->drops += new->drops - old->drops;
++}
++
++static int
++nfp_abm_red_stats(struct nfp_abm_link *alink, struct tc_red_qopt_offload *opt)
++{
++	struct nfp_alink_stats *prev_stats;
++	struct nfp_alink_stats stats;
++	int err;
++
++	if (alink->qdiscs[0].handle != opt->handle)
++		return -EOPNOTSUPP;
++	prev_stats = &alink->qdiscs[0].stats;
++
++	err = nfp_abm_ctrl_read_stats(alink, &stats);
++	if (err)
++		return err;
++
++	nfp_abm_update_stats(&stats, prev_stats, &opt->stats);
++
++	*prev_stats = stats;
++
++	return 0;
++}
++
++static int
++nfp_abm_red_xstats(struct nfp_abm_link *alink, struct tc_red_qopt_offload *opt)
++{
++	struct nfp_alink_xstats *prev_xstats;
++	struct nfp_alink_xstats xstats;
++	int err;
++
++	if (alink->qdiscs[0].handle != opt->handle)
++		return -EOPNOTSUPP;
++	prev_xstats = &alink->qdiscs[0].xstats;
++
++	err = nfp_abm_ctrl_read_xstats(alink, &xstats);
++	if (err)
++		return err;
++
++	opt->xstats->forced_mark += xstats.ecn_marked - prev_xstats->ecn_marked;
++	opt->xstats->pdrop += xstats.pdrop - prev_xstats->pdrop;
++
++	*prev_xstats = xstats;
++
++	return 0;
++}
++
+ static int
+ nfp_abm_setup_tc_red(struct net_device *netdev, struct nfp_abm_link *alink,
+ 		     struct tc_red_qopt_offload *opt)
+@@ -111,6 +199,10 @@ nfp_abm_setup_tc_red(struct net_device *netdev, struct nfp_abm_link *alink,
+ 	case TC_RED_DESTROY:
+ 		nfp_abm_red_destroy(netdev, alink, opt->handle);
+ 		return 0;
++	case TC_RED_STATS:
++		return nfp_abm_red_stats(alink, opt);
++	case TC_RED_XSTATS:
++		return nfp_abm_red_xstats(alink, opt);
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+* Unmerged path drivers/net/ethernet/netronome/nfp/abm/main.h
