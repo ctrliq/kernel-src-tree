@@ -1,0 +1,541 @@
+sysfs: make attr namespace interface less convoluted
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit 58292cbe6669d74498a5f08db13e57cb3bcfb81d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/58292cbe.failed
+
+sysfs ns (namespace) implementation became more convoluted than
+necessary while trying to hide ns information from visible interface.
+The relatively recent attr ns support is a good example.
+
+* attr ns tag is determined by sysfs_ops->namespace() callback while
+  dir tag is determined by kobj_type->namespace().  The placement is
+  arbitrary.
+
+* Instead of performing operations with explicit ns tag, the namespace
+  callback is routed through sysfs_attr_ns(), sysfs_ops->namespace(),
+  class_attr_namespace(), class_attr->namespace().  It's not simpler
+  in any sense.  The only thing this convolution does is traversing
+  the whole stack backwards.
+
+The namespace callbacks are unncessary because the operations involved
+are inherently synchronous.  The information can be provided in in
+straight-forward top-down direction and reversing that direction is
+unnecessary and against basic design principles.
+
+This backward interface is unnecessarily convoluted and hinders
+properly separating out sysfs from driver model / kobject for proper
+layering.  This patch updates attr ns support such that
+
+* sysfs_ops->namespace() and class_attr->namespace() are dropped.
+
+* sysfs_{create|remove}_file_ns(), which take explicit @ns param, are
+  added and sysfs_{create|remove}_file() are now simple wrappers
+  around the ns aware functions.
+
+* ns handling is dropped from sysfs_chmod_file().  Nobody uses it at
+  this point.  sysfs_chmod_file_ns() can be added later if necessary.
+
+* Explicit @ns is propagated through class_{create|remove}_file_ns()
+  and netdev_class_{create|remove}_file_ns().
+
+* driver/net/bonding which is currently the only user of attr
+  namespace is updated to use netdev_class_{create|remove}_file_ns()
+  with @bh->net as the ns tag instead of using the namespace callback.
+
+This patch should be an equivalent conversion without any functional
+difference.  It makes the code easier to follow, reduces lines of code
+a bit and helps proper separation and layering.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Cc: Eric W. Biederman <ebiederm@xmission.com>
+	Cc: Kay Sievers <kay@vrfy.org>
+	Acked-by: David S. Miller <davem@davemloft.net>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 58292cbe6669d74498a5f08db13e57cb3bcfb81d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_sysfs.c
+#	fs/sysfs/file.c
+#	include/linux/netdevice.h
+diff --cc drivers/net/bonding/bond_sysfs.c
+index 93d19dcfd27e,ec9b6460a38d..000000000000
+--- a/drivers/net/bonding/bond_sysfs.c
++++ b/drivers/net/bonding/bond_sysfs.c
+@@@ -159,29 -157,46 +151,28 @@@ static const struct class_attribute cla
+  	},
+  	.show = bonding_show_bonds,
+  	.store = bonding_store_bonds,
+- 	.namespace = bonding_namespace,
+  };
+  
+ -int bond_create_slave_symlinks(struct net_device *master,
+ -			       struct net_device *slave)
+ +/* Generic "store" method for bonding sysfs option setting */
+ +static ssize_t bonding_sysfs_store_option(struct device *d,
+ +					  struct device_attribute *attr,
+ +					  const char *buffer, size_t count)
+  {
+ -	char linkname[IFNAMSIZ+7];
+ -	int ret = 0;
+ -
+ -	/* first, create a link from the slave back to the master */
+ -	ret = sysfs_create_link(&(slave->dev.kobj), &(master->dev.kobj),
+ -				"master");
+ -	if (ret)
+ -		return ret;
+ -	/* next, create a link from the master to the slave */
+ -	sprintf(linkname, "slave_%s", slave->name);
+ -	ret = sysfs_create_link(&(master->dev.kobj), &(slave->dev.kobj),
+ -				linkname);
+ -
+ -	/* free the master link created earlier in case of error */
+ -	if (ret)
+ -		sysfs_remove_link(&(slave->dev.kobj), "master");
+ -
+ -	return ret;
+ -
+ -}
+ +	struct bonding *bond = to_bond(d);
+ +	const struct bond_option *opt;
+ +	int ret;
+  
+ -void bond_destroy_slave_symlinks(struct net_device *master,
+ -				 struct net_device *slave)
+ -{
+ -	char linkname[IFNAMSIZ+7];
+ +	opt = bond_opt_get_by_name(attr->attr.name);
+ +	if (WARN_ON(!opt))
+ +		return -ENOENT;
+ +	ret = bond_opt_tryset_rtnl(bond, opt->id, (char *)buffer);
+ +	if (!ret)
+ +		ret = count;
+  
+ -	sysfs_remove_link(&(slave->dev.kobj), "master");
+ -	sprintf(linkname, "slave_%s", slave->name);
+ -	sysfs_remove_link(&(master->dev.kobj), linkname);
+ +	return ret;
+  }
+  
+ -
+ -/*
+ - * Show the slaves in the current bond.
+ - */
+ +/* Show the slaves in the current bond. */
+  static ssize_t bonding_show_slaves(struct device *d,
+  				   struct device_attribute *attr, char *buf)
+  {
+@@@ -783,8 -1778,10 +774,15 @@@ int bond_create_sysfs(struct bond_net *
+  	bn->class_attr_bonding_masters = class_attr_bonding_masters;
+  	sysfs_attr_init(&bn->class_attr_bonding_masters.attr);
+  
+++<<<<<<< HEAD
+ +	ret = netdev_class_create_file(&bn->class_attr_bonding_masters);
+ +	/* Permit multiple loads of the module by ignoring failures to
+++=======
++ 	ret = netdev_class_create_file_ns(&bn->class_attr_bonding_masters,
++ 					  bn->net);
++ 	/*
++ 	 * Permit multiple loads of the module by ignoring failures to
+++>>>>>>> 58292cbe6669 (sysfs: make attr namespace interface less convoluted)
+  	 * create the bonding_masters sysfs file.  Bonding devices
+  	 * created by second or subsequent loads of the module will
+  	 * not be listed in, or controllable by, bonding_masters, but
+@@@ -807,13 -1804,16 +805,13 @@@
+  
+  }
+  
+ -/*
+ - * Remove /sys/class/net/bonding_masters.
+ - */
+ +/* Remove /sys/class/net/bonding_masters. */
+  void bond_destroy_sysfs(struct bond_net *bn)
+  {
+- 	netdev_class_remove_file(&bn->class_attr_bonding_masters);
++ 	netdev_class_remove_file_ns(&bn->class_attr_bonding_masters, bn->net);
+  }
+  
+ -/*
+ - * Initialize sysfs for each bond.  This sets up and registers
+ +/* Initialize sysfs for each bond.  This sets up and registers
+   * the 'bondctl' directory for each individual bond under /sys/class/net.
+   */
+  void bond_prepare_sysfs_group(struct bonding *bond)
+diff --cc fs/sysfs/file.c
+index 3de7949b1b72,e784340f1599..000000000000
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@@ -560,16 -516,17 +517,21 @@@ int sysfs_add_file_mode_ns(struct sysfs
+  int sysfs_add_file(struct sysfs_dirent *dir_sd, const struct attribute *attr,
+  		   int type)
+  {
+- 	return sysfs_add_file_mode(dir_sd, attr, type, attr->mode);
++ 	return sysfs_add_file_mode_ns(dir_sd, attr, type, attr->mode, NULL);
+  }
+  
+- 
+  /**
+-  *	sysfs_create_file - create an attribute file for an object.
+-  *	@kobj:	object we're creating for.
+-  *	@attr:	attribute descriptor.
++  * sysfs_create_file_ns - create an attribute file for an object with custom ns
++  * @kobj: object we're creating for
++  * @attr: attribute descriptor
++  * @ns: namespace the new file should belong to
+   */
+++<<<<<<< HEAD
+ +int sysfs_create_file(struct kobject * kobj, const struct attribute * attr)
+++=======
++ int sysfs_create_file_ns(struct kobject *kobj, const struct attribute *attr,
++ 			 const void *ns)
+++>>>>>>> 58292cbe6669 (sysfs: make attr namespace interface less convoluted)
+  {
+  	BUG_ON(!kobj || !kobj->sd || !attr);
+  
+@@@ -656,24 -609,23 +614,27 @@@ int sysfs_chmod_file(struct kobject *ko
+  EXPORT_SYMBOL_GPL(sysfs_chmod_file);
+  
+  /**
+-  *	sysfs_remove_file - remove an object attribute.
+-  *	@kobj:	object we're acting for.
+-  *	@attr:	attribute descriptor.
++  * sysfs_remove_file_ns - remove an object attribute with a custom ns tag
++  * @kobj: object we're acting for
++  * @attr: attribute descriptor
++  * @ns: namespace tag of the file to remove
+   *
+-  *	Hash the attribute name and kill the victim.
++  * Hash the attribute name and namespace tag and kill the victim.
+   */
+++<<<<<<< HEAD
+ +void sysfs_remove_file(struct kobject * kobj, const struct attribute * attr)
+++=======
++ void sysfs_remove_file_ns(struct kobject *kobj, const struct attribute *attr,
++ 			  const void *ns)
+++>>>>>>> 58292cbe6669 (sysfs: make attr namespace interface less convoluted)
+  {
+- 	const void *ns;
+- 
+- 	if (sysfs_attr_ns(kobj, attr, &ns))
+- 		return;
++ 	struct sysfs_dirent *dir_sd = kobj->sd;
+  
+- 	sysfs_hash_and_remove(kobj->sd, ns, attr->name);
++ 	sysfs_hash_and_remove(dir_sd, ns, attr->name);
+  }
+- EXPORT_SYMBOL_GPL(sysfs_remove_file);
++ EXPORT_SYMBOL_GPL(sysfs_remove_file_ns);
+  
+ -void sysfs_remove_files(struct kobject *kobj, const struct attribute **ptr)
+ +void sysfs_remove_files(struct kobject * kobj, const struct attribute **ptr)
+  {
+  	int i;
+  	for (i = 0; ptr[i]; i++)
+diff --cc include/linux/netdevice.h
+index ac042b4e583c,42421ed49a47..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -3976,29 -2873,20 +3976,46 @@@ int __init dev_proc_init(void)
+  #define dev_proc_init() 0
+  #endif
+  
+++<<<<<<< HEAD
+ +static inline netdev_tx_t __netdev_start_xmit(const struct net_device_ops *ops,
+ +					      struct sk_buff *skb, struct net_device *dev,
+ +					      bool more)
+ +{
+ +	skb->xmit_more = more ? 1 : 0;
+ +	return ops->ndo_start_xmit(skb, dev);
+ +}
+ +
+ +static inline netdev_tx_t netdev_start_xmit(struct sk_buff *skb, struct net_device *dev,
+ +					    struct netdev_queue *txq, bool more)
+ +{
+ +	const struct net_device_ops *ops = dev->netdev_ops;
+ +	int rc;
+ +
+ +	rc = __netdev_start_xmit(ops, skb, dev, more);
+ +	if (rc == NETDEV_TX_OK)
+ +		txq_trans_update(txq);
+ +
+ +	return rc;
+ +}
+ +
+ +int netdev_class_create_file(struct class_attribute *class_attr);
+ +void netdev_class_remove_file(struct class_attribute *class_attr);
+++=======
++ extern int netdev_class_create_file_ns(struct class_attribute *class_attr,
++ 				       const void *ns);
++ extern void netdev_class_remove_file_ns(struct class_attribute *class_attr,
++ 					const void *ns);
++ 
++ static inline int netdev_class_create_file(struct class_attribute *class_attr)
++ {
++ 	return netdev_class_create_file_ns(class_attr, NULL);
++ }
++ 
++ static inline void netdev_class_remove_file(struct class_attribute *class_attr)
++ {
++ 	netdev_class_remove_file_ns(class_attr, NULL);
++ }
+++>>>>>>> 58292cbe6669 (sysfs: make attr namespace interface less convoluted)
+  
+  extern struct kobj_ns_type_operations net_ns_type_operations;
+  
+diff --git a/drivers/base/class.c b/drivers/base/class.c
+index 8b7818b80056..f96f70419a78 100644
+--- a/drivers/base/class.c
++++ b/drivers/base/class.c
+@@ -47,18 +47,6 @@ static ssize_t class_attr_store(struct kobject *kobj, struct attribute *attr,
+ 	return ret;
+ }
+ 
+-static const void *class_attr_namespace(struct kobject *kobj,
+-					const struct attribute *attr)
+-{
+-	struct class_attribute *class_attr = to_class_attr(attr);
+-	struct subsys_private *cp = to_subsys_private(kobj);
+-	const void *ns = NULL;
+-
+-	if (class_attr->namespace)
+-		ns = class_attr->namespace(cp->class, class_attr);
+-	return ns;
+-}
+-
+ static void class_release(struct kobject *kobj)
+ {
+ 	struct subsys_private *cp = to_subsys_private(kobj);
+@@ -86,7 +74,6 @@ static const struct kobj_ns_type_operations *class_child_ns_type(struct kobject
+ static const struct sysfs_ops class_sysfs_ops = {
+ 	.show	   = class_attr_show,
+ 	.store	   = class_attr_store,
+-	.namespace = class_attr_namespace,
+ };
+ 
+ static struct kobj_type class_ktype = {
+@@ -99,21 +86,23 @@ static struct kobj_type class_ktype = {
+ static struct kset *class_kset;
+ 
+ 
+-int class_create_file(struct class *cls, const struct class_attribute *attr)
++int class_create_file_ns(struct class *cls, const struct class_attribute *attr,
++			 const void *ns)
+ {
+ 	int error;
+ 	if (cls)
+-		error = sysfs_create_file(&cls->p->subsys.kobj,
+-					  &attr->attr);
++		error = sysfs_create_file_ns(&cls->p->subsys.kobj,
++					     &attr->attr, ns);
+ 	else
+ 		error = -EINVAL;
+ 	return error;
+ }
+ 
+-void class_remove_file(struct class *cls, const struct class_attribute *attr)
++void class_remove_file_ns(struct class *cls, const struct class_attribute *attr,
++			  const void *ns)
+ {
+ 	if (cls)
+-		sysfs_remove_file(&cls->p->subsys.kobj, &attr->attr);
++		sysfs_remove_file_ns(&cls->p->subsys.kobj, &attr->attr, ns);
+ }
+ 
+ static struct class *class_get(struct class *cls)
+@@ -600,8 +589,8 @@ int __init classes_init(void)
+ 	return 0;
+ }
+ 
+-EXPORT_SYMBOL_GPL(class_create_file);
+-EXPORT_SYMBOL_GPL(class_remove_file);
++EXPORT_SYMBOL_GPL(class_create_file_ns);
++EXPORT_SYMBOL_GPL(class_remove_file_ns);
+ EXPORT_SYMBOL_GPL(class_unregister);
+ EXPORT_SYMBOL_GPL(class_destroy);
+ 
+* Unmerged path drivers/net/bonding/bond_sysfs.c
+* Unmerged path fs/sysfs/file.c
+diff --git a/fs/sysfs/group.c b/fs/sysfs/group.c
+index 1a6e16c0db91..5414a1d1562e 100644
+--- a/fs/sysfs/group.c
++++ b/fs/sysfs/group.c
+@@ -56,9 +56,10 @@ static int create_files(struct sysfs_dirent *dir_sd, struct kobject *kobj,
+ 				if (!mode)
+ 					continue;
+ 			}
+-			error = sysfs_add_file_mode(dir_sd, *attr,
+-						    SYSFS_KOBJ_ATTR,
+-						    (*attr)->mode | mode);
++			error = sysfs_add_file_mode_ns(dir_sd, *attr,
++						       SYSFS_KOBJ_ATTR,
++						       (*attr)->mode | mode,
++						       NULL);
+ 			if (unlikely(error))
+ 				break;
+ 		}
+diff --git a/fs/sysfs/sysfs.h b/fs/sysfs/sysfs.h
+index b6deca3e301d..a96da2559db2 100644
+--- a/fs/sysfs/sysfs.h
++++ b/fs/sysfs/sysfs.h
+@@ -230,8 +230,9 @@ extern const struct file_operations sysfs_file_operations;
+ int sysfs_add_file(struct sysfs_dirent *dir_sd,
+ 		   const struct attribute *attr, int type);
+ 
+-int sysfs_add_file_mode(struct sysfs_dirent *dir_sd,
+-			const struct attribute *attr, int type, umode_t amode);
++int sysfs_add_file_mode_ns(struct sysfs_dirent *dir_sd,
++			   const struct attribute *attr, int type,
++			   umode_t amode, const void *ns);
+ /*
+  * bin.c
+  */
+diff --git a/include/linux/device.h b/include/linux/device.h
+index d4c3755a043e..37a9212d789b 100644
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@ -449,8 +449,6 @@ struct class_attribute {
+ 			char *buf);
+ 	ssize_t (*store)(struct class *class, struct class_attribute *attr,
+ 			const char *buf, size_t count);
+-	const void *(*namespace)(struct class *class,
+-				 const struct class_attribute *attr);
+ };
+ 
+ #define CLASS_ATTR(_name, _mode, _show, _store) \
+@@ -460,10 +458,24 @@ struct class_attribute {
+ #define CLASS_ATTR_RO(_name) \
+ 	struct class_attribute class_attr_##_name = __ATTR_RO(_name)
+ 
+-extern int __must_check class_create_file(struct class *class,
+-					  const struct class_attribute *attr);
+-extern void class_remove_file(struct class *class,
+-			      const struct class_attribute *attr);
++extern int __must_check class_create_file_ns(struct class *class,
++					     const struct class_attribute *attr,
++					     const void *ns);
++extern void class_remove_file_ns(struct class *class,
++				 const struct class_attribute *attr,
++				 const void *ns);
++
++static inline int __must_check class_create_file(struct class *class,
++					const struct class_attribute *attr)
++{
++	return class_create_file_ns(class, attr, NULL);
++}
++
++static inline void class_remove_file(struct class *class,
++				     const struct class_attribute *attr)
++{
++	return class_remove_file_ns(class, attr, NULL);
++}
+ 
+ /* Simple class attribute that is just a static string */
+ struct class_attribute_string {
+* Unmerged path include/linux/netdevice.h
+diff --git a/include/linux/sysfs.h b/include/linux/sysfs.h
+index 85126b01a2f8..dcf7d1f26c57 100644
+--- a/include/linux/sysfs.h
++++ b/include/linux/sysfs.h
+@@ -173,7 +173,6 @@ struct bin_attribute bin_attr_##_name = __BIN_ATTR_RW(_name, _size)
+ struct sysfs_ops {
+ 	ssize_t	(*show)(struct kobject *, struct attribute *, char *);
+ 	ssize_t	(*store)(struct kobject *, struct attribute *, const char *, size_t);
+-	const void *(*namespace)(struct kobject *, const struct attribute *);
+ };
+ 
+ struct sysfs_dirent;
+@@ -189,13 +188,15 @@ int __must_check sysfs_rename_dir(struct kobject *kobj, const char *new_name);
+ int __must_check sysfs_move_dir(struct kobject *kobj,
+ 				struct kobject *new_parent_kobj);
+ 
+-int __must_check sysfs_create_file(struct kobject *kobj,
+-				   const struct attribute *attr);
++int __must_check sysfs_create_file_ns(struct kobject *kobj,
++				      const struct attribute *attr,
++				      const void *ns);
+ int __must_check sysfs_create_files(struct kobject *kobj,
+ 				   const struct attribute **attr);
+ int __must_check sysfs_chmod_file(struct kobject *kobj,
+ 				  const struct attribute *attr, umode_t mode);
+-void sysfs_remove_file(struct kobject *kobj, const struct attribute *attr);
++void sysfs_remove_file_ns(struct kobject *kobj, const struct attribute *attr,
++			  const void *ns);
+ void sysfs_remove_files(struct kobject *kobj, const struct attribute **attr);
+ 
+ int __must_check sysfs_create_bin_file(struct kobject *kobj,
+@@ -280,8 +281,9 @@ static inline int sysfs_move_dir(struct kobject *kobj,
+ 	return 0;
+ }
+ 
+-static inline int sysfs_create_file(struct kobject *kobj,
+-				    const struct attribute *attr)
++static inline int sysfs_create_file_ns(struct kobject *kobj,
++				       const struct attribute *attr,
++				       const void *ns)
+ {
+ 	return 0;
+ }
+@@ -298,8 +300,9 @@ static inline int sysfs_chmod_file(struct kobject *kobj,
+ 	return 0;
+ }
+ 
+-static inline void sysfs_remove_file(struct kobject *kobj,
+-				     const struct attribute *attr)
++static inline void sysfs_remove_file_ns(struct kobject *kobj,
++					const struct attribute *attr,
++					const void *ns)
+ {
+ }
+ 
+@@ -446,4 +449,16 @@ static inline int __must_check sysfs_init(void)
+ 
+ #endif /* CONFIG_SYSFS */
+ 
++static inline int __must_check sysfs_create_file(struct kobject *kobj,
++						 const struct attribute *attr)
++{
++	return sysfs_create_file_ns(kobj, attr, NULL);
++}
++
++static inline void sysfs_remove_file(struct kobject *kobj,
++				     const struct attribute *attr)
++{
++	return sysfs_remove_file_ns(kobj, attr, NULL);
++}
++
+ #endif /* _SYSFS_H_ */
+diff --git a/net/core/net-sysfs.c b/net/core/net-sysfs.c
+index be3a711946ea..76f4f07f703e 100644
+--- a/net/core/net-sysfs.c
++++ b/net/core/net-sysfs.c
+@@ -1495,17 +1495,19 @@ int netdev_register_kobject(struct net_device *net)
+ 	return error;
+ }
+ 
+-int netdev_class_create_file(struct class_attribute *class_attr)
++int netdev_class_create_file_ns(struct class_attribute *class_attr,
++				const void *ns)
+ {
+-	return class_create_file(&net_class, class_attr);
++	return class_create_file_ns(&net_class, class_attr, ns);
+ }
+-EXPORT_SYMBOL(netdev_class_create_file);
++EXPORT_SYMBOL(netdev_class_create_file_ns);
+ 
+-void netdev_class_remove_file(struct class_attribute *class_attr)
++void netdev_class_remove_file_ns(struct class_attribute *class_attr,
++				 const void *ns)
+ {
+-	class_remove_file(&net_class, class_attr);
++	class_remove_file_ns(&net_class, class_attr, ns);
+ }
+-EXPORT_SYMBOL(netdev_class_remove_file);
++EXPORT_SYMBOL(netdev_class_remove_file_ns);
+ 
+ int netdev_kobject_init(void)
+ {
