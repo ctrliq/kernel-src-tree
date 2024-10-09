@@ -1,0 +1,378 @@
+netfilter: ipset: list:set: Decrease refcount synchronously on deletion and replace
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] ipset: list:set: Decrease refcount synchronously on deletion and replace (Stefano Brivio) [1593732]
+Rebuild_FUZZ: 92.90%
+commit-author Stefano Brivio <sbrivio@redhat.com>
+commit 439cd39ea136d2c026805264d58a91f36b6b64ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/439cd39e.failed
+
+Commit 45040978c899 ("netfilter: ipset: Fix set:list type crash
+when flush/dump set in parallel") postponed decreasing set
+reference counters to the RCU callback.
+
+An 'ipset del' command can terminate before the RCU grace period
+is elapsed, and if sets are listed before then, the reference
+counter shown in userspace will be wrong:
+
+ # ipset create h hash:ip; ipset create l list:set; ipset add l
+ # ipset del l h; ipset list h
+ Name: h
+ Type: hash:ip
+ Revision: 4
+ Header: family inet hashsize 1024 maxelem 65536
+ Size in memory: 88
+ References: 1
+ Number of entries: 0
+ Members:
+ # sleep 1; ipset list h
+ Name: h
+ Type: hash:ip
+ Revision: 4
+ Header: family inet hashsize 1024 maxelem 65536
+ Size in memory: 88
+ References: 0
+ Number of entries: 0
+ Members:
+
+Fix this by making the reference count update synchronous again.
+
+As a result, when sets are listed, ip_set_name_byindex() might
+now fetch a set whose reference count is already zero. Instead
+of relying on the reference count to protect against concurrent
+set renaming, grab ip_set_ref_lock as reader and copy the name,
+while holding the same lock in ip_set_rename() as writer
+instead.
+
+	Reported-by: Li Shuang <shuali@redhat.com>
+Fixes: 45040978c899 ("netfilter: ipset: Fix set:list type crash when flush/dump set in parallel")
+	Signed-off-by: Stefano Brivio <sbrivio@redhat.com>
+	Signed-off-by: Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 439cd39ea136d2c026805264d58a91f36b6b64ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/ipset/ip_set_core.c
+#	net/netfilter/ipset/ip_set_list_set.c
+diff --cc net/netfilter/ipset/ip_set_core.c
+index 8905fc4c2b4c,fa15a831aeee..000000000000
+--- a/net/netfilter/ipset/ip_set_core.c
++++ b/net/netfilter/ipset/ip_set_core.c
+@@@ -549,23 -692,21 +549,35 @@@ ip_set_put_byindex(struct net *net, ip_
+  }
+  EXPORT_SYMBOL_GPL(ip_set_put_byindex);
+  
+++<<<<<<< HEAD
+ +/*
+ + * Get the name of a set behind a set index.
+ + * We assume the set is referenced, so it does exist and
+ + * can't be destroyed. The set cannot be renamed due to
+ + * the referencing either.
+ + *
+++=======
++ /* Get the name of a set behind a set index.
++  * Set itself is protected by RCU, but its name isn't: to protect against
++  * renaming, grab ip_set_ref_lock as reader (see ip_set_rename()) and copy the
++  * name.
+++>>>>>>> 439cd39ea136 (netfilter: ipset: list:set: Decrease refcount synchronously on deletion and replace)
+   */
+- const char *
+- ip_set_name_byindex(struct net *net, ip_set_id_t index)
++ void
++ ip_set_name_byindex(struct net *net, ip_set_id_t index, char *name)
+  {
+- 	const struct ip_set *set = ip_set_rcu_get(net, index);
++ 	struct ip_set *set = ip_set_rcu_get(net, index);
+  
+++<<<<<<< HEAD
+ +	BUG_ON(set == NULL);
+ +	BUG_ON(set->ref == 0);
+++=======
++ 	BUG_ON(!set);
+++>>>>>>> 439cd39ea136 (netfilter: ipset: list:set: Decrease refcount synchronously on deletion and replace)
+  
+- 	/* Referenced, so it's safe */
+- 	return set->name;
++ 	read_lock_bh(&ip_set_ref_lock);
++ 	strncpy(name, set->name, IPSET_MAXNAMELEN);
++ 	read_unlock_bh(&ip_set_ref_lock);
+  }
+  EXPORT_SYMBOL_GPL(ip_set_name_byindex);
+  
+@@@ -1016,10 -1149,10 +1028,10 @@@ ip_set_rename(struct sock *ctnl, struc
+  		return -IPSET_ERR_PROTOCOL;
+  
+  	set = find_set(inst, nla_data(attr[IPSET_ATTR_SETNAME]));
+ -	if (!set)
+ +	if (set == NULL)
+  		return -ENOENT;
+  
+- 	read_lock_bh(&ip_set_ref_lock);
++ 	write_lock_bh(&ip_set_ref_lock);
+  	if (set->ref != 0) {
+  		ret = -IPSET_ERR_REFERENCED;
+  		goto out;
+diff --cc net/netfilter/ipset/ip_set_list_set.c
+index a9a97c07ecb4,4eef55da0878..000000000000
+--- a/net/netfilter/ipset/ip_set_list_set.c
++++ b/net/netfilter/ipset/ip_set_list_set.c
+@@@ -177,70 -136,42 +177,99 @@@ list_set_kadt(struct ip_set *set, cons
+  	default:
+  		break;
+  	}
+ -	rcu_read_unlock();
+ +	return -EINVAL;
+ +}
+  
+ -	return ret;
+ +static bool
+ +id_eq(const struct ip_set *set, u32 i, ip_set_id_t id)
+ +{
+ +	const struct list_set *map = set->data;
+ +	const struct set_elem *e;
+ +
+ +	if (i >= map->size)
+ +		return 0;
+ +
+ +	e = list_set_elem(map, i);
+ +	return !!(e->id == id &&
+ +		 !(SET_WITH_TIMEOUT(set) &&
+ +		   ip_set_timeout_expired(ext_timeout(e, map))));
+  }
+  
+ -/* Userspace interfaces: we are protected by the nfnl mutex */
+ +static int
+ +list_set_add(struct ip_set *set, u32 i, struct set_adt_elem *d,
+ +	     const struct ip_set_ext *ext)
+ +{
+++<<<<<<< HEAD
+ +	struct list_set *map = set->data;
+ +	struct set_elem *e = list_set_elem(map, i);
+ +
+ +	if (e->id != IPSET_INVALID_ID) {
+ +		if (i == map->size - 1)
+ +			/* Last element replaced: e.g. add new,before,last */
+ +			ip_set_put_byindex(map->net, e->id);
+ +		else {
+ +			struct set_elem *x = list_set_elem(map, map->size - 1);
+ +
+ +			/* Last element pushed off */
+ +			if (x->id != IPSET_INVALID_ID)
+ +				ip_set_put_byindex(map->net, x->id);
+ +			memmove(list_set_elem(map, i + 1), e,
+ +				map->dsize * (map->size - (i + 1)));
+ +		}
+ +	}
+  
+ -static void
+ -__list_set_del_rcu(struct rcu_head * rcu)
+ +	e->id = d->id;
+ +	if (SET_WITH_TIMEOUT(set))
+ +		ip_set_timeout_set(ext_timeout(e, map), ext->timeout);
+ +	if (SET_WITH_COUNTER(set))
+ +		ip_set_init_counter(ext_counter(e, map), ext);
+ +	return 0;
+ +}
+ +
+ +static int
+ +list_set_del(struct ip_set *set, u32 i)
+  {
+ +	struct list_set *map = set->data;
+ +	struct set_elem *e = list_set_elem(map, i);
+ +
+ +	ip_set_put_byindex(map->net, e->id);
+ +
+ +	if (i < map->size - 1)
+ +		memmove(e, list_set_elem(map, i + 1),
+ +			map->dsize * (map->size - (i + 1)));
+ +
+ +	/* Last element */
+ +	e = list_set_elem(map, map->size - 1);
+ +	e->id = IPSET_INVALID_ID;
+ +	return 0;
+++=======
++ 	struct set_elem *e = container_of(rcu, struct set_elem, rcu);
++ 	struct ip_set *set = e->set;
++ 
++ 	ip_set_ext_destroy(set, e);
++ 	kfree(e);
++ }
++ 
++ static inline void
++ list_set_del(struct ip_set *set, struct set_elem *e)
++ {
++ 	struct list_set *map = set->data;
++ 
++ 	set->elements--;
++ 	list_del_rcu(&e->list);
++ 	ip_set_put_byindex(map->net, e->id);
++ 	call_rcu(&e->rcu, __list_set_del_rcu);
++ }
++ 
++ static inline void
++ list_set_replace(struct ip_set *set, struct set_elem *e, struct set_elem *old)
++ {
++ 	struct list_set *map = set->data;
++ 
++ 	list_replace_rcu(&old->list, &e->list);
++ 	ip_set_put_byindex(map->net, old->id);
++ 	call_rcu(&old->rcu, __list_set_del_rcu);
+++>>>>>>> 439cd39ea136 (netfilter: ipset: list:set: Decrease refcount synchronously on deletion and replace)
+  }
+  
+  static void
+@@@ -328,22 -274,44 +357,43 @@@ list_set_uadd(struct ip_set *set, void 
+  		ip_set_put_byindex(map->net, d->id);
+  		return 0;
+  	}
+ -	/* Add new entry */
+ -	if (d->before == 0) {
+ -		/* Append  */
+ -		n = list_empty(&map->members) ? NULL :
+ -		    list_last_entry(&map->members, struct set_elem, list);
+ -	} else if (d->before > 0) {
+ -		/* Insert after next element */
+ -		if (!list_is_last(&next->list, &map->members))
+ -			n = list_next_entry(next, list);
+ -	} else {
+ -		/* Insert before prev element */
+ -		if (prev->list.prev != &map->members)
+ -			n = list_prev_entry(prev, list);
+ +insert:
+ +	ret = -IPSET_ERR_LIST_FULL;
+ +	for (i = 0; i < map->size && ret == -IPSET_ERR_LIST_FULL; i++) {
+ +		e = list_set_elem(map, i);
+ +		if (e->id == IPSET_INVALID_ID)
+ +			ret = d->before != 0 ? -IPSET_ERR_REF_EXIST
+ +				: list_set_add(set, i, d, ext);
+ +		else if (e->id != d->refid)
+ +			continue;
+ +		else if (d->before > 0)
+ +			ret = list_set_add(set, i, d, ext);
+ +		else if (i + 1 < map->size)
+ +			ret = list_set_add(set, i + 1, d, ext);
+  	}
+ -	/* Can we replace a timed out entry? */
+ -	if (n &&
+ -	    !(SET_WITH_TIMEOUT(set) &&
+ -	      ip_set_timeout_expired(ext_timeout(n, set))))
+ -		n =  NULL;
+  
+++<<<<<<< HEAD
+ +	return ret;
+++=======
++ 	e = kzalloc(set->dsize, GFP_ATOMIC);
++ 	if (!e)
++ 		return -ENOMEM;
++ 	e->id = d->id;
++ 	e->set = set;
++ 	INIT_LIST_HEAD(&e->list);
++ 	list_set_init_extensions(set, ext, e);
++ 	if (n)
++ 		list_set_replace(set, e, n);
++ 	else if (next)
++ 		list_add_tail_rcu(&e->list, &next->list);
++ 	else if (prev)
++ 		list_add_rcu(&e->list, &prev->list);
++ 	else
++ 		list_add_tail_rcu(&e->list, &map->members);
++ 	set->elements++;
++ 
++ 	return 0;
+++>>>>>>> 439cd39ea136 (netfilter: ipset: list:set: Decrease refcount synchronously on deletion and replace)
+  }
+  
+  static int
+@@@ -509,46 -489,39 +559,60 @@@ list_set_list(const struct ip_set *set
+  {
+  	const struct list_set *map = set->data;
+  	struct nlattr *atd, *nested;
+++<<<<<<< HEAD
+ +	u32 i, first = cb->args[2];
+ +	const struct set_elem *e;
+++=======
++ 	u32 i = 0, first = cb->args[IPSET_CB_ARG0];
++ 	char name[IPSET_MAXNAMELEN];
++ 	struct set_elem *e;
++ 	int ret = 0;
+++>>>>>>> 439cd39ea136 (netfilter: ipset: list:set: Decrease refcount synchronously on deletion and replace)
+  
+  	atd = ipset_nest_start(skb, IPSET_ATTR_ADT);
+  	if (!atd)
+  		return -EMSGSIZE;
+ -
+ -	rcu_read_lock();
+ -	list_for_each_entry_rcu(e, &map->members, list) {
+ -		if (i < first ||
+ -		    (SET_WITH_TIMEOUT(set) &&
+ -		     ip_set_timeout_expired(ext_timeout(e, set)))) {
+ -			i++;
+ +	for (; cb->args[2] < map->size; cb->args[2]++) {
+ +		i = cb->args[2];
+ +		e = list_set_elem(map, i);
+ +		if (e->id == IPSET_INVALID_ID)
+ +			goto finish;
+ +		if (SET_WITH_TIMEOUT(set) &&
+ +		    ip_set_timeout_expired(ext_timeout(e, map)))
+  			continue;
+ -		}
+  		nested = ipset_nest_start(skb, IPSET_ATTR_DATA);
+++<<<<<<< HEAD
+ +		if (!nested) {
+ +			if (i == first) {
+ +				nla_nest_cancel(skb, atd);
+ +				return -EMSGSIZE;
+ +			} else
+ +				goto nla_put_failure;
+ +		}
+ +		if (nla_put_string(skb, IPSET_ATTR_NAME,
+ +				   ip_set_name_byindex(map->net, e->id)))
+++=======
++ 		if (!nested)
++ 			goto nla_put_failure;
++ 		ip_set_name_byindex(map->net, e->id, name);
++ 		if (nla_put_string(skb, IPSET_ATTR_NAME, name))
+++>>>>>>> 439cd39ea136 (netfilter: ipset: list:set: Decrease refcount synchronously on deletion and replace)
+  			goto nla_put_failure;
+ -		if (ip_set_put_extensions(skb, set, e, true))
+ +		if (SET_WITH_TIMEOUT(set) &&
+ +		    nla_put_net32(skb, IPSET_ATTR_TIMEOUT,
+ +				  htonl(ip_set_timeout_get(
+ +						ext_timeout(e, map)))))
+ +			goto nla_put_failure;
+ +		if (SET_WITH_COUNTER(set) &&
+ +		    ip_set_put_counter(skb, ext_counter(e, map)))
+  			goto nla_put_failure;
+  		ipset_nest_end(skb, nested);
+ -		i++;
+  	}
+ -
+ +finish:
+  	ipset_nest_end(skb, atd);
+  	/* Set listing finished */
+ -	cb->args[IPSET_CB_ARG0] = 0;
+ -	goto out;
+ +	cb->args[2] = 0;
+ +	return 0;
+  
+  nla_put_failure:
+  	nla_nest_cancel(skb, nested);
+diff --git a/include/linux/netfilter/ipset/ip_set.h b/include/linux/netfilter/ipset/ip_set.h
+index 3e9c90cf5227..002daa363854 100644
+--- a/include/linux/netfilter/ipset/ip_set.h
++++ b/include/linux/netfilter/ipset/ip_set.h
+@@ -260,7 +260,7 @@ ip_set_init_counter(struct ip_set_counter *counter,
+ extern ip_set_id_t ip_set_get_byname(struct net *net,
+ 				     const char *name, struct ip_set **set);
+ extern void ip_set_put_byindex(struct net *net, ip_set_id_t index);
+-extern const char *ip_set_name_byindex(struct net *net, ip_set_id_t index);
++extern void ip_set_name_byindex(struct net *net, ip_set_id_t index, char *name);
+ extern ip_set_id_t ip_set_nfnl_get_byindex(struct net *net, ip_set_id_t index);
+ extern void ip_set_nfnl_put(struct net *net, ip_set_id_t index);
+ 
+* Unmerged path net/netfilter/ipset/ip_set_core.c
+* Unmerged path net/netfilter/ipset/ip_set_list_set.c
