@@ -1,0 +1,334 @@
+KVM: PPC: Book3S: Treat VTB as a per-subcore register, not per-thread
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Paul Mackerras <paulus@ozlabs.org>
+commit 88b02cf97bb7e742db3e31671d54177e3e19fd89
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/88b02cf9.failed
+
+POWER8 has one virtual timebase (VTB) register per subcore, not one
+per CPU thread.  The HV KVM code currently treats VTB as a per-thread
+register, which can lead to spurious soft lockup messages from guests
+which use the VTB as the time source for the soft lockup detector.
+(CPUs before POWER8 did not have the VTB register.)
+
+For HV KVM, this fixes the problem by making only the primary thread
+in each virtual core save and restore the VTB value.  With this,
+the VTB state becomes part of the kvmppc_vcore structure.  This
+also means that "piggybacking" of multiple virtual cores onto one
+subcore is not possible on POWER8, because then the virtual cores
+would share a single VTB register.
+
+PR KVM emulates a VTB register, which is per-vcpu because PR KVM
+has no notion of CPU threads or SMT.  For PR KVM we move the VTB
+state into the kvmppc_vcpu_book3s struct.
+
+	Cc: stable@vger.kernel.org # v3.14+
+	Reported-by: Thomas Huth <thuth@redhat.com>
+	Tested-by: Thomas Huth <thuth@redhat.com>
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+(cherry picked from commit 88b02cf97bb7e742db3e31671d54177e3e19fd89)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/kvm_book3s.h
+#	arch/powerpc/kvm/book3s.c
+diff --cc arch/powerpc/include/asm/kvm_book3s.h
+index 8f39796c9da8,5cf306ae0ac3..000000000000
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@@ -69,6 -69,43 +69,46 @@@ struct hpte_cache 
+  	int pagesize;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Struct for a virtual core.
++  * Note: entry_exit_map combines a bitmap of threads that have entered
++  * in the bottom 8 bits and a bitmap of threads that have exited in the
++  * next 8 bits.  This is so that we can atomically set the entry bit
++  * iff the exit map is 0 without taking a lock.
++  */
++ struct kvmppc_vcore {
++ 	int n_runnable;
++ 	int num_threads;
++ 	int entry_exit_map;
++ 	int napping_threads;
++ 	int first_vcpuid;
++ 	u16 pcpu;
++ 	u16 last_cpu;
++ 	u8 vcore_state;
++ 	u8 in_guest;
++ 	struct kvmppc_vcore *master_vcore;
++ 	struct kvm_vcpu *runnable_threads[MAX_SMT_THREADS];
++ 	struct list_head preempt_list;
++ 	spinlock_t lock;
++ 	struct swait_queue_head wq;
++ 	spinlock_t stoltb_lock;	/* protects stolen_tb and preempt_tb */
++ 	u64 stolen_tb;
++ 	u64 preempt_tb;
++ 	struct kvm_vcpu *runner;
++ 	struct kvm *kvm;
++ 	u64 tb_offset;		/* guest timebase - host timebase */
++ 	ulong lpcr;
++ 	u32 arch_compat;
++ 	ulong pcr;
++ 	ulong dpdes;		/* doorbell state (POWER8) */
++ 	ulong vtb;		/* virtual timebase */
++ 	ulong conferring_threads;
++ 	unsigned int halt_poll_ns;
++ };
++ 
+++>>>>>>> 88b02cf97bb7 (KVM: PPC: Book3S: Treat VTB as a per-subcore register, not per-thread)
+  struct kvmppc_vcpu_book3s {
+  	struct kvmppc_sid_map sid_map[SID_MAP_NUM];
+  	struct {
+diff --cc arch/powerpc/kvm/book3s.c
+index a2a3b2997330,b6952dd23152..000000000000
+--- a/arch/powerpc/kvm/book3s.c
++++ b/arch/powerpc/kvm/book3s.c
+@@@ -604,25 -585,22 +604,28 @@@ int kvm_vcpu_ioctl_get_one_reg(struct k
+  			break;
+  #endif /* CONFIG_KVM_XICS */
+  		case KVM_REG_PPC_FSCR:
+ -			*val = get_reg_val(id, vcpu->arch.fscr);
+ +			val = get_reg_val(reg->id, vcpu->arch.fscr);
+  			break;
+  		case KVM_REG_PPC_TAR:
+ -			*val = get_reg_val(id, vcpu->arch.tar);
+ +			val = get_reg_val(reg->id, vcpu->arch.tar);
+  			break;
+  		case KVM_REG_PPC_EBBHR:
+ -			*val = get_reg_val(id, vcpu->arch.ebbhr);
+ +			val = get_reg_val(reg->id, vcpu->arch.ebbhr);
+  			break;
+  		case KVM_REG_PPC_EBBRR:
+ -			*val = get_reg_val(id, vcpu->arch.ebbrr);
+ +			val = get_reg_val(reg->id, vcpu->arch.ebbrr);
+  			break;
+  		case KVM_REG_PPC_BESCR:
+ -			*val = get_reg_val(id, vcpu->arch.bescr);
+ +			val = get_reg_val(reg->id, vcpu->arch.bescr);
+  			break;
+++<<<<<<< HEAD
+ +		case KVM_REG_PPC_VTB:
+ +			val = get_reg_val(reg->id, vcpu->arch.vtb);
+ +			break;
+++=======
+++>>>>>>> 88b02cf97bb7 (KVM: PPC: Book3S: Treat VTB as a per-subcore register, not per-thread)
+  		case KVM_REG_PPC_IC:
+ -			*val = get_reg_val(id, vcpu->arch.ic);
+ +			val = get_reg_val(reg->id, vcpu->arch.ic);
+  			break;
+  		default:
+  			r = -EINVAL;
+@@@ -714,25 -656,22 +717,28 @@@ int kvm_vcpu_ioctl_set_one_reg(struct k
+  			break;
+  #endif /* CONFIG_KVM_XICS */
+  		case KVM_REG_PPC_FSCR:
+ -			vcpu->arch.fscr = set_reg_val(id, *val);
+ +			vcpu->arch.fscr = set_reg_val(reg->id, val);
+  			break;
+  		case KVM_REG_PPC_TAR:
+ -			vcpu->arch.tar = set_reg_val(id, *val);
+ +			vcpu->arch.tar = set_reg_val(reg->id, val);
+  			break;
+  		case KVM_REG_PPC_EBBHR:
+ -			vcpu->arch.ebbhr = set_reg_val(id, *val);
+ +			vcpu->arch.ebbhr = set_reg_val(reg->id, val);
+  			break;
+  		case KVM_REG_PPC_EBBRR:
+ -			vcpu->arch.ebbrr = set_reg_val(id, *val);
+ +			vcpu->arch.ebbrr = set_reg_val(reg->id, val);
+  			break;
+  		case KVM_REG_PPC_BESCR:
+ -			vcpu->arch.bescr = set_reg_val(id, *val);
+ +			vcpu->arch.bescr = set_reg_val(reg->id, val);
+ +			break;
+++<<<<<<< HEAD
+ +		case KVM_REG_PPC_VTB:
+ +			vcpu->arch.vtb = set_reg_val(reg->id, val);
+  			break;
+++=======
+++>>>>>>> 88b02cf97bb7 (KVM: PPC: Book3S: Treat VTB as a per-subcore register, not per-thread)
+  		case KVM_REG_PPC_IC:
+ -			vcpu->arch.ic = set_reg_val(id, *val);
+ +			vcpu->arch.ic = set_reg_val(reg->id, val);
+  			break;
+  		default:
+  			r = -EINVAL;
+* Unmerged path arch/powerpc/include/asm/kvm_book3s.h
+diff --git a/arch/powerpc/include/asm/kvm_host.h b/arch/powerpc/include/asm/kvm_host.h
+index 8841a038084f..dc93220e5df9 100644
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@ -489,7 +489,6 @@ struct kvm_vcpu_arch {
+ 	ulong purr;
+ 	ulong spurr;
+ 	ulong ic;
+-	ulong vtb;
+ 	ulong dscr;
+ 	ulong amr;
+ 	ulong uamor;
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index 85977b6d9b81..41fbf9923b9d 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -513,7 +513,6 @@ int main(void)
+ 	DEFINE(VCPU_PURR, offsetof(struct kvm_vcpu, arch.purr));
+ 	DEFINE(VCPU_SPURR, offsetof(struct kvm_vcpu, arch.spurr));
+ 	DEFINE(VCPU_IC, offsetof(struct kvm_vcpu, arch.ic));
+-	DEFINE(VCPU_VTB, offsetof(struct kvm_vcpu, arch.vtb));
+ 	DEFINE(VCPU_DSCR, offsetof(struct kvm_vcpu, arch.dscr));
+ 	DEFINE(VCPU_AMR, offsetof(struct kvm_vcpu, arch.amr));
+ 	DEFINE(VCPU_UAMOR, offsetof(struct kvm_vcpu, arch.uamor));
+@@ -566,6 +565,7 @@ int main(void)
+ 	DEFINE(VCORE_LPCR, offsetof(struct kvmppc_vcore, lpcr));
+ 	DEFINE(VCORE_PCR, offsetof(struct kvmppc_vcore, pcr));
+ 	DEFINE(VCORE_DPDES, offsetof(struct kvmppc_vcore, dpdes));
++	DEFINE(VCORE_VTB, offsetof(struct kvmppc_vcore, vtb));
+ 	DEFINE(VCPU_SLB_E, offsetof(struct kvmppc_slb, orige));
+ 	DEFINE(VCPU_SLB_V, offsetof(struct kvmppc_slb, origv));
+ 	DEFINE(VCPU_SLB_SIZE, sizeof(struct kvmppc_slb));
+* Unmerged path arch/powerpc/kvm/book3s.c
+diff --git a/arch/powerpc/kvm/book3s_emulate.c b/arch/powerpc/kvm/book3s_emulate.c
+index 2afdb9c0937d..7d9e4ed2e415 100644
+--- a/arch/powerpc/kvm/book3s_emulate.c
++++ b/arch/powerpc/kvm/book3s_emulate.c
+@@ -579,7 +579,7 @@ int kvmppc_core_emulate_mfspr_pr(struct kvm_vcpu *vcpu, int sprn, ulong *spr_val
+ 		*spr_val = vcpu->arch.spurr;
+ 		break;
+ 	case SPRN_VTB:
+-		*spr_val = vcpu->arch.vtb;
++		*spr_val = to_book3s(vcpu)->vtb;
+ 		break;
+ 	case SPRN_IC:
+ 		*spr_val = vcpu->arch.ic;
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index 9a307d3552bf..0136a8ffe942 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -1124,6 +1124,9 @@ static int kvmppc_get_one_reg_hv(struct kvm_vcpu *vcpu, u64 id,
+ 	case KVM_REG_PPC_DPDES:
+ 		*val = get_reg_val(id, vcpu->arch.vcore->dpdes);
+ 		break;
++	case KVM_REG_PPC_VTB:
++		*val = get_reg_val(id, vcpu->arch.vcore->vtb);
++		break;
+ 	case KVM_REG_PPC_DAWR:
+ 		*val = get_reg_val(id, vcpu->arch.dawr);
+ 		break;
+@@ -1316,6 +1319,9 @@ static int kvmppc_set_one_reg_hv(struct kvm_vcpu *vcpu, u64 id,
+ 	case KVM_REG_PPC_DPDES:
+ 		vcpu->arch.vcore->dpdes = set_reg_val(id, *val);
+ 		break;
++	case KVM_REG_PPC_VTB:
++		vcpu->arch.vcore->vtb = set_reg_val(id, *val);
++		break;
+ 	case KVM_REG_PPC_DAWR:
+ 		vcpu->arch.dawr = set_reg_val(id, *val);
+ 		break;
+@@ -2139,9 +2145,11 @@ static bool can_piggyback_subcore(struct kvmppc_vcore *pvc,
+ 	    pvc->lpcr != vc->lpcr)
+ 		return false;
+ 
+-	/* P8 guest with > 1 thread per core would see wrong TIR value */
+-	if (cpu_has_feature(CPU_FTR_ARCH_207S) &&
+-	    (vc->num_threads > 1 || pvc->num_threads > 1))
++	/*
++	 * P8 guests can't do piggybacking, because then the
++	 * VTB would be shared between the vcpus.
++	 */
++	if (cpu_has_feature(CPU_FTR_ARCH_207S))
+ 		return false;
+ 
+ 	n_thr = cip->subcore_threads[sub] + pvc->num_threads;
+diff --git a/arch/powerpc/kvm/book3s_hv_rmhandlers.S b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index a4309327567b..2ad058cdccc7 100644
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@ -596,9 +596,11 @@ ALT_FTR_SECTION_END_IFSET(CPU_FTR_ARCH_207S)
+ 38:
+ 
+ BEGIN_FTR_SECTION
+-	/* DPDES is shared between threads */
++	/* DPDES and VTB are shared between threads */
+ 	ld	r8, VCORE_DPDES(r5)
++	ld	r7, VCORE_VTB(r5)
+ 	mtspr	SPRN_DPDES, r8
++	mtspr	SPRN_VTB, r7
+ END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
+ 
+ 	li	r0,1
+@@ -753,10 +755,8 @@ END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_207S)
+ 	mtspr	SPRN_CIABR, r7
+ 	mtspr	SPRN_TAR, r8
+ 	ld	r5, VCPU_IC(r4)
+-	ld	r6, VCPU_VTB(r4)
+-	mtspr	SPRN_IC, r5
+-	mtspr	SPRN_VTB, r6
+ 	ld	r8, VCPU_EBBHR(r4)
++	mtspr	SPRN_IC, r5
+ 	mtspr	SPRN_EBBHR, r8
+ 	ld	r5, VCPU_EBBRR(r4)
+ 	ld	r6, VCPU_BESCR(r4)
+@@ -1237,10 +1237,8 @@ END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_207S)
+ 	stw	r6, VCPU_PSPB(r9)
+ 	std	r7, VCPU_FSCR(r9)
+ 	mfspr	r5, SPRN_IC
+-	mfspr	r6, SPRN_VTB
+ 	mfspr	r7, SPRN_TAR
+ 	std	r5, VCPU_IC(r9)
+-	std	r6, VCPU_VTB(r9)
+ 	std	r7, VCPU_TAR(r9)
+ 	mfspr	r8, SPRN_EBBHR
+ 	std	r8, VCPU_EBBHR(r9)
+@@ -1467,9 +1465,11 @@ kvmhv_switch_to_host:
+ 	isync
+ 
+ BEGIN_FTR_SECTION
+-	/* DPDES is shared between threads */
++	/* DPDES and VTB are shared between threads */
+ 	mfspr	r7, SPRN_DPDES
++	mfspr	r8, SPRN_VTB
+ 	std	r7, VCORE_DPDES(r5)
++	std	r8, VCORE_VTB(r5)
+ 	/* clear DPDES so we don't get guest doorbells in the host */
+ 	li	r8, 0
+ 	mtspr	SPRN_DPDES, r8
+diff --git a/arch/powerpc/kvm/book3s_pr.c b/arch/powerpc/kvm/book3s_pr.c
+index 61bb522030cf..1665117f0517 100644
+--- a/arch/powerpc/kvm/book3s_pr.c
++++ b/arch/powerpc/kvm/book3s_pr.c
+@@ -226,7 +226,7 @@ void kvmppc_copy_from_svcpu(struct kvm_vcpu *vcpu,
+ 	 */
+ 	vcpu->arch.purr += get_tb() - vcpu->arch.entry_tb;
+ 	vcpu->arch.spurr += get_tb() - vcpu->arch.entry_tb;
+-	vcpu->arch.vtb += get_vtb() - vcpu->arch.entry_vtb;
++	to_book3s(vcpu)->vtb += get_vtb() - vcpu->arch.entry_vtb;
+ 	if (cpu_has_feature(CPU_FTR_ARCH_207S))
+ 		vcpu->arch.ic += mfspr(SPRN_IC) - vcpu->arch.entry_ic;
+ 	svcpu->in_use = false;
+@@ -1356,6 +1356,9 @@ static int kvmppc_get_one_reg_pr(struct kvm_vcpu *vcpu, u64 id,
+ 	case KVM_REG_PPC_HIOR:
+ 		*val = get_reg_val(id, to_book3s(vcpu)->hior);
+ 		break;
++	case KVM_REG_PPC_VTB:
++		*val = get_reg_val(id, to_book3s(vcpu)->vtb);
++		break;
+ 	case KVM_REG_PPC_LPCR:
+ 	case KVM_REG_PPC_LPCR_64:
+ 		/*
+@@ -1392,6 +1395,9 @@ static int kvmppc_set_one_reg_pr(struct kvm_vcpu *vcpu, u64 id,
+ 		to_book3s(vcpu)->hior = set_reg_val(id, *val);
+ 		to_book3s(vcpu)->hior_explicit = true;
+ 		break;
++	case KVM_REG_PPC_VTB:
++		to_book3s(vcpu)->vtb = set_reg_val(id, *val);
++		break;
+ 	case KVM_REG_PPC_LPCR:
+ 	case KVM_REG_PPC_LPCR_64:
+ 		kvmppc_set_lpcr_pr(vcpu, set_reg_val(id, *val));
