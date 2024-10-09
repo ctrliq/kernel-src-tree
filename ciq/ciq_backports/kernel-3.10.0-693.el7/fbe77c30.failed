@@ -1,0 +1,157 @@
+NFS: move rw_mode to nfs_pageio_header
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Benjamin Coddington <bcodding@redhat.com>
+commit fbe77c30e9abcb3429380dec622439991a718e31
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/fbe77c30.failed
+
+Let's try to have it in a cacheline in nfs4_proc_pgio_rpc_prepare().
+
+	Signed-off-by: Benjamin Coddington <bcodding@redhat.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit fbe77c30e9abcb3429380dec622439991a718e31)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/write.c
+diff --cc fs/nfs/write.c
+index c51910643a0b,95ac001b6fdf..000000000000
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@@ -80,8 -96,10 +80,15 @@@ static struct nfs_pgio_header *nfs_writ
+  {
+  	struct nfs_pgio_header *p = mempool_alloc(nfs_wdata_mempool, GFP_NOIO);
+  
+++<<<<<<< HEAD
+ +	if (p)
+ +		memset(p, 0, sizeof(*p));
+++=======
++ 	if (p) {
++ 		memset(p, 0, sizeof(*p));
++ 		p->rw_mode = FMODE_WRITE;
++ 	}
+++>>>>>>> fbe77c30e9ab (NFS: move rw_mode to nfs_pageio_header)
+  	return p;
+  }
+  
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index 98d786f46093..36f35af7084d 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -4558,7 +4558,7 @@ static int nfs4_proc_pgio_rpc_prepare(struct rpc_task *task,
+ 		return 0;
+ 	if (nfs4_set_rw_stateid(&hdr->args.stateid, hdr->args.context,
+ 				hdr->args.lock_context,
+-				hdr->rw_ops->rw_mode) == -EIO)
++				hdr->rw_mode) == -EIO)
+ 		return -EIO;
+ 	if (unlikely(test_bit(NFS_CONTEXT_BAD, &hdr->args.context->flags)))
+ 		return -EIO;
+diff --git a/fs/nfs/pagelist.c b/fs/nfs/pagelist.c
+index 3fb4b786ff75..9b3f190688b1 100644
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@ -696,11 +696,11 @@ void nfs_pageio_init(struct nfs_pageio_descriptor *desc,
+ 		     const struct nfs_pgio_completion_ops *compl_ops,
+ 		     const struct nfs_rw_ops *rw_ops,
+ 		     size_t bsize,
+-		     int io_flags)
++		     int io_flags,
++		     gfp_t gfp_flags)
+ {
+ 	struct nfs_pgio_mirror *new;
+ 	int i;
+-	gfp_t gfp_flags = GFP_KERNEL;
+ 
+ 	desc->pg_moreio = 0;
+ 	desc->pg_inode = inode;
+@@ -720,8 +720,6 @@ void nfs_pageio_init(struct nfs_pageio_descriptor *desc,
+ 	if (pg_ops->pg_get_mirror_count) {
+ 		/* until we have a request, we don't have an lseg and no
+ 		 * idea how many mirrors there will be */
+-		if (desc->pg_rw_ops->rw_mode == FMODE_WRITE)
+-			gfp_flags = GFP_NOIO;
+ 		new = kcalloc(NFS_PAGEIO_DESCRIPTOR_MIRROR_MAX,
+ 			      sizeof(struct nfs_pgio_mirror), gfp_flags);
+ 		desc->pg_mirrors_dynamic = new;
+@@ -785,7 +783,7 @@ int nfs_generic_pgio(struct nfs_pageio_descriptor *desc,
+ 	if (pagecount <= ARRAY_SIZE(pg_array->page_array))
+ 		pg_array->pagevec = pg_array->page_array;
+ 	else {
+-		if (desc->pg_rw_ops->rw_mode == FMODE_WRITE)
++		if (hdr->rw_mode == FMODE_WRITE)
+ 			gfp_flags = GFP_NOIO;
+ 		pg_array->pagevec = kcalloc(pagecount, sizeof(struct page *), gfp_flags);
+ 		if (!pg_array->pagevec) {
+diff --git a/fs/nfs/read.c b/fs/nfs/read.c
+index 54c427a55527..0afaceb9c83e 100644
+--- a/fs/nfs/read.c
++++ b/fs/nfs/read.c
+@@ -35,7 +35,11 @@ static struct kmem_cache *nfs_rdata_cachep;
+ 
+ static struct nfs_pgio_header *nfs_readhdr_alloc(void)
+ {
+-	return kmem_cache_zalloc(nfs_rdata_cachep, GFP_KERNEL);
++	struct nfs_pgio_header *p = kmem_cache_zalloc(nfs_rdata_cachep, GFP_KERNEL);
++
++	if (p)
++		p->rw_mode = FMODE_READ;
++	return p;
+ }
+ 
+ static void nfs_readhdr_free(struct nfs_pgio_header *rhdr)
+@@ -64,7 +68,7 @@ void nfs_pageio_init_read(struct nfs_pageio_descriptor *pgio,
+ 		pg_ops = server->pnfs_curr_ld->pg_read_ops;
+ #endif
+ 	nfs_pageio_init(pgio, inode, pg_ops, compl_ops, &nfs_rw_read_ops,
+-			server->rsize, 0);
++			server->rsize, 0, GFP_KERNEL);
+ }
+ EXPORT_SYMBOL_GPL(nfs_pageio_init_read);
+ 
+@@ -451,7 +455,6 @@ void nfs_destroy_readpagecache(void)
+ }
+ 
+ static const struct nfs_rw_ops nfs_rw_read_ops = {
+-	.rw_mode		= FMODE_READ,
+ 	.rw_alloc_header	= nfs_readhdr_alloc,
+ 	.rw_free_header		= nfs_readhdr_free,
+ 	.rw_done		= nfs_readpage_done,
+* Unmerged path fs/nfs/write.c
+diff --git a/include/linux/nfs_page.h b/include/linux/nfs_page.h
+index f2f650f136ee..1827000947cc 100644
+--- a/include/linux/nfs_page.h
++++ b/include/linux/nfs_page.h
+@@ -64,7 +64,6 @@ struct nfs_pageio_ops {
+ };
+ 
+ struct nfs_rw_ops {
+-	const fmode_t rw_mode;
+ 	struct nfs_pgio_header *(*rw_alloc_header)(void);
+ 	void (*rw_free_header)(struct nfs_pgio_header *);
+ 	int  (*rw_done)(struct rpc_task *, struct nfs_pgio_header *,
+@@ -124,7 +123,8 @@ extern	void nfs_pageio_init(struct nfs_pageio_descriptor *desc,
+ 			     const struct nfs_pgio_completion_ops *compl_ops,
+ 			     const struct nfs_rw_ops *rw_ops,
+ 			     size_t bsize,
+-			     int how);
++			     int how,
++			     gfp_t gfp_flags);
+ extern	int nfs_pageio_add_request(struct nfs_pageio_descriptor *,
+ 				   struct nfs_page *);
+ extern  int nfs_pageio_resend(struct nfs_pageio_descriptor *,
+diff --git a/include/linux/nfs_xdr.h b/include/linux/nfs_xdr.h
+index ec4603fd2a1c..2293c9d2fcb8 100644
+--- a/include/linux/nfs_xdr.h
++++ b/include/linux/nfs_xdr.h
+@@ -1385,6 +1385,7 @@ struct nfs_pgio_header {
+ 	struct list_head	pages;
+ 	struct nfs_page		*req;
+ 	struct nfs_writeverf	verf;		/* Used for writes */
++	fmode_t			rw_mode;
+ 	struct pnfs_layout_segment *lseg;
+ 	loff_t			io_start;
+ 	const struct rpc_call_ops *mds_ops;
