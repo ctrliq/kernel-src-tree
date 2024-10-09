@@ -1,0 +1,1036 @@
+amd-xgbe: Mask auto-negotiation interrupts in ISR
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit ced3fcae693b563b20ee8d2dba966760e6b771d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/ced3fcae.failed
+
+Currently the auto-negotiation interrupt handling disables the irq
+instead of masking off the interrupts. This was done because the phy
+library was originally used to read and write the PCS registers, which
+could not be performed in interrupt context. Now that the phy library is
+no longer used to read and write the PCS registers the interrupts can be
+masked off in the interrupt service routine eliminating the need to call
+disable_irq/enable_irq. This also requires changing the protection mutex
+to a spinlock.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ced3fcae693b563b20ee8d2dba966760e6b771d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-main.c
+#	drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
+#	drivers/net/ethernet/amd/xgbe/xgbe.h
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-main.c
+index 51cdca78ec38,3eee3201b58f..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-main.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-main.c
+@@@ -245,7 -363,39 +245,43 @@@ static int xgbe_probe(struct platform_d
+  	platform_set_drvdata(pdev, netdev);
+  
+  	spin_lock_init(&pdata->lock);
+++<<<<<<< HEAD
+ +	mutex_init(&pdata->xpcs_mutex);
+++=======
++ 	spin_lock_init(&pdata->xpcs_lock);
++ 	mutex_init(&pdata->rss_mutex);
++ 	spin_lock_init(&pdata->tstamp_lock);
++ 
++ 	pdata->msg_enable = netif_msg_init(debug, default_msg_level);
++ 
++ 	set_bit(XGBE_DOWN, &pdata->dev_state);
++ 
++ 	/* Check if we should use ACPI or DT */
++ 	pdata->use_acpi = dev->of_node ? 0 : 1;
++ 
++ 	phy_pdev = xgbe_get_phy_pdev(pdata);
++ 	if (!phy_pdev) {
++ 		dev_err(dev, "unable to obtain phy device\n");
++ 		ret = -EINVAL;
++ 		goto err_phydev;
++ 	}
++ 	phy_dev = &phy_pdev->dev;
++ 
++ 	if (pdev == phy_pdev) {
++ 		/* New style device tree or ACPI:
++ 		 *   The XGBE and PHY resources are grouped together with
++ 		 *   the PHY resources listed last
++ 		 */
++ 		phy_memnum = xgbe_resource_count(pdev, IORESOURCE_MEM) - 3;
++ 		phy_irqnum = xgbe_resource_count(pdev, IORESOURCE_IRQ) - 1;
++ 	} else {
++ 		/* Old style device tree:
++ 		 *   The XGBE and PHY resources are separate
++ 		 */
++ 		phy_memnum = 0;
++ 		phy_irqnum = 0;
++ 	}
+++>>>>>>> ced3fcae693b (amd-xgbe: Mask auto-negotiation interrupts in ISR)
+  
+  	/* Set and validate the number of descriptors for a ring */
+  	BUILD_BUG_ON_NOT_POWER_OF_2(XGBE_TX_DESC_CNT);
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
+index 8514b5841ecd,84c5d296d13e..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
+@@@ -124,73 -125,766 +124,799 @@@
+  #include "xgbe.h"
+  #include "xgbe-common.h"
+  
+ -static void xgbe_an_enable_kr_training(struct xgbe_prv_data *pdata)
+ +
+ +static int xgbe_mdio_read(struct mii_bus *mii, int prtad, int mmd_reg)
+  {
+ -	unsigned int reg;
+ +	struct xgbe_prv_data *pdata = mii->priv;
+ +	struct xgbe_hw_if *hw_if = &pdata->hw_if;
+ +	int mmd_data;
+  
+ -	reg = XMDIO_READ(pdata, MDIO_MMD_PMAPMD, MDIO_PMA_10GBR_PMD_CTRL);
+ +	DBGPR_MDIO("-->xgbe_mdio_read: prtad=%#x mmd_reg=%#x\n",
+ +		   prtad, mmd_reg);
+ +
+ +	mmd_data = hw_if->read_mmd_regs(pdata, prtad, mmd_reg);
+ +
+ +	DBGPR_MDIO("<--xgbe_mdio_read: mmd_data=%#x\n", mmd_data);
+  
+ -	reg |= XGBE_KR_TRAINING_ENABLE;
+ -	XMDIO_WRITE(pdata, MDIO_MMD_PMAPMD, MDIO_PMA_10GBR_PMD_CTRL, reg);
+ +	return mmd_data;
+  }
+  
+ -static void xgbe_an_disable_kr_training(struct xgbe_prv_data *pdata)
+ +static int xgbe_mdio_write(struct mii_bus *mii, int prtad, int mmd_reg,
+ +			   u16 mmd_val)
+  {
+ -	unsigned int reg;
+ +	struct xgbe_prv_data *pdata = mii->priv;
+ +	struct xgbe_hw_if *hw_if = &pdata->hw_if;
+ +	int mmd_data = mmd_val;
+  
+ -	reg = XMDIO_READ(pdata, MDIO_MMD_PMAPMD, MDIO_PMA_10GBR_PMD_CTRL);
+ +	DBGPR_MDIO("-->xgbe_mdio_write: prtad=%#x mmd_reg=%#x mmd_data=%#x\n",
+ +		   prtad, mmd_reg, mmd_data);
+ +
+ +	hw_if->write_mmd_regs(pdata, prtad, mmd_reg, mmd_data);
+  
+ -	reg &= ~XGBE_KR_TRAINING_ENABLE;
+ -	XMDIO_WRITE(pdata, MDIO_MMD_PMAPMD, MDIO_PMA_10GBR_PMD_CTRL, reg);
+ +	DBGPR_MDIO("<--xgbe_mdio_write\n");
+ +
+ +	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void xgbe_adjust_link(struct net_device *netdev)
+++=======
++ static void xgbe_pcs_power_cycle(struct xgbe_prv_data *pdata)
++ {
++ 	unsigned int reg;
++ 
++ 	reg = XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_CTRL1);
++ 
++ 	reg |= MDIO_CTRL1_LPOWER;
++ 	XMDIO_WRITE(pdata, MDIO_MMD_PCS, MDIO_CTRL1, reg);
++ 
++ 	usleep_range(75, 100);
++ 
++ 	reg &= ~MDIO_CTRL1_LPOWER;
++ 	XMDIO_WRITE(pdata, MDIO_MMD_PCS, MDIO_CTRL1, reg);
++ }
++ 
++ static void xgbe_serdes_start_ratechange(struct xgbe_prv_data *pdata)
++ {
++ 	/* Assert Rx and Tx ratechange */
++ 	XSIR1_IOWRITE_BITS(pdata, SIR1_SPEED, RATECHANGE, 1);
++ }
++ 
++ static void xgbe_serdes_complete_ratechange(struct xgbe_prv_data *pdata)
++ {
++ 	unsigned int wait;
++ 	u16 status;
++ 
++ 	/* Release Rx and Tx ratechange */
++ 	XSIR1_IOWRITE_BITS(pdata, SIR1_SPEED, RATECHANGE, 0);
++ 
++ 	/* Wait for Rx and Tx ready */
++ 	wait = XGBE_RATECHANGE_COUNT;
++ 	while (wait--) {
++ 		usleep_range(50, 75);
++ 
++ 		status = XSIR0_IOREAD(pdata, SIR0_STATUS);
++ 		if (XSIR_GET_BITS(status, SIR0_STATUS, RX_READY) &&
++ 		    XSIR_GET_BITS(status, SIR0_STATUS, TX_READY))
++ 			goto rx_reset;
++ 	}
++ 
++ 	netif_dbg(pdata, link, pdata->netdev, "SerDes rx/tx not ready (%#hx)\n",
++ 		  status);
++ 
++ rx_reset:
++ 	/* Perform Rx reset for the DFE changes */
++ 	XRXTX_IOWRITE_BITS(pdata, RXTX_REG6, RESETB_RXD, 0);
++ 	XRXTX_IOWRITE_BITS(pdata, RXTX_REG6, RESETB_RXD, 1);
++ }
++ 
++ static void xgbe_xgmii_mode(struct xgbe_prv_data *pdata)
++ {
++ 	unsigned int reg;
++ 
++ 	/* Enable KR training */
++ 	xgbe_an_enable_kr_training(pdata);
++ 
++ 	/* Set MAC to 10G speed */
++ 	pdata->hw_if.set_xgmii_speed(pdata);
++ 
++ 	/* Set PCS to KR/10G speed */
++ 	reg = XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_CTRL2);
++ 	reg &= ~MDIO_PCS_CTRL2_TYPE;
++ 	reg |= MDIO_PCS_CTRL2_10GBR;
++ 	XMDIO_WRITE(pdata, MDIO_MMD_PCS, MDIO_CTRL2, reg);
++ 
++ 	reg = XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_CTRL1);
++ 	reg &= ~MDIO_CTRL1_SPEEDSEL;
++ 	reg |= MDIO_CTRL1_SPEED10G;
++ 	XMDIO_WRITE(pdata, MDIO_MMD_PCS, MDIO_CTRL1, reg);
++ 
++ 	xgbe_pcs_power_cycle(pdata);
++ 
++ 	/* Set SerDes to 10G speed */
++ 	xgbe_serdes_start_ratechange(pdata);
++ 
++ 	XSIR1_IOWRITE_BITS(pdata, SIR1_SPEED, DATARATE, XGBE_SPEED_10000_RATE);
++ 	XSIR1_IOWRITE_BITS(pdata, SIR1_SPEED, WORDMODE, XGBE_SPEED_10000_WORD);
++ 	XSIR1_IOWRITE_BITS(pdata, SIR1_SPEED, PLLSEL, XGBE_SPEED_10000_PLL);
++ 
++ 	XSIR1_IOWRITE_BITS(pdata, SIR1_SPEED, CDR_RATE,
++ 			   pdata->serdes_cdr_rate[XGBE_SPEED_10000]);
++ 	XSIR1_IOWRITE_BITS(pdata, SIR1_SPEED, TXAMP,
++ 			   pdata->serdes_tx_amp[XGBE_SPEED_10000]);
++ 	XRXTX_IOWRITE_BITS(pdata, RXTX_REG20, BLWC_ENA,
++ 			   pdata->serdes_blwc[XGBE_SPEED_10000]);
++ 	XRXTX_IOWRITE_BITS(pdata, RXTX_REG114, PQ_REG,
++ 			   pdata->serdes_pq_skew[XGBE_SPEED_10000]);
++ 	XRXTX_IOWRITE_BITS(pdata, RXTX_REG129, RXDFE_CONFIG,
++ 			   pdata->serdes_dfe_tap_cfg[XGBE_SPEED_10000]);
++ 	XRXTX_IOWRITE(pdata, RXTX_REG22,
++ 		      pdata->serdes_dfe_tap_ena[XGBE_SPEED_10000]);
++ 
++ 	xgbe_serdes_complete_ratechange(pdata);
++ 
++ 	netif_dbg(pdata, link, pdata->netdev, "10GbE KR mode set\n");
++ }
++ 
++ static void xgbe_gmii_2500_mode(struct xgbe_prv_data *pdata)
++ {
++ 	unsigned int reg;
++ 
++ 	/* Disable KR training */
++ 	xgbe_an_disable_kr_training(pdata);
++ 
++ 	/* Set MAC to 2.5G speed */
++ 	pdata->hw_if.set_gmii_2500_speed(pdata);
++ 
++ 	/* Set PCS to KX/1G speed */
++ 	reg = XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_CTRL2);
++ 	reg &= ~MDIO_PCS_CTRL2_TYPE;
++ 	reg |= MDIO_PCS_CTRL2_10GBX;
++ 	XMDIO_WRITE(pdata, MDIO_MMD_PCS, MDIO_CTRL2, reg);
++ 
++ 	reg = XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_CTRL1);
++ 	reg &= ~MDIO_CTRL1_SPEEDSEL;
++ 	reg |= MDIO_CTRL1_SPEED1G;
++ 	XMDIO_WRITE(pdata, MDIO_MMD_PCS, MDIO_CTRL1, reg);
++ 
++ 	xgbe_pcs_power_cycle(pdata);
++ 
++ 	/* Set SerDes to 2.5G speed */
++ 	xgbe_serdes_start_ratechange(pdata);
++ 
++ 	XSIR1_IOWRITE_BITS(pdata, SIR1_SPEED, DATARATE, XGBE_SPEED_2500_RATE);
++ 	XSIR1_IOWRITE_BITS(pdata, SIR1_SPEED, WORDMODE, XGBE_SPEED_2500_WORD);
++ 	XSIR1_IOWRITE_BITS(pdata, SIR1_SPEED, PLLSEL, XGBE_SPEED_2500_PLL);
++ 
++ 	XSIR1_IOWRITE_BITS(pdata, SIR1_SPEED, CDR_RATE,
++ 			   pdata->serdes_cdr_rate[XGBE_SPEED_2500]);
++ 	XSIR1_IOWRITE_BITS(pdata, SIR1_SPEED, TXAMP,
++ 			   pdata->serdes_tx_amp[XGBE_SPEED_2500]);
++ 	XRXTX_IOWRITE_BITS(pdata, RXTX_REG20, BLWC_ENA,
++ 			   pdata->serdes_blwc[XGBE_SPEED_2500]);
++ 	XRXTX_IOWRITE_BITS(pdata, RXTX_REG114, PQ_REG,
++ 			   pdata->serdes_pq_skew[XGBE_SPEED_2500]);
++ 	XRXTX_IOWRITE_BITS(pdata, RXTX_REG129, RXDFE_CONFIG,
++ 			   pdata->serdes_dfe_tap_cfg[XGBE_SPEED_2500]);
++ 	XRXTX_IOWRITE(pdata, RXTX_REG22,
++ 		      pdata->serdes_dfe_tap_ena[XGBE_SPEED_2500]);
++ 
++ 	xgbe_serdes_complete_ratechange(pdata);
++ 
++ 	netif_dbg(pdata, link, pdata->netdev, "2.5GbE KX mode set\n");
++ }
++ 
++ static void xgbe_gmii_mode(struct xgbe_prv_data *pdata)
++ {
++ 	unsigned int reg;
++ 
++ 	/* Disable KR training */
++ 	xgbe_an_disable_kr_training(pdata);
++ 
++ 	/* Set MAC to 1G speed */
++ 	pdata->hw_if.set_gmii_speed(pdata);
++ 
++ 	/* Set PCS to KX/1G speed */
++ 	reg = XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_CTRL2);
++ 	reg &= ~MDIO_PCS_CTRL2_TYPE;
++ 	reg |= MDIO_PCS_CTRL2_10GBX;
++ 	XMDIO_WRITE(pdata, MDIO_MMD_PCS, MDIO_CTRL2, reg);
++ 
++ 	reg = XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_CTRL1);
++ 	reg &= ~MDIO_CTRL1_SPEEDSEL;
++ 	reg |= MDIO_CTRL1_SPEED1G;
++ 	XMDIO_WRITE(pdata, MDIO_MMD_PCS, MDIO_CTRL1, reg);
++ 
++ 	xgbe_pcs_power_cycle(pdata);
++ 
++ 	/* Set SerDes to 1G speed */
++ 	xgbe_serdes_start_ratechange(pdata);
++ 
++ 	XSIR1_IOWRITE_BITS(pdata, SIR1_SPEED, DATARATE, XGBE_SPEED_1000_RATE);
++ 	XSIR1_IOWRITE_BITS(pdata, SIR1_SPEED, WORDMODE, XGBE_SPEED_1000_WORD);
++ 	XSIR1_IOWRITE_BITS(pdata, SIR1_SPEED, PLLSEL, XGBE_SPEED_1000_PLL);
++ 
++ 	XSIR1_IOWRITE_BITS(pdata, SIR1_SPEED, CDR_RATE,
++ 			   pdata->serdes_cdr_rate[XGBE_SPEED_1000]);
++ 	XSIR1_IOWRITE_BITS(pdata, SIR1_SPEED, TXAMP,
++ 			   pdata->serdes_tx_amp[XGBE_SPEED_1000]);
++ 	XRXTX_IOWRITE_BITS(pdata, RXTX_REG20, BLWC_ENA,
++ 			   pdata->serdes_blwc[XGBE_SPEED_1000]);
++ 	XRXTX_IOWRITE_BITS(pdata, RXTX_REG114, PQ_REG,
++ 			   pdata->serdes_pq_skew[XGBE_SPEED_1000]);
++ 	XRXTX_IOWRITE_BITS(pdata, RXTX_REG129, RXDFE_CONFIG,
++ 			   pdata->serdes_dfe_tap_cfg[XGBE_SPEED_1000]);
++ 	XRXTX_IOWRITE(pdata, RXTX_REG22,
++ 		      pdata->serdes_dfe_tap_ena[XGBE_SPEED_1000]);
++ 
++ 	xgbe_serdes_complete_ratechange(pdata);
++ 
++ 	netif_dbg(pdata, link, pdata->netdev, "1GbE KX mode set\n");
++ }
++ 
++ static void xgbe_cur_mode(struct xgbe_prv_data *pdata,
++ 			  enum xgbe_mode *mode)
++ {
++ 	unsigned int reg;
++ 
++ 	reg = XMDIO_READ(pdata, MDIO_MMD_PCS, MDIO_CTRL2);
++ 	if ((reg & MDIO_PCS_CTRL2_TYPE) == MDIO_PCS_CTRL2_10GBR)
++ 		*mode = XGBE_MODE_KR;
++ 	else
++ 		*mode = XGBE_MODE_KX;
++ }
++ 
++ static bool xgbe_in_kr_mode(struct xgbe_prv_data *pdata)
++ {
++ 	enum xgbe_mode mode;
++ 
++ 	xgbe_cur_mode(pdata, &mode);
++ 
++ 	return (mode == XGBE_MODE_KR);
++ }
++ 
++ static void xgbe_switch_mode(struct xgbe_prv_data *pdata)
++ {
++ 	/* If we are in KR switch to KX, and vice-versa */
++ 	if (xgbe_in_kr_mode(pdata)) {
++ 		if (pdata->speed_set == XGBE_SPEEDSET_1000_10000)
++ 			xgbe_gmii_mode(pdata);
++ 		else
++ 			xgbe_gmii_2500_mode(pdata);
++ 	} else {
++ 		xgbe_xgmii_mode(pdata);
++ 	}
++ }
++ 
++ static void xgbe_set_mode(struct xgbe_prv_data *pdata,
++ 			  enum xgbe_mode mode)
++ {
++ 	enum xgbe_mode cur_mode;
++ 
++ 	xgbe_cur_mode(pdata, &cur_mode);
++ 	if (mode != cur_mode)
++ 		xgbe_switch_mode(pdata);
++ }
++ 
++ static bool xgbe_use_xgmii_mode(struct xgbe_prv_data *pdata)
++ {
++ 	if (pdata->phy.autoneg == AUTONEG_ENABLE) {
++ 		if (pdata->phy.advertising & ADVERTISED_10000baseKR_Full)
++ 			return true;
++ 	} else {
++ 		if (pdata->phy.speed == SPEED_10000)
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static bool xgbe_use_gmii_2500_mode(struct xgbe_prv_data *pdata)
++ {
++ 	if (pdata->phy.autoneg == AUTONEG_ENABLE) {
++ 		if (pdata->phy.advertising & ADVERTISED_2500baseX_Full)
++ 			return true;
++ 	} else {
++ 		if (pdata->phy.speed == SPEED_2500)
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static bool xgbe_use_gmii_mode(struct xgbe_prv_data *pdata)
++ {
++ 	if (pdata->phy.autoneg == AUTONEG_ENABLE) {
++ 		if (pdata->phy.advertising & ADVERTISED_1000baseKX_Full)
++ 			return true;
++ 	} else {
++ 		if (pdata->phy.speed == SPEED_1000)
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static void xgbe_set_an(struct xgbe_prv_data *pdata, bool enable, bool restart)
++ {
++ 	unsigned int reg;
++ 
++ 	reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_CTRL1);
++ 	reg &= ~MDIO_AN_CTRL1_ENABLE;
++ 
++ 	if (enable)
++ 		reg |= MDIO_AN_CTRL1_ENABLE;
++ 
++ 	if (restart)
++ 		reg |= MDIO_AN_CTRL1_RESTART;
++ 
++ 	XMDIO_WRITE(pdata, MDIO_MMD_AN, MDIO_CTRL1, reg);
++ }
++ 
++ static void xgbe_restart_an(struct xgbe_prv_data *pdata)
++ {
++ 	xgbe_set_an(pdata, true, true);
++ 
++ 	netif_dbg(pdata, link, pdata->netdev, "AN enabled/restarted\n");
++ }
++ 
++ static void xgbe_disable_an(struct xgbe_prv_data *pdata)
++ {
++ 	xgbe_set_an(pdata, false, false);
++ 
++ 	netif_dbg(pdata, link, pdata->netdev, "AN disabled\n");
++ }
++ 
++ static enum xgbe_an xgbe_an_tx_training(struct xgbe_prv_data *pdata,
++ 					enum xgbe_rx *state)
++ {
++ 	unsigned int ad_reg, lp_reg, reg;
++ 
++ 	*state = XGBE_RX_COMPLETE;
++ 
++ 	/* If we're not in KR mode then we're done */
++ 	if (!xgbe_in_kr_mode(pdata))
++ 		return XGBE_AN_PAGE_RECEIVED;
++ 
++ 	/* Enable/Disable FEC */
++ 	ad_reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_ADVERTISE + 2);
++ 	lp_reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_LPA + 2);
++ 
++ 	reg = XMDIO_READ(pdata, MDIO_MMD_PMAPMD, MDIO_PMA_10GBR_FECCTRL);
++ 	reg &= ~(MDIO_PMA_10GBR_FECABLE_ABLE | MDIO_PMA_10GBR_FECABLE_ERRABLE);
++ 	if ((ad_reg & 0xc000) && (lp_reg & 0xc000))
++ 		reg |= pdata->fec_ability;
++ 
++ 	XMDIO_WRITE(pdata, MDIO_MMD_PMAPMD, MDIO_PMA_10GBR_FECCTRL, reg);
++ 
++ 	/* Start KR training */
++ 	reg = XMDIO_READ(pdata, MDIO_MMD_PMAPMD, MDIO_PMA_10GBR_PMD_CTRL);
++ 	if (reg & XGBE_KR_TRAINING_ENABLE) {
++ 		XSIR0_IOWRITE_BITS(pdata, SIR0_KR_RT_1, RESET, 1);
++ 
++ 		reg |= XGBE_KR_TRAINING_START;
++ 		XMDIO_WRITE(pdata, MDIO_MMD_PMAPMD, MDIO_PMA_10GBR_PMD_CTRL,
++ 			    reg);
++ 
++ 		XSIR0_IOWRITE_BITS(pdata, SIR0_KR_RT_1, RESET, 0);
++ 
++ 		netif_dbg(pdata, link, pdata->netdev,
++ 			  "KR training initiated\n");
++ 	}
++ 
++ 	return XGBE_AN_PAGE_RECEIVED;
++ }
++ 
++ static enum xgbe_an xgbe_an_tx_xnp(struct xgbe_prv_data *pdata,
++ 				   enum xgbe_rx *state)
++ {
++ 	u16 msg;
++ 
++ 	*state = XGBE_RX_XNP;
++ 
++ 	msg = XGBE_XNP_MCF_NULL_MESSAGE;
++ 	msg |= XGBE_XNP_MP_FORMATTED;
++ 
++ 	XMDIO_WRITE(pdata, MDIO_MMD_AN, MDIO_AN_XNP + 2, 0);
++ 	XMDIO_WRITE(pdata, MDIO_MMD_AN, MDIO_AN_XNP + 1, 0);
++ 	XMDIO_WRITE(pdata, MDIO_MMD_AN, MDIO_AN_XNP, msg);
++ 
++ 	return XGBE_AN_PAGE_RECEIVED;
++ }
++ 
++ static enum xgbe_an xgbe_an_rx_bpa(struct xgbe_prv_data *pdata,
++ 				   enum xgbe_rx *state)
++ {
++ 	unsigned int link_support;
++ 	unsigned int reg, ad_reg, lp_reg;
++ 
++ 	/* Read Base Ability register 2 first */
++ 	reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_LPA + 1);
++ 
++ 	/* Check for a supported mode, otherwise restart in a different one */
++ 	link_support = xgbe_in_kr_mode(pdata) ? 0x80 : 0x20;
++ 	if (!(reg & link_support))
++ 		return XGBE_AN_INCOMPAT_LINK;
++ 
++ 	/* Check Extended Next Page support */
++ 	ad_reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_ADVERTISE);
++ 	lp_reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_LPA);
++ 
++ 	return ((ad_reg & XGBE_XNP_NP_EXCHANGE) ||
++ 		(lp_reg & XGBE_XNP_NP_EXCHANGE))
++ 	       ? xgbe_an_tx_xnp(pdata, state)
++ 	       : xgbe_an_tx_training(pdata, state);
++ }
++ 
++ static enum xgbe_an xgbe_an_rx_xnp(struct xgbe_prv_data *pdata,
++ 				   enum xgbe_rx *state)
++ {
++ 	unsigned int ad_reg, lp_reg;
++ 
++ 	/* Check Extended Next Page support */
++ 	ad_reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_XNP);
++ 	lp_reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_LPX);
++ 
++ 	return ((ad_reg & XGBE_XNP_NP_EXCHANGE) ||
++ 		(lp_reg & XGBE_XNP_NP_EXCHANGE))
++ 	       ? xgbe_an_tx_xnp(pdata, state)
++ 	       : xgbe_an_tx_training(pdata, state);
++ }
++ 
++ static enum xgbe_an xgbe_an_page_received(struct xgbe_prv_data *pdata)
++ {
++ 	enum xgbe_rx *state;
++ 	unsigned long an_timeout;
++ 	enum xgbe_an ret;
++ 
++ 	if (!pdata->an_start) {
++ 		pdata->an_start = jiffies;
++ 	} else {
++ 		an_timeout = pdata->an_start +
++ 			     msecs_to_jiffies(XGBE_AN_MS_TIMEOUT);
++ 		if (time_after(jiffies, an_timeout)) {
++ 			/* Auto-negotiation timed out, reset state */
++ 			pdata->kr_state = XGBE_RX_BPA;
++ 			pdata->kx_state = XGBE_RX_BPA;
++ 
++ 			pdata->an_start = jiffies;
++ 
++ 			netif_dbg(pdata, link, pdata->netdev,
++ 				  "AN timed out, resetting state\n");
++ 		}
++ 	}
++ 
++ 	state = xgbe_in_kr_mode(pdata) ? &pdata->kr_state
++ 					   : &pdata->kx_state;
++ 
++ 	switch (*state) {
++ 	case XGBE_RX_BPA:
++ 		ret = xgbe_an_rx_bpa(pdata, state);
++ 		break;
++ 
++ 	case XGBE_RX_XNP:
++ 		ret = xgbe_an_rx_xnp(pdata, state);
++ 		break;
++ 
++ 	default:
++ 		ret = XGBE_AN_ERROR;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static enum xgbe_an xgbe_an_incompat_link(struct xgbe_prv_data *pdata)
++ {
++ 	/* Be sure we aren't looping trying to negotiate */
++ 	if (xgbe_in_kr_mode(pdata)) {
++ 		pdata->kr_state = XGBE_RX_ERROR;
++ 
++ 		if (!(pdata->phy.advertising & ADVERTISED_1000baseKX_Full) &&
++ 		    !(pdata->phy.advertising & ADVERTISED_2500baseX_Full))
++ 			return XGBE_AN_NO_LINK;
++ 
++ 		if (pdata->kx_state != XGBE_RX_BPA)
++ 			return XGBE_AN_NO_LINK;
++ 	} else {
++ 		pdata->kx_state = XGBE_RX_ERROR;
++ 
++ 		if (!(pdata->phy.advertising & ADVERTISED_10000baseKR_Full))
++ 			return XGBE_AN_NO_LINK;
++ 
++ 		if (pdata->kr_state != XGBE_RX_BPA)
++ 			return XGBE_AN_NO_LINK;
++ 	}
++ 
++ 	xgbe_disable_an(pdata);
++ 
++ 	xgbe_switch_mode(pdata);
++ 
++ 	xgbe_restart_an(pdata);
++ 
++ 	return XGBE_AN_INCOMPAT_LINK;
++ }
++ 
++ static irqreturn_t xgbe_an_isr(int irq, void *data)
++ {
++ 	struct xgbe_prv_data *pdata = (struct xgbe_prv_data *)data;
++ 
++ 	netif_dbg(pdata, intr, pdata->netdev, "AN interrupt received\n");
++ 
++ 	/* Disable AN interrupts */
++ 	XMDIO_WRITE(pdata, MDIO_MMD_AN, MDIO_AN_INTMASK, 0);
++ 
++ 	/* Save the interrupt(s) that fired */
++ 	pdata->an_int = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_INT);
++ 
++ 	if (pdata->an_int) {
++ 		/* Clear the interrupt(s) that fired and process them */
++ 		XMDIO_WRITE(pdata, MDIO_MMD_AN, MDIO_AN_INT, ~pdata->an_int);
++ 
++ 		queue_work(pdata->an_workqueue, &pdata->an_irq_work);
++ 	} else {
++ 		/* Enable AN interrupts */
++ 		XMDIO_WRITE(pdata, MDIO_MMD_AN, MDIO_AN_INTMASK,
++ 			    XGBE_AN_INT_MASK);
++ 	}
++ 
++ 	return IRQ_HANDLED;
++ }
++ 
++ static void xgbe_an_irq_work(struct work_struct *work)
++ {
++ 	struct xgbe_prv_data *pdata = container_of(work,
++ 						   struct xgbe_prv_data,
++ 						   an_irq_work);
++ 
++ 	/* Avoid a race between enabling the IRQ and exiting the work by
++ 	 * waiting for the work to finish and then queueing it
++ 	 */
++ 	flush_work(&pdata->an_work);
++ 	queue_work(pdata->an_workqueue, &pdata->an_work);
++ }
++ 
++ static const char *xgbe_state_as_string(enum xgbe_an state)
++ {
++ 	switch (state) {
++ 	case XGBE_AN_READY:
++ 		return "Ready";
++ 	case XGBE_AN_PAGE_RECEIVED:
++ 		return "Page-Received";
++ 	case XGBE_AN_INCOMPAT_LINK:
++ 		return "Incompatible-Link";
++ 	case XGBE_AN_COMPLETE:
++ 		return "Complete";
++ 	case XGBE_AN_NO_LINK:
++ 		return "No-Link";
++ 	case XGBE_AN_ERROR:
++ 		return "Error";
++ 	default:
++ 		return "Undefined";
++ 	}
++ }
++ 
++ static void xgbe_an_state_machine(struct work_struct *work)
++ {
++ 	struct xgbe_prv_data *pdata = container_of(work,
++ 						   struct xgbe_prv_data,
++ 						   an_work);
++ 	enum xgbe_an cur_state = pdata->an_state;
++ 
++ 	mutex_lock(&pdata->an_mutex);
++ 
++ 	if (!pdata->an_int)
++ 		goto out;
++ 
++ next_int:
++ 	if (pdata->an_int & XGBE_AN_PG_RCV) {
++ 		pdata->an_state = XGBE_AN_PAGE_RECEIVED;
++ 		pdata->an_int &= ~XGBE_AN_PG_RCV;
++ 	} else if (pdata->an_int & XGBE_AN_INC_LINK) {
++ 		pdata->an_state = XGBE_AN_INCOMPAT_LINK;
++ 		pdata->an_int &= ~XGBE_AN_INC_LINK;
++ 	} else if (pdata->an_int & XGBE_AN_INT_CMPLT) {
++ 		pdata->an_state = XGBE_AN_COMPLETE;
++ 		pdata->an_int &= ~XGBE_AN_INT_CMPLT;
++ 	} else {
++ 		pdata->an_state = XGBE_AN_ERROR;
++ 	}
++ 
++ 	pdata->an_result = pdata->an_state;
++ 
++ again:
++ 	netif_dbg(pdata, link, pdata->netdev, "AN %s\n",
++ 		  xgbe_state_as_string(pdata->an_state));
++ 
++ 	cur_state = pdata->an_state;
++ 
++ 	switch (pdata->an_state) {
++ 	case XGBE_AN_READY:
++ 		pdata->an_supported = 0;
++ 		break;
++ 
++ 	case XGBE_AN_PAGE_RECEIVED:
++ 		pdata->an_state = xgbe_an_page_received(pdata);
++ 		pdata->an_supported++;
++ 		break;
++ 
++ 	case XGBE_AN_INCOMPAT_LINK:
++ 		pdata->an_supported = 0;
++ 		pdata->parallel_detect = 0;
++ 		pdata->an_state = xgbe_an_incompat_link(pdata);
++ 		break;
++ 
++ 	case XGBE_AN_COMPLETE:
++ 		pdata->parallel_detect = pdata->an_supported ? 0 : 1;
++ 		netif_dbg(pdata, link, pdata->netdev, "%s successful\n",
++ 			  pdata->an_supported ? "Auto negotiation"
++ 					      : "Parallel detection");
++ 		break;
++ 
++ 	case XGBE_AN_NO_LINK:
++ 		break;
++ 
++ 	default:
++ 		pdata->an_state = XGBE_AN_ERROR;
++ 	}
++ 
++ 	if (pdata->an_state == XGBE_AN_NO_LINK) {
++ 		pdata->an_int = 0;
++ 		XMDIO_WRITE(pdata, MDIO_MMD_AN, MDIO_AN_INT, 0);
++ 	} else if (pdata->an_state == XGBE_AN_ERROR) {
++ 		netdev_err(pdata->netdev,
++ 			   "error during auto-negotiation, state=%u\n",
++ 			   cur_state);
++ 
++ 		pdata->an_int = 0;
++ 		XMDIO_WRITE(pdata, MDIO_MMD_AN, MDIO_AN_INT, 0);
++ 	}
++ 
++ 	if (pdata->an_state >= XGBE_AN_COMPLETE) {
++ 		pdata->an_result = pdata->an_state;
++ 		pdata->an_state = XGBE_AN_READY;
++ 		pdata->kr_state = XGBE_RX_BPA;
++ 		pdata->kx_state = XGBE_RX_BPA;
++ 		pdata->an_start = 0;
++ 
++ 		netif_dbg(pdata, link, pdata->netdev, "AN result: %s\n",
++ 			  xgbe_state_as_string(pdata->an_result));
++ 	}
++ 
++ 	if (cur_state != pdata->an_state)
++ 		goto again;
++ 
++ 	if (pdata->an_int)
++ 		goto next_int;
++ 
++ out:
++ 	/* Enable AN interrupts on the way out */
++ 	XMDIO_WRITE(pdata, MDIO_MMD_AN, MDIO_AN_INTMASK, XGBE_AN_INT_MASK);
++ 
++ 	mutex_unlock(&pdata->an_mutex);
++ }
++ 
++ static void xgbe_an_init(struct xgbe_prv_data *pdata)
++ {
++ 	unsigned int reg;
++ 
++ 	/* Set up Advertisement register 3 first */
++ 	reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_ADVERTISE + 2);
++ 	if (pdata->phy.advertising & ADVERTISED_10000baseR_FEC)
++ 		reg |= 0xc000;
++ 	else
++ 		reg &= ~0xc000;
++ 
++ 	XMDIO_WRITE(pdata, MDIO_MMD_AN, MDIO_AN_ADVERTISE + 2, reg);
++ 
++ 	/* Set up Advertisement register 2 next */
++ 	reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_ADVERTISE + 1);
++ 	if (pdata->phy.advertising & ADVERTISED_10000baseKR_Full)
++ 		reg |= 0x80;
++ 	else
++ 		reg &= ~0x80;
++ 
++ 	if ((pdata->phy.advertising & ADVERTISED_1000baseKX_Full) ||
++ 	    (pdata->phy.advertising & ADVERTISED_2500baseX_Full))
++ 		reg |= 0x20;
++ 	else
++ 		reg &= ~0x20;
++ 
++ 	XMDIO_WRITE(pdata, MDIO_MMD_AN, MDIO_AN_ADVERTISE + 1, reg);
++ 
++ 	/* Set up Advertisement register 1 last */
++ 	reg = XMDIO_READ(pdata, MDIO_MMD_AN, MDIO_AN_ADVERTISE);
++ 	if (pdata->phy.advertising & ADVERTISED_Pause)
++ 		reg |= 0x400;
++ 	else
++ 		reg &= ~0x400;
++ 
++ 	if (pdata->phy.advertising & ADVERTISED_Asym_Pause)
++ 		reg |= 0x800;
++ 	else
++ 		reg &= ~0x800;
++ 
++ 	/* We don't intend to perform XNP */
++ 	reg &= ~XGBE_XNP_NP_EXCHANGE;
++ 
++ 	XMDIO_WRITE(pdata, MDIO_MMD_AN, MDIO_AN_ADVERTISE, reg);
++ 
++ 	netif_dbg(pdata, link, pdata->netdev, "AN initialized\n");
++ }
++ 
++ static const char *xgbe_phy_fc_string(struct xgbe_prv_data *pdata)
++ {
++ 	if (pdata->tx_pause && pdata->rx_pause)
++ 		return "rx/tx";
++ 	else if (pdata->rx_pause)
++ 		return "rx";
++ 	else if (pdata->tx_pause)
++ 		return "tx";
++ 	else
++ 		return "off";
++ }
++ 
++ static const char *xgbe_phy_speed_string(int speed)
++ {
++ 	switch (speed) {
++ 	case SPEED_1000:
++ 		return "1Gbps";
++ 	case SPEED_2500:
++ 		return "2.5Gbps";
++ 	case SPEED_10000:
++ 		return "10Gbps";
++ 	case SPEED_UNKNOWN:
++ 		return "Unknown";
++ 	default:
++ 		return "Unsupported";
++ 	}
++ }
++ 
++ static void xgbe_phy_print_status(struct xgbe_prv_data *pdata)
++ {
++ 	if (pdata->phy.link)
++ 		netdev_info(pdata->netdev,
++ 			    "Link is Up - %s/%s - flow control %s\n",
++ 			    xgbe_phy_speed_string(pdata->phy.speed),
++ 			    pdata->phy.duplex == DUPLEX_FULL ? "Full" : "Half",
++ 			    xgbe_phy_fc_string(pdata));
++ 	else
++ 		netdev_info(pdata->netdev, "Link is Down\n");
++ }
++ 
++ static void xgbe_phy_adjust_link(struct xgbe_prv_data *pdata)
+++>>>>>>> ced3fcae693b (amd-xgbe: Mask auto-negotiation interrupts in ISR)
+  {
+ +	struct xgbe_prv_data *pdata = netdev_priv(netdev);
+ +	struct xgbe_hw_if *hw_if = &pdata->hw_if;
+ +	struct phy_device *phydev = pdata->phydev;
+  	int new_state = 0;
+  
+ -	if (pdata->phy.link) {
+ +	if (phydev == NULL)
+ +		return;
+ +
+ +	DBGPR_MDIO("-->xgbe_adjust_link: address=%d, newlink=%d, curlink=%d\n",
+ +		   phydev->addr, phydev->link, pdata->phy_link);
+ +
+ +	if (phydev->link) {
+  		/* Flow control support */
+ -		pdata->pause_autoneg = pdata->phy.pause_autoneg;
+ +		if (pdata->pause_autoneg) {
+ +			if (phydev->pause || phydev->asym_pause) {
+ +				pdata->tx_pause = 1;
+ +				pdata->rx_pause = 1;
+ +			} else {
+ +				pdata->tx_pause = 0;
+ +				pdata->rx_pause = 0;
+ +			}
+ +		}
+  
+ -		if (pdata->tx_pause != pdata->phy.tx_pause) {
+ -			new_state = 1;
+ -			pdata->hw_if.config_tx_flow_control(pdata);
+ -			pdata->tx_pause = pdata->phy.tx_pause;
+ +		if (pdata->tx_pause != pdata->phy_tx_pause) {
+ +			hw_if->config_tx_flow_control(pdata);
+ +			pdata->phy_tx_pause = pdata->tx_pause;
+  		}
+  
+ -		if (pdata->rx_pause != pdata->phy.rx_pause) {
+ -			new_state = 1;
+ -			pdata->hw_if.config_rx_flow_control(pdata);
+ -			pdata->rx_pause = pdata->phy.rx_pause;
+ +		if (pdata->rx_pause != pdata->phy_rx_pause) {
+ +			hw_if->config_rx_flow_control(pdata);
+ +			pdata->phy_rx_pause = pdata->rx_pause;
+  		}
+  
+  		/* Speed support */
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe.h
+index 1903f878545a,98d9d63c4353..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe.h
+@@@ -526,12 -774,20 +526,12 @@@ struct xgbe_prv_data 
+  	/* Overall device lock */
+  	spinlock_t lock;
+  
+- 	/* XPCS indirect addressing mutex */
+- 	struct mutex xpcs_mutex;
++ 	/* XPCS indirect addressing lock */
++ 	spinlock_t xpcs_lock;
+  
+ -	/* RSS addressing mutex */
+ -	struct mutex rss_mutex;
+ -
+ -	/* Flags representing xgbe_state */
+ -	unsigned long dev_state;
+ -
+ -	int dev_irq;
+ -	unsigned int per_channel_irq;
+ +	int irq_number;
+  
+  	struct xgbe_hw_if hw_if;
+ -	struct xgbe_phy_if phy_if;
+  	struct xgbe_desc_if desc_if;
+  
+  	/* AXI DMA settings */
+@@@ -611,6 -892,55 +611,58 @@@
+  	/* Keeps track of power mode */
+  	unsigned int power_down;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Network interface message level setting */
++ 	u32 msg_enable;
++ 
++ 	/* Current PHY settings */
++ 	phy_interface_t phy_mode;
++ 	int phy_link;
++ 	int phy_speed;
++ 
++ 	/* MDIO/PHY related settings */
++ 	struct xgbe_phy phy;
++ 	int mdio_mmd;
++ 	unsigned long link_check;
++ 
++ 	char an_name[IFNAMSIZ + 32];
++ 	struct workqueue_struct *an_workqueue;
++ 
++ 	int an_irq;
++ 	struct work_struct an_irq_work;
++ 
++ 	unsigned int speed_set;
++ 
++ 	/* SerDes UEFI configurable settings.
++ 	 *   Switching between modes/speeds requires new values for some
++ 	 *   SerDes settings.  The values can be supplied as device
++ 	 *   properties in array format.  The first array entry is for
++ 	 *   1GbE, second for 2.5GbE and third for 10GbE
++ 	 */
++ 	u32 serdes_blwc[XGBE_SPEEDS];
++ 	u32 serdes_cdr_rate[XGBE_SPEEDS];
++ 	u32 serdes_pq_skew[XGBE_SPEEDS];
++ 	u32 serdes_tx_amp[XGBE_SPEEDS];
++ 	u32 serdes_dfe_tap_cfg[XGBE_SPEEDS];
++ 	u32 serdes_dfe_tap_ena[XGBE_SPEEDS];
++ 
++ 	/* Auto-negotiation state machine support */
++ 	unsigned int an_int;
++ 	struct mutex an_mutex;
++ 	enum xgbe_an an_result;
++ 	enum xgbe_an an_state;
++ 	enum xgbe_rx kr_state;
++ 	enum xgbe_rx kx_state;
++ 	struct work_struct an_work;
++ 	unsigned int an_supported;
++ 	unsigned int parallel_detect;
++ 	unsigned int fec_ability;
++ 	unsigned long an_start;
++ 
++ 	unsigned int lpm_ctrl;		/* CTRL1 for resume */
++ 
+++>>>>>>> ced3fcae693b (amd-xgbe: Mask auto-negotiation interrupts in ISR)
+  #ifdef CONFIG_DEBUG_FS
+  	struct dentry *xgbe_debugfs;
+  
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-dev.c b/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+index a748fd8a1c58..2f4fa1dbb0df 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+@@ -652,6 +652,7 @@ static int xgbe_set_mac_address(struct xgbe_prv_data *pdata, u8 *addr)
+ static int xgbe_read_mmd_regs(struct xgbe_prv_data *pdata, int prtad,
+ 			      int mmd_reg)
+ {
++	unsigned long flags;
+ 	unsigned int mmd_address;
+ 	int mmd_data;
+ 
+@@ -669,10 +670,10 @@ static int xgbe_read_mmd_regs(struct xgbe_prv_data *pdata, int prtad,
+ 	 * register offsets must therefore be adjusted by left shifting the
+ 	 * offset 2 bits and reading 32 bits of data.
+ 	 */
+-	mutex_lock(&pdata->xpcs_mutex);
++	spin_lock_irqsave(&pdata->xpcs_lock, flags);
+ 	XPCS_IOWRITE(pdata, PCS_MMD_SELECT << 2, mmd_address >> 8);
+ 	mmd_data = XPCS_IOREAD(pdata, (mmd_address & 0xff) << 2);
+-	mutex_unlock(&pdata->xpcs_mutex);
++	spin_unlock_irqrestore(&pdata->xpcs_lock, flags);
+ 
+ 	return mmd_data;
+ }
+@@ -681,6 +682,7 @@ static void xgbe_write_mmd_regs(struct xgbe_prv_data *pdata, int prtad,
+ 				int mmd_reg, int mmd_data)
+ {
+ 	unsigned int mmd_address;
++	unsigned long flags;
+ 
+ 	if (mmd_reg & MII_ADDR_C45)
+ 		mmd_address = mmd_reg & ~MII_ADDR_C45;
+@@ -713,10 +715,10 @@ static void xgbe_write_mmd_regs(struct xgbe_prv_data *pdata, int prtad,
+ 	 * register offsets must therefore be adjusted by left shifting the
+ 	 * offset 2 bits and reading 32 bits of data.
+ 	 */
+-	mutex_lock(&pdata->xpcs_mutex);
++	spin_lock_irqsave(&pdata->xpcs_lock, flags);
+ 	XPCS_IOWRITE(pdata, PCS_MMD_SELECT << 2, mmd_address >> 8);
+ 	XPCS_IOWRITE(pdata, (mmd_address & 0xff) << 2, mmd_data);
+-	mutex_unlock(&pdata->xpcs_mutex);
++	spin_unlock_irqrestore(&pdata->xpcs_lock, flags);
+ }
+ 
+ static int xgbe_tx_complete(struct xgbe_ring_desc *rdesc)
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-main.c
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-mdio.c
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe.h
