@@ -1,0 +1,212 @@
+proc/maps: make vm_is_stack() logic namespace-friendly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Oleg Nesterov <oleg@redhat.com>
+commit 58cb65487e92b47448d00a711c9f5922137d5678
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/58cb6548.failed
+
+- Rename vm_is_stack() to task_of_stack() and change it to return
+  "struct task_struct *" rather than the global (and thus wrong in
+  general) pid_t.
+
+- Add the new pid_of_stack() helper which calls task_of_stack() and
+  uses the right namespace to report the correct pid_t.
+
+  Unfortunately we need to define this helper twice, in task_mmu.c
+  and in task_nommu.c. perhaps it makes sense to add fs/proc/util.c
+  and move at least pid_of_stack/task_of_stack there to avoid the
+  code duplication.
+
+- Change show_map_vma() and show_numa_map() to use the new helper.
+
+	Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+	Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+	Cc: Cyrill Gorcunov <gorcunov@openvz.org>
+	Cc: "Eric W. Biederman" <ebiederm@xmission.com>
+	Cc: Greg Ungerer <gerg@uclinux.org>
+	Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 58cb65487e92b47448d00a711c9f5922137d5678)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/task_nommu.c
+diff --cc fs/proc/task_nommu.c
+index 56123a6f462e,599ec2e20104..000000000000
+--- a/fs/proc/task_nommu.c
++++ b/fs/proc/task_nommu.c
+@@@ -123,12 -123,23 +123,32 @@@ unsigned long task_statm(struct mm_stru
+  	return size;
+  }
+  
+++<<<<<<< HEAD
+ +static void pad_len_spaces(struct seq_file *m, int len)
+ +{
+ +	len = 25 + sizeof(void*) * 6 - len;
+ +	if (len < 1)
+ +		len = 1;
+ +	seq_printf(m, "%*c", len, ' ');
+++=======
++ static pid_t pid_of_stack(struct proc_maps_private *priv,
++ 				struct vm_area_struct *vma, bool is_pid)
++ {
++ 	struct inode *inode = priv->inode;
++ 	struct task_struct *task;
++ 	pid_t ret = 0;
++ 
++ 	rcu_read_lock();
++ 	task = pid_task(proc_pid(inode), PIDTYPE_PID);
++ 	if (task) {
++ 		task = task_of_stack(task, vma, is_pid);
++ 		if (task)
++ 			ret = task_pid_nr_ns(task, inode->i_sb->s_fs_info);
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return ret;
+++>>>>>>> 58cb65487e92 (proc/maps: make vm_is_stack() logic namespace-friendly)
+  }
+  
+  /*
+@@@ -164,16 -176,16 +184,16 @@@ static int nommu_vma_show(struct seq_fi
+  		   flags & VM_EXEC ? 'x' : '-',
+  		   flags & VM_MAYSHARE ? flags & VM_SHARED ? 'S' : 's' : 'p',
+  		   pgoff,
+ -		   MAJOR(dev), MINOR(dev), ino);
+ +		   MAJOR(dev), MINOR(dev), ino, &len);
+  
+  	if (file) {
+ -		seq_pad(m, ' ');
+ +		pad_len_spaces(m, len);
+  		seq_path(m, &file->f_path, "");
+  	} else if (mm) {
+- 		pid_t tid = vm_is_stack(priv->task, vma, is_pid);
++ 		pid_t tid = pid_of_stack(priv, vma, is_pid);
+  
+  		if (tid != 0) {
+ -			seq_pad(m, ' ');
+ +			pad_len_spaces(m, len);
+  			/*
+  			 * Thread stack in /proc/PID/task/TID/maps or
+  			 * the main process stack.
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index 09ca18a42ac3..2b2e18e4fb05 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -286,13 +286,31 @@ static int do_maps_open(struct inode *inode, struct file *file,
+ 				sizeof(struct proc_maps_private));
+ }
+ 
++static pid_t pid_of_stack(struct proc_maps_private *priv,
++				struct vm_area_struct *vma, bool is_pid)
++{
++	struct inode *inode = priv->inode;
++	struct task_struct *task;
++	pid_t ret = 0;
++
++	rcu_read_lock();
++	task = pid_task(proc_pid(inode), PIDTYPE_PID);
++	if (task) {
++		task = task_of_stack(task, vma, is_pid);
++		if (task)
++			ret = task_pid_nr_ns(task, inode->i_sb->s_fs_info);
++	}
++	rcu_read_unlock();
++
++	return ret;
++}
++
+ static void
+ show_map_vma(struct seq_file *m, struct vm_area_struct *vma, int is_pid)
+ {
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	struct file *file = vma->vm_file;
+ 	struct proc_maps_private *priv = m->private;
+-	struct task_struct *task = priv->task;
+ 	vm_flags_t flags = vma->vm_flags;
+ 	unsigned long ino = 0;
+ 	unsigned long long pgoff = 0;
+@@ -351,8 +369,7 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma, int is_pid)
+ 			goto done;
+ 		}
+ 
+-		tid = vm_is_stack(task, vma, is_pid);
+-
++		tid = pid_of_stack(priv, vma, is_pid);
+ 		if (tid != 0) {
+ 			/*
+ 			 * Thread stack in /proc/PID/task/TID/maps or
+@@ -1518,7 +1535,7 @@ static int show_numa_map(struct seq_file *m, void *v, int is_pid)
+ 	} else if (vma->vm_start <= mm->brk && vma->vm_end >= mm->start_brk) {
+ 		seq_printf(m, " heap");
+ 	} else {
+-		pid_t tid = vm_is_stack(task, vma, is_pid);
++		pid_t tid = pid_of_stack(proc_priv, vma, is_pid);
+ 		if (tid != 0) {
+ 			/*
+ 			 * Thread stack in /proc/PID/task/TID/maps or
+* Unmerged path fs/proc/task_nommu.c
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index e7edaaec02da..567a40e562e6 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -1323,8 +1323,8 @@ static inline int stack_guard_page_end(struct vm_area_struct *vma,
+ 		!vma_growsup(vma->vm_next, addr);
+ }
+ 
+-extern pid_t
+-vm_is_stack(struct task_struct *task, struct vm_area_struct *vma, int in_group);
++extern struct task_struct *task_of_stack(struct task_struct *task,
++				struct vm_area_struct *vma, bool in_group);
+ 
+ extern unsigned long move_page_tables(struct vm_area_struct *vma,
+ 		unsigned long old_addr, struct vm_area_struct *new_vma,
+diff --git a/mm/util.c b/mm/util.c
+index c13190fa2ed4..13dcd23327b1 100644
+--- a/mm/util.c
++++ b/mm/util.c
+@@ -332,32 +332,25 @@ static int vm_is_stack_for_task(struct task_struct *t,
+ /*
+  * Check if the vma is being used as a stack.
+  * If is_group is non-zero, check in the entire thread group or else
+- * just check in the current task. Returns the pid of the task that
+- * the vma is stack for.
++ * just check in the current task. Returns the task_struct of the task
++ * that the vma is stack for. Must be called under rcu_read_lock().
+  */
+-pid_t vm_is_stack(struct task_struct *task,
+-		  struct vm_area_struct *vma, int in_group)
++struct task_struct *task_of_stack(struct task_struct *task,
++				struct vm_area_struct *vma, bool in_group)
+ {
+-	pid_t ret = 0;
+-
+ 	if (vm_is_stack_for_task(task, vma))
+-		return task->pid;
++		return task;
+ 
+ 	if (in_group) {
+ 		struct task_struct *t;
+ 
+-		rcu_read_lock();
+ 		for_each_thread(task, t) {
+-			if (vm_is_stack_for_task(t, vma)) {
+-				ret = t->pid;
+-				goto done;
+-			}
++			if (vm_is_stack_for_task(t, vma))
++				return t;
+ 		}
+-done:
+-		rcu_read_unlock();
+ 	}
+ 
+-	return ret;
++	return NULL;
+ }
+ 
+ #if defined(CONFIG_MMU) && !defined(HAVE_ARCH_PICK_MMAP_LAYOUT)
