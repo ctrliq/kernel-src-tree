@@ -1,0 +1,233 @@
+hrtimer: Allow hrtimer::function() to free the timer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 887d9dc989eb0154492e41e7c07492edbb088ba1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/887d9dc9.failed
+
+Currently an hrtimer callback function cannot free its own timer
+because __run_hrtimer() still needs to clear HRTIMER_STATE_CALLBACK
+after it. Freeing the timer would result in a clear use-after-free.
+
+Solve this by using a scheme similar to regular timers; track the
+current running timer in hrtimer_clock_base::running.
+
+	Suggested-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: ktkhai@parallels.com
+	Cc: rostedt@goodmis.org
+	Cc: juri.lelli@gmail.com
+	Cc: pang.xunlei@linaro.org
+	Cc: wanpeng.li@linux.intel.com
+	Cc: Al Viro <viro@ZenIV.linux.org.uk>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Paul McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: umgwanakikbuti@gmail.com
+Link: http://lkml.kernel.org/r/20150611124743.471563047@infradead.org
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 887d9dc989eb0154492e41e7c07492edbb088ba1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/hrtimer.h
+#	kernel/hrtimer.c
+diff --cc include/linux/hrtimer.h
+index 26e969ccdd1c,5db055821ef3..000000000000
+--- a/include/linux/hrtimer.h
++++ b/include/linux/hrtimer.h
+@@@ -160,12 -158,15 +155,18 @@@ enum  hrtimer_base_type 
+   * struct hrtimer_cpu_base - the per cpu clock bases
+   * @lock:		lock protecting the base and associated clock bases
+   *			and timers
+++<<<<<<< HEAD
+++=======
++  * @seq:		seqcount around __run_hrtimer
++  * @running:		pointer to the currently running hrtimer
++  * @cpu:		cpu number
+++>>>>>>> 887d9dc989eb (hrtimer: Allow hrtimer::function() to free the timer)
+   * @active_bases:	Bitfield to mark bases with active timers
+ - * @clock_was_set_seq:	Sequence counter of clock was set events
+ + * @clock_was_set:	Sequence counter of clock was set events
+ + *			Note that in RHEL7 clock_was_set is upstream's
+ + *			clock_was_set_seq (KABI).
+   * @expires_next:	absolute time of the next event which was scheduled
+   *			via clock_set_next_event()
+ - * @next_timer:		Pointer to the first expiring timer
+ - * @in_hrtirq:		hrtimer_interrupt() is currently executing
+   * @hres_active:	State of high resolution mode
+   * @hang_detected:	The last hrtimer interrupt detected a hang
+   * @nr_events:		Total number of hrtimer interrupt events
+@@@ -180,23 -181,24 +181,29 @@@
+   */
+  struct hrtimer_cpu_base {
+  	raw_spinlock_t			lock;
+++<<<<<<< HEAD
+++=======
++ 	seqcount_t			seq;
++ 	struct hrtimer			*running;
++ 	unsigned int			cpu;
+++>>>>>>> 887d9dc989eb (hrtimer: Allow hrtimer::function() to free the timer)
+  	unsigned int			active_bases;
+ -	unsigned int			clock_was_set_seq;
+ +	unsigned int			clock_was_set; /* clock_was_set_seq */
+  #ifdef CONFIG_HIGH_RES_TIMERS
+ -	unsigned int			in_hrtirq	: 1,
+ -					hres_active	: 1,
+ -					hang_detected	: 1;
+  	ktime_t				expires_next;
+ -	struct hrtimer			*next_timer;
+ -	unsigned int			nr_events;
+ -	unsigned int			nr_retries;
+ -	unsigned int			nr_hangs;
+ -	unsigned int			max_hang_time;
+ +	int				hres_active;
+ +	int				hang_detected;
+ +	unsigned long			nr_events;
+ +	unsigned long			nr_retries;
+ +	unsigned long			nr_hangs;
+ +	ktime_t				max_hang_time;
+  #endif
+  	struct hrtimer_clock_base	clock_base[HRTIMER_MAX_CLOCK_BASES];
+ -} ____cacheline_aligned;
+ +	RH_KABI_EXTEND(int cpu)
+ +	RH_KABI_EXTEND(int in_hrtirq)
+ +	RH_KABI_EXTEND(bool migration_enabled)
+ +	RH_KABI_EXTEND(bool nohz_active)
+ +};
+  
+  static inline void hrtimer_set_expires(struct hrtimer *timer, ktime_t time)
+  {
+diff --cc kernel/hrtimer.c
+index 3e09845e9ee2,f026413de4d6..000000000000
+--- a/kernel/hrtimer.c
++++ b/kernel/hrtimer.c
+@@@ -66,8 -66,8 +66,9 @@@
+   */
+  DEFINE_PER_CPU(struct hrtimer_cpu_base, hrtimer_bases) =
+  {
+ +
+  	.lock = __RAW_SPIN_LOCK_UNLOCKED(hrtimer_bases.lock),
++ 	.seq = SEQCNT_ZERO(hrtimer_bases.seq),
+  	.clock_base =
+  	{
+  		{
+@@@ -885,16 -849,11 +898,12 @@@ static int enqueue_hrtimer(struct hrtim
+  {
+  	debug_activate(timer);
+  
+ +	timerqueue_add(&base->active, &timer->node);
+  	base->cpu_base->active_bases |= 1 << base->index;
+  
+- 	/*
+- 	 * HRTIMER_STATE_ENQUEUED is or'ed to the current state to preserve the
+- 	 * state of a possibly running callback.
+- 	 */
+- 	timer->state |= HRTIMER_STATE_ENQUEUED;
++ 	timer->state = HRTIMER_STATE_ENQUEUED;
+  
+ -	return timerqueue_add(&base->active, &timer->node);
+ +	return (&timer->node == base->active.next);
+  }
+  
+  /*
+@@@ -957,13 -914,11 +966,21 @@@ remove_hrtimer(struct hrtimer *timer, s
+  		 */
+  		debug_deactivate(timer);
+  		timer_stats_hrtimer_clear_start_info(timer);
+++<<<<<<< HEAD:kernel/hrtimer.c
+ +		reprogram = base->cpu_base == &__get_cpu_var(hrtimer_bases);
+ +		/*
+ +		 * We must preserve the CALLBACK state flag here,
+ +		 * otherwise we could move the timer base in
+ +		 * switch_hrtimer_base.
+ +		 */
+ +		state = timer->state & HRTIMER_STATE_CALLBACK;
+++=======
++ 		reprogram = base->cpu_base == this_cpu_ptr(&hrtimer_bases);
++ 
++ 		if (!restart)
++ 			state = HRTIMER_STATE_INACTIVE;
++ 
+++>>>>>>> 887d9dc989eb (hrtimer: Allow hrtimer::function() to free the timer):kernel/time/hrtimer.c
+  		__remove_hrtimer(timer, base, state, reprogram);
+  		return 1;
+  	}
+@@@ -1193,25 -1119,50 +1210,72 @@@ void hrtimer_init(struct hrtimer *timer
+  }
+  EXPORT_SYMBOL_GPL(hrtimer_init);
+  
+++<<<<<<< HEAD:kernel/hrtimer.c
+ +/**
+ + * hrtimer_get_res - get the timer resolution for a clock
+ + * @which_clock: which clock to query
+ + * @tp:		 pointer to timespec variable to store the resolution
+ + *
+ + * Store the resolution of the clock selected by @which_clock in the
+ + * variable pointed to by @tp.
+ + */
+ +int hrtimer_get_res(const clockid_t which_clock, struct timespec *tp)
+ +{
+ +	struct hrtimer_cpu_base *cpu_base;
+ +	int base = hrtimer_clockid_to_base(which_clock);
+ +
+ +	cpu_base = &__raw_get_cpu_var(hrtimer_bases);
+ +	*tp = ktime_to_timespec(cpu_base->clock_base[base].resolution);
+ +
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL_GPL(hrtimer_get_res);
+++=======
++ /*
++  * A timer is active, when it is enqueued into the rbtree or the
++  * callback function is running or it's in the state of being migrated
++  * to another cpu.
++  *
++  * It is important for this function to not return a false negative.
++  */
++ bool hrtimer_active(const struct hrtimer *timer)
++ {
++ 	struct hrtimer_cpu_base *cpu_base;
++ 	unsigned int seq;
++ 
++ 	do {
++ 		cpu_base = READ_ONCE(timer->base->cpu_base);
++ 		seq = raw_read_seqcount_begin(&cpu_base->seq);
++ 
++ 		if (timer->state != HRTIMER_STATE_INACTIVE ||
++ 		    cpu_base->running == timer)
++ 			return true;
++ 
++ 	} while (read_seqcount_retry(&cpu_base->seq, seq) ||
++ 		 cpu_base != READ_ONCE(timer->base->cpu_base));
++ 
++ 	return false;
++ }
++ EXPORT_SYMBOL_GPL(hrtimer_active);
++ 
++ /*
++  * The write_seqcount_barrier()s in __run_hrtimer() split the thing into 3
++  * distinct sections:
++  *
++  *  - queued:	the timer is queued
++  *  - callback:	the timer is being ran
++  *  - post:	the timer is inactive or (re)queued
++  *
++  * On the read side we ensure we observe timer->state and cpu_base->running
++  * from the same section, if anything changed while we looked at it, we retry.
++  * This includes timer->base changing because sequence numbers alone are
++  * insufficient for that.
++  *
++  * The sequence numbers are required because otherwise we could still observe
++  * a false negative if the read side got smeared over multiple consequtive
++  * __run_hrtimer() invocations.
++  */
+++>>>>>>> 887d9dc989eb (hrtimer: Allow hrtimer::function() to free the timer):kernel/time/hrtimer.c
+  
+  static void __run_hrtimer(struct hrtimer_cpu_base *cpu_base,
+  			  struct hrtimer_clock_base *base,
+* Unmerged path include/linux/hrtimer.h
+* Unmerged path kernel/hrtimer.c
