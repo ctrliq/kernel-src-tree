@@ -248,6 +248,8 @@ static int cirrus_fbdev_destroy(struct drm_device *dev,
 {
 	struct cirrus_framebuffer *gfb = &gfbdev->gfb;
 
+	drm_helper_force_disable_all(dev);
+
 	drm_fb_helper_unregister_fbi(&gfbdev->helper);
 
 	if (gfb->obj) {
