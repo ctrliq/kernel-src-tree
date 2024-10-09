@@ -1,0 +1,90 @@
+locking/rwsem: Exit read lock slowpath if queue empty & no writer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [locking] rwsem: Exit read lock slowpath if queue empty & no writer (Waiman Long) [1691099]
+Rebuild_FUZZ: 93.44%
+commit-author Waiman Long <longman@redhat.com>
+commit 4b486b535c33ef354ecf02a2650919004fd7d2b0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/4b486b53.failed
+
+It was discovered that a constant stream of readers with occassional
+writers pounding on a rwsem may cause many of the readers to enter the
+slowpath unnecessarily thus increasing latency and lowering performance.
+
+In the current code, a reader entering the slowpath critical section
+will unconditionally set the WAITING_BIAS, if not set yet, and clear
+its active count even if no one is in the wait queue and no writer
+is present. This causes some incoming readers to observe the presence
+of waiters in the wait queue and hence have to go into the slowpath
+themselves.
+
+With sufficient numbers of readers and a relatively short lock hold time,
+the WAITING_BIAS may be repeatedly turned on and off and a substantial
+portion of the readers will go into the slowpath sustaining a rather
+long queue in the wait queue spinlock and repeated WAITING_BIAS on/off
+cycle until the logjam is broken opportunistically.
+
+To avoid this situation from happening, an additional check is added to
+detect the special case that the reader in the critical section is the
+only one in the wait queue and no writer is present. When that happens,
+it can just exit the slowpath and return immediately as its active count
+has already been set in the lock.  Other incoming readers won't observe
+the presence of waiters and so will not be forced into the slowpath.
+
+The issue was found in a customer site where they had an application
+that pounded on the pread64 syscalls heavily on an XFS filesystem. The
+application was run in a recent 4-socket boxes with a lot of CPUs. They
+saw significant spinlock contention in the rwsem_down_read_failed() call.
+With this patch applied, the system CPU usage went down from 85% to 57%,
+and the spinlock contention in the pread64 syscalls was gone.
+
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Davidlohr Bueso <dbueso@suse.de>
+	Acked-by: Will Deacon <will.deacon@arm.com>
+	Cc: Joe Mario <jmario@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/1532459425-19204-1-git-send-email-longman@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 4b486b535c33ef354ecf02a2650919004fd7d2b0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/rwsem.c
+diff --cc lib/rwsem.c
+index dcbfa1eac830,01fcb807598c..000000000000
+--- a/lib/rwsem.c
++++ b/lib/rwsem.c
+@@@ -233,9 -233,20 +233,26 @@@ struct rw_semaphore __sched *rwsem_down
+  	waiter.type = RWSEM_WAITING_FOR_READ;
+  
+  	raw_spin_lock_irq(&sem->wait_lock);
+++<<<<<<< HEAD:lib/rwsem.c
+ +	if (slist_empty(&sem->wait_list))
+ +		adjustment += RWSEM_WAITING_BIAS;
+ +	slist_add_tail(&waiter.list, &sem->wait_list);
+++=======
++ 	if (list_empty(&sem->wait_list)) {
++ 		/*
++ 		 * In case the wait queue is empty and the lock isn't owned
++ 		 * by a writer, this reader can exit the slowpath and return
++ 		 * immediately as its RWSEM_ACTIVE_READ_BIAS has already
++ 		 * been set in the count.
++ 		 */
++ 		if (atomic_long_read(&sem->count) >= 0) {
++ 			raw_spin_unlock_irq(&sem->wait_lock);
++ 			return sem;
++ 		}
++ 		adjustment += RWSEM_WAITING_BIAS;
++ 	}
++ 	list_add_tail(&waiter.list, &sem->wait_list);
+++>>>>>>> 4b486b535c33 (locking/rwsem: Exit read lock slowpath if queue empty & no writer):kernel/locking/rwsem-xadd.c
+  
+  	/* we're now waiting on the lock, but no longer actively locking */
+  	count = atomic_long_add_return(adjustment, &sem->count);
+* Unmerged path lib/rwsem.c
