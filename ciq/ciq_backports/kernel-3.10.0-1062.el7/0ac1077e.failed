@@ -1,0 +1,351 @@
+sctp: get pr_assoc and pr_stream all status with SCTP_PR_SCTP_ALL instead
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 0ac1077e3a549bf8d35971613e2be05bdbb41a00
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/0ac1077e.failed
+
+According to rfc7496 section 4.3 or 4.4:
+
+   sprstat_policy:  This parameter indicates for which PR-SCTP policy
+      the user wants the information.  It is an error to use
+      SCTP_PR_SCTP_NONE in sprstat_policy.  If SCTP_PR_SCTP_ALL is used,
+      the counters provided are aggregated over all supported policies.
+
+We change to dump pr_assoc and pr_stream all status by SCTP_PR_SCTP_ALL
+instead, and return error for SCTP_PR_SCTP_NONE, as it also said "It is
+an error to use SCTP_PR_SCTP_NONE in sprstat_policy. "
+
+Fixes: 826d253d57b1 ("sctp: add SCTP_PR_ASSOC_STATUS on sctp sockopt")
+Fixes: d229d48d183f ("sctp: add SCTP_PR_STREAM_STATUS sockopt for prsctp")
+	Reported-by: Ying Xu <yinxu@redhat.com>
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Acked-by: Neil Horman <nhorman@tuxdriver.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0ac1077e3a549bf8d35971613e2be05bdbb41a00)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/sctp.h
+#	net/sctp/socket.c
+diff --cc include/uapi/linux/sctp.h
+index 0a1fe5f25b30,34dd3d497f2c..000000000000
+--- a/include/uapi/linux/sctp.h
++++ b/include/uapi/linux/sctp.h
+@@@ -253,6 -299,9 +253,12 @@@ enum sctp_sinfo_flags 
+  	SCTP_ADDR_OVER		= (1 << 1), /* Override the primary destination. */
+  	SCTP_ABORT		= (1 << 2), /* Send an ABORT message to the peer. */
+  	SCTP_SACK_IMMEDIATELY	= (1 << 3), /* SACK should be sent without delay. */
+++<<<<<<< HEAD
+++=======
++ 	/* 2 bits here have been used by SCTP_PR_SCTP_MASK */
++ 	SCTP_SENDALL		= (1 << 6),
++ 	SCTP_PR_SCTP_ALL	= (1 << 7),
+++>>>>>>> 0ac1077e3a54 (sctp: get pr_assoc and pr_stream all status with SCTP_PR_SCTP_ALL instead)
+  	SCTP_NOTIFICATION	= MSG_NOTIFICATION, /* Next message is not user msg but notification. */
+  	SCTP_EOF		= MSG_FIN,  /* Initiate graceful shutdown process. */
+  };
+diff --cc net/sctp/socket.c
+index 3673c7824195,e25a20fc629a..000000000000
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@@ -6541,6 -7139,291 +6541,294 @@@ out
+  	return retval;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int sctp_getsockopt_pr_streamstatus(struct sock *sk, int len,
++ 					   char __user *optval,
++ 					   int __user *optlen)
++ {
++ 	struct sctp_stream_out_ext *streamoute;
++ 	struct sctp_association *asoc;
++ 	struct sctp_prstatus params;
++ 	int retval = -EINVAL;
++ 	int policy;
++ 
++ 	if (len < sizeof(params))
++ 		goto out;
++ 
++ 	len = sizeof(params);
++ 	if (copy_from_user(&params, optval, len)) {
++ 		retval = -EFAULT;
++ 		goto out;
++ 	}
++ 
++ 	policy = params.sprstat_policy;
++ 	if (!policy || (policy & ~(SCTP_PR_SCTP_MASK | SCTP_PR_SCTP_ALL)))
++ 		goto out;
++ 
++ 	asoc = sctp_id2assoc(sk, params.sprstat_assoc_id);
++ 	if (!asoc || params.sprstat_sid >= asoc->stream.outcnt)
++ 		goto out;
++ 
++ 	streamoute = SCTP_SO(&asoc->stream, params.sprstat_sid)->ext;
++ 	if (!streamoute) {
++ 		/* Not allocated yet, means all stats are 0 */
++ 		params.sprstat_abandoned_unsent = 0;
++ 		params.sprstat_abandoned_sent = 0;
++ 		retval = 0;
++ 		goto out;
++ 	}
++ 
++ 	if (policy == SCTP_PR_SCTP_ALL) {
++ 		params.sprstat_abandoned_unsent = 0;
++ 		params.sprstat_abandoned_sent = 0;
++ 		for (policy = 0; policy <= SCTP_PR_INDEX(MAX); policy++) {
++ 			params.sprstat_abandoned_unsent +=
++ 				streamoute->abandoned_unsent[policy];
++ 			params.sprstat_abandoned_sent +=
++ 				streamoute->abandoned_sent[policy];
++ 		}
++ 	} else {
++ 		params.sprstat_abandoned_unsent =
++ 			streamoute->abandoned_unsent[__SCTP_PR_INDEX(policy)];
++ 		params.sprstat_abandoned_sent =
++ 			streamoute->abandoned_sent[__SCTP_PR_INDEX(policy)];
++ 	}
++ 
++ 	if (put_user(len, optlen) || copy_to_user(optval, &params, len)) {
++ 		retval = -EFAULT;
++ 		goto out;
++ 	}
++ 
++ 	retval = 0;
++ 
++ out:
++ 	return retval;
++ }
++ 
++ static int sctp_getsockopt_reconfig_supported(struct sock *sk, int len,
++ 					      char __user *optval,
++ 					      int __user *optlen)
++ {
++ 	struct sctp_assoc_value params;
++ 	struct sctp_association *asoc;
++ 	int retval = -EFAULT;
++ 
++ 	if (len < sizeof(params)) {
++ 		retval = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	len = sizeof(params);
++ 	if (copy_from_user(&params, optval, len))
++ 		goto out;
++ 
++ 	asoc = sctp_id2assoc(sk, params.assoc_id);
++ 	if (asoc) {
++ 		params.assoc_value = asoc->reconf_enable;
++ 	} else if (!params.assoc_id) {
++ 		struct sctp_sock *sp = sctp_sk(sk);
++ 
++ 		params.assoc_value = sp->ep->reconf_enable;
++ 	} else {
++ 		retval = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	if (put_user(len, optlen))
++ 		goto out;
++ 
++ 	if (copy_to_user(optval, &params, len))
++ 		goto out;
++ 
++ 	retval = 0;
++ 
++ out:
++ 	return retval;
++ }
++ 
++ static int sctp_getsockopt_enable_strreset(struct sock *sk, int len,
++ 					   char __user *optval,
++ 					   int __user *optlen)
++ {
++ 	struct sctp_assoc_value params;
++ 	struct sctp_association *asoc;
++ 	int retval = -EFAULT;
++ 
++ 	if (len < sizeof(params)) {
++ 		retval = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	len = sizeof(params);
++ 	if (copy_from_user(&params, optval, len))
++ 		goto out;
++ 
++ 	asoc = sctp_id2assoc(sk, params.assoc_id);
++ 	if (asoc) {
++ 		params.assoc_value = asoc->strreset_enable;
++ 	} else if (!params.assoc_id) {
++ 		struct sctp_sock *sp = sctp_sk(sk);
++ 
++ 		params.assoc_value = sp->ep->strreset_enable;
++ 	} else {
++ 		retval = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	if (put_user(len, optlen))
++ 		goto out;
++ 
++ 	if (copy_to_user(optval, &params, len))
++ 		goto out;
++ 
++ 	retval = 0;
++ 
++ out:
++ 	return retval;
++ }
++ 
++ static int sctp_getsockopt_scheduler(struct sock *sk, int len,
++ 				     char __user *optval,
++ 				     int __user *optlen)
++ {
++ 	struct sctp_assoc_value params;
++ 	struct sctp_association *asoc;
++ 	int retval = -EFAULT;
++ 
++ 	if (len < sizeof(params)) {
++ 		retval = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	len = sizeof(params);
++ 	if (copy_from_user(&params, optval, len))
++ 		goto out;
++ 
++ 	asoc = sctp_id2assoc(sk, params.assoc_id);
++ 	if (!asoc) {
++ 		retval = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	params.assoc_value = sctp_sched_get_sched(asoc);
++ 
++ 	if (put_user(len, optlen))
++ 		goto out;
++ 
++ 	if (copy_to_user(optval, &params, len))
++ 		goto out;
++ 
++ 	retval = 0;
++ 
++ out:
++ 	return retval;
++ }
++ 
++ static int sctp_getsockopt_scheduler_value(struct sock *sk, int len,
++ 					   char __user *optval,
++ 					   int __user *optlen)
++ {
++ 	struct sctp_stream_value params;
++ 	struct sctp_association *asoc;
++ 	int retval = -EFAULT;
++ 
++ 	if (len < sizeof(params)) {
++ 		retval = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	len = sizeof(params);
++ 	if (copy_from_user(&params, optval, len))
++ 		goto out;
++ 
++ 	asoc = sctp_id2assoc(sk, params.assoc_id);
++ 	if (!asoc) {
++ 		retval = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	retval = sctp_sched_get_value(asoc, params.stream_id,
++ 				      &params.stream_value);
++ 	if (retval)
++ 		goto out;
++ 
++ 	if (put_user(len, optlen)) {
++ 		retval = -EFAULT;
++ 		goto out;
++ 	}
++ 
++ 	if (copy_to_user(optval, &params, len)) {
++ 		retval = -EFAULT;
++ 		goto out;
++ 	}
++ 
++ out:
++ 	return retval;
++ }
++ 
++ static int sctp_getsockopt_interleaving_supported(struct sock *sk, int len,
++ 						  char __user *optval,
++ 						  int __user *optlen)
++ {
++ 	struct sctp_assoc_value params;
++ 	struct sctp_association *asoc;
++ 	int retval = -EFAULT;
++ 
++ 	if (len < sizeof(params)) {
++ 		retval = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	len = sizeof(params);
++ 	if (copy_from_user(&params, optval, len))
++ 		goto out;
++ 
++ 	asoc = sctp_id2assoc(sk, params.assoc_id);
++ 	if (asoc) {
++ 		params.assoc_value = asoc->intl_enable;
++ 	} else if (!params.assoc_id) {
++ 		struct sctp_sock *sp = sctp_sk(sk);
++ 
++ 		params.assoc_value = sp->strm_interleave;
++ 	} else {
++ 		retval = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	if (put_user(len, optlen))
++ 		goto out;
++ 
++ 	if (copy_to_user(optval, &params, len))
++ 		goto out;
++ 
++ 	retval = 0;
++ 
++ out:
++ 	return retval;
++ }
++ 
++ static int sctp_getsockopt_reuse_port(struct sock *sk, int len,
++ 				      char __user *optval,
++ 				      int __user *optlen)
++ {
++ 	int val;
++ 
++ 	if (len < sizeof(int))
++ 		return -EINVAL;
++ 
++ 	len = sizeof(int);
++ 	val = sctp_sk(sk)->reuse;
++ 	if (put_user(len, optlen))
++ 		return -EFAULT;
++ 
++ 	if (copy_to_user(optval, &val, len))
++ 		return -EFAULT;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 0ac1077e3a54 (sctp: get pr_assoc and pr_stream all status with SCTP_PR_SCTP_ALL instead)
+  static int sctp_getsockopt(struct sock *sk, int level, int optname,
+  			   char __user *optval, int __user *optlen)
+  {
+* Unmerged path include/uapi/linux/sctp.h
+* Unmerged path net/sctp/socket.c
