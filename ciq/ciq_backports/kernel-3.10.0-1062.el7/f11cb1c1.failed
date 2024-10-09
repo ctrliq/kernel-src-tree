@@ -1,0 +1,346 @@
+drm/i915/dp: revert back to max link rate and lane count on eDP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jani Nikula <jani.nikula@intel.com>
+commit f11cb1c19ad0563b3c1ea5eb16a6bac0e401f428
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/f11cb1c1.failed
+
+Commit 7769db588384 ("drm/i915/dp: optimize eDP 1.4+ link config fast
+and narrow") started to optize the eDP 1.4+ link config, both per spec
+and as preparation for display stream compression support.
+
+Sadly, we again face panels that flat out fail with parameters they
+claim to support. Revert, and go back to the drawing board.
+
+v2: Actually revert to max params instead of just wide-and-slow.
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=109959
+Fixes: 7769db588384 ("drm/i915/dp: optimize eDP 1.4+ link config fast and narrow")
+	Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+	Cc: Manasi Navare <manasi.d.navare@intel.com>
+	Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+	Cc: Matt Atwood <matthew.s.atwood@intel.com>
+	Cc: "Lee, Shawn C" <shawn.c.lee@intel.com>
+	Cc: Dave Airlie <airlied@gmail.com>
+	Cc: intel-gfx@lists.freedesktop.org
+	Cc: <stable@vger.kernel.org> # v5.0+
+	Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+	Reviewed-by: Manasi Navare <manasi.d.navare@intel.com>
+	Tested-by: Albert Astals Cid <aacid@kde.org> # v5.0 backport
+	Tested-by: Emanuele Panigati <ilpanich@gmail.com> # v5.0 backport
+	Tested-by: Matteo Iervasi <matteoiervasi@gmail.com> # v5.0 backport
+	Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190405075220.9815-1-jani.nikula@intel.com
+(cherry picked from commit f11cb1c19ad0563b3c1ea5eb16a6bac0e401f428)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_dp.c
+diff --cc drivers/gpu/drm/i915/intel_dp.c
+index cd6e87756509,0936d08aa982..000000000000
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@@ -1786,28 -1825,186 +1786,165 @@@ intel_dp_compute_config(struct intel_en
+  						    intel_dp->num_common_rates,
+  						    intel_dp->compliance.test_link_rate);
+  			if (index >= 0)
+ -				limits->min_clock = limits->max_clock = index;
+ -			limits->min_lane_count = limits->max_lane_count =
+ -				intel_dp->compliance.test_lane_count;
+ +				min_clock = max_clock = index;
+ +			min_lane_count = max_lane_count = intel_dp->compliance.test_lane_count;
+  		}
+  	}
+++<<<<<<< HEAD
+ +	DRM_DEBUG_KMS("DP link computation with max lane count %i "
+ +		      "max bw %d pixel clock %iKHz\n",
+ +		      max_lane_count, intel_dp->common_rates[max_clock],
+ +		      adjusted_mode->crtc_clock);
+++=======
++ }
++ 
++ /* Optimize link config in order: max bpp, min clock, min lanes */
++ static int
++ intel_dp_compute_link_config_wide(struct intel_dp *intel_dp,
++ 				  struct intel_crtc_state *pipe_config,
++ 				  const struct link_config_limits *limits)
++ {
++ 	struct drm_display_mode *adjusted_mode = &pipe_config->base.adjusted_mode;
++ 	int bpp, clock, lane_count;
++ 	int mode_rate, link_clock, link_avail;
++ 
++ 	for (bpp = limits->max_bpp; bpp >= limits->min_bpp; bpp -= 2 * 3) {
++ 		mode_rate = intel_dp_link_required(adjusted_mode->crtc_clock,
++ 						   bpp);
++ 
++ 		for (clock = limits->min_clock; clock <= limits->max_clock; clock++) {
++ 			for (lane_count = limits->min_lane_count;
++ 			     lane_count <= limits->max_lane_count;
++ 			     lane_count <<= 1) {
++ 				link_clock = intel_dp->common_rates[clock];
++ 				link_avail = intel_dp_max_data_rate(link_clock,
++ 								    lane_count);
++ 
++ 				if (mode_rate <= link_avail) {
++ 					pipe_config->lane_count = lane_count;
++ 					pipe_config->pipe_bpp = bpp;
++ 					pipe_config->port_clock = link_clock;
++ 
++ 					return 0;
++ 				}
++ 			}
++ 		}
++ 	}
++ 
++ 	return -EINVAL;
++ }
++ 
++ static int intel_dp_dsc_compute_bpp(struct intel_dp *intel_dp, u8 dsc_max_bpc)
++ {
++ 	int i, num_bpc;
++ 	u8 dsc_bpc[3] = {0};
++ 
++ 	num_bpc = drm_dp_dsc_sink_supported_input_bpcs(intel_dp->dsc_dpcd,
++ 						       dsc_bpc);
++ 	for (i = 0; i < num_bpc; i++) {
++ 		if (dsc_max_bpc >= dsc_bpc[i])
++ 			return dsc_bpc[i] * 3;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int intel_dp_dsc_compute_config(struct intel_dp *intel_dp,
++ 				       struct intel_crtc_state *pipe_config,
++ 				       struct drm_connector_state *conn_state,
++ 				       struct link_config_limits *limits)
++ {
++ 	struct intel_digital_port *dig_port = dp_to_dig_port(intel_dp);
++ 	struct drm_i915_private *dev_priv = to_i915(dig_port->base.base.dev);
++ 	struct drm_display_mode *adjusted_mode = &pipe_config->base.adjusted_mode;
++ 	u8 dsc_max_bpc;
++ 	int pipe_bpp;
++ 	int ret;
++ 
++ 	if (!intel_dp_supports_dsc(intel_dp, pipe_config))
++ 		return -EINVAL;
++ 
++ 	dsc_max_bpc = min_t(u8, DP_DSC_MAX_SUPPORTED_BPC,
++ 			    conn_state->max_requested_bpc);
++ 
++ 	pipe_bpp = intel_dp_dsc_compute_bpp(intel_dp, dsc_max_bpc);
++ 	if (pipe_bpp < DP_DSC_MIN_SUPPORTED_BPC * 3) {
++ 		DRM_DEBUG_KMS("No DSC support for less than 8bpc\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	/*
++ 	 * For now enable DSC for max bpp, max link rate, max lane count.
++ 	 * Optimize this later for the minimum possible link rate/lane count
++ 	 * with DSC enabled for the requested mode.
++ 	 */
++ 	pipe_config->pipe_bpp = pipe_bpp;
++ 	pipe_config->port_clock = intel_dp->common_rates[limits->max_clock];
++ 	pipe_config->lane_count = limits->max_lane_count;
+++>>>>>>> f11cb1c19ad0 (drm/i915/dp: revert back to max link rate and lane count on eDP)
+  
+ +	/* Walk through all bpp values. Luckily they're all nicely spaced with 2
+ +	 * bpc in between. */
+ +	bpp = intel_dp_compute_bpp(intel_dp, pipe_config);
+  	if (intel_dp_is_edp(intel_dp)) {
+ -		pipe_config->dsc_params.compressed_bpp =
+ -			min_t(u16, drm_edp_dsc_sink_output_bpp(intel_dp->dsc_dpcd) >> 4,
+ -			      pipe_config->pipe_bpp);
+ -		pipe_config->dsc_params.slice_count =
+ -			drm_dp_dsc_sink_max_slice_count(intel_dp->dsc_dpcd,
+ -							true);
+ -	} else {
+ -		u16 dsc_max_output_bpp;
+ -		u8 dsc_dp_slice_count;
+ -
+ -		dsc_max_output_bpp =
+ -			intel_dp_dsc_get_output_bpp(pipe_config->port_clock,
+ -						    pipe_config->lane_count,
+ -						    adjusted_mode->crtc_clock,
+ -						    adjusted_mode->crtc_hdisplay);
+ -		dsc_dp_slice_count =
+ -			intel_dp_dsc_get_slice_count(intel_dp,
+ -						     adjusted_mode->crtc_clock,
+ -						     adjusted_mode->crtc_hdisplay);
+ -		if (!dsc_max_output_bpp || !dsc_dp_slice_count) {
+ -			DRM_DEBUG_KMS("Compressed BPP/Slice Count not supported\n");
+ -			return -EINVAL;
+ -		}
+ -		pipe_config->dsc_params.compressed_bpp = min_t(u16,
+ -							       dsc_max_output_bpp >> 4,
+ -							       pipe_config->pipe_bpp);
+ -		pipe_config->dsc_params.slice_count = dsc_dp_slice_count;
+ -	}
+ -	/*
+ -	 * VDSC engine operates at 1 Pixel per clock, so if peak pixel rate
+ -	 * is greater than the maximum Cdclock and if slice count is even
+ -	 * then we need to use 2 VDSC instances.
+ -	 */
+ -	if (adjusted_mode->crtc_clock > dev_priv->max_cdclk_freq) {
+ -		if (pipe_config->dsc_params.slice_count > 1) {
+ -			pipe_config->dsc_params.dsc_split = true;
+ -		} else {
+ -			DRM_DEBUG_KMS("Cannot split stream to use 2 VDSC instances\n");
+ -			return -EINVAL;
+ +
+ +		/* Get bpp from vbt only for panels that dont have bpp in edid */
+ +		if (intel_connector->base.display_info.bpc == 0 &&
+ +			(dev_priv->vbt.edp.bpp && dev_priv->vbt.edp.bpp < bpp)) {
+ +			DRM_DEBUG_KMS("clamping bpp for eDP panel to BIOS-provided %i\n",
+ +				      dev_priv->vbt.edp.bpp);
+ +			bpp = dev_priv->vbt.edp.bpp;
+  		}
+ -	}
+  
+++<<<<<<< HEAD
+++=======
++ 	ret = intel_dp_compute_dsc_params(intel_dp, pipe_config);
++ 	if (ret < 0) {
++ 		DRM_DEBUG_KMS("Cannot compute valid DSC parameters for Input Bpp = %d "
++ 			      "Compressed BPP = %d\n",
++ 			      pipe_config->pipe_bpp,
++ 			      pipe_config->dsc_params.compressed_bpp);
++ 		return ret;
++ 	}
++ 
++ 	pipe_config->dsc_params.compression_enable = true;
++ 	DRM_DEBUG_KMS("DP DSC computed with Input Bpp = %d "
++ 		      "Compressed Bpp = %d Slice Count = %d\n",
++ 		      pipe_config->pipe_bpp,
++ 		      pipe_config->dsc_params.compressed_bpp,
++ 		      pipe_config->dsc_params.slice_count);
++ 
++ 	return 0;
++ }
++ 
++ static int
++ intel_dp_compute_link_config(struct intel_encoder *encoder,
++ 			     struct intel_crtc_state *pipe_config,
++ 			     struct drm_connector_state *conn_state)
++ {
++ 	struct drm_display_mode *adjusted_mode = &pipe_config->base.adjusted_mode;
++ 	struct intel_dp *intel_dp = enc_to_intel_dp(&encoder->base);
++ 	struct link_config_limits limits;
++ 	int common_len;
++ 	int ret;
++ 
++ 	common_len = intel_dp_common_len_rate_limit(intel_dp,
++ 						    intel_dp->max_link_rate);
++ 
++ 	/* No common link rates between source and sink */
++ 	WARN_ON(common_len <= 0);
++ 
++ 	limits.min_clock = 0;
++ 	limits.max_clock = common_len - 1;
++ 
++ 	limits.min_lane_count = 1;
++ 	limits.max_lane_count = intel_dp_max_lane_count(intel_dp);
++ 
++ 	limits.min_bpp = 6 * 3;
++ 	limits.max_bpp = intel_dp_compute_bpp(intel_dp, pipe_config);
++ 
++ 	if (intel_dp_is_edp(intel_dp)) {
+++>>>>>>> f11cb1c19ad0 (drm/i915/dp: revert back to max link rate and lane count on eDP)
+  		/*
+  		 * Use the maximum clock and number of lanes the eDP panel
+  		 * advertizes being capable of. The panels are generally
+@@@ -1815,33 -2012,66 +1952,41 @@@
+  		 * configuration, and typically these values correspond to the
+  		 * native resolution of the panel.
+  		 */
+ -		limits.min_lane_count = limits.max_lane_count;
+ -		limits.min_clock = limits.max_clock;
+ +		min_lane_count = max_lane_count;
+ +		min_clock = max_clock;
+  	}
+  
+ -	intel_dp_adjust_compliance_config(intel_dp, pipe_config, &limits);
+ +	for (; bpp >= 6*3; bpp -= 2*3) {
+ +		mode_rate = intel_dp_link_required(adjusted_mode->crtc_clock,
+ +						   bpp);
+  
+ -	DRM_DEBUG_KMS("DP link computation with max lane count %i "
+ -		      "max rate %d max bpp %d pixel clock %iKHz\n",
+ -		      limits.max_lane_count,
+ -		      intel_dp->common_rates[limits.max_clock],
+ -		      limits.max_bpp, adjusted_mode->crtc_clock);
+ +		for (clock = min_clock; clock <= max_clock; clock++) {
+ +			for (lane_count = min_lane_count;
+ +				lane_count <= max_lane_count;
+ +				lane_count <<= 1) {
+  
+ -	/*
+ -	 * Optimize for slow and wide. This is the place to add alternative
+++<<<<<<< HEAD
+ +				link_clock = intel_dp->common_rates[clock];
+ +				link_avail = intel_dp_max_data_rate(link_clock,
+ +								    lane_count);
+++=======
+++	/*
+++	 * Optimize for slow and wide. This is the place to add alternative
++ 	 * optimization policy.
++ 	 */
++ 	ret = intel_dp_compute_link_config_wide(intel_dp, pipe_config, &limits);
+++>>>>>>> f11cb1c19ad0 (drm/i915/dp: revert back to max link rate and lane count on eDP)
+  
+ -	/* enable compression if the mode doesn't fit available BW */
+ -	DRM_DEBUG_KMS("Force DSC en = %d\n", intel_dp->force_dsc_en);
+ -	if (ret || intel_dp->force_dsc_en) {
+ -		ret = intel_dp_dsc_compute_config(intel_dp, pipe_config,
+ -						  conn_state, &limits);
+ -		if (ret < 0)
+ -			return ret;
+ -	}
+ -
+ -	if (pipe_config->dsc_params.compression_enable) {
+ -		DRM_DEBUG_KMS("DP lane count %d clock %d Input bpp %d Compressed bpp %d\n",
+ -			      pipe_config->lane_count, pipe_config->port_clock,
+ -			      pipe_config->pipe_bpp,
+ -			      pipe_config->dsc_params.compressed_bpp);
+ -
+ -		DRM_DEBUG_KMS("DP link rate required %i available %i\n",
+ -			      intel_dp_link_required(adjusted_mode->crtc_clock,
+ -						     pipe_config->dsc_params.compressed_bpp),
+ -			      intel_dp_max_data_rate(pipe_config->port_clock,
+ -						     pipe_config->lane_count));
+ -	} else {
+ -		DRM_DEBUG_KMS("DP lane count %d clock %d bpp %d\n",
+ -			      pipe_config->lane_count, pipe_config->port_clock,
+ -			      pipe_config->pipe_bpp);
+ -
+ -		DRM_DEBUG_KMS("DP link rate required %i available %i\n",
+ -			      intel_dp_link_required(adjusted_mode->crtc_clock,
+ -						     pipe_config->pipe_bpp),
+ -			      intel_dp_max_data_rate(pipe_config->port_clock,
+ -						     pipe_config->lane_count));
+ +				if (mode_rate <= link_avail) {
+ +					goto found;
+ +				}
+ +			}
+ +		}
+  	}
+ -	return 0;
+ -}
+  
+ -bool intel_dp_limited_color_range(const struct intel_crtc_state *crtc_state,
+ -				  const struct drm_connector_state *conn_state)
+ -{
+ -	const struct intel_digital_connector_state *intel_conn_state =
+ -		to_intel_digital_connector_state(conn_state);
+ -	const struct drm_display_mode *adjusted_mode =
+ -		&crtc_state->base.adjusted_mode;
+ +	return false;
+  
+ +found:
+  	if (intel_conn_state->broadcast_rgb == INTEL_BROADCAST_RGB_AUTO) {
+  		/*
+  		 * See:
+* Unmerged path drivers/gpu/drm/i915/intel_dp.c
