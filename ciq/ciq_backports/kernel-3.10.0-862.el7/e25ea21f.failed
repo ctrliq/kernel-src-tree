@@ -1,0 +1,338 @@
+net: sched: introduce a TRAP control action
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] sched: introduce a TRAP control action (Ivan Vecera) [1445420]
+Rebuild_FUZZ: 93.83%
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit e25ea21ffa66a029acfa89d2611c0e7ef23e7d8c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e25ea21f.failed
+
+There is need to instruct the HW offloaded path to push certain matched
+packets to cpu/kernel for further analysis. So this patch introduces a
+new TRAP control action to TC.
+
+For kernel datapath, this action does not make much sense. So with the
+same logic as in HW, new TRAP behaves similar to STOLEN. The skb is just
+dropped in the datapath (and virtually ejected to an upper level, which
+does not exist in case of kernel).
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Reviewed-by: Yotam Gigi <yotamg@mellanox.com>
+	Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e25ea21ffa66a029acfa89d2611c0e7ef23e7d8c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/pkt_cls.h
+#	net/core/dev.c
+#	net/sched/cls_bpf.c
+#	net/sched/sch_atm.c
+#	net/sched/sch_dsmark.c
+diff --cc include/uapi/linux/pkt_cls.h
+index c8461c78431f,2055783e6ee9..000000000000
+--- a/include/uapi/linux/pkt_cls.h
++++ b/include/uapi/linux/pkt_cls.h
+@@@ -113,7 -36,29 +113,33 @@@ enum 
+  #define TC_ACT_STOLEN		4
+  #define TC_ACT_QUEUED		5
+  #define TC_ACT_REPEAT		6
+++<<<<<<< HEAD
+ +#define TC_ACT_JUMP		0x10000000
+++=======
++ #define TC_ACT_REDIRECT		7
++ #define TC_ACT_TRAP		8 /* For hw path, this means "trap to cpu"
++ 				   * and don't further process the frame
++ 				   * in hardware. For sw path, this is
++ 				   * equivalent of TC_ACT_STOLEN - drop
++ 				   * the skb and act like everything
++ 				   * is alright.
++ 				   */
++ 
++ /* There is a special kind of actions called "extended actions",
++  * which need a value parameter. These have a local opcode located in
++  * the highest nibble, starting from 1. The rest of the bits
++  * are used to carry the value. These two parts together make
++  * a combined opcode.
++  */
++ #define __TC_ACT_EXT_SHIFT 28
++ #define __TC_ACT_EXT(local) ((local) << __TC_ACT_EXT_SHIFT)
++ #define TC_ACT_EXT_VAL_MASK ((1 << __TC_ACT_EXT_SHIFT) - 1)
++ #define TC_ACT_EXT_CMP(combined, opcode) \
++ 	(((combined) & (~TC_ACT_EXT_VAL_MASK)) == opcode)
++ 
++ #define TC_ACT_JUMP __TC_ACT_EXT(1)
++ #define TC_ACT_GOTO_CHAIN __TC_ACT_EXT(2)
+++>>>>>>> e25ea21ffa66 (net: sched: introduce a TRAP control action)
+  
+  /* Action type identifiers*/
+  enum {
+diff --cc net/core/dev.c
+index 54ad82302512,8f72f4a9c6ac..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -3135,6 -3244,48 +3135,51 @@@ int dev_loopback_xmit(struct sock *sk, 
+  }
+  EXPORT_SYMBOL(dev_loopback_xmit);
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NET_EGRESS
++ static struct sk_buff *
++ sch_handle_egress(struct sk_buff *skb, int *ret, struct net_device *dev)
++ {
++ 	struct tcf_proto *cl = rcu_dereference_bh(dev->egress_cl_list);
++ 	struct tcf_result cl_res;
++ 
++ 	if (!cl)
++ 		return skb;
++ 
++ 	/* qdisc_skb_cb(skb)->pkt_len was already set by the caller. */
++ 	qdisc_bstats_cpu_update(cl->q, skb);
++ 
++ 	switch (tcf_classify(skb, cl, &cl_res, false)) {
++ 	case TC_ACT_OK:
++ 	case TC_ACT_RECLASSIFY:
++ 		skb->tc_index = TC_H_MIN(cl_res.classid);
++ 		break;
++ 	case TC_ACT_SHOT:
++ 		qdisc_qstats_cpu_drop(cl->q);
++ 		*ret = NET_XMIT_DROP;
++ 		kfree_skb(skb);
++ 		return NULL;
++ 	case TC_ACT_STOLEN:
++ 	case TC_ACT_QUEUED:
++ 	case TC_ACT_TRAP:
++ 		*ret = NET_XMIT_SUCCESS;
++ 		consume_skb(skb);
++ 		return NULL;
++ 	case TC_ACT_REDIRECT:
++ 		/* No need to push/pop skb's mac_header here on egress! */
++ 		skb_do_redirect(skb);
++ 		*ret = NET_XMIT_SUCCESS;
++ 		return NULL;
++ 	default:
++ 		break;
++ 	}
++ 
++ 	return skb;
++ }
++ #endif /* CONFIG_NET_EGRESS */
++ 
+++>>>>>>> e25ea21ffa66 (net: sched: introduce a TRAP control action)
+  static inline int get_xps_queue(struct net_device *dev, struct sk_buff *skb)
+  {
+  #ifdef CONFIG_XPS
+@@@ -3823,8 -4039,17 +3868,9 @@@ static inline struct sk_buff *handle_in
+  		return NULL;
+  	case TC_ACT_STOLEN:
+  	case TC_ACT_QUEUED:
++ 	case TC_ACT_TRAP:
+  		consume_skb(skb);
+  		return NULL;
+ -	case TC_ACT_REDIRECT:
+ -		/* skb_mac_header check was done by cls/act_bpf, so
+ -		 * we can safely push the L2 header back before
+ -		 * redirecting to another netdev
+ -		 */
+ -		__skb_push(skb, skb->mac_len);
+ -		skb_do_redirect(skb);
+ -		return NULL;
+  	default:
+  		break;
+  	}
+diff --cc net/sched/cls_bpf.c
+index c13fb5505297,a9c56ad4533a..000000000000
+--- a/net/sched/cls_bpf.c
++++ b/net/sched/cls_bpf.c
+@@@ -49,6 -64,21 +49,24 @@@ static const struct nla_policy bpf_poli
+  				    .len = sizeof(struct sock_filter) * BPF_MAXINSNS },
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int cls_bpf_exec_opcode(int code)
++ {
++ 	switch (code) {
++ 	case TC_ACT_OK:
++ 	case TC_ACT_SHOT:
++ 	case TC_ACT_STOLEN:
++ 	case TC_ACT_TRAP:
++ 	case TC_ACT_REDIRECT:
++ 	case TC_ACT_UNSPEC:
++ 		return code;
++ 	default:
++ 		return TC_ACT_UNSPEC;
++ 	}
++ }
++ 
+++>>>>>>> e25ea21ffa66 (net: sched: introduce a TRAP control action)
+  static int cls_bpf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
+  			    struct tcf_result *res)
+  {
+diff --cc net/sched/sch_atm.c
+index 74e837f9d79a,de162592eee0..000000000000
+--- a/net/sched/sch_atm.c
++++ b/net/sched/sch_atm.c
+@@@ -398,10 -406,11 +398,15 @@@ done
+  		switch (result) {
+  		case TC_ACT_QUEUED:
+  		case TC_ACT_STOLEN:
+++<<<<<<< HEAD
+ +			kfree_skb(skb);
+++=======
++ 		case TC_ACT_TRAP:
++ 			__qdisc_drop(skb, to_free);
+++>>>>>>> e25ea21ffa66 (net: sched: introduce a TRAP control action)
+  			return NET_XMIT_SUCCESS | __NET_XMIT_STOLEN;
+  		case TC_ACT_SHOT:
+ -			__qdisc_drop(skb, to_free);
+ +			kfree_skb(skb);
+  			goto drop;
+  		case TC_ACT_RECLASSIFY:
+  			if (flow->excess)
+diff --cc net/sched/sch_dsmark.c
+index 7f6319e334db,6d94fcc3592a..000000000000
+--- a/net/sched/sch_dsmark.c
++++ b/net/sched/sch_dsmark.c
+@@@ -239,7 -243,8 +239,12 @@@ static int dsmark_enqueue(struct sk_buf
+  #ifdef CONFIG_NET_CLS_ACT
+  		case TC_ACT_QUEUED:
+  		case TC_ACT_STOLEN:
+++<<<<<<< HEAD
+ +			kfree_skb(skb);
+++=======
++ 		case TC_ACT_TRAP:
++ 			__qdisc_drop(skb, to_free);
+++>>>>>>> e25ea21ffa66 (net: sched: introduce a TRAP control action)
+  			return NET_XMIT_SUCCESS | __NET_XMIT_STOLEN;
+  
+  		case TC_ACT_SHOT:
+* Unmerged path include/uapi/linux/pkt_cls.h
+* Unmerged path net/core/dev.c
+* Unmerged path net/sched/cls_bpf.c
+* Unmerged path net/sched/sch_atm.c
+diff --git a/net/sched/sch_cbq.c b/net/sched/sch_cbq.c
+index 24f30ccfced6..6db264f54a2c 100644
+--- a/net/sched/sch_cbq.c
++++ b/net/sched/sch_cbq.c
+@@ -252,6 +252,7 @@ cbq_classify(struct sk_buff *skb, struct Qdisc *sch, int *qerr)
+ 		switch (result) {
+ 		case TC_ACT_QUEUED:
+ 		case TC_ACT_STOLEN:
++		case TC_ACT_TRAP:
+ 			*qerr = NET_XMIT_SUCCESS | __NET_XMIT_STOLEN;
+ 		case TC_ACT_SHOT:
+ 			return NULL;
+diff --git a/net/sched/sch_drr.c b/net/sched/sch_drr.c
+index c44f9d3bf69e..fe3f40b21ae5 100644
+--- a/net/sched/sch_drr.c
++++ b/net/sched/sch_drr.c
+@@ -337,6 +337,7 @@ static struct drr_class *drr_classify(struct sk_buff *skb, struct Qdisc *sch,
+ 		switch (result) {
+ 		case TC_ACT_QUEUED:
+ 		case TC_ACT_STOLEN:
++		case TC_ACT_TRAP:
+ 			*qerr = NET_XMIT_SUCCESS | __NET_XMIT_STOLEN;
+ 		case TC_ACT_SHOT:
+ 			return NULL;
+* Unmerged path net/sched/sch_dsmark.c
+diff --git a/net/sched/sch_fq_codel.c b/net/sched/sch_fq_codel.c
+index 7d8847dc1983..5d17fb341368 100644
+--- a/net/sched/sch_fq_codel.c
++++ b/net/sched/sch_fq_codel.c
+@@ -101,6 +101,7 @@ static unsigned int fq_codel_classify(struct sk_buff *skb, struct Qdisc *sch,
+ 		switch (result) {
+ 		case TC_ACT_STOLEN:
+ 		case TC_ACT_QUEUED:
++		case TC_ACT_TRAP:
+ 			*qerr = NET_XMIT_SUCCESS | __NET_XMIT_STOLEN;
+ 		case TC_ACT_SHOT:
+ 			return 0;
+diff --git a/net/sched/sch_hfsc.c b/net/sched/sch_hfsc.c
+index 4ffeb7ff2b61..6ffc07844c69 100644
+--- a/net/sched/sch_hfsc.c
++++ b/net/sched/sch_hfsc.c
+@@ -1145,6 +1145,7 @@ hfsc_classify(struct sk_buff *skb, struct Qdisc *sch, int *qerr)
+ 		switch (result) {
+ 		case TC_ACT_QUEUED:
+ 		case TC_ACT_STOLEN:
++		case TC_ACT_TRAP:
+ 			*qerr = NET_XMIT_SUCCESS | __NET_XMIT_STOLEN;
+ 		case TC_ACT_SHOT:
+ 			return NULL;
+diff --git a/net/sched/sch_htb.c b/net/sched/sch_htb.c
+index 2abcfb74a823..47ab2c0e1acf 100644
+--- a/net/sched/sch_htb.c
++++ b/net/sched/sch_htb.c
+@@ -235,6 +235,7 @@ static struct htb_class *htb_classify(struct sk_buff *skb, struct Qdisc *sch,
+ 		switch (result) {
+ 		case TC_ACT_QUEUED:
+ 		case TC_ACT_STOLEN:
++		case TC_ACT_TRAP:
+ 			*qerr = NET_XMIT_SUCCESS | __NET_XMIT_STOLEN;
+ 		case TC_ACT_SHOT:
+ 			return NULL;
+diff --git a/net/sched/sch_multiq.c b/net/sched/sch_multiq.c
+index 759faafd074d..e39414166d88 100644
+--- a/net/sched/sch_multiq.c
++++ b/net/sched/sch_multiq.c
+@@ -52,6 +52,7 @@ multiq_classify(struct sk_buff *skb, struct Qdisc *sch, int *qerr)
+ 	switch (err) {
+ 	case TC_ACT_STOLEN:
+ 	case TC_ACT_QUEUED:
++	case TC_ACT_TRAP:
+ 		*qerr = NET_XMIT_SUCCESS | __NET_XMIT_STOLEN;
+ 	case TC_ACT_SHOT:
+ 		return NULL;
+diff --git a/net/sched/sch_prio.c b/net/sched/sch_prio.c
+index bda93ee4f685..c0e0530d2a1d 100644
+--- a/net/sched/sch_prio.c
++++ b/net/sched/sch_prio.c
+@@ -47,6 +47,7 @@ prio_classify(struct sk_buff *skb, struct Qdisc *sch, int *qerr)
+ 		switch (err) {
+ 		case TC_ACT_STOLEN:
+ 		case TC_ACT_QUEUED:
++		case TC_ACT_TRAP:
+ 			*qerr = NET_XMIT_SUCCESS | __NET_XMIT_STOLEN;
+ 		case TC_ACT_SHOT:
+ 			return NULL;
+diff --git a/net/sched/sch_qfq.c b/net/sched/sch_qfq.c
+index c65d929a9687..80d2ad40177e 100644
+--- a/net/sched/sch_qfq.c
++++ b/net/sched/sch_qfq.c
+@@ -723,6 +723,7 @@ static struct qfq_class *qfq_classify(struct sk_buff *skb, struct Qdisc *sch,
+ 		switch (result) {
+ 		case TC_ACT_QUEUED:
+ 		case TC_ACT_STOLEN:
++		case TC_ACT_TRAP:
+ 			*qerr = NET_XMIT_SUCCESS | __NET_XMIT_STOLEN;
+ 		case TC_ACT_SHOT:
+ 			return NULL;
+diff --git a/net/sched/sch_sfb.c b/net/sched/sch_sfb.c
+index ba31a5b026c4..e4cf87acb872 100644
+--- a/net/sched/sch_sfb.c
++++ b/net/sched/sch_sfb.c
+@@ -264,6 +264,7 @@ static bool sfb_classify(struct sk_buff *skb, struct tcf_proto *fl,
+ 		switch (result) {
+ 		case TC_ACT_STOLEN:
+ 		case TC_ACT_QUEUED:
++		case TC_ACT_TRAP:
+ 			*qerr = NET_XMIT_SUCCESS | __NET_XMIT_STOLEN;
+ 		case TC_ACT_SHOT:
+ 			return false;
+diff --git a/net/sched/sch_sfq.c b/net/sched/sch_sfq.c
+index 24f2e8978693..b7dac926a940 100644
+--- a/net/sched/sch_sfq.c
++++ b/net/sched/sch_sfq.c
+@@ -185,6 +185,7 @@ static unsigned int sfq_classify(struct sk_buff *skb, struct Qdisc *sch,
+ 		switch (result) {
+ 		case TC_ACT_STOLEN:
+ 		case TC_ACT_QUEUED:
++		case TC_ACT_TRAP:
+ 			*qerr = NET_XMIT_SUCCESS | __NET_XMIT_STOLEN;
+ 		case TC_ACT_SHOT:
+ 			return 0;
