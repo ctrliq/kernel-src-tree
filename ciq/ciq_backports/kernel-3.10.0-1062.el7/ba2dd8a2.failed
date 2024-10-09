@@ -1,0 +1,131 @@
+powerpc/pseries/mm: call H_BLOCK_REMOVE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [powerpc] pseries/mm: call H_BLOCK_REMOVE (Steve Best) [1650255]
+Rebuild_FUZZ: 88.57%
+commit-author Laurent Dufour <ldufour@linux.vnet.ibm.com>
+commit ba2dd8a26baa7e140555746d396e32952709c42d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/ba2dd8a2.failed
+
+This hypervisor's call allows to remove up to 8 ptes with only call to
+tlbie.
+
+The virtual pages must be all within the same naturally aligned 8 pages
+virtual address block and have the same page and segment size encodings.
+
+	Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.ibm.com>
+	Cc: Nicholas Piggin <npiggin@gmail.com>
+	Cc: Michael Ellerman <mpe@ellerman.id.au>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Signed-off-by: Laurent Dufour <ldufour@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit ba2dd8a26baa7e140555746d396e32952709c42d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/pseries/lpar.c
+diff --cc arch/powerpc/platforms/pseries/lpar.c
+index 06cdf447d9fa,0b5081085a44..000000000000
+--- a/arch/powerpc/platforms/pseries/lpar.c
++++ b/arch/powerpc/platforms/pseries/lpar.c
+@@@ -419,6 -417,80 +419,83 @@@ static void pSeries_lpar_hpte_invalidat
+  	BUG_ON(lpar_rc != H_SUCCESS);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * As defined in the PAPR's section 14.5.4.1.8
++  * The control mask doesn't include the returned reference and change bit from
++  * the processed PTE.
++  */
++ #define HBLKR_AVPN		0x0100000000000000UL
++ #define HBLKR_CTRL_MASK		0xf800000000000000UL
++ #define HBLKR_CTRL_SUCCESS	0x8000000000000000UL
++ #define HBLKR_CTRL_ERRNOTFOUND	0x8800000000000000UL
++ #define HBLKR_CTRL_ERRBUSY	0xa000000000000000UL
++ 
++ /**
++  * H_BLOCK_REMOVE caller.
++  * @idx should point to the latest @param entry set with a PTEX.
++  * If PTE cannot be processed because another CPUs has already locked that
++  * group, those entries are put back in @param starting at index 1.
++  * If entries has to be retried and @retry_busy is set to true, these entries
++  * are retried until success. If @retry_busy is set to false, the returned
++  * is the number of entries yet to process.
++  */
++ static unsigned long call_block_remove(unsigned long idx, unsigned long *param,
++ 				       bool retry_busy)
++ {
++ 	unsigned long i, rc, new_idx;
++ 	unsigned long retbuf[PLPAR_HCALL9_BUFSIZE];
++ 
++ 	if (idx < 2) {
++ 		pr_warn("Unexpected empty call to H_BLOCK_REMOVE");
++ 		return 0;
++ 	}
++ again:
++ 	new_idx = 0;
++ 	if (idx > PLPAR_HCALL9_BUFSIZE) {
++ 		pr_err("Too many PTEs (%lu) for H_BLOCK_REMOVE", idx);
++ 		idx = PLPAR_HCALL9_BUFSIZE;
++ 	} else if (idx < PLPAR_HCALL9_BUFSIZE)
++ 		param[idx] = HBR_END;
++ 
++ 	rc = plpar_hcall9(H_BLOCK_REMOVE, retbuf,
++ 			  param[0], /* AVA */
++ 			  param[1],  param[2],  param[3],  param[4], /* TS0-7 */
++ 			  param[5],  param[6],  param[7],  param[8]);
++ 	if (rc == H_SUCCESS)
++ 		return 0;
++ 
++ 	BUG_ON(rc != H_PARTIAL);
++ 
++ 	/* Check that the unprocessed entries were 'not found' or 'busy' */
++ 	for (i = 0; i < idx-1; i++) {
++ 		unsigned long ctrl = retbuf[i] & HBLKR_CTRL_MASK;
++ 
++ 		if (ctrl == HBLKR_CTRL_ERRBUSY) {
++ 			param[++new_idx] = param[i+1];
++ 			continue;
++ 		}
++ 
++ 		BUG_ON(ctrl != HBLKR_CTRL_SUCCESS
++ 		       && ctrl != HBLKR_CTRL_ERRNOTFOUND);
++ 	}
++ 
++ 	/*
++ 	 * If there were entries found busy, retry these entries if requested,
++ 	 * of if all the entries have to be retried.
++ 	 */
++ 	if (new_idx && (retry_busy || new_idx == (PLPAR_HCALL9_BUFSIZE-1))) {
++ 		idx = new_idx + 1;
++ 		goto again;
++ 	}
++ 
++ 	return new_idx;
++ }
++ 
++ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+++>>>>>>> ba2dd8a26baa (powerpc/pseries/mm: call H_BLOCK_REMOVE)
+  /*
+   * Limit iterations holding pSeries_lpar_tlbie_lock to 3. We also need
+   * to make sure that we avoid bouncing the hypervisor tlbie lock.
+diff --git a/arch/powerpc/include/asm/hvcall.h b/arch/powerpc/include/asm/hvcall.h
+index 5ec34cede8dd..98457634a93d 100644
+--- a/arch/powerpc/include/asm/hvcall.h
++++ b/arch/powerpc/include/asm/hvcall.h
+@@ -276,6 +276,7 @@
+ #define H_COP			0x304
+ #define H_GET_MPP_X		0x314
+ #define H_SET_MODE		0x31C
++#define H_BLOCK_REMOVE		0x328
+ #define H_CLEAR_HPT		0x358
+ #define H_RESIZE_HPT_PREPARE	0x36C
+ #define H_RESIZE_HPT_COMMIT	0x370
+* Unmerged path arch/powerpc/platforms/pseries/lpar.c
