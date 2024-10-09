@@ -1,0 +1,227 @@
+nfp: bpf: add map data structure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 4da98eea7903670d7b1d9ac83bbc6502a60bf0fd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/4da98eea.failed
+
+To be able to split code into reasonable chunks we need to add
+the map data structures already.  Later patches will add code
+piece by piece.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 4da98eea7903670d7b1d9ac83bbc6502a60bf0fd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/bpf/main.c
+#	drivers/net/ethernet/netronome/nfp/bpf/main.h
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/main.c
+index 60a7af297852,c9fd7d417d1a..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.c
+@@@ -143,6 -201,139 +143,142 @@@ static bool nfp_bpf_tc_busy(struct nfp_
+  	return !!bv->tc_prog;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ nfp_bpf_change_mtu(struct nfp_app *app, struct net_device *netdev, int new_mtu)
++ {
++ 	struct nfp_net *nn = netdev_priv(netdev);
++ 	unsigned int max_mtu;
++ 
++ 	if (~nn->dp.ctrl & NFP_NET_CFG_CTRL_BPF)
++ 		return 0;
++ 
++ 	max_mtu = nn_readb(nn, NFP_NET_CFG_BPF_INL_MTU) * 64 - 32;
++ 	if (new_mtu > max_mtu) {
++ 		nn_info(nn, "BPF offload active, MTU over %u not supported\n",
++ 			max_mtu);
++ 		return -EBUSY;
++ 	}
++ 	return 0;
++ }
++ 
++ static int
++ nfp_bpf_parse_cap_adjust_head(struct nfp_app_bpf *bpf, void __iomem *value,
++ 			      u32 length)
++ {
++ 	struct nfp_bpf_cap_tlv_adjust_head __iomem *cap = value;
++ 	struct nfp_cpp *cpp = bpf->app->pf->cpp;
++ 
++ 	if (length < sizeof(*cap)) {
++ 		nfp_err(cpp, "truncated adjust_head TLV: %d\n", length);
++ 		return -EINVAL;
++ 	}
++ 
++ 	bpf->adjust_head.flags = readl(&cap->flags);
++ 	bpf->adjust_head.off_min = readl(&cap->off_min);
++ 	bpf->adjust_head.off_max = readl(&cap->off_max);
++ 	bpf->adjust_head.guaranteed_sub = readl(&cap->guaranteed_sub);
++ 	bpf->adjust_head.guaranteed_add = readl(&cap->guaranteed_add);
++ 
++ 	if (bpf->adjust_head.off_min > bpf->adjust_head.off_max) {
++ 		nfp_err(cpp, "invalid adjust_head TLV: min > max\n");
++ 		return -EINVAL;
++ 	}
++ 	if (!FIELD_FIT(UR_REG_IMM_MAX, bpf->adjust_head.off_min) ||
++ 	    !FIELD_FIT(UR_REG_IMM_MAX, bpf->adjust_head.off_max)) {
++ 		nfp_warn(cpp, "disabling adjust_head - driver expects min/max to fit in as immediates\n");
++ 		memset(&bpf->adjust_head, 0, sizeof(bpf->adjust_head));
++ 		return 0;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int nfp_bpf_parse_capabilities(struct nfp_app *app)
++ {
++ 	struct nfp_cpp *cpp = app->pf->cpp;
++ 	struct nfp_cpp_area *area;
++ 	u8 __iomem *mem, *start;
++ 
++ 	mem = nfp_rtsym_map(app->pf->rtbl, "_abi_bpf_capabilities", "bpf.cap",
++ 			    8, &area);
++ 	if (IS_ERR(mem))
++ 		return PTR_ERR(mem) == -ENOENT ? 0 : PTR_ERR(mem);
++ 
++ 	start = mem;
++ 	while (mem - start + 8 < nfp_cpp_area_size(area)) {
++ 		u8 __iomem *value;
++ 		u32 type, length;
++ 
++ 		type = readl(mem);
++ 		length = readl(mem + 4);
++ 		value = mem + 8;
++ 
++ 		mem += 8 + length;
++ 		if (mem - start > nfp_cpp_area_size(area))
++ 			goto err_release_free;
++ 
++ 		switch (type) {
++ 		case NFP_BPF_CAP_TYPE_ADJUST_HEAD:
++ 			if (nfp_bpf_parse_cap_adjust_head(app->priv, value,
++ 							  length))
++ 				goto err_release_free;
++ 			break;
++ 		default:
++ 			nfp_dbg(cpp, "unknown BPF capability: %d\n", type);
++ 			break;
++ 		}
++ 	}
++ 	if (mem - start != nfp_cpp_area_size(area)) {
++ 		nfp_err(cpp, "BPF capabilities left after parsing, parsed:%zd total length:%zu\n",
++ 			mem - start, nfp_cpp_area_size(area));
++ 		goto err_release_free;
++ 	}
++ 
++ 	nfp_cpp_area_release_free(area);
++ 
++ 	return 0;
++ 
++ err_release_free:
++ 	nfp_err(cpp, "invalid BPF capabilities at offset:%zd\n", mem - start);
++ 	nfp_cpp_area_release_free(area);
++ 	return -EINVAL;
++ }
++ 
++ static int nfp_bpf_init(struct nfp_app *app)
++ {
++ 	struct nfp_app_bpf *bpf;
++ 	int err;
++ 
++ 	bpf = kzalloc(sizeof(*bpf), GFP_KERNEL);
++ 	if (!bpf)
++ 		return -ENOMEM;
++ 	bpf->app = app;
++ 	app->priv = bpf;
++ 
++ 	INIT_LIST_HEAD(&bpf->map_list);
++ 
++ 	err = nfp_bpf_parse_capabilities(app);
++ 	if (err)
++ 		goto err_free_bpf;
++ 
++ 	return 0;
++ 
++ err_free_bpf:
++ 	kfree(bpf);
++ 	return err;
++ }
++ 
++ static void nfp_bpf_clean(struct nfp_app *app)
++ {
++ 	struct nfp_app_bpf *bpf = app->priv;
++ 
++ 	WARN_ON(!list_empty(&bpf->map_list));
++ 	kfree(bpf);
++ }
++ 
+++>>>>>>> 4da98eea7903 (nfp: bpf: add map data structure)
+  const struct nfp_app_type app_bpf = {
+  	.id		= NFP_APP_BPF_NIC,
+  	.name		= "ebpf",
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 5212b54abaf7,23763b22f8fc..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@@ -85,6 -89,47 +85,50 @@@ enum nfp_bpf_action_type 
+  #define NFP_BPF_ABI_FLAGS	reg_imm(0)
+  #define   NFP_BPF_ABI_FLAG_MARK	1
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * struct nfp_app_bpf - bpf app priv structure
++  * @app:		backpointer to the app
++  *
++  * @map_list:		list of offloaded maps
++  *
++  * @adjust_head:	adjust head capability
++  * @flags:		extra flags for adjust head
++  * @off_min:		minimal packet offset within buffer required
++  * @off_max:		maximum packet offset within buffer required
++  * @guaranteed_sub:	amount of negative adjustment guaranteed possible
++  * @guaranteed_add:	amount of positive adjustment guaranteed possible
++  */
++ struct nfp_app_bpf {
++ 	struct nfp_app *app;
++ 
++ 	struct list_head map_list;
++ 
++ 	struct nfp_bpf_cap_adjust_head {
++ 		u32 flags;
++ 		int off_min;
++ 		int off_max;
++ 		int guaranteed_sub;
++ 		int guaranteed_add;
++ 	} adjust_head;
++ };
++ 
++ /**
++  * struct nfp_bpf_map - private per-map data attached to BPF maps for offload
++  * @offmap:	pointer to the offloaded BPF map
++  * @bpf:	back pointer to bpf app private structure
++  * @tid:	table id identifying map on datapath
++  * @l:		link on the nfp_app_bpf->map_list list
++  */
++ struct nfp_bpf_map {
++ 	struct bpf_offloaded_map *offmap;
++ 	struct nfp_app_bpf *bpf;
++ 	u32 tid;
++ 	struct list_head l;
++ };
++ 
+++>>>>>>> 4da98eea7903 (nfp: bpf: add map data structure)
+  struct nfp_prog;
+  struct nfp_insn_meta;
+  typedef int (*instr_cb_t)(struct nfp_prog *, struct nfp_insn_meta *);
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/main.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/main.h
