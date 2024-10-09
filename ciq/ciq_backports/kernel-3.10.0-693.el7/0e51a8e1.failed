@@ -1,0 +1,532 @@
+xfs: optimize bio handling in the buffer writeback path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 0e51a8e191dbd9b9c7b7bb0a1c28d57cd2be8e6a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/0e51a8e1.failed
+
+This patch implements two closely related changes:  First it embeds
+a bio the ioend structure so that we don't have to allocate one
+separately.  Second it uses the block layer bio chaining mechanism
+to chain additional bios off this first one if needed instead of
+manually accounting for multiple bio completions in the ioend
+structure.  Together this removes a memory allocation per ioend and
+greatly simplifies the ioend setup and I/O completion path.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit 0e51a8e191dbd9b9c7b7bb0a1c28d57cd2be8e6a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_aops.c
+#	fs/xfs/xfs_aops.h
+diff --cc fs/xfs/xfs_aops.c
+index acf6c4a54883,b5f1c66bbb58..000000000000
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@@ -77,16 -124,32 +77,42 @@@ xfs_find_bdev_for_inode
+   */
+  STATIC void
+  xfs_destroy_ioend(
+++<<<<<<< HEAD
+ +	xfs_ioend_t		*ioend)
+ +{
+ +	struct buffer_head	*bh, *next;
+ +
+ +	for (bh = ioend->io_buffer_head; bh; bh = next) {
+ +		next = bh->b_private;
+ +		bh->b_end_io(bh, !ioend->io_error);
+- 	}
+++=======
++ 	struct xfs_ioend	*ioend,
++ 	int			error)
++ {
++ 	struct inode		*inode = ioend->io_inode;
++ 	struct bio		*last = ioend->io_bio;
++ 	struct bio		*bio, *next;
+  
+- 	mempool_free(ioend, xfs_ioend_pool);
++ 	for (bio = &ioend->io_inline_bio; bio; bio = next) {
++ 		struct bio_vec	*bvec;
++ 		int		i;
++ 
++ 		/*
++ 		 * For the last bio, bi_private points to the ioend, so we
++ 		 * need to explicitly end the iteration here.
++ 		 */
++ 		if (bio == last)
++ 			next = NULL;
++ 		else
++ 			next = bio->bi_private;
++ 
++ 		/* walk each page on bio, ending page IO on them */
++ 		bio_for_each_segment_all(bvec, bio, i)
++ 			xfs_finish_page_writeback(inode, bvec, error);
++ 
++ 		bio_put(bio);
+++>>>>>>> 0e51a8e191db (xfs: optimize bio handling in the buffer writeback path)
++ 	}
+  }
+  
+  /*
+@@@ -172,13 -235,12 +199,13 @@@ xfs_setfilesize_ioend
+  	 * Similarly for freeze protection.
+  	 */
+  	current_set_flags_nested(&tp->t_pflags, PF_FSTRANS);
+ -	__sb_writers_acquired(VFS_I(ip)->i_sb, SB_FREEZE_FS);
+ +	rwsem_acquire_read(&VFS_I(ip)->i_sb->s_writers.lock_map[SB_FREEZE_FS-1],
+ +			   0, 1, _THIS_IP_);
+  
+  	/* we abort the update if there was an IO error */
+- 	if (ioend->io_error) {
++ 	if (error) {
+  		xfs_trans_cancel(tp);
+- 		return ioend->io_error;
++ 		return error;
+  	}
+  
+  	return xfs_setfilesize(ip, tp, ioend->io_offset, ioend->io_size);
+@@@ -243,44 -284,22 +249,45 @@@ xfs_end_io
+  	}
+  
+  done:
+- 	if (error)
+- 		ioend->io_error = error;
+- 	xfs_destroy_ioend(ioend);
++ 	xfs_destroy_ioend(ioend, error);
+  }
+  
+- /*
+-  * Allocate and initialise an IO completion structure.
+-  * We need to track unwritten extent write completion here initially.
+-  * We'll need to extend this for updating the ondisk inode size later
+-  * (vs. incore size).
+-  */
+- STATIC xfs_ioend_t *
+- xfs_alloc_ioend(
+- 	struct inode		*inode,
+- 	unsigned int		type)
++ STATIC void
++ xfs_end_bio(
++ 	struct bio		*bio)
+  {
+- 	xfs_ioend_t		*ioend;
++ 	struct xfs_ioend	*ioend = bio->bi_private;
++ 	struct xfs_mount	*mp = XFS_I(ioend->io_inode)->i_mount;
+  
+++<<<<<<< HEAD
+ +	ioend = mempool_alloc(xfs_ioend_pool, GFP_NOFS);
+ +
+ +	/*
+ +	 * Set the count to 1 initially, which will prevent an I/O
+ +	 * completion callback from happening before we have started
+ +	 * all the I/O from calling the completion routine too early.
+ +	 */
+ +	atomic_set(&ioend->io_remaining, 1);
+ +	ioend->io_error = 0;
+ +	ioend->io_list = NULL;
+ +	ioend->io_type = type;
+ +	ioend->io_inode = inode;
+ +	ioend->io_buffer_head = NULL;
+ +	ioend->io_buffer_tail = NULL;
+ +	ioend->io_offset = 0;
+ +	ioend->io_size = 0;
+ +	ioend->io_append_trans = NULL;
+ +
+ +	INIT_WORK(&ioend->io_work, xfs_end_io);
+ +	return ioend;
+++=======
++ 	if (ioend->io_type == XFS_IO_UNWRITTEN)
++ 		queue_work(mp->m_unwritten_workqueue, &ioend->io_work);
++ 	else if (ioend->io_append_trans)
++ 		queue_work(mp->m_data_workqueue, &ioend->io_work);
++ 	else
++ 		xfs_destroy_ioend(ioend, bio->bi_error);
+++>>>>>>> 0e51a8e191db (xfs: optimize bio handling in the buffer writeback path)
+  }
+  
+  STATIC int
+@@@ -352,53 -371,6 +359,56 @@@ xfs_imap_valid
+  		offset < imap->br_startoff + imap->br_blockcount;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * BIO completion handler for buffered IO.
+ + */
+ +STATIC void
+ +xfs_end_bio(
+ +	struct bio		*bio,
+ +	int			error)
+ +{
+ +	xfs_ioend_t		*ioend = bio->bi_private;
+ +
+ +	ASSERT(atomic_read(&bio->bi_cnt) >= 1);
+ +	if (!ioend->io_error && !test_bit(BIO_UPTODATE, &bio->bi_flags))
+ +		ioend->io_error = error;
+ +
+ +	/* Toss bio and pass work off to an xfsdatad thread */
+ +	bio->bi_private = NULL;
+ +	bio->bi_end_io = NULL;
+ +	bio_put(bio);
+ +
+ +	xfs_finish_ioend(ioend);
+ +}
+ +
+ +STATIC void
+ +xfs_submit_ioend_bio(
+ +	struct writeback_control *wbc,
+ +	xfs_ioend_t		*ioend,
+ +	struct bio		*bio)
+ +{
+ +	atomic_inc(&ioend->io_remaining);
+ +	bio->bi_private = ioend;
+ +	bio->bi_end_io = xfs_end_bio;
+ +	submit_bio(wbc->sync_mode == WB_SYNC_ALL ? WRITE_SYNC : WRITE, bio);
+ +}
+ +
+ +STATIC struct bio *
+ +xfs_alloc_ioend_bio(
+ +	struct buffer_head	*bh)
+ +{
+ +	int			nvecs = bio_get_nr_vecs(bh->b_bdev);
+ +	struct bio		*bio = bio_alloc(GFP_NOIO, nvecs);
+ +
+ +	ASSERT(bio->bi_private == NULL);
+ +	bio->bi_sector = bh->b_blocknr * (bh->b_size >> 9);
+ +	bio->bi_bdev = bh->b_bdev;
+ +	return bio;
+ +}
+ +
+++=======
+++>>>>>>> 0e51a8e191db (xfs: optimize bio handling in the buffer writeback path)
+  STATIC void
+  xfs_start_buffer_writeback(
+  	struct buffer_head	*bh)
+@@@ -466,67 -424,100 +476,157 @@@ static inline int xfs_bio_add_buffer(st
+   *
+   * If @fail is non-zero, it means that we have a situation where some part of
+   * the submission process has failed after we have marked paged for writeback
+ - * and unlocked them. In this situation, we need to fail the bio and ioend
+ - * rather than submit it to IO. This typically only happens on a filesystem
+ - * shutdown.
+ + * and unlocked them. In this situation, we need to fail the ioend chain rather
+ + * than submit it to IO. This typically only happens on a filesystem shutdown.
+   */
+ -STATIC int
+ +STATIC void
+  xfs_submit_ioend(
+  	struct writeback_control *wbc,
+++<<<<<<< HEAD
+ +	xfs_ioend_t		*ioend,
+ +	int			fail)
+ +{
+ +	xfs_ioend_t		*head = ioend;
+ +	xfs_ioend_t		*next;
+ +	struct buffer_head	*bh;
+ +	struct bio		*bio;
+ +	sector_t		lastblock = 0;
+ +
+ +	/* Pass 1 - start writeback */
+ +	do {
+ +		next = ioend->io_list;
+ +		for (bh = ioend->io_buffer_head; bh; bh = bh->b_private)
+ +			xfs_start_buffer_writeback(bh);
+ +	} while ((ioend = next) != NULL);
+ +
+ +	/* Pass 2 - submit I/O */
+ +	ioend = head;
+ +	do {
+ +		next = ioend->io_list;
+ +		bio = NULL;
+ +
+ +		/*
+ +		 * If we are failing the IO now, just mark the ioend with an
+ +		 * error and finish it. This will run IO completion immediately
+ +		 * as there is only one reference to the ioend at this point in
+ +		 * time.
+ +		 */
+ +		if (fail) {
+ +			ioend->io_error = fail;
+ +			xfs_finish_ioend(ioend);
+ +			continue;
+ +		}
+ +
+ +		for (bh = ioend->io_buffer_head; bh; bh = bh->b_private) {
+ +
+ +			if (!bio) {
+ + retry:
+ +				bio = xfs_alloc_ioend_bio(bh);
+ +			} else if (bh->b_blocknr != lastblock + 1) {
+ +				xfs_submit_ioend_bio(wbc, ioend, bio);
+ +				goto retry;
+ +			}
+ +
+ +			if (xfs_bio_add_buffer(bio, bh) != bh->b_size) {
+ +				xfs_submit_ioend_bio(wbc, ioend, bio);
+ +				goto retry;
+ +			}
+ +
+ +			lastblock = bh->b_blocknr;
+ +		}
+ +		if (bio)
+ +			xfs_submit_ioend_bio(wbc, ioend, bio);
+ +		xfs_finish_ioend(ioend);
+ +	} while ((ioend = next) != NULL);
+++=======
++ 	struct xfs_ioend	*ioend,
++ 	int			status)
++ {
++ 	/* Reserve log space if we might write beyond the on-disk inode size. */
++ 	if (!status &&
++ 	    ioend->io_type != XFS_IO_UNWRITTEN &&
++ 	    xfs_ioend_is_append(ioend) &&
++ 	    !ioend->io_append_trans)
++ 		status = xfs_setfilesize_trans_alloc(ioend);
++ 
++ 	ioend->io_bio->bi_private = ioend;
++ 	ioend->io_bio->bi_end_io = xfs_end_bio;
++ 
++ 	/*
++ 	 * If we are failing the IO now, just mark the ioend with an
++ 	 * error and finish it. This will run IO completion immediately
++ 	 * as there is only one reference to the ioend at this point in
++ 	 * time.
++ 	 */
++ 	if (status) {
++ 		ioend->io_bio->bi_error = status;
++ 		bio_endio(ioend->io_bio);
++ 		return status;
++ 	}
++ 
++ 	submit_bio(wbc->sync_mode == WB_SYNC_ALL ? WRITE_SYNC : WRITE,
++ 		   ioend->io_bio);
++ 	return 0;
+++>>>>>>> 0e51a8e191db (xfs: optimize bio handling in the buffer writeback path)
++ }
++ 
++ static void
++ xfs_init_bio_from_bh(
++ 	struct bio		*bio,
++ 	struct buffer_head	*bh)
++ {
++ 	bio->bi_iter.bi_sector = bh->b_blocknr * (bh->b_size >> 9);
++ 	bio->bi_bdev = bh->b_bdev;
++ }
++ 
++ static struct xfs_ioend *
++ xfs_alloc_ioend(
++ 	struct inode		*inode,
++ 	unsigned int		type,
++ 	xfs_off_t		offset,
++ 	struct buffer_head	*bh)
++ {
++ 	struct xfs_ioend	*ioend;
++ 	struct bio		*bio;
++ 
++ 	bio = bio_alloc_bioset(GFP_NOFS, BIO_MAX_PAGES, xfs_ioend_bioset);
++ 	xfs_init_bio_from_bh(bio, bh);
++ 
++ 	ioend = container_of(bio, struct xfs_ioend, io_inline_bio);
++ 	INIT_LIST_HEAD(&ioend->io_list);
++ 	ioend->io_type = type;
++ 	ioend->io_inode = inode;
++ 	ioend->io_size = 0;
++ 	ioend->io_offset = offset;
++ 	INIT_WORK(&ioend->io_work, xfs_end_io);
++ 	ioend->io_append_trans = NULL;
++ 	ioend->io_bio = bio;
++ 	return ioend;
++ }
++ 
++ /*
++  * Allocate a new bio, and chain the old bio to the new one.
++  *
++  * Note that we have to do perform the chaining in this unintuitive order
++  * so that the bi_private linkage is set up in the right direction for the
++  * traversal in xfs_destroy_ioend().
++  */
++ static void
++ xfs_chain_bio(
++ 	struct xfs_ioend	*ioend,
++ 	struct writeback_control *wbc,
++ 	struct buffer_head	*bh)
++ {
++ 	struct bio *new;
++ 
++ 	new = bio_alloc(GFP_NOFS, BIO_MAX_PAGES);
++ 	xfs_init_bio_from_bh(new, bh);
++ 
++ 	bio_chain(ioend->io_bio, new);
++ 	bio_get(ioend->io_bio);		/* for xfs_destroy_ioend */
++ 	submit_bio(wbc->sync_mode == WB_SYNC_ALL ? WRITE_SYNC : WRITE,
++ 		   ioend->io_bio);
++ 	ioend->io_bio = new;
+  }
+  
+  /*
+@@@ -540,29 -532,28 +640,50 @@@ xfs_add_to_ioend
+  	struct inode		*inode,
+  	struct buffer_head	*bh,
+  	xfs_off_t		offset,
+ -	struct xfs_writepage_ctx *wpc,
+ -	struct writeback_control *wbc,
+ -	struct list_head	*iolist)
+ +	unsigned int		type,
+ +	xfs_ioend_t		**result,
+ +	int			need_ioend)
+  {
+++<<<<<<< HEAD
+ +	xfs_ioend_t		*ioend = *result;
+ +
+ +	if (!ioend || need_ioend || type != ioend->io_type) {
+ +		xfs_ioend_t	*previous = *result;
+ +
+ +		ioend = xfs_alloc_ioend(inode, type);
+ +		ioend->io_offset = offset;
+ +		ioend->io_buffer_head = bh;
+ +		ioend->io_buffer_tail = bh;
+ +		if (previous)
+ +			previous->io_list = ioend;
+ +		*result = ioend;
+ +	} else {
+ +		ioend->io_buffer_tail->b_private = bh;
+ +		ioend->io_buffer_tail = bh;
+ +	}
+ +
+ +	bh->b_private = NULL;
+ +	ioend->io_size += bh->b_size;
+++=======
++ 	if (!wpc->ioend || wpc->io_type != wpc->ioend->io_type ||
++ 	    bh->b_blocknr != wpc->last_block + 1 ||
++ 	    offset != wpc->ioend->io_offset + wpc->ioend->io_size) {
++ 		if (wpc->ioend)
++ 			list_add(&wpc->ioend->io_list, iolist);
++ 		wpc->ioend = xfs_alloc_ioend(inode, wpc->io_type, offset, bh);
++ 	}
++ 
++ 	/*
++ 	 * If the buffer doesn't fit into the bio we need to allocate a new
++ 	 * one.  This shouldn't happen more than once for a given buffer.
++ 	 */
++ 	while (xfs_bio_add_buffer(wpc->ioend->io_bio, bh) != bh->b_size)
++ 		xfs_chain_bio(wpc->ioend, wbc, bh);
++ 
++ 	wpc->ioend->io_size += bh->b_size;
++ 	wpc->last_block = bh->b_blocknr;
++ 	xfs_start_buffer_writeback(bh);
+++>>>>>>> 0e51a8e191db (xfs: optimize bio handling in the buffer writeback path)
+  }
+  
+  STATIC void
+diff --cc fs/xfs/xfs_aops.h
+index a4343c63fb38,814aab790713..000000000000
+--- a/fs/xfs/xfs_aops.h
++++ b/fs/xfs/xfs_aops.h
+@@@ -35,22 -37,19 +35,30 @@@ enum 
+  	{ XFS_IO_OVERWRITE,		"overwrite" }
+  
+  /*
+-  * xfs_ioend struct manages large extent writes for XFS.
+-  * It can manage several multi-page bio's at once.
++  * Structure for buffered I/O completions.
+   */
+++<<<<<<< HEAD
+ +typedef struct xfs_ioend {
+ +	struct xfs_ioend	*io_list;	/* next ioend in chain */
+++=======
++ struct xfs_ioend {
++ 	struct list_head	io_list;	/* next ioend in chain */
+++>>>>>>> 0e51a8e191db (xfs: optimize bio handling in the buffer writeback path)
+  	unsigned int		io_type;	/* delalloc / unwritten */
+- 	int			io_error;	/* I/O error code */
+- 	atomic_t		io_remaining;	/* hold count */
+  	struct inode		*io_inode;	/* file being written to */
+ +	struct buffer_head	*io_buffer_head;/* buffer linked list head */
+ +	struct buffer_head	*io_buffer_tail;/* buffer linked list tail */
+  	size_t			io_size;	/* size of the extent */
+  	xfs_off_t		io_offset;	/* offset in the file */
+  	struct work_struct	io_work;	/* xfsdatad work queue */
+  	struct xfs_trans	*io_append_trans;/* xact. for size update */
+++<<<<<<< HEAD
+ +} xfs_ioend_t;
+++=======
++ 	struct bio		*io_bio;	/* bio being built */
++ 	struct bio		io_inline_bio;	/* MUST BE LAST! */
++ };
+++>>>>>>> 0e51a8e191db (xfs: optimize bio handling in the buffer writeback path)
+  
+  extern const struct address_space_operations xfs_address_space_operations;
+  
+* Unmerged path fs/xfs/xfs_aops.c
+* Unmerged path fs/xfs/xfs_aops.h
+diff --git a/fs/xfs/xfs_super.c b/fs/xfs/xfs_super.c
+index addf8e0edd3b..74e256937234 100644
+--- a/fs/xfs/xfs_super.c
++++ b/fs/xfs/xfs_super.c
+@@ -58,8 +58,7 @@
+ #include <linux/parser.h>
+ 
+ static const struct super_operations xfs_super_operations;
+-static kmem_zone_t *xfs_ioend_zone;
+-mempool_t *xfs_ioend_pool;
++struct bio_set *xfs_ioend_bioset;
+ 
+ static struct kset *xfs_kset;		/* top-level xfs sysfs dir */
+ #ifdef DEBUG
+@@ -1700,20 +1699,15 @@ MODULE_ALIAS_FS("xfs");
+ STATIC int __init
+ xfs_init_zones(void)
+ {
+-
+-	xfs_ioend_zone = kmem_zone_init(sizeof(xfs_ioend_t), "xfs_ioend");
+-	if (!xfs_ioend_zone)
++	xfs_ioend_bioset = bioset_create(4 * MAX_BUF_PER_PAGE,
++			offsetof(struct xfs_ioend, io_inline_bio));
++	if (!xfs_ioend_bioset)
+ 		goto out;
+ 
+-	xfs_ioend_pool = mempool_create_slab_pool(4 * MAX_BUF_PER_PAGE,
+-						  xfs_ioend_zone);
+-	if (!xfs_ioend_pool)
+-		goto out_destroy_ioend_zone;
+-
+ 	xfs_log_ticket_zone = kmem_zone_init(sizeof(xlog_ticket_t),
+ 						"xfs_log_ticket");
+ 	if (!xfs_log_ticket_zone)
+-		goto out_destroy_ioend_pool;
++		goto out_free_ioend_bioset;
+ 
+ 	xfs_bmap_free_item_zone = kmem_zone_init(sizeof(xfs_bmap_free_item_t),
+ 						"xfs_bmap_free_item");
+@@ -1809,10 +1803,8 @@ xfs_init_zones(void)
+ 	kmem_zone_destroy(xfs_bmap_free_item_zone);
+  out_destroy_log_ticket_zone:
+ 	kmem_zone_destroy(xfs_log_ticket_zone);
+- out_destroy_ioend_pool:
+-	mempool_destroy(xfs_ioend_pool);
+- out_destroy_ioend_zone:
+-	kmem_zone_destroy(xfs_ioend_zone);
++ out_free_ioend_bioset:
++	bioset_free(xfs_ioend_bioset);
+  out:
+ 	return -ENOMEM;
+ }
+@@ -1838,9 +1830,7 @@ xfs_destroy_zones(void)
+ 	kmem_zone_destroy(xfs_btree_cur_zone);
+ 	kmem_zone_destroy(xfs_bmap_free_item_zone);
+ 	kmem_zone_destroy(xfs_log_ticket_zone);
+-	mempool_destroy(xfs_ioend_pool);
+-	kmem_zone_destroy(xfs_ioend_zone);
+-
++	bioset_free(xfs_ioend_bioset);
+ }
+ 
+ STATIC int __init
