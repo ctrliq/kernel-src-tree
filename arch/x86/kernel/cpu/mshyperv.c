@@ -163,8 +163,6 @@ static unsigned char hv_get_nmi_reason(void)
 
 static void __init ms_hyperv_init_platform(void)
 {
-	u64	hv_lapic_frequency;
-
 	/*
 	 * Extract the features and hints
 	 */
@@ -180,6 +178,8 @@ static void __init ms_hyperv_init_platform(void)
 		/*
 		 * Get the APIC frequency.
 		 */
+		u64	hv_lapic_frequency;
+
 		rdmsrl(HV_X64_MSR_APIC_FREQUENCY, hv_lapic_frequency);
 		hv_lapic_frequency = div_u64(hv_lapic_frequency, HZ);
 		lapic_timer_frequency = hv_lapic_frequency;
