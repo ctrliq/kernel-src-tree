@@ -1,0 +1,143 @@
+mm/migrate: allow migrate_vma() to alloc new page on empty entry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [mm] migrate: allow migrate_vma() to alloc new page on empty entry v2 (Jerome Glisse) [1444991]
+Rebuild_FUZZ: 95.31%
+commit-author Jérôme Glisse <jglisse@redhat.com>
+commit 8315ada7f095bfa2cae0cd1e915b95bf6226897d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8315ada7.failed
+
+This allows callers of migrate_vma() to allocate new page for empty CPU
+page table entry (pte_none or back by zero page).  This is only for
+anonymous memory and it won't allow new page to be instanced if the
+userfaultfd is armed.
+
+This is useful to device driver that want to migrate a range of virtual
+address and would rather allocate new memory than having to fault later
+on.
+
+Link: http://lkml.kernel.org/r/20170817000548.32038-18-jglisse@redhat.com
+	Signed-off-by: Jérôme Glisse <jglisse@redhat.com>
+	Cc: Aneesh Kumar <aneesh.kumar@linux.vnet.ibm.com>
+	Cc: Balbir Singh <bsingharora@gmail.com>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: David Nellans <dnellans@nvidia.com>
+	Cc: Evgeny Baskakov <ebaskakov@nvidia.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: John Hubbard <jhubbard@nvidia.com>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Mark Hairgrove <mhairgrove@nvidia.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: Sherry Cheung <SCheung@nvidia.com>
+	Cc: Subhash Gutti <sgutti@nvidia.com>
+	Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+	Cc: Bob Liu <liubo95@huawei.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 8315ada7f095bfa2cae0cd1e915b95bf6226897d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/migrate.c
+diff --cc mm/migrate.c
+index 30d96a5dccef,e581253ef330..000000000000
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@@ -35,8 -36,14 +35,13 @@@
+  #include <linux/hugetlb.h>
+  #include <linux/hugetlb_cgroup.h>
+  #include <linux/gfp.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/memremap.h>
++ #include <linux/userfaultfd_k.h>
+++>>>>>>> 8315ada7f095 (mm/migrate: allow migrate_vma() to alloc new page on empty entry)
+  #include <linux/balloon_compaction.h>
+  #include <linux/mmu_notifier.h>
+ -#include <linux/page_idle.h>
+ -#include <linux/page_owner.h>
+ -#include <linux/sched/mm.h>
+ -#include <linux/ptrace.h>
+  
+  #include <asm/tlbflush.h>
+  
+@@@ -1987,13 -2232,43 +2011,52 @@@ again
+  		pte = *ptep;
+  		pfn = pte_pfn(pte);
+  
+++<<<<<<< HEAD
+ +		if (!pte_present(pte)) {
+ +			mpfn = pfn = 0;
+ +			goto next;
+ +		}
+ +
+++=======
++ 		if (pte_none(pte)) {
++ 			mpfn = MIGRATE_PFN_MIGRATE;
++ 			migrate->cpages++;
++ 			pfn = 0;
++ 			goto next;
++ 		}
++ 
++ 		if (!pte_present(pte)) {
++ 			mpfn = pfn = 0;
++ 
++ 			/*
++ 			 * Only care about unaddressable device page special
++ 			 * page table entry. Other special swap entries are not
++ 			 * migratable, and we ignore regular swapped page.
++ 			 */
++ 			entry = pte_to_swp_entry(pte);
++ 			if (!is_device_private_entry(entry))
++ 				goto next;
++ 
++ 			page = device_private_entry_to_page(entry);
++ 			mpfn = migrate_pfn(page_to_pfn(page))|
++ 				MIGRATE_PFN_DEVICE | MIGRATE_PFN_MIGRATE;
++ 			if (is_write_device_private_entry(entry))
++ 				mpfn |= MIGRATE_PFN_WRITE;
++ 		} else {
++ 			if (is_zero_pfn(pfn)) {
++ 				mpfn = MIGRATE_PFN_MIGRATE;
++ 				migrate->cpages++;
++ 				pfn = 0;
++ 				goto next;
++ 			}
++ 			page = vm_normal_page(migrate->vma, addr, pte);
++ 			mpfn = migrate_pfn(pfn) | MIGRATE_PFN_MIGRATE;
++ 			mpfn |= pte_write(pte) ? MIGRATE_PFN_WRITE : 0;
++ 		}
++ 
+++>>>>>>> 8315ada7f095 (mm/migrate: allow migrate_vma() to alloc new page on empty entry)
+  		/* FIXME support THP */
+ +		page = vm_normal_page(migrate->vma, addr, pte);
+  		if (!page || !page->mapping || PageTransCompound(page)) {
+  			mpfn = pfn = 0;
+  			goto next;
+diff --git a/include/linux/migrate.h b/include/linux/migrate.h
+index 834ae7167ac7..f314a4572d30 100644
+--- a/include/linux/migrate.h
++++ b/include/linux/migrate.h
+@@ -175,6 +175,15 @@ static inline unsigned long migrate_pfn(unsigned long pfn)
+  * driver should avoid setting MIGRATE_PFN_ERROR unless it is really in an
+  * unrecoverable state.
+  *
++ * For empty entry inside CPU page table (pte_none() or pmd_none() is true) we
++ * do set MIGRATE_PFN_MIGRATE flag inside the corresponding source array thus
++ * allowing device driver to allocate device memory for those unback virtual
++ * address. For this the device driver simply have to allocate device memory
++ * and properly set the destination entry like for regular migration. Note that
++ * this can still fails and thus inside the device driver must check if the
++ * migration was successful for those entry inside the finalize_and_map()
++ * callback just like for regular migration.
++ *
+  * THE alloc_and_copy() CALLBACK MUST NOT CHANGE ANY OF THE SRC ARRAY ENTRIES
+  * OR BAD THINGS WILL HAPPEN !
+  *
+* Unmerged path mm/migrate.c
