@@ -410,6 +410,8 @@ struct phy_device {
 
 	struct net_device *attached_dev;
 
+	u8 mdix;
+
 	void (*adjust_link)(struct net_device *dev);
 	RH_KABI_DEPRECATE_FN(void, adjust_state, struct net_device *dev)
 };
