@@ -1,0 +1,251 @@
+dm mpath: fix missing call of path selector type->end_io
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Yufen Yu <yuyufen@huawei.com>
+commit 5de719e3d01b4abe0de0d7b857148a880ff2a90b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/5de719e3.failed
+
+After commit 396eaf21ee17 ("blk-mq: improve DM's blk-mq IO merging via
+blk_insert_cloned_request feedback"), map_request() will requeue the tio
+when issued clone request return BLK_STS_RESOURCE or BLK_STS_DEV_RESOURCE.
+
+Thus, if device driver status is error, a tio may be requeued multiple
+times until the return value is not DM_MAPIO_REQUEUE.  That means
+type->start_io may be called multiple times, while type->end_io is only
+called when IO complete.
+
+In fact, even without commit 396eaf21ee17, setup_clone() failure can
+also cause tio requeue and associated missed call to type->end_io.
+
+The service-time path selector selects path based on in_flight_size,
+which is increased by st_start_io() and decreased by st_end_io().
+Missed calls to st_end_io() can lead to in_flight_size count error and
+will cause the selector to make the wrong choice.  In addition,
+queue-length path selector will also be affected.
+
+To fix the problem, call type->end_io in ->release_clone_rq before tio
+requeue.  map_info is passed to ->release_clone_rq() for map_request()
+error path that result in requeue.
+
+Fixes: 396eaf21ee17 ("blk-mq: improve DM's blk-mq IO merging via blk_insert_cloned_request feedback")
+	Cc: stable@vger.kernl.org
+	Signed-off-by: Yufen Yu <yuyufen@huawei.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 5de719e3d01b4abe0de0d7b857148a880ff2a90b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-mpath.c
+#	drivers/md/dm-rq.c
+diff --cc drivers/md/dm-mpath.c
+index 35f7a9de1d86,07cfef67c0ba..000000000000
+--- a/drivers/md/dm-mpath.c
++++ b/drivers/md/dm-mpath.c
+@@@ -592,22 -544,24 +592,43 @@@ static int __multipath_map(struct dm_ta
+  	return DM_MAPIO_REMAPPED;
+  }
+  
+++<<<<<<< HEAD
+ +static int multipath_map(struct dm_target *ti, struct request *clone,
+ +			 union map_info *map_context)
+ +{
+ +	return __multipath_map(ti, clone, map_context, NULL, NULL);
+ +}
+ +
+ +static int multipath_clone_and_map(struct dm_target *ti, struct request *rq,
+ +				   union map_info *map_context,
+ +				   struct request **clone)
+ +{
+ +	return __multipath_map(ti, NULL, map_context, rq, clone);
+ +}
+ +
+ +static void multipath_release_clone(struct request *clone)
+ +{
+ +	blk_mq_free_request(clone);
+++=======
++ static void multipath_release_clone(struct request *clone,
++ 				    union map_info *map_context)
++ {
++ 	if (unlikely(map_context)) {
++ 		/*
++ 		 * non-NULL map_context means caller is still map
++ 		 * method; must undo multipath_clone_and_map()
++ 		 */
++ 		struct dm_mpath_io *mpio = get_mpio(map_context);
++ 		struct pgpath *pgpath = mpio->pgpath;
++ 
++ 		if (pgpath && pgpath->pg->ps.type->end_io)
++ 			pgpath->pg->ps.type->end_io(&pgpath->pg->ps,
++ 						    &pgpath->path,
++ 						    mpio->nr_bytes);
++ 	}
++ 
++ 	blk_put_request(clone);
+++>>>>>>> 5de719e3d01b (dm mpath: fix missing call of path selector type->end_io)
+  }
+  
+  /*
+diff --cc drivers/md/dm-rq.c
+index 9ab5c0555b6f,5f7063f05ae0..000000000000
+--- a/drivers/md/dm-rq.c
++++ b/drivers/md/dm-rq.c
+@@@ -264,56 -167,12 +264,61 @@@ static void dm_end_request(struct reque
+  	struct mapped_device *md = tio->md;
+  	struct request *rq = tio->orig;
+  
+++<<<<<<< HEAD
+ +	if (rq->cmd_type == REQ_TYPE_BLOCK_PC) {
+ +		rq->errors = clone->errors;
+ +		rq->resid_len = clone->resid_len;
+++=======
++ 	blk_rq_unprep_clone(clone);
++ 	tio->ti->type->release_clone_rq(clone, NULL);
+++>>>>>>> 5de719e3d01b (dm mpath: fix missing call of path selector type->end_io)
+ +
+ +		if (rq->sense)
+ +			/*
+ +			 * We are using the sense buffer of the original
+ +			 * request.
+ +			 * So setting the length of the sense data is enough.
+ +			 */
+ +			rq->sense_len = clone->sense_len;
+ +	}
+  
+ +	free_rq_clone(clone);
+  	rq_end_stats(md, rq);
+ -	blk_mq_end_request(rq, error);
+ -	rq_completed(md);
+ +	if (!rq->q->mq_ops)
+ +		blk_end_request_all(rq, error);
+ +	else
+ +		blk_mq_end_request(rq, error);
+ +	rq_completed(md, rw, true);
+ +}
+ +
+ +static void dm_unprep_request(struct request *rq)
+ +{
+ +	struct dm_rq_target_io *tio = tio_from_request(rq);
+ +	struct request *clone = tio->clone;
+ +
+ +	if (!rq->q->mq_ops) {
+ +		rq->special = NULL;
+ +		rq->cmd_flags &= ~REQ_DONTPREP;
+ +	}
+ +
+ +	if (clone)
+ +		free_rq_clone(clone);
+ +	else if (!tio->md->queue->mq_ops)
+ +		free_old_rq_tio(tio);
+ +}
+ +
+ +/*
+ + * Requeue the original request of a clone.
+ + */
+ +static void dm_old_requeue_request(struct request *rq, unsigned long delay_ms)
+ +{
+ +	struct request_queue *q = rq->q;
+ +	unsigned long flags;
+ +
+ +	spin_lock_irqsave(q->queue_lock, flags);
+ +	blk_requeue_request(q, rq);
+ +	blk_delay_queue(q, delay_ms);
+ +	spin_unlock_irqrestore(q->queue_lock, flags);
+  }
+  
+  static void __dm_mq_kick_requeue_list(struct request_queue *q, unsigned long msecs)
+@@@ -341,19 -199,18 +346,26 @@@ static void dm_requeue_original_request
+  	unsigned long delay_ms = delay_requeue ? 100 : 0;
+  
+  	rq_end_stats(md, rq);
+++<<<<<<< HEAD
+ +	dm_unprep_request(rq);
+++=======
++ 	if (tio->clone) {
++ 		blk_rq_unprep_clone(tio->clone);
++ 		tio->ti->type->release_clone_rq(tio->clone, NULL);
++ 	}
+++>>>>>>> 5de719e3d01b (dm mpath: fix missing call of path selector type->end_io)
+ +
+ +	if (!rq->q->mq_ops)
+ +		dm_old_requeue_request(rq, delay_ms);
+ +	else
+ +		dm_mq_delay_requeue_request(rq, delay_ms);
+  
+ -	dm_mq_delay_requeue_request(rq, delay_ms);
+ -	rq_completed(md);
+ +	rq_completed(md, rw, false);
+  }
+  
+ -static void dm_done(struct request *clone, blk_status_t error, bool mapped)
+ +static void dm_done(struct request *clone, int error, bool mapped)
+  {
+ -	int r = DM_ENDIO_DONE;
+ +	int r = error;
+  	struct dm_rq_target_io *tio = clone->end_io_data;
+  	dm_request_endio_fn rq_end_io = NULL;
+  
+@@@ -662,19 -396,21 +674,28 @@@ check_again
+  		/* The target has taken the I/O to submit by itself later */
+  		break;
+  	case DM_MAPIO_REMAPPED:
+++<<<<<<< HEAD
+++=======
++ 		if (setup_clone(clone, rq, tio, GFP_ATOMIC)) {
++ 			/* -ENOMEM */
++ 			ti->type->release_clone_rq(clone, &tio->info);
++ 			return DM_MAPIO_REQUEUE;
++ 		}
++ 
+++>>>>>>> 5de719e3d01b (dm mpath: fix missing call of path selector type->end_io)
+  		/* The target has remapped the I/O so dispatch it */
+  		trace_block_rq_remap(clone->q, clone, disk_devt(dm_disk(md)),
+  				     blk_rq_pos(rq));
+  		ret = dm_dispatch_clone_request(clone, rq);
+ -		if (ret == BLK_STS_RESOURCE || ret == BLK_STS_DEV_RESOURCE) {
+ +		if (ret == BLK_MQ_RQ_QUEUE_BUSY) {
+  			blk_rq_unprep_clone(clone);
+- 			tio->ti->type->release_clone_rq(clone);
++ 			tio->ti->type->release_clone_rq(clone, &tio->info);
+  			tio->clone = NULL;
+ -			return DM_MAPIO_REQUEUE;
+ +			if (!rq->q->mq_ops)
+ +				r = DM_MAPIO_DELAY_REQUEUE;
+ +			else
+ +				r = DM_MAPIO_REQUEUE;
+ +			goto check_again;
+  		}
+  		break;
+  	case DM_MAPIO_REQUEUE:
+* Unmerged path drivers/md/dm-mpath.c
+* Unmerged path drivers/md/dm-rq.c
+diff --git a/drivers/md/dm-target.c b/drivers/md/dm-target.c
+index 96fd0c559d35..293d414b0f00 100644
+--- a/drivers/md/dm-target.c
++++ b/drivers/md/dm-target.c
+@@ -144,7 +144,8 @@ static int io_err_clone_and_map_rq(struct dm_target *ti, struct request *rq,
+ 	return -EIO;
+ }
+ 
+-static void io_err_release_clone_rq(struct request *clone)
++static void io_err_release_clone_rq(struct request *clone,
++				    union map_info *map_context)
+ {
+ }
+ 
+diff --git a/include/linux/device-mapper.h b/include/linux/device-mapper.h
+index 2aeb0e46d8d8..e24bdee0453f 100644
+--- a/include/linux/device-mapper.h
++++ b/include/linux/device-mapper.h
+@@ -63,7 +63,8 @@ typedef int (*dm_clone_and_map_request_fn) (struct dm_target *ti,
+ 					    struct request *rq,
+ 					    union map_info *map_context,
+ 					    struct request **clone);
+-typedef void (*dm_release_clone_request_fn) (struct request *clone);
++typedef void (*dm_release_clone_request_fn) (struct request *clone,
++					     union map_info *map_context);
+ 
+ /*
+  * Returns:
