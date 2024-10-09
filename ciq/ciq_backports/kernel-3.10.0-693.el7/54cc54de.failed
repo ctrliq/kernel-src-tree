@@ -1,0 +1,253 @@
+perf evlist: Setup backward mmap state machine
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Wang Nan <wangnan0@huawei.com>
+commit 54cc54decd79b2c92f4db06001b4b245f38181b7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/54cc54de.failed
+
+Introduce a bkw_mmap_state state machine to evlist:
+
+                     .________________(forbid)_____________.
+                     |                                     V
+ NOTREADY --(0)--> RUNNING --(1)--> DATA_PENDING --(2)--> EMPTY
+                     ^  ^              |   ^               |
+                     |  |__(forbid)____/   |___(forbid)___/|
+                     |                                     |
+                      \_________________(3)_______________/
+
+ NOTREADY     : Backward ring buffers are not ready
+ RUNNING      : Backward ring buffers are recording
+ DATA_PENDING : We are required to collect data from backward ring buffers
+ EMPTY        : We have collected data from backward ring buffers.
+
+ (0): Setup backward ring buffer
+ (1): Pause ring buffers for reading
+ (2): Read from ring buffers
+ (3): Resume ring buffers for recording
+
+We can't avoid this complexity. Since we deliberately drop records from
+overwritable ring buffer, there's no way for us to check remaining from
+ring buffer itself (by checking head and old pointers). Therefore, we
+need DATA_PENDING and EMPTY state to help us recording what we have done
+to the ring buffer.
+
+In record__mmap_read_evlist(), drive this state machine from DATA_PENDING
+to EMPTY.
+
+In perf_evlist__mmap_per_evsel(), drive this state machine from NOTREADY
+to RUNNING when creating backward mmap.
+
+	Signed-off-by: Wang Nan <wangnan0@huawei.com>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: He Kuang <hekuang@huawei.com>
+	Cc: Masami Hiramatsu <mhiramat@kernel.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Nilay Vaish <nilayvaish@gmail.com>
+	Cc: Zefan Li <lizefan@huawei.com>
+	Cc: pi3orama@163.com
+Link: http://lkml.kernel.org/r/1468485287-33422-11-git-send-email-wangnan0@huawei.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 54cc54decd79b2c92f4db06001b4b245f38181b7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/evlist.c
+diff --cc tools/perf/util/evlist.c
+index 9937812b74aa,93ab66415f51..000000000000
+--- a/tools/perf/util/evlist.c
++++ b/tools/perf/util/evlist.c
+@@@ -1068,11 -1056,24 +1070,27 @@@ static int perf_evlist__mmap_per_evsel(
+  	struct perf_evsel *evsel;
+  	int revent;
+  
+ -	evlist__for_each_entry(evlist, evsel) {
+ -		struct perf_mmap *maps = evlist->mmap;
+ -		int *output = _output;
+ +	evlist__for_each(evlist, evsel) {
+  		int fd;
+  
+++<<<<<<< HEAD
+ +		if (evsel->overwrite != (evlist->overwrite && evlist->backward))
+ +			continue;
+++=======
++ 		if (evsel->attr.write_backward) {
++ 			output = _output_backward;
++ 			maps = evlist->backward_mmap;
++ 
++ 			if (!maps) {
++ 				maps = perf_evlist__alloc_mmap(evlist);
++ 				if (!maps)
++ 					return -1;
++ 				evlist->backward_mmap = maps;
++ 				if (evlist->bkw_mmap_state == BKW_MMAP_NOTREADY)
++ 					perf_evlist__toggle_bkw_mmap(evlist, BKW_MMAP_RUNNING);
++ 			}
++ 		}
+++>>>>>>> 54cc54decd79 (perf evlist: Setup backward mmap state machine)
+  
+  		if (evsel->system_wide && thread)
+  			continue;
+@@@ -1956,3 -1960,77 +1974,80 @@@ void perf_evlist__set_tracking_event(st
+  
+  	tracking_evsel->tracking = true;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ struct perf_evsel *
++ perf_evlist__find_evsel_by_str(struct perf_evlist *evlist,
++ 			       const char *str)
++ {
++ 	struct perf_evsel *evsel;
++ 
++ 	evlist__for_each_entry(evlist, evsel) {
++ 		if (!evsel->name)
++ 			continue;
++ 		if (strcmp(str, evsel->name) == 0)
++ 			return evsel;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ void perf_evlist__toggle_bkw_mmap(struct perf_evlist *evlist,
++ 				  enum bkw_mmap_state state)
++ {
++ 	enum bkw_mmap_state old_state = evlist->bkw_mmap_state;
++ 	enum action {
++ 		NONE,
++ 		PAUSE,
++ 		RESUME,
++ 	} action = NONE;
++ 
++ 	if (!evlist->backward_mmap)
++ 		return;
++ 
++ 	switch (old_state) {
++ 	case BKW_MMAP_NOTREADY: {
++ 		if (state != BKW_MMAP_RUNNING)
++ 			goto state_err;;
++ 		break;
++ 	}
++ 	case BKW_MMAP_RUNNING: {
++ 		if (state != BKW_MMAP_DATA_PENDING)
++ 			goto state_err;
++ 		action = PAUSE;
++ 		break;
++ 	}
++ 	case BKW_MMAP_DATA_PENDING: {
++ 		if (state != BKW_MMAP_EMPTY)
++ 			goto state_err;
++ 		break;
++ 	}
++ 	case BKW_MMAP_EMPTY: {
++ 		if (state != BKW_MMAP_RUNNING)
++ 			goto state_err;
++ 		action = RESUME;
++ 		break;
++ 	}
++ 	default:
++ 		WARN_ONCE(1, "Shouldn't get there\n");
++ 	}
++ 
++ 	evlist->bkw_mmap_state = state;
++ 
++ 	switch (action) {
++ 	case PAUSE:
++ 		perf_evlist__pause(evlist);
++ 		break;
++ 	case RESUME:
++ 		perf_evlist__resume(evlist);
++ 		break;
++ 	case NONE:
++ 	default:
++ 		break;
++ 	}
++ 
++ state_err:
++ 	return;
++ }
+++>>>>>>> 54cc54decd79 (perf evlist: Setup backward mmap state machine)
+diff --git a/tools/perf/builtin-record.c b/tools/perf/builtin-record.c
+index 5f9433ee7668..827e28fde9fd 100644
+--- a/tools/perf/builtin-record.c
++++ b/tools/perf/builtin-record.c
+@@ -542,6 +542,9 @@ static int record__mmap_read_evlist(struct record *rec, struct perf_evlist *evli
+ 	if (!maps)
+ 		return 0;
+ 
++	if (backward && evlist->bkw_mmap_state != BKW_MMAP_DATA_PENDING)
++		return 0;
++
+ 	for (i = 0; i < evlist->nr_mmaps; i++) {
+ 		struct auxtrace_mmap *mm = &maps[i].auxtrace_mmap;
+ 
+@@ -567,6 +570,8 @@ static int record__mmap_read_evlist(struct record *rec, struct perf_evlist *evli
+ 	if (bytes_written != rec->bytes_written)
+ 		rc = record__write(rec, &finished_round_event, sizeof(finished_round_event));
+ 
++	if (backward)
++		perf_evlist__toggle_bkw_mmap(evlist, BKW_MMAP_EMPTY);
+ out:
+ 	return rc;
+ }
+* Unmerged path tools/perf/util/evlist.c
+diff --git a/tools/perf/util/evlist.h b/tools/perf/util/evlist.h
+index 6223c5c51611..08a66b6d00a1 100644
+--- a/tools/perf/util/evlist.h
++++ b/tools/perf/util/evlist.h
+@@ -41,6 +41,34 @@ perf_mmap__mmap_len(struct perf_mmap *map)
+ 	return map->mask + 1 + page_size;
+ }
+ 
++/*
++ * State machine of bkw_mmap_state:
++ *
++ *                     .________________(forbid)_____________.
++ *                     |                                     V
++ * NOTREADY --(0)--> RUNNING --(1)--> DATA_PENDING --(2)--> EMPTY
++ *                     ^  ^              |   ^               |
++ *                     |  |__(forbid)____/   |___(forbid)___/|
++ *                     |                                     |
++ *                      \_________________(3)_______________/
++ *
++ * NOTREADY     : Backward ring buffers are not ready
++ * RUNNING      : Backward ring buffers are recording
++ * DATA_PENDING : We are required to collect data from backward ring buffers
++ * EMPTY        : We have collected data from backward ring buffers.
++ *
++ * (0): Setup backward ring buffer
++ * (1): Pause ring buffers for reading
++ * (2): Read from ring buffers
++ * (3): Resume ring buffers for recording
++ */
++enum bkw_mmap_state {
++	BKW_MMAP_NOTREADY,
++	BKW_MMAP_RUNNING,
++	BKW_MMAP_DATA_PENDING,
++	BKW_MMAP_EMPTY,
++};
++
+ struct perf_evlist {
+ 	struct list_head entries;
+ 	struct hlist_head heads[PERF_EVLIST__HLIST_SIZE];
+@@ -54,6 +82,7 @@ struct perf_evlist {
+ 	int		 id_pos;
+ 	int		 is_pos;
+ 	u64		 combined_sample_type;
++	enum bkw_mmap_state bkw_mmap_state;
+ 	struct {
+ 		int	cork_fd;
+ 		pid_t	pid;
+@@ -135,6 +164,8 @@ struct perf_evsel *perf_evlist__id2evsel_strict(struct perf_evlist *evlist,
+ 
+ struct perf_sample_id *perf_evlist__id2sid(struct perf_evlist *evlist, u64 id);
+ 
++void perf_evlist__toggle_bkw_mmap(struct perf_evlist *evlist, enum bkw_mmap_state state);
++
+ union perf_event *perf_mmap__read_forward(struct perf_mmap *map, bool check_messup);
+ union perf_event *perf_mmap__read_backward(struct perf_mmap *map);
+ 
