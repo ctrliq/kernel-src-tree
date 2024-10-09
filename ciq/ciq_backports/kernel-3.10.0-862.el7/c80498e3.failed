@@ -1,0 +1,472 @@
+vxlan: fix ovs support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Nicolas Dichtel <nicolas.dichtel@6wind.com>
+commit c80498e36d4ef3e24599d363c622fbf22a1293cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c80498e3.failed
+
+The required changes in the function vxlan_dev_create() were missing
+in commit 8bcdc4f3a20b.
+The vxlan device is not registered anymore after this patch and the error
+path causes an stack dump:
+ WARNING: CPU: 3 PID: 1498 at net/core/dev.c:6713 rollback_registered_many+0x9d/0x3f0
+
+Fixes: 8bcdc4f3a20b ("vxlan: add changelink support")
+CC: Roopa Prabhu <roopa@cumulusnetworks.com>
+	Signed-off-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+	Acked-by: Roopa Prabhu <roopa@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c80498e36d4ef3e24599d363c622fbf22a1293cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+diff --cc drivers/net/vxlan.c
+index 6746d18c06b0,bdb6ae16d4a8..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -2897,16 -2973,31 +2897,41 @@@ static int vxlan_dev_configure(struct n
+  		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	return 0;
++ }
++ 
++ static int __vxlan_dev_create(struct net *net, struct net_device *dev,
++ 			      struct vxlan_config *conf)
++ {
++ 	struct vxlan_net *vn = net_generic(net, vxlan_net_id);
++ 	struct vxlan_dev *vxlan = netdev_priv(dev);
++ 	int err;
++ 
++ 	err = vxlan_dev_configure(net, dev, conf, false);
++ 	if (err)
++ 		return err;
++ 
+++>>>>>>> c80498e36d4e (vxlan: fix ovs support)
+  	dev->ethtool_ops = &vxlan_ethtool_ops;
+  
+  	/* create an fdb entry for a valid default destination */
+  	if (!vxlan_addr_any(&vxlan->default_dst.remote_ip)) {
+  		err = vxlan_fdb_create(vxlan, all_zeros_mac,
+  				       &vxlan->default_dst.remote_ip,
+++<<<<<<< HEAD
+ +				       NUD_REACHABLE|NUD_PERMANENT,
+ +				       NLM_F_EXCL|NLM_F_CREATE,
+ +				       vxlan->cfg.dst_port,
+ +				       vxlan->default_dst.remote_vni,
+++=======
++ 				       NUD_REACHABLE | NUD_PERMANENT,
++ 				       NLM_F_EXCL | NLM_F_CREATE,
++ 				       vxlan->cfg.dst_port,
++ 				       vxlan->default_dst.remote_vni,
++ 				       vxlan->default_dst.remote_vni,
+++>>>>>>> c80498e36d4e (vxlan: fix ovs support)
+  				       vxlan->default_dst.remote_ifindex,
+  				       NTF_SELF);
+  		if (err)
+@@@ -2915,130 -3006,270 +2940,344 @@@
+  
+  	err = register_netdevice(dev);
+  	if (err) {
+++<<<<<<< HEAD
+ +		vxlan_fdb_delete_default(vxlan);
+++=======
++ 		vxlan_fdb_delete_default(vxlan, vxlan->default_dst.remote_vni);
+++>>>>>>> c80498e36d4e (vxlan: fix ovs support)
+  		return err;
+  	}
+  
+  	list_add(&vxlan->next, &vn->vxlan_list);
+++<<<<<<< HEAD
+++
+++	return 0;
+++=======
++ 	return 0;
++ }
++ 
++ static int vxlan_nl2conf(struct nlattr *tb[], struct nlattr *data[],
++ 			 struct net_device *dev, struct vxlan_config *conf,
++ 			 bool changelink)
++ {
++ 	struct vxlan_dev *vxlan = netdev_priv(dev);
++ 
++ 	memset(conf, 0, sizeof(*conf));
++ 
++ 	/* if changelink operation, start with old existing cfg */
++ 	if (changelink)
++ 		memcpy(conf, &vxlan->cfg, sizeof(*conf));
++ 
++ 	if (data[IFLA_VXLAN_ID]) {
++ 		__be32 vni = cpu_to_be32(nla_get_u32(data[IFLA_VXLAN_ID]));
++ 
++ 		if (changelink && (vni != conf->vni))
++ 			return -EOPNOTSUPP;
++ 		conf->vni = cpu_to_be32(nla_get_u32(data[IFLA_VXLAN_ID]));
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_GROUP]) {
++ 		conf->remote_ip.sin.sin_addr.s_addr = nla_get_in_addr(data[IFLA_VXLAN_GROUP]);
++ 	} else if (data[IFLA_VXLAN_GROUP6]) {
++ 		if (!IS_ENABLED(CONFIG_IPV6))
++ 			return -EPFNOSUPPORT;
++ 
++ 		conf->remote_ip.sin6.sin6_addr = nla_get_in6_addr(data[IFLA_VXLAN_GROUP6]);
++ 		conf->remote_ip.sa.sa_family = AF_INET6;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_LOCAL]) {
++ 		conf->saddr.sin.sin_addr.s_addr = nla_get_in_addr(data[IFLA_VXLAN_LOCAL]);
++ 		conf->saddr.sa.sa_family = AF_INET;
++ 	} else if (data[IFLA_VXLAN_LOCAL6]) {
++ 		if (!IS_ENABLED(CONFIG_IPV6))
++ 			return -EPFNOSUPPORT;
++ 
++ 		/* TODO: respect scope id */
++ 		conf->saddr.sin6.sin6_addr = nla_get_in6_addr(data[IFLA_VXLAN_LOCAL6]);
++ 		conf->saddr.sa.sa_family = AF_INET6;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_LINK])
++ 		conf->remote_ifindex = nla_get_u32(data[IFLA_VXLAN_LINK]);
++ 
++ 	if (data[IFLA_VXLAN_TOS])
++ 		conf->tos  = nla_get_u8(data[IFLA_VXLAN_TOS]);
++ 
++ 	if (data[IFLA_VXLAN_TTL])
++ 		conf->ttl = nla_get_u8(data[IFLA_VXLAN_TTL]);
++ 
++ 	if (data[IFLA_VXLAN_LABEL])
++ 		conf->label = nla_get_be32(data[IFLA_VXLAN_LABEL]) &
++ 			     IPV6_FLOWLABEL_MASK;
++ 
++ 	if (data[IFLA_VXLAN_LEARNING]) {
++ 		if (nla_get_u8(data[IFLA_VXLAN_LEARNING])) {
++ 			conf->flags |= VXLAN_F_LEARN;
++ 		} else {
++ 			conf->flags &= ~VXLAN_F_LEARN;
++ 			vxlan->flags &= ~VXLAN_F_LEARN;
++ 		}
++ 	} else if (!changelink) {
++ 		/* default to learn on a new device */
++ 		conf->flags |= VXLAN_F_LEARN;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_AGEING]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		conf->age_interval = nla_get_u32(data[IFLA_VXLAN_AGEING]);
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_PROXY]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		if (nla_get_u8(data[IFLA_VXLAN_PROXY]))
++ 			conf->flags |= VXLAN_F_PROXY;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_RSC]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		if (nla_get_u8(data[IFLA_VXLAN_RSC]))
++ 			conf->flags |= VXLAN_F_RSC;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_L2MISS]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		if (nla_get_u8(data[IFLA_VXLAN_L2MISS]))
++ 			conf->flags |= VXLAN_F_L2MISS;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_L3MISS]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		if (nla_get_u8(data[IFLA_VXLAN_L3MISS]))
++ 			conf->flags |= VXLAN_F_L3MISS;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_LIMIT]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		conf->addrmax = nla_get_u32(data[IFLA_VXLAN_LIMIT]);
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_COLLECT_METADATA]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		if (nla_get_u8(data[IFLA_VXLAN_COLLECT_METADATA]))
++ 			conf->flags |= VXLAN_F_COLLECT_METADATA;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_PORT_RANGE]) {
++ 		if (!changelink) {
++ 			const struct ifla_vxlan_port_range *p
++ 				= nla_data(data[IFLA_VXLAN_PORT_RANGE]);
++ 			conf->port_min = ntohs(p->low);
++ 			conf->port_max = ntohs(p->high);
++ 		} else {
++ 			return -EOPNOTSUPP;
++ 		}
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_PORT]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		conf->dst_port = nla_get_be16(data[IFLA_VXLAN_PORT]);
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_UDP_CSUM]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		if (!nla_get_u8(data[IFLA_VXLAN_UDP_CSUM]))
++ 			conf->flags |= VXLAN_F_UDP_ZERO_CSUM_TX;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_UDP_ZERO_CSUM6_TX]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		if (nla_get_u8(data[IFLA_VXLAN_UDP_ZERO_CSUM6_TX]))
++ 			conf->flags |= VXLAN_F_UDP_ZERO_CSUM6_TX;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_UDP_ZERO_CSUM6_RX]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		if (nla_get_u8(data[IFLA_VXLAN_UDP_ZERO_CSUM6_RX]))
++ 			conf->flags |= VXLAN_F_UDP_ZERO_CSUM6_RX;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_REMCSUM_TX]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		if (nla_get_u8(data[IFLA_VXLAN_REMCSUM_TX]))
++ 			conf->flags |= VXLAN_F_REMCSUM_TX;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_REMCSUM_RX]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		if (nla_get_u8(data[IFLA_VXLAN_REMCSUM_RX]))
++ 			conf->flags |= VXLAN_F_REMCSUM_RX;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_GBP]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		conf->flags |= VXLAN_F_GBP;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_GPE]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		conf->flags |= VXLAN_F_GPE;
++ 	}
++ 
++ 	if (data[IFLA_VXLAN_REMCSUM_NOPARTIAL]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		conf->flags |= VXLAN_F_REMCSUM_NOPARTIAL;
++ 	}
++ 
++ 	if (tb[IFLA_MTU]) {
++ 		if (changelink)
++ 			return -EOPNOTSUPP;
++ 		conf->mtu = nla_get_u32(tb[IFLA_MTU]);
++ 	}
+  
+  	return 0;
+  }
+  
++ static int vxlan_newlink(struct net *src_net, struct net_device *dev,
++ 			 struct nlattr *tb[], struct nlattr *data[])
++ {
++ 	struct vxlan_config conf;
++ 	int err;
++ 
++ 	err = vxlan_nl2conf(tb, data, dev, &conf, false);
++ 	if (err)
++ 		return err;
++ 
++ 	return __vxlan_dev_create(src_net, dev, &conf);
+++>>>>>>> c80498e36d4e (vxlan: fix ovs support)
++ }
++ 
+ -static int vxlan_changelink(struct net_device *dev, struct nlattr *tb[],
+ -			    struct nlattr *data[])
+ +static int vxlan_newlink(struct net *src_net, struct net_device *dev,
+ +			 struct nlattr *tb[], struct nlattr *data[])
+  {
+ -	struct vxlan_dev *vxlan = netdev_priv(dev);
+ -	struct vxlan_rdst *dst = &vxlan->default_dst;
+ -	struct vxlan_rdst old_dst;
+  	struct vxlan_config conf;
+ -	int err;
+  
+ -	err = vxlan_nl2conf(tb, data,
+ -			    dev, &conf, true);
+ -	if (err)
+ -		return err;
+ +	memset(&conf, 0, sizeof(conf));
+  
+ -	memcpy(&old_dst, dst, sizeof(struct vxlan_rdst));
+ +	if (data[IFLA_VXLAN_ID])
+ +		conf.vni = cpu_to_be32(nla_get_u32(data[IFLA_VXLAN_ID]));
+  
+ -	err = vxlan_dev_configure(vxlan->net, dev, &conf, true);
+ -	if (err)
+ -		return err;
+ +	if (data[IFLA_VXLAN_GROUP]) {
+ +		conf.remote_ip.sin.sin_addr.s_addr = nla_get_in_addr(data[IFLA_VXLAN_GROUP]);
+ +	} else if (data[IFLA_VXLAN_GROUP6]) {
+ +		if (!IS_ENABLED(CONFIG_IPV6))
+ +			return -EPFNOSUPPORT;
+  
+ -	/* handle default dst entry */
+ -	if (!vxlan_addr_equal(&dst->remote_ip, &old_dst.remote_ip)) {
+ -		spin_lock_bh(&vxlan->hash_lock);
+ -		if (!vxlan_addr_any(&old_dst.remote_ip))
+ -			__vxlan_fdb_delete(vxlan, all_zeros_mac,
+ -					   old_dst.remote_ip,
+ -					   vxlan->cfg.dst_port,
+ -					   old_dst.remote_vni,
+ -					   old_dst.remote_vni,
+ -					   old_dst.remote_ifindex, 0);
+ -
+ -		if (!vxlan_addr_any(&dst->remote_ip)) {
+ -			err = vxlan_fdb_create(vxlan, all_zeros_mac,
+ -					       &dst->remote_ip,
+ -					       NUD_REACHABLE | NUD_PERMANENT,
+ -					       NLM_F_CREATE | NLM_F_APPEND,
+ -					       vxlan->cfg.dst_port,
+ -					       dst->remote_vni,
+ -					       dst->remote_vni,
+ -					       dst->remote_ifindex,
+ -					       NTF_SELF);
+ -			if (err) {
+ -				spin_unlock_bh(&vxlan->hash_lock);
+ -				return err;
+ -			}
+ -		}
+ -		spin_unlock_bh(&vxlan->hash_lock);
+ +		conf.remote_ip.sin6.sin6_addr = nla_get_in6_addr(data[IFLA_VXLAN_GROUP6]);
+ +		conf.remote_ip.sa.sa_family = AF_INET6;
+  	}
+  
+ -	return 0;
+ +	if (data[IFLA_VXLAN_LOCAL]) {
+ +		conf.saddr.sin.sin_addr.s_addr = nla_get_in_addr(data[IFLA_VXLAN_LOCAL]);
+ +		conf.saddr.sa.sa_family = AF_INET;
+ +	} else if (data[IFLA_VXLAN_LOCAL6]) {
+ +		if (!IS_ENABLED(CONFIG_IPV6))
+ +			return -EPFNOSUPPORT;
+ +
+ +		/* TODO: respect scope id */
+ +		conf.saddr.sin6.sin6_addr = nla_get_in6_addr(data[IFLA_VXLAN_LOCAL6]);
+ +		conf.saddr.sa.sa_family = AF_INET6;
+ +	}
+ +
+ +	if (data[IFLA_VXLAN_LINK])
+ +		conf.remote_ifindex = nla_get_u32(data[IFLA_VXLAN_LINK]);
+ +
+ +	if (data[IFLA_VXLAN_TOS])
+ +		conf.tos  = nla_get_u8(data[IFLA_VXLAN_TOS]);
+ +
+ +	if (data[IFLA_VXLAN_TTL])
+ +		conf.ttl = nla_get_u8(data[IFLA_VXLAN_TTL]);
+ +
+ +	if (data[IFLA_VXLAN_LABEL])
+ +		conf.label = nla_get_be32(data[IFLA_VXLAN_LABEL]) &
+ +			     IPV6_FLOWLABEL_MASK;
+ +
+ +	if (!data[IFLA_VXLAN_LEARNING] || nla_get_u8(data[IFLA_VXLAN_LEARNING]))
+ +		conf.flags |= VXLAN_F_LEARN;
+ +
+ +	if (data[IFLA_VXLAN_AGEING])
+ +		conf.age_interval = nla_get_u32(data[IFLA_VXLAN_AGEING]);
+ +
+ +	if (data[IFLA_VXLAN_PROXY] && nla_get_u8(data[IFLA_VXLAN_PROXY]))
+ +		conf.flags |= VXLAN_F_PROXY;
+ +
+ +	if (data[IFLA_VXLAN_RSC] && nla_get_u8(data[IFLA_VXLAN_RSC]))
+ +		conf.flags |= VXLAN_F_RSC;
+ +
+ +	if (data[IFLA_VXLAN_L2MISS] && nla_get_u8(data[IFLA_VXLAN_L2MISS]))
+ +		conf.flags |= VXLAN_F_L2MISS;
+ +
+ +	if (data[IFLA_VXLAN_L3MISS] && nla_get_u8(data[IFLA_VXLAN_L3MISS]))
+ +		conf.flags |= VXLAN_F_L3MISS;
+ +
+ +	if (data[IFLA_VXLAN_LIMIT])
+ +		conf.addrmax = nla_get_u32(data[IFLA_VXLAN_LIMIT]);
+ +
+ +	if (data[IFLA_VXLAN_COLLECT_METADATA] &&
+ +	    nla_get_u8(data[IFLA_VXLAN_COLLECT_METADATA]))
+ +		conf.flags |= VXLAN_F_COLLECT_METADATA;
+ +
+ +	if (data[IFLA_VXLAN_PORT_RANGE]) {
+ +		const struct ifla_vxlan_port_range *p
+ +			= nla_data(data[IFLA_VXLAN_PORT_RANGE]);
+ +		conf.port_min = ntohs(p->low);
+ +		conf.port_max = ntohs(p->high);
+ +	}
+ +
+ +	if (data[IFLA_VXLAN_PORT])
+ +		conf.dst_port = nla_get_be16(data[IFLA_VXLAN_PORT]);
+ +
+ +	/* RHEL: preserve the previous default */
+ +	conf.flags |= VXLAN_F_UDP_ZERO_CSUM_TX;
+ +	if (data[IFLA_VXLAN_UDP_CSUM] &&
+ +	    nla_get_u8(data[IFLA_VXLAN_UDP_CSUM]))
+ +		conf.flags &= ~VXLAN_F_UDP_ZERO_CSUM_TX;
+ +
+ +	if (data[IFLA_VXLAN_UDP_ZERO_CSUM6_TX] &&
+ +	    nla_get_u8(data[IFLA_VXLAN_UDP_ZERO_CSUM6_TX]))
+ +		conf.flags |= VXLAN_F_UDP_ZERO_CSUM6_TX;
+ +
+ +	if (data[IFLA_VXLAN_UDP_ZERO_CSUM6_RX] &&
+ +	    nla_get_u8(data[IFLA_VXLAN_UDP_ZERO_CSUM6_RX]))
+ +		conf.flags |= VXLAN_F_UDP_ZERO_CSUM6_RX;
+ +
+ +	if (data[IFLA_VXLAN_REMCSUM_TX] &&
+ +	    nla_get_u8(data[IFLA_VXLAN_REMCSUM_TX]))
+ +		conf.flags |= VXLAN_F_REMCSUM_TX;
+ +
+ +	if (data[IFLA_VXLAN_REMCSUM_RX] &&
+ +	    nla_get_u8(data[IFLA_VXLAN_REMCSUM_RX]))
+ +		conf.flags |= VXLAN_F_REMCSUM_RX;
+ +
+ +	if (data[IFLA_VXLAN_GBP])
+ +		conf.flags |= VXLAN_F_GBP;
+ +
+ +	if (data[IFLA_VXLAN_GPE])
+ +		conf.flags |= VXLAN_F_GPE;
+ +
+ +	if (data[IFLA_VXLAN_REMCSUM_NOPARTIAL])
+ +		conf.flags |= VXLAN_F_REMCSUM_NOPARTIAL;
+ +
+ +	if (tb[IFLA_MTU])
+ +		conf.mtu = nla_get_u32(tb[IFLA_MTU]);
+ +
+ +	return vxlan_dev_configure(src_net, dev, &conf);
+  }
+  
+  static void vxlan_dellink(struct net_device *dev, struct list_head *head)
+@@@ -3206,7 -3447,7 +3445,11 @@@ struct net_device *vxlan_dev_create(str
+  	if (IS_ERR(dev))
+  		return dev;
+  
+++<<<<<<< HEAD
+ +	err = vxlan_dev_configure(net, dev, conf);
+++=======
++ 	err = __vxlan_dev_create(net, dev, conf);
+++>>>>>>> c80498e36d4e (vxlan: fix ovs support)
+  	if (err < 0) {
+  		free_netdev(dev);
+  		return ERR_PTR(err);
+* Unmerged path drivers/net/vxlan.c
