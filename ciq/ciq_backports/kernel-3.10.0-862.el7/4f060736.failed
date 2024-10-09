@@ -1,0 +1,279 @@
+qla2xxx: Fix erroneous invalid handle message
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Quinn Tran <quinn.tran@cavium.com>
+commit 4f060736f29a960aba8e781a88837464756200a8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4f060736.failed
+
+Termination of Immediate Notify IOCB was using wrong
+IOCB handle. IOCB completion code was unable to find
+appropriate code path due to wrong handle.
+
+Following message is seen in the logs.
+
+"Error entry - invalid handle/queue (ffff)."
+
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+[ bvanassche: Fixed word order in patch title ]
+	Signed-off-by: Bart Van Assche <bart.vanassche@sandisk.com>
+(cherry picked from commit 4f060736f29a960aba8e781a88837464756200a8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_target.c
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 94564b5245d8,73ec6b764951..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -2194,6 -2903,227 +2194,230 @@@ out_unlock_free_unmap
+  EXPORT_SYMBOL(qlt_rdy_to_xfer);
+  
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Checks the guard or meta-data for the type of error
++  * detected by the HBA.
++  */
++ static inline int
++ qlt_handle_dif_error(struct scsi_qla_host *vha, struct qla_tgt_cmd *cmd,
++ 		struct ctio_crc_from_fw *sts)
++ {
++ 	uint8_t		*ap = &sts->actual_dif[0];
++ 	uint8_t		*ep = &sts->expected_dif[0];
++ 	uint32_t	e_ref_tag, a_ref_tag;
++ 	uint16_t	e_app_tag, a_app_tag;
++ 	uint16_t	e_guard, a_guard;
++ 	uint64_t	lba = cmd->se_cmd.t_task_lba;
++ 
++ 	a_guard   = be16_to_cpu(*(uint16_t *)(ap + 0));
++ 	a_app_tag = be16_to_cpu(*(uint16_t *)(ap + 2));
++ 	a_ref_tag = be32_to_cpu(*(uint32_t *)(ap + 4));
++ 
++ 	e_guard   = be16_to_cpu(*(uint16_t *)(ep + 0));
++ 	e_app_tag = be16_to_cpu(*(uint16_t *)(ep + 2));
++ 	e_ref_tag = be32_to_cpu(*(uint32_t *)(ep + 4));
++ 
++ 	ql_dbg(ql_dbg_tgt, vha, 0xe075,
++ 	    "iocb(s) %p Returned STATUS.\n", sts);
++ 
++ 	ql_dbg(ql_dbg_tgt, vha, 0xf075,
++ 	    "dif check TGT cdb 0x%x lba 0x%llx: [Actual|Expected] Ref Tag[0x%x|0x%x], App Tag [0x%x|0x%x], Guard [0x%x|0x%x]\n",
++ 	    cmd->atio.u.isp24.fcp_cmnd.cdb[0], lba,
++ 	    a_ref_tag, e_ref_tag, a_app_tag, e_app_tag, a_guard, e_guard);
++ 
++ 	/*
++ 	 * Ignore sector if:
++ 	 * For type     3: ref & app tag is all 'f's
++ 	 * For type 0,1,2: app tag is all 'f's
++ 	 */
++ 	if ((a_app_tag == 0xffff) &&
++ 	    ((cmd->se_cmd.prot_type != TARGET_DIF_TYPE3_PROT) ||
++ 	     (a_ref_tag == 0xffffffff))) {
++ 		uint32_t blocks_done;
++ 
++ 		/* 2TB boundary case covered automatically with this */
++ 		blocks_done = e_ref_tag - (uint32_t)lba + 1;
++ 		cmd->se_cmd.bad_sector = e_ref_tag;
++ 		cmd->se_cmd.pi_err = 0;
++ 		ql_dbg(ql_dbg_tgt, vha, 0xf074,
++ 			"need to return scsi good\n");
++ 
++ 		/* Update protection tag */
++ 		if (cmd->prot_sg_cnt) {
++ 			uint32_t i, k = 0, num_ent;
++ 			struct scatterlist *sg, *sgl;
++ 
++ 
++ 			sgl = cmd->prot_sg;
++ 
++ 			/* Patch the corresponding protection tags */
++ 			for_each_sg(sgl, sg, cmd->prot_sg_cnt, i) {
++ 				num_ent = sg_dma_len(sg) / 8;
++ 				if (k + num_ent < blocks_done) {
++ 					k += num_ent;
++ 					continue;
++ 				}
++ 				k = blocks_done;
++ 				break;
++ 			}
++ 
++ 			if (k != blocks_done) {
++ 				ql_log(ql_log_warn, vha, 0xf076,
++ 				    "unexpected tag values tag:lba=%u:%llu)\n",
++ 				    e_ref_tag, (unsigned long long)lba);
++ 				goto out;
++ 			}
++ 
++ #if 0
++ 			struct sd_dif_tuple *spt;
++ 			/* TODO:
++ 			 * This section came from initiator. Is it valid here?
++ 			 * should ulp be override with actual val???
++ 			 */
++ 			spt = page_address(sg_page(sg)) + sg->offset;
++ 			spt += j;
++ 
++ 			spt->app_tag = 0xffff;
++ 			if (cmd->se_cmd.prot_type == SCSI_PROT_DIF_TYPE3)
++ 				spt->ref_tag = 0xffffffff;
++ #endif
++ 		}
++ 
++ 		return 0;
++ 	}
++ 
++ 	/* check guard */
++ 	if (e_guard != a_guard) {
++ 		cmd->se_cmd.pi_err = TCM_LOGICAL_BLOCK_GUARD_CHECK_FAILED;
++ 		cmd->se_cmd.bad_sector = cmd->se_cmd.t_task_lba;
++ 
++ 		ql_log(ql_log_warn, vha, 0xe076,
++ 		    "Guard ERR: cdb 0x%x lba 0x%llx: [Actual|Expected] Ref Tag[0x%x|0x%x], App Tag [0x%x|0x%x], Guard [0x%x|0x%x] cmd=%p\n",
++ 		    cmd->atio.u.isp24.fcp_cmnd.cdb[0], lba,
++ 		    a_ref_tag, e_ref_tag, a_app_tag, e_app_tag,
++ 		    a_guard, e_guard, cmd);
++ 		goto out;
++ 	}
++ 
++ 	/* check ref tag */
++ 	if (e_ref_tag != a_ref_tag) {
++ 		cmd->se_cmd.pi_err = TCM_LOGICAL_BLOCK_REF_TAG_CHECK_FAILED;
++ 		cmd->se_cmd.bad_sector = e_ref_tag;
++ 
++ 		ql_log(ql_log_warn, vha, 0xe077,
++ 			"Ref Tag ERR: cdb 0x%x lba 0x%llx: [Actual|Expected] Ref Tag[0x%x|0x%x], App Tag [0x%x|0x%x], Guard [0x%x|0x%x] cmd=%p\n",
++ 			cmd->atio.u.isp24.fcp_cmnd.cdb[0], lba,
++ 			a_ref_tag, e_ref_tag, a_app_tag, e_app_tag,
++ 			a_guard, e_guard, cmd);
++ 		goto out;
++ 	}
++ 
++ 	/* check appl tag */
++ 	if (e_app_tag != a_app_tag) {
++ 		cmd->se_cmd.pi_err = TCM_LOGICAL_BLOCK_APP_TAG_CHECK_FAILED;
++ 		cmd->se_cmd.bad_sector = cmd->se_cmd.t_task_lba;
++ 
++ 		ql_log(ql_log_warn, vha, 0xe078,
++ 			"App Tag ERR: cdb 0x%x lba 0x%llx: [Actual|Expected] Ref Tag[0x%x|0x%x], App Tag [0x%x|0x%x], Guard [0x%x|0x%x] cmd=%p\n",
++ 			cmd->atio.u.isp24.fcp_cmnd.cdb[0], lba,
++ 			a_ref_tag, e_ref_tag, a_app_tag, e_app_tag,
++ 			a_guard, e_guard, cmd);
++ 		goto out;
++ 	}
++ out:
++ 	return 1;
++ }
++ 
++ 
++ /* If hardware_lock held on entry, might drop it, then reaquire */
++ /* This function sends the appropriate CTIO to ISP 2xxx or 24xx */
++ static int __qlt_send_term_imm_notif(struct scsi_qla_host *vha,
++ 	struct imm_ntfy_from_isp *ntfy)
++ {
++ 	struct nack_to_isp *nack;
++ 	struct qla_hw_data *ha = vha->hw;
++ 	request_t *pkt;
++ 	int ret = 0;
++ 
++ 	ql_dbg(ql_dbg_tgt_tmr, vha, 0xe01c,
++ 	    "Sending TERM ELS CTIO (ha=%p)\n", ha);
++ 
++ 	pkt = (request_t *)qla2x00_alloc_iocbs_ready(vha, NULL);
++ 	if (pkt == NULL) {
++ 		ql_dbg(ql_dbg_tgt, vha, 0xe080,
++ 		    "qla_target(%d): %s failed: unable to allocate "
++ 		    "request packet\n", vha->vp_idx, __func__);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	pkt->entry_type = NOTIFY_ACK_TYPE;
++ 	pkt->entry_count = 1;
++ 	pkt->handle = QLA_TGT_SKIP_HANDLE;
++ 
++ 	nack = (struct nack_to_isp *)pkt;
++ 	nack->ox_id = ntfy->ox_id;
++ 
++ 	nack->u.isp24.nport_handle = ntfy->u.isp24.nport_handle;
++ 	if (le16_to_cpu(ntfy->u.isp24.status) == IMM_NTFY_ELS) {
++ 		nack->u.isp24.flags = ntfy->u.isp24.flags &
++ 			__constant_cpu_to_le32(NOTIFY24XX_FLAGS_PUREX_IOCB);
++ 	}
++ 
++ 	/* terminate */
++ 	nack->u.isp24.flags |=
++ 		__constant_cpu_to_le16(NOTIFY_ACK_FLAGS_TERMINATE);
++ 
++ 	nack->u.isp24.srr_rx_id = ntfy->u.isp24.srr_rx_id;
++ 	nack->u.isp24.status = ntfy->u.isp24.status;
++ 	nack->u.isp24.status_subcode = ntfy->u.isp24.status_subcode;
++ 	nack->u.isp24.fw_handle = ntfy->u.isp24.fw_handle;
++ 	nack->u.isp24.exchange_address = ntfy->u.isp24.exchange_address;
++ 	nack->u.isp24.srr_rel_offs = ntfy->u.isp24.srr_rel_offs;
++ 	nack->u.isp24.srr_ui = ntfy->u.isp24.srr_ui;
++ 	nack->u.isp24.vp_index = ntfy->u.isp24.vp_index;
++ 
++ 	qla2x00_start_iocbs(vha, vha->req);
++ 	return ret;
++ }
++ 
++ static void qlt_send_term_imm_notif(struct scsi_qla_host *vha,
++ 	struct imm_ntfy_from_isp *imm, int ha_locked)
++ {
++ 	unsigned long flags = 0;
++ 	int rc;
++ 
++ 	if (qlt_issue_marker(vha, ha_locked) < 0)
++ 		return;
++ 
++ 	if (ha_locked) {
++ 		rc = __qlt_send_term_imm_notif(vha, imm);
++ 
++ #if 0	/* Todo  */
++ 		if (rc == -ENOMEM)
++ 			qlt_alloc_qfull_cmd(vha, imm, 0, 0);
++ #else
++ 		if (rc) {
++ 		}
++ #endif
++ 		goto done;
++ 	}
++ 
++ 	spin_lock_irqsave(&vha->hw->hardware_lock, flags);
++ 	rc = __qlt_send_term_imm_notif(vha, imm);
++ 
++ #if 0	/* Todo */
++ 	if (rc == -ENOMEM)
++ 		qlt_alloc_qfull_cmd(vha, imm, 0, 0);
++ #endif
++ 
++ done:
++ 	if (!ha_locked)
++ 		spin_unlock_irqrestore(&vha->hw->hardware_lock, flags);
++ }
++ 
+++>>>>>>> 4f060736f29a (qla2xxx: Fix erroneous invalid handle message)
+  /* If hardware_lock held on entry, might drop it, then reaquire */
+  /* This function sends the appropriate CTIO to ISP 2xxx or 24xx */
+  static int __qlt_send_term_exchange(struct scsi_qla_host *vha,
+diff --git a/drivers/scsi/qla2xxx/qla_isr.c b/drivers/scsi/qla2xxx/qla_isr.c
+index 61661da1dd7e..bd724200ac31 100644
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@ -2485,6 +2485,10 @@ qla2x00_error_entry(scsi_qla_host_t *vha, struct rsp_que *rsp, sts_entry_t *pkt)
+ 	if (pkt->entry_status & RF_BUSY)
+ 		res = DID_BUS_BUSY << 16;
+ 
++	if (pkt->entry_type == NOTIFY_ACK_TYPE &&
++	    pkt->handle == QLA_TGT_SKIP_HANDLE)
++		return;
++
+ 	sp = qla2x00_get_sp_from_handle(vha, func, req, pkt);
+ 	if (sp) {
+ 		sp->done(ha, sp, res);
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
