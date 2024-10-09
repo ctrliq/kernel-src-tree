@@ -1,0 +1,348 @@
+watchdog: Separate and maintain variables based on variable lifetime
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [watchdog] Separate and maintain variables based on variable lifetime (David Arcari) [1576173]
+Rebuild_FUZZ: 92.06%
+commit-author Guenter Roeck <linux@roeck-us.net>
+commit b4ffb1909843b28f3b1b60197d517b123b7a9b66
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b4ffb190.failed
+
+All variables required by the watchdog core to manage a watchdog are
+currently stored in struct watchdog_device. The lifetime of those
+variables is determined by the watchdog driver. However, the lifetime
+of variables used by the watchdog core differs from the lifetime of
+struct watchdog_device. To remedy this situation, watchdog drivers
+can implement ref and unref callbacks, to be used by the watchdog
+core to lock struct watchdog_device in memory.
+
+While this solves the immediate problem, it depends on watchdog drivers
+to actually implement the ref/unref callbacks. This is error prone,
+often not implemented in the first place, or not implemented correctly.
+
+To solve the problem without requiring driver support, split the variables
+in struct watchdog_device into two data structures - one for variables
+associated with the watchdog driver, one for variables associated with
+the watchdog core. With this approach, the watchdog core can keep track
+of its variable lifetime and no longer depends on ref/unref callbacks
+in the driver. As a side effect, some of the variables originally in
+struct watchdog_driver are now private to the watchdog core and no longer
+visible in watchdog drivers.
+
+As a side effect of the changes made, an ioctl will now always fail
+with -ENODEV after a watchdog device was unregistered with the character
+device still open. Previously, it would only fail with -ENODEV in some
+situations. Also, ioctl operations are now atomic from driver perspective.
+With this change, it is now guaranteed that the driver will not unregister
+a watchdog between a timeout change and the subsequent ping.
+
+The 'ref' and 'unref' callbacks in struct watchdog_driver are no longer
+used and marked as deprecated.
+
+	Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+	Signed-off-by: Wim Van Sebroeck <wim@iguana.be>
+(cherry picked from commit b4ffb1909843b28f3b1b60197d517b123b7a9b66)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/watchdog/watchdog-kernel-api.txt
+#	drivers/watchdog/watchdog_dev.c
+#	include/linux/watchdog.h
+diff --cc Documentation/watchdog/watchdog-kernel-api.txt
+index d8b0d3367706,72a009478b15..000000000000
+--- a/Documentation/watchdog/watchdog-kernel-api.txt
++++ b/Documentation/watchdog/watchdog-kernel-api.txt
+@@@ -53,8 -52,10 +52,8 @@@ struct watchdog_device 
+  	unsigned int timeout;
+  	unsigned int min_timeout;
+  	unsigned int max_timeout;
+ -	struct notifier_block reboot_nb;
+ -	struct notifier_block restart_nb;
+  	void *driver_data;
+- 	struct mutex lock;
++ 	struct watchdog_core_data *wd_data;
+  	unsigned long status;
+  	struct list_head deferred;
+  };
+@@@ -100,8 -105,9 +96,14 @@@ struct watchdog_ops 
+  	unsigned int (*status)(struct watchdog_device *);
+  	int (*set_timeout)(struct watchdog_device *, unsigned int);
+  	unsigned int (*get_timeleft)(struct watchdog_device *);
+++<<<<<<< HEAD
+ +	void (*ref)(struct watchdog_device *);
+ +	void (*unref)(struct watchdog_device *);
+++=======
++ 	int (*restart)(struct watchdog_device *);
++ 	void (*ref)(struct watchdog_device *) __deprecated;
++ 	void (*unref)(struct watchdog_device *) __deprecated;
+++>>>>>>> b4ffb1909843 (watchdog: Separate and maintain variables based on variable lifetime)
+  	long (*ioctl)(struct watchdog_device *, unsigned int, unsigned long);
+  };
+  
+@@@ -164,10 -156,8 +152,15 @@@ they are supported. These optional rout
+    (Note: the WDIOF_SETTIMEOUT needs to be set in the options field of the
+    watchdog's info structure).
+  * get_timeleft: this routines returns the time that's left before a reset.
+++<<<<<<< HEAD
+ +* ref: the operation that calls kref_get on the kref of a dynamically
+ +  allocated watchdog_device struct.
+ +* unref: the operation that calls kref_put on the kref of a dynamically
+ +  allocated watchdog_device struct.
+++=======
++ * restart: this routine restarts the machine. It returns 0 on success or a
++   negative errno code for failure.
+++>>>>>>> b4ffb1909843 (watchdog: Separate and maintain variables based on variable lifetime)
+  * ioctl: if this routine is present then it will be called first before we do
+    our own internal ioctl call handling. This routine should return -ENOIOCTLCMD
+    if a command is not supported. The parameters that are passed to the ioctl
+diff --cc drivers/watchdog/watchdog_dev.c
+index f06fbcf0bea2,3cab6f6e7f1c..000000000000
+--- a/drivers/watchdog/watchdog_dev.c
++++ b/drivers/watchdog/watchdog_dev.c
+@@@ -636,12 -643,22 +642,26 @@@ static struct miscdevice watchdog_miscd
+   *	thus we set it up like that.
+   */
+  
+ -static int watchdog_cdev_register(struct watchdog_device *wdd, dev_t devno)
+ +int watchdog_dev_register(struct watchdog_device *wdd)
+  {
+++<<<<<<< HEAD
+ +	int err, devno;
+++=======
++ 	struct watchdog_core_data *wd_data;
++ 	int err;
+++>>>>>>> b4ffb1909843 (watchdog: Separate and maintain variables based on variable lifetime)
++ 
++ 	wd_data = kzalloc(sizeof(struct watchdog_core_data), GFP_KERNEL);
++ 	if (!wd_data)
++ 		return -ENOMEM;
++ 	kref_init(&wd_data->kref);
++ 	mutex_init(&wd_data->lock);
++ 
++ 	wd_data->wdd = wdd;
++ 	wdd->wd_data = wd_data;
+  
+  	if (wdd->id == 0) {
+- 		old_wdd = wdd;
++ 		old_wd_data = wd_data;
+  		watchdog_miscdev.parent = wdd->parent;
+  		err = misc_register(&watchdog_miscdev);
+  		if (err != 0) {
+@@@ -656,12 -674,11 +677,17 @@@
+  	}
+  
+  	/* Fill in the data structures */
+++<<<<<<< HEAD
+ +	devno = MKDEV(MAJOR(watchdog_devt), wdd->id);
+ +	cdev_init(&wdd->cdev, &watchdog_fops);
+ +	wdd->cdev.owner = wdd->ops->owner;
+++=======
++ 	cdev_init(&wd_data->cdev, &watchdog_fops);
++ 	wd_data->cdev.owner = wdd->ops->owner;
+++>>>>>>> b4ffb1909843 (watchdog: Separate and maintain variables based on variable lifetime)
+  
+  	/* Add the device */
+- 	err  = cdev_add(&wdd->cdev, devno, 1);
++ 	err = cdev_add(&wd_data->cdev, devno, 1);
+  	if (err) {
+  		pr_err("watchdog%d unable to add device %d:%d\n",
+  			wdd->id,  MAJOR(watchdog_devt), wdd->id);
+@@@ -674,24 -692,29 +701,32 @@@
+  }
+  
+  /*
+ - *	watchdog_cdev_unregister: unregister watchdog character device
+ + *	watchdog_dev_unregister: unregister a watchdog device
+   *	@watchdog: watchdog device
+   *
+ - *	Unregister watchdog character device and if needed the legacy
+ - *	/dev/watchdog device.
+ + *	Unregister the watchdog and if needed the legacy /dev/watchdog device.
+   */
+  
+ -static void watchdog_cdev_unregister(struct watchdog_device *wdd)
+ +int watchdog_dev_unregister(struct watchdog_device *wdd)
+  {
+- 	mutex_lock(&wdd->lock);
+- 	set_bit(WDOG_UNREGISTERED, &wdd->status);
+- 	mutex_unlock(&wdd->lock);
++ 	struct watchdog_core_data *wd_data = wdd->wd_data;
+  
+- 	cdev_del(&wdd->cdev);
++ 	cdev_del(&wd_data->cdev);
+  	if (wdd->id == 0) {
+  		misc_deregister(&watchdog_miscdev);
+- 		old_wdd = NULL;
++ 		old_wd_data = NULL;
+  	}
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ 
++ 	mutex_lock(&wd_data->lock);
++ 	wd_data->wdd = NULL;
++ 	wdd->wd_data = NULL;
++ 	mutex_unlock(&wd_data->lock);
++ 
++ 	kref_put(&wd_data->kref, watchdog_core_data_release);
+++>>>>>>> b4ffb1909843 (watchdog: Separate and maintain variables based on variable lifetime)
+  }
+  
+  static struct class watchdog_class = {
+@@@ -701,6 -724,53 +736,56 @@@
+  };
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  *	watchdog_dev_register: register a watchdog device
++  *	@wdd: watchdog device
++  *
++  *	Register a watchdog device including handling the legacy
++  *	/dev/watchdog node. /dev/watchdog is actually a miscdevice and
++  *	thus we set it up like that.
++  */
++ 
++ int watchdog_dev_register(struct watchdog_device *wdd)
++ {
++ 	struct device *dev;
++ 	dev_t devno;
++ 	int ret;
++ 
++ 	devno = MKDEV(MAJOR(watchdog_devt), wdd->id);
++ 
++ 	ret = watchdog_cdev_register(wdd, devno);
++ 	if (ret)
++ 		return ret;
++ 
++ 	dev = device_create(&watchdog_class, wdd->parent, devno, wdd,
++ 			    "watchdog%d", wdd->id);
++ 	if (IS_ERR(dev)) {
++ 		watchdog_cdev_unregister(wdd);
++ 		return PTR_ERR(dev);
++ 	}
++ 	wdd->dev = dev;
++ 
++ 	return ret;
++ }
++ 
++ /*
++  *	watchdog_dev_unregister: unregister a watchdog device
++  *	@watchdog: watchdog device
++  *
++  *	Unregister watchdog device and if needed the legacy
++  *	/dev/watchdog device.
++  */
++ 
++ void watchdog_dev_unregister(struct watchdog_device *wdd)
++ {
++ 	device_destroy(&watchdog_class, wdd->dev->devt);
++ 	wdd->dev = NULL;
++ 	watchdog_cdev_unregister(wdd);
++ }
++ 
++ /*
+++>>>>>>> b4ffb1909843 (watchdog: Separate and maintain variables based on variable lifetime)
+   *	watchdog_dev_init: init dev part of watchdog core
+   *
+   *	Allocate a range of chardev nodes to use for watchdog devices
+diff --cc include/linux/watchdog.h
+index e90e3ea5ebeb,850af04fe0c7..000000000000
+--- a/include/linux/watchdog.h
++++ b/include/linux/watchdog.h
+@@@ -24,10 -26,9 +25,16 @@@ struct watchdog_core_data
+   * @stop:	The routine for stopping the watchdog device.
+   * @ping:	The routine that sends a keepalive ping to the watchdog device.
+   * @status:	The routine that shows the status of the watchdog device.
+++<<<<<<< HEAD
+ + * @set_timeout:The routine for setting the watchdog devices timeout value.
+ + * @get_timeleft:The routine that get's the time that's left before a reset.
+ + * @ref:	The ref operation for dyn. allocated watchdog_device structs
+ + * @unref:	The unref operation for dyn. allocated watchdog_device structs
+++=======
++  * @set_timeout:The routine for setting the watchdog devices timeout value (in seconds).
++  * @get_timeleft:The routine that gets the time left before a reset (in seconds).
++  * @restart:	The routine for restarting the machine.
+++>>>>>>> b4ffb1909843 (watchdog: Separate and maintain variables based on variable lifetime)
+   * @ioctl:	The routines that handles extra ioctl calls.
+   *
+   * The watchdog_ops structure contains a list of low-level operations
+@@@ -45,8 -46,9 +52,14 @@@ struct watchdog_ops 
+  	unsigned int (*status)(struct watchdog_device *);
+  	int (*set_timeout)(struct watchdog_device *, unsigned int);
+  	unsigned int (*get_timeleft)(struct watchdog_device *);
+++<<<<<<< HEAD
+ +	void (*ref)(struct watchdog_device *);
+ +	void (*unref)(struct watchdog_device *);
+++=======
++ 	int (*restart)(struct watchdog_device *);
++ 	void (*ref)(struct watchdog_device *) __deprecated;
++ 	void (*unref)(struct watchdog_device *) __deprecated;
+++>>>>>>> b4ffb1909843 (watchdog: Separate and maintain variables based on variable lifetime)
+  	long (*ioctl)(struct watchdog_device *, unsigned int, unsigned long);
+  };
+  
+@@@ -59,11 -60,13 +71,21 @@@
+   * @info:	Pointer to a watchdog_info structure.
+   * @ops:	Pointer to the list of watchdog operations.
+   * @bootstatus:	Status of the watchdog device at boot.
+++<<<<<<< HEAD
+ + * @timeout:	The watchdog devices timeout value.
+ + * @min_timeout:The watchdog devices minimum timeout value.
+ + * @max_timeout:The watchdog devices maximum timeout value.
+ + * @driver-data:Pointer to the drivers private data.
+ + * @lock:	Lock for watchdog core internal use only.
+++=======
++  * @timeout:	The watchdog devices timeout value (in seconds).
++  * @min_timeout:The watchdog devices minimum timeout value (in seconds).
++  * @max_timeout:The watchdog devices maximum timeout value (in seconds).
++  * @reboot_nb:	The notifier block to stop watchdog on reboot.
++  * @restart_nb:	The notifier block to register a restart function.
++  * @driver_data:Pointer to the drivers private data.
++  * @wd_data:	Pointer to watchdog core internal data.
+++>>>>>>> b4ffb1909843 (watchdog: Separate and maintain variables based on variable lifetime)
+   * @status:	Field that contains the devices internal status bits.
+   * @deferred: entry in wtd_deferred_reg_list which is used to
+   *			   register early initialized watchdogs.
+@@@ -88,15 -90,15 +109,20 @@@ struct watchdog_device 
+  	unsigned int timeout;
+  	unsigned int min_timeout;
+  	unsigned int max_timeout;
+ -	struct notifier_block reboot_nb;
+ -	struct notifier_block restart_nb;
+  	void *driver_data;
+- 	struct mutex lock;
++ 	struct watchdog_core_data *wd_data;
+  	unsigned long status;
+  /* Bit numbers for status flags */
+  #define WDOG_ACTIVE		0	/* Is the watchdog running/active */
+++<<<<<<< HEAD
+ +#define WDOG_DEV_OPEN		1	/* Opened via /dev/watchdog ? */
+ +#define WDOG_ALLOW_RELEASE	2	/* Did we receive the magic char ? */
+ +#define WDOG_NO_WAY_OUT		3	/* Is 'nowayout' feature set ? */
+ +#define WDOG_UNREGISTERED	4	/* Has the device been unregistered */
+++=======
++ #define WDOG_NO_WAY_OUT		1	/* Is 'nowayout' feature set ? */
++ #define WDOG_STOP_ON_REBOOT	2	/* Should be stopped on reboot */
+++>>>>>>> b4ffb1909843 (watchdog: Separate and maintain variables based on variable lifetime)
+  	struct list_head deferred;
+  };
+  
+* Unmerged path Documentation/watchdog/watchdog-kernel-api.txt
+diff --git a/drivers/watchdog/watchdog_core.c b/drivers/watchdog/watchdog_core.c
+index ec37c78cc500..ae29cbddeb06 100644
+--- a/drivers/watchdog/watchdog_core.c
++++ b/drivers/watchdog/watchdog_core.c
+@@ -156,8 +156,6 @@ static int __watchdog_register_device(struct watchdog_device *wdd)
+ 	 * corrupted in a later stage then we expect a kernel panic!
+ 	 */
+ 
+-	mutex_init(&wdd->lock);
+-
+ 	/* Use alias for watchdog id if possible */
+ 	if (wdd->parent) {
+ 		ret = of_alias_get_id(wdd->parent->of_node, "watchdog");
+* Unmerged path drivers/watchdog/watchdog_dev.c
+* Unmerged path include/linux/watchdog.h
