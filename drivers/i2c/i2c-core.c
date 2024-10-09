@@ -1224,7 +1224,7 @@ static int __process_new_adapter(struct device_driver *d, void *data)
 
 static int i2c_register_adapter(struct i2c_adapter *adap)
 {
-	int res = 0;
+	int res = -EINVAL;
 
 	/* Can't register until after driver model init */
 	if (unlikely(WARN_ON(!i2c_bus_type.p))) {
@@ -1236,12 +1236,12 @@ static int i2c_register_adapter(struct i2c_adapter *adap)
 	if (unlikely(adap->name[0] == '\0')) {
 		pr_err("i2c-core: Attempt to register an adapter with "
 		       "no name!\n");
-		return -EINVAL;
+		goto out_list;
 	}
 	if (unlikely(!adap->algo)) {
 		pr_err("i2c-core: Attempt to register adapter '%s' with "
 		       "no algo!\n", adap->name);
-		return -EINVAL;
+		goto out_list;
 	}
 
 	if (!adap->lock_bus) {
