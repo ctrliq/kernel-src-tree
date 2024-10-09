@@ -454,6 +454,8 @@ void xgbe_deconfig_netdev(struct xgbe_prv_data *pdata)
 
 	xgbe_ptp_unregister(pdata);
 
+	unregister_netdev(netdev);
+
 	pdata->phy_if.phy_exit(pdata);
 
 	flush_workqueue(pdata->an_workqueue);
@@ -461,8 +463,6 @@ void xgbe_deconfig_netdev(struct xgbe_prv_data *pdata)
 
 	flush_workqueue(pdata->dev_workqueue);
 	destroy_workqueue(pdata->dev_workqueue);
-
-	unregister_netdev(netdev);
 }
 
 static int __init xgbe_mod_init(void)
