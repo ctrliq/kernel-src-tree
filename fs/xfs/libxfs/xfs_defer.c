@@ -396,6 +396,12 @@ xfs_defer_finish(
 			cleanup_fn(*tp, state, error);
 	}
 
+	/*
+	 * Roll the transaction once more to avoid returning to the caller
+	 * with a dirty transaction.
+	 */
+	if ((*tp)->t_flags & XFS_TRANS_DIRTY)
+		error = xfs_defer_trans_roll(tp, dop);
 out:
 	if (error)
 		trace_xfs_defer_finish_error((*tp)->t_mountp, dop, error);
