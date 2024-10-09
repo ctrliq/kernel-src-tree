@@ -1,0 +1,319 @@
+sched,rt: Remove return value from pull_rt_task()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 8046d6806247088de5725eaf8a2580b29e50ac5a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/8046d680.failed
+
+In order to be able to use pull_rt_task() from a callback, we need to
+do away with the return value.
+
+Since the return value indicates if we should reschedule, do this
+inside the function. Since not all callers currently do this, this can
+increase the number of reschedules due rt balancing.
+
+Too many reschedules is not a correctness issues, too few are.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: ktkhai@parallels.com
+	Cc: rostedt@goodmis.org
+	Cc: juri.lelli@gmail.com
+	Cc: pang.xunlei@linaro.org
+	Cc: oleg@redhat.com
+	Cc: wanpeng.li@linux.intel.com
+	Cc: umgwanakikbuti@gmail.com
+Link: http://lkml.kernel.org/r/20150611124742.679002000@infradead.org
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 8046d6806247088de5725eaf8a2580b29e50ac5a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/rt.c
+diff --cc kernel/sched/rt.c
+index 6b68ceb9a68d,c702b48de9f0..000000000000
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@@ -229,6 -260,14 +229,17 @@@ int alloc_rt_sched_group(struct task_gr
+  
+  #ifdef CONFIG_SMP
+  
+++<<<<<<< HEAD
+++=======
++ static void pull_rt_task(struct rq *this_rq);
++ 
++ static inline bool need_pull_rt_task(struct rq *rq, struct task_struct *prev)
++ {
++ 	/* Try to pull RT tasks here if we lower this rq's prio */
++ 	return rq->rt.highest_prio.curr > prev->prio;
++ }
++ 
+++>>>>>>> 8046d6806247 (sched,rt: Remove return value from pull_rt_task())
+  static inline int rt_overloaded(struct rq *rq)
+  {
+  	return atomic_read(&rq->rd->rto_count);
+@@@ -357,8 -410,23 +368,23 @@@ void dec_rt_migration(struct sched_rt_e
+  {
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool need_pull_rt_task(struct rq *rq, struct task_struct *prev)
++ {
++ 	return false;
++ }
++ 
++ static inline void pull_rt_task(struct rq *this_rq)
++ {
++ }
++ 
++ static inline void queue_push_tasks(struct rq *rq)
++ {
++ }
+++>>>>>>> 8046d6806247 (sched,rt: Remove return value from pull_rt_task())
+  #endif /* CONFIG_SMP */
+  
+ -static void enqueue_top_rt_rq(struct rt_rq *rt_rq);
+ -static void dequeue_top_rt_rq(struct rt_rq *rt_rq);
+ -
+  static inline int on_rt_rq(struct sched_rt_entity *rt_se)
+  {
+  	return !list_empty(&rt_se->run_list);
+@@@ -1699,15 -1796,187 +1725,194 @@@ static void push_rt_tasks(struct rq *rq
+  		;
+  }
+  
+++<<<<<<< HEAD
+ +static int pull_rt_task(struct rq *this_rq)
+++=======
++ #ifdef HAVE_RT_PUSH_IPI
++ /*
++  * The search for the next cpu always starts at rq->cpu and ends
++  * when we reach rq->cpu again. It will never return rq->cpu.
++  * This returns the next cpu to check, or nr_cpu_ids if the loop
++  * is complete.
++  *
++  * rq->rt.push_cpu holds the last cpu returned by this function,
++  * or if this is the first instance, it must hold rq->cpu.
++  */
++ static int rto_next_cpu(struct rq *rq)
++ {
++ 	int prev_cpu = rq->rt.push_cpu;
++ 	int cpu;
++ 
++ 	cpu = cpumask_next(prev_cpu, rq->rd->rto_mask);
++ 
++ 	/*
++ 	 * If the previous cpu is less than the rq's CPU, then it already
++ 	 * passed the end of the mask, and has started from the beginning.
++ 	 * We end if the next CPU is greater or equal to rq's CPU.
++ 	 */
++ 	if (prev_cpu < rq->cpu) {
++ 		if (cpu >= rq->cpu)
++ 			return nr_cpu_ids;
++ 
++ 	} else if (cpu >= nr_cpu_ids) {
++ 		/*
++ 		 * We passed the end of the mask, start at the beginning.
++ 		 * If the result is greater or equal to the rq's CPU, then
++ 		 * the loop is finished.
++ 		 */
++ 		cpu = cpumask_first(rq->rd->rto_mask);
++ 		if (cpu >= rq->cpu)
++ 			return nr_cpu_ids;
++ 	}
++ 	rq->rt.push_cpu = cpu;
++ 
++ 	/* Return cpu to let the caller know if the loop is finished or not */
++ 	return cpu;
++ }
++ 
++ static int find_next_push_cpu(struct rq *rq)
++ {
++ 	struct rq *next_rq;
++ 	int cpu;
++ 
++ 	while (1) {
++ 		cpu = rto_next_cpu(rq);
++ 		if (cpu >= nr_cpu_ids)
++ 			break;
++ 		next_rq = cpu_rq(cpu);
++ 
++ 		/* Make sure the next rq can push to this rq */
++ 		if (next_rq->rt.highest_prio.next < rq->rt.highest_prio.curr)
++ 			break;
++ 	}
++ 
++ 	return cpu;
++ }
++ 
++ #define RT_PUSH_IPI_EXECUTING		1
++ #define RT_PUSH_IPI_RESTART		2
++ 
++ static void tell_cpu_to_push(struct rq *rq)
++ {
++ 	int cpu;
++ 
++ 	if (rq->rt.push_flags & RT_PUSH_IPI_EXECUTING) {
++ 		raw_spin_lock(&rq->rt.push_lock);
++ 		/* Make sure it's still executing */
++ 		if (rq->rt.push_flags & RT_PUSH_IPI_EXECUTING) {
++ 			/*
++ 			 * Tell the IPI to restart the loop as things have
++ 			 * changed since it started.
++ 			 */
++ 			rq->rt.push_flags |= RT_PUSH_IPI_RESTART;
++ 			raw_spin_unlock(&rq->rt.push_lock);
++ 			return;
++ 		}
++ 		raw_spin_unlock(&rq->rt.push_lock);
++ 	}
++ 
++ 	/* When here, there's no IPI going around */
++ 
++ 	rq->rt.push_cpu = rq->cpu;
++ 	cpu = find_next_push_cpu(rq);
++ 	if (cpu >= nr_cpu_ids)
++ 		return;
++ 
++ 	rq->rt.push_flags = RT_PUSH_IPI_EXECUTING;
++ 
++ 	irq_work_queue_on(&rq->rt.push_work, cpu);
++ }
++ 
++ /* Called from hardirq context */
++ static void try_to_push_tasks(void *arg)
+  {
+- 	int this_cpu = this_rq->cpu, ret = 0, cpu;
++ 	struct rt_rq *rt_rq = arg;
++ 	struct rq *rq, *src_rq;
++ 	int this_cpu;
++ 	int cpu;
++ 
++ 	this_cpu = rt_rq->push_cpu;
++ 
++ 	/* Paranoid check */
++ 	BUG_ON(this_cpu != smp_processor_id());
++ 
++ 	rq = cpu_rq(this_cpu);
++ 	src_rq = rq_of_rt_rq(rt_rq);
++ 
++ again:
++ 	if (has_pushable_tasks(rq)) {
++ 		raw_spin_lock(&rq->lock);
++ 		push_rt_task(rq);
++ 		raw_spin_unlock(&rq->lock);
++ 	}
++ 
++ 	/* Pass the IPI to the next rt overloaded queue */
++ 	raw_spin_lock(&rt_rq->push_lock);
++ 	/*
++ 	 * If the source queue changed since the IPI went out,
++ 	 * we need to restart the search from that CPU again.
++ 	 */
++ 	if (rt_rq->push_flags & RT_PUSH_IPI_RESTART) {
++ 		rt_rq->push_flags &= ~RT_PUSH_IPI_RESTART;
++ 		rt_rq->push_cpu = src_rq->cpu;
++ 	}
++ 
++ 	cpu = find_next_push_cpu(src_rq);
++ 
++ 	if (cpu >= nr_cpu_ids)
++ 		rt_rq->push_flags &= ~RT_PUSH_IPI_EXECUTING;
++ 	raw_spin_unlock(&rt_rq->push_lock);
++ 
++ 	if (cpu >= nr_cpu_ids)
++ 		return;
++ 
++ 	/*
++ 	 * It is possible that a restart caused this CPU to be
++ 	 * chosen again. Don't bother with an IPI, just see if we
++ 	 * have more to push.
++ 	 */
++ 	if (unlikely(cpu == rq->cpu))
++ 		goto again;
++ 
++ 	/* Try the next RT overloaded CPU */
++ 	irq_work_queue_on(&rt_rq->push_work, cpu);
++ }
++ 
++ static void push_irq_work_func(struct irq_work *work)
++ {
++ 	struct rt_rq *rt_rq = container_of(work, struct rt_rq, push_work);
++ 
++ 	try_to_push_tasks(rt_rq);
++ }
++ #endif /* HAVE_RT_PUSH_IPI */
++ 
++ static void pull_rt_task(struct rq *this_rq)
+++>>>>>>> 8046d6806247 (sched,rt: Remove return value from pull_rt_task())
++ {
++ 	int this_cpu = this_rq->cpu, cpu;
++ 	bool resched = false;
+  	struct task_struct *p;
+  	struct rq *src_rq;
+  
+  	if (likely(!rt_overloaded(this_rq)))
+- 		return 0;
++ 		return;
++ 
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Match the barrier from rt_set_overloaded; this guarantees that if we
++ 	 * see overloaded we must also see the rto_mask bit.
++ 	 */
++ 	smp_rmb();
+  
++ #ifdef HAVE_RT_PUSH_IPI
++ 	if (sched_feat(RT_PUSH_IPI)) {
++ 		tell_cpu_to_push(this_rq);
++ 		return;
++ 	}
++ #endif
++ 
+++>>>>>>> 8046d6806247 (sched,rt: Remove return value from pull_rt_task())
+  	for_each_cpu(cpu, this_rq->rd->rto_mask) {
+  		if (this_cpu == cpu)
+  			continue;
+@@@ -1775,21 -2042,10 +1980,22 @@@ skip
+  		double_unlock_balance(this_rq, src_rq);
+  	}
+  
+- 	return ret;
++ 	if (resched)
++ 		resched_curr(this_rq);
+  }
+  
+ +static void pre_schedule_rt(struct rq *rq, struct task_struct *prev)
+ +{
+ +	/* Try to pull RT tasks here if we lower this rq's prio */
+ +	if (rq->rt.highest_prio.curr > prev->prio)
+ +		pull_rt_task(rq);
+ +}
+ +
+ +static void post_schedule_rt(struct rq *rq)
+ +{
+ +	push_rt_tasks(rq);
+ +}
+ +
+  /*
+   * If we are not running and we are not going to reschedule soon, we should
+   * try to push tasks away now
+@@@ -1883,11 -2139,10 +2089,10 @@@ static void switched_from_rt(struct rq 
+  	if (!task_on_rq_queued(p) || rq->rt.rt_nr_running)
+  		return;
+  
+- 	if (pull_rt_task(rq))
+- 		resched_curr(rq);
++ 	pull_rt_task(rq);
+  }
+  
+ -void __init init_sched_rt_class(void)
+ +void init_sched_rt_class(void)
+  {
+  	unsigned int i;
+  
+* Unmerged path kernel/sched/rt.c
