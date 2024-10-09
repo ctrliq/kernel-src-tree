@@ -1,0 +1,330 @@
+nvme: explicitly disable APST on quirked devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [nvme] explicitly disable APST on quirked devices (David Milburn) [1389600]
+Rebuild_FUZZ: 93.33%
+commit-author Kai-Heng Feng <kai.heng.feng@canonical.com>
+commit 76a5af841755a0427229a6a77ca83781d61e5b2a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/76a5af84.failed
+
+A user reports APST is enabled, even when the NVMe is quirked or with
+option "default_ps_max_latency_us=0".
+
+The current logic will not set APST if the device is quirked. But the
+NVMe in question will enable APST automatically.
+
+Separate the logic "apst is supported" and "to enable apst", so we can
+use the latter one to explicitly disable APST at initialiaztion.
+
+BugLink: https://bugs.launchpad.net/bugs/1699004
+	Signed-off-by: Kai-Heng Feng <kai.heng.feng@canonical.com>
+	Reviewed-by: Andy Lutomirski <luto@kernel.org>
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 76a5af841755a0427229a6a77ca83781d61e5b2a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/nvme.h
+diff --cc drivers/nvme/host/core.c
+index f3660f9b6cc7,9c03655ac2a9..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -1161,9 -1503,206 +1161,210 @@@ static void nvme_set_queue_limits(struc
+  	}
+  	if (ctrl->quirks & NVME_QUIRK_STRIPE_SIZE)
+  		blk_queue_chunk_sectors(q, ctrl->max_hw_sectors);
+ -	blk_queue_virt_boundary(q, ctrl->page_size - 1);
+  	if (ctrl->vwc & NVME_CTRL_VWC_PRESENT)
+++<<<<<<< HEAD
+ +		blk_queue_flush(q, REQ_FLUSH | REQ_FUA);
+ +	blk_queue_virt_boundary(q, ctrl->page_size - 1);
+++=======
++ 		vwc = true;
++ 	blk_queue_write_cache(q, vwc, vwc);
++ }
++ 
++ static void nvme_configure_apst(struct nvme_ctrl *ctrl)
++ {
++ 	/*
++ 	 * APST (Autonomous Power State Transition) lets us program a
++ 	 * table of power state transitions that the controller will
++ 	 * perform automatically.  We configure it with a simple
++ 	 * heuristic: we are willing to spend at most 2% of the time
++ 	 * transitioning between power states.  Therefore, when running
++ 	 * in any given state, we will enter the next lower-power
++ 	 * non-operational state after waiting 50 * (enlat + exlat)
++ 	 * microseconds, as long as that state's exit latency is under
++ 	 * the requested maximum latency.
++ 	 *
++ 	 * We will not autonomously enter any non-operational state for
++ 	 * which the total latency exceeds ps_max_latency_us.  Users
++ 	 * can set ps_max_latency_us to zero to turn off APST.
++ 	 */
++ 
++ 	unsigned apste;
++ 	struct nvme_feat_auto_pst *table;
++ 	u64 max_lat_us = 0;
++ 	int max_ps = -1;
++ 	int ret;
++ 
++ 	/*
++ 	 * If APST isn't supported or if we haven't been initialized yet,
++ 	 * then don't do anything.
++ 	 */
++ 	if (!ctrl->apsta)
++ 		return;
++ 
++ 	if (ctrl->npss > 31) {
++ 		dev_warn(ctrl->device, "NPSS is invalid; not using APST\n");
++ 		return;
++ 	}
++ 
++ 	table = kzalloc(sizeof(*table), GFP_KERNEL);
++ 	if (!table)
++ 		return;
++ 
++ 	if (!ctrl->apst_enabled || ctrl->ps_max_latency_us == 0) {
++ 		/* Turn off APST. */
++ 		apste = 0;
++ 		dev_dbg(ctrl->device, "APST disabled\n");
++ 	} else {
++ 		__le64 target = cpu_to_le64(0);
++ 		int state;
++ 
++ 		/*
++ 		 * Walk through all states from lowest- to highest-power.
++ 		 * According to the spec, lower-numbered states use more
++ 		 * power.  NPSS, despite the name, is the index of the
++ 		 * lowest-power state, not the number of states.
++ 		 */
++ 		for (state = (int)ctrl->npss; state >= 0; state--) {
++ 			u64 total_latency_us, exit_latency_us, transition_ms;
++ 
++ 			if (target)
++ 				table->entries[state] = target;
++ 
++ 			/*
++ 			 * Don't allow transitions to the deepest state
++ 			 * if it's quirked off.
++ 			 */
++ 			if (state == ctrl->npss &&
++ 			    (ctrl->quirks & NVME_QUIRK_NO_DEEPEST_PS))
++ 				continue;
++ 
++ 			/*
++ 			 * Is this state a useful non-operational state for
++ 			 * higher-power states to autonomously transition to?
++ 			 */
++ 			if (!(ctrl->psd[state].flags &
++ 			      NVME_PS_FLAGS_NON_OP_STATE))
++ 				continue;
++ 
++ 			exit_latency_us =
++ 				(u64)le32_to_cpu(ctrl->psd[state].exit_lat);
++ 			if (exit_latency_us > ctrl->ps_max_latency_us)
++ 				continue;
++ 
++ 			total_latency_us =
++ 				exit_latency_us +
++ 				le32_to_cpu(ctrl->psd[state].entry_lat);
++ 
++ 			/*
++ 			 * This state is good.  Use it as the APST idle
++ 			 * target for higher power states.
++ 			 */
++ 			transition_ms = total_latency_us + 19;
++ 			do_div(transition_ms, 20);
++ 			if (transition_ms > (1 << 24) - 1)
++ 				transition_ms = (1 << 24) - 1;
++ 
++ 			target = cpu_to_le64((state << 3) |
++ 					     (transition_ms << 8));
++ 
++ 			if (max_ps == -1)
++ 				max_ps = state;
++ 
++ 			if (total_latency_us > max_lat_us)
++ 				max_lat_us = total_latency_us;
++ 		}
++ 
++ 		apste = 1;
++ 
++ 		if (max_ps == -1) {
++ 			dev_dbg(ctrl->device, "APST enabled but no non-operational states are available\n");
++ 		} else {
++ 			dev_dbg(ctrl->device, "APST enabled: max PS = %d, max round-trip latency = %lluus, table = %*phN\n",
++ 				max_ps, max_lat_us, (int)sizeof(*table), table);
++ 		}
++ 	}
++ 
++ 	ret = nvme_set_features(ctrl, NVME_FEAT_AUTO_PST, apste,
++ 				table, sizeof(*table), NULL);
++ 	if (ret)
++ 		dev_err(ctrl->device, "failed to set APST feature (%d)\n", ret);
++ 
++ 	kfree(table);
++ }
++ 
++ static void nvme_set_latency_tolerance(struct device *dev, s32 val)
++ {
++ 	struct nvme_ctrl *ctrl = dev_get_drvdata(dev);
++ 	u64 latency;
++ 
++ 	switch (val) {
++ 	case PM_QOS_LATENCY_TOLERANCE_NO_CONSTRAINT:
++ 	case PM_QOS_LATENCY_ANY:
++ 		latency = U64_MAX;
++ 		break;
++ 
++ 	default:
++ 		latency = val;
++ 	}
++ 
++ 	if (ctrl->ps_max_latency_us != latency) {
++ 		ctrl->ps_max_latency_us = latency;
++ 		nvme_configure_apst(ctrl);
++ 	}
++ }
++ 
++ struct nvme_core_quirk_entry {
++ 	/*
++ 	 * NVMe model and firmware strings are padded with spaces.  For
++ 	 * simplicity, strings in the quirk table are padded with NULLs
++ 	 * instead.
++ 	 */
++ 	u16 vid;
++ 	const char *mn;
++ 	const char *fr;
++ 	unsigned long quirks;
++ };
++ 
++ static const struct nvme_core_quirk_entry core_quirks[] = {
++ 	{
++ 		/*
++ 		 * This Toshiba device seems to die using any APST states.  See:
++ 		 * https://bugs.launchpad.net/ubuntu/+source/linux/+bug/1678184/comments/11
++ 		 */
++ 		.vid = 0x1179,
++ 		.mn = "THNSF5256GPUK TOSHIBA",
++ 		.quirks = NVME_QUIRK_NO_APST,
++ 	}
++ };
++ 
++ /* match is null-terminated but idstr is space-padded. */
++ static bool string_matches(const char *idstr, const char *match, size_t len)
++ {
++ 	size_t matchlen;
++ 
++ 	if (!match)
++ 		return true;
++ 
++ 	matchlen = strlen(match);
++ 	WARN_ON_ONCE(matchlen > len);
++ 
++ 	if (memcmp(idstr, match, matchlen))
++ 		return false;
++ 
++ 	for (; matchlen < len; matchlen++)
++ 		if (idstr[matchlen] != ' ')
++ 			return false;
++ 
++ 	return true;
++ }
++ 
++ static bool quirk_matches(const struct nvme_id_ctrl *id,
++ 			  const struct nvme_core_quirk_entry *q)
++ {
++ 	return q->vid == le16_to_cpu(id->vid) &&
++ 		string_matches(id->mn, q->mn, sizeof(id->mn)) &&
++ 		string_matches(id->fr, q->fr, sizeof(id->fr));
+++>>>>>>> 76a5af841755 (nvme: explicitly disable APST on quirked devices)
+  }
+  
+  /*
+@@@ -1177,6 -1716,7 +1378,10 @@@ int nvme_init_identify(struct nvme_ctr
+  	u64 cap;
+  	int ret, page_shift;
+  	u32 max_hw_sectors;
+++<<<<<<< HEAD
+++=======
++ 	bool prev_apst_enabled;
+++>>>>>>> 76a5af841755 (nvme: explicitly disable APST on quirked devices)
+  
+  	ret = ctrl->ops->reg_read32(ctrl, NVME_REG_VS, &ctrl->vs);
+  	if (ret) {
+@@@ -1219,7 -1783,22 +1424,26 @@@
+  	ctrl->sgls = le32_to_cpu(id->sgls);
+  	ctrl->kas = le16_to_cpu(id->kas);
+  
+++<<<<<<< HEAD
+ +	if (ctrl->ops->is_fabrics) {
+++=======
++ 	ctrl->npss = id->npss;
++ 	ctrl->apsta = id->apsta;
++ 	prev_apst_enabled = ctrl->apst_enabled;
++ 	if (ctrl->quirks & NVME_QUIRK_NO_APST) {
++ 		if (force_apst && id->apsta) {
++ 			dev_warn(ctrl->device, "forcibly allowing APST due to nvme_core.force_apst -- use at your own risk\n");
++ 			ctrl->apst_enabled = true;
++ 		} else {
++ 			ctrl->apst_enabled = false;
++ 		}
++ 	} else {
++ 		ctrl->apst_enabled = id->apsta;
++ 	}
++ 	memcpy(ctrl->psd, id->psd, sizeof(ctrl->psd));
++ 
++ 	if (ctrl->ops->flags & NVME_F_FABRICS) {
+++>>>>>>> 76a5af841755 (nvme: explicitly disable APST on quirked devices)
+  		ctrl->icdoff = le16_to_cpu(id->icdoff);
+  		ctrl->ioccsz = le32_to_cpu(id->ioccsz);
+  		ctrl->iorcsz = le32_to_cpu(id->iorcsz);
+@@@ -1242,6 -1821,19 +1466,20 @@@
+  	}
+  
+  	kfree(id);
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (ctrl->apst_enabled && !prev_apst_enabled)
++ 		dev_pm_qos_expose_latency_tolerance(ctrl->device);
++ 	else if (!ctrl->apst_enabled && prev_apst_enabled)
++ 		dev_pm_qos_hide_latency_tolerance(ctrl->device);
++ 
++ 	nvme_configure_apst(ctrl);
++ 	nvme_configure_directives(ctrl);
++ 
++ 	ctrl->identified = true;
++ 
+++>>>>>>> 76a5af841755 (nvme: explicitly disable APST on quirked devices)
+  	return ret;
+  }
+  EXPORT_SYMBOL_GPL(nvme_init_identify);
+diff --cc drivers/nvme/host/nvme.h
+index a338bbe34fd8,b74f954eac66..000000000000
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@@ -142,6 -165,13 +142,16 @@@ struct nvme_ctrl 
+  	struct work_struct async_event_work;
+  	struct delayed_work ka_work;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Power saving configuration */
++ 	u64 ps_max_latency_us;
++ 	bool apst_enabled;
++ 
++ 	u32 hmpre;
++ 	u32 hmmin;
++ 
+++>>>>>>> 76a5af841755 (nvme: explicitly disable APST on quirked devices)
+  	/* Fabrics only */
+  	u16 sqsize;
+  	u32 ioccsz;
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/nvme.h
