@@ -1,0 +1,271 @@
+xfs: refactor bmap record validation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit 30b0984d9117dd14c895265886d34335856b712b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/30b0984d.failed
+
+Refactor the bmap validator into a more complete helper that looks for
+extents that run off the end of the device, overflow into the next AG,
+or have invalid flag states.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+(cherry picked from commit 30b0984d9117dd14c895265886d34335856b712b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_bmap.c
+diff --cc fs/xfs/libxfs/xfs_bmap.c
+index b4df2de3f162,91214f21563c..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@@ -5738,3 -6022,175 +5742,178 @@@ out
+  	xfs_trans_cancel(tp);
+  	return error;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /* Deferred mapping is only for real extents in the data fork. */
++ static bool
++ xfs_bmap_is_update_needed(
++ 	struct xfs_bmbt_irec	*bmap)
++ {
++ 	return  bmap->br_startblock != HOLESTARTBLOCK &&
++ 		bmap->br_startblock != DELAYSTARTBLOCK;
++ }
++ 
++ /* Record a bmap intent. */
++ static int
++ __xfs_bmap_add(
++ 	struct xfs_mount		*mp,
++ 	struct xfs_defer_ops		*dfops,
++ 	enum xfs_bmap_intent_type	type,
++ 	struct xfs_inode		*ip,
++ 	int				whichfork,
++ 	struct xfs_bmbt_irec		*bmap)
++ {
++ 	int				error;
++ 	struct xfs_bmap_intent		*bi;
++ 
++ 	trace_xfs_bmap_defer(mp,
++ 			XFS_FSB_TO_AGNO(mp, bmap->br_startblock),
++ 			type,
++ 			XFS_FSB_TO_AGBNO(mp, bmap->br_startblock),
++ 			ip->i_ino, whichfork,
++ 			bmap->br_startoff,
++ 			bmap->br_blockcount,
++ 			bmap->br_state);
++ 
++ 	bi = kmem_alloc(sizeof(struct xfs_bmap_intent), KM_SLEEP | KM_NOFS);
++ 	INIT_LIST_HEAD(&bi->bi_list);
++ 	bi->bi_type = type;
++ 	bi->bi_owner = ip;
++ 	bi->bi_whichfork = whichfork;
++ 	bi->bi_bmap = *bmap;
++ 
++ 	error = xfs_defer_ijoin(dfops, bi->bi_owner);
++ 	if (error) {
++ 		kmem_free(bi);
++ 		return error;
++ 	}
++ 
++ 	xfs_defer_add(dfops, XFS_DEFER_OPS_TYPE_BMAP, &bi->bi_list);
++ 	return 0;
++ }
++ 
++ /* Map an extent into a file. */
++ int
++ xfs_bmap_map_extent(
++ 	struct xfs_mount	*mp,
++ 	struct xfs_defer_ops	*dfops,
++ 	struct xfs_inode	*ip,
++ 	struct xfs_bmbt_irec	*PREV)
++ {
++ 	if (!xfs_bmap_is_update_needed(PREV))
++ 		return 0;
++ 
++ 	return __xfs_bmap_add(mp, dfops, XFS_BMAP_MAP, ip,
++ 			XFS_DATA_FORK, PREV);
++ }
++ 
++ /* Unmap an extent out of a file. */
++ int
++ xfs_bmap_unmap_extent(
++ 	struct xfs_mount	*mp,
++ 	struct xfs_defer_ops	*dfops,
++ 	struct xfs_inode	*ip,
++ 	struct xfs_bmbt_irec	*PREV)
++ {
++ 	if (!xfs_bmap_is_update_needed(PREV))
++ 		return 0;
++ 
++ 	return __xfs_bmap_add(mp, dfops, XFS_BMAP_UNMAP, ip,
++ 			XFS_DATA_FORK, PREV);
++ }
++ 
++ /*
++  * Process one of the deferred bmap operations.  We pass back the
++  * btree cursor to maintain our lock on the bmapbt between calls.
++  */
++ int
++ xfs_bmap_finish_one(
++ 	struct xfs_trans		*tp,
++ 	struct xfs_defer_ops		*dfops,
++ 	struct xfs_inode		*ip,
++ 	enum xfs_bmap_intent_type	type,
++ 	int				whichfork,
++ 	xfs_fileoff_t			startoff,
++ 	xfs_fsblock_t			startblock,
++ 	xfs_filblks_t			*blockcount,
++ 	xfs_exntst_t			state)
++ {
++ 	xfs_fsblock_t			firstfsb;
++ 	int				error = 0;
++ 
++ 	/*
++ 	 * firstfsb is tied to the transaction lifetime and is used to
++ 	 * ensure correct AG locking order and schedule work item
++ 	 * continuations.  XFS_BUI_MAX_FAST_EXTENTS (== 1) restricts us
++ 	 * to only making one bmap call per transaction, so it should
++ 	 * be safe to have it as a local variable here.
++ 	 */
++ 	firstfsb = NULLFSBLOCK;
++ 
++ 	trace_xfs_bmap_deferred(tp->t_mountp,
++ 			XFS_FSB_TO_AGNO(tp->t_mountp, startblock), type,
++ 			XFS_FSB_TO_AGBNO(tp->t_mountp, startblock),
++ 			ip->i_ino, whichfork, startoff, *blockcount, state);
++ 
++ 	if (WARN_ON_ONCE(whichfork != XFS_DATA_FORK))
++ 		return -EFSCORRUPTED;
++ 
++ 	if (XFS_TEST_ERROR(false, tp->t_mountp,
++ 			XFS_ERRTAG_BMAP_FINISH_ONE))
++ 		return -EIO;
++ 
++ 	switch (type) {
++ 	case XFS_BMAP_MAP:
++ 		error = xfs_bmapi_remap(tp, ip, startoff, *blockcount,
++ 				startblock, dfops);
++ 		*blockcount = 0;
++ 		break;
++ 	case XFS_BMAP_UNMAP:
++ 		error = __xfs_bunmapi(tp, ip, startoff, blockcount,
++ 				XFS_BMAPI_REMAP, 1, &firstfsb, dfops);
++ 		break;
++ 	default:
++ 		ASSERT(0);
++ 		error = -EFSCORRUPTED;
++ 	}
++ 
++ 	return error;
++ }
++ 
++ /* Check that an inode's extent does not have invalid flags or bad ranges. */
++ xfs_failaddr_t
++ xfs_bmap_validate_extent(
++ 	struct xfs_inode	*ip,
++ 	int			whichfork,
++ 	struct xfs_bmbt_irec	*irec)
++ {
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	xfs_fsblock_t		endfsb;
++ 	bool			isrt;
++ 
++ 	isrt = XFS_IS_REALTIME_INODE(ip);
++ 	endfsb = irec->br_startblock + irec->br_blockcount - 1;
++ 	if (isrt) {
++ 		if (!xfs_verify_rtbno(mp, irec->br_startblock))
++ 			return __this_address;
++ 		if (!xfs_verify_rtbno(mp, endfsb))
++ 			return __this_address;
++ 	} else {
++ 		if (!xfs_verify_fsbno(mp, irec->br_startblock))
++ 			return __this_address;
++ 		if (!xfs_verify_fsbno(mp, endfsb))
++ 			return __this_address;
++ 		if (XFS_FSB_TO_AGNO(mp, irec->br_startblock) !=
++ 		    XFS_FSB_TO_AGNO(mp, endfsb))
++ 			return __this_address;
++ 	}
++ 	if (irec->br_state != XFS_EXT_NORM) {
++ 		if (whichfork != XFS_DATA_FORK)
++ 			return __this_address;
++ 		if (!xfs_sb_version_hasextflgbit(&mp->m_sb))
++ 			return __this_address;
++ 	}
++ 	return NULL;
++ }
+++>>>>>>> 30b0984d9117 (xfs: refactor bmap record validation)
+* Unmerged path fs/xfs/libxfs/xfs_bmap.c
+diff --git a/fs/xfs/libxfs/xfs_bmap.h b/fs/xfs/libxfs/xfs_bmap.h
+index a85a6c96e9c5..d3bec691ac7f 100644
+--- a/fs/xfs/libxfs/xfs_bmap.h
++++ b/fs/xfs/libxfs/xfs_bmap.h
+@@ -205,4 +205,7 @@ static inline int xfs_bmap_fork_to_state(int whichfork)
+ 	}
+ }
+ 
++xfs_failaddr_t xfs_bmap_validate_extent(struct xfs_inode *ip, int whichfork,
++		struct xfs_bmbt_irec *irec);
++
+ #endif	/* __XFS_BMAP_H__ */
+diff --git a/fs/xfs/libxfs/xfs_bmap_btree.h b/fs/xfs/libxfs/xfs_bmap_btree.h
+index a22e61ae0c13..3a6f47f392c6 100644
+--- a/fs/xfs/libxfs/xfs_bmap_btree.h
++++ b/fs/xfs/libxfs/xfs_bmap_btree.h
+@@ -120,18 +120,4 @@ extern int xfs_bmbt_change_owner(struct xfs_trans *tp, struct xfs_inode *ip,
+ extern struct xfs_btree_cur *xfs_bmbt_init_cursor(struct xfs_mount *,
+ 		struct xfs_trans *, struct xfs_inode *, int);
+ 
+-/*
+- * Check that the extent does not contain an invalid unwritten extent flag.
+- */
+-static inline bool xfs_bmbt_validate_extent(struct xfs_mount *mp, int whichfork,
+-		struct xfs_bmbt_irec *irec)
+-{
+-	if (irec->br_state == XFS_EXT_NORM)
+-		return true;
+-	if (whichfork == XFS_DATA_FORK &&
+-	    xfs_sb_version_hasextflgbit(&mp->m_sb))
+-		return true;
+-	return false;
+-}
+-
+ #endif	/* __XFS_BMAP_BTREE_H__ */
+diff --git a/fs/xfs/libxfs/xfs_inode_fork.c b/fs/xfs/libxfs/xfs_inode_fork.c
+index 8836ac831338..2d66cd97d6dc 100644
+--- a/fs/xfs/libxfs/xfs_inode_fork.c
++++ b/fs/xfs/libxfs/xfs_inode_fork.c
+@@ -242,10 +242,14 @@ xfs_iformat_extents(
+ 
+ 		xfs_iext_first(ifp, &icur);
+ 		for (i = 0; i < nex; i++, dp++) {
++			xfs_failaddr_t	fa;
++
+ 			xfs_bmbt_disk_get_all(dp, &new);
+-			if (!xfs_bmbt_validate_extent(mp, whichfork, &new)) {
+-				XFS_ERROR_REPORT("xfs_iformat_extents(2)",
+-						 XFS_ERRLEVEL_LOW, mp);
++			fa = xfs_bmap_validate_extent(ip, whichfork, &new);
++			if (fa) {
++				xfs_inode_verifier_error(ip, -EFSCORRUPTED,
++						"xfs_iformat_extents(2)",
++						dp, sizeof(*dp), fa);
+ 				return -EFSCORRUPTED;
+ 			}
+ 
+@@ -589,7 +593,7 @@ xfs_iextents_copy(
+ 	for_each_xfs_iext(ifp, &icur, &rec) {
+ 		if (isnullstartblock(rec.br_startblock))
+ 			continue;
+-		ASSERT(xfs_bmbt_validate_extent(ip->i_mount, whichfork, &rec));
++		ASSERT(xfs_bmap_validate_extent(ip, whichfork, &rec) == NULL);
+ 		xfs_bmbt_disk_set_all(dp, &rec);
+ 		trace_xfs_write_extent(ip, &icur, state, _RET_IP_);
+ 		copied += sizeof(struct xfs_bmbt_rec);
