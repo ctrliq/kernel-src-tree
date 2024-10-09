@@ -1,0 +1,199 @@
+IB/ipoib: Sync between remove_one to sysfs calls that use rtnl_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Erez Shitrit <erezsh@mellanox.com>
+commit 69956d83267e29e38cda7d506c4085932789fef2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/69956d83.failed
+
+In order to avoid deadlock between sysfs functions (like create/delete
+child) and remove_one (both of them are using the sysfs lock and
+rtnl_lock) the driver will use a state mutex for sync.
+
+That will fix traces as the following:
+schedule+0x3e/0x90
+kernfs_drain+0x75/0xf0
+? wait_woken+0x90/0x90
+__kernfs_remove+0x12e/0x1c0
+kernfs_remove+0x25/0x40
+sysfs_remove_dir+0x57/0x90
+kobject_del+0x22/0x60
+device_del+0x195/0x230
+ pm_runtime_set_memalloc_noio+0xac/0xf0
+netdev_unregister_kobject+0x71/0x80
+rollback_registered_many+0x205/0x2f0
+rollback_registered+0x31/0x40
+unregister_netdevice_queue+0x58/0xb0
+unregister_netdev+0x20/0x30
+ipoib_remove_one+0xb7/0x240 [ib_ipoib]
+ib_unregister_device+0xbc/0x1b0 [ib_core]
+ib_unregister_mad_agent+0x29/0x30 [ib_core]
+mlx4_ib_remove+0x67/0x280 [mlx4_ib]
+INFO: task echo:24082 blocked for more than 120 seconds.
+Tainted: G           OE   4.1.12-37.5.1.el6uek.x86_64 #2
+"echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this
+message.
+Call Trace:
+schedule+0x3e/0x90
+schedule_preempt_disabled+0xe/0x10
+__mutex_lock_slowpath+0x95/0x110
+? _rcu_barrier+0x177/0x220
+mutex_lock+0x23/0x40
+rtnl_lock+0x15/0x20
+netdev_run_todo+0x81/0x1f0
+rtnl_unlock+0xe/0x10
+ipoib_vlan_delete+0x12f/0x1c0 [ib_ipoib]
+delete_child+0x69/0x80 [ib_ipoib]
+dev_attr_store+0x20/0x30
+sysfs_kf_write+0x41/0x50
+
+	Signed-off-by: Erez Shitrit <erezsh@mellanox.com>
+	Reviewed-by: Alex Vesker <valex@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 69956d83267e29e38cda7d506c4085932789fef2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/ipoib/ipoib_main.c
+#	drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+diff --cc drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 2c91d4539781,5f143445daa9..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@@ -1936,13 -1868,17 +1936,14 @@@ void ipoib_setup(struct net_device *dev
+  	netif_keep_dst(dev);
+  
+  	memcpy(dev->broadcast, ipv4_bcast_addr, INFINIBAND_ALEN);
+ -}
+ -
+ -static void ipoib_build_priv(struct net_device *dev)
+ -{
+ -	struct ipoib_dev_priv *priv = ipoib_priv(dev);
+  
+  	priv->dev = dev;
+ +
+  	spin_lock_init(&priv->lock);
+ +
+  	init_rwsem(&priv->vlan_rwsem);
+  	mutex_init(&priv->mcast_mutex);
++ 	mutex_init(&priv->sysfs_mutex);
+  
+  	INIT_LIST_HEAD(&priv->path_list);
+  	INIT_LIST_HEAD(&priv->child_intfs);
+@@@ -2321,8 -2330,17 +2322,21 @@@ static void ipoib_remove_one(struct ib_
+  		cancel_delayed_work(&priv->neigh_reap_task);
+  		flush_workqueue(priv->wq);
+  
++ 		/* Wrap rtnl_lock/unlock with mutex to protect sysfs calls */
++ 		mutex_lock(&priv->sysfs_mutex);
+  		unregister_netdev(priv->dev);
+++<<<<<<< HEAD
+ +		free_netdev(priv->dev);
+++=======
++ 		mutex_unlock(&priv->sysfs_mutex);
++ 
++ 		rn->free_rdma_netdev(priv->dev);
++ 
++ 		list_for_each_entry_safe(cpriv, tcpriv, &priv->child_intfs, list)
++ 			kfree(cpriv);
++ 
++ 		kfree(priv);
+++>>>>>>> 69956d83267e (IB/ipoib: Sync between remove_one to sysfs calls that use rtnl_lock)
+  	}
+  
+  	kfree(dev_list);
+diff --cc drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+index a69df126283b,9927cd6b7082..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+@@@ -131,13 -132,22 +131,28 @@@ int ipoib_vlan_add(struct net_device *p
+  
+  	snprintf(intf_name, sizeof intf_name, "%s.%04x",
+  		 ppriv->dev->name, pkey);
+ +	priv = ipoib_intf_alloc(intf_name);
+ +	if (!priv)
+ +		return -ENOMEM;
+  
+- 	if (!rtnl_trylock())
++ 	if (!mutex_trylock(&ppriv->sysfs_mutex))
+  		return restart_syscall();
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!rtnl_trylock()) {
++ 		mutex_unlock(&ppriv->sysfs_mutex);
++ 		return restart_syscall();
++ 	}
++ 
++ 	priv = ipoib_intf_alloc(ppriv->ca, ppriv->port, intf_name);
++ 	if (!priv) {
++ 		rtnl_unlock();
++ 		mutex_unlock(&ppriv->sysfs_mutex);
++ 		return -ENOMEM;
++ 	}
++ 
+++>>>>>>> 69956d83267e (IB/ipoib: Sync between remove_one to sysfs calls that use rtnl_lock)
+  	down_write(&ppriv->vlan_rwsem);
+  
+  	/*
+@@@ -162,11 -172,13 +177,11 @@@
+  
+  out:
+  	up_write(&ppriv->vlan_rwsem);
+- 
+  	rtnl_unlock();
++ 	mutex_unlock(&ppriv->sysfs_mutex);
+  
+ -	if (result) {
+ +	if (result)
+  		free_netdev(priv->dev);
+ -		kfree(priv);
+ -	}
+  
+  	return result;
+  }
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib.h b/drivers/infiniband/ulp/ipoib/ipoib.h
+index 32268a15c423..c3cd3e0968dc 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib.h
++++ b/drivers/infiniband/ulp/ipoib/ipoib.h
+@@ -334,6 +334,7 @@ struct ipoib_dev_priv {
+ 
+ 	struct rw_semaphore vlan_rwsem;
+ 	struct mutex mcast_mutex;
++	struct mutex sysfs_mutex;
+ 
+ 	struct rb_root  path_tree;
+ 	struct list_head path_list;
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_cm.c b/drivers/infiniband/ulp/ipoib/ipoib_cm.c
+index 6a6afa9c906b..024dee61dee7 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_cm.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_cm.c
+@@ -1507,9 +1507,14 @@ static ssize_t set_mode(struct device *d, struct device_attribute *attr,
+ 	if (test_bit(IPOIB_FLAG_GOING_DOWN, &priv->flags))
+ 		return -EPERM;
+ 
+-	if (!rtnl_trylock())
++	if (!mutex_trylock(&priv->sysfs_mutex))
+ 		return restart_syscall();
+ 
++	if (!rtnl_trylock()) {
++		mutex_unlock(&priv->sysfs_mutex);
++		return restart_syscall();
++	}
++
+ 	ret = ipoib_set_mode(dev, buf);
+ 
+ 	/* The assumption is that the function ipoib_set_mode returned
+@@ -1518,6 +1523,7 @@ static ssize_t set_mode(struct device *d, struct device_attribute *attr,
+ 	 */
+ 	if (ret != -EBUSY)
+ 		rtnl_unlock();
++	mutex_unlock(&priv->sysfs_mutex);
+ 
+ 	return (!ret || ret == -EBUSY) ? count : ret;
+ }
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib_main.c
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib_vlan.c
