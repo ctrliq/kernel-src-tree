@@ -2925,7 +2925,7 @@ vmxnet3_close(struct net_device *netdev)
 	 * completion.
 	 */
 	while (test_and_set_bit(VMXNET3_STATE_BIT_RESETTING, &adapter->state))
-		msleep(1);
+		usleep_range(1000, 2000);
 
 	vmxnet3_quiesce_dev(adapter);
 
@@ -2975,7 +2975,7 @@ vmxnet3_change_mtu(struct net_device *netdev, int new_mtu)
 	 * completion.
 	 */
 	while (test_and_set_bit(VMXNET3_STATE_BIT_RESETTING, &adapter->state))
-		msleep(1);
+		usleep_range(1000, 2000);
 
 	if (netif_running(netdev)) {
 		vmxnet3_quiesce_dev(adapter);
@@ -3531,7 +3531,7 @@ static void vmxnet3_shutdown_device(struct pci_dev *pdev)
 	 * completion.
 	 */
 	while (test_and_set_bit(VMXNET3_STATE_BIT_RESETTING, &adapter->state))
-		msleep(1);
+		usleep_range(1000, 2000);
 
 	if (test_and_set_bit(VMXNET3_STATE_BIT_QUIESCED,
 			     &adapter->state)) {
