@@ -1,0 +1,289 @@
+swap: fix races exposed by swap discard
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Shaohua Li <shli@kernel.org>
+commit edfe23dac3e2981277087b05bec7fec7790d1835
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/edfe23da.failed
+
+The previous patch can expose races, according to Hugh:
+
+swapoff was sometimes failing with "Cannot allocate memory", coming from
+try_to_unuse()'s -ENOMEM: it needs to allow for swap_duplicate() failing
+on a free entry temporarily SWAP_MAP_BAD while being discarded.
+
+We should use ACCESS_ONCE() there, and whenever accessing swap_map
+locklessly; but rather than peppering it throughout try_to_unuse(), just
+declare *swap_map with volatile.
+
+try_to_unuse() is accustomed to *swap_map going down racily, but not
+necessarily to it jumping up from 0 to SWAP_MAP_BAD: we'll be safer to
+prevent that transition once SWP_WRITEOK is switched off, when it's a
+waste of time to issue discards anyway (swapon can do a whole discard).
+
+Another issue is:
+
+In swapin_readahead(), read_swap_cache_async() can read a bad swap entry,
+because we don't check if readahead swap entry is bad.  This doesn't break
+anything but such swapin page is wasteful and can only be freed at page
+reclaim.  We should avoid read such swap entry.  And in discard, we mark
+swap entry SWAP_MAP_BAD and then switch it to normal when discard is
+finished.  If readahead reads such swap entry, we have the same issue, so
+we much check if swap entry is bad too.
+
+Thanks Hugh to inspire swapin_readahead could use bad swap entry.
+
+[include Hugh's patch 'swap: fix swapoff ENOMEMs from discard']
+	Signed-off-by: Shaohua Li <shli@fusionio.com>
+	Signed-off-by: Hugh Dickins <hughd@google.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Kyungmin Park <kmpark@infradead.org>
+	Cc: Rafael Aquini <aquini@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit edfe23dac3e2981277087b05bec7fec7790d1835)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/swapfile.c
+diff --cc mm/swapfile.c
+index 44c2eac6b890,98e52e373bd8..000000000000
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@@ -202,6 -178,229 +202,232 @@@ static void discard_swap_cluster(struc
+  #define SWAPFILE_CLUSTER	256
+  #define LATENCY_LIMIT		256
+  
+++<<<<<<< HEAD
+++=======
++ static inline void cluster_set_flag(struct swap_cluster_info *info,
++ 	unsigned int flag)
++ {
++ 	info->flags = flag;
++ }
++ 
++ static inline unsigned int cluster_count(struct swap_cluster_info *info)
++ {
++ 	return info->data;
++ }
++ 
++ static inline void cluster_set_count(struct swap_cluster_info *info,
++ 				     unsigned int c)
++ {
++ 	info->data = c;
++ }
++ 
++ static inline void cluster_set_count_flag(struct swap_cluster_info *info,
++ 					 unsigned int c, unsigned int f)
++ {
++ 	info->flags = f;
++ 	info->data = c;
++ }
++ 
++ static inline unsigned int cluster_next(struct swap_cluster_info *info)
++ {
++ 	return info->data;
++ }
++ 
++ static inline void cluster_set_next(struct swap_cluster_info *info,
++ 				    unsigned int n)
++ {
++ 	info->data = n;
++ }
++ 
++ static inline void cluster_set_next_flag(struct swap_cluster_info *info,
++ 					 unsigned int n, unsigned int f)
++ {
++ 	info->flags = f;
++ 	info->data = n;
++ }
++ 
++ static inline bool cluster_is_free(struct swap_cluster_info *info)
++ {
++ 	return info->flags & CLUSTER_FLAG_FREE;
++ }
++ 
++ static inline bool cluster_is_null(struct swap_cluster_info *info)
++ {
++ 	return info->flags & CLUSTER_FLAG_NEXT_NULL;
++ }
++ 
++ static inline void cluster_set_null(struct swap_cluster_info *info)
++ {
++ 	info->flags = CLUSTER_FLAG_NEXT_NULL;
++ 	info->data = 0;
++ }
++ 
++ /* Add a cluster to discard list and schedule it to do discard */
++ static void swap_cluster_schedule_discard(struct swap_info_struct *si,
++ 		unsigned int idx)
++ {
++ 	/*
++ 	 * If scan_swap_map() can't find a free cluster, it will check
++ 	 * si->swap_map directly. To make sure the discarding cluster isn't
++ 	 * taken by scan_swap_map(), mark the swap entries bad (occupied). It
++ 	 * will be cleared after discard
++ 	 */
++ 	memset(si->swap_map + idx * SWAPFILE_CLUSTER,
++ 			SWAP_MAP_BAD, SWAPFILE_CLUSTER);
++ 
++ 	if (cluster_is_null(&si->discard_cluster_head)) {
++ 		cluster_set_next_flag(&si->discard_cluster_head,
++ 						idx, 0);
++ 		cluster_set_next_flag(&si->discard_cluster_tail,
++ 						idx, 0);
++ 	} else {
++ 		unsigned int tail = cluster_next(&si->discard_cluster_tail);
++ 		cluster_set_next(&si->cluster_info[tail], idx);
++ 		cluster_set_next_flag(&si->discard_cluster_tail,
++ 						idx, 0);
++ 	}
++ 
++ 	schedule_work(&si->discard_work);
++ }
++ 
++ /*
++  * Doing discard actually. After a cluster discard is finished, the cluster
++  * will be added to free cluster list. caller should hold si->lock.
++ */
++ static void swap_do_scheduled_discard(struct swap_info_struct *si)
++ {
++ 	struct swap_cluster_info *info;
++ 	unsigned int idx;
++ 
++ 	info = si->cluster_info;
++ 
++ 	while (!cluster_is_null(&si->discard_cluster_head)) {
++ 		idx = cluster_next(&si->discard_cluster_head);
++ 
++ 		cluster_set_next_flag(&si->discard_cluster_head,
++ 						cluster_next(&info[idx]), 0);
++ 		if (cluster_next(&si->discard_cluster_tail) == idx) {
++ 			cluster_set_null(&si->discard_cluster_head);
++ 			cluster_set_null(&si->discard_cluster_tail);
++ 		}
++ 		spin_unlock(&si->lock);
++ 
++ 		discard_swap_cluster(si, idx * SWAPFILE_CLUSTER,
++ 				SWAPFILE_CLUSTER);
++ 
++ 		spin_lock(&si->lock);
++ 		cluster_set_flag(&info[idx], CLUSTER_FLAG_FREE);
++ 		if (cluster_is_null(&si->free_cluster_head)) {
++ 			cluster_set_next_flag(&si->free_cluster_head,
++ 						idx, 0);
++ 			cluster_set_next_flag(&si->free_cluster_tail,
++ 						idx, 0);
++ 		} else {
++ 			unsigned int tail;
++ 
++ 			tail = cluster_next(&si->free_cluster_tail);
++ 			cluster_set_next(&info[tail], idx);
++ 			cluster_set_next_flag(&si->free_cluster_tail,
++ 						idx, 0);
++ 		}
++ 		memset(si->swap_map + idx * SWAPFILE_CLUSTER,
++ 				0, SWAPFILE_CLUSTER);
++ 	}
++ }
++ 
++ static void swap_discard_work(struct work_struct *work)
++ {
++ 	struct swap_info_struct *si;
++ 
++ 	si = container_of(work, struct swap_info_struct, discard_work);
++ 
++ 	spin_lock(&si->lock);
++ 	swap_do_scheduled_discard(si);
++ 	spin_unlock(&si->lock);
++ }
++ 
++ /*
++  * The cluster corresponding to page_nr will be used. The cluster will be
++  * removed from free cluster list and its usage counter will be increased.
++  */
++ static void inc_cluster_info_page(struct swap_info_struct *p,
++ 	struct swap_cluster_info *cluster_info, unsigned long page_nr)
++ {
++ 	unsigned long idx = page_nr / SWAPFILE_CLUSTER;
++ 
++ 	if (!cluster_info)
++ 		return;
++ 	if (cluster_is_free(&cluster_info[idx])) {
++ 		VM_BUG_ON(cluster_next(&p->free_cluster_head) != idx);
++ 		cluster_set_next_flag(&p->free_cluster_head,
++ 			cluster_next(&cluster_info[idx]), 0);
++ 		if (cluster_next(&p->free_cluster_tail) == idx) {
++ 			cluster_set_null(&p->free_cluster_tail);
++ 			cluster_set_null(&p->free_cluster_head);
++ 		}
++ 		cluster_set_count_flag(&cluster_info[idx], 0, 0);
++ 	}
++ 
++ 	VM_BUG_ON(cluster_count(&cluster_info[idx]) >= SWAPFILE_CLUSTER);
++ 	cluster_set_count(&cluster_info[idx],
++ 		cluster_count(&cluster_info[idx]) + 1);
++ }
++ 
++ /*
++  * The cluster corresponding to page_nr decreases one usage. If the usage
++  * counter becomes 0, which means no page in the cluster is in using, we can
++  * optionally discard the cluster and add it to free cluster list.
++  */
++ static void dec_cluster_info_page(struct swap_info_struct *p,
++ 	struct swap_cluster_info *cluster_info, unsigned long page_nr)
++ {
++ 	unsigned long idx = page_nr / SWAPFILE_CLUSTER;
++ 
++ 	if (!cluster_info)
++ 		return;
++ 
++ 	VM_BUG_ON(cluster_count(&cluster_info[idx]) == 0);
++ 	cluster_set_count(&cluster_info[idx],
++ 		cluster_count(&cluster_info[idx]) - 1);
++ 
++ 	if (cluster_count(&cluster_info[idx]) == 0) {
++ 		/*
++ 		 * If the swap is discardable, prepare discard the cluster
++ 		 * instead of free it immediately. The cluster will be freed
++ 		 * after discard.
++ 		 */
++ 		if ((p->flags & (SWP_WRITEOK | SWP_PAGE_DISCARD)) ==
++ 				 (SWP_WRITEOK | SWP_PAGE_DISCARD)) {
++ 			swap_cluster_schedule_discard(p, idx);
++ 			return;
++ 		}
++ 
++ 		cluster_set_flag(&cluster_info[idx], CLUSTER_FLAG_FREE);
++ 		if (cluster_is_null(&p->free_cluster_head)) {
++ 			cluster_set_next_flag(&p->free_cluster_head, idx, 0);
++ 			cluster_set_next_flag(&p->free_cluster_tail, idx, 0);
++ 		} else {
++ 			unsigned int tail = cluster_next(&p->free_cluster_tail);
++ 			cluster_set_next(&cluster_info[tail], idx);
++ 			cluster_set_next_flag(&p->free_cluster_tail, idx, 0);
++ 		}
++ 	}
++ }
++ 
++ /*
++  * It's possible scan_swap_map() uses a free cluster in the middle of free
++  * cluster list. Avoiding such abuse to avoid list corruption.
++  */
++ static inline bool scan_swap_map_recheck_cluster(struct swap_info_struct *si,
++ 	unsigned long offset)
++ {
++ 	offset /= SWAPFILE_CLUSTER;
++ 	return !cluster_is_null(&si->free_cluster_head) &&
++ 		offset != cluster_next(&si->free_cluster_head) &&
++ 		cluster_is_free(&si->cluster_info[offset]);
++ }
++ 
+++>>>>>>> edfe23dac3e2 (swap: fix races exposed by swap discard)
+  static unsigned long scan_swap_map(struct swap_info_struct *si,
+  				   unsigned char usage)
+  {
+* Unmerged path mm/swapfile.c
