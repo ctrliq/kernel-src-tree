@@ -1,0 +1,261 @@
+kvm: x86: mmu: Verify that restored PTE has needed perms in fast page fault
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Junaid Shahid <junaids@google.com>
+commit d3e328f2cb01f6f09259a5810baae3edf5416076
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d3e328f2.failed
+
+Before fast page fault restores an access track PTE back to a regular PTE,
+it now also verifies that the restored PTE would grant the necessary
+permissions for the faulting access to succeed. If not, it falls back
+to the slow page fault path.
+
+	Signed-off-by: Junaid Shahid <junaids@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit d3e328f2cb01f6f09259a5810baae3edf5416076)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.c
+diff --cc arch/x86/kvm/mmu.c
+index e71e54d84771,2fd7586aad4d..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -649,6 -704,78 +654,81 @@@ static u64 mmu_spte_get_lockless(u64 *s
+  	return __get_spte_lockless(sptep);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static u64 mark_spte_for_access_track(u64 spte)
++ {
++ 	if (shadow_accessed_mask != 0)
++ 		return spte & ~shadow_accessed_mask;
++ 
++ 	if (shadow_acc_track_mask == 0 || is_access_track_spte(spte))
++ 		return spte;
++ 
++ 	/*
++ 	 * Making an Access Tracking PTE will result in removal of write access
++ 	 * from the PTE. So, verify that we will be able to restore the write
++ 	 * access in the fast page fault path later on.
++ 	 */
++ 	WARN_ONCE((spte & PT_WRITABLE_MASK) &&
++ 		  !spte_can_locklessly_be_made_writable(spte),
++ 		  "kvm: Writable SPTE is not locklessly dirty-trackable\n");
++ 
++ 	WARN_ONCE(spte & (shadow_acc_track_saved_bits_mask <<
++ 			  shadow_acc_track_saved_bits_shift),
++ 		  "kvm: Access Tracking saved bit locations are not zero\n");
++ 
++ 	spte |= (spte & shadow_acc_track_saved_bits_mask) <<
++ 		shadow_acc_track_saved_bits_shift;
++ 	spte &= ~shadow_acc_track_mask;
++ 	spte |= shadow_acc_track_value;
++ 
++ 	return spte;
++ }
++ 
++ /* Restore an acc-track PTE back to a regular PTE */
++ static u64 restore_acc_track_spte(u64 spte)
++ {
++ 	u64 new_spte = spte;
++ 	u64 saved_bits = (spte >> shadow_acc_track_saved_bits_shift)
++ 			 & shadow_acc_track_saved_bits_mask;
++ 
++ 	WARN_ON_ONCE(!is_access_track_spte(spte));
++ 
++ 	new_spte &= ~shadow_acc_track_mask;
++ 	new_spte &= ~(shadow_acc_track_saved_bits_mask <<
++ 		      shadow_acc_track_saved_bits_shift);
++ 	new_spte |= saved_bits;
++ 
++ 	return new_spte;
++ }
++ 
++ /* Returns the Accessed status of the PTE and resets it at the same time. */
++ static bool mmu_spte_age(u64 *sptep)
++ {
++ 	u64 spte = mmu_spte_get_lockless(sptep);
++ 
++ 	if (!is_accessed_spte(spte))
++ 		return false;
++ 
++ 	if (shadow_accessed_mask) {
++ 		clear_bit((ffs(shadow_accessed_mask) - 1),
++ 			  (unsigned long *)sptep);
++ 	} else {
++ 		/*
++ 		 * Capture the dirty status of the page, so that it doesn't get
++ 		 * lost when the SPTE is marked for access tracking.
++ 		 */
++ 		if (is_writable_pte(spte))
++ 			kvm_set_pfn_dirty(spte_to_pfn(spte));
++ 
++ 		spte = mark_spte_for_access_track(spte);
++ 		mmu_spte_update_no_track(sptep, spte);
++ 	}
++ 
++ 	return true;
++ }
++ 
+++>>>>>>> d3e328f2cb01 (kvm: x86: mmu: Verify that restored PTE has needed perms in fast page fault)
+  static void walk_shadow_page_lockless_begin(struct kvm_vcpu *vcpu)
+  {
+  	/*
+@@@ -2900,18 -3041,12 +2980,25 @@@ static bool page_fault_can_be_fast(u32 
+   */
+  static bool
+  fast_pf_fix_direct_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
+++<<<<<<< HEAD
+ +			u64 *sptep, u64 spte)
+++=======
++ 			u64 *sptep, u64 old_spte, u64 new_spte)
+++>>>>>>> d3e328f2cb01 (kvm: x86: mmu: Verify that restored PTE has needed perms in fast page fault)
+  {
+  	gfn_t gfn;
+  
+  	WARN_ON(!sp->role.direct);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * The gfn of direct spte is stable since it is calculated
+ +	 * by sp->gfn.
+ +	 */
+ +	gfn = kvm_mmu_page_get_gfn(sp, sptep - sp->spt);
+ +
+++=======
+++>>>>>>> d3e328f2cb01 (kvm: x86: mmu: Verify that restored PTE has needed perms in fast page fault)
+  	/*
+  	 * Theoretically we could also set dirty bit (and flush TLB) here in
+  	 * order to eliminate unnecessary PML logging. See comments in
+@@@ -2924,10 -3059,17 +3011,21 @@@
+  	 *
+  	 * Compare with set_spte where instead shadow_dirty_mask is set.
+  	 */
+ -	if (cmpxchg64(sptep, old_spte, new_spte) != old_spte)
+ +	if (cmpxchg64(sptep, spte, spte | PT_WRITABLE_MASK) != spte)
+  		return false;
+  
+++<<<<<<< HEAD
+ +	kvm_vcpu_mark_page_dirty(vcpu, gfn);
+++=======
++ 	if (is_writable_pte(new_spte) && !is_writable_pte(old_spte)) {
++ 		/*
++ 		 * The gfn of direct spte is stable since it is
++ 		 * calculated by sp->gfn.
++ 		 */
++ 		gfn = kvm_mmu_page_get_gfn(sp, sptep - sp->spt);
++ 		kvm_vcpu_mark_page_dirty(vcpu, gfn);
++ 	}
+++>>>>>>> d3e328f2cb01 (kvm: x86: mmu: Verify that restored PTE has needed perms in fast page fault)
+  
+  	return true;
+  }
+@@@ -2955,14 -3109,7 +3065,18 @@@ static bool fast_page_fault(struct kvm_
+  	walk_shadow_page_lockless_begin(vcpu);
+  
+  	do {
+++<<<<<<< HEAD
+ +		/*
+ +		 * If the mapping has been changed, let the vcpu fault on the
+ +		 * same address again.
+ +		 */
+ +		if (!is_shadow_present_pte(spte)) {
+ +			fault_handled = true;
+ +			break;
+ +		}
+++=======
++ 		u64 new_spte;
+++>>>>>>> d3e328f2cb01 (kvm: x86: mmu: Verify that restored PTE has needed perms in fast page fault)
+  
+  		for_each_shadow_entry_lockless(vcpu, gva, iterator, spte)
+  			if (!is_shadow_present_pte(spte) ||
+@@@ -2979,30 -3130,44 +3093,61 @@@
+  		 * Need not check the access of upper level table entries since
+  		 * they are always ACC_ALL.
+  		 */
+++<<<<<<< HEAD
+ +		if (is_writable_pte(spte)) {
+++=======
++ 		if (is_access_allowed(error_code, spte)) {
+++>>>>>>> d3e328f2cb01 (kvm: x86: mmu: Verify that restored PTE has needed perms in fast page fault)
+  			fault_handled = true;
+  			break;
+  		}
+  
+++<<<<<<< HEAD
+ +		/*
+ +		 * Currently, to simplify the code, only the spte
+ +		 * write-protected by dirty-log can be fast fixed.
+ +		 */
+ +		if (!spte_can_locklessly_be_made_writable(spte))
+ +			break;
+++=======
++ 		new_spte = spte;
++ 
++ 		if (is_access_track_spte(spte))
++ 			new_spte = restore_acc_track_spte(new_spte);
+++>>>>>>> d3e328f2cb01 (kvm: x86: mmu: Verify that restored PTE has needed perms in fast page fault)
+  
+  		/*
+- 		 * Do not fix write-permission on the large spte since we only
+- 		 * dirty the first page into the dirty-bitmap in
+- 		 * fast_pf_fix_direct_spte() that means other pages are missed
+- 		 * if its slot is dirty-logged.
+- 		 *
+- 		 * Instead, we let the slow page fault path create a normal spte
+- 		 * to fix the access.
+- 		 *
+- 		 * See the comments in kvm_arch_commit_memory_region().
++ 		 * Currently, to simplify the code, write-protection can
++ 		 * be removed in the fast path only if the SPTE was
++ 		 * write-protected for dirty-logging or access tracking.
+  		 */
+++<<<<<<< HEAD
+ +		if (sp->role.level > PT_PAGE_TABLE_LEVEL)
+++=======
++ 		if ((error_code & PFERR_WRITE_MASK) &&
++ 		    spte_can_locklessly_be_made_writable(spte))
++ 		{
++ 			new_spte |= PT_WRITABLE_MASK;
++ 
++ 			/*
++ 			 * Do not fix write-permission on the large spte.  Since
++ 			 * we only dirty the first page into the dirty-bitmap in
++ 			 * fast_pf_fix_direct_spte(), other pages are missed
++ 			 * if its slot has dirty logging enabled.
++ 			 *
++ 			 * Instead, we let the slow page fault path create a
++ 			 * normal spte to fix the access.
++ 			 *
++ 			 * See the comments in kvm_arch_commit_memory_region().
++ 			 */
++ 			if (sp->role.level > PT_PAGE_TABLE_LEVEL)
++ 				break;
++ 		}
++ 
++ 		/* Verify that the fault can be handled in the fast path */
++ 		if (new_spte == spte ||
++ 		    !is_access_allowed(error_code, new_spte))
+++>>>>>>> d3e328f2cb01 (kvm: x86: mmu: Verify that restored PTE has needed perms in fast page fault)
+  			break;
+  
+  		/*
+@@@ -3011,7 -3176,8 +3156,12 @@@
+  		 * Documentation/virtual/kvm/locking.txt to get more detail.
+  		 */
+  		fault_handled = fast_pf_fix_direct_spte(vcpu, sp,
+++<<<<<<< HEAD
+ +							iterator.sptep, spte);
+++=======
++ 							iterator.sptep, spte,
++ 							new_spte);
+++>>>>>>> d3e328f2cb01 (kvm: x86: mmu: Verify that restored PTE has needed perms in fast page fault)
+  		if (fault_handled)
+  			break;
+  
+* Unmerged path arch/x86/kvm/mmu.c
