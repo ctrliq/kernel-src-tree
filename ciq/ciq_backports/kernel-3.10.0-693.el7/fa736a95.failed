@@ -1,0 +1,385 @@
+sysfs, kernfs: move mount core code to fs/kernfs/mount.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit fa736a951e456b996a76826ba78ff974414c3b55
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/fa736a95.failed
+
+Move core mount code to fs/kernfs/mount.c.  The respective
+declarations in fs/sysfs/sysfs.h are moved to
+fs/kernfs/kernfs-internal.h.
+
+This is pure relocation.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit fa736a951e456b996a76826ba78ff974414c3b55)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/kernfs/kernfs-internal.h
+#	fs/sysfs/mount.c
+#	fs/sysfs/sysfs.h
+diff --cc fs/sysfs/mount.c
+index afd83273e6ce,e7e3aa8e7b78..000000000000
+--- a/fs/sysfs/mount.c
++++ b/fs/sysfs/mount.c
+@@@ -23,130 -19,34 +19,160 @@@
+  
+  #include "sysfs.h"
+  
+++<<<<<<< HEAD
+ +
+ +static struct vfsmount *sysfs_mnt;
+ +struct kmem_cache *sysfs_dir_cachep;
+ +
+ +static const struct super_operations sysfs_ops = {
+ +	.statfs		= simple_statfs,
+ +	.drop_inode	= generic_delete_inode,
+ +	.evict_inode	= sysfs_evict_inode,
+ +};
+ +
+ +struct sysfs_dirent sysfs_root = {
+ +	.s_name		= "",
+ +	.s_count	= ATOMIC_INIT(1),
+ +	.s_flags	= SYSFS_DIR | (KOBJ_NS_TYPE_NONE << SYSFS_NS_TYPE_SHIFT),
+ +	.s_mode		= S_IFDIR | S_IRUGO | S_IXUGO,
+ +	.s_ino		= 1,
+ +};
+ +
+ +static int sysfs_fill_super(struct super_block *sb, void *data, int silent)
+ +{
+ +	struct inode *inode;
+ +	struct dentry *root;
+ +
+ +	sb->s_blocksize = PAGE_CACHE_SIZE;
+ +	sb->s_blocksize_bits = PAGE_CACHE_SHIFT;
+ +	sb->s_magic = SYSFS_MAGIC;
+ +	sb->s_op = &sysfs_ops;
+ +	sb->s_time_gran = 1;
+ +
+ +	/* get root inode, initialize and unlock it */
+ +	mutex_lock(&sysfs_mutex);
+ +	inode = sysfs_get_inode(sb, &sysfs_root);
+ +	mutex_unlock(&sysfs_mutex);
+ +	if (!inode) {
+ +		pr_debug("sysfs: could not get root inode\n");
+ +		return -ENOMEM;
+ +	}
+ +
+ +	/* instantiate and link root dentry */
+ +	root = d_make_root(inode);
+ +	if (!root) {
+ +		pr_debug("%s: could not get root dentry!\n",__func__);
+ +		return -ENOMEM;
+ +	}
+ +	root->d_fsdata = &sysfs_root;
+ +	sb->s_root = root;
+ +	sb->s_d_op = &sysfs_dentry_ops;
+ +	return 0;
+ +}
+ +
+ +static int sysfs_test_super(struct super_block *sb, void *data)
+ +{
+ +	struct sysfs_super_info *sb_info = sysfs_info(sb);
+ +	struct sysfs_super_info *info = data;
+ +	enum kobj_ns_type type;
+ +	int found = 1;
+ +
+ +	for (type = KOBJ_NS_TYPE_NONE; type < KOBJ_NS_TYPES; type++) {
+ +		if (sb_info->ns[type] != info->ns[type])
+ +			found = 0;
+ +	}
+ +	return found;
+ +}
+ +
+ +static int sysfs_set_super(struct super_block *sb, void *data)
+ +{
+ +	int error;
+ +	error = set_anon_super(sb, data);
+ +	if (!error)
+ +		sb->s_fs_info = data;
+ +	return error;
+ +}
+ +
+ +static void free_sysfs_super_info(struct sysfs_super_info *info)
+ +{
+ +	int type;
+ +	for (type = KOBJ_NS_TYPE_NONE; type < KOBJ_NS_TYPES; type++)
+ +		kobj_ns_drop(type, info->ns[type]);
+ +	kfree(info);
+ +}
+ +
+ +static struct dentry *sysfs_mount(struct file_system_type *fs_type,
+ +	int flags, const char *dev_name, void *data)
+ +{
+ +	struct sysfs_super_info *info;
+ +	enum kobj_ns_type type;
+ +	struct super_block *sb;
+ +	int error;
+ +
+ +	if (!(flags & MS_KERNMOUNT) && !current_user_ns()->may_mount_sysfs)
+ +		return ERR_PTR(-EPERM);
+ +
+ +	info = kzalloc(sizeof(*info), GFP_KERNEL);
+ +	if (!info)
+ +		return ERR_PTR(-ENOMEM);
+ +
+ +	for (type = KOBJ_NS_TYPE_NONE; type < KOBJ_NS_TYPES; type++)
+ +		info->ns[type] = kobj_ns_grab_current(type);
+ +
+ +	sb = sget(fs_type, sysfs_test_super, sysfs_set_super, flags, info);
+ +	if (IS_ERR(sb) || sb->s_fs_info != info)
+ +		free_sysfs_super_info(info);
+ +	if (IS_ERR(sb))
+ +		return ERR_CAST(sb);
+ +	if (!sb->s_root) {
+ +		error = sysfs_fill_super(sb, data, flags & MS_SILENT ? 1 : 0);
+ +		if (error) {
+ +			deactivate_locked_super(sb);
+ +			return ERR_PTR(error);
+ +		}
+ +		sb->s_flags |= MS_ACTIVE;
+ +	}
+ +
+ +	return dget(sb->s_root);
+++=======
++ static struct kernfs_root *sysfs_root;
++ struct sysfs_dirent *sysfs_root_sd;
++ 
++ static struct dentry *sysfs_mount(struct file_system_type *fs_type,
++ 	int flags, const char *dev_name, void *data)
++ {
++ 	struct dentry *root;
++ 	void *ns;
++ 
++ 	if (!(flags & MS_KERNMOUNT)) {
++ 		if (!capable(CAP_SYS_ADMIN) && !fs_fully_visible(fs_type))
++ 			return ERR_PTR(-EPERM);
++ 
++ 		if (!kobj_ns_current_may_mount(KOBJ_NS_TYPE_NET))
++ 			return ERR_PTR(-EPERM);
++ 	}
++ 
++ 	ns = kobj_ns_grab_current(KOBJ_NS_TYPE_NET);
++ 	root = kernfs_mount_ns(fs_type, flags, sysfs_root, ns);
++ 	if (IS_ERR(root))
++ 		kobj_ns_drop(KOBJ_NS_TYPE_NET, ns);
++ 	return root;
+++>>>>>>> fa736a951e45 (sysfs, kernfs: move mount core code to fs/kernfs/mount.c)
+  }
+  
+  static void sysfs_kill_sb(struct super_block *sb)
+  {
+++<<<<<<< HEAD
+ +	struct sysfs_super_info *info = sysfs_info(sb);
+ +	/* Remove the superblock from fs_supers/s_instances
+ +	 * so we can't find it, before freeing sysfs_super_info.
+ +	 */
+ +	kill_anon_super(sb);
+ +	free_sysfs_super_info(info);
+++=======
++ 	kernfs_kill_sb(sb);
++ 	kobj_ns_drop(KOBJ_NS_TYPE_NET, (void *)kernfs_super_ns(sb));
+++>>>>>>> fa736a951e45 (sysfs, kernfs: move mount core code to fs/kernfs/mount.c)
+  }
+  
+  static struct file_system_type sysfs_fs_type = {
+diff --cc fs/sysfs/sysfs.h
+index d1e4043eb0c3,6a82311a50fe..000000000000
+--- a/fs/sysfs/sysfs.h
++++ b/fs/sysfs/sysfs.h
+@@@ -139,18 -17,7 +139,22 @@@ struct sysfs_addrm_cxt 
+  /*
+   * mount.c
+   */
+++<<<<<<< HEAD
+ +
+ +/*
+ + * Each sb is associated with a set of namespace tags (i.e.
+ + * the network namespace of the task which mounted this sysfs
+ + * instance).
+ + */
+ +struct sysfs_super_info {
+ +	void *ns[KOBJ_NS_TYPES];
+ +};
+ +#define sysfs_info(SB) ((struct sysfs_super_info *)(SB->s_fs_info))
+ +extern struct sysfs_dirent sysfs_root;
+ +extern struct kmem_cache *sysfs_dir_cachep;
+++=======
++ extern struct sysfs_dirent *sysfs_root_sd;
+++>>>>>>> fa736a951e45 (sysfs, kernfs: move mount core code to fs/kernfs/mount.c)
+  
+  /*
+   * dir.c
+* Unmerged path fs/kernfs/kernfs-internal.h
+* Unmerged path fs/kernfs/kernfs-internal.h
+diff --git a/fs/kernfs/mount.c b/fs/kernfs/mount.c
+index 872e262e5166..84c83e24bf25 100644
+--- a/fs/kernfs/mount.c
++++ b/fs/kernfs/mount.c
+@@ -7,3 +7,159 @@
+  *
+  * This file is released under the GPLv2.
+  */
++
++#include <linux/fs.h>
++#include <linux/mount.h>
++#include <linux/init.h>
++#include <linux/magic.h>
++#include <linux/slab.h>
++#include <linux/pagemap.h>
++
++#include "kernfs-internal.h"
++
++struct kmem_cache *sysfs_dir_cachep;
++
++static const struct super_operations sysfs_ops = {
++	.statfs		= simple_statfs,
++	.drop_inode	= generic_delete_inode,
++	.evict_inode	= sysfs_evict_inode,
++};
++
++static int sysfs_fill_super(struct super_block *sb)
++{
++	struct sysfs_super_info *info = sysfs_info(sb);
++	struct inode *inode;
++	struct dentry *root;
++
++	sb->s_blocksize = PAGE_CACHE_SIZE;
++	sb->s_blocksize_bits = PAGE_CACHE_SHIFT;
++	sb->s_magic = SYSFS_MAGIC;
++	sb->s_op = &sysfs_ops;
++	sb->s_time_gran = 1;
++
++	/* get root inode, initialize and unlock it */
++	mutex_lock(&sysfs_mutex);
++	inode = sysfs_get_inode(sb, info->root->sd);
++	mutex_unlock(&sysfs_mutex);
++	if (!inode) {
++		pr_debug("sysfs: could not get root inode\n");
++		return -ENOMEM;
++	}
++
++	/* instantiate and link root dentry */
++	root = d_make_root(inode);
++	if (!root) {
++		pr_debug("%s: could not get root dentry!\n", __func__);
++		return -ENOMEM;
++	}
++	kernfs_get(info->root->sd);
++	root->d_fsdata = info->root->sd;
++	sb->s_root = root;
++	sb->s_d_op = &sysfs_dentry_ops;
++	return 0;
++}
++
++static int sysfs_test_super(struct super_block *sb, void *data)
++{
++	struct sysfs_super_info *sb_info = sysfs_info(sb);
++	struct sysfs_super_info *info = data;
++
++	return sb_info->root == info->root && sb_info->ns == info->ns;
++}
++
++static int sysfs_set_super(struct super_block *sb, void *data)
++{
++	int error;
++	error = set_anon_super(sb, data);
++	if (!error)
++		sb->s_fs_info = data;
++	return error;
++}
++
++/**
++ * kernfs_super_ns - determine the namespace tag of a kernfs super_block
++ * @sb: super_block of interest
++ *
++ * Return the namespace tag associated with kernfs super_block @sb.
++ */
++const void *kernfs_super_ns(struct super_block *sb)
++{
++	struct sysfs_super_info *info = sysfs_info(sb);
++
++	return info->ns;
++}
++
++/**
++ * kernfs_mount_ns - kernfs mount helper
++ * @fs_type: file_system_type of the fs being mounted
++ * @flags: mount flags specified for the mount
++ * @root: kernfs_root of the hierarchy being mounted
++ * @ns: optional namespace tag of the mount
++ *
++ * This is to be called from each kernfs user's file_system_type->mount()
++ * implementation, which should pass through the specified @fs_type and
++ * @flags, and specify the hierarchy and namespace tag to mount via @root
++ * and @ns, respectively.
++ *
++ * The return value can be passed to the vfs layer verbatim.
++ */
++struct dentry *kernfs_mount_ns(struct file_system_type *fs_type, int flags,
++			       struct kernfs_root *root, const void *ns)
++{
++	struct super_block *sb;
++	struct sysfs_super_info *info;
++	int error;
++
++	info = kzalloc(sizeof(*info), GFP_KERNEL);
++	if (!info)
++		return ERR_PTR(-ENOMEM);
++
++	info->root = root;
++	info->ns = ns;
++
++	sb = sget(fs_type, sysfs_test_super, sysfs_set_super, flags, info);
++	if (IS_ERR(sb) || sb->s_fs_info != info)
++		kfree(info);
++	if (IS_ERR(sb))
++		return ERR_CAST(sb);
++	if (!sb->s_root) {
++		error = sysfs_fill_super(sb);
++		if (error) {
++			deactivate_locked_super(sb);
++			return ERR_PTR(error);
++		}
++		sb->s_flags |= MS_ACTIVE;
++	}
++
++	return dget(sb->s_root);
++}
++
++/**
++ * kernfs_kill_sb - kill_sb for kernfs
++ * @sb: super_block being killed
++ *
++ * This can be used directly for file_system_type->kill_sb().  If a kernfs
++ * user needs extra cleanup, it can implement its own kill_sb() and call
++ * this function at the end.
++ */
++void kernfs_kill_sb(struct super_block *sb)
++{
++	struct sysfs_super_info *info = sysfs_info(sb);
++	struct sysfs_dirent *root_sd = sb->s_root->d_fsdata;
++
++	/*
++	 * Remove the superblock from fs_supers/s_instances
++	 * so we can't find it, before freeing sysfs_super_info.
++	 */
++	kill_anon_super(sb);
++	kfree(info);
++	kernfs_put(root_sd);
++}
++
++void __init kernfs_init(void)
++{
++	sysfs_dir_cachep = kmem_cache_create("sysfs_dir_cache",
++					      sizeof(struct sysfs_dirent),
++					      0, SLAB_PANIC, NULL);
++	sysfs_inode_init();
++}
+* Unmerged path fs/sysfs/mount.c
+* Unmerged path fs/sysfs/sysfs.h
