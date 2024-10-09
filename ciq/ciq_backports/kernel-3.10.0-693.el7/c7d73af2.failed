@@ -1,0 +1,174 @@
+pnfs: pnfs_update_layout needs to consider if strict iomode checking is on
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Tom Haynes <thomas.haynes@primarydata.com>
+commit c7d73af2d249f0323f5cdb171a59497ce80011fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/c7d73af2.failed
+
+As flexfiles has FF_FLAGS_NO_READ_IO, there is a need to generically
+support enforcing that a IOMODE_RW segment will not allow READ I/O.
+
+	Signed-off-by: Tom Haynes <loghyr@primarydata.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit c7d73af2d249f0323f5cdb171a59497ce80011fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/pnfs.c
+diff --cc fs/nfs/pnfs.c
+index 4d9339084474,0c7e0d45a4de..000000000000
+--- a/fs/nfs/pnfs.c
++++ b/fs/nfs/pnfs.c
+@@@ -1559,9 -1547,29 +1567,35 @@@ lookup_again
+  		goto out_unlock;
+  	}
+  
+++<<<<<<< HEAD
+ +	first = list_empty(&lo->plh_segs);
+ +	if (first) {
+ +		/* The first layoutget for the file. Need to serialize per
+++=======
++ 	lseg = pnfs_find_lseg(lo, &arg, strict_iomode);
++ 	if (lseg) {
++ 		trace_pnfs_update_layout(ino, pos, count, iomode, lo, lseg,
++ 				PNFS_UPDATE_LAYOUT_FOUND_CACHED);
++ 		goto out_unlock;
++ 	}
++ 
++ 	if (!nfs4_valid_open_stateid(ctx->state)) {
++ 		trace_pnfs_update_layout(ino, pos, count, iomode, lo, lseg,
++ 				PNFS_UPDATE_LAYOUT_INVALID_OPEN);
++ 		goto out_unlock;
++ 	}
++ 
++ 	/*
++ 	 * Choose a stateid for the LAYOUTGET. If we don't have a layout
++ 	 * stateid, or it has been invalidated, then we must use the open
++ 	 * stateid.
++ 	 */
++ 	if (lo->plh_stateid.seqid == 0 ||
++ 	    test_bit(NFS_LAYOUT_INVALID_STID, &lo->plh_flags)) {
++ 
++ 		/*
++ 		 * The first layoutget for the file. Need to serialize per
+++>>>>>>> c7d73af2d249 (pnfs: pnfs_update_layout needs to consider if strict iomode checking is on)
+  		 * RFC 5661 Errata 3208.
+  		 */
+  		if (test_and_set_bit(NFS_LAYOUT_FIRST_LAYOUTGET,
+diff --git a/fs/nfs/filelayout/filelayout.c b/fs/nfs/filelayout/filelayout.c
+index 18388a5ed9b0..d0b51d931117 100644
+--- a/fs/nfs/filelayout/filelayout.c
++++ b/fs/nfs/filelayout/filelayout.c
+@@ -889,6 +889,7 @@ filelayout_pg_init_read(struct nfs_pageio_descriptor *pgio,
+ 					   0,
+ 					   NFS4_MAX_UINT64,
+ 					   IOMODE_READ,
++					   false,
+ 					   GFP_KERNEL);
+ 		if (IS_ERR(pgio->pg_lseg)) {
+ 			pgio->pg_error = PTR_ERR(pgio->pg_lseg);
+@@ -914,6 +915,7 @@ filelayout_pg_init_write(struct nfs_pageio_descriptor *pgio,
+ 					   0,
+ 					   NFS4_MAX_UINT64,
+ 					   IOMODE_RW,
++					   false,
+ 					   GFP_NOFS);
+ 		if (IS_ERR(pgio->pg_lseg)) {
+ 			pgio->pg_error = PTR_ERR(pgio->pg_lseg);
+diff --git a/fs/nfs/flexfilelayout/flexfilelayout.c b/fs/nfs/flexfilelayout/flexfilelayout.c
+index d71e81921325..7ace4fb41a39 100644
+--- a/fs/nfs/flexfilelayout/flexfilelayout.c
++++ b/fs/nfs/flexfilelayout/flexfilelayout.c
+@@ -820,6 +820,36 @@ ff_layout_choose_best_ds_for_read(struct pnfs_layout_segment *lseg,
+ 	return NULL;
+ }
+ 
++static void
++ff_layout_pg_get_read(struct nfs_pageio_descriptor *pgio,
++		      struct nfs_page *req,
++		      bool strict_iomode)
++{
++retry_strict:
++	pnfs_put_lseg(pgio->pg_lseg);
++	pgio->pg_lseg = pnfs_update_layout(pgio->pg_inode,
++					   req->wb_context,
++					   0,
++					   NFS4_MAX_UINT64,
++					   IOMODE_READ,
++					   strict_iomode,
++					   GFP_KERNEL);
++	if (IS_ERR(pgio->pg_lseg)) {
++		pgio->pg_error = PTR_ERR(pgio->pg_lseg);
++		pgio->pg_lseg = NULL;
++	}
++
++	/* If we don't have checking, do get a IOMODE_RW
++	 * segment, and the server wants to avoid READs
++	 * there, then retry!
++	 */
++	if (pgio->pg_lseg && !strict_iomode &&
++	    ff_layout_avoid_read_on_rw(pgio->pg_lseg)) {
++		strict_iomode = true;
++		goto retry_strict;
++	}
++}
++
+ static void
+ ff_layout_pg_init_read(struct nfs_pageio_descriptor *pgio,
+ 			struct nfs_page *req)
+@@ -830,19 +860,10 @@ ff_layout_pg_init_read(struct nfs_pageio_descriptor *pgio,
+ 	int ds_idx;
+ 
+ 	/* Use full layout for now */
+-	if (!pgio->pg_lseg || ff_layout_avoid_read_on_rw(pgio->pg_lseg)) {
+-		pnfs_put_lseg(pgio->pg_lseg);
+-		pgio->pg_lseg = pnfs_update_layout(pgio->pg_inode,
+-						   req->wb_context,
+-						   0,
+-						   NFS4_MAX_UINT64,
+-						   IOMODE_READ,
+-						   GFP_KERNEL);
+-		if (IS_ERR(pgio->pg_lseg)) {
+-			pgio->pg_error = PTR_ERR(pgio->pg_lseg);
+-			pgio->pg_lseg = NULL;
+-		}
+-	}
++	if (!pgio->pg_lseg)
++		ff_layout_pg_get_read(pgio, req, false);
++	else if (ff_layout_avoid_read_on_rw(pgio->pg_lseg))
++		ff_layout_pg_get_read(pgio, req, true);
+ 
+ 	/* If no lseg, fall back to read through mds */
+ 	if (pgio->pg_lseg == NULL)
+@@ -894,6 +915,7 @@ ff_layout_pg_init_write(struct nfs_pageio_descriptor *pgio,
+ 						   0,
+ 						   NFS4_MAX_UINT64,
+ 						   IOMODE_RW,
++						   false,
+ 						   GFP_NOFS);
+ 		if (IS_ERR(pgio->pg_lseg)) {
+ 			pgio->pg_error = PTR_ERR(pgio->pg_lseg);
+@@ -952,6 +974,7 @@ ff_layout_pg_get_mirror_count_write(struct nfs_pageio_descriptor *pgio,
+ 						   0,
+ 						   NFS4_MAX_UINT64,
+ 						   IOMODE_RW,
++						   false,
+ 						   GFP_NOFS);
+ 		if (IS_ERR(pgio->pg_lseg)) {
+ 			pgio->pg_error = PTR_ERR(pgio->pg_lseg);
+* Unmerged path fs/nfs/pnfs.c
+diff --git a/fs/nfs/pnfs.h b/fs/nfs/pnfs.h
+index dbdd40fae50e..e88bcf3dd368 100644
+--- a/fs/nfs/pnfs.h
++++ b/fs/nfs/pnfs.h
+@@ -289,6 +289,7 @@ struct pnfs_layout_segment *pnfs_update_layout(struct inode *ino,
+ 					       loff_t pos,
+ 					       u64 count,
+ 					       enum pnfs_iomode iomode,
++					       bool strict_iomode,
+ 					       gfp_t gfp_flags);
+ void pnfs_clear_layoutreturn_waitbit(struct pnfs_layout_hdr *lo);
+ 
