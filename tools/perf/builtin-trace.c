@@ -743,10 +743,12 @@ static struct syscall_fmt {
 	  .arg = { [0] = STRARRAY(resource, rlimit_resources), }, },
 	{ .name	    = "socket",
 	  .arg = { [0] = STRARRAY(family, socket_families),
-		   [1] = { .scnprintf = SCA_SK_TYPE, /* type */ }, }, },
+		   [1] = { .scnprintf = SCA_SK_TYPE, /* type */ },
+		   [2] = { .scnprintf = SCA_SK_PROTO, /* protocol */ }, }, },
 	{ .name	    = "socketpair",
 	  .arg = { [0] = STRARRAY(family, socket_families),
-		   [1] = { .scnprintf = SCA_SK_TYPE, /* type */ }, }, },
+		   [1] = { .scnprintf = SCA_SK_TYPE, /* type */ },
+		   [2] = { .scnprintf = SCA_SK_PROTO, /* protocol */ }, }, },
 	{ .name	    = "stat", .alias = "newstat", },
 #if 0
 	XXX there is no statx syscall in RHEL7
