@@ -1,0 +1,170 @@
+fw_cfg: fix sparse warnings in fw_cfg_sel_endianness()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Marc-André Lureau <marcandre.lureau@redhat.com>
+commit 8d59d5bd8f088be1366f69590729aaef2f8cb17b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/8d59d5bd.failed
+
+Dispatch to the appropriate iowrite() instead of casting restricted
+type to u16.
+
+- if fw_cfg_is_mmio:
+  before: iowrite16(cpu_to_be16(key))
+  after: iowrite16be(key)
+- if !fw_cfg_is_mmio:
+  before: iowrite16(cpu_to_le16(key))
+  after: iowrite16(key)
+  which is equivalent on little-endian systems, where fw_cfg IO is supported.
+
+Fixes:
+$ make C=1 CF=-D__CHECK_ENDIAN__ drivers/firmware/qemu_fw_cfg.o
+
+drivers/firmware/qemu_fw_cfg.c:55:33: warning: restricted __be16 degrades to integer
+drivers/firmware/qemu_fw_cfg.c:55:52: warning: restricted __le16 degrades to integer
+
+	Signed-off-by: Marc-André Lureau <marcandre.lureau@redhat.com>
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+(cherry picked from commit 8d59d5bd8f088be1366f69590729aaef2f8cb17b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/firmware/qemu_fw_cfg.c
+diff --cc drivers/firmware/qemu_fw_cfg.c
+index 0d0d7a831ec8,e7ea2b3b1d11..000000000000
+--- a/drivers/firmware/qemu_fw_cfg.c
++++ b/drivers/firmware/qemu_fw_cfg.c
+@@@ -95,88 -68,17 +95,91 @@@ static void __iomem *fw_cfg_reg_dma
+  static DEFINE_MUTEX(fw_cfg_dev_lock);
+  
+  /* pick appropriate endianness for selector key */
+- static inline u16 fw_cfg_sel_endianness(u16 key)
++ static void fw_cfg_sel_endianness(u16 key)
+  {
+- 	return fw_cfg_is_mmio ? cpu_to_be16(key) : cpu_to_le16(key);
++ 	if (fw_cfg_is_mmio)
++ 		iowrite16be(key, fw_cfg_reg_ctrl);
++ 	else
++ 		iowrite16(key, fw_cfg_reg_ctrl);
+  }
+  
+ +static inline bool fw_cfg_dma_enabled(void)
+ +{
+ +	return fw_cfg_rev & FW_CFG_VERSION_DMA && fw_cfg_reg_dma;
+ +}
+ +
+ +/* qemu fw_cfg device is sync today, but spec says it may become async */
+ +static void fw_cfg_wait_for_control(struct fw_cfg_dma *d, dma_addr_t dma)
+ +{
+ +	do {
+ +		dma_sync_single_for_cpu(dev, dma, sizeof(*d), DMA_FROM_DEVICE);
+ +		if ((be32_to_cpu(d->control) & ~FW_CFG_DMA_CTL_ERROR) == 0)
+ +			return;
+ +
+ +		usleep_range(50, 100);
+ +	} while (true);
+ +}
+ +
+ +static ssize_t fw_cfg_dma_transfer(void *address, u32 length, u32 control)
+ +{
+ +	dma_addr_t dma_addr = 0;
+ +	struct fw_cfg_dma *d = NULL;
+ +	dma_addr_t dma;
+ +	ssize_t ret = length;
+ +	enum dma_data_direction dir =
+ +		(control & FW_CFG_DMA_CTL_READ ? DMA_FROM_DEVICE : 0) |
+ +		(control & FW_CFG_DMA_CTL_WRITE ? DMA_TO_DEVICE : 0);
+ +
+ +	if (address && length) {
+ +		dma_addr = dma_map_single(dev, address, length, dir);
+ +		if (dma_mapping_error(dev, dma_addr)) {
+ +			WARN(1, "%s: failed to map address\n", __func__);
+ +			return -EFAULT;
+ +		}
+ +	}
+ +
+ +	d = kmalloc(sizeof(*d), GFP_KERNEL);
+ +	if (!d) {
+ +		ret = -ENOMEM;
+ +		goto end;
+ +	}
+ +
+ +	*d = (struct fw_cfg_dma) {
+ +		.address = cpu_to_be64(dma_addr),
+ +		.length = cpu_to_be32(length),
+ +		.control = cpu_to_be32(control)
+ +	};
+ +
+ +	dma = dma_map_single(dev, d, sizeof(*d), DMA_BIDIRECTIONAL);
+ +	if (dma_mapping_error(dev, dma)) {
+ +		WARN(1, "%s: failed to map fw_cfg_dma\n", __func__);
+ +		ret = -EFAULT;
+ +		goto end;
+ +	}
+ +
+ +	iowrite32be((u64)dma >> 32, fw_cfg_reg_dma);
+ +	iowrite32be(dma, fw_cfg_reg_dma + 4);
+ +
+ +	fw_cfg_wait_for_control(d, dma);
+ +
+ +	if (be32_to_cpu(d->control) & FW_CFG_DMA_CTL_ERROR) {
+ +		ret = -EIO;
+ +	}
+ +
+ +	dma_unmap_single(dev, dma, sizeof(*d), DMA_BIDIRECTIONAL);
+ +
+ +end:
+ +	kfree(d);
+ +	if (dma_addr)
+ +		dma_unmap_single(dev, dma_addr, length, dir);
+ +
+ +	return ret;
+ +}
+ +
+  /* read chunk of given fw_cfg blob (caller responsible for sanity-check) */
+ -static inline void fw_cfg_read_blob(u16 key,
+ -				    void *buf, loff_t pos, size_t count)
+ +static ssize_t fw_cfg_read_blob(u16 key,
+ +				void *buf, loff_t pos, size_t count,
+ +				bool dma)
+  {
+  	u32 glk = -1U;
+  	acpi_status status;
+@@@ -194,27 -95,10 +197,34 @@@
+  	}
+  
+  	mutex_lock(&fw_cfg_dev_lock);
+++<<<<<<< HEAD
+ +	if (dma && fw_cfg_dma_enabled()) {
+ +		if (pos == 0) {
+ +			ret = fw_cfg_dma_transfer(buf, count, key << 16
+ +						  | FW_CFG_DMA_CTL_SELECT
+ +						  | FW_CFG_DMA_CTL_READ);
+ +		} else {
+ +			iowrite16(fw_cfg_sel_endianness(key), fw_cfg_reg_ctrl);
+ +			ret = fw_cfg_dma_transfer(NULL, pos, FW_CFG_DMA_CTL_SKIP);
+ +			if (ret < 0)
+ +				goto end;
+ +			ret = fw_cfg_dma_transfer(buf, count,
+ +						  FW_CFG_DMA_CTL_READ);
+ +		}
+ +	} else {
+ +		iowrite16(fw_cfg_sel_endianness(key), fw_cfg_reg_ctrl);
+ +		while (pos-- > 0)
+ +			ioread8(fw_cfg_reg_data);
+ +		ioread8_rep(fw_cfg_reg_data, buf, count);
+ +	}
+ +
+ +end:
+++=======
++ 	fw_cfg_sel_endianness(key);
++ 	while (pos-- > 0)
++ 		ioread8(fw_cfg_reg_data);
++ 	ioread8_rep(fw_cfg_reg_data, buf, count);
+++>>>>>>> 8d59d5bd8f08 (fw_cfg: fix sparse warnings in fw_cfg_sel_endianness())
+  	mutex_unlock(&fw_cfg_dev_lock);
+  
+  	acpi_release_global_lock(glk);
+* Unmerged path drivers/firmware/qemu_fw_cfg.c
