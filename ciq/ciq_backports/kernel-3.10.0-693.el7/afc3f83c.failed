@@ -1,0 +1,119 @@
+scsi: ipr: Add asynchronous error notification
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] ipr: Add asynchronous error notification (Gustavo Duarte) [1384383]
+Rebuild_FUZZ: 93.02%
+commit-author Brian King <brking@linux.vnet.ibm.com>
+commit afc3f83cb4a5bb3c8f18380bdeca6b65a6ff9543
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/afc3f83c.failed
+
+This patch implements functions for pushing HCAM (host controlled
+asynchronous messages) error buffers to userspace through sysfs
+attributes.  Reads to the "async_err_log" attribute will result in a
+single HCAM buffer being copied to userspace; one can process the next
+HCAM buffer by writing any string to the same attribute.
+
+A new list was added to the ioa_cfg structure to store the HCAM buffers
+for later reporting. We also send a KOBJ_CHANGE event whenever a new
+HCAM buffer is made available to userspace.
+
+	Signed-off-by: Heitor Ricardo Alves de Siqueira <halves@linux.vnet.ibm.com>
+	Signed-off-by: Gabriel Krisman Bertazi <krisman@linux.vnet.ibm.com>
+	Signed-off-by: Brian King <brking@linux.vnet.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit afc3f83cb4a5bb3c8f18380bdeca6b65a6ff9543)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/ipr.c
+diff --cc drivers/scsi/ipr.c
+index 5ff93cdb75b5,5ecc32cecd10..000000000000
+--- a/drivers/scsi/ipr.c
++++ b/drivers/scsi/ipr.c
+@@@ -9392,20 -9407,19 +9475,28 @@@ static void ipr_free_mem(struct ipr_ioa
+  	ipr_free_cmd_blks(ioa_cfg);
+  
+  	for (i = 0; i < ioa_cfg->hrrq_num; i++)
+ -		dma_free_coherent(&ioa_cfg->pdev->dev,
+ -				  sizeof(u32) * ioa_cfg->hrrq[i].size,
+ -				  ioa_cfg->hrrq[i].host_rrq,
+ -				  ioa_cfg->hrrq[i].host_rrq_dma);
+ -
+ -	dma_free_coherent(&ioa_cfg->pdev->dev, ioa_cfg->cfg_table_size,
+ -			  ioa_cfg->u.cfg_table, ioa_cfg->cfg_table_dma);
+ +		pci_free_consistent(ioa_cfg->pdev,
+ +					sizeof(u32) * ioa_cfg->hrrq[i].size,
+ +					ioa_cfg->hrrq[i].host_rrq,
+ +					ioa_cfg->hrrq[i].host_rrq_dma);
+  
+ +	pci_free_consistent(ioa_cfg->pdev, ioa_cfg->cfg_table_size,
+ +			    ioa_cfg->u.cfg_table,
+ +			    ioa_cfg->cfg_table_dma);
+ +
+++<<<<<<< HEAD
+ +	for (i = 0; i < IPR_NUM_HCAMS; i++) {
+ +		pci_free_consistent(ioa_cfg->pdev,
+ +				    sizeof(struct ipr_hostrcb),
+ +				    ioa_cfg->hostrcb[i],
+ +				    ioa_cfg->hostrcb_dma[i]);
+++=======
++ 	for (i = 0; i < IPR_MAX_HCAMS; i++) {
++ 		dma_free_coherent(&ioa_cfg->pdev->dev,
++ 				  sizeof(struct ipr_hostrcb),
++ 				  ioa_cfg->hostrcb[i],
++ 				  ioa_cfg->hostrcb_dma[i]);
+++>>>>>>> afc3f83cb4a5 (scsi: ipr: Add asynchronous error notification)
+  	}
+  
+  	ipr_free_dump(ioa_cfg);
+@@@ -9638,10 -9655,11 +9729,18 @@@ static int ipr_alloc_mem(struct ipr_ioa
+  	if (!ioa_cfg->u.cfg_table)
+  		goto out_free_host_rrq;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < IPR_NUM_HCAMS; i++) {
+ +		ioa_cfg->hostrcb[i] = pci_alloc_consistent(ioa_cfg->pdev,
+ +							   sizeof(struct ipr_hostrcb),
+ +							   &ioa_cfg->hostrcb_dma[i]);
+++=======
++ 	for (i = 0; i < IPR_MAX_HCAMS; i++) {
++ 		ioa_cfg->hostrcb[i] = dma_alloc_coherent(&pdev->dev,
++ 							 sizeof(struct ipr_hostrcb),
++ 							 &ioa_cfg->hostrcb_dma[i],
++ 							 GFP_KERNEL);
+++>>>>>>> afc3f83cb4a5 (scsi: ipr: Add asynchronous error notification)
+  
+  		if (!ioa_cfg->hostrcb[i])
+  			goto out_free_hostrcb_dma;
+* Unmerged path drivers/scsi/ipr.c
+diff --git a/drivers/scsi/ipr.h b/drivers/scsi/ipr.h
+index debedca82ad7..6c39460af54c 100644
+--- a/drivers/scsi/ipr.h
++++ b/drivers/scsi/ipr.h
+@@ -154,7 +154,9 @@
+ #define IPR_DEFAULT_MAX_ERROR_DUMP			984
+ #define IPR_NUM_LOG_HCAMS				2
+ #define IPR_NUM_CFG_CHG_HCAMS				2
++#define IPR_NUM_HCAM_QUEUE				12
+ #define IPR_NUM_HCAMS	(IPR_NUM_LOG_HCAMS + IPR_NUM_CFG_CHG_HCAMS)
++#define IPR_MAX_HCAMS	(IPR_NUM_HCAMS + IPR_NUM_HCAM_QUEUE)
+ 
+ #define IPR_MAX_SIS64_TARGETS_PER_BUS			1024
+ #define IPR_MAX_SIS64_LUNS_PER_TARGET			0xffffffff
+@@ -1532,10 +1534,11 @@ struct ipr_ioa_cfg {
+ 
+ 	char ipr_hcam_label[8];
+ #define IPR_HCAM_LABEL			"hcams"
+-	struct ipr_hostrcb *hostrcb[IPR_NUM_HCAMS];
+-	dma_addr_t hostrcb_dma[IPR_NUM_HCAMS];
++	struct ipr_hostrcb *hostrcb[IPR_MAX_HCAMS];
++	dma_addr_t hostrcb_dma[IPR_MAX_HCAMS];
+ 	struct list_head hostrcb_free_q;
+ 	struct list_head hostrcb_pending_q;
++	struct list_head hostrcb_report_q;
+ 
+ 	struct ipr_hrr_queue hrrq[IPR_MAX_HRRQ_NUM];
+ 	u32 hrrq_num;
