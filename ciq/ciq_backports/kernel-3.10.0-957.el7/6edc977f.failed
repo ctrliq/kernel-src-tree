@@ -1,0 +1,178 @@
+xfs: remove xfs_bmap_search_extents
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 6edc977f775e5ac10655b03607ef091d2b06f2f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/6edc977f.failed
+
+Now that all users are gone.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit 6edc977f775e5ac10655b03607ef091d2b06f2f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_bmap.h
+diff --cc fs/xfs/libxfs/xfs_bmap.h
+index b02804fe53c5,ffed1f9208ce..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.h
++++ b/fs/xfs/libxfs/xfs_bmap.h
+@@@ -194,15 -232,35 +194,48 @@@ int	xfs_check_nostate_extents(struct xf
+  		xfs_extnum_t num);
+  uint	xfs_default_attroffset(struct xfs_inode *ip);
+  int	xfs_bmap_shift_extents(struct xfs_trans *tp, struct xfs_inode *ip,
+++<<<<<<< HEAD
+ +		xfs_fileoff_t start_fsb, xfs_fileoff_t offset_shift_fsb,
+ +		int *done, xfs_fileoff_t *next_fsb, xfs_fsblock_t *firstblock,
+ +		struct xfs_defer_ops *dfops, int num_exts);
+ +struct xfs_bmbt_rec_host *
+ +	xfs_bmap_search_extents(struct xfs_inode *ip, xfs_fileoff_t bno,
+ +		int fork, int *eofp, xfs_extnum_t *lastxp,
+ +		struct xfs_bmbt_irec *gotp, struct xfs_bmbt_irec *prevp);
+ +int	xfs_bmapi_reserve_delalloc(struct xfs_inode *ip, xfs_fileoff_t aoff,
+ +		xfs_filblks_t len, struct xfs_bmbt_irec *got,
+ +		struct xfs_bmbt_irec *prev, xfs_extnum_t *lastx, int eof);
+++=======
++ 		xfs_fileoff_t *next_fsb, xfs_fileoff_t offset_shift_fsb,
++ 		int *done, xfs_fileoff_t stop_fsb, xfs_fsblock_t *firstblock,
++ 		struct xfs_defer_ops *dfops, enum shift_direction direction,
++ 		int num_exts);
++ int	xfs_bmap_split_extent(struct xfs_inode *ip, xfs_fileoff_t split_offset);
++ int	xfs_bmapi_reserve_delalloc(struct xfs_inode *ip, int whichfork,
++ 		xfs_fileoff_t aoff, xfs_filblks_t len,
++ 		struct xfs_bmbt_irec *got, xfs_extnum_t *lastx, int eof);
++ 
++ enum xfs_bmap_intent_type {
++ 	XFS_BMAP_MAP = 1,
++ 	XFS_BMAP_UNMAP,
++ };
++ 
++ struct xfs_bmap_intent {
++ 	struct list_head			bi_list;
++ 	enum xfs_bmap_intent_type		bi_type;
++ 	struct xfs_inode			*bi_owner;
++ 	int					bi_whichfork;
++ 	struct xfs_bmbt_irec			bi_bmap;
++ };
++ 
++ int	xfs_bmap_finish_one(struct xfs_trans *tp, struct xfs_defer_ops *dfops,
++ 		struct xfs_inode *ip, enum xfs_bmap_intent_type type,
++ 		int whichfork, xfs_fileoff_t startoff, xfs_fsblock_t startblock,
++ 		xfs_filblks_t blockcount, xfs_exntst_t state);
++ int	xfs_bmap_map_extent(struct xfs_mount *mp, struct xfs_defer_ops *dfops,
++ 		struct xfs_inode *ip, struct xfs_bmbt_irec *imap);
++ int	xfs_bmap_unmap_extent(struct xfs_mount *mp, struct xfs_defer_ops *dfops,
++ 		struct xfs_inode *ip, struct xfs_bmbt_irec *imap);
+++>>>>>>> 6edc977f775e (xfs: remove xfs_bmap_search_extents)
+  
+  #endif	/* __XFS_BMAP_H__ */
+diff --git a/fs/xfs/libxfs/xfs_bmap.c b/fs/xfs/libxfs/xfs_bmap.c
+index 54c679c67045..cc6d1ca08fbd 100644
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@ -1322,97 +1322,6 @@ error0:
+ 	return -EFSCORRUPTED;
+ }
+ 
+-
+-/*
+- * Search the extent records for the entry containing block bno.
+- * If bno lies in a hole, point to the next entry.  If bno lies
+- * past eof, *eofp will be set, and *prevp will contain the last
+- * entry (null if none).  Else, *lastxp will be set to the index
+- * of the found entry; *gotp will contain the entry.
+- */
+-STATIC xfs_bmbt_rec_host_t *		/* pointer to found extent entry */
+-xfs_bmap_search_multi_extents(
+-	xfs_ifork_t	*ifp,		/* inode fork pointer */
+-	xfs_fileoff_t	bno,		/* block number searched for */
+-	int		*eofp,		/* out: end of file found */
+-	xfs_extnum_t	*lastxp,	/* out: last extent index */
+-	xfs_bmbt_irec_t	*gotp,		/* out: extent entry found */
+-	xfs_bmbt_irec_t	*prevp)		/* out: previous extent entry found */
+-{
+-	xfs_bmbt_rec_host_t *ep;		/* extent record pointer */
+-	xfs_extnum_t	lastx;		/* last extent index */
+-
+-	/*
+-	 * Initialize the extent entry structure to catch access to
+-	 * uninitialized br_startblock field.
+-	 */
+-	gotp->br_startoff = 0xffa5a5a5a5a5a5a5LL;
+-	gotp->br_blockcount = 0xa55a5a5a5a5a5a5aLL;
+-	gotp->br_state = XFS_EXT_INVALID;
+-	gotp->br_startblock = 0xffffa5a5a5a5a5a5LL;
+-	prevp->br_startoff = NULLFILEOFF;
+-
+-	ep = xfs_iext_bno_to_ext(ifp, bno, &lastx);
+-	if (lastx > 0) {
+-		xfs_bmbt_get_all(xfs_iext_get_ext(ifp, lastx - 1), prevp);
+-	}
+-	if (lastx < xfs_iext_count(ifp)) {
+-		xfs_bmbt_get_all(ep, gotp);
+-		*eofp = 0;
+-	} else {
+-		if (lastx > 0) {
+-			*gotp = *prevp;
+-		}
+-		*eofp = 1;
+-		ep = NULL;
+-	}
+-	*lastxp = lastx;
+-	return ep;
+-}
+-
+-/*
+- * Search the extents list for the inode, for the extent containing bno.
+- * If bno lies in a hole, point to the next entry.  If bno lies past eof,
+- * *eofp will be set, and *prevp will contain the last entry (null if none).
+- * Else, *lastxp will be set to the index of the found
+- * entry; *gotp will contain the entry.
+- */
+-xfs_bmbt_rec_host_t *                 /* pointer to found extent entry */
+-xfs_bmap_search_extents(
+-	xfs_inode_t     *ip,            /* incore inode pointer */
+-	xfs_fileoff_t   bno,            /* block number searched for */
+-	int             fork,      	/* data or attr fork */
+-	int             *eofp,          /* out: end of file found */
+-	xfs_extnum_t    *lastxp,        /* out: last extent index */
+-	xfs_bmbt_irec_t *gotp,          /* out: extent entry found */
+-	xfs_bmbt_irec_t *prevp)         /* out: previous extent entry found */
+-{
+-	xfs_ifork_t	*ifp;		/* inode fork pointer */
+-	xfs_bmbt_rec_host_t  *ep;            /* extent record pointer */
+-
+-	XFS_STATS_INC(ip->i_mount, xs_look_exlist);
+-	ifp = XFS_IFORK_PTR(ip, fork);
+-
+-	ep = xfs_bmap_search_multi_extents(ifp, bno, eofp, lastxp, gotp, prevp);
+-
+-	if (unlikely(!(gotp->br_startblock) && (*lastxp != NULLEXTNUM) &&
+-		     !(XFS_IS_REALTIME_INODE(ip) && fork == XFS_DATA_FORK))) {
+-		xfs_alert_tag(ip->i_mount, XFS_PTAG_FSBLOCK_ZERO,
+-				"Access to block zero in inode %llu "
+-				"start_block: %llx start_off: %llx "
+-				"blkcnt: %llx extent-state: %x lastx: %x",
+-			(unsigned long long)ip->i_ino,
+-			(unsigned long long)gotp->br_startblock,
+-			(unsigned long long)gotp->br_startoff,
+-			(unsigned long long)gotp->br_blockcount,
+-			gotp->br_state, *lastxp);
+-		*lastxp = NULLEXTNUM;
+-		*eofp = 1;
+-		return NULL;
+-	}
+-	return ep;
+-}
+-
+ /*
+  * Returns the file-relative block number of the first unused block(s)
+  * in the file with at least "len" logically contiguous blocks free.
+* Unmerged path fs/xfs/libxfs/xfs_bmap.h
