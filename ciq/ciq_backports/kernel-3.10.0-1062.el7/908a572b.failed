@@ -1,0 +1,91 @@
+fuse: fix blocked_waitq wakeup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Miklos Szeredi <mszeredi@redhat.com>
+commit 908a572b80f6e9577b45e81b3dfe2e22111286b8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/908a572b.failed
+
+Using waitqueue_active() is racy.  Make sure we issue a wake_up()
+unconditionally after storing into fc->blocked.  After that it's okay to
+optimize with waitqueue_active() since the first wake up provides the
+necessary barrier for all waiters, not the just the woken one.
+
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+Fixes: 3c18ef8117f0 ("fuse: optimize wake_up")
+	Cc: <stable@vger.kernel.org> # v3.10
+(cherry picked from commit 908a572b80f6e9577b45e81b3dfe2e22111286b8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fuse/dev.c
+diff --cc fs/fuse/dev.c
+index d81feeed9393,51eb602a435b..000000000000
+--- a/fs/fuse/dev.c
++++ b/fs/fuse/dev.c
+@@@ -363,31 -375,39 +363,53 @@@ static void flush_bg_queue(struct fuse_
+   * was closed.  The requester thread is woken up (if still waiting),
+   * the 'end' callback is called if given, else the reference to the
+   * request is released
+ + *
+ + * Called with fc->lock, unlocks it
+   */
+  static void request_end(struct fuse_conn *fc, struct fuse_req *req)
+ -{
+ -	struct fuse_iqueue *fiq = &fc->iq;
+ -
+ +__releases(fc->lock)
+ +{
+ +	void (*end) (struct fuse_conn *, struct fuse_req *) = req->end;
+ +	req->end = NULL;
+ +	list_del(&req->list);
+ +	list_del(&req->intr_entry);
+ +	req->state = FUSE_REQ_FINISHED;
+ +	if (req->background) {
+ +		req->background = 0;
+ +
+++<<<<<<< HEAD
+ +		if (fc->num_background == fc->max_background)
+++=======
++ 	if (test_and_set_bit(FR_FINISHED, &req->flags))
++ 		goto put_request;
++ 
++ 	spin_lock(&fiq->waitq.lock);
++ 	list_del_init(&req->intr_entry);
++ 	spin_unlock(&fiq->waitq.lock);
++ 	WARN_ON(test_bit(FR_PENDING, &req->flags));
++ 	WARN_ON(test_bit(FR_SENT, &req->flags));
++ 	if (test_bit(FR_BACKGROUND, &req->flags)) {
++ 		spin_lock(&fc->lock);
++ 		clear_bit(FR_BACKGROUND, &req->flags);
++ 		if (fc->num_background == fc->max_background) {
+++>>>>>>> 908a572b80f6 (fuse: fix blocked_waitq wakeup)
+  			fc->blocked = 0;
+- 
+- 		/* Wake up next waiter, if any */
+- 		if (!fc->blocked && waitqueue_active(&fc->blocked_waitq))
+  			wake_up(&fc->blocked_waitq);
++ 		} else if (!fc->blocked) {
++ 			/*
++ 			 * Wake up next waiter, if any.  It's okay to use
++ 			 * waitqueue_active(), as we've already synced up
++ 			 * fc->blocked with waiters with the wake_up() call
++ 			 * above.
++ 			 */
++ 			if (waitqueue_active(&fc->blocked_waitq))
++ 				wake_up(&fc->blocked_waitq);
++ 		}
+  
+ -		if (fc->num_background == fc->congestion_threshold && fc->sb) {
+ -			clear_bdi_congested(fc->sb->s_bdi, BLK_RW_SYNC);
+ -			clear_bdi_congested(fc->sb->s_bdi, BLK_RW_ASYNC);
+ +		if (fc->num_background == fc->congestion_threshold &&
+ +		    fc->connected && fc->bdi_initialized) {
+ +			clear_bdi_congested(&fc->bdi, BLK_RW_SYNC);
+ +			clear_bdi_congested(&fc->bdi, BLK_RW_ASYNC);
+  		}
+  		fc->num_background--;
+  		fc->active_background--;
+* Unmerged path fs/fuse/dev.c
