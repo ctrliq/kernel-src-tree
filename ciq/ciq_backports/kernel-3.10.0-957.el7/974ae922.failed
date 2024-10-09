@@ -1,0 +1,229 @@
+xfs: track preallocation separately in xfs_bmapi_reserve_delalloc()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit 974ae922efd93b07b6cdf989ae959883f6f05fd8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/974ae922.failed
+
+Speculative preallocation is currently processed entirely by the callers
+of xfs_bmapi_reserve_delalloc(). The caller determines how much
+preallocation to include, adjusts the extent length and passes down the
+resulting request.
+
+While this works fine for post-eof speculative preallocation, it is not
+as reliable for COW fork preallocation. COW fork preallocation is
+implemented via the cowextszhint, which aligns the start offset as well
+as the length of the extent. Further, it is difficult for the caller to
+accurately identify when preallocation occurs because the returned
+extent could have been merged with neighboring extents in the fork.
+
+To simplify this situation and facilitate further COW fork preallocation
+enhancements, update xfs_bmapi_reserve_delalloc() to take a separate
+preallocation parameter to incorporate into the allocation request. The
+preallocation blocks value is tacked onto the end of the request and
+adjusted to accommodate neighboring extents and extent size limits.
+Since xfs_bmapi_reserve_delalloc() now knows precisely how much
+preallocation was included in the allocation, it can also tag the inodes
+appropriately to support preallocation reclaim.
+
+Note that xfs_bmapi_reserve_delalloc() callers are not yet updated to
+use the preallocation mechanism. This patch should not change behavior
+outside of correctly tagging reflink inodes when start offset
+preallocation occurs (which the caller does not handle correctly).
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit 974ae922efd93b07b6cdf989ae959883f6f05fd8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_bmap.c
+#	fs/xfs/libxfs/xfs_bmap.h
+#	fs/xfs/xfs_iomap.c
+#	fs/xfs/xfs_reflink.c
+diff --cc fs/xfs/libxfs/xfs_bmap.c
+index 7c5cad7c4ccb,6b7e6eb29414..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@@ -46,6 -46,11 +46,14 @@@
+  #include "xfs_symlink.h"
+  #include "xfs_attr_leaf.h"
+  #include "xfs_filestream.h"
+++<<<<<<< HEAD
+++=======
++ #include "xfs_rmap.h"
++ #include "xfs_ag_resv.h"
++ #include "xfs_refcount.h"
++ #include "xfs_rmap_btree.h"
++ #include "xfs_icache.h"
+++>>>>>>> 974ae922efd9 (xfs: track preallocation separately in xfs_bmapi_reserve_delalloc())
+  
+  
+  kmem_zone_t		*xfs_bmap_free_item_zone;
+@@@ -4116,10 -4154,11 +4124,16 @@@ xfs_bmapi_read
+  int
+  xfs_bmapi_reserve_delalloc(
+  	struct xfs_inode	*ip,
+++<<<<<<< HEAD
+ +	xfs_fileoff_t		aoff,
+++=======
++ 	int			whichfork,
++ 	xfs_fileoff_t		off,
+++>>>>>>> 974ae922efd9 (xfs: track preallocation separately in xfs_bmapi_reserve_delalloc())
+  	xfs_filblks_t		len,
++ 	xfs_filblks_t		prealloc,
+  	struct xfs_bmbt_irec	*got,
+ +	struct xfs_bmbt_irec	*prev,
+  	xfs_extnum_t		*lastx,
+  	int			eof)
+  {
+@@@ -4129,15 -4169,30 +4143,22 @@@
+  	char			rt = XFS_IS_REALTIME_INODE(ip);
+  	xfs_extlen_t		extsz;
+  	int			error;
++ 	xfs_fileoff_t		aoff = off;
+  
+- 	alen = XFS_FILBLKS_MIN(len, MAXEXTLEN);
++ 	/*
++ 	 * Cap the alloc length. Keep track of prealloc so we know whether to
++ 	 * tag the inode before we return.
++ 	 */
++ 	alen = XFS_FILBLKS_MIN(len + prealloc, MAXEXTLEN);
+  	if (!eof)
+  		alen = XFS_FILBLKS_MIN(alen, got->br_startoff - aoff);
++ 	if (prealloc && alen >= len)
++ 		prealloc = alen - len;
+  
+  	/* Figure out the extent size, adjust alen */
+ -	if (whichfork == XFS_COW_FORK)
+ -		extsz = xfs_get_cowextsz_hint(ip);
+ -	else
+ -		extsz = xfs_get_extsz_hint(ip);
+ +	extsz = xfs_get_extsz_hint(ip);
+  	if (extsz) {
+ -		struct xfs_bmbt_irec	prev;
+ -
+ -		if (!xfs_iext_get_extent(ifp, *lastx - 1, &prev))
+ -			prev.br_startoff = NULLFILEOFF;
+ -
+ -		error = xfs_bmap_extsize_align(mp, got, &prev, extsz, rt, eof,
+ +		error = xfs_bmap_extsize_align(mp, got, prev, extsz, rt, eof,
+  					       1, 0, &aoff, &alen);
+  		ASSERT(!error);
+  	}
+@@@ -4182,9 -4237,28 +4203,26 @@@
+  	got->br_startblock = nullstartblock(indlen);
+  	got->br_blockcount = alen;
+  	got->br_state = XFS_EXT_NORM;
+ -	xfs_bmap_add_extent_hole_delay(ip, whichfork, lastx, got);
+  
+ -	/*
+ -	 * Update our extent pointer, given that xfs_bmap_add_extent_hole_delay
+ -	 * might have merged it into one of the neighbouring ones.
+ -	 */
+ -	xfs_bmbt_get_all(xfs_iext_get_ext(ifp, *lastx), got);
+ +	xfs_bmap_add_extent_hole_delay(ip, lastx, got);
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Tag the inode if blocks were preallocated. Note that COW fork
++ 	 * preallocation can occur at the start or end of the extent, even when
++ 	 * prealloc == 0, so we must also check the aligned offset and length.
++ 	 */
++ 	if (whichfork == XFS_DATA_FORK && prealloc)
++ 		xfs_inode_set_eofblocks_tag(ip);
++ 	if (whichfork == XFS_COW_FORK && (prealloc || aoff < off || alen > len))
++ 		xfs_inode_set_cowblocks_tag(ip);
++ 
++ 	ASSERT(got->br_startoff <= aoff);
++ 	ASSERT(got->br_startoff + got->br_blockcount >= aoff + alen);
++ 	ASSERT(isnullstartblock(got->br_startblock));
++ 	ASSERT(got->br_state == XFS_EXT_NORM);
+++>>>>>>> 974ae922efd9 (xfs: track preallocation separately in xfs_bmapi_reserve_delalloc())
+  	return 0;
+  
+  out_unreserve_blocks:
+diff --cc fs/xfs/libxfs/xfs_bmap.h
+index b02804fe53c5,cecd094404cc..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.h
++++ b/fs/xfs/libxfs/xfs_bmap.h
+@@@ -194,15 -232,35 +194,48 @@@ int	xfs_check_nostate_extents(struct xf
+  		xfs_extnum_t num);
+  uint	xfs_default_attroffset(struct xfs_inode *ip);
+  int	xfs_bmap_shift_extents(struct xfs_trans *tp, struct xfs_inode *ip,
+++<<<<<<< HEAD
+ +		xfs_fileoff_t start_fsb, xfs_fileoff_t offset_shift_fsb,
+ +		int *done, xfs_fileoff_t *next_fsb, xfs_fsblock_t *firstblock,
+ +		struct xfs_defer_ops *dfops, int num_exts);
+ +struct xfs_bmbt_rec_host *
+ +	xfs_bmap_search_extents(struct xfs_inode *ip, xfs_fileoff_t bno,
+ +		int fork, int *eofp, xfs_extnum_t *lastxp,
+ +		struct xfs_bmbt_irec *gotp, struct xfs_bmbt_irec *prevp);
+ +int	xfs_bmapi_reserve_delalloc(struct xfs_inode *ip, xfs_fileoff_t aoff,
+ +		xfs_filblks_t len, struct xfs_bmbt_irec *got,
+ +		struct xfs_bmbt_irec *prev, xfs_extnum_t *lastx, int eof);
+++=======
++ 		xfs_fileoff_t *next_fsb, xfs_fileoff_t offset_shift_fsb,
++ 		int *done, xfs_fileoff_t stop_fsb, xfs_fsblock_t *firstblock,
++ 		struct xfs_defer_ops *dfops, enum shift_direction direction,
++ 		int num_exts);
++ int	xfs_bmap_split_extent(struct xfs_inode *ip, xfs_fileoff_t split_offset);
++ int	xfs_bmapi_reserve_delalloc(struct xfs_inode *ip, int whichfork,
++ 		xfs_fileoff_t off, xfs_filblks_t len, xfs_filblks_t prealloc,
++ 		struct xfs_bmbt_irec *got, xfs_extnum_t *lastx, int eof);
++ 
++ enum xfs_bmap_intent_type {
++ 	XFS_BMAP_MAP = 1,
++ 	XFS_BMAP_UNMAP,
++ };
++ 
++ struct xfs_bmap_intent {
++ 	struct list_head			bi_list;
++ 	enum xfs_bmap_intent_type		bi_type;
++ 	struct xfs_inode			*bi_owner;
++ 	int					bi_whichfork;
++ 	struct xfs_bmbt_irec			bi_bmap;
++ };
++ 
++ int	xfs_bmap_finish_one(struct xfs_trans *tp, struct xfs_defer_ops *dfops,
++ 		struct xfs_inode *ip, enum xfs_bmap_intent_type type,
++ 		int whichfork, xfs_fileoff_t startoff, xfs_fsblock_t startblock,
++ 		xfs_filblks_t blockcount, xfs_exntst_t state);
++ int	xfs_bmap_map_extent(struct xfs_mount *mp, struct xfs_defer_ops *dfops,
++ 		struct xfs_inode *ip, struct xfs_bmbt_irec *imap);
++ int	xfs_bmap_unmap_extent(struct xfs_mount *mp, struct xfs_defer_ops *dfops,
++ 		struct xfs_inode *ip, struct xfs_bmbt_irec *imap);
+++>>>>>>> 974ae922efd9 (xfs: track preallocation separately in xfs_bmapi_reserve_delalloc())
+  
+  #endif	/* __XFS_BMAP_H__ */
+diff --cc fs/xfs/xfs_iomap.c
+index 936cba6f7d93,e4bfde212cc2..000000000000
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@@ -604,9 -619,8 +604,14 @@@ xfs_iomap_write_delay
+  	}
+  
+  retry:
+++<<<<<<< HEAD
+ +	error = xfs_bmapi_reserve_delalloc(ip, offset_fsb,
+ +			end_fsb - offset_fsb, &got,
+ +			&prev, &idx, eof);
+++=======
++ 	error = xfs_bmapi_reserve_delalloc(ip, XFS_DATA_FORK, offset_fsb,
++ 			end_fsb - offset_fsb, 0, &got, &idx, eof);
+++>>>>>>> 974ae922efd9 (xfs: track preallocation separately in xfs_bmapi_reserve_delalloc())
+  	switch (error) {
+  	case 0:
+  		break;
+* Unmerged path fs/xfs/xfs_reflink.c
+* Unmerged path fs/xfs/libxfs/xfs_bmap.c
+* Unmerged path fs/xfs/libxfs/xfs_bmap.h
+* Unmerged path fs/xfs/xfs_iomap.c
+* Unmerged path fs/xfs/xfs_reflink.c
