@@ -38,6 +38,10 @@ void tsc_verify_tsc_adjust(void)
 	if (!boot_cpu_has(X86_FEATURE_TSC_ADJUST))
 		return;
 
+	/* Skip unnecessary error messages if TSC already unstable */
+	if (check_tsc_unstable())
+		return;
+
 	/* Rate limit the MSR check */
 	if (time_before(jiffies, adj->nextcheck))
 		return;
@@ -65,6 +69,10 @@ bool __init tsc_store_and_check_tsc_adjust(void)
 	s64 bootval;
 
 	if (!boot_cpu_has(X86_FEATURE_TSC_ADJUST))
+		return false;
+
+	/* Skip unnecessary error messages if TSC already unstable */
+	if (check_tsc_unstable())
 		return false;
 
 	rdmsrl(MSR_IA32_TSC_ADJUST, bootval);
