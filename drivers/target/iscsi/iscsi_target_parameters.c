@@ -1924,7 +1924,7 @@ void iscsi_set_session_parameters(
 				param->value);
 		} else if (!strcmp(param->name, INITIALR2T)) {
 			ops->InitialR2T = !strcmp(param->value, YES);
-			 pr_debug("InitialR2T:                   %s\n",
+			pr_debug("InitialR2T:                   %s\n",
 				param->value);
 		} else if (!strcmp(param->name, IMMEDIATEDATA)) {
 			ops->ImmediateData = !strcmp(param->value, YES);
