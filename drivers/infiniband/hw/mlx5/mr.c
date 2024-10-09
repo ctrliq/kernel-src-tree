@@ -1007,7 +1007,6 @@ int mlx5_ib_update_xlt(struct mlx5_ib_mr *mr, u64 idx, int npages,
 {
 	struct mlx5_ib_dev *dev = mr->dev;
 	struct device *ddev = dev->ib_dev.dev.parent;
-	struct mlx5_ib_ucontext *uctx = NULL;
 	int size;
 	void *xlt;
 	dma_addr_t dma;
@@ -1023,6 +1022,7 @@ int mlx5_ib_update_xlt(struct mlx5_ib_mr *mr, u64 idx, int npages,
 	size_t pages_to_map = 0;
 	size_t pages_iter = 0;
 	gfp_t gfp;
+	bool use_emergency_page = false;
 
 	if ((flags & MLX5_IB_UPD_XLT_INDIRECT) &&
 	    !umr_can_use_indirect_mkey(dev))
@@ -1053,12 +1053,11 @@ int mlx5_ib_update_xlt(struct mlx5_ib_mr *mr, u64 idx, int npages,
 	}
 
 	if (!xlt) {
-		uctx = to_mucontext(mr->ibmr.pd->uobject->context);
 		mlx5_ib_warn(dev, "Using XLT emergency buffer\n");
+		xlt = (void *)mlx5_ib_get_xlt_emergency_page();
 		size = PAGE_SIZE;
-		xlt = (void *)uctx->upd_xlt_page;
-		mutex_lock(&uctx->upd_xlt_page_mutex);
 		memset(xlt, 0, size);
+		use_emergency_page = true;
 	}
 	pages_iter = size / desc_size;
 	dma = dma_map_single(ddev, xlt, size, DMA_TO_DEVICE);
@@ -1122,8 +1121,8 @@ int mlx5_ib_update_xlt(struct mlx5_ib_mr *mr, u64 idx, int npages,
 	dma_unmap_single(ddev, dma, size, DMA_TO_DEVICE);
 
 free_xlt:
-	if (uctx)
-		mutex_unlock(&uctx->upd_xlt_page_mutex);
+	if (use_emergency_page)
+		mlx5_ib_put_xlt_emergency_page();
 	else
 		free_pages((unsigned long)xlt, get_order(size));
 
