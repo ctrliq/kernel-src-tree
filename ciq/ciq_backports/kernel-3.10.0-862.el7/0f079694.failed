@@ -1,0 +1,352 @@
+shmem: introduce shmem_inode_acct_block
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Mike Rapoport <rppt@linux.vnet.ibm.com>
+commit 0f0796945614b7523987f7eea32407421af4b1ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/0f079694.failed
+
+The shmem_acct_block and the update of used_blocks are following one
+another in all the places they are used.  Combine these two into a
+helper function.
+
+Link: http://lkml.kernel.org/r/1497939652-16528-3-git-send-email-rppt@linux.vnet.ibm.com
+	Signed-off-by: Mike Rapoport <rppt@linux.vnet.ibm.com>
+	Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Hillf Danton <hillf.zj@alibaba-inc.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Pavel Emelyanov <xemul@virtuozzo.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 0f0796945614b7523987f7eea32407421af4b1ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/shmem.c
+diff --cc mm/shmem.c
+index 570b71564183,b7d84c4f2a5c..000000000000
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@@ -173,9 -185,41 +173,41 @@@ static inline int shmem_acct_block(unsi
+  static inline void shmem_unacct_blocks(unsigned long flags, long pages)
+  {
+  	if (flags & VM_NORESERVE)
+ -		vm_unacct_memory(pages * VM_ACCT(PAGE_SIZE));
+ +		vm_unacct_memory(pages * VM_ACCT(PAGE_CACHE_SIZE));
+  }
+  
++ static inline bool shmem_inode_acct_block(struct inode *inode, long pages)
++ {
++ 	struct shmem_inode_info *info = SHMEM_I(inode);
++ 	struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
++ 
++ 	if (shmem_acct_block(info->flags, pages))
++ 		return false;
++ 
++ 	if (sbinfo->max_blocks) {
++ 		if (percpu_counter_compare(&sbinfo->used_blocks,
++ 					   sbinfo->max_blocks - pages) > 0)
++ 			goto unacct;
++ 		percpu_counter_add(&sbinfo->used_blocks, pages);
++ 	}
++ 
++ 	return true;
++ 
++ unacct:
++ 	shmem_unacct_blocks(info->flags, pages);
++ 	return false;
++ }
++ 
++ static inline void shmem_inode_unacct_blocks(struct inode *inode, long pages)
++ {
++ 	struct shmem_inode_info *info = SHMEM_I(inode);
++ 	struct shmem_sb_info *sbinfo = SHMEM_SB(inode->i_sb);
++ 
++ 	if (sbinfo->max_blocks)
++ 		percpu_counter_sub(&sbinfo->used_blocks, pages);
++ 	shmem_unacct_blocks(info->flags, pages);
++ }
++ 
+  static const struct super_operations shmem_ops;
+  static const struct address_space_operations shmem_aops;
+  static const struct file_operations shmem_file_operations;
+@@@ -250,6 -287,38 +279,41 @@@ static void shmem_recalc_inode(struct i
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ bool shmem_charge(struct inode *inode, long pages)
++ {
++ 	struct shmem_inode_info *info = SHMEM_I(inode);
++ 	unsigned long flags;
++ 
++ 	if (!shmem_inode_acct_block(inode, pages))
++ 		return false;
++ 
++ 	spin_lock_irqsave(&info->lock, flags);
++ 	info->alloced += pages;
++ 	inode->i_blocks += pages * BLOCKS_PER_PAGE;
++ 	shmem_recalc_inode(inode);
++ 	spin_unlock_irqrestore(&info->lock, flags);
++ 	inode->i_mapping->nrpages += pages;
++ 
++ 	return true;
++ }
++ 
++ void shmem_uncharge(struct inode *inode, long pages)
++ {
++ 	struct shmem_inode_info *info = SHMEM_I(inode);
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&info->lock, flags);
++ 	info->alloced -= pages;
++ 	inode->i_blocks -= pages * BLOCKS_PER_PAGE;
++ 	shmem_recalc_inode(inode);
++ 	spin_unlock_irqrestore(&info->lock, flags);
++ 
++ 	shmem_inode_unacct_blocks(inode, pages);
++ }
++ 
+++>>>>>>> 0f0796945614 (shmem: introduce shmem_inode_acct_block)
+  /*
+   * Replace item expected in radix tree by a new item, while holding tree lock.
+   */
+@@@ -991,32 -1463,38 +1055,66 @@@ static struct page *shmem_alloc_page(gf
+  
+  	return page;
+  }
+++<<<<<<< HEAD
+ +#else /* !CONFIG_NUMA */
+ +#ifdef CONFIG_TMPFS
+ +static inline void shmem_show_mpol(struct seq_file *seq, struct mempolicy *mpol)
+ +{
+++=======
++ 
++ static struct page *shmem_alloc_and_acct_page(gfp_t gfp,
++ 		struct inode *inode,
++ 		pgoff_t index, bool huge)
++ {
++ 	struct shmem_inode_info *info = SHMEM_I(inode);
++ 	struct page *page;
++ 	int nr;
++ 	int err = -ENOSPC;
++ 
++ 	if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGE_PAGECACHE))
++ 		huge = false;
++ 	nr = huge ? HPAGE_PMD_NR : 1;
++ 
++ 	if (!shmem_inode_acct_block(inode, nr))
++ 		goto failed;
++ 
++ 	if (huge)
++ 		page = shmem_alloc_hugepage(gfp, info, index);
++ 	else
++ 		page = shmem_alloc_page(gfp, info, index);
++ 	if (page) {
++ 		__SetPageLocked(page);
++ 		__SetPageSwapBacked(page);
++ 		return page;
++ 	}
++ 
++ 	err = -ENOMEM;
++ 	shmem_inode_unacct_blocks(inode, nr);
++ failed:
++ 	return ERR_PTR(err);
+++>>>>>>> 0f0796945614 (shmem: introduce shmem_inode_acct_block)
+  }
+ +#endif /* CONFIG_TMPFS */
+ +
+ +static inline struct page *shmem_swapin(swp_entry_t swap, gfp_t gfp,
+ +			struct shmem_inode_info *info, pgoff_t index)
+ +{
+ +	return swapin_readahead(swap, gfp, NULL, 0);
+ +}
+ +
+ +static inline struct page *shmem_alloc_page(gfp_t gfp,
+ +			struct shmem_inode_info *info, pgoff_t index)
+ +{
+ +	return alloc_page(gfp);
+ +}
+ +#endif /* CONFIG_NUMA */
+ +
+ +#if !defined(CONFIG_NUMA) || !defined(CONFIG_TMPFS)
+ +static inline struct mempolicy *shmem_get_sbmpol(struct shmem_sb_info *sbinfo)
+ +{
+ +	return NULL;
+ +}
+ +#endif
+  
+  /*
+   * When a page is moved from swapcache to shmem filecache (either by the
+@@@ -1225,43 -1725,80 +1323,96 @@@ repeat
+  
+  	} else {
+  		if (vma && userfaultfd_missing(vma)) {
+ -			*fault_type = handle_userfault(vmf, VM_UFFD_MISSING);
+ +			*fault_type = handle_userfault(vma,
+ +						       (unsigned long)
+ +						       vmf->virtual_address,
+ +						       vmf->flags,
+ +						       VM_UFFD_MISSING);
+  			return 0;
+  		}
+ +		if (shmem_acct_block(info->flags)) {
+ +			error = -ENOSPC;
+  
+++<<<<<<< HEAD
+++=======
++ 		/* shmem_symlink() */
++ 		if (mapping->a_ops != &shmem_aops)
++ 			goto alloc_nohuge;
++ 		if (shmem_huge == SHMEM_HUGE_DENY || sgp_huge == SGP_NOHUGE)
++ 			goto alloc_nohuge;
++ 		if (shmem_huge == SHMEM_HUGE_FORCE)
++ 			goto alloc_huge;
++ 		switch (sbinfo->huge) {
++ 			loff_t i_size;
++ 			pgoff_t off;
++ 		case SHMEM_HUGE_NEVER:
++ 			goto alloc_nohuge;
++ 		case SHMEM_HUGE_WITHIN_SIZE:
++ 			off = round_up(index, HPAGE_PMD_NR);
++ 			i_size = round_up(i_size_read(inode), PAGE_SIZE);
++ 			if (i_size >= HPAGE_PMD_SIZE &&
++ 					i_size >> PAGE_SHIFT >= off)
++ 				goto alloc_huge;
++ 			/* fallthrough */
++ 		case SHMEM_HUGE_ADVISE:
++ 			if (sgp_huge == SGP_HUGE)
++ 				goto alloc_huge;
++ 			/* TODO: implement fadvise() hints */
++ 			goto alloc_nohuge;
++ 		}
++ 
++ alloc_huge:
++ 		page = shmem_alloc_and_acct_page(gfp, inode, index, true);
++ 		if (IS_ERR(page)) {
++ alloc_nohuge:		page = shmem_alloc_and_acct_page(gfp, inode,
++ 					index, false);
++ 		}
++ 		if (IS_ERR(page)) {
++ 			int retry = 5;
++ 			error = PTR_ERR(page);
++ 			page = NULL;
++ 			if (error != -ENOSPC)
++ 				goto failed;
++ 			/*
++ 			 * Try to reclaim some spece by splitting a huge page
++ 			 * beyond i_size on the filesystem.
++ 			 */
++ 			while (retry--) {
++ 				int ret;
++ 				ret = shmem_unused_huge_shrink(sbinfo, NULL, 1);
++ 				if (ret == SHRINK_STOP)
++ 					break;
++ 				if (ret)
++ 					goto alloc_nohuge;
++ 			}
+++>>>>>>> 0f0796945614 (shmem: introduce shmem_inode_acct_block)
+  			goto failed;
+  		}
+ +		if (sbinfo->max_blocks) {
+ +			if (percpu_counter_compare(&sbinfo->used_blocks,
+ +						sbinfo->max_blocks) >= 0) {
+ +				error = -ENOSPC;
+ +				goto unacct;
+ +			}
+ +			percpu_counter_inc(&sbinfo->used_blocks);
+ +		}
+  
+ -		if (PageTransHuge(page))
+ -			hindex = round_down(index, HPAGE_PMD_NR);
+ -		else
+ -			hindex = index;
+ -
+ -		if (sgp == SGP_WRITE)
+ -			__SetPageReferenced(page);
+ +		page = shmem_alloc_page(gfp, info, index);
+ +		if (!page) {
+ +			error = -ENOMEM;
+ +			goto decused;
+ +		}
+  
+ -		error = mem_cgroup_try_charge(page, charge_mm, gfp, &memcg,
+ -				PageTransHuge(page));
+ +		SetPageSwapBacked(page);
+ +		__set_page_locked(page);
+ +		error = mem_cgroup_cache_charge(page, current->mm,
+ +						gfp & GFP_RECLAIM_MASK);
+  		if (error)
+ -			goto unacct;
+ -		error = radix_tree_maybe_preload_order(gfp & GFP_RECLAIM_MASK,
+ -				compound_order(page));
+ +			goto decused;
+ +		error = radix_tree_maybe_preload(gfp & GFP_RECLAIM_MASK);
+  		if (!error) {
+ -			error = shmem_add_to_page_cache(page, mapping, hindex,
+ -							NULL);
+ +			error = shmem_add_to_page_cache(page, mapping, index,
+ +							gfp, NULL);
+  			radix_tree_preload_end();
+  		}
+  		if (error) {
+@@@ -1312,23 -1879,16 +1463,34 @@@ clear
+  	/*
+  	 * Error recovery.
+  	 */
+++<<<<<<< HEAD
+ +trunc:
+ +	info = SHMEM_I(inode);
+ +	ClearPageDirty(page);
+ +	delete_from_page_cache(page);
+ +	spin_lock(&info->lock);
+ +	info->alloced--;
+ +	inode->i_blocks -= BLOCKS_PER_PAGE;
+ +	spin_unlock(&info->lock);
+ +decused:
+ +	sbinfo = SHMEM_SB(inode->i_sb);
+ +	if (sbinfo->max_blocks)
+ +		percpu_counter_add(&sbinfo->used_blocks, -1);
+ +unacct:
+ +	shmem_unacct_blocks(info->flags, 1);
+++=======
++ unacct:
++ 	shmem_inode_unacct_blocks(inode, 1 << compound_order(page));
++ 
++ 	if (PageTransHuge(page)) {
++ 		unlock_page(page);
++ 		put_page(page);
++ 		goto alloc_nohuge;
++ 	}
+++>>>>>>> 0f0796945614 (shmem: introduce shmem_inode_acct_block)
+  failed:
+ -	if (swap.val && !shmem_confirm_swap(mapping, index, swap))
+ +	if (swap.val && error != -EINVAL &&
+ +	    !shmem_confirm_swap(mapping, index, swap))
+  		error = -EEXIST;
+  unlock:
+  	if (page) {
+@@@ -1571,14 -2227,8 +1732,12 @@@ int shmem_mcopy_atomic_pte(struct mm_st
+  	int ret;
+  
+  	ret = -ENOMEM;
+++<<<<<<< HEAD
+ +	if (shmem_acct_block(info->flags))
+++=======
++ 	if (!shmem_inode_acct_block(inode, 1))
+++>>>>>>> 0f0796945614 (shmem: introduce shmem_inode_acct_block)
+  		goto out;
+- 	if (sbinfo->max_blocks) {
+- 		if (percpu_counter_compare(&sbinfo->used_blocks,
+- 					   sbinfo->max_blocks) >= 0)
+- 			goto out_unacct_blocks;
+- 		percpu_counter_inc(&sbinfo->used_blocks);
+- 	}
+  
+  	if (!*pagep) {
+  		page = shmem_alloc_page(gfp, info, pgoff);
+* Unmerged path mm/shmem.c
