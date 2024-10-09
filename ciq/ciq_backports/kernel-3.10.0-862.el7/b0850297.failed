@@ -1,0 +1,164 @@
+block: pass 'run_queue' to blk_mq_request_bypass_insert
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [block] pass 'run_queue' to blk_mq_request_bypass_insert (Ming Lei) [1471956]
+Rebuild_FUZZ: 93.20%
+commit-author Ming Lei <ming.lei@redhat.com>
+commit b0850297c749ea79a5717d597931366b3d7f4b09
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b0850297.failed
+
+Block flush need this function without running the queue, so add a
+parameter controlling whether we run it or not.
+
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit b0850297c749ea79a5717d597931366b3d7f4b09)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+#	block/blk-mq.c
+#	block/blk-mq.h
+diff --cc block/blk-core.c
+index df55e6267498,b8d1aa2d1008..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -2193,8 -2392,13 +2193,18 @@@ int blk_insert_cloned_request(struct re
+  	if (q->mq_ops) {
+  		if (blk_queue_io_stat(q))
+  			blk_account_io_start(rq, true);
+++<<<<<<< HEAD
+ +		blk_mq_insert_request(rq, false, true, false);
+ +		return 0;
+++=======
++ 		/*
++ 		 * Since we have a scheduler attached on the top device,
++ 		 * bypass a potential scheduler on the bottom device for
++ 		 * insert.
++ 		 */
++ 		blk_mq_request_bypass_insert(rq, true);
++ 		return BLK_STS_OK;
+++>>>>>>> b0850297c749 (block: pass 'run_queue' to blk_mq_request_bypass_insert)
+  	}
+  
+  	spin_lock_irqsave(q->queue_lock, flags);
+diff --cc block/blk-mq.c
+index d9bfe0c6bc0e,021562bd5d2c..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -1160,36 -1488,27 +1160,49 @@@ static void __blk_mq_insert_request(str
+  	blk_mq_hctx_mark_pending(hctx, ctx);
+  }
+  
+++<<<<<<< HEAD
+ +void blk_mq_insert_request(struct request *rq, bool at_head, bool run_queue,
+ +			   bool async)
+++=======
++ /*
++  * Should only be used carefully, when the caller knows we want to
++  * bypass a potential IO scheduler on the target device.
++  */
++ void blk_mq_request_bypass_insert(struct request *rq, bool run_queue)
+++>>>>>>> b0850297c749 (block: pass 'run_queue' to blk_mq_request_bypass_insert)
+  {
+  	struct blk_mq_ctx *ctx = rq->mq_ctx;
+ -	struct blk_mq_hw_ctx *hctx = blk_mq_map_queue(rq->q, ctx->cpu);
+ +	struct request_queue *q = rq->q;
+ +	struct blk_mq_hw_ctx *hctx;
+  
+ -	spin_lock(&hctx->lock);
+ -	list_add_tail(&rq->queuelist, &hctx->dispatch);
+ -	spin_unlock(&hctx->lock);
+ +	hctx = q->mq_ops->map_queue(q, ctx->cpu);
+  
+++<<<<<<< HEAD
+ +	spin_lock(&ctx->lock);
+ +	__blk_mq_insert_request(hctx, rq, at_head);
+ +	spin_unlock(&ctx->lock);
+ +
+ +	if (run_queue)
+ +		blk_mq_run_hw_queue(hctx, async);
+++=======
++ 	if (run_queue)
++ 		blk_mq_run_hw_queue(hctx, false);
+++>>>>>>> b0850297c749 (block: pass 'run_queue' to blk_mq_request_bypass_insert)
+  }
+  
+ -void blk_mq_insert_requests(struct blk_mq_hw_ctx *hctx, struct blk_mq_ctx *ctx,
+ -			    struct list_head *list)
+ +static void blk_mq_insert_requests(struct request_queue *q,
+ +				     struct blk_mq_ctx *ctx,
+ +				     struct list_head *list,
+ +				     int depth,
+ +				     bool from_schedule)
+  
+  {
+ +	struct blk_mq_hw_ctx *hctx;
+ +
+ +	trace_block_unplug(q, depth, !from_schedule);
+ +
+ +	hctx = q->mq_ops->map_queue(q, ctx->cpu);
+ +
+  	/*
+  	 * preemption doesn't flush plug list, so it's possible ctx->cpu is
+  	 * offline now
+diff --cc block/blk-mq.h
+index 2d50f02667c4,9fffec0ad8e9..000000000000
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@@ -33,20 -30,35 +33,41 @@@ void blk_mq_freeze_queue(struct request
+  void blk_mq_free_queue(struct request_queue *q);
+  int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr);
+  void blk_mq_wake_waiters(struct request_queue *q);
+ -bool blk_mq_dispatch_rq_list(struct request_queue *, struct list_head *, bool);
+ -void blk_mq_flush_busy_ctxs(struct blk_mq_hw_ctx *hctx, struct list_head *list);
+ -bool blk_mq_hctx_has_pending(struct blk_mq_hw_ctx *hctx);
+ -bool blk_mq_get_driver_tag(struct request *rq, struct blk_mq_hw_ctx **hctx,
+ -				bool wait);
+ -struct request *blk_mq_dequeue_from_ctx(struct blk_mq_hw_ctx *hctx,
+ -					struct blk_mq_ctx *start);
+ +bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *, struct list_head *);
+  
+  /*
+ - * Internal helpers for allocating/freeing the request map
+ + * CPU hotplug helpers
+   */
+++<<<<<<< HEAD
+ +struct blk_mq_cpu_notifier;
+ +void blk_mq_init_cpu_notifier(struct blk_mq_cpu_notifier *notifier,
+ +			      int (*fn)(void *, unsigned long, unsigned int),
+ +			      void *data);
+ +void blk_mq_register_cpu_notifier(struct blk_mq_cpu_notifier *notifier);
+ +void blk_mq_unregister_cpu_notifier(struct blk_mq_cpu_notifier *notifier);
+ +void blk_mq_cpu_init(void);
+ +void blk_mq_enable_hotplug(void);
+ +void blk_mq_disable_hotplug(void);
+++=======
++ void blk_mq_free_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
++ 		     unsigned int hctx_idx);
++ void blk_mq_free_rq_map(struct blk_mq_tags *tags);
++ struct blk_mq_tags *blk_mq_alloc_rq_map(struct blk_mq_tag_set *set,
++ 					unsigned int hctx_idx,
++ 					unsigned int nr_tags,
++ 					unsigned int reserved_tags);
++ int blk_mq_alloc_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
++ 		     unsigned int hctx_idx, unsigned int depth);
++ 
++ /*
++  * Internal helpers for request insertion into sw queues
++  */
++ void __blk_mq_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
++ 				bool at_head);
++ void blk_mq_request_bypass_insert(struct request *rq, bool run_queue);
++ void blk_mq_insert_requests(struct blk_mq_hw_ctx *hctx, struct blk_mq_ctx *ctx,
++ 				struct list_head *list);
+++>>>>>>> b0850297c749 (block: pass 'run_queue' to blk_mq_request_bypass_insert)
+  
+  /*
+   * CPU -> queue mappings
+* Unmerged path block/blk-core.c
+* Unmerged path block/blk-mq.c
+* Unmerged path block/blk-mq.h
