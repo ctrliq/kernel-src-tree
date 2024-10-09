@@ -1,0 +1,380 @@
+net: add alloc_skb_with_frags() helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] add alloc_skb_with_frags() helper (Neil Horman) [1364038]
+Rebuild_FUZZ: 92.96%
+commit-author Eric Dumazet <edumazet@google.com>
+commit 2e4e44107176d552f8bb1bb76053e850e3809841
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/2e4e4410.failed
+
+Extract from sock_alloc_send_pskb() code building skb with frags,
+so that we can reuse this in other contexts.
+
+Intent is to use it from tcp_send_rcvq(), tcp_collapse(), ...
+
+We also want to replace some skb_linearize() calls to a more reliable
+strategy in pathological cases where we need to reduce number of frags.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2e4e44107176d552f8bb1bb76053e850e3809841)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+#	net/core/skbuff.c
+diff --cc include/linux/skbuff.h
+index d816dfc48c6b,f1bfa3781c75..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -845,34 -769,11 +845,42 @@@ static inline struct sk_buff *alloc_skb
+  	return __alloc_skb(size, priority, 0, NUMA_NO_NODE);
+  }
+  
+++<<<<<<< HEAD
+ +/* Layout of fast clones : [skb1][skb2][fclone_ref] */
+ +struct sk_buff_fclones {
+ +	struct sk_buff	skb1;
+ +
+ +	struct sk_buff	skb2;
+ +
+ +	atomic_t	fclone_ref;
+ +};
+ +
+ +/**
+ + *	skb_fclone_busy - check if fclone is busy
+ + *	@skb: buffer
+ + *
+ + * Returns true is skb is a fast clone, and its clone is not freed.
+ + * Some drivers call skb_orphan() in their ndo_start_xmit(),
+ + * so we also check that this didnt happen.
+ + */
+ +static inline bool skb_fclone_busy(const struct sock *sk,
+ +				   const struct sk_buff *skb)
+ +{
+ +	const struct sk_buff_fclones *fclones;
+ +
+ +	fclones = container_of(skb, struct sk_buff_fclones, skb1);
+ +
+ +	return skb->fclone == SKB_FCLONE_ORIG &&
+ +	       fclones->skb2.fclone == SKB_FCLONE_CLONE &&
+ +	       fclones->skb2.sk == sk;
+ +}
+++=======
++ struct sk_buff *alloc_skb_with_frags(unsigned long header_len,
++ 				     unsigned long data_len,
++ 				     int max_page_order,
++ 				     int *errcode,
++ 				     gfp_t gfp_mask);
+++>>>>>>> 2e4e44107176 (net: add alloc_skb_with_frags() helper)
+  
+  static inline struct sk_buff *alloc_skb_fclone(unsigned int size,
+  					       gfp_t priority)
+diff --cc net/core/skbuff.c
+index d6348adc7de0,06a8feb10099..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -4008,110 -4103,80 +4008,190 @@@ err_free
+  }
+  EXPORT_SYMBOL(skb_vlan_untag);
+  
+++<<<<<<< HEAD
+ +int skb_ensure_writable(struct sk_buff *skb, int write_len)
+ +{
+ +	if (!pskb_may_pull(skb, write_len))
+ +		return -ENOMEM;
+ +
+ +	if (!skb_cloned(skb) || skb_clone_writable(skb, write_len))
+ +		return 0;
+ +
+ +	return pskb_expand_head(skb, 0, 0, GFP_ATOMIC);
+ +}
+ +EXPORT_SYMBOL(skb_ensure_writable);
+ +
+ +/* remove VLAN header from packet and update csum accordingly. */
+ +static int __skb_vlan_pop(struct sk_buff *skb, u16 *vlan_tci)
+ +{
+ +	struct vlan_hdr *vhdr;
+ +	unsigned int offset = skb->data - skb_mac_header(skb);
+ +	int err;
+ +
+ +	__skb_push(skb, offset);
+ +	err = skb_ensure_writable(skb, VLAN_ETH_HLEN);
+ +	if (unlikely(err))
+ +		goto pull;
+ +
+ +	skb_postpull_rcsum(skb, skb->data + (2 * ETH_ALEN), VLAN_HLEN);
+ +
+ +	vhdr = (struct vlan_hdr *)(skb->data + ETH_HLEN);
+ +	*vlan_tci = ntohs(vhdr->h_vlan_TCI);
+ +
+ +	memmove(skb->data + VLAN_HLEN, skb->data, 2 * ETH_ALEN);
+ +	__skb_pull(skb, VLAN_HLEN);
+ +
+ +	vlan_set_encap_proto(skb, vhdr);
+ +	skb->mac_header += VLAN_HLEN;
+ +
+ +	if (skb_network_offset(skb) < ETH_HLEN)
+ +		skb_set_network_header(skb, ETH_HLEN);
+ +
+ +	skb_reset_mac_len(skb);
+ +pull:
+ +	__skb_pull(skb, offset);
+ +
+ +	return err;
+ +}
+ +
+ +int skb_vlan_pop(struct sk_buff *skb)
+ +{
+ +	u16 vlan_tci;
+ +	__be16 vlan_proto;
+ +	int err;
+ +
+ +	if (likely(skb_vlan_tag_present(skb))) {
+ +		skb->vlan_tci = 0;
+ +	} else {
+ +		if (unlikely((skb->protocol != htons(ETH_P_8021Q) &&
+ +			      skb->protocol != htons(ETH_P_8021AD)) ||
+ +			     skb->len < VLAN_ETH_HLEN))
+ +			return 0;
+ +
+ +		err = __skb_vlan_pop(skb, &vlan_tci);
+ +		if (err)
+ +			return err;
+ +	}
+ +	/* move next vlan tag to hw accel tag */
+ +	if (likely((skb->protocol != htons(ETH_P_8021Q) &&
+ +		    skb->protocol != htons(ETH_P_8021AD)) ||
+ +		   skb->len < VLAN_ETH_HLEN))
+ +		return 0;
+ +
+ +	vlan_proto = skb->protocol;
+ +	err = __skb_vlan_pop(skb, &vlan_tci);
+ +	if (unlikely(err))
+ +		return err;
+ +
+ +	__vlan_hwaccel_put_tag(skb, vlan_proto, vlan_tci);
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(skb_vlan_pop);
+ +
+ +int skb_vlan_push(struct sk_buff *skb, __be16 vlan_proto, u16 vlan_tci)
+ +{
+ +	if (skb_vlan_tag_present(skb)) {
+ +		unsigned int offset = skb->data - skb_mac_header(skb);
+ +		int err;
+ +
+ +		/* __vlan_insert_tag expect skb->data pointing to mac header.
+ +		 * So change skb->data before calling it and change back to
+ +		 * original position later
+ +		 */
+ +		__skb_push(skb, offset);
+ +		err = __vlan_insert_tag(skb, skb->vlan_proto,
+ +					skb_vlan_tag_get(skb));
+ +		if (err) {
+ +			__skb_pull(skb, offset);
+ +			return err;
+ +		}
+ +
+ +		skb->protocol = skb->vlan_proto;
+ +		skb->mac_len += VLAN_HLEN;
+ +
+ +		skb_postpush_rcsum(skb, skb->data + (2 * ETH_ALEN), VLAN_HLEN);
+ +		__skb_pull(skb, offset);
+ +	}
+ +	__vlan_hwaccel_put_tag(skb, vlan_proto, vlan_tci);
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(skb_vlan_push);
+++=======
++ /**
++  * alloc_skb_with_frags - allocate skb with page frags
++  *
++  * header_len: size of linear part
++  * data_len: needed length in frags
++  * max_page_order: max page order desired.
++  * errcode: pointer to error code if any
++  * gfp_mask: allocation mask
++  *
++  * This can be used to allocate a paged skb, given a maximal order for frags.
++  */
++ struct sk_buff *alloc_skb_with_frags(unsigned long header_len,
++ 				     unsigned long data_len,
++ 				     int max_page_order,
++ 				     int *errcode,
++ 				     gfp_t gfp_mask)
++ {
++ 	int npages = (data_len + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
++ 	unsigned long chunk;
++ 	struct sk_buff *skb;
++ 	struct page *page;
++ 	gfp_t gfp_head;
++ 	int i;
++ 
++ 	*errcode = -EMSGSIZE;
++ 	/* Note this test could be relaxed, if we succeed to allocate
++ 	 * high order pages...
++ 	 */
++ 	if (npages > MAX_SKB_FRAGS)
++ 		return NULL;
++ 
++ 	gfp_head = gfp_mask;
++ 	if (gfp_head & __GFP_WAIT)
++ 		gfp_head |= __GFP_REPEAT;
++ 
++ 	*errcode = -ENOBUFS;
++ 	skb = alloc_skb(header_len, gfp_head);
++ 	if (!skb)
++ 		return NULL;
++ 
++ 	skb->truesize += npages << PAGE_SHIFT;
++ 
++ 	for (i = 0; npages > 0; i++) {
++ 		int order = max_page_order;
++ 
++ 		while (order) {
++ 			if (npages >= 1 << order) {
++ 				page = alloc_pages(gfp_mask |
++ 						   __GFP_COMP |
++ 						   __GFP_NOWARN |
++ 						   __GFP_NORETRY,
++ 						   order);
++ 				if (page)
++ 					goto fill_page;
++ 				/* Do not retry other high order allocations */
++ 				order = 1;
++ 				max_page_order = 0;
++ 			}
++ 			order--;
++ 		}
++ 		page = alloc_page(gfp_mask);
++ 		if (!page)
++ 			goto failure;
++ fill_page:
++ 		chunk = min_t(unsigned long, data_len,
++ 			      PAGE_SIZE << order);
++ 		skb_fill_page_desc(skb, i, page, 0, chunk);
++ 		data_len -= chunk;
++ 		npages -= 1 << order;
++ 	}
++ 	return skb;
++ 
++ failure:
++ 	kfree_skb(skb);
++ 	return NULL;
++ }
++ EXPORT_SYMBOL(alloc_skb_with_frags);
+++>>>>>>> 2e4e44107176 (net: add alloc_skb_with_frags() helper)
+* Unmerged path include/linux/skbuff.h
+* Unmerged path net/core/skbuff.c
+diff --git a/net/core/sock.c b/net/core/sock.c
+index 4efe87f66737..305715950ccc 100644
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -1769,21 +1769,12 @@ struct sk_buff *sock_alloc_send_pskb(struct sock *sk, unsigned long header_len,
+ 				     unsigned long data_len, int noblock,
+ 				     int *errcode, int max_page_order)
+ {
+-	struct sk_buff *skb = NULL;
+-	unsigned long chunk;
+-	gfp_t gfp_mask;
++	struct sk_buff *skb;
+ 	long timeo;
+ 	int err;
+-	int npages = (data_len + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
+-	struct page *page;
+-	int i;
+-
+-	err = -EMSGSIZE;
+-	if (npages > MAX_SKB_FRAGS)
+-		goto failure;
+ 
+ 	timeo = sock_sndtimeo(sk, noblock);
+-	while (!skb) {
++	for (;;) {
+ 		err = sock_error(sk);
+ 		if (err != 0)
+ 			goto failure;
+@@ -1792,66 +1783,27 @@ struct sk_buff *sock_alloc_send_pskb(struct sock *sk, unsigned long header_len,
+ 		if (sk->sk_shutdown & SEND_SHUTDOWN)
+ 			goto failure;
+ 
+-		if (atomic_read(&sk->sk_wmem_alloc) >= sk->sk_sndbuf) {
+-			set_bit(SOCK_ASYNC_NOSPACE, &sk->sk_socket->flags);
+-			set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
+-			err = -EAGAIN;
+-			if (!timeo)
+-				goto failure;
+-			if (signal_pending(current))
+-				goto interrupted;
+-			timeo = sock_wait_for_wmem(sk, timeo);
+-			continue;
+-		}
+-
+-		err = -ENOBUFS;
+-		gfp_mask = sk->sk_allocation;
+-		if (gfp_mask & __GFP_WAIT)
+-			gfp_mask |= __GFP_REPEAT;
++		if (sk_wmem_alloc_get(sk) < sk->sk_sndbuf)
++			break;
+ 
+-		skb = alloc_skb(header_len, gfp_mask);
+-		if (!skb)
++		set_bit(SOCK_ASYNC_NOSPACE, &sk->sk_socket->flags);
++		set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
++		err = -EAGAIN;
++		if (!timeo)
+ 			goto failure;
+-
+-		skb->truesize += data_len;
+-
+-		for (i = 0; npages > 0; i++) {
+-			int order = max_page_order;
+-
+-			while (order) {
+-				if (npages >= 1 << order) {
+-					page = alloc_pages(sk->sk_allocation |
+-							   __GFP_COMP |
+-							   __GFP_NOWARN |
+-							   __GFP_NORETRY,
+-							   order);
+-					if (page)
+-						goto fill_page;
+-					/* Do not retry other high order allocations */
+-					order = 1;
+-					max_page_order = 0;
+-				}
+-				order--;
+-			}
+-			page = alloc_page(sk->sk_allocation);
+-			if (!page)
+-				goto failure;
+-fill_page:
+-			chunk = min_t(unsigned long, data_len,
+-				      PAGE_SIZE << order);
+-			skb_fill_page_desc(skb, i, page, 0, chunk);
+-			data_len -= chunk;
+-			npages -= 1 << order;
+-		}
++		if (signal_pending(current))
++			goto interrupted;
++		timeo = sock_wait_for_wmem(sk, timeo);
+ 	}
+-
+-	skb_set_owner_w(skb, sk);
++	skb = alloc_skb_with_frags(header_len, data_len, max_page_order,
++				   errcode, sk->sk_allocation);
++	if (skb)
++		skb_set_owner_w(skb, sk);
+ 	return skb;
+ 
+ interrupted:
+ 	err = sock_intr_errno(timeo);
+ failure:
+-	kfree_skb(skb);
+ 	*errcode = err;
+ 	return NULL;
+ }
