@@ -1,0 +1,126 @@
+KVM: x86: preparatory changes for APICv cleanups
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 810e6defcca4d05275aa15c2872c0a4949178fcb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/810e6def.failed
+
+Add return value to __kvm_apic_update_irr/kvm_apic_update_irr.
+Move vmx_sync_pir_to_irr around.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 810e6defcca4d05275aa15c2872c0a4949178fcb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 4de6d6513aff,4ac9b484e244..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -8302,9 -8722,24 +8286,29 @@@ static void vmx_hwapic_irr_update(struc
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void vmx_load_eoi_exitmap(struct kvm_vcpu *vcpu)
+++=======
++ static void vmx_sync_pir_to_irr(struct kvm_vcpu *vcpu)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 
++ 	if (!pi_test_on(&vmx->pi_desc))
++ 		return;
++ 
++ 	pi_clear_on(&vmx->pi_desc);
++ 	/*
++ 	 * IOMMU can write to PIR.ON, so the barrier matters even on UP.
++ 	 * But on x86 this is just a compiler barrier anyway.
++ 	 */
++ 	smp_mb__after_atomic();
++ 	kvm_apic_update_irr(vcpu, vmx->pi_desc.pir);
++ }
++ 
++ static void vmx_load_eoi_exitmap(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap)
+++>>>>>>> 810e6defcca4 (KVM: x86: preparatory changes for APICv cleanups)
+  {
+ +	u64 *eoi_exit_bitmap = vcpu->arch.eoi_exit_bitmap;
+  	if (!kvm_vcpu_apicv_active(vcpu))
+  		return;
+  
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index b41723334890..43186b7b766f 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -340,7 +340,7 @@ static int find_highest_vector(void *bitmap)
+ 	     vec >= 0; vec -= APIC_VECTORS_PER_REG) {
+ 		reg = bitmap + REG_POS(vec);
+ 		if (*reg)
+-			return fls(*reg) - 1 + vec;
++			return __fls(*reg) + vec;
+ 	}
+ 
+ 	return -1;
+@@ -360,27 +360,36 @@ static u8 count_vectors(void *bitmap)
+ 	return count;
+ }
+ 
+-void __kvm_apic_update_irr(u32 *pir, void *regs)
++int __kvm_apic_update_irr(u32 *pir, void *regs)
+ {
+-	u32 i, pir_val;
++	u32 i, vec;
++	u32 pir_val, irr_val;
++	int max_irr = -1;
+ 
+-	for (i = 0; i <= 7; i++) {
++	for (i = vec = 0; i <= 7; i++, vec += 32) {
+ 		pir_val = READ_ONCE(pir[i]);
++		irr_val = *((u32 *)(regs + APIC_IRR + i * 0x10));
+ 		if (pir_val) {
+-			pir_val = xchg(&pir[i], 0);
+-			*((u32 *)(regs + APIC_IRR + i * 0x10)) |= pir_val;
++			irr_val |= xchg(&pir[i], 0);
++			*((u32 *)(regs + APIC_IRR + i * 0x10)) = irr_val;
+ 		}
++		if (irr_val)
++			max_irr = __fls(irr_val) + vec;
+ 	}
++
++	return max_irr;
+ }
+ EXPORT_SYMBOL_GPL(__kvm_apic_update_irr);
+ 
+-void kvm_apic_update_irr(struct kvm_vcpu *vcpu, u32 *pir)
++int kvm_apic_update_irr(struct kvm_vcpu *vcpu, u32 *pir)
+ {
+ 	struct kvm_lapic *apic = vcpu->arch.apic;
++	int max_irr;
+ 
+-	__kvm_apic_update_irr(pir, apic->regs);
++	max_irr = __kvm_apic_update_irr(pir, apic->regs);
+ 
+ 	kvm_make_request(KVM_REQ_EVENT, vcpu);
++	return max_irr;
+ }
+ EXPORT_SYMBOL_GPL(kvm_apic_update_irr);
+ 
+diff --git a/arch/x86/kvm/lapic.h b/arch/x86/kvm/lapic.h
+index a08ef06557c6..dd4a1c663887 100644
+--- a/arch/x86/kvm/lapic.h
++++ b/arch/x86/kvm/lapic.h
+@@ -69,8 +69,8 @@ int kvm_lapic_reg_read(struct kvm_lapic *apic, u32 offset, int len,
+ bool kvm_apic_match_dest(struct kvm_vcpu *vcpu, struct kvm_lapic *source,
+ 			   int short_hand, unsigned int dest, int dest_mode);
+ 
+-void __kvm_apic_update_irr(u32 *pir, void *regs);
+-void kvm_apic_update_irr(struct kvm_vcpu *vcpu, u32 *pir);
++int __kvm_apic_update_irr(u32 *pir, void *regs);
++int kvm_apic_update_irr(struct kvm_vcpu *vcpu, u32 *pir);
+ void kvm_apic_update_ppr(struct kvm_vcpu *vcpu);
+ int kvm_apic_set_irq(struct kvm_vcpu *vcpu, struct kvm_lapic_irq *irq,
+ 		     struct dest_map *dest_map);
+* Unmerged path arch/x86/kvm/vmx.c
