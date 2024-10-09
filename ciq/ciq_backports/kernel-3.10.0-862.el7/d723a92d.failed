@@ -1,0 +1,161 @@
+sysfs/bin: Fix size handling overflow for bin_attribute
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Benjamin Herrenschmidt <benh@kernel.crashing.org>
+commit d723a92dd465d549bf79dd481c09d59f0be02936
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d723a92d.failed
+
+While looking at the code, I noticed that bin_attribute read() and write()
+ops copy the inode size into an int for futher comparisons.
+
+Some bin_attributes can be fairly large. For example, pci creates some for
+BARs set to the BAR size and giant BARs are around the corner, so this is
+going to break something somewhere eventually.
+
+Let's use the right type.
+
+[adjust for seqfile conversions, only needed for bin_read() - gkh]
+
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit d723a92dd465d549bf79dd481c09d59f0be02936)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/sysfs/file.c
+diff --cc fs/sysfs/file.c
+index d8887c896abc,5d818df7250b..000000000000
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@@ -98,13 -140,118 +98,118 @@@ static int fill_read_buffer(struct dent
+  		/* Try to struggle along */
+  		count = PAGE_SIZE - 1;
+  	}
+++<<<<<<< HEAD
+ +	if (count >= 0) {
+ +		buffer->needs_read_fill = 0;
+ +		buffer->count = count;
+++=======
++ 	seq_commit(sf, count);
++ 	return 0;
++ }
++ 
++ /*
++  * Read method for bin files.  As reading a bin file can have side-effects,
++  * the exact offset and bytes specified in read(2) call should be passed to
++  * the read callback making it difficult to use seq_file.  Implement
++  * simplistic custom buffering for bin files.
++  */
++ static ssize_t sysfs_bin_read(struct file *file, char __user *userbuf,
++ 			      size_t bytes, loff_t *off)
++ {
++ 	struct sysfs_open_file *of = sysfs_of(file);
++ 	struct bin_attribute *battr = of->sd->s_bin_attr.bin_attr;
++ 	struct kobject *kobj = of->sd->s_parent->s_dir.kobj;
++ 	loff_t size = file_inode(file)->i_size;
++ 	int count = min_t(size_t, bytes, PAGE_SIZE);
++ 	loff_t offs = *off;
++ 	char *buf;
++ 
++ 	if (!bytes)
++ 		return 0;
++ 
++ 	if (size) {
++ 		if (offs > size)
++ 			return 0;
++ 		if (offs + count > size)
++ 			count = size - offs;
++ 	}
++ 
++ 	buf = kmalloc(count, GFP_KERNEL);
++ 	if (!buf)
++ 		return -ENOMEM;
++ 
++ 	/* need of->sd for battr, its parent for kobj */
++ 	mutex_lock(&of->mutex);
++ 	if (!sysfs_get_active(of->sd)) {
++ 		count = -ENODEV;
++ 		mutex_unlock(&of->mutex);
++ 		goto out_free;
++ 	}
++ 
++ 	if (battr->read)
++ 		count = battr->read(file, kobj, battr, buf, offs, count);
++ 	else
++ 		count = -EIO;
++ 
++ 	sysfs_put_active(of->sd);
++ 	mutex_unlock(&of->mutex);
++ 
++ 	if (count < 0)
++ 		goto out_free;
++ 
++ 	if (copy_to_user(userbuf, buf, count)) {
++ 		count = -EFAULT;
++ 		goto out_free;
++ 	}
++ 
++ 	pr_debug("offs = %lld, *off = %lld, count = %d\n", offs, *off, count);
++ 
++ 	*off = offs + count;
++ 
++  out_free:
++ 	kfree(buf);
++ 	return count;
++ }
++ 
++ /**
++  * flush_write_buffer - push buffer to kobject
++  * @of: open file
++  * @buf: data buffer for file
++  * @off: file offset to write to
++  * @count: number of bytes
++  *
++  * Get the correct pointers for the kobject and the attribute we're dealing
++  * with, then call the store() method for it with @buf.
++  */
++ static int flush_write_buffer(struct sysfs_open_file *of, char *buf, loff_t off,
++ 			      size_t count)
++ {
++ 	struct kobject *kobj = of->sd->s_parent->s_dir.kobj;
++ 	int rc = 0;
++ 
++ 	/*
++ 	 * Need @of->sd for attr and ops, its parent for kobj.  @of->mutex
++ 	 * nests outside active ref and is just to ensure that the ops
++ 	 * aren't called concurrently for the same open file.
++ 	 */
++ 	mutex_lock(&of->mutex);
++ 	if (!sysfs_get_active(of->sd)) {
++ 		mutex_unlock(&of->mutex);
++ 		return -ENODEV;
++ 	}
++ 
++ 	if (sysfs_is_bin(of->sd)) {
++ 		struct bin_attribute *battr = of->sd->s_bin_attr.bin_attr;
++ 
++ 		rc = -EIO;
++ 		if (battr->write)
++ 			rc = battr->write(of->file, kobj, battr, buf, off,
++ 					  count);
+++>>>>>>> d723a92dd465 (sysfs/bin: Fix size handling overflow for bin_attribute)
+  	} else {
+ -		const struct sysfs_ops *ops = sysfs_file_ops(of->sd);
+ -
+ -		rc = ops->store(kobj, of->sd->s_attr.attr, buf, count);
+ +		ret = count;
+  	}
+ -
+ -	sysfs_put_active(of->sd);
+ -	mutex_unlock(&of->mutex);
+ -
+ -	return rc;
+ +	return ret;
+  }
+  
+  /**
+* Unmerged path fs/sysfs/file.c
