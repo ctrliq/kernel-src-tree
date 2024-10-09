@@ -1,0 +1,141 @@
+md/raid10: add rcu protection to rdev access in raid10_sync_request.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [md] raid10: add rcu protection to rdev access in raid10_sync_request (Jes Sorensen) [1380016]
+Rebuild_FUZZ: 96.97%
+commit-author NeilBrown <neilb@suse.com>
+commit f90145f317efad72e6552cecb09ab7a4e5d1e404
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f90145f3.failed
+
+mirrors[].rdev can become NULL at any point unless:
+  - a counted reference is held
+  - ->reconfig_mutex is held, or
+  - rcu_read_lock() is held
+
+Previously they could not become NULL during a resync/recovery/reshape either.
+However when remove_and_add_spares() was added to hot_remove_disk(), that
+changed.
+
+So raid10_sync_request didn't previously need to protect rdev access,
+but now it does.
+
+Fix missed check(Shaohua)
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit f90145f317efad72e6552cecb09ab7a4e5d1e404)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid10.c
+diff --cc drivers/md/raid10.c
+index b37f3fbc3165,cb997c63bfe0..000000000000
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@@ -3206,9 -3082,9 +3222,15 @@@ static sector_t raid10_sync_request(str
+  					bio->bi_private = r10_bio;
+  					bio->bi_end_io = end_sync_write;
+  					bio->bi_rw = WRITE;
+++<<<<<<< HEAD
+ +					bio->bi_sector = to_addr
+ +						+ rdev->data_offset;
+ +					bio->bi_bdev = rdev->bdev;
+++=======
++ 					bio->bi_iter.bi_sector = to_addr
++ 						+ mrdev->data_offset;
++ 					bio->bi_bdev = mrdev->bdev;
+++>>>>>>> f90145f317ef (md/raid10: add rcu protection to rdev access in raid10_sync_request.)
+  					atomic_inc(&r10_bio->remaining);
+  				} else
+  					r10_bio->devs[1].bio->bi_end_io = NULL;
+@@@ -3235,8 -3110,9 +3256,14 @@@
+  				bio->bi_private = r10_bio;
+  				bio->bi_end_io = end_sync_write;
+  				bio->bi_rw = WRITE;
+++<<<<<<< HEAD
+ +				bio->bi_sector = to_addr + rdev->data_offset;
+ +				bio->bi_bdev = rdev->bdev;
+++=======
++ 				bio->bi_iter.bi_sector = to_addr +
++ 					mreplace->data_offset;
++ 				bio->bi_bdev = mreplace->bdev;
+++>>>>>>> f90145f317ef (md/raid10: add rcu protection to rdev access in raid10_sync_request.)
+  				atomic_inc(&r10_bio->remaining);
+  				break;
+  			}
+@@@ -3330,13 -3214,15 +3365,21 @@@
+  
+  			bio = r10_bio->devs[i].bio;
+  			bio_reset(bio);
+++<<<<<<< HEAD
+ +			clear_bit(BIO_UPTODATE, &bio->bi_flags);
+ +			if (conf->mirrors[d].rdev == NULL ||
+ +			    test_bit(Faulty, &conf->mirrors[d].rdev->flags))
+++=======
++ 			bio->bi_error = -EIO;
++ 			rcu_read_lock();
++ 			rdev = rcu_dereference(conf->mirrors[d].rdev);
++ 			if (rdev == NULL || test_bit(Faulty, &rdev->flags)) {
++ 				rcu_read_unlock();
+++>>>>>>> f90145f317ef (md/raid10: add rcu protection to rdev access in raid10_sync_request.)
+  				continue;
++ 			}
+  			sector = r10_bio->devs[i].addr;
+- 			if (is_badblock(conf->mirrors[d].rdev,
+- 					sector, max_sync,
++ 			if (is_badblock(rdev, sector, max_sync,
+  					&first_bad, &bad_sectors)) {
+  				if (first_bad > sector)
+  					max_sync = first_bad - sector;
+@@@ -3354,31 -3241,31 +3398,43 @@@
+  			bio->bi_private = r10_bio;
+  			bio->bi_end_io = end_sync_read;
+  			bio->bi_rw = READ;
+++<<<<<<< HEAD
+ +			bio->bi_sector = sector +
+ +				conf->mirrors[d].rdev->data_offset;
+ +			bio->bi_bdev = conf->mirrors[d].rdev->bdev;
+++=======
++ 			bio->bi_iter.bi_sector = sector + rdev->data_offset;
++ 			bio->bi_bdev = rdev->bdev;
+++>>>>>>> f90145f317ef (md/raid10: add rcu protection to rdev access in raid10_sync_request.)
+  			count++;
+  
+- 			if (conf->mirrors[d].replacement == NULL ||
+- 			    test_bit(Faulty,
+- 				     &conf->mirrors[d].replacement->flags))
++ 			rdev = rcu_dereference(conf->mirrors[d].replacement);
++ 			if (rdev == NULL || test_bit(Faulty, &rdev->flags)) {
++ 				rcu_read_unlock();
+  				continue;
++ 			}
++ 			atomic_inc(&rdev->nr_pending);
++ 			rcu_read_unlock();
+  
+  			/* Need to set up for writing to the replacement */
+  			bio = r10_bio->devs[i].repl_bio;
+  			bio_reset(bio);
+ -			bio->bi_error = -EIO;
+ +			clear_bit(BIO_UPTODATE, &bio->bi_flags);
+  
+  			sector = r10_bio->devs[i].addr;
+- 			atomic_inc(&conf->mirrors[d].replacement->nr_pending);
+  			bio->bi_next = biolist;
+  			biolist = bio;
+  			bio->bi_private = r10_bio;
+  			bio->bi_end_io = end_sync_write;
+  			bio->bi_rw = WRITE;
+++<<<<<<< HEAD
+ +			bio->bi_sector = sector +
+ +				conf->mirrors[d].replacement->data_offset;
+ +			bio->bi_bdev = conf->mirrors[d].replacement->bdev;
+++=======
++ 			bio->bi_iter.bi_sector = sector + rdev->data_offset;
++ 			bio->bi_bdev = rdev->bdev;
+++>>>>>>> f90145f317ef (md/raid10: add rcu protection to rdev access in raid10_sync_request.)
+  			count++;
+  		}
+  
+* Unmerged path drivers/md/raid10.c
