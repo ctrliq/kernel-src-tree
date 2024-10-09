@@ -1,0 +1,116 @@
+scsi: cxlflash: Support WS16 unmap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] cxlflash: Support WS16 unmap (Gustavo Duarte) [1456494]
+Rebuild_FUZZ: 90.32%
+commit-author Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+commit 3223c01aa1cec60d59bd218aca5e202b558d225a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3223c01a.failed
+
+The cxlflash driver supports performing a write-same16 to scrub virtual
+luns when they are released by a user. To date, AFUs for adapters that
+are supported by cxlflash do not have the capability to unmap as part of
+the WS operation. This can lead to fragmented flash devices which results
+in performance degradation.
+
+Future AFUs can optionally support unmap write-same commands and reflects
+this support via the context control register. This provides userspace
+applications with direct visibility such that they need not depend on a
+host API.
+
+Detect unmap support during cxlflash initialization by reading the context
+control register associated with the primary hardware queue. Update the
+existing write_same16() routine to set the unmap bit in the CDB when unmap
+is supported by the host.
+
+	Signed-off-by: Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+	Signed-off-by: Uma Krishnan <ukrishn@linux.vnet.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 3223c01aa1cec60d59bd218aca5e202b558d225a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/cxlflash/main.c
+diff --cc drivers/scsi/cxlflash/main.c
+index c68badcfa77f,0cce442c260a..000000000000
+--- a/drivers/scsi/cxlflash/main.c
++++ b/drivers/scsi/cxlflash/main.c
+@@@ -1546,14 -1803,29 +1546,38 @@@ static int init_global(struct cxlflash_
+  	/* Set up master's own CTX_CAP to allow real mode, host translation */
+  	/* tables, afu cmds and read/write GSCSI cmds. */
+  	/* First, unlock ctx_cap write by reading mbox */
+++<<<<<<< HEAD
+ +	(void)readq_be(&afu->ctrl_map->mbox_r);	/* unlock ctx_cap */
+ +	writeq_be((SISL_CTX_CAP_REAL_MODE | SISL_CTX_CAP_HOST_XLATE |
+ +		   SISL_CTX_CAP_READ_CMD | SISL_CTX_CAP_WRITE_CMD |
+ +		   SISL_CTX_CAP_AFU_CMD | SISL_CTX_CAP_GSCSI_CMD),
+ +		  &afu->ctrl_map->ctx_cap);
+++=======
++ 	for (i = 0; i < afu->num_hwqs; i++) {
++ 		hwq = get_hwq(afu, i);
++ 
++ 		(void)readq_be(&hwq->ctrl_map->mbox_r);	/* unlock ctx_cap */
++ 		writeq_be((SISL_CTX_CAP_REAL_MODE | SISL_CTX_CAP_HOST_XLATE |
++ 			SISL_CTX_CAP_READ_CMD | SISL_CTX_CAP_WRITE_CMD |
++ 			SISL_CTX_CAP_AFU_CMD | SISL_CTX_CAP_GSCSI_CMD),
++ 			&hwq->ctrl_map->ctx_cap);
++ 	}
++ 
++ 	/*
++ 	 * Determine write-same unmap support for host by evaluating the unmap
++ 	 * sector support bit of the context control register associated with
++ 	 * the primary hardware queue. Note that while this status is reflected
++ 	 * in a context register, the outcome can be assumed to be host-wide.
++ 	 */
++ 	hwq = get_hwq(afu, PRIMARY_HWQ);
++ 	reg = readq_be(&hwq->host_map->ctx_ctrl);
++ 	if (reg & SISL_CTX_CTRL_UNMAP_SECTOR)
++ 		cfg->ws_unmap = true;
++ 
+++>>>>>>> 3223c01aa1ce (scsi: cxlflash: Support WS16 unmap)
+  	/* Initialize heartbeat */
+  	afu->hb = readq_be(&afu->afu_map->global.regs.afu_hb);
+ +
+  out:
+  	return rc;
+  }
+diff --git a/drivers/scsi/cxlflash/common.h b/drivers/scsi/cxlflash/common.h
+index 811927d91c5c..38e6ac163387 100644
+--- a/drivers/scsi/cxlflash/common.h
++++ b/drivers/scsi/cxlflash/common.h
+@@ -125,6 +125,7 @@ struct cxlflash_cfg {
+ 	wait_queue_head_t tmf_waitq;
+ 	spinlock_t tmf_slock;
+ 	bool tmf_active;
++	bool ws_unmap;		/* Write-same unmap supported */
+ 	wait_queue_head_t reset_waitq;
+ 	enum cxlflash_state state;
+ };
+* Unmerged path drivers/scsi/cxlflash/main.c
+diff --git a/drivers/scsi/cxlflash/sislite.h b/drivers/scsi/cxlflash/sislite.h
+index 347fc1671975..2b7ce76227ef 100755
+--- a/drivers/scsi/cxlflash/sislite.h
++++ b/drivers/scsi/cxlflash/sislite.h
+@@ -259,6 +259,7 @@ struct sisl_host_map {
+ 	__be64 rrq_end;		/* write sequence: start followed by end */
+ 	__be64 cmd_room;
+ 	__be64 ctx_ctrl;	/* least significant byte or b56:63 is LISN# */
++#define SISL_CTX_CTRL_UNMAP_SECTOR	0x8000000000000000ULL /* b0 */
+ 	__be64 mbox_w;		/* restricted use */
+ };
+ 
+diff --git a/drivers/scsi/cxlflash/vlun.c b/drivers/scsi/cxlflash/vlun.c
+index 90c5d7f5278e..d7ee52ae694d 100644
+--- a/drivers/scsi/cxlflash/vlun.c
++++ b/drivers/scsi/cxlflash/vlun.c
+@@ -447,6 +447,7 @@ static int write_same16(struct scsi_device *sdev,
+ 	while (left > 0) {
+ 
+ 		scsi_cmd[0] = WRITE_SAME_16;
++		scsi_cmd[1] = cfg->ws_unmap ? 0x8 : 0;
+ 		put_unaligned_be64(offset, &scsi_cmd[2]);
+ 		put_unaligned_be32(ws_limit < left ? ws_limit : left,
+ 				   &scsi_cmd[10]);
