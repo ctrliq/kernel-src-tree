@@ -1,0 +1,284 @@
+virtio_net: Extend virtio to use VF datapath when available
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Sridhar Samudrala <sridhar.samudrala@intel.com>
+commit ba5e4426e80e0435358c7117c339e6a4c22c34ad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/ba5e4426.failed
+
+This patch enables virtio_net to switch over to a VF datapath when STANDBY
+feature is enabled and a VF netdev is present with the same MAC address.
+It allows live migration of a VM with a direct attached VF without the need
+to setup a bond/team between a VF and virtio net device in the guest.
+
+It uses the API that is exported by the net_failover driver to create and
+and destroy a master failover netdev. When STANDBY feature is enabled, an
+additional netdev(failover netdev) is created that acts as a master device
+and tracks the state of the 2 lower netdevs. The original virtio_net netdev
+is marked as 'standby' netdev and a passthru device with the same MAC is
+registered as 'primary' netdev.
+
+The hypervisor needs to unplug the VF device from the guest on the source
+host and reset the MAC filter of the VF to initiate failover of datapath
+to virtio before starting the migration. After the migration is completed,
+the destination hypervisor sets the MAC filter on the VF and plugs it back
+to the guest to switch over to VF datapath.
+
+This patch is based on the discussion initiated by Jesse on this thread.
+https://marc.info/?l=linux-virtualization&m=151189725224231&w=2
+
+	Signed-off-by: Sridhar Samudrala <sridhar.samudrala@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ba5e4426e80e0435358c7117c339e6a4c22c34ad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/networking/net_failover.rst
+#	drivers/net/virtio_net.c
+diff --cc drivers/net/virtio_net.c
+index 5660f4230ca4,8f08a3e1bbaa..000000000000
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@@ -27,6 -28,13 +27,16 @@@
+  #include <linux/if_vlan.h>
+  #include <linux/slab.h>
+  #include <linux/cpu.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/average.h>
++ #include <linux/filter.h>
++ #include <linux/netdevice.h>
++ #include <linux/pci.h>
++ #include <net/route.h>
++ #include <net/xdp.h>
++ #include <net/net_failover.h>
+++>>>>>>> ba5e4426e80e (virtio_net: Extend virtio to use VF datapath when available)
+  
+  static int napi_weight = NAPI_POLL_WEIGHT;
+  module_param(napi_weight, int, 0444);
+@@@ -124,14 -202,20 +134,25 @@@ struct virtnet_info 
+  	/* Does the affinity hint is set for virtqueues? */
+  	bool affinity_hint_set;
+  
+ -	/* CPU hotplug instances for online & dead */
+ -	struct hlist_node node;
+ -	struct hlist_node node_dead;
+ +	/* Per-cpu variable to show the mapping from CPU to virtqueue */
+ +	int __percpu *vq_index;
+  
+ -	struct control_buf *ctrl;
+ +	/* CPU hot plug notifier */
+ +	struct notifier_block nb;
+  
+++<<<<<<< HEAD
+ +	/* Maximum allowed MTU */
+ +	u16 max_mtu;
+++=======
++ 	/* Ethtool settings */
++ 	u8 duplex;
++ 	u32 speed;
++ 
++ 	unsigned long guest_offloads;
++ 
++ 	/* failover when STANDBY feature enabled */
++ 	struct failover *failover;
+++>>>>>>> ba5e4426e80e (virtio_net: Extend virtio to use VF datapath when available)
+  };
+  
+  struct padded_vnet_hdr {
+@@@ -879,12 -1557,19 +900,23 @@@ static int virtnet_set_mac_address(stru
+  	struct virtnet_info *vi = netdev_priv(dev);
+  	struct virtio_device *vdev = vi->vdev;
+  	int ret;
+ -	struct sockaddr *addr;
+ +	struct sockaddr *addr = p;
+  	struct scatterlist sg;
+  
+++<<<<<<< HEAD
+ +	ret = eth_prepare_mac_addr_change(dev, p);
+++=======
++ 	if (virtio_has_feature(vi->vdev, VIRTIO_NET_F_STANDBY))
++ 		return -EOPNOTSUPP;
++ 
++ 	addr = kmemdup(p, sizeof(*addr), GFP_KERNEL);
++ 	if (!addr)
++ 		return -ENOMEM;
++ 
++ 	ret = eth_prepare_mac_addr_change(dev, addr);
+++>>>>>>> ba5e4426e80e (virtio_net: Extend virtio to use VF datapath when available)
+  	if (ret)
+ -		goto out;
+ +		return ret;
+  
+  	if (virtio_has_feature(vdev, VIRTIO_NET_F_CTRL_MAC_ADDR)) {
+  		sg_init_one(&sg, addr->sa_data, dev->addr_len);
+@@@ -1240,50 -2311,57 +1272,66 @@@ static int virtnet_set_channels(struct 
+  	return err;
+  }
+  
+ -static u32 virtnet_xdp_query(struct net_device *dev)
+ +static void virtnet_get_channels(struct net_device *dev,
+ +				 struct ethtool_channels *channels)
+  {
+  	struct virtnet_info *vi = netdev_priv(dev);
+ -	const struct bpf_prog *xdp_prog;
+ -	int i;
+  
+ -	for (i = 0; i < vi->max_queue_pairs; i++) {
+ -		xdp_prog = rtnl_dereference(vi->rq[i].xdp_prog);
+ -		if (xdp_prog)
+ -			return xdp_prog->aux->id;
+ -	}
+ -	return 0;
+ +	channels->combined_count = vi->curr_queue_pairs;
+ +	channels->max_combined = vi->max_queue_pairs;
+ +	channels->max_other = 0;
+ +	channels->rx_count = 0;
+ +	channels->tx_count = 0;
+ +	channels->other_count = 0;
+  }
+  
+ -static int virtnet_xdp(struct net_device *dev, struct netdev_bpf *xdp)
+ +static const struct ethtool_ops virtnet_ethtool_ops = {
+ +	.get_drvinfo = virtnet_get_drvinfo,
+ +	.get_link = ethtool_op_get_link,
+ +	.get_ringparam = virtnet_get_ringparam,
+ +	.set_channels = virtnet_set_channels,
+ +	.get_channels = virtnet_get_channels,
+ +};
+ +
+ +/* To avoid contending a lock hold by a vcpu who would exit to host, select the
+ + * txq based on the processor id.
+ + */
+ +static u16 virtnet_select_queue(struct net_device *dev, struct sk_buff *skb,
+ +			void *accel_priv, select_queue_fallback_t fallback)
+  {
+ -	switch (xdp->command) {
+ -	case XDP_SETUP_PROG:
+ -		return virtnet_xdp_set(dev, xdp->prog, xdp->extack);
+ -	case XDP_QUERY_PROG:
+ -		xdp->prog_id = virtnet_xdp_query(dev);
+ -		xdp->prog_attached = !!xdp->prog_id;
+ -		return 0;
+ -	default:
+ -		return -EINVAL;
+ +	int txq;
+ +	struct virtnet_info *vi = netdev_priv(dev);
+ +
+ +	if (skb_rx_queue_recorded(skb)) {
+ +		txq = skb_get_rx_queue(skb);
+ +	} else {
+ +		txq = *__this_cpu_ptr(vi->vq_index);
+ +		if (txq == -1)
+ +			txq = 0;
+  	}
+ +
+ +	while (unlikely(txq >= dev->real_num_tx_queues))
+ +		txq -= dev->real_num_tx_queues;
+ +
+ +	return txq;
+  }
+  
++ static int virtnet_get_phys_port_name(struct net_device *dev, char *buf,
++ 				      size_t len)
++ {
++ 	struct virtnet_info *vi = netdev_priv(dev);
++ 	int ret;
++ 
++ 	if (!virtio_has_feature(vi->vdev, VIRTIO_NET_F_STANDBY))
++ 		return -EOPNOTSUPP;
++ 
++ 	ret = snprintf(buf, len, "sby");
++ 	if (ret >= len)
++ 		return -EOPNOTSUPP;
++ 
++ 	return 0;
++ }
++ 
+  static const struct net_device_ops virtnet_netdev = {
+  	.ndo_open            = virtnet_open,
+  	.ndo_stop   	     = virtnet_close,
+@@@ -1298,7 -2375,11 +1346,8 @@@
+  #ifdef CONFIG_NET_POLL_CONTROLLER
+  	.ndo_poll_controller = virtnet_netpoll,
+  #endif
+ -	.ndo_bpf		= virtnet_xdp,
+ -	.ndo_xdp_xmit		= virtnet_xdp_xmit,
+ -	.ndo_xdp_flush		= virtnet_xdp_flush,
+  	.ndo_features_check	= passthru_features_check,
++ 	.ndo_get_phys_port_name	= virtnet_get_phys_port_name,
+  };
+  
+  static void virtnet_config_changed_work(struct work_struct *work)
+@@@ -1676,6 -2927,18 +1725,17 @@@ static int virtnet_probe(struct virtio_
+  	netif_set_real_num_tx_queues(dev, vi->curr_queue_pairs);
+  	netif_set_real_num_rx_queues(dev, vi->curr_queue_pairs);
+  
+++<<<<<<< HEAD
+++=======
++ 	virtnet_init_settings(dev);
++ 
++ 	if (virtio_has_feature(vdev, VIRTIO_NET_F_STANDBY)) {
++ 		vi->failover = net_failover_create(vi->dev);
++ 		if (IS_ERR(vi->failover))
++ 			goto free_vqs;
++ 	}
++ 
+++>>>>>>> ba5e4426e80e (virtio_net: Extend virtio to use VF datapath when available)
+  	err = register_netdev(dev);
+  	if (err) {
+  		pr_debug("virtio_net: registering device failed\n");
+@@@ -1722,18 -2975,16 +1782,20 @@@
+  
+  	return 0;
+  
+ -free_unregister_netdev:
+ +free_recv_bufs:
+  	vi->vdev->config->reset(vdev);
+  
+ +	free_receive_bufs(vi);
+  	unregister_netdev(dev);
++ free_failover:
++ 	net_failover_destroy(vi->failover);
+  free_vqs:
+  	cancel_delayed_work_sync(&vi->refill);
+ -	free_receive_page_frags(vi);
+  	virtnet_del_vqs(vi);
+ +free_index:
+ +	free_percpu(vi->vq_index);
+ +free_stats:
+ +	free_percpu(vi->stats);
+  free:
+  	free_netdev(dev);
+  	return err;
+@@@ -1762,11 -3015,10 +1824,13 @@@ static void virtnet_remove(struct virti
+  
+  	unregister_netdev(vi->dev);
+  
++ 	net_failover_destroy(vi->failover);
++ 
+  	remove_vq_common(vi);
+  
+ +
+ +	free_percpu(vi->vq_index);
+ +	free_percpu(vi->stats);
+  	free_netdev(vi->dev);
+  }
+  
+* Unmerged path Documentation/networking/net_failover.rst
+* Unmerged path Documentation/networking/net_failover.rst
+diff --git a/drivers/net/Kconfig b/drivers/net/Kconfig
+index 8381fdde9ed5..5089ed28e042 100644
+--- a/drivers/net/Kconfig
++++ b/drivers/net/Kconfig
+@@ -270,6 +270,7 @@ config VETH
+ config VIRTIO_NET
+ 	tristate "Virtio network driver"
+ 	depends on VIRTIO
++	select NET_FAILOVER
+ 	---help---
+ 	  This is the virtual network driver for virtio.  It can be used with
+ 	  lguest or QEMU based VMMs (like KVM or Xen).  Say Y or M.
+* Unmerged path drivers/net/virtio_net.c
