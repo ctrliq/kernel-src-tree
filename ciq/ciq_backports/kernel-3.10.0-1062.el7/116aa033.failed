@@ -1,0 +1,663 @@
+IB/{hfi1, qib, rdmavt}: Move send completion logic to rdmavt
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Venkata Sandeep Dhanalakota <venkata.s.dhanalakota@intel.com>
+commit 116aa0330ec71b9872dfb3a3cc5202a72b5a1666
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/116aa033.failed
+
+Moving send completion code into rdmavt in order to have shared logic
+between qib and hfi1 drivers.
+
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Reviewed-by: Brian Welty <brian.welty@intel.com>
+	Signed-off-by: Venkata Sandeep Dhanalakota <venkata.s.dhanalakota@intel.com>
+	Signed-off-by: Harish Chegondi <harish.chegondi@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 116aa0330ec71b9872dfb3a3cc5202a72b5a1666)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rdmavt/qp.c
+#	include/rdma/rdmavt_qp.h
+diff --cc drivers/infiniband/sw/rdmavt/qp.c
+index bc0e332ee6a2,7e3ec6674cf7..000000000000
+--- a/drivers/infiniband/sw/rdmavt/qp.c
++++ b/drivers/infiniband/sw/rdmavt/qp.c
+@@@ -2465,3 -2657,123 +2465,126 @@@ void rvt_qp_iter(struct rvt_dev_info *r
+  	rcu_read_unlock();
+  }
+  EXPORT_SYMBOL(rvt_qp_iter);
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * This should be called with s_lock held.
++  */
++ void rvt_send_complete(struct rvt_qp *qp, struct rvt_swqe *wqe,
++ 		       enum ib_wc_status status)
++ {
++ 	u32 old_last, last;
++ 	struct rvt_dev_info *rdi = ib_to_rvt(qp->ibqp.device);
++ 
++ 	if (!(ib_rvt_state_ops[qp->state] & RVT_PROCESS_OR_FLUSH_SEND))
++ 		return;
++ 
++ 	last = qp->s_last;
++ 	old_last = last;
++ 	trace_rvt_qp_send_completion(qp, wqe, last);
++ 	if (++last >= qp->s_size)
++ 		last = 0;
++ 	trace_rvt_qp_send_completion(qp, wqe, last);
++ 	qp->s_last = last;
++ 	/* See post_send() */
++ 	barrier();
++ 	rvt_put_swqe(wqe);
++ 	if (qp->ibqp.qp_type == IB_QPT_UD ||
++ 	    qp->ibqp.qp_type == IB_QPT_SMI ||
++ 	    qp->ibqp.qp_type == IB_QPT_GSI)
++ 		atomic_dec(&ibah_to_rvtah(wqe->ud_wr.ah)->refcount);
++ 
++ 	rvt_qp_swqe_complete(qp,
++ 			     wqe,
++ 			     rdi->wc_opcode[wqe->wr.opcode],
++ 			     status);
++ 
++ 	if (qp->s_acked == old_last)
++ 		qp->s_acked = last;
++ 	if (qp->s_cur == old_last)
++ 		qp->s_cur = last;
++ 	if (qp->s_tail == old_last)
++ 		qp->s_tail = last;
++ 	if (qp->state == IB_QPS_SQD && last == qp->s_cur)
++ 		qp->s_draining = 0;
++ }
++ EXPORT_SYMBOL(rvt_send_complete);
++ 
++ /**
++  * rvt_copy_sge - copy data to SGE memory
++  * @qp: associated QP
++  * @ss: the SGE state
++  * @data: the data to copy
++  * @length: the length of the data
++  * @release: boolean to release MR
++  * @copy_last: do a separate copy of the last 8 bytes
++  */
++ void rvt_copy_sge(struct rvt_qp *qp, struct rvt_sge_state *ss,
++ 		  void *data, u32 length,
++ 		  bool release, bool copy_last)
++ {
++ 	struct rvt_sge *sge = &ss->sge;
++ 	int i;
++ 	bool in_last = false;
++ 	bool cacheless_copy = false;
++ 	struct rvt_dev_info *rdi = ib_to_rvt(qp->ibqp.device);
++ 	struct rvt_wss *wss = rdi->wss;
++ 	unsigned int sge_copy_mode = rdi->dparms.sge_copy_mode;
++ 
++ 	if (sge_copy_mode == RVT_SGE_COPY_CACHELESS) {
++ 		cacheless_copy = length >= PAGE_SIZE;
++ 	} else if (sge_copy_mode == RVT_SGE_COPY_ADAPTIVE) {
++ 		if (length >= PAGE_SIZE) {
++ 			/*
++ 			 * NOTE: this *assumes*:
++ 			 * o The first vaddr is the dest.
++ 			 * o If multiple pages, then vaddr is sequential.
++ 			 */
++ 			wss_insert(wss, sge->vaddr);
++ 			if (length >= (2 * PAGE_SIZE))
++ 				wss_insert(wss, (sge->vaddr + PAGE_SIZE));
++ 
++ 			cacheless_copy = wss_exceeds_threshold(wss);
++ 		} else {
++ 			wss_advance_clean_counter(wss);
++ 		}
++ 	}
++ 
++ 	if (copy_last) {
++ 		if (length > 8) {
++ 			length -= 8;
++ 		} else {
++ 			copy_last = false;
++ 			in_last = true;
++ 		}
++ 	}
++ 
++ again:
++ 	while (length) {
++ 		u32 len = rvt_get_sge_length(sge, length);
++ 
++ 		WARN_ON_ONCE(len == 0);
++ 		if (unlikely(in_last)) {
++ 			/* enforce byte transfer ordering */
++ 			for (i = 0; i < len; i++)
++ 				((u8 *)sge->vaddr)[i] = ((u8 *)data)[i];
++ 		} else if (cacheless_copy) {
++ 			cacheless_memcpy(sge->vaddr, data, len);
++ 		} else {
++ 			memcpy(sge->vaddr, data, len);
++ 		}
++ 		rvt_update_sge(ss, len, release);
++ 		data += len;
++ 		length -= len;
++ 	}
++ 
++ 	if (copy_last) {
++ 		copy_last = false;
++ 		in_last = true;
++ 		length = 8;
++ 		goto again;
++ 	}
++ }
++ EXPORT_SYMBOL(rvt_copy_sge);
+++>>>>>>> 116aa0330ec7 (IB/{hfi1, qib, rdmavt}: Move send completion logic to rdmavt)
+diff --cc include/rdma/rdmavt_qp.h
+index 927f6d5b6d0f,6fd6f2ad9c0f..000000000000
+--- a/include/rdma/rdmavt_qp.h
++++ b/include/rdma/rdmavt_qp.h
+@@@ -678,6 -678,12 +678,15 @@@ void rvt_del_timers_sync(struct rvt_qp 
+  void rvt_stop_rc_timers(struct rvt_qp *qp);
+  void rvt_add_retry_timer(struct rvt_qp *qp);
+  
+++<<<<<<< HEAD
+++=======
++ void rvt_copy_sge(struct rvt_qp *qp, struct rvt_sge_state *ss,
++ 		  void *data, u32 length,
++ 		  bool release, bool copy_last);
++ void rvt_send_complete(struct rvt_qp *qp, struct rvt_swqe *wqe,
++ 		       enum ib_wc_status status);
++ 
+++>>>>>>> 116aa0330ec7 (IB/{hfi1, qib, rdmavt}: Move send completion logic to rdmavt)
+  /**
+   * struct rvt_qp_iter - the iterator for QPs
+   * @qp - the current QP
+diff --git a/drivers/infiniband/hw/hfi1/rc.c b/drivers/infiniband/hw/hfi1/rc.c
+index 9bd63abb2dfe..73e0fcfefdd7 100644
+--- a/drivers/infiniband/hw/hfi1/rc.c
++++ b/drivers/infiniband/hw/hfi1/rc.c
+@@ -309,7 +309,7 @@ int hfi1_make_rc_req(struct rvt_qp *qp, struct hfi1_pkt_state *ps)
+ 		}
+ 		clear_ahg(qp);
+ 		wqe = rvt_get_swqe_ptr(qp, qp->s_last);
+-		hfi1_send_complete(qp, wqe, qp->s_last != qp->s_acked ?
++		rvt_send_complete(qp, wqe, qp->s_last != qp->s_acked ?
+ 			IB_WC_SUCCESS : IB_WC_WR_FLUSH_ERR);
+ 		/* will get called again */
+ 		goto done_free_tx;
+@@ -378,9 +378,9 @@ int hfi1_make_rc_req(struct rvt_qp *qp, struct hfi1_pkt_state *ps)
+ 						wqe->wr.ex.invalidate_rkey);
+ 					local_ops = 1;
+ 				}
+-				hfi1_send_complete(qp, wqe,
+-						   err ? IB_WC_LOC_PROT_ERR
+-						       : IB_WC_SUCCESS);
++				rvt_send_complete(qp, wqe,
++						  err ? IB_WC_LOC_PROT_ERR
++						      : IB_WC_SUCCESS);
+ 				if (local_ops)
+ 					atomic_dec(&qp->local_ops_pending);
+ 				goto done_free_tx;
+@@ -1043,7 +1043,7 @@ void hfi1_restart_rc(struct rvt_qp *qp, u32 psn, int wait)
+ 			hfi1_migrate_qp(qp);
+ 			qp->s_retry = qp->s_retry_cnt;
+ 		} else if (qp->s_last == qp->s_acked) {
+-			hfi1_send_complete(qp, wqe, IB_WC_RETRY_EXC_ERR);
++			rvt_send_complete(qp, wqe, IB_WC_RETRY_EXC_ERR);
+ 			rvt_error_qp(qp, IB_WC_WR_FLUSH_ERR);
+ 			return;
+ 		} else { /* need to handle delayed completion */
+@@ -1468,7 +1468,7 @@ static int do_rc_ack(struct rvt_qp *qp, u32 aeth, u32 psn, int opcode,
+ 			ibp->rvp.n_other_naks++;
+ class_b:
+ 			if (qp->s_last == qp->s_acked) {
+-				hfi1_send_complete(qp, wqe, status);
++				rvt_send_complete(qp, wqe, status);
+ 				rvt_error_qp(qp, IB_WC_WR_FLUSH_ERR);
+ 			}
+ 			break;
+@@ -1704,7 +1704,7 @@ ack_len_err:
+ 	status = IB_WC_LOC_LEN_ERR;
+ ack_err:
+ 	if (qp->s_last == qp->s_acked) {
+-		hfi1_send_complete(qp, wqe, status);
++		rvt_send_complete(qp, wqe, status);
+ 		rvt_error_qp(qp, IB_WC_WR_FLUSH_ERR);
+ 	}
+ ack_done:
+diff --git a/drivers/infiniband/hw/hfi1/ruc.c b/drivers/infiniband/hw/hfi1/ruc.c
+index cdb8c22819f8..f1782f15a272 100644
+--- a/drivers/infiniband/hw/hfi1/ruc.c
++++ b/drivers/infiniband/hw/hfi1/ruc.c
+@@ -410,7 +410,7 @@ send_comp:
+ 	ibp->rvp.n_loop_pkts++;
+ flush_send:
+ 	sqp->s_rnr_retry = sqp->s_rnr_retry_cnt;
+-	hfi1_send_complete(sqp, wqe, send_status);
++	rvt_send_complete(sqp, wqe, send_status);
+ 	if (local_ops) {
+ 		atomic_dec(&sqp->local_ops_pending);
+ 		local_ops = 0;
+@@ -458,7 +458,7 @@ err:
+ 
+ serr:
+ 	spin_lock_irqsave(&sqp->s_lock, flags);
+-	hfi1_send_complete(sqp, wqe, send_status);
++	rvt_send_complete(sqp, wqe, send_status);
+ 	if (sqp->ibqp.qp_type == IB_QPT_RC) {
+ 		int lastwqe = rvt_error_qp(sqp, IB_WC_WR_FLUSH_ERR);
+ 
+@@ -917,44 +917,3 @@ void hfi1_do_send(struct rvt_qp *qp, bool in_thread)
+ 	iowait_starve_clear(ps.pkts_sent, &priv->s_iowait);
+ 	spin_unlock_irqrestore(&qp->s_lock, ps.flags);
+ }
+-
+-/*
+- * This should be called with s_lock held.
+- */
+-void hfi1_send_complete(struct rvt_qp *qp, struct rvt_swqe *wqe,
+-			enum ib_wc_status status)
+-{
+-	u32 old_last, last;
+-
+-	if (!(ib_rvt_state_ops[qp->state] & RVT_PROCESS_OR_FLUSH_SEND))
+-		return;
+-
+-	last = qp->s_last;
+-	old_last = last;
+-	trace_hfi1_qp_send_completion(qp, wqe, last);
+-	if (++last >= qp->s_size)
+-		last = 0;
+-	trace_hfi1_qp_send_completion(qp, wqe, last);
+-	qp->s_last = last;
+-	/* See post_send() */
+-	barrier();
+-	rvt_put_swqe(wqe);
+-	if (qp->ibqp.qp_type == IB_QPT_UD ||
+-	    qp->ibqp.qp_type == IB_QPT_SMI ||
+-	    qp->ibqp.qp_type == IB_QPT_GSI)
+-		atomic_dec(&ibah_to_rvtah(wqe->ud_wr.ah)->refcount);
+-
+-	rvt_qp_swqe_complete(qp,
+-			     wqe,
+-			     ib_hfi1_wc_opcode[wqe->wr.opcode],
+-			     status);
+-
+-	if (qp->s_acked == old_last)
+-		qp->s_acked = last;
+-	if (qp->s_cur == old_last)
+-		qp->s_cur = last;
+-	if (qp->s_tail == old_last)
+-		qp->s_tail = last;
+-	if (qp->state == IB_QPS_SQD && last == qp->s_cur)
+-		qp->s_draining = 0;
+-}
+diff --git a/drivers/infiniband/hw/hfi1/uc.c b/drivers/infiniband/hw/hfi1/uc.c
+index c47d335b479d..e93ac8fa28dd 100644
+--- a/drivers/infiniband/hw/hfi1/uc.c
++++ b/drivers/infiniband/hw/hfi1/uc.c
+@@ -88,7 +88,7 @@ int hfi1_make_uc_req(struct rvt_qp *qp, struct hfi1_pkt_state *ps)
+ 		}
+ 		clear_ahg(qp);
+ 		wqe = rvt_get_swqe_ptr(qp, qp->s_last);
+-		hfi1_send_complete(qp, wqe, IB_WC_WR_FLUSH_ERR);
++		rvt_send_complete(qp, wqe, IB_WC_WR_FLUSH_ERR);
+ 		goto done_free_tx;
+ 	}
+ 
+@@ -140,7 +140,7 @@ int hfi1_make_uc_req(struct rvt_qp *qp, struct hfi1_pkt_state *ps)
+ 					qp, wqe->wr.ex.invalidate_rkey);
+ 				local_ops = 1;
+ 			}
+-			hfi1_send_complete(qp, wqe, err ? IB_WC_LOC_PROT_ERR
++			rvt_send_complete(qp, wqe, err ? IB_WC_LOC_PROT_ERR
+ 							: IB_WC_SUCCESS);
+ 			if (local_ops)
+ 				atomic_dec(&qp->local_ops_pending);
+diff --git a/drivers/infiniband/hw/hfi1/ud.c b/drivers/infiniband/hw/hfi1/ud.c
+index 840fc396abbe..118d08fbefb7 100644
+--- a/drivers/infiniband/hw/hfi1/ud.c
++++ b/drivers/infiniband/hw/hfi1/ud.c
+@@ -518,7 +518,7 @@ int hfi1_make_ud_req(struct rvt_qp *qp, struct hfi1_pkt_state *ps)
+ 			goto bail;
+ 		}
+ 		wqe = rvt_get_swqe_ptr(qp, qp->s_last);
+-		hfi1_send_complete(qp, wqe, IB_WC_WR_FLUSH_ERR);
++		rvt_send_complete(qp, wqe, IB_WC_WR_FLUSH_ERR);
+ 		goto done_free_tx;
+ 	}
+ 
+@@ -560,7 +560,7 @@ int hfi1_make_ud_req(struct rvt_qp *qp, struct hfi1_pkt_state *ps)
+ 			ud_loopback(qp, wqe);
+ 			spin_lock_irqsave(&qp->s_lock, tflags);
+ 			ps->flags = tflags;
+-			hfi1_send_complete(qp, wqe, IB_WC_SUCCESS);
++			rvt_send_complete(qp, wqe, IB_WC_SUCCESS);
+ 			goto done_free_tx;
+ 		}
+ 	}
+diff --git a/drivers/infiniband/hw/hfi1/verbs.c b/drivers/infiniband/hw/hfi1/verbs.c
+index 8b1b27b20e68..888e713bf0e3 100644
+--- a/drivers/infiniband/hw/hfi1/verbs.c
++++ b/drivers/infiniband/hw/hfi1/verbs.c
+@@ -715,7 +715,7 @@ static void verbs_sdma_complete(
+ 
+ 	spin_lock(&qp->s_lock);
+ 	if (tx->wqe) {
+-		hfi1_send_complete(qp, tx->wqe, IB_WC_SUCCESS);
++		rvt_send_complete(qp, tx->wqe, IB_WC_SUCCESS);
+ 	} else if (qp->ibqp.qp_type == IB_QPT_RC) {
+ 		struct hfi1_opa_header *hdr;
+ 
+@@ -1162,7 +1162,7 @@ int hfi1_verbs_send_pio(struct rvt_qp *qp, struct hfi1_pkt_state *ps,
+ pio_bail:
+ 	if (qp->s_wqe) {
+ 		spin_lock_irqsave(&qp->s_lock, flags);
+-		hfi1_send_complete(qp, qp->s_wqe, wc_status);
++		rvt_send_complete(qp, qp->s_wqe, wc_status);
+ 		spin_unlock_irqrestore(&qp->s_lock, flags);
+ 	} else if (qp->ibqp.qp_type == IB_QPT_RC) {
+ 		spin_lock_irqsave(&qp->s_lock, flags);
+@@ -1369,7 +1369,7 @@ int hfi1_verbs_send(struct rvt_qp *qp, struct hfi1_pkt_state *ps)
+ 			hfi1_cdbg(PIO, "%s() Failed. Completing with err",
+ 				  __func__);
+ 			spin_lock_irqsave(&qp->s_lock, flags);
+-			hfi1_send_complete(qp, qp->s_wqe, IB_WC_GENERAL_ERR);
++			rvt_send_complete(qp, qp->s_wqe, IB_WC_GENERAL_ERR);
+ 			spin_unlock_irqrestore(&qp->s_lock, flags);
+ 		}
+ 		return -EINVAL;
+@@ -1961,6 +1961,9 @@ int hfi1_register_ib_device(struct hfi1_devdata *dd)
+ 	/* post send table */
+ 	dd->verbs_dev.rdi.post_parms = hfi1_post_parms;
+ 
++	/* opcode translation table */
++	dd->verbs_dev.rdi.wc_opcode = ib_hfi1_wc_opcode;
++
+ 	ppd = dd->pport;
+ 	for (i = 0; i < dd->num_pports; i++, ppd++)
+ 		rvt_init_port(&dd->verbs_dev.rdi,
+diff --git a/drivers/infiniband/hw/hfi1/verbs.h b/drivers/infiniband/hw/hfi1/verbs.h
+index e7f727ca9212..73e7fe444cdb 100644
+--- a/drivers/infiniband/hw/hfi1/verbs.h
++++ b/drivers/infiniband/hw/hfi1/verbs.h
+@@ -365,9 +365,6 @@ void hfi1_do_send_from_rvt(struct rvt_qp *qp);
+ 
+ void hfi1_do_send(struct rvt_qp *qp, bool in_thread);
+ 
+-void hfi1_send_complete(struct rvt_qp *qp, struct rvt_swqe *wqe,
+-			enum ib_wc_status status);
+-
+ void hfi1_send_rc_ack(struct hfi1_packet *packet, bool is_fecn);
+ 
+ int hfi1_make_rc_req(struct rvt_qp *qp, struct hfi1_pkt_state *ps);
+diff --git a/drivers/infiniband/hw/qib/qib_rc.c b/drivers/infiniband/hw/qib/qib_rc.c
+index 9030049e89e1..2937d0660e8f 100644
+--- a/drivers/infiniband/hw/qib/qib_rc.c
++++ b/drivers/infiniband/hw/qib/qib_rc.c
+@@ -254,7 +254,7 @@ int qib_make_rc_req(struct rvt_qp *qp, unsigned long *flags)
+ 			goto bail;
+ 		}
+ 		wqe = rvt_get_swqe_ptr(qp, qp->s_last);
+-		qib_send_complete(qp, wqe, qp->s_last != qp->s_acked ?
++		rvt_send_complete(qp, wqe, qp->s_last != qp->s_acked ?
+ 			IB_WC_SUCCESS : IB_WC_WR_FLUSH_ERR);
+ 		/* will get called again */
+ 		goto done;
+@@ -838,7 +838,7 @@ void qib_restart_rc(struct rvt_qp *qp, u32 psn, int wait)
+ 			qib_migrate_qp(qp);
+ 			qp->s_retry = qp->s_retry_cnt;
+ 		} else if (qp->s_last == qp->s_acked) {
+-			qib_send_complete(qp, wqe, IB_WC_RETRY_EXC_ERR);
++			rvt_send_complete(qp, wqe, IB_WC_RETRY_EXC_ERR);
+ 			rvt_error_qp(qp, IB_WC_WR_FLUSH_ERR);
+ 			return;
+ 		} else /* XXX need to handle delayed completion */
+@@ -1221,7 +1221,7 @@ static int do_rc_ack(struct rvt_qp *qp, u32 aeth, u32 psn, int opcode,
+ 			ibp->rvp.n_other_naks++;
+ class_b:
+ 			if (qp->s_last == qp->s_acked) {
+-				qib_send_complete(qp, wqe, status);
++				rvt_send_complete(qp, wqe, status);
+ 				rvt_error_qp(qp, IB_WC_WR_FLUSH_ERR);
+ 			}
+ 			break;
+@@ -1490,7 +1490,7 @@ ack_len_err:
+ 	status = IB_WC_LOC_LEN_ERR;
+ ack_err:
+ 	if (qp->s_last == qp->s_acked) {
+-		qib_send_complete(qp, wqe, status);
++		rvt_send_complete(qp, wqe, status);
+ 		rvt_error_qp(qp, IB_WC_WR_FLUSH_ERR);
+ 	}
+ ack_done:
+diff --git a/drivers/infiniband/hw/qib/qib_ruc.c b/drivers/infiniband/hw/qib/qib_ruc.c
+index d6231e874b82..15b5fb0ad20e 100644
+--- a/drivers/infiniband/hw/qib/qib_ruc.c
++++ b/drivers/infiniband/hw/qib/qib_ruc.c
+@@ -403,7 +403,7 @@ send_comp:
+ 	ibp->rvp.n_loop_pkts++;
+ flush_send:
+ 	sqp->s_rnr_retry = sqp->s_rnr_retry_cnt;
+-	qib_send_complete(sqp, wqe, send_status);
++	rvt_send_complete(sqp, wqe, send_status);
+ 	goto again;
+ 
+ rnr_nak:
+@@ -447,7 +447,7 @@ err:
+ 
+ serr:
+ 	spin_lock_irqsave(&sqp->s_lock, flags);
+-	qib_send_complete(sqp, wqe, send_status);
++	rvt_send_complete(sqp, wqe, send_status);
+ 	if (sqp->ibqp.qp_type == IB_QPT_RC) {
+ 		int lastwqe = rvt_error_qp(sqp, IB_WC_WR_FLUSH_ERR);
+ 
+@@ -613,42 +613,3 @@ void qib_do_send(struct rvt_qp *qp)
+ 
+ 	spin_unlock_irqrestore(&qp->s_lock, flags);
+ }
+-
+-/*
+- * This should be called with s_lock held.
+- */
+-void qib_send_complete(struct rvt_qp *qp, struct rvt_swqe *wqe,
+-		       enum ib_wc_status status)
+-{
+-	u32 old_last, last;
+-
+-	if (!(ib_rvt_state_ops[qp->state] & RVT_PROCESS_OR_FLUSH_SEND))
+-		return;
+-
+-	last = qp->s_last;
+-	old_last = last;
+-	if (++last >= qp->s_size)
+-		last = 0;
+-	qp->s_last = last;
+-	/* See post_send() */
+-	barrier();
+-	rvt_put_swqe(wqe);
+-	if (qp->ibqp.qp_type == IB_QPT_UD ||
+-	    qp->ibqp.qp_type == IB_QPT_SMI ||
+-	    qp->ibqp.qp_type == IB_QPT_GSI)
+-		atomic_dec(&ibah_to_rvtah(wqe->ud_wr.ah)->refcount);
+-
+-	rvt_qp_swqe_complete(qp,
+-			     wqe,
+-			     ib_qib_wc_opcode[wqe->wr.opcode],
+-			     status);
+-
+-	if (qp->s_acked == old_last)
+-		qp->s_acked = last;
+-	if (qp->s_cur == old_last)
+-		qp->s_cur = last;
+-	if (qp->s_tail == old_last)
+-		qp->s_tail = last;
+-	if (qp->state == IB_QPS_SQD && last == qp->s_cur)
+-		qp->s_draining = 0;
+-}
+diff --git a/drivers/infiniband/hw/qib/qib_sdma.c b/drivers/infiniband/hw/qib/qib_sdma.c
+index 891873b38a1e..5a3b74aca8bb 100644
+--- a/drivers/infiniband/hw/qib/qib_sdma.c
++++ b/drivers/infiniband/hw/qib/qib_sdma.c
+@@ -675,7 +675,7 @@ unmap:
+ 		if (ib_rvt_state_ops[qp->state] & RVT_PROCESS_RECV_OK)
+ 			rvt_error_qp(qp, IB_WC_GENERAL_ERR);
+ 	} else if (qp->s_wqe)
+-		qib_send_complete(qp, qp->s_wqe, IB_WC_GENERAL_ERR);
++		rvt_send_complete(qp, qp->s_wqe, IB_WC_GENERAL_ERR);
+ 	spin_unlock(&qp->s_lock);
+ 	spin_unlock(&qp->r_lock);
+ 	/* return zero to process the next send work request */
+diff --git a/drivers/infiniband/hw/qib/qib_uc.c b/drivers/infiniband/hw/qib/qib_uc.c
+index 64878dc8f5f6..cb87a318ef9f 100644
+--- a/drivers/infiniband/hw/qib/qib_uc.c
++++ b/drivers/infiniband/hw/qib/qib_uc.c
+@@ -68,7 +68,7 @@ int qib_make_uc_req(struct rvt_qp *qp, unsigned long *flags)
+ 			goto bail;
+ 		}
+ 		wqe = rvt_get_swqe_ptr(qp, qp->s_last);
+-		qib_send_complete(qp, wqe, IB_WC_WR_FLUSH_ERR);
++		rvt_send_complete(qp, wqe, IB_WC_WR_FLUSH_ERR);
+ 		goto done;
+ 	}
+ 
+diff --git a/drivers/infiniband/hw/qib/qib_ud.c b/drivers/infiniband/hw/qib/qib_ud.c
+index b18985816da0..df557802f408 100644
+--- a/drivers/infiniband/hw/qib/qib_ud.c
++++ b/drivers/infiniband/hw/qib/qib_ud.c
+@@ -260,7 +260,7 @@ int qib_make_ud_req(struct rvt_qp *qp, unsigned long *flags)
+ 			goto bail;
+ 		}
+ 		wqe = rvt_get_swqe_ptr(qp, qp->s_last);
+-		qib_send_complete(qp, wqe, IB_WC_WR_FLUSH_ERR);
++		rvt_send_complete(qp, wqe, IB_WC_WR_FLUSH_ERR);
+ 		goto done;
+ 	}
+ 
+@@ -304,7 +304,7 @@ int qib_make_ud_req(struct rvt_qp *qp, unsigned long *flags)
+ 			qib_ud_loopback(qp, wqe);
+ 			spin_lock_irqsave(&qp->s_lock, tflags);
+ 			*flags = tflags;
+-			qib_send_complete(qp, wqe, IB_WC_SUCCESS);
++			rvt_send_complete(qp, wqe, IB_WC_SUCCESS);
+ 			goto done;
+ 		}
+ 	}
+diff --git a/drivers/infiniband/hw/qib/qib_verbs.c b/drivers/infiniband/hw/qib/qib_verbs.c
+index 021a776bffe6..8544f3942bce 100644
+--- a/drivers/infiniband/hw/qib/qib_verbs.c
++++ b/drivers/infiniband/hw/qib/qib_verbs.c
+@@ -753,7 +753,7 @@ static void sdma_complete(struct qib_sdma_txreq *cookie, int status)
+ 
+ 	spin_lock(&qp->s_lock);
+ 	if (tx->wqe)
+-		qib_send_complete(qp, tx->wqe, IB_WC_SUCCESS);
++		rvt_send_complete(qp, tx->wqe, IB_WC_SUCCESS);
+ 	else if (qp->ibqp.qp_type == IB_QPT_RC) {
+ 		struct ib_header *hdr;
+ 
+@@ -1026,7 +1026,7 @@ done:
+ 	}
+ 	if (qp->s_wqe) {
+ 		spin_lock_irqsave(&qp->s_lock, flags);
+-		qib_send_complete(qp, qp->s_wqe, IB_WC_SUCCESS);
++		rvt_send_complete(qp, qp->s_wqe, IB_WC_SUCCESS);
+ 		spin_unlock_irqrestore(&qp->s_lock, flags);
+ 	} else if (qp->ibqp.qp_type == IB_QPT_RC) {
+ 		spin_lock_irqsave(&qp->s_lock, flags);
+@@ -1512,6 +1512,9 @@ static void qib_fill_device_attr(struct qib_devdata *dd)
+ 					rdi->dparms.props.max_mcast_grp;
+ 	/* post send table */
+ 	dd->verbs_dev.rdi.post_parms = qib_post_parms;
++
++	/* opcode translation table */
++	dd->verbs_dev.rdi.wc_opcode = ib_qib_wc_opcode;
+ }
+ 
+ /**
+diff --git a/drivers/infiniband/hw/qib/qib_verbs.h b/drivers/infiniband/hw/qib/qib_verbs.h
+index f9a46768a19a..b9536701a573 100644
+--- a/drivers/infiniband/hw/qib/qib_verbs.h
++++ b/drivers/infiniband/hw/qib/qib_verbs.h
+@@ -336,9 +336,6 @@ void _qib_do_send(struct work_struct *work);
+ 
+ void qib_do_send(struct rvt_qp *qp);
+ 
+-void qib_send_complete(struct rvt_qp *qp, struct rvt_swqe *wqe,
+-		       enum ib_wc_status status);
+-
+ void qib_send_rc_ack(struct rvt_qp *qp);
+ 
+ int qib_make_rc_req(struct rvt_qp *qp, unsigned long *flags);
+* Unmerged path drivers/infiniband/sw/rdmavt/qp.c
+diff --git a/drivers/infiniband/sw/rdmavt/trace_tx.h b/drivers/infiniband/sw/rdmavt/trace_tx.h
+index 0ef25fc49f25..d5df352eadb1 100644
+--- a/drivers/infiniband/sw/rdmavt/trace_tx.h
++++ b/drivers/infiniband/sw/rdmavt/trace_tx.h
+@@ -153,6 +153,48 @@ TRACE_EVENT(
+ 	)
+ );
+ 
++TRACE_EVENT(
++	rvt_qp_send_completion,
++	TP_PROTO(struct rvt_qp *qp, struct rvt_swqe *wqe, u32 idx),
++	TP_ARGS(qp, wqe, idx),
++	TP_STRUCT__entry(
++		RDI_DEV_ENTRY(ib_to_rvt(qp->ibqp.device))
++		__field(struct rvt_swqe *, wqe)
++		__field(u64, wr_id)
++		__field(u32, qpn)
++		__field(u32, qpt)
++		__field(u32, length)
++		__field(u32, idx)
++		__field(u32, ssn)
++		__field(enum ib_wr_opcode, opcode)
++		__field(int, send_flags)
++	),
++	TP_fast_assign(
++		RDI_DEV_ASSIGN(ib_to_rvt(qp->ibqp.device))
++		__entry->wqe = wqe;
++		__entry->wr_id = wqe->wr.wr_id;
++		__entry->qpn = qp->ibqp.qp_num;
++		__entry->qpt = qp->ibqp.qp_type;
++		__entry->length = wqe->length;
++		__entry->idx = idx;
++		__entry->ssn = wqe->ssn;
++		__entry->opcode = wqe->wr.opcode;
++		__entry->send_flags = wqe->wr.send_flags;
++	),
++	TP_printk(
++		"[%s] qpn 0x%x qpt %u wqe %p idx %u wr_id %llx length %u ssn %u opcode %x send_flags %x",
++		__get_str(dev),
++		__entry->qpn,
++		__entry->qpt,
++		__entry->wqe,
++		__entry->idx,
++		__entry->wr_id,
++		__entry->length,
++		__entry->ssn,
++		__entry->opcode,
++		__entry->send_flags
++	)
++);
+ #endif /* __RVT_TRACE_TX_H */
+ 
+ #undef TRACE_INCLUDE_PATH
+diff --git a/include/rdma/rdma_vt.h b/include/rdma/rdma_vt.h
+index d0e9083f9b9e..1a23408b7404 100644
+--- a/include/rdma/rdma_vt.h
++++ b/include/rdma/rdma_vt.h
+@@ -369,6 +369,9 @@ struct rvt_dev_info {
+ 	/* post send table */
+ 	const struct rvt_operation_params *post_parms;
+ 
++	/* opcode translation table */
++	const enum ib_wc_opcode *wc_opcode;
++
+ 	/* Driver specific helper functions */
+ 	struct rvt_driver_provided driver_f;
+ 
+* Unmerged path include/rdma/rdmavt_qp.h
