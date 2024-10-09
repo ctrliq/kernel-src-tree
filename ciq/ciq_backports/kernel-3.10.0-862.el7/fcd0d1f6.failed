@@ -1,0 +1,228 @@
+s390/zcrypt: cleanup AP bus timer code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [s390] zcrypt: cleanup AP bus timer code (Hendrik Brueckner) [1380349]
+Rebuild_FUZZ: 92.96%
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit fcd0d1f637e57777fdc742adee6bfbcab5876295
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fcd0d1f6.failed
+
+Set the configuration timer at the end of the ap_scan_bus function.
+Make use of setup_timer and remove some unnecessary add_timer, mod_timer
+and del_timer_sync calls. Replace the complicated timer_pending, mod_timer
+and add_timer code in ap_config_time_store with a simple mod_timer.
+
+Reviewd-by: Ingo Tuchscherer <ingo.tuchscherer@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit fcd0d1f637e57777fdc742adee6bfbcab5876295)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/ap_bus.c
+diff --cc drivers/s390/crypto/ap_bus.c
+index 5386d81f8cd3,ba1f806051b7..000000000000
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@@ -51,19 -52,13 +51,20 @@@
+  /* Some prototypes. */
+  static void ap_scan_bus(struct work_struct *);
+  static void ap_poll_all(unsigned long);
+++<<<<<<< HEAD
+ +static enum hrtimer_restart ap_poll_timeout(struct hrtimer *);
+ +static int ap_poll_thread_start(void);
+ +static void ap_poll_thread_stop(void);
+++=======
+++>>>>>>> fcd0d1f637e5 (s390/zcrypt: cleanup AP bus timer code)
+  static void ap_request_timeout(unsigned long);
+- static inline void ap_schedule_poll_timer(void);
+  static int __ap_poll_device(struct ap_device *ap_dev, unsigned long *flags);
+  static int ap_device_remove(struct device *dev);
+  static int ap_device_probe(struct device *dev);
+  static void ap_interrupt_handler(struct airq_struct *airq);
+  static void ap_reset(struct ap_device *ap_dev, unsigned long *flags);
+- static void ap_config_timeout(unsigned long ptr);
+  static int ap_select_domain(void);
+ +static void ap_query_configuration(void);
+  
+  /*
+   * Module description.
+@@@ -878,58 -911,75 +879,84 @@@ static int ap_bus_suspend(struct devic
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int ap_bus_resume(struct device *dev)
+++=======
++ static int ap_dev_resume(struct device *dev)
++ {
++ 	return 0;
++ }
++ 
++ static void ap_bus_suspend(void)
++ {
++ 	ap_suspend_flag = 1;
++ 	/*
++ 	 * Disable scanning for devices, thus we do not want to scan
++ 	 * for them after removing.
++ 	 */
++ 	flush_workqueue(ap_work_queue);
++ 	tasklet_disable(&ap_tasklet);
++ }
++ 
++ static int __ap_devices_unregister(struct device *dev, void *dummy)
++ {
++ 	device_unregister(dev);
++ 	return 0;
++ }
++ 
++ static void ap_bus_resume(void)
+++>>>>>>> fcd0d1f637e5 (s390/zcrypt: cleanup AP bus timer code)
+  {
+ +	struct ap_device *ap_dev = to_ap_dev(dev);
+  	int rc;
+  
+ -	/* Unconditionally remove all AP devices */
+ -	bus_for_each_dev(&ap_bus_type, NULL, NULL, __ap_devices_unregister);
+ -	/* Reset thin interrupt setting */
+ -	if (ap_interrupts_available() && !ap_using_interrupts()) {
+ -		rc = register_adapter_interrupt(&ap_airq);
+ -		ap_airq_flag = (rc == 0);
+ -	}
+ -	if (!ap_interrupts_available() && ap_using_interrupts()) {
+ -		unregister_adapter_interrupt(&ap_airq);
+ -		ap_airq_flag = 0;
+ +	if (ap_suspend_flag) {
+ +		ap_suspend_flag = 0;
+ +		if (ap_interrupts_available()) {
+ +			if (!ap_using_interrupts()) {
+ +				rc = register_adapter_interrupt(&ap_airq);
+ +				ap_airq_flag = (rc == 0);
+ +			}
+ +		} else {
+ +			if (ap_using_interrupts()) {
+ +				unregister_adapter_interrupt(&ap_airq);
+ +				ap_airq_flag = 0;
+ +			}
+ +		}
+ +		ap_query_configuration();
+ +		if (!user_set_domain) {
+ +			ap_domain_index = -1;
+ +			ap_select_domain();
+ +		}
+ +		init_timer(&ap_config_timer);
+ +		ap_config_timer.function = ap_config_timeout;
+ +		ap_config_timer.data = 0;
+ +		ap_config_timer.expires = jiffies + ap_config_time * HZ;
+ +		add_timer(&ap_config_timer);
+ +		ap_work_queue = create_singlethread_workqueue("kapwork");
+ +		if (!ap_work_queue)
+ +			return -ENOMEM;
+ +		tasklet_enable(&ap_tasklet);
+ +		if (!ap_using_interrupts())
+ +			ap_schedule_poll_timer();
+ +		else
+ +			tasklet_schedule(&ap_tasklet);
+ +		if (ap_thread_flag)
+ +			rc = ap_poll_thread_start();
+ +		else
+ +			rc = 0;
+ +	} else
+ +		rc = 0;
+ +	if (AP_QID_QUEUE(ap_dev->qid) != ap_domain_index) {
+ +		spin_lock_bh(&ap_dev->lock);
+ +		ap_dev->qid = AP_MKQID(AP_QID_DEVICE(ap_dev->qid),
+ +				       ap_domain_index);
+ +		spin_unlock_bh(&ap_dev->lock);
+  	}
+ -	/* Reset domain */
+ -	if (!user_set_domain)
+ -		ap_domain_index = -1;
+ -	/* Get things going again */
+ -	ap_suspend_flag = 0;
+ -	if (ap_airq_flag)
+ -		xchg(ap_airq.lsi_ptr, 0);
+ -	tasklet_enable(&ap_tasklet);
+  	queue_work(ap_work_queue, &ap_config_work);
+ -	wake_up(&ap_poll_wait);
+ -}
+  
+ -static int ap_power_event(struct notifier_block *this, unsigned long event,
+ -			  void *ptr)
+ -{
+ -	switch (event) {
+ -	case PM_HIBERNATION_PREPARE:
+ -	case PM_SUSPEND_PREPARE:
+ -		ap_bus_suspend();
+ -		break;
+ -	case PM_POST_HIBERNATION:
+ -	case PM_POST_SUSPEND:
+ -		ap_bus_resume();
+ -		break;
+ -	default:
+ -		break;
+ -	}
+ -	return NOTIFY_DONE;
+ +	return rc;
+  }
+ -static struct notifier_block ap_power_notifier = {
+ -	.notifier_call = ap_power_event,
+ -};
+  
+  static struct bus_type ap_bus_type = {
+  	.name = "ap",
+@@@ -1034,9 -1084,10 +1061,15 @@@ EXPORT_SYMBOL(ap_driver_unregister)
+  
+  void ap_bus_force_rescan(void)
+  {
+++<<<<<<< HEAD
+ +	/* reconfigure the AP bus rescan timer. */
+ +	mod_timer(&ap_config_timer, jiffies + ap_config_time * HZ);
+++=======
++ 	if (ap_suspend_flag)
++ 		return;
+++>>>>>>> fcd0d1f637e5 (s390/zcrypt: cleanup AP bus timer code)
+  	/* processing a asynchronous bus rescan */
++ 	del_timer(&ap_config_timer);
+  	queue_work(ap_work_queue, &ap_config_work);
+  	flush_work(&ap_config_work);
+  }
+@@@ -1453,9 -1405,9 +1482,15 @@@ static void ap_scan_bus(struct work_str
+  	int rc, i;
+  
+  	ap_query_configuration();
+++<<<<<<< HEAD
+ +	if (ap_select_domain() != 0) {
+ +		return;
+ +	}
+++=======
++ 	if (ap_select_domain() != 0)
++ 		goto out;
++ 
+++>>>>>>> fcd0d1f637e5 (s390/zcrypt: cleanup AP bus timer code)
+  	for (i = 0; i < AP_DEVICES; i++) {
+  		qid = AP_MKQID(i, ap_domain_index);
+  		dev = bus_find_device(&ap_bus_type, NULL,
+@@@ -1546,14 -1483,15 +1581,14 @@@
+  		else
+  			device_unregister(&ap_dev->device);
+  	}
++ out:
++ 	mod_timer(&ap_config_timer, jiffies + ap_config_time * HZ);
+  }
+  
+ -static void ap_config_timeout(unsigned long ptr)
+ +static void
+ +ap_config_timeout(unsigned long ptr)
+  {
+ -	if (ap_suspend_flag)
+ -		return;
+  	queue_work(ap_work_queue, &ap_config_work);
+- 	ap_config_timer.expires = jiffies + ap_config_time * HZ;
+- 	add_timer(&ap_config_timer);
+  }
+  
+  /**
+* Unmerged path drivers/s390/crypto/ap_bus.c
