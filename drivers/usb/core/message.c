@@ -1355,7 +1355,7 @@ int usb_set_interface(struct usb_device *dev, int interface, int alternate)
 	 * so that the xHCI driver can recalculate the U1/U2 timeouts.
 	 */
 	if (usb_disable_lpm(dev)) {
-		dev_err(&iface->dev, "%s Failed to disable LPM\n.", __func__);
+		dev_err(&iface->dev, "%s Failed to disable LPM\n", __func__);
 		mutex_unlock(hcd->bandwidth_mutex);
 		return -ENOMEM;
 	}
@@ -1499,7 +1499,7 @@ int usb_reset_configuration(struct usb_device *dev)
 	 * that the xHCI driver can recalculate the U1/U2 timeouts.
 	 */
 	if (usb_disable_lpm(dev)) {
-		dev_err(&dev->dev, "%s Failed to disable LPM\n.", __func__);
+		dev_err(&dev->dev, "%s Failed to disable LPM\n", __func__);
 		mutex_unlock(hcd->bandwidth_mutex);
 		return -ENOMEM;
 	}
@@ -1846,7 +1846,7 @@ free_interfaces:
 	 * timeouts.
 	 */
 	if (dev->actconfig && usb_disable_lpm(dev)) {
-		dev_err(&dev->dev, "%s Failed to disable LPM\n.", __func__);
+		dev_err(&dev->dev, "%s Failed to disable LPM\n", __func__);
 		mutex_unlock(hcd->bandwidth_mutex);
 		ret = -ENOMEM;
 		goto free_interfaces;
