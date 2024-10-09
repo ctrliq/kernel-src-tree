@@ -1,0 +1,160 @@
+ipv4: consider TOS in fib_select_default
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Julian Anastasov <ja@ssi.bg>
+commit 2392debc2be721a7d5b907cbcbc0ebb858dead01
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/2392debc.failed
+
+fib_select_default considers alternative routes only when
+res->fi is for the first alias in res->fa_head. In the
+common case this can happen only when the initial lookup
+matches the first alias with highest TOS value. This
+prevents the alternative routes to require specific TOS.
+
+This patch solves the problem as follows:
+
+- routes that require specific TOS should be returned by
+fib_select_default only when TOS matches, as already done
+in fib_table_lookup. This rule implies that depending on the
+TOS we can have many different lists of alternative gateways
+and we have to keep the last used gateway (fa_default) in first
+alias for the TOS instead of using single tb_default value.
+
+- as the aliases are ordered by many keys (TOS desc,
+fib_priority asc), we restrict the possible results to
+routes with matching TOS and lowest metric (fib_priority)
+and routes that match any TOS, again with lowest metric.
+
+For example, packet with TOS 8 can not use gw3 (not lowest
+metric), gw4 (different TOS) and gw6 (not lowest metric),
+all other gateways can be used:
+
+tos 8 via gw1 metric 2 <--- res->fa_head and res->fi
+tos 8 via gw2 metric 2
+tos 8 via gw3 metric 3
+tos 4 via gw4
+tos 0 via gw5
+tos 0 via gw6 metric 1
+
+	Reported-by: Hagen Paul Pfeifer <hagen@jauu.net>
+	Signed-off-by: Julian Anastasov <ja@ssi.bg>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2392debc2be721a7d5b907cbcbc0ebb858dead01)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/fib_semantics.c
+diff --cc net/ipv4/fib_semantics.c
+index 8a694b72dc21,3a06586b170c..000000000000
+--- a/net/ipv4/fib_semantics.c
++++ b/net/ipv4/fib_semantics.c
+@@@ -1436,21 -1242,23 +1448,28 @@@ void fib_select_default(const struct fl
+  
+  		fib_alias_accessed(fa);
+  
+ -		if (!fi) {
+ +		if (fi == NULL) {
+  			if (next_fi != res->fi)
+  				break;
++ 			fa1 = fa;
+  		} else if (!fib_detect_death(fi, order, &last_resort,
+- 					     &last_idx, tb->tb_default)) {
++ 					     &last_idx, fa1->fa_default)) {
+  			fib_result_assign(res, fi);
+- 			tb->tb_default = order;
++ 			fa1->fa_default = order;
+  			goto out;
+  		}
+  		fi = next_fi;
+  		order++;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (order <= 0 || fi == NULL) {
+ +		tb->tb_default = -1;
+++=======
++ 	if (order <= 0 || !fi) {
++ 		if (fa1)
++ 			fa1->fa_default = -1;
+++>>>>>>> 2392debc2be7 (ipv4: consider TOS in fib_select_default)
+  		goto out;
+  	}
+  
+diff --git a/include/net/ip_fib.h b/include/net/ip_fib.h
+index d6ffc0f1a3d4..58f2304e76ac 100644
+--- a/include/net/ip_fib.h
++++ b/include/net/ip_fib.h
+@@ -228,7 +228,6 @@ void fib_notify(struct net *net, struct notifier_block *nb);
+ struct fib_table {
+ 	struct hlist_node	tb_hlist;
+ 	u32			tb_id;
+-	int			tb_default;
+ 	int			tb_num_default;
+ 	struct rcu_head		rcu;
+ 	unsigned long 		*tb_data;
+@@ -360,7 +359,7 @@ __be32 fib_compute_spec_dst(struct sk_buff *skb);
+ int fib_validate_source(struct sk_buff *skb, __be32 src, __be32 dst,
+ 			u8 tos, int oif, struct net_device *dev,
+ 			struct in_device *idev, u32 *itag);
+-void fib_select_default(struct fib_result *res);
++void fib_select_default(const struct flowi4 *flp, struct fib_result *res);
+ #ifdef CONFIG_IP_ROUTE_CLASSID
+ static inline int fib_num_tclassid_users(struct net *net)
+ {
+diff --git a/net/ipv4/fib_lookup.h b/net/ipv4/fib_lookup.h
+index 66564d624d5f..2c15f38cd8dd 100644
+--- a/net/ipv4/fib_lookup.h
++++ b/net/ipv4/fib_lookup.h
+@@ -13,6 +13,7 @@ struct fib_alias {
+ 	u8			fa_state;
+ 	u8			fa_slen;
+ 	u32			tb_id;
++	s16			fa_default;
+ 	struct rcu_head		rcu;
+ };
+ 
+* Unmerged path net/ipv4/fib_semantics.c
+diff --git a/net/ipv4/fib_trie.c b/net/ipv4/fib_trie.c
+index d518e773d80e..3edb3ec358f5 100644
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@ -1204,6 +1204,7 @@ int fib_table_insert(struct net *net, struct fib_table *tb,
+ 			new_fa->fa_state = state & ~FA_S_ACCESSED;
+ 			new_fa->fa_slen = fa->fa_slen;
+ 			new_fa->tb_id = tb->tb_id;
++			new_fa->fa_default = -1;
+ 
+ 			call_fib_entry_notifiers(net, FIB_EVENT_ENTRY_REPLACE,
+ 						 key, plen, fi,
+@@ -1252,6 +1253,7 @@ int fib_table_insert(struct net *net, struct fib_table *tb,
+ 	new_fa->fa_state = 0;
+ 	new_fa->fa_slen = slen;
+ 	new_fa->tb_id = tb->tb_id;
++	new_fa->fa_default = -1;
+ 
+ 	/* Insert new entry to the list. */
+ 	err = fib_insert_alias(t, tp, l, new_fa, fa, key);
+@@ -2055,7 +2057,6 @@ struct fib_table *fib_trie_table(u32 id, struct fib_table *alias)
+ 		return NULL;
+ 
+ 	tb->tb_id = id;
+-	tb->tb_default = -1;
+ 	tb->tb_num_default = 0;
+ 	tb->tb_data = (alias ? alias->__data : tb->__data);
+ 
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index c62c5860782f..60c57d83f6c4 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -2320,7 +2320,7 @@ struct rtable *__ip_route_output_key_hash(struct net *net, struct flowi4 *fl4,
+ 	if (!res.prefixlen &&
+ 	    res.table->tb_num_default > 1 &&
+ 	    res.type == RTN_UNICAST && !fl4->flowi4_oif)
+-		fib_select_default(&res);
++		fib_select_default(fl4, &res);
+ 
+ 	if (!fl4->saddr)
+ 		fl4->saddr = FIB_RES_PREFSRC(net, res);
