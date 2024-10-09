@@ -1,0 +1,112 @@
+qla2xxx: Terminate exchange if corrupted
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Quinn Tran <quinn.tran@cavium.com>
+commit 5f35509db179ca7ed1feaa4b14f841adb06ed220
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5f35509d.failed
+
+Corrupted ATIO is defined as length of fcp_header & fcp_cmd
+payload is less than 0x38. It's the minimum size for a frame to
+carry 8..16 bytes SCSI CDB. The exchange will be dropped or
+terminated if corrupted.
+
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+[ bvanassche: Fixed spelling in patch title ]
+	Signed-off-by: Bart Van Assche <bart.vanassche@sandisk.com>
+(cherry picked from commit 5f35509db179ca7ed1feaa4b14f841adb06ed220)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_target.c
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 94564b5245d8,85dcd7cdffca..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -4664,7 -6459,24 +4665,28 @@@ qlt_24xx_process_atio_queue(struct scsi
+  		pkt = (struct atio_from_isp *)ha->tgt.atio_ring_ptr;
+  		cnt = pkt->u.raw.entry_count;
+  
+++<<<<<<< HEAD
+ +		qlt_24xx_atio_pkt_all_vps(vha, (struct atio_from_isp *)pkt);
+++=======
++ 		if (unlikely(fcpcmd_is_corrupted(ha->tgt.atio_ring_ptr))) {
++ 			/*
++ 			 * This packet is corrupted. The header + payload
++ 			 * can not be trusted. There is no point in passing
++ 			 * it further up.
++ 			 */
++ 			ql_log(ql_log_warn, vha, 0xffff,
++ 			    "corrupted fcp frame SID[%3phN] OXID[%04x] EXCG[%x] %64phN\n",
++ 			    pkt->u.isp24.fcp_hdr.s_id,
++ 			    be16_to_cpu(pkt->u.isp24.fcp_hdr.ox_id),
++ 			    le32_to_cpu(pkt->u.isp24.exchange_addr), pkt);
++ 
++ 			adjust_corrupted_atio(pkt);
++ 			qlt_send_term_exchange(vha, NULL, pkt, ha_locked, 0);
++ 		} else {
++ 			qlt_24xx_atio_pkt_all_vps(vha,
++ 			    (struct atio_from_isp *)pkt, ha_locked);
++ 		}
+++>>>>>>> 5f35509db179 (qla2xxx: Terminate exchange if corrupted)
+  
+  		for (i = 0; i < cnt; i++) {
+  			ha->tgt.atio_ring_index++;
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index e18cc36570ad..e2fe38466ef8 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -1546,7 +1546,8 @@ typedef struct {
+ struct atio {
+ 	uint8_t		entry_type;		/* Entry type. */
+ 	uint8_t		entry_count;		/* Entry count. */
+-	uint8_t		data[58];
++	__le16		attr_n_length;
++	uint8_t		data[56];
+ 	uint32_t	signature;
+ #define ATIO_PROCESSED 0xDEADDEAD		/* Signature */
+ };
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
+diff --git a/drivers/scsi/qla2xxx/qla_target.h b/drivers/scsi/qla2xxx/qla_target.h
+index b33e411f28a0..6cfb6ee98a44 100644
+--- a/drivers/scsi/qla2xxx/qla_target.h
++++ b/drivers/scsi/qla2xxx/qla_target.h
+@@ -408,13 +408,33 @@ struct atio_from_isp {
+ 		struct {
+ 			uint8_t  entry_type;	/* Entry type. */
+ 			uint8_t  entry_count;	/* Entry count. */
+-			uint8_t  data[58];
++			__le16	 attr_n_length;
++#define FCP_CMD_LENGTH_MASK 0x0fff
++#define FCP_CMD_LENGTH_MIN  0x38
++			uint8_t  data[56];
+ 			uint32_t signature;
+ #define ATIO_PROCESSED 0xDEADDEAD		/* Signature */
+ 		} raw;
+ 	} u;
+ } __packed;
+ 
++static inline int fcpcmd_is_corrupted(struct atio *atio)
++{
++	if (atio->entry_type == ATIO_TYPE7 &&
++	    (le16_to_cpu(atio->attr_n_length & FCP_CMD_LENGTH_MASK) <
++	    FCP_CMD_LENGTH_MIN))
++		return 1;
++	else
++		return 0;
++}
++
++/* adjust corrupted atio so we won't trip over the same entry again. */
++static inline void adjust_corrupted_atio(struct atio_from_isp *atio)
++{
++	atio->u.raw.attr_n_length = cpu_to_le16(FCP_CMD_LENGTH_MIN);
++	atio->u.isp24.fcp_cmnd.add_cdb_len = 0;
++}
++
+ #define CTIO_TYPE7 0x12 /* Continue target I/O entry (for 24xx) */
+ 
+ /*
