@@ -1,0 +1,111 @@
+nvme-pci: fix race between poll and IRQ completions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 68fa9dbe0823e4f833ad8ddbb59c9ca279e84d57
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/68fa9dbe.failed
+
+If polling completions are racing with the IRQ triggered by a
+completion, the IRQ handler will find no work and return IRQ_NONE.
+This can trigger complaints about spurious interrupts:
+
+[  560.169153] irq 630: nobody cared (try booting with the "irqpoll" option)
+[  560.175988] CPU: 40 PID: 0 Comm: swapper/40 Not tainted 4.17.0-rc2+ #65
+[  560.175990] Hardware name: Intel Corporation S2600STB/S2600STB, BIOS SE5C620.86B.00.01.0010.010920180151 01/09/2018
+[  560.175991] Call Trace:
+[  560.175994]  <IRQ>
+[  560.176005]  dump_stack+0x5c/0x7b
+[  560.176010]  __report_bad_irq+0x30/0xc0
+[  560.176013]  note_interrupt+0x235/0x280
+[  560.176020]  handle_irq_event_percpu+0x51/0x70
+[  560.176023]  handle_irq_event+0x27/0x50
+[  560.176026]  handle_edge_irq+0x6d/0x180
+[  560.176031]  handle_irq+0xa5/0x110
+[  560.176036]  do_IRQ+0x41/0xc0
+[  560.176042]  common_interrupt+0xf/0xf
+[  560.176043]  </IRQ>
+[  560.176050] RIP: 0010:cpuidle_enter_state+0x9b/0x2b0
+[  560.176052] RSP: 0018:ffffa0ed4659fe98 EFLAGS: 00000246 ORIG_RAX: ffffffffffffffdd
+[  560.176055] RAX: ffff9527beb20a80 RBX: 000000826caee491 RCX: 000000000000001f
+[  560.176056] RDX: 000000826caee491 RSI: 00000000335206ee RDI: 0000000000000000
+[  560.176057] RBP: 0000000000000001 R08: 00000000ffffffff R09: 0000000000000008
+[  560.176059] R10: ffffa0ed4659fe78 R11: 0000000000000001 R12: ffff9527beb29358
+[  560.176060] R13: ffffffffa235d4b8 R14: 0000000000000000 R15: 000000826caed593
+[  560.176065]  ? cpuidle_enter_state+0x8b/0x2b0
+[  560.176071]  do_idle+0x1f4/0x260
+[  560.176075]  cpu_startup_entry+0x6f/0x80
+[  560.176080]  start_secondary+0x184/0x1d0
+[  560.176085]  secondary_startup_64+0xa5/0xb0
+[  560.176088] handlers:
+[  560.178387] [<00000000efb612be>] nvme_irq [nvme]
+[  560.183019] Disabling IRQ #630
+
+A previous commit removed ->cqe_seen that was handling this case,
+but we need to handle this a bit differently due to completions
+now running outside the queue lock. Return IRQ_HANDLED from the
+IRQ handler, if the completion ring head was moved since we last
+saw it.
+
+Fixes: 5cb525c8315f ("nvme-pci: handle completions outside of the queue lock")
+	Reported-by: Keith Busch <keith.busch@intel.com>
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+	Tested-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 68fa9dbe0823e4f833ad8ddbb59c9ca279e84d57)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/pci.c
+index 555634b3136a,917e1714f7d9..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -151,9 -160,9 +151,10 @@@ struct nvme_queue 
+  	s16 cq_vector;
+  	u16 sq_tail;
+  	u16 cq_head;
++ 	u16 last_cq_head;
+  	u16 qid;
+  	u8 cq_phase;
+ +	u8 cqe_seen;
+  	u32 *dbbuf_sq_db;
+  	u32 *dbbuf_cq_db;
+  	u32 *dbbuf_sq_ei;
+@@@ -790,14 -999,23 +791,33 @@@ static int nvme_process_cq(struct nvme_
+  
+  static irqreturn_t nvme_irq(int irq, void *data)
+  {
+ +	irqreturn_t result;
+  	struct nvme_queue *nvmeq = data;
+++<<<<<<< HEAD
+ +	spin_lock(&nvmeq->q_lock);
+ +	nvme_process_cq(nvmeq);
+ +	result = nvmeq->cqe_seen ? IRQ_HANDLED : IRQ_NONE;
+ +	nvmeq->cqe_seen = 0;
+ +	spin_unlock(&nvmeq->q_lock);
+ +	return result;
+++=======
++ 	irqreturn_t ret = IRQ_NONE;
++ 	u16 start, end;
++ 
++ 	spin_lock(&nvmeq->cq_lock);
++ 	if (nvmeq->cq_head != nvmeq->last_cq_head)
++ 		ret = IRQ_HANDLED;
++ 	nvme_process_cq(nvmeq, &start, &end, -1);
++ 	nvmeq->last_cq_head = nvmeq->cq_head;
++ 	spin_unlock(&nvmeq->cq_lock);
++ 
++ 	if (start != end) {
++ 		nvme_complete_cqes(nvmeq, start, end);
++ 		return IRQ_HANDLED;
++ 	}
++ 
++ 	return ret;
+++>>>>>>> 68fa9dbe0823 (nvme-pci: fix race between poll and IRQ completions)
+  }
+  
+  static irqreturn_t nvme_irq_check(int irq, void *data)
+* Unmerged path drivers/nvme/host/pci.c
