@@ -1,0 +1,222 @@
+xfs: don't change inode mode if ACL update fails
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 67f2ffe31d1a683170c2ba0ecc643e42a5fdd397
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/67f2ffe3.failed
+
+If we get ENOSPC half way through setting the ACL, the inode mode
+can still be changed even though the ACL does not exist. Reorder the
+operation to only change the mode of the inode if the ACL is set
+correctly.
+
+Whilst this does not fix the problem with crash consistency (that requires
+attribute addition to be a deferred op) it does prevent ENOSPC and other
+non-fatal errors setting an xattr to be handled sanely.
+
+This fixes xfstests generic/449.
+
+Signed-Off-By: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 67f2ffe31d1a683170c2ba0ecc643e42a5fdd397)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_acl.c
+diff --cc fs/xfs/xfs_acl.c
+index 8ca2ed07db2b,3354140de07e..000000000000
+--- a/fs/xfs/xfs_acl.c
++++ b/fs/xfs/xfs_acl.c
+@@@ -261,156 -244,39 +261,183 @@@ xfs_set_mode(struct inode *inode, umode
+  	return error;
+  }
+  
+ +/*
+ + * No need for i_mutex because the inode is not yet exposed to the VFS.
+ + */
+  int
+ -xfs_set_acl(struct inode *inode, struct posix_acl *acl, int type)
+ +xfs_inherit_acl(struct inode *inode, struct posix_acl *acl)
+  {
+++<<<<<<< HEAD
+ +	umode_t mode = inode->i_mode;
+ +	int error = 0, inherit = 0;
+ +
+ +	if (S_ISDIR(inode->i_mode)) {
+ +		error = xfs_set_acl(inode, ACL_TYPE_DEFAULT, acl);
+ +		if (error)
+ +			goto out;
+ +	}
+ +
+ +	error = posix_acl_create(&acl, GFP_KERNEL, &mode);
+ +	if (error < 0)
+ +		return error;
+ +
+ +	/*
+ +	 * If posix_acl_create returns a positive value we need to
+ +	 * inherit a permission that can't be represented using the Unix
+ +	 * mode bits and we actually need to set an ACL.
+ +	 */
+ +	if (error > 0)
+ +		inherit = 1;
+ +
+ +	error = xfs_set_mode(inode, mode);
+ +	if (error)
+ +		goto out;
+ +
+ +	if (inherit)
+ +		error = xfs_set_acl(inode, ACL_TYPE_ACCESS, acl);
+ +
+ +out:
+ +	posix_acl_release(acl);
+ +	return error;
+ +}
+ +
+ +int
+ +xfs_acl_chmod(struct inode *inode)
+ +{
+ +	struct posix_acl *acl;
+ +	int error;
+ +
+ +	if (S_ISLNK(inode->i_mode))
+ +		return -EOPNOTSUPP;
+ +
+ +	acl = xfs_get_acl(inode, ACL_TYPE_ACCESS);
+ +	if (IS_ERR(acl) || !acl)
+ +		return PTR_ERR(acl);
+ +
+ +	error = posix_acl_chmod(&acl, GFP_KERNEL, inode->i_mode);
+ +	if (error)
+ +		return error;
+ +
+ +	error = xfs_set_acl(inode, ACL_TYPE_ACCESS, acl);
+ +	posix_acl_release(acl);
+ +	return error;
+ +}
+ +
+ +static int
+ +xfs_xattr_acl_get(struct dentry *dentry, const char *name,
+ +		void *value, size_t size, int type)
+ +{
+ +	struct posix_acl *acl;
+ +	int error;
+ +
+ +	acl = xfs_get_acl(dentry->d_inode, type);
+ +	if (IS_ERR(acl))
+ +		return PTR_ERR(acl);
+ +	if (acl == NULL)
+ +		return -ENODATA;
+ +
+ +	error = posix_acl_to_xattr(&init_user_ns, acl, value, size);
+ +	posix_acl_release(acl);
+ +
+ +	return error;
+ +}
+ +
+ +static int
+ +xfs_xattr_acl_set(struct dentry *dentry, const char *name,
+ +		const void *value, size_t size, int flags, int type)
+ +{
+ +	struct inode *inode = dentry->d_inode;
+ +	struct posix_acl *acl = NULL, *real_acl = NULL;
+++=======
++ 	umode_t mode;
++ 	bool set_mode = false;
+++>>>>>>> 67f2ffe31d1a (xfs: don't change inode mode if ACL update fails)
+  	int error = 0;
+  
+ -	if (!acl)
+ +	if (flags & XATTR_CREATE)
+ +		return -EINVAL;
+ +	if (type == ACL_TYPE_DEFAULT && !S_ISDIR(inode->i_mode))
+ +		return value ? -EACCES : 0;
+ +	if (!inode_owner_or_capable(inode))
+ +		return -EPERM;
+ +
+ +	if (!value)
+  		goto set_acl;
+  
+ +	acl = posix_acl_from_xattr(&init_user_ns, value, size);
+ +	if (!acl) {
+ +		/*
+ +		 * acl_set_file(3) may request that we set default ACLs with
+ +		 * zero length -- defend (gracefully) against that here.
+ +		 */
+ +		goto out;
+ +	}
+ +	if (IS_ERR(acl)) {
+ +		error = PTR_ERR(acl);
+ +		goto out;
+ +	}
+ +
+ +	error = posix_acl_valid(acl);
+ +	if (error)
+ +		goto out_release;
+ +
+  	error = -E2BIG;
+  	if (acl->a_count > XFS_ACL_MAX_ENTRIES(XFS_M(inode->i_sb)))
+ -		return error;
+ +		goto out_release;
+  
+ +	real_acl = acl;
+  	if (type == ACL_TYPE_ACCESS) {
+++<<<<<<< HEAD
+ +		umode_t mode;
+ +
+ +		error = posix_acl_update_mode(inode, &mode, &real_acl);
+ +		if (error)
+ +			goto out_release;
+ +
+ +		error = xfs_set_mode(inode, mode);
+ +		if (error)
+ +			goto out_release;
+ +	}
+ +
+ + set_acl:
+ +	error = xfs_set_acl(inode, type, real_acl);
+ + out_release:
+ +	posix_acl_release(acl);
+ + out:
+++=======
++ 		error = posix_acl_update_mode(inode, &mode, &acl);
++ 		if (error)
++ 			return error;
++ 		set_mode = true;
++ 	}
++ 
++  set_acl:
++ 	error =  __xfs_set_acl(inode, acl, type);
++ 	if (error)
++ 		return error;
++ 
++ 	/*
++ 	 * We set the mode after successfully updating the ACL xattr because the
++ 	 * xattr update can fail at ENOSPC and we don't want to change the mode
++ 	 * if the ACL update hasn't been applied.
++ 	 */
++ 	if (set_mode)
++ 		error = xfs_set_mode(inode, mode);
++ 
+++>>>>>>> 67f2ffe31d1a (xfs: don't change inode mode if ACL update fails)
+  	return error;
+  }
+ +
+ +const struct xattr_handler xfs_xattr_acl_access_handler = {
+ +	.prefix	= POSIX_ACL_XATTR_ACCESS,
+ +	.flags	= ACL_TYPE_ACCESS,
+ +	.get	= xfs_xattr_acl_get,
+ +	.set	= xfs_xattr_acl_set,
+ +};
+ +
+ +const struct xattr_handler xfs_xattr_acl_default_handler = {
+ +	.prefix	= POSIX_ACL_XATTR_DEFAULT,
+ +	.flags	= ACL_TYPE_DEFAULT,
+ +	.get	= xfs_xattr_acl_get,
+ +	.set	= xfs_xattr_acl_set,
+ +};
+* Unmerged path fs/xfs/xfs_acl.c
