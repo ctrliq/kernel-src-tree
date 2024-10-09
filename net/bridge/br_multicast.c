@@ -26,6 +26,7 @@
 #include <linux/timer.h>
 #include <linux/inetdevice.h>
 #include <net/ip.h>
+#include <net/switchdev.h>
 #if IS_ENABLED(CONFIG_IPV6)
 #include <net/ipv6.h>
 #include <net/mld.h>
@@ -1006,6 +1007,18 @@ static void br_ip6_multicast_port_query_expired(unsigned long data)
 }
 #endif
 
+static void br_mc_disabled_update(struct net_device *dev, bool value)
+{
+	struct switchdev_attr attr = {
+		.orig_dev = dev,
+		.id = SWITCHDEV_ATTR_ID_BRIDGE_MC_DISABLED,
+		.flags = SWITCHDEV_F_DEFER,
+		.u.mc_disabled = value,
+	};
+
+	switchdev_port_attr_set(dev, &attr);
+}
+
 int br_multicast_add_port(struct net_bridge_port *port)
 {
 	port->multicast_router = MDB_RTR_TYPE_TEMP_QUERY;
@@ -1018,6 +1031,8 @@ int br_multicast_add_port(struct net_bridge_port *port)
 	setup_timer(&port->ip6_own_query.timer,
 		    br_ip6_multicast_port_query_expired, (unsigned long)port);
 #endif
+	br_mc_disabled_update(port->dev, port->br->multicast_disabled);
+
 	port->mcast_stats = netdev_alloc_pcpu_stats(struct bridge_mcast_stats);
 	if (!port->mcast_stats)
 		return -ENOMEM;
@@ -2099,6 +2114,7 @@ int br_multicast_toggle(struct net_bridge *br, unsigned long val)
 	if (br->multicast_disabled == !val)
 		goto unlock;
 
+	br_mc_disabled_update(br->dev, !val);
 	br->multicast_disabled = !val;
 	if (br->multicast_disabled)
 		goto unlock;
