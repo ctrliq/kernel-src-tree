@@ -1,0 +1,265 @@
+drm/i915: Reject unknown syncobj flags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+commit ebcaa1ff8b59097805d548fe7a676f194625c033
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ebcaa1ff.failed
+
+We have to reject unknown flags for uAPI considerations, and also
+because the curent implementation limits their i915 storage space
+to two bits.
+
+v2: (Chris Wilson)
+ * Fix fail in ABI check.
+ * Added unknown flags and BUILD_BUG_ON.
+
+v3:
+ * Use ARCH_KMALLOC_MINALIGN instead of alignof. (Chris Wilson)
+
+	Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Fixes: cf6e7bac6357 ("drm/i915: Add support for drm syncobjs")
+	Cc: Jason Ekstrand <jason@jlekstrand.net>
+	Cc: Chris Wilson <chris@chris-wilson.co.uk>
+	Cc: Jani Nikula <jani.nikula@linux.intel.com>
+	Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+	Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+	Cc: David Airlie <airlied@linux.ie>
+	Cc: intel-gfx@lists.freedesktop.org
+	Cc: dri-devel@lists.freedesktop.org
+	Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/20171031102326.9738-1-tvrtko.ursulin@linux.intel.com
+(cherry picked from commit ebcaa1ff8b59097805d548fe7a676f194625c033)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_gem_execbuffer.c
+#	include/uapi/drm/i915_drm.h
+diff --cc drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 3d37a15531ad,435ed95df144..000000000000
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@@ -1528,34 -2062,169 +1528,112 @@@ eb_select_engine(struct drm_i915_privat
+  	return engine;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ __free_fence_array(struct drm_syncobj **fences, unsigned int n)
++ {
++ 	while (n--)
++ 		drm_syncobj_put(ptr_mask_bits(fences[n], 2));
++ 	kvfree(fences);
++ }
++ 
++ static struct drm_syncobj **
++ get_fence_array(struct drm_i915_gem_execbuffer2 *args,
++ 		struct drm_file *file)
++ {
++ 	const unsigned int nfences = args->num_cliprects;
++ 	struct drm_i915_gem_exec_fence __user *user;
++ 	struct drm_syncobj **fences;
++ 	unsigned int n;
++ 	int err;
++ 
++ 	if (!(args->flags & I915_EXEC_FENCE_ARRAY))
++ 		return NULL;
++ 
++ 	if (nfences > SIZE_MAX / sizeof(*fences))
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	user = u64_to_user_ptr(args->cliprects_ptr);
++ 	if (!access_ok(VERIFY_READ, user, nfences * 2 * sizeof(u32)))
++ 		return ERR_PTR(-EFAULT);
++ 
++ 	fences = kvmalloc_array(args->num_cliprects, sizeof(*fences),
++ 				__GFP_NOWARN | GFP_KERNEL);
++ 	if (!fences)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	for (n = 0; n < nfences; n++) {
++ 		struct drm_i915_gem_exec_fence fence;
++ 		struct drm_syncobj *syncobj;
++ 
++ 		if (__copy_from_user(&fence, user++, sizeof(fence))) {
++ 			err = -EFAULT;
++ 			goto err;
++ 		}
++ 
++ 		if (fence.flags & __I915_EXEC_FENCE_UNKNOWN_FLAGS) {
++ 			err = -EINVAL;
++ 			goto err;
++ 		}
++ 
++ 		syncobj = drm_syncobj_find(file, fence.handle);
++ 		if (!syncobj) {
++ 			DRM_DEBUG("Invalid syncobj handle provided\n");
++ 			err = -ENOENT;
++ 			goto err;
++ 		}
++ 
++ 		BUILD_BUG_ON(~(ARCH_KMALLOC_MINALIGN - 1) &
++ 			     ~__I915_EXEC_FENCE_UNKNOWN_FLAGS);
++ 
++ 		fences[n] = ptr_pack_bits(syncobj, fence.flags, 2);
++ 	}
++ 
++ 	return fences;
++ 
++ err:
++ 	__free_fence_array(fences, n);
++ 	return ERR_PTR(err);
++ }
++ 
++ static void
++ put_fence_array(struct drm_i915_gem_execbuffer2 *args,
++ 		struct drm_syncobj **fences)
++ {
++ 	if (fences)
++ 		__free_fence_array(fences, args->num_cliprects);
++ }
++ 
+++>>>>>>> ebcaa1ff8b59 (drm/i915: Reject unknown syncobj flags)
+  static int
+ -await_fence_array(struct i915_execbuffer *eb,
+ -		  struct drm_syncobj **fences)
+ -{
+ -	const unsigned int nfences = eb->args->num_cliprects;
+ -	unsigned int n;
+ -	int err;
+ -
+ -	for (n = 0; n < nfences; n++) {
+ -		struct drm_syncobj *syncobj;
+ -		struct dma_fence *fence;
+ -		unsigned int flags;
+ -
+ -		syncobj = ptr_unpack_bits(fences[n], &flags, 2);
+ -		if (!(flags & I915_EXEC_FENCE_WAIT))
+ -			continue;
+ -
+ -		fence = drm_syncobj_fence_get(syncobj);
+ -		if (!fence)
+ -			return -EINVAL;
+ -
+ -		err = i915_gem_request_await_dma_fence(eb->request, fence);
+ -		dma_fence_put(fence);
+ -		if (err < 0)
+ -			return err;
+ -	}
+ -
+ -	return 0;
+ -}
+ -
+ -static void
+ -signal_fence_array(struct i915_execbuffer *eb,
+ -		   struct drm_syncobj **fences)
+ -{
+ -	const unsigned int nfences = eb->args->num_cliprects;
+ -	struct dma_fence * const fence = &eb->request->fence;
+ -	unsigned int n;
+ -
+ -	for (n = 0; n < nfences; n++) {
+ -		struct drm_syncobj *syncobj;
+ -		unsigned int flags;
+ -
+ -		syncobj = ptr_unpack_bits(fences[n], &flags, 2);
+ -		if (!(flags & I915_EXEC_FENCE_SIGNAL))
+ -			continue;
+ -
+ -		drm_syncobj_replace_fence(syncobj, fence);
+ -	}
+ -}
+ -
+ -static int
+ -i915_gem_do_execbuffer(struct drm_device *dev,
+ +i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+  		       struct drm_file *file,
+  		       struct drm_i915_gem_execbuffer2 *args,
+ -		       struct drm_i915_gem_exec_object2 *exec,
+ -		       struct drm_syncobj **fences)
+ +		       struct drm_i915_gem_exec_object2 *exec)
+  {
+ -	struct i915_execbuffer eb;
+ -	struct dma_fence *in_fence = NULL;
+ -	struct sync_file *out_fence = NULL;
+ -	int out_fence_fd = -1;
+ -	int err;
+ -
+ -	BUILD_BUG_ON(__EXEC_INTERNAL_FLAGS & ~__I915_EXEC_ILLEGAL_FLAGS);
+ -	BUILD_BUG_ON(__EXEC_OBJECT_INTERNAL_FLAGS &
+ -		     ~__EXEC_OBJECT_UNKNOWN_FLAGS);
+ -
+ -	eb.i915 = to_i915(dev);
+ -	eb.file = file;
+ -	eb.args = args;
+ -	if (DBG_FORCE_RELOC || !(args->flags & I915_EXEC_NO_RELOC))
+ -		args->flags |= __EXEC_HAS_RELOC;
+ -
+ -	eb.exec = exec;
+ -	eb.vma = (struct i915_vma **)(exec + args->buffer_count + 1);
+ -	eb.vma[0] = NULL;
+ -	eb.flags = (unsigned int *)(eb.vma + args->buffer_count + 1);
+ +	struct drm_i915_private *dev_priv = to_i915(dev);
+ +	struct i915_ggtt *ggtt = &dev_priv->ggtt;
+ +	struct eb_vmas *eb;
+ +	struct drm_i915_gem_exec_object2 shadow_exec_entry;
+ +	struct intel_engine_cs *engine;
+ +	struct i915_gem_context *ctx;
+ +	struct i915_address_space *vm;
+ +	struct i915_execbuffer_params params_master; /* XXX: will be removed later */
+ +	struct i915_execbuffer_params *params = &params_master;
+ +	const u32 ctx_id = i915_execbuffer2_get_context_id(*args);
+ +	u32 dispatch_flags;
+ +	int ret;
+ +	bool need_relocs;
+  
+ -	eb.invalid_flags = __EXEC_OBJECT_UNKNOWN_FLAGS;
+ -	if (USES_FULL_PPGTT(eb.i915))
+ -		eb.invalid_flags |= EXEC_OBJECT_NEEDS_GTT;
+ -	reloc_cache_init(&eb.reloc_cache, eb.i915);
+ +	if (!i915_gem_check_execbuffer(args))
+ +		return -EINVAL;
+  
+ -	eb.buffer_count = args->buffer_count;
+ -	eb.batch_start_offset = args->batch_start_offset;
+ -	eb.batch_len = args->batch_len;
+ +	ret = validate_exec_list(dev, exec, args->buffer_count);
+ +	if (ret)
+ +		return ret;
+  
+ -	eb.batch_flags = 0;
+ +	dispatch_flags = 0;
+  	if (args->flags & I915_EXEC_SECURE) {
+  		if (!drm_is_current_master(file) || !capable(CAP_SYS_ADMIN))
+  		    return -EPERM;
+diff --cc include/uapi/drm/i915_drm.h
+index 1c12a350eca3,ac3c6503ca27..000000000000
+--- a/include/uapi/drm/i915_drm.h
++++ b/include/uapi/drm/i915_drm.h
+@@@ -745,6 -831,18 +745,21 @@@ struct drm_i915_gem_exec_object2 
+  	__u64 rsvd2;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct drm_i915_gem_exec_fence {
++ 	/**
++ 	 * User's handle for a drm_syncobj to wait on or signal.
++ 	 */
++ 	__u32 handle;
++ 
++ #define I915_EXEC_FENCE_WAIT            (1<<0)
++ #define I915_EXEC_FENCE_SIGNAL          (1<<1)
++ #define __I915_EXEC_FENCE_UNKNOWN_FLAGS (-(I915_EXEC_FENCE_SIGNAL << 1))
++ 	__u32 flags;
++ };
++ 
+++>>>>>>> ebcaa1ff8b59 (drm/i915: Reject unknown syncobj flags)
+  struct drm_i915_gem_execbuffer2 {
+  	/**
+  	 * List of gem_exec_object2 structs
+* Unmerged path drivers/gpu/drm/i915/i915_gem_execbuffer.c
+* Unmerged path include/uapi/drm/i915_drm.h
