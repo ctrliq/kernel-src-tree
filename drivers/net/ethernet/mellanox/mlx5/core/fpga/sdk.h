@@ -42,8 +42,14 @@
  * This header defines the in-kernel API for Innova FPGA client drivers.
  */
 
+/**
+ * enum mlx5_fpga_access_type - Enumerated the different methods possible for
+ * accessing the device memory address space
+ */
 enum mlx5_fpga_access_type {
+	/** Use the slow CX-FPGA I2C bus */
 	MLX5_FPGA_ACCESS_TYPE_I2C = 0x0,
+	/** Use the fastest available method */
 	MLX5_FPGA_ACCESS_TYPE_DONTCARE = 0x0,
 };
 
