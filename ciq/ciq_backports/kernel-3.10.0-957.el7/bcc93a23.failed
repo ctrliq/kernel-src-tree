@@ -1,0 +1,222 @@
+nfp: register devlink after app is created
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit bcc93a23ca595fb1d7d7540bec68196a3715da13
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/bcc93a23.failed
+
+Devlink used to have two global locks: devlink lock and port lock,
+our lock ordering looked like this:
+
+  devlink lock -> driver's pf->lock -> devlink port lock
+
+After recent changes port lock was replaced with per-instance
+lock.  Unfortunately, new per-instance lock is taken on most
+operations now.  This means we can only grab the pf->lock from
+the port split/unsplit ops.  Lock ordering looks like this:
+
+  devlink lock -> driver's pf->lock -> devlink instance lock
+
+Since we can't take pf->lock from most devlink ops, make sure
+nfp_apps are prepared to service them as soon as devlink is
+registered.  Locking the pf must be pushed down after
+nfp_app_init() callback.
+
+The init order looks like this:
+ nfp_app_init
+ devlink_register
+ nfp_app_start
+ netdev/port_register
+
+As soon as app_init is done nfp_apps must be ready to service
+devlink-related callbacks.  apps can only register their own
+devlink objects from nfp_app_start.
+
+Fixes: 2406e7e546b2 ("devlink: Add per devlink instance lock")
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bcc93a23ca595fb1d7d7540bec68196a3715da13)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_main.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_main.c
+index d68955fb796f,c5b91040b12e..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_main.c
+@@@ -540,9 -543,8 +536,7 @@@ err_fw_unload
+  	if (pf->fw_loaded)
+  		nfp_fw_unload(pf);
+  	kfree(pf->eth_tbl);
+ -	kfree(pf->nspi);
+  	vfree(pf->dumpspec);
+- err_devlink_unreg:
+- 	devlink_unregister(devlink);
+  err_hwinfo_free:
+  	kfree(pf->hwinfo);
+  	nfp_cpp_free(pf->cpp);
+@@@ -563,11 -565,8 +557,14 @@@ err_pci_disable
+  static void nfp_pci_remove(struct pci_dev *pdev)
+  {
+  	struct nfp_pf *pf = pci_get_drvdata(pdev);
+- 	struct devlink *devlink;
+  
+++<<<<<<< HEAD
+ +	devlink = priv_to_devlink(pf);
+ +
+ +	nfp_net_pci_remove(pf);
+++=======
++ 	nfp_hwmon_unregister(pf);
+++>>>>>>> bcc93a23ca59 (nfp: register devlink after app is created)
+  
+  	nfp_pcie_sriov_disable(pdev);
+  	pci_sriov_set_totalvfs(pf->pdev, 0);
+@@@ -586,8 -585,9 +583,8 @@@
+  	nfp_cpp_free(pf->cpp);
+  
+  	kfree(pf->eth_tbl);
+ -	kfree(pf->nspi);
+  	mutex_destroy(&pf->lock);
+- 	devlink_free(devlink);
++ 	devlink_free(priv_to_devlink(pf));
+  	pci_release_regions(pdev);
+  	pci_disable_device(pdev);
+  }
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_devlink.c b/drivers/net/ethernet/netronome/nfp/nfp_devlink.c
+index 6c9f29c2e975..eb0fc614673d 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_devlink.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_devlink.c
+@@ -152,18 +152,8 @@ out:
+ static int nfp_devlink_eswitch_mode_get(struct devlink *devlink, u16 *mode)
+ {
+ 	struct nfp_pf *pf = devlink_priv(devlink);
+-	int ret;
+-
+-	mutex_lock(&pf->lock);
+-	if (!pf->app) {
+-		ret = -EBUSY;
+-		goto out;
+-	}
+-	ret = nfp_app_eswitch_mode_get(pf->app, mode);
+-out:
+-	mutex_unlock(&pf->lock);
+ 
+-	return ret;
++	return nfp_app_eswitch_mode_get(pf->app, mode);
+ }
+ 
+ const struct devlink_ops nfp_devlink_ops = {
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_main.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+index e4f4aa5c298e..fd9554002fca 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+@@ -373,7 +373,9 @@ nfp_net_pf_app_init(struct nfp_pf *pf, u8 __iomem *qc_bar, unsigned int stride)
+ 	if (IS_ERR(pf->app))
+ 		return PTR_ERR(pf->app);
+ 
++	mutex_lock(&pf->lock);
+ 	err = nfp_app_init(pf->app);
++	mutex_unlock(&pf->lock);
+ 	if (err)
+ 		goto err_free;
+ 
+@@ -401,7 +403,9 @@ nfp_net_pf_app_init(struct nfp_pf *pf, u8 __iomem *qc_bar, unsigned int stride)
+ err_unmap:
+ 	nfp_cpp_area_release_free(pf->ctrl_vnic_bar);
+ err_app_clean:
++	mutex_lock(&pf->lock);
+ 	nfp_app_clean(pf->app);
++	mutex_unlock(&pf->lock);
+ err_free:
+ 	nfp_app_free(pf->app);
+ 	pf->app = NULL;
+@@ -414,7 +418,11 @@ static void nfp_net_pf_app_clean(struct nfp_pf *pf)
+ 		nfp_net_pf_free_vnic(pf, pf->ctrl_vnic);
+ 		nfp_cpp_area_release_free(pf->ctrl_vnic_bar);
+ 	}
++
++	mutex_lock(&pf->lock);
+ 	nfp_app_clean(pf->app);
++	mutex_unlock(&pf->lock);
++
+ 	nfp_app_free(pf->app);
+ 	pf->app = NULL;
+ }
+@@ -693,6 +701,7 @@ int nfp_net_refresh_eth_port(struct nfp_port *port)
+  */
+ int nfp_net_pci_probe(struct nfp_pf *pf)
+ {
++	struct devlink *devlink = priv_to_devlink(pf);
+ 	struct nfp_net_fw_version fw_ver;
+ 	u8 __iomem *ctrl_bar, *qc_bar;
+ 	int stride;
+@@ -706,16 +715,13 @@ int nfp_net_pci_probe(struct nfp_pf *pf)
+ 		return -EINVAL;
+ 	}
+ 
+-	mutex_lock(&pf->lock);
+ 	pf->max_data_vnics = nfp_net_pf_get_num_ports(pf);
+-	if ((int)pf->max_data_vnics < 0) {
+-		err = pf->max_data_vnics;
+-		goto err_unlock;
+-	}
++	if ((int)pf->max_data_vnics < 0)
++		return pf->max_data_vnics;
+ 
+ 	err = nfp_net_pci_map_mem(pf);
+ 	if (err)
+-		goto err_unlock;
++		return err;
+ 
+ 	ctrl_bar = nfp_cpp_area_iomem(pf->data_vnic_bar);
+ 	qc_bar = nfp_cpp_area_iomem(pf->qc_area);
+@@ -754,6 +760,11 @@ int nfp_net_pci_probe(struct nfp_pf *pf)
+ 	if (err)
+ 		goto err_unmap;
+ 
++	err = devlink_register(devlink, &pf->pdev->dev);
++	if (err)
++		goto err_app_clean;
++
++	mutex_lock(&pf->lock);
+ 	pf->ddir = nfp_net_debugfs_device_add(pf->pdev);
+ 
+ 	/* Allocate the vnics and do basic init */
+@@ -785,12 +796,13 @@ err_free_vnics:
+ 	nfp_net_pf_free_vnics(pf);
+ err_clean_ddir:
+ 	nfp_net_debugfs_dir_clean(&pf->ddir);
++	mutex_unlock(&pf->lock);
++	cancel_work_sync(&pf->port_refresh_work);
++	devlink_unregister(devlink);
++err_app_clean:
+ 	nfp_net_pf_app_clean(pf);
+ err_unmap:
+ 	nfp_net_pci_unmap_mem(pf);
+-err_unlock:
+-	mutex_unlock(&pf->lock);
+-	cancel_work_sync(&pf->port_refresh_work);
+ 	return err;
+ }
+ 
+@@ -810,11 +822,13 @@ void nfp_net_pci_remove(struct nfp_pf *pf)
+ 	/* stop app first, to avoid double free of ctrl vNIC's ddir */
+ 	nfp_net_debugfs_dir_clean(&pf->ddir);
+ 
++	mutex_unlock(&pf->lock);
++
++	devlink_unregister(priv_to_devlink(pf));
++
+ 	nfp_net_pf_free_irqs(pf);
+ 	nfp_net_pf_app_clean(pf);
+ 	nfp_net_pci_unmap_mem(pf);
+ 
+-	mutex_unlock(&pf->lock);
+-
+ 	cancel_work_sync(&pf->port_refresh_work);
+ }
