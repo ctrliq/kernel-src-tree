@@ -1,0 +1,229 @@
+cxgb4: implement ndo_features_check
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Ganesh Goudar <ganeshgr@chelsio.com>
+commit 4621ffd604f935bd3c5d989364ef586c5ff79c98
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/4621ffd6.failed
+
+	Signed-off-by: Ganesh Goudar <ganeshgr@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4621ffd604f935bd3c5d989364ef586c5ff79c98)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index 78a568c4dc20,3293980ce6e0..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@@ -2939,6 -2957,182 +2939,185 @@@ static int cxgb_setup_tc(struct net_dev
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int cxgb_setup_tc_block(struct net_device *dev,
++ 			       struct tc_block_offload *f)
++ {
++ 	struct port_info *pi = netdev2pinfo(dev);
++ 
++ 	if (f->binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (f->command) {
++ 	case TC_BLOCK_BIND:
++ 		return tcf_block_cb_register(f->block, cxgb_setup_tc_block_cb,
++ 					     pi, dev);
++ 	case TC_BLOCK_UNBIND:
++ 		tcf_block_cb_unregister(f->block, cxgb_setup_tc_block_cb, pi);
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int cxgb_setup_tc(struct net_device *dev, enum tc_setup_type type,
++ 			 void *type_data)
++ {
++ 	switch (type) {
++ 	case TC_SETUP_BLOCK:
++ 		return cxgb_setup_tc_block(dev, type_data);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static void cxgb_del_udp_tunnel(struct net_device *netdev,
++ 				struct udp_tunnel_info *ti)
++ {
++ 	struct port_info *pi = netdev_priv(netdev);
++ 	struct adapter *adapter = pi->adapter;
++ 	unsigned int chip_ver = CHELSIO_CHIP_VERSION(adapter->params.chip);
++ 	u8 match_all_mac[] = { 0, 0, 0, 0, 0, 0 };
++ 	int ret = 0, i;
++ 
++ 	if (chip_ver < CHELSIO_T6)
++ 		return;
++ 
++ 	switch (ti->type) {
++ 	case UDP_TUNNEL_TYPE_VXLAN:
++ 		if (!adapter->vxlan_port_cnt ||
++ 		    adapter->vxlan_port != ti->port)
++ 			return; /* Invalid VxLAN destination port */
++ 
++ 		adapter->vxlan_port_cnt--;
++ 		if (adapter->vxlan_port_cnt)
++ 			return;
++ 
++ 		adapter->vxlan_port = 0;
++ 		t4_write_reg(adapter, MPS_RX_VXLAN_TYPE_A, 0);
++ 		break;
++ 	default:
++ 		return;
++ 	}
++ 
++ 	/* Matchall mac entries can be deleted only after all tunnel ports
++ 	 * are brought down or removed.
++ 	 */
++ 	if (!adapter->rawf_cnt)
++ 		return;
++ 	for_each_port(adapter, i) {
++ 		pi = adap2pinfo(adapter, i);
++ 		ret = t4_free_raw_mac_filt(adapter, pi->viid,
++ 					   match_all_mac, match_all_mac,
++ 					   adapter->rawf_start +
++ 					    pi->port_id,
++ 					   1, pi->port_id, true);
++ 		if (ret < 0) {
++ 			netdev_info(netdev, "Failed to free mac filter entry, for port %d\n",
++ 				    i);
++ 			return;
++ 		}
++ 		atomic_dec(&adapter->mps_encap[adapter->rawf_start +
++ 			   pi->port_id].refcnt);
++ 	}
++ }
++ 
++ static void cxgb_add_udp_tunnel(struct net_device *netdev,
++ 				struct udp_tunnel_info *ti)
++ {
++ 	struct port_info *pi = netdev_priv(netdev);
++ 	struct adapter *adapter = pi->adapter;
++ 	unsigned int chip_ver = CHELSIO_CHIP_VERSION(adapter->params.chip);
++ 	u8 match_all_mac[] = { 0, 0, 0, 0, 0, 0 };
++ 	int i, ret;
++ 
++ 	if (chip_ver < CHELSIO_T6)
++ 		return;
++ 
++ 	switch (ti->type) {
++ 	case UDP_TUNNEL_TYPE_VXLAN:
++ 		/* For T6 fw reserves last 2 entries for
++ 		 * storing match all mac filter (config file entry).
++ 		 */
++ 		if (!adapter->rawf_cnt)
++ 			return;
++ 
++ 		/* Callback for adding vxlan port can be called with the same
++ 		 * port for both IPv4 and IPv6. We should not disable the
++ 		 * offloading when the same port for both protocols is added
++ 		 * and later one of them is removed.
++ 		 */
++ 		if (adapter->vxlan_port_cnt &&
++ 		    adapter->vxlan_port == ti->port) {
++ 			adapter->vxlan_port_cnt++;
++ 			return;
++ 		}
++ 
++ 		/* We will support only one VxLAN port */
++ 		if (adapter->vxlan_port_cnt) {
++ 			netdev_info(netdev, "UDP port %d already offloaded, not adding port %d\n",
++ 				    be16_to_cpu(adapter->vxlan_port),
++ 				    be16_to_cpu(ti->port));
++ 			return;
++ 		}
++ 
++ 		adapter->vxlan_port = ti->port;
++ 		adapter->vxlan_port_cnt = 1;
++ 
++ 		t4_write_reg(adapter, MPS_RX_VXLAN_TYPE_A,
++ 			     VXLAN_V(be16_to_cpu(ti->port)) | VXLAN_EN_F);
++ 		break;
++ 	default:
++ 		return;
++ 	}
++ 
++ 	/* Create a 'match all' mac filter entry for inner mac,
++ 	 * if raw mac interface is supported. Once the linux kernel provides
++ 	 * driver entry points for adding/deleting the inner mac addresses,
++ 	 * we will remove this 'match all' entry and fallback to adding
++ 	 * exact match filters.
++ 	 */
++ 	if (adapter->rawf_cnt) {
++ 		for_each_port(adapter, i) {
++ 			pi = adap2pinfo(adapter, i);
++ 
++ 			ret = t4_alloc_raw_mac_filt(adapter, pi->viid,
++ 						    match_all_mac,
++ 						    match_all_mac,
++ 						    adapter->rawf_start +
++ 						    pi->port_id,
++ 						    1, pi->port_id, true);
++ 			if (ret < 0) {
++ 				netdev_info(netdev, "Failed to allocate a mac filter entry, not adding port %d\n",
++ 					    be16_to_cpu(ti->port));
++ 				cxgb_del_udp_tunnel(netdev, ti);
++ 				return;
++ 			}
++ 			atomic_inc(&adapter->mps_encap[ret].refcnt);
++ 		}
++ 	}
++ }
++ 
++ static netdev_features_t cxgb_features_check(struct sk_buff *skb,
++ 					     struct net_device *dev,
++ 					     netdev_features_t features)
++ {
++ 	struct port_info *pi = netdev_priv(dev);
++ 	struct adapter *adapter = pi->adapter;
++ 
++ 	if (CHELSIO_CHIP_VERSION(adapter->params.chip) < CHELSIO_T6)
++ 		return features;
++ 
++ 	/* Check if hw supports offload for this packet */
++ 	if (!skb->encapsulation || cxgb_encap_offload_supported(skb))
++ 		return features;
++ 
++ 	/* Offload is not supported for this encapsulated packet */
++ 	return features & ~(NETIF_F_CSUM_MASK | NETIF_F_GSO_MASK);
++ }
++ 
+++>>>>>>> 4621ffd604f9 (cxgb4: implement ndo_features_check)
+  static netdev_features_t cxgb_fix_features(struct net_device *dev,
+  					   netdev_features_t features)
+  {
+@@@ -2965,8 -3158,15 +3144,20 @@@ static const struct net_device_ops cxgb
+  #ifdef CONFIG_NET_POLL_CONTROLLER
+  	.ndo_poll_controller  = cxgb_netpoll,
+  #endif
+++<<<<<<< HEAD
+ +	.extended.ndo_set_tx_maxrate   = cxgb_set_tx_maxrate,
+ +	.extended.ndo_setup_tc_rh      = cxgb_setup_tc,
+++=======
++ #ifdef CONFIG_CHELSIO_T4_FCOE
++ 	.ndo_fcoe_enable      = cxgb_fcoe_enable,
++ 	.ndo_fcoe_disable     = cxgb_fcoe_disable,
++ #endif /* CONFIG_CHELSIO_T4_FCOE */
++ 	.ndo_set_tx_maxrate   = cxgb_set_tx_maxrate,
++ 	.ndo_setup_tc         = cxgb_setup_tc,
++ 	.ndo_udp_tunnel_add   = cxgb_add_udp_tunnel,
++ 	.ndo_udp_tunnel_del   = cxgb_del_udp_tunnel,
++ 	.ndo_features_check   = cxgb_features_check,
+++>>>>>>> 4621ffd604f9 (cxgb4: implement ndo_features_check)
+  	.ndo_fix_features     = cxgb_fix_features,
+  };
+  
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
