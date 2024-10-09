@@ -1,0 +1,161 @@
+mlx4: dma_dir is a mlx4_en_priv attribute
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 69ba943151b2e40e201700cf5b3a94e433c6fd83
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/69ba9431.failed
+
+No need to duplicate it for all queues and frags.
+
+num_frags & log_rx_info become u8 to save space.
+u8 accesses are a bit faster than u16 anyway.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Acked-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 69ba943151b2e40e201700cf5b3a94e433c6fd83)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/en_rx.c
+#	drivers/net/ethernet/mellanox/mlx4/en_tx.c
+#	drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_rx.c
+index 984f22166c89,6183128b2d3d..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@@ -144,9 -146,10 +144,9 @@@ static void mlx4_en_free_frag(struct ml
+  	const struct mlx4_en_frag_info *frag_info = &priv->frag_info[i];
+  	u32 next_frag_end = frags[i].page_offset + 2 * frag_info->frag_stride;
+  
+ -
+  	if (next_frag_end > frags[i].page_size)
+  		dma_unmap_page(priv->ddev, frags[i].dma, frags[i].page_size,
+- 			       frag_info->dma_dir);
++ 			       priv->dma_dir);
+  
+  	if (frags[i].page)
+  		put_page(frags[i].page);
+@@@ -1138,28 -1187,41 +1138,62 @@@ static const int frag_sizes[] = 
+  
+  void mlx4_en_calc_rx_buf(struct net_device *dev)
+  {
+ +	enum dma_data_direction dma_dir = PCI_DMA_FROMDEVICE;
+  	struct mlx4_en_priv *priv = netdev_priv(dev);
+ -	int eff_mtu = MLX4_EN_EFF_MTU(dev->mtu);
+ +	/* VLAN_HLEN is added twice,to support skb vlan tagged with multiple
+ +	 * headers. (For example: ETH_P_8021Q and ETH_P_8021AD).
+ +	 */
+ +	int eff_mtu = dev->mtu + ETH_HLEN + (2 * VLAN_HLEN);
+ +	int order = MLX4_EN_ALLOC_PREFER_ORDER;
+ +	u32 align = SMP_CACHE_BYTES;
+ +	int buf_size = 0;
+  	int i = 0;
+  
+++<<<<<<< HEAD
+ +	while (buf_size < eff_mtu) {
+ +		priv->frag_info[i].order = order;
+ +		priv->frag_info[i].frag_size =
+ +			(eff_mtu > buf_size + frag_sizes[i]) ?
+ +				frag_sizes[i] : eff_mtu - buf_size;
+ +		priv->frag_info[i].frag_prefix_size = buf_size;
+ +		priv->frag_info[i].frag_stride =
+ +				ALIGN(priv->frag_info[i].frag_size, align);
+ +		priv->frag_info[i].dma_dir = dma_dir;
+ +		buf_size += priv->frag_info[i].frag_size;
+ +		i++;
+++=======
++ 	/* bpf requires buffers to be set up as 1 packet per page.
++ 	 * This only works when num_frags == 1.
++ 	 */
++ 	if (priv->tx_ring_num[TX_XDP]) {
++ 		priv->frag_info[0].order = 0;
++ 		priv->frag_info[0].frag_size = eff_mtu;
++ 		priv->frag_info[0].frag_prefix_size = 0;
++ 		/* This will gain efficient xdp frame recycling at the
++ 		 * expense of more costly truesize accounting
++ 		 */
++ 		priv->frag_info[0].frag_stride = PAGE_SIZE;
++ 		priv->dma_dir = PCI_DMA_BIDIRECTIONAL;
++ 		priv->frag_info[0].rx_headroom = XDP_PACKET_HEADROOM;
++ 		i = 1;
++ 	} else {
++ 		int buf_size = 0;
++ 
++ 		while (buf_size < eff_mtu) {
++ 			priv->frag_info[i].order = MLX4_EN_ALLOC_PREFER_ORDER;
++ 			priv->frag_info[i].frag_size =
++ 				(eff_mtu > buf_size + frag_sizes[i]) ?
++ 					frag_sizes[i] : eff_mtu - buf_size;
++ 			priv->frag_info[i].frag_prefix_size = buf_size;
++ 			priv->frag_info[i].frag_stride =
++ 				ALIGN(priv->frag_info[i].frag_size,
++ 				      SMP_CACHE_BYTES);
++ 			priv->frag_info[i].rx_headroom = 0;
++ 			buf_size += priv->frag_info[i].frag_size;
++ 			i++;
++ 		}
++ 		priv->dma_dir = PCI_DMA_FROMDEVICE;
+++>>>>>>> 69ba943151b2 (mlx4: dma_dir is a mlx4_en_priv attribute)
+  	}
+  
+  	priv->num_frags = i;
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_tx.c
+index df6a060edf95,98bc67a7249b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+@@@ -344,6 -345,27 +344,30 @@@ static u32 mlx4_en_free_tx_desc(struct 
+  	return tx_info->nr_txbb;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ u32 mlx4_en_recycle_tx_desc(struct mlx4_en_priv *priv,
++ 			    struct mlx4_en_tx_ring *ring,
++ 			    int index, u8 owner, u64 timestamp,
++ 			    int napi_mode)
++ {
++ 	struct mlx4_en_tx_info *tx_info = &ring->tx_info[index];
++ 	struct mlx4_en_rx_alloc frame = {
++ 		.page = tx_info->page,
++ 		.dma = tx_info->map0_dma,
++ 		.page_offset = XDP_PACKET_HEADROOM,
++ 		.page_size = PAGE_SIZE,
++ 	};
++ 
++ 	if (!mlx4_en_rx_recycle(ring->recycle_ring, &frame)) {
++ 		dma_unmap_page(priv->ddev, tx_info->map0_dma,
++ 			       PAGE_SIZE, priv->dma_dir);
++ 		put_page(tx_info->page);
++ 	}
++ 
++ 	return tx_info->nr_txbb;
++ }
+++>>>>>>> 69ba943151b2 (mlx4: dma_dir is a mlx4_en_priv attribute)
+  
+  int mlx4_en_free_tx_buf(struct net_device *dev, struct mlx4_en_tx_ring *ring)
+  {
+diff --cc drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+index d8f46d99701e,a4c7d94d52c6..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+@@@ -474,8 -474,8 +474,13 @@@ struct mlx4_en_frag_info 
+  	u16 frag_size;
+  	u16 frag_prefix_size;
+  	u32 frag_stride;
+++<<<<<<< HEAD
+ +	enum dma_data_direction dma_dir;
+ +	int order;
+++=======
++ 	u16 order;
++ 	u16 rx_headroom;
+++>>>>>>> 69ba943151b2 (mlx4: dma_dir is a mlx4_en_priv attribute)
+  };
+  
+  #ifdef CONFIG_MLX4_EN_DCB
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_rx.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_tx.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
