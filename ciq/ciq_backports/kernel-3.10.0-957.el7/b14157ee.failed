@@ -1,0 +1,145 @@
+nfp: bpf: support stack accesses via non-constant pointers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit b14157eeed4eff2b293e0ca7738f6a3dbfff51cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b14157ee.failed
+
+If stack pointer has a different value on different paths
+but the alignment to words (4B) remains the same, we can
+set a new LMEM access pointer to the calculated value and
+access whichever word it's pointing to.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b14157eeed4eff2b293e0ca7738f6a3dbfff51cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/bpf/jit.c
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/jit.c
+index 06a0d5712367,d84f00b80aac..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/jit.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/jit.c
+@@@ -754,10 -837,56 +754,56 @@@ mem_op_stack(struct nfp_prog *nfp_prog
+  {
+  	s32 off = nfp_prog->stack_depth + meta->insn.off + ptr_off;
+  	bool first = true, last;
+ -	bool needs_inc = false;
+ -	swreg stack_off_reg;
+  	u8 prev_gpr = 255;
+  	u32 gpr_byte = 0;
+ -	bool lm3 = true;
+  	int ret;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (meta->ptr_not_const) {
++ 		/* Use of the last encountered ptr_off is OK, they all have
++ 		 * the same alignment.  Depend on low bits of value being
++ 		 * discarded when written to LMaddr register.
++ 		 */
++ 		stack_off_reg = ur_load_imm_any(nfp_prog, meta->insn.off,
++ 						stack_imm(nfp_prog));
++ 
++ 		emit_alu(nfp_prog, imm_b(nfp_prog),
++ 			 reg_a(ptr_gpr), ALU_OP_ADD, stack_off_reg);
++ 
++ 		needs_inc = true;
++ 	} else if (off + size <= 64) {
++ 		/* We can reach bottom 64B with LMaddr0 */
++ 		lm3 = false;
++ 	} else if (round_down(off, 32) == round_down(off + size - 1, 32)) {
++ 		/* We have to set up a new pointer.  If we know the offset
++ 		 * and the entire access falls into a single 32 byte aligned
++ 		 * window we won't have to increment the LM pointer.
++ 		 * The 32 byte alignment is imporant because offset is ORed in
++ 		 * not added when doing *l$indexN[off].
++ 		 */
++ 		stack_off_reg = ur_load_imm_any(nfp_prog, round_down(off, 32),
++ 						stack_imm(nfp_prog));
++ 		emit_alu(nfp_prog, imm_b(nfp_prog),
++ 			 stack_reg(nfp_prog), ALU_OP_ADD, stack_off_reg);
++ 
++ 		off %= 32;
++ 	} else {
++ 		stack_off_reg = ur_load_imm_any(nfp_prog, round_down(off, 4),
++ 						stack_imm(nfp_prog));
++ 
++ 		emit_alu(nfp_prog, imm_b(nfp_prog),
++ 			 stack_reg(nfp_prog), ALU_OP_ADD, stack_off_reg);
++ 
++ 		needs_inc = true;
++ 	}
++ 	if (lm3) {
++ 		emit_csr_wr(nfp_prog, imm_b(nfp_prog), NFP_CSR_ACT_LM_ADDR3);
++ 		/* For size < 4 one slot will be filled by zeroing of upper. */
++ 		wrp_nops(nfp_prog, clr_gpr && size < 8 ? 2 : 3);
++ 	}
++ 
+++>>>>>>> b14157eeed4e (nfp: bpf: support stack accesses via non-constant pointers)
+  	if (clr_gpr && size < 8)
+  		wrp_immed(nfp_prog, reg_both(gpr + 1), 0);
+  
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/jit.c
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index ebcbc0ba3a0c..b61d5e6912c2 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -101,6 +101,7 @@ typedef int (*instr_cb_t)(struct nfp_prog *, struct nfp_insn_meta *);
+  * struct nfp_insn_meta - BPF instruction wrapper
+  * @insn: BPF instruction
+  * @ptr: pointer type for memory operations
++ * @ptr_not_const: pointer is not always constant
+  * @off: index of first generated machine instruction (in nfp_prog.prog)
+  * @n: eBPF instruction number
+  * @skip: skip this instruction (optimized out)
+@@ -110,6 +111,7 @@ typedef int (*instr_cb_t)(struct nfp_prog *, struct nfp_insn_meta *);
+ struct nfp_insn_meta {
+ 	struct bpf_insn insn;
+ 	struct bpf_reg_state ptr;
++	bool ptr_not_const;
+ 	unsigned int off;
+ 	unsigned short n;
+ 	bool skip;
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/verifier.c b/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
+index 8b981cfbeb65..9638c200c34b 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
+@@ -108,7 +108,8 @@ nfp_bpf_check_exit(struct nfp_prog *nfp_prog,
+ }
+ 
+ static int
+-nfp_bpf_check_stack_access(struct nfp_insn_meta *meta,
++nfp_bpf_check_stack_access(struct nfp_prog *nfp_prog,
++			   struct nfp_insn_meta *meta,
+ 			   const struct bpf_reg_state *reg)
+ {
+ 	s32 old_off, new_off;
+@@ -124,7 +125,12 @@ nfp_bpf_check_stack_access(struct nfp_insn_meta *meta,
+ 	old_off = meta->ptr.off + meta->ptr.var_off.value;
+ 	new_off = reg->off + reg->var_off.value;
+ 
+-	if (old_off == new_off)
++	meta->ptr_not_const |= old_off != new_off;
++
++	if (!meta->ptr_not_const)
++		return 0;
++
++	if (old_off % 4 == new_off % 4)
+ 		return 0;
+ 
+ 	pr_info("stack access changed location was:%d is:%d\n",
+@@ -147,7 +153,7 @@ nfp_bpf_check_ptr(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
+ 	}
+ 
+ 	if (reg->type == PTR_TO_STACK) {
+-		err = nfp_bpf_check_stack_access(meta, reg);
++		err = nfp_bpf_check_stack_access(nfp_prog, meta, reg);
+ 		if (err)
+ 			return err;
+ 	}
