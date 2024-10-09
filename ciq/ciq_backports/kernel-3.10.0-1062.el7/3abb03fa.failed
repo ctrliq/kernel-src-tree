@@ -1,0 +1,217 @@
+svcrdma: Simplify svc_rdma_send()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 3abb03facee06ea052be6e3a435f6dbb4e54fc04
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/3abb03fa.failed
+
+Clean up: No current caller of svc_rdma_send's passes in a chained
+WR. The logic that counts the chain length can be replaced with a
+constant (1).
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit 3abb03facee06ea052be6e3a435f6dbb4e54fc04)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/svc_rdma_sendto.c
+diff --cc net/sunrpc/xprtrdma/svc_rdma_sendto.c
+index 00a497c70989,edfeca45ac1c..000000000000
+--- a/net/sunrpc/xprtrdma/svc_rdma_sendto.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_sendto.c
+@@@ -114,6 -114,187 +114,190 @@@
+  
+  #define RPCDBG_FACILITY	RPCDBG_SVCXPRT
+  
+++<<<<<<< HEAD
+++=======
++ static void svc_rdma_wc_send(struct ib_cq *cq, struct ib_wc *wc);
++ 
++ static inline struct svc_rdma_send_ctxt *
++ svc_rdma_next_send_ctxt(struct list_head *list)
++ {
++ 	return list_first_entry_or_null(list, struct svc_rdma_send_ctxt,
++ 					sc_list);
++ }
++ 
++ static struct svc_rdma_send_ctxt *
++ svc_rdma_send_ctxt_alloc(struct svcxprt_rdma *rdma)
++ {
++ 	struct svc_rdma_send_ctxt *ctxt;
++ 	size_t size;
++ 	int i;
++ 
++ 	size = sizeof(*ctxt);
++ 	size += rdma->sc_max_send_sges * sizeof(struct ib_sge);
++ 	ctxt = kmalloc(size, GFP_KERNEL);
++ 	if (!ctxt)
++ 		return NULL;
++ 
++ 	ctxt->sc_cqe.done = svc_rdma_wc_send;
++ 	ctxt->sc_send_wr.next = NULL;
++ 	ctxt->sc_send_wr.wr_cqe = &ctxt->sc_cqe;
++ 	ctxt->sc_send_wr.sg_list = ctxt->sc_sges;
++ 	ctxt->sc_send_wr.send_flags = IB_SEND_SIGNALED;
++ 	for (i = 0; i < rdma->sc_max_send_sges; i++)
++ 		ctxt->sc_sges[i].lkey = rdma->sc_pd->local_dma_lkey;
++ 	return ctxt;
++ }
++ 
++ /**
++  * svc_rdma_send_ctxts_destroy - Release all send_ctxt's for an xprt
++  * @rdma: svcxprt_rdma being torn down
++  *
++  */
++ void svc_rdma_send_ctxts_destroy(struct svcxprt_rdma *rdma)
++ {
++ 	struct svc_rdma_send_ctxt *ctxt;
++ 
++ 	while ((ctxt = svc_rdma_next_send_ctxt(&rdma->sc_send_ctxts))) {
++ 		list_del(&ctxt->sc_list);
++ 		kfree(ctxt);
++ 	}
++ }
++ 
++ /**
++  * svc_rdma_send_ctxt_get - Get a free send_ctxt
++  * @rdma: controlling svcxprt_rdma
++  *
++  * Returns a ready-to-use send_ctxt, or NULL if none are
++  * available and a fresh one cannot be allocated.
++  */
++ struct svc_rdma_send_ctxt *svc_rdma_send_ctxt_get(struct svcxprt_rdma *rdma)
++ {
++ 	struct svc_rdma_send_ctxt *ctxt;
++ 
++ 	spin_lock(&rdma->sc_send_lock);
++ 	ctxt = svc_rdma_next_send_ctxt(&rdma->sc_send_ctxts);
++ 	if (!ctxt)
++ 		goto out_empty;
++ 	list_del(&ctxt->sc_list);
++ 	spin_unlock(&rdma->sc_send_lock);
++ 
++ out:
++ 	ctxt->sc_send_wr.num_sge = 0;
++ 	ctxt->sc_page_count = 0;
++ 	return ctxt;
++ 
++ out_empty:
++ 	spin_unlock(&rdma->sc_send_lock);
++ 	ctxt = svc_rdma_send_ctxt_alloc(rdma);
++ 	if (!ctxt)
++ 		return NULL;
++ 	goto out;
++ }
++ 
++ /**
++  * svc_rdma_send_ctxt_put - Return send_ctxt to free list
++  * @rdma: controlling svcxprt_rdma
++  * @ctxt: object to return to the free list
++  *
++  * Pages left in sc_pages are DMA unmapped and released.
++  */
++ void svc_rdma_send_ctxt_put(struct svcxprt_rdma *rdma,
++ 			    struct svc_rdma_send_ctxt *ctxt)
++ {
++ 	struct ib_device *device = rdma->sc_cm_id->device;
++ 	unsigned int i;
++ 
++ 	for (i = 0; i < ctxt->sc_send_wr.num_sge; i++)
++ 		ib_dma_unmap_page(device,
++ 				  ctxt->sc_sges[i].addr,
++ 				  ctxt->sc_sges[i].length,
++ 				  DMA_TO_DEVICE);
++ 
++ 	for (i = 0; i < ctxt->sc_page_count; ++i)
++ 		put_page(ctxt->sc_pages[i]);
++ 
++ 	spin_lock(&rdma->sc_send_lock);
++ 	list_add(&ctxt->sc_list, &rdma->sc_send_ctxts);
++ 	spin_unlock(&rdma->sc_send_lock);
++ }
++ 
++ /**
++  * svc_rdma_wc_send - Invoked by RDMA provider for each polled Send WC
++  * @cq: Completion Queue context
++  * @wc: Work Completion object
++  *
++  * NB: The svc_xprt/svcxprt_rdma is pinned whenever it's possible that
++  * the Send completion handler could be running.
++  */
++ static void svc_rdma_wc_send(struct ib_cq *cq, struct ib_wc *wc)
++ {
++ 	struct svcxprt_rdma *rdma = cq->cq_context;
++ 	struct ib_cqe *cqe = wc->wr_cqe;
++ 	struct svc_rdma_send_ctxt *ctxt;
++ 
++ 	trace_svcrdma_wc_send(wc);
++ 
++ 	atomic_inc(&rdma->sc_sq_avail);
++ 	wake_up(&rdma->sc_send_wait);
++ 
++ 	ctxt = container_of(cqe, struct svc_rdma_send_ctxt, sc_cqe);
++ 	svc_rdma_send_ctxt_put(rdma, ctxt);
++ 
++ 	if (unlikely(wc->status != IB_WC_SUCCESS)) {
++ 		set_bit(XPT_CLOSE, &rdma->sc_xprt.xpt_flags);
++ 		svc_xprt_enqueue(&rdma->sc_xprt);
++ 		if (wc->status != IB_WC_WR_FLUSH_ERR)
++ 			pr_err("svcrdma: Send: %s (%u/0x%x)\n",
++ 			       ib_wc_status_msg(wc->status),
++ 			       wc->status, wc->vendor_err);
++ 	}
++ 
++ 	svc_xprt_put(&rdma->sc_xprt);
++ }
++ 
++ /**
++  * svc_rdma_send - Post a single Send WR
++  * @rdma: transport on which to post the WR
++  * @wr: prepared Send WR to post
++  *
++  * Returns zero the Send WR was posted successfully. Otherwise, a
++  * negative errno is returned.
++  */
++ int svc_rdma_send(struct svcxprt_rdma *rdma, struct ib_send_wr *wr)
++ {
++ 	struct ib_send_wr *bad_wr;
++ 	int ret;
++ 
++ 	might_sleep();
++ 
++ 	/* If the SQ is full, wait until an SQ entry is available */
++ 	while (1) {
++ 		if ((atomic_dec_return(&rdma->sc_sq_avail) < 0)) {
++ 			atomic_inc(&rdma_stat_sq_starve);
++ 			trace_svcrdma_sq_full(rdma);
++ 			atomic_inc(&rdma->sc_sq_avail);
++ 			wait_event(rdma->sc_send_wait,
++ 				   atomic_read(&rdma->sc_sq_avail) > 1);
++ 			if (test_bit(XPT_CLOSE, &rdma->sc_xprt.xpt_flags))
++ 				return -ENOTCONN;
++ 			trace_svcrdma_sq_retry(rdma);
++ 			continue;
++ 		}
++ 
++ 		svc_xprt_get(&rdma->sc_xprt);
++ 		ret = ib_post_send(rdma->sc_qp, wr, &bad_wr);
++ 		trace_svcrdma_post_send(wr, ret);
++ 		if (ret) {
++ 			set_bit(XPT_CLOSE, &rdma->sc_xprt.xpt_flags);
++ 			svc_xprt_put(&rdma->sc_xprt);
++ 			wake_up(&rdma->sc_send_wait);
++ 		}
++ 		break;
++ 	}
++ 	return ret;
++ }
++ 
+++>>>>>>> 3abb03facee0 (svcrdma: Simplify svc_rdma_send())
+  static u32 xdr_padsize(u32 len)
+  {
+  	return (len & 3) ? (4 - (len & 3)) : 0;
+* Unmerged path net/sunrpc/xprtrdma/svc_rdma_sendto.c
