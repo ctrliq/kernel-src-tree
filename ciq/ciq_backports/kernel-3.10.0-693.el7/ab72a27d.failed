@@ -1,0 +1,245 @@
+x86/efi: Consolidate region mapping logic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [x86] efi: Consolidate region mapping logic (Bhupesh Sharma) [1446102]
+Rebuild_FUZZ: 94.87%
+commit-author Matt Fleming <matt@codeblueprint.co.uk>
+commit ab72a27da4c6c19b0e3d6d7556fdd4afb581c8ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/ab72a27d.failed
+
+EFI regions are currently mapped in two separate places. The bulk of
+the work is done in efi_map_regions() but when CONFIG_EFI_MIXED is
+enabled the additional regions that are required when operating in
+mixed mode are mapping in efi_setup_page_tables().
+
+Pull everything into efi_map_regions() and refactor the test for
+which regions should be mapped into a should_map_region() function.
+Generously sprinkle comments to clarify the different cases.
+
+	Acked-by: Borislav Petkov <bp@suse.de>
+	Tested-by: Dave Young <dyoung@redhat.com> [kexec/kdump]
+	Tested-by: Ard Biesheuvel <ard.biesheuvel@linaro.org> [arm]
+	Acked-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+	Signed-off-by: Matt Fleming <matt@codeblueprint.co.uk>
+(cherry picked from commit ab72a27da4c6c19b0e3d6d7556fdd4afb581c8ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/platform/efi/efi.c
+#	arch/x86/platform/efi/efi_64.c
+diff --cc arch/x86/platform/efi/efi.c
+index d62c6c91d23e,625ec729b4e8..000000000000
+--- a/arch/x86/platform/efi/efi.c
++++ b/arch/x86/platform/efi/efi.c
+@@@ -1006,6 -682,110 +1006,113 @@@ out
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Iterate the EFI memory map in reverse order because the regions
++  * will be mapped top-down. The end result is the same as if we had
++  * mapped things forward, but doesn't require us to change the
++  * existing implementation of efi_map_region().
++  */
++ static inline void *efi_map_next_entry_reverse(void *entry)
++ {
++ 	/* Initial call */
++ 	if (!entry)
++ 		return efi.memmap.map_end - efi.memmap.desc_size;
++ 
++ 	entry -= efi.memmap.desc_size;
++ 	if (entry < efi.memmap.map)
++ 		return NULL;
++ 
++ 	return entry;
++ }
++ 
++ /*
++  * efi_map_next_entry - Return the next EFI memory map descriptor
++  * @entry: Previous EFI memory map descriptor
++  *
++  * This is a helper function to iterate over the EFI memory map, which
++  * we do in different orders depending on the current configuration.
++  *
++  * To begin traversing the memory map @entry must be %NULL.
++  *
++  * Returns %NULL when we reach the end of the memory map.
++  */
++ static void *efi_map_next_entry(void *entry)
++ {
++ 	if (!efi_enabled(EFI_OLD_MEMMAP) && efi_enabled(EFI_64BIT)) {
++ 		/*
++ 		 * Starting in UEFI v2.5 the EFI_PROPERTIES_TABLE
++ 		 * config table feature requires us to map all entries
++ 		 * in the same order as they appear in the EFI memory
++ 		 * map. That is to say, entry N must have a lower
++ 		 * virtual address than entry N+1. This is because the
++ 		 * firmware toolchain leaves relative references in
++ 		 * the code/data sections, which are split and become
++ 		 * separate EFI memory regions. Mapping things
++ 		 * out-of-order leads to the firmware accessing
++ 		 * unmapped addresses.
++ 		 *
++ 		 * Since we need to map things this way whether or not
++ 		 * the kernel actually makes use of
++ 		 * EFI_PROPERTIES_TABLE, let's just switch to this
++ 		 * scheme by default for 64-bit.
++ 		 */
++ 		return efi_map_next_entry_reverse(entry);
++ 	}
++ 
++ 	/* Initial call */
++ 	if (!entry)
++ 		return efi.memmap.map;
++ 
++ 	entry += efi.memmap.desc_size;
++ 	if (entry >= efi.memmap.map_end)
++ 		return NULL;
++ 
++ 	return entry;
++ }
++ 
++ static bool should_map_region(efi_memory_desc_t *md)
++ {
++ 	/*
++ 	 * Runtime regions always require runtime mappings (obviously).
++ 	 */
++ 	if (md->attribute & EFI_MEMORY_RUNTIME)
++ 		return true;
++ 
++ 	/*
++ 	 * 32-bit EFI doesn't suffer from the bug that requires us to
++ 	 * reserve boot services regions, and mixed mode support
++ 	 * doesn't exist for 32-bit kernels.
++ 	 */
++ 	if (IS_ENABLED(CONFIG_X86_32))
++ 		return false;
++ 
++ 	/*
++ 	 * Map all of RAM so that we can access arguments in the 1:1
++ 	 * mapping when making EFI runtime calls.
++ 	 */
++ 	if (IS_ENABLED(CONFIG_EFI_MIXED) && !efi_is_native()) {
++ 		if (md->type == EFI_CONVENTIONAL_MEMORY ||
++ 		    md->type == EFI_LOADER_DATA ||
++ 		    md->type == EFI_LOADER_CODE)
++ 			return true;
++ 	}
++ 
++ 	/*
++ 	 * Map boot services regions as a workaround for buggy
++ 	 * firmware that accesses them even when they shouldn't.
++ 	 *
++ 	 * See efi_{reserve,free}_boot_services().
++ 	 */
++ 	if (md->type == EFI_BOOT_SERVICES_CODE ||
++ 	    md->type == EFI_BOOT_SERVICES_DATA)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ /*
+++>>>>>>> ab72a27da4c6 (x86/efi: Consolidate region mapping logic)
+   * Map the efi memory ranges of the runtime services and update new_mmap with
+   * virtual addresses.
+   */
+@@@ -1013,17 -793,17 +1120,13 @@@ static void * __init efi_map_regions(in
+  {
+  	void *p, *new_memmap = NULL;
+  	unsigned long left = 0;
+ -	unsigned long desc_size;
+  	efi_memory_desc_t *md;
+  
+ -	desc_size = efi.memmap.desc_size;
+ -
+ -	p = NULL;
+ -	while ((p = efi_map_next_entry(p))) {
+ +	for (p = memmap.map; p < memmap.map_end; p += memmap.desc_size) {
+  		md = p;
+- 		if (!(md->attribute & EFI_MEMORY_RUNTIME)) {
+- #ifdef CONFIG_X86_64
+- 			if (md->type != EFI_BOOT_SERVICES_CODE &&
+- 			    md->type != EFI_BOOT_SERVICES_DATA)
+- #endif
+- 				continue;
+- 		}
++ 
++ 		if (!should_map_region(md))
++ 			continue;
+  
+  		efi_map_region(md);
+  		get_systab_virt_addr(md);
+diff --cc arch/x86/platform/efi/efi_64.c
+index 319a8a40b098,45434ea345e9..000000000000
+--- a/arch/x86/platform/efi/efi_64.c
++++ b/arch/x86/platform/efi/efi_64.c
+@@@ -132,18 -170,52 +132,23 @@@ void efi_sync_low_kernel_mappings(void
+  	if (efi_enabled(EFI_OLD_MEMMAP))
+  		return;
+  
+ -	/*
+ -	 * We can share all PGD entries apart from the one entry that
+ -	 * covers the EFI runtime mapping space.
+ -	 *
+ -	 * Make sure the EFI runtime region mappings are guaranteed to
+ -	 * only span a single PGD entry and that the entry also maps
+ -	 * other important kernel regions.
+ -	 */
+ -	BUILD_BUG_ON(pgd_index(EFI_VA_END) != pgd_index(MODULES_END));
+ -	BUILD_BUG_ON((EFI_VA_START & PGDIR_MASK) !=
+ -			(EFI_VA_END & PGDIR_MASK));
+ -
+ -	pgd_efi = efi_pgd + pgd_index(PAGE_OFFSET);
+ -	pgd_k = pgd_offset_k(PAGE_OFFSET);
+ +	num_pgds = pgd_index(MODULES_END - 1) - pgd_index(PAGE_OFFSET);
+  
+ -	num_entries = pgd_index(EFI_VA_END) - pgd_index(PAGE_OFFSET);
+ -	memcpy(pgd_efi, pgd_k, sizeof(pgd_t) * num_entries);
+ -
+ -	/*
+ -	 * We share all the PUD entries apart from those that map the
+ -	 * EFI regions. Copy around them.
+ -	 */
+ -	BUILD_BUG_ON((EFI_VA_START & ~PUD_MASK) != 0);
+ -	BUILD_BUG_ON((EFI_VA_END & ~PUD_MASK) != 0);
+ -
+ -	pgd_efi = efi_pgd + pgd_index(EFI_VA_END);
+ -	pud_efi = pud_offset(pgd_efi, 0);
+ -
+ -	pgd_k = pgd_offset_k(EFI_VA_END);
+ -	pud_k = pud_offset(pgd_k, 0);
+ -
+ -	num_entries = pud_index(EFI_VA_END);
+ -	memcpy(pud_efi, pud_k, sizeof(pud_t) * num_entries);
+ -
+ -	pud_efi = pud_offset(pgd_efi, EFI_VA_START);
+ -	pud_k = pud_offset(pgd_k, EFI_VA_START);
+ -
+ -	num_entries = PTRS_PER_PUD - pud_index(EFI_VA_START);
+ -	memcpy(pud_efi, pud_k, sizeof(pud_t) * num_entries);
+ +	memcpy(pgd + pgd_index(PAGE_OFFSET),
+ +		init_mm.pgd + pgd_index(PAGE_OFFSET),
+ +		sizeof(pgd_t) * num_pgds);
+  }
+  
+ -int __init efi_setup_page_tables(unsigned long pa_memmap, unsigned num_pages)
+ +int efi_setup_page_tables(unsigned long pa_memmap, unsigned num_pages)
+  {
+++<<<<<<< HEAD
+ +	unsigned long text;
+++=======
++ 	unsigned long pfn, text;
++ 	struct page *page;
+++>>>>>>> ab72a27da4c6 (x86/efi: Consolidate region mapping logic)
+  	unsigned npages;
+ +	struct page *page;
+  	pgd_t *pgd;
+  
+  	if (efi_enabled(EFI_OLD_MEMMAP))
+* Unmerged path arch/x86/platform/efi/efi.c
+* Unmerged path arch/x86/platform/efi/efi_64.c
