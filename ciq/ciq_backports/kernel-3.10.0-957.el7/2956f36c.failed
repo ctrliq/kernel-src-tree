@@ -1,0 +1,288 @@
+crypto: chelsio - Remove allocation of sg list to implement 2K limit of dsgl header
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [crypto] chelsio: Remove allocation of sg list to implement 2K limit of dsgl header (Arjun Vynipadath) [1548047]
+Rebuild_FUZZ: 92.99%
+commit-author Harsh Jain <harsh@chelsio.com>
+commit 2956f36c954ee6e31068a02cf2ca551efa5235f1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/2956f36c.failed
+
+Update DMA address index instead of allocating new sg list to impose  2k size limit for each entry.
+
+	Signed-off-by: Harsh Jain <harsh@chelsio.com>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit 2956f36c954ee6e31068a02cf2ca551efa5235f1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/chelsio/chcr_algo.c
+#	drivers/crypto/chelsio/chcr_crypto.h
+diff --cc drivers/crypto/chelsio/chcr_algo.c
+index dde319f5f616,33533fe9df43..000000000000
+--- a/drivers/crypto/chelsio/chcr_algo.c
++++ b/drivers/crypto/chelsio/chcr_algo.c
+@@@ -1833,63 -1837,19 +1845,79 @@@ static void chcr_hmac_cra_exit(struct c
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static int is_newsg(struct scatterlist *sgl, unsigned int *newents)
+ +{
+ +	int nents = 0;
+ +	int ret = 0;
+ +
+ +	while (sgl) {
+ +		if (sgl->length > CHCR_SG_SIZE)
+ +			ret = 1;
+ +		nents += DIV_ROUND_UP(sgl->length, CHCR_SG_SIZE);
+ +		sgl = sg_next(sgl);
+ +	}
+ +	*newents = nents;
+ +	return ret;
+ +}
+ +
+ +static inline void free_new_sg(struct scatterlist *sgl)
+ +{
+ +	kfree(sgl);
+ +}
+ +
+ +static struct scatterlist *alloc_new_sg(struct scatterlist *sgl,
+ +				       unsigned int nents)
+ +{
+ +	struct scatterlist *newsg, *sg;
+ +	int i, len, processed = 0;
+ +	struct page *spage;
+ +	int offset;
+ +
+ +	newsg = kmalloc_array(nents, sizeof(struct scatterlist), GFP_KERNEL);
+ +	if (!newsg)
+ +		return ERR_PTR(-ENOMEM);
+ +	sg = newsg;
+ +	sg_init_table(sg, nents);
+ +	offset = sgl->offset;
+ +	spage = sg_page(sgl);
+ +	for (i = 0; i < nents; i++) {
+ +		len = min_t(u32, sgl->length - processed, CHCR_SG_SIZE);
+ +		sg_set_page(sg, spage, len, offset);
+ +		processed += len;
+ +		offset += len;
+ +		if (offset >= PAGE_SIZE) {
+ +			offset = offset % PAGE_SIZE;
+ +			spage++;
+ +		}
+ +		if (processed == sgl->length) {
+ +			processed = 0;
+ +			sgl = sg_next(sgl);
+ +			if (!sgl)
+ +				break;
+ +			spage = sg_page(sgl);
+ +			offset = sgl->offset;
+ +		}
+ +		sg = sg_next(sg);
+ +	}
+ +	return newsg;
+ +}
+ +
+++=======
++ static int chcr_copy_assoc(struct aead_request *req,
++ 				struct chcr_aead_ctx *ctx)
++ {
++ 	SKCIPHER_REQUEST_ON_STACK(skreq, ctx->null);
++ 
++ 	skcipher_request_set_tfm(skreq, ctx->null);
++ 	skcipher_request_set_callback(skreq, aead_request_flags(req),
++ 			NULL, NULL);
++ 	skcipher_request_set_crypt(skreq, req->src, req->dst, req->assoclen,
++ 			NULL);
++ 
++ 	return crypto_skcipher_encrypt(skreq);
++ }
+++>>>>>>> 2956f36c954e (crypto: chelsio - Remove allocation of sg list to implement 2K limit of dsgl header)
+  static int chcr_aead_need_fallback(struct aead_request *req, int src_nent,
+  				   int aadmax, int wrlen,
+  				   unsigned short op_type)
+@@@ -1948,25 -1909,24 +1976,41 @@@ static struct sk_buff *create_authenc_w
+  		GFP_ATOMIC;
+  	struct adapter *adap = padap(ctx->dev);
+  
+++<<<<<<< HEAD
+ +	reqctx->newdstsg = NULL;
+ +	dst_size = req->cryptlen + (op_type ? -authsize :
+ +					      authsize);
+++=======
++ 	dst_size = req->assoclen + req->cryptlen + (op_type ? -authsize :
++ 						   authsize);
+++>>>>>>> 2956f36c954e (crypto: chelsio - Remove allocation of sg list to implement 2K limit of dsgl header)
+  	if (aeadctx->enckey_len == 0 || (req->cryptlen <= 0))
+  		goto err;
+  
+  	if (op_type && req->cryptlen < crypto_aead_authsize(tfm))
+  		goto err;
+ -	src_nent = sg_nents_for_len(req->src, req->assoclen + req->cryptlen);
+ +	src_nent = sg_nents_for_len(req->src, req->cryptlen);
+  	if (src_nent < 0)
+  		goto err;
+++<<<<<<< HEAD
+ +
+ +	if (dst_size && is_newsg(req->dst, &nents)) {
+ +		reqctx->newdstsg = alloc_new_sg(req->dst, nents);
+ +		if (IS_ERR(reqctx->newdstsg))
+ +			return ERR_CAST(reqctx->newdstsg);
+ +		reqctx->dst = reqctx->newdstsg;
+ +	} else {
+ +		reqctx->dst = req->dst;
+++=======
++ 	src = scatterwalk_ffwd(reqctx->srcffwd, req->src, req->assoclen);
++ 	reqctx->dst = src;
++ 	if (req->src != req->dst) {
++ 		error = chcr_copy_assoc(req, aeadctx);
++ 		if (error)
++ 			return ERR_PTR(error);
++ 		reqctx->dst = scatterwalk_ffwd(reqctx->dstffwd, req->dst,
++ 					       req->assoclen);
+++>>>>>>> 2956f36c954e (crypto: chelsio - Remove allocation of sg list to implement 2K limit of dsgl header)
+  	}
+  	if (get_aead_subtype(tfm) == CRYPTO_ALG_SUB_TYPE_AEAD_NULL) {
+  		null = 1;
+@@@ -2272,23 -2247,25 +2314,41 @@@ static struct sk_buff *create_aead_ccm_
+  		GFP_ATOMIC;
+  	struct adapter *adap = padap(ctx->dev);
+  
+++<<<<<<< HEAD
+ +	dst_size = req->cryptlen + (op_type ? -authsize :
+ +					      authsize);
+ +	reqctx->newdstsg = NULL;
+++=======
++ 	dst_size = req->assoclen + req->cryptlen + (op_type ? -authsize :
++ 						   authsize);
+++>>>>>>> 2956f36c954e (crypto: chelsio - Remove allocation of sg list to implement 2K limit of dsgl header)
+  	if (op_type && req->cryptlen < crypto_aead_authsize(tfm))
+  		goto err;
+ -	src_nent = sg_nents_for_len(req->src, req->assoclen + req->cryptlen);
+ +	src_nent = sg_nents_for_len(req->src, req->cryptlen);
+  	if (src_nent < 0)
+  		goto err;
+  
+  	sub_type = get_aead_subtype(tfm);
+++<<<<<<< HEAD
+ +	if (dst_size && is_newsg(req->dst, &nents)) {
+ +		reqctx->newdstsg = alloc_new_sg(req->dst, nents);
+ +		if (IS_ERR(reqctx->newdstsg))
+ +			return ERR_CAST(reqctx->newdstsg);
+ +		reqctx->dst = reqctx->newdstsg;
+ +	} else {
+ +		reqctx->dst = req->dst;
+++=======
++ 	src = scatterwalk_ffwd(reqctx->srcffwd, req->src, req->assoclen);
++ 	reqctx->dst = src;
++ 	if (req->src != req->dst) {
++ 		error = chcr_copy_assoc(req, aeadctx);
++ 		if (error) {
++ 			pr_err("AAD copy to destination buffer fails\n");
++ 			return ERR_PTR(error);
++ 		}
++ 		reqctx->dst = scatterwalk_ffwd(reqctx->dstffwd, req->dst,
++ 						       req->assoclen);
+++>>>>>>> 2956f36c954e (crypto: chelsio - Remove allocation of sg list to implement 2K limit of dsgl header)
+  	}
+  	reqctx->dst_nents = sg_nents_for_len(reqctx->dst, req->cryptlen +
+  					     (op_type ? -authsize : authsize));
+@@@ -2386,9 -2360,8 +2443,14 @@@ static struct sk_buff *create_gcm_wr(st
+  		GFP_ATOMIC;
+  	struct adapter *adap = padap(ctx->dev);
+  
+++<<<<<<< HEAD
+ +	reqctx->newdstsg = NULL;
+ +	dst_size = req->cryptlen + (op_type ? -authsize :
+ +					      authsize);
+++=======
++ 	dst_size = assoclen + req->cryptlen + (op_type ? -authsize :
++ 						    authsize);
+++>>>>>>> 2956f36c954e (crypto: chelsio - Remove allocation of sg list to implement 2K limit of dsgl header)
+  	/* validate key size */
+  	if (aeadctx->enckey_len == 0)
+  		goto err;
+@@@ -2399,15 -2372,15 +2461,27 @@@
+  	if (src_nent < 0)
+  		goto err;
+  
+++<<<<<<< HEAD
+ +	if (dst_size && is_newsg(req->dst, &nents)) {
+ +		reqctx->newdstsg = alloc_new_sg(req->dst, nents);
+ +		if (IS_ERR(reqctx->newdstsg))
+ +			return ERR_CAST(reqctx->newdstsg);
+ +		reqctx->dst = reqctx->newdstsg;
+ +	} else {
+ +		reqctx->dst = req->dst;
+ +	}
+ +
+++=======
++ 	src = scatterwalk_ffwd(reqctx->srcffwd, req->src, assoclen);
++ 	reqctx->dst = src;
++ 	if (req->src != req->dst) {
++ 		error = chcr_copy_assoc(req, aeadctx);
++ 		if (error)
++ 			return	ERR_PTR(error);
++ 		reqctx->dst = scatterwalk_ffwd(reqctx->dstffwd, req->dst,
++ 					       req->assoclen);
++ 	}
+++>>>>>>> 2956f36c954e (crypto: chelsio - Remove allocation of sg list to implement 2K limit of dsgl header)
+  	reqctx->dst_nents = sg_nents_for_len(reqctx->dst, req->cryptlen +
+  					     (op_type ? -authsize : authsize));
+  	if (reqctx->dst_nents < 0) {
+diff --cc drivers/crypto/chelsio/chcr_crypto.h
+index ee637a7f2f30,8f436f80cb21..000000000000
+--- a/drivers/crypto/chelsio/chcr_crypto.h
++++ b/drivers/crypto/chelsio/chcr_crypto.h
+@@@ -166,7 -166,8 +166,12 @@@ struct ablk_ctx 
+  struct chcr_aead_reqctx {
+  	struct	sk_buff	*skb;
+  	struct scatterlist *dst;
+++<<<<<<< HEAD
+ +	struct scatterlist *newdstsg;
+++=======
++ 	struct scatterlist srcffwd[2];
++ 	struct scatterlist dstffwd[2];
+++>>>>>>> 2956f36c954e (crypto: chelsio - Remove allocation of sg list to implement 2K limit of dsgl header)
+  	short int dst_nents;
+  	u16 verify;
+  	u8 iv[CHCR_MAX_CRYPTO_IV_LEN];
+* Unmerged path drivers/crypto/chelsio/chcr_algo.c
+diff --git a/drivers/crypto/chelsio/chcr_algo.h b/drivers/crypto/chelsio/chcr_algo.h
+index 583008de51a3..bf3aae91968c 100644
+--- a/drivers/crypto/chelsio/chcr_algo.h
++++ b/drivers/crypto/chelsio/chcr_algo.h
+@@ -221,7 +221,7 @@
+ #define MAX_WR_SIZE			512
+ #define ROUND_16(bytes)		((bytes) & 0xFFFFFFF0)
+ #define MAX_DSGL_ENT			32
+-#define MAX_DIGEST_SKB_SGE	(MAX_SKB_FRAGS - 2)
++#define MAX_DIGEST_SKB_SGE	(MAX_SKB_FRAGS - 1)
+ #define MIN_CIPHER_SG			1 /* IV */
+ #define MIN_AUTH_SG			2 /*IV + AAD*/
+ #define MIN_GCM_SG			2 /* IV + AAD*/
+@@ -261,7 +261,6 @@ struct cipher_wr_param {
+ 	struct scatterlist *srcsg;
+ 	char *iv;
+ 	int bytes;
+-	short int snent;
+ 	unsigned short qid;
+ };
+ enum {
+diff --git a/drivers/crypto/chelsio/chcr_core.h b/drivers/crypto/chelsio/chcr_core.h
+index c9a19b2a1e9f..94e7412f6164 100644
+--- a/drivers/crypto/chelsio/chcr_core.h
++++ b/drivers/crypto/chelsio/chcr_core.h
+@@ -89,7 +89,7 @@ struct uld_ctx {
+ 	struct chcr_dev *dev;
+ };
+ 
+-struct uld_ctx * assign_chcr_device(void);
++struct uld_ctx *assign_chcr_device(void);
+ int chcr_send_wr(struct sk_buff *skb);
+ int start_crypto(void);
+ int stop_crypto(void);
+* Unmerged path drivers/crypto/chelsio/chcr_crypto.h
