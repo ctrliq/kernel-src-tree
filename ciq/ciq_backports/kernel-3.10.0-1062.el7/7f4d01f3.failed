@@ -1,0 +1,131 @@
+xfs: add log item pinning error injection tag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit 7f4d01f36a3ac16f539f0fd3839de5d58fa4940f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/7f4d01f3.failed
+
+Add an error injection tag to force log items in the AIL to the
+pinned state. This option can be used by test infrastructure to
+induce head behind tail conditions. Specifically, this is intended
+to be used by xfstests to reproduce log recovery problems after
+failed/corrupted log writes overwrite the last good tail LSN in the
+log.
+
+When enabled, AIL push attempts see log items in the AIL in the
+pinned state. This stalls metadata writeback and thus prevents the
+current tail of the log from moving forward. When disabled,
+subsequent AIL pushes observe the log items in their appropriate
+state and filesystem operation continues as normal.
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 7f4d01f36a3ac16f539f0fd3839de5d58fa4940f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_error.h
+diff --cc fs/xfs/xfs_error.h
+index 825e5352fc8d,7c4bef3bddb7..000000000000
+--- a/fs/xfs/xfs_error.h
++++ b/fs/xfs/xfs_error.h
+@@@ -99,9 -104,10 +99,16 @@@ extern void xfs_verifier_error(struct x
+   * delalloc blocks!) are tossed as part of the write failure error
+   * handling sequence.
+   */
+++<<<<<<< HEAD
+ +#define XFS_ERRTAG_DROP_WRITES				23
+ +#define XFS_ERRTAG_LOG_BAD_CRC				24
+ +#define XFS_ERRTAG_MAX					25
+++=======
++ #define XFS_ERRTAG_DROP_WRITES				28
++ #define XFS_ERRTAG_LOG_BAD_CRC				29
++ #define XFS_ERRTAG_LOG_ITEM_PIN				30
++ #define XFS_ERRTAG_MAX					31
+++>>>>>>> 7f4d01f36a3a (xfs: add log item pinning error injection tag)
+  
+  /*
+   * Random factors for above tags, 1 means always, 2 means 1/2 time, etc.
+@@@ -129,8 -135,14 +136,9 @@@
+  #define XFS_RANDOM_DIOWRITE_IOERR			(XFS_RANDOM_DEFAULT/10)
+  #define	XFS_RANDOM_BMAPIFORMAT				XFS_RANDOM_DEFAULT
+  #define XFS_RANDOM_FREE_EXTENT				1
+ -#define XFS_RANDOM_RMAP_FINISH_ONE			1
+ -#define XFS_RANDOM_REFCOUNT_CONTINUE_UPDATE		1
+ -#define XFS_RANDOM_REFCOUNT_FINISH_ONE			1
+ -#define XFS_RANDOM_BMAP_FINISH_ONE			1
+ -#define XFS_RANDOM_AG_RESV_CRITICAL			4
+  #define XFS_RANDOM_DROP_WRITES				1
+  #define XFS_RANDOM_LOG_BAD_CRC				1
++ #define XFS_RANDOM_LOG_ITEM_PIN				1
+  
+  #ifdef DEBUG
+  extern int xfs_errortag_init(struct xfs_mount *mp);
+diff --git a/fs/xfs/xfs_error.c b/fs/xfs/xfs_error.c
+index 4d546eecc660..6ba55f147eea 100644
+--- a/fs/xfs/xfs_error.c
++++ b/fs/xfs/xfs_error.c
+@@ -52,6 +52,7 @@ static unsigned int xfs_errortag_random_default[] = {
+ 	XFS_RANDOM_FREE_EXTENT,
+ 	XFS_RANDOM_DROP_WRITES,
+ 	XFS_RANDOM_LOG_BAD_CRC,
++	XFS_RANDOM_LOG_ITEM_PIN,
+ };
+ 
+ struct xfs_errortag_attr {
+@@ -151,6 +152,7 @@ XFS_ERRORTAG_ATTR_RW(bmapifmt,		XFS_ERRTAG_BMAPIFORMAT);
+ XFS_ERRORTAG_ATTR_RW(free_extent,	XFS_ERRTAG_FREE_EXTENT);
+ XFS_ERRORTAG_ATTR_RW(drop_writes,	XFS_ERRTAG_DROP_WRITES);
+ XFS_ERRORTAG_ATTR_RW(log_bad_crc,	XFS_ERRTAG_LOG_BAD_CRC);
++XFS_ERRORTAG_ATTR_RW(log_item_pin,	XFS_ERRTAG_LOG_ITEM_PIN);
+ 
+ static struct attribute *xfs_errortag_attrs[] = {
+ 	XFS_ERRORTAG_ATTR_LIST(noerror),
+@@ -178,6 +180,7 @@ static struct attribute *xfs_errortag_attrs[] = {
+ 	XFS_ERRORTAG_ATTR_LIST(free_extent),
+ 	XFS_ERRORTAG_ATTR_LIST(drop_writes),
+ 	XFS_ERRORTAG_ATTR_LIST(log_bad_crc),
++	XFS_ERRORTAG_ATTR_LIST(log_item_pin),
+ 	NULL,
+ };
+ 
+* Unmerged path fs/xfs/xfs_error.h
+diff --git a/fs/xfs/xfs_trans_ail.c b/fs/xfs/xfs_trans_ail.c
+index 70f5ab017323..354368a906e5 100644
+--- a/fs/xfs/xfs_trans_ail.c
++++ b/fs/xfs/xfs_trans_ail.c
+@@ -325,6 +325,21 @@ xfs_ail_delete(
+ 	xfs_trans_ail_cursor_clear(ailp, lip);
+ }
+ 
++static inline uint
++xfsaild_push_item(
++	struct xfs_ail		*ailp,
++	struct xfs_log_item	*lip)
++{
++	/*
++	 * If log item pinning is enabled, skip the push and track the item as
++	 * pinned. This can help induce head-behind-tail conditions.
++	 */
++	if (XFS_TEST_ERROR(false, ailp->xa_mount, XFS_ERRTAG_LOG_ITEM_PIN))
++		return XFS_ITEM_PINNED;
++
++	return lip->li_ops->iop_push(lip, &ailp->xa_buf_list);
++}
++
+ static long
+ xfsaild_push(
+ 	struct xfs_ail		*ailp)
+@@ -382,7 +397,7 @@ xfsaild_push(
+ 		 * rely on the AIL cursor implementation to be able to deal with
+ 		 * the dropped lock.
+ 		 */
+-		lock_result = lip->li_ops->iop_push(lip, &ailp->xa_buf_list);
++		lock_result = xfsaild_push_item(ailp, lip);
+ 		switch (lock_result) {
+ 		case XFS_ITEM_SUCCESS:
+ 			XFS_STATS_INC(mp, xs_push_ail_success);
