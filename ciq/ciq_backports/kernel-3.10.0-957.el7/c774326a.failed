@@ -1,0 +1,293 @@
+Input: psmouse - introduce notion of SMBus companions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [input] psmouse - introduce notion of SMBus companions (Benjamin Tissoires) [1554926]
+Rebuild_FUZZ: 92.93%
+commit-author Dmitry Torokhov <dmitry.torokhov@gmail.com>
+commit c774326a219536ab615d68a22875673f6f608b62
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/c774326a.failed
+
+Prepare PS/2 mouse drivers to work with devices that are accessible both
+via PS/2 and SMBus, which provides higher bandwidth, and thus suits better
+for modern multi-touch devices.
+
+We expect that SMBus drivers will take control over the device, so when
+we detect SMBus "protocol" we forego registering input device, or enabling
+PS/2 device reports (as it usually makes device unresponsive to access over
+SMBus).
+
+	Reviewed-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+	Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+(cherry picked from commit c774326a219536ab615d68a22875673f6f608b62)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/input/mouse/psmouse.h
+diff --cc drivers/input/mouse/psmouse.h
+index c01433fafba8,e853dee05e79..000000000000
+--- a/drivers/input/mouse/psmouse.h
++++ b/drivers/input/mouse/psmouse.h
+@@@ -105,6 -68,65 +105,67 @@@ enum psmouse_type 
+  	PSMOUSE_AUTO		/* This one should always be last */
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct psmouse;
++ 
++ struct psmouse_protocol {
++ 	enum psmouse_type type;
++ 	bool maxproto;
++ 	bool ignore_parity; /* Protocol should ignore parity errors from KBC */
++ 	bool try_passthru; /* Try protocol also on passthrough ports */
++ 	bool smbus_companion; /* "Protocol" is a stub, device is on SMBus */
++ 	const char *name;
++ 	const char *alias;
++ 	int (*detect)(struct psmouse *, bool);
++ 	int (*init)(struct psmouse *);
++ };
++ 
++ struct psmouse {
++ 	void *private;
++ 	struct input_dev *dev;
++ 	struct ps2dev ps2dev;
++ 	struct delayed_work resync_work;
++ 	const char *vendor;
++ 	const char *name;
++ 	const struct psmouse_protocol *protocol;
++ 	unsigned char packet[8];
++ 	unsigned char badbyte;
++ 	unsigned char pktcnt;
++ 	unsigned char pktsize;
++ 	unsigned char oob_data_type;
++ 	unsigned char extra_buttons;
++ 	bool acks_disable_command;
++ 	unsigned int model;
++ 	unsigned long last;
++ 	unsigned long out_of_sync_cnt;
++ 	unsigned long num_resyncs;
++ 	enum psmouse_state state;
++ 	char devname[64];
++ 	char phys[32];
++ 
++ 	unsigned int rate;
++ 	unsigned int resolution;
++ 	unsigned int resetafter;
++ 	unsigned int resync_time;
++ 	bool smartscroll;	/* Logitech only */
++ 
++ 	psmouse_ret_t (*protocol_handler)(struct psmouse *psmouse);
++ 	void (*set_rate)(struct psmouse *psmouse, unsigned int rate);
++ 	void (*set_resolution)(struct psmouse *psmouse, unsigned int resolution);
++ 	void (*set_scale)(struct psmouse *psmouse, enum psmouse_scale scale);
++ 
++ 	int (*reconnect)(struct psmouse *psmouse);
++ 	int (*fast_reconnect)(struct psmouse *psmouse);
++ 	void (*disconnect)(struct psmouse *psmouse);
++ 	void (*cleanup)(struct psmouse *psmouse);
++ 	int (*poll)(struct psmouse *psmouse);
++ 
++ 	void (*pt_activate)(struct psmouse *psmouse);
++ 	void (*pt_deactivate)(struct psmouse *psmouse);
++ };
++ 
+++>>>>>>> c774326a2195 (Input: psmouse - introduce notion of SMBus companions)
+  void psmouse_queue_work(struct psmouse *psmouse, struct delayed_work *work,
+  		unsigned long delay);
+  int psmouse_sliced_command(struct psmouse *psmouse, unsigned char command);
+diff --git a/drivers/input/mouse/psmouse-base.c b/drivers/input/mouse/psmouse-base.c
+index 689f85d37ffb..b664de8a267f 100644
+--- a/drivers/input/mouse/psmouse-base.c
++++ b/drivers/input/mouse/psmouse-base.c
+@@ -1371,9 +1371,8 @@ static void psmouse_cleanup(struct serio *serio)
+ 
+ static void psmouse_disconnect(struct serio *serio)
+ {
+-	struct psmouse *psmouse, *parent = NULL;
+-
+-	psmouse = serio_get_drvdata(serio);
++	struct psmouse *psmouse = serio_get_drvdata(serio);
++	struct psmouse *parent = NULL;
+ 
+ 	sysfs_remove_group(&serio->dev.kobj, &psmouse_attribute_group);
+ 
+@@ -1401,7 +1400,10 @@ static void psmouse_disconnect(struct serio *serio)
+ 
+ 	serio_close(serio);
+ 	serio_set_drvdata(serio, NULL);
+-	input_unregister_device(psmouse->dev);
++
++	if (psmouse->dev)
++		input_unregister_device(psmouse->dev);
++
+ 	kfree(psmouse);
+ 
+ 	if (parent)
+@@ -1519,12 +1521,18 @@ static int psmouse_connect(struct serio *serio, struct serio_driver *drv)
+ 
+ 	psmouse_switch_protocol(psmouse, NULL);
+ 
+-	psmouse_set_state(psmouse, PSMOUSE_CMD_MODE);
+-	psmouse_initialize(psmouse);
++	if (!psmouse->protocol->smbus_companion) {
++		psmouse_set_state(psmouse, PSMOUSE_CMD_MODE);
++		psmouse_initialize(psmouse);
+ 
+-	error = input_register_device(psmouse->dev);
+-	if (error)
+-		goto err_protocol_disconnect;
++		error = input_register_device(input_dev);
++		if (error)
++			goto err_protocol_disconnect;
++	} else {
++		/* Smbus companion will be reporting events, not us. */
++		input_free_device(input_dev);
++		psmouse->dev = input_dev = NULL;
++	}
+ 
+ 	if (parent && parent->pt_activate)
+ 		parent->pt_activate(parent);
+@@ -1533,7 +1541,12 @@ static int psmouse_connect(struct serio *serio, struct serio_driver *drv)
+ 	if (error)
+ 		goto err_pt_deactivate;
+ 
+-	psmouse_activate(psmouse);
++	/*
++	 * PS/2 devices having SMBus companions should stay disabled
++	 * on PS/2 side, in order to have SMBus part operable.
++	 */
++	if (!psmouse->protocol->smbus_companion)
++		psmouse_activate(psmouse);
+ 
+  out:
+ 	/* If this is a pass-through port the parent needs to be re-activated */
+@@ -1546,8 +1559,10 @@ static int psmouse_connect(struct serio *serio, struct serio_driver *drv)
+  err_pt_deactivate:
+ 	if (parent && parent->pt_deactivate)
+ 		parent->pt_deactivate(parent);
+-	input_unregister_device(psmouse->dev);
+-	input_dev = NULL; /* so we don't try to free it below */
++	if (input_dev) {
++		input_unregister_device(input_dev);
++		input_dev = NULL; /* so we don't try to free it below */
++	}
+  err_protocol_disconnect:
+ 	if (psmouse->disconnect)
+ 		psmouse->disconnect(psmouse);
+@@ -1606,14 +1621,21 @@ static int psmouse_reconnect(struct serio *serio)
+ 	 * OK, the device type (and capabilities) match the old one,
+ 	 * we can continue using it, complete initialization
+ 	 */
+-	psmouse_set_state(psmouse, PSMOUSE_CMD_MODE);
+-
+-	psmouse_initialize(psmouse);
++	if (!psmouse->protocol->smbus_companion) {
++		psmouse_set_state(psmouse, PSMOUSE_CMD_MODE);
++		psmouse_initialize(psmouse);
++	}
+ 
+ 	if (parent && parent->pt_activate)
+ 		parent->pt_activate(parent);
+ 
+-	psmouse_activate(psmouse);
++	/*
++	 * PS/2 devices having SMBus companions should stay disabled
++	 * on PS/2 side, in order to have SMBus part operable.
++	 */
++	if (!psmouse->protocol->smbus_companion)
++		psmouse_activate(psmouse);
++
+ 	rc = 0;
+ 
+ out:
+@@ -1661,9 +1683,11 @@ ssize_t psmouse_attr_show_helper(struct device *dev, struct device_attribute *de
+ {
+ 	struct serio *serio = to_serio_port(dev);
+ 	struct psmouse_attribute *attr = to_psmouse_attr(devattr);
+-	struct psmouse *psmouse;
++	struct psmouse *psmouse = serio_get_drvdata(serio);
+ 
+-	psmouse = serio_get_drvdata(serio);
++	if (psmouse->protocol->smbus_companion &&
++			devattr != &psmouse_attr_protocol.dattr)
++		return -ENOENT;
+ 
+ 	return attr->show(psmouse, attr->data, buf);
+ }
+@@ -1682,6 +1706,12 @@ ssize_t psmouse_attr_set_helper(struct device *dev, struct device_attribute *dev
+ 
+ 	psmouse = serio_get_drvdata(serio);
+ 
++	if (psmouse->protocol->smbus_companion &&
++			devattr != &psmouse_attr_protocol.dattr) {
++		retval = -ENOENT;
++		goto out_unlock;
++	}
++
+ 	if (attr->protect) {
+ 		if (psmouse->state == PSMOUSE_IGNORE) {
+ 			retval = -ENODEV;
+@@ -1693,13 +1723,14 @@ ssize_t psmouse_attr_set_helper(struct device *dev, struct device_attribute *dev
+ 			psmouse_deactivate(parent);
+ 		}
+ 
+-		psmouse_deactivate(psmouse);
++		if (!psmouse->protocol->smbus_companion)
++			psmouse_deactivate(psmouse);
+ 	}
+ 
+ 	retval = attr->set(psmouse, attr->data, buf, count);
+ 
+ 	if (attr->protect) {
+-		if (retval != -ENODEV)
++		if (retval != -ENODEV && !psmouse->protocol->smbus_companion)
+ 			psmouse_activate(psmouse);
+ 
+ 		if (parent)
+@@ -1808,23 +1839,29 @@ static ssize_t psmouse_attr_set_protocol(struct psmouse *psmouse, void *data, co
+ 	psmouse_initialize(psmouse);
+ 	psmouse_set_state(psmouse, PSMOUSE_CMD_MODE);
+ 
+-	error = input_register_device(psmouse->dev);
+-	if (error) {
+-		if (psmouse->disconnect)
+-			psmouse->disconnect(psmouse);
++	if (psmouse->protocol->smbus_companion) {
++		input_free_device(psmouse->dev);
++		psmouse->dev = NULL;
++	} else {
++		error = input_register_device(psmouse->dev);
++		if (error) {
++			if (psmouse->disconnect)
++				psmouse->disconnect(psmouse);
+ 
+-		psmouse_set_state(psmouse, PSMOUSE_IGNORE);
+-		input_free_device(new_dev);
+-		psmouse->dev = old_dev;
+-		psmouse_set_state(psmouse, PSMOUSE_INITIALIZING);
+-		psmouse_switch_protocol(psmouse, old_proto);
+-		psmouse_initialize(psmouse);
+-		psmouse_set_state(psmouse, PSMOUSE_CMD_MODE);
++			psmouse_set_state(psmouse, PSMOUSE_IGNORE);
++			input_free_device(new_dev);
++			psmouse->dev = old_dev;
++			psmouse_set_state(psmouse, PSMOUSE_INITIALIZING);
++			psmouse_switch_protocol(psmouse, old_proto);
++			psmouse_initialize(psmouse);
++			psmouse_set_state(psmouse, PSMOUSE_CMD_MODE);
+ 
+-		return error;
++			return error;
++		}
+ 	}
+ 
+-	input_unregister_device(old_dev);
++	if (old_dev)
++		input_unregister_device(old_dev);
+ 
+ 	if (parent && parent->pt_activate)
+ 		parent->pt_activate(parent);
+* Unmerged path drivers/input/mouse/psmouse.h
