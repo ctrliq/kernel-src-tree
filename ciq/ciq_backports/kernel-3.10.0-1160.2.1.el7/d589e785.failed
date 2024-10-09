@@ -1,0 +1,168 @@
+net/mlx5e: Allow concurrent creation of encap entries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.2.1.el7
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit d589e785baf5e48ee80a4fbfed96661a4c7c8c8d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.2.1.el7/d589e785.failed
+
+Encap entries creation is fully synchronized by encap_tbl_lock. In order to
+allow concurrent allocation of hardware resources used to offload
+encapsulation, extend mlx5e_encap_entry with 'res_ready' completion. Move
+call to mlx5e_tc_tun_create_header_ipv{4|6}() out of encap_tbl_lock
+critical section. Modify code that attaches new flows to existing encap to
+wait for 'res_ready' completion before using the entry. Insert encap entry
+to table before provisioning it to hardware and modify all users of the
+encap table to verify that encap was fully initialized by checking
+completion result for non-zero value (and to wait for 'res_ready'
+completion, if necessary).
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit d589e785baf5e48ee80a4fbfed96661a4c7c8c8d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 38175da1db0a,5be3da621499..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -2627,26 -2905,38 +2627,51 @@@ static int mlx5e_attach_encap(struct ml
+  
+  	/* must verify if encap is valid or not */
+  	if (e) {
+++<<<<<<< HEAD
+ +		/* Check that entry was not already attached to this flow */
+ +		if (is_duplicated_encap_entry(priv, flow, out_index, e, extack)) {
+ +			err = -EOPNOTSUPP;
+ +			goto out_err;
+ +		}
+++=======
++ 		mutex_unlock(&esw->offloads.encap_tbl_lock);
++ 		wait_for_completion(&e->res_ready);
++ 
++ 		/* Protect against concurrent neigh update. */
++ 		mutex_lock(&esw->offloads.encap_tbl_lock);
++ 		if (e->compl_result) {
++ 			err = -EREMOTEIO;
++ 			goto out_err;
++ 		}
++ 		goto attach_flow;
++ 	}
+++>>>>>>> d589e785baf5 (net/mlx5e: Allow concurrent creation of encap entries)
+  
+ -	e = kzalloc(sizeof(*e), GFP_KERNEL);
+ -	if (!e) {
+ -		err = -ENOMEM;
+ -		goto out_err;
+ +		goto attach_flow;
+  	}
+  
+ +	e = kzalloc(sizeof(*e), GFP_KERNEL);
+ +	if (!e)
+ +		return -ENOMEM;
+ +
+  	refcount_set(&e->refcnt, 1);
+++<<<<<<< HEAD
+ +	e->tun_info = *tun_info;
+++=======
++ 	init_completion(&e->res_ready);
++ 
++ 	e->tun_info = tun_info;
+++>>>>>>> d589e785baf5 (net/mlx5e: Allow concurrent creation of encap entries)
+  	err = mlx5e_tc_tun_init_encap_attr(mirred_dev, priv, e, extack);
+- 	if (err)
++ 	if (err) {
++ 		kfree(e);
++ 		e = NULL;
+  		goto out_err;
++ 	}
+  
+  	INIT_LIST_HEAD(&e->flows);
++ 	hash_add_rcu(esw->offloads.encap_tbl, &e->encap_hlist, hash_key);
++ 	mutex_unlock(&esw->offloads.encap_tbl_lock);
+  
+  	if (family == AF_INET)
+  		err = mlx5e_tc_tun_create_header_ipv4(priv, mirred_dev, e);
+@@@ -2674,57 -2968,9 +2702,63 @@@ attach_flow
+  	return err;
+  
+  out_err:
+++<<<<<<< HEAD
+ +	kfree(e);
+++=======
++ 	mutex_unlock(&esw->offloads.encap_tbl_lock);
++ 	if (e)
++ 		mlx5e_encap_put(priv, e);
+++>>>>>>> d589e785baf5 (net/mlx5e: Allow concurrent creation of encap entries)
+ +	return err;
+ +}
+ +
+ +static int add_vlan_rewrite_action(struct mlx5e_priv *priv,
+ +				   const struct tc_action *a,
+ +				   struct mlx5_esw_flow_attr *attr,
+ +				   struct mlx5e_tc_flow_parse_attr *parse_attr,
+ +				   u32 *action, struct netlink_ext_ack *extack)
+ +{
+ +	u8 match_prio_mask, match_prio_val;
+ +	void *headers_c, *headers_v;
+ +	int err;
+ +	struct tcf_pedit_key_ex pedit_key_ex = {
+ +		.htype = TCA_PEDIT_KEY_EX_HDR_TYPE_ETH,
+ +		.cmd = TCA_PEDIT_KEY_EX_CMD_SET,
+ +	};
+ +	u16 mask16 = VLAN_VID_MASK;
+ +	u16 val16 = tcf_vlan_push_vid(a) & VLAN_VID_MASK;
+ +	struct tc_pedit_key pedit_key = {
+ +		.mask = ~(u32)be16_to_cpu(*(__be16 *)&mask16),
+ +		.val = (u32)be16_to_cpu(*(__be16 *)&val16),
+ +		.off = offsetof(struct vlan_ethhdr, h_vlan_TCI),
+ +	};
+ +	const struct tcf_pedit pedit_act = {
+ +		.tcfp_nkeys = 1,
+ +		.tcfp_keys = &pedit_key,
+ +		.tcfp_keys_ex = &pedit_key_ex,
+ +	};
+ +
+ +	headers_c = get_match_headers_criteria(*action, &parse_attr->spec);
+ +	headers_v = get_match_headers_value(*action, &parse_attr->spec);
+ +
+ +	if (!(MLX5_GET(fte_match_set_lyr_2_4, headers_c, cvlan_tag) &&
+ +	      MLX5_GET(fte_match_set_lyr_2_4, headers_v, cvlan_tag))) {
+ +		NL_SET_ERR_MSG_MOD(extack,
+ +				   "VLAN rewrite action must have VLAN protocol match");
+ +		return -EOPNOTSUPP;
+ +	}
+ +
+ +	match_prio_mask = MLX5_GET(fte_match_set_lyr_2_4, headers_c, first_prio);
+ +	match_prio_val = MLX5_GET(fte_match_set_lyr_2_4, headers_v, first_prio);
+ +	if (tcf_vlan_push_prio(a) != (match_prio_val & match_prio_mask)) {
+ +		NL_SET_ERR_MSG_MOD(extack,
+ +				   "Changing VLAN prio is not supported");
+ +		return -EOPNOTSUPP;
+ +	}
+ +
+ +	err = parse_tc_pedit_action(priv, (const struct tc_action *)&pedit_act,
+ +				    MLX5_FLOW_NAMESPACE_FDB, parse_attr, action, NULL);
+ +	*action |= MLX5_FLOW_CONTEXT_ACTION_MOD_HDR;
+  	return err;
+  }
+  
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+index ed1a83de5330..4fa5d7c237e9 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+@@ -159,6 +159,8 @@ struct mlx5e_encap_entry {
+ 	char *encap_header;
+ 	int encap_size;
+ 	refcount_t refcnt;
++	struct completion res_ready;
++	int compl_result;
+ };
+ 
+ struct mlx5e_rep_sq {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
