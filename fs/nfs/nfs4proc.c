@@ -5067,7 +5067,6 @@ static void nfs4_init_boot_verifier(const struct nfs_client *clp,
 static int
 nfs4_init_nonuniform_client_string(struct nfs_client *clp)
 {
-	int result;
 	size_t len;
 	char *str;
 
@@ -5095,7 +5094,7 @@ nfs4_init_nonuniform_client_string(struct nfs_client *clp)
 		return -ENOMEM;
 
 	rcu_read_lock();
-	result = scnprintf(str, len, "Linux NFSv4.0 %s/%s %s",
+	scnprintf(str, len, "Linux NFSv4.0 %s/%s %s",
 			clp->cl_ipaddr,
 			rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_ADDR),
 			rpc_peeraddr2str(clp->cl_rpcclient, RPC_DISPLAY_PROTO));
@@ -5108,7 +5107,6 @@ nfs4_init_nonuniform_client_string(struct nfs_client *clp)
 static int
 nfs4_init_uniquifier_client_string(struct nfs_client *clp)
 {
-	int result;
 	size_t len;
 	char *str;
 
@@ -5128,7 +5126,7 @@ nfs4_init_uniquifier_client_string(struct nfs_client *clp)
 	if (!str)
 		return -ENOMEM;
 
-	result = scnprintf(str, len, "Linux NFSv%u.%u %s/%s",
+	scnprintf(str, len, "Linux NFSv%u.%u %s/%s",
 			clp->rpc_ops->version, clp->cl_minorversion,
 			nfs4_client_id_uniquifier,
 			clp->cl_rpcclient->cl_nodename);
@@ -5139,7 +5137,6 @@ nfs4_init_uniquifier_client_string(struct nfs_client *clp)
 static int
 nfs4_init_uniform_client_string(struct nfs_client *clp)
 {
-	int result;
 	size_t len;
 	char *str;
 
@@ -5164,7 +5161,7 @@ nfs4_init_uniform_client_string(struct nfs_client *clp)
 	if (!str)
 		return -ENOMEM;
 
-	result = scnprintf(str, len, "Linux NFSv%u.%u %s",
+	scnprintf(str, len, "Linux NFSv%u.%u %s",
 			clp->rpc_ops->version, clp->cl_minorversion,
 			clp->cl_rpcclient->cl_nodename);
 	clp->cl_owner_id = str;
