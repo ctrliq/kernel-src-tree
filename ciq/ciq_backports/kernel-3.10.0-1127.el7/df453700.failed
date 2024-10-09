@@ -1,0 +1,135 @@
+inet: switch IP ID generator to siphash
+
+jira LE-1907
+cve CVE-2019-10638
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit df453700e8d81b1bdafdf684365ee2b9431fb702
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/df453700.failed
+
+According to Amit Klein and Benny Pinkas, IP ID generation is too weak
+and might be used by attackers.
+
+Even with recent net_hash_mix() fix (netns: provide pure entropy for net_hash_mix())
+having 64bit key and Jenkins hash is risky.
+
+It is time to switch to siphash and its 128bit keys.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Reported-by: Amit Klein <aksecurity@gmail.com>
+	Reported-by: Benny Pinkas <benny@pinkas.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit df453700e8d81b1bdafdf684365ee2b9431fb702)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/siphash.h
+#	include/net/netns/ipv4.h
+#	net/ipv6/output_core.c
+diff --cc include/net/netns/ipv4.h
+index 79c995f4a025,7698460a3dd1..000000000000
+--- a/include/net/netns/ipv4.h
++++ b/include/net/netns/ipv4.h
+@@@ -86,5 -206,18 +87,21 @@@ struct netns_ipv4 
+  	struct fib_rules_ops	*mr_rules_ops;
+  #endif
+  #endif
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_IP_ROUTE_MULTIPATH
++ 	int sysctl_fib_multipath_use_neigh;
++ 	int sysctl_fib_multipath_hash_policy;
++ #endif
++ 
++ 	struct fib_notifier_ops	*notifier_ops;
++ 	unsigned int	fib_seq;	/* protected by rtnl_mutex */
++ 
++ 	struct fib_notifier_ops	*ipmr_notifier_ops;
++ 	unsigned int	ipmr_seq;	/* protected by rtnl_mutex */
++ 
++ 	atomic_t	rt_genid;
++ 	siphash_key_t	ip_id_key;
+++>>>>>>> df453700e8d8 (inet: switch IP ID generator to siphash)
+  };
+  #endif
+diff --cc net/ipv6/output_core.c
+index f5687b74fff0,868ae23dbae1..000000000000
+--- a/net/ipv6/output_core.c
++++ b/net/ipv6/output_core.c
+@@@ -7,9 -7,10 +7,9 @@@
+  #include <net/ipv6.h>
+  #include <net/ip6_fib.h>
+  #include <net/addrconf.h>
+ -#include <net/secure_seq.h>
+  #include <linux/netfilter.h>
+  
+- static u32 __ipv6_select_ident(struct net *net, u32 hashrnd,
++ static u32 __ipv6_select_ident(struct net *net,
+  			       const struct in6_addr *dst,
+  			       const struct in6_addr *src)
+  {
+@@@ -38,9 -49,8 +48,8 @@@
+   *
+   * The network header must be set before calling this.
+   */
+ -__be32 ipv6_proxy_select_ident(struct net *net, struct sk_buff *skb)
+ +void ipv6_proxy_select_ident(struct net *net, struct sk_buff *skb)
+  {
+- 	static u32 ip6_proxy_idents_hashrnd __read_mostly;
+  	struct in6_addr buf[2];
+  	struct in6_addr *addrs;
+  	u32 id;
+@@@ -50,14 -60,10 +59,19 @@@
+  				   offsetof(struct ipv6hdr, saddr),
+  				   sizeof(buf), buf);
+  	if (!addrs)
+ -		return 0;
+ +		return;
+  
+++<<<<<<< HEAD
+ +	net_get_random_once(&ip6_proxy_idents_hashrnd,
+ +			    sizeof(ip6_proxy_idents_hashrnd));
+ +
+ +	id = __ipv6_select_ident(net, ip6_proxy_idents_hashrnd,
+ +				 &addrs[1], &addrs[0]);
+ +	skb_shinfo(skb)->ip6_frag_id = htonl(id);
+++=======
++ 	id = __ipv6_select_ident(net, &addrs[1], &addrs[0]);
++ 	return htonl(id);
+++>>>>>>> df453700e8d8 (inet: switch IP ID generator to siphash)
+  }
+  EXPORT_SYMBOL_GPL(ipv6_proxy_select_ident);
+  
+* Unmerged path include/linux/siphash.h
+* Unmerged path include/linux/siphash.h
+* Unmerged path include/net/netns/ipv4.h
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index de4634270735..264e067d4ea1 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -515,15 +515,17 @@ EXPORT_SYMBOL(ip_idents_reserve);
+ 
+ void __ip_select_ident(struct net *net, struct iphdr *iph, int segs)
+ {
+-	static u32 ip_idents_hashrnd __read_mostly;
+ 	u32 hash, id;
+ 
+-	net_get_random_once(&ip_idents_hashrnd, sizeof(ip_idents_hashrnd));
++	/* Note the following code is not safe, but this is okay. */
++	if (unlikely(siphash_key_is_zero(&net->ipv4.ip_id_key)))
++		get_random_bytes(&net->ipv4.ip_id_key,
++				 sizeof(net->ipv4.ip_id_key));
+ 
+-	hash = jhash_3words((__force u32)iph->daddr,
++	hash = siphash_3u32((__force u32)iph->daddr,
+ 			    (__force u32)iph->saddr,
+-			    iph->protocol ^ net_hash_mix(net),
+-			    ip_idents_hashrnd);
++			    iph->protocol,
++			    &net->ipv4.ip_id_key);
+ 	id = ip_idents_reserve(hash, segs);
+ 	iph->id = htons(id);
+ }
+* Unmerged path net/ipv6/output_core.c
