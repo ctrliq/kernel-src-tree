@@ -1,0 +1,177 @@
+ceph: make seeky readdir more efficient
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Yan, Zheng <zyan@redhat.com>
+commit 79162547b76e4979b21ef80c9629ada94a51a59b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/79162547.failed
+
+Current cephfs client uses string to indicate start position of
+readdir. The string is last entry of previous readdir reply.
+This approach does not work for seeky readdir because we can
+not easily convert the new postion to a string. For seeky readdir,
+mds needs to return dentries from the beginning. Client keeps
+retrying if the reply does not contain the dentry it wants.
+
+In current version of ceph, mds sorts CDentry in its cache in
+hash order. Client also uses dentry hash to compose dir postion.
+For seeky readdir, if client passes the hash part of dir postion
+to mds. mds can avoid replying useless dentries.
+
+	Signed-off-by: "Yan, Zheng" <zyan@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 79162547b76e4979b21ef80c9629ada94a51a59b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/inode.c
+#	fs/ceph/mds_client.c
+#	fs/ceph/mds_client.h
+#	include/linux/ceph/ceph_fs.h
+diff --cc fs/ceph/inode.c
+index 9d67b9b0f077,dcce79b84406..000000000000
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@@ -1447,6 -1482,19 +1447,22 @@@ int ceph_readdir_prepopulate(struct cep
+  	if (test_bit(CEPH_MDS_R_ABORTED, &req->r_req_flags))
+  		return readdir_prepopulate_inodes_only(req, session);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (rinfo->hash_order) {
++ 		if (req->r_path2) {
++ 			last_hash = ceph_str_hash(ci->i_dir_layout.dl_dir_hash,
++ 						  req->r_path2,
++ 						  strlen(req->r_path2));
++ 			last_hash = ceph_frag_value(last_hash);
++ 		} else if (rinfo->offset_hash) {
++ 			/* mds understands offset_hash */
++ 			WARN_ON_ONCE(req->r_readdir_offset != 2);
++ 			last_hash = le32_to_cpu(rhead->args.readdir.offset_hash);
++ 		}
++ 	}
++ 
+++>>>>>>> 79162547b76e (ceph: make seeky readdir more efficient)
+  	if (rinfo->dir_dir &&
+  	    le32_to_cpu(rinfo->dir_dir->frag) != frag) {
+  		dout("readdir_prepopulate got new frag %x -> %x\n",
+@@@ -1471,10 -1517,9 +1487,10 @@@
+  	}
+  
+  	if (ceph_frag_is_leftmost(frag) && req->r_readdir_offset == 2 &&
+- 	    !(rinfo->hash_order && req->r_path2)) {
++ 	    !(rinfo->hash_order && last_hash)) {
+  		/* note dir version at start of readdir so we can tell
+  		 * if any dentries get dropped */
+ +		struct ceph_inode_info *ci = ceph_inode(parent->d_inode);
+  		req->r_dir_release_cnt = atomic64_read(&ci->i_release_count);
+  		req->r_dir_ordered_cnt = atomic64_read(&ci->i_ordered_count);
+  		req->r_readdir_cache_idx = 0;
+diff --cc fs/ceph/mds_client.c
+index 06ecdebe64d7,8cc4d4e8b077..000000000000
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@@ -181,8 -184,13 +181,18 @@@ static int parse_reply_info_dir(void **
+  
+  	ceph_decode_need(p, end, sizeof(num) + 2, bad);
+  	num = ceph_decode_32(p);
+++<<<<<<< HEAD
+ +	info->dir_end = ceph_decode_8(p);
+ +	info->dir_complete = ceph_decode_8(p);
+++=======
++ 	{
++ 		u16 flags = ceph_decode_16(p);
++ 		info->dir_end = !!(flags & CEPH_READDIR_FRAG_END);
++ 		info->dir_complete = !!(flags & CEPH_READDIR_FRAG_COMPLETE);
++ 		info->hash_order = !!(flags & CEPH_READDIR_HASH_ORDER);
++ 		info->offset_hash = !!(flags & CEPH_READDIR_OFFSET_HASH);
++ 	}
+++>>>>>>> 79162547b76e (ceph: make seeky readdir more efficient)
+  	if (num == 0)
+  		goto done;
+  
+diff --cc fs/ceph/mds_client.h
+index de2a0169112c,3e67dd2169fa..000000000000
+--- a/fs/ceph/mds_client.h
++++ b/fs/ceph/mds_client.h
+@@@ -73,11 -83,11 +73,19 @@@ struct ceph_mds_reply_info_parsed 
+  			struct ceph_mds_reply_dirfrag *dir_dir;
+  			size_t			      dir_buf_size;
+  			int                           dir_nr;
+++<<<<<<< HEAD
+ +			char                          **dir_dname;
+ +			u32                           *dir_dname_len;
+ +			struct ceph_mds_reply_lease   **dir_dlease;
+ +			struct ceph_mds_reply_info_in *dir_in;
+ +			u8                            dir_complete, dir_end;
+++=======
++ 			bool			      dir_end;
++ 			bool			      dir_complete;
++ 			bool			      hash_order;
++ 			bool			      offset_hash;
++ 			struct ceph_mds_reply_dir_entry  *dir_entries;
+++>>>>>>> 79162547b76e (ceph: make seeky readdir more efficient)
+  		};
+  
+  		/* for create results */
+diff --cc include/linux/ceph/ceph_fs.h
+index 112e6d73771c,1787e4a8e251..000000000000
+--- a/include/linux/ceph/ceph_fs.h
++++ b/include/linux/ceph/ceph_fs.h
+@@@ -360,6 -354,19 +360,22 @@@ extern const char *ceph_mds_op_name(in
+  #define CEPH_XATTR_REPLACE (1 << 1)
+  #define CEPH_XATTR_REMOVE  (1 << 31)
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * readdir request flags;
++  */
++ #define CEPH_READDIR_REPLY_BITFLAGS	(1<<0)
++ 
++ /*
++  * readdir reply flags.
++  */
++ #define CEPH_READDIR_FRAG_END		(1<<0)
++ #define CEPH_READDIR_FRAG_COMPLETE	(1<<8)
++ #define CEPH_READDIR_HASH_ORDER		(1<<9)
++ #define CEPH_READDIR_OFFSET_HASH	(1<<10)
++ 
+++>>>>>>> 79162547b76e (ceph: make seeky readdir more efficient)
+  union ceph_mds_request_args {
+  	struct {
+  		__le32 mask;                 /* CEPH_CAP_* */
+@@@ -377,6 -384,8 +393,11 @@@
+  		__le32 frag;                 /* which dir fragment */
+  		__le32 max_entries;          /* how many dentries to grab */
+  		__le32 max_bytes;
+++<<<<<<< HEAD
+++=======
++ 		__le16 flags;
++ 		__le32 offset_hash;
+++>>>>>>> 79162547b76e (ceph: make seeky readdir more efficient)
+  	} __attribute__ ((packed)) readdir;
+  	struct {
+  		__le32 mode;
+diff --git a/fs/ceph/dir.c b/fs/ceph/dir.c
+index ae8662bc47cc..a7ea82c49fd8 100644
+--- a/fs/ceph/dir.c
++++ b/fs/ceph/dir.c
+@@ -326,7 +326,11 @@ more:
+ 				ceph_mdsc_put_request(req);
+ 				return -ENOMEM;
+ 			}
++		} else if (is_hash_order(ctx->pos)) {
++			req->r_args.readdir.offset_hash =
++				cpu_to_le32(fpos_hash(ctx->pos));
+ 		}
++
+ 		req->r_dir_release_cnt = fi->dir_release_count;
+ 		req->r_dir_ordered_cnt = fi->dir_ordered_count;
+ 		req->r_readdir_cache_idx = fi->readdir_cache_idx;
+* Unmerged path fs/ceph/inode.c
+* Unmerged path fs/ceph/mds_client.c
+* Unmerged path fs/ceph/mds_client.h
+* Unmerged path include/linux/ceph/ceph_fs.h
