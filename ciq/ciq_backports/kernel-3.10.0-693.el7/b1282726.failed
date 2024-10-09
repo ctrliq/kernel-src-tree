@@ -1,0 +1,302 @@
+bridge: make br_device_notifier static
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Cong Wang <xiyou.wangcong@gmail.com>
+commit b1282726d53465c7362eb134eb335173e8cd5b8c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/b1282726.failed
+
+Merge net/bridge/br_notify.c into net/bridge/br.c,
+since it has only br_device_event() and br.c is small.
+
+	Cc: Stephen Hemminger <stephen@networkplumber.org>
+	Cc: David S. Miller <davem@davemloft.net>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b1282726d53465c7362eb134eb335173e8cd5b8c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br.c
+diff --cc net/bridge/br.c
+index 8a1ecd1e7f96,1a755a1e5410..000000000000
+--- a/net/bridge/br.c
++++ b/net/bridge/br.c
+@@@ -22,9 -22,118 +22,124 @@@
+  
+  #include "br_private.h"
+  
+++<<<<<<< HEAD
+ +static const struct stp_proto br_stp_proto = {
+ +	.rcv	= br_stp_rcv,
+ +};
+++=======
++ /*
++  * Handle changes in state of network devices enslaved to a bridge.
++  *
++  * Note: don't care about up/down if bridge itself is down, because
++  *     port state is checked when bridge is brought up.
++  */
++ static int br_device_event(struct notifier_block *unused, unsigned long event, void *ptr)
++ {
++ 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
++ 	struct net_bridge_port *p;
++ 	struct net_bridge *br;
++ 	bool changed_addr;
++ 	int err;
++ 
++ 	/* register of bridge completed, add sysfs entries */
++ 	if ((dev->priv_flags & IFF_EBRIDGE) && event == NETDEV_REGISTER) {
++ 		br_sysfs_addbr(dev);
++ 		return NOTIFY_DONE;
++ 	}
++ 
++ 	/* not a port of a bridge */
++ 	p = br_port_get_rtnl(dev);
++ 	if (!p)
++ 		return NOTIFY_DONE;
++ 
++ 	br = p->br;
++ 
++ 	switch (event) {
++ 	case NETDEV_CHANGEMTU:
++ 		dev_set_mtu(br->dev, br_min_mtu(br));
++ 		break;
++ 
++ 	case NETDEV_CHANGEADDR:
++ 		spin_lock_bh(&br->lock);
++ 		br_fdb_changeaddr(p, dev->dev_addr);
++ 		changed_addr = br_stp_recalculate_bridge_id(br);
++ 		spin_unlock_bh(&br->lock);
++ 
++ 		if (changed_addr)
++ 			call_netdevice_notifiers(NETDEV_CHANGEADDR, br->dev);
++ 
++ 		break;
++ 
++ 	case NETDEV_CHANGE:
++ 		br_port_carrier_check(p);
++ 		break;
++ 
++ 	case NETDEV_FEAT_CHANGE:
++ 		netdev_update_features(br->dev);
++ 		break;
++ 
++ 	case NETDEV_DOWN:
++ 		spin_lock_bh(&br->lock);
++ 		if (br->dev->flags & IFF_UP)
++ 			br_stp_disable_port(p);
++ 		spin_unlock_bh(&br->lock);
++ 		break;
++ 
++ 	case NETDEV_UP:
++ 		if (netif_running(br->dev) && netif_oper_up(dev)) {
++ 			spin_lock_bh(&br->lock);
++ 			br_stp_enable_port(p);
++ 			spin_unlock_bh(&br->lock);
++ 		}
++ 		break;
++ 
++ 	case NETDEV_UNREGISTER:
++ 		br_del_if(br, dev);
++ 		break;
++ 
++ 	case NETDEV_CHANGENAME:
++ 		err = br_sysfs_renameif(p);
++ 		if (err)
++ 			return notifier_from_errno(err);
++ 		break;
++ 
++ 	case NETDEV_PRE_TYPE_CHANGE:
++ 		/* Forbid underlaying device to change its type. */
++ 		return NOTIFY_BAD;
++ 
++ 	case NETDEV_RESEND_IGMP:
++ 		/* Propagate to master device */
++ 		call_netdevice_notifiers(event, br->dev);
++ 		break;
++ 	}
++ 
++ 	/* Events that may cause spanning tree to refresh */
++ 	if (event == NETDEV_CHANGEADDR || event == NETDEV_UP ||
++ 	    event == NETDEV_CHANGE || event == NETDEV_DOWN)
++ 		br_ifinfo_notify(RTM_NEWLINK, p);
++ 
++ 	return NOTIFY_DONE;
++ }
++ 
++ static struct notifier_block br_device_notifier = {
++ 	.notifier_call = br_device_event
++ };
++ 
++ static void __net_exit br_net_exit(struct net *net)
++ {
++ 	struct net_device *dev;
++ 	LIST_HEAD(list);
++ 
++ 	rtnl_lock();
++ 	for_each_netdev(net, dev)
++ 		if (dev->priv_flags & IFF_EBRIDGE)
++ 			br_dev_delete(dev, &list);
++ 
++ 	unregister_netdevice_many(&list);
++ 	rtnl_unlock();
++ 
++ }
+++>>>>>>> b1282726d534 (bridge: make br_device_notifier static)
+  
+  static struct pernet_operations br_net_ops = {
+  	.exit	= br_net_exit,
+diff --git a/net/bridge/Makefile b/net/bridge/Makefile
+index 2228f91be4e6..a1cda5d4718d 100644
+--- a/net/bridge/Makefile
++++ b/net/bridge/Makefile
+@@ -5,7 +5,7 @@
+ obj-$(CONFIG_BRIDGE) += bridge.o
+ 
+ bridge-y	:= br.o br_device.o br_fdb.o br_forward.o br_if.o br_input.o \
+-			br_ioctl.o br_notify.o br_stp.o br_stp_bpdu.o \
++			br_ioctl.o br_stp.o br_stp_bpdu.o \
+ 			br_stp_if.o br_stp_timer.o br_netlink.o
+ 
+ bridge-$(CONFIG_SYSFS) += br_sysfs_if.o br_sysfs_br.o
+* Unmerged path net/bridge/br.c
+diff --git a/net/bridge/br_notify.c b/net/bridge/br_notify.c
+deleted file mode 100644
+index 2998dd1769a0..000000000000
+--- a/net/bridge/br_notify.c
++++ /dev/null
+@@ -1,118 +0,0 @@
+-/*
+- *	Device event handling
+- *	Linux ethernet bridge
+- *
+- *	Authors:
+- *	Lennert Buytenhek		<buytenh@gnu.org>
+- *
+- *	This program is free software; you can redistribute it and/or
+- *	modify it under the terms of the GNU General Public License
+- *	as published by the Free Software Foundation; either version
+- *	2 of the License, or (at your option) any later version.
+- */
+-
+-#include <linux/kernel.h>
+-#include <linux/rtnetlink.h>
+-#include <net/net_namespace.h>
+-
+-#include "br_private.h"
+-
+-static int br_device_event(struct notifier_block *unused, unsigned long event, void *ptr);
+-
+-struct notifier_block br_device_notifier = {
+-	.notifier_call = br_device_event
+-};
+-
+-/*
+- * Handle changes in state of network devices enslaved to a bridge.
+- *
+- * Note: don't care about up/down if bridge itself is down, because
+- *     port state is checked when bridge is brought up.
+- */
+-static int br_device_event(struct notifier_block *unused, unsigned long event, void *ptr)
+-{
+-	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+-	struct net_bridge_port *p;
+-	struct net_bridge *br;
+-	bool changed_addr;
+-	int err;
+-
+-	/* register of bridge completed, add sysfs entries */
+-	if ((dev->priv_flags & IFF_EBRIDGE) && event == NETDEV_REGISTER) {
+-		br_sysfs_addbr(dev);
+-		return NOTIFY_DONE;
+-	}
+-
+-	/* not a port of a bridge */
+-	p = br_port_get_rtnl(dev);
+-	if (!p)
+-		return NOTIFY_DONE;
+-
+-	br = p->br;
+-
+-	switch (event) {
+-	case NETDEV_CHANGEMTU:
+-		dev_set_mtu(br->dev, br_min_mtu(br));
+-		break;
+-
+-	case NETDEV_CHANGEADDR:
+-		spin_lock_bh(&br->lock);
+-		br_fdb_changeaddr(p, dev->dev_addr);
+-		changed_addr = br_stp_recalculate_bridge_id(br);
+-		spin_unlock_bh(&br->lock);
+-
+-		if (changed_addr)
+-			call_netdevice_notifiers(NETDEV_CHANGEADDR, br->dev);
+-
+-		break;
+-
+-	case NETDEV_CHANGE:
+-		br_port_carrier_check(p);
+-		break;
+-
+-	case NETDEV_FEAT_CHANGE:
+-		netdev_update_features(br->dev);
+-		break;
+-
+-	case NETDEV_DOWN:
+-		spin_lock_bh(&br->lock);
+-		if (br->dev->flags & IFF_UP)
+-			br_stp_disable_port(p);
+-		spin_unlock_bh(&br->lock);
+-		break;
+-
+-	case NETDEV_UP:
+-		if (netif_running(br->dev) && netif_oper_up(dev)) {
+-			spin_lock_bh(&br->lock);
+-			br_stp_enable_port(p);
+-			spin_unlock_bh(&br->lock);
+-		}
+-		break;
+-
+-	case NETDEV_UNREGISTER:
+-		br_del_if(br, dev);
+-		break;
+-
+-	case NETDEV_CHANGENAME:
+-		err = br_sysfs_renameif(p);
+-		if (err)
+-			return notifier_from_errno(err);
+-		break;
+-
+-	case NETDEV_PRE_TYPE_CHANGE:
+-		/* Forbid underlaying device to change its type. */
+-		return NOTIFY_BAD;
+-
+-	case NETDEV_RESEND_IGMP:
+-		/* Propagate to master device */
+-		call_netdevice_notifiers(event, br->dev);
+-		break;
+-	}
+-
+-	/* Events that may cause spanning tree to refresh */
+-	if (event == NETDEV_CHANGEADDR || event == NETDEV_UP ||
+-	    event == NETDEV_CHANGE || event == NETDEV_DOWN)
+-		br_ifinfo_notify(RTM_NEWLINK, p);
+-
+-	return NOTIFY_DONE;
+-}
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index 4acaee2dd1b9..d66065f7bd5b 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -320,8 +320,6 @@ struct br_input_skb_cb {
+ #define br_debug(br, format, args...)			\
+ 	pr_debug("%s: " format,  (br)->dev->name, ##args)
+ 
+-extern struct notifier_block br_device_notifier;
+-
+ /* called under bridge lock */
+ static inline int br_is_root_bridge(const struct net_bridge *br)
+ {
