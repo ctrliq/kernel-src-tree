@@ -547,6 +547,7 @@ int main(int argc, const char **argv)
 	srandom(time(NULL));
 
 	perf_config(perf_default_config, NULL);
+	set_buildid_dir(NULL);
 
 	/* get debugfs/tracefs mount point from /proc/mounts */
 	tracing_path_mount();
@@ -570,7 +571,6 @@ int main(int argc, const char **argv)
 	}
 	if (!prefixcmp(cmd, "trace")) {
 #ifdef HAVE_LIBAUDIT_SUPPORT
-		set_buildid_dir(NULL);
 		setup_path();
 		argv[0] = "trace";
 		return cmd_trace(argc, argv, NULL);
@@ -585,7 +585,6 @@ int main(int argc, const char **argv)
 	argc--;
 	handle_options(&argv, &argc, NULL);
 	commit_pager_choice();
-	set_buildid_dir(NULL);
 
 	if (argc > 0) {
 		if (!prefixcmp(argv[0], "--"))
