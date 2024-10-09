@@ -1,0 +1,136 @@
+x86/power/64: Do not refer to __PAGE_OFFSET from assembly code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit c226fab474291e3c6ac5fa30a2b0778acc311e61
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/c226fab4.failed
+
+When CONFIG_RANDOMIZE_MEMORY is set on x86-64, __PAGE_OFFSET becomes
+a variable and using it as a symbol in the image memory restoration
+assembly code under core_restore_code is not correct any more.
+
+To avoid that problem, modify set_up_temporary_mappings() to compute
+the physical address of the temporary page tables and store it in
+temp_level4_pgt, so that the value of that variable is ready to be
+written into CR3.  Then, the assembly code doesn't have to worry
+about converting that value into a physical address and things work
+regardless of whether or not CONFIG_RANDOMIZE_MEMORY is set.
+
+Reported-and-tested-by: Thomas Garnier <thgarnie@google.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit c226fab474291e3c6ac5fa30a2b0778acc311e61)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/power/hibernate_64.c
+#	arch/x86/power/hibernate_asm_64.S
+diff --cc arch/x86/power/hibernate_64.c
+index a0fde91c16cf,f0b5f2d402af..000000000000
+--- a/arch/x86/power/hibernate_64.c
++++ b/arch/x86/power/hibernate_64.c
+@@@ -35,11 -35,47 +35,53 @@@ unsigned long restore_jump_address
+   * Value of the cr3 register from before the hibernation (this value is passed
+   * in the image header).
+   */
+ -unsigned long restore_cr3 __visible;
+ +unsigned long restore_cr3;
+ +
+++<<<<<<< HEAD
+ +pgd_t *temp_level4_pgt;
+  
+ +void *relocated_restore_code;
+++=======
++ unsigned long temp_level4_pgt __visible;
++ 
++ unsigned long relocated_restore_code __visible;
++ 
++ static int set_up_temporary_text_mapping(pgd_t *pgd)
++ {
++ 	pmd_t *pmd;
++ 	pud_t *pud;
++ 
++ 	/*
++ 	 * The new mapping only has to cover the page containing the image
++ 	 * kernel's entry point (jump_address_phys), because the switch over to
++ 	 * it is carried out by relocated code running from a page allocated
++ 	 * specifically for this purpose and covered by the identity mapping, so
++ 	 * the temporary kernel text mapping is only needed for the final jump.
++ 	 * Moreover, in that mapping the virtual address of the image kernel's
++ 	 * entry point must be the same as its virtual address in the image
++ 	 * kernel (restore_jump_address), so the image kernel's
++ 	 * restore_registers() code doesn't find itself in a different area of
++ 	 * the virtual address space after switching over to the original page
++ 	 * tables used by the image kernel.
++ 	 */
++ 	pud = (pud_t *)get_safe_page(GFP_ATOMIC);
++ 	if (!pud)
++ 		return -ENOMEM;
++ 
++ 	pmd = (pmd_t *)get_safe_page(GFP_ATOMIC);
++ 	if (!pmd)
++ 		return -ENOMEM;
++ 
++ 	set_pmd(pmd + pmd_index(restore_jump_address),
++ 		__pmd((jump_address_phys & PMD_MASK) | __PAGE_KERNEL_LARGE_EXEC));
++ 	set_pud(pud + pud_index(restore_jump_address),
++ 		__pud(__pa(pmd) | _KERNPG_TABLE));
++ 	set_pgd(pgd + pgd_index(restore_jump_address),
++ 		__pgd(__pa(pud) | _KERNPG_TABLE));
++ 
++ 	return 0;
++ }
+++>>>>>>> c226fab47429 (x86/power/64: Do not refer to __PAGE_OFFSET from assembly code)
+  
+  static void *alloc_pgt_page(void *context)
+  {
+@@@ -57,13 -94,14 +100,20 @@@ static int set_up_temporary_mappings(vo
+  	int result;
+  	int i;
+  
+- 	temp_level4_pgt = (pgd_t *)get_safe_page(GFP_ATOMIC);
+- 	if (!temp_level4_pgt)
++ 	pgd = (pgd_t *)get_safe_page(GFP_ATOMIC);
++ 	if (!pgd)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	/* It is safe to reuse the original kernel mapping */
+ +	set_pgd(temp_level4_pgt + pgd_index(__START_KERNEL_map),
+ +		init_level4_pgt[pgd_index(__START_KERNEL_map)]);
+++=======
++ 	/* Prepare a temporary mapping for the kernel text */
++ 	result = set_up_temporary_text_mapping(pgd);
++ 	if (result)
++ 		return result;
+++>>>>>>> c226fab47429 (x86/power/64: Do not refer to __PAGE_OFFSET from assembly code)
+  
+  	/* Set up the direct mapping from scratch */
+  	for (i = 0; i < nr_pfn_mapped; i++) {
+diff --cc arch/x86/power/hibernate_asm_64.S
+index 4400a43b9e28,ce8da3a0412c..000000000000
+--- a/arch/x86/power/hibernate_asm_64.S
++++ b/arch/x86/power/hibernate_asm_64.S
+@@@ -82,6 -71,15 +82,18 @@@ ENTRY(restore_image
+  
+  	/* code below has been relocated to a safe page */
+  ENTRY(core_restore_code)
+++<<<<<<< HEAD
+++=======
++ 	/* switch to temporary page tables */
++ 	movq	%rax, %cr3
++ 	/* flush TLB */
++ 	movq	%rbx, %rcx
++ 	andq	$~(X86_CR4_PGE), %rcx
++ 	movq	%rcx, %cr4;  # turn off PGE
++ 	movq	%cr3, %rcx;  # flush TLB
++ 	movq	%rcx, %cr3;
++ 	movq	%rbx, %cr4;  # turn PGE back on
+++>>>>>>> c226fab47429 (x86/power/64: Do not refer to __PAGE_OFFSET from assembly code)
+  .Lloop:
+  	testq	%rdx, %rdx
+  	jz	.Ldone
+* Unmerged path arch/x86/power/hibernate_64.c
+* Unmerged path arch/x86/power/hibernate_asm_64.S
