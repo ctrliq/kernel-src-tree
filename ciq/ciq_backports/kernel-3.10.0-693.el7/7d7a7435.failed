@@ -1,0 +1,267 @@
+tcmu: Convert cmd_time_out into backend device attribute
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit 7d7a743543905a8297dce53b36e793e5307da5d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7d7a7435.failed
+
+Instead of putting cmd_time_out under ../target/core/user_0/foo/control,
+which has historically been used by parameters needed for initial
+backend device configuration, go ahead and move cmd_time_out into
+a backend device attribute.
+
+In order to do this, tcmu_module_init() has been updated to create
+a local struct configfs_attribute **tcmu_attrs, that is based upon
+the existing passthrough_attrib_attrs along with the new cmd_time_out
+attribute.  Once **tcm_attrs has been setup, go ahead and point
+it at tcmu_ops->tb_dev_attrib_attrs so it's picked up by target-core.
+
+Also following MNC's previous change, ->cmd_time_out is stored in
+milliseconds but exposed via configfs in seconds.  Also, note this
+patch restricts the modification of ->cmd_time_out to before +
+after the TCMU device has been configured, but not while it has
+active fabric exports.
+
+	Cc: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 7d7a743543905a8297dce53b36e793e5307da5d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 58fd6c885be4,c6874c38a10b..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -27,8 -27,11 +27,13 @@@
+  #include <linux/uio_driver.h>
+  #include <linux/stringify.h>
+  #include <linux/bitops.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/highmem.h>
++ #include <linux/configfs.h>
+++>>>>>>> 7d7a74354390 (tcmu: Convert cmd_time_out into backend device attribute)
+  #include <net/genetlink.h>
+ -#include <scsi/scsi_common.h>
+ -#include <scsi/scsi_proto.h>
+ +#include <asm/unaligned.h>
+  #include <target/target_core_base.h>
+  #include <target/target_core_fabric.h>
+  #include <target/target_core_backend.h>
+@@@ -1175,95 -1164,54 +1160,140 @@@ static sector_t tcmu_get_blocks(struct 
+  static sense_reason_t
+  tcmu_parse_cdb(struct se_cmd *cmd)
+  {
+ -	return passthrough_parse_cdb(cmd, tcmu_queue_cmd);
+ +	unsigned char *cdb = cmd->t_task_cdb;
+ +
+ +	/*
+ +	 * Clear a lun set in the cdb if the initiator talking to use spoke
+ +	 * and old standards version, as we can't assume the underlying device
+ +	 * won't choke up on it.
+ +	 */
+ +	switch (cdb[0]) {
+ +	case READ_10: /* SBC - RDProtect */
+ +	case READ_12: /* SBC - RDProtect */
+ +	case READ_16: /* SBC - RDProtect */
+ +	case SEND_DIAGNOSTIC: /* SPC - SELF-TEST Code */
+ +	case VERIFY: /* SBC - VRProtect */
+ +	case VERIFY_16: /* SBC - VRProtect */
+ +	case WRITE_VERIFY: /* SBC - VRProtect */
+ +	case WRITE_VERIFY_12: /* SBC - VRProtect */
+ +	case MAINTENANCE_IN: /* SPC - Parameter Data Format for SA RTPG */
+ +		break;
+ +	default:
+ +		cdb[1] &= 0x1f; /* clear logical unit number */
+ +		break;
+ +	}
+ +
+ +	/*
+ +	 * For REPORT LUNS we always need to emulate the response, for everything
+ +	 * else, pass it up.
+ +	 */
+ +	if (cdb[0] == REPORT_LUNS) {
+ +		cmd->execute_cmd = spc_emulate_report_luns;
+ +		return TCM_NO_SENSE;
+ +	}
+ +
+ +	/* Set DATA_CDB flag for ops that should have it */
+ +	switch (cdb[0]) {
+ +	case READ_6:
+ +	case READ_10:
+ +	case READ_12:
+ +	case READ_16:
+ +	case WRITE_6:
+ +	case WRITE_10:
+ +	case WRITE_12:
+ +	case WRITE_16:
+ +	case WRITE_VERIFY:
+ +	case WRITE_VERIFY_12:
+ +	case 0x8e: /* WRITE_VERIFY_16 */
+ +	case COMPARE_AND_WRITE:
+ +	case XDWRITEREAD_10:
+ +		cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
+ +		break;
+ +	case VARIABLE_LENGTH_CMD:
+ +		switch (get_unaligned_be16(&cdb[8])) {
+ +		case READ_32:
+ +		case WRITE_32:
+ +		case 0x0c: /* WRITE_VERIFY_32 */
+ +		case XDWRITEREAD_32:
+ +			cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
+ +			break;
+ +		}
+ +	}
+ +
+ +	cmd->execute_cmd = tcmu_queue_cmd;
+ +
+ +	return TCM_NO_SENSE;
+  }
+  
+++<<<<<<< HEAD
+ +DEF_TB_DEV_ATTRIB_RO(tcmu, hw_pi_prot_type);
+ +TB_DEV_ATTR_RO(tcmu, hw_pi_prot_type);
+ +
+ +DEF_TB_DEV_ATTRIB_RO(tcmu, hw_block_size);
+ +TB_DEV_ATTR_RO(tcmu, hw_block_size);
+ +
+ +DEF_TB_DEV_ATTRIB_RO(tcmu, hw_max_sectors);
+ +TB_DEV_ATTR_RO(tcmu, hw_max_sectors);
+ +
+ +DEF_TB_DEV_ATTRIB_RO(tcmu, hw_queue_depth);
+ +TB_DEV_ATTR_RO(tcmu, hw_queue_depth);
+ +
+ +static struct configfs_attribute *tcmu_backend_dev_attrs[] = {
+ +	&tcmu_dev_attrib_hw_pi_prot_type.attr,
+ +	&tcmu_dev_attrib_hw_block_size.attr,
+ +	&tcmu_dev_attrib_hw_max_sectors.attr,
+ +	&tcmu_dev_attrib_hw_queue_depth.attr,
+ +	NULL,
+ +};
+ +
+ +static struct se_subsystem_api tcmu_template = {
+++=======
++ static ssize_t tcmu_cmd_time_out_show(struct config_item *item, char *page)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 					struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = container_of(da->da_dev,
++ 					struct tcmu_dev, se_dev);
++ 
++ 	return snprintf(page, PAGE_SIZE, "%lu\n", udev->cmd_time_out / MSEC_PER_SEC);
++ }
++ 
++ static ssize_t tcmu_cmd_time_out_store(struct config_item *item, const char *page,
++ 				       size_t count)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 					struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = container_of(da->da_dev,
++ 					struct tcmu_dev, se_dev);
++ 	u32 val;
++ 	int ret;
++ 
++ 	if (da->da_dev->export_count) {
++ 		pr_err("Unable to set tcmu cmd_time_out while exports exist\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	ret = kstrtou32(page, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	if (!val) {
++ 		pr_err("Illegal value for cmd_time_out\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	udev->cmd_time_out = val * MSEC_PER_SEC;
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, cmd_time_out);
++ 
++ static struct configfs_attribute **tcmu_attrs;
++ 
++ static struct target_backend_ops tcmu_ops = {
+++>>>>>>> 7d7a74354390 (tcmu: Convert cmd_time_out into backend device attribute)
+  	.name			= "user",
+  	.owner			= THIS_MODULE,
+ -	.transport_flags	= TRANSPORT_FLAG_PASSTHROUGH,
+ +	.transport_type		= TRANSPORT_PLUGIN_PHBA_PDEV,
+  	.attach_hba		= tcmu_attach_hba,
+  	.detach_hba		= tcmu_detach_hba,
+  	.alloc_device		= tcmu_alloc_device,
+@@@ -1274,12 -1222,12 +1304,20 @@@
+  	.show_configfs_dev_params = tcmu_show_configfs_dev_params,
+  	.get_device_type	= sbc_get_device_type,
+  	.get_blocks		= tcmu_get_blocks,
+++<<<<<<< HEAD
+++=======
++ 	.tb_dev_attrib_attrs	= NULL,
+++>>>>>>> 7d7a74354390 (tcmu: Convert cmd_time_out into backend device attribute)
+  };
+  
+  static int __init tcmu_module_init(void)
+  {
+++<<<<<<< HEAD
+ +	struct target_backend_cits *tbc = &tcmu_template.tb_cits;
+ +	int ret;
+++=======
++ 	int ret, i, len = 0;
+++>>>>>>> 7d7a74354390 (tcmu: Convert cmd_time_out into backend device attribute)
+  
+  	BUILD_BUG_ON((sizeof(struct tcmu_cmd_entry) % TCMU_OP_ALIGN_SIZE) != 0);
+  
+@@@ -1301,12 -1249,26 +1339,33 @@@
+  		goto out_unreg_device;
+  	}
+  
+++<<<<<<< HEAD
+ +	target_core_setup_sub_cits(&tcmu_template);
+ +	tbc->tb_dev_attrib_cit.ct_attrs = tcmu_backend_dev_attrs;
+ +
+ +	ret = transport_subsystem_register(&tcmu_template);
+- 	if (ret)
+++=======
++ 	for (i = 0; passthrough_attrib_attrs[i] != NULL; i++) {
++ 		len += sizeof(struct configfs_attribute *);
++ 	}
++ 	len += sizeof(struct configfs_attribute *) * 2;
++ 
++ 	tcmu_attrs = kzalloc(len, GFP_KERNEL);
++ 	if (!tcmu_attrs) {
++ 		ret = -ENOMEM;
+  		goto out_unreg_genl;
++ 	}
++ 
++ 	for (i = 0; passthrough_attrib_attrs[i] != NULL; i++) {
++ 		tcmu_attrs[i] = passthrough_attrib_attrs[i];
++ 	}
++ 	tcmu_attrs[i] = &tcmu_attr_cmd_time_out;
++ 	tcmu_ops.tb_dev_attrib_attrs = tcmu_attrs;
++ 
++ 	ret = transport_backend_register(&tcmu_ops);
+++>>>>>>> 7d7a74354390 (tcmu: Convert cmd_time_out into backend device attribute)
++ 	if (ret)
++ 		goto out_attrs;
+  
+  	return 0;
+  
+@@@ -1322,7 -1286,8 +1383,12 @@@ out_free_cache
+  
+  static void __exit tcmu_module_exit(void)
+  {
+++<<<<<<< HEAD
+ +	transport_subsystem_release(&tcmu_template);
+++=======
++ 	target_backend_unregister(&tcmu_ops);
++ 	kfree(tcmu_attrs);
+++>>>>>>> 7d7a74354390 (tcmu: Convert cmd_time_out into backend device attribute)
+  	genl_unregister_family(&tcmu_genl_family);
+  	root_device_unregister(tcmu_root_device);
+  	kmem_cache_destroy(tcmu_cmd_cache);
+* Unmerged path drivers/target/target_core_user.c
