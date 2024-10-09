@@ -10063,12 +10063,12 @@ static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
 	    ((vmcs12->guest_cr4 & VMXON_CR4_ALWAYSON) != VMXON_CR4_ALWAYSON)) {
 		nested_vmx_entry_failure(vcpu, vmcs12,
 			EXIT_REASON_INVALID_STATE, ENTRY_FAIL_DEFAULT);
-		goto out;
+		return 1;
 	}
 	if (vmcs12->vmcs_link_pointer != -1ull) {
 		nested_vmx_entry_failure(vcpu, vmcs12,
 			EXIT_REASON_INVALID_STATE, ENTRY_FAIL_VMCS_LINK_PTR);
-		goto out;
+		return 1;
 	}
 
 	/*
@@ -10088,7 +10088,7 @@ static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
 		     ia32e != !!(vmcs12->guest_ia32_efer & EFER_LME))) {
 			nested_vmx_entry_failure(vcpu, vmcs12,
 				EXIT_REASON_INVALID_STATE, ENTRY_FAIL_DEFAULT);
-			goto out;
+			return 1;
 		}
 	}
 
@@ -10106,7 +10106,7 @@ static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
 		    ia32e != !!(vmcs12->host_ia32_efer & EFER_LME)) {
 			nested_vmx_entry_failure(vcpu, vmcs12,
 				EXIT_REASON_INVALID_STATE, ENTRY_FAIL_DEFAULT);
-			goto out;
+			return 1;
 		}
 	}
 
