@@ -1,0 +1,877 @@
+bpf: add support for persistent maps/progs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit b2197755b2633e164a439682fb05a9b5ea48f706
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b2197755.failed
+
+This work adds support for "persistent" eBPF maps/programs. The term
+"persistent" is to be understood that maps/programs have a facility
+that lets them survive process termination. This is desired by various
+eBPF subsystem users.
+
+Just to name one example: tc classifier/action. Whenever tc parses
+the ELF object, extracts and loads maps/progs into the kernel, these
+file descriptors will be out of reach after the tc instance exits.
+So a subsequent tc invocation won't be able to access/relocate on this
+resource, and therefore maps cannot easily be shared, f.e. between the
+ingress and egress networking data path.
+
+The current workaround is that Unix domain sockets (UDS) need to be
+instrumented in order to pass the created eBPF map/program file
+descriptors to a third party management daemon through UDS' socket
+passing facility. This makes it a bit complicated to deploy shared
+eBPF maps or programs (programs f.e. for tail calls) among various
+processes.
+
+We've been brainstorming on how we could tackle this issue and various
+approches have been tried out so far, which can be read up further in
+the below reference.
+
+The architecture we eventually ended up with is a minimal file system
+that can hold map/prog objects. The file system is a per mount namespace
+singleton, and the default mount point is /sys/fs/bpf/. Any subsequent
+mounts within a given namespace will point to the same instance. The
+file system allows for creating a user-defined directory structure.
+The objects for maps/progs are created/fetched through bpf(2) with
+two new commands (BPF_OBJ_PIN/BPF_OBJ_GET). I.e. a bpf file descriptor
+along with a pathname is being passed to bpf(2) that in turn creates
+(we call it eBPF object pinning) the file system nodes. Only the pathname
+is being passed to bpf(2) for getting a new BPF file descriptor to an
+existing node. The user can use that to access maps and progs later on,
+through bpf(2). Removal of file system nodes is being managed through
+normal VFS functions such as unlink(2), etc. The file system code is
+kept to a very minimum and can be further extended later on.
+
+The next step I'm working on is to add dump eBPF map/prog commands
+to bpf(2), so that a specification from a given file descriptor can
+be retrieved. This can be used by things like CRIU but also applications
+can inspect the meta data after calling BPF_OBJ_GET.
+
+Big thanks also to Alexei and Hannes who significantly contributed
+in the design discussion that eventually let us end up with this
+architecture here.
+
+Reference: https://lkml.org/lkml/2015/10/15/925
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b2197755b2633e164a439682fb05a9b5ea48f706)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	include/uapi/linux/bpf.h
+#	include/uapi/linux/magic.h
+#	kernel/bpf/Makefile
+#	kernel/bpf/syscall.c
+diff --cc include/linux/bpf.h
+index d4c1f9049ad3,de464e6683b6..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -97,20 -124,95 +97,101 @@@ struct bpf_prog_type_list 
+  	enum bpf_prog_type type;
+  };
+  
+ +void bpf_register_prog_type(struct bpf_prog_type_list *tl);
+ +
+ +struct bpf_prog;
+ +
+  struct bpf_prog_aux {
+  	atomic_t refcnt;
+ -	u32 used_map_cnt;
+ -	const struct bpf_verifier_ops *ops;
+ +	bool is_gpl_compatible;
+ +	enum bpf_prog_type prog_type;
+ +	struct bpf_verifier_ops *ops;
+ +	u32 id;
+  	struct bpf_map **used_maps;
+ +	u32 used_map_cnt;
+  	struct bpf_prog *prog;
+ -	struct user_struct *user;
+ -	union {
+ -		struct work_struct work;
+ -		struct rcu_head	rcu;
+ -	};
+ +	struct work_struct work;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct bpf_array {
++ 	struct bpf_map map;
++ 	u32 elem_size;
++ 	/* 'ownership' of prog_array is claimed by the first program that
++ 	 * is going to use this map or by the first program which FD is stored
++ 	 * in the map to make sure that all callers and callees have the same
++ 	 * prog_type and JITed flag
++ 	 */
++ 	enum bpf_prog_type owner_prog_type;
++ 	bool owner_jited;
++ 	union {
++ 		char value[0] __aligned(8);
++ 		void *ptrs[0] __aligned(8);
++ 	};
++ };
++ #define MAX_TAIL_CALL_CNT 32
++ 
++ u64 bpf_tail_call(u64 ctx, u64 r2, u64 index, u64 r4, u64 r5);
++ void bpf_fd_array_map_clear(struct bpf_map *map);
++ bool bpf_prog_array_compatible(struct bpf_array *array, const struct bpf_prog *fp);
++ const struct bpf_func_proto *bpf_get_trace_printk_proto(void);
++ 
++ #ifdef CONFIG_BPF_SYSCALL
++ void bpf_register_prog_type(struct bpf_prog_type_list *tl);
++ void bpf_register_map_type(struct bpf_map_type_list *tl);
++ 
++ struct bpf_prog *bpf_prog_get(u32 ufd);
++ void bpf_prog_put(struct bpf_prog *prog);
++ void bpf_prog_put_rcu(struct bpf_prog *prog);
++ 
++ struct bpf_map *bpf_map_get(u32 ufd);
++ struct bpf_map *__bpf_map_get(struct fd f);
++ void bpf_map_put(struct bpf_map *map);
++ 
++ extern int sysctl_unprivileged_bpf_disabled;
++ 
++ int bpf_map_new_fd(struct bpf_map *map);
++ int bpf_prog_new_fd(struct bpf_prog *prog);
++ 
++ int bpf_obj_pin_user(u32 ufd, const char __user *pathname);
++ int bpf_obj_get_user(const char __user *pathname);
++ 
++ /* verify correctness of eBPF program */
++ int bpf_check(struct bpf_prog **fp, union bpf_attr *attr);
++ #else
++ static inline void bpf_register_prog_type(struct bpf_prog_type_list *tl)
++ {
++ }
++ 
++ static inline struct bpf_prog *bpf_prog_get(u32 ufd)
++ {
++ 	return ERR_PTR(-EOPNOTSUPP);
++ }
++ 
++ static inline void bpf_prog_put(struct bpf_prog *prog)
++ {
++ }
++ #endif /* CONFIG_BPF_SYSCALL */
++ 
++ /* verifier prototypes for helper functions called from eBPF programs */
++ extern const struct bpf_func_proto bpf_map_lookup_elem_proto;
++ extern const struct bpf_func_proto bpf_map_update_elem_proto;
++ extern const struct bpf_func_proto bpf_map_delete_elem_proto;
++ 
++ extern const struct bpf_func_proto bpf_get_prandom_u32_proto;
++ extern const struct bpf_func_proto bpf_get_smp_processor_id_proto;
++ extern const struct bpf_func_proto bpf_tail_call_proto;
++ extern const struct bpf_func_proto bpf_ktime_get_ns_proto;
++ extern const struct bpf_func_proto bpf_get_current_pid_tgid_proto;
++ extern const struct bpf_func_proto bpf_get_current_uid_gid_proto;
++ extern const struct bpf_func_proto bpf_get_current_comm_proto;
++ extern const struct bpf_func_proto bpf_skb_vlan_push_proto;
++ extern const struct bpf_func_proto bpf_skb_vlan_pop_proto;
++ 
++ /* Shared helpers among cBPF and eBPF. */
++ void bpf_user_rnd_init_once(void);
++ u64 bpf_user_rnd_u32(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5);
++ 
+++>>>>>>> b2197755b263 (bpf: add support for persistent maps/progs)
+  #endif /* _LINUX_BPF_H */
+diff --cc include/uapi/linux/bpf.h
+index e369860b690e,9ea2d22fa2cb..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -62,50 -63,16 +62,43 @@@ struct bpf_insn 
+  	__s32	imm;		/* signed immediate constant */
+  };
+  
+- /* BPF syscall commands */
++ /* BPF syscall commands, see bpf(2) man-page for details. */
+  enum bpf_cmd {
+- 	/* create a map with given type and attributes
+- 	 * fd = bpf(BPF_MAP_CREATE, union bpf_attr *, u32 size)
+- 	 * returns fd or negative error
+- 	 * map is deleted when fd is closed
+- 	 */
+  	BPF_MAP_CREATE,
+++<<<<<<< HEAD
+ +
+ +	/* verify and load eBPF program
+ +	 * prog_fd = bpf(BPF_PROG_LOAD, union bpf_attr *attr, u32 size)
+ +	 * Using attr->prog_type, attr->insns, attr->license
+ +	 * returns fd or negative error
+ +	 */
+ +	BPF_PROG_LOAD,
+ +
+ +	/* lookup key in a given map
+ +	 * err = bpf(BPF_MAP_LOOKUP_ELEM, union bpf_attr *attr, u32 size)
+ +	 * Using attr->map_fd, attr->key, attr->value
+ +	 * returns zero and stores found elem into value
+ +	 * or negative error
+ +	 */
+  	BPF_MAP_LOOKUP_ELEM,
+ +
+ +	/* create or update key/value pair in a given map
+ +	 * err = bpf(BPF_MAP_UPDATE_ELEM, union bpf_attr *attr, u32 size)
+ +	 * Using attr->map_fd, attr->key, attr->value
+ +	 * returns zero or negative error
+ +	 */
+++=======
+++	BPF_MAP_LOOKUP_ELEM,
+++>>>>>>> b2197755b263 (bpf: add support for persistent maps/progs)
+  	BPF_MAP_UPDATE_ELEM,
+- 
+- 	/* find and delete elem by key in a given map
+- 	 * err = bpf(BPF_MAP_DELETE_ELEM, union bpf_attr *attr, u32 size)
+- 	 * Using attr->map_fd, attr->key
+- 	 * returns zero or negative error
+- 	 */
+  	BPF_MAP_DELETE_ELEM,
+- 
+- 	/* lookup key in a given map and return next key
+- 	 * err = bpf(BPF_MAP_GET_NEXT_KEY, union bpf_attr *attr, u32 size)
+- 	 * Using attr->map_fd, attr->key, attr->next_key
+- 	 * returns zero and stores next key or negative error
+- 	 */
+  	BPF_MAP_GET_NEXT_KEY,
+++<<<<<<< HEAD
+++=======
++ 	BPF_PROG_LOAD,
++ 	BPF_OBJ_PIN,
++ 	BPF_OBJ_GET,
+++>>>>>>> b2197755b263 (bpf: add support for persistent maps/progs)
+  };
+  
+  enum bpf_map_type {
+@@@ -132,37 -113,189 +125,42 @@@ union bpf_attr 
+  			__aligned_u64 value;
+  			__aligned_u64 next_key;
+  		};
+ -		__u64		flags;
+ -	};
+ -
+ -	struct { /* anonymous struct used by BPF_PROG_LOAD command */
+ -		__u32		prog_type;	/* one of enum bpf_prog_type */
+ -		__u32		insn_cnt;
+ -		__aligned_u64	insns;
+ -		__aligned_u64	license;
+ -		__u32		log_level;	/* verbosity level of verifier */
+ -		__u32		log_size;	/* size of user buffer */
+ -		__aligned_u64	log_buf;	/* user supplied buffer */
+ -		__u32		kern_version;	/* checked when prog_type=kprobe */
+  	};
++ 
++ 	struct { /* anonymous struct used by BPF_OBJ_* commands */
++ 		__aligned_u64	pathname;
++ 		__u32		bpf_fd;
++ 	};
+  } __attribute__((aligned(8)));
+  
+ -/* integer value in 'imm' field of BPF_CALL instruction selects which helper
+ - * function eBPF program intends to call
+ +/* User return codes for XDP prog type.
+ + * A valid XDP program must return one of these defined values. All other
+ + * return codes are reserved for future use. Unknown return codes will result
+ + * in packet drop.
+   */
+ -enum bpf_func_id {
+ -	BPF_FUNC_unspec,
+ -	BPF_FUNC_map_lookup_elem, /* void *map_lookup_elem(&map, &key) */
+ -	BPF_FUNC_map_update_elem, /* int map_update_elem(&map, &key, &value, flags) */
+ -	BPF_FUNC_map_delete_elem, /* int map_delete_elem(&map, &key) */
+ -	BPF_FUNC_probe_read,      /* int bpf_probe_read(void *dst, int size, void *src) */
+ -	BPF_FUNC_ktime_get_ns,    /* u64 bpf_ktime_get_ns(void) */
+ -	BPF_FUNC_trace_printk,    /* int bpf_trace_printk(const char *fmt, int fmt_size, ...) */
+ -	BPF_FUNC_get_prandom_u32, /* u32 prandom_u32(void) */
+ -	BPF_FUNC_get_smp_processor_id, /* u32 raw_smp_processor_id(void) */
+ -
+ -	/**
+ -	 * skb_store_bytes(skb, offset, from, len, flags) - store bytes into packet
+ -	 * @skb: pointer to skb
+ -	 * @offset: offset within packet from skb->mac_header
+ -	 * @from: pointer where to copy bytes from
+ -	 * @len: number of bytes to store into packet
+ -	 * @flags: bit 0 - if true, recompute skb->csum
+ -	 *         other bits - reserved
+ -	 * Return: 0 on success
+ -	 */
+ -	BPF_FUNC_skb_store_bytes,
+ -
+ -	/**
+ -	 * l3_csum_replace(skb, offset, from, to, flags) - recompute IP checksum
+ -	 * @skb: pointer to skb
+ -	 * @offset: offset within packet where IP checksum is located
+ -	 * @from: old value of header field
+ -	 * @to: new value of header field
+ -	 * @flags: bits 0-3 - size of header field
+ -	 *         other bits - reserved
+ -	 * Return: 0 on success
+ -	 */
+ -	BPF_FUNC_l3_csum_replace,
+ -
+ -	/**
+ -	 * l4_csum_replace(skb, offset, from, to, flags) - recompute TCP/UDP checksum
+ -	 * @skb: pointer to skb
+ -	 * @offset: offset within packet where TCP/UDP checksum is located
+ -	 * @from: old value of header field
+ -	 * @to: new value of header field
+ -	 * @flags: bits 0-3 - size of header field
+ -	 *         bit 4 - is pseudo header
+ -	 *         other bits - reserved
+ -	 * Return: 0 on success
+ -	 */
+ -	BPF_FUNC_l4_csum_replace,
+ -
+ -	/**
+ -	 * bpf_tail_call(ctx, prog_array_map, index) - jump into another BPF program
+ -	 * @ctx: context pointer passed to next program
+ -	 * @prog_array_map: pointer to map which type is BPF_MAP_TYPE_PROG_ARRAY
+ -	 * @index: index inside array that selects specific program to run
+ -	 * Return: 0 on success
+ -	 */
+ -	BPF_FUNC_tail_call,
+ -
+ -	/**
+ -	 * bpf_clone_redirect(skb, ifindex, flags) - redirect to another netdev
+ -	 * @skb: pointer to skb
+ -	 * @ifindex: ifindex of the net device
+ -	 * @flags: bit 0 - if set, redirect to ingress instead of egress
+ -	 *         other bits - reserved
+ -	 * Return: 0 on success
+ -	 */
+ -	BPF_FUNC_clone_redirect,
+ -
+ -	/**
+ -	 * u64 bpf_get_current_pid_tgid(void)
+ -	 * Return: current->tgid << 32 | current->pid
+ -	 */
+ -	BPF_FUNC_get_current_pid_tgid,
+ -
+ -	/**
+ -	 * u64 bpf_get_current_uid_gid(void)
+ -	 * Return: current_gid << 32 | current_uid
+ -	 */
+ -	BPF_FUNC_get_current_uid_gid,
+ -
+ -	/**
+ -	 * bpf_get_current_comm(char *buf, int size_of_buf)
+ -	 * stores current->comm into buf
+ -	 * Return: 0 on success
+ -	 */
+ -	BPF_FUNC_get_current_comm,
+ -
+ -	/**
+ -	 * bpf_get_cgroup_classid(skb) - retrieve a proc's classid
+ -	 * @skb: pointer to skb
+ -	 * Return: classid if != 0
+ -	 */
+ -	BPF_FUNC_get_cgroup_classid,
+ -	BPF_FUNC_skb_vlan_push, /* bpf_skb_vlan_push(skb, vlan_proto, vlan_tci) */
+ -	BPF_FUNC_skb_vlan_pop,  /* bpf_skb_vlan_pop(skb) */
+ -
+ -	/**
+ -	 * bpf_skb_[gs]et_tunnel_key(skb, key, size, flags)
+ -	 * retrieve or populate tunnel metadata
+ -	 * @skb: pointer to skb
+ -	 * @key: pointer to 'struct bpf_tunnel_key'
+ -	 * @size: size of 'struct bpf_tunnel_key'
+ -	 * @flags: room for future extensions
+ -	 * Retrun: 0 on success
+ -	 */
+ -	BPF_FUNC_skb_get_tunnel_key,
+ -	BPF_FUNC_skb_set_tunnel_key,
+ -	BPF_FUNC_perf_event_read,	/* u64 bpf_perf_event_read(&map, index) */
+ -	/**
+ -	 * bpf_redirect(ifindex, flags) - redirect to another netdev
+ -	 * @ifindex: ifindex of the net device
+ -	 * @flags: bit 0 - if set, redirect to ingress instead of egress
+ -	 *         other bits - reserved
+ -	 * Return: TC_ACT_REDIRECT
+ -	 */
+ -	BPF_FUNC_redirect,
+ -
+ -	/**
+ -	 * bpf_get_route_realm(skb) - retrieve a dst's tclassid
+ -	 * @skb: pointer to skb
+ -	 * Return: realm if != 0
+ -	 */
+ -	BPF_FUNC_get_route_realm,
+ -
+ -	/**
+ -	 * bpf_perf_event_output(ctx, map, index, data, size) - output perf raw sample
+ -	 * @ctx: struct pt_regs*
+ -	 * @map: pointer to perf_event_array map
+ -	 * @index: index of event in the map
+ -	 * @data: data on stack to be output as raw data
+ -	 * @size: size of data
+ -	 * Return: 0 on success
+ -	 */
+ -	BPF_FUNC_perf_event_output,
+ -	__BPF_FUNC_MAX_ID,
+ +enum xdp_action {
+ +	XDP_ABORTED = 0,
+ +	XDP_DROP,
+ +	XDP_PASS,
+ +	XDP_TX,
+  };
+  
+ -/* user accessible mirror of in-kernel sk_buff.
+ - * new fields can only be added to the end of this structure
+ +/* user accessible metadata for XDP packet hook
+ + * new fields must be added to the end of this structure
+   */
+ -struct __sk_buff {
+ -	__u32 len;
+ -	__u32 pkt_type;
+ -	__u32 mark;
+ -	__u32 queue_mapping;
+ -	__u32 protocol;
+ -	__u32 vlan_present;
+ -	__u32 vlan_tci;
+ -	__u32 vlan_proto;
+ -	__u32 priority;
+ -	__u32 ingress_ifindex;
+ -	__u32 ifindex;
+ -	__u32 tc_index;
+ -	__u32 cb[5];
+ -	__u32 hash;
+ -	__u32 tc_classid;
+ +struct xdp_md {
+ +	__u32 data;
+ +	__u32 data_end;
+  };
+  
+ -struct bpf_tunnel_key {
+ -	__u32 tunnel_id;
+ -	__u32 remote_ipv4;
+ +#define XDP_PACKET_HEADROOM 256
+ +
+ +/* integer value in 'imm' field of BPF_CALL instruction selects which helper
+ + * function eBPF program intends to call
+ + */
+ +enum bpf_func_id {
+ +	BPF_FUNC_unspec,
+ +	__BPF_FUNC_MAX_ID,
+  };
+  
+  #endif /* _UAPI__LINUX_BPF_H__ */
+diff --cc include/uapi/linux/magic.h
+index 599c96d6d03d,accb036bbc9c..000000000000
+--- a/include/uapi/linux/magic.h
++++ b/include/uapi/linux/magic.h
+@@@ -75,5 -74,7 +75,10 @@@
+  #define MTD_INODE_FS_MAGIC      0x11307854
+  #define ANON_INODE_FS_MAGIC	0x09041934
+  #define BTRFS_TEST_MAGIC	0x73727279
+++<<<<<<< HEAD
+++=======
++ #define NSFS_MAGIC		0x6e736673
++ #define BPF_FS_MAGIC		0xcafe4a11
+++>>>>>>> b2197755b263 (bpf: add support for persistent maps/progs)
+  
+  #endif /* __LINUX_MAGIC_H__ */
+* Unmerged path kernel/bpf/Makefile
+* Unmerged path kernel/bpf/syscall.c
+* Unmerged path include/linux/bpf.h
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path include/uapi/linux/magic.h
+* Unmerged path kernel/bpf/Makefile
+diff --git a/kernel/bpf/inode.c b/kernel/bpf/inode.c
+new file mode 100644
+index 000000000000..be6d726e31c9
+--- /dev/null
++++ b/kernel/bpf/inode.c
+@@ -0,0 +1,387 @@
++/*
++ * Minimal file system backend for holding eBPF maps and programs,
++ * used by bpf(2) object pinning.
++ *
++ * Authors:
++ *
++ *	Daniel Borkmann <daniel@iogearbox.net>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * version 2 as published by the Free Software Foundation.
++ */
++
++#include <linux/module.h>
++#include <linux/magic.h>
++#include <linux/major.h>
++#include <linux/mount.h>
++#include <linux/namei.h>
++#include <linux/fs.h>
++#include <linux/kdev_t.h>
++#include <linux/filter.h>
++#include <linux/bpf.h>
++
++enum bpf_type {
++	BPF_TYPE_UNSPEC	= 0,
++	BPF_TYPE_PROG,
++	BPF_TYPE_MAP,
++};
++
++static void *bpf_any_get(void *raw, enum bpf_type type)
++{
++	switch (type) {
++	case BPF_TYPE_PROG:
++		atomic_inc(&((struct bpf_prog *)raw)->aux->refcnt);
++		break;
++	case BPF_TYPE_MAP:
++		atomic_inc(&((struct bpf_map *)raw)->refcnt);
++		break;
++	default:
++		WARN_ON_ONCE(1);
++		break;
++	}
++
++	return raw;
++}
++
++static void bpf_any_put(void *raw, enum bpf_type type)
++{
++	switch (type) {
++	case BPF_TYPE_PROG:
++		bpf_prog_put(raw);
++		break;
++	case BPF_TYPE_MAP:
++		bpf_map_put(raw);
++		break;
++	default:
++		WARN_ON_ONCE(1);
++		break;
++	}
++}
++
++static void *bpf_fd_probe_obj(u32 ufd, enum bpf_type *type)
++{
++	void *raw;
++
++	*type = BPF_TYPE_MAP;
++	raw = bpf_map_get(ufd);
++	if (IS_ERR(raw)) {
++		*type = BPF_TYPE_PROG;
++		raw = bpf_prog_get(ufd);
++	}
++
++	return raw;
++}
++
++static const struct inode_operations bpf_dir_iops;
++
++static const struct inode_operations bpf_prog_iops = { };
++static const struct inode_operations bpf_map_iops  = { };
++
++static struct inode *bpf_get_inode(struct super_block *sb,
++				   const struct inode *dir,
++				   umode_t mode)
++{
++	struct inode *inode;
++
++	switch (mode & S_IFMT) {
++	case S_IFDIR:
++	case S_IFREG:
++		break;
++	default:
++		return ERR_PTR(-EINVAL);
++	}
++
++	inode = new_inode(sb);
++	if (!inode)
++		return ERR_PTR(-ENOSPC);
++
++	inode->i_ino = get_next_ino();
++	inode->i_atime = CURRENT_TIME;
++	inode->i_mtime = inode->i_atime;
++	inode->i_ctime = inode->i_atime;
++
++	inode_init_owner(inode, dir, mode);
++
++	return inode;
++}
++
++static int bpf_inode_type(const struct inode *inode, enum bpf_type *type)
++{
++	*type = BPF_TYPE_UNSPEC;
++	if (inode->i_op == &bpf_prog_iops)
++		*type = BPF_TYPE_PROG;
++	else if (inode->i_op == &bpf_map_iops)
++		*type = BPF_TYPE_MAP;
++	else
++		return -EACCES;
++
++	return 0;
++}
++
++static bool bpf_dname_reserved(const struct dentry *dentry)
++{
++	return strchr(dentry->d_name.name, '.');
++}
++
++static int bpf_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
++{
++	struct inode *inode;
++
++	if (bpf_dname_reserved(dentry))
++		return -EPERM;
++
++	inode = bpf_get_inode(dir->i_sb, dir, mode | S_IFDIR);
++	if (IS_ERR(inode))
++		return PTR_ERR(inode);
++
++	inode->i_op = &bpf_dir_iops;
++	inode->i_fop = &simple_dir_operations;
++
++	inc_nlink(inode);
++	inc_nlink(dir);
++
++	d_instantiate(dentry, inode);
++	dget(dentry);
++
++	return 0;
++}
++
++static int bpf_mkobj_ops(struct inode *dir, struct dentry *dentry,
++			 umode_t mode, const struct inode_operations *iops)
++{
++	struct inode *inode;
++
++	if (bpf_dname_reserved(dentry))
++		return -EPERM;
++
++	inode = bpf_get_inode(dir->i_sb, dir, mode | S_IFREG);
++	if (IS_ERR(inode))
++		return PTR_ERR(inode);
++
++	inode->i_op = iops;
++	inode->i_private = dentry->d_fsdata;
++
++	d_instantiate(dentry, inode);
++	dget(dentry);
++
++	return 0;
++}
++
++static int bpf_mkobj(struct inode *dir, struct dentry *dentry, umode_t mode,
++		     dev_t devt)
++{
++	enum bpf_type type = MINOR(devt);
++
++	if (MAJOR(devt) != UNNAMED_MAJOR || !S_ISREG(mode) ||
++	    dentry->d_fsdata == NULL)
++		return -EPERM;
++
++	switch (type) {
++	case BPF_TYPE_PROG:
++		return bpf_mkobj_ops(dir, dentry, mode, &bpf_prog_iops);
++	case BPF_TYPE_MAP:
++		return bpf_mkobj_ops(dir, dentry, mode, &bpf_map_iops);
++	default:
++		return -EPERM;
++	}
++}
++
++static const struct inode_operations bpf_dir_iops = {
++	.lookup		= simple_lookup,
++	.mknod		= bpf_mkobj,
++	.mkdir		= bpf_mkdir,
++	.rmdir		= simple_rmdir,
++	.unlink		= simple_unlink,
++};
++
++static int bpf_obj_do_pin(const struct filename *pathname, void *raw,
++			  enum bpf_type type)
++{
++	struct dentry *dentry;
++	struct inode *dir;
++	struct path path;
++	umode_t mode;
++	dev_t devt;
++	int ret;
++
++	dentry = kern_path_create(AT_FDCWD, pathname->name, &path, 0);
++	if (IS_ERR(dentry))
++		return PTR_ERR(dentry);
++
++	mode = S_IFREG | ((S_IRUSR | S_IWUSR) & ~current_umask());
++	devt = MKDEV(UNNAMED_MAJOR, type);
++
++	ret = security_path_mknod(&path, dentry, mode, devt);
++	if (ret)
++		goto out;
++
++	dir = d_inode(path.dentry);
++	if (dir->i_op != &bpf_dir_iops) {
++		ret = -EPERM;
++		goto out;
++	}
++
++	dentry->d_fsdata = raw;
++	ret = vfs_mknod(dir, dentry, mode, devt);
++	dentry->d_fsdata = NULL;
++out:
++	done_path_create(&path, dentry);
++	return ret;
++}
++
++int bpf_obj_pin_user(u32 ufd, const char __user *pathname)
++{
++	struct filename *pname;
++	enum bpf_type type;
++	void *raw;
++	int ret;
++
++	pname = getname(pathname);
++	if (IS_ERR(pname))
++		return PTR_ERR(pname);
++
++	raw = bpf_fd_probe_obj(ufd, &type);
++	if (IS_ERR(raw)) {
++		ret = PTR_ERR(raw);
++		goto out;
++	}
++
++	ret = bpf_obj_do_pin(pname, raw, type);
++	if (ret != 0)
++		bpf_any_put(raw, type);
++out:
++	putname(pname);
++	return ret;
++}
++
++static void *bpf_obj_do_get(const struct filename *pathname,
++			    enum bpf_type *type)
++{
++	struct inode *inode;
++	struct path path;
++	void *raw;
++	int ret;
++
++	ret = kern_path(pathname->name, LOOKUP_FOLLOW, &path);
++	if (ret)
++		return ERR_PTR(ret);
++
++	inode = d_backing_inode(path.dentry);
++	ret = inode_permission(inode, MAY_WRITE);
++	if (ret)
++		goto out;
++
++	ret = bpf_inode_type(inode, type);
++	if (ret)
++		goto out;
++
++	raw = bpf_any_get(inode->i_private, *type);
++	touch_atime(&path);
++
++	path_put(&path);
++	return raw;
++out:
++	path_put(&path);
++	return ERR_PTR(ret);
++}
++
++int bpf_obj_get_user(const char __user *pathname)
++{
++	enum bpf_type type = BPF_TYPE_UNSPEC;
++	struct filename *pname;
++	int ret = -ENOENT;
++	void *raw;
++
++	pname = getname(pathname);
++	if (IS_ERR(pname))
++		return PTR_ERR(pname);
++
++	raw = bpf_obj_do_get(pname, &type);
++	if (IS_ERR(raw)) {
++		ret = PTR_ERR(raw);
++		goto out;
++	}
++
++	if (type == BPF_TYPE_PROG)
++		ret = bpf_prog_new_fd(raw);
++	else if (type == BPF_TYPE_MAP)
++		ret = bpf_map_new_fd(raw);
++	else
++		goto out;
++
++	if (ret < 0)
++		bpf_any_put(raw, type);
++out:
++	putname(pname);
++	return ret;
++}
++
++static void bpf_evict_inode(struct inode *inode)
++{
++	enum bpf_type type;
++
++	truncate_inode_pages_final(&inode->i_data);
++	clear_inode(inode);
++
++	if (!bpf_inode_type(inode, &type))
++		bpf_any_put(inode->i_private, type);
++}
++
++static const struct super_operations bpf_super_ops = {
++	.statfs		= simple_statfs,
++	.drop_inode	= generic_delete_inode,
++	.evict_inode	= bpf_evict_inode,
++};
++
++static int bpf_fill_super(struct super_block *sb, void *data, int silent)
++{
++	static struct tree_descr bpf_rfiles[] = { { "" } };
++	struct inode *inode;
++	int ret;
++
++	ret = simple_fill_super(sb, BPF_FS_MAGIC, bpf_rfiles);
++	if (ret)
++		return ret;
++
++	sb->s_op = &bpf_super_ops;
++
++	inode = sb->s_root->d_inode;
++	inode->i_op = &bpf_dir_iops;
++	inode->i_mode &= ~S_IALLUGO;
++	inode->i_mode |= S_ISVTX | S_IRWXUGO;
++
++	return 0;
++}
++
++static struct dentry *bpf_mount(struct file_system_type *type, int flags,
++				const char *dev_name, void *data)
++{
++	return mount_ns(type, flags, current->nsproxy->mnt_ns, bpf_fill_super);
++}
++
++static struct file_system_type bpf_fs_type = {
++	.owner		= THIS_MODULE,
++	.name		= "bpf",
++	.mount		= bpf_mount,
++	.kill_sb	= kill_litter_super,
++	.fs_flags	= FS_USERNS_MOUNT,
++};
++
++MODULE_ALIAS_FS("bpf");
++
++static int __init bpf_init(void)
++{
++	int ret;
++
++	ret = sysfs_create_mount_point(fs_kobj, "bpf");
++	if (ret)
++		return ret;
++
++	ret = register_filesystem(&bpf_fs_type);
++	if (ret)
++		sysfs_remove_mount_point(fs_kobj, "bpf");
++
++	return ret;
++}
++fs_initcall(bpf_init);
+* Unmerged path kernel/bpf/syscall.c
