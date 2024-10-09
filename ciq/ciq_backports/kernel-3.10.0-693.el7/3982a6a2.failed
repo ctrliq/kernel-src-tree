@@ -1,0 +1,136 @@
+pnfs: keep track of the return sequence number in pnfs_layout_hdr
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jeff Layton <jlayton@poochiereds.net>
+commit 3982a6a2d0e64441c938f4e7f93985aff37d8fb3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/3982a6a2.failed
+
+When we want to selectively do a LAYOUTRETURN, we need to specify a
+stateid that represents most recent layout acquisition that is to be
+returned.
+
+When we mark a layout stateid to be returned, we update the return
+sequence number in the layout header with that value, if it's newer
+than the existing one. Then, when we go to do a LAYOUTRETURN on
+layout header put, we overwrite the seqid in the stateid with the
+saved one, and then zero it out.
+
+	Signed-off-by: Jeff Layton <jeff.layton@primarydata.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 3982a6a2d0e64441c938f4e7f93985aff37d8fb3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/pnfs.c
+diff --cc fs/nfs/pnfs.c
+index fd03bf04b6ba,3ad6bd377d35..000000000000
+--- a/fs/nfs/pnfs.c
++++ b/fs/nfs/pnfs.c
+@@@ -897,8 -899,9 +897,9 @@@ pnfs_prepare_layoutreturn(struct pnfs_l
+  	if (test_and_set_bit(NFS_LAYOUT_RETURN, &lo->plh_flags))
+  		return false;
+  	lo->plh_return_iomode = 0;
++ 	lo->plh_return_seq = 0;
+  	pnfs_get_layout_hdr(lo);
+ -	clear_bit(NFS_LAYOUT_RETURN_REQUESTED, &lo->plh_flags);
+ +	clear_bit(NFS_LAYOUT_RETURN_BEFORE_CLOSE, &lo->plh_flags);
+  	return true;
+  }
+  
+@@@ -1744,12 -1748,37 +1746,40 @@@ out_forget_reply
+  	goto out;
+  }
+  
+++<<<<<<< HEAD
+ +void
+++=======
++ static void
++ pnfs_set_plh_return_info(struct pnfs_layout_hdr *lo, enum pnfs_iomode iomode,
++ 			 u32 seq)
++ {
++ 	if (lo->plh_return_iomode == iomode)
++ 		return;
++ 	if (lo->plh_return_iomode != 0)
++ 		iomode = IOMODE_ANY;
++ 	lo->plh_return_iomode = iomode;
++ 	set_bit(NFS_LAYOUT_RETURN_REQUESTED, &lo->plh_flags);
++ 	if (!lo->plh_return_seq || pnfs_seqid_is_newer(seq, lo->plh_return_seq))
++ 		lo->plh_return_seq = seq;
++ }
++ 
++ /**
++  * pnfs_mark_matching_lsegs_return - Free or return matching layout segments
++  * @lo: pointer to layout header
++  * @tmp_list: list header to be used with pnfs_free_lseg_list()
++  * @return_range: describe layout segment ranges to be returned
++  *
++  * This function is mainly intended for use by layoutrecall. It attempts
++  * to free the layout segment immediately, or else to mark it for return
++  * as soon as its reference count drops to zero.
++  */
++ int
+++>>>>>>> 3982a6a2d0e6 (pnfs: keep track of the return sequence number in pnfs_layout_hdr)
+  pnfs_mark_matching_lsegs_return(struct pnfs_layout_hdr *lo,
+  				struct list_head *tmp_list,
+ -				const struct pnfs_layout_range *return_range)
+ +				struct pnfs_layout_range *return_range)
+  {
+  	struct pnfs_layout_segment *lseg, *next;
+ -	int remaining = 0;
+  
+  	dprintk("%s:Begin lo %p\n", __func__, lo);
+  
+@@@ -1765,11 -1794,13 +1795,15 @@@
+  				lseg, lseg->pls_range.iomode,
+  				lseg->pls_range.offset,
+  				lseg->pls_range.length);
+ -			if (mark_lseg_invalid(lseg, tmp_list))
+ -				continue;
+ -			remaining++;
+  			set_bit(NFS_LSEG_LAYOUTRETURN, &lseg->pls_flags);
+++<<<<<<< HEAD
+ +			mark_lseg_invalid(lseg, tmp_list);
+ +			set_bit(NFS_LAYOUT_RETURN_BEFORE_CLOSE,
+ +					&lo->plh_flags);
+++=======
++ 			pnfs_set_plh_return_info(lo, return_range->iomode, lseg->pls_seq);
+++>>>>>>> 3982a6a2d0e6 (pnfs: keep track of the return sequence number in pnfs_layout_hdr)
+  		}
+ -	return remaining;
+  }
+  
+  void pnfs_error_mark_layout_for_return(struct inode *inode,
+@@@ -1782,12 -1813,10 +1816,16 @@@
+  		.length = NFS4_MAX_UINT64,
+  	};
+  	LIST_HEAD(free_me);
+ -	bool return_now = false;
+  
+  	spin_lock(&inode->i_lock);
+++<<<<<<< HEAD
+ +	if (lo->plh_return_iomode == 0)
+ +		lo->plh_return_iomode = range.iomode;
+ +	else if (lo->plh_return_iomode != range.iomode)
+ +		lo->plh_return_iomode = IOMODE_ANY;
+++=======
++ 	pnfs_set_plh_return_info(lo, range.iomode, lseg->pls_seq);
+++>>>>>>> 3982a6a2d0e6 (pnfs: keep track of the return sequence number in pnfs_layout_hdr)
+  	/*
+  	 * mark all matching lsegs so that we are sure to have no live
+  	 * segments at hand when sending layoutreturn. See pnfs_put_lseg()
+* Unmerged path fs/nfs/pnfs.c
+diff --git a/fs/nfs/pnfs.h b/fs/nfs/pnfs.h
+index dbdd40fae50e..03da88c7cfb3 100644
+--- a/fs/nfs/pnfs.h
++++ b/fs/nfs/pnfs.h
+@@ -195,6 +195,7 @@ struct pnfs_layout_hdr {
+ 	unsigned long		plh_flags;
+ 	nfs4_stateid		plh_stateid;
+ 	u32			plh_barrier; /* ignore lower seqids */
++	u32			plh_return_seq;
+ 	enum pnfs_iomode	plh_return_iomode;
+ 	loff_t			plh_lwb; /* last write byte for layoutcommit */
+ 	struct rpc_cred		*plh_lc_cred; /* layoutcommit cred */
