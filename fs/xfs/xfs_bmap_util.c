@@ -848,6 +848,7 @@ xfs_alloc_file_space(
 	xfs_filblks_t		allocatesize_fsb;
 	xfs_extlen_t		extsz, temp;
 	xfs_fileoff_t		startoffset_fsb;
+	xfs_fileoff_t		endoffset_fsb;
 	xfs_fsblock_t		firstfsb;
 	int			nimaps;
 	int			quota_flag;
@@ -877,7 +878,8 @@ xfs_alloc_file_space(
 	imapp = &imaps[0];
 	nimaps = 1;
 	startoffset_fsb	= XFS_B_TO_FSBT(mp, offset);
-	allocatesize_fsb = XFS_B_TO_FSB(mp, count);
+	endoffset_fsb = XFS_B_TO_FSB(mp, offset + count);
+	allocatesize_fsb = endoffset_fsb - startoffset_fsb;
 
 	/*
 	 * Allocate file space until done or until there is an error
@@ -1075,7 +1077,8 @@ xfs_adjust_extent_unmap_boundaries(
 	return 0;
 }
 
-static int
+/* Caller must first wait for the completion of any pending DIOs if required. */
+int
 xfs_flush_unmap_range(
 	struct xfs_inode	*ip,
 	xfs_off_t		offset,
@@ -1085,9 +1088,6 @@ xfs_flush_unmap_range(
 	struct inode		*inode = VFS_I(ip);
 	xfs_off_t		rounding, start, end;
 	int			error;
-
-	/* wait for the completion of any pending DIOs */
-	inode_dio_wait(inode);
 
 	rounding = max_t(xfs_off_t, 1 << mp->m_sb.sb_blocklog, PAGE_SIZE);
 	start = round_down(offset, rounding);
@@ -1119,10 +1119,6 @@ xfs_free_file_space(
 
 	if (len <= 0)	/* if nothing being freed */
 		return 0;
-
-	error = xfs_flush_unmap_range(ip, offset, len);
-	if (error)
-		return error;
 
 	startoffset_fsb = XFS_B_TO_FSB(mp, offset);
 	endoffset_fsb = XFS_B_TO_FSBT(mp, offset + len);

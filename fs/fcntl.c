@@ -531,11 +531,28 @@ void send_sigio(struct fown_struct *fown, int fd, int band)
 	if (!pid)
 		goto out_unlock_fown;
 	
-	qread_lock(&tasklist_lock);
-	do_each_pid_task(pid, type, p) {
-		send_sigio_to_task(p, fown, fd, band, group);
-	} while_each_pid_task(pid, type, p);
-	qread_unlock(&tasklist_lock);
+	if (type == PIDTYPE_PID) {
+		rcu_read_lock();
+		p = pid_task(pid, PIDTYPE_PID);
+		if (p)
+			send_sigio_to_task(p, fown, fd, band, group);
+		rcu_read_unlock();
+	} else {
+		/*
+		 * BZ1838799:
+		 * If irq is disabled, we go into unfair locking mode
+		 * to avoid deadlock in case we are holding uart_port.lock.
+		 */
+		if (irqs_disabled())
+			qread_lock_unfair(&tasklist_lock);
+		else
+			qread_lock(&tasklist_lock);
+
+		do_each_pid_task(pid, type, p) {
+			send_sigio_to_task(p, fown, fd, band, group);
+		} while_each_pid_task(pid, type, p);
+		qread_unlock(&tasklist_lock);
+	}
  out_unlock_fown:
 	read_unlock(&fown->lock);
 }
@@ -569,11 +586,19 @@ int send_sigurg(struct fown_struct *fown)
 
 	ret = 1;
 	
-	qread_lock(&tasklist_lock);
-	do_each_pid_task(pid, type, p) {
-		send_sigurg_to_task(p, fown, group);
-	} while_each_pid_task(pid, type, p);
-	qread_unlock(&tasklist_lock);
+	if (type == PIDTYPE_PID) {
+		rcu_read_lock();
+		p = pid_task(pid, PIDTYPE_PID);
+		if (p)
+			send_sigurg_to_task(p, fown, group);
+		rcu_read_unlock();
+	} else {
+		qread_lock(&tasklist_lock);
+		do_each_pid_task(pid, type, p) {
+			send_sigurg_to_task(p, fown, group);
+		} while_each_pid_task(pid, type, p);
+		qread_unlock(&tasklist_lock);
+	}
  out_unlock_fown:
 	read_unlock(&fown->lock);
 	return ret;

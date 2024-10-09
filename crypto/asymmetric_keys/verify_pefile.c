@@ -105,6 +105,7 @@ static int pefile_parse_binary(const void *pebuf, unsigned int pelen,
 
 	chkaddr(ctx->header_size, ddir->certs.virtual_address,
 		ddir->certs.size);
+	ctx->certs_offset = ddir->certs.virtual_address;
 	ctx->sig_offset = ddir->certs.virtual_address;
 	ctx->sig_len = ddir->certs.size;
 	pr_debug("cert = %x @%x [%*ph]\n",
@@ -139,10 +140,14 @@ static int pefile_strip_sig_wrapper(const void *pebuf,
 	pr_debug("sig wrapper = { %x, %x, %x }\n",
 		 wrapper.length, wrapper.revision, wrapper.cert_type);
 
-	/* Both pesign and sbsign round up the length of certificate table
+	/* This key wrapper must fit within the remaining signature space.
+	 * But it's ok if there's leftover space for additional sigs.
+	 * Both pesign and sbsign round up the length of certificate table
 	 * (in optional header data directories) to 8 byte alignment.
+	 * This key wrapper must fit within the remaining signature space.
+	 * But it's ok if there's leftover space, perhaps for other sigs.
 	 */
-	if (round_up(wrapper.length, 8) != ctx->sig_len) {
+	if (round_up(wrapper.length, 8) > ctx->sig_len) {
 		pr_debug("Signature wrapper len wrong\n");
 		return -ELIBBAD;
 	}
@@ -200,6 +205,32 @@ check_len:
 not_pkcs7:
 	pr_debug("Signature data not PKCS#7\n");
 	return -ELIBBAD;
+}
+
+/*
+ * If possible, advance the signature context (ctx->sig_offset, ctx->sig_len)
+ * to delimit the remaining space in the pefile certs area where there may be
+ * additional signatures after the current one.
+ *
+ * Returns:
+ *  true  if signature context was advanced into space after current sig
+ *  false if we have reached the end of the certs area
+ */
+static bool pefile_next_sig(struct pefile_context *ctx)
+{
+	unsigned int next_sig_offset;	/* pefile offset to sig */
+	unsigned int next_certs_offset;	/* certs offset to sig */
+
+	next_sig_offset = round_up(ctx->sig_offset + ctx->sig_len, 8);
+	next_certs_offset = next_sig_offset - ctx->certs_offset;
+
+	if (next_certs_offset >= ctx->certs_size)
+		return false;
+
+	ctx->sig_offset = next_sig_offset;
+	ctx->sig_len = ctx->certs_size - next_certs_offset;
+
+	return true;
 }
 
 /*
@@ -395,8 +426,14 @@ error_no_desc:
  * @trust_keyring: Signing certificates to use as starting points
  * @_trusted: Set to true if trustworth, false otherwise
  *
- * Validate that the certificate chain inside the PKCS#7 message inside the PE
+ * Validate that the certificate chain inside a PKCS#7 message inside the PE
  * binary image intersects keys we already know and trust.
+ *
+ * Note that the PE binary image may be signed more than once with different
+ * keys. Although verification is only required via a single signature, every
+ * signature must be checked to make sure that its associated key has not
+ * been blocked. In particular, any error other than the key is not found in
+ * the trusted keys results in failure.
  *
  * Returns, in order of descending priority:
  *
@@ -424,14 +461,24 @@ int verify_pefile_signature(const void *pebuf, unsigned pelen,
 	const void *data;
 	size_t datalen;
 	int ret;
+	int ret_final = -ENOKEY;
+	bool trusted_cur;
+	bool trusted_any = false;
 
 	kenter("");
+
+	*_trusted = false;
 
 	memset(&ctx, 0, sizeof(ctx));
 	ret = pefile_parse_binary(pebuf, pelen, &ctx);
 	if (ret < 0)
 		return ret;
 
+	/* The pefile may have multiple signatures with different keys.
+	 * pefile_parse_binary set the context to the first signature
+	 * and pefile_next_sig advances the context to potential next.
+	 */
+next_sig:
 	ret = pefile_strip_sig_wrapper(pebuf, &ctx);
 	if (ret < 0)
 		return ret;
@@ -466,7 +513,31 @@ int verify_pefile_signature(const void *pebuf, unsigned pelen,
 	if (ret < 0)
 		goto error;
 
-	ret = pkcs7_validate_trust(pkcs7, trusted_keyring, _trusted);
+	ret = pkcs7_validate_trust(pkcs7, trusted_keyring, &trusted_cur);
+
+	/* If key in this signature is trusted, remember that.
+	 * Otherwise, if any error other than -ENOKEY, return that error.
+	 */
+	if (ret == 0) {
+		ret_final = 0;
+		trusted_any |= trusted_cur;
+	} else if (ret != -ENOKEY) {
+		goto error;
+	}
+
+	pkcs7_free_message(ctx.pkcs7);
+	ctx.pkcs7 = NULL;
+
+	/* If more signatures can follow the current one, go consider the
+	 * next one. Otherwise, we are exactly at the end of signatures
+	 * and need to return the final status, which will either be
+	 * success or -ENOKEY.
+	 */
+	if (pefile_next_sig(&ctx))
+		goto next_sig;
+
+	*_trusted = trusted_any;
+	return ret_final;
 
 error:
 	pkcs7_free_message(ctx.pkcs7);

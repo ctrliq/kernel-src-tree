@@ -278,6 +278,7 @@ static void pv_init(void)
 	swiotlb_init(1);
 	swiotlb_update_mem_attributes();
 	swiotlb_force = 1;
+	swiotlb_panic_on_full = 0;
 	/* use swiotlb_dma_ops */
 	s390_dma_ops = &s390_pv_dma_ops;
 }

@@ -670,6 +670,9 @@ static ktime_t tick_nohz_stop_sched_tick(struct tick_sched *ts,
 	expires = min_t(u64, expires, next_tick);
 	tick.tv64 = expires;
 
+	/* Even if the tick was already stopped, load may have changed */
+	calc_load_enter_idle();
+
 	/* Skip reprogram of event if its not changed */
 	if (ts->tick_stopped && (expires == ts->next_tick.tv64)) {
 		/* Sanity check: make sure clockevent is actually programmed */
@@ -691,7 +694,6 @@ static ktime_t tick_nohz_stop_sched_tick(struct tick_sched *ts,
 	 */
 	if (!ts->tick_stopped) {
 		nohz_balance_enter_idle(cpu);
-		calc_load_enter_idle();
 
 		ts->last_tick = hrtimer_get_expires(&ts->sched_timer);
 		ts->tick_stopped = 1;

@@ -1069,13 +1069,13 @@ static long aio_read_events_ring(struct kioctx *ctx,
 	/* Access to ->ring_pages here is protected by ctx->ring_lock. */
 	ring = kmap_atomic(ctx->ring_pages[0]);
 	head = ring->head;
+	tail = ring->tail;
 	kunmap_atomic(ring);
 
 	/*
 	 * Ensure that once we've read the current tail pointer, that
 	 * we also see the events that were stored up to the tail.
 	 */
-	tail = ctx->tail;
 	smp_rmb();
 
 	pr_debug("h%u t%u m%u\n", head, tail, ctx->nr_events);
@@ -1084,6 +1084,7 @@ static long aio_read_events_ring(struct kioctx *ctx,
 		goto out;
 
 	head %= ctx->nr_events;
+	tail %= ctx->nr_events;
 
 	while (ret < nr) {
 		long avail;

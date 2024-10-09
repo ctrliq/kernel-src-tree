@@ -165,6 +165,7 @@ typedef void (busy_iter_fn)(struct blk_mq_hw_ctx *, struct request *, void *,
 		bool);
 typedef void (busy_tag_iter_fn)(struct request *, void *, bool);
 typedef int (map_queues_fn)(struct blk_mq_tag_set *set);
+typedef void (cleanup_rq_fn)(struct request *);
 
 struct blk_mq_aux_ops {
 	reinit_request_fn	*reinit_request;
@@ -178,6 +179,12 @@ struct blk_mq_aux_ops {
 	 */
 	get_budget_fn		*get_budget;
 	put_budget_fn		*put_budget;
+
+	/*
+	 * Called before freeing one request which isn't completed yet,
+	 * and usually for freeing the driver private data
+	 */
+	cleanup_rq_fn		*cleanup_rq;
 };
 
 struct blk_mq_ops {
@@ -397,5 +404,13 @@ static inline struct request_aux *rq_aux(struct request *rq)
 #define hctx_for_each_ctx(hctx, ctx, i)					\
 	for ((i) = 0; (i) < (hctx)->nr_ctx &&				\
 	     ({ ctx = (hctx)->ctxs[(i)]; 1; }); (i)++)
+
+static inline void blk_mq_cleanup_rq(struct request *rq)
+{
+	struct request_queue *q = rq->q;
+
+	if (q->mq_ops->aux_ops && q->mq_ops->aux_ops->cleanup_rq)
+		q->mq_ops->aux_ops->cleanup_rq(rq);
+}
 
 #endif

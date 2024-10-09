@@ -374,21 +374,9 @@ out:
  * Synchronous I/O uses a stack-allocated iocb.  Thus we can't trust
  * the iocb is still valid here if this is a synchronous request.
  */
-static void nfs_direct_complete(struct nfs_direct_req *dreq, bool write)
+static void nfs_direct_complete(struct nfs_direct_req *dreq)
 {
 	struct inode *inode = dreq->inode;
-
-	if (dreq->iocb && write) {
-		loff_t pos = dreq->iocb->ki_pos + dreq->count;
-
-		spin_lock(&inode->i_lock);
-		if (i_size_read(inode) < pos)
-			i_size_write(inode, pos);
-		spin_unlock(&inode->i_lock);
-	}
-
-	if (write)
-		nfs_zap_mapping(inode, inode->i_mapping);
 
 	inode_dio_end(inode);
 
@@ -442,7 +430,7 @@ static void nfs_direct_read_completion(struct nfs_pgio_header *hdr)
 	}
 out_put:
 	if (put_dreq(dreq))
-		nfs_direct_complete(dreq, false);
+		nfs_direct_complete(dreq);
 	hdr->release(hdr);
 }
 
@@ -501,7 +489,7 @@ static ssize_t nfs_direct_read_schedule_segment(struct nfs_pageio_descriptor *de
 		result = -ENOMEM;
 		npages = nfs_page_array_len(pgbase, bytes);
 		if (!pagevec)
-			pagevec = kmalloc(npages * sizeof(struct page *),
+			pagevec = kmalloc((npages + 1) * sizeof(struct page *),
 					  GFP_KERNEL);
 		if (!pagevec)
 			break;
@@ -606,7 +594,7 @@ static ssize_t nfs_direct_read_schedule_iovec(struct nfs_direct_req *dreq,
 	}
 
 	if (put_dreq(dreq))
-		nfs_direct_complete(dreq, false);
+		nfs_direct_complete(dreq);
 	return 0;
 }
 
@@ -652,17 +640,12 @@ ssize_t nfs_file_direct_read(struct kiocb *iocb, const struct iovec *iov,
 	if (!count)
 		goto out;
 
-	mutex_lock(&inode->i_mutex);
-	result = nfs_sync_mapping(mapping);
-	if (result)
-		goto out_unlock;
-
 	task_io_account_read(count);
 
 	result = -ENOMEM;
 	dreq = nfs_direct_req_alloc();
 	if (dreq == NULL)
-		goto out_unlock;
+		goto out;
 
 	dreq->inode = inode;
 	dreq->bytes_left = iov_length(iov, nr_segs);
@@ -677,10 +660,12 @@ ssize_t nfs_file_direct_read(struct kiocb *iocb, const struct iovec *iov,
 	if (!is_sync_kiocb(iocb))
 		dreq->iocb = iocb;
 
+	nfs_start_io_direct(inode);
+
 	NFS_I(inode)->read_io += iov_length(iov, nr_segs);
 	result = nfs_direct_read_schedule_iovec(dreq, iov, nr_segs, pos, uio);
 
-	mutex_unlock(&inode->i_mutex);
+	nfs_end_io_direct(inode);
 
 	if (!result) {
 		result = nfs_direct_wait(dreq);
@@ -688,13 +673,8 @@ ssize_t nfs_file_direct_read(struct kiocb *iocb, const struct iovec *iov,
 			iocb->ki_pos = pos + result;
 	}
 
-	nfs_direct_req_release(dreq);
-	return result;
-
 out_release:
 	nfs_direct_req_release(dreq);
-out_unlock:
-	mutex_unlock(&inode->i_mutex);
 out:
 	return result;
 }
@@ -846,7 +826,8 @@ static void nfs_direct_write_schedule_work(struct work_struct *work)
 			nfs_direct_write_reschedule(dreq);
 			break;
 		default:
-			nfs_direct_complete(dreq, true);
+			nfs_zap_mapping(dreq->inode, dreq->inode->i_mapping);
+			nfs_direct_complete(dreq);
 	}
 }
 
@@ -892,7 +873,7 @@ static ssize_t nfs_direct_write_schedule_segment(struct nfs_pageio_descriptor *d
 		result = -ENOMEM;
 		npages = nfs_page_array_len(pgbase, bytes);
 		if (!pagevec)
-			pagevec = kmalloc(npages * sizeof(struct page *), GFP_KERNEL);
+			pagevec = kmalloc((npages + 1) * sizeof(struct page *), GFP_KERNEL);
 		if (!pagevec)
 			break;
 
@@ -1143,25 +1124,12 @@ ssize_t nfs_file_direct_write(struct kiocb *iocb, const struct iovec *iov,
 	if (!count)
 		goto out;
 
-	mutex_lock(&inode->i_mutex);
-
-	result = nfs_sync_mapping(mapping);
-	if (result)
-		goto out_unlock;
-
-	if (mapping->nrpages) {
-		result = invalidate_inode_pages2_range(mapping,
-					pos >> PAGE_CACHE_SHIFT, end);
-		if (result)
-			goto out_unlock;
-	}
-
 	task_io_account_write(count);
 
 	result = -ENOMEM;
 	dreq = nfs_direct_req_alloc();
 	if (!dreq)
-		goto out_unlock;
+		goto out;
 
 	dreq->inode = inode;
 	dreq->bytes_left = count;
@@ -1176,6 +1144,8 @@ ssize_t nfs_file_direct_write(struct kiocb *iocb, const struct iovec *iov,
 	if (!is_sync_kiocb(iocb))
 		dreq->iocb = iocb;
 
+	nfs_start_io_direct(inode);
+
 	result = nfs_direct_write_schedule_iovec(dreq, iov, nr_segs, pos, uio);
 
 	if (mapping->nrpages) {
@@ -1183,28 +1153,18 @@ ssize_t nfs_file_direct_write(struct kiocb *iocb, const struct iovec *iov,
 					      pos >> PAGE_CACHE_SHIFT, end);
 	}
 
-	mutex_unlock(&inode->i_mutex);
+	nfs_end_io_direct(inode);
 
 	if (!result) {
 		result = nfs_direct_wait(dreq);
 		if (result > 0) {
-			struct inode *inode = mapping->host;
-
 			iocb->ki_pos = pos + result;
-			spin_lock(&inode->i_lock);
-			if (i_size_read(inode) < iocb->ki_pos)
-				i_size_write(inode, iocb->ki_pos);
-			spin_unlock(&inode->i_lock);
 			generic_write_sync(file, pos, result);
 		}
 	}
-	nfs_direct_req_release(dreq);
-	return result;
 
 out_release:
 	nfs_direct_req_release(dreq);
-out_unlock:
-	mutex_unlock(&inode->i_mutex);
 out:
 	return result;
 }

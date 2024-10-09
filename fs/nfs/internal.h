@@ -362,7 +362,7 @@ int nfs_mknod(struct inode *, struct dentry *, umode_t, dev_t);
 int nfs_rename(struct inode *, struct dentry *, struct inode *, struct dentry *);
 
 /* file.c */
-int nfs_file_fsync_commit(struct file *, loff_t, loff_t, int);
+int nfs_file_fsync(struct file *file, loff_t start, loff_t end, int datasync);
 loff_t nfs_file_llseek(struct file *, loff_t, int);
 ssize_t nfs_file_read(struct kiocb *, const struct iovec *, unsigned long, loff_t);
 ssize_t nfs_file_splice_read(struct file *, loff_t *, struct pipe_inode_info *,
@@ -417,6 +417,14 @@ extern int __init register_nfs_fs(void);
 extern void __exit unregister_nfs_fs(void);
 extern bool nfs_sb_active(struct super_block *sb);
 extern void nfs_sb_deactive(struct super_block *sb);
+
+/* io.c */
+extern void nfs_start_io_read(struct inode *inode);
+extern void nfs_end_io_read(struct inode *inode);
+extern void nfs_start_io_write(struct inode *inode);
+extern void nfs_end_io_write(struct inode *inode);
+extern void nfs_start_io_direct(struct inode *inode);
+extern void nfs_end_io_direct(struct inode *inode);
 
 /* namespace.c */
 #define NFS_PATH_CANONICAL 1

@@ -633,36 +633,6 @@ static int mlx5_core_set_issi(struct mlx5_core_dev *dev)
 	return -EOPNOTSUPP;
 }
 
-/* PCI table of mlx5 devices that are tech preview in RHEL */
-static const struct pci_device_id mlx5_core_hw_unsupp_pci_table[] = {
-	{ PCI_VDEVICE(MELLANOX, 0x101d) },			/* ConnectX-6 Dx */
-	{ PCI_VDEVICE(MELLANOX, 0x101e), MLX5_PCI_DEV_IS_VF},	/* ConnectX Family mlx5Gen Virtual Function */
-	{ 0, }
-};
-
-static char mlx5_pci_id[32]; /* more than enough space */
-/*
- * Function to check if an mlx5 device is tech-preview.
- * If so, print out message and mark accordingly.
- *
- * most of it stolen from pci_match_device() in drivers/pci/pci-drivers.c
- *
- */
-static void mlx5_check_hw_unsupp_status(struct pci_dev *pdev)
-{
-	const struct pci_device_id *found_id = NULL;
-
-	found_id = pci_match_id(mlx5_core_hw_unsupp_pci_table, pdev);
-
-	if (found_id) {
-		sprintf(mlx5_pci_id, "%s: %04x:%02x:%02x.%01x\n", "pci-device",
-				pci_domain_nr(pdev->bus), pdev->bus->number,
-				PCI_SLOT(pdev->devfn), PCI_FUNC(pdev->devfn));
-		/* mark-hw-unsupported doesn't taint kernel; just prints warning */
-		mark_hardware_unsupported(mlx5_pci_id);
-	}
-}
-
 static int mlx5_pci_init(struct mlx5_core_dev *dev, struct mlx5_priv *priv)
 {
 	struct pci_dev *pdev = dev->pdev;
@@ -712,7 +682,6 @@ static int mlx5_pci_init(struct mlx5_core_dev *dev, struct mlx5_priv *priv)
 		goto err_clr_master;
 	}
 
-	mlx5_check_hw_unsupp_status(pdev);
 	return 0;
 
 err_clr_master:

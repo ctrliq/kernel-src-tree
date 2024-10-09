@@ -318,6 +318,7 @@ static int faulty_run(struct mddev *mddev)
 	struct md_rdev *rdev;
 	int i;
 	struct faulty_conf *conf;
+	bool no_sg_merge = false;
 
 	if (md_check_no_bitmap(mddev))
 		return -EINVAL;
@@ -336,8 +337,17 @@ static int faulty_run(struct mddev *mddev)
 		conf->rdev = rdev;
 		disk_stack_limits(mddev->gendisk, rdev->bdev,
 				  rdev->data_offset << 9);
+		if (test_bit(QUEUE_FLAG_NO_SG_MERGE,
+		    &bdev_get_queue(rdev->bdev)->queue_flags))
+			no_sg_merge = true;
 	}
 
+	if (no_sg_merge)
+		queue_flag_set_unlocked(QUEUE_FLAG_NO_SG_MERGE,
+					mddev->queue);
+	else
+		queue_flag_clear_unlocked(QUEUE_FLAG_NO_SG_MERGE,
+					mddev->queue);
 	md_set_array_sectors(mddev, faulty_size(mddev, 0, 0));
 	mddev->private = conf;
 

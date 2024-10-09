@@ -54,6 +54,7 @@
 #include <asm/debug.h>
 #include <asm/kexec.h>
 #include <asm/asm-prototypes.h>
+#include <asm/ftrace.h>
 
 #ifdef DEBUG
 #include <asm/udbg.h>
@@ -760,6 +761,9 @@ void start_secondary(void *unused)
 	set_cpu_online(cpu, true);
 
 	local_irq_enable();
+
+	/* We can enable ftrace for secondary cpus now */
+	this_cpu_enable_ftrace();
 
 	cpu_startup_entry(CPUHP_ONLINE);
 

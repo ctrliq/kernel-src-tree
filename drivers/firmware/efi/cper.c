@@ -32,6 +32,7 @@
 #include <linux/acpi.h>
 #include <linux/pci.h>
 #include <linux/aer.h>
+#include <acpi/ghes.h>
 
 #define INDENT_SP	" "
 
@@ -344,7 +345,7 @@ static const char * const pcie_port_type_strs[] = {
 };
 
 static void cper_print_pcie(const char *pfx, const struct cper_sec_pcie *pcie,
-			    const struct acpi_generic_data *gdata)
+			    const struct acpi_hest_generic_data *gdata)
 {
 	if (pcie->validation_bits & CPER_PCIE_VALID_PORT_TYPE)
 		printk("%s""port_type: %d, %s\n", pfx, pcie->port_type,
@@ -394,8 +395,9 @@ static void cper_print_pcie(const char *pfx, const struct cper_sec_pcie *pcie,
 	}
 }
 
-static void cper_estatus_print_section(
-	const char *pfx, const struct acpi_generic_data *gdata, int sec_no)
+static void
+cper_estatus_print_section(const char *pfx, struct acpi_hest_generic_data *gdata,
+			   int sec_no)
 {
 	uuid_le *sec_type = (uuid_le *)gdata->section_type;
 	__u16 severity;
@@ -411,21 +413,24 @@ static void cper_estatus_print_section(
 
 	snprintf(newpfx, sizeof(newpfx), "%s%s", pfx, INDENT_SP);
 	if (!uuid_le_cmp(*sec_type, CPER_SEC_PROC_GENERIC)) {
-		struct cper_sec_proc_generic *proc_err = (void *)(gdata + 1);
+		struct cper_sec_proc_generic *proc_err = acpi_hest_get_payload(gdata);
+
 		printk("%s""section_type: general processor error\n", newpfx);
 		if (gdata->error_data_length >= sizeof(*proc_err))
 			cper_print_proc_generic(newpfx, proc_err);
 		else
 			goto err_section_too_small;
 	} else if (!uuid_le_cmp(*sec_type, CPER_SEC_PLATFORM_MEM)) {
-		struct cper_sec_mem_err *mem_err = (void *)(gdata + 1);
+		struct cper_sec_mem_err *mem_err = acpi_hest_get_payload(gdata);
+
 		printk("%s""section_type: memory error\n", newpfx);
 		if (gdata->error_data_length >= sizeof(*mem_err))
 			cper_print_mem(newpfx, mem_err);
 		else
 			goto err_section_too_small;
 	} else if (!uuid_le_cmp(*sec_type, CPER_SEC_PCIE)) {
-		struct cper_sec_pcie *pcie = (void *)(gdata + 1);
+		struct cper_sec_pcie *pcie = acpi_hest_get_payload(gdata);
+
 		printk("%s""section_type: PCIe error\n", newpfx);
 		if (gdata->error_data_length >= sizeof(*pcie))
 			cper_print_pcie(newpfx, pcie, gdata);
@@ -441,10 +446,10 @@ err_section_too_small:
 }
 
 void cper_estatus_print(const char *pfx,
-			const struct acpi_generic_status *estatus)
+			const struct acpi_hest_generic_status *estatus)
 {
-	struct acpi_generic_data *gdata;
-	unsigned int data_len, gedata_len;
+	struct acpi_hest_generic_data *gdata;
+	unsigned int data_len;
 	int sec_no = 0;
 	char newpfx[64];
 	__u16 severity;
@@ -456,22 +461,22 @@ void cper_estatus_print(const char *pfx,
 		       "and requires no further action");
 	printk("%s""event severity: %s\n", pfx, cper_severity_str(severity));
 	data_len = estatus->data_length;
-	gdata = (struct acpi_generic_data *)(estatus + 1);
+	gdata = (struct acpi_hest_generic_data *)(estatus + 1);
 	snprintf(newpfx, sizeof(newpfx), "%s%s", pfx, INDENT_SP);
-	while (data_len >= sizeof(*gdata)) {
-		gedata_len = gdata->error_data_length;
+
+	while (data_len >= acpi_hest_get_size(gdata)) {
 		cper_estatus_print_section(newpfx, gdata, sec_no);
-		data_len -= gedata_len + sizeof(*gdata);
-		gdata = (void *)(gdata + 1) + gedata_len;
+		data_len -= acpi_hest_get_record_size(gdata);
+		gdata = acpi_hest_get_next(gdata);
 		sec_no++;
 	}
 }
 EXPORT_SYMBOL_GPL(cper_estatus_print);
 
-int cper_estatus_check_header(const struct acpi_generic_status *estatus)
+int cper_estatus_check_header(const struct acpi_hest_generic_status *estatus)
 {
 	if (estatus->data_length &&
-	    estatus->data_length < sizeof(struct acpi_generic_data))
+	    estatus->data_length < sizeof(struct acpi_hest_generic_data))
 		return -EINVAL;
 	if (estatus->raw_data_length &&
 	    estatus->raw_data_offset < sizeof(*estatus) + estatus->data_length)
@@ -481,9 +486,9 @@ int cper_estatus_check_header(const struct acpi_generic_status *estatus)
 }
 EXPORT_SYMBOL_GPL(cper_estatus_check_header);
 
-int cper_estatus_check(const struct acpi_generic_status *estatus)
+int cper_estatus_check(const struct acpi_hest_generic_status *estatus)
 {
-	struct acpi_generic_data *gdata;
+	struct acpi_hest_generic_data *gdata;
 	unsigned int data_len, gedata_len;
 	int rc;
 
@@ -491,13 +496,15 @@ int cper_estatus_check(const struct acpi_generic_status *estatus)
 	if (rc)
 		return rc;
 	data_len = estatus->data_length;
-	gdata = (struct acpi_generic_data *)(estatus + 1);
-	while (data_len >= sizeof(*gdata)) {
-		gedata_len = gdata->error_data_length;
-		if (gedata_len > data_len - sizeof(*gdata))
+	gdata = (struct acpi_hest_generic_data *)(estatus + 1);
+
+	while (data_len >= acpi_hest_get_size(gdata)) {
+		gedata_len = acpi_hest_get_error_length(gdata);
+		if (gedata_len > data_len - acpi_hest_get_size(gdata))
 			return -EINVAL;
-		data_len -= gedata_len + sizeof(*gdata);
-		gdata = (void *)(gdata + 1) + gedata_len;
+
+		data_len -= acpi_hest_get_record_size(gdata);
+		gdata = acpi_hest_get_next(gdata);
 	}
 	if (data_len)
 		return -EINVAL;

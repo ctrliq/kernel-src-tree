@@ -314,6 +314,13 @@ static void cbs_destroy(struct Qdisc *sch)
 	struct cbs_sched_data *q = qdisc_priv(sch);
 	struct net_device *dev = qdisc_dev(sch);
 
+	/*
+	 * RHEL: don't try further uninit if qdisc_watchdog_init()
+	 * and cbs_change() have not been called.
+	 */
+	if (!q->watchdog.qdisc)
+		return;
+
 	qdisc_watchdog_cancel(&q->watchdog);
 
 	cbs_disable_offload(dev, q);

@@ -15,6 +15,9 @@
  * that group keep the CPUID for the variants sorted by model number.
  */
 
+/* Wildcard match for FAM6 so X86_MATCH_INTEL_FAM6_MODEL(ANY) works */
+#define INTEL_FAM6_ANY			X86_MODEL_ANY
+
 #define INTEL_FAM6_CORE_YONAH		0x0E
 #define INTEL_FAM6_CORE2_MEROM		0x0F
 #define INTEL_FAM6_CORE2_MEROM_L	0x16

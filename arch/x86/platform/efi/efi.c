@@ -553,6 +553,7 @@ void __init efi_init(void)
 	print_efi_memmap();
 
 	efi_esrt_init();
+	efi_mokvar_config_init();
 }
 
 void __init efi_late_init(void)

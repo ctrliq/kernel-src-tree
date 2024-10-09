@@ -1,7 +1,7 @@
 /*******************************************************************
  * This file is part of the Emulex Linux Device Driver for         *
  * Fibre Channel Host Bus Adapters.                                *
- * Copyright (C) 2017-2018 Broadcom. All Rights Reserved. The term *
+ * Copyright (C) 2017-2020 Broadcom. All Rights Reserved. The term *
  * “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.  *
  * Copyright (C) 2004-2016 Emulex.  All rights reserved.           *
  * EMULEX and SLI are trademarks of Emulex.                        *
@@ -222,25 +222,16 @@ lpfc_sli4_wq_put(struct lpfc_queue *q, union lpfc_wqe128 *wqe)
  * This routine will update the HBA index of a queue to reflect consumption of
  * Work Queue Entries by the HBA. When the HBA indicates that it has consumed
  * an entry the host calls this function to update the queue's internal
- * pointers. This routine returns the number of entries that were consumed by
- * the HBA.
+ * pointers.
  **/
-static uint32_t
+static void
 lpfc_sli4_wq_release(struct lpfc_queue *q, uint32_t index)
 {
-	uint32_t released = 0;
-
 	/* sanity check on queue memory */
 	if (unlikely(!q))
-		return 0;
+		return;
 
-	if (q->hba_index == index)
-		return 0;
-	do {
-		q->hba_index = ((q->hba_index + 1) % q->entry_count);
-		released++;
-	} while (q->hba_index != index);
-	return released;
+	q->hba_index = index;
 }
 
 /**
@@ -2282,8 +2273,6 @@ lpfc_sli_hbqbuf_find(struct lpfc_hba *phba, uint32_t tag)
 	struct lpfc_dmabuf *d_buf;
 	struct hbq_dmabuf *hbq_buf;
 	uint32_t hbqno;
-
-	lockdep_assert_held(&phba->hbalock);
 
 	hbqno = tag >> 16;
 	if (hbqno >= LPFC_MAX_HBQS)
@@ -14111,8 +14100,11 @@ lpfc_sli4_hba_process_cq(struct work_struct *work)
 			cq->isr_timestamp = 0;
 #endif
 		workposted |= lpfc_sli4_fp_handle_cqe(phba, cq, cqe);
-		if (!(++ccount % cq->entry_repost))
+		if (!(++ccount % cq->max_proc_limit))
 			break;
+
+		if (!(ccount % cq->entry_repost))
+			phba->sli4_hba.sli4_cq_release(cq, LPFC_QUEUE_NOARM);
 	}
 
 	/* Track the max number of CQEs processed in 1 EQ */
@@ -14982,6 +14974,7 @@ lpfc_cq_create(struct lpfc_hba *phba, struct lpfc_queue *cq,
 	cq->host_index = 0;
 	cq->hba_index = 0;
 	cq->entry_repost = LPFC_CQ_REPOST;
+	cq->max_proc_limit = min(phba->cfg_cq_max_proc_limit, cq->entry_count);
 
 out:
 	mempool_free(mbox, phba->mbox_mem_pool);
@@ -15190,6 +15183,8 @@ lpfc_cq_create_set(struct lpfc_hba *phba, struct lpfc_queue **cqp,
 		cq->host_index = 0;
 		cq->hba_index = 0;
 		cq->entry_repost = LPFC_CQ_REPOST;
+		cq->max_proc_limit = min(phba->cfg_cq_max_proc_limit,
+					 cq->entry_count);
 		cq->chann = idx;
 
 		rc = 0;

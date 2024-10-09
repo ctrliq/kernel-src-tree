@@ -253,4 +253,8 @@ static inline u64 mul_u64_u32_div(u64 a, u32 mul, u32 divisor)
 }
 #endif /* mul_u64_u32_div */
 
+#ifndef mul_u64_u64_div_u64
+u64 mul_u64_u64_div_u64(u64 a, u64 mul, u64 div);
+#endif
+
 #endif /* _LINUX_MATH64_H */

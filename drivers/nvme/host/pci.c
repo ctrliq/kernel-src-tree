@@ -1362,7 +1362,7 @@ static int nvme_alloc_admin_tags(struct nvme_dev *dev)
 		dev->ctrl.admin_tagset = &dev->admin_tagset;
 
 		dev->ctrl.admin_q = blk_mq_init_queue(&dev->admin_tagset);
-		if (!dev->ctrl.admin_q) {
+		if (IS_ERR(dev->ctrl.admin_q)) {
 			blk_mq_free_tag_set(&dev->admin_tagset);
 			return -ENOMEM;
 		}
@@ -1739,6 +1739,7 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 {
 	struct nvme_queue *adminq = &dev->queues[0];
 	struct pci_dev *pdev = to_pci_dev(dev->dev);
+	struct nvme_ctrl *ctrl = &dev->ctrl;
 	int result, nr_io_queues;
 	unsigned long size;
 
@@ -1747,6 +1748,15 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 	};
 
 	nr_io_queues = num_online_cpus();
+
+	/*
+	 * Limit number of IO queues on Dell configuration.
+	 */
+	if ((ctrl->quirks & NVME_QUIRK_MAX_IO_QUEUES)) {
+		if (nr_io_queues > 255)
+			nr_io_queues = 255;
+	}
+
 	result = nvme_set_queue_count(&dev->ctrl, &nr_io_queues);
 	if (result < 0)
 		return result;
@@ -2556,6 +2566,8 @@ static const struct pci_device_id nvme_id_table[] = {
 		.driver_data = NVME_QUIRK_DELAY_BEFORE_CHK_RDY, },
 	{ PCI_DEVICE(0x144d, 0xa822),   /* Samsung PM1725a */
 		.driver_data = NVME_QUIRK_DELAY_BEFORE_CHK_RDY, },
+	{ PCI_DEVICE_SUB(0x144d, 0xa824, 0x1028, PCI_ANY_ID),   /* Samsung PM1733/PM1735 */
+		.driver_data = NVME_QUIRK_MAX_IO_QUEUES, },
 	{ PCI_DEVICE_CLASS(PCI_CLASS_STORAGE_EXPRESS, 0xffffff) },
 	{ 0, }
 };

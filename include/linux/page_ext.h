@@ -1,6 +1,9 @@
 #ifndef __LINUX_PAGE_EXT_H
 #define __LINUX_PAGE_EXT_H
 
+#include <linux/types.h>
+#include <linux/stacktrace.h>
+
 struct page_ext_operations {
 	bool (*need)(void);
 	void (*init)(void);
@@ -20,6 +23,7 @@ struct page_ext_operations {
 enum page_ext_flags {
 	PAGE_EXT_DEBUG_POISON,		/* Page is poisoned */
 	PAGE_EXT_DEBUG_GUARD,
+	PAGE_EXT_OWNER,
 #if defined(CONFIG_IDLE_PAGE_TRACKING) && !defined(CONFIG_64BIT)
 	PAGE_EXT_YOUNG,
 	PAGE_EXT_IDLE,
@@ -35,6 +39,12 @@ enum page_ext_flags {
  */
 struct page_ext {
 	unsigned long flags;
+#ifdef CONFIG_PAGE_OWNER
+	unsigned int order;
+	gfp_t gfp_mask;
+	unsigned int nr_entries;
+	unsigned long trace_entries[8];
+#endif
 };
 
 #ifdef CONFIG_PAGE_EXTENSION

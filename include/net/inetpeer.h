@@ -59,6 +59,7 @@ struct inet_peer {
 	/* following fields might be frequently dirtied */
 	__u32			dtime;	/* the time of last use of not referenced entries */
 	atomic_t		refcnt;
+	RH_KABI_EXTEND(u32	n_redirects)
 };
 
 struct inet_peer_base {

@@ -1286,8 +1286,11 @@ scsi_prep_state_check(struct scsi_device *sdev, struct request *req)
 			 * commands.  The device must be brought online
 			 * before trying any recovery commands.
 			 */
-			sdev_printk(KERN_ERR, sdev,
+			if (!sdev->offline_already) {
+				sdev->offline_already = 1;
+				sdev_printk(KERN_ERR, sdev,
 				    "rejecting I/O to offline device\n");
+			}
 			ret = BLKPREP_KILL;
 			break;
 		case SDEV_DEL:
@@ -1691,8 +1694,11 @@ static void scsi_request_fn(struct request_queue *q)
 			break;
 
 		if (unlikely(!scsi_device_online(sdev))) {
-			sdev_printk(KERN_ERR, sdev,
+			if (!sdev->offline_already) {
+				sdev->offline_already = 1;
+				sdev_printk(KERN_ERR, sdev,
 				    "rejecting I/O to offline device\n");
+			}
 			scsi_kill_request(req, q);
 			continue;
 		}
@@ -1891,6 +1897,18 @@ out:
 	if (atomic_read(&sdev->device_busy) == 0 && !scsi_device_blocked(sdev))
 		blk_mq_delay_run_hw_queue(hctx, SCSI_QUEUE_DELAY);
 	return false;
+}
+
+/*
+ * Only called when the request isn't completed by SCSI, and not freed by
+ * SCSI
+ */
+static void scsi_cleanup_rq(struct request *rq)
+{
+	if (rq->cmd_flags & REQ_DONTPREP) {
+		scsi_mq_uninit_cmd(blk_mq_rq_to_pdu(rq));
+		rq->cmd_flags &= ~REQ_DONTPREP;
+	}
 }
 
 static int scsi_queue_rq(struct blk_mq_hw_ctx *hctx,
@@ -2092,6 +2110,7 @@ struct request_queue *scsi_alloc_queue(struct scsi_device *sdev)
 static struct blk_mq_aux_ops scsi_mq_aux_ops = {
 	.get_budget	= scsi_mq_get_budget,
 	.put_budget	= scsi_mq_put_budget,
+	.cleanup_rq	= scsi_cleanup_rq,
 };
 
 static struct blk_mq_ops scsi_mq_ops = {
@@ -2587,6 +2606,7 @@ scsi_device_set_state(struct scsi_device *sdev, enum scsi_device_state state)
 		break;
 
 	}
+	sdev->offline_already = 0;
 	sdev->sdev_state = state;
 	return 0;
 

@@ -252,16 +252,24 @@ void __kprobes vtime_stop_cpu(void)
 cputime64_t s390_get_idle_time(int cpu)
 {
 	struct s390_idle_data *idle = &per_cpu(s390_idle, cpu);
-	unsigned long long now, idle_enter, idle_exit;
+	unsigned long long now, idle_enter, idle_exit, in_idle;
 	unsigned int sequence;
 
 	do {
-		now = get_tod_clock();
 		sequence = ACCESS_ONCE(idle->sequence);
 		idle_enter = ACCESS_ONCE(idle->clock_idle_enter);
 		idle_exit = ACCESS_ONCE(idle->clock_idle_exit);
 	} while ((sequence & 1) || (ACCESS_ONCE(idle->sequence) != sequence));
-	return idle_enter ? ((idle_exit ?: now) - idle_enter) : 0;
+	in_idle = 0;
+	now = get_tod_clock();
+	if (idle_enter) {
+		if (idle_exit) {
+			in_idle = idle_exit - idle_enter;
+		} else if (now > idle_enter) {
+			in_idle = now - idle_enter;
+		}
+	}
+	return in_idle;
 }
 
 /*

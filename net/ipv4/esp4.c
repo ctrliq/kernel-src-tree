@@ -211,6 +211,7 @@ static int esp_output(struct xfrm_state *x, struct sk_buff *skb)
 		__be32 *udpdata32;
 		__be16 sport, dport;
 		int encap_type;
+		unsigned int len;
 
 		spin_lock_bh(&x->lock);
 		sport = encap->encap_sport;
@@ -218,10 +219,16 @@ static int esp_output(struct xfrm_state *x, struct sk_buff *skb)
 		encap_type = encap->encap_type;
 		spin_unlock_bh(&x->lock);
 
+		len = skb->len - skb_transport_offset(skb);
+		if (len + sizeof(struct iphdr) >= IP_MAX_MTU) {
+			err = -EMSGSIZE;
+			goto err_free;
+		}
+
 		uh = (struct udphdr *)esph;
 		uh->source = sport;
 		uh->dest = dport;
-		uh->len = htons(skb->len - skb_transport_offset(skb));
+		uh->len = htons(len);
 		uh->check = 0;
 
 		switch (encap_type) {
@@ -271,6 +278,7 @@ static int esp_output(struct xfrm_state *x, struct sk_buff *skb)
 	if (err == -EBUSY)
 		err = NET_XMIT_DROP;
 
+err_free:
 	kfree(tmp);
 
 error:

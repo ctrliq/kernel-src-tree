@@ -31,9 +31,11 @@ struct static_key retp_enabled_key = STATIC_KEY_INIT_FALSE;
 struct static_key ibrs_present_key = STATIC_KEY_INIT_FALSE;
 struct static_key ibrs_entry_key   = STATIC_KEY_INIT_FALSE;
 struct static_key ibrs_exit_key    = STATIC_KEY_INIT_FALSE;
+struct static_key ibpb_enabled_key = STATIC_KEY_INIT_FALSE;
 EXPORT_SYMBOL(ssbd_userset_key);
 EXPORT_SYMBOL(retp_enabled_key);
 EXPORT_SYMBOL(ibrs_present_key);
+EXPORT_SYMBOL(ibpb_enabled_key);
 
 /*
  * The vendor and possibly platform specific bits which can be modified in
@@ -261,6 +263,12 @@ recheck:
 		goto recheck;
 }
 
+static void set_spec_ctrl_ibpb(bool enable)
+{
+	if (boot_cpu_has(X86_FEATURE_IBPB))
+		set_static_key(&ibpb_enabled_key, enable);
+}
+
 /*
  * The following values are written to IBRS on kernel entry/exit:
  *
@@ -273,18 +281,21 @@ recheck:
 static void set_spec_ctrl_pcp_ibrs(void)
 {
 	set_spec_ctrl_pcp(true, false);
+	set_spec_ctrl_ibpb(true);
 	ibrs_mode = IBRS_ENABLED;
 }
 
 static void set_spec_ctrl_pcp_ibrs_always(void)
 {
 	set_spec_ctrl_pcp(true, true);
+	set_spec_ctrl_ibpb(true);
 	ibrs_mode = IBRS_ENABLED_ALWAYS;
 }
 
 static void set_spec_ctrl_pcp_ibrs_user(void)
 {
 	set_spec_ctrl_pcp(false, true);
+	set_spec_ctrl_ibpb(true);
 	ibrs_mode = IBRS_ENABLED_USER;
 }
 
@@ -292,6 +303,8 @@ void clear_spec_ctrl_pcp(void)
 {
 	ibrs_mode = IBRS_DISABLED;
 	set_spec_ctrl_pcp(false, false);
+	if (!static_key_enabled(&retp_enabled_key))
+		set_spec_ctrl_ibpb(false);
 }
 
 static void sync_all_cpus_spec_ctrl(void)
@@ -332,7 +345,14 @@ static void sync_all_cpus_ibp(bool enable)
 
 static void set_spec_ctrl_retp(bool enable)
 {
+	/*
+	 * Make sure that IBPB is enabled if either IBRS or retpoline
+	 * is enabled. ibrs_mode should be properly set before calling
+	 * set_spec_ctrl_retp().
+	 */
 	set_static_key(&retp_enabled_key, enable);
+	if (enable || (ibrs_mode == IBRS_DISABLED))
+		set_spec_ctrl_ibpb(enable);
 }
 
 static void spec_ctrl_disable_all(void)
@@ -343,6 +363,7 @@ static void spec_ctrl_disable_all(void)
 		WRITE_ONCE(per_cpu(spec_ctrl_pcp.enabled, cpu), 0);
 
 	set_spec_ctrl_retp(false);
+	set_spec_ctrl_ibpb(false);
 }
 
 static int __init noibrs(char *str)
@@ -384,6 +405,7 @@ void spec_ctrl_enable_ibrs_enhanced(void)
 {
 	ibrs_mode = IBRS_ENHANCED;
 	set_spec_ctrl_pcp(true, true);
+	set_spec_ctrl_ibpb(true);
 }
 
 bool spec_ctrl_force_enable_ibrs(void)

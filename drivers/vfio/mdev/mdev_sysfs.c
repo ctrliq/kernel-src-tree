@@ -1,13 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * File attributes for Mediated devices
  *
  * Copyright (c) 2016, NVIDIA CORPORATION. All rights reserved.
  *     Author: Neo Jia <cjia@nvidia.com>
  *             Kirti Wankhede <kwankhede@nvidia.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
  */
 
 #include <linux/sysfs.h>
@@ -225,15 +222,6 @@ create_err:
 	return ret;
 }
 
-static void remove_callback(struct device *dev)
-{
-	int ret;
-
-	ret = mdev_device_remove(dev, false);
-	if (ret)
-		dev_info(dev, "Unable to remove device: %d\n",ret);
-}
-
 static ssize_t remove_store(struct device *dev, struct device_attribute *attr,
 			    const char *buf, size_t count)
 {
@@ -242,11 +230,12 @@ static ssize_t remove_store(struct device *dev, struct device_attribute *attr,
 	if (kstrtoul(buf, 0, &val) < 0)
 		return -EINVAL;
 
-	if (val) {
-		int ret = device_schedule_callback(dev, remove_callback);
+	if (val && device_remove_file_self(dev, attr)) {
+		int ret;
 
+		ret = mdev_device_remove(dev);
 		if (ret)
-			count = ret;
+			return ret;
 	}
 
 	return count;

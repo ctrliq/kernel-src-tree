@@ -192,6 +192,10 @@ int bio_integrity_enabled(struct bio *bio)
 	if (bio_integrity(bio))
 		return 0;
 
+	/* discard is recognized as WRITE, so bypass discard now */
+	if (!bio_has_data(bio))
+		return 0;
+
 	return bdev_integrity_enabled(bio->bi_bdev, bio_data_dir(bio));
 }
 EXPORT_SYMBOL(bio_integrity_enabled);

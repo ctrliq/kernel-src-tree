@@ -1,7 +1,7 @@
 /*******************************************************************
  * This file is part of the Emulex Linux Device Driver for         *
  * Fibre Channel Host Bus Adapters.                                *
- * Copyright (C) 2017-2018 Broadcom. All Rights Reserved. The term *
+ * Copyright (C) 2017-2020 Broadcom. All Rights Reserved. The term *
  * “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.  *
  * Copyright (C) 2004-2016 Emulex.  All rights reserved.           *
  * EMULEX and SLI are trademarks of Emulex.                        *
@@ -5051,6 +5051,112 @@ static DEVICE_ATTR(lpfc_fcp_imax, S_IRUGO | S_IWUSR,
 LPFC_ATTR_RW(auto_imax, 1, 0, 1, "Enable Auto imax");
 
 /**
+ * lpfc_cq_max_proc_limit_store
+ *
+ * @dev: class device that is converted into a Scsi_host.
+ * @attr: device attribute, not used.
+ * @buf: string with the cq max processing limit of cqes
+ * @count: unused variable.
+ *
+ * Description:
+ * If val is in a valid range, then set value on each cq
+ *
+ * Returns:
+ * The length of the buf: if successful
+ * -ERANGE: if val is not in the valid range
+ * -EINVAL: if bad value format or intended mode is not supported.
+ **/
+static ssize_t
+lpfc_cq_max_proc_limit_store(struct device *dev, struct device_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct Scsi_Host *shost = class_to_shost(dev);
+	struct lpfc_vport *vport = (struct lpfc_vport *)shost->hostdata;
+	struct lpfc_hba *phba = vport->phba;
+	struct lpfc_queue *eq, *cq;
+	unsigned long val;
+	int i;
+
+	/* cq_max_proc_limit is only valid for SLI4 */
+	if (phba->sli_rev != LPFC_SLI_REV4)
+		return -EINVAL;
+
+	/* Sanity check on user data */
+	if (!isdigit(buf[0]))
+		return -EINVAL;
+	if (kstrtoul(buf, 0, &val))
+		return -EINVAL;
+
+	if (val < LPFC_CQ_MIN_PROC_LIMIT || val > LPFC_CQ_MAX_PROC_LIMIT)
+		return -ERANGE;
+
+	phba->cfg_cq_max_proc_limit = (uint32_t)val;
+
+	/* set the values on the cq's */
+	for (i = 0; i < phba->cfg_fcp_io_channel; i++) {
+		/* Get the EQ corresponding to the IRQ vector */
+		eq = phba->sli4_hba.hba_eq[i];
+		if (!eq)
+			continue;
+
+		list_for_each_entry(cq, &eq->child_list, list)
+			cq->max_proc_limit = min(phba->cfg_cq_max_proc_limit,
+						 cq->entry_count);
+	}
+
+	return strlen(buf);
+}
+
+/*
+ * lpfc_cq_max_proc_limit: The maximum number CQE entries processed in an
+ *   iteration of CQ processing.
+ */
+static int lpfc_cq_max_proc_limit = LPFC_CQ_DEF_MAX_PROC_LIMIT;
+module_param(lpfc_cq_max_proc_limit, int, 0644);
+MODULE_PARM_DESC(lpfc_cq_max_proc_limit,
+	    "Set the maximum number CQEs processed in an iteration of "
+	    "CQ processing");
+lpfc_param_show(cq_max_proc_limit)
+
+/**
+ * lpfc_cq_max_proc_limit_init - Set the initial cq max_proc_limit
+ * @phba: lpfc_hba pointer.
+ * @val: entry limit
+ *
+ * Description:
+ * If val is in a valid range, then initialize the adapter's maximum
+ * value.
+ *
+ * Returns:
+ *  Always returns 0 for success, even if value not always set to
+ *  requested value. If value out of range or not supported, will fall
+ *  back to default.
+ **/
+static int
+lpfc_cq_max_proc_limit_init(struct lpfc_hba *phba, int val)
+{
+	phba->cfg_cq_max_proc_limit = LPFC_CQ_DEF_MAX_PROC_LIMIT;
+
+	if (phba->sli_rev != LPFC_SLI_REV4)
+		return 0;
+
+	if (val >= LPFC_CQ_MIN_PROC_LIMIT && val <= LPFC_CQ_MAX_PROC_LIMIT) {
+		phba->cfg_cq_max_proc_limit = val;
+		return 0;
+	}
+
+	lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+			"0371 "LPFC_DRIVER_NAME"_cq_max_proc_limit: "
+			"%d out of range, using default\n",
+			phba->cfg_cq_max_proc_limit);
+
+	return 0;
+}
+
+static DEVICE_ATTR(lpfc_cq_max_proc_limit, S_IRUGO | S_IWUSR,
+		   lpfc_cq_max_proc_limit_show, lpfc_cq_max_proc_limit_store);
+
+/**
  * lpfc_state_show - Display current driver CPU affinity
  * @dev: class converted to a Scsi_host structure.
  * @attr: device attribute, not used.
@@ -5804,6 +5910,7 @@ struct device_attribute *lpfc_hba_attrs[] = {
 	&dev_attr_lpfc_nvme_embed_cmd,
 	&dev_attr_lpfc_auto_imax,
 	&dev_attr_lpfc_fcp_imax,
+	&dev_attr_lpfc_cq_max_proc_limit,
 	&dev_attr_lpfc_fcp_cpu_map,
 	&dev_attr_lpfc_fcp_io_channel,
 	&dev_attr_lpfc_suppress_rsp,
@@ -6856,6 +6963,7 @@ lpfc_get_cfgparam(struct lpfc_hba *phba)
 	lpfc_nvme_embed_cmd_init(phba, lpfc_nvme_embed_cmd);
 	lpfc_auto_imax_init(phba, lpfc_auto_imax);
 	lpfc_fcp_imax_init(phba, lpfc_fcp_imax);
+	lpfc_cq_max_proc_limit_init(phba, lpfc_cq_max_proc_limit);
 	lpfc_fcp_cpu_map_init(phba, lpfc_fcp_cpu_map);
 	lpfc_enable_hba_reset_init(phba, lpfc_enable_hba_reset);
 	lpfc_enable_hba_heartbeat_init(phba, lpfc_enable_hba_heartbeat);

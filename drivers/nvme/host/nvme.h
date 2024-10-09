@@ -82,6 +82,11 @@ enum nvme_quirks {
 	 * Ignore device provided subnqn.
 	 */
 	NVME_QUIRK_IGNORE_DEV_SUBNQN		= (1 << 8),
+
+	/*
+	 * Set maximum number of IO queues
+	 */
+	NVME_QUIRK_MAX_IO_QUEUES		= (1 << 9),
 };
 
 /*

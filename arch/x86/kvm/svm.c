@@ -44,6 +44,7 @@
 #include <asm/kvm_para.h>
 #include <asm/irq_remapping.h>
 #include <asm/nospec-branch.h>
+#include <asm/cpu_device_id.h>
 
 #include <asm/virtext.h>
 #include "trace.h"
@@ -1728,6 +1729,7 @@ static void svm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
 	u32 eax = 1;
 
 	svm->virt_spec_ctrl = 0;
+
 	if (!init_event) {
 		svm->vcpu.arch.apic_base = APIC_DEFAULT_PHYS_BASE |
 					   MSR_IA32_APICBASE_ENABLE;
@@ -1820,6 +1822,7 @@ static struct kvm_vcpu *svm_create_vcpu(struct kvm *kvm, unsigned int id)
 	init_vmcb(svm);
 
 	svm_init_osvw(&svm->vcpu);
+	svm->vcpu.arch.microcode_version = 0x01000065;
 
 	return &svm->vcpu;
 
@@ -3788,9 +3791,6 @@ static int svm_get_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 			return 1;
 
 		msr_info->data = svm->virt_spec_ctrl;
-		break;
-	case MSR_IA32_UCODE_REV:
-		msr_info->data = 0x01000065;
 		break;
 	default:
 		return kvm_get_msr_common(vcpu, msr_info);

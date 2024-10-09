@@ -183,6 +183,7 @@
 extern struct static_key retp_enabled_key;
 extern struct static_key ibrs_present_key;
 extern struct static_key ssbd_userset_key;
+extern struct static_key ibpb_enabled_key;
 
 /*
  * Special SPEC_CTRL MSR value to write the content of the spec_ctrl_pcp.
@@ -310,7 +311,7 @@ static inline bool retp_enabled_full(void)
 
 static inline bool ibpb_enabled(void)
 {
-	return static_cpu_has(X86_FEATURE_USE_IBPB);
+	return static_key_false(&ibpb_enabled_key);
 }
 
 /*

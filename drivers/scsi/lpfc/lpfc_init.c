@@ -1,7 +1,7 @@
 /*******************************************************************
  * This file is part of the Emulex Linux Device Driver for         *
  * Fibre Channel Host Bus Adapters.                                *
- * Copyright (C) 2017-2018 Broadcom. All Rights Reserved. The term *
+ * Copyright (C) 2017-2020 Broadcom. All Rights Reserved. The term *
  * “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.  *
  * Copyright (C) 2004-2016 Emulex.  All rights reserved.           *
  * EMULEX and SLI are trademarks of Emulex.                        *
@@ -10424,6 +10424,7 @@ lpfc_cpu_affinity_check(struct lpfc_hba *phba, int vectors)
 	struct cpuinfo_x86 *cpuinfo;
 #endif
 	uint8_t chann[LPFC_HBA_IO_CHAN_MAX+1];
+	u32 if_type;
 
 	/* Init cpu_map array */
 	memset(phba->sli4_hba.cpu_map, 0xff,
@@ -10625,8 +10626,11 @@ out:
 				num_io_channel, phba->sli4_hba.num_present_cpu,
 				vectors);
 
-	/* Enable using cpu affinity for scheduling */
-	phba->cfg_fcp_io_sched = LPFC_FCP_SCHED_BY_CPU;
+	/* Conditionally enable use of cpu affinity for scheduling */
+	if_type = bf_get(lpfc_sli_intf_if_type, &phba->sli4_hba.sli_intf);
+	if (if_type != LPFC_SLI_INTF_IF_TYPE_0)
+		phba->cfg_fcp_io_sched = LPFC_FCP_SCHED_BY_CPU;
+
 	return;
 }
 

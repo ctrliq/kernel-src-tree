@@ -6,6 +6,7 @@
 #include <linux/io.h>
 #include <linux/sched.h>
 #include <linux/random.h>
+#include <linux/topology.h>
 #include <asm/processor.h>
 #include <asm/apic.h>
 #include <asm/cacheinfo.h>
@@ -599,6 +600,9 @@ static void early_init_amd(struct cpuinfo_x86 *c)
 		case 0x16: bit = 33; break;
 		case 0x17: bit = 10;
 			   set_cpu_cap(c, X86_FEATURE_ZEN);
+#ifdef CONFIG_NUMA
+			   node_reclaim_distance = 32;
+#endif
 			   break;
 		default: return;
 		}

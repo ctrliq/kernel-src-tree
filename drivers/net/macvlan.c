@@ -436,7 +436,7 @@ static int macvlan_open(struct net_device *dev)
 			return 0;
 	}
 
-	err = -EBUSY;
+	err = -EADDRINUSE;
 	if (macvlan_addr_busy(vlan->port, dev->dev_addr))
 		goto out;
 
@@ -511,7 +511,7 @@ static int macvlan_set_mac_address(struct net_device *dev, void *p)
 	} else {
 		/* Rehash and update the device filters */
 		if (macvlan_addr_busy(vlan->port, addr->sa_data))
-			return -EBUSY;
+			return -EADDRINUSE;
 
 		err = dev_uc_add(lowerdev, addr->sa_data);
 		if (err)

@@ -20,16 +20,18 @@
 __kernel_clock_gettime:
 	.cfi_startproc
 	larl	%r5,_vdso_data
-	cghi	%r2,__CLOCK_REALTIME
+	cghi	%r2,__CLOCK_REALTIME_COARSE
 	je	4f
+	cghi	%r2,__CLOCK_REALTIME
+	je	5f
 	cghi	%r2,-3		/* Per-thread CPUCLOCK with PID=0, VIRT=1 */
 	je	9f
+	cghi	%r2,__CLOCK_MONOTONIC_COARSE
+	je	3f
 	cghi	%r2,__CLOCK_MONOTONIC
 	jne	12f
 
 	/* CLOCK_MONOTONIC */
-	ltgr	%r3,%r3
-	jz	3f				/* tp == NULL */
 0:	lg	%r4,__VDSO_UPD_COUNT(%r5)	/* load update counter */
 	tmll	%r4,0x0001			/* pending update ? loop */
 	jnz	0b
@@ -51,12 +53,30 @@ __kernel_clock_gettime:
 	j	1b
 2:	stg	%r0,0(%r3)			/* store tp->tv_sec */
 	stg	%r1,8(%r3)			/* store tp->tv_nsec */
-3:	lghi	%r2,0
+	lghi	%r2,0
 	br	%r14
 
+	/* CLOCK_MONOTONIC_COARSE */
+3:	lg	%r4,__VDSO_UPD_COUNT(%r5)	/* load update counter */
+	tmll	%r4,0x0001			/* pending update ? loop */
+	jnz	3b
+	lg	%r0,__VDSO_WTOM_CRS_SEC(%r5)
+	lg	%r1,__VDSO_WTOM_CRS_NSEC(%r5)
+	clg	%r4,__VDSO_UPD_COUNT(%r5)	/* check update counter */
+	jne	3b
+	j	2b
+
+	/* CLOCK_REALTIME_COARSE */
+4:	lg	%r4,__VDSO_UPD_COUNT(%r5)	/* load update counter */
+	tmll	%r4,0x0001			/* pending update ? loop */
+	jnz	4b
+	lg	%r0,__VDSO_XTIME_CRS_SEC(%r5)
+	lg	%r1,__VDSO_XTIME_CRS_NSEC(%r5)
+	clg	%r4,__VDSO_UPD_COUNT(%r5)	/* check update counter */
+	jne	4b
+	j	7f
+
 	/* CLOCK_REALTIME */
-4:	ltr	%r3,%r3				/* tp == NULL */
-	jz	8f
 5:	lg	%r4,__VDSO_UPD_COUNT(%r5)	/* load update counter */
 	tmll	%r4,0x0001			/* pending update ? loop */
 	jnz	5b
@@ -78,7 +98,7 @@ __kernel_clock_gettime:
 	j	6b
 7:	stg	%r0,0(%r3)			/* store tp->tv_sec */
 	stg	%r1,8(%r3)			/* store tp->tv_nsec */
-8:	lghi	%r2,0
+	lghi	%r2,0
 	br	%r14
 
 	/* CPUCLOCK_VIRT for this thread */

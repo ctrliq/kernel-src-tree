@@ -425,14 +425,6 @@ static void scsi_device_dev_release_usercontext(struct work_struct *work)
 	kfree(sdev->vpd_pg83);
 	kfree(sdev->vpd_pg80);
 	kfree(sdev->inquiry);
-	if (sdev->sdev_gendev.device_rh) {
-		kfree(sdev->sdev_gendev.device_rh);
-		sdev->sdev_gendev.device_rh = NULL;
-	}
-	if (sdev->sdev_dev.device_rh) {
-		kfree(sdev->sdev_dev.device_rh);
-		sdev->sdev_dev.device_rh = NULL;
-	}
 	kfree(sdev);
 
 	if (parent)

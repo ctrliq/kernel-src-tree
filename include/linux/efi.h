@@ -607,6 +607,9 @@ void efi_native_runtime_setup(void);
 #define EFI_SHIM_LOCK_GUID \
     EFI_GUID(  0x605dab50, 0xe046, 0x4300, 0xab, 0xb6, 0x3d, 0xd8, 0x10, 0xdd, 0x8b, 0x23 )
 
+#define LINUX_EFI_MOK_VARIABLE_STORE \
+    EFI_GUID(  0xc451ed2b, 0x9694, 0x45d3, 0xba, 0xba, 0xed, 0x9f, 0x89, 0x88, 0xa3, 0x89 )
+
 typedef struct {
 	efi_guid_t guid;
 	u64 table;
@@ -870,6 +873,10 @@ extern struct efi {
 	RH_KABI_EXTEND(efi_set_variable_nonblocking_t *set_variable_nonblocking)
 	/* Provide a non-blocking QueryVariableInfo() operation */
 	RH_KABI_EXTEND(efi_query_variable_info_t *query_variable_info_nonblocking)
+#ifdef CONFIG_MODULE_SIG_UEFI
+	/* Linux EFI config table with Machine Owner Key (MOK) variables */
+	RH_KABI_EXTEND(unsigned long mokvar_config)
+#endif
 } efi;
 
 extern struct mm_struct efi_mm;
@@ -900,6 +907,7 @@ extern efi_status_t efi_query_variable_store(u32 attributes,
 					     unsigned long size,
 					     bool nonblocking);
 extern void efi_find_mirror(void);
+extern bool efi_bgrt_image_remappable(u64 pa, size_t pa_size); /* RHEL7-ONLY */
 #else
 static inline void efi_late_init(void) {}
 static inline void efi_free_boot_services(void) {}
@@ -1387,4 +1395,9 @@ extern struct efi_runtime_work efi_rts_work;
 /* Workqueue to queue EFI Runtime Services */
 extern struct workqueue_struct *efi_rts_wq;
 
+#ifdef CONFIG_MODULE_SIG_UEFI
+extern void __init efi_mokvar_config_init(void);
+#else
+static inline void efi_mokvar_config_init(void) { }
+#endif
 #endif /* _LINUX_EFI_H */

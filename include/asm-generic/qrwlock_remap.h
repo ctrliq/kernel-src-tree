@@ -7,6 +7,7 @@
 typedef rwlock_t qrwlock_t;
 
 #define qread_lock(l)		read_lock(l)
+#define qread_lock_unfair(l)	read_lock(l)
 #define qread_trylock(l)	read_trylock(l)
 #define qread_unlock(l)		read_unlock(l)
 

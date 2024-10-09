@@ -32,6 +32,7 @@
 #include <linux/slab.h>
 #include <linux/crash_dump.h>
 #include <asm/asm-offsets.h>
+#include <asm/diag.h>
 #include <asm/switch_to.h>
 #include <asm/facility.h>
 #include <asm/ipl.h>
@@ -436,11 +437,14 @@ void smp_yield(void)
 
 void smp_yield_cpu(int cpu)
 {
-	if (MACHINE_HAS_DIAG9C)
+	if (MACHINE_HAS_DIAG9C) {
+		diag_stat_inc_norecursion(DIAG_STAT_X09C);
 		asm volatile("diag %0,0,0x9c"
 			     : : "d" (pcpu_devices[cpu].address));
-	else if (MACHINE_HAS_DIAG44)
+	} else if (MACHINE_HAS_DIAG44) {
+		diag_stat_inc_norecursion(DIAG_STAT_X044);
 		asm volatile("diag 0,0,0x44");
+	}
 }
 
 /*
@@ -1156,18 +1160,26 @@ static DEVICE_ATTR(idle_count, 0444, show_idle_count, NULL);
 static ssize_t show_idle_time(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
+	unsigned long long now, idle_time, idle_enter, idle_exit, in_idle;
 	struct s390_idle_data *idle = &per_cpu(s390_idle, dev->id);
-	unsigned long long now, idle_time, idle_enter, idle_exit;
 	unsigned int sequence;
 
 	do {
-		now = get_tod_clock();
 		sequence = ACCESS_ONCE(idle->sequence);
 		idle_time = ACCESS_ONCE(idle->idle_time);
 		idle_enter = ACCESS_ONCE(idle->clock_idle_enter);
 		idle_exit = ACCESS_ONCE(idle->clock_idle_exit);
 	} while ((sequence & 1) || (ACCESS_ONCE(idle->sequence) != sequence));
-	idle_time += idle_enter ? ((idle_exit ? : now) - idle_enter) : 0;
+	in_idle = 0;
+	now = get_tod_clock();
+	if (idle_enter) {
+		if (idle_exit) {
+			in_idle = idle_exit - idle_enter;
+		} else if (now > idle_enter) {
+			in_idle = now - idle_enter;
+		}
+	}
+	idle_time += in_idle;
 	return sprintf(buf, "%llu\n", idle_time >> 12);
 }
 static DEVICE_ATTR(idle_time_us, 0444, show_idle_time, NULL);

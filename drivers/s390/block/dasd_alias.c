@@ -379,14 +379,14 @@ suborder_not_supported(struct dasd_ccw_req *cqr)
 	char msg_no;
 
 	/*
-	 * intrc values ENODEV, ENOLINK and EPERM
+	 * intrc values ENODEV, EAGAIN and EPERM
 	 * will be optained from sleep_on to indicate that no
 	 * IO operation can be started
 	 */
 	if (cqr->intrc == -ENODEV)
 		return 1;
 
-	if (cqr->intrc == -ENOLINK)
+	if (cqr->intrc == -EAGAIN)
 		return 1;
 
 	if (cqr->intrc == -EPERM)

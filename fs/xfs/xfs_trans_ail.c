@@ -534,7 +534,8 @@ xfsaild(
 	long		tout = 0;	/* milliseconds */
 	unsigned int	noreclaim_flag;
 
-	noreclaim_flag = memalloc_noreclaim_save();
+	noreclaim_flag = current->flags & PF_MEMALLOC;
+	current->flags |= PF_MEMALLOC;
 	set_freezable();
 
 	while (1) {
@@ -589,7 +590,7 @@ xfsaild(
 		tout = xfsaild_push(ailp);
 	}
 
-	memalloc_noreclaim_restore(noreclaim_flag);
+	current->flags = (current->flags & ~PF_MEMALLOC) | noreclaim_flag;
 	return 0;
 }
 

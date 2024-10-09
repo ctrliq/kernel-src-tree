@@ -249,6 +249,11 @@ static inline int is_hwpoison_entry(swp_entry_t entry)
 {
 	return swp_type(entry) == SWP_HWPOISON;
 }
+
+static inline bool test_set_page_hwpoison(struct page *page)
+{
+	return TestSetPageHWPoison(page);
+}
 #else
 
 static inline swp_entry_t make_hwpoison_entry(struct page *page)
@@ -257,6 +262,11 @@ static inline swp_entry_t make_hwpoison_entry(struct page *page)
 }
 
 static inline int is_hwpoison_entry(swp_entry_t swp)
+{
+	return 0;
+}
+
+static inline bool test_set_page_hwpoison(struct page *page)
 {
 	return 0;
 }

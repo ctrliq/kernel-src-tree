@@ -297,7 +297,7 @@ cleanup:
 int
 ext4_acl_chmod(struct inode *inode)
 {
-	struct posix_acl *acl;
+	struct posix_acl *acl, *real_acl;
 	handle_t *handle;
 	int retries = 0;
 	int error;
@@ -323,13 +323,14 @@ retry:
 		ext4_std_error(inode->i_sb, error);
 		goto out;
 	}
+	real_acl = acl;
 	if (acl) {
-		error = posix_acl_update_mode(inode, &mode, &acl);
+		error = posix_acl_update_mode(inode, &mode, &real_acl);
 		if (error)
 			goto out_stop;
 		update_mode = 1;
 	}
-	error = ext4_set_acl(handle, inode, ACL_TYPE_ACCESS, acl);
+	error = ext4_set_acl(handle, inode, ACL_TYPE_ACCESS, real_acl);
 	if (!error && update_mode) {
 		inode->i_mode = mode;
 		inode->i_ctime = ext4_current_time(inode);
@@ -403,7 +404,7 @@ ext4_xattr_set_acl(struct dentry *dentry, const char *name, const void *value,
 {
 	struct inode *inode = dentry->d_inode;
 	handle_t *handle;
-	struct posix_acl *acl;
+	struct posix_acl *acl, *real_acl;
 	int error, retries = 0;
 	int update_mode = 0;
 	umode_t mode = inode->i_mode;
@@ -434,13 +435,14 @@ retry:
 		error = PTR_ERR(handle);
 		goto release_and_out;
 	}
-	if ((type == ACL_TYPE_ACCESS) && acl) {
-		error = posix_acl_update_mode(inode, &mode, &acl);
+	real_acl = acl;
+	if ((type == ACL_TYPE_ACCESS) && real_acl) {
+		error = posix_acl_update_mode(inode, &mode, &real_acl);
 		if (error)
 			goto out_stop;
 		update_mode = 1;
 	}
-	error = ext4_set_acl(handle, inode, type, acl);
+	error = ext4_set_acl(handle, inode, type, real_acl);
 	if (!error && update_mode) {
 		inode->i_mode = mode;
 		inode->i_ctime = ext4_current_time(inode);

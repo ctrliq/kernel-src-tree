@@ -67,6 +67,14 @@ void __init efi_bgrt_init(void)
 		return;
 	}
 
+	/* RHEL7-ONLY */
+	if (!efi_bgrt_image_remappable(bgrt_tab->image_address,
+				       sizeof(bmp_header))) {
+		/* All failures imply memory encryption is active */
+		pr_notice("Ignoring BGRT: can't map image header with mem_encrypt=on\n");
+		return;
+	}
+
 	image = memremap(bgrt_tab->image_address, sizeof(bmp_header), MEMREMAP_WB);
 	if (!image) {
 		pr_notice("Ignoring BGRT: failed to map image header memory\n");
@@ -86,6 +94,14 @@ void __init efi_bgrt_init(void)
 	if (!bgrt_image) {
 		pr_notice("Ignoring BGRT: failed to allocate memory for image (wanted %zu bytes)\n",
 		       bgrt_image_size);
+		return;
+	}
+
+	/* RHEL7-ONLY */
+	if (!efi_bgrt_image_remappable(bgrt_tab->image_address,
+				       bmp_header.size)) {
+		/* All failures imply memory encryption is active */
+		pr_notice("Ignoring BGRT: can't map image with mem_encrypt=on\n");
 		return;
 	}
 

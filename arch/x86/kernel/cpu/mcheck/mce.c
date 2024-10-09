@@ -117,6 +117,9 @@ static struct irq_work mce_irq_work;
 
 static void (*quirk_no_way_out)(int bank, struct mce *m, struct pt_regs *regs);
 
+/* filter false positives from panic pr_emerg */
+static int (*quirk_noprint)(struct mce *m);
+
 /*
  * CPU/chipset specific EDAC code can register a notifier call here to print
  * MCE errors in a human-readable form.
@@ -282,6 +285,9 @@ struct mca_msr_regs msr_ops = {
 
 static void __print_mce(struct mce *m)
 {
+	if (quirk_noprint && quirk_noprint(m))
+		return;
+
 	pr_emerg(HW_ERR "CPU %d: Machine Check%s: %Lx Bank %d: %016Lx\n",
 		 m->extcpu,
 		 (m->mcgstatus & MCG_STATUS_MCIP ? " Exception" : ""),
@@ -1574,6 +1580,15 @@ static void quirk_sandybridge_ifu(int bank, struct mce *m, struct pt_regs *regs)
 	m->cs = regs->cs;
 }
 
+static int quirk_haswell_noprint(struct mce *m)
+{
+	if (m->bank == 0 &&
+	    (m->status & 0xa0000000ffffffff) == 0x80000000000f0005)
+		return 1;
+
+	return 0;
+}
+
 /* Add per CPU specific workarounds here */
 static int __mcheck_cpu_apply_quirks(struct cpuinfo_x86 *c)
 {
@@ -1677,6 +1692,18 @@ static int __mcheck_cpu_apply_quirks(struct cpuinfo_x86 *c)
 
 		if (c->x86 == 6 && c->x86_model == 45)
 			quirk_no_way_out = quirk_sandybridge_ifu;
+
+		if (c->x86 == 6) {
+			switch (c->x86_model) {
+			case 0x3c: /* HSD131, HSM142, HSW131 */
+			case 0x3d: /* BDM48 */
+			case 0x45: /* HSM142 */
+			case 0x46: /* HSM142 */
+				pr_info("Detected Haswell CPU. MCE quirk HSD131, HSM142, HSW131, BDM48, or HSM142 enabled.\n");
+				quirk_noprint = quirk_haswell_noprint;
+				break;
+			}
+		}
 	}
 	if (cfg->monarch_timeout < 0)
 		cfg->monarch_timeout = 0;

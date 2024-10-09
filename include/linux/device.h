@@ -894,6 +894,7 @@ struct device_rh {
 };
 /* allocator for device_rh */
 extern void device_rh_alloc(struct device *dev);
+extern void device_rh_free(struct device *dev);
 
 static inline struct device *kobj_to_dev(struct kobject *kobj)
 {

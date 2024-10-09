@@ -2786,7 +2786,7 @@ static void handle_session(struct ceph_mds_session *session,
 	int wake = 0;
 
 	/* decode */
-	if (msg->front.iov_len != sizeof(*h))
+	if (msg->front.iov_len < sizeof(*h))
 		goto bad;
 	op = le32_to_cpu(h->op);
 	seq = le64_to_cpu(h->seq);

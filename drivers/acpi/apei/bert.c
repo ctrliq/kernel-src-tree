@@ -32,7 +32,8 @@
 #undef pr_fmt
 #define pr_fmt(fmt) "BERT: " fmt
 
-static int bert_disable;
+/* RHEL note: disabled by default, enable with bert_enable */
+static int bert_disable = 1;
 
 static void __init bert_print_all(struct acpi_bert_region *region,
 				  unsigned int region_len)
@@ -75,6 +76,14 @@ static void __init bert_print_all(struct acpi_bert_region *region,
 	}
 }
 
+static int __init setup_bert_enable(char *str)
+{
+	bert_disable = 0;
+
+	return 0;
+}
+__setup("bert_enable", setup_bert_enable);
+
 static int __init setup_bert_disable(char *str)
 {
 	bert_disable = 1;
@@ -105,7 +114,7 @@ static int __init bert_init(void)
 		return 0;
 
 	if (bert_disable) {
-		pr_info("Boot Error Record Table support is disabled.\n");
+		pr_info("Boot Error Record Table support is disabled. Enable it by using bert_enable as kernel parameter.\n");
 		return 0;
 	}
 

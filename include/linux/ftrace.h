@@ -100,6 +100,8 @@ typedef void (*ftrace_func_t)(unsigned long ip, unsigned long parent_ip,
  *            SAVE_REGS. If another ops with this flag set is already registered
  *            for any of the functions that this ops will be registered for, then
  *            this ops will fail to register or set_filter_ip.
+ * PERMANENT - Set when the ops is permanent and should not be affected by
+ *             ftrace_enabled.
  */
 enum {
 	FTRACE_OPS_FL_ENABLED			= 1 << 0,
@@ -112,6 +114,7 @@ enum {
 	FTRACE_OPS_FL_STUB			= 1 << 7,
 	FTRACE_OPS_FL_INITIALIZED		= 1 << 8,
 	FTRACE_OPS_FL_IPMODIFY			= 1 << 9,
+	FTRACE_OPS_FL_PERMANENT                 = 1 << 10,
 };
 
 struct ftrace_ops {

@@ -615,7 +615,7 @@ static void iscsi_target_do_login_rx(struct work_struct *work)
 	conn->login_kworker = current;
 	allow_signal(SIGINT);
 
-	init_timer(&login_timer);
+	init_timer_on_stack(&login_timer);
 	login_timer.expires = (get_jiffies_64() + TA_LOGIN_TIMEOUT * HZ);
 	login_timer.data = (unsigned long)conn;
 	login_timer.function = iscsi_target_login_timeout;

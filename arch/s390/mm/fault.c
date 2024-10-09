@@ -30,6 +30,7 @@
 #include <linux/uaccess.h>
 #include <linux/hugetlb.h>
 #include <asm/asm-offsets.h>
+#include <asm/diag.h>
 #include <asm/pgtable.h>
 #include <asm/irq.h>
 #include <asm/mmu_context.h>
@@ -506,6 +507,7 @@ int pfault_init(void)
 
 	if (pfault_disable)
 		return -1;
+	diag_stat_inc(DIAG_STAT_X258);
 	asm volatile(
 		"	diag	%1,%0,0x258\n"
 		"0:	j	2f\n"
@@ -527,6 +529,7 @@ void pfault_fini(void)
 
 	if (pfault_disable)
 		return;
+	diag_stat_inc(DIAG_STAT_X258);
 	asm volatile(
 		"	diag	%0,0,0x258\n"
 		"0:\n"

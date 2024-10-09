@@ -616,10 +616,13 @@ static void multipath_release_clone(struct request *clone,
 		struct dm_mpath_io *mpio = get_mpio(map_context);
 		struct pgpath *pgpath = mpio->pgpath;
 
-		if (pgpath && pgpath->pg->ps.type->end_io)
-			pgpath->pg->ps.type->end_io(&pgpath->pg->ps,
-						    &pgpath->path,
-						    mpio->nr_bytes);
+		if (pgpath) {
+			if (pgpath->pg->ps.type->end_io)
+				pgpath->pg->ps.type->end_io(&pgpath->pg->ps,
+							    &pgpath->path,
+							    mpio->nr_bytes);
+			clear_request_fn_mpio(pgpath->pg->m, map_context);
+		}
 	}
 
 	blk_mq_free_request(clone);

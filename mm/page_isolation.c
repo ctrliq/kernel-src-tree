@@ -69,6 +69,9 @@ out:
 	spin_unlock_irqrestore(&zone->lock, flags);
 	if (!ret)
 		drain_all_pages();
+	else
+		WARN_ON_ONCE(zone_idx(zone) == ZONE_MOVABLE);
+
 	return ret;
 }
 

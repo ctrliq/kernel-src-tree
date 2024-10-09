@@ -47,6 +47,7 @@
 #define TPGS_SUPPORT_LBA_DEPENDENT	0x10
 #define TPGS_SUPPORT_OFFLINE		0x40
 #define TPGS_SUPPORT_TRANSITION		0x80
+#define TPGS_SUPPORT_ALL		0xdf
 
 #define RTPG_FMT_MASK			0x70
 #define RTPG_FMT_EXT_HDR		0x10
@@ -88,6 +89,7 @@ struct alua_port_group {
 	int			tpgs;
 	int			state;
 	int			pref;
+	int			valid_states;
 	unsigned		flags; /* used for optimizing STPG */
 	unsigned char		transition_tmo;
 	unsigned long		expiry;
@@ -148,12 +150,12 @@ static void release_port_group(struct kref *kref)
 static int submit_rtpg(struct scsi_device *sdev, unsigned char *buff,
 		       int bufflen, struct scsi_sense_hdr *sshdr, int flags)
 {
-	u8 cdb[COMMAND_SIZE(MAINTENANCE_IN)];
+	u8 cdb[MAX_COMMAND_SIZE];
 	int req_flags = REQ_FAILFAST_DEV | REQ_FAILFAST_TRANSPORT |
 		REQ_FAILFAST_DRIVER;
 
 	/* Prepare the command. */
-	memset(cdb, 0x0, COMMAND_SIZE(MAINTENANCE_IN));
+	memset(cdb, 0x0, MAX_COMMAND_SIZE);
 	cdb[0] = MAINTENANCE_IN;
 	if (!(flags & ALUA_RTPG_EXT_HDR_UNSUPP))
 		cdb[1] = MI_REPORT_TARGET_PGS | MI_EXT_HDR_PARAM_FMT;
@@ -177,7 +179,7 @@ static int submit_rtpg(struct scsi_device *sdev, unsigned char *buff,
 static int submit_stpg(struct scsi_device *sdev, int group_id,
 		       struct scsi_sense_hdr *sshdr)
 {
-	u8 cdb[COMMAND_SIZE(MAINTENANCE_OUT)];
+	u8 cdb[MAX_COMMAND_SIZE];
 	unsigned char stpg_data[8];
 	int stpg_len = 8;
 	int req_flags = REQ_FAILFAST_DEV | REQ_FAILFAST_TRANSPORT |
@@ -189,7 +191,7 @@ static int submit_stpg(struct scsi_device *sdev, int group_id,
 	put_unaligned_be16(group_id, &stpg_data[6]);
 
 	/* Prepare the command. */
-	memset(cdb, 0x0, COMMAND_SIZE(MAINTENANCE_OUT));
+	memset(cdb, 0x0, MAX_COMMAND_SIZE);
 	cdb[0] = MAINTENANCE_OUT;
 	cdb[1] = MO_SET_TARGET_PGS;
 	put_unaligned_be32(stpg_len, &cdb[6]);
@@ -257,6 +259,7 @@ static struct alua_port_group *alua_alloc_pg(struct scsi_device *sdev,
 	pg->group_id = group_id;
 	pg->tpgs = tpgs;
 	pg->state = TPGS_STATE_OPTIMIZED;
+	pg->valid_states = TPGS_SUPPORT_ALL;
 	if (optimize_stpg)
 		pg->flags |= ALUA_OPTIMIZE_STPG;
 	kref_init(&pg->kref);
@@ -515,7 +518,7 @@ static int alua_rtpg(struct scsi_device *sdev, struct alua_port_group *pg)
 {
 	struct scsi_sense_hdr sense_hdr;
 	struct alua_port_group *tmp_pg;
-	int len, k, off, valid_states = 0, bufflen = ALUA_RTPG_SIZE;
+	int len, k, off, bufflen = ALUA_RTPG_SIZE;
 	unsigned char *desc, *buff;
 	unsigned err, retval;
 	unsigned int tpg_desc_tbl_off;
@@ -541,6 +544,22 @@ static int alua_rtpg(struct scsi_device *sdev, struct alua_port_group *pg)
 	retval = submit_rtpg(sdev, buff, bufflen, &sense_hdr, pg->flags);
 
 	if (retval) {
+		/*
+		 * Some (broken) implementations have a habit of returning
+		 * an error during things like firmware update etc.
+		 * But if the target only supports active/optimized there's
+		 * not much we can do; it's not that we can switch paths
+		 * or anything.
+		 * So ignore any errors to avoid spurious failures during
+		 * path failover.
+		 */
+		if ((pg->valid_states & ~TPGS_SUPPORT_OPTIMIZED) == 0) {
+			sdev_printk(KERN_INFO, sdev,
+				    "%s: ignoring rtpg result %d\n",
+				    ALUA_DH_NAME, retval);
+			kfree(buff);
+			return SCSI_DH_OK;
+		}
 		if (!scsi_sense_valid(&sense_hdr)) {
 			sdev_printk(KERN_INFO, sdev,
 				    "%s: rtpg failed, result %d\n",
@@ -648,7 +667,7 @@ static int alua_rtpg(struct scsi_device *sdev, struct alua_port_group *pg)
 					tmp_pg->pref = desc[0] >> 7;
 				}
 				if (tmp_pg == pg)
-					valid_states = desc[1];
+					tmp_pg->valid_states = desc[1];
 				spin_unlock_irqrestore(&tmp_pg->lock, flags);
 			}
 			kref_put(&tmp_pg->kref, release_port_group);
@@ -659,19 +678,19 @@ static int alua_rtpg(struct scsi_device *sdev, struct alua_port_group *pg)
  skip_rtpg:
 	spin_lock_irqsave(&pg->lock, flags);
 	if (transitioning_sense)
-		pg->state = SCSI_ACCESS_STATE_TRANSITIONING;
+		pg->state = TPGS_STATE_TRANSITIONING;
 
 	sdev_printk(KERN_INFO, sdev,
 		    "%s: port group %02x state %c %s supports %c%c%c%c%c%c%c\n",
 		    ALUA_DH_NAME, pg->group_id, print_alua_state(pg->state),
 		    pg->pref ? "preferred" : "non-preferred",
-		    valid_states&TPGS_SUPPORT_TRANSITION?'T':'t',
-		    valid_states&TPGS_SUPPORT_OFFLINE?'O':'o',
-		    valid_states&TPGS_SUPPORT_LBA_DEPENDENT?'L':'l',
-		    valid_states&TPGS_SUPPORT_UNAVAILABLE?'U':'u',
-		    valid_states&TPGS_SUPPORT_STANDBY?'S':'s',
-		    valid_states&TPGS_SUPPORT_NONOPTIMIZED?'N':'n',
-		    valid_states&TPGS_SUPPORT_OPTIMIZED?'A':'a');
+		    pg->valid_states&TPGS_SUPPORT_TRANSITION?'T':'t',
+		    pg->valid_states&TPGS_SUPPORT_OFFLINE?'O':'o',
+		    pg->valid_states&TPGS_SUPPORT_LBA_DEPENDENT?'L':'l',
+		    pg->valid_states&TPGS_SUPPORT_UNAVAILABLE?'U':'u',
+		    pg->valid_states&TPGS_SUPPORT_STANDBY?'S':'s',
+		    pg->valid_states&TPGS_SUPPORT_NONOPTIMIZED?'N':'n',
+		    pg->valid_states&TPGS_SUPPORT_OPTIMIZED?'A':'a');
 
 	switch (pg->state) {
 	case TPGS_STATE_TRANSITIONING:

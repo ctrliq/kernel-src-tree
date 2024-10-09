@@ -109,6 +109,24 @@ static inline void queued_read_lock(struct qrwlock *lock)
 }
 
 /**
+ * queued_read_lock_unfair - unfairly acquire read lock of a queue rwlock
+ * @lock : Pointer to queue rwlock structure
+ *
+ * This function should only be used sparingly to avoid lock starvation.
+ */
+static inline void queued_read_lock_unfair(struct qrwlock *lock)
+{
+	u32 cnts;
+
+	cnts = atomic_add_return(_QR_BIAS, &lock->cnts);
+	while ((cnts & _QW_WMASK) == _QW_LOCKED) {
+		/* Wait until the writer goes away */
+		cpu_relax();
+		cnts = atomic_read_acquire(&lock->cnts);
+	}
+}
+
+/**
  * queued_write_lock - acquire write lock of a queue rwlock
  * @lock : Pointer to queue rwlock structure
  */
@@ -165,5 +183,11 @@ static inline void queued_write_unlock(struct qrwlock *lock)
 
 #define arch_qread_lock_flags(lock, flags)  arch_qread_lock(lock)
 #define arch_qwrite_lock_flags(lock, flags) arch_qwrite_lock(lock)
+
+#define qread_lock_unfair(lock)	do {					\
+		preempt_disable();					\
+		rwlock_acquire_read(&(lock)->dep_map, 0, 0, _RET_IP_);	\
+		queued_read_lock_unfair(&(lock)->raw_lock);		\
+	} while (0)
 
 #endif /* __ASM_GENERIC_QRWLOCK_H */

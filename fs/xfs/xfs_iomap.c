@@ -874,7 +874,7 @@ xfs_iomap_write_unwritten(
 	resblks = XFS_DIOSTRAT_SPACE_RES(mp, 0) << 1;
 
 	/* Attach dquots so that bmbt splits are accounted correctly. */
-	error = xfs_qm_dqattach(ip);
+	error = xfs_qm_dqattach(ip, 0);
 	if (error)
 		return error;
 
@@ -893,6 +893,7 @@ xfs_iomap_write_unwritten(
 		if (error)
 			return error;
 
+		xfs_defer_init(&dfops, &firstfsb);
 		xfs_ilock(ip, XFS_ILOCK_EXCL);
 		xfs_trans_ijoin(tp, ip, 0);
 
@@ -904,7 +905,6 @@ xfs_iomap_write_unwritten(
 		/*
 		 * Modify the unwritten extent state of the buffer.
 		 */
-		xfs_defer_init(&dfops, &firstfsb);
 		nimaps = 1;
 		error = xfs_bmapi_write(tp, ip, offset_fsb, count_fsb,
 					XFS_BMAPI_CONVERT, &firstfsb, resblks,

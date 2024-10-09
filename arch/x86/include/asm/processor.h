@@ -699,7 +699,7 @@ static inline void clear_in_cr4(unsigned long mask)
 
 	mmu_cr4_features &= ~mask;
 	if (trampoline_cr4_features)
-		*trampoline_cr4_features = mmu_cr4_features;
+		*trampoline_cr4_features = mmu_cr4_features & ~X86_CR4_PCIDE;
 	cr4 = read_cr4();
 	cr4 &= ~mask;
 	write_cr4(cr4);

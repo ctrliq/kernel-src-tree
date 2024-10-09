@@ -64,6 +64,7 @@
 #include <linux/sched/rt.h>
 #include <linux/kthread.h>
 #include <linux/nmi.h>
+#include <linux/page_owner.h>
 
 #include <asm/sections.h>
 #include <asm/tlbflush.h>
@@ -974,6 +975,8 @@ static bool free_pages_prepare(struct page *page, unsigned int order)
 	if (bad)
 		return false;
 
+	reset_page_owner(page, order);
+
 	if (!PageHighMem(page)) {
 		debug_check_no_locks_freed(page_address(page),PAGE_SIZE<<order);
 		debug_check_no_obj_freed(page_address(page),
@@ -1571,6 +1574,7 @@ static int prep_new_page(struct page *page, int order, gfp_t gfp_flags)
 	if (order && (gfp_flags & __GFP_COMP))
 		prep_compound_page(page, order);
 
+	set_page_owner(page, order, gfp_flags);
 	/*
 	 * Make sure the caller of get_page_unless_zero() will see the
 	 * fully initialized page. Say, to ensure that compound_lock()
@@ -2116,6 +2120,7 @@ void free_trans_huge_page_list(struct list_head *list)
 void split_page(struct page *page, unsigned int order)
 {
 	int i;
+	gfp_t gfp_mask;
 
 	VM_BUG_ON_PAGE(PageCompound(page), page);
 	VM_BUG_ON_PAGE(!page_count(page), page);
@@ -2129,8 +2134,12 @@ void split_page(struct page *page, unsigned int order)
 		split_page(virt_to_page(page[0].shadow), order);
 #endif
 
-	for (i = 1; i < (1 << order); i++)
+	gfp_mask = get_page_owner_gfp(page);
+	set_page_owner(page, 0, gfp_mask);
+	for (i = 1; i < (1 << order); i++) {
 		set_page_refcounted(page + i);
+		set_page_owner(page + i, 0, gfp_mask);
+	}
 }
 EXPORT_SYMBOL_GPL(split_page);
 
@@ -2159,6 +2168,8 @@ static int __isolate_free_page(struct page *page, unsigned int order)
 	zone->free_area[order].nr_free--;
 	rmv_page_order(page);
 
+	set_page_owner(page, order, __GFP_MOVABLE);
+
 	/* Set the pageblock if the isolated page is at least a pageblock */
 	if (order >= pageblock_order - 1) {
 		struct page *endpage = page + (1 << order) - 1;
@@ -2169,6 +2180,7 @@ static int __isolate_free_page(struct page *page, unsigned int order)
 							  MIGRATE_MOVABLE);
 		}
 	}
+
 
 	return 1UL << order;
 }
@@ -2536,7 +2548,7 @@ static bool zone_local(struct zone *local_zone, struct zone *zone)
 static bool zone_allows_reclaim(struct zone *local_zone, struct zone *zone)
 {
 	return node_distance(zone_to_nid(local_zone), zone_to_nid(zone)) <=
-				RECLAIM_DISTANCE;
+				node_reclaim_distance;
 }
 
 #else	/* CONFIG_NUMA */
@@ -7168,7 +7180,6 @@ bool has_unmovable_pages(struct zone *zone, struct page *page, int count,
 	}
 	return false;
 unmovable:
-	WARN_ON_ONCE(zone_idx(zone) == ZONE_MOVABLE);
 	return true;
 }
 

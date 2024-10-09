@@ -266,8 +266,6 @@ static struct bio *gfs2_log_alloc_bio(struct gfs2_sbd *sdp, u64 blkno,
 	unsigned nrvecs = bio_get_nr_vecs(sb->s_bdev);
 	struct bio *bio;
 
-	BUG_ON(sdp->sd_log_bio);
-
 	while (1) {
 		bio = bio_alloc(GFP_NOIO, nrvecs);
 		if (likely(bio))
@@ -275,7 +273,7 @@ static struct bio *gfs2_log_alloc_bio(struct gfs2_sbd *sdp, u64 blkno,
 		nrvecs = max(nrvecs/2, 1U);
 	}
 
-	bio->bi_sector = blkno * (sb->s_blocksize >> 9);
+	bio->bi_sector = blkno << sdp->sd_fsb2bb_shift;
 	bio->bi_bdev = sb->s_bdev;
 	bio->bi_end_io = end_io;
 	bio->bi_private = sdp;
@@ -479,6 +477,18 @@ static void gfs2_jhead_process_page(struct gfs2_jdesc *jd, unsigned long index,
 	put_page(page); /* Once more for find_or_create_page */
 }
 
+static struct bio *gfs2_chain_bio(struct bio *prev, unsigned int nr_iovecs)
+{
+	struct bio *new;
+
+	new = bio_alloc(GFP_NOIO, nr_iovecs);
+	new->bi_bdev = prev->bi_bdev;
+	new->bi_sector = bio_end_sector(prev);
+	bio_chain(new, prev);
+	submit_bio(READ, prev);
+	return new;
+}
+
 /**
  * gfs2_find_jhead - find the head of a log
  * @jd: The journal descriptor
@@ -495,10 +505,10 @@ int gfs2_find_jhead(struct gfs2_jdesc *jd, struct gfs2_log_header_host *head,
 	struct gfs2_sbd *sdp = GFS2_SB(jd->jd_inode);
 	struct address_space *mapping = jd->jd_inode->i_mapping;
 	unsigned int block = 0, blocks_submitted = 0, blocks_read = 0;
-	unsigned int bsize = sdp->sd_sb.sb_bsize;
+	unsigned int bsize = sdp->sd_sb.sb_bsize, off = 0;
 	unsigned int bsize_shift = sdp->sd_sb.sb_bsize_shift;
 	unsigned int shift = PAGE_SHIFT - bsize_shift;
-	unsigned int readhead_blocks = BIO_MAX_PAGES << shift;
+	unsigned int max_blocks = 2 * 1024 * 1024 >> bsize_shift;
 	struct gfs2_journal_extent *je;
 	int sz, ret = 0;
 	struct bio *bio = NULL;
@@ -510,9 +520,9 @@ int gfs2_find_jhead(struct gfs2_jdesc *jd, struct gfs2_log_header_host *head,
 		gfs2_map_journal_extents(sdp, jd);
 
 	list_for_each_entry(je, &jd->extent_list, list) {
-		for (; block < je->lblock + je->blocks; block++) {
-			u64 dblock;
+		u64 dblock = je->dblock;
 
+		for (; block < je->lblock + je->blocks; block++, dblock++) {
 			if (!page) {
 				page = find_or_create_page(mapping,
 						block >> shift, GFP_NOFS);
@@ -521,34 +531,40 @@ int gfs2_find_jhead(struct gfs2_jdesc *jd, struct gfs2_log_header_host *head,
 					done = true;
 					goto out;
 				}
+				off = 0;
+			}
+
+			if (bio && (off || block < blocks_submitted + max_blocks)) {
+				sector_t sector = dblock << sdp->sd_fsb2bb_shift;
+
+				if (bio_end_sector(bio) == sector) {
+					sz = bio_add_page(bio, page, bsize, off);
+					if (sz == bsize)
+						goto block_added;
+				}
+				if (off) {
+					unsigned int blocks =
+						(PAGE_SIZE - off) >> bsize_shift;
+
+					bio = gfs2_chain_bio(bio, blocks);
+					goto add_block_to_new_bio;
+				}
 			}
 
 			if (bio) {
-				unsigned int off;
-
-				off = (block << bsize_shift) & ~PAGE_MASK;
-				sz = bio_add_page(bio, page, bsize, off);
-				if (sz == bsize) { /* block added */
-					if (off + bsize == PAGE_SIZE) {
-						page = NULL;
-						goto page_added;
-					}
-					continue;
-				}
-				blocks_submitted = block + 1;
+				blocks_submitted = block;
 				submit_bio(READ, bio);
-				bio = NULL;
 			}
 
-			dblock = je->dblock + (block - je->lblock);
 			bio = gfs2_log_alloc_bio(sdp, dblock, gfs2_end_log_read);
-			sz = bio_add_page(bio, page, bsize, 0);
-			gfs2_assert_warn(sdp, sz == bsize);
-			if (bsize == PAGE_SIZE)
+add_block_to_new_bio:
+			sz = bio_add_page(bio, page, bsize, off);
+			BUG_ON(sz != bsize);
+block_added:
+			off += bsize;
+			if (off == PAGE_SIZE)
 				page = NULL;
-
-page_added:
-			if (blocks_submitted < blocks_read + readhead_blocks) {
+			if (blocks_submitted <= blocks_read + max_blocks) {
 				/* Keep at least one bio in flight */
 				continue;
 			}
@@ -696,7 +712,7 @@ static void buf_lo_after_commit(struct gfs2_sbd *sdp, struct gfs2_trans *tr)
 
 	head = &tr->tr_buf;
 	while (!list_empty(head)) {
-		bd = list_entry(head->next, struct gfs2_bufdata, bd_list);
+		bd = list_first_entry(head, struct gfs2_bufdata, bd_list);
 		list_del_init(&bd->bd_list);
 		gfs2_unpin(sdp, bd->bd_bh, tr);
 	}
@@ -826,7 +842,7 @@ static void revoke_lo_after_commit(struct gfs2_sbd *sdp, struct gfs2_trans *tr)
 	struct gfs2_glock *gl;
 
 	while (!list_empty(head)) {
-		bd = list_entry(head->next, struct gfs2_bufdata, bd_list);
+		bd = list_first_entry(head, struct gfs2_bufdata, bd_list);
 		list_del_init(&bd->bd_list);
 		gl = bd->bd_gl;
 		atomic_dec(&gl->gl_revokes);
@@ -1006,7 +1022,7 @@ static void databuf_lo_after_commit(struct gfs2_sbd *sdp, struct gfs2_trans *tr)
 
 	head = &tr->tr_databuf;
 	while (!list_empty(head)) {
-		bd = list_entry(head->next, struct gfs2_bufdata, bd_list);
+		bd = list_first_entry(head, struct gfs2_bufdata, bd_list);
 		list_del_init(&bd->bd_list);
 		gfs2_unpin(sdp, bd->bd_bh, tr);
 	}

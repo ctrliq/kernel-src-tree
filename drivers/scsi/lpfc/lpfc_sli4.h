@@ -1,7 +1,7 @@
 /*******************************************************************
  * This file is part of the Emulex Linux Device Driver for         *
  * Fibre Channel Host Bus Adapters.                                *
- * Copyright (C) 2017-2018 Broadcom. All Rights Reserved. The term *
+ * Copyright (C) 2017-2020 Broadcom. All Rights Reserved. The term *
  * “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.     *
  * Copyright (C) 2009-2016 Emulex.  All rights reserved.           *
  * EMULEX and SLI are trademarks of Emulex.                        *
@@ -157,9 +157,13 @@ struct lpfc_queue {
 	uint32_t entry_repost;	/* Count of entries before doorbell is rung */
 #define LPFC_EQ_REPOST		8
 #define LPFC_MQ_REPOST		8
-#define LPFC_CQ_REPOST		64
+#define LPFC_CQ_REPOST		16
 #define LPFC_RQ_REPOST		64
 #define LPFC_RELEASE_NOTIFICATION_INTERVAL	32  /* For WQs */
+	uint32_t max_proc_limit; /* Queue Processing Limit */
+#define LPFC_CQ_MIN_PROC_LIMIT		64
+#define LPFC_CQ_MAX_PROC_LIMIT		LPFC_CQE_DEF_COUNT
+#define LPFC_CQ_DEF_MAX_PROC_LIMIT	256
 	uint32_t queue_id;	/* Queue ID assigned by the hardware */
 	uint32_t assoc_qid;     /* Queue ID associated with, for CQ/WQ/MQ */
 	uint32_t host_index;	/* The host's index for putting or getting */

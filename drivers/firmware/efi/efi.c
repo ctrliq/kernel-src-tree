@@ -37,6 +37,9 @@ struct efi __read_mostly efi = {
 	.runtime    = EFI_INVALID_TABLE_ADDR,
 	.config_table  = EFI_INVALID_TABLE_ADDR,
 	.esrt       = EFI_INVALID_TABLE_ADDR,
+#ifdef CONFIG_MODULE_SIG_UEFI
+	.mokvar_config = EFI_INVALID_TABLE_ADDR,
+#endif
 };
 EXPORT_SYMBOL(efi);
 
@@ -55,6 +58,9 @@ static unsigned long *efi_tables[] = {
 	&efi.runtime,
 	&efi.config_table,
 	&efi.esrt,
+#ifdef CONFIG_MODULE_SIG_UEFI
+	&efi.mokvar_config,
+#endif
 };
 
 struct kobject *efi_kobj;
@@ -351,6 +357,9 @@ static __initdata efi_config_table_type_t common_tables[] = {
 	{SMBIOS3_TABLE_GUID, "SMBIOS 3.0", &efi.smbios3},
 	{UGA_IO_PROTOCOL_GUID, "UGA", &efi.uga},
 	{EFI_SYSTEM_RESOURCE_TABLE_GUID, "ESRT", &efi.esrt},
+#ifdef CONFIG_MODULE_SIG_UEFI
+	{LINUX_EFI_MOK_VARIABLE_STORE, "MOKvar", &efi.mokvar_config},
+#endif
 	{NULL_GUID, NULL, NULL},
 };
 

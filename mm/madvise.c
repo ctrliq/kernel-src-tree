@@ -618,16 +618,24 @@ static long madvise_remove(struct vm_area_struct *vma,
 static int madvise_hwpoison(int bhv, unsigned long start, unsigned long end)
 {
 	struct page *p;
+	unsigned int order;
 	int ret = 0;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
-	for (; start < end; start += PAGE_SIZE <<
-				compound_order(compound_head(p))) {
+	for (; start < end; start += PAGE_SIZE << order) {
 		unsigned long pfn;
 		int ret = get_user_pages_fast(start, 1, 0, &p);
 		if (ret != 1)
 			return ret;
+
+		/*
+		 * When soft offlining hugepages, after migrating the page
+		 * we dissolve it, therefore in the second loop "page" will
+		 * no longer be a compound page, and order will be 0.
+		 */
+		order = compound_order(compound_head(p));
+
 		if (PageHWPoison(p)) {
 			put_page(p);
 			continue;

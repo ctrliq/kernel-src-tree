@@ -341,15 +341,9 @@ static int follow_fault_pfn(struct vm_area_struct *vma, struct mm_struct *mm,
 
 	ret = follow_pfn(vma, vaddr, pfn);
 	if (ret) {
-		bool unlocked = false;
-
 		ret = fixup_user_fault(NULL, mm, vaddr,
 				       FAULT_FLAG_REMOTE |
-				       (write_fault ?  FAULT_FLAG_WRITE : 0),
-				       &unlocked);
-		if (unlocked)
-			return -EAGAIN;
-
+				       (write_fault ?  FAULT_FLAG_WRITE : 0));
 		if (ret)
 			return ret;
 
@@ -394,14 +388,10 @@ static int vaddr_get_pfn(struct mm_struct *mm, unsigned long vaddr,
 
 	down_read(&mm->mmap_sem);
 
-retry:
 	vma = find_vma_intersection(mm, vaddr, vaddr + 1);
 
 	if (vma && vma->vm_flags & VM_PFNMAP) {
 		ret = follow_fault_pfn(vma, mm, vaddr, pfn, prot & IOMMU_WRITE);
-		if (ret == -EAGAIN)
-			goto retry;
-
 		if (!ret && !is_invalid_reserved_pfn(*pfn))
 			ret = -EFAULT;
 	}

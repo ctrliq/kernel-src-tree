@@ -555,6 +555,8 @@ struct nqe_cn {
 #define BNXT_DEFAULT_TX_RING_SIZE	511
 
 #define MAX_TPA		64
+#define MAX_TPA_P5	256
+#define MAX_TPA_SEGS_P5	0x3f
 
 #if (BNXT_PAGE_SHIFT == 16)
 #define MAX_RX_PAGES	1
@@ -830,6 +832,8 @@ struct bnxt_tpa_info {
 	((hdr_info) & 0x1ff)
 
 	u16			cfa_code; /* cfa_code in TPA start compl */
+	u8			agg_count;
+	struct rx_agg_cmp	*agg_arr;
 };
 
 struct bnxt_rx_ring_info {
@@ -1484,6 +1488,8 @@ struct bnxt {
 					       u16, void *, u8 *, dma_addr_t,
 					       unsigned int);
 
+	u16			max_tpa_v2;
+	u16			max_tpa;
 	u32			rx_buf_size;
 	u32			rx_buf_use_size;	/* useable size */
 	u16			rx_offset;
@@ -1587,6 +1593,7 @@ struct bnxt {
 	int			hw_port_stats_size;
 	u16			fw_rx_stats_ext_size;
 	u16			fw_tx_stats_ext_size;
+	u16			hw_ring_stats_size;
 	u8			pri2cos[8];
 	u8			pri2cos_valid;
 

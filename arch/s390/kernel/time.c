@@ -252,6 +252,19 @@ void update_vsyscall(struct timekeeper *tk)
 		vdso_data->wtom_clock_nsec -= nsecps;
 		vdso_data->wtom_clock_sec++;
 	}
+
+	vdso_data->xtime_coarse_sec = tk->xtime_sec;
+	vdso_data->xtime_coarse_nsec =
+		(long)(tk->tkr_mono.xtime_nsec >> tk->tkr_mono.shift);
+	vdso_data->wtom_coarse_sec =
+		vdso_data->xtime_coarse_sec + tk->wall_to_monotonic.tv_sec;
+	vdso_data->wtom_coarse_nsec =
+		vdso_data->xtime_coarse_nsec + tk->wall_to_monotonic.tv_nsec;
+	while (vdso_data->wtom_coarse_nsec >= NSEC_PER_SEC) {
+		vdso_data->wtom_coarse_nsec -= NSEC_PER_SEC;
+		vdso_data->wtom_coarse_sec++;
+	}
+
 	vdso_data->tk_mult = tk->tkr_mono.mult;
 	vdso_data->tk_shift = tk->tkr_mono.shift;
 	smp_wmb();

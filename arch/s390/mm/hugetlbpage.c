@@ -8,7 +8,6 @@
 #include <linux/mm.h>
 #include <linux/hugetlb.h>
 #include <linux/mman.h>
-#include <linux/sched/mm.h>
 #include <linux/security.h>
 
 static inline unsigned long __pte_to_rste(pte_t pte)
@@ -356,7 +355,7 @@ unsigned long hugetlb_get_unmapped_area(struct file *file, unsigned long addr,
 check_asce_limit:
 	if (addr + len > current->mm->context.asce_limit &&
 	    addr + len <= TASK_SIZE) {
-		rc = crst_table_upgrade(mm, addr + len);
+		rc = crst_table_upgrade(mm);
 		if (rc)
 			return (unsigned long) rc;
 	}

@@ -49,6 +49,8 @@
 
 #include "internal.h"
 
+extern atomic_long_t num_poisoned_pages __read_mostly;
+
 /*
  * migrate_prep() needs to be called before we start compiling a list of pages
  * to be migrated using isolate_lru_page(). If scheduling work on other CPUs is
@@ -1057,7 +1059,7 @@ out:
  */
 static int unmap_and_move_huge_page(new_page_t get_new_page,
 				unsigned long private, struct page *hpage,
-				int force, enum migrate_mode mode)
+				int force, enum migrate_mode mode, int reason)
 {
 	int rc = 0;
 	int *result = NULL;
@@ -1132,6 +1134,10 @@ out_unlock:
 out:
 	if (rc != -EAGAIN)
 		putback_active_hugepage(hpage);
+
+	if (reason == MR_MEMORY_FAILURE && !test_set_page_hwpoison(hpage))
+		atomic_long_inc(&num_poisoned_pages);
+
 	putback_active_hugepage(new_hpage);
 	if (result) {
 		if (rc)
@@ -1184,7 +1190,8 @@ int migrate_pages(struct list_head *from, new_page_t get_new_page,
 
 			if (PageHuge(page))
 				rc = unmap_and_move_huge_page(get_new_page,
-						private, page, pass > 2, mode);
+						private, page, pass > 2, mode,
+						reason);
 			else
 				rc = unmap_and_move(get_new_page, private,
 						page, pass > 2, mode, reason);

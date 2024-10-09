@@ -187,6 +187,7 @@ struct paca_struct {
 	 */
 	struct sibling_subcore_state *sibling_subcore_state;
 #endif
+	u8 ftrace_enabled;		/* Hard disable ftrace */
 
 	/* Stuff for accurate time accounting */
 	u64 user_time;			/* accumulated usermode TB ticks */

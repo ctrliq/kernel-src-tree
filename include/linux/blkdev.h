@@ -499,7 +499,11 @@ struct request_queue {
 	unsigned int		sg_reserved_size;
 	int			node;
 #ifdef CONFIG_BLK_DEV_IO_TRACE
+#ifdef __GENKSYMS__
 	struct blk_trace	*blk_trace;
+#else
+	struct blk_trace __rcu	*blk_trace;
+#endif
 #endif
 	/*
 	 * for flush operations
@@ -585,6 +589,11 @@ struct request_queue {
 	RH_KABI_EXTEND(exit_rq_fn		*exit_rq_fn)
 	RH_KABI_EXTEND(size_t			cmd_size)
 	RH_KABI_EXTEND(void			*rq_alloc_data)
+	/*
+	 * Protect concurrent access to q_usage_counter by
+	 * percpu_ref_kill() and percpu_ref_reinit().
+	 */
+	RH_KABI_EXTEND(struct mutex		mq_freeze_lock)
 };
 
 #define QUEUE_FLAG_QUEUED	1	/* uses generic tag queueing */

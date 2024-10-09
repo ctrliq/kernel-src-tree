@@ -53,6 +53,9 @@
 
 int swiotlb_force;
 
+/* set to false when devices can handle mapping failures */
+int swiotlb_panic_on_full = 1;
+
 /*
  * Used to do a quick range check in swiotlb_tbl_unmap_single and
  * swiotlb_tbl_sync_single_*, to see if the memory was in fact allocated by this
@@ -730,8 +733,12 @@ swiotlb_full(struct device *dev, size_t size, enum dma_data_direction dir,
 	 * When the mapping is small enough return a static buffer to limit
 	 * the damage, or panic when the transfer is too big.
 	 */
-	printk(KERN_ERR "DMA: Out of SW-IOMMU space for %zu bytes at "
-	       "device %s\n", size, dev ? dev_name(dev) : "?");
+	if (swiotlb_panic_on_full)
+		printk(KERN_ERR "DMA: Out of SW-IOMMU space for %zu bytes at "
+		       "device %s\n", size, dev ? dev_name(dev) : "?");
+	else
+		pr_info_once("DMA: Out of SW-IOMMU space for %zu bytes at "
+		       "device %s\n", size, dev ? dev_name(dev) : "?");
 
 	if (size <= io_tlb_overflow || !do_panic)
 		return;
@@ -771,7 +778,7 @@ dma_addr_t swiotlb_map_page(struct device *dev, struct page *page,
 	/* Oh well, have to allocate and map a bounce buffer. */
 	map = map_single(dev, phys, size, dir);
 	if (map == SWIOTLB_MAP_ERROR) {
-		swiotlb_full(dev, size, dir, 1);
+		swiotlb_full(dev, size, dir, swiotlb_panic_on_full);
 		return swiotlb_phys_to_dma(dev, io_tlb_overflow_buffer);
 	}
 

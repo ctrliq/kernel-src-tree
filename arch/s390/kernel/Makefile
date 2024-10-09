@@ -69,6 +69,8 @@ obj-y				+= runtime_instr.o cache.o
 endif
 obj-$(CONFIG_PROTECTED_VIRTUALIZATION_GUEST)	+= uv.o
 
+obj-$(CONFIG_TRACEPOINTS)	+= trace.o
+
 # vdso
 obj-$(CONFIG_64BIT)		+= vdso64/
 obj-$(CONFIG_32BIT)		+= vdso32/

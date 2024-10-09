@@ -873,7 +873,7 @@ static int rawv6_sendmsg(struct kiocb *iocb, struct sock *sk,
 
 	fl6.flowlabel = ip6_make_flowinfo(tclass, fl6.flowlabel);
 
-	dst = ip6_dst_lookup_flow(sk, &fl6, final_p);
+	dst = ip6_dst_lookup_flow(sock_net(sk), sk, &fl6, final_p);
 	if (IS_ERR(dst)) {
 		err = PTR_ERR(dst);
 		goto out;

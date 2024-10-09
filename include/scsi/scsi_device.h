@@ -191,6 +191,7 @@ struct scsi_device {
 	RH_KABI_FILL_HOLE(unsigned lun_in_cdb:1) /* Store LUN bits in CDB[1] */
 	RH_KABI_FILL_HOLE(unsigned try_vpd_pages:1)	/* attempt to read VPD pages */
 	RH_KABI_FILL_HOLE(unsigned unmap_limit_for_ws:1)	/* Use the UNMAP limit for WRITE SAME */
+	RH_KABI_FILL_HOLE(unsigned offline_already:1)	/* Device offline message logged */
 
 	atomic_t disk_events_disable_depth; /* disable depth for disk events */
 

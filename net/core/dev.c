@@ -7006,7 +7006,8 @@ int __dev_set_mtu(struct net_device *dev, int new_mtu)
 	else if (ops->ndo_change_mtu_rh74)
 		return ops->ndo_change_mtu_rh74(dev, new_mtu);
 
-	dev->mtu = new_mtu;
+	/* Pairs with all the lockless reads of dev->mtu in the stack */
+	WRITE_ONCE(dev->mtu, new_mtu);
 	return 0;
 }
 EXPORT_SYMBOL(__dev_set_mtu);

@@ -11,6 +11,8 @@
 #include <linux/bootmem.h>
 #include <linux/acpi.h>
 #include <linux/dmi.h>
+#include <linux/mem_encrypt.h>
+#include <linux/mm.h>
 #include <asm/efi.h>
 #include <asm/uv/uv.h>
 #include <asm/reboot.h>
@@ -272,6 +274,95 @@ void __init efi_free_boot_services(void)
 	}
 
 	efi_unmap_memmap();
+}
+
+/*
+ * RHEL7-ONLY
+ *
+ * Test if the specified BGRT image physical address range is,
+ * or can be made, eligible for memremap().
+ *
+ * If memory encryption is not active, memremap() can use the
+ * direct mapping and imposes no additional constraints on the
+ * pages in the physical address range. Therefore this routine
+ * returns true when that applies.
+ *
+ * However, if memory encryption is active, the direct map cannot
+ * be used for the BGRT image since the image is not encrypted and
+ * the direct map is an encrypting/decrypting mapping. Instead, a
+ * new mapping needs to be created for the BGRT image without
+ * encryption enabled. The creation of a such a new mapping imposes
+ * the additional requirement that the pages within that range must
+ * have been previously marked as reserved.
+ *
+ * If memory encryption is active, this routine expects that the
+ * BGRT image is within an EFI boot services data or code memory
+ * range which has already been marked as needed at runtime.
+ * If that's the case, this routine can safely mark the pages
+ * within the specified physical memory range as reserved and
+ * returns true. Otherwise, it returns false.
+ *
+ * This routine must be called after efi_reserve_boot_services()
+ * and before efi_free_boot_services(). It is patterned after
+ * efi_free_boot_services().
+ */
+bool __init efi_bgrt_image_remappable(u64 pa, size_t pa_size)
+{
+	void *p;
+
+	/*
+	 * The direct map can be used for the BGRT image by
+	 * memremap() when memory encryption is not active.
+	 */
+	if (!mem_encrypt_active())
+		return true;
+
+	/*
+	 * This routine must be called before efi_free_boot_services()
+	 * unmaps the EFI memory map. If called too late, just assume
+	 * that the BGRT image can't be mapped.
+	 */
+	if (memmap.map == NULL)
+		return false;
+
+	/*
+	 * Find the EFI memory descriptor which contains the physical
+	 * address of the BGRT image. That memory descriptor:
+	 * (a) Must entirely contain the pa_size range;
+	 * (b) Must be of type boot services code or data;
+	 * (c) Must be marked as needed at runtime.
+	 * If all of these are true, then efi_free_boot_services()
+	 * is not going to make this memory available for normal use.
+	 * Therefore there is no loss in explicitly marking these pages
+	 * as reserved. The pages need to be marked as reserved to be
+	 * eligible for memremap() to create a new remapping when memory
+	 * encryption is active.
+	 */
+	for (p = memmap.map; p < memmap.map_end; p += memmap.desc_size) {
+		efi_memory_desc_t *md = p;
+		unsigned long long start = md->phys_addr;
+		unsigned long long size = md->num_pages << EFI_PAGE_SHIFT;
+
+		if (pa < start || pa >= (start + size))
+			continue;
+
+		if (pa + pa_size > start + size)
+			break;
+
+		if (md->type != EFI_BOOT_SERVICES_CODE &&
+		    md->type != EFI_BOOT_SERVICES_DATA)
+			break;
+
+		if (!(md->attribute & EFI_MEMORY_RUNTIME))
+			break;
+
+		reserve_bootmem_region(pa, pa + pa_size);
+
+		return true;
+	}
+
+	/* Can't guarantee that the memory range is remappable */
+	return false;
 }
 
 /*

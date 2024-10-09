@@ -243,6 +243,7 @@ static void device_release(struct kobject *kobj)
 	 * possible memory leak.
 	 */
 	devres_release_all(dev);
+	device_rh_free(dev);
 
 	if (dev->release)
 		dev->release(dev);
@@ -1080,6 +1081,16 @@ void device_rh_alloc(struct device *dev)
 }
 EXPORT_SYMBOL(device_rh_alloc);
 
+/** device_rh_free -- disassociate a device_rh from a device and free it
+ * @dev: device to disassociate from
+ */
+void device_rh_free(struct device *dev)
+{
+	kfree(dev->device_rh);
+	dev->device_rh = NULL;
+}
+EXPORT_SYMBOL(device_rh_free);
+
 /**
  * device_add - add device to device hierarchy.
  * @dev: device.
@@ -1157,7 +1168,7 @@ int device_add(struct device *dev)
 		dev->kobj.parent = kobj;
 
 	/* use parent numa_node */
-	if (parent)
+	if (parent && (dev_to_node(dev) == NUMA_NO_NODE))
 		set_dev_node(dev, dev_to_node(parent));
 
 	/* first, register with generic layer. */
@@ -1776,6 +1787,7 @@ EXPORT_SYMBOL_GPL(root_device_unregister);
 static void device_create_release(struct device *dev)
 {
 	pr_debug("device: '%s': %s\n", dev_name(dev), __func__);
+	kfree(dev->device_rh);
 	kfree(dev);
 }
 

@@ -29,6 +29,7 @@
 #include <linux/workqueue.h>
 #include <linux/cgroup.h>
 #include <scsi/sg.h>		/* for struct sg_iovec */
+#include <linux/sched/sysctl.h>
 
 #include <trace/events/block.h>
 
@@ -847,13 +848,22 @@ static void submit_bio_wait_endio(struct bio *bio, int error)
 int submit_bio_wait(int rw, struct bio *bio)
 {
 	struct submit_bio_ret ret;
+	unsigned long hang_check;
 
 	rw |= REQ_SYNC;
 	init_completion(&ret.event);
 	bio->bi_private = &ret;
 	bio->bi_end_io = submit_bio_wait_endio;
 	submit_bio(rw, bio);
-	wait_for_completion(&ret.event);
+
+	/* Prevent hang_check timer from firing at us during very long I/O */
+	hang_check = sysctl_hung_task_timeout_secs;
+	if (hang_check)
+		while (!wait_for_completion_timeout(&ret.event,
+					hang_check * (HZ/2)))
+			;
+	else
+		wait_for_completion(&ret.event);
 
 	return ret.error;
 }

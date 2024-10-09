@@ -1954,6 +1954,7 @@ static const struct target_core_fabric_ops tcm_qla2xxx_npiv_ops = {
 					tcm_qla2xxx_check_demo_write_protect,
 	.tpg_check_demo_mode_login_only	= tcm_qla2xxx_check_demo_mode_login_only,
 	.tpg_get_inst_index		= tcm_qla2xxx_tpg_get_inst_index,
+	.check_stop_free		= tcm_qla2xxx_check_stop_free,
 	.release_cmd			= tcm_qla2xxx_release_cmd,
 	.shutdown_session		= tcm_qla2xxx_shutdown_session,
 	.close_session			= tcm_qla2xxx_close_session,

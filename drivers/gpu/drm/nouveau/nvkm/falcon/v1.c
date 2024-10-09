@@ -247,7 +247,6 @@ nvkm_falcon_v1_bind_context(struct nvkm_falcon *falcon, struct nvkm_memory *ctx)
 	 * the SEC2 RTOS would begin executing.
 	 */
 	switch (falcon->owner->index) {
-	case NVKM_SUBDEV_GSP:
 	case NVKM_ENGINE_SEC2:
 		nvkm_msec(device, 10,
 			u32 irqstat = nvkm_falcon_rd32(falcon, 0x008);

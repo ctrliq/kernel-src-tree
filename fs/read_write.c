@@ -1394,6 +1394,8 @@ ssize_t vfs_copy_file_range(struct file *file_in, loff_t pos_in,
 	if (fop_out && fop_out->copy_file_range) {
 		ret = fop_out->copy_file_range(file_in, pos_in, file_out,
 						      pos_out, len, flags);
+		if (ret == -EOPNOTSUPP)
+			ret = -ENOSYS;
 	} else {
 		/* Userspace callers all understand -ENOSYS */
 		ret = -ENOSYS;
