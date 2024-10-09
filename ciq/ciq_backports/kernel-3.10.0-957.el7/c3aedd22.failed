@@ -1,0 +1,142 @@
+nvme_fc: cleanup io completion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author James Smart <jsmart2021@gmail.com>
+commit c3aedd225f8bcc3b3e61df074bc045b80542b38a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/c3aedd22.failed
+
+There was some old cold that dealt with complete_rq being called
+prior to the lldd returning the io completion. This is garbage code.
+The complete_rq routine was being called after eh_timeouts were
+called and it was due to eh_timeouts not being handled properly.
+The timeouts were fixed in prior patches so that in general, a
+timeout will initiate an abort and the reset timer restarted as
+the abort operation will take care of completing things. Given the
+reset timer restarted, the erroneous complete_rq calls were eliminated.
+
+So remove the work that was synchronizing complete_rq with io
+completion.
+
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+(cherry picked from commit c3aedd225f8bcc3b3e61df074bc045b80542b38a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/fc.c
+diff --cc drivers/nvme/host/fc.c
+index 6e7bb75ba7ba,7f51f8414b97..000000000000
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@@ -1546,60 -1535,26 +1543,61 @@@ static voi
+  nvme_fc_abort_aen_ops(struct nvme_fc_ctrl *ctrl)
+  {
+  	struct nvme_fc_fcp_op *aen_op = ctrl->aen_ops;
+ -	int i;
+ +	unsigned long flags;
+ +	int i, ret;
+  
+ -	for (i = 0; i < NVME_NR_AEN_COMMANDS; i++, aen_op++)
+ -		__nvme_fc_abort_op(ctrl, aen_op);
+ +	for (i = 0; i < NVME_FC_NR_AEN_COMMANDS; i++, aen_op++) {
+ +		if (atomic_read(&aen_op->state) != FCPOP_STATE_ACTIVE)
+ +			continue;
+ +
+ +		spin_lock_irqsave(&ctrl->lock, flags);
+ +		if (ctrl->flags & FCCTRL_TERMIO) {
+ +			ctrl->iocnt++;
+ +			aen_op->flags |= FCOP_FLAGS_TERMIO;
+ +		}
+ +		spin_unlock_irqrestore(&ctrl->lock, flags);
+ +
+ +		ret = __nvme_fc_abort_op(ctrl, aen_op);
+ +		if (ret) {
+ +			/*
+ +			 * if __nvme_fc_abort_op failed the io wasn't
+ +			 * active. Thus this call path is running in
+ +			 * parallel to the io complete. Treat as non-error.
+ +			 */
+ +
+ +			/* back out the flags/counters */
+ +			spin_lock_irqsave(&ctrl->lock, flags);
+ +			if (ctrl->flags & FCCTRL_TERMIO)
+ +				ctrl->iocnt--;
+ +			aen_op->flags &= ~FCOP_FLAGS_TERMIO;
+ +			spin_unlock_irqrestore(&ctrl->lock, flags);
+ +			return;
+ +		}
+ +	}
+  }
+  
+- static inline int
++ static inline void
+  __nvme_fc_fcpop_chk_teardowns(struct nvme_fc_ctrl *ctrl,
+ -		struct nvme_fc_fcp_op *op, int opstate)
+ +		struct nvme_fc_fcp_op *op)
+  {
+  	unsigned long flags;
+- 	bool complete_rq = false;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&ctrl->lock, flags);
+ +	if (unlikely(op->flags & FCOP_FLAGS_TERMIO)) {
+++=======
++ 	if (opstate == FCPOP_STATE_ABORTED) {
++ 		spin_lock_irqsave(&ctrl->lock, flags);
+++>>>>>>> c3aedd225f8b (nvme_fc: cleanup io completion)
+  		if (ctrl->flags & FCCTRL_TERMIO) {
+  			if (!--ctrl->iocnt)
+  				wake_up(&ctrl->ioabort_wait);
+  		}
+++<<<<<<< HEAD
+++=======
++ 		spin_unlock_irqrestore(&ctrl->lock, flags);
+++>>>>>>> c3aedd225f8b (nvme_fc: cleanup io completion)
+  	}
+- 	if (op->flags & FCOP_FLAGS_RELEASED)
+- 		complete_rq = true;
+- 	else
+- 		op->flags |= FCOP_FLAGS_COMPLETE;
+- 	spin_unlock_irqrestore(&ctrl->lock, flags);
+- 
+- 	return complete_rq;
+  }
+  
+  static void
+@@@ -1736,13 -1693,11 +1734,18 @@@ done
+  	if (status &&
+  	    (blk_queue_dying(rq->q) ||
+  	     ctrl->ctrl.state == NVME_CTRL_NEW ||
+ -	     ctrl->ctrl.state == NVME_CTRL_CONNECTING))
+ +	     ctrl->ctrl.state == NVME_CTRL_RECONNECTING))
+  		status |= cpu_to_le16(NVME_SC_DNR << 1);
+  
+++<<<<<<< HEAD
+ +	if (__nvme_fc_fcpop_chk_teardowns(ctrl, op))
+ +		__nvme_fc_final_op_cleanup(rq);
+ +	else
+ +		nvme_end_request(rq, status, result);
+++=======
++ 	__nvme_fc_fcpop_chk_teardowns(ctrl, op, opstate);
++ 	nvme_end_request(rq, status, result);
+++>>>>>>> c3aedd225f8b (nvme_fc: cleanup io completion)
+  
+  check_error:
+  	if (terminate_assoc)
+@@@ -2411,8 -2390,6 +2414,11 @@@ nvme_fc_complete_rq(struct request *rq
+  	struct nvme_fc_ctrl *ctrl = op->ctrl;
+  
+  	atomic_set(&op->state, FCPOP_STATE_IDLE);
+++<<<<<<< HEAD
+ +	op->flags &= ~(FCOP_FLAGS_TERMIO | FCOP_FLAGS_RELEASED |
+ +			FCOP_FLAGS_COMPLETE);
+++=======
+++>>>>>>> c3aedd225f8b (nvme_fc: cleanup io completion)
+  
+  	nvme_fc_unmap_data(ctrl, rq, op);
+  	nvme_complete_rq(rq);
+* Unmerged path drivers/nvme/host/fc.c
