@@ -1,0 +1,419 @@
+scsi: qla2xxx: Remove defer flag to indicate immeadiate port loss
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Himanshu Madhani <hmadhani@marvell.com>
+commit 3c75ad1d87c7d277c6174051b98757fe981d592d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/3c75ad1d.failed
+
+During cable pull test case, if the port is disconnected for time larger
+than devloss timeout, driver does not mark path offline.  In such case,
+instead of notifying SCSI-ML of loop down, driver goes into endless loop of
+device relogin because defer flag is set.
+
+With newer handling of device relogin in driver discovery, defer flag is
+now redundant. This patch removes defer flag and cleans up code handling
+port lost indication to SCSI-ML.
+
+Link: https://lore.kernel.org/r/20191217220617.28084-2-hmadhani@marvell.com
+	Signed-off-by: Quinn Tran <qtran@marvell.com>
+	Signed-off-by: Himanshu Madhani <hmadhani@marvell.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 3c75ad1d87c7d277c6174051b98757fe981d592d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_os.c
+diff --cc drivers/scsi/qla2xxx/qla_os.c
+index b6160b2a5405,936036375f73..000000000000
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@@ -1135,9 -1108,17 +1135,15 @@@ static inline int test_fcport_count(scs
+  void
+  qla2x00_wait_for_sess_deletion(scsi_qla_host_t *vha)
+  {
+++<<<<<<< HEAD
+ +	qla2x00_mark_all_devices_lost(vha, 0);
+++=======
++ 	u8 i;
++ 
++ 	qla2x00_mark_all_devices_lost(vha);
+++>>>>>>> 3c75ad1d87c7 (scsi: qla2xxx: Remove defer flag to indicate immeadiate port loss)
+  
+ -	for (i = 0; i < 10; i++) {
+ -		if (wait_event_timeout(vha->fcport_waitQ,
+ -		    test_fcport_count(vha), HZ) > 0)
+ -			break;
+ -	}
+ -
+ -	flush_workqueue(vha->hw->wq);
+ +	wait_event_timeout(vha->fcport_waitQ, test_fcport_count(vha), 10*HZ);
+  }
+  
+  /*
+@@@ -6933,6 -6833,78 +6916,81 @@@ qla2x00_release_firmware(void
+  	mutex_unlock(&qla_fw_lock);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void qla_pci_error_cleanup(scsi_qla_host_t *vha)
++ {
++ 	struct qla_hw_data *ha = vha->hw;
++ 	scsi_qla_host_t *base_vha = pci_get_drvdata(ha->pdev);
++ 	struct qla_qpair *qpair = NULL;
++ 	struct scsi_qla_host *vp;
++ 	fc_port_t *fcport;
++ 	int i;
++ 	unsigned long flags;
++ 
++ 	ha->chip_reset++;
++ 
++ 	ha->base_qpair->chip_reset = ha->chip_reset;
++ 	for (i = 0; i < ha->max_qpairs; i++) {
++ 		if (ha->queue_pair_map[i])
++ 			ha->queue_pair_map[i]->chip_reset =
++ 			    ha->base_qpair->chip_reset;
++ 	}
++ 
++ 	/* purge MBox commands */
++ 	if (atomic_read(&ha->num_pend_mbx_stage3)) {
++ 		clear_bit(MBX_INTR_WAIT, &ha->mbx_cmd_flags);
++ 		complete(&ha->mbx_intr_comp);
++ 	}
++ 
++ 	i = 0;
++ 
++ 	while (atomic_read(&ha->num_pend_mbx_stage3) ||
++ 	    atomic_read(&ha->num_pend_mbx_stage2) ||
++ 	    atomic_read(&ha->num_pend_mbx_stage1)) {
++ 		msleep(20);
++ 		i++;
++ 		if (i > 50)
++ 			break;
++ 	}
++ 
++ 	ha->flags.purge_mbox = 0;
++ 
++ 	mutex_lock(&ha->mq_lock);
++ 	list_for_each_entry(qpair, &base_vha->qp_list, qp_list_elem)
++ 		qpair->online = 0;
++ 	mutex_unlock(&ha->mq_lock);
++ 
++ 	qla2x00_mark_all_devices_lost(vha);
++ 
++ 	spin_lock_irqsave(&ha->vport_slock, flags);
++ 	list_for_each_entry(vp, &ha->vp_list, list) {
++ 		atomic_inc(&vp->vref_count);
++ 		spin_unlock_irqrestore(&ha->vport_slock, flags);
++ 		qla2x00_mark_all_devices_lost(vp);
++ 		spin_lock_irqsave(&ha->vport_slock, flags);
++ 		atomic_dec(&vp->vref_count);
++ 	}
++ 	spin_unlock_irqrestore(&ha->vport_slock, flags);
++ 
++ 	/* Clear all async request states across all VPs. */
++ 	list_for_each_entry(fcport, &vha->vp_fcports, list)
++ 		fcport->flags &= ~(FCF_LOGIN_NEEDED | FCF_ASYNC_SENT);
++ 
++ 	spin_lock_irqsave(&ha->vport_slock, flags);
++ 	list_for_each_entry(vp, &ha->vp_list, list) {
++ 		atomic_inc(&vp->vref_count);
++ 		spin_unlock_irqrestore(&ha->vport_slock, flags);
++ 		list_for_each_entry(fcport, &vp->vp_fcports, list)
++ 			fcport->flags &= ~(FCF_LOGIN_NEEDED | FCF_ASYNC_SENT);
++ 		spin_lock_irqsave(&ha->vport_slock, flags);
++ 		atomic_dec(&vp->vref_count);
++ 	}
++ 	spin_unlock_irqrestore(&ha->vport_slock, flags);
++ }
++ 
++ 
+++>>>>>>> 3c75ad1d87c7 (scsi: qla2xxx: Remove defer flag to indicate immeadiate port loss)
+  static pci_ers_result_t
+  qla2xxx_pci_error_detected(struct pci_dev *pdev, pci_channel_state_t state)
+  {
+diff --git a/drivers/scsi/qla2xxx/qla_gbl.h b/drivers/scsi/qla2xxx/qla_gbl.h
+index 69faea46da73..0add051fa671 100644
+--- a/drivers/scsi/qla2xxx/qla_gbl.h
++++ b/drivers/scsi/qla2xxx/qla_gbl.h
+@@ -250,8 +250,8 @@ extern scsi_qla_host_t *qla24xx_create_vhost(struct fc_vport *);
+ extern void qla2x00_sp_free_dma(void *);
+ extern char *qla2x00_get_fw_version_str(struct scsi_qla_host *, char *);
+ 
+-extern void qla2x00_mark_device_lost(scsi_qla_host_t *, fc_port_t *, int, int);
+-extern void qla2x00_mark_all_devices_lost(scsi_qla_host_t *, int);
++extern void qla2x00_mark_device_lost(scsi_qla_host_t *, fc_port_t *, int);
++extern void qla2x00_mark_all_devices_lost(scsi_qla_host_t *);
+ 
+ extern struct fw_blob *qla2x00_request_firmware(scsi_qla_host_t *);
+ 
+diff --git a/drivers/scsi/qla2xxx/qla_init.c b/drivers/scsi/qla2xxx/qla_init.c
+index c327139a9ced..e8763624198b 100644
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@ -434,7 +434,7 @@ qla2x00_async_prlo_done(struct scsi_qla_host *vha, fc_port_t *fcport,
+ 	fcport->flags &= ~FCF_ASYNC_ACTIVE;
+ 	/* Don't re-login in target mode */
+ 	if (!fcport->tgt_session)
+-		qla2x00_mark_device_lost(vha, fcport, 1, 0);
++		qla2x00_mark_device_lost(vha, fcport, 1);
+ 	qlt_logo_completion_handler(fcport, data[0]);
+ }
+ 
+@@ -2007,7 +2007,7 @@ qla24xx_handle_plogi_done_event(struct scsi_qla_host *vha, struct event_arg *ea)
+ 		if (ea->data[1] & QLA_LOGIO_LOGIN_RETRIED)
+ 			set_bit(RELOGIN_NEEDED, &vha->dpc_flags);
+ 		else
+-			qla2x00_mark_device_lost(vha, ea->fcport, 1, 0);
++			qla2x00_mark_device_lost(vha, ea->fcport, 1);
+ 		break;
+ 	case MBS_LOOP_ID_USED:
+ 		/* data[1] = IO PARAM 1 = nport ID  */
+@@ -5266,7 +5266,7 @@ skip_login:
+ 			    qla_ini_mode_enabled(vha)) &&
+ 			    atomic_read(&fcport->state) == FCS_ONLINE) {
+ 				qla2x00_mark_device_lost(vha, fcport,
+-					ql2xplogiabsentdevice, 0);
++					ql2xplogiabsentdevice);
+ 				if (fcport->loop_id != FC_NO_LOOP_ID &&
+ 				    (fcport->flags & FCF_FCP2_DEVICE) == 0 &&
+ 				    fcport->port_type != FCT_INITIATOR &&
+@@ -5942,7 +5942,7 @@ qla2x00_find_all_fabric_devs(scsi_qla_host_t *vha)
+ 			    qla_ini_mode_enabled(vha)) &&
+ 			    atomic_read(&fcport->state) == FCS_ONLINE) {
+ 				qla2x00_mark_device_lost(vha, fcport,
+-					ql2xplogiabsentdevice, 0);
++					ql2xplogiabsentdevice);
+ 				if (fcport->loop_id != FC_NO_LOOP_ID &&
+ 				    (fcport->flags & FCF_FCP2_DEVICE) == 0 &&
+ 				    fcport->port_type != FCT_INITIATOR &&
+@@ -6107,7 +6107,7 @@ qla2x00_fabric_login(scsi_qla_host_t *vha, fc_port_t *fcport,
+ 			ha->isp_ops->fabric_logout(vha, fcport->loop_id,
+ 			    fcport->d_id.b.domain, fcport->d_id.b.area,
+ 			    fcport->d_id.b.al_pa);
+-			qla2x00_mark_device_lost(vha, fcport, 1, 0);
++			qla2x00_mark_device_lost(vha, fcport, 1);
+ 
+ 			rval = 1;
+ 			break;
+@@ -6621,9 +6621,9 @@ qla2x00_quiesce_io(scsi_qla_host_t *vha)
+ 	atomic_set(&ha->loop_down_timer, LOOP_DOWN_TIME);
+ 	if (atomic_read(&vha->loop_state) != LOOP_DOWN) {
+ 		atomic_set(&vha->loop_state, LOOP_DOWN);
+-		qla2x00_mark_all_devices_lost(vha, 0);
++		qla2x00_mark_all_devices_lost(vha);
+ 		list_for_each_entry(vp, &ha->vp_list, list)
+-			qla2x00_mark_all_devices_lost(vp, 0);
++			qla2x00_mark_all_devices_lost(vp);
+ 	} else {
+ 		if (!atomic_read(&vha->loop_down_timer))
+ 			atomic_set(&vha->loop_down_timer,
+@@ -6698,14 +6698,14 @@ qla2x00_abort_isp_cleanup(scsi_qla_host_t *vha)
+ 	atomic_set(&vha->loop_down_timer, LOOP_DOWN_TIME);
+ 	if (atomic_read(&vha->loop_state) != LOOP_DOWN) {
+ 		atomic_set(&vha->loop_state, LOOP_DOWN);
+-		qla2x00_mark_all_devices_lost(vha, 0);
++		qla2x00_mark_all_devices_lost(vha);
+ 
+ 		spin_lock_irqsave(&ha->vport_slock, flags);
+ 		list_for_each_entry(vp, &ha->vp_list, list) {
+ 			atomic_inc(&vp->vref_count);
+ 			spin_unlock_irqrestore(&ha->vport_slock, flags);
+ 
+-			qla2x00_mark_all_devices_lost(vp, 0);
++			qla2x00_mark_all_devices_lost(vp);
+ 
+ 			spin_lock_irqsave(&ha->vport_slock, flags);
+ 			atomic_dec(&vp->vref_count);
+diff --git a/drivers/scsi/qla2xxx/qla_isr.c b/drivers/scsi/qla2xxx/qla_isr.c
+index 6d2e6ff88dac..4607c779daee 100644
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@ -788,7 +788,7 @@ skip_rio:
+ 		if (atomic_read(&vha->loop_state) != LOOP_DOWN) {
+ 			atomic_set(&vha->loop_state, LOOP_DOWN);
+ 			atomic_set(&vha->loop_down_timer, LOOP_DOWN_TIME);
+-			qla2x00_mark_all_devices_lost(vha, 1);
++			qla2x00_mark_all_devices_lost(vha);
+ 		}
+ 
+ 		if (vha->vp_idx) {
+@@ -861,7 +861,7 @@ skip_rio:
+ 			}
+ 
+ 			vha->device_flags |= DFLG_NO_CABLE;
+-			qla2x00_mark_all_devices_lost(vha, 1);
++			qla2x00_mark_all_devices_lost(vha);
+ 		}
+ 
+ 		if (vha->vp_idx) {
+@@ -881,7 +881,7 @@ skip_rio:
+ 		if (atomic_read(&vha->loop_state) != LOOP_DOWN) {
+ 			atomic_set(&vha->loop_state, LOOP_DOWN);
+ 			atomic_set(&vha->loop_down_timer, LOOP_DOWN_TIME);
+-			qla2x00_mark_all_devices_lost(vha, 1);
++			qla2x00_mark_all_devices_lost(vha);
+ 		}
+ 
+ 		if (vha->vp_idx) {
+@@ -924,7 +924,7 @@ skip_rio:
+ 				atomic_set(&vha->loop_down_timer,
+ 				    LOOP_DOWN_TIME);
+ 			if (!N2N_TOPO(ha))
+-				qla2x00_mark_all_devices_lost(vha, 1);
++				qla2x00_mark_all_devices_lost(vha);
+ 		}
+ 
+ 		if (vha->vp_idx) {
+@@ -953,7 +953,7 @@ skip_rio:
+ 			if (!atomic_read(&vha->loop_down_timer))
+ 				atomic_set(&vha->loop_down_timer,
+ 				    LOOP_DOWN_TIME);
+-			qla2x00_mark_all_devices_lost(vha, 1);
++			qla2x00_mark_all_devices_lost(vha);
+ 		}
+ 
+ 		if (vha->vp_idx) {
+@@ -1022,7 +1022,6 @@ skip_rio:
+ 			    "Marking port lost loopid=%04x portid=%06x.\n",
+ 			    fcport->loop_id, fcport->d_id.b24);
+ 			if (qla_ini_mode_enabled(vha)) {
+-				qla2x00_mark_device_lost(fcport->vha, fcport, 1, 1);
+ 				fcport->logout_on_delete = 0;
+ 				qlt_schedule_sess_for_deletion(fcport);
+ 			}
+@@ -1034,14 +1033,14 @@ global_port_update:
+ 				atomic_set(&vha->loop_down_timer,
+ 				    LOOP_DOWN_TIME);
+ 				vha->device_flags |= DFLG_NO_CABLE;
+-				qla2x00_mark_all_devices_lost(vha, 1);
++				qla2x00_mark_all_devices_lost(vha);
+ 			}
+ 
+ 			if (vha->vp_idx) {
+ 				atomic_set(&vha->vp_state, VP_FAILED);
+ 				fc_vport_set_state(vha->fc_vport,
+ 				    FC_VPORT_FAILED);
+-				qla2x00_mark_all_devices_lost(vha, 1);
++				qla2x00_mark_all_devices_lost(vha);
+ 			}
+ 
+ 			vha->flags.management_server_logged_in = 0;
+@@ -2743,7 +2742,6 @@ check_scsi_status:
+ 				port_state_str[atomic_read(&fcport->state)],
+ 				comp_status);
+ 
+-			qla2x00_mark_device_lost(fcport->vha, fcport, 1, 1);
+ 			qlt_schedule_sess_for_deletion(fcport);
+ 		}
+ 
+diff --git a/drivers/scsi/qla2xxx/qla_mid.c b/drivers/scsi/qla2xxx/qla_mid.c
+index 55276b65ddae..3d09124c897c 100644
+--- a/drivers/scsi/qla2xxx/qla_mid.c
++++ b/drivers/scsi/qla2xxx/qla_mid.c
+@@ -143,7 +143,7 @@ qla2x00_mark_vp_devices_dead(scsi_qla_host_t *vha)
+ 		    "Marking port dead, loop_id=0x%04x : %x.\n",
+ 		    fcport->loop_id, fcport->vha->vp_idx);
+ 
+-		qla2x00_mark_device_lost(vha, fcport, 0, 0);
++		qla2x00_mark_device_lost(vha, fcport, 0);
+ 		qla2x00_set_fcport_state(fcport, FCS_UNCONFIGURED);
+ 	}
+ }
+@@ -163,7 +163,7 @@ qla24xx_disable_vp(scsi_qla_host_t *vha)
+ 	list_for_each_entry(fcport, &vha->vp_fcports, list)
+ 		fcport->logout_on_delete = 0;
+ 
+-	qla2x00_mark_all_devices_lost(vha, 0);
++	qla2x00_mark_all_devices_lost(vha);
+ 
+ 	/* Remove port id from vp target map */
+ 	spin_lock_irqsave(&vha->hw->hardware_lock, flags);
+@@ -306,7 +306,7 @@ qla2x00_vp_abort_isp(scsi_qla_host_t *vha)
+ 	 */
+ 	if (atomic_read(&vha->loop_state) != LOOP_DOWN) {
+ 		atomic_set(&vha->loop_state, LOOP_DOWN);
+-		qla2x00_mark_all_devices_lost(vha, 0);
++		qla2x00_mark_all_devices_lost(vha);
+ 	} else {
+ 		if (!atomic_read(&vha->loop_down_timer))
+ 			atomic_set(&vha->loop_down_timer, LOOP_DOWN_TIME);
+diff --git a/drivers/scsi/qla2xxx/qla_mr.c b/drivers/scsi/qla2xxx/qla_mr.c
+index 815d22ff35f6..f9ef606292bd 100644
+--- a/drivers/scsi/qla2xxx/qla_mr.c
++++ b/drivers/scsi/qla2xxx/qla_mr.c
+@@ -1210,7 +1210,7 @@ qlafx00_find_all_targets(scsi_qla_host_t *vha,
+ 				    " Existing TGT-ID %x did not get "
+ 				    " offline event from firmware.\n",
+ 				    fcport->old_tgt_id);
+-				qla2x00_mark_device_lost(vha, fcport, 0, 0);
++				qla2x00_mark_device_lost(vha, fcport, 0);
+ 				set_bit(LOOP_RESYNC_NEEDED, &vha->dpc_flags);
+ 				kfree(new_fcport);
+ 				return rval;
+@@ -1274,7 +1274,7 @@ qlafx00_configure_all_targets(scsi_qla_host_t *vha)
+ 
+ 		if (atomic_read(&fcport->state) == FCS_DEVICE_LOST) {
+ 			if (fcport->port_type != FCT_INITIATOR)
+-				qla2x00_mark_device_lost(vha, fcport, 0, 0);
++				qla2x00_mark_device_lost(vha, fcport, 0);
+ 		}
+ 	}
+ 
+@@ -1706,7 +1706,7 @@ qlafx00_tgt_detach(struct scsi_qla_host *vha, int tgt_id)
+ 	if (!fcport)
+ 		return;
+ 
+-	qla2x00_mark_device_lost(vha, fcport, 0, 0);
++	qla2x00_mark_device_lost(vha, fcport, 0);
+ 
+ 	return;
+ }
+@@ -1740,7 +1740,7 @@ qlafx00_process_aen(struct scsi_qla_host *vha, struct qla_work_evt *evt)
+ 				set_bit(LOOP_RESYNC_NEEDED, &vha->dpc_flags);
+ 			} else if (evt->u.aenfx.mbx[2] == 2) {
+ 				vha->device_flags |= DFLG_NO_CABLE;
+-				qla2x00_mark_all_devices_lost(vha, 1);
++				qla2x00_mark_all_devices_lost(vha);
+ 			}
+ 		}
+ 		break;
+@@ -2517,7 +2517,7 @@ check_scsi_status:
+ 		    atomic_read(&fcport->state));
+ 
+ 		if (atomic_read(&fcport->state) == FCS_ONLINE)
+-			qla2x00_mark_device_lost(fcport->vha, fcport, 1, 1);
++			qla2x00_mark_device_lost(fcport->vha, fcport, 1);
+ 		break;
+ 
+ 	case CS_ABORTED:
+diff --git a/drivers/scsi/qla2xxx/qla_nx.c b/drivers/scsi/qla2xxx/qla_nx.c
+index 397226994341..af3bc1b15d01 100644
+--- a/drivers/scsi/qla2xxx/qla_nx.c
++++ b/drivers/scsi/qla2xxx/qla_nx.c
+@@ -3026,7 +3026,7 @@ qla8xxx_dev_failed_handler(scsi_qla_host_t *vha)
+ 	/* Set DEV_FAILED flag to disable timer */
+ 	vha->device_flags |= DFLG_DEV_FAILED;
+ 	qla2x00_abort_all_cmds(vha, DID_NO_CONNECT << 16);
+-	qla2x00_mark_all_devices_lost(vha, 0);
++	qla2x00_mark_all_devices_lost(vha);
+ 	vha->flags.online = 0;
+ 	vha->flags.init_done = 0;
+ }
+* Unmerged path drivers/scsi/qla2xxx/qla_os.c
+diff --git a/drivers/scsi/qla2xxx/qla_target.c b/drivers/scsi/qla2xxx/qla_target.c
+index 83be92c72fb3..4e40236c47da 100644
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@ -975,7 +975,7 @@ void qlt_free_session_done(struct work_struct *work)
+ 		sess->send_els_logo);
+ 
+ 	if (!IS_SW_RESV_ADDR(sess->d_id)) {
+-		qla2x00_mark_device_lost(vha, sess, 0, 0);
++		qla2x00_mark_device_lost(vha, sess, 0);
+ 
+ 		if (sess->send_els_logo) {
+ 			qlt_port_logo_t logo;
