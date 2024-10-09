@@ -1,0 +1,137 @@
+tcp: handle inet_csk_reqsk_queue_add() failures
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Guillaume Nault <gnault@redhat.com>
+commit 9d3e1368bb45893a75a5dfb7cd21fdebfa6b47af
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/9d3e1368.failed
+
+Commit 7716682cc58e ("tcp/dccp: fix another race at listener
+dismantle") let inet_csk_reqsk_queue_add() fail, and adjusted
+{tcp,dccp}_check_req() accordingly. However, TFO and syncookies
+weren't modified, thus leaking allocated resources on error.
+
+Contrary to tcp_check_req(), in both syncookies and TFO cases,
+we need to drop the request socket. Also, since the child socket is
+created with inet_csk_clone_lock(), we have to unlock it and drop an
+extra reference (->sk_refcount is initially set to 2 and
+inet_csk_reqsk_queue_add() drops only one ref).
+
+For TFO, we also need to revert the work done by tcp_try_fastopen()
+(with reqsk_fastopen_remove()).
+
+Fixes: 7716682cc58e ("tcp/dccp: fix another race at listener dismantle")
+	Signed-off-by: Guillaume Nault <gnault@redhat.com>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9d3e1368bb45893a75a5dfb7cd21fdebfa6b47af)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/syncookies.c
+#	net/ipv4/tcp_input.c
+diff --cc net/ipv4/syncookies.c
+index 650ced499f23,e531344611a0..000000000000
+--- a/net/ipv4/syncookies.c
++++ b/net/ipv4/syncookies.c
+@@@ -225,16 -208,26 +225,32 @@@ static inline struct sock *get_cookie_s
+  {
+  	struct inet_connection_sock *icsk = inet_csk(sk);
+  	struct sock *child;
+ -	bool own_req;
+  
+++<<<<<<< HEAD
+ +	child = icsk->icsk_af_ops->syn_recv_sock(sk, skb, req, dst);
+ +	if (child)
+ +		inet_csk_reqsk_queue_add(sk, req, child);
+ +	else
+++=======
++ 	child = icsk->icsk_af_ops->syn_recv_sock(sk, skb, req, dst,
++ 						 NULL, &own_req);
++ 	if (child) {
++ 		refcount_set(&req->rsk_refcnt, 1);
++ 		tcp_sk(child)->tsoffset = tsoff;
++ 		sock_rps_save_rxhash(child, skb);
++ 		if (!inet_csk_reqsk_queue_add(sk, req, child)) {
++ 			bh_unlock_sock(child);
++ 			sock_put(child);
++ 			child = NULL;
++ 			reqsk_put(req);
++ 		}
++ 	} else {
+++>>>>>>> 9d3e1368bb45 (tcp: handle inet_csk_reqsk_queue_add() failures)
+  		reqsk_free(req);
+ -	}
+ +
+  	return child;
+  }
+ -EXPORT_SYMBOL(tcp_get_cookie_sock);
+ +
+  
+  /*
+   * when syncookies are in effect and tcp timestamps are enabled we stored
+diff --cc net/ipv4/tcp_input.c
+index c07b8bdef70c,5def3c48870e..000000000000
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@@ -6210,19 -6487,41 +6210,50 @@@ int tcp_conn_request(struct request_soc
+  	}
+  
+  	tcp_rsk(req)->snt_isn = isn;
+ -	tcp_rsk(req)->txhash = net_tx_rndhash();
+  	tcp_openreq_init_rwin(req, sk, dst);
+ -	sk_rx_queue_set(req_to_sk(req), skb);
+ -	if (!want_cookie) {
+ -		tcp_reqsk_record_syn(sk, req, skb);
+ -		fastopen_sk = tcp_try_fastopen(sk, skb, req, &foc, dst);
+ +	fastopen = !want_cookie &&
+ +		   tcp_try_fastopen(sk, skb, req, &foc, dst);
+ +	err = af_ops->send_synack(sk, dst, &fl, req,
+ +				  skb_get_queue_mapping(skb), &foc);
+ +	if (!fastopen) {
+ +		if (err || want_cookie)
+ +			goto drop_and_free;
+ +
+ +		tcp_rsk(req)->listener = NULL;
+ +		af_ops->queue_hash_add(sk, req, TCP_TIMEOUT_INIT);
+  	}
+- 
+++<<<<<<< HEAD
+++
+++=======
++ 	if (fastopen_sk) {
++ 		af_ops->send_synack(fastopen_sk, dst, &fl, req,
++ 				    &foc, TCP_SYNACK_FASTOPEN);
++ 		/* Add the child socket directly into the accept queue */
++ 		if (!inet_csk_reqsk_queue_add(sk, req, fastopen_sk)) {
++ 			reqsk_fastopen_remove(fastopen_sk, req, false);
++ 			bh_unlock_sock(fastopen_sk);
++ 			sock_put(fastopen_sk);
++ 			reqsk_put(req);
++ 			goto drop;
++ 		}
++ 		sk->sk_data_ready(sk);
++ 		bh_unlock_sock(fastopen_sk);
++ 		sock_put(fastopen_sk);
++ 	} else {
++ 		tcp_rsk(req)->tfo_listener = false;
++ 		if (!want_cookie)
++ 			inet_csk_reqsk_queue_hash_add(sk, req,
++ 				tcp_timeout_init((struct sock *)req));
++ 		af_ops->send_synack(sk, dst, &fl, req, &foc,
++ 				    !want_cookie ? TCP_SYNACK_NORMAL :
++ 						   TCP_SYNACK_COOKIE);
++ 		if (want_cookie) {
++ 			reqsk_free(req);
++ 			return 0;
++ 		}
++ 	}
++ 	reqsk_put(req);
+++>>>>>>> 9d3e1368bb45 (tcp: handle inet_csk_reqsk_queue_add() failures)
+  	return 0;
+  
+  drop_and_release:
+* Unmerged path net/ipv4/syncookies.c
+* Unmerged path net/ipv4/tcp_input.c
