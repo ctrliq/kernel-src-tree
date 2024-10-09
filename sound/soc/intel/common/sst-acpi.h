@@ -29,7 +29,7 @@ const char *sst_acpi_find_name_from_hid(const u8 hid[ACPI_ID_LEN]);
 bool sst_acpi_find_package_from_hid(const u8 hid[ACPI_ID_LEN],
 				    struct sst_acpi_package_context *ctx);
 #else
-inline const char *sst_acpi_find_name_from_hid(const u8 hid[ACPI_ID_LEN])
+static inline const char *sst_acpi_find_name_from_hid(const u8 hid[ACPI_ID_LEN])
 {
 	return NULL;
 }
