@@ -1,0 +1,279 @@
+PCI/portdrv: Simplify PCIe feature permission checking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [pci] portdrv: Simplify PCIe feature permission checking (Jarod Wilson) [1495223]
+Rebuild_FUZZ: 96.15%
+commit-author Bjorn Helgaas <bhelgaas@google.com>
+commit 02bfeb484230dfd073148a17253aeb1717ce769c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/02bfeb48.failed
+
+Some PCIe features (AER, DPC, hotplug, PME) can be managed by either the
+platform firmware or the OS, so the host bridge driver may have to request
+permission from the platform before using them.  On ACPI systems, this is
+done by negotiate_os_control() in acpi_pci_root_add().
+
+The PCIe port driver later uses pcie_port_platform_notify() and
+pcie_port_acpi_setup() to figure out whether it can use these features.
+But all we need is a single bit for each service, so these interfaces are
+needlessly complicated.
+
+Simplify this by adding bits in the struct pci_host_bridge to show when the
+OS has permission to use each feature:
+
+  + unsigned int native_aer:1;       /* OS may use PCIe AER */
+  + unsigned int native_hotplug:1;   /* OS may use PCIe hotplug */
+  + unsigned int native_pme:1;       /* OS may use PCIe PME */
+
+These are set when we create a host bridge, and the host bridge driver can
+clear the bits corresponding to any feature the platform doesn't want us to
+use.
+
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Reviewed-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 02bfeb484230dfd073148a17253aeb1717ce769c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/pcie/Makefile
+#	drivers/pci/pcie/portdrv_core.c
+#	drivers/pci/probe.c
+#	include/linux/pci.h
+diff --cc drivers/pci/pcie/Makefile
+index b24525b3dec1,11fb633b866c..000000000000
+--- a/drivers/pci/pcie/Makefile
++++ b/drivers/pci/pcie/Makefile
+@@@ -5,8 -6,7 +5,12 @@@
+  # Build PCI Express ASPM if needed
+  obj-$(CONFIG_PCIEASPM)		+= aspm.o
+  
+++<<<<<<< HEAD
+ +pcieportdrv-y			:= portdrv_core.o portdrv_pci.o portdrv_bus.o
+ +pcieportdrv-$(CONFIG_ACPI)	+= portdrv_acpi.o
+++=======
++ pcieportdrv-y			:= portdrv_core.o portdrv_pci.o
+++>>>>>>> 02bfeb484230 (PCI/portdrv: Simplify PCIe feature permission checking)
+  
+  obj-$(CONFIG_PCIEPORTBUS)	+= pcieportdrv.o
+  
+diff --cc drivers/pci/pcie/portdrv_core.c
+index b7a5dc54a88e,5c25761cd05e..000000000000
+--- a/drivers/pci/pcie/portdrv_core.c
++++ b/drivers/pci/pcie/portdrv_core.c
+@@@ -189,20 -206,20 +189,27 @@@ static int pcie_init_service_irqs(struc
+   */
+  static int get_port_device_capability(struct pci_dev *dev)
+  {
++ 	struct pci_host_bridge *host = pci_find_host_bridge(dev->bus);
++ 	bool native;
+  	int services = 0;
+- 	int cap_mask = 0;
+  
+++<<<<<<< HEAD
+ +	cap_mask = PCIE_PORT_SERVICE_PME | PCIE_PORT_SERVICE_HP
+ +			| PCIE_PORT_SERVICE_VC | PCIE_PORT_SERVICE_DPC;
+ +	if (pci_aer_available())
+ +		cap_mask |= PCIE_PORT_SERVICE_AER;
+++=======
++ 	/*
++ 	 * If the user specified "pcie_ports=native", use the PCIe services
++ 	 * regardless of whether the platform has given us permission.  On
++ 	 * ACPI systems, this means we ignore _OSC.
++ 	 */
++ 	native = !pcie_ports_auto;
+++>>>>>>> 02bfeb484230 (PCI/portdrv: Simplify PCIe feature permission checking)
+  
+- 	if (pcie_ports_auto)
+- 		pcie_port_platform_notify(dev, &cap_mask);
+- 
+- 	/* Hot-Plug Capable */
+- 	if ((cap_mask & PCIE_PORT_SERVICE_HP) && dev->is_hotplug_bridge) {
++ 	if (dev->is_hotplug_bridge && (native || host->native_hotplug)) {
+  		services |= PCIE_PORT_SERVICE_HP;
++ 
+  		/*
+  		 * Disable hot-plug interrupts in case they have been enabled
+  		 * by the BIOS and the hot-plug service driver is not loaded.
+@@@ -220,13 -238,16 +228,25 @@@
+  		 */
+  		pci_disable_pcie_error_reporting(dev);
+  	}
+++<<<<<<< HEAD
+ +	/* VC support */
+ +	if (pci_find_ext_capability(dev, PCI_EXT_CAP_ID_VC))
+ +		services |= PCIE_PORT_SERVICE_VC;
+ +	/* Root ports are capable of generating PME too */
+ +	if ((cap_mask & PCIE_PORT_SERVICE_PME)
+ +	    && pci_pcie_type(dev) == PCI_EXP_TYPE_ROOT_PORT) {
+++=======
++ 
++ 	/*
++ 	 * Root ports are capable of generating PME too.  Root Complex
++ 	 * Event Collectors can also generate PMEs, but we don't handle
++ 	 * those yet.
++ 	 */
++ 	if (pci_pcie_type(dev) == PCI_EXP_TYPE_ROOT_PORT &&
++ 	    (native || host->native_pme)) {
+++>>>>>>> 02bfeb484230 (PCI/portdrv: Simplify PCIe feature permission checking)
+  		services |= PCIE_PORT_SERVICE_PME;
++ 
+  		/*
+  		 * Disable PME interrupt on this port in case it's been enabled
+  		 * by the BIOS (the PME service driver will enable it when
+diff --cc drivers/pci/probe.c
+index 60cc4d4c4ea4,a00de697a970..000000000000
+--- a/drivers/pci/probe.c
++++ b/drivers/pci/probe.c
+@@@ -557,7 -521,57 +557,59 @@@ static void pci_release_host_bridge_dev
+  
+  	if (bridge->release_fn)
+  		bridge->release_fn(bridge);
+ -}
+  
+++<<<<<<< HEAD
+++=======
++ static void pci_release_host_bridge_dev(struct device *dev)
++ {
++ 	devm_pci_release_host_bridge_dev(dev);
++ 	pci_free_host_bridge(to_pci_host_bridge(dev));
++ }
++ 
++ struct pci_host_bridge *pci_alloc_host_bridge(size_t priv)
++ {
++ 	struct pci_host_bridge *bridge;
++ 
++ 	bridge = kzalloc(sizeof(*bridge) + priv, GFP_KERNEL);
++ 	if (!bridge)
++ 		return NULL;
++ 
++ 	INIT_LIST_HEAD(&bridge->windows);
++ 	bridge->dev.release = pci_release_host_bridge_dev;
++ 
++ 	/*
++ 	 * We assume we can manage these PCIe features.  Some systems may
++ 	 * reserve these for use by the platform itself, e.g., an ACPI BIOS
++ 	 * may implement its own AER handling and use _OSC to prevent the
++ 	 * OS from interfering.
++ 	 */
++ 	bridge->native_aer = 1;
++ 	bridge->native_hotplug = 1;
++ 	bridge->native_pme = 1;
++ 
++ 	return bridge;
++ }
++ EXPORT_SYMBOL(pci_alloc_host_bridge);
++ 
++ struct pci_host_bridge *devm_pci_alloc_host_bridge(struct device *dev,
++ 						   size_t priv)
++ {
++ 	struct pci_host_bridge *bridge;
++ 
++ 	bridge = devm_kzalloc(dev, sizeof(*bridge) + priv, GFP_KERNEL);
++ 	if (!bridge)
++ 		return NULL;
++ 
++ 	INIT_LIST_HEAD(&bridge->windows);
++ 	bridge->dev.release = devm_pci_release_host_bridge_dev;
++ 
++ 	return bridge;
++ }
++ EXPORT_SYMBOL(devm_pci_alloc_host_bridge);
++ 
++ void pci_free_host_bridge(struct pci_host_bridge *bridge)
++ {
+++>>>>>>> 02bfeb484230 (PCI/portdrv: Simplify PCIe feature permission checking)
+  	pci_free_resource_list(&bridge->windows);
+  
+  	kfree(bridge);
+diff --cc include/linux/pci.h
+index 2d20a9a169fc,a04b7abc6b7a..000000000000
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@@ -437,12 -456,22 +437,22 @@@ static inline int pci_channel_offline(s
+  }
+  
+  struct pci_host_bridge {
+ -	struct device	dev;
+ -	struct pci_bus	*bus;		/* Root bus */
+ -	struct pci_ops	*ops;
+ -	void		*sysdata;
+ -	int		busnr;
+ +	struct device dev;
+ +	struct pci_bus *bus;		/* root bus */
+  	struct list_head windows;	/* resource_entry */
+ -	u8 (*swizzle_irq)(struct pci_dev *, u8 *); /* Platform IRQ swizzler */
+ -	int (*map_irq)(const struct pci_dev *, u8, u8);
+  	void (*release_fn)(struct pci_host_bridge *);
+++<<<<<<< HEAD
+ +	void *release_data;
+ +	unsigned int ignore_reset_delay:1;	/* for entire hierarchy */
+++=======
++ 	void		*release_data;
++ 	struct msi_controller *msi;
++ 	unsigned int	ignore_reset_delay:1;	/* For entire hierarchy */
++ 	unsigned int	no_ext_tags:1;		/* No Extended Tags */
++ 	unsigned int	native_aer:1;		/* OS may use PCIe AER */
++ 	unsigned int	native_hotplug:1;	/* OS may use PCIe hotplug */
++ 	unsigned int	native_pme:1;		/* OS may use PCIe PME */
+++>>>>>>> 02bfeb484230 (PCI/portdrv: Simplify PCIe feature permission checking)
+  	/* Resource alignment requirements */
+  	resource_size_t (*align_resource)(struct pci_dev *dev,
+  			const struct resource *res,
+diff --git a/drivers/acpi/pci_root.c b/drivers/acpi/pci_root.c
+index 4eb111ffa6b4..51cb91e69ec3 100644
+--- a/drivers/acpi/pci_root.c
++++ b/drivers/acpi/pci_root.c
+@@ -830,6 +830,7 @@ struct pci_bus *acpi_pci_root_create(struct acpi_pci_root *root,
+ 	struct acpi_device *device = root->device;
+ 	int node = acpi_get_node(device->handle);
+ 	struct pci_bus *bus;
++	struct pci_host_bridge *host_bridge;
+ 
+ 	info->root = root;
+ 	info->bridge = device;
+@@ -854,9 +855,17 @@ struct pci_bus *acpi_pci_root_create(struct acpi_pci_root *root,
+ 	if (!bus)
+ 		goto out_release_info;
+ 
++	host_bridge = to_pci_host_bridge(bus->bridge);
++	if (!(root->osc_control_set & OSC_PCI_EXPRESS_NATIVE_HP_CONTROL))
++		host_bridge->native_hotplug = 0;
++	if (!(root->osc_control_set & OSC_PCI_EXPRESS_AER_CONTROL))
++		host_bridge->native_aer = 0;
++	if (!(root->osc_control_set & OSC_PCI_EXPRESS_PME_CONTROL))
++		host_bridge->native_pme = 0;
++
+ 	pci_scan_child_bus(bus);
+-	pci_set_host_bridge_release(to_pci_host_bridge(bus->bridge),
+-				    acpi_pci_root_release_info, info);
++	pci_set_host_bridge_release(host_bridge, acpi_pci_root_release_info,
++				    info);
+ 	if (node != NUMA_NO_NODE)
+ 		dev_printk(KERN_DEBUG, &bus->dev, "on NUMA node %d\n", node);
+ 	return bus;
+* Unmerged path drivers/pci/pcie/Makefile
+diff --git a/drivers/pci/pcie/portdrv.h b/drivers/pci/pcie/portdrv.h
+index 587aef36030d..0ca625367785 100644
+--- a/drivers/pci/pcie/portdrv.h
++++ b/drivers/pci/pcie/portdrv.h
+@@ -66,15 +66,4 @@ static inline bool pcie_pme_no_msi(void) { return false; }
+ static inline void pcie_pme_interrupt_enable(struct pci_dev *dev, bool en) {}
+ #endif /* !CONFIG_PCIE_PME */
+ 
+-#ifdef CONFIG_ACPI
+-void pcie_port_acpi_setup(struct pci_dev *port, int *mask);
+-
+-static inline void pcie_port_platform_notify(struct pci_dev *port, int *mask)
+-{
+-	pcie_port_acpi_setup(port, mask);
+-}
+-#else /* !CONFIG_ACPI */
+-static inline void pcie_port_platform_notify(struct pci_dev *port, int *mask){}
+-#endif /* !CONFIG_ACPI */
+-
+ #endif /* _PORTDRV_H_ */
+* Unmerged path drivers/pci/pcie/portdrv_core.c
+* Unmerged path drivers/pci/probe.c
+* Unmerged path include/linux/pci.h
