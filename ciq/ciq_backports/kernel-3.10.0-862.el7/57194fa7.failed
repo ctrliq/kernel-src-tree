@@ -1,0 +1,170 @@
+IB/hfi1: Prevent a NULL dereference
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [infiniband] hfi1: Prevent a NULL dereference (Alex Estrin) [1535166]
+Rebuild_FUZZ: 95.52%
+commit-author Dan Carpenter <dan.carpenter@oracle.com>
+commit 57194fa763bfa1a0908f30d4c77835beaa118fcb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/57194fa7.failed
+
+In the original code, we set "fd->uctxt" to NULL and then dereference it
+which will cause an Oops.
+
+Fixes: f2a3bc00a03c ("IB/hfi1: Protect context array set/clear with spinlock")
+	Cc: <stable@vger.kernel.org> # 4.14.x
+	Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Reviewed-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 57194fa763bfa1a0908f30d4c77835beaa118fcb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/file_ops.c
+diff --cc drivers/infiniband/hw/hfi1/file_ops.c
+index 7180c3d1bfd2,1df7da47f431..000000000000
+--- a/drivers/infiniband/hw/hfi1/file_ops.c
++++ b/drivers/infiniband/hw/hfi1/file_ops.c
+@@@ -842,44 -728,108 +842,54 @@@ static u64 kvirt_to_phys(void *addr
+  	return paddr;
+  }
+  
+ -/**
+ - * complete_subctxt
+ - * @fd: valid filedata pointer
+ - *
+ - * Sub-context info can only be set up after the base context
+ - * has been completed.  This is indicated by the clearing of the
+ - * HFI1_CTXT_BASE_UINIT bit.
+ - *
+ - * Wait for the bit to be cleared, and then complete the subcontext
+ - * initialization.
+ - *
+ - */
+ -static int complete_subctxt(struct hfi1_filedata *fd)
+ +static int assign_ctxt(struct file *fp, struct hfi1_user_info *uinfo)
+  {
+ -	int ret;
+ -	unsigned long flags;
+ +	int i_minor, ret = 0;
+ +	unsigned int swmajor, swminor;
+  
+ -	/*
+ -	 * sub-context info can only be set up after the base context
+ -	 * has been completed.
+ -	 */
+ -	ret = wait_event_interruptible(
+ -		fd->uctxt->wait,
+ -		!test_bit(HFI1_CTXT_BASE_UNINIT, &fd->uctxt->event_flags));
+ -
+ -	if (test_bit(HFI1_CTXT_BASE_FAILED, &fd->uctxt->event_flags))
+ -		ret = -ENOMEM;
+ -
+ -	/* Finish the sub-context init */
+ -	if (!ret) {
+ -		fd->rec_cpu_num = hfi1_get_proc_affinity(fd->uctxt->numa_id);
+ -		ret = init_user_ctxt(fd, fd->uctxt);
+ +	swmajor = uinfo->userversion >> 16;
+ +	if (swmajor != HFI1_USER_SWMAJOR) {
+ +		ret = -ENODEV;
+ +		goto done;
+  	}
+  
+++<<<<<<< HEAD
+ +	swminor = uinfo->userversion & 0xffff;
+++=======
++ 	if (ret) {
++ 		spin_lock_irqsave(&fd->dd->uctxt_lock, flags);
++ 		__clear_bit(fd->subctxt, fd->uctxt->in_use_ctxts);
++ 		spin_unlock_irqrestore(&fd->dd->uctxt_lock, flags);
++ 		hfi1_rcd_put(fd->uctxt);
++ 		fd->uctxt = NULL;
++ 	}
+++>>>>>>> 57194fa763bf (IB/hfi1: Prevent a NULL dereference)
+  
+ -	return ret;
+ -}
+ -
+ -static int assign_ctxt(struct hfi1_filedata *fd, unsigned long arg, u32 len)
+ -{
+ -	int ret;
+ -	unsigned int swmajor;
+ -	struct hfi1_ctxtdata *uctxt = NULL;
+ -	struct hfi1_user_info uinfo;
+ -
+ -	if (fd->uctxt)
+ -		return -EINVAL;
+ -
+ -	if (sizeof(uinfo) != len)
+ -		return -EINVAL;
+ -
+ -	if (copy_from_user(&uinfo, (void __user *)arg, sizeof(uinfo)))
+ -		return -EFAULT;
+ -
+ -	swmajor = uinfo.userversion >> 16;
+ -	if (swmajor != HFI1_USER_SWMAJOR)
+ -		return -ENODEV;
+ -
+ -	if (uinfo.subctxt_cnt > HFI1_MAX_SHARED_CTXTS)
+ -		return -EINVAL;
+ -
+ -	/*
+ -	 * Acquire the mutex to protect against multiple creations of what
+ -	 * could be a shared base context.
+ -	 */
+  	mutex_lock(&hfi1_mutex);
+ -	/*
+ -	 * Get a sub context if available  (fd->uctxt will be set).
+ -	 * ret < 0 error, 0 no context, 1 sub-context found
+ -	 */
+ -	ret = find_sub_ctxt(fd, &uinfo);
+ +	/* First, lets check if we need to setup a shared context? */
+ +	if (uinfo->subctxt_cnt) {
+ +		struct hfi1_filedata *fd = fp->private_data;
+ +
+ +		ret = find_shared_ctxt(fp, uinfo);
+ +		if (ret < 0)
+ +			goto done_unlock;
+ +		if (ret) {
+ +			fd->rec_cpu_num =
+ +				hfi1_get_proc_affinity(fd->uctxt->numa_id);
+ +		}
+ +	}
+  
+  	/*
+ -	 * Allocate a base context if context sharing is not required or a
+ -	 * sub context wasn't found.
+ +	 * We execute the following block if we couldn't find a
+ +	 * shared context or if context sharing is not required.
+  	 */
+ -	if (!ret)
+ -		ret = allocate_ctxt(fd, fd->dd, &uinfo, &uctxt);
+ -
+ -	mutex_unlock(&hfi1_mutex);
+ -
+ -	/* Depending on the context type, finish the appropriate init */
+ -	switch (ret) {
+ -	case 0:
+ -		ret = setup_base_ctxt(fd, uctxt);
+ -		if (ret)
+ -			deallocate_ctxt(uctxt);
+ -		break;
+ -	case 1:
+ -		ret = complete_subctxt(fd);
+ -		break;
+ -	default:
+ -		break;
+ +	if (!ret) {
+ +		i_minor = iminor(file_inode(fp)) - HFI1_USER_MINOR_BASE;
+ +		ret = get_user_context(fp, uinfo, i_minor);
+  	}
+ -
+ +done_unlock:
+ +	mutex_unlock(&hfi1_mutex);
+ +done:
+  	return ret;
+  }
+  
+* Unmerged path drivers/infiniband/hw/hfi1/file_ops.c
