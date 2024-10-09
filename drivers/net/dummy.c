@@ -135,6 +135,9 @@ static void dummy_setup(struct net_device *dev)
 	dev->features	|= NETIF_F_SG | NETIF_F_FRAGLIST | NETIF_F_TSO;
 	dev->features	|= NETIF_F_HW_CSUM | NETIF_F_HIGHDMA | NETIF_F_LLTX;
 	eth_hw_addr_random(dev);
+
+	dev->min_mtu = 0;
+	dev->max_mtu = ETH_MAX_MTU;
 }
 
 static int dummy_validate(struct nlattr *tb[], struct nlattr *data[])
