@@ -1,0 +1,299 @@
+nvme: move AER handling to common code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [nvme] move AER handling to common code (David Milburn) [1384066]
+Rebuild_FUZZ: 91.43%
+commit-author Christoph Hellwig <hch@lst.de>
+commit f866fc4282a81673ef973ad54c68235a3263b42e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f866fc42.failed
+
+The transport driver still needs to do the actual submission, but all the
+higher level code can be shared.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit f866fc4282a81673ef973ad54c68235a3263b42e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/nvme.h
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/core.c
+index b3ed604adce1,3cf366ab66e9..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -1371,7 -1582,56 +1371,55 @@@ void nvme_remove_namespaces(struct nvme
+  	list_for_each_entry_safe(ns, next, &ctrl->namespaces, list)
+  		nvme_ns_remove(ns);
+  }
+ -EXPORT_SYMBOL_GPL(nvme_remove_namespaces);
+  
++ static void nvme_async_event_work(struct work_struct *work)
++ {
++ 	struct nvme_ctrl *ctrl =
++ 		container_of(work, struct nvme_ctrl, async_event_work);
++ 
++ 	spin_lock_irq(&ctrl->lock);
++ 	while (ctrl->event_limit > 0) {
++ 		int aer_idx = --ctrl->event_limit;
++ 
++ 		spin_unlock_irq(&ctrl->lock);
++ 		ctrl->ops->submit_async_event(ctrl, aer_idx);
++ 		spin_lock_irq(&ctrl->lock);
++ 	}
++ 	spin_unlock_irq(&ctrl->lock);
++ }
++ 
++ void nvme_complete_async_event(struct nvme_ctrl *ctrl,
++ 		struct nvme_completion *cqe)
++ {
++ 	u16 status = le16_to_cpu(cqe->status) >> 1;
++ 	u32 result = le32_to_cpu(cqe->result);
++ 
++ 	if (status == NVME_SC_SUCCESS || status == NVME_SC_ABORT_REQ) {
++ 		++ctrl->event_limit;
++ 		schedule_work(&ctrl->async_event_work);
++ 	}
++ 
++ 	if (status != NVME_SC_SUCCESS)
++ 		return;
++ 
++ 	switch (result & 0xff07) {
++ 	case NVME_AER_NOTICE_NS_CHANGED:
++ 		dev_info(ctrl->device, "rescanning\n");
++ 		nvme_queue_scan(ctrl);
++ 		break;
++ 	default:
++ 		dev_warn(ctrl->device, "async event result %08x\n", result);
++ 	}
++ }
++ EXPORT_SYMBOL_GPL(nvme_complete_async_event);
++ 
++ void nvme_queue_async_events(struct nvme_ctrl *ctrl)
++ {
++ 	ctrl->event_limit = NVME_NR_AERS;
++ 	schedule_work(&ctrl->async_event_work);
++ }
++ EXPORT_SYMBOL_GPL(nvme_queue_async_events);
++ 
+  static DEFINE_IDA(nvme_instance_ida);
+  
+  static int nvme_set_instance(struct nvme_ctrl *ctrl)
+@@@ -1402,7 -1662,11 +1450,15 @@@ static void nvme_release_instance(struc
+  }
+  
+  void nvme_uninit_ctrl(struct nvme_ctrl *ctrl)
+++<<<<<<< HEAD
+ + {
+++=======
++ {
++ 	flush_work(&ctrl->async_event_work);
++ 	flush_work(&ctrl->scan_work);
++ 	nvme_remove_namespaces(ctrl);
++ 
+++>>>>>>> f866fc4282a8 (nvme: move AER handling to common code)
+  	device_destroy(nvme_class, MKDEV(nvme_char_major, ctrl->instance));
+  
+  	spin_lock(&dev_list_lock);
+@@@ -1442,6 -1710,8 +1498,11 @@@ int nvme_init_ctrl(struct nvme_ctrl *ct
+  	ctrl->dev = dev;
+  	ctrl->ops = ops;
+  	ctrl->quirks = quirks;
+++<<<<<<< HEAD
+++=======
++ 	INIT_WORK(&ctrl->scan_work, nvme_scan_work);
++ 	INIT_WORK(&ctrl->async_event_work, nvme_async_event_work);
+++>>>>>>> f866fc4282a8 (nvme: move AER handling to common code)
+  
+  	ret = nvme_set_instance(ctrl);
+  	if (ret)
+diff --cc drivers/nvme/host/nvme.h
+index b4cca1f4b0ba,631a11e15b7c..000000000000
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@@ -107,6 -108,8 +107,11 @@@ struct nvme_ctrl 
+  	u32 vs;
+  	bool subsystem;
+  	unsigned long quirks;
+++<<<<<<< HEAD
+++=======
++ 	struct work_struct scan_work;
++ 	struct work_struct async_event_work;
+++>>>>>>> f866fc4282a8 (nvme: move AER handling to common code)
+  };
+  
+  /*
+@@@ -145,6 -149,8 +150,11 @@@ struct nvme_ctrl_ops 
+  	int (*reg_read64)(struct nvme_ctrl *ctrl, u32 off, u64 *val);
+  	int (*reset_ctrl)(struct nvme_ctrl *ctrl);
+  	void (*free_ctrl)(struct nvme_ctrl *ctrl);
+++<<<<<<< HEAD
+++=======
++ 	void (*post_scan)(struct nvme_ctrl *ctrl);
++ 	void (*submit_async_event)(struct nvme_ctrl *ctrl, int aer_idx);
+++>>>>>>> f866fc4282a8 (nvme: move AER handling to common code)
+  };
+  
+  static inline bool nvme_ctrl_ready(struct nvme_ctrl *ctrl)
+@@@ -232,9 -211,14 +242,14 @@@ void nvme_uninit_ctrl(struct nvme_ctrl 
+  void nvme_put_ctrl(struct nvme_ctrl *ctrl);
+  int nvme_init_identify(struct nvme_ctrl *ctrl);
+  
+ -void nvme_queue_scan(struct nvme_ctrl *ctrl);
+ +void nvme_scan_namespaces(struct nvme_ctrl *ctrl);
+  void nvme_remove_namespaces(struct nvme_ctrl *ctrl);
+  
++ #define NVME_NR_AERS	1
++ void nvme_complete_async_event(struct nvme_ctrl *ctrl,
++ 		struct nvme_completion *cqe);
++ void nvme_queue_async_events(struct nvme_ctrl *ctrl);
++ 
+  void nvme_stop_queues(struct nvme_ctrl *ctrl);
+  void nvme_start_queues(struct nvme_ctrl *ctrl);
+  void nvme_kill_queues(struct nvme_ctrl *ctrl);
+diff --cc drivers/nvme/host/pci.c
+index b6cb5e36606f,82a0fc200f44..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -91,9 -91,7 +90,8 @@@ struct nvme_dev 
+  	struct msix_entry *entry;
+  	void __iomem *bar;
+  	struct work_struct reset_work;
+ +	struct work_struct scan_work;
+  	struct work_struct remove_work;
+- 	struct work_struct async_work;
+  	struct timer_list watchdog_timer;
+  	struct mutex shutdown_lock;
+  	bool subsystem;
+@@@ -270,40 -263,6 +268,43 @@@ static int nvme_init_request(void *data
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void nvme_queue_scan(struct nvme_dev *dev)
+ +{
+ +	/*
+ +	 * Do not queue new scan work when a controller is reset during
+ +	 * removal.
+ +	 */
+ +	if (test_bit(NVME_CTRL_REMOVING, &dev->flags))
+ +		return;
+ +	queue_work(nvme_workq, &dev->scan_work);
+ +}
+ +
+ +static void nvme_complete_async_event(struct nvme_dev *dev,
+ +		struct nvme_completion *cqe)
+ +{
+ +	u16 status = le16_to_cpu(cqe->status) >> 1;
+ +	u32 result = le32_to_cpu(cqe->result);
+ +
+ +	if (status == NVME_SC_SUCCESS || status == NVME_SC_ABORT_REQ) {
+ +		++dev->ctrl.event_limit;
+ +		queue_work(nvme_workq, &dev->async_work);
+ +	}
+ +
+ +	if (status != NVME_SC_SUCCESS)
+ +		return;
+ +
+ +	switch (result & 0xff07) {
+ +	case NVME_AER_NOTICE_NS_CHANGED:
+ +		dev_info(dev->dev, "rescanning\n");
+ +		nvme_queue_scan(dev);
+ +	default:
+ +		dev_warn(dev->dev, "async event result %08x\n", result);
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> f866fc4282a8 (nvme: move AER handling to common code)
+  /**
+   * __nvme_submit_cmd() - Copy a command into a queue and ring the doorbell
+   * @nvmeq: The queue to use
+@@@ -741,15 -732,30 +742,15 @@@ static irqreturn_t nvme_irq(int irq, vo
+  static irqreturn_t nvme_irq_check(int irq, void *data)
+  {
+  	struct nvme_queue *nvmeq = data;
+ -	if (nvme_cqe_valid(nvmeq, nvmeq->cq_head, nvmeq->cq_phase))
+ -		return IRQ_WAKE_THREAD;
+ -	return IRQ_NONE;
+ -}
+ -
+ -static int nvme_poll(struct blk_mq_hw_ctx *hctx, unsigned int tag)
+ -{
+ -	struct nvme_queue *nvmeq = hctx->driver_data;
+ -
+ -	if (nvme_cqe_valid(nvmeq, nvmeq->cq_head, nvmeq->cq_phase)) {
+ -		spin_lock_irq(&nvmeq->q_lock);
+ -		__nvme_process_cq(nvmeq, &tag);
+ -		spin_unlock_irq(&nvmeq->q_lock);
+ -
+ -		if (tag == -1)
+ -			return 1;
+ -	}
+ -
+ -	return 0;
+ +	struct nvme_completion cqe = nvmeq->cqes[nvmeq->cq_head];
+ +	if ((le16_to_cpu(cqe.status) & 1) != nvmeq->cq_phase)
+ +		return IRQ_NONE;
+ +	return IRQ_WAKE_THREAD;
+  }
+  
+- static void nvme_async_event_work(struct work_struct *work)
++ static void nvme_pci_submit_async_event(struct nvme_ctrl *ctrl, int aer_idx)
+  {
+- 	struct nvme_dev *dev = container_of(work, struct nvme_dev, async_work);
++ 	struct nvme_dev *dev = to_nvme_dev(ctrl);
+  	struct nvme_queue *nvmeq = dev->queues[0];
+  	struct nvme_command c;
+  
+@@@ -1907,6 -1904,8 +1903,11 @@@ static const struct nvme_ctrl_ops nvme_
+  	.reg_read64		= nvme_pci_reg_read64,
+  	.reset_ctrl		= nvme_pci_reset_ctrl,
+  	.free_ctrl		= nvme_pci_free_ctrl,
+++<<<<<<< HEAD
+++=======
++ 	.post_scan		= nvme_pci_post_scan,
++ 	.submit_async_event	= nvme_pci_submit_async_event,
+++>>>>>>> f866fc4282a8 (nvme: move AER handling to common code)
+  };
+  
+  static int nvme_dev_map(struct nvme_dev *dev)
+@@@ -1958,10 -1957,8 +1959,9 @@@ static int nvme_probe(struct pci_dev *p
+  	if (result)
+  		goto free;
+  
+ +	INIT_WORK(&dev->scan_work, nvme_dev_scan);
+  	INIT_WORK(&dev->reset_work, nvme_reset_work);
+  	INIT_WORK(&dev->remove_work, nvme_remove_dead_ctrl_work);
+- 	INIT_WORK(&dev->async_work, nvme_async_event_work);
+  	setup_timer(&dev->watchdog_timer, nvme_watchdog_timer,
+  		(unsigned long)dev);
+  	mutex_init(&dev->shutdown_lock);
+@@@ -2016,12 -2015,11 +2016,15 @@@ static void nvme_remove(struct pci_dev 
+  {
+  	struct nvme_dev *dev = pci_get_drvdata(pdev);
+  
+ -	del_timer_sync(&dev->watchdog_timer);
+ -
+ -	nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_DELETING);
+ -
+ +	set_bit(NVME_CTRL_REMOVING, &dev->flags);
+  	pci_set_drvdata(pdev, NULL);
+++<<<<<<< HEAD
+ +	flush_work(&dev->async_work);
+ +	flush_work(&dev->reset_work);
+ +	flush_work(&dev->scan_work);
+ +	nvme_remove_namespaces(&dev->ctrl);
+++=======
+++>>>>>>> f866fc4282a8 (nvme: move AER handling to common code)
+  	nvme_uninit_ctrl(&dev->ctrl);
+  	nvme_dev_disable(dev, true);
+  	flush_work(&dev->reset_work);
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/nvme.h
+* Unmerged path drivers/nvme/host/pci.c
