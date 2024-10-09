@@ -1,0 +1,437 @@
+x86/speculation/mds: Add mitigation control for MDS
+
+jira LE-1907
+cve CVE-2019-11091
+cve CVE-2018-12130
+cve CVE-2018-12127
+cve CVE-2018-12126
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [x86] speculation/mds: Add mitigation control for MDS (Waiman Long) [1709296 1690358 1690348 1690335] {CVE-2018-12126 CVE-2018-12127 CVE-2018-12130 CVE-2019-11091}
+Rebuild_FUZZ: 95.92%
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit bc1241700acd82ec69fde98c5763ce51086269f8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/bc124170.failed
+
+Now that the mitigations are in place, add a command line parameter to
+control the mitigation, a mitigation selector function and a SMT update
+mechanism.
+
+This is the minimal straight forward initial implementation which just
+provides an always on/off mode. The command line parameter is:
+
+  mds=[full|off]
+
+This is consistent with the existing mitigations for other speculative
+hardware vulnerabilities.
+
+The idle invocation is dynamically updated according to the SMT state of
+the system similar to the dynamic update of the STIBP mitigation. The idle
+mitigation is limited to CPUs which are only affected by MSBDS and not any
+other variant, because the other variants cannot be mitigated on SMT
+enabled systems.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Jon Masters <jcm@redhat.com>
+	Tested-by: Jon Masters <jcm@redhat.com>
+(cherry picked from commit bc1241700acd82ec69fde98c5763ce51086269f8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/bugs.c
+diff --cc arch/x86/kernel/cpu/bugs.c
+index 6ec1d2da76d1,c7b29d200d27..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -22,15 -27,49 +22,51 @@@
+  #include <asm/paravirt.h>
+  #include <asm/alternative.h>
+  #include <asm/pgtable.h>
+ -#include <asm/set_memory.h>
+ -#include <asm/intel-family.h>
+ -#include <asm/e820/api.h>
+ -#include <asm/hypervisor.h>
+ -
+ -#include "cpu.h"
+ +#include <asm/cacheflush.h>
+ +#include <asm/spec_ctrl.h>
+ +#include <linux/prctl.h>
+  
+  static void __init spectre_v2_select_mitigation(void);
+ -static void __init ssb_select_mitigation(void);
+ +static void __init ssb_parse_cmdline(void);
+ +void ssb_select_mitigation(void);
+  static void __init l1tf_select_mitigation(void);
+++<<<<<<< HEAD
+ +extern void spec_ctrl_save_msr(void);
+++=======
++ static void __init mds_select_mitigation(void);
++ 
++ /* The base value of the SPEC_CTRL MSR that always has to be preserved. */
++ u64 x86_spec_ctrl_base;
++ EXPORT_SYMBOL_GPL(x86_spec_ctrl_base);
++ static DEFINE_MUTEX(spec_ctrl_mutex);
++ 
++ /*
++  * The vendor and possibly platform specific bits which can be modified in
++  * x86_spec_ctrl_base.
++  */
++ static u64 __ro_after_init x86_spec_ctrl_mask = SPEC_CTRL_IBRS;
++ 
++ /*
++  * AMD specific MSR info for Speculative Store Bypass control.
++  * x86_amd_ls_cfg_ssbd_mask is initialized in identify_boot_cpu().
++  */
++ u64 __ro_after_init x86_amd_ls_cfg_base;
++ u64 __ro_after_init x86_amd_ls_cfg_ssbd_mask;
++ 
++ /* Control conditional STIBP in switch_to() */
++ DEFINE_STATIC_KEY_FALSE(switch_to_cond_stibp);
++ /* Control conditional IBPB in switch_mm() */
++ DEFINE_STATIC_KEY_FALSE(switch_mm_cond_ibpb);
++ /* Control unconditional IBPB in switch_mm() */
++ DEFINE_STATIC_KEY_FALSE(switch_mm_always_ibpb);
++ 
++ /* Control MDS CPU buffer clear before returning to user space */
++ DEFINE_STATIC_KEY_FALSE(mds_user_clear);
++ EXPORT_SYMBOL_GPL(mds_user_clear);
++ /* Control MDS CPU buffer clear before idling (halt, mwait) */
++ DEFINE_STATIC_KEY_FALSE(mds_idle_clear);
++ EXPORT_SYMBOL_GPL(mds_idle_clear);
+++>>>>>>> bc1241700acd (x86/speculation/mds: Add mitigation control for MDS)
+  
+  void __init check_bugs(void)
+  {
+@@@ -111,33 -216,50 +149,77 @@@ void x86_amd_ssbd_enable(void
+  		wrmsrl(MSR_AMD64_LS_CFG, msrval);
+  }
+  
+ +/* The kernel command line selection */
+ +enum spectre_v2_mitigation_cmd {
+ +	SPECTRE_V2_CMD_NONE,
+ +	SPECTRE_V2_CMD_FORCE,
+ +	SPECTRE_V2_CMD_AUTO,
+ +	SPECTRE_V2_CMD_RETPOLINE,
+ +	SPECTRE_V2_CMD_RETPOLINE_IBRS_USER,
+ +	SPECTRE_V2_CMD_IBRS,
+ +	SPECTRE_V2_CMD_IBRS_ALWAYS,
+ +};
+ +
+ +static const char *spectre_v2_strings[] = {
+ +	[SPECTRE_V2_NONE]			= "Vulnerable",
+ +	[SPECTRE_V2_RETPOLINE_MINIMAL]		= "Vulnerable: Minimal ASM retpoline",
+ +	[SPECTRE_V2_RETPOLINE_NO_IBPB]		= "Vulnerable: Retpoline without IBPB",
+ +	[SPECTRE_V2_RETPOLINE_SKYLAKE]		= "Vulnerable: Retpoline on Skylake+",
+ +	[SPECTRE_V2_RETPOLINE_UNSAFE_MODULE]	= "Vulnerable: Retpoline with unsafe module(s)",
+ +	[SPECTRE_V2_RETPOLINE]			= "Mitigation: Full retpoline",
+ +	[SPECTRE_V2_RETPOLINE_IBRS_USER]	= "Mitigation: Full retpoline and IBRS (user space)",
+ +	[SPECTRE_V2_IBRS]			= "Mitigation: IBRS (kernel)",
+ +	[SPECTRE_V2_IBRS_ALWAYS]		= "Mitigation: IBRS (kernel and user space)",
+ +	[SPECTRE_V2_IBP_DISABLED]		= "Mitigation: IBP disabled",
+ +	[SPECTRE_V2_IBRS_ENHANCED]		= "Mitigation: Enhanced IBRS",
+ +};
+ +
+ +enum spectre_v2_mitigation_cmd spectre_v2_cmd = SPECTRE_V2_CMD_AUTO;
+ +
++ #undef pr_fmt
++ #define pr_fmt(fmt)	"MDS: " fmt
++ 
++ /* Default mitigation for L1TF-affected CPUs */
++ static enum mds_mitigations mds_mitigation __ro_after_init = MDS_MITIGATION_FULL;
++ 
++ static const char * const mds_strings[] = {
++ 	[MDS_MITIGATION_OFF]	= "Vulnerable",
++ 	[MDS_MITIGATION_FULL]	= "Mitigation: Clear CPU buffers"
++ };
++ 
++ static void __init mds_select_mitigation(void)
++ {
++ 	if (!boot_cpu_has_bug(X86_BUG_MDS)) {
++ 		mds_mitigation = MDS_MITIGATION_OFF;
++ 		return;
++ 	}
++ 
++ 	if (mds_mitigation == MDS_MITIGATION_FULL) {
++ 		if (boot_cpu_has(X86_FEATURE_MD_CLEAR))
++ 			static_branch_enable(&mds_user_clear);
++ 		else
++ 			mds_mitigation = MDS_MITIGATION_OFF;
++ 	}
++ 	pr_info("%s\n", mds_strings[mds_mitigation]);
++ }
++ 
++ static int __init mds_cmdline(char *str)
++ {
++ 	if (!boot_cpu_has_bug(X86_BUG_MDS))
++ 		return 0;
++ 
++ 	if (!str)
++ 		return -EINVAL;
++ 
++ 	if (!strcmp(str, "off"))
++ 		mds_mitigation = MDS_MITIGATION_OFF;
++ 	else if (!strcmp(str, "full"))
++ 		mds_mitigation = MDS_MITIGATION_FULL;
++ 
++ 	return 0;
++ }
++ early_param("mds", mds_cmdline);
++ 
+  #undef pr_fmt
+  #define pr_fmt(fmt)     "Spectre V2 : " fmt
+  
+@@@ -199,52 -553,162 +281,107 @@@ void __spectre_v2_select_mitigation(voi
+  	case SPECTRE_V2_CMD_FORCE:
+  	case SPECTRE_V2_CMD_AUTO:
+  		if (boot_cpu_has(X86_FEATURE_IBRS_ENHANCED)) {
+ -			mode = SPECTRE_V2_IBRS_ENHANCED;
+ -			/* Force it so VMEXIT will restore correctly */
+ -			x86_spec_ctrl_base |= SPEC_CTRL_IBRS;
+ -			wrmsrl(MSR_IA32_SPEC_CTRL, x86_spec_ctrl_base);
+ -			goto specv2_set_mode;
+ +			spec_ctrl_enable_ibrs_enhanced();
+ +			return;
+  		}
+ -		if (IS_ENABLED(CONFIG_RETPOLINE))
+ -			goto retpoline_auto;
+ -		break;
+ -	case SPECTRE_V2_CMD_RETPOLINE_AMD:
+ -		if (IS_ENABLED(CONFIG_RETPOLINE))
+ -			goto retpoline_amd;
+ -		break;
+ -	case SPECTRE_V2_CMD_RETPOLINE_GENERIC:
+ -		if (IS_ENABLED(CONFIG_RETPOLINE))
+ -			goto retpoline_generic;
+  		break;
+ -	case SPECTRE_V2_CMD_RETPOLINE:
+ -		if (IS_ENABLED(CONFIG_RETPOLINE))
+ -			goto retpoline_auto;
+ -		break;
+ -	}
+ -	pr_err("Spectre mitigation: kernel not compiled with retpoline; no mitigation available!");
+ -	return;
+ -
+ -retpoline_auto:
+ -	if (boot_cpu_data.x86_vendor == X86_VENDOR_AMD ||
+ -	    boot_cpu_data.x86_vendor == X86_VENDOR_HYGON) {
+ -	retpoline_amd:
+ -		if (!boot_cpu_has(X86_FEATURE_LFENCE_RDTSC)) {
+ -			pr_err("Spectre mitigation: LFENCE not serializing, switching to generic retpoline\n");
+ -			goto retpoline_generic;
+ -		}
+ -		mode = SPECTRE_V2_RETPOLINE_AMD;
+ -		setup_force_cpu_cap(X86_FEATURE_RETPOLINE_AMD);
+ -		setup_force_cpu_cap(X86_FEATURE_RETPOLINE);
+ -	} else {
+ -	retpoline_generic:
+ -		mode = SPECTRE_V2_RETPOLINE_GENERIC;
+ -		setup_force_cpu_cap(X86_FEATURE_RETPOLINE);
+ -	}
+ -
+ -specv2_set_mode:
+ -	spectre_v2_enabled = mode;
+ -	pr_info("%s\n", spectre_v2_strings[mode]);
+ -
+ -	/*
+ -	 * If spectre v2 protection has been enabled, unconditionally fill
+ -	 * RSB during a context switch; this protects against two independent
+ -	 * issues:
+ -	 *
+ -	 *	- RSB underflow (and switch to BTB) on Skylake+
+ -	 *	- SpectreRSB variant of spectre v2 on X86_BUG_SPECTRE_V2 CPUs
+ -	 */
+ -	setup_force_cpu_cap(X86_FEATURE_RSB_CTXSW);
+ -	pr_info("Spectre v2 / SpectreRSB mitigation: Filling RSB on context switch\n");
+ -
+ -	/*
+ -	 * Retpoline means the kernel is safe because it has no indirect
+ -	 * branches. Enhanced IBRS protects firmware too, so, enable restricted
+ -	 * speculation around firmware calls only when Enhanced IBRS isn't
+ -	 * supported.
+ -	 *
+ -	 * Use "mode" to check Enhanced IBRS instead of boot_cpu_has(), because
+ -	 * the user might select retpoline on the kernel command line and if
+ -	 * the CPU supports Enhanced IBRS, kernel might un-intentionally not
+ -	 * enable IBRS around firmware calls.
+ -	 */
+ -	if (boot_cpu_has(X86_FEATURE_IBRS) && mode != SPECTRE_V2_IBRS_ENHANCED) {
+ -		setup_force_cpu_cap(X86_FEATURE_USE_IBRS_FW);
+ -		pr_info("Enabling Restricted Speculation for firmware calls\n");
+ -	}
+ -
+ -	/* Set up IBPB and STIBP depending on the general spectre V2 command */
+ -	spectre_v2_user_select_mitigation(cmd);
+ -
+ -	/* Enable STIBP if appropriate */
+ -	arch_smt_update();
+ -}
+ -
+ -static void update_stibp_msr(void * __unused)
+ -{
+ -	wrmsrl(MSR_IA32_SPEC_CTRL, x86_spec_ctrl_base);
+ -}
+ -
+ -/* Update x86_spec_ctrl_base in case SMT state changed. */
+ -static void update_stibp_strict(void)
+ -{
+ -	u64 mask = x86_spec_ctrl_base & ~SPEC_CTRL_STIBP;
+ -
+ -	if (sched_smt_active())
+ -		mask |= SPEC_CTRL_STIBP;
+  
+ -	if (mask == x86_spec_ctrl_base)
+ +	case SPECTRE_V2_CMD_RETPOLINE:
+ +		spec_ctrl_enable_retpoline();
+  		return;
+  
+++<<<<<<< HEAD
+ +	case SPECTRE_V2_CMD_IBRS:
+ +		if (spec_ctrl_force_enable_ibrs())
+ +			return;
+++=======
++ 	pr_info("Update user space SMT mitigation: STIBP %s\n",
++ 		mask & SPEC_CTRL_STIBP ? "always-on" : "off");
++ 	x86_spec_ctrl_base = mask;
++ 	on_each_cpu(update_stibp_msr, NULL, 1);
++ }
++ 
++ /* Update the static key controlling the evaluation of TIF_SPEC_IB */
++ static void update_indir_branch_cond(void)
++ {
++ 	if (sched_smt_active())
++ 		static_branch_enable(&switch_to_cond_stibp);
++ 	else
++ 		static_branch_disable(&switch_to_cond_stibp);
++ }
++ 
++ /* Update the static key controlling the MDS CPU buffer clear in idle */
++ static void update_mds_branch_idle(void)
++ {
++ 	/*
++ 	 * Enable the idle clearing if SMT is active on CPUs which are
++ 	 * affected only by MSBDS and not any other MDS variant.
++ 	 *
++ 	 * The other variants cannot be mitigated when SMT is enabled, so
++ 	 * clearing the buffers on idle just to prevent the Store Buffer
++ 	 * repartitioning leak would be a window dressing exercise.
++ 	 */
++ 	if (!boot_cpu_has_bug(X86_BUG_MSBDS_ONLY))
++ 		return;
++ 
++ 	if (sched_smt_active())
++ 		static_branch_enable(&mds_idle_clear);
++ 	else
++ 		static_branch_disable(&mds_idle_clear);
++ }
++ 
++ void arch_smt_update(void)
++ {
++ 	/* Enhanced IBRS implies STIBP. No update required. */
++ 	if (spectre_v2_enabled == SPECTRE_V2_IBRS_ENHANCED)
++ 		return;
++ 
++ 	mutex_lock(&spec_ctrl_mutex);
++ 
++ 	switch (spectre_v2_user) {
++ 	case SPECTRE_V2_USER_NONE:
+++>>>>>>> bc1241700acd (x86/speculation/mds: Add mitigation control for MDS)
+  		break;
+ -	case SPECTRE_V2_USER_STRICT:
+ -	case SPECTRE_V2_USER_STRICT_PREFERRED:
+ -		update_stibp_strict();
+ +
+ +	case SPECTRE_V2_CMD_IBRS_ALWAYS:
+ +		if (spec_ctrl_enable_ibrs_always() ||
+ +		    spec_ctrl_force_enable_ibp_disabled())
+ +			return;
+  		break;
+ -	case SPECTRE_V2_USER_PRCTL:
+ -	case SPECTRE_V2_USER_SECCOMP:
+ -		update_indir_branch_cond();
+ +
+ +	case SPECTRE_V2_CMD_RETPOLINE_IBRS_USER:
+ +		if (spec_ctrl_enable_retpoline_ibrs_user())
+ +			return;
+  		break;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (spec_ctrl_cond_enable_ibrs(full_retpoline))
+ +		return;
+ +
+ +	if (spec_ctrl_cond_enable_ibp_disabled())
+ +		return;
+ +
+ +	spec_ctrl_enable_retpoline();
+ +}
+ +
+ +void spectre_v2_print_mitigation(void)
+ +{
+ +
+ +	pr_info("%s\n", spectre_v2_strings[spec_ctrl_get_mitigation()]);
+ +}
+ +
+ +static void __init spectre_v2_select_mitigation(void)
+ +{
+ +	spectre_v2_cmd = spectre_v2_parse_cmdline();
+ +	__spectre_v2_select_mitigation();
+ +	spectre_v2_print_mitigation();
+++=======
++ 	if (mds_mitigation == MDS_MITIGATION_FULL)
++ 		update_mds_branch_idle();
++ 
++ 	mutex_unlock(&spec_ctrl_mutex);
+++>>>>>>> bc1241700acd (x86/speculation/mds: Add mitigation control for MDS)
+  }
+  
+  #undef pr_fmt
+diff --git a/Documentation/kernel-parameters.txt b/Documentation/kernel-parameters.txt
+index f6852ae416ce..10ab85fb898e 100644
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -1855,6 +1855,28 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
+ 			Format: <first>,<last>
+ 			Specifies range of consoles to be captured by the MDA.
+ 
++	mds=		[X86,INTEL]
++			Control mitigation for the Micro-architectural Data
++			Sampling (MDS) vulnerability.
++
++			Certain CPUs are vulnerable to an exploit against CPU
++			internal buffers which can forward information to a
++			disclosure gadget under certain conditions.
++
++			In vulnerable processors, the speculatively
++			forwarded data can be used in a cache side channel
++			attack, to access data to which the attacker does
++			not have direct access.
++
++			This parameter controls the MDS mitigation. The
++			options are:
++
++			full    - Enable MDS mitigation on vulnerable CPUs
++			off     - Unconditionally disable MDS mitigation
++
++			Not specifying this option is equivalent to
++			mds=full.
++
+ 	mem=nn[KMG]	[KNL,BOOT] Force usage of a specific amount of memory
+ 			Amount of memory to be used when the kernel is not able
+ 			to see the whole system memory or for test.
+diff --git a/arch/x86/include/asm/processor.h b/arch/x86/include/asm/processor.h
+index 1cec5508cffb..a5eb958203ef 100644
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@ -1101,4 +1101,9 @@ enum l1tf_mitigations {
+ 
+ extern enum l1tf_mitigations l1tf_mitigation;
+ 
++enum mds_mitigations {
++	MDS_MITIGATION_OFF,
++	MDS_MITIGATION_FULL,
++};
++
+ #endif /* _ASM_X86_PROCESSOR_H */
+* Unmerged path arch/x86/kernel/cpu/bugs.c
