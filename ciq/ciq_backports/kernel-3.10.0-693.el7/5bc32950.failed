@@ -1,0 +1,127 @@
+x86/mce: Handle broadcasted MCE gracefully with kexec
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [x86] mce: Handle broadcasted MCE gracefully with kexec (Xunlei Pang) [1256375]
+Rebuild_FUZZ: 96.08%
+commit-author Xunlei Pang <xlpang@redhat.com>
+commit 5bc329503e8191c91c4c40836f062ef771d8ba83
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/5bc32950.failed
+
+When we are about to kexec a crash kernel and right then and there a
+broadcasted MCE fires while we're still in the first kernel and while
+the other CPUs remain in a holding pattern, the #MC handler of the
+first kernel will timeout and then panic due to never completing MCE
+synchronization.
+
+Handle this in a similar way as to when the CPUs are offlined when that
+broadcasted MCE happens.
+
+[ Boris: rewrote commit message and comments. ]
+
+	Suggested-by: Borislav Petkov <bp@alien8.de>
+	Signed-off-by: Xunlei Pang <xlpang@redhat.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Acked-by: Tony Luck <tony.luck@intel.com>
+	Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: kexec@lists.infradead.org
+	Cc: linux-edac <linux-edac@vger.kernel.org>
+Link: http://lkml.kernel.org/r/1487857012-9059-1-git-send-email-xlpang@redhat.com
+Link: http://lkml.kernel.org/r/20170313095019.19351-1-bp@alien8.de
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+(cherry picked from commit 5bc329503e8191c91c4c40836f062ef771d8ba83)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/mcheck/mce.c
+diff --cc arch/x86/kernel/cpu/mcheck/mce.c
+index 1bfa973429e1,177472ace838..000000000000
+--- a/arch/x86/kernel/cpu/mcheck/mce.c
++++ b/arch/x86/kernel/cpu/mcheck/mce.c
+@@@ -41,10 -41,15 +41,11 @@@
+  #include <linux/debugfs.h>
+  #include <linux/irq_work.h>
+  #include <linux/export.h>
+ -#include <linux/jump_label.h>
+  
+ -#include <asm/intel-family.h>
+  #include <asm/processor.h>
+ -#include <asm/traps.h>
+ -#include <asm/tlbflush.h>
+  #include <asm/mce.h>
+  #include <asm/msr.h>
++ #include <asm/reboot.h>
+  
+  #include "mce-internal.h"
+  
+@@@ -996,12 -1122,28 +997,34 @@@ void do_machine_check(struct pt_regs *r
+  	DECLARE_BITMAP(toclear, MAX_NR_BANKS);
+  	DECLARE_BITMAP(valid_banks, MAX_NR_BANKS);
+  	char *msg = "Unknown";
+++<<<<<<< HEAD
+ +	u64 recover_paddr = ~0ull;
+ +	int flags = MF_ACTION_REQUIRED;
+ +	int lmce = 0;
+++=======
+  
+- 	/* If this CPU is offline, just bail out. */
+- 	if (cpu_is_offline(smp_processor_id())) {
++ 	/*
++ 	 * MCEs are always local on AMD. Same is determined by MCG_STATUS_LMCES
++ 	 * on Intel.
++ 	 */
++ 	int lmce = 1;
++ 	int cpu = smp_processor_id();
+++>>>>>>> 5bc329503e81 (x86/mce: Handle broadcasted MCE gracefully with kexec)
++ 
++ 	/*
++ 	 * Cases where we avoid rendezvous handler timeout:
++ 	 * 1) If this CPU is offline.
++ 	 *
++ 	 * 2) If crashing_cpu was set, e.g. we're entering kdump and we need to
++ 	 *  skip those CPUs which remain looping in the 1st kernel - see
++ 	 *  crash_nmi_callback().
++ 	 *
++ 	 * Note: there still is a small window between kexec-ing and the new,
++ 	 * kdump kernel establishing a new #MC handler where a broadcasted MCE
++ 	 * might not get handled properly.
++ 	 */
++ 	if (cpu_is_offline(cpu) ||
++ 	    (crashing_cpu != -1 && crashing_cpu != cpu)) {
+  		u64 mcgstatus;
+  
+  		mcgstatus = mce_rdmsrl(MSR_IA32_MCG_STATUS);
+diff --git a/arch/x86/include/asm/reboot.h b/arch/x86/include/asm/reboot.h
+index 2cb1cc253d51..fc62ba8dce93 100644
+--- a/arch/x86/include/asm/reboot.h
++++ b/arch/x86/include/asm/reboot.h
+@@ -15,6 +15,7 @@ struct machine_ops {
+ };
+ 
+ extern struct machine_ops machine_ops;
++extern int crashing_cpu;
+ 
+ void native_machine_crash_shutdown(struct pt_regs *regs);
+ void native_machine_shutdown(void);
+* Unmerged path arch/x86/kernel/cpu/mcheck/mce.c
+diff --git a/arch/x86/kernel/reboot.c b/arch/x86/kernel/reboot.c
+index ad3f233d74c1..7c71e450333e 100644
+--- a/arch/x86/kernel/reboot.c
++++ b/arch/x86/kernel/reboot.c
+@@ -759,10 +759,11 @@ void machine_crash_shutdown(struct pt_regs *regs)
+ #endif
+ 
+ 
++/* This is the CPU performing the emergency shutdown work. */
++int crashing_cpu = -1;
++
+ #if defined(CONFIG_SMP)
+ 
+-/* This keeps a track of which one is crashing cpu. */
+-static int crashing_cpu;
+ static nmi_shootdown_cb shootdown_callback;
+ 
+ static atomic_t waiting_for_crash_ipi;
