@@ -591,6 +591,7 @@ static void intel_pstate_hwp_set_online_cpus(void)
 static int pid_param_set(void *data, u64 val)
 {
 	*(u32 *)data = val;
+	pid_params.sample_rate_ns = pid_params.sample_rate_ms * NSEC_PER_MSEC;
 	intel_pstate_reset_all_pid();
 	return 0;
 }
