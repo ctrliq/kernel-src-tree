@@ -45,7 +45,6 @@ typedef uuid_be			uuid_t;
 
 #include "kmem.h"
 #include "mrlock.h"
-#include "uuid.h"
 
 #include <linux/semaphore.h>
 #include <linux/mm.h>
