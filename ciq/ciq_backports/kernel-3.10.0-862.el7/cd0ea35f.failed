@@ -1,0 +1,113 @@
+signals, pkeys: Notify userspace about protection key faults
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit cd0ea35ff5511cde299a61c21a95889b4a71464e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/cd0ea35f.failed
+
+A protection key fault is very similar to any other access error.
+There must be a VMA, etc...  We even want to take the same action
+(SIGSEGV) that we do with a normal access fault.
+
+However, we do need to let userspace know that something is
+different.  We do this the same way what we did with SEGV_BNDERR
+with Memory Protection eXtensions (MPX): define a new SEGV code:
+SEGV_PKUERR.
+
+We add a siginfo field: si_pkey that reveals to userspace which
+protection key was set on the PTE that we faulted on.  There is
+no other easy way for userspace to figure this out.  They could
+parse smaps but that would be a bit cruel.
+
+We share space with in siginfo with _addr_bnd.  #BR faults from
+MPX are completely separate from page faults (#PF) that trigger
+from protection key violations, so we never need both at the same
+time.
+
+Note that _pkey is a 64-bit value.  The current hardware only
+supports 4-bit protection keys.  We do this because there is
+_plenty_ of space in _sigfault and it is possible that future
+processors would support more than 4 bits of protection keys.
+
+The x86 code to actually fill in the siginfo is in the next
+patch.
+
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: Amanieu d'Antras <amanieu@gmail.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Dave Hansen <dave@sr71.net>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Palmer Dabbelt <palmer@dabbelt.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Richard Weinberger <richard@nod.at>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Sasha Levin <sasha.levin@oracle.com>
+	Cc: Vegard Nossum <vegard.nossum@oracle.com>
+	Cc: Vladimir Davydov <vdavydov@parallels.com>
+	Cc: linux-arch@vger.kernel.org
+	Cc: linux-kernel@vger.kernel.org
+	Cc: linux-mm@kvack.org
+Link: http://lkml.kernel.org/r/20160212210212.3A9B83AC@viggo.jf.intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit cd0ea35ff5511cde299a61c21a95889b4a71464e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/asm-generic/siginfo.h
+diff --cc include/uapi/asm-generic/siginfo.h
+index 0d397d4e8bf8,90384d55225b..000000000000
+--- a/include/uapi/asm-generic/siginfo.h
++++ b/include/uapi/asm-generic/siginfo.h
+@@@ -91,12 -91,15 +91,24 @@@ typedef struct siginfo 
+  			int _trapno;	/* TRAP # which caused the signal */
+  #endif
+  			short _addr_lsb; /* LSB of the reported address */
+++<<<<<<< HEAD
+ +#ifndef __GENKSYMS__
+ +			struct {
+ +				void __user *_lower;
+ +				void __user *_upper;
+ +			} _addr_bnd;
+ +#endif
+++=======
++ 			union {
++ 				/* used when si_code=SEGV_BNDERR */
++ 				struct {
++ 					void __user *_lower;
++ 					void __user *_upper;
++ 				} _addr_bnd;
++ 				/* used when si_code=SEGV_PKUERR */
++ 				u64 _pkey;
++ 			};
+++>>>>>>> cd0ea35ff551 (signals, pkeys: Notify userspace about protection key faults)
+  		} _sigfault;
+  
+  		/* SIGPOLL */
+* Unmerged path include/uapi/asm-generic/siginfo.h
+diff --git a/kernel/signal.c b/kernel/signal.c
+index 2dec6a0b02ed..57827ce4a990 100644
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -2784,6 +2784,10 @@ int copy_siginfo_to_user(siginfo_t __user *to, siginfo_t *from)
+ #ifdef SEGV_BNDERR
+ 		err |= __put_user(from->si_lower, &to->si_lower);
+ 		err |= __put_user(from->si_upper, &to->si_upper);
++#endif
++#ifdef SEGV_PKUERR
++		if (from->si_signo == SIGSEGV && from->si_code == SEGV_PKUERR)
++			err |= __put_user(from->si_pkey, &to->si_pkey);
+ #endif
+ 		break;
+ 	case __SI_CHLD:
