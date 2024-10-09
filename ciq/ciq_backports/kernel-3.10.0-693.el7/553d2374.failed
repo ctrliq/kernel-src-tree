@@ -1,0 +1,297 @@
+crypto: ccp - Support for multiple CCPs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [crypto] ccp - Support for multiple CCPs (Suravee Suthikulpanit) [1390820]
+Rebuild_FUZZ: 88.57%
+commit-author Gary R Hook <gary.hook@amd.com>
+commit 553d2374db0bb3f48bbd29bef7ba2a4d1a3f325d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/553d2374.failed
+
+Enable management of >1 CCPs in a system. Each device will
+get a unique identifier, as well as uniquely named
+resources. Treat each CCP as an orthogonal unit and register
+ resources individually.
+
+	Signed-off-by: Gary R Hook <gary.hook@amd.com>
+	Acked-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit 553d2374db0bb3f48bbd29bef7ba2a4d1a3f325d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/ccp/ccp-dev.c
+#	drivers/crypto/ccp/ccp-platform.c
+diff --cc drivers/crypto/ccp/ccp-dev.c
+index 2777dc97b570,dd71e673a109..000000000000
+--- a/drivers/crypto/ccp/ccp-dev.c
++++ b/drivers/crypto/ccp/ccp-dev.c
+@@@ -35,24 -39,117 +37,126 @@@ struct ccp_tasklet_data 
+  	struct ccp_cmd *cmd;
+  };
+  
+++<<<<<<< HEAD
+ +
+ +static struct ccp_device *ccp_dev;
+ +static inline struct ccp_device *ccp_get_device(void)
+++=======
++ /* List of CCPs, CCP count, read-write access lock, and access functions
++  *
++  * Lock structure: get ccp_unit_lock for reading whenever we need to
++  * examine the CCP list. While holding it for reading we can acquire
++  * the RR lock to update the round-robin next-CCP pointer. The unit lock
++  * must be acquired before the RR lock.
++  *
++  * If the unit-lock is acquired for writing, we have total control over
++  * the list, so there's no value in getting the RR lock.
++  */
++ static DEFINE_RWLOCK(ccp_unit_lock);
++ static LIST_HEAD(ccp_units);
++ 
++ /* Round-robin counter */
++ static DEFINE_RWLOCK(ccp_rr_lock);
++ static struct ccp_device *ccp_rr;
++ 
++ /* Ever-increasing value to produce unique unit numbers */
++ static atomic_t ccp_unit_ordinal;
++ unsigned int ccp_increment_unit_ordinal(void)
+++>>>>>>> 553d2374db0b (crypto: ccp - Support for multiple CCPs)
+  {
+- 	return ccp_dev;
++ 	return atomic_inc_return(&ccp_unit_ordinal);
+  }
+  
++ /*
++  * Put this CCP on the unit list, which makes it available
++  * for use.
++  */
+  static inline void ccp_add_device(struct ccp_device *ccp)
+  {
+- 	ccp_dev = ccp;
++ 	unsigned long flags;
++ 
++ 	write_lock_irqsave(&ccp_unit_lock, flags);
++ 	list_add_tail(&ccp->entry, &ccp_units);
++ 	if (!ccp_rr)
++ 		/* We already have the list lock (we're first) so this
++ 		 * pointer can't change on us. Set its initial value.
++ 		 */
++ 		ccp_rr = ccp;
++ 	write_unlock_irqrestore(&ccp_unit_lock, flags);
+  }
+  
++ /* Remove this unit from the list of devices. If the next device
++  * up for use is this one, adjust the pointer. If this is the last
++  * device, NULL the pointer.
++  */
+  static inline void ccp_del_device(struct ccp_device *ccp)
+  {
+- 	ccp_dev = NULL;
++ 	unsigned long flags;
++ 
++ 	write_lock_irqsave(&ccp_unit_lock, flags);
++ 	if (ccp_rr == ccp) {
++ 		/* ccp_unit_lock is read/write; any read access
++ 		 * will be suspended while we make changes to the
++ 		 * list and RR pointer.
++ 		 */
++ 		if (list_is_last(&ccp_rr->entry, &ccp_units))
++ 			ccp_rr = list_first_entry(&ccp_units, struct ccp_device,
++ 						  entry);
++ 		else
++ 			ccp_rr = list_next_entry(ccp_rr, entry);
++ 	}
++ 	list_del(&ccp->entry);
++ 	if (list_empty(&ccp_units))
++ 		ccp_rr = NULL;
++ 	write_unlock_irqrestore(&ccp_unit_lock, flags);
++ }
++ 
++ static struct ccp_device *ccp_get_device(void)
++ {
++ 	unsigned long flags;
++ 	struct ccp_device *dp = NULL;
++ 
++ 	/* We round-robin through the unit list.
++ 	 * The (ccp_rr) pointer refers to the next unit to use.
++ 	 */
++ 	read_lock_irqsave(&ccp_unit_lock, flags);
++ 	if (!list_empty(&ccp_units)) {
++ 		write_lock_irqsave(&ccp_rr_lock, flags);
++ 		dp = ccp_rr;
++ 		if (list_is_last(&ccp_rr->entry, &ccp_units))
++ 			ccp_rr = list_first_entry(&ccp_units, struct ccp_device,
++ 						  entry);
++ 		else
++ 			ccp_rr = list_next_entry(ccp_rr, entry);
++ 		write_unlock_irqrestore(&ccp_rr_lock, flags);
++ 	}
++ 	read_unlock_irqrestore(&ccp_unit_lock, flags);
++ 
++ 	return dp;
++ }
++ 
++ /**
+++<<<<<<< HEAD
+++=======
++  * ccp_present - check if a CCP device is present
++  *
++  * Returns zero if a CCP device is present, -ENODEV otherwise.
++  */
++ int ccp_present(void)
++ {
++ 	unsigned long flags;
++ 	int ret;
++ 
++ 	read_lock_irqsave(&ccp_unit_lock, flags);
++ 	ret = list_empty(&ccp_units);
++ 	read_unlock_irqrestore(&ccp_unit_lock, flags);
++ 
++ 	return ret ? -ENODEV : 0;
+  }
++ EXPORT_SYMBOL_GPL(ccp_present);
+  
+  /**
+++>>>>>>> 553d2374db0b (crypto: ccp - Support for multiple CCPs)
+   * ccp_enqueue_cmd - queue an operation for processing by the CCP
+   *
+   * @cmd: ccp_cmd struct to be processed
+@@@ -558,38 -664,39 +667,56 @@@ bool ccp_queues_suspended(struct ccp_de
+  }
+  #endif
+  
+ +static const struct x86_cpu_id ccp_support[] = {
+ +	{ X86_VENDOR_AMD, 22, },
+ +	{ },
+ +};
+ +
+  static int __init ccp_mod_init(void)
+  {
+ -#ifdef CONFIG_X86
+ +	struct cpuinfo_x86 *cpuinfo = &boot_cpu_data;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	if (!x86_match_cpu(ccp_support))
+++=======
++ 	ret = ccp_pci_init();
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Don't leave the driver loaded if init failed */
++ 	if (ccp_present() != 0) {
++ 		ccp_pci_exit();
+++>>>>>>> 553d2374db0b (crypto: ccp - Support for multiple CCPs)
+  		return -ENODEV;
+ -	}
+  
+ -	return 0;
+ -#endif
+ +	switch (cpuinfo->x86) {
+ +	case 22:
+ +		if ((cpuinfo->x86_model < 48) || (cpuinfo->x86_model > 63))
+ +			return -ENODEV;
+  
+ -#ifdef CONFIG_ARM64
+ -	int ret;
+ +		ret = ccp_pci_init();
+ +		if (ret)
+ +			return ret;
+  
+ -	ret = ccp_platform_init();
+ -	if (ret)
+ -		return ret;
+ +		/* Don't leave the driver loaded if init failed */
+ +		if (!ccp_get_device()) {
+ +			ccp_pci_exit();
+ +			return -ENODEV;
+ +		}
+  
+++<<<<<<< HEAD
+ +		return 0;
+++=======
++ 	/* Don't leave the driver loaded if init failed */
++ 	if (ccp_present() != 0) {
++ 		ccp_platform_exit();
++ 		return -ENODEV;
++ 	}
+++>>>>>>> 553d2374db0b (crypto: ccp - Support for multiple CCPs)
+  
+ -	return 0;
+ -#endif
+ +		break;
+ +	};
+  
+  	return -ENODEV;
+  }
+* Unmerged path drivers/crypto/ccp/ccp-platform.c
+* Unmerged path drivers/crypto/ccp/ccp-dev.c
+diff --git a/drivers/crypto/ccp/ccp-dev.h b/drivers/crypto/ccp/ccp-dev.h
+index 72bf1536b653..e643904a8871 100644
+--- a/drivers/crypto/ccp/ccp-dev.h
++++ b/drivers/crypto/ccp/ccp-dev.h
+@@ -1,7 +1,7 @@
+ /*
+  * AMD Cryptographic Coprocessor (CCP) driver
+  *
+- * Copyright (C) 2013 Advanced Micro Devices, Inc.
++ * Copyright (C) 2013,2016 Advanced Micro Devices, Inc.
+  *
+  * Author: Tom Lendacky <thomas.lendacky@amd.com>
+  *
+@@ -23,6 +23,7 @@
+ #include <linux/hw_random.h>
+ 
+ 
++#define MAX_CCP_NAME_LEN		16
+ #define MAX_DMAPOOL_NAME_LEN		32
+ 
+ #define MAX_HW_QUEUES			5
+@@ -184,6 +185,12 @@ struct ccp_cmd_queue {
+ } ____cacheline_aligned;
+ 
+ struct ccp_device {
++	struct list_head entry;
++
++	unsigned int ord;
++	char name[MAX_CCP_NAME_LEN];
++	char rngname[MAX_CCP_NAME_LEN];
++
+ 	struct device *dev;
+ 
+ 	/*
+diff --git a/drivers/crypto/ccp/ccp-pci.c b/drivers/crypto/ccp/ccp-pci.c
+index 15741de944bc..e95aff1b195d 100644
+--- a/drivers/crypto/ccp/ccp-pci.c
++++ b/drivers/crypto/ccp/ccp-pci.c
+@@ -1,7 +1,7 @@
+ /*
+  * AMD Cryptographic Coprocessor (CCP) driver
+  *
+- * Copyright (C) 2013 Advanced Micro Devices, Inc.
++ * Copyright (C) 2013,2016 Advanced Micro Devices, Inc.
+  *
+  * Author: Tom Lendacky <thomas.lendacky@amd.com>
+  *
+@@ -60,7 +60,8 @@ static int ccp_get_msix_irqs(struct ccp_device *ccp)
+ 	ccp_pci->msix_count = v;
+ 	for (v = 0; v < ccp_pci->msix_count; v++) {
+ 		/* Set the interrupt names and request the irqs */
+-		snprintf(ccp_pci->msix[v].name, name_len, "ccp-%u", v);
++		snprintf(ccp_pci->msix[v].name, name_len, "%s-%u",
++			 ccp->name, v);
+ 		ccp_pci->msix[v].vector = msix_entry[v].vector;
+ 		ret = request_irq(ccp_pci->msix[v].vector, ccp_irq_handler,
+ 				  0, ccp_pci->msix[v].name, dev);
+@@ -95,7 +96,7 @@ static int ccp_get_msi_irq(struct ccp_device *ccp)
+ 		return ret;
+ 
+ 	ccp->irq = pdev->irq;
+-	ret = request_irq(ccp->irq, ccp_irq_handler, 0, "ccp", dev);
++	ret = request_irq(ccp->irq, ccp_irq_handler, 0, ccp->name, dev);
+ 	if (ret) {
+ 		dev_notice(dev, "unable to allocate MSI IRQ (%d)\n", ret);
+ 		goto e_msi;
+* Unmerged path drivers/crypto/ccp/ccp-platform.c
