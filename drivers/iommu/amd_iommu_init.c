@@ -2157,6 +2157,9 @@ static int __init early_amd_iommu_init(void)
 	if (ret)
 		goto out;
 
+	/* Disable any previously enabled IOMMUs */
+	disable_iommus();
+
 	if (amd_iommu_irq_remap)
 		amd_iommu_irq_remap = check_ioapic_information();
 
