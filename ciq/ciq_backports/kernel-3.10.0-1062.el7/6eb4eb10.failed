@@ -1,0 +1,320 @@
+IB/hfi1: Make the MSIx resource allocation a bit more flexible
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Michael J. Ruhl <michael.j.ruhl@intel.com>
+commit 6eb4eb10fb0d14340956c05281b7e09d80902788
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/6eb4eb10.failed
+
+The current method of allocating MSIx resources is a bit cumbersome,
+and not very easily added to.
+
+Refactor and re-order the code paths into a more consistent interface.
+
+Update the interface so that allocations are not order dependent.
+
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Reviewed-by: Sadanand Warrier <sadanand.warrier@intel.com>
+	Signed-off-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 6eb4eb10fb0d14340956c05281b7e09d80902788)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/chip.c
+#	drivers/infiniband/hw/hfi1/msix.c
+#	drivers/infiniband/hw/hfi1/vnic_main.c
+#	drivers/net/wireless/intel/iwlwifi/fw/common_rx.c
+diff --cc drivers/infiniband/hw/hfi1/chip.c
+index 82f2710fc5bc,8acbf8b0304f..000000000000
+--- a/drivers/infiniband/hw/hfi1/chip.c
++++ b/drivers/infiniband/hw/hfi1/chip.c
+@@@ -13364,49 -13099,14 +13364,60 @@@ static void reset_interrupts(struct hfi
+  		write_csr(dd, CCE_INT_MAP + (8 * i), 0);
+  }
+  
+++<<<<<<< HEAD
+ +static int set_up_interrupts(struct hfi1_devdata *dd)
+ +{
+ +	u32 total;
+ +	int ret, request;
+ +	int single_interrupt = 0; /* we expect to have all the interrupts */
+ +
+ +	/*
+ +	 * Interrupt count:
+ +	 *	1 general, "slow path" interrupt (includes the SDMA engines
+ +	 *		slow source, SDMACleanupDone)
+ +	 *	N interrupts - one per used SDMA engine
+ +	 *	M interrupt - one per kernel receive context
+ +	 *	V interrupt - one for each VNIC context
+ +	 */
+ +	total = 1 + dd->num_sdma + dd->n_krcv_queues + dd->num_vnic_contexts;
+ +
+ +	/* ask for MSI-X interrupts */
+ +	request = request_msix(dd, total);
+ +	if (request < 0) {
+ +		ret = request;
+ +		goto fail;
+ +	} else if (request == 0) {
+ +		/* using INTx */
+ +		/* dd->num_msix_entries already zero */
+ +		single_interrupt = 1;
+ +		dd_dev_err(dd, "MSI-X failed, using INTx interrupts\n");
+ +	} else if (request < total) {
+ +		/* using MSI-X, with reduced interrupts */
+ +		dd_dev_err(dd, "reduced interrupt found, wanted %u, got %u\n",
+ +			   total, request);
+ +		ret = -EINVAL;
+ +		goto fail;
+ +	} else {
+ +		dd->msix_entries = kcalloc(total, sizeof(*dd->msix_entries),
+ +					   GFP_KERNEL);
+ +		if (!dd->msix_entries) {
+ +			ret = -ENOMEM;
+ +			goto fail;
+ +		}
+ +		/* using MSI-X */
+ +		dd->num_msix_entries = total;
+ +		dd_dev_info(dd, "%u MSI-X interrupts allocated\n", total);
+ +	}
+++=======
++ /**
++  * set_up_interrupts() - Initialize the IRQ resources and state
++  * @dd: valid devdata
++  *
++  */
++ static int set_up_interrupts(struct hfi1_devdata *dd)
++ {
++ 	int ret;
+++>>>>>>> 6eb4eb10fb0d (IB/hfi1: Make the MSIx resource allocation a bit more flexible)
+  
+  	/* mask all interrupts */
+  	set_intr_state(dd, 0);
+@@@ -13416,17 -13116,15 +13427,29 @@@
+  	/* reset general handler mask, chip MSI-X mappings */
+  	reset_interrupts(dd);
+  
+++<<<<<<< HEAD
+ +	if (single_interrupt)
+ +		ret = request_intx_irq(dd);
+ +	else
+ +		ret = request_msix_irqs(dd);
+ +	if (ret)
+ +		goto fail;
+ +
+ +	return 0;
+ +
+ +fail:
+ +	hfi1_clean_up_interrupts(dd);
+++=======
++ 	/* ask for MSI-X interrupts */
++ 	ret = msix_initialize(dd);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = msix_request_irqs(dd);
++ 	if (ret)
++ 		msix_clean_up_interrupts(dd);
++ 
+++>>>>>>> 6eb4eb10fb0d (IB/hfi1: Make the MSIx resource allocation a bit more flexible)
+  	return ret;
+  }
+  
+@@@ -15296,7 -14994,8 +15319,12 @@@ bail_free_rcverr
+  bail_free_cntrs:
+  	free_cntrs(dd);
+  bail_clear_intr:
+++<<<<<<< HEAD
+ +	hfi1_clean_up_interrupts(dd);
+++=======
++ 	hfi1_comp_vectors_clean_up(dd);
++ 	msix_clean_up_interrupts(dd);
+++>>>>>>> 6eb4eb10fb0d (IB/hfi1: Make the MSIx resource allocation a bit more flexible)
+  bail_cleanup:
+  	hfi1_pcie_ddcleanup(dd);
+  bail_free:
+diff --cc drivers/infiniband/hw/hfi1/vnic_main.c
+index f298ee097aa6,c9876d9e3cb9..000000000000
+--- a/drivers/infiniband/hw/hfi1/vnic_main.c
++++ b/drivers/infiniband/hw/hfi1/vnic_main.c
+@@@ -120,8 -120,7 +120,12 @@@ static int allocate_vnic_ctxt(struct hf
+  	uctxt->seq_cnt = 1;
+  	uctxt->is_vnic = true;
+  
+++<<<<<<< HEAD
+ +	if (dd->num_msix_entries)
+ +		hfi1_set_vnic_msix_info(uctxt);
+++=======
++ 	msix_request_rcd_irq(uctxt);
+++>>>>>>> 6eb4eb10fb0d (IB/hfi1: Make the MSIx resource allocation a bit more flexible)
+  
+  	hfi1_stats.sps_ctxts++;
+  	dd_dev_dbg(dd, "created vnic context %d\n", uctxt->ctxt);
+@@@ -136,9 -135,6 +140,12 @@@ static void deallocate_vnic_ctxt(struc
+  	dd_dev_dbg(dd, "closing vnic context %d\n", uctxt->ctxt);
+  	flush_wc();
+  
+++<<<<<<< HEAD
+ +	if (dd->num_msix_entries)
+ +		hfi1_reset_vnic_msix_info(uctxt);
+ +
+++=======
+++>>>>>>> 6eb4eb10fb0d (IB/hfi1: Make the MSIx resource allocation a bit more flexible)
+  	/*
+  	 * Disable receive context and interrupt available, reset all
+  	 * RcvCtxtCtrl bits to default values.
+diff --cc drivers/net/wireless/intel/iwlwifi/fw/common_rx.c
+index 6f75985eea66,a514881632a4..000000000000
+--- a/drivers/net/wireless/intel/iwlwifi/fw/common_rx.c
++++ b/drivers/net/wireless/intel/iwlwifi/fw/common_rx.c
+@@@ -54,35 -44,21 +54,48 @@@
+   * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+   * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+   *
+ - */
+ -#ifndef _HFI1_MSIX_H
+ -#define _HFI1_MSIX_H
+ + *****************************************************************************/
+ +#include "iwl-drv.h"
+ +#include "runtime.h"
+ +#include "fw/api/commands.h"
+ +#include "fw/api/alive.h"
+ +
+ +static void iwl_fwrt_fseq_ver_mismatch(struct iwl_fw_runtime *fwrt,
+ +				       struct iwl_rx_cmd_buffer *rxb)
+ +{
+ +	struct iwl_rx_packet *pkt = rxb_addr(rxb);
+ +	struct iwl_fseq_ver_mismatch_ntf *fseq = (void *)pkt->data;
+  
+ -#include "hfi.h"
+++<<<<<<< HEAD:drivers/net/wireless/intel/iwlwifi/fw/common_rx.c
+ +	IWL_ERR(fwrt, "FSEQ version mismatch (aux: %d, wifi: %d)\n",
+ +		__le32_to_cpu(fseq->aux_read_fseq_ver),
+ +		__le32_to_cpu(fseq->wifi_fseq_ver));
+ +}
+  
+ +void iwl_fwrt_handle_notification(struct iwl_fw_runtime *fwrt,
+ +				  struct iwl_rx_cmd_buffer *rxb)
+ +{
+ +	struct iwl_rx_packet *pkt = rxb_addr(rxb);
+ +	u32 cmd = WIDE_ID(pkt->hdr.group_id, pkt->hdr.cmd);
+++=======
++ /* MSIx interface */
++ int msix_initialize(struct hfi1_devdata *dd);
++ int msix_request_irqs(struct hfi1_devdata *dd);
++ void msix_clean_up_interrupts(struct hfi1_devdata *dd);
++ int msix_request_rcd_irq(struct hfi1_ctxtdata *rcd);
++ int msix_request_sdma_irq(struct sdma_engine *sde);
++ void msix_free_irq(struct hfi1_devdata *dd, u8 msix_intr);
++ 
++ /* VNIC interface */
++ void msix_vnic_synchronize_irq(struct hfi1_devdata *dd);
+++>>>>>>> 6eb4eb10fb0d (IB/hfi1: Make the MSIx resource allocation a bit more flexible):drivers/infiniband/hw/hfi1/msix.h
+  
+ -#endif
+ +	switch (cmd) {
+ +	case WIDE_ID(SYSTEM_GROUP, FSEQ_VER_MISMATCH_NTF):
+ +		iwl_fwrt_fseq_ver_mismatch(fwrt, rxb);
+ +		break;
+ +	default:
+ +		break;
+ +	}
+ +}
+ +IWL_EXPORT_SYMBOL(iwl_fwrt_handle_notification);
+* Unmerged path drivers/infiniband/hw/hfi1/msix.c
+diff --git a/drivers/infiniband/hw/hfi1/affinity.c b/drivers/infiniband/hw/hfi1/affinity.c
+index 8fc3787db208..a19d577dbb1d 100644
+--- a/drivers/infiniband/hw/hfi1/affinity.c
++++ b/drivers/infiniband/hw/hfi1/affinity.c
+@@ -417,10 +417,10 @@ static void hfi1_update_sdma_affinity(struct hfi1_msix_entry *msix, int cpu)
+ 	set = &entry->def_intr;
+ 	cpumask_set_cpu(cpu, &set->mask);
+ 	cpumask_set_cpu(cpu, &set->used);
+-	for (i = 0; i < dd->num_msix_entries; i++) {
++	for (i = 0; i < dd->msix_info.max_requested; i++) {
+ 		struct hfi1_msix_entry *other_msix;
+ 
+-		other_msix = &dd->msix_entries[i];
++		other_msix = &dd->msix_info.msix_entries[i];
+ 		if (other_msix->type != IRQ_SDMA || other_msix == msix)
+ 			continue;
+ 
+* Unmerged path drivers/infiniband/hw/hfi1/chip.c
+diff --git a/drivers/infiniband/hw/hfi1/hfi.h b/drivers/infiniband/hw/hfi1/hfi.h
+index d83062c16532..e30856b388bf 100644
+--- a/drivers/infiniband/hw/hfi1/hfi.h
++++ b/drivers/infiniband/hw/hfi1/hfi.h
+@@ -668,6 +668,14 @@ struct hfi1_msix_entry {
+ 	struct irq_affinity_notify notify;
+ };
+ 
++struct hfi1_msix_info {
++	/* lock to synchronize in_use_msix access */
++	spinlock_t msix_lock;
++	DECLARE_BITMAP(in_use_msix, CCE_NUM_MSIX_VECTORS);
++	struct hfi1_msix_entry *msix_entries;
++	u16 max_requested;
++};
++
+ /* per-SL CCA information */
+ struct cca_timer {
+ 	struct hrtimer hrtimer;
+@@ -993,7 +1001,6 @@ struct hfi1_vnic_data {
+ 	struct idr vesw_idr;
+ 	u8 rmt_start;
+ 	u8 num_ctxt;
+-	u32 msix_idx;
+ };
+ 
+ struct hfi1_vnic_vport_info;
+@@ -1222,9 +1229,7 @@ struct hfi1_devdata {
+ 	struct diag_client *diag_client;
+ 
+ 	/* MSI-X information */
+-	struct hfi1_msix_entry *msix_entries;
+-	u32 num_msix_entries;
+-	u32 first_dyn_msix_idx;
++	struct hfi1_msix_info msix_info;
+ 
+ 	/* INTx information */
+ 	u32 requested_intx_irq;		/* did we request one? */
+diff --git a/drivers/infiniband/hw/hfi1/init.c b/drivers/infiniband/hw/hfi1/init.c
+index d0f1408a5fdc..039b87c7973a 100644
+--- a/drivers/infiniband/hw/hfi1/init.c
++++ b/drivers/infiniband/hw/hfi1/init.c
+@@ -1053,7 +1053,7 @@ static void shutdown_device(struct hfi1_devdata *dd)
+ 
+ 	/* mask and clean up interrupts, but not errors */
+ 	set_intr_state(dd, 0);
+-	hfi1_clean_up_interrupts(dd);
++	msix_clean_up_interrupts(dd);
+ 
+ 	for (pidx = 0; pidx < dd->num_pports; ++pidx) {
+ 		ppd = dd->pport + pidx;
+@@ -1720,7 +1720,7 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 		dd_dev_err(dd, "Failed to create /dev devices: %d\n", -j);
+ 
+ 	if (initfail || ret) {
+-		hfi1_clean_up_interrupts(dd);
++		msix_clean_up_interrupts(dd);
+ 		stop_timers(dd);
+ 		flush_workqueue(ib_wq);
+ 		for (pidx = 0; pidx < dd->num_pports; ++pidx) {
+* Unmerged path drivers/infiniband/hw/hfi1/msix.c
+diff --git a/drivers/infiniband/hw/hfi1/sdma.h b/drivers/infiniband/hw/hfi1/sdma.h
+index b433dd503585..dae8b09df070 100644
+--- a/drivers/infiniband/hw/hfi1/sdma.h
++++ b/drivers/infiniband/hw/hfi1/sdma.h
+@@ -405,6 +405,7 @@ struct sdma_engine {
+ 	struct list_head flushlist;
+ 	struct cpumask cpu_mask;
+ 	struct kobject kobj;
++	u32 msix_intr;
+ };
+ 
+ int sdma_init(struct hfi1_devdata *dd, u8 port);
+* Unmerged path drivers/infiniband/hw/hfi1/vnic_main.c
+* Unmerged path drivers/net/wireless/intel/iwlwifi/fw/common_rx.c
