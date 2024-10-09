@@ -15,6 +15,10 @@ struct nv50_disp {
 	struct nvkm_event uevent;
 
 	struct {
+		int nr;
+	} head;
+
+	struct {
 		u32 lvdsconf;
 	} sor;
 
