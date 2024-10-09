@@ -1,0 +1,192 @@
+tcmu: prep queue_cmd_ring to be used by unmap wq
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mike Christie <mchristi@redhat.com>
+commit 6fd0ce79724dabe2cd0bd8aed111cbe94755bf88
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/6fd0ce79.failed
+
+In the next patches we will call queue_cmd_ring from the submitting
+context and also the completion path. This changes the queue_cmd_ring
+return code so in the next patches we can return a sense_reason_t
+and also signal if a command was requeued.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 6fd0ce79724dabe2cd0bd8aed111cbe94755bf88)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 8fa83807dcdc,68d1d7214eeb..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -588,8 -752,40 +588,45 @@@ static inline size_t tcmu_cmd_get_cmd_s
+  	return command_size;
+  }
+  
+++<<<<<<< HEAD
+ +static sense_reason_t
+ +tcmu_queue_cmd_ring(struct tcmu_cmd *tcmu_cmd)
+++=======
++ static int tcmu_setup_cmd_timer(struct tcmu_cmd *tcmu_cmd)
++ {
++ 	struct tcmu_dev *udev = tcmu_cmd->tcmu_dev;
++ 	unsigned long tmo = udev->cmd_time_out;
++ 	int cmd_id;
++ 
++ 	if (tcmu_cmd->cmd_id)
++ 		return 0;
++ 
++ 	cmd_id = idr_alloc(&udev->commands, tcmu_cmd, 1, USHRT_MAX, GFP_NOWAIT);
++ 	if (cmd_id < 0) {
++ 		pr_err("tcmu: Could not allocate cmd id.\n");
++ 		return cmd_id;
++ 	}
++ 	tcmu_cmd->cmd_id = cmd_id;
++ 
++ 	if (!tmo)
++ 		return 0;
++ 
++ 	tcmu_cmd->deadline = round_jiffies_up(jiffies + msecs_to_jiffies(tmo));
++ 	mod_timer(&udev->timeout, tcmu_cmd->deadline);
++ 	return 0;
++ }
++ 
++ /**
++  * queue_cmd_ring - queue cmd to ring or internally
++  * @tcmu_cmd: cmd to queue
++  * @scsi_err: TCM error code if failure (-1) returned.
++  *
++  * Returns:
++  * -1 we cannot queue internally or to the ring.
++  *  0 success
++  */
++ static sense_reason_t queue_cmd_ring(struct tcmu_cmd *tcmu_cmd, int *scsi_err)
+++>>>>>>> 6fd0ce79724d (tcmu: prep queue_cmd_ring to be used by unmap wq)
+  {
+  	struct tcmu_dev *udev = tcmu_cmd->tcmu_dev;
+  	struct se_cmd *se_cmd = tcmu_cmd->se_cmd;
+@@@ -601,10 -797,14 +638,14 @@@
+  	uint32_t cmd_head;
+  	uint64_t cdb_off;
+  	bool copy_to_data_area;
+ -	size_t data_length = tcmu_cmd_get_data_length(tcmu_cmd);
+ +	size_t data_length;
+  
+- 	if (test_bit(TCMU_DEV_BIT_BROKEN, &udev->flags))
+- 		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
++ 	*scsi_err = TCM_NO_SENSE;
++ 
++ 	if (test_bit(TCMU_DEV_BIT_BROKEN, &udev->flags)) {
++ 		*scsi_err = TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
++ 		return -1;
++ 	}
+  
+  	/*
+  	 * Must be a certain minimum size for response sense info, but
+@@@ -635,11 -830,12 +676,17 @@@
+  		pr_warn("TCMU: Request of size %zu/%zu is too big for %u/%zu "
+  			"cmd ring/data area\n", command_size, data_length,
+  			udev->cmdr_size, udev->data_size);
+++<<<<<<< HEAD
+ +		spin_unlock_irq(&udev->cmdr_lock);
+ +		return TCM_INVALID_CDB_FIELD;
+++=======
++ 		mutex_unlock(&udev->cmdr_lock);
++ 		*scsi_err = TCM_INVALID_CDB_FIELD;
++ 		return -1;
+++>>>>>>> 6fd0ce79724d (tcmu: prep queue_cmd_ring to be used by unmap wq)
+  	}
+  
+ -	while (!is_ring_space_avail(udev, tcmu_cmd, command_size, data_length)) {
+ +	while (!is_ring_space_avail(udev, command_size, data_length)) {
+  		int ret;
+  		DEFINE_WAIT(__wait);
+  
+@@@ -667,11 -857,12 +714,17 @@@
+  			ret = schedule_timeout(msecs_to_jiffies(TCMU_TIME_OUT));
+  		finish_wait(&udev->wait_cmdr, &__wait);
+  		if (!ret) {
+++<<<<<<< HEAD
+ +			pr_debug("tcmu: command timed out waiting for ring space.\n");
+ +			return TCM_OUT_OF_RESOURCES;
+++=======
++ 			pr_warn("tcmu: command timed out\n");
++ 			*scsi_err = TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
++ 			return -1;
+++>>>>>>> 6fd0ce79724d (tcmu: prep queue_cmd_ring to be used by unmap wq)
+  		}
+  
+ -		mutex_lock(&udev->cmdr_lock);
+ +		spin_lock_irq(&udev->cmdr_lock);
+  
+  		/* We dropped cmdr_lock, cmd_head is stale */
+  		cmd_head = mb->cmd_head % udev->cmdr_size; /* UAM */
+@@@ -714,11 -904,24 +767,24 @@@
+  
+  	/* Handle BIDI commands */
+  	iov_cnt = 0;
+ -	if (se_cmd->se_cmd_flags & SCF_BIDI) {
+ -		iov++;
+ -		scatter_data_area(udev, tcmu_cmd, se_cmd->t_bidi_data_sg,
+ -				  se_cmd->t_bidi_data_nents, &iov, &iov_cnt,
+ -				  false);
+ -	}
+ +	alloc_and_scatter_data_area(udev, tcmu_cmd->data_bitmap,
+ +		se_cmd->t_bidi_data_sg, se_cmd->t_bidi_data_nents, &iov,
+ +		&iov_cnt, false);
+  	entry->req.iov_bidi_cnt = iov_cnt;
+  
+++<<<<<<< HEAD
+++=======
++ 	ret = tcmu_setup_cmd_timer(tcmu_cmd);
++ 	if (ret) {
++ 		tcmu_cmd_free_data(tcmu_cmd, tcmu_cmd->dbi_cnt);
++ 		mutex_unlock(&udev->cmdr_lock);
++ 
++ 		*scsi_err = TCM_OUT_OF_RESOURCES;
++ 		return -1;
++ 	}
++ 	entry->hdr.cmd_id = tcmu_cmd->cmd_id;
++ 
+++>>>>>>> 6fd0ce79724d (tcmu: prep queue_cmd_ring to be used by unmap wq)
+  	/*
+  	 * Recalaulate the command's base size and size according
+  	 * to the actual needs
+@@@ -753,25 -955,17 +819,28 @@@
+  static sense_reason_t
+  tcmu_queue_cmd(struct se_cmd *se_cmd)
+  {
+ +	struct se_device *se_dev = se_cmd->se_dev;
+ +	struct tcmu_dev *udev = TCMU_DEV(se_dev);
+  	struct tcmu_cmd *tcmu_cmd;
+- 	sense_reason_t ret;
++ 	sense_reason_t scsi_ret;
+  
+  	tcmu_cmd = tcmu_alloc_cmd(se_cmd);
+  	if (!tcmu_cmd)
+  		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+  
+++<<<<<<< HEAD
+ +	ret = tcmu_queue_cmd_ring(tcmu_cmd);
+ +	if (ret != TCM_NO_SENSE) {
+ +		spin_lock_irq(&udev->commands_lock);
+ +		idr_remove(&udev->commands, tcmu_cmd->cmd_id);
+ +		spin_unlock_irq(&udev->commands_lock);
+ +
+++=======
++ 	if (queue_cmd_ring(tcmu_cmd, &scsi_ret) < 0)
+++>>>>>>> 6fd0ce79724d (tcmu: prep queue_cmd_ring to be used by unmap wq)
+  		tcmu_free_cmd(tcmu_cmd);
+- 	}
+  
+- 	return ret;
++ 	return scsi_ret;
+  }
+  
+  static void tcmu_handle_completion(struct tcmu_cmd *cmd, struct tcmu_cmd_entry *entry)
+* Unmerged path drivers/target/target_core_user.c
