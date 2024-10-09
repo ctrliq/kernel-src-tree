@@ -20,6 +20,7 @@ nfp-objs := \
 	    nfp_devlink.o \
 	    nfp_main.o \
 	    nfp_net_common.o \
+	    nfp_net_ctrl.o \
 	    nfp_net_debugdump.o \
 	    nfp_net_ethtool.o \
 	    nfp_net_main.o \
