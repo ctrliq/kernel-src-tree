@@ -1,0 +1,107 @@
+nfp: use AND instead of modulo to get ring indexes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 1a1d74d378b13ad3f93e8975a0ade0980a49d28b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1a1d74d3.failed
+
+We already force ring sizes to be power of 2 so replace
+modulo operations with AND (size - 1) in index calculations.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1a1d74d378b13ad3f93e8975a0ade0980a49d28b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 8344e8e82257,7225ab61a120..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -1104,10 -1129,10 +1104,10 @@@ static void nfp_net_rx_give_one(struct 
+  {
+  	unsigned int wr_idx;
+  
+- 	wr_idx = rx_ring->wr_p % rx_ring->cnt;
++ 	wr_idx = rx_ring->wr_p & (rx_ring->cnt - 1);
+  
+  	/* Stash SKB and DMA address away */
+ -	rx_ring->rxbufs[wr_idx].frag = frag;
+ +	rx_ring->rxbufs[wr_idx].skb = skb;
+  	rx_ring->rxbufs[wr_idx].dma_addr = dma_addr;
+  
+  	/* Fill freelist descriptor */
+@@@ -1139,12 -1164,12 +1139,12 @@@ static void nfp_net_rx_ring_reset(struc
+  	unsigned int wr_idx, last_idx;
+  
+  	/* Move the empty entry to the end of the list */
+- 	wr_idx = rx_ring->wr_p % rx_ring->cnt;
++ 	wr_idx = rx_ring->wr_p & (rx_ring->cnt - 1);
+  	last_idx = rx_ring->cnt - 1;
+  	rx_ring->rxbufs[wr_idx].dma_addr = rx_ring->rxbufs[last_idx].dma_addr;
+ -	rx_ring->rxbufs[wr_idx].frag = rx_ring->rxbufs[last_idx].frag;
+ +	rx_ring->rxbufs[wr_idx].skb = rx_ring->rxbufs[last_idx].skb;
+  	rx_ring->rxbufs[last_idx].dma_addr = 0;
+ -	rx_ring->rxbufs[last_idx].frag = NULL;
+ +	rx_ring->rxbufs[last_idx].skb = NULL;
+  
+  	memset(rx_ring->rxds, 0, sizeof(*rx_ring->rxds) * rx_ring->cnt);
+  	rx_ring->wr_p = 0;
+@@@ -1341,41 -1404,21 +1341,46 @@@ static int nfp_net_rx(struct nfp_net_rx
+  	struct nfp_net_r_vector *r_vec = rx_ring->r_vec;
+  	struct nfp_net *nn = r_vec->nfp_net;
+  	unsigned int data_len, meta_len;
+ -	struct nfp_net_rx_buf *rxbuf;
+ +	int avail = 0, pkts_polled = 0;
+ +	struct sk_buff *skb, *new_skb;
+  	struct nfp_net_rx_desc *rxd;
+  	dma_addr_t new_dma_addr;
+ -	struct sk_buff *skb;
+ -	int pkts_polled = 0;
+ -	void *new_frag;
+ +	u32 qcp_wr_p;
+  	int idx;
+  
+++<<<<<<< HEAD
+ +	if (nn->is_nfp3200) {
+ +		/* Work out how many packets arrived */
+ +		qcp_wr_p = nfp_qcp_wr_ptr_read(rx_ring->qcp_rx);
+ +		idx = rx_ring->rd_p % rx_ring->cnt;
+ +
+ +		if (qcp_wr_p == idx)
+ +			/* No new packets */
+ +			return 0;
+ +
+ +		if (qcp_wr_p > idx)
+ +			avail = qcp_wr_p - idx;
+ +		else
+ +			avail = qcp_wr_p + rx_ring->cnt - idx;
+ +	} else {
+ +		avail = budget + 1;
+ +	}
+ +
+ +	while (avail > 0 && pkts_polled < budget) {
+ +		idx = rx_ring->rd_p % rx_ring->cnt;
+++=======
++ 	while (pkts_polled < budget) {
++ 		idx = rx_ring->rd_p & (rx_ring->cnt - 1);
+++>>>>>>> 1a1d74d378b1 (nfp: use AND instead of modulo to get ring indexes)
+  
+  		rxd = &rx_ring->rxds[idx];
+ -		if (!(rxd->rxd.meta_len_dd & PCIE_DESC_RX_DD))
+ +		if (!(rxd->rxd.meta_len_dd & PCIE_DESC_RX_DD)) {
+ +			if (nn->is_nfp3200)
+ +				nn_dbg(nn, "RX descriptor not valid (DD)%d:%u rxd[0]=%#x rxd[1]=%#x\n",
+ +				       rx_ring->idx, idx,
+ +				       rxd->vals[0], rxd->vals[1]);
+  			break;
+ -
+ +		}
+  		/* Memory barrier to ensure that we won't do other reads
+  		 * before the DD bit.
+  		 */
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
