@@ -46,6 +46,8 @@
 #define trace_hw_interval_param(substream, type, index, prev, curr)
 #endif
 
+#include "pcm_local.h"
+
 /*
  *  Compatibility
  */
