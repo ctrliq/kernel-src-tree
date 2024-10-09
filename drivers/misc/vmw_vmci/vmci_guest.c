@@ -164,7 +164,7 @@ static void vmci_guest_cid_update(u32 sub_id,
  * true if required hypercalls (or fallback hypercalls) are
  * supported by the host, false otherwise.
  */
-static bool vmci_check_host_caps(struct pci_dev *pdev)
+static int vmci_check_host_caps(struct pci_dev *pdev)
 {
 	bool result;
 	struct vmci_resource_query_msg *msg;
@@ -175,7 +175,7 @@ static bool vmci_check_host_caps(struct pci_dev *pdev)
 	check_msg = kmalloc(msg_size, GFP_KERNEL);
 	if (!check_msg) {
 		dev_err(&pdev->dev, "%s: Insufficient memory\n", __func__);
-		return false;
+		return -ENOMEM;
 	}
 
 	check_msg->dst = vmci_make_handle(VMCI_HYPERVISOR_CONTEXT_ID,
@@ -195,7 +195,7 @@ static bool vmci_check_host_caps(struct pci_dev *pdev)
 		__func__, result ? "PASSED" : "FAILED");
 
 	/* We need the vector. There are no fallbacks. */
-	return result;
+	return result ? 0 : -ENXIO;
 }
 
 /*
@@ -563,12 +563,14 @@ static int vmci_guest_probe_device(struct pci_dev *pdev,
 			dev_warn(&pdev->dev,
 				 "VMCI device unable to register notification bitmap with PPN 0x%x\n",
 				 (u32) bitmap_ppn);
+			error = -ENXIO;
 			goto err_remove_vmci_dev_g;
 		}
 	}
 
 	/* Check host capabilities. */
-	if (!vmci_check_host_caps(pdev))
+	error = vmci_check_host_caps(pdev);
+	if (error)
 		goto err_remove_bitmap;
 
 	/* Enable device. */
