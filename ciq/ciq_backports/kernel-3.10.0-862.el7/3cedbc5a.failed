@@ -1,0 +1,295 @@
+intel_pstate: use updated msr-index.h HWP.EPP values
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Len Brown <len.brown@intel.com>
+commit 3cedbc5a6d7f7c5539e139f89ec9f6e1ed668418
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3cedbc5a.failed
+
+intel_pstate exports sysfs attributes for setting and observing HWP.EPP.
+These attributes use strings to describe 4 operating states, and
+inside the driver, these strings are mapped to numerical register
+values.
+
+The authorative mapping between the strings and numerical HWP.EPP values
+are now globally defined in msr-index.h, replacing the out-dated
+mapping that were open-coded into intel_pstate.c
+
+new old string
+--- --- ------
+  0   0 performance
+128  64 balance_performance
+192 128 balance_power
+255 192 power
+
+Note that the HW and BIOS default value on most system is 128,
+which intel_pstate will now call "balance_performance"
+while it used to call it "balance_power".
+
+	Signed-off-by: Len Brown <len.brown@intel.com>
+(cherry picked from commit 3cedbc5a6d7f7c5539e139f89ec9f6e1ed668418)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/intel_pstate.c
+diff --cc drivers/cpufreq/intel_pstate.c
+index b6f8db18a31a,ab8ebaeb3621..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -541,22 -640,243 +541,239 @@@ static inline void update_turbo_state(v
+  		 cpu->pstate.max_pstate == cpu->pstate.turbo_pstate);
+  }
+  
+++<<<<<<< HEAD
+ +static void intel_pstate_hwp_set(const struct cpumask *cpumask)
+++=======
++ static s16 intel_pstate_get_epb(struct cpudata *cpu_data)
++ {
++ 	u64 epb;
++ 	int ret;
++ 
++ 	if (!static_cpu_has(X86_FEATURE_EPB))
++ 		return -ENXIO;
++ 
++ 	ret = rdmsrl_on_cpu(cpu_data->cpu, MSR_IA32_ENERGY_PERF_BIAS, &epb);
++ 	if (ret)
++ 		return (s16)ret;
++ 
++ 	return (s16)(epb & 0x0f);
++ }
++ 
++ static s16 intel_pstate_get_epp(struct cpudata *cpu_data, u64 hwp_req_data)
++ {
++ 	s16 epp;
++ 
++ 	if (static_cpu_has(X86_FEATURE_HWP_EPP)) {
++ 		/*
++ 		 * When hwp_req_data is 0, means that caller didn't read
++ 		 * MSR_HWP_REQUEST, so need to read and get EPP.
++ 		 */
++ 		if (!hwp_req_data) {
++ 			epp = rdmsrl_on_cpu(cpu_data->cpu, MSR_HWP_REQUEST,
++ 					    &hwp_req_data);
++ 			if (epp)
++ 				return epp;
++ 		}
++ 		epp = (hwp_req_data >> 24) & 0xff;
++ 	} else {
++ 		/* When there is no EPP present, HWP uses EPB settings */
++ 		epp = intel_pstate_get_epb(cpu_data);
++ 	}
++ 
++ 	return epp;
++ }
++ 
++ static int intel_pstate_set_epb(int cpu, s16 pref)
++ {
++ 	u64 epb;
++ 	int ret;
++ 
++ 	if (!static_cpu_has(X86_FEATURE_EPB))
++ 		return -ENXIO;
++ 
++ 	ret = rdmsrl_on_cpu(cpu, MSR_IA32_ENERGY_PERF_BIAS, &epb);
++ 	if (ret)
++ 		return ret;
++ 
++ 	epb = (epb & ~0x0f) | pref;
++ 	wrmsrl_on_cpu(cpu, MSR_IA32_ENERGY_PERF_BIAS, epb);
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * EPP/EPB display strings corresponding to EPP index in the
++  * energy_perf_strings[]
++  *	index		String
++  *-------------------------------------
++  *	0		default
++  *	1		performance
++  *	2		balance_performance
++  *	3		balance_power
++  *	4		power
++  */
++ static const char * const energy_perf_strings[] = {
++ 	"default",
++ 	"performance",
++ 	"balance_performance",
++ 	"balance_power",
++ 	"power",
++ 	NULL
++ };
++ static const unsigned int epp_values[] = {
++ 	HWP_EPP_PERFORMANCE,
++ 	HWP_EPP_BALANCE_PERFORMANCE,
++ 	HWP_EPP_BALANCE_POWERSAVE,
++ 	HWP_EPP_POWERSAVE
++ };
++ 
++ static int intel_pstate_get_energy_pref_index(struct cpudata *cpu_data)
++ {
++ 	s16 epp;
++ 	int index = -EINVAL;
++ 
++ 	epp = intel_pstate_get_epp(cpu_data, 0);
++ 	if (epp < 0)
++ 		return epp;
++ 
++ 	if (static_cpu_has(X86_FEATURE_HWP_EPP)) {
++ 		if (epp == HWP_EPP_PERFORMANCE)
++ 			return 1;
++ 		if (epp <= HWP_EPP_BALANCE_PERFORMANCE)
++ 			return 2;
++ 		if (epp <= HWP_EPP_BALANCE_POWERSAVE)
++ 			return 3;
++ 		else
++ 			return 4;
++ 	} else if (static_cpu_has(X86_FEATURE_EPB)) {
++ 		/*
++ 		 * Range:
++ 		 *	0x00-0x03	:	Performance
++ 		 *	0x04-0x07	:	Balance performance
++ 		 *	0x08-0x0B	:	Balance power
++ 		 *	0x0C-0x0F	:	Power
++ 		 * The EPB is a 4 bit value, but our ranges restrict the
++ 		 * value which can be set. Here only using top two bits
++ 		 * effectively.
++ 		 */
++ 		index = (epp >> 2) + 1;
++ 	}
++ 
++ 	return index;
++ }
++ 
++ static int intel_pstate_set_energy_pref_index(struct cpudata *cpu_data,
++ 					      int pref_index)
++ {
++ 	int epp = -EINVAL;
++ 	int ret;
++ 
++ 	if (!pref_index)
++ 		epp = cpu_data->epp_default;
++ 
++ 	mutex_lock(&intel_pstate_limits_lock);
++ 
++ 	if (static_cpu_has(X86_FEATURE_HWP_EPP)) {
++ 		u64 value;
++ 
++ 		ret = rdmsrl_on_cpu(cpu_data->cpu, MSR_HWP_REQUEST, &value);
++ 		if (ret)
++ 			goto return_pref;
++ 
++ 		value &= ~GENMASK_ULL(31, 24);
++ 
++ 		if (epp == -EINVAL)
++ 			epp = epp_values[pref_index - 1];
++ 
++ 		value |= (u64)epp << 24;
++ 		ret = wrmsrl_on_cpu(cpu_data->cpu, MSR_HWP_REQUEST, value);
++ 	} else {
++ 		if (epp == -EINVAL)
++ 			epp = (pref_index - 1) << 2;
++ 		ret = intel_pstate_set_epb(cpu_data->cpu, epp);
++ 	}
++ return_pref:
++ 	mutex_unlock(&intel_pstate_limits_lock);
++ 
++ 	return ret;
++ }
++ 
++ static ssize_t show_energy_performance_available_preferences(
++ 				struct cpufreq_policy *policy, char *buf)
++ {
++ 	int i = 0;
++ 	int ret = 0;
++ 
++ 	while (energy_perf_strings[i] != NULL)
++ 		ret += sprintf(&buf[ret], "%s ", energy_perf_strings[i++]);
++ 
++ 	ret += sprintf(&buf[ret], "\n");
++ 
++ 	return ret;
++ }
++ 
++ cpufreq_freq_attr_ro(energy_performance_available_preferences);
++ 
++ static ssize_t store_energy_performance_preference(
++ 		struct cpufreq_policy *policy, const char *buf, size_t count)
++ {
++ 	struct cpudata *cpu_data = all_cpu_data[policy->cpu];
++ 	char str_preference[21];
++ 	int ret, i = 0;
++ 
++ 	ret = sscanf(buf, "%20s", str_preference);
++ 	if (ret != 1)
++ 		return -EINVAL;
++ 
++ 	while (energy_perf_strings[i] != NULL) {
++ 		if (!strcmp(str_preference, energy_perf_strings[i])) {
++ 			intel_pstate_set_energy_pref_index(cpu_data, i);
++ 			return count;
++ 		}
++ 		++i;
++ 	}
++ 
++ 	return -EINVAL;
++ }
++ 
++ static ssize_t show_energy_performance_preference(
++ 				struct cpufreq_policy *policy, char *buf)
++ {
++ 	struct cpudata *cpu_data = all_cpu_data[policy->cpu];
++ 	int preference;
++ 
++ 	preference = intel_pstate_get_energy_pref_index(cpu_data);
++ 	if (preference < 0)
++ 		return preference;
++ 
++ 	return  sprintf(buf, "%s\n", energy_perf_strings[preference]);
++ }
++ 
++ cpufreq_freq_attr_rw(energy_performance_preference);
++ 
++ static struct freq_attr *hwp_cpufreq_attrs[] = {
++ 	&energy_performance_preference,
++ 	&energy_performance_available_preferences,
++ 	NULL,
++ };
++ 
++ static void intel_pstate_hwp_set(struct cpufreq_policy *policy)
+++>>>>>>> 3cedbc5a6d7f (intel_pstate: use updated msr-index.h HWP.EPP values)
+  {
+  	int min, hw_min, max, hw_max, cpu, range, adj_range;
+ -	struct perf_limits *perf_limits = limits;
+  	u64 value, cap;
+  
+ -	for_each_cpu(cpu, policy->cpus) {
+ -		int max_perf_pct, min_perf_pct;
+ -		struct cpudata *cpu_data = all_cpu_data[cpu];
+ -		s16 epp;
+ -
+ -		if (per_cpu_limits)
+ -			perf_limits = all_cpu_data[cpu]->perf_limits;
+ -
+ +	for_each_cpu(cpu, cpumask) {
+  		rdmsrl_on_cpu(cpu, MSR_HWP_CAPABILITIES, &cap);
+  		hw_min = HWP_LOWEST_PERF(cap);
+ -		hw_max = HWP_HIGHEST_PERF(cap);
+ +		if (limits->no_turbo)
+ +			hw_max = HWP_GUARANTEED_PERF(cap);
+ +		else
+ +			hw_max = HWP_HIGHEST_PERF(cap);
+  		range = hw_max - hw_min;
+  
+ -		max_perf_pct = perf_limits->max_perf_pct;
+ -		min_perf_pct = perf_limits->min_perf_pct;
+ -
+  		rdmsrl_on_cpu(cpu, MSR_HWP_REQUEST, &value);
+ -		adj_range = min_perf_pct * range / 100;
+ +		adj_range = limits->min_perf_pct * range / 100;
+  		min = hw_min + adj_range;
+  		value &= ~HWP_MIN_PERF(~0L);
+  		value |= HWP_MIN_PERF(min);
+* Unmerged path drivers/cpufreq/intel_pstate.c
