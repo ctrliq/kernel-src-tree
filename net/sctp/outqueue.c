@@ -362,7 +362,7 @@ static int sctp_prsctp_prune_sent(struct sctp_association *asoc,
 
 	list_for_each_entry_safe(chk, temp, queue, transmitted_list) {
 		if (!SCTP_PR_PRIO_ENABLED(chk->sinfo.sinfo_flags) ||
-		    chk->prsctp_param <= sinfo->sinfo_timetolive)
+		    chk->sinfo.sinfo_timetolive <= sinfo->sinfo_timetolive)
 			continue;
 
 		list_del_init(&chk->transmitted_list);
@@ -397,7 +397,7 @@ static int sctp_prsctp_prune_unsent(struct sctp_association *asoc,
 
 	list_for_each_entry_safe(chk, temp, queue, list) {
 		if (!SCTP_PR_PRIO_ENABLED(chk->sinfo.sinfo_flags) ||
-		    chk->prsctp_param <= sinfo->sinfo_timetolive)
+		    chk->sinfo.sinfo_timetolive <= sinfo->sinfo_timetolive)
 			continue;
 
 		list_del_init(&chk->list);
