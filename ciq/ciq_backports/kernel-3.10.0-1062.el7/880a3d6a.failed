@@ -1,0 +1,179 @@
+powerpc/xics: Properly set Edge/Level type and enable resend
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [powerpc] xics: Properly set Edge/Level type and enable resend (Gustavo Duarte) [1577105]
+Rebuild_FUZZ: 92.86%
+commit-author Benjamin Herrenschmidt <benh@kernel.crashing.org>
+commit 880a3d6afd068682d6386a0528be1217541d3d8e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/880a3d6a.failed
+
+This sets the type of the interrupt appropriately. We set it as follow:
+
+ - If not mapped from the device-tree, we use edge. This is the case
+of the virtual interrupts and PCI MSIs for example.
+
+ - If mapped from the device-tree and #interrupt-cells is 2 (PAPR
+compliant), we use the second cell to set the appropriate type
+
+ - If mapped from the device-tree and #interrupt-cells is 1 (current
+OPAL on P8 does that), we assume level sensitive since those are
+typically going to be the PSI LSIs which are level sensitive.
+
+Additionally, we mark the interrupts requested via the opal_interrupts
+property all level. This is a bit fishy but the best we can do until we
+fix OPAL to properly expose them with a complete descriptor. It is also
+correct for the current HW anyway as OPAL interrupts are currently PCI
+error and PSI interrupts which are level.
+
+Finally now that edge interrupts are properly identified, we can enable
+CONFIG_HARDIRQS_SW_RESEND which will make the core re-send them if
+they occur while masked, which some drivers rely upon.
+
+This fixes issues with lost interrupts on some Mellanox adapters.
+
+	Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 880a3d6afd068682d6386a0528be1217541d3d8e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/powernv/opal-irqchip.c
+* Unmerged path arch/powerpc/platforms/powernv/opal-irqchip.c
+diff --git a/arch/powerpc/include/asm/xics.h b/arch/powerpc/include/asm/xics.h
+index e45d8ec5a9c4..2b991a34ae50 100644
+--- a/arch/powerpc/include/asm/xics.h
++++ b/arch/powerpc/include/asm/xics.h
+@@ -153,6 +153,8 @@ extern void xics_teardown_cpu(void);
+ extern void xics_kexec_teardown_cpu(int secondary);
+ extern void xics_migrate_irqs_away(void);
+ extern void icp_native_eoi(struct irq_data *d);
++extern int xics_set_irq_type(struct irq_data *d, unsigned int flow_type);
++extern int xics_retrigger(struct irq_data *data);
+ #ifdef CONFIG_SMP
+ extern int xics_get_irq_server(unsigned int virq, const struct cpumask *cpumask,
+ 			       unsigned int strict_check);
+* Unmerged path arch/powerpc/platforms/powernv/opal-irqchip.c
+diff --git a/arch/powerpc/sysdev/xics/Kconfig b/arch/powerpc/sysdev/xics/Kconfig
+index 0031eda320c3..385e7aa9e273 100644
+--- a/arch/powerpc/sysdev/xics/Kconfig
++++ b/arch/powerpc/sysdev/xics/Kconfig
+@@ -1,6 +1,7 @@
+ config PPC_XICS
+        def_bool n
+        select PPC_SMP_MUXED_IPI
++       select HARDIRQS_SW_RESEND
+ 
+ config PPC_ICP_NATIVE
+        def_bool n
+diff --git a/arch/powerpc/sysdev/xics/ics-opal.c b/arch/powerpc/sysdev/xics/ics-opal.c
+index 3c6ee1b64e5d..1ee905b7aa3a 100644
+--- a/arch/powerpc/sysdev/xics/ics-opal.c
++++ b/arch/powerpc/sysdev/xics/ics-opal.c
+@@ -158,7 +158,9 @@ static struct irq_chip ics_opal_irq_chip = {
+ 	.irq_mask = ics_opal_mask_irq,
+ 	.irq_unmask = ics_opal_unmask_irq,
+ 	.irq_eoi = NULL, /* Patched at init time */
+-	.irq_set_affinity = ics_opal_set_affinity
++	.irq_set_affinity = ics_opal_set_affinity,
++	.irq_set_type = xics_set_irq_type,
++	.irq_retrigger = xics_retrigger,
+ };
+ 
+ static int ics_opal_map(struct ics *ics, unsigned int virq);
+diff --git a/arch/powerpc/sysdev/xics/ics-rtas.c b/arch/powerpc/sysdev/xics/ics-rtas.c
+index 936575d99c5c..b4eff5e7c42d 100644
+--- a/arch/powerpc/sysdev/xics/ics-rtas.c
++++ b/arch/powerpc/sysdev/xics/ics-rtas.c
+@@ -166,7 +166,9 @@ static struct irq_chip ics_rtas_irq_chip = {
+ 	.irq_mask = ics_rtas_mask_irq,
+ 	.irq_unmask = ics_rtas_unmask_irq,
+ 	.irq_eoi = NULL, /* Patched at init time */
+-	.irq_set_affinity = ics_rtas_set_affinity
++	.irq_set_affinity = ics_rtas_set_affinity,
++	.irq_set_type = xics_set_irq_type,
++	.irq_retrigger = xics_retrigger,
+ };
+ 
+ static int ics_rtas_map(struct ics *ics, unsigned int virq)
+diff --git a/arch/powerpc/sysdev/xics/xics-common.c b/arch/powerpc/sysdev/xics/xics-common.c
+index fe0cca477164..46c4a1bd9fce 100644
+--- a/arch/powerpc/sysdev/xics/xics-common.c
++++ b/arch/powerpc/sysdev/xics/xics-common.c
+@@ -329,8 +329,12 @@ static int xics_host_map(struct irq_domain *h, unsigned int virq,
+ 
+ 	pr_devel("xics: map virq %d, hwirq 0x%lx\n", virq, hw);
+ 
+-	/* They aren't all level sensitive but we just don't really know */
+-	irq_set_status_flags(virq, IRQ_LEVEL);
++	/*
++	 * Mark interrupts as edge sensitive by default so that resend
++	 * actually works. The device-tree parsing will turn the LSIs
++	 * back to level.
++	 */
++	irq_clear_status_flags(virq, IRQ_LEVEL);
+ 
+ 	/* Don't call into ICS for IPIs */
+ 	if (hw == XICS_IPI) {
+@@ -352,13 +356,54 @@ static int xics_host_xlate(struct irq_domain *h, struct device_node *ct,
+ 			   irq_hw_number_t *out_hwirq, unsigned int *out_flags)
+ 
+ {
+-	/* Current xics implementation translates everything
+-	 * to level. It is not technically right for MSIs but this
+-	 * is irrelevant at this point. We might get smarter in the future
+-	 */
+ 	*out_hwirq = intspec[0];
+-	*out_flags = IRQ_TYPE_LEVEL_LOW;
+ 
++	/*
++	 * If intsize is at least 2, we look for the type in the second cell,
++	 * we assume the LSB indicates a level interrupt.
++	 */
++	if (intsize > 1) {
++		if (intspec[1] & 1)
++			*out_flags = IRQ_TYPE_LEVEL_LOW;
++		else
++			*out_flags = IRQ_TYPE_EDGE_RISING;
++	} else
++		*out_flags = IRQ_TYPE_LEVEL_LOW;
++
++	return 0;
++}
++
++int xics_set_irq_type(struct irq_data *d, unsigned int flow_type)
++{
++	/*
++	 * We only support these. This has really no effect other than setting
++	 * the corresponding descriptor bits mind you but those will in turn
++	 * affect the resend function when re-enabling an edge interrupt.
++	 *
++	 * Set set the default to edge as explained in map().
++	 */
++	if (flow_type == IRQ_TYPE_DEFAULT || flow_type == IRQ_TYPE_NONE)
++		flow_type = IRQ_TYPE_EDGE_RISING;
++
++	if (flow_type != IRQ_TYPE_EDGE_RISING &&
++	    flow_type != IRQ_TYPE_LEVEL_LOW)
++		return -EINVAL;
++
++	irqd_set_trigger_type(d, flow_type);
++
++	return IRQ_SET_MASK_OK_NOCOPY;
++}
++
++int xics_retrigger(struct irq_data *data)
++{
++	/*
++	 * We need to push a dummy CPPR when retriggering, since the subsequent
++	 * EOI will try to pop it. Passing 0 works, as the function hard codes
++	 * the priority value anyway.
++	 */
++	xics_push_cppr(0);
++
++	/* Tell the core to do a soft retrigger */
+ 	return 0;
+ }
+ 
