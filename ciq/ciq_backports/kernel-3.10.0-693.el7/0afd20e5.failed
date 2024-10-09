@@ -1,0 +1,86 @@
+fm10k: implement request_lport_map pointer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 0afd20e5573c4aa976f1b935b6df73592b46ded5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/0afd20e5.failed
+
+If the fm10k interface is brought up, but the switch manager software is
+not running, the driver will continuously request the lport map every
+few seconds in the base driver watchdog routine. Eventually after
+several minutes the switch mailbox Tx fifo will fill up and the mailbox
+will timeout, resulting in a reset. This reset will appear as if for no
+reason, and occurs regularly every few minutes until the switch manager
+software is loaded.
+
+Prevent this from happening by only requesting the lport map after we've
+verified the switch mailbox is tx_ready. In order to simplify code logic
+and reduce code duplication, implement this as a new function pointer
+"mac.ops.request_lport_map" which the VF will not implement. Otherwise,
+we have to duplicate the tx_ready check outside of
+fm10k_get_host_state_generic, or re-implement most of
+fm10k_get_host_state_generic in the pf version.
+
+The resulting code is simpler and easier to understand, and prevents the
+PF from continuously requesting lport map and filling the Tx fifo of
+a switch mailbox that isn't ready.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Krishneil Singh <Krishneil.k.singh@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 0afd20e5573c4aa976f1b935b6df73592b46ded5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/fm10k/fm10k_pf.c
+diff --cc drivers/net/ethernet/intel/fm10k/fm10k_pf.c
+index fe5f2c11adc7,682299dd0ce4..000000000000
+--- a/drivers/net/ethernet/intel/fm10k/fm10k_pf.c
++++ b/drivers/net/ethernet/intel/fm10k/fm10k_pf.c
+@@@ -1912,8 -1806,7 +1902,12 @@@ static const struct fm10k_mac_ops mac_o
+  	.set_dma_mask		= fm10k_set_dma_mask_pf,
+  	.get_fault		= fm10k_get_fault_pf,
+  	.get_host_state		= fm10k_get_host_state_pf,
+++<<<<<<< HEAD
+ +	.adjust_systime		= fm10k_adjust_systime_pf,
+ +	.read_systime		= fm10k_read_systime_pf,
+++=======
++ 	.request_lport_map	= fm10k_request_lport_map_pf,
+++>>>>>>> 0afd20e5573c (fm10k: implement request_lport_map pointer)
+  };
+  
+  static const struct fm10k_iov_ops iov_ops_pf = {
+diff --git a/drivers/net/ethernet/intel/fm10k/fm10k_common.c b/drivers/net/ethernet/intel/fm10k/fm10k_common.c
+index 6cfae6ac04ea..6258d8c7eb37 100644
+--- a/drivers/net/ethernet/intel/fm10k/fm10k_common.c
++++ b/drivers/net/ethernet/intel/fm10k/fm10k_common.c
+@@ -519,8 +519,12 @@ s32 fm10k_get_host_state_generic(struct fm10k_hw *hw, bool *host_ready)
+ 		goto out;
+ 
+ 	/* interface cannot receive traffic without logical ports */
+-	if (mac->dglort_map == FM10K_DGLORTMAP_NONE)
++	if (mac->dglort_map == FM10K_DGLORTMAP_NONE) {
++		if (hw->mac.ops.request_lport_map)
++			ret_val = hw->mac.ops.request_lport_map(hw);
++
+ 		goto out;
++	}
+ 
+ 	/* if we passed all the tests above then the switch is ready and we no
+ 	 * longer need to check for link
+* Unmerged path drivers/net/ethernet/intel/fm10k/fm10k_pf.c
+diff --git a/drivers/net/ethernet/intel/fm10k/fm10k_type.h b/drivers/net/ethernet/intel/fm10k/fm10k_type.h
+index 6fad5f274ae6..8a0cca930231 100644
+--- a/drivers/net/ethernet/intel/fm10k/fm10k_type.h
++++ b/drivers/net/ethernet/intel/fm10k/fm10k_type.h
+@@ -534,6 +534,7 @@ struct fm10k_mac_ops {
+ 	s32 (*stop_hw)(struct fm10k_hw *);
+ 	s32 (*get_bus_info)(struct fm10k_hw *);
+ 	s32 (*get_host_state)(struct fm10k_hw *, bool *);
++	s32 (*request_lport_map)(struct fm10k_hw *);
+ 	s32 (*update_vlan)(struct fm10k_hw *, u32, u8, bool);
+ 	s32 (*read_mac_addr)(struct fm10k_hw *);
+ 	s32 (*update_uc_addr)(struct fm10k_hw *, u16, const u8 *,
