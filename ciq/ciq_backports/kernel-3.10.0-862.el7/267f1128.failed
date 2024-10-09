@@ -1,0 +1,87 @@
+locks: remove conditional lock release in middle of flock_lock_file
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jeff Layton <jeff.layton@primarydata.com>
+commit 267f1128583074b575b90a58de4dcb12dd25af96
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/267f1128.failed
+
+As Linus pointed out:
+
+    Say we have an existing flock, and now do a new one that conflicts. I
+    see what looks like three separate bugs.
+
+     - We go through the first loop, find a lock of another type, and
+    delete it in preparation for replacing it
+
+     - we *drop* the lock context spinlock.
+
+     - BUG #1? So now there is no lock at all, and somebody can come in
+    and see that unlocked state. Is that really valid?
+
+     - another thread comes in while the first thread dropped the lock
+    context lock, and wants to add its own lock. It doesn't see the
+    deleted or pending locks, so it just adds it
+
+     - the first thread gets the context spinlock again, and adds the lock
+    that replaced the original
+
+     - BUG #2? So now there are *two* locks on the thing, and the next
+    time you do an unlock (or when you close the file), it will only
+    remove/replace the first one.
+
+...remove the "drop the spinlock" code in the middle of this function as
+it has always been suspicious. This should eliminate the potential race
+that can leave two locks for the same struct file on the list.
+
+He also pointed out another thing as a bug -- namely that you
+flock_lock_file removes the lock from the list unconditionally when
+doing a lock upgrade, without knowing whether it'll be able to set the
+new lock. Bruce pointed out that this is expected behavior and may help
+prevent certain deadlock situations.
+
+We may want to revisit that at some point, but it's probably best that
+we do so in the context of a different patchset.
+
+	Reported-by: Linus Torvalds <torvalds@linux-foundation.org>
+	Signed-off-by: Jeff Layton <jeff.layton@primarydata.com>
+(cherry picked from commit 267f1128583074b575b90a58de4dcb12dd25af96)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/locks.c
+diff --cc fs/locks.c
+index ab1f74462caf,90b652ad306f..000000000000
+--- a/fs/locks.c
++++ b/fs/locks.c
+@@@ -908,23 -901,8 +908,26 @@@ static int flock_lock_inode(struct inod
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * If a higher-priority process was blocked on the old file lock,
+ +	 * give it the opportunity to lock the file.
+ +	 */
+ +	if (found) {
+ +		spin_unlock(&inode->i_lock);
+ +		cond_resched();
+ +		spin_lock(&inode->i_lock);
+ +	}
+ +
+++=======
+++>>>>>>> 267f11285830 (locks: remove conditional lock release in middle of flock_lock_file)
+  find_conflict:
+ -	list_for_each_entry(fl, &ctx->flc_flock, fl_list) {
+ +	for_each_lock(inode, before) {
+ +		struct file_lock *fl = *before;
+ +		if (IS_POSIX(fl))
+ +			break;
+ +		if (IS_LEASE(fl))
+ +			continue;
+  		if (!flock_locks_conflict(request, fl))
+  			continue;
+  		error = -EAGAIN;
+* Unmerged path fs/locks.c
