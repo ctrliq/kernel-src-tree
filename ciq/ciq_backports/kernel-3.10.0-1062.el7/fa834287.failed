@@ -1,0 +1,298 @@
+scsi: target: rename target_alloc_session
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Mike Christie <mchristi@redhat.com>
+commit fa834287300ba6a89e0a590f520a3398527eb541
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/fa834287.failed
+
+Rename target_alloc_session to target_setup_session to avoid confusion with
+the other transport session allocation function that only allocates the
+session and because the target_alloc_session does so much more. It
+allocates the session, sets up the nacl and registers the session.
+
+The next patch will then add a remove function to match the setup in this
+one, so it should make sense for all drivers, except iscsi, to just call
+those 2 functions to setup and remove a session.
+
+iscsi will continue to be the odd driver.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Reviewed-by: Bart Van Assche <bart.vanassche@wdc.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Cc: Chris Boot <bootc@bootc.net>
+	Cc: Bryant G. Ly <bryantly@linux.vnet.ibm.com>
+	Cc: Michael Cyr <mikecyr@linux.vnet.ibm.com>
+	Cc: <qla2xxx-upstream@qlogic.com>
+	Cc: Johannes Thumshirn <jth@kernel.org>
+	Cc: Felipe Balbi <balbi@kernel.org>
+	Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Cc: Andrzej Pietrasiewicz <andrzej.p@samsung.com>
+	Cc: Michael S. Tsirkin <mst@redhat.com>
+	Cc: Juergen Gross <jgross@suse.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit fa834287300ba6a89e0a590f520a3398527eb541)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/ibmvscsi_tgt/ibmvscsi_tgt.c
+#	drivers/scsi/qla2xxx/tcm_qla2xxx.c
+#	drivers/usb/gadget/tcm_usb_gadget.c
+#	drivers/vhost/scsi.c
+#	drivers/xen/xen-scsiback.c
+diff --cc drivers/scsi/qla2xxx/tcm_qla2xxx.c
+index 5b48ab343bc7,b9ce4e7e1c3e..000000000000
+--- a/drivers/scsi/qla2xxx/tcm_qla2xxx.c
++++ b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+@@@ -1522,32 -1539,12 +1522,41 @@@ static int tcm_qla2xxx_check_initiator_
+  	 * Locate our struct se_node_acl either from an explict NodeACL created
+  	 * via ConfigFS, or via running in TPG demo mode.
+  	 */
+++<<<<<<< HEAD
+ +	se_sess->se_node_acl = core_tpg_check_initiator_node_acl(se_tpg,
+ +					port_name);
+ +	if (!se_sess->se_node_acl) {
+ +		transport_free_session(se_sess);
+ +		return -EINVAL;
+ +	}
+ +	se_nacl = se_sess->se_node_acl;
+ +	nacl = container_of(se_nacl, struct tcm_qla2xxx_nacl, se_node_acl);
+ +	be_sid[0] = qlat_sess->d_id.b.domain;
+ +	be_sid[1] = qlat_sess->d_id.b.area;
+ +	be_sid[2] = qlat_sess->d_id.b.al_pa;
+ +
+ +	/*
+ +	 * And now setup the new se_nacl and session pointers into our HW lport
+ +	 * mappings for fabric S_ID and LOOP_ID.
+ +	 */
+ +	spin_lock_irqsave(&ha->tgt.sess_lock, flags);
+ +	tcm_qla2xxx_set_sess_by_s_id(lport, se_nacl, nacl, se_sess,
+ +			qlat_sess, be_sid);
+ +	tcm_qla2xxx_set_sess_by_loop_id(lport, se_nacl, nacl, se_sess,
+ +			qlat_sess, qlat_sess->loop_id);
+ +	spin_unlock_irqrestore(&ha->tgt.sess_lock, flags);
+ +	/*
+ +	 * Finally register the new FC Nexus with TCM
+ +	 */
+ +	__transport_register_session(se_nacl->se_tpg, se_nacl, se_sess, qlat_sess);
+++=======
++ 	se_sess = target_setup_session(&tpg->se_tpg, num_tags,
++ 				       sizeof(struct qla_tgt_cmd),
++ 				       TARGET_PROT_ALL, port_name,
++ 				       qlat_sess, tcm_qla2xxx_session_cb);
++ 	if (IS_ERR(se_sess))
++ 		return PTR_ERR(se_sess);
+++>>>>>>> fa834287300b (scsi: target: rename target_alloc_session)
+  
+  	return 0;
+  }
+diff --cc drivers/usb/gadget/tcm_usb_gadget.c
+index 9891e23fa6cb,ba7c5f68d38a..000000000000
+--- a/drivers/usb/gadget/tcm_usb_gadget.c
++++ b/drivers/usb/gadget/tcm_usb_gadget.c
+@@@ -1674,47 -1583,29 +1674,61 @@@ static int tcm_usbg_make_nexus(struct u
+  	if (tpg->tpg_nexus) {
+  		ret = -EEXIST;
+  		pr_debug("tpg->tpg_nexus already exists\n");
+ -		goto out_unlock;
+ +		goto err_unlock;
+  	}
+ +	se_tpg = &tpg->se_tpg;
+  
+ +	ret = -ENOMEM;
+  	tv_nexus = kzalloc(sizeof(*tv_nexus), GFP_KERNEL);
+  	if (!tv_nexus) {
+ -		ret = -ENOMEM;
+ -		goto out_unlock;
+ +		pr_err("Unable to allocate struct tcm_vhost_nexus\n");
+ +		goto err_unlock;
+  	}
+ +	tv_nexus->tvn_se_sess = transport_init_session();
+ +	if (IS_ERR(tv_nexus->tvn_se_sess))
+ +		goto err_free;
+  
+++<<<<<<< HEAD:drivers/usb/gadget/tcm_usb_gadget.c
+ +	/*
+ +	 * Since we are running in 'demo mode' this call with generate a
+ +	 * struct se_node_acl for the tcm_vhost struct se_portal_group with
+ +	 * the SCSI Initiator port name of the passed configfs group 'name'.
+ +	 */
+ +	tv_nexus->tvn_se_sess->se_node_acl = core_tpg_check_initiator_node_acl(
+ +			se_tpg, name);
+ +	if (!tv_nexus->tvn_se_sess->se_node_acl) {
+ +		pr_debug("core_tpg_check_initiator_node_acl() failed"
+ +				" for %s\n", name);
+ +		goto err_session;
+++=======
++ 	tv_nexus->tvn_se_sess = target_setup_session(&tpg->se_tpg,
++ 						     USB_G_DEFAULT_SESSION_TAGS,
++ 						     sizeof(struct usbg_cmd),
++ 						     TARGET_PROT_NORMAL, name,
++ 						     tv_nexus, usbg_alloc_sess_cb);
++ 	if (IS_ERR(tv_nexus->tvn_se_sess)) {
++ #define MAKE_NEXUS_MSG "core_tpg_check_initiator_node_acl() failed for %s\n"
++ 		pr_debug(MAKE_NEXUS_MSG, name);
++ #undef MAKE_NEXUS_MSG
++ 		ret = PTR_ERR(tv_nexus->tvn_se_sess);
++ 		kfree(tv_nexus);
+++>>>>>>> fa834287300b (scsi: target: rename target_alloc_session):drivers/usb/gadget/function/f_tcm.c
+  	}
+ +	/*
+ +	 * Now register the TCM vHost virtual I_T Nexus as active with the
+ +	 * call to __transport_register_session()
+ +	 */
+ +	__transport_register_session(se_tpg, tv_nexus->tvn_se_sess->se_node_acl,
+ +			tv_nexus->tvn_se_sess, tv_nexus);
+ +	tpg->tpg_nexus = tv_nexus;
+ +	mutex_unlock(&tpg->tpg_mutex);
+ +	return 0;
+  
+ -out_unlock:
+ +err_session:
+ +	transport_free_session(tv_nexus->tvn_se_sess);
+ +err_free:
+ +	kfree(tv_nexus);
+ +err_unlock:
+  	mutex_unlock(&tpg->tpg_mutex);
+  	return ret;
+  }
+diff --cc drivers/vhost/scsi.c
+index 2b14ae4c9782,e9368842c63f..000000000000
+--- a/drivers/vhost/scsi.c
++++ b/drivers/vhost/scsi.c
+@@@ -1493,16 -1735,17 +1493,27 @@@ static int tcm_vhost_make_nexus(struct 
+  	}
+  	/*
+  	 * Since we are running in 'demo mode' this call with generate a
+ -	 * struct se_node_acl for the vhost_scsi struct se_portal_group with
+ +	 * struct se_node_acl for the tcm_vhost struct se_portal_group with
+  	 * the SCSI Initiator port name of the passed configfs group 'name'.
+  	 */
+++<<<<<<< HEAD
+ +	tv_nexus->tvn_se_sess->se_node_acl = core_tpg_check_initiator_node_acl(
+ +				se_tpg, (unsigned char *)name);
+ +	if (!tv_nexus->tvn_se_sess->se_node_acl) {
+ +		mutex_unlock(&tv_tpg->tv_tpg_mutex);
+ +		pr_debug("core_tpg_check_initiator_node_acl() failed"
+ +				" for %s\n", name);
+ +		transport_free_session(tv_nexus->tvn_se_sess);
+++=======
++ 	tv_nexus->tvn_se_sess = target_setup_session(&tpg->se_tpg,
++ 					VHOST_SCSI_DEFAULT_TAGS,
++ 					sizeof(struct vhost_scsi_cmd),
++ 					TARGET_PROT_DIN_PASS | TARGET_PROT_DOUT_PASS,
++ 					(unsigned char *)name, tv_nexus,
++ 					vhost_scsi_nexus_cb);
++ 	if (IS_ERR(tv_nexus->tvn_se_sess)) {
++ 		mutex_unlock(&tpg->tv_tpg_mutex);
+++>>>>>>> fa834287300b (scsi: target: rename target_alloc_session)
+  		kfree(tv_nexus);
+  		return -ENOMEM;
+  	}
+* Unmerged path drivers/scsi/ibmvscsi_tgt/ibmvscsi_tgt.c
+* Unmerged path drivers/xen/xen-scsiback.c
+diff --git a/drivers/infiniband/ulp/srpt/ib_srpt.c b/drivers/infiniband/ulp/srpt/ib_srpt.c
+index 4b79fbb1ec2b..019ca304f2f4 100644
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.c
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.c
+@@ -2220,16 +2220,16 @@ static int srpt_cm_req_recv(struct srpt_device *const sdev,
+ 	pr_debug("registering session %s\n", ch->sess_name);
+ 
+ 	if (sport->port_guid_tpg.se_tpg_wwn)
+-		ch->sess = target_alloc_session(&sport->port_guid_tpg, 0, 0,
++		ch->sess = target_setup_session(&sport->port_guid_tpg, 0, 0,
+ 						TARGET_PROT_NORMAL,
+ 						ch->sess_name, ch, NULL);
+ 	if (sport->port_gid_tpg.se_tpg_wwn && IS_ERR_OR_NULL(ch->sess))
+-		ch->sess = target_alloc_session(&sport->port_gid_tpg, 0, 0,
++		ch->sess = target_setup_session(&sport->port_gid_tpg, 0, 0,
+ 					TARGET_PROT_NORMAL, i_port_id, ch,
+ 					NULL);
+ 	/* Retry without leading "0x" */
+ 	if (sport->port_gid_tpg.se_tpg_wwn && IS_ERR_OR_NULL(ch->sess))
+-		ch->sess = target_alloc_session(&sport->port_gid_tpg, 0, 0,
++		ch->sess = target_setup_session(&sport->port_gid_tpg, 0, 0,
+ 						TARGET_PROT_NORMAL,
+ 						i_port_id + 2, ch, NULL);
+ 	if (IS_ERR_OR_NULL(ch->sess)) {
+* Unmerged path drivers/scsi/ibmvscsi_tgt/ibmvscsi_tgt.c
+* Unmerged path drivers/scsi/qla2xxx/tcm_qla2xxx.c
+diff --git a/drivers/target/loopback/tcm_loop.c b/drivers/target/loopback/tcm_loop.c
+index 9c89c28a7bc3..e2f1408e763d 100644
+--- a/drivers/target/loopback/tcm_loop.c
++++ b/drivers/target/loopback/tcm_loop.c
+@@ -818,7 +818,7 @@ static int tcm_loop_make_nexus(
+ 		return -ENOMEM;
+ 	}
+ 
+-	tl_nexus->se_sess = target_alloc_session(&tl_tpg->tl_se_tpg, 0, 0,
++	tl_nexus->se_sess = target_setup_session(&tl_tpg->tl_se_tpg, 0, 0,
+ 					TARGET_PROT_DIN_PASS | TARGET_PROT_DOUT_PASS,
+ 					name, tl_nexus, tcm_loop_alloc_sess_cb);
+ 	if (IS_ERR(tl_nexus->se_sess)) {
+diff --git a/drivers/target/sbp/sbp_target.c b/drivers/target/sbp/sbp_target.c
+index 2c0296913a29..eccbbada8076 100644
+--- a/drivers/target/sbp/sbp_target.c
++++ b/drivers/target/sbp/sbp_target.c
+@@ -210,7 +210,7 @@ static struct sbp_session *sbp_session_create(
+ 	INIT_DELAYED_WORK(&sess->maint_work, session_maintenance_work);
+ 	sess->guid = guid;
+ 
+-	sess->se_sess = target_alloc_session(&tpg->se_tpg, 128,
++	sess->se_sess = target_setup_session(&tpg->se_tpg, 128,
+ 					     sizeof(struct sbp_target_request),
+ 					     TARGET_PROT_NORMAL, guid_str,
+ 					     sess, NULL);
+diff --git a/drivers/target/target_core_transport.c b/drivers/target/target_core_transport.c
+index 40ec7c06776a..27f15313b492 100644
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -388,7 +388,7 @@ void transport_register_session(
+ EXPORT_SYMBOL(transport_register_session);
+ 
+ struct se_session *
+-target_alloc_session(struct se_portal_group *tpg,
++target_setup_session(struct se_portal_group *tpg,
+ 		     unsigned int tag_num, unsigned int tag_size,
+ 		     enum target_prot_op prot_op,
+ 		     const char *initiatorname, void *private,
+@@ -430,7 +430,7 @@ target_alloc_session(struct se_portal_group *tpg,
+ 	transport_register_session(tpg, sess->se_node_acl, sess, private);
+ 	return sess;
+ }
+-EXPORT_SYMBOL(target_alloc_session);
++EXPORT_SYMBOL(target_setup_session);
+ 
+ static void target_release_session(struct kref *kref)
+ {
+diff --git a/drivers/target/tcm_fc/tfc_sess.c b/drivers/target/tcm_fc/tfc_sess.c
+index 0d89a3852938..52fe261e12f8 100644
+--- a/drivers/target/tcm_fc/tfc_sess.c
++++ b/drivers/target/tcm_fc/tfc_sess.c
+@@ -243,7 +243,7 @@ static struct ft_sess *ft_sess_create(struct ft_tport *tport, u32 port_id,
+ 	sess->tport = tport;
+ 	sess->port_id = port_id;
+ 
+-	sess->se_sess = target_alloc_session(se_tpg, TCM_FC_DEFAULT_TAGS,
++	sess->se_sess = target_setup_session(se_tpg, TCM_FC_DEFAULT_TAGS,
+ 					     sizeof(struct ft_cmd),
+ 					     TARGET_PROT_NORMAL, &initiatorname[0],
+ 					     sess, ft_sess_alloc_cb);
+* Unmerged path drivers/usb/gadget/tcm_usb_gadget.c
+* Unmerged path drivers/vhost/scsi.c
+* Unmerged path drivers/xen/xen-scsiback.c
+diff --git a/include/target/target_core_fabric.h b/include/target/target_core_fabric.h
+index 1839cb28b54a..ab154c30fc4f 100644
+--- a/include/target/target_core_fabric.h
++++ b/include/target/target_core_fabric.h
+@@ -108,7 +108,7 @@ void target_unregister_template(const struct target_core_fabric_ops *fo);
+ int target_depend_item(struct config_item *item);
+ void target_undepend_item(struct config_item *item);
+ 
+-struct se_session *target_alloc_session(struct se_portal_group *,
++struct se_session *target_setup_session(struct se_portal_group *,
+ 		unsigned int, unsigned int, enum target_prot_op prot_op,
+ 		const char *, void *,
+ 		int (*callback)(struct se_portal_group *,
