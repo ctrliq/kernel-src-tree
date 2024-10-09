@@ -1,0 +1,161 @@
+KVM: x86: do not scan IRR twice on APICv vmentry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 76dfafd536730ef9b9d99b1cf596916d52be76d1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/76dfafd5.failed
+
+Calls to apic_find_highest_irr are scanning IRR twice, once
+in vmx_sync_pir_from_irr and once in apic_search_irr.  Change
+sync_pir_from_irr to get the new maximum IRR from kvm_apic_update_irr;
+now that it does the computation, it can also do the RVI write.
+
+In order to avoid complications in svm.c, make the callback optional.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 76dfafd536730ef9b9d99b1cf596916d52be76d1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 4de6d6513aff,d03cb62b70d2..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -8302,9 -8724,29 +8304,34 @@@ static void vmx_hwapic_irr_update(struc
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void vmx_load_eoi_exitmap(struct kvm_vcpu *vcpu)
+++=======
++ static int vmx_sync_pir_to_irr(struct kvm_vcpu *vcpu)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 	int max_irr;
++ 
++ 	WARN_ON(!vcpu->arch.apicv_active);
++ 	if (pi_test_on(&vmx->pi_desc)) {
++ 		pi_clear_on(&vmx->pi_desc);
++ 		/*
++ 		 * IOMMU can write to PIR.ON, so the barrier matters even on UP.
++ 		 * But on x86 this is just a compiler barrier anyway.
++ 		 */
++ 		smp_mb__after_atomic();
++ 		max_irr = kvm_apic_update_irr(vcpu, vmx->pi_desc.pir);
++ 	} else {
++ 		max_irr = kvm_lapic_find_highest_irr(vcpu);
++ 	}
++ 	vmx_hwapic_irr_update(vcpu, max_irr);
++ 	return max_irr;
++ }
++ 
++ static void vmx_load_eoi_exitmap(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap)
+++>>>>>>> 76dfafd53673 (KVM: x86: do not scan IRR twice on APICv vmentry)
+  {
+ +	u64 *eoi_exit_bitmap = vcpu->arch.eoi_exit_bitmap;
+  	if (!kvm_vcpu_apicv_active(vcpu))
+  		return;
+  
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 5ee33ee3bf1d..c91f91b30fcb 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -882,7 +882,7 @@ struct kvm_x86_ops {
+ 	void (*set_virtual_x2apic_mode)(struct kvm_vcpu *vcpu, bool set);
+ 	void (*set_apic_access_page_addr)(struct kvm_vcpu *vcpu, hpa_t hpa);
+ 	void (*deliver_posted_interrupt)(struct kvm_vcpu *vcpu, int vector);
+-	void (*sync_pir_to_irr)(struct kvm_vcpu *vcpu);
++	int (*sync_pir_to_irr)(struct kvm_vcpu *vcpu);
+ 	int (*set_tss_addr)(struct kvm *kvm, unsigned int addr);
+ 	int (*get_tdp_level)(void);
+ 	u64 (*get_mt_mask)(struct kvm_vcpu *vcpu, gfn_t gfn, bool is_mmio);
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 1e74c743d62f..acde31f9e187 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -505,6 +505,7 @@ int kvm_lapic_find_highest_irr(struct kvm_vcpu *vcpu)
+ 	 */
+ 	return apic_find_highest_irr(vcpu->arch.apic);
+ }
++EXPORT_SYMBOL_GPL(kvm_lapic_find_highest_irr);
+ 
+ static int __apic_accept_irq(struct kvm_lapic *apic, int delivery_mode,
+ 			     int vector, int level, int trig_mode,
+@@ -570,9 +571,10 @@ static void pv_eoi_clr_pending(struct kvm_vcpu *vcpu)
+ static int apic_has_interrupt_for_ppr(struct kvm_lapic *apic, u32 ppr)
+ {
+ 	int highest_irr;
+-	if (apic->vcpu->arch.apicv_active)
+-		kvm_x86_ops->sync_pir_to_irr(apic->vcpu);
+-	highest_irr = apic_find_highest_irr(apic);
++	if (kvm_x86_ops->sync_pir_to_irr && apic->vcpu->arch.apicv_active)
++		highest_irr = kvm_x86_ops->sync_pir_to_irr(apic->vcpu);
++	else
++		highest_irr = apic_find_highest_irr(apic);
+ 	if (highest_irr == -1 || (highest_irr & 0xF0) <= ppr)
+ 		return -1;
+ 	return highest_irr;
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index 7ad17773012b..385d71f94f70 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -4166,11 +4166,6 @@ static void svm_load_eoi_exitmap(struct kvm_vcpu *vcpu)
+ 	return;
+ }
+ 
+-static void svm_sync_pir_to_irr(struct kvm_vcpu *vcpu)
+-{
+-	return;
+-}
+-
+ static void svm_deliver_avic_intr(struct kvm_vcpu *vcpu, int vec)
+ {
+ 	kvm_lapic_set_irr(vec, vcpu->arch.apic);
+@@ -4988,7 +4983,6 @@ static struct kvm_x86_ops svm_x86_ops = {
+ 	.get_enable_apicv = svm_get_enable_apicv,
+ 	.refresh_apicv_exec_ctrl = svm_refresh_apicv_exec_ctrl,
+ 	.load_eoi_exitmap = svm_load_eoi_exitmap,
+-	.sync_pir_to_irr = svm_sync_pir_to_irr,
+ 	.hwapic_irr_update = svm_hwapic_irr_update,
+ 	.hwapic_isr_update = svm_hwapic_isr_update,
+ 	.apicv_post_state_restore = avic_post_state_restore,
+* Unmerged path arch/x86/kvm/vmx.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 70ee0f368722..64261b56175a 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -2812,7 +2812,7 @@ void kvm_arch_vcpu_put(struct kvm_vcpu *vcpu)
+ static int kvm_vcpu_ioctl_get_lapic(struct kvm_vcpu *vcpu,
+ 				    struct kvm_lapic_state *s)
+ {
+-	if (vcpu->arch.apicv_active)
++	if (kvm_x86_ops->sync_pir_to_irr && vcpu->arch.apicv_active)
+ 		kvm_x86_ops->sync_pir_to_irr(vcpu);
+ 
+ 	return kvm_apic_get_state(vcpu, s);
+@@ -6470,7 +6470,7 @@ static void vcpu_scan_ioapic(struct kvm_vcpu *vcpu)
+ 	if (irqchip_split(vcpu->kvm))
+ 		kvm_scan_ioapic_routes(vcpu, vcpu->arch.eoi_exit_bitmap);
+ 	else {
+-		if (vcpu->arch.apicv_active)
++		if (kvm_x86_ops->sync_pir_to_irr && vcpu->arch.apicv_active)
+ 			kvm_x86_ops->sync_pir_to_irr(vcpu);
+ 		kvm_ioapic_scan_entry(vcpu, vcpu->arch.eoi_exit_bitmap);
+ 	}
+@@ -6612,11 +6612,8 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 		 * Update architecture specific hints for APIC
+ 		 * virtual interrupt delivery.
+ 		 */
+-		if (vcpu->arch.apicv_active) {
++		if (kvm_x86_ops->sync_pir_to_irr && vcpu->arch.apicv_active)
+ 			kvm_x86_ops->sync_pir_to_irr(vcpu);
+-			kvm_x86_ops->hwapic_irr_update(vcpu,
+-				kvm_lapic_find_highest_irr(vcpu));
+-		}
+ 	}
+ 
+ 	if (kvm_check_request(KVM_REQ_EVENT, vcpu) || req_int_win) {
