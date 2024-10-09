@@ -1,0 +1,144 @@
+capabilities: fix logic for effective root or real root
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Richard Guy Briggs <rgb@redhat.com>
+commit 588fb2c7e294753d3090a1dc2e7c34e7e3ce5aff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/588fb2c7.failed
+
+Now that the logic is inverted, it is much easier to see that both real
+root and effective root conditions had to be met to avoid printing the
+BPRM_FCAPS record with audit syscalls.  This meant that any setuid root
+applications would print a full BPRM_FCAPS record when it wasn't
+necessary, cluttering the event output, since the SYSCALL and PATH
+records indicated the presence of the setuid bit and effective root user
+id.
+
+Require only one of effective root or real root to avoid printing the
+unnecessary record.
+
+Ref: commit 3fc689e96c0c ("Add audit_log_bprm_fcaps/AUDIT_BPRM_FCAPS")
+See: https://github.com/linux-audit/audit-kernel/issues/16
+
+	Signed-off-by: Richard Guy Briggs <rgb@redhat.com>
+	Reviewed-by: Serge Hallyn <serge@hallyn.com>
+	Acked-by: James Morris <james.l.morris@oracle.com>
+	Acked-by: Kees Cook <keescook@chromium.org>
+	Acked-by: Paul Moore <paul@paul-moore.com>
+	Signed-off-by: James Morris <james.l.morris@oracle.com>
+(cherry picked from commit 588fb2c7e294753d3090a1dc2e7c34e7e3ce5aff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/commoncap.c
+diff --cc security/commoncap.c
+index 9fb6de81bb8f,ad7536d76820..000000000000
+--- a/security/commoncap.c
++++ b/security/commoncap.c
+@@@ -482,6 -695,100 +482,103 @@@ out
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool root_privileged(void) { return !issecure(SECURE_NOROOT); }
++ 
++ static inline bool __is_real(kuid_t uid, struct cred *cred)
++ { return uid_eq(cred->uid, uid); }
++ 
++ static inline bool __is_eff(kuid_t uid, struct cred *cred)
++ { return uid_eq(cred->euid, uid); }
++ 
++ static inline bool __is_suid(kuid_t uid, struct cred *cred)
++ { return !__is_real(uid, cred) && __is_eff(uid, cred); }
++ 
++ /*
++  * handle_privileged_root - Handle case of privileged root
++  * @bprm: The execution parameters, including the proposed creds
++  * @has_fcap: Are any file capabilities set?
++  * @effective: Do we have effective root privilege?
++  * @root_uid: This namespace' root UID WRT initial USER namespace
++  *
++  * Handle the case where root is privileged and hasn't been neutered by
++  * SECURE_NOROOT.  If file capabilities are set, they won't be combined with
++  * set UID root and nothing is changed.  If we are root, cap_permitted is
++  * updated.  If we have become set UID root, the effective bit is set.
++  */
++ static void handle_privileged_root(struct linux_binprm *bprm, bool has_fcap,
++ 				   bool *effective, kuid_t root_uid)
++ {
++ 	const struct cred *old = current_cred();
++ 	struct cred *new = bprm->cred;
++ 
++ 	if (!root_privileged())
++ 		return;
++ 	/*
++ 	 * If the legacy file capability is set, then don't set privs
++ 	 * for a setuid root binary run by a non-root user.  Do set it
++ 	 * for a root user just to cause least surprise to an admin.
++ 	 */
++ 	if (has_fcap && __is_suid(root_uid, new)) {
++ 		warn_setuid_and_fcaps_mixed(bprm->filename);
++ 		return;
++ 	}
++ 	/*
++ 	 * To support inheritance of root-permissions and suid-root
++ 	 * executables under compatibility mode, we override the
++ 	 * capability sets for the file.
++ 	 */
++ 	if (__is_eff(root_uid, new) || __is_real(root_uid, new)) {
++ 		/* pP' = (cap_bset & ~0) | (pI & ~0) */
++ 		new->cap_permitted = cap_combine(old->cap_bset,
++ 						 old->cap_inheritable);
++ 	}
++ 	/*
++ 	 * If only the real uid is 0, we do not set the effective bit.
++ 	 */
++ 	if (__is_eff(root_uid, new))
++ 		*effective = true;
++ }
++ 
++ #define __cap_gained(field, target, source) \
++ 	!cap_issubset(target->cap_##field, source->cap_##field)
++ #define __cap_grew(target, source, cred) \
++ 	!cap_issubset(cred->cap_##target, cred->cap_##source)
++ #define __cap_full(field, cred) \
++ 	cap_issubset(CAP_FULL_SET, cred->cap_##field)
++ 
++ static inline bool __is_setuid(struct cred *new, const struct cred *old)
++ { return !uid_eq(new->euid, old->uid); }
++ 
++ static inline bool __is_setgid(struct cred *new, const struct cred *old)
++ { return !gid_eq(new->egid, old->gid); }
++ 
++ /*
++  * Audit candidate if current->cap_effective is set
++  *
++  * We do not bother to audit if 3 things are true:
++  *   1) cap_effective has all caps
++  *   2) we became root *OR* are were already root
++  *   3) root is supposed to have all caps (SECURE_NOROOT)
++  * Since this is just a normal root execing a process.
++  *
++  * Number 1 above might fail if you don't have a full bset, but I think
++  * that is interesting information to audit.
++  */
++ static inline bool nonroot_raised_pE(struct cred *cred, kuid_t root)
++ {
++ 	bool ret = false;
++ 
++ 	if (__cap_grew(effective, ambient, cred) &&
++ 	    !(__cap_full(effective, cred) &&
++ 	      (__is_eff(root, cred) || __is_real(root, cred)) &&
++ 	      root_privileged()))
++ 		ret = true;
++ 	return ret;
++ }
++ 
+++>>>>>>> 588fb2c7e294 (capabilities: fix logic for effective root or real root)
+  /**
+   * cap_bprm_set_creds - Set up the proposed credentials for execve().
+   * @bprm: The execution parameters, including the proposed creds
+* Unmerged path security/commoncap.c
