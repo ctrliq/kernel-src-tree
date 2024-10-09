@@ -1,0 +1,294 @@
+drm/i915: Let execlist_update_context() cover !FULL_PPGTT mode.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [drm] i915: Let execlist_update_context() cover !FULL_PPGTT mode (Rob Clark) [1380115 1422186]
+Rebuild_FUZZ: 95.87%
+commit-author Zhi Wang <zhi.a.wang@intel.com>
+commit 04da811b3d821567e7a9a8a0baf48a6c1718b582
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/04da811b.failed
+
+execlist_update_context() will try to update PDPs in a context before a
+ELSP submission only for full PPGTT mode, while PDPs was populated during
+context initialization. Now the latter code path is removed. Let
+execlist_update_context() also cover !FULL_PPGTT mode.
+
+Fixes: 34869776c76b ("drm/i915: check ppgtt validity when init reg state")
+	Cc: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+	Cc: Michal Winiarski <michal.winiarski@intel.com>
+	Cc: Michel Thierry <michel.thierry@intel.com>
+	Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+	Cc: Chris Wilson <chris@chris-wilson.co.uk>
+	Cc: Zhenyu Wang <zhenyuw@linux.intel.com>
+	Cc: Zhiyuan Lv <zhiyuan.lv@intel.com>
+	Signed-off-by: Zhi Wang <zhi.a.wang@intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/1486377436-15380-1-git-send-email-zhi.a.wang@intel.com
+	Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+(cherry picked from commit 04da811b3d821567e7a9a8a0baf48a6c1718b582)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_lrc.c
+diff --cc drivers/gpu/drm/i915/intel_lrc.c
+index b7bec1c75519,15b8a132b8e0..000000000000
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@@ -303,32 -264,234 +303,235 @@@ logical_ring_init_platform_invariants(s
+   * expensive to calculate, we'll just do it once and cache the result,
+   * which remains valid until the context is unpinned.
+   *
+ - * This is what a descriptor looks like, from LSB to MSB::
+ - *
+ - *      bits  0-11:    flags, GEN8_CTX_* (cached in ctx->desc_template)
+ - *      bits 12-31:    LRCA, GTT address of (the HWSP of) this context
+ - *      bits 32-52:    ctx ID, a globally unique tag
+ - *      bits 53-54:    mbz, reserved for use by hardware
+ - *      bits 55-63:    group ID, currently unused and set to 0
+ + * This is what a descriptor looks like, from LSB to MSB:
+ + *    bits 0-11:    flags, GEN8_CTX_* (cached in ctx_desc_template)
+ + *    bits 12-31:    LRCA, GTT address of (the HWSP of) this context
+ + *    bits 32-51:    ctx ID, a globally unique tag (the LRCA again!)
+ + *    bits 52-63:    reserved, may encode the engine ID (for GuC)
+   */
+  static void
+ -intel_lr_context_descriptor_update(struct i915_gem_context *ctx,
+ -				   struct intel_engine_cs *engine)
+ +intel_lr_context_descriptor_update(struct intel_context *ctx,
+ +				   struct intel_engine_cs *ring)
+  {
+ -	struct intel_context *ce = &ctx->engine[engine->id];
+ -	u64 desc;
+ +	uint64_t lrca, desc;
+  
+ -	BUILD_BUG_ON(MAX_CONTEXT_HW_ID > (1<<GEN8_CTX_ID_WIDTH));
+ +	lrca = ctx->engine[ring->id].lrc_vma->node.start +
+ +	       LRC_PPHWSP_PN * PAGE_SIZE;
+  
+ -	desc = ctx->desc_template;				/* bits  0-11 */
+ -	desc |= i915_ggtt_offset(ce->state) + LRC_PPHWSP_PN * PAGE_SIZE;
+ -								/* bits 12-31 */
+ -	desc |= (u64)ctx->hw_id << GEN8_CTX_ID_SHIFT;		/* bits 32-52 */
+ +	desc = ring->ctx_desc_template;			   /* bits  0-11 */
+ +	desc |= lrca;					   /* bits 12-31 */
+ +	desc |= (lrca >> PAGE_SHIFT) << GEN8_CTX_ID_SHIFT; /* bits 32-51 */
+  
+ -	ce->lrc_desc = desc;
+ +	ctx->engine[ring->id].lrc_desc = desc;
+  }
+  
+ -uint64_t intel_lr_context_descriptor(struct i915_gem_context *ctx,
+ -				     struct intel_engine_cs *engine)
+ +uint64_t intel_lr_context_descriptor(struct intel_context *ctx,
+ +				     struct intel_engine_cs *ring)
+  {
+++<<<<<<< HEAD
+ +	return ctx->engine[ring->id].lrc_desc;
+++=======
++ 	return ctx->engine[engine->id].lrc_desc;
++ }
++ 
++ static inline void
++ execlists_context_status_change(struct drm_i915_gem_request *rq,
++ 				unsigned long status)
++ {
++ 	/*
++ 	 * Only used when GVT-g is enabled now. When GVT-g is disabled,
++ 	 * The compiler should eliminate this function as dead-code.
++ 	 */
++ 	if (!IS_ENABLED(CONFIG_DRM_I915_GVT))
++ 		return;
++ 
++ 	atomic_notifier_call_chain(&rq->ctx->status_notifier, status, rq);
++ }
++ 
++ static void
++ execlists_update_context_pdps(struct i915_hw_ppgtt *ppgtt, u32 *reg_state)
++ {
++ 	ASSIGN_CTX_PDP(ppgtt, reg_state, 3);
++ 	ASSIGN_CTX_PDP(ppgtt, reg_state, 2);
++ 	ASSIGN_CTX_PDP(ppgtt, reg_state, 1);
++ 	ASSIGN_CTX_PDP(ppgtt, reg_state, 0);
++ }
++ 
++ static u64 execlists_update_context(struct drm_i915_gem_request *rq)
++ {
++ 	struct intel_context *ce = &rq->ctx->engine[rq->engine->id];
++ 	struct i915_hw_ppgtt *ppgtt =
++ 		rq->ctx->ppgtt ?: rq->i915->mm.aliasing_ppgtt;
++ 	u32 *reg_state = ce->lrc_reg_state;
++ 
++ 	reg_state[CTX_RING_TAIL+1] = rq->tail;
++ 
++ 	/* True 32b PPGTT with dynamic page allocation: update PDP
++ 	 * registers and point the unallocated PDPs to scratch page.
++ 	 * PML4 is allocated during ppgtt init, so this is not needed
++ 	 * in 48-bit mode.
++ 	 */
++ 	if (ppgtt && !USES_FULL_48BIT_PPGTT(ppgtt->base.dev))
++ 		execlists_update_context_pdps(ppgtt, reg_state);
++ 
++ 	return ce->lrc_desc;
++ }
++ 
++ static void execlists_submit_ports(struct intel_engine_cs *engine)
++ {
++ 	struct drm_i915_private *dev_priv = engine->i915;
++ 	struct execlist_port *port = engine->execlist_port;
++ 	u32 __iomem *elsp =
++ 		dev_priv->regs + i915_mmio_reg_offset(RING_ELSP(engine));
++ 	u64 desc[2];
++ 
++ 	GEM_BUG_ON(port[0].count > 1);
++ 	if (!port[0].count)
++ 		execlists_context_status_change(port[0].request,
++ 						INTEL_CONTEXT_SCHEDULE_IN);
++ 	desc[0] = execlists_update_context(port[0].request);
++ 	port[0].count++;
++ 
++ 	if (port[1].request) {
++ 		GEM_BUG_ON(port[1].count);
++ 		execlists_context_status_change(port[1].request,
++ 						INTEL_CONTEXT_SCHEDULE_IN);
++ 		desc[1] = execlists_update_context(port[1].request);
++ 		port[1].count = 1;
++ 	} else {
++ 		desc[1] = 0;
++ 	}
++ 	GEM_BUG_ON(desc[0] == desc[1]);
++ 
++ 	/* You must always write both descriptors in the order below. */
++ 	writel(upper_32_bits(desc[1]), elsp);
++ 	writel(lower_32_bits(desc[1]), elsp);
++ 
++ 	writel(upper_32_bits(desc[0]), elsp);
++ 	/* The context is automatically loaded after the following */
++ 	writel(lower_32_bits(desc[0]), elsp);
++ }
++ 
++ static bool ctx_single_port_submission(const struct i915_gem_context *ctx)
++ {
++ 	return (IS_ENABLED(CONFIG_DRM_I915_GVT) &&
++ 		i915_gem_context_force_single_submission(ctx));
++ }
++ 
++ static bool can_merge_ctx(const struct i915_gem_context *prev,
++ 			  const struct i915_gem_context *next)
++ {
++ 	if (prev != next)
++ 		return false;
++ 
++ 	if (ctx_single_port_submission(prev))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static void execlists_dequeue(struct intel_engine_cs *engine)
++ {
++ 	struct drm_i915_gem_request *last;
++ 	struct execlist_port *port = engine->execlist_port;
++ 	unsigned long flags;
++ 	struct rb_node *rb;
++ 	bool submit = false;
++ 
++ 	last = port->request;
++ 	if (last)
++ 		/* WaIdleLiteRestore:bdw,skl
++ 		 * Apply the wa NOOPs to prevent ring:HEAD == req:TAIL
++ 		 * as we resubmit the request. See gen8_emit_breadcrumb()
++ 		 * for where we prepare the padding after the end of the
++ 		 * request.
++ 		 */
++ 		last->tail = last->wa_tail;
++ 
++ 	GEM_BUG_ON(port[1].request);
++ 
++ 	/* Hardware submission is through 2 ports. Conceptually each port
++ 	 * has a (RING_START, RING_HEAD, RING_TAIL) tuple. RING_START is
++ 	 * static for a context, and unique to each, so we only execute
++ 	 * requests belonging to a single context from each ring. RING_HEAD
++ 	 * is maintained by the CS in the context image, it marks the place
++ 	 * where it got up to last time, and through RING_TAIL we tell the CS
++ 	 * where we want to execute up to this time.
++ 	 *
++ 	 * In this list the requests are in order of execution. Consecutive
++ 	 * requests from the same context are adjacent in the ringbuffer. We
++ 	 * can combine these requests into a single RING_TAIL update:
++ 	 *
++ 	 *              RING_HEAD...req1...req2
++ 	 *                                    ^- RING_TAIL
++ 	 * since to execute req2 the CS must first execute req1.
++ 	 *
++ 	 * Our goal then is to point each port to the end of a consecutive
++ 	 * sequence of requests as being the most optimal (fewest wake ups
++ 	 * and context switches) submission.
++ 	 */
++ 
++ 	spin_lock_irqsave(&engine->timeline->lock, flags);
++ 	rb = engine->execlist_first;
++ 	while (rb) {
++ 		struct drm_i915_gem_request *cursor =
++ 			rb_entry(rb, typeof(*cursor), priotree.node);
++ 
++ 		/* Can we combine this request with the current port? It has to
++ 		 * be the same context/ringbuffer and not have any exceptions
++ 		 * (e.g. GVT saying never to combine contexts).
++ 		 *
++ 		 * If we can combine the requests, we can execute both by
++ 		 * updating the RING_TAIL to point to the end of the second
++ 		 * request, and so we never need to tell the hardware about
++ 		 * the first.
++ 		 */
++ 		if (last && !can_merge_ctx(cursor->ctx, last->ctx)) {
++ 			/* If we are on the second port and cannot combine
++ 			 * this request with the last, then we are done.
++ 			 */
++ 			if (port != engine->execlist_port)
++ 				break;
++ 
++ 			/* If GVT overrides us we only ever submit port[0],
++ 			 * leaving port[1] empty. Note that we also have
++ 			 * to be careful that we don't queue the same
++ 			 * context (even though a different request) to
++ 			 * the second port.
++ 			 */
++ 			if (ctx_single_port_submission(last->ctx) ||
++ 			    ctx_single_port_submission(cursor->ctx))
++ 				break;
++ 
++ 			GEM_BUG_ON(last->ctx == cursor->ctx);
++ 
++ 			i915_gem_request_assign(&port->request, last);
++ 			port++;
++ 		}
++ 
++ 		rb = rb_next(rb);
++ 		rb_erase(&cursor->priotree.node, &engine->execlist_queue);
++ 		RB_CLEAR_NODE(&cursor->priotree.node);
++ 		cursor->priotree.priority = INT_MAX;
++ 
++ 		__i915_gem_request_submit(cursor);
++ 		last = cursor;
++ 		submit = true;
++ 	}
++ 	if (submit) {
++ 		i915_gem_request_assign(&port->request, last);
++ 		engine->execlist_first = rb;
++ 	}
++ 	spin_unlock_irqrestore(&engine->timeline->lock, flags);
++ 
++ 	if (submit)
++ 		execlists_submit_ports(engine);
++ }
++ 
++ static bool execlists_elsp_idle(struct intel_engine_cs *engine)
++ {
++ 	return !engine->execlist_port[0].request;
+++>>>>>>> 04da811b3d82 (drm/i915: Let execlist_update_context() cover !FULL_PPGTT mode.)
+  }
+  
+  /**
+* Unmerged path drivers/gpu/drm/i915/intel_lrc.c
