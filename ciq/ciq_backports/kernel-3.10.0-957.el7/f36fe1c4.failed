@@ -1,0 +1,675 @@
+net: sched: introduce block mechanism to handle netif_keep_dst calls
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] sched: introduce block mechanism to handle netif_keep_dst calls (Ivan Vecera) [1584592]
+Rebuild_FUZZ: 96.18%
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit f36fe1c498c8959812415c57b683abaa4527dec5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/f36fe1c4.failed
+
+Couple of classifiers call netif_keep_dst directly on q->dev. That is
+not possible to do directly for shared blocke where multiple qdiscs are
+owning the block. So introduce a infrastructure to keep track of the
+block owners in list and use this list to implement block variant of
+netif_keep_dst.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Acked-by: David Ahern <dsahern@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f36fe1c498c8959812415c57b683abaa4527dec5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sch_generic.h
+#	net/sched/cls_api.c
+#	net/sched/cls_bpf.c
+diff --cc include/net/sch_generic.h
+index 7a74a222e0f8,f655e66ce742..000000000000
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@@ -286,6 -284,13 +286,16 @@@ struct tcf_chain 
+  
+  struct tcf_block {
+  	struct list_head chain_list;
+++<<<<<<< HEAD
+++=======
++ 	u32 index; /* block index for shared blocks */
++ 	unsigned int refcnt;
++ 	struct net *net;
++ 	struct Qdisc *q;
++ 	struct list_head cb_list;
++ 	struct list_head owner_list;
++ 	bool keep_dst;
+++>>>>>>> f36fe1c498c8 (net: sched: introduce block mechanism to handle netif_keep_dst calls)
+  };
+  
+  static inline void qdisc_cb_private_validate(const struct sk_buff *skb, int sz)
+diff --cc net/sched/cls_api.c
+index 93341e7cfffc,1ca84230f4de..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -247,11 -268,268 +247,225 @@@ void tcf_chain_put(struct tcf_chain *ch
+  }
+  EXPORT_SYMBOL(tcf_chain_put);
+  
+ -static void tcf_block_offload_cmd(struct tcf_block *block, struct Qdisc *q,
+ -				  struct tcf_block_ext_info *ei,
+ -				  enum tc_block_command command)
+ -{
+ -	struct net_device *dev = q->dev_queue->dev;
+ -	struct tc_block_offload bo = {};
+ -
+ -	if (!dev->netdev_ops->ndo_setup_tc)
+ -		return;
+ -	bo.command = command;
+ -	bo.binder_type = ei->binder_type;
+ -	bo.block = block;
+ -	dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_BLOCK, &bo);
+ -}
+ -
+ -static void tcf_block_offload_bind(struct tcf_block *block, struct Qdisc *q,
+ -				   struct tcf_block_ext_info *ei)
+ -{
+ -	tcf_block_offload_cmd(block, q, ei, TC_BLOCK_BIND);
+ -}
+ -
+ -static void tcf_block_offload_unbind(struct tcf_block *block, struct Qdisc *q,
+ -				     struct tcf_block_ext_info *ei)
+ -{
+ -	tcf_block_offload_cmd(block, q, ei, TC_BLOCK_UNBIND);
+ -}
+ -
+ -static int
+ -tcf_chain_head_change_cb_add(struct tcf_chain *chain,
+ -			     struct tcf_block_ext_info *ei,
+ -			     struct netlink_ext_ack *extack)
+ -{
+ -	struct tcf_filter_chain_list_item *item;
+ -
+ -	item = kmalloc(sizeof(*item), GFP_KERNEL);
+ -	if (!item) {
+ -		NL_SET_ERR_MSG(extack, "Memory allocation for head change callback item failed");
+ -		return -ENOMEM;
+ -	}
+ -	item->chain_head_change = ei->chain_head_change;
+ -	item->chain_head_change_priv = ei->chain_head_change_priv;
+ -	if (chain->filter_chain)
+ -		tcf_chain_head_change_item(item, chain->filter_chain);
+ -	list_add(&item->list, &chain->filter_chain_list);
+ -	return 0;
+ -}
+ -
+  static void
+ -tcf_chain_head_change_cb_del(struct tcf_chain *chain,
+ -			     struct tcf_block_ext_info *ei)
+ +tcf_chain_filter_chain_ptr_set(struct tcf_chain *chain,
+ +			       struct tcf_proto __rcu **p_filter_chain)
+  {
+++<<<<<<< HEAD
+ +	chain->p_filter_chain = p_filter_chain;
+++=======
++ 	struct tcf_filter_chain_list_item *item;
++ 
++ 	list_for_each_entry(item, &chain->filter_chain_list, list) {
++ 		if ((!ei->chain_head_change && !ei->chain_head_change_priv) ||
++ 		    (item->chain_head_change == ei->chain_head_change &&
++ 		     item->chain_head_change_priv == ei->chain_head_change_priv)) {
++ 			tcf_chain_head_change_item(item, NULL);
++ 			list_del(&item->list);
++ 			kfree(item);
++ 			return;
++ 		}
++ 	}
++ 	WARN_ON(1);
++ }
++ 
++ struct tcf_net {
++ 	struct idr idr;
++ };
++ 
++ static unsigned int tcf_net_id;
++ 
++ static int tcf_block_insert(struct tcf_block *block, struct net *net,
++ 			    u32 block_index, struct netlink_ext_ack *extack)
++ {
++ 	struct tcf_net *tn = net_generic(net, tcf_net_id);
++ 	int err;
++ 
++ 	err = idr_alloc_ext(&tn->idr, block, NULL, block_index,
++ 			    block_index + 1, GFP_KERNEL);
++ 	if (err)
++ 		return err;
++ 	block->index = block_index;
++ 	return 0;
++ }
++ 
++ static void tcf_block_remove(struct tcf_block *block, struct net *net)
++ {
++ 	struct tcf_net *tn = net_generic(net, tcf_net_id);
++ 
++ 	idr_remove_ext(&tn->idr, block->index);
++ }
++ 
++ static struct tcf_block *tcf_block_create(struct net *net, struct Qdisc *q,
++ 					  struct netlink_ext_ack *extack)
++ {
++ 	struct tcf_block *block;
++ 	struct tcf_chain *chain;
++ 	int err;
++ 
++ 	block = kzalloc(sizeof(*block), GFP_KERNEL);
++ 	if (!block) {
++ 		NL_SET_ERR_MSG(extack, "Memory allocation for block failed");
++ 		return ERR_PTR(-ENOMEM);
++ 	}
++ 	INIT_LIST_HEAD(&block->chain_list);
++ 	INIT_LIST_HEAD(&block->cb_list);
++ 	INIT_LIST_HEAD(&block->owner_list);
++ 
++ 	/* Create chain 0 by default, it has to be always present. */
++ 	chain = tcf_chain_create(block, 0);
++ 	if (!chain) {
++ 		NL_SET_ERR_MSG(extack, "Failed to create new tcf chain");
++ 		err = -ENOMEM;
++ 		goto err_chain_create;
++ 	}
++ 	block->net = qdisc_net(q);
++ 	block->refcnt = 1;
++ 	block->net = net;
++ 	block->q = q;
++ 	return block;
++ 
++ err_chain_create:
++ 	kfree(block);
++ 	return ERR_PTR(err);
++ }
++ 
++ static struct tcf_block *tcf_block_lookup(struct net *net, u32 block_index)
++ {
++ 	struct tcf_net *tn = net_generic(net, tcf_net_id);
++ 
++ 	return idr_find_ext(&tn->idr, block_index);
++ }
++ 
++ static struct tcf_chain *tcf_block_chain_zero(struct tcf_block *block)
++ {
++ 	return list_first_entry(&block->chain_list, struct tcf_chain, list);
++ }
++ 
++ struct tcf_block_owner_item {
++ 	struct list_head list;
++ 	struct Qdisc *q;
++ 	enum tcf_block_binder_type binder_type;
++ };
++ 
++ static void
++ tcf_block_owner_netif_keep_dst(struct tcf_block *block,
++ 			       struct Qdisc *q,
++ 			       enum tcf_block_binder_type binder_type)
++ {
++ 	if (block->keep_dst &&
++ 	    binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS &&
++ 	    binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_EGRESS)
++ 		netif_keep_dst(qdisc_dev(q));
++ }
++ 
++ void tcf_block_netif_keep_dst(struct tcf_block *block)
++ {
++ 	struct tcf_block_owner_item *item;
++ 
++ 	block->keep_dst = true;
++ 	list_for_each_entry(item, &block->owner_list, list)
++ 		tcf_block_owner_netif_keep_dst(block, item->q,
++ 					       item->binder_type);
++ }
++ EXPORT_SYMBOL(tcf_block_netif_keep_dst);
++ 
++ static int tcf_block_owner_add(struct tcf_block *block,
++ 			       struct Qdisc *q,
++ 			       enum tcf_block_binder_type binder_type)
++ {
++ 	struct tcf_block_owner_item *item;
++ 
++ 	item = kmalloc(sizeof(*item), GFP_KERNEL);
++ 	if (!item)
++ 		return -ENOMEM;
++ 	item->q = q;
++ 	item->binder_type = binder_type;
++ 	list_add(&item->list, &block->owner_list);
++ 	return 0;
++ }
++ 
++ static void tcf_block_owner_del(struct tcf_block *block,
++ 				struct Qdisc *q,
++ 				enum tcf_block_binder_type binder_type)
++ {
++ 	struct tcf_block_owner_item *item;
++ 
++ 	list_for_each_entry(item, &block->owner_list, list) {
++ 		if (item->q == q && item->binder_type == binder_type) {
++ 			list_del(&item->list);
++ 			kfree(item);
++ 			return;
++ 		}
++ 	}
++ 	WARN_ON(1);
++ }
++ 
++ int tcf_block_get_ext(struct tcf_block **p_block, struct Qdisc *q,
++ 		      struct tcf_block_ext_info *ei,
++ 		      struct netlink_ext_ack *extack)
++ {
++ 	struct net *net = qdisc_net(q);
++ 	struct tcf_block *block = NULL;
++ 	bool created = false;
++ 	int err;
++ 
++ 	if (ei->block_index) {
++ 		/* block_index not 0 means the shared block is requested */
++ 		block = tcf_block_lookup(net, ei->block_index);
++ 		if (block)
++ 			block->refcnt++;
++ 	}
++ 
++ 	if (!block) {
++ 		block = tcf_block_create(net, q, extack);
++ 		if (IS_ERR(block))
++ 			return PTR_ERR(block);
++ 		created = true;
++ 		if (ei->block_index) {
++ 			err = tcf_block_insert(block, net,
++ 					       ei->block_index, extack);
++ 			if (err)
++ 				goto err_block_insert;
++ 		}
++ 	}
++ 
++ 	err = tcf_block_owner_add(block, q, ei->binder_type);
++ 	if (err)
++ 		goto err_block_owner_add;
++ 
++ 	tcf_block_owner_netif_keep_dst(block, q, ei->binder_type);
++ 
++ 	err = tcf_chain_head_change_cb_add(tcf_block_chain_zero(block),
++ 					   ei, extack);
++ 	if (err)
++ 		goto err_chain_head_change_cb_add;
++ 	tcf_block_offload_bind(block, q, ei);
++ 	*p_block = block;
++ 	return 0;
++ 
++ err_chain_head_change_cb_add:
++ 	tcf_block_owner_del(block, q, ei->binder_type);
++ err_block_owner_add:
++ 	if (created) {
++ 		if (tcf_block_shared(block))
++ 			tcf_block_remove(block, net);
++ err_block_insert:
++ 		kfree(tcf_block_chain_zero(block));
++ 		kfree(block);
++ 	} else {
++ 		block->refcnt--;
++ 	}
++ 	return err;
++ }
++ EXPORT_SYMBOL(tcf_block_get_ext);
++ 
++ static void tcf_chain_head_change_dflt(struct tcf_proto *tp_head, void *priv)
++ {
++ 	struct tcf_proto __rcu **p_filter_chain = priv;
++ 
++ 	rcu_assign_pointer(*p_filter_chain, tp_head);
+++>>>>>>> f36fe1c498c8 (net: sched: introduce block mechanism to handle netif_keep_dst calls)
+  }
+  
+  int tcf_block_get(struct tcf_block **p_block,
+@@@ -289,26 -556,150 +503,31 @@@ void tcf_block_put(struct tcf_block *bl
+  
+  	if (!block)
+  		return;
+++<<<<<<< HEAD
+++=======
++ 	tcf_chain_head_change_cb_del(tcf_block_chain_zero(block), ei);
++ 	tcf_block_owner_del(block, q, ei->binder_type);
+++>>>>>>> f36fe1c498c8 (net: sched: introduce block mechanism to handle netif_keep_dst calls)
+  
+ -	if (--block->refcnt == 0) {
+ -		if (tcf_block_shared(block))
+ -			tcf_block_remove(block, block->net);
+ -
+ -		/* Hold a refcnt for all chains, so that they don't disappear
+ -		 * while we are iterating.
+ -		 */
+ -		list_for_each_entry(chain, &block->chain_list, list)
+ -			tcf_chain_hold(chain);
+ -
+ -		list_for_each_entry(chain, &block->chain_list, list)
+ -			tcf_chain_flush(chain);
+ -	}
+ -
+ -	tcf_block_offload_unbind(block, q, ei);
+ -
+ -	if (block->refcnt == 0) {
+ -		/* At this point, all the chains should have refcnt >= 1. */
+ -		list_for_each_entry_safe(chain, tmp, &block->chain_list, list)
+ -			tcf_chain_put(chain);
+ +	/* Hold a refcnt for all chains, so that they don't disappear
+ +	 * while we are iterating.
+ +	 */
+ +	list_for_each_entry(chain, &block->chain_list, list)
+ +		tcf_chain_hold(chain);
+  
+ -		/* Finally, put chain 0 and allow block to be freed. */
+ -		tcf_chain_put(tcf_block_chain_zero(block));
+ -	}
+ -}
+ -EXPORT_SYMBOL(tcf_block_put_ext);
+ +	list_for_each_entry(chain, &block->chain_list, list)
+ +		tcf_chain_flush(chain);
+  
+ -void tcf_block_put(struct tcf_block *block)
+ -{
+ -	struct tcf_block_ext_info ei = {0, };
+ +	/* At this point, all the chains should have refcnt >= 1. */
+ +	list_for_each_entry_safe(chain, tmp, &block->chain_list, list)
+ +		tcf_chain_put(chain);
+  
+ -	if (!block)
+ -		return;
+ -	tcf_block_put_ext(block, block->q, &ei);
+ +	/* Finally, put chain 0 and allow block to be freed. */
+ +	chain = list_first_entry(&block->chain_list, struct tcf_chain, list);
+ +	tcf_chain_put(chain);
+  }
+ -
+  EXPORT_SYMBOL(tcf_block_put);
+  
+ -struct tcf_block_cb {
+ -	struct list_head list;
+ -	tc_setup_cb_t *cb;
+ -	void *cb_ident;
+ -	void *cb_priv;
+ -	unsigned int refcnt;
+ -};
+ -
+ -void *tcf_block_cb_priv(struct tcf_block_cb *block_cb)
+ -{
+ -	return block_cb->cb_priv;
+ -}
+ -EXPORT_SYMBOL(tcf_block_cb_priv);
+ -
+ -struct tcf_block_cb *tcf_block_cb_lookup(struct tcf_block *block,
+ -					 tc_setup_cb_t *cb, void *cb_ident)
+ -{	struct tcf_block_cb *block_cb;
+ -
+ -	list_for_each_entry(block_cb, &block->cb_list, list)
+ -		if (block_cb->cb == cb && block_cb->cb_ident == cb_ident)
+ -			return block_cb;
+ -	return NULL;
+ -}
+ -EXPORT_SYMBOL(tcf_block_cb_lookup);
+ -
+ -void tcf_block_cb_incref(struct tcf_block_cb *block_cb)
+ -{
+ -	block_cb->refcnt++;
+ -}
+ -EXPORT_SYMBOL(tcf_block_cb_incref);
+ -
+ -unsigned int tcf_block_cb_decref(struct tcf_block_cb *block_cb)
+ -{
+ -	return --block_cb->refcnt;
+ -}
+ -EXPORT_SYMBOL(tcf_block_cb_decref);
+ -
+ -struct tcf_block_cb *__tcf_block_cb_register(struct tcf_block *block,
+ -					     tc_setup_cb_t *cb, void *cb_ident,
+ -					     void *cb_priv)
+ -{
+ -	struct tcf_block_cb *block_cb;
+ -
+ -	block_cb = kzalloc(sizeof(*block_cb), GFP_KERNEL);
+ -	if (!block_cb)
+ -		return NULL;
+ -	block_cb->cb = cb;
+ -	block_cb->cb_ident = cb_ident;
+ -	block_cb->cb_priv = cb_priv;
+ -	list_add(&block_cb->list, &block->cb_list);
+ -	return block_cb;
+ -}
+ -EXPORT_SYMBOL(__tcf_block_cb_register);
+ -
+ -int tcf_block_cb_register(struct tcf_block *block,
+ -			  tc_setup_cb_t *cb, void *cb_ident,
+ -			  void *cb_priv)
+ -{
+ -	struct tcf_block_cb *block_cb;
+ -
+ -	block_cb = __tcf_block_cb_register(block, cb, cb_ident, cb_priv);
+ -	return block_cb ? 0 : -ENOMEM;
+ -}
+ -EXPORT_SYMBOL(tcf_block_cb_register);
+ -
+ -void __tcf_block_cb_unregister(struct tcf_block_cb *block_cb)
+ -{
+ -	list_del(&block_cb->list);
+ -	kfree(block_cb);
+ -}
+ -EXPORT_SYMBOL(__tcf_block_cb_unregister);
+ -
+ -void tcf_block_cb_unregister(struct tcf_block *block,
+ -			     tc_setup_cb_t *cb, void *cb_ident)
+ -{
+ -	struct tcf_block_cb *block_cb;
+ -
+ -	block_cb = tcf_block_cb_lookup(block, cb, cb_ident);
+ -	if (!block_cb)
+ -		return;
+ -	__tcf_block_cb_unregister(block_cb);
+ -}
+ -EXPORT_SYMBOL(tcf_block_cb_unregister);
+ -
+ -static int tcf_block_cb_call(struct tcf_block *block, enum tc_setup_type type,
+ -			     void *type_data, bool err_stop)
+ -{
+ -	struct tcf_block_cb *block_cb;
+ -	int ok_count = 0;
+ -	int err;
+ -
+ -	list_for_each_entry(block_cb, &block->cb_list, list) {
+ -		err = block_cb->cb(type, type_data, block_cb->cb_priv);
+ -		if (err) {
+ -			if (err_stop)
+ -				return err;
+ -		} else {
+ -			ok_count++;
+ -		}
+ -	}
+ -	return ok_count;
+ -}
+ -
+  /* Main classifier routine: scans classifier chain attached
+   * to this qdisc, (optionally) tests for protocol and asks
+   * specific classifiers.
+diff --cc net/sched/cls_bpf.c
+index c7a7c00a2b7c,d79cc5086509..000000000000
+--- a/net/sched/cls_bpf.c
++++ b/net/sched/cls_bpf.c
+@@@ -212,45 -348,102 +212,104 @@@ static int cls_bpf_set_parms(struct ne
+  
+  	memcpy(bpf_ops, nla_data(tb[TCA_BPF_OPS]), bpf_size);
+  
+ -	fprog_tmp.len = bpf_num_ops;
+ -	fprog_tmp.filter = bpf_ops;
+ +	tmp.len = bpf_len;
+ +	tmp.filter = (struct sock_filter __user *) bpf_ops;
+  
+ -	ret = bpf_prog_create(&fp, &fprog_tmp);
+ -	if (ret < 0) {
+ -		kfree(bpf_ops);
+ -		return ret;
+ -	}
+ +	ret = sk_unattached_filter_create(&fp, &tmp);
+ +	if (ret)
+ +		goto errout_free;
+  
+ +	prog->bpf_len = bpf_len;
+  	prog->bpf_ops = bpf_ops;
+ -	prog->bpf_num_ops = bpf_num_ops;
+ -	prog->bpf_name = NULL;
+  	prog->filter = fp;
+ +	prog->res.classid = classid;
+ +
+ +	tcf_bind_filter(tp, &prog->res, base);
+  
+  	return 0;
+ +errout_free:
+ +	kfree(bpf_ops);
+ +	return ret;
+  }
+  
+ -static int cls_bpf_prog_from_efd(struct nlattr **tb, struct cls_bpf_prog *prog,
+ -				 u32 gen_flags, const struct tcf_proto *tp)
+ +static u32 cls_bpf_grab_new_handle(struct tcf_proto *tp,
+ +				   struct cls_bpf_head *head)
+  {
+ -	struct bpf_prog *fp;
+ -	char *name = NULL;
+ -	bool skip_sw;
+ -	u32 bpf_fd;
+ -
+ -	bpf_fd = nla_get_u32(tb[TCA_BPF_FD]);
+ -	skip_sw = gen_flags & TCA_CLS_FLAGS_SKIP_SW;
+ -
+ -	fp = bpf_prog_get_type_dev(bpf_fd, BPF_PROG_TYPE_SCHED_CLS, skip_sw);
+ -	if (IS_ERR(fp))
+ -		return PTR_ERR(fp);
+ -
+ -	if (tb[TCA_BPF_NAME]) {
+ -		name = nla_memdup(tb[TCA_BPF_NAME], GFP_KERNEL);
+ -		if (!name) {
+ -			bpf_prog_put(fp);
+ -			return -ENOMEM;
+ -		}
+ +	unsigned int i = 0x80000000;
+ +	u32 handle;
+ +
+ +	do {
+ +		if (++head->hgen == 0x7FFFFFFF)
+ +			head->hgen = 1;
+ +	} while (--i > 0 && cls_bpf_get(tp, head->hgen));
+ +
+ +	if (unlikely(i == 0)) {
+ +		pr_err("Insufficient number of handles\n");
+ +		handle = 0;
+ +	} else {
+ +		handle = head->hgen;
+  	}
+  
+++<<<<<<< HEAD
+ +	return handle;
+++=======
++ 	prog->bpf_ops = NULL;
++ 	prog->bpf_name = name;
++ 	prog->filter = fp;
++ 
++ 	if (fp->dst_needed)
++ 		tcf_block_netif_keep_dst(tp->chain->block);
++ 
++ 	return 0;
++ }
++ 
++ static int cls_bpf_set_parms(struct net *net, struct tcf_proto *tp,
++ 			     struct cls_bpf_prog *prog, unsigned long base,
++ 			     struct nlattr **tb, struct nlattr *est, bool ovr)
++ {
++ 	bool is_bpf, is_ebpf, have_exts = false;
++ 	u32 gen_flags = 0;
++ 	int ret;
++ 
++ 	is_bpf = tb[TCA_BPF_OPS_LEN] && tb[TCA_BPF_OPS];
++ 	is_ebpf = tb[TCA_BPF_FD];
++ 	if ((!is_bpf && !is_ebpf) || (is_bpf && is_ebpf))
++ 		return -EINVAL;
++ 
++ 	ret = tcf_exts_validate(net, tp, tb, est, &prog->exts, ovr);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	if (tb[TCA_BPF_FLAGS]) {
++ 		u32 bpf_flags = nla_get_u32(tb[TCA_BPF_FLAGS]);
++ 
++ 		if (bpf_flags & ~TCA_BPF_FLAG_ACT_DIRECT)
++ 			return -EINVAL;
++ 
++ 		have_exts = bpf_flags & TCA_BPF_FLAG_ACT_DIRECT;
++ 	}
++ 	if (tb[TCA_BPF_FLAGS_GEN]) {
++ 		gen_flags = nla_get_u32(tb[TCA_BPF_FLAGS_GEN]);
++ 		if (gen_flags & ~CLS_BPF_SUPPORTED_GEN_FLAGS ||
++ 		    !tc_flags_valid(gen_flags))
++ 			return -EINVAL;
++ 	}
++ 
++ 	prog->exts_integrated = have_exts;
++ 	prog->gen_flags = gen_flags;
++ 
++ 	ret = is_bpf ? cls_bpf_prog_from_ops(tb, prog) :
++ 		       cls_bpf_prog_from_efd(tb, prog, gen_flags, tp);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	if (tb[TCA_BPF_CLASSID]) {
++ 		prog->res.classid = nla_get_u32(tb[TCA_BPF_CLASSID]);
++ 		tcf_bind_filter(tp, &prog->res, base);
++ 	}
++ 
++ 	return 0;
+++>>>>>>> f36fe1c498c8 (net: sched: introduce block mechanism to handle netif_keep_dst calls)
+  }
+  
+  static int cls_bpf_change(struct net *net, struct sk_buff *in_skb,
+diff --git a/include/net/pkt_cls.h b/include/net/pkt_cls.h
+index bf70a6a4bd8a..1e801dc3bb46 100644
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -24,6 +24,7 @@ bool tcf_queue_work(struct work_struct *work);
+ struct tcf_chain *tcf_chain_get(struct tcf_block *block, u32 chain_index,
+ 				bool create);
+ void tcf_chain_put(struct tcf_chain *chain);
++void tcf_block_netif_keep_dst(struct tcf_block *block);
+ int tcf_block_get(struct tcf_block **p_block,
+ 		  struct tcf_proto __rcu **p_filter_chain);
+ void tcf_block_put(struct tcf_block *block);
+* Unmerged path include/net/sch_generic.h
+* Unmerged path net/sched/cls_api.c
+* Unmerged path net/sched/cls_bpf.c
+diff --git a/net/sched/cls_flow.c b/net/sched/cls_flow.c
+index abdf7cfd2a39..8b28a2cbdf31 100644
+--- a/net/sched/cls_flow.c
++++ b/net/sched/cls_flow.c
+@@ -520,7 +520,7 @@ static int flow_change(struct net *net, struct sk_buff *in_skb,
+ 	setup_deferrable_timer(&fnew->perturb_timer, flow_perturbation,
+ 			       (unsigned long)fnew);
+ 
+-	netif_keep_dst(qdisc_dev(tp->q));
++	tcf_block_netif_keep_dst(tp->chain->block);
+ 
+ 	if (tb[TCA_FLOW_KEYS]) {
+ 		fnew->keymask = keymask;
+diff --git a/net/sched/cls_route.c b/net/sched/cls_route.c
+index 6bb80681ce4f..309adae07493 100644
+--- a/net/sched/cls_route.c
++++ b/net/sched/cls_route.c
+@@ -527,7 +527,7 @@ static int route4_change(struct net *net, struct sk_buff *in_skb,
+ 		if (f->handle < f1->handle)
+ 			break;
+ 
+-	netif_keep_dst(qdisc_dev(tp->q));
++	tcf_block_netif_keep_dst(tp->chain->block);
+ 	rcu_assign_pointer(f->next, f1);
+ 	rcu_assign_pointer(*fp, f);
+ 
