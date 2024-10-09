@@ -1985,6 +1985,7 @@ static int btrfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	struct btrfs_block_rsv *block_rsv = &fs_info->global_block_rsv;
 	int ret;
 	u64 thresh = 0;
+	int mixed = 0;
 
 	/*
 	 * holding chunk_mutex to avoid allocating new chunks, holding
@@ -2010,8 +2011,17 @@ static int btrfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 				}
 			}
 		}
-		if (found->flags & BTRFS_BLOCK_GROUP_METADATA)
-			total_free_meta += found->disk_total - found->disk_used;
+
+		/*
+		 * Metadata in mixed block goup profiles are accounted in data
+		 */
+		if (!mixed && found->flags & BTRFS_BLOCK_GROUP_METADATA) {
+			if (found->flags & BTRFS_BLOCK_GROUP_DATA)
+				mixed = 1;
+			else
+				total_free_meta += found->disk_total -
+					found->disk_used;
+		}
 
 		total_used += found->disk_used;
 	}
@@ -2049,7 +2059,7 @@ static int btrfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	 */
 	thresh = 4 * 1024 * 1024;
 
-	if (total_free_meta - thresh < block_rsv->size)
+	if (!mixed && total_free_meta - thresh < block_rsv->size)
 		buf->f_bavail = 0;
 
 	buf->f_type = BTRFS_SUPER_MAGIC;
