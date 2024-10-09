@@ -1,0 +1,190 @@
+ntb: stop link work when we do not have memory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [ntb] stop link work when we do not have memory (Suravee Suthikulpanit) [1303727]
+Rebuild_FUZZ: 94.25%
+commit-author Dave Jiang <dave.jiang@intel.com>
+commit 84f766855f61ed2e5d07f0ec737b15ee687afb92
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/84f76685.failed
+
+Instead of keep trying to go through the init routine when we aren't able
+to allocate memory, we should just stop and go down.
+
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+	Signed-off-by: Jon Mason <jdmason@kudzu.us>
+(cherry picked from commit 84f766855f61ed2e5d07f0ec737b15ee687afb92)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/ntb/ntb_transport.c
+diff --cc drivers/ntb/ntb_transport.c
+index cc39efa77597,2ef9d9130864..000000000000
+--- a/drivers/ntb/ntb_transport.c
++++ b/drivers/ntb/ntb_transport.c
+@@@ -683,108 -823,60 +683,112 @@@ static void ntb_transport_event_callbac
+  
+  static void ntb_transport_link_work(struct work_struct *work)
+  {
+ -	struct ntb_transport_ctx *nt =
+ -		container_of(work, struct ntb_transport_ctx, link_work.work);
+ -	struct ntb_dev *ndev = nt->ndev;
+ -	struct pci_dev *pdev = ndev->pdev;
+ -	resource_size_t size;
+ +	struct ntb_transport *nt = container_of(work, struct ntb_transport,
+ +						link_work.work);
+ +	struct ntb_device *ndev = nt->ndev;
+ +	struct pci_dev *pdev = ntb_query_pdev(ndev);
+  	u32 val;
+++<<<<<<< HEAD
+ +	int rc, i;
+++=======
++ 	int rc = 0, i, spad;
+++>>>>>>> 84f766855f61 (ntb: stop link work when we do not have memory)
+  
+  	/* send the local info, in the opposite order of the way we read it */
+ -	for (i = 0; i < nt->mw_count; i++) {
+ -		size = nt->mw_vec[i].phys_size;
+ -
+ -		if (max_mw_size && size > max_mw_size)
+ -			size = max_mw_size;
+ -
+ -		spad = MW0_SZ_HIGH + (i * 2);
+ -		ntb_peer_spad_write(ndev, spad, upper_32_bits(size));
+ +	for (i = 0; i < ntb_max_mw(ndev); i++) {
+ +		rc = ntb_write_remote_spad(ndev, MW0_SZ_HIGH + (i * 2),
+ +					   ntb_get_mw_size(ndev, i) >> 32);
+ +		if (rc) {
+ +			dev_err(&pdev->dev, "Error writing %u to remote spad %d\n",
+ +				(u32)(ntb_get_mw_size(ndev, i) >> 32),
+ +				MW0_SZ_HIGH + (i * 2));
+ +			goto out;
+ +		}
+  
+ -		spad = MW0_SZ_LOW + (i * 2);
+ -		ntb_peer_spad_write(ndev, spad, lower_32_bits(size));
+ +		rc = ntb_write_remote_spad(ndev, MW0_SZ_LOW + (i * 2),
+ +					   (u32) ntb_get_mw_size(ndev, i));
+ +		if (rc) {
+ +			dev_err(&pdev->dev, "Error writing %u to remote spad %d\n",
+ +				(u32) ntb_get_mw_size(ndev, i),
+ +				MW0_SZ_LOW + (i * 2));
+ +			goto out;
+ +		}
+  	}
+  
+ -	ntb_peer_spad_write(ndev, NUM_MWS, nt->mw_count);
+ +	rc = ntb_write_remote_spad(ndev, NUM_MWS, ntb_max_mw(ndev));
+ +	if (rc) {
+ +		dev_err(&pdev->dev, "Error writing %x to remote spad %d\n",
+ +			ntb_max_mw(ndev), NUM_MWS);
+ +		goto out;
+ +	}
+  
+ -	ntb_peer_spad_write(ndev, NUM_QPS, nt->qp_count);
+ +	rc = ntb_write_remote_spad(ndev, NUM_QPS, nt->max_qps);
+ +	if (rc) {
+ +		dev_err(&pdev->dev, "Error writing %x to remote spad %d\n",
+ +			nt->max_qps, NUM_QPS);
+ +		goto out;
+ +	}
+  
+ -	ntb_peer_spad_write(ndev, VERSION, NTB_TRANSPORT_VERSION);
+ +	rc = ntb_write_remote_spad(ndev, VERSION, NTB_TRANSPORT_VERSION);
+ +	if (rc) {
+ +		dev_err(&pdev->dev, "Error writing %x to remote spad %d\n",
+ +			NTB_TRANSPORT_VERSION, VERSION);
+ +		goto out;
+ +	}
+  
+  	/* Query the remote side for its info */
+ -	val = ntb_spad_read(ndev, VERSION);
+ -	dev_dbg(&pdev->dev, "Remote version = %d\n", val);
+ +	rc = ntb_read_remote_spad(ndev, VERSION, &val);
+ +	if (rc) {
+ +		dev_err(&pdev->dev, "Error reading remote spad %d\n", VERSION);
+ +		goto out;
+ +	}
+ +
+  	if (val != NTB_TRANSPORT_VERSION)
+  		goto out;
+ +	dev_dbg(&pdev->dev, "Remote version = %d\n", val);
+ +
+ +	rc = ntb_read_remote_spad(ndev, NUM_QPS, &val);
+ +	if (rc) {
+ +		dev_err(&pdev->dev, "Error reading remote spad %d\n", NUM_QPS);
+ +		goto out;
+ +	}
+  
+ -	val = ntb_spad_read(ndev, NUM_QPS);
+ +	if (val != nt->max_qps)
+ +		goto out;
+  	dev_dbg(&pdev->dev, "Remote max number of qps = %d\n", val);
+ -	if (val != nt->qp_count)
+ +
+ +	rc = ntb_read_remote_spad(ndev, NUM_MWS, &val);
+ +	if (rc) {
+ +		dev_err(&pdev->dev, "Error reading remote spad %d\n", NUM_MWS);
+  		goto out;
+ +	}
+  
+ -	val = ntb_spad_read(ndev, NUM_MWS);
+ -	dev_dbg(&pdev->dev, "Remote number of mws = %d\n", val);
+ -	if (val != nt->mw_count)
+ +	if (val != ntb_max_mw(ndev))
+  		goto out;
+ +	dev_dbg(&pdev->dev, "Remote number of mws = %d\n", val);
+  
+ -	for (i = 0; i < nt->mw_count; i++) {
+ +	for (i = 0; i < ntb_max_mw(ndev); i++) {
+  		u64 val64;
+  
+ -		val = ntb_spad_read(ndev, MW0_SZ_HIGH + (i * 2));
+ -		val64 = (u64)val << 32;
+ +		rc = ntb_read_remote_spad(ndev, MW0_SZ_HIGH + (i * 2), &val);
+ +		if (rc) {
+ +			dev_err(&pdev->dev, "Error reading remote spad %d\n",
+ +				MW0_SZ_HIGH + (i * 2));
+ +			goto out1;
+ +		}
+ +
+ +		val64 = (u64) val << 32;
+ +
+ +		rc = ntb_read_remote_spad(ndev, MW0_SZ_LOW + (i * 2), &val);
+ +		if (rc) {
+ +			dev_err(&pdev->dev, "Error reading remote spad %d\n",
+ +				MW0_SZ_LOW + (i * 2));
+ +			goto out1;
+ +		}
+  
+ -		val = ntb_spad_read(ndev, MW0_SZ_LOW + (i * 2));
+  		val64 |= val;
+  
+ -		dev_dbg(&pdev->dev, "Remote MW%d size = %#llx\n", i, val64);
+ +		dev_dbg(&pdev->dev, "Remote MW%d size = %llu\n", i, val64);
+  
+  		rc = ntb_set_mw(nt, i, val64);
+  		if (rc)
+@@@ -805,10 -897,17 +809,17 @@@
+  	return;
+  
+  out1:
+ -	for (i = 0; i < nt->mw_count; i++)
+ +	for (i = 0; i < ntb_max_mw(ndev); i++)
+  		ntb_free_mw(nt, i);
++ 
++ 	/* if there's an actual failure, we should just bail */
++ 	if (rc < 0) {
++ 		ntb_link_disable(ndev);
++ 		return;
++ 	}
++ 
+  out:
+ -	if (ntb_link_is_up(ndev, NULL, NULL) == 1)
+ +	if (ntb_hw_link_status(ndev))
+  		schedule_delayed_work(&nt->link_work,
+  				      msecs_to_jiffies(NTB_LINK_DOWN_TIMEOUT));
+  }
+* Unmerged path drivers/ntb/ntb_transport.c
