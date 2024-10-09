@@ -1,0 +1,272 @@
+sysfs: move sysfs_hash_and_remove() to fs/sysfs/dir.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit 7eed6ecb0785681892ab1fe47188fc981241cfd0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7eed6ecb.failed
+
+Most removal related logic is implemented in fs/sysfs/dir.c.  Move
+sysfs_hash_and_remove() to fs/sysfs/dir.c so that __sysfs_remove()
+doesn't have to be public.
+
+This is pure relocation.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 7eed6ecb0785681892ab1fe47188fc981241cfd0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/sysfs/dir.c
+#	fs/sysfs/inode.c
+#	fs/sysfs/sysfs.h
+diff --cc fs/sysfs/dir.c
+index fd502d3fc9fc,486238d06021..000000000000
+--- a/fs/sysfs/dir.c
++++ b/fs/sysfs/dir.c
+@@@ -804,7 -758,87 +804,91 @@@ const struct inode_operations sysfs_dir
+  	.setxattr	= sysfs_setxattr,
+  };
+  
+++<<<<<<< HEAD
+ +static void remove_dir(struct sysfs_dirent *sd)
+++=======
++ static struct sysfs_dirent *sysfs_leftmost_descendant(struct sysfs_dirent *pos)
++ {
++ 	struct sysfs_dirent *last;
++ 
++ 	while (true) {
++ 		struct rb_node *rbn;
++ 
++ 		last = pos;
++ 
++ 		if (sysfs_type(pos) != SYSFS_DIR)
++ 			break;
++ 
++ 		rbn = rb_first(&pos->s_dir.children);
++ 		if (!rbn)
++ 			break;
++ 
++ 		pos = to_sysfs_dirent(rbn);
++ 	}
++ 
++ 	return last;
++ }
++ 
++ /**
++  * sysfs_next_descendant_post - find the next descendant for post-order walk
++  * @pos: the current position (%NULL to initiate traversal)
++  * @root: sysfs_dirent whose descendants to walk
++  *
++  * Find the next descendant to visit for post-order traversal of @root's
++  * descendants.  @root is included in the iteration and the last node to be
++  * visited.
++  */
++ static struct sysfs_dirent *sysfs_next_descendant_post(struct sysfs_dirent *pos,
++ 						       struct sysfs_dirent *root)
++ {
++ 	struct rb_node *rbn;
++ 
++ 	lockdep_assert_held(&sysfs_mutex);
++ 
++ 	/* if first iteration, visit leftmost descendant which may be root */
++ 	if (!pos)
++ 		return sysfs_leftmost_descendant(root);
++ 
++ 	/* if we visited @root, we're done */
++ 	if (pos == root)
++ 		return NULL;
++ 
++ 	/* if there's an unvisited sibling, visit its leftmost descendant */
++ 	rbn = rb_next(&pos->s_rb);
++ 	if (rbn)
++ 		return sysfs_leftmost_descendant(to_sysfs_dirent(rbn));
++ 
++ 	/* no sibling left, visit parent */
++ 	return pos->s_parent;
++ }
++ 
++ static void __sysfs_remove(struct sysfs_addrm_cxt *acxt,
++ 			   struct sysfs_dirent *sd)
++ {
++ 	struct sysfs_dirent *pos, *next;
++ 
++ 	if (!sd)
++ 		return;
++ 
++ 	pr_debug("sysfs %s: removing\n", sd->s_name);
++ 
++ 	next = NULL;
++ 	do {
++ 		pos = next;
++ 		next = sysfs_next_descendant_post(pos, sd);
++ 		if (pos)
++ 			sysfs_remove_one(acxt, pos);
++ 	} while (next);
++ }
++ 
++ /**
++  * sysfs_remove - remove a sysfs_dirent recursively
++  * @sd: the sysfs_dirent to remove
++  *
++  * Remove @sd along with all its subdirectories and files.
++  */
++ void sysfs_remove(struct sysfs_dirent *sd)
+++>>>>>>> 7eed6ecb0785 (sysfs: move sysfs_hash_and_remove() to fs/sysfs/dir.c)
+  {
+  	struct sysfs_addrm_cxt acxt;
+  
+@@@ -813,34 -847,41 +897,69 @@@
+  	sysfs_addrm_finish(&acxt);
+  }
+  
+ +void sysfs_remove_subdir(struct sysfs_dirent *sd)
+ +{
+ +	remove_dir(sd);
+ +}
+ +
+ +
+ +static void __sysfs_remove_dir(struct sysfs_dirent *dir_sd)
+ +{
+ +	struct sysfs_addrm_cxt acxt;
+ +	struct rb_node *pos;
+ +
+ +	if (!dir_sd)
+ +		return;
+ +
+ +	pr_debug("sysfs %s: removing dir\n", dir_sd->s_name);
+ +	sysfs_addrm_start(&acxt, dir_sd);
+ +	pos = rb_first(&dir_sd->s_dir.children);
+ +	while (pos) {
+ +		struct sysfs_dirent *sd = to_sysfs_dirent(pos);
+ +		pos = rb_next(pos);
+ +		if (sysfs_type(sd) != SYSFS_DIR)
+ +			sysfs_remove_one(&acxt, sd);
+ +	}
+ +	sysfs_addrm_finish(&acxt);
+ +
+ +	remove_dir(dir_sd);
+ +}
+ +
++ /**
++  * sysfs_hash_and_remove - find a sysfs_dirent by name and remove it
++  * @dir_sd: parent of the target
++  * @name: name of the sysfs_dirent to remove
++  * @ns: namespace tag of the sysfs_dirent to remove
++  *
++  * Look for the sysfs_dirent with @name and @ns under @dir_sd and remove
++  * it.  Returns 0 on success, -ENOENT if such entry doesn't exist.
++  */
++ int sysfs_hash_and_remove(struct sysfs_dirent *dir_sd, const char *name,
++ 			  const void *ns)
++ {
++ 	struct sysfs_addrm_cxt acxt;
++ 	struct sysfs_dirent *sd;
++ 
++ 	if (!dir_sd) {
++ 		WARN(1, KERN_WARNING "sysfs: can not remove '%s', no directory\n",
++ 			name);
++ 		return -ENOENT;
++ 	}
++ 
++ 	sysfs_addrm_start(&acxt);
++ 
++ 	sd = sysfs_find_dirent(dir_sd, name, ns);
++ 	if (sd)
++ 		__sysfs_remove(&acxt, sd);
++ 
++ 	sysfs_addrm_finish(&acxt);
++ 
++ 	if (sd)
++ 		return 0;
++ 	else
++ 		return -ENOENT;
++ }
++ 
+  /**
+   *	sysfs_remove_dir - remove an object's directory.
+   *	@kobj:	object.
+diff --cc fs/sysfs/inode.c
+index 15a606d56f5d,1750f790af3b..000000000000
+--- a/fs/sysfs/inode.c
++++ b/fs/sysfs/inode.c
+@@@ -312,31 -314,6 +312,34 @@@ void sysfs_evict_inode(struct inode *in
+  	sysfs_put(sd);
+  }
+  
+++<<<<<<< HEAD
+ +int sysfs_hash_and_remove(struct sysfs_dirent *dir_sd, const void *ns, const char *name)
+ +{
+ +	struct sysfs_addrm_cxt acxt;
+ +	struct sysfs_dirent *sd;
+ +
+ +	if (!dir_sd) {
+ +		WARN(1, KERN_WARNING "sysfs: can not remove '%s', no directory\n",
+ +			name);
+ +		return -ENOENT;
+ +	}
+ +
+ +	sysfs_addrm_start(&acxt, dir_sd);
+ +
+ +	sd = sysfs_find_dirent(dir_sd, ns, name);
+ +	if (sd)
+ +		sysfs_remove_one(&acxt, sd);
+ +
+ +	sysfs_addrm_finish(&acxt);
+ +
+ +	if (sd)
+ +		return 0;
+ +	else
+ +		return -ENOENT;
+ +}
+ +
+++=======
+++>>>>>>> 7eed6ecb0785 (sysfs: move sysfs_hash_and_remove() to fs/sysfs/dir.c)
+  int sysfs_permission(struct inode *inode, int mask)
+  {
+  	struct sysfs_dirent *sd;
+diff --cc fs/sysfs/sysfs.h
+index e18c3f38727c,8d3dc1ddb546..000000000000
+--- a/fs/sysfs/sysfs.h
++++ b/fs/sysfs/sysfs.h
+@@@ -164,11 -167,14 +164,22 @@@ extern const struct inode_operations sy
+  
+  struct sysfs_dirent *sysfs_get_active(struct sysfs_dirent *sd);
+  void sysfs_put_active(struct sysfs_dirent *sd);
+++<<<<<<< HEAD
+ +void sysfs_addrm_start(struct sysfs_addrm_cxt *acxt,
+ +		       struct sysfs_dirent *parent_sd);
+ +int __sysfs_add_one(struct sysfs_addrm_cxt *acxt, struct sysfs_dirent *sd);
+ +int sysfs_add_one(struct sysfs_addrm_cxt *acxt, struct sysfs_dirent *sd);
+ +void sysfs_remove_one(struct sysfs_addrm_cxt *acxt, struct sysfs_dirent *sd);
+++=======
++ void sysfs_addrm_start(struct sysfs_addrm_cxt *acxt);
++ int __sysfs_add_one(struct sysfs_addrm_cxt *acxt, struct sysfs_dirent *sd,
++ 		    struct sysfs_dirent *parent_sd);
++ int sysfs_add_one(struct sysfs_addrm_cxt *acxt, struct sysfs_dirent *sd,
++ 		  struct sysfs_dirent *parent_sd);
++ void sysfs_remove(struct sysfs_dirent *sd);
++ int sysfs_hash_and_remove(struct sysfs_dirent *dir_sd, const char *name,
++ 			  const void *ns);
+++>>>>>>> 7eed6ecb0785 (sysfs: move sysfs_hash_and_remove() to fs/sysfs/dir.c)
+  void sysfs_addrm_finish(struct sysfs_addrm_cxt *acxt);
+  
+  struct sysfs_dirent *sysfs_find_dirent(struct sysfs_dirent *parent_sd,
+@@@ -217,8 -219,6 +228,11 @@@ int sysfs_getattr(struct vfsmount *mnt
+  		  struct kstat *stat);
+  int sysfs_setxattr(struct dentry *dentry, const char *name, const void *value,
+  		   size_t size, int flags);
+++<<<<<<< HEAD
+ +int sysfs_hash_and_remove(struct sysfs_dirent *dir_sd, const void *ns,
+ +			  const char *name);
+++=======
+++>>>>>>> 7eed6ecb0785 (sysfs: move sysfs_hash_and_remove() to fs/sysfs/dir.c)
+  int sysfs_inode_init(void);
+  
+  /*
+* Unmerged path fs/sysfs/dir.c
+* Unmerged path fs/sysfs/inode.c
+* Unmerged path fs/sysfs/sysfs.h
