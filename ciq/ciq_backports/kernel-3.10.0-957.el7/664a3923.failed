@@ -1,0 +1,610 @@
+watchdog: Introduce hardware maximum heartbeat in watchdog core
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [watchdog] Introduce hardware maximum heartbeat in watchdog core (David Arcari) [1576173]
+Rebuild_FUZZ: 91.38%
+commit-author Guenter Roeck <linux@roeck-us.net>
+commit 664a39236e718f9f03fa73fc01006da9ced04efc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/664a3923.failed
+
+Introduce an optional hardware maximum heartbeat in the watchdog core.
+The hardware maximum heartbeat can be lower than the maximum timeout.
+
+Drivers can set the maximum hardware heartbeat value in the watchdog data
+structure. If the configured timeout exceeds the maximum hardware heartbeat,
+the watchdog core enables a timer function to assist sending keepalive
+requests to the watchdog driver.
+
+	Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+	Signed-off-by: Wim Van Sebroeck <wim@iguana.be>
+(cherry picked from commit 664a39236e718f9f03fa73fc01006da9ced04efc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/watchdog/watchdog-kernel-api.txt
+#	drivers/watchdog/watchdog_dev.c
+#	include/linux/watchdog.h
+diff --cc Documentation/watchdog/watchdog-kernel-api.txt
+index d8b0d3367706,15a02595ade1..000000000000
+--- a/Documentation/watchdog/watchdog-kernel-api.txt
++++ b/Documentation/watchdog/watchdog-kernel-api.txt
+@@@ -53,8 -52,11 +53,14 @@@ struct watchdog_device 
+  	unsigned int timeout;
+  	unsigned int min_timeout;
+  	unsigned int max_timeout;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int max_hw_heartbeat_ms;
++ 	struct notifier_block reboot_nb;
++ 	struct notifier_block restart_nb;
+++>>>>>>> 664a39236e71 (watchdog: Introduce hardware maximum heartbeat in watchdog core)
+  	void *driver_data;
+ -	struct watchdog_core_data *wd_data;
+ +	struct mutex lock;
+  	unsigned long status;
+  	struct list_head deferred;
+  };
+@@@ -73,8 -74,25 +79,29 @@@ It contains following fields
+    additional information about the watchdog timer itself. (Like it's unique name)
+  * ops: a pointer to the list of watchdog operations that the watchdog supports.
+  * timeout: the watchdog timer's timeout value (in seconds).
++   This is the time after which the system will reboot if user space does
++   not send a heartbeat request if WDOG_ACTIVE is set.
+  * min_timeout: the watchdog timer's minimum timeout value (in seconds).
+++<<<<<<< HEAD
+ +* max_timeout: the watchdog timer's maximum timeout value (in seconds).
+++=======
++   If set, the minimum configurable value for 'timeout'.
++ * max_timeout: the watchdog timer's maximum timeout value (in seconds),
++   as seen from userspace. If set, the maximum configurable value for
++   'timeout'. Not used if max_hw_heartbeat_ms is non-zero.
++ * max_hw_heartbeat_ms: Maximum hardware heartbeat, in milli-seconds.
++   If set, the infrastructure will send heartbeats to the watchdog driver
++   if 'timeout' is larger than max_hw_heartbeat_ms, unless WDOG_ACTIVE
++   is set and userspace failed to send a heartbeat for at least 'timeout'
++   seconds.
++ * reboot_nb: notifier block that is registered for reboot notifications, for
++   internal use only. If the driver calls watchdog_stop_on_reboot, watchdog core
++   will stop the watchdog on such notifications.
++ * restart_nb: notifier block that is registered for machine restart, for
++   internal use only. If a watchdog is capable of restarting the machine, it
++   should define ops->restart. Priority can be changed through
++   watchdog_set_restart_priority.
+++>>>>>>> 664a39236e71 (watchdog: Introduce hardware maximum heartbeat in watchdog core)
+  * bootstatus: status of the device after booting (reported with watchdog
+    WDIOF_* status bits).
+  * driver_data: a pointer to the drivers private data of a watchdog device.
+@@@ -160,14 -164,21 +187,18 @@@ they are supported. These optional rout
+    and -EIO for "could not write value to the watchdog". On success this
+    routine should set the timeout value of the watchdog_device to the
+    achieved timeout value (which may be different from the requested one
+-   because the watchdog does not necessarily has a 1 second resolution).
++   because the watchdog does not necessarily have a 1 second resolution).
++   Drivers implementing max_hw_heartbeat_ms set the hardware watchdog heartbeat
++   to the minimum of timeout and max_hw_heartbeat_ms. Those drivers set the
++   timeout value of the watchdog_device either to the requested timeout value
++   (if it is larger than max_hw_heartbeat_ms), or to the achieved timeout value.
+    (Note: the WDIOF_SETTIMEOUT needs to be set in the options field of the
+    watchdog's info structure).
+ -  If the watchdog driver does not have to perform any action but setting the
+ -  watchdog_device.timeout, this callback can be omitted.
+ -  If set_timeout is not provided but, WDIOF_SETTIMEOUT is set, the watchdog
+ -  infrastructure updates the timeout value of the watchdog_device internally
+ -  to the requested value.
+  * get_timeleft: this routines returns the time that's left before a reset.
+ -* restart: this routine restarts the machine. It returns 0 on success or a
+ -  negative errno code for failure.
+ +* ref: the operation that calls kref_get on the kref of a dynamically
+ +  allocated watchdog_device struct.
+ +* unref: the operation that calls kref_put on the kref of a dynamically
+ +  allocated watchdog_device struct.
+  * ioctl: if this routine is present then it will be called first before we do
+    our own internal ioctl call handling. This routine should return -ENOIOCTLCMD
+    if a command is not supported. The parameters that are passed to the ioctl
+diff --cc drivers/watchdog/watchdog_dev.c
+index f06fbcf0bea2,e668a9e8b648..000000000000
+--- a/drivers/watchdog/watchdog_dev.c
++++ b/drivers/watchdog/watchdog_dev.c
+@@@ -32,23 -32,119 +32,131 @@@
+  
+  #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+  
+++<<<<<<< HEAD
+++=======
++ #include <linux/cdev.h>		/* For character device */
++ #include <linux/errno.h>	/* For the -ENODEV/... values */
++ #include <linux/fs.h>		/* For file operations */
++ #include <linux/init.h>		/* For __init/__exit/... */
++ #include <linux/jiffies.h>	/* For timeout functions */
++ #include <linux/kernel.h>	/* For printk/panic/... */
++ #include <linux/kref.h>		/* For data references */
++ #include <linux/miscdevice.h>	/* For handling misc devices */
+++>>>>>>> 664a39236e71 (watchdog: Introduce hardware maximum heartbeat in watchdog core)
+  #include <linux/module.h>	/* For module stuff/... */
+ -#include <linux/mutex.h>	/* For mutexes */
+ -#include <linux/slab.h>		/* For memory functions */
+  #include <linux/types.h>	/* For standard types (like size_t) */
+ +#include <linux/errno.h>	/* For the -ENODEV/... values */
+ +#include <linux/kernel.h>	/* For printk/panic/... */
+ +#include <linux/fs.h>		/* For file operations */
+  #include <linux/watchdog.h>	/* For watchdog specific items */
+++<<<<<<< HEAD
+ +#include <linux/miscdevice.h>	/* For handling misc devices */
+ +#include <linux/init.h>		/* For __init/__exit/... */
+++=======
++ #include <linux/workqueue.h>	/* For workqueue */
+++>>>>>>> 664a39236e71 (watchdog: Introduce hardware maximum heartbeat in watchdog core)
+  #include <linux/uaccess.h>	/* For copy_to_user/put_user/... */
+  
+  #include "watchdog_core.h"
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * struct watchdog_core_data - watchdog core internal data
++  * @kref:	Reference count.
++  * @cdev:	The watchdog's Character device.
++  * @wdd:	Pointer to watchdog device.
++  * @lock:	Lock for watchdog core.
++  * @status:	Watchdog core internal status bits.
++  */
++ struct watchdog_core_data {
++ 	struct kref kref;
++ 	struct cdev cdev;
++ 	struct watchdog_device *wdd;
++ 	struct mutex lock;
++ 	unsigned long last_keepalive;
++ 	struct delayed_work work;
++ 	unsigned long status;		/* Internal status bits */
++ #define _WDOG_DEV_OPEN		0	/* Opened ? */
++ #define _WDOG_ALLOW_RELEASE	1	/* Did we receive the magic char ? */
++ };
++ 
+++>>>>>>> 664a39236e71 (watchdog: Introduce hardware maximum heartbeat in watchdog core)
+  /* the dev_t structure to store the dynamically allocated watchdog devices */
+  static dev_t watchdog_devt;
+ -/* Reference to watchdog device behind /dev/watchdog */
+ -static struct watchdog_core_data *old_wd_data;
+ +/* the watchdog device behind /dev/watchdog */
+ +static struct watchdog_device *old_wdd;
+  
++ static struct workqueue_struct *watchdog_wq;
++ 
++ static inline bool watchdog_need_worker(struct watchdog_device *wdd)
++ {
++ 	/* All variables in milli-seconds */
++ 	unsigned int hm = wdd->max_hw_heartbeat_ms;
++ 	unsigned int t = wdd->timeout * 1000;
++ 
++ 	/*
++ 	 * A worker to generate heartbeat requests is needed if all of the
++ 	 * following conditions are true.
++ 	 * - Userspace activated the watchdog.
++ 	 * - The driver provided a value for the maximum hardware timeout, and
++ 	 *   thus is aware that the framework supports generating heartbeat
++ 	 *   requests.
++ 	 * - Userspace requests a longer timeout than the hardware can handle.
++ 	 */
++ 	return watchdog_active(wdd) && hm && t > hm;
++ }
++ 
++ static long watchdog_next_keepalive(struct watchdog_device *wdd)
++ {
++ 	struct watchdog_core_data *wd_data = wdd->wd_data;
++ 	unsigned int timeout_ms = wdd->timeout * 1000;
++ 	unsigned long keepalive_interval;
++ 	unsigned long last_heartbeat;
++ 	unsigned long virt_timeout;
++ 	unsigned int hw_heartbeat_ms;
++ 
++ 	virt_timeout = wd_data->last_keepalive + msecs_to_jiffies(timeout_ms);
++ 	hw_heartbeat_ms = min(timeout_ms, wdd->max_hw_heartbeat_ms);
++ 	keepalive_interval = msecs_to_jiffies(hw_heartbeat_ms / 2);
++ 
++ 	/*
++ 	 * To ensure that the watchdog times out wdd->timeout seconds
++ 	 * after the most recent ping from userspace, the last
++ 	 * worker ping has to come in hw_heartbeat_ms before this timeout.
++ 	 */
++ 	last_heartbeat = virt_timeout - msecs_to_jiffies(hw_heartbeat_ms);
++ 	return min_t(long, last_heartbeat - jiffies, keepalive_interval);
++ }
++ 
++ static inline void watchdog_update_worker(struct watchdog_device *wdd)
++ {
++ 	struct watchdog_core_data *wd_data = wdd->wd_data;
++ 
++ 	if (watchdog_need_worker(wdd)) {
++ 		long t = watchdog_next_keepalive(wdd);
++ 
++ 		if (t > 0)
++ 			mod_delayed_work(watchdog_wq, &wd_data->work, t);
++ 	} else {
++ 		cancel_delayed_work(&wd_data->work);
++ 	}
++ }
++ 
++ static int __watchdog_ping(struct watchdog_device *wdd)
++ {
++ 	int err;
++ 
++ 	if (wdd->ops->ping)
++ 		err = wdd->ops->ping(wdd);  /* ping the watchdog */
++ 	else
++ 		err = wdd->ops->start(wdd); /* restart watchdog */
++ 
++ 	watchdog_update_worker(wdd);
++ 
++ 	return err;
++ }
++ 
+  /*
+   *	watchdog_ping: ping the watchdog.
+   *	@wdd: the watchdog device to ping
+@@@ -61,26 -159,28 +169,45 @@@
+  
+  static int watchdog_ping(struct watchdog_device *wdd)
+  {
+++<<<<<<< HEAD
+ +	int err = 0;
+ +
+ +	mutex_lock(&wdd->lock);
+ +
+ +	if (test_bit(WDOG_UNREGISTERED, &wdd->status)) {
+ +		err = -ENODEV;
+ +		goto out_ping;
+ +	}
+++=======
++ 	struct watchdog_core_data *wd_data = wdd->wd_data;
+++>>>>>>> 664a39236e71 (watchdog: Introduce hardware maximum heartbeat in watchdog core)
+  
+  	if (!watchdog_active(wdd))
+ -		return 0;
+ +		goto out_ping;
+  
+- 	if (wdd->ops->ping)
+- 		err = wdd->ops->ping(wdd);	/* ping the watchdog */
+- 	else
+- 		err = wdd->ops->start(wdd);	/* restart watchdog */
++ 	wd_data->last_keepalive = jiffies;
++ 	return __watchdog_ping(wdd);
++ }
+  
+++<<<<<<< HEAD
+ +out_ping:
+ +	mutex_unlock(&wdd->lock);
+ +	return err;
+++=======
++ static void watchdog_ping_work(struct work_struct *work)
++ {
++ 	struct watchdog_core_data *wd_data;
++ 	struct watchdog_device *wdd;
++ 
++ 	wd_data = container_of(to_delayed_work(work), struct watchdog_core_data,
++ 			       work);
++ 
++ 	mutex_lock(&wd_data->lock);
++ 	wdd = wd_data->wdd;
++ 	if (wdd && watchdog_active(wdd))
++ 		__watchdog_ping(wdd);
++ 	mutex_unlock(&wd_data->lock);
+++>>>>>>> 664a39236e71 (watchdog: Introduce hardware maximum heartbeat in watchdog core)
+  }
+  
+  /*
+@@@ -94,24 -196,21 +221,34 @@@
+  
+  static int watchdog_start(struct watchdog_device *wdd)
+  {
+++<<<<<<< HEAD
+ +	int err = 0;
+ +
+ +	mutex_lock(&wdd->lock);
+ +
+ +	if (test_bit(WDOG_UNREGISTERED, &wdd->status)) {
+ +		err = -ENODEV;
+ +		goto out_start;
+ +	}
+++=======
++ 	struct watchdog_core_data *wd_data = wdd->wd_data;
++ 	unsigned long started_at;
++ 	int err;
+++>>>>>>> 664a39236e71 (watchdog: Introduce hardware maximum heartbeat in watchdog core)
+  
+  	if (watchdog_active(wdd))
+ -		return 0;
+ +		goto out_start;
+  
++ 	started_at = jiffies;
+  	err = wdd->ops->start(wdd);
+- 	if (err == 0)
++ 	if (err == 0) {
+  		set_bit(WDOG_ACTIVE, &wdd->status);
++ 		wd_data->last_keepalive = started_at;
++ 		watchdog_update_worker(wdd);
++ 	}
+  
+ +out_start:
+ +	mutex_unlock(&wdd->lock);
+  	return err;
+  }
+  
+@@@ -127,30 -228,24 +264,37 @@@
+  
+  static int watchdog_stop(struct watchdog_device *wdd)
+  {
+++<<<<<<< HEAD
+ +	int err = 0;
+ +
+ +	mutex_lock(&wdd->lock);
+ +
+ +	if (test_bit(WDOG_UNREGISTERED, &wdd->status)) {
+ +		err = -ENODEV;
+ +		goto out_stop;
+ +	}
+++=======
++ 	struct watchdog_core_data *wd_data = wdd->wd_data;
++ 	int err;
+++>>>>>>> 664a39236e71 (watchdog: Introduce hardware maximum heartbeat in watchdog core)
+  
+  	if (!watchdog_active(wdd))
+ -		return 0;
+ +		goto out_stop;
+  
+  	if (test_bit(WDOG_NO_WAY_OUT, &wdd->status)) {
+ -		pr_info("watchdog%d: nowayout prevents watchdog being stopped!\n",
+ -			wdd->id);
+ -		return -EBUSY;
+ +		dev_info(wdd->dev, "nowayout prevents watchdog being stopped!\n");
+ +		err = -EBUSY;
+ +		goto out_stop;
+  	}
+  
+  	err = wdd->ops->stop(wdd);
+- 	if (err == 0)
++ 	if (err == 0) {
+  		clear_bit(WDOG_ACTIVE, &wdd->status);
++ 		cancel_delayed_work(&wd_data->work);
++ 	}
+  
+ +out_stop:
+ +	mutex_unlock(&wdd->lock);
+  	return err;
+  }
+  
+@@@ -202,17 -285,13 +346,22 @@@ static int watchdog_set_timeout(struct 
+  	if (watchdog_timeout_invalid(wdd, timeout))
+  		return -EINVAL;
+  
+ -	if (wdd->ops->set_timeout)
+ -		err = wdd->ops->set_timeout(wdd, timeout);
+ -	else
+ -		wdd->timeout = timeout;
+ +	mutex_lock(&wdd->lock);
+  
+++<<<<<<< HEAD
+ +	if (test_bit(WDOG_UNREGISTERED, &wdd->status)) {
+ +		err = -ENODEV;
+ +		goto out_timeout;
+ +	}
+ +
+ +	err = wdd->ops->set_timeout(wdd, timeout);
+ +
+ +out_timeout:
+ +	mutex_unlock(&wdd->lock);
+++=======
++ 	watchdog_update_worker(wdd);
++ 
+++>>>>>>> 664a39236e71 (watchdog: Introduce hardware maximum heartbeat in watchdog core)
+  	return err;
+  }
+  
+@@@ -600,16 -712,16 +749,26 @@@ static int watchdog_release(struct inod
+  		watchdog_ping(wdd);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	cancel_delayed_work_sync(&wd_data->work);
++ 
++ 	/* make sure that /dev/watchdog can be re-opened */
++ 	clear_bit(_WDOG_DEV_OPEN, &wd_data->status);
++ 
++ done:
++ 	mutex_unlock(&wd_data->lock);
+++>>>>>>> 664a39236e71 (watchdog: Introduce hardware maximum heartbeat in watchdog core)
+  	/* Allow the owner module to be unloaded again */
+ -	module_put(wd_data->cdev.owner);
+ -	kref_put(&wd_data->kref, watchdog_core_data_release);
+ +	module_put(wdd->ops->owner);
+ +
+ +	/* make sure that /dev/watchdog can be re-opened */
+ +	clear_bit(WDOG_DEV_OPEN, &wdd->status);
+ +
+ +	/* Note wdd may be gone after this, do not use after this! */
+ +	if (wdd->ops->unref)
+ +		wdd->ops->unref(wdd);
+ +
+  	return 0;
+  }
+  
+@@@ -628,6 -740,103 +787,106 @@@ static struct miscdevice watchdog_miscd
+  };
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  *	watchdog_cdev_register: register watchdog character device
++  *	@wdd: watchdog device
++  *	@devno: character device number
++  *
++  *	Register a watchdog character device including handling the legacy
++  *	/dev/watchdog node. /dev/watchdog is actually a miscdevice and
++  *	thus we set it up like that.
++  */
++ 
++ static int watchdog_cdev_register(struct watchdog_device *wdd, dev_t devno)
++ {
++ 	struct watchdog_core_data *wd_data;
++ 	int err;
++ 
++ 	wd_data = kzalloc(sizeof(struct watchdog_core_data), GFP_KERNEL);
++ 	if (!wd_data)
++ 		return -ENOMEM;
++ 	kref_init(&wd_data->kref);
++ 	mutex_init(&wd_data->lock);
++ 
++ 	wd_data->wdd = wdd;
++ 	wdd->wd_data = wd_data;
++ 
++ 	if (!watchdog_wq)
++ 		return -ENODEV;
++ 
++ 	INIT_DELAYED_WORK(&wd_data->work, watchdog_ping_work);
++ 
++ 	if (wdd->id == 0) {
++ 		old_wd_data = wd_data;
++ 		watchdog_miscdev.parent = wdd->parent;
++ 		err = misc_register(&watchdog_miscdev);
++ 		if (err != 0) {
++ 			pr_err("%s: cannot register miscdev on minor=%d (err=%d).\n",
++ 				wdd->info->identity, WATCHDOG_MINOR, err);
++ 			if (err == -EBUSY)
++ 				pr_err("%s: a legacy watchdog module is probably present.\n",
++ 					wdd->info->identity);
++ 			old_wd_data = NULL;
++ 			kfree(wd_data);
++ 			return err;
++ 		}
++ 	}
++ 
++ 	/* Fill in the data structures */
++ 	cdev_init(&wd_data->cdev, &watchdog_fops);
++ 	wd_data->cdev.owner = wdd->ops->owner;
++ 
++ 	/* Add the device */
++ 	err = cdev_add(&wd_data->cdev, devno, 1);
++ 	if (err) {
++ 		pr_err("watchdog%d unable to add device %d:%d\n",
++ 			wdd->id,  MAJOR(watchdog_devt), wdd->id);
++ 		if (wdd->id == 0) {
++ 			misc_deregister(&watchdog_miscdev);
++ 			old_wd_data = NULL;
++ 			kref_put(&wd_data->kref, watchdog_core_data_release);
++ 		}
++ 	}
++ 	return err;
++ }
++ 
++ /*
++  *	watchdog_cdev_unregister: unregister watchdog character device
++  *	@watchdog: watchdog device
++  *
++  *	Unregister watchdog character device and if needed the legacy
++  *	/dev/watchdog device.
++  */
++ 
++ static void watchdog_cdev_unregister(struct watchdog_device *wdd)
++ {
++ 	struct watchdog_core_data *wd_data = wdd->wd_data;
++ 
++ 	cdev_del(&wd_data->cdev);
++ 	if (wdd->id == 0) {
++ 		misc_deregister(&watchdog_miscdev);
++ 		old_wd_data = NULL;
++ 	}
++ 
++ 	mutex_lock(&wd_data->lock);
++ 	wd_data->wdd = NULL;
++ 	wdd->wd_data = NULL;
++ 	mutex_unlock(&wd_data->lock);
++ 
++ 	cancel_delayed_work_sync(&wd_data->work);
++ 
++ 	kref_put(&wd_data->kref, watchdog_core_data_release);
++ }
++ 
++ static struct class watchdog_class = {
++ 	.name =		"watchdog",
++ 	.owner =	THIS_MODULE,
++ 	.dev_groups =	wdt_groups,
++ };
++ 
++ /*
+++>>>>>>> 664a39236e71 (watchdog: Introduce hardware maximum heartbeat in watchdog core)
+   *	watchdog_dev_register: register a watchdog device
+   *	@wdd: watchdog device
+   *
+diff --cc include/linux/watchdog.h
+index e90e3ea5ebeb,8e82daecb7d3..000000000000
+--- a/include/linux/watchdog.h
++++ b/include/linux/watchdog.h
+@@@ -10,8 -10,10 +10,13 @@@
+  
+  
+  #include <linux/bitops.h>
+- #include <linux/device.h>
+  #include <linux/cdev.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/device.h>
++ #include <linux/kernel.h>
++ #include <linux/notifier.h>
+++>>>>>>> 664a39236e71 (watchdog: Introduce hardware maximum heartbeat in watchdog core)
+  #include <uapi/linux/watchdog.h>
+  
+  struct watchdog_ops;
+@@@ -59,14 -58,23 +64,29 @@@ struct watchdog_ops 
+   * @info:	Pointer to a watchdog_info structure.
+   * @ops:	Pointer to the list of watchdog operations.
+   * @bootstatus:	Status of the watchdog device at boot.
+++<<<<<<< HEAD
+ + * @timeout:	The watchdog devices timeout value.
+ + * @min_timeout:The watchdog devices minimum timeout value.
+ + * @max_timeout:The watchdog devices maximum timeout value.
+ + * @driver-data:Pointer to the drivers private data.
+ + * @lock:	Lock for watchdog core internal use only.
+++=======
++  * @timeout:	The watchdog devices timeout value (in seconds).
++  * @min_timeout:The watchdog devices minimum timeout value (in seconds).
++  * @max_timeout:The watchdog devices maximum timeout value (in seconds)
++  *		as configurable from user space. Only relevant if
++  *		max_hw_heartbeat_ms is not provided.
++  * @max_hw_heartbeat_ms:
++  *		Hardware limit for maximum timeout, in milli-seconds.
++  *		Replaces max_timeout if specified.
++  * @reboot_nb:	The notifier block to stop watchdog on reboot.
++  * @restart_nb:	The notifier block to register a restart function.
++  * @driver_data:Pointer to the drivers private data.
++  * @wd_data:	Pointer to watchdog core internal data.
+++>>>>>>> 664a39236e71 (watchdog: Introduce hardware maximum heartbeat in watchdog core)
+   * @status:	Field that contains the devices internal status bits.
+-  * @deferred: entry in wtd_deferred_reg_list which is used to
+-  *			   register early initialized watchdogs.
++  * @deferred:	Entry in wtd_deferred_reg_list which is used to
++  *		register early initialized watchdogs.
+   *
+   * The watchdog_device structure contains all information about a
+   * watchdog timer device.
+@@@ -88,8 -95,11 +108,14 @@@ struct watchdog_device 
+  	unsigned int timeout;
+  	unsigned int min_timeout;
+  	unsigned int max_timeout;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int max_hw_heartbeat_ms;
++ 	struct notifier_block reboot_nb;
++ 	struct notifier_block restart_nb;
+++>>>>>>> 664a39236e71 (watchdog: Introduce hardware maximum heartbeat in watchdog core)
+  	void *driver_data;
+ -	struct watchdog_core_data *wd_data;
+ +	struct mutex lock;
+  	unsigned long status;
+  /* Bit numbers for status flags */
+  #define WDOG_ACTIVE		0	/* Is the watchdog running/active */
+* Unmerged path Documentation/watchdog/watchdog-kernel-api.txt
+* Unmerged path drivers/watchdog/watchdog_dev.c
+* Unmerged path include/linux/watchdog.h
