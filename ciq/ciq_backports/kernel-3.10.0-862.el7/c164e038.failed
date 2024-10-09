@@ -1,0 +1,346 @@
+mm: fix huge zero page accounting in smaps report
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [mm] fix huge zero page accounting in smaps report (Oleg Nesterov) [1409913 1447952]
+Rebuild_FUZZ: 95.74%
+commit-author Kirill A. Shutemov <kirill@shutemov.name>
+commit c164e038eee805147e95789dddb88ae3b3aca11c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c164e038.failed
+
+As a small zero page, huge zero page should not be accounted in smaps
+report as normal page.
+
+For small pages we rely on vm_normal_page() to filter out zero page, but
+vm_normal_page() is not designed to handle pmds.  We only get here due
+hackish cast pmd to pte in smaps_pte_range() -- pte and pmd format is not
+necessary compatible on each and every architecture.
+
+Let's add separate codepath to handle pmds.  follow_trans_huge_pmd() will
+detect huge zero page for us.
+
+We would need pmd_dirty() helper to do this properly.  The patch adds it
+to THP-enabled architectures which don't yet have one.
+
+[akpm@linux-foundation.org: use do_div to fix 32-bit build]
+	Signed-off-by: "Kirill A. Shutemov" <kirill@shutemov.name>
+	Reported-by: Fengguang Wu <fengguang.wu@intel.com>
+	Tested-by: Fengwei Yin <yfw.kernel@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c164e038eee805147e95789dddb88ae3b3aca11c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/pgtable.h
+#	arch/sparc/include/asm/pgtable_64.h
+#	fs/proc/task_mmu.c
+diff --cc arch/arm64/include/asm/pgtable.h
+index e333a243bfcc,df22314f57cf..000000000000
+--- a/arch/arm64/include/asm/pgtable.h
++++ b/arch/arm64/include/asm/pgtable.h
+@@@ -178,6 -244,74 +178,77 @@@ static inline void set_pte_at(struct mm
+  
+  #define __HAVE_ARCH_PTE_SPECIAL
+  
+++<<<<<<< HEAD
+++=======
++ static inline pte_t pud_pte(pud_t pud)
++ {
++ 	return __pte(pud_val(pud));
++ }
++ 
++ static inline pmd_t pud_pmd(pud_t pud)
++ {
++ 	return __pmd(pud_val(pud));
++ }
++ 
++ static inline pte_t pmd_pte(pmd_t pmd)
++ {
++ 	return __pte(pmd_val(pmd));
++ }
++ 
++ static inline pmd_t pte_pmd(pte_t pte)
++ {
++ 	return __pmd(pte_val(pte));
++ }
++ 
++ /*
++  * THP definitions.
++  */
++ 
++ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
++ #define pmd_trans_huge(pmd)	(pmd_val(pmd) && !(pmd_val(pmd) & PMD_TABLE_BIT))
++ #define pmd_trans_splitting(pmd)	pte_special(pmd_pte(pmd))
++ #ifdef CONFIG_HAVE_RCU_TABLE_FREE
++ #define __HAVE_ARCH_PMDP_SPLITTING_FLUSH
++ struct vm_area_struct;
++ void pmdp_splitting_flush(struct vm_area_struct *vma, unsigned long address,
++ 			  pmd_t *pmdp);
++ #endif /* CONFIG_HAVE_RCU_TABLE_FREE */
++ #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
++ 
++ #define pmd_dirty(pmd)		pte_dirty(pmd_pte(pmd))
++ #define pmd_young(pmd)		pte_young(pmd_pte(pmd))
++ #define pmd_wrprotect(pmd)	pte_pmd(pte_wrprotect(pmd_pte(pmd)))
++ #define pmd_mksplitting(pmd)	pte_pmd(pte_mkspecial(pmd_pte(pmd)))
++ #define pmd_mkold(pmd)		pte_pmd(pte_mkold(pmd_pte(pmd)))
++ #define pmd_mkwrite(pmd)	pte_pmd(pte_mkwrite(pmd_pte(pmd)))
++ #define pmd_mkdirty(pmd)	pte_pmd(pte_mkdirty(pmd_pte(pmd)))
++ #define pmd_mkyoung(pmd)	pte_pmd(pte_mkyoung(pmd_pte(pmd)))
++ #define pmd_mknotpresent(pmd)	(__pmd(pmd_val(pmd) & ~PMD_TYPE_MASK))
++ 
++ #define __HAVE_ARCH_PMD_WRITE
++ #define pmd_write(pmd)		pte_write(pmd_pte(pmd))
++ 
++ #define pmd_mkhuge(pmd)		(__pmd(pmd_val(pmd) & ~PMD_TABLE_BIT))
++ 
++ #define pmd_pfn(pmd)		(((pmd_val(pmd) & PMD_MASK) & PHYS_MASK) >> PAGE_SHIFT)
++ #define pfn_pmd(pfn,prot)	(__pmd(((phys_addr_t)(pfn) << PAGE_SHIFT) | pgprot_val(prot)))
++ #define mk_pmd(page,prot)	pfn_pmd(page_to_pfn(page),prot)
++ 
++ #define pmd_page(pmd)           pfn_to_page(__phys_to_pfn(pmd_val(pmd) & PHYS_MASK))
++ #define pud_write(pud)		pte_write(pud_pte(pud))
++ #define pud_pfn(pud)		(((pud_val(pud) & PUD_MASK) & PHYS_MASK) >> PAGE_SHIFT)
++ 
++ #define set_pmd_at(mm, addr, pmdp, pmd)	set_pte_at(mm, addr, (pte_t *)pmdp, pmd_pte(pmd))
++ 
++ static inline int has_transparent_hugepage(void)
++ {
++ 	return 1;
++ }
++ 
++ #define __pgprot_modify(prot,mask,bits) \
++ 	__pgprot((pgprot_val(prot) & ~(mask)) | (bits))
++ 
+++>>>>>>> c164e038eee8 (mm: fix huge zero page accounting in smaps report)
+  /*
+   * Mark the prot value as uncacheable and unbufferable.
+   */
+diff --cc arch/sparc/include/asm/pgtable_64.h
+index 32f242038137,1ff9e7864168..000000000000
+--- a/arch/sparc/include/asm/pgtable_64.h
++++ b/arch/sparc/include/asm/pgtable_64.h
+@@@ -626,39 -652,54 +626,51 @@@ static inline unsigned long pte_special
+  	return pte_val(pte) & _PAGE_SPECIAL;
+  }
+  
+ -static inline unsigned long pmd_large(pmd_t pmd)
+ +static inline int pmd_large(pmd_t pmd)
+  {
+ -	pte_t pte = __pte(pmd_val(pmd));
+ -
+ -	return pte_val(pte) & _PAGE_PMD_HUGE;
+ +	return (pmd_val(pmd) & (PMD_ISHUGE | PMD_HUGE_PRESENT)) ==
+ +		(PMD_ISHUGE | PMD_HUGE_PRESENT);
+  }
+  
+ -static inline unsigned long pmd_pfn(pmd_t pmd)
+ +#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ +static inline int pmd_young(pmd_t pmd)
+  {
+ -	pte_t pte = __pte(pmd_val(pmd));
+ -
+ -	return pte_pfn(pte);
+ +	return pmd_val(pmd) & PMD_HUGE_ACCESSED;
+  }
+  
+ -#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ -static inline unsigned long pmd_dirty(pmd_t pmd)
+ +static inline int pmd_write(pmd_t pmd)
+  {
+ -	pte_t pte = __pte(pmd_val(pmd));
+ -
+ -	return pte_dirty(pte);
+ +	return pmd_val(pmd) & PMD_HUGE_WRITE;
+  }
+  
+ -static inline unsigned long pmd_young(pmd_t pmd)
+ +static inline unsigned long pmd_pfn(pmd_t pmd)
+  {
+ -	pte_t pte = __pte(pmd_val(pmd));
+ +	unsigned long val = pmd_val(pmd) & PMD_HUGE_PADDR;
+  
+ -	return pte_young(pte);
+ +	return val >> (PAGE_SHIFT - PMD_PADDR_SHIFT);
+  }
+  
+ -static inline unsigned long pmd_write(pmd_t pmd)
+++<<<<<<< HEAD
+ +static inline int pmd_trans_splitting(pmd_t pmd)
+++=======
+++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+++static inline unsigned long pmd_dirty(pmd_t pmd)
++ {
++ 	pte_t pte = __pte(pmd_val(pmd));
++ 
+ -	return pte_write(pte);
+++	return pte_dirty(pte);
++ }
++ 
+ -static inline unsigned long pmd_trans_huge(pmd_t pmd)
+++static inline unsigned long pmd_young(pmd_t pmd)
+++>>>>>>> c164e038eee8 (mm: fix huge zero page accounting in smaps report)
+  {
+ -	pte_t pte = __pte(pmd_val(pmd));
+ -
+ -	return pte_val(pte) & _PAGE_PMD_HUGE;
+ +	return (pmd_val(pmd) & (PMD_ISHUGE|PMD_HUGE_SPLITTING)) ==
+ +		(PMD_ISHUGE|PMD_HUGE_SPLITTING);
+  }
+  
+ -static inline unsigned long pmd_trans_splitting(pmd_t pmd)
+ +static inline int pmd_trans_huge(pmd_t pmd)
+  {
+ -	pte_t pte = __pte(pmd_val(pmd));
+ -
+ -	return pmd_trans_huge(pmd) && pte_special(pte);
+ +	return pmd_val(pmd) & PMD_ISHUGE;
+  }
+  
+  #define has_transparent_hugepage() 1
+diff --cc fs/proc/task_mmu.c
+index a48a2953412f,246eae84b13b..000000000000
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@@ -454,60 -445,60 +454,99 @@@ struct mem_size_stats 
+  	unsigned long swap;
+  	unsigned long nonlinear;
+  	u64 pss;
+ +	bool check_shmem_swap;
+  };
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_SHMEM
+ +static int smaps_pte_hole(unsigned long addr, unsigned long end,
+ +		struct mm_walk *walk)
+ +{
+ +	struct mem_size_stats *mss = walk->private;
+ +
+ +	mss->swap += shmem_partial_swap_usage(
+ +			mss->vma->vm_file->f_mapping, addr, end);
+ +
+ +	return 0;
+ +}
+ +#endif
+++=======
++ static void smaps_account(struct mem_size_stats *mss, struct page *page,
++ 		unsigned long size, bool young, bool dirty)
++ {
++ 	int mapcount;
+++>>>>>>> c164e038eee8 (mm: fix huge zero page accounting in smaps report)
++ 
++ 	if (PageAnon(page))
++ 		mss->anonymous += size;
++ 
++ 	mss->resident += size;
++ 	/* Accumulate the size in pages that have been accessed. */
++ 	if (young || PageReferenced(page))
++ 		mss->referenced += size;
++ 	mapcount = page_mapcount(page);
++ 	if (mapcount >= 2) {
++ 		u64 pss_delta;
++ 
++ 		if (dirty || PageDirty(page))
++ 			mss->shared_dirty += size;
++ 		else
++ 			mss->shared_clean += size;
++ 		pss_delta = (u64)size << PSS_SHIFT;
++ 		do_div(pss_delta, mapcount);
++ 		mss->pss += pss_delta;
++ 	} else {
++ 		if (dirty || PageDirty(page))
++ 			mss->private_dirty += size;
++ 		else
++ 			mss->private_clean += size;
++ 		mss->pss += (u64)size << PSS_SHIFT;
++ 	}
++ }
+  
+- static void smaps_pte_entry(pte_t ptent, unsigned long addr,
+- 		unsigned long ptent_size, struct mm_walk *walk)
++ static void smaps_pte_entry(pte_t *pte, unsigned long addr,
++ 		struct mm_walk *walk)
+  {
+  	struct mem_size_stats *mss = walk->private;
+  	struct vm_area_struct *vma = mss->vma;
+  	pgoff_t pgoff = linear_page_index(vma, addr);
+  	struct page *page = NULL;
+- 	int mapcount;
+  
+- 	if (pte_present(ptent)) {
+- 		page = vm_normal_page(vma, addr, ptent);
+- 	} else if (is_swap_pte(ptent)) {
+- 		swp_entry_t swpent = pte_to_swp_entry(ptent);
++ 	if (pte_present(*pte)) {
++ 		page = vm_normal_page(vma, addr, *pte);
++ 	} else if (is_swap_pte(*pte)) {
++ 		swp_entry_t swpent = pte_to_swp_entry(*pte);
+  
+  		if (!non_swap_entry(swpent))
+- 			mss->swap += ptent_size;
++ 			mss->swap += PAGE_SIZE;
+  		else if (is_migration_entry(swpent))
+  			page = migration_entry_to_page(swpent);
+++<<<<<<< HEAD
+ +		else if (is_hmm_entry(swpent))
+ +			page = hmm_entry_to_page(swpent);
+ +	} else if (pte_file(ptent)) {
+ +		if (pte_to_pgoff(ptent) != pgoff)
+ +			mss->nonlinear += ptent_size;
+ +	} else if (unlikely(IS_ENABLED(CONFIG_SHMEM) && mss->check_shmem_swap
+ +			    && pte_none(ptent))) {
+ +		/* We shouldn't encounter huge pages here */
+ +		WARN_ON(ptent_size != PAGE_SIZE);
+ +		page = find_get_page(vma->vm_file->f_mapping,
+ +						linear_page_index(vma, addr));
+ +		if (!page)
+ +			return;
+ +
+ +		if (radix_tree_exceptional_entry(page))
+ +			mss->swap += PAGE_SIZE;
+ +		else
+ +			page_cache_release(page);
+ +
+ +		return;
+++=======
++ 	} else if (pte_file(*pte)) {
++ 		if (pte_to_pgoff(*pte) != pgoff)
++ 			mss->nonlinear += PAGE_SIZE;
+++>>>>>>> c164e038eee8 (mm: fix huge zero page accounting in smaps report)
+  	}
+  
+  	if (!page)
+* Unmerged path arch/arm64/include/asm/pgtable.h
+diff --git a/arch/powerpc/include/asm/pgtable-ppc64.h b/arch/powerpc/include/asm/pgtable-ppc64.h
+index 6b6573bf02b8..76e549a2464d 100644
+--- a/arch/powerpc/include/asm/pgtable-ppc64.h
++++ b/arch/powerpc/include/asm/pgtable-ppc64.h
+@@ -489,6 +489,7 @@ static inline pte_t *pmdp_ptep(pmd_t *pmd)
+ }
+ 
+ #define pmd_pfn(pmd)		pte_pfn(pmd_pte(pmd))
++#define pmd_dirty(pmd)		pte_dirty(pmd_pte(pmd))
+ #define pmd_young(pmd)		pte_young(pmd_pte(pmd))
+ #define pmd_mkold(pmd)		pte_pmd(pte_mkold(pmd_pte(pmd)))
+ #define pmd_wrprotect(pmd)	pte_pmd(pte_wrprotect(pmd_pte(pmd)))
+* Unmerged path arch/sparc/include/asm/pgtable_64.h
+diff --git a/arch/x86/include/asm/pgtable.h b/arch/x86/include/asm/pgtable.h
+index 50bdb1a560e0..9a46888620e6 100644
+--- a/arch/x86/include/asm/pgtable.h
++++ b/arch/x86/include/asm/pgtable.h
+@@ -112,6 +112,11 @@ static inline int pte_young(pte_t pte)
+ 	return pte_flags(pte) & _PAGE_ACCESSED;
+ }
+ 
++static inline int pmd_dirty(pmd_t pmd)
++{
++	return pmd_flags(pmd) & _PAGE_DIRTY;
++}
++
+ static inline int pmd_young(pmd_t pmd)
+ {
+ 	return pmd_flags(pmd) & _PAGE_ACCESSED;
+* Unmerged path fs/proc/task_mmu.c
