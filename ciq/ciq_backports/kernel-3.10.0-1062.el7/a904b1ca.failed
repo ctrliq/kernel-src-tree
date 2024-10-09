@@ -1,0 +1,428 @@
+xfs: Add support FALLOC_FL_INSERT_RANGE for fallocate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Namjae Jeon <namjae.jeon@samsung.com>
+commit a904b1ca5751faf5ece8600e18cd3b674afcca1b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/a904b1ca.failed
+
+This patch implements fallocate's FALLOC_FL_INSERT_RANGE for XFS.
+
+1) Make sure that both offset and len are block size aligned.
+2) Update the i_size of inode by len bytes.
+3) Compute the file's logical block number against offset. If the computed
+   block number is not the starting block of the extent, split the extent
+   such that the block number is the starting block of the extent.
+4) Shift all the extents which are lying bewteen [offset, last allocated extent]
+   towards right by len bytes. This step will make a hole of len bytes
+   at offset.
+
+	Signed-off-by: Namjae Jeon <namjae.jeon@samsung.com>
+	Signed-off-by: Ashish Sangwan <a.sangwan@samsung.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit a904b1ca5751faf5ece8600e18cd3b674afcca1b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_bmap.c
+#	fs/xfs/libxfs/xfs_bmap.h
+#	fs/xfs/xfs_bmap_util.c
+#	fs/xfs/xfs_file.c
+diff --cc fs/xfs/libxfs/xfs_bmap.c
+index a821827ec13e,e8696f5a8041..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@@ -5586,12 -5644,13 +5626,17 @@@ in
+  xfs_bmap_shift_extents(
+  	struct xfs_trans	*tp,
+  	struct xfs_inode	*ip,
+- 	xfs_fileoff_t		start_fsb,
++ 	xfs_fileoff_t		*next_fsb,
+  	xfs_fileoff_t		offset_shift_fsb,
+  	int			*done,
+- 	xfs_fileoff_t		*next_fsb,
++ 	xfs_fileoff_t		stop_fsb,
+  	xfs_fsblock_t		*firstblock,
+++<<<<<<< HEAD
+ +	struct xfs_defer_ops	*dfops,
+++=======
++ 	struct xfs_bmap_free	*flist,
++ 	enum shift_direction	direction,
+++>>>>>>> a904b1ca5751 (xfs: Add support FALLOC_FL_INSERT_RANGE for fallocate)
+  	int			num_exts)
+  {
+  	struct xfs_btree_cur		*cur = NULL;
+@@@ -5636,6 -5698,38 +5684,42 @@@
+  		cur->bc_private.b.flags = 0;
+  	}
+  
++ 	/*
++ 	 * There may be delalloc extents in the data fork before the range we
++ 	 * are collapsing out, so we cannot use the count of real extents here.
++ 	 * Instead we have to calculate it from the incore fork.
++ 	 */
+++<<<<<<< HEAD
+++	total_extents = xfs_iext_count(ifp);
+++	while (nexts++ < num_exts && current_ext < total_extents) {
+++=======
++ 	total_extents = ifp->if_bytes / sizeof(xfs_bmbt_rec_t);
++ 	if (total_extents == 0) {
++ 		*done = 1;
++ 		goto del_cursor;
++ 	}
++ 
++ 	/*
++ 	 * In case of first right shift, we need to initialize next_fsb
++ 	 */
++ 	if (*next_fsb == NULLFSBLOCK) {
++ 		gotp = xfs_iext_get_ext(ifp, total_extents - 1);
++ 		xfs_bmbt_get_all(gotp, &got);
++ 		*next_fsb = got.br_startoff;
++ 		if (stop_fsb > *next_fsb) {
++ 			*done = 1;
++ 			goto del_cursor;
++ 		}
++ 	}
++ 
++ 	/* Lookup the extent index at which we have to stop */
++ 	if (direction == SHIFT_RIGHT) {
++ 		gotp = xfs_iext_bno_to_ext(ifp, stop_fsb, &stop_extent);
++ 		/* Make stop_extent exclusive of shift range */
++ 		stop_extent--;
++ 	} else
++ 		stop_extent = total_extents;
++ 
+  	/*
+  	 * Look up the extent index for the fsb where we start shifting. We can
+  	 * henceforth iterate with current_ext as extent list changes are locked
+@@@ -5651,22 -5745,33 +5735,40 @@@
+  		goto del_cursor;
+  	}
+  
+- 	/*
+- 	 * There may be delalloc extents in the data fork before the range we
+- 	 * are collapsing out, so we cannot use the count of real extents here.
+- 	 * Instead we have to calculate it from the incore fork.
+- 	 */
+- 	total_extents = xfs_iext_count(ifp);
+- 	while (nexts++ < num_exts && current_ext < total_extents) {
++ 	/* some sanity checking before we finally start shifting extents */
++ 	if ((direction == SHIFT_LEFT && current_ext >= stop_extent) ||
++ 	     (direction == SHIFT_RIGHT && current_ext <= stop_extent)) {
++ 		error = -EIO;
++ 		goto del_cursor;
++ 	}
++ 
++ 	while (nexts++ < num_exts) {
+++>>>>>>> a904b1ca5751 (xfs: Add support FALLOC_FL_INSERT_RANGE for fallocate)
+  		error = xfs_bmse_shift_one(ip, whichfork, offset_shift_fsb,
+- 					&current_ext, gotp, cur, &logflags);
++ 					   &current_ext, gotp, cur, &logflags,
++ 					   direction);
+  		if (error)
+  			goto del_cursor;
++ 		/*
++ 		 * If there was an extent merge during the shift, the extent
++ 		 * count can change. Update the total and grade the next record.
++ 		 */
++ 		if (direction == SHIFT_LEFT) {
++ 			total_extents = ifp->if_bytes / sizeof(xfs_bmbt_rec_t);
++ 			stop_extent = total_extents;
++ 		}
+  
+++<<<<<<< HEAD
+ +		/* update total extent count and grab the next record */
+ +		total_extents = xfs_iext_count(ifp);
+ +		if (current_ext >= total_extents)
+++=======
++ 		if (current_ext == stop_extent) {
++ 			*done = 1;
++ 			*next_fsb = NULLFSBLOCK;
+++>>>>>>> a904b1ca5751 (xfs: Add support FALLOC_FL_INSERT_RANGE for fallocate)
+  			break;
++ 		}
+  		gotp = xfs_iext_get_ext(ifp, current_ext);
+  	}
+  
+diff --cc fs/xfs/libxfs/xfs_bmap.h
+index bbb72c6ceb86,6aaa0c1c7200..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.h
++++ b/fs/xfs/libxfs/xfs_bmap.h
+@@@ -193,14 -211,15 +198,22 @@@ int	__xfs_bunmapi(struct xfs_trans *tp
+  int	xfs_bunmapi(struct xfs_trans *tp, struct xfs_inode *ip,
+  		xfs_fileoff_t bno, xfs_filblks_t len, int flags,
+  		xfs_extnum_t nexts, xfs_fsblock_t *firstblock,
+ -		struct xfs_bmap_free *flist, int *done);
+ -int	xfs_check_nostate_extents(struct xfs_ifork *ifp, xfs_extnum_t idx,
+ -		xfs_extnum_t num);
+ +		struct xfs_defer_ops *dfops, int *done);
+  uint	xfs_default_attroffset(struct xfs_inode *ip);
+  int	xfs_bmap_shift_extents(struct xfs_trans *tp, struct xfs_inode *ip,
+++<<<<<<< HEAD
+ +		xfs_fileoff_t start_fsb, xfs_fileoff_t offset_shift_fsb,
+ +		int *done, xfs_fileoff_t *next_fsb, xfs_fsblock_t *firstblock,
+ +		struct xfs_defer_ops *dfops, int num_exts);
+ +int	xfs_bmapi_reserve_delalloc(struct xfs_inode *ip, xfs_fileoff_t off,
+ +		xfs_filblks_t len, xfs_filblks_t prealloc,
+ +		struct xfs_bmbt_irec *got, xfs_extnum_t *lastx, int eof);
+++=======
++ 		xfs_fileoff_t *next_fsb, xfs_fileoff_t offset_shift_fsb,
++ 		int *done, xfs_fileoff_t stop_fsb, xfs_fsblock_t *firstblock,
++ 		struct xfs_bmap_free *flist, enum shift_direction direction,
++ 		int num_exts);
++ int	xfs_bmap_split_extent(struct xfs_inode *ip, xfs_fileoff_t split_offset);
+++>>>>>>> a904b1ca5751 (xfs: Add support FALLOC_FL_INSERT_RANGE for fallocate)
+  
+  #endif	/* __XFS_BMAP_H__ */
+diff --cc fs/xfs/xfs_bmap_util.c
+index b512c688c5f3,fe1f11b96d0d..000000000000
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@@ -1270,9 -1394,10 +1267,14 @@@ xfs_shift_file_space
+  	struct xfs_mount	*mp = ip->i_mount;
+  	struct xfs_trans	*tp;
+  	int			error;
+ -	struct xfs_bmap_free	free_list;
+ +	struct xfs_defer_ops	dfops;
+  	xfs_fsblock_t		first_block;
+++<<<<<<< HEAD
+ +	xfs_fileoff_t		start_fsb;
+++=======
++ 	int			committed;
++ 	xfs_fileoff_t		stop_fsb;
+++>>>>>>> a904b1ca5751 (xfs: Add support FALLOC_FL_INSERT_RANGE for fallocate)
+  	xfs_fileoff_t		next_fsb;
+  	xfs_fileoff_t		shift_fsb;
+  
+@@@ -1313,7 -1440,19 +1317,18 @@@
+  	if (error)
+  		return error;
+  
++ 	/*
++ 	 * The extent shiting code works on extent granularity. So, if
++ 	 * stop_fsb is not the starting block of extent, we need to split
++ 	 * the extent at stop_fsb.
++ 	 */
++ 	if (direction == SHIFT_RIGHT) {
++ 		error = xfs_bmap_split_extent(ip, stop_fsb);
++ 		if (error)
++ 			return error;
++ 	}
++ 
+  	while (!error && !done) {
+ -		tp = xfs_trans_alloc(mp, XFS_TRANS_DIOSTRAT);
+  		/*
+  		 * We would need to reserve permanent block for transaction.
+  		 * This will come into picture when after shifting extent into
+@@@ -1331,38 -1472,33 +1346,53 @@@
+  				XFS_DIOSTRAT_SPACE_RES(mp, 0), 0,
+  				XFS_QMOPT_RES_REGBLKS);
+  		if (error)
+ -			goto out;
+ +			goto out_trans_cancel;
+  
+- 		xfs_trans_ijoin(tp, ip, 0);
++ 		xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
+  
+ -		xfs_bmap_init(&free_list, &first_block);
+ +		xfs_defer_init(&dfops, &first_block);
+  
+  		/*
+  		 * We are using the write transaction in which max 2 bmbt
+  		 * updates are allowed
+  		 */
+++<<<<<<< HEAD
+ +		start_fsb = next_fsb;
+ +		error = xfs_bmap_shift_extents(tp, ip, start_fsb, shift_fsb,
+ +				&done, &next_fsb, &first_block, &dfops,
+ +				XFS_BMAP_MAX_SHIFT_EXTENTS);
+++=======
++ 		error = xfs_bmap_shift_extents(tp, ip, &next_fsb, shift_fsb,
++ 				&done, stop_fsb, &first_block, &free_list,
++ 				direction, XFS_BMAP_MAX_SHIFT_EXTENTS);
+++>>>>>>> a904b1ca5751 (xfs: Add support FALLOC_FL_INSERT_RANGE for fallocate)
+  		if (error)
+ -			goto out;
+ +			goto out_bmap_cancel;
+  
+ -		error = xfs_bmap_finish(&tp, &free_list, &committed);
+ +		error = xfs_defer_finish(&tp, &dfops, NULL);
+  		if (error)
+ -			goto out;
+ +			goto out_bmap_cancel;
+  
+++<<<<<<< HEAD
+ +		error = xfs_trans_commit(tp);
+ +		xfs_iunlock(ip, XFS_ILOCK_EXCL);
+++=======
++ 		error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
+++>>>>>>> a904b1ca5751 (xfs: Add support FALLOC_FL_INSERT_RANGE for fallocate)
+  	}
+  
+  	return error;
+  
+++<<<<<<< HEAD
+ +out_bmap_cancel:
+ +	xfs_defer_cancel(&dfops);
+ +out_trans_cancel:
+ +	xfs_trans_cancel(tp);
+ +	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+++=======
++ out:
++ 	xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES | XFS_TRANS_ABORT);
+++>>>>>>> a904b1ca5751 (xfs: Add support FALLOC_FL_INSERT_RANGE for fallocate)
+  	return error;
+  }
+  
+diff --cc fs/xfs/xfs_file.c
+index 374d446488ef,edeaccc7961a..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -903,69 -816,10 +903,76 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static void
+ +xfs_wait_dax_page(
+ +	struct inode		*inode)
+ +{
+ +	struct xfs_inode	*ip = XFS_I(inode);
+ +
+ +	xfs_iunlock(ip, XFS_MMAPLOCK_EXCL);
+ +	schedule();
+ +	xfs_ilock(ip, XFS_MMAPLOCK_EXCL);
+ +}
+ +
+ +static int
+ +xfs_break_dax_layouts(
+ +	struct inode		*inode,
+ +	uint			iolock,
+ +	bool			*retry)
+ +{
+ +	struct page		*page;
+ +
+ +	ASSERT(xfs_isilocked(XFS_I(inode), XFS_MMAPLOCK_EXCL));
+ +
+ +	page = dax_layout_busy_page(inode->i_mapping);
+ +	if (!page)
+ +		return 0;
+ +
+ +	*retry = true;
+ +	return ___wait_var_event(&page->_count,
+ +			atomic_read(&page->_count) == 1, TASK_INTERRUPTIBLE,
+ +			0, 0, xfs_wait_dax_page(inode));
+ +}
+ +
+ +int
+ +xfs_break_layouts(
+ +	struct inode		*inode,
+ +	uint			*iolock,
+ +	enum layout_break_reason reason,
+ +	bool			with_imutex)
+ +{
+ +	bool			retry;
+ +	int			error;
+ +
+ +	ASSERT(xfs_isilocked(XFS_I(inode), XFS_IOLOCK_SHARED|XFS_IOLOCK_EXCL));
+ +
+ +	do {
+ +		retry = false;
+ +		switch (reason) {
+ +		case BREAK_UNMAP:
+ +			error = xfs_break_dax_layouts(inode, *iolock, &retry);
+ +			if (error || retry)
+ +				break;
+ +			/* fall through */
+ +		case BREAK_WRITE:
+ +			error = xfs_break_leased_layouts(inode, iolock,
+ +							 with_imutex, &retry);
+ +			break;
+ +		default:
+ +			WARN_ON_ONCE(1);
+ +			error = -EINVAL;
+ +		}
+ +	} while (error == 0 && retry);
+ +
+ +	return error;
+ +}
+++=======
++ #define	XFS_FALLOC_FL_SUPPORTED						\
++ 		(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE |		\
++ 		 FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_ZERO_RANGE |	\
++ 		 FALLOC_FL_INSERT_RANGE)
+++>>>>>>> a904b1ca5751 (xfs: Add support FALLOC_FL_INSERT_RANGE for fallocate)
+  
+  STATIC long
+  xfs_file_fallocate(
+@@@ -978,8 -832,9 +985,9 @@@
+  	struct xfs_inode	*ip = XFS_I(inode);
+  	long			error;
+  	enum xfs_prealloc_flags	flags = 0;
+ -	uint			iolock = XFS_IOLOCK_EXCL;
+ +	uint			iolock = XFS_IOLOCK_EXCL | XFS_MMAPLOCK_EXCL;
+  	loff_t			new_size = 0;
++ 	bool			do_file_insert = 0;
+  
+  	if (!S_ISREG(inode->i_mode))
+  		return -EINVAL;
+@@@ -1051,9 -926,20 +1079,24 @@@
+  
+  		iattr.ia_valid = ATTR_SIZE;
+  		iattr.ia_size = new_size;
+++<<<<<<< HEAD
+ +		error = xfs_vn_setattr_size(file_dentry(file), &iattr);
+++=======
++ 		error = xfs_setattr_size(ip, &iattr);
++ 		if (error)
++ 			goto out_unlock;
+++>>>>>>> a904b1ca5751 (xfs: Add support FALLOC_FL_INSERT_RANGE for fallocate)
+  	}
+  
++ 	/*
++ 	 * Perform hole insertion now that the file size has been
++ 	 * updated so that if we crash during the operation we don't
++ 	 * leave shifted extents past EOF and hence losing access to
++ 	 * the data that is contained within them.
++ 	 */
++ 	if (do_file_insert)
++ 		error = xfs_insert_file_space(ip, offset, len);
++ 
+  out_unlock:
+  	xfs_iunlock(ip, iolock);
+  	return error;
+* Unmerged path fs/xfs/libxfs/xfs_bmap.c
+* Unmerged path fs/xfs/libxfs/xfs_bmap.h
+* Unmerged path fs/xfs/xfs_bmap_util.c
+diff --git a/fs/xfs/xfs_bmap_util.h b/fs/xfs/xfs_bmap_util.h
+index 4299313a4ec9..0cede1043571 100644
+--- a/fs/xfs/xfs_bmap_util.h
++++ b/fs/xfs/xfs_bmap_util.h
+@@ -58,6 +58,8 @@ int	xfs_zero_file_space(struct xfs_inode *ip, xfs_off_t offset,
+ 			    xfs_off_t len);
+ int	xfs_collapse_file_space(struct xfs_inode *, xfs_off_t offset,
+ 				xfs_off_t len);
++int	xfs_insert_file_space(struct xfs_inode *, xfs_off_t offset,
++				xfs_off_t len);
+ 
+ /* EOF block manipulation functions */
+ bool	xfs_can_free_eofblocks(struct xfs_inode *ip, bool force);
+* Unmerged path fs/xfs/xfs_file.c
+diff --git a/fs/xfs/xfs_trace.h b/fs/xfs/xfs_trace.h
+index 6163c3fb0f5e..27a22f85fcbb 100644
+--- a/fs/xfs/xfs_trace.h
++++ b/fs/xfs/xfs_trace.h
+@@ -659,6 +659,7 @@ DEFINE_INODE_EVENT(xfs_alloc_file_space);
+ DEFINE_INODE_EVENT(xfs_free_file_space);
+ DEFINE_INODE_EVENT(xfs_zero_file_space);
+ DEFINE_INODE_EVENT(xfs_collapse_file_space);
++DEFINE_INODE_EVENT(xfs_insert_file_space);
+ DEFINE_INODE_EVENT(xfs_readdir);
+ #ifdef CONFIG_XFS_POSIX_ACL
+ DEFINE_INODE_EVENT(xfs_get_acl);
