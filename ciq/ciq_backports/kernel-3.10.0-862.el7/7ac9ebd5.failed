@@ -1,0 +1,386 @@
+nfp: introduce very minimal nfp_app
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 7ac9ebd567252d1799002b9282c658f7229ba21c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7ac9ebd5.failed
+
+Introduce a concept of an application.  For now it's just grouping
+pointers and serving as a layer of indirection.  It will help us
+weaken the dependency on nfp_net in ethtool code.  Later series
+will flesh out support for different apps in the driver.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7ac9ebd567252d1799002b9282c658f7229ba21c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_main.h
+#	drivers/net/ethernet/netronome/nfp/nfp_net.h
+#	drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+#	drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_main.h
+index 1ac430fbaa18,3716ef6b8599..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_main.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_main.h
+@@@ -57,10 -57,11 +57,15 @@@ struct nfp_eth_table
+   * struct nfp_pf - NFP PF-specific device structure
+   * @pdev:		Backpointer to PCI device
+   * @cpp:		Pointer to the CPP handle
+++<<<<<<< HEAD
+ + * @ctrl_area:		Pointer to the CPP area for the control BAR
+++=======
++  * @app:		Pointer to the APP handle
++  * @data_vnic_bar:	Pointer to the CPP area for the data vNICs' BARs
+++>>>>>>> 7ac9ebd56725 (nfp: introduce very minimal nfp_app)
+   * @tx_area:		Pointer to the CPP area for the TX queues
+   * @rx_area:		Pointer to the CPP area for the FL/RX queues
+ - * @irq_entries:	Array of MSI-X entries for all vNICs
+ + * @irq_entries:	Array of MSI-X entries for all ports
+   * @limit_vfs:		Number of VFs supported by firmware (~0 for PCI limit)
+   * @num_vfs:		Number of SR-IOV VFs enabled
+   * @fw_loaded:		Is the firmware loaded?
+@@@ -76,7 -78,9 +81,13 @@@ struct nfp_pf 
+  
+  	struct nfp_cpp *cpp;
+  
+++<<<<<<< HEAD
+ +	struct nfp_cpp_area *ctrl_area;
+++=======
++ 	struct nfp_app *app;
++ 
++ 	struct nfp_cpp_area *data_vnic_bar;
+++>>>>>>> 7ac9ebd56725 (nfp: introduce very minimal nfp_app)
+  	struct nfp_cpp_area *tx_area;
+  	struct nfp_cpp_area *rx_area;
+  
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net.h
+index 600c79f39fe0,d8edd61a5ad1..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@@ -471,25 -555,16 +471,32 @@@ static inline bool nfp_net_fw_ver_eq(st
+   * @rx_bar:             Pointer to mapped FL/RX queues
+   * @debugfs_dir:	Device directory in debugfs
+   * @ethtool_dump_flag:	Ethtool dump flag
+++<<<<<<< HEAD
+ + * @port_list:		Entry on device port list
+ + * @cpp:		CPP device handle if available
+++=======
++  * @vnic_list:		Entry on device vNIC list
++  * @pdev:		Backpointer to PCI device
++  * @app:		APP handle if available
++  * @eth_port:		Translated ETH Table port entry
+++>>>>>>> 7ac9ebd56725 (nfp: introduce very minimal nfp_app)
+   */
+  struct nfp_net {
+ -	struct nfp_net_dp dp;
+ +	struct pci_dev *pdev;
+ +	struct net_device *netdev;
+  
+ -	struct nfp_net_fw_version fw_ver;
+ +	unsigned is_vf:1;
+ +	unsigned fw_loaded:1;
+ +
+ +	u32 ctrl;
+ +	u32 fl_bufsz;
+  
+ +	u32 rx_offset;
+ +
+ +	struct nfp_net_tx_ring *tx_rings;
+ +	struct nfp_net_rx_ring *rx_rings;
+ +
+ +	struct nfp_net_fw_version fw_ver;
+  	u32 cap;
+  	u32 max_mtu;
+  
+@@@ -552,16 -625,12 +559,21 @@@
+  	struct dentry *debugfs_dir;
+  	u32 ethtool_dump_flag;
+  
+ -	struct list_head vnic_list;
+ +	struct list_head port_list;
+  
+++<<<<<<< HEAD
+ +	struct nfp_cpp *cpp;
+ +};
+++=======
++ 	struct pci_dev *pdev;
++ 	struct nfp_app *app;
+++>>>>>>> 7ac9ebd56725 (nfp: introduce very minimal nfp_app)
+  
+ -	struct nfp_eth_table_port *eth_port;
+ +struct nfp_net_ring_set {
+ +	unsigned int n_rings;
+ +	unsigned int mtu;
+ +	unsigned int dcnt;
+ +	void *rings;
+  };
+  
+  /* Functions to read/write from/to a BAR
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+index 69f458e0de89,b9a70659530d..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+@@@ -48,7 -49,8 +48,12 @@@
+  #include <linux/ethtool.h>
+  
+  #include "nfpcore/nfp.h"
+++<<<<<<< HEAD
+ +#include "nfpcore/nfp_nsp_eth.h"
+++=======
++ #include "nfpcore/nfp_nsp.h"
++ #include "nfp_app.h"
+++>>>>>>> 7ac9ebd56725 (nfp: introduce very minimal nfp_app)
+  #include "nfp_net_ctrl.h"
+  #include "nfp_net.h"
+  
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+index acc8cfe284f3,1281e9019e92..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+@@@ -52,9 -52,9 +52,9 @@@
+  #include "nfpcore/nfp.h"
+  #include "nfpcore/nfp_cpp.h"
+  #include "nfpcore/nfp_nffw.h"
+ -#include "nfpcore/nfp_nsp.h"
+ +#include "nfpcore/nfp_nsp_eth.h"
+  #include "nfpcore/nfp6000_pcie.h"
+- 
++ #include "nfp_app.h"
+  #include "nfp_net_ctrl.h"
+  #include "nfp_net.h"
+  #include "nfp_main.h"
+@@@ -296,14 -302,15 +296,14 @@@ nfp_net_pf_alloc_port_netdev(struct nfp
+  	if (IS_ERR(nn))
+  		return nn;
+  
+- 	nn->cpp = pf->cpp;
++ 	nn->app = pf->app;
+  	nn->fw_ver = *fw_ver;
+ -	nn->dp.ctrl_bar = ctrl_bar;
+ +	nn->ctrl_bar = ctrl_bar;
+  	nn->tx_bar = tx_bar;
+  	nn->rx_bar = rx_bar;
+ -	nn->dp.is_vf = 0;
+ +	nn->is_vf = 0;
+  	nn->stride_rx = stride;
+  	nn->stride_tx = stride;
+ -	nn->eth_port = eth_port;
+  
+  	return nn;
+  }
+@@@ -454,12 -482,14 +466,14 @@@ static void nfp_net_pci_remove_finish(s
+  	nfp_net_irqs_disable(pf->pdev);
+  	kfree(pf->irq_entries);
+  
++ 	nfp_net_pf_app_clean(pf);
++ 
+  	nfp_cpp_area_release_free(pf->rx_area);
+  	nfp_cpp_area_release_free(pf->tx_area);
+ -	nfp_cpp_area_release_free(pf->data_vnic_bar);
+ +	nfp_cpp_area_release_free(pf->ctrl_area);
+  }
+  
+ -static void nfp_net_refresh_vnics(struct work_struct *work)
+ +static void nfp_net_refresh_netdevs(struct work_struct *work)
+  {
+  	struct nfp_pf *pf = container_of(work, struct nfp_pf,
+  					 port_refresh_work);
+@@@ -522,6 -552,31 +536,34 @@@ void nfp_net_refresh_port_config(struc
+  	schedule_work(&pf->port_refresh_work);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int nfp_net_refresh_eth_port(struct nfp_net *nn)
++ {
++ 	struct nfp_eth_table_port *eth_port;
++ 	struct nfp_eth_table *eth_table;
++ 
++ 	eth_table = nfp_eth_read_ports(nn->app->cpp);
++ 	if (!eth_table) {
++ 		nn_err(nn, "Error refreshing port state table!\n");
++ 		return -EIO;
++ 	}
++ 
++ 	eth_port = nfp_net_find_port(eth_table, nn->eth_port->eth_index);
++ 	if (!eth_port) {
++ 		nn_err(nn, "Error finding state of the port!\n");
++ 		kfree(eth_table);
++ 		return -EIO;
++ 	}
++ 
++ 	memcpy(nn->eth_port, eth_port, sizeof(*eth_port));
++ 
++ 	kfree(eth_table);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 7ac9ebd56725 (nfp: introduce very minimal nfp_app)
+  /*
+   * PCI device functions
+   */
+@@@ -618,10 -673,14 +660,14 @@@ int nfp_net_pci_probe(struct nfp_pf *pf
+  		goto err_unmap_tx;
+  	}
+  
++ 	err = nfp_net_pf_app_init(pf);
++ 	if (err)
++ 		goto err_unmap_rx;
++ 
+  	pf->ddir = nfp_net_debugfs_device_add(pf->pdev);
+  
+ -	err = nfp_net_pf_spawn_vnics(pf, ctrl_bar, tx_bar, rx_bar,
+ -				     stride, &fw_ver);
+ +	err = nfp_net_pf_spawn_netdevs(pf, ctrl_bar, tx_bar, rx_bar,
+ +				       stride, &fw_ver);
+  	if (err)
+  		goto err_clean_ddir;
+  
+diff --git a/drivers/net/ethernet/netronome/nfp/Makefile b/drivers/net/ethernet/netronome/nfp/Makefile
+index a30f2e651180..2a2f0f94a0bb 100644
+--- a/drivers/net/ethernet/netronome/nfp/Makefile
++++ b/drivers/net/ethernet/netronome/nfp/Makefile
+@@ -14,6 +14,7 @@ nfp-objs := \
+ 	    nfpcore/nfp_resource.o \
+ 	    nfpcore/nfp_rtsym.o \
+ 	    nfpcore/nfp_target.o \
++	    nfp_app.o \
+ 	    nfp_main.o \
+ 	    nfp_net_common.o \
+ 	    nfp_net_ethtool.o \
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_app.c b/drivers/net/ethernet/netronome/nfp/nfp_app.c
+new file mode 100644
+index 000000000000..59be638bb60e
+--- /dev/null
++++ b/drivers/net/ethernet/netronome/nfp/nfp_app.c
+@@ -0,0 +1,57 @@
++/*
++ * Copyright (C) 2017 Netronome Systems, Inc.
++ *
++ * This software is dual licensed under the GNU General License Version 2,
++ * June 1991 as shown in the file COPYING in the top-level directory of this
++ * source tree or the BSD 2-Clause License provided below.  You have the
++ * option to license this software under the complete terms of either license.
++ *
++ * The BSD 2-Clause License:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      1. Redistributions of source code must retain the above
++ *         copyright notice, this list of conditions and the following
++ *         disclaimer.
++ *
++ *      2. Redistributions in binary form must reproduce the above
++ *         copyright notice, this list of conditions and the following
++ *         disclaimer in the documentation and/or other materials
++ *         provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#include <linux/slab.h>
++
++#include "nfp_app.h"
++#include "nfp_main.h"
++
++struct nfp_app *nfp_app_alloc(struct nfp_pf *pf)
++{
++	struct nfp_app *app;
++
++	app = kzalloc(sizeof(*app), GFP_KERNEL);
++	if (!app)
++		return ERR_PTR(-ENOMEM);
++
++	app->pf = pf;
++	app->cpp = pf->cpp;
++	app->pdev = pf->pdev;
++
++	return app;
++}
++
++void nfp_app_free(struct nfp_app *app)
++{
++	kfree(app);
++}
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_app.h b/drivers/net/ethernet/netronome/nfp/nfp_app.h
+new file mode 100644
+index 000000000000..e63425c02c8d
+--- /dev/null
++++ b/drivers/net/ethernet/netronome/nfp/nfp_app.h
+@@ -0,0 +1,56 @@
++/*
++ * Copyright (C) 2017 Netronome Systems, Inc.
++ *
++ * This software is dual licensed under the GNU General License Version 2,
++ * June 1991 as shown in the file COPYING in the top-level directory of this
++ * source tree or the BSD 2-Clause License provided below.  You have the
++ * option to license this software under the complete terms of either license.
++ *
++ * The BSD 2-Clause License:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      1. Redistributions of source code must retain the above
++ *         copyright notice, this list of conditions and the following
++ *         disclaimer.
++ *
++ *      2. Redistributions in binary form must reproduce the above
++ *         copyright notice, this list of conditions and the following
++ *         disclaimer in the documentation and/or other materials
++ *         provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#ifndef _NFP_APP_H
++#define _NFP_APP_H 1
++
++struct pci_dev;
++struct nfp_cpp;
++struct nfp_pf;
++
++/**
++ * struct nfp_app - NFP application container
++ * @pdev:	backpointer to PCI device
++ * @pf:		backpointer to NFP PF structure
++ * @cpp:	pointer to the CPP handle
++ */
++struct nfp_app {
++	struct pci_dev *pdev;
++	struct nfp_pf *pf;
++	struct nfp_cpp *cpp;
++};
++
++struct nfp_app *nfp_app_alloc(struct nfp_pf *pf);
++void nfp_app_free(struct nfp_app *app);
++
++#endif
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_main.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_main.c
