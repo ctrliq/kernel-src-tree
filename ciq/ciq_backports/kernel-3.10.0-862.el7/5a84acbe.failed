@@ -1,0 +1,141 @@
+bnxt_en: query cfa flow stats periodically to compute 'lastused' attribute
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Sathya Perla <sathya.perla@broadcom.com>
+commit 5a84acbebb22f93dfc9ce1e5f0427c45c94acb33
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5a84acbe.failed
+
+This patch implements periodic querying of cfa flow stats
+in batches to compute the 'lastused' attribute of TC flow stats.
+
+	Signed-off-by: Sathya Perla <sathya.perla@broadcom.com>
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5a84acbebb22f93dfc9ce1e5f0427c45c94acb33)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.h
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_tc.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_tc.h
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index db9012ea3731,b8343ee4182c..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@@ -905,6 -944,78 +905,81 @@@ struct bnxt_led_info 
+  #define BNXT_CAG_REG_LEGACY_INT_STATUS	0x4014
+  #define BNXT_CAG_REG_BASE		0x300000
+  
+++<<<<<<< HEAD
+++=======
++ struct bnxt_coal {
++ 	u16			coal_ticks;
++ 	u16			coal_ticks_irq;
++ 	u16			coal_bufs;
++ 	u16			coal_bufs_irq;
++ 			/* RING_IDLE enabled when coal ticks < idle_thresh  */
++ 	u16			idle_thresh;
++ 	u8			bufs_per_record;
++ 	u8			budget;
++ };
++ 
++ struct bnxt_tc_flow_stats {
++ 	u64		packets;
++ 	u64		bytes;
++ };
++ 
++ struct bnxt_tc_info {
++ 	bool				enabled;
++ 
++ 	/* hash table to store TC offloaded flows */
++ 	struct rhashtable		flow_table;
++ 	struct rhashtable_params	flow_ht_params;
++ 
++ 	/* hash table to store L2 keys of TC flows */
++ 	struct rhashtable		l2_table;
++ 	struct rhashtable_params	l2_ht_params;
++ 	/* hash table to store L2 keys for TC tunnel decap */
++ 	struct rhashtable		decap_l2_table;
++ 	struct rhashtable_params	decap_l2_ht_params;
++ 	/* hash table to store tunnel decap entries */
++ 	struct rhashtable		decap_table;
++ 	struct rhashtable_params	decap_ht_params;
++ 	/* hash table to store tunnel encap entries */
++ 	struct rhashtable		encap_table;
++ 	struct rhashtable_params	encap_ht_params;
++ 
++ 	/* lock to atomically add/del an l2 node when a flow is
++ 	 * added or deleted.
++ 	 */
++ 	struct mutex			lock;
++ 
++ 	/* Fields used for batching stats query */
++ 	struct rhashtable_iter		iter;
++ #define BNXT_FLOW_STATS_BATCH_MAX	10
++ 	struct bnxt_tc_stats_batch {
++ 		void			  *flow_node;
++ 		struct bnxt_tc_flow_stats hw_stats;
++ 	} stats_batch[BNXT_FLOW_STATS_BATCH_MAX];
++ 
++ 	/* Stat counter mask (width) */
++ 	u64				bytes_mask;
++ 	u64				packets_mask;
++ };
++ 
++ struct bnxt_vf_rep_stats {
++ 	u64			packets;
++ 	u64			bytes;
++ 	u64			dropped;
++ };
++ 
++ struct bnxt_vf_rep {
++ 	struct bnxt			*bp;
++ 	struct net_device		*dev;
++ 	struct metadata_dst		*dst;
++ 	u16				vf_idx;
++ 	u16				tx_cfa_action;
++ 	u16				rx_cfa_code;
++ 
++ 	struct bnxt_vf_rep_stats	rx_stats;
++ 	struct bnxt_vf_rep_stats	tx_stats;
++ };
++ 
+++>>>>>>> 5a84acbebb22 (bnxt_en: query cfa flow stats periodically to compute 'lastused' attribute)
+  struct bnxt {
+  	void __iomem		*bar0;
+  	void __iomem		*bar1;
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_tc.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_tc.h
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index c325a10cc99e..46437e25e7ea 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -6607,6 +6607,11 @@ static void bnxt_timer(unsigned long data)
+ 		set_bit(BNXT_PERIODIC_STATS_SP_EVENT, &bp->sp_event);
+ 		schedule_work(&bp->sp_task);
+ 	}
++
++	if (bnxt_tc_flower_enabled(bp)) {
++		set_bit(BNXT_FLOW_STATS_SP_EVENT, &bp->sp_event);
++		bnxt_queue_sp_work(bp);
++	}
+ bnxt_restart_timer:
+ 	mod_timer(&bp->timer, jiffies + bp->current_interval);
+ }
+@@ -6697,6 +6702,10 @@ static void bnxt_sp_task(struct work_struct *work)
+ 		bnxt_get_port_module_status(bp);
+ 		mutex_unlock(&bp->link_lock);
+ 	}
++
++	if (test_and_clear_bit(BNXT_FLOW_STATS_SP_EVENT, &bp->sp_event))
++		bnxt_tc_flow_stats_work(bp);
++
+ 	/* These functions below will clear BNXT_STATE_IN_SP_TASK.  They
+ 	 * must be the last functions to be called before exiting.
+ 	 */
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.h
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_tc.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_tc.h
