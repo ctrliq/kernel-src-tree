@@ -1,0 +1,772 @@
+nvme: Move transports to use nvme-core workqueue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [nvme] Move transports to use nvme-core workqueue (David Milburn) [1457880 1456486 1454365]
+Rebuild_FUZZ: 93.33%
+commit-author Sagi Grimberg <sagi@grimberg.me>
+commit 9a6327d2f25b14cb568ca2c55ccbc8f00aa400e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9a6327d2.failed
+
+Instead of each transport using it's own workqueue, export
+a single nvme-core workqueue and use that instead.
+
+In the future, this will help us moving towards some unification
+if controller setup/teardown flows.
+
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 9a6327d2f25b14cb568ca2c55ccbc8f00aa400e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/fc.c
+#	drivers/nvme/host/nvme.h
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/core.c
+index 8d8a4cb67c01,9a7fcad62d81..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -56,6 -56,18 +56,21 @@@ EXPORT_SYMBOL_GPL(nvme_max_retries)
+  static int nvme_char_major;
+  module_param(nvme_char_major, int, 0);
+  
+++<<<<<<< HEAD
+++=======
++ static unsigned long default_ps_max_latency_us = 100000;
++ module_param(default_ps_max_latency_us, ulong, 0644);
++ MODULE_PARM_DESC(default_ps_max_latency_us,
++ 		 "max power saving latency for new devices; use PM QOS to change per device");
++ 
++ static bool force_apst;
++ module_param(force_apst, bool, 0644);
++ MODULE_PARM_DESC(force_apst, "allow APST for newly enumerated devices even if quirked off");
++ 
++ struct workqueue_struct *nvme_wq;
++ EXPORT_SYMBOL_GPL(nvme_wq);
++ 
+++>>>>>>> 9a6327d2f25b (nvme: Move transports to use nvme-core workqueue)
+  static LIST_HEAD(nvme_ctrl_list);
+  static DEFINE_SPINLOCK(dev_list_lock);
+  
+diff --cc drivers/nvme/host/fc.c
+index a2d701be7e74,e6084f3b365f..000000000000
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@@ -1604,27 -1754,33 +1603,34 @@@ nvme_fc_free_nvme_ctrl(struct nvme_ctr
+  	nvme_fc_ctrl_put(ctrl);
+  }
+  
+ -static void
+ -nvme_fc_error_recovery(struct nvme_fc_ctrl *ctrl, char *errmsg)
+ -{
+ -	dev_warn(ctrl->ctrl.device,
+ -		"NVME-FC{%d}: transport association error detected: %s\n",
+ -		ctrl->cnum, errmsg);
+ -	dev_warn(ctrl->ctrl.device,
+ -		"NVME-FC{%d}: resetting controller\n", ctrl->cnum);
+  
+ -	/* stop the queues on error, cleanup is in reset thread */
+ -	if (ctrl->queue_count > 1)
+ -		nvme_stop_queues(&ctrl->ctrl);
+ +static int
+ +__nvme_fc_abort_op(struct nvme_fc_ctrl *ctrl, struct nvme_fc_fcp_op *op)
+ +{
+ +	int state;
+  
+ -	if (!nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_RECONNECTING)) {
+ -		dev_err(ctrl->ctrl.device,
+ -			"NVME-FC{%d}: error_recovery: Couldn't change state "
+ -			"to RECONNECTING\n", ctrl->cnum);
+ -		return;
+ +	state = atomic_xchg(&op->state, FCPOP_STATE_ABORTED);
+ +	if (state != FCPOP_STATE_ACTIVE) {
+ +		atomic_set(&op->state, state);
+ +		return -ECANCELED; /* fail */
+  	}
+  
+++<<<<<<< HEAD
+ +	ctrl->lport->ops->fcp_abort(&ctrl->lport->localport,
+ +					&ctrl->rport->remoteport,
+ +					op->queue->lldd_handle,
+ +					&op->fcp_req);
+ +
+ +	return 0;
+++=======
++ 	if (!queue_work(nvme_wq, &ctrl->reset_work))
++ 		dev_err(ctrl->ctrl.device,
++ 			"NVME-FC{%d}: error_recovery: Failed to schedule "
++ 			"reset work\n", ctrl->cnum);
+++>>>>>>> 9a6327d2f25b (nvme: Move transports to use nvme-core workqueue)
+  }
+  
+ -static enum blk_eh_timer_return
+ +enum blk_eh_timer_return
+  nvme_fc_timeout(struct request *rq, bool reserved)
+  {
+  	struct nvme_fc_fcp_op *op = blk_mq_rq_to_pdu(rq);
+@@@ -2256,9 -2258,453 +2262,456 @@@ out_free_tag_set
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ nvme_fc_reinit_io_queues(struct nvme_fc_ctrl *ctrl)
++ {
++ 	struct nvmf_ctrl_options *opts = ctrl->ctrl.opts;
++ 	int ret;
++ 
++ 	ret = nvme_set_queue_count(&ctrl->ctrl, &opts->nr_io_queues);
++ 	if (ret) {
++ 		dev_info(ctrl->ctrl.device,
++ 			"set_queue_count failed: %d\n", ret);
++ 		return ret;
++ 	}
++ 
++ 	/* check for io queues existing */
++ 	if (ctrl->queue_count == 1)
++ 		return 0;
++ 
++ 	nvme_fc_init_io_queues(ctrl);
++ 
++ 	ret = blk_mq_reinit_tagset(&ctrl->tag_set);
++ 	if (ret)
++ 		goto out_free_io_queues;
++ 
++ 	ret = nvme_fc_create_hw_io_queues(ctrl, ctrl->ctrl.opts->queue_size);
++ 	if (ret)
++ 		goto out_free_io_queues;
++ 
++ 	ret = nvme_fc_connect_io_queues(ctrl, ctrl->ctrl.opts->queue_size);
++ 	if (ret)
++ 		goto out_delete_hw_queues;
++ 
++ 	return 0;
++ 
++ out_delete_hw_queues:
++ 	nvme_fc_delete_hw_io_queues(ctrl);
++ out_free_io_queues:
++ 	nvme_fc_free_io_queues(ctrl);
++ 	return ret;
++ }
++ 
++ /*
++  * This routine restarts the controller on the host side, and
++  * on the link side, recreates the controller association.
++  */
++ static int
++ nvme_fc_create_association(struct nvme_fc_ctrl *ctrl)
++ {
++ 	struct nvmf_ctrl_options *opts = ctrl->ctrl.opts;
++ 	u32 segs;
++ 	int ret;
++ 	bool changed;
++ 
++ 	++ctrl->ctrl.opts->nr_reconnects;
++ 
++ 	/*
++ 	 * Create the admin queue
++ 	 */
++ 
++ 	nvme_fc_init_queue(ctrl, 0, NVME_FC_AQ_BLKMQ_DEPTH);
++ 
++ 	ret = __nvme_fc_create_hw_queue(ctrl, &ctrl->queues[0], 0,
++ 				NVME_FC_AQ_BLKMQ_DEPTH);
++ 	if (ret)
++ 		goto out_free_queue;
++ 
++ 	ret = nvme_fc_connect_admin_queue(ctrl, &ctrl->queues[0],
++ 				NVME_FC_AQ_BLKMQ_DEPTH,
++ 				(NVME_FC_AQ_BLKMQ_DEPTH / 4));
++ 	if (ret)
++ 		goto out_delete_hw_queue;
++ 
++ 	if (ctrl->ctrl.state != NVME_CTRL_NEW)
++ 		blk_mq_start_stopped_hw_queues(ctrl->ctrl.admin_q, true);
++ 
++ 	ret = nvmf_connect_admin_queue(&ctrl->ctrl);
++ 	if (ret)
++ 		goto out_disconnect_admin_queue;
++ 
++ 	/*
++ 	 * Check controller capabilities
++ 	 *
++ 	 * todo:- add code to check if ctrl attributes changed from
++ 	 * prior connection values
++ 	 */
++ 
++ 	ret = nvmf_reg_read64(&ctrl->ctrl, NVME_REG_CAP, &ctrl->cap);
++ 	if (ret) {
++ 		dev_err(ctrl->ctrl.device,
++ 			"prop_get NVME_REG_CAP failed\n");
++ 		goto out_disconnect_admin_queue;
++ 	}
++ 
++ 	ctrl->ctrl.sqsize =
++ 		min_t(int, NVME_CAP_MQES(ctrl->cap) + 1, ctrl->ctrl.sqsize);
++ 
++ 	ret = nvme_enable_ctrl(&ctrl->ctrl, ctrl->cap);
++ 	if (ret)
++ 		goto out_disconnect_admin_queue;
++ 
++ 	segs = min_t(u32, NVME_FC_MAX_SEGMENTS,
++ 			ctrl->lport->ops->max_sgl_segments);
++ 	ctrl->ctrl.max_hw_sectors = (segs - 1) << (PAGE_SHIFT - 9);
++ 
++ 	ret = nvme_init_identify(&ctrl->ctrl);
++ 	if (ret)
++ 		goto out_disconnect_admin_queue;
++ 
++ 	/* sanity checks */
++ 
++ 	/* FC-NVME does not have other data in the capsule */
++ 	if (ctrl->ctrl.icdoff) {
++ 		dev_err(ctrl->ctrl.device, "icdoff %d is not supported!\n",
++ 				ctrl->ctrl.icdoff);
++ 		goto out_disconnect_admin_queue;
++ 	}
++ 
++ 	nvme_start_keep_alive(&ctrl->ctrl);
++ 
++ 	/* FC-NVME supports normal SGL Data Block Descriptors */
++ 
++ 	if (opts->queue_size > ctrl->ctrl.maxcmd) {
++ 		/* warn if maxcmd is lower than queue_size */
++ 		dev_warn(ctrl->ctrl.device,
++ 			"queue_size %zu > ctrl maxcmd %u, reducing "
++ 			"to queue_size\n",
++ 			opts->queue_size, ctrl->ctrl.maxcmd);
++ 		opts->queue_size = ctrl->ctrl.maxcmd;
++ 	}
++ 
++ 	ret = nvme_fc_init_aen_ops(ctrl);
++ 	if (ret)
++ 		goto out_term_aen_ops;
++ 
++ 	/*
++ 	 * Create the io queues
++ 	 */
++ 
++ 	if (ctrl->queue_count > 1) {
++ 		if (ctrl->ctrl.state == NVME_CTRL_NEW)
++ 			ret = nvme_fc_create_io_queues(ctrl);
++ 		else
++ 			ret = nvme_fc_reinit_io_queues(ctrl);
++ 		if (ret)
++ 			goto out_term_aen_ops;
++ 	}
++ 
++ 	changed = nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_LIVE);
++ 	WARN_ON_ONCE(!changed);
++ 
++ 	ctrl->ctrl.opts->nr_reconnects = 0;
++ 
++ 	if (ctrl->queue_count > 1) {
++ 		nvme_start_queues(&ctrl->ctrl);
++ 		nvme_queue_scan(&ctrl->ctrl);
++ 		nvme_queue_async_events(&ctrl->ctrl);
++ 	}
++ 
++ 	return 0;	/* Success */
++ 
++ out_term_aen_ops:
++ 	nvme_fc_term_aen_ops(ctrl);
++ 	nvme_stop_keep_alive(&ctrl->ctrl);
++ out_disconnect_admin_queue:
++ 	/* send a Disconnect(association) LS to fc-nvme target */
++ 	nvme_fc_xmt_disconnect_assoc(ctrl);
++ out_delete_hw_queue:
++ 	__nvme_fc_delete_hw_queue(ctrl, &ctrl->queues[0], 0);
++ out_free_queue:
++ 	nvme_fc_free_queue(&ctrl->queues[0]);
++ 
++ 	return ret;
++ }
++ 
++ /*
++  * This routine stops operation of the controller on the host side.
++  * On the host os stack side: Admin and IO queues are stopped,
++  *   outstanding ios on them terminated via FC ABTS.
++  * On the link side: the association is terminated.
++  */
++ static void
++ nvme_fc_delete_association(struct nvme_fc_ctrl *ctrl)
++ {
++ 	unsigned long flags;
++ 
++ 	nvme_stop_keep_alive(&ctrl->ctrl);
++ 
++ 	spin_lock_irqsave(&ctrl->lock, flags);
++ 	ctrl->flags |= FCCTRL_TERMIO;
++ 	ctrl->iocnt = 0;
++ 	spin_unlock_irqrestore(&ctrl->lock, flags);
++ 
++ 	/*
++ 	 * If io queues are present, stop them and terminate all outstanding
++ 	 * ios on them. As FC allocates FC exchange for each io, the
++ 	 * transport must contact the LLDD to terminate the exchange,
++ 	 * thus releasing the FC exchange. We use blk_mq_tagset_busy_itr()
++ 	 * to tell us what io's are busy and invoke a transport routine
++ 	 * to kill them with the LLDD.  After terminating the exchange
++ 	 * the LLDD will call the transport's normal io done path, but it
++ 	 * will have an aborted status. The done path will return the
++ 	 * io requests back to the block layer as part of normal completions
++ 	 * (but with error status).
++ 	 */
++ 	if (ctrl->queue_count > 1) {
++ 		nvme_stop_queues(&ctrl->ctrl);
++ 		blk_mq_tagset_busy_iter(&ctrl->tag_set,
++ 				nvme_fc_terminate_exchange, &ctrl->ctrl);
++ 	}
++ 
++ 	/*
++ 	 * Other transports, which don't have link-level contexts bound
++ 	 * to sqe's, would try to gracefully shutdown the controller by
++ 	 * writing the registers for shutdown and polling (call
++ 	 * nvme_shutdown_ctrl()). Given a bunch of i/o was potentially
++ 	 * just aborted and we will wait on those contexts, and given
++ 	 * there was no indication of how live the controlelr is on the
++ 	 * link, don't send more io to create more contexts for the
++ 	 * shutdown. Let the controller fail via keepalive failure if
++ 	 * its still present.
++ 	 */
++ 
++ 	/*
++ 	 * clean up the admin queue. Same thing as above.
++ 	 * use blk_mq_tagset_busy_itr() and the transport routine to
++ 	 * terminate the exchanges.
++ 	 */
++ 	blk_mq_stop_hw_queues(ctrl->ctrl.admin_q);
++ 	blk_mq_tagset_busy_iter(&ctrl->admin_tag_set,
++ 				nvme_fc_terminate_exchange, &ctrl->ctrl);
++ 
++ 	/* kill the aens as they are a separate path */
++ 	nvme_fc_abort_aen_ops(ctrl);
++ 
++ 	/* wait for all io that had to be aborted */
++ 	spin_lock_irqsave(&ctrl->lock, flags);
++ 	while (ctrl->iocnt) {
++ 		spin_unlock_irqrestore(&ctrl->lock, flags);
++ 		msleep(1000);
++ 		spin_lock_irqsave(&ctrl->lock, flags);
++ 	}
++ 	ctrl->flags &= ~FCCTRL_TERMIO;
++ 	spin_unlock_irqrestore(&ctrl->lock, flags);
++ 
++ 	nvme_fc_term_aen_ops(ctrl);
++ 
++ 	/*
++ 	 * send a Disconnect(association) LS to fc-nvme target
++ 	 * Note: could have been sent at top of process, but
++ 	 * cleaner on link traffic if after the aborts complete.
++ 	 * Note: if association doesn't exist, association_id will be 0
++ 	 */
++ 	if (ctrl->association_id)
++ 		nvme_fc_xmt_disconnect_assoc(ctrl);
++ 
++ 	if (ctrl->ctrl.tagset) {
++ 		nvme_fc_delete_hw_io_queues(ctrl);
++ 		nvme_fc_free_io_queues(ctrl);
++ 	}
++ 
++ 	__nvme_fc_delete_hw_queue(ctrl, &ctrl->queues[0], 0);
++ 	nvme_fc_free_queue(&ctrl->queues[0]);
++ }
++ 
++ static void
++ nvme_fc_delete_ctrl_work(struct work_struct *work)
++ {
++ 	struct nvme_fc_ctrl *ctrl =
++ 		container_of(work, struct nvme_fc_ctrl, delete_work);
++ 
++ 	cancel_work_sync(&ctrl->reset_work);
++ 	cancel_delayed_work_sync(&ctrl->connect_work);
++ 
++ 	/*
++ 	 * kill the association on the link side.  this will block
++ 	 * waiting for io to terminate
++ 	 */
++ 	nvme_fc_delete_association(ctrl);
++ 
++ 	/*
++ 	 * tear down the controller
++ 	 * After the last reference on the nvme ctrl is removed,
++ 	 * the transport nvme_fc_nvme_ctrl_freed() callback will be
++ 	 * invoked. From there, the transport will tear down it's
++ 	 * logical queues and association.
++ 	 */
++ 	nvme_uninit_ctrl(&ctrl->ctrl);
++ 
++ 	nvme_put_ctrl(&ctrl->ctrl);
++ }
++ 
++ static bool
++ __nvme_fc_schedule_delete_work(struct nvme_fc_ctrl *ctrl)
++ {
++ 	if (!nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_DELETING))
++ 		return true;
++ 
++ 	if (!queue_work(nvme_wq, &ctrl->delete_work))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static int
++ __nvme_fc_del_ctrl(struct nvme_fc_ctrl *ctrl)
++ {
++ 	return __nvme_fc_schedule_delete_work(ctrl) ? -EBUSY : 0;
++ }
++ 
++ /*
++  * Request from nvme core layer to delete the controller
++  */
++ static int
++ nvme_fc_del_nvme_ctrl(struct nvme_ctrl *nctrl)
++ {
++ 	struct nvme_fc_ctrl *ctrl = to_fc_ctrl(nctrl);
++ 	int ret;
++ 
++ 	if (!kref_get_unless_zero(&ctrl->ctrl.kref))
++ 		return -EBUSY;
++ 
++ 	ret = __nvme_fc_del_ctrl(ctrl);
++ 
++ 	if (!ret)
++ 		flush_workqueue(nvme_wq);
++ 
++ 	nvme_put_ctrl(&ctrl->ctrl);
++ 
++ 	return ret;
++ }
++ 
++ static void
++ nvme_fc_reconnect_or_delete(struct nvme_fc_ctrl *ctrl, int status)
++ {
++ 	/* If we are resetting/deleting then do nothing */
++ 	if (ctrl->ctrl.state != NVME_CTRL_RECONNECTING) {
++ 		WARN_ON_ONCE(ctrl->ctrl.state == NVME_CTRL_NEW ||
++ 			ctrl->ctrl.state == NVME_CTRL_LIVE);
++ 		return;
++ 	}
++ 
++ 	dev_info(ctrl->ctrl.device,
++ 		"NVME-FC{%d}: reset: Reconnect attempt failed (%d)\n",
++ 		ctrl->cnum, status);
++ 
++ 	if (nvmf_should_reconnect(&ctrl->ctrl)) {
++ 		dev_info(ctrl->ctrl.device,
++ 			"NVME-FC{%d}: Reconnect attempt in %d seconds.\n",
++ 			ctrl->cnum, ctrl->ctrl.opts->reconnect_delay);
++ 		queue_delayed_work(nvme_wq, &ctrl->connect_work,
++ 				ctrl->ctrl.opts->reconnect_delay * HZ);
++ 	} else {
++ 		dev_warn(ctrl->ctrl.device,
++ 				"NVME-FC{%d}: Max reconnect attempts (%d) "
++ 				"reached. Removing controller\n",
++ 				ctrl->cnum, ctrl->ctrl.opts->nr_reconnects);
++ 		WARN_ON(__nvme_fc_schedule_delete_work(ctrl));
++ 	}
++ }
++ 
++ static void
++ nvme_fc_reset_ctrl_work(struct work_struct *work)
++ {
++ 	struct nvme_fc_ctrl *ctrl =
++ 			container_of(work, struct nvme_fc_ctrl, reset_work);
++ 	int ret;
++ 
++ 	/* will block will waiting for io to terminate */
++ 	nvme_fc_delete_association(ctrl);
++ 
++ 	ret = nvme_fc_create_association(ctrl);
++ 	if (ret)
++ 		nvme_fc_reconnect_or_delete(ctrl, ret);
++ 	else
++ 		dev_info(ctrl->ctrl.device,
++ 			"NVME-FC{%d}: controller reset complete\n", ctrl->cnum);
++ }
++ 
++ /*
++  * called by the nvme core layer, for sysfs interface that requests
++  * a reset of the nvme controller
++  */
++ static int
++ nvme_fc_reset_nvme_ctrl(struct nvme_ctrl *nctrl)
++ {
++ 	struct nvme_fc_ctrl *ctrl = to_fc_ctrl(nctrl);
++ 
++ 	dev_info(ctrl->ctrl.device,
++ 		"NVME-FC{%d}: admin requested controller reset\n", ctrl->cnum);
++ 
++ 	if (!nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_RESETTING))
++ 		return -EBUSY;
++ 
++ 	if (!queue_work(nvme_wq, &ctrl->reset_work))
++ 		return -EBUSY;
++ 
++ 	flush_work(&ctrl->reset_work);
++ 
++ 	return 0;
++ }
++ 
++ static const struct nvme_ctrl_ops nvme_fc_ctrl_ops = {
++ 	.name			= "fc",
++ 	.module			= THIS_MODULE,
++ 	.flags			= NVME_F_FABRICS,
++ 	.reg_read32		= nvmf_reg_read32,
++ 	.reg_read64		= nvmf_reg_read64,
++ 	.reg_write32		= nvmf_reg_write32,
++ 	.reset_ctrl		= nvme_fc_reset_nvme_ctrl,
++ 	.free_ctrl		= nvme_fc_nvme_ctrl_freed,
++ 	.submit_async_event	= nvme_fc_submit_async_event,
++ 	.delete_ctrl		= nvme_fc_del_nvme_ctrl,
++ 	.get_subsysnqn		= nvmf_get_subsysnqn,
++ 	.get_address		= nvmf_get_address,
++ };
++ 
++ static void
++ nvme_fc_connect_ctrl_work(struct work_struct *work)
++ {
++ 	int ret;
++ 
++ 	struct nvme_fc_ctrl *ctrl =
++ 			container_of(to_delayed_work(work),
++ 				struct nvme_fc_ctrl, connect_work);
++ 
++ 	ret = nvme_fc_create_association(ctrl);
++ 	if (ret)
++ 		nvme_fc_reconnect_or_delete(ctrl, ret);
++ 	else
++ 		dev_info(ctrl->ctrl.device,
++ 			"NVME-FC{%d}: controller reconnect complete\n",
++ 			ctrl->cnum);
++ }
++ 
++ 
++ static const struct blk_mq_ops nvme_fc_admin_mq_ops = {
++ 	.queue_rq	= nvme_fc_queue_rq,
++ 	.complete	= nvme_fc_complete_rq,
++ 	.init_request	= nvme_fc_init_admin_request,
++ 	.exit_request	= nvme_fc_exit_request,
++ 	.reinit_request	= nvme_fc_reinit_request,
++ 	.init_hctx	= nvme_fc_init_admin_hctx,
++ 	.timeout	= nvme_fc_timeout,
++ };
++ 
+++>>>>>>> 9a6327d2f25b (nvme: Move transports to use nvme-core workqueue)
+  
+  static struct nvme_ctrl *
+ -nvme_fc_init_ctrl(struct device *dev, struct nvmf_ctrl_options *opts,
+ +__nvme_fc_create_ctrl(struct device *dev, struct nvmf_ctrl_options *opts,
+  	struct nvme_fc_lport *lport, struct nvme_fc_rport *rport)
+  {
+  	struct nvme_fc_ctrl *ctrl;
+@@@ -2530,12 -2965,6 +2983,15 @@@ static struct nvmf_transport_ops nvme_f
+  
+  static int __init nvme_fc_init_module(void)
+  {
+++<<<<<<< HEAD
+ +	mark_tech_preview("NVMe over FC", THIS_MODULE);
+ +
+ +	nvme_fc_wq = create_workqueue("nvme_fc_wq");
+ +	if (!nvme_fc_wq)
+ +		return -ENOMEM;
+ +
+++=======
+++>>>>>>> 9a6327d2f25b (nvme: Move transports to use nvme-core workqueue)
+  	return nvmf_register_transport(&nvme_fc_transport);
+  }
+  
+diff --cc drivers/nvme/host/nvme.h
+index edb3488b21b7,80e9adce2691..000000000000
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@@ -42,7 -33,12 +42,16 @@@ extern unsigned char shutdown_timeout
+  #define NVME_DEFAULT_KATO	5
+  #define NVME_KATO_GRACE		10
+  
+++<<<<<<< HEAD
+ +extern unsigned int nvme_max_retries;
+++=======
++ extern struct workqueue_struct *nvme_wq;
++ 
++ enum {
++ 	NVME_NS_LBA		= 0,
++ 	NVME_NS_LIGHTNVM	= 1,
++ };
+++>>>>>>> 9a6327d2f25b (nvme: Move transports to use nvme-core workqueue)
+  
+  /*
+   * List of workarounds for devices that required behavior not specified in
+diff --cc drivers/nvme/host/pci.c
+index f136fc3284bb,ebd5cdfc0174..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -63,7 -66,10 +63,14 @@@ static bool use_cmb_sqes = true
+  module_param(use_cmb_sqes, bool, 0644);
+  MODULE_PARM_DESC(use_cmb_sqes, "use controller's memory buffer for I/O SQes");
+  
+++<<<<<<< HEAD
+ +static struct workqueue_struct *nvme_workq;
+++=======
++ static unsigned int max_host_mem_size_mb = 128;
++ module_param(max_host_mem_size_mb, uint, 0444);
++ MODULE_PARM_DESC(max_host_mem_size_mb,
++ 	"Maximum Host Memory Buffer (HMB) size per controller (in MiB)");
+++>>>>>>> 9a6327d2f25b (nvme: Move transports to use nvme-core workqueue)
+  
+  struct nvme_dev;
+  struct nvme_queue;
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/fc.c
+* Unmerged path drivers/nvme/host/nvme.h
+* Unmerged path drivers/nvme/host/pci.c
+diff --git a/drivers/nvme/host/rdma.c b/drivers/nvme/host/rdma.c
+index fd437c895706..dfaea6c7e860 100644
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@ -144,8 +144,6 @@ static DEFINE_MUTEX(device_list_mutex);
+ static LIST_HEAD(nvme_rdma_ctrl_list);
+ static DEFINE_MUTEX(nvme_rdma_ctrl_mutex);
+ 
+-static struct workqueue_struct *nvme_rdma_wq;
+-
+ /*
+  * Disabling this option makes small I/O goes faster, but is fundamentally
+  * unsafe.  With it turned off we will have to register a global rkey that
+@@ -711,11 +709,11 @@ static void nvme_rdma_reconnect_or_remove(struct nvme_rdma_ctrl *ctrl)
+ 	if (nvmf_should_reconnect(&ctrl->ctrl)) {
+ 		dev_info(ctrl->ctrl.device, "Reconnecting in %d seconds...\n",
+ 			ctrl->ctrl.opts->reconnect_delay);
+-		queue_delayed_work(nvme_rdma_wq, &ctrl->reconnect_work,
++		queue_delayed_work(nvme_wq, &ctrl->reconnect_work,
+ 				ctrl->ctrl.opts->reconnect_delay * HZ);
+ 	} else {
+ 		dev_info(ctrl->ctrl.device, "Removing controller...\n");
+-		queue_work(nvme_rdma_wq, &ctrl->delete_work);
++		queue_work(nvme_wq, &ctrl->delete_work);
+ 	}
+ }
+ 
+@@ -824,7 +822,7 @@ static void nvme_rdma_error_recovery(struct nvme_rdma_ctrl *ctrl)
+ 	if (!nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_RECONNECTING))
+ 		return;
+ 
+-	queue_work(nvme_rdma_wq, &ctrl->err_work);
++	queue_work(nvme_wq, &ctrl->err_work);
+ }
+ 
+ static void nvme_rdma_wr_error(struct ib_cq *cq, struct ib_wc *wc,
+@@ -1693,7 +1691,7 @@ static int __nvme_rdma_del_ctrl(struct nvme_rdma_ctrl *ctrl)
+ 	if (!nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_DELETING))
+ 		return -EBUSY;
+ 
+-	if (!queue_work(nvme_rdma_wq, &ctrl->delete_work))
++	if (!queue_work(nvme_wq, &ctrl->delete_work))
+ 		return -EBUSY;
+ 
+ 	return 0;
+@@ -1769,7 +1767,7 @@ static void nvme_rdma_reset_ctrl_work(struct work_struct *work)
+ del_dead_ctrl:
+ 	/* Deleting this dead controller... */
+ 	dev_warn(ctrl->ctrl.device, "Removing after reset failure\n");
+-	WARN_ON(!queue_work(nvme_rdma_wq, &ctrl->delete_work));
++	WARN_ON(!queue_work(nvme_wq, &ctrl->delete_work));
+ }
+ 
+ static int nvme_rdma_reset_ctrl(struct nvme_ctrl *nctrl)
+@@ -1779,7 +1777,7 @@ static int nvme_rdma_reset_ctrl(struct nvme_ctrl *nctrl)
+ 	if (!nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_RESETTING))
+ 		return -EBUSY;
+ 
+-	if (!queue_work(nvme_rdma_wq, &ctrl->reset_work))
++	if (!queue_work(nvme_wq, &ctrl->reset_work))
+ 		return -EBUSY;
+ 
+ 	flush_work(&ctrl->reset_work);
+@@ -2026,7 +2024,7 @@ static void nvme_rdma_remove_one(struct ib_device *ib_device, void *client_data)
+ 	}
+ 	mutex_unlock(&nvme_rdma_ctrl_mutex);
+ 
+-	flush_workqueue(nvme_rdma_wq);
++	flush_workqueue(nvme_wq);
+ }
+ 
+ static struct ib_client nvme_rdma_ib_client = {
+@@ -2039,13 +2037,9 @@ static int __init nvme_rdma_init_module(void)
+ {
+ 	int ret;
+ 
+-	nvme_rdma_wq = create_workqueue("nvme_rdma_wq");
+-	if (!nvme_rdma_wq)
+-		return -ENOMEM;
+-
+ 	ret = ib_register_client(&nvme_rdma_ib_client);
+ 	if (ret)
+-		goto err_destroy_wq;
++		return ret;
+ 
+ 	ret = nvmf_register_transport(&nvme_rdma_transport);
+ 	if (ret)
+@@ -2055,8 +2049,6 @@ static int __init nvme_rdma_init_module(void)
+ 
+ err_unreg_client:
+ 	ib_unregister_client(&nvme_rdma_ib_client);
+-err_destroy_wq:
+-	destroy_workqueue(nvme_rdma_wq);
+ 	return ret;
+ }
+ 
+@@ -2064,7 +2056,6 @@ static void __exit nvme_rdma_cleanup_module(void)
+ {
+ 	nvmf_unregister_transport(&nvme_rdma_transport);
+ 	ib_unregister_client(&nvme_rdma_ib_client);
+-	destroy_workqueue(nvme_rdma_wq);
+ }
+ 
+ module_init(nvme_rdma_init_module);
+diff --git a/drivers/nvme/target/loop.c b/drivers/nvme/target/loop.c
+index 33c15e3b47d4..b5ec03b7353b 100644
+--- a/drivers/nvme/target/loop.c
++++ b/drivers/nvme/target/loop.c
+@@ -169,7 +169,7 @@ nvme_loop_timeout(struct request *rq, bool reserved)
+ 	struct nvme_loop_iod *iod = blk_mq_rq_to_pdu(rq);
+ 
+ 	/* queue error recovery */
+-	schedule_work(&iod->queue->ctrl->reset_work);
++	queue_work(nvme_wq, &iod->queue->ctrl->reset_work);
+ 
+ 	/* fail with DNR on admin cmd timeout */
+ 	rq->errors = NVME_SC_ABORT_REQ | NVME_SC_DNR;
+@@ -487,7 +487,7 @@ static int __nvme_loop_del_ctrl(struct nvme_loop_ctrl *ctrl)
+ 	if (!nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_DELETING))
+ 		return -EBUSY;
+ 
+-	if (!schedule_work(&ctrl->delete_work))
++	if (!queue_work(nvme_wq, &ctrl->delete_work))
+ 		return -EBUSY;
+ 
+ 	return 0;
+@@ -567,7 +567,7 @@ static int nvme_loop_reset_ctrl(struct nvme_ctrl *nctrl)
+ 	if (!nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_RESETTING))
+ 		return -EBUSY;
+ 
+-	if (!schedule_work(&ctrl->reset_work))
++	if (!queue_work(nvme_wq, &ctrl->reset_work))
+ 		return -EBUSY;
+ 
+ 	flush_work(&ctrl->reset_work);
+@@ -784,7 +784,7 @@ static void __exit nvme_loop_cleanup_module(void)
+ 		__nvme_loop_del_ctrl(ctrl);
+ 	mutex_unlock(&nvme_loop_ctrl_mutex);
+ 
+-	flush_scheduled_work();
++	flush_workqueue(nvme_wq);
+ }
+ 
+ module_init(nvme_loop_init_module);
