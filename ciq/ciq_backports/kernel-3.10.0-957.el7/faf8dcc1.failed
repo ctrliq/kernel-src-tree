@@ -1,0 +1,184 @@
+sfc: Track RPS flow IDs per channel instead of per function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jon Cooper <jcooper@solarflare.com>
+commit faf8dcc12c2780bfec61eb95e5ad74af2ff4f82f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/faf8dcc1.failed
+
+Otherwise we get confused when two flows on different channels get the
+ same flow ID.
+
+	Signed-off-by: Edward Cree <ecree@solarflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit faf8dcc12c2780bfec61eb95e5ad74af2ff4f82f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/sfc/rx.c
+diff --cc drivers/net/ethernet/sfc/rx.c
+index 90c85f16047f,02b0b5272c14..000000000000
+--- a/drivers/net/ethernet/sfc/rx.c
++++ b/drivers/net/ethernet/sfc/rx.c
+@@@ -833,33 -842,18 +833,41 @@@ int efx_filter_rfs(struct net_device *n
+  	struct efx_nic *efx = netdev_priv(net_dev);
+  	struct efx_channel *channel;
+  	struct efx_filter_spec spec;
+ -	struct flow_keys fk;
+ +	const __be16 *ports;
+ +	__be16 ether_type;
+ +	int nhoff;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	/* The core RPS/RFS code has already parsed and validated
+ +	 * VLAN, IP and transport headers.  We assume they are in the
+ +	 * header area.
+ +	 */
+++=======
++ 	if (flow_id == RPS_FLOW_ID_INVALID)
++ 		return -EINVAL;
++ 
++ 	if (!skb_flow_dissect_flow_keys(skb, &fk, 0))
++ 		return -EPROTONOSUPPORT;
+++>>>>>>> faf8dcc12c27 (sfc: Track RPS flow IDs per channel instead of per function)
+  
+ -	if (fk.basic.n_proto != htons(ETH_P_IP) && fk.basic.n_proto != htons(ETH_P_IPV6))
+ -		return -EPROTONOSUPPORT;
+ -	if (fk.control.flags & FLOW_DIS_IS_FRAGMENT)
+ +	if (skb->protocol == htons(ETH_P_8021Q)) {
+ +		const struct vlan_hdr *vh =
+ +			(const struct vlan_hdr *)skb->data;
+ +
+ +		/* We can't filter on the IP 5-tuple and the vlan
+ +		 * together, so just strip the vlan header and filter
+ +		 * on the IP part.
+ +		 */
+ +		EFX_WARN_ON_ONCE_PARANOID(skb_headlen(skb) < sizeof(*vh));
+ +		ether_type = vh->h_vlan_encapsulated_proto;
+ +		nhoff = sizeof(struct vlan_hdr);
+ +	} else {
+ +		ether_type = skb->protocol;
+ +		nhoff = 0;
+ +	}
+ +
+ +	if (ether_type != htons(ETH_P_IP) && ether_type != htons(ETH_P_IPV6))
+  		return -EPROTONOSUPPORT;
+  
+  	efx_filter_init_rx(&spec, EFX_FILTER_PRI_HINT,
+@@@ -903,11 -882,11 +911,11 @@@
+  		return rc;
+  
+  	/* Remember this so we can check whether to expire the filter later */
+- 	efx->rps_flow_id[rc] = flow_id;
+- 	channel = efx_get_channel(efx, skb_get_rx_queue(skb));
++ 	channel = efx_get_channel(efx, rxq_index);
++ 	channel->rps_flow_id[rc] = flow_id;
+  	++channel->rfs_filters_added;
+  
+ -	if (spec.ether_type == htons(ETH_P_IP))
+ +	if (ether_type == htons(ETH_P_IP))
+  		netif_info(efx, rx_status, efx->net_dev,
+  			   "steering %s %pI4:%u:%pI4:%u to queue %u [flow %u filter %d]\n",
+  			   (spec.ip_proto == IPPROTO_TCP) ? "TCP" : "UDP",
+diff --git a/drivers/net/ethernet/sfc/efx.c b/drivers/net/ethernet/sfc/efx.c
+index 5aa04d4b517e..3919717a95e7 100644
+--- a/drivers/net/ethernet/sfc/efx.c
++++ b/drivers/net/ethernet/sfc/efx.c
+@@ -1761,14 +1761,33 @@ static int efx_probe_filters(struct efx_nic *efx)
+ 
+ #ifdef CONFIG_RFS_ACCEL
+ 	if (efx->type->offload_features & NETIF_F_NTUPLE) {
+-		efx->rps_flow_id = kcalloc(efx->type->max_rx_ip_filters,
+-					   sizeof(*efx->rps_flow_id),
+-					   GFP_KERNEL);
+-		if (!efx->rps_flow_id) {
++		struct efx_channel *channel;
++		int i, success = 1;
++
++		efx_for_each_channel(channel, efx) {
++			channel->rps_flow_id =
++				kcalloc(efx->type->max_rx_ip_filters,
++					sizeof(*channel->rps_flow_id),
++					GFP_KERNEL);
++			if (!channel->rps_flow_id)
++				success = 0;
++			else
++				for (i = 0;
++				     i < efx->type->max_rx_ip_filters;
++				     ++i)
++					channel->rps_flow_id[i] =
++						RPS_FLOW_ID_INVALID;
++		}
++
++		if (!success) {
++			efx_for_each_channel(channel, efx)
++				kfree(channel->rps_flow_id);
+ 			efx->type->filter_table_remove(efx);
+ 			rc = -ENOMEM;
+ 			goto out_unlock;
+ 		}
++
++		efx->rps_expire_index = efx->rps_expire_channel = 0;
+ 	}
+ #endif
+ out_unlock:
+@@ -1780,7 +1799,10 @@ out_unlock:
+ static void efx_remove_filters(struct efx_nic *efx)
+ {
+ #ifdef CONFIG_RFS_ACCEL
+-	kfree(efx->rps_flow_id);
++	struct efx_channel *channel;
++
++	efx_for_each_channel(channel, efx)
++		kfree(channel->rps_flow_id);
+ #endif
+ 	down_write(&efx->filter_sem);
+ 	efx->type->filter_table_remove(efx);
+diff --git a/drivers/net/ethernet/sfc/net_driver.h b/drivers/net/ethernet/sfc/net_driver.h
+index a269b32507e4..1645351b89a8 100644
+--- a/drivers/net/ethernet/sfc/net_driver.h
++++ b/drivers/net/ethernet/sfc/net_driver.h
+@@ -421,6 +421,8 @@ enum efx_sync_events_state {
+  * @event_test_cpu: Last CPU to handle interrupt or test event for this channel
+  * @irq_count: Number of IRQs since last adaptive moderation decision
+  * @irq_mod_score: IRQ moderation score
++ * @rps_flow_id: Flow IDs of filters allocated for accelerated RFS,
++ *      indexed by filter ID
+  * @n_rx_tobe_disc: Count of RX_TOBE_DISC errors
+  * @n_rx_ip_hdr_chksum_err: Count of RX IP header checksum errors
+  * @n_rx_tcp_udp_chksum_err: Count of RX TCP and UDP checksum errors
+@@ -464,6 +466,8 @@ struct efx_channel {
+ 	unsigned int irq_mod_score;
+ #ifdef CONFIG_RFS_ACCEL
+ 	unsigned int rfs_filters_added;
++#define RPS_FLOW_ID_INVALID 0xFFFFFFFF
++	u32 *rps_flow_id;
+ #endif
+ 
+ 	unsigned int n_rx_tobe_disc;
+@@ -794,9 +798,9 @@ struct vfdi_status;
+  * @filter_sem: Filter table rw_semaphore, for freeing the table
+  * @filter_lock: Filter table lock, for mere content changes
+  * @filter_state: Architecture-dependent filter table state
+- * @rps_flow_id: Flow IDs of filters allocated for accelerated RFS,
+- *	indexed by filter ID
+- * @rps_expire_index: Next index to check for expiry in @rps_flow_id
++ * @rps_expire_channel: Next channel to check for expiry
++ * @rps_expire_index: Next index to check for expiry in
++ *	@rps_expire_channel's @rps_flow_id
+  * @active_queues: Count of RX and TX queues that haven't been flushed and drained.
+  * @rxq_flush_pending: Count of number of receive queues that need to be flushed.
+  *	Decremented when the efx_flush_rx_queue() is called.
+@@ -945,7 +949,7 @@ struct efx_nic {
+ 	spinlock_t filter_lock;
+ 	void *filter_state;
+ #ifdef CONFIG_RFS_ACCEL
+-	u32 *rps_flow_id;
++	unsigned int rps_expire_channel;
+ 	unsigned int rps_expire_index;
+ #endif
+ 
+* Unmerged path drivers/net/ethernet/sfc/rx.c
