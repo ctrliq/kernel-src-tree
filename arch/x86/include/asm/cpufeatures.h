@@ -303,6 +303,12 @@
 #define X86_FEATURE_AVX512VBMI	(16*32+ 1) /* AVX512 Vector Bit Manipulation instructions*/
 #define X86_FEATURE_PKU		(16*32+ 3) /* Protection Keys for Userspace */
 #define X86_FEATURE_OSPKE	(16*32+ 4) /* OS Protection Keys Enable */
+#define X86_FEATURE_AVX512_VBMI2 (16*32+ 6) /* Additional AVX512 Vector Bit Manipulation Instructions */
+#define X86_FEATURE_GFNI	(16*32+ 8) /* Galois Field New Instructions */
+#define X86_FEATURE_VAES	(16*32+ 9) /* Vector AES */
+#define X86_FEATURE_VPCLMULQDQ	(16*32+ 10) /* Carry-Less Multiplication Double Quadword */
+#define X86_FEATURE_AVX512_VNNI (16*32+ 11) /* Vector Neural Network Instructions */
+#define X86_FEATURE_AVX512_BITALG (16*32+12) /* Support for VPOPCNT[B,W] and VPSHUF-BITQMB */
 #define X86_FEATURE_AVX512_VPOPCNTDQ (16*32+14) /* POPCNT for vectors of DW/QW */
 
 /* Intel-defined CPU features, CPUID level 0x00000007:0 (EDX), word 18 */
