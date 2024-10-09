@@ -54,6 +54,12 @@ struct annotate_browser {
 	char			    search_bf[128];
 };
 
+static inline struct annotation *browser__annotation(struct ui_browser *browser)
+{
+	struct map_symbol *ms = browser->priv;
+	return symbol__annotation(ms->sym);
+}
+
 static inline struct browser_line *browser_line(struct annotation_line *al)
 {
 	void *ptr = al;
@@ -64,8 +70,7 @@ static inline struct browser_line *browser_line(struct annotation_line *al)
 
 static bool disasm_line__filter(struct ui_browser *browser, void *entry)
 {
-	struct map_symbol *ms = browser->priv;
-	struct annotation *notes = symbol__annotation(ms->sym);
+	struct annotation *notes = browser__annotation(browser);
 
 	if (notes->options->hide_src_code) {
 		struct annotation_line *al = list_entry(entry, struct annotation_line, node);
@@ -98,8 +103,7 @@ static int annotate_browser__set_jumps_percent_color(struct annotate_browser *br
 static void disasm_line__write(struct disasm_line *dl, struct ui_browser *browser,
 			       char *bf, size_t size)
 {
-	struct map_symbol *ms = browser->priv;
-	struct annotation *notes = symbol__annotation(ms->sym);
+	struct annotation *notes = browser__annotation(browser);
 
 	if (dl->ins.ops && dl->ins.ops->scnprintf) {
 		if (ins__is_jump(&dl->ins)) {
@@ -127,9 +131,7 @@ static void disasm_line__write(struct disasm_line *dl, struct ui_browser *browse
 static void annotate_browser__write(struct ui_browser *browser, void *entry, int row)
 {
 	struct annotate_browser *ab = container_of(browser, struct annotate_browser, b);
-	struct map_symbol *ms = browser->priv;
-	struct symbol *sym = ms->sym;
-	struct annotation *notes = symbol__annotation(sym);
+	struct annotation *notes = browser__annotation(browser);
 	struct annotation_line *al = list_entry(entry, struct annotation_line, node);
 	struct browser_line *bl = browser_line(al);
 	bool current_entry = ui_browser__is_current_entry(browser, row);
@@ -367,8 +369,7 @@ static void annotate_browser__draw_current_jump(struct ui_browser *browser)
 
 static unsigned int annotate_browser__refresh(struct ui_browser *browser)
 {
-	struct map_symbol *ms = browser->priv;
-	struct annotation *notes = symbol__annotation(ms->sym);
+	struct annotation *notes = browser__annotation(browser);
 	int ret = ui_browser__list_head_refresh(browser);
 	int pcnt_width = annotation__pcnt_width(notes);
 
@@ -437,8 +438,7 @@ static void annotate_browser__set_top(struct annotate_browser *browser,
 static void annotate_browser__set_rb_top(struct annotate_browser *browser,
 					 struct rb_node *nd)
 {
-	struct map_symbol *ms = browser->b.priv;
-	struct annotation *notes = symbol__annotation(ms->sym);
+	struct annotation *notes = browser__annotation(&browser->b);
 	struct browser_line *bpos;
 	struct annotation_line *pos;
 	u32 idx;
@@ -496,8 +496,7 @@ static void annotate_browser__calc_percent(struct annotate_browser *browser,
 
 static bool annotate_browser__toggle_source(struct annotate_browser *browser)
 {
-	struct map_symbol *ms = browser->b.priv;
-	struct annotation *notes = symbol__annotation(ms->sym);
+	struct annotation *notes = browser__annotation(&browser->b);
 	struct annotation_line *al;
 	struct browser_line *bl;
 	off_t offset = browser->b.index - browser->b.top_idx;
@@ -587,9 +586,7 @@ static
 struct disasm_line *annotate_browser__find_offset(struct annotate_browser *browser,
 					  s64 offset, s64 *idx)
 {
-	struct map_symbol *ms = browser->b.priv;
-	struct symbol *sym = ms->sym;
-	struct annotation *notes = symbol__annotation(sym);
+	struct annotation *notes = browser__annotation(&browser->b);
 	struct disasm_line *pos;
 
 	*idx = 0;
@@ -628,9 +625,7 @@ static
 struct annotation_line *annotate_browser__find_string(struct annotate_browser *browser,
 					  char *s, s64 *idx)
 {
-	struct map_symbol *ms = browser->b.priv;
-	struct symbol *sym = ms->sym;
-	struct annotation *notes = symbol__annotation(sym);
+	struct annotation *notes = browser__annotation(&browser->b);
 	struct annotation_line *al = browser->selection;
 
 	*idx = browser->b.index;
@@ -667,9 +662,7 @@ static
 struct annotation_line *annotate_browser__find_string_reverse(struct annotate_browser *browser,
 						  char *s, s64 *idx)
 {
-	struct map_symbol *ms = browser->b.priv;
-	struct symbol *sym = ms->sym;
-	struct annotation *notes = symbol__annotation(sym);
+	struct annotation *notes = browser__annotation(&browser->b);
 	struct annotation_line *al = browser->selection;
 
 	*idx = browser->b.index;
@@ -752,8 +745,7 @@ bool annotate_browser__continue_search_reverse(struct annotate_browser *browser,
 
 static void annotate_browser__update_addr_width(struct annotate_browser *browser)
 {
-	struct map_symbol *ms = browser->b.priv;
-	struct annotation *notes = symbol__annotation(ms->sym);
+	struct annotation *notes = browser__annotation(&browser->b);
 
 	if (notes->options->use_offset)
 		browser->target_width = browser->min_addr_width;
