@@ -1,0 +1,1926 @@
+s390: introduce execute-trampolines for branches
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [s390] introduce execute-trampolines for branches (Hendrik Brueckner) [1558325]
+Rebuild_FUZZ: 93.33%
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit f19fbd5ed642dc31c809596412dab1ed56f2f156
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/f19fbd5e.failed
+
+Add CONFIG_EXPOLINE to enable the use of the new -mindirect-branch= and
+-mfunction_return= compiler options to create a kernel fortified against
+the specte v2 attack.
+
+With CONFIG_EXPOLINE=y all indirect branches will be issued with an
+execute type instruction. For z10 or newer the EXRL instruction will
+be used, for older machines the EX instruction. The typical indirect
+call
+
+	basr	%r14,%r1
+
+is replaced with a PC relative call to a new thunk
+
+	brasl	%r14,__s390x_indirect_jump_r1
+
+The thunk contains the EXRL/EX instruction to the indirect branch
+
+__s390x_indirect_jump_r1:
+	exrl	0,0f
+	j	.
+0:	br	%r1
+
+The detour via the execute type instruction has a performance impact.
+To get rid of the detour the new kernel parameter "nospectre_v2" and
+"spectre_v2=[on,off,auto]" can be used. If the parameter is specified
+the kernel and module code will be patched at runtime.
+
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit f19fbd5ed642dc31c809596412dab1ed56f2f156)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/Kconfig
+#	arch/s390/Makefile
+#	arch/s390/include/asm/lowcore.h
+#	arch/s390/kernel/Makefile
+#	arch/s390/kernel/entry.S
+#	arch/s390/kernel/module.c
+#	arch/s390/kernel/smp.c
+#	drivers/s390/char/Makefile
+diff --cc arch/s390/Kconfig
+index 6d4676098bd9,0636229dae22..000000000000
+--- a/arch/s390/Kconfig
++++ b/arch/s390/Kconfig
+@@@ -445,6 -540,51 +445,54 @@@ config ARCH_RANDO
+  
+  	  If unsure, say Y.
+  
+++<<<<<<< HEAD
+++=======
++ config KERNEL_NOBP
++ 	def_bool n
++ 	prompt "Enable modified branch prediction for the kernel by default"
++ 	help
++ 	  If this option is selected the kernel will switch to a modified
++ 	  branch prediction mode if the firmware interface is available.
++ 	  The modified branch prediction mode improves the behaviour in
++ 	  regard to speculative execution.
++ 
++ 	  With the option enabled the kernel parameter "nobp=0" or "nospec"
++ 	  can be used to run the kernel in the normal branch prediction mode.
++ 
++ 	  With the option disabled the modified branch prediction mode is
++ 	  enabled with the "nobp=1" kernel parameter.
++ 
++ 	  If unsure, say N.
++ 
++ config EXPOLINE
++ 	def_bool n
++ 	prompt "Avoid speculative indirect branches in the kernel"
++ 	help
++ 	  Compile the kernel with the expoline compiler options to guard
++ 	  against kernel-to-user data leaks by avoiding speculative indirect
++ 	  branches.
++ 	  Requires a compiler with -mindirect-branch=thunk support for full
++ 	  protection. The kernel may run slower.
++ 
++ 	  If unsure, say N.
++ 
++ choice
++ 	prompt "Expoline default"
++ 	depends on EXPOLINE
++ 	default EXPOLINE_FULL
++ 
++ config EXPOLINE_OFF
++ 	bool "spectre_v2=off"
++ 
++ config EXPOLINE_MEDIUM
++ 	bool "spectre_v2=auto"
++ 
++ config EXPOLINE_FULL
++ 	bool "spectre_v2=on"
++ 
++ endchoice
++ 
+++>>>>>>> f19fbd5ed642 (s390: introduce execute-trampolines for branches)
+  endmenu
+  
+  menu "Memory setup"
+diff --cc arch/s390/Makefile
+index f9751c3fc245,2ced3239cb84..000000000000
+--- a/arch/s390/Makefile
++++ b/arch/s390/Makefile
+@@@ -87,9 -78,33 +87,35 @@@ ifeq ($(call cc-option-yn,-mwarn-dynami
+  cflags-$(CONFIG_WARN_DYNAMIC_STACK) += -mwarn-dynamicstack
+  endif
+  
+++<<<<<<< HEAD
+++=======
++ ifdef CONFIG_EXPOLINE
++   ifeq ($(call cc-option-yn,$(CC_FLAGS_MARCH) -mindirect-branch=thunk),y)
++     CC_FLAGS_EXPOLINE := -mindirect-branch=thunk
++     CC_FLAGS_EXPOLINE += -mfunction-return=thunk
++     CC_FLAGS_EXPOLINE += -mindirect-branch-table
++     export CC_FLAGS_EXPOLINE
++     cflags-y += $(CC_FLAGS_EXPOLINE)
++   endif
++ endif
++ 
++ ifdef CONFIG_FUNCTION_TRACER
++ # make use of hotpatch feature if the compiler supports it
++ cc_hotpatch	:= -mhotpatch=0,3
++ ifeq ($(call cc-option-yn,$(cc_hotpatch)),y)
++ CC_FLAGS_FTRACE := $(cc_hotpatch)
++ KBUILD_AFLAGS	+= -DCC_USING_HOTPATCH
++ KBUILD_CFLAGS	+= -DCC_USING_HOTPATCH
++ endif
++ endif
++ 
++ # Test CFI features of binutils
++ cfi := $(call as-instr,.cfi_startproc\n.cfi_val_offset 15$(comma)-160\n.cfi_endproc,-DCONFIG_AS_CFI_VAL_OFFSET=1)
++ 
+++>>>>>>> f19fbd5ed642 (s390: introduce execute-trampolines for branches)
+  KBUILD_CFLAGS	+= -mbackchain -msoft-float $(cflags-y)
+  KBUILD_CFLAGS	+= -pipe -fno-strength-reduce -Wno-sign-compare
+ -KBUILD_CFLAGS	+= -fno-asynchronous-unwind-tables $(cfi)
+ -KBUILD_AFLAGS	+= $(aflags-y) $(cfi)
+ +KBUILD_AFLAGS	+= $(aflags-y)
+  
+  OBJCOPYFLAGS	:= -O binary
+  
+diff --cc arch/s390/include/asm/lowcore.h
+index f7f58dd58e1e,5bc888841eaf..000000000000
+--- a/arch/s390/include/asm/lowcore.h
++++ b/arch/s390/include/asm/lowcore.h
+@@@ -292,27 -122,25 +292,45 @@@ struct _lowcore 
+  	 * 64-bit value that is set as program
+  	 * parameter with the LPP instruction.
+  	 */
+ -	__u32	lpp;				/* 0x0390 */
+ -	__u32	current_pid;			/* 0x0394 */
+ +	__u32	lpp;				/* 0x0368 */
+ +	__u32	current_pid;			/* 0x036c */
+  
+  	/* SMP info area */
+++<<<<<<< HEAD
+ +	__u32	cpu_nr;				/* 0x0370 */
+ +	__u32	softirq_pending;		/* 0x0374 */
+ +	__u64	percpu_offset;			/* 0x0378 */
+ +	__u64	vdso_per_cpu_data;		/* 0x0380 */
+ +	__u64	machine_flags;			/* 0x0388 */
+ +	__u64	ftrace_func;			/* 0x0390 */
+ +	__u64	gmap;				/* 0x0398 */
+ +	__u32	spinlock_lockval;		/* 0x03a0 */
+ +	__u8	pad_0x03a4[0x0400-0x03a4];	/* 0x03a4 */
+ +
+ +	/* Interrupt response block. */
+ +	__u8	irb[64];			/* 0x0400 */
+ +
+ +	/* Per cpu primary space access list */
+ +	__u32	paste[16];			/* 0x0440 */
+ +
+ +	__u8	pad_0x0480[0x0e00-0x0480];	/* 0x0480 */
+++=======
++ 	__u32	cpu_nr;				/* 0x0398 */
++ 	__u32	softirq_pending;		/* 0x039c */
++ 	__u32	preempt_count;			/* 0x03a0 */
++ 	__u32	spinlock_lockval;		/* 0x03a4 */
++ 	__u32	spinlock_index;			/* 0x03a8 */
++ 	__u32	fpu_flags;			/* 0x03ac */
++ 	__u64	percpu_offset;			/* 0x03b0 */
++ 	__u64	vdso_per_cpu_data;		/* 0x03b8 */
++ 	__u64	machine_flags;			/* 0x03c0 */
++ 	__u64	gmap;				/* 0x03c8 */
++ 	__u8	pad_0x03d0[0x0400-0x03d0];	/* 0x03d0 */
++ 
++ 	/* br %r1 trampoline */
++ 	__u16	br_r1_trampoline;		/* 0x0400 */
++ 	__u8	pad_0x0402[0x0e00-0x0402];	/* 0x0402 */
+++>>>>>>> f19fbd5ed642 (s390: introduce execute-trampolines for branches)
+  
+  	/*
+  	 * 0xe00 contains the address of the IPL Parameter Information
+diff --cc arch/s390/kernel/Makefile
+index 597a10a12dc4,7f27e3da9709..000000000000
+--- a/arch/s390/kernel/Makefile
++++ b/arch/s390/kernel/Makefile
+@@@ -3,11 -4,39 +3,37 @@@
+  #
+  
+  ifdef CONFIG_FUNCTION_TRACER
+ -
+ -# Do not trace tracer code
+ -CFLAGS_REMOVE_ftrace.o	= $(CC_FLAGS_FTRACE)
+ -
+ -# Do not trace early setup code
+ -CFLAGS_REMOVE_als.o	= $(CC_FLAGS_FTRACE)
+ -CFLAGS_REMOVE_early.o	= $(CC_FLAGS_FTRACE)
+ -
+ +# Don't trace early setup code and tracing code
+ +CFLAGS_REMOVE_early.o = -pg
+ +CFLAGS_REMOVE_ftrace.o = -pg
+  endif
+  
+++<<<<<<< HEAD
+++=======
++ GCOV_PROFILE_als.o	:= n
++ GCOV_PROFILE_early.o	:= n
++ 
++ KCOV_INSTRUMENT_als.o	:= n
++ KCOV_INSTRUMENT_early.o	:= n
++ 
++ UBSAN_SANITIZE_als.o	:= n
++ UBSAN_SANITIZE_early.o	:= n
++ 
++ #
++ # Use -march=z900 for als.c to be able to print an error
++ # message if the kernel is started on a machine which is too old
++ #
++ ifneq ($(CC_FLAGS_MARCH),-march=z900)
++ CFLAGS_REMOVE_als.o	+= $(CC_FLAGS_MARCH)
++ CFLAGS_REMOVE_als.o	+= $(CC_FLAGS_EXPOLINE)
++ CFLAGS_als.o		+= -march=z900
++ AFLAGS_REMOVE_head.o	+= $(CC_FLAGS_MARCH)
++ AFLAGS_head.o		+= -march=z900
++ endif
++ 
++ CFLAGS_als.o		+= -D__NO_FORTIFY
++ 
+++>>>>>>> f19fbd5ed642 (s390: introduce execute-trampolines for branches)
+  #
+  # Passing null pointers is ok for smp code, since we access the lowcore here.
+  #
+@@@ -26,35 -55,30 +52,42 @@@ CFLAGS_dumpstack.o	+= -fno-optimize-sib
+  #
+  CFLAGS_ptrace.o		+= -DUTS_MACHINE='"$(UTS_MACHINE)"'
+  
+ -obj-y	:= traps.o time.o process.o base.o early.o setup.o idle.o vtime.o
+ +CFLAGS_sysinfo.o += -Iinclude/math-emu -Iarch/s390/math-emu -w
+ +
+ +obj-y	:= bitmap.o traps.o time.o process.o base.o early.o setup.o vtime.o
+  obj-y	+= processor.o sys_s390.o ptrace.o signal.o cpcmd.o ebcdic.o nmi.o
+ -obj-y	+= debug.o irq.o ipl.o dis.o diag.o vdso.o als.o
+ +obj-y	+= debug.o irq.o ipl.o dis.o diag.o sclp.o vdso.o
+  obj-y	+= sysinfo.o jump_label.o lgr.o os_info.o machine_kexec.o pgm_check.o
+ -obj-y	+= runtime_instr.o cache.o fpu.o dumpstack.o guarded_storage.o sthyi.o
+ -obj-y	+= entry.o reipl.o relocate_kernel.o kdebugfs.o alternative.o
+ +obj-y	+= dumpstack.o guarded_storage.o alternative.o
+  
+ -extra-y				+= head.o head64.o vmlinux.lds
+ +obj-y	+= $(if $(CONFIG_64BIT),entry64.o,entry.o)
+ +obj-y	+= $(if $(CONFIG_64BIT),reipl64.o,reipl.o)
+ +obj-y	+= $(if $(CONFIG_64BIT),relocate_kernel64.o,relocate_kernel.o)
+  
+++<<<<<<< HEAD
+ +extra-y				+= head.o vmlinux.lds
+ +extra-y				+= $(if $(CONFIG_64BIT),head64.o,head31.o)
+ +
+ +obj-$(CONFIG_MODULES)		+= s390_ksyms.o module.o
+++=======
++ obj-$(CONFIG_EXPOLINE)		+= nospec-branch.o
++ CFLAGS_REMOVE_expoline.o	+= $(CC_FLAGS_EXPOLINE)
++ 
++ obj-$(CONFIG_MODULES)		+= module.o
+++>>>>>>> f19fbd5ed642 (s390: introduce execute-trampolines for branches)
+  obj-$(CONFIG_SMP)		+= smp.o
+ -obj-$(CONFIG_SCHED_TOPOLOGY)	+= topology.o
+ -obj-$(CONFIG_HIBERNATION)	+= suspend.o swsusp.o
+ +obj-$(CONFIG_SCHED_BOOK)	+= topology.o
+ +obj-$(CONFIG_HIBERNATION)	+= suspend.o swsusp_asm64.o
+  obj-$(CONFIG_AUDIT)		+= audit.o
+  compat-obj-$(CONFIG_AUDIT)	+= compat_audit.o
+ -obj-$(CONFIG_COMPAT)		+= compat_linux.o compat_signal.o
+ -obj-$(CONFIG_COMPAT)		+= compat_wrapper.o $(compat-obj-y)
+ -obj-$(CONFIG_EARLY_PRINTK)	+= early_printk.o
+ +obj-$(CONFIG_COMPAT)		+= compat_linux.o compat_signal.o \
+ +					compat_wrapper.o compat_exec_domain.o \
+ +					$(compat-obj-y)
+ +
+  obj-$(CONFIG_STACKTRACE)	+= stacktrace.o
+  obj-$(CONFIG_KPROBES)		+= kprobes.o
+ -obj-$(CONFIG_FUNCTION_TRACER)	+= mcount.o ftrace.o
+ +obj-$(CONFIG_FUNCTION_TRACER)	+= $(if $(CONFIG_64BIT),mcount64.o,mcount.o)
+ +obj-$(CONFIG_FUNCTION_TRACER)	+= ftrace.o
+  obj-$(CONFIG_CRASH_DUMP)	+= crash_dump.o
+  obj-$(CONFIG_UPROBES)		+= uprobes.o
+  
+diff --cc arch/s390/kernel/entry.S
+index be8edbeb24eb,13a133a6015c..000000000000
+--- a/arch/s390/kernel/entry.S
++++ b/arch/s390/kernel/entry.S
+@@@ -164,7 -188,113 +164,106 @@@ STACK_INIT  = STACK_SIZE - STACK_FRAME_
+  	.popsection
+  	.endm
+  
+++<<<<<<< HEAD
+++=======
++ 	.macro BPENTER tif_ptr,tif_mask
++ 	.pushsection .altinstr_replacement, "ax"
++ 662:	.word	0xc004, 0x0000, 0x0000	# 6 byte nop
++ 	.word	0xc004, 0x0000, 0x0000	# 6 byte nop
++ 	.popsection
++ 664:	TSTMSK	\tif_ptr,\tif_mask
++ 	jz	. + 8
++ 	.long	0xb2e8d000
++ 	.pushsection .altinstructions, "a"
++ 	.long 664b - .
++ 	.long 662b - .
++ 	.word 82
++ 	.byte 12
++ 	.byte 12
++ 	.popsection
++ 	.endm
++ 
++ 	.macro BPEXIT tif_ptr,tif_mask
++ 	TSTMSK	\tif_ptr,\tif_mask
++ 	.pushsection .altinstr_replacement, "ax"
++ 662:	jnz	. + 8
++ 	.long	0xb2e8d000
++ 	.popsection
++ 664:	jz	. + 8
++ 	.long	0xb2e8c000
++ 	.pushsection .altinstructions, "a"
++ 	.long 664b - .
++ 	.long 662b - .
++ 	.word 82
++ 	.byte 8
++ 	.byte 8
++ 	.popsection
++ 	.endm
++ 
++ #ifdef CONFIG_EXPOLINE
++ 
++ 	.macro GEN_BR_THUNK name,reg,tmp
++ 	.section .text.\name,"axG",@progbits,\name,comdat
++ 	.globl \name
++ 	.hidden \name
++ 	.type \name,@function
++ \name:
++ 	.cfi_startproc
++ #ifdef CONFIG_HAVE_MARCH_Z10_FEATURES
++ 	exrl	0,0f
++ #else
++ 	larl	\tmp,0f
++ 	ex	0,0(\tmp)
++ #endif
++ 	j	.
++ 0:	br	\reg
++ 	.cfi_endproc
++ 	.endm
++ 
++ 	GEN_BR_THUNK __s390x_indirect_jump_r1use_r9,%r9,%r1
++ 	GEN_BR_THUNK __s390x_indirect_jump_r1use_r14,%r14,%r1
++ 	GEN_BR_THUNK __s390x_indirect_jump_r11use_r14,%r14,%r11
++ 
++ 	.macro BASR_R14_R9
++ 0:	brasl	%r14,__s390x_indirect_jump_r1use_r9
++ 	.pushsection .s390_indirect_branches,"a",@progbits
++ 	.long	0b-.
++ 	.popsection
++ 	.endm
++ 
++ 	.macro BR_R1USE_R14
++ 0:	jg	__s390x_indirect_jump_r1use_r14
++ 	.pushsection .s390_indirect_branches,"a",@progbits
++ 	.long	0b-.
++ 	.popsection
++ 	.endm
++ 
++ 	.macro BR_R11USE_R14
++ 0:	jg	__s390x_indirect_jump_r11use_r14
++ 	.pushsection .s390_indirect_branches,"a",@progbits
++ 	.long	0b-.
++ 	.popsection
++ 	.endm
++ 
++ #else	/* CONFIG_EXPOLINE */
++ 
++ 	.macro BASR_R14_R9
++ 	basr	%r14,%r9
++ 	.endm
++ 
++ 	.macro BR_R1USE_R14
++ 	br	%r14
++ 	.endm
++ 
++ 	.macro BR_R11USE_R14
++ 	br	%r14
++ 	.endm
++ 
++ #endif /* CONFIG_EXPOLINE */
++ 
++ 
+++>>>>>>> f19fbd5ed642 (s390: introduce execute-trampolines for branches)
+  	.section .kprobes.text, "ax"
+ -.Ldummy:
+ -	/*
+ -	 * This nop exists only in order to avoid that __switch_to starts at
+ -	 * the beginning of the kprobes text section. In that case we would
+ -	 * have several symbols at the same address. E.g. objdump would take
+ -	 * an arbitrary symbol name when disassembling this code.
+ -	 * With the added nop in between the __switch_to symbol is unique
+ -	 * again.
+ -	 */
+ -	nop	0
+  
+  ENTRY(__bpon)
+  	.globl __bpon
+@@@ -179,26 -309,103 +278,126 @@@
+   *  gpr2 = prev
+   */
+  ENTRY(__switch_to)
+++<<<<<<< HEAD
+ +	stm	%r6,%r15,__SF_GPRS(%r15)	# store gprs of prev task
+ +	st	%r15,__THREAD_ksp(%r2)		# store kernel stack of prev
+ +	l	%r4,__THREAD_info(%r2)		# get thread_info of prev
+ +	l	%r5,__THREAD_info(%r3)		# get thread_info of next
+ +	lr	%r15,%r5
+ +	ahi	%r15,STACK_INIT			# end of kernel stack of next
+ +	st	%r3,__LC_CURRENT		# store task struct of next
+ +	st	%r5,__LC_THREAD_INFO		# store thread info of next
+ +	st	%r15,__LC_KERNEL_STACK		# store end of kernel stack
+ +	lctl	%c4,%c4,__TASK_pid(%r3)		# load pid to control reg. 4
+ +	mvc	__LC_CURRENT_PID(4,%r0),__TASK_pid(%r3)	# store pid of next
+ +	l	%r15,__THREAD_ksp(%r3)		# load kernel stack of next
+ +	tm	__TI_flags+3(%r4),_TIF_MCCK_PENDING # machine check pending?
+ +	jz	0f
+ +	ni	__TI_flags+3(%r4),255-_TIF_MCCK_PENDING	# clear flag in prev
+ +	oi	__TI_flags+3(%r5),_TIF_MCCK_PENDING	# set it in next
+ +0:	lm	%r6,%r15,__SF_GPRS(%r15)	# load gprs of next task
+ +	br	%r14
+ +
+ +__critical_start:
+++=======
++ 	stmg	%r6,%r15,__SF_GPRS(%r15)	# store gprs of prev task
++ 	lghi	%r4,__TASK_stack
++ 	lghi	%r1,__TASK_thread
++ 	lg	%r5,0(%r4,%r3)			# start of kernel stack of next
++ 	stg	%r15,__THREAD_ksp(%r1,%r2)	# store kernel stack of prev
++ 	lgr	%r15,%r5
++ 	aghi	%r15,STACK_INIT			# end of kernel stack of next
++ 	stg	%r3,__LC_CURRENT		# store task struct of next
++ 	stg	%r15,__LC_KERNEL_STACK		# store end of kernel stack
++ 	lg	%r15,__THREAD_ksp(%r1,%r3)	# load kernel stack of next
++ 	aghi	%r3,__TASK_pid
++ 	mvc	__LC_CURRENT_PID(4,%r0),0(%r3)	# store pid of next
++ 	lmg	%r6,%r15,__SF_GPRS(%r15)	# load gprs of next task
++ 	TSTMSK	__LC_MACHINE_FLAGS,MACHINE_FLAG_LPP
++ 	jz	0f
++ 	.insn	s,0xb2800000,__LC_LPP		# set program parameter
++ 0:	BR_R1USE_R14
++ 
++ .L__critical_start:
++ 
++ #if IS_ENABLED(CONFIG_KVM)
++ /*
++  * sie64a calling convention:
++  * %r2 pointer to sie control block
++  * %r3 guest register save area
++  */
++ ENTRY(sie64a)
++ 	stmg	%r6,%r14,__SF_GPRS(%r15)	# save kernel registers
++ 	lg	%r12,__LC_CURRENT
++ 	stg	%r2,__SF_EMPTY(%r15)		# save control block pointer
++ 	stg	%r3,__SF_EMPTY+8(%r15)		# save guest register save area
++ 	xc	__SF_EMPTY+16(8,%r15),__SF_EMPTY+16(%r15) # reason code = 0
++ 	mvc	__SF_EMPTY+24(8,%r15),__TI_flags(%r12) # copy thread flags
++ 	TSTMSK	__LC_CPU_FLAGS,_CIF_FPU		# load guest fp/vx registers ?
++ 	jno	.Lsie_load_guest_gprs
++ 	brasl	%r14,load_fpu_regs		# load guest fp/vx regs
++ .Lsie_load_guest_gprs:
++ 	lmg	%r0,%r13,0(%r3)			# load guest gprs 0-13
++ 	lg	%r14,__LC_GMAP			# get gmap pointer
++ 	ltgr	%r14,%r14
++ 	jz	.Lsie_gmap
++ 	lctlg	%c1,%c1,__GMAP_ASCE(%r14)	# load primary asce
++ .Lsie_gmap:
++ 	lg	%r14,__SF_EMPTY(%r15)		# get control block pointer
++ 	oi	__SIE_PROG0C+3(%r14),1		# we are going into SIE now
++ 	tm	__SIE_PROG20+3(%r14),3		# last exit...
++ 	jnz	.Lsie_skip
++ 	TSTMSK	__LC_CPU_FLAGS,_CIF_FPU
++ 	jo	.Lsie_skip			# exit if fp/vx regs changed
++ 	BPEXIT	__SF_EMPTY+24(%r15),(_TIF_ISOLATE_BP|_TIF_ISOLATE_BP_GUEST)
++ .Lsie_entry:
++ 	sie	0(%r14)
++ .Lsie_exit:
++ 	BPOFF
++ 	BPENTER	__SF_EMPTY+24(%r15),(_TIF_ISOLATE_BP|_TIF_ISOLATE_BP_GUEST)
++ .Lsie_skip:
++ 	ni	__SIE_PROG0C+3(%r14),0xfe	# no longer in SIE
++ 	lctlg	%c1,%c1,__LC_USER_ASCE		# load primary asce
++ .Lsie_done:
++ # some program checks are suppressing. C code (e.g. do_protection_exception)
++ # will rewind the PSW by the ILC, which is often 4 bytes in case of SIE. There
++ # are some corner cases (e.g. runtime instrumentation) where ILC is unpredictable.
++ # Other instructions between sie64a and .Lsie_done should not cause program
++ # interrupts. So lets use 3 nops as a landing pad for all possible rewinds.
++ # See also .Lcleanup_sie
++ .Lrewind_pad6:
++ 	nopr	7
++ .Lrewind_pad4:
++ 	nopr	7
++ .Lrewind_pad2:
++ 	nopr	7
++ 	.globl sie_exit
++ sie_exit:
++ 	lg	%r14,__SF_EMPTY+8(%r15)		# load guest register save area
++ 	stmg	%r0,%r13,0(%r14)		# save guest gprs 0-13
++ 	xgr	%r0,%r0				# clear guest registers to
++ 	xgr	%r1,%r1				# prevent speculative use
++ 	xgr	%r2,%r2
++ 	xgr	%r3,%r3
++ 	xgr	%r4,%r4
++ 	xgr	%r5,%r5
++ 	lmg	%r6,%r14,__SF_GPRS(%r15)	# restore kernel registers
++ 	lg	%r2,__SF_EMPTY+16(%r15)		# return exit reason code
++ 	BR_R1USE_R14
++ .Lsie_fault:
++ 	lghi	%r14,-EFAULT
++ 	stg	%r14,__SF_EMPTY+16(%r15)	# set exit reason code
++ 	j	sie_exit
++ 
++ 	EX_TABLE(.Lrewind_pad6,.Lsie_fault)
++ 	EX_TABLE(.Lrewind_pad4,.Lsie_fault)
++ 	EX_TABLE(.Lrewind_pad2,.Lsie_fault)
++ 	EX_TABLE(sie_exit,.Lsie_fault)
++ EXPORT_SYMBOL(sie64a)
++ EXPORT_SYMBOL(sie_exit)
++ #endif
++ 
+++>>>>>>> f19fbd5ed642 (s390: introduce execute-trampolines for branches)
+  /*
+   * SVC interrupt handler routine. System calls are synchronous events and
+   * are executed with interrupts enabled.
+@@@ -206,57 -413,67 +405,70 @@@
+  
+  ENTRY(system_call)
+  	stpt	__LC_SYNC_ENTER_TIMER
+ -.Lsysc_stmg:
+ -	stmg	%r8,%r15,__LC_SAVE_AREA_SYNC
+ +sysc_stm:
+ +	stm	%r8,%r15,__LC_SAVE_AREA_SYNC
+  	BPOFF
+ -	lg	%r12,__LC_CURRENT
+ -	lghi	%r13,__TASK_thread
+ -	lghi	%r14,_PIF_SYSCALL
+ -.Lsysc_per:
+ -	lg	%r15,__LC_KERNEL_STACK
+ +	l	%r12,__LC_THREAD_INFO
+ +	l	%r13,__LC_SVC_NEW_PSW+4
+ +sysc_per:
+ +	l	%r15,__LC_KERNEL_STACK
+  	la	%r11,STACK_FRAME_OVERHEAD(%r15)	# pointer to pt_regs
+ -.Lsysc_vtime:
+ +sysc_vtime:
+  	UPDATE_VTIME %r8,%r9,__LC_SYNC_ENTER_TIMER
+ -	BPENTER __TI_flags(%r12),_TIF_ISOLATE_BP
+ -	stmg	%r0,%r7,__PT_R0(%r11)
+ -	# clear user controlled register to prevent speculative use
+ -	xgr	%r0,%r0
+ -	mvc	__PT_R8(64,%r11),__LC_SAVE_AREA_SYNC
+ -	mvc	__PT_PSW(16,%r11),__LC_SVC_OLD_PSW
+ +	stm	%r0,%r7,__PT_R0(%r11)
+ +	mvc	__PT_R8(32,%r11),__LC_SAVE_AREA_SYNC
+ +	mvc	__PT_PSW(8,%r11),__LC_SVC_OLD_PSW
+  	mvc	__PT_INT_CODE(4,%r11),__LC_SVC_ILC
+ -	stg	%r14,__PT_FLAGS(%r11)
+ -.Lsysc_do_svc:
+ -	# load address of system call table
+ -	lg	%r10,__THREAD_sysc_table(%r13,%r12)
+ -	llgh	%r8,__PT_INT_CODE+2(%r11)
+ -	slag	%r8,%r8,2			# shift and test for svc 0
+ -	jnz	.Lsysc_nr_ok
+ +sysc_do_svc:
+ +	oi	__TI_flags+2(%r12),_TIF_SYSCALL>>8
+ +	l	%r10,__TI_sysc_table(%r12)	# 31 bit system call table
+ +	lh	%r8,__PT_INT_CODE+2(%r11)
+ +	sla	%r8,2				# shift and test for svc0
+ +	jnz	sysc_nr_ok
+  	# svc 0: system call number in %r1
+ -	llgfr	%r1,%r1				# clear high word in r1
+ -	cghi	%r1,NR_syscalls
+ -	jnl	.Lsysc_nr_ok
+ +	cl	%r1,BASED(.Lnr_syscalls)
+ +	jnl	sysc_nr_ok
+  	sth	%r1,__PT_INT_CODE+2(%r11)
+++<<<<<<< HEAD
+ +	lr	%r8,%r1
+ +	sla	%r8,2
+ +sysc_nr_ok:
+ +	xc	__SF_BACKCHAIN(4,%r15),__SF_BACKCHAIN(%r15)
+ +	st	%r2,__PT_ORIG_GPR2(%r11)
+ +	st	%r7,STACK_FRAME_OVERHEAD(%r15)
+ +	l	%r9,0(%r8,%r10)			# get system call addr.
+ +	tm	__TI_flags+2(%r12),_TIF_TRACE >> 8
+ +	jnz	sysc_tracesys
+ +	basr	%r14,%r9			# call sys_xxxx
+ +	st	%r2,__PT_R2(%r11)		# store return value
+++=======
++ 	slag	%r8,%r1,2
++ .Lsysc_nr_ok:
++ 	xc	__SF_BACKCHAIN(8,%r15),__SF_BACKCHAIN(%r15)
++ 	stg	%r2,__PT_ORIG_GPR2(%r11)
++ 	stg	%r7,STACK_FRAME_OVERHEAD(%r15)
++ 	lgf	%r9,0(%r8,%r10)			# get system call add.
++ 	TSTMSK	__TI_flags(%r12),_TIF_TRACE
++ 	jnz	.Lsysc_tracesys
++ 	BASR_R14_R9				# call sys_xxxx
++ 	stg	%r2,__PT_R2(%r11)		# store return value
+++>>>>>>> f19fbd5ed642 (s390: introduce execute-trampolines for branches)
+  
+ -.Lsysc_return:
+ +sysc_return:
+  	LOCKDEP_SYS_EXIT
+ -.Lsysc_tif:
+ -	TSTMSK	__PT_FLAGS(%r11),_PIF_WORK
+ -	jnz	.Lsysc_work
+ -	TSTMSK	__TI_flags(%r12),_TIF_WORK
+ -	jnz	.Lsysc_work			# check for work
+ -	TSTMSK	__LC_CPU_FLAGS,_CIF_WORK
+ -	jnz	.Lsysc_work
+ -	BPEXIT	__TI_flags(%r12),_TIF_ISOLATE_BP
+ -.Lsysc_restore:
+ -	lg	%r14,__LC_VDSO_PER_CPU
+ -	lmg	%r0,%r10,__PT_R0(%r11)
+ -	mvc	__LC_RETURN_PSW(16),__PT_PSW(%r11)
+ -.Lsysc_exit_timer:
+ +sysc_tif:
+ +	tm	__PT_PSW+1(%r11),0x01		# returning to user ?
+ +	jno	sysc_restore
+ +	tm	__TI_flags+3(%r12),_TIF_WORK_SVC
+ +	jnz	sysc_work			# check for work
+ +	ni	__TI_flags+2(%r12),255-_TIF_SYSCALL>>8
+ +	BPON
+ +sysc_restore:
+ +	mvc	__LC_RETURN_PSW(8),__PT_PSW(%r11)
+  	stpt	__LC_EXIT_TIMER
+ -	mvc	__VDSO_ECTG_BASE(16,%r14),__LC_EXIT_TIMER
+ -	lmg	%r11,%r15,__PT_R11(%r11)
+ -	lpswe	__LC_RETURN_PSW
+ -.Lsysc_done:
+ +	lm	%r0,%r15,__PT_R0(%r11)
+ +	lpsw	__LC_RETURN_PSW
+ +sysc_done:
+  
+  #
+  # One of the work bits is on. Find out which one.
+@@@ -341,32 -621,29 +553,55 @@@ sysc_singlestep
+  # call tracehook_report_syscall_entry/tracehook_report_syscall_exit before
+  # and after the system call
+  #
+ -.Lsysc_tracesys:
+ -	lgr	%r2,%r11		# pass pointer to pt_regs
+ +sysc_tracesys:
+ +	l	%r1,BASED(.Ltrace_enter)
+ +	lr	%r2,%r11		# pass pointer to pt_regs
+  	la	%r3,0
+++<<<<<<< HEAD
+ +	xr	%r0,%r0
+ +	icm	%r0,3,__PT_INT_CODE+2(%r11)
+ +	st	%r0,__PT_R2(%r11)
+ +	basr	%r14,%r1		# call do_syscall_trace_enter
+ +	cl	%r2,BASED(.Lnr_syscalls)
+ +	jnl	sysc_tracenogo
+ +	lr	%r8,%r2
+ +	sll	%r8,2
+ +	l	%r9,0(%r8,%r10)
+ +sysc_tracego:
+ +	lm	%r3,%r7,__PT_R3(%r11)
+ +	st	%r7,STACK_FRAME_OVERHEAD(%r15)
+ +	l	%r2,__PT_ORIG_GPR2(%r11)
+ +	basr	%r14,%r9		# call sys_xxx
+ +	st	%r2,__PT_R2(%r11)	# store return value
+ +sysc_tracenogo:
+ +	tm	__TI_flags+2(%r12),_TIF_TRACE >> 8
+ +	jz	sysc_return
+ +	l	%r1,BASED(.Ltrace_exit)
+ +	lr	%r2,%r11		# pass pointer to pt_regs
+ +	la	%r14,BASED(sysc_return)
+ +	br	%r1			# call do_syscall_trace_exit
+++=======
++ 	llgh	%r0,__PT_INT_CODE+2(%r11)
++ 	stg	%r0,__PT_R2(%r11)
++ 	brasl	%r14,do_syscall_trace_enter
++ 	lghi	%r0,NR_syscalls
++ 	clgr	%r0,%r2
++ 	jnh	.Lsysc_tracenogo
++ 	sllg	%r8,%r2,2
++ 	lgf	%r9,0(%r8,%r10)
++ .Lsysc_tracego:
++ 	lmg	%r3,%r7,__PT_R3(%r11)
++ 	stg	%r7,STACK_FRAME_OVERHEAD(%r15)
++ 	lg	%r2,__PT_ORIG_GPR2(%r11)
++ 	BASR_R14_R9			# call sys_xxx
++ 	stg	%r2,__PT_R2(%r11)	# store return value
++ .Lsysc_tracenogo:
++ 	TSTMSK	__TI_flags(%r12),_TIF_TRACE
++ 	jz	.Lsysc_return
++ 	lgr	%r2,%r11		# pass pointer to pt_regs
++ 	larl	%r14,.Lsysc_return
++ 	jg	do_syscall_trace_exit
+++>>>>>>> f19fbd5ed642 (s390: introduce execute-trampolines for branches)
+  
+  #
+  # a new process exits the kernel with ret_from_fork
+@@@ -380,13 -655,13 +615,18 @@@ ENTRY(ret_from_fork
+  	TRACE_IRQS_ON
+  	ssm	__LC_SVC_NEW_PSW	# reenable interrupts
+  	tm	__PT_PSW+1(%r11),0x01	# forking a kernel thread ?
+ -	jne	.Lsysc_tracenogo
+ +	jne	sysc_tracenogo
+  	# it's a kernel thread
+ -	lmg	%r9,%r10,__PT_R9(%r11)	# load gprs
+ +	lm	%r9,%r10,__PT_R9(%r11)	# load gprs
+  ENTRY(kernel_thread_starter)
+  	la	%r2,0(%r10)
+++<<<<<<< HEAD
+ +	basr	%r14,%r9
+ +	j	sysc_tracenogo
+++=======
++ 	BASR_R14_R9
++ 	j	.Lsysc_tracenogo
+++>>>>>>> f19fbd5ed642 (s390: introduce execute-trampolines for branches)
+  
+  /*
+   * Program check handler routine
+@@@ -395,51 -670,86 +635,59 @@@
+  ENTRY(pgm_check_handler)
+  	stpt	__LC_SYNC_ENTER_TIMER
+  	BPOFF
+ -	stmg	%r8,%r15,__LC_SAVE_AREA_SYNC
+ -	lg	%r10,__LC_LAST_BREAK
+ -	lg	%r12,__LC_CURRENT
+ -	lghi	%r11,0
+ -	larl	%r13,cleanup_critical
+ -	lmg	%r8,%r9,__LC_PGM_OLD_PSW
+ -	tmhh	%r8,0x0001		# test problem state bit
+ -	jnz	2f			# -> fault in user space
+ -#if IS_ENABLED(CONFIG_KVM)
+ -	# cleanup critical section for program checks in sie64a
+ -	lgr	%r14,%r9
+ -	slg	%r14,BASED(.Lsie_critical_start)
+ -	clg	%r14,BASED(.Lsie_critical_length)
+ -	jhe	0f
+ -	lg	%r14,__SF_EMPTY(%r15)		# get control block pointer
+ -	ni	__SIE_PROG0C+3(%r14),0xfe	# no longer in SIE
+ -	lctlg	%c1,%c1,__LC_USER_ASCE		# load primary asce
+ -	larl	%r9,sie_exit			# skip forward to sie_exit
+ -	lghi	%r11,_PIF_GUEST_FAULT
+ -#endif
+ -0:	tmhh	%r8,0x4000		# PER bit set in old PSW ?
+ -	jnz	1f			# -> enabled, can't be a double fault
+ +	stm	%r8,%r15,__LC_SAVE_AREA_SYNC
+ +	l	%r12,__LC_THREAD_INFO
+ +	l	%r13,__LC_SVC_NEW_PSW+4
+ +	lm	%r8,%r9,__LC_PGM_OLD_PSW
+ +	tmh	%r8,0x0001		# test problem state bit
+ +	jnz	1f			# -> fault in user space
+ +	tmh	%r8,0x4000		# PER bit set in old PSW ?
+ +	jnz	0f			# -> enabled, can't be a double fault
+  	tm	__LC_PGM_ILC+3,0x80	# check for per exception
+ -	jnz	.Lpgm_svcper		# -> single stepped svc
+ -1:	CHECK_STACK STACK_SIZE,__LC_SAVE_AREA_SYNC
+ -	aghi	%r15,-(STACK_FRAME_OVERHEAD + __PT_SIZE)
+ -	j	4f
+ -2:	UPDATE_VTIME %r14,%r15,__LC_SYNC_ENTER_TIMER
+ -	BPENTER __TI_flags(%r12),_TIF_ISOLATE_BP
+ -	lg	%r15,__LC_KERNEL_STACK
+ -	lgr	%r14,%r12
+ -	aghi	%r14,__TASK_thread	# pointer to thread_struct
+ -	lghi	%r13,__LC_PGM_TDB
+ -	tm	__LC_PGM_ILC+2,0x02	# check for transaction abort
+ -	jz	3f
+ -	mvc	__THREAD_trap_tdb(256,%r14),0(%r13)
+ -3:	stg	%r10,__THREAD_last_break(%r14)
+ -4:	lgr	%r13,%r11
+ -	la	%r11,STACK_FRAME_OVERHEAD(%r15)
+ -	stmg	%r0,%r7,__PT_R0(%r11)
+ -	# clear user controlled registers to prevent speculative use
+ -	xgr	%r0,%r0
+ -	xgr	%r1,%r1
+ -	xgr	%r2,%r2
+ -	xgr	%r3,%r3
+ -	xgr	%r4,%r4
+ -	xgr	%r5,%r5
+ -	xgr	%r6,%r6
+ -	xgr	%r7,%r7
+ -	mvc	__PT_R8(64,%r11),__LC_SAVE_AREA_SYNC
+ -	stmg	%r8,%r9,__PT_PSW(%r11)
+ +	jnz	pgm_svcper		# -> single stepped svc
+ +0:	CHECK_STACK STACK_SIZE,__LC_SAVE_AREA_SYNC
+ +	ahi	%r15,-(STACK_FRAME_OVERHEAD + __PT_SIZE)
+ +	j	2f
+ +1:	UPDATE_VTIME %r14,%r15,__LC_SYNC_ENTER_TIMER
+ +	l	%r15,__LC_KERNEL_STACK
+ +2:	la	%r11,STACK_FRAME_OVERHEAD(%r15)
+ +	stm	%r0,%r7,__PT_R0(%r11)
+ +	mvc	__PT_R8(32,%r11),__LC_SAVE_AREA_SYNC
+ +	stm	%r8,%r9,__PT_PSW(%r11)
+  	mvc	__PT_INT_CODE(4,%r11),__LC_PGM_ILC
+ -	mvc	__PT_INT_PARM_LONG(8,%r11),__LC_TRANS_EXC_CODE
+ -	stg	%r13,__PT_FLAGS(%r11)
+ -	stg	%r10,__PT_ARGS(%r11)
+ +	mvc	__PT_INT_PARM_LONG(4,%r11),__LC_TRANS_EXC_CODE
+  	tm	__LC_PGM_ILC+3,0x80	# check for per exception
+ -	jz	5f
+ -	tmhh	%r8,0x0001		# kernel per event ?
+ -	jz	.Lpgm_kprobe
+ -	oi	__PT_FLAGS+7(%r11),_PIF_PER_TRAP
+ -	mvc	__THREAD_per_address(8,%r14),__LC_PER_ADDRESS
+ -	mvc	__THREAD_per_cause(2,%r14),__LC_PER_CODE
+ -	mvc	__THREAD_per_paid(1,%r14),__LC_PER_ACCESS_ID
+ -5:	REENABLE_IRQS
+ -	xc	__SF_BACKCHAIN(8,%r15),__SF_BACKCHAIN(%r15)
+ -	larl	%r1,pgm_check_table
+ -	llgh	%r10,__PT_INT_CODE+2(%r11)
+ -	nill	%r10,0x007f
+ +	jz	0f
+ +	l	%r1,__TI_task(%r12)
+ +	tmh	%r8,0x0001		# kernel per event ?
+ +	jz	pgm_kprobe
+ +	oi	__TI_flags+3(%r12),_TIF_PER_TRAP
+ +	mvc	__THREAD_per_address(4,%r1),__LC_PER_ADDRESS
+ +	mvc	__THREAD_per_cause(2,%r1),__LC_PER_CAUSE
+ +	mvc	__THREAD_per_paid(1,%r1),__LC_PER_PAID
+ +0:	REENABLE_IRQS
+ +	xc	__SF_BACKCHAIN(4,%r15),__SF_BACKCHAIN(%r15)
+ +	l	%r1,BASED(.Ljump_table)
+ +	la	%r10,0x7f
+ +	n	%r10,__PT_INT_CODE(%r11)
+ +	je	pgm_exit
+  	sll	%r10,2
+++<<<<<<< HEAD
+ +	l	%r1,0(%r10,%r1)		# load address of handler routine
+ +	lr	%r2,%r11		# pass pointer to pt_regs
+ +	basr	%r14,%r1		# branch to interrupt-handler
+ +pgm_exit:
+++=======
++ 	je	.Lpgm_return
++ 	lgf	%r9,0(%r10,%r1)		# load address of handler routine
++ 	lgr	%r2,%r11		# pass pointer to pt_regs
++ 	BASR_R14_R9			# branch to interrupt-handler
++ .Lpgm_return:
+++>>>>>>> f19fbd5ed642 (s390: introduce execute-trampolines for branches)
+  	LOCKDEP_SYS_EXIT
+  	tm	__PT_PSW+1(%r11),0x01	# returning to user ?
+ -	jno	.Lsysc_restore
+ -	TSTMSK	__PT_FLAGS(%r11),_PIF_SYSCALL
+ -	jo	.Lsysc_do_syscall
+ -	j	.Lsysc_tif
+ +	jno	sysc_restore
+ +	j	sysc_tif
+  
+  #
+  # PER event in supervisor state, must be kprobes
+@@@ -623,49 -1003,155 +871,146 @@@ io_notify_resume
+  /*
+   * External interrupt handler routine
+   */
+ +
+  ENTRY(ext_int_handler)
+ -	STCK	__LC_INT_CLOCK
+ +	stck	__LC_INT_CLOCK
+  	stpt	__LC_ASYNC_ENTER_TIMER
+  	BPOFF
+ -	stmg	%r8,%r15,__LC_SAVE_AREA_ASYNC
+ -	lg	%r12,__LC_CURRENT
+ -	larl	%r13,cleanup_critical
+ -	lmg	%r8,%r9,__LC_EXT_OLD_PSW
+ -	SWITCH_ASYNC __LC_SAVE_AREA_ASYNC,__LC_ASYNC_ENTER_TIMER
+ -	stmg	%r0,%r7,__PT_R0(%r11)
+ -	# clear user controlled registers to prevent speculative use
+ -	xgr	%r0,%r0
+ -	xgr	%r1,%r1
+ -	xgr	%r2,%r2
+ -	xgr	%r3,%r3
+ -	xgr	%r4,%r4
+ -	xgr	%r5,%r5
+ -	xgr	%r6,%r6
+ -	xgr	%r7,%r7
+ -	xgr	%r10,%r10
+ -	mvc	__PT_R8(64,%r11),__LC_SAVE_AREA_ASYNC
+ -	stmg	%r8,%r9,__PT_PSW(%r11)
+ -	lghi	%r1,__LC_EXT_PARAMS2
+ -	mvc	__PT_INT_CODE(4,%r11),__LC_EXT_CPU_ADDR
+ -	mvc	__PT_INT_PARM(4,%r11),__LC_EXT_PARAMS
+ -	mvc	__PT_INT_PARM_LONG(8,%r11),0(%r1)
+ -	xc	__PT_FLAGS(8,%r11),__PT_FLAGS(%r11)
+ -	TSTMSK	__LC_CPU_FLAGS,_CIF_IGNORE_IRQ
+ -	jo	.Lio_restore
+ +	stm	%r8,%r15,__LC_SAVE_AREA_ASYNC
+ +	l	%r12,__LC_THREAD_INFO
+ +	l	%r13,__LC_SVC_NEW_PSW+4
+ +	lm	%r8,%r9,__LC_EXT_OLD_PSW
+ +	tmh	%r8,0x0001		# interrupting from user ?
+ +	jz	ext_skip
+ +	UPDATE_VTIME %r14,%r15,__LC_ASYNC_ENTER_TIMER
+ +ext_skip:
+ +	SWITCH_ASYNC __LC_SAVE_AREA_ASYNC,__LC_ASYNC_STACK,STACK_SHIFT
+ +	stm	%r0,%r7,__PT_R0(%r11)
+ +	mvc	__PT_R8(32,%r11),__LC_SAVE_AREA_ASYNC
+ +	stm	%r8,%r9,__PT_PSW(%r11)
+  	TRACE_IRQS_OFF
+ -	xc	__SF_BACKCHAIN(8,%r15),__SF_BACKCHAIN(%r15)
+ -	lgr	%r2,%r11		# pass pointer to pt_regs
+ -	lghi	%r3,EXT_INTERRUPT
+ -	brasl	%r14,do_IRQ
+ -	j	.Lio_return
+ +	lr	%r2,%r11		# pass pointer to pt_regs
+ +	l	%r3,__LC_EXT_CPU_ADDR	# get cpu address + interruption code
+ +	l	%r4,__LC_EXT_PARAMS	# get external parameters
+ +	l	%r1,BASED(.Ldo_extint)
+ +	basr	%r14,%r1		# call do_extint
+ +	j	io_return
+  
+  /*
+ - * Load idle PSW. The second "half" of this function is in .Lcleanup_idle.
+ + * Load idle PSW. The second "half" of this function is in cleanup_idle.
+   */
+  ENTRY(psw_idle)
+ -	stg	%r3,__SF_EMPTY(%r15)
+ -	larl	%r1,.Lpsw_idle_lpsw+4
+ -	stg	%r1,__SF_EMPTY+8(%r15)
+ -#ifdef CONFIG_SMP
+ -	larl	%r1,smp_cpu_mtid
+ -	llgf	%r1,0(%r1)
+ -	ltgr	%r1,%r1
+ -	jz	.Lpsw_idle_stcctm
+ -	.insn	rsy,0xeb0000000017,%r1,5,__SF_EMPTY+16(%r15)
+ -.Lpsw_idle_stcctm:
+ -#endif
+ -	oi	__LC_CPU_FLAGS+7,_CIF_ENABLED_WAIT
+ +	st	%r3,__SF_EMPTY(%r15)
+ +	basr	%r1,0
+ +	la	%r1,psw_idle_lpsw+4-.(%r1)
+ +	st	%r1,__SF_EMPTY+4(%r15)
+ +	oi	__SF_EMPTY+4(%r15),0x80
+  	BPON
+ -	STCK	__CLOCK_IDLE_ENTER(%r2)
+ +	stck	__CLOCK_IDLE_ENTER(%r2)
+  	stpt	__TIMER_IDLE_ENTER(%r2)
+++<<<<<<< HEAD
+ +psw_idle_lpsw:
+ +	lpsw	__SF_EMPTY(%r15)
+ +	br	%r14
+ +psw_idle_end:
+ +
+ +__critical_end:
+++=======
++ .Lpsw_idle_lpsw:
++ 	lpswe	__SF_EMPTY(%r15)
++ 	BR_R1USE_R14
++ .Lpsw_idle_end:
++ 
++ /*
++  * Store floating-point controls and floating-point or vector register
++  * depending whether the vector facility is available.	A critical section
++  * cleanup assures that the registers are stored even if interrupted for
++  * some other work.  The CIF_FPU flag is set to trigger a lazy restore
++  * of the register contents at return from io or a system call.
++  */
++ ENTRY(save_fpu_regs)
++ 	lg	%r2,__LC_CURRENT
++ 	aghi	%r2,__TASK_thread
++ 	TSTMSK	__LC_CPU_FLAGS,_CIF_FPU
++ 	jo	.Lsave_fpu_regs_exit
++ 	stfpc	__THREAD_FPU_fpc(%r2)
++ 	lg	%r3,__THREAD_FPU_regs(%r2)
++ 	TSTMSK	__LC_MACHINE_FLAGS,MACHINE_FLAG_VX
++ 	jz	.Lsave_fpu_regs_fp	  # no -> store FP regs
++ 	VSTM	%v0,%v15,0,%r3		  # vstm 0,15,0(3)
++ 	VSTM	%v16,%v31,256,%r3	  # vstm 16,31,256(3)
++ 	j	.Lsave_fpu_regs_done	  # -> set CIF_FPU flag
++ .Lsave_fpu_regs_fp:
++ 	std	0,0(%r3)
++ 	std	1,8(%r3)
++ 	std	2,16(%r3)
++ 	std	3,24(%r3)
++ 	std	4,32(%r3)
++ 	std	5,40(%r3)
++ 	std	6,48(%r3)
++ 	std	7,56(%r3)
++ 	std	8,64(%r3)
++ 	std	9,72(%r3)
++ 	std	10,80(%r3)
++ 	std	11,88(%r3)
++ 	std	12,96(%r3)
++ 	std	13,104(%r3)
++ 	std	14,112(%r3)
++ 	std	15,120(%r3)
++ .Lsave_fpu_regs_done:
++ 	oi	__LC_CPU_FLAGS+7,_CIF_FPU
++ .Lsave_fpu_regs_exit:
++ 	BR_R1USE_R14
++ .Lsave_fpu_regs_end:
++ EXPORT_SYMBOL(save_fpu_regs)
++ 
++ /*
++  * Load floating-point controls and floating-point or vector registers.
++  * A critical section cleanup assures that the register contents are
++  * loaded even if interrupted for some other work.
++  *
++  * There are special calling conventions to fit into sysc and io return work:
++  *	%r15:	<kernel stack>
++  * The function requires:
++  *	%r4
++  */
++ load_fpu_regs:
++ 	lg	%r4,__LC_CURRENT
++ 	aghi	%r4,__TASK_thread
++ 	TSTMSK	__LC_CPU_FLAGS,_CIF_FPU
++ 	jno	.Lload_fpu_regs_exit
++ 	lfpc	__THREAD_FPU_fpc(%r4)
++ 	TSTMSK	__LC_MACHINE_FLAGS,MACHINE_FLAG_VX
++ 	lg	%r4,__THREAD_FPU_regs(%r4)	# %r4 <- reg save area
++ 	jz	.Lload_fpu_regs_fp		# -> no VX, load FP regs
++ 	VLM	%v0,%v15,0,%r4
++ 	VLM	%v16,%v31,256,%r4
++ 	j	.Lload_fpu_regs_done
++ .Lload_fpu_regs_fp:
++ 	ld	0,0(%r4)
++ 	ld	1,8(%r4)
++ 	ld	2,16(%r4)
++ 	ld	3,24(%r4)
++ 	ld	4,32(%r4)
++ 	ld	5,40(%r4)
++ 	ld	6,48(%r4)
++ 	ld	7,56(%r4)
++ 	ld	8,64(%r4)
++ 	ld	9,72(%r4)
++ 	ld	10,80(%r4)
++ 	ld	11,88(%r4)
++ 	ld	12,96(%r4)
++ 	ld	13,104(%r4)
++ 	ld	14,112(%r4)
++ 	ld	15,120(%r4)
++ .Lload_fpu_regs_done:
++ 	ni	__LC_CPU_FLAGS+7,255-_CIF_FPU
++ .Lload_fpu_regs_exit:
++ 	BR_R1USE_R14
++ .Lload_fpu_regs_end:
++ 
++ .L__critical_end:
+++>>>>>>> f19fbd5ed642 (s390: introduce execute-trampolines for branches)
+  
+  /*
+   * Machine check handler routines
+@@@ -780,141 -1319,198 +1125,258 @@@ ENTRY(restart_int_handler
+   * Setup a pt_regs so that show_trace can provide a good call trace.
+   */
+  stack_overflow:
+ -	lg	%r15,__LC_PANIC_STACK	# change to panic stack
+ +	l	%r15,__LC_PANIC_STACK	# change to panic stack
+  	la	%r11,STACK_FRAME_OVERHEAD(%r15)
+ -	stmg	%r0,%r7,__PT_R0(%r11)
+ -	stmg	%r8,%r9,__PT_PSW(%r11)
+ -	mvc	__PT_R8(64,%r11),0(%r14)
+ -	stg	%r10,__PT_ORIG_GPR2(%r11) # store last break to orig_gpr2
+ -	xc	__SF_BACKCHAIN(8,%r15),__SF_BACKCHAIN(%r15)
+ -	lgr	%r2,%r11		# pass pointer to pt_regs
+ -	jg	kernel_stack_overflow
+ +	stm	%r0,%r7,__PT_R0(%r11)
+ +	stm	%r8,%r9,__PT_PSW(%r11)
+ +	mvc	__PT_R8(32,%r11),0(%r14)
+ +	l	%r1,BASED(1f)
+ +	xc	__SF_BACKCHAIN(4,%r15),__SF_BACKCHAIN(%r15)
+ +	lr	%r2,%r11		# pass pointer to pt_regs
+ +	br	%r1			# branch to kernel_stack_overflow
+ +1:	.long	kernel_stack_overflow
+  #endif
+  
+ +cleanup_table:
+ +	.long	system_call + 0x80000000
+ +	.long	sysc_do_svc + 0x80000000
+ +	.long	sysc_tif + 0x80000000
+ +	.long	sysc_restore + 0x80000000
+ +	.long	sysc_done + 0x80000000
+ +	.long	io_tif + 0x80000000
+ +	.long	io_restore + 0x80000000
+ +	.long	io_done + 0x80000000
+ +	.long	psw_idle + 0x80000000
+ +	.long	psw_idle_end + 0x80000000
+ +
+  cleanup_critical:
+ -#if IS_ENABLED(CONFIG_KVM)
+ -	clg	%r9,BASED(.Lcleanup_table_sie)	# .Lsie_gmap
+ +	cl	%r9,BASED(cleanup_table)	# system_call
+  	jl	0f
+ -	clg	%r9,BASED(.Lcleanup_table_sie+8)# .Lsie_done
+ -	jl	.Lcleanup_sie
+ -#endif
+ -	clg	%r9,BASED(.Lcleanup_table)	# system_call
+ +	cl	%r9,BASED(cleanup_table+4)	# sysc_do_svc
+ +	jl	cleanup_system_call
+ +	cl	%r9,BASED(cleanup_table+8)	# sysc_tif
+  	jl	0f
+ -	clg	%r9,BASED(.Lcleanup_table+8)	# .Lsysc_do_svc
+ -	jl	.Lcleanup_system_call
+ -	clg	%r9,BASED(.Lcleanup_table+16)	# .Lsysc_tif
+ +	cl	%r9,BASED(cleanup_table+12)	# sysc_restore
+ +	jl	cleanup_sysc_tif
+ +	cl	%r9,BASED(cleanup_table+16)	# sysc_done
+ +	jl	cleanup_sysc_restore
+ +	cl	%r9,BASED(cleanup_table+20)	# io_tif
+  	jl	0f
+ -	clg	%r9,BASED(.Lcleanup_table+24)	# .Lsysc_restore
+ -	jl	.Lcleanup_sysc_tif
+ -	clg	%r9,BASED(.Lcleanup_table+32)	# .Lsysc_done
+ -	jl	.Lcleanup_sysc_restore
+ -	clg	%r9,BASED(.Lcleanup_table+40)	# .Lio_tif
+ +	cl	%r9,BASED(cleanup_table+24)	# io_restore
+ +	jl	cleanup_io_tif
+ +	cl	%r9,BASED(cleanup_table+28)	# io_done
+ +	jl	cleanup_io_restore
+ +	cl	%r9,BASED(cleanup_table+32)	# psw_idle
+  	jl	0f
+++<<<<<<< HEAD
+ +	cl	%r9,BASED(cleanup_table+36)	# psw_idle_end
+ +	jl	cleanup_idle
+ +0:	br	%r14
+ +
+ +cleanup_system_call:
+++=======
++ 	clg	%r9,BASED(.Lcleanup_table+48)	# .Lio_restore
++ 	jl	.Lcleanup_io_tif
++ 	clg	%r9,BASED(.Lcleanup_table+56)	# .Lio_done
++ 	jl	.Lcleanup_io_restore
++ 	clg	%r9,BASED(.Lcleanup_table+64)	# psw_idle
++ 	jl	0f
++ 	clg	%r9,BASED(.Lcleanup_table+72)	# .Lpsw_idle_end
++ 	jl	.Lcleanup_idle
++ 	clg	%r9,BASED(.Lcleanup_table+80)	# save_fpu_regs
++ 	jl	0f
++ 	clg	%r9,BASED(.Lcleanup_table+88)	# .Lsave_fpu_regs_end
++ 	jl	.Lcleanup_save_fpu_regs
++ 	clg	%r9,BASED(.Lcleanup_table+96)	# load_fpu_regs
++ 	jl	0f
++ 	clg	%r9,BASED(.Lcleanup_table+104)	# .Lload_fpu_regs_end
++ 	jl	.Lcleanup_load_fpu_regs
++ 0:	BR_R11USE_R14
++ 
++ 	.align	8
++ .Lcleanup_table:
++ 	.quad	system_call
++ 	.quad	.Lsysc_do_svc
++ 	.quad	.Lsysc_tif
++ 	.quad	.Lsysc_restore
++ 	.quad	.Lsysc_done
++ 	.quad	.Lio_tif
++ 	.quad	.Lio_restore
++ 	.quad	.Lio_done
++ 	.quad	psw_idle
++ 	.quad	.Lpsw_idle_end
++ 	.quad	save_fpu_regs
++ 	.quad	.Lsave_fpu_regs_end
++ 	.quad	load_fpu_regs
++ 	.quad	.Lload_fpu_regs_end
++ 
++ #if IS_ENABLED(CONFIG_KVM)
++ .Lcleanup_table_sie:
++ 	.quad	.Lsie_gmap
++ 	.quad	.Lsie_done
++ 
++ .Lcleanup_sie:
++ 	cghi    %r11,__LC_SAVE_AREA_ASYNC 	#Is this in normal interrupt?
++ 	je      1f
++ 	slg     %r9,BASED(.Lsie_crit_mcck_start)
++ 	clg     %r9,BASED(.Lsie_crit_mcck_length)
++ 	jh      1f
++ 	oi      __LC_CPU_FLAGS+7, _CIF_MCCK_GUEST
++ 1:	BPENTER __SF_EMPTY+24(%r15),(_TIF_ISOLATE_BP|_TIF_ISOLATE_BP_GUEST)
++ 	lg	%r9,__SF_EMPTY(%r15)		# get control block pointer
++ 	ni	__SIE_PROG0C+3(%r9),0xfe	# no longer in SIE
++ 	lctlg	%c1,%c1,__LC_USER_ASCE		# load primary asce
++ 	larl	%r9,sie_exit			# skip forward to sie_exit
++ 	BR_R11USE_R14
++ #endif
++ 
++ .Lcleanup_system_call:
+++>>>>>>> f19fbd5ed642 (s390: introduce execute-trampolines for branches)
+  	# check if stpt has been executed
+ -	clg	%r9,BASED(.Lcleanup_system_call_insn)
+ +	cl	%r9,BASED(cleanup_system_call_insn)
+  	jh	0f
+  	mvc	__LC_SYNC_ENTER_TIMER(8),__LC_ASYNC_ENTER_TIMER
+ -	cghi	%r11,__LC_SAVE_AREA_ASYNC
+ +	chi	%r11,__LC_SAVE_AREA_ASYNC
+  	je	0f
+  	mvc	__LC_SYNC_ENTER_TIMER(8),__LC_MCCK_ENTER_TIMER
+ -0:	# check if stmg has been executed
+ -	clg	%r9,BASED(.Lcleanup_system_call_insn+8)
+ +0:	# check if stm has been executed
+ +	cl	%r9,BASED(cleanup_system_call_insn+4)
+  	jh	0f
+ -	mvc	__LC_SAVE_AREA_SYNC(64),0(%r11)
+ -0:	# check if base register setup + TIF bit load has been done
+ -	clg	%r9,BASED(.Lcleanup_system_call_insn+16)
+ -	jhe	0f
+ -	# set up saved register r12 task struct pointer
+ -	stg	%r12,32(%r11)
+ -	# set up saved register r13 __TASK_thread offset
+ -	mvc	40(8,%r11),BASED(.Lcleanup_system_call_const)
+ -0:	# check if the user time update has been done
+ -	clg	%r9,BASED(.Lcleanup_system_call_insn+24)
+ +	mvc	__LC_SAVE_AREA_SYNC(32),0(%r11)
+ +0:	# set up saved registers r12, and r13
+ +	st	%r12,16(%r11)		# r12 thread-info pointer
+ +	st	%r13,20(%r11)		# r13 literal-pool pointer
+ +	# check if the user time calculation has been done
+ +	cl	%r9,BASED(cleanup_system_call_insn+8)
+  	jh	0f
+ -	lg	%r15,__LC_EXIT_TIMER
+ -	slg	%r15,__LC_SYNC_ENTER_TIMER
+ -	alg	%r15,__LC_USER_TIMER
+ -	stg	%r15,__LC_USER_TIMER
+ -0:	# check if the system time update has been done
+ -	clg	%r9,BASED(.Lcleanup_system_call_insn+32)
+ +	l	%r10,__LC_EXIT_TIMER
+ +	l	%r15,__LC_EXIT_TIMER+4
+ +	SUB64	%r10,%r15,__LC_SYNC_ENTER_TIMER
+ +	ADD64	%r10,%r15,__LC_USER_TIMER
+ +	st	%r10,__LC_USER_TIMER
+ +	st	%r15,__LC_USER_TIMER+4
+ +0:	# check if the system time calculation has been done
+ +	cl	%r9,BASED(cleanup_system_call_insn+12)
+  	jh	0f
+ -	lg	%r15,__LC_LAST_UPDATE_TIMER
+ -	slg	%r15,__LC_EXIT_TIMER
+ -	alg	%r15,__LC_SYSTEM_TIMER
+ -	stg	%r15,__LC_SYSTEM_TIMER
+ +	l	%r10,__LC_LAST_UPDATE_TIMER
+ +	l	%r15,__LC_LAST_UPDATE_TIMER+4
+ +	SUB64	%r10,%r15,__LC_EXIT_TIMER
+ +	ADD64	%r10,%r15,__LC_SYSTEM_TIMER
+ +	st	%r10,__LC_SYSTEM_TIMER
+ +	st	%r15,__LC_SYSTEM_TIMER+4
+  0:	# update accounting time stamp
+  	mvc	__LC_LAST_UPDATE_TIMER(8),__LC_SYNC_ENTER_TIMER
+ -	# set up saved register r11
+ -	lg	%r15,__LC_KERNEL_STACK
+ +	# set up saved register 11
+ +	l	%r15,__LC_KERNEL_STACK
+  	la	%r9,STACK_FRAME_OVERHEAD(%r15)
+ -	stg	%r9,24(%r11)		# r11 pt_regs pointer
+ +	st	%r9,12(%r11)		# r11 pt_regs pointer
+  	# fill pt_regs
+ -	mvc	__PT_R8(64,%r9),__LC_SAVE_AREA_SYNC
+ -	stmg	%r0,%r7,__PT_R0(%r9)
+ -	mvc	__PT_PSW(16,%r9),__LC_SVC_OLD_PSW
+ +	mvc	__PT_R8(32,%r9),__LC_SAVE_AREA_SYNC
+ +	stm	%r0,%r7,__PT_R0(%r9)
+ +	mvc	__PT_PSW(8,%r9),__LC_SVC_OLD_PSW
+  	mvc	__PT_INT_CODE(4,%r9),__LC_SVC_ILC
+ -	xc	__PT_FLAGS(8,%r9),__PT_FLAGS(%r9)
+ -	mvi	__PT_FLAGS+7(%r9),_PIF_SYSCALL
+ -	# setup saved register r15
+ -	stg	%r15,56(%r11)		# r15 stack pointer
+ +	# setup saved register 15
+ +	st	%r15,28(%r11)		# r15 stack pointer
+  	# set new psw address and exit
+++<<<<<<< HEAD
+ +	l	%r9,BASED(cleanup_table+4)	# sysc_do_svc + 0x80000000
+ +	br	%r14
+ +cleanup_system_call_insn:
+ +	.long	system_call + 0x80000000
+ +	.long	sysc_stm + 0x80000000
+ +	.long	sysc_vtime + 0x80000000 + 36
+ +	.long	sysc_vtime + 0x80000000 + 76
+ +
+ +cleanup_sysc_tif:
+ +	l	%r9,BASED(cleanup_table+8)	# sysc_tif + 0x80000000
+ +	br	%r14
+ +
+ +cleanup_sysc_restore:
+ +	cl	%r9,BASED(cleanup_sysc_restore_insn)
+ +	jhe	0f
+ +	l	%r9,12(%r11)		# get saved pointer to pt_regs
+ +	mvc	__LC_RETURN_PSW(8),__PT_PSW(%r9)
+ +	mvc	0(32,%r11),__PT_R8(%r9)
+ +	lm	%r0,%r7,__PT_R0(%r9)
+ +0:	lm	%r8,%r9,__LC_RETURN_PSW
+ +	br	%r14
+ +cleanup_sysc_restore_insn:
+ +	.long	sysc_done - 4 + 0x80000000
+ +
+ +cleanup_io_tif:
+ +	l	%r9,BASED(cleanup_table+20)	# io_tif + 0x80000000
+ +	br	%r14
+ +
+ +cleanup_io_restore:
+ +	cl	%r9,BASED(cleanup_io_restore_insn)
+ +	jhe	0f
+ +	l	%r9,12(%r11)		# get saved r11 pointer to pt_regs
+ +	mvc	__LC_RETURN_PSW(8),__PT_PSW(%r9)
+ +	mvc	0(32,%r11),__PT_R8(%r9)
+ +	lm	%r0,%r7,__PT_R0(%r9)
+ +0:	lm	%r8,%r9,__LC_RETURN_PSW
+ +	br	%r14
+ +cleanup_io_restore_insn:
+ +	.long	io_done - 4 + 0x80000000
+++=======
++ 	larl	%r9,.Lsysc_do_svc
++ 	BR_R11USE_R14
++ .Lcleanup_system_call_insn:
++ 	.quad	system_call
++ 	.quad	.Lsysc_stmg
++ 	.quad	.Lsysc_per
++ 	.quad	.Lsysc_vtime+36
++ 	.quad	.Lsysc_vtime+42
++ .Lcleanup_system_call_const:
++ 	.quad	__TASK_thread
++ 
++ .Lcleanup_sysc_tif:
++ 	larl	%r9,.Lsysc_tif
++ 	BR_R11USE_R14
++ 
++ .Lcleanup_sysc_restore:
++ 	# check if stpt has been executed
++ 	clg	%r9,BASED(.Lcleanup_sysc_restore_insn)
++ 	jh	0f
++ 	mvc	__LC_EXIT_TIMER(8),__LC_ASYNC_ENTER_TIMER
++ 	cghi	%r11,__LC_SAVE_AREA_ASYNC
++ 	je	0f
++ 	mvc	__LC_EXIT_TIMER(8),__LC_MCCK_ENTER_TIMER
++ 0:	clg	%r9,BASED(.Lcleanup_sysc_restore_insn+8)
++ 	je	1f
++ 	lg	%r9,24(%r11)		# get saved pointer to pt_regs
++ 	mvc	__LC_RETURN_PSW(16),__PT_PSW(%r9)
++ 	mvc	0(64,%r11),__PT_R8(%r9)
++ 	lmg	%r0,%r7,__PT_R0(%r9)
++ 1:	lmg	%r8,%r9,__LC_RETURN_PSW
++ 	BR_R11USE_R14
++ .Lcleanup_sysc_restore_insn:
++ 	.quad	.Lsysc_exit_timer
++ 	.quad	.Lsysc_done - 4
++ 
++ .Lcleanup_io_tif:
++ 	larl	%r9,.Lio_tif
++ 	BR_R11USE_R14
++ 
++ .Lcleanup_io_restore:
++ 	# check if stpt has been executed
++ 	clg	%r9,BASED(.Lcleanup_io_restore_insn)
++ 	jh	0f
++ 	mvc	__LC_EXIT_TIMER(8),__LC_MCCK_ENTER_TIMER
++ 0:	clg	%r9,BASED(.Lcleanup_io_restore_insn+8)
++ 	je	1f
++ 	lg	%r9,24(%r11)		# get saved r11 pointer to pt_regs
++ 	mvc	__LC_RETURN_PSW(16),__PT_PSW(%r9)
++ 	mvc	0(64,%r11),__PT_R8(%r9)
++ 	lmg	%r0,%r7,__PT_R0(%r9)
++ 1:	lmg	%r8,%r9,__LC_RETURN_PSW
++ 	BR_R11USE_R14
++ .Lcleanup_io_restore_insn:
++ 	.quad	.Lio_exit_timer
++ 	.quad	.Lio_done - 4
+++>>>>>>> f19fbd5ed642 (s390: introduce execute-trampolines for branches)
+  
+ -.Lcleanup_idle:
+ -	ni	__LC_CPU_FLAGS+7,255-_CIF_ENABLED_WAIT
+ +cleanup_idle:
+  	# copy interrupt clock & cpu timer
+  	mvc	__CLOCK_IDLE_EXIT(8,%r2),__LC_INT_CLOCK
+  	mvc	__TIMER_IDLE_EXIT(8,%r2),__LC_ASYNC_ENTER_TIMER
+@@@ -922,72 -1518,87 +1384,108 @@@
+  	je	0f
+  	mvc	__CLOCK_IDLE_EXIT(8,%r2),__LC_MCCK_CLOCK
+  	mvc	__TIMER_IDLE_EXIT(8,%r2),__LC_MCCK_ENTER_TIMER
+ -0:	# check if stck & stpt have been executed
+ -	clg	%r9,BASED(.Lcleanup_idle_insn)
+ +0:	# check if stck has been executed
+ +	cl	%r9,BASED(cleanup_idle_insn)
+  	jhe	1f
+  	mvc	__CLOCK_IDLE_ENTER(8,%r2),__CLOCK_IDLE_EXIT(%r2)
+ -	mvc	__TIMER_IDLE_ENTER(8,%r2),__TIMER_IDLE_EXIT(%r2)
+ -1:	# calculate idle cycles
+ -#ifdef CONFIG_SMP
+ -	clg	%r9,BASED(.Lcleanup_idle_insn)
+ -	jl	3f
+ -	larl	%r1,smp_cpu_mtid
+ -	llgf	%r1,0(%r1)
+ -	ltgr	%r1,%r1
+ -	jz	3f
+ -	.insn	rsy,0xeb0000000017,%r1,5,__SF_EMPTY+80(%r15)
+ -	larl	%r3,mt_cycles
+ -	ag	%r3,__LC_PERCPU_OFFSET
+ -	la	%r4,__SF_EMPTY+16(%r15)
+ -2:	lg	%r0,0(%r3)
+ -	slg	%r0,0(%r4)
+ -	alg	%r0,64(%r4)
+ -	stg	%r0,0(%r3)
+ -	la	%r3,8(%r3)
+ -	la	%r4,8(%r4)
+ -	brct	%r1,2b
+ -#endif
+ -3:	# account system time going idle
+ -	lg	%r9,__LC_STEAL_TIMER
+ -	alg	%r9,__CLOCK_IDLE_ENTER(%r2)
+ -	slg	%r9,__LC_LAST_UPDATE_CLOCK
+ -	stg	%r9,__LC_STEAL_TIMER
+ +	mvc	__TIMER_IDLE_ENTER(8,%r2),__TIMER_IDLE_EXIT(%r3)
+ +1:	# account system time going idle
+ +	lm	%r9,%r10,__LC_STEAL_TIMER
+ +	ADD64	%r9,%r10,__CLOCK_IDLE_ENTER(%r2)
+ +	SUB64	%r9,%r10,__LC_LAST_UPDATE_CLOCK
+ +	stm	%r9,%r10,__LC_STEAL_TIMER
+  	mvc	__LC_LAST_UPDATE_CLOCK(8),__CLOCK_IDLE_EXIT(%r2)
+ -	lg	%r9,__LC_SYSTEM_TIMER
+ -	alg	%r9,__LC_LAST_UPDATE_TIMER
+ -	slg	%r9,__TIMER_IDLE_ENTER(%r2)
+ -	stg	%r9,__LC_SYSTEM_TIMER
+ +	lm	%r9,%r10,__LC_SYSTEM_TIMER
+ +	ADD64	%r9,%r10,__LC_LAST_UPDATE_TIMER
+ +	SUB64	%r9,%r10,__TIMER_IDLE_ENTER(%r2)
+ +	stm	%r9,%r10,__LC_SYSTEM_TIMER
+  	mvc	__LC_LAST_UPDATE_TIMER(8),__TIMER_IDLE_EXIT(%r2)
+  	# prepare return psw
+++<<<<<<< HEAD
+ +	n	%r8,BASED(cleanup_idle_wait)	# clear irq & wait state bits
+ +	l	%r9,24(%r11)			# return from psw_idle
+ +	br	%r14
+ +cleanup_idle_insn:
+ +	.long	psw_idle_lpsw + 0x80000000
+ +cleanup_idle_wait:
+ +	.long	0xfcfdffff
+++=======
++ 	nihh	%r8,0xfcfd		# clear irq & wait state bits
++ 	lg	%r9,48(%r11)		# return from psw_idle
++ 	BR_R11USE_R14
++ .Lcleanup_idle_insn:
++ 	.quad	.Lpsw_idle_lpsw
++ 
++ .Lcleanup_save_fpu_regs:
++ 	larl	%r9,save_fpu_regs
++ 	BR_R11USE_R14
++ 
++ .Lcleanup_load_fpu_regs:
++ 	larl	%r9,load_fpu_regs
++ 	BR_R11USE_R14
+++>>>>>>> f19fbd5ed642 (s390: introduce execute-trampolines for branches)
+  
+  /*
+   * Integer constants
+   */
+++<<<<<<< HEAD
+ +	.align	4
+ +.Lnr_syscalls:
+ +	.long	NR_syscalls
+ +.Lvtimer_max:
+ +	.quad	0x7fffffffffffffff
+ +
+ +/*
+ + * Symbol constants
+ + */
+ +.Ldo_machine_check:	.long	s390_do_machine_check
+ +.Lhandle_mcck:		.long	s390_handle_mcck
+ +.Ldo_IRQ:		.long	do_IRQ
+ +.Ldo_extint:		.long	do_extint
+ +.Ldo_signal:		.long	do_signal
+ +.Ldo_notify_resume:	.long	do_notify_resume
+ +.Ldo_per_trap:		.long	do_per_trap
+ +.Ljump_table:		.long	pgm_check_table
+ +.Lschedule:		.long	schedule
+ +#ifdef CONFIG_PREEMPT
+ +.Lpreempt_irq:		.long	preempt_schedule_irq
+ +#endif
+ +.Ltrace_enter:		.long	do_syscall_trace_enter
+ +.Ltrace_exit:		.long	do_syscall_trace_exit
+ +.Lschedule_tail:	.long	schedule_tail
+ +.Lsysc_per:		.long	sysc_per + 0x80000000
+ +#ifdef CONFIG_TRACE_IRQFLAGS
+ +.Lhardirqs_on:		.long	trace_hardirqs_on_caller
+ +.Lhardirqs_off:		.long	trace_hardirqs_off_caller
+ +#endif
+ +#ifdef CONFIG_LOCKDEP
+ +.Llockdep_sys_exit:	.long	lockdep_sys_exit
+ +#endif
+ +.Lcritical_start:	.long	__critical_start + 0x80000000
+ +.Lcritical_length:	.long	__critical_end - __critical_start
+ +
+ +		.section .rodata, "a"
+ +#define SYSCALL(esa,esame,emu)	.long esa
+++=======
++ 	.align	8
++ .Lcritical_start:
++ 	.quad	.L__critical_start
++ .Lcritical_length:
++ 	.quad	.L__critical_end - .L__critical_start
++ #if IS_ENABLED(CONFIG_KVM)
++ .Lsie_critical_start:
++ 	.quad	.Lsie_gmap
++ .Lsie_critical_length:
++ 	.quad	.Lsie_done - .Lsie_gmap
++ .Lsie_crit_mcck_start:
++ 	.quad   .Lsie_entry
++ .Lsie_crit_mcck_length:
++ 	.quad   .Lsie_skip - .Lsie_entry
++ #endif
++ 	.section .rodata, "a"
++ #define SYSCALL(esame,emu)	.long esame
+++>>>>>>> f19fbd5ed642 (s390: introduce execute-trampolines for branches)
+  	.globl	sys_call_table
+  sys_call_table:
+ -#include "asm/syscall_table.h"
+ +#include "syscalls.S"
+  #undef SYSCALL
+ -
+ -#ifdef CONFIG_COMPAT
+ -
+ -#define SYSCALL(esame,emu)	.long emu
+ -	.globl	sys_call_table_emu
+ -sys_call_table_emu:
+ -#include "asm/syscall_table.h"
+ -#undef SYSCALL
+ -#endif
+diff --cc arch/s390/kernel/module.c
+index 5fb5da4560c2,1fc6d1ff92d3..000000000000
+--- a/arch/s390/kernel/module.c
++++ b/arch/s390/kernel/module.c
+@@@ -170,11 -154,15 +172,23 @@@ int module_frob_arch_sections(Elf_Ehdr 
+  
+  	/* Increase core size by size of got & plt and set start
+  	   offsets for got and plt. */
+++<<<<<<< HEAD
+ +	me->core_size = ALIGN(me->core_size, 4);
+ +	me->arch.got_offset = me->core_size;
+ +	me->core_size += me->arch.got_size;
+ +	me->arch.plt_offset = me->core_size;
+ +	me->core_size += me->arch.plt_size;
+++=======
++ 	me->core_layout.size = ALIGN(me->core_layout.size, 4);
++ 	me->arch.got_offset = me->core_layout.size;
++ 	me->core_layout.size += me->arch.got_size;
++ 	me->arch.plt_offset = me->core_layout.size;
++ 	if (me->arch.plt_size) {
++ 		if (IS_ENABLED(CONFIG_EXPOLINE) && !nospec_call_disable)
++ 			me->arch.plt_size += PLT_ENTRY_SIZE;
++ 		me->core_layout.size += me->arch.plt_size;
++ 	}
+++>>>>>>> f19fbd5ed642 (s390: introduce execute-trampolines for branches)
+  	return 0;
+  }
+  
+@@@ -326,19 -314,25 +340,37 @@@ static int apply_rela(Elf_Rela *rela, E
+  	case R_390_PLTOFF64:	/* 16 bit offset from GOT to PLT. */
+  		if (info->plt_initialized == 0) {
+  			unsigned int *ip;
+ -			ip = me->core_layout.base + me->arch.plt_offset +
+ +			ip = me->module_core + me->arch.plt_offset +
+  				info->plt_offset;
+++<<<<<<< HEAD
+ +#ifndef CONFIG_64BIT
+ +			ip[0] = 0x0d105810; /* basr 1,0; l 1,6(1); br 1 */
+ +			ip[1] = 0x100607f1;
+ +			ip[2] = val;
+ +#else /* CONFIG_64BIT */
+ +			ip[0] = 0x0d10e310; /* basr 1,0; lg 1,10(1); br 1 */
+ +			ip[1] = 0x100a0004;
+ +			ip[2] = 0x07f10000;
+++=======
++ 			ip[0] = 0x0d10e310;	/* basr 1,0  */
++ 			ip[1] = 0x100a0004;	/* lg	1,10(1) */
++ 			if (IS_ENABLED(CONFIG_EXPOLINE) &&
++ 			    !nospec_call_disable) {
++ 				unsigned int *ij;
++ 				ij = me->core_layout.base +
++ 					me->arch.plt_offset +
++ 					me->arch.plt_size - PLT_ENTRY_SIZE;
++ 				ip[2] = 0xa7f40000 +	/* j __jump_r1 */
++ 					(unsigned int)(u16)
++ 					(((unsigned long) ij - 8 -
++ 					  (unsigned long) ip) / 2);
++ 			} else {
++ 				ip[2] = 0x07f10000;	/* br %r1 */
++ 			}
+++>>>>>>> f19fbd5ed642 (s390: introduce execute-trampolines for branches)
+  			ip[3] = (unsigned int) (val >> 32);
+  			ip[4] = (unsigned int) val;
+ +#endif /* CONFIG_64BIT */
+  			info->plt_initialized = 1;
+  		}
+  		if (r_type == R_390_PLTOFF16 ||
+@@@ -442,18 -436,44 +474,48 @@@ int module_finalize(const Elf_Ehdr *hdr
+  		    struct module *me)
+  {
+  	const Elf_Shdr *s;
+++<<<<<<< HEAD
+ +	char *secstrings = (void *)hdr + sechdrs[hdr->e_shstrndx].sh_offset;
+++=======
++ 	char *secstrings, *secname;
++ 	void *aseg;
++ 
++ 	if (IS_ENABLED(CONFIG_EXPOLINE) &&
++ 	    !nospec_call_disable && me->arch.plt_size) {
++ 		unsigned int *ij;
++ 
++ 		ij = me->core_layout.base + me->arch.plt_offset +
++ 			me->arch.plt_size - PLT_ENTRY_SIZE;
++ 		if (test_facility(35)) {
++ 			ij[0] = 0xc6000000;	/* exrl	%r0,.+10	*/
++ 			ij[1] = 0x0005a7f4;	/* j	.		*/
++ 			ij[2] = 0x000007f1;	/* br	%r1		*/
++ 		} else {
++ 			ij[0] = 0x44000000 | (unsigned int)
++ 				offsetof(struct lowcore, br_r1_trampoline);
++ 			ij[1] = 0xa7f40000;	/* j	.		*/
++ 		}
++ 	}
+++>>>>>>> f19fbd5ed642 (s390: introduce execute-trampolines for branches)
+  
+ -	secstrings = (void *)hdr + sechdrs[hdr->e_shstrndx].sh_offset;
+  	for (s = sechdrs; s < sechdrs + hdr->e_shnum; s++) {
+- 		if (!strcmp(".altinstructions", secstrings + s->sh_name)) {
+- 			/* patch .altinstructions */
+- 			void *aseg = (void *)s->sh_addr;
++ 		aseg = (void *) s->sh_addr;
++ 		secname = secstrings + s->sh_name;
+  
++ 		if (!strcmp(".altinstructions", secname))
++ 			/* patch .altinstructions */
+  			apply_alternatives(aseg, aseg + s->sh_size);
+- 		}
++ 
++ 		if (IS_ENABLED(CONFIG_EXPOLINE) &&
++ 		    (!strcmp(".nospec_call_table", secname)))
++ 			nospec_call_revert(aseg, aseg + s->sh_size);
++ 
++ 		if (IS_ENABLED(CONFIG_EXPOLINE) &&
++ 		    (!strcmp(".nospec_return_table", secname)))
++ 			nospec_return_revert(aseg, aseg + s->sh_size);
+  	}
+  
+ -	jump_label_apply_nops(me);
+ +	vfree(me->arch.syminfo);
+ +	me->arch.syminfo = NULL;
+  	return 0;
+  }
+diff --cc arch/s390/kernel/smp.c
+index 8eca5b44a73a,a4a9fe1934e9..000000000000
+--- a/arch/s390/kernel/smp.c
++++ b/arch/s390/kernel/smp.c
+@@@ -219,23 -209,16 +219,30 @@@ static int pcpu_alloc_lowcore(struct pc
+  	lc = pcpu->lowcore;
+  	memcpy(lc, &S390_lowcore, 512);
+  	memset((char *) lc + 512, 0, sizeof(*lc) - 512);
+ -	lc->async_stack = async_stack + ASYNC_FRAME_OFFSET;
+ -	lc->panic_stack = panic_stack + PANIC_FRAME_OFFSET;
+ +	lc->async_stack = pcpu->async_stack + ASYNC_SIZE
+ +		- STACK_FRAME_OVERHEAD - sizeof(struct pt_regs);
+ +	lc->panic_stack = pcpu->panic_stack + PAGE_SIZE
+ +		- STACK_FRAME_OVERHEAD - sizeof(struct pt_regs);
+ +	lc->mcesad = mcesa_origin | mcesa_bits;
+  	lc->cpu_nr = cpu;
+  	lc->spinlock_lockval = arch_spin_lockval(cpu);
+++<<<<<<< HEAD
+ +#ifndef CONFIG_64BIT
+ +	if (MACHINE_HAS_IEEE) {
+ +		lc->extended_save_area_addr = get_zeroed_page(GFP_KERNEL);
+ +		if (!lc->extended_save_area_addr)
+ +			goto out;
+ +	}
+ +#else
+++=======
++ 	lc->spinlock_index = 0;
++ 	lc->br_r1_trampoline = 0x07f1;	/* br %r1 */
++ 	if (nmi_alloc_per_cpu(lc))
++ 		goto out;
+++>>>>>>> f19fbd5ed642 (s390: introduce execute-trampolines for branches)
+  	if (vdso_alloc_per_cpu(lc))
+ -		goto out_mcesa;
+ +		goto out;
+ +#endif
+  	lowcore_ptr[cpu] = lc;
+  	pcpu_sigp_retry(pcpu, SIGP_SET_PREFIX, (u32)(unsigned long) lc);
+  	return 0;
+diff --cc drivers/s390/char/Makefile
+index f58b758e2f01,a2b33a22c82a..000000000000
+--- a/drivers/s390/char/Makefile
++++ b/drivers/s390/char/Makefile
+@@@ -2,9 -3,27 +2,30 @@@
+  # S/390 character devices
+  #
+  
+++<<<<<<< HEAD
+++=======
++ ifdef CONFIG_FUNCTION_TRACER
++ # Do not trace early setup code
++ CFLAGS_REMOVE_sclp_early_core.o	= $(CC_FLAGS_FTRACE)
++ endif
++ 
++ GCOV_PROFILE_sclp_early_core.o		:= n
++ KCOV_INSTRUMENT_sclp_early_core.o	:= n
++ UBSAN_SANITIZE_sclp_early_core.o	:= n
++ 
++ ifneq ($(CC_FLAGS_MARCH),-march=z900)
++ CFLAGS_REMOVE_sclp_early_core.o	+= $(CC_FLAGS_MARCH)
++ CFLAGS_sclp_early_core.o		+= -march=z900
++ endif
++ 
++ CFLAGS_sclp_early_core.o		+= -D__NO_FORTIFY
++ 
++ CFLAGS_REMOVE_sclp_early_core.o	+= $(CC_FLAGS_EXPOLINE)
++ 
+++>>>>>>> f19fbd5ed642 (s390: introduce execute-trampolines for branches)
+  obj-y += ctrlchar.o keyboard.o defkeymap.o sclp.o sclp_rw.o sclp_quiesce.o \
+  	 sclp_cmd.o sclp_config.o sclp_cpi_sys.o sclp_ocf.o sclp_ctl.o \
+ -	 sclp_early.o sclp_early_core.o
+ +	 sclp_early.o
+  
+  obj-$(CONFIG_TN3270) += raw3270.o
+  obj-$(CONFIG_TN3270_CONSOLE) += con3270.o
+* Unmerged path arch/s390/Kconfig
+* Unmerged path arch/s390/Makefile
+* Unmerged path arch/s390/include/asm/lowcore.h
+diff --git a/arch/s390/include/asm/nospec-branch.h b/arch/s390/include/asm/nospec-branch.h
+new file mode 100644
+index 000000000000..7df48e5cf36f
+--- /dev/null
++++ b/arch/s390/include/asm/nospec-branch.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _ASM_S390_EXPOLINE_H
++#define _ASM_S390_EXPOLINE_H
++
++#ifndef __ASSEMBLY__
++
++#include <linux/types.h>
++
++extern int nospec_call_disable;
++extern int nospec_return_disable;
++
++void nospec_init_branches(void);
++void nospec_call_revert(s32 *start, s32 *end);
++void nospec_return_revert(s32 *start, s32 *end);
++
++#endif /* __ASSEMBLY__ */
++
++#endif /* _ASM_S390_EXPOLINE_H */
+* Unmerged path arch/s390/kernel/Makefile
+* Unmerged path arch/s390/kernel/entry.S
+* Unmerged path arch/s390/kernel/module.c
+diff --git a/arch/s390/kernel/nospec-branch.c b/arch/s390/kernel/nospec-branch.c
+new file mode 100644
+index 000000000000..69d7fcf48158
+--- /dev/null
++++ b/arch/s390/kernel/nospec-branch.c
+@@ -0,0 +1,100 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/module.h>
++#include <asm/nospec-branch.h>
++
++int nospec_call_disable = IS_ENABLED(EXPOLINE_OFF);
++int nospec_return_disable = !IS_ENABLED(EXPOLINE_FULL);
++
++static int __init nospectre_v2_setup_early(char *str)
++{
++	nospec_call_disable = 1;
++	nospec_return_disable = 1;
++	return 0;
++}
++early_param("nospectre_v2", nospectre_v2_setup_early);
++
++static int __init spectre_v2_setup_early(char *str)
++{
++	if (str && !strncmp(str, "on", 2)) {
++		nospec_call_disable = 0;
++		nospec_return_disable = 0;
++	}
++	if (str && !strncmp(str, "off", 3)) {
++		nospec_call_disable = 1;
++		nospec_return_disable = 1;
++	}
++	if (str && !strncmp(str, "auto", 4)) {
++		nospec_call_disable = 0;
++		nospec_return_disable = 1;
++	}
++	return 0;
++}
++early_param("spectre_v2", spectre_v2_setup_early);
++
++static void __init_or_module __nospec_revert(s32 *start, s32 *end)
++{
++	enum { BRCL_EXPOLINE, BRASL_EXPOLINE } type;
++	u8 *instr, *thunk, *br;
++	u8 insnbuf[6];
++	s32 *epo;
++
++	/* Second part of the instruction replace is always a nop */
++	memcpy(insnbuf + 2, (char[]) { 0x47, 0x00, 0x00, 0x00 }, 4);
++	for (epo = start; epo < end; epo++) {
++		instr = (u8 *) epo + *epo;
++		if (instr[0] == 0xc0 && (instr[1] & 0x0f) == 0x04)
++			type = BRCL_EXPOLINE;	/* brcl instruction */
++		else if (instr[0] == 0xc0 && (instr[1] & 0x0f) == 0x05)
++			type = BRASL_EXPOLINE;	/* brasl instruction */
++		else
++			continue;
++		thunk = instr + (*(int *)(instr + 2)) * 2;
++		if (thunk[0] == 0xc6 && thunk[1] == 0x00)
++			/* exrl %r0,<target-br> */
++			br = thunk + (*(int *)(thunk + 2)) * 2;
++		else if (thunk[0] == 0xc0 && (thunk[1] & 0x0f) == 0x00 &&
++			 thunk[6] == 0x44 && thunk[7] == 0x00 &&
++			 (thunk[8] & 0x0f) == 0x00 && thunk[9] == 0x00 &&
++			 (thunk[1] & 0xf0) == (thunk[8] & 0xf0))
++			/* larl %rx,<target br> + ex %r0,0(%rx) */
++			br = thunk + (*(int *)(thunk + 2)) * 2;
++		else
++			continue;
++		if (br[0] != 0x07 || (br[1] & 0xf0) != 0xf0)
++			continue;
++		switch (type) {
++		case BRCL_EXPOLINE:
++			/* brcl to thunk, replace with br + nop */
++			insnbuf[0] = br[0];
++			insnbuf[1] = (instr[1] & 0xf0) | (br[1] & 0x0f);
++			break;
++		case BRASL_EXPOLINE:
++			/* brasl to thunk, replace with basr + nop */
++			insnbuf[0] = 0x0d;
++			insnbuf[1] = (instr[1] & 0xf0) | (br[1] & 0x0f);
++			break;
++		}
++
++		s390_kernel_write(instr, insnbuf, 6);
++	}
++}
++
++void __init_or_module nospec_call_revert(s32 *start, s32 *end)
++{
++	if (nospec_call_disable)
++		__nospec_revert(start, end);
++}
++
++void __init_or_module nospec_return_revert(s32 *start, s32 *end)
++{
++	if (nospec_return_disable)
++		__nospec_revert(start, end);
++}
++
++extern s32 __nospec_call_start[], __nospec_call_end[];
++extern s32 __nospec_return_start[], __nospec_return_end[];
++void __init nospec_init_branches(void)
++{
++	nospec_call_revert(__nospec_call_start, __nospec_call_end);
++	nospec_return_revert(__nospec_return_start, __nospec_return_end);
++}
+diff --git a/arch/s390/kernel/setup.c b/arch/s390/kernel/setup.c
+index d6e8e87b465f..b6f475577f62 100644
+--- a/arch/s390/kernel/setup.c
++++ b/arch/s390/kernel/setup.c
+@@ -62,6 +62,7 @@
+ #include <asm/os_info.h>
+ #include <asm/sclp.h>
+ #include <asm/alternative.h>
++#include <asm/nospec-branch.h>
+ #include "entry.h"
+ 
+ /*
+@@ -390,6 +391,7 @@ static void __init setup_lowcore(void)
+ #ifdef CONFIG_SMP
+ 	lc->spinlock_lockval = arch_spin_lockval(0);
+ #endif
++	lc->br_r1_trampoline = 0x07f1;	/* br %r1 */
+ 
+ 	set_prefix((u32)(unsigned long) lc);
+ 	lowcore_ptr[0] = lc;
+@@ -1073,6 +1075,8 @@ void __init setup_arch(char **cmdline_p)
+ 	set_preferred_console();
+ 
+ 	apply_alternative_instructions();
++	if (IS_ENABLED(CONFIG_EXPOLINE))
++		nospec_init_branches();
+ 
+ 	/* Setup zfcpdump support */
+ 	setup_zfcpdump();
+* Unmerged path arch/s390/kernel/smp.c
+diff --git a/arch/s390/kernel/vmlinux.lds.S b/arch/s390/kernel/vmlinux.lds.S
+index b7ea9abac37c..164d386ef1a5 100644
+--- a/arch/s390/kernel/vmlinux.lds.S
++++ b/arch/s390/kernel/vmlinux.lds.S
+@@ -126,6 +126,20 @@ SECTIONS
+ 		*(.altinstr_replacement)
+ 	}
+ 
++	/*
++	 * Table with the patch locations to undo expolines
++	*/
++	.nospec_call_table : {
++		__nospec_call_start = . ;
++		*(.s390_indirect*)
++		__nospec_call_end = . ;
++	}
++	.nospec_return_table : {
++		__nospec_return_start = . ;
++		*(.s390_return*)
++		__nospec_return_end = . ;
++	}
++
+ 	/* early.c uses stsi, which requires page aligned data. */
+ 	. = ALIGN(PAGE_SIZE);
+ 	INIT_DATA_SECTION(0x100)
+* Unmerged path drivers/s390/char/Makefile
