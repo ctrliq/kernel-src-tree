@@ -1,0 +1,2168 @@
+blk-mq-sched: add framework for MQ capable IO schedulers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit bd166ef183c263c5ced656d49ef19c7da4adc774
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/bd166ef1.failed
+
+This adds a set of hooks that intercepts the blk-mq path of
+allocating/inserting/issuing/completing requests, allowing
+us to develop a scheduler within that framework.
+
+We reuse the existing elevator scheduler API on the registration
+side, but augment that with the scheduler flagging support for
+the blk-mq interfce, and with a separate set of ops hooks for MQ
+devices.
+
+We split driver and scheduler tags, so we can run the scheduling
+independently of device queue depth.
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+	Reviewed-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Reviewed-by: Omar Sandoval <osandov@fb.com>
+(cherry picked from commit bd166ef183c263c5ced656d49ef19c7da4adc774)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/Makefile
+#	block/blk-cgroup.c
+#	block/blk-core.c
+#	block/blk-ioc.c
+#	block/blk-merge.c
+#	block/blk-mq.c
+#	block/blk-mq.h
+#	block/elevator.c
+#	include/linux/elevator.h
+diff --cc block/Makefile
+index 578954ad1cb9,2eee9e1bb6db..000000000000
+--- a/block/Makefile
++++ b/block/Makefile
+@@@ -2,14 -2,15 +2,21 @@@
+  # Makefile for the kernel block layer
+  #
+  
+ -obj-$(CONFIG_BLOCK) := bio.o elevator.o blk-core.o blk-tag.o blk-sysfs.o \
+ +obj-$(CONFIG_BLOCK) := elevator.o blk-core.o blk-tag.o blk-sysfs.o \
+  			blk-flush.o blk-settings.o blk-ioc.o blk-map.o \
+  			blk-exec.o blk-merge.o blk-softirq.o blk-timeout.o \
+++<<<<<<< HEAD
+ +			blk-lib.o blk-mq.o blk-mq-tag.o \
+ +			blk-mq-sysfs.o blk-mq-cpu.o blk-mq-cpumap.o ioctl.o \
+ +			genhd.o scsi_ioctl.o partition-generic.o partitions/ \
+ +			badblocks.o
+++=======
++ 			blk-lib.o blk-mq.o blk-mq-tag.o blk-stat.o \
++ 			blk-mq-sysfs.o blk-mq-cpumap.o blk-mq-sched.o ioctl.o \
++ 			genhd.o scsi_ioctl.o partition-generic.o ioprio.o \
++ 			badblocks.o partitions/
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  
+ -obj-$(CONFIG_BOUNCE)	+= bounce.o
+  obj-$(CONFIG_BLK_DEV_BSG)	+= bsg.o
+  obj-$(CONFIG_BLK_DEV_BSGLIB)	+= bsg-lib.o
+  obj-$(CONFIG_BLK_CGROUP)	+= blk-cgroup.o
+diff --cc block/blk-cgroup.c
+index 61f595f4525f,2630f64bed19..000000000000
+--- a/block/blk-cgroup.c
++++ b/block/blk-cgroup.c
+@@@ -946,59 -1223,20 +946,71 @@@ int blkcg_activate_policy(struct reques
+  	if (blkcg_policy_enabled(q, pol))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	/* preallocations for root blkg */
+ +	new_blkg = blkg_alloc(&blkcg_root, q, GFP_KERNEL);
+ +	if (!new_blkg)
+ +		return -ENOMEM;
+ +
+ +	blk_queue_bypass_start(q);
+ +
+ +	preloaded = !radix_tree_preload(GFP_KERNEL);
+ +
+ +	/*
+ +	 * Make sure the root blkg exists and count the existing blkgs.  As
+ +	 * @q is bypassing at this point, blkg_lookup_create() can't be
+ +	 * used.  Open code it.
+ +	 */
+ +	spin_lock_irq(q->queue_lock);
+ +
+ +	rcu_read_lock();
+ +	blkg = __blkg_lookup(&blkcg_root, q, false);
+ +	if (blkg)
+ +		blkg_free(new_blkg);
+ +	else
+ +		blkg = blkg_create(&blkcg_root, q, new_blkg);
+ +	rcu_read_unlock();
+ +
+ +	if (preloaded)
+ +		radix_tree_preload_end();
+ +
+ +	if (IS_ERR(blkg)) {
+ +		ret = PTR_ERR(blkg);
+ +		goto out_unlock;
+ +	}
+ +	q->root_blkg = blkg;
+ +	q->root_rl.blkg = blkg;
+ +
+ +	list_for_each_entry(blkg, &q->blkg_list, q_node)
+ +		cnt++;
+ +
+ +	spin_unlock_irq(q->queue_lock);
+ +
+ +	/* allocate policy_data for all existing blkgs */
+ +	while (cnt--) {
+ +		pd = kzalloc_node(pol->pd_size, GFP_KERNEL, q->node);
+ +		if (!pd) {
+++=======
++ 	if (q->mq_ops) {
++ 		blk_mq_freeze_queue(q);
++ 		blk_mq_quiesce_queue(q);
++ 	} else
++ 		blk_queue_bypass_start(q);
++ pd_prealloc:
++ 	if (!pd_prealloc) {
++ 		pd_prealloc = pol->pd_alloc_fn(GFP_KERNEL, q->node);
++ 		if (!pd_prealloc) {
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  			ret = -ENOMEM;
+ -			goto out_bypass_end;
+ +			goto out_free;
+  		}
+ +		list_add_tail(&pd->alloc_node, &pds);
+  	}
+  
+ +	/*
+ +	 * Install the allocated pds.  With @q bypassing, no new blkg
+ +	 * should have been created while the queue lock was dropped.
+ +	 */
+  	spin_lock_irq(q->queue_lock);
+  
+  	list_for_each_entry(blkg, &q->blkg_list, q_node) {
+@@@ -1023,12 -1262,15 +1035,22 @@@
+  
+  	__set_bit(pol->plid, q->blkcg_pols);
+  	ret = 0;
+ -
+ +out_unlock:
+  	spin_unlock_irq(q->queue_lock);
+++<<<<<<< HEAD
+ +out_free:
+ +	blk_queue_bypass_end(q);
+ +	list_for_each_entry_safe(pd, n, &pds, alloc_node)
+ +		kfree(pd);
+++=======
++ out_bypass_end:
++ 	if (q->mq_ops)
++ 		blk_mq_unfreeze_queue(q);
++ 	else
++ 		blk_queue_bypass_end(q);
++ 	if (pd_prealloc)
++ 		pol->pd_free_fn(pd_prealloc);
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  	return ret;
+  }
+  EXPORT_SYMBOL_GPL(blkcg_activate_policy);
+diff --cc block/blk-core.c
+index 9db4ccd0b9a5,a61f1407f4f6..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -37,8 -38,9 +37,13 @@@
+  #include <trace/events/block.h>
+  
+  #include "blk.h"
+ +#include "blk-cgroup.h"
+  #include "blk-mq.h"
+++<<<<<<< HEAD
+++=======
++ #include "blk-mq-sched.h"
++ #include "blk-wbt.h"
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  
+  EXPORT_TRACEPOINT_SYMBOL_GPL(block_bio_remap);
+  EXPORT_TRACEPOINT_SYMBOL_GPL(block_rq_remap);
+diff --cc block/blk-ioc.c
+index 3be61baa1810,fe186a9eade9..000000000000
+--- a/block/blk-ioc.c
++++ b/block/blk-ioc.c
+@@@ -44,8 -43,10 +44,15 @@@ static void ioc_exit_icq(struct io_cq *
+  	if (icq->flags & ICQ_EXITED)
+  		return;
+  
+++<<<<<<< HEAD
+ +	if (et->ops.elevator_exit_icq_fn)
+ +		et->ops.elevator_exit_icq_fn(icq);
+++=======
++ 	if (et->uses_mq && et->ops.mq.exit_icq)
++ 		et->ops.mq.exit_icq(icq);
++ 	else if (!et->uses_mq && et->ops.sq.elevator_exit_icq_fn)
++ 		et->ops.sq.elevator_exit_icq_fn(icq);
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  
+  	icq->flags |= ICQ_EXITED;
+  }
+@@@ -383,8 -385,10 +390,15 @@@ struct io_cq *ioc_create_icq(struct io_
+  	if (likely(!radix_tree_insert(&ioc->icq_tree, q->id, icq))) {
+  		hlist_add_head(&icq->ioc_node, &ioc->icq_list);
+  		list_add(&icq->q_node, &q->icq_list);
+++<<<<<<< HEAD
+ +		if (et->ops.elevator_init_icq_fn)
+ +			et->ops.elevator_init_icq_fn(icq);
+++=======
++ 		if (et->uses_mq && et->ops.mq.init_icq)
++ 			et->ops.mq.init_icq(icq);
++ 		else if (!et->uses_mq && et->ops.sq.elevator_init_icq_fn)
++ 			et->ops.sq.elevator_init_icq_fn(icq);
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  	} else {
+  		kmem_cache_free(et->icq_cache, icq);
+  		icq = ioc_lookup_icq(ioc, q);
+diff --cc block/blk-merge.c
+index 0e8b7f203168,6aa43dec5af4..000000000000
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@@ -536,6 -761,12 +536,15 @@@ int attempt_front_merge(struct request_
+  int blk_attempt_req_merge(struct request_queue *q, struct request *rq,
+  			  struct request *next)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct elevator_queue *e = q->elevator;
++ 
++ 	if (!e->uses_mq && e->type->ops.sq.elevator_allow_rq_merge_fn)
++ 		if (!e->type->ops.sq.elevator_allow_rq_merge_fn(q, rq, next))
++ 			return 0;
++ 
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  	return attempt_merge(q, rq, next);
+  }
+  
+diff --cc block/blk-mq.c
+index 5b92b7659b74,45e1707a9f86..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -29,6 -30,9 +29,12 @@@
+  #include "blk.h"
+  #include "blk-mq.h"
+  #include "blk-mq-tag.h"
+++<<<<<<< HEAD
+++=======
++ #include "blk-stat.h"
++ #include "blk-wbt.h"
++ #include "blk-mq-sched.h"
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  
+  static DEFINE_MUTEX(all_q_mutex);
+  static LIST_HEAD(all_q_list);
+@@@ -40,24 -42,11 +46,30 @@@ static void __blk_mq_run_hw_queue(struc
+   */
+  static bool blk_mq_hctx_has_pending(struct blk_mq_hw_ctx *hctx)
+  {
+++<<<<<<< HEAD
+ +	unsigned int i;
+ +
+ +	for (i = 0; i < hctx->ctx_map.size; i++)
+ +		if (hctx->ctx_map.map[i].word)
+ +			return true;
+ +
+ +	return false;
+++=======
++ 	return sbitmap_any_bit_set(&hctx->ctx_map) ||
++ 			!list_empty_careful(&hctx->dispatch) ||
++ 			blk_mq_sched_has_work(hctx);
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  }
+  
+ +static inline struct blk_align_bitmap *get_bm(struct blk_mq_hw_ctx *hctx,
+ +					      struct blk_mq_ctx *ctx)
+ +{
+ +	return &hctx->ctx_map.map[ctx->index_hw / hctx->ctx_map.bits_per_word];
+ +}
+ +
+ +#define CTX_TO_BIT(hctx, ctx)	\
+ +	((ctx)->index_hw & ((hctx)->ctx_map.bits_per_word - 1))
+ +
+  /*
+   * Mark this ctx as having pending work in this hardware queue
+   */
+@@@ -251,15 -226,24 +263,33 @@@ __blk_mq_alloc_request(struct blk_mq_al
+  
+  	tag = blk_mq_get_tag(data);
+  	if (tag != BLK_MQ_TAG_FAIL) {
+++<<<<<<< HEAD
+ +		rq = data->hctx->tags->rqs[tag];
+++=======
++ 		struct blk_mq_tags *tags = blk_mq_tags_from_data(data);
++ 
++ 		rq = tags->static_rqs[tag];
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  
+  		if (blk_mq_tag_busy(data->hctx)) {
+ -			rq->rq_flags = RQF_MQ_INFLIGHT;
+ +			rq->cmd_flags = REQ_MQ_INFLIGHT;
+  			atomic_inc(&data->hctx->nr_active);
+  		}
+  
+++<<<<<<< HEAD
+ +		rq->tag = tag;
+ +		blk_mq_rq_ctx_init(data->q, data->ctx, rq, rw);
+++=======
++ 		if (data->flags & BLK_MQ_REQ_INTERNAL) {
++ 			rq->tag = -1;
++ 			rq->internal_tag = tag;
++ 		} else {
++ 			rq->tag = tag;
++ 			rq->internal_tag = -1;
++ 		}
++ 
++ 		blk_mq_rq_ctx_init(data->q, data->ctx, rq, op);
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  		return rq;
+  	}
+  
+@@@ -279,26 -262,17 +307,40 @@@ struct request *blk_mq_alloc_request(st
+  	if (ret)
+  		return ERR_PTR(ret);
+  
+++<<<<<<< HEAD
+ +	ctx = blk_mq_get_ctx(q);
+ +	hctx = q->mq_ops->map_queue(q, ctx->cpu);
+ +	blk_mq_set_alloc_data(&alloc_data, q, flags, ctx, hctx);
+ +
+ +	rq = __blk_mq_alloc_request(&alloc_data, rw);
+ +	if (!rq && !(flags & BLK_MQ_REQ_NOWAIT)) {
+ +		__blk_mq_run_hw_queue(hctx);
+ +		blk_mq_put_ctx(ctx);
+ +
+ +		ctx = blk_mq_get_ctx(q);
+ +		hctx = q->mq_ops->map_queue(q, ctx->cpu);
+ +		blk_mq_set_alloc_data(&alloc_data, q, flags, ctx, hctx);
+ +		rq =  __blk_mq_alloc_request(&alloc_data, rw);
+ +		ctx = alloc_data.ctx;
+ +	}
+ +	blk_mq_put_ctx(ctx);
+ +	if (!rq) {
+ +		blk_queue_exit(q);
+ +		return ERR_PTR(-EWOULDBLOCK);
+ +	}
+++=======
++ 	rq = blk_mq_sched_get_request(q, NULL, rw, &alloc_data);
++ 
++ 	blk_mq_put_ctx(alloc_data.ctx);
++ 	blk_queue_exit(q);
++ 
++ 	if (!rq)
++ 		return ERR_PTR(-EWOULDBLOCK);
++ 
++ 	rq->__data_len = 0;
++ 	rq->__sector = (sector_t) -1;
++ 	rq->bio = rq->biotail = NULL;
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  	return rq;
+  }
+  EXPORT_SYMBOL(blk_mq_alloc_request);
+@@@ -354,18 -328,24 +396,31 @@@ out_queue_exit
+  }
+  EXPORT_SYMBOL_GPL(blk_mq_alloc_request_hctx);
+  
+++<<<<<<< HEAD
+ +static void __blk_mq_free_request(struct blk_mq_hw_ctx *hctx,
+ +				  struct blk_mq_ctx *ctx, struct request *rq)
+++=======
++ void __blk_mq_finish_request(struct blk_mq_hw_ctx *hctx, struct blk_mq_ctx *ctx,
++ 			     struct request *rq)
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  {
+- 	const int tag = rq->tag;
++ 	const int sched_tag = rq->internal_tag;
+  	struct request_queue *q = rq->q;
+  
+ -	if (rq->rq_flags & RQF_MQ_INFLIGHT)
+ +	if (rq->cmd_flags & REQ_MQ_INFLIGHT)
+  		atomic_dec(&hctx->nr_active);
+ -
+ -	wbt_done(q->rq_wb, &rq->issue_stat);
+ -	rq->rq_flags = 0;
+ +	rq->cmd_flags = 0;
+  
+  	clear_bit(REQ_ATOM_STARTED, &rq->atomic_flags);
+++<<<<<<< HEAD
+ +	blk_mq_put_tag(hctx, tag, &ctx->last_tag);
+++=======
++ 	clear_bit(REQ_ATOM_POLL_SLEPT, &rq->atomic_flags);
++ 	if (rq->tag != -1)
++ 		blk_mq_put_tag(hctx, hctx->tags, ctx, rq->tag);
++ 	if (sched_tag != -1)
++ 		blk_mq_sched_completed_request(hctx, rq);
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  	blk_queue_exit(q);
+  }
+  
+@@@ -380,11 -365,7 +440,15 @@@ void blk_mq_finish_request(struct reque
+  
+  void blk_mq_free_request(struct request *rq)
+  {
+++<<<<<<< HEAD
+ +	struct blk_mq_hw_ctx *hctx;
+ +	struct request_queue *q = rq->q;
+ +
+ +	hctx = q->mq_ops->map_queue(q, rq->mq_ctx->cpu);
+ +	blk_mq_free_hctx_request(hctx, rq);
+++=======
++ 	blk_mq_sched_put_request(rq);
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  }
+  EXPORT_SYMBOL_GPL(blk_mq_free_request);
+  
+@@@ -534,6 -532,8 +600,11 @@@ static void __blk_mq_requeue_request(st
+  	struct request_queue *q = rq->q;
+  
+  	trace_block_rq_requeue(q, rq);
+++<<<<<<< HEAD
+++=======
++ 	wbt_requeue(q->rq_wb, &rq->issue_stat);
++ 	blk_mq_sched_requeue_request(rq);
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  
+  	if (test_and_clear_bit(REQ_ATOM_STARTED, &rq->atomic_flags)) {
+  		if (q->dma_drain_size && blk_rq_bytes(rq))
+@@@ -563,12 -563,12 +634,12 @@@ static void blk_mq_requeue_work(struct 
+  	spin_unlock_irqrestore(&q->requeue_lock, flags);
+  
+  	list_for_each_entry_safe(rq, next, &rq_list, queuelist) {
+ -		if (!(rq->rq_flags & RQF_SOFTBARRIER))
+ +		if (!(rq->cmd_flags & REQ_SOFTBARRIER))
+  			continue;
+  
+ -		rq->rq_flags &= ~RQF_SOFTBARRIER;
+ +		rq->cmd_flags &= ~REQ_SOFTBARRIER;
+  		list_del_init(&rq->queuelist);
+- 		blk_mq_insert_request(rq, true, false, false);
++ 		blk_mq_sched_insert_request(rq, true, false, false);
+  	}
+  
+  	while (!list_empty(&rq_list)) {
+@@@ -906,41 -992,6 +1046,44 @@@ bool blk_mq_dispatch_rq_list(struct blk
+  	return ret != BLK_MQ_RQ_QUEUE_BUSY;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Run this hardware queue, pulling any software queues mapped to it in.
+ + * Note that this function currently has various problems around ordering
+ + * of IO. In particular, we'd like FIFO behaviour on handling existing
+ + * items on the hctx->dispatch list. Ignore that for now.
+ + */
+ +static void blk_mq_process_rq_list(struct blk_mq_hw_ctx *hctx)
+ +{
+ +	LIST_HEAD(rq_list);
+ +	LIST_HEAD(driver_list);
+ +
+ +	if (unlikely(blk_mq_hctx_stopped(hctx)))
+ +		return;
+ +
+ +	hctx->run++;
+ +
+ +	/*
+ +	 * Touch any software queue that has pending entries.
+ +	 */
+ +	flush_busy_ctxs(hctx, &rq_list);
+ +
+ +	/*
+ +	 * If we have previous entries on our dispatch list, grab them
+ +	 * and stuff them at the front for more fair dispatch.
+ +	 */
+ +	if (!list_empty_careful(&hctx->dispatch)) {
+ +		spin_lock(&hctx->lock);
+ +		if (!list_empty(&hctx->dispatch))
+ +			list_splice_init(&hctx->dispatch, &rq_list);
+ +		spin_unlock(&hctx->lock);
+ +	}
+ +
+ +	blk_mq_dispatch_rq_list(hctx, &rq_list);
+ +}
+ +
+++=======
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  static void __blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx)
+  {
+  	int srcu_idx;
+@@@ -1156,36 -1198,10 +1298,43 @@@ static void __blk_mq_insert_request(str
+  	blk_mq_hctx_mark_pending(hctx, ctx);
+  }
+  
+++<<<<<<< HEAD
+ +void blk_mq_insert_request(struct request *rq, bool at_head, bool run_queue,
+ +			   bool async)
+ +{
+ +	struct blk_mq_ctx *ctx = rq->mq_ctx;
+ +	struct request_queue *q = rq->q;
+ +	struct blk_mq_hw_ctx *hctx;
+ +
+ +	hctx = q->mq_ops->map_queue(q, ctx->cpu);
+ +
+ +	spin_lock(&ctx->lock);
+ +	__blk_mq_insert_request(hctx, rq, at_head);
+ +	spin_unlock(&ctx->lock);
+ +
+ +	if (run_queue)
+ +		blk_mq_run_hw_queue(hctx, async);
+ +}
+ +
+ +static void blk_mq_insert_requests(struct request_queue *q,
+ +				     struct blk_mq_ctx *ctx,
+ +				     struct list_head *list,
+ +				     int depth,
+ +				     bool from_schedule)
+ +
+ +{
+ +	struct blk_mq_hw_ctx *hctx;
+ +
+ +	trace_block_unplug(q, depth, !from_schedule);
+ +
+ +	hctx = q->mq_ops->map_queue(q, ctx->cpu);
+ +
+++=======
++ void blk_mq_insert_requests(struct blk_mq_hw_ctx *hctx, struct blk_mq_ctx *ctx,
++ 			    struct list_head *list)
++ 
++ {
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  	/*
+  	 * preemption doesn't flush plug list, so it's possible ctx->cpu is
+  	 * offline now
+@@@ -1302,65 -1317,34 +1451,90 @@@ insert_rq
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +struct blk_map_ctx {
+ +	struct blk_mq_hw_ctx *hctx;
+ +	struct blk_mq_ctx *ctx;
+ +};
+ +
+ +static struct request *blk_mq_map_request(struct request_queue *q,
+ +					  struct bio *bio,
+ +					  struct blk_map_ctx *data)
+ +{
+ +	struct blk_mq_hw_ctx *hctx;
+ +	struct blk_mq_ctx *ctx;
+ +	struct request *rq;
+ +	int rw = bio_data_dir(bio);
+ +	struct blk_mq_alloc_data alloc_data;
+ +
+ +	blk_queue_enter_live(q);
+ +	ctx = blk_mq_get_ctx(q);
+ +	hctx = q->mq_ops->map_queue(q, ctx->cpu);
+ +
+ +	if (rw_is_sync(bio->bi_rw))
+ +		rw |= REQ_SYNC;
+ +
+ +	trace_block_getrq(q, bio, rw);
+ +	blk_mq_set_alloc_data(&alloc_data, q, BLK_MQ_REQ_NOWAIT, ctx, hctx);
+ +	rq = __blk_mq_alloc_request(&alloc_data, rw);
+ +	if (unlikely(!rq)) {
+ +		__blk_mq_run_hw_queue(hctx);
+ +		blk_mq_put_ctx(ctx);
+ +		trace_block_sleeprq(q, bio, rw);
+ +
+ +		ctx = blk_mq_get_ctx(q);
+ +		hctx = q->mq_ops->map_queue(q, ctx->cpu);
+ +		blk_mq_set_alloc_data(&alloc_data, q, 0, ctx, hctx);
+ +		rq = __blk_mq_alloc_request(&alloc_data, rw);
+ +		ctx = alloc_data.ctx;
+ +		hctx = alloc_data.hctx;
+ +	}
+ +
+ +	hctx->queued++;
+ +	data->hctx = hctx;
+ +	data->ctx = ctx;
+ +	return rq;
+ +}
+ +
+ +static void blk_mq_try_issue_directly(struct request *rq)
+++=======
++ static blk_qc_t request_to_qc_t(struct blk_mq_hw_ctx *hctx, struct request *rq)
++ {
++ 	if (rq->tag != -1)
++ 		return blk_tag_to_qc_t(rq->tag, hctx->queue_num, false);
++ 
++ 	return blk_tag_to_qc_t(rq->internal_tag, hctx->queue_num, true);
++ }
++ 
++ static void blk_mq_try_issue_directly(struct request *rq, blk_qc_t *cookie)
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  {
+- 	int ret;
+  	struct request_queue *q = rq->q;
+++<<<<<<< HEAD
+ +	struct blk_mq_hw_ctx *hctx = q->mq_ops->map_queue(q,
+ +			rq->mq_ctx->cpu);
+++=======
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  	struct blk_mq_queue_data bd = {
+  		.rq = rq,
+  		.list = NULL,
+  		.last = 1
+  	};
+++<<<<<<< HEAD
+++=======
++ 	struct blk_mq_hw_ctx *hctx;
++ 	blk_qc_t new_cookie;
++ 	int ret;
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
++ 
++ 	if (q->elevator)
++ 		goto insert;
+  
+- 	if (blk_mq_hctx_stopped(hctx))
++ 	if (!blk_mq_get_driver_tag(rq, &hctx, false))
+  		goto insert;
+  
++ 	new_cookie = request_to_qc_t(hctx, rq);
++ 
+  	/*
+  	 * For OK queue, we are done. For error, kill it. Any other
+  	 * error (busy), just add it to our list as we previously
+@@@ -1400,17 -1389,32 +1574,38 @@@ static void blk_mq_make_request(struct 
+  	blk_queue_bounce(q, &bio);
+  
+  	if (bio_integrity_enabled(bio) && bio_integrity_prep(bio)) {
+ -		bio_io_error(bio);
+ -		return BLK_QC_T_NONE;
+ +		bio_endio(bio, -EIO);
+ +		return;
+  	}
+  
+ -	blk_queue_split(q, &bio, q->bio_split);
+ -
+  	if (!is_flush_fua && !blk_queue_nomerges(q) &&
+  	    blk_attempt_plug_merge(q, bio, &request_count, &same_queue_rq))
+++<<<<<<< HEAD
+ +		return;
+ +
+ +	rq = blk_mq_map_request(q, bio, &data);
+ +	if (unlikely(!rq))
+ +		return;
+++=======
++ 		return BLK_QC_T_NONE;
++ 
++ 	if (blk_mq_sched_bio_merge(q, bio))
++ 		return BLK_QC_T_NONE;
++ 
++ 	wb_acct = wbt_wait(q->rq_wb, bio, NULL);
++ 
++ 	trace_block_getrq(q, bio, bio->bi_opf);
++ 
++ 	rq = blk_mq_sched_get_request(q, bio, bio->bi_opf, &data);
++ 	if (unlikely(!rq)) {
++ 		__wbt_done(q->rq_wb, wb_acct);
++ 		return BLK_QC_T_NONE;
++ 	}
++ 
++ 	wbt_track(&rq->issue_stat, wb_acct);
++ 
++ 	cookie = request_to_qc_t(data.hctx, rq);
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  
+  	if (unlikely(is_flush_fua)) {
+  		blk_mq_bio_to_request(rq, bio);
+@@@ -1458,12 -1463,18 +1654,18 @@@
+  			rcu_read_unlock();
+  		} else {
+  			srcu_idx = srcu_read_lock(&data.hctx->queue_rq_srcu);
+ -			blk_mq_try_issue_directly(old_rq, &cookie);
+ +			blk_mq_try_issue_directly(old_rq);
+  			srcu_read_unlock(&data.hctx->queue_rq_srcu, srcu_idx);
+  		}
+ -		goto done;
+ +		return;
+  	}
+  
++ 	if (q->elevator) {
++ 		blk_mq_put_ctx(data.ctx);
++ 		blk_mq_bio_to_request(rq, bio);
++ 		blk_mq_sched_insert_request(rq, false, true, true);
++ 		goto done;
++ 	}
+  	if (!blk_mq_merge_queue_io(data.hctx, data.ctx, rq, bio)) {
+  		/*
+  		 * For a SYNC request, send it to the hardware immediately. For
+@@@ -1493,17 -1508,34 +1695,44 @@@ static void blk_sq_make_request(struct 
+  	blk_queue_bounce(q, &bio);
+  
+  	if (bio_integrity_enabled(bio) && bio_integrity_prep(bio)) {
+ -		bio_io_error(bio);
+ -		return BLK_QC_T_NONE;
+ +		bio_endio(bio, -EIO);
+ +		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!is_flush_fua && !blk_queue_nomerges(q) &&
+ +	    blk_attempt_plug_merge(q, bio, &request_count, NULL))
+ +		return;
+ +
+ +	rq = blk_mq_map_request(q, bio, &data);
+ +	if (unlikely(!rq))
+ +		return;
+++=======
++ 	blk_queue_split(q, &bio, q->bio_split);
++ 
++ 	if (!is_flush_fua && !blk_queue_nomerges(q)) {
++ 		if (blk_attempt_plug_merge(q, bio, &request_count, NULL))
++ 			return BLK_QC_T_NONE;
++ 	} else
++ 		request_count = blk_plug_queued_count(q);
++ 
++ 	if (blk_mq_sched_bio_merge(q, bio))
++ 		return BLK_QC_T_NONE;
++ 
++ 	wb_acct = wbt_wait(q->rq_wb, bio, NULL);
++ 
++ 	trace_block_getrq(q, bio, bio->bi_opf);
++ 
++ 	rq = blk_mq_sched_get_request(q, bio, bio->bi_opf, &data);
++ 	if (unlikely(!rq)) {
++ 		__wbt_done(q->rq_wb, wb_acct);
++ 		return BLK_QC_T_NONE;
++ 	}
++ 
++ 	wbt_track(&rq->issue_stat, wb_acct);
++ 
++ 	cookie = request_to_qc_t(data.hctx, rq);
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  
+  	if (unlikely(is_flush_fua)) {
+  		blk_mq_bio_to_request(rq, bio);
+@@@ -1530,9 -1575,15 +1760,15 @@@
+  		}
+  
+  		list_add_tail(&rq->queuelist, &plug->mq_list);
+ -		return cookie;
+ +		return;
+  	}
+  
++ 	if (q->elevator) {
++ 		blk_mq_put_ctx(data.ctx);
++ 		blk_mq_bio_to_request(rq, bio);
++ 		blk_mq_sched_insert_request(rq, false, true, true);
++ 		goto done;
++ 	}
+  	if (!blk_mq_merge_queue_io(data.hctx, data.ctx, rq, bio)) {
+  		/*
+  		 * For a SYNC request, send it to the hardware immediately. For
+@@@ -1545,19 -1596,12 +1781,24 @@@ run_queue
+  	}
+  
+  	blk_mq_put_ctx(data.ctx);
+++<<<<<<< HEAD
+++=======
++ done:
++ 	return cookie;
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+ +}
+ +
+ +/*
+ + * Default mapping to a software queue, since we use one per CPU.
+ + */
+ +struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *q, const int cpu)
+ +{
+ +	return q->queue_hw_ctx[q->mq_map[cpu]];
+  }
+ +EXPORT_SYMBOL(blk_mq_map_queue);
+  
+ -void blk_mq_free_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
+ -		     unsigned int hctx_idx)
+ +static void blk_mq_free_rq_map(struct blk_mq_tag_set *set,
+ +		struct blk_mq_tags *tags, unsigned int hctx_idx)
+  {
+  	struct page *page;
+  
+@@@ -1905,6 -1944,35 +2146,38 @@@ static void blk_mq_init_cpu_queues(stru
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool __blk_mq_alloc_rq_map(struct blk_mq_tag_set *set, int hctx_idx)
++ {
++ 	int ret = 0;
++ 
++ 	set->tags[hctx_idx] = blk_mq_alloc_rq_map(set, hctx_idx,
++ 					set->queue_depth, set->reserved_tags);
++ 	if (!set->tags[hctx_idx])
++ 		return false;
++ 
++ 	ret = blk_mq_alloc_rqs(set, set->tags[hctx_idx], hctx_idx,
++ 				set->queue_depth);
++ 	if (!ret)
++ 		return true;
++ 
++ 	blk_mq_free_rq_map(set->tags[hctx_idx]);
++ 	set->tags[hctx_idx] = NULL;
++ 	return false;
++ }
++ 
++ static void blk_mq_free_map_and_requests(struct blk_mq_tag_set *set,
++ 					 unsigned int hctx_idx)
++ {
++ 	if (set->tags[hctx_idx]) {
++ 		blk_mq_free_rqs(set, set->tags[hctx_idx], hctx_idx);
++ 		blk_mq_free_rq_map(set->tags[hctx_idx]);
++ 		set->tags[hctx_idx] = NULL;
++ 	}
++ }
++ 
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  static void blk_mq_map_swqueue(struct request_queue *q,
+  			       const struct cpumask *online_mask)
+  {
+@@@ -2546,6 -2604,168 +2829,171 @@@ void blk_mq_update_nr_hw_queues(struct 
+  }
+  EXPORT_SYMBOL_GPL(blk_mq_update_nr_hw_queues);
+  
+++<<<<<<< HEAD
+++=======
++ static unsigned long blk_mq_poll_nsecs(struct request_queue *q,
++ 				       struct blk_mq_hw_ctx *hctx,
++ 				       struct request *rq)
++ {
++ 	struct blk_rq_stat stat[2];
++ 	unsigned long ret = 0;
++ 
++ 	/*
++ 	 * If stats collection isn't on, don't sleep but turn it on for
++ 	 * future users
++ 	 */
++ 	if (!blk_stat_enable(q))
++ 		return 0;
++ 
++ 	/*
++ 	 * We don't have to do this once per IO, should optimize this
++ 	 * to just use the current window of stats until it changes
++ 	 */
++ 	memset(&stat, 0, sizeof(stat));
++ 	blk_hctx_stat_get(hctx, stat);
++ 
++ 	/*
++ 	 * As an optimistic guess, use half of the mean service time
++ 	 * for this type of request. We can (and should) make this smarter.
++ 	 * For instance, if the completion latencies are tight, we can
++ 	 * get closer than just half the mean. This is especially
++ 	 * important on devices where the completion latencies are longer
++ 	 * than ~10 usec.
++ 	 */
++ 	if (req_op(rq) == REQ_OP_READ && stat[BLK_STAT_READ].nr_samples)
++ 		ret = (stat[BLK_STAT_READ].mean + 1) / 2;
++ 	else if (req_op(rq) == REQ_OP_WRITE && stat[BLK_STAT_WRITE].nr_samples)
++ 		ret = (stat[BLK_STAT_WRITE].mean + 1) / 2;
++ 
++ 	return ret;
++ }
++ 
++ static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
++ 				     struct blk_mq_hw_ctx *hctx,
++ 				     struct request *rq)
++ {
++ 	struct hrtimer_sleeper hs;
++ 	enum hrtimer_mode mode;
++ 	unsigned int nsecs;
++ 	ktime_t kt;
++ 
++ 	if (test_bit(REQ_ATOM_POLL_SLEPT, &rq->atomic_flags))
++ 		return false;
++ 
++ 	/*
++ 	 * poll_nsec can be:
++ 	 *
++ 	 * -1:	don't ever hybrid sleep
++ 	 *  0:	use half of prev avg
++ 	 * >0:	use this specific value
++ 	 */
++ 	if (q->poll_nsec == -1)
++ 		return false;
++ 	else if (q->poll_nsec > 0)
++ 		nsecs = q->poll_nsec;
++ 	else
++ 		nsecs = blk_mq_poll_nsecs(q, hctx, rq);
++ 
++ 	if (!nsecs)
++ 		return false;
++ 
++ 	set_bit(REQ_ATOM_POLL_SLEPT, &rq->atomic_flags);
++ 
++ 	/*
++ 	 * This will be replaced with the stats tracking code, using
++ 	 * 'avg_completion_time / 2' as the pre-sleep target.
++ 	 */
++ 	kt = nsecs;
++ 
++ 	mode = HRTIMER_MODE_REL;
++ 	hrtimer_init_on_stack(&hs.timer, CLOCK_MONOTONIC, mode);
++ 	hrtimer_set_expires(&hs.timer, kt);
++ 
++ 	hrtimer_init_sleeper(&hs, current);
++ 	do {
++ 		if (test_bit(REQ_ATOM_COMPLETE, &rq->atomic_flags))
++ 			break;
++ 		set_current_state(TASK_UNINTERRUPTIBLE);
++ 		hrtimer_start_expires(&hs.timer, mode);
++ 		if (hs.task)
++ 			io_schedule();
++ 		hrtimer_cancel(&hs.timer);
++ 		mode = HRTIMER_MODE_ABS;
++ 	} while (hs.task && !signal_pending(current));
++ 
++ 	__set_current_state(TASK_RUNNING);
++ 	destroy_hrtimer_on_stack(&hs.timer);
++ 	return true;
++ }
++ 
++ static bool __blk_mq_poll(struct blk_mq_hw_ctx *hctx, struct request *rq)
++ {
++ 	struct request_queue *q = hctx->queue;
++ 	long state;
++ 
++ 	/*
++ 	 * If we sleep, have the caller restart the poll loop to reset
++ 	 * the state. Like for the other success return cases, the
++ 	 * caller is responsible for checking if the IO completed. If
++ 	 * the IO isn't complete, we'll get called again and will go
++ 	 * straight to the busy poll loop.
++ 	 */
++ 	if (blk_mq_poll_hybrid_sleep(q, hctx, rq))
++ 		return true;
++ 
++ 	hctx->poll_considered++;
++ 
++ 	state = current->state;
++ 	while (!need_resched()) {
++ 		int ret;
++ 
++ 		hctx->poll_invoked++;
++ 
++ 		ret = q->mq_ops->poll(hctx, rq->tag);
++ 		if (ret > 0) {
++ 			hctx->poll_success++;
++ 			set_current_state(TASK_RUNNING);
++ 			return true;
++ 		}
++ 
++ 		if (signal_pending_state(state, current))
++ 			set_current_state(TASK_RUNNING);
++ 
++ 		if (current->state == TASK_RUNNING)
++ 			return true;
++ 		if (ret < 0)
++ 			break;
++ 		cpu_relax();
++ 	}
++ 
++ 	return false;
++ }
++ 
++ bool blk_mq_poll(struct request_queue *q, blk_qc_t cookie)
++ {
++ 	struct blk_mq_hw_ctx *hctx;
++ 	struct blk_plug *plug;
++ 	struct request *rq;
++ 
++ 	if (!q->mq_ops || !q->mq_ops->poll || !blk_qc_t_valid(cookie) ||
++ 	    !test_bit(QUEUE_FLAG_POLL, &q->queue_flags))
++ 		return false;
++ 
++ 	plug = current->plug;
++ 	if (plug)
++ 		blk_flush_plug_list(plug, false);
++ 
++ 	hctx = q->queue_hw_ctx[blk_qc_t_to_queue_num(cookie)];
++ 	if (!blk_qc_t_is_internal(cookie))
++ 		rq = blk_mq_tag_to_rq(hctx->tags, blk_qc_t_to_tag(cookie));
++ 	else
++ 		rq = blk_mq_tag_to_rq(hctx->sched_tags, blk_qc_t_to_tag(cookie));
++ 
++ 	return __blk_mq_poll(hctx, rq);
++ }
++ EXPORT_SYMBOL_GPL(blk_mq_poll);
++ 
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  void blk_mq_disable_hotplug(void)
+  {
+  	mutex_lock(&all_q_mutex);
+diff --cc block/blk-mq.h
+index 2d50f02667c4,0c7c034d9ddd..000000000000
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@@ -34,17 -32,31 +34,40 @@@ void blk_mq_free_queue(struct request_q
+  int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr);
+  void blk_mq_wake_waiters(struct request_queue *q);
+  bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *, struct list_head *);
+ -void blk_mq_flush_busy_ctxs(struct blk_mq_hw_ctx *hctx, struct list_head *list);
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Internal helpers for allocating/freeing the request map
++  */
++ void blk_mq_free_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
++ 		     unsigned int hctx_idx);
++ void blk_mq_free_rq_map(struct blk_mq_tags *tags);
++ struct blk_mq_tags *blk_mq_alloc_rq_map(struct blk_mq_tag_set *set,
++ 					unsigned int hctx_idx,
++ 					unsigned int nr_tags,
++ 					unsigned int reserved_tags);
++ int blk_mq_alloc_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
++ 		     unsigned int hctx_idx, unsigned int depth);
++ 
++ /*
++  * Internal helpers for request insertion into sw queues
++  */
++ void __blk_mq_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
++ 				bool at_head);
++ void blk_mq_insert_requests(struct blk_mq_hw_ctx *hctx, struct blk_mq_ctx *ctx,
++ 				struct list_head *list);
++ /*
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+   * CPU hotplug helpers
+   */
+ +struct blk_mq_cpu_notifier;
+ +void blk_mq_init_cpu_notifier(struct blk_mq_cpu_notifier *notifier,
+ +			      int (*fn)(void *, unsigned long, unsigned int),
+ +			      void *data);
+ +void blk_mq_register_cpu_notifier(struct blk_mq_cpu_notifier *notifier);
+ +void blk_mq_unregister_cpu_notifier(struct blk_mq_cpu_notifier *notifier);
+ +void blk_mq_cpu_init(void);
+  void blk_mq_enable_hotplug(void);
+  void blk_mq_disable_hotplug(void);
+  
+@@@ -116,6 -124,25 +139,28 @@@ static inline void blk_mq_set_alloc_dat
+  	data->hctx = hctx;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline struct blk_mq_tags *blk_mq_tags_from_data(struct blk_mq_alloc_data *data)
++ {
++ 	if (data->flags & BLK_MQ_REQ_INTERNAL)
++ 		return data->hctx->sched_tags;
++ 
++ 	return data->hctx->tags;
++ }
++ 
++ /*
++  * Internal helpers for request allocation/init/free
++  */
++ void blk_mq_rq_ctx_init(struct request_queue *q, struct blk_mq_ctx *ctx,
++ 			struct request *rq, unsigned int op);
++ void __blk_mq_finish_request(struct blk_mq_hw_ctx *hctx, struct blk_mq_ctx *ctx,
++ 				struct request *rq);
++ void blk_mq_finish_request(struct request *rq);
++ struct request *__blk_mq_alloc_request(struct blk_mq_alloc_data *data,
++ 					unsigned int op);
++ 
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  static inline bool blk_mq_hctx_stopped(struct blk_mq_hw_ctx *hctx)
+  {
+  	return test_bit(BLK_MQ_S_STOPPED, &hctx->state);
+diff --cc block/elevator.c
+index 0070ed26a3c0,0e1ccddab8a2..000000000000
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@@ -39,7 -40,7 +39,11 @@@
+  #include <trace/events/block.h>
+  
+  #include "blk.h"
+++<<<<<<< HEAD
+ +#include "blk-cgroup.h"
+++=======
++ #include "blk-mq-sched.h"
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  
+  static DEFINE_SPINLOCK(elv_list_lock);
+  static LIST_HEAD(elv_list);
+@@@ -58,8 -59,10 +62,15 @@@ static int elv_iosched_allow_merge(stru
+  	struct request_queue *q = rq->q;
+  	struct elevator_queue *e = q->elevator;
+  
+++<<<<<<< HEAD
+ +	if (e->type->ops.elevator_allow_merge_fn)
+ +		return e->type->ops.elevator_allow_merge_fn(q, rq, bio);
+++=======
++ 	if (e->uses_mq && e->type->ops.mq.allow_merge)
++ 		return e->type->ops.mq.allow_merge(q, rq, bio);
++ 	else if (!e->uses_mq && e->type->ops.sq.elevator_allow_bio_merge_fn)
++ 		return e->type->ops.sq.elevator_allow_bio_merge_fn(q, rq, bio);
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  
+  	return 1;
+  }
+@@@ -164,12 -166,9 +175,13 @@@ struct elevator_queue *elevator_alloc(s
+  	kobject_init(&eq->kobj, &elv_ktype);
+  	mutex_init(&eq->sysfs_lock);
+  	hash_init(eq->hash);
++ 	eq->uses_mq = e->uses_mq;
+  
+  	return eq;
+ +err:
+ +	kfree(eq);
+ +	elevator_put(e);
+ +	return NULL;
+  }
+  EXPORT_SYMBOL(elevator_alloc);
+  
+@@@ -229,9 -232,17 +245,22 @@@ int elevator_init(struct request_queue 
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	err = e->ops.elevator_init_fn(q, e);
+ +	if (err)
+++=======
++ 	if (e->uses_mq) {
++ 		err = blk_mq_sched_setup(q);
++ 		if (!err)
++ 			err = e->ops.mq.init_sched(q, e);
++ 	} else
++ 		err = e->ops.sq.elevator_init_fn(q, e);
++ 	if (err) {
++ 		if (e->uses_mq)
++ 			blk_mq_sched_teardown(q);
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  		elevator_put(e);
++ 	}
+  	return err;
+  }
+  EXPORT_SYMBOL(elevator_init);
+@@@ -239,8 -250,10 +268,15 @@@
+  void elevator_exit(struct elevator_queue *e)
+  {
+  	mutex_lock(&e->sysfs_lock);
+++<<<<<<< HEAD
+ +	if (e->type->ops.elevator_exit_fn)
+ +		e->type->ops.elevator_exit_fn(e);
+++=======
++ 	if (e->uses_mq && e->type->ops.mq.exit_sched)
++ 		e->type->ops.mq.exit_sched(e);
++ 	else if (!e->uses_mq && e->type->ops.sq.elevator_exit_fn)
++ 		e->type->ops.sq.elevator_exit_fn(e);
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  	mutex_unlock(&e->sysfs_lock);
+  
+  	kobject_put(&e->kobj);
+@@@ -265,8 -279,9 +302,9 @@@ void elv_rqhash_add(struct request_queu
+  
+  	BUG_ON(ELV_ON_HASH(rq));
+  	hash_add(e->hash, &rq->hash, rq_hash_key(rq));
+ -	rq->rq_flags |= RQF_HASHED;
+ +	rq->cmd_flags |= REQ_HASHED;
+  }
++ EXPORT_SYMBOL_GPL(elv_rqhash_add);
+  
+  void elv_rqhash_reposition(struct request_queue *q, struct request *rq)
+  {
+@@@ -451,8 -463,10 +489,15 @@@ int elv_merge(struct request_queue *q, 
+  		return ELEVATOR_BACK_MERGE;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (e->type->ops.elevator_merge_fn)
+ +		return e->type->ops.elevator_merge_fn(q, req, bio);
+++=======
++ 	if (e->uses_mq && e->type->ops.mq.request_merge)
++ 		return e->type->ops.mq.request_merge(q, req, bio);
++ 	else if (!e->uses_mq && e->type->ops.sq.elevator_merge_fn)
++ 		return e->type->ops.sq.elevator_merge_fn(q, req, bio);
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  
+  	return ELEVATOR_NO_MERGE;
+  }
+@@@ -503,8 -516,10 +547,15 @@@ void elv_merged_request(struct request_
+  {
+  	struct elevator_queue *e = q->elevator;
+  
+++<<<<<<< HEAD
+ +	if (e->type->ops.elevator_merged_fn)
+ +		e->type->ops.elevator_merged_fn(q, rq, type);
+++=======
++ 	if (e->uses_mq && e->type->ops.mq.request_merged)
++ 		e->type->ops.mq.request_merged(q, rq, type);
++ 	else if (!e->uses_mq && e->type->ops.sq.elevator_merged_fn)
++ 		e->type->ops.sq.elevator_merged_fn(q, rq, type);
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  
+  	if (type == ELEVATOR_BACK_MERGE)
+  		elv_rqhash_reposition(q, rq);
+@@@ -516,10 -531,15 +567,22 @@@ void elv_merge_requests(struct request_
+  			     struct request *next)
+  {
+  	struct elevator_queue *e = q->elevator;
+++<<<<<<< HEAD
+ +	const int next_sorted = next->cmd_flags & REQ_SORTED;
+ +
+ +	if (next_sorted && e->type->ops.elevator_merge_req_fn)
+ +		e->type->ops.elevator_merge_req_fn(q, rq, next);
+++=======
++ 	bool next_sorted = false;
++ 
++ 	if (e->uses_mq && e->type->ops.mq.requests_merged)
++ 		e->type->ops.mq.requests_merged(q, rq, next);
++ 	else if (e->type->ops.sq.elevator_merge_req_fn) {
++ 		next_sorted = next->rq_flags & RQF_SORTED;
++ 		if (next_sorted)
++ 			e->type->ops.sq.elevator_merge_req_fn(q, rq, next);
++ 	}
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  
+  	elv_rqhash_reposition(q, rq);
+  
+@@@ -536,14 -556,17 +599,22 @@@ void elv_bio_merged(struct request_queu
+  {
+  	struct elevator_queue *e = q->elevator;
+  
+++<<<<<<< HEAD
+ +	if (e->type->ops.elevator_bio_merged_fn)
+ +		e->type->ops.elevator_bio_merged_fn(q, rq, bio);
+++=======
++ 	if (WARN_ON_ONCE(e->uses_mq))
++ 		return;
++ 
++ 	if (e->type->ops.sq.elevator_bio_merged_fn)
++ 		e->type->ops.sq.elevator_bio_merged_fn(q, rq, bio);
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  }
+  
+ -#ifdef CONFIG_PM
+ +#ifdef CONFIG_PM_RUNTIME
+  static void blk_pm_requeue_request(struct request *rq)
+  {
+ -	if (rq->q->dev && !(rq->rq_flags & RQF_PM))
+ +	if (rq->q->dev && !(rq->cmd_flags & REQ_PM))
+  		rq->q->nr_pending--;
+  }
+  
+@@@ -582,11 -605,15 +653,19 @@@ void elv_requeue_request(struct request
+  
+  void elv_drain_elevator(struct request_queue *q)
+  {
++ 	struct elevator_queue *e = q->elevator;
+  	static int printed;
+  
++ 	if (WARN_ON_ONCE(e->uses_mq))
++ 		return;
++ 
+  	lockdep_assert_held(q->queue_lock);
+  
+++<<<<<<< HEAD
+ +	while (q->elevator->type->ops.elevator_dispatch_fn(q, 1))
+++=======
++ 	while (e->type->ops.sq.elevator_dispatch_fn(q, 1))
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  		;
+  	if (q->nr_sorted && printed++ < 10) {
+  		printk(KERN_ERR "%s: forced dispatching is broken "
+@@@ -690,8 -717,11 +769,16 @@@ struct request *elv_latter_request(stru
+  {
+  	struct elevator_queue *e = q->elevator;
+  
+++<<<<<<< HEAD
+ +	if (e->type->ops.elevator_latter_req_fn)
+ +		return e->type->ops.elevator_latter_req_fn(q, rq);
+++=======
++ 	if (e->uses_mq && e->type->ops.mq.next_request)
++ 		return e->type->ops.mq.next_request(q, rq);
++ 	else if (!e->uses_mq && e->type->ops.sq.elevator_latter_req_fn)
++ 		return e->type->ops.sq.elevator_latter_req_fn(q, rq);
++ 
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  	return NULL;
+  }
+  
+@@@ -699,8 -729,10 +786,15 @@@ struct request *elv_former_request(stru
+  {
+  	struct elevator_queue *e = q->elevator;
+  
+++<<<<<<< HEAD
+ +	if (e->type->ops.elevator_former_req_fn)
+ +		return e->type->ops.elevator_former_req_fn(q, rq);
+++=======
++ 	if (e->uses_mq && e->type->ops.mq.former_request)
++ 		return e->type->ops.mq.former_request(q, rq);
++ 	if (!e->uses_mq && e->type->ops.sq.elevator_former_req_fn)
++ 		return e->type->ops.sq.elevator_former_req_fn(q, rq);
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  	return NULL;
+  }
+  
+@@@ -709,8 -741,11 +803,16 @@@ int elv_set_request(struct request_queu
+  {
+  	struct elevator_queue *e = q->elevator;
+  
+++<<<<<<< HEAD
+ +	if (e->type->ops.elevator_set_req_fn)
+ +		return e->type->ops.elevator_set_req_fn(q, rq, bio, gfp_mask);
+++=======
++ 	if (WARN_ON_ONCE(e->uses_mq))
++ 		return 0;
++ 
++ 	if (e->type->ops.sq.elevator_set_req_fn)
++ 		return e->type->ops.sq.elevator_set_req_fn(q, rq, bio, gfp_mask);
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  	return 0;
+  }
+  
+@@@ -718,16 -753,22 +820,32 @@@ void elv_put_request(struct request_que
+  {
+  	struct elevator_queue *e = q->elevator;
+  
+++<<<<<<< HEAD
+ +	if (e->type->ops.elevator_put_req_fn)
+ +		e->type->ops.elevator_put_req_fn(rq);
+++=======
++ 	if (WARN_ON_ONCE(e->uses_mq))
++ 		return;
++ 
++ 	if (e->type->ops.sq.elevator_put_req_fn)
++ 		e->type->ops.sq.elevator_put_req_fn(rq);
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  }
+  
+ -int elv_may_queue(struct request_queue *q, unsigned int op)
+ +int elv_may_queue(struct request_queue *q, int rw)
+  {
+  	struct elevator_queue *e = q->elevator;
+  
+++<<<<<<< HEAD
+ +	if (e->type->ops.elevator_may_queue_fn)
+ +		return e->type->ops.elevator_may_queue_fn(q, rw);
+++=======
++ 	if (WARN_ON_ONCE(e->uses_mq))
++ 		return 0;
++ 
++ 	if (e->type->ops.sq.elevator_may_queue_fn)
++ 		return e->type->ops.sq.elevator_may_queue_fn(q, op);
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  
+  	return ELV_MQUEUE_MAY;
+  }
+@@@ -811,8 -855,8 +932,13 @@@ int elv_register_queue(struct request_q
+  		}
+  		kobject_uevent(&e->kobj, KOBJ_ADD);
+  		e->registered = 1;
+++<<<<<<< HEAD
+ +		if (e->type->ops.elevator_registered_fn)
+ +			e->type->ops.elevator_registered_fn(q);
+++=======
++ 		if (!e->uses_mq && e->type->ops.sq.elevator_registered_fn)
++ 			e->type->ops.sq.elevator_registered_fn(q);
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  	}
+  	return error;
+  }
+@@@ -909,22 -958,35 +1040,41 @@@ static int elevator_switch(struct reque
+  	 * using INSERT_BACK.  All requests have SOFTBARRIER set and no
+  	 * merge happens either.
+  	 */
+- 	blk_queue_bypass_start(q);
++ 	if (old) {
++ 		old_registered = old->registered;
++ 
++ 		if (old->uses_mq)
++ 			blk_mq_sched_teardown(q);
+  
+- 	/* unregister and clear all auxiliary data of the old elevator */
+- 	if (registered)
+- 		elv_unregister_queue(q);
++ 		if (!q->mq_ops)
++ 			blk_queue_bypass_start(q);
+  
+- 	spin_lock_irq(q->queue_lock);
+- 	ioc_clear_queue(q);
+- 	spin_unlock_irq(q->queue_lock);
++ 		/* unregister and clear all auxiliary data of the old elevator */
++ 		if (old_registered)
++ 			elv_unregister_queue(q);
++ 
++ 		spin_lock_irq(q->queue_lock);
++ 		ioc_clear_queue(q);
++ 		spin_unlock_irq(q->queue_lock);
++ 	}
+  
+  	/* allocate, init and register new elevator */
+++<<<<<<< HEAD
+ +	err = new_e->ops.elevator_init_fn(q, new_e);
+ +	if (err)
+ +		goto fail_init;
+++=======
++ 	if (new_e) {
++ 		if (new_e->uses_mq) {
++ 			err = blk_mq_sched_setup(q);
++ 			if (!err)
++ 				err = new_e->ops.mq.init_sched(q, new_e);
++ 		} else
++ 			err = new_e->ops.sq.elevator_init_fn(q, new_e);
++ 		if (err)
++ 			goto fail_init;
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  
+- 	if (registered) {
+  		err = elv_register_queue(q);
+  		if (err)
+  			goto fail_register;
+diff --cc include/linux/elevator.h
+index 297200f44dc5,ecb96fd67c6d..000000000000
+--- a/include/linux/elevator.h
++++ b/include/linux/elevator.h
+@@@ -89,7 -122,10 +117,14 @@@ struct elevator_typ
+  	struct kmem_cache *icq_cache;
+  
+  	/* fields provided by elevator implementation */
+++<<<<<<< HEAD
+ +	struct elevator_ops ops;
+++=======
++ 	union {
++ 		struct elevator_ops sq;
++ 		struct elevator_mq_ops mq;
++ 	} ops;
+++>>>>>>> bd166ef183c2 (blk-mq-sched: add framework for MQ capable IO schedulers)
+  	size_t icq_size;	/* see iocontext.h */
+  	size_t icq_align;	/* ditto */
+  	struct elv_fs_entry *elevator_attrs;
+* Unmerged path block/Makefile
+* Unmerged path block/blk-cgroup.c
+* Unmerged path block/blk-core.c
+diff --git a/block/blk-exec.c b/block/blk-exec.c
+index 9924725fa50d..ee5766e6c499 100644
+--- a/block/blk-exec.c
++++ b/block/blk-exec.c
+@@ -9,6 +9,7 @@
+ #include <linux/sched/sysctl.h>
+ 
+ #include "blk.h"
++#include "blk-mq-sched.h"
+ 
+ /*
+  * for max sense size
+@@ -66,7 +67,7 @@ void blk_execute_rq_nowait(struct request_queue *q, struct gendisk *bd_disk,
+ 	 * be resued after dying flag is set
+ 	 */
+ 	if (q->mq_ops) {
+-		blk_mq_insert_request(rq, at_head, true, false);
++		blk_mq_sched_insert_request(rq, at_head, true, false);
+ 		return;
+ 	}
+ 
+diff --git a/block/blk-flush.c b/block/blk-flush.c
+index 5ab2a59b3f9c..4d904a962881 100644
+--- a/block/blk-flush.c
++++ b/block/blk-flush.c
+@@ -74,6 +74,7 @@
+ #include "blk.h"
+ #include "blk-mq.h"
+ #include "blk-mq-tag.h"
++#include "blk-mq-sched.h"
+ 
+ /* FLUSH/FUA sequences */
+ enum {
+@@ -361,9 +362,10 @@ static void mq_flush_data_end_io(struct request *rq, int error)
+ 	 * the comment in flush_end_io().
+ 	 */
+ 	spin_lock_irqsave(&fq->mq_flush_lock, flags);
+-	if (blk_flush_complete_seq(rq, fq, REQ_FSEQ_DATA, error))
+-		blk_mq_run_hw_queue(hctx, true);
++	blk_flush_complete_seq(rq, fq, REQ_FSEQ_DATA, error);
+ 	spin_unlock_irqrestore(&fq->mq_flush_lock, flags);
++
++	blk_mq_run_hw_queue(hctx, true);
+ }
+ 
+ /**
+@@ -416,9 +418,9 @@ void blk_insert_flush(struct request *rq)
+ 	 */
+ 	if ((policy & REQ_FSEQ_DATA) &&
+ 	    !(policy & (REQ_FSEQ_PREFLUSH | REQ_FSEQ_POSTFLUSH))) {
+-		if (q->mq_ops) {
+-			blk_mq_insert_request(rq, false, true, false);
+-		} else
++		if (q->mq_ops)
++			blk_mq_sched_insert_request(rq, false, true, false);
++		else
+ 			list_add_tail(&rq->queuelist, &q->queue_head);
+ 		return;
+ 	}
+* Unmerged path block/blk-ioc.c
+* Unmerged path block/blk-merge.c
+diff --git a/block/blk-mq-sched.c b/block/blk-mq-sched.c
+new file mode 100644
+index 000000000000..26759798a0b3
+--- /dev/null
++++ b/block/blk-mq-sched.c
+@@ -0,0 +1,368 @@
++/*
++ * blk-mq scheduling framework
++ *
++ * Copyright (C) 2016 Jens Axboe
++ */
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/blk-mq.h>
++
++#include <trace/events/block.h>
++
++#include "blk.h"
++#include "blk-mq.h"
++#include "blk-mq-sched.h"
++#include "blk-mq-tag.h"
++#include "blk-wbt.h"
++
++void blk_mq_sched_free_hctx_data(struct request_queue *q,
++				 void (*exit)(struct blk_mq_hw_ctx *))
++{
++	struct blk_mq_hw_ctx *hctx;
++	int i;
++
++	queue_for_each_hw_ctx(q, hctx, i) {
++		if (exit && hctx->sched_data)
++			exit(hctx);
++		kfree(hctx->sched_data);
++		hctx->sched_data = NULL;
++	}
++}
++EXPORT_SYMBOL_GPL(blk_mq_sched_free_hctx_data);
++
++int blk_mq_sched_init_hctx_data(struct request_queue *q, size_t size,
++				int (*init)(struct blk_mq_hw_ctx *),
++				void (*exit)(struct blk_mq_hw_ctx *))
++{
++	struct blk_mq_hw_ctx *hctx;
++	int ret;
++	int i;
++
++	queue_for_each_hw_ctx(q, hctx, i) {
++		hctx->sched_data = kmalloc_node(size, GFP_KERNEL, hctx->numa_node);
++		if (!hctx->sched_data) {
++			ret = -ENOMEM;
++			goto error;
++		}
++
++		if (init) {
++			ret = init(hctx);
++			if (ret) {
++				/*
++				 * We don't want to give exit() a partially
++				 * initialized sched_data. init() must clean up
++				 * if it fails.
++				 */
++				kfree(hctx->sched_data);
++				hctx->sched_data = NULL;
++				goto error;
++			}
++		}
++	}
++
++	return 0;
++error:
++	blk_mq_sched_free_hctx_data(q, exit);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(blk_mq_sched_init_hctx_data);
++
++static void __blk_mq_sched_assign_ioc(struct request_queue *q,
++				      struct request *rq, struct io_context *ioc)
++{
++	struct io_cq *icq;
++
++	spin_lock_irq(q->queue_lock);
++	icq = ioc_lookup_icq(ioc, q);
++	spin_unlock_irq(q->queue_lock);
++
++	if (!icq) {
++		icq = ioc_create_icq(ioc, q, GFP_ATOMIC);
++		if (!icq)
++			return;
++	}
++
++	rq->elv.icq = icq;
++	if (!blk_mq_sched_get_rq_priv(q, rq)) {
++		rq->rq_flags |= RQF_ELVPRIV;
++		get_io_context(icq->ioc);
++		return;
++	}
++
++	rq->elv.icq = NULL;
++}
++
++static void blk_mq_sched_assign_ioc(struct request_queue *q,
++				    struct request *rq, struct bio *bio)
++{
++	struct io_context *ioc;
++
++	ioc = rq_ioc(bio);
++	if (ioc)
++		__blk_mq_sched_assign_ioc(q, rq, ioc);
++}
++
++struct request *blk_mq_sched_get_request(struct request_queue *q,
++					 struct bio *bio,
++					 unsigned int op,
++					 struct blk_mq_alloc_data *data)
++{
++	struct elevator_queue *e = q->elevator;
++	struct blk_mq_hw_ctx *hctx;
++	struct blk_mq_ctx *ctx;
++	struct request *rq;
++	const bool is_flush = op & (REQ_PREFLUSH | REQ_FUA);
++
++	blk_queue_enter_live(q);
++	ctx = blk_mq_get_ctx(q);
++	hctx = blk_mq_map_queue(q, ctx->cpu);
++
++	blk_mq_set_alloc_data(data, q, 0, ctx, hctx);
++
++	if (e) {
++		data->flags |= BLK_MQ_REQ_INTERNAL;
++
++		/*
++		 * Flush requests are special and go directly to the
++		 * dispatch list.
++		 */
++		if (!is_flush && e->type->ops.mq.get_request) {
++			rq = e->type->ops.mq.get_request(q, op, data);
++			if (rq)
++				rq->rq_flags |= RQF_QUEUED;
++		} else
++			rq = __blk_mq_alloc_request(data, op);
++	} else {
++		rq = __blk_mq_alloc_request(data, op);
++		data->hctx->tags->rqs[rq->tag] = rq;
++	}
++
++	if (rq) {
++		if (!is_flush) {
++			rq->elv.icq = NULL;
++			if (e && e->type->icq_cache)
++				blk_mq_sched_assign_ioc(q, rq, bio);
++		}
++		data->hctx->queued++;
++		return rq;
++	}
++
++	blk_queue_exit(q);
++	return NULL;
++}
++
++void blk_mq_sched_put_request(struct request *rq)
++{
++	struct request_queue *q = rq->q;
++	struct elevator_queue *e = q->elevator;
++
++	if (rq->rq_flags & RQF_ELVPRIV) {
++		blk_mq_sched_put_rq_priv(rq->q, rq);
++		if (rq->elv.icq) {
++			put_io_context(rq->elv.icq->ioc);
++			rq->elv.icq = NULL;
++		}
++	}
++
++	if ((rq->rq_flags & RQF_QUEUED) && e && e->type->ops.mq.put_request)
++		e->type->ops.mq.put_request(rq);
++	else
++		blk_mq_finish_request(rq);
++}
++
++void blk_mq_sched_dispatch_requests(struct blk_mq_hw_ctx *hctx)
++{
++	struct elevator_queue *e = hctx->queue->elevator;
++	LIST_HEAD(rq_list);
++
++	if (unlikely(blk_mq_hctx_stopped(hctx)))
++		return;
++
++	hctx->run++;
++
++	/*
++	 * If we have previous entries on our dispatch list, grab them first for
++	 * more fair dispatch.
++	 */
++	if (!list_empty_careful(&hctx->dispatch)) {
++		spin_lock(&hctx->lock);
++		if (!list_empty(&hctx->dispatch))
++			list_splice_init(&hctx->dispatch, &rq_list);
++		spin_unlock(&hctx->lock);
++	}
++
++	/*
++	 * Only ask the scheduler for requests, if we didn't have residual
++	 * requests from the dispatch list. This is to avoid the case where
++	 * we only ever dispatch a fraction of the requests available because
++	 * of low device queue depth. Once we pull requests out of the IO
++	 * scheduler, we can no longer merge or sort them. So it's best to
++	 * leave them there for as long as we can. Mark the hw queue as
++	 * needing a restart in that case.
++	 */
++	if (list_empty(&rq_list)) {
++		if (e && e->type->ops.mq.dispatch_requests)
++			e->type->ops.mq.dispatch_requests(hctx, &rq_list);
++		else
++			blk_mq_flush_busy_ctxs(hctx, &rq_list);
++	} else
++		blk_mq_sched_mark_restart(hctx);
++
++	blk_mq_dispatch_rq_list(hctx, &rq_list);
++}
++
++void blk_mq_sched_move_to_dispatch(struct blk_mq_hw_ctx *hctx,
++				   struct list_head *rq_list,
++				   struct request *(*get_rq)(struct blk_mq_hw_ctx *))
++{
++	do {
++		struct request *rq;
++
++		rq = get_rq(hctx);
++		if (!rq)
++			break;
++
++		list_add_tail(&rq->queuelist, rq_list);
++	} while (1);
++}
++EXPORT_SYMBOL_GPL(blk_mq_sched_move_to_dispatch);
++
++bool blk_mq_sched_try_merge(struct request_queue *q, struct bio *bio)
++{
++	struct request *rq;
++	int ret;
++
++	ret = elv_merge(q, &rq, bio);
++	if (ret == ELEVATOR_BACK_MERGE) {
++		if (!blk_mq_sched_allow_merge(q, rq, bio))
++			return false;
++		if (bio_attempt_back_merge(q, rq, bio)) {
++			if (!attempt_back_merge(q, rq))
++				elv_merged_request(q, rq, ret);
++			return true;
++		}
++	} else if (ret == ELEVATOR_FRONT_MERGE) {
++		if (!blk_mq_sched_allow_merge(q, rq, bio))
++			return false;
++		if (bio_attempt_front_merge(q, rq, bio)) {
++			if (!attempt_front_merge(q, rq))
++				elv_merged_request(q, rq, ret);
++			return true;
++		}
++	}
++
++	return false;
++}
++EXPORT_SYMBOL_GPL(blk_mq_sched_try_merge);
++
++bool __blk_mq_sched_bio_merge(struct request_queue *q, struct bio *bio)
++{
++	struct elevator_queue *e = q->elevator;
++
++	if (e->type->ops.mq.bio_merge) {
++		struct blk_mq_ctx *ctx = blk_mq_get_ctx(q);
++		struct blk_mq_hw_ctx *hctx = blk_mq_map_queue(q, ctx->cpu);
++
++		blk_mq_put_ctx(ctx);
++		return e->type->ops.mq.bio_merge(hctx, bio);
++	}
++
++	return false;
++}
++
++bool blk_mq_sched_try_insert_merge(struct request_queue *q, struct request *rq)
++{
++	return rq_mergeable(rq) && elv_attempt_insert_merge(q, rq);
++}
++EXPORT_SYMBOL_GPL(blk_mq_sched_try_insert_merge);
++
++void blk_mq_sched_request_inserted(struct request *rq)
++{
++	trace_block_rq_insert(rq->q, rq);
++}
++EXPORT_SYMBOL_GPL(blk_mq_sched_request_inserted);
++
++bool blk_mq_sched_bypass_insert(struct blk_mq_hw_ctx *hctx, struct request *rq)
++{
++	if (rq->tag == -1) {
++		rq->rq_flags |= RQF_SORTED;
++		return false;
++	}
++
++	/*
++	 * If we already have a real request tag, send directly to
++	 * the dispatch list.
++	 */
++	spin_lock(&hctx->lock);
++	list_add(&rq->queuelist, &hctx->dispatch);
++	spin_unlock(&hctx->lock);
++	return true;
++}
++EXPORT_SYMBOL_GPL(blk_mq_sched_bypass_insert);
++
++static void blk_mq_sched_free_tags(struct blk_mq_tag_set *set,
++				   struct blk_mq_hw_ctx *hctx,
++				   unsigned int hctx_idx)
++{
++	if (hctx->sched_tags) {
++		blk_mq_free_rqs(set, hctx->sched_tags, hctx_idx);
++		blk_mq_free_rq_map(hctx->sched_tags);
++		hctx->sched_tags = NULL;
++	}
++}
++
++int blk_mq_sched_setup(struct request_queue *q)
++{
++	struct blk_mq_tag_set *set = q->tag_set;
++	struct blk_mq_hw_ctx *hctx;
++	int ret, i;
++
++	/*
++	 * Default to 256, since we don't split into sync/async like the
++	 * old code did. Additionally, this is a per-hw queue depth.
++	 */
++	q->nr_requests = 2 * BLKDEV_MAX_RQ;
++
++	/*
++	 * We're switching to using an IO scheduler, so setup the hctx
++	 * scheduler tags and switch the request map from the regular
++	 * tags to scheduler tags. First allocate what we need, so we
++	 * can safely fail and fallback, if needed.
++	 */
++	ret = 0;
++	queue_for_each_hw_ctx(q, hctx, i) {
++		hctx->sched_tags = blk_mq_alloc_rq_map(set, i, q->nr_requests, 0);
++		if (!hctx->sched_tags) {
++			ret = -ENOMEM;
++			break;
++		}
++		ret = blk_mq_alloc_rqs(set, hctx->sched_tags, i, q->nr_requests);
++		if (ret)
++			break;
++	}
++
++	/*
++	 * If we failed, free what we did allocate
++	 */
++	if (ret) {
++		queue_for_each_hw_ctx(q, hctx, i) {
++			if (!hctx->sched_tags)
++				continue;
++			blk_mq_sched_free_tags(set, hctx, i);
++		}
++
++		return ret;
++	}
++
++	return 0;
++}
++
++void blk_mq_sched_teardown(struct request_queue *q)
++{
++	struct blk_mq_tag_set *set = q->tag_set;
++	struct blk_mq_hw_ctx *hctx;
++	int i;
++
++	queue_for_each_hw_ctx(q, hctx, i)
++		blk_mq_sched_free_tags(set, hctx, i);
++}
+diff --git a/block/blk-mq-sched.h b/block/blk-mq-sched.h
+new file mode 100644
+index 000000000000..35c49e2e008a
+--- /dev/null
++++ b/block/blk-mq-sched.h
+@@ -0,0 +1,170 @@
++#ifndef BLK_MQ_SCHED_H
++#define BLK_MQ_SCHED_H
++
++#include "blk-mq.h"
++#include "blk-mq-tag.h"
++
++int blk_mq_sched_init_hctx_data(struct request_queue *q, size_t size,
++				int (*init)(struct blk_mq_hw_ctx *),
++				void (*exit)(struct blk_mq_hw_ctx *));
++
++void blk_mq_sched_free_hctx_data(struct request_queue *q,
++				 void (*exit)(struct blk_mq_hw_ctx *));
++
++struct request *blk_mq_sched_get_request(struct request_queue *q, struct bio *bio, unsigned int op, struct blk_mq_alloc_data *data);
++void blk_mq_sched_put_request(struct request *rq);
++
++void blk_mq_sched_request_inserted(struct request *rq);
++bool blk_mq_sched_bypass_insert(struct blk_mq_hw_ctx *hctx, struct request *rq);
++bool blk_mq_sched_try_merge(struct request_queue *q, struct bio *bio);
++bool __blk_mq_sched_bio_merge(struct request_queue *q, struct bio *bio);
++bool blk_mq_sched_try_insert_merge(struct request_queue *q, struct request *rq);
++
++void blk_mq_sched_dispatch_requests(struct blk_mq_hw_ctx *hctx);
++void blk_mq_sched_move_to_dispatch(struct blk_mq_hw_ctx *hctx,
++			struct list_head *rq_list,
++			struct request *(*get_rq)(struct blk_mq_hw_ctx *));
++
++int blk_mq_sched_setup(struct request_queue *q);
++void blk_mq_sched_teardown(struct request_queue *q);
++
++static inline bool
++blk_mq_sched_bio_merge(struct request_queue *q, struct bio *bio)
++{
++	struct elevator_queue *e = q->elevator;
++
++	if (!e || blk_queue_nomerges(q) || !bio_mergeable(bio))
++		return false;
++
++	return __blk_mq_sched_bio_merge(q, bio);
++}
++
++static inline int blk_mq_sched_get_rq_priv(struct request_queue *q,
++					   struct request *rq)
++{
++	struct elevator_queue *e = q->elevator;
++
++	if (e && e->type->ops.mq.get_rq_priv)
++		return e->type->ops.mq.get_rq_priv(q, rq);
++
++	return 0;
++}
++
++static inline void blk_mq_sched_put_rq_priv(struct request_queue *q,
++					    struct request *rq)
++{
++	struct elevator_queue *e = q->elevator;
++
++	if (e && e->type->ops.mq.put_rq_priv)
++		e->type->ops.mq.put_rq_priv(q, rq);
++}
++
++static inline void
++blk_mq_sched_insert_request(struct request *rq, bool at_head, bool run_queue,
++			    bool async)
++{
++	struct request_queue *q = rq->q;
++	struct elevator_queue *e = q->elevator;
++	struct blk_mq_ctx *ctx = rq->mq_ctx;
++	struct blk_mq_hw_ctx *hctx = blk_mq_map_queue(q, ctx->cpu);
++
++	if (e && e->type->ops.mq.insert_requests) {
++		LIST_HEAD(list);
++
++		list_add(&rq->queuelist, &list);
++		e->type->ops.mq.insert_requests(hctx, &list, at_head);
++	} else {
++		spin_lock(&ctx->lock);
++		__blk_mq_insert_request(hctx, rq, at_head);
++		spin_unlock(&ctx->lock);
++	}
++
++	if (run_queue)
++		blk_mq_run_hw_queue(hctx, async);
++}
++
++static inline void
++blk_mq_sched_insert_requests(struct request_queue *q, struct blk_mq_ctx *ctx,
++			     struct list_head *list, bool run_queue_async)
++{
++	struct blk_mq_hw_ctx *hctx = blk_mq_map_queue(q, ctx->cpu);
++	struct elevator_queue *e = hctx->queue->elevator;
++
++	if (e && e->type->ops.mq.insert_requests)
++		e->type->ops.mq.insert_requests(hctx, list, false);
++	else
++		blk_mq_insert_requests(hctx, ctx, list);
++
++	blk_mq_run_hw_queue(hctx, run_queue_async);
++}
++
++static inline bool
++blk_mq_sched_allow_merge(struct request_queue *q, struct request *rq,
++			 struct bio *bio)
++{
++	struct elevator_queue *e = q->elevator;
++
++	if (e && e->type->ops.mq.allow_merge)
++		return e->type->ops.mq.allow_merge(q, rq, bio);
++
++	return true;
++}
++
++static inline void
++blk_mq_sched_completed_request(struct blk_mq_hw_ctx *hctx, struct request *rq)
++{
++	struct elevator_queue *e = hctx->queue->elevator;
++
++	if (e && e->type->ops.mq.completed_request)
++		e->type->ops.mq.completed_request(hctx, rq);
++
++	BUG_ON(rq->internal_tag == -1);
++
++	blk_mq_put_tag(hctx, hctx->sched_tags, rq->mq_ctx, rq->internal_tag);
++
++	if (test_bit(BLK_MQ_S_SCHED_RESTART, &hctx->state)) {
++		clear_bit(BLK_MQ_S_SCHED_RESTART, &hctx->state);
++		blk_mq_run_hw_queue(hctx, true);
++	}
++}
++
++static inline void blk_mq_sched_started_request(struct request *rq)
++{
++	struct request_queue *q = rq->q;
++	struct elevator_queue *e = q->elevator;
++
++	if (e && e->type->ops.mq.started_request)
++		e->type->ops.mq.started_request(rq);
++}
++
++static inline void blk_mq_sched_requeue_request(struct request *rq)
++{
++	struct request_queue *q = rq->q;
++	struct elevator_queue *e = q->elevator;
++
++	if (e && e->type->ops.mq.requeue_request)
++		e->type->ops.mq.requeue_request(rq);
++}
++
++static inline bool blk_mq_sched_has_work(struct blk_mq_hw_ctx *hctx)
++{
++	struct elevator_queue *e = hctx->queue->elevator;
++
++	if (e && e->type->ops.mq.has_work)
++		return e->type->ops.mq.has_work(hctx);
++
++	return false;
++}
++
++static inline void blk_mq_sched_mark_restart(struct blk_mq_hw_ctx *hctx)
++{
++	if (!test_bit(BLK_MQ_S_SCHED_RESTART, &hctx->state))
++		set_bit(BLK_MQ_S_SCHED_RESTART, &hctx->state);
++}
++
++static inline bool blk_mq_sched_needs_restart(struct blk_mq_hw_ctx *hctx)
++{
++	return test_bit(BLK_MQ_S_SCHED_RESTART, &hctx->state);
++}
++
++#endif
+diff --git a/block/blk-mq-sysfs.c b/block/blk-mq-sysfs.c
+index 08941faf0f9a..6271eb525a40 100644
+--- a/block/blk-mq-sysfs.c
++++ b/block/blk-mq-sysfs.c
+@@ -216,6 +216,14 @@ static ssize_t blk_mq_hw_sysfs_rq_list_show(struct blk_mq_hw_ctx *hctx,
+ 	return ret;
+ }
+ 
++static ssize_t blk_mq_hw_sysfs_sched_tags_show(struct blk_mq_hw_ctx *hctx, char *page)
++{
++	if (hctx->sched_tags)
++		return blk_mq_tag_sysfs_show(hctx->sched_tags, page);
++
++	return 0;
++}
++
+ static ssize_t blk_mq_hw_sysfs_tags_show(struct blk_mq_hw_ctx *hctx, char *page)
+ {
+ 	return blk_mq_tag_sysfs_show(hctx->tags, page);
+@@ -289,6 +297,10 @@ static struct blk_mq_hw_ctx_sysfs_entry blk_mq_hw_sysfs_pending = {
+ 	.attr = {.name = "pending", .mode = S_IRUGO },
+ 	.show = blk_mq_hw_sysfs_rq_list_show,
+ };
++static struct blk_mq_hw_ctx_sysfs_entry blk_mq_hw_sysfs_sched_tags = {
++	.attr = {.name = "sched_tags", .mode = S_IRUGO },
++	.show = blk_mq_hw_sysfs_sched_tags_show,
++};
+ static struct blk_mq_hw_ctx_sysfs_entry blk_mq_hw_sysfs_tags = {
+ 	.attr = {.name = "tags", .mode = S_IRUGO },
+ 	.show = blk_mq_hw_sysfs_tags_show,
+@@ -304,6 +316,7 @@ static struct attribute *default_hw_ctx_attrs[] = {
+ 	&blk_mq_hw_sysfs_dispatched.attr,
+ 	&blk_mq_hw_sysfs_pending.attr,
+ 	&blk_mq_hw_sysfs_tags.attr,
++	&blk_mq_hw_sysfs_sched_tags.attr,
+ 	&blk_mq_hw_sysfs_cpus.attr,
+ 	&blk_mq_hw_sysfs_active.attr,
+ 	NULL,
+* Unmerged path block/blk-mq.c
+* Unmerged path block/blk-mq.h
+diff --git a/block/blk-tag.c b/block/blk-tag.c
+index f0344e6939d5..e77bd62ab34d 100644
+--- a/block/blk-tag.c
++++ b/block/blk-tag.c
+@@ -272,6 +272,7 @@ void blk_queue_end_tag(struct request_queue *q, struct request *rq)
+ 	list_del_init(&rq->queuelist);
+ 	rq->cmd_flags &= ~REQ_QUEUED;
+ 	rq->tag = -1;
++	rq->internal_tag = -1;
+ 
+ 	if (unlikely(bqt->tag_index[tag] == NULL))
+ 		printk(KERN_ERR "%s: tag %d is missing\n",
+* Unmerged path block/elevator.c
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index e0a594c33528..b9a486340ba2 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -33,6 +33,7 @@ struct blk_mq_hw_ctx {
+ 
+ 	unsigned long		flags;		/* BLK_MQ_F_* flags */
+ 
++	void			*sched_data;
+ 	struct request_queue	*queue;
+ 	unsigned int		queue_num;
+ 
+@@ -54,6 +55,7 @@ struct blk_mq_hw_ctx {
+ 			struct list_head	padding3)
+ 
+ 	struct blk_mq_tags	*tags;
++	struct blk_mq_tags	*sched_tags;
+ 
+ 	unsigned long		queued;
+ 	unsigned long		run;
+@@ -208,6 +210,7 @@ enum {
+ 
+ 	BLK_MQ_S_STOPPED	= 0,
+ 	BLK_MQ_S_TAG_ACTIVE	= 1,
++	BLK_MQ_S_SCHED_RESTART	= 2,
+ 
+ 	BLK_MQ_MAX_DEPTH	= 10240,
+ 
+@@ -225,13 +228,13 @@ void blk_mq_free_tag_set(struct blk_mq_tag_set *set);
+ 
+ void blk_mq_flush_plug_list(struct blk_plug *plug, bool from_schedule);
+ 
+-void blk_mq_insert_request(struct request *, bool, bool, bool);
+ void blk_mq_free_request(struct request *rq);
+ bool blk_mq_can_queue(struct blk_mq_hw_ctx *);
+ 
+ enum {
+ 	BLK_MQ_REQ_NOWAIT	= (1 << 0), /* return when out of requests */
+ 	BLK_MQ_REQ_RESERVED	= (1 << 1), /* allocate from reserved pool */
++	BLK_MQ_REQ_INTERNAL	= (1 << 2), /* allocate internal/sched tag */
+ };
+ 
+ struct request *blk_mq_alloc_request(struct request_queue *q, int rw,
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 5e42b39c9d84..2d3c6259a760 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -131,6 +131,7 @@ struct request {
+ 
+ 	/* the following two fields are internal, NEVER access directly */
+ 	unsigned int __data_len;	/* total data len */
++	int tag;
+ 	sector_t __sector;		/* sector cursor */
+ 
+ 	struct bio *bio;
+@@ -199,10 +200,11 @@ struct request {
+ 
+ 	unsigned short ioprio;
+ 
++	int internal_tag;
++
+ 	void *special;		/* opaque pointer available for LLD use */
+ 	char *buffer;		/* kaddr of the current segment if available */
+ 
+-	int tag;
+ 	int errors;
+ 
+ 	/*
+* Unmerged path include/linux/elevator.h
