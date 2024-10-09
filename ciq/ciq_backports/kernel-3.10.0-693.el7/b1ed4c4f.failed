@@ -1,0 +1,145 @@
+tcp: add an ability to dump and restore window parameters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Andrey Vagin <avagin@openvz.org>
+commit b1ed4c4fa9a5ccf325184fd90edc50978ef6e33a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/b1ed4c4f.failed
+
+We found that sometimes a restored tcp socket doesn't work.
+
+A reason of this bug is incorrect window parameters and in this case
+tcp_acceptable_seq() returns tcp_wnd_end(tp) instead of tp->snd_nxt. The
+other side drops packets with this seq, because seq is less than
+tp->rcv_nxt ( tcp_sequence() ).
+
+Data from a send queue is sent only if there is enough space in a
+window, so when we restore unacked data, we need to expand a window to
+fit this data.
+
+This was in a first version of this patch:
+"tcp: extend window to fit all restored unacked data in a send queue"
+
+Then Alexey recommended me to restore window parameters instead of
+adjusted them according with data in a sent queue. This sounds resonable.
+
+rcv_wnd has to be restored, because it was reported to another side
+and the offered window is never shrunk.
+One of reasons why we need to restore snd_wnd was described above.
+
+	Cc: Pavel Emelyanov <xemul@parallels.com>
+	Cc: "David S. Miller" <davem@davemloft.net>
+	Cc: Alexey Kuznetsov <kuznet@ms2.inr.ac.ru>
+	Cc: James Morris <jmorris@namei.org>
+	Cc: Hideaki YOSHIFUJI <yoshfuji@linux-ipv6.org>
+	Cc: Patrick McHardy <kaber@trash.net>
+	Signed-off-by: Andrey Vagin <avagin@openvz.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b1ed4c4fa9a5ccf325184fd90edc50978ef6e33a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/tcp.h
+diff --cc include/uapi/linux/tcp.h
+index 42da8a620a2f,482898fc433a..000000000000
+--- a/include/uapi/linux/tcp.h
++++ b/include/uapi/linux/tcp.h
+@@@ -112,6 -112,10 +112,13 @@@ enum 
+  #define TCP_FASTOPEN		23	/* Enable FastOpen on listeners */
+  #define TCP_TIMESTAMP		24
+  #define TCP_NOTSENT_LOWAT	25	/* limit number of unsent bytes in write queue */
+++<<<<<<< HEAD
+++=======
++ #define TCP_CC_INFO		26	/* Get Congestion Control (optional) info */
++ #define TCP_SAVE_SYN		27	/* Record SYN headers for new connections */
++ #define TCP_SAVED_SYN		28	/* Get SYN headers recorded for connection */
++ #define TCP_REPAIR_WINDOW	29	/* Get/set window parameters */
+++>>>>>>> b1ed4c4fa9a5 (tcp: add an ability to dump and restore window parameters)
+  
+  struct tcp_repair_opt {
+  	__u32	opt_code;
+* Unmerged path include/uapi/linux/tcp.h
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index ffb93a90d175..908f5a4a7154 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -2258,6 +2258,38 @@ static inline bool tcp_can_repair_sock(const struct sock *sk)
+ 		((1 << sk->sk_state) & (TCPF_CLOSE | TCPF_ESTABLISHED));
+ }
+ 
++static int tcp_repair_set_window(struct tcp_sock *tp, char __user *optbuf, int len)
++{
++	struct tcp_repair_window opt;
++
++	if (!tp->repair)
++		return -EPERM;
++
++	if (len != sizeof(opt))
++		return -EINVAL;
++
++	if (copy_from_user(&opt, optbuf, sizeof(opt)))
++		return -EFAULT;
++
++	if (opt.max_window < opt.snd_wnd)
++		return -EINVAL;
++
++	if (after(opt.snd_wl1, tp->rcv_nxt + opt.rcv_wnd))
++		return -EINVAL;
++
++	if (after(opt.rcv_wup, tp->rcv_nxt))
++		return -EINVAL;
++
++	tp->snd_wl1	= opt.snd_wl1;
++	tp->snd_wnd	= opt.snd_wnd;
++	tp->max_window	= opt.max_window;
++
++	tp->rcv_wnd	= opt.rcv_wnd;
++	tp->rcv_wup	= opt.rcv_wup;
++
++	return 0;
++}
++
+ static int tcp_repair_options_est(struct tcp_sock *tp,
+ 		struct tcp_repair_opt __user *optbuf, unsigned int len)
+ {
+@@ -2577,6 +2609,9 @@ static int do_tcp_setsockopt(struct sock *sk, int level,
+ 		else
+ 			tp->tsoffset = val - tcp_time_stamp;
+ 		break;
++	case TCP_REPAIR_WINDOW:
++		err = tcp_repair_set_window(tp, optval, optlen);
++		break;
+ 	case TCP_NOTSENT_LOWAT:
+ 		tp->notsent_lowat = val;
+ 		sk->sk_write_space(sk);
+@@ -2798,6 +2833,28 @@ static int do_tcp_getsockopt(struct sock *sk, int level,
+ 			return -EINVAL;
+ 		break;
+ 
++	case TCP_REPAIR_WINDOW: {
++		struct tcp_repair_window opt;
++
++		if (get_user(len, optlen))
++			return -EFAULT;
++
++		if (len != sizeof(opt))
++			return -EINVAL;
++
++		if (!tp->repair)
++			return -EPERM;
++
++		opt.snd_wl1	= tp->snd_wl1;
++		opt.snd_wnd	= tp->snd_wnd;
++		opt.max_window	= tp->max_window;
++		opt.rcv_wnd	= tp->rcv_wnd;
++		opt.rcv_wup	= tp->rcv_wup;
++
++		if (copy_to_user(optval, &opt, len))
++			return -EFAULT;
++		return 0;
++	}
+ 	case TCP_QUEUE_SEQ:
+ 		if (tp->repair_queue == TCP_SEND_QUEUE)
+ 			val = tp->write_seq;
