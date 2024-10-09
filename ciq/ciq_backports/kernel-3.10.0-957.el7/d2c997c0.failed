@@ -1,0 +1,162 @@
+fs, dax: use page->mapping to warn if truncate collides with a busy page
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit d2c997c0f14535eff68d8ed9c2f1c5e100625751
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/d2c997c0.failed
+
+Catch cases where extent unmap operations encounter pages that are
+pinned / busy. Typically this is pinned pages that are under active dma.
+This warning is a canary for potential data corruption as truncated
+blocks could be allocated to a new file while the device is still
+performing i/o.
+
+Here is an example of a collision that this implementation catches:
+
+ WARNING: CPU: 2 PID: 1286 at fs/dax.c:343 dax_disassociate_entry+0x55/0x80
+ [..]
+ Call Trace:
+  __dax_invalidate_mapping_entry+0x6c/0xf0
+  dax_delete_mapping_entry+0xf/0x20
+  truncate_exceptional_pvec_entries.part.12+0x1af/0x200
+  truncate_inode_pages_range+0x268/0x970
+  ? tlb_gather_mmu+0x10/0x20
+  ? up_write+0x1c/0x40
+  ? unmap_mapping_range+0x73/0x140
+  xfs_free_file_space+0x1b6/0x5b0 [xfs]
+  ? xfs_file_fallocate+0x7f/0x320 [xfs]
+  ? down_write_nested+0x40/0x70
+  ? xfs_ilock+0x21d/0x2f0 [xfs]
+  xfs_file_fallocate+0x162/0x320 [xfs]
+  ? rcu_read_lock_sched_held+0x3f/0x70
+  ? rcu_sync_lockdep_assert+0x2a/0x50
+  ? __sb_start_write+0xd0/0x1b0
+  ? vfs_fallocate+0x20c/0x270
+  vfs_fallocate+0x154/0x270
+  SyS_fallocate+0x43/0x80
+  entry_SYSCALL_64_fastpath+0x1f/0x96
+
+	Cc: Jeff Moyer <jmoyer@redhat.com>
+	Cc: Matthew Wilcox <mawilcox@microsoft.com>
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit d2c997c0f14535eff68d8ed9c2f1c5e100625751)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+diff --cc fs/dax.c
+index 879d2cfa39b7,a77394fe586e..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -263,11 -298,68 +263,68 @@@ static void put_unlocked_mapping_entry(
+  	dax_wake_mapping_entry_waiter(mapping, index, entry, false);
+  }
+  
++ static unsigned long dax_entry_size(void *entry)
++ {
++ 	if (dax_is_zero_entry(entry))
++ 		return 0;
++ 	else if (dax_is_empty_entry(entry))
++ 		return 0;
++ 	else if (dax_is_pmd_entry(entry))
++ 		return PMD_SIZE;
++ 	else
++ 		return PAGE_SIZE;
++ }
++ 
++ static unsigned long dax_radix_end_pfn(void *entry)
++ {
++ 	return dax_radix_pfn(entry) + dax_entry_size(entry) / PAGE_SIZE;
++ }
++ 
++ /*
++  * Iterate through all mapped pfns represented by an entry, i.e. skip
++  * 'empty' and 'zero' entries.
++  */
++ #define for_each_mapped_pfn(entry, pfn) \
++ 	for (pfn = dax_radix_pfn(entry); \
++ 			pfn < dax_radix_end_pfn(entry); pfn++)
++ 
++ static void dax_associate_entry(void *entry, struct address_space *mapping)
++ {
++ 	unsigned long pfn;
++ 
++ 	if (IS_ENABLED(CONFIG_FS_DAX_LIMITED))
++ 		return;
++ 
++ 	for_each_mapped_pfn(entry, pfn) {
++ 		struct page *page = pfn_to_page(pfn);
++ 
++ 		WARN_ON_ONCE(page->mapping);
++ 		page->mapping = mapping;
++ 	}
++ }
++ 
++ static void dax_disassociate_entry(void *entry, struct address_space *mapping,
++ 		bool trunc)
++ {
++ 	unsigned long pfn;
++ 
++ 	if (IS_ENABLED(CONFIG_FS_DAX_LIMITED))
++ 		return;
++ 
++ 	for_each_mapped_pfn(entry, pfn) {
++ 		struct page *page = pfn_to_page(pfn);
++ 
++ 		WARN_ON_ONCE(trunc && page_ref_count(page) > 1);
++ 		WARN_ON_ONCE(page->mapping && page->mapping != mapping);
++ 		page->mapping = NULL;
++ 	}
++ }
++ 
+  /*
+ - * Find radix tree entry at given index. If it points to an exceptional entry,
+ - * return it with the radix tree entry locked. If the radix tree doesn't
+ - * contain given index, create an empty exceptional entry for the index and
+ - * return with it locked.
+ + * Find radix tree entry at given index. If it points to a page, return with
+ + * the page locked. If it points to the exceptional entry, return with the
+ + * radix tree entry locked. If the radix tree doesn't contain given index,
+ + * create empty exceptional entry for the index and return with it locked.
+   *
+   * When requesting an entry with size RADIX_DAX_PMD, grab_mapping_entry() will
+   * either return that locked entry or will return an error.  This error will
+@@@ -603,21 -605,13 +662,29 @@@ static void *dax_insert_mapping_entry(s
+  	}
+  
+  	spin_lock_irq(&mapping->tree_lock);
+++<<<<<<< HEAD
+ +	new_entry = dax_radix_locked_entry(sector, flags);
+++=======
++ 	new_entry = dax_radix_locked_entry(pfn, flags);
++ 	if (dax_entry_size(entry) != dax_entry_size(new_entry)) {
++ 		dax_disassociate_entry(entry, mapping, false);
++ 		dax_associate_entry(new_entry, mapping);
++ 	}
+ -
+ -	if (dax_is_zero_entry(entry) || dax_is_empty_entry(entry)) {
+++>>>>>>> d2c997c0f145 (fs, dax: use page->mapping to warn if truncate collides with a busy page)
+ +
+ +	if (hole_fill) {
+ +		__delete_from_page_cache(entry, NULL);
+ +		mem_cgroup_uncharge_page(entry);
+ +		/* Drop pagecache reference */
+ +		page_cache_release(entry);
+ +		error = __radix_tree_insert(page_tree, index,
+ +				dax_radix_order(new_entry), new_entry);
+ +		if (error) {
+ +			new_entry = ERR_PTR(error);
+ +			goto unlock;
+ +		}
+ +		mapping->nrexceptional++;
+ +	} else if (dax_is_zero_entry(entry) || dax_is_empty_entry(entry)) {
+  		/*
+  		 * Only swap our new entry into the radix tree if the current
+  		 * entry is a zero page or an empty entry.  If a normal PTE or
+* Unmerged path fs/dax.c
