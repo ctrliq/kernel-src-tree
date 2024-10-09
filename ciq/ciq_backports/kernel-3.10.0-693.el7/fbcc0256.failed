@@ -1,0 +1,92 @@
+xfs: Introduce writeback context for writepages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit fbcc025613590d7b1d15521555dcc6393a148a6b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/fbcc0256.failed
+
+xfs_vm_writepages() calls generic_writepages to writeback a range of
+a file, but then xfs_vm_writepage() clusters pages itself as it does
+not have any context it can pass between->writepage calls from
+__write_cache_pages().
+
+Introduce a writeback context for xfs_vm_writepages() and call
+__write_cache_pages directly with our own writepage callback so that
+we can pass that context to each writepage invocation. This
+encapsulates the current mapping, whether it is valid or not, the
+current ioend and it's IO type and the ioend chain being built.
+
+This requires us to move the ioend submission up to the level where
+the writepage context is declared. This does mean we do not submit
+IO until we packaged the entire writeback range, but with the block
+plugging in the writepages call this is the way IO is submitted,
+anyway.
+
+It also means that we need to handle discontiguous page ranges.  If
+the pages sent down by write_cache_pages to the writepage callback
+are discontiguous, we need to detect this and put each discontiguous
+page range into individual ioends. This is needed to ensure that the
+ioend accurately represents the range of the file that it covers so
+that file size updates during IO completion set the size correctly.
+Failure to take into account the discontiguous ranges results in
+files being too small when writeback patterns are non-sequential.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit fbcc025613590d7b1d15521555dcc6393a148a6b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_aops.c
+diff --cc fs/xfs/xfs_aops.c
+index acf6c4a54883,e0be34125cf0..000000000000
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@@ -1200,12 -1196,14 +1204,22 @@@ xfs_vm_writepages
+  	struct address_space	*mapping,
+  	struct writeback_control *wbc)
+  {
++ 	struct xfs_writepage_ctx wpc = {
++ 		.io_type = XFS_IO_INVALID,
++ 	};
++ 	int			ret;
++ 
+  	xfs_iflags_clear(XFS_I(mapping->host), XFS_ITRUNCATED);
+++<<<<<<< HEAD
+ +	if (dax_mapping(mapping))
+ +		return dax_writeback_mapping_range(mapping,
+ +				xfs_find_bdev_for_inode(mapping->host), wbc);
+ +
+ +	return generic_writepages(mapping, wbc);
+++=======
++ 	ret = write_cache_pages(mapping, wbc, xfs_do_writepage, &wpc);
++ 	return xfs_writepage_submit(&wpc, wbc, ret);
+++>>>>>>> fbcc02561359 (xfs: Introduce writeback context for writepages)
+  }
+  
+  /*
+* Unmerged path fs/xfs/xfs_aops.c
+diff --git a/fs/xfs/xfs_aops.h b/fs/xfs/xfs_aops.h
+index a4343c63fb38..fcaa4cd39c4c 100644
+--- a/fs/xfs/xfs_aops.h
++++ b/fs/xfs/xfs_aops.h
+@@ -24,12 +24,14 @@ extern mempool_t *xfs_ioend_pool;
+  * Types of I/O for bmap clustering and I/O completion tracking.
+  */
+ enum {
++	XFS_IO_INVALID,		/* initial state */
+ 	XFS_IO_DELALLOC,	/* covers delalloc region */
+ 	XFS_IO_UNWRITTEN,	/* covers allocated but uninitialized data */
+ 	XFS_IO_OVERWRITE,	/* covers already allocated extent */
+ };
+ 
+ #define XFS_IO_TYPES \
++	{ XFS_IO_INVALID,		"invalid" }, \
+ 	{ XFS_IO_DELALLOC,		"delalloc" }, \
+ 	{ XFS_IO_UNWRITTEN,		"unwritten" }, \
+ 	{ XFS_IO_OVERWRITE,		"overwrite" }
