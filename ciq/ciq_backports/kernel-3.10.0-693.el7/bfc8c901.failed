@@ -1,0 +1,297 @@
+mem-hotplug: implement get/put_online_mems
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Vladimir Davydov <vdavydov@parallels.com>
+commit bfc8c90139ebd049b9801a951db3b9a4a00bed9c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/bfc8c901.failed
+
+kmem_cache_{create,destroy,shrink} need to get a stable value of
+cpu/node online mask, because they init/destroy/access per-cpu/node
+kmem_cache parts, which can be allocated or destroyed on cpu/mem
+hotplug.  To protect against cpu hotplug, these functions use
+{get,put}_online_cpus.  However, they do nothing to synchronize with
+memory hotplug - taking the slab_mutex does not eliminate the
+possibility of race as described in patch 2.
+
+What we need there is something like get_online_cpus, but for memory.
+We already have lock_memory_hotplug, which serves for the purpose, but
+it's a bit of a hammer right now, because it's backed by a mutex.  As a
+result, it imposes some limitations to locking order, which are not
+desirable, and can't be used just like get_online_cpus.  That's why in
+patch 1 I substitute it with get/put_online_mems, which work exactly
+like get/put_online_cpus except they block not cpu, but memory hotplug.
+
+[ v1 can be found at https://lkml.org/lkml/2014/4/6/68.  I NAK'ed it by
+  myself, because it used an rw semaphore for get/put_online_mems,
+  making them dead lock prune.  ]
+
+This patch (of 2):
+
+{un}lock_memory_hotplug, which is used to synchronize against memory
+hotplug, is currently backed by a mutex, which makes it a bit of a
+hammer - threads that only want to get a stable value of online nodes
+mask won't be able to proceed concurrently.  Also, it imposes some
+strong locking ordering rules on it, which narrows down the set of its
+usage scenarios.
+
+This patch introduces get/put_online_mems, which are the same as
+get/put_online_cpus, but for memory hotplug, i.e.  executing a code
+inside a get/put_online_mems section will guarantee a stable value of
+online nodes, present pages, etc.
+
+lock_memory_hotplug()/unlock_memory_hotplug() are removed altogether.
+
+	Signed-off-by: Vladimir Davydov <vdavydov@parallels.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: Tang Chen <tangchen@cn.fujitsu.com>
+	Cc: Zhang Yanfei <zhangyanfei@cn.fujitsu.com>
+	Cc: Toshi Kani <toshi.kani@hp.com>
+	Cc: Xishi Qiu <qiuxishi@huawei.com>
+	Cc: Jiang Liu <liuj97@gmail.com>
+	Cc: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Wen Congyang <wency@cn.fujitsu.com>
+	Cc: Yasuaki Ishimatsu <isimatu.yasuaki@jp.fujitsu.com>
+	Cc: Lai Jiangshan <laijs@cn.fujitsu.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit bfc8c90139ebd049b9801a951db3b9a4a00bed9c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memory_hotplug.c
+diff --cc mm/memory_hotplug.c
+index 53747167957f,2906873a1502..000000000000
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@@ -965,23 -976,18 +1034,37 @@@ int __ref online_pages(unsigned long pf
+  	 */
+  	zone = page_zone(pfn_to_page(pfn));
+  
++ 	ret = -EINVAL;
+  	if ((zone_idx(zone) > ZONE_NORMAL || online_type == ONLINE_MOVABLE) &&
+++<<<<<<< HEAD
+ +	    !can_online_high_movable(zone)) {
+ +		unlock_memory_hotplug();
+ +		return -1;
+ +	}
+ +
+ +	if (online_type == ONLINE_KERNEL && zone_idx(zone) == ZONE_MOVABLE) {
+ +		if (move_pfn_range_left(zone - 1, zone, pfn, pfn + nr_pages)) {
+ +			unlock_memory_hotplug();
+ +			return -1;
+ +		}
+ +	}
+ +	if (online_type == ONLINE_MOVABLE && zone_idx(zone) == ZONE_MOVABLE - 1) {
+ +		if (move_pfn_range_right(zone, zone + 1, pfn, pfn + nr_pages)) {
+ +			unlock_memory_hotplug();
+ +			return -1;
+ +		}
+++=======
++ 	    !can_online_high_movable(zone))
++ 		goto out;
++ 
++ 	if (online_type == ONLINE_KERNEL && zone_idx(zone) == ZONE_MOVABLE) {
++ 		if (move_pfn_range_left(zone - 1, zone, pfn, pfn + nr_pages))
++ 			goto out;
++ 	}
++ 	if (online_type == ONLINE_MOVABLE && zone_idx(zone) == ZONE_MOVABLE - 1) {
++ 		if (move_pfn_range_right(zone, zone + 1, pfn, pfn + nr_pages))
++ 			goto out;
+++>>>>>>> bfc8c90139eb (mem-hotplug: implement get/put_online_mems)
+  	}
+  
+  	/* Previous code may changed the zone of the pfn range */
+@@@ -1235,13 -1179,7 +1316,17 @@@ int __ref add_memory(int nid, u64 start
+  		new_pgdat = !p;
+  	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Add new range to memblock so that when hotadd_new_pgdat() is called
+ +	 * to allocate new pgdat, get_pfn_range_for_nid() will be able to find
+ +	 * this new range and calculate total pages correctly.  The range will
+ +	 * be removed at hot-remove time.
+ +	 */
+ +	memblock_add_node(start, size, nid);
+++=======
++ 	mem_hotplug_begin();
+++>>>>>>> bfc8c90139eb (mem-hotplug: implement get/put_online_mems)
+  
+  	new_node = !node_online(nid);
+  	if (new_node) {
+@@@ -1280,10 -1218,9 +1365,10 @@@ error
+  	if (new_pgdat)
+  		rollback_node_hotadd(nid, pgdat);
+  	release_memory_resource(res);
+ +	memblock_remove(start, size);
+  
+  out:
+- 	unlock_memory_hotplug();
++ 	mem_hotplug_done();
+  	return ret;
+  }
+  EXPORT_SYMBOL_GPL(add_memory);
+@@@ -2000,11 -1958,9 +2085,15 @@@ void __ref remove_memory(int nid, u64 s
+  	 * if this is not the case.
+  	 */
+  	ret = walk_memory_range(PFN_DOWN(start), PFN_UP(start + size - 1), NULL,
+++<<<<<<< HEAD
+ +				is_memblock_offlined_cb);
+ +	if (ret) {
+ +		unlock_memory_hotplug();
+++=======
++ 				check_memblock_offlined_cb);
++ 	if (ret)
+++>>>>>>> bfc8c90139eb (mem-hotplug: implement get/put_online_mems)
+  		BUG();
+- 	}
+  
+  	/* remove memmap entry */
+  	firmware_map_remove(start, start + size, "System RAM");
+diff --git a/include/linux/memory_hotplug.h b/include/linux/memory_hotplug.h
+index b74828398ae5..ff51d8e6f2dc 100644
+--- a/include/linux/memory_hotplug.h
++++ b/include/linux/memory_hotplug.h
+@@ -187,14 +187,8 @@ extern void put_page_bootmem(struct page *page);
+ extern void get_page_bootmem(unsigned long ingo, struct page *page,
+ 			     unsigned long type);
+ 
+-/*
+- * Lock for memory hotplug guarantees 1) all callbacks for memory hotplug
+- * notifier will be called under this. 2) offline/online/add/remove memory
+- * will not run simultaneously.
+- */
+-
+-void lock_memory_hotplug(void);
+-void unlock_memory_hotplug(void);
++void get_online_mems(void);
++void put_online_mems(void);
+ 
+ #else /* ! CONFIG_MEMORY_HOTPLUG */
+ /*
+@@ -232,8 +226,8 @@ static inline int try_online_node(int nid)
+ 	return 0;
+ }
+ 
+-static inline void lock_memory_hotplug(void) {}
+-static inline void unlock_memory_hotplug(void) {}
++static inline void get_online_mems(void) {}
++static inline void put_online_mems(void) {}
+ 
+ #endif /* ! CONFIG_MEMORY_HOTPLUG */
+ 
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index f2a804d7d2a3..d4fc89452e38 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -499,9 +499,8 @@ struct zone {
+ 	 * give them a chance of being in the same cacheline.
+ 	 *
+ 	 * Write access to present_pages at runtime should be protected by
+-	 * lock_memory_hotplug()/unlock_memory_hotplug().  Any reader who can't
+-	 * tolerant drift of present_pages should hold memory hotplug lock to
+-	 * get a stable value.
++	 * mem_hotplug_begin/end(). Any reader who can't tolerant drift of
++	 * present_pages should get_online_mems() to get a stable value.
+ 	 *
+ 	 * Read access to managed_pages should be safe because it's unsigned
+ 	 * long. Write access to zone->managed_pages and totalram_pages are
+@@ -792,7 +791,8 @@ typedef struct pglist_data {
+ 	nodemask_t reclaim_nodes;	/* Nodes allowed to reclaim from */
+ 	wait_queue_head_t kswapd_wait;
+ 	wait_queue_head_t pfmemalloc_wait;
+-	struct task_struct *kswapd;	/* Protected by lock_memory_hotplug() */
++	struct task_struct *kswapd;	/* Protected by
++					   mem_hotplug_begin/end() */
+ 	int kswapd_max_order;
+ 	enum zone_type classzone_idx;
+ #ifdef CONFIG_NUMA_BALANCING
+diff --git a/mm/kmemleak.c b/mm/kmemleak.c
+index 04723cdbe17d..0e4f53049797 100644
+--- a/mm/kmemleak.c
++++ b/mm/kmemleak.c
+@@ -1298,7 +1298,7 @@ static void kmemleak_scan(void)
+ 	/*
+ 	 * Struct page scanning for each node.
+ 	 */
+-	lock_memory_hotplug();
++	get_online_mems();
+ 	for_each_online_node(i) {
+ 		unsigned long start_pfn = node_start_pfn(i);
+ 		unsigned long end_pfn = node_end_pfn(i);
+@@ -1316,7 +1316,7 @@ static void kmemleak_scan(void)
+ 			scan_block(page, page + 1, NULL, 1);
+ 		}
+ 	}
+-	unlock_memory_hotplug();
++	put_online_mems();
+ 
+ 	/*
+ 	 * Scanning the task stacks (may introduce false negatives).
+diff --git a/mm/memory-failure.c b/mm/memory-failure.c
+index fa0f38d270a2..e99bafbf62ff 100644
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@ -1641,11 +1641,7 @@ int soft_offline_page(struct page *page, int flags)
+ 		}
+ 	}
+ 
+-	/*
+-	 * The lock_memory_hotplug prevents a race with memory hotplug.
+-	 * This is a big hammer, a better would be nicer.
+-	 */
+-	lock_memory_hotplug();
++	get_online_mems();
+ 
+ 	/*
+ 	 * Isolate the page, so that it doesn't get reallocated if it
+@@ -1656,7 +1652,7 @@ int soft_offline_page(struct page *page, int flags)
+ 		set_migratetype_isolate(page, true);
+ 
+ 	ret = get_any_page(page, pfn, flags);
+-	unlock_memory_hotplug();
++	put_online_mems();
+ 	if (ret > 0) { /* for in-use pages */
+ 		if (PageHuge(page))
+ 			ret = soft_offline_huge_page(page, flags);
+* Unmerged path mm/memory_hotplug.c
+diff --git a/mm/slub.c b/mm/slub.c
+index 9a04dd15ed0d..4e83c8337168 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -4547,7 +4547,7 @@ static ssize_t show_slab_objects(struct kmem_cache *s,
+ 		}
+ 	}
+ 
+-	lock_memory_hotplug();
++	get_online_mems();
+ #ifdef CONFIG_SLUB_DEBUG
+ 	if (flags & SO_ALL) {
+ 		for_each_node_state(node, N_NORMAL_MEMORY) {
+@@ -4588,7 +4588,7 @@ static ssize_t show_slab_objects(struct kmem_cache *s,
+ 			x += sprintf(buf + x, " N%d=%lu",
+ 					node, nodes[node]);
+ #endif
+-	unlock_memory_hotplug();
++	put_online_mems();
+ 	kfree(nodes);
+ 	return x + sprintf(buf + x, "\n");
+ }
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 647425138e16..082f09f10c5a 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -3468,7 +3468,7 @@ int kswapd_run(int nid)
+ 
+ /*
+  * Called by memory hotplug when all memory in a node is offlined.  Caller must
+- * hold lock_memory_hotplug().
++ * hold mem_hotplug_begin/end().
+  */
+ void kswapd_stop(int nid)
+ {
