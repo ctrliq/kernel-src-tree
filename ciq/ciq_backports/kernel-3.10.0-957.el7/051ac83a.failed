@@ -1,0 +1,195 @@
+mm/rmap: make rmap_walk to get the rmap_walk_control argument
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mm] rmap: make rmap_walk to get the rmap_walk_control argument (Rafael Aquini) [1562137]
+Rebuild_FUZZ: 97.48%
+commit-author Joonsoo Kim <iamjoonsoo.kim@lge.com>
+commit 051ac83adf69eea4f57a97356e4282e395a5fa6d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/051ac83a.failed
+
+In each rmap traverse case, there is some difference so that we need
+function pointers and arguments to them in order to handle these
+
+For this purpose, struct rmap_walk_control is introduced in this patch,
+and will be extended in following patch.  Introducing and extending are
+separate, because it clarify changes.
+
+	Signed-off-by: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Reviewed-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Hillf Danton <dhillf@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 051ac83adf69eea4f57a97356e4282e395a5fa6d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/rmap.c
+diff --cc mm/rmap.c
+index 794c49685fc7,f8f10ad5d359..000000000000
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@@ -1915,27 -1696,42 +1915,48 @@@ static int rmap_walk_anon(struct page *
+  	 */
+  	anon_vma = page_anon_vma(page);
+  	if (!anon_vma)
+++<<<<<<< HEAD
+++=======
++ 		return NULL;
++ 
++ 	anon_vma_lock_read(anon_vma);
++ 	return anon_vma;
++ }
++ 
++ /*
++  * rmap_walk() and its helpers rmap_walk_anon() and rmap_walk_file():
++  * Called by migrate.c to remove migration ptes, but might be used more later.
++  */
++ static int rmap_walk_anon(struct page *page, struct rmap_walk_control *rwc)
++ {
++ 	struct anon_vma *anon_vma;
++ 	pgoff_t pgoff = page->index << (PAGE_CACHE_SHIFT - PAGE_SHIFT);
++ 	struct anon_vma_chain *avc;
++ 	int ret = SWAP_AGAIN;
++ 
++ 	anon_vma = rmap_walk_anon_lock(page);
++ 	if (!anon_vma)
+++>>>>>>> 051ac83adf69 (mm/rmap: make rmap_walk to get the rmap_walk_control argument)
+  		return ret;
+ -
+ +	anon_vma_lock_read(anon_vma);
+ +	pgoff = page_to_pgoff(page);
+  	anon_vma_interval_tree_foreach(avc, &anon_vma->rb_root, pgoff, pgoff) {
+  		struct vm_area_struct *vma = avc->vma;
+  		unsigned long address = vma_address(page, vma);
+- 		ret = rmap_one(page, vma, address, arg);
++ 		ret = rwc->rmap_one(page, vma, address, rwc->arg);
+  		if (ret != SWAP_AGAIN)
+  			break;
+ +
+ +		cond_resched();
+  	}
+  	anon_vma_unlock_read(anon_vma);
+  	return ret;
+  }
+  
+- static int rmap_walk_file(struct page *page, int (*rmap_one)(struct page *,
+- 		struct vm_area_struct *, unsigned long, void *), void *arg)
++ static int rmap_walk_file(struct page *page, struct rmap_walk_control *rwc)
+  {
+  	struct address_space *mapping = page->mapping;
+ -	pgoff_t pgoff = page->index << compound_order(page);
+ +	pgoff_t pgoff;
+  	struct vm_area_struct *vma;
+  	int ret = SWAP_AGAIN;
+  
+@@@ -1945,11 -1740,9 +1966,11 @@@
+  	mutex_lock(&mapping->i_mmap_mutex);
+  	vma_interval_tree_foreach(vma, &mapping->i_mmap, pgoff, pgoff) {
+  		unsigned long address = vma_address(page, vma);
+- 		ret = rmap_one(page, vma, address, arg);
++ 		ret = rwc->rmap_one(page, vma, address, rwc->arg);
+  		if (ret != SWAP_AGAIN)
+  			break;
+ +
+ +		cond_resched();
+  	}
+  	/*
+  	 * No nonlinear handling: being always shared, nonlinear vmas
+diff --git a/include/linux/ksm.h b/include/linux/ksm.h
+index 45c9b6a17bcb..0eef8cb0baf7 100644
+--- a/include/linux/ksm.h
++++ b/include/linux/ksm.h
+@@ -76,8 +76,7 @@ struct page *ksm_might_need_to_copy(struct page *page,
+ int page_referenced_ksm(struct page *page,
+ 			struct mem_cgroup *memcg, unsigned long *vm_flags);
+ int try_to_unmap_ksm(struct page *page, enum ttu_flags flags);
+-int rmap_walk_ksm(struct page *page, int (*rmap_one)(struct page *,
+-		  struct vm_area_struct *, unsigned long, void *), void *arg);
++int rmap_walk_ksm(struct page *page, struct rmap_walk_control *rwc);
+ void ksm_migrate_page(struct page *newpage, struct page *oldpage);
+ 
+ #else  /* !CONFIG_KSM */
+@@ -120,8 +119,8 @@ static inline int try_to_unmap_ksm(struct page *page, enum ttu_flags flags)
+ 	return 0;
+ }
+ 
+-static inline int rmap_walk_ksm(struct page *page, int (*rmap_one)(struct page*,
+-		struct vm_area_struct *, unsigned long, void *), void *arg)
++static inline int rmap_walk_ksm(struct page *page,
++			struct rmap_walk_control *rwc)
+ {
+ 	return 0;
+ }
+diff --git a/include/linux/rmap.h b/include/linux/rmap.h
+index 4fef883ac5c3..a63c065a3873 100644
+--- a/include/linux/rmap.h
++++ b/include/linux/rmap.h
+@@ -245,11 +245,16 @@ struct anon_vma *page_lock_anon_vma_read(struct page *page);
+ void page_unlock_anon_vma_read(struct anon_vma *anon_vma);
+ int page_mapped_in_vma(struct page *page, struct vm_area_struct *vma);
+ 
++struct rmap_walk_control {
++	void *arg;
++	int (*rmap_one)(struct page *page, struct vm_area_struct *vma,
++					unsigned long addr, void *arg);
++};
++
+ /*
+  * Called by migrate.c to remove migration ptes, but might be used more later.
+  */
+-int rmap_walk(struct page *page, int (*rmap_one)(struct page *,
+-		struct vm_area_struct *, unsigned long, void *), void *arg);
++int rmap_walk(struct page *page, struct rmap_walk_control *rwc);
+ 
+ #else	/* !CONFIG_MMU */
+ 
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 1813339bf866..8c20423cd586 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -2608,8 +2608,7 @@ out:
+ }
+ 
+ #ifdef CONFIG_MIGRATION
+-int rmap_walk_ksm(struct page *page, int (*rmap_one)(struct page *,
+-		  struct vm_area_struct *, unsigned long, void *), void *arg)
++int rmap_walk_ksm(struct page *page, struct rmap_walk_control *rwc)
+ {
+ 	struct stable_node *stable_node;
+ 	struct rmap_item *rmap_item;
+@@ -2644,7 +2643,8 @@ again:
+ 			if ((rmap_item->mm == vma->vm_mm) == search_new_forks)
+ 				continue;
+ 
+-			ret = rmap_one(page, vma, rmap_item->address, arg);
++			ret = rwc->rmap_one(page, vma,
++					rmap_item->address, rwc->arg);
+ 			if (ret != SWAP_AGAIN) {
+ 				anon_vma_unlock_read(anon_vma);
+ 				goto out;
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 50c754f07cf8..bd9a31978229 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -205,7 +205,12 @@ out:
+  */
+ static void remove_migration_ptes(struct page *old, struct page *new)
+ {
+-	rmap_walk(new, remove_migration_pte, old);
++	struct rmap_walk_control rwc = {
++		.rmap_one = remove_migration_pte,
++		.arg = old,
++	};
++
++	rmap_walk(new, &rwc);
+ }
+ 
+ /*
+* Unmerged path mm/rmap.c
