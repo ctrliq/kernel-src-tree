@@ -1,0 +1,404 @@
+amd-xgbe: Add support for the skb->xmit_more flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit 16958a2b05def4ed214ae681b7ee4ce8537b00fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/16958a2b.failed
+
+Add support to delay telling the hardware about data that is ready to
+be transmitted if the skb->xmit_more flag is set.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 16958a2b05def4ed214ae681b7ee4ce8537b00fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+index 81bd491c7d02,53f5f66ec2ee..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+@@@ -896,7 -1151,204 +896,208 @@@ static void xgbe_rx_desc_init(struct xg
+  	DBGPR("<--rx_desc_init\n");
+  }
+  
+++<<<<<<< HEAD
+ +static void xgbe_pre_xmit(struct xgbe_channel *channel)
+++=======
++ static void xgbe_update_tstamp_addend(struct xgbe_prv_data *pdata,
++ 				      unsigned int addend)
++ {
++ 	/* Set the addend register value and tell the device */
++ 	XGMAC_IOWRITE(pdata, MAC_TSAR, addend);
++ 	XGMAC_IOWRITE_BITS(pdata, MAC_TSCR, TSADDREG, 1);
++ 
++ 	/* Wait for addend update to complete */
++ 	while (XGMAC_IOREAD_BITS(pdata, MAC_TSCR, TSADDREG))
++ 		udelay(5);
++ }
++ 
++ static void xgbe_set_tstamp_time(struct xgbe_prv_data *pdata, unsigned int sec,
++ 				 unsigned int nsec)
++ {
++ 	/* Set the time values and tell the device */
++ 	XGMAC_IOWRITE(pdata, MAC_STSUR, sec);
++ 	XGMAC_IOWRITE(pdata, MAC_STNUR, nsec);
++ 	XGMAC_IOWRITE_BITS(pdata, MAC_TSCR, TSINIT, 1);
++ 
++ 	/* Wait for time update to complete */
++ 	while (XGMAC_IOREAD_BITS(pdata, MAC_TSCR, TSINIT))
++ 		udelay(5);
++ }
++ 
++ static u64 xgbe_get_tstamp_time(struct xgbe_prv_data *pdata)
++ {
++ 	u64 nsec;
++ 
++ 	nsec = XGMAC_IOREAD(pdata, MAC_STSR);
++ 	nsec *= NSEC_PER_SEC;
++ 	nsec += XGMAC_IOREAD(pdata, MAC_STNR);
++ 
++ 	return nsec;
++ }
++ 
++ static u64 xgbe_get_tx_tstamp(struct xgbe_prv_data *pdata)
++ {
++ 	unsigned int tx_snr;
++ 	u64 nsec;
++ 
++ 	tx_snr = XGMAC_IOREAD(pdata, MAC_TXSNR);
++ 	if (XGMAC_GET_BITS(tx_snr, MAC_TXSNR, TXTSSTSMIS))
++ 		return 0;
++ 
++ 	nsec = XGMAC_IOREAD(pdata, MAC_TXSSR);
++ 	nsec *= NSEC_PER_SEC;
++ 	nsec += tx_snr;
++ 
++ 	return nsec;
++ }
++ 
++ static void xgbe_get_rx_tstamp(struct xgbe_packet_data *packet,
++ 			       struct xgbe_ring_desc *rdesc)
++ {
++ 	u64 nsec;
++ 
++ 	if (XGMAC_GET_BITS_LE(rdesc->desc3, RX_CONTEXT_DESC3, TSA) &&
++ 	    !XGMAC_GET_BITS_LE(rdesc->desc3, RX_CONTEXT_DESC3, TSD)) {
++ 		nsec = le32_to_cpu(rdesc->desc1);
++ 		nsec <<= 32;
++ 		nsec |= le32_to_cpu(rdesc->desc0);
++ 		if (nsec != 0xffffffffffffffffULL) {
++ 			packet->rx_tstamp = nsec;
++ 			XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES,
++ 				       RX_TSTAMP, 1);
++ 		}
++ 	}
++ }
++ 
++ static int xgbe_config_tstamp(struct xgbe_prv_data *pdata,
++ 			      unsigned int mac_tscr)
++ {
++ 	/* Set one nano-second accuracy */
++ 	XGMAC_SET_BITS(mac_tscr, MAC_TSCR, TSCTRLSSR, 1);
++ 
++ 	/* Set fine timestamp update */
++ 	XGMAC_SET_BITS(mac_tscr, MAC_TSCR, TSCFUPDT, 1);
++ 
++ 	/* Overwrite earlier timestamps */
++ 	XGMAC_SET_BITS(mac_tscr, MAC_TSCR, TXTSSTSM, 1);
++ 
++ 	XGMAC_IOWRITE(pdata, MAC_TSCR, mac_tscr);
++ 
++ 	/* Exit if timestamping is not enabled */
++ 	if (!XGMAC_GET_BITS(mac_tscr, MAC_TSCR, TSENA))
++ 		return 0;
++ 
++ 	/* Initialize time registers */
++ 	XGMAC_IOWRITE_BITS(pdata, MAC_SSIR, SSINC, XGBE_TSTAMP_SSINC);
++ 	XGMAC_IOWRITE_BITS(pdata, MAC_SSIR, SNSINC, XGBE_TSTAMP_SNSINC);
++ 	xgbe_update_tstamp_addend(pdata, pdata->tstamp_addend);
++ 	xgbe_set_tstamp_time(pdata, 0, 0);
++ 
++ 	/* Initialize the timecounter */
++ 	timecounter_init(&pdata->tstamp_tc, &pdata->tstamp_cc,
++ 			 ktime_to_ns(ktime_get_real()));
++ 
++ 	return 0;
++ }
++ 
++ static void xgbe_config_dcb_tc(struct xgbe_prv_data *pdata)
++ {
++ 	struct ieee_ets *ets = pdata->ets;
++ 	unsigned int total_weight, min_weight, weight;
++ 	unsigned int i;
++ 
++ 	if (!ets)
++ 		return;
++ 
++ 	/* Set Tx to deficit weighted round robin scheduling algorithm (when
++ 	 * traffic class is using ETS algorithm)
++ 	 */
++ 	XGMAC_IOWRITE_BITS(pdata, MTL_OMR, ETSALG, MTL_ETSALG_DWRR);
++ 
++ 	/* Set Traffic Class algorithms */
++ 	total_weight = pdata->netdev->mtu * pdata->hw_feat.tc_cnt;
++ 	min_weight = total_weight / 100;
++ 	if (!min_weight)
++ 		min_weight = 1;
++ 
++ 	for (i = 0; i < pdata->hw_feat.tc_cnt; i++) {
++ 		switch (ets->tc_tsa[i]) {
++ 		case IEEE_8021QAZ_TSA_STRICT:
++ 			DBGPR("  TC%u using SP\n", i);
++ 			XGMAC_MTL_IOWRITE_BITS(pdata, i, MTL_TC_ETSCR, TSA,
++ 					       MTL_TSA_SP);
++ 			break;
++ 		case IEEE_8021QAZ_TSA_ETS:
++ 			weight = total_weight * ets->tc_tx_bw[i] / 100;
++ 			weight = clamp(weight, min_weight, total_weight);
++ 
++ 			DBGPR("  TC%u using DWRR (weight %u)\n", i, weight);
++ 			XGMAC_MTL_IOWRITE_BITS(pdata, i, MTL_TC_ETSCR, TSA,
++ 					       MTL_TSA_ETS);
++ 			XGMAC_MTL_IOWRITE_BITS(pdata, i, MTL_TC_QWR, QW,
++ 					       weight);
++ 			break;
++ 		}
++ 	}
++ }
++ 
++ static void xgbe_config_dcb_pfc(struct xgbe_prv_data *pdata)
++ {
++ 	struct ieee_pfc *pfc = pdata->pfc;
++ 	struct ieee_ets *ets = pdata->ets;
++ 	unsigned int mask, reg, reg_val;
++ 	unsigned int tc, prio;
++ 
++ 	if (!pfc || !ets)
++ 		return;
++ 
++ 	for (tc = 0; tc < pdata->hw_feat.tc_cnt; tc++) {
++ 		mask = 0;
++ 		for (prio = 0; prio < IEEE_8021QAZ_MAX_TCS; prio++) {
++ 			if ((pfc->pfc_en & (1 << prio)) &&
++ 			    (ets->prio_tc[prio] == tc))
++ 				mask |= (1 << prio);
++ 		}
++ 		mask &= 0xff;
++ 
++ 		DBGPR("  TC%u PFC mask=%#x\n", tc, mask);
++ 		reg = MTL_TCPM0R + (MTL_TCPM_INC * (tc / MTL_TCPM_TC_PER_REG));
++ 		reg_val = XGMAC_IOREAD(pdata, reg);
++ 
++ 		reg_val &= ~(0xff << ((tc % MTL_TCPM_TC_PER_REG) << 3));
++ 		reg_val |= (mask << ((tc % MTL_TCPM_TC_PER_REG) << 3));
++ 
++ 		XGMAC_IOWRITE(pdata, reg, reg_val);
++ 	}
++ 
++ 	xgbe_config_flow_control(pdata);
++ }
++ 
++ static void xgbe_tx_start_xmit(struct xgbe_channel *channel,
++ 			       struct xgbe_ring *ring)
++ {
++ 	struct xgbe_prv_data *pdata = channel->pdata;
++ 	struct xgbe_ring_data *rdata;
++ 
++ 	/* Issue a poll command to Tx DMA by writing address
++ 	 * of next immediate free descriptor */
++ 	rdata = XGBE_GET_DESC_DATA(ring, ring->cur);
++ 	XGMAC_DMA_IOWRITE(channel, DMA_CH_TDTR_LO,
++ 			  lower_32_bits(rdata->rdesc_dma));
++ 
++ 	/* Start the Tx coalescing timer */
++ 	if (pdata->tx_usecs && !channel->tx_timer_active) {
++ 		channel->tx_timer_active = 1;
++ 		hrtimer_start(&channel->tx_timer,
++ 			      ktime_set(0, pdata->tx_usecs * NSEC_PER_USEC),
++ 			      HRTIMER_MODE_REL);
++ 	}
++ 
++ 	ring->tx.xmit_more = 0;
++ }
++ 
++ static void xgbe_dev_xmit(struct xgbe_channel *channel)
+++>>>>>>> 16958a2b05de (amd-xgbe: Add support for the skb->xmit_more flag)
+  {
+  	struct xgbe_prv_data *pdata = channel->pdata;
+  	struct xgbe_ring *ring = channel->tx_ring;
+@@@ -1085,20 -1551,13 +1286,27 @@@
+  	/* Make sure ownership is written to the descriptor */
+  	wmb();
+  
+- 	/* Issue a poll command to Tx DMA by writing address
+- 	 * of next immediate free descriptor */
+  	ring->cur++;
+++<<<<<<< HEAD
+ +	rdata = XGBE_GET_DESC_DATA(ring, ring->cur);
+ +	XGMAC_DMA_IOWRITE(channel, DMA_CH_TDTR_LO,
+ +			  lower_32_bits(rdata->rdesc_dma));
+ +
+ +	/* Start the Tx coalescing timer */
+ +	if (tx_coalesce && !channel->tx_timer_active) {
+ +		channel->tx_timer_active = 1;
+ +		hrtimer_start(&channel->tx_timer,
+ +			      ktime_set(0, pdata->tx_usecs * NSEC_PER_USEC),
+ +			      HRTIMER_MODE_REL);
+ +	}
+++=======
++ 	if (!packet->skb->xmit_more ||
++ 	    netif_xmit_stopped(netdev_get_tx_queue(pdata->netdev,
++ 						   channel->queue_index)))
++ 		xgbe_tx_start_xmit(channel, ring);
++ 	else
++ 		ring->tx.xmit_more = 1;
+++>>>>>>> 16958a2b05de (amd-xgbe: Add support for the skb->xmit_more flag)
+  
+  	DBGPR("  %s: descriptors %u to %u written\n",
+  	      channel->name, start_index & (ring->rdesc_count - 1),
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-desc.c b/drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+index a9ce56d5e988..02a671b6cf74 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-desc.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+@@ -267,7 +267,7 @@ static void xgbe_wrapper_tx_descriptor_init(struct xgbe_prv_data *pdata)
+ 
+ 		ring->cur = 0;
+ 		ring->dirty = 0;
+-		ring->tx.queue_stopped = 0;
++		memset(&ring->tx, 0, sizeof(ring->tx));
+ 
+ 		hw_if->tx_desc_init(channel);
+ 	}
+@@ -326,8 +326,7 @@ static void xgbe_wrapper_rx_descriptor_init(struct xgbe_prv_data *pdata)
+ 
+ 		ring->cur = 0;
+ 		ring->dirty = 0;
+-		ring->rx.realloc_index = 0;
+-		ring->rx.realloc_threshold = 0;
++		memset(&ring->rx, 0, sizeof(ring->rx));
+ 
+ 		hw_if->rx_desc_init(channel);
+ 	}
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index f42678309ce8..ca4c0384d536 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@ -133,6 +133,28 @@ static inline unsigned int xgbe_tx_avail_desc(struct xgbe_ring *ring)
+ 	return (ring->rdesc_count - (ring->cur - ring->dirty));
+ }
+ 
++static int xgbe_maybe_stop_tx_queue(struct xgbe_channel *channel,
++				    struct xgbe_ring *ring, unsigned int count)
++{
++	struct xgbe_prv_data *pdata = channel->pdata;
++
++	if (count > xgbe_tx_avail_desc(ring)) {
++		DBGPR("  Tx queue stopped, not enough descriptors available\n");
++		netif_stop_subqueue(pdata->netdev, channel->queue_index);
++		ring->tx.queue_stopped = 1;
++
++		/* If we haven't notified the hardware because of xmit_more
++		 * support, tell it now
++		 */
++		if (ring->tx.xmit_more)
++			pdata->hw_if.tx_start_xmit(channel, ring);
++
++		return NETDEV_TX_BUSY;
++	}
++
++	return 0;
++}
++
+ static int xgbe_calc_rx_buf_size(struct net_device *netdev, unsigned int mtu)
+ {
+ 	unsigned int rx_buf_size;
+@@ -703,6 +725,8 @@ static void xgbe_packet_info(struct xgbe_ring *ring, struct sk_buff *skb,
+ 	unsigned int len;
+ 	unsigned int i;
+ 
++	packet->skb = skb;
++
+ 	context_desc = 0;
+ 	packet->rdesc_count = 0;
+ 
+@@ -877,13 +901,9 @@ static int xgbe_xmit(struct sk_buff *skb, struct net_device *netdev)
+ 	xgbe_packet_info(ring, skb, packet);
+ 
+ 	/* Check that there are enough descriptors available */
+-	if (packet->rdesc_count > xgbe_tx_avail_desc(ring)) {
+-		DBGPR("  Tx queue stopped, not enough descriptors available\n");
+-		netif_stop_subqueue(netdev, channel->queue_index);
+-		ring->tx.queue_stopped = 1;
+-		ret = NETDEV_TX_BUSY;
++	ret = xgbe_maybe_stop_tx_queue(channel, ring, packet->rdesc_count);
++	if (ret)
+ 		goto tx_netdev_return;
+-	}
+ 
+ 	ret = xgbe_prep_tso(skb, packet);
+ 	if (ret) {
+@@ -905,6 +925,11 @@ static int xgbe_xmit(struct sk_buff *skb, struct net_device *netdev)
+ 	xgbe_print_pkt(netdev, skb, true);
+ #endif
+ 
++	/* Stop the queue in advance if there may not be enough descriptors */
++	xgbe_maybe_stop_tx_queue(channel, ring, XGBE_TX_MAX_DESCS);
++
++	ret = NETDEV_TX_OK;
++
+ tx_netdev_return:
+ 	spin_unlock_irqrestore(&ring->lock, flags);
+ 
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe.h b/drivers/net/ethernet/amd/xgbe/xgbe.h
+index 1d8899bca25d..11ea33eb62c4 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe.h
+@@ -135,6 +135,17 @@
+ 
+ #define XGBE_TX_MAX_BUF_SIZE	(0x3fff & ~(64 - 1))
+ 
++/* Descriptors required for maximum contigous TSO/GSO packet */
++#define XGBE_TX_MAX_SPLIT	((GSO_MAX_SIZE / XGBE_TX_MAX_BUF_SIZE) + 1)
++
++/* Maximum possible descriptors needed for an SKB:
++ * - Maximum number of SKB frags
++ * - Maximum descriptors for contiguous TSO/GSO packet
++ * - Possible context descriptor
++ * - Possible TSO header descriptor
++ */
++#define XGBE_TX_MAX_DESCS	(MAX_SKB_FRAGS + XGBE_TX_MAX_SPLIT + 2)
++
+ #define XGBE_RX_MIN_BUF_SIZE	(ETH_FRAME_LEN + ETH_FCS_LEN + VLAN_HLEN)
+ #define XGBE_RX_BUF_ALIGN	64
+ 
+@@ -198,6 +209,8 @@
+ struct xgbe_prv_data;
+ 
+ struct xgbe_packet_data {
++	struct sk_buff *skb;
++
+ 	unsigned int attributes;
+ 
+ 	unsigned int errors;
+@@ -274,6 +287,7 @@ struct xgbe_ring {
+ 	union {
+ 		struct {
+ 			unsigned int queue_stopped;
++			unsigned int xmit_more;
+ 			unsigned short cur_mss;
+ 			unsigned short cur_vlan_ctag;
+ 		} tx;
+@@ -428,6 +442,7 @@ struct xgbe_hw_if {
+ 	void (*tx_desc_reset)(struct xgbe_ring_data *);
+ 	int (*is_last_desc)(struct xgbe_ring_desc *);
+ 	int (*is_context_desc)(struct xgbe_ring_desc *);
++	void (*tx_start_xmit)(struct xgbe_channel *, struct xgbe_ring *);
+ 
+ 	/* For FLOW ctrl */
+ 	int (*config_tx_flow_control)(struct xgbe_prv_data *);
