@@ -1,0 +1,152 @@
+iommu/amd: Add iommu support for ACPI HID devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [iommu] amd: Add iommu support for ACPI HID devices (Jerry Snitselaar) [1411581]
+Rebuild_FUZZ: 93.48%
+commit-author Wan Zongshun <Vincent.Wan@amd.com>
+commit 2bf9a0a12749b2c45964020795859d4a1f228a1d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2bf9a0a1.failed
+
+Current IOMMU driver make assumption that the downstream devices are PCI.
+With the newly added ACPI-HID IVHD device entry support, this is no
+longer true. This patch is to add dev type check and to distinguish the
+pci and acpihid device code path.
+
+	Signed-off-by: Wan Zongshun <Vincent.Wan@amd.com>
+	Signed-off-by: Suravee Suthikulpanit <Suravee.Suthikulpanit@amd.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 2bf9a0a12749b2c45964020795859d4a1f228a1d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/amd_iommu.c
+diff --cc drivers/iommu/amd_iommu.c
+index 6eeb01f55cdf,0df651a379df..000000000000
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@@ -314,11 -351,9 +362,7 @@@ static bool check_device(struct device 
+  	if (!dev || !dev->dma_mask)
+  		return false;
+  
+- 	/* No PCI device */
+- 	if (!dev_is_pci(dev))
+- 		return false;
+- 
+  	devid = get_device_id(dev);
+ -	if (IS_ERR_VALUE(devid))
+ -		return false;
+  
+  	/* Out of our scope? */
+  	if (devid > amd_iommu_last_bdf)
+@@@ -351,72 -386,10 +395,71 @@@ out
+  	iommu_group_put(group);
+  }
+  
+ +static int __last_alias(struct pci_dev *pdev, u16 alias, void *data)
+ +{
+ +	*(u16 *)data = alias;
+ +	return 0;
+ +}
+ +
+ +static u16 get_alias(struct device *dev)
+ +{
+ +	struct pci_dev *pdev = to_pci_dev(dev);
+ +	u16 devid, ivrs_alias, pci_alias;
+ +
+ +	devid = get_device_id(dev);
+ +	ivrs_alias = amd_iommu_alias_table[devid];
+ +	pci_for_each_dma_alias(pdev, __last_alias, &pci_alias);
+ +
+ +	if (ivrs_alias == pci_alias)
+ +		return ivrs_alias;
+ +
+ +	/*
+ +	 * DMA alias showdown
+ +	 *
+ +	 * The IVRS is fairly reliable in telling us about aliases, but it
+ +	 * can't know about every screwy device.  If we don't have an IVRS
+ +	 * reported alias, use the PCI reported alias.  In that case we may
+ +	 * still need to initialize the rlookup and dev_table entries if the
+ +	 * alias is to a non-existent device.
+ +	 */
+ +	if (ivrs_alias == devid) {
+ +		if (!amd_iommu_rlookup_table[pci_alias]) {
+ +			amd_iommu_rlookup_table[pci_alias] =
+ +				amd_iommu_rlookup_table[devid];
+ +			memcpy(amd_iommu_dev_table[pci_alias].data,
+ +			       amd_iommu_dev_table[devid].data,
+ +			       sizeof(amd_iommu_dev_table[pci_alias].data));
+ +		}
+ +
+ +		return pci_alias;
+ +	}
+ +
+ +	pr_info("AMD-Vi: Using IVRS reported alias %02x:%02x.%d "
+ +		"for device %s[%04x:%04x], kernel reported alias "
+ +		"%02x:%02x.%d\n", PCI_BUS_NUM(ivrs_alias), PCI_SLOT(ivrs_alias),
+ +		PCI_FUNC(ivrs_alias), dev_name(dev), pdev->vendor, pdev->device,
+ +		PCI_BUS_NUM(pci_alias), PCI_SLOT(pci_alias),
+ +		PCI_FUNC(pci_alias));
+ +
+ +	/*
+ +	 * If we don't have a PCI DMA alias and the IVRS alias is on the same
+ +	 * bus, then the IVRS table may know about a quirk that we don't.
+ +	 */
+ +	if (pci_alias == devid &&
+ +	    PCI_BUS_NUM(ivrs_alias) == pdev->bus->number) {
+ +		pci_add_dma_alias(pdev, ivrs_alias & 0xff);
+ +		pr_info("AMD-Vi: Added PCI DMA alias %02x.%d for %s\n",
+ +			PCI_SLOT(ivrs_alias), PCI_FUNC(ivrs_alias),
+ +			dev_name(dev));
+ +	}
+ +
+ +	return ivrs_alias;
+ +}
+ +
+  static int iommu_init_device(struct device *dev)
+  {
+- 	struct pci_dev *pdev = to_pci_dev(dev);
+  	struct iommu_dev_data *dev_data;
+ -	int devid;
+ +	u16 alias;
+  
+  	if (dev->archdata.iommu)
+  		return 0;
+@@@ -425,28 -402,10 +468,32 @@@
+  	if (!dev_data)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	alias = get_alias(dev);
+ +
+ +	if (alias != dev_data->devid) {
+ +		struct iommu_dev_data *alias_data;
+ +
+ +		alias_data = find_dev_data(alias);
+ +		if (alias_data == NULL) {
+ +			pr_err("AMD-Vi: Warning: Unhandled device %s\n",
+ +					dev_name(dev));
+ +			free_dev_data(dev_data);
+ +			return -ENOTSUPP;
+ +		}
+ +		dev_data->alias_data = alias_data;
+ +
+ +		/* Add device to the alias_list */
+ +		list_add(&dev_data->alias_list, &alias_data->alias_list);
+ +	}
+ +
+ +	if (pci_iommuv2_capable(pdev)) {
+++=======
++ 	if (dev_is_pci(dev) && pci_iommuv2_capable(to_pci_dev(dev))) {
+++>>>>>>> 2bf9a0a12749 (iommu/amd: Add iommu support for ACPI HID devices)
+  		struct amd_iommu *iommu;
+  
+- 		iommu              = amd_iommu_rlookup_table[dev_data->devid];
++ 		iommu = amd_iommu_rlookup_table[dev_data->devid];
+  		dev_data->iommu_v2 = iommu->is_iommu_v2;
+  	}
+  
+* Unmerged path drivers/iommu/amd_iommu.c
