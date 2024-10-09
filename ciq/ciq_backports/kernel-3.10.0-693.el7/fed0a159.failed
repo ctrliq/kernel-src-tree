@@ -1,0 +1,209 @@
+bridge: fix link notification skb size calculation to include vlan ranges
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Roopa Prabhu <roopa@cumulusnetworks.com>
+commit fed0a159c8c5e453d79d6a73897c576efea0a8a5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/fed0a159.failed
+
+my previous patch skipped vlan range optimizations during skb size
+calculations for simplicity.
+
+This incremental patch considers vlan ranges during
+skb size calculations. This leads to a bit of code duplication
+in the fill and size calculation functions. But, I could not find a
+prettier way to do this. will take any suggestions.
+
+Previously, I had reused the existing br_get_link_af_size size calculation
+function to calculate skb size for notifications. Reusing it this time
+around creates some change in behaviour issues for the usual
+.get_link_af_size callback.
+
+This patch adds a new br_get_link_af_size_filtered() function to
+base the size calculation on the incoming filter flag and include
+vlan ranges.
+
+	Signed-off-by: Roopa Prabhu <roopa@cumulusnetworks.com>
+	Reviewed-by: Scott Feldman <sfeldma@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fed0a159c8c5e453d79d6a73897c576efea0a8a5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_netlink.c
+diff --cc net/bridge/br_netlink.c
+index 389930889e03,3de0eefe2b82..000000000000
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@@ -22,6 -22,83 +22,86 @@@
+  #include "br_private.h"
+  #include "br_private_stp.h"
+  
+++<<<<<<< HEAD
+++=======
++ static int br_get_num_vlan_infos(const struct net_port_vlans *pv,
++ 				 u32 filter_mask)
++ {
++ 	u16 vid_range_start = 0, vid_range_end = 0;
++ 	u16 vid_range_flags = 0;
++ 	u16 pvid, vid, flags;
++ 	int num_vlans = 0;
++ 
++ 	if (filter_mask & RTEXT_FILTER_BRVLAN)
++ 		return pv->num_vlans;
++ 
++ 	if (!(filter_mask & RTEXT_FILTER_BRVLAN_COMPRESSED))
++ 		return 0;
++ 
++ 	/* Count number of vlan info's
++ 	 */
++ 	pvid = br_get_pvid(pv);
++ 	for_each_set_bit(vid, pv->vlan_bitmap, VLAN_N_VID) {
++ 		flags = 0;
++ 		if (vid == pvid)
++ 			flags |= BRIDGE_VLAN_INFO_PVID;
++ 
++ 		if (test_bit(vid, pv->untagged_bitmap))
++ 			flags |= BRIDGE_VLAN_INFO_UNTAGGED;
++ 
++ 		if (vid_range_start == 0) {
++ 			goto initvars;
++ 		} else if ((vid - vid_range_end) == 1 &&
++ 			flags == vid_range_flags) {
++ 			vid_range_end = vid;
++ 			continue;
++ 		} else {
++ 			if ((vid_range_end - vid_range_start) > 0)
++ 				num_vlans += 2;
++ 			else
++ 				num_vlans += 1;
++ 		}
++ initvars:
++ 		vid_range_start = vid;
++ 		vid_range_end = vid;
++ 		vid_range_flags = flags;
++ 	}
++ 
++ 	if (vid_range_start != 0) {
++ 		if ((vid_range_end - vid_range_start) > 0)
++ 			num_vlans += 2;
++ 		else
++ 			num_vlans += 1;
++ 	}
++ 
++ 	return num_vlans;
++ }
++ 
++ static size_t br_get_link_af_size_filtered(const struct net_device *dev,
++ 					   u32 filter_mask)
++ {
++ 	struct net_port_vlans *pv;
++ 	int num_vlan_infos;
++ 
++ 	if (br_port_exists(dev))
++ 		pv = nbp_get_vlan_info(br_port_get_rtnl(dev));
++ 	else if (dev->priv_flags & IFF_EBRIDGE)
++ 		pv = br_get_vlan_info((struct net_bridge *)netdev_priv(dev));
++ 	else
++ 		return 0;
++ 
++ 	if (!pv)
++ 		return 0;
++ 
++ 	num_vlan_infos = br_get_num_vlan_infos(pv, filter_mask);
++ 	if (!num_vlan_infos)
++ 		return 0;
++ 
++ 	/* Each VLAN is returned in bridge_vlan_info along with flags */
++ 	return num_vlan_infos * nla_total_size(sizeof(struct bridge_vlan_info));
++ }
++ 
+++>>>>>>> fed0a159c8c5 (bridge: fix link notification skb size calculation to include vlan ranges)
+  static inline size_t br_port_info_size(void)
+  {
+  	return nla_total_size(1)	/* IFLA_BRPORT_STATE  */
+@@@ -36,7 -113,7 +116,11 @@@
+  		+ 0;
+  }
+  
+++<<<<<<< HEAD
+ +static inline size_t br_nlmsg_size(void)
+++=======
++ static inline size_t br_nlmsg_size(struct net_device *dev, u32 filter_mask)
+++>>>>>>> fed0a159c8c5 (bridge: fix link notification skb size calculation to include vlan ranges)
+  {
+  	return NLMSG_ALIGN(sizeof(struct ifinfomsg))
+  		+ nla_total_size(IFNAMSIZ) /* IFLA_IFNAME */
+@@@ -45,7 -122,9 +129,13 @@@
+  		+ nla_total_size(4) /* IFLA_MTU */
+  		+ nla_total_size(4) /* IFLA_LINK */
+  		+ nla_total_size(1) /* IFLA_OPERSTATE */
+++<<<<<<< HEAD
+ +		+ nla_total_size(br_port_info_size()); /* IFLA_PROTINFO */
+++=======
++ 		+ nla_total_size(br_port_info_size()) /* IFLA_PROTINFO */
++ 		+ nla_total_size(br_get_link_af_size_filtered(dev,
++ 				 filter_mask)); /* IFLA_AF_SPEC */
+++>>>>>>> fed0a159c8c5 (bridge: fix link notification skb size calculation to include vlan ranges)
+  }
+  
+  static int br_port_fill_attrs(struct sk_buff *skb,
+@@@ -287,11 -368,11 +378,19 @@@ void br_ifinfo_notify(int event, struc
+  	br_debug(port->br, "port %u(%s) event %d\n",
+  		 (unsigned int)port->port_no, port->dev->name, event);
+  
+++<<<<<<< HEAD
+ +	skb = nlmsg_new(br_nlmsg_size(), GFP_ATOMIC);
+ +	if (skb == NULL)
+ +		goto errout;
+ +
+ +	err = br_fill_ifinfo(skb, port, 0, 0, event, 0, 0, port->dev);
+++=======
++ 	skb = nlmsg_new(br_nlmsg_size(port->dev, filter), GFP_ATOMIC);
++ 	if (skb == NULL)
++ 		goto errout;
++ 
++ 	err = br_fill_ifinfo(skb, port, 0, 0, event, 0, filter, port->dev);
+++>>>>>>> fed0a159c8c5 (bridge: fix link notification skb size calculation to include vlan ranges)
+  	if (err < 0) {
+  		/* -EMSGSIZE implies BUG in br_nlmsg_size() */
+  		WARN_ON(err == -EMSGSIZE);
+@@@ -630,20 -783,6 +729,23 @@@ static int br_fill_info(struct sk_buff 
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int br_dev_newlink(struct net *src_net, struct net_device *dev,
+ +			  struct nlattr *tb[], struct nlattr *data[])
+ +{
+ +	struct net_bridge *br = netdev_priv(dev);
+ +
+ +	if (tb[IFLA_ADDRESS]) {
+ +		spin_lock_bh(&br->lock);
+ +		br_stp_change_bridge_id(br, nla_data(tb[IFLA_ADDRESS]));
+ +		spin_unlock_bh(&br->lock);
+ +	}
+ +
+ +	return register_netdevice(dev);
+ +}
+ +
+++=======
+++>>>>>>> fed0a159c8c5 (bridge: fix link notification skb size calculation to include vlan ranges)
+  static size_t br_get_link_af_size(const struct net_device *dev)
+  {
+  	struct net_port_vlans *pv;
+@@@ -662,7 -801,7 +764,11 @@@
+  	return pv->num_vlans * nla_total_size(sizeof(struct bridge_vlan_info));
+  }
+  
+++<<<<<<< HEAD
+ +static struct rtnl_af_ops br_af_ops = {
+++=======
++ static struct rtnl_af_ops br_af_ops __read_mostly = {
+++>>>>>>> fed0a159c8c5 (bridge: fix link notification skb size calculation to include vlan ranges)
+  	.family			= AF_BRIDGE,
+  	.get_link_af_size	= br_get_link_af_size,
+  };
+* Unmerged path net/bridge/br_netlink.c
