@@ -1,0 +1,115 @@
+hv_netvsc: Add ethtool handler to set and get UDP hash levels
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Haiyang Zhang <haiyangz@microsoft.com>
+commit 4823eb2f3af44e2b9f7f02bed5a211e9ce79051f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4823eb2f.failed
+
+The patch add the functions to switch UDP hash level between
+L3 and L4 by ethtool command. UDP over IPv4 and v6 can be set
+differently. The default hash level is L4. We currently only
+allow switching TX hash level from within the guests.
+
+On Azure, fragmented UDP packets have high loss rate with L4
+hashing. Using L3 hashing is recommended in this case.
+
+For example, for UDP over IPv4 on eth0:
+To include UDP port numbers in hasing:
+	ethtool -N eth0 rx-flow-hash udp4 sdfn
+To exclude UDP port numbers in hasing:
+	ethtool -N eth0 rx-flow-hash udp4 sd
+To show UDP hash level:
+	ethtool -n eth0 rx-flow-hash udp4
+
+	Signed-off-by: Haiyang Zhang <haiyangz@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4823eb2f3af44e2b9f7f02bed5a211e9ce79051f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/netvsc_drv.c
+diff --cc drivers/net/hyperv/netvsc_drv.c
+index 5103dca8a92e,c0c4c9195a3f..000000000000
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@@ -201,6 -190,60 +201,63 @@@ static void *init_ppi_data(struct rndis
+  	return ppi;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Azure hosts don't support non-TCP port numbers in hashing for fragmented
++  * packets. We can use ethtool to change UDP hash level when necessary.
++  */
++ static inline u32 netvsc_get_hash(
++ 	struct sk_buff *skb,
++ 	const struct net_device_context *ndc)
++ {
++ 	struct flow_keys flow;
++ 	u32 hash;
++ 	static u32 hashrnd __read_mostly;
++ 
++ 	net_get_random_once(&hashrnd, sizeof(hashrnd));
++ 
++ 	if (!skb_flow_dissect_flow_keys(skb, &flow, 0))
++ 		return 0;
++ 
++ 	if (flow.basic.ip_proto == IPPROTO_TCP ||
++ 	    (flow.basic.ip_proto == IPPROTO_UDP &&
++ 	     ((flow.basic.n_proto == htons(ETH_P_IP) && ndc->udp4_l4_hash) ||
++ 	      (flow.basic.n_proto == htons(ETH_P_IPV6) &&
++ 	       ndc->udp6_l4_hash)))) {
++ 		return skb_get_hash(skb);
++ 	} else {
++ 		if (flow.basic.n_proto == htons(ETH_P_IP))
++ 			hash = jhash2((u32 *)&flow.addrs.v4addrs, 2, hashrnd);
++ 		else if (flow.basic.n_proto == htons(ETH_P_IPV6))
++ 			hash = jhash2((u32 *)&flow.addrs.v6addrs, 8, hashrnd);
++ 		else
++ 			hash = 0;
++ 
++ 		skb_set_hash(skb, hash, PKT_HASH_TYPE_L3);
++ 	}
++ 
++ 	return hash;
++ }
++ 
++ static inline int netvsc_get_tx_queue(struct net_device *ndev,
++ 				      struct sk_buff *skb, int old_idx)
++ {
++ 	const struct net_device_context *ndc = netdev_priv(ndev);
++ 	struct sock *sk = skb->sk;
++ 	int q_idx;
++ 
++ 	q_idx = ndc->tx_send_table[netvsc_get_hash(skb, ndc) &
++ 				   (VRSS_SEND_TAB_SIZE - 1)];
++ 
++ 	/* If queue index changed record the new value */
++ 	if (q_idx != old_idx &&
++ 	    sk && sk_fullsock(sk) && rcu_access_pointer(sk->sk_dst_cache))
++ 		sk_tx_queue_set(sk, q_idx);
++ 
++ 	return q_idx;
++ }
++ 
+++>>>>>>> 4823eb2f3af4 (hv_netvsc: Add ethtool handler to set and get UDP hash levels)
+  /*
+   * Select queue for transmit.
+   *
+diff --git a/drivers/net/hyperv/hyperv_net.h b/drivers/net/hyperv/hyperv_net.h
+index a32d7f1b2505..60c628e07d79 100644
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@ -699,6 +699,8 @@ struct net_device_context {
+ 	struct netvsc_stats __percpu *rx_stats;
+ 
+ 	/* Ethtool settings */
++	bool udp4_l4_hash;
++	bool udp6_l4_hash;
+ 	u8 duplex;
+ 	u32 speed;
+ 	struct netvsc_ethtool_stats eth_stats;
+* Unmerged path drivers/net/hyperv/netvsc_drv.c
