@@ -1,0 +1,192 @@
+perf stat: Collapse identically named events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Andi Kleen <ak@linux.intel.com>
+commit 430daf2dc7aff16096a137347e6fd03d4af609e9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/430daf2d.failed
+
+The uncore PMU has a lot of duplicated PMUs for different subsystems.
+When expanding an uncore alias we usually end up with a large
+number of identically named aliases, which makes perf stat
+output difficult to read.
+
+Automatically sum them up in perf stat, unless --no-merge is specified.
+
+This can be default because only the uncores generally have duplicated
+aliases. Other PMUs have unique names.
+
+Before:
+
+  % perf stat --no-merge -a -e unc_c_llc_lookup.any sleep 1
+
+  Performance counter stats for 'system wide':
+
+           694,976 Bytes unc_c_llc_lookup.any
+           706,304 Bytes unc_c_llc_lookup.any
+           956,608 Bytes unc_c_llc_lookup.any
+           782,720 Bytes unc_c_llc_lookup.any
+           605,696 Bytes unc_c_llc_lookup.any
+           442,816 Bytes unc_c_llc_lookup.any
+           659,328 Bytes unc_c_llc_lookup.any
+           509,312 Bytes unc_c_llc_lookup.any
+           263,936 Bytes unc_c_llc_lookup.any
+           592,448 Bytes unc_c_llc_lookup.any
+           672,448 Bytes unc_c_llc_lookup.any
+           608,640 Bytes unc_c_llc_lookup.any
+           641,024 Bytes unc_c_llc_lookup.any
+           856,896 Bytes unc_c_llc_lookup.any
+           808,832 Bytes unc_c_llc_lookup.any
+           684,864 Bytes unc_c_llc_lookup.any
+           710,464 Bytes unc_c_llc_lookup.any
+           538,304 Bytes unc_c_llc_lookup.any
+
+       1.002577660 seconds time elapsed
+
+After:
+
+  % perf stat -a -e unc_c_llc_lookup.any sleep 1
+
+  Performance counter stats for 'system wide':
+
+         2,685,120 Bytes unc_c_llc_lookup.any
+
+       1.002648032 seconds time elapsed
+
+v2: Split collect_aliases. Rename alias flag.
+v3: Make sure unsupported/not counted is always printed.
+v4: Factor out callback change into separate patch.
+v5: Move check for bad results here
+    Move merged check into collect_data
+
+	Signed-off-by: Andi Kleen <ak@linux.intel.com>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+Link: http://lkml.kernel.org/r/20170320201711.14142-3-andi@firstfloor.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 430daf2dc7aff16096a137347e6fd03d4af609e9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/evsel.h
+diff --cc tools/perf/util/evsel.h
+index 8e15288107c4,bd2e9b112d49..000000000000
+--- a/tools/perf/util/evsel.h
++++ b/tools/perf/util/evsel.h
+@@@ -128,6 -130,8 +128,11 @@@ struct perf_evsel 
+  	char			*group_name;
+  	bool			cmdline_group_boundary;
+  	struct list_head	config_terms;
+++<<<<<<< HEAD
+++=======
++ 	int			bpf_fd;
++ 	bool			merged_stat;
+++>>>>>>> 430daf2dc7af (perf stat: Collapse identically named events)
+  };
+  
+  union u64_swap {
+diff --git a/tools/perf/Documentation/perf-stat.txt b/tools/perf/Documentation/perf-stat.txt
+index 978548138624..bd0e4417f2be 100644
+--- a/tools/perf/Documentation/perf-stat.txt
++++ b/tools/perf/Documentation/perf-stat.txt
+@@ -236,6 +236,9 @@ To interpret the results it is usually needed to know on which
+ CPUs the workload runs on. If needed the CPUs can be forced using
+ taskset.
+ 
++--no-merge::
++Do not merge results from same PMUs.
++
+ EXAMPLES
+ --------
+ 
+diff --git a/tools/perf/builtin-stat.c b/tools/perf/builtin-stat.c
+index 743928676fde..5ee1b51d8be9 100644
+--- a/tools/perf/builtin-stat.c
++++ b/tools/perf/builtin-stat.c
+@@ -140,6 +140,7 @@ static unsigned int		unit_width			= 4; /* strlen("unit") */
+ static bool			forever				= false;
+ static bool			metric_only			= false;
+ static bool			force_metric_only		= false;
++static bool			no_merge			= false;
+ static struct timespec		ref_time;
+ static struct cpu_map		*aggr_map;
+ static aggr_get_id_t		aggr_get_id;
+@@ -1182,12 +1183,37 @@ static void aggr_update_shadow(void)
+ 	}
+ }
+ 
+-static void collect_data(struct perf_evsel *counter,
++static void collect_all_aliases(struct perf_evsel *counter,
+ 			    void (*cb)(struct perf_evsel *counter, void *data,
+ 				       bool first),
+ 			    void *data)
+ {
++	struct perf_evsel *alias;
++
++	alias = list_prepare_entry(counter, &(evsel_list->entries), node);
++	list_for_each_entry_continue (alias, &evsel_list->entries, node) {
++		if (strcmp(perf_evsel__name(alias), perf_evsel__name(counter)) ||
++		    alias->scale != counter->scale ||
++		    alias->cgrp != counter->cgrp ||
++		    strcmp(alias->unit, counter->unit) ||
++		    nsec_counter(alias) != nsec_counter(counter))
++			break;
++		alias->merged_stat = true;
++		cb(alias, data, false);
++	}
++}
++
++static bool collect_data(struct perf_evsel *counter,
++			    void (*cb)(struct perf_evsel *counter, void *data,
++				       bool first),
++			    void *data)
++{
++	if (counter->merged_stat)
++		return false;
+ 	cb(counter, data, true);
++	if (!no_merge)
++		collect_all_aliases(counter, cb, data);
++	return true;
+ }
+ 
+ struct aggr_data {
+@@ -1245,7 +1271,8 @@ static void print_aggr(char *prefix)
+ 		evlist__for_each_entry(evsel_list, counter) {
+ 			ad.val = ad.ena = ad.run = 0;
+ 			ad.nr = 0;
+-			collect_data(counter, aggr_cb, &ad);
++			if (!collect_data(counter, aggr_cb, &ad))
++				continue;
+ 			nr = ad.nr;
+ 			ena = ad.ena;
+ 			run = ad.run;
+@@ -1318,7 +1345,8 @@ static void print_counter_aggr(struct perf_evsel *counter, char *prefix)
+ 	double uval;
+ 	struct caggr_data cd = { .avg = 0.0 };
+ 
+-	collect_data(counter, counter_aggr_cb, &cd);
++	if (!collect_data(counter, counter_aggr_cb, &cd))
++		return;
+ 
+ 	if (prefix && !metric_only)
+ 		fprintf(output, "%s", prefix);
+@@ -1353,7 +1381,8 @@ static void print_counter(struct perf_evsel *counter, char *prefix)
+ 	for (cpu = 0; cpu < perf_evsel__nr_cpus(counter); cpu++) {
+ 		struct aggr_data ad = { .cpu = cpu };
+ 
+-		collect_data(counter, counter_cb, &ad);
++		if (!collect_data(counter, counter_cb, &ad))
++			return;
+ 		val = ad.val;
+ 		ena = ad.ena;
+ 		run = ad.run;
+@@ -1701,6 +1730,7 @@ static const struct option stat_options[] = {
+ 		    "list of cpus to monitor in system-wide"),
+ 	OPT_SET_UINT('A', "no-aggr", &stat_config.aggr_mode,
+ 		    "disable CPU count aggregation", AGGR_NONE),
++	OPT_BOOLEAN(0, "no-merge", &no_merge, "Do not merge identical named events"),
+ 	OPT_STRING('x', "field-separator", &csv_sep, "separator",
+ 		   "print counts with custom separator"),
+ 	OPT_CALLBACK('G', "cgroup", &evsel_list, "name",
+* Unmerged path tools/perf/util/evsel.h
