@@ -1,0 +1,274 @@
+target: Fix unknown fabric callback queue-full errors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit fa7e25cf13a6d0b82b5ed1008246f44d42e8422c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/fa7e25cf.failed
+
+This patch fixes a set of queue-full response handling
+bugs, where outgoing responses are leaked when a fabric
+driver is propagating non -EAGAIN or -ENOMEM errors
+to target-core.
+
+It introduces TRANSPORT_COMPLETE_QF_ERR state used to
+signal when CHECK_CONDITION status should be generated,
+when fabric driver ->write_pending(), ->queue_data_in(),
+or ->queue_status() callbacks fail with non -EAGAIN or
+-ENOMEM errors, and data-transfer should not be retried.
+
+Note all fabric driver -EAGAIN and -ENOMEM errors are
+still retried indefinately with associated data-transfer
+callbacks, following existing queue-full logic.
+
+Also fix two missing ->queue_status() queue-full cases
+related to CMD_T_ABORTED w/ TAS status handling.
+
+	Reported-by: Potnuri Bharat Teja <bharat@chelsio.com>
+	Reviewed-by: Potnuri Bharat Teja <bharat@chelsio.com>
+	Tested-by: Potnuri Bharat Teja <bharat@chelsio.com>
+	Cc: Potnuri Bharat Teja <bharat@chelsio.com>
+	Reported-by: Steve Wise <swise@opengridcomputing.com>
+	Cc: Steve Wise <swise@opengridcomputing.com>
+	Cc: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit fa7e25cf13a6d0b82b5ed1008246f44d42e8422c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_transport.c
+diff --cc drivers/target/target_core_transport.c
+index 1bf113bb5bf3,a0cd56ee5fe9..000000000000
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@@ -1657,14 -1714,14 +1659,19 @@@ void transport_generic_request_failure(
+  		 * See spc4r17, section 7.4.6 Control Mode Page, Table 349
+  		 */
+  		if (cmd->se_sess &&
+ -		    cmd->se_dev->dev_attrib.emulate_ua_intlck_ctrl == 2) {
+ -			target_ua_allocate_lun(cmd->se_sess->se_node_acl,
+ -					       cmd->orig_fe_lun, 0x2C,
+ -					ASCQ_2CH_PREVIOUS_RESERVATION_CONFLICT_STATUS);
+ -		}
+ +		    cmd->se_dev->dev_attrib.emulate_ua_intlck_ctrl == 2)
+ +			core_scsi3_ua_allocate(cmd->se_sess->se_node_acl,
+ +				cmd->orig_fe_lun, 0x2C,
+ +				ASCQ_2CH_PREVIOUS_RESERVATION_CONFLICT_STATUS);
+ +
+  		trace_target_cmd_complete(cmd);
+++<<<<<<< HEAD
+ +		ret = cmd->se_tfo-> queue_status(cmd);
+ +		if (ret == -EAGAIN || ret == -ENOMEM)
+++=======
++ 		ret = cmd->se_tfo->queue_status(cmd);
++ 		if (ret)
+++>>>>>>> fa7e25cf13a6 (target: Fix unknown fabric callback queue-full errors)
+  			goto queue_full;
+  		goto check_stop;
+  	default:
+@@@ -1871,15 -1978,34 +1877,31 @@@ static void transport_complete_qf(struc
+  	int ret = 0;
+  
+  	transport_complete_task_attr(cmd);
++ 	/*
++ 	 * If a fabric driver ->write_pending() or ->queue_data_in() callback
++ 	 * has returned neither -ENOMEM or -EAGAIN, assume it's fatal and
++ 	 * the same callbacks should not be retried.  Return CHECK_CONDITION
++ 	 * if a scsi_status is not already set.
++ 	 *
++ 	 * If a fabric driver ->queue_status() has returned non zero, always
++ 	 * keep retrying no matter what..
++ 	 */
++ 	if (cmd->t_state == TRANSPORT_COMPLETE_QF_ERR) {
++ 		if (cmd->scsi_status)
++ 			goto queue_status;
+  
+- 	if (cmd->se_cmd_flags & SCF_TRANSPORT_TASK_SENSE) {
+- 		trace_target_cmd_complete(cmd);
+- 		ret = cmd->se_tfo->queue_status(cmd);
+- 		goto out;
++ 		cmd->se_cmd_flags |= SCF_EMULATED_TASK_SENSE;
++ 		cmd->scsi_status = SAM_STAT_CHECK_CONDITION;
++ 		cmd->scsi_sense_length  = TRANSPORT_SENSE_BUFFER;
++ 		translate_sense_reason(cmd, TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE);
++ 		goto queue_status;
+  	}
+  
++ 	if (cmd->se_cmd_flags & SCF_TRANSPORT_TASK_SENSE)
++ 		goto queue_status;
++ 
+  	switch (cmd->data_direction) {
+  	case DMA_FROM_DEVICE:
+ -		if (cmd->scsi_status)
+ -			goto queue_status;
+ -
+  		trace_target_cmd_complete(cmd);
+  		ret = cmd->se_tfo->queue_data_in(cmd);
+  		break;
+@@@ -2008,11 -2162,10 +2044,11 @@@ queue_rsp
+  		 * backend had PI enabled, if the transport will not be
+  		 * performing hardware READ_STRIP offload.
+  		 */
+ -		if (target_read_prot_action(cmd)) {
+ +		if (cmd->prot_op == TARGET_PROT_DIN_STRIP &&
+ +		    target_check_read_strip(cmd)) {
+  			ret = transport_send_check_condition_and_sense(cmd,
+  						cmd->pi_err, 0);
+- 			if (ret == -EAGAIN || ret == -ENOMEM)
++ 			if (ret)
+  				goto queue_full;
+  
+  			transport_lun_remove_cmd(cmd);
+@@@ -2036,22 -2185,19 +2072,22 @@@
+  		 * Check if we need to send READ payload for BIDI-COMMAND
+  		 */
+  		if (cmd->se_cmd_flags & SCF_BIDI) {
+ -			atomic_long_add(cmd->data_length,
+ -					&cmd->se_lun->lun_stats.tx_data_octets);
+ +			spin_lock(&cmd->se_lun->lun_sep_lock);
+ +			if (cmd->se_lun->lun_sep) {
+ +				cmd->se_lun->lun_sep->sep_stats.tx_data_octets +=
+ +					cmd->data_length;
+ +			}
+ +			spin_unlock(&cmd->se_lun->lun_sep_lock);
+  			ret = cmd->se_tfo->queue_data_in(cmd);
+- 			if (ret == -EAGAIN || ret == -ENOMEM)
++ 			if (ret)
+  				goto queue_full;
+  			break;
+  		}
+  		/* Fall through for DMA_TO_DEVICE */
+  	case DMA_NONE:
+ -queue_status:
+  		trace_target_cmd_complete(cmd);
+  		ret = cmd->se_tfo->queue_status(cmd);
+- 		if (ret == -EAGAIN || ret == -ENOMEM)
++ 		if (ret)
+  			goto queue_full;
+  		break;
+  	default:
+@@@ -2065,11 -2211,11 +2101,11 @@@
+  queue_full:
+  	pr_debug("Handling complete_ok QUEUE_FULL: se_cmd: %p,"
+  		" data_direction: %d\n", cmd, cmd->data_direction);
+- 	cmd->t_state = TRANSPORT_COMPLETE_QF_OK;
+- 	transport_handle_queue_full(cmd, cmd->se_dev);
++ 
++ 	transport_handle_queue_full(cmd, cmd->se_dev, ret, false);
+  }
+  
+ -void target_free_sgl(struct scatterlist *sgl, int nents)
+ +static inline void transport_free_sgl(struct scatterlist *sgl, int nents)
+  {
+  	struct scatterlist *sg;
+  	int count;
+@@@ -2325,16 -2460,30 +2361,13 @@@ transport_generic_new_cmd(struct se_cm
+  		target_execute_cmd(cmd);
+  		return 0;
+  	}
+ -
+ -	spin_lock_irqsave(&cmd->t_state_lock, flags);
+ -	cmd->t_state = TRANSPORT_WRITE_PENDING;
+ -	/*
+ -	 * Determine if frontend context caller is requesting the stopping of
+ -	 * this command for frontend exceptions.
+ -	 */
+ -	if (cmd->transport_state & CMD_T_STOP) {
+ -		pr_debug("%s:%d CMD_T_STOP for ITT: 0x%08llx\n",
+ -			 __func__, __LINE__, cmd->tag);
+ -
+ -		spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+ -
+ -		complete_all(&cmd->t_transport_stop_comp);
+ -		return 0;
+ -	}
+ -	cmd->transport_state &= ~CMD_T_ACTIVE;
+ -	spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+ +	transport_cmd_check_stop(cmd, false, true);
+  
+  	ret = cmd->se_tfo->write_pending(cmd);
+- 	if (ret == -EAGAIN || ret == -ENOMEM)
++ 	if (ret)
+  		goto queue_full;
+  
+- 	/* fabric drivers should only return -EAGAIN or -ENOMEM as error */
+- 	WARN_ON(ret);
+- 
+- 	return (!ret) ? 0 : TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
++ 	return 0;
+  
+  queue_full:
+  	pr_debug("Handling write_pending QUEUE__FULL: se_cmd: %p\n", cmd);
+@@@ -2880,11 -3034,17 +2912,19 @@@ after_reason
+  }
+  EXPORT_SYMBOL(transport_send_check_condition_and_sense);
+  
+ -static int __transport_check_aborted_status(struct se_cmd *cmd, int send_status)
+ -	__releases(&cmd->t_state_lock)
+ -	__acquires(&cmd->t_state_lock)
+ +int transport_check_aborted_status(struct se_cmd *cmd, int send_status)
+  {
+++<<<<<<< HEAD
+++=======
++ 	int ret;
++ 
++ 	assert_spin_locked(&cmd->t_state_lock);
++ 	WARN_ON_ONCE(!irqs_disabled());
++ 
+++>>>>>>> fa7e25cf13a6 (target: Fix unknown fabric callback queue-full errors)
+  	if (!(cmd->transport_state & CMD_T_ABORTED))
+  		return 0;
+ +
+  	/*
+  	 * If cmd has been aborted but either no status is to be sent or it has
+  	 * already been sent, just return
+@@@ -2898,7 -3061,12 +2938,16 @@@
+  	cmd->se_cmd_flags &= ~SCF_SEND_DELAYED_TAS;
+  	cmd->scsi_status = SAM_STAT_TASK_ABORTED;
+  	trace_target_cmd_complete(cmd);
+++<<<<<<< HEAD
+ +	cmd->se_tfo->queue_status(cmd);
+++=======
++ 
++ 	spin_unlock_irq(&cmd->t_state_lock);
++ 	ret = cmd->se_tfo->queue_status(cmd);
++ 	if (ret)
++ 		transport_handle_queue_full(cmd, cmd->se_dev, ret, false);
++ 	spin_lock_irq(&cmd->t_state_lock);
+++>>>>>>> fa7e25cf13a6 (target: Fix unknown fabric callback queue-full errors)
+  
+  	return 1;
+  }
+@@@ -2932,12 -3118,13 +2982,14 @@@ void transport_send_task_abort(struct s
+  
+  	transport_lun_remove_cmd(cmd);
+  
+ -	pr_debug("Setting SAM_STAT_TASK_ABORTED status for CDB: 0x%02x, ITT: 0x%08llx\n",
+ -		 cmd->t_task_cdb[0], cmd->tag);
+ +	pr_debug("Setting SAM_STAT_TASK_ABORTED status for CDB: 0x%02x,"
+ +		" ITT: 0x%08x\n", cmd->t_task_cdb[0],
+ +		cmd->se_tfo->get_task_tag(cmd));
+  
+  	trace_target_cmd_complete(cmd);
+- 	cmd->se_tfo->queue_status(cmd);
++ 	ret = cmd->se_tfo->queue_status(cmd);
++ 	if (ret)
++ 		transport_handle_queue_full(cmd, cmd->se_dev, ret, false);
+  }
+  
+  static void target_tmr_work(struct work_struct *work)
+* Unmerged path drivers/target/target_core_transport.c
+diff --git a/include/target/target_core_base.h b/include/target/target_core_base.h
+index 985ca4c907fe..6b1b452bbc09 100644
+--- a/include/target/target_core_base.h
++++ b/include/target/target_core_base.h
+@@ -147,6 +147,7 @@ enum transport_state_table {
+ 	TRANSPORT_ISTATE_PROCESSING = 11,
+ 	TRANSPORT_COMPLETE_QF_WP = 18,
+ 	TRANSPORT_COMPLETE_QF_OK = 19,
++	TRANSPORT_COMPLETE_QF_ERR = 20,
+ };
+ 
+ /* Used for struct se_cmd->se_cmd_flags */
