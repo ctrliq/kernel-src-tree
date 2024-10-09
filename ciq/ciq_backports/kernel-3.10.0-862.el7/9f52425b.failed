@@ -1,0 +1,237 @@
+x86/intel_rdt/mbm: Basic counting of MBM events (total and local)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] intel_rdt/mbm: Basic counting of MBM events (total and local) (Jiri Olsa) [1457533]
+Rebuild_FUZZ: 96.83%
+commit-author Tony Luck <tony.luck@intel.com>
+commit 9f52425ba303d91c8370719e91d7e578bfdf309f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9f52425b.failed
+
+Check CPUID bits for whether each of the MBM events is supported.
+Allocate space for each RMID for each counter in each domain to save
+previous MSR counter value and running total of data.
+Create files in each of the monitor directories.
+
+	Signed-off-by: Tony Luck <tony.luck@intel.com>
+	Signed-off-by: Vikas Shivappa <vikas.shivappa@linux.intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: ravi.v.shankar@intel.com
+	Cc: fenghua.yu@intel.com
+	Cc: peterz@infradead.org
+	Cc: eranian@google.com
+	Cc: vikas.shivappa@intel.com
+	Cc: ak@linux.intel.com
+	Cc: davidcc@google.com
+	Cc: reinette.chatre@intel.com
+Link: http://lkml.kernel.org/r/1501017287-28083-27-git-send-email-vikas.shivappa@linux.intel.com
+
+(cherry picked from commit 9f52425ba303d91c8370719e91d7e578bfdf309f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/intel_rdt.c
+#	arch/x86/kernel/cpu/intel_rdt.h
+#	arch/x86/kernel/cpu/intel_rdt_monitor.c
+#	arch/x86/kernel/cpu/intel_rdt_schemata.c
+diff --cc arch/x86/kernel/cpu/intel_rdt.c
+index ad087dd4421e,4c17a7060dfd..000000000000
+--- a/arch/x86/kernel/cpu/intel_rdt.c
++++ b/arch/x86/kernel/cpu/intel_rdt.c
+@@@ -280,6 -392,64 +280,67 @@@ static struct rdt_domain *rdt_find_doma
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int domain_setup_ctrlval(struct rdt_resource *r, struct rdt_domain *d)
++ {
++ 	struct msr_param m;
++ 	u32 *dc;
++ 	int i;
++ 
++ 	dc = kmalloc_array(r->num_closid, sizeof(*d->ctrl_val), GFP_KERNEL);
++ 	if (!dc)
++ 		return -ENOMEM;
++ 
++ 	d->ctrl_val = dc;
++ 
++ 	/*
++ 	 * Initialize the Control MSRs to having no control.
++ 	 * For Cache Allocation: Set all bits in cbm
++ 	 * For Memory Allocation: Set b/w requested to 100
++ 	 */
++ 	for (i = 0; i < r->num_closid; i++, dc++)
++ 		*dc = r->default_ctrl;
++ 
++ 	m.low = 0;
++ 	m.high = r->num_closid;
++ 	r->msr_update(d, &m, r);
++ 	return 0;
++ }
++ 
++ static int domain_setup_mon_state(struct rdt_resource *r, struct rdt_domain *d)
++ {
++ 	size_t tsize;
++ 
++ 	if (is_llc_occupancy_enabled()) {
++ 		d->rmid_busy_llc = kcalloc(BITS_TO_LONGS(r->num_rmid),
++ 					   sizeof(unsigned long),
++ 					   GFP_KERNEL);
++ 		if (!d->rmid_busy_llc)
++ 			return -ENOMEM;
++ 	}
++ 	if (is_mbm_total_enabled()) {
++ 		tsize = sizeof(*d->mbm_total);
++ 		d->mbm_total = kcalloc(r->num_rmid, tsize, GFP_KERNEL);
++ 		if (!d->mbm_total) {
++ 			kfree(d->rmid_busy_llc);
++ 			return -ENOMEM;
++ 		}
++ 	}
++ 	if (is_mbm_local_enabled()) {
++ 		tsize = sizeof(*d->mbm_local);
++ 		d->mbm_local = kcalloc(r->num_rmid, tsize, GFP_KERNEL);
++ 		if (!d->mbm_local) {
++ 			kfree(d->rmid_busy_llc);
++ 			kfree(d->mbm_total);
++ 			return -ENOMEM;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 9f52425ba303 (x86/intel_rdt/mbm: Basic counting of MBM events (total and local))
+  /*
+   * domain_add_cpu - Add a cpu to a resource's domain list.
+   *
+@@@ -315,23 -485,26 +376,23 @@@ static void domain_add_cpu(int cpu, str
+  		return;
+  
+  	d->id = id;
++ 	cpumask_set_cpu(cpu, &d->cpu_mask);
+  
+ -	if (r->alloc_capable && domain_setup_ctrlval(r, d)) {
+ +	d->cbm = kmalloc_array(r->num_closid, sizeof(*d->cbm), GFP_KERNEL);
+ +	if (!d->cbm) {
+  		kfree(d);
+  		return;
+  	}
+  
+ -	if (r->mon_capable && domain_setup_mon_state(r, d)) {
+ -		kfree(d);
+ -		return;
+ +	for (i = 0; i < r->num_closid; i++) {
+ +		int idx = cbm_idx(r, i);
+ +
+ +		d->cbm[i] = r->max_cbm;
+ +		if (notifier)
+ +			wrmsrl(r->msr_base + idx, d->cbm[i]);
+  	}
+  
+- 	cpumask_set_cpu(cpu, &d->cpu_mask);
+  	list_add_tail(&d->list, add_pos);
+ -
+ -	/*
+ -	 * If resctrl is mounted, add
+ -	 * per domain monitor data directories.
+ -	 */
+ -	if (static_branch_unlikely(&rdt_mon_enable_key))
+ -		mkdir_mondata_subdir_allrdtgrp(r, d);
+  }
+  
+  static void domain_remove_cpu(int cpu, struct rdt_resource *r)
+@@@ -347,7 -520,16 +408,20 @@@
+  
+  	cpumask_clear_cpu(cpu, &d->cpu_mask);
+  	if (cpumask_empty(&d->cpu_mask)) {
+++<<<<<<< HEAD
+ +		kfree(d->cbm);
+++=======
++ 		/*
++ 		 * If resctrl is mounted, remove all the
++ 		 * per domain monitor data directories.
++ 		 */
++ 		if (static_branch_unlikely(&rdt_mon_enable_key))
++ 			rmdir_mondata_subdir_allrdtgrp(r, d->id);
++ 		kfree(d->ctrl_val);
++ 		kfree(d->rmid_busy_llc);
++ 		kfree(d->mbm_total);
++ 		kfree(d->mbm_local);
+++>>>>>>> 9f52425ba303 (x86/intel_rdt/mbm: Basic counting of MBM events (total and local))
+  		list_del(&d->list);
+  		kfree(d);
+  	}
+diff --cc arch/x86/kernel/cpu/intel_rdt_schemata.c
+index 6efa856bc635,cf8e2c776440..000000000000
+--- a/arch/x86/kernel/cpu/intel_rdt_schemata.c
++++ b/arch/x86/kernel/cpu/intel_rdt_schemata.c
+@@@ -235,3 -285,56 +235,59 @@@ int rdtgroup_schemata_show(struct kernf
+  	rdtgroup_kn_unlock(of->kn);
+  	return ret;
+  }
+++<<<<<<< HEAD:arch/x86/kernel/cpu/intel_rdt_schemata.c
+++=======
++ 
++ void mon_event_read(struct rmid_read *rr, struct rdt_domain *d,
++ 		    struct rdtgroup *rdtgrp, int evtid)
++ {
++ 	/*
++ 	 * setup the parameters to send to the IPI to read the data.
++ 	 */
++ 	rr->rgrp = rdtgrp;
++ 	rr->evtid = evtid;
++ 	rr->d = d;
++ 	rr->val = 0;
++ 
++ 	smp_call_function_any(&d->cpu_mask, mon_event_count, rr, 1);
++ }
++ 
++ int rdtgroup_mondata_show(struct seq_file *m, void *arg)
++ {
++ 	struct kernfs_open_file *of = m->private;
++ 	u32 resid, evtid, domid;
++ 	struct rdtgroup *rdtgrp;
++ 	struct rdt_resource *r;
++ 	union mon_data_bits md;
++ 	struct rdt_domain *d;
++ 	struct rmid_read rr;
++ 	int ret = 0;
++ 
++ 	rdtgrp = rdtgroup_kn_lock_live(of->kn);
++ 
++ 	md.priv = of->kn->priv;
++ 	resid = md.u.rid;
++ 	domid = md.u.domid;
++ 	evtid = md.u.evtid;
++ 
++ 	r = &rdt_resources_all[resid];
++ 	d = rdt_find_domain(r, domid, NULL);
++ 	if (!d) {
++ 		ret = -ENOENT;
++ 		goto out;
++ 	}
++ 
++ 	mon_event_read(&rr, d, rdtgrp, evtid);
++ 
++ 	if (rr.val & RMID_VAL_ERROR)
++ 		seq_puts(m, "Error\n");
++ 	else if (rr.val & RMID_VAL_UNAVAIL)
++ 		seq_puts(m, "Unavailable\n");
++ 	else
++ 		seq_printf(m, "%llu\n", rr.val * r->mon_scale);
++ 
++ out:
++ 	rdtgroup_kn_unlock(of->kn);
++ 	return ret;
++ }
+++>>>>>>> 9f52425ba303 (x86/intel_rdt/mbm: Basic counting of MBM events (total and local)):arch/x86/kernel/cpu/intel_rdt_ctrlmondata.c
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.h
+* Unmerged path arch/x86/kernel/cpu/intel_rdt_monitor.c
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.c
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.h
+* Unmerged path arch/x86/kernel/cpu/intel_rdt_monitor.c
+* Unmerged path arch/x86/kernel/cpu/intel_rdt_schemata.c
