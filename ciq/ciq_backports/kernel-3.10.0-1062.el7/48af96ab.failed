@@ -1,0 +1,121 @@
+xfs: don't reserve blocks for right shift transactions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit 48af96ab92bc68fb645068b978ce36df2379e076
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/48af96ab.failed
+
+The block reservation for the transaction allocated in
+xfs_shift_file_space() is an artifact of the original collapse range
+support. It exists to handle the case where a collapse range occurs,
+the initial extent is left shifted into a location that forms a
+contiguous boundary with the previous extent and thus the extents
+are merged. This code was subsequently refactored and reused for
+insert range (right shift) support.
+
+If an insert range occurs under low free space conditions, the
+extent at the starting offset is split before the first shift
+transaction is allocated. If the block reservation fails, this
+leaves separate, but contiguous extents around in the inode. While
+not a fatal problem, this is unexpected and will flag a warning on
+subsequent insert range operations on the inode. This problem has
+been reproduce intermittently by generic/270 running against a
+ramdisk device.
+
+Since right shift does not create new extent boundaries in the
+inode, a block reservation for extent merge is unnecessary. Update
+xfs_shift_file_space() to conditionally reserve fs blocks for left
+shift transactions only. This avoids the warning reproduced by
+generic/270.
+
+	Reported-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 48af96ab92bc68fb645068b978ce36df2379e076)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_bmap_util.c
+diff --cc fs/xfs/xfs_bmap_util.c
+index b512c688c5f3,6be5f26783a1..000000000000
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@@ -1272,21 -1382,33 +1272,42 @@@ xfs_collapse_file_space
+  	int			error;
+  	struct xfs_defer_ops	dfops;
+  	xfs_fsblock_t		first_block;
+ -	xfs_fileoff_t		stop_fsb;
+ +	xfs_fileoff_t		start_fsb;
+  	xfs_fileoff_t		next_fsb;
+  	xfs_fileoff_t		shift_fsb;
++ 	uint			resblks;
+  
+ -	ASSERT(direction == SHIFT_LEFT || direction == SHIFT_RIGHT);
+ +	ASSERT(xfs_isilocked(ip, XFS_IOLOCK_EXCL));
+  
+++<<<<<<< HEAD
+ +	trace_xfs_collapse_file_space(ip);
+++=======
++ 	if (direction == SHIFT_LEFT) {
++ 		/*
++ 		 * Reserve blocks to cover potential extent merges after left
++ 		 * shift operations.
++ 		 */
++ 		resblks = XFS_DIOSTRAT_SPACE_RES(mp, 0);
++ 		next_fsb = XFS_B_TO_FSB(mp, offset + len);
++ 		stop_fsb = XFS_B_TO_FSB(mp, VFS_I(ip)->i_size);
++ 	} else {
++ 		/*
++ 		 * If right shift, delegate the work of initialization of
++ 		 * next_fsb to xfs_bmap_shift_extent as it has ilock held.
++ 		 */
++ 		resblks = 0;
++ 		next_fsb = NULLFSBLOCK;
++ 		stop_fsb = XFS_B_TO_FSB(mp, offset);
++ 	}
+++>>>>>>> 48af96ab92bc (xfs: don't reserve blocks for right shift transactions)
+  
+ +	next_fsb = XFS_B_TO_FSB(mp, offset + len);
+  	shift_fsb = XFS_B_TO_FSB(mp, len);
+  
+ +	error = xfs_free_file_space(ip, offset, len);
+ +	if (error)
+ +		return error;
+ +
+  	/*
+  	 * Trim eofblocks to avoid shifting uninitialized post-eof preallocation
+  	 * into the accessible region of the file.
+@@@ -1313,15 -1432,20 +1334,9 @@@
+  	if (error)
+  		return error;
+  
+ -	/*
+ -	 * The extent shiting code works on extent granularity. So, if
+ -	 * stop_fsb is not the starting block of extent, we need to split
+ -	 * the extent at stop_fsb.
+ -	 */
+ -	if (direction == SHIFT_RIGHT) {
+ -		error = xfs_bmap_split_extent(ip, stop_fsb);
+ -		if (error)
+ -			return error;
+ -	}
+ -
+  	while (!error && !done) {
+- 		/*
+- 		 * We would need to reserve permanent block for transaction.
+- 		 * This will come into picture when after shifting extent into
+- 		 * hole we found that adjacent extents can be merged which
+- 		 * may lead to freeing of a block during record update.
+- 		 */
+- 		error = xfs_trans_alloc(mp, &M_RES(mp)->tr_write,
+- 				XFS_DIOSTRAT_SPACE_RES(mp, 0), 0, 0, &tp);
++ 		error = xfs_trans_alloc(mp, &M_RES(mp)->tr_write, resblks, 0, 0,
++ 					&tp);
+  		if (error)
+  			break;
+  
+* Unmerged path fs/xfs/xfs_bmap_util.c
