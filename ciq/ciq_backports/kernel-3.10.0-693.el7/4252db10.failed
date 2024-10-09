@@ -1,0 +1,179 @@
+x86/KASLR: Update description for decompressor worst case size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [x86] kaslr: Update description for decompressor worst case size (Baoquan He) [1290840]
+Rebuild_FUZZ: 96.67%
+commit-author Baoquan He <bhe@redhat.com>
+commit 4252db10559fc3d1efc1e43613254fdd220b014b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/4252db10.failed
+
+The comment that describes the analysis for the size of the decompressor
+code only took gzip into account (there are currently 6 other decompressors
+that could be used). The actual z_extract_offset calculation in code was
+already handling the correct maximum size, but this documentation hadn't
+been updated. This updates the documentation, fixes several typos, moves
+the comment to header.S, updates references, and adds a note at the end
+of the decompressor include list to remind us about updating the comment
+in the future.
+
+(Instead of moving the comment to mkpiggy.c, where the calculation
+is currently happening, it is being moved to header.S because
+the calculations in mkpiggy.c will be removed in favor of header.S
+calculations in a following patch, and it seemed like overkill to move
+the giant comment twice, especially when there's already reference to
+z_extract_offset in header.S.)
+
+	Signed-off-by: Baoquan He <bhe@redhat.com>
+[ Rewrote changelog, cleaned up comment style, moved comments around. ]
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Borislav Petkov <bp@suse.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: H.J. Lu <hjl.tools@gmail.com>
+	Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Yinghai Lu <yinghai@kernel.org>
+Link: http://lkml.kernel.org/r/1461185746-8017-2-git-send-email-keescook@chromium.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 4252db10559fc3d1efc1e43613254fdd220b014b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/kaslr.c
+#	arch/x86/boot/compressed/misc.c
+diff --cc arch/x86/boot/compressed/misc.c
+index 136cb407d4ef,e96829bdb6d2..000000000000
+--- a/arch/x86/boot/compressed/misc.c
++++ b/arch/x86/boot/compressed/misc.c
+@@@ -149,6 -68,14 +72,17 @@@ static int lines, cols
+  #include "../../../../lib/decompress_unlzo.c"
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_KERNEL_LZ4
++ #include "../../../../lib/decompress_unlz4.c"
++ #endif
++ /*
++  * NOTE: When adding a new decompressor, please update the analysis in
++  * ../header.S.
++  */
++ 
+++>>>>>>> 4252db10559f (x86/KASLR: Update description for decompressor worst case size)
+  static void scroll(void)
+  {
+  	int i;
+* Unmerged path arch/x86/boot/compressed/kaslr.c
+* Unmerged path arch/x86/boot/compressed/kaslr.c
+* Unmerged path arch/x86/boot/compressed/misc.c
+diff --git a/arch/x86/boot/header.S b/arch/x86/boot/header.S
+index 7a6d43a554d7..fde7e5a7521e 100644
+--- a/arch/x86/boot/header.S
++++ b/arch/x86/boot/header.S
+@@ -440,6 +440,94 @@ setup_data:		.quad 0			# 64-bit physical pointer to
+ 
+ pref_address:		.quad LOAD_PHYSICAL_ADDR	# preferred load addr
+ 
++#
++# Getting to provably safe in-place decompression is hard. Worst case
++# behaviours need to be analyzed. Here let's take the decompression of
++# a gzip-compressed kernel as example, to illustrate it:
++#
++# The file layout of gzip compressed kernel is:
++#
++#    magic[2]
++#    method[1]
++#    flags[1]
++#    timestamp[4]
++#    extraflags[1]
++#    os[1]
++#    compressed data blocks[N]
++#    crc[4] orig_len[4]
++#
++# ... resulting in +18 bytes overhead of uncompressed data.
++#
++# (For more information, please refer to RFC 1951 and RFC 1952.)
++#
++# Files divided into blocks
++# 1 bit (last block flag)
++# 2 bits (block type)
++#
++# 1 block occurs every 32K -1 bytes or when there 50% compression
++# has been achieved. The smallest block type encoding is always used.
++#
++# stored:
++#    32 bits length in bytes.
++#
++# fixed:
++#    magic fixed tree.
++#    symbols.
++#
++# dynamic:
++#    dynamic tree encoding.
++#    symbols.
++#
++#
++# The buffer for decompression in place is the length of the uncompressed
++# data, plus a small amount extra to keep the algorithm safe. The
++# compressed data is placed at the end of the buffer.  The output pointer
++# is placed at the start of the buffer and the input pointer is placed
++# where the compressed data starts. Problems will occur when the output
++# pointer overruns the input pointer.
++#
++# The output pointer can only overrun the input pointer if the input
++# pointer is moving faster than the output pointer.  A condition only
++# triggered by data whose compressed form is larger than the uncompressed
++# form.
++#
++# The worst case at the block level is a growth of the compressed data
++# of 5 bytes per 32767 bytes.
++#
++# The worst case internal to a compressed block is very hard to figure.
++# The worst case can at least be bounded by having one bit that represents
++# 32764 bytes and then all of the rest of the bytes representing the very
++# very last byte.
++#
++# All of which is enough to compute an amount of extra data that is required
++# to be safe.  To avoid problems at the block level allocating 5 extra bytes
++# per 32767 bytes of data is sufficient.  To avoid problems internal to a
++# block adding an extra 32767 bytes (the worst case uncompressed block size)
++# is sufficient, to ensure that in the worst case the decompressed data for
++# block will stop the byte before the compressed data for a block begins.
++# To avoid problems with the compressed data's meta information an extra 18
++# bytes are needed.  Leading to the formula:
++#
++# extra_bytes = (uncompressed_size >> 12) + 32768 + 18 + decompressor_size
++#
++# Adding 8 bytes per 32K is a bit excessive but much easier to calculate.
++# Adding 32768 instead of 32767 just makes for round numbers.
++# Adding the decompressor_size is necessary as it musht live after all
++# of the data as well.  Last I measured the decompressor is about 14K.
++# 10K of actual data and 4K of bss.
++#
++# Above analysis is for decompressing gzip compressed kernel only. Up to
++# now 6 different decompressor are supported all together. And among them
++# xz stores data in chunks and has maximum chunk of 64K. Hence safety
++# margin should be updated to cover all decompressors so that we don't
++# need to deal with each of them separately. Please check
++# the description in lib/decompressor_xxx.c for specific information.
++#
++# extra_bytes = (uncompressed_size >> 12) + 65536 + 128
++#
++# Note that this calculation, which results in z_extract_offset (below),
++# is currently generated in compressed/mkpiggy.c
++
+ #define ZO_INIT_SIZE	(ZO__end - ZO_startup_32 + ZO_z_extract_offset)
+ #define VO_INIT_SIZE	(VO__end - VO__text)
+ #if ZO_INIT_SIZE > VO_INIT_SIZE
