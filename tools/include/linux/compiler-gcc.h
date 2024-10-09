@@ -22,4 +22,6 @@
 
 #define  noinline	__attribute__((noinline))
 
+#define __packed	__attribute__((packed))
+
 #define __noreturn	__attribute__((noreturn))
