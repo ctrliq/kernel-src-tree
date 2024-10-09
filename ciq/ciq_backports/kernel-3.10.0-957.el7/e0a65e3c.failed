@@ -1,0 +1,375 @@
+sfc: protect list of RSS contexts under a mutex
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Edward Cree <ecree@solarflare.com>
+commit e0a65e3c5e3b7b11ec9320524b8fcc210f2026e9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/e0a65e3c.failed
+
+Otherwise races are possible between ethtool ops and
+ efx_ef10_rx_restore_rss_contexts().
+Also, don't try to perform the restore on every reset, only after an MC
+ reboot, otherwise we'll leak RSS contexts on the NIC.
+
+Fixes: 42356d9a137b ("sfc: support RSS spreading of ethtool ntuple filters")
+	Signed-off-by: Edward Cree <ecree@solarflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e0a65e3c5e3b7b11ec9320524b8fcc210f2026e9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/sfc/ef10.c
+diff --cc drivers/net/ethernet/sfc/ef10.c
+index 85c02e9c3fe4,c4c45c94da77..000000000000
+--- a/drivers/net/ethernet/sfc/ef10.c
++++ b/drivers/net/ethernet/sfc/ef10.c
+@@@ -4242,7 -4324,9 +4259,8 @@@ static s32 efx_ef10_filter_insert(struc
+  	struct efx_rss_context *ctx = NULL;
+  	unsigned int match_pri, hash;
+  	unsigned int priv_flags;
++ 	bool rss_locked = false;
+  	bool replacing = false;
+ -	unsigned int depth, i;
+  	int ins_index = -1;
+  	DEFINE_WAIT(wait);
+  	bool is_mc_recip;
+@@@ -4264,15 -4354,20 +4282,16 @@@
+  		bitmap_zero(mc_rem_map, EFX_EF10_FILTER_SEARCH_LIMIT);
+  
+  	if (spec->flags & EFX_FILTER_FLAG_RX_RSS) {
++ 		mutex_lock(&efx->rss_lock);
++ 		rss_locked = true;
+  		if (spec->rss_context)
+- 			ctx = efx_find_rss_context_entry(spec->rss_context,
+- 							 &efx->rss_context.list);
++ 			ctx = efx_find_rss_context_entry(efx, spec->rss_context);
+  		else
+  			ctx = &efx->rss_context;
+ -		if (!ctx) {
+ -			rc = -ENOENT;
+ -			goto out_unlock;
+ -		}
+ -		if (ctx->context_id == EFX_EF10_RSS_CONTEXT_INVALID) {
+ -			rc = -EOPNOTSUPP;
+ -			goto out_unlock;
+ -		}
+ +		if (!ctx)
+ +			return -ENOENT;
+ +		if (ctx->context_id == EFX_EF10_RSS_CONTEXT_INVALID)
+ +			return -EOPNOTSUPP;
+  	}
+  
+  	/* Find any existing filters with the same match tuple or
+@@@ -4457,10 -4519,11 +4476,17 @@@ found
+  	if (rc == 0)
+  		rc = efx_ef10_make_filter_id(match_pri, ins_index);
+  
+ +	wake_up_all(&table->waitq);
+  out_unlock:
+++<<<<<<< HEAD
+ +	spin_unlock_bh(&efx->filter_lock);
+ +	finish_wait(&table->waitq, &wait);
+++=======
++ 	if (rss_locked)
++ 		mutex_unlock(&efx->rss_lock);
++ 	up_write(&table->lock);
++ 	up_read(&efx->filter_sem);
+++>>>>>>> e0a65e3c5e3b (sfc: protect list of RSS contexts under a mutex)
+  	return rc;
+  }
+  
+@@@ -5120,7 -5028,8 +5146,12 @@@ static void efx_ef10_filter_table_resto
+  	if (!table)
+  		return;
+  
+++<<<<<<< HEAD
+ +	spin_lock_bh(&efx->filter_lock);
+++=======
++ 	down_write(&table->lock);
++ 	mutex_lock(&efx->rss_lock);
+++>>>>>>> e0a65e3c5e3b (sfc: protect list of RSS contexts under a mutex)
+  
+  	for (filter_idx = 0; filter_idx < HUNT_FILTER_TBL_ROWS; filter_idx++) {
+  		spec = efx_ef10_filter_entry_spec(table, filter_idx);
+@@@ -5184,7 -5085,8 +5214,12 @@@ not_restored
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	spin_unlock_bh(&efx->filter_lock);
+++=======
++ 	mutex_unlock(&efx->rss_lock);
++ 	up_write(&table->lock);
+++>>>>>>> e0a65e3c5e3b (sfc: protect list of RSS contexts under a mutex)
+  
+  	/* This can happen validly if the MC's capabilities have changed, so
+  	 * is not an error.
+* Unmerged path drivers/net/ethernet/sfc/ef10.c
+diff --git a/drivers/net/ethernet/sfc/efx.c b/drivers/net/ethernet/sfc/efx.c
+index 546cc9e439a8..ff0eae657a1c 100644
+--- a/drivers/net/ethernet/sfc/efx.c
++++ b/drivers/net/ethernet/sfc/efx.c
+@@ -2618,6 +2618,7 @@ void efx_reset_down(struct efx_nic *efx, enum reset_type method)
+ 	efx_disable_interrupts(efx);
+ 
+ 	mutex_lock(&efx->mac_lock);
++	mutex_lock(&efx->rss_lock);
+ 	if (efx->port_initialized && method != RESET_TYPE_INVISIBLE &&
+ 	    method != RESET_TYPE_DATAPATH)
+ 		efx->phy_op->fini(efx);
+@@ -2673,6 +2674,7 @@ int efx_reset_up(struct efx_nic *efx, enum reset_type method, bool ok)
+ 
+ 	if (efx->type->rx_restore_rss_contexts)
+ 		efx->type->rx_restore_rss_contexts(efx);
++	mutex_unlock(&efx->rss_lock);
+ 	down_read(&efx->filter_sem);
+ 	efx_restore_filters(efx);
+ 	up_read(&efx->filter_sem);
+@@ -2691,6 +2693,7 @@ int efx_reset_up(struct efx_nic *efx, enum reset_type method, bool ok)
+ fail:
+ 	efx->port_initialized = false;
+ 
++	mutex_unlock(&efx->rss_lock);
+ 	mutex_unlock(&efx->mac_lock);
+ 
+ 	return rc;
+@@ -2977,6 +2980,7 @@ static int efx_init_struct(struct efx_nic *efx,
+ 	efx->rx_packet_ts_offset =
+ 		efx->type->rx_ts_offset - efx->type->rx_prefix_size;
+ 	INIT_LIST_HEAD(&efx->rss_context.list);
++	mutex_init(&efx->rss_lock);
+ 	spin_lock_init(&efx->stats_lock);
+ 	efx->vi_stride = EFX_DEFAULT_VI_STRIDE;
+ 	efx->num_mac_stats = MC_CMD_MAC_NSTATS;
+@@ -3049,11 +3053,14 @@ void efx_update_sw_stats(struct efx_nic *efx, u64 *stats)
+ /* RSS contexts.  We're using linked lists and crappy O(n) algorithms, because
+  * (a) this is an infrequent control-plane operation and (b) n is small (max 64)
+  */
+-struct efx_rss_context *efx_alloc_rss_context_entry(struct list_head *head)
++struct efx_rss_context *efx_alloc_rss_context_entry(struct efx_nic *efx)
+ {
++	struct list_head *head = &efx->rss_context.list;
+ 	struct efx_rss_context *ctx, *new;
+ 	u32 id = 1; /* Don't use zero, that refers to the master RSS context */
+ 
++	WARN_ON(!mutex_is_locked(&efx->rss_lock));
++
+ 	/* Search for first gap in the numbering */
+ 	list_for_each_entry(ctx, head, list) {
+ 		if (ctx->user_id != id)
+@@ -3079,10 +3086,13 @@ struct efx_rss_context *efx_alloc_rss_context_entry(struct list_head *head)
+ 	return new;
+ }
+ 
+-struct efx_rss_context *efx_find_rss_context_entry(u32 id, struct list_head *head)
++struct efx_rss_context *efx_find_rss_context_entry(struct efx_nic *efx, u32 id)
+ {
++	struct list_head *head = &efx->rss_context.list;
+ 	struct efx_rss_context *ctx;
+ 
++	WARN_ON(!mutex_is_locked(&efx->rss_lock));
++
+ 	list_for_each_entry(ctx, head, list)
+ 		if (ctx->user_id == id)
+ 			return ctx;
+diff --git a/drivers/net/ethernet/sfc/efx.h b/drivers/net/ethernet/sfc/efx.h
+index 871340e4cd7e..9049e54c5f03 100644
+--- a/drivers/net/ethernet/sfc/efx.h
++++ b/drivers/net/ethernet/sfc/efx.h
+@@ -184,8 +184,8 @@ static inline void efx_filter_rfs_expire(struct efx_channel *channel) {}
+ bool efx_filter_is_mc_recipient(const struct efx_filter_spec *spec);
+ 
+ /* RSS contexts */
+-struct efx_rss_context *efx_alloc_rss_context_entry(struct list_head *list);
+-struct efx_rss_context *efx_find_rss_context_entry(u32 id, struct list_head *list);
++struct efx_rss_context *efx_alloc_rss_context_entry(struct efx_nic *efx);
++struct efx_rss_context *efx_find_rss_context_entry(struct efx_nic *efx, u32 id);
+ void efx_free_rss_context_entry(struct efx_rss_context *ctx);
+ static inline bool efx_rss_active(struct efx_rss_context *ctx)
+ {
+diff --git a/drivers/net/ethernet/sfc/ethtool.c b/drivers/net/ethernet/sfc/ethtool.c
+index bb1c80d48d12..e07c8bc8f4bd 100644
+--- a/drivers/net/ethernet/sfc/ethtool.c
++++ b/drivers/net/ethernet/sfc/ethtool.c
+@@ -979,7 +979,7 @@ efx_ethtool_get_rxnfc(struct net_device *net_dev,
+ {
+ 	struct efx_nic *efx = netdev_priv(net_dev);
+ 	u32 rss_context = 0;
+-	s32 rc;
++	s32 rc = 0;
+ 
+ 	switch (info->cmd) {
+ 	case ETHTOOL_GRXRINGS:
+@@ -989,15 +989,17 @@ efx_ethtool_get_rxnfc(struct net_device *net_dev,
+ 	case ETHTOOL_GRXFH: {
+ 		struct efx_rss_context *ctx = &efx->rss_context;
+ 
++		mutex_lock(&efx->rss_lock);
+ 		if (info->flow_type & FLOW_RSS && info->rss_context) {
+-			ctx = efx_find_rss_context_entry(info->rss_context,
+-							 &efx->rss_context.list);
+-			if (!ctx)
+-				return -ENOENT;
++			ctx = efx_find_rss_context_entry(efx, info->rss_context);
++			if (!ctx) {
++				rc = -ENOENT;
++				goto out_unlock;
++			}
+ 		}
+ 		info->data = 0;
+ 		if (!efx_rss_active(ctx)) /* No RSS */
+-			return 0;
++			goto out_unlock;
+ 		switch (info->flow_type & ~FLOW_RSS) {
+ 		case UDP_V4_FLOW:
+ 			if (ctx->rx_hash_udp_4tuple)
+@@ -1024,7 +1026,9 @@ efx_ethtool_get_rxnfc(struct net_device *net_dev,
+ 		default:
+ 			break;
+ 		}
+-		return 0;
++out_unlock:
++		mutex_unlock(&efx->rss_lock);
++		return rc;
+ 	}
+ 
+ 	case ETHTOOL_GRXCLSRLCNT:
+@@ -1366,16 +1370,20 @@ static int efx_ethtool_get_rxfh_context(struct net_device *net_dev, u32 *indir,
+ {
+ 	struct efx_nic *efx = netdev_priv(net_dev);
+ 	struct efx_rss_context *ctx;
+-	int rc;
++	int rc = 0;
+ 
+ 	if (!efx->type->rx_pull_rss_context_config)
+ 		return -EOPNOTSUPP;
+-	ctx = efx_find_rss_context_entry(rss_context, &efx->rss_context.list);
+-	if (!ctx)
+-		return -ENOENT;
++
++	mutex_lock(&efx->rss_lock);
++	ctx = efx_find_rss_context_entry(efx, rss_context);
++	if (!ctx) {
++		rc = -ENOENT;
++		goto out_unlock;
++	}
+ 	rc = efx->type->rx_pull_rss_context_config(efx, ctx);
+ 	if (rc)
+-		return rc;
++		goto out_unlock;
+ 
+ 	if (hfunc)
+ 		*hfunc = ETH_RSS_HASH_TOP;
+@@ -1383,7 +1391,9 @@ static int efx_ethtool_get_rxfh_context(struct net_device *net_dev, u32 *indir,
+ 		memcpy(indir, ctx->rx_indir_table, sizeof(ctx->rx_indir_table));
+ 	if (key)
+ 		memcpy(key, ctx->rx_hash_key, efx->type->rx_hash_key_size);
+-	return 0;
++out_unlock:
++	mutex_unlock(&efx->rss_lock);
++	return rc;
+ }
+ 
+ static int efx_ethtool_set_rxfh_context(struct net_device *net_dev,
+@@ -1401,23 +1411,31 @@ static int efx_ethtool_set_rxfh_context(struct net_device *net_dev,
+ 	/* Hash function is Toeplitz, cannot be changed */
+ 	if (hfunc != ETH_RSS_HASH_NO_CHANGE && hfunc != ETH_RSS_HASH_TOP)
+ 		return -EOPNOTSUPP;
++
++	mutex_lock(&efx->rss_lock);
++
+ 	if (*rss_context == ETH_RXFH_CONTEXT_ALLOC) {
+-		if (delete)
++		if (delete) {
+ 			/* alloc + delete == Nothing to do */
+-			return -EINVAL;
+-		ctx = efx_alloc_rss_context_entry(&efx->rss_context.list);
+-		if (!ctx)
+-			return -ENOMEM;
++			rc = -EINVAL;
++			goto out_unlock;
++		}
++		ctx = efx_alloc_rss_context_entry(efx);
++		if (!ctx) {
++			rc = -ENOMEM;
++			goto out_unlock;
++		}
+ 		ctx->context_id = EFX_EF10_RSS_CONTEXT_INVALID;
+ 		/* Initialise indir table and key to defaults */
+ 		efx_set_default_rx_indir_table(efx, ctx);
+ 		netdev_rss_key_fill(ctx->rx_hash_key, sizeof(ctx->rx_hash_key));
+ 		allocated = true;
+ 	} else {
+-		ctx = efx_find_rss_context_entry(*rss_context,
+-						 &efx->rss_context.list);
+-		if (!ctx)
+-			return -ENOENT;
++		ctx = efx_find_rss_context_entry(efx, *rss_context);
++		if (!ctx) {
++			rc = -ENOENT;
++			goto out_unlock;
++		}
+ 	}
+ 
+ 	if (delete) {
+@@ -1425,7 +1443,7 @@ static int efx_ethtool_set_rxfh_context(struct net_device *net_dev,
+ 		rc = efx->type->rx_push_rss_context_config(efx, ctx, NULL, NULL);
+ 		if (!rc)
+ 			efx_free_rss_context_entry(ctx);
+-		return rc;
++		goto out_unlock;
+ 	}
+ 
+ 	if (!key)
+@@ -1438,6 +1456,8 @@ static int efx_ethtool_set_rxfh_context(struct net_device *net_dev,
+ 		efx_free_rss_context_entry(ctx);
+ 	else
+ 		*rss_context = ctx->user_id;
++out_unlock:
++	mutex_unlock(&efx->rss_lock);
+ 	return rc;
+ }
+ 
+diff --git a/drivers/net/ethernet/sfc/net_driver.h b/drivers/net/ethernet/sfc/net_driver.h
+index d3b503c79fbe..b9dea706ae92 100644
+--- a/drivers/net/ethernet/sfc/net_driver.h
++++ b/drivers/net/ethernet/sfc/net_driver.h
+@@ -774,6 +774,7 @@ struct efx_rss_context {
+  * @rx_scatter: Scatter mode enabled for receives
+  * @rss_context: Main RSS context.  Its @list member is the head of the list of
+  *	RSS contexts created by user requests
++ * @rss_lock: Protects custom RSS context software state in @rss_context.list
+  * @int_error_count: Number of internal errors seen recently
+  * @int_error_expire: Time at which error count will be expired
+  * @irq_soft_enabled: Are IRQs soft-enabled? If not, IRQ handler will
+@@ -917,6 +918,7 @@ struct efx_nic {
+ 	int rx_packet_ts_offset;
+ 	bool rx_scatter;
+ 	struct efx_rss_context rss_context;
++	struct mutex rss_lock;
+ 
+ 	unsigned int_error_count;
+ 	unsigned long int_error_expire;
+diff --git a/drivers/net/ethernet/sfc/nic.h b/drivers/net/ethernet/sfc/nic.h
+index c176081112f9..01f1f197dfb7 100644
+--- a/drivers/net/ethernet/sfc/nic.h
++++ b/drivers/net/ethernet/sfc/nic.h
+@@ -365,6 +365,8 @@ enum {
+  * @vi_base: Absolute index of first VI in this function
+  * @n_allocated_vis: Number of VIs allocated to this function
+  * @must_realloc_vis: Flag: VIs have yet to be reallocated after MC reboot
++ * @must_restore_rss_contexts: Flag: RSS contexts have yet to be restored after
++ *	MC reboot
+  * @must_restore_filters: Flag: filters have yet to be restored after MC reboot
+  * @n_piobufs: Number of PIO buffers allocated to this function
+  * @wc_membase: Base address of write-combining mapping of the memory BAR
+@@ -407,6 +409,7 @@ struct efx_ef10_nic_data {
+ 	unsigned int vi_base;
+ 	unsigned int n_allocated_vis;
+ 	bool must_realloc_vis;
++	bool must_restore_rss_contexts;
+ 	bool must_restore_filters;
+ 	unsigned int n_piobufs;
+ 	void __iomem *wc_membase, *pio_write_base;
