@@ -1,0 +1,225 @@
+net: bridge: add per-port multicast flood flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] bridge: add per-port multicast flood flag (Ivan Vecera) [1352289]
+Rebuild_FUZZ: 94.25%
+commit-author Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+commit b6cb5ac8331b6bcfe9ce38c7f7f58db6e1d6270a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/b6cb5ac8.failed
+
+Add a per-port flag to control the unknown multicast flood, similar to the
+unknown unicast flood flag and break a few long lines in the netlink flag
+exports.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b6cb5ac8331b6bcfe9ce38c7f7f58db6e1d6270a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/if_bridge.h
+#	include/uapi/linux/if_link.h
+#	net/bridge/br_forward.c
+#	net/bridge/br_netlink.c
+#	net/bridge/br_sysfs_if.c
+diff --cc include/linux/if_bridge.h
+index d66e75e57470,c6587c01d951..000000000000
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@@ -44,10 -44,8 +44,15 @@@ struct br_ip_list 
+  #define BR_PROMISC		BIT(7)
+  #define BR_PROXYARP		BIT(8)
+  #define BR_LEARNING_SYNC	BIT(9)
+++<<<<<<< HEAD
+ +
+ +/* values as per ieee8021QBridgeFdbAgingTime */
+ +#define BR_MIN_AGEING_TIME	(10 * HZ)
+ +#define BR_MAX_AGEING_TIME	(1000000 * HZ)
+++=======
++ #define BR_PROXYARP_WIFI	BIT(10)
++ #define BR_MCAST_FLOOD		BIT(11)
+++>>>>>>> b6cb5ac8331b (net: bridge: add per-port multicast flood flag)
+  
+  #define BR_DEFAULT_AGEING_TIME	(300 * HZ)
+  
+diff --cc include/uapi/linux/if_link.h
+index 1b43f8aab560,9bf3aecfe05b..000000000000
+--- a/include/uapi/linux/if_link.h
++++ b/include/uapi/linux/if_link.h
+@@@ -253,9 -301,24 +253,28 @@@ enum 
+  	IFLA_BRPORT_FAST_LEAVE,	/* multicast fast leave    */
+  	IFLA_BRPORT_LEARNING,	/* mac learning */
+  	IFLA_BRPORT_UNICAST_FLOOD, /* flood unicast traffic */
+ -	IFLA_BRPORT_PROXYARP,	/* proxy ARP */
+ +	/* RHEL: IFLA_BRPORT_PROXYARP not fully supported yet */
+ +	RESERVED_IFLA_BRPORT_PROXYARP,	/* proxy ARP */
+  	IFLA_BRPORT_LEARNING_SYNC, /* mac learning sync from device */
+++<<<<<<< HEAD
+++=======
++ 	IFLA_BRPORT_PROXYARP_WIFI, /* proxy ARP for Wi-Fi */
++ 	IFLA_BRPORT_ROOT_ID,	/* designated root */
++ 	IFLA_BRPORT_BRIDGE_ID,	/* designated bridge */
++ 	IFLA_BRPORT_DESIGNATED_PORT,
++ 	IFLA_BRPORT_DESIGNATED_COST,
++ 	IFLA_BRPORT_ID,
++ 	IFLA_BRPORT_NO,
++ 	IFLA_BRPORT_TOPOLOGY_CHANGE_ACK,
++ 	IFLA_BRPORT_CONFIG_PENDING,
++ 	IFLA_BRPORT_MESSAGE_AGE_TIMER,
++ 	IFLA_BRPORT_FORWARD_DELAY_TIMER,
++ 	IFLA_BRPORT_HOLD_TIMER,
++ 	IFLA_BRPORT_FLUSH,
++ 	IFLA_BRPORT_MULTICAST_ROUTER,
++ 	IFLA_BRPORT_PAD,
++ 	IFLA_BRPORT_MCAST_FLOOD,
+++>>>>>>> b6cb5ac8331b (net: bridge: add per-port multicast flood flag)
+  	__IFLA_BRPORT_MAX
+  };
+  #define IFLA_BRPORT_MAX (__IFLA_BRPORT_MAX - 1)
+diff --cc net/bridge/br_forward.c
+index 20c11b41fe6a,7cb41aee4c82..000000000000
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@@ -203,11 -184,25 +203,26 @@@ static void br_flood(struct net_bridge 
+  
+  	list_for_each_entry_rcu(p, &br->port_list, list) {
+  		/* Do not flood unicast traffic to ports that turn it off */
+ -		if (pkt_type == BR_PKT_UNICAST && !(p->flags & BR_FLOOD))
+ +		if (unicast && !(p->flags & BR_FLOOD))
+  			continue;
+++<<<<<<< HEAD
+ +		prev = maybe_deliver(prev, p, skb, __packet_hook);
+++=======
++ 		if (pkt_type == BR_PKT_MULTICAST &&
++ 		    !(p->flags & BR_MCAST_FLOOD))
++ 			continue;
++ 
++ 		/* Do not flood to ports that enable proxy ARP */
++ 		if (p->flags & BR_PROXYARP)
++ 			continue;
++ 		if ((p->flags & BR_PROXYARP_WIFI) &&
++ 		    BR_INPUT_SKB_CB(skb)->proxyarp_replied)
++ 			continue;
++ 
++ 		prev = maybe_deliver(prev, p, skb, local_orig);
+++>>>>>>> b6cb5ac8331b (net: bridge: add per-port multicast flood flag)
+  		if (IS_ERR(prev))
+  			goto out;
+ -		if (prev == p)
+ -			br_multicast_count(p->br, p, skb, igmp_type,
+ -					   BR_MCAST_DIR_TX);
+  	}
+  
+  	if (!prev)
+diff --cc net/bridge/br_netlink.c
+index 2f4d900feeb1,e99037c6f7b7..000000000000
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@@ -59,12 -169,50 +59,35 @@@ static int br_port_fill_attrs(struct sk
+  	    nla_put_u32(skb, IFLA_BRPORT_COST, p->path_cost) ||
+  	    nla_put_u8(skb, IFLA_BRPORT_MODE, mode) ||
+  	    nla_put_u8(skb, IFLA_BRPORT_GUARD, !!(p->flags & BR_BPDU_GUARD)) ||
+- 	    nla_put_u8(skb, IFLA_BRPORT_PROTECT, !!(p->flags & BR_ROOT_BLOCK)) ||
+- 	    nla_put_u8(skb, IFLA_BRPORT_FAST_LEAVE, !!(p->flags & BR_MULTICAST_FAST_LEAVE)) ||
++ 	    nla_put_u8(skb, IFLA_BRPORT_PROTECT,
++ 		       !!(p->flags & BR_ROOT_BLOCK)) ||
++ 	    nla_put_u8(skb, IFLA_BRPORT_FAST_LEAVE,
++ 		       !!(p->flags & BR_MULTICAST_FAST_LEAVE)) ||
+  	    nla_put_u8(skb, IFLA_BRPORT_LEARNING, !!(p->flags & BR_LEARNING)) ||
+++<<<<<<< HEAD
+ +	    nla_put_u8(skb, IFLA_BRPORT_UNICAST_FLOOD, !!(p->flags & BR_FLOOD)))
+++=======
++ 	    nla_put_u8(skb, IFLA_BRPORT_UNICAST_FLOOD,
++ 		       !!(p->flags & BR_FLOOD)) ||
++ 	    nla_put_u8(skb, IFLA_BRPORT_MCAST_FLOOD,
++ 		       !!(p->flags & BR_MCAST_FLOOD)) ||
++ 	    nla_put_u8(skb, IFLA_BRPORT_PROXYARP, !!(p->flags & BR_PROXYARP)) ||
++ 	    nla_put_u8(skb, IFLA_BRPORT_PROXYARP_WIFI,
++ 		       !!(p->flags & BR_PROXYARP_WIFI)) ||
++ 	    nla_put(skb, IFLA_BRPORT_ROOT_ID, sizeof(struct ifla_bridge_id),
++ 		    &p->designated_root) ||
++ 	    nla_put(skb, IFLA_BRPORT_BRIDGE_ID, sizeof(struct ifla_bridge_id),
++ 		    &p->designated_bridge) ||
++ 	    nla_put_u16(skb, IFLA_BRPORT_DESIGNATED_PORT, p->designated_port) ||
++ 	    nla_put_u16(skb, IFLA_BRPORT_DESIGNATED_COST, p->designated_cost) ||
++ 	    nla_put_u16(skb, IFLA_BRPORT_ID, p->port_id) ||
++ 	    nla_put_u16(skb, IFLA_BRPORT_NO, p->port_no) ||
++ 	    nla_put_u8(skb, IFLA_BRPORT_TOPOLOGY_CHANGE_ACK,
++ 		       p->topology_change_ack) ||
++ 	    nla_put_u8(skb, IFLA_BRPORT_CONFIG_PENDING, p->config_pending))
+++>>>>>>> b6cb5ac8331b (net: bridge: add per-port multicast flood flag)
+  		return -EMSGSIZE;
+  
+ -	timerval = br_timer_value(&p->message_age_timer);
+ -	if (nla_put_u64_64bit(skb, IFLA_BRPORT_MESSAGE_AGE_TIMER, timerval,
+ -			      IFLA_BRPORT_PAD))
+ -		return -EMSGSIZE;
+ -	timerval = br_timer_value(&p->forward_delay_timer);
+ -	if (nla_put_u64_64bit(skb, IFLA_BRPORT_FORWARD_DELAY_TIMER, timerval,
+ -			      IFLA_BRPORT_PAD))
+ -		return -EMSGSIZE;
+ -	timerval = br_timer_value(&p->hold_timer);
+ -	if (nla_put_u64_64bit(skb, IFLA_BRPORT_HOLD_TIMER, timerval,
+ -			      IFLA_BRPORT_PAD))
+ -		return -EMSGSIZE;
+ -
+ -#ifdef CONFIG_BRIDGE_IGMP_SNOOPING
+ -	if (nla_put_u8(skb, IFLA_BRPORT_MULTICAST_ROUTER,
+ -		       p->multicast_router))
+ -		return -EMSGSIZE;
+ -#endif
+ -
+  	return 0;
+  }
+  
+@@@ -475,6 -635,9 +498,12 @@@ static int br_setport(struct net_bridge
+  	br_set_port_flag(p, tb, IFLA_BRPORT_PROTECT, BR_ROOT_BLOCK);
+  	br_set_port_flag(p, tb, IFLA_BRPORT_LEARNING, BR_LEARNING);
+  	br_set_port_flag(p, tb, IFLA_BRPORT_UNICAST_FLOOD, BR_FLOOD);
+++<<<<<<< HEAD
+++=======
++ 	br_set_port_flag(p, tb, IFLA_BRPORT_MCAST_FLOOD, BR_MCAST_FLOOD);
++ 	br_set_port_flag(p, tb, IFLA_BRPORT_PROXYARP, BR_PROXYARP);
++ 	br_set_port_flag(p, tb, IFLA_BRPORT_PROXYARP_WIFI, BR_PROXYARP_WIFI);
+++>>>>>>> b6cb5ac8331b (net: bridge: add per-port multicast flood flag)
+  
+  	if (tb[IFLA_BRPORT_COST]) {
+  		err = br_stp_set_path_cost(p, nla_get_u32(tb[IFLA_BRPORT_COST]));
+diff --cc net/bridge/br_sysfs_if.c
+index 51d2694047c6,e657258e1f2c..000000000000
+--- a/net/bridge/br_sysfs_if.c
++++ b/net/bridge/br_sysfs_if.c
+@@@ -169,6 -169,9 +169,12 @@@ BRPORT_ATTR_FLAG(bpdu_guard, BR_BPDU_GU
+  BRPORT_ATTR_FLAG(root_block, BR_ROOT_BLOCK);
+  BRPORT_ATTR_FLAG(learning, BR_LEARNING);
+  BRPORT_ATTR_FLAG(unicast_flood, BR_FLOOD);
+++<<<<<<< HEAD
+++=======
++ BRPORT_ATTR_FLAG(proxyarp, BR_PROXYARP);
++ BRPORT_ATTR_FLAG(proxyarp_wifi, BR_PROXYARP_WIFI);
++ BRPORT_ATTR_FLAG(multicast_flood, BR_MCAST_FLOOD);
+++>>>>>>> b6cb5ac8331b (net: bridge: add per-port multicast flood flag)
+  
+  #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
+  static ssize_t show_multicast_router(struct net_bridge_port *p, char *buf)
+* Unmerged path include/linux/if_bridge.h
+* Unmerged path include/uapi/linux/if_link.h
+* Unmerged path net/bridge/br_forward.c
+diff --git a/net/bridge/br_if.c b/net/bridge/br_if.c
+index 9445aee8bbee..8eaaac7468a4 100644
+--- a/net/bridge/br_if.c
++++ b/net/bridge/br_if.c
+@@ -359,7 +359,7 @@ static struct net_bridge_port *new_nbp(struct net_bridge *br,
+ 	p->path_cost = port_cost(dev);
+ 	p->priority = 0x8000 >> BR_PORT_BITS;
+ 	p->port_no = index;
+-	p->flags = BR_LEARNING | BR_FLOOD;
++	p->flags = BR_LEARNING | BR_FLOOD | BR_MCAST_FLOOD;
+ 	br_init_port(p);
+ 	br_set_state(p, BR_STATE_DISABLED);
+ 	br_stp_port_timer_init(p);
+* Unmerged path net/bridge/br_netlink.c
+* Unmerged path net/bridge/br_sysfs_if.c
