@@ -1,0 +1,263 @@
+perf tools: Implement branch_type event parameter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Andi Kleen <ak@linux.intel.com>
+commit ac12f6764c5097e791cd44f10b8943b40f44bfe7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/ac12f676.failed
+
+It can be useful to specify branch type state per event, for example if
+we want to collect both software trace points and last branch PMU events
+in a single collection. Currently this doesn't work because the software
+trace point errors out with -b.
+
+There was already a branch-type parameter to configure branch sample
+types per event in the parser, but it was stubbed out. This patch
+implements the necessary plumbing to actually enable it.
+
+Now:
+
+  $ perf record -e sched:sched_switch,cpu/cpu-cycles,branch_type=any/ ...
+
+works.
+
+	Signed-off-by: Andi Kleen <ak@linux.intel.com>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+Link: http://lkml.kernel.org/r/1476306127-19721-1-git-send-email-andi@firstfloor.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit ac12f6764c5097e791cd44f10b8943b40f44bfe7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/evsel.h
+diff --cc tools/perf/util/evsel.h
+index 686af5a4b625,8cd7cd227483..000000000000
+--- a/tools/perf/util/evsel.h
++++ b/tools/perf/util/evsel.h
+@@@ -44,6 -44,10 +44,13 @@@ enum 
+  	PERF_EVSEL__CONFIG_TERM_CALLGRAPH,
+  	PERF_EVSEL__CONFIG_TERM_STACK_USER,
+  	PERF_EVSEL__CONFIG_TERM_INHERIT,
+++<<<<<<< HEAD
+++=======
++ 	PERF_EVSEL__CONFIG_TERM_MAX_STACK,
++ 	PERF_EVSEL__CONFIG_TERM_OVERWRITE,
++ 	PERF_EVSEL__CONFIG_TERM_DRV_CFG,
++ 	PERF_EVSEL__CONFIG_TERM_BRANCH,
+++>>>>>>> ac12f6764c50 (perf tools: Implement branch_type event parameter)
+  	PERF_EVSEL__CONFIG_TERM_MAX,
+  };
+  
+@@@ -55,8 -59,12 +62,13 @@@ struct perf_evsel_config_term 
+  		u64	freq;
+  		bool	time;
+  		char	*callgraph;
+ -		char	*drv_cfg;
+  		u64	stack_user;
+ -		int	max_stack;
+  		bool	inherit;
+++<<<<<<< HEAD
+++=======
++ 		bool	overwrite;
++ 		char	*branch;
+++>>>>>>> ac12f6764c50 (perf tools: Implement branch_type event parameter)
+  	} val;
+  };
+  
+diff --git a/tools/perf/util/evsel.c b/tools/perf/util/evsel.c
+index f76f126b80c9..bf942b73aa79 100644
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@ -28,6 +28,7 @@
+ #include "debug.h"
+ #include "trace-event.h"
+ #include "stat.h"
++#include "util/parse-branch-options.h"
+ 
+ static struct {
+ 	bool sample_id_all;
+@@ -694,6 +695,14 @@ static void apply_config_terms(struct perf_evsel *evsel,
+ 		case PERF_EVSEL__CONFIG_TERM_CALLGRAPH:
+ 			callgraph_buf = term->val.callgraph;
+ 			break;
++		case PERF_EVSEL__CONFIG_TERM_BRANCH:
++			if (term->val.branch && strcmp(term->val.branch, "no")) {
++				perf_evsel__set_sample_bit(evsel, BRANCH_STACK);
++				parse_branch_str(term->val.branch,
++						 &attr->branch_sample_type);
++			} else
++				perf_evsel__reset_sample_bit(evsel, BRANCH_STACK);
++			break;
+ 		case PERF_EVSEL__CONFIG_TERM_STACK_USER:
+ 			dump_size = term->val.stack_user;
+ 			break;
+* Unmerged path tools/perf/util/evsel.h
+diff --git a/tools/perf/util/parse-branch-options.c b/tools/perf/util/parse-branch-options.c
+index afc088dd7d20..3634d6974300 100644
+--- a/tools/perf/util/parse-branch-options.c
++++ b/tools/perf/util/parse-branch-options.c
+@@ -31,59 +31,51 @@ static const struct branch_mode branch_modes[] = {
+ 	BRANCH_END
+ };
+ 
+-int
+-parse_branch_stack(const struct option *opt, const char *str, int unset)
++int parse_branch_str(const char *str, __u64 *mode)
+ {
+ #define ONLY_PLM \
+ 	(PERF_SAMPLE_BRANCH_USER	|\
+ 	 PERF_SAMPLE_BRANCH_KERNEL	|\
+ 	 PERF_SAMPLE_BRANCH_HV)
+ 
+-	uint64_t *mode = (uint64_t *)opt->value;
++	int ret = 0;
++	char *p, *s;
++	char *os = NULL;
+ 	const struct branch_mode *br;
+-	char *s, *os = NULL, *p;
+-	int ret = -1;
+ 
+-	if (unset)
++	if (str == NULL) {
++		*mode = PERF_SAMPLE_BRANCH_ANY;
+ 		return 0;
++	}
+ 
+-	/*
+-	 * cannot set it twice, -b + --branch-filter for instance
+-	 */
+-	if (*mode)
++	/* because str is read-only */
++	s = os = strdup(str);
++	if (!s)
+ 		return -1;
+ 
+-	/* str may be NULL in case no arg is passed to -b */
+-	if (str) {
+-		/* because str is read-only */
+-		s = os = strdup(str);
+-		if (!s)
+-			return -1;
+-
+-		for (;;) {
+-			p = strchr(s, ',');
+-			if (p)
+-				*p = '\0';
+-
+-			for (br = branch_modes; br->name; br++) {
+-				if (!strcasecmp(s, br->name))
+-					break;
+-			}
+-			if (!br->name) {
+-				ui__warning("unknown branch filter %s,"
+-					    " check man page\n", s);
+-				goto error;
+-			}
+-
+-			*mode |= br->mode;
+-
+-			if (!p)
+-				break;
++	for (;;) {
++		p = strchr(s, ',');
++		if (p)
++			*p = '\0';
+ 
+-			s = p + 1;
++		for (br = branch_modes; br->name; br++) {
++			if (!strcasecmp(s, br->name))
++				break;
++		}
++		if (!br->name) {
++			ret = -1;
++			ui__warning("unknown branch filter %s,"
++				    " check man page\n", s);
++			goto error;
+ 		}
++
++		*mode |= br->mode;
++
++		if (!p)
++			break;
++
++		s = p + 1;
+ 	}
+-	ret = 0;
+ 
+ 	/* default to any branch */
+ 	if ((*mode & ~ONLY_PLM) == 0) {
+@@ -93,3 +85,20 @@ error:
+ 	free(os);
+ 	return ret;
+ }
++
++int
++parse_branch_stack(const struct option *opt, const char *str, int unset)
++{
++	__u64 *mode = (__u64 *)opt->value;
++
++	if (unset)
++		return 0;
++
++	/*
++	 * cannot set it twice, -b + --branch-filter for instance
++	 */
++	if (*mode)
++		return -1;
++
++	return parse_branch_str(str, mode);
++}
+diff --git a/tools/perf/util/parse-branch-options.h b/tools/perf/util/parse-branch-options.h
+index b9d9470c2e82..6086fd90eb23 100644
+--- a/tools/perf/util/parse-branch-options.h
++++ b/tools/perf/util/parse-branch-options.h
+@@ -1,5 +1,6 @@
+ #ifndef _PERF_PARSE_BRANCH_OPTIONS_H
+ #define _PERF_PARSE_BRANCH_OPTIONS_H 1
+-struct option;
++#include <stdint.h>
+ int parse_branch_stack(const struct option *opt, const char *str, int unset);
++int parse_branch_str(const char *str, __u64 *mode);
+ #endif /* _PERF_PARSE_BRANCH_OPTIONS_H */
+diff --git a/tools/perf/util/parse-events.c b/tools/perf/util/parse-events.c
+index 7c245c81239b..9bd1c6b30f4f 100644
+--- a/tools/perf/util/parse-events.c
++++ b/tools/perf/util/parse-events.c
+@@ -21,6 +21,7 @@
+ #include "cpumap.h"
+ #include "probe-file.h"
+ #include "asm/bug.h"
++#include "util/parse-branch-options.h"
+ 
+ #define MAX_NAME_LEN 100
+ 
+@@ -743,10 +744,13 @@ do {									   \
+ 		CHECK_TYPE_VAL(NUM);
+ 		break;
+ 	case PARSE_EVENTS__TERM_TYPE_BRANCH_SAMPLE_TYPE:
+-		/*
+-		 * TODO uncomment when the field is available
+-		 * attr->branch_sample_type = term->val.num;
+-		 */
++		CHECK_TYPE_VAL(STR);
++		if (strcmp(term->val.str, "no") &&
++		    parse_branch_str(term->val.str, &attr->branch_sample_type)) {
++			err->str = strdup("invalid branch sample type");
++			err->idx = term->err_val;
++			return -EINVAL;
++		}
+ 		break;
+ 	case PARSE_EVENTS__TERM_TYPE_TIME:
+ 		CHECK_TYPE_VAL(NUM);
+@@ -876,6 +880,9 @@ do {								\
+ 		case PARSE_EVENTS__TERM_TYPE_CALLGRAPH:
+ 			ADD_CONFIG_TERM(CALLGRAPH, callgraph, term->val.str);
+ 			break;
++		case PARSE_EVENTS__TERM_TYPE_BRANCH_SAMPLE_TYPE:
++			ADD_CONFIG_TERM(BRANCH, branch, term->val.str);
++			break;
+ 		case PARSE_EVENTS__TERM_TYPE_STACKSIZE:
+ 			ADD_CONFIG_TERM(STACK_USER, stack_user, term->val.num);
+ 			break;
