@@ -1,0 +1,114 @@
+mm, madvise_inject_error: Let memory_failure() optionally take a page reference
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 23e7b5c2e2715947cf1ff57124dd3e96caf48521
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/23e7b5c2.failed
+
+The madvise_inject_error() routine uses get_user_pages() to lookup the
+pfn and other information for injected error, but it does not release
+that pin. The assumption is that failed pages should be taken out of
+circulation.
+
+However, for dax mappings it is not possible to take pages out of
+circulation since they are 1:1 physically mapped as filesystem blocks,
+or device-dax capacity. They also typically represent persistent memory
+which has an error clearing capability.
+
+In preparation for adding a special handler for dax mappings, shift the
+responsibility of taking the page reference to memory_failure(). I.e.
+drop the page reference and do not specify MF_COUNT_INCREASED to
+memory_failure().
+
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Acked-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+(cherry picked from commit 23e7b5c2e2715947cf1ff57124dd3e96caf48521)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/madvise.c
+diff --cc mm/madvise.c
+index d97fe56413a1,972a9eaa898b..000000000000
+--- a/mm/madvise.c
++++ b/mm/madvise.c
+@@@ -622,26 -628,50 +622,72 @@@ static int madvise_hwpoison(int bhv, un
+  
+  	if (!capable(CAP_SYS_ADMIN))
+  		return -EPERM;
+++<<<<<<< HEAD
+ +	for (; start < end; start += PAGE_SIZE <<
+ +				compound_order(compound_head(p))) {
+ +		int ret = get_user_pages_fast(start, 1, 0, &p);
+ +		if (ret != 1)
+ +			return ret;
+ +		if (PageHWPoison(p)) {
+ +			put_page(p);
+ +			continue;
+ +		}
+ +		if (bhv == MADV_SOFT_OFFLINE) {
+ +			printk(KERN_INFO "Soft offlining page %lx at %lx\n",
+ +				page_to_pfn(p), start);
+ +			ret = soft_offline_page(p, MF_COUNT_INCREASED);
+++=======
++ 
++ 
++ 	for (; start < end; start += PAGE_SIZE << order) {
++ 		unsigned long pfn;
++ 		int ret;
++ 
++ 		ret = get_user_pages_fast(start, 1, 0, &page);
++ 		if (ret != 1)
++ 			return ret;
++ 		pfn = page_to_pfn(page);
++ 
++ 		/*
++ 		 * When soft offlining hugepages, after migrating the page
++ 		 * we dissolve it, therefore in the second loop "page" will
++ 		 * no longer be a compound page, and order will be 0.
++ 		 */
++ 		order = compound_order(compound_head(page));
++ 
++ 		if (PageHWPoison(page)) {
++ 			put_page(page);
++ 			continue;
++ 		}
++ 
++ 		if (behavior == MADV_SOFT_OFFLINE) {
++ 			pr_info("Soft offlining pfn %#lx at process virtual address %#lx\n",
++ 					pfn, start);
++ 
++ 			ret = soft_offline_page(page, MF_COUNT_INCREASED);
+++>>>>>>> 23e7b5c2e271 (mm, madvise_inject_error: Let memory_failure() optionally take a page reference)
+  			if (ret)
+ -				return ret;
+ +				break;
+  			continue;
+  		}
+++<<<<<<< HEAD
+ +		printk(KERN_INFO "Injecting memory failure for page %lx at %lx\n",
+ +		       page_to_pfn(p), start);
+ +		ret = memory_failure(page_to_pfn(p), 0, MF_COUNT_INCREASED);
+++=======
++ 
++ 		pr_info("Injecting memory failure for pfn %#lx at process virtual address %#lx\n",
++ 				pfn, start);
++ 
++ 		/*
++ 		 * Drop the page reference taken by get_user_pages_fast(). In
++ 		 * the absence of MF_COUNT_INCREASED the memory_failure()
++ 		 * routine is responsible for pinning the page to prevent it
++ 		 * from being released back to the page allocator.
++ 		 */
++ 		put_page(page);
++ 		ret = memory_failure(pfn, 0);
+++>>>>>>> 23e7b5c2e271 (mm, madvise_inject_error: Let memory_failure() optionally take a page reference)
+  		if (ret)
+  			return ret;
+  	}
+* Unmerged path mm/madvise.c
