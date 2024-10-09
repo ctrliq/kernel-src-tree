@@ -1,0 +1,166 @@
+gfs2: Fix iomap buffered write support for journaled files
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit dc480feb454a975b7ee2c18a2f98fb34e04d3baf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/dc480feb.failed
+
+Commit 64bc06bb32ee broke buffered writes to journaled files (chattr
++j): we'll try to journal the buffer heads of the page being written to
+in gfs2_iomap_journaled_page_done.  However, the iomap code no longer
+creates buffer heads, so we'll BUG() in gfs2_page_add_databufs.  Fix
+that by creating buffer heads ourself when needed.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit dc480feb454a975b7ee2c18a2f98fb34e04d3baf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/bmap.c
+diff --cc fs/gfs2/bmap.c
+index e578c30e1381,3c159a7f9a9e..000000000000
+--- a/fs/gfs2/bmap.c
++++ b/fs/gfs2/bmap.c
+@@@ -757,7 -873,134 +757,138 @@@ int gfs2_iomap_begin(struct inode *inod
+  	if (height > ip->i_height || gfs2_is_stuffed(ip))
+  		goto do_alloc;
+  
+++<<<<<<< HEAD
+ +	ret = lookup_metapath(ip, &mp);
+++=======
++ 	ret = lookup_metapath(ip, mp);
++ 	if (ret)
++ 		goto unlock;
++ 
++ 	if (mp->mp_aheight != ip->i_height)
++ 		goto do_alloc;
++ 
++ 	ptr = metapointer(ip->i_height - 1, mp);
++ 	if (*ptr == 0)
++ 		goto do_alloc;
++ 
++ 	bh = mp->mp_bh[ip->i_height - 1];
++ 	len = gfs2_extent_length(bh, ptr, len, &eob);
++ 
++ 	iomap->addr = be64_to_cpu(*ptr) << inode->i_blkbits;
++ 	iomap->length = len << inode->i_blkbits;
++ 	iomap->type = IOMAP_MAPPED;
++ 	iomap->flags |= IOMAP_F_MERGED;
++ 	if (eob)
++ 		iomap->flags |= IOMAP_F_GFS2_BOUNDARY;
++ 
++ out:
++ 	iomap->bdev = inode->i_sb->s_bdev;
++ unlock:
++ 	up_read(&ip->i_rw_mutex);
++ 	if (ret && dibh)
++ 		brelse(dibh);
++ 	return ret;
++ 
++ do_alloc:
++ 	iomap->addr = IOMAP_NULL_ADDR;
++ 	iomap->type = IOMAP_HOLE;
++ 	if (flags & IOMAP_REPORT) {
++ 		if (pos >= size)
++ 			ret = -ENOENT;
++ 		else if (height == ip->i_height)
++ 			ret = gfs2_hole_size(inode, lblock, len, mp, iomap);
++ 		else
++ 			iomap->length = size - pos;
++ 	} else if (flags & IOMAP_WRITE) {
++ 		u64 alloc_size;
++ 
++ 		if (flags & IOMAP_DIRECT)
++ 			goto out;  /* (see gfs2_file_direct_write) */
++ 
++ 		len = gfs2_alloc_size(inode, mp, len);
++ 		alloc_size = len << inode->i_blkbits;
++ 		if (alloc_size < iomap->length)
++ 			iomap->length = alloc_size;
++ 	} else {
++ 		if (pos < size && height == ip->i_height)
++ 			ret = gfs2_hole_size(inode, lblock, len, mp, iomap);
++ 	}
++ 	goto out;
++ }
++ 
++ static int gfs2_write_lock(struct inode *inode)
++ {
++ 	struct gfs2_inode *ip = GFS2_I(inode);
++ 	struct gfs2_sbd *sdp = GFS2_SB(inode);
++ 	int error;
++ 
++ 	gfs2_holder_init(ip->i_gl, LM_ST_EXCLUSIVE, 0, &ip->i_gh);
++ 	error = gfs2_glock_nq(&ip->i_gh);
++ 	if (error)
++ 		goto out_uninit;
++ 	if (&ip->i_inode == sdp->sd_rindex) {
++ 		struct gfs2_inode *m_ip = GFS2_I(sdp->sd_statfs_inode);
++ 
++ 		error = gfs2_glock_nq_init(m_ip->i_gl, LM_ST_EXCLUSIVE,
++ 					   GL_NOCACHE, &m_ip->i_gh);
++ 		if (error)
++ 			goto out_unlock;
++ 	}
++ 	return 0;
++ 
++ out_unlock:
++ 	gfs2_glock_dq(&ip->i_gh);
++ out_uninit:
++ 	gfs2_holder_uninit(&ip->i_gh);
++ 	return error;
++ }
++ 
++ static void gfs2_write_unlock(struct inode *inode)
++ {
++ 	struct gfs2_inode *ip = GFS2_I(inode);
++ 	struct gfs2_sbd *sdp = GFS2_SB(inode);
++ 
++ 	if (&ip->i_inode == sdp->sd_rindex) {
++ 		struct gfs2_inode *m_ip = GFS2_I(sdp->sd_statfs_inode);
++ 
++ 		gfs2_glock_dq_uninit(&m_ip->i_gh);
++ 	}
++ 	gfs2_glock_dq_uninit(&ip->i_gh);
++ }
++ 
++ static void gfs2_iomap_journaled_page_done(struct inode *inode, loff_t pos,
++ 				unsigned copied, struct page *page,
++ 				struct iomap *iomap)
++ {
++ 	struct gfs2_inode *ip = GFS2_I(inode);
++ 
++ 	if (!page_has_buffers(page)) {
++ 		create_empty_buffers(page, inode->i_sb->s_blocksize,
++ 				     (1 << BH_Dirty)|(1 << BH_Uptodate));
++ 	}
++ 	gfs2_page_add_databufs(ip, page, offset_in_page(pos), copied);
++ }
++ 
++ static int gfs2_iomap_begin_write(struct inode *inode, loff_t pos,
++ 				  loff_t length, unsigned flags,
++ 				  struct iomap *iomap)
++ {
++ 	struct metapath mp = { .mp_aheight = 1, };
++ 	struct gfs2_inode *ip = GFS2_I(inode);
++ 	struct gfs2_sbd *sdp = GFS2_SB(inode);
++ 	unsigned int data_blocks = 0, ind_blocks = 0, rblocks;
++ 	bool unstuff, alloc_required;
++ 	int ret;
++ 
++ 	ret = gfs2_write_lock(inode);
++ 	if (ret)
++ 		return ret;
++ 
++ 	unstuff = gfs2_is_stuffed(ip) &&
++ 		  pos + length > gfs2_max_stuffed_size(ip);
++ 
++ 	ret = gfs2_iomap_get(inode, pos, length, flags, iomap, &mp);
+++>>>>>>> dc480feb454a (gfs2: Fix iomap buffered write support for journaled files)
+  	if (ret)
+  		goto out_release;
+  
+* Unmerged path fs/gfs2/bmap.c
