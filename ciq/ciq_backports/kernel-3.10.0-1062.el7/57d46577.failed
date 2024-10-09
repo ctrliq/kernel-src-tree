@@ -1,0 +1,223 @@
+audit: ignore fcaps on umount
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Richard Guy Briggs <rgb@redhat.com>
+commit 57d4657716aca81ef4d7ec23e8123d26e3d28954
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/57d46577.failed
+
+Don't fetch fcaps when umount2 is called to avoid a process hang while
+it waits for the missing resource to (possibly never) re-appear.
+
+Note the comment above user_path_mountpoint_at():
+ * A umount is a special case for path walking. We're not actually interested
+ * in the inode in this situation, and ESTALE errors can be a problem.  We
+ * simply want track down the dentry and vfsmount attached at the mountpoint
+ * and avoid revalidating the last component.
+
+This can happen on ceph, cifs, 9p, lustre, fuse (gluster) or NFS.
+
+Please see the github issue tracker
+https://github.com/linux-audit/audit-kernel/issues/100
+
+	Signed-off-by: Richard Guy Briggs <rgb@redhat.com>
+[PM: merge fuzz in audit_log_fcaps()]
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit 57d4657716aca81ef4d7ec23e8123d26e3d28954)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namei.c
+#	include/linux/namei.h
+diff --cc fs/namei.c
+index 081045d3a2f2,87d7710a2e1d..000000000000
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@@ -2480,20 -2706,23 +2480,26 @@@ out
+  }
+  
+  static int
+ -filename_mountpoint(int dfd, struct filename *name, struct path *path,
+ +filename_mountpoint(int dfd, struct filename *s, struct path *path,
+  			unsigned int flags)
+  {
+ -	struct nameidata nd;
+  	int error;
+ -	if (IS_ERR(name))
+ -		return PTR_ERR(name);
+ -	set_nameidata(&nd, dfd, name);
+ -	error = path_mountpoint(&nd, flags | LOOKUP_RCU, path);
+ +	if (IS_ERR(s))
+ +		return PTR_ERR(s);
+ +	error = path_mountpoint(dfd, s->name, path, flags | LOOKUP_RCU);
+  	if (unlikely(error == -ECHILD))
+ -		error = path_mountpoint(&nd, flags, path);
+ +		error = path_mountpoint(dfd, s->name, path, flags);
+  	if (unlikely(error == -ESTALE))
+ -		error = path_mountpoint(&nd, flags | LOOKUP_REVAL, path);
+ +		error = path_mountpoint(dfd, s->name, path, flags | LOOKUP_REVAL);
+  	if (likely(!error))
+++<<<<<<< HEAD
+ +		audit_inode(s, path->dentry, 0);
+ +	putname(s);
+++=======
++ 		audit_inode(name, path->dentry, flags & LOOKUP_NO_EVAL);
++ 	restore_nameidata();
++ 	putname(name);
+++>>>>>>> 57d4657716ac (audit: ignore fcaps on umount)
+  	return error;
+  }
+  
+diff --cc include/linux/namei.h
+index 20da4337c38e,9138b4471dbf..000000000000
+--- a/include/linux/namei.h
++++ b/include/linux/namei.h
+@@@ -44,6 -34,8 +46,11 @@@ enum {LAST_NORM, LAST_ROOT, LAST_DOT, L
+  #define LOOKUP_PARENT		0x0010
+  #define LOOKUP_REVAL		0x0020
+  #define LOOKUP_RCU		0x0040
+++<<<<<<< HEAD
+++=======
++ #define LOOKUP_NO_REVAL		0x0080
++ #define LOOKUP_NO_EVAL		0x0100
+++>>>>>>> 57d4657716ac (audit: ignore fcaps on umount)
+  
+  /*
+   * Intent data
+* Unmerged path fs/namei.c
+diff --git a/fs/namespace.c b/fs/namespace.c
+index b931013c73ea..4889326c6579 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -1736,6 +1736,8 @@ SYSCALL_DEFINE2(umount, char __user *, name, int, flags)
+ 	if (!(flags & UMOUNT_NOFOLLOW))
+ 		lookup_flags |= LOOKUP_FOLLOW;
+ 
++	lookup_flags |= LOOKUP_NO_EVAL;
++
+ 	retval = user_path_mountpoint_at(AT_FDCWD, name, lookup_flags, &path);
+ 	if (retval)
+ 		goto out;
+diff --git a/include/linux/audit.h b/include/linux/audit.h
+index 9b538c709e06..20a90e61b268 100644
+--- a/include/linux/audit.h
++++ b/include/linux/audit.h
+@@ -25,6 +25,7 @@
+ 
+ #include <linux/sched.h>
+ #include <linux/ptrace.h>
++#include <linux/namei.h>  /* LOOKUP_* */
+ #include <uapi/linux/audit.h>
+ 
+ #define AUDIT_INO_UNSET ((unsigned long)-1)
+@@ -215,6 +216,7 @@ extern void __audit_getname(struct filename *name);
+ 
+ #define AUDIT_INODE_PARENT	1	/* dentry represents the parent */
+ #define AUDIT_INODE_HIDDEN	2	/* audit record should be hidden */
++#define AUDIT_INODE_NOEVAL	4	/* audit record incomplete */
+ extern void __audit_inode(struct filename *name, const struct dentry *dentry,
+ 				unsigned int flags);
+ extern void __audit_inode_child(struct inode *parent,
+@@ -262,12 +264,15 @@ static inline void audit_getname(struct filename *name)
+ }
+ static inline void audit_inode(struct filename *name,
+ 				const struct dentry *dentry,
+-				unsigned int parent) {
++				unsigned int flags) {
+ 	if (unlikely(!audit_dummy_context())) {
+-		unsigned int flags = 0;
+-		if (parent)
+-			flags |= AUDIT_INODE_PARENT;
+-		__audit_inode(name, dentry, flags);
++		unsigned int aflags = 0;
++
++		if (flags & LOOKUP_PARENT)
++			aflags |= AUDIT_INODE_PARENT;
++		if (flags & LOOKUP_NO_EVAL)
++			aflags |= AUDIT_INODE_NOEVAL;
++		__audit_inode(name, dentry, aflags);
+ 	}
+ }
+ static inline void audit_inode_parent_hidden(struct filename *name,
+* Unmerged path include/linux/namei.h
+diff --git a/kernel/audit.c b/kernel/audit.c
+index c83e54dd96d5..f2ddc72edb8e 100644
+--- a/kernel/audit.c
++++ b/kernel/audit.c
+@@ -1603,6 +1603,10 @@ void audit_log_cap(struct audit_buffer *ab, char *prefix, kernel_cap_t *cap)
+ 
+ void audit_log_fcaps(struct audit_buffer *ab, struct audit_names *name)
+ {
++	if (name->fcap_ver == -1) {
++		audit_log_format(ab, " cap_fe=? cap_fver=? cap_fp=? cap_fi=?");
++		return;
++	}
+ 	audit_log_cap(ab, "cap_fp", &name->fcap.permitted);
+ 	audit_log_cap(ab, "cap_fi", &name->fcap.inheritable);
+ 	audit_log_format(ab, " cap_fe=%d cap_fver=%x",
+@@ -1633,7 +1637,7 @@ static inline int audit_copy_fcaps(struct audit_names *name,
+ 
+ /* Copy inode data into an audit_names. */
+ void audit_copy_inode(struct audit_names *name, const struct dentry *dentry,
+-		      struct inode *inode)
++		      struct inode *inode, unsigned int flags)
+ {
+ 	name->ino   = inode->i_ino;
+ 	name->dev   = inode->i_sb->s_dev;
+@@ -1642,6 +1646,10 @@ void audit_copy_inode(struct audit_names *name, const struct dentry *dentry,
+ 	name->gid   = inode->i_gid;
+ 	name->rdev  = inode->i_rdev;
+ 	security_inode_getsecid(inode, &name->osid);
++	if (flags & AUDIT_INODE_NOEVAL) {
++		name->fcap_ver = -1;
++		return;
++	}
+ 	audit_copy_fcaps(name, dentry);
+ }
+ 
+diff --git a/kernel/audit.h b/kernel/audit.h
+index 9238d589781b..940e79e04df4 100644
+--- a/kernel/audit.h
++++ b/kernel/audit.h
+@@ -226,7 +226,7 @@ extern int audit_ever_enabled;
+ 
+ extern void audit_copy_inode(struct audit_names *name,
+ 			     const struct dentry *dentry,
+-			     struct inode *inode);
++			     struct inode *inode, unsigned int flags);
+ extern void audit_log_cap(struct audit_buffer *ab, char *prefix,
+ 			  kernel_cap_t *cap);
+ extern void audit_log_fcaps(struct audit_buffer *ab, struct audit_names *name);
+diff --git a/kernel/auditsc.c b/kernel/auditsc.c
+index a1ead7ba65c6..95fd9888ed30 100644
+--- a/kernel/auditsc.c
++++ b/kernel/auditsc.c
+@@ -1867,7 +1867,7 @@ out:
+ 		n->type = AUDIT_TYPE_NORMAL;
+ 	}
+ 	handle_path(dentry);
+-	audit_copy_inode(n, dentry, inode);
++	audit_copy_inode(n, dentry, inode, flags & AUDIT_INODE_NOEVAL);
+ }
+ 
+ /**
+@@ -1961,7 +1961,7 @@ void __audit_inode_child(struct inode *parent,
+ 		n = audit_alloc_name(context, AUDIT_TYPE_PARENT);
+ 		if (!n)
+ 			return;
+-		audit_copy_inode(n, NULL, parent);
++		audit_copy_inode(n, NULL, parent, 0);
+ 	}
+ 
+ 	if (!found_child) {
+@@ -1980,7 +1980,7 @@ void __audit_inode_child(struct inode *parent,
+ 	}
+ 
+ 	if (inode)
+-		audit_copy_inode(found_child, dentry, inode);
++		audit_copy_inode(found_child, dentry, inode, 0);
+ 	else
+ 		found_child->ino = AUDIT_INO_UNSET;
+ }
