@@ -1,0 +1,523 @@
+IB/hif1: Remove static tracing from SDMA hot path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Michael J. Ruhl <michael.j.ruhl@intel.com>
+commit 34ab4de77fe512ba3aeabdcdc97504bd19791511
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/34ab4de7.failed
+
+The hfi1_cdbg() macro can be instantiated in the hot path even when it
+is not in use.  This shows up on perf profiles.
+
+Rework the macros (for SDMA and MMU), to use the trace interface directly
+to eliminate this performance hit.
+
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 34ab4de77fe512ba3aeabdcdc97504bd19791511)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/user_sdma.h
+diff --cc drivers/infiniband/hw/hfi1/user_sdma.h
+index 39001714f551,9b8bb5634c0d..000000000000
+--- a/drivers/infiniband/hw/hfi1/user_sdma.h
++++ b/drivers/infiniband/hw/hfi1/user_sdma.h
+@@@ -51,6 -53,64 +51,67 @@@
+  #include "iowait.h"
+  #include "user_exp_rcv.h"
+  
+++<<<<<<< HEAD
+++=======
++ /* The maximum number of Data io vectors per message/request */
++ #define MAX_VECTORS_PER_REQ 8
++ /*
++  * Maximum number of packet to send from each message/request
++  * before moving to the next one.
++  */
++ #define MAX_PKTS_PER_QUEUE 16
++ 
++ #define num_pages(x) (1 + ((((x) - 1) & PAGE_MASK) >> PAGE_SHIFT))
++ 
++ #define req_opcode(x) \
++ 	(((x) >> HFI1_SDMA_REQ_OPCODE_SHIFT) & HFI1_SDMA_REQ_OPCODE_MASK)
++ #define req_version(x) \
++ 	(((x) >> HFI1_SDMA_REQ_VERSION_SHIFT) & HFI1_SDMA_REQ_OPCODE_MASK)
++ #define req_iovcnt(x) \
++ 	(((x) >> HFI1_SDMA_REQ_IOVCNT_SHIFT) & HFI1_SDMA_REQ_IOVCNT_MASK)
++ 
++ /* Number of BTH.PSN bits used for sequence number in expected rcvs */
++ #define BTH_SEQ_MASK 0x7ffull
++ 
++ #define AHG_KDETH_INTR_SHIFT 12
++ #define AHG_KDETH_SH_SHIFT   13
++ #define AHG_KDETH_ARRAY_SIZE  9
++ 
++ #define PBC2LRH(x) ((((x) & 0xfff) << 2) - 4)
++ #define LRH2PBC(x) ((((x) >> 2) + 1) & 0xfff)
++ 
++ #define AHG_HEADER_SET(arr, idx, dw, bit, width, value)			\
++ 	do {								\
++ 		if ((idx) < ARRAY_SIZE((arr)))				\
++ 			(arr)[(idx++)] = sdma_build_ahg_descriptor(	\
++ 				(__force u16)(value), (dw), (bit),	\
++ 							(width));	\
++ 		else							\
++ 			return -ERANGE;					\
++ 	} while (0)
++ 
++ /* Tx request flag bits */
++ #define TXREQ_FLAGS_REQ_ACK   BIT(0)      /* Set the ACK bit in the header */
++ #define TXREQ_FLAGS_REQ_DISABLE_SH BIT(1) /* Disable header suppression */
++ 
++ #define SDMA_PKT_Q_INACTIVE BIT(0)
++ #define SDMA_PKT_Q_ACTIVE   BIT(1)
++ #define SDMA_PKT_Q_DEFERRED BIT(2)
++ 
++ /*
++  * Maximum retry attempts to submit a TX request
++  * before putting the process to sleep.
++  */
++ #define MAX_DEFER_RETRY_COUNT 1
++ 
++ #define SDMA_IOWAIT_TIMEOUT 1000 /* in milliseconds */
++ 
++ #define SDMA_DBG(req, fmt, ...)				     \
++ 	hfi1_cdbg(SDMA, "[%u:%u:%u:%u] " fmt, (req)->pq->dd->unit, \
++ 		 (req)->pq->ctxt, (req)->pq->subctxt, (req)->info.comp_idx, \
++ 		 ##__VA_ARGS__)
++ 
+++>>>>>>> 34ab4de77fe5 (IB/hif1: Remove static tracing from SDMA hot path)
+  extern uint extended_psn;
+  
+  struct hfi1_user_sdma_pkt_q {
+diff --git a/drivers/infiniband/hw/hfi1/file_ops.c b/drivers/infiniband/hw/hfi1/file_ops.c
+index 7180c3d1bfd2..ec5f809854d8 100644
+--- a/drivers/infiniband/hw/hfi1/file_ops.c
++++ b/drivers/infiniband/hw/hfi1/file_ops.c
+@@ -422,8 +422,7 @@ static ssize_t hfi1_aio_write(struct kiocb *kiocb, const struct iovec *iovec,
+ 	if (!dim)
+ 		return -EINVAL;
+ 
+-	hfi1_cdbg(SDMA, "SDMA request from %u:%u (%lu)",
+-		  fd->uctxt->ctxt, fd->subctxt, dim);
++	trace_hfi1_sdma_request(fd->dd, fd->uctxt->ctxt, fd->subctxt, dim);
+ 
+ 	if (atomic_read(&pq->n_reqs) == pq->n_max_reqs)
+ 		return -ENOSPC;
+diff --git a/drivers/infiniband/hw/hfi1/mmu_rb.c b/drivers/infiniband/hw/hfi1/mmu_rb.c
+index db6561397793..2f0d285dc278 100644
+--- a/drivers/infiniband/hw/hfi1/mmu_rb.c
++++ b/drivers/infiniband/hw/hfi1/mmu_rb.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright(c) 2016 Intel Corporation.
++ * Copyright(c) 2016 - 2017 Intel Corporation.
+  *
+  * This file is provided under a dual BSD/GPLv2 license.  When using or
+  * redistributing this file, you may do so under either license.
+@@ -169,9 +169,8 @@ int hfi1_mmu_rb_insert(struct mmu_rb_handler *handler,
+ 	unsigned long flags;
+ 	int ret = 0;
+ 
++	trace_hfi1_mmu_rb_insert(mnode->addr, mnode->len);
+ 	spin_lock_irqsave(&handler->lock, flags);
+-	hfi1_cdbg(MMU, "Inserting node addr 0x%llx, len %u", mnode->addr,
+-		  mnode->len);
+ 	node = __mmu_rb_search(handler, mnode->addr, mnode->len);
+ 	if (node) {
+ 		ret = -EINVAL;
+@@ -197,7 +196,7 @@ static struct mmu_rb_node *__mmu_rb_search(struct mmu_rb_handler *handler,
+ {
+ 	struct mmu_rb_node *node = NULL;
+ 
+-	hfi1_cdbg(MMU, "Searching for addr 0x%llx, len %u", addr, len);
++	trace_hfi1_mmu_rb_search(addr, len);
+ 	if (!handler->ops->filter) {
+ 		node = __mmu_int_rb_iter_first(&handler->root, addr,
+ 					       (addr + len) - 1);
+@@ -278,8 +277,7 @@ void hfi1_mmu_rb_remove(struct mmu_rb_handler *handler,
+ 	unsigned long flags;
+ 
+ 	/* Validity of handler and node pointers has been checked by caller. */
+-	hfi1_cdbg(MMU, "Removing node addr 0x%llx, len %u", node->addr,
+-		  node->len);
++	trace_hfi1_mmu_rb_remove(node->addr, node->len);
+ 	spin_lock_irqsave(&handler->lock, flags);
+ 	__mmu_int_rb_remove(node, &handler->root);
+ 	list_del(&node->list); /* remove from LRU list */
+@@ -312,8 +310,7 @@ static void mmu_notifier_mem_invalidate(struct mmu_notifier *mn,
+ 	     node; node = ptr) {
+ 		/* Guard against node removal. */
+ 		ptr = __mmu_int_rb_iter_next(node, start, end - 1);
+-		hfi1_cdbg(MMU, "Invalidating node addr 0x%llx, len %u",
+-			  node->addr, node->len);
++		trace_hfi1_mmu_mem_invalidate(node->addr, node->len);
+ 		if (handler->ops->invalidate(handler->ops_arg, node)) {
+ 			__mmu_int_rb_remove(node, root);
+ 			/* move from LRU list to delete list */
+diff --git a/drivers/infiniband/hw/hfi1/trace.h b/drivers/infiniband/hw/hfi1/trace.h
+index 92dc88f013c9..af50c0793450 100644
+--- a/drivers/infiniband/hw/hfi1/trace.h
++++ b/drivers/infiniband/hw/hfi1/trace.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright(c) 2015, 2016 Intel Corporation.
++ * Copyright(c) 2015 - 2017 Intel Corporation.
+  *
+  * This file is provided under a dual BSD/GPLv2 license.  When using or
+  * redistributing this file, you may do so under either license.
+@@ -51,3 +51,4 @@
+ #include "trace_rc.h"
+ #include "trace_rx.h"
+ #include "trace_tx.h"
++#include "trace_mmu.h"
+diff --git a/drivers/infiniband/hw/hfi1/trace_mmu.h b/drivers/infiniband/hw/hfi1/trace_mmu.h
+new file mode 100644
+index 000000000000..3b7abbc382c2
+--- /dev/null
++++ b/drivers/infiniband/hw/hfi1/trace_mmu.h
+@@ -0,0 +1,95 @@
++/*
++ * Copyright(c) 2017 Intel Corporation.
++ *
++ * This file is provided under a dual BSD/GPLv2 license.  When using or
++ * redistributing this file, you may do so under either license.
++ *
++ * GPL LICENSE SUMMARY
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of version 2 of the GNU General Public License as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * BSD LICENSE
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ *  - Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ *  - Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ *  - Neither the name of Intel Corporation nor the names of its
++ *    contributors may be used to endorse or promote products derived
++ *    from this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ *
++ */
++#if !defined(__HFI1_TRACE_MMU_H) || defined(TRACE_HEADER_MULTI_READ)
++#define __HFI1_TRACE_MMU_H
++
++#include <linux/tracepoint.h>
++#include <linux/trace_seq.h>
++
++#include "hfi.h"
++
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM hfi1_mmu
++
++DECLARE_EVENT_CLASS(hfi1_mmu_rb_template,
++		    TP_PROTO(unsigned long addr, unsigned long len),
++		    TP_ARGS(addr, len),
++		    TP_STRUCT__entry(__field(unsigned long, addr)
++				     __field(unsigned long, len)
++			    ),
++		    TP_fast_assign(__entry->addr = addr;
++				   __entry->len = len;
++			    ),
++		    TP_printk("MMU node addr 0x%lx, len %lu",
++			      __entry->addr,
++			      __entry->len
++			    )
++);
++
++DEFINE_EVENT(hfi1_mmu_rb_template, hfi1_mmu_rb_insert,
++	     TP_PROTO(unsigned long addr, unsigned long len),
++	     TP_ARGS(addr, len));
++
++DEFINE_EVENT(hfi1_mmu_rb_template, hfi1_mmu_rb_search,
++	     TP_PROTO(unsigned long addr, unsigned long len),
++	     TP_ARGS(addr, len));
++
++DEFINE_EVENT(hfi1_mmu_rb_template, hfi1_mmu_rb_remove,
++	     TP_PROTO(unsigned long addr, unsigned long len),
++	     TP_ARGS(addr, len));
++
++DEFINE_EVENT(hfi1_mmu_rb_template, hfi1_mmu_mem_invalidate,
++	     TP_PROTO(unsigned long addr, unsigned long len),
++	     TP_ARGS(addr, len));
++
++#endif /* __HFI1_TRACE_RC_H */
++
++#undef TRACE_INCLUDE_PATH
++#undef TRACE_INCLUDE_FILE
++#define TRACE_INCLUDE_PATH .
++#define TRACE_INCLUDE_FILE trace_mmu
++#include <trace/define_trace.h>
+diff --git a/drivers/infiniband/hw/hfi1/trace_tx.h b/drivers/infiniband/hw/hfi1/trace_tx.h
+index c59809a7f121..c57af3b31fe1 100644
+--- a/drivers/infiniband/hw/hfi1/trace_tx.h
++++ b/drivers/infiniband/hw/hfi1/trace_tx.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright(c) 2015, 2016 Intel Corporation.
++ * Copyright(c) 2015 - 2017 Intel Corporation.
+  *
+  * This file is provided under a dual BSD/GPLv2 license.  When using or
+  * redistributing this file, you may do so under either license.
+@@ -198,6 +198,140 @@ TRACE_EVENT(hfi1_sdma_engine_select,
+ 		      )
+ );
+ 
++TRACE_EVENT(hfi1_sdma_user_free_queues,
++	    TP_PROTO(struct hfi1_devdata *dd, u16 ctxt, u16 subctxt),
++	    TP_ARGS(dd, ctxt, subctxt),
++	    TP_STRUCT__entry(DD_DEV_ENTRY(dd)
++			     __field(u16, ctxt)
++			     __field(u16, subctxt)
++			     ),
++	    TP_fast_assign(DD_DEV_ASSIGN(dd);
++			   __entry->ctxt = ctxt;
++			   __entry->subctxt = subctxt;
++			   ),
++	    TP_printk("[%s] SDMA [%u:%u] Freeing user SDMA queues",
++		      __get_str(dev),
++		      __entry->ctxt,
++		      __entry->subctxt
++		      )
++);
++
++TRACE_EVENT(hfi1_sdma_user_process_request,
++	    TP_PROTO(struct hfi1_devdata *dd, u16 ctxt, u16 subctxt,
++		     u16 comp_idx),
++	    TP_ARGS(dd, ctxt, subctxt, comp_idx),
++	    TP_STRUCT__entry(DD_DEV_ENTRY(dd)
++			     __field(u16, ctxt)
++			     __field(u16, subctxt)
++			     __field(u16, comp_idx)
++			     ),
++	    TP_fast_assign(DD_DEV_ASSIGN(dd);
++			   __entry->ctxt = ctxt;
++			   __entry->subctxt = subctxt;
++			   __entry->comp_idx = comp_idx;
++			   ),
++	    TP_printk("[%s] SDMA [%u:%u] Using req/comp entry: %u",
++		      __get_str(dev),
++		      __entry->ctxt,
++		      __entry->subctxt,
++		      __entry->comp_idx
++		      )
++);
++
++DECLARE_EVENT_CLASS(
++	hfi1_sdma_value_template,
++	TP_PROTO(struct hfi1_devdata *dd, u16 ctxt, u16 subctxt, u16 comp_idx,
++		 u32 value),
++	TP_ARGS(dd, ctxt, subctxt, comp_idx, value),
++	TP_STRUCT__entry(DD_DEV_ENTRY(dd)
++			 __field(u16, ctxt)
++			 __field(u16, subctxt)
++			 __field(u16, comp_idx)
++			 __field(u32, value)
++		),
++	TP_fast_assign(DD_DEV_ASSIGN(dd);
++		       __entry->ctxt = ctxt;
++		       __entry->subctxt = subctxt;
++		       __entry->comp_idx = comp_idx;
++		       __entry->value = value;
++		),
++	TP_printk("[%s] SDMA [%u:%u:%u] value: %u",
++		  __get_str(dev),
++		  __entry->ctxt,
++		  __entry->subctxt,
++		  __entry->comp_idx,
++		  __entry->value
++		)
++);
++
++DEFINE_EVENT(hfi1_sdma_value_template, hfi1_sdma_user_initial_tidoffset,
++	     TP_PROTO(struct hfi1_devdata *dd, u16 ctxt, u16 subctxt,
++		      u16 comp_idx, u32 tidoffset),
++	     TP_ARGS(dd, ctxt, subctxt, comp_idx, tidoffset));
++
++DEFINE_EVENT(hfi1_sdma_value_template, hfi1_sdma_user_data_length,
++	     TP_PROTO(struct hfi1_devdata *dd, u16 ctxt, u16 subctxt,
++		      u16 comp_idx, u32 data_len),
++	     TP_ARGS(dd, ctxt, subctxt, comp_idx, data_len));
++
++DEFINE_EVENT(hfi1_sdma_value_template, hfi1_sdma_user_compute_length,
++	     TP_PROTO(struct hfi1_devdata *dd, u16 ctxt, u16 subctxt,
++		      u16 comp_idx, u32 data_len),
++	     TP_ARGS(dd, ctxt, subctxt, comp_idx, data_len));
++
++TRACE_EVENT(hfi1_sdma_user_tid_info,
++	    TP_PROTO(struct hfi1_devdata *dd, u16 ctxt, u16 subctxt,
++		     u16 comp_idx, u32 tidoffset, u32 units, u8 shift),
++	    TP_ARGS(dd, ctxt, subctxt, comp_idx, tidoffset, units, shift),
++	    TP_STRUCT__entry(DD_DEV_ENTRY(dd)
++			     __field(u16, ctxt)
++			     __field(u16, subctxt)
++			     __field(u16, comp_idx)
++			     __field(u32, tidoffset)
++			     __field(u32, units)
++			     __field(u8, shift)
++			     ),
++	    TP_fast_assign(DD_DEV_ASSIGN(dd);
++			   __entry->ctxt = ctxt;
++			   __entry->subctxt = subctxt;
++			   __entry->comp_idx = comp_idx;
++			   __entry->tidoffset = tidoffset;
++			   __entry->units = units;
++			   __entry->shift = shift;
++			   ),
++	    TP_printk("[%s] SDMA [%u:%u:%u] TID offset %ubytes %uunits om %u",
++		      __get_str(dev),
++		      __entry->ctxt,
++		      __entry->subctxt,
++		      __entry->comp_idx,
++		      __entry->tidoffset,
++		      __entry->units,
++		      __entry->shift
++		      )
++);
++
++TRACE_EVENT(hfi1_sdma_request,
++	    TP_PROTO(struct hfi1_devdata *dd, u16 ctxt, u16 subctxt,
++		     unsigned long dim),
++	    TP_ARGS(dd, ctxt, subctxt, dim),
++	    TP_STRUCT__entry(DD_DEV_ENTRY(dd)
++			     __field(u16, ctxt)
++			     __field(u16, subctxt)
++			     __field(unsigned long, dim)
++			     ),
++	    TP_fast_assign(DD_DEV_ASSIGN(dd);
++			   __entry->ctxt = ctxt;
++			   __entry->subctxt = subctxt;
++			   __entry->dim = dim;
++			   ),
++	    TP_printk("[%s] SDMA from %u:%u (%lu)",
++		      __get_str(dev),
++		      __entry->ctxt,
++		      __entry->subctxt,
++		      __entry->dim
++		      )
++);
++
+ DECLARE_EVENT_CLASS(hfi1_sdma_engine_class,
+ 		    TP_PROTO(struct sdma_engine *sde, u64 status),
+ 		    TP_ARGS(sde, status),
+diff --git a/drivers/infiniband/hw/hfi1/user_sdma.c b/drivers/infiniband/hw/hfi1/user_sdma.c
+index b5260e7006cc..b0d756a621eb 100644
+--- a/drivers/infiniband/hw/hfi1/user_sdma.c
++++ b/drivers/infiniband/hw/hfi1/user_sdma.c
+@@ -486,8 +486,8 @@ int hfi1_user_sdma_free_queues(struct hfi1_filedata *fd)
+ 	struct hfi1_user_sdma_pkt_q *pq;
+ 	unsigned long flags;
+ 
+-	hfi1_cdbg(SDMA, "[%u:%u:%u] Freeing user SDMA queues", uctxt->dd->unit,
+-		  uctxt->ctxt, fd->subctxt);
++	trace_hfi1_sdma_user_free_queues(uctxt->dd, uctxt->ctxt, fd->subctxt);
++
+ 	pq = fd->pq;
+ 	if (pq) {
+ 		if (pq->handler)
+@@ -571,7 +571,6 @@ int hfi1_user_sdma_process_request(struct file *fp, struct iovec *iovec,
+ 
+ 	trace_hfi1_sdma_user_reqinfo(dd, uctxt->ctxt, fd->subctxt,
+ 				     (u16 *)&info);
+-
+ 	if (info.comp_idx >= hfi1_sdma_comp_ring_size) {
+ 		hfi1_cdbg(SDMA,
+ 			  "[%u:%u:%u:%u] Invalid comp index",
+@@ -608,8 +607,8 @@ int hfi1_user_sdma_process_request(struct file *fp, struct iovec *iovec,
+ 	/*
+ 	 * All safety checks have been done and this request has been claimed.
+ 	 */
+-	hfi1_cdbg(SDMA, "[%u:%u:%u] Using req/comp entry %u\n", dd->unit,
+-		  uctxt->ctxt, fd->subctxt, info.comp_idx);
++	trace_hfi1_sdma_user_process_request(dd, uctxt->ctxt, fd->subctxt,
++					     info.comp_idx);
+ 	req = pq->reqs + info.comp_idx;
+ 	req->data_iovs = req_iovcnt(info.ctrl) - 1; /* subtract header vector */
+ 	req->data_len  = 0;
+@@ -708,7 +707,8 @@ int hfi1_user_sdma_process_request(struct file *fp, struct iovec *iovec,
+ 	req->tidoffset = KDETH_GET(req->hdr.kdeth.ver_tid_offset, OFFSET) *
+ 		(KDETH_GET(req->hdr.kdeth.ver_tid_offset, OM) ?
+ 		 KDETH_OM_LARGE : KDETH_OM_SMALL);
+-	SDMA_DBG(req, "Initial TID offset %u", req->tidoffset);
++	trace_hfi1_sdma_user_initial_tidoffset(dd, uctxt->ctxt, fd->subctxt,
++					       info.comp_idx, req->tidoffset);
+ 	idx++;
+ 
+ 	/* Save all the IO vector structures */
+@@ -726,8 +726,8 @@ int hfi1_user_sdma_process_request(struct file *fp, struct iovec *iovec,
+ 		}
+ 		req->data_len += req->iovs[i].iov.iov_len;
+ 	}
+-	SDMA_DBG(req, "total data length %u", req->data_len);
+-
++	trace_hfi1_sdma_user_data_length(dd, uctxt->ctxt, fd->subctxt,
++					 info.comp_idx, req->data_len);
+ 	if (pcount > req->info.npkts)
+ 		pcount = req->info.npkts;
+ 	/*
+@@ -882,7 +882,11 @@ static inline u32 compute_data_length(struct user_sdma_request *req,
+ 	} else {
+ 		len = min(req->data_len - req->sent, (u32)req->info.fragsize);
+ 	}
+-	SDMA_DBG(req, "Data Length = %u", len);
++	trace_hfi1_sdma_user_compute_length(req->pq->dd,
++					    req->pq->ctxt,
++					    req->pq->subctxt,
++					    req->info.comp_idx,
++					    len);
+ 	return len;
+ }
+ 
+@@ -1463,9 +1467,10 @@ static int set_txreq_header(struct user_sdma_request *req,
+ 		 * Set the KDETH.OFFSET and KDETH.OM based on size of
+ 		 * transfer.
+ 		 */
+-		SDMA_DBG(req, "TID offset %ubytes %uunits om%u",
+-			 req->tidoffset, req->tidoffset >> omfactor,
+-			 omfactor != KDETH_OM_SMALL_SHIFT);
++		trace_hfi1_sdma_user_tid_info(
++			pq->dd, pq->ctxt, pq->subctxt, req->info.comp_idx,
++			req->tidoffset, req->tidoffset >> omfactor,
++			omfactor != KDETH_OM_SMALL_SHIFT);
+ 		KDETH_SET(hdr->kdeth.ver_tid_offset, OFFSET,
+ 			  req->tidoffset >> omfactor);
+ 		KDETH_SET(hdr->kdeth.ver_tid_offset, OM,
+@@ -1673,8 +1678,6 @@ static inline void set_comp_state(struct hfi1_user_sdma_pkt_q *pq,
+ 				  u16 idx, enum hfi1_sdma_comp_state state,
+ 				  int ret)
+ {
+-	hfi1_cdbg(SDMA, "[%u:%u:%u:%u] Setting completion status %u %d",
+-		  pq->dd->unit, pq->ctxt, pq->subctxt, idx, state, ret);
+ 	if (state == ERROR)
+ 		cq->comps[idx].errcode = -ret;
+ 	smp_wmb(); /* make sure errcode is visible first */
+* Unmerged path drivers/infiniband/hw/hfi1/user_sdma.h
