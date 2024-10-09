@@ -1,0 +1,231 @@
+net: ipv6: Do not duplicate DAD on link up
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] ipv6: Do not duplicate DAD on link up (Ivan Vecera) [1500871]
+Rebuild_FUZZ: 93.67%
+commit-author David Ahern <dsahern@gmail.com>
+commit 6d717134a1a6e1b34a7d0d70e953037bc2642046
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/6d717134.failed
+
+Andrey reported a warning triggered by the rcu code:
+
+------------[ cut here ]------------
+WARNING: CPU: 1 PID: 5911 at lib/debugobjects.c:289
+debug_print_object+0x175/0x210
+ODEBUG: activate active (active state 1) object type: rcu_head hint:
+        (null)
+Modules linked in:
+CPU: 1 PID: 5911 Comm: a.out Not tainted 4.11.0-rc8+ #271
+Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS Bochs 01/01/2011
+Call Trace:
+ __dump_stack lib/dump_stack.c:16
+ dump_stack+0x192/0x22d lib/dump_stack.c:52
+ __warn+0x19f/0x1e0 kernel/panic.c:549
+ warn_slowpath_fmt+0xe0/0x120 kernel/panic.c:564
+ debug_print_object+0x175/0x210 lib/debugobjects.c:286
+ debug_object_activate+0x574/0x7e0 lib/debugobjects.c:442
+ debug_rcu_head_queue kernel/rcu/rcu.h:75
+ __call_rcu.constprop.76+0xff/0x9c0 kernel/rcu/tree.c:3229
+ call_rcu_sched+0x12/0x20 kernel/rcu/tree.c:3288
+ rt6_rcu_free net/ipv6/ip6_fib.c:158
+ rt6_release+0x1ea/0x290 net/ipv6/ip6_fib.c:188
+ fib6_del_route net/ipv6/ip6_fib.c:1461
+ fib6_del+0xa42/0xdc0 net/ipv6/ip6_fib.c:1500
+ __ip6_del_rt+0x100/0x160 net/ipv6/route.c:2174
+ ip6_del_rt+0x140/0x1b0 net/ipv6/route.c:2187
+ __ipv6_ifa_notify+0x269/0x780 net/ipv6/addrconf.c:5520
+ addrconf_ifdown+0xe60/0x1a20 net/ipv6/addrconf.c:3672
+...
+
+Andrey's reproducer program runs in a very tight loop, calling
+'unshare -n' and then spawning 2 sets of 14 threads running random ioctl
+calls. The relevant networking sequence:
+
+1. New network namespace created via unshare -n
+- ip6tnl0 device is created in down state
+
+2. address added to ip6tnl0
+- equivalent to ip -6 addr add dev ip6tnl0 fd00::bb/1
+- DAD is started on the address and when it completes the host
+  route is inserted into the FIB
+
+3. ip6tnl0 is brought up
+- the new fixup_permanent_addr function restarts DAD on the address
+
+4. exit namespace
+- teardown / cleanup sequence starts
+- once in a blue moon, lo teardown appears to happen BEFORE teardown
+  of ip6tunl0
+  + down on 'lo' removes the host route from the FIB since the dst->dev
+    for the route is loobback
+  + host route added to rcu callback list
+    * rcu callback has not run yet, so rt is NOT on the gc list so it has
+      NOT been marked obsolete
+
+5. in parallel to 4. worker_thread runs addrconf_dad_completed
+- DAD on the address on ip6tnl0 completes
+- calls ipv6_ifa_notify which inserts the host route
+
+All of that happens very quickly. The result is that a host route that
+has been deleted from the IPv6 FIB and added to the RCU list is re-inserted
+into the FIB.
+
+The exit namespace eventually gets to cleaning up ip6tnl0 which removes the
+host route from the FIB again, calls the rcu function for cleanup -- and
+triggers the double rcu trace.
+
+The root cause is duplicate DAD on the address -- steps 2 and 3. Arguably,
+DAD should not be started in step 2. The interface is in the down state,
+so it can not really send out requests for the address which makes starting
+DAD pointless.
+
+Since the second DAD was introduced by a recent change, seems appropriate
+to use it for the Fixes tag and have the fixup function only start DAD for
+addresses in the PREDAD state which occurs in addrconf_ifdown if the
+address is retained.
+
+Big thanks to Andrey for isolating a reliable reproducer for this problem.
+Fixes: f1705ec197e7 ("net: ipv6: Make address flushing on ifdown optional")
+	Reported-by: Andrey Konovalov <andreyknvl@google.com>
+	Signed-off-by: David Ahern <dsahern@gmail.com>
+	Tested-by: Andrey Konovalov <andreyknvl@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6d717134a1a6e1b34a7d0d70e953037bc2642046)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/addrconf.c
+diff --cc net/ipv6/addrconf.c
+index 836f13f8d356,a2a370b71249..000000000000
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@@ -3071,6 -3300,66 +3071,69 @@@ static void addrconf_gre_config(struct 
+  }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ static int fixup_permanent_addr(struct inet6_dev *idev,
++ 				struct inet6_ifaddr *ifp)
++ {
++ 	/* rt6i_ref == 0 means the host route was removed from the
++ 	 * FIB, for example, if 'lo' device is taken down. In that
++ 	 * case regenerate the host route.
++ 	 */
++ 	if (!ifp->rt || !atomic_read(&ifp->rt->rt6i_ref)) {
++ 		struct rt6_info *rt, *prev;
++ 
++ 		rt = addrconf_dst_alloc(idev, &ifp->addr, false);
++ 		if (unlikely(IS_ERR(rt)))
++ 			return PTR_ERR(rt);
++ 
++ 		/* ifp->rt can be accessed outside of rtnl */
++ 		spin_lock(&ifp->lock);
++ 		prev = ifp->rt;
++ 		ifp->rt = rt;
++ 		spin_unlock(&ifp->lock);
++ 
++ 		ip6_rt_put(prev);
++ 	}
++ 
++ 	if (!(ifp->flags & IFA_F_NOPREFIXROUTE)) {
++ 		addrconf_prefix_route(&ifp->addr, ifp->prefix_len,
++ 				      idev->dev, 0, 0);
++ 	}
++ 
++ 	if (ifp->state == INET6_IFADDR_STATE_PREDAD)
++ 		addrconf_dad_start(ifp);
++ 
++ 	return 0;
++ }
++ 
++ static void addrconf_permanent_addr(struct net_device *dev)
++ {
++ 	struct inet6_ifaddr *ifp, *tmp;
++ 	struct inet6_dev *idev;
++ 
++ 	idev = __in6_dev_get(dev);
++ 	if (!idev)
++ 		return;
++ 
++ 	write_lock_bh(&idev->lock);
++ 
++ 	list_for_each_entry_safe(ifp, tmp, &idev->addr_list, if_list) {
++ 		if ((ifp->flags & IFA_F_PERMANENT) &&
++ 		    fixup_permanent_addr(idev, ifp) < 0) {
++ 			write_unlock_bh(&idev->lock);
++ 			ipv6_del_addr(ifp);
++ 			write_lock_bh(&idev->lock);
++ 
++ 			net_info_ratelimited("%s: Failed to add prefix route for address %pI6c; dropping\n",
++ 					     idev->dev->name, &ifp->addr);
++ 		}
++ 	}
++ 
++ 	write_unlock_bh(&idev->lock);
++ }
++ 
+++>>>>>>> 6d717134a1a6 (net: ipv6: Do not duplicate DAD on link up)
+  static int addrconf_notify(struct notifier_block *this, unsigned long event,
+  			   void *ptr)
+  {
+@@@ -3330,20 -3661,45 +3393,38 @@@ static int addrconf_ifdown(struct net_d
+  		write_lock_bh(&idev->lock);
+  	}
+  
+ -	/* re-combine the user config with event to determine if permanent
+ -	 * addresses are to be removed from the interface list
+ -	 */
+ -	keep_addr = (!how && _keep_addr > 0 && !idev->cnf.disable_ipv6);
+ -
+ -	INIT_LIST_HEAD(&del_list);
+ -	list_for_each_entry_safe(ifa, tmp, &idev->addr_list, if_list) {
+ -		struct rt6_info *rt = NULL;
+ -		bool keep;
+ -
+ +	while (!list_empty(&idev->addr_list)) {
+ +		ifa = list_first_entry(&idev->addr_list,
+ +				       struct inet6_ifaddr, if_list);
+  		addrconf_del_dad_work(ifa);
+  
+ -		keep = keep_addr && (ifa->flags & IFA_F_PERMANENT) &&
+ -			!addr_is_local(&ifa->addr);
+ -		if (!keep)
+ -			list_move(&ifa->if_list, &del_list);
+ +		list_del(&ifa->if_list);
+  
+  		write_unlock_bh(&idev->lock);
+ +
+  		spin_lock_bh(&ifa->lock);
+++<<<<<<< HEAD
+ +		state = ifa->state;
+ +		ifa->state = INET6_IFADDR_STATE_DEAD;
+++=======
++ 
++ 		if (keep) {
++ 			/* set state to skip the notifier below */
++ 			state = INET6_IFADDR_STATE_DEAD;
++ 			ifa->state = INET6_IFADDR_STATE_PREDAD;
++ 			if (!(ifa->flags & IFA_F_NODAD))
++ 				ifa->flags |= IFA_F_TENTATIVE;
++ 
++ 			rt = ifa->rt;
++ 			ifa->rt = NULL;
++ 		} else {
++ 			state = ifa->state;
++ 			ifa->state = INET6_IFADDR_STATE_DEAD;
++ 		}
++ 
+++>>>>>>> 6d717134a1a6 (net: ipv6: Do not duplicate DAD on link up)
+  		spin_unlock_bh(&ifa->lock);
+  
+ -		if (rt)
+ -			ip6_del_rt(rt);
+ -
+  		if (state != INET6_IFADDR_STATE_DEAD) {
+  			__ipv6_ifa_notify(RTM_DELADDR, ifa);
+  			inet6addr_notifier_call_chain(NETDEV_DOWN, ifa);
+* Unmerged path net/ipv6/addrconf.c
