@@ -1,0 +1,121 @@
+sched/autogroup: Fix autogroup_move_group() to never skip sched_move_task()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Oleg Nesterov <oleg@redhat.com>
+commit 18f649ef344127ef6de23a5a4272dbe2fdb73dde
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/18f649ef.failed
+
+The PF_EXITING check in task_wants_autogroup() is no longer needed. Remove
+it, but see the next patch.
+
+However the comment is correct in that autogroup_move_group() must always
+change task_group() for every thread so the sysctl_ check is very wrong;
+we can race with cgroups and even sys_setsid() is not safe because a task
+running with task_group() == ag->tg must participate in refcounting:
+
+	int main(void)
+	{
+		int sctl = open("/proc/sys/kernel/sched_autogroup_enabled", O_WRONLY);
+
+		assert(sctl > 0);
+		if (fork()) {
+			wait(NULL); // destroy the child's ag/tg
+			pause();
+		}
+
+		assert(pwrite(sctl, "1\n", 2, 0) == 2);
+		assert(setsid() > 0);
+		if (fork())
+			pause();
+
+		kill(getppid(), SIGKILL);
+		sleep(1);
+
+		// The child has gone, the grandchild runs with kref == 1
+		assert(pwrite(sctl, "0\n", 2, 0) == 2);
+		assert(setsid() > 0);
+
+		// runs with the freed ag/tg
+		for (;;)
+			sleep(1);
+
+		return 0;
+	}
+
+crashes the kernel. It doesn't really need sleep(1), it doesn't matter if
+autogroup_move_group() actually frees the task_group or this happens later.
+
+	Reported-by: Vern Lovejoy <vlovejoy@redhat.com>
+	Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Mike Galbraith <efault@gmx.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: hartsjc@redhat.com
+	Cc: vbendel@redhat.com
+Link: http://lkml.kernel.org/r/20161114184609.GA15965@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 18f649ef344127ef6de23a5a4272dbe2fdb73dde)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/auto_group.c
+diff --cc kernel/sched/auto_group.c
+index 031cc02f02aa,ad2b19ad6ca0..000000000000
+--- a/kernel/sched/auto_group.c
++++ b/kernel/sched/auto_group.c
+@@@ -114,17 -111,11 +114,18 @@@ bool task_wants_autogroup(struct task_s
+  {
+  	if (tg != &root_task_group)
+  		return false;
+++<<<<<<< HEAD
+ +
+ +	if (p->sched_class != &fair_sched_class)
+ +		return false;
+ +
+++=======
+++>>>>>>> 18f649ef3441 (sched/autogroup: Fix autogroup_move_group() to never skip sched_move_task())
+  	/*
+- 	 * We can only assume the task group can't go away on us if
+- 	 * autogroup_move_group() can see us on ->thread_group list.
++ 	 * If we race with autogroup_move_group() the caller can use the old
++ 	 * value of signal->autogroup but in this case sched_move_task() will
++ 	 * be called again before autogroup_kref_put().
+  	 */
+- 	if (p->flags & PF_EXITING)
+- 		return false;
+- 
+  	return true;
+  }
+  
+@@@ -144,13 -135,17 +145,24 @@@ autogroup_move_group(struct task_struc
+  	}
+  
+  	p->signal->autogroup = autogroup_kref_get(ag);
+++<<<<<<< HEAD
+ +
+ +	if (!ACCESS_ONCE(sysctl_sched_autogroup_enabled))
+ +		goto out;
+ +
+++=======
++ 	/*
++ 	 * We can't avoid sched_move_task() after we changed signal->autogroup,
++ 	 * this process can already run with task_group() == prev->tg or we can
++ 	 * race with cgroup code which can read autogroup = prev under rq->lock.
++ 	 * In the latter case for_each_thread() can not miss a migrating thread,
++ 	 * cpu_cgroup_attach() must not be possible after cgroup_exit() and it
++ 	 * can't be removed from thread list, we hold ->siglock.
++ 	 */
+++>>>>>>> 18f649ef3441 (sched/autogroup: Fix autogroup_move_group() to never skip sched_move_task())
+  	for_each_thread(p, t)
+  		sched_move_task(t);
+- out:
++ 
+  	unlock_task_sighand(p, &flags);
+  	autogroup_kref_put(prev);
+  }
+* Unmerged path kernel/sched/auto_group.c
