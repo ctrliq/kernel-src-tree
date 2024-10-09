@@ -9,6 +9,7 @@
 #include "i40e_trace.h"
 #include "i40e_prototype.h"
 #include "i40e_txrx_common.h"
+#include "i40e_xsk.h"
 
 static inline __le64 build_ctob(u32 td_cmd, u32 td_offset, unsigned int size,
 				u32 td_tag)
@@ -1381,6 +1382,9 @@ void i40e_clean_rx_ring(struct i40e_ring *rx_ring)
 		rx_ring->skb = NULL;
 	}
 
+	if (rx_ring->xsk_umem)
+		goto skip_free;
+
 	/* Free all the Rx ring sk_buffs */
 	for (i = 0; i < rx_ring->count; i++) {
 		struct i40e_rx_buffer *rx_bi = &rx_ring->rx_bi[i];
@@ -1411,6 +1415,7 @@ void i40e_clean_rx_ring(struct i40e_ring *rx_ring)
 		rx_bi->page_offset = 0;
 	}
 
+skip_free:
 	bi_size = sizeof(struct i40e_rx_buffer) * rx_ring->count;
 	memset(rx_ring->rx_bi, 0, bi_size);
 
@@ -2628,7 +2633,9 @@ int i40e_napi_poll(struct napi_struct *napi, int budget)
 	budget_per_ring = max(budget/q_vector->num_ringpairs, 1);
 
 	i40e_for_each_ring(ring, q_vector->rx) {
-		int cleaned = i40e_clean_rx_irq(ring, budget_per_ring);
+		int cleaned = ring->xsk_umem ?
+			      i40e_clean_rx_irq_zc(ring, budget_per_ring) :
+			      i40e_clean_rx_irq(ring, budget_per_ring);
 
 		work_done += cleaned;
 		/* if we clean as many as budgeted, we must not be done */
