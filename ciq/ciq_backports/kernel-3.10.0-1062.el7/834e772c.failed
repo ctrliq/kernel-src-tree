@@ -1,0 +1,98 @@
+vhost/vsock: fix use-after-free in network stack callers
+
+jira LE-1907
+cve CVE-2018-14625
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [vhost] vsock: fix use-after-free in network stack callers (Stefan Hajnoczi) [1623776] {CVE-2018-14625}
+Rebuild_FUZZ: 94.34%
+commit-author Stefan Hajnoczi <stefanha@redhat.com>
+commit 834e772c8db0c6a275d75315d90aba4ebbb1e249
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/834e772c.failed
+
+If the network stack calls .send_pkt()/.cancel_pkt() during .release(),
+a struct vhost_vsock use-after-free is possible.  This occurs because
+.release() does not wait for other CPUs to stop using struct
+vhost_vsock.
+
+Switch to an RCU-enabled hashtable (indexed by guest CID) so that
+.release() can wait for other CPUs by calling synchronize_rcu().  This
+also eliminates vhost_vsock_lock acquisition in the data path so it
+could have a positive effect on performance.
+
+This is CVE-2018-14625 "kernel: use-after-free Read in vhost_transport_send_pkt".
+
+	Cc: stable@vger.kernel.org
+Reported-and-tested-by: syzbot+bd391451452fb0b93039@syzkaller.appspotmail.com
+	Reported-by: syzbot+e3e074963495f92a89ed@syzkaller.appspotmail.com
+	Reported-by: syzbot+d5a0a170c5069658b141@syzkaller.appspotmail.com
+	Signed-off-by: Stefan Hajnoczi <stefanha@redhat.com>
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+	Acked-by: Jason Wang <jasowang@redhat.com>
+(cherry picked from commit 834e772c8db0c6a275d75315d90aba4ebbb1e249)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vhost/vsock.c
+diff --cc drivers/vhost/vsock.c
+index 1b2746cf27a1,98ed5be132c6..000000000000
+--- a/drivers/vhost/vsock.c
++++ b/drivers/vhost/vsock.c
+@@@ -232,6 -226,52 +230,55 @@@ vhost_transport_send_pkt(struct virtio_
+  	return len;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ vhost_transport_cancel_pkt(struct vsock_sock *vsk)
++ {
++ 	struct vhost_vsock *vsock;
++ 	struct virtio_vsock_pkt *pkt, *n;
++ 	int cnt = 0;
++ 	int ret = -ENODEV;
++ 	LIST_HEAD(freeme);
++ 
++ 	rcu_read_lock();
++ 
++ 	/* Find the vhost_vsock according to guest context id  */
++ 	vsock = vhost_vsock_get(vsk->remote_addr.svm_cid);
++ 	if (!vsock)
++ 		goto out;
++ 
++ 	spin_lock_bh(&vsock->send_pkt_list_lock);
++ 	list_for_each_entry_safe(pkt, n, &vsock->send_pkt_list, list) {
++ 		if (pkt->vsk != vsk)
++ 			continue;
++ 		list_move(&pkt->list, &freeme);
++ 	}
++ 	spin_unlock_bh(&vsock->send_pkt_list_lock);
++ 
++ 	list_for_each_entry_safe(pkt, n, &freeme, list) {
++ 		if (pkt->reply)
++ 			cnt++;
++ 		list_del(&pkt->list);
++ 		virtio_transport_free_pkt(pkt);
++ 	}
++ 
++ 	if (cnt) {
++ 		struct vhost_virtqueue *tx_vq = &vsock->vqs[VSOCK_VQ_TX];
++ 		int new_cnt;
++ 
++ 		new_cnt = atomic_sub_return(cnt, &vsock->queued_replies);
++ 		if (new_cnt + cnt >= tx_vq->num && new_cnt < tx_vq->num)
++ 			vhost_poll_queue(&tx_vq->poll);
++ 	}
++ 
++ 	ret = 0;
++ out:
++ 	rcu_read_unlock();
++ 	return ret;
++ }
++ 
+++>>>>>>> 834e772c8db0 (vhost/vsock: fix use-after-free in network stack callers)
+  static struct virtio_vsock_pkt *
+  vhost_vsock_alloc_pkt(struct vhost_virtqueue *vq,
+  		      unsigned int out, unsigned int in)
+* Unmerged path drivers/vhost/vsock.c
