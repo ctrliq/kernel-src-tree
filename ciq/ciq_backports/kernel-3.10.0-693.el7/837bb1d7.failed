@@ -1,0 +1,255 @@
+NFSv4.2: Fix writeback races in nfs4_copy_file_range
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Trond Myklebust <trond.myklebust@primarydata.com>
+commit 837bb1d752d92ea4d870877ffbd6ec5cf76624b3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/837bb1d7.failed
+
+We need to ensure that any writes to the destination file are serialised
+with the copy, meaning that the writeback has to occur under the inode lock.
+
+Also relax the writeback requirement on the source, and rely on the
+stateid checking to tell us if the source rebooted. Add the helper
+nfs_filemap_write_and_wait_range() to call pnfs_sync_inode() as
+is appropriate for pNFS servers that may need a layoutcommit.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 837bb1d752d92ea4d870877ffbd6ec5cf76624b3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs42proc.c
+#	fs/nfs/nfs4file.c
+diff --cc fs/nfs/nfs42proc.c
+index 923864bebddf,b7d457cea03f..000000000000
+--- a/fs/nfs/nfs42proc.c
++++ b/fs/nfs/nfs42proc.c
+@@@ -121,8 -123,122 +121,122 @@@ int nfs42_proc_deallocate(struct file *
+  		truncate_pagecache_range(inode, offset, (offset + len) -1);
+  	if (err == -EOPNOTSUPP)
+  		NFS_SERVER(inode)->caps &= ~NFS_CAP_DEALLOCATE;
+ -out_unlock:
+ -	inode_unlock(inode);
+ -	return err;
+ -}
+  
+++<<<<<<< HEAD
+ +	mutex_unlock(&inode->i_mutex);
+++=======
++ static ssize_t _nfs42_proc_copy(struct file *src, loff_t pos_src,
++ 				struct nfs_lock_context *src_lock,
++ 				struct file *dst, loff_t pos_dst,
++ 				struct nfs_lock_context *dst_lock,
++ 				size_t count)
++ {
++ 	struct nfs42_copy_args args = {
++ 		.src_fh		= NFS_FH(file_inode(src)),
++ 		.src_pos	= pos_src,
++ 		.dst_fh		= NFS_FH(file_inode(dst)),
++ 		.dst_pos	= pos_dst,
++ 		.count		= count,
++ 	};
++ 	struct nfs42_copy_res res;
++ 	struct rpc_message msg = {
++ 		.rpc_proc = &nfs4_procedures[NFSPROC4_CLNT_COPY],
++ 		.rpc_argp = &args,
++ 		.rpc_resp = &res,
++ 	};
++ 	struct inode *dst_inode = file_inode(dst);
++ 	struct nfs_server *server = NFS_SERVER(dst_inode);
++ 	int status;
++ 
++ 	status = nfs4_set_rw_stateid(&args.src_stateid, src_lock->open_context,
++ 				     src_lock, FMODE_READ);
++ 	if (status)
++ 		return status;
++ 
++ 	status = nfs_filemap_write_and_wait_range(file_inode(src)->i_mapping,
++ 			pos_src, pos_src + (loff_t)count - 1);
++ 	if (status)
++ 		return status;
++ 
++ 	status = nfs4_set_rw_stateid(&args.dst_stateid, dst_lock->open_context,
++ 				     dst_lock, FMODE_WRITE);
++ 	if (status)
++ 		return status;
++ 
++ 	status = nfs_sync_inode(dst_inode);
++ 	if (status)
++ 		return status;
++ 
++ 	status = nfs4_call_sync(server->client, server, &msg,
++ 				&args.seq_args, &res.seq_res, 0);
++ 	if (status == -ENOTSUPP)
++ 		server->caps &= ~NFS_CAP_COPY;
++ 	if (status)
++ 		return status;
++ 
++ 	if (res.write_res.verifier.committed != NFS_FILE_SYNC) {
++ 		status = nfs_commit_file(dst, &res.write_res.verifier.verifier);
++ 		if (status)
++ 			return status;
++ 	}
++ 
++ 	truncate_pagecache_range(dst_inode, pos_dst,
++ 				 pos_dst + res.write_res.count);
++ 
++ 	return res.write_res.count;
++ }
++ 
++ ssize_t nfs42_proc_copy(struct file *src, loff_t pos_src,
++ 			struct file *dst, loff_t pos_dst,
++ 			size_t count)
++ {
++ 	struct nfs_server *server = NFS_SERVER(file_inode(dst));
++ 	struct nfs_lock_context *src_lock;
++ 	struct nfs_lock_context *dst_lock;
++ 	struct nfs4_exception src_exception = { };
++ 	struct nfs4_exception dst_exception = { };
++ 	ssize_t err, err2;
++ 
++ 	if (!nfs_server_capable(file_inode(dst), NFS_CAP_COPY))
++ 		return -EOPNOTSUPP;
++ 
++ 	src_lock = nfs_get_lock_context(nfs_file_open_context(src));
++ 	if (IS_ERR(src_lock))
++ 		return PTR_ERR(src_lock);
++ 
++ 	src_exception.inode = file_inode(src);
++ 	src_exception.state = src_lock->open_context->state;
++ 
++ 	dst_lock = nfs_get_lock_context(nfs_file_open_context(dst));
++ 	if (IS_ERR(dst_lock)) {
++ 		err = PTR_ERR(dst_lock);
++ 		goto out_put_src_lock;
++ 	}
++ 
++ 	dst_exception.inode = file_inode(dst);
++ 	dst_exception.state = dst_lock->open_context->state;
++ 
++ 	do {
++ 		inode_lock(file_inode(dst));
++ 		err = _nfs42_proc_copy(src, pos_src, src_lock,
++ 				       dst, pos_dst, dst_lock, count);
++ 		inode_unlock(file_inode(dst));
++ 
++ 		if (err == -ENOTSUPP) {
++ 			err = -EOPNOTSUPP;
++ 			break;
++ 		}
++ 
++ 		err2 = nfs4_handle_exception(server, err, &src_exception);
++ 		err  = nfs4_handle_exception(server, err, &dst_exception);
++ 		if (!err)
++ 			err = err2;
++ 	} while (src_exception.retry || dst_exception.retry);
++ 
++ 	nfs_put_lock_context(dst_lock);
++ out_put_src_lock:
++ 	nfs_put_lock_context(src_lock);
+++>>>>>>> 837bb1d752d9 (NFSv4.2: Fix writeback races in nfs4_copy_file_range)
+  	return err;
+  }
+  
+diff --cc fs/nfs/nfs4file.c
+index ea8125acbd96,7cdc0ab9e6f5..000000000000
+--- a/fs/nfs/nfs4file.c
++++ b/fs/nfs/nfs4file.c
+@@@ -128,38 -128,17 +128,45 @@@ nfs4_file_flush(struct file *file, fl_o
+  	return vfs_fsync(file, 0);
+  }
+  
+ -#ifdef CONFIG_NFS_V4_2
+ -static ssize_t nfs4_copy_file_range(struct file *file_in, loff_t pos_in,
+ -				    struct file *file_out, loff_t pos_out,
+ -				    size_t count, unsigned int flags)
+ +static int
+ +nfs4_file_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+  {
+++<<<<<<< HEAD
+ +	int ret;
+ +	struct inode *inode = file_inode(file);
+ +
+ +	trace_nfs_fsync_enter(inode);
+ +
+ +	nfs_inode_dio_wait(inode);
+ +	do {
+ +		ret = filemap_write_and_wait_range(inode->i_mapping, start, end);
+ +		if (ret != 0)
+ +			break;
+ +		mutex_lock(&inode->i_mutex);
+ +		ret = nfs_file_fsync_commit(file, start, end, datasync);
+ +		if (!ret)
+ +			ret = pnfs_sync_inode(inode, !!datasync);
+ +		mutex_unlock(&inode->i_mutex);
+ +		/*
+ +		 * If nfs_file_fsync_commit detected a server reboot, then
+ +		 * resend all dirty pages that might have been covered by
+ +		 * the NFS_CONTEXT_RESEND_WRITES flag
+ +		 */
+ +		start = 0;
+ +		end = LLONG_MAX;
+ +	} while (ret == -EAGAIN);
+ +
+ +	trace_nfs_fsync_exit(inode, ret);
+ +	return ret;
+++=======
++ 	if (file_inode(file_in) == file_inode(file_out))
++ 		return -EINVAL;
++ 
++ 	return nfs42_proc_copy(file_in, pos_in, file_out, pos_out, count);
+++>>>>>>> 837bb1d752d9 (NFSv4.2: Fix writeback races in nfs4_copy_file_range)
+  }
+  
+ +#ifdef CONFIG_NFS_V4_2
+  static loff_t nfs4_file_llseek(struct file *filep, loff_t offset, int whence)
+  {
+  	loff_t ret;
+diff --git a/fs/nfs/internal.h b/fs/nfs/internal.h
+index bfaacccbdab9..14f3b3565ccd 100644
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@ -509,6 +509,9 @@ int nfs_key_timeout_notify(struct file *filp, struct inode *inode);
+ bool nfs_ctx_key_to_expire(struct nfs_open_context *ctx);
+ void nfs_pageio_stop_mirroring(struct nfs_pageio_descriptor *pgio);
+ 
++int nfs_filemap_write_and_wait_range(struct address_space *mapping,
++		loff_t lstart, loff_t lend);
++
+ #ifdef CONFIG_NFS_V4_1
+ static inline
+ void nfs_clear_pnfs_ds_commit_verifiers(struct pnfs_ds_commit_info *cinfo)
+* Unmerged path fs/nfs/nfs42proc.c
+* Unmerged path fs/nfs/nfs4file.c
+diff --git a/fs/nfs/write.c b/fs/nfs/write.c
+index c51910643a0b..f6c279872690 100644
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@ -1868,6 +1868,24 @@ out_mark_dirty:
+ }
+ EXPORT_SYMBOL_GPL(nfs_write_inode);
+ 
++/*
++ * Wrapper for filemap_write_and_wait_range()
++ *
++ * Needed for pNFS in order to ensure data becomes visible to the
++ * client.
++ */
++int nfs_filemap_write_and_wait_range(struct address_space *mapping,
++		loff_t lstart, loff_t lend)
++{
++	int ret;
++
++	ret = filemap_write_and_wait_range(mapping, lstart, lend);
++	if (ret == 0)
++		ret = pnfs_sync_inode(mapping->host, true);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(nfs_filemap_write_and_wait_range);
++
+ /*
+  * flush the inode to disk.
+  */
