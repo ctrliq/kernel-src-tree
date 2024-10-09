@@ -1,0 +1,137 @@
+tcmu: fix double se_cmd completion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mike Christie <mchristi@redhat.com>
+commit 0d44374c1aaec7c81b470d3b5f955bc270711f9c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/0d44374c.failed
+
+If cmd_time_out != 0, then tcmu_queue_cmd_ring could end up
+sleeping waiting for ring space, timing out and then returning
+failure to lio, and tcmu_check_expired_cmd could also detect
+the timeout and call target_complete_cmd on the cmd.
+
+This patch just delays setting up the deadline value and adding
+the cmd to the udev->commands idr until we have allocated ring
+space and are about to send the cmd to userspace.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 0d44374c1aaec7c81b470d3b5f955bc270711f9c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 3a9402c59df4,9ddf0909d33e..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -330,36 -437,19 +329,44 @@@ static struct tcmu_cmd *tcmu_alloc_cmd(
+  	if (!tcmu_cmd)
+  		return NULL;
+  
+ +	tcmu_cmd->data_bitmap = kzalloc(BITS_TO_LONGS(udev->max_blocks) *
+ +					sizeof(unsigned long), GFP_KERNEL);
+ +	if (!tcmu_cmd->data_bitmap)
+ +		goto free_cmd;
+ +
+  	tcmu_cmd->se_cmd = se_cmd;
+  	tcmu_cmd->tcmu_dev = udev;
+- 	if (udev->cmd_time_out)
+- 		tcmu_cmd->deadline = jiffies +
+- 					msecs_to_jiffies(udev->cmd_time_out);
+  
+++<<<<<<< HEAD
+ +	idr_preload(GFP_KERNEL);
+ +	spin_lock_irq(&udev->commands_lock);
+ +	cmd_id = idr_alloc(&udev->commands, tcmu_cmd, 0,
+ +		USHRT_MAX, GFP_NOWAIT);
+ +	spin_unlock_irq(&udev->commands_lock);
+ +	idr_preload_end();
+ +
+ +	if (cmd_id < 0)
+ +		goto free_bitmap;
+ +
+ +	tcmu_cmd->cmd_id = cmd_id;
+++=======
++ 	tcmu_cmd_reset_dbi_cur(tcmu_cmd);
++ 	tcmu_cmd->dbi_cnt = tcmu_cmd_get_block_cnt(tcmu_cmd);
++ 	tcmu_cmd->dbi = kcalloc(tcmu_cmd->dbi_cnt, sizeof(uint32_t),
++ 				GFP_KERNEL);
++ 	if (!tcmu_cmd->dbi) {
++ 		kmem_cache_free(tcmu_cmd_cache, tcmu_cmd);
++ 		return NULL;
++ 	}
+++>>>>>>> 0d44374c1aae (tcmu: fix double se_cmd completion)
+  
+  	return tcmu_cmd;
+ +
+ +free_bitmap:
+ +	kfree(tcmu_cmd->data_bitmap);
+ +free_cmd:
+ +	kmem_cache_free(tcmu_cmd_cache, tcmu_cmd);
+ +	return NULL;
+  }
+  
+  static inline void tcmu_flush_dcache_range(void *vaddr, size_t size)
+@@@ -698,9 -848,9 +729,8 @@@ tcmu_queue_cmd_ring(struct tcmu_cmd *tc
+  	entry = (void *) mb + CMDR_OFF + cmd_head;
+  	memset(entry, 0, command_size);
+  	tcmu_hdr_set_op(&entry->hdr.len_op, TCMU_OP_CMD);
+- 	entry->hdr.cmd_id = tcmu_cmd->cmd_id;
+  
+  	/* Handle allocating space from the data area */
+ -	tcmu_cmd_reset_dbi_cur(tcmu_cmd);
+  	iov = &entry->req.iov[0];
+  	iov_cnt = 0;
+  	copy_to_data_area = (se_cmd->data_direction == DMA_TO_DEVICE
+@@@ -713,11 -869,29 +743,18 @@@
+  
+  	/* Handle BIDI commands */
+  	iov_cnt = 0;
+ -	if (se_cmd->se_cmd_flags & SCF_BIDI) {
+ -		iov++;
+ -		ret = scatter_data_area(udev, tcmu_cmd,
+ -					se_cmd->t_bidi_data_sg,
+ -					se_cmd->t_bidi_data_nents,
+ -					&iov, &iov_cnt, false);
+ -		if (ret) {
+ -			tcmu_cmd_free_data(tcmu_cmd, tcmu_cmd->dbi_cnt);
+ -			mutex_unlock(&udev->cmdr_lock);
+ -
+ -			pr_err("tcmu: alloc and scatter bidi data failed\n");
+ -			return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+ -		}
+ -	}
+ +	alloc_and_scatter_data_area(udev, tcmu_cmd->data_bitmap,
+ +		se_cmd->t_bidi_data_sg, se_cmd->t_bidi_data_nents, &iov,
+ +		&iov_cnt, false);
+  	entry->req.iov_bidi_cnt = iov_cnt;
+  
++ 	ret = tcmu_setup_cmd_timer(tcmu_cmd);
++ 	if (ret) {
++ 		tcmu_cmd_free_data(tcmu_cmd, tcmu_cmd->dbi_cnt);
++ 		return TCM_OUT_OF_RESOURCES;
++ 	}
++ 	entry->hdr.cmd_id = tcmu_cmd->cmd_id;
++ 
+  	/*
+  	 * Recalaulate the command's base size and size according
+  	 * to the actual needs
+@@@ -763,9 -934,7 +798,13 @@@ tcmu_queue_cmd(struct se_cmd *se_cmd
+  
+  	ret = tcmu_queue_cmd_ring(tcmu_cmd);
+  	if (ret != TCM_NO_SENSE) {
+++<<<<<<< HEAD
+ +		spin_lock_irq(&udev->commands_lock);
+ +		idr_remove(&udev->commands, tcmu_cmd->cmd_id);
+ +		spin_unlock_irq(&udev->commands_lock);
+++=======
++ 		pr_err("TCMU: Could not queue command\n");
+++>>>>>>> 0d44374c1aae (tcmu: fix double se_cmd completion)
+  
+  		tcmu_free_cmd(tcmu_cmd);
+  	}
+* Unmerged path drivers/target/target_core_user.c
