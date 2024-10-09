@@ -1,0 +1,258 @@
+dax, xfs, ext4: compile out iomap-dax paths in the FS_DAX=n case
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit f5705aa8cfed142d980ecac12bee0d81b756479e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/f5705aa8.failed
+
+Tetsuo reports:
+
+  fs/built-in.o: In function `xfs_file_iomap_end':
+  xfs_iomap.c:(.text+0xe0ef9): undefined reference to `put_dax'
+  fs/built-in.o: In function `xfs_file_iomap_begin':
+  xfs_iomap.c:(.text+0xe1a7f): undefined reference to `dax_get_by_host'
+  make: *** [vmlinux] Error 1
+  $ grep DAX .config
+  CONFIG_DAX=m
+  # CONFIG_DEV_DAX is not set
+  # CONFIG_FS_DAX is not set
+
+When FS_DAX=n we can/must throw away the dax code in filesystems.
+Implement 'fs_' versions of dax_get_by_host() and put_dax() that are
+nops in the FS_DAX=n case.
+
+	Cc: <linux-xfs@vger.kernel.org>
+	Cc: <linux-ext4@vger.kernel.org>
+	Cc: Jan Kara <jack@suse.com>
+	Cc: "Theodore Ts'o" <tytso@mit.edu>
+	Cc: "Darrick J. Wong" <darrick.wong@oracle.com>
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Tested-by: Tony Luck <tony.luck@intel.com>
+Fixes: ef51042472f5 ("block, dax: move 'select DAX' from BLOCK to FS_DAX")
+	Reported-by: Tetsuo Handa <penguin-kernel@i-love.sakura.ne.jp>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit f5705aa8cfed142d980ecac12bee0d81b756479e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext2/inode.c
+diff --cc fs/ext2/inode.c
+index 95bf3ba3580e,2dcbd5698884..000000000000
+--- a/fs/ext2/inode.c
++++ b/fs/ext2/inode.c
+@@@ -763,19 -770,94 +763,100 @@@ cleanup
+  	return err;
+  }
+  
+ -int ext2_get_block(struct inode *inode, sector_t iblock,
+ -		struct buffer_head *bh_result, int create)
+ +int ext2_get_block(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create)
+  {
+  	unsigned max_blocks = bh_result->b_size >> inode->i_blkbits;
+++<<<<<<< HEAD
+ +	int ret = ext2_get_blocks(inode, iblock, max_blocks,
+ +			      bh_result, create);
+ +	if (ret > 0) {
+ +		bh_result->b_size = (ret << inode->i_blkbits);
+ +		ret = 0;
+++=======
++ 	bool new = false, boundary = false;
++ 	u32 bno;
++ 	int ret;
++ 
++ 	ret = ext2_get_blocks(inode, iblock, max_blocks, &bno, &new, &boundary,
++ 			create);
++ 	if (ret <= 0)
++ 		return ret;
++ 
++ 	map_bh(bh_result, inode->i_sb, bno);
++ 	bh_result->b_size = (ret << inode->i_blkbits);
++ 	if (new)
++ 		set_buffer_new(bh_result);
++ 	if (boundary)
++ 		set_buffer_boundary(bh_result);
++ 	return 0;
++ 
++ }
++ 
++ #ifdef CONFIG_FS_DAX
++ static int ext2_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
++ 		unsigned flags, struct iomap *iomap)
++ {
++ 	struct block_device *bdev;
++ 	unsigned int blkbits = inode->i_blkbits;
++ 	unsigned long first_block = offset >> blkbits;
++ 	unsigned long max_blocks = (length + (1 << blkbits) - 1) >> blkbits;
++ 	bool new = false, boundary = false;
++ 	u32 bno;
++ 	int ret;
++ 
++ 	ret = ext2_get_blocks(inode, first_block, max_blocks,
++ 			&bno, &new, &boundary, flags & IOMAP_WRITE);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	iomap->flags = 0;
++ 	bdev = inode->i_sb->s_bdev;
++ 	iomap->bdev = bdev;
++ 	iomap->offset = (u64)first_block << blkbits;
++ 	if (blk_queue_dax(bdev->bd_queue))
++ 		iomap->dax_dev = fs_dax_get_by_host(bdev->bd_disk->disk_name);
++ 	else
++ 		iomap->dax_dev = NULL;
++ 
++ 	if (ret == 0) {
++ 		iomap->type = IOMAP_HOLE;
++ 		iomap->blkno = IOMAP_NULL_BLOCK;
++ 		iomap->length = 1 << blkbits;
++ 	} else {
++ 		iomap->type = IOMAP_MAPPED;
++ 		iomap->blkno = (sector_t)bno << (blkbits - 9);
++ 		iomap->length = (u64)ret << blkbits;
++ 		iomap->flags |= IOMAP_F_MERGED;
+++>>>>>>> f5705aa8cfed (dax, xfs, ext4: compile out iomap-dax paths in the FS_DAX=n case)
+  	}
+ +	return ret;
+  
+ -	if (new)
+ -		iomap->flags |= IOMAP_F_NEW;
+ -	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int
++ ext2_iomap_end(struct inode *inode, loff_t offset, loff_t length,
++ 		ssize_t written, unsigned flags, struct iomap *iomap)
++ {
++ 	fs_put_dax(iomap->dax_dev);
++ 	if (iomap->type == IOMAP_MAPPED &&
++ 	    written < length &&
++ 	    (flags & IOMAP_WRITE))
++ 		ext2_write_failed(inode->i_mapping, offset + length);
++ 	return 0;
++ }
++ 
++ const struct iomap_ops ext2_iomap_ops = {
++ 	.iomap_begin		= ext2_iomap_begin,
++ 	.iomap_end		= ext2_iomap_end,
++ };
++ #else
++ /* Define empty ops for !CONFIG_FS_DAX case to avoid ugly ifdefs */
++ const struct iomap_ops ext2_iomap_ops;
++ #endif /* CONFIG_FS_DAX */
++ 
+++>>>>>>> f5705aa8cfed (dax, xfs, ext4: compile out iomap-dax paths in the FS_DAX=n case)
+  int ext2_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
+  		u64 start, u64 len)
+  {
+* Unmerged path fs/ext2/inode.c
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 83725648daac..ea7f626e6fd8 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -3162,7 +3162,7 @@ retry:
+ 	bdev = inode->i_sb->s_bdev;
+ 	iomap->bdev = bdev;
+ 	if (blk_queue_dax(bdev->bd_queue))
+-		iomap->dax_dev = dax_get_by_host(bdev->bd_disk->disk_name);
++		iomap->dax_dev = fs_dax_get_by_host(bdev->bd_disk->disk_name);
+ 	else
+ 		iomap->dax_dev = NULL;
+ 	iomap->offset = first_block << blkbits;
+@@ -3197,7 +3197,7 @@ static int ext4_iomap_end(struct inode *inode, loff_t offset, loff_t length,
+ 	int blkbits = inode->i_blkbits;
+ 	bool truncate = false;
+ 
+-	put_dax(iomap->dax_dev);
++	fs_put_dax(iomap->dax_dev);
+ 	if (!(flags & IOMAP_WRITE) || (flags & IOMAP_FAULT))
+ 		return 0;
+ 
+diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
+index 6b763d8b96c1..d033e4843a0b 100644
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@ -1045,7 +1045,7 @@ xfs_file_iomap_begin(
+ 	/* optionally associate a dax device with the iomap bdev */
+ 	bdev = iomap->bdev;
+ 	if (blk_queue_dax(bdev->bd_queue))
+-		iomap->dax_dev = dax_get_by_host(bdev->bd_disk->disk_name);
++		iomap->dax_dev = fs_dax_get_by_host(bdev->bd_disk->disk_name);
+ 	else
+ 		iomap->dax_dev = NULL;
+ 
+@@ -1121,7 +1121,7 @@ xfs_file_iomap_end(
+ 	unsigned		flags,
+ 	struct iomap		*iomap)
+ {
+-	put_dax(iomap->dax_dev);
++	fs_put_dax(iomap->dax_dev);
+ 	if ((flags & IOMAP_WRITE) && iomap->type == IOMAP_DELALLOC)
+ 		return xfs_file_iomap_end_delalloc(XFS_I(inode), offset,
+ 				length, written, iomap);
+diff --git a/include/linux/dax.h b/include/linux/dax.h
+index b7b81d6cc271..2f007292a648 100644
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@ -48,6 +48,20 @@ struct dax_operations {
+ 	void (*flush)(struct dax_device *, pgoff_t, void *, size_t);
+ };
+ 
++#if IS_ENABLED(CONFIG_DAX)
++struct dax_device *dax_get_by_host(const char *host);
++void put_dax(struct dax_device *dax_dev);
++#else
++static inline struct dax_device *dax_get_by_host(const char *host)
++{
++	return NULL;
++}
++
++static inline void put_dax(struct dax_device *dax_dev)
++{
++}
++#endif
++
+ int bdev_dax_pgoff(struct block_device *, sector_t, size_t, pgoff_t *pgoff);
+ #if IS_ENABLED(CONFIG_FS_DAX)
+ int __bdev_dax_supported(struct super_block *sb, int blocksize);
+@@ -55,23 +69,29 @@ static inline int bdev_dax_supported(struct super_block *sb, int blocksize)
+ {
+ 	return __bdev_dax_supported(sb, blocksize);
+ }
++
++static inline struct dax_device *fs_dax_get_by_host(const char *host)
++{
++	return dax_get_by_host(host);
++}
++
++static inline void fs_put_dax(struct dax_device *dax_dev)
++{
++	put_dax(dax_dev);
++}
++
+ #else
+ static inline int bdev_dax_supported(struct super_block *sb, int blocksize)
+ {
+ 	return -EOPNOTSUPP;
+ }
+-#endif
+ 
+-#if IS_ENABLED(CONFIG_DAX)
+-struct dax_device *dax_get_by_host(const char *host);
+-void put_dax(struct dax_device *dax_dev);
+-#else
+-static inline struct dax_device *dax_get_by_host(const char *host)
++static inline struct dax_device *fs_dax_get_by_host(const char *host)
+ {
+ 	return NULL;
+ }
+ 
+-static inline void put_dax(struct dax_device *dax_dev)
++static inline void fs_put_dax(struct dax_device *dax_dev)
+ {
+ }
+ #endif
