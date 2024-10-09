@@ -1,0 +1,241 @@
+perf probe: Support escaped character in parser
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Masami Hiramatsu <mhiramat@kernel.org>
+commit c588d158124d5b60184fc612e551a19720720d68
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/c588d158.failed
+
+Support the special characters escaped by '\' in parser.  This allows
+user to specify versions directly like below.
+
+  =====
+  # ./perf probe -x /lib64/libc-2.25.so malloc_get_state\\@GLIBC_2.2.5
+  Added new event:
+    probe_libc:malloc_get_state (on malloc_get_state@GLIBC_2.2.5 in /usr/lib64/libc-2.25.so)
+
+  You can now use it in all perf tools, such as:
+
+	  perf record -e probe_libc:malloc_get_state -aR sleep 1
+
+  =====
+
+Or, you can use separators in source filename, e.g.
+
+  =====
+  # ./perf probe -x /opt/test/a.out foo+bar.c:3
+  Semantic error :There is non-digit character in offset.
+    Error: Command Parse Error.
+  =====
+
+Usually "+" in source file cause parser error, but
+
+  =====
+  # ./perf probe -x /opt/test/a.out foo\\+bar.c:4
+  Added new event:
+    probe_a:main         (on @foo+bar.c:4 in /opt/test/a.out)
+
+  You can now use it in all perf tools, such as:
+
+	  perf record -e probe_a:main -aR sleep 1
+  =====
+
+escaped "\+" allows you to specify that.
+
+	Signed-off-by: Masami Hiramatsu <mhiramat@kernel.org>
+	Reviewed-by: Thomas Richter <tmricht@linux.vnet.ibm.com>
+	Acked-by: Ravi Bangoria <ravi.bangoria@linux.vnet.ibm.com>
+	Cc: Paul Clarke <pc@us.ibm.com>
+	Cc: bhargavb <bhargavaramudu@gmail.com>
+	Cc: linux-rt-users@vger.kernel.org
+Link: http://lkml.kernel.org/r/151309111236.18107.5634753157435343410.stgit@devbox
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit c588d158124d5b60184fc612e551a19720720d68)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/Documentation/perf-probe.txt
+diff --cc tools/perf/Documentation/perf-probe.txt
+index 48ff4b7b802d,b6866a05edd2..000000000000
+--- a/tools/perf/Documentation/perf-probe.txt
++++ b/tools/perf/Documentation/perf-probe.txt
+@@@ -265,6 -277,23 +273,26 @@@ Add probes at malloc() function on lib
+  
+   ./perf probe -x /lib/libc.so.6 malloc or ./perf probe /lib/libc.so.6 malloc
+  
+++<<<<<<< HEAD
+++=======
++ Add a uprobe to a target process running in a different mount namespace
++ 
++  ./perf probe --target-ns <target pid> -x /lib64/libc.so.6 malloc
++ 
++ Add a USDT probe to a target process running in a different mount namespace
++ 
++  ./perf probe --target-ns <target pid> -x /usr/lib/jvm/java-1.8.0-openjdk-1.8.0.121-0.b13.el7_3.x86_64/jre/lib/amd64/server/libjvm.so %sdt_hotspot:thread__sleep__end
++ 
++ Add a probe on specific versioned symbol by backslash escape
++ 
++  ./perf probe -x /lib64/libc-2.25.so 'malloc_get_state\@GLIBC_2.2.5'
++ 
++ Add a probe in a source file using special characters by backslash escape
++ 
++  ./perf probe -x /opt/test/a.out 'foo\+bar.c:4'
++ 
++ 
+++>>>>>>> c588d158124d (perf probe: Support escaped character in parser)
+  SEE ALSO
+  --------
+  linkperf:perf-trace[1], linkperf:perf-record[1], linkperf:perf-buildid-cache[1]
+* Unmerged path tools/perf/Documentation/perf-probe.txt
+diff --git a/tools/perf/util/probe-event.c b/tools/perf/util/probe-event.c
+index 6b344b1852bd..b22d0e612f70 100644
+--- a/tools/perf/util/probe-event.c
++++ b/tools/perf/util/probe-event.c
+@@ -1303,27 +1303,30 @@ static int parse_perf_probe_event_name(char **arg, struct perf_probe_event *pev)
+ {
+ 	char *ptr;
+ 
+-	ptr = strchr(*arg, ':');
++	ptr = strpbrk_esc(*arg, ":");
+ 	if (ptr) {
+ 		*ptr = '\0';
+ 		if (!pev->sdt && !is_c_func_name(*arg))
+ 			goto ng_name;
+-		pev->group = strdup(*arg);
++		pev->group = strdup_esc(*arg);
+ 		if (!pev->group)
+ 			return -ENOMEM;
+ 		*arg = ptr + 1;
+ 	} else
+ 		pev->group = NULL;
+-	if (!pev->sdt && !is_c_func_name(*arg)) {
++
++	pev->event = strdup_esc(*arg);
++	if (pev->event == NULL)
++		return -ENOMEM;
++
++	if (!pev->sdt && !is_c_func_name(pev->event)) {
++		zfree(&pev->event);
+ ng_name:
++		zfree(&pev->group);
+ 		semantic_error("%s is bad for event name -it must "
+ 			       "follow C symbol-naming rule.\n", *arg);
+ 		return -EINVAL;
+ 	}
+-	pev->event = strdup(*arg);
+-	if (pev->event == NULL)
+-		return -ENOMEM;
+-
+ 	return 0;
+ }
+ 
+@@ -1351,7 +1354,7 @@ static int parse_perf_probe_point(char *arg, struct perf_probe_event *pev)
+ 			arg++;
+ 	}
+ 
+-	ptr = strpbrk(arg, ";=@+%");
++	ptr = strpbrk_esc(arg, ";=@+%");
+ 	if (pev->sdt) {
+ 		if (ptr) {
+ 			if (*ptr != '@') {
+@@ -1365,7 +1368,7 @@ static int parse_perf_probe_point(char *arg, struct perf_probe_event *pev)
+ 				pev->target = build_id_cache__origname(tmp);
+ 				free(tmp);
+ 			} else
+-				pev->target = strdup(ptr + 1);
++				pev->target = strdup_esc(ptr + 1);
+ 			if (!pev->target)
+ 				return -ENOMEM;
+ 			*ptr = '\0';
+@@ -1399,13 +1402,14 @@ static int parse_perf_probe_point(char *arg, struct perf_probe_event *pev)
+ 	 *
+ 	 * Otherwise, we consider arg to be a function specification.
+ 	 */
+-	if (!strpbrk(arg, "+@%") && (ptr = strpbrk(arg, ";:")) != NULL) {
++	if (!strpbrk_esc(arg, "+@%")) {
++		ptr = strpbrk_esc(arg, ";:");
+ 		/* This is a file spec if it includes a '.' before ; or : */
+-		if (memchr(arg, '.', ptr - arg))
++		if (ptr && memchr(arg, '.', ptr - arg))
+ 			file_spec = true;
+ 	}
+ 
+-	ptr = strpbrk(arg, ";:+@%");
++	ptr = strpbrk_esc(arg, ";:+@%");
+ 	if (ptr) {
+ 		nc = *ptr;
+ 		*ptr++ = '\0';
+@@ -1414,7 +1418,7 @@ static int parse_perf_probe_point(char *arg, struct perf_probe_event *pev)
+ 	if (arg[0] == '\0')
+ 		tmp = NULL;
+ 	else {
+-		tmp = strdup(arg);
++		tmp = strdup_esc(arg);
+ 		if (tmp == NULL)
+ 			return -ENOMEM;
+ 	}
+@@ -1447,12 +1451,12 @@ static int parse_perf_probe_point(char *arg, struct perf_probe_event *pev)
+ 		arg = ptr;
+ 		c = nc;
+ 		if (c == ';') {	/* Lazy pattern must be the last part */
+-			pp->lazy_line = strdup(arg);
++			pp->lazy_line = strdup(arg); /* let leave escapes */
+ 			if (pp->lazy_line == NULL)
+ 				return -ENOMEM;
+ 			break;
+ 		}
+-		ptr = strpbrk(arg, ";:+@%");
++		ptr = strpbrk_esc(arg, ";:+@%");
+ 		if (ptr) {
+ 			nc = *ptr;
+ 			*ptr++ = '\0';
+@@ -1479,7 +1483,7 @@ static int parse_perf_probe_point(char *arg, struct perf_probe_event *pev)
+ 				semantic_error("SRC@SRC is not allowed.\n");
+ 				return -EINVAL;
+ 			}
+-			pp->file = strdup(arg);
++			pp->file = strdup_esc(arg);
+ 			if (pp->file == NULL)
+ 				return -ENOMEM;
+ 			break;
+@@ -2775,23 +2779,31 @@ static int find_probe_functions(struct map *map, char *name,
+ 	struct rb_node *tmp;
+ 	const char *norm, *ver;
+ 	char *buf = NULL;
++	bool cut_version = true;
+ 
+ 	if (map__load(map) < 0)
+ 		return 0;
+ 
++	/* If user gives a version, don't cut off the version from symbols */
++	if (strchr(name, '@'))
++		cut_version = false;
++
+ 	map__for_each_symbol(map, sym, tmp) {
+ 		norm = arch__normalize_symbol_name(sym->name);
+ 		if (!norm)
+ 			continue;
+ 
+-		/* We don't care about default symbol or not */
+-		ver = strchr(norm, '@');
+-		if (ver) {
+-			buf = strndup(norm, ver - norm);
+-			if (!buf)
+-				return -ENOMEM;
+-			norm = buf;
++		if (cut_version) {
++			/* We don't care about default symbol or not */
++			ver = strchr(norm, '@');
++			if (ver) {
++				buf = strndup(norm, ver - norm);
++				if (!buf)
++					return -ENOMEM;
++				norm = buf;
++			}
+ 		}
++
+ 		if (strglobmatch(norm, name)) {
+ 			found++;
+ 			if (syms && found < probe_conf.max_probes)
