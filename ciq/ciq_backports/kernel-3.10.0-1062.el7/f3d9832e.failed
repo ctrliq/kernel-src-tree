@@ -1,0 +1,182 @@
+ipv6: addrconf: cleanup locking in ipv6_add_addr
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author David Ahern <dsahern@gmail.com>
+commit f3d9832e56c48e4ca50bab0457e21bcaade4536d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/f3d9832e.failed
+
+ipv6_add_addr is called in process context with rtnl lock held
+(e.g., manual config of an address) or during softirq processing
+(e.g., autoconf and address from a router advertisement).
+
+Currently, ipv6_add_addr calls rcu_read_lock_bh shortly after entry
+and does not call unlock until exit, minus the call around the address
+validator notifier. Similarly, addrconf_hash_lock is taken after the
+validator notifier and held until exit. This forces the allocation of
+inet6_ifaddr to always be atomic.
+
+Refactor ipv6_add_addr as follows:
+1. add an input boolean to discriminate the call path (process context
+   or softirq). This new flag controls whether the alloc can be done
+   with GFP_KERNEL or GFP_ATOMIC.
+
+2. Move the rcu_read_lock_bh and unlock calls only around functions that
+   do rcu updates.
+
+3. Remove the in6_dev_hold and put added by 3ad7d2468f79f ("Ipvlan should
+   return an error when an address is already in use."). This was done
+   presumably because rcu_read_unlock_bh needs to be called before calling
+   the validator. Since rcu_read_lock is not needed before the validator
+   runs revert the hold and put added by 3ad7d2468f79f and only do the
+   hold when setting ifp->idev.
+
+4. move duplicate address check and insertion of new address in the global
+   address hash into a helper. The helper is called after an ifa is
+   allocated and filled in.
+
+This allows the ifa for manually configured addresses to be done with
+GFP_KERNEL and reduces the overall amount of time with rcu_read_lock held
+and hash table spinlock held.
+
+	Signed-off-by: David Ahern <dsahern@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f3d9832e56c48e4ca50bab0457e21bcaade4536d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/addrconf.c
+diff --cc net/ipv6/addrconf.c
+index a8297bbf8643,a8d202b1b919..000000000000
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@@ -808,11 -986,14 +832,20 @@@ out
+  static struct inet6_ifaddr *
+  ipv6_add_addr(struct inet6_dev *idev, const struct in6_addr *addr,
+  	      const struct in6_addr *peer_addr, int pfxlen,
+- 	      int scope, u32 flags, u32 valid_lft, u32 prefered_lft)
++ 	      int scope, u32 flags, u32 valid_lft, u32 prefered_lft,
++ 	      bool can_block)
+  {
+++<<<<<<< HEAD
+ +	struct inet6_ifaddr *ifa = NULL;
+ +	struct rt6_info *rt;
+ +	unsigned int hash;
+++=======
++ 	gfp_t gfp_flags = can_block ? GFP_KERNEL : GFP_ATOMIC;
++ 	struct net *net = dev_net(idev->dev);
++ 	struct inet6_ifaddr *ifa = NULL;
++ 	struct rt6_info *rt = NULL;
++ 	struct in6_validator_info i6vi;
+++>>>>>>> f3d9832e56c4 (ipv6: addrconf: cleanup locking in ipv6_add_addr)
+  	int err = 0;
+  	int addr_type = ipv6_addr_type(addr);
+  
+@@@ -822,29 -1003,25 +855,42 @@@
+  	     addr_type & IPV6_ADDR_LOOPBACK))
+  		return ERR_PTR(-EADDRNOTAVAIL);
+  
+++<<<<<<< HEAD
+ +	rcu_read_lock_bh();
+++=======
+++>>>>>>> f3d9832e56c4 (ipv6: addrconf: cleanup locking in ipv6_add_addr)
+  	if (idev->dead) {
+  		err = -ENODEV;			/*XXX*/
+- 		goto out2;
++ 		goto out;
+  	}
+  
+  	if (idev->cnf.disable_ipv6) {
+  		err = -EACCES;
+- 		goto out2;
++ 		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	spin_lock(&addrconf_hash_lock);
+ +
+ +	/* Ignore adding duplicate addresses on an interface */
+ +	if (ipv6_chk_same_addr(dev_net(idev->dev), addr, idev->dev)) {
+ +		ADBG("ipv6_add_addr: already assigned\n");
+ +		err = -EEXIST;
+++=======
++ 	i6vi.i6vi_addr = *addr;
++ 	i6vi.i6vi_dev = idev;
++ 	err = inet6addr_validator_notifier_call_chain(NETDEV_UP, &i6vi);
++ 	err = notifier_to_errno(err);
++ 	if (err < 0)
+++>>>>>>> f3d9832e56c4 (ipv6: addrconf: cleanup locking in ipv6_add_addr)
+  		goto out;
+- 	}
+- 
+- 	ifa = kzalloc(sizeof(struct inet6_ifaddr), GFP_ATOMIC);
+  
+++<<<<<<< HEAD
+ +	if (ifa == NULL) {
+++=======
++ 	ifa = kzalloc(sizeof(*ifa), gfp_flags);
++ 	if (!ifa) {
+++>>>>>>> f3d9832e56c4 (ipv6: addrconf: cleanup locking in ipv6_add_addr)
+  		ADBG("ipv6_add_addr: malloc failed\n");
+  		err = -ENOBUFS;
+  		goto out;
+@@@ -880,16 -1062,20 +927,23 @@@
+  
+  	ifa->idev = idev;
+  	in6_dev_hold(idev);
+++<<<<<<< HEAD
+++=======
++ 
+++>>>>>>> f3d9832e56c4 (ipv6: addrconf: cleanup locking in ipv6_add_addr)
+  	/* For caller */
+ -	refcount_set(&ifa->refcnt, 1);
+ +	in6_ifa_hold(ifa);
+  
+- 	/* Add to big hash table */
+- 	hash = inet6_addr_hash(addr);
++ 	rcu_read_lock_bh();
+  
+- 	hlist_add_head_rcu(&ifa->addr_lst, &inet6_addr_lst[hash]);
+- 	spin_unlock(&addrconf_hash_lock);
++ 	err = ipv6_add_addr_hash(idev->dev, ifa);
++ 	if (err < 0) {
++ 		rcu_read_unlock_bh();
++ 		goto out;
++ 	}
+  
+  	write_lock(&idev->lock);
++ 
+  	/* Add to inet6_dev unicast addr list. */
+  	ipv6_link_dev_addr(idev, ifa);
+  
+@@@ -900,13 -1086,19 +954,26 @@@
+  
+  	in6_ifa_hold(ifa);
+  	write_unlock(&idev->lock);
+- out2:
++ 
+  	rcu_read_unlock_bh();
+  
+++<<<<<<< HEAD
+ +	if (likely(err == 0))
+ +		inet6addr_notifier_call_chain(NETDEV_UP, ifa);
+ +	else {
+ +		kfree(ifa);
+++=======
++ 	inet6addr_notifier_call_chain(NETDEV_UP, ifa);
++ out:
++ 	if (unlikely(err < 0)) {
++ 		if (rt)
++ 			ip6_rt_put(rt);
++ 		if (ifa) {
++ 			if (ifa->idev)
++ 				in6_dev_put(ifa->idev);
++ 			kfree(ifa);
++ 		}
+++>>>>>>> f3d9832e56c4 (ipv6: addrconf: cleanup locking in ipv6_add_addr)
+  		ifa = ERR_PTR(err);
+  	}
+  
+* Unmerged path net/ipv6/addrconf.c
