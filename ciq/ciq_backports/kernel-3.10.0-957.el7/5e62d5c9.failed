@@ -1,0 +1,286 @@
+nvmet: better data length validation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 5e62d5c993e6889cd314d5b5de6b670152109a0e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/5e62d5c9.failed
+
+Currently the NVMe target stores the expexted data length in req->data_len
+and uses that for data transfer decisions, but that does not take the
+actual transfer length in the SGLs into account.  So this adds a new
+transfer_len field, into which the transport drivers store the actual
+transfer length.  We then check the two match before actually executing
+the command.
+
+The FC transport driver already had such a field, which is removed in
+favour of the common one.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 5e62d5c993e6889cd314d5b5de6b670152109a0e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/target/loop.c
+diff --cc drivers/nvme/target/loop.c
+index 21dcbdab74e4,96d390416789..000000000000
+--- a/drivers/nvme/target/loop.c
++++ b/drivers/nvme/target/loop.c
+@@@ -186,7 -176,7 +186,11 @@@ static int nvme_loop_queue_rq(struct bl
+  
+  		iod->req.sg = iod->sg_table.sgl;
+  		iod->req.sg_cnt = blk_rq_map_sg(req->q, req, iod->sg_table.sgl);
+++<<<<<<< HEAD
+ +		BUG_ON(iod->req.sg_cnt > req->nr_phys_segments);
+++=======
++ 		iod->req.transfer_len = blk_rq_bytes(req);
+++>>>>>>> 5e62d5c993e6 (nvmet: better data length validation)
+  	}
+  
+  	blk_mq_start_request(req);
+diff --git a/drivers/nvme/target/core.c b/drivers/nvme/target/core.c
+index 279458f40781..3e8801995cef 100644
+--- a/drivers/nvme/target/core.c
++++ b/drivers/nvme/target/core.c
+@@ -508,6 +508,7 @@ bool nvmet_req_init(struct nvmet_req *req, struct nvmet_cq *cq,
+ 	req->ops = ops;
+ 	req->sg = NULL;
+ 	req->sg_cnt = 0;
++	req->transfer_len = 0;
+ 	req->rsp->status = 0;
+ 
+ 	/* no support for fused commands yet */
+@@ -557,6 +558,15 @@ void nvmet_req_uninit(struct nvmet_req *req)
+ }
+ EXPORT_SYMBOL_GPL(nvmet_req_uninit);
+ 
++void nvmet_req_execute(struct nvmet_req *req)
++{
++	if (unlikely(req->data_len != req->transfer_len))
++		nvmet_req_complete(req, NVME_SC_SGL_INVALID_DATA | NVME_SC_DNR);
++	else
++		req->execute(req);
++}
++EXPORT_SYMBOL_GPL(nvmet_req_execute);
++
+ static inline bool nvmet_cc_en(u32 cc)
+ {
+ 	return (cc >> NVME_CC_EN_SHIFT) & 0x1;
+diff --git a/drivers/nvme/target/fc.c b/drivers/nvme/target/fc.c
+index e91b8be3f190..ddad802a47da 100644
+--- a/drivers/nvme/target/fc.c
++++ b/drivers/nvme/target/fc.c
+@@ -76,7 +76,6 @@ struct nvmet_fc_fcp_iod {
+ 	dma_addr_t			rspdma;
+ 	struct scatterlist		*data_sg;
+ 	int				data_sg_cnt;
+-	u32				total_length;
+ 	u32				offset;
+ 	enum nvmet_fcp_datadir		io_dir;
+ 	bool				active;
+@@ -1700,7 +1699,7 @@ nvmet_fc_alloc_tgt_pgs(struct nvmet_fc_fcp_iod *fod)
+ 	u32 page_len, length;
+ 	int i = 0;
+ 
+-	length = fod->total_length;
++	length = fod->req.transfer_len;
+ 	nent = DIV_ROUND_UP(length, PAGE_SIZE);
+ 	sg = kmalloc_array(nent, sizeof(struct scatterlist), GFP_KERNEL);
+ 	if (!sg)
+@@ -1789,7 +1788,7 @@ nvmet_fc_prep_fcp_rsp(struct nvmet_fc_tgtport *tgtport,
+ 	u32 rsn, rspcnt, xfr_length;
+ 
+ 	if (fod->fcpreq->op == NVMET_FCOP_READDATA_RSP)
+-		xfr_length = fod->total_length;
++		xfr_length = fod->req.transfer_len;
+ 	else
+ 		xfr_length = fod->offset;
+ 
+@@ -1815,7 +1814,7 @@ nvmet_fc_prep_fcp_rsp(struct nvmet_fc_tgtport *tgtport,
+ 	rspcnt = atomic_inc_return(&fod->queue->zrspcnt);
+ 	if (!(rspcnt % fod->queue->ersp_ratio) ||
+ 	    sqe->opcode == nvme_fabrics_command ||
+-	    xfr_length != fod->total_length ||
++	    xfr_length != fod->req.transfer_len ||
+ 	    (le16_to_cpu(cqe->status) & 0xFFFE) || cqewd[0] || cqewd[1] ||
+ 	    (sqe->flags & (NVME_CMD_FUSE_FIRST | NVME_CMD_FUSE_SECOND)) ||
+ 	    queue_90percent_full(fod->queue, le16_to_cpu(cqe->sq_head)))
+@@ -1892,7 +1891,7 @@ nvmet_fc_transfer_fcp_data(struct nvmet_fc_tgtport *tgtport,
+ 	fcpreq->timeout = NVME_FC_TGTOP_TIMEOUT_SEC;
+ 
+ 	tlen = min_t(u32, tgtport->max_sg_cnt * PAGE_SIZE,
+-			(fod->total_length - fod->offset));
++			(fod->req.transfer_len - fod->offset));
+ 	fcpreq->transfer_length = tlen;
+ 	fcpreq->transferred_length = 0;
+ 	fcpreq->fcp_error = 0;
+@@ -1906,7 +1905,7 @@ nvmet_fc_transfer_fcp_data(struct nvmet_fc_tgtport *tgtport,
+ 	 * combined xfr with response.
+ 	 */
+ 	if ((op == NVMET_FCOP_READDATA) &&
+-	    ((fod->offset + fcpreq->transfer_length) == fod->total_length) &&
++	    ((fod->offset + fcpreq->transfer_length) == fod->req.transfer_len) &&
+ 	    (tgtport->ops->target_features & NVMET_FCTGTFEAT_READDATA_RSP)) {
+ 		fcpreq->op = NVMET_FCOP_READDATA_RSP;
+ 		nvmet_fc_prep_fcp_rsp(tgtport, fod);
+@@ -1986,7 +1985,7 @@ nvmet_fc_fod_op_done(struct nvmet_fc_fcp_iod *fod)
+ 		}
+ 
+ 		fod->offset += fcpreq->transferred_length;
+-		if (fod->offset != fod->total_length) {
++		if (fod->offset != fod->req.transfer_len) {
+ 			spin_lock_irqsave(&fod->flock, flags);
+ 			fod->writedataactive = true;
+ 			spin_unlock_irqrestore(&fod->flock, flags);
+@@ -1998,9 +1997,7 @@ nvmet_fc_fod_op_done(struct nvmet_fc_fcp_iod *fod)
+ 		}
+ 
+ 		/* data transfer complete, resume with nvmet layer */
+-
+-		fod->req.execute(&fod->req);
+-
++		nvmet_req_execute(&fod->req);
+ 		break;
+ 
+ 	case NVMET_FCOP_READDATA:
+@@ -2023,7 +2020,7 @@ nvmet_fc_fod_op_done(struct nvmet_fc_fcp_iod *fod)
+ 		}
+ 
+ 		fod->offset += fcpreq->transferred_length;
+-		if (fod->offset != fod->total_length) {
++		if (fod->offset != fod->req.transfer_len) {
+ 			/* transfer the next chunk */
+ 			nvmet_fc_transfer_fcp_data(tgtport, fod,
+ 						NVMET_FCOP_READDATA);
+@@ -2160,7 +2157,7 @@ nvmet_fc_handle_fcp_rqst(struct nvmet_fc_tgtport *tgtport,
+ 
+ 	fod->fcpreq->done = nvmet_fc_xmt_fcp_op_done;
+ 
+-	fod->total_length = be32_to_cpu(cmdiu->data_len);
++	fod->req.transfer_len = be32_to_cpu(cmdiu->data_len);
+ 	if (cmdiu->flags & FCNVME_CMD_FLAGS_WRITE) {
+ 		fod->io_dir = NVMET_FCP_WRITE;
+ 		if (!nvme_is_write(&cmdiu->sqe))
+@@ -2171,7 +2168,7 @@ nvmet_fc_handle_fcp_rqst(struct nvmet_fc_tgtport *tgtport,
+ 			goto transport_error;
+ 	} else {
+ 		fod->io_dir = NVMET_FCP_NODATA;
+-		if (fod->total_length)
++		if (fod->req.transfer_len)
+ 			goto transport_error;
+ 	}
+ 
+@@ -2179,9 +2176,6 @@ nvmet_fc_handle_fcp_rqst(struct nvmet_fc_tgtport *tgtport,
+ 	fod->req.rsp = &fod->rspiubuf.cqe;
+ 	fod->req.port = fod->queue->port;
+ 
+-	/* ensure nvmet handlers will set cmd handler callback */
+-	fod->req.execute = NULL;
+-
+ 	/* clear any response payload */
+ 	memset(&fod->rspiubuf, 0, sizeof(fod->rspiubuf));
+ 
+@@ -2201,7 +2195,7 @@ nvmet_fc_handle_fcp_rqst(struct nvmet_fc_tgtport *tgtport,
+ 	/* keep a running counter of tail position */
+ 	atomic_inc(&fod->queue->sqtail);
+ 
+-	if (fod->total_length) {
++	if (fod->req.transfer_len) {
+ 		ret = nvmet_fc_alloc_tgt_pgs(fod);
+ 		if (ret) {
+ 			nvmet_req_complete(&fod->req, ret);
+@@ -2224,9 +2218,7 @@ nvmet_fc_handle_fcp_rqst(struct nvmet_fc_tgtport *tgtport,
+ 	 * can invoke the nvmet_layer now. If read data, cmd completion will
+ 	 * push the data
+ 	 */
+-
+-	fod->req.execute(&fod->req);
+-
++	nvmet_req_execute(&fod->req);
+ 	return;
+ 
+ transport_error:
+* Unmerged path drivers/nvme/target/loop.c
+diff --git a/drivers/nvme/target/nvmet.h b/drivers/nvme/target/nvmet.h
+index 7b5634f2bdee..01bf432ae67b 100644
+--- a/drivers/nvme/target/nvmet.h
++++ b/drivers/nvme/target/nvmet.h
+@@ -223,7 +223,10 @@ struct nvmet_req {
+ 	struct bio		inline_bio;
+ 	struct bio_vec		inline_bvec[NVMET_MAX_INLINE_BIOVEC];
+ 	int			sg_cnt;
++	/* data length as parsed from the command: */
+ 	size_t			data_len;
++	/* data length as parsed from the SGL descriptor: */
++	size_t			transfer_len;
+ 
+ 	struct nvmet_port	*port;
+ 
+@@ -266,6 +269,7 @@ u16 nvmet_parse_fabrics_cmd(struct nvmet_req *req);
+ bool nvmet_req_init(struct nvmet_req *req, struct nvmet_cq *cq,
+ 		struct nvmet_sq *sq, struct nvmet_fabrics_ops *ops);
+ void nvmet_req_uninit(struct nvmet_req *req);
++void nvmet_req_execute(struct nvmet_req *req);
+ void nvmet_req_complete(struct nvmet_req *req, u16 status);
+ 
+ void nvmet_cq_setup(struct nvmet_ctrl *ctrl, struct nvmet_cq *cq, u16 qid,
+diff --git a/drivers/nvme/target/rdma.c b/drivers/nvme/target/rdma.c
+index 3ef43a78b61e..039a4a638a3d 100644
+--- a/drivers/nvme/target/rdma.c
++++ b/drivers/nvme/target/rdma.c
+@@ -148,14 +148,14 @@ static inline u32 get_unaligned_le24(const u8 *p)
+ static inline bool nvmet_rdma_need_data_in(struct nvmet_rdma_rsp *rsp)
+ {
+ 	return nvme_is_write(rsp->req.cmd) &&
+-		rsp->req.data_len &&
++		rsp->req.transfer_len &&
+ 		!(rsp->flags & NVMET_RDMA_REQ_INLINE_DATA);
+ }
+ 
+ static inline bool nvmet_rdma_need_data_out(struct nvmet_rdma_rsp *rsp)
+ {
+ 	return !nvme_is_write(rsp->req.cmd) &&
+-		rsp->req.data_len &&
++		rsp->req.transfer_len &&
+ 		!rsp->req.rsp->status &&
+ 		!(rsp->flags & NVMET_RDMA_REQ_INLINE_DATA);
+ }
+@@ -577,7 +577,7 @@ static void nvmet_rdma_read_data_done(struct ib_cq *cq, struct ib_wc *wc)
+ 		return;
+ 	}
+ 
+-	rsp->req.execute(&rsp->req);
++	nvmet_req_execute(&rsp->req);
+ }
+ 
+ static void nvmet_rdma_use_inline_sg(struct nvmet_rdma_rsp *rsp, u32 len,
+@@ -609,6 +609,7 @@ static u16 nvmet_rdma_map_sgl_inline(struct nvmet_rdma_rsp *rsp)
+ 
+ 	nvmet_rdma_use_inline_sg(rsp, len, off);
+ 	rsp->flags |= NVMET_RDMA_REQ_INLINE_DATA;
++	rsp->req.transfer_len += len;
+ 	return 0;
+ }
+ 
+@@ -636,6 +637,7 @@ static u16 nvmet_rdma_map_sgl_keyed(struct nvmet_rdma_rsp *rsp,
+ 			nvmet_data_dir(&rsp->req));
+ 	if (ret < 0)
+ 		return NVME_SC_INTERNAL;
++	rsp->req.transfer_len += len;
+ 	rsp->n_rdma += ret;
+ 
+ 	if (invalidate) {
+@@ -693,7 +695,7 @@ static bool nvmet_rdma_execute_command(struct nvmet_rdma_rsp *rsp)
+ 				queue->cm_id->port_num, &rsp->read_cqe, NULL))
+ 			nvmet_req_complete(&rsp->req, NVME_SC_DATA_XFER_ERROR);
+ 	} else {
+-		rsp->req.execute(&rsp->req);
++		nvmet_req_execute(&rsp->req);
+ 	}
+ 
+ 	return true;
