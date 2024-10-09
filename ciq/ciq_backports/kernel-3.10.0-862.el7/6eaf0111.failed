@@ -1,0 +1,174 @@
+ovl: fix EIO from lookup of non-indexed upper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit 6eaf011144af10cad34c0d46f82e50d382c8e926
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6eaf0111.failed
+
+Commit fbaf94ee3cd5 ("ovl: don't set origin on broken lower hardlink")
+attempt to avoid the condition of non-indexed upper inode with lower
+hardlink as origin. If this condition is found, lookup returns EIO.
+
+The protection of commit mentioned above does not cover the case of lower
+that is not a hardlink when it is copied up (with either index=off/on)
+and then lower is hardlinked while overlay is offline.
+
+Changes to lower layer while overlayfs is offline should not result in
+unexpected behavior, so a permanent EIO error after creating a link in
+lower layer should not be considered as correct behavior.
+
+This fix replaces EIO error with success in cases where upper has origin
+but no index is found, or index is found that does not match upper
+inode. In those cases, lookup will not fail and the returned overlay inode
+will be hashed by upper inode instead of by lower origin inode.
+
+Fixes: 359f392ca53e ("ovl: lookup index entry for copy up origin")
+	Cc: <stable@vger.kernel.org> # v4.13
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 6eaf011144af10cad34c0d46f82e50d382c8e926)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/inode.c
+#	fs/overlayfs/namei.c
+#	fs/overlayfs/overlayfs.h
+diff --cc fs/overlayfs/inode.c
+index e60c6d748742,321511ed8c42..000000000000
+--- a/fs/overlayfs/inode.c
++++ b/fs/overlayfs/inode.c
+@@@ -436,18 -576,93 +436,101 @@@ static int ovl_inode_set(struct inode *
+  	return 0;
+  }
+  
+ -static bool ovl_verify_inode(struct inode *inode, struct dentry *lowerdentry,
+ -			     struct dentry *upperdentry)
+ +struct inode *ovl_get_inode(struct super_block *sb, struct inode *realinode)
+ +
+  {
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Allow non-NULL lower inode in ovl_inode even if lowerdentry is NULL.
++ 	 * This happens when finding a copied up overlay inode for a renamed
++ 	 * or hardlinked overlay dentry and lower dentry cannot be followed
++ 	 * by origin because lower fs does not support file handles.
++ 	 */
++ 	if (lowerdentry && ovl_inode_lower(inode) != d_inode(lowerdentry))
++ 		return false;
++ 
++ 	/*
++ 	 * Allow non-NULL __upperdentry in inode even if upperdentry is NULL.
++ 	 * This happens when finding a lower alias for a copied up hard link.
++ 	 */
++ 	if (upperdentry && ovl_inode_upper(inode) != d_inode(upperdentry))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ struct inode *ovl_get_inode(struct dentry *dentry, struct dentry *upperdentry,
++ 			    struct dentry *index)
++ {
++ 	struct dentry *lowerdentry = ovl_dentry_lower(dentry);
++ 	struct inode *realinode = upperdentry ? d_inode(upperdentry) : NULL;
+++>>>>>>> 6eaf011144af (ovl: fix EIO from lookup of non-indexed upper)
+  	struct inode *inode;
++ 	/* Already indexed or could be indexed on copy up? */
++ 	bool indexed = (index || (ovl_indexdir(dentry->d_sb) && !upperdentry));
++ 
++ 	if (WARN_ON(upperdentry && indexed && !lowerdentry))
++ 		return ERR_PTR(-EIO);
+  
+++<<<<<<< HEAD
+ +	inode = iget5_locked(sb, (unsigned long) realinode,
+ +			     ovl_inode_test, ovl_inode_set, realinode);
+ +	if (inode && inode->i_state & I_NEW) {
+ +		ovl_fill_inode(inode, realinode->i_mode);
+ +		set_nlink(inode, realinode->i_nlink);
+++=======
++ 	if (!realinode)
++ 		realinode = d_inode(lowerdentry);
++ 
++ 	/*
++ 	 * Copy up origin (lower) may exist for non-indexed upper, but we must
++ 	 * not use lower as hash key in that case.
++ 	 * Hash inodes that are or could be indexed by origin inode and
++ 	 * non-indexed upper inodes that could be hard linked by upper inode.
++ 	 */
++ 	if (!S_ISDIR(realinode->i_mode) && (upperdentry || indexed)) {
++ 		struct inode *key = d_inode(indexed ? lowerdentry :
++ 						      upperdentry);
++ 		unsigned int nlink;
++ 
++ 		inode = iget5_locked(dentry->d_sb, (unsigned long) key,
++ 				     ovl_inode_test, ovl_inode_set, key);
++ 		if (!inode)
++ 			goto out_nomem;
++ 		if (!(inode->i_state & I_NEW)) {
++ 			/*
++ 			 * Verify that the underlying files stored in the inode
++ 			 * match those in the dentry.
++ 			 */
++ 			if (!ovl_verify_inode(inode, lowerdentry, upperdentry)) {
++ 				iput(inode);
++ 				inode = ERR_PTR(-ESTALE);
++ 				goto out;
++ 			}
++ 
++ 			dput(upperdentry);
++ 			goto out;
++ 		}
++ 
++ 		nlink = ovl_get_nlink(lowerdentry, upperdentry,
++ 				      realinode->i_nlink);
++ 		set_nlink(inode, nlink);
++ 	} else {
++ 		inode = new_inode(dentry->d_sb);
++ 		if (!inode)
++ 			goto out_nomem;
++ 	}
++ 	ovl_fill_inode(inode, realinode->i_mode, realinode->i_rdev);
++ 	ovl_inode_init(inode, upperdentry, lowerdentry);
++ 
++ 	if (upperdentry && ovl_is_impuredir(upperdentry))
++ 		ovl_set_flag(OVL_IMPURE, inode);
++ 
++ 	if (inode->i_state & I_NEW)
+++>>>>>>> 6eaf011144af (ovl: fix EIO from lookup of non-indexed upper)
+  		unlock_new_inode(inode);
+ -out:
+ -	return inode;
+ +	}
+  
+ -out_nomem:
+ -	inode = ERR_PTR(-ENOMEM);
+ -	goto out;
+ +	return inode;
+  }
+diff --cc fs/overlayfs/overlayfs.h
+index 952ccab31629,d9a0edd4e57e..000000000000
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@@ -195,8 -285,9 +195,14 @@@ int ovl_open_maybe_copy_up(struct dentr
+  int ovl_update_time(struct inode *inode, struct timespec *ts, int flags);
+  bool ovl_is_private_xattr(const char *name);
+  
+++<<<<<<< HEAD
+ +struct inode *ovl_new_inode(struct super_block *sb, umode_t mode);
+ +struct inode *ovl_get_inode(struct super_block *sb, struct inode *realinode);
+++=======
++ struct inode *ovl_new_inode(struct super_block *sb, umode_t mode, dev_t rdev);
++ struct inode *ovl_get_inode(struct dentry *dentry, struct dentry *upperdentry,
++ 			    struct dentry *index);
+++>>>>>>> 6eaf011144af (ovl: fix EIO from lookup of non-indexed upper)
+  static inline void ovl_copyattr(struct inode *from, struct inode *to)
+  {
+  	to->i_uid = from->i_uid;
+* Unmerged path fs/overlayfs/namei.c
+* Unmerged path fs/overlayfs/inode.c
+* Unmerged path fs/overlayfs/namei.c
+* Unmerged path fs/overlayfs/overlayfs.h
