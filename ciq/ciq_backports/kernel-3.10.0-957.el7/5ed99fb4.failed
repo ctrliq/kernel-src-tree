@@ -1,0 +1,281 @@
+net/mlx5e: Move ethernet representors data into separate struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Move ethernet representors data into separate struct (Alaa Hleihel) [1591249]
+Rebuild_FUZZ: 96.72%
+commit-author Mark Bloch <markb@mellanox.com>
+commit 5ed99fb421d4d5cd4cba613c1ab115585aa277d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/5ed99fb4.failed
+
+Ethernet representors have a need to store data which is applicable
+only for them. Create a priv void pointer in struct mlx5_eswitch_rep
+and move mlx5e to store the relevant data there. As part of this change
+we also initialize rep_if in mlx5e_rep_register_vf_vports() as otherwise the
+E-Switch code will copy a priv value which is garbage.
+
+We also rename mlx5_eswitch_get_uplink_netdev() to
+mlx5_eswitch_get_uplink_priv() and make it return void *.
+This way E-Switch code doesn't need to deal with net devices and
+we leave the task of getting it to mlx5e.
+
+	Signed-off-by: Mark Bloch <markb@mellanox.com>
+	Reviewed-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 5ed99fb421d4d5cd4cba613c1ab115585aa277d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index 1f6b50ed685e,3c74f0599ad3..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@@ -211,9 -209,10 +213,10 @@@ static void mlx5e_sqs2vport_stop(struc
+  
+  static int mlx5e_sqs2vport_start(struct mlx5_eswitch *esw,
+  				 struct mlx5_eswitch_rep *rep,
+ -				 u16 *sqns_array, int sqns_num)
+ +				 u32 *sqns_array, int sqns_num)
+  {
+  	struct mlx5_flow_handle *flow_rule;
++ 	struct mlx5e_rep_priv *rpriv;
+  	struct mlx5_esw_sq *esw_sq;
+  	int err;
+  	int i;
+@@@ -1033,10 -1023,10 +1036,10 @@@ static const struct mlx5e_profile mlx5e
+  /* e-Switch vport representors */
+  
+  static int
+ -mlx5e_nic_rep_load(struct mlx5_core_dev *dev, struct mlx5_eswitch_rep *rep)
+ +mlx5e_nic_rep_load(struct mlx5_eswitch *esw, struct mlx5_eswitch_rep *rep)
+  {
+- 	struct mlx5e_priv *priv = netdev_priv(rep->netdev);
+- 	struct mlx5e_rep_priv *rpriv = priv->ppriv;
++ 	struct mlx5e_rep_priv *rpriv = mlx5e_rep_to_rep_priv(rep);
++ 	struct mlx5e_priv *priv = netdev_priv(rpriv->netdev);
+  
+  	int err;
+  
+@@@ -1058,10 -1048,10 +1061,10 @@@ err_remove_sqs
+  }
+  
+  static void
+ -mlx5e_nic_rep_unload(struct mlx5_eswitch_rep *rep)
+ +mlx5e_nic_rep_unload(struct mlx5_eswitch *esw, struct mlx5_eswitch_rep *rep)
+  {
+- 	struct mlx5e_priv *priv = netdev_priv(rep->netdev);
+- 	struct mlx5e_rep_priv *rpriv = priv->ppriv;
++ 	struct mlx5e_rep_priv *rpriv = mlx5e_rep_to_rep_priv(rep);
++ 	struct mlx5e_priv *priv = netdev_priv(rpriv->netdev);
+  
+  	if (test_bit(MLX5E_STATE_OPENED, &priv->state))
+  		mlx5e_remove_sqs_fwd_rules(priv);
+@@@ -1074,10 -1064,12 +1077,11 @@@
+  }
+  
+  static int
+ -mlx5e_vport_rep_load(struct mlx5_core_dev *dev, struct mlx5_eswitch_rep *rep)
+ +mlx5e_vport_rep_load(struct mlx5_eswitch *esw, struct mlx5_eswitch_rep *rep)
+  {
++ 	struct mlx5e_rep_priv *uplink_rpriv;
+  	struct mlx5e_rep_priv *rpriv;
+  	struct net_device *netdev;
+ -	struct mlx5e_priv *upriv;
+  	int err;
+  
+  	rpriv = kzalloc(sizeof(*rpriv), GFP_KERNEL);
+@@@ -1109,6 -1103,13 +1115,16 @@@
+  		goto err_detach_netdev;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	uplink_rpriv = mlx5_eswitch_get_uplink_priv(dev->priv.eswitch);
++ 	upriv = netdev_priv(uplink_rpriv->netdev);
++ 	err = tc_setup_cb_egdev_register(netdev, mlx5e_setup_tc_block_cb,
++ 					 upriv);
++ 	if (err)
++ 		goto err_neigh_cleanup;
++ 
+++>>>>>>> 5ed99fb421d4 (net/mlx5e: Move ethernet representors data into separate struct)
+  	err = register_netdev(netdev);
+  	if (err) {
+  		pr_warn("Failed to register representor netdev for vport %d\n",
+@@@ -1131,15 -1136,20 +1147,24 @@@ err_destroy_netdev
+  }
+  
+  static void
+ -mlx5e_vport_rep_unload(struct mlx5_eswitch_rep *rep)
+ +mlx5e_vport_rep_unload(struct mlx5_eswitch *esw, struct mlx5_eswitch_rep *rep)
+  {
+- 	struct net_device *netdev = rep->netdev;
++ 	struct mlx5e_rep_priv *rpriv = mlx5e_rep_to_rep_priv(rep);
++ 	struct net_device *netdev = rpriv->netdev;
+  	struct mlx5e_priv *priv = netdev_priv(netdev);
+- 	struct mlx5e_rep_priv *rpriv = priv->ppriv;
++ 	struct mlx5e_rep_priv *uplink_rpriv;
+  	void *ppriv = priv->ppriv;
+ -	struct mlx5e_priv *upriv;
+  
+++<<<<<<< HEAD
+ +	unregister_netdev(rep->netdev);
+ +
+++=======
++ 	unregister_netdev(netdev);
++ 	uplink_rpriv = mlx5_eswitch_get_uplink_priv(priv->mdev->priv.eswitch);
++ 	upriv = netdev_priv(uplink_rpriv->netdev);
++ 	tc_setup_cb_egdev_unregister(netdev, mlx5e_setup_tc_block_cb,
++ 				     upriv);
+++>>>>>>> 5ed99fb421d4 (net/mlx5e: Move ethernet representors data into separate struct)
+  	mlx5e_rep_neigh_cleanup(rpriv);
+  	mlx5e_detach_netdev(priv);
+  	mlx5e_destroy_netdev(priv);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index 288cff3a0677,3a21ea4e4d24..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@@ -147,16 -139,12 +147,17 @@@ struct mlx5_esw_sq 
+  };
+  
+  struct mlx5_eswitch_rep {
+ -	int		       (*load)(struct mlx5_core_dev *dev,
+ +	int		       (*load)(struct mlx5_eswitch *esw,
+  				       struct mlx5_eswitch_rep *rep);
+++<<<<<<< HEAD
+ +	void		       (*unload)(struct mlx5_eswitch *esw,
+ +					 struct mlx5_eswitch_rep *rep);
+++=======
++ 	void		       (*unload)(struct mlx5_eswitch_rep *rep);
++ 	void			*priv;
+++>>>>>>> 5ed99fb421d4 (net/mlx5e: Move ethernet representors data into separate struct)
+  	u16		       vport;
+  	u8		       hw_id[ETH_ALEN];
+- 	struct net_device      *netdev;
+- 
+- 	struct mlx5_flow_handle *vport_rx_rule;
+- 	struct list_head       vport_sqs_list;
+  	u16		       vlan;
+  	u32		       vlan_refcount;
+  	bool		       valid;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+index 5659ed9f51e6..8db68369367e 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+@@ -56,8 +56,17 @@ struct mlx5e_neigh_update_table {
+ struct mlx5e_rep_priv {
+ 	struct mlx5_eswitch_rep *rep;
+ 	struct mlx5e_neigh_update_table neigh_update;
++	struct net_device      *netdev;
++	struct mlx5_flow_handle *vport_rx_rule;
++	struct list_head       vport_sqs_list;
+ };
+ 
++static inline
++struct mlx5e_rep_priv *mlx5e_rep_to_rep_priv(struct mlx5_eswitch_rep *rep)
++{
++	return (struct mlx5e_rep_priv *)rep->priv;
++}
++
+ struct mlx5e_neigh {
+ 	struct net_device *dev;
+ 	union {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 63cafbf82fe8..cfce273b6828 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@ -1085,7 +1085,8 @@ static int parse_tunnel_attr(struct mlx5e_priv *priv,
+ 						  FLOW_DISSECTOR_KEY_ENC_PORTS,
+ 						  f->mask);
+ 		struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+-		struct net_device *up_dev = mlx5_eswitch_get_uplink_netdev(esw);
++		struct mlx5e_rep_priv *uplink_rpriv = mlx5_eswitch_get_uplink_priv(esw);
++		struct net_device *up_dev = uplink_rpriv->netdev;
+ 		struct mlx5e_priv *up_priv = netdev_priv(up_dev);
+ 
+ 		/* Full udp dst port must be given */
+@@ -2006,6 +2007,7 @@ static int mlx5e_route_lookup_ipv4(struct mlx5e_priv *priv,
+ 				   int *out_ttl)
+ {
+ 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
++	struct mlx5e_rep_priv *uplink_rpriv;
+ 	struct rtable *rt;
+ 	struct neighbour *n = NULL;
+ 
+@@ -2019,9 +2021,10 @@ static int mlx5e_route_lookup_ipv4(struct mlx5e_priv *priv,
+ #else
+ 	return -EOPNOTSUPP;
+ #endif
++	uplink_rpriv = mlx5_eswitch_get_uplink_priv(esw);
+ 	/* if the egress device isn't on the same HW e-switch, we use the uplink */
+ 	if (!switchdev_port_same_parent_id(priv->netdev, rt->dst.dev))
+-		*out_dev = mlx5_eswitch_get_uplink_netdev(esw);
++		*out_dev = uplink_rpriv->netdev;
+ 	else
+ 		*out_dev = rt->dst.dev;
+ 
+@@ -2043,6 +2046,7 @@ static int mlx5e_route_lookup_ipv6(struct mlx5e_priv *priv,
+ 				   struct neighbour **out_n,
+ 				   int *out_ttl)
+ {
++	struct mlx5e_rep_priv *uplink_rpriv;
+ 	struct neighbour *n = NULL;
+ 	struct dst_entry *dst;
+ 
+@@ -2057,9 +2061,10 @@ static int mlx5e_route_lookup_ipv6(struct mlx5e_priv *priv,
+ 
+ 	*out_ttl = ip6_dst_hoplimit(dst);
+ 
++	uplink_rpriv = mlx5_eswitch_get_uplink_priv(esw);
+ 	/* if the egress device isn't on the same HW e-switch, we use the uplink */
+ 	if (!switchdev_port_same_parent_id(priv->netdev, dst->dev))
+-		*out_dev = mlx5_eswitch_get_uplink_netdev(esw);
++		*out_dev = uplink_rpriv->netdev;
+ 	else
+ 		*out_dev = dst->dev;
+ #else
+@@ -2359,7 +2364,8 @@ static int mlx5e_attach_encap(struct mlx5e_priv *priv,
+ 			      struct mlx5e_tc_flow *flow)
+ {
+ 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+-	struct net_device *up_dev = mlx5_eswitch_get_uplink_netdev(esw);
++	struct mlx5e_rep_priv *uplink_rpriv = mlx5_eswitch_get_uplink_priv(esw);
++	struct net_device *up_dev = uplink_rpriv->netdev;
+ 	unsigned short family = ip_tunnel_info_af(tun_info);
+ 	struct mlx5e_priv *up_priv = netdev_priv(up_dev);
+ 	struct mlx5_esw_flow_attr *attr = flow->esw_attr;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index 50fceb0bde65..874692e33ef2 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@ -1130,9 +1130,8 @@ void mlx5_eswitch_register_vport_rep(struct mlx5_eswitch *esw,
+ 
+ 	rep->load   = __rep->load;
+ 	rep->unload = __rep->unload;
+-	rep->netdev = __rep->netdev;
++	rep->priv = __rep->priv;
+ 
+-	INIT_LIST_HEAD(&rep->vport_sqs_list);
+ 	rep->valid = true;
+ }
+ 
+@@ -1150,12 +1149,12 @@ void mlx5_eswitch_unregister_vport_rep(struct mlx5_eswitch *esw,
+ 	rep->valid = false;
+ }
+ 
+-struct net_device *mlx5_eswitch_get_uplink_netdev(struct mlx5_eswitch *esw)
++void *mlx5_eswitch_get_uplink_priv(struct mlx5_eswitch *esw)
+ {
+ #define UPLINK_REP_INDEX 0
+ 	struct mlx5_esw_offload *offloads = &esw->offloads;
+ 	struct mlx5_eswitch_rep *rep;
+ 
+ 	rep = &offloads->vport_reps[UPLINK_REP_INDEX];
+-	return rep->netdev;
++	return rep->priv;
+ }
