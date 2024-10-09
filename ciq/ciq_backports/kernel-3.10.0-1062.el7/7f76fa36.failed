@@ -1,0 +1,548 @@
+net: sched: register callbacks for indirect tc block binds
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [net] sched: register callbacks for indirect tc block binds (Ivan Vecera) [1657872]
+Rebuild_FUZZ: 95.50%
+commit-author John Hurley <john.hurley@netronome.com>
+commit 7f76fa36754b08d9709ae50cd0a9477a6f998b21
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/7f76fa36.failed
+
+Currently drivers can register to receive TC block bind/unbind callbacks
+by implementing the setup_tc ndo in any of their given netdevs. However,
+drivers may also be interested in binds to higher level devices (e.g.
+tunnel drivers) to potentially offload filters applied to them.
+
+Introduce indirect block devs which allows drivers to register callbacks
+for block binds on other devices. The callback is triggered when the
+device is bound to a block, allowing the driver to register for rules
+applied to that block using already available functions.
+
+Freeing an indirect block callback will trigger an unbind event (if
+necessary) to direct the driver to remove any offloaded rules and unreg
+any block rule callbacks. It is the responsibility of the implementing
+driver to clean any registered indirect block callbacks before exiting,
+if the block it still active at such a time.
+
+Allow registering an indirect block dev callback for a device that is
+already bound to a block. In this case (if it is an ingress block),
+register and also trigger the callback meaning that any already installed
+rules can be replayed to the calling driver.
+
+	Signed-off-by: John Hurley <john.hurley@netronome.com>
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7f76fa36754b08d9709ae50cd0a9477a6f998b21)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_api.c
+diff --cc net/sched/cls_api.c
+index c5c5c61d0859,d92f44ac4c39..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -23,9 -23,9 +23,14 @@@
+  #include <linux/skbuff.h>
+  #include <linux/init.h>
+  #include <linux/kmod.h>
+ +#include <linux/err.h>
+  #include <linux/slab.h>
+++<<<<<<< HEAD
+ +#include <linux/idr_ext.h>
+++=======
++ #include <linux/idr.h>
++ #include <linux/rhashtable.h>
+++>>>>>>> 7f76fa36754b (net: sched: register callbacks for indirect tc block binds)
+  #include <net/net_namespace.h>
+  #include <net/sock.h>
+  #include <net/netlink.h>
+@@@ -249,23 -266,345 +254,262 @@@ struct tcf_chain *tcf_chain_get(struct 
+  	struct tcf_chain *chain;
+  
+  	list_for_each_entry(chain, &block->chain_list, list) {
+ -		if (chain->index == chain_index)
+ +		if (chain->index == chain_index) {
+ +			tcf_chain_hold(chain);
+  			return chain;
+ +		}
+  	}
+ -	return NULL;
+ -}
+ -
+ -static int tc_chain_notify(struct tcf_chain *chain, struct sk_buff *oskb,
+ -			   u32 seq, u16 flags, int event, bool unicast);
+ -
+ -static struct tcf_chain *__tcf_chain_get(struct tcf_block *block,
+ -					 u32 chain_index, bool create,
+ -					 bool by_act)
+ -{
+ -	struct tcf_chain *chain = tcf_chain_lookup(block, chain_index);
+ -
+ -	if (chain) {
+ -		tcf_chain_hold(chain);
+ -	} else {
+ -		if (!create)
+ -			return NULL;
+ -		chain = tcf_chain_create(block, chain_index);
+ -		if (!chain)
+ -			return NULL;
+ -	}
+ -
+ -	if (by_act)
+ -		++chain->action_refcnt;
+ -
+ -	/* Send notification only in case we got the first
+ -	 * non-action reference. Until then, the chain acts only as
+ -	 * a placeholder for actions pointing to it and user ought
+ -	 * not know about them.
+ -	 */
+ -	if (chain->refcnt - chain->action_refcnt == 1 && !by_act)
+ -		tc_chain_notify(chain, NULL, 0, NLM_F_CREATE | NLM_F_EXCL,
+ -				RTM_NEWCHAIN, false);
+ -
+ -	return chain;
+ -}
+  
+ -static struct tcf_chain *tcf_chain_get(struct tcf_block *block, u32 chain_index,
+ -				       bool create)
+ -{
+ -	return __tcf_chain_get(block, chain_index, create, false);
+ -}
+ -
+ -struct tcf_chain *tcf_chain_get_by_act(struct tcf_block *block, u32 chain_index)
+ -{
+ -	return __tcf_chain_get(block, chain_index, true, true);
+ +	return create ? tcf_chain_create(block, chain_index) : NULL;
+  }
+ -EXPORT_SYMBOL(tcf_chain_get_by_act);
+ +EXPORT_SYMBOL(tcf_chain_get);
+  
+ -static void tc_chain_tmplt_del(struct tcf_chain *chain);
+ -
+ -static void __tcf_chain_put(struct tcf_chain *chain, bool by_act)
+ +void tcf_chain_put(struct tcf_chain *chain)
+  {
+ -	if (by_act)
+ -		chain->action_refcnt--;
+ -	chain->refcnt--;
+ -
+ -	/* The last dropped non-action reference will trigger notification. */
+ -	if (chain->refcnt - chain->action_refcnt == 0 && !by_act)
+ -		tc_chain_notify(chain, NULL, 0, 0, RTM_DELCHAIN, false);
+ -
+ -	if (chain->refcnt == 0) {
+ -		tc_chain_tmplt_del(chain);
+ +	if (--chain->refcnt == 0)
+  		tcf_chain_destroy(chain);
+ -	}
+ -}
+ -
+ -static void tcf_chain_put(struct tcf_chain *chain)
+ -{
+ -	__tcf_chain_put(chain, false);
+ -}
+ -
+ -void tcf_chain_put_by_act(struct tcf_chain *chain)
+ -{
+ -	__tcf_chain_put(chain, true);
+ -}
+ -EXPORT_SYMBOL(tcf_chain_put_by_act);
+ -
+ -static void tcf_chain_put_explicitly_created(struct tcf_chain *chain)
+ -{
+ -	if (chain->explicitly_created)
+ -		tcf_chain_put(chain);
+ -}
+ -
+ -static void tcf_chain_flush(struct tcf_chain *chain)
+ -{
+ -	struct tcf_proto *tp = rtnl_dereference(chain->filter_chain);
+ -
+ -	tcf_chain0_head_change(chain, NULL);
+ -	while (tp) {
+ -		RCU_INIT_POINTER(chain->filter_chain, tp->next);
+ -		tcf_proto_destroy(tp, NULL);
+ -		tp = rtnl_dereference(chain->filter_chain);
+ -		tcf_chain_put(chain);
+ -	}
+  }
+ +EXPORT_SYMBOL(tcf_chain_put);
+  
++ static struct tcf_block *tc_dev_ingress_block(struct net_device *dev)
++ {
++ 	const struct Qdisc_class_ops *cops;
++ 	struct Qdisc *qdisc;
++ 
++ 	if (!dev_ingress_queue(dev))
++ 		return NULL;
++ 
++ 	qdisc = dev_ingress_queue(dev)->qdisc_sleeping;
++ 	if (!qdisc)
++ 		return NULL;
++ 
++ 	cops = qdisc->ops->cl_ops;
++ 	if (!cops)
++ 		return NULL;
++ 
++ 	if (!cops->tcf_block)
++ 		return NULL;
++ 
++ 	return cops->tcf_block(qdisc, TC_H_MIN_INGRESS, NULL);
++ }
++ 
++ static struct rhashtable indr_setup_block_ht;
++ 
++ struct tc_indr_block_dev {
++ 	struct rhash_head ht_node;
++ 	struct net_device *dev;
++ 	unsigned int refcnt;
++ 	struct list_head cb_list;
++ 	struct tcf_block *block;
++ };
++ 
++ struct tc_indr_block_cb {
++ 	struct list_head list;
++ 	void *cb_priv;
++ 	tc_indr_block_bind_cb_t *cb;
++ 	void *cb_ident;
++ };
++ 
++ static const struct rhashtable_params tc_indr_setup_block_ht_params = {
++ 	.key_offset	= offsetof(struct tc_indr_block_dev, dev),
++ 	.head_offset	= offsetof(struct tc_indr_block_dev, ht_node),
++ 	.key_len	= sizeof(struct net_device *),
++ };
++ 
++ static struct tc_indr_block_dev *
++ tc_indr_block_dev_lookup(struct net_device *dev)
++ {
++ 	return rhashtable_lookup_fast(&indr_setup_block_ht, &dev,
++ 				      tc_indr_setup_block_ht_params);
++ }
++ 
++ static struct tc_indr_block_dev *tc_indr_block_dev_get(struct net_device *dev)
++ {
++ 	struct tc_indr_block_dev *indr_dev;
++ 
++ 	indr_dev = tc_indr_block_dev_lookup(dev);
++ 	if (indr_dev)
++ 		goto inc_ref;
++ 
++ 	indr_dev = kzalloc(sizeof(*indr_dev), GFP_KERNEL);
++ 	if (!indr_dev)
++ 		return NULL;
++ 
++ 	INIT_LIST_HEAD(&indr_dev->cb_list);
++ 	indr_dev->dev = dev;
++ 	indr_dev->block = tc_dev_ingress_block(dev);
++ 	if (rhashtable_insert_fast(&indr_setup_block_ht, &indr_dev->ht_node,
++ 				   tc_indr_setup_block_ht_params)) {
++ 		kfree(indr_dev);
++ 		return NULL;
++ 	}
++ 
++ inc_ref:
++ 	indr_dev->refcnt++;
++ 	return indr_dev;
++ }
++ 
++ static void tc_indr_block_dev_put(struct tc_indr_block_dev *indr_dev)
++ {
++ 	if (--indr_dev->refcnt)
++ 		return;
++ 
++ 	rhashtable_remove_fast(&indr_setup_block_ht, &indr_dev->ht_node,
++ 			       tc_indr_setup_block_ht_params);
++ 	kfree(indr_dev);
++ }
++ 
++ static struct tc_indr_block_cb *
++ tc_indr_block_cb_lookup(struct tc_indr_block_dev *indr_dev,
++ 			tc_indr_block_bind_cb_t *cb, void *cb_ident)
++ {
++ 	struct tc_indr_block_cb *indr_block_cb;
++ 
++ 	list_for_each_entry(indr_block_cb, &indr_dev->cb_list, list)
++ 		if (indr_block_cb->cb == cb &&
++ 		    indr_block_cb->cb_ident == cb_ident)
++ 			return indr_block_cb;
++ 	return NULL;
++ }
++ 
++ static struct tc_indr_block_cb *
++ tc_indr_block_cb_add(struct tc_indr_block_dev *indr_dev, void *cb_priv,
++ 		     tc_indr_block_bind_cb_t *cb, void *cb_ident)
++ {
++ 	struct tc_indr_block_cb *indr_block_cb;
++ 
++ 	indr_block_cb = tc_indr_block_cb_lookup(indr_dev, cb, cb_ident);
++ 	if (indr_block_cb)
++ 		return ERR_PTR(-EEXIST);
++ 
++ 	indr_block_cb = kzalloc(sizeof(*indr_block_cb), GFP_KERNEL);
++ 	if (!indr_block_cb)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	indr_block_cb->cb_priv = cb_priv;
++ 	indr_block_cb->cb = cb;
++ 	indr_block_cb->cb_ident = cb_ident;
++ 	list_add(&indr_block_cb->list, &indr_dev->cb_list);
++ 
++ 	return indr_block_cb;
++ }
++ 
++ static void tc_indr_block_cb_del(struct tc_indr_block_cb *indr_block_cb)
++ {
++ 	list_del(&indr_block_cb->list);
++ 	kfree(indr_block_cb);
++ }
++ 
++ static void tc_indr_block_ing_cmd(struct tc_indr_block_dev *indr_dev,
++ 				  struct tc_indr_block_cb *indr_block_cb,
++ 				  enum tc_block_command command)
++ {
++ 	struct tc_block_offload bo = {
++ 		.command	= command,
++ 		.binder_type	= TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS,
++ 		.block		= indr_dev->block,
++ 	};
++ 
++ 	if (!indr_dev->block)
++ 		return;
++ 
++ 	indr_block_cb->cb(indr_dev->dev, indr_block_cb->cb_priv, TC_SETUP_BLOCK,
++ 			  &bo);
++ }
++ 
++ int __tc_indr_block_cb_register(struct net_device *dev, void *cb_priv,
++ 				tc_indr_block_bind_cb_t *cb, void *cb_ident)
++ {
++ 	struct tc_indr_block_cb *indr_block_cb;
++ 	struct tc_indr_block_dev *indr_dev;
++ 	int err;
++ 
++ 	indr_dev = tc_indr_block_dev_get(dev);
++ 	if (!indr_dev)
++ 		return -ENOMEM;
++ 
++ 	indr_block_cb = tc_indr_block_cb_add(indr_dev, cb_priv, cb, cb_ident);
++ 	err = PTR_ERR_OR_ZERO(indr_block_cb);
++ 	if (err)
++ 		goto err_dev_put;
++ 
++ 	tc_indr_block_ing_cmd(indr_dev, indr_block_cb, TC_BLOCK_BIND);
++ 	return 0;
++ 
++ err_dev_put:
++ 	tc_indr_block_dev_put(indr_dev);
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(__tc_indr_block_cb_register);
++ 
++ int tc_indr_block_cb_register(struct net_device *dev, void *cb_priv,
++ 			      tc_indr_block_bind_cb_t *cb, void *cb_ident)
++ {
++ 	int err;
++ 
++ 	rtnl_lock();
++ 	err = __tc_indr_block_cb_register(dev, cb_priv, cb, cb_ident);
++ 	rtnl_unlock();
++ 
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(tc_indr_block_cb_register);
++ 
++ void __tc_indr_block_cb_unregister(struct net_device *dev,
++ 				   tc_indr_block_bind_cb_t *cb, void *cb_ident)
++ {
++ 	struct tc_indr_block_cb *indr_block_cb;
++ 	struct tc_indr_block_dev *indr_dev;
++ 
++ 	indr_dev = tc_indr_block_dev_lookup(dev);
++ 	if (!indr_dev)
++ 		return;
++ 
++ 	indr_block_cb = tc_indr_block_cb_lookup(indr_dev, cb, cb_ident);
++ 	if (!indr_block_cb)
++ 		return;
++ 
++ 	/* Send unbind message if required to free any block cbs. */
++ 	tc_indr_block_ing_cmd(indr_dev, indr_block_cb, TC_BLOCK_UNBIND);
++ 	tc_indr_block_cb_del(indr_block_cb);
++ 	tc_indr_block_dev_put(indr_dev);
++ }
++ EXPORT_SYMBOL_GPL(__tc_indr_block_cb_unregister);
++ 
++ void tc_indr_block_cb_unregister(struct net_device *dev,
++ 				 tc_indr_block_bind_cb_t *cb, void *cb_ident)
++ {
++ 	rtnl_lock();
++ 	__tc_indr_block_cb_unregister(dev, cb, cb_ident);
++ 	rtnl_unlock();
++ }
++ EXPORT_SYMBOL_GPL(tc_indr_block_cb_unregister);
++ 
++ static void tc_indr_block_call(struct tcf_block *block, struct net_device *dev,
++ 			       struct tcf_block_ext_info *ei,
++ 			       enum tc_block_command command,
++ 			       struct netlink_ext_ack *extack)
++ {
++ 	struct tc_indr_block_cb *indr_block_cb;
++ 	struct tc_indr_block_dev *indr_dev;
++ 	struct tc_block_offload bo = {
++ 		.command	= command,
++ 		.binder_type	= ei->binder_type,
++ 		.block		= block,
++ 		.extack		= extack,
++ 	};
++ 
++ 	indr_dev = tc_indr_block_dev_lookup(dev);
++ 	if (!indr_dev)
++ 		return;
++ 
++ 	indr_dev->block = command == TC_BLOCK_BIND ? block : NULL;
++ 
++ 	list_for_each_entry(indr_block_cb, &indr_dev->cb_list, list)
++ 		indr_block_cb->cb(dev, indr_block_cb->cb_priv, TC_SETUP_BLOCK,
++ 				  &bo);
++ }
++ 
+  static bool tcf_block_offload_in_use(struct tcf_block *block)
+  {
+  	return block->offloadcnt;
+@@@ -296,13 -638,19 +540,17 @@@ static int tcf_block_offload_bind(struc
+  	/* If tc offload feature is disabled and the block we try to bind
+  	 * to already has some offloaded filters, forbid to bind.
+  	 */
+ -	if (!tc_can_offload(dev) && tcf_block_offload_in_use(block)) {
+ -		NL_SET_ERR_MSG(extack, "Bind to offloaded block failed as dev has offload disabled");
+ +	if (!tc_can_offload(dev) && tcf_block_offload_in_use(block))
+  		return -EOPNOTSUPP;
+ -	}
+  
+ -	err = tcf_block_offload_cmd(block, dev, ei, TC_BLOCK_BIND, extack);
+ +	err = tcf_block_offload_cmd(block, dev, ei, TC_BLOCK_BIND);
+  	if (err == -EOPNOTSUPP)
+  		goto no_offload_dev_inc;
+- 	return err;
++ 	if (err)
++ 		return err;
++ 
++ 	tc_indr_block_call(block, dev, ei, TC_BLOCK_BIND, extack);
++ 	return 0;
+  
+  no_offload_dev_inc:
+  	if (tcf_block_offload_in_use(block))
+@@@ -317,9 -666,11 +566,15 @@@ static void tcf_block_offload_unbind(st
+  	struct net_device *dev = q->dev_queue->dev;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	if (!__rh_has_ndo_setup_tc(dev))
+++=======
++ 	tc_indr_block_call(block, dev, ei, TC_BLOCK_UNBIND, NULL);
++ 
++ 	if (!dev->netdev_ops->ndo_setup_tc)
+++>>>>>>> 7f76fa36754b (net: sched: register callbacks for indirect tc block binds)
+  		goto no_offload_dev_dec;
+ -	err = tcf_block_offload_cmd(block, dev, ei, TC_BLOCK_UNBIND, NULL);
+ +	err = tcf_block_offload_cmd(block, dev, ei, TC_BLOCK_UNBIND);
+  	if (err == -EOPNOTSUPP)
+  		goto no_offload_dev_dec;
+  	return;
+@@@ -1602,10 -2602,19 +1857,26 @@@ static int __init tc_filter_init(void
+  	if (err)
+  		goto err_register_pernet_subsys;
+  
+++<<<<<<< HEAD
+ +	rtnl_register(PF_UNSPEC, RTM_NEWTFILTER, tc_ctl_tfilter, NULL, NULL);
+ +	rtnl_register(PF_UNSPEC, RTM_DELTFILTER, tc_ctl_tfilter, NULL, NULL);
+ +	rtnl_register(PF_UNSPEC, RTM_GETTFILTER, tc_ctl_tfilter,
+ +		      tc_dump_tfilter, NULL);
+++=======
++ 	err = rhashtable_init(&indr_setup_block_ht,
++ 			      &tc_indr_setup_block_ht_params);
++ 	if (err)
++ 		goto err_rhash_setup_block_ht;
++ 
++ 	rtnl_register(PF_UNSPEC, RTM_NEWTFILTER, tc_new_tfilter, NULL, 0);
++ 	rtnl_register(PF_UNSPEC, RTM_DELTFILTER, tc_del_tfilter, NULL, 0);
++ 	rtnl_register(PF_UNSPEC, RTM_GETTFILTER, tc_get_tfilter,
++ 		      tc_dump_tfilter, 0);
++ 	rtnl_register(PF_UNSPEC, RTM_NEWCHAIN, tc_ctl_chain, NULL, 0);
++ 	rtnl_register(PF_UNSPEC, RTM_DELCHAIN, tc_ctl_chain, NULL, 0);
++ 	rtnl_register(PF_UNSPEC, RTM_GETCHAIN, tc_ctl_chain,
++ 		      tc_dump_chain, 0);
+++>>>>>>> 7f76fa36754b (net: sched: register callbacks for indirect tc block binds)
+  
+  	return 0;
+  
+diff --git a/include/net/pkt_cls.h b/include/net/pkt_cls.h
+index 4ce9437e911a..1f172c668aa5 100644
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -77,6 +77,14 @@ int tcf_block_cb_register(struct tcf_block *block,
+ void __tcf_block_cb_unregister(struct tcf_block_cb *block_cb);
+ void tcf_block_cb_unregister(struct tcf_block *block,
+ 			     tc_setup_cb_t *cb, void *cb_ident);
++int __tc_indr_block_cb_register(struct net_device *dev, void *cb_priv,
++				tc_indr_block_bind_cb_t *cb, void *cb_ident);
++int tc_indr_block_cb_register(struct net_device *dev, void *cb_priv,
++			      tc_indr_block_bind_cb_t *cb, void *cb_ident);
++void __tc_indr_block_cb_unregister(struct net_device *dev,
++				   tc_indr_block_bind_cb_t *cb, void *cb_ident);
++void tc_indr_block_cb_unregister(struct net_device *dev,
++				 tc_indr_block_bind_cb_t *cb, void *cb_ident);
+ 
+ int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
+ 		 struct tcf_result *res, bool compat_mode);
+@@ -180,6 +188,32 @@ void tcf_block_cb_unregister(struct tcf_block *block,
+ {
+ }
+ 
++static inline
++int __tc_indr_block_cb_register(struct net_device *dev, void *cb_priv,
++				tc_indr_block_bind_cb_t *cb, void *cb_ident)
++{
++	return 0;
++}
++
++static inline
++int tc_indr_block_cb_register(struct net_device *dev, void *cb_priv,
++			      tc_indr_block_bind_cb_t *cb, void *cb_ident)
++{
++	return 0;
++}
++
++static inline
++void __tc_indr_block_cb_unregister(struct net_device *dev,
++				   tc_indr_block_bind_cb_t *cb, void *cb_ident)
++{
++}
++
++static inline
++void tc_indr_block_cb_unregister(struct net_device *dev,
++				 tc_indr_block_bind_cb_t *cb, void *cb_ident)
++{
++}
++
+ static inline int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
+ 			       struct tcf_result *res, bool compat_mode)
+ {
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index db12c638e516..65b824e4f389 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -34,6 +34,9 @@ struct qdisc_walker;
+ struct tcf_walker;
+ struct module;
+ 
++typedef int tc_indr_block_bind_cb_t(struct net_device *dev, void *cb_priv,
++				    enum tc_setup_type type, void *type_data);
++
+ struct qdisc_rate_table {
+ 	struct tc_ratespec rate;
+ 	u32		data[256];
+* Unmerged path net/sched/cls_api.c
