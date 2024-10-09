@@ -1,0 +1,391 @@
+IB/uverbs: Revise the placement of get/puts on uobject
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Gunthorpe <jgg@mellanox.com>
+commit 5671f79b42da197466bf0908bce6f7ab4e35488f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/5671f79b.failed
+
+This wasn't wrong, but the placement of two krefs didn't make any
+sense. Follow some simple rules.
+
+- A kref is held inside uobjects_list
+- A kref is held inside the IDR
+- A kref is held inside file->private
+- A stack based kref is passed bettwen alloc_begin and
+  alloc_abort/alloc_commit
+
+Any place we destroy one of the above pointers, we stick a put,
+or 'move' the kref into another pointer.
+
+The key functions have sensible semantics:
+- alloc_uobj fully initializes the common members in uobj, including
+  the list
+- Get rid of the uverbs_idr_remove_uobj helper since IDR remove
+  does require put, but it depends on the situation. Later
+  patches will re-consolidate this differently.
+- alloc_abort always consumes the passed kref, done in the type
+- alloc_commit always consumes the passed kref, done in the type
+- rdma_remove_commit_uobject always pairs with a lookup_get
+
+After it is all done the only control flow change is to:
+- move a get from alloc_commit_fd_uobject to rdma_alloc_commit_uobject
+- add a put to remove_commit_idr_uobject
+- Consistenly use rdma_lookup_put in rdma_remove_commit_uobject at
+  the right place
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 5671f79b42da197466bf0908bce6f7ab4e35488f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/rdma_core.c
+diff --cc drivers/infiniband/core/rdma_core.c
+index 586f179a9de6,80e1e3cb2110..000000000000
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@@ -161,7 -161,9 +161,13 @@@ static struct ib_uobject *alloc_uobj(st
+  	 * user_handle should be filled by the handler,
+  	 * The object is added to the list in the commit stage.
+  	 */
+++<<<<<<< HEAD
+ +	uobj->context = context;
+++=======
++ 	uobj->ufile = ufile;
++ 	uobj->context = ufile->ucontext;
++ 	INIT_LIST_HEAD(&uobj->list);
+++>>>>>>> 5671f79b42da (IB/uverbs: Revise the placement of get/puts on uobject)
+  	uobj->type = type;
+  	/*
+  	 * Allocated objects start out as write locked to deny any other
+@@@ -197,23 -199,16 +203,26 @@@ static int idr_add_uobj(struct ib_uobje
+  	return ret < 0 ? ret : 0;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * It only removes it from the uobjects list, uverbs_uobject_put() is still
+ + * required.
+ + */
+ +static void uverbs_idr_remove_uobj(struct ib_uobject *uobj)
+ +{
+ +	spin_lock(&uobj->context->ufile->idr_lock);
+ +	idr_remove(&uobj->context->ufile->idr, uobj->id);
+ +	spin_unlock(&uobj->context->ufile->idr_lock);
+ +}
+ +
+++=======
+++>>>>>>> 5671f79b42da (IB/uverbs: Revise the placement of get/puts on uobject)
+  /* Returns the ib_uobject or an error. The caller should check for IS_ERR. */
+ -static struct ib_uobject *
+ -lookup_get_idr_uobject(const struct uverbs_obj_type *type,
+ -		       struct ib_uverbs_file *ufile, s64 id, bool exclusive)
+ +static struct ib_uobject *lookup_get_idr_uobject(const struct uverbs_obj_type *type,
+ +						 struct ib_ucontext *ucontext,
+ +						 int id, bool exclusive)
+  {
+  	struct ib_uobject *uobj;
+ -	unsigned long idrno = id;
+ -
+ -	if (id < 0 || id > ULONG_MAX)
+ -		return ERR_PTR(-EINVAL);
+  
+  	rcu_read_lock();
+  	/* object won't be released as we're protected in rcu */
+@@@ -312,9 -311,17 +321,16 @@@ static struct ib_uobject *alloc_begin_i
+  	if (ret)
+  		goto uobj_put;
+  
+ -	ret = ib_rdmacg_try_charge(&uobj->cg_obj, ufile->ucontext->device,
+ -				   RDMACG_RESOURCE_HCA_OBJECT);
+ -	if (ret)
+ -		goto idr_remove;
+ -
+  	return uobj;
+  
+++<<<<<<< HEAD
+ +	uverbs_idr_remove_uobj(uobj);
+++=======
++ idr_remove:
++ 	spin_lock(&ufile->idr_lock);
++ 	idr_remove(&ufile->idr, uobj->id);
++ 	spin_unlock(&ufile->idr_lock);
+++>>>>>>> 5671f79b42da (IB/uverbs: Revise the placement of get/puts on uobject)
+  uobj_put:
+  	uverbs_uobject_put(uobj);
+  	return ERR_PTR(ret);
+@@@ -340,10 -346,16 +356,20 @@@ static struct ib_uobject *alloc_begin_f
+  		return uobj;
+  	}
+  
+++<<<<<<< HEAD
+ +	uobj_file = container_of(uobj, struct ib_uobject_file, uobj);
+++=======
++ 	/*
++ 	 * The kref for uobj is moved into filp->private data and put in
++ 	 * uverbs_close_fd(). Once anon_inode_getfile() succeeds
++ 	 * uverbs_close_fd() must be guaranteed to be called from the provided
++ 	 * fops release callback. We piggyback our kref of uobj on the stack
++ 	 * with the lifetime of the struct file.
++ 	 */
+++>>>>>>> 5671f79b42da (IB/uverbs: Revise the placement of get/puts on uobject)
+  	filp = anon_inode_getfile(fd_type->name,
+  				  fd_type->fops,
+ -				  uobj,
+ +				  uobj_file,
+  				  fd_type->flags);
+  	if (IS_ERR(filp)) {
+  		put_unused_fd(new_fd);
+@@@ -351,11 -363,11 +377,19 @@@
+  		return (void *)filp;
+  	}
+  
+++<<<<<<< HEAD
+ +	uobj_file->uobj.id = new_fd;
+ +	uobj_file->uobj.object = filp;
+ +	uobj_file->ufile = ucontext->ufile;
+ +	INIT_LIST_HEAD(&uobj->list);
+ +	kref_get(&uobj_file->ufile->ref);
+++=======
++ 	uobj->id = new_fd;
++ 	uobj->object = filp;
++ 	uobj->ufile = ufile;
++ 	/* Matching put will be done in uverbs_close_fd() */
++ 	kref_get(&ufile->ref);
+++>>>>>>> 5671f79b42da (IB/uverbs: Revise the placement of get/puts on uobject)
+  
+  	return uobj;
+  }
+@@@ -376,12 -388,21 +410,24 @@@ static int __must_check remove_commit_i
+  
+  	/*
+  	 * We can only fail gracefully if the user requested to destroy the
+ -	 * object or when a retry may be called upon an error.
+ -	 * In the rest of the cases, just remove whatever you can.
+ +	 * object. In the rest of the cases, just remove whatever you can.
+  	 */
+ -	if (ib_is_destroy_retryable(ret, why, uobj))
+ +	if (why == RDMA_REMOVE_DESTROY && ret)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	uverbs_idr_remove_uobj(uobj);
+++=======
++ 	ib_rdmacg_uncharge(&uobj->cg_obj, uobj->context->device,
++ 			   RDMACG_RESOURCE_HCA_OBJECT);
++ 
++ 	spin_lock(&uobj->ufile->idr_lock);
++ 	idr_remove(&uobj->ufile->idr, uobj->id);
++ 	spin_unlock(&uobj->ufile->idr_lock);
++ 
++ 	/* Matches the kref in alloc_commit_idr_uobject */
++ 	uverbs_uobject_put(uobj);
+++>>>>>>> 5671f79b42da (IB/uverbs: Revise the placement of get/puts on uobject)
+  
+  	return ret;
+  }
+@@@ -432,21 -449,23 +478,34 @@@ static void assert_uverbs_usecnt(struc
+  static int __must_check _rdma_remove_commit_uobject(struct ib_uobject *uobj,
+  						    enum rdma_remove_reason why)
+  {
+ -	struct ib_uverbs_file *ufile = uobj->ufile;
+  	int ret;
+ -
+ -	if (!uobj->object)
+ -		return 0;
+ +	struct ib_ucontext *ucontext = uobj->context;
+  
+  	ret = uobj->type->type_class->remove_commit(uobj, why);
+++<<<<<<< HEAD
+ +	if (ret && why == RDMA_REMOVE_DESTROY) {
+ +		/* We couldn't remove the object, so just unlock the uobject */
+ +		atomic_set(&uobj->usecnt, 0);
+ +		uobj->type->type_class->lookup_put(uobj, true);
+ +	} else {
+ +		mutex_lock(&ucontext->uobjects_lock);
+ +		list_del(&uobj->list);
+ +		mutex_unlock(&ucontext->uobjects_lock);
+ +		/* put the ref we took when we created the object */
+ +		uverbs_uobject_put(uobj);
+ +	}
+++=======
++ 	if (ib_is_destroy_retryable(ret, why, uobj))
++ 		return ret;
++ 
++ 	uobj->object = NULL;
++ 
++ 	mutex_lock(&ufile->uobjects_lock);
++ 	list_del(&uobj->list);
++ 	mutex_unlock(&ufile->uobjects_lock);
++ 	/* Pairs with the get in rdma_alloc_commit_uobject() */
++ 	uverbs_uobject_put(uobj);
+++>>>>>>> 5671f79b42da (IB/uverbs: Revise the placement of get/puts on uobject)
+  
+  	return ret;
+  }
+@@@ -521,20 -520,28 +584,30 @@@ static void alloc_commit_idr_uobject(st
+  
+  static void alloc_commit_fd_uobject(struct ib_uobject *uobj)
+  {
+ -	int fd = uobj->id;
+ +	struct ib_uobject_file *uobj_file =
+ +		container_of(uobj, struct ib_uobject_file, uobj);
+  
+ +	fd_install(uobj_file->uobj.id, uobj->object);
+  	/* This shouldn't be used anymore. Use the file object instead */
+++<<<<<<< HEAD
+ +	uobj_file->uobj.id = 0;
+ +	/* Get another reference as we export this to the fops */
+ +	uverbs_uobject_get(&uobj_file->uobj);
+++=======
++ 	uobj->id = 0;
++ 
++ 	/*
++ 	 * NOTE: Once we install the file we loose ownership of our kref on
++ 	 * uobj. It will be put by uverbs_close_fd()
++ 	 */
++ 	fd_install(fd, uobj->object);
+++>>>>>>> 5671f79b42da (IB/uverbs: Revise the placement of get/puts on uobject)
+  }
+  
+ -/*
+ - * In all cases rdma_alloc_commit_uobject() consumes the kref to uobj and the
+ - * caller can no longer assume uobj is valid.
+ - */
+  int rdma_alloc_commit_uobject(struct ib_uobject *uobj)
+  {
+ -	struct ib_uverbs_file *ufile = uobj->ufile;
+ -
+  	/* Cleanup is running. Calling this should have been impossible */
+ -	if (!down_read_trylock(&ufile->cleanup_rwsem)) {
+ +	if (!down_read_trylock(&uobj->context->cleanup_rwsem)) {
+  		int ret;
+  
+  		WARN(true, "ib_uverbs: Cleanup is running while allocating an uobject\n");
+@@@ -550,19 -557,30 +623,39 @@@
+  	assert_uverbs_usecnt(uobj, true);
+  	atomic_set(&uobj->usecnt, 0);
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&uobj->context->uobjects_lock);
+ +	list_add(&uobj->list, &uobj->context->uobjects);
+ +	mutex_unlock(&uobj->context->uobjects_lock);
+++=======
++ 	/* kref is held so long as the uobj is on the uobj list. */
++ 	uverbs_uobject_get(uobj);
++ 	mutex_lock(&ufile->uobjects_lock);
++ 	list_add(&uobj->list, &ufile->uobjects);
++ 	mutex_unlock(&ufile->uobjects_lock);
+++>>>>>>> 5671f79b42da (IB/uverbs: Revise the placement of get/puts on uobject)
+  
+ -	/* alloc_commit consumes the uobj kref */
+  	uobj->type->type_class->alloc_commit(uobj);
+ -	up_read(&ufile->cleanup_rwsem);
+ +	up_read(&uobj->context->cleanup_rwsem);
+  
+  	return 0;
+  }
+  
+  static void alloc_abort_idr_uobject(struct ib_uobject *uobj)
+  {
+++<<<<<<< HEAD
+ +	uverbs_idr_remove_uobj(uobj);
+++=======
++ 	ib_rdmacg_uncharge(&uobj->cg_obj, uobj->context->device,
++ 			   RDMACG_RESOURCE_HCA_OBJECT);
++ 
++ 	spin_lock(&uobj->ufile->idr_lock);
++ 	/* The value of the handle in the IDR is NULL at this point. */
++ 	idr_remove(&uobj->ufile->idr, uobj->id);
++ 	spin_unlock(&uobj->ufile->idr_lock);
++ 
++ 	/* Pairs with the kref from alloc_begin_idr_uobject */
+++>>>>>>> 5671f79b42da (IB/uverbs: Revise the placement of get/puts on uobject)
+  	uverbs_uobject_put(uobj);
+  }
+  
+@@@ -648,21 -670,67 +746,77 @@@ unlock
+  
+  void uverbs_close_fd(struct file *f)
+  {
+ -	struct ib_uobject *uobj = f->private_data;
+ -	struct kref *uverbs_file_ref = &uobj->ufile->ref;
+ +	struct ib_uobject_file *uobj_file = f->private_data;
+ +	struct kref *uverbs_file_ref = &uobj_file->ufile->ref;
+ +
+++<<<<<<< HEAD
+ +	_uverbs_close_fd(uobj_file);
+ +	uverbs_uobject_put(&uobj_file->uobj);
+ +	kref_put(uverbs_file_ref, ib_uverbs_release_file);
+ +}
+  
+ +void uverbs_cleanup_ucontext(struct ib_ucontext *ucontext, bool device_removed)
+++=======
++ 	_uverbs_close_fd(uobj);
++ 	/* Pairs with filp->private_data in alloc_begin_fd_uobject */
++ 	uverbs_uobject_put(uobj);
++ 	kref_put(uverbs_file_ref, ib_uverbs_release_file);
++ }
++ 
++ static int __uverbs_cleanup_ufile(struct ib_uverbs_file *ufile,
++ 				  enum rdma_remove_reason reason)
++ {
++ 	struct ib_uobject *obj, *next_obj;
++ 	int ret = -EINVAL;
++ 	int err = 0;
++ 
++ 	/*
++ 	 * This shouldn't run while executing other commands on this
++ 	 * context. Thus, the only thing we should take care of is
++ 	 * releasing a FD while traversing this list. The FD could be
++ 	 * closed and released from the _release fop of this FD.
++ 	 * In order to mitigate this, we add a lock.
++ 	 * We take and release the lock per traversal in order to let
++ 	 * other threads (which might still use the FDs) chance to run.
++ 	 */
++ 	mutex_lock(&ufile->uobjects_lock);
++ 	ufile->cleanup_reason = reason;
++ 	list_for_each_entry_safe(obj, next_obj, &ufile->uobjects, list) {
++ 		/*
++ 		 * if we hit this WARN_ON, that means we are
++ 		 * racing with a lookup_get.
++ 		 */
++ 		WARN_ON(uverbs_try_lock_object(obj, true));
++ 		err = obj->type->type_class->remove_commit(obj, reason);
++ 
++ 		if (ib_is_destroy_retryable(err, reason, obj)) {
++ 			pr_debug("ib_uverbs: failed to remove uobject id %d err %d\n",
++ 				 obj->id, err);
++ 			atomic_set(&obj->usecnt, 0);
++ 			continue;
++ 		}
++ 
++ 		if (err)
++ 			pr_err("ib_uverbs: unable to remove uobject id %d err %d\n",
++ 				obj->id, err);
++ 
++ 		list_del(&obj->list);
++ 		/* Pairs with the get in rdma_alloc_commit_uobject() */
++ 		uverbs_uobject_put(obj);
++ 		ret = 0;
++ 	}
++ 	mutex_unlock(&ufile->uobjects_lock);
++ 	return ret;
++ }
++ 
++ void uverbs_cleanup_ufile(struct ib_uverbs_file *ufile, bool device_removed)
+++>>>>>>> 5671f79b42da (IB/uverbs: Revise the placement of get/puts on uobject)
+  {
+  	enum rdma_remove_reason reason = device_removed ?
+ -					RDMA_REMOVE_DRIVER_REMOVE :
+ -					RDMA_REMOVE_CLOSE;
+ +		RDMA_REMOVE_DRIVER_REMOVE : RDMA_REMOVE_CLOSE;
+ +	unsigned int cur_order = 0;
+  
+ +	ucontext->cleanup_reason = reason;
+  	/*
+  	 * Waits for all remove_commit and alloc_commit to finish. Logically, We
+  	 * want to hold this forever as the context is going to be destroyed,
+* Unmerged path drivers/infiniband/core/rdma_core.c
