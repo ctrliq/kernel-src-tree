@@ -1,0 +1,146 @@
+nvme: move the retries count to struct nvme_request
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [nvme] move the retries count to struct nvme_request (David Milburn) [1454365 1456486 1457880]
+Rebuild_FUZZ: 93.75%
+commit-author Christoph Hellwig <hch@lst.de>
+commit 44e44b29fb99a299dfaa404a59fa35519a197c6b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/44e44b29.failed
+
+The way NVMe uses this field is entirely different from the older
+SCSI/BLOCK_PC usage, so move it into struct nvme_request.
+
+Also reduce the size of the file to a unsigned char so that we leave
+space for additional smaller fields that will appear soon.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 44e44b29fb99a299dfaa404a59fa35519a197c6b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index bd223cb63595,dc05f41c3992..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -48,10 -49,9 +48,15 @@@ unsigned char shutdown_timeout = 5
+  module_param(shutdown_timeout, byte, 0644);
+  MODULE_PARM_DESC(shutdown_timeout, "timeout in seconds for controller shutdown");
+  
+++<<<<<<< HEAD
+ +unsigned int nvme_max_retries = 5;
+ +module_param_named(max_retries, nvme_max_retries, uint, 0644);
+++=======
++ static u8 nvme_max_retries = 5;
++ module_param_named(max_retries, nvme_max_retries, byte, 0644);
+++>>>>>>> 44e44b29fb99 (nvme: move the retries count to struct nvme_request)
+  MODULE_PARM_DESC(max_retries, "max number of retries a command may have");
+ +EXPORT_SYMBOL_GPL(nvme_max_retries);
+  
+  static int nvme_char_major;
+  module_param(nvme_char_major, int, 0);
+@@@ -61,6 -66,41 +66,44 @@@ static DEFINE_SPINLOCK(dev_list_lock)
+  
+  static struct class *nvme_class;
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool nvme_req_needs_retry(struct request *req)
++ {
++ 	if (blk_noretry_request(req))
++ 		return false;
++ 	if (req->errors & NVME_SC_DNR)
++ 		return false;
++ 	if (jiffies - req->start_time >= req->timeout)
++ 		return false;
++ 	if (nvme_req(req)->retries >= nvme_max_retries)
++ 		return false;
++ 	return true;
++ }
++ 
++ void nvme_complete_rq(struct request *req)
++ {
++ 	int error = 0;
++ 
++ 	if (unlikely(req->errors)) {
++ 		if (nvme_req_needs_retry(req)) {
++ 			nvme_req(req)->retries++;
++ 			blk_mq_requeue_request(req,
++ 					!blk_mq_queue_stopped(req->q));
++ 			return;
++ 		}
++ 
++ 		if (blk_rq_is_passthrough(req))
++ 			error = req->errors;
++ 		else
++ 			error = nvme_error_status(req->errors);
++ 	}
++ 
++ 	blk_mq_end_request(req, error);
++ }
++ EXPORT_SYMBOL_GPL(nvme_complete_rq);
++ 
+++>>>>>>> 44e44b29fb99 (nvme: move the retries count to struct nvme_request)
+  void nvme_cancel_request(struct request *req, void *data, bool reserved)
+  {
+  	int status;
+@@@ -311,17 -355,32 +354,28 @@@ int nvme_setup_cmd(struct nvme_ns *ns, 
+  {
+  	int ret = BLK_MQ_RQ_QUEUE_OK;
+  
+++<<<<<<< HEAD
+ +	if (req->cmd_type == REQ_TYPE_DRV_PRIV)
+++=======
++ 	if (!(req->rq_flags & RQF_DONTPREP)) {
++ 		nvme_req(req)->retries = 0;
++ 		req->rq_flags |= RQF_DONTPREP;
++ 	}
++ 
++ 	switch (req_op(req)) {
++ 	case REQ_OP_DRV_IN:
++ 	case REQ_OP_DRV_OUT:
+++>>>>>>> 44e44b29fb99 (nvme: move the retries count to struct nvme_request)
+  		memcpy(cmd, nvme_req(req)->cmd, sizeof(*cmd));
+ -		break;
+ -	case REQ_OP_FLUSH:
+ +	else if (req->cmd_flags & REQ_FLUSH)
+  		nvme_setup_flush(ns, cmd);
+ -		break;
+ -	case REQ_OP_DISCARD:
+ +	else if (req->cmd_flags & REQ_DISCARD)
+  		ret = nvme_setup_discard(ns, req, cmd);
+ -		break;
+ -	case REQ_OP_READ:
+ -	case REQ_OP_WRITE:
+ +	else
+  		nvme_setup_rw(ns, req, cmd);
+ -		break;
+ -	default:
+ -		WARN_ON_ONCE(1);
+ -		return BLK_MQ_RQ_QUEUE_ERROR;
+ -	}
+  
+  	cmd->common.command_id = req->tag;
+ +
+  	return ret;
+  }
+  EXPORT_SYMBOL_GPL(nvme_setup_cmd);
+* Unmerged path drivers/nvme/host/core.c
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index edb3488b21b7..d2cfd39be62d 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -81,6 +81,7 @@ enum nvme_quirks {
+ struct nvme_request {
+ 	struct nvme_command	*cmd;
+ 	union nvme_result	result;
++	u8			retries;
+ };
+ 
+ static inline struct nvme_request *nvme_req(struct request *req)
