@@ -1,0 +1,280 @@
+net: sched: remove tcf_proto from ematch calls
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] sched: remove tcf_proto from ematch calls (Ivan Vecera) [1428588]
+Rebuild_FUZZ: 94.25%
+commit-author John Fastabend <john.fastabend@gmail.com>
+commit 82a470f1119eb7d2e4941b915bf9cd6fd8d54494
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/82a470f1.failed
+
+This removes the tcf_proto argument from the ematch code paths that
+only need it to reference the net namespace. This allows simplifying
+qdisc code paths especially when we need to tear down the ematch
+from an RCU callback. In this case we can not guarentee that the
+tcf_proto structure is still valid.
+
+	Signed-off-by: John Fastabend <john.r.fastabend@intel.com>
+	Acked-by: Cong Wang <cwang@twopensource.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 82a470f1119eb7d2e4941b915bf9cd6fd8d54494)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/em_ipset.c
+diff --cc net/sched/em_ipset.c
+index 938b7cbf5627,5b4a4efe468c..000000000000
+--- a/net/sched/em_ipset.c
++++ b/net/sched/em_ipset.c
+@@@ -45,7 -45,7 +45,11 @@@ static void em_ipset_destroy(struct tcf
+  {
+  	const struct xt_set_info *set = (const void *) em->data;
+  	if (set) {
+++<<<<<<< HEAD
+ +		ip_set_nfnl_put(set->index);
+++=======
++ 		ip_set_nfnl_put(em->net, set->index);
+++>>>>>>> 82a470f1119e (net: sched: remove tcf_proto from ematch calls)
+  		kfree((void *) em->data);
+  	}
+  }
+diff --git a/include/net/pkt_cls.h b/include/net/pkt_cls.h
+index 73f9532ee581..17ad44014694 100644
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -170,6 +170,7 @@ struct tcf_ematch {
+ 	unsigned int		datalen;
+ 	u16			matchid;
+ 	u16			flags;
++	struct net		*net;
+ };
+ 
+ static inline int tcf_em_is_container(struct tcf_ematch *em)
+@@ -233,12 +234,11 @@ struct tcf_ematch_tree {
+ struct tcf_ematch_ops {
+ 	int			kind;
+ 	int			datalen;
+-	int			(*change)(struct tcf_proto *, void *,
++	int			(*change)(struct net *net, void *,
+ 					  int, struct tcf_ematch *);
+ 	int			(*match)(struct sk_buff *, struct tcf_ematch *,
+ 					 struct tcf_pkt_info *);
+-	void			(*destroy)(struct tcf_proto *,
+-					   struct tcf_ematch *);
++	void			(*destroy)(struct tcf_ematch *);
+ 	int			(*dump)(struct sk_buff *, struct tcf_ematch *);
+ 	struct module		*owner;
+ 	struct list_head	link;
+@@ -248,7 +248,7 @@ int tcf_em_register(struct tcf_ematch_ops *);
+ void tcf_em_unregister(struct tcf_ematch_ops *);
+ int tcf_em_tree_validate(struct tcf_proto *, struct nlattr *,
+ 			 struct tcf_ematch_tree *);
+-void tcf_em_tree_destroy(struct tcf_proto *, struct tcf_ematch_tree *);
++void tcf_em_tree_destroy(struct tcf_ematch_tree *);
+ int tcf_em_tree_dump(struct sk_buff *, struct tcf_ematch_tree *, int);
+ int __tcf_em_tree_match(struct sk_buff *, struct tcf_ematch_tree *,
+ 			struct tcf_pkt_info *);
+@@ -305,7 +305,7 @@ struct tcf_ematch_tree {
+ };
+ 
+ #define tcf_em_tree_validate(tp, tb, t) ((void)(t), 0)
+-#define tcf_em_tree_destroy(tp, t) do { (void)(t); } while(0)
++#define tcf_em_tree_destroy(t) do { (void)(t); } while(0)
+ #define tcf_em_tree_dump(skb, t, tlv) (0)
+ #define tcf_em_tree_change(tp, dst, src) do { } while(0)
+ #define tcf_em_tree_match(skb, t, info) ((void)(info), 1)
+diff --git a/net/sched/cls_basic.c b/net/sched/cls_basic.c
+index a2883e2cb8ec..ca2acf3b9c5b 100644
+--- a/net/sched/cls_basic.c
++++ b/net/sched/cls_basic.c
+@@ -95,7 +95,7 @@ static void basic_delete_filter(struct rcu_head *head)
+ 
+ 	tcf_unbind_filter(tp, &f->res);
+ 	tcf_exts_destroy(&f->exts);
+-	tcf_em_tree_destroy(tp, &f->ematches);
++	tcf_em_tree_destroy(&f->ematches);
+ 	kfree(f);
+ }
+ 
+diff --git a/net/sched/cls_cgroup.c b/net/sched/cls_cgroup.c
+index 85dfa6d39151..b6311d4b1061 100644
+--- a/net/sched/cls_cgroup.c
++++ b/net/sched/cls_cgroup.c
+@@ -180,7 +180,7 @@ static void cls_cgroup_destroy_rcu(struct rcu_head *root)
+ 						    rcu);
+ 
+ 	tcf_exts_destroy(&head->exts);
+-	tcf_em_tree_destroy(head->tp, &head->ematches);
++	tcf_em_tree_destroy(&head->ematches);
+ 	kfree(head);
+ }
+ 
+@@ -250,7 +250,7 @@ static void cls_cgroup_destroy(struct tcf_proto *tp)
+ 
+ 	if (head) {
+ 		tcf_exts_destroy(&head->exts);
+-		tcf_em_tree_destroy(tp, &head->ematches);
++		tcf_em_tree_destroy(&head->ematches);
+ 		RCU_INIT_POINTER(tp->root, NULL);
+ 		kfree_rcu(head, rcu);
+ 	}
+diff --git a/net/sched/cls_flow.c b/net/sched/cls_flow.c
+index 1c214075e484..81a94b234b34 100644
+--- a/net/sched/cls_flow.c
++++ b/net/sched/cls_flow.c
+@@ -355,7 +355,7 @@ static void flow_destroy_filter(struct rcu_head *head)
+ 
+ 	del_timer_sync(&f->perturb_timer);
+ 	tcf_exts_destroy(&f->exts);
+-	tcf_em_tree_destroy(f->tp, &f->ematches);
++	tcf_em_tree_destroy(&f->ematches);
+ 	kfree(f);
+ }
+ 
+@@ -533,7 +533,7 @@ static int flow_change(struct net *net, struct sk_buff *in_skb,
+ 	return 0;
+ 
+ err2:
+-	tcf_em_tree_destroy(tp, &t);
++	tcf_em_tree_destroy(&t);
+ 	kfree(fnew);
+ err1:
+ 	tcf_exts_destroy(&e);
+diff --git a/net/sched/em_canid.c b/net/sched/em_canid.c
+index bfd34e4c1afc..03444ec16ed1 100644
+--- a/net/sched/em_canid.c
++++ b/net/sched/em_canid.c
+@@ -120,7 +120,7 @@ static int em_canid_match(struct sk_buff *skb, struct tcf_ematch *m,
+ 	return match;
+ }
+ 
+-static int em_canid_change(struct tcf_proto *tp, void *data, int len,
++static int em_canid_change(struct net *net, void *data, int len,
+ 			  struct tcf_ematch *m)
+ {
+ 	struct can_filter *conf = data; /* Array with rules */
+@@ -190,7 +190,7 @@ static int em_canid_change(struct tcf_proto *tp, void *data, int len,
+ 	return 0;
+ }
+ 
+-static void em_canid_destroy(struct tcf_proto *tp, struct tcf_ematch *m)
++static void em_canid_destroy(struct tcf_ematch *m)
+ {
+ 	struct canid_match *cm = em_canid_priv(m);
+ 
+* Unmerged path net/sched/em_ipset.c
+diff --git a/net/sched/em_meta.c b/net/sched/em_meta.c
+index 22e7f0d90d10..7524daa2997f 100644
+--- a/net/sched/em_meta.c
++++ b/net/sched/em_meta.c
+@@ -769,7 +769,7 @@ static const struct nla_policy meta_policy[TCA_EM_META_MAX + 1] = {
+ 	[TCA_EM_META_HDR]	= { .len = sizeof(struct tcf_meta_hdr) },
+ };
+ 
+-static int em_meta_change(struct tcf_proto *tp, void *data, int len,
++static int em_meta_change(struct net *net, void *data, int len,
+ 			  struct tcf_ematch *m)
+ {
+ 	int err;
+@@ -819,7 +819,7 @@ errout:
+ 	return err;
+ }
+ 
+-static void em_meta_destroy(struct tcf_proto *tp, struct tcf_ematch *m)
++static void em_meta_destroy(struct tcf_ematch *m)
+ {
+ 	if (m)
+ 		meta_delete((struct meta_match *) m->data);
+diff --git a/net/sched/em_nbyte.c b/net/sched/em_nbyte.c
+index a3bed07a008b..df3110d69585 100644
+--- a/net/sched/em_nbyte.c
++++ b/net/sched/em_nbyte.c
+@@ -23,7 +23,7 @@ struct nbyte_data {
+ 	char			pattern[0];
+ };
+ 
+-static int em_nbyte_change(struct tcf_proto *tp, void *data, int data_len,
++static int em_nbyte_change(struct net *net, void *data, int data_len,
+ 			   struct tcf_ematch *em)
+ {
+ 	struct tcf_em_nbyte *nbyte = data;
+diff --git a/net/sched/em_text.c b/net/sched/em_text.c
+index 15d353d2e4be..f03c3de16c27 100644
+--- a/net/sched/em_text.c
++++ b/net/sched/em_text.c
+@@ -45,7 +45,7 @@ static int em_text_match(struct sk_buff *skb, struct tcf_ematch *m,
+ 	return skb_find_text(skb, from, to, tm->config, &state) != UINT_MAX;
+ }
+ 
+-static int em_text_change(struct tcf_proto *tp, void *data, int len,
++static int em_text_change(struct net *net, void *data, int len,
+ 			  struct tcf_ematch *m)
+ {
+ 	struct text_match *tm;
+@@ -100,7 +100,7 @@ retry:
+ 	return 0;
+ }
+ 
+-static void em_text_destroy(struct tcf_proto *tp, struct tcf_ematch *m)
++static void em_text_destroy(struct tcf_ematch *m)
+ {
+ 	if (EM_TEXT_PRIV(m) && EM_TEXT_PRIV(m)->config)
+ 		textsearch_destroy(EM_TEXT_PRIV(m)->config);
+diff --git a/net/sched/ematch.c b/net/sched/ematch.c
+index 3a633debb6df..09339256539b 100644
+--- a/net/sched/ematch.c
++++ b/net/sched/ematch.c
+@@ -178,6 +178,7 @@ static int tcf_em_validate(struct tcf_proto *tp,
+ 	struct tcf_ematch_hdr *em_hdr = nla_data(nla);
+ 	int data_len = nla_len(nla) - sizeof(*em_hdr);
+ 	void *data = (void *) em_hdr + sizeof(*em_hdr);
++	struct net *net = dev_net(qdisc_dev(tp->q));
+ 
+ 	if (!TCF_EM_REL_VALID(em_hdr->flags))
+ 		goto errout;
+@@ -240,7 +241,7 @@ static int tcf_em_validate(struct tcf_proto *tp,
+ 			goto errout;
+ 
+ 		if (em->ops->change) {
+-			err = em->ops->change(tp, data, data_len, em);
++			err = em->ops->change(net, data, data_len, em);
+ 			if (err < 0)
+ 				goto errout;
+ 		} else if (data_len > 0) {
+@@ -271,6 +272,7 @@ static int tcf_em_validate(struct tcf_proto *tp,
+ 	em->matchid = em_hdr->matchid;
+ 	em->flags = em_hdr->flags;
+ 	em->datalen = data_len;
++	em->net = net;
+ 
+ 	err = 0;
+ errout:
+@@ -378,7 +380,7 @@ errout:
+ 	return err;
+ 
+ errout_abort:
+-	tcf_em_tree_destroy(tp, tree);
++	tcf_em_tree_destroy(tree);
+ 	return err;
+ }
+ EXPORT_SYMBOL(tcf_em_tree_validate);
+@@ -393,7 +395,7 @@ EXPORT_SYMBOL(tcf_em_tree_validate);
+  * tcf_em_tree_validate()/tcf_em_tree_change(). You must ensure that
+  * the ematch tree is not in use before calling this function.
+  */
+-void tcf_em_tree_destroy(struct tcf_proto *tp, struct tcf_ematch_tree *tree)
++void tcf_em_tree_destroy(struct tcf_ematch_tree *tree)
+ {
+ 	int i;
+ 
+@@ -405,7 +407,7 @@ void tcf_em_tree_destroy(struct tcf_proto *tp, struct tcf_ematch_tree *tree)
+ 
+ 		if (em->ops) {
+ 			if (em->ops->destroy)
+-				em->ops->destroy(tp, em);
++				em->ops->destroy(em);
+ 			else if (!tcf_em_is_simple(em))
+ 				kfree((void *) em->data);
+ 			module_put(em->ops->owner);
