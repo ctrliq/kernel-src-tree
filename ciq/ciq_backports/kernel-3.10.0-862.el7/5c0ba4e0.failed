@@ -1,0 +1,380 @@
+[readdir] introduce iterate_dir() and dir_context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [fs] introduce iterate_dir() and dir_context ("Eric W. Biederman") [1487751]
+Rebuild_FUZZ: 88.64%
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 5c0ba4e0762e6dabd14a5c276652e2defec38de7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5c0ba4e0.failed
+
+iterate_dir(): new helper, replacing vfs_readdir().
+
+struct dir_context: contains the readdir callback (and will get more stuff
+in it), embedded into whatever data that callback wants to deal with;
+eventually, we'll be passing it to ->readdir() replacement instead of
+(data,filldir) pair.
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 5c0ba4e0762e6dabd14a5c276652e2defec38de7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfs4recover.c
+diff --cc fs/nfsd/nfs4recover.c
+index cdb8e1753ca6,4f8cc6ba7c28..000000000000
+--- a/fs/nfsd/nfs4recover.c
++++ b/fs/nfsd/nfs4recover.c
+@@@ -262,8 -263,10 +262,15 @@@ nfsd4_list_rec_dir(recdir_func *f, stru
+  {
+  	const struct cred *original_cred;
+  	struct dentry *dir = nn->rec_file->f_path.dentry;
+++<<<<<<< HEAD
+ +	LIST_HEAD(names);
+ +	struct name_list *entry, *tmp;
+++=======
++ 	struct {
++ 		struct dir_context ctx;
++ 		struct list_head names;
++ 	} ctx;
+++>>>>>>> 5c0ba4e0762e ([readdir] introduce iterate_dir() and dir_context)
+  	int status;
+  
+  	status = nfs4_save_creds(&original_cred);
+@@@ -276,9 -279,13 +283,17 @@@
+  		return status;
+  	}
+  
+- 	status = vfs_readdir(nn->rec_file, nfsd4_build_namelist, &names);
++ 	INIT_LIST_HEAD(&ctx.names);	
++ 	ctx.ctx.actor = nfsd4_build_namelist;
++ 	status = iterate_dir(nn->rec_file, &ctx.ctx);
+  	mutex_lock_nested(&dir->d_inode->i_mutex, I_MUTEX_PARENT);
+++<<<<<<< HEAD
+ +	list_for_each_entry_safe(entry, tmp, &names, list) {
+++=======
++ 	while (!list_empty(&ctx.names)) {
++ 		struct name_list *entry;
++ 		entry = list_entry(ctx.names.next, struct name_list, list);
+++>>>>>>> 5c0ba4e0762e ([readdir] introduce iterate_dir() and dir_context)
+  		if (!status) {
+  			struct dentry *dentry;
+  			dentry = lookup_one_len(entry->name, dir, HEXDIR_LEN-1);
+diff --git a/Documentation/filesystems/porting b/Documentation/filesystems/porting
+index d0bdfa78fe8c..fbfc7338f2bd 100644
+--- a/Documentation/filesystems/porting
++++ b/Documentation/filesystems/porting
+@@ -445,3 +445,6 @@ object doesn't exist.  It's remote/distributed ones that might care...
+ [mandatory]
+ 	FS_REVAL_DOT is gone; if you used to have it, add ->d_weak_revalidate()
+ in your dentry operations instead.
++--
++[mandatory]
++	vfs_readdir() is gone; switch to iterate_dir() instead
+diff --git a/arch/alpha/kernel/osf_sys.c b/arch/alpha/kernel/osf_sys.c
+index b9e37ad6fa19..ac19c7299d8e 100644
+--- a/arch/alpha/kernel/osf_sys.c
++++ b/arch/alpha/kernel/osf_sys.c
+@@ -96,6 +96,7 @@ struct osf_dirent {
+ };
+ 
+ struct osf_dirent_callback {
++	struct dir_context ctx;
+ 	struct osf_dirent __user *dirent;
+ 	long __user *basep;
+ 	unsigned int count;
+@@ -155,8 +156,9 @@ SYSCALL_DEFINE4(osf_getdirentries, unsigned int, fd,
+ 	buf.basep = basep;
+ 	buf.count = count;
+ 	buf.error = 0;
++	buf.ctx.actor = osf_filldir;
+ 
+-	error = vfs_readdir(arg.file, osf_filldir, &buf);
++	error = iterate_dir(arg.file, &buf.ctx);
+ 	if (error >= 0)
+ 		error = buf.error;
+ 	if (count != buf.count)
+diff --git a/arch/parisc/hpux/fs.c b/arch/parisc/hpux/fs.c
+index 47f0103bdb96..d0f82a30aae7 100644
+--- a/arch/parisc/hpux/fs.c
++++ b/arch/parisc/hpux/fs.c
+@@ -47,6 +47,7 @@ struct hpux_dirent {
+ };
+ 
+ struct getdents_callback {
++	struct dir_context ctx;
+ 	struct hpux_dirent __user *current_dir;
+ 	struct hpux_dirent __user *previous;
+ 	int count;
+@@ -108,8 +109,9 @@ int hpux_getdents(unsigned int fd, struct hpux_dirent __user *dirent, unsigned i
+ 	buf.previous = NULL;
+ 	buf.count = count;
+ 	buf.error = 0;
++	buf.ctx.actor = filldir;
+ 
+-	error = vfs_readdir(arg.file, filldir, &buf);
++	error = iterate_dir(arg.file, &buf.ctx);
+ 	if (error >= 0)
+ 		error = buf.error;
+ 	lastdirent = buf.previous;
+diff --git a/fs/compat.c b/fs/compat.c
+index ce28ea16eb65..e2ca4ef87fcb 100644
+--- a/fs/compat.c
++++ b/fs/compat.c
+@@ -832,6 +832,7 @@ struct compat_old_linux_dirent {
+ };
+ 
+ struct compat_readdir_callback {
++	struct dir_context ctx;
+ 	struct compat_old_linux_dirent __user *dirent;
+ 	int result;
+ };
+@@ -880,8 +881,9 @@ asmlinkage long compat_sys_old_readdir(unsigned int fd,
+ 
+ 	buf.result = 0;
+ 	buf.dirent = dirent;
++	buf.ctx.actor = compat_fillonedir;
+ 
+-	error = vfs_readdir(f.file, compat_fillonedir, &buf);
++	error = iterate_dir(f.file, &buf.ctx);
+ 	if (buf.result)
+ 		error = buf.result;
+ 
+@@ -897,6 +899,7 @@ struct compat_linux_dirent {
+ };
+ 
+ struct compat_getdents_callback {
++	struct dir_context ctx;
+ 	struct compat_linux_dirent __user *current_dir;
+ 	struct compat_linux_dirent __user *previous;
+ 	int count;
+@@ -965,8 +968,9 @@ asmlinkage long compat_sys_getdents(unsigned int fd,
+ 	buf.previous = NULL;
+ 	buf.count = count;
+ 	buf.error = 0;
++	buf.ctx.actor = compat_filldir;
+ 
+-	error = vfs_readdir(f.file, compat_filldir, &buf);
++	error = iterate_dir(f.file, &buf.ctx);
+ 	if (error >= 0)
+ 		error = buf.error;
+ 	lastdirent = buf.previous;
+@@ -983,6 +987,7 @@ asmlinkage long compat_sys_getdents(unsigned int fd,
+ #ifndef __ARCH_OMIT_COMPAT_SYS_GETDENTS64
+ 
+ struct compat_getdents_callback64 {
++	struct dir_context ctx;
+ 	struct linux_dirent64 __user *current_dir;
+ 	struct linux_dirent64 __user *previous;
+ 	int count;
+@@ -1050,8 +1055,9 @@ asmlinkage long compat_sys_getdents64(unsigned int fd,
+ 	buf.previous = NULL;
+ 	buf.count = count;
+ 	buf.error = 0;
++	buf.ctx.actor = compat_filldir64;
+ 
+-	error = vfs_readdir(f.file, compat_filldir64, &buf);
++	error = iterate_dir(f.file, &buf.ctx);
+ 	if (error >= 0)
+ 		error = buf.error;
+ 	lastdirent = buf.previous;
+diff --git a/fs/ecryptfs/file.c b/fs/ecryptfs/file.c
+index a7abbea2c096..041379a646b3 100644
+--- a/fs/ecryptfs/file.c
++++ b/fs/ecryptfs/file.c
+@@ -68,6 +68,7 @@ static ssize_t ecryptfs_read_update_atime(struct kiocb *iocb,
+ }
+ 
+ struct ecryptfs_getdents_callback {
++	struct dir_context ctx;
+ 	void *dirent;
+ 	struct dentry *dentry;
+ 	filldir_t filldir;
+@@ -126,7 +127,8 @@ static int ecryptfs_readdir(struct file *file, void *dirent, filldir_t filldir)
+ 	buf.filldir = filldir;
+ 	buf.filldir_called = 0;
+ 	buf.entries_written = 0;
+-	rc = vfs_readdir(lower_file, ecryptfs_filldir, (void *)&buf);
++	buf.ctx.actor = ecryptfs_filldir;
++	rc = iterate_dir(lower_file, &buf.ctx);
+ 	file->f_pos = lower_file->f_pos;
+ 	if (rc < 0)
+ 		goto out;
+diff --git a/fs/exportfs/expfs.c b/fs/exportfs/expfs.c
+index 262fc9940982..7cb190426cec 100644
+--- a/fs/exportfs/expfs.c
++++ b/fs/exportfs/expfs.c
+@@ -212,6 +212,7 @@ reconnect_path(struct vfsmount *mnt, struct dentry *target_dir, char *nbuf)
+ }
+ 
+ struct getdents_callback {
++	struct dir_context ctx;
+ 	char *name;		/* name that was found. It already points to a
+ 				   buffer NAME_MAX+1 is size */
+ 	unsigned long ino;	/* the inum we are looking for */
+@@ -278,10 +279,11 @@ static int get_name(const struct path *path, char *name, struct dentry *child)
+ 	buffer.ino = child->d_inode->i_ino;
+ 	buffer.found = 0;
+ 	buffer.sequence = 0;
++	buffer.ctx.actor = filldir_one;
+ 	while (1) {
+ 		int old_seq = buffer.sequence;
+ 
+-		error = vfs_readdir(file, filldir_one, &buffer);
++		error = iterate_dir(file, &buffer.ctx);
+ 		if (buffer.found) {
+ 			error = 0;
+ 			break;
+* Unmerged path fs/nfsd/nfs4recover.c
+diff --git a/fs/nfsd/vfs.c b/fs/nfsd/vfs.c
+index c439a9b86cda..00e98c3eec37 100644
+--- a/fs/nfsd/vfs.c
++++ b/fs/nfsd/vfs.c
+@@ -1956,6 +1956,7 @@ struct buffered_dirent {
+ };
+ 
+ struct readdir_data {
++	struct dir_context ctx;
+ 	char		*dirent;
+ 	size_t		used;
+ 	int		full;
+@@ -1993,6 +1994,7 @@ static __be32 nfsd_buffered_readdir(struct file *file, filldir_t func,
+ 	int size;
+ 	loff_t offset;
+ 
++	buf.ctx.actor = nfsd_buffered_filldir;
+ 	buf.dirent = (void *)__get_free_page(GFP_KERNEL);
+ 	if (!buf.dirent)
+ 		return nfserrno(-ENOMEM);
+@@ -2006,7 +2008,7 @@ static __be32 nfsd_buffered_readdir(struct file *file, filldir_t func,
+ 		buf.used = 0;
+ 		buf.full = 0;
+ 
+-		host_err = vfs_readdir(file, nfsd_buffered_filldir, &buf);
++		host_err = iterate_dir(file, &buf.ctx);
+ 		if (buf.full)
+ 			host_err = 0;
+ 
+diff --git a/fs/readdir.c b/fs/readdir.c
+index fee38e04fae4..5b620a2b45e6 100644
+--- a/fs/readdir.c
++++ b/fs/readdir.c
+@@ -20,7 +20,7 @@
+ 
+ #include <asm/uaccess.h>
+ 
+-int vfs_readdir(struct file *file, filldir_t filler, void *buf)
++int iterate_dir(struct file *file, struct dir_context *ctx)
+ {
+ 	struct inode *inode = file_inode(file);
+ 	int res = -ENOTDIR;
+@@ -37,15 +37,14 @@ int vfs_readdir(struct file *file, filldir_t filler, void *buf)
+ 
+ 	res = -ENOENT;
+ 	if (!IS_DEADDIR(inode)) {
+-		res = file->f_op->readdir(file, buf, filler);
++		res = file->f_op->readdir(file, ctx, ctx->actor);
+ 		file_accessed(file);
+ 	}
+ 	mutex_unlock(&inode->i_mutex);
+ out:
+ 	return res;
+ }
+-
+-EXPORT_SYMBOL(vfs_readdir);
++EXPORT_SYMBOL(iterate_dir);
+ 
+ /*
+  * Traditional linux readdir() handling..
+@@ -66,6 +65,7 @@ struct old_linux_dirent {
+ };
+ 
+ struct readdir_callback {
++	struct dir_context ctx;
+ 	struct old_linux_dirent __user * dirent;
+ 	int result;
+ };
+@@ -73,7 +73,7 @@ struct readdir_callback {
+ static int fillonedir(void * __buf, const char * name, int namlen, loff_t offset,
+ 		      u64 ino, unsigned int d_type)
+ {
+-	struct readdir_callback * buf = (struct readdir_callback *) __buf;
++	struct readdir_callback *buf = (struct readdir_callback *) __buf;
+ 	struct old_linux_dirent __user * dirent;
+ 	unsigned long d_ino;
+ 
+@@ -112,10 +112,11 @@ SYSCALL_DEFINE3(old_readdir, unsigned int, fd,
+ 	if (!f.file)
+ 		return -EBADF;
+ 
++	buf.ctx.actor = fillonedir;
+ 	buf.result = 0;
+ 	buf.dirent = dirent;
+ 
+-	error = vfs_readdir(f.file, fillonedir, &buf);
++	error = iterate_dir(f.file, &buf.ctx);
+ 	if (buf.result)
+ 		error = buf.result;
+ 
+@@ -137,6 +138,7 @@ struct linux_dirent {
+ };
+ 
+ struct getdents_callback {
++	struct dir_context ctx;
+ 	struct linux_dirent __user * current_dir;
+ 	struct linux_dirent __user * previous;
+ 	int count;
+@@ -205,8 +207,9 @@ SYSCALL_DEFINE3(getdents, unsigned int, fd,
+ 	buf.previous = NULL;
+ 	buf.count = count;
+ 	buf.error = 0;
++	buf.ctx.actor = filldir;
+ 
+-	error = vfs_readdir(f.file, filldir, &buf);
++	error = iterate_dir(f.file, &buf.ctx);
+ 	if (error >= 0)
+ 		error = buf.error;
+ 	lastdirent = buf.previous;
+@@ -221,6 +224,7 @@ SYSCALL_DEFINE3(getdents, unsigned int, fd,
+ }
+ 
+ struct getdents_callback64 {
++	struct dir_context ctx;
+ 	struct linux_dirent64 __user * current_dir;
+ 	struct linux_dirent64 __user * previous;
+ 	int count;
+@@ -285,8 +289,9 @@ SYSCALL_DEFINE3(getdents64, unsigned int, fd,
+ 	buf.previous = NULL;
+ 	buf.count = count;
+ 	buf.error = 0;
++	buf.ctx.actor = filldir64;
+ 
+-	error = vfs_readdir(f.file, filldir64, &buf);
++	error = iterate_dir(f.file, &buf.ctx);
+ 	if (error >= 0)
+ 		error = buf.error;
+ 	lastdirent = buf.previous;
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 4086333a0708..77a626dd1b53 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -1741,6 +1741,9 @@ int fiemap_check_flags(struct fiemap_extent_info *fieinfo, u32 fs_flags);
+  * to have different dirent layouts depending on the binary type.
+  */
+ typedef int (*filldir_t)(void *, const char *, int, loff_t, u64, unsigned);
++struct dir_context {
++	filldir_t actor;
++};
+ struct block_device_operations;
+ 
+ /* These macros are for out of kernel modules to test that
+@@ -3024,6 +3027,7 @@ loff_t inode_get_bytes(struct inode *inode);
+ void inode_set_bytes(struct inode *inode, loff_t bytes);
+ 
+ extern int vfs_readdir(struct file *, filldir_t, void *);
++extern int iterate_dir(struct file *, struct dir_context *);
+ 
+ extern int vfs_stat(const char __user *, struct kstat *);
+ extern int vfs_lstat(const char __user *, struct kstat *);
