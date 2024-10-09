@@ -1,0 +1,260 @@
+gpio: add a data pointer to gpio_chip
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Linus Walleij <linus.walleij@linaro.org>
+commit b08ea35a3296ee25c4cb53a977b752266dafa2c2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b08ea35a.failed
+
+This adds a void * pointer to gpio_chip so that driver can
+assign and retrieve some states. This is done to get rid of
+container_of() calls for gpio_chips embedded inside state
+containers, so we can remove the need to have the gpio_chip
+or later (planned) struct gpio_device be dynamically allocated
+at registration time, so that its struct device can be properly
+reference counted and not bound to its parent device (e.g.
+a platform_device) but instead live on after unregistration
+if it is opened by e.g. a char device or sysfs.
+
+The data is added with the new function gpiochip_add_data()
+and for compatibility we add static inline wrapper function
+gpiochip_add() that will call gpiochip_add_data() with
+NULL as argument. The latter will be removed once we have
+exorcised gpiochip_add() from the kernel.
+
+gpiochip_get_data() is added as a static inline accessor
+for drivers to quickly get their data out.
+
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+(cherry picked from commit b08ea35a3296ee25c4cb53a977b752266dafa2c2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpio/gpiolib.c
+#	include/linux/gpio/driver.h
+diff --cc drivers/gpio/gpiolib.c
+index 927a1d077837,905408b8d54b..000000000000
+--- a/drivers/gpio/gpiolib.c
++++ b/drivers/gpio/gpiolib.c
+@@@ -1205,8 -309,8 +1205,13 @@@ static void gpiodevice_release(struct d
+   * because the chip->base is invalid or already associated with a
+   * different chip.  Otherwise it returns zero as a success code.
+   *
+++<<<<<<< HEAD
+ + * When gpiochip_add() is called very early during boot, so that GPIOs
+ + * can be freely used, the chip->dev device must be registered before
+++=======
++  * When gpiochip_add_data() is called very early during boot, so that GPIOs
++  * can be freely used, the chip->parent device must be registered before
+++>>>>>>> b08ea35a3296 (gpio: add a data pointer to gpio_chip)
+   * the gpio framework's arch_initcall().  Otherwise sysfs initialization
+   * for GPIOs will fail rudely.
+   *
+@@@ -1217,55 -321,15 +1222,59 @@@ int gpiochip_add_data(struct gpio_chip 
+  {
+  	unsigned long	flags;
+  	int		status = 0;
+ -	unsigned	id;
+ +	unsigned	i;
+  	int		base = chip->base;
+  	struct gpio_desc *descs;
+ +	struct gpio_device *gdev;
+  
+ -	descs = kcalloc(chip->ngpio, sizeof(descs[0]), GFP_KERNEL);
+ -	if (!descs)
+ +	/*
+ +	 * First: allocate and populate the internal stat container, and
+ +	 * set up the struct device.
+ +	 */
+ +	gdev = kzalloc(sizeof(*gdev), GFP_KERNEL);
+ +	if (!gdev)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	gdev->chip = chip;
+ +	chip->gpiodev = gdev;
+ +	if (chip->dev) {
+ +		gdev->dev.parent = chip->dev;
+ +		gdev->dev.of_node = chip->dev->of_node;
+ +	} else {
+ +#ifdef CONFIG_OF_GPIO
+ +	/* If the gpiochip has an assigned OF node this takes precedence */
+ +		if (chip->of_node)
+ +			gdev->dev.of_node = chip->of_node;
+ +#endif
+ +	}
+ +	gdev->id = ida_simple_get(&gpio_ida, 0, 0, GFP_KERNEL);
+ +	if (gdev->id < 0) {
+ +		status = gdev->id;
+ +		goto err_free_gdev;
+ +	}
+ +	dev_set_name(&gdev->dev, "gpiochip%d", gdev->id);
+ +	device_initialize(&gdev->dev);
+ +	dev_set_drvdata(&gdev->dev, gdev);
+ +	if (chip->dev && chip->dev->driver)
+ +		gdev->owner = chip->dev->driver->owner;
+ +	else if (chip->gpiodev->owner)
+ +		/* TODO: remove chip->gpiodev->owner */
+ +		gdev->owner = chip->gpiodev->owner;
+ +	else
+ +		gdev->owner = THIS_MODULE;
+ +
+ +	/* FIXME: devm_kcalloc() these and move to gpio_device */
+ +	descs = kcalloc(chip->ngpio, sizeof(descs[0]), GFP_KERNEL);
+ +	if (!descs) {
+ +		status = -ENOMEM;
+ +		goto err_free_gdev;
+ +	}
+ +
+ +	/* FIXME: move driver data into gpio_device dev_set_drvdata() */
+++=======
++ 	chip->data = data;
+++>>>>>>> b08ea35a3296 (gpio: add a data pointer to gpio_chip)
+  
+  	if (chip->ngpio == 0) {
+  		chip_err(chip, "tried to insert a GPIO chip with zero lines\n");
+@@@ -1355,11 -417,8 +1364,11 @@@ err_free_gdev
+  		chip->label ? : "generic");
+  	return status;
+  }
+- EXPORT_SYMBOL_GPL(gpiochip_add);
++ EXPORT_SYMBOL_GPL(gpiochip_add_data);
+  
+ +/* Forward-declaration */
+ +static void gpiochip_irqchip_remove(struct gpio_chip *gpiochip);
+ +
+  /**
+   * gpiochip_remove() - unregister a gpio_chip
+   * @chip: the chip to unregister
+diff --cc include/linux/gpio/driver.h
+index e61dc96b3e98,b833a5f9629a..000000000000
+--- a/include/linux/gpio/driver.h
++++ b/include/linux/gpio/driver.h
+@@@ -17,9 -20,11 +17,14 @@@ struct gpio_device
+  /**
+   * struct gpio_chip - abstract a GPIO controller
+   * @label: for diagnostics
+ - * @parent: optional parent device providing the GPIOs
+ - * @cdev: class device used by sysfs interface (may be NULL)
+ + * @gpiodev: the internal state holder, opaque struct
+ + * @dev: optional device providing the GPIOs
+   * @owner: helps prevent removal of modules exporting active GPIOs
+++<<<<<<< HEAD
+++=======
++  * @data: per-instance data assigned by the driver
++  * @list: links gpio_chips together for traversal
+++>>>>>>> b08ea35a3296 (gpio: add a data pointer to gpio_chip)
+   * @request: optional hook for chip-specific activation, such as
+   *	enabling module power and clock; may sleep
+   * @free: optional hook for chip-specific deactivation, such as
+@@@ -68,9 -89,11 +73,14 @@@
+   */
+  struct gpio_chip {
+  	const char		*label;
+ -	struct device		*parent;
+ -	struct device		*cdev;
+ +	struct gpio_device	*gpiodev;
+ +	struct device		*dev;
+  	struct module		*owner;
+++<<<<<<< HEAD
+++=======
++ 	void			*data;
++ 	struct list_head        list;
+++>>>>>>> b08ea35a3296 (gpio: add a data pointer to gpio_chip)
+  
+  	int			(*request)(struct gpio_chip *chip,
+  						unsigned offset);
+@@@ -139,68 -167,26 +149,87 @@@ extern const char *gpiochip_is_requeste
+  			unsigned offset);
+  
+  /* add/remove chips */
+++<<<<<<< HEAD
+ +extern int gpiochip_add(struct gpio_chip *chip);
+ +extern int gpiochip_remove(struct gpio_chip *chip);
+++=======
++ extern int gpiochip_add_data(struct gpio_chip *chip, void *data);
++ static inline int gpiochip_add(struct gpio_chip *chip)
++ {
++ 	return gpiochip_add_data(chip, NULL);
++ }
++ extern void gpiochip_remove(struct gpio_chip *chip);
+++>>>>>>> b08ea35a3296 (gpio: add a data pointer to gpio_chip)
+  extern struct gpio_chip *gpiochip_find(void *data,
+  			      int (*match)(struct gpio_chip *chip, void *data));
+  
+  /* lock/unlock as IRQ */
+ -int gpiochip_lock_as_irq(struct gpio_chip *chip, unsigned int offset);
+ -void gpiochip_unlock_as_irq(struct gpio_chip *chip, unsigned int offset);
+ +int gpiod_lock_as_irq(struct gpio_desc *desc);
+ +void gpiod_unlock_as_irq(struct gpio_desc *desc);
+ +
+++<<<<<<< HEAD
+ +enum gpio_lookup_flags {
+ +	GPIO_ACTIVE_HIGH = (0 << 0),
+ +	GPIO_ACTIVE_LOW = (1 << 0),
+ +	GPIO_OPEN_DRAIN = (1 << 1),
+ +	GPIO_OPEN_SOURCE = (1 << 2),
+ +};
+ +
+ +/**
+ + * struct gpiod_lookup - lookup table
+ + * @chip_label: name of the chip the GPIO belongs to
+ + * @chip_hwnum: hardware number (i.e. relative to the chip) of the GPIO
+ + * @con_id: name of the GPIO from the device's point of view
+ + * @idx: index of the GPIO in case several GPIOs share the same name
+ + * @flags: mask of GPIO_* values
+ + *
+ + * gpiod_lookup is a lookup table for associating GPIOs to specific devices and
+ + * functions using platform data.
+ + */
+ +struct gpiod_lookup {
+ +	const char *chip_label;
+ +	u16 chip_hwnum;
+ +	const char *con_id;
+ +	unsigned int idx;
+ +	enum gpio_lookup_flags flags;
+ +};
+ +
+ +struct gpiod_lookup_table {
+ +	struct list_head list;
+ +	const char *dev_id;
+ +	struct gpiod_lookup table[];
+ +};
+ +
+ +/*
+ + * Simple definition of a single GPIO under a con_id
+ + */
+ +#define GPIO_LOOKUP(_chip_label, _chip_hwnum, _con_id, _flags) \
+ +	GPIO_LOOKUP_IDX(_chip_label, _chip_hwnum, _con_id, 0, _flags)
+  
+ +/*
+ + * Use this macro if you need to have several GPIOs under the same con_id.
+ + * Each GPIO needs to use a different index and can be accessed using
+ + * gpiod_get_index()
+ + */
+ +#define GPIO_LOOKUP_IDX(_chip_label, _chip_hwnum, _con_id, _idx, _flags)  \
+ +{                                                                         \
+ +	.chip_label = _chip_label,                                        \
+ +	.chip_hwnum = _chip_hwnum,                                        \
+ +	.con_id = _con_id,                                                \
+ +	.idx = _idx,                                                      \
+ +	.flags = _flags,                                                  \
+ +}
+ +
+ +void gpiod_add_lookup_table(struct gpiod_lookup_table *table);
+++=======
++ /* get driver data */
++ static inline void *gpiochip_get_data(struct gpio_chip *chip)
++ {
++ 	return chip->data;
++ }
++ 
++ struct gpio_chip *gpiod_to_chip(const struct gpio_desc *desc);
+++>>>>>>> b08ea35a3296 (gpio: add a data pointer to gpio_chip)
+  
+  #ifdef CONFIG_GPIOLIB_IRQCHIP
+  
+* Unmerged path drivers/gpio/gpiolib.c
+* Unmerged path include/linux/gpio/driver.h
