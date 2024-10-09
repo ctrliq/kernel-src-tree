@@ -38,6 +38,7 @@
 #include <net/xdp.h>
 
 #include "vf.h"
+#include "ipsec.h"
 
 #define IXGBE_MAX_TXD_PWR	14
 #define IXGBE_MAX_DATA_PER_TXD	BIT(IXGBE_MAX_TXD_PWR)
@@ -187,6 +188,7 @@ struct ixgbevf_ring {
 #define IXGBE_TX_FLAGS_VLAN		BIT(1)
 #define IXGBE_TX_FLAGS_TSO		BIT(2)
 #define IXGBE_TX_FLAGS_IPV4		BIT(3)
+#define IXGBE_TX_FLAGS_IPSEC		BIT(4)
 #define IXGBE_TX_FLAGS_VLAN_MASK	0xffff0000
 #define IXGBE_TX_FLAGS_VLAN_PRIO_MASK	0x0000e000
 #define IXGBE_TX_FLAGS_VLAN_SHIFT	16
@@ -362,6 +364,7 @@ struct ixgbevf_adapter {
 	struct ixgbevf_ring *tx_ring[MAX_TX_QUEUES]; /* One per active queue */
 	u64 restart_queue;
 	u32 tx_timeout_count;
+	u64 tx_ipsec;
 
 	/* RX */
 	int num_rx_queues;
@@ -372,6 +375,7 @@ struct ixgbevf_adapter {
 	u64 alloc_rx_page_failed;
 	u64 alloc_rx_buff_failed;
 	u64 alloc_rx_page;
+	u64 rx_ipsec;
 
 	struct msix_entry *msix_entries;
 
@@ -408,6 +412,10 @@ struct ixgbevf_adapter {
 	u8 rss_indir_tbl[IXGBEVF_X550_VFRETA_SIZE];
 	u32 flags;
 #define IXGBEVF_FLAGS_LEGACY_RX		BIT(1)
+
+#ifdef CONFIG_XFRM
+	struct ixgbevf_ipsec *ipsec;
+#endif /* CONFIG_XFRM */
 };
 
 enum ixbgevf_state_t {
