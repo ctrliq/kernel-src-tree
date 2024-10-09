@@ -1,0 +1,149 @@
+xfs: move some code around inside xfs_bmap_shift_extents
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 05b7c8ab2be71e6fef4615451e7af1bc79ffdf29
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/05b7c8ab.failed
+
+For the first right move we need to look up next_fsb.  That means
+our last fsb that contains next_fsb must also be the current extent,
+so take advantage of that by moving the code around a bit.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 05b7c8ab2be71e6fef4615451e7af1bc79ffdf29)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_bmap.c
+diff --cc fs/xfs/libxfs/xfs_bmap.c
+index 4d66a536c4be,e529bed6be41..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@@ -5625,6 -6126,7 +5625,10 @@@ xfs_bmap_shift_extents
+  
+  	ASSERT(xfs_isilocked(ip, XFS_IOLOCK_EXCL));
+  	ASSERT(xfs_isilocked(ip, XFS_ILOCK_EXCL));
+++<<<<<<< HEAD
+++=======
++ 	ASSERT(direction == SHIFT_LEFT || direction == SHIFT_RIGHT);
+++>>>>>>> 05b7c8ab2be7 (xfs: move some code around inside xfs_bmap_shift_extents)
+  
+  	ifp = XFS_IFORK_PTR(ip, whichfork);
+  	if (!(ifp->if_flags & XFS_IFEXTENTS)) {
+@@@ -5642,36 -6144,84 +5646,96 @@@
+  	}
+  
+  	/*
+++<<<<<<< HEAD
+ +	 * Look up the extent index for the fsb where we start shifting. We can
+ +	 * henceforth iterate with current_ext as extent list changes are locked
+ +	 * out via ilock.
+ +	 *
+ +	 * gotp can be null in 2 cases: 1) if there are no extents or 2)
+ +	 * start_fsb lies in a hole beyond which there are no extents. Either
+ +	 * way, we are done.
+ +	 */
+ +	gotp = xfs_iext_bno_to_ext(ifp, start_fsb, &current_ext);
+ +	if (!gotp) {
+ +		*done = 1;
+ +		goto del_cursor;
+ +	}
+ +
+ +	/*
+++=======
+++>>>>>>> 05b7c8ab2be7 (xfs: move some code around inside xfs_bmap_shift_extents)
+  	 * There may be delalloc extents in the data fork before the range we
+  	 * are collapsing out, so we cannot use the count of real extents here.
+  	 * Instead we have to calculate it from the incore fork.
+  	 */
+  	total_extents = xfs_iext_count(ifp);
+++<<<<<<< HEAD
+ +	while (nexts++ < num_exts && current_ext < total_extents) {
+++=======
++ 	if (total_extents == 0) {
++ 		*done = 1;
++ 		goto del_cursor;
++ 	}
++ 
++ 	/*
++ 	 * In case of first right shift, we need to initialize next_fsb
++ 	 */
++ 	if (*next_fsb == NULLFSBLOCK) {
++ 		ASSERT(direction == SHIFT_RIGHT);
++ 
++ 		current_ext = total_extents - 1;
++ 		gotp = xfs_iext_get_ext(ifp, current_ext);
++ 		xfs_bmbt_get_all(gotp, &got);
++ 		*next_fsb = got.br_startoff;
++ 		if (stop_fsb > *next_fsb) {
++ 			*done = 1;
++ 			goto del_cursor;
++ 		}
++ 	} else {
++ 		/*
++ 		 * Look up the extent index for the fsb where we start shifting. We can
++ 		 * henceforth iterate with current_ext as extent list changes are locked
++ 		 * out via ilock.
++ 		 *
++ 		 * gotp can be null in 2 cases: 1) if there are no extents or 2)
++ 		 * *next_fsb lies in a hole beyond which there are no extents. Either
++ 		 * way, we are done.
++ 		 */
++ 		gotp = xfs_iext_bno_to_ext(ifp, *next_fsb, &current_ext);
++ 		if (!gotp) {
++ 			*done = 1;
++ 			goto del_cursor;
++ 		}
++ 	}
++ 
++ 	/* Lookup the extent index at which we have to stop */
++ 	if (direction == SHIFT_RIGHT) {
++ 		xfs_iext_bno_to_ext(ifp, stop_fsb, &stop_extent);
++ 		/* Make stop_extent exclusive of shift range */
++ 		stop_extent--;
++ 		if (current_ext <= stop_extent) {
++ 			error = -EIO;
++ 			goto del_cursor;
++ 		}
++ 	} else {
++ 		stop_extent = total_extents;
++ 		if (current_ext >= stop_extent) {
++ 			error = -EIO;
++ 			goto del_cursor;
++ 		}
++ 	}
++ 
++ 	while (nexts++ < num_exts) {
+++>>>>>>> 05b7c8ab2be7 (xfs: move some code around inside xfs_bmap_shift_extents)
+  		error = xfs_bmse_shift_one(ip, whichfork, offset_shift_fsb,
+ -					   &current_ext, gotp, cur, &logflags,
+ -					   direction, dfops);
+ +					&current_ext, gotp, cur, &logflags);
+  		if (error)
+  			goto del_cursor;
+ -		/*
+ -		 * If there was an extent merge during the shift, the extent
+ -		 * count can change. Update the total and grade the next record.
+ -		 */
+ -		if (direction == SHIFT_LEFT) {
+ -			total_extents = xfs_iext_count(ifp);
+ -			stop_extent = total_extents;
+ -		}
+  
+ -		if (current_ext == stop_extent) {
+ -			*done = 1;
+ -			*next_fsb = NULLFSBLOCK;
+ +		/* update total extent count and grab the next record */
+ +		total_extents = xfs_iext_count(ifp);
+ +		if (current_ext >= total_extents)
+  			break;
+ -		}
+  		gotp = xfs_iext_get_ext(ifp, current_ext);
+  	}
+  
+* Unmerged path fs/xfs/libxfs/xfs_bmap.c
