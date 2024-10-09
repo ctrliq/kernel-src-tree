@@ -1,0 +1,181 @@
+packet: copy user buffers before orphan or clone
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.2.1.el7
+commit-author Willem de Bruijn <willemb@google.com>
+commit 5cd8d46ea1562be80063f53c7c6a5f40224de623
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.2.1.el7/5cd8d46e.failed
+
+tpacket_snd sends packets with user pages linked into skb frags. It
+notifies that pages can be reused when the skb is released by setting
+skb->destructor to tpacket_destruct_skb.
+
+This can cause data corruption if the skb is orphaned (e.g., on
+transmit through veth) or cloned (e.g., on mirror to another psock).
+
+Create a kernel-private copy of data in these cases, same as tun/tap
+zerocopy transmission. Reuse that infrastructure: mark the skb as
+SKBTX_ZEROCOPY_FRAG, which will trigger copy in skb_orphan_frags(_rx).
+
+Unlike other zerocopy packets, do not set shinfo destructor_arg to
+struct ubuf_info. tpacket_destruct_skb already uses that ptr to notify
+when the original skb is released and a timestamp is recorded. Do not
+change this timestamp behavior. The ubuf_info->callback is not needed
+anyway, as no zerocopy notification is expected.
+
+Mark destructor_arg as not-a-uarg by setting the lower bit to 1. The
+resulting value is not a valid ubuf_info pointer, nor a valid
+tpacket_snd frame address. Add skb_zcopy_.._nouarg helpers for this.
+
+The fix relies on features introduced in commit 52267790ef52 ("sock:
+add MSG_ZEROCOPY"), so can be backported as is only to 4.14.
+
+Tested with from `./in_netns.sh ./txring_overwrite` from
+http://github.com/wdebruij/kerneltools/tests
+
+Fixes: 69e3c75f4d54 ("net: TX_RING and packet mmap")
+	Reported-by: Anand H. Krishnan <anandhkrishnan@gmail.com>
+	Signed-off-by: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5cd8d46ea1562be80063f53c7c6a5f40224de623)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+#	net/packet/af_packet.c
+diff --cc include/linux/skbuff.h
+index 7b84e5e67acf,0d1b2c3f127b..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -1277,6 -1310,77 +1277,80 @@@ static inline struct skb_shared_hwtstam
+  	return &skb_shinfo(skb)->hwtstamps;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline struct ubuf_info *skb_zcopy(struct sk_buff *skb)
++ {
++ 	bool is_zcopy = skb && skb_shinfo(skb)->tx_flags & SKBTX_DEV_ZEROCOPY;
++ 
++ 	return is_zcopy ? skb_uarg(skb) : NULL;
++ }
++ 
++ static inline void skb_zcopy_set(struct sk_buff *skb, struct ubuf_info *uarg)
++ {
++ 	if (skb && uarg && !skb_zcopy(skb)) {
++ 		sock_zerocopy_get(uarg);
++ 		skb_shinfo(skb)->destructor_arg = uarg;
++ 		skb_shinfo(skb)->tx_flags |= SKBTX_ZEROCOPY_FRAG;
++ 	}
++ }
++ 
++ static inline void skb_zcopy_set_nouarg(struct sk_buff *skb, void *val)
++ {
++ 	skb_shinfo(skb)->destructor_arg = (void *)((uintptr_t) val | 0x1UL);
++ 	skb_shinfo(skb)->tx_flags |= SKBTX_ZEROCOPY_FRAG;
++ }
++ 
++ static inline bool skb_zcopy_is_nouarg(struct sk_buff *skb)
++ {
++ 	return (uintptr_t) skb_shinfo(skb)->destructor_arg & 0x1UL;
++ }
++ 
++ static inline void *skb_zcopy_get_nouarg(struct sk_buff *skb)
++ {
++ 	return (void *)((uintptr_t) skb_shinfo(skb)->destructor_arg & ~0x1UL);
++ }
++ 
++ /* Release a reference on a zerocopy structure */
++ static inline void skb_zcopy_clear(struct sk_buff *skb, bool zerocopy)
++ {
++ 	struct ubuf_info *uarg = skb_zcopy(skb);
++ 
++ 	if (uarg) {
++ 		if (uarg->callback == sock_zerocopy_callback) {
++ 			uarg->zerocopy = uarg->zerocopy && zerocopy;
++ 			sock_zerocopy_put(uarg);
++ 		} else if (!skb_zcopy_is_nouarg(skb)) {
++ 			uarg->callback(uarg, zerocopy);
++ 		}
++ 
++ 		skb_shinfo(skb)->tx_flags &= ~SKBTX_ZEROCOPY_FRAG;
++ 	}
++ }
++ 
++ /* Abort a zerocopy operation and revert zckey on error in send syscall */
++ static inline void skb_zcopy_abort(struct sk_buff *skb)
++ {
++ 	struct ubuf_info *uarg = skb_zcopy(skb);
++ 
++ 	if (uarg) {
++ 		sock_zerocopy_put_abort(uarg);
++ 		skb_shinfo(skb)->tx_flags &= ~SKBTX_ZEROCOPY_FRAG;
++ 	}
++ }
++ 
++ static inline void skb_mark_not_on_list(struct sk_buff *skb)
++ {
++ 	skb->next = NULL;
++ }
++ 
++ static inline void skb_list_del_init(struct sk_buff *skb)
++ {
++ 	__list_del_entry(&skb->list);
++ 	skb_mark_not_on_list(skb);
++ }
++ 
+++>>>>>>> 5cd8d46ea156 (packet: copy user buffers before orphan or clone)
+  /**
+   *	skb_queue_empty - check if a queue is empty
+   *	@list: queue head
+diff --cc net/packet/af_packet.c
+index d41f5d797983,a74650e98f42..000000000000
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@@ -2027,12 -2389,12 +2027,12 @@@ ring_is_full
+  static void tpacket_destruct_skb(struct sk_buff *skb)
+  {
+  	struct packet_sock *po = pkt_sk(skb->sk);
+ +	void *ph;
+  
+  	if (likely(po->tx_ring.pg_vec)) {
+ -		void *ph;
+  		__u32 ts;
+  
+- 		ph = skb_shinfo(skb)->destructor_arg;
++ 		ph = skb_zcopy_get_nouarg(skb);
+  		packet_dec_pending(&po->tx_ring);
+  
+  		ts = __packet_set_timestamp(po, ph, skb);
+@@@ -2071,21 -2459,9 +2071,27 @@@ static int tpacket_fill_skb(struct pack
+  	skb->dev = dev;
+  	skb->priority = po->sk.sk_priority;
+  	skb->mark = po->sk.sk_mark;
+++<<<<<<< HEAD
+ +	sock_tx_timestamp(&po->sk, &skb_shinfo(skb)->tx_flags);
+ +	skb_shinfo(skb)->destructor_arg = ph.raw;
+++=======
++ 	skb->tstamp = sockc->transmit_time;
++ 	sock_tx_timestamp(&po->sk, sockc->tsflags, &skb_shinfo(skb)->tx_flags);
++ 	skb_zcopy_set_nouarg(skb, ph.raw);
+++>>>>>>> 5cd8d46ea156 (packet: copy user buffers before orphan or clone)
+ +
+ +	switch (po->tp_version) {
+ +	case TPACKET_V2:
+ +		tp_len = ph.h2->tp_len;
+ +		break;
+ +	default:
+ +		tp_len = ph.h1->tp_len;
+ +		break;
+ +	}
+ +	if (unlikely(tp_len > size_max)) {
+ +		pr_err("packet size is too long (%d > %d)\n", tp_len, size_max);
+ +		return -EMSGSIZE;
+ +	}
+  
+  	skb_reserve(skb, hlen);
+  	skb_reset_network_header(skb);
+* Unmerged path include/linux/skbuff.h
+* Unmerged path net/packet/af_packet.c
