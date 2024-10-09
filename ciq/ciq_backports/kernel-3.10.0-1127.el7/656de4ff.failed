@@ -1,0 +1,158 @@
+xfs: merge _xfs_log_force_lsn and xfs_log_force_lsn
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 656de4ffaffd921e1b45de4150c86ba50da135e9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/656de4ff.failed
+
+Switch to a single interface for flushing the log to a specific LSN, which
+gives consistent trace point coverage and a less confusing interface.
+
+The was only a single user of the previous xfs_log_force_lsn function,
+which now also passes a NULL log_flushed argument.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 656de4ffaffd921e1b45de4150c86ba50da135e9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_log.h
+diff --cc fs/xfs/xfs_log.h
+index bf212772595c,7e2d62922a16..000000000000
+--- a/fs/xfs/xfs_log.h
++++ b/fs/xfs/xfs_log.h
+@@@ -129,18 -129,9 +129,24 @@@ xfs_lsn_t xfs_log_done(struct xfs_moun
+  		       struct xlog_ticket *ticket,
+  		       struct xlog_in_core **iclog,
+  		       bool regrant);
+++<<<<<<< HEAD
+ +int	  _xfs_log_force(struct xfs_mount *mp,
+ +			 uint		flags,
+ +			 int		*log_forced);
+ +void	  xfs_log_force(struct xfs_mount	*mp,
+ +			uint			flags);
+ +int	  _xfs_log_force_lsn(struct xfs_mount *mp,
+ +			     xfs_lsn_t		lsn,
+ +			     uint		flags,
+ +			     int		*log_forced);
+ +void	  xfs_log_force_lsn(struct xfs_mount	*mp,
+ +			    xfs_lsn_t		lsn,
+ +			    uint		flags);
+++=======
++ int	  xfs_log_force(struct xfs_mount *mp, uint flags);
++ int	  xfs_log_force_lsn(struct xfs_mount *mp, xfs_lsn_t lsn, uint flags,
++ 		int *log_forced);
+++>>>>>>> 656de4ffaffd (xfs: merge _xfs_log_force_lsn and xfs_log_force_lsn)
+  int	  xfs_log_mount(struct xfs_mount	*mp,
+  			struct xfs_buftarg	*log_target,
+  			xfs_daddr_t		start_block,
+diff --git a/fs/xfs/xfs_export.c b/fs/xfs/xfs_export.c
+index 593047caea5e..8be0ae0f1134 100644
+--- a/fs/xfs/xfs_export.c
++++ b/fs/xfs/xfs_export.c
+@@ -237,7 +237,7 @@ xfs_fs_nfs_commit_metadata(
+ 
+ 	if (!lsn)
+ 		return 0;
+-	return _xfs_log_force_lsn(mp, lsn, XFS_LOG_SYNC, NULL);
++	return xfs_log_force_lsn(mp, lsn, XFS_LOG_SYNC, NULL);
+ }
+ 
+ const struct export_operations xfs_export_operations = {
+diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+index b4fabc1eb17c..a2ef366f443c 100644
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -160,7 +160,7 @@ xfs_dir_fsync(
+ 
+ 	if (!lsn)
+ 		return 0;
+-	return _xfs_log_force_lsn(mp, lsn, XFS_LOG_SYNC, NULL);
++	return xfs_log_force_lsn(mp, lsn, XFS_LOG_SYNC, NULL);
+ }
+ 
+ STATIC int
+@@ -220,7 +220,7 @@ xfs_file_fsync(
+ 	}
+ 
+ 	if (lsn) {
+-		error = _xfs_log_force_lsn(mp, lsn, XFS_LOG_SYNC, &log_flushed);
++		error = xfs_log_force_lsn(mp, lsn, XFS_LOG_SYNC, &log_flushed);
+ 		ip->i_itemp->ili_fsync_fields = 0;
+ 	}
+ 	xfs_iunlock(ip, XFS_ILOCK_SHARED);
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index 9967b377f603..01b24ebb3b8d 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -2415,7 +2415,7 @@ xfs_iunpin(
+ 	trace_xfs_inode_unpin_nowait(ip, _RET_IP_);
+ 
+ 	/* Give the log a push to start the unpinning I/O */
+-	xfs_log_force_lsn(ip->i_mount, ip->i_itemp->ili_last_lsn, 0);
++	xfs_log_force_lsn(ip->i_mount, ip->i_itemp->ili_last_lsn, 0, NULL);
+ 
+ }
+ 
+diff --git a/fs/xfs/xfs_log.c b/fs/xfs/xfs_log.c
+index 8afceb40a0b1..0462cc7122e5 100644
+--- a/fs/xfs/xfs_log.c
++++ b/fs/xfs/xfs_log.c
+@@ -3421,7 +3421,7 @@ xfs_log_force(
+  * sv.
+  */
+ int
+-_xfs_log_force_lsn(
++xfs_log_force_lsn(
+ 	struct xfs_mount	*mp,
+ 	xfs_lsn_t		lsn,
+ 	uint			flags,
+@@ -3434,6 +3434,7 @@ _xfs_log_force_lsn(
+ 	ASSERT(lsn != 0);
+ 
+ 	XFS_STATS_INC(mp, xs_log_force);
++	trace_xfs_log_force(mp, lsn, _RET_IP_);
+ 
+ 	lsn = xlog_cil_force_lsn(log, lsn);
+ 	if (lsn == NULLCOMMITLSN)
+@@ -3530,21 +3531,6 @@ try_again:
+ 	return 0;
+ }
+ 
+-/*
+- * Wrapper for _xfs_log_force_lsn(), to be used when caller doesn't care
+- * about errors or whether the log was flushed or not. This is the normal
+- * interface to use when trying to unpin items or move the log forward.
+- */
+-void
+-xfs_log_force_lsn(
+-	xfs_mount_t	*mp,
+-	xfs_lsn_t	lsn,
+-	uint		flags)
+-{
+-	trace_xfs_log_force(mp, lsn, _RET_IP_);
+-	_xfs_log_force_lsn(mp, lsn, flags, NULL);
+-}
+-
+ /*
+  * Called when we want to mark the current iclog as being ready to sync to
+  * disk.
+* Unmerged path fs/xfs/xfs_log.h
+diff --git a/fs/xfs/xfs_trans.c b/fs/xfs/xfs_trans.c
+index 7489319ad0b8..225eff7ace4f 100644
+--- a/fs/xfs/xfs_trans.c
++++ b/fs/xfs/xfs_trans.c
+@@ -927,7 +927,7 @@ __xfs_trans_commit(
+ 	 * log out now and wait for it.
+ 	 */
+ 	if (sync) {
+-		error = _xfs_log_force_lsn(mp, commit_lsn, XFS_LOG_SYNC, NULL);
++		error = xfs_log_force_lsn(mp, commit_lsn, XFS_LOG_SYNC, NULL);
+ 		XFS_STATS_INC(mp, xs_trans_sync);
+ 	} else {
+ 		XFS_STATS_INC(mp, xs_trans_async);
