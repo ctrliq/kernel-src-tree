@@ -1,0 +1,173 @@
+mlxsw: spectrum_router: Add loopback accessors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Petr Machata <petrm@mellanox.com>
+commit 92107cfb411f5371bee56d9a13d28ef8b40bbbbc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/92107cfb.failed
+
+struct mlxsw_sp_rif is a router-private structure, and therefore
+everything related to it is as well: parameters, and derived RIF types
+including loopbacks. IPIP module needs access to some details of
+loopback interfaces, but exporting all the RIF shebang would create too
+large an interface.
+
+So instead export just the bare minimum necessary: accessors for RIF
+index and underlay VRF ID.
+
+	Signed-off-by: Petr Machata <petrm@mellanox.com>
+	Reviewed-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 92107cfb411f5371bee56d9a13d28ef8b40bbbbc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+index 2055c8543e7b,6068eea8152f..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+@@@ -2888,68 -4939,87 +2888,98 @@@ static bool mlxsw_sp_rif_should_config(
+  	return false;
+  }
+  
+ -static enum mlxsw_sp_rif_type
+ -mlxsw_sp_dev_rif_type(const struct mlxsw_sp *mlxsw_sp,
+ -		      const struct net_device *dev)
+ +#define MLXSW_SP_INVALID_RIF 0xffff
+ +static int mlxsw_sp_avail_rif_get(struct mlxsw_sp *mlxsw_sp)
+  {
+ -	enum mlxsw_sp_fid_type type;
+ +	int i;
+  
+ -	if (mlxsw_sp_netdev_ipip_type(mlxsw_sp, dev, NULL))
+ -		return MLXSW_SP_RIF_TYPE_IPIP_LB;
+ +	for (i = 0; i < MLXSW_CORE_RES_GET(mlxsw_sp->core, MAX_RIFS); i++)
+ +		if (!mlxsw_sp->rifs[i])
+ +			return i;
+  
+ -	/* Otherwise RIF type is derived from the type of the underlying FID. */
+ -	if (is_vlan_dev(dev) && netif_is_bridge_master(vlan_dev_real_dev(dev)))
+ -		type = MLXSW_SP_FID_TYPE_8021Q;
+ -	else if (netif_is_bridge_master(dev) && br_vlan_enabled(dev))
+ -		type = MLXSW_SP_FID_TYPE_8021Q;
+ -	else if (netif_is_bridge_master(dev))
+ -		type = MLXSW_SP_FID_TYPE_8021D;
+ -	else
+ -		type = MLXSW_SP_FID_TYPE_RFID;
+ +	return MLXSW_SP_INVALID_RIF;
+ +}
+ +
+ +static void mlxsw_sp_vport_rif_sp_attr_get(struct mlxsw_sp_port *mlxsw_sp_vport,
+ +					   bool *p_lagged, u16 *p_system_port)
+ +{
+ +	u8 local_port = mlxsw_sp_vport->local_port;
+  
+ -	return mlxsw_sp_fid_type_rif_type(mlxsw_sp, type);
+ +	*p_lagged = mlxsw_sp_vport->lagged;
+ +	*p_system_port = *p_lagged ? mlxsw_sp_vport->lag_id : local_port;
+  }
+  
+ -static int mlxsw_sp_rif_index_alloc(struct mlxsw_sp *mlxsw_sp, u16 *p_rif_index)
+ +static int mlxsw_sp_vport_rif_sp_op(struct mlxsw_sp_port *mlxsw_sp_vport,
+ +				    u16 vr_id, struct net_device *l3_dev,
+ +				    u16 rif, bool create)
+  {
+ -	int i;
+ +	struct mlxsw_sp *mlxsw_sp = mlxsw_sp_vport->mlxsw_sp;
+ +	bool lagged = mlxsw_sp_vport->lagged;
+ +	char ritr_pl[MLXSW_REG_RITR_LEN];
+ +	u16 system_port;
+  
+ -	for (i = 0; i < MLXSW_CORE_RES_GET(mlxsw_sp->core, MAX_RIFS); i++) {
+ -		if (!mlxsw_sp->router->rifs[i]) {
+ -			*p_rif_index = i;
+ -			return 0;
+ -		}
+ -	}
+ +	mlxsw_reg_ritr_pack(ritr_pl, create, MLXSW_REG_RITR_SP_IF, rif, vr_id,
+ +			    l3_dev->mtu, l3_dev->dev_addr);
+  
+ -	return -ENOBUFS;
+ +	mlxsw_sp_vport_rif_sp_attr_get(mlxsw_sp_vport, &lagged, &system_port);
+ +	mlxsw_reg_ritr_sp_if_pack(ritr_pl, lagged, system_port,
+ +				  mlxsw_sp_vport_vid_get(mlxsw_sp_vport));
+ +
+ +	return mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(ritr), ritr_pl);
+ +}
+ +
+ +static void mlxsw_sp_vport_rif_sp_leave(struct mlxsw_sp_port *mlxsw_sp_vport);
+ +
+ +static u16 mlxsw_sp_rif_sp_to_fid(u16 rif)
+ +{
+ +	return MLXSW_SP_RFID_BASE + rif;
+  }
+  
+ -static struct mlxsw_sp_rif *mlxsw_sp_rif_alloc(size_t rif_size, u16 rif_index,
+ -					       u16 vr_id,
+ -					       struct net_device *l3_dev)
+ +static struct mlxsw_sp_fid *
+ +mlxsw_sp_rfid_alloc(u16 fid, struct net_device *l3_dev)
+  {
+ -	struct mlxsw_sp_rif *rif;
+ +	struct mlxsw_sp_fid *f;
+  
+ -	rif = kzalloc(rif_size, GFP_KERNEL);
+ -	if (!rif)
+ +	f = kzalloc(sizeof(*f), GFP_KERNEL);
+ +	if (!f)
+  		return NULL;
+  
+ -	INIT_LIST_HEAD(&rif->nexthop_list);
+ -	INIT_LIST_HEAD(&rif->neigh_list);
+ -	ether_addr_copy(rif->addr, l3_dev->dev_addr);
+ -	rif->mtu = l3_dev->mtu;
+ -	rif->vr_id = vr_id;
+ -	rif->dev = l3_dev;
+ -	rif->rif_index = rif_index;
+ +	f->leave = mlxsw_sp_vport_rif_sp_leave;
+ +	f->ref_count = 0;
+ +	f->dev = l3_dev;
+ +	f->fid = fid;
+  
+++<<<<<<< HEAD
+ +	return f;
+++=======
++ 	return rif;
++ }
++ 
++ struct mlxsw_sp_rif *mlxsw_sp_rif_by_index(const struct mlxsw_sp *mlxsw_sp,
++ 					   u16 rif_index)
++ {
++ 	return mlxsw_sp->router->rifs[rif_index];
++ }
++ 
++ u16 mlxsw_sp_rif_index(const struct mlxsw_sp_rif *rif)
++ {
++ 	return rif->rif_index;
++ }
++ 
++ u16 mlxsw_sp_ipip_lb_rif_index(const struct mlxsw_sp_rif_ipip_lb *lb_rif)
++ {
++ 	return lb_rif->common.rif_index;
++ }
++ 
++ u16 mlxsw_sp_ipip_lb_ul_vr_id(const struct mlxsw_sp_rif_ipip_lb *lb_rif)
++ {
++ 	return lb_rif->ul_vr_id;
++ }
++ 
++ int mlxsw_sp_rif_dev_ifindex(const struct mlxsw_sp_rif *rif)
++ {
++ 	return rif->dev->ifindex;
+++>>>>>>> 92107cfb411f (mlxsw: spectrum_router: Add loopback accessors)
+  }
+  
+  static struct mlxsw_sp_rif *
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
