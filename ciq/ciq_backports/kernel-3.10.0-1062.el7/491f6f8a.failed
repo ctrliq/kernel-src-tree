@@ -1,0 +1,170 @@
+xfs: use the state defines in xfs_bmap_del_extent_real
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 491f6f8abfa7a91d23b969be67ed476817bcefd7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/491f6f8a.failed
+
+Use the same defines as the other extent add and delete helpers, which
+both improves code readability and trace point output.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 491f6f8abfa7a91d23b969be67ed476817bcefd7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_bmap.c
+diff --cc fs/xfs/libxfs/xfs_bmap.c
+index 7800126fabda,fc052efb52f9..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@@ -4712,71 -5109,64 +4712,91 @@@ xfs_bmap_del_extent
+  	del_endoff = del->br_startoff + del->br_blockcount;
+  	got_endoff = got.br_startoff + got.br_blockcount;
+  	ASSERT(got_endoff >= del_endoff);
+ -	ASSERT(!isnullstartblock(got.br_startblock));
+ +	delay = isnullstartblock(got.br_startblock);
+ +	ASSERT(isnullstartblock(del->br_startblock) == delay);
+ +	flags = 0;
+  	qfield = 0;
+  	error = 0;
+ -
+  	/*
+ -	 * If it's the case where the directory code is running with no block
+ -	 * reservation, and the deleted block is in the middle of its extent,
+ -	 * and the resulting insert of an extent would cause transformation to
+ -	 * btree format, then reject it.  The calling code will then swap blocks
+ -	 * around instead.  We have to do this now, rather than waiting for the
+ -	 * conversion to btree format, since the transaction will be dirty then.
+ +	 * If deleting a real allocation, must free up the disk space.
+  	 */
+ -	if (tp->t_blk_res == 0 &&
+ -	    XFS_IFORK_FORMAT(ip, whichfork) == XFS_DINODE_FMT_EXTENTS &&
+ -	    XFS_IFORK_NEXTENTS(ip, whichfork) >=
+ -			XFS_IFORK_MAXEXT(ip, whichfork) &&
+ -	    del->br_startoff > got.br_startoff && del_endoff < got_endoff)
+ -		return -ENOSPC;
+ -
+ -	flags = XFS_ILOG_CORE;
+ -	if (whichfork == XFS_DATA_FORK && XFS_IS_REALTIME_INODE(ip)) {
+ -		xfs_fsblock_t	bno;
+ -		xfs_filblks_t	len;
+ -
+ -		ASSERT(do_mod(del->br_blockcount, mp->m_sb.sb_rextsize) == 0);
+ -		ASSERT(do_mod(del->br_startblock, mp->m_sb.sb_rextsize) == 0);
+ -		bno = del->br_startblock;
+ -		len = del->br_blockcount;
+ -		do_div(bno, mp->m_sb.sb_rextsize);
+ -		do_div(len, mp->m_sb.sb_rextsize);
+ -		error = xfs_rtfree_extent(tp, bno, (xfs_extlen_t)len);
+ -		if (error)
+ -			goto done;
+ -		do_fx = 0;
+ -		nblks = len * mp->m_sb.sb_rextsize;
+ -		qfield = XFS_TRANS_DQ_RTBCOUNT;
+ -	} else {
+ -		do_fx = 1;
+ -		nblks = del->br_blockcount;
+ -		qfield = XFS_TRANS_DQ_BCOUNT;
+ -	}
+ -
+ -	del_endblock = del->br_startblock + del->br_blockcount;
+ -	if (cur) {
+ -		error = xfs_bmbt_lookup_eq(cur, got.br_startoff,
+ -				got.br_startblock, got.br_blockcount, &i);
+ -		if (error)
+ -			goto done;
+ -		XFS_WANT_CORRUPTED_GOTO(mp, i == 1, done);
+ -	}
+ -
+ -	if (got.br_startoff == del->br_startoff)
+ -		state |= BMAP_LEFT_FILLING;
+ -	if (got_endoff == del_endoff)
+ -		state |= BMAP_RIGHT_FILLING;
+ +	if (!delay) {
+ +		flags = XFS_ILOG_CORE;
+ +		/*
+ +		 * Realtime allocation.  Free it and record di_nblocks update.
+ +		 */
+ +		if (whichfork == XFS_DATA_FORK && XFS_IS_REALTIME_INODE(ip)) {
+ +			xfs_fsblock_t	bno;
+ +			xfs_filblks_t	len;
+ +
+ +			ASSERT(do_mod(del->br_blockcount,
+ +				      mp->m_sb.sb_rextsize) == 0);
+ +			ASSERT(do_mod(del->br_startblock,
+ +				      mp->m_sb.sb_rextsize) == 0);
+ +			bno = del->br_startblock;
+ +			len = del->br_blockcount;
+ +			do_div(bno, mp->m_sb.sb_rextsize);
+ +			do_div(len, mp->m_sb.sb_rextsize);
+ +			error = xfs_rtfree_extent(tp, bno, (xfs_extlen_t)len);
+ +			if (error)
+ +				goto done;
+ +			do_fx = 0;
+ +			nblks = len * mp->m_sb.sb_rextsize;
+ +			qfield = XFS_TRANS_DQ_RTBCOUNT;
+ +		}
+ +		/*
+ +		 * Ordinary allocation.
+ +		 */
+ +		else {
+ +			do_fx = 1;
+ +			nblks = del->br_blockcount;
+ +			qfield = XFS_TRANS_DQ_BCOUNT;
+ +		}
+ +		/*
+ +		 * Set up del_endblock and cur for later.
+ +		 */
+ +		del_endblock = del->br_startblock + del->br_blockcount;
+ +		if (cur) {
+ +			if ((error = xfs_bmbt_lookup_eq(cur, got.br_startoff,
+ +					got.br_startblock, got.br_blockcount,
+ +					&i)))
+ +				goto done;
+ +			XFS_WANT_CORRUPTED_GOTO(mp, i == 1, done);
+ +		}
+ +		da_old = da_new = 0;
+ +	} else {
+ +		da_old = startblockval(got.br_startblock);
+ +		da_new = 0;
+ +		nblks = 0;
+ +		do_fx = 0;
+ +	}
+++<<<<<<< HEAD
+ +	/*
+ +	 * Set flag value to use in switch statement.
+ +	 * Left-contig is 2, right-contig is 1.
+ +	 */
+ +	switch (((got.br_startoff == del->br_startoff) << 1) |
+ +		(got_endoff == del_endoff)) {
+ +	case 3:
+++=======
+++
+++	del_endblock = del->br_startblock + del->br_blockcount;
+++	if (cur) {
+++		error = xfs_bmbt_lookup_eq(cur, got.br_startoff,
+++				got.br_startblock, got.br_blockcount, &i);
+++		if (error)
+++			goto done;
+++		XFS_WANT_CORRUPTED_GOTO(mp, i == 1, done);
+++	}
+++
+++	if (got.br_startoff == del->br_startoff)
+++		state |= BMAP_LEFT_FILLING;
+++	if (got_endoff == del_endoff)
+++		state |= BMAP_RIGHT_FILLING;
++ 
++ 	switch (state & (BMAP_LEFT_FILLING | BMAP_RIGHT_FILLING)) {
++ 	case BMAP_LEFT_FILLING | BMAP_RIGHT_FILLING:
+++>>>>>>> 491f6f8abfa7 (xfs: use the state defines in xfs_bmap_del_extent_real)
+  		/*
+  		 * Matches the whole extent.  Delete the entry.
+  		 */
+* Unmerged path fs/xfs/libxfs/xfs_bmap.c
