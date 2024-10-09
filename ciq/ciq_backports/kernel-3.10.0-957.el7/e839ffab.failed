@@ -1,0 +1,997 @@
+Input: synaptics - add support for Intertouch devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [input] synaptics - add support for Intertouch devices (Benjamin Tissoires) [1554926]
+Rebuild_FUZZ: 92.93%
+commit-author Benjamin Tissoires <benjamin.tissoires@redhat.com>
+commit e839ffab028981ac77f650faf8c84f16e1719738
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/e839ffab.failed
+
+Most of the Synaptics devices are connected through PS/2 and a different
+bus (SMBus or HID over I2C). The secondary bus capability is indicated by
+the InterTouch bit in extended capability 0x0C.
+
+We only enable the InterTouch device to be created for the laptops
+registered with the top software button property or those we know that are
+functional. In the future, we might change the default to always rely on
+the InterTouch bus. Currently, users can enable/disable the feature with
+the psmouse parameter synaptics_intertouch.
+
+	Signed-off-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+	Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+(cherry picked from commit e839ffab028981ac77f650faf8c84f16e1719738)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/input/mouse/psmouse-base.c
+#	drivers/input/mouse/psmouse.h
+#	drivers/input/mouse/synaptics.c
+diff --cc drivers/input/mouse/psmouse-base.c
+index 689f85d37ffb,f73b47b8c578..000000000000
+--- a/drivers/input/mouse/psmouse-base.c
++++ b/drivers/input/mouse/psmouse-base.c
+@@@ -1132,6 -934,282 +1142,285 @@@ static const struct psmouse_protocol *p
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Apply default settings to the psmouse structure. Most of them will
++  * be overridden by individual protocol initialization routines.
++  */
++ static void psmouse_apply_defaults(struct psmouse *psmouse)
++ {
++ 	struct input_dev *input_dev = psmouse->dev;
++ 
++ 	memset(input_dev->evbit, 0, sizeof(input_dev->evbit));
++ 	memset(input_dev->keybit, 0, sizeof(input_dev->keybit));
++ 	memset(input_dev->relbit, 0, sizeof(input_dev->relbit));
++ 	memset(input_dev->absbit, 0, sizeof(input_dev->absbit));
++ 	memset(input_dev->mscbit, 0, sizeof(input_dev->mscbit));
++ 
++ 	__set_bit(EV_KEY, input_dev->evbit);
++ 	__set_bit(EV_REL, input_dev->evbit);
++ 
++ 	__set_bit(BTN_LEFT, input_dev->keybit);
++ 	__set_bit(BTN_RIGHT, input_dev->keybit);
++ 
++ 	__set_bit(REL_X, input_dev->relbit);
++ 	__set_bit(REL_Y, input_dev->relbit);
++ 
++ 	__set_bit(INPUT_PROP_POINTER, input_dev->propbit);
++ 
++ 	psmouse->protocol = &psmouse_protocols[0];
++ 
++ 	psmouse->set_rate = psmouse_set_rate;
++ 	psmouse->set_resolution = psmouse_set_resolution;
++ 	psmouse->set_scale = psmouse_set_scale;
++ 	psmouse->poll = psmouse_poll;
++ 	psmouse->protocol_handler = psmouse_process_byte;
++ 	psmouse->pktsize = 3;
++ 	psmouse->reconnect = NULL;
++ 	psmouse->fast_reconnect = NULL;
++ 	psmouse->disconnect = NULL;
++ 	psmouse->cleanup = NULL;
++ 	psmouse->pt_activate = NULL;
++ 	psmouse->pt_deactivate = NULL;
++ }
++ 
++ static bool psmouse_try_protocol(struct psmouse *psmouse,
++ 				 enum psmouse_type type,
++ 				 unsigned int *max_proto,
++ 				 bool set_properties, bool init_allowed)
++ {
++ 	const struct psmouse_protocol *proto;
++ 
++ 	proto = __psmouse_protocol_by_type(type);
++ 	if (!proto)
++ 		return false;
++ 
++ 	if (psmouse->ps2dev.serio->id.type == SERIO_PS_PSTHRU &&
++ 	    !proto->try_passthru) {
++ 		return false;
++ 	}
++ 
++ 	if (set_properties)
++ 		psmouse_apply_defaults(psmouse);
++ 
++ 	if (proto->detect(psmouse, set_properties) != 0)
++ 		return false;
++ 
++ 	if (set_properties && proto->init && init_allowed) {
++ 		if (proto->init(psmouse) != 0) {
++ 			/*
++ 			 * We detected device, but init failed. Adjust
++ 			 * max_proto so we only try standard protocols.
++ 			 */
++ 			if (*max_proto > PSMOUSE_IMEX)
++ 				*max_proto = PSMOUSE_IMEX;
++ 
++ 			return false;
++ 		}
++ 	}
++ 
++ 	return true;
++ }
++ 
++ /*
++  * psmouse_extensions() probes for any extensions to the basic PS/2 protocol
++  * the mouse may have.
++  */
++ static int psmouse_extensions(struct psmouse *psmouse,
++ 			      unsigned int max_proto, bool set_properties)
++ {
++ 	bool synaptics_hardware = false;
++ 	int ret;
++ 
++ 	/*
++ 	 * Always check for focaltech, this is safe as it uses pnp-id
++ 	 * matching.
++ 	 */
++ 	if (psmouse_try_protocol(psmouse, PSMOUSE_FOCALTECH,
++ 				 &max_proto, set_properties, false)) {
++ 		if (max_proto > PSMOUSE_IMEX &&
++ 		    IS_ENABLED(CONFIG_MOUSE_PS2_FOCALTECH) &&
++ 		    (!set_properties || focaltech_init(psmouse) == 0)) {
++ 			return PSMOUSE_FOCALTECH;
++ 		}
++ 		/*
++ 		 * Restrict psmouse_max_proto so that psmouse_initialize()
++ 		 * does not try to reset rate and resolution, because even
++ 		 * that upsets the device.
++ 		 * This also causes us to basically fall through to basic
++ 		 * protocol detection, where we fully reset the mouse,
++ 		 * and set it up as bare PS/2 protocol device.
++ 		 */
++ 		psmouse_max_proto = max_proto = PSMOUSE_PS2;
++ 	}
++ 
++ 	/*
++ 	 * We always check for LifeBook because it does not disturb mouse
++ 	 * (it only checks DMI information).
++ 	 */
++ 	if (psmouse_try_protocol(psmouse, PSMOUSE_LIFEBOOK, &max_proto,
++ 				 set_properties, max_proto > PSMOUSE_IMEX))
++ 		return PSMOUSE_LIFEBOOK;
++ 
++ 	if (psmouse_try_protocol(psmouse, PSMOUSE_VMMOUSE, &max_proto,
++ 				 set_properties, max_proto > PSMOUSE_IMEX))
++ 		return PSMOUSE_VMMOUSE;
++ 
++ 	/*
++ 	 * Try Kensington ThinkingMouse (we try first, because Synaptics
++ 	 * probe upsets the ThinkingMouse).
++ 	 */
++ 	if (max_proto > PSMOUSE_IMEX &&
++ 	    psmouse_try_protocol(psmouse, PSMOUSE_THINKPS, &max_proto,
++ 				 set_properties, true)) {
++ 		return PSMOUSE_THINKPS;
++ 	}
++ 
++ 	/*
++ 	 * Try Synaptics TouchPad. Note that probing is done even if
++ 	 * Synaptics protocol support is disabled in config - we need to
++ 	 * know if it is Synaptics so we can reset it properly after
++ 	 * probing for IntelliMouse.
++ 	 */
++ 	if (max_proto > PSMOUSE_PS2 &&
++ 	    psmouse_try_protocol(psmouse, PSMOUSE_SYNAPTICS, &max_proto,
++ 				 set_properties, false)) {
++ 		synaptics_hardware = true;
++ 
++ 		if (max_proto > PSMOUSE_IMEX) {
++ 			/*
++ 			 * Try activating protocol, but check if support is
++ 			 * enabled first, since we try detecting Synaptics
++ 			 * even when protocol is disabled.
++ 			 */
++ 			if (IS_ENABLED(CONFIG_MOUSE_PS2_SYNAPTICS) ||
++ 			    IS_ENABLED(CONFIG_MOUSE_PS2_SYNAPTICS_SMBUS)) {
++ 				if (!set_properties)
++ 					return PSMOUSE_SYNAPTICS;
++ 
++ 				ret = synaptics_init(psmouse);
++ 				if (ret >= 0)
++ 					return ret;
++ 			}
++ 
++ 			/*
++ 			 * Some Synaptics touchpads can emulate extended
++ 			 * protocols (like IMPS/2).  Unfortunately
++ 			 * Logitech/Genius probes confuse some firmware
++ 			 * versions so we'll have to skip them.
++ 			 */
++ 			max_proto = PSMOUSE_IMEX;
++ 		}
++ 
++ 		/*
++ 		 * Make sure that touchpad is in relative mode, gestures
++ 		 * (taps) are enabled.
++ 		 */
++ 		synaptics_reset(psmouse);
++ 	}
++ 
++ 	/*
++ 	 * Try Cypress Trackpad. We must try it before Finger Sensing Pad
++ 	 * because Finger Sensing Pad probe upsets some modules of Cypress
++ 	 * Trackpads.
++ 	 */
++ 	if (max_proto > PSMOUSE_IMEX &&
++ 	    psmouse_try_protocol(psmouse, PSMOUSE_CYPRESS, &max_proto,
++ 				 set_properties, true)) {
++ 		return PSMOUSE_CYPRESS;
++ 	}
++ 
++ 	/* Try ALPS TouchPad */
++ 	if (max_proto > PSMOUSE_IMEX) {
++ 		ps2_command(&psmouse->ps2dev, NULL, PSMOUSE_CMD_RESET_DIS);
++ 		if (psmouse_try_protocol(psmouse, PSMOUSE_ALPS,
++ 					 &max_proto, set_properties, true))
++ 			return PSMOUSE_ALPS;
++ 	}
++ 
++ 	/* Try OLPC HGPK touchpad */
++ 	if (max_proto > PSMOUSE_IMEX &&
++ 	    psmouse_try_protocol(psmouse, PSMOUSE_HGPK, &max_proto,
++ 				 set_properties, true)) {
++ 		return PSMOUSE_HGPK;
++ 	}
++ 
++ 	/* Try Elantech touchpad */
++ 	if (max_proto > PSMOUSE_IMEX &&
++ 	    psmouse_try_protocol(psmouse, PSMOUSE_ELANTECH,
++ 				 &max_proto, set_properties, true)) {
++ 		return PSMOUSE_ELANTECH;
++ 	}
++ 
++ 	if (max_proto > PSMOUSE_IMEX) {
++ 		if (psmouse_try_protocol(psmouse, PSMOUSE_GENPS,
++ 					 &max_proto, set_properties, true))
++ 			return PSMOUSE_GENPS;
++ 
++ 		if (psmouse_try_protocol(psmouse, PSMOUSE_PS2PP,
++ 					 &max_proto, set_properties, true))
++ 			return PSMOUSE_PS2PP;
++ 
++ 		if (psmouse_try_protocol(psmouse, PSMOUSE_TRACKPOINT,
++ 					 &max_proto, set_properties, true))
++ 			return PSMOUSE_TRACKPOINT;
++ 
++ 		if (psmouse_try_protocol(psmouse, PSMOUSE_TOUCHKIT_PS2,
++ 					 &max_proto, set_properties, true))
++ 			return PSMOUSE_TOUCHKIT_PS2;
++ 	}
++ 
++ 	/*
++ 	 * Try Finger Sensing Pad. We do it here because its probe upsets
++ 	 * Trackpoint devices (causing TP_READ_ID command to time out).
++ 	 */
++ 	if (max_proto > PSMOUSE_IMEX &&
++ 	    psmouse_try_protocol(psmouse, PSMOUSE_FSP,
++ 				 &max_proto, set_properties, true)) {
++ 		return PSMOUSE_FSP;
++ 	}
++ 
++ 	/*
++ 	 * Reset to defaults in case the device got confused by extended
++ 	 * protocol probes. Note that we follow up with full reset because
++ 	 * some mice put themselves to sleep when they see PSMOUSE_RESET_DIS.
++ 	 */
++ 	ps2_command(&psmouse->ps2dev, NULL, PSMOUSE_CMD_RESET_DIS);
++ 	psmouse_reset(psmouse);
++ 
++ 	if (max_proto >= PSMOUSE_IMEX &&
++ 	    psmouse_try_protocol(psmouse, PSMOUSE_IMEX,
++ 				 &max_proto, set_properties, true)) {
++ 		return PSMOUSE_IMEX;
++ 	}
++ 
++ 	if (max_proto >= PSMOUSE_IMPS &&
++ 	    psmouse_try_protocol(psmouse, PSMOUSE_IMPS,
++ 				 &max_proto, set_properties, true)) {
++ 		return PSMOUSE_IMPS;
++ 	}
++ 
++ 	/*
++ 	 * Okay, all failed, we have a standard mouse here. The number of
++ 	 * the buttons is still a question, though. We assume 3.
++ 	 */
++ 	psmouse_try_protocol(psmouse, PSMOUSE_PS2,
++ 			     &max_proto, set_properties, true);
++ 
++ 	if (synaptics_hardware) {
++ 		/*
++ 		 * We detected Synaptics hardware but it did not respond to
++ 		 * IMPS/2 probes.  We need to reset the touchpad because if
++ 		 * there is a track point on the pass through port it could
++ 		 * get disabled while probing for protocol extensions.
++ 		 */
++ 		psmouse_reset(psmouse);
++ 	}
++ 
++ 	return PSMOUSE_PS2;
++ }
+++>>>>>>> e839ffab0289 (Input: synaptics - add support for Intertouch devices)
+  
+  /*
+   * psmouse_probe() probes for a PS/2 mouse.
+diff --cc drivers/input/mouse/psmouse.h
+index c01433fafba8,38855e425f01..000000000000
+--- a/drivers/input/mouse/psmouse.h
++++ b/drivers/input/mouse/psmouse.h
+@@@ -82,29 -128,6 +82,34 @@@ struct psmouse 
+  	void (*pt_deactivate)(struct psmouse *psmouse);
+  };
+  
+ +enum psmouse_type {
+ +	PSMOUSE_NONE,
+ +	PSMOUSE_PS2,
+ +	PSMOUSE_PS2PP,
+ +	PSMOUSE_THINKPS,
+ +	PSMOUSE_GENPS,
+ +	PSMOUSE_IMPS,
+ +	PSMOUSE_IMEX,
+ +	PSMOUSE_SYNAPTICS,
+ +	PSMOUSE_ALPS,
+ +	PSMOUSE_LIFEBOOK,
+ +	PSMOUSE_TRACKPOINT,
+ +	PSMOUSE_TOUCHKIT_PS2,
+ +	PSMOUSE_CORTRON,
+ +	PSMOUSE_HGPK,
+ +	PSMOUSE_ELANTECH,
+ +	PSMOUSE_FSP,
+ +	PSMOUSE_SYNAPTICS_RELATIVE,
+ +	PSMOUSE_CYPRESS,
+ +	PSMOUSE_VMMOUSE,
+++<<<<<<< HEAD
+++=======
+++	PSMOUSE_BYD,
+++	PSMOUSE_SYNAPTICS_SMBUS,
+++>>>>>>> e839ffab0289 (Input: synaptics - add support for Intertouch devices)
+ +	PSMOUSE_AUTO		/* This one should always be last */
+ +};
+ +
+  void psmouse_queue_work(struct psmouse *psmouse, struct delayed_work *work,
+  		unsigned long delay);
+  int psmouse_sliced_command(struct psmouse *psmouse, unsigned char command);
+diff --cc drivers/input/mouse/synaptics.c
+index 5f5887ef5b0a,d494c6c6aadc..000000000000
+--- a/drivers/input/mouse/synaptics.c
++++ b/drivers/input/mouse/synaptics.c
+@@@ -116,47 -121,8 +118,52 @@@ void synaptics_reset(struct psmouse *ps
+  	synaptics_mode_cmd(psmouse, 0);
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_MOUSE_PS2_SYNAPTICS
+ +
+ +#define ANY_BOARD_ID 0
+ +struct min_max_quirk {
+ +	const char * const *pnp_ids;
+ +	struct {
+ +		unsigned long int min, max;
+ +	} board_id;
+ +	int x_min, x_max, y_min, y_max;
+ +};
+ +
+ +static const struct min_max_quirk min_max_pnpid_table[] = {
+ +	{
+ +		(const char * const []){"LEN0033", NULL},
+ +		{ANY_BOARD_ID, ANY_BOARD_ID},
+ +		1024, 5052, 2258, 4832
+ +	},
+ +	{
+ +		(const char * const []){"LEN0042", NULL},
+ +		{ANY_BOARD_ID, ANY_BOARD_ID},
+ +		1232, 5710, 1156, 4696
+ +	},
+ +	{
+ +		(const char * const []){"LEN0034", "LEN0036", "LEN0037",
+ +					"LEN0039", "LEN2002", "LEN2004",
+ +					NULL},
+ +		{ANY_BOARD_ID, 2961},
+ +		1024, 5112, 2024, 4832
+ +	},
+ +	{
+ +		(const char * const []){"LEN2001", NULL},
+ +		{ANY_BOARD_ID, ANY_BOARD_ID},
+ +		1024, 5022, 2508, 4832
+ +	},
+ +	{
+ +		(const char * const []){"LEN2006", NULL},
+ +		{ANY_BOARD_ID, ANY_BOARD_ID},
+ +		1264, 5675, 1171, 4688
+ +	},
+ +	{ }
+ +};
+++=======
++ #if defined(CONFIG_MOUSE_PS2_SYNAPTICS) || \
++     defined(CONFIG_MOUSE_PS2_SYNAPTICS_SMBUS)
+++>>>>>>> e839ffab0289 (Input: synaptics - add support for Intertouch devices)
+  
+  /* This list has been kindly provided by Synaptics. */
+  static const char * const topbuttonpad_pnp_ids[] = {
+@@@ -196,19 -162,14 +203,30 @@@
+  	NULL
+  };
+  
+++<<<<<<< HEAD
+ +/*****************************************************************************
+ + *	Synaptics communications functions
+ + ****************************************************************************/
+ +
+ +/*
+ + * Synaptics touchpads report the y coordinate from bottom to top, which is
+ + * opposite from what userspace expects.
+ + * This function is used to invert y before reporting.
+ + */
+ +static int synaptics_invert_y(int y)
+ +{
+ +	return YMAX_NOMINAL + YMIN_NOMINAL - y;
+ +}
+++=======
++ static const char * const smbus_pnp_ids[] = {
++ 	/* all of the topbuttonpad_pnp_ids are valid, we just add some extras */
++ 	"LEN0048", /* X1 Carbon 3 */
++ 	"LEN0046", /* X250 */
++ 	"LEN004a", /* W541 */
++ 	"LEN200f", /* T450s */
++ 	NULL
++ };
+++>>>>>>> e839ffab0289 (Input: synaptics - add support for Intertouch devices)
+  
+  /*
+   * Send a command to the synpatics touchpad by special commands
+@@@ -237,16 -226,34 +280,38 @@@ static int synaptics_model_id(struct ps
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int synaptics_more_extended_queries(struct psmouse *psmouse)
+++=======
++ /*
++  * Read the firmware id from the touchpad
++  */
++ static int synaptics_firmware_id(struct psmouse *psmouse,
++ 				 struct synaptics_device_info *info)
++ {
++ 	unsigned char fwid[3];
++ 	int error;
++ 
++ 	error = synaptics_send_cmd(psmouse, SYN_QUE_FIRMWARE_ID, fwid);
++ 	if (error)
++ 		return error;
++ 
++ 	info->firmware_id = (fwid[0] << 16) | (fwid[1] << 8) | fwid[2];
++ 	return 0;
++ }
++ 
++ static int synaptics_more_extended_queries(struct psmouse *psmouse,
++ 					   struct synaptics_device_info *info)
+++>>>>>>> e839ffab0289 (Input: synaptics - add support for Intertouch devices)
+  {
+ +	struct synaptics_data *priv = psmouse->private;
+  	unsigned char buf[3];
+ -	int error;
+  
+ -	error = synaptics_send_cmd(psmouse, SYN_QUE_MEXT_CAPAB_10, buf);
+ -	if (error)
+ -		return error;
+ +	if (synaptics_send_cmd(psmouse, SYN_QUE_MEXT_CAPAB_10, buf))
+ +		return -1;
+ +
+ +	priv->ext_cap_10 = (buf[0]<<16) | (buf[1]<<8) | buf[2];
+  
+ -	info->ext_cap_10 = (buf[0] << 16) | (buf[1] << 8) | buf[2];
+  	return 0;
+  }
+  
+@@@ -274,20 -284,6 +339,23 @@@ static int synaptics_query_modes(struc
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Read the firmware id from the touchpad
+ + */
+ +static int synaptics_firmware_id(struct psmouse *psmouse)
+ +{
+ +	struct synaptics_data *priv = psmouse->private;
+ +	unsigned char fwid[3];
+ +
+ +	if (synaptics_send_cmd(psmouse, SYN_QUE_FIRMWARE_ID, fwid))
+ +		return -1;
+ +	priv->firmware_id = (fwid[0] << 16) | (fwid[1] << 8) | fwid[2];
+ +	return 0;
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> e839ffab0289 (Input: synaptics - add support for Intertouch devices)
+   * Read the capability-bits from the touchpad
+   * see also the SYN_CAP_* macros
+   */
+@@@ -344,39 -344,23 +412,47 @@@ static int synaptics_capability(struct 
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Identify Touchpad
+ + * See also the SYN_ID_* macros
+ + */
+ +static int synaptics_identify(struct psmouse *psmouse)
+ +{
+ +	struct synaptics_data *priv = psmouse->private;
+ +	unsigned char id[3];
+ +
+ +	if (synaptics_send_cmd(psmouse, SYN_QUE_IDENTIFY, id))
+ +		return -1;
+ +	priv->identity = (id[0]<<16) | (id[1]<<8) | id[2];
+ +	if (SYN_ID_IS_SYNAPTICS(priv->identity))
+ +		return 0;
+ +	return -1;
+ +}
+ +
+ +/*
+ + * Read touchpad resolution and maximum reported coordinates
+ + * Resolution is left zero if touchpad does not support the query
+ + */
+ +
+ +static int synaptics_resolution(struct psmouse *psmouse)
+++=======
++  * Read touchpad resolution and maximum reported coordinates
++  * Resolution is left zero if touchpad does not support the query
++  */
++ static int synaptics_resolution(struct psmouse *psmouse,
++ 				struct synaptics_device_info *info)
+++>>>>>>> e839ffab0289 (Input: synaptics - add support for Intertouch devices)
+  {
+ +	struct synaptics_data *priv = psmouse->private;
+  	unsigned char resp[3];
+ -	int error;
+  
+ -	if (SYN_ID_MAJOR(info->identity) < 4)
+ +	if (SYN_ID_MAJOR(priv->identity) < 4)
+  		return 0;
+  
+ -	error = synaptics_send_cmd(psmouse, SYN_QUE_RESOLUTION, resp);
+ -	if (!error) {
+ +	if (synaptics_send_cmd(psmouse, SYN_QUE_RESOLUTION, resp) == 0) {
+  		if (resp[0] != 0 && (resp[1] & 0x80) && resp[2] != 0) {
+ -			info->x_res = resp[0]; /* x resolution in units/mm */
+ -			info->y_res = resp[2]; /* y resolution in units/mm */
+ +			priv->x_res = resp[0]; /* x resolution in units/mm */
+ +			priv->y_res = resp[2]; /* y resolution in units/mm */
+  		}
+  	}
+  
+@@@ -417,56 -405,34 +493,61 @@@
+  	return 0;
+  }
+  
+ -static int synaptics_query_hardware(struct psmouse *psmouse,
+ -				    struct synaptics_device_info *info)
+++<<<<<<< HEAD
+ +/*
+ + * Apply quirk(s) if the hardware matches
+ + */
+ +
+ +static void synaptics_apply_quirks(struct psmouse *psmouse)
+  {
+ -	int error;
+ +	struct synaptics_data *priv = psmouse->private;
+ +	int i;
+  
+ -	error = synaptics_identify(psmouse, info);
+ -	if (error)
+ -		return error;
+ +	for (i = 0; min_max_pnpid_table[i].pnp_ids; i++) {
+ +		if (!psmouse_matches_pnp_id(psmouse,
+ +					    min_max_pnpid_table[i].pnp_ids))
+ +			continue;
+  
+ -	error = synaptics_model_id(psmouse, info);
+ -	if (error)
+ -		return error;
+ +		if (min_max_pnpid_table[i].board_id.min != ANY_BOARD_ID &&
+ +		    priv->board_id < min_max_pnpid_table[i].board_id.min)
+ +			continue;
+  
+ -	error = synaptics_firmware_id(psmouse, info);
+ -	if (error)
+ -		return error;
+ +		if (min_max_pnpid_table[i].board_id.max != ANY_BOARD_ID &&
+ +		    priv->board_id > min_max_pnpid_table[i].board_id.max)
+ +			continue;
+  
+ -	error = synaptics_query_modes(psmouse, info);
+ -	if (error)
+ -		return error;
+ +		priv->x_min = min_max_pnpid_table[i].x_min;
+ +		priv->x_max = min_max_pnpid_table[i].x_max;
+ +		priv->y_min = min_max_pnpid_table[i].y_min;
+ +		priv->y_max = min_max_pnpid_table[i].y_max;
+ +		psmouse_info(psmouse,
+ +			     "quirked min/max coordinates: x [%d..%d], y [%d..%d]\n",
+ +			     priv->x_min, priv->x_max,
+ +			     priv->y_min, priv->y_max);
+ +		break;
+ +	}
+ +}
+  
+ -	error = synaptics_capability(psmouse, info);
+ -	if (error)
+ -		return error;
+ +static int synaptics_query_hardware(struct psmouse *psmouse)
+++=======
+++static int synaptics_query_hardware(struct psmouse *psmouse,
+++				    struct synaptics_device_info *info)
+++>>>>>>> e839ffab0289 (Input: synaptics - add support for Intertouch devices)
+ +{
+ +	if (synaptics_identify(psmouse))
+ +		return -1;
+ +	if (synaptics_model_id(psmouse))
+ +		return -1;
+ +	if (synaptics_firmware_id(psmouse))
+ +		return -1;
+ +	if (synaptics_query_modes(psmouse))
+ +		return -1;
+ +	if (synaptics_capability(psmouse))
+ +		return -1;
+ +	if (synaptics_resolution(psmouse))
+ +		return -1;
+  
+ -	error = synaptics_resolution(psmouse, info);
+ -	if (error)
+ -		return error;
+ +	synaptics_apply_quirks(psmouse);
+  
+  	return 0;
+  }
+@@@ -1560,7 -1356,14 +1751,18 @@@ static void synaptics_disconnect(struc
+  {
+  	struct synaptics_data *priv = psmouse->private;
+  
+++<<<<<<< HEAD
+ +	if (!priv->absolute_mode && SYN_ID_DISGEST_SUPPORTED(priv->identity))
+++=======
++ 	/*
++ 	 * We might have left a breadcrumb when trying to
++ 	 * set up SMbus companion.
++ 	 */
++ 	psmouse_smbus_cleanup(psmouse);
++ 
++ 	if (!priv->absolute_mode &&
++ 			SYN_ID_DISGEST_SUPPORTED(priv->info.identity))
+++>>>>>>> e839ffab0289 (Input: synaptics - add support for Intertouch devices)
+  		device_remove_file(&psmouse->ps2dev.serio->dev,
+  				   &psmouse_attr_disable_gesture.dattr);
+  
+@@@ -1683,41 -1499,35 +1885,52 @@@ void __init synaptics_module_init(void
+  {
+  	impaired_toshiba_kbc = dmi_check_system(toshiba_dmi_table);
+  	broken_olpc_ec = dmi_check_system(olpc_dmi_table);
+ -	cr48_profile_sensor = dmi_check_system(cr48_dmi_table);
+  }
+  
+- static int __synaptics_init(struct psmouse *psmouse, bool absolute_mode)
++ static int synaptics_init_ps2(struct psmouse *psmouse,
++ 			      struct synaptics_device_info *info,
++ 			      bool absolute_mode)
+  {
+  	struct synaptics_data *priv;
+++<<<<<<< HEAD
+ +	int err = -1;
+++=======
++ 	int err;
+++>>>>>>> e839ffab0289 (Input: synaptics - add support for Intertouch devices)
+  
+- 	/*
+- 	 * The OLPC XO has issues with Synaptics' absolute mode; the constant
+- 	 * packet spew overloads the EC such that key presses on the keyboard
+- 	 * are missed.  Given that, don't even attempt to use Absolute mode.
+- 	 * Relative mode seems to work just fine.
+- 	 */
+- 	if (absolute_mode && broken_olpc_ec) {
+- 		psmouse_info(psmouse,
+- 			     "OLPC XO detected, not enabling Synaptics protocol.\n");
+- 		return -ENODEV;
+- 	}
++ 	synaptics_apply_quirks(psmouse, info);
+  
+  	psmouse->private = priv = kzalloc(sizeof(struct synaptics_data), GFP_KERNEL);
+  	if (!priv)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	psmouse_reset(psmouse);
+ +
+ +	if (synaptics_query_hardware(psmouse)) {
+ +		psmouse_err(psmouse, "Unable to query device.\n");
+ +		goto init_fail;
+ +	}
+ +
+++=======
++ 	priv->info = *info;
+++>>>>>>> e839ffab0289 (Input: synaptics - add support for Intertouch devices)
+  	priv->absolute_mode = absolute_mode;
+ -	if (SYN_ID_DISGEST_SUPPORTED(info->identity))
+ +	if (SYN_ID_DISGEST_SUPPORTED(priv->identity))
+  		priv->disable_gesture = true;
+  
+++<<<<<<< HEAD
+ +	if (synaptics_set_mode(psmouse)) {
+++=======
++ 	/*
++ 	 * Unfortunately ForcePad capability is not exported over PS/2,
++ 	 * so we have to resort to checking PNP IDs.
++ 	 */
++ 	priv->is_forcepad = psmouse_matches_pnp_id(psmouse, forcepad_pnp_ids);
++ 
++ 	err = synaptics_set_mode(psmouse);
++ 	if (err) {
+++>>>>>>> e839ffab0289 (Input: synaptics - add support for Intertouch devices)
+  		psmouse_err(psmouse, "Unable to initialize device.\n");
+  		goto init_fail;
+  	}
+@@@ -1803,9 -1630,29 +2032,35 @@@ int synaptics_init_relative(struct psmo
+  	return __synaptics_init(psmouse, false);
+  }
+  
+++<<<<<<< HEAD
+ +bool synaptics_supported(void)
+ +{
+ +	return true;
+++=======
++ static int synaptics_setup_ps2(struct psmouse *psmouse,
++ 			       struct synaptics_device_info *info)
++ {
++ 	bool absolute_mode = true;
++ 	int error;
++ 
++ 	/*
++ 	 * The OLPC XO has issues with Synaptics' absolute mode; the constant
++ 	 * packet spew overloads the EC such that key presses on the keyboard
++ 	 * are missed.  Given that, don't even attempt to use Absolute mode.
++ 	 * Relative mode seems to work just fine.
++ 	 */
++ 	if (broken_olpc_ec) {
++ 		psmouse_info(psmouse,
++ 			     "OLPC XO detected, forcing relative protocol.\n");
++ 		absolute_mode = false;
++ 	}
++ 
++ 	error = synaptics_init_ps2(psmouse, info, absolute_mode);
++ 	if (error)
++ 		return error;
++ 
++ 	return absolute_mode ? PSMOUSE_SYNAPTICS : PSMOUSE_SYNAPTICS_RELATIVE;
+++>>>>>>> e839ffab0289 (Input: synaptics - add support for Intertouch devices)
+  }
+  
+  #else /* CONFIG_MOUSE_PS2_SYNAPTICS */
+@@@ -1819,9 -1668,166 +2076,171 @@@ synaptics_setup_ps2(struct psmouse *psm
+  	return -ENOSYS;
+  }
+  
+ +bool synaptics_supported(void)
+ +{
+ +	return false;
+ +}
+ +
+  #endif /* CONFIG_MOUSE_PS2_SYNAPTICS */
++ 
++ #ifdef CONFIG_MOUSE_PS2_SYNAPTICS_SMBUS
++ 
++ /*
++  * The newest Synaptics device can use a secondary bus (called InterTouch) which
++  * provides a better bandwidth and allow a better control of the touchpads.
++  * This is used to decide if we need to use this bus or not.
++  */
++ enum {
++ 	SYNAPTICS_INTERTOUCH_NOT_SET = -1,
++ 	SYNAPTICS_INTERTOUCH_OFF,
++ 	SYNAPTICS_INTERTOUCH_ON,
++ };
++ 
++ static int synaptics_intertouch = SYNAPTICS_INTERTOUCH_NOT_SET;
++ module_param_named(synaptics_intertouch, synaptics_intertouch, int, 0644);
++ MODULE_PARM_DESC(synaptics_intertouch, "Use a secondary bus for the Synaptics device.");
++ 
++ static int synaptics_create_intertouch(struct psmouse *psmouse,
++ 				       struct synaptics_device_info *info,
++ 				       bool leave_breadcrumbs)
++ {
++ 	bool topbuttonpad =
++ 		psmouse_matches_pnp_id(psmouse, topbuttonpad_pnp_ids) &&
++ 		!SYN_CAP_EXT_BUTTONS_STICK(info->ext_cap_10);
++ 	const struct rmi_device_platform_data pdata = {
++ 		.sensor_pdata = {
++ 			.sensor_type = rmi_sensor_touchpad,
++ 			.axis_align.flip_y = true,
++ 			/* to prevent cursors jumps: */
++ 			.kernel_tracking = true,
++ 			.topbuttonpad = topbuttonpad,
++ 		},
++ 		.f30_data = {
++ 			.buttonpad = SYN_CAP_CLICKPAD(info->ext_cap_0c),
++ 			.trackstick_buttons =
++ 				!!SYN_CAP_EXT_BUTTONS_STICK(info->ext_cap_10),
++ 		},
++ 	};
++ 	const struct i2c_board_info intertouch_board = {
++ 		I2C_BOARD_INFO("rmi4_smbus", 0x2c),
++ 		.flags = I2C_CLIENT_HOST_NOTIFY,
++ 	};
++ 
++ 	return psmouse_smbus_init(psmouse, &intertouch_board,
++ 				  &pdata, sizeof(pdata),
++ 				  leave_breadcrumbs);
++ }
++ 
++ /**
++  * synaptics_setup_intertouch - called once the PS/2 devices are enumerated
++  * and decides to instantiate a SMBus InterTouch device.
++  */
++ static int synaptics_setup_intertouch(struct psmouse *psmouse,
++ 				      struct synaptics_device_info *info,
++ 				      bool leave_breadcrumbs)
++ {
++ 	int error;
++ 
++ 	if (synaptics_intertouch == SYNAPTICS_INTERTOUCH_OFF)
++ 		return -ENXIO;
++ 
++ 	if (synaptics_intertouch == SYNAPTICS_INTERTOUCH_NOT_SET) {
++ 		if (!psmouse_matches_pnp_id(psmouse, topbuttonpad_pnp_ids) &&
++ 		    !psmouse_matches_pnp_id(psmouse, smbus_pnp_ids))
++ 			return -ENXIO;
++ 	}
++ 
++ 	psmouse_info(psmouse, "Trying to set up SMBus access\n");
++ 
++ 	error = synaptics_create_intertouch(psmouse, info, leave_breadcrumbs);
++ 	if (error) {
++ 		if (error == -EAGAIN)
++ 			psmouse_info(psmouse, "SMbus companion is not ready yet\n");
++ 		else
++ 			psmouse_err(psmouse, "unable to create intertouch device\n");
++ 
++ 		return error;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int synaptics_init_smbus(struct psmouse *psmouse)
++ {
++ 	struct synaptics_device_info info;
++ 	int error;
++ 
++ 	psmouse_reset(psmouse);
++ 
++ 	error = synaptics_query_hardware(psmouse, &info);
++ 	if (error) {
++ 		psmouse_err(psmouse, "Unable to query device: %d\n", error);
++ 		return error;
++ 	}
++ 
++ 	if (!SYN_CAP_INTERTOUCH(info.ext_cap_0c))
++ 		return -ENXIO;
++ 
++ 	return synaptics_create_intertouch(psmouse, &info, false);
++ }
++ 
++ #else /* CONFIG_MOUSE_PS2_SYNAPTICS_SMBUS */
++ 
++ static int __maybe_unused
++ synaptics_setup_intertouch(struct psmouse *psmouse,
++ 			   struct synaptics_device_info *info,
++ 			   bool leave_breadcrumbs)
++ {
++ 	return -ENOSYS;
++ }
++ 
++ int synaptics_init_smbus(struct psmouse *psmouse)
++ {
++ 	return -ENOSYS;
++ }
++ 
++ #endif /* CONFIG_MOUSE_PS2_SYNAPTICS_SMBUS */
++ 
++ #if defined(CONFIG_MOUSE_PS2_SYNAPTICS) || \
++     defined(CONFIG_MOUSE_PS2_SYNAPTICS_SMBUS)
++ 
++ int synaptics_init(struct psmouse *psmouse)
++ {
++ 	struct synaptics_device_info info;
++ 	int error;
++ 	int retval;
++ 
++ 	psmouse_reset(psmouse);
++ 
++ 	error = synaptics_query_hardware(psmouse, &info);
++ 	if (error) {
++ 		psmouse_err(psmouse, "Unable to query device: %d\n", error);
++ 		return error;
++ 	}
++ 
++ 	if (SYN_CAP_INTERTOUCH(info.ext_cap_0c)) {
++ 		error = synaptics_setup_intertouch(psmouse, &info, true);
++ 		if (!error)
++ 			return PSMOUSE_SYNAPTICS_SMBUS;
++ 	}
++ 
++ 	retval = synaptics_setup_ps2(psmouse, &info);
++ 	if (retval < 0) {
++ 		/*
++ 		 * Not using any flavor of Synaptics support, so clean up
++ 		 * SMbus breadcrumbs, if any.
++ 		 */
++ 		psmouse_smbus_cleanup(psmouse);
++ 	}
++ 
++ 	return retval;
++ }
++ 
++ #else /* CONFIG_MOUSE_PS2_SYNAPTICS || CONFIG_MOUSE_PS2_SYNAPTICS_SMBUS */
++ 
++ int synaptics_init(struct psmouse *psmouse)
++ {
++ 	return -ENOSYS;
++ }
++ 
++ #endif /* CONFIG_MOUSE_PS2_SYNAPTICS || CONFIG_MOUSE_PS2_SYNAPTICS_SMBUS */
+diff --git a/drivers/input/mouse/Kconfig b/drivers/input/mouse/Kconfig
+index 7f2b97bee190..82cbd4f4a8c6 100644
+--- a/drivers/input/mouse/Kconfig
++++ b/drivers/input/mouse/Kconfig
+@@ -68,6 +68,18 @@ config MOUSE_PS2_SYNAPTICS
+ 
+ 	  If unsure, say Y.
+ 
++config MOUSE_PS2_SYNAPTICS_SMBUS
++	bool "Synaptics PS/2 SMbus companion" if EXPERT
++	default y
++	depends on MOUSE_PS2
++	depends on I2C=y || I2C=MOUSE_PS2
++	select MOUSE_PS2_SMBUS
++	help
++	  Say Y here if you have a Synaptics RMI4 touchpad connected to
++	  to an SMBus, but enumerated through PS/2.
++
++	  If unsure, say Y.
++
+ config MOUSE_PS2_CYPRESS
+        bool "Cypress PS/2 mouse protocol extension" if EXPERT
+        default y
+* Unmerged path drivers/input/mouse/psmouse-base.c
+* Unmerged path drivers/input/mouse/psmouse.h
+* Unmerged path drivers/input/mouse/synaptics.c
+diff --git a/drivers/input/mouse/synaptics.h b/drivers/input/mouse/synaptics.h
+index 1b0e490b1040..4ed2dcb2675d 100644
+--- a/drivers/input/mouse/synaptics.h
++++ b/drivers/input/mouse/synaptics.h
+@@ -88,6 +88,7 @@
+ #define SYN_CAP_ADV_GESTURE(ex0c)	((ex0c) & 0x080000)
+ #define SYN_CAP_REDUCED_FILTERING(ex0c)	((ex0c) & 0x000400)
+ #define SYN_CAP_IMAGE_SENSOR(ex0c)	((ex0c) & 0x000800)
++#define SYN_CAP_INTERTOUCH(ex0c)	((ex0c) & 0x004000)
+ 
+ /*
+  * The following descibes response for the 0x10 query.
+@@ -208,8 +209,10 @@ struct synaptics_data {
+ 
+ void synaptics_module_init(void);
+ int synaptics_detect(struct psmouse *psmouse, bool set_properties);
+-int synaptics_init(struct psmouse *psmouse);
++int synaptics_init_absolute(struct psmouse *psmouse);
+ int synaptics_init_relative(struct psmouse *psmouse);
++int synaptics_init_smbus(struct psmouse *psmouse);
++int synaptics_init(struct psmouse *psmouse);
+ void synaptics_reset(struct psmouse *psmouse);
+ bool synaptics_supported(void);
+ 
