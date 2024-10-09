@@ -1,0 +1,250 @@
+ACPI / DPTF: Add DPTF power participant driver
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+commit 6256ebd5daf93505f12b66916fb1b961b38f4cf2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6256ebd5.failed
+
+This driver adds support for Dynamic Platform and Thermal Framework
+(DPTF) Platform Power Participant device (INT3407) support.
+
+This participant is responsible for exposing platform telemetry such as:
+    max_platform_power
+    platform_power_source
+    adapter_rating
+    battery_steady_power
+    charger_type
+
+These attributes are presented via sysfs interface under the INT3407
+platform device:
+$ls /sys/bus/platform/devices/INT3407\:00/dptf_power/
+    adapter_rating_mw
+    battery_steady_power_mw
+    charger_type
+    max_platform_power_mw
+    platform_power_source
+    `
+ACPI methods description used in this driver:
+    PMAX: Maximum platform power that can be supported by the battery in
+          mW.
+    PSRC: System charge source,
+            0x00 = DC
+            0x01 = AC
+            0x02 = USB
+            0x03 = Wireless Charger
+    ARTG: Adapter rating in mW (Maximum Adapter power) Must be 0 if no
+          AC adapter is plugged in.
+    CTYP: Charger Type,
+            Traditional : 0x01
+            Hybrid: 0x02
+            NVDC: 0x03
+    PBSS: Returns max sustained power for battery in milliWatts.
+
+The INT3407 also contains _BTS and _BIX objects, which are compliant to
+ACPI 5.0, specification. Those objects are already used by ACPI battery
+(PNP0C0A) driver and information about them is exported via Linux power
+supply class registration.
+
+	Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 6256ebd5daf93505f12b66916fb1b961b38f4cf2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/Makefile
+diff --cc drivers/acpi/Makefile
+index a19b51ba2075,f6d0cc0fb4e1..000000000000
+--- a/drivers/acpi/Makefile
++++ b/drivers/acpi/Makefile
+@@@ -88,3 -95,10 +88,13 @@@ obj-$(CONFIG_ACPI_PROCESSOR_AGGREGATOR
+  obj-$(CONFIG_ACPI_APEI)		+= apei/
+  
+  obj-$(CONFIG_ACPI_EXTLOG)	+= acpi_extlog.o
+++<<<<<<< HEAD
+++=======
++ 
++ obj-$(CONFIG_PMIC_OPREGION)	+= pmic/intel_pmic.o
++ obj-$(CONFIG_CRC_PMIC_OPREGION) += pmic/intel_pmic_crc.o
++ obj-$(CONFIG_XPOWER_PMIC_OPREGION) += pmic/intel_pmic_xpower.o
++ 
++ video-objs			+= acpi_video.o video_detect.o
++ obj-y				+= dptf/
+++>>>>>>> 6256ebd5daf9 (ACPI / DPTF: Add DPTF power participant driver)
+diff --git a/drivers/acpi/Kconfig b/drivers/acpi/Kconfig
+index b498c958cc17..b3052a7694ac 100644
+--- a/drivers/acpi/Kconfig
++++ b/drivers/acpi/Kconfig
+@@ -380,6 +380,7 @@ config ACPI_BGRT
+ source "drivers/acpi/nfit/Kconfig"
+ 
+ source "drivers/acpi/apei/Kconfig"
++source "drivers/acpi/dptf/Kconfig"
+ 
+ config ACPI_EXTLOG
+ 	tristate "Extended Error Log support"
+* Unmerged path drivers/acpi/Makefile
+diff --git a/drivers/acpi/dptf/Kconfig b/drivers/acpi/dptf/Kconfig
+new file mode 100644
+index 000000000000..ac0a6ed0cf46
+--- /dev/null
++++ b/drivers/acpi/dptf/Kconfig
+@@ -0,0 +1,15 @@
++config DPTF_POWER
++	tristate "DPTF Platform Power Participant"
++	depends on X86
++	help
++	  This driver adds support for Dynamic Platform and Thermal Framework
++	  (DPTF) Platform Power Participant device (INT3407) support.
++	  This participant is responsible for exposing platform telemetry:
++		max_platform_power
++		platform_power_source
++		adapter_rating
++		battery_steady_power
++		charger_type
++
++	  To compile this driver as a module, choose M here:
++	  the module will be called dptf_power.
+diff --git a/drivers/acpi/dptf/Makefile b/drivers/acpi/dptf/Makefile
+new file mode 100644
+index 000000000000..62cbe8753a19
+--- /dev/null
++++ b/drivers/acpi/dptf/Makefile
+@@ -0,0 +1 @@
++obj-$(CONFIG_DPTF_POWER)	+= dptf_power.o
+diff --git a/drivers/acpi/dptf/dptf_power.c b/drivers/acpi/dptf/dptf_power.c
+new file mode 100644
+index 000000000000..734642dc5008
+--- /dev/null
++++ b/drivers/acpi/dptf/dptf_power.c
+@@ -0,0 +1,128 @@
++/*
++ * dptf_power:  DPTF platform power driver
++ * Copyright (c) 2016, Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/acpi.h>
++#include <linux/platform_device.h>
++
++/*
++ * Presentation of attributes which are defined for INT3407. They are:
++ * PMAX : Maximum platform powe
++ * PSRC : Platform power source
++ * ARTG : Adapter rating
++ * CTYP : Charger type
++ * PBSS : Battery steady power
++ */
++#define DPTF_POWER_SHOW(name, object) \
++static ssize_t name##_show(struct device *dev,\
++			   struct device_attribute *attr,\
++			   char *buf)\
++{\
++	struct platform_device *pdev = to_platform_device(dev);\
++	struct acpi_device *acpi_dev = platform_get_drvdata(pdev);\
++	unsigned long long val;\
++	acpi_status status;\
++\
++	status = acpi_evaluate_integer(acpi_dev->handle, #object,\
++				       NULL, &val);\
++	if (ACPI_SUCCESS(status))\
++		return sprintf(buf, "%d\n", (int)val);\
++	else \
++		return -EINVAL;\
++}
++
++DPTF_POWER_SHOW(max_platform_power_mw, PMAX)
++DPTF_POWER_SHOW(platform_power_source, PSRC)
++DPTF_POWER_SHOW(adapter_rating_mw, ARTG)
++DPTF_POWER_SHOW(battery_steady_power_mw, PBSS)
++DPTF_POWER_SHOW(charger_type, CTYP)
++
++static DEVICE_ATTR_RO(max_platform_power_mw);
++static DEVICE_ATTR_RO(platform_power_source);
++static DEVICE_ATTR_RO(adapter_rating_mw);
++static DEVICE_ATTR_RO(battery_steady_power_mw);
++static DEVICE_ATTR_RO(charger_type);
++
++static struct attribute *dptf_power_attrs[] = {
++	&dev_attr_max_platform_power_mw.attr,
++	&dev_attr_platform_power_source.attr,
++	&dev_attr_adapter_rating_mw.attr,
++	&dev_attr_battery_steady_power_mw.attr,
++	&dev_attr_charger_type.attr,
++	NULL
++};
++
++static struct attribute_group dptf_power_attribute_group = {
++	.attrs = dptf_power_attrs,
++	.name = "dptf_power"
++};
++
++static int dptf_power_add(struct platform_device *pdev)
++{
++	struct acpi_device *acpi_dev;
++	acpi_status status;
++	unsigned long long ptype;
++	int result;
++
++	acpi_dev = ACPI_COMPANION(&(pdev->dev));
++	if (!acpi_dev)
++		return -ENODEV;
++
++	status = acpi_evaluate_integer(acpi_dev->handle, "PTYP", NULL, &ptype);
++	if (ACPI_FAILURE(status))
++		return -ENODEV;
++
++	if (ptype != 0x11)
++		return -ENODEV;
++
++	result = sysfs_create_group(&pdev->dev.kobj,
++				    &dptf_power_attribute_group);
++	if (result)
++		return result;
++
++	platform_set_drvdata(pdev, acpi_dev);
++
++	return 0;
++}
++
++static int dptf_power_remove(struct platform_device *pdev)
++{
++
++	sysfs_remove_group(&pdev->dev.kobj, &dptf_power_attribute_group);
++
++	return 0;
++}
++
++static const struct acpi_device_id int3407_device_ids[] = {
++	{"INT3407", 0},
++	{"", 0},
++};
++MODULE_DEVICE_TABLE(acpi, int3407_device_ids);
++
++static struct platform_driver dptf_power_driver = {
++	.probe = dptf_power_add,
++	.remove = dptf_power_remove,
++	.driver = {
++		.name = "DPTF Platform Power",
++		.acpi_match_table = int3407_device_ids,
++	},
++};
++
++module_platform_driver(dptf_power_driver);
++
++MODULE_AUTHOR("Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>");
++MODULE_LICENSE("GPL v2");
++MODULE_DESCRIPTION("ACPI DPTF platform power driver");
