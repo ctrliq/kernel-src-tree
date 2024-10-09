@@ -1,0 +1,160 @@
+iommu/vt-d: avoid dev iotlb logic for domains with no dev iotlbs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [iommu] vt-d: avoid dev iotlb logic for domains with no dev iotlbs (Jerry Snitselaar) [1519117]
+Rebuild_FUZZ: 95.08%
+commit-author Omer Peleg <omer@cs.technion.ac.il>
+commit 0824c5920b16fe11034f3b5d2d48456d282d83f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/0824c592.failed
+
+This patch avoids taking the device_domain_lock in iommu_flush_dev_iotlb()
+for domains with no dev iotlb devices.
+
+	Signed-off-by: Omer Peleg <omer@cs.technion.ac.il>
+[gvdl@google.com: fixed locking issues]
+	Signed-off-by: Godfrey van der Linden <gvdl@google.com>
+[mad@cs.technion.ac.il: rebased and reworded the commit message]
+	Signed-off-by: Adam Morrison <mad@cs.technion.ac.il>
+	Reviewed-by: Shaohua Li <shli@fb.com>
+	Reviewed-by: Ben Serebrin <serebrin@google.com>
+	Signed-off-by: David Woodhouse <David.Woodhouse@intel.com>
+(cherry picked from commit 0824c5920b16fe11034f3b5d2d48456d282d83f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-iommu.c
+diff --cc drivers/iommu/intel-iommu.c
+index 260597e4a50b,d100583e15e3..000000000000
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@@ -1446,20 -1462,32 +1447,43 @@@ iommu_support_dev_iotlb (struct dmar_do
+  			break;
+  		}
+  
+ -	return NULL;
+ +	if (!found || !info->dev || !dev_is_pci(info->dev))
+ +		return NULL;
+ +
+ +	pdev = to_pci_dev(info->dev);
+ +
+ +	if (!pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_ATS))
+ +		return NULL;
+ +
+ +	if (!dmar_find_matched_atsr_unit(pdev))
+ +		return NULL;
+ +
+ +	return info;
+  }
+  
++ static void domain_update_iotlb(struct dmar_domain *domain)
++ {
++ 	struct device_domain_info *info;
++ 	bool has_iotlb_device = false;
++ 
++ 	assert_spin_locked(&device_domain_lock);
++ 
++ 	list_for_each_entry(info, &domain->devices, link) {
++ 		struct pci_dev *pdev;
++ 
++ 		if (!info->dev || !dev_is_pci(info->dev))
++ 			continue;
++ 
++ 		pdev = to_pci_dev(info->dev);
++ 		if (pdev->ats_enabled) {
++ 			has_iotlb_device = true;
++ 			break;
++ 		}
++ 	}
++ 
++ 	domain->has_iotlb_device = has_iotlb_device;
++ }
++ 
+  static void iommu_enable_dev_iotlb(struct device_domain_info *info)
+  {
+  	struct pci_dev *pdev;
+@@@ -1468,20 -1498,52 +1494,67 @@@
+  		return;
+  
+  	pdev = to_pci_dev(info->dev);
+ +	if (pci_enable_ats(pdev, VTD_PAGE_SHIFT))
+ +		return;
+  
+++<<<<<<< HEAD
+ +	info->ats.enabled = 1;
+ +	info->ats.qdep = pci_ats_queue_depth(pdev);
+++=======
++ #ifdef CONFIG_INTEL_IOMMU_SVM
++ 	/* The PCIe spec, in its wisdom, declares that the behaviour of
++ 	   the device if you enable PASID support after ATS support is
++ 	   undefined. So always enable PASID support on devices which
++ 	   have it, even if we can't yet know if we're ever going to
++ 	   use it. */
++ 	if (info->pasid_supported && !pci_enable_pasid(pdev, info->pasid_supported & ~1))
++ 		info->pasid_enabled = 1;
++ 
++ 	if (info->pri_supported && !pci_reset_pri(pdev) && !pci_enable_pri(pdev, 32))
++ 		info->pri_enabled = 1;
++ #endif
++ 	if (info->ats_supported && !pci_enable_ats(pdev, VTD_PAGE_SHIFT)) {
++ 		info->ats_enabled = 1;
++ 		domain_update_iotlb(info->domain);
++ 		info->ats_qdep = pci_ats_queue_depth(pdev);
++ 	}
+++>>>>>>> 0824c5920b16 (iommu/vt-d: avoid dev iotlb logic for domains with no dev iotlbs)
+  }
+  
+  static void iommu_disable_dev_iotlb(struct device_domain_info *info)
+  {
+++<<<<<<< HEAD
+ +	if (!info->ats.enabled)
+ +		return;
+ +
+ +	pci_disable_ats(to_pci_dev(info->dev));
+ +	info->ats.enabled = 0;
+++=======
++ 	struct pci_dev *pdev;
++ 
++ 	assert_spin_locked(&device_domain_lock);
++ 
++ 	if (!dev_is_pci(info->dev))
++ 		return;
++ 
++ 	pdev = to_pci_dev(info->dev);
++ 
++ 	if (info->ats_enabled) {
++ 		pci_disable_ats(pdev);
++ 		info->ats_enabled = 0;
++ 		domain_update_iotlb(info->domain);
++ 	}
++ #ifdef CONFIG_INTEL_IOMMU_SVM
++ 	if (info->pri_enabled) {
++ 		pci_disable_pri(pdev);
++ 		info->pri_enabled = 0;
++ 	}
++ 	if (info->pasid_enabled) {
++ 		pci_disable_pasid(pdev);
++ 		info->pasid_enabled = 0;
++ 	}
++ #endif
+++>>>>>>> 0824c5920b16 (iommu/vt-d: avoid dev iotlb logic for domains with no dev iotlbs)
+  }
+  
+  static void iommu_flush_dev_iotlb(struct dmar_domain *domain,
+@@@ -1491,9 -1553,12 +1564,12 @@@
+  	unsigned long flags;
+  	struct device_domain_info *info;
+  
++ 	if (!domain->has_iotlb_device)
++ 		return;
++ 
+  	spin_lock_irqsave(&device_domain_lock, flags);
+  	list_for_each_entry(info, &domain->devices, link) {
+ -		if (!info->ats_enabled)
+ +		if (!info->ats.enabled)
+  			continue;
+  
+  		sid = info->bus << 8 | info->devfn;
+* Unmerged path drivers/iommu/intel-iommu.c
