@@ -319,6 +319,8 @@ xfs_file_dio_aio_read(
 		return -EINVAL;
 	}
 
+	file_accessed(iocb->ki_filp);
+
 	/*
 	 * Locking is a bit tricky here. If we take an exclusive lock for direct
 	 * IO, we effectively serialise all new concurrent read IO to this file
@@ -370,7 +372,6 @@ xfs_file_dio_aio_read(
 	}
 	xfs_rw_iunlock(ip, XFS_IOLOCK_SHARED);
 
-	file_accessed(iocb->ki_filp);
 	return ret;
 }
 
