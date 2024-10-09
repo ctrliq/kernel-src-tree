@@ -1,0 +1,87 @@
+scsi: qla2xxx: Fix double free bug after firmware timeout
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Fix double free bug after firmware timeout (Himanshu Madhani) [1547714]
+Rebuild_FUZZ: 94.44%
+commit-author Quinn Tran <quinn.tran@cavium.com>
+commit eaf75d1815dad230dac2f1e8f1dc0349b2d50071
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/eaf75d18.failed
+
+This patch is based on Max's original patch.
+
+When the qla2xxx firmware is unavailable, eventually
+qla2x00_sp_timeout() is reached, which calls the timeout function and
+frees the srb_t instance.
+
+The timeout function always resolves to qla2x00_async_iocb_timeout(),
+which invokes another callback function called "done".  All of these
+qla2x00_*_sp_done() callbacks also free the srb_t instance; after
+returning to qla2x00_sp_timeout(), it is freed again.
+
+The fix is to remove the "sp->free(sp)" call from qla2x00_sp_timeout()
+and add it to those code paths in qla2x00_async_iocb_timeout() which
+do not already free the object.
+
+This is how it looks like with KASAN:
+
+BUG: KASAN: use-after-free in qla2x00_sp_timeout+0x228/0x250
+Read of size 8 at addr ffff88278147a590 by task swapper/2/0
+
+Allocated by task 1502:
+save_stack+0x33/0xa0
+kasan_kmalloc+0xa0/0xd0
+kmem_cache_alloc+0xb8/0x1c0
+mempool_alloc+0xd6/0x260
+qla24xx_async_gnl+0x3c5/0x1100
+
+Freed by task 0:
+save_stack+0x33/0xa0
+kasan_slab_free+0x72/0xc0
+kmem_cache_free+0x75/0x200
+qla24xx_async_gnl_sp_done+0x556/0x9e0
+qla2x00_async_iocb_timeout+0x1c7/0x420
+qla2x00_sp_timeout+0x16d/0x250
+call_timer_fn+0x36/0x200
+
+The buggy address belongs to the object at ffff88278147a440
+which belongs to the cache qla2xxx_srbs of size 344
+The buggy address is located 336 bytes inside of
+344-byte region [ffff88278147a440, ffff88278147a598)
+
+	Reported-by: Max Kellermann <mk@cm4all.com>
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Cc: Max Kellermann <mk@cm4all.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit eaf75d1815dad230dac2f1e8f1dc0349b2d50071)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_init.c
+diff --cc drivers/scsi/qla2xxx/qla_init.c
+index 12e11bcce844,2dea1129d396..000000000000
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@@ -229,12 -220,10 +214,17 @@@ static voi
+  qla2x00_async_logout_sp_done(void *ptr, int res)
+  {
+  	srb_t *sp = ptr;
+- 	struct srb_iocb *lio = &sp->u.iocb_cmd;
+  
+++<<<<<<< HEAD
+ +	sp->fcport->flags &= ~FCF_ASYNC_SENT;
+ +	if (!test_bit(UNLOADING, &sp->vha->dpc_flags))
+ +		qla2x00_post_async_logout_done_work(sp->vha, sp->fcport,
+ +		    lio->u.logio.data);
+++=======
++ 	sp->fcport->flags &= ~(FCF_ASYNC_SENT | FCF_ASYNC_ACTIVE);
++ 	sp->fcport->login_gen++;
++ 	qlt_logo_completion_handler(sp->fcport, res);
+++>>>>>>> eaf75d1815da (scsi: qla2xxx: Fix double free bug after firmware timeout)
+  	sp->free(sp);
+  }
+  
+* Unmerged path drivers/scsi/qla2xxx/qla_init.c
