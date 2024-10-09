@@ -1,0 +1,195 @@
+tcmu: Fix possbile memory leak / OOPs when recalculating cmd base size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Xiubo Li <lixiubo@cmss.chinamobile.com>
+commit b3743c71b7c33a126d6d8942bb268775987400ec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b3743c71.failed
+
+For all the entries allocated from the ring cmd area, the memory is
+something like the stack memory, which will always reserve the old
+data, so the entry->req.iov_bidi_cnt maybe none zero.
+
+On some environments, the crash could be reproduce very easy and some
+not. The following is the crash core trace as reported by Damien:
+
+[  240.143969] CPU: 0 PID: 1285 Comm: iscsi_trx Not tainted 4.12.0-rc1+ #3
+[  240.150607] Hardware name: ASUS All Series/H87-PRO, BIOS 2104 10/28/2014
+[  240.157331] task: ffff8807de4f5800 task.stack: ffffc900047dc000
+[  240.163270] RIP: 0010:memcpy_erms+0x6/0x10
+[  240.167377] RSP: 0018:ffffc900047dfc68 EFLAGS: 00010202
+[  240.172621] RAX: ffffc9065db85540 RBX: ffff8807f7980000 RCX: 0000000000000010
+[  240.179771] RDX: 0000000000000010 RSI: ffff8807de574fe0 RDI: ffffc9065db85540
+[  240.186930] RBP: ffffc900047dfd30 R08: ffff8807de41b000 R09: 0000000000000000
+[  240.194088] R10: 0000000000000040 R11: ffff8807e9b726f0 R12: 00000006565726b0
+[  240.201246] R13: ffffc90007612ea0 R14: 000000065657d540 R15: 0000000000000000
+[  240.208397] FS:  0000000000000000(0000) GS:ffff88081fa00000(0000) knlGS:0000000000000000
+[  240.216510] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[  240.222280] CR2: ffffc9065db85540 CR3: 0000000001c0f000 CR4: 00000000001406f0
+[  240.229430] Call Trace:
+[  240.231887]  ? tcmu_queue_cmd+0x83c/0xa80
+[  240.235916]  ? target_check_reservation+0xcd/0x6f0
+[  240.240725]  __target_execute_cmd+0x27/0xa0
+[  240.244918]  target_execute_cmd+0x232/0x2c0
+[  240.249124]  ? __local_bh_enable_ip+0x64/0xa0
+[  240.253499]  iscsit_execute_cmd+0x20d/0x270
+[  240.257693]  iscsit_sequence_cmd+0x110/0x190
+[  240.261985]  iscsit_get_rx_pdu+0x360/0xc80
+[  240.267565]  ? iscsi_target_rx_thread+0x54/0xd0
+[  240.273571]  iscsi_target_rx_thread+0x9a/0xd0
+[  240.279413]  kthread+0x113/0x150
+[  240.284120]  ? iscsi_target_tx_thread+0x1e0/0x1e0
+[  240.290297]  ? kthread_create_on_node+0x40/0x40
+[  240.296297]  ret_from_fork+0x2e/0x40
+[  240.301332] Code: 90 90 90 90 90 eb 1e 0f 1f 00 48 89 f8 48 89 d1 48
+c1 e9 03 83 e2 07 f3 48 a5 89 d1 f3 a4 c3 66 0f 1f 44 00 00 48 89 f8 48
+89 d1 <f3> a4 c3 0f 1f 80 00 00 00 00 48 89 f8 48 83 fa 20 72 7e 40 38
+[  240.321751] RIP: memcpy_erms+0x6/0x10 RSP: ffffc900047dfc68
+[  240.328838] CR2: ffffc9065db85540
+[  240.333667] ---[ end trace b7e5354cfb54d08b ]---
+
+To fix this, just memset all the entry memory before using it, and
+also to be more readable we adjust the bidi code.
+
+Fixed: fe25cc34795(tcmu: Recalculate the tcmu_cmd size to save cmd area
+		memories)
+	Reported-by: Bryant G. Ly <bryantly@linux.vnet.ibm.com>
+	Tested-by: Bryant G. Ly <bryantly@linux.vnet.ibm.com>
+	Reported-by: Damien Le Moal <damien.lemoal@wdc.com>
+	Tested-by: Damien Le Moal <damien.lemoal@wdc.com>
+	Reviewed-by: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Xiubo Li <lixiubo@cmss.chinamobile.com>
+	Cc: <stable@vger.kernel.org> # 4.12+
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit b3743c71b7c33a126d6d8942bb268775987400ec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 5b22226ed5d2,3b25ef3d5596..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -402,16 -549,22 +402,22 @@@ static void alloc_and_scatter_data_area
+  		from = kmap_atomic(sg_page(sg)) + sg->offset;
+  		while (sg_remaining > 0) {
+  			if (block_remaining == 0) {
+ -				if (to)
+ -					kunmap_atomic(to);
+ -
+ +				block = find_first_zero_bit(udev->data_bitmap,
+ +						DATA_BLOCK_BITS);
+  				block_remaining = DATA_BLOCK_SIZE;
+ -				dbi = tcmu_cmd_get_dbi(tcmu_cmd);
+ -				page = tcmu_get_block_page(udev, dbi);
+ -				to = kmap_atomic(page);
+ +				set_bit(block, udev->data_bitmap);
+  			}
+ -
+  			copy_bytes = min_t(size_t, sg_remaining,
+  					block_remaining);
+ -			to_offset = get_block_offset_user(udev, dbi,
+ +			to_offset = get_block_offset(udev, block,
+  					block_remaining);
+++<<<<<<< HEAD
+ +			to = (void *)udev->mb_addr + to_offset;
+++=======
++ 			offset = DATA_BLOCK_SIZE - block_remaining;
++ 			to += offset;
++ 
+++>>>>>>> b3743c71b7c3 (tcmu: Fix possbile memory leak / OOPs when recalculating cmd base size)
+  			if (*iov_cnt != 0 &&
+  			    to_offset == iov_tail(udev, *iov)) {
+  				(*iov)->iov_len += copy_bytes;
+@@@ -459,9 -635,8 +465,14 @@@ static void gather_data_area(struct tcm
+  			}
+  			copy_bytes = min_t(size_t, sg_remaining,
+  					block_remaining);
+++<<<<<<< HEAD
+ +			from_offset = get_block_offset(udev, block,
+ +					block_remaining);
+ +			from = (void *) udev->mb_addr + from_offset;
+++=======
++ 			offset = DATA_BLOCK_SIZE - block_remaining;
++ 			from += offset;
+++>>>>>>> b3743c71b7c3 (tcmu: Fix possbile memory leak / OOPs when recalculating cmd base size)
+  			tcmu_flush_dcache_range(from, copy_bytes);
+  			memcpy(to + sg->length - sg_remaining, from,
+  					copy_bytes);
+@@@ -619,33 -840,55 +630,59 @@@ tcmu_queue_cmd_ring(struct tcmu_cmd *tc
+  	}
+  
+  	entry = (void *) mb + CMDR_OFF + cmd_head;
++ 	memset(entry, 0, command_size);
+  	tcmu_hdr_set_op(&entry->hdr.len_op, TCMU_OP_CMD);
+ +	tcmu_hdr_set_len(&entry->hdr.len_op, command_size);
+  	entry->hdr.cmd_id = tcmu_cmd->cmd_id;
+- 	entry->hdr.kflags = 0;
+- 	entry->hdr.uflags = 0;
+  
+ +	bitmap_copy(old_bitmap, udev->data_bitmap, DATA_BLOCK_BITS);
+ +
+  	/* Handle allocating space from the data area */
+ -	tcmu_cmd_reset_dbi_cur(tcmu_cmd);
+  	iov = &entry->req.iov[0];
+  	iov_cnt = 0;
+  	copy_to_data_area = (se_cmd->data_direction == DMA_TO_DEVICE
+  		|| se_cmd->se_cmd_flags & SCF_BIDI);
+ -	ret = scatter_data_area(udev, tcmu_cmd, se_cmd->t_data_sg,
+ -				se_cmd->t_data_nents, &iov, &iov_cnt,
+ -				copy_to_data_area);
+ -	if (ret) {
+ -		tcmu_cmd_free_data(tcmu_cmd, tcmu_cmd->dbi_cnt);
+ -		mutex_unlock(&udev->cmdr_lock);
+ -
+ -		pr_err("tcmu: alloc and scatter data failed\n");
+ -		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+ -	}
+ +	alloc_and_scatter_data_area(udev, se_cmd->t_data_sg,
+ +		se_cmd->t_data_nents, &iov, &iov_cnt, copy_to_data_area);
+  	entry->req.iov_cnt = iov_cnt;
+- 	entry->req.iov_dif_cnt = 0;
+  
+  	/* Handle BIDI commands */
+  	iov_cnt = 0;
+++<<<<<<< HEAD
+ +	alloc_and_scatter_data_area(udev, se_cmd->t_bidi_data_sg,
+ +		se_cmd->t_bidi_data_nents, &iov, &iov_cnt, false);
+ +	entry->req.iov_bidi_cnt = iov_cnt;
+ +
+ +	/* cmd's data_bitmap is what changed in process */
+ +	bitmap_xor(tcmu_cmd->data_bitmap, old_bitmap, udev->data_bitmap,
+ +			DATA_BLOCK_BITS);
+++=======
++ 	if (se_cmd->se_cmd_flags & SCF_BIDI) {
++ 		iov++;
++ 		ret = scatter_data_area(udev, tcmu_cmd,
++ 					se_cmd->t_bidi_data_sg,
++ 					se_cmd->t_bidi_data_nents,
++ 					&iov, &iov_cnt, false);
++ 		if (ret) {
++ 			tcmu_cmd_free_data(tcmu_cmd, tcmu_cmd->dbi_cnt);
++ 			mutex_unlock(&udev->cmdr_lock);
++ 
++ 			pr_err("tcmu: alloc and scatter bidi data failed\n");
++ 			return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
++ 		}
++ 	}
++ 	entry->req.iov_bidi_cnt = iov_cnt;
++ 
++ 	/*
++ 	 * Recalaulate the command's base size and size according
++ 	 * to the actual needs
++ 	 */
++ 	base_command_size = tcmu_cmd_get_base_cmd_size(entry->req.iov_cnt +
++ 						       entry->req.iov_bidi_cnt);
++ 	command_size = tcmu_cmd_get_cmd_size(tcmu_cmd, base_command_size);
++ 
++ 	tcmu_hdr_set_len(&entry->hdr.len_op, command_size);
+++>>>>>>> b3743c71b7c3 (tcmu: Fix possbile memory leak / OOPs when recalculating cmd base size)
+  
+  	/* All offsets relative to mb_addr, not start of entry! */
+  	cdb_off = CMDR_OFF + cmd_head + base_command_size;
+* Unmerged path drivers/target/target_core_user.c
