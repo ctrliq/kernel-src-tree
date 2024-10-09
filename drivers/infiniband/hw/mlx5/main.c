@@ -2478,7 +2478,7 @@ static void mlx5_disable_roce(struct mlx5_ib_dev *dev)
 	unregister_netdevice_notifier_rh(&dev->roce.nb);
 }
 
-static const char const *names[] = {
+static const char * const names[] = {
 	"rx_write_requests",
 	"rx_read_requests",
 	"rx_atomic_requests",
