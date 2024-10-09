@@ -1,0 +1,262 @@
+mmc: block: respect bool returned from blk_end_request()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] block: respect bool returned from blk_end_request() (Gopal Tiwari) [1549495]
+Rebuild_FUZZ: 95.33%
+commit-author Linus Walleij <linus.walleij@linaro.org>
+commit 0e65f10cf1774a27acf9e933e006f1e55a4ef642
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/0e65f10c.failed
+
+The return value from blk_end_request() is a bool but is
+treated like an int. This is generally safe, but the variable
+also has the opaque name "ret" and gets returned from the
+helper function mmc_blk_cmd_err().
+
+- Switch the variable to a bool, applies everywhere.
+
+- Return a bool from mmc_blk_cmd_err() and rename the function
+  mmc_blk_rw_cmd_err() to indicate through the namespace that
+  this is a helper for mmc_blk_issue_rw_rq().
+
+- Rename the variable from "ret" to "req_pending" inside the
+  while() loop inside mmc_blk_issue_rq_rq(), which finally
+  makes it very clear what this while loop is waiting for.
+
+- Augment the argument "ret" to mmc_blk_rq_cmd_err() to
+  old_req_pending so it becomes evident that this is an
+  older state, and it is returned only if we fail to get
+  the number of written blocks from an SD card in the
+  function mmc_sd_num_wr_blocks().
+
+- Augment the while() loop in mmc_blk_rq_cmd_abort(): it
+  is evident now that we know this is a bool variable,
+  that the function is just spinning waiting for
+  blk_end_request() to return false.
+
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit 0e65f10cf1774a27acf9e933e006f1e55a4ef642)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/block.c
+diff --cc drivers/mmc/core/block.c
+index ce6b35d943ba,cd909aecfded..000000000000
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@@ -1580,32 -1583,64 +1582,68 @@@ static bool mmc_blk_rw_cmd_err(struct m
+  		int err;
+  
+  		err = mmc_sd_num_wr_blocks(card, &blocks);
+- 		if (!err) {
+- 			ret = blk_end_request(req, 0, blocks << 9);
+- 		}
++ 		if (err)
++ 			req_pending = old_req_pending;
++ 		else
++ 			req_pending = blk_end_request(req, 0, blocks << 9);
+  	} else {
+- 		ret = blk_end_request(req, 0, brq->data.bytes_xfered);
++ 		req_pending = blk_end_request(req, 0, brq->data.bytes_xfered);
+  	}
+- 	return ret;
++ 	return req_pending;
+  }
+  
+++<<<<<<< HEAD
+ +static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
+++=======
++ static void mmc_blk_rw_cmd_abort(struct mmc_card *card, struct request *req)
++ {
++ 	if (mmc_card_removed(card))
++ 		req->rq_flags |= RQF_QUIET;
++ 	while (blk_end_request(req, -EIO, blk_rq_cur_bytes(req)));
++ }
++ 
++ /**
++  * mmc_blk_rw_try_restart() - tries to restart the current async request
++  * @mq: the queue with the card and host to restart
++  * @req: a new request that want to be started after the current one
++  */
++ static void mmc_blk_rw_try_restart(struct mmc_queue *mq, struct request *req)
++ {
++ 	if (!req)
++ 		return;
++ 
++ 	/*
++ 	 * If the card was removed, just cancel everything and return.
++ 	 */
++ 	if (mmc_card_removed(mq->card)) {
++ 		req->rq_flags |= RQF_QUIET;
++ 		blk_end_request_all(req, -EIO);
++ 		return;
++ 	}
++ 	/* Else proceed and try to restart the current async request */
++ 	mmc_blk_rw_rq_prep(mq->mqrq_cur, mq->card, 0, mq);
++ 	mmc_start_areq(mq->card->host, &mq->mqrq_cur->areq, NULL);
++ }
++ 
++ static void mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *new_req)
+++>>>>>>> 0e65f10cf177 (mmc: block: respect bool returned from blk_end_request())
+  {
+  	struct mmc_blk_data *md = mq->blkdata;
+  	struct mmc_card *card = md->queue.card;
+  	struct mmc_blk_request *brq;
+- 	int ret = 1, disable_multi = 0, retry = 0, type, retune_retry_done = 0;
++ 	int disable_multi = 0, retry = 0, type, retune_retry_done = 0;
+  	enum mmc_blk_status status;
+  	struct mmc_queue_req *mq_rq;
+ -	struct request *old_req;
+ +	struct request *req;
+  	struct mmc_async_req *new_areq;
+  	struct mmc_async_req *old_areq;
++ 	bool req_pending = true;
+  
+ -	if (!new_req && !mq->mqrq_prev->req)
+ -		return;
+ +	if (!rqc && !mq->mqrq_prev->req)
+ +		return 0;
+  
+  	do {
+ -		if (new_req) {
+ +		if (rqc) {
+  			/*
+  			 * When 4KB native sector is enabled, only 8 blocks
+  			 * multiple read or write is allowed
+@@@ -1653,28 -1688,32 +1691,46 @@@
+  			 */
+  			mmc_blk_reset_success(md, type);
+  
+++<<<<<<< HEAD
+ +			ret = blk_end_request(req, 0,
+ +					brq->data.bytes_xfered);
+ +
+++=======
++ 			req_pending = blk_end_request(old_req, 0,
++ 						      brq->data.bytes_xfered);
+++>>>>>>> 0e65f10cf177 (mmc: block: respect bool returned from blk_end_request())
+  			/*
+  			 * If the blk_end_request function returns non-zero even
+  			 * though all data has been transferred and no errors
+  			 * were returned by the host controller, it's a bug.
+  			 */
+- 			if (status == MMC_BLK_SUCCESS && ret) {
++ 			if (status == MMC_BLK_SUCCESS && req_pending) {
+  				pr_err("%s BUG rq_tot %d d_xfer %d\n",
+ -				       __func__, blk_rq_bytes(old_req),
+ +				       __func__, blk_rq_bytes(req),
+  				       brq->data.bytes_xfered);
+ -				mmc_blk_rw_cmd_abort(card, old_req);
+ -				return;
+ +				mmc_blk_rw_cmd_abort(card, req);
+ +				return 0;
+  			}
+  			break;
+  		case MMC_BLK_CMD_ERR:
+++<<<<<<< HEAD
+ +			ret = mmc_blk_cmd_err(md, card, brq, req, ret);
+ +			if (mmc_blk_reset(md, card->host, type))
+ +				goto cmd_abort;
+ +			if (!ret)
+ +				goto start_new_req;
+++=======
++ 			req_pending = mmc_blk_rw_cmd_err(md, card, brq, old_req, req_pending);
++ 			if (mmc_blk_reset(md, card->host, type)) {
++ 				mmc_blk_rw_cmd_abort(card, old_req);
++ 				mmc_blk_rw_try_restart(mq, new_req);
++ 				return;
++ 			}
++ 			if (!req_pending) {
++ 				mmc_blk_rw_try_restart(mq, new_req);
++ 				return;
++ 			}
+++>>>>>>> 0e65f10cf177 (mmc: block: respect bool returned from blk_end_request())
+  			break;
+  		case MMC_BLK_RETRY:
+  			retune_retry_done = brq->retune_retry_done;
+@@@ -1708,57 -1752,40 +1764,70 @@@
+  			 * time, so we only reach here after trying to
+  			 * read a single sector.
+  			 */
+++<<<<<<< HEAD
+ +			ret = blk_end_request(req, -EIO,
+ +						brq->data.blksz);
+ +			if (!ret)
+ +				goto start_new_req;
+++=======
++ 			req_pending = blk_end_request(old_req, -EIO,
++ 						      brq->data.blksz);
++ 			if (!req_pending) {
++ 				mmc_blk_rw_try_restart(mq, new_req);
++ 				return;
++ 			}
+++>>>>>>> 0e65f10cf177 (mmc: block: respect bool returned from blk_end_request())
+  			break;
+  		case MMC_BLK_NOMEDIUM:
+ -			mmc_blk_rw_cmd_abort(card, old_req);
+ -			mmc_blk_rw_try_restart(mq, new_req);
+ -			return;
+ +			goto cmd_abort;
+  		default:
+  			pr_err("%s: Unhandled return value (%d)",
+ -					old_req->rq_disk->disk_name, status);
+ -			mmc_blk_rw_cmd_abort(card, old_req);
+ -			mmc_blk_rw_try_restart(mq, new_req);
+ -			return;
+ +					req->rq_disk->disk_name, status);
+ +			goto cmd_abort;
+  		}
+  
+- 		if (ret) {
++ 		if (req_pending) {
+  			/*
+  			 * In case of a incomplete request
+  			 * prepare it again and resend.
+  			 */
+  			mmc_blk_rw_rq_prep(mq_rq, card,
+  					disable_multi, mq);
+ -			mmc_start_areq(card->host,
+ -					&mq_rq->areq, NULL);
+ +			mmc_start_req(card->host,
+ +					&mq_rq->mmc_active, NULL);
+  			mq_rq->brq.retune_retry_done = retune_retry_done;
+  		}
+++<<<<<<< HEAD
+ +	} while (ret);
+ +
+ +	return 1;
+ +
+ + cmd_abort:
+ +	if (mmc_card_removed(card))
+ +		req->cmd_flags |= REQ_QUIET;
+ +	while (ret)
+ +		ret = blk_end_request(req, -EIO,
+ +				blk_rq_cur_bytes(req));
+ +
+ + start_new_req:
+ +	if (rqc) {
+ +		if (mmc_card_removed(card)) {
+ +			rqc->cmd_flags |= REQ_QUIET;
+ +			blk_end_request_all(rqc, -EIO);
+ +		} else {
+ +			mmc_blk_rw_rq_prep(mq->mqrq_cur, card, 0, mq);
+ +			mmc_start_req(card->host,
+ +				      &mq->mqrq_cur->mmc_active, NULL);
+ +		}
+ +	}
+ +
+ +	return 0;
+++=======
++ 	} while (req_pending);
+++>>>>>>> 0e65f10cf177 (mmc: block: respect bool returned from blk_end_request())
+  }
+  
+ -void mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
+ +int mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
+  {
+  	int ret;
+  	struct mmc_blk_data *md = mq->blkdata;
+* Unmerged path drivers/mmc/core/block.c
