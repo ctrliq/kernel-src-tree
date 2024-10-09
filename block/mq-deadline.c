@@ -654,6 +654,7 @@ static struct elevator_mq_ops dd_ops = {
 static struct elevator_type mq_deadline = {
 	.elevator_attrs = deadline_attrs,
 	.elevator_name = "mq-deadline",
+	.elevator_alias = "deadline",
 	.elevator_owner = THIS_MODULE,
 };
 MODULE_ALIAS("mq-deadline-iosched");
