@@ -1,0 +1,124 @@
+dm snapshot: Replace mutex with rw semaphore
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Nikos Tsironis <ntsironis@arrikto.com>
+commit 4ad8d880b6c4497e365fb6fd16bab52e9974a3f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/4ad8d880.failed
+
+dm-snapshot uses a single mutex to serialize every access to the
+snapshot state. This includes all accesses to the complete and pending
+exception tables, which occur at every origin write, every snapshot
+read/write and every exception completion.
+
+The lock statistics indicate that this mutex is a bottleneck (average
+wait time ~480 usecs for 8 processes doing random 4K writes to the
+origin device) preventing dm-snapshot to scale as the number of threads
+doing IO increases.
+
+The major contention points are __origin_write()/snapshot_map() and
+pending_complete(), i.e., the submission and completion of pending
+exceptions.
+
+Replace this mutex with a rw semaphore.
+
+We essentially revert commit ae1093be5a0ef9 ("dm snapshot: use mutex
+instead of rw_semaphore") and together with the next two patches we
+substitute the single mutex with a fine-grained locking scheme, where we
+use a read-write semaphore to protect the mostly read fields of the
+snapshot structure, e.g., valid, active, etc., and per-bucket bit
+spinlocks to protect accesses to the complete and pending exception
+tables.
+
+Co-developed-by: Ilias Tsitsimpis <iliastsi@arrikto.com>
+	Signed-off-by: Nikos Tsironis <ntsironis@arrikto.com>
+	Acked-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 4ad8d880b6c4497e365fb6fd16bab52e9974a3f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-snap.c
+diff --cc drivers/md/dm-snap.c
+index 4f3251269638,5a67f408876e..000000000000
+--- a/drivers/md/dm-snap.c
++++ b/drivers/md/dm-snap.c
+@@@ -1748,12 -1746,13 +1746,12 @@@ static int snapshot_map(struct dm_targe
+  	/* Full snapshots are not usable */
+  	/* To get here the table must be live so s->active is always set. */
+  	if (!s->valid)
+ -		return DM_MAPIO_KILL;
+ +		return -EIO;
+  
+- 	mutex_lock(&s->lock);
++ 	down_write(&s->lock);
+  
+ -	if (!s->valid || (unlikely(s->snapshot_overflowed) &&
+ -	    bio_data_dir(bio) == WRITE)) {
+ -		r = DM_MAPIO_KILL;
+ +	if (!s->valid || (unlikely(s->snapshot_overflowed) && bio_rw(bio) == WRITE)) {
+ +		r = -EIO;
+  		goto out_unlock;
+  	}
+  
+@@@ -1769,12 -1768,12 +1767,12 @@@
+  	 * flags so we should only get this if we are
+  	 * writeable.
+  	 */
+ -	if (bio_data_dir(bio) == WRITE) {
+ +	if (bio_rw(bio) == WRITE) {
+  		pe = __lookup_pending_exception(s, chunk);
+  		if (!pe) {
+- 			mutex_unlock(&s->lock);
++ 			up_write(&s->lock);
+  			pe = alloc_pending_exception(s);
+- 			mutex_lock(&s->lock);
++ 			down_write(&s->lock);
+  
+  			if (!s->valid || s->snapshot_overflowed) {
+  				free_pending_exception(pe);
+@@@ -1806,9 -1805,10 +1804,9 @@@
+  		r = DM_MAPIO_SUBMITTED;
+  
+  		if (!pe->started &&
+ -		    bio->bi_iter.bi_size ==
+ -		    (s->store->chunk_size << SECTOR_SHIFT)) {
+ +		    bio->bi_size == (s->store->chunk_size << SECTOR_SHIFT)) {
+  			pe->started = 1;
+- 			mutex_unlock(&s->lock);
++ 			up_write(&s->lock);
+  			start_full_bio(pe, bio);
+  			goto out;
+  		}
+@@@ -1862,9 -1862,9 +1860,9 @@@ static int snapshot_merge_map(struct dm
+  		return DM_MAPIO_REMAPPED;
+  	}
+  
+ -	chunk = sector_to_chunk(s->store, bio->bi_iter.bi_sector);
+ +	chunk = sector_to_chunk(s->store, bio->bi_sector);
+  
+- 	mutex_lock(&s->lock);
++ 	down_write(&s->lock);
+  
+  	/* Full merging snapshots are redirected to the origin */
+  	if (!s->valid)
+@@@ -1892,10 -1892,10 +1890,15 @@@
+  	}
+  
+  redirect_to_origin:
+ -	bio_set_dev(bio, s->origin->bdev);
+ +	bio->bi_bdev = s->origin->bdev;
+  
+++<<<<<<< HEAD
+ +	if (bio_rw(bio) == WRITE) {
+ +		mutex_unlock(&s->lock);
+++=======
++ 	if (bio_data_dir(bio) == WRITE) {
++ 		up_write(&s->lock);
+++>>>>>>> 4ad8d880b6c4 (dm snapshot: Replace mutex with rw semaphore)
+  		return do_origin(s->origin, bio);
+  	}
+  
+* Unmerged path drivers/md/dm-snap.c
