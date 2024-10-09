@@ -1,0 +1,263 @@
+mm: memcontrol: do not recurse in direct reclaim
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [mm] memcontrol: do not recurse in direct reclaim (Rik van Riel) [1397330]
+Rebuild_FUZZ: 95.65%
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit 89a2848381b5fcd9c4d9c0cd97680e3b28730e31
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/89a28483.failed
+
+On 4.0, we saw a stack corruption from a page fault entering direct
+memory cgroup reclaim, calling into btrfs_releasepage(), which then
+tried to allocate an extent and recursed back into a kmem charge ad
+nauseam:
+
+  [...]
+  btrfs_releasepage+0x2c/0x30
+  try_to_release_page+0x32/0x50
+  shrink_page_list+0x6da/0x7a0
+  shrink_inactive_list+0x1e5/0x510
+  shrink_lruvec+0x605/0x7f0
+  shrink_zone+0xee/0x320
+  do_try_to_free_pages+0x174/0x440
+  try_to_free_mem_cgroup_pages+0xa7/0x130
+  try_charge+0x17b/0x830
+  memcg_charge_kmem+0x40/0x80
+  new_slab+0x2d9/0x5a0
+  __slab_alloc+0x2fd/0x44f
+  kmem_cache_alloc+0x193/0x1e0
+  alloc_extent_state+0x21/0xc0
+  __clear_extent_bit+0x2b5/0x400
+  try_release_extent_mapping+0x1a3/0x220
+  __btrfs_releasepage+0x31/0x70
+  btrfs_releasepage+0x2c/0x30
+  try_to_release_page+0x32/0x50
+  shrink_page_list+0x6da/0x7a0
+  shrink_inactive_list+0x1e5/0x510
+  shrink_lruvec+0x605/0x7f0
+  shrink_zone+0xee/0x320
+  do_try_to_free_pages+0x174/0x440
+  try_to_free_mem_cgroup_pages+0xa7/0x130
+  try_charge+0x17b/0x830
+  mem_cgroup_try_charge+0x65/0x1c0
+  handle_mm_fault+0x117f/0x1510
+  __do_page_fault+0x177/0x420
+  do_page_fault+0xc/0x10
+  page_fault+0x22/0x30
+
+On later kernels, kmem charging is opt-in rather than opt-out, and that
+particular kmem allocation in btrfs_releasepage() is no longer being
+charged and won't recurse and overrun the stack anymore.
+
+But it's not impossible for an accounted allocation to happen from the
+memcg direct reclaim context, and we needed to reproduce this crash many
+times before we even got a useful stack trace out of it.
+
+Like other direct reclaimers, mark tasks in memcg reclaim PF_MEMALLOC to
+avoid recursing into any other form of direct reclaim.  Then let
+recursive charges from PF_MEMALLOC contexts bypass the cgroup limit.
+
+Link: http://lkml.kernel.org/r/20161025141050.GA13019@cmpxchg.org
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 89a2848381b5fcd9c4d9c0cd97680e3b28730e31)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+#	mm/vmscan.c
+diff --cc mm/memcontrol.c
+index 3fcb8718aa0d,0f870ba43942..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -2593,54 -1834,120 +2593,85 @@@ static int memcg_cpu_hotplug_callback(s
+  	return NOTIFY_OK;
+  }
+  
+ -static void reclaim_high(struct mem_cgroup *memcg,
+ -			 unsigned int nr_pages,
+ -			 gfp_t gfp_mask)
+ -{
+ -	do {
+ -		if (page_counter_read(&memcg->memory) <= memcg->high)
+ -			continue;
+ -		mem_cgroup_events(memcg, MEMCG_HIGH, 1);
+ -		try_to_free_mem_cgroup_pages(memcg, nr_pages, gfp_mask, true);
+ -	} while ((memcg = parent_mem_cgroup(memcg)));
+ -}
+ -
+ -static void high_work_func(struct work_struct *work)
+ -{
+ -	struct mem_cgroup *memcg;
+ -
+ -	memcg = container_of(work, struct mem_cgroup, high_work);
+ -	reclaim_high(memcg, CHARGE_BATCH, GFP_KERNEL);
+ -}
+ -
+ -/*
+ - * Scheduled by try_charge() to be executed from the userland return path
+ - * and reclaims memory over the high limit.
+ - */
+ -void mem_cgroup_handle_over_high(void)
+ -{
+ -	unsigned int nr_pages = current->memcg_nr_pages_over_high;
+ -	struct mem_cgroup *memcg;
+ -
+ -	if (likely(!nr_pages))
+ -		return;
+  
+ -	memcg = get_mem_cgroup_from_mm(current->mm);
+ -	reclaim_high(memcg, nr_pages, GFP_KERNEL);
+ -	css_put(&memcg->css);
+ -	current->memcg_nr_pages_over_high = 0;
+ -}
+ +/* See __mem_cgroup_try_charge() for details */
+ +enum {
+ +	CHARGE_OK,		/* success */
+ +	CHARGE_RETRY,		/* need to retry but retry is not bad */
+ +	CHARGE_NOMEM,		/* we can't do more. return -ENOMEM */
+ +	CHARGE_WOULDBLOCK,	/* GFP_WAIT wasn't set and no enough res. */
+ +};
+  
+ -static int try_charge(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ -		      unsigned int nr_pages)
+ +static int mem_cgroup_do_charge(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ +				unsigned int nr_pages, unsigned int min_pages,
+ +				bool invoke_oom)
+  {
+ -	unsigned int batch = max(CHARGE_BATCH, nr_pages);
+ -	int nr_retries = MEM_CGROUP_RECLAIM_RETRIES;
+  	struct mem_cgroup *mem_over_limit;
+  	struct page_counter *counter;
+ -	unsigned long nr_reclaimed;
+ -	bool may_swap = true;
+ -	bool drained = false;
+ -
+ -	if (mem_cgroup_is_root(memcg))
+ -		return 0;
+ -retry:
+ -	if (consume_stock(memcg, nr_pages))
+ -		return 0;
+ +	unsigned long flags = 0;
+ +	int ret;
+  
+ -	if (!do_memsw_account() ||
+ -	    page_counter_try_charge(&memcg->memsw, batch, &counter)) {
+ -		if (page_counter_try_charge(&memcg->memory, batch, &counter))
+ -			goto done_restock;
+ -		if (do_memsw_account())
+ -			page_counter_uncharge(&memcg->memsw, batch);
+ -		mem_over_limit = mem_cgroup_from_counter(counter, memory);
+ -	} else {
+ -		mem_over_limit = mem_cgroup_from_counter(counter, memsw);
+ -		may_swap = false;
+ -	}
+ +	ret = page_counter_try_charge(&memcg->memory, nr_pages, &counter);
+  
+ -	if (batch > nr_pages) {
+ -		batch = nr_pages;
+ -		goto retry;
+ -	}
+ +	if (likely(!ret)) {
+ +		if (!do_swap_account)
+ +			return CHARGE_OK;
+ +		ret = page_counter_try_charge(&memcg->memsw, nr_pages, &counter);
+ +		if (likely(!ret))
+ +			return CHARGE_OK;
+  
+ +		page_counter_uncharge(&memcg->memory, nr_pages);
+ +		mem_over_limit = mem_cgroup_from_counter(counter, memsw);
+ +		flags |= MEM_CGROUP_RECLAIM_NOSWAP;
+ +	} else
+ +		mem_over_limit = mem_cgroup_from_counter(counter, memory);
+  	/*
+ -	 * Unlike in global OOM situations, memcg is not in a physical
+ -	 * memory shortage.  Allow dying and OOM-killed tasks to
+ -	 * bypass the last charges so that they can exit quickly and
+ -	 * free their memory.
+ +	 * Never reclaim on behalf of optional batching, retry with a
+ +	 * single page instead.
+  	 */
+ -	if (unlikely(test_thread_flag(TIF_MEMDIE) ||
+ -		     fatal_signal_pending(current) ||
+ -		     current->flags & PF_EXITING))
+ -		goto force;
+ +	if (nr_pages > min_pages)
+ +		return CHARGE_RETRY;
+  
+++<<<<<<< HEAD
+ +	if (!(gfp_mask & __GFP_WAIT))
+ +		return CHARGE_WOULDBLOCK;
+++=======
++ 	/*
++ 	 * Prevent unbounded recursion when reclaim operations need to
++ 	 * allocate memory. This might exceed the limits temporarily,
++ 	 * but we prefer facilitating memory reclaim and getting back
++ 	 * under the limit over triggering OOM kills in these cases.
++ 	 */
++ 	if (unlikely(current->flags & PF_MEMALLOC))
++ 		goto force;
++ 
++ 	if (unlikely(task_in_memcg_oom(current)))
++ 		goto nomem;
++ 
++ 	if (!gfpflags_allow_blocking(gfp_mask))
++ 		goto nomem;
++ 
++ 	mem_cgroup_events(mem_over_limit, MEMCG_MAX, 1);
++ 
++ 	nr_reclaimed = try_to_free_mem_cgroup_pages(mem_over_limit, nr_pages,
++ 						    gfp_mask, may_swap);
++ 
++ 	if (mem_cgroup_margin(mem_over_limit) >= nr_pages)
++ 		goto retry;
++ 
++ 	if (!drained) {
++ 		drain_all_stock(mem_over_limit);
++ 		drained = true;
++ 		goto retry;
++ 	}
+++>>>>>>> 89a2848381b5 (mm: memcontrol: do not recurse in direct reclaim)
+  
+  	if (gfp_mask & __GFP_NORETRY)
+ -		goto nomem;
+ +		return CHARGE_NOMEM;
+ +
+ +	ret = mem_cgroup_reclaim(mem_over_limit, gfp_mask, flags);
+ +	if (mem_cgroup_margin(mem_over_limit) >= nr_pages)
+ +		return CHARGE_RETRY;
+  	/*
+  	 * Even though the limit is exceeded at this point, reclaim
+  	 * may have been able to free some pages.  Retry the charge
+diff --cc mm/vmscan.c
+index 647425138e16,76fda2268148..000000000000
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@@ -2755,9 -3040,12 +2755,15 @@@ unsigned long try_to_free_mem_cgroup_pa
+  
+  	trace_mm_vmscan_memcg_reclaim_begin(0,
+  					    sc.may_writepage,
+ -					    sc.gfp_mask,
+ -					    sc.reclaim_idx);
+ +					    sc.gfp_mask);
+  
+++<<<<<<< HEAD
+ +	nr_reclaimed = do_try_to_free_pages(zonelist, &sc, &shrink);
+++=======
++ 	current->flags |= PF_MEMALLOC;
++ 	nr_reclaimed = do_try_to_free_pages(zonelist, &sc);
++ 	current->flags &= ~PF_MEMALLOC;
+++>>>>>>> 89a2848381b5 (mm: memcontrol: do not recurse in direct reclaim)
+  
+  	trace_mm_vmscan_memcg_reclaim_end(nr_reclaimed);
+  
+* Unmerged path mm/memcontrol.c
+* Unmerged path mm/vmscan.c
