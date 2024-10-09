@@ -1,0 +1,143 @@
+x86/vdso: Fix vDSO build if a retpoline is emitted
+
+jira LE-1907
+cve CVE-2022-29901
+cve CVE-2022-29900
+cve CVE-2022-23825
+cve CVE-2022-23816
+Rebuild_History Non-Buildable kernel-3.10.0-1160.80.1.el7
+commit-author Andy Lutomirski <luto@kernel.org>
+commit 2e549b2ee0e358bc758480e716b881f9cabedb6a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.80.1.el7/2e549b2e.failed
+
+Currently, if the vDSO ends up containing an indirect branch or
+call, GCC will emit the "external thunk" style of retpoline, and it
+will fail to link.
+
+Fix it by building the vDSO with inline retpoline thunks.
+
+I haven't seen any reports of this triggering on an unpatched
+kernel.
+
+Fixes: commit 76b043848fd2 ("x86/retpoline: Add initial retpoline support")
+	Signed-off-by: Andy Lutomirski <luto@kernel.org>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Matt Rickard <matt@softrans.com.au>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Jason Vas Dias <jason.vas.dias@gmail.com>
+	Cc: David Woodhouse <dwmw2@infradead.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: stable@vger.kernel.org
+Link: https://lkml.kernel.org/r/c76538cd3afbe19c6246c2d1715bc6a60bd63985.1534448381.git.luto@kernel.org
+
+(cherry picked from commit 2e549b2ee0e358bc758480e716b881f9cabedb6a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Makefile
+#	arch/x86/entry/vdso/Makefile
+diff --cc Makefile
+index d51de1c1b3d5,7bab2e90e4e1..000000000000
+--- a/Makefile
++++ b/Makefile
+@@@ -468,57 -492,45 +468,77 @@@ ifneq ($(KBUILD_SRC),
+  	    $(srctree) $(objtree) $(VERSION) $(PATCHLEVEL)
+  endif
+  
+ -ifeq ($(cc-name),clang)
+ -ifneq ($(CROSS_COMPILE),)
+ -CLANG_TARGET	:= --target=$(notdir $(CROSS_COMPILE:%-=%))
+ -GCC_TOOLCHAIN	:= $(realpath $(dir $(shell which $(LD)))/..)
+ -endif
+ -ifneq ($(GCC_TOOLCHAIN),)
+ -CLANG_GCC_TC	:= --gcc-toolchain=$(GCC_TOOLCHAIN)
+ -endif
+ -KBUILD_CFLAGS += $(CLANG_TARGET) $(CLANG_GCC_TC)
+ -KBUILD_AFLAGS += $(CLANG_TARGET) $(CLANG_GCC_TC)
+ -KBUILD_CFLAGS += $(call cc-option, -no-integrated-as)
+ -KBUILD_AFLAGS += $(call cc-option, -no-integrated-as)
+ +# Support for using generic headers in asm-generic
+ +PHONY += asm-generic
+ +asm-generic:
+ +	$(Q)$(MAKE) -f $(srctree)/scripts/Makefile.asm-generic \
+ +	            src=asm obj=arch/$(SRCARCH)/include/generated/asm
+ +	$(Q)$(MAKE) -f $(srctree)/scripts/Makefile.asm-generic \
+ +	            src=uapi/asm obj=arch/$(SRCARCH)/include/generated/uapi/asm
+ +
+ +# To make sure we do not include .config for any of the *config targets
+ +# catch them early, and hand them over to scripts/kconfig/Makefile
+ +# It is allowed to specify more targets when calling make, including
+ +# mixing *config targets and build targets.
+ +# For example 'make oldconfig all'.
+ +# Detect when mixed targets is specified, and make a second invocation
+ +# of make so .config is not included in this case either (for *config).
+ +
+ +version_h := include/generated/uapi/linux/version.h
+ +
+ +no-dot-config-targets := clean mrproper distclean \
+ +			 cscope gtags TAGS tags help %docs check% coccicheck \
+ +			 $(version_h) headers_% archheaders archscripts \
+ +			 kernelversion %src-pkg
+ +
+ +config-targets := 0
+ +mixed-targets  := 0
+ +dot-config     := 1
+ +
+ +ifneq ($(filter $(no-dot-config-targets), $(MAKECMDGOALS)),)
+ +	ifeq ($(filter-out $(no-dot-config-targets), $(MAKECMDGOALS)),)
+ +		dot-config := 0
+ +	endif
+  endif
+  
+++<<<<<<< HEAD
+ +ifeq ($(KBUILD_EXTMOD),)
+ +        ifneq ($(filter config %config,$(MAKECMDGOALS)),)
+ +                config-targets := 1
+ +                ifneq ($(filter-out config %config,$(MAKECMDGOALS)),)
+ +                        mixed-targets := 1
+ +                endif
+ +        endif
+++=======
++ RETPOLINE_CFLAGS_GCC := -mindirect-branch=thunk-extern -mindirect-branch-register
++ RETPOLINE_VDSO_CFLAGS_GCC := -mindirect-branch=thunk-inline -mindirect-branch-register
++ RETPOLINE_CFLAGS_CLANG := -mretpoline-external-thunk
++ RETPOLINE_VDSO_CFLAGS_CLANG := -mretpoline
++ RETPOLINE_CFLAGS := $(call cc-option,$(RETPOLINE_CFLAGS_GCC),$(call cc-option,$(RETPOLINE_CFLAGS_CLANG)))
++ RETPOLINE_VDSO_CFLAGS := $(call cc-option,$(RETPOLINE_VDSO_CFLAGS_GCC),$(call cc-option,$(RETPOLINE_VDSO_CFLAGS_CLANG)))
++ export RETPOLINE_CFLAGS
++ export RETPOLINE_VDSO_CFLAGS
++ 
++ KBUILD_CFLAGS	+= $(call cc-option,-fno-PIE)
++ KBUILD_AFLAGS	+= $(call cc-option,-fno-PIE)
++ 
++ # check for 'asm goto'
++ ifeq ($(shell $(CONFIG_SHELL) $(srctree)/scripts/gcc-goto.sh $(CC) $(KBUILD_CFLAGS)), y)
++   CC_HAVE_ASM_GOTO := 1
++   KBUILD_CFLAGS += -DCC_HAVE_ASM_GOTO
++   KBUILD_AFLAGS += -DCC_HAVE_ASM_GOTO
+++>>>>>>> 2e549b2ee0e3 (x86/vdso: Fix vDSO build if a retpoline is emitted)
+  endif
+  
+ -# The expansion should be delayed until arch/$(SRCARCH)/Makefile is included.
+ -# Some architectures define CROSS_COMPILE in arch/$(SRCARCH)/Makefile.
+ -# CC_VERSION_TEXT is referenced from Kconfig (so it needs export),
+ -# and from include/config/auto.conf.cmd to detect the compiler upgrade.
+ -CC_VERSION_TEXT = $(shell $(CC) --version | head -n 1)
+ +ifeq ($(mixed-targets),1)
+ +# ===========================================================================
+ +# We're called with mixed targets (*config and build targets).
+ +# Handle them one by one.
+ +
+ +%:: FORCE
+ +	$(Q)$(MAKE) -C $(srctree) KBUILD_SRC= $@
+  
+ +else
+  ifeq ($(config-targets),1)
+  # ===========================================================================
+  # *config targets only - make sure prerequisites are updated, and descend
+* Unmerged path arch/x86/entry/vdso/Makefile
+* Unmerged path Makefile
+* Unmerged path arch/x86/entry/vdso/Makefile
