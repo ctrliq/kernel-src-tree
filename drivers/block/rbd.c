@@ -465,7 +465,6 @@ static ssize_t rbd_add_single_major(struct bus_type *bus, const char *buf,
 static ssize_t rbd_remove_single_major(struct bus_type *bus, const char *buf,
 				       size_t count);
 static int rbd_dev_image_probe(struct rbd_device *rbd_dev, int depth);
-static void rbd_spec_put(struct rbd_spec *spec);
 
 static ssize_t rbd_supported_features_show(struct bus_type *bus, char *buf)
 {
