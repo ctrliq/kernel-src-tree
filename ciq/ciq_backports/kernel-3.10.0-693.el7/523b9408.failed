@@ -1,0 +1,104 @@
+hv: make CPU offlining prevention fine-grained
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [hv] make CPU offlining prevention fine-grained (Vitaly Kuznetsov) [1396335]
+Rebuild_FUZZ: 95.45%
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 523b94087078f7f5ac10b7d9cd04277927031c39
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/523b9408.failed
+
+Since commit e513229b4c38 ("Drivers: hv: vmbus: prevent cpu offlining on
+newer hypervisors") cpu offlining was disabled. It is still true that we
+can't offline CPUs which have VMBus channels bound to them but we may have
+'free' CPUs (e.v. we booted with maxcpus= parameter and onlined CPUs after
+VMBus was initialized), these CPUs may be disabled without issues.
+
+In future, we may even allow closing CPUs which have only sub-channels
+assinged to them by closing these sub-channels. All devices will continue
+to work.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 523b94087078f7f5ac10b7d9cd04277927031c39)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/vmbus_drv.c
+diff --cc drivers/hv/vmbus_drv.c
+index b87ba642b475,565bdd16134a..000000000000
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@@ -892,8 -1008,6 +892,11 @@@ static int vmbus_bus_init(int irq
+  	if (ret)
+  		goto err_connect;
+  
+++<<<<<<< HEAD
+ +	hv_cpu_hotplug_quirk(true);
+ +
+++=======
+++>>>>>>> 523b94087078 (hv: make CPU offlining prevention fine-grained)
+  	/*
+  	 * Only register if the crash MSRs are available
+  	 */
+@@@ -1452,7 -1567,6 +1459,10 @@@ static void __exit vmbus_exit(void
+  	cpuhp_remove_state(hyperv_cpuhp_online);
+  	hv_synic_free();
+  	acpi_bus_unregister_driver(&vmbus_acpi_driver);
+++<<<<<<< HEAD
+ +	hv_cpu_hotplug_quirk(false);
+++=======
+++>>>>>>> 523b94087078 (hv: make CPU offlining prevention fine-grained)
+  }
+  
+  
+diff --git a/drivers/hv/hv.c b/drivers/hv/hv.c
+index aaec44d49bc5..adbbf75413e0 100644
+--- a/drivers/hv/hv.c
++++ b/drivers/hv/hv.c
+@@ -593,10 +593,41 @@ int hv_synic_cleanup(unsigned int cpu)
+ 	union hv_synic_simp simp;
+ 	union hv_synic_siefp siefp;
+ 	union hv_synic_scontrol sctrl;
++	struct vmbus_channel *channel, *sc;
++	bool channel_found = false;
++	unsigned long flags;
+ 
+ 	if (!hv_context.synic_initialized)
+ 		return -EFAULT;
+ 
++	/*
++	 * Search for channels which are bound to the CPU we're about to
++	 * cleanup. In case we find one and vmbus is still connected we need to
++	 * fail, this will effectively prevent CPU offlining. There is no way
++	 * we can re-bind channels to different CPUs for now.
++	 */
++	mutex_lock(&vmbus_connection.channel_mutex);
++	list_for_each_entry(channel, &vmbus_connection.chn_list, listentry) {
++		if (channel->target_cpu == cpu) {
++			channel_found = true;
++			break;
++		}
++		spin_lock_irqsave(&channel->lock, flags);
++		list_for_each_entry(sc, &channel->sc_list, sc_list) {
++			if (sc->target_cpu == cpu) {
++				channel_found = true;
++				break;
++			}
++		}
++		spin_unlock_irqrestore(&channel->lock, flags);
++		if (channel_found)
++			break;
++	}
++	mutex_unlock(&vmbus_connection.channel_mutex);
++
++	if (channel_found && vmbus_connection.conn_state == CONNECTED)
++		return -EBUSY;
++
+ 	/* Turn off clockevent device */
+ 	if (ms_hyperv.features & HV_X64_MSR_SYNTIMER_AVAILABLE)
+ 		hv_ce_setmode(CLOCK_EVT_MODE_SHUTDOWN,
+* Unmerged path drivers/hv/vmbus_drv.c
