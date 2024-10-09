@@ -1,0 +1,174 @@
+NVMe: Short-cut removal on surprise hot-unplug
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [nvme] Short-cut removal on surprise hot-unplug (David Milburn) [1384066]
+Rebuild_FUZZ: 93.02%
+commit-author Keith Busch <keith.busch@intel.com>
+commit 0ff9d4e1a284a9282a049bf064f123e27f838907
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/0ff9d4e1.failed
+
+This patch adds a new state that when set has the core automatically
+kill request queues prior to removing namespaces.
+
+If PCI device is not present at the time the nvme driver's remove is
+called, we can kill all IO queues immediately instead of waiting for
+the watchdog thread to do that at its polling interval. This improves
+scenarios where multiple hot plug events occur at the same time since
+it doesn't block the pci enumeration for as long.
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 0ff9d4e1a284a9282a049bf064f123e27f838907)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/nvme.h
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/core.c
+index b10275d9cb61,beed3940786b..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -56,6 -58,64 +56,67 @@@ DEFINE_SPINLOCK(dev_list_lock)
+  
+  static struct class *nvme_class;
+  
+++<<<<<<< HEAD
+++=======
++ bool nvme_change_ctrl_state(struct nvme_ctrl *ctrl,
++ 		enum nvme_ctrl_state new_state)
++ {
++ 	enum nvme_ctrl_state old_state = ctrl->state;
++ 	bool changed = false;
++ 
++ 	spin_lock_irq(&ctrl->lock);
++ 	switch (new_state) {
++ 	case NVME_CTRL_LIVE:
++ 		switch (old_state) {
++ 		case NVME_CTRL_RESETTING:
++ 			changed = true;
++ 			/* FALLTHRU */
++ 		default:
++ 			break;
++ 		}
++ 		break;
++ 	case NVME_CTRL_RESETTING:
++ 		switch (old_state) {
++ 		case NVME_CTRL_NEW:
++ 		case NVME_CTRL_LIVE:
++ 			changed = true;
++ 			/* FALLTHRU */
++ 		default:
++ 			break;
++ 		}
++ 		break;
++ 	case NVME_CTRL_DELETING:
++ 		switch (old_state) {
++ 		case NVME_CTRL_LIVE:
++ 		case NVME_CTRL_RESETTING:
++ 			changed = true;
++ 			/* FALLTHRU */
++ 		default:
++ 			break;
++ 		}
++ 		break;
++ 	case NVME_CTRL_DEAD:
++ 		switch (old_state) {
++ 		case NVME_CTRL_DELETING:
++ 			changed = true;
++ 			/* FALLTHRU */
++ 		default:
++ 			break;
++ 		}
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 	spin_unlock_irq(&ctrl->lock);
++ 
++ 	if (changed)
++ 		ctrl->state = new_state;
++ 
++ 	return changed;
++ }
++ EXPORT_SYMBOL_GPL(nvme_change_ctrl_state);
++ 
+++>>>>>>> 0ff9d4e1a284 (NVMe: Short-cut removal on surprise hot-unplug)
+  static void nvme_free_ns(struct kref *kref)
+  {
+  	struct nvme_ns *ns = container_of(kref, struct nvme_ns, kref);
+diff --cc drivers/nvme/host/nvme.h
+index ddd7fc3f3881,1daa0482de0e..000000000000
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@@ -60,22 -65,19 +60,32 @@@ enum nvme_quirks 
+  	 * logical blocks.
+  	 */
+  	NVME_QUIRK_DISCARD_ZEROES		= (1 << 2),
+ +
+ +	/*
+ +	 * The controller needs a delay before starts checking the device
+ +	 * readiness, which is done by reading the NVME_CSTS_RDY bit.
+ +	 */
+ +	NVME_QUIRK_DELAY_BEFORE_CHK_RDY		= (1 << 3),
+  };
+  
+++<<<<<<< HEAD
+ +/* The below value is the specific amount of delay needed before checking
+ + * readiness in case of the PCI_DEVICE(0x1c58, 0x0003), which needs the
+ + * NVME_QUIRK_DELAY_BEFORE_CHK_RDY quirk enabled. The value (in ms) was
+ + * found empirically.
+ + */
+ +#define NVME_QUIRK_DELAY_AMOUNT		2000
+++=======
++ enum nvme_ctrl_state {
++ 	NVME_CTRL_NEW,
++ 	NVME_CTRL_LIVE,
++ 	NVME_CTRL_RESETTING,
++ 	NVME_CTRL_DELETING,
++ 	NVME_CTRL_DEAD,
++ };
+++>>>>>>> 0ff9d4e1a284 (NVMe: Short-cut removal on surprise hot-unplug)
+  
+  struct nvme_ctrl {
+ -	enum nvme_ctrl_state state;
+ -	spinlock_t lock;
+  	const struct nvme_ctrl_ops *ops;
+  	struct request_queue *admin_q;
+  	struct device *dev;
+diff --cc drivers/nvme/host/pci.c
+index 3da37f90d030,3bdcf0e34fd6..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -2015,15 -2014,16 +2015,22 @@@ static void nvme_remove(struct pci_dev 
+  {
+  	struct nvme_dev *dev = pci_get_drvdata(pdev);
+  
+ -	nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_DELETING);
+ -
+ +	set_bit(NVME_CTRL_REMOVING, &dev->flags);
+  	pci_set_drvdata(pdev, NULL);
+++<<<<<<< HEAD
+ +	flush_work(&dev->async_work);
+++=======
++ 
++ 	if (!pci_device_is_present(pdev))
++ 		nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_DEAD);
++ 
+++>>>>>>> 0ff9d4e1a284 (NVMe: Short-cut removal on surprise hot-unplug)
+  	flush_work(&dev->reset_work);
+ +	flush_work(&dev->scan_work);
+ +	nvme_remove_namespaces(&dev->ctrl);
+  	nvme_uninit_ctrl(&dev->ctrl);
+  	nvme_dev_disable(dev, true);
+ +	flush_work(&dev->reset_work);
+  	nvme_dev_remove_admin(dev);
+  	nvme_free_queues(dev, 0);
+  	nvme_release_cmb(dev);
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/nvme.h
+* Unmerged path drivers/nvme/host/pci.c
