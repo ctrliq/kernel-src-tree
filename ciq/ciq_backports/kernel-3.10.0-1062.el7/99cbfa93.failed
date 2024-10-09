@@ -1,0 +1,868 @@
+net/mlx5e: RX, Use cyclic WQ in legacy RQ
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: RX, Use cyclic WQ in legacy RQ (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 94.87%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit 99cbfa93a6122b1e9011d3f4e94b58e10d2f5cd0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/99cbfa93.failed
+
+Now that LRO is not supported for Legacy RQ, there is no source of
+out-of-order completions in the WQ, and we can use a cyclic one.
+This has multiple advantages:
+- reduces the WQE size (smaller PCI transactions).
+- lower overhead in datapath (no handling of 'next' pointers).
+- no reserved WQE for the WQ head (was need in linked-list).
+- allows using a constant map between frag and dma_info struct, in downstream patch.
+
+Performance tests:
+ConnectX-4, single core, single RX ring.
+Major gain in packet rate of single ring XDP drop.
+Bottleneck is shifted form HW (at 16Mpps) to SW (at 20Mpps).
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 99cbfa93a6122b1e9011d3f4e94b58e10d2f5cd0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+#	drivers/net/ethernet/mellanox/mlx5/core/wq.c
+#	drivers/net/ethernet/mellanox/mlx5/core/wq.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 13394c230883,af521dd52993..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -185,11 -183,16 +185,15 @@@ static inline int mlx5e_get_max_num_cha
+  struct mlx5e_tx_wqe {
+  	struct mlx5_wqe_ctrl_seg ctrl;
+  	struct mlx5_wqe_eth_seg  eth;
+ -	struct mlx5_wqe_data_seg data[0];
+  };
+  
+- struct mlx5e_rx_wqe {
++ struct mlx5e_rx_wqe_ll {
+  	struct mlx5_wqe_srq_next_seg  next;
+- 	struct mlx5_wqe_data_seg      data;
++ 	struct mlx5_wqe_data_seg      data[0];
++ };
++ 
++ struct mlx5e_rx_wqe_cyc {
++ 	struct mlx5_wqe_data_seg      data[0];
+  };
+  
+  struct mlx5e_umr_wqe {
+@@@ -490,10 -502,9 +494,14 @@@ enum mlx5e_rq_flag 
+  
+  struct mlx5e_rq {
+  	/* data path */
+ +	struct mlx5_wq_ll      wq;
+ +
+  	union {
+  		struct {
+++<<<<<<< HEAD
+++=======
++ 			struct mlx5_wq_cyc     wq;
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  			struct mlx5e_wqe_frag_info *frag_info;
+  			u32 frag_sz;	/* max possible skb frag_sz */
+  			union {
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index a11f70af9727,7fd2d736fbb1..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -108,9 -166,12 +108,9 @@@ static u16 mlx5e_get_rq_headroom(struc
+  
+  	linear_rq_headroom += NET_IP_ALIGN;
+  
+- 	if (params->rq_wq_type == MLX5_WQ_TYPE_LINKED_LIST)
++ 	if (params->rq_wq_type == MLX5_WQ_TYPE_CYCLIC)
+  		return linear_rq_headroom;
+  
+ -	if (mlx5e_rx_mpwqe_is_linear_skb(mdev, params))
+ -		return linear_rq_headroom;
+ -
+  	return 0;
+  }
+  
+@@@ -275,15 -313,30 +275,36 @@@ static inline void mlx5e_build_umr_wqe(
+  	cseg->fm_ce_se  = MLX5_WQE_CTRL_CQ_UPDATE;
+  	cseg->imm       = rq->mkey_be;
+  
+ -	ucseg->flags = MLX5_UMR_TRANSLATION_OFFSET_EN | MLX5_UMR_INLINE;
+ +	ucseg->flags = MLX5_UMR_TRANSLATION_OFFSET_EN;
+  	ucseg->xlt_octowords =
+  		cpu_to_be16(MLX5_MTT_OCTW(MLX5_MPWRQ_PAGES_PER_WQE));
+ +	ucseg->bsf_octowords =
+ +		cpu_to_be16(MLX5_MTT_OCTW(umr_wqe_mtt_offset));
+  	ucseg->mkey_mask     = cpu_to_be64(MLX5_MKEY_MASK_FREE);
+ -}
+  
+++<<<<<<< HEAD
+ +	dseg->lkey = sq->mkey_be;
+ +	dseg->addr = cpu_to_be64(wi->umr.mtt_addr);
+++=======
++ static u32 mlx5e_rqwq_get_size(struct mlx5e_rq *rq)
++ {
++ 	switch (rq->wq_type) {
++ 	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
++ 		return mlx5_wq_ll_get_size(&rq->mpwqe.wq);
++ 	default:
++ 		return mlx5_wq_cyc_get_size(&rq->wqe.wq);
++ 	}
++ }
++ 
++ static u32 mlx5e_rqwq_get_cur_sz(struct mlx5e_rq *rq)
++ {
++ 	switch (rq->wq_type) {
++ 	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
++ 		return rq->mpwqe.wq.cur_sz;
++ 	default:
++ 		return rq->wqe.wq.cur_sz;
++ 	}
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  }
+  
+  static int mlx5e_rq_alloc_mpwqe_info(struct mlx5e_rq *rq,
+@@@ -475,7 -491,16 +496,20 @@@ static int mlx5e_alloc_rq(struct mlx5e_
+  		if (err)
+  			goto err_destroy_umr_mkey;
+  		break;
+++<<<<<<< HEAD
+ +	default: /* MLX5_WQ_TYPE_LINKED_LIST */
+++=======
++ 	default: /* MLX5_WQ_TYPE_CYCLIC */
++ 		err = mlx5_wq_cyc_create(mdev, &rqp->wq, rqc_wq, &rq->wqe.wq,
++ 					 &rq->wq_ctrl);
++ 		if (err)
++ 			return err;
++ 
++ 		rq->wqe.wq.db = &rq->wqe.wq.db[MLX5_RCV_DBR];
++ 
++ 		wq_sz = mlx5_wq_cyc_get_size(&rq->wqe.wq);
++ 
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  		rq->wqe.frag_info =
+  			kzalloc_node(wq_sz * sizeof(*rq->wqe.frag_info),
+  				     GFP_KERNEL, cpu_to_node(c->cpu));
+@@@ -517,25 -540,48 +551,41 @@@
+  		rq->mkey_be = c->mkey_be;
+  	}
+  
+ -	/* Create a page_pool and register it with rxq */
+ -	pp_params.order     = rq->buff.page_order;
+ -	pp_params.flags     = 0; /* No-internal DMA mapping in page_pool */
+ -	pp_params.pool_size = pool_size;
+ -	pp_params.nid       = cpu_to_node(c->cpu);
+ -	pp_params.dev       = c->pdev;
+ -	pp_params.dma_dir   = rq->buff.map_dir;
+ -
+ -	/* page_pool can be used even when there is no rq->xdp_prog,
+ -	 * given page_pool does not handle DMA mapping there is no
+ -	 * required state to clear. And page_pool gracefully handle
+ -	 * elevated refcnt.
+ -	 */
+ -	rq->page_pool = page_pool_create(&pp_params);
+ -	if (IS_ERR(rq->page_pool)) {
+ -		if (rq->wq_type != MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ)
+ -			kfree(rq->wqe.frag_info);
+ -		err = PTR_ERR(rq->page_pool);
+ -		rq->page_pool = NULL;
+ -		goto err_rq_wq_destroy;
+ +	/* This must only be activate for order-0 pages */
+ +	if (rq->xdp_prog) {
+ +		err = xdp_rxq_info_reg_mem_model(&rq->xdp_rxq,
+ +						 MEM_TYPE_PAGE_ORDER0, NULL);
+ +		if (err)
+ +			goto err_rq_wq_destroy;
+  	}
+ -	err = xdp_rxq_info_reg_mem_model(&rq->xdp_rxq,
+ -					 MEM_TYPE_PAGE_POOL, rq->page_pool);
+ -	if (err)
+ -		goto err_rq_wq_destroy;
+  
+  	for (i = 0; i < wq_sz; i++) {
+ +		struct mlx5e_rx_wqe *wqe = mlx5_wq_ll_get_wqe(&rq->wq, i);
+ +
+  		if (rq->wq_type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ) {
+++<<<<<<< HEAD
+ +			u64 dma_offset = (u64)mlx5e_get_wqe_mtt_offset(rq, i) << PAGE_SHIFT;
+ +
+ +			wqe->data.addr = cpu_to_be64(dma_offset);
+++=======
++ 			struct mlx5e_rx_wqe_ll *wqe =
++ 				mlx5_wq_ll_get_wqe(&rq->mpwqe.wq, i);
++ 			u64 dma_offset = mlx5e_get_mpwqe_offset(rq, i);
++ 
++ 			wqe->data[0].addr = cpu_to_be64(dma_offset + rq->buff.headroom);
++ 			wqe->data[0].byte_count = cpu_to_be32(byte_count);
++ 			wqe->data[0].lkey = rq->mkey_be;
++ 		} else {
++ 			struct mlx5e_rx_wqe_cyc *wqe =
++ 				mlx5_wq_cyc_get_wqe(&rq->wqe.wq, i);
++ 
++ 			wqe->data[0].byte_count = cpu_to_be32(byte_count);
++ 			wqe->data[0].lkey = rq->mkey_be;
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  		}
+ +
+ +		wqe->data.byte_count = cpu_to_be32(byte_count);
+ +		wqe->data.lkey = rq->mkey_be;
+  	}
+  
+  	INIT_WORK(&rq->dim.work, mlx5e_rx_dim_work);
+@@@ -572,12 -621,16 +622,12 @@@ static void mlx5e_free_rq(struct mlx5e_
+  	if (rq->xdp_prog)
+  		bpf_prog_put(rq->xdp_prog);
+  
+ -	xdp_rxq_info_unreg(&rq->xdp_rxq);
+ -	if (rq->page_pool)
+ -		page_pool_destroy(rq->page_pool);
+ -
+  	switch (rq->wq_type) {
+  	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
+ -		kfree(rq->mpwqe.info);
+ +		mlx5e_rq_free_mpwqe_info(rq);
+  		mlx5_core_destroy_mkey(rq->mdev, &rq->umr_mkey);
+  		break;
+- 	default: /* MLX5_WQ_TYPE_LINKED_LIST */
++ 	default: /* MLX5_WQ_TYPE_CYCLIC */
+  		kfree(rq->wqe.frag_info);
+  	}
+  
+@@@ -748,28 -798,41 +798,58 @@@ static void mlx5e_free_rx_descs(struct 
+  	__be16 wqe_ix_be;
+  	u16 wqe_ix;
+  
+ -	if (rq->wq_type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ) {
+ -		struct mlx5_wq_ll *wq = &rq->mpwqe.wq;
+ -
+ +	/* UMR WQE (if in progress) is always at wq->head */
+ +	if (rq->wq_type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ &&
+ +	    rq->mpwqe.umr_in_progress)
+ +		mlx5e_free_rx_mpwqe(rq, &rq->mpwqe.info[wq->head]);
+ +
+++<<<<<<< HEAD
+ +	while (!mlx5_wq_ll_is_empty(wq)) {
+ +		wqe_ix_be = *wq->tail_next;
+ +		wqe_ix    = be16_to_cpu(wqe_ix_be);
+ +		wqe       = mlx5_wq_ll_get_wqe(&rq->wq, wqe_ix);
+ +		rq->dealloc_wqe(rq, wqe_ix);
+ +		mlx5_wq_ll_pop(&rq->wq, wqe_ix_be,
+ +			       &wqe->next.next_wqe_index);
+ +	}
+++=======
++ 		/* UMR WQE (if in progress) is always at wq->head */
++ 		if (rq->mpwqe.umr_in_progress)
++ 			mlx5e_free_rx_mpwqe(rq, &rq->mpwqe.info[wq->head]);
++ 
++ 		while (!mlx5_wq_ll_is_empty(wq)) {
++ 			struct mlx5e_rx_wqe_ll *wqe;
++ 
++ 			wqe_ix_be = *wq->tail_next;
++ 			wqe_ix    = be16_to_cpu(wqe_ix_be);
++ 			wqe       = mlx5_wq_ll_get_wqe(wq, wqe_ix);
++ 			rq->dealloc_wqe(rq, wqe_ix);
++ 			mlx5_wq_ll_pop(wq, wqe_ix_be,
++ 				       &wqe->next.next_wqe_index);
++ 		}
++ 	} else {
++ 		struct mlx5_wq_cyc *wq = &rq->wqe.wq;
++ 
++ 		while (!mlx5_wq_cyc_is_empty(wq)) {
++ 			wqe_ix = mlx5_wq_cyc_get_tail(wq);
++ 			rq->dealloc_wqe(rq, wqe_ix);
++ 			mlx5_wq_cyc_pop(wq);
++ 		}
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  
+ +	if (rq->wq_type == MLX5_WQ_TYPE_LINKED_LIST && rq->wqe.page_reuse) {
+  		/* Clean outstanding pages on handled WQEs that decided to do page-reuse,
+  		 * but yet to be re-posted.
+  		 */
+++<<<<<<< HEAD
+ +		int wq_sz = mlx5_wq_ll_get_size(&rq->wq);
+++=======
++ 		if (rq->wqe.page_reuse) {
++ 			int wq_sz = mlx5_wq_cyc_get_size(wq);
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  
+ -			for (wqe_ix = 0; wqe_ix < wq_sz; wqe_ix++)
+ -				rq->dealloc_wqe(rq, wqe_ix);
+ -		}
+ +		for (wqe_ix = 0; wqe_ix < wq_sz; wqe_ix++)
+ +			rq->dealloc_wqe(rq, wqe_ix);
+  	}
+  }
+  
+@@@ -1778,18 -1981,21 +1874,33 @@@ static void mlx5e_build_rq_param(struc
+  	switch (params->rq_wq_type) {
+  	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
+  		MLX5_SET(wq, wq, log_wqe_num_of_strides,
+ -			 mlx5e_mpwqe_get_log_num_strides(mdev, params) -
+ -			 MLX5_MPWQE_LOG_NUM_STRIDES_BASE);
+ +			 mlx5e_mpwqe_get_log_num_strides(mdev, params) - 9);
+  		MLX5_SET(wq, wq, log_wqe_stride_size,
+++<<<<<<< HEAD
+ +			 mlx5e_mpwqe_get_log_stride_size(mdev, params) - 6);
+ +		MLX5_SET(wq, wq, wq_type, MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ);
+ +		break;
+ +	default: /* MLX5_WQ_TYPE_LINKED_LIST */
+ +		MLX5_SET(wq, wq, wq_type, MLX5_WQ_TYPE_LINKED_LIST);
+++=======
++ 			 mlx5e_mpwqe_get_log_stride_size(mdev, params) -
++ 			 MLX5_MPWQE_LOG_STRIDE_SZ_BASE);
++ 		MLX5_SET(wq, wq, log_wq_sz, mlx5e_mpwqe_get_log_rq_size(params));
++ 		break;
++ 	default: /* MLX5_WQ_TYPE_CYCLIC */
++ 		MLX5_SET(wq, wq, log_wq_sz, params->log_rq_mtu_frames);
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  	}
+  
++ 	MLX5_SET(wq, wq, wq_type,          params->rq_wq_type);
+  	MLX5_SET(wq, wq, end_padding_mode, MLX5_WQ_END_PAD_MODE_ALIGN);
+++<<<<<<< HEAD
+ +	MLX5_SET(wq, wq, log_wq_stride,    ilog2(sizeof(struct mlx5e_rx_wqe)));
+ +	MLX5_SET(wq, wq, log_wq_sz,        params->log_rq_size);
+++=======
++ 	MLX5_SET(wq, wq, log_wq_stride,
++ 		 mlx5e_get_rqwq_log_stride(params->rq_wq_type, ndsegs));
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  	MLX5_SET(wq, wq, pd,               mdev->mlx5e_res.pdn);
+  	MLX5_SET(rqc, rqc, counter_set_id, priv->q_counter);
+  	MLX5_SET(rqc, rqc, vsd,            params->vlan_strip_disable);
+@@@ -1853,11 -2061,11 +1965,16 @@@ static void mlx5e_build_rx_cq_param(str
+  
+  	switch (params->rq_wq_type) {
+  	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
+ -		log_cq_size = mlx5e_mpwqe_get_log_rq_size(params) +
+ -			mlx5e_mpwqe_get_log_num_strides(mdev, params);
+ +		log_cq_size = params->log_rq_size +
+ +			mlx5e_mpwqe_get_log_num_strides(priv->mdev, params);
+  		break;
+++<<<<<<< HEAD
+ +	default: /* MLX5_WQ_TYPE_LINKED_LIST */
+ +		log_cq_size = params->log_rq_size;
+++=======
++ 	default: /* MLX5_WQ_TYPE_CYCLIC */
++ 		log_cq_size = params->log_rq_mtu_frames;
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  	}
+  
+  	MLX5_SET(cqc, cqc, log_cq_size, log_cq_size);
+@@@ -2662,8 -2870,8 +2779,13 @@@ static int mlx5e_alloc_drop_rq(struct m
+  
+  	param->wq.db_numa_node = param->wq.buf_numa_node;
+  
+++<<<<<<< HEAD
+ +	err = mlx5_wq_ll_create(mdev, &param->wq, rqc_wq, &rq->wq,
+ +				&rq->wq_ctrl);
+++=======
++ 	err = mlx5_wq_cyc_create(mdev, &param->wq, rqc_wq, &rq->wqe.wq,
++ 				 &rq->wq_ctrl);
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  	if (err)
+  		return err;
+  
+@@@ -3148,14 -3361,26 +3270,23 @@@ static int set_feature_lro(struct net_d
+  
+  	mutex_lock(&priv->state_lock);
+  
+ -	old_params = &priv->channels.params;
+ -	if (enable && !MLX5E_GET_PFLAG(old_params, MLX5E_PFLAG_RX_STRIDING_RQ)) {
+ -		netdev_warn(netdev, "can't set LRO with legacy RQ\n");
+ -		err = -EINVAL;
+ -		goto out;
+ -	}
+ -
+ -	reset = test_bit(MLX5E_STATE_OPENED, &priv->state);
+ +	reset = (priv->channels.params.rq_wq_type == MLX5_WQ_TYPE_LINKED_LIST);
+ +	reset = reset && test_bit(MLX5E_STATE_OPENED, &priv->state);
+  
+ -	new_channels.params = *old_params;
+ +	new_channels.params = priv->channels.params;
+  	new_channels.params.lro_en = enable;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (old_params->rq_wq_type != MLX5_WQ_TYPE_CYCLIC) {
++ 		if (mlx5e_rx_mpwqe_is_linear_skb(mdev, old_params) ==
++ 		    mlx5e_rx_mpwqe_is_linear_skb(mdev, &new_channels.params))
++ 			reset = false;
++ 	}
++ 
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  	if (!reset) {
+ -		*old_params = new_channels.params;
+ +		priv->channels.params = new_channels.params;
+  		err = mlx5e_modify_tirs_lro(priv);
+  		goto out;
+  	}
+@@@ -3339,15 -3572,23 +3470,28 @@@ int mlx5e_change_mtu(struct net_device 
+  	mutex_lock(&priv->state_lock);
+  
+  	params = &priv->channels.params;
+ +	reset = !params->lro_en &&
+ +		(params->rq_wq_type != MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ);
+  
+ -	reset = !params->lro_en;
+  	reset = reset && test_bit(MLX5E_STATE_OPENED, &priv->state);
+  
+++<<<<<<< HEAD
+++=======
++ 	new_channels.params = *params;
++ 	new_channels.params.sw_mtu = new_mtu;
++ 
++ 	if (params->rq_wq_type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ) {
++ 		u8 ppw_old = mlx5e_mpwqe_log_pkts_per_wqe(params);
++ 		u8 ppw_new = mlx5e_mpwqe_log_pkts_per_wqe(&new_channels.params);
++ 
++ 		reset = reset && (ppw_old != ppw_new);
++ 	}
++ 
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  	if (!reset) {
+  		params->sw_mtu = new_mtu;
+ -		set_mtu_cb(priv);
+ +		if (set_mtu_cb)
+ +			set_mtu_cb(priv);
+  		netdev->mtu = params->sw_mtu;
+  		goto out;
+  	}
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index 7aafa931adf7,3857f22b5500..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@@ -936,8 -927,8 +936,13 @@@ static void mlx5e_build_rep_params(stru
+  	params->hard_mtu    = MLX5E_ETH_HARD_MTU;
+  	params->sw_mtu      = mtu;
+  	params->log_sq_size = MLX5E_REP_PARAMS_LOG_SQ_SIZE;
+++<<<<<<< HEAD
+ +	params->rq_wq_type  = MLX5_WQ_TYPE_LINKED_LIST;
+ +	params->log_rq_size = MLX5E_REP_PARAMS_LOG_RQ_SIZE;
+++=======
++ 	params->rq_wq_type  = MLX5_WQ_TYPE_CYCLIC;
++ 	params->log_rq_mtu_frames = MLX5E_REP_PARAMS_LOG_RQ_SIZE;
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  
+  	params->rx_dim_enabled = MLX5_CAP_GEN(mdev, cq_moderation);
+  	mlx5e_set_rx_cq_mode_params(params, cq_period_mode);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index 29331bf7aa1d,3cdf2c097356..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -111,7 -113,7 +111,11 @@@ static inline void mlx5e_decompress_cqe
+  			mpwrq_get_cqe_consumed_strides(&cq->title);
+  	else
+  		cq->decmprs_wqe_counter =
+++<<<<<<< HEAD
+ +			(cq->decmprs_wqe_counter + 1) & rq->wq.sz_m1;
+++=======
++ 			mlx5_wq_cyc_ctr2ix(&rq->wqe.wq, cq->decmprs_wqe_counter + 1);
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  }
+  
+  static inline void mlx5e_decompress_cqe_no_hash(struct mlx5e_rq *rq,
+@@@ -413,47 -466,6 +422,52 @@@ err_unmap
+  	return err;
+  }
+  
+ +void mlx5e_free_rx_mpwqe(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi)
+ +{
+ +	int pg_strides = mlx5e_mpwqe_strides_per_page(rq);
+ +	struct mlx5e_dma_info *dma_info = &wi->umr.dma_info[0];
+ +	int i;
+ +
+ +	for (i = 0; i < MLX5_MPWRQ_PAGES_PER_WQE; i++, dma_info++) {
+ +		page_ref_sub(dma_info->page, pg_strides - wi->skbs_frags[i]);
+ +		mlx5e_page_release(rq, dma_info, true);
+ +	}
+ +}
+ +
+ +static void mlx5e_post_rx_mpwqe(struct mlx5e_rq *rq)
+ +{
+++<<<<<<< HEAD
+ +	struct mlx5_wq_ll *wq = &rq->wq;
+ +	struct mlx5e_rx_wqe *wqe = mlx5_wq_ll_get_wqe(wq, wq->head);
+++=======
+++	struct mlx5_wq_ll *wq = &rq->mpwqe.wq;
+++	struct mlx5e_rx_wqe_ll *wqe = mlx5_wq_ll_get_wqe(wq, wq->head);
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+ +
+ +	rq->mpwqe.umr_in_progress = false;
+ +
+ +	mlx5_wq_ll_push(wq, be16_to_cpu(wqe->next.next_wqe_index));
+ +
+ +	/* ensure wqes are visible to device before updating doorbell record */
+ +	dma_wmb();
+ +
+ +	mlx5_wq_ll_update_db_record(wq);
+ +}
+ +
+ +static int mlx5e_alloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix)
+ +{
+ +	int err;
+ +
+ +	err = mlx5e_alloc_rx_umr_mpwqe(rq, ix);
+ +	if (unlikely(err)) {
+ +		rq->stats->buff_alloc_err++;
+ +		return err;
+ +	}
+ +	rq->mpwqe.umr_in_progress = true;
+ +	mlx5e_post_umr_wqe(rq, ix);
+ +	return 0;
+ +}
+ +
+  void mlx5e_dealloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix)
+  {
+  	struct mlx5e_mpw_info *wi = &rq->mpwqe.info[ix];
+@@@ -463,13 -475,13 +477,17 @@@
+  
+  bool mlx5e_post_rx_wqes(struct mlx5e_rq *rq)
+  {
+++<<<<<<< HEAD
+ +	struct mlx5_wq_ll *wq = &rq->wq;
+++=======
++ 	struct mlx5_wq_cyc *wq = &rq->wqe.wq;
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  	int err;
+  
+ -	if (unlikely(!test_bit(MLX5E_RQ_STATE_ENABLED, &rq->state)))
+ +	if (unlikely(!MLX5E_TEST_BIT(rq->state, MLX5E_RQ_STATE_ENABLED)))
+  		return false;
+  
+- 	if (mlx5_wq_ll_is_full(wq))
++ 	if (mlx5_wq_cyc_is_full(wq))
+  		return false;
+  
+  	do {
+@@@ -926,18 -993,15 +945,26 @@@ struct sk_buff *skb_from_cqe(struct mlx
+  
+  void mlx5e_handle_rx_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct mlx5_wq_cyc *wq = &rq->wqe.wq;
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  	struct mlx5e_wqe_frag_info *wi;
+- 	struct mlx5e_rx_wqe *wqe;
+- 	__be16 wqe_counter_be;
+  	struct sk_buff *skb;
+- 	u16 wqe_counter;
+  	u32 cqe_bcnt;
++ 	u16 ci;
+  
+++<<<<<<< HEAD
+ +	wqe_counter_be = cqe->wqe_counter;
+ +	wqe_counter    = be16_to_cpu(wqe_counter_be);
+ +	wqe            = mlx5_wq_ll_get_wqe(&rq->wq, wqe_counter);
+ +	wi             = &rq->wqe.frag_info[wqe_counter];
+ +	cqe_bcnt       = be32_to_cpu(cqe->byte_cnt);
+++=======
++ 	ci       = mlx5_wq_cyc_ctr2ix(wq, be16_to_cpu(cqe->wqe_counter));
++ 	wi       = get_frag(rq, ci);
++ 	cqe_bcnt = be32_to_cpu(cqe->byte_cnt);
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  
+  	skb = skb_from_cqe(rq, cqe, wi, cqe_bcnt);
+  	if (!skb) {
+@@@ -956,9 -1020,8 +983,14 @@@
+  	napi_gro_receive(rq->cq.napi, skb);
+  
+  	mlx5e_free_rx_wqe_reuse(rq, wi);
+++<<<<<<< HEAD
+ +wq_ll_pop:
+ +	mlx5_wq_ll_pop(&rq->wq, wqe_counter_be,
+ +		       &wqe->next.next_wqe_index);
+++=======
++ wq_cyc_pop:
++ 	mlx5_wq_cyc_pop(wq);
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  }
+  
+  #ifdef CONFIG_MLX5_ESWITCH
+@@@ -968,18 -1031,15 +1000,26 @@@ void mlx5e_handle_rx_cqe_rep(struct mlx
+  	struct mlx5e_priv *priv = netdev_priv(netdev);
+  	struct mlx5e_rep_priv *rpriv  = priv->ppriv;
+  	struct mlx5_eswitch_rep *rep = rpriv->rep;
+++<<<<<<< HEAD
+++=======
++ 	struct mlx5_wq_cyc *wq = &rq->wqe.wq;
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  	struct mlx5e_wqe_frag_info *wi;
+- 	struct mlx5e_rx_wqe *wqe;
+  	struct sk_buff *skb;
+- 	__be16 wqe_counter_be;
+- 	u16 wqe_counter;
+  	u32 cqe_bcnt;
++ 	u16 ci;
+  
+++<<<<<<< HEAD
+ +	wqe_counter_be = cqe->wqe_counter;
+ +	wqe_counter    = be16_to_cpu(wqe_counter_be);
+ +	wqe            = mlx5_wq_ll_get_wqe(&rq->wq, wqe_counter);
+ +	wi             = &rq->wqe.frag_info[wqe_counter];
+ +	cqe_bcnt       = be32_to_cpu(cqe->byte_cnt);
+++=======
++ 	ci       = mlx5_wq_cyc_ctr2ix(wq, be16_to_cpu(cqe->wqe_counter));
++ 	wi       = get_frag(rq, ci);
++ 	cqe_bcnt = be32_to_cpu(cqe->byte_cnt);
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  
+  	skb = skb_from_cqe(rq, cqe, wi, cqe_bcnt);
+  	if (!skb) {
+@@@ -1001,9 -1061,8 +1041,14 @@@
+  	napi_gro_receive(rq->cq.napi, skb);
+  
+  	mlx5e_free_rx_wqe_reuse(rq, wi);
+++<<<<<<< HEAD
+ +wq_ll_pop:
+ +	mlx5_wq_ll_pop(&rq->wq, wqe_counter_be,
+ +		       &wqe->next.next_wqe_index);
+++=======
++ wq_cyc_pop:
++ 	mlx5_wq_cyc_pop(wq);
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  }
+  #endif
+  
+@@@ -1050,7 -1157,12 +1095,16 @@@ void mlx5e_handle_rx_cqe_mpwrq(struct m
+  	u16 cstrides       = mpwrq_get_cqe_consumed_strides(cqe);
+  	u16 wqe_id         = be16_to_cpu(cqe->wqe_id);
+  	struct mlx5e_mpw_info *wi = &rq->mpwqe.info[wqe_id];
+++<<<<<<< HEAD
+ +	struct mlx5e_rx_wqe  *wqe = mlx5_wq_ll_get_wqe(&rq->wq, wqe_id);
+++=======
++ 	u16 stride_ix      = mpwrq_get_cqe_stride_index(cqe);
++ 	u32 wqe_offset     = stride_ix << rq->mpwqe.log_stride_sz;
++ 	u32 head_offset    = wqe_offset & (PAGE_SIZE - 1);
++ 	u32 page_idx       = wqe_offset >> PAGE_SHIFT;
++ 	struct mlx5e_rx_wqe_ll *wqe;
++ 	struct mlx5_wq_ll *wq;
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  	struct sk_buff *skb;
+  	u16 cqe_bcnt;
+  
+@@@ -1295,18 -1399,15 +1349,26 @@@ static inline void mlx5i_complete_rx_cq
+  
+  void mlx5i_handle_rx_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct mlx5_wq_cyc *wq = &rq->wqe.wq;
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  	struct mlx5e_wqe_frag_info *wi;
+- 	struct mlx5e_rx_wqe *wqe;
+- 	__be16 wqe_counter_be;
+  	struct sk_buff *skb;
+- 	u16 wqe_counter;
+  	u32 cqe_bcnt;
++ 	u16 ci;
+  
+++<<<<<<< HEAD
+ +	wqe_counter_be = cqe->wqe_counter;
+ +	wqe_counter    = be16_to_cpu(wqe_counter_be);
+ +	wqe            = mlx5_wq_ll_get_wqe(&rq->wq, wqe_counter);
+ +	wi             = &rq->wqe.frag_info[wqe_counter];
+ +	cqe_bcnt       = be32_to_cpu(cqe->byte_cnt);
+++=======
++ 	ci       = mlx5_wq_cyc_ctr2ix(wq, be16_to_cpu(cqe->wqe_counter));
++ 	wi       = get_frag(rq, ci);
++ 	cqe_bcnt = be32_to_cpu(cqe->byte_cnt);
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  
+  	skb = skb_from_cqe(rq, cqe, wi, cqe_bcnt);
+  	if (!skb)
+@@@ -1321,8 -1422,7 +1383,12 @@@
+  
+  wq_free_wqe:
+  	mlx5e_free_rx_wqe_reuse(rq, wi);
+++<<<<<<< HEAD
+ +	mlx5_wq_ll_pop(&rq->wq, wqe_counter_be,
+ +		       &wqe->next.next_wqe_index);
+++=======
++ 	mlx5_wq_cyc_pop(wq);
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  }
+  
+  #endif /* CONFIG_MLX5_CORE_IPOIB */
+@@@ -1331,18 -1431,15 +1397,26 @@@
+  
+  void mlx5e_ipsec_handle_rx_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct mlx5_wq_cyc *wq = &rq->wqe.wq;
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  	struct mlx5e_wqe_frag_info *wi;
+- 	struct mlx5e_rx_wqe *wqe;
+- 	__be16 wqe_counter_be;
+  	struct sk_buff *skb;
+- 	u16 wqe_counter;
+  	u32 cqe_bcnt;
++ 	u16 ci;
+  
+++<<<<<<< HEAD
+ +	wqe_counter_be = cqe->wqe_counter;
+ +	wqe_counter    = be16_to_cpu(wqe_counter_be);
+ +	wqe            = mlx5_wq_ll_get_wqe(&rq->wq, wqe_counter);
+ +	wi             = &rq->wqe.frag_info[wqe_counter];
+ +	cqe_bcnt       = be32_to_cpu(cqe->byte_cnt);
+++=======
++ 	ci       = mlx5_wq_cyc_ctr2ix(wq, be16_to_cpu(cqe->wqe_counter));
++ 	wi       = get_frag(rq, ci);
++ 	cqe_bcnt = be32_to_cpu(cqe->byte_cnt);
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  
+  	skb = skb_from_cqe(rq, cqe, wi, cqe_bcnt);
+  	if (unlikely(!skb)) {
+@@@ -1360,9 -1457,8 +1434,14 @@@
+  	napi_gro_receive(rq->cq.napi, skb);
+  
+  	mlx5e_free_rx_wqe_reuse(rq, wi);
+++<<<<<<< HEAD
+ +wq_ll_pop:
+ +	mlx5_wq_ll_pop(&rq->wq, wqe_counter_be,
+ +		       &wqe->next.next_wqe_index);
+++=======
++ wq_cyc_pop:
++ 	mlx5_wq_cyc_pop(wq);
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  }
+  
+  #endif /* CONFIG_MLX5_EN_IPSEC */
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/wq.c
+index ea66448ba365,b97bb72b4db4..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/wq.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/wq.c
+@@@ -74,10 -79,13 +74,17 @@@ int mlx5_wq_cyc_create(struct mlx5_core
+  		       void *wqc, struct mlx5_wq_cyc *wq,
+  		       struct mlx5_wq_ctrl *wq_ctrl)
+  {
+ -	struct mlx5_frag_buf_ctrl *fbc = &wq->fbc;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	wq->log_stride = MLX5_GET(wq, wqc, log_wq_stride);
+ +	wq->sz_m1 = (1 << MLX5_GET(wq, wqc, log_wq_sz)) - 1;
+++=======
++ 	mlx5_fill_fbc(MLX5_GET(wq, wqc, log_wq_stride),
++ 		      MLX5_GET(wq, wqc, log_wq_sz),
++ 		      fbc);
++ 	wq->sz    = wq->fbc.sz_m1 + 1;
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  
+  	err = mlx5_db_alloc_node(mdev, &wq_ctrl->db, param->db_numa_node);
+  	if (err) {
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/wq.h
+index f3dfa0ca3c5d,0b47126815b6..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/wq.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/wq.h
+@@@ -48,17 -48,12 +48,23 @@@ struct mlx5_wq_ctrl 
+  	struct mlx5_db		db;
+  };
+  
+ +struct mlx5_frag_wq_ctrl {
+ +	struct mlx5_core_dev	*mdev;
+ +	struct mlx5_frag_buf	frag_buf;
+ +	struct mlx5_db		db;
+ +};
+ +
+  struct mlx5_wq_cyc {
+ -	struct mlx5_frag_buf_ctrl fbc;
+ +	void			*buf;
+  	__be32			*db;
+++<<<<<<< HEAD
+ +	u16			sz_m1;
+ +	u8			log_stride;
+++=======
++ 	u16			sz;
++ 	u16			wqe_ctr;
++ 	u16			cur_sz;
+++>>>>>>> 99cbfa93a612 (net/mlx5e: RX, Use cyclic WQ in legacy RQ)
+  };
+  
+  struct mlx5_wq_qp {
+@@@ -103,16 -97,67 +109,63 @@@ int mlx5_wq_ll_create(struct mlx5_core_
+  u32 mlx5_wq_ll_get_size(struct mlx5_wq_ll *wq);
+  
+  void mlx5_wq_destroy(struct mlx5_wq_ctrl *wq_ctrl);
+ +void mlx5_cqwq_destroy(struct mlx5_frag_wq_ctrl *wq_ctrl);
+  
++ static inline int mlx5_wq_cyc_is_full(struct mlx5_wq_cyc *wq)
++ {
++ 	return wq->cur_sz == wq->sz;
++ }
++ 
++ static inline int mlx5_wq_cyc_missing(struct mlx5_wq_cyc *wq)
++ {
++ 	return wq->sz - wq->cur_sz;
++ }
++ 
++ static inline int mlx5_wq_cyc_is_empty(struct mlx5_wq_cyc *wq)
++ {
++ 	return !wq->cur_sz;
++ }
++ 
++ static inline void mlx5_wq_cyc_push(struct mlx5_wq_cyc *wq)
++ {
++ 	wq->wqe_ctr++;
++ 	wq->cur_sz++;
++ }
++ 
++ static inline void mlx5_wq_cyc_push_n(struct mlx5_wq_cyc *wq, u8 n)
++ {
++ 	wq->wqe_ctr += n;
++ 	wq->cur_sz += n;
++ }
++ 
++ static inline void mlx5_wq_cyc_pop(struct mlx5_wq_cyc *wq)
++ {
++ 	wq->cur_sz--;
++ }
++ 
++ static inline void mlx5_wq_cyc_update_db_record(struct mlx5_wq_cyc *wq)
++ {
++ 	*wq->db = cpu_to_be32(wq->wqe_ctr);
++ }
++ 
+  static inline u16 mlx5_wq_cyc_ctr2ix(struct mlx5_wq_cyc *wq, u16 ctr)
+  {
+ -	return ctr & wq->fbc.sz_m1;
+ -}
+ -
+ -static inline u16 mlx5_wq_cyc_ctr2fragix(struct mlx5_wq_cyc *wq, u16 ctr)
+ -{
+ -	return ctr & wq->fbc.frag_sz_m1;
+ +	return ctr & wq->sz_m1;
+  }
+  
++ static inline u16 mlx5_wq_cyc_get_head(struct mlx5_wq_cyc *wq)
++ {
++ 	return mlx5_wq_cyc_ctr2ix(wq, wq->wqe_ctr);
++ }
++ 
++ static inline u16 mlx5_wq_cyc_get_tail(struct mlx5_wq_cyc *wq)
++ {
++ 	return mlx5_wq_cyc_ctr2ix(wq, wq->wqe_ctr - wq->cur_sz);
++ }
++ 
+  static inline void *mlx5_wq_cyc_get_wqe(struct mlx5_wq_cyc *wq, u16 ix)
+  {
+ -	return mlx5_frag_buf_get_wqe(&wq->fbc, ix);
+ +	return wq->buf + (ix << wq->log_stride);
+  }
+  
+  static inline int mlx5_wq_cyc_cc_bigger(u16 cc1, u16 cc2)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/wq.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/wq.h
