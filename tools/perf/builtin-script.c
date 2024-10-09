@@ -578,7 +578,7 @@ static void print_sample_bts(struct perf_sample *sample,
 			}
 		}
 		perf_evsel__print_ip(evsel, sample, al, print_opts,
-				     scripting_max_stack);
+				     scripting_max_stack, stdout);
 	}
 
 	/* print branch_to information */
@@ -710,7 +710,7 @@ static void process_event(struct perf_script *script,
 
 		perf_evsel__print_ip(evsel, sample, al,
 				     output[attr->type].print_ip_opts,
-				     scripting_max_stack);
+				     scripting_max_stack, stdout);
 	}
 
 	if (PRINT_FIELD(IREGS))
