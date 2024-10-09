@@ -1,0 +1,124 @@
+ovl: lockdep annotate of nested stacked overlayfs inode lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit b1eaa950f7e905aaffca0454aa05101ce4f6446a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b1eaa950.failed
+
+An overlayfs instance can be the lower layer of another overlayfs
+instance. This setup triggers a lockdep splat of possible recursive
+locking of sb->s_type->i_mutex_key in iterate_dir(). Trimmed snip:
+
+ [ INFO: possible recursive locking detected ]
+ bash/2468 is trying to acquire lock:
+  &sb->s_type->i_mutex_key#14, at: iterate_dir+0x7d/0x15c
+ but task is already holding lock:
+  &sb->s_type->i_mutex_key#14, at: iterate_dir+0x7d/0x15c
+
+One problem observed with this splat is that ovl_new_inode()
+does not call lockdep_annotate_inode_mutex_key() to annotate
+the dir inode lock as &sb->s_type->i_mutex_dir_key like other
+fs do.
+
+The other problem is that the 2 nested levels of overlayfs inode
+lock are annotated using the same key, which is the cause of the
+false positive lockdep warning.
+
+Fix this by annotating overlayfs inode lock in ovl_fill_inode()
+according to stack level of the super block instance and use
+different key for dir vs. non-dir like other fs do.
+
+Here is an edited snip from /proc/lockdep_chains after
+iterate_dir() of nested overlayfs:
+
+ [...] &ovl_i_mutex_dir_key[depth]   (stack_depth=2)
+ [...] &ovl_i_mutex_dir_key[depth]#2 (stack_depth=1)
+ [...] &type->i_mutex_dir_key        (stack_depth=0)
+
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit b1eaa950f7e905aaffca0454aa05101ce4f6446a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/inode.c
+diff --cc fs/overlayfs/inode.c
+index 470081ef3bc4,17b8418358ed..000000000000
+--- a/fs/overlayfs/inode.c
++++ b/fs/overlayfs/inode.c
+@@@ -371,18 -303,60 +371,70 @@@ static const struct inode_operations ov
+  	.update_time	= ovl_update_time,
+  };
+  
+++<<<<<<< HEAD
+ +static void ovl_fill_inode(struct inode *inode, umode_t mode)
+++=======
++ /*
++  * It is possible to stack overlayfs instance on top of another
++  * overlayfs instance as lower layer. We need to annonate the
++  * stackable i_mutex locks according to stack level of the super
++  * block instance. An overlayfs instance can never be in stack
++  * depth 0 (there is always a real fs below it).  An overlayfs
++  * inode lock will use the lockdep annotaion ovl_i_mutex_key[depth].
++  *
++  * For example, here is a snip from /proc/lockdep_chains after
++  * dir_iterate of nested overlayfs:
++  *
++  * [...] &ovl_i_mutex_dir_key[depth]   (stack_depth=2)
++  * [...] &ovl_i_mutex_dir_key[depth]#2 (stack_depth=1)
++  * [...] &type->i_mutex_dir_key        (stack_depth=0)
++  */
++ #define OVL_MAX_NESTING FILESYSTEM_MAX_STACK_DEPTH
++ 
++ static inline void ovl_lockdep_annotate_inode_mutex_key(struct inode *inode)
++ {
++ #ifdef CONFIG_LOCKDEP
++ 	static struct lock_class_key ovl_i_mutex_key[OVL_MAX_NESTING];
++ 	static struct lock_class_key ovl_i_mutex_dir_key[OVL_MAX_NESTING];
++ 
++ 	int depth = inode->i_sb->s_stack_depth - 1;
++ 
++ 	if (WARN_ON_ONCE(depth < 0 || depth >= OVL_MAX_NESTING))
++ 		depth = 0;
++ 
++ 	if (S_ISDIR(inode->i_mode))
++ 		lockdep_set_class(&inode->i_rwsem, &ovl_i_mutex_dir_key[depth]);
++ 	else
++ 		lockdep_set_class(&inode->i_rwsem, &ovl_i_mutex_key[depth]);
++ #endif
++ }
++ 
++ static void ovl_fill_inode(struct inode *inode, umode_t mode, dev_t rdev)
+++>>>>>>> b1eaa950f7e9 (ovl: lockdep annotate of nested stacked overlayfs inode lock)
+  {
+  	inode->i_ino = get_next_ino();
+  	inode->i_mode = mode;
+  	inode->i_flags |= S_NOCMTIME;
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_FS_POSIX_ACL
++ 	inode->i_acl = inode->i_default_acl = ACL_DONT_CACHE;
++ #endif
++ 
++ 	ovl_lockdep_annotate_inode_mutex_key(inode);
++ 
++ 	switch (mode & S_IFMT) {
++ 	case S_IFREG:
++ 		inode->i_op = &ovl_file_inode_operations;
++ 		break;
+++>>>>>>> b1eaa950f7e9 (ovl: lockdep annotate of nested stacked overlayfs inode lock)
+  
+ +	mode &= S_IFMT;
+ +	switch (mode) {
+  	case S_IFDIR:
+ -		inode->i_op = &ovl_dir_inode_operations;
+ +		inode->i_op = &ovl_dir_inode_operations.ops;
+  		inode->i_fop = &ovl_dir_operations;
+ +		inode->i_flags |= S_IOPS_WRAPPER;
+  		break;
+  
+  	case S_IFLNK:
+* Unmerged path fs/overlayfs/inode.c
