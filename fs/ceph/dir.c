@@ -232,6 +232,11 @@ static int __dcache_readdir(struct file *filp,
 		if (ret < 0)
 			err = ret;
 		dput(last);
+		/* last_name no longer match cache index */
+		if (fi->readdir_cache_idx >= 0) {
+			fi->readdir_cache_idx = -1;
+			fi->dir_release_count = 0;
+		}
 	}
 	return err;
 }
