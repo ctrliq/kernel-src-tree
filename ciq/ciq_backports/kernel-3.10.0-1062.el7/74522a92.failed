@@ -1,0 +1,243 @@
+scsi: mpt3sas: Optimize I/O memory consumption in driver.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [scsi] mpt3sas: Optimize I/O memory consumption in driver (Tomas Henzl) [1513855]
+Rebuild_FUZZ: 93.46%
+commit-author Chaitra P B <chaitra.basappa@broadcom.com>
+commit 74522a92bbf003111852d77f1a95d961c1de7baf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/74522a92.failed
+
+For every IO, memory of PAGE size is allocated for handling NVMe native
+PRPS. And in addition to that for every IO (chains need per IO * chain
+buffer size, e.g. 38 * 128byte) amount of memory is allocated for chain
+buffers.
+
+However, at any point of time; the IO request can be for NVMe target
+device (where PRP's page is used for framing PRP's) or can be for SCSI
+target device (where chain buffers are used for framing chain
+SGE's). This patch modifies the driver to reuse same pre-allocated PRP
+page buffers as a chain buffer for IO's targeted for SCSI target
+devices. No need to allocate separate buffers for chain SGE's buffers.
+
+Suppose if the number of chain buffers need for IO doesn't fit in the
+PRP Page size then driver maintain's separate buffers for those extra
+chain buffers that exceeds the PRP page size. For example consider PRP
+page size as 4K and chain buffer size as 128 bytes, then number of chain
+buffers that can fit in PRP page is 4096/128 => 32. if the number of
+chain buffer need per IO exceeds 32; for example consider number of
+chains need per IO is 36 then for remaining 4 chain buffer's driver
+allocates them individual.
+
+	Signed-off-by: Chaitra P B <chaitra.basappa@broadcom.com>
+	Signed-off-by: Suganath Prabu S <suganath-prabu.subramani@broadcom.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 74522a92bbf003111852d77f1a95d961c1de7baf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/mpt3sas/mpt3sas_base.c
+diff --cc drivers/scsi/mpt3sas/mpt3sas_base.c
+index 32e701bf73f2,2863a3b334c3..000000000000
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.c
+@@@ -3311,14 -4190,19 +3311,27 @@@ _base_release_memory_pools(struct MPT3S
+  	kfree(ioc->hpr_lookup);
+  	kfree(ioc->internal_lookup);
+  	if (ioc->chain_lookup) {
+++<<<<<<< HEAD
+ +		for (i = 0; i < ioc->chain_depth; i++) {
+ +			if (ioc->chain_lookup[i].chain_buffer)
+ +				dma_pool_free(ioc->chain_dma_pool,
+ +				    ioc->chain_lookup[i].chain_buffer,
+ +				    ioc->chain_lookup[i].chain_buffer_dma);
+++=======
++ 		for (i = 0; i < ioc->scsiio_depth; i++) {
++ 			for (j = ioc->chains_per_prp_buffer;
++ 			    j < ioc->chains_needed_per_io; j++) {
++ 				ct = &ioc->chain_lookup[i].chains_per_smid[j];
++ 				if (ct && ct->chain_buffer)
++ 					dma_pool_free(ioc->chain_dma_pool,
++ 						ct->chain_buffer,
++ 						ct->chain_buffer_dma);
++ 			}
++ 			kfree(ioc->chain_lookup[i].chains_per_smid);
+++>>>>>>> 74522a92bbf0 (scsi: mpt3sas: Optimize I/O memory consumption in driver.)
+  		}
+  		dma_pool_destroy(ioc->chain_dma_pool);
+ -		kfree(ioc->chain_lookup);
+ +		free_pages((ulong)ioc->chain_lookup, ioc->chain_pages);
+  		ioc->chain_lookup = NULL;
+  	}
+  }
+@@@ -3623,37 -4506,23 +3636,54 @@@ _base_allocate_memory_pools(struct MPT3
+  		ioc->name, ioc->request, ioc->scsiio_depth));
+  
+  	ioc->chain_depth = min_t(u32, ioc->chain_depth, MAX_CHAIN_DEPTH);
+ -	sz = ioc->scsiio_depth * sizeof(struct chain_lookup);
+ -	ioc->chain_lookup = kzalloc(sz, GFP_KERNEL);
+ +	sz = ioc->chain_depth * sizeof(struct chain_tracker);
+ +	ioc->chain_pages = get_order(sz);
+ +	ioc->chain_lookup = (struct chain_tracker *)__get_free_pages(
+ +	    GFP_KERNEL, ioc->chain_pages);
+  	if (!ioc->chain_lookup) {
+++<<<<<<< HEAD
+ +		pr_err(MPT3SAS_FMT "chain_lookup: __get_free_pages failed\n",
+ +			ioc->name);
+ +		goto out;
+ +	}
+ +	ioc->chain_dma_pool = dma_pool_create("chain pool", &ioc->pdev->dev,
+ +	    ioc->chain_segment_sz, 16, 0);
+ +	if (!ioc->chain_dma_pool) {
+ +		pr_err(MPT3SAS_FMT "chain_dma_pool: dma_pool_create failed\n",
+ +			ioc->name);
+ +		goto out;
+ +	}
+ +	for (i = 0; i < ioc->chain_depth; i++) {
+ +		ioc->chain_lookup[i].chain_buffer = dma_pool_alloc(
+ +		    ioc->chain_dma_pool , GFP_KERNEL,
+ +		    &ioc->chain_lookup[i].chain_buffer_dma);
+ +		if (!ioc->chain_lookup[i].chain_buffer) {
+ +			ioc->chain_depth = i;
+ +			goto chain_done;
+ +		}
+ +		total_sz += ioc->chain_segment_sz;
+ +	}
+ + chain_done:
+ +	dinitprintk(ioc, pr_info(MPT3SAS_FMT
+ +		"chain pool depth(%d), frame_size(%d), pool_size(%d kB)\n",
+ +		ioc->name, ioc->chain_depth, ioc->chain_segment_sz,
+ +		((ioc->chain_depth *  ioc->chain_segment_sz))/1024));
+++=======
++ 		pr_err(MPT3SAS_FMT "chain_lookup: __get_free_pages "
++ 				"failed\n", ioc->name);
++ 		goto out;
++ 	}
++ 
++ 	sz = ioc->chains_needed_per_io * sizeof(struct chain_tracker);
++ 	for (i = 0; i < ioc->scsiio_depth; i++) {
++ 		ioc->chain_lookup[i].chains_per_smid = kzalloc(sz, GFP_KERNEL);
++ 		if (!ioc->chain_lookup[i].chains_per_smid) {
++ 			pr_err(MPT3SAS_FMT "chain_lookup: "
++ 					" kzalloc failed\n", ioc->name);
++ 			goto out;
++ 		}
++ 	}
+++>>>>>>> 74522a92bbf0 (scsi: mpt3sas: Optimize I/O memory consumption in driver.)
+  
+  	/* initialize hi-priority queue smid's */
+  	ioc->hpr_lookup = kcalloc(ioc->hi_priority_depth,
+@@@ -3682,7 -4551,106 +3712,110 @@@
+  		"internal(0x%p): depth(%d), start smid(%d)\n",
+  		ioc->name, ioc->internal,
+  	    ioc->internal_depth, ioc->internal_smid));
+++<<<<<<< HEAD
+++
+++=======
++ 	/*
++ 	 * The number of NVMe page sized blocks needed is:
++ 	 *     (((sg_tablesize * 8) - 1) / (page_size - 8)) + 1
++ 	 * ((sg_tablesize * 8) - 1) is the max PRP's minus the first PRP entry
++ 	 * that is placed in the main message frame.  8 is the size of each PRP
++ 	 * entry or PRP list pointer entry.  8 is subtracted from page_size
++ 	 * because of the PRP list pointer entry at the end of a page, so this
++ 	 * is not counted as a PRP entry.  The 1 added page is a round up.
++ 	 *
++ 	 * To avoid allocation failures due to the amount of memory that could
++ 	 * be required for NVMe PRP's, only each set of NVMe blocks will be
++ 	 * contiguous, so a new set is allocated for each possible I/O.
++ 	 */
++ 	ioc->chains_per_prp_buffer = 0;
++ 	if (ioc->facts.ProtocolFlags & MPI2_IOCFACTS_PROTOCOL_NVME_DEVICES) {
++ 		nvme_blocks_needed =
++ 			(ioc->shost->sg_tablesize * NVME_PRP_SIZE) - 1;
++ 		nvme_blocks_needed /= (ioc->page_size - NVME_PRP_SIZE);
++ 		nvme_blocks_needed++;
++ 
++ 		sz = sizeof(struct pcie_sg_list) * ioc->scsiio_depth;
++ 		ioc->pcie_sg_lookup = kzalloc(sz, GFP_KERNEL);
++ 		if (!ioc->pcie_sg_lookup) {
++ 			pr_info(MPT3SAS_FMT
++ 			    "PCIe SGL lookup: kzalloc failed\n", ioc->name);
++ 			goto out;
++ 		}
++ 		sz = nvme_blocks_needed * ioc->page_size;
++ 		ioc->pcie_sgl_dma_pool =
++ 			dma_pool_create("PCIe SGL pool", &ioc->pdev->dev, sz, 16, 0);
++ 		if (!ioc->pcie_sgl_dma_pool) {
++ 			pr_info(MPT3SAS_FMT
++ 			    "PCIe SGL pool: dma_pool_create failed\n",
++ 			    ioc->name);
++ 			goto out;
++ 		}
++ 
++ 		ioc->chains_per_prp_buffer = sz/ioc->chain_segment_sz;
++ 		ioc->chains_per_prp_buffer = min(ioc->chains_per_prp_buffer,
++ 						ioc->chains_needed_per_io);
++ 
++ 		for (i = 0; i < ioc->scsiio_depth; i++) {
++ 			ioc->pcie_sg_lookup[i].pcie_sgl = dma_pool_alloc(
++ 				ioc->pcie_sgl_dma_pool, GFP_KERNEL,
++ 				&ioc->pcie_sg_lookup[i].pcie_sgl_dma);
++ 			if (!ioc->pcie_sg_lookup[i].pcie_sgl) {
++ 				pr_info(MPT3SAS_FMT
++ 				    "PCIe SGL pool: dma_pool_alloc failed\n",
++ 				    ioc->name);
++ 				goto out;
++ 			}
++ 			for (j = 0; j < ioc->chains_per_prp_buffer; j++) {
++ 				ct = &ioc->chain_lookup[i].chains_per_smid[j];
++ 				ct->chain_buffer =
++ 				    ioc->pcie_sg_lookup[i].pcie_sgl +
++ 				    (j * ioc->chain_segment_sz);
++ 				ct->chain_buffer_dma =
++ 				    ioc->pcie_sg_lookup[i].pcie_sgl_dma +
++ 				    (j * ioc->chain_segment_sz);
++ 			}
++ 		}
++ 
++ 		dinitprintk(ioc, pr_info(MPT3SAS_FMT "PCIe sgl pool depth(%d), "
++ 			"element_size(%d), pool_size(%d kB)\n", ioc->name,
++ 			ioc->scsiio_depth, sz, (sz * ioc->scsiio_depth)/1024));
++ 		dinitprintk(ioc, pr_info(MPT3SAS_FMT "Number of chains can "
++ 		    "fit in a PRP page(%d)\n", ioc->name,
++ 		    ioc->chains_per_prp_buffer));
++ 		total_sz += sz * ioc->scsiio_depth;
++ 	}
++ 
++ 	ioc->chain_dma_pool = dma_pool_create("chain pool", &ioc->pdev->dev,
++ 	    ioc->chain_segment_sz, 16, 0);
++ 	if (!ioc->chain_dma_pool) {
++ 		pr_err(MPT3SAS_FMT "chain_dma_pool: dma_pool_create failed\n",
++ 			ioc->name);
++ 		goto out;
++ 	}
++ 	for (i = 0; i < ioc->scsiio_depth; i++) {
++ 		for (j = ioc->chains_per_prp_buffer;
++ 				j < ioc->chains_needed_per_io; j++) {
++ 			ct = &ioc->chain_lookup[i].chains_per_smid[j];
++ 			ct->chain_buffer = dma_pool_alloc(
++ 					ioc->chain_dma_pool, GFP_KERNEL,
++ 					&ct->chain_buffer_dma);
++ 			if (!ct->chain_buffer) {
++ 				pr_err(MPT3SAS_FMT "chain_lookup: "
++ 				" pci_pool_alloc failed\n", ioc->name);
++ 				_base_release_memory_pools(ioc);
++ 				goto out;
++ 			}
++ 		}
++ 		total_sz += ioc->chain_segment_sz;
++ 	}
++ 
++ 	dinitprintk(ioc, pr_info(MPT3SAS_FMT
++ 		"chain pool depth(%d), frame_size(%d), pool_size(%d kB)\n",
++ 		ioc->name, ioc->chain_depth, ioc->chain_segment_sz,
++ 		((ioc->chain_depth *  ioc->chain_segment_sz))/1024));
+  
+++>>>>>>> 74522a92bbf0 (scsi: mpt3sas: Optimize I/O memory consumption in driver.)
+  	/* sense buffers, 4 byte align */
+  	sz = ioc->scsiio_depth * SCSI_SENSE_BUFFERSIZE;
+  	ioc->sense_dma_pool = dma_pool_create("sense pool", &ioc->pdev->dev, sz,
+* Unmerged path drivers/scsi/mpt3sas/mpt3sas_base.c
