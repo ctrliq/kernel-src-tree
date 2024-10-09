@@ -1,0 +1,256 @@
+KVM: x86: implement MSR_IA32_TSX_CTRL effect on CPUID
+
+jira LE-1907
+cve CVE-2019-19338
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit edef5c36b0c7f07ab4926f6c9e50731f3772c79d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/edef5c36.failed
+
+Because KVM always emulates CPUID, the CPUID clear bit
+(bit 1) of MSR_IA32_TSX_CTRL must be emulated "manually"
+by the hypervisor when performing said emulation.
+
+Right now neither kvm-intel.ko nor kvm-amd.ko implement
+MSR_IA32_TSX_CTRL but this will change in the next patch.
+
+	Reviewed-by: Jim Mattson <jmattson@google.com>
+	Tested-by: Jim Mattson <jmattson@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit edef5c36b0c7f07ab4926f6c9e50731f3772c79d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/cpuid.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index 35f22ae3e497,663d09ac7778..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -1184,8 -1357,11 +1184,16 @@@ static inline int emulate_instruction(s
+  
+  void kvm_enable_efer_bits(u64);
+  bool kvm_valid_efer(struct kvm_vcpu *vcpu, u64 efer);
+++<<<<<<< HEAD
+ +int kvm_get_msr(struct kvm_vcpu *vcpu, struct msr_data *msr);
+ +int kvm_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr);
+++=======
++ int __kvm_get_msr(struct kvm_vcpu *vcpu, u32 index, u64 *data, bool host_initiated);
++ int kvm_get_msr(struct kvm_vcpu *vcpu, u32 index, u64 *data);
++ int kvm_set_msr(struct kvm_vcpu *vcpu, u32 index, u64 data);
++ int kvm_emulate_rdmsr(struct kvm_vcpu *vcpu);
++ int kvm_emulate_wrmsr(struct kvm_vcpu *vcpu);
+++>>>>>>> edef5c36b0c7 (KVM: x86: implement MSR_IA32_TSX_CTRL effect on CPUID)
+  
+  struct x86_emulate_ctxt;
+  
+diff --cc arch/x86/kvm/cpuid.c
+index efff14a23b4d,c0aa07487eb8..000000000000
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@@ -695,21 -807,17 +695,19 @@@ out
+  	return r;
+  }
+  
+ -static int do_cpuid_func(struct kvm_cpuid_entry2 *entry, u32 func,
+ -			 int *nent, int maxnent, unsigned int type)
+ +static int do_cpuid_ent(struct kvm_cpuid_entry2 *entry, u32 func,
+ +			u32 idx, int *nent, int maxnent, unsigned int type)
+  {
+  	if (type == KVM_GET_EMULATED_CPUID)
+ -		return __do_cpuid_func_emulated(entry, func, nent, maxnent);
+ +		return __do_cpuid_ent_emulated(entry, func, idx, nent, maxnent);
+  
+ -	return __do_cpuid_func(entry, func, nent, maxnent);
+ +	return __do_cpuid_ent(entry, func, idx, nent, maxnent);
+  }
+  
+- #undef F
+- 
+  struct kvm_cpuid_param {
+  	u32 func;
+ +	u32 idx;
+ +	bool has_leaf_count;
+  	bool (*qualifier)(const struct kvm_cpuid_param *param);
+  };
+  
+@@@ -865,44 -972,72 +863,75 @@@ struct kvm_cpuid_entry2 *kvm_find_cpuid
+  EXPORT_SYMBOL_GPL(kvm_find_cpuid_entry);
+  
+  /*
+ - * If the basic or extended CPUID leaf requested is higher than the
+ - * maximum supported basic or extended leaf, respectively, then it is
+ - * out of range.
+ + * If no match is found, check whether we exceed the vCPU's limit
+ + * and return the content of the highest valid _standard_ leaf instead.
+ + * This is to satisfy the CPUID specification.
+   */
+ -static bool cpuid_function_in_range(struct kvm_vcpu *vcpu, u32 function)
+ +static struct kvm_cpuid_entry2* check_cpuid_limit(struct kvm_vcpu *vcpu,
+ +                                                  u32 function, u32 index)
+  {
+ -	struct kvm_cpuid_entry2 *max;
+ -
+ -	max = kvm_find_cpuid_entry(vcpu, function & 0x80000000, 0);
+ -	return max && function <= max->eax;
+ +	struct kvm_cpuid_entry2 *maxlevel;
+ +
+ +	maxlevel = kvm_find_cpuid_entry(vcpu, function & 0x80000000, 0);
+ +	if (!maxlevel || maxlevel->eax >= function)
+ +		return NULL;
+ +	if (function & 0x80000000) {
+ +		maxlevel = kvm_find_cpuid_entry(vcpu, 0, 0);
+ +		if (!maxlevel)
+ +			return NULL;
+ +	}
+ +	return kvm_find_cpuid_entry(vcpu, maxlevel->eax, index);
+  }
+  
+ -bool kvm_cpuid(struct kvm_vcpu *vcpu, u32 *eax, u32 *ebx,
+ -	       u32 *ecx, u32 *edx, bool check_limit)
+ +void kvm_cpuid(struct kvm_vcpu *vcpu, u32 *eax, u32 *ebx, u32 *ecx, u32 *edx)
+  {
+  	u32 function = *eax, index = *ecx;
+ -	struct kvm_cpuid_entry2 *entry;
+ -	struct kvm_cpuid_entry2 *max;
+ -	bool found;
+ +	struct kvm_cpuid_entry2 *best;
+  
+++<<<<<<< HEAD
+ +	best = kvm_find_cpuid_entry(vcpu, function, index);
+ +
+ +	if (!best)
+ +		best = check_cpuid_limit(vcpu, function, index);
+ +
+ +	if (best) {
+ +		*eax = best->eax;
+ +		*ebx = best->ebx;
+ +		*ecx = best->ecx;
+ +		*edx = best->edx;
+ +	} else
+++=======
++ 	entry = kvm_find_cpuid_entry(vcpu, function, index);
++ 	found = entry;
++ 	/*
++ 	 * Intel CPUID semantics treats any query for an out-of-range
++ 	 * leaf as if the highest basic leaf (i.e. CPUID.0H:EAX) were
++ 	 * requested. AMD CPUID semantics returns all zeroes for any
++ 	 * undefined leaf, whether or not the leaf is in range.
++ 	 */
++ 	if (!entry && check_limit && !guest_cpuid_is_amd(vcpu) &&
++ 	    !cpuid_function_in_range(vcpu, function)) {
++ 		max = kvm_find_cpuid_entry(vcpu, 0, 0);
++ 		if (max) {
++ 			function = max->eax;
++ 			entry = kvm_find_cpuid_entry(vcpu, function, index);
++ 		}
++ 	}
++ 	if (entry) {
++ 		*eax = entry->eax;
++ 		*ebx = entry->ebx;
++ 		*ecx = entry->ecx;
++ 		*edx = entry->edx;
++ 		if (function == 7 && index == 0) {
++ 			u64 data;
++ 		        if (!__kvm_get_msr(vcpu, MSR_IA32_TSX_CTRL, &data, true) &&
++ 			    (data & TSX_CTRL_CPUID_CLEAR))
++ 				*ebx &= ~(F(RTM) | F(HLE));
++ 		}
++ 	} else {
+++>>>>>>> edef5c36b0c7 (KVM: x86: implement MSR_IA32_TSX_CTRL effect on CPUID)
+  		*eax = *ebx = *ecx = *edx = 0;
+ -		/*
+ -		 * When leaf 0BH or 1FH is defined, CL is pass-through
+ -		 * and EDX is always the x2APIC ID, even for undefined
+ -		 * subleaves. Index 1 will exist iff the leaf is
+ -		 * implemented, so we pass through CL iff leaf 1
+ -		 * exists. EDX can be copied from any existing index.
+ -		 */
+ -		if (function == 0xb || function == 0x1f) {
+ -			entry = kvm_find_cpuid_entry(vcpu, function, 1);
+ -			if (entry) {
+ -				*ecx = index & 0xff;
+ -				*edx = entry->edx;
+ -			}
+ -		}
+ -	}
+ -	trace_kvm_cpuid(function, *eax, *ebx, *ecx, *edx, found);
+ -	return found;
+ +	trace_kvm_cpuid(function, *eax, *ebx, *ecx, *edx);
+  }
+  EXPORT_SYMBOL_GPL(kvm_cpuid);
+  
+diff --cc arch/x86/kvm/x86.c
+index 5be8b7fd8c76,648e84e728fc..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -1102,9 -1456,58 +1102,50 @@@ int kvm_set_msr(struct kvm_vcpu *vcpu, 
+  		break;
+  	case MSR_IA32_SYSENTER_EIP:
+  	case MSR_IA32_SYSENTER_ESP:
+ -		/*
+ -		 * IA32_SYSENTER_ESP and IA32_SYSENTER_EIP cause #GP if
+ -		 * non-canonical address is written on Intel but not on
+ -		 * AMD (which ignores the top 32-bits, because it does
+ -		 * not implement 64-bit SYSENTER).
+ -		 *
+ -		 * 64-bit code should hence be able to write a non-canonical
+ -		 * value on AMD.  Making the address canonical ensures that
+ -		 * vmentry does not fail on Intel after writing a non-canonical
+ -		 * value, and that something deterministic happens if the guest
+ -		 * invokes 64-bit SYSENTER.
+ -		 */
+ -		data = get_canonical(data, vcpu_virt_addr_bits(vcpu));
+ +		msr->data = get_canonical(msr->data);
+  	}
+++<<<<<<< HEAD
+ +	return kvm_x86_ops->set_msr(vcpu, msr);
+++=======
++ 
++ 	msr.data = data;
++ 	msr.index = index;
++ 	msr.host_initiated = host_initiated;
++ 
++ 	return kvm_x86_ops->set_msr(vcpu, &msr);
++ }
++ 
++ /*
++  * Read the MSR specified by @index into @data.  Select MSR specific fault
++  * checks are bypassed if @host_initiated is %true.
++  * Returns 0 on success, non-0 otherwise.
++  * Assumes vcpu_load() was already called.
++  */
++ int __kvm_get_msr(struct kvm_vcpu *vcpu, u32 index, u64 *data,
++ 		  bool host_initiated)
++ {
++ 	struct msr_data msr;
++ 	int ret;
++ 
++ 	msr.index = index;
++ 	msr.host_initiated = host_initiated;
++ 
++ 	ret = kvm_x86_ops->get_msr(vcpu, &msr);
++ 	if (!ret)
++ 		*data = msr.data;
++ 	return ret;
++ }
++ 
++ int kvm_get_msr(struct kvm_vcpu *vcpu, u32 index, u64 *data)
++ {
++ 	return __kvm_get_msr(vcpu, index, data, false);
++ }
++ EXPORT_SYMBOL_GPL(kvm_get_msr);
++ 
++ int kvm_set_msr(struct kvm_vcpu *vcpu, u32 index, u64 data)
++ {
++ 	return __kvm_set_msr(vcpu, index, data, false);
+++>>>>>>> edef5c36b0c7 (KVM: x86: implement MSR_IA32_TSX_CTRL effect on CPUID)
+  }
+  EXPORT_SYMBOL_GPL(kvm_set_msr);
+  
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/cpuid.c
+* Unmerged path arch/x86/kvm/x86.c
