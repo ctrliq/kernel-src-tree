@@ -1,0 +1,407 @@
+ceph: rados pool namespace support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Yan, Zheng <zyan@redhat.com>
+commit 779fe0fb8e1883d5c479ac6bd85fbd237deed1f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/779fe0fb.failed
+
+This patch adds codes that decode pool namespace information in
+cap message and request reply. Pool namespace is saved in i_layout,
+it will be passed to libceph when doing read/write.
+
+	Signed-off-by: Yan, Zheng <zyan@redhat.com>
+(cherry picked from commit 779fe0fb8e1883d5c479ac6bd85fbd237deed1f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/addr.c
+#	fs/ceph/caps.c
+#	fs/ceph/inode.c
+#	fs/ceph/ioctl.c
+#	fs/ceph/mds_client.c
+#	fs/ceph/mds_client.h
+#	fs/ceph/xattr.c
+diff --cc fs/ceph/addr.c
+index adf7d1009bc0,d5b6f959a3c3..000000000000
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@@ -1721,7 -1730,8 +1721,12 @@@ enum 
+  	POOL_WRITE	= 2,
+  };
+  
+++<<<<<<< HEAD
+ +static int __ceph_pool_perm_get(struct ceph_inode_info *ci, u32 pool)
+++=======
++ static int __ceph_pool_perm_get(struct ceph_inode_info *ci,
++ 				s64 pool, struct ceph_string *pool_ns)
+++>>>>>>> 779fe0fb8e18 (ceph: rados pool namespace support)
+  {
+  	struct ceph_fs_client *fsc = ceph_inode_to_client(&ci->vfs_inode);
+  	struct ceph_mds_client *mdsc = fsc->mdsc;
+@@@ -1748,9 -1768,14 +1763,18 @@@
+  	if (*p)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	dout("__ceph_pool_perm_get pool %u no perm cached\n", pool);
+++=======
++ 	if (pool_ns)
++ 		dout("__ceph_pool_perm_get pool %lld ns %.*s no perm cached\n",
++ 		     pool, (int)pool_ns->len, pool_ns->str);
++ 	else
++ 		dout("__ceph_pool_perm_get pool %lld no perm cached\n", pool);
+++>>>>>>> 779fe0fb8e18 (ceph: rados pool namespace support)
+  
+  	down_write(&mdsc->pool_perm_rwsem);
++ 	p = &mdsc->pool_perm_tree.rb_node;
+  	parent = NULL;
+  	while (*p) {
+  		parent = *p;
+@@@ -1852,28 -1893,20 +1893,43 @@@ out_unlock
+  out:
+  	if (!err)
+  		err = have;
+++<<<<<<< HEAD
+ +	dout("__ceph_pool_perm_get pool %u result = %d\n", pool, err);
+++=======
++ 	if (pool_ns)
++ 		dout("__ceph_pool_perm_get pool %lld ns %.*s result = %d\n",
++ 		     pool, (int)pool_ns->len, pool_ns->str, err);
++ 	else
++ 		dout("__ceph_pool_perm_get pool %lld result = %d\n", pool, err);
+++>>>>>>> 779fe0fb8e18 (ceph: rados pool namespace support)
+  	return err;
+  }
+  
+  int ceph_pool_perm_check(struct ceph_inode_info *ci, int need)
+  {
+++<<<<<<< HEAD
+ +	u32 pool;
+ +	int ret, flags;
+ +
+ +	/* does not support pool namespace yet */
+ +	if (ci->i_pool_ns_len)
+ +		return -EIO;
+ +
+ +	if (ci->i_vino.snap != CEPH_NOSNAP) {
+ +		/*
+ +		 * Pool permission check needs to write to the first object.
+ +		 * But for snapshot, head of the first object may have alread
+ +		 * been deleted. Skip check to avoid creating orphan object.
+ +		 */
+ +		return 0;
+ +	}
+ +
+++=======
++ 	s64 pool;
++ 	struct ceph_string *pool_ns;
++ 	int ret, flags;
++ 
+++>>>>>>> 779fe0fb8e18 (ceph: rados pool namespace support)
+  	if (ceph_test_mount_opt(ceph_inode_to_client(&ci->vfs_inode),
+  				NOPOOLPERM))
+  		return 0;
+@@@ -1908,10 -1943,11 +1966,16 @@@ check
+  		flags |= CEPH_I_POOL_WR;
+  
+  	spin_lock(&ci->i_ceph_lock);
+++<<<<<<< HEAD
+ +	if (pool == ceph_file_layout_pg_pool(ci->i_layout)) {
+ +		ci->i_ceph_flags = flags;
+++=======
++ 	if (pool == ci->i_layout.pool_id &&
++ 	    pool_ns == rcu_dereference_raw(ci->i_layout.pool_ns)) {
++ 		ci->i_ceph_flags |= flags;
+++>>>>>>> 779fe0fb8e18 (ceph: rados pool namespace support)
+          } else {
+ -		pool = ci->i_layout.pool_id;
+ +		pool = ceph_file_layout_pg_pool(ci->i_layout);
+  		flags = ci->i_ceph_flags;
+  	}
+  	spin_unlock(&ci->i_ceph_lock);
+diff --cc fs/ceph/caps.c
+index 18838e531007,0a9406a8a794..000000000000
+--- a/fs/ceph/caps.c
++++ b/fs/ceph/caps.c
+@@@ -3135,8 -2894,18 +3134,23 @@@ static void handle_cap_grant(struct cep
+  
+  	if (newcaps & (CEPH_CAP_ANY_FILE_RD | CEPH_CAP_ANY_FILE_WR)) {
+  		/* file layout may have changed */
+++<<<<<<< HEAD
+ +		ci->i_layout = grant->layout;
+ +		ci->i_pool_ns_len = pool_ns_len;
+++=======
++ 		s64 old_pool = ci->i_layout.pool_id;
++ 		struct ceph_string *old_ns;
++ 
++ 		ceph_file_layout_from_legacy(&ci->i_layout, &grant->layout);
++ 		old_ns = rcu_dereference_protected(ci->i_layout.pool_ns,
++ 					lockdep_is_held(&ci->i_ceph_lock));
++ 		rcu_assign_pointer(ci->i_layout.pool_ns, *pns);
++ 
++ 		if (ci->i_layout.pool_id != old_pool || *pns != old_ns)
++ 			ci->i_ceph_flags &= ~CEPH_I_POOL_PERM;
+++>>>>>>> 779fe0fb8e18 (ceph: rados pool namespace support)
++ 
++ 		*pns = old_ns;
+  
+  		/* size/truncate_seq? */
+  		queue_trunc = ceph_fill_file_size(inode, issued,
+@@@ -3784,7 -3493,10 +3793,14 @@@ void ceph_handle_caps(struct ceph_mds_s
+  	if (le16_to_cpu(msg->hdr.version) >= 8) {
+  		u64 flush_tid;
+  		u32 caller_uid, caller_gid;
+- 
+++<<<<<<< HEAD
+++
+++=======
++ 		u32 osd_epoch_barrier;
++ 		u32 pool_ns_len;
++ 		/* version >= 5 */
++ 		ceph_decode_32_safe(&p, end, osd_epoch_barrier, bad);
+++>>>>>>> 779fe0fb8e18 (ceph: rados pool namespace support)
+  		/* version >= 6 */
+  		ceph_decode_64_safe(&p, end, flush_tid, bad);
+  		/* version >= 7 */
+@@@ -3812,10 -3529,9 +3833,10 @@@
+  			cap = ceph_get_cap(mdsc, NULL);
+  			cap->cap_ino = vino.ino;
+  			cap->queue_release = 1;
+- 			cap->cap_id = cap_id;
++ 			cap->cap_id = le64_to_cpu(h->cap_id);
+  			cap->mseq = mseq;
+  			cap->seq = seq;
+ +			cap->issue_seq = seq;
+  			spin_lock(&session->s_cap_lock);
+  			list_add_tail(&cap->session_caps,
+  					&session->s_cap_releases);
+diff --cc fs/ceph/inode.c
+index e8aea0cbac25,dc032566ed71..000000000000
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@@ -441,7 -446,7 +441,11 @@@ struct inode *ceph_alloc_inode(struct s
+  	ci->i_symlink = NULL;
+  
+  	memset(&ci->i_dir_layout, 0, sizeof(ci->i_dir_layout));
+++<<<<<<< HEAD
+ +	ci->i_pool_ns_len = 0;
+++=======
++ 	RCU_INIT_POINTER(ci->i_layout.pool_ns, NULL);
+++>>>>>>> 779fe0fb8e18 (ceph: rados pool namespace support)
+  
+  	ci->i_fragtree = RB_ROOT;
+  	mutex_init(&ci->i_fragtree_mutex);
+@@@ -561,6 -570,8 +565,11 @@@ void ceph_destroy_inode(struct inode *i
+  	if (ci->i_xattrs.prealloc_blob)
+  		ceph_buffer_put(ci->i_xattrs.prealloc_blob);
+  
+++<<<<<<< HEAD
+++=======
++ 	ceph_put_string(rcu_dereference_raw(ci->i_layout.pool_ns));
++ 
+++>>>>>>> 779fe0fb8e18 (ceph: rados pool namespace support)
+  	call_rcu(&inode->i_rcu, ceph_i_callback);
+  }
+  
+@@@ -801,11 -821,19 +815,25 @@@ static int fill_inode(struct inode *ino
+  
+  	if (new_version ||
+  	    (new_issued & (CEPH_CAP_ANY_FILE_RD | CEPH_CAP_ANY_FILE_WR))) {
+++<<<<<<< HEAD
+ +		if (ci->i_layout.fl_pg_pool != info->layout.fl_pg_pool)
+++=======
++ 		s64 old_pool = ci->i_layout.pool_id;
++ 		struct ceph_string *old_ns;
++ 
++ 		ceph_file_layout_from_legacy(&ci->i_layout, &info->layout);
++ 		old_ns = rcu_dereference_protected(ci->i_layout.pool_ns,
++ 					lockdep_is_held(&ci->i_ceph_lock));
++ 		rcu_assign_pointer(ci->i_layout.pool_ns, pool_ns);
++ 
++ 		if (ci->i_layout.pool_id != old_pool || pool_ns != old_ns)
+++>>>>>>> 779fe0fb8e18 (ceph: rados pool namespace support)
+  			ci->i_ceph_flags &= ~CEPH_I_POOL_PERM;
+ +		ci->i_layout = info->layout;
+ +		ci->i_pool_ns_len = iinfo->pool_ns_len;
+  
++ 		pool_ns = old_ns;
++ 
+  		queue_trunc = ceph_fill_file_size(inode, issued,
+  					le32_to_cpu(info->truncate_seq),
+  					le64_to_cpu(info->truncate_size),
+diff --cc fs/ceph/ioctl.c
+index c4904b66320d,6a30101b55ef..000000000000
+--- a/fs/ceph/ioctl.c
++++ b/fs/ceph/ioctl.c
+@@@ -212,7 -212,8 +212,12 @@@ static long ceph_ioctl_get_dataloc(stru
+  	snprintf(dl.object_name, sizeof(dl.object_name), "%llx.%08llx",
+  		 ceph_ino(inode), dl.object_no);
+  
+++<<<<<<< HEAD
+ +	oloc.pool = ceph_file_layout_pg_pool(ci->i_layout);
+++=======
++ 	oloc.pool = ci->i_layout.pool_id;
++ 	oloc.pool_ns = ceph_try_get_string(ci->i_layout.pool_ns);
+++>>>>>>> 779fe0fb8e18 (ceph: rados pool namespace support)
+  	ceph_oid_printf(&oid, "%s", dl.object_name);
+  
+  	r = ceph_object_locator_to_pg(osdc->osdmap, &oid, &oloc, &pgid);
+diff --cc fs/ceph/mds_client.c
+index b252f485a1dc,46641bbc8056..000000000000
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@@ -2383,14 -2295,6 +2386,17 @@@ int ceph_mdsc_do_request(struct ceph_md
+  		ceph_get_cap_refs(ceph_inode(req->r_old_dentry_dir),
+  				  CEPH_CAP_PIN);
+  
+++<<<<<<< HEAD
+ +	/* deny access to directories with pool_ns layouts */
+ +	if (req->r_inode && S_ISDIR(req->r_inode->i_mode) &&
+ +	    ceph_inode(req->r_inode)->i_pool_ns_len)
+ +		return -EIO;
+ +	if (test_bit(CEPH_MDS_R_PARENT_LOCKED, &req->r_req_flags) &&
+ +	    ceph_inode(req->r_parent)->i_pool_ns_len)
+ +		return -EIO;
+ +
+++=======
+++>>>>>>> 779fe0fb8e18 (ceph: rados pool namespace support)
+  	/* issue */
+  	mutex_lock(&mdsc->mutex);
+  	__register_request(mdsc, req, dir);
+diff --cc fs/ceph/mds_client.h
+index 3c0db49cd37e,2ce8e9f9bfc9..000000000000
+--- a/fs/ceph/mds_client.h
++++ b/fs/ceph/mds_client.h
+@@@ -285,8 -276,10 +286,14 @@@ struct ceph_mds_request 
+  
+  struct ceph_pool_perm {
+  	struct rb_node node;
+ +	u32 pool;
+  	int perm;
+++<<<<<<< HEAD
+++=======
++ 	s64 pool;
++ 	size_t pool_ns_len;
++ 	char pool_ns[];
+++>>>>>>> 779fe0fb8e18 (ceph: rados pool namespace support)
+  };
+  
+  /*
+diff --cc fs/ceph/xattr.c
+index 4a72e8322a31,adc231892b0d..000000000000
+--- a/fs/ceph/xattr.c
++++ b/fs/ceph/xattr.c
+@@@ -66,44 -66,56 +63,90 @@@ static bool ceph_vxattrcb_layout_exists
+  static size_t ceph_vxattrcb_layout(struct ceph_inode_info *ci, char *val,
+  				   size_t size)
+  {
+- 	int ret;
+  	struct ceph_fs_client *fsc = ceph_sb_to_client(ci->vfs_inode.i_sb);
+  	struct ceph_osd_client *osdc = &fsc->client->osdc;
+++<<<<<<< HEAD
+ +	s64 pool = ceph_file_layout_pg_pool(ci->i_layout);
+++=======
++ 	struct ceph_string *pool_ns;
++ 	s64 pool = ci->i_layout.pool_id;
+++>>>>>>> 779fe0fb8e18 (ceph: rados pool namespace support)
+  	const char *pool_name;
++ 	const char *ns_field = " pool_namespace=";
+  	char buf[128];
++ 	size_t len, total_len = 0;
++ 	int ret;
++ 
++ 	pool_ns = ceph_try_get_string(ci->i_layout.pool_ns);
+  
+  	dout("ceph_vxattrcb_layout %p\n", &ci->vfs_inode);
+  	down_read(&osdc->lock);
+  	pool_name = ceph_pg_pool_name_by_id(osdc->osdmap, pool);
+  	if (pool_name) {
+++<<<<<<< HEAD
+ +		size_t len = strlen(pool_name);
+ +		ret = snprintf(buf, sizeof(buf),
+ +		"stripe_unit=%lld stripe_count=%lld object_size=%lld pool=",
+ +		(unsigned long long)ceph_file_layout_su(ci->i_layout),
+ +		(unsigned long long)ceph_file_layout_stripe_count(ci->i_layout),
+ +	        (unsigned long long)ceph_file_layout_object_size(ci->i_layout));
+ +		if (!size) {
+ +			ret += len;
+ +		} else if (ret + len > size) {
+ +			ret = -ERANGE;
+ +		} else {
+ +			memcpy(val, buf, ret);
+ +			memcpy(val + ret, pool_name, len);
+ +			ret += len;
+ +		}
+ +	} else {
+ +		ret = snprintf(buf, sizeof(buf),
+ +		"stripe_unit=%lld stripe_count=%lld object_size=%lld pool=%lld",
+ +		(unsigned long long)ceph_file_layout_su(ci->i_layout),
+ +		(unsigned long long)ceph_file_layout_stripe_count(ci->i_layout),
+ +	        (unsigned long long)ceph_file_layout_object_size(ci->i_layout),
+ +		(unsigned long long)pool);
+ +		if (size) {
+ +			if (ret <= size)
+ +				memcpy(val, buf, ret);
+ +			else
+ +				ret = -ERANGE;
+++=======
++ 		len = snprintf(buf, sizeof(buf),
++ 		"stripe_unit=%u stripe_count=%u object_size=%u pool=",
++ 		ci->i_layout.stripe_unit, ci->i_layout.stripe_count,
++ 	        ci->i_layout.object_size);
++ 		total_len = len + strlen(pool_name);
++ 	} else {
++ 		len = snprintf(buf, sizeof(buf),
++ 		"stripe_unit=%u stripe_count=%u object_size=%u pool=%lld",
++ 		ci->i_layout.stripe_unit, ci->i_layout.stripe_count,
++ 	        ci->i_layout.object_size, (unsigned long long)pool);
++ 		total_len = len;
++ 	}
++ 
++ 	if (pool_ns)
++ 		total_len += strlen(ns_field) + pool_ns->len;
++ 
++ 	if (!size) {
++ 		ret = total_len;
++ 	} else if (total_len > size) {
++ 		ret = -ERANGE;
++ 	} else {
++ 		memcpy(val, buf, len);
++ 		ret = len;
++ 		if (pool_name) {
++ 			len = strlen(pool_name);
++ 			memcpy(val + ret, pool_name, len);
++ 			ret += len;
++ 		}
++ 		if (pool_ns) {
++ 			len = strlen(ns_field);
++ 			memcpy(val + ret, ns_field, len);
++ 			ret += len;
++ 			memcpy(val + ret, pool_ns->str, pool_ns->len);
++ 			ret += pool_ns->len;
+++>>>>>>> 779fe0fb8e18 (ceph: rados pool namespace support)
+  		}
+  	}
+  	up_read(&osdc->lock);
+* Unmerged path fs/ceph/addr.c
+* Unmerged path fs/ceph/caps.c
+* Unmerged path fs/ceph/inode.c
+* Unmerged path fs/ceph/ioctl.c
+* Unmerged path fs/ceph/mds_client.c
+* Unmerged path fs/ceph/mds_client.h
+diff --git a/fs/ceph/super.h b/fs/ceph/super.h
+index 2ea6359d8d08..a2a454ed3663 100644
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@ -292,7 +292,6 @@ struct ceph_inode_info {
+ 
+ 	struct ceph_dir_layout i_dir_layout;
+ 	struct ceph_file_layout i_layout;
+-	size_t i_pool_ns_len;
+ 	char *i_symlink;
+ 
+ 	/* for dirs */
+* Unmerged path fs/ceph/xattr.c
