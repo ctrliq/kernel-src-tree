@@ -873,7 +873,7 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
 			 "I/O %d QID %d timeout, reset controller\n",
 			 req->tag, nvmeq->qid);
 		nvme_dev_disable(dev, false);
-		queue_work(nvme_workq, &dev->reset_work);
+		nvme_reset(dev);
 
 		/*
 		 * Mark the request as handled, since the inline shutdown
@@ -1295,7 +1295,7 @@ static void nvme_watchdog_timer(unsigned long data)
 
 	/* Skip controllers under certain specific conditions. */
 	if (nvme_should_reset(dev, csts)) {
-		if (queue_work(nvme_workq, &dev->reset_work))
+		if (!nvme_reset(dev))
 			dev_warn(dev->dev,
 				"Failed status: 0x%x, reset controller.\n",
 				csts);
@@ -1864,11 +1864,10 @@ static int nvme_reset(struct nvme_dev *dev)
 {
 	if (!dev->ctrl.admin_q || blk_queue_dying(dev->ctrl.admin_q))
 		return -ENODEV;
-
+	if (work_busy(&dev->reset_work))
+		return -ENODEV;
 	if (!queue_work(nvme_workq, &dev->reset_work))
 		return -EBUSY;
-
-	flush_work(&dev->reset_work);
 	return 0;
 }
 
@@ -1892,7 +1891,12 @@ static int nvme_pci_reg_read64(struct nvme_ctrl *ctrl, u32 off, u64 *val)
 
 static int nvme_pci_reset_ctrl(struct nvme_ctrl *ctrl)
 {
-	return nvme_reset(to_nvme_dev(ctrl));
+	struct nvme_dev *dev = to_nvme_dev(ctrl);
+	int ret = nvme_reset(dev);
+
+	if (!ret)
+		flush_work(&dev->reset_work);
+	return ret;
 }
 
 static const struct nvme_ctrl_ops nvme_pci_ctrl_ops = {
@@ -1993,7 +1997,7 @@ static void nvme_reset_notify(struct pci_dev *pdev, bool prepare)
 	if (prepare)
 		nvme_dev_disable(dev, false);
 	else
-		queue_work(nvme_workq, &dev->reset_work);
+		nvme_reset(dev);
 }
 
 static void nvme_shutdown(struct pci_dev *pdev)
@@ -2042,7 +2046,7 @@ static int nvme_resume(struct device *dev)
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct nvme_dev *ndev = pci_get_drvdata(pdev);
 
-	queue_work(nvme_workq, &ndev->reset_work);
+	nvme_reset(ndev);
 	return 0;
 }
 
@@ -2077,7 +2081,7 @@ static pci_ers_result_t nvme_slot_reset(struct pci_dev *pdev)
 
 	dev_info(&pdev->dev, "restart after slot reset\n");
 	pci_restore_state(pdev);
-	queue_work(nvme_workq, &dev->reset_work);
+	nvme_reset(dev);
 	return PCI_ERS_RESULT_RECOVERED;
 }
 
