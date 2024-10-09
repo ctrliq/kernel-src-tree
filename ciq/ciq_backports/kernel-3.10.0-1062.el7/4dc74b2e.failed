@@ -1,0 +1,290 @@
+scsi: mpt3sas: Convert mlsleading uses of pr_<level> with MPT3SAS_FMT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [scsi] mpt3sas: Convert mlsleading uses of pr_<level> with MPT3SAS_FMT (Tomas Henzl) [1642370]
+Rebuild_FUZZ: 95.45%
+commit-author Joe Perches <joe@perches.com>
+commit 4dc74b2eb9ea780a1a97d603e9c0baa0cd6ccf8c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/4dc74b2e.failed
+
+These have misordered uses of __func__ and ioc->name that could mismatch
+MPT3SAS_FMT and "%s: ".
+
+Convert them to ioc_<level>.
+
+	Signed-off-by: Joe Perches <joe@perches.com>
+	Acked-by: Suganath Prabu <suganath-prabu.subramani@broadcom.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 4dc74b2eb9ea780a1a97d603e9c0baa0cd6ccf8c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/mpt3sas/mpt3sas_transport.c
+diff --cc drivers/scsi/mpt3sas/mpt3sas_transport.c
+index e56990fd083f,09034a3fba2c..000000000000
+--- a/drivers/scsi/mpt3sas/mpt3sas_transport.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_transport.c
+@@@ -1891,27 -1880,19 +1887,33 @@@ _transport_smp_handler(struct Scsi_Hos
+  	u16 smid;
+  	u32 ioc_state;
+  	void *psge;
+ -	dma_addr_t dma_addr_in;
+ -	dma_addr_t dma_addr_out;
+ -	void *addr_in = NULL;
+ -	void *addr_out = NULL;
+ -	size_t dma_len_in;
+ -	size_t dma_len_out;
+ +	u8 issue_reset = 0;
+ +	dma_addr_t dma_addr_in = 0;
+ +	dma_addr_t dma_addr_out = 0;
+ +	dma_addr_t pci_dma_in = 0;
+ +	dma_addr_t pci_dma_out = 0;
+ +	void *pci_addr_in = NULL;
+ +	void *pci_addr_out = NULL;
+  	u16 wait_state_count;
+ -	unsigned int reslen = 0;
+ +	struct request *rsp = req->next_rq;
+ +	struct bio_vec *bvec = NULL;
+ +
+ +	if (!rsp) {
+ +		pr_err(MPT3SAS_FMT "%s: the smp response space is missing\n",
+ +			ioc->name, __func__);
+ +		return -EINVAL;
+ +	}
+  
+  	if (ioc->shost_recovery || ioc->pci_error_recovery) {
+++<<<<<<< HEAD
+ +		pr_info(MPT3SAS_FMT "%s: host reset in progress!\n",
+ +		    __func__, ioc->name);
+ +		return -EFAULT;
+++=======
++ 		ioc_info(ioc, "%s: host reset in progress!\n", __func__);
++ 		rc = -EFAULT;
++ 		goto job_done;
+++>>>>>>> 4dc74b2eb9ea (scsi: mpt3sas: Convert mlsleading uses of pr_<level> with MPT3SAS_FMT)
+  	}
+  
+  	rc = mutex_lock_interruptible(&ioc->transport_cmds.mutex);
+@@@ -2035,83 -1970,49 +2037,82 @@@
+  	wait_for_completion_timeout(&ioc->transport_cmds.done, 10*HZ);
+  
+  	if (!(ioc->transport_cmds.status & MPT3_CMD_COMPLETE)) {
+- 		pr_err(MPT3SAS_FMT "%s : timeout\n",
+- 		    __func__, ioc->name);
++ 		ioc_err(ioc, "%s: timeout\n", __func__);
+  		_debug_dump_mf(mpi_request,
+  		    sizeof(Mpi2SmpPassthroughRequest_t)/4);
+ -		if (!(ioc->transport_cmds.status & MPT3_CMD_RESET)) {
+ -			mpt3sas_base_hard_reset_handler(ioc, FORCE_BIG_HAMMER);
+ -			rc = -ETIMEDOUT;
+ -			goto unmap_in;
+ -		}
+ +		if (!(ioc->transport_cmds.status & MPT3_CMD_RESET))
+ +			issue_reset = 1;
+ +		goto issue_host_reset;
+  	}
+  
+ -	dtransportprintk(ioc, ioc_info(ioc, "%s - complete\n", __func__));
+ +	dtransportprintk(ioc, pr_info(MPT3SAS_FMT
+ +		"%s - complete\n", ioc->name, __func__));
+ +
+ +	if (ioc->transport_cmds.status & MPT3_CMD_REPLY_VALID) {
+ +
+ +		mpi_reply = ioc->transport_cmds.reply;
+  
+ -	if (!(ioc->transport_cmds.status & MPT3_CMD_REPLY_VALID)) {
+ -		dtransportprintk(ioc,
+ -				 ioc_info(ioc, "%s: no reply\n", __func__));
+ +		dtransportprintk(ioc, pr_info(MPT3SAS_FMT
+ +		    "%s - reply data transfer size(%d)\n",
+ +		    ioc->name, __func__,
+ +		    le16_to_cpu(mpi_reply->ResponseDataLength)));
+ +
+ +		memcpy(req->sense, mpi_reply, sizeof(*mpi_reply));
+ +		req->sense_len = sizeof(*mpi_reply);
+ +		req->resid_len = 0;
+ +		rsp->resid_len -=
+ +		    le16_to_cpu(mpi_reply->ResponseDataLength);
+ +
+ +		/* check if the resp needs to be copied from the allocated
+ +		 * pci mem */
+ +		if (rsp->bio->bi_vcnt > 1) {
+ +			u32 offset = 0;
+ +			u32 bytes_to_copy =
+ +			    le16_to_cpu(mpi_reply->ResponseDataLength);
+ +			bio_for_each_segment(bvec, rsp->bio, i) {
+ +				if (bytes_to_copy <= bvec->bv_len) {
+ +					memcpy(page_address(bvec->bv_page) +
+ +					    bvec->bv_offset, pci_addr_in +
+ +					    offset, bytes_to_copy);
+ +					break;
+ +				} else {
+ +					memcpy(page_address(bvec->bv_page) +
+ +					    bvec->bv_offset, pci_addr_in +
+ +					    offset, bvec->bv_len);
+ +					bytes_to_copy -= bvec->bv_len;
+ +				}
+ +				offset += bvec->bv_len;
+ +			}
+ +		}
+ +	} else {
+ +		dtransportprintk(ioc, pr_info(MPT3SAS_FMT
+ +		    "%s - no reply\n", ioc->name, __func__));
+  		rc = -ENXIO;
+ -		goto unmap_in;
+  	}
+  
+ -	mpi_reply = ioc->transport_cmds.reply;
+ + issue_host_reset:
+ +	if (issue_reset) {
+ +		mpt3sas_base_hard_reset_handler(ioc, FORCE_BIG_HAMMER);
+ +		rc = -ETIMEDOUT;
+ +	}
+  
+ -	dtransportprintk(ioc,
+ -			 ioc_info(ioc, "%s: reply data transfer size(%d)\n",
+ -				  __func__,
+ -				  le16_to_cpu(mpi_reply->ResponseDataLength)));
+ + unmap:
+ +	if (dma_addr_out)
+ +		pci_unmap_single(ioc->pdev, dma_addr_out, blk_rq_bytes(req),
+ +		    PCI_DMA_BIDIRECTIONAL);
+ +	if (dma_addr_in)
+ +		pci_unmap_single(ioc->pdev, dma_addr_in, blk_rq_bytes(rsp),
+ +		    PCI_DMA_BIDIRECTIONAL);
+  
+ -	memcpy(job->reply, mpi_reply, sizeof(*mpi_reply));
+ -	job->reply_len = sizeof(*mpi_reply);
+ -	reslen = le16_to_cpu(mpi_reply->ResponseDataLength);
+ + free_pci:
+ +	if (pci_addr_out)
+ +		pci_free_consistent(ioc->pdev, blk_rq_bytes(req), pci_addr_out,
+ +		    pci_dma_out);
+  
+ -	if (addr_in) {
+ -		sg_copy_to_buffer(job->reply_payload.sg_list,
+ -				job->reply_payload.sg_cnt, addr_in,
+ -				job->reply_payload.payload_len);
+ -	}
+ +	if (pci_addr_in)
+ +		pci_free_consistent(ioc->pdev, blk_rq_bytes(rsp), pci_addr_in,
+ +		    pci_dma_in);
+  
+ -	rc = 0;
+ - unmap_in:
+ -	_transport_unmap_smp_buffer(&ioc->pdev->dev, &job->reply_payload,
+ -			dma_addr_in, addr_in);
+ - unmap_out:
+ -	_transport_unmap_smp_buffer(&ioc->pdev->dev, &job->request_payload,
+ -			dma_addr_out, addr_out);
+   out:
+  	ioc->transport_cmds.status = MPT3_CMD_NOT_USED;
+  	mutex_unlock(&ioc->transport_cmds.mutex);
+diff --git a/drivers/scsi/mpt3sas/mpt3sas_scsih.c b/drivers/scsi/mpt3sas/mpt3sas_scsih.c
+index 9086915b17c4..d5cc86ab9e31 100644
+--- a/drivers/scsi/mpt3sas/mpt3sas_scsih.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_scsih.c
+@@ -2763,15 +2763,13 @@ mpt3sas_scsih_issue_tm(struct MPT3SAS_ADAPTER *ioc, u16 handle, uint channel,
+ 	lockdep_assert_held(&ioc->tm_cmds.mutex);
+ 
+ 	if (ioc->tm_cmds.status != MPT3_CMD_NOT_USED) {
+-		pr_info(MPT3SAS_FMT "%s: tm_cmd busy!!!\n",
+-		    __func__, ioc->name);
++		ioc_info(ioc, "%s: tm_cmd busy!!!\n", __func__);
+ 		return FAILED;
+ 	}
+ 
+ 	if (ioc->shost_recovery || ioc->remove_host ||
+ 	    ioc->pci_error_recovery) {
+-		pr_info(MPT3SAS_FMT "%s: host reset in progress!\n",
+-		    __func__, ioc->name);
++		ioc_info(ioc, "%s: host reset in progress!\n", __func__);
+ 		return FAILED;
+ 	}
+ 
+@@ -3707,18 +3705,16 @@ _scsih_tm_tr_send(struct MPT3SAS_ADAPTER *ioc, u16 handle)
+ 	u32 ioc_state;
+ 
+ 	if (ioc->pci_error_recovery) {
+-		dewtprintk(ioc, pr_info(MPT3SAS_FMT
+-			"%s: host in pci error recovery: handle(0x%04x)\n",
+-			__func__, ioc->name,
+-		    handle));
++		dewtprintk(ioc,
++			   ioc_info(ioc, "%s: host in pci error recovery: handle(0x%04x)\n",
++				    __func__, handle));
+ 		return;
+ 	}
+ 	ioc_state = mpt3sas_base_get_iocstate(ioc, 1);
+ 	if (ioc_state != MPI2_IOC_STATE_OPERATIONAL) {
+-		dewtprintk(ioc, pr_info(MPT3SAS_FMT
+-			"%s: host is not operational: handle(0x%04x)\n",
+-			__func__, ioc->name,
+-		   handle));
++		dewtprintk(ioc,
++			   ioc_info(ioc, "%s: host is not operational: handle(0x%04x)\n",
++				    __func__, handle));
+ 		return;
+ 	}
+ 
+@@ -3973,9 +3969,9 @@ _scsih_tm_tr_volume_send(struct MPT3SAS_ADAPTER *ioc, u16 handle)
+ 	struct _tr_list *delayed_tr;
+ 
+ 	if (ioc->pci_error_recovery) {
+-		dewtprintk(ioc, pr_info(MPT3SAS_FMT
+-			"%s: host reset in progress!\n",
+-			__func__, ioc->name));
++		dewtprintk(ioc,
++			   ioc_info(ioc, "%s: host reset in progress!\n",
++				    __func__));
+ 		return;
+ 	}
+ 
+@@ -4026,9 +4022,9 @@ _scsih_tm_volume_tr_complete(struct MPT3SAS_ADAPTER *ioc, u16 smid,
+ 	    mpt3sas_base_get_reply_virt_addr(ioc, reply);
+ 
+ 	if (ioc->shost_recovery || ioc->pci_error_recovery) {
+-		dewtprintk(ioc, pr_info(MPT3SAS_FMT
+-			"%s: host reset in progress!\n",
+-			__func__, ioc->name));
++		dewtprintk(ioc,
++			   ioc_info(ioc, "%s: host reset in progress!\n",
++				    __func__));
+ 		return 1;
+ 	}
+ 	if (unlikely(!mpi_reply)) {
+@@ -4115,21 +4111,21 @@ _scsih_issue_delayed_sas_io_unit_ctrl(struct MPT3SAS_ADAPTER *ioc,
+ 	unsigned long flags;
+ 
+ 	if (ioc->remove_host) {
+-		dewtprintk(ioc, pr_info(MPT3SAS_FMT
+-			    "%s: host has been removed\n",
+-			     __func__, ioc->name));
++		dewtprintk(ioc,
++			   ioc_info(ioc, "%s: host has been removed\n",
++				    __func__));
+ 		return;
+ 	} else if (ioc->pci_error_recovery) {
+-		dewtprintk(ioc, pr_info(MPT3SAS_FMT
+-			    "%s: host in pci error recovery\n",
+-			    __func__, ioc->name));
++		dewtprintk(ioc,
++			   ioc_info(ioc, "%s: host in pci error recovery\n",
++				    __func__));
+ 		return;
+ 	}
+ 	ioc_state = mpt3sas_base_get_iocstate(ioc, 1);
+ 	if (ioc_state != MPI2_IOC_STATE_OPERATIONAL) {
+-		dewtprintk(ioc, pr_info(MPT3SAS_FMT
+-		    "%s: host is not operational\n",
+-		    __func__, ioc->name));
++		dewtprintk(ioc,
++			   ioc_info(ioc, "%s: host is not operational\n",
++				    __func__));
+ 		return;
+ 	}
+ 
+* Unmerged path drivers/scsi/mpt3sas/mpt3sas_transport.c
