@@ -1,0 +1,129 @@
+net/mlx5e: Enabling aRFS mechanism
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Enabling aRFS mechanism (Don Dutile) [1383273 1417284]
+Rebuild_FUZZ: 93.75%
+commit-author Maor Gottlieb <maorg@mellanox.com>
+commit 45bf454ae88414e80b80979ebb2c22bd66ea7d1b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/45bf454a.failed
+
+Accelerated RFS requires that ntuple filtering is enabled via
+ethtool and driver supports ndo_rx_flow_steer.
+When the ntuple filtering is enabled, we modify the l3_l4 ttc
+rules to point on the aRFS flow tables and when the filtering
+is disabled, we modify the l3_l4 ttc rules to point on the RSS
+TIRs.
+
+	Signed-off-by: Maor Gottlieb <maorg@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 45bf454ae88414e80b80979ebb2c22bd66ea7d1b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_arfs.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 0d8462a92334,34523c48444e..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -629,6 -683,32 +629,35 @@@ extern const struct dcbnl_rtnl_ops mlx5
+  int mlx5e_dcbnl_ieee_setets_core(struct mlx5e_priv *priv, struct ieee_ets *ets);
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #ifndef CONFIG_RFS_ACCEL
++ static inline int mlx5e_arfs_create_tables(struct mlx5e_priv *priv)
++ {
++ 	return 0;
++ }
++ 
++ static inline void mlx5e_arfs_destroy_tables(struct mlx5e_priv *priv) {}
++ 
++ static inline int mlx5e_arfs_enable(struct mlx5e_priv *priv)
++ {
++ 	return -ENOTSUPP;
++ }
++ 
++ static inline int mlx5e_arfs_disable(struct mlx5e_priv *priv)
++ {
++ 	return -ENOTSUPP;
++ }
++ #else
++ int mlx5e_arfs_create_tables(struct mlx5e_priv *priv);
++ void mlx5e_arfs_destroy_tables(struct mlx5e_priv *priv);
++ int mlx5e_arfs_enable(struct mlx5e_priv *priv);
++ int mlx5e_arfs_disable(struct mlx5e_priv *priv);
++ int mlx5e_rx_flow_steer(struct net_device *dev, const struct sk_buff *skb,
++ 			u16 rxq_index, u32 flow_id);
++ #endif
++ 
+++>>>>>>> 45bf454ae884 (net/mlx5e: Enabling aRFS mechanism)
+  u16 mlx5e_get_max_inline_cap(struct mlx5_core_dev *mdev);
+  
+  #endif /* __MLX5_EN_H__ */
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index d6efb3d4bdda,4ccfc1ac62c5..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -2550,6 -2603,8 +2572,11 @@@ static const struct net_device_ops mlx5
+  	.ndo_add_vxlan_port      = mlx5e_add_vxlan_port,
+  	.ndo_del_vxlan_port      = mlx5e_del_vxlan_port,
+  	.ndo_features_check      = mlx5e_features_check,
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_RFS_ACCEL
++ 	.ndo_rx_flow_steer	 = mlx5e_rx_flow_steer,
+++>>>>>>> 45bf454ae884 (net/mlx5e: Enabling aRFS mechanism)
+  #endif
+  	.ndo_set_vf_mac          = mlx5e_set_vf_mac,
+  	.ndo_set_vf_vlan         = mlx5e_set_vf_vlan,
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_arfs.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_arfs.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+index 498d40784ae9..534d99e2f9c8 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+@@ -456,6 +456,7 @@ static int mlx5e_set_channels(struct net_device *dev,
+ 	struct mlx5e_priv *priv = netdev_priv(dev);
+ 	int ncv = mlx5e_get_max_num_channels(priv->mdev);
+ 	unsigned int count = ch->combined_count;
++	bool arfs_enabled;
+ 	bool was_opened;
+ 	int err = 0;
+ 
+@@ -484,13 +485,27 @@ static int mlx5e_set_channels(struct net_device *dev,
+ 	if (was_opened)
+ 		mlx5e_close_locked(dev);
+ 
++	arfs_enabled = dev->features & NETIF_F_NTUPLE;
++	if (arfs_enabled)
++		mlx5e_arfs_disable(priv);
++
+ 	priv->params.num_channels = count;
+ 	mlx5e_build_default_indir_rqt(priv->mdev, priv->params.indirection_rqt,
+ 				      MLX5E_INDIR_RQT_SIZE, count);
+ 
+ 	if (was_opened)
+ 		err = mlx5e_open_locked(dev);
++	if (err)
++		goto out;
+ 
++	if (arfs_enabled) {
++		err = mlx5e_arfs_enable(priv);
++		if (err)
++			netdev_err(dev, "%s: mlx5e_arfs_enable failed: %d\n",
++				   __func__, err);
++	}
++
++out:
+ 	mutex_unlock(&priv->state_lock);
+ 
+ 	return err;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
