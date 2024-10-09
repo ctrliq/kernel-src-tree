@@ -1,0 +1,243 @@
+much milder d_walk() race
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit ba65dc5ef16f82fba77869cecf7a7d515f61446b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/ba65dc5e.failed
+
+d_walk() relies upon the tree not getting rearranged under it without
+rename_lock being touched.  And we do grab rename_lock around the
+places that change the tree topology.  Unfortunately, branch reordering
+is just as bad from d_walk() POV and we have two places that do it
+without touching rename_lock - one in handling of cursors (for ramfs-style
+directories) and another in autofs.  autofs one is a separate story; this
+commit deals with the cursors.
+	* mark cursor dentries explicitly at allocation time
+	* make __dentry_kill() leave ->d_child.next pointing to the next
+non-cursor sibling, making sure that it won't be moved around unnoticed
+before the parent is relocked on ascend-to-parent path in d_walk().
+	* make d_walk() skip cursors explicitly; strictly speaking it's
+not necessary (all callbacks we pass to d_walk() are no-ops on cursors),
+but it makes analysis easier.
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit ba65dc5ef16f82fba77869cecf7a7d515f61446b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+#	fs/internal.h
+#	include/linux/dcache.h
+diff --cc fs/dcache.c
+index 09793d5231d5,b7eddfd35aa5..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -509,12 -507,49 +509,50 @@@ void d_drop(struct dentry *dentry
+  }
+  EXPORT_SYMBOL(d_drop);
+  
++ static inline void dentry_unlist(struct dentry *dentry, struct dentry *parent)
++ {
++ 	struct dentry *next;
++ 	/*
++ 	 * Inform d_walk() and shrink_dentry_list() that we are no longer
++ 	 * attached to the dentry tree
++ 	 */
++ 	dentry->d_flags |= DCACHE_DENTRY_KILLED;
++ 	if (unlikely(list_empty(&dentry->d_child)))
++ 		return;
++ 	__list_del_entry(&dentry->d_child);
++ 	/*
++ 	 * Cursors can move around the list of children.  While we'd been
++ 	 * a normal list member, it didn't matter - ->d_child.next would've
++ 	 * been updated.  However, from now on it won't be and for the
++ 	 * things like d_walk() it might end up with a nasty surprise.
++ 	 * Normally d_walk() doesn't care about cursors moving around -
++ 	 * ->d_lock on parent prevents that and since a cursor has no children
++ 	 * of its own, we get through it without ever unlocking the parent.
++ 	 * There is one exception, though - if we ascend from a child that
++ 	 * gets killed as soon as we unlock it, the next sibling is found
++ 	 * using the value left in its ->d_child.next.  And if _that_
++ 	 * pointed to a cursor, and cursor got moved (e.g. by lseek())
++ 	 * before d_walk() regains parent->d_lock, we'll end up skipping
++ 	 * everything the cursor had been moved past.
++ 	 *
++ 	 * Solution: make sure that the pointer left behind in ->d_child.next
++ 	 * points to something that won't be moving around.  I.e. skip the
++ 	 * cursors.
++ 	 */
++ 	while (dentry->d_child.next != &parent->d_subdirs) {
++ 		next = list_entry(dentry->d_child.next, struct dentry, d_child);
++ 		if (likely(!(next->d_flags & DCACHE_DENTRY_CURSOR)))
++ 			break;
++ 		dentry->d_child.next = next->d_child.next;
++ 	}
++ }
++ 
+  static void __dentry_kill(struct dentry *dentry)
+  {
+ -	struct dentry *parent = NULL;
+ -	bool can_free = true;
+ -	if (!IS_ROOT(dentry))
+ +	struct dentry *parent;
+ +	if (IS_ROOT(dentry))
+ +		parent = NULL;
+ +	else
+  		parent = dentry->d_parent;
+  
+  	/*
+@@@ -526,18 -561,16 +564,22 @@@
+  	 * inform the fs via d_prune that this dentry is about to be
+  	 * unhashed and destroyed.
+  	 */
+ -	if (dentry->d_flags & DCACHE_OP_PRUNE)
+ +	if ((dentry->d_flags & DCACHE_OP_PRUNE) && !d_unhashed(dentry))
+  		dentry->d_op->d_prune(dentry);
+  
+ -	if (dentry->d_flags & DCACHE_LRU_LIST) {
+ -		if (!(dentry->d_flags & DCACHE_SHRINK_LIST))
+ -			d_lru_del(dentry);
+ -	}
+ +	dentry_lru_del(dentry);
+  	/* if it was on the hash then remove it */
+  	__d_drop(dentry);
+++<<<<<<< HEAD
+ +	__list_del_entry(&dentry->d_u.d_child);
+ +	/*
+ +	 * Inform d_walk() that we are no longer attached to the
+ +	 * dentry tree
+ +	 */
+ +	dentry->d_flags |= DCACHE_DENTRY_KILLED;
+++=======
++ 	dentry_unlist(dentry, parent);
+++>>>>>>> ba65dc5ef16f (much milder d_walk() race)
+  	if (parent)
+  		spin_unlock(&parent->d_lock);
+  	dentry_iput(dentry);
+@@@ -1154,9 -1233,12 +1196,12 @@@ repeat
+  resume:
+  	while (next != &this_parent->d_subdirs) {
+  		struct list_head *tmp = next;
+ -		struct dentry *dentry = list_entry(tmp, struct dentry, d_child);
+ +		struct dentry *dentry = list_entry(tmp, struct dentry, d_u.d_child);
+  		next = tmp->next;
+  
++ 		if (unlikely(dentry->d_flags & DCACHE_DENTRY_CURSOR))
++ 			continue;
++ 
+  		spin_lock_nested(&dentry->d_lock, DENTRY_D_LOCK_NESTED);
+  
+  		ret = enter(data, dentry);
+@@@ -1596,13 -1687,15 +1641,25 @@@ struct dentry *d_alloc(struct dentry * 
+  }
+  EXPORT_SYMBOL(d_alloc);
+  
+++<<<<<<< HEAD
+ +struct dentry *d_alloc_anon(struct super_block *sb)
+ +{
+ +	static const struct qstr anonstring = QSTR_INIT("/", 1);
+ +
+ +	return __d_alloc(sb, &anonstring);
+ +}
+ +EXPORT_SYMBOL(d_alloc_anon);
+++=======
++ struct dentry *d_alloc_cursor(struct dentry * parent)
++ {
++ 	struct dentry *dentry = __d_alloc(parent->d_sb, NULL);
++ 	if (dentry) {
++ 		dentry->d_flags |= DCACHE_RCUACCESS | DCACHE_DENTRY_CURSOR;
++ 		dentry->d_parent = dget(parent);
++ 	}
++ 	return dentry;
++ }
+++>>>>>>> ba65dc5ef16f (much milder d_walk() race)
+  
+  /**
+   * d_alloc_pseudo - allocate a dentry (for lookup-less filesystems)
+diff --cc fs/internal.h
+index 3310bfe574a4,f57ced528cde..000000000000
+--- a/fs/internal.h
++++ b/fs/internal.h
+@@@ -146,6 -129,8 +146,11 @@@ extern int invalidate_inodes(struct sup
+   */
+  extern struct dentry *__d_alloc(struct super_block *, const struct qstr *);
+  extern int d_set_mounted(struct dentry *dentry);
+++<<<<<<< HEAD
+++=======
++ extern long prune_dcache_sb(struct super_block *sb, struct shrink_control *sc);
++ extern struct dentry *d_alloc_cursor(struct dentry *);
+++>>>>>>> ba65dc5ef16f (much milder d_walk() race)
+  
+  /*
+   * read_write.c
+diff --cc include/linux/dcache.h
+index 8399d10072a5,bcd0c64e3ed8..000000000000
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@@ -222,24 -193,29 +222,30 @@@ struct dentry_operations_wrapper 
+  #define DCACHE_MANAGED_DENTRY \
+  	(DCACHE_MOUNTED|DCACHE_NEED_AUTOMOUNT|DCACHE_MANAGE_TRANSIT)
+  
+ -#define DCACHE_LRU_LIST			0x00080000
+ -
+ -#define DCACHE_ENTRY_TYPE		0x00700000
+ -#define DCACHE_MISS_TYPE		0x00000000 /* Negative dentry (maybe fallthru to nowhere) */
+ -#define DCACHE_WHITEOUT_TYPE		0x00100000 /* Whiteout dentry (stop pathwalk) */
+ -#define DCACHE_DIRECTORY_TYPE		0x00200000 /* Normal directory */
+ -#define DCACHE_AUTODIR_TYPE		0x00300000 /* Lookupless directory (presumed automount) */
+ -#define DCACHE_REGULAR_TYPE		0x00400000 /* Regular file type (or fallthru to such) */
+ -#define DCACHE_SPECIAL_TYPE		0x00500000 /* Other file type (or fallthru to such) */
+ -#define DCACHE_SYMLINK_TYPE		0x00600000 /* Symlink (or fallthru to such) */
+ -
+ -#define DCACHE_MAY_FREE			0x00800000
+ -#define DCACHE_FALLTHRU			0x01000000 /* Fall through to lower layer */
+ -#define DCACHE_OP_SELECT_INODE		0x02000000 /* Unioned entry: dcache op selects inode */
+ +#define DCACHE_LRU_LIST		0x80000
+ +#define DCACHE_DENTRY_KILLED	0x100000
+  
+ -#define DCACHE_ENCRYPTED_WITH_KEY	0x04000000 /* dir is encrypted with a valid key */
+ +#define DCACHE_ENTRY_TYPE		0x07000000
+ +#define DCACHE_MISS_TYPE		0x00000000 /* Negative dentry */
+ +#define DCACHE_DIRECTORY_TYPE		0x01000000 /* Normal directory */
+ +#define DCACHE_AUTODIR_TYPE		0x02000000 /* Lookupless directory (presumed automount) */
+ +#define DCACHE_SYMLINK_TYPE		0x03000000 /* Symlink */
+ +#define DCACHE_FILE_TYPE		0x04000000 /* Other file type */
+  #define DCACHE_OP_REAL			0x08000000
+  
+++<<<<<<< HEAD
+++=======
++ #define DCACHE_PAR_LOOKUP		0x10000000 /* being looked up (with parent locked shared) */
++ #define DCACHE_DENTRY_CURSOR		0x20000000
++ 
+++>>>>>>> ba65dc5ef16f (much milder d_walk() race)
+  extern seqlock_t rename_lock;
+  
+ +static inline int dname_external(struct dentry *dentry)
+ +{
+ +	return dentry->d_name.name != dentry->d_iname;
+ +}
+ +
+  /*
+   * These are the low-level FS interfaces to the dcache..
+   */
+* Unmerged path fs/dcache.c
+* Unmerged path fs/internal.h
+diff --git a/fs/libfs.c b/fs/libfs.c
+index 1f2023801ea9..b0107507caff 100644
+--- a/fs/libfs.c
++++ b/fs/libfs.c
+@@ -73,9 +73,7 @@ EXPORT_SYMBOL(simple_lookup);
+ 
+ int dcache_dir_open(struct inode *inode, struct file *file)
+ {
+-	static struct qstr cursor_name = QSTR_INIT(".", 1);
+-
+-	file->private_data = d_alloc(file->f_path.dentry, &cursor_name);
++	file->private_data = d_alloc_cursor(file->f_path.dentry);
+ 
+ 	return file->private_data ? 0 : -ENOMEM;
+ }
+* Unmerged path include/linux/dcache.h
