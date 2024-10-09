@@ -1,0 +1,243 @@
+nfp: move refresh tracking into the port structure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 6d4f8cba5fbbc83e74ee8a49e5234e446306bac6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6d4f8cba.failed
+
+Track whether physical port's state have changed since last refresh
+inside the nfp_port structure instead of the vNIC structure.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6d4f8cba5fbbc83e74ee8a49e5234e446306bac6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net.h
+#	drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+#	drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+#	drivers/net/ethernet/netronome/nfp/nfp_port.h
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net.h
+index 600c79f39fe0,7882d2604835..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@@ -757,13 -835,11 +755,16 @@@ void nfp_net_irqs_disable(struct pci_de
+  void
+  nfp_net_irqs_assign(struct nfp_net *nn, struct msix_entry *irq_entries,
+  		    unsigned int n);
+ +int
+ +nfp_net_ring_reconfig(struct nfp_net *nn, struct nfp_net_ring_set *rx,
+ +		      struct nfp_net_ring_set *tx);
+  
+ -struct nfp_net_dp *nfp_net_clone_dp(struct nfp_net *nn);
+ -int nfp_net_ring_reconfig(struct nfp_net *nn, struct nfp_net_dp *new,
+ -			  struct netlink_ext_ack *extack);
+++<<<<<<< HEAD
+ +bool nfp_net_link_changed_read_clear(struct nfp_net *nn);
+ +void nfp_net_refresh_port_config(struct nfp_net *nn);
+  
+++=======
+++>>>>>>> 6d4f8cba5fbb (nfp: move refresh tracking into the port structure)
+  #ifdef CONFIG_NFP_DEBUG
+  void nfp_net_debugfs_create(void);
+  void nfp_net_debugfs_destroy(void);
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+index 69f458e0de89,23f9ea0f8982..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+@@@ -194,11 -218,17 +194,25 @@@ nfp_net_get_link_ksettings(struct net_d
+  		return 0;
+  
+  	/* Use link speed from ETH table if available, otherwise try the BAR */
+++<<<<<<< HEAD
+ +	if (nn->eth_port && nfp_net_link_changed_read_clear(nn))
+ +		nfp_net_refresh_port_config(nn);
+ +	/* Separate if - on FW error the port could've disappeared from table */
+ +	if (nn->eth_port) {
+ +		cmd->base.speed = nn->eth_port->speed;
+++=======
++ 	if (eth_port) {
++ 		int err;
++ 
++ 		if (test_bit(NFP_PORT_CHANGED, &port->flags)) {
++ 			err = nfp_net_refresh_eth_port(port);
++ 			if (err)
++ 				return err;
++ 		}
++ 
++ 		cmd->base.port = eth_port->port_type;
++ 		cmd->base.speed = eth_port->speed;
+++>>>>>>> 6d4f8cba5fbb (nfp: move refresh tracking into the port structure)
+  		cmd->base.duplex = DUPLEX_FULL;
+  		return 0;
+  	}
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+index acc8cfe284f3,e8d54b9b9b97..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+@@@ -463,63 -546,81 +463,102 @@@ static void nfp_net_refresh_netdevs(str
+  {
+  	struct nfp_pf *pf = container_of(work, struct nfp_pf,
+  					 port_refresh_work);
+ -	struct nfp_eth_table *eth_table;
+  	struct nfp_net *nn, *next;
+  
+ -	mutex_lock(&pf->lock);
+ +	mutex_lock(&pf->port_lock);
+  
+  	/* Check for nfp_net_pci_remove() racing against us */
+ -	if (list_empty(&pf->vnics))
+ +	if (list_empty(&pf->ports))
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry_safe(nn, next, &pf->ports, port_list) {
+ +		if (!nn->eth_port) {
+ +			nfp_warn(pf->cpp, "Warning: port not present after reconfig\n");
+ +			continue;
+ +		}
+ +		if (!nn->eth_port->override_changed)
+ +			continue;
+ +
+ +		nn_warn(nn, "Port config changed, unregistering. Reboot required before port will be operational again.\n");
+++=======
++ 	/* Update state of all ports */
++ 	rtnl_lock();
++ 	list_for_each_entry(nn, &pf->vnics, vnic_list)
++ 		if (nn->port)
++ 			clear_bit(NFP_PORT_CHANGED, &nn->port->flags);
++ 
++ 	eth_table = nfp_eth_read_ports(pf->cpp);
++ 	if (!eth_table) {
++ 		rtnl_unlock();
++ 		nfp_err(pf->cpp, "Error refreshing port config!\n");
++ 		goto out;
++ 	}
++ 
++ 	list_for_each_entry(nn, &pf->vnics, vnic_list) {
++ 		if (!__nfp_port_get_eth_port(nn->port))
++ 			continue;
++ 
++ 		nfp_net_eth_port_update(pf->cpp, nn->port, eth_table);
++ 	}
++ 	rtnl_unlock();
++ 
++ 	kfree(eth_table);
++ 
++ 	/* Shoot off the ports which became invalid */
++ 	list_for_each_entry_safe(nn, next, &pf->vnics, vnic_list) {
++ 		if (!nn->port || nn->port->type != NFP_PORT_INVALID)
++ 			continue;
+++>>>>>>> 6d4f8cba5fbb (nfp: move refresh tracking into the port structure)
+  
+  		nfp_net_debugfs_dir_clean(&nn->debugfs_dir);
+ -		nfp_net_clean(nn);
+ +		nfp_net_netdev_clean(nn->dp.netdev);
+  
+ -		nfp_net_pf_free_vnic(pf, nn);
+ +		list_del(&nn->port_list);
+ +		pf->num_netdevs--;
+ +		nfp_net_netdev_free(nn);
+  	}
+  
+ -	if (list_empty(&pf->vnics))
+ +	if (list_empty(&pf->ports))
+  		nfp_net_pci_remove_finish(pf);
+  out:
+ -	mutex_unlock(&pf->lock);
+ +	mutex_unlock(&pf->port_lock);
+  }
+  
+ -void nfp_net_refresh_port_table(struct nfp_port *port)
+ +void nfp_net_refresh_port_config(struct nfp_net *nn)
+  {
+ -	struct nfp_pf *pf = port->app->pf;
+ +	struct nfp_pf *pf = pci_get_drvdata(nn->pdev);
+ +	struct nfp_eth_table *old_table;
+  
+ -	schedule_work(&pf->port_refresh_work);
+ -}
+ +	ASSERT_RTNL();
+  
+ -int nfp_net_refresh_eth_port(struct nfp_port *port)
+ -{
+ -	struct nfp_cpp *cpp = port->app->cpp;
+ -	struct nfp_eth_table *eth_table;
+ -	int ret;
+ +	old_table = pf->eth_tbl;
+ +
+++<<<<<<< HEAD
+ +	list_for_each_entry(nn, &pf->ports, port_list)
+ +		nfp_net_link_changed_read_clear(nn);
+  
+ +	pf->eth_tbl = nfp_eth_read_ports(pf->cpp);
+ +	if (!pf->eth_tbl) {
+ +		pf->eth_tbl = old_table;
+ +		nfp_err(pf->cpp, "Error refreshing port config!\n");
+ +		return;
+++=======
++ 	clear_bit(NFP_PORT_CHANGED, &port->flags);
++ 
++ 	eth_table = nfp_eth_read_ports(cpp);
++ 	if (!eth_table) {
++ 		nfp_err(cpp, "Error refreshing port state table!\n");
++ 		return -EIO;
+++>>>>>>> 6d4f8cba5fbb (nfp: move refresh tracking into the port structure)
+  	}
+  
+ -	ret = nfp_net_eth_port_update(cpp, port, eth_table);
+ +	list_for_each_entry(nn, &pf->ports, port_list)
+ +		nn->eth_port = nfp_net_find_port(pf, nn->eth_port->eth_index);
+  
+ -	kfree(eth_table);
+ +	kfree(old_table);
+  
+ -	return ret;
+ +	schedule_work(&pf->port_refresh_work);
+  }
+  
+  /*
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_port.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net.h
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 5094c56dbda7..4b7d4a9cb483 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@ -370,19 +370,6 @@ static irqreturn_t nfp_net_irq_rxtx(int irq, void *data)
+ 	return IRQ_HANDLED;
+ }
+ 
+-bool nfp_net_link_changed_read_clear(struct nfp_net *nn)
+-{
+-	unsigned long flags;
+-	bool ret;
+-
+-	spin_lock_irqsave(&nn->link_status_lock, flags);
+-	ret = nn->link_changed;
+-	nn->link_changed = false;
+-	spin_unlock_irqrestore(&nn->link_status_lock, flags);
+-
+-	return ret;
+-}
+-
+ /**
+  * nfp_net_read_link_status() - Reread link status from control BAR
+  * @nn:       NFP Network structure
+@@ -402,7 +389,8 @@ static void nfp_net_read_link_status(struct nfp_net *nn)
+ 		goto out;
+ 
+ 	nn->link_up = link_up;
+-	nn->link_changed = true;
++	if (nn->port)
++		set_bit(NFP_PORT_CHANGED, &nn->port->flags);
+ 
+ 	if (nn->link_up) {
+ 		netif_carrier_on(nn->netdev);
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_port.h
