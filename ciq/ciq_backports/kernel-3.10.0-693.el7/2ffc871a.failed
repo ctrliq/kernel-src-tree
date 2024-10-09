@@ -1,0 +1,194 @@
+xprtrdma: Release orphaned MRs immediately
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 2ffc871a574daa760ef4f7750e0a36187a45754a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/2ffc871a.failed
+
+Instead of leaving orphaned MRs to be released when the transport
+is destroyed, release them immediately. The MR free list can now be
+replenished if it becomes exhausted.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Tested-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 2ffc871a574daa760ef4f7750e0a36187a45754a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/fmr_ops.c
+#	net/sunrpc/xprtrdma/frwr_ops.c
+diff --cc net/sunrpc/xprtrdma/fmr_ops.c
+index ecde1e1b320a,6521dceff638..000000000000
+--- a/net/sunrpc/xprtrdma/fmr_ops.c
++++ b/net/sunrpc/xprtrdma/fmr_ops.c
+@@@ -71,29 -95,61 +71,57 @@@ __fmr_unmap(struct rpcrdma_mw *mw
+  	return rc;
+  }
+  
+ -static void
+ -fmr_op_release_mr(struct rpcrdma_mw *r)
+ -{
+ -	LIST_HEAD(unmap_list);
+ -	int rc;
+ -
+ -	kfree(r->fmr.fm_physaddrs);
+ -	kfree(r->mw_sg);
+ -
+ -	/* In case this one was left mapped, try to unmap it
+ -	 * to prevent dealloc_fmr from failing with EBUSY
+ -	 */
+ -	rc = __fmr_unmap(r);
+ -	if (rc)
+ -		pr_err("rpcrdma: final ib_unmap_fmr for %p failed %i\n",
+ -		       r, rc);
+ -
+ -	rc = ib_dealloc_fmr(r->fmr.fm_mr);
+ -	if (rc)
+ -		pr_err("rpcrdma: final ib_dealloc_fmr for %p returned %i\n",
+ -		       r, rc);
+ -
+ -	kfree(r);
+ -}
+ -
+ -/* Reset of a single FMR.
+ +/* Deferred reset of a single FMR. Generate a fresh rkey by
+ + * replacing the MR. There's no recovery if this fails.
+   */
+  static void
+ -fmr_op_recover_mr(struct rpcrdma_mw *mw)
+ +__fmr_recovery_worker(struct work_struct *work)
+  {
+ +	struct rpcrdma_mw *mw = container_of(work, struct rpcrdma_mw,
+ +					    mw_work);
+  	struct rpcrdma_xprt *r_xprt = mw->mw_xprt;
+++<<<<<<< HEAD
+++=======
++ 	int rc;
++ 
++ 	/* ORDER: invalidate first */
++ 	rc = __fmr_unmap(mw);
++ 
++ 	/* ORDER: then DMA unmap */
++ 	ib_dma_unmap_sg(r_xprt->rx_ia.ri_device,
++ 			mw->mw_sg, mw->mw_nents, mw->mw_dir);
++ 	if (rc)
++ 		goto out_release;
+++>>>>>>> 2ffc871a574d (xprtrdma: Release orphaned MRs immediately)
+  
+ +	__fmr_unmap(mw);
+  	rpcrdma_put_mw(r_xprt, mw);
+++<<<<<<< HEAD
+ +	return;
+ +}
+ +
+ +/* A broken MR was discovered in a context that can't sleep.
+ + * Defer recovery to the recovery worker.
+ + */
+ +static void
+ +__fmr_queue_recovery(struct rpcrdma_mw *mw)
+ +{
+ +	INIT_WORK(&mw->mw_work, __fmr_recovery_worker);
+ +	queue_work(fmr_recovery_wq, &mw->mw_work);
+++=======
++ 	r_xprt->rx_stats.mrs_recovered++;
++ 	return;
++ 
++ out_release:
++ 	pr_err("rpcrdma: FMR reset failed (%d), %p released\n", rc, mw);
++ 	r_xprt->rx_stats.mrs_orphaned++;
++ 
++ 	spin_lock(&r_xprt->rx_buf.rb_mwlock);
++ 	list_del(&mw->mw_all);
++ 	spin_unlock(&r_xprt->rx_buf.rb_mwlock);
++ 
++ 	fmr_op_release_mr(mw);
+++>>>>>>> 2ffc871a574d (xprtrdma: Release orphaned MRs immediately)
+  }
+  
+  static int
+diff --cc net/sunrpc/xprtrdma/frwr_ops.c
+index 144dce124c80,f4c06c8ba622..000000000000
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@@ -183,9 -130,69 +183,75 @@@ __frwr_release(struct rpcrdma_mw *r
+  
+  	rc = ib_dereg_mr(r->frmr.fr_mr);
+  	if (rc)
+++<<<<<<< HEAD
+ +		dprintk("RPC:       %s: ib_dereg_mr status %i\n",
+ +			__func__, rc);
+ +	kfree(r->frmr.sg);
+++=======
++ 		pr_err("rpcrdma: final ib_dereg_mr for %p returned %i\n",
++ 		       r, rc);
++ 	kfree(r->mw_sg);
++ 	kfree(r);
++ }
++ 
++ static int
++ __frwr_reset_mr(struct rpcrdma_ia *ia, struct rpcrdma_mw *r)
++ {
++ 	struct rpcrdma_frmr *f = &r->frmr;
++ 	int rc;
++ 
++ 	rc = ib_dereg_mr(f->fr_mr);
++ 	if (rc) {
++ 		pr_warn("rpcrdma: ib_dereg_mr status %d, frwr %p orphaned\n",
++ 			rc, r);
++ 		return rc;
++ 	}
++ 
++ 	f->fr_mr = ib_alloc_mr(ia->ri_pd, IB_MR_TYPE_MEM_REG,
++ 			       ia->ri_max_frmr_depth);
++ 	if (IS_ERR(f->fr_mr)) {
++ 		pr_warn("rpcrdma: ib_alloc_mr status %ld, frwr %p orphaned\n",
++ 			PTR_ERR(f->fr_mr), r);
++ 		return PTR_ERR(f->fr_mr);
++ 	}
++ 
++ 	dprintk("RPC:       %s: recovered FRMR %p\n", __func__, r);
++ 	f->fr_state = FRMR_IS_INVALID;
++ 	return 0;
++ }
++ 
++ /* Reset of a single FRMR. Generate a fresh rkey by replacing the MR.
++  *
++  * There's no recovery if this fails. The FRMR is abandoned, but
++  * remains in rb_all. It will be cleaned up when the transport is
++  * destroyed.
++  */
++ static void
++ frwr_op_recover_mr(struct rpcrdma_mw *mw)
++ {
++ 	struct rpcrdma_xprt *r_xprt = mw->mw_xprt;
++ 	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
++ 	int rc;
++ 
++ 	rc = __frwr_reset_mr(ia, mw);
++ 	ib_dma_unmap_sg(ia->ri_device, mw->mw_sg, mw->mw_nents, mw->mw_dir);
++ 	if (rc)
++ 		goto out_release;
++ 
++ 	rpcrdma_put_mw(r_xprt, mw);
++ 	r_xprt->rx_stats.mrs_recovered++;
++ 	return;
++ 
++ out_release:
++ 	pr_err("rpcrdma: FRMR reset failed %d, %p release\n", rc, mw);
++ 	r_xprt->rx_stats.mrs_orphaned++;
++ 
++ 	spin_lock(&r_xprt->rx_buf.rb_mwlock);
++ 	list_del(&mw->mw_all);
++ 	spin_unlock(&r_xprt->rx_buf.rb_mwlock);
++ 
++ 	frwr_op_release_mr(mw);
+++>>>>>>> 2ffc871a574d (xprtrdma: Release orphaned MRs immediately)
+  }
+  
+  static int
+* Unmerged path net/sunrpc/xprtrdma/fmr_ops.c
+* Unmerged path net/sunrpc/xprtrdma/frwr_ops.c
