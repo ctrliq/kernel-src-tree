@@ -1,0 +1,640 @@
+rdma/cxgb4: Add support for kernel mode SRQ's
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Raju Rangoju <rajur@chelsio.com>
+commit 6a0b6174d35a141dfa30a32c848a3903e2d7f495
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/6a0b6174.failed
+
+This patch implements the srq specific verbs such as create/destroy/modify
+and post_srq_recv. And adds srq specific structures and defines to t4.h
+and uapi.
+
+Also updates the cq poll logic to deal with completions that are
+associated with the SRQ's.
+
+This patch also handles kernel mode SRQ_LIMIT events as well as flushed
+SRQ buffers
+
+	Signed-off-by: Raju Rangoju <rajur@chelsio.com>
+	Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 6a0b6174d35a141dfa30a32c848a3903e2d7f495)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/cxgb4/provider.c
+#	drivers/infiniband/hw/cxgb4/qp.c
+diff --cc drivers/infiniband/hw/cxgb4/provider.c
+index 596ceaefacf4,c314d8fdfbba..000000000000
+--- a/drivers/infiniband/hw/cxgb4/provider.c
++++ b/drivers/infiniband/hw/cxgb4/provider.c
+@@@ -342,8 -342,12 +342,16 @@@ static int c4iw_query_device(struct ib_
+  	props->vendor_part_id = (u32)dev->rdev.lldi.pdev->device;
+  	props->max_mr_size = T4_MAX_MR_SIZE;
+  	props->max_qp = dev->rdev.lldi.vr->qp.size / 2;
++ 	props->max_srq = dev->rdev.lldi.vr->srq.size;
+  	props->max_qp_wr = dev->rdev.hw_queue.t4_max_qp_depth;
+++<<<<<<< HEAD
+ +	props->max_sge = T4_MAX_RECV_SGE;
+++=======
++ 	props->max_srq_wr = dev->rdev.hw_queue.t4_max_qp_depth;
++ 	props->max_send_sge = min(T4_MAX_SEND_SGE, T4_MAX_WRITE_SGE);
++ 	props->max_recv_sge = T4_MAX_RECV_SGE;
++ 	props->max_srq_sge = T4_MAX_RECV_SGE;
+++>>>>>>> 6a0b6174d35a (rdma/cxgb4: Add support for kernel mode SRQ's)
+  	props->max_sge_rd = 1;
+  	props->max_res_rd_atom = dev->rdev.lldi.max_ird_adapter;
+  	props->max_qp_rd_atom = min(dev->rdev.lldi.max_ordird_qp,
+diff --cc drivers/infiniband/hw/cxgb4/qp.c
+index 4106eed1b8fb,08dc555942af..000000000000
+--- a/drivers/infiniband/hw/cxgb4/qp.c
++++ b/drivers/infiniband/hw/cxgb4/qp.c
+@@@ -216,18 -222,21 +222,29 @@@ static int create_qp(struct c4iw_rdev *
+  	}
+  
+  	if (!user) {
+ -		wq->sq.sw_sq = kcalloc(wq->sq.size, sizeof(*wq->sq.sw_sq),
+ -				       GFP_KERNEL);
+ +		wq->sq.sw_sq = kzalloc(wq->sq.size * sizeof *wq->sq.sw_sq,
+ +				 GFP_KERNEL);
+  		if (!wq->sq.sw_sq) {
+  			ret = -ENOMEM;
+- 			goto free_rq_qid;
++ 			goto free_rq_qid;//FIXME
+  		}
+  
+++<<<<<<< HEAD
+ +		wq->rq.sw_rq = kzalloc(wq->rq.size * sizeof *wq->rq.sw_rq,
+ +				 GFP_KERNEL);
+ +		if (!wq->rq.sw_rq) {
+ +			ret = -ENOMEM;
+ +			goto free_sw_sq;
+++=======
++ 		if (need_rq) {
++ 			wq->rq.sw_rq = kcalloc(wq->rq.size,
++ 					       sizeof(*wq->rq.sw_rq),
++ 					       GFP_KERNEL);
++ 			if (!wq->rq.sw_rq) {
++ 				ret = -ENOMEM;
++ 				goto free_sw_sq;
++ 			}
+++>>>>>>> 6a0b6174d35a (rdma/cxgb4: Add support for kernel mode SRQ's)
+  		}
+  	}
+  
+diff --git a/drivers/infiniband/hw/cxgb4/cm.c b/drivers/infiniband/hw/cxgb4/cm.c
+index 35b972ce9aee..44e6b966351f 100644
+--- a/drivers/infiniband/hw/cxgb4/cm.c
++++ b/drivers/infiniband/hw/cxgb4/cm.c
+@@ -1853,10 +1853,34 @@ static int rx_data(struct c4iw_dev *dev, struct sk_buff *skb)
+ 	return 0;
+ }
+ 
++static void complete_cached_srq_buffers(struct c4iw_ep *ep, u32 srqidx_status)
++{
++	enum chip_type adapter_type;
++	u32 srqidx;
++	u8 status;
++
++	adapter_type = ep->com.dev->rdev.lldi.adapter_type;
++	status = ABORT_RSS_STATUS_G(be32_to_cpu(srqidx_status));
++	srqidx = ABORT_RSS_SRQIDX_G(be32_to_cpu(srqidx_status));
++
++	/*
++	 * If this TCB had a srq buffer cached, then we must complete
++	 * it. For user mode, that means saving the srqidx in the
++	 * user/kernel status page for this qp.  For kernel mode, just
++	 * synthesize the CQE now.
++	 */
++	if (CHELSIO_CHIP_VERSION(adapter_type) > CHELSIO_T5 && srqidx) {
++		if (ep->com.qp->ibqp.uobject)
++			t4_set_wq_in_error(&ep->com.qp->wq, srqidx);
++		else
++			c4iw_flush_srqidx(ep->com.qp, srqidx);
++	}
++}
++
+ static int abort_rpl(struct c4iw_dev *dev, struct sk_buff *skb)
+ {
+ 	struct c4iw_ep *ep;
+-	struct cpl_abort_rpl_rss *rpl = cplhdr(skb);
++	struct cpl_abort_rpl_rss6 *rpl = cplhdr(skb);
+ 	int release = 0;
+ 	unsigned int tid = GET_TID(rpl);
+ 
+@@ -1865,6 +1889,9 @@ static int abort_rpl(struct c4iw_dev *dev, struct sk_buff *skb)
+ 		pr_warn("Abort rpl to freed endpoint\n");
+ 		return 0;
+ 	}
++
++	complete_cached_srq_buffers(ep, rpl->srqidx_status);
++
+ 	pr_debug("ep %p tid %u\n", ep, ep->hwtid);
+ 	mutex_lock(&ep->com.mutex);
+ 	switch (ep->com.state) {
+@@ -2718,28 +2745,35 @@ static int peer_close(struct c4iw_dev *dev, struct sk_buff *skb)
+ 
+ static int peer_abort(struct c4iw_dev *dev, struct sk_buff *skb)
+ {
+-	struct cpl_abort_req_rss *req = cplhdr(skb);
++	struct cpl_abort_req_rss6 *req = cplhdr(skb);
+ 	struct c4iw_ep *ep;
+ 	struct sk_buff *rpl_skb;
+ 	struct c4iw_qp_attributes attrs;
+ 	int ret;
+ 	int release = 0;
+ 	unsigned int tid = GET_TID(req);
++	u8 status;
++
+ 	u32 len = roundup(sizeof(struct cpl_abort_rpl), 16);
+ 
+ 	ep = get_ep_from_tid(dev, tid);
+ 	if (!ep)
+ 		return 0;
+ 
+-	if (cxgb_is_neg_adv(req->status)) {
++	status = ABORT_RSS_STATUS_G(be32_to_cpu(req->srqidx_status));
++
++	if (cxgb_is_neg_adv(status)) {
+ 		pr_debug("Negative advice on abort- tid %u status %d (%s)\n",
+-			 ep->hwtid, req->status, neg_adv_str(req->status));
++			 ep->hwtid, status, neg_adv_str(status));
+ 		ep->stats.abort_neg_adv++;
+ 		mutex_lock(&dev->rdev.stats.lock);
+ 		dev->rdev.stats.neg_adv++;
+ 		mutex_unlock(&dev->rdev.stats.lock);
+ 		goto deref_ep;
+ 	}
++
++	complete_cached_srq_buffers(ep, req->srqidx_status);
++
+ 	pr_debug("ep %p tid %u state %u\n", ep, ep->hwtid,
+ 		 ep->com.state);
+ 	set_bit(PEER_ABORT, &ep->com.history);
+diff --git a/drivers/infiniband/hw/cxgb4/cq.c b/drivers/infiniband/hw/cxgb4/cq.c
+index 187de3ffba7e..c4e7b8e5bc89 100644
+--- a/drivers/infiniband/hw/cxgb4/cq.c
++++ b/drivers/infiniband/hw/cxgb4/cq.c
+@@ -182,7 +182,7 @@ err1:
+ 	return ret;
+ }
+ 
+-static void insert_recv_cqe(struct t4_wq *wq, struct t4_cq *cq)
++static void insert_recv_cqe(struct t4_wq *wq, struct t4_cq *cq, u32 srqidx)
+ {
+ 	struct t4_cqe cqe;
+ 
+@@ -195,6 +195,8 @@ static void insert_recv_cqe(struct t4_wq *wq, struct t4_cq *cq)
+ 				 CQE_SWCQE_V(1) |
+ 				 CQE_QPID_V(wq->sq.qid));
+ 	cqe.bits_type_ts = cpu_to_be64(CQE_GENBIT_V((u64)cq->gen));
++	if (srqidx)
++		cqe.u.srcqe.abs_rqe_idx = cpu_to_be32(srqidx);
+ 	cq->sw_queue[cq->sw_pidx] = cqe;
+ 	t4_swcq_produce(cq);
+ }
+@@ -207,7 +209,7 @@ int c4iw_flush_rq(struct t4_wq *wq, struct t4_cq *cq, int count)
+ 	pr_debug("wq %p cq %p rq.in_use %u skip count %u\n",
+ 		 wq, cq, wq->rq.in_use, count);
+ 	while (in_use--) {
+-		insert_recv_cqe(wq, cq);
++		insert_recv_cqe(wq, cq, 0);
+ 		flushed++;
+ 	}
+ 	return flushed;
+@@ -458,6 +460,72 @@ void c4iw_count_rcqes(struct t4_cq *cq, struct t4_wq *wq, int *count)
+ 	pr_debug("cq %p count %d\n", cq, *count);
+ }
+ 
++static void post_pending_srq_wrs(struct t4_srq *srq)
++{
++	struct t4_srq_pending_wr *pwr;
++	u16 idx = 0;
++
++	while (srq->pending_in_use) {
++		pwr = &srq->pending_wrs[srq->pending_cidx];
++		srq->sw_rq[srq->pidx].wr_id = pwr->wr_id;
++		srq->sw_rq[srq->pidx].valid = 1;
++
++		pr_debug("%s posting pending cidx %u pidx %u wq_pidx %u in_use %u rq_size %u wr_id %llx\n",
++			 __func__,
++			 srq->cidx, srq->pidx, srq->wq_pidx,
++			 srq->in_use, srq->size,
++			 (unsigned long long)pwr->wr_id);
++
++		c4iw_copy_wr_to_srq(srq, &pwr->wqe, pwr->len16);
++		t4_srq_consume_pending_wr(srq);
++		t4_srq_produce(srq, pwr->len16);
++		idx += DIV_ROUND_UP(pwr->len16 * 16, T4_EQ_ENTRY_SIZE);
++	}
++
++	if (idx) {
++		t4_ring_srq_db(srq, idx, pwr->len16, &pwr->wqe);
++		srq->queue[srq->size].status.host_wq_pidx =
++			srq->wq_pidx;
++	}
++}
++
++static u64 reap_srq_cqe(struct t4_cqe *hw_cqe, struct t4_srq *srq)
++{
++	int rel_idx = CQE_ABS_RQE_IDX(hw_cqe) - srq->rqt_abs_idx;
++	u64 wr_id;
++
++	srq->sw_rq[rel_idx].valid = 0;
++	wr_id = srq->sw_rq[rel_idx].wr_id;
++
++	if (rel_idx == srq->cidx) {
++		pr_debug("%s in order cqe rel_idx %u cidx %u pidx %u wq_pidx %u in_use %u rq_size %u wr_id %llx\n",
++			 __func__, rel_idx, srq->cidx, srq->pidx,
++			 srq->wq_pidx, srq->in_use, srq->size,
++			 (unsigned long long)srq->sw_rq[rel_idx].wr_id);
++		t4_srq_consume(srq);
++		while (srq->ooo_count && !srq->sw_rq[srq->cidx].valid) {
++			pr_debug("%s eat ooo cidx %u pidx %u wq_pidx %u in_use %u rq_size %u ooo_count %u wr_id %llx\n",
++				 __func__, srq->cidx, srq->pidx,
++				 srq->wq_pidx, srq->in_use,
++				 srq->size, srq->ooo_count,
++				 (unsigned long long)
++				 srq->sw_rq[srq->cidx].wr_id);
++			t4_srq_consume_ooo(srq);
++		}
++		if (srq->ooo_count == 0 && srq->pending_in_use)
++			post_pending_srq_wrs(srq);
++	} else {
++		pr_debug("%s ooo cqe rel_idx %u cidx %u pidx %u wq_pidx %u in_use %u rq_size %u ooo_count %u wr_id %llx\n",
++			 __func__, rel_idx, srq->cidx,
++			 srq->pidx, srq->wq_pidx,
++			 srq->in_use, srq->size,
++			 srq->ooo_count,
++			 (unsigned long long)srq->sw_rq[rel_idx].wr_id);
++		t4_srq_produce_ooo(srq);
++	}
++	return wr_id;
++}
++
+ /*
+  * poll_cq
+  *
+@@ -475,7 +543,8 @@ void c4iw_count_rcqes(struct t4_cq *cq, struct t4_wq *wq, int *count)
+  *    -EOVERFLOW    CQ overflow detected.
+  */
+ static int poll_cq(struct t4_wq *wq, struct t4_cq *cq, struct t4_cqe *cqe,
+-		   u8 *cqe_flushed, u64 *cookie, u32 *credit)
++		   u8 *cqe_flushed, u64 *cookie, u32 *credit,
++		   struct t4_srq *srq)
+ {
+ 	int ret = 0;
+ 	struct t4_cqe *hw_cqe, read_cqe;
+@@ -540,7 +609,7 @@ static int poll_cq(struct t4_wq *wq, struct t4_cq *cq, struct t4_cqe *cqe,
+ 		 */
+ 		if (CQE_TYPE(hw_cqe) == 1) {
+ 			if (CQE_STATUS(hw_cqe))
+-				t4_set_wq_in_error(wq);
++				t4_set_wq_in_error(wq, 0);
+ 			ret = -EAGAIN;
+ 			goto skip_cqe;
+ 		}
+@@ -551,7 +620,7 @@ static int poll_cq(struct t4_wq *wq, struct t4_cq *cq, struct t4_cqe *cqe,
+ 		 */
+ 		if (CQE_WRID_STAG(hw_cqe) == 1) {
+ 			if (CQE_STATUS(hw_cqe))
+-				t4_set_wq_in_error(wq);
++				t4_set_wq_in_error(wq, 0);
+ 			ret = -EAGAIN;
+ 			goto skip_cqe;
+ 		}
+@@ -576,7 +645,7 @@ static int poll_cq(struct t4_wq *wq, struct t4_cq *cq, struct t4_cqe *cqe,
+ 
+ 	if (CQE_STATUS(hw_cqe) || t4_wq_in_error(wq)) {
+ 		*cqe_flushed = (CQE_STATUS(hw_cqe) == T4_ERR_SWFLUSH);
+-		t4_set_wq_in_error(wq);
++		t4_set_wq_in_error(wq, 0);
+ 	}
+ 
+ 	/*
+@@ -590,15 +659,9 @@ static int poll_cq(struct t4_wq *wq, struct t4_cq *cq, struct t4_cqe *cqe,
+ 		 * then we complete this with T4_ERR_MSN and mark the wq in
+ 		 * error.
+ 		 */
+-
+-		if (t4_rq_empty(wq)) {
+-			t4_set_wq_in_error(wq);
+-			ret = -EAGAIN;
+-			goto skip_cqe;
+-		}
+ 		if (unlikely(!CQE_STATUS(hw_cqe) &&
+ 			     CQE_WRID_MSN(hw_cqe) != wq->rq.msn)) {
+-			t4_set_wq_in_error(wq);
++			t4_set_wq_in_error(wq, 0);
+ 			hw_cqe->header |= cpu_to_be32(CQE_STATUS_V(T4_ERR_MSN));
+ 		}
+ 		goto proc_cqe;
+@@ -657,11 +720,16 @@ proc_cqe:
+ 			c4iw_log_wr_stats(wq, hw_cqe);
+ 		t4_sq_consume(wq);
+ 	} else {
+-		pr_debug("completing rq idx %u\n", wq->rq.cidx);
+-		*cookie = wq->rq.sw_rq[wq->rq.cidx].wr_id;
+-		if (c4iw_wr_log)
+-			c4iw_log_wr_stats(wq, hw_cqe);
+-		t4_rq_consume(wq);
++		if (!srq) {
++			pr_debug("completing rq idx %u\n", wq->rq.cidx);
++			*cookie = wq->rq.sw_rq[wq->rq.cidx].wr_id;
++			if (c4iw_wr_log)
++				c4iw_log_wr_stats(wq, hw_cqe);
++			t4_rq_consume(wq);
++		} else {
++			*cookie = reap_srq_cqe(hw_cqe, srq);
++		}
++		wq->rq.msn++;
+ 		goto skip_cqe;
+ 	}
+ 
+@@ -685,7 +753,7 @@ skip_cqe:
+ }
+ 
+ static int __c4iw_poll_cq_one(struct c4iw_cq *chp, struct c4iw_qp *qhp,
+-			      struct ib_wc *wc)
++			      struct ib_wc *wc, struct c4iw_srq *srq)
+ {
+ 	struct t4_cqe cqe;
+ 	struct t4_wq *wq = qhp ? &qhp->wq : NULL;
+@@ -694,7 +762,8 @@ static int __c4iw_poll_cq_one(struct c4iw_cq *chp, struct c4iw_qp *qhp,
+ 	u64 cookie = 0;
+ 	int ret;
+ 
+-	ret = poll_cq(wq, &(chp->cq), &cqe, &cqe_flushed, &cookie, &credit);
++	ret = poll_cq(wq, &(chp->cq), &cqe, &cqe_flushed, &cookie, &credit,
++		      srq ? &srq->wq : NULL);
+ 	if (ret)
+ 		goto out;
+ 
+@@ -703,6 +772,13 @@ static int __c4iw_poll_cq_one(struct c4iw_cq *chp, struct c4iw_qp *qhp,
+ 	wc->vendor_err = CQE_STATUS(&cqe);
+ 	wc->wc_flags = 0;
+ 
++	/*
++	 * Simulate a SRQ_LIMIT_REACHED HW notification if required.
++	 */
++	if (srq && !(srq->flags & T4_SRQ_LIMIT_SUPPORT) && srq->armed &&
++	    srq->wq.in_use < srq->srq_limit)
++		c4iw_dispatch_srq_limit_reached_event(srq);
++
+ 	pr_debug("qpid 0x%x type %d opcode %d status 0x%x len %u wrid hi 0x%x lo 0x%x cookie 0x%llx\n",
+ 		 CQE_QPID(&cqe),
+ 		 CQE_TYPE(&cqe), CQE_OPCODE(&cqe),
+@@ -828,6 +904,7 @@ out:
+  */
+ static int c4iw_poll_cq_one(struct c4iw_cq *chp, struct ib_wc *wc)
+ {
++	struct c4iw_srq *srq = NULL;
+ 	struct c4iw_qp *qhp = NULL;
+ 	struct t4_cqe *rd_cqe;
+ 	int ret;
+@@ -840,10 +917,15 @@ static int c4iw_poll_cq_one(struct c4iw_cq *chp, struct ib_wc *wc)
+ 	qhp = get_qhp(chp->rhp, CQE_QPID(rd_cqe));
+ 	if (qhp) {
+ 		spin_lock(&qhp->lock);
+-		ret = __c4iw_poll_cq_one(chp, qhp, wc);
++		srq = qhp->srq;
++		if (srq)
++			spin_lock(&srq->lock);
++		ret = __c4iw_poll_cq_one(chp, qhp, wc, srq);
+ 		spin_unlock(&qhp->lock);
++		if (srq)
++			spin_unlock(&srq->lock);
+ 	} else {
+-		ret = __c4iw_poll_cq_one(chp, NULL, wc);
++		ret = __c4iw_poll_cq_one(chp, NULL, wc, NULL);
+ 	}
+ 	return ret;
+ }
+@@ -1078,3 +1160,19 @@ int c4iw_arm_cq(struct ib_cq *ibcq, enum ib_cq_notify_flags flags)
+ 	spin_unlock_irqrestore(&chp->lock, flag);
+ 	return ret;
+ }
++
++void c4iw_flush_srqidx(struct c4iw_qp *qhp, u32 srqidx)
++{
++	struct c4iw_cq *rchp = to_c4iw_cq(qhp->ibqp.recv_cq);
++	unsigned long flag;
++
++	/* locking heirarchy: cq lock first, then qp lock. */
++	spin_lock_irqsave(&rchp->lock, flag);
++	spin_lock(&qhp->lock);
++
++	/* create a SRQ RECV CQE for srqidx */
++	insert_recv_cqe(&qhp->wq, &rchp->cq, srqidx);
++
++	spin_unlock(&qhp->lock);
++	spin_unlock_irqrestore(&rchp->lock, flag);
++}
+diff --git a/drivers/infiniband/hw/cxgb4/device.c b/drivers/infiniband/hw/cxgb4/device.c
+index aca5bf2747f9..08f6efabfc3f 100644
+--- a/drivers/infiniband/hw/cxgb4/device.c
++++ b/drivers/infiniband/hw/cxgb4/device.c
+@@ -275,10 +275,11 @@ static int dump_qp(int id, void *p, void *data)
+ 
+ 			set_ep_sin_addrs(ep, &lsin, &rsin, &m_lsin, &m_rsin);
+ 			cc = snprintf(qpd->buf + qpd->pos, space,
+-				      "rc qp sq id %u rq id %u state %u "
++				      "rc qp sq id %u %s id %u state %u "
+ 				      "onchip %u ep tid %u state %u "
+ 				      "%pI4:%u/%u->%pI4:%u/%u\n",
+-				      qp->wq.sq.qid, qp->wq.rq.qid,
++				      qp->wq.sq.qid, qp->srq ? "srq" : "rq",
++				      qp->srq ? qp->srq->idx : qp->wq.rq.qid,
+ 				      (int)qp->attr.state,
+ 				      qp->wq.sq.flags & T4_SQ_ONCHIP,
+ 				      ep->hwtid, (int)ep->com.state,
+@@ -480,6 +481,9 @@ static int stats_show(struct seq_file *seq, void *v)
+ 	seq_printf(seq, "      QID: %10llu %10llu %10llu %10llu\n",
+ 			dev->rdev.stats.qid.total, dev->rdev.stats.qid.cur,
+ 			dev->rdev.stats.qid.max, dev->rdev.stats.qid.fail);
++	seq_printf(seq, "     SRQS: %10llu %10llu %10llu %10llu\n",
++		   dev->rdev.stats.srqt.total, dev->rdev.stats.srqt.cur,
++			dev->rdev.stats.srqt.max, dev->rdev.stats.srqt.fail);
+ 	seq_printf(seq, "   TPTMEM: %10llu %10llu %10llu %10llu\n",
+ 			dev->rdev.stats.stag.total, dev->rdev.stats.stag.cur,
+ 			dev->rdev.stats.stag.max, dev->rdev.stats.stag.fail);
+@@ -530,6 +534,8 @@ static ssize_t stats_clear(struct file *file, const char __user *buf,
+ 	dev->rdev.stats.pbl.fail = 0;
+ 	dev->rdev.stats.rqt.max = 0;
+ 	dev->rdev.stats.rqt.fail = 0;
++	dev->rdev.stats.rqt.max = 0;
++	dev->rdev.stats.rqt.fail = 0;
+ 	dev->rdev.stats.ocqp.max = 0;
+ 	dev->rdev.stats.ocqp.fail = 0;
+ 	dev->rdev.stats.db_full = 0;
+@@ -815,7 +821,7 @@ static int c4iw_rdev_open(struct c4iw_rdev *rdev)
+ 
+ 	rdev->qpmask = rdev->lldi.udb_density - 1;
+ 	rdev->cqmask = rdev->lldi.ucq_density - 1;
+-	pr_debug("dev %s stag start 0x%0x size 0x%0x num stags %d pbl start 0x%0x size 0x%0x rq start 0x%0x size 0x%0x qp qid start %u size %u cq qid start %u size %u\n",
++	pr_debug("dev %s stag start 0x%0x size 0x%0x num stags %d pbl start 0x%0x size 0x%0x rq start 0x%0x size 0x%0x qp qid start %u size %u cq qid start %u size %u srq size %u\n",
+ 		 pci_name(rdev->lldi.pdev), rdev->lldi.vr->stag.start,
+ 		 rdev->lldi.vr->stag.size, c4iw_num_stags(rdev),
+ 		 rdev->lldi.vr->pbl.start,
+@@ -824,7 +830,8 @@ static int c4iw_rdev_open(struct c4iw_rdev *rdev)
+ 		 rdev->lldi.vr->qp.start,
+ 		 rdev->lldi.vr->qp.size,
+ 		 rdev->lldi.vr->cq.start,
+-		 rdev->lldi.vr->cq.size);
++		 rdev->lldi.vr->cq.size,
++		 rdev->lldi.vr->srq.size);
+ 	pr_debug("udb %pR db_reg %p gts_reg %p qpmask 0x%x cqmask 0x%x\n",
+ 		 &rdev->lldi.pdev->resource[2],
+ 		 rdev->lldi.db_reg, rdev->lldi.gts_reg,
+@@ -837,10 +844,12 @@ static int c4iw_rdev_open(struct c4iw_rdev *rdev)
+ 	rdev->stats.stag.total = rdev->lldi.vr->stag.size;
+ 	rdev->stats.pbl.total = rdev->lldi.vr->pbl.size;
+ 	rdev->stats.rqt.total = rdev->lldi.vr->rq.size;
++	rdev->stats.srqt.total = rdev->lldi.vr->srq.size;
+ 	rdev->stats.ocqp.total = rdev->lldi.vr->ocq.size;
+ 	rdev->stats.qid.total = rdev->lldi.vr->qp.size;
+ 
+-	err = c4iw_init_resource(rdev, c4iw_num_stags(rdev), T4_MAX_NUM_PD);
++	err = c4iw_init_resource(rdev, c4iw_num_stags(rdev),
++				 T4_MAX_NUM_PD, rdev->lldi.vr->srq.size);
+ 	if (err) {
+ 		pr_err("error %d initializing resources\n", err);
+ 		return err;
+diff --git a/drivers/infiniband/hw/cxgb4/iw_cxgb4.h b/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+index d6c215c77581..8bacb14d7597 100644
+--- a/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
++++ b/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+@@ -1013,7 +1013,8 @@ void c4iw_put_qpid(struct c4iw_rdev *rdev, u32 qpid,
+ 		   struct c4iw_dev_ucontext *uctx);
+ u32 c4iw_get_resource(struct c4iw_id_table *id_table);
+ void c4iw_put_resource(struct c4iw_id_table *id_table, u32 entry);
+-int c4iw_init_resource(struct c4iw_rdev *rdev, u32 nr_tpt, u32 nr_pdid);
++int c4iw_init_resource(struct c4iw_rdev *rdev, u32 nr_tpt,
++		       u32 nr_pdid, u32 nr_srqt);
+ int c4iw_init_ctrl_qp(struct c4iw_rdev *rdev);
+ int c4iw_pblpool_create(struct c4iw_rdev *rdev);
+ int c4iw_rqtpool_create(struct c4iw_rdev *rdev);
+* Unmerged path drivers/infiniband/hw/cxgb4/provider.c
+* Unmerged path drivers/infiniband/hw/cxgb4/qp.c
+diff --git a/drivers/infiniband/hw/cxgb4/resource.c b/drivers/infiniband/hw/cxgb4/resource.c
+index 0ef25ae05e6f..57ed26b3cc21 100644
+--- a/drivers/infiniband/hw/cxgb4/resource.c
++++ b/drivers/infiniband/hw/cxgb4/resource.c
+@@ -53,7 +53,8 @@ static int c4iw_init_qid_table(struct c4iw_rdev *rdev)
+ }
+ 
+ /* nr_* must be power of 2 */
+-int c4iw_init_resource(struct c4iw_rdev *rdev, u32 nr_tpt, u32 nr_pdid)
++int c4iw_init_resource(struct c4iw_rdev *rdev, u32 nr_tpt,
++		       u32 nr_pdid, u32 nr_srqt)
+ {
+ 	int err = 0;
+ 	err = c4iw_id_table_alloc(&rdev->resource.tpt_table, 0, nr_tpt, 1,
+@@ -67,7 +68,17 @@ int c4iw_init_resource(struct c4iw_rdev *rdev, u32 nr_tpt, u32 nr_pdid)
+ 					nr_pdid, 1, 0);
+ 	if (err)
+ 		goto pdid_err;
++	if (!nr_srqt)
++		err = c4iw_id_table_alloc(&rdev->resource.srq_table, 0,
++					  1, 1, 0);
++	else
++		err = c4iw_id_table_alloc(&rdev->resource.srq_table, 0,
++					  nr_srqt, 0, 0);
++	if (err)
++		goto srq_err;
+ 	return 0;
++ srq_err:
++	c4iw_id_table_free(&rdev->resource.pdid_table);
+  pdid_err:
+ 	c4iw_id_table_free(&rdev->resource.qid_table);
+  qid_err:
+@@ -371,13 +382,21 @@ void c4iw_rqtpool_free(struct c4iw_rdev *rdev, u32 addr, int size)
+ int c4iw_rqtpool_create(struct c4iw_rdev *rdev)
+ {
+ 	unsigned rqt_start, rqt_chunk, rqt_top;
++	int skip = 0;
+ 
+ 	rdev->rqt_pool = gen_pool_create(MIN_RQT_SHIFT, -1);
+ 	if (!rdev->rqt_pool)
+ 		return -ENOMEM;
+ 
+-	rqt_start = rdev->lldi.vr->rq.start;
+-	rqt_chunk = rdev->lldi.vr->rq.size;
++	/*
++	 * If SRQs are supported, then never use the first RQE from
++	 * the RQT region. This is because HW uses RQT index 0 as NULL.
++	 */
++	if (rdev->lldi.vr->srq.size)
++		skip = T4_RQT_ENTRY_SIZE;
++
++	rqt_start = rdev->lldi.vr->rq.start + skip;
++	rqt_chunk = rdev->lldi.vr->rq.size - skip;
+ 	rqt_top = rqt_start + rqt_chunk;
+ 
+ 	while (rqt_start < rqt_top) {
+@@ -405,6 +424,32 @@ void c4iw_rqtpool_destroy(struct c4iw_rdev *rdev)
+ 	kref_put(&rdev->rqt_kref, destroy_rqtpool);
+ }
+ 
++int c4iw_alloc_srq_idx(struct c4iw_rdev *rdev)
++{
++	int idx;
++
++	idx = c4iw_id_alloc(&rdev->resource.srq_table);
++	mutex_lock(&rdev->stats.lock);
++	if (idx == -1) {
++		rdev->stats.srqt.fail++;
++		mutex_unlock(&rdev->stats.lock);
++		return -ENOMEM;
++	}
++	rdev->stats.srqt.cur++;
++	if (rdev->stats.srqt.cur > rdev->stats.srqt.max)
++		rdev->stats.srqt.max = rdev->stats.srqt.cur;
++	mutex_unlock(&rdev->stats.lock);
++	return idx;
++}
++
++void c4iw_free_srq_idx(struct c4iw_rdev *rdev, int idx)
++{
++	c4iw_id_free(&rdev->resource.srq_table, idx);
++	mutex_lock(&rdev->stats.lock);
++	rdev->stats.srqt.cur--;
++	mutex_unlock(&rdev->stats.lock);
++}
++
+ /*
+  * On-Chip QP Memory.
+  */
+diff --git a/drivers/infiniband/hw/cxgb4/t4.h b/drivers/infiniband/hw/cxgb4/t4.h
+index 29a4dd5053f2..11d55fc2ded7 100644
+--- a/drivers/infiniband/hw/cxgb4/t4.h
++++ b/drivers/infiniband/hw/cxgb4/t4.h
+@@ -491,7 +491,6 @@ static inline void t4_rq_produce(struct t4_wq *wq, u8 len16)
+ static inline void t4_rq_consume(struct t4_wq *wq)
+ {
+ 	wq->rq.in_use--;
+-	wq->rq.msn++;
+ 	if (++wq->rq.cidx == wq->rq.size)
+ 		wq->rq.cidx = 0;
+ }
+@@ -641,12 +640,14 @@ static inline void t4_ring_rq_db(struct t4_wq *wq, u16 inc,
+ 
+ static inline int t4_wq_in_error(struct t4_wq *wq)
+ {
+-	return wq->rq.queue[wq->rq.size].status.qp_err;
++	return *wq->qp_errp;
+ }
+ 
+-static inline void t4_set_wq_in_error(struct t4_wq *wq)
++static inline void t4_set_wq_in_error(struct t4_wq *wq, u32 srqidx)
+ {
+-	wq->rq.queue[wq->rq.size].status.qp_err = 1;
++	if (srqidx)
++		*wq->srqidxp = srqidx;
++	*wq->qp_errp = 1;
+ }
+ 
+ static inline void t4_disable_wq_db(struct t4_wq *wq)
