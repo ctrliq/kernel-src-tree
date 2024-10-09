@@ -1,0 +1,90 @@
+sctp: set new_asoc temp when processing dupcookie
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 7e06297768886337707f5833942b3bd524a6d3d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7e062977.failed
+
+After sctp changed to use transport hashtable, a transport would be
+added into global hashtable when adding the peer to an asoc, then
+the asoc can be got by searching the transport in the hashtbale.
+
+The problem is when processing dupcookie in sctp_sf_do_5_2_4_dupcook,
+a new asoc would be created. A peer with the same addr and port as
+the one in the old asoc might be added into the new asoc, but fail
+to be added into the hashtable, as they also belong to the same sk.
+
+It causes that sctp's dupcookie processing can not really work.
+
+Since the new asoc will be freed after copying it's information to
+the old asoc, it's more like a temp asoc. So this patch is to fix
+it by setting it as a temp asoc to avoid adding it's any transport
+into the hashtable and also avoid allocing assoc_id.
+
+An extra thing it has to do is to also alloc stream info for any
+temp asoc, as sctp dupcookie process needs it to update old asoc.
+But I don't think it would hurt something, as a temp asoc would
+always be freed after finishing processing cookie echo packet.
+
+	Reported-by: Jianwen Ji <jiji@redhat.com>
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Acked-by: Neil Horman <nhorman@tuxdriver.com>
+	Acked-by: Vlad Yasevich <vyasevich@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7e06297768886337707f5833942b3bd524a6d3d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sctp/sm_make_chunk.c
+diff --cc net/sctp/sm_make_chunk.c
+index a2d162d7ff52,92e332e17391..000000000000
+--- a/net/sctp/sm_make_chunk.c
++++ b/net/sctp/sm_make_chunk.c
+@@@ -2463,21 -2454,11 +2463,29 @@@ int sctp_process_init(struct sctp_assoc
+  	 * stream sequence number shall be set to 0.
+  	 */
+  
+++<<<<<<< HEAD
+ +	/* Allocate storage for the negotiated streams if it is not a temporary
+ +	 * association.
+ +	 */
+ +	if (!asoc->temp) {
+ +		int error;
+ +
+ +		asoc->ssnmap = sctp_ssnmap_new(asoc->c.sinit_max_instreams,
+ +					       asoc->c.sinit_num_ostreams, gfp);
+ +		if (!asoc->ssnmap)
+ +			goto clean_up;
+ +
+ +		error = sctp_assoc_set_id(asoc, gfp);
+ +		if (error)
+ +			goto clean_up;
+ +	}
+++=======
++ 	if (sctp_stream_init(asoc, gfp))
++ 		goto clean_up;
++ 
++ 	if (!asoc->temp && sctp_assoc_set_id(asoc, gfp))
++ 		goto clean_up;
+++>>>>>>> 7e0629776888 (sctp: set new_asoc temp when processing dupcookie)
+  
+  	/* ADDIP Section 4.1 ASCONF Chunk Procedures
+  	 *
+* Unmerged path net/sctp/sm_make_chunk.c
+diff --git a/net/sctp/sm_statefuns.c b/net/sctp/sm_statefuns.c
+index 35451e80eda6..79c69c73e74b 100644
+--- a/net/sctp/sm_statefuns.c
++++ b/net/sctp/sm_statefuns.c
+@@ -2068,6 +2068,9 @@ sctp_disposition_t sctp_sf_do_5_2_4_dupcook(struct net *net,
+ 		}
+ 	}
+ 
++	/* Set temp so that it won't be added into hashtable */
++	new_asoc->temp = 1;
++
+ 	/* Compare the tie_tag in cookie with the verification tag of
+ 	 * current association.
+ 	 */
