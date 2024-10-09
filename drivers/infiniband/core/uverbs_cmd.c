@@ -2790,6 +2790,9 @@ void ib_uverbs_flow_resources_free(struct ib_uflow_resources *uflow_res)
 {
 	unsigned int i;
 
+	if (!uflow_res)
+		return;
+
 	for (i = 0; i < uflow_res->collection_num; i++)
 		atomic_dec(&uflow_res->collection[i]->usecnt);
 
@@ -3608,6 +3611,7 @@ int ib_uverbs_ex_create_flow(struct ib_uverbs_file *file,
 	}
 	atomic_inc(&qp->usecnt);
 	flow_id->qp = qp;
+	flow_id->device = qp->device;
 	flow_id->uobject = uobj;
 	uobj->object = flow_id;
 	uflow = container_of(uobj, typeof(*uflow), uobject);

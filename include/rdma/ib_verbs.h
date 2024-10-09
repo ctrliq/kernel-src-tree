@@ -2048,6 +2048,7 @@ struct ib_flow_attr {
 
 struct ib_flow {
 	struct ib_qp		*qp;
+	struct ib_device	*device;
 	struct ib_uobject	*uobject;
 };
 
