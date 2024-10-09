@@ -1478,7 +1478,8 @@ void qed_get_protocol_stats(struct qed_dev *cdev,
 		stats->lan_stats.fcs_err = -1;
 		break;
 	default:
-		DP_ERR(cdev, "Invalid protocol type = %d\n", type);
+		DP_VERBOSE(cdev, QED_MSG_SP,
+			   "Invalid protocol type = %d\n", type);
 		return;
 	}
 }
