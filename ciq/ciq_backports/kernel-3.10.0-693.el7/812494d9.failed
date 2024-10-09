@@ -1,0 +1,366 @@
+xen-netfront: always set num queues if possible
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author chas williams <3chas3@gmail.com>
+commit 812494d9a0cacf77e0a538be18183c7b471812aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/812494d9.failed
+
+If netfront connects with two (or more) queues and then reconnects with
+only one queue it fails to delete or rewrite the multi-queue-num-queues
+key and netback will try to use the wrong number of queues.
+
+Always write the num-queues field if the backend has multi-queue support.
+
+	Signed-off-by: Chas Williams <3chas3@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 812494d9a0cacf77e0a538be18183c7b471812aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/xen-netfront.c
+diff --cc drivers/net/xen-netfront.c
+index 8896052a2ee0,9bf63c27a9b7..000000000000
+--- a/drivers/net/xen-netfront.c
++++ b/drivers/net/xen-netfront.c
+@@@ -1631,58 -1546,301 +1631,83 @@@ fail
+  	return err;
+  }
+  
+ -/* Queue-specific initialisation
+ - * This used to be done in xennet_create_dev() but must now
+ - * be run per-queue.
+ - */
+ -static int xennet_init_queue(struct netfront_queue *queue)
+ +/* Common code used when first setting up, and when resuming. */
+ +static int talk_to_netback(struct xenbus_device *dev,
+ +			   struct netfront_info *info)
+  {
+ -	unsigned short i;
+ -	int err = 0;
+ -
+ -	spin_lock_init(&queue->tx_lock);
+ -	spin_lock_init(&queue->rx_lock);
+ -
+ -	setup_timer(&queue->rx_refill_timer, rx_refill_timeout,
+ -		    (unsigned long)queue);
+ -
+ -	snprintf(queue->name, sizeof(queue->name), "%s-q%u",
+ -		 queue->info->netdev->name, queue->id);
+ -
+ -	/* Initialise tx_skbs as a free chain containing every entry. */
+ -	queue->tx_skb_freelist = 0;
+ -	for (i = 0; i < NET_TX_RING_SIZE; i++) {
+ -		skb_entry_set_link(&queue->tx_skbs[i], i+1);
+ -		queue->grant_tx_ref[i] = GRANT_INVALID_REF;
+ -		queue->grant_tx_page[i] = NULL;
+ -	}
+ -
+ -	/* Clear out rx_skbs */
+ -	for (i = 0; i < NET_RX_RING_SIZE; i++) {
+ -		queue->rx_skbs[i] = NULL;
+ -		queue->grant_rx_ref[i] = GRANT_INVALID_REF;
+ -	}
+ -
+ -	/* A grant for every tx ring slot */
+ -	if (gnttab_alloc_grant_references(NET_TX_RING_SIZE,
+ -					  &queue->gref_tx_head) < 0) {
+ -		pr_alert("can't alloc tx grant refs\n");
+ -		err = -ENOMEM;
+ -		goto exit;
+ -	}
+ -
+ -	/* A grant for every rx ring slot */
+ -	if (gnttab_alloc_grant_references(NET_RX_RING_SIZE,
+ -					  &queue->gref_rx_head) < 0) {
+ -		pr_alert("can't alloc rx grant refs\n");
+ -		err = -ENOMEM;
+ -		goto exit_free_tx;
+ -	}
+ -
+ -	return 0;
+ +	const char *message;
+ +	struct xenbus_transaction xbt;
+ +	int err;
+  
+ - exit_free_tx:
+ -	gnttab_free_grant_references(queue->gref_tx_head);
+ - exit:
+ -	return err;
+ -}
+ +	/* Create shared ring, alloc event channel. */
+ +	err = setup_netfront(dev, info);
+ +	if (err)
+ +		goto out;
+  
+ -static int write_queue_xenstore_keys(struct netfront_queue *queue,
+ -			   struct xenbus_transaction *xbt, int write_hierarchical)
+ -{
+ -	/* Write the queue-specific keys into XenStore in the traditional
+ -	 * way for a single queue, or in a queue subkeys for multiple
+ -	 * queues.
+ -	 */
+ -	struct xenbus_device *dev = queue->info->xbdev;
+ -	int err;
+ -	const char *message;
+ -	char *path;
+ -	size_t pathsize;
+ -
+ -	/* Choose the correct place to write the keys */
+ -	if (write_hierarchical) {
+ -		pathsize = strlen(dev->nodename) + 10;
+ -		path = kzalloc(pathsize, GFP_KERNEL);
+ -		if (!path) {
+ -			err = -ENOMEM;
+ -			message = "out of memory while writing ring references";
+ -			goto error;
+ -		}
+ -		snprintf(path, pathsize, "%s/queue-%u",
+ -				dev->nodename, queue->id);
+ -	} else {
+ -		path = (char *)dev->nodename;
+ +again:
+ +	err = xenbus_transaction_start(&xbt);
+ +	if (err) {
+ +		xenbus_dev_fatal(dev, err, "starting transaction");
+ +		goto destroy_ring;
+  	}
+  
+ -	/* Write ring references */
+ -	err = xenbus_printf(*xbt, path, "tx-ring-ref", "%u",
+ -			queue->tx_ring_ref);
+++<<<<<<< HEAD
+ +	err = xenbus_printf(xbt, dev->nodename, "tx-ring-ref", "%u",
+ +			    info->tx_ring_ref);
+  	if (err) {
+ -		message = "writing tx-ring-ref";
+ -		goto error;
+ +		message = "writing tx ring-ref";
+ +		goto abort_transaction;
+  	}
+ -
+ -	err = xenbus_printf(*xbt, path, "rx-ring-ref", "%u",
+ -			queue->rx_ring_ref);
+ +	err = xenbus_printf(xbt, dev->nodename, "rx-ring-ref", "%u",
+ +			    info->rx_ring_ref);
+  	if (err) {
+ -		message = "writing rx-ring-ref";
+ -		goto error;
+ +		message = "writing rx ring-ref";
+ +		goto abort_transaction;
+  	}
+  
+ -	/* Write event channels; taking into account both shared
+ -	 * and split event channel scenarios.
+ -	 */
+ -	if (queue->tx_evtchn == queue->rx_evtchn) {
+ -		/* Shared event channel */
+ -		err = xenbus_printf(*xbt, path,
+ -				"event-channel", "%u", queue->tx_evtchn);
+ +	if (info->tx_evtchn == info->rx_evtchn) {
+ +		err = xenbus_printf(xbt, dev->nodename,
+ +				    "event-channel", "%u", info->tx_evtchn);
+  		if (err) {
+  			message = "writing event-channel";
+ -			goto error;
+ +			goto abort_transaction;
+  		}
+  	} else {
+ -		/* Split event channels */
+ -		err = xenbus_printf(*xbt, path,
+ -				"event-channel-tx", "%u", queue->tx_evtchn);
+ +		err = xenbus_printf(xbt, dev->nodename,
+ +				    "event-channel-tx", "%u", info->tx_evtchn);
+  		if (err) {
+  			message = "writing event-channel-tx";
+ -			goto error;
+ +			goto abort_transaction;
+  		}
+ -
+ -		err = xenbus_printf(*xbt, path,
+ -				"event-channel-rx", "%u", queue->rx_evtchn);
+ +		err = xenbus_printf(xbt, dev->nodename,
+ +				    "event-channel-rx", "%u", info->rx_evtchn);
+  		if (err) {
+  			message = "writing event-channel-rx";
+ -			goto error;
+ -		}
+ -	}
+ -
+ -	if (write_hierarchical)
+ -		kfree(path);
+ -	return 0;
+ -
+ -error:
+ -	if (write_hierarchical)
+ -		kfree(path);
+ -	xenbus_dev_fatal(dev, err, "%s", message);
+ -	return err;
+ -}
+ -
+ -static void xennet_destroy_queues(struct netfront_info *info)
+ -{
+ -	unsigned int i;
+ -
+ -	rtnl_lock();
+ -
+ -	for (i = 0; i < info->netdev->real_num_tx_queues; i++) {
+ -		struct netfront_queue *queue = &info->queues[i];
+ -
+ -		if (netif_running(info->netdev))
+ -			napi_disable(&queue->napi);
+ -		del_timer_sync(&queue->rx_refill_timer);
+ -		netif_napi_del(&queue->napi);
+ -	}
+ -
+ -	rtnl_unlock();
+ -
+ -	kfree(info->queues);
+ -	info->queues = NULL;
+ -}
+ -
+ -static int xennet_create_queues(struct netfront_info *info,
+ -				unsigned int num_queues)
+ -{
+ -	unsigned int i;
+ -	int ret;
+ -
+ -	info->queues = kcalloc(num_queues, sizeof(struct netfront_queue),
+ -			       GFP_KERNEL);
+ -	if (!info->queues)
+ -		return -ENOMEM;
+ -
+ -	rtnl_lock();
+ -
+ -	for (i = 0; i < num_queues; i++) {
+ -		struct netfront_queue *queue = &info->queues[i];
+ -
+ -		queue->id = i;
+ -		queue->info = info;
+ -
+ -		ret = xennet_init_queue(queue);
+ -		if (ret < 0) {
+ -			dev_warn(&info->netdev->dev,
+ -				 "only created %d queues\n", i);
+ -			num_queues = i;
+ -			break;
+ -		}
+ -
+ -		netif_napi_add(queue->info->netdev, &queue->napi,
+ -			       xennet_poll, 64);
+ -		if (netif_running(info->netdev))
+ -			napi_enable(&queue->napi);
+ -	}
+ -
+ -	netif_set_real_num_tx_queues(info->netdev, num_queues);
+ -
+ -	rtnl_unlock();
+ -
+ -	if (num_queues == 0) {
+ -		dev_err(&info->netdev->dev, "no queues\n");
+ -		return -EINVAL;
+ -	}
+ -	return 0;
+ -}
+ -
+ -/* Common code used when first setting up, and when resuming. */
+ -static int talk_to_netback(struct xenbus_device *dev,
+ -			   struct netfront_info *info)
+ -{
+ -	const char *message;
+ -	struct xenbus_transaction xbt;
+ -	int err;
+ -	unsigned int feature_split_evtchn;
+ -	unsigned int i = 0;
+ -	unsigned int max_queues = 0;
+ -	struct netfront_queue *queue = NULL;
+ -	unsigned int num_queues = 1;
+ -
+ -	info->netdev->irq = 0;
+ -
+ -	/* Check if backend supports multiple queues */
+ -	err = xenbus_scanf(XBT_NIL, info->xbdev->otherend,
+ -			   "multi-queue-max-queues", "%u", &max_queues);
+ -	if (err < 0)
+ -		max_queues = 1;
+ -	num_queues = min(max_queues, xennet_max_queues);
+ -
+ -	/* Check feature-split-event-channels */
+ -	err = xenbus_scanf(XBT_NIL, info->xbdev->otherend,
+ -			   "feature-split-event-channels", "%u",
+ -			   &feature_split_evtchn);
+ -	if (err < 0)
+ -		feature_split_evtchn = 0;
+ -
+ -	/* Read mac addr. */
+ -	err = xen_net_read_mac(dev, info->netdev->dev_addr);
+ -	if (err) {
+ -		xenbus_dev_fatal(dev, err, "parsing %s/mac", dev->nodename);
+ -		goto out;
+ -	}
+ -
+ -	if (info->queues)
+ -		xennet_destroy_queues(info);
+ -
+ -	err = xennet_create_queues(info, num_queues);
+ -	if (err < 0)
+ -		goto destroy_ring;
+ -
+ -	/* Create shared ring, alloc event channel -- for each queue */
+ -	for (i = 0; i < num_queues; ++i) {
+ -		queue = &info->queues[i];
+ -		err = setup_netfront(dev, queue, feature_split_evtchn);
+ -		if (err) {
+ -			/* setup_netfront() will tidy up the current
+ -			 * queue on error, but we need to clean up
+ -			 * those already allocated.
+ -			 */
+ -			if (i > 0) {
+ -				rtnl_lock();
+ -				netif_set_real_num_tx_queues(info->netdev, i);
+ -				rtnl_unlock();
+ -				goto destroy_ring;
+ -			} else {
+ -				goto out;
+ -			}
+ -		}
+ -	}
+ -
+ -again:
+ -	err = xenbus_transaction_start(&xbt);
+ -	if (err) {
+ -		xenbus_dev_fatal(dev, err, "starting transaction");
+ -		goto destroy_ring;
+ -	}
+ -
+ +			goto abort_transaction;
+++=======
++ 	if (xenbus_exists(XBT_NIL,
++ 			  info->xbdev->otherend, "multi-queue-max-queues")) {
++ 		/* Write the number of queues */
++ 		err = xenbus_printf(xbt, dev->nodename,
++ 				    "multi-queue-num-queues", "%u", num_queues);
++ 		if (err) {
++ 			message = "writing multi-queue-num-queues";
++ 			goto abort_transaction_no_dev_fatal;
++ 		}
++ 	}
++ 
++ 	if (num_queues == 1) {
++ 		err = write_queue_xenstore_keys(&info->queues[0], &xbt, 0); /* flat */
++ 		if (err)
++ 			goto abort_transaction_no_dev_fatal;
++ 	} else {
++ 		/* Write the keys for each queue */
++ 		for (i = 0; i < num_queues; ++i) {
++ 			queue = &info->queues[i];
++ 			err = write_queue_xenstore_keys(queue, &xbt, 1); /* hierarchical */
++ 			if (err)
++ 				goto abort_transaction_no_dev_fatal;
+++>>>>>>> 812494d9a0ca (xen-netfront: always set num queues if possible)
+  		}
+  	}
+  
+* Unmerged path drivers/net/xen-netfront.c
