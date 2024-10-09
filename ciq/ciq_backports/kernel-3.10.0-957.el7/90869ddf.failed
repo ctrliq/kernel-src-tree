@@ -1,0 +1,320 @@
+net: aquantia: Implement pci shutdown callback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [netdrv] aquantia: Implement pci shutdown callback (David Arcari) [1570787]
+Rebuild_FUZZ: 94.25%
+commit-author Igor Russkikh <igor.russkikh@aquantia.com>
+commit 90869ddfefebb1a79bd7bebfa4f28baa9f8c82cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/90869ddf.failed
+
+We should close link and all NIC operations during shutdown.
+On some systems graceful reboot never closes NIC interface on its own,
+but only indicates pci device shutdown. Without explicit handler, NIC
+rx rings continued to transfer DMA data into prepared buffers while CPU
+rebooted already. That caused memory corruptions on soft reboot.
+
+	Signed-off-by: Igor Russkikh <igor.russkikh@aquantia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 90869ddfefebb1a79bd7bebfa4f28baa9f8c82cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/aquantia/atlantic/aq_pci_func.c
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_pci_func.c
+index 667e08a571a5,ecc6306f940f..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_pci_func.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_pci_func.c
+@@@ -261,87 -177,189 +261,149 @@@ void aq_pci_func_free_irqs(struct aq_pc
+  	}
+  }
+  
+ -unsigned int aq_pci_func_get_irq_type(struct aq_nic_s *self)
+ +void __iomem *aq_pci_func_get_mmio(struct aq_pci_func_s *self)
+  {
+ -	if (self->pdev->msix_enabled)
+ -		return AQ_HW_IRQ_MSIX;
+ -	if (self->pdev->msi_enabled)
+ -		return AQ_HW_IRQ_MSIX;
+ -	return AQ_HW_IRQ_LEGACY;
+ +	return self->mmio;
+  }
+  
+ -static void aq_pci_free_irq_vectors(struct aq_nic_s *self)
+ +unsigned int aq_pci_func_get_irq_type(struct aq_pci_func_s *self)
+  {
+ -	pci_free_irq_vectors(self->pdev);
+ +	return self->irq_type;
+  }
+  
+ -static int aq_pci_probe(struct pci_dev *pdev,
+ -			const struct pci_device_id *pci_id)
+ +void aq_pci_func_deinit(struct aq_pci_func_s *self)
+  {
+ -	struct aq_nic_s *self = NULL;
+ -	int err = 0;
+ -	struct net_device *ndev;
+ -	resource_size_t mmio_pa;
+ -	u32 bar;
+ -	u32 numvecs;
+ +	if (!self)
+ +		goto err_exit;
+  
+ -	err = pci_enable_device(pdev);
+ -	if (err)
+ -		return err;
+ +	aq_pci_func_free_irqs(self);
+  
+ -	err = aq_pci_func_init(pdev);
+ -	if (err)
+ -		goto err_pci_func;
+ +	switch (self->irq_type) {
+ +	case AQ_HW_IRQ_MSI:
+ +		pci_disable_msi(self->pdev);
+ +		break;
+  
+ -	ndev = aq_ndev_alloc();
+ -	if (!ndev) {
+ -		err = -ENOMEM;
+ -		goto err_ndev;
+ +	case AQ_HW_IRQ_MSIX:
+ +		pci_disable_msix(self->pdev);
+ +		break;
+ +
+ +	case AQ_HW_IRQ_LEGACY:
+ +		break;
+ +
+ +	default:
+ +		break;
+  	}
+  
+ -	self = netdev_priv(ndev);
+ -	self->pdev = pdev;
+ -	SET_NETDEV_DEV(ndev, &pdev->dev);
+ -	pci_set_drvdata(pdev, self);
+ +	if (self->is_regions)
+ +		pci_release_regions(self->pdev);
+  
+ -	err = aq_pci_probe_get_hw_by_id(pdev, &self->aq_hw_ops,
+ -					&aq_nic_get_cfg(self)->aq_hw_caps);
+ -	if (err)
+ -		goto err_ioremap;
+ +	if (self->is_pci_enabled)
+ +		pci_disable_device(self->pdev);
+  
+ -	self->aq_hw = kzalloc(sizeof(*self->aq_hw), GFP_KERNEL);
+ -	if (!self->aq_hw) {
+ -		err = -ENOMEM;
+ -		goto err_ioremap;
+ -	}
+ -	self->aq_hw->aq_nic_cfg = aq_nic_get_cfg(self);
+ +err_exit:;
+ +}
+  
+ -	for (bar = 0; bar < 4; ++bar) {
+ -		if (IORESOURCE_MEM & pci_resource_flags(pdev, bar)) {
+ -			resource_size_t reg_sz;
+ +void aq_pci_func_free(struct aq_pci_func_s *self)
+ +{
+ +	unsigned int port = 0U;
+  
+ -			mmio_pa = pci_resource_start(pdev, bar);
+ -			if (mmio_pa == 0U) {
+ -				err = -EIO;
+ -				goto err_free_aq_hw;
+ -			}
+ +	if (!self)
+ +		goto err_exit;
+  
+ -			reg_sz = pci_resource_len(pdev, bar);
+ -			if ((reg_sz <= 24 /*ATL_REGS_SIZE*/)) {
+ -				err = -EIO;
+ -				goto err_free_aq_hw;
+ -			}
+ +	for (port = 0; port < self->ports; ++port) {
+ +		if (!self->port[port])
+ +			continue;
+  
+ -			self->aq_hw->mmio = ioremap_nocache(mmio_pa, reg_sz);
+ -			if (!self->aq_hw->mmio) {
+ -				err = -EIO;
+ -				goto err_free_aq_hw;
+ -			}
+ -			break;
+ -		}
+ +		aq_nic_ndev_free(self->port[port]);
+  	}
+  
+ -	if (bar == 4) {
+ -		err = -EIO;
+ -		goto err_free_aq_hw;
+ -	}
+ +	if (self->mmio)
+ +		iounmap(self->mmio);
+  
+ -	numvecs = min((u8)AQ_CFG_VECS_DEF,
+ -		      aq_nic_get_cfg(self)->aq_hw_caps->msix_irqs);
+ -	numvecs = min(numvecs, num_online_cpus());
+ -	/*enable interrupts */
+ -#if !AQ_CFG_FORCE_LEGACY_INT
+ -	err = pci_alloc_irq_vectors(self->pdev, numvecs, numvecs,
+ -				    PCI_IRQ_MSIX);
+ +	kfree(self);
+  
+ -	if (err < 0) {
+ -		err = pci_alloc_irq_vectors(self->pdev, 1, 1,
+ -					    PCI_IRQ_MSI | PCI_IRQ_LEGACY);
+ -		if (err < 0)
+ -			goto err_hwinit;
+ -	}
+ -#endif
+ +err_exit:;
+ +}
+  
+ -	/* net device init */
+ -	aq_nic_cfg_start(self);
+ +int aq_pci_func_change_pm_state(struct aq_pci_func_s *self,
+ +				pm_message_t *pm_msg)
+ +{
+ +	int err = 0;
+ +	unsigned int port = 0U;
+  
+ -	aq_nic_ndev_init(self);
+ +	if (!self) {
+ +		err = -EFAULT;
+ +		goto err_exit;
+ +	}
+ +	for (port = 0; port < self->ports; ++port) {
+ +		if (!self->port[port])
+ +			continue;
+  
+ -	err = aq_nic_ndev_register(self);
+ -	if (err < 0)
+ -		goto err_register;
+ -
+ -	return 0;
+ -
+ -err_register:
+ -	aq_nic_free_vectors(self);
+ -	aq_pci_free_irq_vectors(self);
+ -err_hwinit:
+ -	iounmap(self->aq_hw->mmio);
+ -err_free_aq_hw:
+ -	kfree(self->aq_hw);
+ -err_ioremap:
+ -	free_netdev(ndev);
+ -err_pci_func:
+ -	pci_release_regions(pdev);
+ -err_ndev:
+ -	pci_disable_device(pdev);
+ +		(void)aq_nic_change_pm_state(self->port[port], pm_msg);
+ +	}
+ +
+ +err_exit:
+  	return err;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static void aq_pci_remove(struct pci_dev *pdev)
++ {
++ 	struct aq_nic_s *self = pci_get_drvdata(pdev);
++ 
++ 	if (self->ndev) {
++ 		if (self->ndev->reg_state == NETREG_REGISTERED)
++ 			unregister_netdev(self->ndev);
++ 		aq_nic_free_vectors(self);
++ 		aq_pci_free_irq_vectors(self);
++ 		iounmap(self->aq_hw->mmio);
++ 		kfree(self->aq_hw);
++ 		pci_release_regions(pdev);
++ 		free_netdev(self->ndev);
++ 	}
++ 
++ 	pci_disable_device(pdev);
++ }
++ 
++ static void aq_pci_shutdown(struct pci_dev *pdev)
++ {
++ 	struct aq_nic_s *self = pci_get_drvdata(pdev);
++ 
++ 	aq_nic_shutdown(self);
++ 
++ 	pci_disable_device(pdev);
++ 
++ 	if (system_state == SYSTEM_POWER_OFF) {
++ 		pci_wake_from_d3(pdev, false);
++ 		pci_set_power_state(pdev, PCI_D3hot);
++ 	}
++ }
++ 
++ static int aq_pci_suspend(struct pci_dev *pdev, pm_message_t pm_msg)
++ {
++ 	struct aq_nic_s *self = pci_get_drvdata(pdev);
++ 
++ 	return aq_nic_change_pm_state(self, &pm_msg);
++ }
++ 
++ static int aq_pci_resume(struct pci_dev *pdev)
++ {
++ 	struct aq_nic_s *self = pci_get_drvdata(pdev);
++ 	pm_message_t pm_msg = PMSG_RESTORE;
++ 
++ 	return aq_nic_change_pm_state(self, &pm_msg);
++ }
++ 
++ static struct pci_driver aq_pci_ops = {
++ 	.name = AQ_CFG_DRV_NAME,
++ 	.id_table = aq_pci_tbl,
++ 	.probe = aq_pci_probe,
++ 	.remove = aq_pci_remove,
++ 	.suspend = aq_pci_suspend,
++ 	.resume = aq_pci_resume,
++ 	.shutdown = aq_pci_shutdown,
++ };
++ 
++ module_pci_driver(aq_pci_ops);
+++>>>>>>> 90869ddfefeb (net: aquantia: Implement pci shutdown callback)
+diff --git a/drivers/net/ethernet/aquantia/atlantic/aq_nic.c b/drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+index 06b1526703b5..28c3eb97de94 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_nic.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+@@ -1054,3 +1054,23 @@ err_exit:
+ out:
+ 	return err;
+ }
++
++void aq_nic_shutdown(struct aq_nic_s *self)
++{
++	int err = 0;
++
++	if (!self->ndev)
++		return;
++
++	rtnl_lock();
++
++	netif_device_detach(self->ndev);
++
++	err = aq_nic_stop(self);
++	if (err < 0)
++		goto err_exit;
++	aq_nic_deinit(self);
++
++err_exit:
++	rtnl_unlock();
++}
+\ No newline at end of file
+diff --git a/drivers/net/ethernet/aquantia/atlantic/aq_nic.h b/drivers/net/ethernet/aquantia/atlantic/aq_nic.h
+index 715b53c689ef..fae284cb00d6 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_nic.h
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_nic.h
+@@ -107,5 +107,6 @@ struct aq_nic_cfg_s *aq_nic_get_cfg(struct aq_nic_s *self);
+ u32 aq_nic_get_fw_version(struct aq_nic_s *self);
+ int aq_nic_change_pm_state(struct aq_nic_s *self, pm_message_t *pm_msg);
+ int aq_nic_update_interrupt_moderation_settings(struct aq_nic_s *self);
++void aq_nic_shutdown(struct aq_nic_s *self);
+ 
+ #endif /* AQ_NIC_H */
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_pci_func.c
