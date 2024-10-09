@@ -1,0 +1,1236 @@
+mm: add new mmgrab() helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Vegard Nossum <vegard.nossum@oracle.com>
+commit f1f1007644ffc8051a4c11427d58b1967ae7b75a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/f1f10076.failed
+
+Apart from adding the helper function itself, the rest of the kernel is
+converted mechanically using:
+
+  git grep -l 'atomic_inc.*mm_count' | xargs sed -i 's/atomic_inc(&\(.*\)->mm_count);/mmgrab\(\1\);/'
+  git grep -l 'atomic_inc.*mm_count' | xargs sed -i 's/atomic_inc(&\(.*\)\.mm_count);/mmgrab\(\&\1\);/'
+
+This is needed for a later patch that hooks into the helper, but might
+be a worthwhile cleanup on its own.
+
+(Michal Hocko provided most of the kerneldoc comment.)
+
+Link: http://lkml.kernel.org/r/20161218123229.22952-1-vegard.nossum@oracle.com
+	Signed-off-by: Vegard Nossum <vegard.nossum@oracle.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: David Rientjes <rientjes@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit f1f1007644ffc8051a4c11427d58b1967ae7b75a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/processor.c
+#	arch/xtensa/kernel/smp.c
+#	drivers/gpu/drm/amd/amdkfd/kfd_process.c
+#	drivers/infiniband/hw/hfi1/file_ops.c
+#	fs/proc/base.c
+#	kernel/exit.c
+#	mm/khugepaged.c
+#	mm/oom_kill.c
+diff --cc arch/s390/kernel/processor.c
+index c3627d6038aa,bc2b60dcb178..000000000000
+--- a/arch/s390/kernel/processor.c
++++ b/arch/s390/kernel/processor.c
+@@@ -33,11 -68,12 +33,17 @@@ EXPORT_SYMBOL(cpu_relax)
+   */
+  void cpu_init(void)
+  {
+ -	struct cpuid *id = this_cpu_ptr(&cpu_info.cpu_id);
+ +	struct s390_idle_data *idle = &__get_cpu_var(s390_idle);
+ +	struct cpuid *id = &__get_cpu_var(cpu_id);
+  
+  	get_cpu_id(id);
+++<<<<<<< HEAD
+ +	atomic_inc(&init_mm.mm_count);
+++=======
++ 	if (machine_has_cpu_mhz)
++ 		update_cpu_mhz(NULL);
++ 	mmgrab(&init_mm);
+++>>>>>>> f1f1007644ff (mm: add new mmgrab() helper)
+  	current->active_mm = &init_mm;
+  	BUG_ON(current->mm);
+  	enter_lazy_tlb(&init_mm, current);
+diff --cc drivers/gpu/drm/amd/amdkfd/kfd_process.c
+index 1711ad0642f7,ca5f2aa7232d..000000000000
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_process.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_process.c
+@@@ -401,37 -235,35 +401,47 @@@ static void kfd_process_notifier_releas
+  	mutex_unlock(&kfd_processes_mutex);
+  	synchronize_srcu(&kfd_processes_srcu);
+  
+ -	mutex_lock(&p->mutex);
+ +	cancel_delayed_work_sync(&p->eviction_work);
+ +	cancel_delayed_work_sync(&p->restore_work);
+  
+ -	/* In case our notifier is called before IOMMU notifier */
+ -	pqm_uninit(&p->pqm);
+ +	mutex_lock(&p->mutex);
+  
+ -	/* Iterate over all process device data structure and check
+ -	 * if we should delete debug managers and reset all wavefronts
+ +	/* Iterate over all process device data structures and if the
+ +	 * pdd is in debug mode, we should first force unregistration,
+ +	 * then we will be able to destroy the queues
+  	 */
+  	list_for_each_entry(pdd, &p->per_device_data, per_device_list) {
+ -		if ((pdd->dev->dbgmgr) &&
+ -				(pdd->dev->dbgmgr->pasid == p->pasid))
+ -			kfd_dbgmgr_destroy(pdd->dev->dbgmgr);
+ -
+ -		if (pdd->reset_wavefronts) {
+ -			pr_warn("amdkfd: Resetting all wave fronts\n");
+ -			dbgdev_wave_reset_wavefronts(pdd->dev, p);
+ -			pdd->reset_wavefronts = false;
+ +		struct kfd_dev *dev = pdd->dev;
+ +
+ +		mutex_lock(kfd_get_dbgmgr_mutex());
+ +		if (dev && dev->dbgmgr && dev->dbgmgr->pasid == p->pasid) {
+ +			if (!kfd_dbgmgr_unregister(dev->dbgmgr, p)) {
+ +				kfd_dbgmgr_destroy(dev->dbgmgr);
+ +				dev->dbgmgr = NULL;
+ +			}
+  		}
+ +		mutex_unlock(kfd_get_dbgmgr_mutex());
+  	}
+  
+ +	kfd_process_dequeue_from_all_devices(p);
+ +	pqm_uninit(&p->pqm);
+ +
+ +	/* Indicate to other users that MM is no longer valid */
+ +	p->mm = NULL;
+ +
+  	mutex_unlock(&p->mutex);
+  
+++<<<<<<< HEAD
+ +	mmu_notifier_unregister_no_release(&p->mmu_notifier, mm);
+++=======
++ 	/*
++ 	 * Because we drop mm_count inside kfd_process_destroy_delayed
++ 	 * and because the mmu_notifier_unregister function also drop
++ 	 * mm_count we need to take an extra count here.
++ 	 */
++ 	mmgrab(p->mm);
++ 	mmu_notifier_unregister_no_release(&p->mmu_notifier, p->mm);
+++>>>>>>> f1f1007644ff (mm: add new mmgrab() helper)
+  	mmu_notifier_call_srcu(&p->rcu, &kfd_process_destroy_delayed);
+  }
+  
+diff --cc drivers/infiniband/hw/hfi1/file_ops.c
+index db50afb2e335,3b19c16a9e45..000000000000
+--- a/drivers/infiniband/hw/hfi1/file_ops.c
++++ b/drivers/infiniband/hw/hfi1/file_ops.c
+@@@ -204,9 -185,7 +204,13 @@@ static int hfi1_file_open(struct inode 
+  	if (fd) {
+  		fd->rec_cpu_num = -1; /* no cpu affinity by default */
+  		fd->mm = current->mm;
+++<<<<<<< HEAD
+ +		atomic_inc(&fd->mm->mm_count);
+ +		fd->dd = dd;
+ +		kobject_get(&fd->dd->kobj);
+++=======
++ 		mmgrab(fd->mm);
+++>>>>>>> f1f1007644ff (mm: add new mmgrab() helper)
+  		fp->private_data = fd;
+  	} else {
+  		fp->private_data = NULL;
+diff --cc fs/proc/base.c
+index 3f20e2834b87,5d51a188871b..000000000000
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@@ -1108,6 -1020,104 +1108,107 @@@ static ssize_t oom_adj_read(struct fil
+  	return simple_read_from_buffer(buf, count, ppos, buffer, len);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int __set_oom_adj(struct file *file, int oom_adj, bool legacy)
++ {
++ 	static DEFINE_MUTEX(oom_adj_mutex);
++ 	struct mm_struct *mm = NULL;
++ 	struct task_struct *task;
++ 	int err = 0;
++ 
++ 	task = get_proc_task(file_inode(file));
++ 	if (!task)
++ 		return -ESRCH;
++ 
++ 	mutex_lock(&oom_adj_mutex);
++ 	if (legacy) {
++ 		if (oom_adj < task->signal->oom_score_adj &&
++ 				!capable(CAP_SYS_RESOURCE)) {
++ 			err = -EACCES;
++ 			goto err_unlock;
++ 		}
++ 		/*
++ 		 * /proc/pid/oom_adj is provided for legacy purposes, ask users to use
++ 		 * /proc/pid/oom_score_adj instead.
++ 		 */
++ 		pr_warn_once("%s (%d): /proc/%d/oom_adj is deprecated, please use /proc/%d/oom_score_adj instead.\n",
++ 			  current->comm, task_pid_nr(current), task_pid_nr(task),
++ 			  task_pid_nr(task));
++ 	} else {
++ 		if ((short)oom_adj < task->signal->oom_score_adj_min &&
++ 				!capable(CAP_SYS_RESOURCE)) {
++ 			err = -EACCES;
++ 			goto err_unlock;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * Make sure we will check other processes sharing the mm if this is
++ 	 * not vfrok which wants its own oom_score_adj.
++ 	 * pin the mm so it doesn't go away and get reused after task_unlock
++ 	 */
++ 	if (!task->vfork_done) {
++ 		struct task_struct *p = find_lock_task_mm(task);
++ 
++ 		if (p) {
++ 			if (atomic_read(&p->mm->mm_users) > 1) {
++ 				mm = p->mm;
++ 				mmgrab(mm);
++ 			}
++ 			task_unlock(p);
++ 		}
++ 	}
++ 
++ 	task->signal->oom_score_adj = oom_adj;
++ 	if (!legacy && has_capability_noaudit(current, CAP_SYS_RESOURCE))
++ 		task->signal->oom_score_adj_min = (short)oom_adj;
++ 	trace_oom_score_adj_update(task);
++ 
++ 	if (mm) {
++ 		struct task_struct *p;
++ 
++ 		rcu_read_lock();
++ 		for_each_process(p) {
++ 			if (same_thread_group(task, p))
++ 				continue;
++ 
++ 			/* do not touch kernel threads or the global init */
++ 			if (p->flags & PF_KTHREAD || is_global_init(p))
++ 				continue;
++ 
++ 			task_lock(p);
++ 			if (!p->vfork_done && process_shares_mm(p, mm)) {
++ 				pr_info("updating oom_score_adj for %d (%s) from %d to %d because it shares mm with %d (%s). Report if this is unexpected.\n",
++ 						task_pid_nr(p), p->comm,
++ 						p->signal->oom_score_adj, oom_adj,
++ 						task_pid_nr(task), task->comm);
++ 				p->signal->oom_score_adj = oom_adj;
++ 				if (!legacy && has_capability_noaudit(current, CAP_SYS_RESOURCE))
++ 					p->signal->oom_score_adj_min = (short)oom_adj;
++ 			}
++ 			task_unlock(p);
++ 		}
++ 		rcu_read_unlock();
++ 		mmdrop(mm);
++ 	}
++ err_unlock:
++ 	mutex_unlock(&oom_adj_mutex);
++ 	put_task_struct(task);
++ 	return err;
++ }
++ 
++ /*
++  * /proc/pid/oom_adj exists solely for backwards compatibility with previous
++  * kernels.  The effective policy is defined by oom_score_adj, which has a
++  * different scale: oom_adj grew exponentially and oom_score_adj grows linearly.
++  * Values written to oom_adj are simply mapped linearly to oom_score_adj.
++  * Processes that become oom disabled via oom_adj will still be oom disabled
++  * with this implementation.
++  *
++  * oom_adj cannot be removed since existing userspace binaries use it.
++  */
+++>>>>>>> f1f1007644ff (mm: add new mmgrab() helper)
+  static ssize_t oom_adj_write(struct file *file, const char __user *buf,
+  			     size_t count, loff_t *ppos)
+  {
+diff --cc kernel/exit.c
+index 148a7842928d,8a768a3672a5..000000000000
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@@ -567,19 -536,60 +567,24 @@@ static void exit_mm(struct task_struct 
+  				break;
+  			freezable_schedule();
+  		}
+ -		__set_current_state(TASK_RUNNING);
+ +		__set_task_state(tsk, TASK_RUNNING);
+  		down_read(&mm->mmap_sem);
+  	}
+++<<<<<<< HEAD
+ +	atomic_inc(&mm->mm_count);
+ +	BUG_ON(mm != tsk->active_mm);
+++=======
++ 	mmgrab(mm);
++ 	BUG_ON(mm != current->active_mm);
+++>>>>>>> f1f1007644ff (mm: add new mmgrab() helper)
+  	/* more a memory barrier than a real lock */
+ -	task_lock(current);
+ -	current->mm = NULL;
+ +	task_lock(tsk);
+ +	tsk->mm = NULL;
+  	up_read(&mm->mmap_sem);
+  	enter_lazy_tlb(mm, current);
+ -	task_unlock(current);
+ +	task_unlock(tsk);
+  	mm_update_next_owner(mm);
+ -	userfaultfd_exit(mm);
+  	mmput(mm);
+ -	if (test_thread_flag(TIF_MEMDIE))
+ -		exit_oom_victim();
+ -}
+ -
+ -static struct task_struct *find_alive_thread(struct task_struct *p)
+ -{
+ -	struct task_struct *t;
+ -
+ -	for_each_thread(p, t) {
+ -		if (!(t->flags & PF_EXITING))
+ -			return t;
+ -	}
+ -	return NULL;
+ -}
+ -
+ -static struct task_struct *find_child_reaper(struct task_struct *father)
+ -	__releases(&tasklist_lock)
+ -	__acquires(&tasklist_lock)
+ -{
+ -	struct pid_namespace *pid_ns = task_active_pid_ns(father);
+ -	struct task_struct *reaper = pid_ns->child_reaper;
+ -
+ -	if (likely(reaper != father))
+ -		return reaper;
+ -
+ -	reaper = find_alive_thread(father);
+ -	if (reaper) {
+ -		pid_ns->child_reaper = reaper;
+ -		return reaper;
+ -	}
+ -
+ -	write_unlock_irq(&tasklist_lock);
+ -	if (unlikely(pid_ns == &init_pid_ns)) {
+ -		panic("Attempted to kill init! exitcode=0x%08x\n",
+ -			father->signal->group_exit_code ?: father->exit_code);
+ -	}
+ -	zap_pid_ns_processes(pid_ns);
+ -	write_lock_irq(&tasklist_lock);
+ -
+ -	return father;
+  }
+  
+  /*
+diff --cc mm/oom_kill.c
+index 287e96813fc2,51c091849dcb..000000000000
+--- a/mm/oom_kill.c
++++ b/mm/oom_kill.c
+@@@ -383,35 -401,406 +383,397 @@@ static void dump_tasks(const struct mem
+  	rcu_read_unlock();
+  }
+  
+ -static void dump_header(struct oom_control *oc, struct task_struct *p)
+ +static void dump_header(struct task_struct *p, gfp_t gfp_mask, int order,
+ +			struct mem_cgroup *memcg, const nodemask_t *nodemask)
+  {
+ -	pr_warn("%s invoked oom-killer: gfp_mask=%#x(%pGg), nodemask=",
+ -		current->comm, oc->gfp_mask, &oc->gfp_mask);
+ -	if (oc->nodemask)
+ -		pr_cont("%*pbl", nodemask_pr_args(oc->nodemask));
+ -	else
+ -		pr_cont("(null)");
+ -	pr_cont(",  order=%d, oom_score_adj=%hd\n",
+ -		oc->order, current->signal->oom_score_adj);
+ -	if (!IS_ENABLED(CONFIG_COMPACTION) && oc->order)
+ -		pr_warn("COMPACTION is disabled!!!\n");
+ -
+ -	cpuset_print_current_mems_allowed();
+ +	task_lock(current);
+ +	pr_warning("%s invoked oom-killer: gfp_mask=0x%x, order=%d, "
+ +		"oom_score_adj=%hd\n",
+ +		current->comm, gfp_mask, order,
+ +		current->signal->oom_score_adj);
+ +	cpuset_print_task_mems_allowed(current);
+ +	task_unlock(current);
+  	dump_stack();
+ -	if (oc->memcg)
+ -		mem_cgroup_print_oom_info(oc->memcg, p);
+ +	if (memcg)
+ +		mem_cgroup_print_oom_info(memcg, p);
+  	else
+ -		show_mem(SHOW_MEM_FILTER_NODES, oc->nodemask);
+ +		show_mem(SHOW_MEM_FILTER_NODES);
+  	if (sysctl_oom_dump_tasks)
+ -		dump_tasks(oc->memcg, oc->nodemask);
+ +		dump_tasks(memcg, nodemask);
+  }
+  
+ -/*
+ - * Number of OOM victims in flight
+ - */
+ -static atomic_t oom_victims = ATOMIC_INIT(0);
+ -static DECLARE_WAIT_QUEUE_HEAD(oom_victims_wait);
+ -
+ -static bool oom_killer_disabled __read_mostly;
+ -
+  #define K(x) ((x) << (PAGE_SHIFT-10))
+ -
+  /*
+ - * task->mm can be NULL if the task is the exited group leader.  So to
+ - * determine whether the task is using a particular mm, we examine all the
+ - * task's threads: if one of those is using this mm then this task was also
+ - * using it.
+ + * Must be called while holding a reference to p, which will be released upon
+ + * returning.
+   */
+ -bool process_shares_mm(struct task_struct *p, struct mm_struct *mm)
+ +void oom_kill_process(struct task_struct *p, gfp_t gfp_mask, int order,
+ +		      unsigned int points, unsigned long totalpages,
+ +		      struct mem_cgroup *memcg, nodemask_t *nodemask,
+ +		      const char *message)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct task_struct *t;
++ 
++ 	for_each_thread(p, t) {
++ 		struct mm_struct *t_mm = READ_ONCE(t->mm);
++ 		if (t_mm)
++ 			return t_mm == mm;
++ 	}
++ 	return false;
++ }
++ 
++ 
++ #ifdef CONFIG_MMU
++ /*
++  * OOM Reaper kernel thread which tries to reap the memory used by the OOM
++  * victim (if that is possible) to help the OOM killer to move on.
++  */
++ static struct task_struct *oom_reaper_th;
++ static DECLARE_WAIT_QUEUE_HEAD(oom_reaper_wait);
++ static struct task_struct *oom_reaper_list;
++ static DEFINE_SPINLOCK(oom_reaper_lock);
++ 
++ static bool __oom_reap_task_mm(struct task_struct *tsk, struct mm_struct *mm)
++ {
++ 	struct mmu_gather tlb;
++ 	struct vm_area_struct *vma;
++ 	bool ret = true;
++ 
++ 	/*
++ 	 * We have to make sure to not race with the victim exit path
++ 	 * and cause premature new oom victim selection:
++ 	 * __oom_reap_task_mm		exit_mm
++ 	 *   mmget_not_zero
++ 	 *				  mmput
++ 	 *				    atomic_dec_and_test
++ 	 *				  exit_oom_victim
++ 	 *				[...]
++ 	 *				out_of_memory
++ 	 *				  select_bad_process
++ 	 *				    # no TIF_MEMDIE task selects new victim
++ 	 *  unmap_page_range # frees some memory
++ 	 */
++ 	mutex_lock(&oom_lock);
++ 
++ 	if (!down_read_trylock(&mm->mmap_sem)) {
++ 		ret = false;
++ 		goto unlock_oom;
++ 	}
++ 
++ 	/*
++ 	 * increase mm_users only after we know we will reap something so
++ 	 * that the mmput_async is called only when we have reaped something
++ 	 * and delayed __mmput doesn't matter that much
++ 	 */
++ 	if (!mmget_not_zero(mm)) {
++ 		up_read(&mm->mmap_sem);
++ 		goto unlock_oom;
++ 	}
++ 
++ 	/*
++ 	 * Tell all users of get_user/copy_from_user etc... that the content
++ 	 * is no longer stable. No barriers really needed because unmapping
++ 	 * should imply barriers already and the reader would hit a page fault
++ 	 * if it stumbled over a reaped memory.
++ 	 */
++ 	set_bit(MMF_UNSTABLE, &mm->flags);
++ 
++ 	tlb_gather_mmu(&tlb, mm, 0, -1);
++ 	for (vma = mm->mmap ; vma; vma = vma->vm_next) {
++ 		if (!can_madv_dontneed_vma(vma))
++ 			continue;
++ 
++ 		/*
++ 		 * Only anonymous pages have a good chance to be dropped
++ 		 * without additional steps which we cannot afford as we
++ 		 * are OOM already.
++ 		 *
++ 		 * We do not even care about fs backed pages because all
++ 		 * which are reclaimable have already been reclaimed and
++ 		 * we do not want to block exit_mmap by keeping mm ref
++ 		 * count elevated without a good reason.
++ 		 */
++ 		if (vma_is_anonymous(vma) || !(vma->vm_flags & VM_SHARED))
++ 			unmap_page_range(&tlb, vma, vma->vm_start, vma->vm_end,
++ 					 NULL);
++ 	}
++ 	tlb_finish_mmu(&tlb, 0, -1);
++ 	pr_info("oom_reaper: reaped process %d (%s), now anon-rss:%lukB, file-rss:%lukB, shmem-rss:%lukB\n",
++ 			task_pid_nr(tsk), tsk->comm,
++ 			K(get_mm_counter(mm, MM_ANONPAGES)),
++ 			K(get_mm_counter(mm, MM_FILEPAGES)),
++ 			K(get_mm_counter(mm, MM_SHMEMPAGES)));
++ 	up_read(&mm->mmap_sem);
++ 
++ 	/*
++ 	 * Drop our reference but make sure the mmput slow path is called from a
++ 	 * different context because we shouldn't risk we get stuck there and
++ 	 * put the oom_reaper out of the way.
++ 	 */
++ 	mmput_async(mm);
++ unlock_oom:
++ 	mutex_unlock(&oom_lock);
++ 	return ret;
++ }
++ 
++ #define MAX_OOM_REAP_RETRIES 10
++ static void oom_reap_task(struct task_struct *tsk)
++ {
++ 	int attempts = 0;
++ 	struct mm_struct *mm = tsk->signal->oom_mm;
++ 
++ 	/* Retry the down_read_trylock(mmap_sem) a few times */
++ 	while (attempts++ < MAX_OOM_REAP_RETRIES && !__oom_reap_task_mm(tsk, mm))
++ 		schedule_timeout_idle(HZ/10);
++ 
++ 	if (attempts <= MAX_OOM_REAP_RETRIES)
++ 		goto done;
++ 
++ 
++ 	pr_info("oom_reaper: unable to reap pid:%d (%s)\n",
++ 		task_pid_nr(tsk), tsk->comm);
++ 	debug_show_all_locks();
++ 
++ done:
++ 	tsk->oom_reaper_list = NULL;
++ 
++ 	/*
++ 	 * Hide this mm from OOM killer because it has been either reaped or
++ 	 * somebody can't call up_write(mmap_sem).
++ 	 */
++ 	set_bit(MMF_OOM_SKIP, &mm->flags);
++ 
++ 	/* Drop a reference taken by wake_oom_reaper */
++ 	put_task_struct(tsk);
++ }
++ 
++ static int oom_reaper(void *unused)
++ {
++ 	while (true) {
++ 		struct task_struct *tsk = NULL;
++ 
++ 		wait_event_freezable(oom_reaper_wait, oom_reaper_list != NULL);
++ 		spin_lock(&oom_reaper_lock);
++ 		if (oom_reaper_list != NULL) {
++ 			tsk = oom_reaper_list;
++ 			oom_reaper_list = tsk->oom_reaper_list;
++ 		}
++ 		spin_unlock(&oom_reaper_lock);
++ 
++ 		if (tsk)
++ 			oom_reap_task(tsk);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void wake_oom_reaper(struct task_struct *tsk)
++ {
++ 	if (!oom_reaper_th)
++ 		return;
++ 
++ 	/* tsk is already queued? */
++ 	if (tsk == oom_reaper_list || tsk->oom_reaper_list)
++ 		return;
++ 
++ 	get_task_struct(tsk);
++ 
++ 	spin_lock(&oom_reaper_lock);
++ 	tsk->oom_reaper_list = oom_reaper_list;
++ 	oom_reaper_list = tsk;
++ 	spin_unlock(&oom_reaper_lock);
++ 	wake_up(&oom_reaper_wait);
++ }
++ 
++ static int __init oom_init(void)
++ {
++ 	oom_reaper_th = kthread_run(oom_reaper, NULL, "oom_reaper");
++ 	if (IS_ERR(oom_reaper_th)) {
++ 		pr_err("Unable to start OOM reaper %ld. Continuing regardless\n",
++ 				PTR_ERR(oom_reaper_th));
++ 		oom_reaper_th = NULL;
++ 	}
++ 	return 0;
++ }
++ subsys_initcall(oom_init)
++ #else
++ static inline void wake_oom_reaper(struct task_struct *tsk)
++ {
++ }
++ #endif /* CONFIG_MMU */
++ 
++ /**
++  * mark_oom_victim - mark the given task as OOM victim
++  * @tsk: task to mark
++  *
++  * Has to be called with oom_lock held and never after
++  * oom has been disabled already.
++  *
++  * tsk->mm has to be non NULL and caller has to guarantee it is stable (either
++  * under task_lock or operate on the current).
++  */
++ static void mark_oom_victim(struct task_struct *tsk)
++ {
++ 	struct mm_struct *mm = tsk->mm;
++ 
++ 	WARN_ON(oom_killer_disabled);
++ 	/* OOM killer might race with memcg OOM */
++ 	if (test_and_set_tsk_thread_flag(tsk, TIF_MEMDIE))
++ 		return;
++ 
++ 	/* oom_mm is bound to the signal struct life time. */
++ 	if (!cmpxchg(&tsk->signal->oom_mm, NULL, mm))
++ 		mmgrab(tsk->signal->oom_mm);
++ 
++ 	/*
++ 	 * Make sure that the task is woken up from uninterruptible sleep
++ 	 * if it is frozen because OOM killer wouldn't be able to free
++ 	 * any memory and livelock. freezing_slow_path will tell the freezer
++ 	 * that TIF_MEMDIE tasks should be ignored.
++ 	 */
++ 	__thaw_task(tsk);
++ 	atomic_inc(&oom_victims);
++ }
++ 
++ /**
++  * exit_oom_victim - note the exit of an OOM victim
++  */
++ void exit_oom_victim(void)
++ {
++ 	clear_thread_flag(TIF_MEMDIE);
++ 
++ 	if (!atomic_dec_return(&oom_victims))
++ 		wake_up_all(&oom_victims_wait);
++ }
++ 
++ /**
++  * oom_killer_enable - enable OOM killer
++  */
++ void oom_killer_enable(void)
++ {
++ 	oom_killer_disabled = false;
++ }
++ 
++ /**
++  * oom_killer_disable - disable OOM killer
++  * @timeout: maximum timeout to wait for oom victims in jiffies
++  *
++  * Forces all page allocations to fail rather than trigger OOM killer.
++  * Will block and wait until all OOM victims are killed or the given
++  * timeout expires.
++  *
++  * The function cannot be called when there are runnable user tasks because
++  * the userspace would see unexpected allocation failures as a result. Any
++  * new usage of this function should be consulted with MM people.
++  *
++  * Returns true if successful and false if the OOM killer cannot be
++  * disabled.
++  */
++ bool oom_killer_disable(signed long timeout)
++ {
++ 	signed long ret;
++ 
++ 	/*
++ 	 * Make sure to not race with an ongoing OOM killer. Check that the
++ 	 * current is not killed (possibly due to sharing the victim's memory).
++ 	 */
++ 	if (mutex_lock_killable(&oom_lock))
++ 		return false;
++ 	oom_killer_disabled = true;
++ 	mutex_unlock(&oom_lock);
++ 
++ 	ret = wait_event_interruptible_timeout(oom_victims_wait,
++ 			!atomic_read(&oom_victims), timeout);
++ 	if (ret <= 0) {
++ 		oom_killer_enable();
++ 		return false;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ static inline bool __task_will_free_mem(struct task_struct *task)
++ {
++ 	struct signal_struct *sig = task->signal;
++ 
++ 	/*
++ 	 * A coredumping process may sleep for an extended period in exit_mm(),
++ 	 * so the oom killer cannot assume that the process will promptly exit
++ 	 * and release memory.
++ 	 */
++ 	if (sig->flags & SIGNAL_GROUP_COREDUMP)
++ 		return false;
++ 
++ 	if (sig->flags & SIGNAL_GROUP_EXIT)
++ 		return true;
++ 
++ 	if (thread_group_empty(task) && (task->flags & PF_EXITING))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ /*
++  * Checks whether the given task is dying or exiting and likely to
++  * release its address space. This means that all threads and processes
++  * sharing the same mm have to be killed or exiting.
++  * Caller has to make sure that task->mm is stable (hold task_lock or
++  * it operates on the current).
++  */
++ static bool task_will_free_mem(struct task_struct *task)
++ {
++ 	struct mm_struct *mm = task->mm;
++ 	struct task_struct *p;
++ 	bool ret = true;
++ 
++ 	/*
++ 	 * Skip tasks without mm because it might have passed its exit_mm and
++ 	 * exit_oom_victim. oom_reaper could have rescued that but do not rely
++ 	 * on that for now. We can consider find_lock_task_mm in future.
++ 	 */
++ 	if (!mm)
++ 		return false;
++ 
++ 	if (!__task_will_free_mem(task))
++ 		return false;
++ 
++ 	/*
++ 	 * This task has already been drained by the oom reaper so there are
++ 	 * only small chances it will free some more
++ 	 */
++ 	if (test_bit(MMF_OOM_SKIP, &mm->flags))
++ 		return false;
++ 
++ 	if (atomic_read(&mm->mm_users) <= 1)
++ 		return true;
++ 
++ 	/*
++ 	 * Make sure that all tasks which share the mm with the given tasks
++ 	 * are dying as well to make sure that a) nobody pins its mm and
++ 	 * b) the task is also reapable by the oom reaper.
++ 	 */
++ 	rcu_read_lock();
++ 	for_each_process(p) {
++ 		if (!process_shares_mm(p, mm))
++ 			continue;
++ 		if (same_thread_group(task, p))
++ 			continue;
++ 		ret = __task_will_free_mem(p);
++ 		if (!ret)
++ 			break;
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return ret;
++ }
++ 
++ static void oom_kill_process(struct oom_control *oc, const char *message)
++ {
++ 	struct task_struct *p = oc->chosen;
++ 	unsigned int points = oc->chosen_points;
+++>>>>>>> f1f1007644ff (mm: add new mmgrab() helper)
+  	struct task_struct *victim = p;
+  	struct task_struct *child;
+  	struct task_struct *t;
+@@@ -476,8 -868,16 +838,19 @@@
+  		victim = p;
+  	}
+  
+ -	/* Get a reference to safely compare mm after task_unlock(victim) */
+ +	/* mm cannot safely be dereferenced after task_unlock(victim) */
+  	mm = victim->mm;
+++<<<<<<< HEAD
+++=======
++ 	mmgrab(mm);
++ 	/*
++ 	 * We should send SIGKILL before setting TIF_MEMDIE in order to prevent
++ 	 * the OOM victim from depleting the memory reserves from the user
++ 	 * space under its control.
++ 	 */
++ 	do_send_sig_info(SIGKILL, SEND_SIG_FORCED, victim, true);
++ 	mark_oom_victim(victim);
+++>>>>>>> f1f1007644ff (mm: add new mmgrab() helper)
+  	pr_err("Killed process %d (%s) total-vm:%lukB, anon-rss:%lukB, file-rss:%lukB, shmem-rss:%lukB\n",
+  		task_pid_nr(victim), victim->comm, K(victim->mm->total_vm),
+  		K(get_mm_counter(victim->mm, MM_ANONPAGES)),
+* Unmerged path arch/xtensa/kernel/smp.c
+* Unmerged path mm/khugepaged.c
+diff --git a/arch/alpha/kernel/smp.c b/arch/alpha/kernel/smp.c
+index 7b60834fb4b2..585e965358d6 100644
+--- a/arch/alpha/kernel/smp.c
++++ b/arch/alpha/kernel/smp.c
+@@ -143,7 +143,7 @@ smp_callin(void)
+ 	if (alpha_mv.smp_callin) alpha_mv.smp_callin();
+ 
+ 	/* All kernel threads share the same mm context.  */
+-	atomic_inc(&init_mm.mm_count);
++	mmgrab(&init_mm);
+ 	current->active_mm = &init_mm;
+ 
+ 	/* inform the notifiers about the new cpu */
+diff --git a/arch/arc/kernel/smp.c b/arch/arc/kernel/smp.c
+index 5c7fd603d216..916941c7283c 100644
+--- a/arch/arc/kernel/smp.c
++++ b/arch/arc/kernel/smp.c
+@@ -126,7 +126,7 @@ void __cpuinit start_kernel_secondary(void)
+ 	setup_processor();
+ 
+ 	atomic_inc(&mm->mm_users);
+-	atomic_inc(&mm->mm_count);
++	mmgrab(mm);
+ 	current->active_mm = mm;
+ 
+ 	notify_cpu_starting(cpu);
+diff --git a/arch/arm/kernel/smp.c b/arch/arm/kernel/smp.c
+index 5919eb451bb9..d7b4b7ede16d 100644
+--- a/arch/arm/kernel/smp.c
++++ b/arch/arm/kernel/smp.c
+@@ -328,7 +328,7 @@ asmlinkage void __cpuinit secondary_start_kernel(void)
+ 	 * reference and switch to it.
+ 	 */
+ 	cpu = smp_processor_id();
+-	atomic_inc(&mm->mm_count);
++	mmgrab(mm);
+ 	current->active_mm = mm;
+ 	cpumask_set_cpu(cpu, mm_cpumask(mm));
+ 
+diff --git a/arch/arm64/kernel/smp.c b/arch/arm64/kernel/smp.c
+index 5d54e3717bf8..0a46ad7dc249 100644
+--- a/arch/arm64/kernel/smp.c
++++ b/arch/arm64/kernel/smp.c
+@@ -173,7 +173,7 @@ asmlinkage void __cpuinit secondary_start_kernel(void)
+ 	 * All kernel threads share the same mm context; grab a
+ 	 * reference and switch to it.
+ 	 */
+-	atomic_inc(&mm->mm_count);
++	mmgrab(mm);
+ 	current->active_mm = mm;
+ 	cpumask_set_cpu(cpu, mm_cpumask(mm));
+ 
+diff --git a/arch/blackfin/mach-common/smp.c b/arch/blackfin/mach-common/smp.c
+index 1bc2ce6f3c94..5358e16ba33b 100644
+--- a/arch/blackfin/mach-common/smp.c
++++ b/arch/blackfin/mach-common/smp.c
+@@ -311,7 +311,7 @@ void __cpuinit secondary_start_kernel(void)
+ 
+ 	/* Attach the new idle task to the global mm. */
+ 	atomic_inc(&mm->mm_users);
+-	atomic_inc(&mm->mm_count);
++	mmgrab(mm);
+ 	current->active_mm = mm;
+ 
+ 	preempt_disable();
+diff --git a/arch/hexagon/kernel/smp.c b/arch/hexagon/kernel/smp.c
+index 0e364ca43198..80ab811b89c1 100644
+--- a/arch/hexagon/kernel/smp.c
++++ b/arch/hexagon/kernel/smp.c
+@@ -166,7 +166,7 @@ void __cpuinit start_secondary(void)
+ 	);
+ 
+ 	/*  Set the memory struct  */
+-	atomic_inc(&init_mm.mm_count);
++	mmgrab(&init_mm);
+ 	current->active_mm = &init_mm;
+ 
+ 	cpu = smp_processor_id();
+diff --git a/arch/ia64/kernel/setup.c b/arch/ia64/kernel/setup.c
+index 4978fcbf20b9..de9d7ada730c 100644
+--- a/arch/ia64/kernel/setup.c
++++ b/arch/ia64/kernel/setup.c
+@@ -998,7 +998,7 @@ cpu_init (void)
+ 	 */
+ 	ia64_setreg(_IA64_REG_CR_DCR,  (  IA64_DCR_DP | IA64_DCR_DK | IA64_DCR_DX | IA64_DCR_DR
+ 					| IA64_DCR_DA | IA64_DCR_DD | IA64_DCR_LC));
+-	atomic_inc(&init_mm.mm_count);
++	mmgrab(&init_mm);
+ 	current->active_mm = &init_mm;
+ 	BUG_ON(current->mm);
+ 
+diff --git a/arch/m32r/kernel/setup.c b/arch/m32r/kernel/setup.c
+index 0392112a5d70..4a5dd1f84dff 100644
+--- a/arch/m32r/kernel/setup.c
++++ b/arch/m32r/kernel/setup.c
+@@ -400,7 +400,7 @@ void __init cpu_init (void)
+ 	printk(KERN_INFO "Initializing CPU#%d\n", cpu_id);
+ 
+ 	/* Set up and load the per-CPU TSS and LDT */
+-	atomic_inc(&init_mm.mm_count);
++	mmgrab(&init_mm);
+ 	current->active_mm = &init_mm;
+ 	if (current->mm)
+ 		BUG();
+diff --git a/arch/metag/kernel/smp.c b/arch/metag/kernel/smp.c
+index f443ec9a7cbe..e26dd035dcfc 100644
+--- a/arch/metag/kernel/smp.c
++++ b/arch/metag/kernel/smp.c
+@@ -358,7 +358,7 @@ asmlinkage void secondary_start_kernel(void)
+ 	 * reference and switch to it.
+ 	 */
+ 	atomic_inc(&mm->mm_users);
+-	atomic_inc(&mm->mm_count);
++	mmgrab(mm);
+ 	current->active_mm = mm;
+ 	cpumask_set_cpu(cpu, mm_cpumask(mm));
+ 	enter_lazy_tlb(mm, current);
+diff --git a/arch/mips/kernel/traps.c b/arch/mips/kernel/traps.c
+index a75ae40184aa..4770b5e32bdb 100644
+--- a/arch/mips/kernel/traps.c
++++ b/arch/mips/kernel/traps.c
+@@ -1744,7 +1744,7 @@ void __cpuinit per_cpu_trap_init(bool is_boot_cpu)
+ 	if (!cpu_data[cpu].asid_cache)
+ 		cpu_data[cpu].asid_cache = ASID_FIRST_VERSION;
+ 
+-	atomic_inc(&init_mm.mm_count);
++	mmgrab(&init_mm);
+ 	current->active_mm = &init_mm;
+ 	BUG_ON(current->mm);
+ 	enter_lazy_tlb(&init_mm, current);
+diff --git a/arch/mn10300/kernel/smp.c b/arch/mn10300/kernel/smp.c
+index a17f9c9c14c9..c3a26f873be1 100644
+--- a/arch/mn10300/kernel/smp.c
++++ b/arch/mn10300/kernel/smp.c
+@@ -589,7 +589,7 @@ static void __init smp_cpu_init(void)
+ 	}
+ 	printk(KERN_INFO "Initializing CPU#%d\n", cpu_id);
+ 
+-	atomic_inc(&init_mm.mm_count);
++	mmgrab(&init_mm);
+ 	current->active_mm = &init_mm;
+ 	BUG_ON(current->mm);
+ 
+diff --git a/arch/parisc/kernel/smp.c b/arch/parisc/kernel/smp.c
+index e3614fb343e5..662fa6c47d3d 100644
+--- a/arch/parisc/kernel/smp.c
++++ b/arch/parisc/kernel/smp.c
+@@ -293,7 +293,7 @@ smp_cpu_init(int cpunum)
+ 	set_cpu_online(cpunum, true);
+ 
+ 	/* Initialise the idle task for this CPU */
+-	atomic_inc(&init_mm.mm_count);
++	mmgrab(&init_mm);
+ 	current->active_mm = &init_mm;
+ 	BUG_ON(current->mm);
+ 	enter_lazy_tlb(&init_mm, current);
+diff --git a/arch/powerpc/kernel/smp.c b/arch/powerpc/kernel/smp.c
+index 89f07caaf6d9..b99447cce89f 100644
+--- a/arch/powerpc/kernel/smp.c
++++ b/arch/powerpc/kernel/smp.c
+@@ -713,7 +713,7 @@ void start_secondary(void *unused)
+ 	unsigned int cpu = smp_processor_id();
+ 	int i, base;
+ 
+-	atomic_inc(&init_mm.mm_count);
++	mmgrab(&init_mm);
+ 	current->active_mm = &init_mm;
+ 
+ 	smp_store_cpu_info(cpu);
+* Unmerged path arch/s390/kernel/processor.c
+diff --git a/arch/score/kernel/traps.c b/arch/score/kernel/traps.c
+index 1517a7dcd6d9..87305c8bf820 100644
+--- a/arch/score/kernel/traps.c
++++ b/arch/score/kernel/traps.c
+@@ -335,7 +335,7 @@ void __init trap_init(void)
+ 	set_except_vector(18, handle_dbe);
+ 	flush_icache_range(DEBUG_VECTOR_BASE_ADDR, IRQ_VECTOR_BASE_ADDR);
+ 
+-	atomic_inc(&init_mm.mm_count);
++	mmgrab(&init_mm);
+ 	current->active_mm = &init_mm;
+ 	cpu_cache_init();
+ }
+diff --git a/arch/sh/kernel/smp.c b/arch/sh/kernel/smp.c
+index 45696451f0ea..c9469ee0f4bc 100644
+--- a/arch/sh/kernel/smp.c
++++ b/arch/sh/kernel/smp.c
+@@ -180,7 +180,7 @@ asmlinkage void __cpuinit start_secondary(void)
+ 	struct mm_struct *mm = &init_mm;
+ 
+ 	enable_mmu();
+-	atomic_inc(&mm->mm_count);
++	mmgrab(mm);
+ 	atomic_inc(&mm->mm_users);
+ 	current->active_mm = mm;
+ 	enter_lazy_tlb(mm, current);
+diff --git a/arch/sparc/kernel/leon_smp.c b/arch/sparc/kernel/leon_smp.c
+index 6cfc1b09ec25..73313862547e 100644
+--- a/arch/sparc/kernel/leon_smp.c
++++ b/arch/sparc/kernel/leon_smp.c
+@@ -93,7 +93,7 @@ void __cpuinit leon_cpu_pre_online(void *arg)
+ 			     : "memory" /* paranoid */);
+ 
+ 	/* Attach to the address space of init_task. */
+-	atomic_inc(&init_mm.mm_count);
++	mmgrab(&init_mm);
+ 	current->active_mm = &init_mm;
+ 
+ 	while (!cpumask_test_cpu(cpuid, &smp_commenced_mask))
+diff --git a/arch/sparc/kernel/smp_64.c b/arch/sparc/kernel/smp_64.c
+index 77539eda928c..ce9803df7acf 100644
+--- a/arch/sparc/kernel/smp_64.c
++++ b/arch/sparc/kernel/smp_64.c
+@@ -113,7 +113,7 @@ void __cpuinit smp_callin(void)
+ 	current_thread_info()->new_child = 0;
+ 
+ 	/* Attach to the address space of init_task. */
+-	atomic_inc(&init_mm.mm_count);
++	mmgrab(&init_mm);
+ 	current->active_mm = &init_mm;
+ 
+ 	/* inform the notifiers about the new cpu */
+diff --git a/arch/sparc/kernel/sun4d_smp.c b/arch/sparc/kernel/sun4d_smp.c
+index c9eb82f23d92..e375286a5373 100644
+--- a/arch/sparc/kernel/sun4d_smp.c
++++ b/arch/sparc/kernel/sun4d_smp.c
+@@ -93,7 +93,7 @@ void __cpuinit sun4d_cpu_pre_online(void *arg)
+ 	show_leds(cpuid);
+ 
+ 	/* Attach to the address space of init_task. */
+-	atomic_inc(&init_mm.mm_count);
++	mmgrab(&init_mm);
+ 	current->active_mm = &init_mm;
+ 
+ 	local_ops->cache_all();
+diff --git a/arch/sparc/kernel/sun4m_smp.c b/arch/sparc/kernel/sun4m_smp.c
+index 8a65f158153d..bf912b930ca4 100644
+--- a/arch/sparc/kernel/sun4m_smp.c
++++ b/arch/sparc/kernel/sun4m_smp.c
+@@ -59,7 +59,7 @@ void __cpuinit sun4m_cpu_pre_online(void *arg)
+ 			     : "memory" /* paranoid */);
+ 
+ 	/* Attach to the address space of init_task. */
+-	atomic_inc(&init_mm.mm_count);
++	mmgrab(&init_mm);
+ 	current->active_mm = &init_mm;
+ 
+ 	while (!cpumask_test_cpu(cpuid, &smp_commenced_mask))
+diff --git a/arch/sparc/kernel/traps_32.c b/arch/sparc/kernel/traps_32.c
+index 662982946a89..6c1a2f5a6a3d 100644
+--- a/arch/sparc/kernel/traps_32.c
++++ b/arch/sparc/kernel/traps_32.c
+@@ -451,7 +451,7 @@ void trap_init(void)
+ 		thread_info_offsets_are_bolixed_pete();
+ 
+ 	/* Attach to the address space of init_task. */
+-	atomic_inc(&init_mm.mm_count);
++	mmgrab(&init_mm);
+ 	current->active_mm = &init_mm;
+ 
+ 	/* NOTE: Other cpus have this done as they are started
+diff --git a/arch/sparc/kernel/traps_64.c b/arch/sparc/kernel/traps_64.c
+index b3f833ab90eb..a6e6adb4552b 100644
+--- a/arch/sparc/kernel/traps_64.c
++++ b/arch/sparc/kernel/traps_64.c
+@@ -2747,6 +2747,6 @@ void __init trap_init(void)
+ 	/* Attach to the address space of init_task.  On SMP we
+ 	 * do this in smp.c:smp_callin for other cpus.
+ 	 */
+-	atomic_inc(&init_mm.mm_count);
++	mmgrab(&init_mm);
+ 	current->active_mm = &init_mm;
+ }
+diff --git a/arch/tile/kernel/smpboot.c b/arch/tile/kernel/smpboot.c
+index 44bab29bf2f3..2014becca6a7 100644
+--- a/arch/tile/kernel/smpboot.c
++++ b/arch/tile/kernel/smpboot.c
+@@ -159,7 +159,7 @@ static void __cpuinit start_secondary(void)
+ 	__get_cpu_var(current_asid) = min_asid;
+ 
+ 	/* Set up this thread as another owner of the init_mm */
+-	atomic_inc(&init_mm.mm_count);
++	mmgrab(&init_mm);
+ 	current->active_mm = &init_mm;
+ 	if (current->mm)
+ 		BUG();
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index dcd159d0c4dc..5029f5a128d0 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -1671,7 +1671,7 @@ void cpu_init(void)
+ 	for (i = 0; i <= IO_BITMAP_LONGS; i++)
+ 		t->io_bitmap[i] = ~0UL;
+ 
+-	atomic_inc(&init_mm.mm_count);
++	mmgrab(&init_mm);
+ 	me->active_mm = &init_mm;
+ 	BUG_ON(me->mm);
+ 	enter_lazy_tlb(&init_mm, me);
+@@ -1725,7 +1725,7 @@ void cpu_init(void)
+ 	/*
+ 	 * Set up and load the per-CPU TSS and LDT
+ 	 */
+-	atomic_inc(&init_mm.mm_count);
++	mmgrab(&init_mm);
+ 	curr->active_mm = &init_mm;
+ 	BUG_ON(curr->mm);
+ 	enter_lazy_tlb(&init_mm, curr);
+* Unmerged path arch/xtensa/kernel/smp.c
+* Unmerged path drivers/gpu/drm/amd/amdkfd/kfd_process.c
+* Unmerged path drivers/infiniband/hw/hfi1/file_ops.c
+* Unmerged path fs/proc/base.c
+diff --git a/fs/userfaultfd.c b/fs/userfaultfd.c
+index 8c53cac1e907..76483220a55c 100644
+--- a/fs/userfaultfd.c
++++ b/fs/userfaultfd.c
+@@ -1945,7 +1945,7 @@ SYSCALL_DEFINE1(userfaultfd, int, flags)
+ 	ctx->mmap_changing = false;
+ 	ctx->mm = current->mm;
+ 	/* prevent the mm struct to be freed */
+-	atomic_inc(&ctx->mm->mm_count);
++	mmgrab(ctx->mm);
+ 
+ 	fd = anon_inode_getfd("[userfaultfd]", &userfaultfd_fops, ctx,
+ 			      O_RDWR | (flags & UFFD_SHARED_FCNTL_FLAGS));
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 83cd9508a135..9a080a077cb2 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -2599,6 +2599,28 @@ static inline unsigned long sigsp(unsigned long sp, struct ksignal *ksig)
+  */
+ extern struct mm_struct * mm_alloc(void);
+ 
++/**
++ * mmgrab() - Pin a &struct mm_struct.
++ * @mm: The &struct mm_struct to pin.
++ *
++ * Make sure that @mm will not get freed even after the owning task
++ * exits. This doesn't guarantee that the associated address space
++ * will still exist later on and mmget_not_zero() has to be used before
++ * accessing it.
++ *
++ * This is a preferred way to to pin @mm for a longer/unbounded amount
++ * of time.
++ *
++ * Use mmdrop() to release the reference acquired by mmgrab().
++ *
++ * See also <Documentation/vm/active_mm.txt> for an in-depth explanation
++ * of &mm_struct.mm_count vs &mm_struct.mm_users.
++ */
++static inline void mmgrab(struct mm_struct *mm)
++{
++	atomic_inc(&mm->mm_count);
++}
++
+ /* mmdrop drops the mm and the page tables */
+ extern void __mmdrop(struct mm_struct *);
+ static inline void mmdrop(struct mm_struct *mm)
+* Unmerged path kernel/exit.c
+diff --git a/kernel/futex.c b/kernel/futex.c
+index 80b39fa689a3..b066641a4cce 100644
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@ -253,7 +253,7 @@ static struct {
+ 
+ static inline void futex_get_mm(union futex_key *key)
+ {
+-	atomic_inc(&key->private.mm->mm_count);
++	mmgrab(key->private.mm);
+ 	/*
+ 	 * Ensure futex_get_mm() implies a full barrier such that
+ 	 * get_futex_key() implies a full barrier. This is relied upon
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 4685f09c1be7..ffc609e83d38 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2549,7 +2549,7 @@ context_switch(struct rq *rq, struct task_struct *prev,
+ 	 */
+ 	if (!mm) {
+ 		next->active_mm = oldmm;
+-		atomic_inc(&oldmm->mm_count);
++		mmgrab(oldmm);
+ 		enter_lazy_tlb(oldmm, next);
+ 	} else
+ 		switch_mm_irqs_off(oldmm, mm, next);
+@@ -8575,7 +8575,7 @@ void __init sched_init(void)
+ 	/*
+ 	 * The boot idle thread does lazy MMU switching as well:
+ 	 */
+-	atomic_inc(&init_mm.mm_count);
++	mmgrab(&init_mm);
+ 	enter_lazy_tlb(&init_mm, current);
+ 
+ 	/*
+* Unmerged path mm/khugepaged.c
+diff --git a/mm/ksm.c b/mm/ksm.c
+index aaa161fc9a0d..808a21693f3b 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -2422,7 +2422,7 @@ int __ksm_enter(struct mm_struct *mm)
+ 	spin_unlock(&ksm_mmlist_lock);
+ 
+ 	set_bit(MMF_VM_MERGEABLE, &mm->flags);
+-	atomic_inc(&mm->mm_count);
++	mmgrab(mm);
+ 
+ 	if (needs_wakeup)
+ 		wake_up_interruptible(&ksm_thread_wait);
+diff --git a/mm/mmu_context.c b/mm/mmu_context.c
+index 8a8cd0265e52..873bfb247bab 100644
+--- a/mm/mmu_context.c
++++ b/mm/mmu_context.c
+@@ -25,7 +25,7 @@ void use_mm(struct mm_struct *mm)
+ 	task_lock(tsk);
+ 	active_mm = tsk->active_mm;
+ 	if (active_mm != mm) {
+-		atomic_inc(&mm->mm_count);
++		mmgrab(mm);
+ 		tsk->active_mm = mm;
+ 	}
+ 	tsk->mm = mm;
+diff --git a/mm/mmu_notifier.c b/mm/mmu_notifier.c
+index 93757865a9ab..9124f303d328 100644
+--- a/mm/mmu_notifier.c
++++ b/mm/mmu_notifier.c
+@@ -360,7 +360,7 @@ static int do_mmu_notifier_register(struct mmu_notifier *mn,
+ 		mm->mmu_notifier_mm = &mmu_notifier_mm->b;
+ 		mmu_notifier_mm = NULL;
+ 	}
+-	atomic_inc(&mm->mm_count);
++	mmgrab(mm);
+ 
+ 	/*
+ 	 * Serialize the update against mmu_notifier_unregister. A
+* Unmerged path mm/oom_kill.c
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 365126b76acd..add9a9a52606 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -586,7 +586,7 @@ static struct kvm *kvm_create_vm(unsigned long type)
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	spin_lock_init(&kvm->mmu_lock);
+-	atomic_inc(&current->mm->mm_count);
++	mmgrab(current->mm);
+ 	kvm->mm = current->mm;
+ 	kvm_eventfd_init(kvm);
+ 	mutex_init(&kvm->lock);
