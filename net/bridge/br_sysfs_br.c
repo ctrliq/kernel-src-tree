@@ -864,7 +864,7 @@ static struct attribute *bridge_attrs[] = {
 	NULL
 };
 
-static struct attribute_group bridge_group = {
+static const struct attribute_group bridge_group = {
 	.name = SYSFS_BRIDGE_ATTR,
 	.attrs = bridge_attrs,
 };
