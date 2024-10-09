@@ -1,0 +1,963 @@
+bpf: fix truncated jump targets on heavy expansions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 050fad7c4534c13c8eb1d9c2ba66012e014773cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/050fad7c.failed
+
+Recently during testing, I ran into the following panic:
+
+  [  207.892422] Internal error: Accessing user space memory outside uaccess.h routines: 96000004 [#1] SMP
+  [  207.901637] Modules linked in: binfmt_misc [...]
+  [  207.966530] CPU: 45 PID: 2256 Comm: test_verifier Tainted: G        W         4.17.0-rc3+ #7
+  [  207.974956] Hardware name: FOXCONN R2-1221R-A4/C2U4N_MB, BIOS G31FB18A 03/31/2017
+  [  207.982428] pstate: 60400005 (nZCv daif +PAN -UAO)
+  [  207.987214] pc : bpf_skb_load_helper_8_no_cache+0x34/0xc0
+  [  207.992603] lr : 0xffff000000bdb754
+  [  207.996080] sp : ffff000013703ca0
+  [  207.999384] x29: ffff000013703ca0 x28: 0000000000000001
+  [  208.004688] x27: 0000000000000001 x26: 0000000000000000
+  [  208.009992] x25: ffff000013703ce0 x24: ffff800fb4afcb00
+  [  208.015295] x23: ffff00007d2f5038 x22: ffff00007d2f5000
+  [  208.020599] x21: fffffffffeff2a6f x20: 000000000000000a
+  [  208.025903] x19: ffff000009578000 x18: 0000000000000a03
+  [  208.031206] x17: 0000000000000000 x16: 0000000000000000
+  [  208.036510] x15: 0000ffff9de83000 x14: 0000000000000000
+  [  208.041813] x13: 0000000000000000 x12: 0000000000000000
+  [  208.047116] x11: 0000000000000001 x10: ffff0000089e7f18
+  [  208.052419] x9 : fffffffffeff2a6f x8 : 0000000000000000
+  [  208.057723] x7 : 000000000000000a x6 : 00280c6160000000
+  [  208.063026] x5 : 0000000000000018 x4 : 0000000000007db6
+  [  208.068329] x3 : 000000000008647a x2 : 19868179b1484500
+  [  208.073632] x1 : 0000000000000000 x0 : ffff000009578c08
+  [  208.078938] Process test_verifier (pid: 2256, stack limit = 0x0000000049ca7974)
+  [  208.086235] Call trace:
+  [  208.088672]  bpf_skb_load_helper_8_no_cache+0x34/0xc0
+  [  208.093713]  0xffff000000bdb754
+  [  208.096845]  bpf_test_run+0x78/0xf8
+  [  208.100324]  bpf_prog_test_run_skb+0x148/0x230
+  [  208.104758]  sys_bpf+0x314/0x1198
+  [  208.108064]  el0_svc_naked+0x30/0x34
+  [  208.111632] Code: 91302260 f9400001 f9001fa1 d2800001 (29500680)
+  [  208.117717] ---[ end trace 263cb8a59b5bf29f ]---
+
+The program itself which caused this had a long jump over the whole
+instruction sequence where all of the inner instructions required
+heavy expansions into multiple BPF instructions. Additionally, I also
+had BPF hardening enabled which requires once more rewrites of all
+constant values in order to blind them. Each time we rewrite insns,
+bpf_adj_branches() would need to potentially adjust branch targets
+which cross the patchlet boundary to accommodate for the additional
+delta. Eventually that lead to the case where the target offset could
+not fit into insn->off's upper 0x7fff limit anymore where then offset
+wraps around becoming negative (in s16 universe), or vice versa
+depending on the jump direction.
+
+Therefore it becomes necessary to detect and reject any such occasions
+in a generic way for native eBPF and cBPF to eBPF migrations. For
+the latter we can simply check bounds in the bpf_convert_filter()'s
+BPF_EMIT_JMP helper macro and bail out once we surpass limits. The
+bpf_patch_insn_single() for native eBPF (and cBPF to eBPF in case
+of subsequent hardening) is a bit more complex in that we need to
+detect such truncations before hitting the bpf_prog_realloc(). Thus
+the latter is split into an extra pass to probe problematic offsets
+on the original program in order to fail early. With that in place
+and carefully tested I no longer hit the panic and the rewrites are
+rejected properly. The above example panic I've seen on bpf-next,
+though the issue itself is generic in that a guard against this issue
+in bpf seems more appropriate in this case.
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 050fad7c4534c13c8eb1d9c2ba66012e014773cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/core.c
+#	net/core/filter.c
+diff --cc net/core/filter.c
+index 060ed5f86613,201ff36b17a8..000000000000
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@@ -110,314 -111,581 +110,372 @@@ int sk_filter_trim_cap(struct sock *sk
+  }
+  EXPORT_SYMBOL(sk_filter_trim_cap);
+  
+ -BPF_CALL_1(__skb_get_pay_offset, struct sk_buff *, skb)
+ -{
+ -	return skb_get_poff(skb);
+ -}
+ -
+ -BPF_CALL_3(__skb_get_nlattr, struct sk_buff *, skb, u32, a, u32, x)
+ -{
+ -	struct nlattr *nla;
+ -
+ -	if (skb_is_nonlinear(skb))
+ -		return 0;
+ -
+ -	if (skb->len < sizeof(struct nlattr))
+ -		return 0;
+ -
+ -	if (a > skb->len - sizeof(struct nlattr))
+ -		return 0;
+ -
+ -	nla = nla_find((struct nlattr *) &skb->data[a], skb->len - a, x);
+ -	if (nla)
+ -		return (void *) nla - (void *) skb->data;
+ -
+ -	return 0;
+ -}
+ -
+ -BPF_CALL_3(__skb_get_nlattr_nest, struct sk_buff *, skb, u32, a, u32, x)
+ -{
+ -	struct nlattr *nla;
+ -
+ -	if (skb_is_nonlinear(skb))
+ -		return 0;
+ -
+ -	if (skb->len < sizeof(struct nlattr))
+ -		return 0;
+ -
+ -	if (a > skb->len - sizeof(struct nlattr))
+ -		return 0;
+ -
+ -	nla = (struct nlattr *) &skb->data[a];
+ -	if (nla->nla_len > skb->len - a)
+ -		return 0;
+ -
+ -	nla = nla_find_nested(nla, x);
+ -	if (nla)
+ -		return (void *) nla - (void *) skb->data;
+ -
+ -	return 0;
+ -}
+ -
+ -BPF_CALL_0(__get_raw_cpu_id)
+ -{
+ -	return raw_smp_processor_id();
+ -}
+ -
+ -static const struct bpf_func_proto bpf_get_raw_smp_processor_id_proto = {
+ -	.func		= __get_raw_cpu_id,
+ -	.gpl_only	= false,
+ -	.ret_type	= RET_INTEGER,
+ -};
+ -
+ -static u32 convert_skb_access(int skb_field, int dst_reg, int src_reg,
+ -			      struct bpf_insn *insn_buf)
+ -{
+ -	struct bpf_insn *insn = insn_buf;
+ -
+ -	switch (skb_field) {
+ -	case SKF_AD_MARK:
+ -		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, mark) != 4);
+ -
+ -		*insn++ = BPF_LDX_MEM(BPF_W, dst_reg, src_reg,
+ -				      offsetof(struct sk_buff, mark));
+ -		break;
+ -
+ -	case SKF_AD_PKTTYPE:
+ -		*insn++ = BPF_LDX_MEM(BPF_B, dst_reg, src_reg, PKT_TYPE_OFFSET());
+ -		*insn++ = BPF_ALU32_IMM(BPF_AND, dst_reg, PKT_TYPE_MAX);
+ -#ifdef __BIG_ENDIAN_BITFIELD
+ -		*insn++ = BPF_ALU32_IMM(BPF_RSH, dst_reg, 5);
+ -#endif
+ -		break;
+ -
+ -	case SKF_AD_QUEUE:
+ -		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, queue_mapping) != 2);
+ -
+ -		*insn++ = BPF_LDX_MEM(BPF_H, dst_reg, src_reg,
+ -				      offsetof(struct sk_buff, queue_mapping));
+ -		break;
+ -
+ -	case SKF_AD_VLAN_TAG:
+ -	case SKF_AD_VLAN_TAG_PRESENT:
+ -		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, vlan_tci) != 2);
+ -		BUILD_BUG_ON(VLAN_TAG_PRESENT != 0x1000);
+ -
+ -		/* dst_reg = *(u16 *) (src_reg + offsetof(vlan_tci)) */
+ -		*insn++ = BPF_LDX_MEM(BPF_H, dst_reg, src_reg,
+ -				      offsetof(struct sk_buff, vlan_tci));
+ -		if (skb_field == SKF_AD_VLAN_TAG) {
+ -			*insn++ = BPF_ALU32_IMM(BPF_AND, dst_reg,
+ -						~VLAN_TAG_PRESENT);
+ -		} else {
+ -			/* dst_reg >>= 12 */
+ -			*insn++ = BPF_ALU32_IMM(BPF_RSH, dst_reg, 12);
+ -			/* dst_reg &= 1 */
+ -			*insn++ = BPF_ALU32_IMM(BPF_AND, dst_reg, 1);
+ -		}
+ -		break;
+ -	}
+ -
+ -	return insn - insn_buf;
+ -}
+ -
+ -static bool convert_bpf_extensions(struct sock_filter *fp,
+ -				   struct bpf_insn **insnp)
+ -{
+ -	struct bpf_insn *insn = *insnp;
+ -	u32 cnt;
+ -
+ -	switch (fp->k) {
+ -	case SKF_AD_OFF + SKF_AD_PROTOCOL:
+ -		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, protocol) != 2);
+ -
+ -		/* A = *(u16 *) (CTX + offsetof(protocol)) */
+ -		*insn++ = BPF_LDX_MEM(BPF_H, BPF_REG_A, BPF_REG_CTX,
+ -				      offsetof(struct sk_buff, protocol));
+ -		/* A = ntohs(A) [emitting a nop or swap16] */
+ -		*insn = BPF_ENDIAN(BPF_FROM_BE, BPF_REG_A, 16);
+ -		break;
+ -
+ -	case SKF_AD_OFF + SKF_AD_PKTTYPE:
+ -		cnt = convert_skb_access(SKF_AD_PKTTYPE, BPF_REG_A, BPF_REG_CTX, insn);
+ -		insn += cnt - 1;
+ -		break;
+ -
+ -	case SKF_AD_OFF + SKF_AD_IFINDEX:
+ -	case SKF_AD_OFF + SKF_AD_HATYPE:
+ -		BUILD_BUG_ON(FIELD_SIZEOF(struct net_device, ifindex) != 4);
+ -		BUILD_BUG_ON(FIELD_SIZEOF(struct net_device, type) != 2);
+ -
+ -		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, dev),
+ -				      BPF_REG_TMP, BPF_REG_CTX,
+ -				      offsetof(struct sk_buff, dev));
+ -		/* if (tmp != 0) goto pc + 1 */
+ -		*insn++ = BPF_JMP_IMM(BPF_JNE, BPF_REG_TMP, 0, 1);
+ -		*insn++ = BPF_EXIT_INSN();
+ -		if (fp->k == SKF_AD_OFF + SKF_AD_IFINDEX)
+ -			*insn = BPF_LDX_MEM(BPF_W, BPF_REG_A, BPF_REG_TMP,
+ -					    offsetof(struct net_device, ifindex));
+ -		else
+ -			*insn = BPF_LDX_MEM(BPF_H, BPF_REG_A, BPF_REG_TMP,
+ -					    offsetof(struct net_device, type));
+ -		break;
+ -
+ -	case SKF_AD_OFF + SKF_AD_MARK:
+ -		cnt = convert_skb_access(SKF_AD_MARK, BPF_REG_A, BPF_REG_CTX, insn);
+ -		insn += cnt - 1;
+ -		break;
+ -
+ -	case SKF_AD_OFF + SKF_AD_RXHASH:
+ -		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, hash) != 4);
+ -
+ -		*insn = BPF_LDX_MEM(BPF_W, BPF_REG_A, BPF_REG_CTX,
+ -				    offsetof(struct sk_buff, hash));
+ -		break;
+ -
+ -	case SKF_AD_OFF + SKF_AD_QUEUE:
+ -		cnt = convert_skb_access(SKF_AD_QUEUE, BPF_REG_A, BPF_REG_CTX, insn);
+ -		insn += cnt - 1;
+ -		break;
+ -
+ -	case SKF_AD_OFF + SKF_AD_VLAN_TAG:
+ -		cnt = convert_skb_access(SKF_AD_VLAN_TAG,
+ -					 BPF_REG_A, BPF_REG_CTX, insn);
+ -		insn += cnt - 1;
+ -		break;
+ -
+ -	case SKF_AD_OFF + SKF_AD_VLAN_TAG_PRESENT:
+ -		cnt = convert_skb_access(SKF_AD_VLAN_TAG_PRESENT,
+ -					 BPF_REG_A, BPF_REG_CTX, insn);
+ -		insn += cnt - 1;
+ -		break;
+ -
+ -	case SKF_AD_OFF + SKF_AD_VLAN_TPID:
+ -		BUILD_BUG_ON(FIELD_SIZEOF(struct sk_buff, vlan_proto) != 2);
+ -
+ -		/* A = *(u16 *) (CTX + offsetof(vlan_proto)) */
+ -		*insn++ = BPF_LDX_MEM(BPF_H, BPF_REG_A, BPF_REG_CTX,
+ -				      offsetof(struct sk_buff, vlan_proto));
+ -		/* A = ntohs(A) [emitting a nop or swap16] */
+ -		*insn = BPF_ENDIAN(BPF_FROM_BE, BPF_REG_A, 16);
+ -		break;
+ -
+ -	case SKF_AD_OFF + SKF_AD_PAY_OFFSET:
+ -	case SKF_AD_OFF + SKF_AD_NLATTR:
+ -	case SKF_AD_OFF + SKF_AD_NLATTR_NEST:
+ -	case SKF_AD_OFF + SKF_AD_CPU:
+ -	case SKF_AD_OFF + SKF_AD_RANDOM:
+ -		/* arg1 = CTX */
+ -		*insn++ = BPF_MOV64_REG(BPF_REG_ARG1, BPF_REG_CTX);
+ -		/* arg2 = A */
+ -		*insn++ = BPF_MOV64_REG(BPF_REG_ARG2, BPF_REG_A);
+ -		/* arg3 = X */
+ -		*insn++ = BPF_MOV64_REG(BPF_REG_ARG3, BPF_REG_X);
+ -		/* Emit call(arg1=CTX, arg2=A, arg3=X) */
+ -		switch (fp->k) {
+ -		case SKF_AD_OFF + SKF_AD_PAY_OFFSET:
+ -			*insn = BPF_EMIT_CALL(__skb_get_pay_offset);
+ -			break;
+ -		case SKF_AD_OFF + SKF_AD_NLATTR:
+ -			*insn = BPF_EMIT_CALL(__skb_get_nlattr);
+ -			break;
+ -		case SKF_AD_OFF + SKF_AD_NLATTR_NEST:
+ -			*insn = BPF_EMIT_CALL(__skb_get_nlattr_nest);
+ -			break;
+ -		case SKF_AD_OFF + SKF_AD_CPU:
+ -			*insn = BPF_EMIT_CALL(__get_raw_cpu_id);
+ -			break;
+ -		case SKF_AD_OFF + SKF_AD_RANDOM:
+ -			*insn = BPF_EMIT_CALL(bpf_user_rnd_u32);
+ -			bpf_user_rnd_init_once();
+ -			break;
+ -		}
+ -		break;
+ -
+ -	case SKF_AD_OFF + SKF_AD_ALU_XOR_X:
+ -		/* A ^= X */
+ -		*insn = BPF_ALU32_REG(BPF_XOR, BPF_REG_A, BPF_REG_X);
+ -		break;
+ -
+ -	default:
+ -		/* This is just a dummy call to avoid letting the compiler
+ -		 * evict __bpf_call_base() as an optimization. Placed here
+ -		 * where no-one bothers.
+ -		 */
+ -		BUG_ON(__bpf_call_base(0, 0, 0, 0, 0) != 0);
+ -		return false;
+ -	}
+ -
+ -	*insnp = insn;
+ -	return true;
+ -}
+ -
+  /**
+ - *	bpf_convert_filter - convert filter program
+ - *	@prog: the user passed filter program
+ - *	@len: the length of the user passed filter program
+ - *	@new_prog: allocated 'struct bpf_prog' or NULL
+ - *	@new_len: pointer to store length of converted program
+ - *
+ - * Remap 'sock_filter' style classic BPF (cBPF) instruction set to 'bpf_insn'
+ - * style extended BPF (eBPF).
+ - * Conversion workflow:
+ + *	sk_run_filter - run a filter on a socket
+ + *	@skb: buffer to run the filter on
+ + *	@fentry: filter to apply
+   *
+ - * 1) First pass for calculating the new program length:
+ - *   bpf_convert_filter(old_prog, old_len, NULL, &new_len)
+ - *
+ - * 2) 2nd pass to remap in two passes: 1st pass finds new
+ - *    jump offsets, 2nd pass remapping:
+ - *   bpf_convert_filter(old_prog, old_len, new_prog, &new_len);
+ + * Decode and apply filter instructions to the skb->data.
+ + * Return length to keep, 0 for none. @skb is the data we are
+ + * filtering, @filter is the array of filter instructions.
+ + * Because all jumps are guaranteed to be before last instruction,
+ + * and last instruction guaranteed to be a RET, we dont need to check
+ + * flen. (We used to pass to this function the length of filter)
+   */
+ -static int bpf_convert_filter(struct sock_filter *prog, int len,
+ -			      struct bpf_prog *new_prog, int *new_len)
+ +unsigned int sk_run_filter(const struct sk_buff *skb,
+ +			   const struct sock_filter *fentry)
+  {
+ -	int new_flen = 0, pass = 0, target, i, stack_off;
+ -	struct bpf_insn *new_insn, *first_insn = NULL;
+ -	struct sock_filter *fp;
+ -	int *addrs = NULL;
+ -	u8 bpf_src;
+ -
+ -	BUILD_BUG_ON(BPF_MEMWORDS * sizeof(u32) > MAX_BPF_STACK);
+ -	BUILD_BUG_ON(BPF_REG_FP + 1 != MAX_BPF_REG);
+ -
+ -	if (len <= 0 || len > BPF_MAXINSNS)
+ -		return -EINVAL;
+ -
+ -	if (new_prog) {
+ -		first_insn = new_prog->insnsi;
+ -		addrs = kcalloc(len, sizeof(*addrs),
+ -				GFP_KERNEL | __GFP_NOWARN);
+ -		if (!addrs)
+ -			return -ENOMEM;
+ -	}
+ -
+ -do_pass:
+ -	new_insn = first_insn;
+ -	fp = prog;
+ -
+ -	/* Classic BPF related prologue emission. */
+ -	if (new_prog) {
+ -		/* Classic BPF expects A and X to be reset first. These need
+ -		 * to be guaranteed to be the first two instructions.
+ -		 */
+ -		*new_insn++ = BPF_ALU32_REG(BPF_XOR, BPF_REG_A, BPF_REG_A);
+ -		*new_insn++ = BPF_ALU32_REG(BPF_XOR, BPF_REG_X, BPF_REG_X);
+ -
+ -		/* All programs must keep CTX in callee saved BPF_REG_CTX.
+ -		 * In eBPF case it's done by the compiler, here we need to
+ -		 * do this ourself. Initial CTX is present in BPF_REG_ARG1.
+ -		 */
+ -		*new_insn++ = BPF_MOV64_REG(BPF_REG_CTX, BPF_REG_ARG1);
+ -	} else {
+ -		new_insn += 3;
+ -	}
+ -
+ -	for (i = 0; i < len; fp++, i++) {
+ -		struct bpf_insn tmp_insns[6] = { };
+ -		struct bpf_insn *insn = tmp_insns;
+ -
+ -		if (addrs)
+ -			addrs[i] = new_insn - first_insn;
+ +	void *ptr;
+ +	u32 A = 0;			/* Accumulator */
+ +	u32 X = 0;			/* Index Register */
+ +	u32 mem[BPF_MEMWORDS];		/* Scratch Memory Store */
+ +	u32 tmp;
+ +	int k;
+  
+ -		switch (fp->code) {
+ -		/* All arithmetic insns and skb loads map as-is. */
+ -		case BPF_ALU | BPF_ADD | BPF_X:
+ -		case BPF_ALU | BPF_ADD | BPF_K:
+ -		case BPF_ALU | BPF_SUB | BPF_X:
+ -		case BPF_ALU | BPF_SUB | BPF_K:
+ -		case BPF_ALU | BPF_AND | BPF_X:
+ -		case BPF_ALU | BPF_AND | BPF_K:
+ -		case BPF_ALU | BPF_OR | BPF_X:
+ -		case BPF_ALU | BPF_OR | BPF_K:
+ -		case BPF_ALU | BPF_LSH | BPF_X:
+ -		case BPF_ALU | BPF_LSH | BPF_K:
+ -		case BPF_ALU | BPF_RSH | BPF_X:
+ -		case BPF_ALU | BPF_RSH | BPF_K:
+ -		case BPF_ALU | BPF_XOR | BPF_X:
+ -		case BPF_ALU | BPF_XOR | BPF_K:
+ -		case BPF_ALU | BPF_MUL | BPF_X:
+ -		case BPF_ALU | BPF_MUL | BPF_K:
+ -		case BPF_ALU | BPF_DIV | BPF_X:
+ -		case BPF_ALU | BPF_DIV | BPF_K:
+ -		case BPF_ALU | BPF_MOD | BPF_X:
+ -		case BPF_ALU | BPF_MOD | BPF_K:
+ -		case BPF_ALU | BPF_NEG:
+ -		case BPF_LD | BPF_ABS | BPF_W:
+ -		case BPF_LD | BPF_ABS | BPF_H:
+ -		case BPF_LD | BPF_ABS | BPF_B:
+ -		case BPF_LD | BPF_IND | BPF_W:
+ -		case BPF_LD | BPF_IND | BPF_H:
+ -		case BPF_LD | BPF_IND | BPF_B:
+ -			/* Check for overloaded BPF extension and
+ -			 * directly convert it if found, otherwise
+ -			 * just move on with mapping.
+ -			 */
+ -			if (BPF_CLASS(fp->code) == BPF_LD &&
+ -			    BPF_MODE(fp->code) == BPF_ABS &&
+ -			    convert_bpf_extensions(fp, &insn))
+ -				break;
+ +	/*
+ +	 * Process array of filter instructions.
+ +	 */
+ +	for (;; fentry++) {
+ +#if defined(CONFIG_X86_32)
+ +#define	K (fentry->k)
+ +#else
+ +		const u32 K = fentry->k;
+ +#endif
+  
+ -			if (fp->code == (BPF_ALU | BPF_DIV | BPF_X) ||
+ -			    fp->code == (BPF_ALU | BPF_MOD | BPF_X)) {
+ -				*insn++ = BPF_MOV32_REG(BPF_REG_X, BPF_REG_X);
+ -				/* Error with exception code on div/mod by 0.
+ -				 * For cBPF programs, this was always return 0.
+ -				 */
+ -				*insn++ = BPF_JMP_IMM(BPF_JNE, BPF_REG_X, 0, 2);
+ -				*insn++ = BPF_ALU32_REG(BPF_XOR, BPF_REG_A, BPF_REG_A);
+ -				*insn++ = BPF_EXIT_INSN();
+ +		switch (fentry->code) {
+ +		case BPF_S_ALU_ADD_X:
+ +			A += X;
+ +			continue;
+ +		case BPF_S_ALU_ADD_K:
+ +			A += K;
+ +			continue;
+ +		case BPF_S_ALU_SUB_X:
+ +			A -= X;
+ +			continue;
+ +		case BPF_S_ALU_SUB_K:
+ +			A -= K;
+ +			continue;
+ +		case BPF_S_ALU_MUL_X:
+ +			A *= X;
+ +			continue;
+ +		case BPF_S_ALU_MUL_K:
+ +			A *= K;
+ +			continue;
+ +		case BPF_S_ALU_DIV_X:
+ +			if (X == 0)
+ +				return 0;
+ +			A /= X;
+ +			continue;
+ +		case BPF_S_ALU_DIV_K:
+ +			A /= K;
+ +			continue;
+ +		case BPF_S_ALU_MOD_X:
+ +			if (X == 0)
+ +				return 0;
+ +			A %= X;
+ +			continue;
+ +		case BPF_S_ALU_MOD_K:
+ +			A %= K;
+ +			continue;
+ +		case BPF_S_ALU_AND_X:
+ +			A &= X;
+ +			continue;
+ +		case BPF_S_ALU_AND_K:
+ +			A &= K;
+ +			continue;
+ +		case BPF_S_ALU_OR_X:
+ +			A |= X;
+ +			continue;
+ +		case BPF_S_ALU_OR_K:
+ +			A |= K;
+ +			continue;
+ +		case BPF_S_ANC_ALU_XOR_X:
+ +		case BPF_S_ALU_XOR_X:
+ +			A ^= X;
+ +			continue;
+ +		case BPF_S_ALU_XOR_K:
+ +			A ^= K;
+ +			continue;
+ +		case BPF_S_ALU_LSH_X:
+ +			A <<= X;
+ +			continue;
+ +		case BPF_S_ALU_LSH_K:
+ +			A <<= K;
+ +			continue;
+ +		case BPF_S_ALU_RSH_X:
+ +			A >>= X;
+ +			continue;
+ +		case BPF_S_ALU_RSH_K:
+ +			A >>= K;
+ +			continue;
+ +		case BPF_S_ALU_NEG:
+ +			A = -A;
+ +			continue;
+ +		case BPF_S_JMP_JA:
+ +			fentry += K;
+ +			continue;
+ +		case BPF_S_JMP_JGT_K:
+ +			fentry += (A > K) ? fentry->jt : fentry->jf;
+ +			continue;
+ +		case BPF_S_JMP_JGE_K:
+ +			fentry += (A >= K) ? fentry->jt : fentry->jf;
+ +			continue;
+ +		case BPF_S_JMP_JEQ_K:
+ +			fentry += (A == K) ? fentry->jt : fentry->jf;
+ +			continue;
+ +		case BPF_S_JMP_JSET_K:
+ +			fentry += (A & K) ? fentry->jt : fentry->jf;
+ +			continue;
+ +		case BPF_S_JMP_JGT_X:
+ +			fentry += (A > X) ? fentry->jt : fentry->jf;
+ +			continue;
+ +		case BPF_S_JMP_JGE_X:
+ +			fentry += (A >= X) ? fentry->jt : fentry->jf;
+ +			continue;
+ +		case BPF_S_JMP_JEQ_X:
+ +			fentry += (A == X) ? fentry->jt : fentry->jf;
+ +			continue;
+ +		case BPF_S_JMP_JSET_X:
+ +			fentry += (A & X) ? fentry->jt : fentry->jf;
+ +			continue;
+ +		case BPF_S_LD_W_ABS:
+ +			k = K;
+ +load_w:
+ +			ptr = load_pointer(skb, k, 4, &tmp);
+ +			if (ptr != NULL) {
+ +				A = get_unaligned_be32(ptr);
+ +				continue;
+  			}
+++<<<<<<< HEAD
+ +			return 0;
+ +		case BPF_S_LD_H_ABS:
+ +			k = K;
+ +load_h:
+ +			ptr = load_pointer(skb, k, 2, &tmp);
+ +			if (ptr != NULL) {
+ +				A = get_unaligned_be16(ptr);
+ +				continue;
+++=======
++ 
++ 			*insn = BPF_RAW_INSN(fp->code, BPF_REG_A, BPF_REG_X, 0, fp->k);
++ 			break;
++ 
++ 		/* Jump transformation cannot use BPF block macros
++ 		 * everywhere as offset calculation and target updates
++ 		 * require a bit more work than the rest, i.e. jump
++ 		 * opcodes map as-is, but offsets need adjustment.
++ 		 */
++ 
++ #define BPF_EMIT_JMP							\
++ 	do {								\
++ 		const s32 off_min = S16_MIN, off_max = S16_MAX;		\
++ 		s32 off;						\
++ 									\
++ 		if (target >= len || target < 0)			\
++ 			goto err;					\
++ 		off = addrs ? addrs[target] - addrs[i] - 1 : 0;		\
++ 		/* Adjust pc relative offset for 2nd or 3rd insn. */	\
++ 		off -= insn - tmp_insns;				\
++ 		/* Reject anything not fitting into insn->off. */	\
++ 		if (off < off_min || off > off_max)			\
++ 			goto err;					\
++ 		insn->off = off;					\
++ 	} while (0)
++ 
++ 		case BPF_JMP | BPF_JA:
++ 			target = i + fp->k + 1;
++ 			insn->code = fp->code;
++ 			BPF_EMIT_JMP;
++ 			break;
++ 
++ 		case BPF_JMP | BPF_JEQ | BPF_K:
++ 		case BPF_JMP | BPF_JEQ | BPF_X:
++ 		case BPF_JMP | BPF_JSET | BPF_K:
++ 		case BPF_JMP | BPF_JSET | BPF_X:
++ 		case BPF_JMP | BPF_JGT | BPF_K:
++ 		case BPF_JMP | BPF_JGT | BPF_X:
++ 		case BPF_JMP | BPF_JGE | BPF_K:
++ 		case BPF_JMP | BPF_JGE | BPF_X:
++ 			if (BPF_SRC(fp->code) == BPF_K && (int) fp->k < 0) {
++ 				/* BPF immediates are signed, zero extend
++ 				 * immediate into tmp register and use it
++ 				 * in compare insn.
++ 				 */
++ 				*insn++ = BPF_MOV32_IMM(BPF_REG_TMP, fp->k);
++ 
++ 				insn->dst_reg = BPF_REG_A;
++ 				insn->src_reg = BPF_REG_TMP;
++ 				bpf_src = BPF_X;
++ 			} else {
++ 				insn->dst_reg = BPF_REG_A;
++ 				insn->imm = fp->k;
++ 				bpf_src = BPF_SRC(fp->code);
++ 				insn->src_reg = bpf_src == BPF_X ? BPF_REG_X : 0;
+++>>>>>>> 050fad7c4534 (bpf: fix truncated jump targets on heavy expansions)
+  			}
+ -
+ -			/* Common case where 'jump_false' is next insn. */
+ -			if (fp->jf == 0) {
+ -				insn->code = BPF_JMP | BPF_OP(fp->code) | bpf_src;
+ -				target = i + fp->jt + 1;
+ -				BPF_EMIT_JMP;
+ -				break;
+ +			return 0;
+ +		case BPF_S_LD_B_ABS:
+ +			k = K;
+ +load_b:
+ +			ptr = load_pointer(skb, k, 1, &tmp);
+ +			if (ptr != NULL) {
+ +				A = *(u8 *)ptr;
+ +				continue;
+  			}
+ -
+ -			/* Convert some jumps when 'jump_true' is next insn. */
+ -			if (fp->jt == 0) {
+ -				switch (BPF_OP(fp->code)) {
+ -				case BPF_JEQ:
+ -					insn->code = BPF_JMP | BPF_JNE | bpf_src;
+ -					break;
+ -				case BPF_JGT:
+ -					insn->code = BPF_JMP | BPF_JLE | bpf_src;
+ -					break;
+ -				case BPF_JGE:
+ -					insn->code = BPF_JMP | BPF_JLT | bpf_src;
+ -					break;
+ -				default:
+ -					goto jmp_rest;
+ -				}
+ -
+ -				target = i + fp->jf + 1;
+ -				BPF_EMIT_JMP;
+ -				break;
+ +			return 0;
+ +		case BPF_S_LD_W_LEN:
+ +			A = skb->len;
+ +			continue;
+ +		case BPF_S_LDX_W_LEN:
+ +			X = skb->len;
+ +			continue;
+ +		case BPF_S_LD_W_IND:
+ +			k = X + K;
+ +			goto load_w;
+ +		case BPF_S_LD_H_IND:
+ +			k = X + K;
+ +			goto load_h;
+ +		case BPF_S_LD_B_IND:
+ +			k = X + K;
+ +			goto load_b;
+ +		case BPF_S_LDX_B_MSH:
+ +			ptr = load_pointer(skb, K, 1, &tmp);
+ +			if (ptr != NULL) {
+ +				X = (*(u8 *)ptr & 0xf) << 2;
+ +				continue;
+  			}
+ -jmp_rest:
+ -			/* Other jumps are mapped into two insns: Jxx and JA. */
+ -			target = i + fp->jt + 1;
+ -			insn->code = BPF_JMP | BPF_OP(fp->code) | bpf_src;
+ -			BPF_EMIT_JMP;
+ -			insn++;
+ -
+ -			insn->code = BPF_JMP | BPF_JA;
+ -			target = i + fp->jf + 1;
+ -			BPF_EMIT_JMP;
+ -			break;
+ -
+ -		/* ldxb 4 * ([14] & 0xf) is remaped into 6 insns. */
+ -		case BPF_LDX | BPF_MSH | BPF_B:
+ -			/* tmp = A */
+ -			*insn++ = BPF_MOV64_REG(BPF_REG_TMP, BPF_REG_A);
+ -			/* A = BPF_R0 = *(u8 *) (skb->data + K) */
+ -			*insn++ = BPF_LD_ABS(BPF_B, fp->k);
+ -			/* A &= 0xf */
+ -			*insn++ = BPF_ALU32_IMM(BPF_AND, BPF_REG_A, 0xf);
+ -			/* A <<= 2 */
+ -			*insn++ = BPF_ALU32_IMM(BPF_LSH, BPF_REG_A, 2);
+ -			/* X = A */
+ -			*insn++ = BPF_MOV64_REG(BPF_REG_X, BPF_REG_A);
+ -			/* A = tmp */
+ -			*insn = BPF_MOV64_REG(BPF_REG_A, BPF_REG_TMP);
+ -			break;
+ -
+ -		/* RET_K is remaped into 2 insns. RET_A case doesn't need an
+ -		 * extra mov as BPF_REG_0 is already mapped into BPF_REG_A.
+ -		 */
+ -		case BPF_RET | BPF_A:
+ -		case BPF_RET | BPF_K:
+ -			if (BPF_RVAL(fp->code) == BPF_K)
+ -				*insn++ = BPF_MOV32_RAW(BPF_K, BPF_REG_0,
+ -							0, fp->k);
+ -			*insn = BPF_EXIT_INSN();
+ -			break;
+ -
+ -		/* Store to stack. */
+ -		case BPF_ST:
+ -		case BPF_STX:
+ -			stack_off = fp->k * 4  + 4;
+ -			*insn = BPF_STX_MEM(BPF_W, BPF_REG_FP, BPF_CLASS(fp->code) ==
+ -					    BPF_ST ? BPF_REG_A : BPF_REG_X,
+ -					    -stack_off);
+ -			/* check_load_and_stores() verifies that classic BPF can
+ -			 * load from stack only after write, so tracking
+ -			 * stack_depth for ST|STX insns is enough
+ -			 */
+ -			if (new_prog && new_prog->aux->stack_depth < stack_off)
+ -				new_prog->aux->stack_depth = stack_off;
+ -			break;
+ -
+ -		/* Load from stack. */
+ -		case BPF_LD | BPF_MEM:
+ -		case BPF_LDX | BPF_MEM:
+ -			stack_off = fp->k * 4  + 4;
+ -			*insn = BPF_LDX_MEM(BPF_W, BPF_CLASS(fp->code) == BPF_LD  ?
+ -					    BPF_REG_A : BPF_REG_X, BPF_REG_FP,
+ -					    -stack_off);
+ -			break;
+ -
+ -		/* A = K or X = K */
+ -		case BPF_LD | BPF_IMM:
+ -		case BPF_LDX | BPF_IMM:
+ -			*insn = BPF_MOV32_IMM(BPF_CLASS(fp->code) == BPF_LD ?
+ -					      BPF_REG_A : BPF_REG_X, fp->k);
+ -			break;
+ -
+ -		/* X = A */
+ -		case BPF_MISC | BPF_TAX:
+ -			*insn = BPF_MOV64_REG(BPF_REG_X, BPF_REG_A);
+ -			break;
+ -
+ -		/* A = X */
+ -		case BPF_MISC | BPF_TXA:
+ -			*insn = BPF_MOV64_REG(BPF_REG_A, BPF_REG_X);
+ -			break;
+ -
+ -		/* A = skb->len or X = skb->len */
+ -		case BPF_LD | BPF_W | BPF_LEN:
+ -		case BPF_LDX | BPF_W | BPF_LEN:
+ -			*insn = BPF_LDX_MEM(BPF_W, BPF_CLASS(fp->code) == BPF_LD ?
+ -					    BPF_REG_A : BPF_REG_X, BPF_REG_CTX,
+ -					    offsetof(struct sk_buff, len));
+ -			break;
+ -
+ -		/* Access seccomp_data fields. */
+ -		case BPF_LDX | BPF_ABS | BPF_W:
+ -			/* A = *(u32 *) (ctx + K) */
+ -			*insn = BPF_LDX_MEM(BPF_W, BPF_REG_A, BPF_REG_CTX, fp->k);
+ -			break;
+ -
+ -		/* Unknown instruction. */
+ +			return 0;
+ +		case BPF_S_LD_IMM:
+ +			A = K;
+ +			continue;
+ +		case BPF_S_LDX_IMM:
+ +			X = K;
+ +			continue;
+ +		case BPF_S_LD_MEM:
+ +			A = mem[K];
+ +			continue;
+ +		case BPF_S_LDX_MEM:
+ +			X = mem[K];
+ +			continue;
+ +		case BPF_S_MISC_TAX:
+ +			X = A;
+ +			continue;
+ +		case BPF_S_MISC_TXA:
+ +			A = X;
+ +			continue;
+ +		case BPF_S_RET_K:
+ +			return K;
+ +		case BPF_S_RET_A:
+ +			return A;
+ +		case BPF_S_ST:
+ +			mem[K] = A;
+ +			continue;
+ +		case BPF_S_STX:
+ +			mem[K] = X;
+ +			continue;
+ +		case BPF_S_ANC_PROTOCOL:
+ +			A = ntohs(skb->protocol);
+ +			continue;
+ +		case BPF_S_ANC_PKTTYPE:
+ +			A = skb->pkt_type;
+ +			continue;
+ +		case BPF_S_ANC_IFINDEX:
+ +			if (!skb->dev)
+ +				return 0;
+ +			A = skb->dev->ifindex;
+ +			continue;
+ +		case BPF_S_ANC_MARK:
+ +			A = skb->mark;
+ +			continue;
+ +		case BPF_S_ANC_QUEUE:
+ +			A = skb->queue_mapping;
+ +			continue;
+ +		case BPF_S_ANC_HATYPE:
+ +			if (!skb->dev)
+ +				return 0;
+ +			A = skb->dev->type;
+ +			continue;
+ +		case BPF_S_ANC_RXHASH:
+ +			A = skb->hash;
+ +			continue;
+ +		case BPF_S_ANC_CPU:
+ +			A = raw_smp_processor_id();
+ +			continue;
+ +		case BPF_S_ANC_VLAN_TAG:
+ +			A = skb_vlan_tag_get(skb);
+ +			continue;
+ +		case BPF_S_ANC_VLAN_TAG_PRESENT:
+ +			A = !!skb_vlan_tag_present(skb);
+ +			continue;
+ +		case BPF_S_ANC_PAY_OFFSET:
+ +			A = skb_get_poff(skb);
+ +			continue;
+ +		case BPF_S_ANC_NLATTR: {
+ +			struct nlattr *nla;
+ +
+ +			if (skb_is_nonlinear(skb))
+ +				return 0;
+ +
+ +			if (skb->len < sizeof(struct nlattr))
+ +				return 0;
+ +
+ +			if (A > skb->len - sizeof(struct nlattr))
+ +				return 0;
+ +
+ +			nla = nla_find((struct nlattr *)&skb->data[A],
+ +				       skb->len - A, X);
+ +			if (nla)
+ +				A = (void *)nla - (void *)skb->data;
+ +			else
+ +				A = 0;
+ +			continue;
+ +		}
+ +		case BPF_S_ANC_NLATTR_NEST: {
+ +			struct nlattr *nla;
+ +
+ +			if (skb_is_nonlinear(skb))
+ +				return 0;
+ +
+ +			if (skb->len < sizeof(struct nlattr))
+ +				return 0;
+ +
+ +			if (A > skb->len - sizeof(struct nlattr))
+ +				return 0;
+ +
+ +			nla = (struct nlattr *)&skb->data[A];
+ +			if (nla->nla_len > skb->len - A)
+ +				return 0;
+ +
+ +			nla = nla_find_nested(nla, X);
+ +			if (nla)
+ +				A = (void *)nla - (void *)skb->data;
+ +			else
+ +				A = 0;
+ +			continue;
+ +		}
+ +#ifdef CONFIG_SECCOMP_FILTER
+ +		case BPF_S_ANC_SECCOMP_LD_W:
+ +			A = seccomp_bpf_load(fentry->k);
+ +			continue;
+ +#endif
+  		default:
+ -			goto err;
+ +			WARN_RATELIMIT(1, "Unknown code:%u jt:%u tf:%u k:%u\n",
+ +				       fentry->code, fentry->jt,
+ +				       fentry->jf, fentry->k);
+ +			return 0;
+  		}
+ -
+ -		insn++;
+ -		if (new_prog)
+ -			memcpy(new_insn, tmp_insns,
+ -			       sizeof(*insn) * (insn - tmp_insns));
+ -		new_insn += insn - tmp_insns;
+ -	}
+ -
+ -	if (!new_prog) {
+ -		/* Only calculating new length. */
+ -		*new_len = new_insn - first_insn;
+ -		return 0;
+ -	}
+ -
+ -	pass++;
+ -	if (new_flen != new_insn - first_insn) {
+ -		new_flen = new_insn - first_insn;
+ -		if (pass > 2)
+ -			goto err;
+ -		goto do_pass;
+  	}
+  
+ -	kfree(addrs);
+ -	BUG_ON(*new_len != new_flen);
+  	return 0;
+ -err:
+ -	kfree(addrs);
+ -	return -EINVAL;
+  }
+ +EXPORT_SYMBOL(sk_run_filter);
+  
+ -/* Security:
+ - *
+ +/*
+ + * Security :
+ + * A BPF program is able to use 16 cells of memory to store intermediate
+ + * values (check u32 mem[BPF_MEMWORDS] in sk_run_filter())
+   * As we dont want to clear mem[] array for each packet going through
+ - * __bpf_prog_run(), we check that filter loaded by user never try to read
+ + * sk_run_filter(), we check that filter loaded by user never try to read
+   * a cell if not previously written, and we check all branches to be sure
+   * a malicious user doesn't try to abuse us.
+   */
+* Unmerged path kernel/bpf/core.c
+* Unmerged path kernel/bpf/core.c
+* Unmerged path net/core/filter.c
