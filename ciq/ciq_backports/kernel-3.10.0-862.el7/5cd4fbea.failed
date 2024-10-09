@@ -1,0 +1,235 @@
+nfp: make use of the DMA_ATTR_SKIP_CPU_SYNC attr
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 5cd4fbeab21b89e08df4590b2020f2e5f60c0d19
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5cd4fbea.failed
+
+DMA unmap may destroy changes CPU made to the buffer.  To make XDP
+run correctly on non-x86 platforms we should use the
+DMA_ATTR_SKIP_CPU_SYNC attribute.
+
+Thanks to using the attribute we can now push the sync operation to the
+common code path from XDP handler.
+
+A little bit of variable name reshuffling is required to bring the
+code back to readable state.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5cd4fbeab21b89e08df4590b2020f2e5f60c0d19)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 4bac97838402,f1128d12cd24..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -80,20 -85,33 +80,47 @@@ void nfp_net_get_fw_version(struct nfp_
+  	put_unaligned_le32(reg, fw_ver);
+  }
+  
+ -static dma_addr_t nfp_net_dma_map_rx(struct nfp_net_dp *dp, void *frag)
+ +static dma_addr_t
+ +nfp_net_dma_map_rx(struct nfp_net *nn, void *frag, unsigned int bufsz,
+ +		   int direction)
+  {
+++<<<<<<< HEAD
+ +	return dma_map_single(&nn->pdev->dev, frag + NFP_NET_RX_BUF_HEADROOM,
+ +			      bufsz - NFP_NET_RX_BUF_NON_DATA, direction);
+++=======
++ 	return dma_map_single_attrs(dp->dev, frag + NFP_NET_RX_BUF_HEADROOM,
++ 				    dp->fl_bufsz - NFP_NET_RX_BUF_NON_DATA,
++ 				    dp->rx_dma_dir, DMA_ATTR_SKIP_CPU_SYNC);
++ }
++ 
++ static void
++ nfp_net_dma_sync_dev_rx(const struct nfp_net_dp *dp, dma_addr_t dma_addr)
++ {
++ 	dma_sync_single_for_device(dp->dev, dma_addr,
++ 				   dp->fl_bufsz - NFP_NET_RX_BUF_NON_DATA,
++ 				   dp->rx_dma_dir);
+++>>>>>>> 5cd4fbeab21b (nfp: make use of the DMA_ATTR_SKIP_CPU_SYNC attr)
+  }
+  
+ -static void nfp_net_dma_unmap_rx(struct nfp_net_dp *dp, dma_addr_t dma_addr)
+ +static void
+ +nfp_net_dma_unmap_rx(struct nfp_net *nn, dma_addr_t dma_addr,
+ +		     unsigned int bufsz, int direction)
+  {
+++<<<<<<< HEAD
+ +	dma_unmap_single(&nn->pdev->dev, dma_addr,
+ +			 bufsz - NFP_NET_RX_BUF_NON_DATA, direction);
+++=======
++ 	dma_unmap_single_attrs(dp->dev, dma_addr,
++ 			       dp->fl_bufsz - NFP_NET_RX_BUF_NON_DATA,
++ 			       dp->rx_dma_dir, DMA_ATTR_SKIP_CPU_SYNC);
++ }
++ 
++ static void nfp_net_dma_sync_cpu_rx(struct nfp_net_dp *dp, dma_addr_t dma_addr,
++ 				    unsigned int len)
++ {
++ 	dma_sync_single_for_cpu(dp->dev, dma_addr - NFP_NET_RX_BUF_HEADROOM,
++ 				len, dp->rx_dma_dir);
+++>>>>>>> 5cd4fbeab21b (nfp: make use of the DMA_ATTR_SKIP_CPU_SYNC attr)
+  }
+  
+  /* Firmware reconfig
+@@@ -1384,8 -1580,14 +1413,13 @@@ static int nfp_net_rx(struct nfp_net_rx
+  	int pkts_polled = 0;
+  	int idx;
+  
+ -	rcu_read_lock();
+ -	xdp_prog = READ_ONCE(dp->xdp_prog);
+ -	true_bufsz = xdp_prog ? PAGE_SIZE : dp->fl_bufsz;
+ -	tx_ring = r_vec->xdp_ring;
+ -
+  	while (pkts_polled < budget) {
+++<<<<<<< HEAD
+ +		unsigned int meta_len, data_len, data_off, pkt_len, pkt_off;
+++=======
++ 		unsigned int meta_len, data_len, meta_off, pkt_len, pkt_off;
++ 		u8 meta_prepend[NFP_NET_MAX_PREPEND];
+++>>>>>>> 5cd4fbeab21b (nfp: make use of the DMA_ATTR_SKIP_CPU_SYNC attr)
+  		struct nfp_net_rx_buf *rxbuf;
+  		struct nfp_net_rx_desc *rxd;
+  		dma_addr_t new_dma_addr;
+@@@ -1422,11 -1625,12 +1456,20 @@@
+  		data_len = le16_to_cpu(rxd->rxd.data_len);
+  		pkt_len = data_len - meta_len;
+  
+++<<<<<<< HEAD
+ +		if (nn->rx_offset == NFP_NET_CFG_RX_OFFSET_DYNAMIC)
+ +			pkt_off = meta_len;
+ +		else
+ +			pkt_off = nn->rx_offset;
+ +		data_off = NFP_NET_RX_BUF_HEADROOM + pkt_off;
+++=======
++ 		pkt_off = NFP_NET_RX_BUF_HEADROOM + dp->rx_dma_off;
++ 		if (dp->rx_offset == NFP_NET_CFG_RX_OFFSET_DYNAMIC)
++ 			pkt_off += meta_len;
++ 		else
++ 			pkt_off += dp->rx_offset;
++ 		meta_off = pkt_off - meta_len;
+++>>>>>>> 5cd4fbeab21b (nfp: make use of the DMA_ATTR_SKIP_CPU_SYNC attr)
+  
+  		/* Stats update */
+  		u64_stats_update_begin(&r_vec->rx_sync);
+@@@ -1434,34 -1638,95 +1477,91 @@@
+  		r_vec->rx_bytes += pkt_len;
+  		u64_stats_update_end(&r_vec->rx_sync);
+  
+++<<<<<<< HEAD
+ +		skb = build_skb(rxbuf->frag, nn->fl_bufsz);
+++=======
++ 		/* Pointer to start of metadata */
++ 		meta = rxbuf->frag + meta_off;
++ 
++ 		if (unlikely(meta_len > NFP_NET_MAX_PREPEND ||
++ 			     (dp->rx_offset && meta_len > dp->rx_offset))) {
++ 			nn_dp_warn(dp, "oversized RX packet metadata %u\n",
++ 				   meta_len);
++ 			nfp_net_rx_drop(dp, r_vec, rx_ring, rxbuf, NULL);
++ 			continue;
++ 		}
++ 
++ 		nfp_net_dma_sync_cpu_rx(dp, rxbuf->dma_addr + meta_off,
++ 					data_len);
++ 
++ 		if (xdp_prog && !(rxd->rxd.flags & PCIE_DESC_RX_BPF &&
++ 				  dp->bpf_offload_xdp)) {
++ 			unsigned int dma_off;
++ 			void *hard_start;
++ 			int act;
++ 
++ 			hard_start = rxbuf->frag + NFP_NET_RX_BUF_HEADROOM;
++ 
++ 			/* Move prepend out of the way */
++ 			if (xdp_prog->xdp_adjust_head) {
++ 				memcpy(meta_prepend, meta, meta_len);
++ 				meta = meta_prepend;
++ 			}
++ 
++ 			act = nfp_net_run_xdp(xdp_prog, rxbuf->frag, hard_start,
++ 					      &pkt_off, &pkt_len);
++ 			switch (act) {
++ 			case XDP_PASS:
++ 				break;
++ 			case XDP_TX:
++ 				dma_off = pkt_off - NFP_NET_RX_BUF_HEADROOM;
++ 				if (unlikely(!nfp_net_tx_xdp_buf(dp, rx_ring,
++ 								 tx_ring, rxbuf,
++ 								 dma_off,
++ 								 pkt_len)))
++ 					trace_xdp_exception(dp->netdev,
++ 							    xdp_prog, act);
++ 				continue;
++ 			default:
++ 				bpf_warn_invalid_xdp_action(act);
++ 			case XDP_ABORTED:
++ 				trace_xdp_exception(dp->netdev, xdp_prog, act);
++ 			case XDP_DROP:
++ 				nfp_net_rx_give_one(dp, rx_ring, rxbuf->frag,
++ 						    rxbuf->dma_addr);
++ 				continue;
++ 			}
++ 		}
++ 
++ 		skb = build_skb(rxbuf->frag, true_bufsz);
+++>>>>>>> 5cd4fbeab21b (nfp: make use of the DMA_ATTR_SKIP_CPU_SYNC attr)
+  		if (unlikely(!skb)) {
+ -			nfp_net_rx_drop(dp, r_vec, rx_ring, rxbuf, NULL);
+ +			nfp_net_rx_drop(r_vec, rx_ring, rxbuf, NULL);
+  			continue;
+  		}
+ -		new_frag = nfp_net_napi_alloc_one(dp, &new_dma_addr);
+ +
+ +		nfp_net_set_hash(nn->netdev, skb, rxd);
+ +
+ +		new_frag = nfp_net_napi_alloc_one(nn, &new_dma_addr);
+  		if (unlikely(!new_frag)) {
+ -			nfp_net_rx_drop(dp, r_vec, rx_ring, rxbuf, skb);
+ +			nfp_net_rx_drop(r_vec, rx_ring, rxbuf, skb);
+  			continue;
+  		}
+  
+ -		nfp_net_dma_unmap_rx(dp, rxbuf->dma_addr);
+ +		nfp_net_dma_unmap_rx(nn, rx_ring->rxbufs[idx].dma_addr,
+ +				     nn->fl_bufsz, DMA_FROM_DEVICE);
+  
+ -		nfp_net_rx_give_one(dp, rx_ring, new_frag, new_dma_addr);
+ +		nfp_net_rx_give_one(rx_ring, new_frag, new_dma_addr);
+  
+- 		skb_reserve(skb, data_off);
++ 		skb_reserve(skb, pkt_off);
+  		skb_put(skb, pkt_len);
+  
+ -		if (!dp->chained_metadata_format) {
+ -			nfp_net_set_hash_desc(dp->netdev, skb, meta, rxd);
+ -		} else if (meta_len) {
+ -			void *end;
+ -
+ -			end = nfp_net_parse_meta(dp->netdev, skb, meta,
+ -						 meta_len);
+ -			if (unlikely(end != meta + meta_len)) {
+ -				nn_dp_warn(dp, "invalid RX packet metadata\n");
+ -				nfp_net_rx_drop(dp, r_vec, rx_ring, NULL, skb);
+ -				continue;
+ -			}
+ -		}
+ +		nfp_net_set_hash_desc(nn->netdev, skb, rxd);
+  
+  		skb_record_rx_queue(skb, rx_ring->idx);
+ -		skb->protocol = eth_type_trans(skb, dp->netdev);
+ +		skb->protocol = eth_type_trans(skb, nn->netdev);
+  
+ -		nfp_net_rx_csum(dp, r_vec, rxd, skb);
+ +		nfp_net_rx_csum(nn, r_vec, rxd, skb);
+  
+  		if (rxd->rxd.flags & PCIE_DESC_RX_VLAN)
+  			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
