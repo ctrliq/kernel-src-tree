@@ -1,0 +1,168 @@
+mmc: sdio: Add API to manage SDIO IRQs from a workqueue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] sdio: Add API to manage SDIO IRQs from a workqueue (Gopal Tiwari) [1456570]
+Rebuild_FUZZ: 95.24%
+commit-author Ulf Hansson <ulf.hansson@linaro.org>
+commit 682696605c7093d2800c498c04166831e5aedf87
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/68269660.failed
+
+For hosts not supporting MMC_CAP2_SDIO_IRQ_NOTHREAD but MMC_CAP_SDIO_IRQ,
+the SDIO IRQs are processed from a dedicated kernel thread. For these
+cases, the host calls mmc_signal_sdio_irq() from its ISR to signal a new
+SDIO IRQ.
+
+Signaling an SDIO IRQ makes the host's ->enable_sdio_irq() callback to be
+invoked to temporary disable the IRQs, before the kernel thread is woken up
+to process it. When processing of the IRQs are completed, they are
+re-enabled by the kernel thread, again via invoking the host's
+->enable_sdio_irq().
+
+The observation from this, is that the execution path is being unnecessary
+complex, as the host driver already knows that it needs to temporary
+disable the IRQs before signaling a new one. Moreover, replacing the kernel
+thread with a work/workqueue would not only greatly simplify the code, but
+also make it more robust.
+
+To address the above problems, let's continue to build upon the support for
+MMC_CAP2_SDIO_IRQ_NOTHREAD, as it already implements SDIO IRQs to be
+processed without using the clumsy kernel thread and without the ping-pong
+calls of the host's ->enable_sdio_irq() callback for each processed IRQ.
+
+Therefore, let's add new API sdio_signal_irq(), which enables hosts to
+signal/process SDIO IRQs by using a work/workqueue, rather than using the
+kernel thread.
+
+Add also a new host callback ->ack_sdio_irq(), which the work invokes when
+the SDIO IRQs have been processed. This informs the host about when it
+shall re-enable the SDIO IRQs. Potentially, we could re-use the existing
+->enable_sdio_irq() callback instead of adding a new one, however it has
+turned out that it's more convenient for hosts to get this information via
+a separate callback.
+
+Hosts that wants to use this new method to signal/process SDIO IRQs, must
+enable MMC_CAP2_SDIO_IRQ_NOTHREAD and implement the ->ack_sdio_irq()
+callback.
+
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+	Tested-by: Douglas Anderson <dianders@chromium.org>
+	Reviewed-by: Douglas Anderson <dianders@chromium.org>
+(cherry picked from commit 682696605c7093d2800c498c04166831e5aedf87)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/host.c
+#	drivers/mmc/core/sdio_ops.h
+diff --cc drivers/mmc/core/host.c
+index 4a437a10b17c,8823c97a7b38..000000000000
+--- a/drivers/mmc/core/host.c
++++ b/drivers/mmc/core/host.c
+@@@ -29,6 -29,8 +29,11 @@@
+  #include "core.h"
+  #include "host.h"
+  #include "slot-gpio.h"
+++<<<<<<< HEAD
+++=======
++ #include "pwrseq.h"
++ #include "sdio_ops.h"
+++>>>>>>> 682696605c70 (mmc: sdio: Add API to manage SDIO IRQs from a workqueue)
+  
+  #define cls_dev_to_mmc_host(d)	container_of(d, struct mmc_host, class_dev)
+  
+diff --cc drivers/mmc/core/sdio_ops.h
+index 16a97d3ede85,96945cafbf0b..000000000000
+--- a/drivers/mmc/core/sdio_ops.h
++++ b/drivers/mmc/core/sdio_ops.h
+@@@ -12,14 -12,21 +12,26 @@@
+  #ifndef _MMC_SDIO_OPS_H
+  #define _MMC_SDIO_OPS_H
+  
+ -#include <linux/types.h>
+  #include <linux/mmc/sdio.h>
+  
+++<<<<<<< HEAD
+++=======
++ struct mmc_host;
++ struct mmc_card;
++ struct work_struct;
++ 
+++>>>>>>> 682696605c70 (mmc: sdio: Add API to manage SDIO IRQs from a workqueue)
+  int mmc_send_io_op_cond(struct mmc_host *host, u32 ocr, u32 *rocr);
+  int mmc_io_rw_direct(struct mmc_card *card, int write, unsigned fn,
+  	unsigned addr, u8 in, u8* out);
+  int mmc_io_rw_extended(struct mmc_card *card, int write, unsigned fn,
+  	unsigned addr, int incr_addr, u8 *buf, unsigned blocks, unsigned blksz);
+  int sdio_reset(struct mmc_host *host);
+++<<<<<<< HEAD
+++=======
++ unsigned int mmc_align_data_size(struct mmc_card *card, unsigned int sz);
++ void sdio_irq_work(struct work_struct *work);
+++>>>>>>> 682696605c70 (mmc: sdio: Add API to manage SDIO IRQs from a workqueue)
+  
+  static inline bool sdio_is_io_busy(u32 opcode, u32 arg)
+  {
+* Unmerged path drivers/mmc/core/host.c
+diff --git a/drivers/mmc/core/sdio_irq.c b/drivers/mmc/core/sdio_irq.c
+index 0be23535eafc..d2d3dec74c5d 100644
+--- a/drivers/mmc/core/sdio_irq.c
++++ b/drivers/mmc/core/sdio_irq.c
+@@ -95,11 +95,27 @@ void sdio_run_irqs(struct mmc_host *host)
+ 	if (host->sdio_irqs) {
+ 		host->sdio_irq_pending = true;
+ 		process_sdio_pending_irqs(host);
++		if (host->ops->ack_sdio_irq)
++			host->ops->ack_sdio_irq(host);
+ 	}
+ 	mmc_release_host(host);
+ }
+ EXPORT_SYMBOL_GPL(sdio_run_irqs);
+ 
++void sdio_irq_work(struct work_struct *work)
++{
++	struct mmc_host *host =
++		container_of(work, struct mmc_host, sdio_irq_work.work);
++
++	sdio_run_irqs(host);
++}
++
++void sdio_signal_irq(struct mmc_host *host)
++{
++	queue_delayed_work(system_wq, &host->sdio_irq_work, 0);
++}
++EXPORT_SYMBOL_GPL(sdio_signal_irq);
++
+ static int sdio_irq_thread(void *_host)
+ {
+ 	struct mmc_host *host = _host;
+* Unmerged path drivers/mmc/core/sdio_ops.h
+diff --git a/include/linux/mmc/host.h b/include/linux/mmc/host.h
+index dc8068704c1d..eb1b614a187b 100644
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@ -131,6 +131,7 @@ struct mmc_host_ops {
+ 	int	(*get_cd)(struct mmc_host *host);
+ 
+ 	void	(*enable_sdio_irq)(struct mmc_host *host, int enable);
++	void	(*ack_sdio_irq)(struct mmc_host *host);
+ 
+ 	/* optional callback for HC quirks */
+ 	void	(*init_card)(struct mmc_host *host, struct mmc_card *card);
+@@ -360,6 +361,7 @@ struct mmc_host {
+ 
+ 	unsigned int		sdio_irqs;
+ 	struct task_struct	*sdio_irq_thread;
++	struct delayed_work	sdio_irq_work;
+ 	bool			sdio_irq_pending;
+ 	atomic_t		sdio_irq_thread_abort;
+ 
+@@ -427,6 +429,7 @@ static inline void mmc_signal_sdio_irq(struct mmc_host *host)
+ }
+ 
+ void sdio_run_irqs(struct mmc_host *host);
++void sdio_signal_irq(struct mmc_host *host);
+ 
+ #ifdef CONFIG_REGULATOR
+ int mmc_regulator_get_ocrmask(struct regulator *supply);
