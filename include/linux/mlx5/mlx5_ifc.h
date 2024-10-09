@@ -953,7 +953,7 @@ struct mlx5_ifc_cmd_hca_cap_bits {
 	u8         reserved_at_2a0[0x10];
 	u8         max_wqe_sz_rq[0x10];
 
-	u8         reserved_at_2c0[0x10];
+	u8         max_flow_counter_31_16[0x10];
 	u8         max_wqe_sz_sq_dc[0x10];
 
 	u8         reserved_at_2e0[0x7];
@@ -971,7 +971,7 @@ struct mlx5_ifc_cmd_hca_cap_bits {
 
 	u8         reserved_at_340[0x8];
 	u8         log_max_flow_counter_bulk[0x8];
-	u8         max_flow_counter[0x10];
+	u8         max_flow_counter_15_0[0x10];
 
 
 	u8         reserved_at_360[0x3];
@@ -1060,8 +1060,7 @@ struct mlx5_ifc_dest_format_struct_bits {
 };
 
 struct mlx5_ifc_flow_counter_list_bits {
-	u8         reserved_at_0[0x10];
-	u8         flow_counter_id[0x10];
+	u8         flow_counter_id[0x20];
 
 	u8         reserved_at_20[0x20];
 };
@@ -4389,8 +4388,7 @@ struct mlx5_ifc_query_flow_counter_in_bits {
 	u8         reserved_at_c1[0xf];
 	u8         num_of_counters[0x10];
 
-	u8         reserved_at_e0[0x10];
-	u8         flow_counter_id[0x10];
+	u8         flow_counter_id[0x20];
 };
 
 struct mlx5_ifc_query_esw_vport_context_out_bits {
@@ -6281,8 +6279,7 @@ struct mlx5_ifc_dealloc_flow_counter_in_bits {
 	u8         reserved_at_20[0x10];
 	u8         op_mod[0x10];
 
-	u8         reserved_at_40[0x10];
-	u8         flow_counter_id[0x10];
+	u8         flow_counter_id[0x20];
 
 	u8         reserved_at_60[0x20];
 };
@@ -7107,8 +7104,7 @@ struct mlx5_ifc_alloc_flow_counter_out_bits {
 
 	u8         syndrome[0x20];
 
-	u8         reserved_at_40[0x10];
-	u8         flow_counter_id[0x10];
+	u8         flow_counter_id[0x20];
 
 	u8         reserved_at_60[0x20];
 };
