@@ -1,0 +1,257 @@
+swap: change block allocation algorithm for SSD
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Shaohua Li <shli@kernel.org>
+commit 2a8f9449343260373398d59228a62a4332ea513a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2a8f9449.failed
+
+I'm using a fast SSD to do swap.  scan_swap_map() sometimes uses up to
+20~30% CPU time (when cluster is hard to find, the CPU time can be up to
+80%), which becomes a bottleneck.  scan_swap_map() scans a byte array to
+search a 256 page cluster, which is very slow.
+
+Here I introduced a simple algorithm to search cluster.  Since we only
+care about 256 pages cluster, we can just use a counter to track if a
+cluster is free.  Every 256 pages use one int to store the counter.  If
+the counter of a cluster is 0, the cluster is free.  All free clusters
+will be added to a list, so searching cluster is very efficient.  With
+this, scap_swap_map() overhead disappears.
+
+This might help low end SD card swap too.  Because if the cluster is
+aligned, SD firmware can do flash erase more efficiently.
+
+We only enable the algorithm for SSD.  Hard disk swap isn't fast enough
+and has downside with the algorithm which might introduce regression (see
+below).
+
+The patch slightly changes which cluster is choosen.  It always adds free
+cluster to list tail.  This can help wear leveling for low end SSD too.
+And if no cluster found, the scan_swap_map() will do search from the end
+of last cluster.  So if no cluster found, the scan_swap_map() will do
+search from the end of last free cluster, which is random.  For SSD, this
+isn't a problem at all.
+
+Another downside is the cluster must be aligned to 256 pages, which will
+reduce the chance to find a cluster.  I would expect this isn't a big
+problem for SSD because of the non-seek penality.  (And this is the reason
+I only enable the algorithm for SSD).
+
+	Signed-off-by: Shaohua Li <shli@fusionio.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Kyungmin Park <kmpark@infradead.org>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Rafael Aquini <aquini@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 2a8f9449343260373398d59228a62a4332ea513a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/swapfile.c
+diff --cc mm/swapfile.c
+index 44c2eac6b890,d1fbeb486de5..000000000000
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@@ -333,11 -464,9 +482,12 @@@ checks
+  	if (si->inuse_pages == si->pages) {
+  		si->lowest_bit = si->max;
+  		si->highest_bit = 0;
+ +		spin_lock(&swap_avail_lock);
+ +		plist_del(&si->avail_list, &swap_avail_head);
+ +		spin_unlock(&swap_avail_lock);
+  	}
+  	si->swap_map[offset] = usage;
++ 	inc_cluster_info_page(si, si->cluster_info, offset);
+  	si->cluster_next = offset + 1;
+  	si->flags -= SWP_SCANNING;
+  
+@@@ -595,20 -750,12 +745,21 @@@ static unsigned char swap_entry_free(st
+  
+  	/* free if no reference */
+  	if (!usage) {
++ 		dec_cluster_info_page(p, p->cluster_info, offset);
+  		if (offset < p->lowest_bit)
+  			p->lowest_bit = offset;
+ -		if (offset > p->highest_bit)
+ +		if (offset > p->highest_bit) {
+ +			bool was_full = !p->highest_bit;
+  			p->highest_bit = offset;
+ -		set_highest_priority_index(p->type);
+ +			if (was_full && (p->flags & SWP_WRITEOK)) {
+ +				spin_lock(&swap_avail_lock);
+ +				WARN_ON(!plist_node_empty(&p->avail_list));
+ +				if (plist_node_empty(&p->avail_list))
+ +					plist_add(&p->avail_list,
+ +						  &swap_avail_head);
+ +				spin_unlock(&swap_avail_lock);
+ +			}
+ +		}
+  		atomic_long_inc(&nr_swap_pages);
+  		p->inuse_pages--;
+  		frontswap_invalidate_page(p->type, offset);
+@@@ -1528,19 -1675,17 +1679,21 @@@ static int setup_swap_extents(struct sw
+  }
+  
+  static void _enable_swap_info(struct swap_info_struct *p, int prio,
+- 				unsigned char *swap_map)
++ 				unsigned char *swap_map,
++ 				struct swap_cluster_info *cluster_info)
+  {
+ -	int i, prev;
+ -
+  	if (prio >= 0)
+  		p->prio = prio;
+  	else
+  		p->prio = --least_priority;
+ +	/*
+ +	 * the plist prio is negated because plist ordering is
+ +	 * low-to-high, while swap ordering is high-to-low
+ +	 */
+ +	p->list.prio = -p->prio;
+ +	p->avail_list.prio = -p->prio;
+  	p->swap_map = swap_map;
++ 	p->cluster_info = cluster_info;
+  	p->flags |= SWP_WRITEOK;
+  	atomic_long_add(p->pages, &nr_swap_pages);
+  	total_swap_pages += p->pages;
+@@@ -1690,12 -1837,13 +1847,13 @@@ SYSCALL_DEFINE1(swapoff, const char __u
+  	frontswap_map_set(p, NULL);
+  	spin_unlock(&p->lock);
+  	spin_unlock(&swap_lock);
+ -	frontswap_invalidate_area(type);
+ +	frontswap_invalidate_area(p->type);
+  	mutex_unlock(&swapon_mutex);
+  	vfree(swap_map);
++ 	vfree(cluster_info);
+  	vfree(frontswap_map);
+  	/* Destroy swap account informatin */
+ -	swap_cgroup_swapoff(type);
+ +	swap_cgroup_swapoff(p->type);
+  
+  	inode = mapping->host;
+  	if (S_ISBLK(inode->i_mode)) {
+@@@ -2158,41 -2370,33 +2376,55 @@@ SYSCALL_DEFINE2(swapon, const char __us
+  	if (frontswap_enabled)
+  		frontswap_map = vzalloc(BITS_TO_LONGS(maxpages) * sizeof(long));
+  
+- 	if (p->bdev) {
+- 		if (blk_queue_nonrot(bdev_get_queue(p->bdev))) {
+- 			p->flags |= SWP_SOLIDSTATE;
+- 			p->cluster_next = 1 + (prandom_u32() % p->highest_bit);
+- 		}
++ 	if (p->bdev &&(swap_flags & SWAP_FLAG_DISCARD) && swap_discardable(p)) {
++ 		/*
++ 		 * When discard is enabled for swap with no particular
++ 		 * policy flagged, we set all swap discard flags here in
++ 		 * order to sustain backward compatibility with older
++ 		 * swapon(8) releases.
++ 		 */
++ 		p->flags |= (SWP_DISCARDABLE | SWP_AREA_DISCARD |
++ 			     SWP_PAGE_DISCARD);
+  
+- 		if ((swap_flags & SWAP_FLAG_DISCARD) && swap_discardable(p)) {
+- 			/*
+- 			 * When discard is enabled for swap with no particular
+- 			 * policy flagged, we set all swap discard flags here in
+- 			 * order to sustain backward compatibility with older
+- 			 * swapon(8) releases.
+- 			 */
+- 			p->flags |= (SWP_DISCARDABLE | SWP_AREA_DISCARD |
+- 				     SWP_PAGE_DISCARD);
++ 		/*
++ 		 * By flagging sys_swapon, a sysadmin can tell us to
++ 		 * either do single-time area discards only, or to just
++ 		 * perform discards for released swap page-clusters.
++ 		 * Now it's time to adjust the p->flags accordingly.
++ 		 */
++ 		if (swap_flags & SWAP_FLAG_DISCARD_ONCE)
++ 			p->flags &= ~SWP_PAGE_DISCARD;
++ 		else if (swap_flags & SWAP_FLAG_DISCARD_PAGES)
++ 			p->flags &= ~SWP_AREA_DISCARD;
+  
+++<<<<<<< HEAD
+ +			/*
+ +			 * By flagging sys_swapon, a sysadmin can tell us to
+ +			 * either do single-time area discards only, or to just
+ +			 * perform discards for released swap page-clusters.
+ +			 * Now it's time to adjust the p->flags accordingly.
+ +			 */
+ +			if (swap_flags & SWAP_FLAG_DISCARD_ONCE)
+ +				p->flags &= ~SWP_PAGE_DISCARD;
+ +			else if (swap_flags & SWAP_FLAG_DISCARD_PAGES)
+ +				p->flags &= ~SWP_AREA_DISCARD;
+ +
+ +			/* issue a swapon-time discard if it's still required */
+ +			if (p->flags & SWP_AREA_DISCARD) {
+ +				int err = discard_swap(p);
+ +				if (unlikely(err))
+ +					printk(KERN_ERR
+ +					       "swapon: discard_swap(%p): %d\n",
+ +						p, err);
+ +			}
+++=======
++ 		/* issue a swapon-time discard if it's still required */
++ 		if (p->flags & SWP_AREA_DISCARD) {
++ 			int err = discard_swap(p);
++ 			if (unlikely(err))
++ 				pr_err("swapon: discard_swap(%p): %d\n",
++ 					p, err);
+++>>>>>>> 2a8f94493432 (swap: change block allocation algorithm for SSD)
+  		}
+  	}
+  
+@@@ -2201,9 -2405,9 +2433,9 @@@
+  	if (swap_flags & SWAP_FLAG_PREFER)
+  		prio =
+  		  (swap_flags & SWAP_FLAG_PRIO_MASK) >> SWAP_FLAG_PRIO_SHIFT;
+- 	enable_swap_info(p, prio, swap_map, frontswap_map);
++ 	enable_swap_info(p, prio, swap_map, cluster_info, frontswap_map);
+  
+ -	pr_info("Adding %uk swap on %s.  "
+ +	printk(KERN_INFO "Adding %uk swap on %s.  "
+  			"Priority:%d extents:%d across:%lluk %s%s%s%s%s\n",
+  		p->pages<<(PAGE_SHIFT-10), name->name, p->prio,
+  		nr_extents, (unsigned long long)span<<(PAGE_SHIFT-10),
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 61d41d507b58..1dc1e588a30e 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -195,6 +195,23 @@ enum {
+ #define COUNT_CONTINUED	0x80	/* See swap_map continuation for full count */
+ #define SWAP_MAP_SHMEM	0xbf	/* Owned by shmem/tmpfs, in first swap_map */
+ 
++/*
++ * We use this to track usage of a cluster. A cluster is a block of swap disk
++ * space with SWAPFILE_CLUSTER pages long and naturally aligns in disk. All
++ * free clusters are organized into a list. We fetch an entry from the list to
++ * get a free cluster.
++ *
++ * The data field stores next cluster if the cluster is free or cluster usage
++ * counter otherwise. The flags field determines if a cluster is free. This is
++ * protected by swap_info_struct.lock.
++ */
++struct swap_cluster_info {
++	unsigned int data:24;
++	unsigned int flags:8;
++};
++#define CLUSTER_FLAG_FREE 1 /* This cluster is free */
++#define CLUSTER_FLAG_NEXT_NULL 2 /* This cluster has no next cluster */
++
+ /*
+  * The in-memory structure used to track swap areas.
+  */
+@@ -205,6 +222,9 @@ struct swap_info_struct {
+ 	signed char     next;           /* unused: kept for kABI */
+ 	unsigned int	max;		/* extent of the swap_map */
+ 	unsigned char *swap_map;	/* vmalloc'ed array of usage counts */
++	struct swap_cluster_info *cluster_info; /* cluster info. Only for SSD */
++	struct swap_cluster_info free_cluster_head; /* free cluster list head */
++	struct swap_cluster_info free_cluster_tail; /* free cluster list tail */
+ 	unsigned int lowest_bit;	/* index of first free in swap_map */
+ 	unsigned int highest_bit;	/* index of last free in swap_map */
+ 	unsigned int pages;		/* total of usable pages of swap */
+* Unmerged path mm/swapfile.c
