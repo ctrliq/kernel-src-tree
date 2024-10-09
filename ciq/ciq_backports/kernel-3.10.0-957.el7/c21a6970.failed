@@ -1,0 +1,742 @@
+ipc/shm: introduce shmctl(SHM_STAT_ANY)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [ipc] shm: introduce shmctl(SHM_STAT_ANY) (Joe Lawrence) [1579402]
+Rebuild_FUZZ: 94.59%
+commit-author Davidlohr Bueso <dave@stgolabs.net>
+commit c21a6970ae727839a2f300cd8dd957de0d0238c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/c21a6970.failed
+
+Patch series "sysvipc: introduce STAT_ANY commands", v2.
+
+The following patches adds the discussed (see [1]) new command for shm
+as well as for sems and msq as they are subject to the same
+discrepancies for ipc object permission checks between the syscall and
+via procfs.  These new commands are justified in that (1) we are stuck
+with this semantics as changing syscall and procfs can break userland;
+and (2) some users can benefit from performance (for large amounts of
+shm segments, for example) from not having to parse the procfs
+interface.
+
+Once merged, I will submit the necesary manpage updates.  But I'm thinking
+something like:
+
+: diff --git a/man2/shmctl.2 b/man2/shmctl.2
+: index 7bb503999941..bb00bbe21a57 100644
+: --- a/man2/shmctl.2
+: +++ b/man2/shmctl.2
+: @@ -41,6 +41,7 @@
+:  .\" 2005-04-25, mtk -- noted aberrant Linux behavior w.r.t. new
+:  .\"	attaches to a segment that has already been marked for deletion.
+:  .\" 2005-08-02, mtk: Added IPC_INFO, SHM_INFO, SHM_STAT descriptions.
+: +.\" 2018-02-13, dbueso: Added SHM_STAT_ANY description.
+:  .\"
+:  .TH SHMCTL 2 2017-09-15 "Linux" "Linux Programmer's Manual"
+:  .SH NAME
+: @@ -242,6 +243,18 @@ However, the
+:  argument is not a segment identifier, but instead an index into
+:  the kernel's internal array that maintains information about
+:  all shared memory segments on the system.
+: +.TP
+: +.BR SHM_STAT_ANY " (Linux-specific)"
+: +Return a
+: +.I shmid_ds
+: +structure as for
+: +.BR SHM_STAT .
+: +However, the
+: +.I shm_perm.mode
+: +is not checked for read access for
+: +.IR shmid ,
+: +resembing the behaviour of
+: +/proc/sysvipc/shm.
+:  .PP
+:  The caller can prevent or allow swapping of a shared
+:  memory segment with the following \fIcmd\fP values:
+: @@ -287,7 +300,7 @@ operation returns the index of the highest used entry in the
+:  kernel's internal array recording information about all
+:  shared memory segments.
+:  (This information can be used with repeated
+: -.B SHM_STAT
+: +.B SHM_STAT/SHM_STAT_ANY
+:  operations to obtain information about all shared memory segments
+:  on the system.)
+:  A successful
+: @@ -328,7 +341,7 @@ isn't accessible.
+:  \fIshmid\fP is not a valid identifier, or \fIcmd\fP
+:  is not a valid command.
+:  Or: for a
+: -.B SHM_STAT
+: +.B SHM_STAT/SHM_STAT_ANY
+:  operation, the index value specified in
+:  .I shmid
+:  referred to an array slot that is currently unused.
+
+This patch (of 3):
+
+There is a permission discrepancy when consulting shm ipc object metadata
+between /proc/sysvipc/shm (0444) and the SHM_STAT shmctl command.  The
+later does permission checks for the object vs S_IRUGO.  As such there can
+be cases where EACCESS is returned via syscall but the info is displayed
+anyways in the procfs files.
+
+While this might have security implications via info leaking (albeit no
+writing to the shm metadata), this behavior goes way back and showing all
+the objects regardless of the permissions was most likely an overlook - so
+we are stuck with it.  Furthermore, modifying either the syscall or the
+procfs file can cause userspace programs to break (ie ipcs).  Some
+applications require getting the procfs info (without root privileges) and
+can be rather slow in comparison with a syscall -- up to 500x in some
+reported cases.
+
+This patch introduces a new SHM_STAT_ANY command such that the shm ipc
+object permissions are ignored, and only audited instead.  In addition,
+I've left the lsm security hook checks in place, as if some policy can
+block the call, then the user has no other choice than just parsing the
+procfs file.
+
+[1] https://lkml.org/lkml/2017/12/19/220
+
+Link: http://lkml.kernel.org/r/20180215162458.10059-2-dave@stgolabs.net
+	Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: Michael Kerrisk <mtk.manpages@gmail.com>
+	Cc: Manfred Spraul <manfred@colorfullife.com>
+	Cc: Eric W. Biederman <ebiederm@xmission.com>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Robert Kettler <robert.kettler@outlook.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c21a6970ae727839a2f300cd8dd957de0d0238c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	ipc/shm.c
+diff --cc ipc/shm.c
+index aec05c216381,1a28b6a96449..000000000000
+--- a/ipc/shm.c
++++ b/ipc/shm.c
+@@@ -834,117 -898,188 +834,152 @@@ out_up
+  	return err;
+  }
+  
+ -static int shmctl_ipc_info(struct ipc_namespace *ns,
+ -			   struct shminfo64 *shminfo)
+ +static int shmctl_nolock(struct ipc_namespace *ns, int shmid,
+ +			 int cmd, int version, void __user *buf)
+  {
+ -	int err = security_shm_shmctl(NULL, IPC_INFO);
+ -	if (!err) {
+ -		memset(shminfo, 0, sizeof(*shminfo));
+ -		shminfo->shmmni = shminfo->shmseg = ns->shm_ctlmni;
+ -		shminfo->shmmax = ns->shm_ctlmax;
+ -		shminfo->shmall = ns->shm_ctlall;
+ -		shminfo->shmmin = SHMMIN;
+ -		down_read(&shm_ids(ns).rwsem);
+ -		err = ipc_get_maxid(&shm_ids(ns));
+ -		up_read(&shm_ids(ns).rwsem);
+ -		if (err < 0)
+ -			err = 0;
+ -	}
+ -	return err;
+ -}
+ +	int err;
+ +	struct shmid_kernel *shp;
+  
+ -static int shmctl_shm_info(struct ipc_namespace *ns,
+ -			   struct shm_info *shm_info)
+ -{
+ -	int err = security_shm_shmctl(NULL, SHM_INFO);
+ -	if (!err) {
+ -		memset(shm_info, 0, sizeof(*shm_info));
+ -		down_read(&shm_ids(ns).rwsem);
+ -		shm_info->used_ids = shm_ids(ns).in_use;
+ -		shm_get_stat(ns, &shm_info->shm_rss, &shm_info->shm_swp);
+ -		shm_info->shm_tot = ns->shm_tot;
+ -		shm_info->swap_attempts = 0;
+ -		shm_info->swap_successes = 0;
+ -		err = ipc_get_maxid(&shm_ids(ns));
+ -		up_read(&shm_ids(ns).rwsem);
+ -		if (err < 0)
+ -			err = 0;
+++<<<<<<< HEAD
+ +	/* preliminary security checks for *_INFO */
+ +	if (cmd == IPC_INFO || cmd == SHM_INFO) {
+ +		err = security_shm_shmctl(NULL, cmd);
+ +		if (err)
+ +			return err;
+  	}
+ -	return err;
+ -}
+ -
+ -static int shmctl_stat(struct ipc_namespace *ns, int shmid,
+ -			int cmd, struct shmid64_ds *tbuf)
+ -{
+ -	struct shmid_kernel *shp;
+ -	int id = 0;
+ -	int err;
+  
+ +	switch (cmd) {
+ +	case IPC_INFO:
+ +	{
+ +		struct shminfo64 shminfo;
+++=======
++ 	memset(tbuf, 0, sizeof(*tbuf));
++ 
++ 	rcu_read_lock();
++ 	if (cmd == SHM_STAT || cmd == SHM_STAT_ANY) {
++ 		shp = shm_obtain_object(ns, shmid);
++ 		if (IS_ERR(shp)) {
++ 			err = PTR_ERR(shp);
++ 			goto out_unlock;
++ 		}
++ 		id = shp->shm_perm.id;
++ 	} else { /* IPC_STAT */
++ 		shp = shm_obtain_object_check(ns, shmid);
++ 		if (IS_ERR(shp)) {
++ 			err = PTR_ERR(shp);
++ 			goto out_unlock;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * Semantically SHM_STAT_ANY ought to be identical to
++ 	 * that functionality provided by the /proc/sysvipc/
++ 	 * interface. As such, only audit these calls and
++ 	 * do not do traditional S_IRUGO permission checks on
++ 	 * the ipc object.
++ 	 */
++ 	if (cmd == SHM_STAT_ANY)
++ 		audit_ipc_obj(&shp->shm_perm);
++ 	else {
++ 		err = -EACCES;
++ 		if (ipcperms(ns, &shp->shm_perm, S_IRUGO))
++ 			goto out_unlock;
++ 	}
+++>>>>>>> c21a6970ae72 (ipc/shm: introduce shmctl(SHM_STAT_ANY))
+  
+ -	err = security_shm_shmctl(&shp->shm_perm, cmd);
+ -	if (err)
+ -		goto out_unlock;
+ -
+ -	ipc_lock_object(&shp->shm_perm);
+ +		memset(&shminfo, 0, sizeof(shminfo));
+ +		shminfo.shmmni = shminfo.shmseg = ns->shm_ctlmni;
+ +		shminfo.shmmax = ns->shm_ctlmax;
+ +		shminfo.shmall = ns->shm_ctlall;
+  
+ -	if (!ipc_valid_object(&shp->shm_perm)) {
+ -		ipc_unlock_object(&shp->shm_perm);
+ -		err = -EIDRM;
+ -		goto out_unlock;
+ -	}
+ -
+ -	kernel_to_ipc64_perm(&shp->shm_perm, &tbuf->shm_perm);
+ -	tbuf->shm_segsz	= shp->shm_segsz;
+ -	tbuf->shm_atime	= shp->shm_atim;
+ -	tbuf->shm_dtime	= shp->shm_dtim;
+ -	tbuf->shm_ctime	= shp->shm_ctim;
+ -	tbuf->shm_cpid	= pid_vnr(shp->shm_cprid);
+ -	tbuf->shm_lpid	= pid_vnr(shp->shm_lprid);
+ -	tbuf->shm_nattch = shp->shm_nattch;
+ -
+ -	ipc_unlock_object(&shp->shm_perm);
+ -	rcu_read_unlock();
+ -	return id;
+ -
+ -out_unlock:
+ -	rcu_read_unlock();
+ -	return err;
+ -}
+ +		shminfo.shmmin = SHMMIN;
+ +		if(copy_shminfo_to_user (buf, &shminfo, version))
+ +			return -EFAULT;
+  
+ -static int shmctl_do_lock(struct ipc_namespace *ns, int shmid, int cmd)
+ -{
+ -	struct shmid_kernel *shp;
+ -	struct file *shm_file;
+ -	int err;
+ +		down_read(&shm_ids(ns).rwsem);
+ +		err = ipc_get_maxid(&shm_ids(ns));
+ +		up_read(&shm_ids(ns).rwsem);
+  
+ -	rcu_read_lock();
+ -	shp = shm_obtain_object_check(ns, shmid);
+ -	if (IS_ERR(shp)) {
+ -		err = PTR_ERR(shp);
+ -		goto out_unlock1;
+ +		if(err<0)
+ +			err = 0;
+ +		goto out;
+  	}
+ +	case SHM_INFO:
+ +	{
+ +		struct shm_info shm_info;
+  
+ -	audit_ipc_obj(&(shp->shm_perm));
+ -	err = security_shm_shmctl(&shp->shm_perm, cmd);
+ -	if (err)
+ -		goto out_unlock1;
+ -
+ -	ipc_lock_object(&shp->shm_perm);
+ +		memset(&shm_info, 0, sizeof(shm_info));
+ +		down_read(&shm_ids(ns).rwsem);
+ +		shm_info.used_ids = shm_ids(ns).in_use;
+ +		shm_get_stat (ns, &shm_info.shm_rss, &shm_info.shm_swp);
+ +		shm_info.shm_tot = ns->shm_tot;
+ +		shm_info.swap_attempts = 0;
+ +		shm_info.swap_successes = 0;
+ +		err = ipc_get_maxid(&shm_ids(ns));
+ +		up_read(&shm_ids(ns).rwsem);
+ +		if (copy_to_user(buf, &shm_info, sizeof(shm_info))) {
+ +			err = -EFAULT;
+ +			goto out;
+ +		}
+  
+ -	/* check if shm_destroy() is tearing down shp */
+ -	if (!ipc_valid_object(&shp->shm_perm)) {
+ -		err = -EIDRM;
+ -		goto out_unlock0;
+ +		err = err < 0 ? 0 : err;
+ +		goto out;
+  	}
+ -
+ -	if (!ns_capable(ns->user_ns, CAP_IPC_LOCK)) {
+ -		kuid_t euid = current_euid();
+ -
+ -		if (!uid_eq(euid, shp->shm_perm.uid) &&
+ -		    !uid_eq(euid, shp->shm_perm.cuid)) {
+ -			err = -EPERM;
+ -			goto out_unlock0;
+ -		}
+ -		if (cmd == SHM_LOCK && !rlimit(RLIMIT_MEMLOCK)) {
+ -			err = -EPERM;
+ -			goto out_unlock0;
+ +	case SHM_STAT:
+ +	case IPC_STAT:
+ +	{
+ +		struct shmid64_ds tbuf;
+ +		int result;
+ +
+ +		rcu_read_lock();
+ +		if (cmd == SHM_STAT) {
+ +			shp = shm_obtain_object(ns, shmid);
+ +			if (IS_ERR(shp)) {
+ +				err = PTR_ERR(shp);
+ +				goto out_unlock;
+ +			}
+ +			result = shp->shm_perm.id;
+ +		} else {
+ +			shp = shm_obtain_object_check(ns, shmid);
+ +			if (IS_ERR(shp)) {
+ +				err = PTR_ERR(shp);
+ +				goto out_unlock;
+ +			}
+ +			result = 0;
+  		}
+ -	}
+  
+ -	shm_file = shp->shm_file;
+ -	if (is_file_hugepages(shm_file))
+ -		goto out_unlock0;
+ +		err = -EACCES;
+ +		if (ipcperms(ns, &shp->shm_perm, S_IRUGO))
+ +			goto out_unlock;
+  
+ -	if (cmd == SHM_LOCK) {
+ -		struct user_struct *user = current_user();
+ +		err = security_shm_shmctl(shp, cmd);
+ +		if (err)
+ +			goto out_unlock;
+  
+ -		err = shmem_lock(shm_file, 1, user);
+ -		if (!err && !(shp->shm_perm.mode & SHM_LOCKED)) {
+ -			shp->shm_perm.mode |= SHM_LOCKED;
+ -			shp->mlock_user = user;
+ -		}
+ -		goto out_unlock0;
+ +		memset(&tbuf, 0, sizeof(tbuf));
+ +		kernel_to_ipc64_perm(&shp->shm_perm, &tbuf.shm_perm);
+ +		tbuf.shm_segsz	= shp->shm_segsz;
+ +		tbuf.shm_atime	= shp->shm_atim;
+ +		tbuf.shm_dtime	= shp->shm_dtim;
+ +		tbuf.shm_ctime	= shp->shm_ctim;
+ +		tbuf.shm_cpid	= shp->shm_cprid;
+ +		tbuf.shm_lpid	= shp->shm_lprid;
+ +		tbuf.shm_nattch	= shp->shm_nattch;
+ +		rcu_read_unlock();
+ +
+ +		if (copy_shmid_to_user(buf, &tbuf, version))
+ +			err = -EFAULT;
+ +		else
+ +			err = result;
+ +		goto out;
+ +	}
+ +	default:
+ +		return -EINVAL;
+  	}
+  
+ -	/* SHM_UNLOCK */
+ -	if (!(shp->shm_perm.mode & SHM_LOCKED))
+ -		goto out_unlock0;
+ -	shmem_lock(shm_file, 0, shp->mlock_user);
+ -	shp->shm_perm.mode &= ~SHM_LOCKED;
+ -	shp->mlock_user = NULL;
+ -	get_file(shm_file);
+ -	ipc_unlock_object(&shp->shm_perm);
+ -	rcu_read_unlock();
+ -	shmem_unlock_mapping(shm_file->f_mapping);
+ -
+ -	fput(shm_file);
+ -	return err;
+ -
+ -out_unlock0:
+ -	ipc_unlock_object(&shp->shm_perm);
+ -out_unlock1:
+ +out_unlock:
+  	rcu_read_unlock();
+ +out:
+  	return err;
+  }
+  
+@@@ -961,80 -1096,223 +996,275 @@@ SYSCALL_DEFINE3(shmctl, int, shmid, int
+  	ns = current->nsproxy->ipc_ns;
+  
+  	switch (cmd) {
+ -	case IPC_INFO: {
+ -		struct shminfo64 shminfo;
+ -		err = shmctl_ipc_info(ns, &shminfo);
+ -		if (err < 0)
+ -			return err;
+ -		if (copy_shminfo_to_user(buf, &shminfo, version))
+ -			err = -EFAULT;
+ -		return err;
+ -	}
+ -	case SHM_INFO: {
+ -		struct shm_info shm_info;
+ -		err = shmctl_shm_info(ns, &shm_info);
+ -		if (err < 0)
+ -			return err;
+ -		if (copy_to_user(buf, &shm_info, sizeof(shm_info)))
+ -			err = -EFAULT;
+ -		return err;
+ -	}
+ +	case IPC_INFO:
+ +	case SHM_INFO:
+  	case SHM_STAT:
+++<<<<<<< HEAD
+ +	case IPC_STAT:
+ +		return shmctl_nolock(ns, shmid, cmd, version, buf);
+++=======
++ 	case SHM_STAT_ANY:
++ 	case IPC_STAT: {
++ 		err = shmctl_stat(ns, shmid, cmd, &sem64);
++ 		if (err < 0)
++ 			return err;
++ 		if (copy_shmid_to_user(buf, &sem64, version))
++ 			err = -EFAULT;
++ 		return err;
++ 	}
++ 	case IPC_SET:
++ 		if (copy_shmid_from_user(&sem64, buf, version))
++ 			return -EFAULT;
++ 		/* fallthru */
++ 	case IPC_RMID:
++ 		return shmctl_down(ns, shmid, cmd, &sem64);
++ 	case SHM_LOCK:
++ 	case SHM_UNLOCK:
++ 		return shmctl_do_lock(ns, shmid, cmd);
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
++ SYSCALL_DEFINE3(shmctl, int, shmid, int, cmd, struct shmid_ds __user *, buf)
++ {
++ 	return ksys_shmctl(shmid, cmd, buf);
++ }
++ 
++ #ifdef CONFIG_COMPAT
++ 
++ struct compat_shmid_ds {
++ 	struct compat_ipc_perm shm_perm;
++ 	int shm_segsz;
++ 	compat_time_t shm_atime;
++ 	compat_time_t shm_dtime;
++ 	compat_time_t shm_ctime;
++ 	compat_ipc_pid_t shm_cpid;
++ 	compat_ipc_pid_t shm_lpid;
++ 	unsigned short shm_nattch;
++ 	unsigned short shm_unused;
++ 	compat_uptr_t shm_unused2;
++ 	compat_uptr_t shm_unused3;
++ };
++ 
++ struct compat_shminfo64 {
++ 	compat_ulong_t shmmax;
++ 	compat_ulong_t shmmin;
++ 	compat_ulong_t shmmni;
++ 	compat_ulong_t shmseg;
++ 	compat_ulong_t shmall;
++ 	compat_ulong_t __unused1;
++ 	compat_ulong_t __unused2;
++ 	compat_ulong_t __unused3;
++ 	compat_ulong_t __unused4;
++ };
++ 
++ struct compat_shm_info {
++ 	compat_int_t used_ids;
++ 	compat_ulong_t shm_tot, shm_rss, shm_swp;
++ 	compat_ulong_t swap_attempts, swap_successes;
++ };
++ 
++ static int copy_compat_shminfo_to_user(void __user *buf, struct shminfo64 *in,
++ 					int version)
++ {
++ 	if (in->shmmax > INT_MAX)
++ 		in->shmmax = INT_MAX;
++ 	if (version == IPC_64) {
++ 		struct compat_shminfo64 info;
++ 		memset(&info, 0, sizeof(info));
++ 		info.shmmax = in->shmmax;
++ 		info.shmmin = in->shmmin;
++ 		info.shmmni = in->shmmni;
++ 		info.shmseg = in->shmseg;
++ 		info.shmall = in->shmall;
++ 		return copy_to_user(buf, &info, sizeof(info));
++ 	} else {
++ 		struct shminfo info;
++ 		memset(&info, 0, sizeof(info));
++ 		info.shmmax = in->shmmax;
++ 		info.shmmin = in->shmmin;
++ 		info.shmmni = in->shmmni;
++ 		info.shmseg = in->shmseg;
++ 		info.shmall = in->shmall;
++ 		return copy_to_user(buf, &info, sizeof(info));
++ 	}
++ }
++ 
++ static int put_compat_shm_info(struct shm_info *ip,
++ 				struct compat_shm_info __user *uip)
++ {
++ 	struct compat_shm_info info;
++ 
++ 	memset(&info, 0, sizeof(info));
++ 	info.used_ids = ip->used_ids;
++ 	info.shm_tot = ip->shm_tot;
++ 	info.shm_rss = ip->shm_rss;
++ 	info.shm_swp = ip->shm_swp;
++ 	info.swap_attempts = ip->swap_attempts;
++ 	info.swap_successes = ip->swap_successes;
++ 	return copy_to_user(uip, &info, sizeof(info));
++ }
++ 
++ static int copy_compat_shmid_to_user(void __user *buf, struct shmid64_ds *in,
++ 					int version)
++ {
++ 	if (version == IPC_64) {
++ 		struct compat_shmid64_ds v;
++ 		memset(&v, 0, sizeof(v));
++ 		to_compat_ipc64_perm(&v.shm_perm, &in->shm_perm);
++ 		v.shm_atime = in->shm_atime;
++ 		v.shm_dtime = in->shm_dtime;
++ 		v.shm_ctime = in->shm_ctime;
++ 		v.shm_segsz = in->shm_segsz;
++ 		v.shm_nattch = in->shm_nattch;
++ 		v.shm_cpid = in->shm_cpid;
++ 		v.shm_lpid = in->shm_lpid;
++ 		return copy_to_user(buf, &v, sizeof(v));
++ 	} else {
++ 		struct compat_shmid_ds v;
++ 		memset(&v, 0, sizeof(v));
++ 		to_compat_ipc_perm(&v.shm_perm, &in->shm_perm);
++ 		v.shm_perm.key = in->shm_perm.key;
++ 		v.shm_atime = in->shm_atime;
++ 		v.shm_dtime = in->shm_dtime;
++ 		v.shm_ctime = in->shm_ctime;
++ 		v.shm_segsz = in->shm_segsz;
++ 		v.shm_nattch = in->shm_nattch;
++ 		v.shm_cpid = in->shm_cpid;
++ 		v.shm_lpid = in->shm_lpid;
++ 		return copy_to_user(buf, &v, sizeof(v));
++ 	}
++ }
++ 
++ static int copy_compat_shmid_from_user(struct shmid64_ds *out, void __user *buf,
++ 					int version)
++ {
++ 	memset(out, 0, sizeof(*out));
++ 	if (version == IPC_64) {
++ 		struct compat_shmid64_ds __user *p = buf;
++ 		return get_compat_ipc64_perm(&out->shm_perm, &p->shm_perm);
++ 	} else {
++ 		struct compat_shmid_ds __user *p = buf;
++ 		return get_compat_ipc_perm(&out->shm_perm, &p->shm_perm);
++ 	}
++ }
++ 
++ long compat_ksys_shmctl(int shmid, int cmd, void __user *uptr)
++ {
++ 	struct ipc_namespace *ns;
++ 	struct shmid64_ds sem64;
++ 	int version = compat_ipc_parse_version(&cmd);
++ 	int err;
++ 
++ 	ns = current->nsproxy->ipc_ns;
++ 
++ 	if (cmd < 0 || shmid < 0)
++ 		return -EINVAL;
++ 
++ 	switch (cmd) {
++ 	case IPC_INFO: {
++ 		struct shminfo64 shminfo;
++ 		err = shmctl_ipc_info(ns, &shminfo);
++ 		if (err < 0)
++ 			return err;
++ 		if (copy_compat_shminfo_to_user(uptr, &shminfo, version))
++ 			err = -EFAULT;
++ 		return err;
++ 	}
++ 	case SHM_INFO: {
++ 		struct shm_info shm_info;
++ 		err = shmctl_shm_info(ns, &shm_info);
++ 		if (err < 0)
++ 			return err;
++ 		if (put_compat_shm_info(&shm_info, uptr))
++ 			err = -EFAULT;
++ 		return err;
++ 	}
++ 	case IPC_STAT:
++ 	case SHM_STAT_ANY:
++ 	case SHM_STAT:
++ 		err = shmctl_stat(ns, shmid, cmd, &sem64);
++ 		if (err < 0)
++ 			return err;
++ 		if (copy_compat_shmid_to_user(uptr, &sem64, version))
++ 			err = -EFAULT;
++ 		return err;
++ 
++ 	case IPC_SET:
++ 		if (copy_compat_shmid_from_user(&sem64, uptr, version))
++ 			return -EFAULT;
++ 		/* fallthru */
+++>>>>>>> c21a6970ae72 (ipc/shm: introduce shmctl(SHM_STAT_ANY))
+  	case IPC_RMID:
+ -		return shmctl_down(ns, shmid, cmd, &sem64);
+ +	case IPC_SET:
+ +		return shmctl_down(ns, shmid, cmd, buf, version);
+  	case SHM_LOCK:
+  	case SHM_UNLOCK:
+ -		return shmctl_do_lock(ns, shmid, cmd);
+ -		break;
+ +	{
+ +		struct file *shm_file;
+ +
+ +		rcu_read_lock();
+ +		shp = shm_obtain_object_check(ns, shmid);
+ +		if (IS_ERR(shp)) {
+ +			err = PTR_ERR(shp);
+ +			goto out_unlock1;
+ +		}
+ +
+ +		audit_ipc_obj(&(shp->shm_perm));
+ +		err = security_shm_shmctl(shp, cmd);
+ +		if (err)
+ +			goto out_unlock1;
+ +
+ +		ipc_lock_object(&shp->shm_perm);
+ +
+ +		/* check if shm_destroy() is tearing down shp */
+ +		if (!ipc_valid_object(&shp->shm_perm)) {
+ +			err = -EIDRM;
+ +			goto out_unlock0;
+ +		}
+ +
+ +		if (!ns_capable(ns->user_ns, CAP_IPC_LOCK)) {
+ +			kuid_t euid = current_euid();
+ +			if (!uid_eq(euid, shp->shm_perm.uid) &&
+ +			    !uid_eq(euid, shp->shm_perm.cuid)) {
+ +				err = -EPERM;
+ +				goto out_unlock0;
+ +			}
+ +			if (cmd == SHM_LOCK && !rlimit(RLIMIT_MEMLOCK)) {
+ +				err = -EPERM;
+ +				goto out_unlock0;
+ +			}
+ +		}
+ +
+ +		shm_file = shp->shm_file;
+ +		if (is_file_hugepages(shm_file))
+ +			goto out_unlock0;
+ +
+ +		if (cmd == SHM_LOCK) {
+ +			struct user_struct *user = current_user();
+ +			err = shmem_lock(shm_file, 1, user);
+ +			if (!err && !(shp->shm_perm.mode & SHM_LOCKED)) {
+ +				shp->shm_perm.mode |= SHM_LOCKED;
+ +				shp->mlock_user = user;
+ +			}
+ +			goto out_unlock0;
+ +		}
+ +
+ +		/* SHM_UNLOCK */
+ +		if (!(shp->shm_perm.mode & SHM_LOCKED))
+ +			goto out_unlock0;
+ +		shmem_lock(shm_file, 0, shp->mlock_user);
+ +		shp->shm_perm.mode &= ~SHM_LOCKED;
+ +		shp->mlock_user = NULL;
+ +		get_file(shm_file);
+ +		ipc_unlock_object(&shp->shm_perm);
+ +		rcu_read_unlock();
+ +		shmem_unlock_mapping(shm_file->f_mapping);
+ +
+ +		fput(shm_file);
+ +		return err;
+ +	}
+  	default:
+  		return -EINVAL;
+  	}
+diff --git a/include/uapi/linux/shm.h b/include/uapi/linux/shm.h
+index e704ebe2cd21..4babfd44af5c 100644
+--- a/include/uapi/linux/shm.h
++++ b/include/uapi/linux/shm.h
+@@ -52,8 +52,9 @@ struct shmid_ds {
+ #define SHM_UNLOCK 	12
+ 
+ /* ipcs ctl commands */
+-#define SHM_STAT 	13
+-#define SHM_INFO 	14
++#define SHM_STAT	13
++#define SHM_INFO	14
++#define SHM_STAT_ANY    15
+ 
+ /* Obsolete, used only for backwards compatibility */
+ struct	shminfo {
+* Unmerged path ipc/shm.c
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index fe0d2b1b58b3..92063892aeb7 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -5537,6 +5537,7 @@ static int selinux_shm_shmctl(struct shmid_kernel *shp, int cmd)
+ 		return task_has_system(current, SYSTEM__IPC_INFO);
+ 	case IPC_STAT:
+ 	case SHM_STAT:
++	case SHM_STAT_ANY:
+ 		perms = SHM__GETATTR | SHM__ASSOCIATE;
+ 		break;
+ 	case IPC_SET:
+diff --git a/security/smack/smack_lsm.c b/security/smack/smack_lsm.c
+index 42fad0f7949a..661348326381 100644
+--- a/security/smack/smack_lsm.c
++++ b/security/smack/smack_lsm.c
+@@ -2116,6 +2116,7 @@ static int smack_shm_shmctl(struct shmid_kernel *shp, int cmd)
+ 	switch (cmd) {
+ 	case IPC_STAT:
+ 	case SHM_STAT:
++	case SHM_STAT_ANY:
+ 		may = MAY_READ;
+ 		break;
+ 	case IPC_SET:
