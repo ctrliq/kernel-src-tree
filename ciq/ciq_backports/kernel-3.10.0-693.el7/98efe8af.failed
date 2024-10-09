@@ -1,0 +1,142 @@
+xfs: fix unbalanced inode reclaim flush locking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit 98efe8af1c9ffac47e842b7a75ded903e2f028da
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/98efe8af.failed
+
+Filesystem shutdown testing on an older distro kernel has uncovered an
+imbalanced locking pattern for the inode flush lock in
+xfs_reclaim_inode(). Specifically, there is a double unlock sequence
+between the call to xfs_iflush_abort() and xfs_reclaim_inode() at the
+"reclaim:" label.
+
+This actually does not cause obvious problems on current kernels due to
+the current flush lock implementation. Older kernels use a counting
+based flush lock mechanism, however, which effectively breaks the lock
+indefinitely when an already unlocked flush lock is repeatedly unlocked.
+Though this only currently occurs on filesystem shutdown, it has
+reproduced the effect of elevating an fs shutdown to a system-wide crash
+or hang.
+
+As it turns out, the flush lock is not actually required for the reclaim
+logic in xfs_reclaim_inode() because by that time we have already cycled
+the flush lock once while holding ILOCK_EXCL. Therefore, remove the
+additional flush lock/unlock cycle around the 'reclaim:' label and
+update branches into this label to release the flush lock where
+appropriate. Add an assert to xfs_ifunlock() to help prevent future
+occurences of the same problem.
+
+	Reported-by: Zorro Lang <zlang@redhat.com>
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit 98efe8af1c9ffac47e842b7a75ded903e2f028da)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_icache.c
+diff --cc fs/xfs/xfs_icache.c
+index 68b891ef61bd,9c3e5c6ddf20..000000000000
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@@ -115,6 -114,26 +115,29 @@@ xfs_inode_free
+  		ip->i_itemp = NULL;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	kmem_zone_free(xfs_inode_zone, ip);
++ }
++ 
++ static void
++ __xfs_inode_free(
++ 	struct xfs_inode	*ip)
++ {
++ 	/* asserts to verify all state is correct here */
++ 	ASSERT(atomic_read(&ip->i_pincount) == 0);
++ 	XFS_STATS_DEC(ip->i_mount, vn_active);
++ 
++ 	call_rcu(&VFS_I(ip)->i_rcu, xfs_inode_free_callback);
++ }
++ 
++ void
++ xfs_inode_free(
++ 	struct xfs_inode	*ip)
++ {
++ 	ASSERT(!xfs_isiflocked(ip));
++ 
+++>>>>>>> 98efe8af1c9f (xfs: fix unbalanced inode reclaim flush locking)
+  	/*
+  	 * Because we use RCU freeing we need to ensure the inode always
+  	 * appears to be reclaimed with an invalid inode number when in the
+@@@ -986,9 -1032,24 +1010,28 @@@ restart
+  		xfs_buf_relse(bp);
+  	}
+  
+- 	xfs_iflock(ip);
+  reclaim:
+++<<<<<<< HEAD
+ +	xfs_ifunlock(ip);
+++=======
++ 	ASSERT(!xfs_isiflocked(ip));
++ 
++ 	/*
++ 	 * Because we use RCU freeing we need to ensure the inode always appears
++ 	 * to be reclaimed with an invalid inode number when in the free state.
++ 	 * We do this as early as possible under the ILOCK so that
++ 	 * xfs_iflush_cluster() can be guaranteed to detect races with us here.
++ 	 * By doing this, we guarantee that once xfs_iflush_cluster has locked
++ 	 * XFS_ILOCK that it will see either a valid, flushable inode that will
++ 	 * serialise correctly, or it will see a clean (and invalid) inode that
++ 	 * it can skip.
++ 	 */
++ 	spin_lock(&ip->i_flags_lock);
++ 	ip->i_flags = XFS_IRECLAIM;
++ 	ip->i_ino = 0;
++ 	spin_unlock(&ip->i_flags_lock);
++ 
+++>>>>>>> 98efe8af1c9f (xfs: fix unbalanced inode reclaim flush locking)
+  	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+  
+  	XFS_STATS_INC(ip->i_mount, xs_ig_reclaims);
+* Unmerged path fs/xfs/xfs_icache.c
+diff --git a/fs/xfs/xfs_inode.h b/fs/xfs/xfs_inode.h
+index 4b3afab97ddb..abc934f3887b 100644
+--- a/fs/xfs/xfs_inode.h
++++ b/fs/xfs/xfs_inode.h
+@@ -231,6 +231,11 @@ xfs_get_initial_prid(struct xfs_inode *dp)
+  * Synchronize processes attempting to flush the in-core inode back to disk.
+  */
+ 
++static inline int xfs_isiflocked(struct xfs_inode *ip)
++{
++	return xfs_iflags_test(ip, XFS_IFLOCK);
++}
++
+ extern void __xfs_iflock(struct xfs_inode *ip);
+ 
+ static inline int xfs_iflock_nowait(struct xfs_inode *ip)
+@@ -246,16 +251,12 @@ static inline void xfs_iflock(struct xfs_inode *ip)
+ 
+ static inline void xfs_ifunlock(struct xfs_inode *ip)
+ {
++	ASSERT(xfs_isiflocked(ip));
+ 	xfs_iflags_clear(ip, XFS_IFLOCK);
+ 	smp_mb();
+ 	wake_up_bit(&ip->i_flags, __XFS_IFLOCK_BIT);
+ }
+ 
+-static inline int xfs_isiflocked(struct xfs_inode *ip)
+-{
+-	return xfs_iflags_test(ip, XFS_IFLOCK);
+-}
+-
+ /*
+  * Flags for inode locking.
+  * Bit ranges:	1<<1  - 1<<16-1 -- iolock/ilock modes (bitfield)
