@@ -1,0 +1,255 @@
+nvme-rdma: use inet_pton_with_scope helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Sagi Grimberg <sagi@grimberg.me>
+commit 0928f9b4f194842d2f932d6be5c38768dfada104
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/0928f9b4.failed
+
+Both the destination and the host addresses are now
+parsed using inet_pton_with_scope helper. We also
+get ipv6 (with address scopes support).
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 0928f9b4f194842d2f932d6be5c38768dfada104)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/rdma.c
+diff --cc drivers/nvme/host/rdma.c
+index a2ff5b88b98b,15eb34c1c436..000000000000
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@@ -115,19 -126,13 +115,13 @@@ struct nvme_rdma_ctrl 
+  	struct blk_mq_tag_set	admin_tag_set;
+  	struct nvme_rdma_device	*device;
+  
+ -	u64			cap;
+  	u32			max_fr_pages;
+  
+- 	union {
+- 		struct sockaddr addr;
+- 		struct sockaddr_in addr_in;
+- 	};
+- 	union {
+- 		struct sockaddr src_addr;
+- 		struct sockaddr_in src_addr_in;
+- 	};
++ 	struct sockaddr_storage addr;
++ 	struct sockaddr_storage src_addr;
+  
+  	struct nvme_ctrl	ctrl;
+ +	bool			use_inline_data;
+  };
+  
+  static inline struct nvme_rdma_ctrl *to_rdma_ctrl(struct nvme_ctrl *ctrl)
+@@@ -1835,55 -1788,68 +1830,112 @@@ static const struct nvme_ctrl_ops nvme_
+  	.reg_read32		= nvmf_reg_read32,
+  	.reg_read64		= nvmf_reg_read64,
+  	.reg_write32		= nvmf_reg_write32,
+ -	.reset_ctrl		= nvme_rdma_reset_ctrl,
+  	.free_ctrl		= nvme_rdma_free_ctrl,
+  	.submit_async_event	= nvme_rdma_submit_async_event,
+ -	.delete_ctrl		= nvme_rdma_del_ctrl,
+ -	.get_subsysnqn		= nvmf_get_subsysnqn,
+ +	.delete_ctrl		= nvme_rdma_delete_ctrl,
+  	.get_address		= nvmf_get_address,
+ +	.stop_ctrl		= nvme_rdma_stop_ctrl,
+  };
+  
+++<<<<<<< HEAD
+ +static int nvme_rdma_parse_ipaddr(struct sockaddr_in *in_addr, char *p)
+ +{
+ +	u8 *addr = (u8 *)&in_addr->sin_addr.s_addr;
+ +	size_t buflen = strlen(p);
+ +
+ +	/* XXX: handle IPv6 addresses */
+ +
+ +	if (buflen > INET_ADDRSTRLEN)
+ +		return -EINVAL;
+ +	if (in4_pton(p, buflen, addr, '\0', NULL) == 0)
+ +		return -EINVAL;
+ +	in_addr->sin_family = AF_INET;
+ +	return 0;
+ +}
+ +
+ +/*
+ + * Fails a connection request if it matches an existing controller
+ + * (association) with the same tuple:
+ + * <Host NQN, Host ID, local address, remote address, remote port, SUBSYS NQN>
+ + *
+ + * if local address is not specified in the request, it will match an
+ + * existing controller with all the other parameters the same and no
+ + * local port address specified as well.
+ + *
+ + * The ports don't need to be compared as they are intrinsically
+ + * already matched by the port pointers supplied.
+ + */
+ +static bool
+ +nvme_rdma_existing_controller(struct nvmf_ctrl_options *opts)
+ +{
+ +	struct nvme_rdma_ctrl *ctrl;
+ +	bool found = false;
+ +
+ +	mutex_lock(&nvme_rdma_ctrl_mutex);
+ +	list_for_each_entry(ctrl, &nvme_rdma_ctrl_list, list) {
+ +		found = nvmf_ip_options_match(&ctrl->ctrl, opts);
+ +		if (found)
+ +			break;
+ +	}
+ +	mutex_unlock(&nvme_rdma_ctrl_mutex);
+ +
+ +	return found;
+++=======
++ static int nvme_rdma_create_io_queues(struct nvme_rdma_ctrl *ctrl)
++ {
++ 	int ret;
++ 
++ 	ret = nvme_rdma_init_io_queues(ctrl);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/*
++ 	 * We need a reference on the device as long as the tag_set is alive,
++ 	 * as the MRs in the request structures need a valid ib_device.
++ 	 */
++ 	ret = -EINVAL;
++ 	if (!nvme_rdma_dev_get(ctrl->device))
++ 		goto out_free_io_queues;
++ 
++ 	memset(&ctrl->tag_set, 0, sizeof(ctrl->tag_set));
++ 	ctrl->tag_set.ops = &nvme_rdma_mq_ops;
++ 	ctrl->tag_set.queue_depth = ctrl->ctrl.opts->queue_size;
++ 	ctrl->tag_set.reserved_tags = 1; /* fabric connect */
++ 	ctrl->tag_set.numa_node = NUMA_NO_NODE;
++ 	ctrl->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
++ 	ctrl->tag_set.cmd_size = sizeof(struct nvme_rdma_request) +
++ 		SG_CHUNK_SIZE * sizeof(struct scatterlist);
++ 	ctrl->tag_set.driver_data = ctrl;
++ 	ctrl->tag_set.nr_hw_queues = ctrl->queue_count - 1;
++ 	ctrl->tag_set.timeout = NVME_IO_TIMEOUT;
++ 
++ 	ret = blk_mq_alloc_tag_set(&ctrl->tag_set);
++ 	if (ret)
++ 		goto out_put_dev;
++ 	ctrl->ctrl.tagset = &ctrl->tag_set;
++ 
++ 	ctrl->ctrl.connect_q = blk_mq_init_queue(&ctrl->tag_set);
++ 	if (IS_ERR(ctrl->ctrl.connect_q)) {
++ 		ret = PTR_ERR(ctrl->ctrl.connect_q);
++ 		goto out_free_tag_set;
++ 	}
++ 
++ 	ret = nvme_rdma_connect_io_queues(ctrl);
++ 	if (ret)
++ 		goto out_cleanup_connect_q;
++ 
++ 	return 0;
++ 
++ out_cleanup_connect_q:
++ 	blk_cleanup_queue(ctrl->ctrl.connect_q);
++ out_free_tag_set:
++ 	blk_mq_free_tag_set(&ctrl->tag_set);
++ out_put_dev:
++ 	nvme_rdma_dev_put(ctrl->device);
++ out_free_io_queues:
++ 	nvme_rdma_free_io_queues(ctrl);
++ 	return ret;
+++>>>>>>> 0928f9b4f194 (nvme-rdma: use inet_pton_with_scope helper)
+  }
+  
+  static struct nvme_ctrl *nvme_rdma_create_ctrl(struct device *dev,
+@@@ -1915,23 -1888,12 +1974,29 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	if (opts->mask & NVMF_OPT_TRSVCID) {
+ +		u16 port;
+ +
+ +		ret = kstrtou16(opts->trsvcid, 0, &port);
+ +		if (ret)
+ +			goto out_free_ctrl;
+ +
+ +		ctrl->addr_in.sin_port = cpu_to_be16(port);
+ +	} else {
+ +		ctrl->addr_in.sin_port = cpu_to_be16(NVME_RDMA_IP_PORT);
+ +	}
+ +
+ +	if (!opts->duplicate_connect && nvme_rdma_existing_controller(opts)) {
+ +		ret = -EALREADY;
+++=======
++ 	ret = nvme_init_ctrl(&ctrl->ctrl, dev, &nvme_rdma_ctrl_ops,
++ 				0 /* no quirks, we're perfect! */);
++ 	if (ret)
+++>>>>>>> 0928f9b4f194 (nvme-rdma: use inet_pton_with_scope helper)
+  		goto out_free_ctrl;
+ +	}
+  
+ -	ctrl->reconnect_delay = opts->reconnect_delay;
+  	INIT_DELAYED_WORK(&ctrl->reconnect_work,
+  			nvme_rdma_reconnect_ctrl_work);
+  	INIT_WORK(&ctrl->err_work, nvme_rdma_error_recovery_work);
+@@@ -1952,17 -1915,47 +2017,21 @@@
+  	if (ret)
+  		goto out_kfree_queues;
+  
+ -	/* sanity check icdoff */
+ -	if (ctrl->ctrl.icdoff) {
+ -		dev_err(ctrl->ctrl.device, "icdoff is not supported!\n");
+ -		goto out_remove_admin_queue;
+ -	}
+ -
+ -	/* sanity check keyed sgls */
+ -	if (!(ctrl->ctrl.sgls & (1 << 20))) {
+ -		dev_err(ctrl->ctrl.device, "Mandatory keyed sgls are not support\n");
+ -		goto out_remove_admin_queue;
+ -	}
+ -
+ -	if (opts->queue_size > ctrl->ctrl.maxcmd) {
+ -		/* warn if maxcmd is lower than queue_size */
+ -		dev_warn(ctrl->ctrl.device,
+ -			"queue_size %zu > ctrl maxcmd %u, clamping down\n",
+ -			opts->queue_size, ctrl->ctrl.maxcmd);
+ -		opts->queue_size = ctrl->ctrl.maxcmd;
+ -	}
+ -
+ -	if (opts->queue_size > ctrl->ctrl.sqsize + 1) {
+ -		/* warn if sqsize is lower than queue_size */
+ -		dev_warn(ctrl->ctrl.device,
+ -			"queue_size %zu > ctrl sqsize %u, clamping down\n",
+ -			opts->queue_size, ctrl->ctrl.sqsize + 1);
+ -		opts->queue_size = ctrl->ctrl.sqsize + 1;
+ -	}
+ -
+ -	if (opts->nr_io_queues) {
+ -		ret = nvme_rdma_create_io_queues(ctrl);
+ -		if (ret)
+ -			goto out_remove_admin_queue;
+ -	}
+ -
+ -	changed = nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_LIVE);
+ +	changed = nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_CONNECTING);
+  	WARN_ON_ONCE(!changed);
+  
+++<<<<<<< HEAD
+ +	ret = nvme_rdma_setup_ctrl(ctrl, true);
+ +	if (ret)
+ +		goto out_uninit_ctrl;
+ +
+ +	dev_info(ctrl->ctrl.device, "new ctrl: NQN \"%s\", addr %pISp\n",
+++=======
++ 	dev_info(ctrl->ctrl.device, "new ctrl: NQN \"%s\", addr %pISpcs\n",
+++>>>>>>> 0928f9b4f194 (nvme-rdma: use inet_pton_with_scope helper)
+  		ctrl->ctrl.opts->subsysnqn, &ctrl->addr);
+  
+ -	kref_get(&ctrl->ctrl.kref);
+ +	nvme_get_ctrl(&ctrl->ctrl);
+  
+  	mutex_lock(&nvme_rdma_ctrl_mutex);
+  	list_add_tail(&ctrl->list, &nvme_rdma_ctrl_list);
+* Unmerged path drivers/nvme/host/rdma.c
