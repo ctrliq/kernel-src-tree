@@ -1,0 +1,129 @@
+nvme: improve performance for virtual NVMe devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [nvme] improve performance for virtual NVMe devices (David Milburn) [1454365 1456486 1457880]
+Rebuild_FUZZ: 93.62%
+commit-author Helen Koike <helen.koike@collabora.co.uk>
+commit f9f38e33389c019ec880f6825119c94867c1fde0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f9f38e33.failed
+
+This change provides a mechanism to reduce the number of MMIO doorbell
+writes for the NVMe driver. When running in a virtualized environment
+like QEMU, the cost of an MMIO is quite hefy here. The main idea for
+the patch is provide the device two memory location locations:
+ 1) to store the doorbell values so they can be lookup without the doorbell
+    MMIO write
+ 2) to store an event index.
+I believe the doorbell value is obvious, the event index not so much.
+Similar to the virtio specification, the virtual device can tell the
+driver (guest OS) not to write MMIO unless you are writing past this
+value.
+
+FYI: doorbell values are written by the nvme driver (guest OS) and the
+event index is written by the virtual device (host OS).
+
+The patch implements a new admin command that will communicate where
+these two memory locations reside. If the command fails, the nvme
+driver will work as before without any optimizations.
+
+Contributions:
+  Eric Northup <digitaleric@google.com>
+  Frank Swiderski <fes@google.com>
+  Ted Tso <tytso@mit.edu>
+  Keith Busch <keith.busch@intel.com>
+
+Just to give an idea on the performance boost with the vendor
+extension: Running fio [1], a stock NVMe driver I get about 200K read
+IOPs with my vendor patch I get about 1000K read IOPs. This was
+running with a null device i.e. the backing device simply returned
+success on every read IO request.
+
+[1] Running on a 4 core machine:
+  fio --time_based --name=benchmark --runtime=30
+  --filename=/dev/nvme0n1 --nrfiles=1 --ioengine=libaio --iodepth=32
+  --direct=1 --invalidate=1 --verify=0 --verify_fatal=0 --numjobs=4
+  --rw=randread --blocksize=4k --randrepeat=false
+
+	Signed-off-by: Rob Nelson <rlnelson@google.com>
+[mlin: port for upstream]
+	Signed-off-by: Ming Lin <mlin@kernel.org>
+[koike: updated for upstream]
+	Signed-off-by: Helen Koike <helen.koike@collabora.co.uk>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+(cherry picked from commit f9f38e33389c019ec880f6825119c94867c1fde0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/pci.c
+#	include/linux/nvme.h
+diff --cc drivers/nvme/host/pci.c
+index fa55e4efb61f,a363fecb8d82..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -635,10 -809,12 +761,12 @@@ static int nvme_process_cq(struct nvme_
+  	}
+  
+  	if (head == nvmeq->cq_head && phase == nvmeq->cq_phase)
+ -		return;
+ +		return 0;
+  
+  	if (likely(nvmeq->cq_vector >= 0))
+- 		writel(head, nvmeq->q_db + nvmeq->dev->db_stride);
++ 		if (nvme_dbbuf_update_and_check_event(head, nvmeq->dbbuf_cq_db,
++ 						      nvmeq->dbbuf_cq_ei))
++ 			writel(head, nvmeq->q_db + nvmeq->dev->db_stride);
+  	nvmeq->cq_head = head;
+  	nvmeq->cq_phase = phase;
+  
+@@@ -1705,6 -1916,24 +1837,27 @@@ static void nvme_reset_work(struct work
+  	if (result)
+  		goto out;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (dev->ctrl.oacs & NVME_CTRL_OACS_SEC_SUPP) {
++ 		if (!dev->ctrl.opal_dev)
++ 			dev->ctrl.opal_dev =
++ 				init_opal_dev(&dev->ctrl, &nvme_sec_submit);
++ 		else if (was_suspend)
++ 			opal_unlock_from_suspend(dev->ctrl.opal_dev);
++ 	} else {
++ 		free_opal_dev(dev->ctrl.opal_dev);
++ 		dev->ctrl.opal_dev = NULL;
++ 	}
++ 
++ 	if (dev->ctrl.oacs & NVME_CTRL_OACS_DBBUF_SUPP) {
++ 		result = nvme_dbbuf_dma_alloc(dev);
++ 		if (result)
++ 			dev_warn(dev->dev,
++ 				 "unable to allocate dma for dbbuf\n");
++ 	}
++ 
+++>>>>>>> f9f38e33389c (nvme: improve performance for virtual NVMe devices)
+  	result = nvme_setup_io_queues(dev);
+  	if (result)
+  		goto out;
+diff --cc include/linux/nvme.h
+index 46a43b805258,b625bacf37ef..000000000000
+--- a/include/linux/nvme.h
++++ b/include/linux/nvme.h
+@@@ -243,7 -242,10 +243,12 @@@ enum 
+  	NVME_CTRL_ONCS_COMPARE			= 1 << 0,
+  	NVME_CTRL_ONCS_WRITE_UNCORRECTABLE	= 1 << 1,
+  	NVME_CTRL_ONCS_DSM			= 1 << 2,
+ -	NVME_CTRL_ONCS_WRITE_ZEROES		= 1 << 3,
+  	NVME_CTRL_VWC_PRESENT			= 1 << 0,
+++<<<<<<< HEAD
+++=======
++ 	NVME_CTRL_OACS_SEC_SUPP                 = 1 << 0,
++ 	NVME_CTRL_OACS_DBBUF_SUPP		= 1 << 7,
+++>>>>>>> f9f38e33389c (nvme: improve performance for virtual NVMe devices)
+  };
+  
+  struct nvme_lbaf {
+* Unmerged path drivers/nvme/host/pci.c
+* Unmerged path include/linux/nvme.h
