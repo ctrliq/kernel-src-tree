@@ -1,0 +1,189 @@
+PCI: Avoid FLR for Intel 82579 NICs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [pci] Avoid FLR for Intel 82579 NICs (Jarod Wilson) [966840]
+Rebuild_FUZZ: 92.31%
+commit-author Sasha Neftin <sasha.neftin@intel.com>
+commit f65fd1aa4f9881d5540192d11f7b8ed2fec936db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f65fd1aa.failed
+
+Per Intel Specification Update 335553-002 (see link below), some 82579
+network adapters advertise a Function Level Reset (FLR) capability, but
+they can hang when an FLR is triggered.
+
+To reproduce the problem, attach the device to a VM, then detach and try to
+attach again.
+
+Add a quirk to prevent the use of FLR on these devices.
+
+[bhelgaas: changelog, comments]
+Link: http://www.intel.com/content/dam/www/public/us/en/documents/specification-updates/82579lm-82579v-gigabit-network-connection-spec-update.pdf
+	Signed-off-by: Sasha Neftin <sasha.neftin@intel.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+(cherry picked from commit f65fd1aa4f9881d5540192d11f7b8ed2fec936db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/quirks.c
+diff --cc drivers/pci/quirks.c
+index 30722b42e1d5,823271b13d12..000000000000
+--- a/drivers/pci/quirks.c
++++ b/drivers/pci/quirks.c
+@@@ -4254,3 -4531,113 +4254,116 @@@ int pci_dev_specific_enable_acs(struct 
+  
+  	return -ENOTTY;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * The PCI capabilities list for Intel DH895xCC VFs (device id 0x0443) with
++  * QuickAssist Technology (QAT) is prematurely terminated in hardware.  The
++  * Next Capability pointer in the MSI Capability Structure should point to
++  * the PCIe Capability Structure but is incorrectly hardwired as 0 terminating
++  * the list.
++  */
++ static void quirk_intel_qat_vf_cap(struct pci_dev *pdev)
++ {
++ 	int pos, i = 0;
++ 	u8 next_cap;
++ 	u16 reg16, *cap;
++ 	struct pci_cap_saved_state *state;
++ 
++ 	/* Bail if the hardware bug is fixed */
++ 	if (pdev->pcie_cap || pci_find_capability(pdev, PCI_CAP_ID_EXP))
++ 		return;
++ 
++ 	/* Bail if MSI Capability Structure is not found for some reason */
++ 	pos = pci_find_capability(pdev, PCI_CAP_ID_MSI);
++ 	if (!pos)
++ 		return;
++ 
++ 	/*
++ 	 * Bail if Next Capability pointer in the MSI Capability Structure
++ 	 * is not the expected incorrect 0x00.
++ 	 */
++ 	pci_read_config_byte(pdev, pos + 1, &next_cap);
++ 	if (next_cap)
++ 		return;
++ 
++ 	/*
++ 	 * PCIe Capability Structure is expected to be at 0x50 and should
++ 	 * terminate the list (Next Capability pointer is 0x00).  Verify
++ 	 * Capability Id and Next Capability pointer is as expected.
++ 	 * Open-code some of set_pcie_port_type() and pci_cfg_space_size_ext()
++ 	 * to correctly set kernel data structures which have already been
++ 	 * set incorrectly due to the hardware bug.
++ 	 */
++ 	pos = 0x50;
++ 	pci_read_config_word(pdev, pos, &reg16);
++ 	if (reg16 == (0x0000 | PCI_CAP_ID_EXP)) {
++ 		u32 status;
++ #ifndef PCI_EXP_SAVE_REGS
++ #define PCI_EXP_SAVE_REGS     7
++ #endif
++ 		int size = PCI_EXP_SAVE_REGS * sizeof(u16);
++ 
++ 		pdev->pcie_cap = pos;
++ 		pci_read_config_word(pdev, pos + PCI_EXP_FLAGS, &reg16);
++ 		pdev->pcie_flags_reg = reg16;
++ 		pci_read_config_word(pdev, pos + PCI_EXP_DEVCAP, &reg16);
++ 		pdev->pcie_mpss = reg16 & PCI_EXP_DEVCAP_PAYLOAD;
++ 
++ 		pdev->cfg_size = PCI_CFG_SPACE_EXP_SIZE;
++ 		if (pci_read_config_dword(pdev, PCI_CFG_SPACE_SIZE, &status) !=
++ 		    PCIBIOS_SUCCESSFUL || (status == 0xffffffff))
++ 			pdev->cfg_size = PCI_CFG_SPACE_SIZE;
++ 
++ 		if (pci_find_saved_cap(pdev, PCI_CAP_ID_EXP))
++ 			return;
++ 
++ 		/*
++ 		 * Save PCIE cap
++ 		 */
++ 		state = kzalloc(sizeof(*state) + size, GFP_KERNEL);
++ 		if (!state)
++ 			return;
++ 
++ 		state->cap.cap_nr = PCI_CAP_ID_EXP;
++ 		state->cap.cap_extended = 0;
++ 		state->cap.size = size;
++ 		cap = (u16 *)&state->cap.data[0];
++ 		pcie_capability_read_word(pdev, PCI_EXP_DEVCTL, &cap[i++]);
++ 		pcie_capability_read_word(pdev, PCI_EXP_LNKCTL, &cap[i++]);
++ 		pcie_capability_read_word(pdev, PCI_EXP_SLTCTL, &cap[i++]);
++ 		pcie_capability_read_word(pdev, PCI_EXP_RTCTL,  &cap[i++]);
++ 		pcie_capability_read_word(pdev, PCI_EXP_DEVCTL2, &cap[i++]);
++ 		pcie_capability_read_word(pdev, PCI_EXP_LNKCTL2, &cap[i++]);
++ 		pcie_capability_read_word(pdev, PCI_EXP_SLTCTL2, &cap[i++]);
++ 		hlist_add_head(&state->next, &pdev->saved_cap_space);
++ 	}
++ }
++ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x443, quirk_intel_qat_vf_cap);
++ 
++ /*
++  * VMD-enabled root ports will change the source ID for all messages
++  * to the VMD device. Rather than doing device matching with the source
++  * ID, the AER driver should traverse the child device tree, reading
++  * AER registers to find the faulting device.
++  */
++ static void quirk_no_aersid(struct pci_dev *pdev)
++ {
++ 	/* VMD Domain */
++ 	if (pdev->bus->sysdata && pci_domain_nr(pdev->bus) >= 0x10000)
++ 		pdev->bus->bus_flags |= PCI_BUS_FLAGS_NO_AERSID;
++ }
++ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x2030, quirk_no_aersid);
++ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x2031, quirk_no_aersid);
++ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x2032, quirk_no_aersid);
++ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x2033, quirk_no_aersid);
++ 
++ /* FLR may cause some 82579 devices to hang. */
++ static void quirk_intel_no_flr(struct pci_dev *dev)
++ {
++ 	dev->dev_flags |= PCI_DEV_FLAGS_NO_FLR_RESET;
++ }
++ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x1502, quirk_intel_no_flr);
++ DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x1503, quirk_intel_no_flr);
+++>>>>>>> f65fd1aa4f98 (PCI: Avoid FLR for Intel 82579 NICs)
+diff --git a/drivers/pci/pci.c b/drivers/pci/pci.c
+index ab9b307511c6..a0286ed076c4 100644
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@ -3516,6 +3516,9 @@ static int pcie_flr(struct pci_dev *dev, int probe)
+ 	if (!(cap & PCI_EXP_DEVCAP_FLR))
+ 		return -ENOTTY;
+ 
++	if (dev->dev_flags & PCI_DEV_FLAGS_NO_FLR_RESET)
++		return -ENOTTY;
++
+ 	if (probe)
+ 		return 0;
+ 
+@@ -3536,6 +3539,9 @@ static int pci_af_flr(struct pci_dev *dev, int probe)
+ 	if (!pos)
+ 		return -ENOTTY;
+ 
++	if (dev->dev_flags & PCI_DEV_FLAGS_NO_FLR_RESET)
++		return -ENOTTY;
++
+ 	pci_read_config_byte(dev, pos + PCI_AF_CAP, &cap);
+ 	if (!(cap & PCI_AF_CAP_TP) || !(cap & PCI_AF_CAP_FLR))
+ 		return -ENOTTY;
+* Unmerged path drivers/pci/quirks.c
+diff --git a/include/linux/pci.h b/include/linux/pci.h
+index 10e8958fbddb..71586b1aac93 100644
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -182,6 +182,8 @@ enum pci_dev_flags {
+ 	PCI_DEV_FLAGS_NO_PM_RESET = (__force pci_dev_flags_t) (1 << 7),
+ 	/* Get VPD from function 0 VPD */
+ 	PCI_DEV_FLAGS_VPD_REF_F0 = (__force pci_dev_flags_t) (1 << 8),
++	/* Do not use FLR even if device advertises PCI_AF_CAP */
++	PCI_DEV_FLAGS_NO_FLR_RESET = (__force pci_dev_flags_t) (1 << 10),
+ };
+ 
+ enum pci_irq_reroute_variant {
