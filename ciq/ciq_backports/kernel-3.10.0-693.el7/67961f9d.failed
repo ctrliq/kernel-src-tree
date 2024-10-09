@@ -1,0 +1,150 @@
+mm/hugetlb: fix huge page reserve accounting for private mappings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [mm] hugetlb: fix huge page reserve accounting for private mappings (Andrea Arcangeli) [1430172]
+Rebuild_FUZZ: 97.64%
+commit-author Mike Kravetz <mike.kravetz@oracle.com>
+commit 67961f9db8c477026ea20ce05761bde6f8bf85b0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/67961f9d.failed
+
+When creating a private mapping of a hugetlbfs file, it is possible to
+unmap pages via ftruncate or fallocate hole punch.  If subsequent faults
+repopulate these mappings, the reserve counts will go negative.  This is
+because the code currently assumes all faults to private mappings will
+consume reserves.  The problem can be recreated as follows:
+
+ - mmap(MAP_PRIVATE) a file in hugetlbfs filesystem
+ - write fault in pages in the mapping
+ - fallocate(FALLOC_FL_PUNCH_HOLE) some pages in the mapping
+ - write fault in pages in the hole
+
+This will result in negative huge page reserve counts and negative
+subpool usage counts for the hugetlbfs.  Note that this can also be
+recreated with ftruncate, but fallocate is more straight forward.
+
+This patch modifies the routines vma_needs_reserves and vma_has_reserves
+to examine the reserve map associated with private mappings similar to
+that for shared mappings.  However, the reserve map semantics for
+private and shared mappings are very different.  This results in subtly
+different code that is explained in the comments.
+
+Link: http://lkml.kernel.org/r/1464720957-15698-1-git-send-email-mike.kravetz@oracle.com
+	Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+	Acked-by: Hillf Danton <hillf.zj@alibaba-inc.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: Kirill Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Michal Hocko <mhocko@suse.cz>
+	Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: Aneesh Kumar <aneesh.kumar@linux.vnet.ibm.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 67961f9db8c477026ea20ce05761bde6f8bf85b0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index 657b46a931be,388c2bb9b55c..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -1519,16 -1780,84 +1538,77 @@@ static void return_unused_surplus_pages
+  	}
+  }
+  
+ -
+  /*
+ - * vma_needs_reservation, vma_commit_reservation and vma_end_reservation
+ - * are used by the huge page allocation routines to manage reservations.
+ - *
+ - * vma_needs_reservation is called to determine if the huge page at addr
+ - * within the vma has an associated reservation.  If a reservation is
+ - * needed, the value 1 is returned.  The caller is then responsible for
+ - * managing the global reservation and subpool usage counts.  After
+ - * the huge page has been allocated, vma_commit_reservation is called
+ - * to add the page to the reservation map.  If the page allocation fails,
+ - * the reservation must be ended instead of committed.  vma_end_reservation
+ - * is called in such cases.
+ - *
+ - * In the normal case, vma_commit_reservation returns the same value
+ - * as the preceding vma_needs_reservation call.  The only time this
+ - * is not the case is if a reserve map was changed between calls.  It
+ - * is the responsibility of the caller to notice the difference and
+ - * take appropriate action.
+ + * Determine if the huge page at addr within the vma has an associated
+ + * reservation.  Where it does not we will need to logically increase
+ + * reservation and actually increase subpool usage before an allocation
+ + * can occur.  Where any new reservation would be required the
+ + * reservation change is prepared, but not committed.  Once the page
+ + * has been allocated from the subpool and instantiated the change should
+ + * be committed via vma_commit_reservation.  No action is required on
+ + * failure.
+   */
+++<<<<<<< HEAD
+++=======
++ enum vma_resv_mode {
++ 	VMA_NEEDS_RESV,
++ 	VMA_COMMIT_RESV,
++ 	VMA_END_RESV,
++ };
++ static long __vma_reservation_common(struct hstate *h,
++ 				struct vm_area_struct *vma, unsigned long addr,
++ 				enum vma_resv_mode mode)
++ {
++ 	struct resv_map *resv;
++ 	pgoff_t idx;
++ 	long ret;
++ 
++ 	resv = vma_resv_map(vma);
++ 	if (!resv)
++ 		return 1;
++ 
++ 	idx = vma_hugecache_offset(h, vma, addr);
++ 	switch (mode) {
++ 	case VMA_NEEDS_RESV:
++ 		ret = region_chg(resv, idx, idx + 1);
++ 		break;
++ 	case VMA_COMMIT_RESV:
++ 		ret = region_add(resv, idx, idx + 1);
++ 		break;
++ 	case VMA_END_RESV:
++ 		region_abort(resv, idx, idx + 1);
++ 		ret = 0;
++ 		break;
++ 	default:
++ 		BUG();
++ 	}
++ 
++ 	if (vma->vm_flags & VM_MAYSHARE)
++ 		return ret;
++ 	else if (is_vma_resv_set(vma, HPAGE_RESV_OWNER) && ret >= 0) {
++ 		/*
++ 		 * In most cases, reserves always exist for private mappings.
++ 		 * However, a file associated with mapping could have been
++ 		 * hole punched or truncated after reserves were consumed.
++ 		 * As subsequent fault on such a range will not use reserves.
++ 		 * Subtle - The reserve map for private mappings has the
++ 		 * opposite meaning than that of shared mappings.  If NO
++ 		 * entry is in the reserve map, it means a reservation exists.
++ 		 * If an entry exists in the reserve map, it means the
++ 		 * reservation has already been consumed.  As a result, the
++ 		 * return value of this routine is the opposite of the
++ 		 * value returned from reserve map manipulation routines above.
++ 		 */
++ 		if (ret)
++ 			return 0;
++ 		else
++ 			return 1;
++ 	}
++ 	else
++ 		return ret < 0 ? ret : 0;
++ }
++ 
+++>>>>>>> 67961f9db8c4 (mm/hugetlb: fix huge page reserve accounting for private mappings)
+  static long vma_needs_reservation(struct hstate *h,
+  			struct vm_area_struct *vma, unsigned long addr)
+  {
+* Unmerged path mm/hugetlb.c
