@@ -1,0 +1,165 @@
+i40e: remove hw_disabled_flags in favor of using separate flag bits
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 47994c119a36e28e1779efabc92d6ab5329a6f75
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/47994c11.failed
+
+The hw_disabled_flags field was added as a way of signifying that
+a feature was automatically or temporarily disabled. However, we
+actually only use this for FDir features. Replace its use with new
+_AUTO_DISABLED flags instead. This is more readable, because you aren't
+setting an *_ENABLED flag to *disable* the feature.
+
+Additionally, clean up a few areas where we used these bits. First, we
+don't really need to set the auto-disable flag for ATR if we're fully
+disabling the feature via ethtool.
+
+Second, we should always clear the auto-disable bits in case they somehow
+got set when the feature was disabled. However, avoid displaying
+a message that we've re-enabled the feature.
+
+Third, we shouldn't be re-enabling ATR in the SB ntuple add flow,
+because it might have been disabled due to space constraints. Instead,
+we should just wait for the fdir_check_and_reenable to be called by the
+watchdog.
+
+Overall, this change allows us to simplify some code by removing an
+extra field we didn't need, and the result should make it more clear as
+to what we're actually doing with these flags.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 47994c119a36e28e1779efabc92d6ab5329a6f75)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e.h
+#	drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+#	drivers/net/ethernet/intel/i40e/i40e_main.c
+#	drivers/net/ethernet/intel/i40e/i40e_txrx.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e.h
+index 4e086347d4bd,cdde3cc28fb5..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e.h
++++ b/drivers/net/ethernet/intel/i40e/i40e.h
+@@@ -444,18 -440,8 +446,21 @@@ struct i40e_pf 
+  #define I40E_FLAG_TEMP_LINK_POLLING		BIT_ULL(55)
+  #define I40E_FLAG_CLIENT_L2_CHANGE		BIT_ULL(56)
+  #define I40E_FLAG_WOL_MC_MAGIC_PKT_WAKE		BIT_ULL(57)
+ -#define I40E_FLAG_LEGACY_RX			BIT_ULL(58)
+  
+++<<<<<<< HEAD
+ +	/* Tracks features that are disabled due to hw limitations.
+ +	 * If a bit is set here, it means that the corresponding
+ +	 * bit in the 'flags' field is cleared i.e that feature
+ +	 * is disabled
+ +	 */
+ +	u64 hw_disabled_flags;
+ +
+ +#ifdef I40E_FCOE
+ +	struct i40e_fcoe fcoe;
+ +
+ +#endif /* I40E_FCOE */
+++=======
+++>>>>>>> 47994c119a36 (i40e: remove hw_disabled_flags in favor of using separate flag bits)
+  	struct i40e_client_instance *cinst;
+  	bool stat_offsets_loaded;
+  	struct i40e_hw_port_stats stats;
+diff --cc drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+index ecd8b33e1b43,7a8eb486b9ea..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_ethtool.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+@@@ -3677,14 -3643,14 +3677,14 @@@ static int i40e_add_fdir_ethtool(struc
+  	if (!(pf->flags & I40E_FLAG_FD_SB_ENABLED))
+  		return -EOPNOTSUPP;
+  
+- 	if (pf->hw_disabled_flags & I40E_FLAG_FD_SB_ENABLED)
++ 	if (pf->flags & I40E_FLAG_FD_SB_AUTO_DISABLED)
+  		return -ENOSPC;
+  
+ -	if (test_bit(__I40E_RESET_RECOVERY_PENDING, pf->state) ||
+ -	    test_bit(__I40E_RESET_INTR_RECEIVED, pf->state))
+ +	if (test_bit(__I40E_RESET_RECOVERY_PENDING, &pf->state) ||
+ +	    test_bit(__I40E_RESET_INTR_RECEIVED, &pf->state))
+  		return -EBUSY;
+  
+ -	if (test_bit(__I40E_FD_FLUSH_REQUESTED, pf->state))
+ +	if (test_bit(__I40E_FD_FLUSH_REQUESTED, &pf->state))
+  		return -EBUSY;
+  
+  	fsp = (struct ethtool_rx_flow_spec *)&cmd->fs;
+@@@ -4119,8 -4086,8 +4119,13 @@@ flags_complete
+  	/* Flush current ATR settings if ATR was disabled */
+  	if ((changed_flags & I40E_FLAG_FD_ATR_ENABLED) &&
+  	    !(pf->flags & I40E_FLAG_FD_ATR_ENABLED)) {
+++<<<<<<< HEAD
+ +		pf->hw_disabled_flags |= I40E_FLAG_FD_ATR_ENABLED;
+ +		set_bit(__I40E_FD_FLUSH_REQUESTED, &pf->state);
+++=======
++ 		pf->flags |= I40E_FLAG_FD_ATR_AUTO_DISABLED;
++ 		set_bit(__I40E_FD_FLUSH_REQUESTED, pf->state);
+++>>>>>>> 47994c119a36 (i40e: remove hw_disabled_flags in favor of using separate flag bits)
+  	}
+  
+  	/* Only allow ATR evict on hardware that is capable of handling it */
+diff --cc drivers/net/ethernet/intel/i40e/i40e_main.c
+index f8ed38f6be11,d5c9c9e06ff5..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@@ -6163,12 -6075,10 +6163,10 @@@ void i40e_fdir_check_and_reenable(struc
+  	u32 fcnt_prog, fcnt_avail;
+  	struct hlist_node *node;
+  
+ -	if (test_bit(__I40E_FD_FLUSH_REQUESTED, pf->state))
+ +	if (test_bit(__I40E_FD_FLUSH_REQUESTED, &pf->state))
+  		return;
+  
+- 	/* Check if, FD SB or ATR was auto disabled and if there is enough room
+- 	 * to re-enable
+- 	 */
++ 	/* Check if we have enough room to re-enable FDir SB capability. */
+  	fcnt_prog = i40e_get_global_fd_count(pf);
+  	fcnt_avail = pf->fdir_pf_filter_count;
+  	if ((fcnt_prog < (fcnt_avail - I40E_FDIR_BUFFER_HEAD_ROOM)) ||
+@@@ -6261,8 -6172,8 +6260,13 @@@ static void i40e_fdir_flush_and_replay(
+  		/* replay sideband filters */
+  		i40e_fdir_filter_restore(pf->vsi[pf->lan_vsi]);
+  		if (!disable_atr && !pf->fd_tcp4_filter_cnt)
+++<<<<<<< HEAD
+ +			pf->hw_disabled_flags &= ~I40E_FLAG_FD_ATR_ENABLED;
+ +		clear_bit(__I40E_FD_FLUSH_REQUESTED, &pf->state);
+++=======
++ 			pf->flags &= ~I40E_FLAG_FD_ATR_AUTO_DISABLED;
++ 		clear_bit(__I40E_FD_FLUSH_REQUESTED, pf->state);
+++>>>>>>> 47994c119a36 (i40e: remove hw_disabled_flags in favor of using separate flag bits)
+  		if (I40E_DEBUG_FD & pf->hw.debug_mask)
+  			dev_info(&pf->pdev->dev, "FD Filter table flushed and FD-SB replayed.\n");
+  	}
+diff --cc drivers/net/ethernet/intel/i40e/i40e_txrx.c
+index 4656a603459e,29321a6167a6..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+@@@ -596,9 -591,9 +590,15 @@@ static void i40e_fd_handle_status(struc
+  		pf->fd_atr_cnt = i40e_get_current_atr_cnt(pf);
+  
+  		if ((rx_desc->wb.qword0.hi_dword.fd_id == 0) &&
+++<<<<<<< HEAD
+ +		    (pf->hw_disabled_flags & I40E_FLAG_FD_SB_ENABLED)) {
+ +			pf->hw_disabled_flags |= I40E_FLAG_FD_ATR_ENABLED;
+ +			set_bit(__I40E_FD_FLUSH_REQUESTED, &pf->state);
+++=======
++ 		    pf->flags & I40E_FLAG_FD_SB_AUTO_DISABLED) {
++ 			pf->flags |= I40E_FLAG_FD_ATR_AUTO_DISABLED;
++ 			set_bit(__I40E_FD_FLUSH_REQUESTED, pf->state);
+++>>>>>>> 47994c119a36 (i40e: remove hw_disabled_flags in favor of using separate flag bits)
+  		}
+  
+  		/* filter programming failed most likely due to table full */
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e.h
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_main.c
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_txrx.c
