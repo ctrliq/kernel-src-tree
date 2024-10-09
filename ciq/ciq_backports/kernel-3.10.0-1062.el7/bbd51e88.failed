@@ -1,0 +1,420 @@
+IB/uverbs: Do not pass struct ib_device to the write based methods
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Gunthorpe <jgg@mellanox.com>
+commit bbd51e881ff05aa6dccda025e335438f3b3a1dba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/bbd51e88.failed
+
+This is a step to get rid of the global check for disassociation. In this
+model, the ib_dev is not proven to be valid by the core code and cannot be
+provided to the method. Instead, every method decides if it is able to
+run after disassociation and obtains the ib_dev using one of three
+different approaches:
+
+- Call srcu_dereference on the udevice's ib_dev. As before, this means
+  the method cannot be called after disassociation begins.
+  (eg alloc ucontext)
+- Retrieve the ib_dev from the ucontext, via ib_uverbs_get_ucontext()
+- Retrieve the ib_dev from the uobject->object after checking
+  under SRCU if disassociation has started (eg uobj_get)
+
+Largely, the code is all ready for this, the main work is to provide a
+ib_dev after calling uobj_alloc(). The few other places simply use
+ib_uverbs_get_ucontext() to get the ib_dev.
+
+This flexibility will let the next patches allow destroy to operate
+after disassociation.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit bbd51e881ff05aa6dccda025e335438f3b3a1dba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/uverbs_cmd.c
+#	include/rdma/uverbs_std_types.h
+diff --cc drivers/infiniband/core/uverbs_cmd.c
+index a027ca305b7e,465b4d921024..000000000000
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@@ -60,13 -59,13 +60,12 @@@ ib_uverbs_lookup_comp_file(int fd, stru
+  	uverbs_uobject_get(uobj);
+  	uobj_put_read(uobj);
+  
+ -	return container_of(uobj, struct ib_uverbs_completion_event_file,
+ -			    uobj);
+ +	uobj_file = container_of(uobj, struct ib_uobject_file, uobj);
+ +	return container_of(uobj_file, struct ib_uverbs_completion_event_file,
+ +			    uobj_file);
+  }
+ -#define ib_uverbs_lookup_comp_file(_fd, _ufile)                                \
+ -	_ib_uverbs_lookup_comp_file((_fd)*typecheck(s32, _fd), _ufile)
+  
+  ssize_t ib_uverbs_get_context(struct ib_uverbs_file *file,
+- 			      struct ib_device *ib_dev,
+  			      const char __user *buf,
+  			      int in_len, int out_len)
+  {
+@@@ -75,6 -74,8 +74,11 @@@
+  	struct ib_udata                   udata;
+  	struct ib_ucontext		 *ucontext;
+  	struct file			 *filp;
+++<<<<<<< HEAD
+++=======
++ 	struct ib_rdmacg_object		 cg_obj;
++ 	struct ib_device *ib_dev;
+++>>>>>>> bbd51e881ff0 (IB/uverbs: Do not pass struct ib_device to the write based methods)
+  	int ret;
+  
+  	if (out_len < sizeof resp)
+@@@ -83,7 -84,13 +87,17 @@@
+  	if (copy_from_user(&cmd, buf, sizeof cmd))
+  		return -EFAULT;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&file->mutex);
+++=======
++ 	mutex_lock(&file->ucontext_lock);
++ 	ib_dev = srcu_dereference(file->device->ib_dev,
++ 				  &file->device->disassociate_srcu);
++ 	if (!ib_dev) {
++ 		ret = -EIO;
++ 		goto err;
++ 	}
+++>>>>>>> bbd51e881ff0 (IB/uverbs: Do not pass struct ib_device to the write based methods)
+  
+  	if (file->ucontext) {
+  		ret = -EINVAL;
+@@@ -234,8 -258,28 +253,7 @@@ ssize_t ib_uverbs_query_device(struct i
+  	return in_len;
+  }
+  
+ -/*
+ - * ib_uverbs_query_port_resp.port_cap_flags started out as just a copy of the
+ - * PortInfo CapabilityMask, but was extended with unique bits.
+ - */
+ -static u32 make_port_cap_flags(const struct ib_port_attr *attr)
+ -{
+ -	u32 res;
+ -
+ -	/* All IBA CapabilityMask bits are passed through here, except bit 26,
+ -	 * which is overridden with IP_BASED_GIDS. This is due to a historical
+ -	 * mistake in the implementation of IP_BASED_GIDS. Otherwise all other
+ -	 * bits match the IBA definition across all kernel versions.
+ -	 */
+ -	res = attr->port_cap_flags & ~(u32)IB_UVERBS_PCF_IP_BASED_GIDS;
+ -
+ -	if (attr->ip_gids)
+ -		res |= IB_UVERBS_PCF_IP_BASED_GIDS;
+ -
+ -	return res;
+ -}
+ -
+  ssize_t ib_uverbs_query_port(struct ib_uverbs_file *file,
+- 			     struct ib_device *ib_dev,
+  			     const char __user *buf,
+  			     int in_len, int out_len)
+  {
+@@@ -313,7 -367,7 +338,11 @@@ ssize_t ib_uverbs_alloc_pd(struct ib_uv
+                     in_len - sizeof(cmd) - sizeof(struct ib_uverbs_cmd_hdr),
+                     out_len - sizeof(resp));
+  
+++<<<<<<< HEAD
+ +	uobj  = uobj_alloc(UVERBS_OBJECT_PD, file->ucontext);
+++=======
++ 	uobj = uobj_alloc(UVERBS_OBJECT_PD, file, &ib_dev);
+++>>>>>>> bbd51e881ff0 (IB/uverbs: Do not pass struct ib_device to the write based methods)
+  	if (IS_ERR(uobj))
+  		return PTR_ERR(uobj);
+  
+@@@ -500,8 -551,8 +528,13 @@@ ssize_t ib_uverbs_open_xrcd(struct ib_u
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	obj  = (struct ib_uxrcd_object *)uobj_alloc(UVERBS_OBJECT_XRCD,
+ +						    file->ucontext);
+++=======
++ 	obj = (struct ib_uxrcd_object *)uobj_alloc(UVERBS_OBJECT_XRCD, file,
++ 						   &ib_dev);
+++>>>>>>> bbd51e881ff0 (IB/uverbs: Do not pass struct ib_device to the write based methods)
+  	if (IS_ERR(obj)) {
+  		ret = PTR_ERR(obj);
+  		goto err_tree_mutex_unlock;
+@@@ -639,7 -691,7 +671,11 @@@ ssize_t ib_uverbs_reg_mr(struct ib_uver
+  	if (ret)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	uobj  = uobj_alloc(UVERBS_OBJECT_MR, file->ucontext);
+++=======
++ 	uobj = uobj_alloc(UVERBS_OBJECT_MR, file, &ib_dev);
+++>>>>>>> bbd51e881ff0 (IB/uverbs: Do not pass struct ib_device to the write based methods)
+  	if (IS_ERR(uobj))
+  		return PTR_ERR(uobj);
+  
+@@@ -825,7 -875,7 +859,11 @@@ ssize_t ib_uverbs_alloc_mw(struct ib_uv
+  	if (copy_from_user(&cmd, buf, sizeof(cmd)))
+  		return -EFAULT;
+  
+++<<<<<<< HEAD
+ +	uobj  = uobj_alloc(UVERBS_OBJECT_MW, file->ucontext);
+++=======
++ 	uobj = uobj_alloc(UVERBS_OBJECT_MW, file, &ib_dev);
+++>>>>>>> bbd51e881ff0 (IB/uverbs: Do not pass struct ib_device to the write based methods)
+  	if (IS_ERR(uobj))
+  		return PTR_ERR(uobj);
+  
+@@@ -906,7 -953,7 +943,11 @@@ ssize_t ib_uverbs_create_comp_channel(s
+  	if (copy_from_user(&cmd, buf, sizeof cmd))
+  		return -EFAULT;
+  
+++<<<<<<< HEAD
+ +	uobj = uobj_alloc(UVERBS_OBJECT_COMP_CHANNEL, file->ucontext);
+++=======
++ 	uobj = uobj_alloc(UVERBS_OBJECT_COMP_CHANNEL, file, &ib_dev);
+++>>>>>>> bbd51e881ff0 (IB/uverbs: Do not pass struct ib_device to the write based methods)
+  	if (IS_ERR(uobj))
+  		return PTR_ERR(uobj);
+  
+@@@ -951,14 -994,18 +989,24 @@@ static struct ib_ucq_object *create_cq(
+  	if (cmd->comp_vector >= file->device->num_comp_vectors)
+  		return ERR_PTR(-EINVAL);
+  
+++<<<<<<< HEAD
+ +	obj  = (struct ib_ucq_object *)uobj_alloc(UVERBS_OBJECT_CQ,
+ +						  file->ucontext);
+++=======
++ 	obj = (struct ib_ucq_object *)uobj_alloc(UVERBS_OBJECT_CQ, file,
++ 						 &ib_dev);
+++>>>>>>> bbd51e881ff0 (IB/uverbs: Do not pass struct ib_device to the write based methods)
+  	if (IS_ERR(obj))
+  		return obj;
+  
++ 	if (!ib_dev->create_cq) {
++ 		ret = -EOPNOTSUPP;
++ 		goto err;
++ 	}
++ 
+  	if (cmd->comp_channel >= 0) {
+ -		ev_file = ib_uverbs_lookup_comp_file(cmd->comp_channel, file);
+ +		ev_file = ib_uverbs_lookup_comp_file(cmd->comp_channel,
+ +						     file->ucontext);
+  		if (IS_ERR(ev_file)) {
+  			ret = PTR_ERR(ev_file);
+  			goto err;
+@@@ -1338,8 -1365,8 +1381,13 @@@ static int create_qp(struct ib_uverbs_f
+  	if (cmd->qp_type == IB_QPT_RAW_PACKET && !capable(CAP_NET_RAW))
+  		return -EPERM;
+  
+++<<<<<<< HEAD
+ +	obj  = (struct ib_uqp_object *)uobj_alloc(UVERBS_OBJECT_QP,
+ +						  file->ucontext);
+++=======
++ 	obj = (struct ib_uqp_object *)uobj_alloc(UVERBS_OBJECT_QP, file,
++ 						 &ib_dev);
+++>>>>>>> bbd51e881ff0 (IB/uverbs: Do not pass struct ib_device to the write based methods)
+  	if (IS_ERR(obj))
+  		return PTR_ERR(obj);
+  	obj->uxrcd = NULL;
+@@@ -1718,8 -1743,8 +1764,13 @@@ ssize_t ib_uverbs_open_qp(struct ib_uve
+  		   in_len - sizeof(cmd) - sizeof(struct ib_uverbs_cmd_hdr),
+  		   out_len - sizeof(resp));
+  
+++<<<<<<< HEAD
+ +	obj  = (struct ib_uqp_object *)uobj_alloc(UVERBS_OBJECT_QP,
+ +						  file->ucontext);
+++=======
++ 	obj = (struct ib_uqp_object *)uobj_alloc(UVERBS_OBJECT_QP, file,
++ 						 &ib_dev);
+++>>>>>>> bbd51e881ff0 (IB/uverbs: Do not pass struct ib_device to the write based methods)
+  	if (IS_ERR(obj))
+  		return PTR_ERR(obj);
+  
+@@@ -2579,11 -2530,16 +2620,24 @@@ ssize_t ib_uverbs_create_ah(struct ib_u
+  		   in_len - sizeof(cmd) - sizeof(struct ib_uverbs_cmd_hdr),
+  		   out_len - sizeof(resp));
+  
+++<<<<<<< HEAD
+ +	uobj  = uobj_alloc(UVERBS_OBJECT_AH, file->ucontext);
+ +	if (IS_ERR(uobj))
+ +		return PTR_ERR(uobj);
+ +
+ +	pd = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd.pd_handle, file->ucontext);
+++=======
++ 	uobj = uobj_alloc(UVERBS_OBJECT_AH, file, &ib_dev);
++ 	if (IS_ERR(uobj))
++ 		return PTR_ERR(uobj);
++ 
++ 	if (!rdma_is_port_valid(ib_dev, cmd.attr.port_num)) {
++ 		ret = -EINVAL;
++ 		goto err;
++ 	}
++ 
++ 	pd = uobj_get_obj_read(pd, UVERBS_OBJECT_PD, cmd.pd_handle, file);
+++>>>>>>> bbd51e881ff0 (IB/uverbs: Do not pass struct ib_device to the write based methods)
+  	if (!pd) {
+  		ret = -EINVAL;
+  		goto err;
+@@@ -3109,8 -3060,8 +3160,13 @@@ int ib_uverbs_ex_create_wq(struct ib_uv
+  	if (cmd.comp_mask)
+  		return -EOPNOTSUPP;
+  
+++<<<<<<< HEAD
+ +	obj  = (struct ib_uwq_object *)uobj_alloc(UVERBS_OBJECT_WQ,
+ +						  file->ucontext);
+++=======
++ 	obj = (struct ib_uwq_object *)uobj_alloc(UVERBS_OBJECT_WQ, file,
++ 						 &ib_dev);
+++>>>>>>> bbd51e881ff0 (IB/uverbs: Do not pass struct ib_device to the write based methods)
+  	if (IS_ERR(obj))
+  		return PTR_ERR(obj);
+  
+@@@ -3379,7 -3318,7 +3433,11 @@@ int ib_uverbs_ex_create_rwq_ind_table(s
+  		wqs[num_read_wqs] = wq;
+  	}
+  
+++<<<<<<< HEAD
+ +	uobj  = uobj_alloc(UVERBS_OBJECT_RWQ_IND_TBL, file->ucontext);
+++=======
++ 	uobj = uobj_alloc(UVERBS_OBJECT_RWQ_IND_TBL, file, &ib_dev);
+++>>>>>>> bbd51e881ff0 (IB/uverbs: Do not pass struct ib_device to the write based methods)
+  	if (IS_ERR(uobj)) {
+  		err = PTR_ERR(uobj);
+  		goto put_wqs;
+@@@ -3483,10 -3419,11 +3539,11 @@@ int ib_uverbs_ex_create_flow(struct ib_
+  	struct ib_flow_attr		  *flow_attr;
+  	struct ib_qp			  *qp;
+  	struct ib_uflow_resources	  *uflow_res;
+ +	struct ib_uverbs_flow_spec_hdr	  *kern_spec;
+  	int err = 0;
+ -	void *kern_spec;
+  	void *ib_spec;
+  	int i;
++ 	struct ib_device *ib_dev;
+  
+  	if (ucore->inlen < sizeof(cmd))
+  		return -EINVAL;
+@@@ -3542,7 -3479,7 +3599,11 @@@
+  		kern_flow_attr = &cmd.flow_attr;
+  	}
+  
+++<<<<<<< HEAD
+ +	uobj  = uobj_alloc(UVERBS_OBJECT_FLOW, file->ucontext);
+++=======
++ 	uobj = uobj_alloc(UVERBS_OBJECT_FLOW, file, &ib_dev);
+++>>>>>>> bbd51e881ff0 (IB/uverbs: Do not pass struct ib_device to the write based methods)
+  	if (IS_ERR(uobj)) {
+  		err = PTR_ERR(uobj);
+  		goto err_free_attr;
+@@@ -3683,9 -3615,10 +3742,15 @@@ static int __uverbs_create_xsrq(struct 
+  	struct ib_uobject               *uninitialized_var(xrcd_uobj);
+  	struct ib_srq_init_attr          attr;
+  	int ret;
++ 	struct ib_device *ib_dev;
+  
+++<<<<<<< HEAD
+ +	obj  = (struct ib_usrq_object *)uobj_alloc(UVERBS_OBJECT_SRQ,
+ +						   file->ucontext);
+++=======
++ 	obj = (struct ib_usrq_object *)uobj_alloc(UVERBS_OBJECT_SRQ, file,
++ 						  &ib_dev);
+++>>>>>>> bbd51e881ff0 (IB/uverbs: Do not pass struct ib_device to the write based methods)
+  	if (IS_ERR(obj))
+  		return PTR_ERR(obj);
+  
+diff --cc include/rdma/uverbs_std_types.h
+index 6e389a6b0382,64ee2545dd3d..000000000000
+--- a/include/rdma/uverbs_std_types.h
++++ b/include/rdma/uverbs_std_types.h
+@@@ -105,12 -125,18 +105,27 @@@ static inline void uobj_alloc_abort(str
+  }
+  
+  static inline struct ib_uobject *__uobj_alloc(const struct uverbs_obj_type *type,
+++<<<<<<< HEAD
+ +					      struct ib_ucontext *ucontext)
+ +{
+ +	return rdma_alloc_begin_uobject(type, ucontext);
+ +}
+ +
+ +#define uobj_alloc(_type, ucontext)	\
+ +	__uobj_alloc(uobj_get_type(_type), ucontext)
+++=======
++ 					      struct ib_uverbs_file *ufile,
++ 					      struct ib_device **ib_dev)
++ {
++ 	struct ib_uobject *uobj = rdma_alloc_begin_uobject(type, ufile);
++ 
++ 	if (!IS_ERR(uobj))
++ 		*ib_dev = uobj->context->device;
++ 	return uobj;
++ }
++ 
++ #define uobj_alloc(_type, _ufile, _ib_dev)                                     \
++ 	__uobj_alloc(uobj_get_type(_type), _ufile, _ib_dev)
+++>>>>>>> bbd51e881ff0 (IB/uverbs: Do not pass struct ib_device to the write based methods)
+  
+  #endif
+ -
+diff --git a/drivers/infiniband/core/uverbs.h b/drivers/infiniband/core/uverbs.h
+index cbf36c75d546..17c9e514f9cc 100644
+--- a/drivers/infiniband/core/uverbs.h
++++ b/drivers/infiniband/core/uverbs.h
+@@ -286,7 +286,6 @@ extern const struct uverbs_object_def UVERBS_OBJECT(UVERBS_OBJECT_XRCD);
+ 
+ #define IB_UVERBS_DECLARE_CMD(name)					\
+ 	ssize_t ib_uverbs_##name(struct ib_uverbs_file *file,		\
+-				 struct ib_device *ib_dev,              \
+ 				 const char __user *buf, int in_len,	\
+ 				 int out_len)
+ 
+@@ -328,7 +327,6 @@ IB_UVERBS_DECLARE_CMD(close_xrcd);
+ 
+ #define IB_UVERBS_DECLARE_EX_CMD(name)				\
+ 	int ib_uverbs_ex_##name(struct ib_uverbs_file *file,	\
+-				struct ib_device *ib_dev,		\
+ 				struct ib_udata *ucore,		\
+ 				struct ib_udata *uhw)
+ 
+* Unmerged path drivers/infiniband/core/uverbs_cmd.c
+diff --git a/drivers/infiniband/core/uverbs_main.c b/drivers/infiniband/core/uverbs_main.c
+index 9b53f7b4a4a8..57717c5f3957 100644
+--- a/drivers/infiniband/core/uverbs_main.c
++++ b/drivers/infiniband/core/uverbs_main.c
+@@ -77,7 +77,6 @@ static struct class *uverbs_class;
+ static DECLARE_BITMAP(dev_map, IB_UVERBS_MAX_DEVICES);
+ 
+ static ssize_t (*uverbs_cmd_table[])(struct ib_uverbs_file *file,
+-				     struct ib_device *ib_dev,
+ 				     const char __user *buf, int in_len,
+ 				     int out_len) = {
+ 	[IB_USER_VERBS_CMD_GET_CONTEXT]		= ib_uverbs_get_context,
+@@ -118,7 +117,6 @@ static ssize_t (*uverbs_cmd_table[])(struct ib_uverbs_file *file,
+ };
+ 
+ static int (*uverbs_ex_cmd_table[])(struct ib_uverbs_file *file,
+-				    struct ib_device *ib_dev,
+ 				    struct ib_udata *ucore,
+ 				    struct ib_udata *uhw) = {
+ 	[IB_USER_VERBS_EX_CMD_CREATE_FLOW]	= ib_uverbs_ex_create_flow,
+@@ -776,7 +774,7 @@ static ssize_t ib_uverbs_write(struct file *filp, const char __user *buf,
+ 	buf += sizeof(hdr);
+ 
+ 	if (!extended) {
+-		ret = uverbs_cmd_table[command](file, ib_dev, buf,
++		ret = uverbs_cmd_table[command](file, buf,
+ 						hdr.in_words * 4,
+ 						hdr.out_words * 4);
+ 	} else {
+@@ -795,7 +793,7 @@ static ssize_t ib_uverbs_write(struct file *filp, const char __user *buf,
+ 					ex_hdr.provider_in_words * 8,
+ 					ex_hdr.provider_out_words * 8);
+ 
+-		ret = uverbs_ex_cmd_table[command](file, ib_dev, &ucore, &uhw);
++		ret = uverbs_ex_cmd_table[command](file, &ucore, &uhw);
+ 		ret = (ret) ? : count;
+ 	}
+ 
+* Unmerged path include/rdma/uverbs_std_types.h
