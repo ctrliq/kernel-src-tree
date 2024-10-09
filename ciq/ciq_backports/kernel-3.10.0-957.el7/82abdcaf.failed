@@ -1,0 +1,129 @@
+scsi: qla2xxx: Allow target mode to accept PRLI in dual mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Allow target mode to accept PRLI in dual mode (Himanshu Madhani) [1547714]
+Rebuild_FUZZ: 94.74%
+commit-author Quinn Tran <quinn.tran@cavium.com>
+commit 82abdcaf3ededf5ad18644ac7a416f5e4f95a7fe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/82abdcaf.failed
+
+For Dual Mode, Initiator side of the driver finish login,
+target side receive PRLI, but driver terminates PRLI.
+This patch allows target side to go ahead and accept PRLI.
+
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 82abdcaf3ededf5ad18644ac7a416f5e4f95a7fe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_init.c
+diff --cc drivers/scsi/qla2xxx/qla_init.c
+index 320a3c9ed887,34ee8c755655..000000000000
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@@ -1326,6 -1535,9 +1326,12 @@@ static voi
+  qla24xx_handle_plogi_done_event(struct scsi_qla_host *vha, struct event_arg *ea)
+  {
+  	port_id_t cid;	/* conflict Nport id */
+++<<<<<<< HEAD
+++=======
++ 	u16 lid;
++ 	struct fc_port *conflict_fcport;
++ 	unsigned long flags;
+++>>>>>>> 82abdcaf3ede (scsi: qla2xxx: Allow target mode to accept PRLI in dual mode)
+  
+  	switch (ea->data[0]) {
+  	case MBS_COMMAND_COMPLETE:
+@@@ -1334,13 -1546,28 +1340,38 @@@
+  		 * force a relogin attempt via implicit LOGO, PLOGI, and PRLI
+  		 * requests.
+  		 */
+++<<<<<<< HEAD
+ +		ql_dbg(ql_dbg_disc, vha, 0x20ea,
+ +		    "%s %d %8phC post gpdb\n",
+ +		    __func__, __LINE__, ea->fcport->port_name);
+ +		ea->fcport->chip_reset = vha->hw->base_qpair->chip_reset;
+ +		ea->fcport->logout_on_delete = 1;
+ +		ea->fcport->send_els_logo = 0;
+ +		qla24xx_post_gpdb_work(vha, ea->fcport, 0);
+++=======
++ 		if (ea->fcport->fc4f_nvme) {
++ 			ql_dbg(ql_dbg_disc, vha, 0x2117,
++ 				"%s %d %8phC post prli\n",
++ 				__func__, __LINE__, ea->fcport->port_name);
++ 			qla24xx_post_prli_work(vha, ea->fcport);
++ 		} else {
++ 			ql_dbg(ql_dbg_disc, vha, 0x20ea,
++ 			    "%s %d %8phC LoopID 0x%x in use with %06x. post gnl\n",
++ 			    __func__, __LINE__, ea->fcport->port_name,
++ 			    ea->fcport->loop_id, ea->fcport->d_id.b24);
++ 
++ 			set_bit(ea->fcport->loop_id, vha->hw->loop_id_map);
++ 			spin_lock_irqsave(&vha->hw->tgt.sess_lock, flags);
++ 			ea->fcport->loop_id = FC_NO_LOOP_ID;
++ 			ea->fcport->chip_reset = vha->hw->base_qpair->chip_reset;
++ 			ea->fcport->logout_on_delete = 1;
++ 			ea->fcport->send_els_logo = 0;
++ 			ea->fcport->fw_login_state = DSC_LS_PRLI_COMP;
++ 			spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
++ 
++ 			qla24xx_post_gpdb_work(vha, ea->fcport, 0);
++ 		}
+++>>>>>>> 82abdcaf3ede (scsi: qla2xxx: Allow target mode to accept PRLI in dual mode)
+  		break;
+  	case MBS_COMMAND_ERROR:
+  		ql_dbg(ql_dbg_disc, vha, 0x20eb, "%s %d %8phC cmd error %x\n",
+* Unmerged path drivers/scsi/qla2xxx/qla_init.c
+diff --git a/drivers/scsi/qla2xxx/qla_target.c b/drivers/scsi/qla2xxx/qla_target.c
+index 1c8ec70c5535..fdd2d51f1e3e 100644
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@ -4667,7 +4667,7 @@ static int qlt_24xx_handle_els(struct scsi_qla_host *vha,
+ 	uint16_t wd3_lo;
+ 	int res = 0;
+ 	struct qlt_plogi_ack_t *pla;
+-	unsigned long flags;
++	unsigned long flags = 0;
+ 
+ 	wwn = wwn_to_u64(iocb->u.isp24.port_name);
+ 
+@@ -4791,8 +4791,14 @@ static int qlt_24xx_handle_els(struct scsi_qla_host *vha,
+ 		}
+ 
+ 		if (sess != NULL) {
+-			if (sess->fw_login_state != DSC_LS_PLOGI_PEND &&
+-			    sess->fw_login_state != DSC_LS_PLOGI_COMP) {
++			spin_lock_irqsave(&tgt->ha->tgt.sess_lock, flags);
++			switch (sess->fw_login_state) {
++			case DSC_LS_PLOGI_COMP:
++			case DSC_LS_PRLI_COMP:
++				break;
++			default:
++				spin_unlock_irqrestore(&tgt->ha->tgt.sess_lock,
++				    flags);
+ 				/*
+ 				 * Impatient initiator sent PRLI before last
+ 				 * PLOGI could finish. Will force him to re-try,
+@@ -4803,6 +4809,8 @@ static int qlt_24xx_handle_els(struct scsi_qla_host *vha,
+ 				    sess);
+ 				qlt_send_term_imm_notif(vha, iocb, 1);
+ 				res = 0;
++				spin_lock_irqsave(&tgt->ha->tgt.sess_lock,
++				    flags);
+ 				break;
+ 			}
+ 
+@@ -4826,6 +4834,8 @@ static int qlt_24xx_handle_els(struct scsi_qla_host *vha,
+ 				sess->port_type = FCT_INITIATOR;
+ 			else
+ 				sess->port_type = FCT_TARGET;
++
++			spin_unlock_irqrestore(&tgt->ha->tgt.sess_lock, flags);
+ 		}
+ 		res = 1; /* send notify ack */
+ 
