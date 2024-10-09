@@ -1,0 +1,176 @@
+vfs, fdtable: Add fget_task helper
+
+jira LE-1907
+cve CVE-2021-4083
+Rebuild_History Non-Buildable kernel-3.10.0-1160.62.1.el7
+commit-author Sargun Dhillon <sargun@sargun.me>
+commit 5e876fb43dbf24c941a323139752bcb2f0a80da0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.62.1.el7/5e876fb4.failed
+
+This introduces a function which can be used to fetch a file, given an
+arbitrary task. As long as the user holds a reference (refcnt) to the
+task_struct it is safe to call, and will either return NULL on failure,
+or a pointer to the file, with a refcnt.
+
+This patch is based on Oleg Nesterov's (cf. [1]) patch from September
+2018.
+
+[1]: Link: https://lore.kernel.org/r/20180915160423.GA31461@redhat.com
+
+	Signed-off-by: Sargun Dhillon <sargun@sargun.me>
+	Suggested-by: Oleg Nesterov <oleg@redhat.com>
+	Acked-by: Christian Brauner <christian.brauner@ubuntu.com>
+	Reviewed-by: Arnd Bergmann <arnd@arndb.de>
+Link: https://lore.kernel.org/r/20200107175927.4558-2-sargun@sargun.me
+	Signed-off-by: Christian Brauner <christian.brauner@ubuntu.com>
+(cherry picked from commit 5e876fb43dbf24c941a323139752bcb2f0a80da0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/file.c
+#	include/linux/file.h
+diff --cc fs/file.c
+index 44bd634b636a,d044a32c030e..000000000000
+--- a/fs/file.c
++++ b/fs/file.c
+@@@ -718,44 -706,64 +718,79 @@@ void do_close_on_exec(struct files_stru
+  	spin_unlock(&files->file_lock);
+  }
+  
+++<<<<<<< HEAD
+ +struct file *fget(unsigned int fd)
+++=======
++ static struct file *__fget_files(struct files_struct *files, unsigned int fd,
++ 				 fmode_t mask, unsigned int refs)
+++>>>>>>> 5e876fb43dbf (vfs, fdtable: Add fget_task helper)
+  {
+  	struct file *file;
+ +	struct files_struct *files = current->files;
+  
+  	rcu_read_lock();
+ -loop:
+  	file = fcheck_files(files, fd);
+  	if (file) {
+ -		/* File object ref couldn't be taken.
+ -		 * dup2() atomicity guarantee is the reason
+ -		 * we loop to catch the new file (or NULL pointer)
+ -		 */
+ -		if (file->f_mode & mask)
+ +		/* File object ref couldn't be taken */
+ +		if (file->f_mode & FMODE_PATH || !get_file_rcu(file))
+  			file = NULL;
+ -		else if (!get_file_rcu_many(file, refs))
+ -			goto loop;
+  	}
+  	rcu_read_unlock();
+  
+  	return file;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline struct file *__fget(unsigned int fd, fmode_t mask,
++ 				  unsigned int refs)
++ {
++ 	return __fget_files(current->files, fd, mask, refs);
++ }
++ 
++ struct file *fget_many(unsigned int fd, unsigned int refs)
++ {
++ 	return __fget(fd, FMODE_PATH, refs);
++ }
++ 
++ struct file *fget(unsigned int fd)
++ {
++ 	return __fget(fd, FMODE_PATH, 1);
++ }
+++>>>>>>> 5e876fb43dbf (vfs, fdtable: Add fget_task helper)
+  EXPORT_SYMBOL(fget);
+  
+  struct file *fget_raw(unsigned int fd)
+  {
+ -	return __fget(fd, 0, 1);
+ +	struct file *file;
+ +	struct files_struct *files = current->files;
+ +
+ +	rcu_read_lock();
+ +	file = fcheck_files(files, fd);
+ +	if (file) {
+ +		/* File object ref couldn't be taken */
+ +		if (!atomic_long_inc_not_zero(&file->f_count))
+ +			file = NULL;
+ +	}
+ +	rcu_read_unlock();
+ +
+ +	return file;
+  }
+ +
+  EXPORT_SYMBOL(fget_raw);
+  
++ struct file *fget_task(struct task_struct *task, unsigned int fd)
++ {
++ 	struct file *file = NULL;
++ 
++ 	task_lock(task);
++ 	if (task->files)
++ 		file = __fget_files(task->files, fd, 0, 1);
++ 	task_unlock(task);
++ 
++ 	return file;
++ }
++ 
+  /*
+   * Lightweight file lookup - no refcnt increment if fd table isn't shared.
+   *
+diff --cc include/linux/file.h
+index f2517fa2d610,c6c7b24ea9f7..000000000000
+--- a/include/linux/file.h
++++ b/include/linux/file.h
+@@@ -12,13 -13,18 +12,14 @@@
+  struct file;
+  
+  extern void fput(struct file *);
+ -extern void fput_many(struct file *, unsigned int);
+  
+  struct file_operations;
++ struct task_struct;
+  struct vfsmount;
+  struct dentry;
+ -struct inode;
+  struct path;
+ -extern struct file *alloc_file_pseudo(struct inode *, struct vfsmount *,
+ -	const char *, int flags, const struct file_operations *);
+ -extern struct file *alloc_file_clone(struct file *, int flags,
+ -	const struct file_operations *);
+ +extern struct file *alloc_file(struct path *, fmode_t mode,
+ +	const struct file_operations *fop);
+  
+  static inline void fput_light(struct file *file, int fput_needed)
+  {
+@@@ -40,7 -46,18 +41,22 @@@ static inline void fdput(struct fd fd
+  }
+  
+  extern struct file *fget(unsigned int fd);
+++<<<<<<< HEAD
+ +extern struct file *fget_light(unsigned int fd, int *fput_needed);
+++=======
++ extern struct file *fget_many(unsigned int fd, unsigned int refs);
++ extern struct file *fget_raw(unsigned int fd);
++ extern struct file *fget_task(struct task_struct *task, unsigned int fd);
++ extern unsigned long __fdget(unsigned int fd);
++ extern unsigned long __fdget_raw(unsigned int fd);
++ extern unsigned long __fdget_pos(unsigned int fd);
++ extern void __f_unlock_pos(struct file *);
++ 
++ static inline struct fd __to_fd(unsigned long v)
++ {
++ 	return (struct fd){(struct file *)(v & ~3),v & 3};
++ }
+++>>>>>>> 5e876fb43dbf (vfs, fdtable: Add fget_task helper)
+  
+  static inline struct fd fdget(unsigned int fd)
+  {
+* Unmerged path fs/file.c
+* Unmerged path include/linux/file.h
