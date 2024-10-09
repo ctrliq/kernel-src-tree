@@ -1,0 +1,131 @@
+cls_flower: fix use after free in flower S/W path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 44a5cd436ec067c9a62988aca3331ac6eee5268d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/44a5cd43.failed
+
+If flower filter is created without the skip_sw flag, fl_mask_put()
+can race with fl_classify() and we can destroy the mask rhashtable
+while a lookup operation is accessing it.
+
+ BUG: unable to handle kernel paging request at 00000000000911d1
+ PGD 0 P4D 0
+ SMP PTI
+ CPU: 3 PID: 5582 Comm: vhost-5541 Not tainted 4.18.0-rc1.vanilla+ #1950
+ Hardware name: Dell Inc. PowerEdge R730/072T6D, BIOS 2.1.7 06/16/2016
+ RIP: 0010:rht_bucket_nested+0x20/0x60
+ Code: 31 c8 c1 c1 18 29 c8 c3 66 90 8b 4f 04 ba 01 00 00 00 8b 07 48 8b bf 80 00 00 0
+ RSP: 0018:ffffafc5cfbb7a48 EFLAGS: 00010206
+ RAX: 0000000000001978 RBX: ffff9f12dff88a00 RCX: 00000000ffff9f12
+ RDX: 00000000000911d1 RSI: 0000000000000148 RDI: 0000000000000001
+ RBP: ffff9f12dff88a00 R08: 000000005f1cc119 R09: 00000000a715fae2
+ R10: ffffafc5cfbb7aa8 R11: ffff9f1cb4be804e R12: ffff9f1265e13000
+ R13: 0000000000000000 R14: ffffafc5cfbb7b48 R15: ffff9f12dff88b68
+ FS:  0000000000000000(0000) GS:ffff9f1d3f0c0000(0000) knlGS:0000000000000000
+ CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+ CR2: 00000000000911d1 CR3: 0000001575a94006 CR4: 00000000001626e0
+ Call Trace:
+  fl_lookup+0x134/0x140 [cls_flower]
+  fl_classify+0xf3/0x180 [cls_flower]
+  tcf_classify+0x78/0x150
+  __netif_receive_skb_core+0x69e/0xa50
+  netif_receive_skb_internal+0x42/0xf0
+  tun_get_user+0xdd5/0xfd0 [tun]
+  tun_sendmsg+0x52/0x70 [tun]
+  handle_tx+0x2b3/0x5f0 [vhost_net]
+  vhost_worker+0xab/0x100 [vhost]
+  kthread+0xf8/0x130
+  ret_from_fork+0x35/0x40
+ Modules linked in: act_mirred act_gact cls_flower vhost_net vhost tap sch_ingress
+ CR2: 00000000000911d1
+
+Fix the above waiting for a RCU grace period before destroying the
+rhashtable: we need to use tcf_queue_work(), as rhashtable_destroy()
+must run in process context, as pointed out by Cong Wang.
+
+v1 -> v2: use tcf_queue_work to run rhashtable_destroy().
+
+Fixes: 05cd271fd61a ("cls_flower: Support multiple masks per priority")
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 44a5cd436ec067c9a62988aca3331ac6eee5268d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_flower.c
+diff --cc net/sched/cls_flower.c
+index eb4e6a91f3e1,9e8b26a80fb3..000000000000
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@@ -63,7 -61,13 +63,17 @@@ struct fl_flow_mask_range 
+  struct fl_flow_mask {
+  	struct fl_flow_key key;
+  	struct fl_flow_mask_range range;
+++<<<<<<< HEAD
+ +	struct rcu_head	rcu;
+++=======
++ 	struct rhash_head ht_node;
++ 	struct rhashtable ht;
++ 	struct rhashtable_params filter_ht_params;
++ 	struct flow_dissector dissector;
++ 	struct list_head filters;
++ 	struct rcu_work rwork;
++ 	struct list_head list;
+++>>>>>>> 44a5cd436ec0 (cls_flower: fix use after free in flower S/W path)
+  };
+  
+  struct cls_fl_head {
+@@@ -212,11 -196,41 +222,45 @@@ static int fl_init(struct tcf_proto *tp
+  	if (!head)
+  		return -ENOBUFS;
+  
+ -	INIT_LIST_HEAD_RCU(&head->masks);
+ +	INIT_LIST_HEAD_RCU(&head->filters);
+  	rcu_assign_pointer(tp->root, head);
+ -	idr_init(&head->handle_idr);
+ +	idr_init_ext(&head->handle_idr);
+  
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ 	return rhashtable_init(&head->ht, &mask_ht_params);
++ }
++ 
++ static void fl_mask_free(struct fl_flow_mask *mask)
++ {
++ 	rhashtable_destroy(&mask->ht);
++ 	kfree(mask);
++ }
++ 
++ static void fl_mask_free_work(struct work_struct *work)
++ {
++ 	struct fl_flow_mask *mask = container_of(to_rcu_work(work),
++ 						 struct fl_flow_mask, rwork);
++ 
++ 	fl_mask_free(mask);
++ }
++ 
++ static bool fl_mask_put(struct cls_fl_head *head, struct fl_flow_mask *mask,
++ 			bool async)
++ {
++ 	if (!list_empty(&mask->filters))
++ 		return false;
++ 
++ 	rhashtable_remove_fast(&head->ht, &mask->ht_node, mask_ht_params);
++ 	list_del_rcu(&mask->list);
++ 	if (async)
++ 		tcf_queue_work(&mask->rwork, fl_mask_free_work);
++ 	else
++ 		fl_mask_free(mask);
++ 
++ 	return true;
+++>>>>>>> 44a5cd436ec0 (cls_flower: fix use after free in flower S/W path)
+  }
+  
+  static void __fl_destroy_filter(struct cls_fl_filter *f)
+* Unmerged path net/sched/cls_flower.c
