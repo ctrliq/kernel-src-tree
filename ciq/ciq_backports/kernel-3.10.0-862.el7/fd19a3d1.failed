@@ -1,0 +1,208 @@
+PKCS#7: Improve and export the X.509 ASN.1 time object decoder
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author David Howells <dhowells@redhat.com>
+commit fd19a3d195be23e8d9d0d66576b96ea25eea8323
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fd19a3d1.failed
+
+Make the X.509 ASN.1 time object decoder fill in a time64_t rather than a
+struct tm to make comparison easier (unfortunately, this makes readable
+display less easy) and export it so that it can be used by the PKCS#7 code
+too.
+
+Further, tighten up its parsing to reject invalid dates (eg. weird
+characters, non-existent hour numbers) and unsupported dates (eg. timezones
+other than 'Z' or dates earlier than 1970).
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+	Reviewed-by: David Woodhouse <David.Woodhouse@intel.com>
+(cherry picked from commit fd19a3d195be23e8d9d0d66576b96ea25eea8323)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	crypto/asymmetric_keys/x509_parser.h
+diff --cc crypto/asymmetric_keys/x509_parser.h
+index 012c70f4f68a,1de01eaec884..000000000000
+--- a/crypto/asymmetric_keys/x509_parser.h
++++ b/crypto/asymmetric_keys/x509_parser.h
+@@@ -19,10 -19,12 +19,19 @@@ struct x509_certificate 
+  	struct public_key_signature sig;	/* Signature parameters */
+  	char		*issuer;		/* Name of certificate issuer */
+  	char		*subject;		/* Name of certificate subject */
+++<<<<<<< HEAD
+ +	char		*fingerprint;		/* Key fingerprint as hex */
+ +	char		*authority;		/* Authority key fingerprint as hex */
+ +	struct tm	valid_from;
+ +	struct tm	valid_to;
+++=======
++ 	struct asymmetric_key_id *id;		/* Issuer + Serial number */
++ 	struct asymmetric_key_id *skid;		/* Subject + subjectKeyId (optional) */
++ 	struct asymmetric_key_id *akid_id;	/* CA AuthKeyId matching ->id (optional) */
++ 	struct asymmetric_key_id *akid_skid;	/* CA AuthKeyId matching ->skid (optional) */
++ 	time64_t	valid_from;
++ 	time64_t	valid_to;
+++>>>>>>> fd19a3d195be (PKCS#7: Improve and export the X.509 ASN.1 time object decoder)
+  	const void	*tbs;			/* Signed data */
+  	unsigned	tbs_size;		/* Size of signed data */
+  	unsigned	raw_sig_size;		/* Size of sigature */
+diff --git a/crypto/asymmetric_keys/x509_cert_parser.c b/crypto/asymmetric_keys/x509_cert_parser.c
+index ac72348c186a..d05201dec785 100644
+--- a/crypto/asymmetric_keys/x509_cert_parser.c
++++ b/crypto/asymmetric_keys/x509_cert_parser.c
+@@ -493,60 +493,105 @@ int x509_process_extension(void *context, size_t hdrlen,
+ 	return 0;
+ }
+ 
+-/*
+- * Record a certificate time.
++/**
++ * x509_decode_time - Decode an X.509 time ASN.1 object
++ * @_t: The time to fill in
++ * @hdrlen: The length of the object header
++ * @tag: The object tag
++ * @value: The object value
++ * @vlen: The size of the object value
++ *
++ * Decode an ASN.1 universal time or generalised time field into a struct the
++ * kernel can handle and check it for validity.  The time is decoded thus:
++ *
++ *	[RFC5280 §4.1.2.5]
++ *	CAs conforming to this profile MUST always encode certificate validity
++ *	dates through the year 2049 as UTCTime; certificate validity dates in
++ *	2050 or later MUST be encoded as GeneralizedTime.  Conforming
++ *	applications MUST be able to process validity dates that are encoded in
++ *	either UTCTime or GeneralizedTime.
+  */
+-static int x509_note_time(struct tm *tm,  size_t hdrlen,
+-			  unsigned char tag,
+-			  const unsigned char *value, size_t vlen)
++int x509_decode_time(time64_t *_t,  size_t hdrlen,
++		     unsigned char tag,
++		     const unsigned char *value, size_t vlen)
+ {
++	static const unsigned char month_lengths[] = { 31, 29, 31, 30, 31, 30,
++						       31, 31, 30, 31, 30, 31 };
+ 	const unsigned char *p = value;
++	unsigned year, mon, day, hour, min, sec, mon_len;
+ 
+-#define dec2bin(X) ((X) - '0')
++#define dec2bin(X) ({ unsigned char x = (X) - '0'; if (x > 9) goto invalid_time; x; })
+ #define DD2bin(P) ({ unsigned x = dec2bin(P[0]) * 10 + dec2bin(P[1]); P += 2; x; })
+ 
+ 	if (tag == ASN1_UNITIM) {
+ 		/* UTCTime: YYMMDDHHMMSSZ */
+ 		if (vlen != 13)
+ 			goto unsupported_time;
+-		tm->tm_year = DD2bin(p);
+-		if (tm->tm_year >= 50)
+-			tm->tm_year += 1900;
++		year = DD2bin(p);
++		if (year >= 50)
++			year += 1900;
+ 		else
+-			tm->tm_year += 2000;
++			year += 2000;
+ 	} else if (tag == ASN1_GENTIM) {
+ 		/* GenTime: YYYYMMDDHHMMSSZ */
+ 		if (vlen != 15)
+ 			goto unsupported_time;
+-		tm->tm_year = DD2bin(p) * 100 + DD2bin(p);
++		year = DD2bin(p) * 100 + DD2bin(p);
++		if (year >= 1950 && year <= 2049)
++			goto invalid_time;
+ 	} else {
+ 		goto unsupported_time;
+ 	}
+ 
+-	tm->tm_year -= 1900;
+-	tm->tm_mon  = DD2bin(p) - 1;
+-	tm->tm_mday = DD2bin(p);
+-	tm->tm_hour = DD2bin(p);
+-	tm->tm_min  = DD2bin(p);
+-	tm->tm_sec  = DD2bin(p);
++	mon  = DD2bin(p);
++	day = DD2bin(p);
++	hour = DD2bin(p);
++	min  = DD2bin(p);
++	sec  = DD2bin(p);
+ 
+ 	if (*p != 'Z')
+ 		goto unsupported_time;
+ 
++	mon_len = month_lengths[mon];
++	if (mon == 2) {
++		if (year % 4 == 0) {
++			mon_len = 29;
++			if (year % 100 == 0) {
++				year /= 100;
++				if (year % 4 != 0)
++					mon_len = 28;
++			}
++		}
++	}
++
++	if (year < 1970 ||
++	    mon < 1 || mon > 12 ||
++	    day < 1 || day > mon_len ||
++	    hour < 0 || hour > 23 ||
++	    min < 0 || min > 59 ||
++	    sec < 0 || sec > 59)
++		goto invalid_time;
++	
++	*_t = mktime64(year, mon, day, hour, min, sec);
+ 	return 0;
+ 
+ unsupported_time:
+-	pr_debug("Got unsupported time [tag %02x]: '%*.*s'\n",
+-		 tag, (int)vlen, (int)vlen, value);
++	pr_debug("Got unsupported time [tag %02x]: '%*phN'\n",
++		 tag, (int)vlen, value);
++	return -EBADMSG;
++invalid_time:
++	pr_debug("Got invalid time [tag %02x]: '%*phN'\n",
++		 tag, (int)vlen, value);
+ 	return -EBADMSG;
+ }
++EXPORT_SYMBOL_GPL(x509_decode_time);
+ 
+ int x509_note_not_before(void *context, size_t hdrlen,
+ 			 unsigned char tag,
+ 			 const void *value, size_t vlen)
+ {
+ 	struct x509_parse_context *ctx = context;
+-	return x509_note_time(&ctx->cert->valid_from, hdrlen, tag, value, vlen);
++	return x509_decode_time(&ctx->cert->valid_from, hdrlen, tag, value, vlen);
+ }
+ 
+ int x509_note_not_after(void *context, size_t hdrlen,
+@@ -554,5 +599,5 @@ int x509_note_not_after(void *context, size_t hdrlen,
+ 			const void *value, size_t vlen)
+ {
+ 	struct x509_parse_context *ctx = context;
+-	return x509_note_time(&ctx->cert->valid_to, hdrlen, tag, value, vlen);
++	return x509_decode_time(&ctx->cert->valid_to, hdrlen, tag, value, vlen);
+ }
+* Unmerged path crypto/asymmetric_keys/x509_parser.h
+diff --git a/crypto/asymmetric_keys/x509_public_key.c b/crypto/asymmetric_keys/x509_public_key.c
+index 1f7402d003d3..03595e2e660e 100644
+--- a/crypto/asymmetric_keys/x509_public_key.c
++++ b/crypto/asymmetric_keys/x509_public_key.c
+@@ -247,14 +247,7 @@ static int x509_key_preparse(struct key_preparsed_payload *prep)
+ 	}
+ 
+ 	pr_devel("Cert Key Algo: %s\n", pkey_algo_name[cert->pub->pkey_algo]);
+-	pr_devel("Cert Valid From: %04ld-%02d-%02d %02d:%02d:%02d\n",
+-		 cert->valid_from.tm_year + 1900, cert->valid_from.tm_mon + 1,
+-		 cert->valid_from.tm_mday, cert->valid_from.tm_hour,
+-		 cert->valid_from.tm_min,  cert->valid_from.tm_sec);
+-	pr_devel("Cert Valid To: %04ld-%02d-%02d %02d:%02d:%02d\n",
+-		 cert->valid_to.tm_year + 1900, cert->valid_to.tm_mon + 1,
+-		 cert->valid_to.tm_mday, cert->valid_to.tm_hour,
+-		 cert->valid_to.tm_min,  cert->valid_to.tm_sec);
++	pr_devel("Cert Valid period: %lld-%lld\n", cert->valid_from, cert->valid_to);
+ 	pr_devel("Cert Signature: %s + %s\n",
+ 		 pkey_algo_name[cert->sig.pkey_algo],
+ 		 hash_algo_name[cert->sig.pkey_hash_algo]);
