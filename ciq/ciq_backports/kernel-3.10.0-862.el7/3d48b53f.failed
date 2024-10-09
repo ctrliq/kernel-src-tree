@@ -1,0 +1,177 @@
+net: dev_weight: TX/RX orthogonality
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] dev_weight: TX/RX orthogonality (Ivan Vecera) [1445420]
+Rebuild_FUZZ: 92.54%
+commit-author Matthias Tafelmeier <matthias.tafelmeier@gmx.net>
+commit 3d48b53fb2ae37158e700ffef3f45461ff15c965
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3d48b53f.failed
+
+Oftenly, introducing side effects on packet processing on the other half
+of the stack by adjusting one of TX/RX via sysctl is not desirable.
+There are cases of demand for asymmetric, orthogonal configurability.
+
+This holds true especially for nodes where RPS for RFS usage on top is
+configured and therefore use the 'old dev_weight'. This is quite a
+common base configuration setup nowadays, even with NICs of superior processing
+support (e.g. aRFS).
+
+A good example use case are nodes acting as noSQL data bases with a
+large number of tiny requests and rather fewer but large packets as responses.
+It's affordable to have large budget and rx dev_weights for the
+requests. But as a side effect having this large a number on TX
+processed in one run can overwhelm drivers.
+
+This patch therefore introduces an independent configurability via sysctl to
+userland.
+
+	Signed-off-by: Matthias Tafelmeier <matthias.tafelmeier@gmx.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3d48b53fb2ae37158e700ffef3f45461ff15c965)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	net/core/dev.c
+diff --cc include/linux/netdevice.h
+index f2e995a93118,ecd78b3c9aba..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -3792,10 -3795,12 +3792,17 @@@ void netdev_stats_to_stats64(struct rtn
+  extern int		netdev_max_backlog;
+  extern int		netdev_tstamp_prequeue;
+  extern int		weight_p;
+++<<<<<<< HEAD
+ +extern int		bpf_jit_enable;
+++=======
++ extern int		dev_weight_rx_bias;
++ extern int		dev_weight_tx_bias;
++ extern int		dev_rx_weight;
++ extern int		dev_tx_weight;
+++>>>>>>> 3d48b53fb2ae (net: dev_weight: TX/RX orthogonality)
+  
+  bool netdev_has_upper_dev(struct net_device *dev, struct net_device *upper_dev);
+ +bool netdev_has_any_upper_dev(struct net_device *dev);
+  struct net_device *netdev_upper_get_next_dev_rcu(struct net_device *dev,
+  						     struct list_head **iter);
+  struct net_device *netdev_all_upper_get_next_dev_rcu(struct net_device *dev,
+diff --cc net/core/dev.c
+index 54ad82302512,56818f7eab2b..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -4669,11 -4837,9 +4673,16 @@@ static int process_backlog(struct napi_
+  		net_rps_action_and_irq_enable(sd);
+  	}
+  
+++<<<<<<< HEAD
+ +	napi->weight = weight_p;
+ +	local_irq_disable();
+ +	while (work < quota) {
+++=======
++ 	napi->weight = dev_rx_weight;
++ 	while (again) {
+++>>>>>>> 3d48b53fb2ae (net: dev_weight: TX/RX orthogonality)
+  		struct sk_buff *skb;
+ +		unsigned int qlen;
+  
+  		while ((skb = __skb_dequeue(&sd->process_queue))) {
+  			rcu_read_lock();
+diff --git a/Documentation/sysctl/net.txt b/Documentation/sysctl/net.txt
+index 279f4bd757e0..26c40b477fe0 100644
+--- a/Documentation/sysctl/net.txt
++++ b/Documentation/sysctl/net.txt
+@@ -50,6 +50,27 @@ The maximum number of packets that kernel can handle on a NAPI interrupt,
+ it's a Per-CPU variable.
+ Default: 64
+ 
++dev_weight_rx_bias
++--------------
++
++RPS (e.g. RFS, aRFS) processing is competing with the registered NAPI poll function
++of the driver for the per softirq cycle netdev_budget. This parameter influences
++the proportion of the configured netdev_budget that is spent on RPS based packet
++processing during RX softirq cycles. It is further meant for making current
++dev_weight adaptable for asymmetric CPU needs on RX/TX side of the network stack.
++(see dev_weight_tx_bias) It is effective on a per CPU basis. Determination is based
++on dev_weight and is calculated multiplicative (dev_weight * dev_weight_rx_bias).
++Default: 1
++
++dev_weight_tx_bias
++--------------
++
++Scales the maximum number of packets that can be processed during a TX softirq cycle.
++Effective on a per CPU basis. Allows scaling of current dev_weight for asymmetric
++net stack processing needs. Be careful to avoid making TX softirq processing a CPU hog.
++Calculation is based on dev_weight (dev_weight * dev_weight_tx_bias).
++Default: 1
++
+ default_qdisc
+ --------------
+ 
+* Unmerged path include/linux/netdevice.h
+* Unmerged path net/core/dev.c
+diff --git a/net/core/sysctl_net_core.c b/net/core/sysctl_net_core.c
+index c11831767296..ca2d9afec36e 100644
+--- a/net/core/sysctl_net_core.c
++++ b/net/core/sysctl_net_core.c
+@@ -111,6 +111,21 @@ static int set_default_qdisc(struct ctl_table *table, int write,
+ }
+ #endif
+ 
++static int proc_do_dev_weight(struct ctl_table *table, int write,
++			   void __user *buffer, size_t *lenp, loff_t *ppos)
++{
++	int ret;
++
++	ret = proc_dointvec(table, write, buffer, lenp, ppos);
++	if (ret != 0)
++		return ret;
++
++	dev_rx_weight = weight_p * dev_weight_rx_bias;
++	dev_tx_weight = weight_p * dev_weight_tx_bias;
++
++	return ret;
++}
++
+ static int proc_do_rss_key(struct ctl_table *table, int write,
+ 			   void __user *buffer, size_t *lenp, loff_t *ppos)
+ {
+@@ -162,7 +177,21 @@ static struct ctl_table net_core_table[] = {
+ 		.data		= &weight_p,
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+-		.proc_handler	= proc_dointvec
++		.proc_handler	= proc_do_dev_weight,
++	},
++	{
++		.procname	= "dev_weight_rx_bias",
++		.data		= &dev_weight_rx_bias,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_do_dev_weight,
++	},
++	{
++		.procname	= "dev_weight_tx_bias",
++		.data		= &dev_weight_tx_bias,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_do_dev_weight,
+ 	},
+ 	{
+ 		.procname	= "netdev_max_backlog",
+diff --git a/net/sched/sch_generic.c b/net/sched/sch_generic.c
+index 57cbfa322683..f3057b83d236 100644
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@ -235,7 +235,7 @@ static inline int qdisc_restart(struct Qdisc *q, int *packets)
+ 
+ void __qdisc_run(struct Qdisc *q)
+ {
+-	int quota = weight_p;
++	int quota = dev_tx_weight;
+ 	int packets;
+ 
+ 	while (qdisc_restart(q, &packets)) {
