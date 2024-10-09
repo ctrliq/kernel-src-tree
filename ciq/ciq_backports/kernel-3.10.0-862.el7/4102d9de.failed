@@ -1,0 +1,251 @@
+dm raid: fix rs_get_progress() synchronization state/ratio
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [md] dm raid: fix rs_get_progress() synchronization state_ratio (Heinz Mauelshagen) [1388632 1508070]
+Rebuild_FUZZ: 98.28%
+commit-author Heinz Mauelshagen <heinzm@redhat.com>
+commit 4102d9de6d375fc27ec70382c4068f4f9f62ce4f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4102d9de.failed
+
+Fix various sync state issues causing racy/bogus sync ratio,
+sync_action ad health chars in dm_status() info output.
+
+Sync ratio could be N/N (i.e. 100%) shortly after raid set
+creation, i.e. creating a new RaidLV or upconverting a linear LV to
+raid1 thus:
+  "0 2097152 raid raid1 2 Aa 2097162/2097152 recover 0 0 -"
+instead of:
+  "0 2097152 raid raid1 2 Aa 0/2097152 idle 0 0 -"
+
+Sync action could be non-idle, when the MD thread was done with io.
+
+Health chars could be 'A' when they should be 'a' for a short time
+before a resynchonization started.
+
+	Signed-off-by: Heinz Mauelshagen <heinzm@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 4102d9de6d375fc27ec70382c4068f4f9f62ce4f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-raid.c
+diff --cc drivers/md/dm-raid.c
+index a5a315efdf86,7e7075fb9c28..000000000000
+--- a/drivers/md/dm-raid.c
++++ b/drivers/md/dm-raid.c
+@@@ -203,6 -209,8 +203,11 @@@ struct raid_dev 
+  #define RT_FLAG_UPDATE_SBS		3
+  #define RT_FLAG_RESHAPE_RS		4
+  #define RT_FLAG_RS_SUSPENDED		5
+++<<<<<<< HEAD
+++=======
++ #define RT_FLAG_RS_IN_SYNC		6
++ #define RT_FLAG_RS_RESYNCING		7
+++>>>>>>> 4102d9de6d37 (dm raid: fix rs_get_progress() synchronization state/ratio)
+  
+  /* Array elements of 64 bit needed for rebuild/failed disk bits */
+  #define DISKS_ARRAY_ELEMS ((MAX_RAID_DEVICES + (sizeof(uint64_t) * 8 - 1)) / sizeof(uint64_t) / 8)
+@@@ -3230,20 -3302,22 +3235,28 @@@ static int raid_map(struct dm_target *t
+  }
+  
+  /* Return string describing the current sync action of @mddev */
+ -static const char *decipher_sync_action(struct mddev *mddev, unsigned long recovery)
+ +static const char *decipher_sync_action(struct mddev *mddev)
+  {
+ -	if (test_bit(MD_RECOVERY_FROZEN, &recovery))
+ +	if (test_bit(MD_RECOVERY_FROZEN, &mddev->recovery))
+  		return "frozen";
+  
+++<<<<<<< HEAD
+ +	if (test_bit(MD_RECOVERY_RUNNING, &mddev->recovery) ||
+ +	    (!mddev->ro && test_bit(MD_RECOVERY_NEEDED, &mddev->recovery))) {
+ +		if (test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery))
+++=======
++ 	/* The MD sync thread can be done with io but still be running */
++ 	if (!test_bit(MD_RECOVERY_DONE, &recovery) &&
++ 	    (test_bit(MD_RECOVERY_RUNNING, &recovery) ||
++ 	     (!mddev->ro && test_bit(MD_RECOVERY_NEEDED, &recovery)))) {
++ 		if (test_bit(MD_RECOVERY_RESHAPE, &recovery))
+++>>>>>>> 4102d9de6d37 (dm raid: fix rs_get_progress() synchronization state/ratio)
+  			return "reshape";
+  
+ -		if (test_bit(MD_RECOVERY_SYNC, &recovery)) {
+ -			if (!test_bit(MD_RECOVERY_REQUESTED, &recovery))
+ +		if (test_bit(MD_RECOVERY_SYNC, &mddev->recovery)) {
+ +			if (!test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery))
+  				return "resync";
+ -			else if (test_bit(MD_RECOVERY_CHECK, &recovery))
+ +			else if (test_bit(MD_RECOVERY_CHECK, &mddev->recovery))
+  				return "check";
+  			return "repair";
+  		}
+@@@ -3272,65 -3346,91 +3285,134 @@@ static const char *__raid_dev_status(st
+  	else if (test_bit(Faulty, &rdev->flags))
+  		return "D";
+  	else if (test_bit(Journal, &rdev->flags))
+++<<<<<<< HEAD
+ +		return "A";
+ +	else if (!array_in_sync || !test_bit(In_sync, &rdev->flags))
+++=======
++ 		return (rs->journal_dev.mode == R5C_JOURNAL_MODE_WRITE_THROUGH) ? "A" : "a";
++ 	else if (test_bit(RT_FLAG_RS_RESYNCING, &rs->runtime_flags) ||
++ 		 (!test_bit(RT_FLAG_RS_IN_SYNC, &rs->runtime_flags) &&
++ 		  !test_bit(In_sync, &rdev->flags)))
+++>>>>>>> 4102d9de6d37 (dm raid: fix rs_get_progress() synchronization state/ratio)
+  		return "a";
+  	else
+  		return "A";
+  }
+  
+ -/* Helper to return resync/reshape progress for @rs and runtime flags for raid set in sync / resynching */
+ -static sector_t rs_get_progress(struct raid_set *rs, unsigned long recovery,
+ -				sector_t resync_max_sectors)
+ +/* Helper to return resync/reshape progress for @rs and @array_in_sync */
+ +static sector_t rs_get_progress(struct raid_set *rs,
+ +				sector_t resync_max_sectors, bool *array_in_sync)
+  {
+++<<<<<<< HEAD
+ +	sector_t r, recovery_cp, curr_resync_completed;
+ +	struct mddev *mddev = &rs->md;
+ +
+ +	curr_resync_completed = mddev->curr_resync_completed ?: mddev->recovery_cp;
+ +	recovery_cp = mddev->recovery_cp;
+ +	*array_in_sync = false;
+++=======
++ 	sector_t r;
++ 	struct mddev *mddev = &rs->md;
++ 
++ 	clear_bit(RT_FLAG_RS_IN_SYNC, &rs->runtime_flags);
++ 	clear_bit(RT_FLAG_RS_RESYNCING, &rs->runtime_flags);
+++>>>>>>> 4102d9de6d37 (dm raid: fix rs_get_progress() synchronization state/ratio)
+  
+  	if (rs_is_raid0(rs)) {
+  		r = resync_max_sectors;
+ -		set_bit(RT_FLAG_RS_IN_SYNC, &rs->runtime_flags);
+ +		*array_in_sync = true;
+  
+  	} else {
+- 		r = mddev->reshape_position;
+- 
+  		/* Reshape is relative to the array size */
+++<<<<<<< HEAD
+ +		if (test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery) ||
+ +		    r != MaxSector) {
+ +			if (r == MaxSector) {
+ +				*array_in_sync = true;
+ +				r = resync_max_sectors;
+ +			} else {
+++=======
++ 		if (test_bit(MD_RECOVERY_RESHAPE, &recovery)) {
++ 			r = mddev->reshape_position;
++ 			if (r != MaxSector) {
+++>>>>>>> 4102d9de6d37 (dm raid: fix rs_get_progress() synchronization state/ratio)
+  				/* Got to reverse on backward reshape */
+  				if (mddev->reshape_backwards)
+  					r = mddev->array_sectors - r;
+  
+- 				/* Devide by # of data stripes */
+- 				sector_div(r, mddev_data_stripes(rs));
++ 				/* Divide by # of data stripes unless raid1 */
++ 				if (!rs_is_raid1(rs))
++ 					sector_div(r, mddev_data_stripes(rs));
+  			}
+  
+++<<<<<<< HEAD
+ +		/* Sync is relative to the component device size */
+ +		} else if (test_bit(MD_RECOVERY_RUNNING, &mddev->recovery))
+ +			r = curr_resync_completed;
+++=======
++ 		/*
++ 		 * Sync/recover is relative to the component device size.
++ 		 *
++ 		 * MD_RECOVERY_NEEDED for https://bugzilla.redhat.com/show_bug.cgi?id=1508070
++ 		 */
++ 		} else if (test_bit(MD_RECOVERY_NEEDED, &recovery) ||
++ 			   test_bit(MD_RECOVERY_RUNNING, &recovery))
++ 			r = mddev->curr_resync_completed;
++ 
+++>>>>>>> 4102d9de6d37 (dm raid: fix rs_get_progress() synchronization state/ratio)
+  		else
+ -			r = mddev->recovery_cp;
+ +			r = recovery_cp;
+  
+++<<<<<<< HEAD
+ +		if (r == MaxSector) {
+ +			/*
+ +			 * Sync complete.
+ +			 */
+ +			*array_in_sync = true;
+ +			r = resync_max_sectors;
+ +		} else if (test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery)) {
+++=======
++ 		if (r >= resync_max_sectors &&
++ 		    (!test_bit(MD_RECOVERY_REQUESTED, &recovery) ||
++ 		     (!test_bit(MD_RECOVERY_FROZEN, &recovery) &&
++ 		      !test_bit(MD_RECOVERY_NEEDED, &recovery) &&
++ 		      !test_bit(MD_RECOVERY_RUNNING, &recovery)))) {
++ 			/*
++ 			 * Sync complete.
++ 			 */
++ 			/* In case we have finished recovering, the array is in sync. */
++ 			if (test_bit(MD_RECOVERY_RECOVER, &recovery))
++ 				set_bit(RT_FLAG_RS_IN_SYNC, &rs->runtime_flags);
++ 
++ 		} else if (test_bit(MD_RECOVERY_RECOVER, &recovery)) {
++ 			/*
++ 			 * In case we are recovering, the array is not in sync
++ 			 * and health chars should show the recovering legs.
++ 			 */
++ 			;
++ 
++ 		} else if (test_bit(MD_RECOVERY_SYNC, &recovery) &&
++ 			   !test_bit(MD_RECOVERY_REQUESTED, &recovery)) {
++ 			/*
++ 			 * If "resync" is occurring, the raid set
++ 			 * is or may be out of sync hence the health
++ 			 * characters shall be 'a'.
++ 			 */
++ 			set_bit(RT_FLAG_RS_RESYNCING, &rs->runtime_flags);
++ 
++ 		} else if (test_bit(MD_RECOVERY_REQUESTED, &recovery)) {
+++>>>>>>> 4102d9de6d37 (dm raid: fix rs_get_progress() synchronization state/ratio)
+  			/*
+  			 * If "check" or "repair" is occurring, the raid set has
+  			 * undergone an initial sync and the health characters
+  			 * should not be 'a' anymore.
+  			 */
+++<<<<<<< HEAD
+ +			*array_in_sync = true;
+++=======
++ 			set_bit(RT_FLAG_RS_IN_SYNC, &rs->runtime_flags);
++ 
+++>>>>>>> 4102d9de6d37 (dm raid: fix rs_get_progress() synchronization state/ratio)
+  		} else {
+  			struct md_rdev *rdev;
+  
+@@@ -3340,13 -3447,13 +3429,21 @@@
+  			 * devices are In_sync, then it is the raid set that is
+  			 * being initialized.
+  			 */
++ 			set_bit(RT_FLAG_RS_IN_SYNC, &rs->runtime_flags);
+  			rdev_for_each(rdev, mddev)
+  				if (!test_bit(Journal, &rdev->flags) &&
+++<<<<<<< HEAD
+ +				    !test_bit(In_sync, &rdev->flags))
+ +					*array_in_sync = true;
+ +#if 0
+ +			r = 0; /* HM FIXME: TESTME: https://bugzilla.redhat.com/show_bug.cgi?id=1210637 ? */
+ +#endif
+++=======
++ 				    !test_bit(In_sync, &rdev->flags)) {
++ 					clear_bit(RT_FLAG_RS_IN_SYNC, &rs->runtime_flags);
++ 					break;
++ 				}
+++>>>>>>> 4102d9de6d37 (dm raid: fix rs_get_progress() synchronization state/ratio)
+  		}
+  	}
+  
+* Unmerged path drivers/md/dm-raid.c
