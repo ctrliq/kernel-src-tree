@@ -1,0 +1,236 @@
+futex: Provide and use pi_state_update_owner()
+
+jira LE-1907
+cve CVE-2021-3347
+Rebuild_History Non-Buildable kernel-3.10.0-1160.31.1.el7
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit c5cade200ab9a2a3be9e7f32a752c8d86b502ec7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.31.1.el7/c5cade20.failed
+
+Updating pi_state::owner is done at several places with the same
+code. Provide a function for it and use that at the obvious places.
+
+This is also a preparation for a bug fix to avoid yet another copy of the
+same code or alternatively introducing a completely unpenetratable mess of
+gotos.
+
+Originally-by: Peter Zijlstra <peterz@infradead.org>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: stable@vger.kernel.org
+(cherry picked from commit c5cade200ab9a2a3be9e7f32a752c8d86b502ec7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/futex.c
+diff --cc kernel/futex.c
+index 877831775d7a,7837f9e561fa..000000000000
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@@ -640,9 -763,44 +640,36 @@@ static struct futex_pi_state * alloc_pi
+  	return pi_state;
+  }
+  
+++<<<<<<< HEAD
+ +static void free_pi_state(struct futex_pi_state *pi_state)
+++=======
++ static void pi_state_update_owner(struct futex_pi_state *pi_state,
++ 				  struct task_struct *new_owner)
++ {
++ 	struct task_struct *old_owner = pi_state->owner;
++ 
++ 	lockdep_assert_held(&pi_state->pi_mutex.wait_lock);
++ 
++ 	if (old_owner) {
++ 		raw_spin_lock(&old_owner->pi_lock);
++ 		WARN_ON(list_empty(&pi_state->list));
++ 		list_del_init(&pi_state->list);
++ 		raw_spin_unlock(&old_owner->pi_lock);
++ 	}
++ 
++ 	if (new_owner) {
++ 		raw_spin_lock(&new_owner->pi_lock);
++ 		WARN_ON(!list_empty(&pi_state->list));
++ 		list_add(&pi_state->list, &new_owner->pi_state_list);
++ 		pi_state->owner = new_owner;
++ 		raw_spin_unlock(&new_owner->pi_lock);
++ 	}
++ }
++ 
++ static void get_pi_state(struct futex_pi_state *pi_state)
+++>>>>>>> c5cade200ab9 (futex: Provide and use pi_state_update_owner())
+  {
+ -	WARN_ON_ONCE(!refcount_inc_not_zero(&pi_state->refcount));
+ -}
+ -
+ -/*
+ - * Drops a reference to the pi_state object and frees or caches it
+ - * when the last reference is gone.
+ - */
+ -static void put_pi_state(struct futex_pi_state *pi_state)
+ -{
+ -	if (!pi_state)
+ -		return;
+ -
+ -	if (!refcount_dec_and_test(&pi_state->refcount))
+ +	if (!atomic_dec_and_test(&pi_state->refcount))
+  		return;
+  
+  	/*
+@@@ -1159,46 -1525,42 +1186,72 @@@ static int wake_futex_pi(u32 __user *ua
+  	 */
+  	newval = FUTEX_WAITERS | task_pid_vnr(new_owner);
+  
+ -	if (unlikely(should_fail_futex(true))) {
+ +	if (cmpxchg_futex_value_locked(&curval, uaddr, uval, newval))
+  		ret = -EFAULT;
+ -		goto out_unlock;
+ +	else if (curval != uval)
+ +		ret = -EINVAL;
+ +	if (ret) {
+ +		raw_spin_unlock(&pi_state->pi_mutex.wait_lock);
+ +		return ret;
+  	}
+  
+++<<<<<<< HEAD
+ +	raw_spin_lock_irq(&pi_state->owner->pi_lock);
+ +	WARN_ON(list_empty(&pi_state->list));
+ +	list_del_init(&pi_state->list);
+ +	raw_spin_unlock_irq(&pi_state->owner->pi_lock);
+ +
+ +	raw_spin_lock_irq(&new_owner->pi_lock);
+ +	WARN_ON(!list_empty(&pi_state->list));
+ +	list_add(&pi_state->list, &new_owner->pi_state_list);
+ +	pi_state->owner = new_owner;
+ +	raw_spin_unlock_irq(&new_owner->pi_lock);
+ +
+ +	raw_spin_unlock(&pi_state->pi_mutex.wait_lock);
+ +	rt_mutex_unlock(&pi_state->pi_mutex);
+++=======
++ 	ret = cmpxchg_futex_value_locked(&curval, uaddr, uval, newval);
++ 	if (!ret && (curval != uval)) {
++ 		/*
++ 		 * If a unconditional UNLOCK_PI operation (user space did not
++ 		 * try the TID->0 transition) raced with a waiter setting the
++ 		 * FUTEX_WAITERS flag between get_user() and locking the hash
++ 		 * bucket lock, retry the operation.
++ 		 */
++ 		if ((FUTEX_TID_MASK & curval) == uval)
++ 			ret = -EAGAIN;
++ 		else
++ 			ret = -EINVAL;
++ 	}
++ 
++ 	if (!ret) {
++ 		/*
++ 		 * This is a point of no return; once we modified the uval
++ 		 * there is no going back and subsequent operations must
++ 		 * not fail.
++ 		 */
++ 		pi_state_update_owner(pi_state, new_owner);
++ 		postunlock = __rt_mutex_futex_unlock(&pi_state->pi_mutex, &wake_q);
++ 	}
+++>>>>>>> c5cade200ab9 (futex: Provide and use pi_state_update_owner())
+  
+ -out_unlock:
+ -	raw_spin_unlock_irq(&pi_state->pi_mutex.wait_lock);
+ +	return 0;
+ +}
+  
+ -	if (postunlock)
+ -		rt_mutex_postunlock(&wake_q);
+ +static int unlock_futex_pi(u32 __user *uaddr, u32 uval)
+ +{
+ +	u32 uninitialized_var(oldval);
+  
+ -	return ret;
+ +	/*
+ +	 * There is no waiter, so we unlock the futex. The owner died
+ +	 * bit has not to be preserved here. We are the owner:
+ +	 */
+ +	if (cmpxchg_futex_value_locked(&oldval, uaddr, uval, 0))
+ +		return -EFAULT;
+ +	if (oldval != uval)
+ +		return -EAGAIN;
+ +
+ +	return 0;
+  }
+  
+  /*
+@@@ -1953,37 -2445,46 +2006,44 @@@ retry
+  	 * We fixed up user space. Now we need to fix the pi_state
+  	 * itself.
+  	 */
+++<<<<<<< HEAD
+ +	if (pi_state->owner != NULL) {
+ +		raw_spin_lock_irq(&pi_state->owner->pi_lock);
+ +		WARN_ON(list_empty(&pi_state->list));
+ +		list_del_init(&pi_state->list);
+ +		raw_spin_unlock_irq(&pi_state->owner->pi_lock);
+ +	}
+ +
+ +	pi_state->owner = newowner;
+ +
+ +	raw_spin_lock_irq(&newowner->pi_lock);
+ +	WARN_ON(!list_empty(&pi_state->list));
+ +	list_add(&pi_state->list, &newowner->pi_state_list);
+ +	raw_spin_unlock_irq(&newowner->pi_lock);
+ +	return 0;
+++=======
++ 	pi_state_update_owner(pi_state, newowner);
++ 	raw_spin_unlock_irq(&pi_state->pi_mutex.wait_lock);
++ 
++ 	return argowner == current;
+++>>>>>>> c5cade200ab9 (futex: Provide and use pi_state_update_owner())
+  
+  	/*
+ -	 * In order to reschedule or handle a page fault, we need to drop the
+ -	 * locks here. In the case of a fault, this gives the other task
+ -	 * (either the highest priority waiter itself or the task which stole
+ -	 * the rtmutex) the chance to try the fixup of the pi_state. So once we
+ -	 * are back from handling the fault we need to check the pi_state after
+ -	 * reacquiring the locks and before trying to do another fixup. When
+ -	 * the fixup has been done already we simply return.
+ -	 *
+ -	 * Note: we hold both hb->lock and pi_mutex->wait_lock. We can safely
+ -	 * drop hb->lock since the caller owns the hb -> futex_q relation.
+ -	 * Dropping the pi_mutex->wait_lock requires the state revalidate.
+ +	 * To handle the page fault we need to drop the hash bucket
+ +	 * lock here. That gives the other task (either the highest priority
+ +	 * waiter itself or the task which stole the rtmutex) the
+ +	 * chance to try the fixup of the pi_state. So once we are
+ +	 * back from handling the fault we need to check the pi_state
+ +	 * after reacquiring the hash bucket lock and before trying to
+ +	 * do another fixup. When the fixup has been done already we
+ +	 * simply return.
+  	 */
+ -handle_err:
+ -	raw_spin_unlock_irq(&pi_state->pi_mutex.wait_lock);
+ +handle_fault:
+  	spin_unlock(q->lock_ptr);
+  
+ -	switch (err) {
+ -	case -EFAULT:
+ -		ret = fault_in_user_writeable(uaddr);
+ -		break;
+ -
+ -	case -EAGAIN:
+ -		cond_resched();
+ -		ret = 0;
+ -		break;
+ -
+ -	default:
+ -		WARN_ON_ONCE(1);
+ -		ret = err;
+ -		break;
+ -	}
+ +	ret = fault_in_user_writeable(uaddr);
+  
+  	spin_lock(q->lock_ptr);
+ -	raw_spin_lock_irq(&pi_state->pi_mutex.wait_lock);
+  
+  	/*
+  	 * Check if someone else fixed it for us:
+* Unmerged path kernel/futex.c
