@@ -1,0 +1,274 @@
+switchdev: introduce transaction item queue for attr_set and obj_add
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 7ea6eb3f56f45cf4babae8b9a7421868e5005f17
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7ea6eb3f.failed
+
+Now, the memory allocation in prepare/commit state is done separatelly
+in each driver (rocker). Introduce the similar mechanism in generic
+switchdev code, in form of queue. That can be used not only for memory
+allocations, but also for different items. Abort item destruction
+is handled as well.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7ea6eb3f56f45cf4babae8b9a7421868e5005f17)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/networking/switchdev.txt
+#	drivers/net/ethernet/rocker/rocker.c
+#	include/net/switchdev.h
+#	net/dsa/slave.c
+#	net/switchdev/switchdev.c
+diff --cc net/dsa/slave.c
+index 6ebd8fbd9285,ac76fd15ad8b..000000000000
+--- a/net/dsa/slave.c
++++ b/net/dsa/slave.c
+@@@ -171,6 -418,230 +171,233 @@@ static int dsa_slave_ioctl(struct net_d
+  	return -EOPNOTSUPP;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Return a bitmask of all ports being currently bridged within a given bridge
++  * device. Note that on leave, the mask will still return the bitmask of ports
++  * currently bridged, prior to port removal, and this is exactly what we want.
++  */
++ static u32 dsa_slave_br_port_mask(struct dsa_switch *ds,
++ 				  struct net_device *bridge)
++ {
++ 	struct dsa_slave_priv *p;
++ 	unsigned int port;
++ 	u32 mask = 0;
++ 
++ 	for (port = 0; port < DSA_MAX_PORTS; port++) {
++ 		if (!dsa_is_port_initialized(ds, port))
++ 			continue;
++ 
++ 		p = netdev_priv(ds->ports[port]);
++ 
++ 		if (ds->ports[port]->priv_flags & IFF_BRIDGE_PORT &&
++ 		    p->bridge_dev == bridge)
++ 			mask |= 1 << port;
++ 	}
++ 
++ 	return mask;
++ }
++ 
++ static int dsa_slave_stp_update(struct net_device *dev, u8 state)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 	int ret = -EOPNOTSUPP;
++ 
++ 	if (ds->drv->port_stp_update)
++ 		ret = ds->drv->port_stp_update(ds, p->port, state);
++ 
++ 	return ret;
++ }
++ 
++ static int dsa_slave_port_attr_set(struct net_device *dev,
++ 				   struct switchdev_attr *attr,
++ 				   struct switchdev_trans *trans)
++ {
++ 	int ret = 0;
++ 
++ 	switch (attr->id) {
++ 	case SWITCHDEV_ATTR_PORT_STP_STATE:
++ 		if (attr->trans_ph == SWITCHDEV_TRANS_COMMIT)
++ 			ret = dsa_slave_stp_update(dev, attr->u.stp_state);
++ 		break;
++ 	default:
++ 		ret = -EOPNOTSUPP;
++ 		break;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int dsa_slave_port_obj_add(struct net_device *dev,
++ 				  struct switchdev_obj *obj,
++ 				  struct switchdev_trans *trans)
++ {
++ 	int err;
++ 
++ 	/* For the prepare phase, ensure the full set of changes is feasable in
++ 	 * one go in order to signal a failure properly. If an operation is not
++ 	 * supported, return -EOPNOTSUPP.
++ 	 */
++ 
++ 	switch (obj->id) {
++ 	case SWITCHDEV_OBJ_PORT_FDB:
++ 		err = dsa_slave_port_fdb_add(dev, obj);
++ 		break;
++ 	case SWITCHDEV_OBJ_PORT_VLAN:
++ 		err = dsa_slave_port_vlan_add(dev, obj);
++ 		break;
++ 	default:
++ 		err = -EOPNOTSUPP;
++ 		break;
++ 	}
++ 
++ 	return err;
++ }
++ 
++ static int dsa_slave_port_obj_del(struct net_device *dev,
++ 				  struct switchdev_obj *obj)
++ {
++ 	int err;
++ 
++ 	switch (obj->id) {
++ 	case SWITCHDEV_OBJ_PORT_FDB:
++ 		err = dsa_slave_port_fdb_del(dev, obj);
++ 		break;
++ 	case SWITCHDEV_OBJ_PORT_VLAN:
++ 		err = dsa_slave_port_vlan_del(dev, obj);
++ 		break;
++ 	default:
++ 		err = -EOPNOTSUPP;
++ 		break;
++ 	}
++ 
++ 	return err;
++ }
++ 
++ static int dsa_slave_port_obj_dump(struct net_device *dev,
++ 				   struct switchdev_obj *obj)
++ {
++ 	int err;
++ 
++ 	switch (obj->id) {
++ 	case SWITCHDEV_OBJ_PORT_FDB:
++ 		err = dsa_slave_port_fdb_dump(dev, obj);
++ 		break;
++ 	case SWITCHDEV_OBJ_PORT_VLAN:
++ 		err = dsa_slave_port_vlan_dump(dev, obj);
++ 		break;
++ 	default:
++ 		err = -EOPNOTSUPP;
++ 		break;
++ 	}
++ 
++ 	return err;
++ }
++ 
++ static int dsa_slave_bridge_port_join(struct net_device *dev,
++ 				      struct net_device *br)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 	int ret = -EOPNOTSUPP;
++ 
++ 	p->bridge_dev = br;
++ 
++ 	if (ds->drv->port_join_bridge)
++ 		ret = ds->drv->port_join_bridge(ds, p->port,
++ 						dsa_slave_br_port_mask(ds, br));
++ 
++ 	return ret;
++ }
++ 
++ static int dsa_slave_bridge_port_leave(struct net_device *dev)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 	int ret = -EOPNOTSUPP;
++ 
++ 
++ 	if (ds->drv->port_leave_bridge)
++ 		ret = ds->drv->port_leave_bridge(ds, p->port,
++ 						 dsa_slave_br_port_mask(ds, p->bridge_dev));
++ 
++ 	p->bridge_dev = NULL;
++ 
++ 	/* Port left the bridge, put in BR_STATE_DISABLED by the bridge layer,
++ 	 * so allow it to be in BR_STATE_FORWARDING to be kept functional
++ 	 */
++ 	dsa_slave_stp_update(dev, BR_STATE_FORWARDING);
++ 
++ 	return ret;
++ }
++ 
++ static int dsa_slave_port_attr_get(struct net_device *dev,
++ 				   struct switchdev_attr *attr)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct dsa_switch *ds = p->parent;
++ 
++ 	switch (attr->id) {
++ 	case SWITCHDEV_ATTR_PORT_PARENT_ID:
++ 		attr->u.ppid.id_len = sizeof(ds->index);
++ 		memcpy(&attr->u.ppid.id, &ds->index, attr->u.ppid.id_len);
++ 		break;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static inline netdev_tx_t dsa_netpoll_send_skb(struct dsa_slave_priv *p,
++ 					       struct sk_buff *skb)
++ {
++ #ifdef CONFIG_NET_POLL_CONTROLLER
++ 	if (p->netpoll)
++ 		netpoll_send_skb(p->netpoll, skb);
++ #else
++ 	BUG();
++ #endif
++ 	return NETDEV_TX_OK;
++ }
++ 
++ static netdev_tx_t dsa_slave_xmit(struct sk_buff *skb, struct net_device *dev)
++ {
++ 	struct dsa_slave_priv *p = netdev_priv(dev);
++ 	struct sk_buff *nskb;
++ 
++ 	dev->stats.tx_packets++;
++ 	dev->stats.tx_bytes += skb->len;
++ 
++ 	/* Transmit function may have to reallocate the original SKB */
++ 	nskb = p->xmit(skb, dev);
++ 	if (!nskb)
++ 		return NETDEV_TX_OK;
++ 
++ 	/* SKB for netpoll still need to be mangled with the protocol-specific
++ 	 * tag to be successfully transmitted
++ 	 */
++ 	if (unlikely(netpoll_tx_running(dev)))
++ 		return dsa_netpoll_send_skb(p, nskb);
++ 
++ 	/* Queue the SKB for transmission on the parent interface, but
++ 	 * do not modify its EtherType
++ 	 */
++ 	nskb->dev = p->parent->dst->master_netdev;
++ 	dev_queue_xmit(nskb);
++ 
++ 	return NETDEV_TX_OK;
++ }
++ 
++ static struct sk_buff *dsa_slave_notag_xmit(struct sk_buff *skb,
++ 					    struct net_device *dev)
++ {
++ 	/* Just return the original SKB */
++ 	return skb;
++ }
++ 
+++>>>>>>> 7ea6eb3f56f4 (switchdev: introduce transaction item queue for attr_set and obj_add)
+  
+  /* ethtool operations *******************************************************/
+  static int
+* Unmerged path Documentation/networking/switchdev.txt
+* Unmerged path drivers/net/ethernet/rocker/rocker.c
+* Unmerged path include/net/switchdev.h
+* Unmerged path net/switchdev/switchdev.c
+* Unmerged path Documentation/networking/switchdev.txt
+* Unmerged path drivers/net/ethernet/rocker/rocker.c
+* Unmerged path include/net/switchdev.h
+* Unmerged path net/dsa/slave.c
+* Unmerged path net/switchdev/switchdev.c
