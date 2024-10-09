@@ -1,0 +1,143 @@
+drm/i915/gen9: Increase PCODE request timeout to 50ms
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [drm] i915/gen9: Increase PCODE request timeout to 50ms (Rob Clark) [1422186]
+Rebuild_FUZZ: 96.08%
+commit-author Imre Deak <imre.deak@intel.com>
+commit 0129936ddda26afd5d9d207c4e86b2425952579f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/0129936d.failed
+
+After
+commit 2c7d0602c815277f7cb7c932b091288710d8aba7
+Author: Imre Deak <imre.deak@intel.com>
+Date:   Mon Dec 5 18:27:37 2016 +0200
+
+    drm/i915/gen9: Fix PCODE polling during CDCLK change notification
+
+there is still one report of the CDCLK-change request timing out on a
+KBL machine, see the Reference link. On that machine the maximum time
+the request took to succeed was 34ms, so increase the timeout to 50ms.
+
+v2:
+- Change timeout from 100 to 50 ms to maintain the current 50 ms limit
+  for atomic waits in the driver. (Chris, Tvrtko)
+
+Reference: https://bugs.freedesktop.org/show_bug.cgi?id=99345
+	Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+	Cc: Chris Wilson <chris@chris-wilson.co.uk>
+	Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Imre Deak <imre.deak@intel.com>
+	Acked-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: http://patchwork.freedesktop.org/patch/msgid/1487946730-17162-1-git-send-email-imre.deak@intel.com
+(cherry picked from commit 0129936ddda26afd5d9d207c4e86b2425952579f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_pm.c
+diff --cc drivers/gpu/drm/i915/intel_pm.c
+index 228daaae43d5,c6938350a6c4..000000000000
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@@ -7584,21 -7905,80 +7584,94 @@@ int sandybridge_pcode_write(struct drm_
+  	return 0;
+  }
+  
+ -static bool skl_pcode_try_request(struct drm_i915_private *dev_priv, u32 mbox,
+ -				  u32 request, u32 reply_mask, u32 reply,
+ -				  u32 *status)
+ +static int vlv_gpu_freq_div(unsigned int czclk_freq)
+  {
+++<<<<<<< HEAD
+ +	switch (czclk_freq) {
+ +	case 200:
+ +		return 10;
+ +	case 267:
+ +		return 12;
+ +	case 320:
+ +	case 333:
+ +		return 16;
+ +	case 400:
+ +		return 20;
+ +	default:
+ +		return -1;
+ +	}
+++=======
++ 	u32 val = request;
++ 
++ 	*status = sandybridge_pcode_read(dev_priv, mbox, &val);
++ 
++ 	return *status || ((val & reply_mask) == reply);
++ }
++ 
++ /**
++  * skl_pcode_request - send PCODE request until acknowledgment
++  * @dev_priv: device private
++  * @mbox: PCODE mailbox ID the request is targeted for
++  * @request: request ID
++  * @reply_mask: mask used to check for request acknowledgment
++  * @reply: value used to check for request acknowledgment
++  * @timeout_base_ms: timeout for polling with preemption enabled
++  *
++  * Keep resending the @request to @mbox until PCODE acknowledges it, PCODE
++  * reports an error or an overall timeout of @timeout_base_ms+50 ms expires.
++  * The request is acknowledged once the PCODE reply dword equals @reply after
++  * applying @reply_mask. Polling is first attempted with preemption enabled
++  * for @timeout_base_ms and if this times out for another 50 ms with
++  * preemption disabled.
++  *
++  * Returns 0 on success, %-ETIMEDOUT in case of a timeout, <0 in case of some
++  * other error as reported by PCODE.
++  */
++ int skl_pcode_request(struct drm_i915_private *dev_priv, u32 mbox, u32 request,
++ 		      u32 reply_mask, u32 reply, int timeout_base_ms)
++ {
++ 	u32 status;
++ 	int ret;
++ 
++ 	WARN_ON(!mutex_is_locked(&dev_priv->rps.hw_lock));
++ 
++ #define COND skl_pcode_try_request(dev_priv, mbox, request, reply_mask, reply, \
++ 				   &status)
++ 
++ 	/*
++ 	 * Prime the PCODE by doing a request first. Normally it guarantees
++ 	 * that a subsequent request, at most @timeout_base_ms later, succeeds.
++ 	 * _wait_for() doesn't guarantee when its passed condition is evaluated
++ 	 * first, so send the first request explicitly.
++ 	 */
++ 	if (COND) {
++ 		ret = 0;
++ 		goto out;
++ 	}
++ 	ret = _wait_for(COND, timeout_base_ms * 1000, 10);
++ 	if (!ret)
++ 		goto out;
++ 
++ 	/*
++ 	 * The above can time out if the number of requests was low (2 in the
++ 	 * worst case) _and_ PCODE was busy for some reason even after a
++ 	 * (queued) request and @timeout_base_ms delay. As a workaround retry
++ 	 * the poll with preemption disabled to maximize the number of
++ 	 * requests. Increase the timeout from @timeout_base_ms to 50ms to
++ 	 * account for interrupts that could reduce the number of these
++ 	 * requests, and for any quirks of the PCODE firmware that delays
++ 	 * the request completion.
++ 	 */
++ 	DRM_DEBUG_KMS("PCODE timeout, retrying with preemption disabled\n");
++ 	WARN_ON_ONCE(timeout_base_ms > 3);
++ 	preempt_disable();
++ 	ret = wait_for_atomic(COND, 50);
++ 	preempt_enable();
++ 
++ out:
++ 	return ret ? ret : status;
++ #undef COND
+++>>>>>>> 0129936ddda2 (drm/i915/gen9: Increase PCODE request timeout to 50ms)
+  }
+  
+  static int byt_gpu_freq(struct drm_i915_private *dev_priv, int val)
+* Unmerged path drivers/gpu/drm/i915/intel_pm.c
