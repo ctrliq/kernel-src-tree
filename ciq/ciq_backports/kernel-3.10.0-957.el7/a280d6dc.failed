@@ -1,0 +1,386 @@
+ipc/sem: introduce semctl(SEM_STAT_ANY)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [ipc] sem: introduce semctl(SEM_STAT_ANY) (Joe Lawrence) [1579402]
+Rebuild_FUZZ: 94.59%
+commit-author Davidlohr Bueso <dave@stgolabs.net>
+commit a280d6dc77eb6002f269d58cd47c7c7e69b617b6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/a280d6dc.failed
+
+There is a permission discrepancy when consulting shm ipc object
+metadata between /proc/sysvipc/sem (0444) and the SEM_STAT semctl
+command.  The later does permission checks for the object vs S_IRUGO.
+As such there can be cases where EACCESS is returned via syscall but the
+info is displayed anyways in the procfs files.
+
+While this might have security implications via info leaking (albeit no
+writing to the sma metadata), this behavior goes way back and showing
+all the objects regardless of the permissions was most likely an
+overlook - so we are stuck with it.  Furthermore, modifying either the
+syscall or the procfs file can cause userspace programs to break (ie
+ipcs).  Some applications require getting the procfs info (without root
+privileges) and can be rather slow in comparison with a syscall -- up to
+500x in some reported cases for shm.
+
+This patch introduces a new SEM_STAT_ANY command such that the sem ipc
+object permissions are ignored, and only audited instead.  In addition,
+I've left the lsm security hook checks in place, as if some policy can
+block the call, then the user has no other choice than just parsing the
+procfs file.
+
+Link: http://lkml.kernel.org/r/20180215162458.10059-3-dave@stgolabs.net
+	Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+	Reported-by: Robert Kettler <robert.kettler@outlook.com>
+	Cc: Eric W. Biederman <ebiederm@xmission.com>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Manfred Spraul <manfred@colorfullife.com>
+	Cc: Michael Kerrisk <mtk.manpages@gmail.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit a280d6dc77eb6002f269d58cd47c7c7e69b617b6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	ipc/sem.c
+diff --cc ipc/sem.c
+index 9d482b450160,06be75d9217a..000000000000
+--- a/ipc/sem.c
++++ b/ipc/sem.c
+@@@ -1145,90 -1210,61 +1145,129 @@@ static time_t get_semotime(struct sem_a
+  	return res;
+  }
+  
+ -static int semctl_stat(struct ipc_namespace *ns, int semid,
+ -			 int cmd, struct semid64_ds *semid64)
+ +static int semctl_nolock(struct ipc_namespace *ns, int semid,
+ +			 int cmd, int version, void __user *p)
+  {
+ -	struct sem_array *sma;
+ -	int id = 0;
+  	int err;
+ +	struct sem_array *sma;
+  
+ -	memset(semid64, 0, sizeof(*semid64));
+ +	switch(cmd) {
+ +	case IPC_INFO:
+ +	case SEM_INFO:
+ +	{
+ +		struct seminfo seminfo;
+ +		int max_id;
+ +
+++<<<<<<< HEAD
+ +		err = security_sem_semctl(NULL, cmd);
+ +		if (err)
+ +			return err;
+ +		
+ +		memset(&seminfo,0,sizeof(seminfo));
+ +		seminfo.semmni = ns->sc_semmni;
+ +		seminfo.semmns = ns->sc_semmns;
+ +		seminfo.semmsl = ns->sc_semmsl;
+ +		seminfo.semopm = ns->sc_semopm;
+ +		seminfo.semvmx = SEMVMX;
+ +		seminfo.semmnu = SEMMNU;
+ +		seminfo.semmap = SEMMAP;
+ +		seminfo.semume = SEMUME;
+ +		down_read(&sem_ids(ns).rwsem);
+ +		if (cmd == SEM_INFO) {
+ +			seminfo.semusz = sem_ids(ns).in_use;
+ +			seminfo.semaem = ns->used_sems;
+ +		} else {
+ +			seminfo.semusz = SEMUSZ;
+ +			seminfo.semaem = SEMAEM;
+ +		}
+ +		max_id = ipc_get_maxid(&sem_ids(ns));
+ +		up_read(&sem_ids(ns).rwsem);
+ +		if (copy_to_user(p, &seminfo, sizeof(struct seminfo))) 
+ +			return -EFAULT;
+ +		return (max_id < 0) ? 0: max_id;
+ +	}
+ +	case IPC_STAT:
+ +	case SEM_STAT:
+ +	{
+ +		struct semid64_ds tbuf;
+ +		int id = 0;
+ +
+ +		memset(&tbuf, 0, sizeof(tbuf));
+  
+ +		rcu_read_lock();
+ +		if (cmd == SEM_STAT) {
+ +			sma = sem_obtain_object(ns, semid);
+ +			if (IS_ERR(sma)) {
+ +				err = PTR_ERR(sma);
+ +				goto out_unlock;
+ +			}
+ +			id = sma->sem_perm.id;
+ +		} else {
+ +			sma = sem_obtain_object_check(ns, semid);
+ +			if (IS_ERR(sma)) {
+ +				err = PTR_ERR(sma);
+ +				goto out_unlock;
+ +			}
+++=======
++ 	rcu_read_lock();
++ 	if (cmd == SEM_STAT || cmd == SEM_STAT_ANY) {
++ 		sma = sem_obtain_object(ns, semid);
++ 		if (IS_ERR(sma)) {
++ 			err = PTR_ERR(sma);
++ 			goto out_unlock;
++ 		}
++ 		id = sma->sem_perm.id;
++ 	} else { /* IPC_STAT */
++ 		sma = sem_obtain_object_check(ns, semid);
++ 		if (IS_ERR(sma)) {
++ 			err = PTR_ERR(sma);
++ 			goto out_unlock;
+++>>>>>>> a280d6dc77eb (ipc/sem: introduce semctl(SEM_STAT_ANY))
+  		}
+ +
+ +		err = -EACCES;
+ +		if (ipcperms(ns, &sma->sem_perm, S_IRUGO))
+ +			goto out_unlock;
+ +
+ +		err = security_sem_semctl(sma, cmd);
+ +		if (err)
+ +			goto out_unlock;
+ +
+ +		kernel_to_ipc64_perm(&sma->sem_perm, &tbuf.sem_perm);
+ +		tbuf.sem_otime = get_semotime(sma);
+ +		tbuf.sem_ctime = sma->sem_ctime;
+ +		tbuf.sem_nsems = sma->sem_nsems;
+ +		rcu_read_unlock();
+ +		if (copy_semid_to_user(p, &tbuf, version))
+ +			return -EFAULT;
+ +		return id;
+  	}
+++<<<<<<< HEAD
+ +	default:
+ +		return -EINVAL;
+++=======
++ 
++ 	/* see comment for SHM_STAT_ANY */
++ 	if (cmd == SEM_STAT_ANY)
++ 		audit_ipc_obj(&sma->sem_perm);
++ 	else {
++ 		err = -EACCES;
++ 		if (ipcperms(ns, &sma->sem_perm, S_IRUGO))
++ 			goto out_unlock;
++ 	}
++ 
++ 	err = security_sem_semctl(&sma->sem_perm, cmd);
++ 	if (err)
++ 		goto out_unlock;
++ 
++ 	ipc_lock_object(&sma->sem_perm);
++ 
++ 	if (!ipc_valid_object(&sma->sem_perm)) {
++ 		ipc_unlock_object(&sma->sem_perm);
++ 		err = -EIDRM;
++ 		goto out_unlock;
+++>>>>>>> a280d6dc77eb (ipc/sem: introduce semctl(SEM_STAT_ANY))
+  	}
+ -
+ -	kernel_to_ipc64_perm(&sma->sem_perm, &semid64->sem_perm);
+ -	semid64->sem_otime = get_semotime(sma);
+ -	semid64->sem_ctime = sma->sem_ctime;
+ -	semid64->sem_nsems = sma->sem_nsems;
+ -
+ -	ipc_unlock_object(&sma->sem_perm);
+ -	rcu_read_unlock();
+ -	return id;
+ -
+  out_unlock:
+  	rcu_read_unlock();
+  	return err;
+@@@ -1566,12 -1625,19 +1605,22 @@@ SYSCALL_DEFINE4(semctl, int, semid, int
+  	version = ipc_parse_version(&cmd);
+  	ns = current->nsproxy->ipc_ns;
+  
+ -	switch (cmd) {
+ +	switch(cmd) {
+  	case IPC_INFO:
+  	case SEM_INFO:
+ -		return semctl_info(ns, semid, cmd, p);
+  	case IPC_STAT:
+  	case SEM_STAT:
+++<<<<<<< HEAD
+ +		return semctl_nolock(ns, semid, cmd, version, p);
+++=======
++ 	case SEM_STAT_ANY:
++ 		err = semctl_stat(ns, semid, cmd, &semid64);
++ 		if (err < 0)
++ 			return err;
++ 		if (copy_semid_to_user(p, &semid64, version))
++ 			err = -EFAULT;
++ 		return err;
+++>>>>>>> a280d6dc77eb (ipc/sem: introduce semctl(SEM_STAT_ANY))
+  	case GETALL:
+  	case GETVAL:
+  	case GETPID:
+@@@ -1579,11 -1645,121 +1628,121 @@@
+  	case GETZCNT:
+  	case SETALL:
+  		return semctl_main(ns, semid, semnum, cmd, p);
+++<<<<<<< HEAD
+++=======
++ 	case SETVAL: {
++ 		int val;
++ #if defined(CONFIG_64BIT) && defined(__BIG_ENDIAN)
++ 		/* big-endian 64bit */
++ 		val = arg >> 32;
++ #else
++ 		/* 32bit or little-endian 64bit */
++ 		val = arg;
++ #endif
++ 		return semctl_setval(ns, semid, semnum, val);
++ 	}
++ 	case IPC_SET:
++ 		if (copy_semid_from_user(&semid64, p, version))
++ 			return -EFAULT;
++ 	case IPC_RMID:
++ 		return semctl_down(ns, semid, cmd, &semid64);
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
++ SYSCALL_DEFINE4(semctl, int, semid, int, semnum, int, cmd, unsigned long, arg)
++ {
++ 	return ksys_semctl(semid, semnum, cmd, arg);
++ }
++ 
++ #ifdef CONFIG_COMPAT
++ 
++ struct compat_semid_ds {
++ 	struct compat_ipc_perm sem_perm;
++ 	compat_time_t sem_otime;
++ 	compat_time_t sem_ctime;
++ 	compat_uptr_t sem_base;
++ 	compat_uptr_t sem_pending;
++ 	compat_uptr_t sem_pending_last;
++ 	compat_uptr_t undo;
++ 	unsigned short sem_nsems;
++ };
++ 
++ static int copy_compat_semid_from_user(struct semid64_ds *out, void __user *buf,
++ 					int version)
++ {
++ 	memset(out, 0, sizeof(*out));
++ 	if (version == IPC_64) {
++ 		struct compat_semid64_ds __user *p = buf;
++ 		return get_compat_ipc64_perm(&out->sem_perm, &p->sem_perm);
++ 	} else {
++ 		struct compat_semid_ds __user *p = buf;
++ 		return get_compat_ipc_perm(&out->sem_perm, &p->sem_perm);
++ 	}
++ }
++ 
++ static int copy_compat_semid_to_user(void __user *buf, struct semid64_ds *in,
++ 					int version)
++ {
++ 	if (version == IPC_64) {
++ 		struct compat_semid64_ds v;
++ 		memset(&v, 0, sizeof(v));
++ 		to_compat_ipc64_perm(&v.sem_perm, &in->sem_perm);
++ 		v.sem_otime = in->sem_otime;
++ 		v.sem_ctime = in->sem_ctime;
++ 		v.sem_nsems = in->sem_nsems;
++ 		return copy_to_user(buf, &v, sizeof(v));
++ 	} else {
++ 		struct compat_semid_ds v;
++ 		memset(&v, 0, sizeof(v));
++ 		to_compat_ipc_perm(&v.sem_perm, &in->sem_perm);
++ 		v.sem_otime = in->sem_otime;
++ 		v.sem_ctime = in->sem_ctime;
++ 		v.sem_nsems = in->sem_nsems;
++ 		return copy_to_user(buf, &v, sizeof(v));
++ 	}
++ }
++ 
++ long compat_ksys_semctl(int semid, int semnum, int cmd, int arg)
++ {
++ 	void __user *p = compat_ptr(arg);
++ 	struct ipc_namespace *ns;
++ 	struct semid64_ds semid64;
++ 	int version = compat_ipc_parse_version(&cmd);
++ 	int err;
++ 
++ 	ns = current->nsproxy->ipc_ns;
++ 
++ 	if (semid < 0)
++ 		return -EINVAL;
++ 
++ 	switch (cmd & (~IPC_64)) {
++ 	case IPC_INFO:
++ 	case SEM_INFO:
++ 		return semctl_info(ns, semid, cmd, p);
++ 	case IPC_STAT:
++ 	case SEM_STAT:
++ 	case SEM_STAT_ANY:
++ 		err = semctl_stat(ns, semid, cmd, &semid64);
++ 		if (err < 0)
++ 			return err;
++ 		if (copy_compat_semid_to_user(p, &semid64, version))
++ 			err = -EFAULT;
++ 		return err;
++ 	case GETVAL:
++ 	case GETPID:
++ 	case GETNCNT:
++ 	case GETZCNT:
++ 	case GETALL:
++ 	case SETALL:
++ 		return semctl_main(ns, semid, semnum, cmd, p);
+++>>>>>>> a280d6dc77eb (ipc/sem: introduce semctl(SEM_STAT_ANY))
+  	case SETVAL:
+  		return semctl_setval(ns, semid, semnum, arg);
+ -	case IPC_SET:
+ -		if (copy_compat_semid_from_user(&semid64, p, version))
+ -			return -EFAULT;
+ -		/* fallthru */
+  	case IPC_RMID:
+ -		return semctl_down(ns, semid, cmd, &semid64);
+ +	case IPC_SET:
+ +		return semctl_down(ns, semid, cmd, version, p);
+  	default:
+  		return -EINVAL;
+  	}
+diff --git a/include/uapi/linux/sem.h b/include/uapi/linux/sem.h
+index 541fce03b50c..370a139dab60 100644
+--- a/include/uapi/linux/sem.h
++++ b/include/uapi/linux/sem.h
+@@ -18,6 +18,7 @@
+ /* ipcs ctl cmds */
+ #define SEM_STAT 18
+ #define SEM_INFO 19
++#define SEM_STAT_ANY 20
+ 
+ /* Obsolete, used only for backwards compatibility and libc5 compiles */
+ struct semid_ds {
+* Unmerged path ipc/sem.c
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index fe0d2b1b58b3..352194fa7918 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -5648,6 +5648,7 @@ static int selinux_sem_semctl(struct sem_array *sma, int cmd)
+ 		break;
+ 	case IPC_STAT:
+ 	case SEM_STAT:
++	case SEM_STAT_ANY:
+ 		perms = SEM__GETATTR | SEM__ASSOCIATE;
+ 		break;
+ 	default:
+diff --git a/security/smack/smack_lsm.c b/security/smack/smack_lsm.c
+index 42fad0f7949a..0837d1a3f1a9 100644
+--- a/security/smack/smack_lsm.c
++++ b/security/smack/smack_lsm.c
+@@ -2244,6 +2244,7 @@ static int smack_sem_semctl(struct sem_array *sma, int cmd)
+ 	case GETALL:
+ 	case IPC_STAT:
+ 	case SEM_STAT:
++	case SEM_STAT_ANY:
+ 		may = MAY_READ;
+ 		break;
+ 	case SETVAL:
