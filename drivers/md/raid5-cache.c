@@ -1690,12 +1690,12 @@ r5l_recovery_verify_data_checksum_for_mb(struct r5l_log *log,
 		payload = (void *)mb + mb_offset;
 		payload_flush = (void *)mb + mb_offset;
 
-		if (payload->header.type == R5LOG_PAYLOAD_DATA) {
+		if (le16_to_cpu(payload->header.type) == R5LOG_PAYLOAD_DATA) {
 			if (r5l_recovery_verify_data_checksum(
 				    log, page, log_offset,
 				    payload->checksum[0]) < 0)
 				goto mismatch;
-		} else if (payload->header.type == R5LOG_PAYLOAD_PARITY) {
+		} else if (le16_to_cpu(payload->header.type) == R5LOG_PAYLOAD_PARITY) {
 			if (r5l_recovery_verify_data_checksum(
 				    log, page, log_offset,
 				    payload->checksum[0]) < 0)
@@ -1707,12 +1707,12 @@ r5l_recovery_verify_data_checksum_for_mb(struct r5l_log *log,
 						 BLOCK_SECTORS),
 				    payload->checksum[1]) < 0)
 				goto mismatch;
-		} else if (payload->header.type == R5LOG_PAYLOAD_FLUSH) {
+		} else if (le16_to_cpu(payload->header.type) == R5LOG_PAYLOAD_FLUSH) {
 			/* nothing to do for R5LOG_PAYLOAD_FLUSH here */
 		} else /* not R5LOG_PAYLOAD_DATA/PARITY/FLUSH */
 			goto mismatch;
 
-		if (payload->header.type == R5LOG_PAYLOAD_FLUSH) {
+		if (le16_to_cpu(payload->header.type) == R5LOG_PAYLOAD_FLUSH) {
 			mb_offset += sizeof(struct r5l_payload_flush) +
 				le32_to_cpu(payload_flush->size);
 		} else {
@@ -1779,7 +1779,7 @@ r5c_recovery_analyze_meta_block(struct r5l_log *log,
 		payload = (void *)mb + mb_offset;
 		payload_flush = (void *)mb + mb_offset;
 
-		if (payload->header.type == R5LOG_PAYLOAD_FLUSH) {
+		if (le16_to_cpu(payload->header.type) == R5LOG_PAYLOAD_FLUSH) {
 			int i, count;
 
 			count = le32_to_cpu(payload_flush->size) / sizeof(__le64);
@@ -1801,7 +1801,7 @@ r5c_recovery_analyze_meta_block(struct r5l_log *log,
 		}
 
 		/* DATA or PARITY payload */
-		stripe_sect = (payload->header.type == R5LOG_PAYLOAD_DATA) ?
+		stripe_sect = (le16_to_cpu(payload->header.type) == R5LOG_PAYLOAD_DATA) ?
 			raid5_compute_sector(
 				conf, le64_to_cpu(payload->location), 0, &dd,
 				NULL)
@@ -1839,7 +1839,7 @@ r5c_recovery_analyze_meta_block(struct r5l_log *log,
 			list_add_tail(&sh->lru, cached_stripe_list);
 		}
 
-		if (payload->header.type == R5LOG_PAYLOAD_DATA) {
+		if (le16_to_cpu(payload->header.type) == R5LOG_PAYLOAD_DATA) {
 			if (!test_bit(STRIPE_R5C_CACHING, &sh->state) &&
 			    test_bit(R5_Wantwrite, &sh->dev[sh->pd_idx].flags)) {
 				r5l_recovery_replay_one_stripe(conf, sh, ctx);
@@ -1847,7 +1847,7 @@ r5c_recovery_analyze_meta_block(struct r5l_log *log,
 			}
 			r5l_recovery_load_data(log, sh, ctx, payload,
 					       log_offset);
-		} else if (payload->header.type == R5LOG_PAYLOAD_PARITY)
+		} else if (le16_to_cpu(payload->header.type) == R5LOG_PAYLOAD_PARITY)
 			r5l_recovery_load_parity(log, sh, ctx, payload,
 						 log_offset);
 		else
@@ -2049,7 +2049,7 @@ r5c_recovery_rewrite_data_only_stripes(struct r5l_log *log,
 				payload = (void *)mb + offset;
 				payload->header.type = cpu_to_le16(
 					R5LOG_PAYLOAD_DATA);
-				payload->size = BLOCK_SECTORS;
+				payload->size = cpu_to_le32(BLOCK_SECTORS);
 				payload->location = cpu_to_le64(
 					raid5_compute_blocknr(sh, i, 0));
 				addr = kmap_atomic(dev->page);
