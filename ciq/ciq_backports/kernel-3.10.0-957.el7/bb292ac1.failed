@@ -1,0 +1,247 @@
+watchdog: Introduce watchdog_stop_on_unregister helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [watchdog] Introduce watchdog_stop_on_unregister helper (David Arcari) [1576173]
+Rebuild_FUZZ: 89.80%
+commit-author Guenter Roeck <linux@roeck-us.net>
+commit bb292ac1c6028344013309a309b44dc691581825
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/bb292ac1.failed
+
+Many watchdog drivers explicitly stop the watchdog when unregistering it.
+While it is unclear if this is actually needed (the whatdog should not be
+running at that time if it can be stopped), introduce a helper to
+explicitly stop the watchdog in the watchdog core when unregistering it.
+This helps reducing driver code size while retaining functionality.
+
+	Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+(cherry picked from commit bb292ac1c6028344013309a309b44dc691581825)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/watchdog/watchdog-kernel-api.txt
+#	drivers/watchdog/watchdog_dev.c
+#	include/linux/watchdog.h
+diff --cc Documentation/watchdog/watchdog-kernel-api.txt
+index d8b0d3367706,9b93953f69cf..000000000000
+--- a/Documentation/watchdog/watchdog-kernel-api.txt
++++ b/Documentation/watchdog/watchdog-kernel-api.txt
+@@@ -231,3 -275,35 +231,38 @@@ the device tree (if the module timeout 
+  to set the default timeout value as timeout value in the watchdog_device and
+  then use this function to set the user "preferred" timeout value.
+  This routine returns zero on success and a negative errno code for failure.
+++<<<<<<< HEAD
+++=======
++ 
++ To disable the watchdog on reboot, the user must call the following helper:
++ 
++ static inline void watchdog_stop_on_reboot(struct watchdog_device *wdd);
++ 
++ To disable the watchdog when unregistering the watchdog, the user must call
++ the following helper. Note that this will only stop the watchdog if the
++ nowayout flag is not set.
++ 
++ static inline void watchdog_stop_on_unregister(struct watchdog_device *wdd);
++ 
++ To change the priority of the restart handler the following helper should be
++ used:
++ 
++ void watchdog_set_restart_priority(struct watchdog_device *wdd, int priority);
++ 
++ User should follow the following guidelines for setting the priority:
++ * 0: should be called in last resort, has limited restart capabilities
++ * 128: default restart handler, use if no other handler is expected to be
++   available, and/or if restart is sufficient to restart the entire system
++ * 255: highest priority, will preempt all other restart handlers
++ 
++ To raise a pretimeout notification, the following function should be used:
++ 
++ void watchdog_notify_pretimeout(struct watchdog_device *wdd)
++ 
++ The function can be called in the interrupt context. If watchdog pretimeout
++ governor framework (kbuild CONFIG_WATCHDOG_PRETIMEOUT_GOV symbol) is enabled,
++ an action is taken by a preconfigured pretimeout governor preassigned to
++ the watchdog device. If watchdog pretimeout governor framework is not
++ enabled, watchdog_notify_pretimeout() prints a notification message to
++ the kernel log buffer.
+++>>>>>>> bb292ac1c602 (watchdog: Introduce watchdog_stop_on_unregister helper)
+diff --cc drivers/watchdog/watchdog_dev.c
+index f06fbcf0bea2,d5d2bbd8f428..000000000000
+--- a/drivers/watchdog/watchdog_dev.c
++++ b/drivers/watchdog/watchdog_dev.c
+@@@ -628,6 -887,123 +628,126 @@@ static struct miscdevice watchdog_miscd
+  };
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  *	watchdog_cdev_register: register watchdog character device
++  *	@wdd: watchdog device
++  *	@devno: character device number
++  *
++  *	Register a watchdog character device including handling the legacy
++  *	/dev/watchdog node. /dev/watchdog is actually a miscdevice and
++  *	thus we set it up like that.
++  */
++ 
++ static int watchdog_cdev_register(struct watchdog_device *wdd, dev_t devno)
++ {
++ 	struct watchdog_core_data *wd_data;
++ 	int err;
++ 
++ 	wd_data = kzalloc(sizeof(struct watchdog_core_data), GFP_KERNEL);
++ 	if (!wd_data)
++ 		return -ENOMEM;
++ 	kref_init(&wd_data->kref);
++ 	mutex_init(&wd_data->lock);
++ 
++ 	wd_data->wdd = wdd;
++ 	wdd->wd_data = wd_data;
++ 
++ 	if (!watchdog_wq)
++ 		return -ENODEV;
++ 
++ 	INIT_DELAYED_WORK(&wd_data->work, watchdog_ping_work);
++ 
++ 	if (wdd->id == 0) {
++ 		old_wd_data = wd_data;
++ 		watchdog_miscdev.parent = wdd->parent;
++ 		err = misc_register(&watchdog_miscdev);
++ 		if (err != 0) {
++ 			pr_err("%s: cannot register miscdev on minor=%d (err=%d).\n",
++ 				wdd->info->identity, WATCHDOG_MINOR, err);
++ 			if (err == -EBUSY)
++ 				pr_err("%s: a legacy watchdog module is probably present.\n",
++ 					wdd->info->identity);
++ 			old_wd_data = NULL;
++ 			kfree(wd_data);
++ 			return err;
++ 		}
++ 	}
++ 
++ 	/* Fill in the data structures */
++ 	cdev_init(&wd_data->cdev, &watchdog_fops);
++ 	wd_data->cdev.owner = wdd->ops->owner;
++ 
++ 	/* Add the device */
++ 	err = cdev_add(&wd_data->cdev, devno, 1);
++ 	if (err) {
++ 		pr_err("watchdog%d unable to add device %d:%d\n",
++ 			wdd->id,  MAJOR(watchdog_devt), wdd->id);
++ 		if (wdd->id == 0) {
++ 			misc_deregister(&watchdog_miscdev);
++ 			old_wd_data = NULL;
++ 			kref_put(&wd_data->kref, watchdog_core_data_release);
++ 		}
++ 		return err;
++ 	}
++ 
++ 	/* Record time of most recent heartbeat as 'just before now'. */
++ 	wd_data->last_hw_keepalive = jiffies - 1;
++ 
++ 	/*
++ 	 * If the watchdog is running, prevent its driver from being unloaded,
++ 	 * and schedule an immediate ping.
++ 	 */
++ 	if (watchdog_hw_running(wdd)) {
++ 		__module_get(wdd->ops->owner);
++ 		kref_get(&wd_data->kref);
++ 		queue_delayed_work(watchdog_wq, &wd_data->work, 0);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  *	watchdog_cdev_unregister: unregister watchdog character device
++  *	@watchdog: watchdog device
++  *
++  *	Unregister watchdog character device and if needed the legacy
++  *	/dev/watchdog device.
++  */
++ 
++ static void watchdog_cdev_unregister(struct watchdog_device *wdd)
++ {
++ 	struct watchdog_core_data *wd_data = wdd->wd_data;
++ 
++ 	cdev_del(&wd_data->cdev);
++ 	if (wdd->id == 0) {
++ 		misc_deregister(&watchdog_miscdev);
++ 		old_wd_data = NULL;
++ 	}
++ 
++ 	mutex_lock(&wd_data->lock);
++ 	wd_data->wdd = NULL;
++ 	wdd->wd_data = NULL;
++ 	mutex_unlock(&wd_data->lock);
++ 
++ 	if (watchdog_active(wdd) &&
++ 	    test_bit(WDOG_STOP_ON_UNREGISTER, &wdd->status)) {
++ 		watchdog_stop(wdd);
++ 	}
++ 
++ 	cancel_delayed_work_sync(&wd_data->work);
++ 
++ 	kref_put(&wd_data->kref, watchdog_core_data_release);
++ }
++ 
++ static struct class watchdog_class = {
++ 	.name =		"watchdog",
++ 	.owner =	THIS_MODULE,
++ 	.dev_groups =	wdt_groups,
++ };
++ 
++ /*
+++>>>>>>> bb292ac1c602 (watchdog: Introduce watchdog_stop_on_unregister helper)
+   *	watchdog_dev_register: register a watchdog device
+   *	@wdd: watchdog device
+   *
+diff --cc include/linux/watchdog.h
+index e90e3ea5ebeb,a786e5e8973b..000000000000
+--- a/include/linux/watchdog.h
++++ b/include/linux/watchdog.h
+@@@ -93,10 -114,10 +93,17 @@@ struct watchdog_device 
+  	unsigned long status;
+  /* Bit numbers for status flags */
+  #define WDOG_ACTIVE		0	/* Is the watchdog running/active */
+++<<<<<<< HEAD
+ +#define WDOG_DEV_OPEN		1	/* Opened via /dev/watchdog ? */
+ +#define WDOG_ALLOW_RELEASE	2	/* Did we receive the magic char ? */
+ +#define WDOG_NO_WAY_OUT		3	/* Is 'nowayout' feature set ? */
+ +#define WDOG_UNREGISTERED	4	/* Has the device been unregistered */
+++=======
++ #define WDOG_NO_WAY_OUT		1	/* Is 'nowayout' feature set ? */
++ #define WDOG_STOP_ON_REBOOT	2	/* Should be stopped on reboot */
++ #define WDOG_HW_RUNNING		3	/* True if HW watchdog running */
++ #define WDOG_STOP_ON_UNREGISTER	4	/* Should be stopped on unregister */
+++>>>>>>> bb292ac1c602 (watchdog: Introduce watchdog_stop_on_unregister helper)
+  	struct list_head deferred;
+  };
+  
+@@@ -116,6 -146,18 +123,21 @@@ static inline void watchdog_set_nowayou
+  		set_bit(WDOG_NO_WAY_OUT, &wdd->status);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Use the following function to stop the watchdog on reboot */
++ static inline void watchdog_stop_on_reboot(struct watchdog_device *wdd)
++ {
++ 	set_bit(WDOG_STOP_ON_REBOOT, &wdd->status);
++ }
++ 
++ /* Use the following function to stop the watchdog when unregistering it */
++ static inline void watchdog_stop_on_unregister(struct watchdog_device *wdd)
++ {
++ 	set_bit(WDOG_STOP_ON_UNREGISTER, &wdd->status);
++ }
++ 
+++>>>>>>> bb292ac1c602 (watchdog: Introduce watchdog_stop_on_unregister helper)
+  /* Use the following function to check if a timeout value is invalid */
+  static inline bool watchdog_timeout_invalid(struct watchdog_device *wdd, unsigned int t)
+  {
+* Unmerged path Documentation/watchdog/watchdog-kernel-api.txt
+* Unmerged path drivers/watchdog/watchdog_dev.c
+* Unmerged path include/linux/watchdog.h
