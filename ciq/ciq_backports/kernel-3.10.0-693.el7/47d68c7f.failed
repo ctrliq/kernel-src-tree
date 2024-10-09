@@ -1,0 +1,927 @@
+ACPICA: Tables: Add mechanism to control early table checksum verification.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [acpi] acpica: tables: Add mechanism to control early table checksum verification (Prarit Bhargava) [1425180]
+Rebuild_FUZZ: 99.33%
+commit-author Lv Zheng <lv.zheng@intel.com>
+commit 47d68c7f688c01557cb67dd80eb540e88d7913b6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/47d68c7f.failed
+
+It is reported that Linux x86 kernel cannot map large tables. The following
+large SSDT table on such platform fails to pass checksum verification and
+cannot be installed:
+ ACPI: SSDT 0x00000000B9638018 07A0C4 (v02 INTEL  S2600CP  00004000 INTL 20100331)
+
+It sounds strange that in the 64-bit virtual memory address space, we
+cannot map a single ACPI table to do checksum verification. The root cause
+is:
+ 1. ACPICA doesn't split IO memory mapping and table mapping;
+ 2. Linux x86 OSL implements acpi_os_map_memory() using a size limited fix-map
+    mechanism during early boot stage, which is more suitable for only IO
+    mappings.
+
+ACPICA originally only mapped table header for signature validation, and
+this header mapping is required by OSL override mechanism. There was no
+checksum verification because we could not map the whole table using this
+OSL. While the following ACPICA commit enforces checksum verification by
+mapping the whole table during Linux boot stage and it finally triggers
+this issue on some platforms:
+ Commit: 86dfc6f339886559d80ee0d4bd20fe5ee90450f0
+ Subject: ACPICA: Tables: Fix table checksums verification before installation.
+
+Before doing further cleanups for the OSL table mapping and override
+implementation, this patch introduces an option for such OSPMs to
+temporarily discard the checksum verification feature. It then can be
+re-enabled easily when the ACPICA and the underlying OSL is ready.
+
+This patch also deletes a comment around the limitation of mappings because
+it is not correct. The limitation is not how many times we can map in the
+early stage, but the OSL mapping facility may not be suitable for mapping
+the ACPI tables and thus may complain us the size limitation.
+
+The acpi_tb_verify_table() is renamed to acpi_tb_verify_temp_table() due to the
+work around added, it now only applies to the table descriptor that hasn't
+been installed and cannot be used in other cases. Lv Zheng.
+
+	Tested-by: Yuanhan Liu <yuanhan.liu@linux.intel.com>
+	Signed-off-by: Lv Zheng <lv.zheng@intel.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 47d68c7f688c01557cb67dd80eb540e88d7913b6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/acpica/actables.h
+#	drivers/acpi/acpica/tbdata.c
+#	drivers/acpi/acpica/tbinstal.c
+#	include/acpi/acpixf.h
+diff --cc drivers/acpi/acpica/actables.h
+index 917315ec21dd,f14882788eee..000000000000
+--- a/drivers/acpi/acpica/actables.h
++++ b/drivers/acpi/acpica/actables.h
+@@@ -52,6 -52,33 +52,34 @@@ acpi_status acpi_allocate_root_table(u3
+  u8 *acpi_tb_scan_memory_for_rsdp(u8 *start_address, u32 length);
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * tbdata - table data structure management
++  */
++ acpi_status acpi_tb_get_next_root_index(u32 *table_index);
++ 
++ void
++ acpi_tb_init_table_descriptor(struct acpi_table_desc *table_desc,
++ 			      acpi_physical_address address,
++ 			      u8 flags, struct acpi_table_header *table);
++ 
++ acpi_status
++ acpi_tb_acquire_temp_table(struct acpi_table_desc *table_desc,
++ 			   acpi_physical_address address, u8 flags);
++ 
++ void acpi_tb_release_temp_table(struct acpi_table_desc *table_desc);
++ 
++ acpi_status acpi_tb_validate_temp_table(struct acpi_table_desc *table_desc);
++ 
++ acpi_status
++ acpi_tb_verify_temp_table(struct acpi_table_desc *table_desc, char *signature);
++ 
++ u8 acpi_tb_is_table_loaded(u32 table_index);
++ 
++ void acpi_tb_set_table_loaded_flag(u32 table_index, u8 is_loaded);
++ 
++ /*
+++>>>>>>> 47d68c7f688c (ACPICA: Tables: Add mechanism to control early table checksum verification.)
+   * tbfadt - FADT parse/convert/validate
+   */
+  void acpi_tb_parse_fadt(u32 table_index);
+@@@ -70,15 -97,25 +98,33 @@@ acpi_tb_find_table(char *signature
+   */
+  acpi_status acpi_tb_resize_root_table_list(void);
+  
+ -acpi_status acpi_tb_validate_table(struct acpi_table_desc *table_desc);
+ +acpi_status acpi_tb_verify_table(struct acpi_table_desc *table_desc);
+  
+ -void acpi_tb_invalidate_table(struct acpi_table_desc *table_desc);
+ +struct acpi_table_header *acpi_tb_table_override(struct acpi_table_header
+ +						 *table_header,
+ +						 struct acpi_table_desc
+ +						 *table_desc);
+  
+++<<<<<<< HEAD
+ +acpi_status
+ +acpi_tb_add_table(struct acpi_table_desc *table_desc, u32 *table_index);
+++=======
++ void acpi_tb_override_table(struct acpi_table_desc *old_table_desc);
++ 
++ acpi_status
++ acpi_tb_acquire_table(struct acpi_table_desc *table_desc,
++ 		      struct acpi_table_header **table_ptr,
++ 		      u32 *table_length, u8 *table_flags);
++ 
++ void
++ acpi_tb_release_table(struct acpi_table_header *table,
++ 		      u32 table_length, u8 table_flags);
++ 
++ acpi_status
++ acpi_tb_install_standard_table(acpi_physical_address address,
++ 			       u8 flags,
++ 			       u8 reload, u8 override, u32 *table_index);
+++>>>>>>> 47d68c7f688c (ACPICA: Tables: Add mechanism to control early table checksum verification.)
+  
+  acpi_status
+  acpi_tb_store_table(acpi_physical_address address,
+diff --cc drivers/acpi/acpica/tbinstal.c
+index 4024bfc5fa21,755b90c40ddf..000000000000
+--- a/drivers/acpi/acpica/tbinstal.c
++++ b/drivers/acpi/acpica/tbinstal.c
+@@@ -49,64 -48,164 +49,81 @@@
+  #define _COMPONENT          ACPI_TABLES
+  ACPI_MODULE_NAME("tbinstal")
+  
+ -/* Local prototypes */
+ -static u8
+ -acpi_tb_compare_tables(struct acpi_table_desc *table_desc, u32 table_index);
+ -
+ -/*******************************************************************************
+ +/******************************************************************************
+   *
+ - * FUNCTION:    acpi_tb_compare_tables
+ + * FUNCTION:    acpi_tb_verify_table
+   *
+ - * PARAMETERS:  table_desc          - Table 1 descriptor to be compared
+ - *              table_index         - Index of table 2 to be compared
+ + * PARAMETERS:  table_desc          - table
+   *
+ - * RETURN:      TRUE if both tables are identical.
+ + * RETURN:      Status
+   *
+ - * DESCRIPTION: This function compares a table with another table that has
+ - *              already been installed in the root table list.
+ + * DESCRIPTION: this function is called to verify and map table
+   *
+ - ******************************************************************************/
+ -
+ -static u8
+ -acpi_tb_compare_tables(struct acpi_table_desc *table_desc, u32 table_index)
+ + *****************************************************************************/
+ +acpi_status acpi_tb_verify_table(struct acpi_table_desc *table_desc)
+  {
+  	acpi_status status = AE_OK;
+ -	u8 is_identical;
+ -	struct acpi_table_header *table;
+ -	u32 table_length;
+ -	u8 table_flags;
+ -
+ -	status =
+ -	    acpi_tb_acquire_table(&acpi_gbl_root_table_list.tables[table_index],
+ -				  &table, &table_length, &table_flags);
+ -	if (ACPI_FAILURE(status)) {
+ -		return (FALSE);
+ -	}
+  
+ -	/*
+ -	 * Check for a table match on the entire table length,
+ -	 * not just the header.
+ -	 */
+ -	is_identical = (u8)((table_desc->length != table_length ||
+ -			     ACPI_MEMCMP(table_desc->pointer, table,
+ -					 table_length)) ? FALSE : TRUE);
+ -
+ -	/* Release the acquired table */
+ -
+ -	acpi_tb_release_table(table, table_length, table_flags);
+ -	return (is_identical);
+ -}
+ +	ACPI_FUNCTION_TRACE(tb_verify_table);
+  
+ -/*******************************************************************************
+ - *
+ - * FUNCTION:    acpi_tb_install_table_with_override
+ - *
+ - * PARAMETERS:  table_index             - Index into root table array
+ - *              new_table_desc          - New table descriptor to install
+ - *              override                - Whether override should be performed
+ - *
+ - * RETURN:      None
+ - *
+ - * DESCRIPTION: Install an ACPI table into the global data structure. The
+ - *              table override mechanism is called to allow the host
+ - *              OS to replace any table before it is installed in the root
+ - *              table array.
+ - *
+ - ******************************************************************************/
+ +	/* Map the table if necessary */
+  
+ -void
+ -acpi_tb_install_table_with_override(u32 table_index,
+ -				    struct acpi_table_desc *new_table_desc,
+ -				    u8 override)
+ -{
+ +	if (!table_desc->pointer) {
+ +		switch (table_desc->flags & ACPI_TABLE_ORIGIN_MASK) {
+ +		case ACPI_TABLE_ORIGIN_MAPPED:
+  
+ -	if (table_index >= acpi_gbl_root_table_list.current_table_count) {
+ -		return;
+ -	}
+ +			table_desc->pointer =
+ +			    acpi_os_map_memory(table_desc->address,
+ +					       table_desc->length);
+ +			break;
+  
+ -	/*
+ -	 * ACPI Table Override:
+ -	 *
+ -	 * Before we install the table, let the host OS override it with a new
+ -	 * one if desired. Any table within the RSDT/XSDT can be replaced,
+ -	 * including the DSDT which is pointed to by the FADT.
+ -	 */
+ -	if (override) {
+ -		acpi_tb_override_table(new_table_desc);
+ -	}
+ +		case ACPI_TABLE_ORIGIN_ALLOCATED:
+ +		case ACPI_TABLE_ORIGIN_UNKNOWN:
+ +		case ACPI_TABLE_ORIGIN_OVERRIDE:
+  
+ -	acpi_tb_init_table_descriptor(&acpi_gbl_root_table_list.
+ -				      tables[table_index],
+ -				      new_table_desc->address,
+ -				      new_table_desc->flags,
+ -				      new_table_desc->pointer);
+ +			table_desc->pointer =
+ +			    ACPI_CAST_PTR(struct acpi_table_header,
+ +					  table_desc->address);
+ +			break;
+  
+ -	acpi_tb_print_table_header(new_table_desc->address,
+ -				   new_table_desc->pointer);
+ +		default:
+  
+ -	/* Set the global integer width (based upon revision of the DSDT) */
+ +			break;
+ +		}
+  
+ -	if (table_index == ACPI_TABLE_INDEX_DSDT) {
+ -		acpi_ut_set_integer_width(new_table_desc->pointer->revision);
+ +		if (!table_desc->pointer) {
+ +			return_ACPI_STATUS(AE_NO_MEMORY);
+ +		}
+  	}
+ -}
+  
+ -/*******************************************************************************
+ - *
+ - * FUNCTION:    acpi_tb_install_fixed_table
+ - *
+ - * PARAMETERS:  address                 - Physical address of DSDT or FACS
+ - *              signature               - Table signature, NULL if no need to
+ - *                                        match
+ - *              table_index             - Index into root table array
+ - *
+ - * RETURN:      Status
+ - *
+ - * DESCRIPTION: Install a fixed ACPI table (DSDT/FACS) into the global data
+ - *              structure.
+ - *
+ - ******************************************************************************/
+ +	/* FACS is the odd table, has no standard ACPI header and no checksum */
+  
+ -acpi_status
+ -acpi_tb_install_fixed_table(acpi_physical_address address,
+ -			    char *signature, u32 table_index)
+ -{
+ -	struct acpi_table_desc new_table_desc;
+ -	acpi_status status;
+ -
+ -	ACPI_FUNCTION_TRACE(tb_install_fixed_table);
+ -
+ -	if (!address) {
+ -		ACPI_ERROR((AE_INFO,
+ -			    "Null physical address for ACPI table [%s]",
+ -			    signature));
+ -		return (AE_NO_MEMORY);
+ -	}
+ +	if (!ACPI_COMPARE_NAME(&table_desc->signature, ACPI_SIG_FACS)) {
+  
+ -	/* Fill a table descriptor for validation */
+ +		/* Always calculate checksum, ignore bad checksum if requested */
+  
+ -	status = acpi_tb_acquire_temp_table(&new_table_desc, address,
+ -					    ACPI_TABLE_ORIGIN_INTERNAL_PHYSICAL);
+ -	if (ACPI_FAILURE(status)) {
+ -		ACPI_ERROR((AE_INFO, "Could not acquire table length at %p",
+ -			    ACPI_CAST_PTR(void, address)));
+ -		return_ACPI_STATUS(status);
+ +		status =
+ +		    acpi_tb_verify_checksum(table_desc->pointer,
+ +					    table_desc->length);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Validate and verify a table before installation */
++ 
++ 	status = acpi_tb_verify_temp_table(&new_table_desc, signature);
++ 	if (ACPI_FAILURE(status)) {
++ 		goto release_and_exit;
++ 	}
++ 
++ 	acpi_tb_install_table_with_override(table_index, &new_table_desc, TRUE);
++ 
++ release_and_exit:
++ 
++ 	/* Release the temporary table descriptor */
++ 
++ 	acpi_tb_release_temp_table(&new_table_desc);
+++>>>>>>> 47d68c7f688c (ACPICA: Tables: Add mechanism to control early table checksum verification.)
+  	return_ACPI_STATUS(status);
+  }
+  
+@@@ -142,93 -252,103 +159,100 @@@ acpi_tb_add_table(struct acpi_table_des
+  	}
+  
+  	/*
+ -	 * Optionally do not load any SSDTs from the RSDT/XSDT. This can
+ -	 * be useful for debugging ACPI problems on some machines.
+ +	 * Validate the incoming table signature.
+ +	 *
+ +	 * 1) Originally, we checked the table signature for "SSDT" or "PSDT".
+ +	 * 2) We added support for OEMx tables, signature "OEM".
+ +	 * 3) Valid tables were encountered with a null signature, so we just
+ +	 *    gave up on validating the signature, (05/2008).
+ +	 * 4) We encountered non-AML tables such as the MADT, which caused
+ +	 *    interpreter errors and kernel faults. So now, we once again allow
+ +	 *    only "SSDT", "OEMx", and now, also a null signature. (05/2011).
+  	 */
+ -	if (!reload &&
+ -	    acpi_gbl_disable_ssdt_table_install &&
+ -	    ACPI_COMPARE_NAME(&new_table_desc.signature, ACPI_SIG_SSDT)) {
+ -		ACPI_INFO((AE_INFO, "Ignoring installation of %4.4s at %p",
+ -			   new_table_desc.signature.ascii, ACPI_CAST_PTR(void,
+ -									 address)));
+ -		goto release_and_exit;
+ +	if ((table_desc->pointer->signature[0] != 0x00) &&
+ +	    (!ACPI_COMPARE_NAME(table_desc->pointer->signature, ACPI_SIG_SSDT))
+ +	    && (ACPI_STRNCMP(table_desc->pointer->signature, "OEM", 3))) {
+ +		ACPI_BIOS_ERROR((AE_INFO,
+ +				 "Table has invalid signature [%4.4s] (0x%8.8X), "
+ +				 "must be SSDT or OEMx",
+ +				 acpi_ut_valid_acpi_name(table_desc->pointer->
+ +							 signature) ?
+ +				 table_desc->pointer->signature : "????",
+ +				 *(u32 *)table_desc->pointer->signature));
+ +
+ +		return_ACPI_STATUS(AE_BAD_SIGNATURE);
+  	}
+  
+ -	/* Validate and verify a table before installation */
+ +	(void)acpi_ut_acquire_mutex(ACPI_MTX_TABLES);
+  
+++<<<<<<< HEAD
+ +	/* Check if table is already registered */
+++=======
++ 	status = acpi_tb_verify_temp_table(&new_table_desc, NULL);
++ 	if (ACPI_FAILURE(status)) {
++ 		goto release_and_exit;
++ 	}
+++>>>>>>> 47d68c7f688c (ACPICA: Tables: Add mechanism to control early table checksum verification.)
+ +
+ +	for (i = 0; i < acpi_gbl_root_table_list.current_table_count; ++i) {
+ +		if (!acpi_gbl_root_table_list.tables[i].pointer) {
+ +			status =
+ +			    acpi_tb_verify_table(&acpi_gbl_root_table_list.
+ +						 tables[i]);
+ +			if (ACPI_FAILURE(status)
+ +			    || !acpi_gbl_root_table_list.tables[i].pointer) {
+ +				continue;
+ +			}
+ +		}
+  
+ -	if (reload) {
+  		/*
+ -		 * Validate the incoming table signature.
+ -		 *
+ -		 * 1) Originally, we checked the table signature for "SSDT" or "PSDT".
+ -		 * 2) We added support for OEMx tables, signature "OEM".
+ -		 * 3) Valid tables were encountered with a null signature, so we just
+ -		 *    gave up on validating the signature, (05/2008).
+ -		 * 4) We encountered non-AML tables such as the MADT, which caused
+ -		 *    interpreter errors and kernel faults. So now, we once again allow
+ -		 *    only "SSDT", "OEMx", and now, also a null signature. (05/2011).
+ +		 * Check for a table match on the entire table length,
+ +		 * not just the header.
+  		 */
+ -		if ((new_table_desc.signature.ascii[0] != 0x00) &&
+ -		    (!ACPI_COMPARE_NAME
+ -		     (&new_table_desc.signature, ACPI_SIG_SSDT))
+ -		    && (ACPI_STRNCMP(new_table_desc.signature.ascii, "OEM", 3)))
+ -		{
+ -			ACPI_BIOS_ERROR((AE_INFO,
+ -					 "Table has invalid signature [%4.4s] (0x%8.8X), "
+ -					 "must be SSDT or OEMx",
+ -					 acpi_ut_valid_acpi_name(new_table_desc.
+ -								 signature.
+ -								 ascii) ?
+ -					 new_table_desc.signature.
+ -					 ascii : "????",
+ -					 new_table_desc.signature.integer));
+ -
+ -			status = AE_BAD_SIGNATURE;
+ -			goto release_and_exit;
+ +		if (table_desc->length !=
+ +		    acpi_gbl_root_table_list.tables[i].length) {
+ +			continue;
+  		}
+  
+ -		/* Check if table is already registered */
+ +		if (ACPI_MEMCMP(table_desc->pointer,
+ +				acpi_gbl_root_table_list.tables[i].pointer,
+ +				acpi_gbl_root_table_list.tables[i].length)) {
+ +			continue;
+ +		}
+  
+ -		for (i = 0; i < acpi_gbl_root_table_list.current_table_count;
+ -		     ++i) {
+ -			/*
+ -			 * Check for a table match on the entire table length,
+ -			 * not just the header.
+ -			 */
+ -			if (!acpi_tb_compare_tables(&new_table_desc, i)) {
+ -				continue;
+ -			}
+ +		/*
+ +		 * Note: the current mechanism does not unregister a table if it is
+ +		 * dynamically unloaded. The related namespace entries are deleted,
+ +		 * but the table remains in the root table list.
+ +		 *
+ +		 * The assumption here is that the number of different tables that
+ +		 * will be loaded is actually small, and there is minimal overhead
+ +		 * in just keeping the table in case it is needed again.
+ +		 *
+ +		 * If this assumption changes in the future (perhaps on large
+ +		 * machines with many table load/unload operations), tables will
+ +		 * need to be unregistered when they are unloaded, and slots in the
+ +		 * root table list should be reused when empty.
+ +		 */
+ +		*table_index = i;
+  
+ -			/*
+ -			 * Note: the current mechanism does not unregister a table if it is
+ -			 * dynamically unloaded. The related namespace entries are deleted,
+ -			 * but the table remains in the root table list.
+ -			 *
+ -			 * The assumption here is that the number of different tables that
+ -			 * will be loaded is actually small, and there is minimal overhead
+ -			 * in just keeping the table in case it is needed again.
+ -			 *
+ -			 * If this assumption changes in the future (perhaps on large
+ -			 * machines with many table load/unload operations), tables will
+ -			 * need to be unregistered when they are unloaded, and slots in the
+ -			 * root table list should be reused when empty.
+ -			 */
+ -			if (acpi_gbl_root_table_list.tables[i].
+ -			    flags & ACPI_TABLE_IS_LOADED) {
+ -
+ -				/* Table is still loaded, this is an error */
+ -
+ -				status = AE_ALREADY_EXISTS;
+ -				goto release_and_exit;
+ -			} else {
+ -				/*
+ -				 * Table was unloaded, allow it to be reloaded.
+ -				 * As we are going to return AE_OK to the caller, we should
+ -				 * take the responsibility of freeing the input descriptor.
+ -				 * Refill the input descriptor to ensure
+ -				 * acpi_tb_install_table_with_override() can be called again to
+ -				 * indicate the re-installation.
+ -				 */
+ -				acpi_tb_uninstall_table(&new_table_desc);
+ -				*table_index = i;
+ -				(void)acpi_ut_release_mutex(ACPI_MTX_TABLES);
+ -				return_ACPI_STATUS(AE_OK);
+ -			}
+ +		if (acpi_gbl_root_table_list.tables[i].
+ +		    flags & ACPI_TABLE_IS_LOADED) {
+ +
+ +			/* Table is still loaded, this is an error */
+ +
+ +			status = AE_ALREADY_EXISTS;
+ +			goto release;
+ +		} else {
+ +			/* Table was unloaded, allow it to be reloaded */
+ +
+ +			acpi_tb_delete_table(table_desc);
+ +			table_desc->pointer =
+ +			    acpi_gbl_root_table_list.tables[i].pointer;
+ +			table_desc->address =
+ +			    acpi_gbl_root_table_list.tables[i].address;
+ +			status = AE_OK;
+ +			goto print_header;
+  		}
+  	}
+  
+@@@ -322,92 -418,39 +346,109 @@@ struct acpi_table_header *acpi_tb_table
+  		goto finish_override;
+  	}
+  
+ -	return;			/* There was no override */
+ +	return (NULL);		/* There was no override */
+ +
+ +      finish_override:
+ +
+ +	ACPI_INFO((AE_INFO,
+ +		   "%4.4s %p %s table override, new table: %p",
+ +		   table_header->signature,
+ +		   ACPI_CAST_PTR(void, table_desc->address),
+ +		   override_type, new_table));
+ +
+++<<<<<<< HEAD
+ +	/* We can now unmap/delete the original table (if fully mapped) */
+  
+ -finish_override:
+ +	acpi_tb_delete_table(table_desc);
+ +
+ +	/* Setup descriptor for the new table */
+ +
+ +	table_desc->address = new_address;
+ +	table_desc->pointer = new_table;
+ +	table_desc->length = new_table_length;
+ +	table_desc->flags = new_flags;
+ +
+ +	return (new_table);
+ +}
+  
+ -	/* Validate and verify a table before overriding */
+ +/*******************************************************************************
+ + *
+ + * FUNCTION:    acpi_tb_resize_root_table_list
+ + *
+ + * PARAMETERS:  None
+ + *
+ + * RETURN:      Status
+ + *
+ + * DESCRIPTION: Expand the size of global table array
+ + *
+ + ******************************************************************************/
+  
+ +acpi_status acpi_tb_resize_root_table_list(void)
+ +{
+ +	struct acpi_table_desc *tables;
+ +	u32 table_count;
+ +
+ +	ACPI_FUNCTION_TRACE(tb_resize_root_table_list);
+ +
+ +	/* allow_resize flag is a parameter to acpi_initialize_tables */
+ +
+ +	if (!(acpi_gbl_root_table_list.flags & ACPI_ROOT_ALLOW_RESIZE)) {
+ +		ACPI_ERROR((AE_INFO,
+ +			    "Resize of Root Table Array is not allowed"));
+ +		return_ACPI_STATUS(AE_SUPPORT);
+++=======
++ 	status = acpi_tb_verify_temp_table(&new_table_desc, NULL);
++ 	if (ACPI_FAILURE(status)) {
++ 		return;
+++>>>>>>> 47d68c7f688c (ACPICA: Tables: Add mechanism to control early table checksum verification.)
+  	}
+  
+ -	ACPI_INFO((AE_INFO, "%4.4s " ACPI_PRINTF_UINT
+ -		   " %s table override, new table: " ACPI_PRINTF_UINT,
+ -		   old_table_desc->signature.ascii,
+ -		   ACPI_FORMAT_TO_UINT(old_table_desc->address),
+ -		   override_type, ACPI_FORMAT_TO_UINT(new_table_desc.address)));
+ +	/* Increase the Table Array size */
+  
+ -	/* We can now uninstall the original table */
+ +	if (acpi_gbl_root_table_list.flags & ACPI_ROOT_ORIGIN_ALLOCATED) {
+ +		table_count = acpi_gbl_root_table_list.max_table_count;
+ +	} else {
+ +		table_count = acpi_gbl_root_table_list.current_table_count;
+ +	}
+  
+ -	acpi_tb_uninstall_table(old_table_desc);
+ +	tables = ACPI_ALLOCATE_ZEROED(((acpi_size) table_count +
+ +				       ACPI_ROOT_TABLE_SIZE_INCREMENT) *
+ +				      sizeof(struct acpi_table_desc));
+ +	if (!tables) {
+ +		ACPI_ERROR((AE_INFO,
+ +			    "Could not allocate new root table array"));
+ +		return_ACPI_STATUS(AE_NO_MEMORY);
+ +	}
+  
+++<<<<<<< HEAD
+ +	/* Copy and free the previous table array */
+++=======
++ 	/*
++ 	 * Replace the original table descriptor and keep its state as
++ 	 * "VALIDATED".
++ 	 */
++ 	acpi_tb_init_table_descriptor(old_table_desc, new_table_desc.address,
++ 				      new_table_desc.flags,
++ 				      new_table_desc.pointer);
++ 	acpi_tb_validate_temp_table(old_table_desc);
+++>>>>>>> 47d68c7f688c (ACPICA: Tables: Add mechanism to control early table checksum verification.)
+  
+ -	/* Release the temporary table descriptor */
+ +	if (acpi_gbl_root_table_list.tables) {
+ +		ACPI_MEMCPY(tables, acpi_gbl_root_table_list.tables,
+ +			    (acpi_size) table_count *
+ +			    sizeof(struct acpi_table_desc));
+  
+ -	acpi_tb_release_temp_table(&new_table_desc);
+ +		if (acpi_gbl_root_table_list.flags & ACPI_ROOT_ORIGIN_ALLOCATED) {
+ +			ACPI_FREE(acpi_gbl_root_table_list.tables);
+ +		}
+ +	}
+ +
+ +	acpi_gbl_root_table_list.tables = tables;
+ +	acpi_gbl_root_table_list.max_table_count =
+ +	    table_count + ACPI_ROOT_TABLE_SIZE_INCREMENT;
+ +	acpi_gbl_root_table_list.flags |= ACPI_ROOT_ORIGIN_ALLOCATED;
+ +
+ +	return_ACPI_STATUS(AE_OK);
+  }
+  
+  /*******************************************************************************
+diff --cc include/acpi/acpixf.h
+index 4f88d18b72e7,35b525c19711..000000000000
+--- a/include/acpi/acpixf.h
++++ b/include/acpi/acpixf.h
+@@@ -55,38 -55,229 +55,223 @@@
+  
+  extern u8 acpi_gbl_permanent_mmap;
+  
+ -/*****************************************************************************
+ - *
+ - * Macros used for ACPICA globals and configuration
+ - *
+ - ****************************************************************************/
+ -
+  /*
+ - * Ensure that global variables are defined and initialized only once.
+ - *
+ - * The use of these macros allows for a single list of globals (here)
+ - * in order to simplify maintenance of the code.
+ + * Globals that are publically available
+   */
+ -#ifdef DEFINE_ACPI_GLOBALS
+ -#define ACPI_GLOBAL(type,name) \
+ -	extern type name; \
+ -	type name
+ +extern u32 acpi_current_gpe_count;
+ +extern struct acpi_table_fadt acpi_gbl_FADT;
+ +extern u8 acpi_gbl_system_awake_and_running;
+ +extern u8 acpi_gbl_reduced_hardware;	/* ACPI 5.0 */
+ +extern u8 acpi_gbl_osi_data;
+  
+ -#define ACPI_INIT_GLOBAL(type,name,value) \
+ -	type name=value
+ +/* Runtime configuration of debug print levels */
+  
+ -#else
+ -#ifndef ACPI_GLOBAL
+ -#define ACPI_GLOBAL(type,name) \
+ -	extern type name
+ -#endif
+ +extern u32 acpi_dbg_level;
+ +extern u32 acpi_dbg_layer;
+  
+ -#ifndef ACPI_INIT_GLOBAL
+ -#define ACPI_INIT_GLOBAL(type,name,value) \
+ -	extern type name
+ -#endif
+ -#endif
+ +/* ACPICA runtime options */
+ +
+ +extern u8 acpi_gbl_enable_interpreter_slack;
+ +extern u8 acpi_gbl_all_methods_serialized;
+ +extern u8 acpi_gbl_create_osi_method;
+ +extern u8 acpi_gbl_use_default_register_widths;
+ +extern acpi_name acpi_gbl_trace_method_name;
+ +extern u32 acpi_gbl_trace_flags;
+ +extern bool acpi_gbl_enable_aml_debug_object;
+ +extern u8 acpi_gbl_copy_dsdt_locally;
+ +extern u8 acpi_gbl_truncate_io_addresses;
+ +extern u8 acpi_gbl_disable_auto_repair;
+ +extern u8 acpi_gbl_disable_ssdt_table_load;
+  
+  /*
+++<<<<<<< HEAD
+ + * Hardware-reduced prototypes. All interfaces that use these macros will
+ + * be configured out of the ACPICA build if the ACPI_REDUCED_HARDWARE flag
+++=======
++  * These macros configure the various ACPICA interfaces. They are
++  * useful for generating stub inline functions for features that are
++  * configured out of the current kernel or ACPICA application.
++  */
++ #ifndef ACPI_EXTERNAL_RETURN_STATUS
++ #define ACPI_EXTERNAL_RETURN_STATUS(prototype) \
++ 	prototype;
++ #endif
++ 
++ #ifndef ACPI_EXTERNAL_RETURN_OK
++ #define ACPI_EXTERNAL_RETURN_OK(prototype) \
++ 	prototype;
++ #endif
++ 
++ #ifndef ACPI_EXTERNAL_RETURN_VOID
++ #define ACPI_EXTERNAL_RETURN_VOID(prototype) \
++ 	prototype;
++ #endif
++ 
++ #ifndef ACPI_EXTERNAL_RETURN_UINT32
++ #define ACPI_EXTERNAL_RETURN_UINT32(prototype) \
++ 	prototype;
++ #endif
++ 
++ #ifndef ACPI_EXTERNAL_RETURN_PTR
++ #define ACPI_EXTERNAL_RETURN_PTR(prototype) \
++ 	prototype;
++ #endif
++ 
++ /*****************************************************************************
++  *
++  * Public globals and runtime configuration options
++  *
++  ****************************************************************************/
++ 
++ /*
++  * Enable "slack mode" of the AML interpreter?  Default is FALSE, and the
++  * interpreter strictly follows the ACPI specification. Setting to TRUE
++  * allows the interpreter to ignore certain errors and/or bad AML constructs.
++  *
++  * Currently, these features are enabled by this flag:
++  *
++  * 1) Allow "implicit return" of last value in a control method
++  * 2) Allow access beyond the end of an operation region
++  * 3) Allow access to uninitialized locals/args (auto-init to integer 0)
++  * 4) Allow ANY object type to be a source operand for the Store() operator
++  * 5) Allow unresolved references (invalid target name) in package objects
++  * 6) Enable warning messages for behavior that is not ACPI spec compliant
++  */
++ ACPI_INIT_GLOBAL(u8, acpi_gbl_enable_interpreter_slack, FALSE);
++ 
++ /*
++  * Automatically serialize all methods that create named objects? Default
++  * is TRUE, meaning that all non_serialized methods are scanned once at
++  * table load time to determine those that create named objects. Methods
++  * that create named objects are marked Serialized in order to prevent
++  * possible run-time problems if they are entered by more than one thread.
++  */
++ ACPI_INIT_GLOBAL(u8, acpi_gbl_auto_serialize_methods, TRUE);
++ 
++ /*
++  * Create the predefined _OSI method in the namespace? Default is TRUE
++  * because ACPICA is fully compatible with other ACPI implementations.
++  * Changing this will revert ACPICA (and machine ASL) to pre-OSI behavior.
++  */
++ ACPI_INIT_GLOBAL(u8, acpi_gbl_create_osi_method, TRUE);
++ 
++ /*
++  * Optionally use default values for the ACPI register widths. Set this to
++  * TRUE to use the defaults, if an FADT contains incorrect widths/lengths.
++  */
++ ACPI_INIT_GLOBAL(u8, acpi_gbl_use_default_register_widths, TRUE);
++ 
++ /*
++  * Whether or not to verify the table checksum before installation. Set
++  * this to TRUE to verify the table checksum before install it to the table
++  * manager. Note that enabling this option causes errors to happen in some
++  * OSPMs during early initialization stages. Default behavior is to do such
++  * verification.
++  */
++ ACPI_INIT_GLOBAL(u8, acpi_gbl_verify_table_checksum, TRUE);
++ 
++ /*
++  * Optionally enable output from the AML Debug Object.
++  */
++ ACPI_INIT_GLOBAL(u8, acpi_gbl_enable_aml_debug_object, FALSE);
++ 
++ /*
++  * Optionally copy the entire DSDT to local memory (instead of simply
++  * mapping it.) There are some BIOSs that corrupt or replace the original
++  * DSDT, creating the need for this option. Default is FALSE, do not copy
++  * the DSDT.
++  */
++ ACPI_INIT_GLOBAL(u8, acpi_gbl_copy_dsdt_locally, FALSE);
++ 
++ /*
++  * Optionally ignore an XSDT if present and use the RSDT instead.
++  * Although the ACPI specification requires that an XSDT be used instead
++  * of the RSDT, the XSDT has been found to be corrupt or ill-formed on
++  * some machines. Default behavior is to use the XSDT if present.
++  */
++ ACPI_INIT_GLOBAL(u8, acpi_gbl_do_not_use_xsdt, FALSE);
++ 
++ /*
++  * Optionally use 32-bit FADT addresses if and when there is a conflict
++  * (address mismatch) between the 32-bit and 64-bit versions of the
++  * address. Although ACPICA adheres to the ACPI specification which
++  * requires the use of the corresponding 64-bit address if it is non-zero,
++  * some machines have been found to have a corrupted non-zero 64-bit
++  * address. Default is TRUE, favor the 32-bit addresses.
++  */
++ ACPI_INIT_GLOBAL(u8, acpi_gbl_use32_bit_fadt_addresses, TRUE);
++ 
++ /*
++  * Optionally truncate I/O addresses to 16 bits. Provides compatibility
++  * with other ACPI implementations. NOTE: During ACPICA initialization,
++  * this value is set to TRUE if any Windows OSI strings have been
++  * requested by the BIOS.
++  */
++ ACPI_INIT_GLOBAL(u8, acpi_gbl_truncate_io_addresses, FALSE);
++ 
++ /*
++  * Disable runtime checking and repair of values returned by control methods.
++  * Use only if the repair is causing a problem on a particular machine.
++  */
++ ACPI_INIT_GLOBAL(u8, acpi_gbl_disable_auto_repair, FALSE);
++ 
++ /*
++  * Optionally do not install any SSDTs from the RSDT/XSDT during initialization.
++  * This can be useful for debugging ACPI problems on some machines.
++  */
++ ACPI_INIT_GLOBAL(u8, acpi_gbl_disable_ssdt_table_install, FALSE);
++ 
++ /*
++  * We keep track of the latest version of Windows that has been requested by
++  * the BIOS. ACPI 5.0.
++  */
++ ACPI_INIT_GLOBAL(u8, acpi_gbl_osi_data, 0);
++ 
++ /*
++  * ACPI 5.0 introduces the concept of a "reduced hardware platform", meaning
++  * that the ACPI hardware is no longer required. A flag in the FADT indicates
++  * a reduced HW machine, and that flag is duplicated here for convenience.
++  */
++ ACPI_INIT_GLOBAL(u8, acpi_gbl_reduced_hardware, FALSE);
++ 
++ /*
++  * This mechanism is used to trace a specified AML method. The method is
++  * traced each time it is executed.
++  */
++ ACPI_INIT_GLOBAL(u32, acpi_gbl_trace_flags, 0);
++ ACPI_INIT_GLOBAL(acpi_name, acpi_gbl_trace_method_name, 0);
++ 
++ /*
++  * Runtime configuration of debug output control masks. We want the debug
++  * switches statically initialized so they are already set when the debugger
++  * is entered.
++  */
++ ACPI_INIT_GLOBAL(u32, acpi_dbg_level, ACPI_DEBUG_DEFAULT);
++ ACPI_INIT_GLOBAL(u32, acpi_dbg_layer, 0);
++ 
++ /*
++  * Other miscellaneous globals
++  */
++ ACPI_GLOBAL(struct acpi_table_fadt, acpi_gbl_FADT);
++ ACPI_GLOBAL(u32, acpi_current_gpe_count);
++ ACPI_GLOBAL(u8, acpi_gbl_system_awake_and_running);
++ 
++ /*****************************************************************************
++  *
++  * ACPICA public interface configuration.
++  *
++  * Interfaces that are configured out of the ACPICA build are replaced
++  * by inlined stubs by default.
++  *
++  ****************************************************************************/
++ 
++ /*
++  * Hardware-reduced prototypes (default: Not hardware reduced).
++  *
++  * All ACPICA hardware-related interfaces that use these macros will be
++  * configured out of the ACPICA build if the ACPI_REDUCED_HARDWARE flag
+++>>>>>>> 47d68c7f688c (ACPICA: Tables: Add mechanism to control early table checksum verification.)
+   * is set to TRUE.
+ - *
+ - * Note: This static build option for reduced hardware is intended to
+ - * reduce ACPICA code size if desired or necessary. However, even if this
+ - * option is not specified, the runtime behavior of ACPICA is dependent
+ - * on the actual FADT reduced hardware flag (HW_REDUCED_ACPI). If set,
+ - * the flag will enable similar behavior -- ACPICA will not attempt
+ - * to access any ACPI-relate hardware (SCI, GPEs, Fixed Events, etc.)
+   */
+  #if (!ACPI_REDUCED_HARDWARE)
+  #define ACPI_HW_DEPENDENT_RETURN_STATUS(prototype) \
+* Unmerged path drivers/acpi/acpica/tbdata.c
+* Unmerged path drivers/acpi/acpica/actables.h
+* Unmerged path drivers/acpi/acpica/tbdata.c
+* Unmerged path drivers/acpi/acpica/tbinstal.c
+diff --git a/drivers/acpi/acpica/tbutils.c b/drivers/acpi/acpica/tbutils.c
+index 61ffb069ecd5..f28097397eb5 100644
+--- a/drivers/acpi/acpica/tbutils.c
++++ b/drivers/acpi/acpica/tbutils.c
+@@ -572,10 +572,6 @@ acpi_tb_parse_root_table(acpi_physical_address rsdp_address)
+ 		acpi_gbl_root_table_list.current_table_count++;
+ 	}
+ 
+-	/*
+-	 * It is not possible to map more than one entry in some environments,
+-	 * so unmap the root table here before mapping other tables
+-	 */
+ 	acpi_os_unmap_memory(table, length);
+ 
+ 	/*
+* Unmerged path include/acpi/acpixf.h
