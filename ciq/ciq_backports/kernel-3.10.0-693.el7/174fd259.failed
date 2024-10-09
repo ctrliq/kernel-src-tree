@@ -1,0 +1,492 @@
+amd-xgbe: Implement split header receive support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit 174fd2597b0bd8c19fce6a97e8b0f753ef4ce7cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/174fd259.failed
+
+Provide support for splitting IP packets so that the header and
+payload can be sent to different DMA addresses.  This will allow
+the IP header to be put into the linear part of the skb while the
+payload can be added as frags.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 174fd2597b0bd8c19fce6a97e8b0f753ef4ce7cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-common.h
+#	drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+#	drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+#	drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+#	drivers/net/ethernet/amd/xgbe/xgbe.h
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-common.h
+index 3373e9ef2003,39bcb1140198..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-common.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-common.h
+@@@ -773,6 -845,18 +777,15 @@@
+  
+  #define RX_NORMAL_DESC0_OVT_INDEX		0
+  #define RX_NORMAL_DESC0_OVT_WIDTH		16
+++<<<<<<< HEAD
+++=======
++ #define RX_NORMAL_DESC2_HL_INDEX		0
++ #define RX_NORMAL_DESC2_HL_WIDTH		10
++ #define RX_NORMAL_DESC3_CDA_INDEX		27
++ #define RX_NORMAL_DESC3_CDA_WIDTH		1
++ #define RX_NORMAL_DESC3_CTXT_INDEX		30
++ #define RX_NORMAL_DESC3_CTXT_WIDTH		1
+++>>>>>>> 174fd2597b0b (amd-xgbe: Implement split header receive support)
+  #define RX_NORMAL_DESC3_ES_INDEX		15
+  #define RX_NORMAL_DESC3_ES_WIDTH		1
+  #define RX_NORMAL_DESC3_ETLT_INDEX		16
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+index a9ce56d5e988,e6b9f54b9697..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-desc.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+@@@ -139,6 -138,28 +139,31 @@@ static void xgbe_free_ring(struct xgbe_
+  		ring->rdata = NULL;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (ring->rx_hdr_pa.pages) {
++ 		dma_unmap_page(pdata->dev, ring->rx_hdr_pa.pages_dma,
++ 			       ring->rx_hdr_pa.pages_len, DMA_FROM_DEVICE);
++ 		put_page(ring->rx_hdr_pa.pages);
++ 
++ 		ring->rx_hdr_pa.pages = NULL;
++ 		ring->rx_hdr_pa.pages_len = 0;
++ 		ring->rx_hdr_pa.pages_offset = 0;
++ 		ring->rx_hdr_pa.pages_dma = 0;
++ 	}
++ 
++ 	if (ring->rx_buf_pa.pages) {
++ 		dma_unmap_page(pdata->dev, ring->rx_buf_pa.pages_dma,
++ 			       ring->rx_buf_pa.pages_len, DMA_FROM_DEVICE);
++ 		put_page(ring->rx_buf_pa.pages);
++ 
++ 		ring->rx_buf_pa.pages = NULL;
++ 		ring->rx_buf_pa.pages_len = 0;
++ 		ring->rx_buf_pa.pages_offset = 0;
++ 		ring->rx_buf_pa.pages_dma = 0;
++ 	}
++ 
+++>>>>>>> 174fd2597b0b (amd-xgbe: Implement split header receive support)
+  	if (ring->rdesc) {
+  		dma_free_coherent(pdata->dev,
+  				  (sizeof(struct xgbe_ring_desc) *
+@@@ -234,6 -255,96 +259,99 @@@ err_ring
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int xgbe_alloc_pages(struct xgbe_prv_data *pdata,
++ 			    struct xgbe_page_alloc *pa, gfp_t gfp, int order)
++ {
++ 	struct page *pages = NULL;
++ 	dma_addr_t pages_dma;
++ 	int ret;
++ 
++ 	/* Try to obtain pages, decreasing order if necessary */
++ 	gfp |= __GFP_COLD | __GFP_COMP;
++ 	while (order >= 0) {
++ 		pages = alloc_pages(gfp, order);
++ 		if (pages)
++ 			break;
++ 
++ 		order--;
++ 	}
++ 	if (!pages)
++ 		return -ENOMEM;
++ 
++ 	/* Map the pages */
++ 	pages_dma = dma_map_page(pdata->dev, pages, 0,
++ 				 PAGE_SIZE << order, DMA_FROM_DEVICE);
++ 	ret = dma_mapping_error(pdata->dev, pages_dma);
++ 	if (ret) {
++ 		put_page(pages);
++ 		return ret;
++ 	}
++ 
++ 	pa->pages = pages;
++ 	pa->pages_len = PAGE_SIZE << order;
++ 	pa->pages_offset = 0;
++ 	pa->pages_dma = pages_dma;
++ 
++ 	return 0;
++ }
++ 
++ static void xgbe_set_buffer_data(struct xgbe_buffer_data *bd,
++ 				 struct xgbe_page_alloc *pa,
++ 				 unsigned int len)
++ {
++ 	get_page(pa->pages);
++ 	bd->pa = *pa;
++ 
++ 	bd->dma = pa->pages_dma + pa->pages_offset;
++ 	bd->dma_len = len;
++ 
++ 	pa->pages_offset += len;
++ 	if ((pa->pages_offset + len) > pa->pages_len) {
++ 		/* This data descriptor is responsible for unmapping page(s) */
++ 		bd->pa_unmap = *pa;
++ 
++ 		/* Get a new allocation next time */
++ 		pa->pages = NULL;
++ 		pa->pages_len = 0;
++ 		pa->pages_offset = 0;
++ 		pa->pages_dma = 0;
++ 	}
++ }
++ 
++ static int xgbe_map_rx_buffer(struct xgbe_prv_data *pdata,
++ 			      struct xgbe_ring *ring,
++ 			      struct xgbe_ring_data *rdata)
++ {
++ 	int order, ret;
++ 
++ 	if (!ring->rx_hdr_pa.pages) {
++ 		ret = xgbe_alloc_pages(pdata, &ring->rx_hdr_pa, GFP_ATOMIC, 0);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	if (!ring->rx_buf_pa.pages) {
++ 		order = max_t(int, PAGE_ALLOC_COSTLY_ORDER - 1, 0);
++ 		ret = xgbe_alloc_pages(pdata, &ring->rx_buf_pa, GFP_ATOMIC,
++ 				       order);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	/* Set up the header page info */
++ 	xgbe_set_buffer_data(&rdata->rx_hdr, &ring->rx_hdr_pa,
++ 			     XGBE_SKB_ALLOC_SIZE);
++ 
++ 	/* Set up the buffer page info */
++ 	xgbe_set_buffer_data(&rdata->rx_buf, &ring->rx_buf_pa,
++ 			     pdata->rx_buf_size);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 174fd2597b0b (amd-xgbe: Implement split header receive support)
+  static void xgbe_wrapper_tx_descriptor_init(struct xgbe_prv_data *pdata)
+  {
+  	struct xgbe_hw_if *hw_if = &pdata->hw_if;
+@@@ -355,6 -451,29 +473,32 @@@ static void xgbe_unmap_skb(struct xgbe_
+  		rdata->skb = NULL;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (rdata->rx_hdr.pa.pages)
++ 		put_page(rdata->rx_hdr.pa.pages);
++ 
++ 	if (rdata->rx_hdr.pa_unmap.pages) {
++ 		dma_unmap_page(pdata->dev, rdata->rx_hdr.pa_unmap.pages_dma,
++ 			       rdata->rx_hdr.pa_unmap.pages_len,
++ 			       DMA_FROM_DEVICE);
++ 		put_page(rdata->rx_hdr.pa_unmap.pages);
++ 	}
++ 
++ 	if (rdata->rx_buf.pa.pages)
++ 		put_page(rdata->rx_buf.pa.pages);
++ 
++ 	if (rdata->rx_buf.pa_unmap.pages) {
++ 		dma_unmap_page(pdata->dev, rdata->rx_buf.pa_unmap.pages_dma,
++ 			       rdata->rx_buf.pa_unmap.pages_len,
++ 			       DMA_FROM_DEVICE);
++ 		put_page(rdata->rx_buf.pa_unmap.pages);
++ 	}
++ 
++ 	memset(&rdata->rx_hdr, 0, sizeof(rdata->rx_hdr));
++ 	memset(&rdata->rx_buf, 0, sizeof(rdata->rx_buf));
++ 
+++>>>>>>> 174fd2597b0b (amd-xgbe: Implement split header receive support)
+  	rdata->tso_header = 0;
+  	rdata->len = 0;
+  	rdata->interrupt = 0;
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+index 2da3691ffcd6,b3719f154637..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+@@@ -805,19 -936,19 +821,25 @@@ static void xgbe_rx_desc_reset(struct x
+  	struct xgbe_ring_desc *rdesc = rdata->rdesc;
+  
+  	/* Reset the Rx descriptor
+- 	 *   Set buffer 1 (lo) address to dma address (lo)
+- 	 *   Set buffer 1 (hi) address to dma address (hi)
+- 	 *   Set buffer 2 (lo) address to zero
+- 	 *   Set buffer 2 (hi) address to zero and set control bits
+- 	 *     OWN and INTE
++ 	 *   Set buffer 1 (lo) address to header dma address (lo)
++ 	 *   Set buffer 1 (hi) address to header dma address (hi)
++ 	 *   Set buffer 2 (lo) address to buffer dma address (lo)
++ 	 *   Set buffer 2 (hi) address to buffer dma address (hi) and
++ 	 *     set control bits OWN and INTE
+  	 */
+++<<<<<<< HEAD
+ +	rdesc->desc0 = cpu_to_le32(lower_32_bits(rdata->skb_dma));
+ +	rdesc->desc1 = cpu_to_le32(upper_32_bits(rdata->skb_dma));
+ +	rdesc->desc2 = 0;
+++=======
++ 	rdesc->desc0 = cpu_to_le32(lower_32_bits(rdata->rx_hdr.dma));
++ 	rdesc->desc1 = cpu_to_le32(upper_32_bits(rdata->rx_hdr.dma));
++ 	rdesc->desc2 = cpu_to_le32(lower_32_bits(rdata->rx_buf.dma));
++ 	rdesc->desc3 = cpu_to_le32(upper_32_bits(rdata->rx_buf.dma));
+++>>>>>>> 174fd2597b0b (amd-xgbe: Implement split header receive support)
+  
+- 	rdesc->desc3 = 0;
+- 	if (rdata->interrupt)
+- 		XGMAC_SET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, INTE, 1);
++ 	XGMAC_SET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, INTE,
++ 			  rdata->interrupt ? 1 : 0);
+  
+  	/* Since the Rx DMA engine is likely running, make sure everything
+  	 * is written to the descriptor(s) before setting the OWN bit
+@@@ -1129,6 -1419,30 +1151,33 @@@ static int xgbe_dev_read(struct xgbe_ch
+  	xgbe_dump_rx_desc(ring, rdesc, ring->cur);
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ 	if (XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, CTXT)) {
++ 		/* Timestamp Context Descriptor */
++ 		xgbe_get_rx_tstamp(packet, rdesc);
++ 
++ 		XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES,
++ 			       CONTEXT, 1);
++ 		XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES,
++ 			       CONTEXT_NEXT, 0);
++ 		return 0;
++ 	}
++ 
++ 	/* Normal Descriptor, be sure Context Descriptor bit is off */
++ 	XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES, CONTEXT, 0);
++ 
++ 	/* Indicate if a Context Descriptor is next */
++ 	if (XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, CDA))
++ 		XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES,
++ 			       CONTEXT_NEXT, 1);
++ 
++ 	/* Get the header length */
++ 	if (XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, FD))
++ 		rdata->hdr_len = XGMAC_GET_BITS_LE(rdesc->desc2,
++ 						   RX_NORMAL_DESC2, HL);
++ 
+++>>>>>>> 174fd2597b0b (amd-xgbe: Implement split header receive support)
+  	/* Get the packet length */
+  	rdata->len = XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, PL);
+  
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index 6baf601c4282,07e2d216323a..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@@ -1098,6 -1618,31 +1098,34 @@@ static void xgbe_rx_refresh(struct xgbe
+  			  lower_32_bits(rdata->rdesc_dma));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct sk_buff *xgbe_create_skb(struct xgbe_prv_data *pdata,
++ 				       struct xgbe_ring_data *rdata,
++ 				       unsigned int *len)
++ {
++ 	struct net_device *netdev = pdata->netdev;
++ 	struct sk_buff *skb;
++ 	u8 *packet;
++ 	unsigned int copy_len;
++ 
++ 	skb = netdev_alloc_skb_ip_align(netdev, rdata->rx_hdr.dma_len);
++ 	if (!skb)
++ 		return NULL;
++ 
++ 	packet = page_address(rdata->rx_hdr.pa.pages) +
++ 		 rdata->rx_hdr.pa.pages_offset;
++ 	copy_len = (rdata->hdr_len) ? rdata->hdr_len : *len;
++ 	copy_len = min(rdata->rx_hdr.dma_len, copy_len);
++ 	skb_copy_to_linear_data(skb, packet, copy_len);
++ 	skb_put(skb, copy_len);
++ 
++ 	*len -= copy_len;
++ 
++ 	return skb;
++ }
++ 
+++>>>>>>> 174fd2597b0b (amd-xgbe: Implement split header receive support)
+  static int xgbe_tx_poll(struct xgbe_channel *channel)
+  {
+  	struct xgbe_prv_data *pdata = channel->pdata;
+@@@ -1193,10 -1751,6 +1221,13 @@@ read_again
+  		ring->cur++;
+  		ring->dirty++;
+  
+++<<<<<<< HEAD
+ +		dma_unmap_single(pdata->dev, rdata->skb_dma,
+ +				 rdata->skb_dma_len, DMA_FROM_DEVICE);
+ +		rdata->skb_dma = 0;
+ +
+++=======
+++>>>>>>> 174fd2597b0b (amd-xgbe: Implement split header receive support)
+  		incomplete = XGMAC_GET_BITS(packet->attributes,
+  					    RX_PACKET_ATTRIBUTES,
+  					    INCOMPLETE);
+@@@ -1209,33 -1769,47 +1240,65 @@@
+  			if (packet->errors)
+  				DBGPR("Error in received packet\n");
+  			dev_kfree_skb(skb);
+ -			goto next_packet;
+ +			continue;
+  		}
+  
+++<<<<<<< HEAD
+ +		put_len = rdata->len - cur_len;
+ +		if (skb) {
+ +			if (pskb_expand_head(skb, 0, put_len, GFP_ATOMIC)) {
+ +				DBGPR("pskb_expand_head error\n");
+ +				if (incomplete) {
+ +					error = 1;
+ +					goto read_again;
+ +				}
+ +
+ +				dev_kfree_skb(skb);
+ +				continue;
+ +			}
+ +			memcpy(skb_tail_pointer(skb), rdata->skb->data,
+ +			       put_len);
+ +		} else {
+ +			skb = rdata->skb;
+ +			rdata->skb = NULL;
+++=======
++ 		if (!context) {
++ 			put_len = rdata->len - len;
++ 			len += put_len;
++ 
++ 			if (!skb) {
++ 				dma_sync_single_for_cpu(pdata->dev,
++ 							rdata->rx_hdr.dma,
++ 							rdata->rx_hdr.dma_len,
++ 							DMA_FROM_DEVICE);
++ 
++ 				skb = xgbe_create_skb(pdata, rdata, &put_len);
++ 				if (!skb) {
++ 					error = 1;
++ 					goto read_again;
++ 				}
++ 			}
++ 
++ 			if (put_len) {
++ 				dma_sync_single_for_cpu(pdata->dev,
++ 							rdata->rx_buf.dma,
++ 							rdata->rx_buf.dma_len,
++ 							DMA_FROM_DEVICE);
++ 
++ 				skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
++ 						rdata->rx_buf.pa.pages,
++ 						rdata->rx_buf.pa.pages_offset,
++ 						put_len, rdata->rx_buf.dma_len);
++ 				rdata->rx_buf.pa.pages = NULL;
++ 			}
+++>>>>>>> 174fd2597b0b (amd-xgbe: Implement split header receive support)
+  		}
+ +		skb_put(skb, put_len);
+ +		cur_len += put_len;
+  
+ -		if (incomplete || context_next)
+ +		if (incomplete)
+  			goto read_again;
+  
+ -		/* Stray Context Descriptor? */
+ -		if (!skb)
+ -			goto next_packet;
+ -
+  		/* Be sure we don't exceed the configured MTU */
+  		max_len = netdev->mtu + ETH_HLEN;
+  		if (!(netdev->features & NETIF_F_HW_VLAN_CTAG_RX) &&
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe.h
+index 30435fbd04b3,1480c9d41821..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe.h
+@@@ -137,8 -142,11 +137,13 @@@
+  
+  #define XGBE_RX_MIN_BUF_SIZE	(ETH_FRAME_LEN + ETH_FCS_LEN + VLAN_HLEN)
+  #define XGBE_RX_BUF_ALIGN	64
+++<<<<<<< HEAD
+++=======
++ #define XGBE_SKB_ALLOC_SIZE	256
++ #define XGBE_SPH_HDSMS_SIZE	2	/* Keep in sync with SKB_ALLOC_SIZE */
+++>>>>>>> 174fd2597b0b (amd-xgbe: Implement split header receive support)
+  
+  #define XGBE_MAX_DMA_CHANNELS	16
+ -#define XGBE_MAX_QUEUES		16
+  
+  /* DMA cache settings - Outer sharable, write-back, write-allocate */
+  #define XGBE_DMA_OS_AXDOMAIN	0x2
+@@@ -221,6 -242,24 +226,27 @@@ struct xgbe_ring_desc 
+  	u32 desc3;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Page allocation related values */
++ struct xgbe_page_alloc {
++ 	struct page *pages;
++ 	unsigned int pages_len;
++ 	unsigned int pages_offset;
++ 
++ 	dma_addr_t pages_dma;
++ };
++ 
++ /* Ring entry buffer data */
++ struct xgbe_buffer_data {
++ 	struct xgbe_page_alloc pa;
++ 	struct xgbe_page_alloc pa_unmap;
++ 
++ 	dma_addr_t dma;
++ 	unsigned int dma_len;
++ };
++ 
+++>>>>>>> 174fd2597b0b (amd-xgbe: Implement split header receive support)
+  /* Structure used to hold information related to the descriptor
+   * and the packet associated with the descriptor (always use
+   * use the XGBE_GET_DESC_DATA macro to access this data from the ring)
+@@@ -234,6 -273,10 +260,13 @@@ struct xgbe_ring_data 
+  	unsigned int skb_dma_len;	/* Length of SKB DMA area */
+  	unsigned int tso_header;        /* TSO header indicator */
+  
+++<<<<<<< HEAD
+++=======
++ 	struct xgbe_buffer_data rx_hdr;	/* Header locations */
++ 	struct xgbe_buffer_data rx_buf; /* Payload locations */
++ 
++ 	unsigned short hdr_len;		/* Length of received header */
+++>>>>>>> 174fd2597b0b (amd-xgbe: Implement split header receive support)
+  	unsigned short len;		/* Length of received Rx packet */
+  
+  	unsigned int interrupt;		/* Interrupt indicator */
+@@@ -258,6 -315,10 +291,13 @@@ struct xgbe_ring 
+  	 */
+  	struct xgbe_ring_data *rdata;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Page allocation for RX buffers */
++ 	struct xgbe_page_alloc rx_hdr_pa;
++ 	struct xgbe_page_alloc rx_buf_pa;
++ 
+++>>>>>>> 174fd2597b0b (amd-xgbe: Implement split header receive support)
+  	/* Ring index values
+  	 *  cur   - Tx: index of descriptor to be used for current transfer
+  	 *          Rx: index of descriptor to check for packet availability
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-common.h
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe.h
