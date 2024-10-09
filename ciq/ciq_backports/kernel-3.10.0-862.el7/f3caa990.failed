@@ -1,0 +1,151 @@
+scsi: qla2xxx: Use sp->free instead of hard coded call.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Use sp->free instead of hard coded call (Himanshu Madhani) [1460030]
+Rebuild_FUZZ: 93.20%
+commit-author Joe Carnuccio <joe.carnuccio@cavium.com>
+commit f3caa9905d496ee7afeb7ef7ed22a529c00866bb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f3caa990.failed
+
+Calling sp->free() ensures the context-correct free routine is called.
+
+	Signed-off-by: Joe Carnuccio <joe.carnuccio@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit f3caa9905d496ee7afeb7ef7ed22a529c00866bb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_os.c
+diff --cc drivers/scsi/qla2xxx/qla_os.c
+index 4e0d0a2f9461,5b033e265a3b..000000000000
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@@ -584,7 -671,83 +584,87 @@@ qla24xx_fw_version_str(struct scsi_qla_
+  }
+  
+  void
+++<<<<<<< HEAD
+ +qla2x00_sp_free_dma(void *vha, void *ptr)
+++=======
++ qla2x00_sp_free_dma(void *ptr)
++ {
++ 	srb_t *sp = ptr;
++ 	struct qla_hw_data *ha = sp->vha->hw;
++ 	struct scsi_cmnd *cmd = GET_CMD_SP(sp);
++ 	void *ctx = GET_CMD_CTX_SP(sp);
++ 
++ 	if (sp->flags & SRB_DMA_VALID) {
++ 		scsi_dma_unmap(cmd);
++ 		sp->flags &= ~SRB_DMA_VALID;
++ 	}
++ 
++ 	if (sp->flags & SRB_CRC_PROT_DMA_VALID) {
++ 		dma_unmap_sg(&ha->pdev->dev, scsi_prot_sglist(cmd),
++ 		    scsi_prot_sg_count(cmd), cmd->sc_data_direction);
++ 		sp->flags &= ~SRB_CRC_PROT_DMA_VALID;
++ 	}
++ 
++ 	if (!ctx)
++ 		goto end;
++ 
++ 	if (sp->flags & SRB_CRC_CTX_DSD_VALID) {
++ 		/* List assured to be having elements */
++ 		qla2x00_clean_dsd_pool(ha, ctx);
++ 		sp->flags &= ~SRB_CRC_CTX_DSD_VALID;
++ 	}
++ 
++ 	if (sp->flags & SRB_CRC_CTX_DMA_VALID) {
++ 		struct crc_context *ctx0 = ctx;
++ 
++ 		dma_pool_free(ha->dl_dma_pool, ctx0, ctx0->crc_ctx_dma);
++ 		sp->flags &= ~SRB_CRC_CTX_DMA_VALID;
++ 	}
++ 
++ 	if (sp->flags & SRB_FCP_CMND_DMA_VALID) {
++ 		struct ct6_dsd *ctx1 = ctx;
++ 
++ 		dma_pool_free(ha->fcp_cmnd_dma_pool, ctx1->fcp_cmnd,
++ 		    ctx1->fcp_cmnd_dma);
++ 		list_splice(&ctx1->dsd_list, &ha->gbl_dsd_list);
++ 		ha->gbl_dsd_inuse -= ctx1->dsd_use_cnt;
++ 		ha->gbl_dsd_avail += ctx1->dsd_use_cnt;
++ 		mempool_free(ctx1, ha->ctx_mempool);
++ 	}
++ 
++ end:
++ 	if (sp->type != SRB_NVME_CMD && sp->type != SRB_NVME_LS) {
++ 		CMD_SP(cmd) = NULL;
++ 		qla2x00_rel_sp(sp);
++ 	}
++ }
++ 
++ void
++ qla2x00_sp_compl(void *ptr, int res)
++ {
++ 	srb_t *sp = ptr;
++ 	struct scsi_cmnd *cmd = GET_CMD_SP(sp);
++ 
++ 	cmd->result = res;
++ 
++ 	if (atomic_read(&sp->ref_count) == 0) {
++ 		ql_dbg(ql_dbg_io, sp->vha, 0x3015,
++ 		    "SP reference-count to ZERO -- sp=%p cmd=%p.\n",
++ 		    sp, GET_CMD_SP(sp));
++ 		if (ql2xextended_error_logging & ql_dbg_io)
++ 			WARN_ON(atomic_read(&sp->ref_count) == 0);
++ 		return;
++ 	}
++ 	if (!atomic_dec_and_test(&sp->ref_count))
++ 		return;
++ 
++ 	sp->free(sp);
++ 	cmd->scsi_done(cmd);
++ }
++ 
++ void
++ qla2xxx_qpair_sp_free_dma(void *ptr)
+++>>>>>>> f3caa9905d49 (scsi: qla2xxx: Use sp->free instead of hard coded call.)
+  {
+  	srb_t *sp = (srb_t *)ptr;
+  	struct scsi_cmnd *cmd = GET_CMD_SP(sp);
+@@@ -718,7 -814,7 +798,11 @@@ qla2xxx_qpair_sp_compl(void *data, voi
+  	if (!atomic_dec_and_test(&sp->ref_count))
+  		return;
+  
+++<<<<<<< HEAD
+ +	qla2xxx_qpair_sp_free_dma(sp->fcport->vha, sp);
+++=======
++ 	sp->free(sp);
+++>>>>>>> f3caa9905d49 (scsi: qla2xxx: Use sp->free instead of hard coded call.)
+  	cmd->scsi_done(cmd);
+  }
+  
+@@@ -839,7 -935,7 +923,11 @@@ qla2xxx_queuecommand(struct Scsi_Host *
+  	return 0;
+  
+  qc24_host_busy_free_sp:
+++<<<<<<< HEAD
+ +	qla2x00_sp_free_dma(ha, sp);
+++=======
++ 	sp->free(sp);
+++>>>>>>> f3caa9905d49 (scsi: qla2xxx: Use sp->free instead of hard coded call.)
+  
+  qc24_host_busy:
+  	return SCSI_MLQUEUE_HOST_BUSY;
+@@@ -928,7 -1024,7 +1016,11 @@@ qla2xxx_mqueuecommand(struct Scsi_Host 
+  	return 0;
+  
+  qc24_host_busy_free_sp:
+++<<<<<<< HEAD
+ +	qla2xxx_qpair_sp_free_dma(vha, sp);
+++=======
++ 	sp->free(sp);
+++>>>>>>> f3caa9905d49 (scsi: qla2xxx: Use sp->free instead of hard coded call.)
+  
+  qc24_host_busy:
+  	return SCSI_MLQUEUE_HOST_BUSY;
+* Unmerged path drivers/scsi/qla2xxx/qla_os.c
