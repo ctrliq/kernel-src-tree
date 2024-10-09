@@ -1,0 +1,303 @@
+ipmi: Make the DMI probe into a generic platform probe
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Corey Minyard <cminyard@mvista.com>
+commit 95e300c052fd9dbb05f289a912c138ed03320ec5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/95e300c0.failed
+
+Rework the DMI probe function to be a generic platform probe, and
+then rework the DMI code (and a few other things) to use the more
+generic information.  This is so other things can declare platform
+IPMI devices.
+
+	Signed-off-by: Corey Minyard <cminyard@mvista.com>
+(cherry picked from commit 95e300c052fd9dbb05f289a912c138ed03320ec5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/char/ipmi/ipmi_si_intf.c
+#	drivers/char/ipmi/ipmi_si_platform.c
+#	drivers/char/ipmi/ipmi_si_sm.h
+#	include/linux/ipmi.h
+diff --cc drivers/char/ipmi/ipmi_si_intf.c
+index 72982bfaeaf1,55e0c42bee4d..000000000000
+--- a/drivers/char/ipmi/ipmi_si_intf.c
++++ b/drivers/char/ipmi/ipmi_si_intf.c
+@@@ -99,15 -89,9 +99,19 @@@ enum si_intf_state 
+  #define IPMI_BT_INTMASK_CLEAR_IRQ_BIT	2
+  #define IPMI_BT_INTMASK_ENABLE_IRQ_BIT	1
+  
+++<<<<<<< HEAD
+ +enum si_type {
+ +	SI_KCS, SI_SMIC, SI_BT
+ +};
+ +
+ +static const char * const si_to_str[] = { "kcs", "smic", "bt" };
+++=======
++ static const char * const si_to_str[] = { "invalid", "kcs", "smic", "bt" };
+++>>>>>>> 95e300c052fd (ipmi: Make the DMI probe into a generic platform probe)
+  
+ -static int initialized;
+ +#define DEVICE_NAME "ipmi_si"
+ +
+ +static struct platform_driver ipmi_driver;
+  
+  /*
+   * Indexes into stats[] in smi_info below.
+diff --cc drivers/char/ipmi/ipmi_si_sm.h
+index a705027c0493,aa8d88ab4433..000000000000
+--- a/drivers/char/ipmi/ipmi_si_sm.h
++++ b/drivers/char/ipmi/ipmi_si_sm.h
+@@@ -40,6 -42,10 +40,13 @@@
+   */
+  struct si_sm_data;
+  
+++<<<<<<< HEAD
+++=======
++ enum si_type {
++ 	SI_TYPE_INVALID, SI_KCS, SI_SMIC, SI_BT
++ };
++ 
+++>>>>>>> 95e300c052fd (ipmi: Make the DMI probe into a generic platform probe)
+  /*
+   * The structure for doing I/O in the state machine.  The state
+   * machine doesn't have the actual I/O routines, they are done through
+diff --cc include/linux/ipmi.h
+index 152939d4a3a1,f4ffacf4fe9d..000000000000
+--- a/include/linux/ipmi.h
++++ b/include/linux/ipmi.h
+@@@ -276,7 -277,7 +276,11 @@@ int ipmi_validate_addr(struct ipmi_add
+   */
+  enum ipmi_addr_src {
+  	SI_INVALID = 0, SI_HOTMOD, SI_HARDCODED, SI_SPMI, SI_ACPI, SI_SMBIOS,
+++<<<<<<< HEAD
+ +	SI_PCI,	SI_DEVICETREE, RH_KABI_RENAME(SI_DEFAULT, SI_LAST)
+++=======
++ 	SI_PCI,	SI_DEVICETREE, SI_PLATFORM, SI_LAST
+++>>>>>>> 95e300c052fd (ipmi: Make the DMI probe into a generic platform probe)
+  };
+  const char *ipmi_addr_src_to_str(enum ipmi_addr_src src);
+  
+* Unmerged path drivers/char/ipmi/ipmi_si_platform.c
+diff --git a/drivers/char/ipmi/ipmi_dmi.c b/drivers/char/ipmi/ipmi_dmi.c
+index 2a84401dea05..d08d41903b0f 100644
+--- a/drivers/char/ipmi/ipmi_dmi.c
++++ b/drivers/char/ipmi/ipmi_dmi.c
+@@ -8,10 +8,16 @@
+ #include <linux/dmi.h>
+ #include <linux/platform_device.h>
+ #include <linux/property.h>
++#include "ipmi_si_sm.h"
+ #include "ipmi_dmi.h"
+ 
++#define IPMI_DMI_TYPE_KCS	0x01
++#define IPMI_DMI_TYPE_SMIC	0x02
++#define IPMI_DMI_TYPE_BT	0x03
++#define IPMI_DMI_TYPE_SSIF	0x04
++
+ struct ipmi_dmi_info {
+-	int type;
++	enum si_type si_type;
+ 	u32 flags;
+ 	unsigned long addr;
+ 	u8 slave_addr;
+@@ -22,6 +28,15 @@ static struct ipmi_dmi_info *ipmi_dmi_infos;
+ 
+ static int ipmi_dmi_nr __initdata;
+ 
++#define set_prop_entry(_p_, _name_, type, val)	\
++do {					\
++	struct property_entry *_p = &_p_;	\
++	_p->name = _name_;			\
++	_p->length = sizeof(type);		\
++	_p->is_string = false;			\
++	_p->value.type##_data = val;		\
++} while(0)
++
+ static void __init dmi_add_platform_ipmi(unsigned long base_addr,
+ 					 u32 flags,
+ 					 u8 slave_addr,
+@@ -32,27 +47,14 @@ static void __init dmi_add_platform_ipmi(unsigned long base_addr,
+ 	struct platform_device *pdev;
+ 	struct resource r[4];
+ 	unsigned int num_r = 1, size;
+-	struct property_entry p[4] = {
+-		PROPERTY_ENTRY_U8("slave-addr", slave_addr),
+-		PROPERTY_ENTRY_U8("ipmi-type", type),
+-		PROPERTY_ENTRY_U16("i2c-addr", base_addr),
+-		{ }
+-	};
++	struct property_entry p[5];
++	unsigned int pidx = 0;
+ 	char *name, *override;
+ 	int rv;
++	enum si_type si_type;
+ 	struct ipmi_dmi_info *info;
+ 
+-	info = kmalloc(sizeof(*info), GFP_KERNEL);
+-	if (!info) {
+-		pr_warn("ipmi:dmi: Could not allocate dmi info\n");
+-	} else {
+-		info->type = type;
+-		info->flags = flags;
+-		info->addr = base_addr;
+-		info->slave_addr = slave_addr;
+-		info->next = ipmi_dmi_infos;
+-		ipmi_dmi_infos = info;
+-	}
++	memset(p, 0, sizeof(p));
+ 
+ 	name = "dmi-ipmi-si";
+ 	override = "ipmi_si";
+@@ -62,19 +64,42 @@ static void __init dmi_add_platform_ipmi(unsigned long base_addr,
+ 		override = "ipmi_ssif";
+ 		offset = 1;
+ 		size = 1;
++		si_type = SI_TYPE_INVALID;
+ 		break;
+ 	case IPMI_DMI_TYPE_BT:
+ 		size = 3;
++		si_type = SI_BT;
+ 		break;
+ 	case IPMI_DMI_TYPE_KCS:
++		size = 2;
++		si_type = SI_KCS;
++		break;
+ 	case IPMI_DMI_TYPE_SMIC:
+ 		size = 2;
++		si_type = SI_SMIC;
+ 		break;
+ 	default:
+ 		pr_err("ipmi:dmi: Invalid IPMI type: %d", type);
+ 		return;
+ 	}
+ 
++	if (si_type != SI_TYPE_INVALID)
++		set_prop_entry(p[pidx++], "ipmi-type", u8, si_type);
++	set_prop_entry(p[pidx++], "slave-addr", u8, slave_addr);
++	set_prop_entry(p[pidx++], "addr-source", u8, SI_SMBIOS);
++
++	info = kmalloc(sizeof(*info), GFP_KERNEL);
++	if (!info) {
++		pr_warn("ipmi:dmi: Could not allocate dmi info\n");
++	} else {
++		info->si_type = si_type;
++		info->flags = flags;
++		info->addr = base_addr;
++		info->slave_addr = slave_addr;
++		info->next = ipmi_dmi_infos;
++		ipmi_dmi_infos = info;
++	}
++
+ 	pdev = platform_device_alloc(name, ipmi_dmi_nr);
+ 	if (!pdev) {
+ 		pr_err("ipmi:dmi: Error allocation IPMI platform device");
+@@ -82,8 +107,10 @@ static void __init dmi_add_platform_ipmi(unsigned long base_addr,
+ 	}
+ 	pdev->driver_override = override;
+ 
+-	if (type == IPMI_DMI_TYPE_SSIF)
++	if (type == IPMI_DMI_TYPE_SSIF) {
++		set_prop_entry(p[pidx++], "i2c-addr", u16, base_addr);
+ 		goto add_properties;
++	}
+ 
+ 	memset(r, 0, sizeof(r));
+ 
+@@ -151,12 +178,13 @@ err:
+  * This function allows an ACPI-specified IPMI device to look up the
+  * slave address from the DMI table.
+  */
+-int ipmi_dmi_get_slave_addr(int type, u32 flags, unsigned long base_addr)
++int ipmi_dmi_get_slave_addr(enum si_type si_type, u32 flags,
++			    unsigned long base_addr)
+ {
+ 	struct ipmi_dmi_info *info = ipmi_dmi_infos;
+ 
+ 	while (info) {
+-		if (info->type == type &&
++		if (info->si_type == si_type &&
+ 		    info->flags == flags &&
+ 		    info->addr == base_addr)
+ 			return info->slave_addr;
+diff --git a/drivers/char/ipmi/ipmi_dmi.h b/drivers/char/ipmi/ipmi_dmi.h
+index 0a1afe5ceb1e..062015b8f520 100644
+--- a/drivers/char/ipmi/ipmi_dmi.h
++++ b/drivers/char/ipmi/ipmi_dmi.h
+@@ -2,11 +2,7 @@
+  * DMI defines for use by IPMI
+  */
+ 
+-#define IPMI_DMI_TYPE_KCS	0x01
+-#define IPMI_DMI_TYPE_SMIC	0x02
+-#define IPMI_DMI_TYPE_BT	0x03
+-#define IPMI_DMI_TYPE_SSIF	0x04
+-
+ #ifdef CONFIG_IPMI_DMI_DECODE
+-int ipmi_dmi_get_slave_addr(int type, u32 flags, unsigned long base_addr);
++int ipmi_dmi_get_slave_addr(enum si_type si_type, u32 flags,
++			    unsigned long base_addr);
+ #endif
+diff --git a/drivers/char/ipmi/ipmi_msghandler.c b/drivers/char/ipmi/ipmi_msghandler.c
+index 23529b23ec40..2d94a71c43f6 100644
+--- a/drivers/char/ipmi/ipmi_msghandler.c
++++ b/drivers/char/ipmi/ipmi_msghandler.c
+@@ -587,7 +587,7 @@ static DEFINE_MUTEX(smi_watchers_mutex);
+ 
+ static const char * const addr_src_to_str[] = {
+ 	"invalid", "hotmod", "hardcoded", "SPMI", "ACPI", "SMBIOS", "PCI",
+-	"device-tree"
++	"device-tree", "platform"
+ };
+ 
+ const char *ipmi_addr_src_to_str(enum ipmi_addr_src src)
+* Unmerged path drivers/char/ipmi/ipmi_si_intf.c
+* Unmerged path drivers/char/ipmi/ipmi_si_platform.c
+* Unmerged path drivers/char/ipmi/ipmi_si_sm.h
+diff --git a/drivers/char/ipmi/ipmi_ssif.c b/drivers/char/ipmi/ipmi_ssif.c
+index dbbf7ba6446f..363e48b8e56a 100644
+--- a/drivers/char/ipmi/ipmi_ssif.c
++++ b/drivers/char/ipmi/ipmi_ssif.c
+@@ -53,6 +53,7 @@
+ #include <linux/acpi.h>
+ #include <linux/ctype.h>
+ #include <linux/time64.h>
++#include "ipmi_si_sm.h"
+ #include "ipmi_dmi.h"
+ 
+ #define PFX "ipmi_ssif: "
+@@ -1484,7 +1485,7 @@ static int find_slave_address(struct i2c_client *client, int slave_addr)
+ #ifdef CONFIG_IPMI_DMI_DECODE
+ 	if (!slave_addr)
+ 		slave_addr = ipmi_dmi_get_slave_addr(
+-			IPMI_DMI_TYPE_SSIF,
++			SI_TYPE_INVALID,
+ 			i2c_adapter_id(client->adapter),
+ 			client->addr);
+ #endif
+@@ -2027,20 +2028,13 @@ static void spmi_find_bmc(void) { }
+ #ifdef CONFIG_DMI
+ static int dmi_ipmi_probe(struct platform_device *pdev)
+ {
+-	u8 type, slave_addr = 0;
++	u8 slave_addr = 0;
+ 	u16 i2c_addr;
+ 	int rv;
+ 
+ 	if (!ssif_trydmi)
+ 		return -ENODEV;
+ 
+-	rv = device_property_read_u8(&pdev->dev, "ipmi-type", &type);
+-	if (rv)
+-		return -ENODEV;
+-
+-	if (type != IPMI_DMI_TYPE_SSIF)
+-		return -ENODEV;
+-
+ 	rv = device_property_read_u16(&pdev->dev, "i2c-addr", &i2c_addr);
+ 	if (rv) {
+ 		dev_warn(&pdev->dev, PFX "No i2c-addr property\n");
+* Unmerged path include/linux/ipmi.h
