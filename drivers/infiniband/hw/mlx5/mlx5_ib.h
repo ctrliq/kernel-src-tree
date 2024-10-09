@@ -744,6 +744,7 @@ enum mlx5_ib_stages {
 	MLX5_IB_STAGE_POST_IB_REG_UMR,
 	MLX5_IB_STAGE_DELAY_DROP,
 	MLX5_IB_STAGE_CLASS_ATTR,
+	MLX5_IB_STAGE_REP_REG,
 	MLX5_IB_STAGE_MAX,
 };
 
@@ -808,6 +809,7 @@ struct mlx5_ib_dev {
 	struct mlx5_sq_bfreg	fp_bfreg;
 	struct mlx5_ib_delay_drop	delay_drop;
 	const struct mlx5_ib_profile	*profile;
+	struct mlx5_eswitch_rep		*rep;
 
 	/* protect the user_td */
 	struct mutex		lb_mutex;
