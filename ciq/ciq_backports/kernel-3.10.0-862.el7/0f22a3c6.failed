@@ -1,0 +1,250 @@
+vxlan: check valid combinations of address scopes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Matthias Schiffer <mschiffer@universe-factory.net>
+commit 0f22a3c68d5fd1696dbc15c45d7ea375c865b7a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/0f22a3c6.failed
+
+* Multicast addresses are never valid as local address
+* Link-local IPv6 unicast addresses may only be used as remote when the
+  local address is link-local as well
+* Don't allow link-local IPv6 local/remote addresses without interface
+
+We also store in the flags field if link-local addresses are used for the
+follow-up patches that actually make VXLAN over link-local IPv6 work.
+
+	Signed-off-by: Matthias Schiffer <mschiffer@universe-factory.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0f22a3c68d5fd1696dbc15c45d7ea375c865b7a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+diff --cc drivers/net/vxlan.c
+index 740e6d79f5f2,d6d57317cbd5..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -2804,76 -2890,147 +2804,152 @@@ static int vxlan_dev_configure(struct n
+  		 */
+  		if ((conf->flags & ~VXLAN_F_ALLOWED_GPE) ||
+  		    !(conf->flags & VXLAN_F_COLLECT_METADATA)) {
+ +			pr_info("unsupported combination of extensions\n");
+  			return -EINVAL;
+  		}
+ -	}
+  
+++<<<<<<< HEAD
+ +		vxlan_raw_setup(dev);
+ +	} else {
+ +		vxlan_ether_setup(dev);
+++=======
++ 	if (!conf->remote_ip.sa.sa_family && !conf->saddr.sa.sa_family) {
++ 		/* Unless IPv6 is explicitly requested, assume IPv4 */
++ 		conf->remote_ip.sa.sa_family = AF_INET;
++ 		conf->saddr.sa.sa_family = AF_INET;
++ 	} else if (!conf->remote_ip.sa.sa_family) {
++ 		conf->remote_ip.sa.sa_family = conf->saddr.sa.sa_family;
++ 	} else if (!conf->saddr.sa.sa_family) {
++ 		conf->saddr.sa.sa_family = conf->remote_ip.sa.sa_family;
++ 	}
++ 
++ 	if (conf->saddr.sa.sa_family != conf->remote_ip.sa.sa_family)
++ 		return -EINVAL;
++ 
++ 	if (vxlan_addr_multicast(&conf->saddr))
++ 		return -EINVAL;
++ 
++ 	if (conf->saddr.sa.sa_family == AF_INET6) {
++ 		if (!IS_ENABLED(CONFIG_IPV6))
++ 			return -EPFNOSUPPORT;
++ 		use_ipv6 = true;
++ 		conf->flags |= VXLAN_F_IPV6;
++ 
++ 		if (!(conf->flags & VXLAN_F_COLLECT_METADATA)) {
++ 			int local_type =
++ 				ipv6_addr_type(&conf->saddr.sin6.sin6_addr);
++ 			int remote_type =
++ 				ipv6_addr_type(&conf->remote_ip.sin6.sin6_addr);
++ 
++ 			if (local_type & IPV6_ADDR_LINKLOCAL) {
++ 				if (!(remote_type & IPV6_ADDR_LINKLOCAL) &&
++ 				    (remote_type != IPV6_ADDR_ANY))
++ 					return -EINVAL;
++ 
++ 				conf->flags |= VXLAN_F_IPV6_LINKLOCAL;
++ 			} else {
++ 				if (remote_type ==
++ 				    (IPV6_ADDR_UNICAST | IPV6_ADDR_LINKLOCAL))
++ 					return -EINVAL;
++ 
++ 				conf->flags &= ~VXLAN_F_IPV6_LINKLOCAL;
++ 			}
++ 		}
++ 	}
++ 
++ 	if (conf->label && !use_ipv6)
++ 		return -EINVAL;
++ 
++ 	if (conf->remote_ifindex) {
++ 		struct net_device *lowerdev;
++ 
++ 		lowerdev = __dev_get_by_index(src_net, conf->remote_ifindex);
++ 		if (!lowerdev)
++ 			return -ENODEV;
++ 
++ #if IS_ENABLED(CONFIG_IPV6)
++ 		if (use_ipv6) {
++ 			struct inet6_dev *idev = __in6_dev_get(lowerdev);
++ 			if (idev && idev->cnf.disable_ipv6)
++ 				return -EPERM;
++ 		}
++ #endif
++ 
++ 		*lower = lowerdev;
++ 	} else {
++ 		if (vxlan_addr_multicast(&conf->remote_ip))
++ 			return -EINVAL;
++ 
++ #if IS_ENABLED(CONFIG_IPV6)
++ 		if (conf->flags & VXLAN_F_IPV6_LINKLOCAL)
++ 			return -EINVAL;
++ #endif
++ 
++ 		*lower = NULL;
+++>>>>>>> 0f22a3c68d5f (vxlan: check valid combinations of address scopes)
+  	}
+  
+ -	if (!conf->dst_port) {
+ -		if (conf->flags & VXLAN_F_GPE)
+ -			conf->dst_port = htons(4790); /* IANA VXLAN-GPE port */
+ -		else
+ -			conf->dst_port = htons(vxlan_port);
+ -	}
+ +	vxlan->net = src_net;
+  
+ -	if (!conf->age_interval)
+ -		conf->age_interval = FDB_AGE_DEFAULT;
+ +	dst->remote_vni = conf->vni;
+  
+ -	list_for_each_entry(tmp, &vn->vxlan_list, next) {
+ -		if (tmp == old)
+ -			continue;
+ +	memcpy(&dst->remote_ip, &conf->remote_ip, sizeof(conf->remote_ip));
+  
+ -		if (tmp->cfg.vni == conf->vni &&
+ -		    tmp->cfg.dst_port == conf->dst_port &&
+ -		    (tmp->cfg.flags & (VXLAN_F_RCV_FLAGS | VXLAN_F_IPV6)) ==
+ -		    (conf->flags & (VXLAN_F_RCV_FLAGS | VXLAN_F_IPV6)))
+ -			return -EEXIST;
+ +	/* Unless IPv6 is explicitly requested, assume IPv4 */
+ +	if (!dst->remote_ip.sa.sa_family)
+ +		dst->remote_ip.sa.sa_family = AF_INET;
+ +
+ +	if (dst->remote_ip.sa.sa_family == AF_INET6 ||
+ +	    vxlan->cfg.saddr.sa.sa_family == AF_INET6) {
+ +		if (!IS_ENABLED(CONFIG_IPV6))
+ +			return -EPFNOSUPPORT;
+ +		use_ipv6 = true;
+ +		vxlan->flags |= VXLAN_F_IPV6;
+  	}
+  
+ -	return 0;
+ -}
+ +	if (conf->label && !use_ipv6) {
+ +		pr_info("label only supported in use with IPv6\n");
+ +		return -EINVAL;
+ +	}
+  
+ -static void vxlan_config_apply(struct net_device *dev,
+ -			       struct vxlan_config *conf,
+ -			       struct net_device *lowerdev, bool changelink)
+ -{
+ -	struct vxlan_dev *vxlan = netdev_priv(dev);
+ -	struct vxlan_rdst *dst = &vxlan->default_dst;
+ -	unsigned short needed_headroom = ETH_HLEN;
+ -	bool use_ipv6 = !!(conf->flags & VXLAN_F_IPV6);
+ -	int max_mtu = ETH_MAX_MTU;
+ +	if (conf->remote_ifindex) {
+ +		lowerdev = __dev_get_by_index(src_net, conf->remote_ifindex);
+ +		dst->remote_ifindex = conf->remote_ifindex;
+  
+ -	if (!changelink) {
+ -		if (conf->flags & VXLAN_F_GPE)
+ -			vxlan_raw_setup(dev);
+ -		else
+ -			vxlan_ether_setup(dev);
+ +		if (!lowerdev) {
+ +			pr_info("ifindex %d does not exist\n", dst->remote_ifindex);
+ +			return -ENODEV;
+ +		}
+  
+ -		if (conf->mtu)
+ -			dev->mtu = conf->mtu;
+ -	}
+ +#if IS_ENABLED(CONFIG_IPV6)
+ +		if (use_ipv6) {
+ +			struct inet6_dev *idev = __in6_dev_get(lowerdev);
+ +			if (idev && idev->cnf.disable_ipv6) {
+ +				pr_info("IPv6 is disabled via sysctl\n");
+ +				return -EPERM;
+ +			}
+ +		}
+ +#endif
+  
+ -	dst->remote_vni = conf->vni;
+ +		if (!conf->mtu)
+ +			dev->mtu = lowerdev->mtu - (use_ipv6 ? VXLAN6_HEADROOM : VXLAN_HEADROOM);
+  
+ -	memcpy(&dst->remote_ip, &conf->remote_ip, sizeof(conf->remote_ip));
+ +		needed_headroom = lowerdev->hard_header_len;
+ +	} else if (vxlan_addr_multicast(&dst->remote_ip)) {
+ +		pr_info("multicast destination requires interface to be specified\n");
+ +		return -EINVAL;
+ +	}
+  
+  	if (lowerdev) {
+ -		dst->remote_ifindex = conf->remote_ifindex;
+ -
+  		dev->gso_max_size = lowerdev->gso_max_size;
+  		dev->gso_max_segs = lowerdev->gso_max_segs;
+ -
+ -		needed_headroom = lowerdev->hard_header_len;
+ -
+ -		max_mtu = lowerdev->mtu - (use_ipv6 ? VXLAN6_HEADROOM :
+ -					   VXLAN_HEADROOM);
+  	}
+  
+ -	if (dev->mtu > max_mtu)
+ -		dev->mtu = max_mtu;
+ +	if (conf->mtu) {
+ +		err = __vxlan_change_mtu(dev, lowerdev, dst, conf->mtu, false);
+ +		if (err)
+ +			return err;
+ +	}
+  
+  	if (use_ipv6 || conf->flags & VXLAN_F_COLLECT_METADATA)
+  		needed_headroom += VXLAN6_HEADROOM;
+* Unmerged path drivers/net/vxlan.c
+diff --git a/include/net/vxlan.h b/include/net/vxlan.h
+index f29e314da893..4dcf6844dd6a 100644
+--- a/include/net/vxlan.h
++++ b/include/net/vxlan.h
+@@ -267,6 +267,7 @@ struct vxlan_dev {
+ #define VXLAN_F_REMCSUM_NOPARTIAL	0x1000
+ #define VXLAN_F_COLLECT_METADATA	0x2000
+ #define VXLAN_F_GPE			0x4000
++#define VXLAN_F_IPV6_LINKLOCAL		0x8000
+ 
+ /* Flags that are used in the receive path. These flags must match in
+  * order for a socket to be shareable
+@@ -281,6 +282,7 @@ struct vxlan_dev {
+ /* Flags that can be set together with VXLAN_F_GPE. */
+ #define VXLAN_F_ALLOWED_GPE		(VXLAN_F_GPE |			\
+ 					 VXLAN_F_IPV6 |			\
++					 VXLAN_F_IPV6_LINKLOCAL |	\
+ 					 VXLAN_F_UDP_ZERO_CSUM_TX |	\
+ 					 VXLAN_F_UDP_ZERO_CSUM6_TX |	\
+ 					 VXLAN_F_UDP_ZERO_CSUM6_RX |	\
