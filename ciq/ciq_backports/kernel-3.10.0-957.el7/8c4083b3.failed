@@ -1,0 +1,247 @@
+net: sched: add block bind/unbind notif. and extended block_get/put
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] sched: add block bind/unbind notif. and extended block_get/put (Ivan Vecera) [1572720]
+Rebuild_FUZZ: 96.12%
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 8c4083b30e56fc71b0e94c26374b32d95d5ea461
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/8c4083b3.failed
+
+Introduce new type of ndo_setup_tc message to propage binding/unbinding
+of a block to driver. Call this ndo whenever qdisc gets/puts a block.
+Alongside with this, there's need to propagate binder type from qdisc
+code down to the notifier. So introduce extended variants of
+block_get/put in order to pass this info.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8c4083b30e56fc71b0e94c26374b32d95d5ea461)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/pkt_cls.h
+#	net/sched/cls_api.c
+diff --cc include/net/pkt_cls.h
+index 43b9922037a8,41bc7d774047..000000000000
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@@ -18,15 -17,27 +18,35 @@@ struct tcf_walker 
+  int register_tcf_proto_ops(struct tcf_proto_ops *ops);
+  int unregister_tcf_proto_ops(struct tcf_proto_ops *ops);
+  
+++<<<<<<< HEAD
+ +bool tcf_queue_work(struct work_struct *work);
+++=======
++ enum tcf_block_binder_type {
++ 	TCF_BLOCK_BINDER_TYPE_UNSPEC,
++ };
++ 
++ struct tcf_block_ext_info {
++ 	enum tcf_block_binder_type binder_type;
++ };
+++>>>>>>> 8c4083b30e56 (net: sched: add block bind/unbind notif. and extended block_get/put)
+  
+  #ifdef CONFIG_NET_CLS
+  struct tcf_chain *tcf_chain_get(struct tcf_block *block, u32 chain_index,
+  				bool create);
+  void tcf_chain_put(struct tcf_chain *chain);
+  int tcf_block_get(struct tcf_block **p_block,
+++<<<<<<< HEAD
+ +		  struct tcf_proto __rcu **p_filter_chain);
+++=======
++ 		  struct tcf_proto __rcu **p_filter_chain, struct Qdisc *q);
++ int tcf_block_get_ext(struct tcf_block **p_block,
++ 		      struct tcf_proto __rcu **p_filter_chain, struct Qdisc *q,
++ 		      struct tcf_block_ext_info *ei);
+++>>>>>>> 8c4083b30e56 (net: sched: add block bind/unbind notif. and extended block_get/put)
+  void tcf_block_put(struct tcf_block *block);
++ void tcf_block_put_ext(struct tcf_block *block,
++ 		       struct tcf_proto __rcu **p_filter_chain, struct Qdisc *q,
++ 		       struct tcf_block_ext_info *ei);
+  
+  static inline struct Qdisc *tcf_block_q(struct tcf_block *block)
+  {
+@@@ -460,8 -460,21 +495,25 @@@ tcf_match_indev(struct sk_buff *skb, in
+  }
+  #endif /* CONFIG_NET_CLS_IND */
+  
+++<<<<<<< HEAD
+++=======
++ int tc_setup_cb_call(struct tcf_exts *exts, enum tc_setup_type type,
++ 		     void *type_data, bool err_stop);
++ 
++ enum tc_block_command {
++ 	TC_BLOCK_BIND,
++ 	TC_BLOCK_UNBIND,
++ };
++ 
++ struct tc_block_offload {
++ 	enum tc_block_command command;
++ 	enum tcf_block_binder_type binder_type;
++ 	struct tcf_block *block;
++ };
++ 
+++>>>>>>> 8c4083b30e56 (net: sched: add block bind/unbind notif. and extended block_get/put)
+  struct tc_cls_common_offload {
+ +	u32 handle;
+  	u32 chain_index;
+  	__be16 protocol;
+  	u32 prio;
+diff --cc net/sched/cls_api.c
+index 0e9c21220742,92dce26d10e3..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -254,8 -240,36 +254,41 @@@ tcf_chain_filter_chain_ptr_set(struct t
+  	chain->p_filter_chain = p_filter_chain;
+  }
+  
+++<<<<<<< HEAD
+ +int tcf_block_get(struct tcf_block **p_block,
+ +		  struct tcf_proto __rcu **p_filter_chain)
+++=======
++ static void tcf_block_offload_cmd(struct tcf_block *block, struct Qdisc *q,
++ 				  struct tcf_block_ext_info *ei,
++ 				  enum tc_block_command command)
++ {
++ 	struct net_device *dev = q->dev_queue->dev;
++ 	struct tc_block_offload bo = {};
++ 
++ 	if (!tc_can_offload(dev))
++ 		return;
++ 	bo.command = command;
++ 	bo.binder_type = ei->binder_type;
++ 	bo.block = block;
++ 	dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_BLOCK, &bo);
++ }
++ 
++ static void tcf_block_offload_bind(struct tcf_block *block, struct Qdisc *q,
++ 				   struct tcf_block_ext_info *ei)
++ {
++ 	tcf_block_offload_cmd(block, q, ei, TC_BLOCK_BIND);
++ }
++ 
++ static void tcf_block_offload_unbind(struct tcf_block *block, struct Qdisc *q,
++ 				     struct tcf_block_ext_info *ei)
++ {
++ 	tcf_block_offload_cmd(block, q, ei, TC_BLOCK_UNBIND);
++ }
++ 
++ int tcf_block_get_ext(struct tcf_block **p_block,
++ 		      struct tcf_proto __rcu **p_filter_chain, struct Qdisc *q,
++ 		      struct tcf_block_ext_info *ei)
+++>>>>>>> 8c4083b30e56 (net: sched: add block bind/unbind notif. and extended block_get/put)
+  {
+  	struct tcf_block *block = kzalloc(sizeof(*block), GFP_KERNEL);
+  	struct tcf_chain *chain;
+@@@ -271,6 -285,9 +304,12 @@@
+  		goto err_chain_create;
+  	}
+  	tcf_chain_filter_chain_ptr_set(chain, p_filter_chain);
+++<<<<<<< HEAD
+++=======
++ 	block->net = qdisc_net(q);
++ 	block->q = q;
++ 	tcf_block_offload_bind(block, q, ei);
+++>>>>>>> 8c4083b30e56 (net: sched: add block bind/unbind notif. and extended block_get/put)
+  	*p_block = block;
+  	return 0;
+  
+@@@ -278,35 -295,63 +317,68 @@@ err_chain_create
+  	kfree(block);
+  	return err;
+  }
++ EXPORT_SYMBOL(tcf_block_get_ext);
++ 
++ int tcf_block_get(struct tcf_block **p_block,
++ 		  struct tcf_proto __rcu **p_filter_chain, struct Qdisc *q)
++ {
++ 	struct tcf_block_ext_info ei = {0, };
++ 
++ 	return tcf_block_get_ext(p_block, p_filter_chain, q, &ei);
++ }
+  EXPORT_SYMBOL(tcf_block_get);
+  
+++<<<<<<< HEAD
+ +/* XXX: Standalone actions are not allowed to jump to any chain, and bound
+ + * actions should be all removed after flushing.
+ + */
+ +void tcf_block_put(struct tcf_block *block)
+++=======
++ void tcf_block_put_ext(struct tcf_block *block,
++ 		       struct tcf_proto __rcu **p_filter_chain, struct Qdisc *q,
++ 		       struct tcf_block_ext_info *ei)
+++>>>>>>> 8c4083b30e56 (net: sched: add block bind/unbind notif. and extended block_get/put)
+  {
+  	struct tcf_chain *chain, *tmp;
+  
+  	if (!block)
+  		return;
+  
+++<<<<<<< HEAD
+ +	/* Hold a refcnt for all chains, so that they don't disappear
+ +	 * while we are iterating.
+++=======
++ 	tcf_block_offload_unbind(block, q, ei);
++ 
++ 	/* XXX: Standalone actions are not allowed to jump to any chain, and
++ 	 * bound actions should be all removed after flushing. However,
++ 	 * filters are destroyed in RCU callbacks, we have to hold the chains
++ 	 * first, otherwise we would always race with RCU callbacks on this list
++ 	 * without proper locking.
+++>>>>>>> 8c4083b30e56 (net: sched: add block bind/unbind notif. and extended block_get/put)
+  	 */
+ -
+ -	/* Wait for existing RCU callbacks to cool down. */
+ -	rcu_barrier();
+ -
+ -	/* Hold a refcnt for all chains, except 0, in case they are gone. */
+  	list_for_each_entry(chain, &block->chain_list, list)
+ -		if (chain->index)
+ -			tcf_chain_hold(chain);
+ +		tcf_chain_hold(chain);
+  
+ -	/* No race on the list, because no chain could be destroyed. */
+  	list_for_each_entry(chain, &block->chain_list, list)
+  		tcf_chain_flush(chain);
+  
+ -	/* Wait for RCU callbacks to release the reference count. */
+ -	rcu_barrier();
+ -
+ -	/* At this point, all the chains should have refcnt == 1. */
+ +	/* At this point, all the chains should have refcnt >= 1. */
+  	list_for_each_entry_safe(chain, tmp, &block->chain_list, list)
+  		tcf_chain_put(chain);
+ -	kfree(block);
+ +
+ +	/* Finally, put chain 0 and allow block to be freed. */
+ +	chain = list_first_entry(&block->chain_list, struct tcf_chain, list);
+ +	tcf_chain_put(chain);
+  }
++ EXPORT_SYMBOL(tcf_block_put_ext);
++ 
++ void tcf_block_put(struct tcf_block *block)
++ {
++ 	struct tcf_block_ext_info ei = {0, };
++ 
++ 	tcf_block_put_ext(block, NULL, block->q, &ei);
++ }
+  EXPORT_SYMBOL(tcf_block_put);
+  
+  /* Main classifier routine: scans classifier chain attached
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index fe1a249a50cb..167a24b55f07 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -814,6 +814,7 @@ enum tc_setup_type {
+ 	TC_SETUP_CLSFLOWER,
+ 	TC_SETUP_CLSMATCHALL,
+ 	TC_SETUP_CLSBPF,
++	TC_SETUP_BLOCK,
+ };
+ 
+ /* Forward declaration of tc_to_netdev structure used by __rh_call_ndo_setup_tc
+* Unmerged path include/net/pkt_cls.h
+* Unmerged path net/sched/cls_api.c
