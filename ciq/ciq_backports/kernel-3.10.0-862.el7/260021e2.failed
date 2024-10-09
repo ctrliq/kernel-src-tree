@@ -1,0 +1,206 @@
+s390/zcrypt: Removed unneeded debug feature directory creation.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [s390] zcrypt: Removed unneeded debug feature directory creation (Hendrik Brueckner) [1380349]
+Rebuild_FUZZ: 95.00%
+commit-author Harald Freudenberger <freude@linux.vnet.ibm.com>
+commit 260021e21b8fcc375984ac7733f93509bf9ad100
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/260021e2.failed
+
+The ap bus code and the zcrypt api had invocations to the
+debug feature debugfs_create_dir() call but never populated
+these directories in any way. Removed this unneeded code.
+
+	Signed-off-by: Harald Freudenberger <freude@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 260021e21b8fcc375984ac7733f93509bf9ad100)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/ap_bus.c
+#	drivers/s390/crypto/zcrypt_api.c
+diff --cc drivers/s390/crypto/ap_bus.c
+index 5386d81f8cd3,5a3a18f7b896..000000000000
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@@ -86,23 -75,26 +86,32 @@@ static int ap_thread_flag = 0
+  module_param_named(poll_thread, ap_thread_flag, int, S_IRUSR|S_IRGRP);
+  MODULE_PARM_DESC(poll_thread, "Turn on/off poll thread, default is 0 (off).");
+  
+ -static struct device *ap_root_device;
+ -
+ -DEFINE_SPINLOCK(ap_list_lock);
+ -LIST_HEAD(ap_card_list);
+ +int ap_hwrng_seed = 1;
+ +EXPORT_SYMBOL(ap_hwrng_seed);
+ +module_param_named(hwrng_seed, ap_hwrng_seed, int, S_IRUSR|S_IRGRP);
+ +MODULE_PARM_DESC(hwrng_seed, "Turn on/off hwrng auto seed, default is 1 (on).");
+  
+ +static struct device *ap_root_device = NULL;
+  static struct ap_config_info *ap_configuration;
+ -static bool initialised;
+ +static DEFINE_SPINLOCK(ap_device_list_lock);
+ +static LIST_HEAD(ap_device_list);
+  
+  /*
+++<<<<<<< HEAD
+ + * Workqueue & timer for bus rescan.
+++=======
++  * AP bus related debug feature things.
++  */
++ debug_info_t *ap_dbf_info;
++ 
++ /*
++  * Workqueue timer for bus rescan.
+++>>>>>>> 260021e21b8f (s390/zcrypt: Removed unneeded debug feature directory creation.)
+   */
+ +static struct workqueue_struct *ap_work_queue;
+  static struct timer_list ap_config_timer;
+  static int ap_config_time = AP_CONFIG_TIME;
+ -static void ap_scan_bus(struct work_struct *);
+ -static DECLARE_WORK(ap_scan_work, ap_scan_bus);
+ +static DECLARE_WORK(ap_config_work, ap_scan_bus);
+  
+  /*
+   * Tasklet & timer for AP request polling and interrupts
+@@@ -2038,6 -1145,21 +2047,24 @@@ static struct reset_call ap_reset_call 
+  	.fn = ap_reset_all,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ int __init ap_debug_init(void)
++ {
++ 	ap_dbf_info = debug_register("ap", 1, 1,
++ 				     DBF_MAX_SPRINTF_ARGS * sizeof(long));
++ 	debug_register_view(ap_dbf_info, &debug_sprintf_view);
++ 	debug_set_level(ap_dbf_info, DBF_ERR);
++ 
++ 	return 0;
++ }
++ 
++ void ap_debug_exit(void)
++ {
++ 	debug_unregister(ap_dbf_info);
++ }
++ 
+++>>>>>>> 260021e21b8f (s390/zcrypt: Removed unneeded debug feature directory creation.)
+  /**
+   * ap_module_init(): The module initialization code.
+   *
+diff --cc drivers/s390/crypto/zcrypt_api.c
+index 0d5282ef176d,144a17941e6f..000000000000
+--- a/drivers/s390/crypto/zcrypt_api.c
++++ b/drivers/s390/crypto/zcrypt_api.c
+@@@ -63,63 -78,10 +63,68 @@@ static atomic_t zcrypt_rescan_count = A
+  atomic_t zcrypt_rescan_req = ATOMIC_INIT(0);
+  EXPORT_SYMBOL(zcrypt_rescan_req);
+  
+ +static int zcrypt_rng_device_add(void);
+ +static void zcrypt_rng_device_remove(void);
+ +
+ +static DEFINE_SPINLOCK(zcrypt_ops_list_lock);
+  static LIST_HEAD(zcrypt_ops_list);
+  
+++<<<<<<< HEAD
+ +static debug_info_t *zcrypt_dbf_common;
+ +static debug_info_t *zcrypt_dbf_devices;
+ +static struct dentry *debugfs_root;
+ +
+ +/*
+ + * Device attributes common for all crypto devices.
+ + */
+ +static ssize_t zcrypt_type_show(struct device *dev,
+ +				struct device_attribute *attr, char *buf)
+ +{
+ +	struct zcrypt_device *zdev = to_ap_dev(dev)->private;
+ +	return snprintf(buf, PAGE_SIZE, "%s\n", zdev->type_string);
+ +}
+ +
+ +static DEVICE_ATTR(type, 0444, zcrypt_type_show, NULL);
+ +
+ +static ssize_t zcrypt_online_show(struct device *dev,
+ +				  struct device_attribute *attr, char *buf)
+ +{
+ +	struct zcrypt_device *zdev = to_ap_dev(dev)->private;
+ +	return snprintf(buf, PAGE_SIZE, "%d\n", zdev->online);
+ +}
+ +
+ +static ssize_t zcrypt_online_store(struct device *dev,
+ +				   struct device_attribute *attr,
+ +				   const char *buf, size_t count)
+ +{
+ +	struct zcrypt_device *zdev = to_ap_dev(dev)->private;
+ +	int online;
+ +
+ +	if (sscanf(buf, "%d\n", &online) != 1 || online < 0 || online > 1)
+ +		return -EINVAL;
+ +	zdev->online = online;
+ +	ZCRYPT_DBF_DEV(DBF_INFO, zdev, "dev%04xo%dman", zdev->ap_dev->qid,
+ +		       zdev->online);
+ +	if (!online)
+ +		ap_flush_queue(zdev->ap_dev);
+ +	return count;
+ +}
+ +
+ +static DEVICE_ATTR(online, 0644, zcrypt_online_show, zcrypt_online_store);
+ +
+ +static struct attribute * zcrypt_device_attrs[] = {
+ +	&dev_attr_type.attr,
+ +	&dev_attr_online.attr,
+ +	NULL,
+ +};
+ +
+ +static struct attribute_group zcrypt_device_attr_group = {
+ +	.attrs = zcrypt_device_attrs,
+ +};
+++=======
++ /* Zcrypt related debug feature stuff. */
++ debug_info_t *zcrypt_dbf_info;
+++>>>>>>> 260021e21b8f (s390/zcrypt: Removed unneeded debug feature directory creation.)
+  
+  /**
+   * Process a rescan of the transport layer.
+@@@ -1461,26 -1426,17 +1466,37 @@@ static void zcrypt_rng_device_remove(vo
+  
+  int __init zcrypt_debug_init(void)
+  {
+++<<<<<<< HEAD
+ +	debugfs_root = debugfs_create_dir("zcrypt", NULL);
+ +
+ +	zcrypt_dbf_common = debug_register("zcrypt_common", 1, 1, 16);
+ +	debug_register_view(zcrypt_dbf_common, &debug_hex_ascii_view);
+ +	debug_set_level(zcrypt_dbf_common, DBF_ERR);
+ +
+ +	zcrypt_dbf_devices = debug_register("zcrypt_devices", 1, 1, 16);
+ +	debug_register_view(zcrypt_dbf_devices, &debug_hex_ascii_view);
+ +	debug_set_level(zcrypt_dbf_devices, DBF_ERR);
+++=======
++ 	zcrypt_dbf_info = debug_register("zcrypt", 1, 1,
++ 					 DBF_MAX_SPRINTF_ARGS * sizeof(long));
++ 	debug_register_view(zcrypt_dbf_info, &debug_sprintf_view);
++ 	debug_set_level(zcrypt_dbf_info, DBF_ERR);
+++>>>>>>> 260021e21b8f (s390/zcrypt: Removed unneeded debug feature directory creation.)
+  
+  	return 0;
+  }
+  
+  void zcrypt_debug_exit(void)
+  {
+++<<<<<<< HEAD
+ +	debugfs_remove(debugfs_root);
+ +	if (zcrypt_dbf_common)
+ +		debug_unregister(zcrypt_dbf_common);
+ +	if (zcrypt_dbf_devices)
+ +		debug_unregister(zcrypt_dbf_devices);
+++=======
++ 	debug_unregister(zcrypt_dbf_info);
+++>>>>>>> 260021e21b8f (s390/zcrypt: Removed unneeded debug feature directory creation.)
+  }
+  
+  /**
+* Unmerged path drivers/s390/crypto/ap_bus.c
+* Unmerged path drivers/s390/crypto/zcrypt_api.c
