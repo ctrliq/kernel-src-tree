@@ -1,0 +1,763 @@
+HID: wacom: use WACOM_*_FIELD macros in wacom_usage_mapping()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [hid] wacom: use WACOM_*_FIELD macros in wacom_usage_mapping() (Aristeu Rozanski) [1346348 1388646 1385026]
+Rebuild_FUZZ: 95.73%
+commit-author Benjamin Tissoires <benjamin.tissoires@redhat.com>
+commit d97a552210320d3bec8ee22b8ccdb1d6d189482a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d97a5522.failed
+
+We introduced nice macros in wacom_wac.c to check whether a field is
+a pen or a touch one.
+
+wacom_usage_mapping() still uses it's own tests, which are not in sync with
+the wacom_wac tests (.application is not checked).
+
+That means that some legitimate fields might be filtered out from the
+usage mapping, and thus will not be used properly while receiving the
+events.
+
+	Signed-off-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+(cherry picked from commit d97a552210320d3bec8ee22b8ccdb1d6d189482a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hid/wacom_sys.c
+#	drivers/hid/wacom_wac.c
+diff --cc drivers/hid/wacom_sys.c
+index 527bf559d1db,f01ab3a0c5f5..000000000000
+--- a/drivers/hid/wacom_sys.c
++++ b/drivers/hid/wacom_sys.c
+@@@ -290,248 -165,143 +290,327 @@@ static void wacom_retrieve_report_data(
+   * interfaces haven't supported pressure or distance, this is enough
+   * information to override invalid values in the wacom_features table.
+   *
+ - * Intuos5 touch interface and 3rd gen Bamboo Touch do not contain useful
+ - * data. We deal with them after returning from this function.
+ + * 3rd gen Bamboo Touch no longer define a Digitizer-Finger Pysical
+ + * Collection. Instead they define a Logical Collection with a single
+ + * Logical Maximum for both X and Y.
+ + *
+ + * Intuos5 touch interface does not contain useful data. We deal with
+ + * this after returning from this function.
+   */
+++<<<<<<< HEAD
+ +static int wacom_parse_hid(struct usb_interface *intf,
+ +			   struct hid_descriptor *hid_desc,
+++=======
++ static void wacom_usage_mapping(struct hid_device *hdev,
++ 		struct hid_field *field, struct hid_usage *usage)
++ {
++ 	struct wacom *wacom = hid_get_drvdata(hdev);
++ 	struct wacom_features *features = &wacom->wacom_wac.features;
++ 	bool finger = WACOM_FINGER_FIELD(field);
++ 	bool pen = WACOM_PEN_FIELD(field);
++ 
++ 	/*
++ 	* Requiring Stylus Usage will ignore boot mouse
++ 	* X/Y values and some cases of invalid Digitizer X/Y
++ 	* values commonly reported.
++ 	*/
++ 	if (!pen && !finger)
++ 		return;
++ 
++ 	/*
++ 	 * Bamboo models do not support HID_DG_CONTACTMAX.
++ 	 * And, Bamboo Pen only descriptor contains touch.
++ 	 */
++ 	if (features->type != BAMBOO_PT) {
++ 		/* ISDv4 touch devices at least supports one touch point */
++ 		if (finger && !features->touch_max)
++ 			features->touch_max = 1;
++ 	}
++ 
++ 	switch (usage->hid) {
++ 	case HID_GD_X:
++ 		features->x_max = field->logical_maximum;
++ 		if (finger) {
++ 			features->device_type = BTN_TOOL_FINGER;
++ 			features->x_phy = field->physical_maximum;
++ 			if (features->type != BAMBOO_PT) {
++ 				features->unit = field->unit;
++ 				features->unitExpo = field->unit_exponent;
++ 			}
++ 		} else {
++ 			features->device_type = BTN_TOOL_PEN;
++ 		}
++ 		break;
++ 	case HID_GD_Y:
++ 		features->y_max = field->logical_maximum;
++ 		if (finger) {
++ 			features->y_phy = field->physical_maximum;
++ 			if (features->type != BAMBOO_PT) {
++ 				features->unit = field->unit;
++ 				features->unitExpo = field->unit_exponent;
++ 			}
++ 		}
++ 		break;
++ 	case HID_DG_TIPPRESSURE:
++ 		if (pen)
++ 			features->pressure_max = field->logical_maximum;
++ 		break;
++ 	}
++ 
++ 	if (features->type == HID_GENERIC)
++ 		wacom_wac_usage_mapping(hdev, field, usage);
++ }
++ 
++ static void wacom_post_parse_hid(struct hid_device *hdev,
++ 				 struct wacom_features *features)
++ {
++ 	struct wacom *wacom = hid_get_drvdata(hdev);
++ 	struct wacom_wac *wacom_wac = &wacom->wacom_wac;
++ 
++ 	if (features->type == HID_GENERIC) {
++ 		/* Any last-minute generic device setup */
++ 		if (features->touch_max > 1) {
++ 			input_mt_init_slots(wacom_wac->input, wacom_wac->features.touch_max,
++ 				    INPUT_MT_DIRECT);
++ 		}
++ 	}
++ }
++ 
++ static void wacom_parse_hid(struct hid_device *hdev,
+++>>>>>>> d97a55221032 (HID: wacom: use WACOM_*_FIELD macros in wacom_usage_mapping())
+  			   struct wacom_features *features)
+  {
+ -	struct hid_report_enum *rep_enum;
+ -	struct hid_report *hreport;
+ -	int i, j;
+ -
+ -	/* check features first */
+ -	rep_enum = &hdev->report_enum[HID_FEATURE_REPORT];
+ -	list_for_each_entry(hreport, &rep_enum->report_list, list) {
+ -		for (i = 0; i < hreport->maxfield; i++) {
+ -			/* Ignore if report count is out of bounds. */
+ -			if (hreport->field[i]->report_count < 1)
+ -				continue;
+ -
+ -			for (j = 0; j < hreport->field[i]->maxusage; j++) {
+ -				wacom_feature_mapping(hdev, hreport->field[i],
+ -						hreport->field[i]->usage + j);
+ +	struct usb_device *dev = interface_to_usbdev(intf);
+ +	char limit = 0;
+ +	/* result has to be defined as int for some devices */
+ +	int result = 0;
+ +	int i = 0, usage = WCM_UNDEFINED, finger = 0, pen = 0;
+ +	unsigned char *report;
+ +
+ +	report = kzalloc(hid_desc->wDescriptorLength, GFP_KERNEL);
+ +	if (!report)
+ +		return -ENOMEM;
+ +
+ +	/* retrive report descriptors */
+ +	do {
+ +		result = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0),
+ +			USB_REQ_GET_DESCRIPTOR,
+ +			USB_RECIP_INTERFACE | USB_DIR_IN,
+ +			HID_DEVICET_REPORT << 8,
+ +			intf->altsetting[0].desc.bInterfaceNumber, /* interface */
+ +			report,
+ +			hid_desc->wDescriptorLength,
+ +			5000); /* 5 secs */
+ +	} while (result < 0 && limit++ < WAC_MSG_RETRIES);
+ +
+ +	/* No need to parse the Descriptor. It isn't an error though */
+ +	if (result < 0)
+ +		goto out;
+ +
+ +	for (i = 0; i < hid_desc->wDescriptorLength; i++) {
+ +
+ +		switch (report[i]) {
+ +		case HID_USAGE_PAGE:
+ +			switch (report[i + 1]) {
+ +			case HID_USAGE_PAGE_DIGITIZER:
+ +				usage = WCM_DIGITIZER;
+ +				i++;
+ +				break;
+ +
+ +			case HID_USAGE_PAGE_DESKTOP:
+ +				usage = WCM_DESKTOP;
+ +				i++;
+ +				break;
+  			}
+ -		}
+ -	}
+ +			break;
+  
+ -	/* now check the input usages */
+ -	rep_enum = &hdev->report_enum[HID_INPUT_REPORT];
+ -	list_for_each_entry(hreport, &rep_enum->report_list, list) {
+ +		case HID_USAGE:
+ +			switch (report[i + 1]) {
+ +			case HID_USAGE_X:
+ +				if (usage == WCM_DESKTOP) {
+ +					if (finger) {
+ +						features->device_type = BTN_TOOL_FINGER;
+ +
+ +						switch (features->type) {
+ +						case TABLETPC2FG:
+ +							features->pktlen = WACOM_PKGLEN_TPC2FG;
+ +							break;
+ +
+ +						case MTSCREEN:
+ +						case WACOM_24HDT:
+ +							features->pktlen = WACOM_PKGLEN_MTOUCH;
+ +							break;
+ +
+ +						case MTTPC:
+ +							features->pktlen = WACOM_PKGLEN_MTTPC;
+ +							break;
+ +
+ +						case BAMBOO_PT:
+ +							features->pktlen = WACOM_PKGLEN_BBTOUCH;
+ +							break;
+ +
+ +						default:
+ +							features->pktlen = WACOM_PKGLEN_GRAPHIRE;
+ +							break;
+ +						}
+ +
+ +						switch (features->type) {
+ +						case BAMBOO_PT:
+ +							features->x_phy =
+ +								get_unaligned_le16(&report[i + 5]);
+ +							features->x_max =
+ +								get_unaligned_le16(&report[i + 8]);
+ +							i += 15;
+ +							break;
+ +
+ +						case WACOM_24HDT:
+ +							features->x_max =
+ +								get_unaligned_le16(&report[i + 3]);
+ +							features->x_phy =
+ +								get_unaligned_le16(&report[i + 8]);
+ +							features->unit = report[i - 1];
+ +							features->unitExpo = report[i - 3];
+ +							i += 12;
+ +							break;
+ +
+ +						case WACOM_27QHDT:
+ +							if (!features->x_max) {
+ +								features->x_max =
+ +									get_unaligned_le16(&report[i - 4]);
+ +								features->x_phy =
+ +									get_unaligned_le16(&report[i - 7]);
+ +								features->unit = report[i - 13];
+ +								features->unitExpo = report[i - 11];
+ +							}
+ +							i += 9;
+ +							break;
+ +
+ +						default:
+ +							features->x_max =
+ +								get_unaligned_le16(&report[i + 3]);
+ +							features->x_phy =
+ +								get_unaligned_le16(&report[i + 6]);
+ +							features->unit = report[i + 9];
+ +							features->unitExpo = report[i + 11];
+ +							i += 12;
+ +							break;
+ +						}
+ +					} else if (pen) {
+ +						/* penabled only accepts exact bytes of data */
+ +						if (features->type >= TABLETPC)
+ +							features->pktlen = WACOM_PKGLEN_GRAPHIRE;
+ +						features->device_type = BTN_TOOL_PEN;
+ +						features->x_max =
+ +							get_unaligned_le16(&report[i + 3]);
+ +						i += 4;
+ +					}
+ +				}
+ +				break;
+  
+ -		if (!hreport->maxfield)
+ -			continue;
+ +			case HID_USAGE_Y:
+ +				if (usage == WCM_DESKTOP) {
+ +					if (finger) {
+ +						switch (features->type) {
+ +						case TABLETPC2FG:
+ +						case MTSCREEN:
+ +						case MTTPC:
+ +							features->y_max =
+ +								get_unaligned_le16(&report[i + 3]);
+ +							features->y_phy =
+ +								get_unaligned_le16(&report[i + 6]);
+ +							i += 7;
+ +							break;
+ +
+ +						case WACOM_24HDT:
+ +							features->y_max =
+ +								get_unaligned_le16(&report[i + 3]);
+ +							features->y_phy =
+ +								get_unaligned_le16(&report[i - 2]);
+ +							i += 7;
+ +							break;
+ +
+ +						case BAMBOO_PT:
+ +							features->y_phy =
+ +								get_unaligned_le16(&report[i + 3]);
+ +							features->y_max =
+ +								get_unaligned_le16(&report[i + 6]);
+ +							i += 12;
+ +							break;
+ +
+ +						case WACOM_27QHDT:
+ +							if (!features->y_max) {
+ +								features->y_max =
+ +									get_unaligned_le16(&report[i - 2]);
+ +								features->y_phy =
+ +									get_unaligned_le16(&report[i - 5]);
+ +							}
+ +							i += 2;
+ +							break;
+ +
+ +						default:
+ +							features->y_max =
+ +								features->x_max;
+ +							features->y_phy =
+ +								get_unaligned_le16(&report[i + 3]);
+ +							i += 4;
+ +							break;
+ +						}
+ +					} else if (pen) {
+ +						features->y_max =
+ +							get_unaligned_le16(&report[i + 3]);
+ +						i += 4;
+ +					}
+ +				}
+ +				break;
+  
+ -		for (i = 0; i < hreport->maxfield; i++)
+ -			for (j = 0; j < hreport->field[i]->maxusage; j++)
+ -				wacom_usage_mapping(hdev, hreport->field[i],
+ -						hreport->field[i]->usage + j);
+ -	}
+ +			case HID_USAGE_FINGER:
+ +				finger = 1;
+ +				i++;
+ +				break;
+  
+ -	wacom_post_parse_hid(hdev, features);
+ -}
+ +			/*
+ +			 * Requiring Stylus Usage will ignore boot mouse
+ +			 * X/Y values and some cases of invalid Digitizer X/Y
+ +			 * values commonly reported.
+ +			 */
+ +			case HID_USAGE_STYLUS:
+ +				pen = 1;
+ +				i++;
+ +				break;
+  
+ -static int wacom_hid_set_device_mode(struct hid_device *hdev)
+ -{
+ -	struct wacom *wacom = hid_get_drvdata(hdev);
+ -	struct hid_data *hid_data = &wacom->wacom_wac.hid_data;
+ -	struct hid_report *r;
+ -	struct hid_report_enum *re;
+ +			case HID_USAGE_CONTACTMAX:
+ +				/* leave touch_max as is if predefined */
+ +				if (!features->touch_max)
+ +					wacom_retrieve_report_data(intf, features);
+ +				i++;
+ +				break;
+ +			}
+ +			break;
+  
+ -	if (hid_data->inputmode < 0)
+ -		return 0;
+ +		case HID_COLLECTION_END:
+ +			/* reset UsagePage and Finger */
+ +			finger = usage = 0;
+ +			break;
+  
+ -	re = &(hdev->report_enum[HID_FEATURE_REPORT]);
+ -	r = re->report_id_hash[hid_data->inputmode];
+ -	if (r) {
+ -		r->field[0]->value[hid_data->inputmode_index] = 2;
+ -		hid_hw_request(hdev, r, HID_REQ_SET_REPORT);
+ +		case HID_COLLECTION:
+ +			i++;
+ +			switch (report[i]) {
+ +			case HID_COLLECTION_LOGICAL:
+ +				i += wacom_parse_logical_collection(&report[i],
+ +								    features);
+ +				break;
+ +			}
+ +			break;
+ +		}
+  	}
+ -	return 0;
+ +
+ + out:
+ +	result = 0;
+ +	kfree(report);
+ +	return result;
+  }
+  
+ -static int wacom_set_device_mode(struct hid_device *hdev, int report_id,
+ -		int length, int mode)
+ +static int wacom_set_device_mode(struct usb_interface *intf, int report_id, int length, int mode)
+  {
+  	unsigned char *rep_data;
+  	int error = -ENOMEM, limit = 0;
+diff --cc drivers/hid/wacom_wac.c
+index 334849232c4c,596a6fb5b8b5..000000000000
+--- a/drivers/hid/wacom_wac.c
++++ b/drivers/hid/wacom_wac.c
+@@@ -1102,6 -1251,318 +1101,321 @@@ static int wacom_tpc_irq(struct wacom_w
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void wacom_map_usage(struct wacom *wacom, struct hid_usage *usage,
++ 		struct hid_field *field, __u8 type, __u16 code, int fuzz)
++ {
++ 	struct wacom_wac *wacom_wac = &wacom->wacom_wac;
++ 	struct input_dev *input = wacom_wac->input;
++ 	int fmin = field->logical_minimum;
++ 	int fmax = field->logical_maximum;
++ 
++ 	usage->type = type;
++ 	usage->code = code;
++ 
++ 	set_bit(type, input->evbit);
++ 
++ 	switch (type) {
++ 	case EV_ABS:
++ 		input_set_abs_params(input, code, fmin, fmax, fuzz, 0);
++ 		input_abs_set_res(input, code,
++ 				  hidinput_calc_abs_res(field, code));
++ 		break;
++ 	case EV_KEY:
++ 		input_set_capability(input, EV_KEY, code);
++ 		break;
++ 	case EV_MSC:
++ 		input_set_capability(input, EV_MSC, code);
++ 		break;
++ 	}
++ }
++ 
++ static void wacom_wac_pen_usage_mapping(struct hid_device *hdev,
++ 		struct hid_field *field, struct hid_usage *usage)
++ {
++ 	struct wacom *wacom = hid_get_drvdata(hdev);
++ 
++ 	switch (usage->hid) {
++ 	case HID_GD_X:
++ 		wacom_map_usage(wacom, usage, field, EV_ABS, ABS_X, 4);
++ 		break;
++ 	case HID_GD_Y:
++ 		wacom_map_usage(wacom, usage, field, EV_ABS, ABS_Y, 4);
++ 		break;
++ 	case HID_DG_TIPPRESSURE:
++ 		wacom_map_usage(wacom, usage, field, EV_ABS, ABS_PRESSURE, 0);
++ 		break;
++ 	case HID_DG_INRANGE:
++ 		wacom_map_usage(wacom, usage, field, EV_KEY, BTN_TOOL_PEN, 0);
++ 		break;
++ 	case HID_DG_INVERT:
++ 		wacom_map_usage(wacom, usage, field, EV_KEY,
++ 				BTN_TOOL_RUBBER, 0);
++ 		break;
++ 	case HID_DG_ERASER:
++ 	case HID_DG_TIPSWITCH:
++ 		wacom_map_usage(wacom, usage, field, EV_KEY, BTN_TOUCH, 0);
++ 		break;
++ 	case HID_DG_BARRELSWITCH:
++ 		wacom_map_usage(wacom, usage, field, EV_KEY, BTN_STYLUS, 0);
++ 		break;
++ 	case HID_DG_BARRELSWITCH2:
++ 		wacom_map_usage(wacom, usage, field, EV_KEY, BTN_STYLUS2, 0);
++ 		break;
++ 	case HID_DG_TOOLSERIALNUMBER:
++ 		wacom_map_usage(wacom, usage, field, EV_MSC, MSC_SERIAL, 0);
++ 		break;
++ 	}
++ }
++ 
++ static int wacom_wac_pen_event(struct hid_device *hdev, struct hid_field *field,
++ 		struct hid_usage *usage, __s32 value)
++ {
++ 	struct wacom *wacom = hid_get_drvdata(hdev);
++ 	struct wacom_wac *wacom_wac = &wacom->wacom_wac;
++ 	struct input_dev *input = wacom_wac->input;
++ 
++ 	/* checking which Tool / tip switch to send */
++ 	switch (usage->hid) {
++ 	case HID_DG_INRANGE:
++ 		wacom_wac->hid_data.inrange_state = value;
++ 		return 0;
++ 	case HID_DG_INVERT:
++ 		wacom_wac->hid_data.invert_state = value;
++ 		return 0;
++ 	case HID_DG_ERASER:
++ 	case HID_DG_TIPSWITCH:
++ 		wacom_wac->hid_data.tipswitch |= value;
++ 		return 0;
++ 	}
++ 
++ 	/* send pen events only when touch is up or forced out */
++ 	if (!usage->type || wacom_wac->shared->touch_down)
++ 		return 0;
++ 
++ 	input_event(input, usage->type, usage->code, value);
++ 
++ 	return 0;
++ }
++ 
++ static void wacom_wac_pen_report(struct hid_device *hdev,
++ 		struct hid_report *report)
++ {
++ 	struct wacom *wacom = hid_get_drvdata(hdev);
++ 	struct wacom_wac *wacom_wac = &wacom->wacom_wac;
++ 	struct input_dev *input = wacom_wac->input;
++ 	bool prox = wacom_wac->hid_data.inrange_state;
++ 
++ 	if (!wacom_wac->shared->stylus_in_proximity) /* first in prox */
++ 		/* Going into proximity select tool */
++ 		wacom_wac->tool[0] = wacom_wac->hid_data.invert_state ?
++ 						BTN_TOOL_RUBBER : BTN_TOOL_PEN;
++ 
++ 	/* keep pen state for touch events */
++ 	wacom_wac->shared->stylus_in_proximity = prox;
++ 
++ 	/* send pen events only when touch is up or forced out */
++ 	if (!wacom_wac->shared->touch_down) {
++ 		input_report_key(input, BTN_TOUCH,
++ 				wacom_wac->hid_data.tipswitch);
++ 		input_report_key(input, wacom_wac->tool[0], prox);
++ 
++ 		wacom_wac->hid_data.tipswitch = false;
++ 
++ 		input_sync(input);
++ 	}
++ }
++ 
++ static void wacom_wac_finger_usage_mapping(struct hid_device *hdev,
++ 		struct hid_field *field, struct hid_usage *usage)
++ {
++ 	struct wacom *wacom = hid_get_drvdata(hdev);
++ 	struct wacom_wac *wacom_wac = &wacom->wacom_wac;
++ 	struct wacom_features *features = &wacom_wac->features;
++ 	unsigned touch_max = wacom_wac->features.touch_max;
++ 
++ 	switch (usage->hid) {
++ 	case HID_GD_X:
++ 		features->last_slot_field = usage->hid;
++ 		if (touch_max == 1)
++ 			wacom_map_usage(wacom, usage, field, EV_ABS, ABS_X, 4);
++ 		else
++ 			wacom_map_usage(wacom, usage, field, EV_ABS,
++ 					ABS_MT_POSITION_X, 4);
++ 		break;
++ 	case HID_GD_Y:
++ 		features->last_slot_field = usage->hid;
++ 		if (touch_max == 1)
++ 			wacom_map_usage(wacom, usage, field, EV_ABS, ABS_Y, 4);
++ 		else
++ 			wacom_map_usage(wacom, usage, field, EV_ABS,
++ 					ABS_MT_POSITION_Y, 4);
++ 		break;
++ 	case HID_DG_CONTACTID:
++ 		features->last_slot_field = usage->hid;
++ 		break;
++ 	case HID_DG_INRANGE:
++ 		features->last_slot_field = usage->hid;
++ 		break;
++ 	case HID_DG_INVERT:
++ 		features->last_slot_field = usage->hid;
++ 		break;
++ 	case HID_DG_TIPSWITCH:
++ 		features->last_slot_field = usage->hid;
++ 		wacom_map_usage(wacom, usage, field, EV_KEY, BTN_TOUCH, 0);
++ 		break;
++ 	}
++ }
++ 
++ static void wacom_wac_finger_slot(struct wacom_wac *wacom_wac,
++ 		struct input_dev *input)
++ {
++ 	struct hid_data *hid_data = &wacom_wac->hid_data;
++ 	bool mt = wacom_wac->features.touch_max > 1;
++ 	bool prox = hid_data->tipswitch &&
++ 		    !wacom_wac->shared->stylus_in_proximity;
++ 
++ 	if (mt) {
++ 		int slot;
++ 
++ 		slot = input_mt_get_slot_by_key(input, hid_data->id);
++ 		input_mt_slot(input, slot);
++ 		input_mt_report_slot_state(input, MT_TOOL_FINGER, prox);
++ 	}
++ 	else {
++ 		input_report_key(input, BTN_TOUCH, prox);
++ 	}
++ 
++ 	if (prox) {
++ 		input_report_abs(input, mt ? ABS_MT_POSITION_X : ABS_X,
++ 				 hid_data->x);
++ 		input_report_abs(input, mt ? ABS_MT_POSITION_Y : ABS_Y,
++ 				 hid_data->y);
++ 	}
++ }
++ 
++ static int wacom_wac_finger_event(struct hid_device *hdev,
++ 		struct hid_field *field, struct hid_usage *usage, __s32 value)
++ {
++ 	struct wacom *wacom = hid_get_drvdata(hdev);
++ 	struct wacom_wac *wacom_wac = &wacom->wacom_wac;
++ 
++ 	switch (usage->hid) {
++ 	case HID_GD_X:
++ 		wacom_wac->hid_data.x = value;
++ 		break;
++ 	case HID_GD_Y:
++ 		wacom_wac->hid_data.y = value;
++ 		break;
++ 	case HID_DG_CONTACTID:
++ 		wacom_wac->hid_data.id = value;
++ 		break;
++ 	case HID_DG_TIPSWITCH:
++ 		wacom_wac->hid_data.tipswitch = value;
++ 		break;
++ 	}
++ 
++ 
++ 	if (usage->usage_index + 1 == field->report_count) {
++ 		if (usage->hid == wacom_wac->features.last_slot_field)
++ 			wacom_wac_finger_slot(wacom_wac, wacom_wac->input);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int wacom_wac_finger_count_touches(struct hid_device *hdev)
++ {
++ 	struct wacom *wacom = hid_get_drvdata(hdev);
++ 	struct wacom_wac *wacom_wac = &wacom->wacom_wac;
++ 	struct input_dev *input = wacom_wac->input;
++ 	unsigned touch_max = wacom_wac->features.touch_max;
++ 	int count = 0;
++ 	int i;
++ 
++ 	if (touch_max == 1)
++ 		return wacom_wac->hid_data.tipswitch &&
++ 		       !wacom_wac->shared->stylus_in_proximity;
++ 
++ 	for (i = 0; i < input->mt->num_slots; i++) {
++ 		struct input_mt_slot *ps = &input->mt->slots[i];
++ 		int id = input_mt_get_value(ps, ABS_MT_TRACKING_ID);
++ 		if (id >= 0)
++ 			count++;
++ 	}
++ 
++ 	return count;
++ }
++ 
++ static void wacom_wac_finger_report(struct hid_device *hdev,
++ 		struct hid_report *report)
++ {
++ 	struct wacom *wacom = hid_get_drvdata(hdev);
++ 	struct wacom_wac *wacom_wac = &wacom->wacom_wac;
++ 	struct input_dev *input = wacom_wac->input;
++ 	unsigned touch_max = wacom_wac->features.touch_max;
++ 
++ 	if (touch_max > 1)
++ 		input_mt_sync_frame(input);
++ 
++ 	input_sync(input);
++ 
++ 	/* keep touch state for pen event */
++ 	wacom_wac->shared->touch_down = wacom_wac_finger_count_touches(hdev);
++ }
++ 
++ void wacom_wac_usage_mapping(struct hid_device *hdev,
++ 		struct hid_field *field, struct hid_usage *usage)
++ {
++ 	struct wacom *wacom = hid_get_drvdata(hdev);
++ 	struct wacom_wac *wacom_wac = &wacom->wacom_wac;
++ 	struct input_dev *input = wacom_wac->input;
++ 
++ 	/* currently, only direct devices have proper hid report descriptors */
++ 	__set_bit(INPUT_PROP_DIRECT, input->propbit);
++ 
++ 	if (WACOM_PEN_FIELD(field))
++ 		return wacom_wac_pen_usage_mapping(hdev, field, usage);
++ 
++ 	if (WACOM_FINGER_FIELD(field))
++ 		return wacom_wac_finger_usage_mapping(hdev, field, usage);
++ }
++ 
++ int wacom_wac_event(struct hid_device *hdev, struct hid_field *field,
++ 		struct hid_usage *usage, __s32 value)
++ {
++ 	struct wacom *wacom = hid_get_drvdata(hdev);
++ 
++ 	if (wacom->wacom_wac.features.type != HID_GENERIC)
++ 		return 0;
++ 
++ 	if (WACOM_PEN_FIELD(field))
++ 		return wacom_wac_pen_event(hdev, field, usage, value);
++ 
++ 	if (WACOM_FINGER_FIELD(field))
++ 		return wacom_wac_finger_event(hdev, field, usage, value);
++ 
++ 	return 0;
++ }
++ 
++ void wacom_wac_report(struct hid_device *hdev, struct hid_report *report)
++ {
++ 	struct wacom *wacom = hid_get_drvdata(hdev);
++ 	struct wacom_wac *wacom_wac = &wacom->wacom_wac;
++ 	struct hid_field *field = report->field[0];
++ 
++ 	if (wacom_wac->features.type != HID_GENERIC)
++ 		return;
++ 
++ 	if (WACOM_PEN_FIELD(field))
++ 		return wacom_wac_pen_report(hdev, report);
++ 
++ 	if (WACOM_FINGER_FIELD(field))
++ 		return wacom_wac_finger_report(hdev, report);
++ }
++ 
+++>>>>>>> d97a55221032 (HID: wacom: use WACOM_*_FIELD macros in wacom_usage_mapping())
+  static int wacom_bpt_touch(struct wacom_wac *wacom)
+  {
+  	struct wacom_features *features = &wacom->features;
+* Unmerged path drivers/hid/wacom_sys.c
+* Unmerged path drivers/hid/wacom_wac.c
+diff --git a/drivers/hid/wacom_wac.h b/drivers/hid/wacom_wac.h
+index d220d069f329..c70d8feed17d 100644
+--- a/drivers/hid/wacom_wac.h
++++ b/drivers/hid/wacom_wac.h
+@@ -10,6 +10,7 @@
+ #define WACOM_WAC_H
+ 
+ #include <linux/types.h>
++#include <linux/hid.h>
+ 
+ /* maximum packet length for USB devices */
+ #define WACOM_PKGLEN_MAX	192
+@@ -64,6 +65,13 @@
+ #define WACOM_QUIRK_NO_INPUT		0x0004
+ #define WACOM_QUIRK_MONITOR		0x0008
+ 
++#define WACOM_PEN_FIELD(f)	(((f)->logical == HID_DG_STYLUS) || \
++				 ((f)->physical == HID_DG_STYLUS) || \
++				 ((f)->application == HID_DG_PEN))
++#define WACOM_FINGER_FIELD(f)	(((f)->logical == HID_DG_FINGER) || \
++				 ((f)->physical == HID_DG_FINGER) || \
++				 ((f)->application == HID_DG_TOUCHSCREEN))
++
+ enum {
+ 	PENPARTNER = 0,
+ 	GRAPHIRE,
