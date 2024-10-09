@@ -4601,15 +4601,8 @@ xlog_recover_process_iunlinks(
 	xfs_agino_t	agino;
 	int		bucket;
 	int		error;
-	uint		mp_dmevmask;
 
 	mp = log->l_mp;
-
-	/*
-	 * Prevent any DMAPI event from being sent while in this function.
-	 */
-	mp_dmevmask = mp->m_dmevmask;
-	mp->m_dmevmask = 0;
 
 	for (agno = 0; agno < mp->m_sb.sb_agcount; agno++) {
 		/*
@@ -4646,8 +4639,6 @@ xlog_recover_process_iunlinks(
 		}
 		xfs_buf_rele(agibp);
 	}
-
-	mp->m_dmevmask = mp_dmevmask;
 }
 
 STATIC int
