@@ -1,0 +1,120 @@
+libnvdimm, namespace: fix btt claim class crash
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 33a56086712561b8b9cdc881e0317f4c36861f72
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/33a56086.failed
+
+Maurice reports:
+
+    BUG: unable to handle kernel NULL pointer dereference at 0000000000000028
+    IP: holder_class_store+0x253/0x2b0 [libnvdimm]
+
+...while trying to reconfigure an NVDIMM-N namespace into 'sector' /
+'btt' mode. The crash points to this line:
+
+    (gdb) li *(holder_class_store+0x253)
+    0x7773 is in holder_class_store (drivers/nvdimm/namespace_devs.c:1420).
+    1415            for (i = 0; i < nd_region->ndr_mappings; i++) {
+    1416                    struct nd_mapping *nd_mapping = &nd_region->mapping[i];
+    1417                    struct nvdimm_drvdata *ndd = to_ndd(nd_mapping);
+    1418                    struct nd_namespace_index *nsindex;
+    1419
+    1420                    nsindex = to_namespace_index(ndd, ndd->ns_current);
+
+...where we are failing because ndd is NULL due to NVDIMM-N dimms not
+supporting labels.
+
+Long story short, default to the BTTv1 format in the label-less /
+NVDIMM-N case.
+
+Fixes: 14e494542636 ("libnvdimm, btt: BTT updates for UEFI 2.7 format")
+	Cc: <stable@vger.kernel.org>
+	Cc: Vishal Verma <vishal.l.verma@intel.com>
+	Reported-by: Maurice A. Saldivar <maurice.a.saldivar@hpe.com>
+	Tested-by: Maurice A. Saldivar <maurice.a.saldivar@hpe.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 33a56086712561b8b9cdc881e0317f4c36861f72)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvdimm/namespace_devs.c
+diff --cc drivers/nvdimm/namespace_devs.c
+index 46394057e1a9,3e4d1e7998da..000000000000
+--- a/drivers/nvdimm/namespace_devs.c
++++ b/drivers/nvdimm/namespace_devs.c
+@@@ -1410,6 -1407,67 +1410,70 @@@ static ssize_t dpa_extents_show(struct 
+  }
+  static DEVICE_ATTR_RO(dpa_extents);
+  
+++<<<<<<< HEAD
+++=======
++ static int btt_claim_class(struct device *dev)
++ {
++ 	struct nd_region *nd_region = to_nd_region(dev->parent);
++ 	int i, loop_bitmask = 0;
++ 
++ 	for (i = 0; i < nd_region->ndr_mappings; i++) {
++ 		struct nd_mapping *nd_mapping = &nd_region->mapping[i];
++ 		struct nvdimm_drvdata *ndd = to_ndd(nd_mapping);
++ 		struct nd_namespace_index *nsindex;
++ 
++ 		/*
++ 		 * If any of the DIMMs do not support labels the only
++ 		 * possible BTT format is v1.
++ 		 */
++ 		if (!ndd) {
++ 			loop_bitmask = 0;
++ 			break;
++ 		}
++ 
++ 		nsindex = to_namespace_index(ndd, ndd->ns_current);
++ 		if (nsindex == NULL)
++ 			loop_bitmask |= 1;
++ 		else {
++ 			/* check whether existing labels are v1.1 or v1.2 */
++ 			if (__le16_to_cpu(nsindex->major) == 1
++ 					&& __le16_to_cpu(nsindex->minor) == 1)
++ 				loop_bitmask |= 2;
++ 			else
++ 				loop_bitmask |= 4;
++ 		}
++ 	}
++ 	/*
++ 	 * If nsindex is null loop_bitmask's bit 0 will be set, and if an index
++ 	 * block is found, a v1.1 label for any mapping will set bit 1, and a
++ 	 * v1.2 label will set bit 2.
++ 	 *
++ 	 * At the end of the loop, at most one of the three bits must be set.
++ 	 * If multiple bits were set, it means the different mappings disagree
++ 	 * about their labels, and this must be cleaned up first.
++ 	 *
++ 	 * If all the label index blocks are found to agree, nsindex of NULL
++ 	 * implies labels haven't been initialized yet, and when they will,
++ 	 * they will be of the 1.2 format, so we can assume BTT2.0
++ 	 *
++ 	 * If 1.1 labels are found, we enforce BTT1.1, and if 1.2 labels are
++ 	 * found, we enforce BTT2.0
++ 	 *
++ 	 * If the loop was never entered, default to BTT1.1 (legacy namespaces)
++ 	 */
++ 	switch (loop_bitmask) {
++ 	case 0:
++ 	case 2:
++ 		return NVDIMM_CCLASS_BTT;
++ 	case 1:
++ 	case 4:
++ 		return NVDIMM_CCLASS_BTT2;
++ 	default:
++ 		return -ENXIO;
++ 	}
++ }
++ 
+++>>>>>>> 33a560867125 (libnvdimm, namespace: fix btt claim class crash)
+  static ssize_t holder_show(struct device *dev,
+  		struct device_attribute *attr, char *buf)
+  {
+* Unmerged path drivers/nvdimm/namespace_devs.c
