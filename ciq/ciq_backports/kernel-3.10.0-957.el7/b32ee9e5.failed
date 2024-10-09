@@ -1,0 +1,156 @@
+perf tools: Lock to protect namespaces and comm list
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Kan Liang <kan.liang@intel.com>
+commit b32ee9e522f7ba26339856a047cfe9efc0be0ff3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b32ee9e5.failed
+
+Add two locks to protect namespaces_list and comm_list.
+
+The lock is only needed for multithreaded code, so using mutex wrappers
+provided by perf tool.
+
+Not all the comm_list/namespaces_list accessing are protected, e.g.
+thread__exec_comm. Because the multithread code for perf top event
+synthesizing does not touch them. They don't need a lock.
+
+	Signed-off-by: Kan Liang <kan.liang@intel.com>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Alexei Starovoitov <ast@kernel.org>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: He Kuang <hekuang@huawei.com>
+	Cc: Lukasz Odzioba <lukasz.odzioba@intel.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Wang Nan <wangnan0@huawei.com>
+Link: http://lkml.kernel.org/r/1506696477-146932-2-git-send-email-kan.liang@intel.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit b32ee9e522f7ba26339856a047cfe9efc0be0ff3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/thread.c
+#	tools/perf/util/thread.h
+diff --cc tools/perf/util/thread.c
+index 718e2ab43079,bf73117b4822..000000000000
+--- a/tools/perf/util/thread.c
++++ b/tools/perf/util/thread.c
+@@@ -42,7 -43,10 +42,9 @@@ struct thread *thread__new(pid_t pid, p
+  		thread->tid = tid;
+  		thread->ppid = -1;
+  		thread->cpu = -1;
+ -		INIT_LIST_HEAD(&thread->namespaces_list);
+  		INIT_LIST_HEAD(&thread->comm_list);
++ 		init_rwsem(&thread->namespaces_lock);
++ 		init_rwsem(&thread->comm_lock);
+  
+  		comm_str = malloc(32);
+  		if (!comm_str)
+@@@ -78,12 -85,26 +80,29 @@@ void thread__delete(struct thread *thre
+  		map_groups__put(thread->mg);
+  		thread->mg = NULL;
+  	}
+++<<<<<<< HEAD
+ +	list_for_each_entry_safe(comm, tmp, &thread->comm_list, list) {
+++=======
++ 	down_write(&thread->namespaces_lock);
++ 	list_for_each_entry_safe(namespaces, tmp_namespaces,
++ 				 &thread->namespaces_list, list) {
++ 		list_del(&namespaces->list);
++ 		namespaces__free(namespaces);
++ 	}
++ 	up_write(&thread->namespaces_lock);
++ 
++ 	down_write(&thread->comm_lock);
++ 	list_for_each_entry_safe(comm, tmp_comm, &thread->comm_list, list) {
+++>>>>>>> b32ee9e522f7 (perf tools: Lock to protect namespaces and comm list)
+  		list_del(&comm->list);
+  		comm__free(comm);
+  	}
++ 	up_write(&thread->comm_lock);
++ 
+  	unwind__finish_access(thread);
+ -	nsinfo__zput(thread->nsinfo);
+  
++ 	exit_rwsem(&thread->namespaces_lock);
++ 	exit_rwsem(&thread->comm_lock);
+  	free(thread);
+  }
+  
+@@@ -106,6 -127,49 +125,52 @@@ void thread__put(struct thread *thread
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct namespaces *thread__namespaces(const struct thread *thread)
++ {
++ 	if (list_empty(&thread->namespaces_list))
++ 		return NULL;
++ 
++ 	return list_first_entry(&thread->namespaces_list, struct namespaces, list);
++ }
++ 
++ static int __thread__set_namespaces(struct thread *thread, u64 timestamp,
++ 				    struct namespaces_event *event)
++ {
++ 	struct namespaces *new, *curr = thread__namespaces(thread);
++ 
++ 	new = namespaces__new(event);
++ 	if (!new)
++ 		return -ENOMEM;
++ 
++ 	list_add(&new->list, &thread->namespaces_list);
++ 
++ 	if (timestamp && curr) {
++ 		/*
++ 		 * setns syscall must have changed few or all the namespaces
++ 		 * of this thread. Update end time for the namespaces
++ 		 * previously used.
++ 		 */
++ 		curr = list_next_entry(new, list);
++ 		curr->end_time = timestamp;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int thread__set_namespaces(struct thread *thread, u64 timestamp,
++ 			   struct namespaces_event *event)
++ {
++ 	int ret;
++ 
++ 	down_write(&thread->namespaces_lock);
++ 	ret = __thread__set_namespaces(thread, timestamp, event);
++ 	up_write(&thread->namespaces_lock);
++ 	return ret;
++ }
++ 
+++>>>>>>> b32ee9e522f7 (perf tools: Lock to protect namespaces and comm list)
+  struct comm *thread__comm(const struct thread *thread)
+  {
+  	if (list_empty(&thread->comm_list))
+diff --cc tools/perf/util/thread.h
+index e57188546465,10555d6a0b86..000000000000
+--- a/tools/perf/util/thread.h
++++ b/tools/perf/util/thread.h
+@@@ -28,7 -29,10 +29,13 @@@ struct thread 
+  	bool			comm_set;
+  	int			comm_len;
+  	bool			dead; /* if set thread has exited */
+++<<<<<<< HEAD
+++=======
++ 	struct list_head	namespaces_list;
++ 	struct rw_semaphore	namespaces_lock;
+++>>>>>>> b32ee9e522f7 (perf tools: Lock to protect namespaces and comm list)
+  	struct list_head	comm_list;
++ 	struct rw_semaphore	comm_lock;
+  	u64			db_id;
+  
+  	void			*priv;
+* Unmerged path tools/perf/util/thread.c
+* Unmerged path tools/perf/util/thread.h
