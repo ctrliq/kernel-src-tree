@@ -1,0 +1,295 @@
+ibmvnic: Set state UP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Mick Tarsel <mjtarsel@linux.vnet.ibm.com>
+commit e876a8a7e9dd89dc88c12ca2e81beb478dbe9897
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e876a8a7.failed
+
+State is initially reported as UNKNOWN. Before register call
+netif_carrier_off(). Once the device is opened, call netif_carrier_on() in
+order to set the state to UP.
+
+	Signed-off-by: Mick Tarsel <mjtarsel@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e876a8a7e9dd89dc88c12ca2e81beb478dbe9897)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index 372983d733ad,4bc14a901571..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -369,36 -347,135 +369,68 @@@ static void replenish_pools(struct ibmv
+  	}
+  }
+  
+ -static void release_stats_buffers(struct ibmvnic_adapter *adapter)
+ -{
+ -	kfree(adapter->tx_stats_buffers);
+ -	kfree(adapter->rx_stats_buffers);
+ -}
+ -
+ -static int init_stats_buffers(struct ibmvnic_adapter *adapter)
+ +static void free_rx_pool(struct ibmvnic_adapter *adapter,
+ +			 struct ibmvnic_rx_pool *pool)
+  {
+ -	adapter->tx_stats_buffers =
+ -				kcalloc(adapter->req_tx_queues,
+ -					sizeof(struct ibmvnic_tx_queue_stats),
+ -					GFP_KERNEL);
+ -	if (!adapter->tx_stats_buffers)
+ -		return -ENOMEM;
+ -
+ -	adapter->rx_stats_buffers =
+ -				kcalloc(adapter->req_rx_queues,
+ -					sizeof(struct ibmvnic_rx_queue_stats),
+ -					GFP_KERNEL);
+ -	if (!adapter->rx_stats_buffers)
+ -		return -ENOMEM;
+ -
+ -	return 0;
+ -}
+ +	int i;
+  
+ -static void release_stats_token(struct ibmvnic_adapter *adapter)
+ -{
+ -	struct device *dev = &adapter->vdev->dev;
+ +	kfree(pool->free_map);
+ +	pool->free_map = NULL;
+  
+ -	if (!adapter->stats_token)
+ +	if (!pool->rx_buff)
+  		return;
+  
+ -	dma_unmap_single(dev, adapter->stats_token,
+ -			 sizeof(struct ibmvnic_statistics),
+ -			 DMA_FROM_DEVICE);
+ -	adapter->stats_token = 0;
+ -}
+ -
+ -static int init_stats_token(struct ibmvnic_adapter *adapter)
+ -{
+ -	struct device *dev = &adapter->vdev->dev;
+ -	dma_addr_t stok;
+ -
+ -	stok = dma_map_single(dev, &adapter->stats,
+ -			      sizeof(struct ibmvnic_statistics),
+ -			      DMA_FROM_DEVICE);
+ -	if (dma_mapping_error(dev, stok)) {
+ -		dev_err(dev, "Couldn't map stats buffer\n");
+ -		return -1;
+ +	for (i = 0; i < pool->size; i++) {
+ +		if (pool->rx_buff[i].skb) {
+ +			dev_kfree_skb_any(pool->rx_buff[i].skb);
+ +			pool->rx_buff[i].skb = NULL;
+ +		}
+  	}
+ -
+ -	adapter->stats_token = stok;
+ -	netdev_dbg(adapter->netdev, "Stats token initialized (%llx)\n", stok);
+ -	return 0;
+ +	kfree(pool->rx_buff);
+ +	pool->rx_buff = NULL;
+  }
+  
+ -static int reset_rx_pools(struct ibmvnic_adapter *adapter)
+ +static int ibmvnic_open(struct net_device *netdev)
+  {
+ -	struct ibmvnic_rx_pool *rx_pool;
+ -	int rx_scrqs;
+ -	int i, j, rc;
+ -
+ -	rx_scrqs = be32_to_cpu(adapter->login_rsp_buf->num_rxadd_subcrqs);
+ -	for (i = 0; i < rx_scrqs; i++) {
+ -		rx_pool = &adapter->rx_pool[i];
+ +	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
+++<<<<<<< HEAD
+ +	struct device *dev = &adapter->vdev->dev;
+++=======
+++	int rc;
++ 
+ -		netdev_dbg(adapter->netdev, "Re-setting rx_pool[%d]\n", i);
+++	mutex_lock(&adapter->reset_lock);
++ 
+ -		rc = reset_long_term_buff(adapter, &rx_pool->long_term_buff);
+ -		if (rc)
+++	if (adapter->state != VNIC_CLOSED) {
+++		rc = ibmvnic_login(netdev);
+++		if (rc) {
+++			mutex_unlock(&adapter->reset_lock);
++ 			return rc;
+ -
+ -		for (j = 0; j < rx_pool->size; j++)
+ -			rx_pool->free_map[j] = j;
+ -
+ -		memset(rx_pool->rx_buff, 0,
+ -		       rx_pool->size * sizeof(struct ibmvnic_rx_buff));
+ -
+ -		atomic_set(&rx_pool->available, 0);
+ -		rx_pool->next_alloc = 0;
+ -		rx_pool->next_free = 0;
+ -		rx_pool->active = 1;
+ -	}
+ -
+ -	return 0;
+ -}
+ -
+ -static void release_rx_pools(struct ibmvnic_adapter *adapter)
+ -{
+ -	struct ibmvnic_rx_pool *rx_pool;
+ -	int rx_scrqs;
+ -	int i, j;
+ -
+ -	if (!adapter->rx_pool)
+ -		return;
+ -
+ -	rx_scrqs = be32_to_cpu(adapter->login_rsp_buf->num_rxadd_subcrqs);
+ -	for (i = 0; i < rx_scrqs; i++) {
+ -		rx_pool = &adapter->rx_pool[i];
+ -
+ -		netdev_dbg(adapter->netdev, "Releasing rx_pool[%d]\n", i);
+ -
+ -		kfree(rx_pool->free_map);
+ -		free_long_term_buff(adapter, &rx_pool->long_term_buff);
+ -
+ -		if (!rx_pool->rx_buff)
+ -			continue;
+ -
+ -		for (j = 0; j < rx_pool->size; j++) {
+ -			if (rx_pool->rx_buff[j].skb) {
+ -				dev_kfree_skb_any(rx_pool->rx_buff[i].skb);
+ -				rx_pool->rx_buff[i].skb = NULL;
+ -			}
++ 		}
++ 
+ -		kfree(rx_pool->rx_buff);
+++		rc = init_resources(adapter);
+++		if (rc) {
+++			netdev_err(netdev, "failed to initialize resources\n");
+++			release_resources(adapter);
+++			mutex_unlock(&adapter->reset_lock);
+++			return rc;
+++		}
++ 	}
++ 
+ -	kfree(adapter->rx_pool);
+ -	adapter->rx_pool = NULL;
+++	rc = __ibmvnic_open(netdev);
+++	netif_carrier_on(netdev);
+++	mutex_unlock(&adapter->reset_lock);
+++
+++	return rc;
++ }
++ 
+ -static int init_rx_pools(struct net_device *netdev)
+++static void clean_tx_pools(struct ibmvnic_adapter *adapter)
++ {
+ -	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
+ -	struct device *dev = &adapter->vdev->dev;
+ -	struct ibmvnic_rx_pool *rx_pool;
+++>>>>>>> e876a8a7e9dd (ibmvnic: Set state UP)
+ +	struct ibmvnic_tx_pool *tx_pool;
+ +	union ibmvnic_crq crq;
+  	int rxadd_subcrqs;
+  	u64 *size_array;
+ +	int tx_subcrqs;
+  	int i, j;
+  
+  	rxadd_subcrqs =
+@@@ -3917,77 -3877,30 +3949,78 @@@ static int ibmvnic_probe(struct vio_de
+  	netdev->ethtool_ops = &ibmvnic_ethtool_ops;
+  	SET_NETDEV_DEV(netdev, &dev->dev);
+  
+ +	INIT_WORK(&adapter->vnic_crq_init, handle_crq_init_rsp);
+ +	INIT_WORK(&adapter->ibmvnic_xport, ibmvnic_xport_event);
+ +
+  	spin_lock_init(&adapter->stats_lock);
+  
+ +	rc = ibmvnic_init_crq_queue(adapter);
+ +	if (rc) {
+ +		dev_err(&dev->dev, "Couldn't initialize crq. rc=%d\n", rc);
+ +		goto free_netdev;
+ +	}
+ +
+  	INIT_LIST_HEAD(&adapter->errors);
+ +	INIT_LIST_HEAD(&adapter->inflight);
+  	spin_lock_init(&adapter->error_list_lock);
+ +	spin_lock_init(&adapter->inflight_lock);
+ +
+ +	adapter->stats_token = dma_map_single(&dev->dev, &adapter->stats,
+ +					      sizeof(struct ibmvnic_statistics),
+ +					      DMA_FROM_DEVICE);
+ +	if (dma_mapping_error(&dev->dev, adapter->stats_token)) {
+ +		if (!firmware_has_feature(FW_FEATURE_CMO))
+ +			dev_err(&dev->dev, "Couldn't map stats buffer\n");
+ +		rc = -ENOMEM;
+ +		goto free_crq;
+ +	}
+ +
+ +	snprintf(buf, sizeof(buf), "ibmvnic_%x", dev->unit_address);
+ +	ent = debugfs_create_dir(buf, NULL);
+ +	if (!ent || IS_ERR(ent)) {
+ +		dev_info(&dev->dev, "debugfs create directory failed\n");
+ +		adapter->debugfs_dir = NULL;
+ +	} else {
+ +		adapter->debugfs_dir = ent;
+ +		ent = debugfs_create_file("dump", S_IRUGO, adapter->debugfs_dir,
+ +					  netdev, &ibmvnic_dump_ops);
+ +		if (!ent || IS_ERR(ent)) {
+ +			dev_info(&dev->dev,
+ +				 "debugfs create dump file failed\n");
+ +			adapter->debugfs_dump = NULL;
+ +		} else {
+ +			adapter->debugfs_dump = ent;
+ +		}
+ +	}
+  
+ -	INIT_WORK(&adapter->ibmvnic_reset, __ibmvnic_reset);
+ -	INIT_LIST_HEAD(&adapter->rwi_list);
+ -	mutex_init(&adapter->reset_lock);
+ -	mutex_init(&adapter->rwi_lock);
+ -	adapter->resetting = false;
+ +	init_completion(&adapter->init_done);
+ +	ibmvnic_send_crq_init(adapter);
+ +	if (!wait_for_completion_timeout(&adapter->init_done, timeout))
+ +		return 0;
+  
+  	do {
+ -		rc = ibmvnic_init(adapter);
+ -		if (rc && rc != EAGAIN)
+ -			goto ibmvnic_init_fail;
+ -	} while (rc == EAGAIN);
+ +		if (adapter->renegotiate) {
+ +			adapter->renegotiate = false;
+ +			release_sub_crqs_no_irqs(adapter);
+ +
+ +			reinit_completion(&adapter->init_done);
+ +			send_cap_queries(adapter);
+ +			if (!wait_for_completion_timeout(&adapter->init_done,
+ +							 timeout))
+ +				return 0;
+ +		}
+ +	} while (adapter->renegotiate);
+  
+ -	netdev->mtu = adapter->req_mtu - ETH_HLEN;
+ +	rc = init_sub_crq_irqs(adapter);
+ +	if (rc) {
+ +		dev_err(&dev->dev, "failed to initialize sub crq irqs\n");
+ +		goto free_debugfs;
+ +	}
+  
+ -	rc = device_create_file(&dev->dev, &dev_attr_failover);
+ -	if (rc)
+ -		goto ibmvnic_init_fail;
+ +	netdev->real_num_tx_queues = adapter->req_tx_queues;
+ +	netdev->mtu = adapter->req_mtu;
+  
++ 	netif_carrier_off(netdev);
+  	rc = register_netdev(netdev);
+  	if (rc) {
+  		dev_err(&dev->dev, "failed to register netdev rc=%d\n", rc);
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
