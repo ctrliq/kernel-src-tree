@@ -1,0 +1,623 @@
+net_sched: update hierarchical backlog too
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] sched: update hierarchical backlog too (Ivan Vecera) [1382040]
+Rebuild_FUZZ: 95.00%
+commit-author WANG Cong <xiyou.wangcong@gmail.com>
+commit 2ccccf5fb43ff62b2b96cc58d95fc0b3596516e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/2ccccf5f.failed
+
+When the bottom qdisc decides to, for example, drop some packet,
+it calls qdisc_tree_decrease_qlen() to update the queue length
+for all its ancestors, we need to update the backlog too to
+keep the stats on root qdisc accurate.
+
+	Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2ccccf5fb43ff62b2b96cc58d95fc0b3596516e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/sch_hhf.c
+#	net/sched/sch_pie.c
+* Unmerged path net/sched/sch_hhf.c
+* Unmerged path net/sched/sch_pie.c
+diff --git a/include/net/codel.h b/include/net/codel.h
+index 1e18005f7f65..0ee76108e741 100644
+--- a/include/net/codel.h
++++ b/include/net/codel.h
+@@ -160,11 +160,13 @@ struct codel_vars {
+  * struct codel_stats - contains codel shared variables and stats
+  * @maxpacket:	largest packet we've seen so far
+  * @drop_count:	temp count of dropped packets in dequeue()
++ * @drop_len:	bytes of dropped packets in dequeue()
+  * ecn_mark:	number of packets we ECN marked instead of dropping
+  */
+ struct codel_stats {
+ 	u32		maxpacket;
+ 	u32		drop_count;
++	u32		drop_len;
+ 	u32		ecn_mark;
+ };
+ 
+@@ -301,6 +303,7 @@ static struct sk_buff *codel_dequeue(struct Qdisc *sch,
+ 								  vars->rec_inv_sqrt);
+ 					goto end;
+ 				}
++				stats->drop_len += qdisc_pkt_len(skb);
+ 				qdisc_drop(skb, sch);
+ 				stats->drop_count++;
+ 				skb = dequeue_func(vars, sch);
+@@ -323,6 +326,7 @@ static struct sk_buff *codel_dequeue(struct Qdisc *sch,
+ 		if (params->ecn && INET_ECN_set_ce(skb)) {
+ 			stats->ecn_mark++;
+ 		} else {
++			stats->drop_len += qdisc_pkt_len(skb);
+ 			qdisc_drop(skb, sch);
+ 			stats->drop_count++;
+ 
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index cd726cbbb6d6..f0d277af943e 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -388,7 +388,8 @@ struct Qdisc *dev_graft_qdisc(struct netdev_queue *dev_queue,
+ 			      struct Qdisc *qdisc);
+ void qdisc_reset(struct Qdisc *qdisc);
+ void qdisc_destroy(struct Qdisc *qdisc);
+-void qdisc_tree_decrease_qlen(struct Qdisc *qdisc, unsigned int n);
++void qdisc_tree_reduce_backlog(struct Qdisc *qdisc, unsigned int n,
++			       unsigned int len);
+ struct Qdisc *qdisc_alloc(struct netdev_queue *dev_queue,
+ 			  const struct Qdisc_ops *ops);
+ struct Qdisc *qdisc_create_dflt(struct netdev_queue *dev_queue,
+@@ -671,7 +672,7 @@ static inline struct Qdisc *qdisc_replace(struct Qdisc *sch, struct Qdisc *new,
+ 	old = *pold;
+ 	*pold = new;
+ 	if (old != NULL) {
+-		qdisc_tree_decrease_qlen(old, old->q.qlen);
++		qdisc_tree_reduce_backlog(old, old->q.qlen, old->qstats.backlog);
+ 		qdisc_reset(old);
+ 	}
+ 	sch_tree_unlock(sch);
+diff --git a/net/sched/sch_api.c b/net/sched/sch_api.c
+index 03ed54566105..b36648ea878f 100644
+--- a/net/sched/sch_api.c
++++ b/net/sched/sch_api.c
+@@ -735,14 +735,15 @@ static u32 qdisc_alloc_handle(struct net_device *dev)
+ 	return 0;
+ }
+ 
+-void qdisc_tree_decrease_qlen(struct Qdisc *sch, unsigned int n)
++void qdisc_tree_reduce_backlog(struct Qdisc *sch, unsigned int n,
++			       unsigned int len)
+ {
+ 	const struct Qdisc_class_ops *cops;
+ 	unsigned long cl;
+ 	u32 parentid;
+ 	int drops;
+ 
+-	if (n == 0)
++	if (n == 0 && len == 0)
+ 		return;
+ 	drops = max_t(int, n, 0);
+ 	while ((parentid = sch->parent)) {
+@@ -761,10 +762,11 @@ void qdisc_tree_decrease_qlen(struct Qdisc *sch, unsigned int n)
+ 			cops->put(sch, cl);
+ 		}
+ 		sch->q.qlen -= n;
++		sch->qstats.backlog -= len;
+ 		__qdisc_qstats_drop(sch, drops);
+ 	}
+ }
+-EXPORT_SYMBOL(qdisc_tree_decrease_qlen);
++EXPORT_SYMBOL(qdisc_tree_reduce_backlog);
+ 
+ static void notify_and_destroy(struct net *net, struct sk_buff *skb,
+ 			       struct nlmsghdr *n, u32 clid,
+diff --git a/net/sched/sch_cbq.c b/net/sched/sch_cbq.c
+index 3389351a8374..4c17d1aada2d 100644
+--- a/net/sched/sch_cbq.c
++++ b/net/sched/sch_cbq.c
+@@ -1927,7 +1927,7 @@ static int cbq_delete(struct Qdisc *sch, unsigned long arg)
+ {
+ 	struct cbq_sched_data *q = qdisc_priv(sch);
+ 	struct cbq_class *cl = (struct cbq_class *)arg;
+-	unsigned int qlen;
++	unsigned int qlen, backlog;
+ 
+ 	if (cl->filters || cl->children || cl == &q->link)
+ 		return -EBUSY;
+@@ -1935,8 +1935,9 @@ static int cbq_delete(struct Qdisc *sch, unsigned long arg)
+ 	sch_tree_lock(sch);
+ 
+ 	qlen = cl->q->q.qlen;
++	backlog = cl->q->qstats.backlog;
+ 	qdisc_reset(cl->q);
+-	qdisc_tree_decrease_qlen(cl->q, qlen);
++	qdisc_tree_reduce_backlog(cl->q, qlen, backlog);
+ 
+ 	if (cl->next_alive)
+ 		cbq_deactivate_class(cl);
+diff --git a/net/sched/sch_choke.c b/net/sched/sch_choke.c
+index 62c6099d12dc..13587cbe2314 100644
+--- a/net/sched/sch_choke.c
++++ b/net/sched/sch_choke.c
+@@ -128,8 +128,8 @@ static void choke_drop_by_idx(struct Qdisc *sch, unsigned int idx)
+ 		choke_zap_tail_holes(q);
+ 
+ 	qdisc_qstats_backlog_dec(sch, skb);
++	qdisc_tree_reduce_backlog(sch, 1, qdisc_pkt_len(skb));
+ 	qdisc_drop(skb, sch);
+-	qdisc_tree_decrease_qlen(sch, 1);
+ 	--sch->q.qlen;
+ }
+ 
+@@ -451,6 +451,7 @@ static int choke_change(struct Qdisc *sch, struct nlattr *opt)
+ 		old = q->tab;
+ 		if (old) {
+ 			unsigned int oqlen = sch->q.qlen, tail = 0;
++			unsigned dropped = 0;
+ 
+ 			while (q->head != q->tail) {
+ 				struct sk_buff *skb = q->tab[q->head];
+@@ -462,11 +463,12 @@ static int choke_change(struct Qdisc *sch, struct nlattr *opt)
+ 					ntab[tail++] = skb;
+ 					continue;
+ 				}
++				dropped += qdisc_pkt_len(skb);
+ 				qdisc_qstats_backlog_dec(sch, skb);
+ 				--sch->q.qlen;
+ 				qdisc_drop(skb, sch);
+ 			}
+-			qdisc_tree_decrease_qlen(sch, oqlen - sch->q.qlen);
++			qdisc_tree_reduce_backlog(sch, oqlen - sch->q.qlen, dropped);
+ 			q->head = 0;
+ 			q->tail = tail;
+ 		}
+diff --git a/net/sched/sch_codel.c b/net/sched/sch_codel.c
+index 7a0bdb16ac92..9a9068d00833 100644
+--- a/net/sched/sch_codel.c
++++ b/net/sched/sch_codel.c
+@@ -79,12 +79,13 @@ static struct sk_buff *codel_qdisc_dequeue(struct Qdisc *sch)
+ 
+ 	skb = codel_dequeue(sch, &q->params, &q->vars, &q->stats, dequeue);
+ 
+-	/* We cant call qdisc_tree_decrease_qlen() if our qlen is 0,
++	/* We cant call qdisc_tree_reduce_backlog() if our qlen is 0,
+ 	 * or HTB crashes. Defer it for next round.
+ 	 */
+ 	if (q->stats.drop_count && sch->q.qlen) {
+-		qdisc_tree_decrease_qlen(sch, q->stats.drop_count);
++		qdisc_tree_reduce_backlog(sch, q->stats.drop_count, q->stats.drop_len);
+ 		q->stats.drop_count = 0;
++		q->stats.drop_len = 0;
+ 	}
+ 	if (skb)
+ 		qdisc_bstats_update(sch, skb);
+@@ -115,7 +116,7 @@ static int codel_change(struct Qdisc *sch, struct nlattr *opt)
+ {
+ 	struct codel_sched_data *q = qdisc_priv(sch);
+ 	struct nlattr *tb[TCA_CODEL_MAX + 1];
+-	unsigned int qlen;
++	unsigned int qlen, dropped = 0;
+ 	int err;
+ 
+ 	if (!opt)
+@@ -149,10 +150,11 @@ static int codel_change(struct Qdisc *sch, struct nlattr *opt)
+ 	while (sch->q.qlen > sch->limit) {
+ 		struct sk_buff *skb = __skb_dequeue(&sch->q);
+ 
++		dropped += qdisc_pkt_len(skb);
+ 		qdisc_qstats_backlog_dec(sch, skb);
+ 		qdisc_drop(skb, sch);
+ 	}
+-	qdisc_tree_decrease_qlen(sch, qlen - sch->q.qlen);
++	qdisc_tree_reduce_backlog(sch, qlen - sch->q.qlen, dropped);
+ 
+ 	sch_tree_unlock(sch);
+ 	return 0;
+diff --git a/net/sched/sch_drr.c b/net/sched/sch_drr.c
+index db055eb7d320..5e1cd434da2e 100644
+--- a/net/sched/sch_drr.c
++++ b/net/sched/sch_drr.c
+@@ -53,9 +53,10 @@ static struct drr_class *drr_find_class(struct Qdisc *sch, u32 classid)
+ static void drr_purge_queue(struct drr_class *cl)
+ {
+ 	unsigned int len = cl->qdisc->q.qlen;
++	unsigned int backlog = cl->qdisc->qstats.backlog;
+ 
+ 	qdisc_reset(cl->qdisc);
+-	qdisc_tree_decrease_qlen(cl->qdisc, len);
++	qdisc_tree_reduce_backlog(cl->qdisc, len, backlog);
+ }
+ 
+ static const struct nla_policy drr_policy[TCA_DRR_MAX + 1] = {
+diff --git a/net/sched/sch_fq.c b/net/sched/sch_fq.c
+index 454799388713..efe361bfdd23 100644
+--- a/net/sched/sch_fq.c
++++ b/net/sched/sch_fq.c
+@@ -662,6 +662,7 @@ static int fq_change(struct Qdisc *sch, struct nlattr *opt)
+ 	struct fq_sched_data *q = qdisc_priv(sch);
+ 	struct nlattr *tb[TCA_FQ_MAX + 1];
+ 	int err, drop_count = 0;
++	unsigned drop_len = 0;
+ 	u32 fq_log;
+ 
+ 	if (!opt)
+@@ -736,10 +737,11 @@ static int fq_change(struct Qdisc *sch, struct nlattr *opt)
+ 
+ 		if (!skb)
+ 			break;
++		drop_len += qdisc_pkt_len(skb);
+ 		kfree_skb(skb);
+ 		drop_count++;
+ 	}
+-	qdisc_tree_decrease_qlen(sch, drop_count);
++	qdisc_tree_reduce_backlog(sch, drop_count, drop_len);
+ 
+ 	sch_tree_unlock(sch);
+ 	return err;
+diff --git a/net/sched/sch_fq_codel.c b/net/sched/sch_fq_codel.c
+index 03125323e5e3..2d7754154d51 100644
+--- a/net/sched/sch_fq_codel.c
++++ b/net/sched/sch_fq_codel.c
+@@ -171,7 +171,7 @@ static unsigned int fq_codel_drop(struct Qdisc *sch)
+ static int fq_codel_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ {
+ 	struct fq_codel_sched_data *q = qdisc_priv(sch);
+-	unsigned int idx;
++	unsigned int idx, prev_backlog;
+ 	struct fq_codel_flow *flow;
+ 	int uninitialized_var(ret);
+ 
+@@ -199,6 +199,7 @@ static int fq_codel_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 	if (++sch->q.qlen <= sch->limit)
+ 		return NET_XMIT_SUCCESS;
+ 
++	prev_backlog = sch->qstats.backlog;
+ 	q->drop_overlimit++;
+ 	/* Return Congestion Notification only if we dropped a packet
+ 	 * from this flow.
+@@ -207,7 +208,7 @@ static int fq_codel_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ 		return NET_XMIT_CN;
+ 
+ 	/* As we dropped a packet, better let upper stack know this */
+-	qdisc_tree_decrease_qlen(sch, 1);
++	qdisc_tree_reduce_backlog(sch, 1, prev_backlog - sch->qstats.backlog);
+ 	return NET_XMIT_SUCCESS;
+ }
+ 
+@@ -237,6 +238,7 @@ static struct sk_buff *fq_codel_dequeue(struct Qdisc *sch)
+ 	struct fq_codel_flow *flow;
+ 	struct list_head *head;
+ 	u32 prev_drop_count, prev_ecn_mark;
++	unsigned int prev_backlog;
+ 
+ begin:
+ 	head = &q->new_flows;
+@@ -255,6 +257,7 @@ begin:
+ 
+ 	prev_drop_count = q->cstats.drop_count;
+ 	prev_ecn_mark = q->cstats.ecn_mark;
++	prev_backlog = sch->qstats.backlog;
+ 
+ 	skb = codel_dequeue(sch, &q->cparams, &flow->cvars, &q->cstats,
+ 			    dequeue);
+@@ -272,12 +275,14 @@ begin:
+ 	}
+ 	qdisc_bstats_update(sch, skb);
+ 	flow->deficit -= qdisc_pkt_len(skb);
+-	/* We cant call qdisc_tree_decrease_qlen() if our qlen is 0,
++	/* We cant call qdisc_tree_reduce_backlog() if our qlen is 0,
+ 	 * or HTB crashes. Defer it for next round.
+ 	 */
+ 	if (q->cstats.drop_count && sch->q.qlen) {
+-		qdisc_tree_decrease_qlen(sch, q->cstats.drop_count);
++		qdisc_tree_reduce_backlog(sch, q->cstats.drop_count,
++					  q->cstats.drop_len);
+ 		q->cstats.drop_count = 0;
++		q->cstats.drop_len = 0;
+ 	}
+ 	return skb;
+ }
+@@ -345,11 +350,13 @@ static int fq_codel_change(struct Qdisc *sch, struct nlattr *opt)
+ 	while (sch->q.qlen > sch->limit) {
+ 		struct sk_buff *skb = fq_codel_dequeue(sch);
+ 
++		q->cstats.drop_len += qdisc_pkt_len(skb);
+ 		kfree_skb(skb);
+ 		q->cstats.drop_count++;
+ 	}
+-	qdisc_tree_decrease_qlen(sch, q->cstats.drop_count);
++	qdisc_tree_reduce_backlog(sch, q->cstats.drop_count, q->cstats.drop_len);
+ 	q->cstats.drop_count = 0;
++	q->cstats.drop_len = 0;
+ 
+ 	sch_tree_unlock(sch);
+ 	return 0;
+diff --git a/net/sched/sch_hfsc.c b/net/sched/sch_hfsc.c
+index 7e202e1de2d5..ab2454bc8186 100644
+--- a/net/sched/sch_hfsc.c
++++ b/net/sched/sch_hfsc.c
+@@ -895,9 +895,10 @@ static void
+ hfsc_purge_queue(struct Qdisc *sch, struct hfsc_class *cl)
+ {
+ 	unsigned int len = cl->qdisc->q.qlen;
++	unsigned int backlog = cl->qdisc->qstats.backlog;
+ 
+ 	qdisc_reset(cl->qdisc);
+-	qdisc_tree_decrease_qlen(cl->qdisc, len);
++	qdisc_tree_reduce_backlog(cl->qdisc, len, backlog);
+ }
+ 
+ static void
+* Unmerged path net/sched/sch_hhf.c
+diff --git a/net/sched/sch_htb.c b/net/sched/sch_htb.c
+index 51880676af9e..0aabaf0adb5c 100644
+--- a/net/sched/sch_htb.c
++++ b/net/sched/sch_htb.c
+@@ -1270,7 +1270,6 @@ static int htb_delete(struct Qdisc *sch, unsigned long arg)
+ {
+ 	struct htb_sched *q = qdisc_priv(sch);
+ 	struct htb_class *cl = (struct htb_class *)arg;
+-	unsigned int qlen;
+ 	struct Qdisc *new_q = NULL;
+ 	int last_child = 0;
+ 
+@@ -1289,9 +1288,11 @@ static int htb_delete(struct Qdisc *sch, unsigned long arg)
+ 	sch_tree_lock(sch);
+ 
+ 	if (!cl->level) {
+-		qlen = cl->un.leaf.q->q.qlen;
++		unsigned int qlen = cl->un.leaf.q->q.qlen;
++		unsigned int backlog = cl->un.leaf.q->qstats.backlog;
++
+ 		qdisc_reset(cl->un.leaf.q);
+-		qdisc_tree_decrease_qlen(cl->un.leaf.q, qlen);
++		qdisc_tree_reduce_backlog(cl->un.leaf.q, qlen, backlog);
+ 	}
+ 
+ 	/* delete from hash and active; remainder in destroy_class */
+@@ -1430,10 +1431,11 @@ static int htb_change_class(struct Qdisc *sch, u32 classid,
+ 		sch_tree_lock(sch);
+ 		if (parent && !parent->level) {
+ 			unsigned int qlen = parent->un.leaf.q->q.qlen;
++			unsigned int backlog = parent->un.leaf.q->qstats.backlog;
+ 
+ 			/* turn parent into inner node */
+ 			qdisc_reset(parent->un.leaf.q);
+-			qdisc_tree_decrease_qlen(parent->un.leaf.q, qlen);
++			qdisc_tree_reduce_backlog(parent->un.leaf.q, qlen, backlog);
+ 			qdisc_destroy(parent->un.leaf.q);
+ 			if (parent->prio_activity)
+ 				htb_deactivate(q, parent);
+diff --git a/net/sched/sch_multiq.c b/net/sched/sch_multiq.c
+index c433de581b93..fa3f9335b349 100644
+--- a/net/sched/sch_multiq.c
++++ b/net/sched/sch_multiq.c
+@@ -218,7 +218,8 @@ static int multiq_tune(struct Qdisc *sch, struct nlattr *opt)
+ 		if (q->queues[i] != &noop_qdisc) {
+ 			struct Qdisc *child = q->queues[i];
+ 			q->queues[i] = &noop_qdisc;
+-			qdisc_tree_decrease_qlen(child, child->q.qlen);
++			qdisc_tree_reduce_backlog(child, child->q.qlen,
++						  child->qstats.backlog);
+ 			qdisc_destroy(child);
+ 		}
+ 	}
+@@ -238,8 +239,9 @@ static int multiq_tune(struct Qdisc *sch, struct nlattr *opt)
+ 				q->queues[i] = child;
+ 
+ 				if (old != &noop_qdisc) {
+-					qdisc_tree_decrease_qlen(old,
+-								 old->q.qlen);
++					qdisc_tree_reduce_backlog(old,
++								  old->q.qlen,
++								  old->qstats.backlog);
+ 					qdisc_destroy(old);
+ 				}
+ 				sch_tree_unlock(sch);
+diff --git a/net/sched/sch_netem.c b/net/sched/sch_netem.c
+index 2399444cb1df..af57285b7c8d 100644
+--- a/net/sched/sch_netem.c
++++ b/net/sched/sch_netem.c
+@@ -641,7 +641,8 @@ deliver:
+ 				if (unlikely(err != NET_XMIT_SUCCESS)) {
+ 					if (net_xmit_drop_count(err)) {
+ 						qdisc_qstats_drop(sch);
+-						qdisc_tree_decrease_qlen(sch, 1);
++						qdisc_tree_reduce_backlog(sch, 1,
++									  qdisc_pkt_len(skb));
+ 					}
+ 				}
+ 				goto tfifo_dequeue;
+* Unmerged path net/sched/sch_pie.c
+diff --git a/net/sched/sch_prio.c b/net/sched/sch_prio.c
+index 981befd8e931..7cdcd29289eb 100644
+--- a/net/sched/sch_prio.c
++++ b/net/sched/sch_prio.c
+@@ -189,7 +189,7 @@ static int prio_tune(struct Qdisc *sch, struct nlattr *opt)
+ 		struct Qdisc *child = q->queues[i];
+ 		q->queues[i] = &noop_qdisc;
+ 		if (child != &noop_qdisc) {
+-			qdisc_tree_decrease_qlen(child, child->q.qlen);
++			qdisc_tree_reduce_backlog(child, child->q.qlen, child->qstats.backlog);
+ 			qdisc_destroy(child);
+ 		}
+ 	}
+@@ -208,8 +208,9 @@ static int prio_tune(struct Qdisc *sch, struct nlattr *opt)
+ 				q->queues[i] = child;
+ 
+ 				if (old != &noop_qdisc) {
+-					qdisc_tree_decrease_qlen(old,
+-								 old->q.qlen);
++					qdisc_tree_reduce_backlog(old,
++								  old->q.qlen,
++								  old->qstats.backlog);
+ 					qdisc_destroy(old);
+ 				}
+ 				sch_tree_unlock(sch);
+diff --git a/net/sched/sch_qfq.c b/net/sched/sch_qfq.c
+index 16e0840d23e2..242ad0c91294 100644
+--- a/net/sched/sch_qfq.c
++++ b/net/sched/sch_qfq.c
+@@ -221,9 +221,10 @@ static struct qfq_class *qfq_find_class(struct Qdisc *sch, u32 classid)
+ static void qfq_purge_queue(struct qfq_class *cl)
+ {
+ 	unsigned int len = cl->qdisc->q.qlen;
++	unsigned int backlog = cl->qdisc->qstats.backlog;
+ 
+ 	qdisc_reset(cl->qdisc);
+-	qdisc_tree_decrease_qlen(cl->qdisc, len);
++	qdisc_tree_reduce_backlog(cl->qdisc, len, backlog);
+ }
+ 
+ static const struct nla_policy qfq_policy[TCA_QFQ_MAX + 1] = {
+diff --git a/net/sched/sch_red.c b/net/sched/sch_red.c
+index d5abcee454d8..8c0508c0e287 100644
+--- a/net/sched/sch_red.c
++++ b/net/sched/sch_red.c
+@@ -210,7 +210,8 @@ static int red_change(struct Qdisc *sch, struct nlattr *opt)
+ 	q->flags = ctl->flags;
+ 	q->limit = ctl->limit;
+ 	if (child) {
+-		qdisc_tree_decrease_qlen(q->qdisc, q->qdisc->q.qlen);
++		qdisc_tree_reduce_backlog(q->qdisc, q->qdisc->q.qlen,
++					  q->qdisc->qstats.backlog);
+ 		qdisc_destroy(q->qdisc);
+ 		q->qdisc = child;
+ 	}
+diff --git a/net/sched/sch_sfb.c b/net/sched/sch_sfb.c
+index f583c785416f..8200b057d618 100644
+--- a/net/sched/sch_sfb.c
++++ b/net/sched/sch_sfb.c
+@@ -516,7 +516,8 @@ static int sfb_change(struct Qdisc *sch, struct nlattr *opt)
+ 
+ 	sch_tree_lock(sch);
+ 
+-	qdisc_tree_decrease_qlen(q->qdisc, q->qdisc->q.qlen);
++	qdisc_tree_reduce_backlog(q->qdisc, q->qdisc->q.qlen,
++				  q->qdisc->qstats.backlog);
+ 	qdisc_destroy(q->qdisc);
+ 	q->qdisc = child;
+ 
+diff --git a/net/sched/sch_sfq.c b/net/sched/sch_sfq.c
+index 26d6814c8b15..4f6952c46fae 100644
+--- a/net/sched/sch_sfq.c
++++ b/net/sched/sch_sfq.c
+@@ -370,7 +370,7 @@ static int
+ sfq_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+ {
+ 	struct sfq_sched_data *q = qdisc_priv(sch);
+-	unsigned int hash;
++	unsigned int hash, dropped;
+ 	sfq_index x, qlen;
+ 	struct sfq_slot *slot;
+ 	int uninitialized_var(ret);
+@@ -485,7 +485,7 @@ enqueue:
+ 		return NET_XMIT_SUCCESS;
+ 
+ 	qlen = slot->qlen;
+-	sfq_drop(sch);
++	dropped = sfq_drop(sch);
+ 	/* Return Congestion Notification only if we dropped a packet
+ 	 * from this flow.
+ 	 */
+@@ -493,7 +493,7 @@ enqueue:
+ 		return NET_XMIT_CN;
+ 
+ 	/* As we dropped a packet, better let upper stack know this */
+-	qdisc_tree_decrease_qlen(sch, 1);
++	qdisc_tree_reduce_backlog(sch, 1, dropped);
+ 	return NET_XMIT_SUCCESS;
+ }
+ 
+@@ -561,6 +561,7 @@ static void sfq_rehash(struct Qdisc *sch)
+ 	struct sfq_slot *slot;
+ 	struct sk_buff_head list;
+ 	int dropped = 0;
++	unsigned int drop_len = 0;
+ 
+ 	__skb_queue_head_init(&list);
+ 
+@@ -589,6 +590,7 @@ static void sfq_rehash(struct Qdisc *sch)
+ 			if (x >= SFQ_MAX_FLOWS) {
+ drop:
+ 				qdisc_qstats_backlog_dec(sch, skb);
++				drop_len += qdisc_pkt_len(skb);
+ 				kfree_skb(skb);
+ 				dropped++;
+ 				continue;
+@@ -618,7 +620,7 @@ drop:
+ 		}
+ 	}
+ 	sch->q.qlen -= dropped;
+-	qdisc_tree_decrease_qlen(sch, dropped);
++	qdisc_tree_reduce_backlog(sch, dropped, drop_len);
+ }
+ 
+ static void sfq_perturbation(unsigned long arg)
+@@ -642,7 +644,7 @@ static int sfq_change(struct Qdisc *sch, struct nlattr *opt)
+ 	struct sfq_sched_data *q = qdisc_priv(sch);
+ 	struct tc_sfq_qopt *ctl = nla_data(opt);
+ 	struct tc_sfq_qopt_v1 *ctl_v1 = NULL;
+-	unsigned int qlen;
++	unsigned int qlen, dropped = 0;
+ 	struct red_parms *p = NULL;
+ 
+ 	if (opt->nla_len < nla_attr_size(sizeof(*ctl)))
+@@ -691,8 +693,8 @@ static int sfq_change(struct Qdisc *sch, struct nlattr *opt)
+ 
+ 	qlen = sch->q.qlen;
+ 	while (sch->q.qlen > q->limit)
+-		sfq_drop(sch);
+-	qdisc_tree_decrease_qlen(sch, qlen - sch->q.qlen);
++		dropped += sfq_drop(sch);
++	qdisc_tree_reduce_backlog(sch, qlen - sch->q.qlen, dropped);
+ 
+ 	del_timer(&q->perturb_timer);
+ 	if (q->perturb_period) {
+diff --git a/net/sched/sch_tbf.c b/net/sched/sch_tbf.c
+index a2431227f479..addd770be103 100644
+--- a/net/sched/sch_tbf.c
++++ b/net/sched/sch_tbf.c
+@@ -168,6 +168,7 @@ static int tbf_segment(struct sk_buff *skb, struct Qdisc *sch)
+ 	struct tbf_sched_data *q = qdisc_priv(sch);
+ 	struct sk_buff *segs, *nskb;
+ 	netdev_features_t features = netif_skb_features(skb);
++	unsigned int len = 0, prev_len = qdisc_pkt_len(skb);
+ 	int ret, nb;
+ 
+ 	segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
+@@ -180,6 +181,7 @@ static int tbf_segment(struct sk_buff *skb, struct Qdisc *sch)
+ 		nskb = segs->next;
+ 		segs->next = NULL;
+ 		qdisc_skb_cb(segs)->pkt_len = segs->len;
++		len += segs->len;
+ 		ret = qdisc_enqueue(segs, q->qdisc);
+ 		if (ret != NET_XMIT_SUCCESS) {
+ 			if (net_xmit_drop_count(ret))
+@@ -191,7 +193,7 @@ static int tbf_segment(struct sk_buff *skb, struct Qdisc *sch)
+ 	}
+ 	sch->q.qlen += nb;
+ 	if (nb > 1)
+-		qdisc_tree_decrease_qlen(sch, 1 - nb);
++		qdisc_tree_reduce_backlog(sch, 1 - nb, prev_len - len);
+ 	consume_skb(skb);
+ 	return nb > 0 ? NET_XMIT_SUCCESS : NET_XMIT_DROP;
+ }
+@@ -400,7 +402,8 @@ static int tbf_change(struct Qdisc *sch, struct nlattr *opt)
+ 
+ 	sch_tree_lock(sch);
+ 	if (child) {
+-		qdisc_tree_decrease_qlen(q->qdisc, q->qdisc->q.qlen);
++		qdisc_tree_reduce_backlog(q->qdisc, q->qdisc->q.qlen,
++					  q->qdisc->qstats.backlog);
+ 		qdisc_destroy(q->qdisc);
+ 		q->qdisc = child;
+ 	}
