@@ -1,0 +1,258 @@
+vmbus: split ring buffer allocation from open
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Stephen Hemminger <stephen@networkplumber.org>
+commit ae6935ed7d424ffa74d634da00767e7b03c98fd3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/ae6935ed.failed
+
+The UIO driver needs the ring buffer to be persistent(reused)
+across open/close. Split the allocation and setup of ring buffer
+out of vmbus_open. For normal usage vmbus_open/vmbus_close there
+are no changes; only impacts uio_hv_generic which needs to keep
+ring buffer memory and reuse when application restarts.
+
+	Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit ae6935ed7d424ffa74d634da00767e7b03c98fd3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/channel.c
+diff --cc drivers/hv/channel.c
+index f33dbb282bfc,ddadb7efd1cc..000000000000
+--- a/drivers/hv/channel.c
++++ b/drivers/hv/channel.c
+@@@ -65,71 -79,86 +65,115 @@@ void vmbus_setevent(struct vmbus_channe
+  }
+  EXPORT_SYMBOL_GPL(vmbus_setevent);
+  
+- /*
+-  * vmbus_open - Open the specified channel.
+-  */
+- int vmbus_open(struct vmbus_channel *newchannel, u32 send_ringbuffer_size,
+- 		     u32 recv_ringbuffer_size, void *userdata, u32 userdatalen,
+- 		     void (*onchannelcallback)(void *context), void *context)
++ /* vmbus_free_ring - drop mapping of ring buffer */
++ void vmbus_free_ring(struct vmbus_channel *channel)
+  {
+++<<<<<<< HEAD
+ +	struct vmbus_channel_open_channel *open_msg;
+ +	struct vmbus_channel_msginfo *open_info = NULL;
+ +	unsigned long flags;
+ +	int ret, err = 0;
+ +	struct page *page;
+ +
+ +	if (send_ringbuffer_size % PAGE_SIZE ||
+ +	    recv_ringbuffer_size % PAGE_SIZE)
+ +		return -EINVAL;
+ +
+ +	spin_lock_irqsave(&newchannel->lock, flags);
+ +	if (newchannel->state == CHANNEL_OPEN_STATE) {
+ +		newchannel->state = CHANNEL_OPENING_STATE;
+ +	} else {
+ +		spin_unlock_irqrestore(&newchannel->lock, flags);
+ +		return -EINVAL;
+++=======
++ 	hv_ringbuffer_cleanup(&channel->outbound);
++ 	hv_ringbuffer_cleanup(&channel->inbound);
++ 
++ 	if (channel->ringbuffer_page) {
++ 		__free_pages(channel->ringbuffer_page,
++ 			     get_order(channel->ringbuffer_pagecount
++ 				       << PAGE_SHIFT));
++ 		channel->ringbuffer_page = NULL;
+++>>>>>>> ae6935ed7d42 (vmbus: split ring buffer allocation from open)
+  	}
+- 	spin_unlock_irqrestore(&newchannel->lock, flags);
++ }
++ EXPORT_SYMBOL_GPL(vmbus_free_ring);
+  
+- 	newchannel->onchannel_callback = onchannelcallback;
+- 	newchannel->channel_callback_context = context;
++ /* vmbus_alloc_ring - allocate and map pages for ring buffer */
++ int vmbus_alloc_ring(struct vmbus_channel *newchannel,
++ 		     u32 send_size, u32 recv_size)
++ {
++ 	struct page *page;
++ 	int order;
++ 
++ 	if (send_size % PAGE_SIZE || recv_size % PAGE_SIZE)
++ 		return -EINVAL;
+  
+  	/* Allocate the ring buffer */
++ 	order = get_order(send_size + recv_size);
+  	page = alloc_pages_node(cpu_to_node(newchannel->target_cpu),
+ -				GFP_KERNEL|__GFP_ZERO, order);
+ +				GFP_KERNEL|__GFP_ZERO,
+ +				get_order(send_ringbuffer_size +
+ +				recv_ringbuffer_size));
+  
+  	if (!page)
+ -		page = alloc_pages(GFP_KERNEL|__GFP_ZERO, order);
+ +		page = alloc_pages(GFP_KERNEL|__GFP_ZERO,
+ +				   get_order(send_ringbuffer_size +
+ +					     recv_ringbuffer_size));
+  
+- 	if (!page) {
+- 		err = -ENOMEM;
+- 		goto error_set_chnstate;
+- 	}
++ 	if (!page)
++ 		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	newchannel->ringbuffer_pages = page_address(page);
+ +	newchannel->ringbuffer_pagecount = (send_ringbuffer_size +
+ +					   recv_ringbuffer_size) >> PAGE_SHIFT;
+++=======
++ 	newchannel->ringbuffer_page = page;
++ 	newchannel->ringbuffer_pagecount = (send_size + recv_size) >> PAGE_SHIFT;
++ 	newchannel->ringbuffer_send_offset = send_size >> PAGE_SHIFT;
+++>>>>>>> ae6935ed7d42 (vmbus: split ring buffer allocation from open)
+  
+- 	ret = hv_ringbuffer_init(&newchannel->outbound, page,
+- 				 send_ringbuffer_size >> PAGE_SHIFT);
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(vmbus_alloc_ring);
+  
+- 	if (ret != 0) {
+- 		err = ret;
+- 		goto error_free_pages;
+- 	}
++ static int __vmbus_open(struct vmbus_channel *newchannel,
++ 		       void *userdata, u32 userdatalen,
++ 		       void (*onchannelcallback)(void *context), void *context)
++ {
++ 	struct vmbus_channel_open_channel *open_msg;
++ 	struct vmbus_channel_msginfo *open_info = NULL;
++ 	struct page *page = newchannel->ringbuffer_page;
++ 	u32 send_pages, recv_pages;
++ 	unsigned long flags;
++ 	int err;
++ 
++ 	if (userdatalen > MAX_USER_DEFINED_BYTES)
++ 		return -EINVAL;
+  
+- 	ret = hv_ringbuffer_init(&newchannel->inbound,
+- 				 &page[send_ringbuffer_size >> PAGE_SHIFT],
+- 				 recv_ringbuffer_size >> PAGE_SHIFT);
+- 	if (ret != 0) {
+- 		err = ret;
+- 		goto error_free_pages;
++ 	send_pages = newchannel->ringbuffer_send_offset;
++ 	recv_pages = newchannel->ringbuffer_pagecount - send_pages;
++ 
++ 	spin_lock_irqsave(&newchannel->lock, flags);
++ 	if (newchannel->state != CHANNEL_OPEN_STATE) {
++ 		spin_unlock_irqrestore(&newchannel->lock, flags);
++ 		return -EINVAL;
+  	}
++ 	spin_unlock_irqrestore(&newchannel->lock, flags);
++ 
++ 	newchannel->state = CHANNEL_OPENING_STATE;
++ 	newchannel->onchannel_callback = onchannelcallback;
++ 	newchannel->channel_callback_context = context;
++ 
++ 	err = hv_ringbuffer_init(&newchannel->outbound, page, send_pages);
++ 	if (err)
++ 		goto error_clean_ring;
+  
++ 	err = hv_ringbuffer_init(&newchannel->inbound,
++ 				 &page[send_pages], recv_pages);
++ 	if (err)
++ 		goto error_clean_ring;
+  
+  	/* Establish the gpadl for the ring buffer */
+  	newchannel->ringbuffer_gpadlhandle = 0;
+@@@ -218,16 -235,14 +250,20 @@@ error_clean_msglist
+  	spin_lock_irqsave(&vmbus_connection.channelmsg_lock, flags);
+  	list_del(&open_info->msglistentry);
+  	spin_unlock_irqrestore(&vmbus_connection.channelmsg_lock, flags);
+- 
++ error_free_info:
++ 	kfree(open_info);
+  error_free_gpadl:
+  	vmbus_teardown_gpadl(newchannel, newchannel->ringbuffer_gpadlhandle);
+- 	kfree(open_info);
+- error_free_pages:
++ 	newchannel->ringbuffer_gpadlhandle = 0;
++ error_clean_ring:
+  	hv_ringbuffer_cleanup(&newchannel->outbound);
+  	hv_ringbuffer_cleanup(&newchannel->inbound);
+++<<<<<<< HEAD
+ +	__free_pages(page,
+ +		     get_order(send_ringbuffer_size + recv_ringbuffer_size));
+ +error_set_chnstate:
+++=======
+++>>>>>>> ae6935ed7d42 (vmbus: split ring buffer allocation from open)
+  	newchannel->state = CHANNEL_OPEN_STATE;
+  	return err;
+  }
+@@@ -637,18 -681,11 +703,22 @@@ static int vmbus_close_internal(struct 
+  			 * If we failed to teardown gpadl,
+  			 * it is perhaps better to leak memory.
+  			 */
+- 			goto out;
+  		}
++ 
++ 		channel->ringbuffer_gpadlhandle = 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Cleanup the ring buffers for this channel */
+ +	hv_ringbuffer_cleanup(&channel->outbound);
+ +	hv_ringbuffer_cleanup(&channel->inbound);
+ +
+ +	free_pages((unsigned long)channel->ringbuffer_pages,
+ +		get_order(channel->ringbuffer_pagecount * PAGE_SIZE));
+ +
+ +out:
+++=======
+++>>>>>>> ae6935ed7d42 (vmbus: split ring buffer allocation from open)
+  	return ret;
+  }
+  
+* Unmerged path drivers/hv/channel.c
+diff --git a/drivers/hv/ring_buffer.c b/drivers/hv/ring_buffer.c
+index 5540d1bf57f2..e824476a04aa 100644
+--- a/drivers/hv/ring_buffer.c
++++ b/drivers/hv/ring_buffer.c
+@@ -241,6 +241,7 @@ int hv_ringbuffer_init(struct hv_ring_buffer_info *ring_info,
+ void hv_ringbuffer_cleanup(struct hv_ring_buffer_info *ring_info)
+ {
+ 	vunmap(ring_info->ring_buffer);
++	ring_info->ring_buffer = NULL;
+ }
+ 
+ /* Write to the ring buffer. */
+diff --git a/include/linux/hyperv.h b/include/linux/hyperv.h
+index f9f31c89e9e7..fd2904e204bf 100644
+--- a/include/linux/hyperv.h
++++ b/include/linux/hyperv.h
+@@ -707,6 +707,7 @@ struct vmbus_channel {
+ 	/* Allocated memory for ring buffer */
+ 	void *ringbuffer_pages;
+ 	u32 ringbuffer_pagecount;
++	u32 ringbuffer_send_offset;
+ 	struct hv_ring_buffer_info outbound;	/* send to parent */
+ 	struct hv_ring_buffer_info inbound;	/* receive from parent */
+ 
+@@ -987,6 +988,14 @@ struct vmbus_packet_mpb_array {
+ 	struct hv_mpb_array range;
+ } __packed;
+ 
++int vmbus_alloc_ring(struct vmbus_channel *channel,
++		     u32 send_size, u32 recv_size);
++void vmbus_free_ring(struct vmbus_channel *channel);
++
++int vmbus_connect_ring(struct vmbus_channel *channel,
++		       void (*onchannel_callback)(void *context),
++		       void *context);
++int vmbus_disconnect_ring(struct vmbus_channel *channel);
+ 
+ extern int vmbus_open(struct vmbus_channel *channel,
+ 			    u32 send_ringbuffersize,
