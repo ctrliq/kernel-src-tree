@@ -1,0 +1,446 @@
+GFS2: Non-recursive delete
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit d552a2b9b33eafdb5eb16c643e745deb564dda7f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d552a2b9.failed
+
+Implement truncate/delete as a non-recursive algorithm. The older
+algorithm was implemented with recursion to strip off each layer
+at a time (going by height, starting with the maximum height.
+This version tries to do the same thing but without recursion,
+and without needing to allocate new structures or lists in memory.
+
+For example, say you want to truncate a very large file to 1 byte,
+and its end-of-file metapath is: 0.505.463.428. The starting
+metapath would be 0.0.0.0. Since it's a truncate to non-zero, it
+needs to preserve that byte, and all metadata pointing to it.
+So it would start at 0.0.0.0, look up all its metadata buffers,
+then free all data blocks pointed to at the highest level.
+After that buffer is "swept", it moves on to 0.0.0.1, then
+0.0.0.2, etc., reading in buffers and sweeping them clean.
+When it gets to the end of the 0.0.0 metadata buffer (for 4K
+blocks the last valid one is 0.0.0.508), it backs up to the
+previous height and starts working on 0.0.1.0, then 0.0.1.1,
+and so forth. After it reaches the end and sweeps 0.0.1.508,
+it continues with 0.0.2.0, and so on. When that height is
+exhausted, and it reaches 0.0.508.508 it backs up another level,
+to 0.1.0.0, then 0.1.0.1, through 0.1.0.508. So it has to keep
+marching backwards and forwards through the metadata until it's
+all swept clean. Once it has all the data blocks freed, it
+lowers the strip height, and begins the process all over again,
+but with one less height. This time it sweeps 0.0.0 through
+0.505.463. When that's clean, it lowers the strip height again
+and works to free 0.505. Eventually it strips the lowest height, 0.
+For a delete or truncate to 0, all metadata for all heights of
+0.0.0.0 would be freed. For a truncate to 1 byte, 0.0.0.0 would
+be preserved.
+
+This isn't much different from normal integer incrementing,
+where an integer gets incremented from 0000 (0.0.0.0) to 3021
+(3.0.2.1). So 0000 gets increments to 0001, 0002, up to 0009,
+then on to 0010, 0011 up to 0099, then 0100 and so forth. It's
+just that each "digit" goes from 0 to 508 (for a total of 509
+pointers) rather than from 0 to 9.
+
+Note that the dinode will only have 483 pointers due to the
+dinode structure itself.
+
+Also note: this is just an example. These numbers (509 and 483)
+are based on a standard 4K block size. Smaller block sizes will
+yield smaller numbers of indirect pointers accordingly.
+
+The truncation process is accomplished with the help of two
+major functions and a few helper functions.
+
+Functions do_strip and recursive_scan are obsolete, so removed.
+
+New function sweep_bh_for_rgrps cleans a buffer_head pointed to
+by the given metapath and height. By cleaning, I mean it frees
+all blocks starting at the offset passed in metapath. It starts
+at the first block in the buffer pointed to by the metapath and
+identifies its resource group (rgrp). From there it frees all
+subsequent block pointers that lie within that rgrp. If it's
+already inside a transaction, it stays within it as long as it
+can. In other words, it doesn't close a transaction until it knows
+it's freed what it can from the resource group. In this way,
+multiple buffers may be cleaned in a single transaction, as long
+as those blocks in the buffer all lie within the same rgrp.
+
+If it's not in a transaction, it starts one. If the buffer_head
+has references to blocks within multiple rgrps, it frees all the
+blocks inside the first rgrp it finds, then closes the
+transaction. Then it repeats the cycle: identifies the next
+unfreed block, uses it to find its rgrp, then starts a new
+transaction for that set. It repeats this process repeatedly
+until the buffer_head contains no more references to any blocks
+past the given metapath.
+
+Function trunc_dealloc has been reworked into a finite state
+automaton. It has basically 3 active states:
+DEALLOC_MP_FULL, DEALLOC_MP_LOWER, and DEALLOC_FILL_MP:
+
+The DEALLOC_MP_FULL state implies the metapath has a full set
+of buffers out to the "shrink height", and therefore, it can
+call function sweep_bh_for_rgrps to free the blocks within the
+highest height of the metapath. If it's just swept the lowest
+level (or an error has occurred) the state machine is ended.
+Otherwise it proceeds to the DEALLOC_MP_LOWER state.
+
+The DEALLOC_MP_LOWER state implies we are finished with a given
+buffer_head, which may now be released, and therefore we are
+then missing some buffer information from the metapath. So we
+need to find more buffers to read in. In most cases, this is
+just a matter of releasing the buffer_head and moving to the
+next pointer from the previous height, so it may be read in and
+swept as well. If it can't find another non-null pointer to
+process, it checks whether it's reached the end of a height
+and needs to lower the strip height, or whether it still needs
+move forward through the previous height's metadata. In this
+state, all zero-pointers are skipped. From this state, it can
+only loop around (once more backing up another height) or,
+once a valid metapath is found (one that has non-zero
+pointers), proceed to state DEALLOC_FILL_MP.
+
+The DEALLOC_FILL_MP state implies that we have a metapath
+but not all its buffers are read in. So we must proceed to read
+in buffer_heads until the metapath has a valid buffer for every
+height. If the previous state backed us up 3 heights, we may
+need to read in a buffer, increment the height, then repeat the
+process until buffers have been read in for all required heights.
+If it's successful reading a buffer, and it's at the highest
+height we need, it proceeds back to the DEALLOC_MP_FULL state.
+If it's unable to fill in a buffer, (encounters a hole, etc.)
+it tries to find another non-zero block pointer. If they're all
+zero, it lowers the height and returns to the DEALLOC_MP_LOWER
+state. If it finds a good non-null pointer, it loops around and
+reads it in, while keeping the metapath in lock-step with the
+pointers it examines.
+
+The state machine runs until the truncation request is
+satisfied. Then any transactions are ended, the quota and
+statfs data are updated, and the function is complete.
+
+Helper function metaptr1 was introduced to be an easy way to
+determine the start of a buffer_head's indirect pointers.
+
+Helper function lookup_mp_height was introduced to find a
+metapath index and read in the buffer that corresponds to it.
+In this way, function lookup_metapath becomes a simple loop to
+call it for every height.
+
+Helper function fillup_metapath is similar to lookup_metapath
+except it can do partial lookups. If the state machine
+backed up multiple levels (like 2999 wrapping to 3000) it
+needs to find out the next starting point and start issuing
+metadata reads at that point.
+
+Helper function hptrs is a shortcut to determine how many
+pointers should be expected in a buffer. Height 0 is the dinode
+which has fewer pointers than the others.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+(cherry picked from commit d552a2b9b33eafdb5eb16c643e745deb564dda7f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/bmap.c
+diff --cc fs/gfs2/bmap.c
+index ad1971d69c1a,3814a60e0aea..000000000000
+--- a/fs/gfs2/bmap.c
++++ b/fs/gfs2/bmap.c
+@@@ -701,252 -754,6 +753,255 @@@ int gfs2_extent_map(struct inode *inode
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * do_strip - Look for a layer a particular layer of the file and strip it off
+ + * @ip: the inode
+ + * @dibh: the dinode buffer
+ + * @bh: A buffer of pointers
+ + * @top: The first pointer in the buffer
+ + * @bottom: One more than the last pointer
+ + * @height: the height this buffer is at
+ + * @data: a pointer to a struct strip_mine
+ + *
+ + * Returns: errno
+ + */
+ +
+ +static int do_strip(struct gfs2_inode *ip, struct buffer_head *dibh,
+ +		    struct buffer_head *bh, __be64 *top, __be64 *bottom,
+ +		    unsigned int height, struct strip_mine *sm)
+ +{
+ +	struct gfs2_sbd *sdp = GFS2_SB(&ip->i_inode);
+ +	struct gfs2_rgrp_list rlist;
+ +	struct gfs2_trans *tr;
+ +	u64 bn, bstart;
+ +	u32 blen, btotal;
+ +	__be64 *p;
+ +	unsigned int rg_blocks = 0;
+ +	int metadata;
+ +	unsigned int revokes = 0;
+ +	int x;
+ +	int error;
+ +	int jblocks_rqsted;
+ +
+ +	error = gfs2_rindex_update(sdp);
+ +	if (error)
+ +		return error;
+ +
+ +	if (!*top)
+ +		sm->sm_first = 0;
+ +
+ +	if (height != sm->sm_height)
+ +		return 0;
+ +
+ +	if (sm->sm_first) {
+ +		top++;
+ +		sm->sm_first = 0;
+ +	}
+ +
+ +	metadata = (height != ip->i_height - 1);
+ +	if (metadata)
+ +		revokes = (height) ? sdp->sd_inptrs : sdp->sd_diptrs;
+ +	else if (ip->i_depth)
+ +		revokes = sdp->sd_inptrs;
+ +
+ +	memset(&rlist, 0, sizeof(struct gfs2_rgrp_list));
+ +	bstart = 0;
+ +	blen = 0;
+ +
+ +	for (p = top; p < bottom; p++) {
+ +		if (!*p)
+ +			continue;
+ +
+ +		bn = be64_to_cpu(*p);
+ +
+ +		if (bstart + blen == bn)
+ +			blen++;
+ +		else {
+ +			if (bstart)
+ +				gfs2_rlist_add(ip, &rlist, bstart);
+ +
+ +			bstart = bn;
+ +			blen = 1;
+ +		}
+ +	}
+ +
+ +	if (bstart)
+ +		gfs2_rlist_add(ip, &rlist, bstart);
+ +	else
+ +		goto out; /* Nothing to do */
+ +
+ +	gfs2_rlist_alloc(&rlist, LM_ST_EXCLUSIVE);
+ +
+ +	for (x = 0; x < rlist.rl_rgrps; x++) {
+ +		struct gfs2_rgrpd *rgd;
+ +		rgd = rlist.rl_ghs[x].gh_gl->gl_object;
+ +		rg_blocks += rgd->rd_length;
+ +	}
+ +
+ +	error = gfs2_glock_nq_m(rlist.rl_rgrps, rlist.rl_ghs);
+ +	if (error)
+ +		goto out_rlist;
+ +
+ +	if (gfs2_rs_active(&ip->i_res)) /* needs to be done with the rgrp glock held */
+ +		gfs2_rs_deltree(&ip->i_res);
+ +
+ +restart:
+ +	jblocks_rqsted = rg_blocks + RES_DINODE +
+ +		RES_INDIRECT + RES_STATFS + RES_QUOTA +
+ +		gfs2_struct2blk(sdp, revokes, sizeof(u64));
+ +	if (jblocks_rqsted > atomic_read(&sdp->sd_log_thresh2))
+ +		jblocks_rqsted = atomic_read(&sdp->sd_log_thresh2);
+ +	error = gfs2_trans_begin(sdp, jblocks_rqsted, revokes);
+ +	if (error)
+ +		goto out_rg_gunlock;
+ +
+ +	tr = current->journal_info;
+ +	down_write(&ip->i_rw_mutex);
+ +
+ +	gfs2_trans_add_meta(ip->i_gl, dibh);
+ +	gfs2_trans_add_meta(ip->i_gl, bh);
+ +
+ +	bstart = 0;
+ +	blen = 0;
+ +	btotal = 0;
+ +
+ +	for (p = top; p < bottom; p++) {
+ +		if (!*p)
+ +			continue;
+ +
+ +		/* check for max reasonable journal transaction blocks */
+ +		if (tr->tr_num_buf_new + RES_STATFS +
+ +		    RES_QUOTA >= atomic_read(&sdp->sd_log_thresh2)) {
+ +			if (rg_blocks >= tr->tr_num_buf_new)
+ +				rg_blocks -= tr->tr_num_buf_new;
+ +			else
+ +				rg_blocks = 0;
+ +			break;
+ +		}
+ +
+ +		bn = be64_to_cpu(*p);
+ +
+ +		if (bstart + blen == bn)
+ +			blen++;
+ +		else {
+ +			if (bstart) {
+ +				__gfs2_free_blocks(ip, bstart, blen, metadata);
+ +				btotal += blen;
+ +			}
+ +
+ +			bstart = bn;
+ +			blen = 1;
+ +		}
+ +
+ +		*p = 0;
+ +		gfs2_add_inode_blocks(&ip->i_inode, -1);
+ +	}
+ +	if (p == bottom)
+ +		rg_blocks = 0;
+ +
+ +	if (bstart) {
+ +		__gfs2_free_blocks(ip, bstart, blen, metadata);
+ +		btotal += blen;
+ +	}
+ +
+ +	gfs2_statfs_change(sdp, 0, +btotal, 0);
+ +	gfs2_quota_change(ip, -(s64)btotal, ip->i_inode.i_uid,
+ +			  ip->i_inode.i_gid);
+ +
+ +	ip->i_inode.i_mtime = ip->i_inode.i_ctime = CURRENT_TIME;
+ +
+ +	gfs2_dinode_out(ip, dibh->b_data);
+ +
+ +	up_write(&ip->i_rw_mutex);
+ +
+ +	gfs2_trans_end(sdp);
+ +
+ +	if (rg_blocks)
+ +		goto restart;
+ +
+ +out_rg_gunlock:
+ +	gfs2_glock_dq_m(rlist.rl_rgrps, rlist.rl_ghs);
+ +out_rlist:
+ +	gfs2_rlist_free(&rlist);
+ +out:
+ +	return error;
+ +}
+ +
+ +/**
+ + * recursive_scan - recursively scan through the end of a file
+ + * @ip: the inode
+ + * @dibh: the dinode buffer
+ + * @mp: the path through the metadata to the point to start
+ + * @height: the height the recursion is at
+ + * @block: the indirect block to look at
+ + * @first: 1 if this is the first block
+ + * @sm: data opaque to this function to pass to @bc
+ + *
+ + * When this is first called @height and @block should be zero and
+ + * @first should be 1.
+ + *
+ + * Returns: errno
+ + */
+ +
+ +static int recursive_scan(struct gfs2_inode *ip, struct buffer_head *dibh,
+ +			  struct metapath *mp, unsigned int height,
+ +			  u64 block, int first, struct strip_mine *sm)
+ +{
+ +	struct gfs2_sbd *sdp = GFS2_SB(&ip->i_inode);
+ +	struct buffer_head *bh = NULL;
+ +	__be64 *top, *bottom;
+ +	u64 bn;
+ +	int error;
+ +	int mh_size = sizeof(struct gfs2_meta_header);
+ +
+ +	if (!height) {
+ +		error = gfs2_meta_inode_buffer(ip, &bh);
+ +		if (error)
+ +			return error;
+ +		dibh = bh;
+ +
+ +		top = (__be64 *)(bh->b_data + sizeof(struct gfs2_dinode)) + mp->mp_list[0];
+ +		bottom = (__be64 *)(bh->b_data + sizeof(struct gfs2_dinode)) + sdp->sd_diptrs;
+ +	} else {
+ +		error = gfs2_meta_indirect_buffer(ip, height, block, &bh);
+ +		if (error)
+ +			return error;
+ +
+ +		top = (__be64 *)(bh->b_data + mh_size) +
+ +				  (first ? mp->mp_list[height] : 0);
+ +
+ +		bottom = (__be64 *)(bh->b_data + mh_size) + sdp->sd_inptrs;
+ +	}
+ +
+ +	error = do_strip(ip, dibh, bh, top, bottom, height, sm);
+ +	if (error)
+ +		goto out;
+ +
+ +	if (height < ip->i_height - 1) {
+ +
+ +		gfs2_metapath_ra(ip->i_gl, bh, top);
+ +
+ +		for (; top < bottom; top++, first = 0) {
+ +			if (!*top)
+ +				continue;
+ +
+ +			bn = be64_to_cpu(*top);
+ +
+ +			error = recursive_scan(ip, dibh, mp, height + 1, bn,
+ +					       first, sm);
+ +			if (error)
+ +				break;
+ +		}
+ +	}
+ +out:
+ +	brelse(bh);
+ +	return error;
+ +}
+ +
+ +
+ +/**
+++=======
+++>>>>>>> d552a2b9b33e (GFS2: Non-recursive delete)
+   * gfs2_block_truncate_page - Deal with zeroing out data for truncate
+   *
+   * This is partly borrowed from ext3.
+* Unmerged path fs/gfs2/bmap.c
+diff --git a/fs/gfs2/rgrp.c b/fs/gfs2/rgrp.c
+index 1e6a443a7c59..cdac201c1a15 100644
+--- a/fs/gfs2/rgrp.c
++++ b/fs/gfs2/rgrp.c
+@@ -457,13 +457,6 @@ void gfs2_rgrp_verify(struct gfs2_rgrpd *rgd)
+ 	}
+ }
+ 
+-static inline int rgrp_contains_block(struct gfs2_rgrpd *rgd, u64 block)
+-{
+-	u64 first = rgd->rd_data0;
+-	u64 last = first + rgd->rd_data;
+-	return first <= block && block < last;
+-}
+-
+ /**
+  * gfs2_blk2rgrpd - Find resource group for a given data/meta block number
+  * @sdp: The GFS2 superblock
+diff --git a/fs/gfs2/rgrp.h b/fs/gfs2/rgrp.h
+index 817b58ffc68c..5b363f86df1a 100644
+--- a/fs/gfs2/rgrp.h
++++ b/fs/gfs2/rgrp.h
+@@ -83,5 +83,12 @@ static inline bool gfs2_rs_active(const struct gfs2_blkreserv *rs)
+ 	return rs && !RB_EMPTY_NODE(&rs->rs_node);
+ }
+ 
++static inline int rgrp_contains_block(struct gfs2_rgrpd *rgd, u64 block)
++{
++	u64 first = rgd->rd_data0;
++	u64 last = first + rgd->rd_data;
++	return first <= block && block < last;
++}
++
+ extern void check_and_update_goal(struct gfs2_inode *ip);
+ #endif /* __RGRP_DOT_H__ */
