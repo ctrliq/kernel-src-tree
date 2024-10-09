@@ -1,0 +1,197 @@
+scsi: qla2xxx: Recheck session state after RSCN
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Recheck session state after RSCN (Himanshu Madhani) [1547714]
+Rebuild_FUZZ: 93.18%
+commit-author Quinn Tran <quinn.tran@cavium.com>
+commit a07fc0a42e9ae76e93235f59b089986dc1b751c8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/a07fc0a4.failed
+
+When RSCN is delivered for specific remote port. Use ADISC to verify the
+session is still valid or not.
+
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit a07fc0a42e9ae76e93235f59b089986dc1b751c8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_init.c
+diff --cc drivers/scsi/qla2xxx/qla_init.c
+index da9c0caf8d85,30b3acacbfca..000000000000
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@@ -36,9 -36,11 +36,13 @@@ static int qla2x00_restart_isp(scsi_qla
+  static struct qla_chip_state_84xx *qla84xx_get_chip(struct scsi_qla_host *);
+  static int qla84xx_init_chip(scsi_qla_host_t *);
+  static int qla25xx_init_queues(struct qla_hw_data *);
+++<<<<<<< HEAD
+ +static int qla24xx_post_gpdb_work(struct scsi_qla_host *, fc_port_t *, u8);
+++=======
++ static int qla24xx_post_prli_work(struct scsi_qla_host*, fc_port_t *);
+++>>>>>>> a07fc0a42e9a (scsi: qla2xxx: Recheck session state after RSCN)
+  static void qla24xx_handle_plogi_done_event(struct scsi_qla_host *,
+      struct event_arg *);
+ -static void qla24xx_handle_prli_done_event(struct scsi_qla_host *,
+ -    struct event_arg *);
+  
+  /* SRB Extensions ---------------------------------------------------------- */
+  
+@@@ -665,8 -675,105 +669,110 @@@ gpd_error_out
+  	sp->free(sp);
+  }
+  
+++<<<<<<< HEAD
+ +static int qla24xx_post_gpdb_work(struct scsi_qla_host *vha, fc_port_t *fcport,
+ +    u8 opt)
+++=======
++ static int qla24xx_post_prli_work(struct scsi_qla_host *vha, fc_port_t *fcport)
++ {
++ 	struct qla_work_evt *e;
++ 
++ 	e = qla2x00_alloc_work(vha, QLA_EVT_PRLI);
++ 	if (!e)
++ 		return QLA_FUNCTION_FAILED;
++ 
++ 	e->u.fcport.fcport = fcport;
++ 
++ 	return qla2x00_post_work(vha, e);
++ }
++ 
++ static void
++ qla2x00_async_prli_sp_done(void *ptr, int res)
++ {
++ 	srb_t *sp = ptr;
++ 	struct scsi_qla_host *vha = sp->vha;
++ 	struct srb_iocb *lio = &sp->u.iocb_cmd;
++ 	struct event_arg ea;
++ 
++ 	ql_dbg(ql_dbg_disc, vha, 0x2129,
++ 	    "%s %8phC res %d \n", __func__,
++ 	    sp->fcport->port_name, res);
++ 
++ 	sp->fcport->flags &= ~FCF_ASYNC_SENT;
++ 
++ 	if (!test_bit(UNLOADING, &vha->dpc_flags)) {
++ 		memset(&ea, 0, sizeof(ea));
++ 		ea.event = FCME_PRLI_DONE;
++ 		ea.fcport = sp->fcport;
++ 		ea.data[0] = lio->u.logio.data[0];
++ 		ea.data[1] = lio->u.logio.data[1];
++ 		ea.iop[0] = lio->u.logio.iop[0];
++ 		ea.iop[1] = lio->u.logio.iop[1];
++ 		ea.sp = sp;
++ 
++ 		qla2x00_fcport_event_handler(vha, &ea);
++ 	}
++ 
++ 	sp->free(sp);
++ }
++ 
++ int
++ qla24xx_async_prli(struct scsi_qla_host *vha, fc_port_t *fcport)
++ {
++ 	srb_t *sp;
++ 	struct srb_iocb *lio;
++ 	int rval = QLA_FUNCTION_FAILED;
++ 
++ 	if (!vha->flags.online)
++ 		return rval;
++ 
++ 	if (fcport->fw_login_state == DSC_LS_PLOGI_PEND ||
++ 	    fcport->fw_login_state == DSC_LS_PLOGI_COMP ||
++ 	    fcport->fw_login_state == DSC_LS_PRLI_PEND)
++ 		return rval;
++ 
++ 	sp = qla2x00_get_sp(vha, fcport, GFP_KERNEL);
++ 	if (!sp)
++ 		return rval;
++ 
++ 	fcport->flags |= FCF_ASYNC_SENT;
++ 	fcport->logout_completed = 0;
++ 
++ 	sp->type = SRB_PRLI_CMD;
++ 	sp->name = "prli";
++ 	qla2x00_init_timer(sp, qla2x00_get_async_timeout(vha) + 2);
++ 
++ 	lio = &sp->u.iocb_cmd;
++ 	lio->timeout = qla2x00_async_iocb_timeout;
++ 	sp->done = qla2x00_async_prli_sp_done;
++ 	lio->u.logio.flags = 0;
++ 
++ 	if  (fcport->fc4f_nvme)
++ 		lio->u.logio.flags |= SRB_LOGIN_NVME_PRLI;
++ 
++ 	rval = qla2x00_start_sp(sp);
++ 	if (rval != QLA_SUCCESS) {
++ 		fcport->flags &= ~FCF_ASYNC_SENT;
++ 		fcport->flags |= FCF_LOGIN_NEEDED;
++ 		set_bit(RELOGIN_NEEDED, &vha->dpc_flags);
++ 		goto done_free_sp;
++ 	}
++ 
++ 	ql_dbg(ql_dbg_disc, vha, 0x211b,
++ 	    "Async-prli - %8phC hdl=%x, loopid=%x portid=%06x retries=%d.\n",
++ 	    fcport->port_name, sp->handle, fcport->loop_id,
++ 	    fcport->d_id.b24, fcport->login_retry);
++ 
++ 	return rval;
++ 
++ done_free_sp:
++ 	sp->free(sp);
++ 	fcport->flags &= ~FCF_ASYNC_SENT;
++ 	return rval;
++ }
++ 
++ int qla24xx_post_gpdb_work(struct scsi_qla_host *vha, fc_port_t *fcport, u8 opt)
+++>>>>>>> a07fc0a42e9a (scsi: qla2xxx: Recheck session state after RSCN)
+  {
+  	struct qla_work_evt *e;
+  
+diff --git a/drivers/scsi/qla2xxx/qla_gbl.h b/drivers/scsi/qla2xxx/qla_gbl.h
+index 547baeb17bb1..78dacf15ce17 100644
+--- a/drivers/scsi/qla2xxx/qla_gbl.h
++++ b/drivers/scsi/qla2xxx/qla_gbl.h
+@@ -105,7 +105,7 @@ int qla24xx_post_newsess_work(struct scsi_qla_host *, port_id_t *, u8 *,
+     void *);
+ int qla24xx_fcport_handle_login(struct scsi_qla_host *, fc_port_t *);
+ int qla24xx_detect_sfp(scsi_qla_host_t *vha);
+-
++int qla24xx_post_gpdb_work(struct scsi_qla_host *, fc_port_t *, u8);
+ /*
+  * Global Data in qla_os.c source file.
+  */
+diff --git a/drivers/scsi/qla2xxx/qla_gs.c b/drivers/scsi/qla2xxx/qla_gs.c
+index 194ce61856ea..8634d6a585dc 100644
+--- a/drivers/scsi/qla2xxx/qla_gs.c
++++ b/drivers/scsi/qla2xxx/qla_gs.c
+@@ -2797,13 +2797,19 @@ void qla24xx_handle_gidpn_event(scsi_qla_host_t *vha, struct event_arg *ea)
+ 				case MODE_INITIATOR:
+ 				case MODE_DUAL:
+ 				default:
++					ql_dbg(ql_dbg_disc, vha, 0x201f,
++					    "%s %d %8phC post %s\n", __func__,
++					    __LINE__, fcport->port_name,
++					    (atomic_read(&fcport->state) ==
++					    FCS_ONLINE) ? "gpdb" : "gnl");
++
+ 					if (atomic_read(&fcport->state) ==
+ 					    FCS_ONLINE)
+-						break;
+-					ql_dbg(ql_dbg_disc, vha, 0x201f,
+-					    "%s %d %8phC post gnl\n",
+-					    __func__, __LINE__, fcport->port_name);
+-					qla24xx_post_gnl_work(vha, fcport);
++						qla24xx_post_gpdb_work(vha,
++						    fcport, PDO_FORCE_ADISC);
++					else
++						qla24xx_post_gnl_work(vha,
++						    fcport);
+ 					break;
+ 				}
+ 			} else { /* fcport->d_id.b24 != ea->id.b24 */
+* Unmerged path drivers/scsi/qla2xxx/qla_init.c
