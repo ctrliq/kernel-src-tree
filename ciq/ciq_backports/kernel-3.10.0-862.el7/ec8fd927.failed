@@ -1,0 +1,329 @@
+net/mlx5e: IPoIB, Underlay QP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: IPoIB, Underlay QP (Don Dutile) [1385325 1499362]
+Rebuild_FUZZ: 92.59%
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit ec8fd927b7a9006425f34dc51880e9fed582c4a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ec8fd927.failed
+
+Create IPoIB underlay QP needed by the IPoIB netdevice profile for RSS
+and TX HW context to perform on IPoIB traffic.
+
+Reset the underlay QP on dev_uninit ndo to stop IPoIB traffic going
+through this QP when the ULP IPoIB decides to cleanup.
+
+Implement attach/detach mcast RDMA netdev callbacks for later RDMA
+netdev use.
+
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Reviewed-by: Erez Shitrit <erezsh@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ec8fd927b7a9006425f34dc51880e9fed582c4a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/ipoib.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/ipoib.c
+index 2f65927a8d03,bd56f36066b3..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib.c
+@@@ -34,6 -34,20 +34,23 @@@
+  #include "en.h"
+  #include "ipoib.h"
+  
+++<<<<<<< HEAD
+++=======
++ #define IB_DEFAULT_Q_KEY   0xb1b
++ 
++ static int mlx5i_open(struct net_device *netdev);
++ static int mlx5i_close(struct net_device *netdev);
++ static int  mlx5i_dev_init(struct net_device *dev);
++ static void mlx5i_dev_cleanup(struct net_device *dev);
++ 
++ static const struct net_device_ops mlx5i_netdev_ops = {
++ 	.ndo_open                = mlx5i_open,
++ 	.ndo_stop                = mlx5i_close,
++ 	.ndo_init                = mlx5i_dev_init,
++ 	.ndo_uninit              = mlx5i_dev_cleanup,
++ };
++ 
+++>>>>>>> ec8fd927b7a9 (net/mlx5e: IPoIB, Underlay QP)
+  /* IPoIB mlx5 netdev profile */
+  
+  /* Called directly after IPoIB netdevice was created to initialize SW structs */
+@@@ -54,15 -85,144 +71,152 @@@ static void mlx5i_cleanup(struct mlx5e_
+  	/* Do nothing .. */
+  }
+  
++ #define MLX5_QP_ENHANCED_ULP_STATELESS_MODE 2
++ 
++ static int mlx5i_create_underlay_qp(struct mlx5_core_dev *mdev, struct mlx5_core_qp *qp)
++ {
++ 	struct mlx5_qp_context *context = NULL;
++ 	u32 *in = NULL;
++ 	void *addr_path;
++ 	int ret = 0;
++ 	int inlen;
++ 	void *qpc;
++ 
++ 	inlen = MLX5_ST_SZ_BYTES(create_qp_in);
++ 	in = mlx5_vzalloc(inlen);
++ 	if (!in)
++ 		return -ENOMEM;
++ 
++ 	qpc = MLX5_ADDR_OF(create_qp_in, in, qpc);
++ 	MLX5_SET(qpc, qpc, st, MLX5_QP_ST_UD);
++ 	MLX5_SET(qpc, qpc, pm_state, MLX5_QP_PM_MIGRATED);
++ 	MLX5_SET(qpc, qpc, ulp_stateless_offload_mode,
++ 		 MLX5_QP_ENHANCED_ULP_STATELESS_MODE);
++ 
++ 	addr_path = MLX5_ADDR_OF(qpc, qpc, primary_address_path);
++ 	MLX5_SET(ads, addr_path, port, 1);
++ 	MLX5_SET(ads, addr_path, grh, 1);
++ 
++ 	ret = mlx5_core_create_qp(mdev, qp, in, inlen);
++ 	if (ret) {
++ 		mlx5_core_err(mdev, "Failed creating IPoIB QP err : %d\n", ret);
++ 		goto out;
++ 	}
++ 
++ 	/* QP states */
++ 	context = kzalloc(sizeof(*context), GFP_KERNEL);
++ 	if (!context) {
++ 		ret = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	context->flags = cpu_to_be32(MLX5_QP_PM_MIGRATED << 11);
++ 	context->pri_path.port = 1;
++ 	context->qkey = cpu_to_be32(IB_DEFAULT_Q_KEY);
++ 
++ 	ret = mlx5_core_qp_modify(mdev, MLX5_CMD_OP_RST2INIT_QP, 0, context, qp);
++ 	if (ret) {
++ 		mlx5_core_err(mdev, "Failed to modify qp RST2INIT, err: %d\n", ret);
++ 		goto out;
++ 	}
++ 	memset(context, 0, sizeof(*context));
++ 
++ 	ret = mlx5_core_qp_modify(mdev, MLX5_CMD_OP_INIT2RTR_QP, 0, context, qp);
++ 	if (ret) {
++ 		mlx5_core_err(mdev, "Failed to modify qp INIT2RTR, err: %d\n", ret);
++ 		goto out;
++ 	}
++ 
++ 	ret = mlx5_core_qp_modify(mdev, MLX5_CMD_OP_RTR2RTS_QP, 0, context, qp);
++ 	if (ret) {
++ 		mlx5_core_err(mdev, "Failed to modify qp RTR2RTS, err: %d\n", ret);
++ 		goto out;
++ 	}
++ 
++ out:
++ 	kfree(context);
++ 	kvfree(in);
++ 	return ret;
++ }
++ 
++ static void mlx5i_destroy_underlay_qp(struct mlx5_core_dev *mdev, struct mlx5_core_qp *qp)
++ {
++ 	mlx5_core_destroy_qp(mdev, qp);
++ }
++ 
+  static int mlx5i_init_tx(struct mlx5e_priv *priv)
+  {
+++<<<<<<< HEAD
+ +	/* TODO: Create IPoIB underlay QP */
+ +	/* TODO: create IPoIB TX HW TIS */
+++=======
++ 	struct mlx5i_priv *ipriv = priv->ppriv;
++ 	int err;
++ 
++ 	err = mlx5i_create_underlay_qp(priv->mdev, &ipriv->qp);
++ 	if (err) {
++ 		mlx5_core_warn(priv->mdev, "create underlay QP failed, %d\n", err);
++ 		return err;
++ 	}
++ 
++ 	err = mlx5e_create_tis(priv->mdev, 0 /* tc */, ipriv->qp.qpn, &priv->tisn[0]);
++ 	if (err) {
++ 		mlx5_core_warn(priv->mdev, "create tis failed, %d\n", err);
++ 		return err;
++ 	}
++ 
+++>>>>>>> ec8fd927b7a9 (net/mlx5e: IPoIB, Underlay QP)
+  	return 0;
+  }
+  
+ -void mlx5i_cleanup_tx(struct mlx5e_priv *priv)
+ +static void mlx5i_cleanup_tx(struct mlx5e_priv *priv)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct mlx5i_priv *ipriv = priv->ppriv;
++ 
++ 	mlx5e_destroy_tis(priv->mdev, priv->tisn[0]);
++ 	mlx5i_destroy_underlay_qp(priv->mdev, &ipriv->qp);
++ }
++ 
++ static int mlx5i_create_flow_steering(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5i_priv *ipriv = priv->ppriv;
++ 	int err;
++ 
++ 	priv->fs.ns = mlx5_get_flow_namespace(priv->mdev,
++ 					       MLX5_FLOW_NAMESPACE_KERNEL);
++ 
++ 	if (!priv->fs.ns)
++ 		return -EINVAL;
++ 
++ 	err = mlx5e_arfs_create_tables(priv);
++ 	if (err) {
++ 		netdev_err(priv->netdev, "Failed to create arfs tables, err=%d\n",
++ 			   err);
++ 		priv->netdev->hw_features &= ~NETIF_F_NTUPLE;
++ 	}
++ 
++ 	err = mlx5e_create_ttc_table(priv, ipriv->qp.qpn);
++ 	if (err) {
++ 		netdev_err(priv->netdev, "Failed to create ttc table, err=%d\n",
++ 			   err);
++ 		goto err_destroy_arfs_tables;
++ 	}
++ 
++ 	return 0;
++ 
++ err_destroy_arfs_tables:
++ 	mlx5e_arfs_destroy_tables(priv);
++ 
++ 	return err;
++ }
++ 
++ static void mlx5i_destroy_flow_steering(struct mlx5e_priv *priv)
++ {
++ 	mlx5e_destroy_ttc_table(priv);
++ 	mlx5e_arfs_destroy_tables(priv);
+++>>>>>>> ec8fd927b7a9 (net/mlx5e: IPoIB, Underlay QP)
+  }
+  
+  static int mlx5i_init_rx(struct mlx5e_priv *priv)
+@@@ -89,7 -285,113 +243,116 @@@ static const struct mlx5e_profile mlx5i
+  	.max_tc		   = MLX5I_MAX_NUM_TC,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* mlx5i netdev NDos */
++ 
++ static int mlx5i_dev_init(struct net_device *dev)
++ {
++ 	struct mlx5e_priv    *priv   = mlx5i_epriv(dev);
++ 	struct mlx5i_priv    *ipriv  = priv->ppriv;
++ 
++ 	/* Set dev address using underlay QP */
++ 	dev->dev_addr[1] = (ipriv->qp.qpn >> 16) & 0xff;
++ 	dev->dev_addr[2] = (ipriv->qp.qpn >>  8) & 0xff;
++ 	dev->dev_addr[3] = (ipriv->qp.qpn) & 0xff;
++ 
++ 	return 0;
++ }
++ 
++ static void mlx5i_dev_cleanup(struct net_device *dev)
++ {
++ 	struct mlx5e_priv    *priv   = mlx5i_epriv(dev);
++ 	struct mlx5_core_dev *mdev   = priv->mdev;
++ 	struct mlx5i_priv    *ipriv  = priv->ppriv;
++ 	struct mlx5_qp_context context;
++ 
++ 	/* detach qp from flow-steering by reset it */
++ 	mlx5_core_qp_modify(mdev, MLX5_CMD_OP_2RST_QP, 0, &context, &ipriv->qp);
++ }
++ 
++ static int mlx5i_open(struct net_device *netdev)
++ {
++ 	struct mlx5e_priv *priv = mlx5i_epriv(netdev);
++ 	int err;
++ 
++ 	mutex_lock(&priv->state_lock);
++ 
++ 	set_bit(MLX5E_STATE_OPENED, &priv->state);
++ 
++ 	err = mlx5e_open_channels(priv, &priv->channels);
++ 	if (err)
++ 		goto err_clear_state_opened_flag;
++ 
++ 	mlx5e_refresh_tirs(priv, false);
++ 	mlx5e_activate_priv_channels(priv);
++ 	mutex_unlock(&priv->state_lock);
++ 	return 0;
++ 
++ err_clear_state_opened_flag:
++ 	clear_bit(MLX5E_STATE_OPENED, &priv->state);
++ 	mutex_unlock(&priv->state_lock);
++ 	return err;
++ }
++ 
++ static int mlx5i_close(struct net_device *netdev)
++ {
++ 	struct mlx5e_priv *priv = mlx5i_epriv(netdev);
++ 
++ 	/* May already be CLOSED in case a previous configuration operation
++ 	 * (e.g RX/TX queue size change) that involves close&open failed.
++ 	 */
++ 	mutex_lock(&priv->state_lock);
++ 
++ 	if (!test_bit(MLX5E_STATE_OPENED, &priv->state))
++ 		goto unlock;
++ 
++ 	clear_bit(MLX5E_STATE_OPENED, &priv->state);
++ 
++ 	netif_carrier_off(priv->netdev);
++ 	mlx5e_deactivate_priv_channels(priv);
++ 	mlx5e_close_channels(&priv->channels);
++ unlock:
++ 	mutex_unlock(&priv->state_lock);
++ 	return 0;
++ }
++ 
+++>>>>>>> ec8fd927b7a9 (net/mlx5e: IPoIB, Underlay QP)
+  /* IPoIB RDMA netdev callbacks */
++ int mlx5i_attach_mcast(struct net_device *netdev, struct ib_device *hca,
++ 		       union ib_gid *gid, u16 lid, int set_qkey)
++ {
++ 	struct mlx5e_priv    *epriv = mlx5i_epriv(netdev);
++ 	struct mlx5_core_dev *mdev  = epriv->mdev;
++ 	struct mlx5i_priv    *ipriv = epriv->ppriv;
++ 	int err;
++ 
++ 	mlx5_core_dbg(mdev, "attaching QPN 0x%x, MGID %pI6\n", ipriv->qp.qpn, gid->raw);
++ 	err = mlx5_core_attach_mcg(mdev, gid, ipriv->qp.qpn);
++ 	if (err)
++ 		mlx5_core_warn(mdev, "failed attaching QPN 0x%x, MGID %pI6\n",
++ 			       ipriv->qp.qpn, gid->raw);
++ 
++ 	return err;
++ }
++ 
++ int mlx5i_detach_mcast(struct net_device *netdev, struct ib_device *hca,
++ 		       union ib_gid *gid, u16 lid)
++ {
++ 	struct mlx5e_priv    *epriv = mlx5i_epriv(netdev);
++ 	struct mlx5_core_dev *mdev  = epriv->mdev;
++ 	struct mlx5i_priv    *ipriv = epriv->ppriv;
++ 	int err;
++ 
++ 	mlx5_core_dbg(mdev, "detaching QPN 0x%x, MGID %pI6\n", ipriv->qp.qpn, gid->raw);
++ 
++ 	err = mlx5_core_detach_mcg(mdev, gid, ipriv->qp.qpn);
++ 	if (err)
++ 		mlx5_core_dbg(mdev, "failed dettaching QPN 0x%x, MGID %pI6\n",
++ 			      ipriv->qp.qpn, gid->raw);
++ 
++ 	return err;
++ }
+  
+  static int mlx5i_check_required_hca_cap(struct mlx5_core_dev *mdev)
+  {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/ipoib.c
