@@ -1,0 +1,307 @@
+netfilter: ipset: Support comments for ipset entries in the core.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] netfilter: ipset: Support comments for ipset entries in the core (Stefano Brivio) [1557599]
+Rebuild_FUZZ: 99.22%
+commit-author Oliver Smith <oliver@8.c.9.b.0.7.4.0.1.0.0.2.ip6.arpa>
+commit 68b63f08d22f23161c43cd2417104aa213ff877f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/68b63f08.failed
+
+This adds the core support for having comments on ipset entries.
+
+The comments are stored as standard null-terminated strings in
+dynamically allocated memory after being passed to the kernel. As a
+result of this, code has been added to the generic destroy function to
+iterate all extensions and call that extension's destroy task if the set
+has that extension activated, and if such a task is defined.
+
+	Signed-off-by: Oliver Smith <oliver@8.c.9.b.0.7.4.0.1.0.0.2.ip6.arpa>
+	Signed-off-by: Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+(cherry picked from commit 68b63f08d22f23161c43cd2417104aa213ff877f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netfilter/ipset/ip_set.h
+#	include/uapi/linux/netfilter/ipset/ip_set.h
+#	net/netfilter/ipset/ip_set_core.c
+diff --cc include/linux/netfilter/ipset/ip_set.h
+index 1309bde24e27,407f84df6a47..000000000000
+--- a/include/linux/netfilter/ipset/ip_set.h
++++ b/include/linux/netfilter/ipset/ip_set.h
+@@@ -49,11 -49,15 +49,19 @@@ enum ip_set_feature 
+  
+  /* Set extensions */
+  enum ip_set_extension {
+ -	IPSET_EXT_BIT_TIMEOUT = 0,
+ +	IPSET_EXT_NONE = 0,
+ +	IPSET_EXT_BIT_TIMEOUT = 1,
+  	IPSET_EXT_TIMEOUT = (1 << IPSET_EXT_BIT_TIMEOUT),
+ -	IPSET_EXT_BIT_COUNTER = 1,
+ +	IPSET_EXT_BIT_COUNTER = 2,
+  	IPSET_EXT_COUNTER = (1 << IPSET_EXT_BIT_COUNTER),
+++<<<<<<< HEAD
+++=======
++ 	IPSET_EXT_BIT_COMMENT = 2,
++ 	IPSET_EXT_COMMENT = (1 << IPSET_EXT_BIT_COMMENT),
++ 	/* Mark set with an extension which needs to call destroy */
++ 	IPSET_EXT_BIT_DESTROY = 7,
++ 	IPSET_EXT_DESTROY = (1 << IPSET_EXT_BIT_DESTROY),
+++>>>>>>> 68b63f08d22f (netfilter: ipset: Support comments for ipset entries in the core.)
+  };
+  
+  #define SET_WITH_TIMEOUT(s)	((s)->extensions & IPSET_EXT_TIMEOUT)
+@@@ -70,10 -89,28 +80,33 @@@ struct ip_set_ext 
+  	u64 packets;
+  	u64 bytes;
+  	u32 timeout;
++ 	char *comment;
+  };
+  
+++<<<<<<< HEAD
+ +struct ip_set;
+ +
+++=======
++ struct ip_set_counter {
++ 	atomic64_t bytes;
++ 	atomic64_t packets;
++ };
++ 
++ struct ip_set_comment {
++ 	char *str;
++ };
++ 
++ struct ip_set;
++ 
++ #define ext_timeout(e, s)	\
++ (unsigned long *)(((void *)(e)) + (s)->offset[IPSET_EXT_ID_TIMEOUT])
++ #define ext_counter(e, s)	\
++ (struct ip_set_counter *)(((void *)(e)) + (s)->offset[IPSET_EXT_ID_COUNTER])
++ #define ext_comment(e, s)	\
++ (struct ip_set_comment *)(((void *)(e)) + (s)->offset[IPSET_EXT_ID_COMMENT])
++ 
++ 
+++>>>>>>> 68b63f08d22f (netfilter: ipset: Support comments for ipset entries in the core.)
+  typedef int (*ipset_adtfn)(struct ip_set *set, void *value,
+  			   const struct ip_set_ext *ext,
+  			   struct ip_set_ext *mext, u32 cmdflags);
+@@@ -188,11 -226,36 +221,41 @@@ struct ip_set 
+  	void *data;
+  };
+  
+ +struct ip_set_counter {
+ +	atomic64_t bytes;
+ +	atomic64_t packets;
+ +};
+ +
++ static inline void
++ ip_set_ext_destroy(struct ip_set *set, void *data)
++ {
++ 	/* Check that the extension is enabled for the set and
++ 	 * call it's destroy function for its extension part in data.
++ 	 */
++ 	if (SET_WITH_COMMENT(set))
++ 		ip_set_extensions[IPSET_EXT_ID_COMMENT].destroy(
++ 			ext_comment(data, set));
++ }
++ 
++ static inline int
++ ip_set_put_flags(struct sk_buff *skb, struct ip_set *set)
++ {
++ 	u32 cadt_flags = 0;
++ 
++ 	if (SET_WITH_TIMEOUT(set))
++ 		if (unlikely(nla_put_net32(skb, IPSET_ATTR_TIMEOUT,
++ 					   htonl(set->timeout))))
++ 			return -EMSGSIZE;
++ 	if (SET_WITH_COUNTER(set))
++ 		cadt_flags |= IPSET_FLAG_WITH_COUNTERS;
++ 	if (SET_WITH_COMMENT(set))
++ 		cadt_flags |= IPSET_FLAG_WITH_COMMENT;
++ 
++ 	if (!cadt_flags)
++ 		return 0;
++ 	return nla_put_net32(skb, IPSET_ATTR_CADT_FLAGS, htonl(cadt_flags));
++ }
++ 
+  static inline void
+  ip_set_add_bytes(u64 bytes, struct ip_set_counter *counter)
+  {
+@@@ -395,14 -459,17 +458,15 @@@ bitmap_bytes(u32 a, u32 b
+  }
+  
+  #include <linux/netfilter/ipset/ip_set_timeout.h>
++ #include <linux/netfilter/ipset/ip_set_comment.h>
+  
+ -#define IP_SET_INIT_KEXT(skb, opt, set)			\
+ +#define IP_SET_INIT_KEXT(skb, opt, map)			\
+  	{ .bytes = (skb)->len, .packets = 1,		\
+ -	  .timeout = ip_set_adt_opt_timeout(opt, set) }
+ +	  .timeout = ip_set_adt_opt_timeout(opt, map) }
+  
+ -#define IP_SET_INIT_UEXT(set)				\
+ +#define IP_SET_INIT_UEXT(map)				\
+  	{ .bytes = ULLONG_MAX, .packets = ULLONG_MAX,	\
+ -	  .timeout = (set)->timeout }
+ -
+ -#define IP_SET_INIT_CIDR(a, b) ((a) ? (a) : (b))
+ +	  .timeout = (map)->timeout }
+  
+  #define IPSET_CONCAT(a, b)		a##b
+  #define IPSET_TOKEN(a, b)		IPSET_CONCAT(a, b)
+diff --cc include/uapi/linux/netfilter/ipset/ip_set.h
+index e3bf405d4779,25d3b2f79c02..000000000000
+--- a/include/uapi/linux/netfilter/ipset/ip_set.h
++++ b/include/uapi/linux/netfilter/ipset/ip_set.h
+@@@ -110,11 -112,7 +112,15 @@@ enum 
+  	IPSET_ATTR_IFACE,
+  	IPSET_ATTR_BYTES,
+  	IPSET_ATTR_PACKETS,
+++<<<<<<< HEAD
+ +	__RH_RESERVED_IPSET_ATTR_COMMENT,
+ +	__RH_RESERVED_IPSET_ATTR_SKBMARK,
+ +	__RH_RESERVED_IPSET_ATTR_SKBPRIO,
+ +	__RH_RESERVED_IPSET_ATTR_SKBQUEUE,
+ +	IPSET_ATTR_PAD,
+++=======
++ 	IPSET_ATTR_COMMENT,
+++>>>>>>> 68b63f08d22f (netfilter: ipset: Support comments for ipset entries in the core.)
+  	__IPSET_ATTR_ADT_MAX,
+  };
+  #define IPSET_ATTR_ADT_MAX	(__IPSET_ATTR_ADT_MAX - 1)
+diff --cc net/netfilter/ipset/ip_set_core.c
+index 99fcd252e259,3bf9a3d29dff..000000000000
+--- a/net/netfilter/ipset/ip_set_core.c
++++ b/net/netfilter/ipset/ip_set_core.c
+@@@ -324,6 -315,60 +324,63 @@@ ip_set_get_ipaddr6(struct nlattr *nla, 
+  }
+  EXPORT_SYMBOL_GPL(ip_set_get_ipaddr6);
+  
+++<<<<<<< HEAD
+++=======
++ typedef void (*destroyer)(void *);
++ /* ipset data extension types, in size order */
++ 
++ const struct ip_set_ext_type ip_set_extensions[] = {
++ 	[IPSET_EXT_ID_COUNTER] = {
++ 		.type	= IPSET_EXT_COUNTER,
++ 		.flag	= IPSET_FLAG_WITH_COUNTERS,
++ 		.len	= sizeof(struct ip_set_counter),
++ 		.align	= __alignof__(struct ip_set_counter),
++ 	},
++ 	[IPSET_EXT_ID_TIMEOUT] = {
++ 		.type	= IPSET_EXT_TIMEOUT,
++ 		.len	= sizeof(unsigned long),
++ 		.align	= __alignof__(unsigned long),
++ 	},
++ 	[IPSET_EXT_ID_COMMENT] = {
++ 		.type	 = IPSET_EXT_COMMENT | IPSET_EXT_DESTROY,
++ 		.flag	 = IPSET_FLAG_WITH_COMMENT,
++ 		.len	 = sizeof(struct ip_set_comment),
++ 		.align	 = __alignof__(struct ip_set_comment),
++ 		.destroy = (destroyer) ip_set_comment_free,
++ 	},
++ };
++ EXPORT_SYMBOL_GPL(ip_set_extensions);
++ 
++ static inline bool
++ add_extension(enum ip_set_ext_id id, u32 flags, struct nlattr *tb[])
++ {
++ 	return ip_set_extensions[id].flag ?
++ 		(flags & ip_set_extensions[id].flag) :
++ 		!!tb[IPSET_ATTR_TIMEOUT];
++ }
++ 
++ size_t
++ ip_set_elem_len(struct ip_set *set, struct nlattr *tb[], size_t len)
++ {
++ 	enum ip_set_ext_id id;
++ 	size_t offset = 0;
++ 	u32 cadt_flags = 0;
++ 
++ 	if (tb[IPSET_ATTR_CADT_FLAGS])
++ 		cadt_flags = ip_set_get_h32(tb[IPSET_ATTR_CADT_FLAGS]);
++ 	for (id = 0; id < IPSET_EXT_ID_MAX; id++) {
++ 		if (!add_extension(id, cadt_flags, tb))
++ 			continue;
++ 		offset += ALIGN(len + offset, ip_set_extensions[id].align);
++ 		set->offset[id] = offset;
++ 		set->extensions |= ip_set_extensions[id].type;
++ 		offset += ip_set_extensions[id].len;
++ 	}
++ 	return len + offset;
++ }
++ EXPORT_SYMBOL_GPL(ip_set_elem_len);
++ 
+++>>>>>>> 68b63f08d22f (netfilter: ipset: Support comments for ipset entries in the core.)
+  int
+  ip_set_get_extensions(struct ip_set *set, struct nlattr *tb[],
+  		      struct ip_set_ext *ext)
+* Unmerged path include/linux/netfilter/ipset/ip_set.h
+diff --git a/include/linux/netfilter/ipset/ip_set_comment.h b/include/linux/netfilter/ipset/ip_set_comment.h
+new file mode 100644
+index 000000000000..21217ea008d7
+--- /dev/null
++++ b/include/linux/netfilter/ipset/ip_set_comment.h
+@@ -0,0 +1,57 @@
++#ifndef _IP_SET_COMMENT_H
++#define _IP_SET_COMMENT_H
++
++/* Copyright (C) 2013 Oliver Smith <oliver@8.c.9.b.0.7.4.0.1.0.0.2.ip6.arpa>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#ifdef __KERNEL__
++
++static inline char*
++ip_set_comment_uget(struct nlattr *tb)
++{
++	return nla_data(tb);
++}
++
++static inline void
++ip_set_init_comment(struct ip_set_comment *comment,
++		    const struct ip_set_ext *ext)
++{
++	size_t len = ext->comment ? strlen(ext->comment) : 0;
++
++	if (unlikely(comment->str)) {
++		kfree(comment->str);
++		comment->str = NULL;
++	}
++	if (!len)
++		return;
++	if (unlikely(len > IPSET_MAX_COMMENT_SIZE))
++		len = IPSET_MAX_COMMENT_SIZE;
++	comment->str = kzalloc(len + 1, GFP_ATOMIC);
++	if (unlikely(!comment->str))
++		return;
++	strlcpy(comment->str, ext->comment, len + 1);
++}
++
++static inline int
++ip_set_put_comment(struct sk_buff *skb, struct ip_set_comment *comment)
++{
++	if (!comment->str)
++		return 0;
++	return nla_put_string(skb, IPSET_ATTR_COMMENT, comment->str);
++}
++
++static inline void
++ip_set_comment_free(struct ip_set_comment *comment)
++{
++	if (unlikely(!comment->str))
++		return;
++	kfree(comment->str);
++	comment->str = NULL;
++}
++
++#endif
++#endif
+* Unmerged path include/uapi/linux/netfilter/ipset/ip_set.h
+* Unmerged path net/netfilter/ipset/ip_set_core.c
