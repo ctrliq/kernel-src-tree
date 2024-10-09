@@ -1,0 +1,243 @@
+blk-mq: dequeue request one by one from sw queue if hctx is busy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 6e768717304bdbe8d2897ca8298f6b58863fdc41
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/6e768717.failed
+
+It won't be efficient to dequeue request one by one from sw queue,
+but we have to do that when queue is busy for better merge performance.
+
+This patch takes the Exponential Weighted Moving Average(EWMA) to figure
+out if queue is busy, then only dequeue request one by one from sw queue
+when queue is busy.
+
+Fixes: b347689ffbca ("blk-mq-sched: improve dispatching from sw queue")
+	Cc: Kashyap Desai <kashyap.desai@broadcom.com>
+	Cc: Laurence Oberman <loberman@redhat.com>
+	Cc: Omar Sandoval <osandov@fb.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Bart Van Assche <bart.vanassche@wdc.com>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Reported-by: Kashyap Desai <kashyap.desai@broadcom.com>
+	Tested-by: Kashyap Desai <kashyap.desai@broadcom.com>
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 6e768717304bdbe8d2897ca8298f6b58863fdc41)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-sched.c
+#	block/blk-mq.c
+#	include/linux/blk-mq.h
+diff --cc block/blk-mq-sched.c
+index e1ac9f3d0935,fdc129e64cc4..000000000000
+--- a/block/blk-mq-sched.c
++++ b/block/blk-mq-sched.c
+@@@ -302,15 -206,8 +302,20 @@@ void blk_mq_sched_dispatch_requests(str
+  		}
+  	} else if (has_sched_dispatch) {
+  		blk_mq_do_dispatch_sched(hctx);
+++<<<<<<< HEAD
+ +	} else if (q->mq_ops->aux_ops && q->mq_ops->aux_ops->get_budget) {
+ +		/*
+ +		 * If we need to get budget before queuing request, we
+ +		 * dequeue request one by one from sw queue for avoiding
+ +		 * to mess up I/O merge when dispatch runs out of resource.
+ +		 *
+ +		 * TODO: get more budgets, and dequeue more requests in
+ +		 * one time.
+ +		 */
+++=======
++ 	} else if (hctx->dispatch_busy) {
++ 		/* dequeue request one by one from sw queue if queue is busy */
+++>>>>>>> 6e768717304b (blk-mq: dequeue request one by one from sw queue if hctx is busy)
+  		blk_mq_do_dispatch_ctx(hctx);
+  	} else {
+  		blk_mq_flush_busy_ctxs(hctx, &rq_list);
+diff --cc block/blk-mq.c
+index a8e551c0c631,850fdd02c385..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -977,32 -1056,58 +977,69 @@@ static bool blk_mq_mark_tag_wait(struc
+  	 * allocation failure and adding the hardware queue to the wait
+  	 * queue.
+  	 */
+ -	ret = blk_mq_get_driver_tag(rq);
+ -	if (!ret) {
+ -		spin_unlock(&hctx->dispatch_wait_lock);
+ -		spin_unlock_irq(&wq->lock);
+ -		return false;
+ -	}
+ +	ret = blk_mq_get_driver_tag(rq, hctx, false);
+  
+ -	/*
+ -	 * We got a tag, remove ourselves from the wait queue to ensure
+ -	 * someone else gets the wakeup.
+ -	 */
+ -	list_del_init(&wait->entry);
+ -	spin_unlock(&hctx->dispatch_wait_lock);
+ -	spin_unlock_irq(&wq->lock);
+ +	if (!shared_tags) {
+ +		/*
+ +		 * Don't clear RESTART here, someone else could have set it.
+ +		 * At most this will cost an extra queue run.
+ +		 */
+ +		return ret;
+ +	} else {
+ +		if (!ret) {
+ +			spin_unlock(&this_hctx->lock);
+ +			return false;
+ +		}
+  
+ -	return true;
+ +		/*
+ +		 * We got a tag, remove ourselves from the wait queue to ensure
+ +		 * someone else gets the wakeup.
+ +		 */
+ +		spin_lock_irq(&ws->wait.lock);
+ +		list_del_init(&wait->task_list);
+ +		spin_unlock_irq(&ws->wait.lock);
+ +		spin_unlock(&this_hctx->lock);
+ +		return true;
+ +	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define BLK_MQ_DISPATCH_BUSY_EWMA_WEIGHT  8
++ #define BLK_MQ_DISPATCH_BUSY_EWMA_FACTOR  4
++ /*
++  * Update dispatch busy with the Exponential Weighted Moving Average(EWMA):
++  * - EWMA is one simple way to compute running average value
++  * - weight(7/8 and 1/8) is applied so that it can decrease exponentially
++  * - take 4 as factor for avoiding to get too small(0) result, and this
++  *   factor doesn't matter because EWMA decreases exponentially
++  */
++ static void blk_mq_update_dispatch_busy(struct blk_mq_hw_ctx *hctx, bool busy)
++ {
++ 	unsigned int ewma;
++ 
++ 	if (hctx->queue->elevator)
++ 		return;
++ 
++ 	ewma = hctx->dispatch_busy;
++ 
++ 	if (!ewma && !busy)
++ 		return;
++ 
++ 	ewma *= BLK_MQ_DISPATCH_BUSY_EWMA_WEIGHT - 1;
++ 	if (busy)
++ 		ewma += 1 << BLK_MQ_DISPATCH_BUSY_EWMA_FACTOR;
++ 	ewma /= BLK_MQ_DISPATCH_BUSY_EWMA_WEIGHT;
++ 
++ 	hctx->dispatch_busy = ewma;
++ }
++ 
++ #define BLK_MQ_RESOURCE_DELAY	3		/* ms units */
++ 
++ /*
++  * Returns true if we did some work AND can potentially do more.
++  */
+++>>>>>>> 6e768717304b (blk-mq: dequeue request one by one from sw queue if hctx is busy)
+  bool blk_mq_dispatch_rq_list(struct request_queue *q, struct list_head *list,
+  			     bool got_budget)
+  {
+@@@ -1137,11 -1217,39 +1174,21 @@@
+  		 * a driver tag with an I/O scheduler attached. If our dispatch
+  		 * waitqueue is no longer active, ensure that we run the queue
+  		 * AFTER adding our entries back to the list.
+ -		 *
+ -		 * If no I/O scheduler has been configured it is possible that
+ -		 * the hardware queue got stopped and restarted before requests
+ -		 * were pushed back onto the dispatch list. Rerun the queue to
+ -		 * avoid starvation. Notes:
+ -		 * - blk_mq_run_hw_queue() checks whether or not a queue has
+ -		 *   been stopped before rerunning a queue.
+ -		 * - Some but not all block drivers stop a queue before
+ -		 *   returning BLK_STS_RESOURCE. Two exceptions are scsi-mq
+ -		 *   and dm-rq.
+ -		 *
+ -		 * If driver returns BLK_STS_RESOURCE and SCHED_RESTART
+ -		 * bit is set, run queue after a delay to avoid IO stalls
+ -		 * that could otherwise occur if the queue is idle.
+  		 */
+ -		needs_restart = blk_mq_sched_needs_restart(hctx);
+ -		if (!needs_restart ||
+ -		    (no_tag && list_empty_careful(&hctx->dispatch_wait.entry)))
+ +		if (!blk_mq_sched_needs_restart(hctx) ||
+ +		    (no_tag && list_empty_careful(&hctx->dispatch_wait.task_list)))
+  			blk_mq_run_hw_queue(hctx, true);
+++<<<<<<< HEAD
+ +	}
+++=======
++ 		else if (needs_restart && (ret == BLK_STS_RESOURCE))
++ 			blk_mq_delay_run_hw_queue(hctx, BLK_MQ_RESOURCE_DELAY);
++ 
++ 		blk_mq_update_dispatch_busy(hctx, true);
++ 		return false;
++ 	} else
++ 		blk_mq_update_dispatch_busy(hctx, false);
+ -
+ -	/*
+ -	 * If the host/device is unable to accept more work, inform the
+ -	 * caller of that.
+ -	 */
+ -	if (ret == BLK_STS_RESOURCE || ret == BLK_STS_DEV_RESOURCE)
+ -		return false;
+++>>>>>>> 6e768717304b (blk-mq: dequeue request one by one from sw queue if hctx is busy)
+  
+  	return (queued + errors) != 0;
+  }
+diff --cc include/linux/blk-mq.h
+index 43b98fa7e562,d710e92874cc..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -39,6 -32,11 +39,14 @@@ struct blk_mq_hw_ctx 
+  
+  	void			*driver_data;
+  
+++<<<<<<< HEAD
+++=======
++ 	struct sbitmap		ctx_map;
++ 
++ 	struct blk_mq_ctx	*dispatch_from;
++ 	unsigned int		dispatch_busy;
++ 
+++>>>>>>> 6e768717304b (blk-mq: dequeue request one by one from sw queue if hctx is busy)
+  	unsigned int		nr_ctx;
+  	struct blk_mq_ctx	**ctxs;
+  
+diff --git a/block/blk-mq-debugfs.c b/block/blk-mq-debugfs.c
+index 7e8a5d632d21..1e16758cddf0 100644
+--- a/block/blk-mq-debugfs.c
++++ b/block/blk-mq-debugfs.c
+@@ -437,6 +437,14 @@ static int hctx_active_show(void *data, struct seq_file *m)
+ 	return 0;
+ }
+ 
++static int hctx_dispatch_busy_show(void *data, struct seq_file *m)
++{
++	struct blk_mq_hw_ctx *hctx = data;
++
++	seq_printf(m, "%u\n", hctx->dispatch_busy);
++	return 0;
++}
++
+ static void *ctx_rq_list_start(struct seq_file *m, loff_t *pos)
+ 	__acquires(&ctx->lock)
+ {
+@@ -619,6 +627,7 @@ static const struct blk_mq_debugfs_attr blk_mq_debugfs_hctx_attrs[] = {
+ 	{"queued", 0600, hctx_queued_show, hctx_queued_write},
+ 	{"run", 0600, hctx_run_show, hctx_run_write},
+ 	{"active", 0400, hctx_active_show},
++	{"dispatch_busy", 0400, hctx_dispatch_busy_show},
+ 	{},
+ };
+ 
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk-mq.c
+* Unmerged path include/linux/blk-mq.h
