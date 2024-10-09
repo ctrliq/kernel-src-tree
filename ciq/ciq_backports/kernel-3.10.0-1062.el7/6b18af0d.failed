@@ -1,0 +1,404 @@
+xfs: remove XFS_BMAP_MAX_SHIFT_EXTENTS
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 6b18af0dfd1695c1d53a2eeead838a90c27b7cb4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/6b18af0d.failed
+
+The define was always set to 1, which means looping until we reach is
+was dead code from the start.
+
+Also remove an initialization of next_fsb for the done case that doesn't
+fit the new code flow - it was never checked by the caller in the done
+case to start with.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 6b18af0dfd1695c1d53a2eeead838a90c27b7cb4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_bmap.c
+#	fs/xfs/libxfs/xfs_bmap.h
+#	fs/xfs/xfs_bmap_util.c
+diff --cc fs/xfs/libxfs/xfs_bmap.c
+index a33b0b71527e,d0118a2e51d3..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@@ -5563,10 -5701,9 +5563,14 @@@ xfs_bmse_shift_one
+  }
+  
+  /*
+ - * Shift extent records to the left/right to cover/create a hole.
+ + * Shift extent records to the left to cover a hole.
+   *
+++<<<<<<< HEAD
+ + * The maximum number of extents to be shifted in a single operation is
+ + * @num_exts. @start_fsb specifies the file offset to start the shift and the
+++=======
++  * @stop_fsb specifies the file offset at which to stop shift and the
+++>>>>>>> 6b18af0dfd16 (xfs: remove XFS_BMAP_MAX_SHIFT_EXTENTS)
+   * file offset where we've left off is returned in @next_fsb. @offset_shift_fsb
+   * is the length by which each extent is shifted. If there is no hole to shift
+   * the extents into, this will be considered invalid operation and we abort
+@@@ -5576,21 -5713,21 +5580,24 @@@ in
+  xfs_bmap_shift_extents(
+  	struct xfs_trans	*tp,
+  	struct xfs_inode	*ip,
+ -	xfs_fileoff_t		*next_fsb,
+ +	xfs_fileoff_t		start_fsb,
+  	xfs_fileoff_t		offset_shift_fsb,
+  	int			*done,
+ -	xfs_fileoff_t		stop_fsb,
+ +	xfs_fileoff_t		*next_fsb,
+  	xfs_fsblock_t		*firstblock,
+  	struct xfs_defer_ops	*dfops,
+++<<<<<<< HEAD
+ +	int			num_exts)
+++=======
++ 	enum shift_direction	direction)
+++>>>>>>> 6b18af0dfd16 (xfs: remove XFS_BMAP_MAX_SHIFT_EXTENTS)
+  {
+  	struct xfs_btree_cur		*cur = NULL;
+ +	struct xfs_bmbt_rec_host	*gotp;
+  	struct xfs_bmbt_irec            got;
+  	struct xfs_mount		*mp = ip->i_mount;
+  	struct xfs_ifork		*ifp;
+- 	xfs_extnum_t			nexts = 0;
+  	xfs_extnum_t			current_ext;
+ -	xfs_extnum_t			total_extents;
+ -	xfs_extnum_t			stop_extent;
+  	int				error = 0;
+  	int				whichfork = XFS_DATA_FORK;
+  	int				logflags = 0;
+@@@ -5642,31 -5775,74 +5649,100 @@@
+  	}
+  
+  	/*
+ -	 * In case of first right shift, we need to initialize next_fsb
+ +	 * There may be delalloc extents in the data fork before the range we
+ +	 * are collapsing out, so we cannot use the count of real extents here.
+ +	 * Instead we have to calculate it from the incore fork.
+  	 */
+++<<<<<<< HEAD
+ +	total_extents = xfs_iext_count(ifp);
+ +	while (nexts++ < num_exts && current_ext < total_extents) {
+ +		error = xfs_bmse_shift_one(ip, whichfork, offset_shift_fsb,
+ +					&current_ext, gotp, cur, &logflags);
+ +		if (error)
+ +			goto del_cursor;
+ +
+ +		/* update total extent count and grab the next record */
+ +		total_extents = xfs_iext_count(ifp);
+ +		if (current_ext >= total_extents)
+ +			break;
+ +		gotp = xfs_iext_get_ext(ifp, current_ext);
+ +	}
+ +
+ +	/* Check if we are done */
+ +	if (current_ext == total_extents) {
+ +		*done = 1;
+ +	} else if (next_fsb) {
+ +		xfs_bmbt_get_all(gotp, &got);
+ +		*next_fsb = got.br_startoff;
+ +	}
+++=======
++ 	if (*next_fsb == NULLFSBLOCK) {
++ 		ASSERT(direction == SHIFT_RIGHT);
++ 
++ 		current_ext = total_extents - 1;
++ 		xfs_iext_get_extent(ifp, current_ext, &got);
++ 		if (stop_fsb > got.br_startoff) {
++ 			*done = 1;
++ 			goto del_cursor;
++ 		}
++ 		*next_fsb = got.br_startoff;
++ 	} else {
++ 		/*
++ 		 * Look up the extent index for the fsb where we start shifting. We can
++ 		 * henceforth iterate with current_ext as extent list changes are locked
++ 		 * out via ilock.
++ 		 *
++ 		 * If next_fsb lies in a hole beyond which there are no extents we are
++ 		 * done.
++ 		 */
++ 		if (!xfs_iext_lookup_extent(ip, ifp, *next_fsb, &current_ext,
++ 				&got)) {
++ 			*done = 1;
++ 			goto del_cursor;
++ 		}
++ 	}
++ 
++ 	/* Lookup the extent index at which we have to stop */
++ 	if (direction == SHIFT_RIGHT) {
++ 		struct xfs_bmbt_irec s;
++ 
++ 		xfs_iext_lookup_extent(ip, ifp, stop_fsb, &stop_extent, &s);
++ 		/* Make stop_extent exclusive of shift range */
++ 		stop_extent--;
++ 		if (current_ext <= stop_extent) {
++ 			error = -EIO;
++ 			goto del_cursor;
++ 		}
++ 	} else {
++ 		stop_extent = total_extents;
++ 		if (current_ext >= stop_extent) {
++ 			error = -EIO;
++ 			goto del_cursor;
++ 		}
++ 	}
++ 
++ 	error = xfs_bmse_shift_one(ip, whichfork, offset_shift_fsb,
++ 				   &current_ext, &got, cur, &logflags,
++ 				   direction, dfops);
++ 	if (error)
++ 		goto del_cursor;
++ 	/*
++ 	 * If there was an extent merge during the shift, the extent
++ 	 * count can change. Update the total and grade the next record.
++ 	 */
++ 	if (direction == SHIFT_LEFT) {
++ 		total_extents = xfs_iext_count(ifp);
++ 		stop_extent = total_extents;
++ 	}
++ 
++ 	if (current_ext == stop_extent) {
++ 		*done = 1;
++ 		goto del_cursor;
++ 	}
++ 	xfs_iext_get_extent(ifp, current_ext, &got);
++ 
++ 	*next_fsb = got.br_startoff;
+++>>>>>>> 6b18af0dfd16 (xfs: remove XFS_BMAP_MAX_SHIFT_EXTENTS)
+  
+  del_cursor:
+  	if (cur)
+diff --cc fs/xfs/libxfs/xfs_bmap.h
+index bbb72c6ceb86,ba5a4835bb13..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.h
++++ b/fs/xfs/libxfs/xfs_bmap.h
+@@@ -144,22 -172,21 +144,40 @@@ static inline int xfs_bmapi_aflag(int w
+  
+  
+  /*
+++<<<<<<< HEAD
+ + * This macro is used to determine how many extents will be shifted
+ + * in one write transaction. We could require two splits,
+ + * an extent move on the first and an extent merge on the second,
+ + * So it is proper that one extent is shifted inside write transaction
+ + * at a time.
+ + */
+ +#define XFS_BMAP_MAX_SHIFT_EXTENTS	1
+ +
+ +#ifdef DEBUG
+ +void	xfs_bmap_trace_exlist(struct xfs_inode *ip, xfs_extnum_t cnt,
+ +		int whichfork, unsigned long caller_ip);
+ +#define	XFS_BMAP_TRACE_EXLIST(ip,c,w)	\
+ +	xfs_bmap_trace_exlist(ip,c,w, _THIS_IP_)
+ +#else
+ +#define	XFS_BMAP_TRACE_EXLIST(ip,c,w)
+ +#endif
+++=======
++  * Return true if the extent is a real, allocated extent, or false if it is  a
++  * delayed allocation, and unwritten extent or a hole.
++  */
++ static inline bool xfs_bmap_is_real_extent(struct xfs_bmbt_irec *irec)
++ {
++ 	return irec->br_state != XFS_EXT_UNWRITTEN &&
++ 		irec->br_startblock != HOLESTARTBLOCK &&
++ 		irec->br_startblock != DELAYSTARTBLOCK &&
++ 		!isnullstartblock(irec->br_startblock);
++ }
++ 
++ enum shift_direction {
++ 	SHIFT_LEFT = 0,
++ 	SHIFT_RIGHT,
++ };
+++>>>>>>> 6b18af0dfd16 (xfs: remove XFS_BMAP_MAX_SHIFT_EXTENTS)
+  
+  void	xfs_trim_extent(struct xfs_bmbt_irec *irec, xfs_fileoff_t bno,
+  		xfs_filblks_t len);
+@@@ -194,13 -222,53 +212,22 @@@ int	xfs_bunmapi(struct xfs_trans *tp, s
+  		xfs_fileoff_t bno, xfs_filblks_t len, int flags,
+  		xfs_extnum_t nexts, xfs_fsblock_t *firstblock,
+  		struct xfs_defer_ops *dfops, int *done);
+ -int	xfs_bmap_del_extent_delay(struct xfs_inode *ip, int whichfork,
+ -		xfs_extnum_t *idx, struct xfs_bmbt_irec *got,
+ -		struct xfs_bmbt_irec *del);
+ -void	xfs_bmap_del_extent_cow(struct xfs_inode *ip, xfs_extnum_t *idx,
+ -		struct xfs_bmbt_irec *got, struct xfs_bmbt_irec *del);
+  uint	xfs_default_attroffset(struct xfs_inode *ip);
+  int	xfs_bmap_shift_extents(struct xfs_trans *tp, struct xfs_inode *ip,
+++<<<<<<< HEAD
+ +		xfs_fileoff_t start_fsb, xfs_fileoff_t offset_shift_fsb,
+ +		int *done, xfs_fileoff_t *next_fsb, xfs_fsblock_t *firstblock,
+ +		struct xfs_defer_ops *dfops, int num_exts);
+ +int	xfs_bmapi_reserve_delalloc(struct xfs_inode *ip, xfs_fileoff_t off,
+ +		xfs_filblks_t len, xfs_filblks_t prealloc,
+++=======
++ 		xfs_fileoff_t *next_fsb, xfs_fileoff_t offset_shift_fsb,
++ 		int *done, xfs_fileoff_t stop_fsb, xfs_fsblock_t *firstblock,
++ 		struct xfs_defer_ops *dfops, enum shift_direction direction);
++ int	xfs_bmap_split_extent(struct xfs_inode *ip, xfs_fileoff_t split_offset);
++ int	xfs_bmapi_reserve_delalloc(struct xfs_inode *ip, int whichfork,
++ 		xfs_fileoff_t off, xfs_filblks_t len, xfs_filblks_t prealloc,
+++>>>>>>> 6b18af0dfd16 (xfs: remove XFS_BMAP_MAX_SHIFT_EXTENTS)
+  		struct xfs_bmbt_irec *got, xfs_extnum_t *lastx, int eof);
+  
+ -enum xfs_bmap_intent_type {
+ -	XFS_BMAP_MAP = 1,
+ -	XFS_BMAP_UNMAP,
+ -};
+ -
+ -struct xfs_bmap_intent {
+ -	struct list_head			bi_list;
+ -	enum xfs_bmap_intent_type		bi_type;
+ -	struct xfs_inode			*bi_owner;
+ -	int					bi_whichfork;
+ -	struct xfs_bmbt_irec			bi_bmap;
+ -};
+ -
+ -int	xfs_bmap_finish_one(struct xfs_trans *tp, struct xfs_defer_ops *dfops,
+ -		struct xfs_inode *ip, enum xfs_bmap_intent_type type,
+ -		int whichfork, xfs_fileoff_t startoff, xfs_fsblock_t startblock,
+ -		xfs_filblks_t *blockcount, xfs_exntst_t state);
+ -int	xfs_bmap_map_extent(struct xfs_mount *mp, struct xfs_defer_ops *dfops,
+ -		struct xfs_inode *ip, struct xfs_bmbt_irec *imap);
+ -int	xfs_bmap_unmap_extent(struct xfs_mount *mp, struct xfs_defer_ops *dfops,
+ -		struct xfs_inode *ip, struct xfs_bmbt_irec *imap);
+ -
+ -static inline int xfs_bmap_fork_to_state(int whichfork)
+ -{
+ -	switch (whichfork) {
+ -	case XFS_ATTR_FORK:
+ -		return BMAP_ATTRFORK;
+ -	case XFS_COW_FORK:
+ -		return BMAP_COWFORK;
+ -	default:
+ -		return 0;
+ -	}
+ -}
+ -
+  #endif	/* __XFS_BMAP_H__ */
+diff --cc fs/xfs/xfs_bmap_util.c
+index ad7a1ab465c3,3273f083c496..000000000000
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@@ -1331,19 -1356,12 +1331,25 @@@ xfs_collapse_file_space
+  				XFS_QMOPT_RES_REGBLKS);
+  		if (error)
+  			goto out_trans_cancel;
+ -		xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
+ +
+ +		xfs_trans_ijoin(tp, ip, 0);
+  
+  		xfs_defer_init(&dfops, &first_block);
+++<<<<<<< HEAD
+ +
+ +		/*
+ +		 * We are using the write transaction in which max 2 bmbt
+ +		 * updates are allowed
+ +		 */
+ +		start_fsb = next_fsb;
+ +		error = xfs_bmap_shift_extents(tp, ip, start_fsb, shift_fsb,
+ +				&done, &next_fsb, &first_block, &dfops,
+ +				XFS_BMAP_MAX_SHIFT_EXTENTS);
+++=======
++ 		error = xfs_bmap_shift_extents(tp, ip, &next_fsb, shift_fsb,
++ 				&done, stop_fsb, &first_block, &dfops,
++ 				SHIFT_LEFT);
+++>>>>>>> 6b18af0dfd16 (xfs: remove XFS_BMAP_MAX_SHIFT_EXTENTS)
+  		if (error)
+  			goto out_bmap_cancel;
+  
+@@@ -1361,7 -1377,79 +1367,83 @@@ out_bmap_cancel
+  	xfs_defer_cancel(&dfops);
+  out_trans_cancel:
+  	xfs_trans_cancel(tp);
+++<<<<<<< HEAD
+ +	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+++=======
++ 	return error;
++ }
++ 
++ /*
++  * xfs_insert_file_space()
++  *	This routine create hole space by shifting extents for the given file.
++  *	The first thing we do is to sync dirty data and invalidate page cache
++  *	over the region on which insert range is working. And split an extent
++  *	to two extents at given offset by calling xfs_bmap_split_extent.
++  *	And shift all extent records which are laying between [offset,
++  *	last allocated extent] to the right to reserve hole range.
++  * RETURNS:
++  *	0 on success
++  *	errno on error
++  */
++ int
++ xfs_insert_file_space(
++ 	struct xfs_inode	*ip,
++ 	loff_t			offset,
++ 	loff_t			len)
++ {
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	struct xfs_trans	*tp;
++ 	int			error;
++ 	struct xfs_defer_ops	dfops;
++ 	xfs_fsblock_t		first_block;
++ 	xfs_fileoff_t		stop_fsb = XFS_B_TO_FSB(mp, offset);
++ 	xfs_fileoff_t		next_fsb = NULLFSBLOCK;
++ 	xfs_fileoff_t		shift_fsb = XFS_B_TO_FSB(mp, len);
++ 	int			done = 0;
++ 
++ 	ASSERT(xfs_isilocked(ip, XFS_IOLOCK_EXCL));
++ 	trace_xfs_insert_file_space(ip);
++ 
++ 	error = xfs_prepare_shift(ip, offset);
++ 	if (error)
++ 		return error;
++ 
++ 	/*
++ 	 * The extent shifting code works on extent granularity. So, if stop_fsb
++ 	 * is not the starting block of extent, we need to split the extent at
++ 	 * stop_fsb.
++ 	 */
++ 	error = xfs_bmap_split_extent(ip, stop_fsb);
++ 	if (error)
++ 		return error;
++ 
++ 	while (!error && !done) {
++ 		error = xfs_trans_alloc(mp, &M_RES(mp)->tr_write, 0, 0, 0,
++ 					&tp);
++ 		if (error)
++ 			break;
++ 
++ 		xfs_ilock(ip, XFS_ILOCK_EXCL);
++ 		xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
++ 		xfs_defer_init(&dfops, &first_block);
++ 		error = xfs_bmap_shift_extents(tp, ip, &next_fsb, shift_fsb,
++ 				&done, stop_fsb, &first_block, &dfops,
++ 				SHIFT_RIGHT);
++ 		if (error)
++ 			goto out_bmap_cancel;
++ 
++ 		error = xfs_defer_finish(&tp, &dfops);
++ 		if (error)
++ 			goto out_bmap_cancel;
++ 		error = xfs_trans_commit(tp);
++ 	}
++ 
++ 	return error;
++ 
++ out_bmap_cancel:
++ 	xfs_defer_cancel(&dfops);
++ 	xfs_trans_cancel(tp);
+++>>>>>>> 6b18af0dfd16 (xfs: remove XFS_BMAP_MAX_SHIFT_EXTENTS)
+  	return error;
+  }
+  
+* Unmerged path fs/xfs/libxfs/xfs_bmap.c
+* Unmerged path fs/xfs/libxfs/xfs_bmap.h
+* Unmerged path fs/xfs/xfs_bmap_util.c
