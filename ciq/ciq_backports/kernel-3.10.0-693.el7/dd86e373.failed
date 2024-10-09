@@ -1,0 +1,170 @@
+perf/x86/intel/rapl: Make package handling more robust
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit dd86e373e09fb16b83e8adf5c48c421a4ca76468
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/dd86e373.failed
+
+The package management code in RAPL relies on package mapping being
+available before a CPU is started. This changed with:
+
+  9d85eb9119f4 ("x86/smpboot: Make logical package management more robust")
+
+because the ACPI/BIOS information turned out to be unreliable, but that
+left RAPL in broken state. This was not noticed because on a regular boot
+all CPUs are online before RAPL is initialized.
+
+A possible fix would be to reintroduce the mess which allocates a package
+data structure in CPU prepare and when it turns out to already exist in
+starting throw it away later in the CPU online callback. But that's a
+horrible hack and not required at all because RAPL becomes functional for
+perf only in the CPU online callback. That's correct because user space is
+not yet informed about the CPU being onlined, so nothing caan rely on RAPL
+being available on that particular CPU.
+
+Move the allocation to the CPU online callback and simplify the hotplug
+handling. At this point the package mapping is established and correct.
+
+This also adds a missing check for available package data in the
+event_init() function.
+
+	Reported-by: Yasuaki Ishimatsu <yasu.isimatu@gmail.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Sebastian Siewior <bigeasy@linutronix.de>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+Fixes: 9d85eb9119f4 ("x86/smpboot: Make logical package management more robust")
+Link: http://lkml.kernel.org/r/20170131230141.212593966@linutronix.de
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit dd86e373e09fb16b83e8adf5c48c421a4ca76468)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/events/intel/rapl.c
+#	include/linux/cpuhotplug.h
+diff --cc arch/x86/events/intel/rapl.c
+index a14d9d5f94a3,22ef4f72cf32..000000000000
+--- a/arch/x86/events/intel/rapl.c
++++ b/arch/x86/events/intel/rapl.c
+@@@ -557,51 -617,9 +579,54 @@@ static void rapl_cpu_init(int cpu
+  
+  	cpumask_set_cpu(cpu, &rapl_cpu_mask);
+  	pmu->cpu = cpu;
+ +}
+ +
+++<<<<<<< HEAD
+ +static int rapl_cpu_prepare(int cpu)
+ +{
+ +	struct rapl_pmu *pmu = cpu_to_rapl_pmu(cpu);
+ +
+ +	if (pmu)
+ +		return 0;
+ +
+ +	pmu = kzalloc_node(sizeof(*pmu), GFP_KERNEL, cpu_to_node(cpu));
+ +	if (!pmu)
+ +		return -ENOMEM;
+ +
+ +	raw_spin_lock_init(&pmu->lock);
+ +	INIT_LIST_HEAD(&pmu->active_list);
+ +	pmu->pmu = &rapl_pmus->pmu;
+ +	pmu->timer_interval = ms_to_ktime(rapl_timer_ms);
+ +	pmu->cpu = -1;
+ +	rapl_hrtimer_init(pmu);
+ +	rapl_pmus->pmus[topology_logical_package_id(cpu)] = pmu;
+  	return 0;
+  }
+  
+ +static int rapl_cpu_notifier(struct notifier_block *self,
+ +			     unsigned long action, void *hcpu)
+ +{
+ +	unsigned int cpu = (long)hcpu;
+ +
+ +	switch (action & ~CPU_TASKS_FROZEN) {
+ +	case CPU_UP_PREPARE:
+ +		rapl_cpu_prepare(cpu);
+ +		break;
+ +
+ +	case CPU_DOWN_FAILED:
+ +	case CPU_ONLINE:
+ +		rapl_cpu_init(cpu);
+ +		break;
+ +
+ +	case CPU_DOWN_PREPARE:
+ +		rapl_cpu_exit(cpu);
+ +		break;
+ +	}
+ +	return NOTIFY_OK;
+ +}
+ +
+++=======
+++>>>>>>> dd86e373e09f (perf/x86/intel/rapl: Make package handling more robust)
+  static int rapl_check_hw_unit(bool apply_quirk)
+  {
+  	u64 msr_rapl_power_unit_bits;
+@@@ -756,25 -801,35 +781,55 @@@ static int __init rapl_pmu_init(void
+  	if (ret)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	cpu_notifier_register_begin();
+ +
+ +	ret = rapl_prepare_cpus();
+++=======
++ 	/*
++ 	 * Install callbacks. Core will call them for each online cpu.
++ 	 */
++ 	ret = cpuhp_setup_state(CPUHP_AP_PERF_X86_RAPL_ONLINE,
++ 				"perf/x86/rapl:online",
++ 				rapl_cpu_online, rapl_cpu_offline);
+++>>>>>>> dd86e373e09f (perf/x86/intel/rapl: Make package handling more robust)
+  	if (ret)
+  		goto out;
+  
+  	ret = perf_pmu_register(&rapl_pmus->pmu, "power", -1);
+  	if (ret)
+++<<<<<<< HEAD
+ +		goto out;
+++=======
++ 		goto out1;
+++>>>>>>> dd86e373e09f (perf/x86/intel/rapl: Make package handling more robust)
+  
+ +	__perf_cpu_notifier(rapl_cpu_notifier);
+ +	cpu_notifier_register_done();
+  	rapl_advertise();
+  	return 0;
+  
+++<<<<<<< HEAD
+++=======
++ out1:
++ 	cpuhp_remove_state(CPUHP_AP_PERF_X86_RAPL_ONLINE);
+++>>>>>>> dd86e373e09f (perf/x86/intel/rapl: Make package handling more robust)
+  out:
+  	pr_warn("Initialization failed (%d), disabled\n", ret);
+  	cleanup_rapl_pmus();
+ +	cpu_notifier_register_done();
+  	return ret;
+  }
+++<<<<<<< HEAD
+ +device_initcall(rapl_pmu_init);
+++=======
++ module_init(rapl_pmu_init);
++ 
++ static void __exit intel_rapl_exit(void)
++ {
++ 	cpuhp_remove_state_nocalls(CPUHP_AP_PERF_X86_RAPL_ONLINE);
++ 	perf_pmu_unregister(&rapl_pmus->pmu);
++ 	cleanup_rapl_pmus();
++ }
++ module_exit(intel_rapl_exit);
+++>>>>>>> dd86e373e09f (perf/x86/intel/rapl: Make package handling more robust)
+* Unmerged path include/linux/cpuhotplug.h
+* Unmerged path arch/x86/events/intel/rapl.c
+* Unmerged path include/linux/cpuhotplug.h
