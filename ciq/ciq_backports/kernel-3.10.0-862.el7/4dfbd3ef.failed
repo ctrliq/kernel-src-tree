@@ -1,0 +1,132 @@
+s390/pci: improve error handling during interrupt deregistration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [s390] pci: improve error handling during interrupt deregistration (Hendrik Brueckner) [1486403]
+Rebuild_FUZZ: 95.93%
+commit-author Sebastian Ott <sebott@linux.vnet.ibm.com>
+commit 4dfbd3efe3f0cf9ff1325b87491e1b1fe07afaf1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4dfbd3ef.failed
+
+When we ask a function to stop creating interrupts this may fail
+due to the function being already gone (e.g. after hot-unplug).
+
+Consequently we don't free associated resources like summary bits
+and bit vectors used for irq processing. This could lead to
+situations where we ran out of these resources and fail to setup
+new interrupts.
+
+The fix is to just ignore the errors in cases where we can be
+sure no new interrupts are generated.
+
+	Signed-off-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+	Reviewed-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 4dfbd3efe3f0cf9ff1325b87491e1b1fe07afaf1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci_insn.c
+diff --cc arch/s390/pci/pci_insn.c
+index 85267c058af8,ea34086c8674..000000000000
+--- a/arch/s390/pci/pci_insn.c
++++ b/arch/s390/pci/pci_insn.c
+@@@ -38,9 -51,9 +38,15 @@@ u8 zpci_mod_fc(u64 req, struct zpci_fi
+  	} while (cc == 2);
+  
+  	if (cc)
+++<<<<<<< HEAD
+ +		printk_once(KERN_ERR "%s: error cc: %d  status: %d\n",
+ +			     __func__, cc, status);
+ +	return (cc) ? -EIO : 0;
+++=======
++ 		zpci_err_insn(cc, *status, req, 0);
++ 
++ 	return cc;
+++>>>>>>> 4dfbd3efe3f0 (s390/pci: improve error handling during interrupt deregistration)
+  }
+  
+  /* Refresh PCI Translations */
+diff --git a/arch/s390/include/asm/pci_insn.h b/arch/s390/include/asm/pci_insn.h
+index 649eb62c52b3..34abcf275799 100644
+--- a/arch/s390/include/asm/pci_insn.h
++++ b/arch/s390/include/asm/pci_insn.h
+@@ -76,7 +76,7 @@ struct zpci_fib {
+ 	u32 gd;
+ } __packed __aligned(8);
+ 
+-int zpci_mod_fc(u64 req, struct zpci_fib *fib);
++u8 zpci_mod_fc(u64 req, struct zpci_fib *fib, u8 *status);
+ int zpci_refresh_trans(u64 fn, u64 addr, u64 range);
+ int zpci_load(u64 *data, u64 req, u64 offset);
+ int zpci_store(u64 data, u64 req, u64 offset);
+diff --git a/arch/s390/pci/pci.c b/arch/s390/pci/pci.c
+index 833b01424c9d..c2d2e82883db 100644
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@ -134,6 +134,7 @@ static int zpci_set_airq(struct zpci_dev *zdev)
+ {
+ 	u64 req = ZPCI_CREATE_REQ(zdev->fh, 0, ZPCI_MOD_FC_REG_INT);
+ 	struct zpci_fib fib = {0};
++	u8 status;
+ 
+ 	fib.isc = PCI_ISC;
+ 	fib.sum = 1;		/* enable summary notifications */
+@@ -143,7 +144,22 @@ static int zpci_set_airq(struct zpci_dev *zdev)
+ 	fib.aisb = (unsigned long) zpci_aisb_iv->vector + (zdev->aisb/64)*8;
+ 	fib.aisbo = zdev->aisb & 63;
+ 
+-	return zpci_mod_fc(req, &fib);
++	return zpci_mod_fc(req, &fib, &status) ? -EIO : 0;
++}
++
++/* Modify PCI: Unregister adapter interruptions */
++static int zpci_clear_airq(struct zpci_dev *zdev)
++{
++	u64 req = ZPCI_CREATE_REQ(zdev->fh, 0, ZPCI_MOD_FC_DEREG_INT);
++	struct zpci_fib fib = {0};
++	u8 cc, status;
++
++	cc = zpci_mod_fc(req, &fib, &status);
++	if (cc == 3 || (cc == 1 && status == 24))
++		/* Function already gone or IRQs already deregistered. */
++		cc = 0;
++
++	return cc ? -EIO : 0;
+ }
+ 
+ struct mod_pci_args {
+@@ -157,13 +173,14 @@ static int mod_pci(struct zpci_dev *zdev, int fn, u8 dmaas, struct mod_pci_args
+ {
+ 	u64 req = ZPCI_CREATE_REQ(zdev->fh, dmaas, fn);
+ 	struct zpci_fib fib = {0};
++	u8 status;
+ 
+ 	fib.pba = args->base;
+ 	fib.pal = args->limit;
+ 	fib.iota = args->iota;
+ 	fib.fmb_addr = args->fmb_addr;
+ 
+-	return zpci_mod_fc(req, &fib);
++	return zpci_mod_fc(req, &fib, &status) ? -EIO : 0;
+ }
+ 
+ /* Modify PCI: Register I/O address translation parameters */
+@@ -185,14 +202,6 @@ int zpci_unregister_ioat(struct zpci_dev *zdev, u8 dmaas)
+ 	return mod_pci(zdev, ZPCI_MOD_FC_DEREG_IOAT, dmaas, &args);
+ }
+ 
+-/* Modify PCI: Unregister adapter interruptions */
+-static int zpci_clear_airq(struct zpci_dev *zdev)
+-{
+-	struct mod_pci_args args = { 0, 0, 0, 0 };
+-
+-	return mod_pci(zdev, ZPCI_MOD_FC_DEREG_INT, 0, &args);
+-}
+-
+ /* Modify PCI: Set PCI function measurement parameters */
+ int zpci_fmb_enable_device(struct zpci_dev *zdev)
+ {
+* Unmerged path arch/s390/pci/pci_insn.c
