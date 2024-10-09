@@ -1,0 +1,160 @@
+KVM: nSVM: fix SMI injection in guest mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ladi Prosek <lprosek@redhat.com>
+commit 05cade71cf3b925042569c3e8dc1fa68a2b26995
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/05cade71.failed
+
+Entering SMM while running in guest mode wasn't working very well because several
+pieces of the vcpu state were left set up for nested operation.
+
+Some of the issues observed:
+
+* L1 was getting unexpected VM exits (using L1 interception controls but running
+  in SMM execution environment)
+* MMU was confused (walk_mmu was still set to nested_mmu)
+* INTERCEPT_SMI was not emulated for L1 (KVM never injected SVM_EXIT_SMI)
+
+Intel SDM actually prescribes the logical processor to "leave VMX operation" upon
+entering SMM in 34.14.1 Default Treatment of SMI Delivery. AMD doesn't seem to
+document this but they provide fields in the SMM state-save area to stash the
+current state of SVM. What we need to do is basically get out of guest mode for
+the duration of SMM. All this completely transparent to L1, i.e. L1 is not given
+control and no L1 observable state changes.
+
+To avoid code duplication this commit takes advantage of the existing nested
+vmexit and run functionality, perhaps at the cost of efficiency. To get out of
+guest mode, nested_svm_vmexit is called, unchanged. Re-entering is performed using
+enter_svm_guest_mode.
+
+This commit fixes running Windows Server 2016 with Hyper-V enabled in a VM with
+OVMF firmware (OVMF_CODE-need-smm.fd).
+
+	Signed-off-by: Ladi Prosek <lprosek@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 05cade71cf3b925042569c3e8dc1fa68a2b26995)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm.c
+diff --cc arch/x86/kvm/svm.c
+index 5d58287b60ba,ff94552f85d0..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -5230,7 -5401,82 +5230,86 @@@ static inline void avic_post_state_rest
+  	avic_handle_ldr_update(vcpu);
+  }
+  
+++<<<<<<< HEAD
+ +static struct kvm_x86_ops svm_x86_ops = {
+++=======
++ static void svm_setup_mce(struct kvm_vcpu *vcpu)
++ {
++ 	/* [63:9] are reserved. */
++ 	vcpu->arch.mcg_cap &= 0x1ff;
++ }
++ 
++ static int svm_smi_allowed(struct kvm_vcpu *vcpu)
++ {
++ 	struct vcpu_svm *svm = to_svm(vcpu);
++ 
++ 	/* Per APM Vol.2 15.22.2 "Response to SMI" */
++ 	if (!gif_set(svm))
++ 		return 0;
++ 
++ 	if (is_guest_mode(&svm->vcpu) &&
++ 	    svm->nested.intercept & (1ULL << INTERCEPT_SMI)) {
++ 		/* TODO: Might need to set exit_info_1 and exit_info_2 here */
++ 		svm->vmcb->control.exit_code = SVM_EXIT_SMI;
++ 		svm->nested.exit_required = true;
++ 		return 0;
++ 	}
++ 
++ 	return 1;
++ }
++ 
++ static int svm_pre_enter_smm(struct kvm_vcpu *vcpu, char *smstate)
++ {
++ 	struct vcpu_svm *svm = to_svm(vcpu);
++ 	int ret;
++ 
++ 	if (is_guest_mode(vcpu)) {
++ 		/* FED8h - SVM Guest */
++ 		put_smstate(u64, smstate, 0x7ed8, 1);
++ 		/* FEE0h - SVM Guest VMCB Physical Address */
++ 		put_smstate(u64, smstate, 0x7ee0, svm->nested.vmcb);
++ 
++ 		svm->vmcb->save.rax = vcpu->arch.regs[VCPU_REGS_RAX];
++ 		svm->vmcb->save.rsp = vcpu->arch.regs[VCPU_REGS_RSP];
++ 		svm->vmcb->save.rip = vcpu->arch.regs[VCPU_REGS_RIP];
++ 
++ 		ret = nested_svm_vmexit(svm);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 	return 0;
++ }
++ 
++ static int svm_pre_leave_smm(struct kvm_vcpu *vcpu, u64 smbase)
++ {
++ 	struct vcpu_svm *svm = to_svm(vcpu);
++ 	struct vmcb *nested_vmcb;
++ 	struct page *page;
++ 	struct {
++ 		u64 guest;
++ 		u64 vmcb;
++ 	} svm_state_save;
++ 	int ret;
++ 
++ 	ret = kvm_vcpu_read_guest(vcpu, smbase + 0xfed8, &svm_state_save,
++ 				  sizeof(svm_state_save));
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (svm_state_save.guest) {
++ 		vcpu->arch.hflags &= ~HF_SMM_MASK;
++ 		nested_vmcb = nested_svm_map(svm, svm_state_save.vmcb, &page);
++ 		if (nested_vmcb)
++ 			enter_svm_guest_mode(svm, svm_state_save.vmcb, nested_vmcb, page);
++ 		else
++ 			ret = 1;
++ 		vcpu->arch.hflags |= HF_SMM_MASK;
++ 	}
++ 	return ret;
++ }
++ 
++ static struct kvm_x86_ops svm_x86_ops __ro_after_init = {
+++>>>>>>> 05cade71cf3b (KVM: nSVM: fix SMI injection in guest mode)
+  	.cpu_has_kvm_support = has_svm,
+  	.disabled_by_bios = is_disabled,
+  	.hardware_setup = svm_hardware_setup,
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index ab2d8132f390..b153d746eb0b 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1340,4 +1340,7 @@ static inline int kvm_cpu_get_apicid(int mps_cpu)
+ #endif
+ }
+ 
++#define put_smstate(type, buf, offset, val)                      \
++	*(type *)((buf) + (offset) - 0x7e00) = val
++
+ #endif /* _ASM_X86_KVM_HOST_H */
+* Unmerged path arch/x86/kvm/svm.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 99e230533b87..2563d61ee534 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -6227,9 +6227,6 @@ static void process_nmi(struct kvm_vcpu *vcpu)
+ 	kvm_make_request(KVM_REQ_EVENT, vcpu);
+ }
+ 
+-#define put_smstate(type, buf, offset, val)			  \
+-	*(type *)((buf) + (offset) - 0x7e00) = val
+-
+ static u32 enter_smm_get_segment_flags(struct kvm_segment *seg)
+ {
+ 	u32 flags = 0;
