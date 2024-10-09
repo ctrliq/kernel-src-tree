@@ -1,0 +1,474 @@
+IB/core: Add generic function to extract IB speed from netdev
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Yuval Shaia <yuval.shaia@oracle.com>
+commit d41861942fc55c14b6280d9568a0d0112037f065
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d4186194.failed
+
+Logic of retrieving netdev speed from net_device and translating it to
+IB speed is implemented in rxe, in usnic and in bnxt drivers.
+
+Define new function which merges all.
+
+	Signed-off-by: Yuval Shaia <yuval.shaia@oracle.com>
+	Reviewed-by: Christian Benvenuti <benve@cisco.com>
+	Reviewed-by: Selvin Xavier <selvin.xavier@broadcom.com>
+	Reviewed-by: Moni Shoua <monis@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit d41861942fc55c14b6280d9568a0d0112037f065)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/verbs.c
+#	drivers/infiniband/hw/usnic/usnic_ib_verbs.c
+#	include/rdma/ib_verbs.h
+diff --cc drivers/infiniband/core/verbs.c
+index 2dcd62fe6e70,40de69bf07cd..000000000000
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@@ -1261,6 -1277,86 +1261,89 @@@ out
+  }
+  EXPORT_SYMBOL(ib_resolve_eth_dmac);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * ib_modify_qp_with_udata - Modifies the attributes for the specified QP.
++  * @qp: The QP to modify.
++  * @attr: On input, specifies the QP attributes to modify.  On output,
++  *   the current values of selected QP attributes are returned.
++  * @attr_mask: A bit-mask used to specify which attributes of the QP
++  *   are being modified.
++  * @udata: pointer to user's input output buffer information
++  *   are being modified.
++  * It returns 0 on success and returns appropriate error code on error.
++  */
++ int ib_modify_qp_with_udata(struct ib_qp *qp, struct ib_qp_attr *attr,
++ 			    int attr_mask, struct ib_udata *udata)
++ {
++ 	int ret;
++ 
++ 	if (attr_mask & IB_QP_AV) {
++ 		ret = ib_resolve_eth_dmac(qp->device, &attr->ah_attr);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 	return ib_security_modify_qp(qp, attr, attr_mask, udata);
++ }
++ EXPORT_SYMBOL(ib_modify_qp_with_udata);
++ 
++ int ib_get_eth_speed(struct ib_device *dev, u8 port_num, u8 *speed, u8 *width)
++ {
++ 	int rc;
++ 	u32 netdev_speed;
++ 	struct net_device *netdev;
++ 	struct ethtool_link_ksettings lksettings;
++ 
++ 	if (rdma_port_get_link_layer(dev, port_num) != IB_LINK_LAYER_ETHERNET)
++ 		return -EINVAL;
++ 
++ 	if (!dev->get_netdev)
++ 		return -EOPNOTSUPP;
++ 
++ 	netdev = dev->get_netdev(dev, port_num);
++ 	if (!netdev)
++ 		return -ENODEV;
++ 
++ 	rtnl_lock();
++ 	rc = __ethtool_get_link_ksettings(netdev, &lksettings);
++ 	rtnl_unlock();
++ 
++ 	dev_put(netdev);
++ 
++ 	if (!rc) {
++ 		netdev_speed = lksettings.base.speed;
++ 	} else {
++ 		netdev_speed = SPEED_1000;
++ 		pr_warn("%s speed is unknown, defaulting to %d\n", netdev->name,
++ 			netdev_speed);
++ 	}
++ 
++ 	if (netdev_speed <= SPEED_1000) {
++ 		*width = IB_WIDTH_1X;
++ 		*speed = IB_SPEED_SDR;
++ 	} else if (netdev_speed <= SPEED_10000) {
++ 		*width = IB_WIDTH_1X;
++ 		*speed = IB_SPEED_FDR10;
++ 	} else if (netdev_speed <= SPEED_20000) {
++ 		*width = IB_WIDTH_4X;
++ 		*speed = IB_SPEED_DDR;
++ 	} else if (netdev_speed <= SPEED_25000) {
++ 		*width = IB_WIDTH_1X;
++ 		*speed = IB_SPEED_EDR;
++ 	} else if (netdev_speed <= SPEED_40000) {
++ 		*width = IB_WIDTH_4X;
++ 		*speed = IB_SPEED_FDR10;
++ 	} else {
++ 		*width = IB_WIDTH_4X;
++ 		*speed = IB_SPEED_EDR;
++ 	}
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(ib_get_eth_speed);
++ 
+++>>>>>>> d41861942fc5 (IB/core: Add generic function to extract IB speed from netdev)
+  int ib_modify_qp(struct ib_qp *qp,
+  		 struct ib_qp_attr *qp_attr,
+  		 int qp_attr_mask)
+diff --cc drivers/infiniband/hw/usnic/usnic_ib_verbs.c
+index d102b50b5684,e5f57dd49980..000000000000
+--- a/drivers/infiniband/hw/usnic/usnic_ib_verbs.c
++++ b/drivers/infiniband/hw/usnic/usnic_ib_verbs.c
+@@@ -331,8 -309,13 +309,18 @@@ int usnic_ib_query_port(struct ib_devic
+  	usnic_dbg("\n");
+  
+  	mutex_lock(&us_ibdev->usdev_lock);
+++<<<<<<< HEAD
+ +	__ethtool_get_link_ksettings(us_ibdev->netdev, &cmd);
+ +	memset(props, 0, sizeof(*props));
+++=======
++ 	if (!ib_get_eth_speed(ibdev, port, &props->active_speed,
++ 			      &props->active_width)) {
++ 		mutex_unlock(&us_ibdev->usdev_lock);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* props being zeroed by the caller, avoid zeroing it here */
+++>>>>>>> d41861942fc5 (IB/core: Add generic function to extract IB speed from netdev)
+  
+  	props->lid = 0;
+  	props->lmc = 1;
+diff --cc include/rdma/ib_verbs.h
+index fd03bba88119,68d947dac9a2..000000000000
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@@ -3503,5 -3554,157 +3503,161 @@@ void ib_drain_sq(struct ib_qp *qp)
+  void ib_drain_qp(struct ib_qp *qp);
+  
+  int ib_resolve_eth_dmac(struct ib_device *device,
+++<<<<<<< HEAD
+ +			struct ib_ah_attr *ah_attr);
+++=======
++ 			struct rdma_ah_attr *ah_attr);
++ int ib_get_eth_speed(struct ib_device *dev, u8 port_num, u8 *speed, u8 *width);
++ 
++ static inline u8 *rdma_ah_retrieve_dmac(struct rdma_ah_attr *attr)
++ {
++ 	if (attr->type == RDMA_AH_ATTR_TYPE_ROCE)
++ 		return attr->roce.dmac;
++ 	return NULL;
++ }
++ 
++ static inline void rdma_ah_set_dlid(struct rdma_ah_attr *attr, u32 dlid)
++ {
++ 	if (attr->type == RDMA_AH_ATTR_TYPE_IB)
++ 		attr->ib.dlid = (u16)dlid;
++ 	else if (attr->type == RDMA_AH_ATTR_TYPE_OPA)
++ 		attr->opa.dlid = dlid;
++ }
++ 
++ static inline u32 rdma_ah_get_dlid(const struct rdma_ah_attr *attr)
++ {
++ 	if (attr->type == RDMA_AH_ATTR_TYPE_IB)
++ 		return attr->ib.dlid;
++ 	else if (attr->type == RDMA_AH_ATTR_TYPE_OPA)
++ 		return attr->opa.dlid;
++ 	return 0;
++ }
++ 
++ static inline void rdma_ah_set_sl(struct rdma_ah_attr *attr, u8 sl)
++ {
++ 	attr->sl = sl;
++ }
++ 
++ static inline u8 rdma_ah_get_sl(const struct rdma_ah_attr *attr)
++ {
++ 	return attr->sl;
++ }
++ 
++ static inline void rdma_ah_set_path_bits(struct rdma_ah_attr *attr,
++ 					 u8 src_path_bits)
++ {
++ 	if (attr->type == RDMA_AH_ATTR_TYPE_IB)
++ 		attr->ib.src_path_bits = src_path_bits;
++ 	else if (attr->type == RDMA_AH_ATTR_TYPE_OPA)
++ 		attr->opa.src_path_bits = src_path_bits;
++ }
++ 
++ static inline u8 rdma_ah_get_path_bits(const struct rdma_ah_attr *attr)
++ {
++ 	if (attr->type == RDMA_AH_ATTR_TYPE_IB)
++ 		return attr->ib.src_path_bits;
++ 	else if (attr->type == RDMA_AH_ATTR_TYPE_OPA)
++ 		return attr->opa.src_path_bits;
++ 	return 0;
++ }
++ 
++ static inline void rdma_ah_set_port_num(struct rdma_ah_attr *attr, u8 port_num)
++ {
++ 	attr->port_num = port_num;
++ }
++ 
++ static inline u8 rdma_ah_get_port_num(const struct rdma_ah_attr *attr)
++ {
++ 	return attr->port_num;
++ }
++ 
++ static inline void rdma_ah_set_static_rate(struct rdma_ah_attr *attr,
++ 					   u8 static_rate)
++ {
++ 	attr->static_rate = static_rate;
++ }
++ 
++ static inline u8 rdma_ah_get_static_rate(const struct rdma_ah_attr *attr)
++ {
++ 	return attr->static_rate;
++ }
++ 
++ static inline void rdma_ah_set_ah_flags(struct rdma_ah_attr *attr,
++ 					enum ib_ah_flags flag)
++ {
++ 	attr->ah_flags = flag;
++ }
++ 
++ static inline enum ib_ah_flags
++ 		rdma_ah_get_ah_flags(const struct rdma_ah_attr *attr)
++ {
++ 	return attr->ah_flags;
++ }
++ 
++ static inline const struct ib_global_route
++ 		*rdma_ah_read_grh(const struct rdma_ah_attr *attr)
++ {
++ 	return &attr->grh;
++ }
++ 
++ /*To retrieve and modify the grh */
++ static inline struct ib_global_route
++ 		*rdma_ah_retrieve_grh(struct rdma_ah_attr *attr)
++ {
++ 	return &attr->grh;
++ }
++ 
++ static inline void rdma_ah_set_dgid_raw(struct rdma_ah_attr *attr, void *dgid)
++ {
++ 	struct ib_global_route *grh = rdma_ah_retrieve_grh(attr);
++ 
++ 	memcpy(grh->dgid.raw, dgid, sizeof(grh->dgid));
++ }
++ 
++ static inline void rdma_ah_set_subnet_prefix(struct rdma_ah_attr *attr,
++ 					     __be64 prefix)
++ {
++ 	struct ib_global_route *grh = rdma_ah_retrieve_grh(attr);
++ 
++ 	grh->dgid.global.subnet_prefix = prefix;
++ }
++ 
++ static inline void rdma_ah_set_interface_id(struct rdma_ah_attr *attr,
++ 					    __be64 if_id)
++ {
++ 	struct ib_global_route *grh = rdma_ah_retrieve_grh(attr);
++ 
++ 	grh->dgid.global.interface_id = if_id;
++ }
++ 
++ static inline void rdma_ah_set_grh(struct rdma_ah_attr *attr,
++ 				   union ib_gid *dgid, u32 flow_label,
++ 				   u8 sgid_index, u8 hop_limit,
++ 				   u8 traffic_class)
++ {
++ 	struct ib_global_route *grh = rdma_ah_retrieve_grh(attr);
++ 
++ 	attr->ah_flags = IB_AH_GRH;
++ 	if (dgid)
++ 		grh->dgid = *dgid;
++ 	grh->flow_label = flow_label;
++ 	grh->sgid_index = sgid_index;
++ 	grh->hop_limit = hop_limit;
++ 	grh->traffic_class = traffic_class;
++ }
++ 
++ /*Get AH type */
++ static inline enum rdma_ah_attr_type rdma_ah_find_type(struct ib_device *dev,
++ 						       u32 port_num)
++ {
++ 	if ((rdma_protocol_roce(dev, port_num)) ||
++ 	    (rdma_protocol_iwarp(dev, port_num)))
++ 		return RDMA_AH_ATTR_TYPE_ROCE;
++ 	else if ((rdma_protocol_ib(dev, port_num)) &&
++ 		 (rdma_cap_opa_ah(dev, port_num)))
++ 		return RDMA_AH_ATTR_TYPE_OPA;
++ 	else
++ 		return RDMA_AH_ATTR_TYPE_IB;
++ }
+++>>>>>>> d41861942fc5 (IB/core: Add generic function to extract IB speed from netdev)
+  #endif /* IB_VERBS_H */
+diff --git a/drivers/infiniband/core/roce_gid_mgmt.c b/drivers/infiniband/core/roce_gid_mgmt.c
+index fb54ac867fbb..548fb83dac67 100644
+--- a/drivers/infiniband/core/roce_gid_mgmt.c
++++ b/drivers/infiniband/core/roce_gid_mgmt.c
+@@ -44,6 +44,8 @@
+ 
+ static struct workqueue_struct *gid_cache_wq;
+ 
++static struct workqueue_struct *gid_cache_wq;
++
+ enum gid_op_type {
+ 	GID_DEL = 0,
+ 	GID_ADD
+* Unmerged path drivers/infiniband/core/verbs.c
+diff --git a/drivers/infiniband/hw/bnxt_re/ib_verbs.c b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+index 33af2e3de399..5fc3d4a0c477 100644
+--- a/drivers/infiniband/hw/bnxt_re/ib_verbs.c
++++ b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+@@ -181,50 +181,6 @@ int bnxt_re_modify_device(struct ib_device *ibdev,
+ 	return 0;
+ }
+ 
+-static void __to_ib_speed_width(struct net_device *netdev, u8 *speed, u8 *width)
+-{
+-	struct ethtool_link_ksettings lksettings;
+-	u32 espeed;
+-
+-	if (netdev->ethtool_ops && netdev->ethtool_ops->get_link_ksettings) {
+-		memset(&lksettings, 0, sizeof(lksettings));
+-		rtnl_lock();
+-		netdev->ethtool_ops->get_link_ksettings(netdev, &lksettings);
+-		rtnl_unlock();
+-		espeed = lksettings.base.speed;
+-	} else {
+-		espeed = SPEED_UNKNOWN;
+-	}
+-	switch (espeed) {
+-	case SPEED_1000:
+-		*speed = IB_SPEED_SDR;
+-		*width = IB_WIDTH_1X;
+-		break;
+-	case SPEED_10000:
+-		*speed = IB_SPEED_QDR;
+-		*width = IB_WIDTH_1X;
+-		break;
+-	case SPEED_20000:
+-		*speed = IB_SPEED_DDR;
+-		*width = IB_WIDTH_4X;
+-		break;
+-	case SPEED_25000:
+-		*speed = IB_SPEED_EDR;
+-		*width = IB_WIDTH_1X;
+-		break;
+-	case SPEED_40000:
+-		*speed = IB_SPEED_QDR;
+-		*width = IB_WIDTH_4X;
+-		break;
+-	case SPEED_50000:
+-		break;
+-	default:
+-		*speed = IB_SPEED_SDR;
+-		*width = IB_WIDTH_1X;
+-		break;
+-	}
+-}
+-
+ /* Port */
+ int bnxt_re_query_port(struct ib_device *ibdev, u8 port_num,
+ 		       struct ib_port_attr *port_attr)
+@@ -266,8 +222,9 @@ int bnxt_re_query_port(struct ib_device *ibdev, u8 port_num,
+ 	 * IB stack to avoid race in the NETDEV_UNREG path
+ 	 */
+ 	if (test_bit(BNXT_RE_FLAG_IBDEV_REGISTERED, &rdev->flags))
+-		__to_ib_speed_width(rdev->netdev, &port_attr->active_speed,
+-				    &port_attr->active_width);
++		if (!ib_get_eth_speed(ibdev, port_num, &port_attr->active_speed,
++				      &port_attr->active_width))
++			return -EINVAL;
+ 	return 0;
+ }
+ 
+* Unmerged path drivers/infiniband/hw/usnic/usnic_ib_verbs.c
+diff --git a/drivers/infiniband/sw/rxe/rxe_verbs.c b/drivers/infiniband/sw/rxe/rxe_verbs.c
+index 28dfc8e8f0a1..e8b484d63429 100644
+--- a/drivers/infiniband/sw/rxe/rxe_verbs.c
++++ b/drivers/infiniband/sw/rxe/rxe_verbs.c
+@@ -49,40 +49,16 @@ static int rxe_query_device(struct ib_device *dev,
+ 	return 0;
+ }
+ 
+-static void rxe_eth_speed_to_ib_speed(int speed, u8 *active_speed,
+-				      u8 *active_width)
+-{
+-	if (speed <= 1000) {
+-		*active_width = IB_WIDTH_1X;
+-		*active_speed = IB_SPEED_SDR;
+-	} else if (speed <= 10000) {
+-		*active_width = IB_WIDTH_1X;
+-		*active_speed = IB_SPEED_FDR10;
+-	} else if (speed <= 20000) {
+-		*active_width = IB_WIDTH_4X;
+-		*active_speed = IB_SPEED_DDR;
+-	} else if (speed <= 30000) {
+-		*active_width = IB_WIDTH_4X;
+-		*active_speed = IB_SPEED_QDR;
+-	} else if (speed <= 40000) {
+-		*active_width = IB_WIDTH_4X;
+-		*active_speed = IB_SPEED_FDR10;
+-	} else {
+-		*active_width = IB_WIDTH_4X;
+-		*active_speed = IB_SPEED_EDR;
+-	}
+-}
+-
+ static int rxe_query_port(struct ib_device *dev,
+ 			  u8 port_num, struct ib_port_attr *attr)
+ {
+ 	struct rxe_dev *rxe = to_rdev(dev);
+ 	struct rxe_port *port;
+-	u32 speed;
++	int rc = -EINVAL;
+ 
+ 	if (unlikely(port_num != 1)) {
+ 		pr_warn("invalid port_number %d\n", port_num);
+-		goto err1;
++		goto out;
+ 	}
+ 
+ 	port = &rxe->port;
+@@ -90,29 +66,12 @@ static int rxe_query_port(struct ib_device *dev,
+ 	*attr = port->attr;
+ 
+ 	mutex_lock(&rxe->usdev_lock);
+-	if (rxe->ndev->ethtool_ops->get_link_ksettings) {
+-		struct ethtool_link_ksettings ks;
+-
+-		rxe->ndev->ethtool_ops->get_link_ksettings(rxe->ndev, &ks);
+-		speed = ks.base.speed;
+-	} else if (rxe->ndev->ethtool_ops->get_settings) {
+-		struct ethtool_cmd cmd;
+-
+-		rxe->ndev->ethtool_ops->get_settings(rxe->ndev, &cmd);
+-		speed = cmd.speed;
+-	} else {
+-		pr_warn("%s speed is unknown, defaulting to 1000\n",
+-			rxe->ndev->name);
+-		speed = 1000;
+-	}
+-	rxe_eth_speed_to_ib_speed(speed, &attr->active_speed,
+-				  &attr->active_width);
++	rc = ib_get_eth_speed(dev, port_num, &attr->active_speed,
++			      &attr->active_width);
+ 	mutex_unlock(&rxe->usdev_lock);
+ 
+-	return 0;
+-
+-err1:
+-	return -EINVAL;
++out:
++	return rc;
+ }
+ 
+ static int rxe_query_gid(struct ib_device *device,
+* Unmerged path include/rdma/ib_verbs.h
