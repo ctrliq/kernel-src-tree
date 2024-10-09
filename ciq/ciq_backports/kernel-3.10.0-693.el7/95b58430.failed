@@ -1,0 +1,308 @@
+fq_codel: add memory limitation per queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] sched: fq_codel: add memory limitation per queue (Ivan Vecera) [1382040]
+Rebuild_FUZZ: 92.13%
+commit-author Eric Dumazet <edumazet@google.com>
+commit 95b58430abe74f5e50970c57d27380bd5b8be324
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/95b58430.failed
+
+On small embedded routers, one wants to control maximal amount of
+memory used by fq_codel, instead of controlling number of packets or
+bytes, since GRO/TSO make these not practical.
+
+Assuming skb->truesize is accurate, we have to keep track of
+skb->truesize sum for skbs in queue.
+
+This patch adds a new TCA_FQ_CODEL_MEMORY_LIMIT attribute.
+
+I chose a default value of 32 MBytes, which looks reasonable even
+for heavy duty usages. (Prior fq_codel users should not be hurt
+when they upgrade their kernels)
+
+Two fields are added to tc_fq_codel_qd_stats to report :
+ - Current memory usage
+ - Number of drops caused by memory limits
+
+# tc qd replace dev eth1 root est 1sec 4sec fq_codel memory_limit 4M
+..
+# tc -s -d qd sh dev eth1
+qdisc fq_codel 8008: root refcnt 257 limit 10240p flows 1024
+ quantum 1514 target 5.0ms interval 100.0ms memory_limit 4Mb ecn
+ Sent 2083566791363 bytes 1376214889 pkt (dropped 4994406, overlimits 0
+requeues 21705223)
+ rate 9841Mbit 812549pps backlog 3906120b 376p requeues 21705223
+  maxpacket 68130 drop_overlimit 4994406 new_flow_count 28855414
+  ecn_mark 0 memory_used 4190048 drop_overmemory 4994406
+  new_flows_len 1 old_flows_len 177
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Cc: Jesper Dangaard Brouer <brouer@redhat.com>
+	Cc: Dave Täht <dave.taht@gmail.com>
+	Cc: Sebastian Möller <moeller0@gmx.de>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 95b58430abe74f5e50970c57d27380bd5b8be324)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/pkt_sched.h
+#	net/sched/sch_fq_codel.c
+diff --cc include/uapi/linux/pkt_sched.h
+index 918b7796073f,2382eed50278..000000000000
+--- a/include/uapi/linux/pkt_sched.h
++++ b/include/uapi/linux/pkt_sched.h
+@@@ -711,6 -717,9 +711,12 @@@ enum 
+  	TCA_FQ_CODEL_ECN,
+  	TCA_FQ_CODEL_FLOWS,
+  	TCA_FQ_CODEL_QUANTUM,
+++<<<<<<< HEAD
+++=======
++ 	TCA_FQ_CODEL_CE_THRESHOLD,
++ 	TCA_FQ_CODEL_DROP_BATCH_SIZE,
++ 	TCA_FQ_CODEL_MEMORY_LIMIT,
+++>>>>>>> 95b58430abe7 (fq_codel: add memory limitation per queue)
+  	__TCA_FQ_CODEL_MAX
+  };
+  
+@@@ -734,6 -743,9 +740,12 @@@ struct tc_fq_codel_qd_stats 
+  				 */
+  	__u32	new_flows_len;	/* count of flows in new list */
+  	__u32	old_flows_len;	/* count of flows in old list */
+++<<<<<<< HEAD
+++=======
++ 	__u32	ce_mark;	/* packets above ce_threshold */
++ 	__u32	memory_usage;	/* in bytes */
++ 	__u32	drop_overmemory;
+++>>>>>>> 95b58430abe7 (fq_codel: add memory limitation per queue)
+  };
+  
+  struct tc_fq_codel_cl_stats {
+diff --cc net/sched/sch_fq_codel.c
+index 83003ceba79a,bb8bd9314629..000000000000
+--- a/net/sched/sch_fq_codel.c
++++ b/net/sched/sch_fq_codel.c
+@@@ -58,8 -59,12 +58,15 @@@ struct fq_codel_sched_data 
+  	u32		flows_cnt;	/* number of flows */
+  	u32		perturbation;	/* hash perturbation */
+  	u32		quantum;	/* psched_mtu(qdisc_dev(sch)); */
+++<<<<<<< HEAD
+++=======
++ 	u32		drop_batch_size;
++ 	u32		memory_limit;
+++>>>>>>> 95b58430abe7 (fq_codel: add memory limitation per queue)
+  	struct codel_params cparams;
+  	struct codel_stats cstats;
++ 	u32		memory_usage;
++ 	u32		drop_overmemory;
+  	u32		drop_overlimit;
+  	u32		new_flow_count;
+  
+@@@ -144,8 -145,10 +151,13 @@@ static unsigned int fq_codel_drop(struc
+  	struct sk_buff *skb;
+  	unsigned int maxbacklog = 0, idx = 0, i, len;
+  	struct fq_codel_flow *flow;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int threshold;
++ 	unsigned int mem = 0;
+++>>>>>>> 95b58430abe7 (fq_codel: add memory limitation per queue)
+  
+ -	/* Queue is full! Find the fat flow and drop packet(s) from it.
+ +	/* Queue is full! Find the fat flow and drop packet from it.
+  	 * This might sound expensive, but with 1024 flows, we scan
+  	 * 4KB of memory, and we dont need to handle a complex tree
+  	 * in fast path (packet queue/enqueue) with many cache misses.
+@@@ -156,15 -161,26 +168,33 @@@
+  			idx = i;
+  		}
+  	}
+ -
+ -	/* Our goal is to drop half of this fat flow backlog */
+ -	threshold = maxbacklog >> 1;
+ -
+  	flow = &q->flows[idx];
+++<<<<<<< HEAD
+ +	skb = dequeue_head(flow);
+ +	len = qdisc_pkt_len(skb);
+ +	q->backlogs[idx] -= len;
+ +	sch->q.qlen--;
+ +	qdisc_qstats_drop(sch);
+ +	qdisc_qstats_backlog_dec(sch, skb);
+ +	kfree_skb(skb);
+ +	flow->dropped++;
+++=======
++ 	len = 0;
++ 	i = 0;
++ 	do {
++ 		skb = dequeue_head(flow);
++ 		len += qdisc_pkt_len(skb);
++ 		mem += skb->truesize;
++ 		kfree_skb(skb);
++ 	} while (++i < max_packets && len < threshold);
++ 
++ 	flow->dropped += i;
++ 	q->backlogs[idx] -= len;
++ 	q->memory_usage -= mem;
++ 	sch->qstats.drops += i;
++ 	sch->qstats.backlog -= len;
++ 	sch->q.qlen -= i;
+++>>>>>>> 95b58430abe7 (fq_codel: add memory limitation per queue)
+  	return idx;
+  }
+  
+@@@ -180,9 -196,10 +210,10 @@@ static unsigned int fq_codel_qdisc_drop
+  static int fq_codel_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+  {
+  	struct fq_codel_sched_data *q = qdisc_priv(sch);
+ -	unsigned int idx, prev_backlog, prev_qlen;
+ +	unsigned int idx;
+  	struct fq_codel_flow *flow;
+  	int uninitialized_var(ret);
++ 	bool memory_limited;
+  
+  	idx = fq_codel_classify(skb, sch, &ret);
+  	if (idx == 0) {
+@@@ -205,19 -222,29 +236,32 @@@
+  		flow->deficit = q->quantum;
+  		flow->dropped = 0;
+  	}
+- 	if (++sch->q.qlen <= sch->limit)
++ 	q->memory_usage += skb->truesize;
++ 	memory_limited = q->memory_usage > q->memory_limit;
++ 	if (++sch->q.qlen <= sch->limit && !memory_limited)
+  		return NET_XMIT_SUCCESS;
+  
+ -	prev_backlog = sch->qstats.backlog;
+ -	prev_qlen = sch->q.qlen;
+ -
+ -	/* fq_codel_drop() is quite expensive, as it performs a linear search
+ -	 * in q->backlogs[] to find a fat flow.
+ -	 * So instead of dropping a single packet, drop half of its backlog
+ -	 * with a 64 packets limit to not add a too big cpu spike here.
+ +	q->drop_overlimit++;
+ +	/* Return Congestion Notification only if we dropped a packet
+ +	 * from this flow.
+  	 */
+ -	ret = fq_codel_drop(sch, q->drop_batch_size);
+ -
+ +	if (fq_codel_drop(sch) == idx)
+ +		return NET_XMIT_CN;
+ +
+++<<<<<<< HEAD
+ +	/* As we dropped a packet, better let upper stack know this */
+ +	qdisc_tree_decrease_qlen(sch, 1);
+ +	return NET_XMIT_SUCCESS;
+++=======
++ 	q->drop_overlimit += prev_qlen - sch->q.qlen;
++ 	if (memory_limited)
++ 		q->drop_overmemory += prev_qlen - sch->q.qlen;
++ 	/* As we dropped packet(s), better let upper stack know this */
++ 	qdisc_tree_reduce_backlog(sch, prev_qlen - sch->q.qlen,
++ 				  prev_backlog - sch->qstats.backlog);
++ 
++ 	return ret == idx ? NET_XMIT_CN : NET_XMIT_SUCCESS;
+++>>>>>>> 95b58430abe7 (fq_codel: add memory limitation per queue)
+  }
+  
+  /* This is the specific function called from codel_dequeue()
+@@@ -279,9 -318,10 +323,10 @@@ begin
+  			list_del_init(&flow->flowchain);
+  		goto begin;
+  	}
++ 	q->memory_usage -= skb->truesize;
+  	qdisc_bstats_update(sch, skb);
+  	flow->deficit -= qdisc_pkt_len(skb);
+ -	/* We cant call qdisc_tree_reduce_backlog() if our qlen is 0,
+ +	/* We cant call qdisc_tree_decrease_qlen() if our qlen is 0,
+  	 * or HTB crashes. Defer it for next round.
+  	 */
+  	if (q->cstats.drop_count && sch->q.qlen) {
+@@@ -322,6 -364,9 +367,12 @@@ static const struct nla_policy fq_codel
+  	[TCA_FQ_CODEL_ECN]	= { .type = NLA_U32 },
+  	[TCA_FQ_CODEL_FLOWS]	= { .type = NLA_U32 },
+  	[TCA_FQ_CODEL_QUANTUM]	= { .type = NLA_U32 },
+++<<<<<<< HEAD
+++=======
++ 	[TCA_FQ_CODEL_CE_THRESHOLD] = { .type = NLA_U32 },
++ 	[TCA_FQ_CODEL_DROP_BATCH_SIZE] = { .type = NLA_U32 },
++ 	[TCA_FQ_CODEL_MEMORY_LIMIT] = { .type = NLA_U32 },
+++>>>>>>> 95b58430abe7 (fq_codel: add memory limitation per queue)
+  };
+  
+  static int fq_codel_change(struct Qdisc *sch, struct nlattr *opt)
+@@@ -367,9 -418,17 +418,20 @@@
+  	if (tb[TCA_FQ_CODEL_QUANTUM])
+  		q->quantum = max(256U, nla_get_u32(tb[TCA_FQ_CODEL_QUANTUM]));
+  
+++<<<<<<< HEAD
+ +	while (sch->q.qlen > sch->limit) {
+++=======
++ 	if (tb[TCA_FQ_CODEL_DROP_BATCH_SIZE])
++ 		q->drop_batch_size = min(1U, nla_get_u32(tb[TCA_FQ_CODEL_DROP_BATCH_SIZE]));
++ 
++ 	if (tb[TCA_FQ_CODEL_MEMORY_LIMIT])
++ 		q->memory_limit = min(1U << 31, nla_get_u32(tb[TCA_FQ_CODEL_MEMORY_LIMIT]));
++ 
++ 	while (sch->q.qlen > sch->limit ||
++ 	       q->memory_usage > q->memory_limit) {
+++>>>>>>> 95b58430abe7 (fq_codel: add memory limitation per queue)
+  		struct sk_buff *skb = fq_codel_dequeue(sch);
+  
+ -		q->cstats.drop_len += qdisc_pkt_len(skb);
+  		kfree_skb(skb);
+  		q->cstats.drop_count++;
+  	}
+@@@ -415,13 -470,16 +477,18 @@@ static int fq_codel_init(struct Qdisc *
+  
+  	sch->limit = 10*1024;
+  	q->flows_cnt = 1024;
+++<<<<<<< HEAD
+++=======
++ 	q->memory_limit = 32 << 20; /* 32 MBytes */
++ 	q->drop_batch_size = 64;
+++>>>>>>> 95b58430abe7 (fq_codel: add memory limitation per queue)
+  	q->quantum = psched_mtu(qdisc_dev(sch));
+ -	q->perturbation = prandom_u32();
+ +	q->perturbation = net_random();
+  	INIT_LIST_HEAD(&q->new_flows);
+  	INIT_LIST_HEAD(&q->old_flows);
+ -	codel_params_init(&q->cparams);
+ +	codel_params_init(&q->cparams, sch);
+  	codel_stats_init(&q->cstats);
+  	q->cparams.ecn = true;
+ -	q->cparams.mtu = psched_mtu(qdisc_dev(sch));
+  
+  	if (opt) {
+  		int err = fq_codel_change(sch, opt);
+@@@ -472,6 -530,10 +539,13 @@@ static int fq_codel_dump(struct Qdisc *
+  			q->cparams.ecn) ||
+  	    nla_put_u32(skb, TCA_FQ_CODEL_QUANTUM,
+  			q->quantum) ||
+++<<<<<<< HEAD
+++=======
++ 	    nla_put_u32(skb, TCA_FQ_CODEL_DROP_BATCH_SIZE,
++ 			q->drop_batch_size) ||
++ 	    nla_put_u32(skb, TCA_FQ_CODEL_MEMORY_LIMIT,
++ 			q->memory_limit) ||
+++>>>>>>> 95b58430abe7 (fq_codel: add memory limitation per queue)
+  	    nla_put_u32(skb, TCA_FQ_CODEL_FLOWS,
+  			q->flows_cnt))
+  		goto nla_put_failure;
+@@@ -494,6 -561,9 +568,12 @@@ static int fq_codel_dump_stats(struct Q
+  	st.qdisc_stats.drop_overlimit = q->drop_overlimit;
+  	st.qdisc_stats.ecn_mark = q->cstats.ecn_mark;
+  	st.qdisc_stats.new_flow_count = q->new_flow_count;
+++<<<<<<< HEAD
+++=======
++ 	st.qdisc_stats.ce_mark = q->cstats.ce_mark;
++ 	st.qdisc_stats.memory_usage  = q->memory_usage;
++ 	st.qdisc_stats.drop_overmemory = q->drop_overmemory;
+++>>>>>>> 95b58430abe7 (fq_codel: add memory limitation per queue)
+  
+  	list_for_each(pos, &q->new_flows)
+  		st.qdisc_stats.new_flows_len++;
+* Unmerged path include/uapi/linux/pkt_sched.h
+* Unmerged path net/sched/sch_fq_codel.c
