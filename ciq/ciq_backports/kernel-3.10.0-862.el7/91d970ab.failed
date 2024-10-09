@@ -1,0 +1,189 @@
+IB/hfi1: Remove unused user context data members
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Michael J. Ruhl <michael.j.ruhl@intel.com>
+commit 91d970abe8d756843eaac57da903bf27f834b091
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/91d970ab.failed
+
+Several data members of the user context have become unused over time.
+Cleaning them up.
+
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 91d970abe8d756843eaac57da903bf27f834b091)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/user_sdma.c
+diff --cc drivers/infiniband/hw/hfi1/user_sdma.c
+index 44eb867b91f4,64d31eb9bd82..000000000000
+--- a/drivers/infiniband/hw/hfi1/user_sdma.c
++++ b/drivers/infiniband/hw/hfi1/user_sdma.c
+@@@ -380,39 -346,19 +380,37 @@@ int hfi1_user_sdma_alloc_queues(struct 
+  	struct hfi1_devdata *dd;
+  	struct hfi1_user_sdma_comp_q *cq;
+  	struct hfi1_user_sdma_pkt_q *pq;
+- 	unsigned long flags;
+  
+ -	if (!uctxt || !fd)
+ -		return -EBADF;
+ +	if (!uctxt || !fp) {
+ +		ret = -EBADF;
+ +		goto done;
+ +	}
+ +
+ +	fd = fp->private_data;
+  
+ -	if (!hfi1_sdma_comp_ring_size)
+ -		return -EINVAL;
+ +	if (!hfi1_sdma_comp_ring_size) {
+ +		ret = -EINVAL;
+ +		goto done;
+ +	}
+  
+  	dd = uctxt->dd;
+  
+  	pq = kzalloc(sizeof(*pq), GFP_KERNEL);
+  	if (!pq)
+ -		return -ENOMEM;
+ +		goto pq_nomem;
+ +
+ +	pq->reqs = kcalloc(hfi1_sdma_comp_ring_size,
+ +			   sizeof(*pq->reqs),
+ +			   GFP_KERNEL);
+ +	if (!pq->reqs)
+ +		goto pq_reqs_nomem;
+ +
+ +	pq->req_in_use = kcalloc(BITS_TO_LONGS(hfi1_sdma_comp_ring_size),
+ +				 sizeof(*pq->req_in_use),
+ +				 GFP_KERNEL);
+ +	if (!pq->req_in_use)
+ +		goto pq_reqs_no_in_use;
+  
+- 	INIT_LIST_HEAD(&pq->list);
+  	pq->dd = dd;
+  	pq->ctxt = uctxt->ctxt;
+  	pq->subctxt = fd->subctxt;
+@@@ -455,14 -413,16 +453,24 @@@
+  				   &pq->handler);
+  	if (ret) {
+  		dd_dev_err(dd, "Failed to register with MMU %d", ret);
+ -		goto pq_mmu_fail;
+ +		goto done;
+  	}
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&uctxt->sdma_qlock, flags);
+ +	list_add(&pq->list, &uctxt->sdma_queues);
+ +	spin_unlock_irqrestore(&uctxt->sdma_qlock, flags);
+ +	goto done;
+ +
+++=======
++ 	fd->pq = pq;
++ 	fd->cq = cq;
++ 
++ 	return 0;
++ 
++ pq_mmu_fail:
++ 	vfree(cq->comps);
+++>>>>>>> 91d970abe8d7 (IB/hfi1: Remove unused user context data members)
+  cq_comps_nomem:
+  	kfree(cq);
+  cq_nomem:
+diff --git a/drivers/infiniband/hw/hfi1/file_ops.c b/drivers/infiniband/hw/hfi1/file_ops.c
+index 32dd4a920494..9fb95b47117b 100644
+--- a/drivers/infiniband/hw/hfi1/file_ops.c
++++ b/drivers/infiniband/hw/hfi1/file_ops.c
+@@ -802,10 +802,6 @@ static int hfi1_file_close(struct inode *inode, struct file *fp)
+ 	hfi1_user_exp_rcv_grp_free(uctxt);
+ 	hfi1_clear_ctxt_pkey(dd, uctxt);
+ 
+-	uctxt->rcvwait_to = 0;
+-	uctxt->piowait_to = 0;
+-	uctxt->rcvnowait = 0;
+-	uctxt->pionowait = 0;
+ 	uctxt->event_flags = 0;
+ 
+ 	hfi1_stats.sps_ctxts--;
+@@ -1037,8 +1033,6 @@ static int allocate_ctxt(struct file *fp, struct hfi1_devdata *dd,
+ 	strlcpy(uctxt->comm, current->comm, sizeof(uctxt->comm));
+ 	memcpy(uctxt->uuid, uinfo->uuid, sizeof(uctxt->uuid));
+ 	uctxt->jkey = generate_jkey(current_uid());
+-	INIT_LIST_HEAD(&uctxt->sdma_queues);
+-	spin_lock_init(&uctxt->sdma_qlock);
+ 	hfi1_stats.sps_ctxts++;
+ 	/*
+ 	 * Disable ASPM when there are open user/PSM contexts to avoid
+diff --git a/drivers/infiniband/hw/hfi1/hfi.h b/drivers/infiniband/hw/hfi1/hfi.h
+index 9e4a63b05006..e78a6d5a4dbf 100644
+--- a/drivers/infiniband/hw/hfi1/hfi.h
++++ b/drivers/infiniband/hw/hfi1/hfi.h
+@@ -252,24 +252,10 @@ struct hfi1_ctxtdata {
+ 
+ 	/* lock protecting all Expected TID data */
+ 	struct mutex exp_lock;
+-	/* number of pio bufs for this ctxt (all procs, if shared) */
+-	u32 piocnt;
+-	/* first pio buffer for this ctxt */
+-	u32 pio_base;
+-	/* chip offset of PIO buffers for this ctxt */
+-	u32 piobufs;
+ 	/* per-context configuration flags */
+ 	unsigned long flags;
+ 	/* per-context event flags for fileops/intr communication */
+ 	unsigned long event_flags;
+-	/* WAIT_RCV that timed out, no interrupt */
+-	u32 rcvwait_to;
+-	/* WAIT_PIO that timed out, no interrupt */
+-	u32 piowait_to;
+-	/* WAIT_RCV already happened, no wait */
+-	u32 rcvnowait;
+-	/* WAIT_PIO already happened, no wait */
+-	u32 pionowait;
+ 	/* total number of polled urgent packets */
+ 	u32 urgent;
+ 	/* saved total number of polled urgent packets for poll edge trigger */
+@@ -299,7 +285,6 @@ struct hfi1_ctxtdata {
+ 	u8 redirect_seq_cnt;
+ 	/* ctxt rcvhdrq head offset */
+ 	u32 head;
+-	u32 pkt_count;
+ 	/* QPs waiting for context processing */
+ 	struct list_head qp_wait_list;
+ 	/* interrupt handling */
+@@ -308,15 +293,6 @@ struct hfi1_ctxtdata {
+ 	unsigned numa_id; /* numa node of this context */
+ 	/* verbs stats per CTX */
+ 	struct hfi1_opcode_stats_perctx *opstats;
+-	/*
+-	 * This is the kernel thread that will keep making
+-	 * progress on the user sdma requests behind the scenes.
+-	 * There is one per context (shared contexts use the master's).
+-	 */
+-	struct task_struct *progress;
+-	struct list_head sdma_queues;
+-	/* protect sdma queues */
+-	spinlock_t sdma_qlock;
+ 
+ 	/* Is ASPM interrupt supported for this context */
+ 	bool aspm_intr_supported;
+* Unmerged path drivers/infiniband/hw/hfi1/user_sdma.c
+diff --git a/drivers/infiniband/hw/hfi1/user_sdma.h b/drivers/infiniband/hw/hfi1/user_sdma.h
+index 39001714f551..4aa961f6ed69 100644
+--- a/drivers/infiniband/hw/hfi1/user_sdma.h
++++ b/drivers/infiniband/hw/hfi1/user_sdma.h
+@@ -54,7 +54,6 @@
+ extern uint extended_psn;
+ 
+ struct hfi1_user_sdma_pkt_q {
+-	struct list_head list;
+ 	unsigned ctxt;
+ 	unsigned subctxt;
+ 	u16 n_max_reqs;
