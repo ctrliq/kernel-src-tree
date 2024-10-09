@@ -1,0 +1,673 @@
+perf bpf: Allow BPF program config probing options
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Wang Nan <wangnan0@huawei.com>
+commit 03e01f568759ddbfdaff892e299758e7771a3478
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/03e01f56.failed
+
+By extending the syntax of BPF object section names, this patch allows users to
+config probing options like what they can do in 'perf probe'.
+
+The error message in 'perf probe' is also updated.
+
+Test result:
+
+For following BPF file test_probe_glob.c:
+
+  # cat test_probe_glob.c
+  __attribute__((section("inlines=no;func=SyS_dup?"), used))
+
+  int func(void *ctx)
+  {
+	  return 1;
+  }
+
+  char _license[] __attribute__((section("license"), used)) = "GPL";
+  int _version __attribute__((section("version"), used)) = 0x40300;
+  #
+  # ./perf record  -e ./test_probe_glob.c ls /
+  ...
+  [ perf record: Woken up 1 times to write data ]
+  [ perf record: Captured and wrote 0.013 MB perf.data ]
+  # ./perf evlist
+  perf_bpf_probe:func_1
+  perf_bpf_probe:func
+
+After changing "inlines=no" to "inlines=yes":
+
+  # ./perf record  -e ./test_probe_glob.c ls /
+  ...
+  [ perf record: Woken up 2 times to write data ]
+  [ perf record: Captured and wrote 0.013 MB perf.data ]
+  # ./perf evlist
+  perf_bpf_probe:func_3
+  perf_bpf_probe:func_2
+  perf_bpf_probe:func_1
+  perf_bpf_probe:func
+
+Then test 'force':
+
+Use following program:
+
+  # cat test_probe_force.c
+  __attribute__((section("func=sys_write"), used))
+
+  int funca(void *ctx)
+  {
+	  return 1;
+  }
+
+  __attribute__((section("force=yes;func=sys_write"), used))
+
+  int funcb(void *ctx)
+  {
+  	return 1;
+  }
+
+  char _license[] __attribute__((section("license"), used)) = "GPL";
+  int _version __attribute__((section("version"), used)) = 0x40300;
+  #
+
+  # perf record -e ./test_probe_force.c usleep 1
+  Error: event "func" already exists.
+   Hint: Remove existing event by 'perf probe -d'
+       or force duplicates by 'perf probe -f'
+       or set 'force=yes' in BPF source.
+  event syntax error: './test_probe_force.c'
+                       \___ Probe point exist. Try 'perf probe -d "*"' and set 'force=yes'
+
+  (add -v to see detail)
+  ...
+
+Then replace 'force=no' to 'force=yes':
+
+  # vim test_probe_force.c
+  # perf record -e ./test_probe_force.c usleep 1
+  [ perf record: Woken up 1 times to write data ]
+  [ perf record: Captured and wrote 0.017 MB perf.data ]
+  # perf evlist
+  perf_bpf_probe:func_1
+  perf_bpf_probe:func
+  #
+
+	Signed-off-by: Wang Nan <wangnan0@huawei.com>
+	Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Alexei Starovoitov <ast@kernel.org>
+	Cc: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Cc: Zefan Li <lizefan@huawei.com>
+	Cc: pi3orama@163.com
+Link: http://lkml.kernel.org/r/1447675815-166222-7-git-send-email-wangnan0@huawei.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 03e01f568759ddbfdaff892e299758e7771a3478)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/bpf-loader.c
+diff --cc tools/perf/util/bpf-loader.c
+index 39bf9252ae96,98f2e5d1a5be..000000000000
+--- a/tools/perf/util/bpf-loader.c
++++ b/tools/perf/util/bpf-loader.c
+@@@ -52,6 -94,537 +53,539 @@@ void bpf__clear(void
+  {
+  	struct bpf_object *obj, *tmp;
+  
+ -	bpf_object__for_each_safe(obj, tmp) {
+ -		bpf__unprobe(obj);
+ +	bpf_object__for_each_safe(obj, tmp)
+  		bpf_object__close(obj);
+++<<<<<<< HEAD
+++=======
++ 	}
++ }
++ 
++ static void
++ bpf_prog_priv__clear(struct bpf_program *prog __maybe_unused,
++ 		     void *_priv)
++ {
++ 	struct bpf_prog_priv *priv = _priv;
++ 
++ 	cleanup_perf_probe_events(&priv->pev, 1);
++ 	free(priv);
++ }
++ 
++ static int
++ config__exec(const char *value, struct perf_probe_event *pev)
++ {
++ 	pev->uprobes = true;
++ 	pev->target = strdup(value);
++ 	if (!pev->target)
++ 		return -ENOMEM;
++ 	return 0;
++ }
++ 
++ static int
++ config__module(const char *value, struct perf_probe_event *pev)
++ {
++ 	pev->uprobes = false;
++ 	pev->target = strdup(value);
++ 	if (!pev->target)
++ 		return -ENOMEM;
++ 	return 0;
++ }
++ 
++ static int
++ config__bool(const char *value,
++ 	     bool *pbool, bool invert)
++ {
++ 	int err;
++ 	bool bool_value;
++ 
++ 	if (!pbool)
++ 		return -EINVAL;
++ 
++ 	err = strtobool(value, &bool_value);
++ 	if (err)
++ 		return err;
++ 
++ 	*pbool = invert ? !bool_value : bool_value;
++ 	return 0;
++ }
++ 
++ static int
++ config__inlines(const char *value,
++ 		struct perf_probe_event *pev __maybe_unused)
++ {
++ 	return config__bool(value, &probe_conf.no_inlines, true);
++ }
++ 
++ static int
++ config__force(const char *value,
++ 	      struct perf_probe_event *pev __maybe_unused)
++ {
++ 	return config__bool(value, &probe_conf.force_add, false);
++ }
++ 
++ static struct {
++ 	const char *key;
++ 	const char *usage;
++ 	const char *desc;
++ 	int (*func)(const char *, struct perf_probe_event *);
++ } bpf_config_terms[] = {
++ 	{
++ 		.key	= "exec",
++ 		.usage	= "exec=<full path of file>",
++ 		.desc	= "Set uprobe target",
++ 		.func	= config__exec,
++ 	},
++ 	{
++ 		.key	= "module",
++ 		.usage	= "module=<module name>    ",
++ 		.desc	= "Set kprobe module",
++ 		.func	= config__module,
++ 	},
++ 	{
++ 		.key	= "inlines",
++ 		.usage	= "inlines=[yes|no]        ",
++ 		.desc	= "Probe at inline symbol",
++ 		.func	= config__inlines,
++ 	},
++ 	{
++ 		.key	= "force",
++ 		.usage	= "force=[yes|no]          ",
++ 		.desc	= "Forcibly add events with existing name",
++ 		.func	= config__force,
++ 	},
++ };
++ 
++ static int
++ do_config(const char *key, const char *value,
++ 	  struct perf_probe_event *pev)
++ {
++ 	unsigned int i;
++ 
++ 	pr_debug("config bpf program: %s=%s\n", key, value);
++ 	for (i = 0; i < ARRAY_SIZE(bpf_config_terms); i++)
++ 		if (strcmp(key, bpf_config_terms[i].key) == 0)
++ 			return bpf_config_terms[i].func(value, pev);
++ 
++ 	pr_debug("BPF: ERROR: invalid config option in object: %s=%s\n",
++ 		 key, value);
++ 
++ 	pr_debug("\nHint: Currently valid options are:\n");
++ 	for (i = 0; i < ARRAY_SIZE(bpf_config_terms); i++)
++ 		pr_debug("\t%s:\t%s\n", bpf_config_terms[i].usage,
++ 			 bpf_config_terms[i].desc);
++ 	pr_debug("\n");
++ 
++ 	return -BPF_LOADER_ERRNO__CONFIG_TERM;
++ }
++ 
++ static const char *
++ parse_config_kvpair(const char *config_str, struct perf_probe_event *pev)
++ {
++ 	char *text = strdup(config_str);
++ 	char *sep, *line;
++ 	const char *main_str = NULL;
++ 	int err = 0;
++ 
++ 	if (!text) {
++ 		pr_debug("No enough memory: dup config_str failed\n");
++ 		return ERR_PTR(-ENOMEM);
++ 	}
++ 
++ 	line = text;
++ 	while ((sep = strchr(line, ';'))) {
++ 		char *equ;
++ 
++ 		*sep = '\0';
++ 		equ = strchr(line, '=');
++ 		if (!equ) {
++ 			pr_warning("WARNING: invalid config in BPF object: %s\n",
++ 				   line);
++ 			pr_warning("\tShould be 'key=value'.\n");
++ 			goto nextline;
++ 		}
++ 		*equ = '\0';
++ 
++ 		err = do_config(line, equ + 1, pev);
++ 		if (err)
++ 			break;
++ nextline:
++ 		line = sep + 1;
++ 	}
++ 
++ 	if (!err)
++ 		main_str = config_str + (line - text);
++ 	free(text);
++ 
++ 	return err ? ERR_PTR(err) : main_str;
++ }
++ 
++ static int
++ parse_config(const char *config_str, struct perf_probe_event *pev)
++ {
++ 	int err;
++ 	const char *main_str = parse_config_kvpair(config_str, pev);
++ 
++ 	if (IS_ERR(main_str))
++ 		return PTR_ERR(main_str);
++ 
++ 	err = parse_perf_probe_command(main_str, pev);
++ 	if (err < 0) {
++ 		pr_debug("bpf: '%s' is not a valid config string\n",
++ 			 config_str);
++ 		/* parse failed, don't need clear pev. */
++ 		return -BPF_LOADER_ERRNO__CONFIG;
++ 	}
++ 	return 0;
++ }
++ 
++ static int
++ config_bpf_program(struct bpf_program *prog)
++ {
++ 	struct perf_probe_event *pev = NULL;
++ 	struct bpf_prog_priv *priv = NULL;
++ 	const char *config_str;
++ 	int err;
++ 
++ 	/* Initialize per-program probing setting */
++ 	probe_conf.no_inlines = false;
++ 	probe_conf.force_add = false;
++ 
++ 	config_str = bpf_program__title(prog, false);
++ 	if (IS_ERR(config_str)) {
++ 		pr_debug("bpf: unable to get title for program\n");
++ 		return PTR_ERR(config_str);
++ 	}
++ 
++ 	priv = calloc(sizeof(*priv), 1);
++ 	if (!priv) {
++ 		pr_debug("bpf: failed to alloc priv\n");
++ 		return -ENOMEM;
++ 	}
++ 	pev = &priv->pev;
++ 
++ 	pr_debug("bpf: config program '%s'\n", config_str);
++ 	err = parse_config(config_str, pev);
++ 	if (err)
++ 		goto errout;
++ 
++ 	if (pev->group && strcmp(pev->group, PERF_BPF_PROBE_GROUP)) {
++ 		pr_debug("bpf: '%s': group for event is set and not '%s'.\n",
++ 			 config_str, PERF_BPF_PROBE_GROUP);
++ 		err = -BPF_LOADER_ERRNO__GROUP;
++ 		goto errout;
++ 	} else if (!pev->group)
++ 		pev->group = strdup(PERF_BPF_PROBE_GROUP);
++ 
++ 	if (!pev->group) {
++ 		pr_debug("bpf: strdup failed\n");
++ 		err = -ENOMEM;
++ 		goto errout;
++ 	}
++ 
++ 	if (!pev->event) {
++ 		pr_debug("bpf: '%s': event name is missing. Section name should be 'key=value'\n",
++ 			 config_str);
++ 		err = -BPF_LOADER_ERRNO__EVENTNAME;
++ 		goto errout;
++ 	}
++ 	pr_debug("bpf: config '%s' is ok\n", config_str);
++ 
++ 	err = bpf_program__set_private(prog, priv, bpf_prog_priv__clear);
++ 	if (err) {
++ 		pr_debug("Failed to set priv for program '%s'\n", config_str);
++ 		goto errout;
++ 	}
++ 
++ 	return 0;
++ 
++ errout:
++ 	if (pev)
++ 		clear_perf_probe_event(pev);
++ 	free(priv);
++ 	return err;
++ }
++ 
++ static int bpf__prepare_probe(void)
++ {
++ 	static int err = 0;
++ 	static bool initialized = false;
++ 
++ 	/*
++ 	 * Make err static, so if init failed the first, bpf__prepare_probe()
++ 	 * fails each time without calling init_probe_symbol_maps multiple
++ 	 * times.
++ 	 */
++ 	if (initialized)
++ 		return err;
++ 
++ 	initialized = true;
++ 	err = init_probe_symbol_maps(false);
++ 	if (err < 0)
++ 		pr_debug("Failed to init_probe_symbol_maps\n");
++ 	probe_conf.max_probes = MAX_PROBES;
++ 	return err;
++ }
++ 
++ int bpf__probe(struct bpf_object *obj)
++ {
++ 	int err = 0;
++ 	struct bpf_program *prog;
++ 	struct bpf_prog_priv *priv;
++ 	struct perf_probe_event *pev;
++ 
++ 	err = bpf__prepare_probe();
++ 	if (err) {
++ 		pr_debug("bpf__prepare_probe failed\n");
++ 		return err;
++ 	}
++ 
++ 	bpf_object__for_each_program(prog, obj) {
++ 		err = config_bpf_program(prog);
++ 		if (err)
++ 			goto out;
++ 
++ 		err = bpf_program__get_private(prog, (void **)&priv);
++ 		if (err || !priv)
++ 			goto out;
++ 		pev = &priv->pev;
++ 
++ 		err = convert_perf_probe_events(pev, 1);
++ 		if (err < 0) {
++ 			pr_debug("bpf_probe: failed to convert perf probe events");
++ 			goto out;
++ 		}
++ 
++ 		err = apply_perf_probe_events(pev, 1);
++ 		if (err < 0) {
++ 			pr_debug("bpf_probe: failed to apply perf probe events");
++ 			goto out;
++ 		}
++ 	}
++ out:
++ 	return err < 0 ? err : 0;
++ }
++ 
++ #define EVENTS_WRITE_BUFSIZE  4096
++ int bpf__unprobe(struct bpf_object *obj)
++ {
++ 	int err, ret = 0;
++ 	struct bpf_program *prog;
++ 	struct bpf_prog_priv *priv;
++ 
++ 	bpf_object__for_each_program(prog, obj) {
++ 		int i;
++ 
++ 		err = bpf_program__get_private(prog, (void **)&priv);
++ 		if (err || !priv)
++ 			continue;
++ 
++ 		for (i = 0; i < priv->pev.ntevs; i++) {
++ 			struct probe_trace_event *tev = &priv->pev.tevs[i];
++ 			char name_buf[EVENTS_WRITE_BUFSIZE];
++ 			struct strfilter *delfilter;
++ 
++ 			snprintf(name_buf, EVENTS_WRITE_BUFSIZE,
++ 				 "%s:%s", tev->group, tev->event);
++ 			name_buf[EVENTS_WRITE_BUFSIZE - 1] = '\0';
++ 
++ 			delfilter = strfilter__new(name_buf, NULL);
++ 			if (!delfilter) {
++ 				pr_debug("Failed to create filter for unprobing\n");
++ 				ret = -ENOMEM;
++ 				continue;
++ 			}
++ 
++ 			err = del_perf_probe_events(delfilter);
++ 			strfilter__delete(delfilter);
++ 			if (err) {
++ 				pr_debug("Failed to delete %s\n", name_buf);
++ 				ret = err;
++ 				continue;
++ 			}
++ 		}
++ 	}
++ 	return ret;
++ }
++ 
++ int bpf__load(struct bpf_object *obj)
++ {
++ 	int err;
++ 
++ 	err = bpf_object__load(obj);
++ 	if (err) {
++ 		pr_debug("bpf: load objects failed\n");
++ 		return err;
++ 	}
++ 	return 0;
++ }
++ 
++ int bpf__foreach_tev(struct bpf_object *obj,
++ 		     bpf_prog_iter_callback_t func,
++ 		     void *arg)
++ {
++ 	struct bpf_program *prog;
++ 	int err;
++ 
++ 	bpf_object__for_each_program(prog, obj) {
++ 		struct probe_trace_event *tev;
++ 		struct perf_probe_event *pev;
++ 		struct bpf_prog_priv *priv;
++ 		int i, fd;
++ 
++ 		err = bpf_program__get_private(prog,
++ 				(void **)&priv);
++ 		if (err || !priv) {
++ 			pr_debug("bpf: failed to get private field\n");
++ 			return -BPF_LOADER_ERRNO__INTERNAL;
++ 		}
++ 
++ 		pev = &priv->pev;
++ 		for (i = 0; i < pev->ntevs; i++) {
++ 			tev = &pev->tevs[i];
++ 
++ 			fd = bpf_program__fd(prog);
++ 			if (fd < 0) {
++ 				pr_debug("bpf: failed to get file descriptor\n");
++ 				return fd;
++ 			}
++ 
++ 			err = (*func)(tev, fd, arg);
++ 			if (err) {
++ 				pr_debug("bpf: call back failed, stop iterate\n");
++ 				return err;
++ 			}
++ 		}
++ 	}
++ 	return 0;
++ }
++ 
++ #define ERRNO_OFFSET(e)		((e) - __BPF_LOADER_ERRNO__START)
++ #define ERRCODE_OFFSET(c)	ERRNO_OFFSET(BPF_LOADER_ERRNO__##c)
++ #define NR_ERRNO	(__BPF_LOADER_ERRNO__END - __BPF_LOADER_ERRNO__START)
++ 
++ static const char *bpf_loader_strerror_table[NR_ERRNO] = {
++ 	[ERRCODE_OFFSET(CONFIG)]	= "Invalid config string",
++ 	[ERRCODE_OFFSET(GROUP)]		= "Invalid group name",
++ 	[ERRCODE_OFFSET(EVENTNAME)]	= "No event name found in config string",
++ 	[ERRCODE_OFFSET(INTERNAL)]	= "BPF loader internal error",
++ 	[ERRCODE_OFFSET(COMPILE)]	= "Error when compiling BPF scriptlet",
++ 	[ERRCODE_OFFSET(CONFIG_TERM)]	= "Invalid config term in config string",
++ };
++ 
++ static int
++ bpf_loader_strerror(int err, char *buf, size_t size)
++ {
++ 	char sbuf[STRERR_BUFSIZE];
++ 	const char *msg;
++ 
++ 	if (!buf || !size)
++ 		return -1;
++ 
++ 	err = err > 0 ? err : -err;
++ 
++ 	if (err >= __LIBBPF_ERRNO__START)
++ 		return libbpf_strerror(err, buf, size);
++ 
++ 	if (err >= __BPF_LOADER_ERRNO__START && err < __BPF_LOADER_ERRNO__END) {
++ 		msg = bpf_loader_strerror_table[ERRNO_OFFSET(err)];
++ 		snprintf(buf, size, "%s", msg);
++ 		buf[size - 1] = '\0';
++ 		return 0;
++ 	}
++ 
++ 	if (err >= __BPF_LOADER_ERRNO__END)
++ 		snprintf(buf, size, "Unknown bpf loader error %d", err);
++ 	else
++ 		snprintf(buf, size, "%s",
++ 			 strerror_r(err, sbuf, sizeof(sbuf)));
++ 
++ 	buf[size - 1] = '\0';
++ 	return -1;
++ }
++ 
++ #define bpf__strerror_head(err, buf, size) \
++ 	char sbuf[STRERR_BUFSIZE], *emsg;\
++ 	if (!size)\
++ 		return 0;\
++ 	if (err < 0)\
++ 		err = -err;\
++ 	bpf_loader_strerror(err, sbuf, sizeof(sbuf));\
++ 	emsg = sbuf;\
++ 	switch (err) {\
++ 	default:\
++ 		scnprintf(buf, size, "%s", emsg);\
++ 		break;
++ 
++ #define bpf__strerror_entry(val, fmt...)\
++ 	case val: {\
++ 		scnprintf(buf, size, fmt);\
++ 		break;\
++ 	}
++ 
++ #define bpf__strerror_end(buf, size)\
++ 	}\
++ 	buf[size - 1] = '\0';
++ 
++ int bpf__strerror_prepare_load(const char *filename, bool source,
++ 			       int err, char *buf, size_t size)
++ {
++ 	size_t n;
++ 	int ret;
++ 
++ 	n = snprintf(buf, size, "Failed to load %s%s: ",
++ 			 filename, source ? " from source" : "");
++ 	if (n >= size) {
++ 		buf[size - 1] = '\0';
++ 		return 0;
++ 	}
++ 	buf += n;
++ 	size -= n;
++ 
++ 	ret = bpf_loader_strerror(err, buf, size);
++ 	buf[size - 1] = '\0';
++ 	return ret;
++ }
++ 
++ int bpf__strerror_probe(struct bpf_object *obj __maybe_unused,
++ 			int err, char *buf, size_t size)
++ {
++ 	bpf__strerror_head(err, buf, size);
++ 	case BPF_LOADER_ERRNO__CONFIG_TERM: {
++ 		scnprintf(buf, size, "%s (add -v to see detail)", emsg);
++ 		break;
++ 	}
++ 	bpf__strerror_entry(EEXIST, "Probe point exist. Try 'perf probe -d \"*\"' and set 'force=yes'");
++ 	bpf__strerror_entry(EACCES, "You need to be root");
++ 	bpf__strerror_entry(EPERM, "You need to be root, and /proc/sys/kernel/kptr_restrict should be 0");
++ 	bpf__strerror_entry(ENOENT, "You need to check probing points in BPF file");
++ 	bpf__strerror_end(buf, size);
++ 	return 0;
++ }
++ 
++ int bpf__strerror_load(struct bpf_object *obj,
++ 		       int err, char *buf, size_t size)
++ {
++ 	bpf__strerror_head(err, buf, size);
++ 	case LIBBPF_ERRNO__KVER: {
++ 		unsigned int obj_kver = bpf_object__get_kversion(obj);
++ 		unsigned int real_kver;
++ 
++ 		if (fetch_kernel_version(&real_kver, NULL, 0)) {
++ 			scnprintf(buf, size, "Unable to fetch kernel version");
++ 			break;
++ 		}
++ 
++ 		if (obj_kver != real_kver) {
++ 			scnprintf(buf, size,
++ 				  "'version' ("KVER_FMT") doesn't match running kernel ("KVER_FMT")",
++ 				  KVER_PARAM(obj_kver),
++ 				  KVER_PARAM(real_kver));
++ 			break;
++ 		}
++ 
++ 		scnprintf(buf, size, "Failed to load program for unknown reason");
++ 		break;
++ 	}
++ 	bpf__strerror_end(buf, size);
++ 	return 0;
+++>>>>>>> 03e01f568759 (perf bpf: Allow BPF program config probing options)
+  }
+* Unmerged path tools/perf/util/bpf-loader.c
+diff --git a/tools/perf/util/probe-event.c b/tools/perf/util/probe-event.c
+index 4c523f343c86..bf7c92814a4d 100644
+--- a/tools/perf/util/probe-event.c
++++ b/tools/perf/util/probe-event.c
+@@ -2577,8 +2577,11 @@ static int get_new_event_name(char *buf, size_t len, const char *base,
+ 		goto out;
+ 
+ 	if (!allow_suffix) {
+-		pr_warning("Error: event \"%s\" already exists. "
+-			   "(Use -f to force duplicates.)\n", buf);
++		pr_warning("Error: event \"%s\" already exists.\n"
++			   " Hint: Remove existing event by 'perf probe -d'\n"
++			   "       or force duplicates by 'perf probe -f'\n"
++			   "       or set 'force=yes' in BPF source.\n",
++			   buf);
+ 		ret = -EEXIST;
+ 		goto out;
+ 	}
