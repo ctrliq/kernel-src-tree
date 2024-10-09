@@ -1,0 +1,164 @@
+PCI: hv: Detect and fix Hyper-V PCI domain number collision
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+Rebuild_CHGLOG: - [pci] hv: Detect and fix Hyper-V PCI domain number collision (Mohammed Gamal) [1634251]
+Rebuild_FUZZ: 95.58%
+commit-author Haiyang Zhang <haiyangz@microsoft.com>
+commit be700103efd1050808db1cf00e52c3a2837bf802
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/be700103.failed
+
+Currently in Azure cloud, for passthrough devices, the host sets the
+device instance ID's bytes 8 - 15 to a value derived from the host HWID,
+which is the same on all devices in a VM. So, the device instance ID's
+bytes 8 and 9 provided by the host are no longer unique. This affects
+all Azure hosts since July 2018, and can cause device passthrough to VMs
+to fail because the bytes 8 and 9 are used as PCI domain number.
+Collision of domain numbers will cause the second device with the same
+domain number fail to load.
+
+In the cases of collision, we will detect and find another number that is
+not in use.
+
+	Suggested-by: Michael Kelley <mikelley@microsoft.com>
+	Signed-off-by: Haiyang Zhang <haiyangz@microsoft.com>
+	Signed-off-by: Lorenzo Pieralisi <lorenzo.pieralisi@arm.com>
+	Acked-by: Sasha Levin <sashal@kernel.org>
+(cherry picked from commit be700103efd1050808db1cf00e52c3a2837bf802)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/pci-hyperv.c
+diff --cc drivers/pci/pci-hyperv.c
+index d5ea96eaad68,4caa3388692a..000000000000
+--- a/drivers/pci/pci-hyperv.c
++++ b/drivers/pci/pci-hyperv.c
+@@@ -2485,30 -2578,50 +2528,54 @@@ static int hv_pci_probe(struct hv_devic
+  	hbus->state = hv_pcibus_init;
+  
+  	/*
+- 	 * The PCI bus "domain" is what is called "segment" in ACPI and
+- 	 * other specs.  Pull it from the instance ID, to get something
+- 	 * unique.  Bytes 8 and 9 are what is used in Windows guests, so
+- 	 * do the same thing for consistency.  Note that, since this code
+- 	 * only runs in a Hyper-V VM, Hyper-V can (and does) guarantee
+- 	 * that (1) the only domain in use for something that looks like
+- 	 * a physical PCI bus (which is actually emulated by the
+- 	 * hypervisor) is domain 0 and (2) there will be no overlap
+- 	 * between domains derived from these instance IDs in the same
+- 	 * VM.
++ 	 * The PCI bus "domain" is what is called "segment" in ACPI and other
++ 	 * specs. Pull it from the instance ID, to get something usually
++ 	 * unique. In rare cases of collision, we will find out another number
++ 	 * not in use.
++ 	 *
++ 	 * Note that, since this code only runs in a Hyper-V VM, Hyper-V
++ 	 * together with this guest driver can guarantee that (1) The only
++ 	 * domain used by Gen1 VMs for something that looks like a physical
++ 	 * PCI bus (which is actually emulated by the hypervisor) is domain 0.
++ 	 * (2) There will be no overlap between domains (after fixing possible
++ 	 * collisions) in the same VM.
+  	 */
+- 	hbus->sysdata.domain = hdev->dev_instance.b[9] |
+- 			       hdev->dev_instance.b[8] << 8;
++ 	dom_req = hdev->dev_instance.b[8] << 8 | hdev->dev_instance.b[9];
++ 	dom = hv_get_dom_num(dom_req);
++ 
++ 	if (dom == HVPCI_DOM_INVALID) {
++ 		dev_err(&hdev->device,
++ 			"Unable to use dom# 0x%hx or other numbers", dom_req);
++ 		ret = -EINVAL;
++ 		goto free_bus;
++ 	}
++ 
++ 	if (dom != dom_req)
++ 		dev_info(&hdev->device,
++ 			 "PCI dom# 0x%hx has collision, using 0x%hx",
++ 			 dom_req, dom);
++ 
++ 	hbus->sysdata.domain = dom;
+  
+  	hbus->hdev = hdev;
+ -	refcount_set(&hbus->remove_lock, 1);
+ +	atomic_inc(&hbus->remove_lock);
+  	INIT_LIST_HEAD(&hbus->children);
+  	INIT_LIST_HEAD(&hbus->dr_list);
+  	INIT_LIST_HEAD(&hbus->resources_for_children);
+  	spin_lock_init(&hbus->config_lock);
+  	spin_lock_init(&hbus->device_list_lock);
+  	spin_lock_init(&hbus->retarget_msi_interrupt_lock);
+ +	sema_init(&hbus->enum_sem, 1);
+  	init_completion(&hbus->remove_event);
+++<<<<<<< HEAD:drivers/pci/pci-hyperv.c
+++=======
++ 	hbus->wq = alloc_ordered_workqueue("hv_pci_%x", 0,
++ 					   hbus->sysdata.domain);
++ 	if (!hbus->wq) {
++ 		ret = -ENOMEM;
++ 		goto free_dom;
++ 	}
+++>>>>>>> be700103efd1 (PCI: hv: Detect and fix Hyper-V PCI domain number collision):drivers/pci/controller/pci-hyperv.c
+  
+  	ret = vmbus_open(hdev->channel, pci_ring_size, pci_ring_size, NULL, 0,
+  			 hv_pci_onchannelcallback, hbus);
+@@@ -2568,6 -2695,10 +2635,13 @@@ release
+  	hv_free_config_window(hbus);
+  close:
+  	vmbus_close(hdev->channel);
+++<<<<<<< HEAD:drivers/pci/pci-hyperv.c
+++=======
++ destroy_wq:
++ 	destroy_workqueue(hbus->wq);
++ free_dom:
++ 	hv_put_dom_num(hbus->sysdata.domain);
+++>>>>>>> be700103efd1 (PCI: hv: Detect and fix Hyper-V PCI domain number collision):drivers/pci/controller/pci-hyperv.c
+  free_bus:
+  	free_page((unsigned long)hbus);
+  	return ret;
+@@@ -2644,8 -2775,14 +2718,15 @@@ static int hv_pci_remove(struct hv_devi
+  	hv_free_config_window(hbus);
+  	pci_free_resource_list(&hbus->resources_for_children);
+  	hv_pci_free_bridge_windows(hbus);
+ -	irq_domain_remove(hbus->irq_domain);
+ -	irq_domain_free_fwnode(hbus->sysdata.fwnode);
+  	put_hvpcibus(hbus);
+  	wait_for_completion(&hbus->remove_event);
+++<<<<<<< HEAD:drivers/pci/pci-hyperv.c
+++=======
++ 	destroy_workqueue(hbus->wq);
++ 
++ 	hv_put_dom_num(hbus->sysdata.domain);
++ 
+++>>>>>>> be700103efd1 (PCI: hv: Detect and fix Hyper-V PCI domain number collision):drivers/pci/controller/pci-hyperv.c
+  	free_page((unsigned long)hbus);
+  	return 0;
+  }
+@@@ -2701,19 -2810,9 +2782,25 @@@ static void __exit exit_hv_pci_drv(void
+  
+  static int __init init_hv_pci_drv(void)
+  {
+++<<<<<<< HEAD:drivers/pci/pci-hyperv.c
+ +	hv_msi.setup_msi_irqs = hv_setup_msi_irqs;
+ +	hv_msi.compose_msi_msg = hv_compose_msi_msg;
+ +	hv_msi.teardown_msi_irqs = hv_teardown_msi_irqs;
+ +	hv_msi.restore_msi_irqs = hv_restore_msi_irqs;
+ +
+ +	/*
+ +	 * Hook the MSI management functions so that interrupts can be
+ +	 * remapped through the hypervisor.
+ +	 */
+ +
+ +	hyperv_install_interrupt_translation(&hv_msi);
+ +
+ +	/* Register this driver with VMBus. */
+++=======
++ 	/* Set the invalid domain number's bit, so it will not be used */
++ 	set_bit(HVPCI_DOM_INVALID, hvpci_dom_map);
++ 
+++>>>>>>> be700103efd1 (PCI: hv: Detect and fix Hyper-V PCI domain number collision):drivers/pci/controller/pci-hyperv.c
+  	return vmbus_driver_register(&hv_pci_drv);
+  }
+  
+* Unmerged path drivers/pci/pci-hyperv.c
