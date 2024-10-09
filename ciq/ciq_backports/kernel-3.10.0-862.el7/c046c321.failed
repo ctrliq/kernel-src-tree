@@ -1,0 +1,388 @@
+dax: re-enable dax pmd mappings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit c046c321cb4a0bdac9fb922db3859893ca556d27
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c046c321.failed
+
+Now that the get_user_pages() path knows how to handle dax-pmd mappings,
+remove the protections that disabled dax-pmd support.
+
+Tests available from github.com/pmem/ndctl:
+
+    make TESTS="lib/test-dax.sh lib/test-mmap.sh" check
+
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c046c321cb4a0bdac9fb922db3859893ca556d27)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+diff --cc fs/dax.c
+index 1dfecdfb6245,7af879759064..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -841,152 -583,225 +841,237 @@@ int dax_fault(struct vm_area_struct *vm
+  	struct file *file = vma->vm_file;
+  	struct address_space *mapping = file->f_mapping;
+  	struct inode *inode = mapping->host;
+ +	void *entry;
+  	struct buffer_head bh;
+ +	unsigned long vaddr = (unsigned long)vmf->virtual_address;
+  	unsigned blkbits = inode->i_blkbits;
+ -	unsigned long pmd_addr = address & PMD_MASK;
+ -	bool write = flags & FAULT_FLAG_WRITE;
+ -	struct block_device *bdev;
+ -	pgoff_t size, pgoff;
+  	sector_t block;
+ -	int result = 0;
+ +	pgoff_t size;
+ +	int error;
+ +	int major = 0;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Check whether offset isn't beyond end of file now. Caller is supposed
+ +	 * to hold locks serializing us with truncate / punch hole so this is
+ +	 * a reliable test.
+ +	 */
+++=======
++ 	/* dax pmd mappings require pfn_t_devmap() */
++ 	if (!IS_ENABLED(CONFIG_FS_DAX_PMD))
++ 		return VM_FAULT_FALLBACK;
++ 
++ 	/* Fall back to PTEs if we're going to COW */
++ 	if (write && !(vma->vm_flags & VM_SHARED)) {
++ 		split_huge_pmd(vma, pmd, address);
++ 		dax_pmd_dbg(NULL, address, "cow write");
++ 		return VM_FAULT_FALLBACK;
++ 	}
++ 	/* If the PMD would extend outside the VMA */
++ 	if (pmd_addr < vma->vm_start) {
++ 		dax_pmd_dbg(NULL, address, "vma start unaligned");
++ 		return VM_FAULT_FALLBACK;
++ 	}
++ 	if ((pmd_addr + PMD_SIZE) > vma->vm_end) {
++ 		dax_pmd_dbg(NULL, address, "vma end unaligned");
++ 		return VM_FAULT_FALLBACK;
++ 	}
++ 
++ 	pgoff = linear_page_index(vma, pmd_addr);
+++>>>>>>> c046c321cb4a (dax: re-enable dax pmd mappings)
+  	size = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
+ -	if (pgoff >= size)
+ +	if (vmf->pgoff >= size)
+  		return VM_FAULT_SIGBUS;
+ -	/* If the PMD would cover blocks out of the file */
+ -	if ((pgoff | PG_PMD_COLOUR) >= size) {
+ -		dax_pmd_dbg(NULL, address,
+ -				"offset + huge page size > file size");
+ -		return VM_FAULT_FALLBACK;
+ -	}
+  
+  	memset(&bh, 0, sizeof(bh));
+ -	block = (sector_t)pgoff << (PAGE_SHIFT - blkbits);
+ -
+ -	bh.b_size = PMD_SIZE;
+ -	if (get_block(inode, block, &bh, write) != 0)
+ -		return VM_FAULT_SIGBUS;
+ -	bdev = bh.b_bdev;
+ -	i_mmap_lock_read(mapping);
+ +	block = (sector_t)vmf->pgoff << (PAGE_SHIFT - blkbits);
+ +	bh.b_bdev = inode->i_sb->s_bdev;
+ +	bh.b_size = PAGE_SIZE;
+  
+ -	/*
+ -	 * If the filesystem isn't willing to tell us the length of a hole,
+ -	 * just fall back to PTEs.  Calling get_block 512 times in a loop
+ -	 * would be silly.
+ -	 */
+ -	if (!buffer_size_valid(&bh) || bh.b_size < PMD_SIZE) {
+ -		dax_pmd_dbg(&bh, address, "allocated block too small");
+ -		goto fallback;
+ +	entry = grab_mapping_entry(mapping, vmf->pgoff);
+ +	if (IS_ERR(entry)) {
+ +		error = PTR_ERR(entry);
+ +		goto out;
+  	}
+  
+ -	/*
+ -	 * If we allocated new storage, make sure no process has any
+ -	 * zero pages covering this hole
+ -	 */
+ -	if (buffer_new(&bh)) {
+ -		i_mmap_unlock_read(mapping);
+ -		unmap_mapping_range(mapping, pgoff << PAGE_SHIFT, PMD_SIZE, 0);
+ -		i_mmap_lock_read(mapping);
+ -	}
+ +	error = get_block(inode, block, &bh, 0);
+ +	if (!error && (bh.b_size < PAGE_SIZE))
+ +		error = -EIO;		/* fs corruption? */
+ +	if (error)
+ +		goto unlock_entry;
+  
+ -	/*
+ -	 * If a truncate happened while we were allocating blocks, we may
+ -	 * leave blocks allocated to the file that are beyond EOF.  We can't
+ -	 * take i_mutex here, so just leave them hanging; they'll be freed
+ -	 * when the file is deleted.
+ -	 */
+ -	size = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
+ -	if (pgoff >= size) {
+ -		result = VM_FAULT_SIGBUS;
+ -		goto out;
+ -	}
+ -	if ((pgoff | PG_PMD_COLOUR) >= size) {
+ -		dax_pmd_dbg(&bh, address, "pgoff unaligned");
+ -		goto fallback;
+ +	if (vmf->cow_page) {
+ +		struct page *new_page = vmf->cow_page;
+ +		if (buffer_written(&bh))
+ +			error = copy_user_dax(bh.b_bdev, to_sector(&bh, inode),
+ +					bh.b_size, new_page, vaddr);
+ +		else
+ +			clear_user_highpage(new_page, vaddr);
+ +		if (error)
+ +			goto unlock_entry;
+ +		if (!radix_tree_exceptional_entry(entry)) {
+ +			vmf->page = entry;
+ +			return VM_FAULT_LOCKED;
+ +		}
+ +		vmf->entry = entry;
+ +		return VM_FAULT_DAX_LOCKED;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!buffer_mapped(&bh)) {
+ +		if (vmf->flags & FAULT_FLAG_WRITE) {
+ +			error = get_block(inode, block, &bh, 1);
+++=======
++ 	if (!write && !buffer_mapped(&bh) && buffer_uptodate(&bh)) {
++ 		spinlock_t *ptl;
++ 		pmd_t entry;
++ 		struct page *zero_page = get_huge_zero_page();
++ 
++ 		if (unlikely(!zero_page)) {
++ 			dax_pmd_dbg(&bh, address, "no zero page");
++ 			goto fallback;
++ 		}
++ 
++ 		ptl = pmd_lock(vma->vm_mm, pmd);
++ 		if (!pmd_none(*pmd)) {
++ 			spin_unlock(ptl);
++ 			dax_pmd_dbg(&bh, address, "pmd already present");
++ 			goto fallback;
++ 		}
++ 
++ 		dev_dbg(part_to_dev(bdev->bd_part),
++ 				"%s: %s addr: %lx pfn: <zero> sect: %llx\n",
++ 				__func__, current->comm, address,
++ 				(unsigned long long) to_sector(&bh, inode));
++ 
++ 		entry = mk_pmd(zero_page, vma->vm_page_prot);
++ 		entry = pmd_mkhuge(entry);
++ 		set_pmd_at(vma->vm_mm, pmd_addr, pmd, entry);
++ 		result = VM_FAULT_NOPAGE;
++ 		spin_unlock(ptl);
++ 	} else {
++ 		struct blk_dax_ctl dax = {
++ 			.sector = to_sector(&bh, inode),
++ 			.size = PMD_SIZE,
++ 		};
++ 		long length = dax_map_atomic(bdev, &dax);
++ 
++ 		if (length < 0) {
++ 			result = VM_FAULT_SIGBUS;
++ 			goto out;
++ 		}
++ 		if (length < PMD_SIZE) {
++ 			dax_pmd_dbg(&bh, address, "dax-length too small");
++ 			dax_unmap_atomic(bdev, &dax);
++ 			goto fallback;
++ 		}
++ 		if (pfn_t_to_pfn(dax.pfn) & PG_PMD_COLOUR) {
++ 			dax_pmd_dbg(&bh, address, "pfn unaligned");
++ 			dax_unmap_atomic(bdev, &dax);
++ 			goto fallback;
++ 		}
++ 
++ 		if (!pfn_t_devmap(dax.pfn)) {
++ 			dax_unmap_atomic(bdev, &dax);
++ 			dax_pmd_dbg(&bh, address, "pfn not in memmap");
++ 			goto fallback;
++ 		}
++ 
++ 		if (buffer_unwritten(&bh) || buffer_new(&bh)) {
++ 			clear_pmem(dax.addr, PMD_SIZE);
++ 			wmb_pmem();
+++>>>>>>> c046c321cb4a (dax: re-enable dax pmd mappings)
+  			count_vm_event(PGMAJFAULT);
+  			mem_cgroup_count_vm_event(vma->vm_mm, PGMAJFAULT);
+ -			result |= VM_FAULT_MAJOR;
+ +			major = VM_FAULT_MAJOR;
+ +			if (!error && (bh.b_size < PAGE_SIZE))
+ +				error = -EIO;
+ +			if (error)
+ +				goto unlock_entry;
+ +		} else {
+ +			return dax_load_hole(mapping, entry, vmf);
+  		}
+ -		dax_unmap_atomic(bdev, &dax);
+ -
+ -		dev_dbg(part_to_dev(bdev->bd_part),
+ -				"%s: %s addr: %lx pfn: %lx sect: %llx\n",
+ -				__func__, current->comm, address,
+ -				pfn_t_to_pfn(dax.pfn),
+ -				(unsigned long long) dax.sector);
+ -		result |= vmf_insert_pfn_pmd(vma, address, pmd,
+ -				dax.pfn, write);
+  	}
+  
+ +	/* Filesystem should not return unwritten buffers to us! */
+ +	WARN_ON_ONCE(buffer_unwritten(&bh) || buffer_new(&bh));
+ +	error = dax_insert_mapping(mapping, bh.b_bdev, to_sector(&bh, inode),
+ +			bh.b_size, &entry, vma, vmf);
+ + unlock_entry:
+ +	put_locked_mapping_entry(mapping, vmf->pgoff, entry);
+   out:
+ -	i_mmap_unlock_read(mapping);
+ -
+ -	if (buffer_unwritten(&bh))
+ -		complete_unwritten(&bh, !(result & VM_FAULT_ERROR));
+ -
+ -	return result;
+ -
+ - fallback:
+ -	count_vm_event(THP_FAULT_FALLBACK);
+ -	result = VM_FAULT_FALLBACK;
+ -	goto out;
+ +	if (error == -ENOMEM)
+ +		return VM_FAULT_OOM | major;
+ +	/* -EBUSY is fine, somebody else faulted on the same PTE */
+ +	if ((error < 0) && (error != -EBUSY))
+ +		return VM_FAULT_SIGBUS | major;
+ +	return VM_FAULT_NOPAGE | major;
+  }
+ -EXPORT_SYMBOL_GPL(__dax_pmd_fault);
+ +EXPORT_SYMBOL_GPL(dax_fault);
+  
+  /**
+ - * dax_pmd_fault - handle a PMD fault on a DAX file
+ + * dax_pfn_mkwrite - handle first write to DAX page
+   * @vma: The virtual memory area where the fault occurred
+   * @vmf: The description of the fault
+ - * @get_block: The filesystem method used to translate file offsets to blocks
+ - *
+ - * When a page fault occurs, filesystems may call this helper in their
+ - * pmd_fault handler for DAX files.
+   */
+ -int dax_pmd_fault(struct vm_area_struct *vma, unsigned long address,
+ -			pmd_t *pmd, unsigned int flags, get_block_t get_block,
+ -			dax_iodone_t complete_unwritten)
+ +int dax_pfn_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
+  {
+ -	int result;
+ -	struct super_block *sb = file_inode(vma->vm_file)->i_sb;
+ +	struct file *file = vma->vm_file;
+ +	struct address_space *mapping = file->f_mapping;
+ +	void *entry;
+ +	pgoff_t index = vmf->pgoff;
+  
+ -	if (flags & FAULT_FLAG_WRITE) {
+ -		sb_start_pagefault(sb);
+ -		file_update_time(vma->vm_file);
+ -	}
+ -	result = __dax_pmd_fault(vma, address, pmd, flags, get_block,
+ -				complete_unwritten);
+ -	if (flags & FAULT_FLAG_WRITE)
+ -		sb_end_pagefault(sb);
+ +	spin_lock_irq(&mapping->tree_lock);
+ +	entry = get_unlocked_mapping_entry(mapping, index, NULL);
+ +	if (!entry || !radix_tree_exceptional_entry(entry))
+ +		goto out;
+ +	radix_tree_tag_set(&mapping->page_tree, index, PAGECACHE_TAG_DIRTY);
+ +	put_unlocked_mapping_entry(mapping, index, entry);
+ +out:
+ +	spin_unlock_irq(&mapping->tree_lock);
+ +	return VM_FAULT_NOPAGE;
+ +}
+ +EXPORT_SYMBOL_GPL(dax_pfn_mkwrite);
+ +
+ +static bool dax_range_is_aligned(struct block_device *bdev,
+ +				 unsigned int offset, unsigned int length)
+ +{
+ +	unsigned short sector_size = bdev_logical_block_size(bdev);
+ +
+ +	if (!IS_ALIGNED(offset, sector_size))
+ +		return false;
+ +	if (!IS_ALIGNED(length, sector_size))
+ +		return false;
+  
+ -	return result;
+ +	return true;
+  }
+ -EXPORT_SYMBOL_GPL(dax_pmd_fault);
+ -#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+  
+ -/**
+ - * dax_pfn_mkwrite - handle first write to DAX page
+ - * @vma: The virtual memory area where the fault occurred
+ - * @vmf: The description of the fault
+ - *
+ - */
+ -int dax_pfn_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
+ +int __dax_zero_page_range(struct block_device *bdev, sector_t sector,
+ +		unsigned int offset, unsigned int length)
+  {
+ -	struct super_block *sb = file_inode(vma->vm_file)->i_sb;
+ +	struct blk_dax_ctl dax = {
+ +		.sector		= sector,
+ +		.size		= PAGE_CACHE_SIZE,
+ +	};
+  
+ -	sb_start_pagefault(sb);
+ -	file_update_time(vma->vm_file);
+ -	sb_end_pagefault(sb);
+ -	return VM_FAULT_NOPAGE;
+ +	if (dax_map_atomic(bdev, &dax) < 0)
+ +		return PTR_ERR(dax.addr);
+ +	clear_pmem(dax.addr + offset, length);
+ +	dax_unmap_atomic(bdev, &dax);
+ +	if (dax_range_is_aligned(bdev, offset, length)) {
+ +		sector_t start_sector = dax.sector + (offset >> 9);
+ +
+ +		return blkdev_issue_zeroout(bdev, start_sector,
+ +				length >> 9, GFP_NOFS);
+ +	} else {
+ +		if (dax_map_atomic(bdev, &dax) < 0)
+ +			return PTR_ERR(dax.addr);
+ +		clear_pmem(dax.addr + offset, length);
+ +		dax_unmap_atomic(bdev, &dax);
+ +	}
+ +	return 0;
+  }
+ -EXPORT_SYMBOL_GPL(dax_pfn_mkwrite);
+ +EXPORT_SYMBOL_GPL(__dax_zero_page_range);
+  
+  /**
+   * dax_zero_page_range - zero a range within a page of a DAX file
+diff --git a/fs/Kconfig b/fs/Kconfig
+index a93dc61a1371..d2fba67e71a2 100644
+--- a/fs/Kconfig
++++ b/fs/Kconfig
+@@ -55,7 +55,8 @@ config FS_DAX_PMD
+ 	bool
+ 	default FS_DAX
+ 	depends on FS_DAX
+-	depends on BROKEN
++	depends on ZONE_DEVICE
++	depends on TRANSPARENT_HUGEPAGE
+ 
+ endif # BLOCK
+ 
+* Unmerged path fs/dax.c
