@@ -1,0 +1,311 @@
+net/mlx5e: RX, Split WQ objects for different RQ types
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: RX, Split WQ objects for different RQ types (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 96.15%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit 422d4c401edd186722d7530ffdaf11a6bb542cab
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/422d4c40.failed
+
+Replace the common RQ WQ object with two separate ones for the
+different RQ types.
+This is in preparation for switching to using a cyclic WQ type
+in Legacy RQ.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 422d4c401edd186722d7530ffdaf11a6bb542cab)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 13394c230883,f2f2dcf6b23c..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -501,8 -508,10 +500,13 @@@ struct mlx5e_rq 
+  			};
+  		} wqe;
+  		struct {
+++<<<<<<< HEAD
+++=======
++ 			struct mlx5_wq_ll      wq;
++ 			struct mlx5e_umr_wqe   umr_wqe;
+++>>>>>>> 422d4c401edd (net/mlx5e: RX, Split WQ objects for different RQ types)
+  			struct mlx5e_mpw_info *info;
+ -			mlx5e_fp_skb_from_cqe_mpwrq skb_from_cqe_mpwrq;
+ +			void                  *mtt_no_align;
+  			u16                    num_strides;
+  			u8                     log_stride_sz;
+  			bool                   umr_in_progress;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index a11f70af9727,3a007717cba5..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -275,24 -313,36 +275,48 @@@ static inline void mlx5e_build_umr_wqe(
+  	cseg->fm_ce_se  = MLX5_WQE_CTRL_CQ_UPDATE;
+  	cseg->imm       = rq->mkey_be;
+  
+ -	ucseg->flags = MLX5_UMR_TRANSLATION_OFFSET_EN | MLX5_UMR_INLINE;
+ +	ucseg->flags = MLX5_UMR_TRANSLATION_OFFSET_EN;
+  	ucseg->xlt_octowords =
+  		cpu_to_be16(MLX5_MTT_OCTW(MLX5_MPWRQ_PAGES_PER_WQE));
+ +	ucseg->bsf_octowords =
+ +		cpu_to_be16(MLX5_MTT_OCTW(umr_wqe_mtt_offset));
+  	ucseg->mkey_mask     = cpu_to_be64(MLX5_MKEY_MASK_FREE);
+ +
+ +	dseg->lkey = sq->mkey_be;
+ +	dseg->addr = cpu_to_be64(wi->umr.mtt_addr);
+  }
+  
++ static u32 mlx5e_rqwq_get_size(struct mlx5e_rq *rq)
++ {
++ 	switch (rq->wq_type) {
++ 	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
++ 		return mlx5_wq_ll_get_size(&rq->mpwqe.wq);
++ 	default:
++ 		return mlx5_wq_ll_get_size(&rq->wqe.wq);
++ 	}
++ }
++ 
++ static u32 mlx5e_rqwq_get_cur_sz(struct mlx5e_rq *rq)
++ {
++ 	switch (rq->wq_type) {
++ 	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
++ 		return rq->mpwqe.wq.cur_sz;
++ 	default:
++ 		return rq->wqe.wq.cur_sz;
++ 	}
++ }
++ 
+  static int mlx5e_rq_alloc_mpwqe_info(struct mlx5e_rq *rq,
+  				     struct mlx5e_channel *c)
+  {
+++<<<<<<< HEAD
+ +	int wq_sz = mlx5_wq_ll_get_size(&rq->wq);
+ +	int mtt_sz = mlx5e_get_wqe_mtt_sz();
+ +	int mtt_alloc = mtt_sz + MLX5_UMR_ALIGN - 1;
+ +	int i;
+++=======
++ 	int wq_sz = mlx5_wq_ll_get_size(&rq->mpwqe.wq);
+++>>>>>>> 422d4c401edd (net/mlx5e: RX, Split WQ objects for different RQ types)
+  
+  	rq->mpwqe.info = kzalloc_node(wq_sz * sizeof(*rq->mpwqe.info),
+  				      GFP_KERNEL, cpu_to_node(c->cpu));
+@@@ -443,7 -445,17 +458,20 @@@ static int mlx5e_alloc_rq(struct mlx5e_
+  
+  	switch (rq->wq_type) {
+  	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
++ 		err = mlx5_wq_ll_create(mdev, &rqp->wq, rqc_wq, &rq->mpwqe.wq,
++ 					&rq->wq_ctrl);
++ 		if (err)
++ 			return err;
++ 
++ 		rq->mpwqe.wq.db = &rq->mpwqe.wq.db[MLX5_RCV_DBR];
+  
++ 		wq_sz = mlx5_wq_ll_get_size(&rq->mpwqe.wq);
++ 
+++<<<<<<< HEAD
+++=======
++ 		pool_size = MLX5_MPWRQ_PAGES_PER_WQE << mlx5e_mpwqe_get_log_rq_size(params);
++ 
+++>>>>>>> 422d4c401edd (net/mlx5e: RX, Split WQ objects for different RQ types)
+  		rq->post_wqes = mlx5e_post_rx_mpwqes;
+  		rq->dealloc_wqe = mlx5e_dealloc_rx_mpwqe;
+  
+@@@ -517,25 -540,48 +554,37 @@@
+  		rq->mkey_be = c->mkey_be;
+  	}
+  
+ -	/* Create a page_pool and register it with rxq */
+ -	pp_params.order     = rq->buff.page_order;
+ -	pp_params.flags     = 0; /* No-internal DMA mapping in page_pool */
+ -	pp_params.pool_size = pool_size;
+ -	pp_params.nid       = cpu_to_node(c->cpu);
+ -	pp_params.dev       = c->pdev;
+ -	pp_params.dma_dir   = rq->buff.map_dir;
+ -
+ -	/* page_pool can be used even when there is no rq->xdp_prog,
+ -	 * given page_pool does not handle DMA mapping there is no
+ -	 * required state to clear. And page_pool gracefully handle
+ -	 * elevated refcnt.
+ -	 */
+ -	rq->page_pool = page_pool_create(&pp_params);
+ -	if (IS_ERR(rq->page_pool)) {
+ -		if (rq->wq_type != MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ)
+ -			kfree(rq->wqe.frag_info);
+ -		err = PTR_ERR(rq->page_pool);
+ -		rq->page_pool = NULL;
+ -		goto err_rq_wq_destroy;
+ +	/* This must only be activate for order-0 pages */
+ +	if (rq->xdp_prog) {
+ +		err = xdp_rxq_info_reg_mem_model(&rq->xdp_rxq,
+ +						 MEM_TYPE_PAGE_ORDER0, NULL);
+ +		if (err)
+ +			goto err_rq_wq_destroy;
+  	}
+ -	err = xdp_rxq_info_reg_mem_model(&rq->xdp_rxq,
+ -					 MEM_TYPE_PAGE_POOL, rq->page_pool);
+ -	if (err)
+ -		goto err_rq_wq_destroy;
+  
+  	for (i = 0; i < wq_sz; i++) {
+- 		struct mlx5e_rx_wqe *wqe = mlx5_wq_ll_get_wqe(&rq->wq, i);
+- 
+  		if (rq->wq_type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ) {
+++<<<<<<< HEAD
+ +			u64 dma_offset = (u64)mlx5e_get_wqe_mtt_offset(rq, i) << PAGE_SHIFT;
+ +
+ +			wqe->data.addr = cpu_to_be64(dma_offset);
+ +		}
+++=======
++ 			struct mlx5e_rx_wqe *wqe =
++ 				mlx5_wq_ll_get_wqe(&rq->mpwqe.wq, i);
++ 			u64 dma_offset = mlx5e_get_mpwqe_offset(rq, i);
++ 
++ 			wqe->data.addr = cpu_to_be64(dma_offset + rq->buff.headroom);
++ 			wqe->data.byte_count = cpu_to_be32(byte_count);
++ 			wqe->data.lkey = rq->mkey_be;
++ 		} else {
++ 			struct mlx5e_rx_wqe *wqe =
++ 				mlx5_wq_ll_get_wqe(&rq->wqe.wq, i);
+++>>>>>>> 422d4c401edd (net/mlx5e: RX, Split WQ objects for different RQ types)
+  
+- 		wqe->data.byte_count = cpu_to_be32(byte_count);
+- 		wqe->data.lkey = rq->mkey_be;
++ 			wqe->data.byte_count = cpu_to_be32(byte_count);
++ 			wqe->data.lkey = rq->mkey_be;
++ 		}
+  	}
+  
+  	INIT_WORK(&rq->dim.work, mlx5e_rx_dim_work);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index 29331bf7aa1d,3b12d4de5b98..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -111,7 -113,7 +111,11 @@@ static inline void mlx5e_decompress_cqe
+  			mpwrq_get_cqe_consumed_strides(&cq->title);
+  	else
+  		cq->decmprs_wqe_counter =
+++<<<<<<< HEAD
+ +			(cq->decmprs_wqe_counter + 1) & rq->wq.sz_m1;
+++=======
++ 			mlx5_wq_ll_ctr2ix(&rq->wqe.wq, cq->decmprs_wqe_counter + 1);
+++>>>>>>> 422d4c401edd (net/mlx5e: RX, Split WQ objects for different RQ types)
+  }
+  
+  static inline void mlx5e_decompress_cqe_no_hash(struct mlx5e_rq *rq,
+@@@ -413,47 -461,6 +417,47 @@@ err_unmap
+  	return err;
+  }
+  
+ +void mlx5e_free_rx_mpwqe(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi)
+ +{
+ +	int pg_strides = mlx5e_mpwqe_strides_per_page(rq);
+ +	struct mlx5e_dma_info *dma_info = &wi->umr.dma_info[0];
+ +	int i;
+ +
+ +	for (i = 0; i < MLX5_MPWRQ_PAGES_PER_WQE; i++, dma_info++) {
+ +		page_ref_sub(dma_info->page, pg_strides - wi->skbs_frags[i]);
+ +		mlx5e_page_release(rq, dma_info, true);
+ +	}
+ +}
+ +
+ +static void mlx5e_post_rx_mpwqe(struct mlx5e_rq *rq)
+ +{
+- 	struct mlx5_wq_ll *wq = &rq->wq;
+++	struct mlx5_wq_ll *wq = &rq->mpwqe.wq;
+ +	struct mlx5e_rx_wqe *wqe = mlx5_wq_ll_get_wqe(wq, wq->head);
+ +
+ +	rq->mpwqe.umr_in_progress = false;
+ +
+ +	mlx5_wq_ll_push(wq, be16_to_cpu(wqe->next.next_wqe_index));
+ +
+ +	/* ensure wqes are visible to device before updating doorbell record */
+ +	dma_wmb();
+ +
+ +	mlx5_wq_ll_update_db_record(wq);
+ +}
+ +
+ +static int mlx5e_alloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix)
+ +{
+ +	int err;
+ +
+ +	err = mlx5e_alloc_rx_umr_mpwqe(rq, ix);
+ +	if (unlikely(err)) {
+ +		rq->stats->buff_alloc_err++;
+ +		return err;
+ +	}
+ +	rq->mpwqe.umr_in_progress = true;
+ +	mlx5e_post_umr_wqe(rq, ix);
+ +	return 0;
+ +}
+ +
+  void mlx5e_dealloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix)
+  {
+  	struct mlx5e_mpw_info *wi = &rq->mpwqe.info[ix];
+@@@ -463,10 -470,10 +467,10 @@@
+  
+  bool mlx5e_post_rx_wqes(struct mlx5e_rq *rq)
+  {
+- 	struct mlx5_wq_ll *wq = &rq->wq;
++ 	struct mlx5_wq_ll *wq = &rq->wqe.wq;
+  	int err;
+  
+ -	if (unlikely(!test_bit(MLX5E_RQ_STATE_ENABLED, &rq->state)))
+ +	if (unlikely(!MLX5E_TEST_BIT(rq->state, MLX5E_RQ_STATE_ENABLED)))
+  		return false;
+  
+  	if (mlx5_wq_ll_is_full(wq))
+@@@ -539,9 -546,9 +543,9 @@@ static void mlx5e_poll_ico_cq(struct ml
+  
+  bool mlx5e_post_rx_mpwqes(struct mlx5e_rq *rq)
+  {
+- 	struct mlx5_wq_ll *wq = &rq->wq;
++ 	struct mlx5_wq_ll *wq = &rq->mpwqe.wq;
+  
+ -	if (unlikely(!test_bit(MLX5E_RQ_STATE_ENABLED, &rq->state)))
+ +	if (unlikely(!MLX5E_TEST_BIT(rq->state, MLX5E_RQ_STATE_ENABLED)))
+  		return false;
+  
+  	mlx5e_poll_ico_cq(&rq->channel->icosq.cq, rq);
+@@@ -1050,7 -1161,12 +1056,16 @@@ void mlx5e_handle_rx_cqe_mpwrq(struct m
+  	u16 cstrides       = mpwrq_get_cqe_consumed_strides(cqe);
+  	u16 wqe_id         = be16_to_cpu(cqe->wqe_id);
+  	struct mlx5e_mpw_info *wi = &rq->mpwqe.info[wqe_id];
+++<<<<<<< HEAD
+ +	struct mlx5e_rx_wqe  *wqe = mlx5_wq_ll_get_wqe(&rq->wq, wqe_id);
+++=======
++ 	u16 stride_ix      = mpwrq_get_cqe_stride_index(cqe);
++ 	u32 wqe_offset     = stride_ix << rq->mpwqe.log_stride_sz;
++ 	u32 head_offset    = wqe_offset & (PAGE_SIZE - 1);
++ 	u32 page_idx       = wqe_offset >> PAGE_SHIFT;
++ 	struct mlx5e_rx_wqe *wqe;
++ 	struct mlx5_wq_ll *wq;
+++>>>>>>> 422d4c401edd (net/mlx5e: RX, Split WQ objects for different RQ types)
+  	struct sk_buff *skb;
+  	u16 cqe_bcnt;
+  
+@@@ -1085,8 -1196,10 +1100,13 @@@ mpwrq_cqe_out
+  	if (likely(wi->consumed_strides < rq->mpwqe.num_strides))
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ 	wq  = &rq->mpwqe.wq;
++ 	wqe = mlx5_wq_ll_get_wqe(wq, wqe_id);
+++>>>>>>> 422d4c401edd (net/mlx5e: RX, Split WQ objects for different RQ types)
+  	mlx5e_free_rx_mpwqe(rq, wi);
+- 	mlx5_wq_ll_pop(&rq->wq, cqe->wqe_id, &wqe->next.next_wqe_index);
++ 	mlx5_wq_ll_pop(wq, cqe->wqe_id, &wqe->next.next_wqe_index);
+  }
+  
+  int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
