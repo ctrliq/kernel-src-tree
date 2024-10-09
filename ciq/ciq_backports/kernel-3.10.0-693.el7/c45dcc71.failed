@@ -1,0 +1,207 @@
+KVM: VMX: enable guest access to LMCE related MSRs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Ashok Raj <ashok.raj@intel.com>
+commit c45dcc71b794b5a346a43ad83bdcfac2138f0a2c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/c45dcc71.failed
+
+On Intel platforms, this patch adds LMCE to KVM MCE supported
+capabilities and handles guest access to LMCE related MSRs.
+
+	Signed-off-by: Ashok Raj <ashok.raj@intel.com>
+[Haozhong: macro KVM_MCE_CAP_SUPPORTED => variable kvm_mce_cap_supported
+           Only enable LMCE on Intel platform
+           Check MSR_IA32_FEATURE_CONTROL when handling guest
+             access to MSR_IA32_MCG_EXT_CTL]
+	Signed-off-by: Haozhong Zhang <haozhong.zhang@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit c45dcc71b794b5a346a43ad83bdcfac2138f0a2c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index 38430109c621,7a628fb6a2c2..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -895,8 -999,18 +896,17 @@@ struct kvm_x86_ops 
+  	 */
+  	int (*pre_block)(struct kvm_vcpu *vcpu);
+  	void (*post_block)(struct kvm_vcpu *vcpu);
+ -
+ -	void (*vcpu_blocking)(struct kvm_vcpu *vcpu);
+ -	void (*vcpu_unblocking)(struct kvm_vcpu *vcpu);
+ -
+  	int (*update_pi_irte)(struct kvm *kvm, unsigned int host_irq,
+  			      uint32_t guest_irq, bool set);
+++<<<<<<< HEAD
+++=======
++ 	void (*apicv_post_state_restore)(struct kvm_vcpu *vcpu);
++ 
++ 	int (*set_hv_timer)(struct kvm_vcpu *vcpu, u64 guest_deadline_tsc);
++ 	void (*cancel_hv_timer)(struct kvm_vcpu *vcpu);
++ 
++ 	void (*setup_mce)(struct kvm_vcpu *vcpu);
+++>>>>>>> c45dcc71b794 (KVM: VMX: enable guest access to LMCE related MSRs)
+  };
+  
+  struct kvm_arch_async_pf {
+@@@ -967,7 -1082,11 +977,9 @@@ extern u32  kvm_max_guest_tsc_khz
+  extern u8   kvm_tsc_scaling_ratio_frac_bits;
+  /* maximum allowed value of TSC scaling ratio */
+  extern u64  kvm_max_tsc_scaling_ratio;
+ -/* 1ull << kvm_tsc_scaling_ratio_frac_bits */
+ -extern u64  kvm_default_tsc_scaling_ratio;
+  
++ extern u64 kvm_mce_cap_supported;
++ 
+  enum emulation_result {
+  	EMULATE_DONE,         /* no further processing */
+  	EMULATE_USER_EXIT,    /* kvm_run ready for userspace exit */
+diff --cc arch/x86/kvm/vmx.c
+index cebaaac0b163,943609f06c90..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -2808,10 -2984,15 +2808,17 @@@ static int vmx_get_msr(struct kvm_vcpu 
+  			return 1;
+  		msr_info->data = vmcs_read64(GUEST_BNDCFGS);
+  		break;
++ 	case MSR_IA32_MCG_EXT_CTL:
++ 		if (!msr_info->host_initiated &&
++ 		    !(to_vmx(vcpu)->msr_ia32_feature_control &
++ 		      FEATURE_CONTROL_LMCE))
++ 			return 1;
++ 		msr_info->data = vcpu->arch.mcg_ext_ctl;
++ 		break;
+  	case MSR_IA32_FEATURE_CONTROL:
+ -		msr_info->data = to_vmx(vcpu)->msr_ia32_feature_control;
+ +		if (!nested_vmx_allowed(vcpu))
+ +			return 1;
+ +		msr_info->data = to_vmx(vcpu)->nested.msr_ia32_feature_control;
+  		break;
+  	case MSR_IA32_VMX_BASIC ... MSR_IA32_VMX_VMFUNC:
+  		if (!nested_vmx_allowed(vcpu))
+@@@ -2897,12 -3082,20 +2904,20 @@@ static int vmx_set_msr(struct kvm_vcpu 
+  	case MSR_IA32_TSC_ADJUST:
+  		ret = kvm_set_msr_common(vcpu, msr_info);
+  		break;
++ 	case MSR_IA32_MCG_EXT_CTL:
++ 		if ((!msr_info->host_initiated &&
++ 		     !(to_vmx(vcpu)->msr_ia32_feature_control &
++ 		       FEATURE_CONTROL_LMCE)) ||
++ 		    (data & ~MCG_EXT_CTL_LMCE_EN))
++ 			return 1;
++ 		vcpu->arch.mcg_ext_ctl = data;
++ 		break;
+  	case MSR_IA32_FEATURE_CONTROL:
+ -		if (!vmx_feature_control_msr_valid(vcpu, data) ||
+ -		    (to_vmx(vcpu)->msr_ia32_feature_control &
+ +		if (!nested_vmx_allowed(vcpu) ||
+ +		    (to_vmx(vcpu)->nested.msr_ia32_feature_control &
+  		     FEATURE_CONTROL_LOCKED && !msr_info->host_initiated))
+  			return 1;
+ -		vmx->msr_ia32_feature_control = data;
+ +		vmx->nested.msr_ia32_feature_control = data;
+  		if (msr_info->host_initiated && data == 0)
+  			vmx_leave_nested(vcpu);
+  		break;
+@@@ -6241,8 -6486,21 +6256,10 @@@ static __init int hardware_setup(void
+  		kvm_x86_ops->enable_log_dirty_pt_masked = NULL;
+  	}
+  
+ -	if (cpu_has_vmx_preemption_timer() && enable_preemption_timer) {
+ -		u64 vmx_msr;
+ -
+ -		rdmsrl(MSR_IA32_VMX_MISC, vmx_msr);
+ -		cpu_preemption_timer_multi =
+ -			 vmx_msr & VMX_MISC_PREEMPTION_TIMER_RATE_MASK;
+ -	} else {
+ -		kvm_x86_ops->set_hv_timer = NULL;
+ -		kvm_x86_ops->cancel_hv_timer = NULL;
+ -	}
+ -
+  	kvm_set_posted_intr_wakeup_handler(wakeup_handler);
+  
++ 	kvm_mce_cap_supported |= MCG_LMCE_P;
++ 
+  	return alloc_kvm_area();
+  
+  out8:
+@@@ -10813,6 -11260,13 +10840,16 @@@ static struct kvm_x86_ops vmx_x86_ops 
+  	.pmu_ops = &intel_pmu_ops,
+  
+  	.update_pi_irte = vmx_update_pi_irte,
+++<<<<<<< HEAD
+++=======
++ 
++ #ifdef CONFIG_X86_64
++ 	.set_hv_timer = vmx_set_hv_timer,
++ 	.cancel_hv_timer = vmx_cancel_hv_timer,
++ #endif
++ 
++ 	.setup_mce = vmx_setup_mce,
+++>>>>>>> c45dcc71b794 (KVM: VMX: enable guest access to LMCE related MSRs)
+  };
+  
+  static int __init vmx_init(void)
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/vmx.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 06fc23807a36..405365c37949 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -72,7 +72,8 @@
+ 
+ #define MAX_IO_MSRS 256
+ #define KVM_MAX_MCE_BANKS 32
+-#define KVM_MCE_CAP_SUPPORTED (MCG_CTL_P | MCG_SER_P)
++u64 __read_mostly kvm_mce_cap_supported = MCG_CTL_P | MCG_SER_P;
++EXPORT_SYMBOL_GPL(kvm_mce_cap_supported);
+ 
+ #define emul_to_vcpu(ctxt) \
+ 	container_of(ctxt, struct kvm_vcpu, arch.emulate_ctxt)
+@@ -978,6 +979,7 @@ static u32 emulated_msrs[] = {
+ 	MSR_IA32_MISC_ENABLE,
+ 	MSR_IA32_MCG_STATUS,
+ 	MSR_IA32_MCG_CTL,
++	MSR_IA32_MCG_EXT_CTL,
+ 	MSR_IA32_SMBASE,
+ };
+ 
+@@ -2877,11 +2879,9 @@ long kvm_arch_dev_ioctl(struct file *filp,
+ 		break;
+ 	}
+ 	case KVM_X86_GET_MCE_CAP_SUPPORTED: {
+-		u64 mce_cap;
+-
+-		mce_cap = KVM_MCE_CAP_SUPPORTED;
+ 		r = -EFAULT;
+-		if (copy_to_user(argp, &mce_cap, sizeof mce_cap))
++		if (copy_to_user(argp, &kvm_mce_cap_supported,
++				 sizeof(kvm_mce_cap_supported)))
+ 			goto out;
+ 		r = 0;
+ 		break;
+@@ -3055,7 +3055,7 @@ static int kvm_vcpu_ioctl_x86_setup_mce(struct kvm_vcpu *vcpu,
+ 	r = -EINVAL;
+ 	if (!bank_num || bank_num >= KVM_MAX_MCE_BANKS)
+ 		goto out;
+-	if (mcg_cap & ~(KVM_MCE_CAP_SUPPORTED | 0xff | 0xff0000))
++	if (mcg_cap & ~(kvm_mce_cap_supported | 0xff | 0xff0000))
+ 		goto out;
+ 	r = 0;
+ 	vcpu->arch.mcg_cap = mcg_cap;
+@@ -3065,6 +3065,9 @@ static int kvm_vcpu_ioctl_x86_setup_mce(struct kvm_vcpu *vcpu,
+ 	/* Init IA32_MCi_CTL to all 1s */
+ 	for (bank = 0; bank < bank_num; bank++)
+ 		vcpu->arch.mce_banks[bank*4] = ~(u64)0;
++
++	if (kvm_x86_ops->setup_mce)
++		kvm_x86_ops->setup_mce(vcpu);
+ out:
+ 	return r;
+ }
