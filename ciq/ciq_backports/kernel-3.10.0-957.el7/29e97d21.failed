@@ -1,0 +1,263 @@
+net: ipmr: rearrange and cleanup setsockopt
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] ipmr: rearrange and cleanup setsockopt (Ivan Vecera) [1584232]
+Rebuild_FUZZ: 93.83%
+commit-author Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+commit 29e97d214509ef4977838e073d30f6b16f75c6d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/29e97d21.failed
+
+Take rtnl in the beginning unconditionally as most options already need
+it (one exception - MRT_DONE, see the comment inside), make the
+lock/unlock places central and move out the switch() local variables.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 29e97d214509ef4977838e073d30f6b16f75c6d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/ipmr.c
+diff --cc net/ipv4/ipmr.c
+index 43241d83bc8e,e384f39202cb..000000000000
+--- a/net/ipv4/ipmr.c
++++ b/net/ipv4/ipmr.c
+@@@ -1262,33 -1270,41 +1262,48 @@@ static void mrtsock_destruct(struct soc
+  	rtnl_unlock();
+  }
+  
+ -/* Socket options and virtual interface manipulation. The whole
+ - * virtual interface system is a complete heap, but unfortunately
+ - * that's how BSD mrouted happens to think. Maybe one day with a proper
+ - * MOSPF/PIM router set up we can clean this up.
+ +/*
+ + *	Socket options and virtual interface manipulation. The whole
+ + *	virtual interface system is a complete heap, but unfortunately
+ + *	that's how BSD mrouted happens to think. Maybe one day with a proper
+ + *	MOSPF/PIM router set up we can clean this up.
+   */
+  
+- int ip_mroute_setsockopt(struct sock *sk, int optname, char __user *optval, unsigned int optlen)
++ int ip_mroute_setsockopt(struct sock *sk, int optname, char __user *optval,
++ 			 unsigned int optlen)
+  {
+- 	int ret, parent = 0;
+- 	struct vifctl vif;
+- 	struct mfcctl mfc;
+  	struct net *net = sock_net(sk);
++ 	int val, ret = 0, parent = 0;
+  	struct mr_table *mrt;
++ 	struct vifctl vif;
++ 	struct mfcctl mfc;
++ 	u32 uval;
+  
++ 	/* There's one exception to the lock - MRT_DONE which needs to unlock */
++ 	rtnl_lock();
+  	if (sk->sk_type != SOCK_RAW ||
+- 	    inet_sk(sk)->inet_num != IPPROTO_IGMP)
+- 		return -EOPNOTSUPP;
++ 	    inet_sk(sk)->inet_num != IPPROTO_IGMP) {
++ 		ret = -EOPNOTSUPP;
++ 		goto out_unlock;
++ 	}
+  
+  	mrt = ipmr_get_table(net, raw_sk(sk)->ipmr_table ? : RT_TABLE_DEFAULT);
+++<<<<<<< HEAD
+ +	if (mrt == NULL)
+ +		return -ENOENT;
+ +
+++=======
++ 	if (!mrt) {
++ 		ret = -ENOENT;
++ 		goto out_unlock;
++ 	}
+++>>>>>>> 29e97d214509 (net: ipmr: rearrange and cleanup setsockopt)
+  	if (optname != MRT_INIT) {
+  		if (sk != rcu_access_pointer(mrt->mroute_sk) &&
+- 		    !ns_capable(net->user_ns, CAP_NET_ADMIN))
+- 			return -EACCES;
++ 		    !ns_capable(net->user_ns, CAP_NET_ADMIN)) {
++ 			ret = -EACCES;
++ 			goto out_unlock;
++ 		}
+  	}
+  
+  	switch (optname) {
+@@@ -1331,13 -1358,10 +1357,20 @@@
+  		} else {
+  			ret = vif_delete(mrt, vif.vifc_vifi, 0, NULL);
+  		}
+++<<<<<<< HEAD
+ +		rtnl_unlock();
+ +		return ret;
+ +
+ +		/*
+ +		 *	Manipulate the forwarding caches. These live
+ +		 *	in a sort of kernel/user symbiosis.
+ +		 */
+++=======
++ 		break;
++ 	/* Manipulate the forwarding caches. These live
++ 	 * in a sort of kernel/user symbiosis.
++ 	 */
+++>>>>>>> 29e97d214509 (net: ipmr: rearrange and cleanup setsockopt)
+  	case MRT_ADD_MFC:
+  	case MRT_DEL_MFC:
+  		parent = -1;
+@@@ -1356,83 -1383,74 +1392,147 @@@
+  			ret = ipmr_mfc_add(net, mrt, &mfc,
+  					   sk == rtnl_dereference(mrt->mroute_sk),
+  					   parent);
+++<<<<<<< HEAD
+ +		rtnl_unlock();
+ +		return ret;
+ +		/*
+ +		 *	Control PIM assert.
+ +		 */
+ +	case MRT_ASSERT:
+ +	{
+ +		int v;
+ +		if (optlen != sizeof(v))
+ +			return -EINVAL;
+ +		if (get_user(v, (int __user *)optval))
+ +			return -EFAULT;
+ +		mrt->mroute_do_assert = v;
+ +		return 0;
+ +	}
+ +#ifdef CONFIG_IP_PIMSM
+ +	case MRT_PIM:
+ +	{
+ +		int v;
+ +
+ +		if (optlen != sizeof(v))
+ +			return -EINVAL;
+ +		if (get_user(v, (int __user *)optval))
+ +			return -EFAULT;
+ +		v = !!v;
+ +
+ +		rtnl_lock();
+ +		ret = 0;
+ +		if (v != mrt->mroute_do_pim) {
+ +			mrt->mroute_do_pim = v;
+ +			mrt->mroute_do_assert = v;
+ +		}
+ +		rtnl_unlock();
+ +		return ret;
+ +	}
+ +#endif
+ +#ifdef CONFIG_IP_MROUTE_MULTIPLE_TABLES
+++=======
++ 		break;
++ 	/* Control PIM assert. */
++ 	case MRT_ASSERT:
++ 		if (optlen != sizeof(val)) {
++ 			ret = -EINVAL;
++ 			break;
++ 		}
++ 		if (get_user(val, (int __user *)optval)) {
++ 			ret = -EFAULT;
++ 			break;
++ 		}
++ 		mrt->mroute_do_assert = val;
++ 		break;
++ 	case MRT_PIM:
++ 		if (!pimsm_enabled()) {
++ 			ret = -ENOPROTOOPT;
++ 			break;
++ 		}
++ 		if (optlen != sizeof(val)) {
++ 			ret = -EINVAL;
++ 			break;
++ 		}
++ 		if (get_user(val, (int __user *)optval)) {
++ 			ret = -EFAULT;
++ 			break;
++ 		}
++ 
++ 		val = !!val;
++ 		if (val != mrt->mroute_do_pim) {
++ 			mrt->mroute_do_pim = val;
++ 			mrt->mroute_do_assert = val;
++ 		}
++ 		break;
+++>>>>>>> 29e97d214509 (net: ipmr: rearrange and cleanup setsockopt)
+  	case MRT_TABLE:
+- 	{
+- 		u32 v;
++ 		if (!IS_BUILTIN(CONFIG_IP_MROUTE_MULTIPLE_TABLES)) {
++ 			ret = -ENOPROTOOPT;
++ 			break;
++ 		}
++ 		if (optlen != sizeof(uval)) {
++ 			ret = -EINVAL;
++ 			break;
++ 		}
++ 		if (get_user(uval, (u32 __user *)optval)) {
++ 			ret = -EFAULT;
++ 			break;
++ 		}
+  
+++<<<<<<< HEAD
+ +		if (optlen != sizeof(u32))
+ +			return -EINVAL;
+ +		if (get_user(v, (u32 __user *)optval))
+ +			return -EFAULT;
+ +
+ +		/* "pimreg%u" should not exceed 16 bytes (IFNAMSIZ) */
+ +		if (v != RT_TABLE_DEFAULT && v >= 1000000000)
+ +			return -EINVAL;
+ +
+ +		rtnl_lock();
+ +		ret = 0;
+ +		if (sk == rtnl_dereference(mrt->mroute_sk)) {
+ +			ret = -EBUSY;
+ +		} else {
+ +			if (!ipmr_new_table(net, v))
+ +				ret = -ENOMEM;
+++=======
++ 		if (sk == rtnl_dereference(mrt->mroute_sk)) {
++ 			ret = -EBUSY;
++ 		} else {
++ 			mrt = ipmr_new_table(net, uval);
++ 			if (IS_ERR(mrt))
++ 				ret = PTR_ERR(mrt);
+++>>>>>>> 29e97d214509 (net: ipmr: rearrange and cleanup setsockopt)
+  			else
+- 				raw_sk(sk)->ipmr_table = v;
++ 				raw_sk(sk)->ipmr_table = uval;
+  		}
+++<<<<<<< HEAD
+ +		rtnl_unlock();
+ +		return ret;
+ +	}
+ +#endif
+ +	/*
+ +	 *	Spurious command, or MRT_VERSION which you cannot
+ +	 *	set.
+ +	 */
+++=======
++ 		break;
++ 	/* Spurious command, or MRT_VERSION which you cannot set. */
+++>>>>>>> 29e97d214509 (net: ipmr: rearrange and cleanup setsockopt)
+  	default:
+- 		return -ENOPROTOOPT;
++ 		ret = -ENOPROTOOPT;
+  	}
++ out_unlock:
++ 	rtnl_unlock();
++ out:
++ 	return ret;
+  }
+  
+ -/* Getsock opt support for the multicast routing system. */
+ +/*
+ + *	Getsock opt support for the multicast routing system.
+ + */
+ +
+  int ip_mroute_getsockopt(struct sock *sk, int optname, char __user *optval, int __user *optlen)
+  {
+  	int olr;
+* Unmerged path net/ipv4/ipmr.c
