@@ -49,6 +49,10 @@
 				 NETIF_F_TSO | \
 				 NETIF_F_TSO6 | \
 				 NETIF_F_HW_CSUM)
+
+/* Restrict GSO size to account for NVGRE */
+#define NETVSC_GSO_MAX_SIZE	62768
+
 static int ring_size = 128;
 module_param(ring_size, int, S_IRUGO);
 MODULE_PARM_DESC(ring_size, "Ring buffer size (# of pages)");
@@ -1428,6 +1432,7 @@ static int netvsc_probe(struct hv_device *dev,
 	nvdev = net_device_ctx->nvdev;
 	netif_set_real_num_tx_queues(net, nvdev->num_chn);
 	netif_set_real_num_rx_queues(net, nvdev->num_chn);
+	netif_set_gso_max_size(net, NETVSC_GSO_MAX_SIZE);
 
 	netvsc_init_settings(net);
 
