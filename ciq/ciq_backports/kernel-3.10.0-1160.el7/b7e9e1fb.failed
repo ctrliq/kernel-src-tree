@@ -1,0 +1,262 @@
+scsi: implement .cleanup_rq callback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Ming Lei <ming.lei@redhat.com>
+commit b7e9e1fb7a9227be34ad4a5e778022c3164494cf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/b7e9e1fb.failed
+
+Implement .cleanup_rq() callback for freeing driver private part
+of the request. Then we can avoid to leak this part if the request isn't
+completed by SCSI, and freed by blk-mq or upper layer(such as dm-rq) finally.
+
+	Cc: Ewan D. Milne <emilne@redhat.com>
+	Cc: Bart Van Assche <bvanassche@acm.org>
+	Cc: Hannes Reinecke <hare@suse.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Mike Snitzer <snitzer@redhat.com>
+	Cc: dm-devel@redhat.com
+	Cc: <stable@vger.kernel.org>
+Fixes: 396eaf21ee17 ("blk-mq: improve DM's blk-mq IO merging via blk_insert_cloned_request feedback")
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit b7e9e1fb7a9227be34ad4a5e778022c3164494cf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_lib.c
+diff --cc drivers/scsi/scsi_lib.c
+index eedd4db07442,4e88d7e9cf9a..000000000000
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@@ -1171,42 -1068,107 +1171,140 @@@ err_exit
+  }
+  EXPORT_SYMBOL(scsi_init_io);
+  
+++<<<<<<< HEAD
+ +static struct scsi_cmnd *scsi_get_cmd_from_req(struct scsi_device *sdev,
+++=======
++ /**
++  * scsi_initialize_rq - initialize struct scsi_cmnd partially
++  * @rq: Request associated with the SCSI command to be initialized.
++  *
++  * This function initializes the members of struct scsi_cmnd that must be
++  * initialized before request processing starts and that won't be
++  * reinitialized if a SCSI command is requeued.
++  *
++  * Called from inside blk_get_request() for pass-through requests and from
++  * inside scsi_init_command() for filesystem requests.
++  */
++ static void scsi_initialize_rq(struct request *rq)
++ {
++ 	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(rq);
++ 
++ 	scsi_req_init(&cmd->req);
++ 	init_rcu_head(&cmd->rcu);
++ 	cmd->jiffies_at_alloc = jiffies;
++ 	cmd->retries = 0;
++ }
++ 
++ /*
++  * Only called when the request isn't completed by SCSI, and not freed by
++  * SCSI
++  */
++ static void scsi_cleanup_rq(struct request *rq)
++ {
++ 	if (rq->rq_flags & RQF_DONTPREP) {
++ 		scsi_mq_uninit_cmd(blk_mq_rq_to_pdu(rq));
++ 		rq->rq_flags &= ~RQF_DONTPREP;
++ 	}
++ }
++ 
++ /* Add a command to the list used by the aacraid and dpt_i2o drivers */
++ void scsi_add_cmd_to_list(struct scsi_cmnd *cmd)
++ {
++ 	struct scsi_device *sdev = cmd->device;
++ 	struct Scsi_Host *shost = sdev->host;
++ 	unsigned long flags;
++ 
++ 	if (shost->use_cmd_list) {
++ 		spin_lock_irqsave(&sdev->list_lock, flags);
++ 		list_add_tail(&cmd->list, &sdev->cmd_list);
++ 		spin_unlock_irqrestore(&sdev->list_lock, flags);
++ 	}
++ }
++ 
++ /* Remove a command from the list used by the aacraid and dpt_i2o drivers */
++ void scsi_del_cmd_from_list(struct scsi_cmnd *cmd)
++ {
++ 	struct scsi_device *sdev = cmd->device;
++ 	struct Scsi_Host *shost = sdev->host;
++ 	unsigned long flags;
++ 
++ 	if (shost->use_cmd_list) {
++ 		spin_lock_irqsave(&sdev->list_lock, flags);
++ 		BUG_ON(list_empty(&cmd->list));
++ 		list_del_init(&cmd->list);
++ 		spin_unlock_irqrestore(&sdev->list_lock, flags);
++ 	}
++ }
++ 
++ /* Called after a request has been started. */
++ void scsi_init_command(struct scsi_device *dev, struct scsi_cmnd *cmd)
++ {
++ 	void *buf = cmd->sense_buffer;
++ 	void *prot = cmd->prot_sdb;
++ 	struct request *rq = blk_mq_rq_from_pdu(cmd);
++ 	unsigned int flags = cmd->flags & SCMD_PRESERVED_FLAGS;
++ 	unsigned long jiffies_at_alloc;
++ 	int retries;
++ 
++ 	if (!blk_rq_is_scsi(rq) && !(flags & SCMD_INITIALIZED)) {
++ 		flags |= SCMD_INITIALIZED;
++ 		scsi_initialize_rq(rq);
++ 	}
++ 
++ 	jiffies_at_alloc = cmd->jiffies_at_alloc;
++ 	retries = cmd->retries;
++ 	/* zero out the cmd, except for the embedded scsi_request */
++ 	memset((char *)cmd + sizeof(cmd->req), 0,
++ 		sizeof(*cmd) - sizeof(cmd->req) + dev->host->hostt->cmd_size);
++ 
++ 	cmd->device = dev;
++ 	cmd->sense_buffer = buf;
++ 	cmd->prot_sdb = prot;
++ 	cmd->flags = flags;
++ 	INIT_DELAYED_WORK(&cmd->abort_work, scmd_eh_abort_handler);
++ 	cmd->jiffies_at_alloc = jiffies_at_alloc;
++ 	cmd->retries = retries;
++ 
++ 	scsi_add_cmd_to_list(cmd);
++ }
++ 
++ static blk_status_t scsi_setup_scsi_cmnd(struct scsi_device *sdev,
+++>>>>>>> b7e9e1fb7a92 (scsi: implement .cleanup_rq callback)
+  		struct request *req)
+  {
+ -	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(req);
+ +	struct scsi_cmnd *cmd;
+ +
+ +	if (!req->special) {
+ +		/* Bail if we can't get a reference to the device */
+ +		if (!get_device(&sdev->sdev_gendev))
+ +			return NULL;
+ +
+ +		cmd = scsi_get_command(sdev, GFP_ATOMIC);
+ +		if (unlikely(!cmd)) {
+ +			put_device(&sdev->sdev_gendev);
+ +			return NULL;
+ +		}
+ +		req->special = cmd;
+ +	} else {
+ +		cmd = req->special;
+ +	}
+ +
+ +	/* pull a tag out of the request if we have one */
+ +	cmd->tag = req->tag;
+ +	cmd->request = req;
+ +
+ +	cmd->cmnd = req->cmd;
+ +	cmd->prot_op = SCSI_PROT_NORMAL;
+ +
+ +	return cmd;
+ +}
+ +
+ +static int scsi_setup_blk_pc_cmnd(struct scsi_device *sdev, struct request *req)
+ +{
+ +	struct scsi_cmnd *cmd = req->special;
+  
+  	/*
+ -	 * Passthrough requests may transfer data, in which case they must
+ +	 * BLOCK_PC requests may transfer data, in which case they must
+  	 * a bio attached to them.  Or they might contain a SCSI command
+  	 * that does not transfer data, in which case they may optionally
+  	 * submit a request without an attached bio.
+@@@ -2047,60 -1806,36 +2145,73 @@@ static void __scsi_init_queue(struct Sc
+  	blk_queue_segment_boundary(q, shost->dma_boundary);
+  	dma_set_seg_boundary(dev, shost->dma_boundary);
+  
+ -	blk_queue_max_segment_size(q, shost->max_segment_size);
+ -	blk_queue_virt_boundary(q, shost->virt_boundary_mask);
+ -	dma_set_max_seg_size(dev, queue_max_segment_size(q));
+ +	blk_queue_max_segment_size(q, dma_get_max_seg_size(dev));
+ +
+ +	if (!shost->use_clustering)
+ +		q->limits.cluster = 0;
+  
+  	/*
+ -	 * Set a reasonable default alignment:  The larger of 32-byte (dword),
+ -	 * which is a common minimum for HBAs, and the minimum DMA alignment,
+ -	 * which is set by the platform.
+ -	 *
+ -	 * Devices that require a bigger alignment can increase it later.
+ +	 * set a reasonable default alignment on word boundaries: the
+ +	 * host and device may alter it using
+ +	 * blk_queue_update_dma_alignment() later.
+  	 */
+ -	blk_queue_dma_alignment(q, max(4, dma_get_cache_alignment()) - 1);
+ +	blk_queue_dma_alignment(q, 0x03);
+ +}
+ +
+ +struct request_queue *__scsi_alloc_queue(struct Scsi_Host *shost,
+ +					 request_fn_proc *request_fn)
+ +{
+ +	struct request_queue *q;
+ +
+ +	q = blk_init_queue(request_fn, NULL);
+ +	if (!q)
+ +		return NULL;
+ +	__scsi_init_queue(shost, q);
+ +	return q;
+ +}
+ +EXPORT_SYMBOL(__scsi_alloc_queue);
+ +
+ +struct request_queue *scsi_alloc_queue(struct scsi_device *sdev)
+ +{
+ +	struct request_queue *q;
+ +
+ +	q = __scsi_alloc_queue(sdev->host, scsi_request_fn);
+ +	if (!q)
+ +		return NULL;
+ +
+ +	blk_queue_prep_rq(q, scsi_prep_fn);
+ +	blk_queue_unprep_rq(q, scsi_unprep_fn);
+ +	blk_queue_softirq_done(q, scsi_softirq_done);
+ +	blk_queue_rq_timed_out(q, scsi_times_out);
+ +	blk_queue_lld_busy(q, scsi_lld_busy);
+ +	return q;
+  }
+ -EXPORT_SYMBOL_GPL(__scsi_init_queue);
+  
+ -static const struct blk_mq_ops scsi_mq_ops = {
+ +static struct blk_mq_aux_ops scsi_mq_aux_ops = {
+  	.get_budget	= scsi_mq_get_budget,
+  	.put_budget	= scsi_mq_put_budget,
+ +};
+ +
+ +static struct blk_mq_ops scsi_mq_ops = {
+ +	.aux_ops	= &scsi_mq_aux_ops,
+  	.queue_rq	= scsi_queue_rq,
+  	.complete	= scsi_softirq_done,
+++<<<<<<< HEAD
+ +	.timeout        = scsi_timeout,
+ +	.init_request	= scsi_init_request,
+ +	.exit_request	= scsi_exit_request,
+++=======
++ 	.timeout	= scsi_timeout,
++ #ifdef CONFIG_BLK_DEBUG_FS
++ 	.show_rq	= scsi_show_rq,
++ #endif
++ 	.init_request	= scsi_mq_init_request,
++ 	.exit_request	= scsi_mq_exit_request,
++ 	.initialize_rq_fn = scsi_initialize_rq,
++ 	.cleanup_rq	= scsi_cleanup_rq,
++ 	.busy		= scsi_mq_lld_busy,
++ 	.map_queues	= scsi_map_queues,
+++>>>>>>> b7e9e1fb7a92 (scsi: implement .cleanup_rq callback)
+  };
+  
+  struct request_queue *scsi_mq_alloc_queue(struct scsi_device *sdev)
+* Unmerged path drivers/scsi/scsi_lib.c
