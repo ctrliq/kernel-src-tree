@@ -1,0 +1,184 @@
+sctp: Add peeloff-flags socket option
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Neil Horman <nhorman@tuxdriver.com>
+commit 2cb5c8e378d10a57aa1c9eaee36bea46c27dd2b9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/2cb5c8e3.failed
+
+Based on a request raised on the sctp devel list, there is a need to
+augment the sctp_peeloff operation while specifying the O_CLOEXEC and
+O_NONBLOCK flags (simmilar to the socket syscall).  Since modifying the
+SCTP_SOCKOPT_PEELOFF socket option would break user space ABI for existing
+programs, this patch creates a new socket option
+SCTP_SOCKOPT_PEELOFF_FLAGS, which accepts a third flags parameter to
+allow atomic assignment of the socket descriptor flags.
+
+Tested successfully by myself and the requestor
+
+	Signed-off-by: Neil Horman <nhorman@tuxdriver.com>
+CC: Vlad Yasevich <vyasevich@gmail.com>
+CC: "David S. Miller" <davem@davemloft.net>
+CC: Andreas Steinmetz <ast@domdv.de>
+CC: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Acked-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2cb5c8e378d10a57aa1c9eaee36bea46c27dd2b9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/sctp.h
+diff --cc include/uapi/linux/sctp.h
+index 55fbc94d1f44,6217ff8500a1..000000000000
+--- a/include/uapi/linux/sctp.h
++++ b/include/uapi/linux/sctp.h
+@@@ -116,6 -115,13 +116,16 @@@ typedef __s32 sctp_assoc_t
+  #define SCTP_PR_SUPPORTED	113
+  #define SCTP_DEFAULT_PRINFO	114
+  #define SCTP_PR_ASSOC_STATUS	115
+++<<<<<<< HEAD
+++=======
++ #define SCTP_PR_STREAM_STATUS	116
++ #define SCTP_RECONFIG_SUPPORTED	117
++ #define SCTP_ENABLE_STREAM_RESET	118
++ #define SCTP_RESET_STREAMS	119
++ #define SCTP_RESET_ASSOC	120
++ #define SCTP_ADD_STREAMS	121
++ #define SCTP_SOCKOPT_PEELOFF_FLAGS 122
+++>>>>>>> 2cb5c8e378d1 (sctp: Add peeloff-flags socket option)
+  
+  /* PR-SCTP policies */
+  #define SCTP_PR_SCTP_NONE	0x0000
+* Unmerged path include/uapi/linux/sctp.h
+diff --git a/net/sctp/socket.c b/net/sctp/socket.c
+index 213fcdb6551d..4349aa2a98ec 100644
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@ -4819,11 +4819,47 @@ int sctp_do_peeloff(struct sock *sk, sctp_assoc_t id, struct socket **sockp)
+ }
+ EXPORT_SYMBOL(sctp_do_peeloff);
+ 
++static int sctp_getsockopt_peeloff_common(struct sock *sk, sctp_peeloff_arg_t *peeloff,
++					  struct file **newfile, unsigned flags)
++{
++	struct socket *newsock;
++	int retval;
++
++	retval = sctp_do_peeloff(sk, peeloff->associd, &newsock);
++	if (retval < 0)
++		goto out;
++
++	/* Map the socket to an unused fd that can be returned to the user.  */
++	retval = get_unused_fd_flags(flags & SOCK_CLOEXEC);
++	if (retval < 0) {
++		sock_release(newsock);
++		goto out;
++	}
++
++	*newfile = sock_alloc_file(newsock, 0, NULL);
++	if (IS_ERR(*newfile)) {
++		put_unused_fd(retval);
++		sock_release(newsock);
++		retval = PTR_ERR(*newfile);
++		*newfile = NULL;
++		return retval;
++	}
++
++	pr_debug("%s: sk:%p, newsk:%p, sd:%d\n", __func__, sk, newsock->sk,
++		 retval);
++
++	peeloff->sd = retval;
++
++	if (flags & SOCK_NONBLOCK)
++		(*newfile)->f_flags |= O_NONBLOCK;
++out:
++	return retval;
++}
++
+ static int sctp_getsockopt_peeloff(struct sock *sk, int len, char __user *optval, int __user *optlen)
+ {
+ 	sctp_peeloff_arg_t peeloff;
+-	struct socket *newsock;
+-	struct file *newfile;
++	struct file *newfile = NULL;
+ 	int retval = 0;
+ 
+ 	if (len < sizeof(sctp_peeloff_arg_t))
+@@ -4832,26 +4868,44 @@ static int sctp_getsockopt_peeloff(struct sock *sk, int len, char __user *optval
+ 	if (copy_from_user(&peeloff, optval, len))
+ 		return -EFAULT;
+ 
+-	retval = sctp_do_peeloff(sk, peeloff.associd, &newsock);
++	retval = sctp_getsockopt_peeloff_common(sk, &peeloff, &newfile, 0);
+ 	if (retval < 0)
+ 		goto out;
+ 
+-	/* Map the socket to an unused fd that can be returned to the user.  */
+-	retval = get_unused_fd_flags(0);
+-	if (retval < 0) {
+-		sock_release(newsock);
+-		goto out;
++	/* Return the fd mapped to the new socket.  */
++	if (put_user(len, optlen)) {
++		fput(newfile);
++		put_unused_fd(retval);
++		return -EFAULT;
+ 	}
+ 
+-	newfile = sock_alloc_file(newsock, 0, NULL);
+-	if (IS_ERR(newfile)) {
++	if (copy_to_user(optval, &peeloff, len)) {
++		fput(newfile);
+ 		put_unused_fd(retval);
+-		sock_release(newsock);
+-		return PTR_ERR(newfile);
++		return -EFAULT;
+ 	}
++	fd_install(retval, newfile);
++out:
++	return retval;
++}
+ 
+-	pr_debug("%s: sk:%p, newsk:%p, sd:%d\n", __func__, sk, newsock->sk,
+-		 retval);
++static int sctp_getsockopt_peeloff_flags(struct sock *sk, int len,
++					 char __user *optval, int __user *optlen)
++{
++	sctp_peeloff_flags_arg_t peeloff;
++	struct file *newfile = NULL;
++	int retval = 0;
++
++	if (len < sizeof(sctp_peeloff_flags_arg_t))
++		return -EINVAL;
++	len = sizeof(sctp_peeloff_flags_arg_t);
++	if (copy_from_user(&peeloff, optval, len))
++		return -EFAULT;
++
++	retval = sctp_getsockopt_peeloff_common(sk, &peeloff.p_arg,
++						&newfile, peeloff.flags);
++	if (retval < 0)
++		goto out;
+ 
+ 	/* Return the fd mapped to the new socket.  */
+ 	if (put_user(len, optlen)) {
+@@ -4859,7 +4913,7 @@ static int sctp_getsockopt_peeloff(struct sock *sk, int len, char __user *optval
+ 		put_unused_fd(retval);
+ 		return -EFAULT;
+ 	}
+-	peeloff.sd = retval;
++
+ 	if (copy_to_user(optval, &peeloff, len)) {
+ 		fput(newfile);
+ 		put_unused_fd(retval);
+@@ -6504,6 +6558,9 @@ static int sctp_getsockopt(struct sock *sk, int level, int optname,
+ 	case SCTP_SOCKOPT_PEELOFF:
+ 		retval = sctp_getsockopt_peeloff(sk, len, optval, optlen);
+ 		break;
++	case SCTP_SOCKOPT_PEELOFF_FLAGS:
++		retval = sctp_getsockopt_peeloff_flags(sk, len, optval, optlen);
++		break;
+ 	case SCTP_PEER_ADDR_PARAMS:
+ 		retval = sctp_getsockopt_peer_addr_params(sk, len, optval,
+ 							  optlen);
