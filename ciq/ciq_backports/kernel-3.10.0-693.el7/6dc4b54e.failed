@@ -1,0 +1,177 @@
+net/mlx5e: Update MPWQE stride size when modifying CQE compress state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Update MPWQE stride size when modifying CQE compress state (Jonathan Toppins) [1448565]
+Rebuild_FUZZ: 97.01%
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit 6dc4b54e77282caf17f0ff72aa32dd296037fbc0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/6dc4b54e.failed
+
+When the admin enables/disables cqe compression, updating
+mpwqe stride size is required:
+    CQE compress ON  ==> stride size = 256B
+    CQE compress OFF ==> stride size = 64B
+
+This is already done on driver load via mlx5e_set_rq_type_params, all we
+need is just to call it on arbitrary admin changes of cqe compression
+state via priv flags or when changing timestamping state
+(as it is mutually exclusive with cqe compression).
+
+This bug introduces no functional damage, it only makes cqe compression
+occur less often, since in ConnectX4-LX CQE compression is performed
+only on packets smaller than stride size.
+
+Tested:
+ ethtool --set-priv-flags ethxx rx_cqe_compress on
+ pktgen with  64 < pkt size < 256 and netperf TCP_STREAM (IPv4/IPv6)
+ verify `ethtool -S ethxx | grep compress` are advancing more often
+ (rapidly)
+
+Fixes: 7219ab34f184 ("net/mlx5e: CQE compression")
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+	Cc: kernel-team@fb.com
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6dc4b54e77282caf17f0ff72aa32dd296037fbc0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+index 942369d80444,a004a5a1a4c2..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+@@@ -1350,6 -1471,27 +1350,30 @@@ static int set_pflag_rx_cqe_based_moder
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int set_pflag_rx_cqe_compress(struct net_device *netdev,
++ 				     bool enable)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(netdev);
++ 	struct mlx5_core_dev *mdev = priv->mdev;
++ 
++ 	if (!MLX5_CAP_GEN(mdev, cqe_compression))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (enable && priv->tstamp.hwtstamp_config.rx_filter != HWTSTAMP_FILTER_NONE) {
++ 		netdev_err(netdev, "Can't enable cqe compression while timestamping is enabled.\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	mlx5e_modify_rx_cqe_compression_locked(priv, enable);
++ 	priv->params.rx_cqe_compress_def = enable;
++ 	mlx5e_set_rq_type_params(priv, priv->params.rq_wq_type);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 6dc4b54e7728 (net/mlx5e: Update MPWQE stride size when modifying CQE compress state)
+  static int mlx5e_handle_pflag(struct net_device *netdev,
+  			      u32 wanted_flags,
+  			      enum mlx5e_priv_flag flag,
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index ae009c7fda21,8ef64c4db2c2..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -71,6 -72,58 +71,61 @@@ struct mlx5e_channel_param 
+  	struct mlx5e_cq_param      icosq_cq;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static bool mlx5e_check_fragmented_striding_rq_cap(struct mlx5_core_dev *mdev)
++ {
++ 	return MLX5_CAP_GEN(mdev, striding_rq) &&
++ 		MLX5_CAP_GEN(mdev, umr_ptr_rlky) &&
++ 		MLX5_CAP_ETH(mdev, reg_umr_sq);
++ }
++ 
++ void mlx5e_set_rq_type_params(struct mlx5e_priv *priv, u8 rq_type)
++ {
++ 	priv->params.rq_wq_type = rq_type;
++ 	priv->params.lro_wqe_sz = MLX5E_PARAMS_DEFAULT_LRO_WQE_SZ;
++ 	switch (priv->params.rq_wq_type) {
++ 	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
++ 		priv->params.log_rq_size = is_kdump_kernel() ?
++ 			MLX5E_PARAMS_MINIMUM_LOG_RQ_SIZE_MPW :
++ 			MLX5E_PARAMS_DEFAULT_LOG_RQ_SIZE_MPW;
++ 		priv->params.mpwqe_log_stride_sz =
++ 			MLX5E_GET_PFLAG(priv, MLX5E_PFLAG_RX_CQE_COMPRESS) ?
++ 			MLX5_MPWRQ_CQE_CMPRS_LOG_STRIDE_SZ(priv->mdev) :
++ 			MLX5_MPWRQ_DEF_LOG_STRIDE_SZ(priv->mdev);
++ 		priv->params.mpwqe_log_num_strides = MLX5_MPWRQ_LOG_WQE_SZ -
++ 			priv->params.mpwqe_log_stride_sz;
++ 		break;
++ 	default: /* MLX5_WQ_TYPE_LINKED_LIST */
++ 		priv->params.log_rq_size = is_kdump_kernel() ?
++ 			MLX5E_PARAMS_MINIMUM_LOG_RQ_SIZE :
++ 			MLX5E_PARAMS_DEFAULT_LOG_RQ_SIZE;
++ 
++ 		/* Extra room needed for build_skb */
++ 		priv->params.lro_wqe_sz -= MLX5_RX_HEADROOM +
++ 			SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
++ 	}
++ 	priv->params.min_rx_wqes = mlx5_min_rx_wqes(priv->params.rq_wq_type,
++ 					       BIT(priv->params.log_rq_size));
++ 
++ 	mlx5_core_info(priv->mdev,
++ 		       "MLX5E: StrdRq(%d) RqSz(%ld) StrdSz(%ld) RxCqeCmprss(%d)\n",
++ 		       priv->params.rq_wq_type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ,
++ 		       BIT(priv->params.log_rq_size),
++ 		       BIT(priv->params.mpwqe_log_stride_sz),
++ 		       MLX5E_GET_PFLAG(priv, MLX5E_PFLAG_RX_CQE_COMPRESS));
++ }
++ 
++ static void mlx5e_set_rq_priv_params(struct mlx5e_priv *priv)
++ {
++ 	u8 rq_type = mlx5e_check_fragmented_striding_rq_cap(priv->mdev) &&
++ 		    !priv->xdp_prog ?
++ 		    MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ :
++ 		    MLX5_WQ_TYPE_LINKED_LIST;
++ 	mlx5e_set_rq_type_params(priv, rq_type);
++ }
++ 
+++>>>>>>> 6dc4b54e7728 (net/mlx5e: Update MPWQE stride size when modifying CQE compress state)
+  static void mlx5e_update_carrier(struct mlx5e_priv *priv)
+  {
+  	struct mlx5_core_dev *mdev = priv->mdev;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index a43ebbb25ba4,d5ce20db3f0b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -170,7 -171,8 +170,12 @@@ void mlx5e_modify_rx_cqe_compression(st
+  	if (was_opened)
+  		mlx5e_close_locked(priv->netdev);
+  
+++<<<<<<< HEAD
+ +	priv->params.rx_cqe_compress = val;
+++=======
++ 	MLX5E_SET_PFLAG(priv, MLX5E_PFLAG_RX_CQE_COMPRESS, val);
++ 	mlx5e_set_rq_type_params(priv, priv->params.rq_wq_type);
+++>>>>>>> 6dc4b54e7728 (net/mlx5e: Update MPWQE stride size when modifying CQE compress state)
+  
+  	if (was_opened)
+  		mlx5e_open_locked(priv->netdev);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index f49539a1ae6e..8a4c9350457e 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -598,6 +598,7 @@ int mlx5e_get_max_linkspeed(struct mlx5_core_dev *mdev, u32 *speed);
+ 
+ void mlx5e_set_rx_cq_mode_params(struct mlx5e_params *params,
+ 				 u8 cq_period_mode);
++void mlx5e_set_rq_type_params(struct mlx5e_priv *priv, u8 rq_type);
+ 
+ static inline void mlx5e_tx_notify_hw(struct mlx5e_sq *sq,
+ 				      struct mlx5_wqe_ctrl_seg *ctrl, int bf_sz)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
