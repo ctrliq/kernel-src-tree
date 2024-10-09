@@ -1,0 +1,139 @@
+net_sched: introduce tclass_del_notify()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author WANG Cong <xiyou.wangcong@gmail.com>
+commit 14546ba1e5653e5dd00d113e98bd21b5b235192b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/14546ba1.failed
+
+Like for TC actions, ->delete() is a special case,
+we have to prepare and fill the notification before delete
+otherwise would get use-after-free after we remove the
+reference count.
+
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 14546ba1e5653e5dd00d113e98bd21b5b235192b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/sch_api.c
+diff --cc net/sched/sch_api.c
+index 0fd3de4f5fdb,3ef4eb578739..000000000000
+--- a/net/sched/sch_api.c
++++ b/net/sched/sch_api.c
+@@@ -1529,9 -1552,106 +1529,85 @@@ done
+   *	Traffic classes manipulation.		*
+   ************************************************/
+  
+ -static int tc_fill_tclass(struct sk_buff *skb, struct Qdisc *q,
+ -			  unsigned long cl,
+ -			  u32 portid, u32 seq, u16 flags, int event)
+ -{
+ -	struct tcmsg *tcm;
+ -	struct nlmsghdr  *nlh;
+ -	unsigned char *b = skb_tail_pointer(skb);
+ -	struct gnet_dump d;
+ -	const struct Qdisc_class_ops *cl_ops = q->ops->cl_ops;
+  
+ -	cond_resched();
+ -	nlh = nlmsg_put(skb, portid, seq, event, sizeof(*tcm), flags);
+ -	if (!nlh)
+ -		goto out_nlmsg_trim;
+ -	tcm = nlmsg_data(nlh);
+ -	tcm->tcm_family = AF_UNSPEC;
+ -	tcm->tcm__pad1 = 0;
+ -	tcm->tcm__pad2 = 0;
+ -	tcm->tcm_ifindex = qdisc_dev(q)->ifindex;
+ -	tcm->tcm_parent = q->handle;
+ -	tcm->tcm_handle = q->handle;
+ -	tcm->tcm_info = 0;
+ -	if (nla_put_string(skb, TCA_KIND, q->ops->id))
+ -		goto nla_put_failure;
+ -	if (cl_ops->dump && cl_ops->dump(q, cl, skb, tcm) < 0)
+ -		goto nla_put_failure;
+  
+++<<<<<<< HEAD
+ +static int tc_ctl_tclass(struct sk_buff *skb, struct nlmsghdr *n)
+++=======
++ 	if (gnet_stats_start_copy_compat(skb, TCA_STATS2, TCA_STATS, TCA_XSTATS,
++ 					 NULL, &d, TCA_PAD) < 0)
++ 		goto nla_put_failure;
++ 
++ 	if (cl_ops->dump_stats && cl_ops->dump_stats(q, cl, &d) < 0)
++ 		goto nla_put_failure;
++ 
++ 	if (gnet_stats_finish_copy(&d) < 0)
++ 		goto nla_put_failure;
++ 
++ 	nlh->nlmsg_len = skb_tail_pointer(skb) - b;
++ 	return skb->len;
++ 
++ out_nlmsg_trim:
++ nla_put_failure:
++ 	nlmsg_trim(skb, b);
++ 	return -1;
++ }
++ 
++ static int tclass_notify(struct net *net, struct sk_buff *oskb,
++ 			 struct nlmsghdr *n, struct Qdisc *q,
++ 			 unsigned long cl, int event)
++ {
++ 	struct sk_buff *skb;
++ 	u32 portid = oskb ? NETLINK_CB(oskb).portid : 0;
++ 
++ 	skb = alloc_skb(NLMSG_GOODSIZE, GFP_KERNEL);
++ 	if (!skb)
++ 		return -ENOBUFS;
++ 
++ 	if (tc_fill_tclass(skb, q, cl, portid, n->nlmsg_seq, 0, event) < 0) {
++ 		kfree_skb(skb);
++ 		return -EINVAL;
++ 	}
++ 
++ 	return rtnetlink_send(skb, net, portid, RTNLGRP_TC,
++ 			      n->nlmsg_flags & NLM_F_ECHO);
++ }
++ 
++ static int tclass_del_notify(struct net *net,
++ 			     const struct Qdisc_class_ops *cops,
++ 			     struct sk_buff *oskb, struct nlmsghdr *n,
++ 			     struct Qdisc *q, unsigned long cl)
++ {
++ 	u32 portid = oskb ? NETLINK_CB(oskb).portid : 0;
++ 	struct sk_buff *skb;
++ 	int err = 0;
++ 
++ 	if (!cops->delete)
++ 		return -EOPNOTSUPP;
++ 
++ 	skb = alloc_skb(NLMSG_GOODSIZE, GFP_KERNEL);
++ 	if (!skb)
++ 		return -ENOBUFS;
++ 
++ 	if (tc_fill_tclass(skb, q, cl, portid, n->nlmsg_seq, 0,
++ 			   RTM_DELTCLASS) < 0) {
++ 		kfree_skb(skb);
++ 		return -EINVAL;
++ 	}
++ 
++ 	err = cops->delete(q, cl);
++ 	if (err) {
++ 		kfree_skb(skb);
++ 		return err;
++ 	}
++ 
++ 	return rtnetlink_send(skb, net, portid, RTNLGRP_TC,
++ 			      n->nlmsg_flags & NLM_F_ECHO);
++ }
++ 
++ static int tc_ctl_tclass(struct sk_buff *skb, struct nlmsghdr *n,
++ 			 struct netlink_ext_ack *extack)
+++>>>>>>> 14546ba1e565 (net_sched: introduce tclass_del_notify())
+  {
+  	struct net *net = sock_net(skb->sk);
+  	struct tcmsg *tcm = nlmsg_data(n);
+* Unmerged path net/sched/sch_api.c
