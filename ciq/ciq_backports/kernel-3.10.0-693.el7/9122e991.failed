@@ -1,0 +1,403 @@
+scsi: be2iscsi: Fix checks for HBA in error state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] be2iscsi: Fix checks for HBA in error state (Maurizio Lombardi) [1382263]
+Rebuild_FUZZ: 93.48%
+commit-author Jitendra Bhivare <jitendra.bhivare@broadcom.com>
+commit 9122e991cebb90a7225109ed7627950f485c5f58
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/9122e991.failed
+
+Save ue_detected and fw_timeout errors in state field of beiscsi_hba.
+BEISCSI_HBA_RUNNING
+BEISCSI_HBA_LINK_UP
+BEISCSI_HBA_BOOT_FOUND
+BEISCSI_HBA_PCI_ERR
+BEISCSI_HBA_FW_TIMEOUT
+BEISCSI_HBA_IN_UE
+
+Make sure no PCI transaction happens once in error state.
+Add checks in IO path to detect HBA in error.
+
+Skip hwi_purge_eq step which can't be done in error state.
+
+	Signed-off-by: Jitendra Bhivare <jitendra.bhivare@broadcom.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 9122e991cebb90a7225109ed7627950f485c5f58)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/be2iscsi/be_main.c
+diff --cc drivers/scsi/be2iscsi/be_main.c
+index 8e3a0f9d2ac4,22fcbea6894d..000000000000
+--- a/drivers/scsi/be2iscsi/be_main.c
++++ b/drivers/scsi/be2iscsi/be_main.c
+@@@ -5612,11 -5635,8 +5650,13 @@@ static int beiscsi_dev_probe(struct pci
+  	/* Initialize Driver configuration Paramters */
+  	beiscsi_hba_attrs_init(phba);
+  
+- 	phba->fw_timeout = false;
+  	phba->mac_addr_set = false;
+  
+++<<<<<<< HEAD
+ +	pci_hw_vendor_status(beiscsi_pci_id_deprecated, pcidev);
+ +
+++=======
+++>>>>>>> 9122e991cebb (scsi: be2iscsi: Fix checks for HBA in error state)
+  	switch (pcidev->device) {
+  	case BE_DEVICE_ID1:
+  	case OC_DEVICE_ID1:
+diff --git a/drivers/scsi/be2iscsi/be_cmds.c b/drivers/scsi/be2iscsi/be_cmds.c
+index 403296239ae9..f16de6cf2678 100644
+--- a/drivers/scsi/be2iscsi/be_cmds.c
++++ b/drivers/scsi/be2iscsi/be_cmds.c
+@@ -152,8 +152,11 @@ int beiscsi_mccq_compl_wait(struct beiscsi_hba *phba,
+ 	struct be_cmd_resp_hdr *mbx_resp_hdr;
+ 	struct be_queue_info *mccq = &phba->ctrl.mcc_obj.q;
+ 
+-	if (beiscsi_error(phba))
+-		return -EPERM;
++	if (beiscsi_hba_in_error(phba)) {
++		clear_bit(MCC_TAG_STATE_RUNNING,
++			  &phba->ctrl.ptag_state[tag].tag_state);
++		return -EIO;
++	}
+ 
+ 	/* wait for the mccq completion */
+ 	rc = wait_event_interruptible_timeout(
+@@ -315,13 +318,16 @@ static void beiscsi_process_async_link(struct beiscsi_hba *phba,
+ 	 * This has been newly introduced in SKH-R Firmware 10.0.338.45.
+ 	 **/
+ 	if (evt->port_link_status & BE_ASYNC_LINK_UP_MASK) {
+-		phba->state = BE_ADAPTER_LINK_UP | BE_ADAPTER_CHECK_BOOT;
+ 		phba->get_boot = BE_GET_BOOT_RETRIES;
++		/* first this needs to be visible to worker thread */
++		wmb();
++		set_bit(BEISCSI_HBA_LINK_UP | BEISCSI_HBA_BOOT_FOUND,
++			&phba->state);
+ 		__beiscsi_log(phba, KERN_ERR,
+ 			      "BC_%d : Link Up on Port %d tag 0x%x\n",
+ 			      evt->physical_port, evt->event_tag);
+ 	} else {
+-		phba->state = BE_ADAPTER_LINK_DOWN;
++		clear_bit(BEISCSI_HBA_LINK_UP, &phba->state);
+ 		__beiscsi_log(phba, KERN_ERR,
+ 			      "BC_%d : Link Down on Port %d tag 0x%x\n",
+ 			      evt->physical_port, evt->event_tag);
+@@ -406,8 +412,10 @@ void beiscsi_process_async_event(struct beiscsi_hba *phba,
+ 		beiscsi_process_async_link(phba, compl);
+ 		break;
+ 	case ASYNC_EVENT_CODE_ISCSI:
+-		phba->state |= BE_ADAPTER_CHECK_BOOT;
+ 		phba->get_boot = BE_GET_BOOT_RETRIES;
++		/* first this needs to be visible to worker thread */
++		wmb();
++		set_bit(BEISCSI_HBA_BOOT_FOUND, &phba->state);
+ 		sev = KERN_ERR;
+ 		break;
+ 	case ASYNC_EVENT_CODE_SLI:
+@@ -504,7 +512,7 @@ int be_mcc_compl_poll(struct beiscsi_hba *phba, unsigned int tag)
+ 		return 0;
+ 	}
+ 	for (i = 0; i < mcc_timeout; i++) {
+-		if (beiscsi_error(phba))
++		if (beiscsi_hba_in_error(phba))
+ 			return -EIO;
+ 
+ 		beiscsi_process_mcc_cq(phba);
+@@ -522,7 +530,7 @@ int be_mcc_compl_poll(struct beiscsi_hba *phba, unsigned int tag)
+ 
+ 	beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG | BEISCSI_LOG_MBOX,
+ 		    "BC_%d : FW Timed Out\n");
+-	phba->fw_timeout = true;
++	set_bit(BEISCSI_HBA_FW_TIMEOUT, &phba->state);
+ 	beiscsi_ue_detect(phba);
+ 	return -EBUSY;
+ }
+@@ -566,7 +574,7 @@ static int be_mbox_db_ready_poll(struct be_ctrl_info *ctrl)
+ 	 */
+ 	timeout = jiffies + msecs_to_jiffies(BEISCSI_MBX_RDY_BIT_TIMEOUT);
+ 	do {
+-		if (beiscsi_error(phba))
++		if (beiscsi_hba_in_error(phba))
+ 			return -EIO;
+ 
+ 		ready = ioread32(db);
+@@ -586,10 +594,8 @@ static int be_mbox_db_ready_poll(struct be_ctrl_info *ctrl)
+ 	beiscsi_log(phba, KERN_ERR,
+ 			BEISCSI_LOG_CONFIG | BEISCSI_LOG_MBOX,
+ 			"BC_%d : FW Timed Out\n");
+-
+-	phba->fw_timeout = true;
++	set_bit(BEISCSI_HBA_FW_TIMEOUT, &phba->state);
+ 	beiscsi_ue_detect(phba);
+-
+ 	return -EBUSY;
+ }
+ 
+diff --git a/drivers/scsi/be2iscsi/be_iscsi.c b/drivers/scsi/be2iscsi/be_iscsi.c
+index faa37f67a8e6..ddb458abbf59 100644
+--- a/drivers/scsi/be2iscsi/be_iscsi.c
++++ b/drivers/scsi/be2iscsi/be_iscsi.c
+@@ -52,22 +52,20 @@ struct iscsi_cls_session *beiscsi_session_create(struct iscsi_endpoint *ep,
+ 
+ 
+ 	if (!ep) {
+-		printk(KERN_ERR
+-		       "beiscsi_session_create: invalid ep\n");
++		pr_err("beiscsi_session_create: invalid ep\n");
+ 		return NULL;
+ 	}
+ 	beiscsi_ep = ep->dd_data;
+ 	phba = beiscsi_ep->phba;
+ 
+-	if (phba->state & BE_ADAPTER_PCI_ERR) {
+-		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG,
+-			    "BS_%d : PCI_ERROR Recovery\n");
+-		return NULL;
+-	} else {
++	if (beiscsi_hba_in_error(phba)) {
+ 		beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
+-			    "BS_%d : In beiscsi_session_create\n");
++			    "BS_%d : HBA in error 0x%lx\n", phba->state);
++		return NULL;
+ 	}
+ 
++	beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
++		    "BS_%d : In beiscsi_session_create\n");
+ 	if (cmds_max > beiscsi_ep->phba->params.wrbs_per_cxn) {
+ 		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG,
+ 			    "BS_%d : Cannot handle %d cmds."
+@@ -436,9 +434,9 @@ int beiscsi_iface_set_param(struct Scsi_Host *shost,
+ 	uint32_t rm_len = dt_len;
+ 	int ret;
+ 
+-	if (phba->state & BE_ADAPTER_PCI_ERR) {
+-		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG,
+-			    "BS_%d : In PCI_ERROR Recovery\n");
++	if (beiscsi_hba_in_error(phba)) {
++		beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
++			    "BS_%d : HBA in error 0x%lx\n", phba->state);
+ 		return -EBUSY;
+ 	}
+ 
+@@ -579,9 +577,9 @@ int beiscsi_iface_get_param(struct iscsi_iface *iface,
+ 
+ 	if (param_type != ISCSI_NET_PARAM)
+ 		return 0;
+-	if (phba->state & BE_ADAPTER_PCI_ERR) {
+-		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG,
+-			    "BS_%d : In PCI_ERROR Recovery\n");
++	if (beiscsi_hba_in_error(phba)) {
++		beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
++			    "BS_%d : HBA in error 0x%lx\n", phba->state);
+ 		return -EBUSY;
+ 	}
+ 
+@@ -737,7 +735,7 @@ static void beiscsi_get_port_state(struct Scsi_Host *shost)
+ 	struct beiscsi_hba *phba = iscsi_host_priv(shost);
+ 	struct iscsi_cls_host *ihost = shost->shost_data;
+ 
+-	ihost->port_state = (phba->state & BE_ADAPTER_LINK_UP) ?
++	ihost->port_state = test_bit(BEISCSI_HBA_LINK_UP, &phba->state) ?
+ 		ISCSI_PORT_STATE_UP : ISCSI_PORT_STATE_DOWN;
+ }
+ 
+@@ -789,16 +787,13 @@ int beiscsi_get_host_param(struct Scsi_Host *shost,
+ 	struct beiscsi_hba *phba = iscsi_host_priv(shost);
+ 	int status = 0;
+ 
+-
+-	if (phba->state & BE_ADAPTER_PCI_ERR) {
+-		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG,
+-			    "BS_%d : In PCI_ERROR Recovery\n");
+-		return -EBUSY;
+-	} else {
++	if (beiscsi_hba_in_error(phba)) {
+ 		beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
+-			    "BS_%d : In beiscsi_get_host_param,"
+-			    " param = %d\n", param);
++			    "BS_%d : HBA in error 0x%lx\n", phba->state);
++		return -EBUSY;
+ 	}
++	beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
++		    "BS_%d : In beiscsi_get_host_param, param = %d\n", param);
+ 
+ 	switch (param) {
+ 	case ISCSI_HOST_PARAM_HWADDRESS:
+@@ -940,15 +935,13 @@ int beiscsi_conn_start(struct iscsi_cls_conn *cls_conn)
+ 
+ 	phba = ((struct beiscsi_conn *)conn->dd_data)->phba;
+ 
+-	if (phba->state & BE_ADAPTER_PCI_ERR) {
+-		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG,
+-			    "BS_%d : In PCI_ERROR Recovery\n");
++	if (beiscsi_hba_in_error(phba)) {
++		beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
++			    "BS_%d : HBA in error 0x%lx\n", phba->state);
+ 		return -EBUSY;
+-	} else {
+-		beiscsi_log(beiscsi_conn->phba, KERN_INFO,
+-			    BEISCSI_LOG_CONFIG,
+-			    "BS_%d : In beiscsi_conn_start\n");
+ 	}
++	beiscsi_log(beiscsi_conn->phba, KERN_INFO, BEISCSI_LOG_CONFIG,
++		    "BS_%d : In beiscsi_conn_start\n");
+ 
+ 	memset(&params, 0, sizeof(struct beiscsi_offload_params));
+ 	beiscsi_ep = beiscsi_conn->ep;
+@@ -1165,28 +1158,20 @@ beiscsi_ep_connect(struct Scsi_Host *shost, struct sockaddr *dst_addr,
+ 	struct iscsi_endpoint *ep;
+ 	int ret;
+ 
+-	if (shost)
+-		phba = iscsi_host_priv(shost);
+-	else {
++	if (!shost) {
+ 		ret = -ENXIO;
+-		printk(KERN_ERR
+-		       "beiscsi_ep_connect shost is NULL\n");
++		pr_err("beiscsi_ep_connect shost is NULL\n");
+ 		return ERR_PTR(ret);
+ 	}
+ 
+-	if (beiscsi_error(phba)) {
++	phba = iscsi_host_priv(shost);
++	if (beiscsi_hba_in_error(phba)) {
+ 		ret = -EIO;
+-		beiscsi_log(phba, KERN_WARNING, BEISCSI_LOG_CONFIG,
+-			    "BS_%d : The FW state Not Stable!!!\n");
++		beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
++			    "BS_%d : HBA in error 0x%lx\n", phba->state);
+ 		return ERR_PTR(ret);
+ 	}
+-
+-	if (phba->state & BE_ADAPTER_PCI_ERR) {
+-		ret = -EBUSY;
+-		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG,
+-			    "BS_%d : In PCI_ERROR Recovery\n");
+-		return ERR_PTR(ret);
+-	} else if (phba->state & BE_ADAPTER_LINK_DOWN) {
++	if (!test_bit(BEISCSI_HBA_LINK_UP, &phba->state)) {
+ 		ret = -EBUSY;
+ 		beiscsi_log(phba, KERN_WARNING, BEISCSI_LOG_CONFIG,
+ 			    "BS_%d : The Adapter Port state is Down!!!\n");
+@@ -1340,9 +1325,9 @@ void beiscsi_ep_disconnect(struct iscsi_endpoint *ep)
+ 		tcp_upload_flag = CONNECTION_UPLOAD_ABORT;
+ 	}
+ 
+-	if (phba->state & BE_ADAPTER_PCI_ERR) {
+-		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG,
+-			    "BS_%d : PCI_ERROR Recovery\n");
++	if (beiscsi_hba_in_error(phba)) {
++		beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
++			    "BS_%d : HBA in error 0x%lx\n", phba->state);
+ 		goto free_ep;
+ 	}
+ 
+* Unmerged path drivers/scsi/be2iscsi/be_main.c
+diff --git a/drivers/scsi/be2iscsi/be_main.h b/drivers/scsi/be2iscsi/be_main.h
+index 90cdc10c01fb..8ab16516ae9a 100644
+--- a/drivers/scsi/be2iscsi/be_main.h
++++ b/drivers/scsi/be2iscsi/be_main.h
+@@ -98,20 +98,9 @@
+ 
+ #define INVALID_SESS_HANDLE	0xFFFFFFFF
+ 
+-/**
+- * Adapter States
+- **/
+-#define BE_ADAPTER_LINK_UP	0x001
+-#define BE_ADAPTER_LINK_DOWN	0x002
+-#define BE_ADAPTER_PCI_ERR	0x004
+-#define BE_ADAPTER_CHECK_BOOT	0x008
+-
+-
+-#define BEISCSI_CLEAN_UNLOAD	0x01
+-#define BEISCSI_EEH_UNLOAD	0x02
+-
+ #define BE_GET_BOOT_RETRIES	45
+ #define BE_GET_BOOT_TO		20
++
+ /**
+  * hardware needs the async PDU buffers to be posted in multiples of 8
+  * So have atleast 8 of them by default
+@@ -417,11 +406,20 @@ struct beiscsi_hba {
+ 		unsigned long ulp_supported;
+ 	} fw_config;
+ 
+-	unsigned int state;
++	unsigned long state;
++#define BEISCSI_HBA_RUNNING	0
++#define BEISCSI_HBA_LINK_UP	1
++#define BEISCSI_HBA_BOOT_FOUND	2
++#define BEISCSI_HBA_PCI_ERR	3
++#define BEISCSI_HBA_FW_TIMEOUT	4
++#define BEISCSI_HBA_IN_UE	5
++/* error bits */
++#define BEISCSI_HBA_IN_ERR	((1 << BEISCSI_HBA_PCI_ERR) | \
++				 (1 << BEISCSI_HBA_FW_TIMEOUT) | \
++				 (1 << BEISCSI_HBA_IN_UE))
++
+ 	u8 optic_state;
+ 	int get_boot;
+-	bool fw_timeout;
+-	bool ue_detected;
+ 	struct delayed_work beiscsi_hw_check_task;
+ 
+ 	bool mac_addr_set;
+@@ -445,6 +443,8 @@ struct beiscsi_hba {
+ 			uint32_t writedir);
+ };
+ 
++#define beiscsi_hba_in_error(phba) ((phba)->state & BEISCSI_HBA_IN_ERR)
++
+ struct beiscsi_session {
+ 	struct pci_pool *bhs_pool;
+ };
+@@ -507,6 +507,7 @@ struct beiscsi_io_task {
+ 	struct sgl_handle *psgl_handle;
+ 	struct beiscsi_conn *conn;
+ 	struct scsi_cmnd *scsi_cmnd;
++	int num_sg;
+ 	struct hwi_wrb_context *pwrb_context;
+ 	unsigned int cmd_sn;
+ 	unsigned int flags;
+@@ -854,11 +855,6 @@ void hwi_ring_cq_db(struct beiscsi_hba *phba,
+ unsigned int beiscsi_process_cq(struct be_eq_obj *pbe_eq, int budget);
+ void beiscsi_process_mcc_cq(struct beiscsi_hba *phba);
+ 
+-static inline bool beiscsi_error(struct beiscsi_hba *phba)
+-{
+-	return phba->ue_detected || phba->fw_timeout;
+-}
+-
+ struct pdu_nop_out {
+ 	u32 dw[12];
+ };
+diff --git a/drivers/scsi/be2iscsi/be_mgmt.c b/drivers/scsi/be2iscsi/be_mgmt.c
+index fa17b8e5a47c..4bf68fa9bbb9 100644
+--- a/drivers/scsi/be2iscsi/be_mgmt.c
++++ b/drivers/scsi/be2iscsi/be_mgmt.c
+@@ -108,9 +108,6 @@ void beiscsi_ue_detect(struct beiscsi_hba *phba)
+ 	uint32_t ue_mask_hi = 0, ue_mask_lo = 0;
+ 	uint8_t i = 0;
+ 
+-	if (phba->ue_detected)
+-		return;
+-
+ 	pci_read_config_dword(phba->pcidev,
+ 			      PCICFG_UE_STATUS_LOW, &ue_lo);
+ 	pci_read_config_dword(phba->pcidev,
+@@ -128,7 +125,7 @@ void beiscsi_ue_detect(struct beiscsi_hba *phba)
+ 
+ 
+ 	if (ue_lo || ue_hi) {
+-		phba->ue_detected = true;
++		set_bit(BEISCSI_HBA_IN_UE, &phba->state);
+ 		beiscsi_log(phba, KERN_ERR,
+ 			    BEISCSI_LOG_CONFIG | BEISCSI_LOG_MBOX,
+ 			    "BG_%d : Error detected on the adapter\n");
