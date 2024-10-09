@@ -1,0 +1,141 @@
+KVM: nVMX: Fix mmu context after VMLAUNCH/VMRESUME failure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Wanpeng Li <wanpeng.li@hotmail.com>
+commit 5af4157388adad82c339e3742fb6b67840721347
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/5af41573.failed
+
+Commit 4f350c6dbcb (kvm: nVMX: Handle deferred early VMLAUNCH/VMRESUME failure
+properly) can result in L1(run kvm-unit-tests/run_tests.sh vmx_controls in L1)
+null pointer deference and also L0 calltrace when EPT=0 on both L0 and L1.
+
+In L1:
+
+BUG: unable to handle kernel paging request at ffffffffc015bf8f
+ IP: vmx_vcpu_run+0x202/0x510 [kvm_intel]
+ PGD 146e13067 P4D 146e13067 PUD 146e15067 PMD 3d2686067 PTE 3d4af9161
+ Oops: 0003 [#1] PREEMPT SMP
+ CPU: 2 PID: 1798 Comm: qemu-system-x86 Not tainted 4.14.0-rc4+ #6
+ RIP: 0010:vmx_vcpu_run+0x202/0x510 [kvm_intel]
+ Call Trace:
+ WARNING: kernel stack frame pointer at ffffb86f4988bc18 in qemu-system-x86:1798 has bad value 0000000000000002
+
+In L0:
+
+-----------[ cut here ]------------
+ WARNING: CPU: 6 PID: 4460 at /home/kernel/linux/arch/x86/kvm//vmx.c:9845 vmx_inject_page_fault_nested+0x130/0x140 [kvm_intel]
+ CPU: 6 PID: 4460 Comm: qemu-system-x86 Tainted: G           OE   4.14.0-rc7+ #25
+ RIP: 0010:vmx_inject_page_fault_nested+0x130/0x140 [kvm_intel]
+ Call Trace:
+  paging64_page_fault+0x500/0xde0 [kvm]
+  ? paging32_gva_to_gpa_nested+0x120/0x120 [kvm]
+  ? nonpaging_page_fault+0x3b0/0x3b0 [kvm]
+  ? __asan_storeN+0x12/0x20
+  ? paging64_gva_to_gpa+0xb0/0x120 [kvm]
+  ? paging64_walk_addr_generic+0x11a0/0x11a0 [kvm]
+  ? lock_acquire+0x2c0/0x2c0
+  ? vmx_read_guest_seg_ar+0x97/0x100 [kvm_intel]
+  ? vmx_get_segment+0x2a6/0x310 [kvm_intel]
+  ? sched_clock+0x1f/0x30
+  ? check_chain_key+0x137/0x1e0
+  ? __lock_acquire+0x83c/0x2420
+  ? kvm_multiple_exception+0xf2/0x220 [kvm]
+  ? debug_check_no_locks_freed+0x240/0x240
+  ? debug_smp_processor_id+0x17/0x20
+  ? __lock_is_held+0x9e/0x100
+  kvm_mmu_page_fault+0x90/0x180 [kvm]
+  kvm_handle_page_fault+0x15c/0x310 [kvm]
+  ? __lock_is_held+0x9e/0x100
+  handle_exception+0x3c7/0x4d0 [kvm_intel]
+  vmx_handle_exit+0x103/0x1010 [kvm_intel]
+  ? kvm_arch_vcpu_ioctl_run+0x1628/0x2e20 [kvm]
+
+The commit avoids to load host state of vmcs12 as vmcs01's guest state
+since vmcs12 is not modified (except for the VM-instruction error field)
+if the checking of vmcs control area fails. However, the mmu context is
+switched to nested mmu in prepare_vmcs02() and it will not be reloaded
+since load_vmcs12_host_state() is skipped when nested VMLAUNCH/VMRESUME
+fails. This patch fixes it by reloading mmu context when nested
+VMLAUNCH/VMRESUME fails.
+
+	Reviewed-by: Jim Mattson <jmattson@google.com>
+	Reviewed-by: Krish Sadhukhan <krish.sadhukhan@oracle.com>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Radim Krčmář <rkrcmar@redhat.com>
+	Cc: Jim Mattson <jmattson@google.com>
+	Signed-off-by: Wanpeng Li <wanpeng.li@hotmail.com>
+	Reviewed-by: Paolo Bonzini <pbonzini@redhat.com>
+	Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+(cherry picked from commit 5af4157388adad82c339e3742fb6b67840721347)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 6e24c4e66a69,10474d26a000..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -11408,6 -11577,56 +11415,59 @@@ static void nested_vmx_vmexit(struct kv
+  
+  	/* in case we halted in L2 */
+  	vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (likely(!vmx->fail)) {
++ 		/*
++ 		 * TODO: SDM says that with acknowledge interrupt on
++ 		 * exit, bit 31 of the VM-exit interrupt information
++ 		 * (valid interrupt) is always set to 1 on
++ 		 * EXIT_REASON_EXTERNAL_INTERRUPT, so we shouldn't
++ 		 * need kvm_cpu_has_interrupt().  See the commit
++ 		 * message for details.
++ 		 */
++ 		if (nested_exit_intr_ack_set(vcpu) &&
++ 		    exit_reason == EXIT_REASON_EXTERNAL_INTERRUPT &&
++ 		    kvm_cpu_has_interrupt(vcpu)) {
++ 			int irq = kvm_cpu_get_interrupt(vcpu);
++ 			WARN_ON(irq < 0);
++ 			vmcs12->vm_exit_intr_info = irq |
++ 				INTR_INFO_VALID_MASK | INTR_TYPE_EXT_INTR;
++ 		}
++ 
++ 		if (exit_reason != -1)
++ 			trace_kvm_nested_vmexit_inject(vmcs12->vm_exit_reason,
++ 						       vmcs12->exit_qualification,
++ 						       vmcs12->idt_vectoring_info_field,
++ 						       vmcs12->vm_exit_intr_info,
++ 						       vmcs12->vm_exit_intr_error_code,
++ 						       KVM_ISA_VMX);
++ 
++ 		load_vmcs12_host_state(vcpu, vmcs12);
++ 
++ 		return;
++ 	}
++ 	
++ 	/*
++ 	 * After an early L2 VM-entry failure, we're now back
++ 	 * in L1 which thinks it just finished a VMLAUNCH or
++ 	 * VMRESUME instruction, so we need to set the failure
++ 	 * flag and the VM-instruction error field of the VMCS
++ 	 * accordingly.
++ 	 */
++ 	nested_vmx_failValid(vcpu, VMXERR_ENTRY_INVALID_CONTROL_FIELD);
++ 
++ 	load_vmcs12_mmu_host_state(vcpu, vmcs12);
++ 
++ 	/*
++ 	 * The emulated instruction was already skipped in
++ 	 * nested_vmx_run, but the updated RIP was never
++ 	 * written back to the vmcs01.
++ 	 */
++ 	skip_emulated_instruction(vcpu);
++ 	vmx->fail = 0;
+++>>>>>>> 5af4157388ad (KVM: nVMX: Fix mmu context after VMLAUNCH/VMRESUME failure)
+  }
+  
+  /*
+* Unmerged path arch/x86/kvm/vmx.c
