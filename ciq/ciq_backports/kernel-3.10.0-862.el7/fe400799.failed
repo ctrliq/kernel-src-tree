@@ -1,0 +1,247 @@
+ipv6: fib: Provide offload indication using nexthop flags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit fe4007999599c02598c17b643e8de43e487d48e8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fe400799.failed
+
+IPv6 routes currently lack nexthop flags as in IPv4. This has several
+implications.
+
+In the forwarding path, it requires us to check the carrier state of the
+nexthop device and potentially ignore a linkdown route, instead of
+checking for RTNH_F_LINKDOWN.
+
+It also requires capable drivers to use the user facing IPv6-specific
+route flags to provide offload indication, instead of using the nexthop
+flags as in IPv4.
+
+Add nexthop flags to IPv6 routes in the 40 bytes hole and use it to
+provide offload indication instead of the RTF_OFFLOAD flag, which is
+removed while it's still not part of any official kernel release.
+
+In the near future we would like to use the field for the
+RTNH_F_{LINKDOWN,DEAD} flags, but this change is more involved and might
+not be ready in time for the current cycle.
+
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: David Ahern <dsahern@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fe4007999599c02598c17b643e8de43e487d48e8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+#	include/uapi/linux/ipv6_route.h
+#	net/ipv6/route.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+index 6908726c154c,4895d5b8942b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+@@@ -1855,10 -2386,50 +1855,55 @@@ mlxsw_sp_fib4_entry_offload_unset(struc
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ mlxsw_sp_fib6_entry_offload_set(struct mlxsw_sp_fib_entry *fib_entry)
++ {
++ 	struct mlxsw_sp_fib6_entry *fib6_entry;
++ 	struct mlxsw_sp_rt6 *mlxsw_sp_rt6;
++ 
++ 	fib6_entry = container_of(fib_entry, struct mlxsw_sp_fib6_entry,
++ 				  common);
++ 
++ 	if (fib_entry->type == MLXSW_SP_FIB_ENTRY_TYPE_LOCAL) {
++ 		list_first_entry(&fib6_entry->rt6_list, struct mlxsw_sp_rt6,
++ 				 list)->rt->rt6i_nh_flags |= RTNH_F_OFFLOAD;
++ 		return;
++ 	}
++ 
++ 	list_for_each_entry(mlxsw_sp_rt6, &fib6_entry->rt6_list, list) {
++ 		struct mlxsw_sp_nexthop_group *nh_grp = fib_entry->nh_group;
++ 		struct mlxsw_sp_nexthop *nh;
++ 
++ 		nh = mlxsw_sp_rt6_nexthop(nh_grp, mlxsw_sp_rt6);
++ 		if (nh && nh->offloaded)
++ 			mlxsw_sp_rt6->rt->rt6i_nh_flags |= RTNH_F_OFFLOAD;
++ 		else
++ 			mlxsw_sp_rt6->rt->rt6i_nh_flags &= ~RTNH_F_OFFLOAD;
++ 	}
++ }
++ 
++ static void
++ mlxsw_sp_fib6_entry_offload_unset(struct mlxsw_sp_fib_entry *fib_entry)
++ {
++ 	struct mlxsw_sp_fib6_entry *fib6_entry;
++ 	struct mlxsw_sp_rt6 *mlxsw_sp_rt6;
++ 
++ 	fib6_entry = container_of(fib_entry, struct mlxsw_sp_fib6_entry,
++ 				  common);
++ 	list_for_each_entry(mlxsw_sp_rt6, &fib6_entry->rt6_list, list) {
++ 		struct rt6_info *rt = mlxsw_sp_rt6->rt;
++ 
++ 		rt->rt6i_nh_flags &= ~RTNH_F_OFFLOAD;
++ 	}
++ }
++ 
+++>>>>>>> fe4007999599 (ipv6: fib: Provide offload indication using nexthop flags)
+  static void mlxsw_sp_fib_entry_offload_set(struct mlxsw_sp_fib_entry *fib_entry)
+  {
+ +	fib_entry->offloaded = true;
+ +
+  	switch (fib_entry->fib_node->fib->proto) {
+  	case MLXSW_SP_L3_PROTO_IPV4:
+  		mlxsw_sp_fib4_entry_offload_set(fib_entry);
+diff --cc include/uapi/linux/ipv6_route.h
+index f6598d1c886e,d496c02e14bc..000000000000
+--- a/include/uapi/linux/ipv6_route.h
++++ b/include/uapi/linux/ipv6_route.h
+@@@ -34,7 -35,7 +34,11 @@@
+  #define RTF_PREF(pref)	((pref) << 27)
+  #define RTF_PREF_MASK	0x18000000
+  
+++<<<<<<< HEAD
+ +#define RTF_PCPU	0x40000000
+++=======
++ #define RTF_PCPU	0x40000000	/* read-only: can not be set by user */
+++>>>>>>> fe4007999599 (ipv6: fib: Provide offload indication using nexthop flags)
+  #define RTF_LOCAL	0x80000000
+  
+  
+diff --cc net/ipv6/route.c
+index bac9d71c26f1,6793135d49db..000000000000
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@@ -1809,12 -1812,28 +1809,29 @@@ int ip6_route_info_create(struct fib6_c
+  	struct inet6_dev *idev = NULL;
+  	struct fib6_table *table;
+  	int addr_type;
+ -	int err = -EINVAL;
+  
+++<<<<<<< HEAD
+ +	if (cfg->fc_dst_len > 128 || cfg->fc_src_len > 128)
+ +		return -EINVAL;
+++=======
++ 	/* RTF_PCPU is an internal flag; can not be set by userspace */
++ 	if (cfg->fc_flags & RTF_PCPU) {
++ 		NL_SET_ERR_MSG(extack, "Userspace can not set RTF_PCPU");
++ 		goto out;
++ 	}
++ 
++ 	if (cfg->fc_dst_len > 128) {
++ 		NL_SET_ERR_MSG(extack, "Invalid prefix length");
++ 		goto out;
++ 	}
++ 	if (cfg->fc_src_len > 128) {
++ 		NL_SET_ERR_MSG(extack, "Invalid source address length");
++ 		goto out;
++ 	}
+++>>>>>>> fe4007999599 (ipv6: fib: Provide offload indication using nexthop flags)
+  #ifndef CONFIG_IPV6_SUBTREES
+ -	if (cfg->fc_src_len) {
+ -		NL_SET_ERR_MSG(extack,
+ -			       "Specifying source address requires IPV6_SUBTREES to be enabled");
+ -		goto out;
+ -	}
+ +	if (cfg->fc_src_len)
+ +		return -EINVAL;
+  #endif
+  	if (cfg->fc_ifindex) {
+  		err = -ENODEV;
+@@@ -3086,8 -3310,69 +3103,74 @@@ static inline size_t rt6_nlmsg_size(str
+  	       + nla_total_size(4) /* RTA_PRIORITY */
+  	       + RTAX_MAX * nla_total_size(4) /* RTA_METRICS */
+  	       + nla_total_size(sizeof(struct rta_cacheinfo))
+++<<<<<<< HEAD
+ +	       + nla_total_size(TCP_CA_NAME_MAX)  /* RTAX_CC_ALGO */
+ +	       + lwtunnel_get_encap_size(rt->dst.lwtstate);
+++=======
++ 	       + nla_total_size(TCP_CA_NAME_MAX) /* RTAX_CC_ALGO */
++ 	       + nla_total_size(1) /* RTA_PREF */
++ 	       + lwtunnel_get_encap_size(rt->dst.lwtstate)
++ 	       + nexthop_len;
++ }
++ 
++ static int rt6_nexthop_info(struct sk_buff *skb, struct rt6_info *rt,
++ 			    unsigned int *flags, bool skip_oif)
++ {
++ 	if (!netif_running(rt->dst.dev) || !netif_carrier_ok(rt->dst.dev)) {
++ 		*flags |= RTNH_F_LINKDOWN;
++ 		if (rt->rt6i_idev->cnf.ignore_routes_with_linkdown)
++ 			*flags |= RTNH_F_DEAD;
++ 	}
++ 
++ 	if (rt->rt6i_flags & RTF_GATEWAY) {
++ 		if (nla_put_in6_addr(skb, RTA_GATEWAY, &rt->rt6i_gateway) < 0)
++ 			goto nla_put_failure;
++ 	}
++ 
++ 	if (rt->rt6i_nh_flags & RTNH_F_OFFLOAD)
++ 		*flags |= RTNH_F_OFFLOAD;
++ 
++ 	/* not needed for multipath encoding b/c it has a rtnexthop struct */
++ 	if (!skip_oif && rt->dst.dev &&
++ 	    nla_put_u32(skb, RTA_OIF, rt->dst.dev->ifindex))
++ 		goto nla_put_failure;
++ 
++ 	if (rt->dst.lwtstate &&
++ 	    lwtunnel_fill_encap(skb, rt->dst.lwtstate) < 0)
++ 		goto nla_put_failure;
++ 
++ 	return 0;
++ 
++ nla_put_failure:
++ 	return -EMSGSIZE;
++ }
++ 
++ /* add multipath next hop */
++ static int rt6_add_nexthop(struct sk_buff *skb, struct rt6_info *rt)
++ {
++ 	struct rtnexthop *rtnh;
++ 	unsigned int flags = 0;
++ 
++ 	rtnh = nla_reserve_nohdr(skb, sizeof(*rtnh));
++ 	if (!rtnh)
++ 		goto nla_put_failure;
++ 
++ 	rtnh->rtnh_hops = 0;
++ 	rtnh->rtnh_ifindex = rt->dst.dev ? rt->dst.dev->ifindex : 0;
++ 
++ 	if (rt6_nexthop_info(skb, rt, &flags, true) < 0)
++ 		goto nla_put_failure;
++ 
++ 	rtnh->rtnh_flags = flags;
++ 
++ 	/* length of rtnetlink header + attributes */
++ 	rtnh->rtnh_len = nlmsg_get_pos(skb) - (void *)rtnh;
++ 
++ 	return 0;
++ 
++ nla_put_failure:
++ 	return -EMSGSIZE;
+++>>>>>>> fe4007999599 (ipv6: fib: Provide offload indication using nexthop flags)
+  }
+  
+  static int rt6_fill_node(struct net *net,
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+diff --git a/include/net/ip6_fib.h b/include/net/ip6_fib.h
+index 2ee17a3a8c5d..e55d17d08b51 100644
+--- a/include/net/ip6_fib.h
++++ b/include/net/ip6_fib.h
+@@ -116,6 +116,8 @@ struct rt6_info {
+ 
+ 	atomic_t			rt6i_ref;
+ 
++	unsigned int			rt6i_nh_flags;
++
+ 	/* These are in a separate cache line. */
+ 	struct rt6key			rt6i_dst ____cacheline_aligned_in_smp;
+ 	u32				rt6i_flags;
+* Unmerged path include/uapi/linux/ipv6_route.h
+* Unmerged path net/ipv6/route.c
