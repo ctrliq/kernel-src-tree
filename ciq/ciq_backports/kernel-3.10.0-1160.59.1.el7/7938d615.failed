@@ -1,0 +1,402 @@
+drm/i915: Flush TLBs before releasing backing store
+
+jira LE-1907
+cve CVE-2022-0330
+Rebuild_History Non-Buildable kernel-3.10.0-1160.59.1.el7
+commit-author Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+commit 7938d61591d33394a21bdd7797a245b65428f44c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.59.1.el7/7938d615.failed
+
+We need to flush TLBs before releasing backing store otherwise userspace
+is able to encounter stale entries if a) it is not declaring access to
+certain buffers and b) it races with the backing store release from a
+such undeclared execution already executing on the GPU in parallel.
+
+The approach taken is to mark any buffer objects which were ever bound
+to the GPU and to trigger a serialized TLB flush when their backing
+store is released.
+
+Alternatively the flushing could be done on VMA unbind, at which point
+we would be able to ascertain whether there is potential a parallel GPU
+execution (which could race), but essentially it boils down to paying
+the cost of TLB flushes potentially needlessly at VMA unbind time (when
+the backing store is not known to be going away so not needed for
+safety), versus potentially needlessly at backing store relase time
+(since we at that point cannot tell whether there is anything executing
+on the GPU which uses that object).
+
+Thereforce simplicity of implementation has been chosen for now with
+scope to benchmark and refine later as required.
+
+	Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+	Reported-by: Sushma Venkatesh Reddy <sushma.venkatesh.reddy@intel.com>
+	Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Acked-by: Dave Airlie <airlied@redhat.com>
+	Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Cc: Jon Bloomfield <jon.bloomfield@intel.com>
+	Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+	Cc: Jani Nikula <jani.nikula@intel.com>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 7938d61591d33394a21bdd7797a245b65428f44c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/gem/i915_gem_object_types.h
+#	drivers/gpu/drm/i915/gem/i915_gem_pages.c
+#	drivers/gpu/drm/i915/gt/intel_gt.c
+#	drivers/gpu/drm/i915/gt/intel_gt.h
+#	drivers/gpu/drm/i915/gt/intel_gt_types.h
+#	drivers/gpu/drm/i915/i915_reg.h
+#	drivers/gpu/drm/i915/i915_vma.c
+#	drivers/gpu/drm/i915/intel_uncore.c
+#	drivers/gpu/drm/i915/intel_uncore.h
+diff --cc drivers/gpu/drm/i915/i915_reg.h
+index 34fa4feb76c5,c32420cb8ed5..000000000000
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@@ -2496,13 -2823,22 +2502,23 @@@ enum i915_power_well_id 
+  #define   FAULT_VA_HIGH_BITS		(0xf << 0)
+  #define   FAULT_GTT_SEL			(1 << 4)
+  
+++<<<<<<< HEAD
+++=======
++ #define GEN12_GFX_TLB_INV_CR	_MMIO(0xced8)
++ #define GEN12_VD_TLB_INV_CR	_MMIO(0xcedc)
++ #define GEN12_VE_TLB_INV_CR	_MMIO(0xcee0)
++ #define GEN12_BLT_TLB_INV_CR	_MMIO(0xcee4)
++ 
++ #define GEN12_AUX_ERR_DBG		_MMIO(0x43f4)
++ 
+++>>>>>>> 7938d61591d3 (drm/i915: Flush TLBs before releasing backing store)
+  #define FPGA_DBG		_MMIO(0x42300)
+ -#define   FPGA_DBG_RM_NOCLAIM	REG_BIT(31)
+ +#define   FPGA_DBG_RM_NOCLAIM	(1 << 31)
+  
+  #define CLAIM_ER		_MMIO(VLV_DISPLAY_BASE + 0x2028)
+ -#define   CLAIM_ER_CLR		REG_BIT(31)
+ -#define   CLAIM_ER_OVERFLOW	REG_BIT(16)
+ -#define   CLAIM_ER_CTR_MASK	REG_GENMASK(15, 0)
+ +#define   CLAIM_ER_CLR		(1 << 31)
+ +#define   CLAIM_ER_OVERFLOW	(1 << 16)
+ +#define   CLAIM_ER_CTR_MASK	0xffff
+  
+  #define DERRMR		_MMIO(0x44050)
+  /* Note that HBLANK events are reserved on bdw+ */
+diff --cc drivers/gpu/drm/i915/i915_vma.c
+index 5b4d78cdb4ca,c0d6d5526abe..000000000000
+--- a/drivers/gpu/drm/i915/i915_vma.c
++++ b/drivers/gpu/drm/i915/i915_vma.c
+@@@ -327,14 -415,52 +327,57 @@@ int i915_vma_bind(struct i915_vma *vma
+  	if (bind_flags == 0)
+  		return 0;
+  
+ -	GEM_BUG_ON(!atomic_read(&vma->pages_count));
+ +	GEM_BUG_ON(!vma->pages);
+  
+  	trace_i915_vma_bind(vma, bind_flags);
+ -	if (work && bind_flags & vma->vm->bind_async_flags) {
+ -		struct dma_fence *prev;
+ +	ret = vma->ops->bind_vma(vma, cache_level, bind_flags);
+ +	if (ret)
+ +		return ret;
+  
+++<<<<<<< HEAD
+ +	vma->flags |= bind_flags;
+++=======
++ 		work->vma = vma;
++ 		work->cache_level = cache_level;
++ 		work->flags = bind_flags;
++ 
++ 		/*
++ 		 * Note we only want to chain up to the migration fence on
++ 		 * the pages (not the object itself). As we don't track that,
++ 		 * yet, we have to use the exclusive fence instead.
++ 		 *
++ 		 * Also note that we do not want to track the async vma as
++ 		 * part of the obj->resv->excl_fence as it only affects
++ 		 * execution and not content or object's backing store lifetime.
++ 		 */
++ 		prev = i915_active_set_exclusive(&vma->active, &work->base.dma);
++ 		if (prev) {
++ 			__i915_sw_fence_await_dma_fence(&work->base.chain,
++ 							prev,
++ 							&work->cb);
++ 			dma_fence_put(prev);
++ 		}
++ 
++ 		work->base.dma.error = 0; /* enable the queue_work() */
++ 
++ 		__i915_gem_object_pin_pages(vma->obj);
++ 		work->pinned = i915_gem_object_get(vma->obj);
++ 	} else {
++ 		if (vma->obj) {
++ 			int ret;
++ 
++ 			ret = i915_gem_object_wait_moving_fence(vma->obj, true);
++ 			if (ret)
++ 				return ret;
++ 		}
++ 		vma->ops->bind_vma(vma->vm, NULL, vma, cache_level, bind_flags);
++ 	}
++ 
++ 	if (vma->obj)
++ 		set_bit(I915_BO_WAS_BOUND_BIT, &vma->obj->flags);
++ 
++ 	atomic_or(bind_flags, &vma->flags);
+++>>>>>>> 7938d61591d3 (drm/i915: Flush TLBs before releasing backing store)
+  	return 0;
+  }
+  
+diff --cc drivers/gpu/drm/i915/intel_uncore.c
+index 99e26fad96ab,778da3179b3c..000000000000
+--- a/drivers/gpu/drm/i915/intel_uncore.c
++++ b/drivers/gpu/drm/i915/intel_uncore.c
+@@@ -704,19 -712,20 +704,25 @@@ void intel_uncore_forcewake_user_put(st
+   * See intel_uncore_forcewake_get(). This variant places the onus
+   * on the caller to explicitly handle the dev_priv->uncore.lock spinlock.
+   */
+ -void intel_uncore_forcewake_get__locked(struct intel_uncore *uncore,
+ +void intel_uncore_forcewake_get__locked(struct drm_i915_private *dev_priv,
+  					enum forcewake_domains fw_domains)
+  {
+ -	lockdep_assert_held(&uncore->lock);
+ +	lockdep_assert_held(&dev_priv->uncore.lock);
+  
+ -	if (!uncore->fw_get_funcs)
+ +	if (!dev_priv->uncore.funcs.force_wake_get)
+  		return;
+  
+ -	__intel_uncore_forcewake_get(uncore, fw_domains);
+ +	__intel_uncore_forcewake_get(dev_priv, fw_domains);
+  }
+  
+++<<<<<<< HEAD
+ +static void __intel_uncore_forcewake_put(struct drm_i915_private *dev_priv,
+ +					 enum forcewake_domains fw_domains)
+++=======
++ static void __intel_uncore_forcewake_put(struct intel_uncore *uncore,
++ 					 enum forcewake_domains fw_domains,
++ 					 bool delayed)
+++>>>>>>> 7938d61591d3 (drm/i915: Flush TLBs before releasing backing store)
+  {
+  	struct intel_uncore_forcewake_domain *domain;
+  	unsigned int tmp;
+@@@ -732,7 -740,11 +738,15 @@@
+  			continue;
+  		}
+  
+++<<<<<<< HEAD
+ +		fw_domain_arm_timer(domain);
+++=======
++ 		if (delayed &&
++ 		    !(domain->uncore->fw_domains_timer & domain->mask))
++ 			fw_domain_arm_timer(domain);
++ 		else
++ 			fw_domains_put(uncore, domain->mask);
+++>>>>>>> 7938d61591d3 (drm/i915: Flush TLBs before releasing backing store)
+  	}
+  }
+  
+@@@ -749,12 -761,47 +763,53 @@@ void intel_uncore_forcewake_put(struct 
+  {
+  	unsigned long irqflags;
+  
+ -	if (!uncore->fw_get_funcs)
+ +	if (!dev_priv->uncore.funcs.force_wake_put)
+  		return;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&dev_priv->uncore.lock, irqflags);
+ +	__intel_uncore_forcewake_put(dev_priv, fw_domains);
+ +	spin_unlock_irqrestore(&dev_priv->uncore.lock, irqflags);
+++=======
++ 	spin_lock_irqsave(&uncore->lock, irqflags);
++ 	__intel_uncore_forcewake_put(uncore, fw_domains, false);
++ 	spin_unlock_irqrestore(&uncore->lock, irqflags);
++ }
++ 
++ void intel_uncore_forcewake_put_delayed(struct intel_uncore *uncore,
++ 					enum forcewake_domains fw_domains)
++ {
++ 	unsigned long irqflags;
++ 
++ 	if (!uncore->fw_get_funcs)
++ 		return;
++ 
++ 	spin_lock_irqsave(&uncore->lock, irqflags);
++ 	__intel_uncore_forcewake_put(uncore, fw_domains, true);
++ 	spin_unlock_irqrestore(&uncore->lock, irqflags);
++ }
++ 
++ /**
++  * intel_uncore_forcewake_flush - flush the delayed release
++  * @uncore: the intel_uncore structure
++  * @fw_domains: forcewake domains to flush
++  */
++ void intel_uncore_forcewake_flush(struct intel_uncore *uncore,
++ 				  enum forcewake_domains fw_domains)
++ {
++ 	struct intel_uncore_forcewake_domain *domain;
++ 	unsigned int tmp;
++ 
++ 	if (!uncore->fw_get_funcs)
++ 		return;
++ 
++ 	fw_domains &= uncore->fw_domains;
++ 	for_each_fw_domain_masked(domain, fw_domains, uncore, tmp) {
++ 		WRITE_ONCE(domain->active, false);
++ 		if (hrtimer_cancel(&domain->timer))
++ 			intel_uncore_fw_release_timer(&domain->timer);
++ 	}
+++>>>>>>> 7938d61591d3 (drm/i915: Flush TLBs before releasing backing store)
+  }
+  
+  /**
+@@@ -765,39 -812,66 +820,43 @@@
+   * See intel_uncore_forcewake_put(). This variant places the onus
+   * on the caller to explicitly handle the dev_priv->uncore.lock spinlock.
+   */
+ -void intel_uncore_forcewake_put__locked(struct intel_uncore *uncore,
+ +void intel_uncore_forcewake_put__locked(struct drm_i915_private *dev_priv,
+  					enum forcewake_domains fw_domains)
+  {
+ -	lockdep_assert_held(&uncore->lock);
+ +	lockdep_assert_held(&dev_priv->uncore.lock);
+  
+ -	if (!uncore->fw_get_funcs)
+ +	if (!dev_priv->uncore.funcs.force_wake_put)
+  		return;
+  
+++<<<<<<< HEAD
+ +	__intel_uncore_forcewake_put(dev_priv, fw_domains);
+++=======
++ 	__intel_uncore_forcewake_put(uncore, fw_domains, false);
+++>>>>>>> 7938d61591d3 (drm/i915: Flush TLBs before releasing backing store)
+  }
+  
+ -void assert_forcewakes_inactive(struct intel_uncore *uncore)
+ +void assert_forcewakes_inactive(struct drm_i915_private *dev_priv)
+  {
+ -	if (!uncore->fw_get_funcs)
+ +	if (!dev_priv->uncore.funcs.force_wake_get)
+  		return;
+  
+ -	drm_WARN(&uncore->i915->drm, uncore->fw_domains_active,
+ -		 "Expected all fw_domains to be inactive, but %08x are still on\n",
+ -		 uncore->fw_domains_active);
+ +	WARN(dev_priv->uncore.fw_domains_active,
+ +	     "Expected all fw_domains to be inactive, but %08x are still on\n",
+ +	     dev_priv->uncore.fw_domains_active);
+  }
+  
+ -void assert_forcewakes_active(struct intel_uncore *uncore,
+ +void assert_forcewakes_active(struct drm_i915_private *dev_priv,
+  			      enum forcewake_domains fw_domains)
+  {
+ -	struct intel_uncore_forcewake_domain *domain;
+ -	unsigned int tmp;
+ -
+ -	if (!IS_ENABLED(CONFIG_DRM_I915_DEBUG_RUNTIME_PM))
+ +	if (!dev_priv->uncore.funcs.force_wake_get)
+  		return;
+  
+ -	if (!uncore->fw_get_funcs)
+ -		return;
+ -
+ -	spin_lock_irq(&uncore->lock);
+ -
+ -	assert_rpm_wakelock_held(uncore->rpm);
+ +	assert_rpm_wakelock_held(dev_priv);
+  
+ -	fw_domains &= uncore->fw_domains;
+ -	drm_WARN(&uncore->i915->drm, fw_domains & ~uncore->fw_domains_active,
+ -		 "Expected %08x fw_domains to be active, but %08x are off\n",
+ -		 fw_domains, fw_domains & ~uncore->fw_domains_active);
+ -
+ -	/*
+ -	 * Check that the caller has an explicit wakeref and we don't mistake
+ -	 * it for the auto wakeref.
+ -	 */
+ -	for_each_fw_domain_masked(domain, fw_domains, uncore, tmp) {
+ -		unsigned int actual = READ_ONCE(domain->wake_count);
+ -		unsigned int expect = 1;
+ -
+ -		if (uncore->fw_domains_timer & domain->mask)
+ -			expect++; /* pending automatic release */
+ -
+ -		if (drm_WARN(&uncore->i915->drm, actual < expect,
+ -			     "Expected domain %d to be held awake by caller, count=%d\n",
+ -			     domain->id, actual))
+ -			break;
+ -	}
+ -
+ -	spin_unlock_irq(&uncore->lock);
+ +	fw_domains &= dev_priv->uncore.fw_domains;
+ +	WARN(fw_domains & ~dev_priv->uncore.fw_domains_active,
+ +	     "Expected %08x fw_domains to be active, but %08x are off\n",
+ +	     fw_domains, fw_domains & ~dev_priv->uncore.fw_domains_active);
+  }
+  
+  /* We give fast paths for the really cool registers */
+diff --cc drivers/gpu/drm/i915/intel_uncore.h
+index e5e157d288de,2a15b2b2e2fc..000000000000
+--- a/drivers/gpu/drm/i915/intel_uncore.h
++++ b/drivers/gpu/drm/i915/intel_uncore.h
+@@@ -161,22 -242,28 +161,33 @@@ intel_uncore_forcewake_for_reg(struct d
+  #define FW_REG_READ  (1)
+  #define FW_REG_WRITE (2)
+  
+ -void intel_uncore_forcewake_get(struct intel_uncore *uncore,
+ +void intel_uncore_forcewake_get(struct drm_i915_private *dev_priv,
+  				enum forcewake_domains domains);
+ -void intel_uncore_forcewake_put(struct intel_uncore *uncore,
+ +void intel_uncore_forcewake_put(struct drm_i915_private *dev_priv,
+  				enum forcewake_domains domains);
+++<<<<<<< HEAD
+ +/* Like above but the caller must manage the uncore.lock itself.
+ + * Must be used with I915_READ_FW and friends.
+++=======
++ void intel_uncore_forcewake_put_delayed(struct intel_uncore *uncore,
++ 					enum forcewake_domains domains);
++ void intel_uncore_forcewake_flush(struct intel_uncore *uncore,
++ 				  enum forcewake_domains fw_domains);
++ 
++ /*
++  * Like above but the caller must manage the uncore.lock itself.
++  * Must be used with intel_uncore_read_fw() and friends.
+++>>>>>>> 7938d61591d3 (drm/i915: Flush TLBs before releasing backing store)
+   */
+ -void intel_uncore_forcewake_get__locked(struct intel_uncore *uncore,
+ +void intel_uncore_forcewake_get__locked(struct drm_i915_private *dev_priv,
+  					enum forcewake_domains domains);
+ -void intel_uncore_forcewake_put__locked(struct intel_uncore *uncore,
+ +void intel_uncore_forcewake_put__locked(struct drm_i915_private *dev_priv,
+  					enum forcewake_domains domains);
+  
+ -void intel_uncore_forcewake_user_get(struct intel_uncore *uncore);
+ -void intel_uncore_forcewake_user_put(struct intel_uncore *uncore);
+ +void intel_uncore_forcewake_user_get(struct drm_i915_private *dev_priv);
+ +void intel_uncore_forcewake_user_put(struct drm_i915_private *dev_priv);
+  
+ -int __intel_wait_for_register(struct intel_uncore *uncore,
+ +int __intel_wait_for_register(struct drm_i915_private *dev_priv,
+  			      i915_reg_t reg,
+  			      u32 mask,
+  			      u32 value,
+* Unmerged path drivers/gpu/drm/i915/gem/i915_gem_object_types.h
+* Unmerged path drivers/gpu/drm/i915/gem/i915_gem_pages.c
+* Unmerged path drivers/gpu/drm/i915/gt/intel_gt.c
+* Unmerged path drivers/gpu/drm/i915/gt/intel_gt.h
+* Unmerged path drivers/gpu/drm/i915/gt/intel_gt_types.h
+* Unmerged path drivers/gpu/drm/i915/gem/i915_gem_object_types.h
+* Unmerged path drivers/gpu/drm/i915/gem/i915_gem_pages.c
+* Unmerged path drivers/gpu/drm/i915/gt/intel_gt.c
+* Unmerged path drivers/gpu/drm/i915/gt/intel_gt.h
+* Unmerged path drivers/gpu/drm/i915/gt/intel_gt_types.h
+* Unmerged path drivers/gpu/drm/i915/i915_reg.h
+* Unmerged path drivers/gpu/drm/i915/i915_vma.c
+* Unmerged path drivers/gpu/drm/i915/intel_uncore.c
+* Unmerged path drivers/gpu/drm/i915/intel_uncore.h
