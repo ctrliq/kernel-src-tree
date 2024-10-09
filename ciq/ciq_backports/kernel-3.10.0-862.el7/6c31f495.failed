@@ -1,0 +1,394 @@
+xfs: use iomap to implement DAX
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 6c31f495d19975b7d2e824ee614934d5db113afe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6c31f495.failed
+
+Another users of buffer_heads bytes the dust.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 6c31f495d19975b7d2e824ee614934d5db113afe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+#	fs/xfs/xfs_iomap.c
+diff --cc fs/xfs/xfs_file.c
+index 4da908a64865,f99d7fac5abf..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -374,34 -327,22 +374,43 @@@ xfs_file_dio_aio_read
+  	return ret;
+  }
+  
+ -static noinline ssize_t
+ +STATIC ssize_t
+  xfs_file_dax_read(
+  	struct kiocb		*iocb,
+ -	struct iov_iter		*to)
+ +	const struct iovec	*iovp,
+ +	unsigned long		nr_segs,
+ +	loff_t			pos)
+  {
+++<<<<<<< HEAD
+ +	struct address_space	*mapping = iocb->ki_filp->f_mapping;
+ +	struct inode		*inode = mapping->host;
+ +	struct xfs_inode	*ip = XFS_I(inode);
+ +	size_t			size = 0;
+++=======
++ 	struct xfs_inode	*ip = XFS_I(iocb->ki_filp->f_mapping->host);
++ 	size_t			count = iov_iter_count(to);
+++>>>>>>> 6c31f495d199 (xfs: use iomap to implement DAX)
+  	ssize_t			ret = 0;
+  
+ -	trace_xfs_file_dax_read(ip, count, iocb->ki_pos);
+ +	ret = generic_segment_checks(iovp, &nr_segs, &size, VERIFY_WRITE);
+ +	if (ret < 0)
+ +		return ret;
+ +
+ +	trace_xfs_file_dax_read(ip, size, iocb->ki_pos);
+  
+ -	if (!count)
+ +	if (!size)
+  		return 0; /* skip atime */
+  
+  	xfs_rw_ilock(ip, XFS_IOLOCK_SHARED);
+++<<<<<<< HEAD
+ +	ret = dax_do_io(READ, iocb, inode, iovp, pos, nr_segs,
+ +			xfs_get_blocks_direct, NULL, 0);
+ +	if (ret > 0) {
+ +		iocb->ki_pos = pos + ret;
+ +	}
+++=======
++ 	ret = iomap_dax_rw(iocb, to, &xfs_iomap_ops);
+++>>>>>>> 6c31f495d199 (xfs: use iomap to implement DAX)
+  	xfs_rw_iunlock(ip, XFS_IOLOCK_SHARED);
+  
+  	file_accessed(iocb->ki_filp);
+@@@ -961,61 -699,37 +970,84 @@@ out
+  	return ret;
+  }
+  
+ -static noinline ssize_t
+ +STATIC ssize_t
+  xfs_file_dax_write(
+  	struct kiocb		*iocb,
+ -	struct iov_iter		*from)
+ +	const struct iovec	*iovp,
+ +	unsigned long		nr_segs,
+ +	loff_t			pos,
+ +	size_t			ocount)
+  {
+++<<<<<<< HEAD
+ +	struct file		*file = iocb->ki_filp;
+ +	struct address_space	*mapping = file->f_mapping;
+ +	struct inode		*inode = mapping->host;
+ +	struct xfs_inode	*ip = XFS_I(inode);
+ +	ssize_t			ret = 0;
+ +	size_t			count = ocount;
+ +	int			iolock = XFS_IOLOCK_EXCL;
+++=======
++ 	struct inode		*inode = iocb->ki_filp->f_mapping->host;
++ 	struct xfs_inode	*ip = XFS_I(inode);
++ 	int			iolock = XFS_IOLOCK_EXCL;
++ 	ssize_t			ret, error = 0;
++ 	size_t			count;
++ 	loff_t			pos;
+++>>>>>>> 6c31f495d199 (xfs: use iomap to implement DAX)
+  
+  	xfs_rw_ilock(ip, iolock);
+ -	ret = xfs_file_aio_write_checks(iocb, from, &iolock);
+ +	ret = xfs_file_aio_write_checks(file, &pos, &count, &iolock);
+  	if (ret)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Yes, even DAX files can have page cache attached to them:  A zeroed
+ +	 * page is inserted into the pagecache when we have to serve a write
+ +	 * fault on a hole.  It should never be dirtied and can simply be
+ +	 * dropped from the pagecache once we get real data for the page.
+ +	 *
+ +	 * XXX: This is racy against mmap, and there's nothing we can do about
+ +	 * it. dax_do_io() should really do this invalidation internally as
+ +	 * it will know if we've allocated over a holei for this specific IO and
+ +	 * if so it needs to update the mapping tree and invalidate existing
+ +	 * PTEs over the newly allocated range. Remove this invalidation when
+ +	 * dax_do_io() is fixed up.
+ +	 */
+ +	if (mapping->nrpages) {
+ +		loff_t end = iocb->ki_pos + count - 1;
+ +		ret = invalidate_inode_pages2_range(mapping,
+ +						iocb->ki_pos >> PAGE_SHIFT,
+ +						end >> PAGE_SHIFT);
+ +		WARN_ON_ONCE(ret);
+ +	}
+ +
+ +	trace_xfs_file_dax_write(ip, count, iocb->ki_pos);
+ +
+ +	ret = dax_do_io(WRITE, iocb, inode, iovp, pos, nr_segs,
+ +			xfs_get_blocks_direct,
+ +			xfs_end_io_direct_write, 0);
+ +
+ +	if (ret > 0) {
+ +		pos += ret;
+ +		iocb->ki_pos = pos;
+ +	}
+++=======
++ 	pos = iocb->ki_pos;
++ 	count = iov_iter_count(from);
++ 
++ 	trace_xfs_file_dax_write(ip, count, pos);
++ 
++ 	ret = iomap_dax_rw(iocb, from, &xfs_iomap_ops);
++ 	if (ret > 0 && iocb->ki_pos > i_size_read(inode)) {
++ 		i_size_write(inode, iocb->ki_pos);
++ 		error = xfs_setfilesize(ip, pos, ret);
++ 	}
++ 
+++>>>>>>> 6c31f495d199 (xfs: use iomap to implement DAX)
+  out:
+  	xfs_rw_iunlock(ip, iolock);
+- 	return ret;
++ 	return error ? error : ret;
+  }
+  
+  STATIC ssize_t
+@@@ -1711,9 -1468,9 +1743,9 @@@ xfs_filemap_page_mkwrite
+  	xfs_ilock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
+  
+  	if (IS_DAX(inode)) {
+- 		ret = dax_mkwrite(vma, vmf, xfs_get_blocks_dax_fault);
++ 		ret = iomap_dax_fault(vma, vmf, &xfs_iomap_ops);
+  	} else {
+ -		ret = iomap_page_mkwrite(vma, vmf, &xfs_iomap_ops);
+ +		ret = __block_page_mkwrite(vma, vmf, xfs_get_blocks);
+  		ret = block_page_mkwrite_return(ret);
+  	}
+  
+diff --cc fs/xfs/xfs_iomap.c
+index 2f3719461cbd,c08253e11545..000000000000
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@@ -942,28 -934,190 +942,117 @@@ error_on_bmapi_transaction
+  	return error;
+  }
+  
+++<<<<<<< HEAD
+ +void
+ +xfs_bmbt_to_iomap(
+++=======
++ static inline bool imap_needs_alloc(struct inode *inode,
++ 		struct xfs_bmbt_irec *imap, int nimaps)
++ {
++ 	return !nimaps ||
++ 		imap->br_startblock == HOLESTARTBLOCK ||
++ 		imap->br_startblock == DELAYSTARTBLOCK ||
++ 		(IS_DAX(inode) && ISUNWRITTEN(imap));
++ }
++ 
++ static int
++ xfs_file_iomap_begin(
++ 	struct inode		*inode,
++ 	loff_t			offset,
++ 	loff_t			length,
++ 	unsigned		flags,
++ 	struct iomap		*iomap)
++ {
++ 	struct xfs_inode	*ip = XFS_I(inode);
++ 	struct xfs_mount	*mp = ip->i_mount;
++ 	struct xfs_bmbt_irec	imap;
++ 	xfs_fileoff_t		offset_fsb, end_fsb;
++ 	int			nimaps = 1, error = 0;
++ 	unsigned		lockmode;
++ 
++ 	if (XFS_FORCED_SHUTDOWN(mp))
++ 		return -EIO;
++ 
++ 	if ((flags & IOMAP_WRITE) &&
++ 	    !IS_DAX(inode) && !xfs_get_extsz_hint(ip)) {
++ 		return xfs_file_iomap_begin_delay(inode, offset, length, flags,
++ 				iomap);
++ 	}
++ 
++ 	lockmode = xfs_ilock_data_map_shared(ip);
++ 
++ 	ASSERT(offset <= mp->m_super->s_maxbytes);
++ 	if ((xfs_fsize_t)offset + length > mp->m_super->s_maxbytes)
++ 		length = mp->m_super->s_maxbytes - offset;
++ 	offset_fsb = XFS_B_TO_FSBT(mp, offset);
++ 	end_fsb = XFS_B_TO_FSB(mp, offset + length);
++ 
++ 	error = xfs_bmapi_read(ip, offset_fsb, end_fsb - offset_fsb, &imap,
++ 			       &nimaps, XFS_BMAPI_ENTIRE);
++ 	if (error) {
++ 		xfs_iunlock(ip, lockmode);
++ 		return error;
++ 	}
++ 
++ 	if ((flags & IOMAP_WRITE) && imap_needs_alloc(inode, &imap, nimaps)) {
++ 		/*
++ 		 * We cap the maximum length we map here to MAX_WRITEBACK_PAGES
++ 		 * pages to keep the chunks of work done where somewhat symmetric
++ 		 * with the work writeback does. This is a completely arbitrary
++ 		 * number pulled out of thin air as a best guess for initial
++ 		 * testing.
++ 		 *
++ 		 * Note that the values needs to be less than 32-bits wide until
++ 		 * the lower level functions are updated.
++ 		 */
++ 		length = min_t(loff_t, length, 1024 * PAGE_SIZE);
++ 		/*
++ 		 * xfs_iomap_write_direct() expects the shared lock. It
++ 		 * is unlocked on return.
++ 		 */
++ 		if (lockmode == XFS_ILOCK_EXCL)
++ 			xfs_ilock_demote(ip, lockmode);
++ 		error = xfs_iomap_write_direct(ip, offset, length, &imap,
++ 				nimaps);
++ 		if (error)
++ 			return error;
++ 
++ 		iomap->flags = IOMAP_F_NEW;
++ 		trace_xfs_iomap_alloc(ip, offset, length, 0, &imap);
++ 	} else {
++ 		ASSERT(nimaps);
++ 
++ 		xfs_iunlock(ip, lockmode);
++ 		trace_xfs_iomap_found(ip, offset, length, 0, &imap);
++ 	}
++ 
++ 	xfs_bmbt_to_iomap(ip, iomap, &imap);
++ 	return 0;
++ }
++ 
++ static int
++ xfs_file_iomap_end_delalloc(
+++>>>>>>> 6c31f495d199 (xfs: use iomap to implement DAX)
+  	struct xfs_inode	*ip,
+ -	loff_t			offset,
+ -	loff_t			length,
+ -	ssize_t			written)
+ -{
+ -	struct xfs_mount	*mp = ip->i_mount;
+ -	xfs_fileoff_t		start_fsb;
+ -	xfs_fileoff_t		end_fsb;
+ -	int			error = 0;
+ -
+ -	start_fsb = XFS_B_TO_FSB(mp, offset + written);
+ -	end_fsb = XFS_B_TO_FSB(mp, offset + length);
+ -
+ -	/*
+ -	 * Trim back delalloc blocks if we didn't manage to write the whole
+ -	 * range reserved.
+ -	 *
+ -	 * We don't need to care about racing delalloc as we hold i_mutex
+ -	 * across the reserve/allocate/unreserve calls. If there are delalloc
+ -	 * blocks in the range, they are ours.
+ -	 */
+ -	if (start_fsb < end_fsb) {
+ -		xfs_ilock(ip, XFS_ILOCK_EXCL);
+ -		error = xfs_bmap_punch_delalloc_range(ip, start_fsb,
+ -					       end_fsb - start_fsb);
+ -		xfs_iunlock(ip, XFS_ILOCK_EXCL);
+ -
+ -		if (error && !XFS_FORCED_SHUTDOWN(mp)) {
+ -			xfs_alert(mp, "%s: unable to clean up ino %lld",
+ -				__func__, ip->i_ino);
+ -			return error;
+ -		}
+ -	}
+ -
+ -	return 0;
+ -}
+ -
+ -static int
+ -xfs_file_iomap_end(
+ -	struct inode		*inode,
+ -	loff_t			offset,
+ -	loff_t			length,
+ -	ssize_t			written,
+ -	unsigned		flags,
+ -	struct iomap		*iomap)
+ -{
+ -	if ((flags & IOMAP_WRITE) && iomap->type == IOMAP_DELALLOC)
+ -		return xfs_file_iomap_end_delalloc(XFS_I(inode), offset,
+ -				length, written);
+ -	return 0;
+ -}
+ -
+ -struct iomap_ops xfs_iomap_ops = {
+ -	.iomap_begin		= xfs_file_iomap_begin,
+ -	.iomap_end		= xfs_file_iomap_end,
+ -};
+ -
+ -static int
+ -xfs_xattr_iomap_begin(
+ -	struct inode		*inode,
+ -	loff_t			offset,
+ -	loff_t			length,
+ -	unsigned		flags,
+ -	struct iomap		*iomap)
+ +	struct iomap		*iomap,
+ +	struct xfs_bmbt_irec	*imap)
+  {
+ -	struct xfs_inode	*ip = XFS_I(inode);
+  	struct xfs_mount	*mp = ip->i_mount;
+ -	xfs_fileoff_t		offset_fsb = XFS_B_TO_FSBT(mp, offset);
+ -	xfs_fileoff_t		end_fsb = XFS_B_TO_FSB(mp, offset + length);
+ -	struct xfs_bmbt_irec	imap;
+ -	int			nimaps = 1, error = 0;
+ -	unsigned		lockmode;
+ -
+ -	if (XFS_FORCED_SHUTDOWN(mp))
+ -		return -EIO;
+ -
+ -	lockmode = xfs_ilock_data_map_shared(ip);
+ -
+ -	/* if there are no attribute fork or extents, return ENOENT */
+ -	if (XFS_IFORK_Q(ip) || !ip->i_d.di_anextents) {
+ -		error = -ENOENT;
+ -		goto out_unlock;
+ -	}
+ -
+ -	ASSERT(ip->i_d.di_aformat != XFS_DINODE_FMT_LOCAL);
+ -	error = xfs_bmapi_read(ip, offset_fsb, end_fsb - offset_fsb, &imap,
+ -			       &nimaps, XFS_BMAPI_ENTIRE | XFS_BMAPI_ATTRFORK);
+ -out_unlock:
+ -	xfs_iunlock(ip, lockmode);
+  
+ -	if (!error) {
+ -		ASSERT(nimaps);
+ -		xfs_bmbt_to_iomap(ip, iomap, &imap);
+ +	if (imap->br_startblock == HOLESTARTBLOCK) {
+ +		iomap->blkno = IOMAP_NULL_BLOCK;
+ +		iomap->type = IOMAP_HOLE;
+ +	} else if (imap->br_startblock == DELAYSTARTBLOCK) {
+ +		iomap->blkno = IOMAP_NULL_BLOCK;
+ +		iomap->type = IOMAP_DELALLOC;
+ +	} else {
+ +		iomap->blkno = xfs_fsb_to_db(ip, imap->br_startblock);
+ +		if (imap->br_state == XFS_EXT_UNWRITTEN)
+ +			iomap->type = IOMAP_UNWRITTEN;
+ +		else
+ +			iomap->type = IOMAP_MAPPED;
+  	}
+ -
+ -	return error;
+ +	iomap->offset = XFS_FSB_TO_B(mp, imap->br_startoff);
+ +	iomap->length = XFS_FSB_TO_B(mp, imap->br_blockcount);
+ +	iomap->bdev = xfs_find_bdev_for_inode(VFS_I(ip));
+  }
+ -
+ -struct iomap_ops xfs_xattr_iomap_ops = {
+ -	.iomap_begin		= xfs_xattr_iomap_begin,
+ -};
+* Unmerged path fs/xfs/xfs_file.c
+* Unmerged path fs/xfs/xfs_iomap.c
