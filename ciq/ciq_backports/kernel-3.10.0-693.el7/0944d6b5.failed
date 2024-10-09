@@ -1,0 +1,210 @@
+bridge: try switchdev op first in __vlan_vid_add/del
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 0944d6b5a2fad9ba3b7abb2e94a6b7d40cd4a935
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/0944d6b5.failed
+
+Some drivers need to implement both switchdev vlan ops and
+vid_add/kill ndos. For that to work in bridge code, we need to try
+switchdev op first when adding/deleting vlan id.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Acked-by: Scott Feldman <sfeldma@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0944d6b5a2fad9ba3b7abb2e94a6b7d40cd4a935)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_vlan.c
+diff --cc net/bridge/br_vlan.c
+index 1122c9d717ea,ad7e4f6b6d6b..000000000000
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@@ -20,45 -46,158 +20,156 @@@ static void __vlan_delete_pvid(struct n
+  		return;
+  
+  	smp_wmb();
+ -	vg->pvid = 0;
+ +	v->pvid = 0;
+  }
+  
+ -static void __vlan_add_flags(struct net_bridge_vlan *v, u16 flags)
+ +static void __vlan_add_flags(struct net_port_vlans *v, u16 vid, u16 flags)
+  {
+ -	struct net_bridge_vlan_group *vg;
+ -
+ -	if (br_vlan_is_master(v))
+ -		vg = v->br->vlgrp;
+ -	else
+ -		vg = v->port->vlgrp;
+ -
+  	if (flags & BRIDGE_VLAN_INFO_PVID)
+ -		__vlan_add_pvid(vg, v->vid);
+ +		__vlan_add_pvid(v, vid);
+  	else
+ -		__vlan_delete_pvid(vg, v->vid);
+ +		__vlan_delete_pvid(v, vid);
+  
+  	if (flags & BRIDGE_VLAN_INFO_UNTAGGED)
+ -		v->flags |= BRIDGE_VLAN_INFO_UNTAGGED;
+ +		set_bit(vid, v->untagged_bitmap);
+  	else
+ -		v->flags &= ~BRIDGE_VLAN_INFO_UNTAGGED;
+ +		clear_bit(vid, v->untagged_bitmap);
+  }
+  
+ -static int __vlan_vid_add(struct net_device *dev, struct net_bridge *br,
+ -			  u16 vid, u16 flags)
+ +static int __vlan_add(struct net_port_vlans *v, u16 vid, u16 flags)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct switchdev_obj_port_vlan v = {
++ 		.obj.id = SWITCHDEV_OBJ_ID_PORT_VLAN,
++ 		.flags = flags,
++ 		.vid_begin = vid,
++ 		.vid_end = vid,
++ 	};
++ 	int err;
++ 
++ 	/* Try switchdev op first. In case it is not supported, fallback to
++ 	 * 8021q add.
++ 	 */
++ 	err = switchdev_port_obj_add(dev, &v.obj);
++ 	if (err == -EOPNOTSUPP)
++ 		return vlan_vid_add(dev, br->vlan_proto, vid);
++ 	return err;
++ }
++ 
++ static void __vlan_add_list(struct net_bridge_vlan *v)
++ {
++ 	struct list_head *headp, *hpos;
++ 	struct net_bridge_vlan *vent;
++ 
++ 	headp = br_vlan_is_master(v) ? &v->br->vlgrp->vlan_list :
++ 				       &v->port->vlgrp->vlan_list;
++ 	list_for_each_prev(hpos, headp) {
++ 		vent = list_entry(hpos, struct net_bridge_vlan, vlist);
++ 		if (v->vid < vent->vid)
++ 			continue;
++ 		else
++ 			break;
++ 	}
++ 	list_add_rcu(&v->vlist, hpos);
++ }
++ 
++ static void __vlan_del_list(struct net_bridge_vlan *v)
++ {
++ 	list_del_rcu(&v->vlist);
++ }
++ 
++ static int __vlan_vid_del(struct net_device *dev, struct net_bridge *br,
++ 			  u16 vid)
++ {
++ 	struct switchdev_obj_port_vlan v = {
++ 		.obj.id = SWITCHDEV_OBJ_ID_PORT_VLAN,
++ 		.vid_begin = vid,
++ 		.vid_end = vid,
++ 	};
++ 	int err;
++ 
++ 	/* Try switchdev op first. In case it is not supported, fallback to
++ 	 * 8021q del.
++ 	 */
++ 	err = switchdev_port_obj_del(dev, &v.obj);
++ 	if (err == -EOPNOTSUPP) {
++ 		vlan_vid_del(dev, br->vlan_proto, vid);
++ 		return 0;
++ 	}
++ 	return err;
++ }
++ 
++ /* Returns a master vlan, if it didn't exist it gets created. In all cases a
++  * a reference is taken to the master vlan before returning.
++  */
++ static struct net_bridge_vlan *br_vlan_get_master(struct net_bridge *br, u16 vid)
++ {
++ 	struct net_bridge_vlan *masterv;
++ 
++ 	masterv = br_vlan_find(br->vlgrp, vid);
++ 	if (!masterv) {
++ 		/* missing global ctx, create it now */
++ 		if (br_vlan_add(br, vid, 0))
++ 			return NULL;
++ 		masterv = br_vlan_find(br->vlgrp, vid);
++ 		if (WARN_ON(!masterv))
++ 			return NULL;
++ 	}
++ 	atomic_inc(&masterv->refcnt);
++ 
++ 	return masterv;
++ }
++ 
++ static void br_vlan_put_master(struct net_bridge_vlan *masterv)
++ {
++ 	if (!br_vlan_is_master(masterv))
++ 		return;
++ 
++ 	if (atomic_dec_and_test(&masterv->refcnt)) {
++ 		rhashtable_remove_fast(&masterv->br->vlgrp->vlan_hash,
++ 				       &masterv->vnode, br_vlan_rht_params);
++ 		__vlan_del_list(masterv);
++ 		kfree_rcu(masterv, rcu);
++ 	}
++ }
++ 
++ /* This is the shared VLAN add function which works for both ports and bridge
++  * devices. There are four possible calls to this function in terms of the
++  * vlan entry type:
++  * 1. vlan is being added on a port (no master flags, global entry exists)
++  * 2. vlan is being added on a bridge (both master and brvlan flags)
++  * 3. vlan is being added on a port, but a global entry didn't exist which
++  *    is being created right now (master flag set, brvlan flag unset), the
++  *    global entry is used for global per-vlan features, but not for filtering
++  * 4. same as 3 but with both master and brvlan flags set so the entry
++  *    will be used for filtering in both the port and the bridge
++  */
++ static int __vlan_add(struct net_bridge_vlan *v, u16 flags)
++ {
++ 	struct net_bridge_vlan *masterv = NULL;
+++>>>>>>> 0944d6b5a2fa (bridge: try switchdev op first in __vlan_vid_add/del)
+  	struct net_bridge_port *p = NULL;
+ -	struct net_bridge_vlan_group *vg;
+ -	struct net_device *dev;
+  	struct net_bridge *br;
+ +	struct net_device *dev;
+  	int err;
+  
+ -	if (br_vlan_is_master(v)) {
+ -		br = v->br;
+ -		dev = br->dev;
+ -		vg = br->vlgrp;
+ -	} else {
+ -		p = v->port;
+ +	if (test_bit(vid, v->vlan_bitmap)) {
+ +		__vlan_add_flags(v, vid, flags);
+ +		return 0;
+ +	}
+ +
+ +	if (v->port_idx) {
+ +		p = v->parent.port;
+  		br = p->br;
+  		dev = p->dev;
+ -		vg = p->vlgrp;
+ +	} else {
+ +		br = v->parent.br;
+ +		dev = br->dev;
+  	}
+  
+ -	if (p) {
+ +	/* Toggle HW filters when filtering is enabled */
+ +	if (p && p->br->vlan_enabled) {
+  		/* Add VLAN to the device filter if it is supported.
+  		 * This ensures tagged traffic enters the bridge when
+  		 * promiscuous mode is disabled by br_manage_promisc().
+* Unmerged path net/bridge/br_vlan.c
