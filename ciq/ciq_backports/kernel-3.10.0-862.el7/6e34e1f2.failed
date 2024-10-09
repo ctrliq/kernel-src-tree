@@ -1,0 +1,488 @@
+cpufreq: intel_pstate: Correct the busy calculation for KNL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [cpufreq] intel_pstate: Correct the busy calculation for KNL (Prarit Bhargava) [1465349]
+Rebuild_FUZZ: 91.74%
+commit-author Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+commit 6e34e1f23d780978da65968327cbba6d7013a73f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6e34e1f2.failed
+
+The busy percent calculated for the Knights Landing (KNL) platform
+is 1024 times smaller than the correct busy value.  This causes
+performance to get stuck at the lowest ratio.
+
+The scaling algorithm used for KNL is performance-based, but it still
+looks at the CPU load to set the scaled busy factor to 0 when the
+load is less than 1 percent.  In this case, since the computed load
+is 1024x smaller than it should be, the scaled busy factor will
+always be 0, irrespective of CPU business.
+
+This needs a fix similar to the turbostat one in commit b2b34dfe4d9a
+(tools/power turbostat: KNL workaround for %Busy and Avg_MHz).
+
+For this reason, add one more callback to processor-specific
+callbacks to specify an MPERF multiplier represented by a number of
+bit positions to shift the value of that register to the left to
+copmensate for its rate difference with respect to the TSC.  This
+shift value is used during CPU busy calculations.
+
+Fixes: ffb810563c (intel_pstate: Avoid getting stuck in high P-states when idle)
+Reported-and-tested-by: Artem Bityutskiy <artem.bityutskiy@linux.intel.com>
+	Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+	Cc: 4.6+ <stable@vger.kernel.org> # 4.6+
+[ rjw: Changelog ]
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 6e34e1f23d780978da65968327cbba6d7013a73f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/intel_pstate.c
+diff --cc drivers/cpufreq/intel_pstate.c
+index c8ed8841fcf2,0ddc0d045831..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -189,7 -260,9 +192,13 @@@ struct cpudata 
+  	struct vid_data vid;
+  	struct _pid pid;
+  
+++<<<<<<< HEAD
+ +	ktime_t last_sample_time;
+++=======
++ 	u64	last_update;
++ 	u64	last_sample_time;
++ 	u64	aperf_mperf_shift;
+++>>>>>>> 6e34e1f23d78 (cpufreq: intel_pstate: Correct the busy calculation for KNL)
+  	u64	prev_aperf;
+  	u64	prev_mperf;
+  	u64	prev_tsc;
+@@@ -244,27 -325,28 +253,32 @@@ struct pstate_funcs 
+  	int (*get_min)(void);
+  	int (*get_turbo)(void);
+  	int (*get_scaling)(void);
+++<<<<<<< HEAD
+ +	void (*set)(struct cpudata*, int pstate);
+++=======
++ 	int (*get_aperf_mperf_shift)(void);
++ 	u64 (*get_val)(struct cpudata*, int pstate);
+++>>>>>>> 6e34e1f23d78 (cpufreq: intel_pstate: Correct the busy calculation for KNL)
+  	void (*get_vid)(struct cpudata *);
+ -	void (*update_util)(struct update_util_data *data, u64 time,
+ -			    unsigned int flags);
+ +	int32_t (*get_target_pstate)(struct cpudata *);
+  };
+  
+ -static struct pstate_funcs pstate_funcs __read_mostly;
+ -static struct pstate_adjust_policy pid_params __read_mostly = {
+ -	.sample_rate_ms = 10,
+ -	.sample_rate_ns = 10 * NSEC_PER_MSEC,
+ -	.deadband = 0,
+ -	.setpoint = 97,
+ -	.p_gain_pct = 20,
+ -	.d_gain_pct = 0,
+ -	.i_gain_pct = 0,
+ +/**
+ + * struct cpu_defaults- Per CPU model default config data
+ + * @pid_policy:	PID config data
+ + * @funcs:		Callback function data
+ + */
+ +struct cpu_defaults {
+ +	struct pstate_adjust_policy pid_policy;
+ +	struct pstate_funcs funcs;
+  };
+  
+ -static int hwp_active __read_mostly;
+ -static bool per_cpu_limits __read_mostly;
+ +static inline int32_t get_target_pstate_use_performance(struct cpudata *cpu);
+ +static inline int32_t get_target_pstate_use_cpu_load(struct cpudata *cpu);
+  
+ -static struct cpufreq_driver *intel_pstate_driver __read_mostly;
+ +static struct pstate_adjust_policy pid_params __read_mostly;
+ +static struct pstate_funcs pstate_funcs __read_mostly;
+ +static int hwp_active __read_mostly;
+  
+  #ifdef CONFIG_ACPI
+  static bool acpi_ppc;
+@@@ -1005,12 -1489,17 +1019,17 @@@ static void core_set_pstate(struct cpud
+  	u64 val;
+  
+  	val = (u64)pstate << 8;
+ -	if (global.no_turbo && !global.turbo_disabled)
+ +	if (limits->no_turbo && !limits->turbo_disabled)
+  		val |= (u64)1 << 32;
+  
+ -	return val;
+ +	wrmsrl_on_cpu(cpudata->cpu, MSR_IA32_PERF_CTL, val);
+  }
+  
++ static int knl_get_aperf_mperf_shift(void)
++ {
++ 	return 10;
++ }
++ 
+  static int knl_get_turbo_pstate(void)
+  {
+  	u64 value;
+@@@ -1134,30 -1554,26 +1153,33 @@@ static void intel_pstate_get_cpu_pstate
+  	cpu->pstate.max_pstate_physical = pstate_funcs.get_max_physical();
+  	cpu->pstate.turbo_pstate = pstate_funcs.get_turbo();
+  	cpu->pstate.scaling = pstate_funcs.get_scaling();
+ -	cpu->pstate.max_freq = cpu->pstate.max_pstate * cpu->pstate.scaling;
+ -	cpu->pstate.turbo_freq = cpu->pstate.turbo_pstate * cpu->pstate.scaling;
+  
++ 	if (pstate_funcs.get_aperf_mperf_shift)
++ 		cpu->aperf_mperf_shift = pstate_funcs.get_aperf_mperf_shift();
++ 
+  	if (pstate_funcs.get_vid)
+  		pstate_funcs.get_vid(cpu);
+ -
+ -	intel_pstate_set_min_pstate(cpu);
+ +	intel_pstate_set_pstate(cpu, cpu->pstate.min_pstate);
+  }
+  
+ -static inline void intel_pstate_calc_avg_perf(struct cpudata *cpu)
+ +static inline void intel_pstate_calc_busy(struct cpudata *cpu)
+  {
+  	struct sample *sample = &cpu->sample;
+ +	int64_t core_pct;
+ +
+ +	core_pct = int_tofp(sample->aperf) * int_tofp(100);
+ +	core_pct = div64_u64(core_pct, int_tofp(sample->mperf));
+  
+ -	sample->core_avg_perf = div_ext_fp(sample->aperf, sample->mperf);
+ +	sample->freq = fp_toint(
+ +		mul_fp(int_tofp(
+ +			cpu->pstate.max_pstate_physical *
+ +			cpu->pstate.scaling / 100),
+ +			core_pct));
+ +
+ +	sample->core_pct_busy = (int32_t)core_pct;
+  }
+  
+ -static inline bool intel_pstate_sample(struct cpudata *cpu, u64 time)
+ +static inline void intel_pstate_sample(struct cpudata *cpu)
+  {
+  	u64 aperf, mperf;
+  	unsigned long flags;
+@@@ -1213,127 -1630,218 +1235,204 @@@ static inline int32_t get_avg_pstate(st
+  static inline int32_t get_target_pstate_use_cpu_load(struct cpudata *cpu)
+  {
+  	struct sample *sample = &cpu->sample;
+ -	int32_t busy_frac, boost;
+ -	int target, avg_pstate;
+ -
+ +	u64 cummulative_iowait, delta_iowait_us;
+ +	u64 delta_iowait_mperf;
+ +	u64 mperf, now;
+ +	int32_t cpu_load;
+ +
+++<<<<<<< HEAD
+ +	cummulative_iowait = get_cpu_iowait_time_us(cpu->cpu, &now);
+++=======
++ 	busy_frac = div_fp(sample->mperf << cpu->aperf_mperf_shift,
++ 			   sample->tsc);
++ 
++ 	boost = cpu->iowait_boost;
++ 	cpu->iowait_boost >>= 1;
++ 
++ 	if (busy_frac < boost)
++ 		busy_frac = boost;
++ 
++ 	sample->busy_scaled = busy_frac * 100;
++ 
++ 	target = global.no_turbo || global.turbo_disabled ?
++ 			cpu->pstate.max_pstate : cpu->pstate.turbo_pstate;
++ 	target += target >> 2;
++ 	target = mul_fp(target, busy_frac);
++ 	if (target < cpu->pstate.min_pstate)
++ 		target = cpu->pstate.min_pstate;
+++>>>>>>> 6e34e1f23d78 (cpufreq: intel_pstate: Correct the busy calculation for KNL)
+ +
+ +	/*
+ +	 * Convert iowait time into number of IO cycles spent at max_freq.
+ +	 * IO is considered as busy only for the cpu_load algorithm. For
+ +	 * performance this is not needed since we always try to reach the
+ +	 * maximum P-State, so we are already boosting the IOs.
+ +	 */
+ +	delta_iowait_us = cummulative_iowait - cpu->prev_cummulative_iowait;
+ +	delta_iowait_mperf = div64_u64(delta_iowait_us * cpu->pstate.scaling *
+ +		cpu->pstate.max_pstate, MSEC_PER_SEC);
+ +
+ +	mperf = cpu->sample.mperf + delta_iowait_mperf;
+ +	cpu->prev_cummulative_iowait = cummulative_iowait;
+  
+  	/*
+ -	 * If the average P-state during the previous cycle was higher than the
+ -	 * current target, add 50% of the difference to the target to reduce
+ -	 * possible performance oscillations and offset possible performance
+ -	 * loss related to moving the workload from one CPU to another within
+ -	 * a package/module.
+ +	 * The load can be estimated as the ratio of the mperf counter
+ +	 * running at a constant frequency during active periods
+ +	 * (C0) and the time stamp counter running at the same frequency
+ +	 * also during C-states.
+  	 */
+ -	avg_pstate = get_avg_pstate(cpu);
+ -	if (avg_pstate > target)
+ -		target += (avg_pstate - target) >> 1;
+ +	cpu_load = div64_u64(int_tofp(100) * mperf, sample->tsc);
+ +	cpu->sample.busy_scaled = cpu_load;
+  
+ -	return target;
+ +	return get_avg_pstate(cpu) - pid_calc(&cpu->pid, cpu_load);
+  }
+  
+  static inline int32_t get_target_pstate_use_performance(struct cpudata *cpu)
+  {
+ -	int32_t perf_scaled, max_pstate, current_pstate, sample_ratio;
+ -	u64 duration_ns;
+ +	int32_t core_busy, max_pstate, current_pstate, sample_ratio;
+ +	s64 duration_us;
+ +	u32 sample_time;
+ +
+ +	intel_pstate_calc_busy(cpu);
+  
+  	/*
+ -	 * perf_scaled is the ratio of the average P-state during the last
+ -	 * sampling period to the P-state requested last time (in percent).
+ +	 * core_busy is the ratio of actual performance to max
+ +	 * max_pstate is the max non turbo pstate available
+ +	 * current_pstate was the pstate that was requested during
+ +	 * 	the last sample period.
+  	 *
+ -	 * That measures the system's response to the previous P-state
+ -	 * selection.
+ +	 * We normalize core_busy, which was our actual percent
+ +	 * performance to what we requested during the last sample
+ +	 * period. The result will be a percentage of busy at a
+ +	 * specified pstate.
+  	 */
+ -	max_pstate = cpu->pstate.max_pstate_physical;
+ -	current_pstate = cpu->pstate.current_pstate;
+ -	perf_scaled = mul_ext_fp(cpu->sample.core_avg_perf,
+ -			       div_fp(100 * max_pstate, current_pstate));
+ +	core_busy = cpu->sample.core_pct_busy;
+ +	max_pstate = int_tofp(cpu->pstate.max_pstate_physical);
+ +	current_pstate = int_tofp(cpu->pstate.current_pstate);
+ +	core_busy = mul_fp(core_busy, div_fp(max_pstate, current_pstate));
+  
+  	/*
+ -	 * Since our utilization update callback will not run unless we are
+ -	 * in C0, check if the actual elapsed time is significantly greater (3x)
+ -	 * than our sample interval.  If it is, then we were idle for a long
+ -	 * enough period of time to adjust our performance metric.
+ +	 * Since we have a deferred timer, it will not fire unless
+ +	 * we are in C0.  So, determine if the actual elapsed time
+ +	 * is significantly greater (3x) than our sample interval.  If it
+ +	 * is, then we were idle for a long enough period of time
+ +	 * to adjust our busyness.
+  	 */
+ -	duration_ns = cpu->sample.time - cpu->last_sample_time;
+ -	if ((s64)duration_ns > pid_params.sample_rate_ns * 3) {
+ -		sample_ratio = div_fp(pid_params.sample_rate_ns, duration_ns);
+ -		perf_scaled = mul_fp(perf_scaled, sample_ratio);
+ +	sample_time = pid_params.sample_rate_ms  * USEC_PER_MSEC;
+ +	duration_us = ktime_us_delta(cpu->sample.time,
+ +				     cpu->last_sample_time);
+ +	if (duration_us > sample_time * 3) {
+ +		sample_ratio = div_fp(int_tofp(sample_time),
+ +				      int_tofp(duration_us));
+ +		core_busy = mul_fp(core_busy, sample_ratio);
+  	} else {
+- 		sample_ratio = div_fp(100 * cpu->sample.mperf, cpu->sample.tsc);
++ 		sample_ratio = div_fp(100 * (cpu->sample.mperf << cpu->aperf_mperf_shift),
++ 				      cpu->sample.tsc);
+  		if (sample_ratio < int_tofp(1))
+ -			perf_scaled = 0;
+ +			core_busy = 0;
+  	}
+  
+ -	cpu->sample.busy_scaled = perf_scaled;
+ -	return cpu->pstate.current_pstate - pid_calc(&cpu->pid, perf_scaled);
+ -}
+ -
+ -static int intel_pstate_prepare_request(struct cpudata *cpu, int pstate)
+ -{
+ -	int max_pstate = intel_pstate_get_base_pstate(cpu);
+ -	int min_pstate;
+ -
+ -	min_pstate = max(cpu->pstate.min_pstate, cpu->min_perf_ratio);
+ -	max_pstate = max(min_pstate, cpu->max_perf_ratio);
+ -	return clamp_t(int, pstate, min_pstate, max_pstate);
+ +	cpu->sample.busy_scaled = core_busy;
+ +	return cpu->pstate.current_pstate - pid_calc(&cpu->pid, core_busy);
+  }
+  
+ -static void intel_pstate_update_pstate(struct cpudata *cpu, int pstate)
+ +static inline void intel_pstate_adjust_busy_pstate(struct cpudata *cpu)
+  {
+ -	if (pstate == cpu->pstate.current_pstate)
+ -		return;
+ -
+ -	cpu->pstate.current_pstate = pstate;
+ -	wrmsrl(MSR_IA32_PERF_CTL, pstate_funcs.get_val(cpu, pstate));
+ -}
+ -
+ -static void intel_pstate_adjust_pstate(struct cpudata *cpu, int target_pstate)
+ -{
+ -	int from = cpu->pstate.current_pstate;
+ +	int from, target_pstate;
+  	struct sample *sample;
+  
+ -	update_turbo_state();
+ +	from = cpu->pstate.current_pstate;
+  
+ -	target_pstate = intel_pstate_prepare_request(cpu, target_pstate);
+ -	trace_cpu_frequency(target_pstate * cpu->pstate.scaling, cpu->cpu);
+ -	intel_pstate_update_pstate(cpu, target_pstate);
+ +	target_pstate = pstate_funcs.get_target_pstate(cpu);
+ +
+ +	intel_pstate_set_pstate(cpu, target_pstate);
+  
+  	sample = &cpu->sample;
+ -	trace_pstate_sample(mul_ext_fp(100, sample->core_avg_perf),
+ +	trace_pstate_sample(fp_toint(sample->core_pct_busy),
+  		fp_toint(sample->busy_scaled),
+  		from,
+  		cpu->pstate.current_pstate,
+  		sample->mperf,
+  		sample->aperf,
+  		sample->tsc,
+ -		get_avg_frequency(cpu),
+ -		fp_toint(cpu->iowait_boost * 100));
+ +		sample->freq);
+  }
+  
+ -static void intel_pstate_update_util_pid(struct update_util_data *data,
+ -					 u64 time, unsigned int flags)
+ +static void intel_hwp_timer_func(unsigned long __data)
+  {
+ -	struct cpudata *cpu = container_of(data, struct cpudata, update_util);
+ -	u64 delta_ns = time - cpu->sample.time;
+ -
+ -	if ((s64)delta_ns < pid_params.sample_rate_ns)
+ -		return;
+ +	struct cpudata *cpu = (struct cpudata *) __data;
+  
+ -	if (intel_pstate_sample(cpu, time)) {
+ -		int target_pstate;
+ -
+ -		target_pstate = get_target_pstate_use_performance(cpu);
+ -		intel_pstate_adjust_pstate(cpu, target_pstate);
+ -	}
+ +	intel_pstate_sample(cpu);
+ +	intel_hwp_set_sample_time(cpu);
+  }
+  
+ -static void intel_pstate_update_util(struct update_util_data *data, u64 time,
+ -				     unsigned int flags)
+ +static void intel_pstate_timer_func(unsigned long __data)
+  {
+ -	struct cpudata *cpu = container_of(data, struct cpudata, update_util);
+ -	u64 delta_ns;
+ +	struct cpudata *cpu = (struct cpudata *) __data;
+  
+ -	if (flags & SCHED_CPUFREQ_IOWAIT) {
+ -		cpu->iowait_boost = int_tofp(1);
+ -	} else if (cpu->iowait_boost) {
+ -		/* Clear iowait_boost if the CPU may have been idle. */
+ -		delta_ns = time - cpu->last_update;
+ -		if (delta_ns > TICK_NSEC)
+ -			cpu->iowait_boost = 0;
+ -	}
+ -	cpu->last_update = time;
+ -	delta_ns = time - cpu->sample.time;
+ -	if ((s64)delta_ns < INTEL_PSTATE_DEFAULT_SAMPLING_INTERVAL)
+ -		return;
+ +	intel_pstate_sample(cpu);
+  
+ -	if (intel_pstate_sample(cpu, time)) {
+ -		int target_pstate;
+ +	intel_pstate_adjust_busy_pstate(cpu);
+  
+ -		target_pstate = get_target_pstate_use_cpu_load(cpu);
+ -		intel_pstate_adjust_pstate(cpu, target_pstate);
+ -	}
+ +	intel_pstate_set_sample_time(cpu);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct pstate_funcs core_funcs = {
++ 	.get_max = core_get_max_pstate,
++ 	.get_max_physical = core_get_max_pstate_physical,
++ 	.get_min = core_get_min_pstate,
++ 	.get_turbo = core_get_turbo_pstate,
++ 	.get_scaling = core_get_scaling,
++ 	.get_val = core_get_val,
++ 	.update_util = intel_pstate_update_util_pid,
++ };
++ 
++ static const struct pstate_funcs silvermont_funcs = {
++ 	.get_max = atom_get_max_pstate,
++ 	.get_max_physical = atom_get_max_pstate,
++ 	.get_min = atom_get_min_pstate,
++ 	.get_turbo = atom_get_turbo_pstate,
++ 	.get_val = atom_get_val,
++ 	.get_scaling = silvermont_get_scaling,
++ 	.get_vid = atom_get_vid,
++ 	.update_util = intel_pstate_update_util,
++ };
++ 
++ static const struct pstate_funcs airmont_funcs = {
++ 	.get_max = atom_get_max_pstate,
++ 	.get_max_physical = atom_get_max_pstate,
++ 	.get_min = atom_get_min_pstate,
++ 	.get_turbo = atom_get_turbo_pstate,
++ 	.get_val = atom_get_val,
++ 	.get_scaling = airmont_get_scaling,
++ 	.get_vid = atom_get_vid,
++ 	.update_util = intel_pstate_update_util,
++ };
++ 
++ static const struct pstate_funcs knl_funcs = {
++ 	.get_max = core_get_max_pstate,
++ 	.get_max_physical = core_get_max_pstate_physical,
++ 	.get_min = core_get_min_pstate,
++ 	.get_turbo = knl_get_turbo_pstate,
++ 	.get_aperf_mperf_shift = knl_get_aperf_mperf_shift,
++ 	.get_scaling = core_get_scaling,
++ 	.get_val = core_get_val,
++ 	.update_util = intel_pstate_update_util_pid,
++ };
++ 
++ static const struct pstate_funcs bxt_funcs = {
++ 	.get_max = core_get_max_pstate,
++ 	.get_max_physical = core_get_max_pstate_physical,
++ 	.get_min = core_get_min_pstate,
++ 	.get_turbo = core_get_turbo_pstate,
++ 	.get_scaling = core_get_scaling,
++ 	.get_val = core_get_val,
++ 	.update_util = intel_pstate_update_util,
++ };
++ 
+++>>>>>>> 6e34e1f23d78 (cpufreq: intel_pstate: Correct the busy calculation for KNL)
+  #define ICPU(model, policy) \
+  	{ X86_VENDOR_INTEL, 6, model, X86_FEATURE_APERFMPERF,\
+  			(unsigned long)&policy }
+@@@ -1601,10 -2420,12 +1700,15 @@@ static void copy_cpu_funcs(struct pstat
+  	pstate_funcs.get_min   = funcs->get_min;
+  	pstate_funcs.get_turbo = funcs->get_turbo;
+  	pstate_funcs.get_scaling = funcs->get_scaling;
+ -	pstate_funcs.get_val   = funcs->get_val;
+ +	pstate_funcs.set       = funcs->set;
+  	pstate_funcs.get_vid   = funcs->get_vid;
+++<<<<<<< HEAD
+ +	pstate_funcs.get_target_pstate = funcs->get_target_pstate;
+++=======
++ 	pstate_funcs.update_util = funcs->update_util;
++ 	pstate_funcs.get_aperf_mperf_shift = funcs->get_aperf_mperf_shift;
+++>>>>>>> 6e34e1f23d78 (cpufreq: intel_pstate: Correct the busy calculation for KNL)
+  
+ -	intel_pstate_use_acpi_profile();
+  }
+  
+  #ifdef CONFIG_ACPI
+* Unmerged path drivers/cpufreq/intel_pstate.c
