@@ -1,0 +1,86 @@
+xfs: reduce lock hold times in buffer writeback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 26f1fe858f2744edfc75e92d34a6be0af5e8b45d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/26f1fe85.failed
+
+When we have a lot of metadata to flush from the AIL, the buffer
+list can get very long. The current submission code tries to batch
+submission to optimise IO order of the metadata (i.e. ascending
+block order) to maximise block layer merging or IO to adjacent
+metadata blocks.
+
+Unfortunately, the method used can result in long lock times
+occurring as buffers locked early on in the buffer list might not be
+dispatched until the end of the IO licst processing. This is because
+sorting does not occur util after the buffer list has been processed
+and the buffers that are going to be submitted are locked. Hence
+when the buffer list is several thousand buffers long, the lock hold
+times before IO dispatch can be significant.
+
+To fix this, sort the buffer list before we start trying to lock and
+submit buffers. This means we can now submit buffers immediately
+after they are locked, allowing merging to occur immediately on the
+plug and dispatch to occur as quickly as possible. This means there
+is minimal delay between locking the buffer and IO submission
+occuring, hence reducing the worst case lock hold times seen during
+delayed write buffer IO submission signficantly.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Carlos Maiolino <cmaiolino@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 26f1fe858f2744edfc75e92d34a6be0af5e8b45d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_buf.c
+diff --cc fs/xfs/xfs_buf.c
+index e2ae94fd5b87,efa2a734268f..000000000000
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@@ -1929,25 -1823,21 +1944,32 @@@ xfs_buf_delwri_submit_buffers
+  			continue;
+  		}
+  
+- 		list_move_tail(&bp->b_list, io_list);
+  		trace_xfs_buf_delwri_split(bp, _RET_IP_);
+++<<<<<<< HEAD
+ +	}
+ +
+ +	list_sort(NULL, io_list, xfs_buf_cmp);
+ +
+ +	blk_start_plug(&plug);
+ +	list_for_each_entry_safe(bp, n, io_list, b_list) {
+ +		bp->b_flags &= ~(_XBF_DELWRI_Q | XBF_WRITE_FAIL);
+ +		bp->b_flags |= XBF_WRITE | XBF_ASYNC;
+++=======
+++>>>>>>> 26f1fe858f27 (xfs: reduce lock hold times in buffer writeback)
+  
+  		/*
+- 		 * we do all Io submission async. This means if we need to wait
+- 		 * for IO completion we need to take an extra reference so the
+- 		 * buffer is still valid on the other side.
++ 		 * We do all IO submission async. This means if we need
++ 		 * to wait for IO completion we need to take an extra
++ 		 * reference so the buffer is still valid on the other
++ 		 * side. We need to move the buffer onto the io_list
++ 		 * at this point so the caller can still access it.
+  		 */
+- 		if (wait)
++ 		bp->b_flags &= ~(_XBF_DELWRI_Q | XBF_ASYNC | XBF_WRITE_FAIL);
++ 		bp->b_flags |= XBF_WRITE | XBF_ASYNC;
++ 		if (wait_list) {
+  			xfs_buf_hold(bp);
+- 		else
++ 			list_move_tail(&bp->b_list, wait_list);
++ 		} else
+  			list_del_init(&bp->b_list);
+  
+  		xfs_buf_submit(bp);
+* Unmerged path fs/xfs/xfs_buf.c
