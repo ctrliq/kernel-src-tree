@@ -1,0 +1,117 @@
+bpf: properly enforce index mask to prevent out-of-bounds speculation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit c93552c443ebc63b14e26e46d2e76941c88e0d71
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/c93552c4.failed
+
+While reviewing the verifier code, I recently noticed that the
+following two program variants in relation to tail calls can be
+loaded.
+
+Variant 1:
+
+  # bpftool p d x i 15
+    0: (15) if r1 == 0x0 goto pc+3
+    1: (18) r2 = map[id:5]
+    3: (05) goto pc+2
+    4: (18) r2 = map[id:6]
+    6: (b7) r3 = 7
+    7: (35) if r3 >= 0xa0 goto pc+2
+    8: (54) (u32) r3 &= (u32) 255
+    9: (85) call bpf_tail_call#12
+   10: (b7) r0 = 1
+   11: (95) exit
+
+  # bpftool m s i 5
+    5: prog_array  flags 0x0
+        key 4B  value 4B  max_entries 4  memlock 4096B
+  # bpftool m s i 6
+    6: prog_array  flags 0x0
+        key 4B  value 4B  max_entries 160  memlock 4096B
+
+Variant 2:
+
+  # bpftool p d x i 20
+    0: (15) if r1 == 0x0 goto pc+3
+    1: (18) r2 = map[id:8]
+    3: (05) goto pc+2
+    4: (18) r2 = map[id:7]
+    6: (b7) r3 = 7
+    7: (35) if r3 >= 0x4 goto pc+2
+    8: (54) (u32) r3 &= (u32) 3
+    9: (85) call bpf_tail_call#12
+   10: (b7) r0 = 1
+   11: (95) exit
+
+  # bpftool m s i 8
+    8: prog_array  flags 0x0
+        key 4B  value 4B  max_entries 160  memlock 4096B
+  # bpftool m s i 7
+    7: prog_array  flags 0x0
+        key 4B  value 4B  max_entries 4  memlock 4096B
+
+In both cases the index masking inserted by the verifier in order
+to control out of bounds speculation from a CPU via b2157399cc98
+("bpf: prevent out-of-bounds speculation") seems to be incorrect
+in what it is enforcing. In the 1st variant, the mask is applied
+from the map with the significantly larger number of entries where
+we would allow to a certain degree out of bounds speculation for
+the smaller map, and in the 2nd variant where the mask is applied
+from the map with the smaller number of entries, we get buggy
+behavior since we truncate the index of the larger map.
+
+The original intent from commit b2157399cc98 is to reject such
+occasions where two or more different tail call maps are used
+in the same tail call helper invocation. However, the check on
+the BPF_MAP_PTR_POISON is never hit since we never poisoned the
+saved pointer in the first place! We do this explicitly for map
+lookups but in case of tail calls we basically used the tail
+call map in insn_aux_data that was processed in the most recent
+path which the verifier walked. Thus any prior path that stored
+a pointer in insn_aux_data at the helper location was always
+overridden.
+
+Fix it by moving the map pointer poison logic into a small helper
+that covers both BPF helpers with the same logic. After that in
+fixup_bpf_calls() the poison check is then hit for tail calls
+and the program rejected. Latter only happens in unprivileged
+case since this is the *only* occasion where a rewrite needs to
+happen, and where such rewrite is specific to the map (max_entries,
+index_mask). In the privileged case the rewrite is generic for
+the insn->imm / insn->code update so multiple maps from different
+paths can be handled just fine since all the remaining logic
+happens in the instruction processing itself. This is similar
+to the case of map lookups: in case there is a collision of
+maps in fixup_bpf_calls() we must skip the inlined rewrite since
+this will turn the generic instruction sequence into a non-
+generic one. Thus the patch_call_imm will simply update the
+insn->imm location where the bpf_map_lookup_elem() will later
+take care of the dispatch. Given we need this 'poison' state
+as a check, the information of whether a map is an unpriv_array
+gets lost, so enforcing it prior to that needs an additional
+state. In general this check is needed since there are some
+complex and tail call intensive BPF programs out there where
+LLVM tends to generate such code occasionally. We therefore
+convert the map_ptr rather into map_state to store all this
+w/o extra memory overhead, and the bit whether one of the maps
+involved in the collision was from an unpriv_array thus needs
+to be retained as well there.
+
+Fixes: b2157399cc98 ("bpf: prevent out-of-bounds speculation")
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit c93552c443ebc63b14e26e46d2e76941c88e0d71)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf_verifier.h
+#	kernel/bpf/verifier.c
+* Unmerged path include/linux/bpf_verifier.h
+* Unmerged path kernel/bpf/verifier.c
+* Unmerged path include/linux/bpf_verifier.h
+* Unmerged path kernel/bpf/verifier.c
