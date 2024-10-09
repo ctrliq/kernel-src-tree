@@ -1,0 +1,140 @@
+scsi_dh_alua: update all port states
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Hannes Reinecke <hare@suse.de>
+commit c57168a1e15007e59fd2730678c7a6b28e8c7a37
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c57168a1.failed
+
+When we read in the target port group state we should be
+updating all affected port groups, otherwise we risk
+running out of sync.
+
+	Reviewed-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit c57168a1e15007e59fd2730678c7a6b28e8c7a37)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/device_handler/scsi_dh_alua.c
+diff --cc drivers/scsi/device_handler/scsi_dh_alua.c
+index 9c9d9c3d8e9b,98d87d9765ab..000000000000
+--- a/drivers/scsi/device_handler/scsi_dh_alua.c
++++ b/drivers/scsi/device_handler/scsi_dh_alua.c
+@@@ -336,23 -473,32 +336,30 @@@ static int alua_check_sense(struct scsi
+   * Returns SCSI_DH_DEV_OFFLINED if the path is
+   * found to be unusable.
+   */
+ -static int alua_rtpg(struct scsi_device *sdev, struct alua_port_group *pg)
+ +static int alua_rtpg(struct scsi_device *sdev, struct alua_dh_data *h, int wait_for_transition)
+  {
+  	struct scsi_sense_hdr sense_hdr;
+++<<<<<<< HEAD
+ +	int len, k, off, valid_states = 0;
+ +	unsigned char *ucp;
+++=======
++ 	struct alua_port_group *tmp_pg;
++ 	int len, k, off, valid_states = 0, bufflen = ALUA_RTPG_SIZE;
++ 	unsigned char *desc, *buff;
+++>>>>>>> c57168a1e150 (scsi_dh_alua: update all port states)
+  	unsigned err, retval;
+ +	unsigned long expiry, interval = 0;
+  	unsigned int tpg_desc_tbl_off;
+  	unsigned char orig_transition_tmo;
++ 	unsigned long flags;
+  
+ -	if (!pg->expiry) {
+ -		unsigned long transition_tmo = ALUA_FAILOVER_TIMEOUT * HZ;
+ -
+ -		if (pg->transition_tmo)
+ -			transition_tmo = pg->transition_tmo * HZ;
+ -
+ -		pg->expiry = round_jiffies_up(jiffies + transition_tmo);
+ -	}
+ -
+ -	buff = kzalloc(bufflen, GFP_KERNEL);
+ -	if (!buff)
+ -		return SCSI_DH_DEV_TEMP_BUSY;
+ +	if (!h->transition_tmo)
+ +		expiry = round_jiffies_up(jiffies + ALUA_FAILOVER_TIMEOUT * HZ);
+ +	else
+ +		expiry = round_jiffies_up(jiffies + h->transition_tmo * HZ);
+  
+   retry:
+ -	retval = submit_rtpg(sdev, buff, bufflen, &sense_hdr, pg->flags);
+ +	retval = submit_rtpg(sdev, h->buff, h->bufflen, &sense_hdr, h->flags);
+  
+  	if (retval) {
+  		if (!scsi_sense_valid(&sense_hdr)) {
+@@@ -430,22 -584,36 +437,47 @@@
+  	else
+  		tpg_desc_tbl_off = 4;
+  
+++<<<<<<< HEAD
+ +	for (k = tpg_desc_tbl_off, ucp = h->buff + tpg_desc_tbl_off;
+++=======
++ 	for (k = tpg_desc_tbl_off, desc = buff + tpg_desc_tbl_off;
+++>>>>>>> c57168a1e150 (scsi_dh_alua: update all port states)
+  	     k < len;
+- 	     k += off, ucp += off) {
++ 	     k += off, desc += off) {
++ 		u16 group_id = get_unaligned_be16(&desc[2]);
+  
+++<<<<<<< HEAD
+ +		if (h->group_id == get_unaligned_be16(&ucp[2])) {
+ +			h->state = ucp[0] & 0x0f;
+ +			h->pref = ucp[0] >> 7;
+ +			valid_states = ucp[1];
+++=======
++ 		spin_lock_irqsave(&port_group_lock, flags);
++ 		tmp_pg = alua_find_get_pg(pg->device_id_str, pg->device_id_len,
++ 					  group_id);
++ 		spin_unlock_irqrestore(&port_group_lock, flags);
++ 		if (tmp_pg) {
++ 			if (spin_trylock_irqsave(&tmp_pg->lock, flags)) {
++ 				if ((tmp_pg == pg) ||
++ 				    !(tmp_pg->flags & ALUA_PG_RUNNING)) {
++ 					tmp_pg->state = desc[0] & 0x0f;
++ 					tmp_pg->pref = desc[0] >> 7;
++ 				}
++ 				if (tmp_pg == pg)
++ 					valid_states = desc[1];
++ 				spin_unlock_irqrestore(&tmp_pg->lock, flags);
++ 			}
++ 			kref_put(&tmp_pg->kref, release_port_group);
+++>>>>>>> c57168a1e150 (scsi_dh_alua: update all port states)
+  		}
+- 		off = 8 + (ucp[7] * 4);
++ 		off = 8 + (desc[7] * 4);
+  	}
+  
++ 	spin_lock_irqsave(&pg->lock, flags);
+  	sdev_printk(KERN_INFO, sdev,
+  		    "%s: port group %02x state %c %s supports %c%c%c%c%c%c%c\n",
+ -		    ALUA_DH_NAME, pg->group_id, print_alua_state(pg->state),
+ -		    pg->pref ? "preferred" : "non-preferred",
+ +		    ALUA_DH_NAME, h->group_id, print_alua_state(h->state),
+ +		    h->pref ? "preferred" : "non-preferred",
+  		    valid_states&TPGS_SUPPORT_TRANSITION?'T':'t',
+  		    valid_states&TPGS_SUPPORT_OFFLINE?'O':'o',
+  		    valid_states&TPGS_SUPPORT_LBA_DEPENDENT?'L':'l',
+@@@ -478,8 -643,11 +510,13 @@@
+  	default:
+  		/* Useable path if active */
+  		err = SCSI_DH_OK;
+ -		pg->expiry = 0;
+  		break;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	spin_unlock_irqrestore(&pg->lock, flags);
++ 	kfree(buff);
+++>>>>>>> c57168a1e150 (scsi_dh_alua: update all port states)
+  	return err;
+  }
+  
+* Unmerged path drivers/scsi/device_handler/scsi_dh_alua.c
