@@ -1,0 +1,204 @@
+x86/mm/pkeys: Fill in pkey field in siginfo
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] mm/pkeys: Fill in pkey field in siginfo (Rui Wang) [1272615]
+Rebuild_FUZZ: 95.12%
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit 019132ff3daf36c97a4006655dfd00ee42f2b590
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/019132ff.failed
+
+This fills in the new siginfo field: si_pkey to indicate to
+userspace which protection key was set on the PTE that we faulted
+on.
+
+Note though that *ALL* protection key faults have to be generated
+by a valid, present PTE at some point.  But this code does no PTE
+lookups which seeds odd.  The reason is that we take advantage of
+the way we generate PTEs from VMAs.  All PTEs under a VMA share
+some attributes.  For instance, they are _all_ either PROT_READ
+*OR* PROT_NONE.  They also always share a protection key, so we
+never have to walk the page tables; we just use the VMA.
+
+Note that _pkey is a 64-bit value.  The current hardware only
+supports 4-bit protection keys.  We do this because there is
+_plenty_ of space in _sigfault and it is possible that future
+processors would support more than 4 bits of protection keys.
+
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Dave Hansen <dave@sr71.net>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: linux-mm@kvack.org
+Link: http://lkml.kernel.org/r/20160212210213.ABC488FA@viggo.jf.intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 019132ff3daf36c97a4006655dfd00ee42f2b590)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/pgtable_types.h
+#	arch/x86/mm/fault.c
+diff --cc arch/x86/include/asm/pgtable_types.h
+index b8078b5f1b11,7b5efe264eff..000000000000
+--- a/arch/x86/include/asm/pgtable_types.h
++++ b/arch/x86/include/asm/pgtable_types.h
+@@@ -53,19 -52,23 +53,26 @@@
+  #define _PAGE_PAT_LARGE (_AT(pteval_t, 1) << _PAGE_BIT_PAT_LARGE)
+  #define _PAGE_SPECIAL	(_AT(pteval_t, 1) << _PAGE_BIT_SPECIAL)
+  #define _PAGE_CPA_TEST	(_AT(pteval_t, 1) << _PAGE_BIT_CPA_TEST)
+ -#ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS
+ -#define _PAGE_PKEY_BIT0	(_AT(pteval_t, 1) << _PAGE_BIT_PKEY_BIT0)
+ -#define _PAGE_PKEY_BIT1	(_AT(pteval_t, 1) << _PAGE_BIT_PKEY_BIT1)
+ -#define _PAGE_PKEY_BIT2	(_AT(pteval_t, 1) << _PAGE_BIT_PKEY_BIT2)
+ -#define _PAGE_PKEY_BIT3	(_AT(pteval_t, 1) << _PAGE_BIT_PKEY_BIT3)
+ -#else
+ -#define _PAGE_PKEY_BIT0	(_AT(pteval_t, 0))
+ -#define _PAGE_PKEY_BIT1	(_AT(pteval_t, 0))
+ -#define _PAGE_PKEY_BIT2	(_AT(pteval_t, 0))
+ -#define _PAGE_PKEY_BIT3	(_AT(pteval_t, 0))
+ -#endif
+ +#define _PAGE_SPLITTING	(_AT(pteval_t, 1) << _PAGE_BIT_SPLITTING)
+  #define __HAVE_ARCH_PTE_SPECIAL
+  
+++<<<<<<< HEAD
+ +#if defined(CONFIG_X86_64) || defined(CONFIG_X86_PAE)
+ +#define _PAGE_KNL_ERRATUM_MASK (_PAGE_DIRTY | _PAGE_ACCESSED)
+ +#else
+ +/*
+ + * With 32-bit PTEs, _PAGE_DIRTY is used to denote a nonlinear
+ + * PTE.  We must not clear the bit.  We do not allow 32-bit
+ + * kernels to run on KNL
+ + */
+ +#define _PAGE_KNL_ERRATUM_MASK 0
+ +#endif
+++=======
++ #define _PAGE_PKEY_MASK (_PAGE_PKEY_BIT0 | \
++ 			 _PAGE_PKEY_BIT1 | \
++ 			 _PAGE_PKEY_BIT2 | \
++ 			 _PAGE_PKEY_BIT3)
+++>>>>>>> 019132ff3daf (x86/mm/pkeys: Fill in pkey field in siginfo)
+  
+  #ifdef CONFIG_KMEMCHECK
+  #define _PAGE_HIDDEN	(_AT(pteval_t, 1) << _PAGE_BIT_HIDDEN)
+diff --cc arch/x86/mm/fault.c
+index 1977abf5754c,6e71dcf699ab..000000000000
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@@ -14,11 -13,16 +14,19 @@@
+  #include <linux/hugetlb.h>		/* hstate_index_to_shift	*/
+  #include <linux/prefetch.h>		/* prefetchw			*/
+  #include <linux/context_tracking.h>	/* exception_enter(), ...	*/
+ -#include <linux/uaccess.h>		/* faulthandler_disabled()	*/
+  
++ #include <asm/cpufeature.h>		/* boot_cpu_has, ...		*/
+  #include <asm/traps.h>			/* dotraplinkage, ...		*/
+  #include <asm/pgalloc.h>		/* pgd_*(), ...			*/
+  #include <asm/kmemcheck.h>		/* kmemcheck_*(), ...		*/
+++<<<<<<< HEAD
+ +#include <asm/fixmap.h>			/* VSYSCALL_START		*/
+++=======
++ #include <asm/fixmap.h>			/* VSYSCALL_ADDR		*/
++ #include <asm/vsyscall.h>		/* emulate_vsyscall		*/
++ #include <asm/vm86.h>			/* struct vm86			*/
++ #include <asm/mmu_context.h>		/* vma_pkey()			*/
+++>>>>>>> 019132ff3daf (x86/mm/pkeys: Fill in pkey field in siginfo)
+  
+  #define CREATE_TRACE_POINTS
+  #include <asm/trace/exceptions.h>
+@@@ -167,9 -171,60 +175,59 @@@ is_prefetch(struct pt_regs *regs, unsig
+  	return prefetch;
+  }
+  
++ /*
++  * A protection key fault means that the PKRU value did not allow
++  * access to some PTE.  Userspace can figure out what PKRU was
++  * from the XSAVE state, and this function fills out a field in
++  * siginfo so userspace can discover which protection key was set
++  * on the PTE.
++  *
++  * If we get here, we know that the hardware signaled a PF_PK
++  * fault and that there was a VMA once we got in the fault
++  * handler.  It does *not* guarantee that the VMA we find here
++  * was the one that we faulted on.
++  *
++  * 1. T1   : mprotect_key(foo, PAGE_SIZE, pkey=4);
++  * 2. T1   : set PKRU to deny access to pkey=4, touches page
++  * 3. T1   : faults...
++  * 4.    T2: mprotect_key(foo, PAGE_SIZE, pkey=5);
++  * 5. T1   : enters fault handler, takes mmap_sem, etc...
++  * 6. T1   : reaches here, sees vma_pkey(vma)=5, when we really
++  *	     faulted on a pte with its pkey=4.
++  */
++ static void fill_sig_info_pkey(int si_code, siginfo_t *info,
++ 		struct vm_area_struct *vma)
++ {
++ 	/* This is effectively an #ifdef */
++ 	if (!boot_cpu_has(X86_FEATURE_OSPKE))
++ 		return;
++ 
++ 	/* Fault not from Protection Keys: nothing to do */
++ 	if (si_code != SEGV_PKUERR)
++ 		return;
++ 	/*
++ 	 * force_sig_info_fault() is called from a number of
++ 	 * contexts, some of which have a VMA and some of which
++ 	 * do not.  The PF_PK handing happens after we have a
++ 	 * valid VMA, so we should never reach this without a
++ 	 * valid VMA.
++ 	 */
++ 	if (!vma) {
++ 		WARN_ONCE(1, "PKU fault with no VMA passed in");
++ 		info->si_pkey = 0;
++ 		return;
++ 	}
++ 	/*
++ 	 * si_pkey should be thought of as a strong hint, but not
++ 	 * absolutely guranteed to be 100% accurate because of
++ 	 * the race explained above.
++ 	 */
++ 	info->si_pkey = vma_pkey(vma);
++ }
++ 
+  static void
+  force_sig_info_fault(int si_signo, int si_code, unsigned long address,
+ -		     struct task_struct *tsk, struct vm_area_struct *vma,
+ -		     int fault)
+ +		     struct task_struct *tsk, int fault)
+  {
+  	unsigned lsb = 0;
+  	siginfo_t info;
+@@@ -814,9 -899,17 +874,21 @@@ bad_area(struct pt_regs *regs, unsigne
+  
+  static noinline void
+  bad_area_access_error(struct pt_regs *regs, unsigned long error_code,
+ -		      unsigned long address, struct vm_area_struct *vma)
+ +		      unsigned long address)
+  {
+++<<<<<<< HEAD
+ +	__bad_area(regs, error_code, address, SEGV_ACCERR);
+++=======
++ 	/*
++ 	 * This OSPKE check is not strictly necessary at runtime.
++ 	 * But, doing it this way allows compiler optimizations
++ 	 * if pkeys are compiled out.
++ 	 */
++ 	if (boot_cpu_has(X86_FEATURE_OSPKE) && (error_code & PF_PK))
++ 		__bad_area(regs, error_code, address, vma, SEGV_PKUERR);
++ 	else
++ 		__bad_area(regs, error_code, address, vma, SEGV_ACCERR);
+++>>>>>>> 019132ff3daf (x86/mm/pkeys: Fill in pkey field in siginfo)
+  }
+  
+  static void
+* Unmerged path arch/x86/include/asm/pgtable_types.h
+* Unmerged path arch/x86/mm/fault.c
