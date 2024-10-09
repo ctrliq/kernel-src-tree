@@ -1,0 +1,229 @@
+mm/rmap: use rmap_walk() in try_to_unmap()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mm] rmap: use rmap_walk() in try_to_unmap() (Rafael Aquini) [1562137]
+Rebuild_FUZZ: 96.30%
+commit-author Joonsoo Kim <iamjoonsoo.kim@lge.com>
+commit 52629506420ce32997f1fba0a1ab2f1aaa9a4f79
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/52629506.failed
+
+Now, we have an infrastructure in rmap_walk() to handle difference from
+variants of rmap traversing functions.
+
+So, just use it in try_to_unmap().
+
+In this patch, I change following things.
+
+1. enable rmap_walk() if !CONFIG_MIGRATION.
+2. mechanical change to use rmap_walk() in try_to_unmap().
+
+	Signed-off-by: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Reviewed-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Hillf Danton <dhillf@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 52629506420ce32997f1fba0a1ab2f1aaa9a4f79)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/rmap.h
+#	mm/ksm.c
+#	mm/rmap.c
+diff --cc include/linux/rmap.h
+index 4fef883ac5c3,2462458708cd..000000000000
+--- a/include/linux/rmap.h
++++ b/include/linux/rmap.h
+@@@ -198,12 -186,14 +198,12 @@@ int page_referenced(struct page *, int 
+  int page_referenced_one(struct page *, struct vm_area_struct *,
+  	unsigned long address, unsigned int *mapcount, unsigned long *vm_flags);
+  
+ -#define TTU_ACTION(x) ((x) & TTU_ACTION_MASK)
+ -
+  int try_to_unmap(struct page *, enum ttu_flags flags);
+  int try_to_unmap_one(struct page *, struct vm_area_struct *,
+- 			unsigned long address, enum ttu_flags flags);
++ 			unsigned long address, void *arg);
+  
+  /*
+ - * Called from mm/filemap_xip.c to unmap empty zero page
+ + * Used by uprobes to replace a userspace page safely
+   */
+  pte_t *__page_check_address(struct page *, struct mm_struct *,
+  				unsigned long, spinlock_t **, int);
+@@@ -246,10 -236,27 +246,34 @@@ void page_unlock_anon_vma_read(struct a
+  int page_mapped_in_vma(struct page *page, struct vm_area_struct *vma);
+  
+  /*
+++<<<<<<< HEAD
+ + * Called by migrate.c to remove migration ptes, but might be used more later.
+ + */
+ +int rmap_walk(struct page *page, int (*rmap_one)(struct page *,
+ +		struct vm_area_struct *, unsigned long, void *), void *arg);
+++=======
++  * rmap_walk_control: To control rmap traversing for specific needs
++  *
++  * arg: passed to rmap_one() and invalid_vma()
++  * rmap_one: executed on each vma where page is mapped
++  * done: for checking traversing termination condition
++  * file_nonlinear: for handling file nonlinear mapping
++  * anon_lock: for getting anon_lock by optimized way rather than default
++  * invalid_vma: for skipping uninterested vma
++  */
++ struct rmap_walk_control {
++ 	void *arg;
++ 	int (*rmap_one)(struct page *page, struct vm_area_struct *vma,
++ 					unsigned long addr, void *arg);
++ 	int (*done)(struct page *page);
++ 	int (*file_nonlinear)(struct page *, struct address_space *,
++ 					struct vm_area_struct *vma);
++ 	struct anon_vma *(*anon_lock)(struct page *page);
++ 	bool (*invalid_vma)(struct vm_area_struct *vma, void *arg);
++ };
++ 
++ int rmap_walk(struct page *page, struct rmap_walk_control *rwc);
+++>>>>>>> 52629506420c (mm/rmap: use rmap_walk() in try_to_unmap())
+  
+  #else	/* !CONFIG_MMU */
+  
+diff --cc mm/ksm.c
+index 1813339bf866,6b4baa97f4c0..000000000000
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@@ -2607,9 -1996,7 +2607,13 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_MIGRATION
+ +int rmap_walk_ksm(struct page *page, int (*rmap_one)(struct page *,
+ +		  struct vm_area_struct *, unsigned long, void *), void *arg)
+++=======
++ int rmap_walk_ksm(struct page *page, struct rmap_walk_control *rwc)
+++>>>>>>> 52629506420c (mm/rmap: use rmap_walk() in try_to_unmap())
+  {
+  	struct stable_node *stable_node;
+  	struct rmap_item *rmap_item;
+diff --cc mm/rmap.c
+index 794c49685fc7,b3263cb32361..000000000000
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@@ -1349,57 -1190,8 +1351,58 @@@ int try_to_unmap_one(struct page *page
+  	pte_t pteval;
+  	spinlock_t *ptl;
+  	int ret = SWAP_AGAIN;
++ 	enum ttu_flags flags = (enum ttu_flags)arg;
+  
+ +	if ((flags & TTU_MIGRATION) && is_zone_device_page(page)) {
+ +		swp_entry_t entry;
+ +		pte_t swp_pte;
+ +		pmd_t *pmdp;
+ +
+ +		if (!is_hmm_page(page))
+ +			goto out;
+ +
+ +		pmdp = mm_find_pmd(mm, address);
+ +		if (!pmdp)
+ +			goto out;
+ +
+ +		pte = pte_offset_map_lock(mm, pmdp, address, &ptl);
+ +		if (!pte)
+ +			goto out;
+ +
+ +		pteval = ptep_get_and_clear(mm, address, pte);
+ +		if (pte_present(pteval) || pte_none(pteval) || pte_file(pteval)) {
+ +			set_pte_at(mm, address, pte, pteval);
+ +			goto out_unmap;
+ +		}
+ +
+ +		entry = pte_to_swp_entry(pteval);
+ +		if (!is_hmm_entry(entry)) {
+ +			set_pte_at(mm, address, pte, pteval);
+ +			goto out_unmap;
+ +		}
+ +
+ +		if (hmm_entry_to_page(entry) != page) {
+ +			set_pte_at(mm, address, pte, pteval);
+ +			goto out_unmap;
+ +		}
+ +
+ +		/*
+ +		 * Store the pfn of the page in a special migration
+ +		 * pte. do_swap_page() will wait until the migration
+ +		 * pte is removed and then restart fault handling.
+ +		 */
+ +		entry = make_migration_entry(page, 0);
+ +		swp_pte = swp_entry_to_pte(entry);
+ +		if (pte_soft_dirty(*pte))
+ +			swp_pte = pte_swp_mksoft_dirty(swp_pte);
+ +		set_pte_at(mm, address, pte, swp_pte);
+ +		goto out_unmap;
+ +	}
+ +
+ +	/* munlock has nothing to gain from examining un-locked vmas */
+ +	if ((flags & TTU_MUNLOCK) && !(vma->vm_flags & VM_LOCKED))
+ +		goto out;
+ +
+  	pte = page_check_address(page, mm, address, &ptl, 0);
+  	if (!pte)
+  		goto out;
+@@@ -1889,23 -1703,19 +1915,28 @@@ void __put_anon_vma(struct anon_vma *an
+  {
+  	struct anon_vma *root = anon_vma->root;
+  
+ +	anon_vma_free(anon_vma);
+  	if (root != anon_vma && atomic_dec_and_test(&root->refcount))
+  		anon_vma_free(root);
+ -
+ -	anon_vma_free(anon_vma);
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_MIGRATION
+ +/*
+ + * rmap_walk() and its helpers rmap_walk_anon() and rmap_walk_file():
+ + * Called by migrate.c to remove migration ptes, but might be used more later.
+ + */
+ +static int rmap_walk_anon(struct page *page, int (*rmap_one)(struct page *,
+ +		struct vm_area_struct *, unsigned long, void *), void *arg)
+++=======
++ static struct anon_vma *rmap_walk_anon_lock(struct page *page,
++ 					struct rmap_walk_control *rwc)
+++>>>>>>> 52629506420c (mm/rmap: use rmap_walk() in try_to_unmap())
+  {
+  	struct anon_vma *anon_vma;
+ -
+ -	if (rwc->anon_lock)
+ -		return rwc->anon_lock(page);
+ +	pgoff_t pgoff;
+ +	struct anon_vma_chain *avc;
+ +	int ret = SWAP_AGAIN;
+  
+  	/*
+  	 * Note: remove_migration_ptes() cannot use page_lock_anon_vma_read()
+@@@ -1966,13 -1804,12 +1997,12 @@@ int rmap_walk(struct page *page, int (*
+  	VM_BUG_ON(!PageLocked(page));
+  
+  	if (unlikely(PageKsm(page)))
+ -		return rmap_walk_ksm(page, rwc);
+ +		return rmap_walk_ksm(page, rmap_one, arg);
+  	else if (PageAnon(page))
+ -		return rmap_walk_anon(page, rwc);
+ +		return rmap_walk_anon(page, rmap_one, arg);
+  	else
+ -		return rmap_walk_file(page, rwc);
+ +		return rmap_walk_file(page, rmap_one, arg);
+  }
+- #endif /* CONFIG_MIGRATION */
+  
+  #ifdef CONFIG_HUGETLB_PAGE
+  /*
+* Unmerged path include/linux/rmap.h
+* Unmerged path mm/ksm.c
+* Unmerged path mm/rmap.c
