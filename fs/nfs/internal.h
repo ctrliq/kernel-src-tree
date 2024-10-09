@@ -533,7 +533,6 @@ static inline void nfs_inode_dio_wait(struct inode *inode)
 extern ssize_t nfs_dreq_bytes_left(struct nfs_direct_req *dreq);
 
 /* nfs4proc.c */
-extern void __nfs4_read_done_cb(struct nfs_pgio_header *);
 extern struct nfs_client *nfs4_init_client(struct nfs_client *clp,
 			    const struct nfs_client_initdata *);
 extern int nfs40_walk_client_list(struct nfs_client *clp,
