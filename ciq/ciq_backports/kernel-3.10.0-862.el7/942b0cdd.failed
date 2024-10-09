@@ -1,0 +1,169 @@
+GFS2: Withdraw for IO errors writing to the journal or statfs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 942b0cddfbf66295effc9fd879ca85ae10638565
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/942b0cdd.failed
+
+Before this patch, if GFS2 encountered IO errors while writing to
+the journal, it would not report the problem, so they would go
+unnoticed, sometimes for many hours. Sometimes this would only be
+noticed later, when recovery tried to do journal replay and failed
+due to invalid metadata at the blocks that resulted in IO errors.
+
+This patch makes GFS2's log daemon check for IO errors. If it
+encounters one, it withdraws from the file system and reports
+why in dmesg. A similar action is taken when IO errors occur when
+writing to the system statfs file.
+
+These errors are also reported back to any callers of fsync, since
+that requires the journal to be flushed. Therefore, any IO errors
+that would previously go unnoticed are now noticed and the file
+system is withdrawn as early as possible, thus preventing further
+file system damage.
+
+Also note that this reintroduces superblock variable sd_log_error,
+which Christoph removed with commit f729b66fca.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+(cherry picked from commit 942b0cddfbf66295effc9fd879ca85ae10638565)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/incore.h
+#	fs/gfs2/lops.c
+#	fs/gfs2/super.c
+diff --cc fs/gfs2/incore.h
+index 6f3cdb32bb5e,0ce0b334f412..000000000000
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@@ -798,9 -818,11 +798,15 @@@ struct gfs2_sbd 
+  	struct bio *sd_log_bio;
+  	wait_queue_head_t sd_log_flush_wait;
+  	int sd_log_error;
+++<<<<<<< HEAD
+++=======
++ 
++ 	atomic_t sd_reserving_log;
++ 	wait_queue_head_t sd_reserving_log_wait;
+++>>>>>>> 942b0cddfbf6 (GFS2: Withdraw for IO errors writing to the journal or statfs)
+  
+  	unsigned int sd_log_flush_head;
+ +	u64 sd_log_flush_wrapped;
+  
+  	spinlock_t sd_ail_lock;
+  	struct list_head sd_ail1_list;
+diff --cc fs/gfs2/lops.c
+index 42a935df8730,7dabbe721dba..000000000000
+--- a/fs/gfs2/lops.c
++++ b/fs/gfs2/lops.c
+@@@ -208,9 -207,10 +208,16 @@@ static void gfs2_end_log_write(struct b
+  	struct page *page;
+  	int i;
+  
+++<<<<<<< HEAD
+ +	if (error) {
+ +		sdp->sd_log_error = error;
+ +		fs_err(sdp, "Error %d writing to log\n", error);
+++=======
++ 	if (bio->bi_status) {
++ 		fs_err(sdp, "Error %d writing to journal, jid=%u\n",
++ 		       bio->bi_status, sdp->sd_jdesc->jd_jid);
++ 		wake_up(&sdp->sd_logd_waitq);
+++>>>>>>> 942b0cddfbf6 (GFS2: Withdraw for IO errors writing to the journal or statfs)
+  	}
+  
+  	bio_for_each_segment_all(bvec, bio, i) {
+diff --cc fs/gfs2/super.c
+index 4b3d1996eead,769841185ce5..000000000000
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@@ -947,9 -944,39 +947,15 @@@ static int gfs2_sync_fs(struct super_bl
+  	struct gfs2_sbd *sdp = sb->s_fs_info;
+  
+  	gfs2_quota_sync(sb, -1);
+++<<<<<<< HEAD
+ +	if (wait && sdp)
+ +		gfs2_log_flush(sdp, NULL);
+ +	return 0;
+++=======
++ 	if (wait)
++ 		gfs2_log_flush(sdp, NULL, NORMAL_FLUSH);
++ 	return sdp->sd_log_error;
+ -}
+ -
+ -void gfs2_freeze_func(struct work_struct *work)
+ -{
+ -	int error;
+ -	struct gfs2_holder freeze_gh;
+ -	struct gfs2_sbd *sdp = container_of(work, struct gfs2_sbd, sd_freeze_work);
+ -	struct super_block *sb = sdp->sd_vfs;
+ -
+ -	atomic_inc(&sb->s_active);
+ -	error = gfs2_glock_nq_init(sdp->sd_freeze_gl, LM_ST_SHARED, 0,
+ -				   &freeze_gh);
+ -	if (error) {
+ -		printk(KERN_INFO "GFS2: couln't get freeze lock : %d\n", error);
+ -		gfs2_assert_withdraw(sdp, 0);
+ -	}
+ -	else {
+ -		atomic_set(&sdp->sd_freeze_state, SFS_UNFROZEN);
+ -		error = thaw_super(sb);
+ -		if (error) {
+ -			printk(KERN_INFO "GFS2: couldn't thaw filesystem: %d\n",
+ -			       error);
+ -			gfs2_assert_withdraw(sdp, 0);
+ -		}
+ -		if (!test_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags))
+ -			freeze_gh.gh_flags |= GL_NOCACHE;
+ -		gfs2_glock_dq_uninit(&freeze_gh);
+ -	}
+ -	deactivate_super(sb);
+ -	return;
+++>>>>>>> 942b0cddfbf6 (GFS2: Withdraw for IO errors writing to the journal or statfs)
+  }
+  
+  /**
+* Unmerged path fs/gfs2/incore.h
+diff --git a/fs/gfs2/log.c b/fs/gfs2/log.c
+index 01a629e49e36..794427db591b 100644
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@ -815,6 +815,15 @@ int gfs2_logd(void *data)
+ 
+ 	while (!kthread_should_stop()) {
+ 
++		/* Check for errors writing to the journal */
++		if (sdp->sd_log_error) {
++			gfs2_lm_withdraw(sdp,
++					 "GFS2: fsid=%s: error %d: "
++					 "withdrawing the file system to "
++					 "prevent further damage.\n",
++					 sdp->sd_fsname, sdp->sd_log_error);
++		}
++
+ 		did_flush = false;
+ 		if (gfs2_jrnl_flush_reqd(sdp) || t == 0) {
+ 			gfs2_ail1_empty(sdp);
+* Unmerged path fs/gfs2/lops.c
+diff --git a/fs/gfs2/quota.c b/fs/gfs2/quota.c
+index e3f54b09777d..3d5f86897bc8 100644
+--- a/fs/gfs2/quota.c
++++ b/fs/gfs2/quota.c
+@@ -1475,8 +1475,11 @@ static void quotad_error(struct gfs2_sbd *sdp, const char *msg, int error)
+ {
+ 	if (error == 0 || error == -EROFS)
+ 		return;
+-	if (!test_bit(SDF_SHUTDOWN, &sdp->sd_flags))
++	if (!test_bit(SDF_SHUTDOWN, &sdp->sd_flags)) {
+ 		fs_err(sdp, "gfs2_quotad: %s error %d\n", msg, error);
++		sdp->sd_log_error = error;
++		wake_up(&sdp->sd_logd_waitq);
++	}
+ }
+ 
+ static void quotad_check_timeo(struct gfs2_sbd *sdp, const char *msg,
+* Unmerged path fs/gfs2/super.c
