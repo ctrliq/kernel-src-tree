@@ -1,0 +1,229 @@
+pipe: kill ->map() and ->unmap()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit fbb32750a62df75d1ffea547f3908b21c5496d9f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/fbb32750.failed
+
+all pipe_buffer_operations have the same instances of those...
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit fbb32750a62df75d1ffea547f3908b21c5496d9f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/char/virtio_console.c
+#	fs/pipe.c
+#	fs/splice.c
+diff --cc drivers/char/virtio_console.c
+index abaf4f6cc551,60aafb8a1f2e..000000000000
+--- a/drivers/char/virtio_console.c
++++ b/drivers/char/virtio_console.c
+@@@ -902,10 -901,9 +902,16 @@@ static int pipe_to_sg(struct pipe_inode
+  		if (len + offset > PAGE_SIZE)
+  			len = PAGE_SIZE - offset;
+  
+++<<<<<<< HEAD
+ +		memcpy(dst + offset, src + buf->offset, len);
+ +
+ +		kunmap(page);
+ +		buf->ops->unmap(pipe, buf, src);
+++=======
++ 		src = kmap_atomic(buf->page);
++ 		memcpy(page_address(page) + offset, src + buf->offset, len);
++ 		kunmap_atomic(src);
+++>>>>>>> fbb32750a62d (pipe: kill ->map() and ->unmap())
+  
+  		sg_set_page(&(sgl->sg[sgl->n]), page, len, offset);
+  	}
+diff --cc fs/pipe.c
+index ab21e3ece863,6679c95eb4c3..000000000000
+--- a/fs/pipe.c
++++ b/fs/pipe.c
+@@@ -418,14 -358,17 +368,26 @@@ pipe_read(struct kiocb *iocb, const str
+  				break;
+  			}
+  
+ -			atomic = !iov_fault_in_pages_write(iov, chars);
+ +			atomic = IS_ENABLED(CONFIG_HIGHMEM) && !iov_fault_in_pages_write(iov, chars);
+ +			remaining = chars;
+ +			offset = buf->offset;
+  redo:
+++<<<<<<< HEAD
+ +			addr = ops->map(pipe, buf, atomic);
+ +			error = pipe_iov_copy_to_user(iov, addr, &offset,
+ +						      &remaining, atomic);
+ +			ops->unmap(pipe, buf, addr);
+++=======
++ 			if (atomic)
++ 				addr = kmap_atomic(buf->page);
++ 			else
++ 				addr = kmap(buf->page);
++ 			error = pipe_iov_copy_to_user(iov, addr + buf->offset, chars, atomic);
++ 			if (atomic)
++ 				kunmap_atomic(addr);
++ 			else
++ 				kunmap(buf->page);
+++>>>>>>> fbb32750a62d (pipe: kill ->map() and ->unmap())
+  			if (unlikely(error)) {
+  				/*
+  				 * Just retry with the slow path if we failed.
+@@@ -550,13 -492,18 +512,26 @@@ pipe_write(struct kiocb *iocb, const st
+  			if (error)
+  				goto out;
+  
+ -			iov_fault_in_pages_read(iov, chars);
+ +			if (IS_ENABLED(CONFIG_HIGHMEM))
+ +				iov_fault_in_pages_read(iov, chars);
+  redo1:
+++<<<<<<< HEAD
+ +			addr = ops->map(pipe, buf, atomic);
+ +			error = pipe_iov_copy_from_user(addr, &offset, iov,
+ +							&remaining, atomic);
+ +			ops->unmap(pipe, buf, addr);
+++=======
++ 			if (atomic)
++ 				addr = kmap_atomic(buf->page);
++ 			else
++ 				addr = kmap(buf->page);
++ 			error = pipe_iov_copy_from_user(offset + addr, iov,
++ 							chars, atomic);
++ 			if (atomic)
++ 				kunmap_atomic(addr);
++ 			else
++ 				kunmap(buf->page);
+++>>>>>>> fbb32750a62d (pipe: kill ->map() and ->unmap())
+  			ret = error;
+  			do_wakeup = 1;
+  			if (error) {
+diff --cc fs/splice.c
+index 4aeeddd31b91,ca3bfbd970f3..000000000000
+--- a/fs/splice.c
++++ b/fs/splice.c
+@@@ -1570,11 -1527,11 +1562,16 @@@ static int pipe_to_user(struct pipe_ino
+  	 * See if we can use the atomic maps, by prefaulting in the
+  	 * pages and doing an atomic copy
+  	 */
+++<<<<<<< HEAD
+ +	if (IS_ENABLED(CONFIG_HIGHMEM) && !fault_in_pages_writeable(sd->u.userptr, sd->len)) {
+ +		src = buf->ops->map(pipe, buf, 1);
+++=======
++ 	if (!fault_in_pages_writeable(sd->u.userptr, sd->len)) {
++ 		src = kmap_atomic(buf->page);
+++>>>>>>> fbb32750a62d (pipe: kill ->map() and ->unmap())
+  		ret = __copy_to_user_inatomic(sd->u.userptr, src + buf->offset,
+  							sd->len);
+- 		buf->ops->unmap(pipe, buf, src);
++ 		kunmap_atomic(src);
+  		if (!ret) {
+  			ret = sd->len;
+  			goto out;
+* Unmerged path drivers/char/virtio_console.c
+diff --git a/fs/fuse/dev.c b/fs/fuse/dev.c
+index 77c3e9637687..22a7daf75050 100644
+--- a/fs/fuse/dev.c
++++ b/fs/fuse/dev.c
+@@ -668,7 +668,7 @@ static void fuse_copy_finish(struct fuse_copy_state *cs)
+ 		struct pipe_buffer *buf = cs->currbuf;
+ 
+ 		if (!cs->write) {
+-			buf->ops->unmap(cs->pipe, buf, cs->mapaddr);
++			kunmap_atomic(cs->mapaddr);
+ 		} else {
+ 			kunmap_atomic(cs->mapaddr);
+ 			buf->len = PAGE_SIZE - cs->len;
+@@ -707,7 +707,7 @@ static int fuse_copy_fill(struct fuse_copy_state *cs)
+ 
+ 			BUG_ON(!cs->nr_segs);
+ 			cs->currbuf = buf;
+-			cs->mapaddr = buf->ops->map(cs->pipe, buf, 1);
++			cs->mapaddr = kmap_atomic(buf->page);
+ 			cs->len = buf->len;
+ 			cs->buf = cs->mapaddr + buf->offset;
+ 			cs->pipebufs++;
+@@ -875,7 +875,7 @@ static int fuse_try_move_page(struct fuse_copy_state *cs, struct page **pagep)
+ out_fallback_unlock:
+ 	unlock_page(newpage);
+ out_fallback:
+-	cs->mapaddr = buf->ops->map(cs->pipe, buf, 1);
++	cs->mapaddr = kmap_atomic(buf->page);
+ 	cs->buf = cs->mapaddr + buf->offset;
+ 
+ 	err = lock_request(cs->fc, cs->req);
+* Unmerged path fs/pipe.c
+* Unmerged path fs/splice.c
+diff --git a/include/linux/pipe_fs_i.h b/include/linux/pipe_fs_i.h
+index 4137fa7bc9a4..6c1681e8d680 100644
+--- a/include/linux/pipe_fs_i.h
++++ b/include/linux/pipe_fs_i.h
+@@ -84,23 +84,6 @@ struct pipe_buf_operations {
+ 	 */
+ 	int can_merge;
+ 
+-	/*
+-	 * ->map() returns a virtual address mapping of the pipe buffer.
+-	 * The last integer flag reflects whether this should be an atomic
+-	 * mapping or not. The atomic map is faster, however you can't take
+-	 * page faults before calling ->unmap() again. So if you need to eg
+-	 * access user data through copy_to/from_user(), then you must get
+-	 * a non-atomic map. ->map() uses the kmap_atomic slot for
+-	 * atomic maps, you have to be careful if mapping another page as
+-	 * source or destination for a copy.
+-	 */
+-	void * (*map)(struct pipe_inode_info *, struct pipe_buffer *, int);
+-
+-	/*
+-	 * Undoes ->map(), finishes the virtual mapping of the pipe buffer.
+-	 */
+-	void (*unmap)(struct pipe_inode_info *, struct pipe_buffer *, void *);
+-
+ 	/*
+ 	 * ->confirm() verifies that the data in the pipe buffer is there
+ 	 * and that the contents are good. If the pages in the pipe belong
+@@ -154,8 +137,6 @@ struct pipe_inode_info *alloc_pipe_info(void);
+ void free_pipe_info(struct pipe_inode_info *);
+ 
+ /* Generic pipe buffer ops functions */
+-void *generic_pipe_buf_map(struct pipe_inode_info *, struct pipe_buffer *, int);
+-void generic_pipe_buf_unmap(struct pipe_inode_info *, struct pipe_buffer *, void *);
+ void generic_pipe_buf_get(struct pipe_inode_info *, struct pipe_buffer *);
+ int generic_pipe_buf_confirm(struct pipe_inode_info *, struct pipe_buffer *);
+ int generic_pipe_buf_steal(struct pipe_inode_info *, struct pipe_buffer *);
+diff --git a/kernel/relay.c b/kernel/relay.c
+index 1b2a7dc44fd9..8f2412b119ca 100644
+--- a/kernel/relay.c
++++ b/kernel/relay.c
+@@ -1225,8 +1225,6 @@ static void relay_pipe_buf_release(struct pipe_inode_info *pipe,
+ 
+ static const struct pipe_buf_operations relay_pipe_buf_ops = {
+ 	.can_merge = 0,
+-	.map = generic_pipe_buf_map,
+-	.unmap = generic_pipe_buf_unmap,
+ 	.confirm = generic_pipe_buf_confirm,
+ 	.release = relay_pipe_buf_release,
+ 	.steal = generic_pipe_buf_steal,
+diff --git a/kernel/trace/trace.c b/kernel/trace/trace.c
+index 7b0fc13198d8..075b45b6b2ed 100644
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@ -4435,8 +4435,6 @@ static void tracing_spd_release_pipe(struct splice_pipe_desc *spd,
+ 
+ static const struct pipe_buf_operations tracing_pipe_buf_ops = {
+ 	.can_merge		= 0,
+-	.map			= generic_pipe_buf_map,
+-	.unmap			= generic_pipe_buf_unmap,
+ 	.confirm		= generic_pipe_buf_confirm,
+ 	.release		= tracing_pipe_buf_release,
+ 	.steal			= generic_pipe_buf_steal,
+@@ -5319,8 +5317,6 @@ static void buffer_pipe_buf_get(struct pipe_inode_info *pipe,
+ /* Pipe buffer operations for a buffer. */
+ static const struct pipe_buf_operations buffer_pipe_buf_ops = {
+ 	.can_merge		= 0,
+-	.map			= generic_pipe_buf_map,
+-	.unmap			= generic_pipe_buf_unmap,
+ 	.confirm		= generic_pipe_buf_confirm,
+ 	.release		= buffer_pipe_buf_release,
+ 	.steal			= generic_pipe_buf_steal,
