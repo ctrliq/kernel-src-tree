@@ -312,7 +312,7 @@ static int cls_bpf_dump(struct net *net, struct tcf_proto *tp, unsigned long fh,
 	if (nla == NULL)
 		goto nla_put_failure;
 
-        memcpy(nla_data(nla), prog->bpf_ops, nla_len(nla));
+	memcpy(nla_data(nla), prog->bpf_ops, nla_len(nla));
 
 	if (tcf_exts_dump(skb, &prog->exts) < 0)
 		goto nla_put_failure;
