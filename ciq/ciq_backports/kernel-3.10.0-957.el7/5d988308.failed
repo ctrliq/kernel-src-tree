@@ -1,0 +1,181 @@
+ceph: track read contexts in ceph_file_info
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Yan, Zheng <zyan@redhat.com>
+commit 5d988308283ecf062fa88f20ae05c52cce0bcdca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/5d988308.failed
+
+Previously ceph_read_iter() uses current->journal to pass context info
+to ceph_readpages(), so that ceph_readpages() can distinguish read(2)
+from readahead(2)/fadvise(2)/madvise(2). The problem is that page fault
+can happen when copying data to userspace memory. Page fault may call
+other filesystem's page_mkwrite() if the userspace memory is mapped to a
+file. The later filesystem may also want to use current->journal.
+
+The fix is define a on-stack data structure in ceph_read_iter(), add it
+to context list in ceph_file_info. ceph_readpages() searches the list,
+find if there is a context belongs to current thread.
+
+	Signed-off-by: "Yan, Zheng" <zyan@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 5d988308283ecf062fa88f20ae05c52cce0bcdca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/addr.c
+#	fs/ceph/file.c
+diff --cc fs/ceph/addr.c
+index adf7d1009bc0,78a1208b878e..000000000000
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@@ -423,11 -446,18 +426,21 @@@ static int ceph_readpages(struct file *
+  	if (ceph_inode(inode)->i_inline_version != CEPH_INLINE_NONE)
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+++=======
++ 	rc = ceph_readpages_from_fscache(mapping->host, mapping, page_list,
++ 					 &nr_pages);
++ 
++ 	if (rc == 0)
++ 		goto out;
++ 
++ 	rw_ctx = ceph_find_rw_context(ci);
+++>>>>>>> 5d988308283e (ceph: track read contexts in ceph_file_info)
+  	max = fsc->mount_options->rsize >> PAGE_SHIFT;
+- 	dout("readpages %p file %p nr_pages %d max %d\n",
+- 	     inode, file, nr_pages, max);
++ 	dout("readpages %p file %p ctx %p nr_pages %d max %d\n",
++ 	     inode, file, rw_ctx, nr_pages, max);
+  	while (!list_empty(page_list)) {
+- 		rc = start_read(inode, page_list, max);
++ 		rc = start_read(inode, rw_ctx, page_list, max);
+  		if (rc < 0)
+  			goto out;
+  	}
+@@@ -1365,9 -1454,10 +1378,16 @@@ static int ceph_filemap_fault(struct vm
+  
+  	if ((got & (CEPH_CAP_FILE_CACHE | CEPH_CAP_FILE_LAZYIO)) ||
+  	    ci->i_inline_version == CEPH_INLINE_NONE) {
+++<<<<<<< HEAD
+ +		current->journal_info = vma->vm_file;
+ +		ret = filemap_fault(vma, vmf);
+ +		current->journal_info = NULL;
+++=======
++ 		CEPH_DEFINE_RW_CONTEXT(rw_ctx, got);
++ 		ceph_add_rw_context(fi, &rw_ctx);
++ 		ret = filemap_fault(vmf);
++ 		ceph_del_rw_context(fi, &rw_ctx);
+++>>>>>>> 5d988308283e (ceph: track read contexts in ceph_file_info)
+  	} else
+  		ret = -EAGAIN;
+  
+diff --cc fs/ceph/file.c
+index 4be6ff2c3e9e,6639926eed4e..000000000000
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@@ -1269,24 -1204,14 +1274,34 @@@ again
+  			retry_op = READ_INLINE;
+  		}
+  	} else {
+++<<<<<<< HEAD
+ +		/*
+ +		 * We can't modify the content of iov,
+ +		 * so we only read from beginning.
+ +		 */
+ +		if (read) {
+ +			iocb->ki_pos = pos;
+ +			len = iocb->ki_nbytes;
+ +			read = 0;
+ +		}
+++=======
++ 		CEPH_DEFINE_RW_CONTEXT(rw_ctx, got);
+++>>>>>>> 5d988308283e (ceph: track read contexts in ceph_file_info)
+  		dout("aio_read %p %llx.%llx %llu~%u got cap refs on %s\n",
+ -		     inode, ceph_vinop(inode), iocb->ki_pos, (unsigned)len,
+ +		     inode, ceph_vinop(inode), pos, (unsigned)len,
+  		     ceph_cap_string(got));
+++<<<<<<< HEAD
+ +
+ +		current->journal_info = filp;
+ +		ret = generic_file_aio_read(iocb, iov, nr_segs, pos);
+ +		current->journal_info = NULL;
+++=======
++ 		ceph_add_rw_context(fi, &rw_ctx);
++ 		ret = generic_file_read_iter(iocb, to);
++ 		ceph_del_rw_context(fi, &rw_ctx);
+++>>>>>>> 5d988308283e (ceph: track read contexts in ceph_file_info)
+  	}
+ +out:
+  	dout("aio_read %p %llx.%llx dropping cap refs on %s = %d\n",
+  	     inode, ceph_vinop(inode), ceph_cap_string(got), (int)ret);
+  	if (pinned_page) {
+* Unmerged path fs/ceph/addr.c
+* Unmerged path fs/ceph/file.c
+diff --git a/fs/ceph/super.h b/fs/ceph/super.h
+index b4cf3e6bac33..b7b95c6126e7 100644
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@ -655,6 +655,9 @@ struct ceph_file_info {
+ 	short fmode;     /* initialized on open */
+ 	short flags;     /* CEPH_F_* */
+ 
++	spinlock_t rw_contexts_lock;
++	struct list_head rw_contexts;
++
+ 	/* readdir: position within the dir */
+ 	u32 frag;
+ 	struct ceph_mds_request *last_readdir;
+@@ -671,6 +674,49 @@ struct ceph_file_info {
+ 	int dir_info_len;
+ };
+ 
++struct ceph_rw_context {
++	struct list_head list;
++	struct task_struct *thread;
++	int caps;
++};
++
++#define CEPH_DEFINE_RW_CONTEXT(_name, _caps)	\
++	struct ceph_rw_context _name = {	\
++		.thread = current,		\
++		.caps = _caps,			\
++	}
++
++static inline void ceph_add_rw_context(struct ceph_file_info *cf,
++				       struct ceph_rw_context *ctx)
++{
++	spin_lock(&cf->rw_contexts_lock);
++	list_add(&ctx->list, &cf->rw_contexts);
++	spin_unlock(&cf->rw_contexts_lock);
++}
++
++static inline void ceph_del_rw_context(struct ceph_file_info *cf,
++				       struct ceph_rw_context *ctx)
++{
++	spin_lock(&cf->rw_contexts_lock);
++	list_del(&ctx->list);
++	spin_unlock(&cf->rw_contexts_lock);
++}
++
++static inline struct ceph_rw_context*
++ceph_find_rw_context(struct ceph_file_info *cf)
++{
++	struct ceph_rw_context *ctx, *found = NULL;
++	spin_lock(&cf->rw_contexts_lock);
++	list_for_each_entry(ctx, &cf->rw_contexts, list) {
++		if (ctx->thread == current) {
++			found = ctx;
++			break;
++		}
++	}
++	spin_unlock(&cf->rw_contexts_lock);
++	return found;
++}
++
+ struct ceph_readdir_cache_control {
+ 	struct page  *page;
+ 	struct dentry **dentries;
