@@ -1,0 +1,222 @@
+x86/KVM/VMX: Use MSR save list for IA32_FLUSH_CMD if required
+
+jira LE-1907
+cve CVE-2018-3620
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [x86] kvm/vmx: use msr save list for ia32_flush_cmd if required (Christoph von Recklinghausen) [1593384] {CVE-2018-3620}
+Rebuild_FUZZ: 96.61%
+commit-author Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+commit 390d975e0c4e60ce70d4157e0dd91ede37824603
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/390d975e.failed
+
+If the L1D flush module parameter is set to 'always' and the IA32_FLUSH_CMD
+MSR is available, optimize the VMENTER code with the MSR save list.
+
+	Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 390d975e0c4e60ce70d4157e0dd91ede37824603)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index e2f48f8aba96,eb7c207a3bc3..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -5176,6 -6237,17 +5176,20 @@@ static void ept_set_mmio_spte_mask(void
+  				   VMX_EPT_MISCONFIG_WX_VALUE);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool vmx_l1d_use_msr_save_list(void)
++ {
++ 	if (!enable_ept || !boot_cpu_has_bug(X86_BUG_L1TF) ||
++ 	    static_cpu_has(X86_FEATURE_HYPERVISOR) ||
++ 	    !static_cpu_has(X86_FEATURE_FLUSH_L1D))
++ 		return false;
++ 
++ 	return vmentry_l1d_flush == VMENTER_L1D_FLUSH_ALWAYS;
++ }
++ 
++ #define VMX_XSS_EXIT_BITMAP 0
+++>>>>>>> 390d975e0c4e (x86/KVM/VMX: Use MSR save list for IA32_FLUSH_CMD if required)
+  /*
+   * Sets up the vmcs for emulated real mode.
+   */
+@@@ -5284,8 -6368,12 +5298,17 @@@ static int vmx_vcpu_setup(struct vcpu_v
+  		vmcs_write64(PML_ADDRESS, page_to_phys(vmx->pml_pg));
+  		vmcs_write16(GUEST_PML_INDEX, PML_ENTITY_NUM - 1);
+  	}
+++<<<<<<< HEAD
+ +
+ +	return 0;
+++=======
++ 	/*
++ 	 * If flushing the L1D cache on every VMENTER is enforced and the
++ 	 * MSR is available, use the MSR save list.
++ 	 */
++ 	if (vmx_l1d_use_msr_save_list())
++ 		add_atomic_switch_msr(vmx, MSR_IA32_FLUSH_CMD, L1D_FLUSH, 0, true);
+++>>>>>>> 390d975e0c4e (x86/KVM/VMX: Use MSR save list for IA32_FLUSH_CMD if required)
+  }
+  
+  static void vmx_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
+@@@ -8434,6 -9604,77 +8457,80 @@@ static int vmx_handle_exit(struct kvm_v
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Software based L1D cache flush which is used when microcode providing
++  * the cache control MSR is not loaded.
++  *
++  * The L1D cache is 32 KiB on Nehalem and later microarchitectures, but to
++  * flush it is required to read in 64 KiB because the replacement algorithm
++  * is not exactly LRU. This could be sized at runtime via topology
++  * information but as all relevant affected CPUs have 32KiB L1D cache size
++  * there is no point in doing so.
++  */
++ #define L1D_CACHE_ORDER 4
++ static void *vmx_l1d_flush_pages;
++ 
++ static void vmx_l1d_flush(struct kvm_vcpu *vcpu)
++ {
++ 	int size = PAGE_SIZE << L1D_CACHE_ORDER;
++ 	bool always;
++ 
++ 	/*
++ 	 * This code is only executed when:
++ 	 * - the flush mode is 'cond'
++ 	 * - the flush mode is 'always' and the flush MSR is not
++ 	 *   available
++ 	 *
++ 	 * If the CPU has the flush MSR then clear the flush bit because
++ 	 * 'always' mode is handled via the MSR save list.
++ 	 *
++ 	 * If the MSR is not avaibable then act depending on the mitigation
++ 	 * mode: If 'flush always', keep the flush bit set, otherwise clear
++ 	 * it.
++ 	 *
++ 	 * The flush bit gets set again either from vcpu_run() or from one
++ 	 * of the unsafe VMEXIT handlers.
++ 	 */
++ 	if (static_cpu_has(X86_FEATURE_FLUSH_L1D))
++ 		always = false;
++ 	else
++ 		always = vmentry_l1d_flush == VMENTER_L1D_FLUSH_ALWAYS;
++ 
++ 	vcpu->arch.l1tf_flush_l1d = always;
++ 
++ 	vcpu->stat.l1d_flush++;
++ 
++ 	if (static_cpu_has(X86_FEATURE_FLUSH_L1D)) {
++ 		wrmsrl(MSR_IA32_FLUSH_CMD, L1D_FLUSH);
++ 		return;
++ 	}
++ 
++ 	asm volatile(
++ 		/* First ensure the pages are in the TLB */
++ 		"xorl	%%eax, %%eax\n"
++ 		".Lpopulate_tlb:\n\t"
++ 		"movzbl	(%[empty_zp], %%" _ASM_AX "), %%ecx\n\t"
++ 		"addl	$4096, %%eax\n\t"
++ 		"cmpl	%%eax, %[size]\n\t"
++ 		"jne	.Lpopulate_tlb\n\t"
++ 		"xorl	%%eax, %%eax\n\t"
++ 		"cpuid\n\t"
++ 		/* Now fill the cache */
++ 		"xorl	%%eax, %%eax\n"
++ 		".Lfill_cache:\n"
++ 		"movzbl	(%[empty_zp], %%" _ASM_AX "), %%ecx\n\t"
++ 		"addl	$64, %%eax\n\t"
++ 		"cmpl	%%eax, %[size]\n\t"
++ 		"jne	.Lfill_cache\n\t"
++ 		"lfence\n"
++ 		:: [empty_zp] "r" (vmx_l1d_flush_pages),
++ 		    [size] "r" (size)
++ 		: "eax", "ebx", "ecx", "edx");
++ }
++ 
+++>>>>>>> 390d975e0c4e (x86/KVM/VMX: Use MSR save list for IA32_FLUSH_CMD if required)
+  static void update_cr8_intercept(struct kvm_vcpu *vcpu, int tpr, int irr)
+  {
+  	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+@@@ -11663,10 -13231,68 +11760,41 @@@ static struct kvm_x86_ops vmx_x86_ops 
+  	.enable_smi_window = enable_smi_window,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int __init vmx_setup_l1d_flush(void)
++ {
++ 	struct page *page;
++ 
++ 	if (vmentry_l1d_flush == VMENTER_L1D_FLUSH_NEVER ||
++ 	    !boot_cpu_has_bug(X86_BUG_L1TF) ||
++ 	    vmx_l1d_use_msr_save_list())
++ 		return 0;
++ 
++ 	if (!boot_cpu_has(X86_FEATURE_FLUSH_L1D)) {
++ 		page = alloc_pages(GFP_KERNEL, L1D_CACHE_ORDER);
++ 		if (!page)
++ 			return -ENOMEM;
++ 		vmx_l1d_flush_pages = page_address(page);
++ 	}
++ 
++ 	static_branch_enable(&vmx_l1d_should_flush);
++ 	return 0;
++ }
++ 
++ static void vmx_free_l1d_flush_pages(void)
++ {
++ 	if (vmx_l1d_flush_pages) {
++ 		free_pages((unsigned long)vmx_l1d_flush_pages, L1D_CACHE_ORDER);
++ 		vmx_l1d_flush_pages = NULL;
++ 	}
++ }
++ 
+++>>>>>>> 390d975e0c4e (x86/KVM/VMX: Use MSR save list for IA32_FLUSH_CMD if required)
+  static int __init vmx_init(void)
+  {
+ -	int r;
+ -
+ -#if IS_ENABLED(CONFIG_HYPERV)
+ -	/*
+ -	 * Enlightened VMCS usage should be recommended and the host needs
+ -	 * to support eVMCS v1 or above. We can also disable eVMCS support
+ -	 * with module parameter.
+ -	 */
+ -	if (enlightened_vmcs &&
+ -	    ms_hyperv.hints & HV_X64_ENLIGHTENED_VMCS_RECOMMENDED &&
+ -	    (ms_hyperv.nested_features & HV_X64_ENLIGHTENED_VMCS_VERSION) >=
+ -	    KVM_EVMCS_VERSION) {
+ -		int cpu;
+ -
+ -		/* Check that we have assist pages on all online CPUs */
+ -		for_each_online_cpu(cpu) {
+ -			if (!hv_get_vp_assist_page(cpu)) {
+ -				enlightened_vmcs = false;
+ -				break;
+ -			}
+ -		}
+ -
+ -		if (enlightened_vmcs) {
+ -			pr_info("KVM: vmx: using Hyper-V Enlightened VMCS\n");
+ -			static_branch_enable(&enable_evmcs);
+ -		}
+ -	} else {
+ -		enlightened_vmcs = false;
+ -	}
+ -#endif
+ -
+ -	r = vmx_setup_l1d_flush();
+ +	int r = kvm_init(&vmx_x86_ops, sizeof(struct vcpu_vmx),
+ +                     __alignof__(struct vcpu_vmx), THIS_MODULE);
+  	if (r)
+  		return r;
+  
+* Unmerged path arch/x86/kvm/vmx.c
