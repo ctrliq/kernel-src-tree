@@ -1,0 +1,827 @@
+RAID1: a new I/O barrier implementation to remove resync window
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author colyli@suse.de <colyli@suse.de>
+commit fd76863e37fef26fe05547fddfa6e3d05e1682e6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/fd76863e.failed
+
+'Commit 79ef3a8aa1cb ("raid1: Rewrite the implementation of iobarrier.")'
+introduces a sliding resync window for raid1 I/O barrier, this idea limits
+I/O barriers to happen only inside a slidingresync window, for regular
+I/Os out of this resync window they don't need to wait for barrier any
+more. On large raid1 device, it helps a lot to improve parallel writing
+I/O throughput when there are background resync I/Os performing at
+same time.
+
+The idea of sliding resync widow is awesome, but code complexity is a
+challenge. Sliding resync window requires several variables to work
+collectively, this is complexed and very hard to make it work correctly.
+Just grep "Fixes: 79ef3a8aa1" in kernel git log, there are 8 more patches
+to fix the original resync window patch. This is not the end, any further
+related modification may easily introduce more regreassion.
+
+Therefore I decide to implement a much simpler raid1 I/O barrier, by
+removing resync window code, I believe life will be much easier.
+
+The brief idea of the simpler barrier is,
+ - Do not maintain a global unique resync window
+ - Use multiple hash buckets to reduce I/O barrier conflicts, regular
+   I/O only has to wait for a resync I/O when both them have same barrier
+   bucket index, vice versa.
+ - I/O barrier can be reduced to an acceptable number if there are enough
+   barrier buckets
+
+Here I explain how the barrier buckets are designed,
+ - BARRIER_UNIT_SECTOR_SIZE
+   The whole LBA address space of a raid1 device is divided into multiple
+   barrier units, by the size of BARRIER_UNIT_SECTOR_SIZE.
+   Bio requests won't go across border of barrier unit size, that means
+   maximum bio size is BARRIER_UNIT_SECTOR_SIZE<<9 (64MB) in bytes.
+   For random I/O 64MB is large enough for both read and write requests,
+   for sequential I/O considering underlying block layer may merge them
+   into larger requests, 64MB is still good enough.
+   Neil also points out that for resync operation, "we want the resync to
+   move from region to region fairly quickly so that the slowness caused
+   by having to synchronize with the resync is averaged out over a fairly
+   small time frame". For full speed resync, 64MB should take less then 1
+   second. When resync is competing with other I/O, it could take up a few
+   minutes. Therefore 64MB size is fairly good range for resync.
+
+ - BARRIER_BUCKETS_NR
+   There are BARRIER_BUCKETS_NR buckets in total, which is defined by,
+        #define BARRIER_BUCKETS_NR_BITS   (PAGE_SHIFT - 2)
+        #define BARRIER_BUCKETS_NR        (1<<BARRIER_BUCKETS_NR_BITS)
+   this patch makes the bellowed members of struct r1conf from integer
+   to array of integers,
+        -       int                     nr_pending;
+        -       int                     nr_waiting;
+        -       int                     nr_queued;
+        -       int                     barrier;
+        +       int                     *nr_pending;
+        +       int                     *nr_waiting;
+        +       int                     *nr_queued;
+        +       int                     *barrier;
+   number of the array elements is defined as BARRIER_BUCKETS_NR. For 4KB
+   kernel space page size, (PAGE_SHIFT - 2) indecates there are 1024 I/O
+   barrier buckets, and each array of integers occupies single memory page.
+   1024 means for a request which is smaller than the I/O barrier unit size
+   has ~0.1% chance to wait for resync to pause, which is quite a small
+   enough fraction. Also requesting single memory page is more friendly to
+   kernel page allocator than larger memory size.
+
+ - I/O barrier bucket is indexed by bio start sector
+   If multiple I/O requests hit different I/O barrier units, they only need
+   to compete I/O barrier with other I/Os which hit the same I/O barrier
+   bucket index with each other. The index of a barrier bucket which a
+   bio should look for is calculated by sector_to_idx() which is defined
+   in raid1.h as an inline function,
+        static inline int sector_to_idx(sector_t sector)
+        {
+                return hash_long(sector >> BARRIER_UNIT_SECTOR_BITS,
+                                BARRIER_BUCKETS_NR_BITS);
+        }
+   Here sector_nr is the start sector number of a bio.
+
+ - Single bio won't go across boundary of a I/O barrier unit
+   If a request goes across boundary of barrier unit, it will be split. A
+   bio may be split in raid1_make_request() or raid1_sync_request(), if
+   sectors returned by align_to_barrier_unit_end() is smaller than
+   original bio size.
+
+Comparing to single sliding resync window,
+ - Currently resync I/O grows linearly, therefore regular and resync I/O
+   will conflict within a single barrier units. So the I/O behavior is
+   similar to single sliding resync window.
+ - But a barrier unit bucket is shared by all barrier units with identical
+   barrier uinit index, the probability of conflict might be higher
+   than single sliding resync window, in condition that writing I/Os
+   always hit barrier units which have identical barrier bucket indexs with
+   the resync I/Os. This is a very rare condition in real I/O work loads,
+   I cannot imagine how it could happen in practice.
+ - Therefore we can achieve a good enough low conflict rate with much
+   simpler barrier algorithm and implementation.
+
+There are two changes should be noticed,
+ - In raid1d(), I change the code to decrease conf->nr_pending[idx] into
+   single loop, it looks like this,
+        spin_lock_irqsave(&conf->device_lock, flags);
+        conf->nr_queued[idx]--;
+        spin_unlock_irqrestore(&conf->device_lock, flags);
+   This change generates more spin lock operations, but in next patch of
+   this patch set, it will be replaced by a single line code,
+        atomic_dec(&conf->nr_queueud[idx]);
+   So we don't need to worry about spin lock cost here.
+ - Mainline raid1 code split original raid1_make_request() into
+   raid1_read_request() and raid1_write_request(). If the original bio
+   goes across an I/O barrier unit size, this bio will be split before
+   calling raid1_read_request() or raid1_write_request(),  this change
+   the code logic more simple and clear.
+ - In this patch wait_barrier() is moved from raid1_make_request() to
+   raid1_write_request(). In raid_read_request(), original wait_barrier()
+   is replaced by raid1_read_request().
+   The differnece is wait_read_barrier() only waits if array is frozen,
+   using different barrier function in different code path makes the code
+   more clean and easy to read.
+Changelog
+V4:
+- Add alloc_r1bio() to remove redundant r1bio memory allocation code.
+- Fix many typos in patch comments.
+- Use (PAGE_SHIFT - ilog2(sizeof(int))) to define BARRIER_BUCKETS_NR_BITS.
+V3:
+- Rebase the patch against latest upstream kernel code.
+- Many fixes by review comments from Neil,
+  - Back to use pointers to replace arraries in struct r1conf
+  - Remove total_barriers from struct r1conf
+  - Add more patch comments to explain how/why the values of
+    BARRIER_UNIT_SECTOR_SIZE and BARRIER_BUCKETS_NR are decided.
+  - Use get_unqueued_pending() to replace get_all_pendings() and
+    get_all_queued()
+  - Increase bucket number from 512 to 1024
+- Change code comments format by review from Shaohua.
+V2:
+- Use bio_split() to split the orignal bio if it goes across barrier unit
+  bounday, to make the code more simple, by suggestion from Shaohua and
+  Neil.
+- Use hash_long() to replace original linear hash, to avoid a possible
+  confilict between resync I/O and sequential write I/O, by suggestion from
+  Shaohua.
+- Add conf->total_barriers to record barrier depth, which is used to
+  control number of parallel sync I/O barriers, by suggestion from Shaohua.
+- In V1 patch the bellowed barrier buckets related members in r1conf are
+  allocated in memory page. To make the code more simple, V2 patch moves
+  the memory space into struct r1conf, like this,
+        -       int                     nr_pending;
+        -       int                     nr_waiting;
+        -       int                     nr_queued;
+        -       int                     barrier;
+        +       int                     nr_pending[BARRIER_BUCKETS_NR];
+        +       int                     nr_waiting[BARRIER_BUCKETS_NR];
+        +       int                     nr_queued[BARRIER_BUCKETS_NR];
+        +       int                     barrier[BARRIER_BUCKETS_NR];
+  This change is by the suggestion from Shaohua.
+- Remove some inrelavent code comments, by suggestion from Guoqing.
+- Add a missing wait_barrier() before jumping to retry_write, in
+  raid1_make_write_request().
+V1:
+- Original RFC patch for comments
+
+	Signed-off-by: Coly Li <colyli@suse.de>
+	Cc: Johannes Thumshirn <jthumshirn@suse.de>
+	Cc: Guoqing Jiang <gqjiang@suse.com>
+	Reviewed-by: Neil Brown <neilb@suse.de>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit fd76863e37fef26fe05547fddfa6e3d05e1682e6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid1.c
+#	drivers/md/raid1.h
+diff --cc drivers/md/raid1.c
+index e588c32492da,40297fd17f7e..000000000000
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@@ -66,10 -71,12 +66,9 @@@
+   */
+  static int max_queued_requests = 1024;
+  
+- static void allow_barrier(struct r1conf *conf, sector_t start_next_window,
+- 			  sector_t bi_sector);
+- static void lower_barrier(struct r1conf *conf);
++ static void allow_barrier(struct r1conf *conf, sector_t sector_nr);
++ static void lower_barrier(struct r1conf *conf, sector_t sector_nr);
+  
+ -#define raid1_log(md, fmt, args...)				\
+ -	do { if ((md)->queue) blk_add_trace_msg((md)->queue, "raid1 " fmt, ##args); } while (0)
+ -
+  static void * r1bio_pool_alloc(gfp_t gfp_flags, void *data)
+  {
+  	struct pool_info *pi = data;
+@@@ -90,7 -97,8 +89,12 @@@ static void r1bio_pool_free(void *r1_bi
+  #define RESYNC_PAGES ((RESYNC_BLOCK_SIZE + PAGE_SIZE-1) / PAGE_SIZE)
+  #define RESYNC_WINDOW (RESYNC_BLOCK_SIZE * RESYNC_DEPTH)
+  #define RESYNC_WINDOW_SECTORS (RESYNC_WINDOW >> 9)
+++<<<<<<< HEAD
+ +#define NEXT_NORMALIO_DISTANCE (3 * RESYNC_WINDOW_SECTORS)
+++=======
++ #define CLUSTER_RESYNC_WINDOW (16 * RESYNC_WINDOW)
++ #define CLUSTER_RESYNC_WINDOW_SECTORS (CLUSTER_RESYNC_WINDOW >> 9)
+++>>>>>>> fd76863e37fe (RAID1: a new I/O barrier implementation to remove resync window)
+  
+  static void * r1buf_pool_alloc(gfp_t gfp_flags, void *data)
+  {
+@@@ -237,8 -243,7 +243,12 @@@ static void call_bio_endio(struct r1bi
+  	struct bio *bio = r1_bio->master_bio;
+  	int done;
+  	struct r1conf *conf = r1_bio->mddev->private;
+++<<<<<<< HEAD
+ +	sector_t start_next_window = r1_bio->start_next_window;
+ +	sector_t bi_sector = bio->bi_sector;
+++=======
++ 	sector_t bi_sector = bio->bi_iter.bi_sector;
+++>>>>>>> fd76863e37fe (RAID1: a new I/O barrier implementation to remove resync window)
+  
+  	if (bio->bi_phys_segments) {
+  		unsigned long flags;
+@@@ -856,75 -873,58 +885,115 @@@ static void lower_barrier(struct r1con
+  	wake_up(&conf->wait_barrier);
+  }
+  
+- static bool need_to_wait_for_sync(struct r1conf *conf, struct bio *bio)
++ static void _wait_barrier(struct r1conf *conf, int idx)
+  {
+++<<<<<<< HEAD
+ +	bool wait = false;
+ +
+ +	if (conf->array_frozen || !bio)
+ +		wait = true;
+ +	else if (conf->barrier && bio_data_dir(bio) == WRITE) {
+ +		if ((conf->mddev->curr_resync_completed
+ +		     >= bio_end_sector(bio)) ||
+ +		    (conf->next_resync + NEXT_NORMALIO_DISTANCE
+ +		     <= bio->bi_sector))
+ +			wait = false;
+ +		else
+ +			wait = true;
+- 	}
+- 
+- 	return wait;
+++=======
++ 	spin_lock_irq(&conf->resync_lock);
++ 	if (conf->array_frozen || conf->barrier[idx]) {
++ 		conf->nr_waiting[idx]++;
++ 		/* Wait for the barrier to drop. */
++ 		wait_event_lock_irq(
++ 			conf->wait_barrier,
++ 			!conf->array_frozen && !conf->barrier[idx],
++ 			conf->resync_lock);
++ 		conf->nr_waiting[idx]--;
+++>>>>>>> fd76863e37fe (RAID1: a new I/O barrier implementation to remove resync window)
++ 	}
++ 
++ 	conf->nr_pending[idx]++;
++ 	spin_unlock_irq(&conf->resync_lock);
+  }
+  
+- static sector_t wait_barrier(struct r1conf *conf, struct bio *bio)
++ static void wait_read_barrier(struct r1conf *conf, sector_t sector_nr)
+  {
+- 	sector_t sector = 0;
++ 	int idx = sector_to_idx(sector_nr);
+  
+  	spin_lock_irq(&conf->resync_lock);
+++<<<<<<< HEAD
+ +	if (need_to_wait_for_sync(conf, bio)) {
+ +		conf->nr_waiting++;
+ +		/* Wait for the barrier to drop.
+ +		 * However if there are already pending
+ +		 * requests (preventing the barrier from
+ +		 * rising completely), and the
+ +		 * per-process bio queue isn't empty,
+ +		 * then don't wait, as we need to empty
+ +		 * that queue to allow conf->start_next_window
+ +		 * to increase.
+ +		 */
+ +		wait_event_lock_irq(conf->wait_barrier,
+ +				    !conf->array_frozen &&
+ +				    (!conf->barrier ||
+ +				     ((conf->start_next_window <
+ +				       conf->next_resync + RESYNC_SECTORS) &&
+ +				      current->bio_list &&
+ +				      !bio_list_empty(current->bio_list))),
+ +				    conf->resync_lock);
+ +		conf->nr_waiting--;
+ +	}
+ +
+ +	if (bio && bio_data_dir(bio) == WRITE) {
+ +		if (bio->bi_sector >= conf->next_resync) {
+ +			if (conf->start_next_window == MaxSector)
+ +				conf->start_next_window =
+ +					conf->next_resync +
+ +					NEXT_NORMALIO_DISTANCE;
+ +
+ +			if ((conf->start_next_window + NEXT_NORMALIO_DISTANCE)
+ +			    <= bio->bi_sector)
+ +				conf->next_window_requests++;
+ +			else
+ +				conf->current_window_requests++;
+ +			sector = conf->start_next_window;
+ +		}
+ +	}
+ +
+ +	conf->nr_pending++;
+++=======
++ 	if (conf->array_frozen) {
++ 		conf->nr_waiting[idx]++;
++ 		/* Wait for array to unfreeze */
++ 		wait_event_lock_irq(
++ 			conf->wait_barrier,
++ 			!conf->array_frozen,
++ 			conf->resync_lock);
++ 		conf->nr_waiting[idx]--;
++ 	}
++ 
++ 	conf->nr_pending[idx]++;
+++>>>>>>> fd76863e37fe (RAID1: a new I/O barrier implementation to remove resync window)
+  	spin_unlock_irq(&conf->resync_lock);
+- 	return sector;
+  }
+  
+- static void allow_barrier(struct r1conf *conf, sector_t start_next_window,
+- 			  sector_t bi_sector)
++ static void wait_barrier(struct r1conf *conf, sector_t sector_nr)
++ {
++ 	int idx = sector_to_idx(sector_nr);
++ 
++ 	_wait_barrier(conf, idx);
++ }
++ 
++ static void wait_all_barriers(struct r1conf *conf)
++ {
++ 	int idx;
++ 
++ 	for (idx = 0; idx < BARRIER_BUCKETS_NR; idx++)
++ 		_wait_barrier(conf, idx);
++ }
++ 
++ static void _allow_barrier(struct r1conf *conf, int idx)
+  {
+  	unsigned long flags;
+  
+@@@ -970,10 -987,12 +1056,19 @@@ static void freeze_array(struct r1conf 
+  	 */
+  	spin_lock_irq(&conf->resync_lock);
+  	conf->array_frozen = 1;
+++<<<<<<< HEAD
+ +	wait_event_lock_irq_cmd(conf->wait_barrier,
+ +				conf->nr_pending == conf->nr_queued+extra,
+ +				conf->resync_lock,
+ +				flush_pending_writes(conf));
+++=======
++ 	raid1_log(conf->mddev, "wait freeze");
++ 	wait_event_lock_irq_cmd(
++ 		conf->wait_barrier,
++ 		get_unqueued_pending(conf) == extra,
++ 		conf->resync_lock,
++ 		flush_pending_writes(conf));
+++>>>>>>> fd76863e37fe (RAID1: a new I/O barrier implementation to remove resync window)
+  	spin_unlock_irq(&conf->resync_lock);
+  }
+  static void unfreeze_array(struct r1conf *conf)
+@@@ -1063,21 -1088,141 +1158,150 @@@ static void raid1_unplug(struct blk_plu
+  	kfree(plug);
+  }
+  
+++<<<<<<< HEAD
+ +static void raid1_make_request(struct mddev *mddev, struct bio * bio)
+++=======
++ static inline struct r1bio *
++ alloc_r1bio(struct mddev *mddev, struct bio *bio, sector_t sectors_handled)
++ {
++ 	struct r1conf *conf = mddev->private;
++ 	struct r1bio *r1_bio;
++ 
++ 	r1_bio = mempool_alloc(conf->r1bio_pool, GFP_NOIO);
++ 
++ 	r1_bio->master_bio = bio;
++ 	r1_bio->sectors = bio_sectors(bio) - sectors_handled;
++ 	r1_bio->state = 0;
++ 	r1_bio->mddev = mddev;
++ 	r1_bio->sector = bio->bi_iter.bi_sector + sectors_handled;
++ 
++ 	return r1_bio;
++ }
++ 
++ static void raid1_read_request(struct mddev *mddev, struct bio *bio)
+++>>>>>>> fd76863e37fe (RAID1: a new I/O barrier implementation to remove resync window)
+  {
+  	struct r1conf *conf = mddev->private;
+  	struct raid1_info *mirror;
+  	struct r1bio *r1_bio;
+  	struct bio *read_bio;
+++<<<<<<< HEAD
+++=======
++ 	struct bitmap *bitmap = mddev->bitmap;
++ 	const int op = bio_op(bio);
++ 	const unsigned long do_sync = (bio->bi_opf & REQ_SYNC);
++ 	int sectors_handled;
++ 	int max_sectors;
++ 	int rdisk;
++ 
++ 	/*
++ 	 * Still need barrier for READ in case that whole
++ 	 * array is frozen.
++ 	 */
++ 	wait_read_barrier(conf, bio->bi_iter.bi_sector);
++ 
++ 	r1_bio = alloc_r1bio(mddev, bio, 0);
++ 
++ 	/*
++ 	 * We might need to issue multiple reads to different
++ 	 * devices if there are bad blocks around, so we keep
++ 	 * track of the number of reads in bio->bi_phys_segments.
++ 	 * If this is 0, there is only one r1_bio and no locking
++ 	 * will be needed when requests complete.  If it is
++ 	 * non-zero, then it is the number of not-completed requests.
++ 	 */
++ 	bio->bi_phys_segments = 0;
++ 	bio_clear_flag(bio, BIO_SEG_VALID);
++ 
++ 	/*
++ 	 * make_request() can abort the operation when read-ahead is being
++ 	 * used and no empty request is available.
++ 	 */
++ read_again:
++ 	rdisk = read_balance(conf, r1_bio, &max_sectors);
++ 
++ 	if (rdisk < 0) {
++ 		/* couldn't find anywhere to read from */
++ 		raid_end_bio_io(r1_bio);
++ 		return;
++ 	}
++ 	mirror = conf->mirrors + rdisk;
++ 
++ 	if (test_bit(WriteMostly, &mirror->rdev->flags) &&
++ 	    bitmap) {
++ 		/*
++ 		 * Reading from a write-mostly device must take care not to
++ 		 * over-take any writes that are 'behind'
++ 		 */
++ 		raid1_log(mddev, "wait behind writes");
++ 		wait_event(bitmap->behind_wait,
++ 			   atomic_read(&bitmap->behind_writes) == 0);
++ 	}
++ 	r1_bio->read_disk = rdisk;
++ 
++ 	read_bio = bio_clone_fast(bio, GFP_NOIO, mddev->bio_set);
++ 	bio_trim(read_bio, r1_bio->sector - bio->bi_iter.bi_sector,
++ 		 max_sectors);
++ 
++ 	r1_bio->bios[rdisk] = read_bio;
++ 
++ 	read_bio->bi_iter.bi_sector = r1_bio->sector +
++ 		mirror->rdev->data_offset;
++ 	read_bio->bi_bdev = mirror->rdev->bdev;
++ 	read_bio->bi_end_io = raid1_end_read_request;
++ 	bio_set_op_attrs(read_bio, op, do_sync);
++ 	if (test_bit(FailFast, &mirror->rdev->flags) &&
++ 	    test_bit(R1BIO_FailFast, &r1_bio->state))
++ 	        read_bio->bi_opf |= MD_FAILFAST;
++ 	read_bio->bi_private = r1_bio;
++ 
++ 	if (mddev->gendisk)
++ 	        trace_block_bio_remap(bdev_get_queue(read_bio->bi_bdev),
++ 	                              read_bio, disk_devt(mddev->gendisk),
++ 	                              r1_bio->sector);
++ 
++ 	if (max_sectors < r1_bio->sectors) {
++ 		/*
++ 		 * could not read all from this device, so we will need another
++ 		 * r1_bio.
++ 		 */
++ 		sectors_handled = (r1_bio->sector + max_sectors
++ 				   - bio->bi_iter.bi_sector);
++ 		r1_bio->sectors = max_sectors;
++ 		spin_lock_irq(&conf->device_lock);
++ 		if (bio->bi_phys_segments == 0)
++ 			bio->bi_phys_segments = 2;
++ 		else
++ 			bio->bi_phys_segments++;
++ 		spin_unlock_irq(&conf->device_lock);
++ 
++ 		/*
++ 		 * Cannot call generic_make_request directly as that will be
++ 		 * queued in __make_request and subsequent mempool_alloc might
++ 		 * block waiting for it.  So hand bio over to raid1d.
++ 		 */
++ 		reschedule_retry(r1_bio);
++ 
++ 		r1_bio = alloc_r1bio(mddev, bio, sectors_handled);
++ 		goto read_again;
++ 	} else
++ 		generic_make_request(read_bio);
++ }
++ 
++ static void raid1_write_request(struct mddev *mddev, struct bio *bio)
++ {
++ 	struct r1conf *conf = mddev->private;
++ 	struct r1bio *r1_bio;
+++>>>>>>> fd76863e37fe (RAID1: a new I/O barrier implementation to remove resync window)
+  	int i, disks;
+ -	struct bitmap *bitmap = mddev->bitmap;
+ +	struct bitmap *bitmap;
+  	unsigned long flags;
+ -	const int op = bio_op(bio);
+ -	const unsigned long do_sync = (bio->bi_opf & REQ_SYNC);
+ -	const unsigned long do_flush_fua = (bio->bi_opf &
+ -						(REQ_PREFLUSH | REQ_FUA));
+ +	const int rw = bio_data_dir(bio);
+ +	const unsigned long do_sync = (bio->bi_rw & REQ_SYNC);
+ +	const unsigned long do_flush_fua = (bio->bi_rw & (REQ_FLUSH | REQ_FUA));
+ +	const unsigned long do_discard = (bio->bi_rw
+ +					  & (REQ_DISCARD | REQ_SECURE));
+ +	const unsigned long do_same = (bio->bi_rw & REQ_WRITE_SAME);
+  	struct md_rdev *blocked_rdev;
+  	struct blk_plug_cb *cb;
+  	struct raid1_plug_cb *plug = NULL;
+@@@ -1113,113 -1264,23 +1336,129 @@@
+  		}
+  		finish_wait(&conf->wait_barrier, &w);
+  	}
+++<<<<<<< HEAD
+ +
+ +	start_next_window = wait_barrier(conf, bio);
+++=======
++ 	wait_barrier(conf, bio->bi_iter.bi_sector);
++ 
++ 	r1_bio = alloc_r1bio(mddev, bio, 0);
++ 
++ 	/* We might need to issue multiple writes to different
++ 	 * devices if there are bad blocks around, so we keep
++ 	 * track of the number of writes in bio->bi_phys_segments.
++ 	 * If this is 0, there is only one r1_bio and no locking
++ 	 * will be needed when requests complete.  If it is
++ 	 * non-zero, then it is the number of not-completed requests.
++ 	 */
++ 	bio->bi_phys_segments = 0;
++ 	bio_clear_flag(bio, BIO_SEG_VALID);
+++>>>>>>> fd76863e37fe (RAID1: a new I/O barrier implementation to remove resync window)
+ +
+ +	bitmap = mddev->bitmap;
+ +
+ +	/*
+ +	 * make_request() can abort the operation when READA is being
+ +	 * used and no empty request is available.
+ +	 *
+ +	 */
+ +	r1_bio = mempool_alloc(conf->r1bio_pool, GFP_NOIO);
+ +
+ +	r1_bio->master_bio = bio;
+ +	r1_bio->sectors = bio_sectors(bio);
+ +	r1_bio->state = 0;
+ +	r1_bio->mddev = mddev;
+ +	r1_bio->sector = bio->bi_sector;
+ +
+ +	/* We might need to issue multiple reads to different
+ +	 * devices if there are bad blocks around, so we keep
+ +	 * track of the number of reads in bio->bi_phys_segments.
+ +	 * If this is 0, there is only one r1_bio and no locking
+ +	 * will be needed when requests complete.  If it is
+ +	 * non-zero, then it is the number of not-completed requests.
+ +	 */
+ +	bio->bi_phys_segments = 0;
+ +	clear_bit(BIO_SEG_VALID, &bio->bi_flags);
+ +
+ +	if (rw == READ) {
+ +		/*
+ +		 * read balancing logic:
+ +		 */
+ +		int rdisk;
+ +
+ +read_again:
+ +		rdisk = read_balance(conf, r1_bio, &max_sectors);
+ +
+ +		if (rdisk < 0) {
+ +			/* couldn't find anywhere to read from */
+ +			raid_end_bio_io(r1_bio);
+ +			return;
+ +		}
+ +		mirror = conf->mirrors + rdisk;
+ +
+ +		if (test_bit(WriteMostly, &mirror->rdev->flags) &&
+ +		    bitmap) {
+ +			/* Reading from a write-mostly device must
+ +			 * take care not to over-take any writes
+ +			 * that are 'behind'
+ +			 */
+ +			wait_event(bitmap->behind_wait,
+ +				   atomic_read(&bitmap->behind_writes) == 0);
+ +		}
+ +		r1_bio->read_disk = rdisk;
+ +		r1_bio->start_next_window = 0;
+  
+ +		read_bio = bio_clone_mddev(bio, GFP_NOIO, mddev);
+ +		bio_trim(read_bio, r1_bio->sector - bio->bi_sector,
+ +			 max_sectors);
+ +
+ +		r1_bio->bios[rdisk] = read_bio;
+ +
+ +		read_bio->bi_sector = r1_bio->sector + mirror->rdev->data_offset;
+ +		read_bio->bi_bdev = mirror->rdev->bdev;
+ +		read_bio->bi_end_io = raid1_end_read_request;
+ +		read_bio->bi_rw = READ | do_sync;
+ +		read_bio->bi_private = r1_bio;
+ +
+ +		if (max_sectors < r1_bio->sectors) {
+ +			/* could not read all from this device, so we will
+ +			 * need another r1_bio.
+ +			 */
+ +
+ +			sectors_handled = (r1_bio->sector + max_sectors
+ +					   - bio->bi_sector);
+ +			r1_bio->sectors = max_sectors;
+ +			spin_lock_irq(&conf->device_lock);
+ +			if (bio->bi_phys_segments == 0)
+ +				bio->bi_phys_segments = 2;
+ +			else
+ +				bio->bi_phys_segments++;
+ +			spin_unlock_irq(&conf->device_lock);
+ +			/* Cannot call generic_make_request directly
+ +			 * as that will be queued in __make_request
+ +			 * and subsequent mempool_alloc might block waiting
+ +			 * for it.  So hand bio over to raid1d.
+ +			 */
+ +			reschedule_retry(r1_bio);
+ +
+ +			r1_bio = mempool_alloc(conf->r1bio_pool, GFP_NOIO);
+ +
+ +			r1_bio->master_bio = bio;
+ +			r1_bio->sectors = bio_sectors(bio) - sectors_handled;
+ +			r1_bio->state = 0;
+ +			r1_bio->mddev = mddev;
+ +			r1_bio->sector = bio->bi_sector + sectors_handled;
+ +			goto read_again;
+ +		} else
+ +			generic_make_request(read_bio);
+ +		return;
+ +	}
+ +
+ +	/*
+ +	 * WRITE:
+ +	 */
+  	if (conf->pending_count >= max_queued_requests) {
+  		md_wakeup_thread(mddev->thread);
+ -		raid1_log(mddev, "wait queued");
+  		wait_event(conf->wait_barrier,
+  			   conf->pending_count < max_queued_requests);
+  	}
+@@@ -1311,18 -1368,10 +1548,14 @@@
+  			if (r1_bio->bios[j])
+  				rdev_dec_pending(conf->mirrors[j].rdev, mddev);
+  		r1_bio->state = 0;
+++<<<<<<< HEAD
+ +		allow_barrier(conf, start_next_window, bio->bi_sector);
+++=======
++ 		allow_barrier(conf, bio->bi_iter.bi_sector);
++ 		raid1_log(mddev, "wait rdev %d blocked", blocked_rdev->raid_disk);
+++>>>>>>> fd76863e37fe (RAID1: a new I/O barrier implementation to remove resync window)
+  		md_wait_for_blocked_rdev(blocked_rdev, mddev);
+- 		start_next_window = wait_barrier(conf, bio);
+- 		/*
+- 		 * We must make sure the multi r1bios of bio have
+- 		 * the same value of bi_phys_segments
+- 		 */
+- 		if (bio->bi_phys_segments && old &&
+- 		    old != start_next_window)
+- 			/* Wait for the former r1bio(s) to complete */
+- 			wait_event(conf->wait_barrier,
+- 				   bio->bi_phys_segments == 1);
++ 		wait_barrier(conf, bio->bi_iter.bi_sector);
+  		goto retry_write;
+  	}
+  
+@@@ -1419,12 -1489,7 +1652,16 @@@
+  		/* We need another r1_bio.  It has already been counted
+  		 * in bio->bi_phys_segments
+  		 */
+++<<<<<<< HEAD
+ +		r1_bio = mempool_alloc(conf->r1bio_pool, GFP_NOIO);
+ +		r1_bio->master_bio = bio;
+ +		r1_bio->sectors = bio_sectors(bio) - sectors_handled;
+ +		r1_bio->state = 0;
+ +		r1_bio->mddev = mddev;
+ +		r1_bio->sector = bio->bi_sector + sectors_handled;
+++=======
++ 		r1_bio = alloc_r1bio(mddev, bio, sectors_handled);
+++>>>>>>> fd76863e37fe (RAID1: a new I/O barrier implementation to remove resync window)
+  		goto retry_write;
+  	}
+  
+@@@ -1434,6 -1499,29 +1671,32 @@@
+  	wake_up(&conf->wait_barrier);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void raid1_make_request(struct mddev *mddev, struct bio *bio)
++ {
++ 	struct bio *split;
++ 	sector_t sectors;
++ 
++ 	/* if bio exceeds barrier unit boundary, split it */
++ 	do {
++ 		sectors = align_to_barrier_unit_end(
++ 				bio->bi_iter.bi_sector, bio_sectors(bio));
++ 		if (sectors < bio_sectors(bio)) {
++ 			split = bio_split(bio, sectors, GFP_NOIO, fs_bio_set);
++ 			bio_chain(split, bio);
++ 		} else {
++ 			split = bio;
++ 		}
++ 
++ 		if (bio_data_dir(split) == READ)
++ 			raid1_read_request(mddev, split);
++ 		else
++ 			raid1_write_request(mddev, split);
++ 	} while (split != bio);
++ }
++ 
+++>>>>>>> fd76863e37fe (RAID1: a new I/O barrier implementation to remove resync window)
+  static void raid1_status(struct seq_file *seq, struct mddev *mddev)
+  {
+  	struct r1conf *conf = mddev->private;
+@@@ -2387,18 -2485,17 +2644,17 @@@ read_more
+  			generic_make_request(bio);
+  			bio = NULL;
+  
+- 			r1_bio = mempool_alloc(conf->r1bio_pool, GFP_NOIO);
+- 
+- 			r1_bio->master_bio = mbio;
+- 			r1_bio->sectors = bio_sectors(mbio) - sectors_handled;
+- 			r1_bio->state = 0;
++ 			r1_bio = alloc_r1bio(mddev, mbio, sectors_handled);
+  			set_bit(R1BIO_ReadError, &r1_bio->state);
+++<<<<<<< HEAD
+ +			r1_bio->mddev = mddev;
+ +			r1_bio->sector = mbio->bi_sector + sectors_handled;
+++=======
+++>>>>>>> fd76863e37fe (RAID1: a new I/O barrier implementation to remove resync window)
+  
+  			goto read_more;
+ -		} else {
+ -			trace_block_bio_remap(bdev_get_queue(bio->bi_bdev),
+ -					      bio, bio_dev, bio_sector);
+ +		} else
+  			generic_make_request(bio);
+ -		}
+  	}
+  }
+  
+@@@ -2414,15 -2512,11 +2671,20 @@@ static void raid1d(struct md_thread *th
+  	md_check_recovery(mddev);
+  
+  	if (!list_empty_careful(&conf->bio_end_io_list) &&
+ -	    !test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags)) {
+ +	    !test_bit(MD_CHANGE_PENDING, &mddev->flags)) {
+  		LIST_HEAD(tmp);
+  		spin_lock_irqsave(&conf->device_lock, flags);
+++<<<<<<< HEAD
+ +		if (!test_bit(MD_CHANGE_PENDING, &mddev->flags)) {
+ +			while (!list_empty(&conf->bio_end_io_list)) {
+ +				list_move(conf->bio_end_io_list.prev, &tmp);
+ +				conf->nr_queued--;
+ +			}
+ +		}
+++=======
++ 		if (!test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags))
++ 			list_splice_init(&conf->bio_end_io_list, &tmp);
+++>>>>>>> fd76863e37fe (RAID1: a new I/O barrier implementation to remove resync window)
+  		spin_unlock_irqrestore(&conf->device_lock, flags);
+  		while (!list_empty(&tmp)) {
+  			r1_bio = list_first_entry(&tmp, struct r1bio,
+@@@ -2560,10 -2664,15 +2827,10 @@@ static sector_t raid1_sync_request(stru
+  	 * If there is non-resync activity waiting for a turn, then let it
+  	 * though before starting on this new sync request.
+  	 */
+- 	if (conf->nr_waiting)
++ 	if (conf->nr_waiting[idx])
+  		schedule_timeout_uninterruptible(1);
+  
+ -	/* we are incrementing sector_nr below. To be safe, we check against
+ -	 * sector_nr + two times RESYNC_SECTORS
+ -	 */
+ -
+ -	bitmap_cond_end_sync(mddev->bitmap, sector_nr,
+ -		mddev_is_clustered(mddev) && (sector_nr + 2 * RESYNC_SECTORS > conf->cluster_sync_high));
+ +	bitmap_cond_end_sync(mddev->bitmap, sector_nr);
+  	r1_bio = mempool_alloc(conf->r1buf_pool, GFP_NOIO);
+  
+  	raise_barrier(conf, sector_nr);
+diff --cc drivers/md/raid1.h
+index c52d7139c5d7,3442e8fe3fcd..000000000000
+--- a/drivers/md/raid1.h
++++ b/drivers/md/raid1.h
+@@@ -173,6 -184,14 +176,19 @@@ struct r1bio 
+  /* If a write for this request means we can clear some
+   * known-bad-block records, we set this flag
+   */
+++<<<<<<< HEAD
+ +#define	R1BIO_MadeGood 7
+ +#define	R1BIO_WriteError 8
+++=======
++ 	R1BIO_MadeGood,
++ 	R1BIO_WriteError,
++ 	R1BIO_FailFast,
++ };
++ 
++ static inline int sector_to_idx(sector_t sector)
++ {
++ 	return hash_long(sector >> BARRIER_UNIT_SECTOR_BITS,
++ 			 BARRIER_BUCKETS_NR_BITS);
++ }
+++>>>>>>> fd76863e37fe (RAID1: a new I/O barrier implementation to remove resync window)
+  #endif
+* Unmerged path drivers/md/raid1.c
+* Unmerged path drivers/md/raid1.h
