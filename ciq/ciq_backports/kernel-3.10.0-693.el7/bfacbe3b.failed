@@ -1,0 +1,362 @@
+perf record: Add switch-output time option argument
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jiri Olsa <jolsa@kernel.org>
+commit bfacbe3bf2443c805aec4c04ecb558d03d0d3ebc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/bfacbe3b.failed
+
+It's now possible to specify the threshold time for perf.data like:
+
+  $ perf record --switch-output=30s ...
+
+Once it's reached, the current data are dumped in to the
+perf.data.<timestamp> file and session does on.
+
+  $ perf record --switch-output=30s ...
+  [ perf record: dump data: Woken up 44 times ]
+  [ perf record: Dump perf.data.2017010213043746 ]
+  ...
+
+The time is expected to be a number with appended unit
+character - s/m/h/d.
+
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+	Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Acked-by: Wang Nan <wangnan0@huawei.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Link: http://lkml.kernel.org/r/1483955520-29063-7-git-send-email-jolsa@kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit bfacbe3bf2443c805aec4c04ecb558d03d0d3ebc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/Documentation/perf-record.txt
+#	tools/perf/builtin-record.c
+diff --cc tools/perf/Documentation/perf-record.txt
+index 37473e1c67b6,27256bc68eda..000000000000
+--- a/tools/perf/Documentation/perf-record.txt
++++ b/tools/perf/Documentation/perf-record.txt
+@@@ -331,6 -418,62 +331,65 @@@ Configure all used events to run in ker
+  --all-user::
+  Configure all used events to run in user space.
+  
+++<<<<<<< HEAD
+++=======
++ --timestamp-filename
++ Append timestamp to output file name.
++ 
++ --switch-output[=mode]::
++ Generate multiple perf.data files, timestamp prefixed, switching to a new one
++ based on 'mode' value:
++   "signal" - when receiving a SIGUSR2 (default value) or
++   <size>   - when reaching the size threshold, size is expected to
++              be a number with appended unit character - B/K/M/G
++   <time>   - when reaching the time threshold, size is expected to
++              be a number with appended unit character - s/m/h/d
++ 
++              Note: the precision of  the size  threshold  hugely depends
++              on your configuration  - the number and size of  your  ring
++              buffers (-m). It is generally more precise for higher sizes
++              (like >5M), for lower values expect different sizes.
++ 
++ A possible use case is to, given an external event, slice the perf.data file
++ that gets then processed, possibly via a perf script, to decide if that
++ particular perf.data snapshot should be kept or not.
++ 
++ Implies --timestamp-filename, --no-buildid and --no-buildid-cache.
++ The reason for the latter two is to reduce the data file switching
++ overhead. You can still switch them on with:
++ 
++   --switch-output --no-no-buildid  --no-no-buildid-cache
++ 
++ --dry-run::
++ Parse options then exit. --dry-run can be used to detect errors in cmdline
++ options.
++ 
++ 'perf record --dry-run -e' can act as a BPF script compiler if llvm.dump-obj
++ in config file is set to true.
++ 
++ --tail-synthesize::
++ Instead of collecting non-sample events (for example, fork, comm, mmap) at
++ the beginning of record, collect them during finalizing an output file.
++ The collected non-sample events reflects the status of the system when
++ record is finished.
++ 
++ --overwrite::
++ Makes all events use an overwritable ring buffer. An overwritable ring
++ buffer works like a flight recorder: when it gets full, the kernel will
++ overwrite the oldest records, that thus will never make it to the
++ perf.data file.
++ 
++ When '--overwrite' and '--switch-output' are used perf records and drops
++ events until it receives a signal, meaning that something unusual was
++ detected that warrants taking a snapshot of the most current events,
++ those fitting in the ring buffer at that moment.
++ 
++ 'overwrite' attribute can also be set or canceled for an event using
++ config terms. For example: 'cycles/overwrite/' and 'instructions/no-overwrite/'.
++ 
++ Implies --tail-synthesize.
++ 
+++>>>>>>> bfacbe3bf244 (perf record: Add switch-output time option argument)
+  SEE ALSO
+  --------
+  linkperf:perf-stat[1], linkperf:perf-list[1]
+diff --cc tools/perf/builtin-record.c
+index 6cb1cbb83a86,33a9eaaf9db4..000000000000
+--- a/tools/perf/builtin-record.c
++++ b/tools/perf/builtin-record.c
+@@@ -41,6 -46,15 +41,18 @@@
+  #include <asm/bug.h>
+  #include <linux/time64.h>
+  
+++<<<<<<< HEAD
+++=======
++ struct switch_output {
++ 	bool		 enabled;
++ 	bool		 signal;
++ 	unsigned long	 size;
++ 	unsigned long	 time;
++ 	const char	*str;
++ 	bool		 set;
++ };
++ 
+++>>>>>>> bfacbe3bf244 (perf record: Add switch-output time option argument)
+  struct record {
+  	struct perf_tool	tool;
+  	struct record_opts	opts;
+@@@ -60,6 -74,30 +72,32 @@@
+  	unsigned long long	samples;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static volatile int auxtrace_record__snapshot_started;
++ static DEFINE_TRIGGER(auxtrace_snapshot_trigger);
++ static DEFINE_TRIGGER(switch_output_trigger);
++ 
++ static bool switch_output_signal(struct record *rec)
++ {
++ 	return rec->switch_output.signal &&
++ 	       trigger_is_ready(&switch_output_trigger);
++ }
++ 
++ static bool switch_output_size(struct record *rec)
++ {
++ 	return rec->switch_output.size &&
++ 	       trigger_is_ready(&switch_output_trigger) &&
++ 	       (rec->bytes_written >= rec->switch_output.size);
++ }
++ 
++ static bool switch_output_time(struct record *rec)
++ {
++ 	return rec->switch_output.time &&
++ 	       trigger_is_ready(&switch_output_trigger);
++ }
++ 
+++>>>>>>> bfacbe3bf244 (perf record: Add switch-output time option argument)
+  static int record__write(struct record *rec, void *bf, size_t size)
+  {
+  	if (perf_data_file__write(rec->session->file, bf, size) < 0) {
+@@@ -954,6 -1044,44 +993,47 @@@ static int __cmd_record(struct record *
+  			}
+  		}
+  
+++<<<<<<< HEAD
+++=======
++ 		if (trigger_is_hit(&switch_output_trigger)) {
++ 			/*
++ 			 * If switch_output_trigger is hit, the data in
++ 			 * overwritable ring buffer should have been collected,
++ 			 * so bkw_mmap_state should be set to BKW_MMAP_EMPTY.
++ 			 *
++ 			 * If SIGUSR2 raise after or during record__mmap_read_all(),
++ 			 * record__mmap_read_all() didn't collect data from
++ 			 * overwritable ring buffer. Read again.
++ 			 */
++ 			if (rec->evlist->bkw_mmap_state == BKW_MMAP_RUNNING)
++ 				continue;
++ 			trigger_ready(&switch_output_trigger);
++ 
++ 			/*
++ 			 * Reenable events in overwrite ring buffer after
++ 			 * record__mmap_read_all(): we should have collected
++ 			 * data from it.
++ 			 */
++ 			perf_evlist__toggle_bkw_mmap(rec->evlist, BKW_MMAP_RUNNING);
++ 
++ 			if (!quiet)
++ 				fprintf(stderr, "[ perf record: dump data: Woken up %ld times ]\n",
++ 					waking);
++ 			waking = 0;
++ 			fd = record__switch_output(rec, false);
++ 			if (fd < 0) {
++ 				pr_err("Failed to switch to new file\n");
++ 				trigger_error(&switch_output_trigger);
++ 				err = fd;
++ 				goto out_child;
++ 			}
++ 
++ 			/* re-arm the alarm */
++ 			if (rec->switch_output.time)
++ 				alarm(rec->switch_output.time);
++ 		}
++ 
+++>>>>>>> bfacbe3bf244 (perf record: Add switch-output time option argument)
+  		if (hits == rec->samples) {
+  			if (done || draining)
+  				break;
+@@@ -1167,6 -1389,78 +1247,81 @@@ out_free
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void switch_output_size_warn(struct record *rec)
++ {
++ 	u64 wakeup_size = perf_evlist__mmap_size(rec->opts.mmap_pages);
++ 	struct switch_output *s = &rec->switch_output;
++ 
++ 	wakeup_size /= 2;
++ 
++ 	if (s->size < wakeup_size) {
++ 		char buf[100];
++ 
++ 		unit_number__scnprintf(buf, sizeof(buf), wakeup_size);
++ 		pr_warning("WARNING: switch-output data size lower than "
++ 			   "wakeup kernel buffer size (%s) "
++ 			   "expect bigger perf.data sizes\n", buf);
++ 	}
++ }
++ 
++ static int switch_output_setup(struct record *rec)
++ {
++ 	struct switch_output *s = &rec->switch_output;
++ 	static struct parse_tag tags_size[] = {
++ 		{ .tag  = 'B', .mult = 1       },
++ 		{ .tag  = 'K', .mult = 1 << 10 },
++ 		{ .tag  = 'M', .mult = 1 << 20 },
++ 		{ .tag  = 'G', .mult = 1 << 30 },
++ 		{ .tag  = 0 },
++ 	};
++ 	static struct parse_tag tags_time[] = {
++ 		{ .tag  = 's', .mult = 1        },
++ 		{ .tag  = 'm', .mult = 60       },
++ 		{ .tag  = 'h', .mult = 60*60    },
++ 		{ .tag  = 'd', .mult = 60*60*24 },
++ 		{ .tag  = 0 },
++ 	};
++ 	unsigned long val;
++ 
++ 	if (!s->set)
++ 		return 0;
++ 
++ 	if (!strcmp(s->str, "signal")) {
++ 		s->signal = true;
++ 		pr_debug("switch-output with SIGUSR2 signal\n");
++ 		goto enabled;
++ 	}
++ 
++ 	val = parse_tag_value(s->str, tags_size);
++ 	if (val != (unsigned long) -1) {
++ 		s->size = val;
++ 		pr_debug("switch-output with %s size threshold\n", s->str);
++ 		goto enabled;
++ 	}
++ 
++ 	val = parse_tag_value(s->str, tags_time);
++ 	if (val != (unsigned long) -1) {
++ 		s->time = val;
++ 		pr_debug("switch-output with %s time threshold (%lu seconds)\n",
++ 			 s->str, s->time);
++ 		goto enabled;
++ 	}
++ 
++ 	return -1;
++ 
++ enabled:
++ 	rec->timestamp_filename = true;
++ 	s->enabled              = true;
++ 
++ 	if (s->size && !rec->opts.no_buffering)
++ 		switch_output_size_warn(rec);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> bfacbe3bf244 (perf record: Add switch-output time option argument)
+  static const char * const __record_usage[] = {
+  	"perf record [<options>] [<command>]",
+  	"perf record [<options>] -- <command> [<options>]",
+@@@ -1319,6 -1628,12 +1474,15 @@@ static struct option __record_options[
+  		    "Record build-id of all DSOs regardless of hits"),
+  	OPT_BOOLEAN(0, "timestamp-filename", &record.timestamp_filename,
+  		    "append timestamp to output filename"),
+++<<<<<<< HEAD
+++=======
++ 	OPT_STRING_OPTARG_SET(0, "switch-output", &record.switch_output.str,
++ 			  &record.switch_output.set, "signal,size,time",
++ 			  "Switch output when receive SIGUSR2 or cross size,time threshold",
++ 			  "signal"),
++ 	OPT_BOOLEAN(0, "dry-run", &dry_run,
++ 		    "Parse options then exit"),
+++>>>>>>> bfacbe3bf244 (perf record: Add switch-output time option argument)
+  	OPT_END()
+  };
+  
+@@@ -1360,6 -1689,16 +1524,19 @@@ int cmd_record(int argc, const char **a
+  		return -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (switch_output_setup(rec)) {
++ 		parse_options_usage(record_usage, record_options, "switch-output", 0);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (rec->switch_output.time) {
++ 		signal(SIGALRM, alarm_sig_handler);
++ 		alarm(rec->switch_output.time);
++ 	}
++ 
+++>>>>>>> bfacbe3bf244 (perf record: Add switch-output time option argument)
+  	if (!rec->itr) {
+  		rec->itr = auxtrace_record__init(rec->evlist, &err);
+  		if (err)
+@@@ -1448,9 -1839,23 +1625,17 @@@ out
+  
+  static void snapshot_sig_handler(int sig __maybe_unused)
+  {
+ -	struct record *rec = &record;
+ -
+ -	if (trigger_is_ready(&auxtrace_snapshot_trigger)) {
+ -		trigger_hit(&auxtrace_snapshot_trigger);
+ -		auxtrace_record__snapshot_started = 1;
+ -		if (auxtrace_record__snapshot_start(record.itr))
+ -			trigger_error(&auxtrace_snapshot_trigger);
+ -	}
+ -
+ -	if (switch_output_signal(rec))
+ -		trigger_hit(&switch_output_trigger);
+ +	if (!auxtrace_snapshot_is_enabled())
+ +		return;
+ +	auxtrace_snapshot_disable();
+ +	auxtrace_snapshot_err = auxtrace_record__snapshot_start(record.itr);
+ +	auxtrace_record__snapshot_started = 1;
+  }
++ 
++ static void alarm_sig_handler(int sig __maybe_unused)
++ {
++ 	struct record *rec = &record;
++ 
++ 	if (switch_output_time(rec))
++ 		trigger_hit(&switch_output_trigger);
++ }
+* Unmerged path tools/perf/Documentation/perf-record.txt
+* Unmerged path tools/perf/builtin-record.c
