@@ -1,0 +1,101 @@
+mlx4: fix use-after-free in mlx4_en_fold_software_stats()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit 7f7bf1606fa8fa0e3aecdeac0ba8005f2a0fbdef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7f7bf160.failed
+
+My recent commit to get more precise rx/tx counters in ndo_get_stats64()
+can lead to crashes at device dismantle, as Jesper found out.
+
+We must prevent mlx4_en_fold_software_stats() trying to access
+tx/rx rings if they are deleted.
+
+Fix this by adding a test against priv->port_up in
+mlx4_en_fold_software_stats()
+
+Calling mlx4_en_fold_software_stats() from mlx4_en_stop_port()
+allows us to eventually broadcast the latest/current counters to
+rtnetlink monitors.
+
+Fixes: 40931b85113d ("mlx4: give precise rx/tx bytes/packets counters")
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reported-and-bisected-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Tested-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Cc: Tariq Toukan <tariqt@mellanox.com>
+	Cc: Saeed Mahameed <saeedm@dev.mellanox.co.il>
+	Acked-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7f7bf1606fa8fa0e3aecdeac0ba8005f2a0fbdef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx4/en_port.c
+diff --cc drivers/net/ethernet/mellanox/mlx4/en_port.c
+index 59473a0ebcdf,9166d90e7328..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx4/en_port.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_port.c
+@@@ -147,6 -147,39 +147,42 @@@ static unsigned long en_stats_adder(__b
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void mlx4_en_fold_software_stats(struct net_device *dev)
++ {
++ 	struct mlx4_en_priv *priv = netdev_priv(dev);
++ 	struct mlx4_en_dev *mdev = priv->mdev;
++ 	unsigned long packets, bytes;
++ 	int i;
++ 
++ 	if (!priv->port_up || mlx4_is_master(mdev->dev))
++ 		return;
++ 
++ 	packets = 0;
++ 	bytes = 0;
++ 	for (i = 0; i < priv->rx_ring_num; i++) {
++ 		const struct mlx4_en_rx_ring *ring = priv->rx_ring[i];
++ 
++ 		packets += READ_ONCE(ring->packets);
++ 		bytes   += READ_ONCE(ring->bytes);
++ 	}
++ 	dev->stats.rx_packets = packets;
++ 	dev->stats.rx_bytes = bytes;
++ 
++ 	packets = 0;
++ 	bytes = 0;
++ 	for (i = 0; i < priv->tx_ring_num[TX]; i++) {
++ 		const struct mlx4_en_tx_ring *ring = priv->tx_ring[TX][i];
++ 
++ 		packets += READ_ONCE(ring->packets);
++ 		bytes   += READ_ONCE(ring->bytes);
++ 	}
++ 	dev->stats.tx_packets = packets;
++ 	dev->stats.tx_bytes = bytes;
++ }
++ 
+++>>>>>>> 7f7bf1606fa8 (mlx4: fix use-after-free in mlx4_en_fold_software_stats())
+  int mlx4_en_DUMP_ETH_STATS(struct mlx4_en_dev *mdev, u8 port, u8 reset)
+  {
+  	struct mlx4_counter tmp_counter_stats;
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index 8a388253cc66..7d5eb4b11644 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@ -1762,8 +1762,12 @@ void mlx4_en_stop_port(struct net_device *dev, int detach)
+ 
+ 	netif_tx_disable(dev);
+ 
++	spin_lock_bh(&priv->stats_lock);
++	mlx4_en_fold_software_stats(dev);
+ 	/* Set port as not active */
+ 	priv->port_up = false;
++	spin_unlock_bh(&priv->stats_lock);
++
+ 	priv->counter_index = MLX4_SINK_COUNTER_INDEX(mdev->dev);
+ 
+ 	/* Promsicuous mode */
+* Unmerged path drivers/net/ethernet/mellanox/mlx4/en_port.c
