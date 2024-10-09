@@ -1,0 +1,142 @@
+userfaultfd: allow get_mempolicy(MPOL_F_NODE|MPOL_F_ADDR) to trigger userfaults
+
+jira LE-1907
+cve CVE-2018-18397
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Andrea Arcangeli <aarcange@redhat.com>
+commit 3b9aadf7278d16d7bed4d5d808501065f70898d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/3b9aadf7.failed
+
+get_mempolicy(MPOL_F_NODE|MPOL_F_ADDR) called a get_user_pages that would
+not be waiting for userfaults before failing and it would hit on a SIGBUS
+instead.  Using get_user_pages_locked/unlocked instead will allow
+get_mempolicy to allow userfaults to resolve the fault and fill the hole,
+before grabbing the node id of the page.
+
+If the user calls get_mempolicy() with MPOL_F_ADDR | MPOL_F_NODE for an
+address inside an area managed by uffd and there is no page at that
+address, the page allocation from within get_mempolicy() will fail
+because get_user_pages() does not allow for page fault retry required
+for uffd; the user will get SIGBUS.
+
+With this patch, the page fault will be resolved by the uffd and the
+get_mempolicy() will continue normally.
+
+Background:
+
+Via code review, previously the syscall would have returned -EFAULT
+(vm_fault_to_errno), now it will block and wait for an userfault (if
+it's waken before the fault is resolved it'll still -EFAULT).
+
+This way get_mempolicy will give a chance to an "unaware" app to be
+compliant with userfaults.
+
+The reason this visible change is that becoming "userfault compliant"
+cannot regress anything: all other syscalls including read(2)/write(2)
+had to become "userfault compliant" long time ago (that's one of the
+things userfaultfd can do that PROT_NONE and trapping segfaults can't).
+
+So this is just one more syscall that become "userfault compliant" like
+all other major ones already were.
+
+This has been happening on virtio-bridge dpdk process which just called
+get_mempolicy on the guest space post live migration, but before the
+memory had a chance to be migrated to destination.
+
+I didn't run an strace to be able to show the -EFAULT going away, but
+I've the confirmation of the below debug aid information (only visible
+with CONFIG_DEBUG_VM=y) going away with the patch:
+
+    [20116.371461] FAULT_FLAG_ALLOW_RETRY missing 0
+    [20116.371464] CPU: 1 PID: 13381 Comm: vhost-events Not tainted 4.17.12-200.fc28.x86_64 #1
+    [20116.371465] Hardware name: LENOVO 20FAS2BN0A/20FAS2BN0A, BIOS N1CET54W (1.22 ) 02/10/2017
+    [20116.371466] Call Trace:
+    [20116.371473]  dump_stack+0x5c/0x80
+    [20116.371476]  handle_userfault.cold.37+0x1b/0x22
+    [20116.371479]  ? remove_wait_queue+0x20/0x60
+    [20116.371481]  ? poll_freewait+0x45/0xa0
+    [20116.371483]  ? do_sys_poll+0x31c/0x520
+    [20116.371485]  ? radix_tree_lookup_slot+0x1e/0x50
+    [20116.371488]  shmem_getpage_gfp+0xce7/0xe50
+    [20116.371491]  ? page_add_file_rmap+0x1a/0x2c0
+    [20116.371493]  shmem_fault+0x78/0x1e0
+    [20116.371495]  ? filemap_map_pages+0x3a1/0x450
+    [20116.371498]  __do_fault+0x1f/0xc0
+    [20116.371500]  __handle_mm_fault+0xe2e/0x12f0
+    [20116.371502]  handle_mm_fault+0xda/0x200
+    [20116.371504]  __get_user_pages+0x238/0x790
+    [20116.371506]  get_user_pages+0x3e/0x50
+    [20116.371510]  kernel_get_mempolicy+0x40b/0x700
+    [20116.371512]  ? vfs_write+0x170/0x1a0
+    [20116.371515]  __x64_sys_get_mempolicy+0x21/0x30
+    [20116.371517]  do_syscall_64+0x5b/0x160
+    [20116.371520]  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+The above harmless debug message (not a kernel crash, just a
+dump_stack()) is shown with CONFIG_DEBUG_VM=y to more quickly identify
+and improve kernel spots that may have to become "userfaultfd
+compliant" like this one (without having to run an strace and search
+for syscall misbehavior).  Spots like the above are more closer to a
+kernel bug for the non-cooperative usages that Mike focuses on, than
+for for dpdk qemu-cooperative usages that reproduced it, but it's still
+nicer to get this fixed for dpdk too.
+
+The part of the patch that caused me to think is only the
+implementation issue of mpol_get, but it looks like it should work safe
+no matter the kind of mempolicy structure that is (the default static
+policy also starts at 1 so it'll go to 2 and back to 1 without crashing
+everything at 0).
+
+[rppt@linux.vnet.ibm.com: changelog addition]
+  http://lkml.kernel.org/r/20180904073718.GA26916@rapoport-lnx
+Link: http://lkml.kernel.org/r/20180831214848.23676-1-aarcange@redhat.com
+	Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+	Reported-by: Maxime Coquelin <maxime.coquelin@redhat.com>
+	Tested-by: Dr. David Alan Gilbert <dgilbert@redhat.com>
+	Reviewed-by: Mike Rapoport <rppt@linux.vnet.ibm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 3b9aadf7278d16d7bed4d5d808501065f70898d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/mempolicy.c
+diff --cc mm/mempolicy.c
+index 9fd71ba9882f,2e76a8f65e94..000000000000
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@@ -907,7 -802,8 +907,12 @@@ static int lookup_node(struct mm_struc
+  	struct page *p;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	err = get_user_pages(current, mm, addr & PAGE_MASK, 1, 0, 0, &p, NULL);
+++=======
++ 	int locked = 1;
++ 	err = get_user_pages_locked(addr & PAGE_MASK, 1, 0, &p, &locked);
+++>>>>>>> 3b9aadf7278d (userfaultfd: allow get_mempolicy(MPOL_F_NODE|MPOL_F_ADDR) to trigger userfaults)
+  	if (err >= 0) {
+  		err = page_to_nid(p);
+  		put_page(p);
+@@@ -962,6 -860,15 +969,18 @@@ static long do_get_mempolicy(int *polic
+  
+  	if (flags & MPOL_F_NODE) {
+  		if (flags & MPOL_F_ADDR) {
+++<<<<<<< HEAD
+++=======
++ 			/*
++ 			 * Take a refcount on the mpol, lookup_node()
++ 			 * wil drop the mmap_sem, so after calling
++ 			 * lookup_node() only "pol" remains valid, "vma"
++ 			 * is stale.
++ 			 */
++ 			pol_refcount = pol;
++ 			vma = NULL;
++ 			mpol_get(pol);
+++>>>>>>> 3b9aadf7278d (userfaultfd: allow get_mempolicy(MPOL_F_NODE|MPOL_F_ADDR) to trigger userfaults)
+  			err = lookup_node(mm, addr);
+  			if (err < 0)
+  				goto out;
+* Unmerged path mm/mempolicy.c
