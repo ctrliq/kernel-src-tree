@@ -1497,7 +1497,8 @@ int debuginfo__find_available_vars_at(struct debuginfo *dbg,
 }
 
 /* For the kernel module, we need a special code to get a DIE */
-static int debuginfo__get_text_offset(struct debuginfo *dbg, Dwarf_Addr *offs)
+int debuginfo__get_text_offset(struct debuginfo *dbg, Dwarf_Addr *offs,
+				bool adjust_offset)
 {
 	int n, i;
 	Elf32_Word shndx;
@@ -1526,6 +1527,8 @@ static int debuginfo__get_text_offset(struct debuginfo *dbg, Dwarf_Addr *offs)
 			if (!shdr)
 				return -ENOENT;
 			*offs = shdr->sh_addr;
+			if (adjust_offset)
+				*offs -= shdr->sh_offset;
 		}
 	}
 	return 0;
@@ -1541,7 +1544,7 @@ int debuginfo__find_probe_point(struct debuginfo *dbg, unsigned long addr,
 	int baseline = 0, lineno = 0, ret = 0;
 
 	/* We always need to relocate the address for aranges */
-	if (debuginfo__get_text_offset(dbg, &baseaddr) == 0)
+	if (debuginfo__get_text_offset(dbg, &baseaddr, false) == 0)
 		addr += baseaddr;
 	/* Find cu die */
 	if (!dwarf_addrdie(dbg->dbg, (Dwarf_Addr)addr, &cudie)) {
