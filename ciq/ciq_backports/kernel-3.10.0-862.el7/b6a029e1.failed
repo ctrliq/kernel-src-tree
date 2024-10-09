@@ -1,0 +1,127 @@
+qla2xxx: Handle chip reset in target mode.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Handle chip reset in target mode (Himanshu Madhani) [1327621]
+Rebuild_FUZZ: 98.80%
+commit-author Arun Easi <arun.easi@qlogic.com>
+commit b6a029e1b0aba337ee54de66b1e428dd3bb624ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b6a029e1.failed
+
+A chip reset can occur after driver submits command to the stack. Abort
+command processing if a chip reset has occurred or in progress when you
+get a follow up for a command.
+
+	Signed-off-by: Arun Easi <arun.easi@qlogic.com>
+	Signed-off-by: Saurav Kashyap <saurav.kashyap@qlogic.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit b6a029e1b0aba337ee54de66b1e428dd3bb624ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_target.c
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 5f7b0de5e170,38f3f1f014a4..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -2729,12 -3351,8 +2776,16 @@@ static int qlt_handle_cmd_for_atio(stru
+  		return -ENOMEM;
+  	}
+  
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&cmd->cmd_list);
+ +
+ +	memcpy(&cmd->atio, atio, sizeof(*atio));
+ +	cmd->state = QLA_TGT_STATE_NEW;
+ +	cmd->tgt = ha->tgt.qla_tgt;
+ +	cmd->vha = vha;
+++=======
++ 	cmd->reset_count = vha->hw->chip_reset;
+++>>>>>>> b6a029e1b0ab (qla2xxx: Handle chip reset in target mode.)
+  
+  	INIT_WORK(&cmd->work, qlt_do_work);
+  	queue_work(qla_tgt_wq, &cmd->work);
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index db7beb33e386..d72715f3f9ae 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -3540,6 +3540,7 @@ struct qla_hw_data {
+ 	struct work_struct board_disable;
+ 
+ 	struct mr_data_fx00 mr;
++	uint32_t chip_reset;
+ 
+ 	struct qlt_hw_data tgt;
+ 	int	allow_cna_fw_dump;
+diff --git a/drivers/scsi/qla2xxx/qla_gbl.h b/drivers/scsi/qla2xxx/qla_gbl.h
+index c4f068539cd6..4ca0a5f27344 100644
+--- a/drivers/scsi/qla2xxx/qla_gbl.h
++++ b/drivers/scsi/qla2xxx/qla_gbl.h
+@@ -72,6 +72,7 @@ extern void qla2x00_async_logout_done(struct scsi_qla_host *, fc_port_t *,
+ extern void qla2x00_async_adisc_done(struct scsi_qla_host *, fc_port_t *,
+     uint16_t *);
+ extern void *qla2x00_alloc_iocbs(struct scsi_qla_host *, srb_t *);
++extern void *qla2x00_alloc_iocbs_ready(struct scsi_qla_host *, srb_t *);
+ extern int qla24xx_update_fcport_fcp_prio(scsi_qla_host_t *, fc_port_t *);
+ 
+ extern fc_port_t *
+diff --git a/drivers/scsi/qla2xxx/qla_init.c b/drivers/scsi/qla2xxx/qla_init.c
+index 206860f8ea7b..d902ac48fe91 100644
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@ -4656,6 +4656,10 @@ qla2x00_abort_isp_cleanup(scsi_qla_host_t *vha)
+ 		/* Requeue all commands in outstanding command list. */
+ 		qla2x00_abort_all_cmds(vha, DID_RESET << 16);
+ 	}
++
++	ha->chip_reset++;
++	/* memory barrier */
++	wmb();
+ }
+ 
+ /*
+diff --git a/drivers/scsi/qla2xxx/qla_iocb.c b/drivers/scsi/qla2xxx/qla_iocb.c
+index 2aea13d9d71e..65ed9fb90276 100644
+--- a/drivers/scsi/qla2xxx/qla_iocb.c
++++ b/drivers/scsi/qla2xxx/qla_iocb.c
+@@ -2084,6 +2084,17 @@ queuing_error:
+ }
+ 
+ /* Generic Control-SRB manipulation functions. */
++
++/* hardware_lock assumed to be held. */
++void *
++qla2x00_alloc_iocbs_ready(scsi_qla_host_t *vha, srb_t *sp)
++{
++	if (qla2x00_reset_active(vha))
++		return NULL;
++
++	return qla2x00_alloc_iocbs(vha, sp);
++}
++
+ void *
+ qla2x00_alloc_iocbs(scsi_qla_host_t *vha, srb_t *sp)
+ {
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
+diff --git a/drivers/scsi/qla2xxx/qla_target.h b/drivers/scsi/qla2xxx/qla_target.h
+index b33e411f28a0..be6380739f1d 100644
+--- a/drivers/scsi/qla2xxx/qla_target.h
++++ b/drivers/scsi/qla2xxx/qla_target.h
+@@ -851,6 +851,7 @@ struct qla_tgt_cmd {
+ 	uint32_t tag;
+ 	uint32_t unpacked_lun;
+ 	enum dma_data_direction dma_data_direction;
++	uint32_t reset_count;
+ 
+ 	uint16_t loop_id;	/* to save extra sess dereferences */
+ 	struct qla_tgt *tgt;	/* to save extra sess dereferences */
+@@ -881,6 +882,7 @@ struct qla_tgt_mgmt_cmd {
+ 	struct se_cmd se_cmd;
+ 	struct work_struct free_work;
+ 	unsigned int flags;
++	uint32_t reset_count;
+ #define QLA24XX_MGMT_SEND_NACK	1
+ 	union {
+ 		struct atio_from_isp atio;
