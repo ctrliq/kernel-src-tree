@@ -1,0 +1,164 @@
+ipmi: Fix some error cleanup issues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Corey Minyard <cminyard@mvista.com>
+commit cc095f0ac1f7c200e51a5c2a78a43c9f42049dbb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/cc095f0a.failed
+
+device_remove_group() was called on any cleanup, even if the
+device attrs had not been added yet.  That can occur in certain
+error scenarios, so add a flag to know if it has been added.
+
+Also make sure we remove the dev if we added it ourselves.
+
+	Signed-off-by: Corey Minyard <cminyard@mvista.com>
+	Cc: stable@vger.kernel.org # 4.15
+	Cc: Laura Abbott <labbott@redhat.com>
+	Tested-by: Bill Perkins <wmp@grnwood.net>
+(cherry picked from commit cc095f0ac1f7c200e51a5c2a78a43c9f42049dbb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/char/ipmi/ipmi_si_intf.c
+diff --cc drivers/char/ipmi/ipmi_si_intf.c
+index 709742a62b66,2b9f434775d4..000000000000
+--- a/drivers/char/ipmi/ipmi_si_intf.c
++++ b/drivers/char/ipmi/ipmi_si_intf.c
+@@@ -284,18 -229,11 +284,23 @@@ struct smi_info 
+  	/* From the get device id response... */
+  	struct ipmi_device_id device_id;
+  
+ -	/* Default driver model device. */
+ +	/* Driver model stuff. */
+ +	struct device *dev;
+  	struct platform_device *pdev;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * True if we allocated the device, false if it came from
+ +	 * someplace else (like PCI).
+ +	 */
+ +	int dev_registered;
+ +
+ +	/* Slave address, could be reported from DMI. */
+ +	unsigned char slave_addr;
+++=======
++ 	/* Have we added the device group to the device? */
++ 	bool dev_group_added;
+++>>>>>>> cc095f0ac1f7 (ipmi: Fix some error cleanup issues)
+  
+  	/* Counters and things for the proc filesystem. */
+  	atomic_t stats[SI_NUM_STATS];
+@@@ -3469,6 -2007,14 +3474,17 @@@ int ipmi_si_add_smi(struct smi_info *ne
+  
+  	list_add_tail(&new_smi->link, &smi_infos);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (initialized) {
++ 		rv = try_smi_init(new_smi);
++ 		if (rv) {
++ 			cleanup_one_si(new_smi);
++ 			mutex_unlock(&smi_infos_lock);
++ 			return rv;
++ 		}
++ 	}
+++>>>>>>> cc095f0ac1f7 (ipmi: Fix some error cleanup issues)
+  out_err:
+  	mutex_unlock(&smi_infos_lock);
+  	return rv;
+@@@ -3611,8 -2159,18 +3627,9 @@@ static int try_smi_init(struct smi_inf
+  				rv);
+  			goto out_err;
+  		}
+ -		platform_device_registered = true;
+ -	}
+ -
+ -	dev_set_drvdata(new_smi->io.dev, new_smi);
+ -	rv = device_add_group(new_smi->io.dev, &ipmi_si_dev_attr_group);
+ -	if (rv) {
+ -		dev_err(new_smi->io.dev,
+ -			"Unable to add device attributes: error %d\n",
+ -			rv);
+ -		goto out_err_stop_timer;
+ +		new_smi->dev_registered = 1;
+  	}
++ 	new_smi->dev_group_added = true;
+  
+  	rv = ipmi_register_smi(&handlers,
+  			       new_smi,
+@@@ -3667,8 -2223,15 +3684,18 @@@
+  
+  	return 0;
+  
+++<<<<<<< HEAD
+++=======
++ out_err_remove_attrs:
++ 	if (new_smi->dev_group_added) {
++ 		device_remove_group(new_smi->io.dev, &ipmi_si_dev_attr_group);
++ 		new_smi->dev_group_added = false;
++ 	}
++ 	dev_set_drvdata(new_smi->io.dev, NULL);
++ 
+++>>>>>>> cc095f0ac1f7 (ipmi: Fix some error cleanup issues)
+  out_err_stop_timer:
+ -	stop_timer_and_thread(new_smi);
+ +	wait_for_timer_and_thread(new_smi);
+  
+  out_err:
+  	new_smi->interrupt_disabled = true;
+@@@ -3697,22 -2260,22 +3724,23 @@@
+  		kfree(new_smi->si_sm);
+  		new_smi->si_sm = NULL;
+  	}
+ -	if (new_smi->io.addr_source_cleanup) {
+ -		new_smi->io.addr_source_cleanup(&new_smi->io);
+ -		new_smi->io.addr_source_cleanup = NULL;
+ +	if (new_smi->addr_source_cleanup) {
+ +		new_smi->addr_source_cleanup(new_smi);
+ +		new_smi->addr_source_cleanup = NULL;
+  	}
+ -	if (new_smi->io.io_cleanup) {
+ -		new_smi->io.io_cleanup(&new_smi->io);
+ -		new_smi->io.io_cleanup = NULL;
+ +	if (new_smi->io_cleanup) {
+ +		new_smi->io_cleanup(new_smi);
+ +		new_smi->io_cleanup = NULL;
+  	}
+  
+ -	if (new_smi->pdev) {
+ -		if (platform_device_registered)
+ -			platform_device_unregister(new_smi->pdev);
+ -		else
+ -			platform_device_put(new_smi->pdev);
+ +	if (new_smi->dev_registered) {
+ +		platform_device_unregister(new_smi->pdev);
+ +		new_smi->dev_registered = 0;
+ +		new_smi->pdev = NULL;
+ +	} else if (new_smi->pdev) {
+ +		platform_device_put(new_smi->pdev);
+  		new_smi->pdev = NULL;
++ 		new_smi->io.dev = NULL;
+  	}
+  
+  	kfree(init_name);
+@@@ -3860,8 -2372,10 +3888,15 @@@ static void cleanup_one_si(struct smi_i
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	if (to_clean->dev)
+ +		dev_set_drvdata(to_clean->dev, NULL);
+++=======
++ 	if (to_clean->dev_group_added)
++ 		device_remove_group(to_clean->io.dev, &ipmi_si_dev_attr_group);
++ 	if (to_clean->io.dev)
++ 		dev_set_drvdata(to_clean->io.dev, NULL);
+++>>>>>>> cc095f0ac1f7 (ipmi: Fix some error cleanup issues)
+  
+  	list_del(&to_clean->link);
+  
+* Unmerged path drivers/char/ipmi/ipmi_si_intf.c
