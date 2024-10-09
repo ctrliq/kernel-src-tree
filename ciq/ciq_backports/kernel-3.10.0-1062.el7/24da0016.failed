@@ -1,0 +1,422 @@
+IB/mlx5: Device memory support in mlx5_ib
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Ariel Levkovich <lariel@mellanox.com>
+commit 24da00164f7a9c247d2224a54494d0e955199630
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/24da0016.failed
+
+This patch adds the mlx5_ib driver implementation for the device
+memory allocation API.
+It implements the ib_device callbacks for allocation and deallocation
+operations as well as a new mmap command support which allows mapping
+an allocated device memory to a VMA.
+
+The change also adds reporting of device memory maximum size and
+alignment parameters reported in device capabilities.
+
+The allocation/deallocation operations are using new firmware
+commands to allocate MEMIC memory on the device.
+
+	Signed-off-by: Ariel Levkovich <lariel@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 24da00164f7a9c247d2224a54494d0e955199630)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/main.c
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+#	drivers/net/ethernet/chelsio/cxgb4/srq.h
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index 4f262a79ae0d,e17eac32394c..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -4643,7 -4954,48 +4763,52 @@@ static void mlx5_ib_cleanup_multiport_m
+  	mlx5_nic_vport_disable_roce(dev->mdev);
+  }
+  
+++<<<<<<< HEAD
+ +static void mlx5_ib_stage_init_cleanup(struct mlx5_ib_dev *dev)
+++=======
++ ADD_UVERBS_ATTRIBUTES_SIMPLE(mlx5_ib_dm, UVERBS_OBJECT_DM,
++ 			     UVERBS_METHOD_DM_ALLOC,
++ 			     &UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_ALLOC_DM_RESP_START_OFFSET,
++ 						  UVERBS_ATTR_TYPE(u64),
++ 						  UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)),
++ 			     &UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_ALLOC_DM_RESP_PAGE_INDEX,
++ 						  UVERBS_ATTR_TYPE(u16),
++ 						  UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)));
++ 
++ ADD_UVERBS_ATTRIBUTES_SIMPLE(mlx5_ib_flow_action, UVERBS_OBJECT_FLOW_ACTION,
++ 			     UVERBS_METHOD_FLOW_ACTION_ESP_CREATE,
++ 			     &UVERBS_ATTR_PTR_IN(MLX5_IB_ATTR_CREATE_FLOW_ACTION_FLAGS,
++ 						 UVERBS_ATTR_TYPE(u64),
++ 						 UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)));
++ 
++ #define NUM_TREES	2
++ static int populate_specs_root(struct mlx5_ib_dev *dev)
++ {
++ 	const struct uverbs_object_tree_def *default_root[NUM_TREES + 1] = {
++ 		uverbs_default_get_objects()};
++ 	size_t num_trees = 1;
++ 
++ 	if (mlx5_accel_ipsec_device_caps(dev->mdev) & MLX5_ACCEL_IPSEC_CAP_DEVICE &&
++ 	    !WARN_ON(num_trees >= ARRAY_SIZE(default_root)))
++ 		default_root[num_trees++] = &mlx5_ib_flow_action;
++ 
++ 	if (MLX5_CAP_DEV_MEM(dev->mdev, memic) &&
++ 	    !WARN_ON(num_trees >= ARRAY_SIZE(default_root)))
++ 		default_root[num_trees++] = &mlx5_ib_dm;
++ 
++ 	dev->ib_dev.specs_root =
++ 		uverbs_alloc_spec_tree(num_trees, default_root);
++ 
++ 	return PTR_ERR_OR_ZERO(dev->ib_dev.specs_root);
++ }
++ 
++ static void depopulate_specs_root(struct mlx5_ib_dev *dev)
++ {
++ 	uverbs_free_spec_tree(dev->ib_dev.specs_root);
++ }
++ 
++ void mlx5_ib_stage_init_cleanup(struct mlx5_ib_dev *dev)
+++>>>>>>> 24da00164f7a (IB/mlx5: Device memory support in mlx5_ib)
+  {
+  	mlx5_ib_cleanup_multiport_master(dev);
+  #ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 7653bfad9f25,3e9b6548a96b..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -45,18 -45,19 +45,19 @@@
+  #include <linux/mlx5/transobj.h>
+  #include <rdma/ib_user_verbs.h>
+  #include <rdma/mlx5-abi.h>
++ #include <rdma/uverbs_ioctl.h>
+  
+ -#define mlx5_ib_dbg(dev, format, arg...)				\
+ -pr_debug("%s:%s:%d:(pid %d): " format, (dev)->ib_dev.name, __func__,	\
+ -	 __LINE__, current->pid, ##arg)
+ +#define mlx5_ib_dbg(_dev, format, arg...)                                      \
+ +	dev_dbg(&(_dev)->ib_dev.dev, "%s:%d:(pid %d): " format, __func__,      \
+ +		__LINE__, current->pid, ##arg)
+  
+ -#define mlx5_ib_err(dev, format, arg...)				\
+ -pr_err("%s:%s:%d:(pid %d): " format, (dev)->ib_dev.name, __func__,	\
+ -	__LINE__, current->pid, ##arg)
+ +#define mlx5_ib_err(_dev, format, arg...)                                      \
+ +	dev_err(&(_dev)->ib_dev.dev, "%s:%d:(pid %d): " format, __func__,      \
+ +		__LINE__, current->pid, ##arg)
+  
+ -#define mlx5_ib_warn(dev, format, arg...)				\
+ -pr_warn("%s:%s:%d:(pid %d): " format, (dev)->ib_dev.name, __func__,	\
+ -	__LINE__, current->pid, ##arg)
+ +#define mlx5_ib_warn(_dev, format, arg...)                                     \
+ +	dev_warn(&(_dev)->ib_dev.dev, "%s:%d:(pid %d): " format, __func__,     \
+ +		 __LINE__, current->pid, ##arg)
+  
+  #define field_avail(type, fld, sz) (offsetof(type, fld) +		\
+  				    sizeof(((type *)0)->fld) <= (sz))
+@@@ -772,6 -791,22 +789,25 @@@ struct mlx5_ib_multiport_info 
+  	bool unaffiliate;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct mlx5_ib_flow_action {
++ 	struct ib_flow_action		ib_action;
++ 	union {
++ 		struct {
++ 			u64			    ib_flags;
++ 			struct mlx5_accel_esp_xfrm *ctx;
++ 		} esp_aes_gcm;
++ 	};
++ };
++ 
++ struct mlx5_memic {
++ 	struct mlx5_core_dev *dev;
++ 	spinlock_t		memic_lock;
++ 	DECLARE_BITMAP(memic_alloc_pages, MLX5_MAX_MEMIC_PAGES);
++ };
++ 
+++>>>>>>> 24da00164f7a (IB/mlx5: Device memory support in mlx5_ib)
+  struct mlx5_ib_dev {
+  	struct ib_device		ib_dev;
+  	struct mlx5_core_dev		*mdev;
+diff --cc drivers/net/ethernet/chelsio/cxgb4/srq.h
+index ec85cf93865a,f7d685ef2d1f..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/srq.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/srq.h
+@@@ -32,34 -30,19 +32,43 @@@
+   * SOFTWARE.
+   */
+  
+ -#ifndef MLX5_USER_IOCTL_CMDS_H
+ -#define MLX5_USER_IOCTL_CMDS_H
+ +#ifndef __CXGB4_SRQ_H
+ +#define __CXGB4_SRQ_H
+ +
+ +struct adapter;
+ +struct cpl_srq_table_rpl;
+  
+ -#include <rdma/ib_user_ioctl_cmds.h>
+ +#define SRQ_WAIT_TO	(HZ * 5)
+ +
+ +struct srq_entry {
+ +	u8 valid;
+ +	u8 idx;
+ +	u8 qlen;
+ +	u16 pdid;
+ +	u16 cur_msn;
+ +	u16 max_msn;
+ +	u32 qbase;
+ +};
+  
+ -enum mlx5_ib_create_flow_action_attrs {
+ -	/* This attribute belong to the driver namespace */
+ -	MLX5_IB_ATTR_CREATE_FLOW_ACTION_FLAGS = (1U << UVERBS_ID_NS_SHIFT),
+++<<<<<<< HEAD:drivers/net/ethernet/chelsio/cxgb4/srq.h
+ +struct srq_data {
+ +	unsigned int srq_size;
+ +	struct srq_entry *entryp;
+ +	struct completion comp;
+ +	struct mutex lock; /* generic mutex for srq data */
+  };
+  
+ +struct srq_data *t4_init_srq(int srq_size);
+ +int cxgb4_get_srq_entry(struct net_device *dev,
+ +			int srq_idx, struct srq_entry *entryp);
+ +void do_srq_table_rpl(struct adapter *adap,
+ +		      const struct cpl_srq_table_rpl *rpl);
+ +#endif  /* __CXGB4_SRQ_H */
+++=======
++ enum mlx5_ib_alloc_dm_attrs {
++ 	MLX5_IB_ATTR_ALLOC_DM_RESP_START_OFFSET = (1U << UVERBS_ID_NS_SHIFT),
++ 	MLX5_IB_ATTR_ALLOC_DM_RESP_PAGE_INDEX,
++ };
++ 
++ #endif
+++>>>>>>> 24da00164f7a (IB/mlx5: Device memory support in mlx5_ib):include/uapi/rdma/mlx5_user_ioctl_cmds.h
+diff --git a/drivers/infiniband/hw/mlx5/cmd.c b/drivers/infiniband/hw/mlx5/cmd.c
+index 6f6712f87a73..55a227cc8609 100644
+--- a/drivers/infiniband/hw/mlx5/cmd.c
++++ b/drivers/infiniband/hw/mlx5/cmd.c
+@@ -66,3 +66,109 @@ int mlx5_cmd_modify_cong_params(struct mlx5_core_dev *dev,
+ 
+ 	return mlx5_cmd_exec(dev, in, in_size, out, sizeof(out));
+ }
++
++int mlx5_cmd_alloc_memic(struct mlx5_memic *memic, phys_addr_t *addr,
++			  u64 length, u32 alignment)
++{
++	struct mlx5_core_dev *dev = memic->dev;
++	u64 num_memic_hw_pages = MLX5_CAP_DEV_MEM(dev, memic_bar_size)
++					>> PAGE_SHIFT;
++	u64 hw_start_addr = MLX5_CAP64_DEV_MEM(dev, memic_bar_start_addr);
++	u32 max_alignment = MLX5_CAP_DEV_MEM(dev, log_max_memic_addr_alignment);
++	u32 num_pages = DIV_ROUND_UP(length, PAGE_SIZE);
++	u32 out[MLX5_ST_SZ_DW(alloc_memic_out)] = {};
++	u32 in[MLX5_ST_SZ_DW(alloc_memic_in)] = {};
++	u32 mlx5_alignment;
++	u64 page_idx = 0;
++	int ret = 0;
++
++	if (!length || (length & MLX5_MEMIC_ALLOC_SIZE_MASK))
++		return -EINVAL;
++
++	/* mlx5 device sets alignment as 64*2^driver_value
++	 * so normalizing is needed.
++	 */
++	mlx5_alignment = (alignment < MLX5_MEMIC_BASE_ALIGN) ? 0 :
++			 alignment - MLX5_MEMIC_BASE_ALIGN;
++	if (mlx5_alignment > max_alignment)
++		return -EINVAL;
++
++	MLX5_SET(alloc_memic_in, in, opcode, MLX5_CMD_OP_ALLOC_MEMIC);
++	MLX5_SET(alloc_memic_in, in, range_size, num_pages * PAGE_SIZE);
++	MLX5_SET(alloc_memic_in, in, memic_size, length);
++	MLX5_SET(alloc_memic_in, in, log_memic_addr_alignment,
++		 mlx5_alignment);
++
++	do {
++		spin_lock(&memic->memic_lock);
++		page_idx = bitmap_find_next_zero_area(memic->memic_alloc_pages,
++						      num_memic_hw_pages,
++						      page_idx,
++						      num_pages, 0);
++
++		if (page_idx + num_pages <= num_memic_hw_pages)
++			bitmap_set(memic->memic_alloc_pages,
++				   page_idx, num_pages);
++		else
++			ret = -ENOMEM;
++
++		spin_unlock(&memic->memic_lock);
++
++		if (ret)
++			return ret;
++
++		MLX5_SET64(alloc_memic_in, in, range_start_addr,
++			   hw_start_addr + (page_idx * PAGE_SIZE));
++
++		ret = mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
++		if (ret) {
++			spin_lock(&memic->memic_lock);
++			bitmap_clear(memic->memic_alloc_pages,
++				     page_idx, num_pages);
++			spin_unlock(&memic->memic_lock);
++
++			if (ret == -EAGAIN) {
++				page_idx++;
++				continue;
++			}
++
++			return ret;
++		}
++
++		*addr = pci_resource_start(dev->pdev, 0) +
++			MLX5_GET64(alloc_memic_out, out, memic_start_addr);
++
++		return ret;
++	} while (page_idx < num_memic_hw_pages);
++
++	return ret;
++}
++
++int mlx5_cmd_dealloc_memic(struct mlx5_memic *memic, u64 addr, u64 length)
++{
++	struct mlx5_core_dev *dev = memic->dev;
++	u64 hw_start_addr = MLX5_CAP64_DEV_MEM(dev, memic_bar_start_addr);
++	u32 num_pages = DIV_ROUND_UP(length, PAGE_SIZE);
++	u32 out[MLX5_ST_SZ_DW(dealloc_memic_out)] = {0};
++	u32 in[MLX5_ST_SZ_DW(dealloc_memic_in)] = {0};
++	u64 start_page_idx;
++	int err;
++
++	addr -= pci_resource_start(dev->pdev, 0);
++	start_page_idx = (addr - hw_start_addr) >> PAGE_SHIFT;
++
++	MLX5_SET(dealloc_memic_in, in, opcode, MLX5_CMD_OP_DEALLOC_MEMIC);
++	MLX5_SET64(dealloc_memic_in, in, memic_start_addr, addr);
++	MLX5_SET(dealloc_memic_in, in, memic_size, length);
++
++	err =  mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
++
++	if (!err) {
++		spin_lock(&memic->memic_lock);
++		bitmap_clear(memic->memic_alloc_pages,
++			     start_page_idx, num_pages);
++		spin_unlock(&memic->memic_lock);
++	}
++
++	return err;
++}
+diff --git a/drivers/infiniband/hw/mlx5/cmd.h b/drivers/infiniband/hw/mlx5/cmd.h
+index 78ffded7cc2c..e7206c8a8011 100644
+--- a/drivers/infiniband/hw/mlx5/cmd.h
++++ b/drivers/infiniband/hw/mlx5/cmd.h
+@@ -33,6 +33,7 @@
+ #ifndef MLX5_IB_CMD_H
+ #define MLX5_IB_CMD_H
+ 
++#include "mlx5_ib.h"
+ #include <linux/kernel.h>
+ #include <linux/mlx5/driver.h>
+ 
+@@ -41,4 +42,7 @@ int mlx5_cmd_query_cong_params(struct mlx5_core_dev *dev, int cong_point,
+ 			       void *out, int out_size);
+ int mlx5_cmd_modify_cong_params(struct mlx5_core_dev *mdev,
+ 				void *in, int in_size);
++int mlx5_cmd_alloc_memic(struct mlx5_memic *memic, phys_addr_t *addr,
++			 u64 length, u32 alignment);
++int mlx5_cmd_dealloc_memic(struct mlx5_memic *memic, u64 addr, u64 length);
+ #endif /* MLX5_IB_CMD_H */
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/srq.h
+diff --git a/include/linux/mlx5/mlx5_ifc.h b/include/linux/mlx5/mlx5_ifc.h
+index 4a01909336e7..0e0ba8a6bf73 100644
+--- a/include/linux/mlx5/mlx5_ifc.h
++++ b/include/linux/mlx5/mlx5_ifc.h
+@@ -92,6 +92,8 @@ enum {
+ 	MLX5_CMD_OP_DESTROY_MKEY                  = 0x202,
+ 	MLX5_CMD_OP_QUERY_SPECIAL_CONTEXTS        = 0x203,
+ 	MLX5_CMD_OP_PAGE_FAULT_RESUME             = 0x204,
++	MLX5_CMD_OP_ALLOC_MEMIC                   = 0x205,
++	MLX5_CMD_OP_DEALLOC_MEMIC                 = 0x206,
+ 	MLX5_CMD_OP_CREATE_EQ                     = 0x301,
+ 	MLX5_CMD_OP_DESTROY_EQ                    = 0x302,
+ 	MLX5_CMD_OP_QUERY_EQ                      = 0x303,
+@@ -8954,4 +8956,57 @@ struct mlx5_ifc_destroy_vport_lag_in_bits {
+ 	u8         reserved_at_40[0x40];
+ };
+ 
++struct mlx5_ifc_alloc_memic_in_bits {
++	u8         opcode[0x10];
++	u8         reserved_at_10[0x10];
++
++	u8         reserved_at_20[0x10];
++	u8         op_mod[0x10];
++
++	u8         reserved_at_30[0x20];
++
++	u8	   reserved_at_40[0x18];
++	u8	   log_memic_addr_alignment[0x8];
++
++	u8         range_start_addr[0x40];
++
++	u8         range_size[0x20];
++
++	u8         memic_size[0x20];
++};
++
++struct mlx5_ifc_alloc_memic_out_bits {
++	u8         status[0x8];
++	u8         reserved_at_8[0x18];
++
++	u8         syndrome[0x20];
++
++	u8         memic_start_addr[0x40];
++};
++
++struct mlx5_ifc_dealloc_memic_in_bits {
++	u8         opcode[0x10];
++	u8         reserved_at_10[0x10];
++
++	u8         reserved_at_20[0x10];
++	u8         op_mod[0x10];
++
++	u8         reserved_at_40[0x40];
++
++	u8         memic_start_addr[0x40];
++
++	u8         memic_size[0x20];
++
++	u8         reserved_at_e0[0x20];
++};
++
++struct mlx5_ifc_dealloc_memic_out_bits {
++	u8         status[0x8];
++	u8         reserved_at_8[0x18];
++
++	u8         syndrome[0x20];
++
++	u8         reserved_at_40[0x40];
++};
++
+ #endif /* MLX5_IFC_H */
+diff --git a/include/uapi/rdma/mlx5-abi.h b/include/uapi/rdma/mlx5-abi.h
+index f2aa380722a6..8e503861c848 100644
+--- a/include/uapi/rdma/mlx5-abi.h
++++ b/include/uapi/rdma/mlx5-abi.h
+@@ -429,6 +429,7 @@ enum mlx5_ib_mmap_cmd {
+ 	MLX5_IB_MMAP_CORE_CLOCK                 = 5,
+ 	MLX5_IB_MMAP_ALLOC_WC                   = 6,
+ 	MLX5_IB_MMAP_CLOCK_INFO                 = 7,
++	MLX5_IB_MMAP_DEVICE_MEM                 = 8,
+ };
+ 
+ enum {
