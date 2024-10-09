@@ -1,0 +1,244 @@
+ovl: verify upper root dir matches lower root dir
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit 8b88a2e6403638b56556ed5b1c60d9318eefea9c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8b88a2e6.failed
+
+When inodes index feature is enabled, verify that the file handle stored
+in upper root dir matches the lower root dir or fail to mount.
+
+If upper root dir has no stored file handle, encode and store the lower
+root dir file handle in overlay.origin xattr.
+
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 8b88a2e6403638b56556ed5b1c60d9318eefea9c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/copy_up.c
+#	fs/overlayfs/namei.c
+#	fs/overlayfs/overlayfs.h
+#	fs/overlayfs/super.c
+diff --cc fs/overlayfs/copy_up.c
+index 6e96b99a973d,42807cb57da0..000000000000
+--- a/fs/overlayfs/copy_up.c
++++ b/fs/overlayfs/copy_up.c
+@@@ -264,9 -233,85 +264,87 @@@ int ovl_set_attr(struct dentry *upperde
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct ovl_fh *ovl_encode_fh(struct dentry *lower)
++ {
++ 	struct ovl_fh *fh;
++ 	int fh_type, fh_len, dwords;
++ 	void *buf;
++ 	int buflen = MAX_HANDLE_SZ;
++ 	uuid_t *uuid = &lower->d_sb->s_uuid;
++ 
++ 	buf = kmalloc(buflen, GFP_TEMPORARY);
++ 	if (!buf)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	/*
++ 	 * We encode a non-connectable file handle for non-dir, because we
++ 	 * only need to find the lower inode number and we don't want to pay
++ 	 * the price or reconnecting the dentry.
++ 	 */
++ 	dwords = buflen >> 2;
++ 	fh_type = exportfs_encode_fh(lower, buf, &dwords, 0);
++ 	buflen = (dwords << 2);
++ 
++ 	fh = ERR_PTR(-EIO);
++ 	if (WARN_ON(fh_type < 0) ||
++ 	    WARN_ON(buflen > MAX_HANDLE_SZ) ||
++ 	    WARN_ON(fh_type == FILEID_INVALID))
++ 		goto out;
++ 
++ 	BUILD_BUG_ON(MAX_HANDLE_SZ + offsetof(struct ovl_fh, fid) > 255);
++ 	fh_len = offsetof(struct ovl_fh, fid) + buflen;
++ 	fh = kmalloc(fh_len, GFP_KERNEL);
++ 	if (!fh) {
++ 		fh = ERR_PTR(-ENOMEM);
++ 		goto out;
++ 	}
++ 
++ 	fh->version = OVL_FH_VERSION;
++ 	fh->magic = OVL_FH_MAGIC;
++ 	fh->type = fh_type;
++ 	fh->flags = OVL_FH_FLAG_CPU_ENDIAN;
++ 	fh->len = fh_len;
++ 	fh->uuid = *uuid;
++ 	memcpy(fh->fid, buf, buflen);
++ 
++ out:
++ 	kfree(buf);
++ 	return fh;
++ }
++ 
++ static int ovl_set_origin(struct dentry *dentry, struct dentry *lower,
++ 			  struct dentry *upper)
++ {
++ 	const struct ovl_fh *fh = NULL;
++ 	int err;
++ 
++ 	/*
++ 	 * When lower layer doesn't support export operations store a 'null' fh,
++ 	 * so we can use the overlay.origin xattr to distignuish between a copy
++ 	 * up and a pure upper inode.
++ 	 */
++ 	if (ovl_can_decode_fh(lower->d_sb)) {
++ 		fh = ovl_encode_fh(lower);
++ 		if (IS_ERR(fh))
++ 			return PTR_ERR(fh);
++ 	}
++ 
++ 	/*
++ 	 * Do not fail when upper doesn't support xattrs.
++ 	 */
++ 	err = ovl_check_setxattr(dentry, upper, OVL_XATTR_ORIGIN, fh,
++ 				 fh ? fh->len : 0, 0);
++ 	kfree(fh);
++ 
++ 	return err;
++ }
++ 
+++>>>>>>> 8b88a2e64036 (ovl: verify upper root dir matches lower root dir)
+  static int ovl_copy_up_locked(struct dentry *workdir, struct dentry *upperdir,
+  			      struct dentry *dentry, struct path *lowerpath,
+ -			      struct kstat *stat, const char *link,
+ -			      struct kstat *pstat, bool tmpfile)
+ +			      struct kstat *stat, const char *link)
+  {
+  	struct inode *wdir = workdir->d_inode;
+  	struct inode *udir = upperdir->d_inode;
+diff --cc fs/overlayfs/overlayfs.h
+index 952ccab31629,38ac84cba6ea..000000000000
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@@ -151,27 -195,48 +151,65 @@@ int ovl_path_next(int idx, struct dentr
+  struct dentry *ovl_dentry_upper(struct dentry *dentry);
+  struct dentry *ovl_dentry_lower(struct dentry *dentry);
+  struct dentry *ovl_dentry_real(struct dentry *dentry);
+ -struct inode *ovl_inode_upper(struct inode *inode);
+ -struct inode *ovl_inode_lower(struct inode *inode);
+ -struct inode *ovl_inode_real(struct inode *inode);
+ +struct vfsmount *ovl_entry_mnt_real(struct ovl_entry *oe, struct inode *inode,
+ +				    bool is_upper);
+  struct ovl_dir_cache *ovl_dir_cache(struct dentry *dentry);
+  void ovl_set_dir_cache(struct dentry *dentry, struct ovl_dir_cache *cache);
+ +struct dentry *ovl_workdir(struct dentry *dentry);
+ +int ovl_want_write(struct dentry *dentry);
+ +void ovl_drop_write(struct dentry *dentry);
+  bool ovl_dentry_is_opaque(struct dentry *dentry);
+++<<<<<<< HEAD
+++=======
++ bool ovl_dentry_is_whiteout(struct dentry *dentry);
++ void ovl_dentry_set_opaque(struct dentry *dentry);
++ bool ovl_redirect_dir(struct super_block *sb);
++ const char *ovl_dentry_get_redirect(struct dentry *dentry);
++ void ovl_dentry_set_redirect(struct dentry *dentry, const char *redirect);
++ void ovl_inode_init(struct inode *inode, struct dentry *upperdentry,
++ 		    struct dentry *lowerdentry);
++ void ovl_inode_update(struct inode *inode, struct dentry *upperdentry);
++ void ovl_dentry_version_inc(struct dentry *dentry);
++ u64 ovl_dentry_version_get(struct dentry *dentry);
++ bool ovl_is_whiteout(struct dentry *dentry);
++ struct file *ovl_path_open(struct path *path, int flags);
++ int ovl_copy_up_start(struct dentry *dentry);
++ void ovl_copy_up_end(struct dentry *dentry);
++ bool ovl_check_dir_xattr(struct dentry *dentry, const char *name);
++ int ovl_check_setxattr(struct dentry *dentry, struct dentry *upperdentry,
++ 		       const char *name, const void *value, size_t size,
++ 		       int xerr);
++ int ovl_set_impure(struct dentry *dentry, struct dentry *upperdentry);
++ void ovl_set_flag(unsigned long flag, struct inode *inode);
++ bool ovl_test_flag(unsigned long flag, struct inode *inode);
++ bool ovl_inuse_trylock(struct dentry *dentry);
++ void ovl_inuse_unlock(struct dentry *dentry);
++ 
++ static inline bool ovl_is_impuredir(struct dentry *dentry)
++ {
++ 	return ovl_check_dir_xattr(dentry, OVL_XATTR_IMPURE);
++ }
++ 
++ 
++ /* namei.c */
++ int ovl_verify_origin(struct dentry *dentry, struct vfsmount *mnt,
++ 		      struct dentry *origin, bool set);
++ int ovl_path_next(int idx, struct dentry *dentry, struct path *path);
++ struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags);
+++>>>>>>> 8b88a2e64036 (ovl: verify upper root dir matches lower root dir)
+  bool ovl_lower_positive(struct dentry *dentry);
+ +bool ovl_dentry_is_whiteout(struct dentry *dentry);
+ +void ovl_dentry_set_opaque(struct dentry *dentry, bool opaque);
+ +bool ovl_is_whiteout(struct dentry *dentry);
+ +const struct cred *ovl_override_creds(struct super_block *sb);
+ +void ovl_dentry_update(struct dentry *dentry, struct dentry *upperdentry);
+ +void ovl_inode_update(struct inode *inode, struct inode *upperinode);
+ +struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry,
+ +			  unsigned int flags);
+ +struct file *ovl_path_open(struct path *path, int flags);
+ +
+ +struct dentry *ovl_upper_create(struct dentry *upperdir, struct dentry *dentry,
+ +				struct kstat *stat, const char *link);
+  
+  /* readdir.c */
+  extern const struct file_operations ovl_dir_operations;
+diff --cc fs/overlayfs/super.c
+index aaf06952d88f,bfdcff0f3168..000000000000
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@@ -1434,11 -1044,36 +1434,39 @@@ static int ovl_fill_super(struct super_
+  	/* If the upper fs is nonexistent, we mark overlayfs r/o too */
+  	if (!ufs->upper_mnt)
+  		sb->s_flags |= MS_RDONLY;
+++<<<<<<< HEAD
+++=======
++ 	else if (ufs->upper_mnt->mnt_sb != ufs->same_sb)
++ 		ufs->same_sb = NULL;
++ 
++ 	if (!(ovl_force_readonly(ufs)) && ufs->config.index) {
++ 		/* Verify lower root is upper root origin */
++ 		err = ovl_verify_origin(upperpath.dentry, ufs->lower_mnt[0],
++ 					stack[0].dentry, true);
++ 		if (err) {
++ 			pr_err("overlayfs: failed to verify upper root origin\n");
++ 			goto out_put_lower_mnt;
++ 		}
++ 
++ 		ufs->indexdir = ovl_workdir_create(sb, ufs, workpath.dentry,
++ 						   OVL_INDEXDIR_NAME, true);
++ 		err = PTR_ERR(ufs->indexdir);
++ 		if (IS_ERR(ufs->indexdir))
++ 			goto out_put_lower_mnt;
++ 
++ 		if (!ufs->indexdir)
++ 			pr_warn("overlayfs: try deleting index dir or mounting with '-o index=off' to disable inodes index.\n");
++ 	}
++ 
++ 	/* Show index=off/on in /proc/mounts for any of the reasons above */
++ 	if (!ufs->indexdir)
++ 		ufs->config.index = false;
+++>>>>>>> 8b88a2e64036 (ovl: verify upper root dir matches lower root dir)
+  
+  	if (remote)
+ -		sb->s_d_op = &ovl_reval_dentry_operations;
+ +		sb->s_d_op = &ovl_reval_dentry_operations.ops;
+  	else
+ -		sb->s_d_op = &ovl_dentry_operations;
+ +		sb->s_d_op = &ovl_dentry_operations.ops;
+  
+  	ufs->creator_cred = cred = prepare_creds();
+  	if (!cred)
+* Unmerged path fs/overlayfs/namei.c
+* Unmerged path fs/overlayfs/copy_up.c
+* Unmerged path fs/overlayfs/namei.c
+* Unmerged path fs/overlayfs/overlayfs.h
+* Unmerged path fs/overlayfs/super.c
