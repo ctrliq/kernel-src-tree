@@ -1,0 +1,147 @@
+md/raid5-cache: adjust the write position of the empty block if no data blocks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [md] raid5-cache: adjust the write position of the empty block if no data blocks (Jes Sorensen) [1380016]
+Rebuild_FUZZ: 98.04%
+commit-author JackieLiu <liuyun01@kylinos.cn>
+commit 43b9674832cc41ad0ad7b7e2ec397e47dcd5f6c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/43b96748.failed
+
+When recovery is complete, we write an empty block and record his
+position first, then make the data-only stripes rewritten done,
+the location of the empty block as the last checkpoint position
+to write into the super block. And we should update last_checkpoint
+to this empty block position.
+
+------------------------------------------------------------------
+|  old log       | empty block | data only stripes | invalid log |
+------------------------------------------------------------------
+^                ^                                 ^
+|                |- log->last_checkpoint           |- log->log_start
+|                |- log->last_cp_seq               |- log->next_checkpoint
+|- log->seq=n    |- log->seq=10+n
+
+At the same time, if there is no data-only stripes, this scene may appear,
+| meta1 | meta2 | meta3 |
+meta 1 is valid, meta 2 is invalid. meta 3 could be valid. so we should
+The solution is we create a new meta in meta2 with its seq == meta1's
+seq + 10 and let superblock points to meta2.
+
+	Signed-off-by: JackieLiu <liuyun01@kylinos.cn>
+	Reviewed-by: Zhengyuan Liu <liuzhengyuan@kylinos.cn>
+	Reviewed-by: Song Liu <songliubraving@fb.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 43b9674832cc41ad0ad7b7e2ec397e47dcd5f6c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid5-cache.c
+diff --cc drivers/md/raid5-cache.c
+index c6ed6dc6889f,5efb876a588d..000000000000
+--- a/drivers/md/raid5-cache.c
++++ b/drivers/md/raid5-cache.c
+@@@ -1658,7 -2133,11 +1657,13 @@@ r5c_recovery_rewrite_data_only_stripes(
+  
+  static int r5l_recovery_log(struct r5l_log *log)
+  {
+ -	struct mddev *mddev = log->rdev->mddev;
+  	struct r5l_recovery_ctx ctx;
+++<<<<<<< HEAD
+++=======
++ 	int ret;
++ 	sector_t pos;
++ 	struct stripe_head *sh;
+++>>>>>>> 43b9674832cc (md/raid5-cache: adjust the write position of the empty block if no data blocks)
+  
+  	ctx.pos = log->last_checkpoint;
+  	ctx.seq = log->last_cp_seq;
+@@@ -1670,47 -2149,44 +1675,82 @@@
+  	if (!ctx.meta_page)
+  		return -ENOMEM;
+  
+ -	ret = r5c_recovery_flush_log(log, &ctx);
+ +	r5l_recovery_flush_log(log, &ctx);
+  	__free_page(ctx.meta_page);
+  
+ -	if (ret)
+ -		return ret;
+ +	/*
+ +	 * we did a recovery. Now ctx.pos points to an invalid meta block. New
+ +	 * log will start here. but we can't let superblock point to last valid
+ +	 * meta block. The log might looks like:
+ +	 * | meta 1| meta 2| meta 3|
+ +	 * meta 1 is valid, meta 2 is invalid. meta 3 could be valid. If
+ +	 * superblock points to meta 1, we write a new valid meta 2n.  if crash
+ +	 * happens again, new recovery will start from meta 1. Since meta 2n is
+ +	 * valid now, recovery will think meta 3 is valid, which is wrong.
+ +	 * The solution is we create a new meta in meta2 with its seq == meta
+ +	 * 1's seq + 10 and let superblock points to meta2. The same recovery will
+ +	 * not think meta 3 is a valid meta, because its seq doesn't match
+ +	 */
+ +	if (ctx.seq > log->last_cp_seq) {
+ +		int ret;
+ +
+++<<<<<<< HEAD
+ +		ret = r5l_log_write_empty_meta_block(log, ctx.pos, ctx.seq + 10);
+ +		if (ret)
+ +			return ret;
+ +		log->seq = ctx.seq + 11;
+ +		log->log_start = r5l_ring_add(log, ctx.pos, BLOCK_SECTORS);
+ +		r5l_write_super(log, ctx.pos);
+ +		log->last_checkpoint = ctx.pos;
+ +		log->next_checkpoint = ctx.pos;
+ +	} else {
+ +		log->log_start = ctx.pos;
+ +		log->seq = ctx.seq;
+ +	}
+ +
+ +	/*
+ +	 * This is to suppress "function defined but not used" warning.
+ +	 * It will be removed when the two functions are used (next patch).
+ +	 */
+ +	if (!log) {
+ +		r5c_recovery_flush_log(log, &ctx);
+ +		r5c_recovery_rewrite_data_only_stripes(log, &ctx);
+ +	}
+  
+++=======
++        pos = ctx.pos;
++        ctx.seq += 10;
++ 
++ 	if (ctx.data_only_stripes == 0) {
++ 		log->next_checkpoint = ctx.pos;
++ 		r5l_log_write_empty_meta_block(log, ctx.pos, ctx.seq++);
++ 		ctx.pos = r5l_ring_add(log, ctx.pos, BLOCK_SECTORS);
++ 	} else {
++ 		sh = list_last_entry(&ctx.cached_list, struct stripe_head, lru);
++ 		log->next_checkpoint = sh->log_start;
++ 	}
++ 
++ 	if ((ctx.data_only_stripes == 0) && (ctx.data_parity_stripes == 0))
++ 		pr_debug("md/raid:%s: starting from clean shutdown\n",
++ 			 mdname(mddev));
++ 	else {
++ 		pr_debug("md/raid:%s: recoverying %d data-only stripes and %d data-parity stripes\n",
++ 			 mdname(mddev), ctx.data_only_stripes,
++ 			 ctx.data_parity_stripes);
++ 
++ 		if (ctx.data_only_stripes > 0)
++ 			if (r5c_recovery_rewrite_data_only_stripes(log, &ctx)) {
++ 				pr_err("md/raid:%s: failed to rewrite stripes to journal\n",
++ 				       mdname(mddev));
++ 				return -EIO;
++ 			}
++ 	}
++ 
++ 	log->log_start = ctx.pos;
++ 	log->seq = ctx.seq;
++ 	log->last_checkpoint = pos;
++ 	r5l_write_super(log, pos);
+++>>>>>>> 43b9674832cc (md/raid5-cache: adjust the write position of the empty block if no data blocks)
+  	return 0;
+  }
+  
+* Unmerged path drivers/md/raid5-cache.c
