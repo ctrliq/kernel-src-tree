@@ -1,0 +1,260 @@
+s390/qeth: ensure linear access to packet headers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit f677fcb9aeb60c523ee36c1061ef2249b558d1b5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/f677fcb9.failed
+
+When the RX path builds non-linear skbs, the packet headers can
+currently spill over into page fragments. Depending on the packet type
+and what fields we need to access in the headers, this could cause us
+to go past the end of skb->data.
+
+So for non-linear packets, copy precisely the length of the necessary
+headers ('linear_len') into skb->data.
+And don't copy more, upper-level protocols will peel whatever additional
+packet headers they need.
+
+Fixes: 4a71df50047f ("qeth: new qeth device driver")
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f677fcb9aeb60c523ee36c1061ef2249b558d1b5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core_main.c
+diff --cc drivers/s390/net/qeth_core_main.c
+index b1a62a620d2b,634913112441..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -5104,49 -5028,20 +5104,62 @@@ out
+  }
+  EXPORT_SYMBOL_GPL(qeth_core_hardsetup_card);
+  
+++<<<<<<< HEAD
+ +static inline int qeth_create_skb_frag(struct qeth_qdio_buffer *qethbuffer,
+ +		struct qdio_buffer_element *element,
+ +		struct sk_buff **pskb, int offset, int *pfrag, int data_len)
+ +{
+ +	struct page *page = virt_to_page(element->addr);
+ +	if (*pskb == NULL) {
+ +		if (qethbuffer->rx_skb) {
+ +			/* only if qeth_card.options.cq == QETH_CQ_ENABLED */
+ +			*pskb = qethbuffer->rx_skb;
+ +			qethbuffer->rx_skb = NULL;
+ +		} else {
+ +			*pskb = dev_alloc_skb(QETH_RX_PULL_LEN + ETH_HLEN);
+ +			if (!(*pskb))
+ +				return -ENOMEM;
+ +		}
+ +
+ +		skb_reserve(*pskb, ETH_HLEN);
+ +		if (data_len <= QETH_RX_PULL_LEN) {
+ +			memcpy(skb_put(*pskb, data_len), element->addr + offset,
+ +				data_len);
+ +		} else {
+ +			get_page(page);
+ +			memcpy(skb_put(*pskb, QETH_RX_PULL_LEN),
+ +			       element->addr + offset, QETH_RX_PULL_LEN);
+ +			skb_fill_page_desc(*pskb, *pfrag, page,
+ +				offset + QETH_RX_PULL_LEN,
+ +				data_len - QETH_RX_PULL_LEN);
+ +			(*pskb)->data_len += data_len - QETH_RX_PULL_LEN;
+ +			(*pskb)->len      += data_len - QETH_RX_PULL_LEN;
+ +			(*pskb)->truesize += data_len - QETH_RX_PULL_LEN;
+ +			(*pfrag)++;
+ +		}
+ +	} else {
+ +		get_page(page);
+ +		skb_fill_page_desc(*pskb, *pfrag, page, offset, data_len);
+ +		(*pskb)->data_len += data_len;
+ +		(*pskb)->len      += data_len;
+ +		(*pskb)->truesize += data_len;
+ +		(*pfrag)++;
+ +	}
+ +
+++=======
++ static void qeth_create_skb_frag(struct sk_buff *skb, char *data, int data_len)
++ {
++ 	struct page *page = virt_to_page(data);
++ 	unsigned int next_frag;
++ 
++ 	next_frag = skb_shinfo(skb)->nr_frags;
++ 	get_page(page);
++ 	skb_add_rx_frag(skb, next_frag, page, offset_in_page(data), data_len,
++ 			data_len);
++ }
+++>>>>>>> f677fcb9aeb6 (s390/qeth: ensure linear access to packet headers)
+  
+ -static inline int qeth_is_last_sbale(struct qdio_buffer_element *sbale)
+ -{
+ -	return (sbale->eflags & SBAL_EFLAGS_LAST_ENTRY);
+ +	return 0;
+  }
+  
+  struct sk_buff *qeth_core_get_next_skb(struct qeth_card *card,
+@@@ -5156,17 -5051,16 +5169,26 @@@
+  {
+  	struct qdio_buffer_element *element = *__element;
+  	struct qdio_buffer *buffer = qethbuffer->buffer;
+++<<<<<<< HEAD
+ +	int offset = *__offset;
+ +	struct sk_buff *skb = NULL;
+ +	int skb_len = 0;
+ +	void *data_ptr;
+ +	int data_len;
+ +	int headroom = 0;
+ +	int use_rx_sg = 0;
+ +	int frag = 0;
+++=======
++ 	unsigned int linear_len = 0;
++ 	int offset = *__offset;
++ 	bool use_rx_sg = false;
++ 	unsigned int headroom;
++ 	struct sk_buff *skb;
++ 	int skb_len = 0;
+++>>>>>>> f677fcb9aeb6 (s390/qeth: ensure linear access to packet headers)
+  
+ -next_packet:
+  	/* qeth_hdr must not cross element boundaries */
+ -	while (element->length < offset + sizeof(struct qeth_hdr)) {
+ +	if (element->length < offset + sizeof(struct qeth_hdr)) {
+  		if (qeth_is_last_sbale(element))
+  			return NULL;
+  		element++;
+@@@ -5190,39 -5101,73 +5212,78 @@@
+  		headroom = sizeof(struct qeth_hdr);
+  		break;
+  	default:
+ -		if ((*hdr)->hdr.l2.id & QETH_HEADER_MASK_INVAL)
+ -			QETH_CARD_STAT_INC(card, rx_frame_errors);
+ -		else
+ -			QETH_CARD_STAT_INC(card, rx_dropped_notsupp);
+ +		break;
+ +	}
+  
+ -		/* Can't determine packet length, drop the whole buffer. */
+ +	if (!skb_len)
+  		return NULL;
+ -	}
+  
+ -	if (skb_len < linear_len) {
+ -		QETH_CARD_STAT_INC(card, rx_dropped_runt);
+ -		goto walk_packet;
+ +	if (((skb_len >= card->options.rx_sg_cb) &&
+ +	     (!(card->info.type == QETH_CARD_TYPE_OSN)) &&
+ +	     (!atomic_read(&card->force_alloc_skb))) ||
+ +	    (card->options.cq == QETH_CQ_ENABLED)) {
+ +		use_rx_sg = 1;
+ +	} else {
+++<<<<<<< HEAD
+ +		skb = dev_alloc_skb(skb_len + headroom);
+ +		if (!skb)
+ +			goto no_mem;
+ +		if (headroom)
+ +			skb_reserve(skb, headroom);
+  	}
+  
+ -	use_rx_sg = (card->options.cq == QETH_CQ_ENABLED) ||
+ -		    ((skb_len >= card->options.rx_sg_cb) &&
+ -		     !atomic_read(&card->force_alloc_skb) &&
+ -		     !IS_OSN(card));
+ -
+ -	if (use_rx_sg && qethbuffer->rx_skb) {
+ -		/* QETH_CQ_ENABLED only: */
+ -		skb = qethbuffer->rx_skb;
+ -		qethbuffer->rx_skb = NULL;
+ -	} else {
+ +	data_ptr = element->addr + offset;
+ +	while (skb_len) {
+ +		data_len = min(skb_len, (int)(element->length - offset));
+ +		if (data_len) {
+ +			if (use_rx_sg) {
+ +				if (qeth_create_skb_frag(qethbuffer, element,
+ +				    &skb, offset, &frag, data_len))
+ +					goto no_mem;
+ +			} else {
+ +				memcpy(skb_put(skb, data_len), data_ptr,
+ +					data_len);
+ +			}
+ +		}
+++=======
++ 		if (!use_rx_sg)
++ 			linear_len = skb_len;
++ 		skb = napi_alloc_skb(&card->napi, linear_len + headroom);
++ 	}
++ 
++ 	if (!skb)
++ 		QETH_CARD_STAT_INC(card, rx_dropped_nomem);
++ 	else if (headroom)
++ 		skb_reserve(skb, headroom);
++ 
++ walk_packet:
++ 	while (skb_len) {
++ 		int data_len = min(skb_len, (int)(element->length - offset));
++ 		char *data = element->addr + offset;
++ 
+++>>>>>>> f677fcb9aeb6 (s390/qeth: ensure linear access to packet headers)
+  		skb_len -= data_len;
++ 		offset += data_len;
++ 
++ 		/* Extract data from current element: */
++ 		if (skb && data_len) {
++ 			if (linear_len) {
++ 				unsigned int copy_len;
++ 
++ 				copy_len = min_t(unsigned int, linear_len,
++ 						 data_len);
++ 
++ 				skb_put_data(skb, data, copy_len);
++ 				linear_len -= copy_len;
++ 				data_len -= copy_len;
++ 				data += copy_len;
++ 			}
++ 
++ 			if (data_len)
++ 				qeth_create_skb_frag(skb, data, data_len);
++ 		}
++ 
++ 		/* Step forward to next element: */
+  		if (skb_len) {
+  			if (qeth_is_last_sbale(element)) {
+  				QETH_CARD_TEXT(card, 4, "unexeob");
+@@@ -5233,24 -5181,21 +5294,21 @@@
+  			}
+  			element++;
+  			offset = 0;
+- 			data_ptr = element->addr;
+- 		} else {
+- 			offset += data_len;
+  		}
+  	}
+ -
+ -	/* This packet was skipped, go get another one: */
+ -	if (!skb)
+ -		goto next_packet;
+ -
+  	*__element = element;
+  	*__offset = offset;
+ -	if (use_rx_sg) {
+ -		QETH_CARD_STAT_INC(card, rx_sg_skbs);
+ -		QETH_CARD_STAT_ADD(card, rx_sg_frags,
+ -				   skb_shinfo(skb)->nr_frags);
+ +	if (use_rx_sg && card->options.performance_stats) {
+ +		card->perf_stats.sg_skbs_rx++;
+ +		card->perf_stats.sg_frags_rx += skb_shinfo(skb)->nr_frags;
+  	}
+  	return skb;
+ +no_mem:
+ +	if (net_ratelimit()) {
+ +		QETH_CARD_TEXT(card, 2, "noskbmem");
+ +	}
+ +	card->stats.rx_dropped++;
+ +	return NULL;
+  }
+  EXPORT_SYMBOL_GPL(qeth_core_get_next_skb);
+  
+* Unmerged path drivers/s390/net/qeth_core_main.c
