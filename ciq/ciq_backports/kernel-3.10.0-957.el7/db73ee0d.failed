@@ -1,0 +1,101 @@
+mm, vmscan: do not loop on too_many_isolated for ever
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mm] vmscan: do not loop on too_many_isolated for ever (Waiman Long) [1632050]
+Rebuild_FUZZ: 96.08%
+commit-author Michal Hocko <mhocko@suse.com>
+commit db73ee0d463799223244e96e7b7eea73b4a6ec31
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/db73ee0d.failed
+
+Tetsuo Handa has reported[1][2][3] that direct reclaimers might get
+stuck in too_many_isolated loop basically for ever because the last few
+pages on the LRU lists are isolated by the kswapd which is stuck on fs
+locks when doing the pageout or slab reclaim.  This in turn means that
+there is nobody to actually trigger the oom killer and the system is
+basically unusable.
+
+too_many_isolated has been introduced by commit 35cd78156c49 ("vmscan:
+throttle direct reclaim when too many pages are isolated already") to
+prevent from pre-mature oom killer invocations because back then no
+reclaim progress could indeed trigger the OOM killer too early.
+
+But since the oom detection rework in commit 0a0337e0d1d1 ("mm, oom:
+rework oom detection") the allocation/reclaim retry loop considers all
+the reclaimable pages and throttles the allocation at that layer so we
+can loosen the direct reclaim throttling.
+
+Make shrink_inactive_list loop over too_many_isolated bounded and
+returns immediately when the situation hasn't resolved after the first
+sleep.
+
+Replace congestion_wait by a simple schedule_timeout_interruptible
+because we are not really waiting on the IO congestion in this path.
+
+Please note that this patch can theoretically cause the OOM killer to
+trigger earlier while there are many pages isolated for the reclaim
+which makes progress only very slowly.  This would be obvious from the
+oom report as the number of isolated pages are printed there.  If we
+ever hit this should_reclaim_retry should consider those numbers in the
+evaluation in one way or another.
+
+[1] http://lkml.kernel.org/r/201602092349.ACG81273.OSVtMJQHLOFOFF@I-love.SAKURA.ne.jp
+[2] http://lkml.kernel.org/r/201702212335.DJB30777.JOFMHSFtVLQOOF@I-love.SAKURA.ne.jp
+[3] http://lkml.kernel.org/r/201706300914.CEH95859.FMQOLVFHJFtOOS@I-love.SAKURA.ne.jp
+
+[mhocko@suse.com: switch to uninterruptible sleep]
+  Link: http://lkml.kernel.org/r/20170724065048.GB25221@dhcp22.suse.cz
+Link: http://lkml.kernel.org/r/20170710074842.23175-1-mhocko@kernel.org
+	Signed-off-by: Michal Hocko <mhocko@suse.com>
+	Reported-by: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+	Tested-by: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+	Acked-by: Mel Gorman <mgorman@suse.de>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Acked-by: Rik van Riel <riel@redhat.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit db73ee0d463799223244e96e7b7eea73b4a6ec31)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/vmscan.c
+diff --cc mm/vmscan.c
+index 4438cd89e986,1638814c7848..000000000000
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@@ -1451,18 -1738,20 +1451,29 @@@ shrink_inactive_list(unsigned long nr_t
+  	unsigned long nr_scanned;
+  	unsigned long nr_reclaimed = 0;
+  	unsigned long nr_taken;
+ -	struct reclaim_stat stat = {};
+ +	unsigned long nr_dirty = 0;
+ +	unsigned long nr_congested = 0;
+ +	unsigned long nr_unqueued_dirty = 0;
+ +	unsigned long nr_writeback = 0;
+ +	unsigned long nr_immediate = 0;
+  	isolate_mode_t isolate_mode = 0;
+  	int file = is_file_lru(lru);
+ -	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+ +	struct zone *zone = lruvec_zone(lruvec);
+  	struct zone_reclaim_stat *reclaim_stat = &lruvec->reclaim_stat;
++ 	bool stalled = false;
+  
+++<<<<<<< HEAD
+ +	while (unlikely(too_many_isolated(zone, file, sc))) {
+ +		congestion_wait(BLK_RW_ASYNC, HZ/10);
+++=======
++ 	while (unlikely(too_many_isolated(pgdat, file, sc))) {
++ 		if (stalled)
++ 			return 0;
++ 
++ 		/* wait a bit for the reclaimer. */
++ 		msleep(100);
++ 		stalled = true;
+++>>>>>>> db73ee0d4637 (mm, vmscan: do not loop on too_many_isolated for ever)
+  
+  		/* We are about to die and free our memory. Return now. */
+  		if (fatal_signal_pending(current))
+* Unmerged path mm/vmscan.c
