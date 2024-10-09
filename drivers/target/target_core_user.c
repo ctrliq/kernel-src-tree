@@ -1624,7 +1624,7 @@ static ssize_t tcmu_max_data_area_mb_show(struct config_item *item, char *page)
 }
 CONFIGFS_ATTR_RO(tcmu_, max_data_area_mb);
 
-struct configfs_attribute *tcmu_attrib_attrs[] = {
+static struct configfs_attribute *tcmu_attrib_attrs[] = {
 	&tcmu_attr_cmd_time_out,
 	&tcmu_attr_qfull_time_out,
 	&tcmu_attr_max_data_area_mb,
