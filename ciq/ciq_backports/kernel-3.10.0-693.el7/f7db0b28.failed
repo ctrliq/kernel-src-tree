@@ -1,0 +1,118 @@
+pNFS: Fix LAYOUTGET handling of NFS4ERR_BAD_STATEID and NFS4ERR_EXPIRED
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Trond Myklebust <trond.myklebust@primarydata.com>
+commit f7db0b283868411dc6bc8a223fd032b211d2d91f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f7db0b28.failed
+
+We want to recover the open stateid if there is no layout stateid
+and/or the stateid argument matches an open stateid.
+Otherwise throw out the existing layout and recover from scratch, as
+the layout stateid is bad.
+
+Fixes: 183d9e7b112aa ("pnfs: rework LAYOUTGET retry handling")
+	Cc: stable@vger.kernel.org # 4.7
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+	Reviewed-by: Jeff Layton <jlayton@redhat.com>
+(cherry picked from commit f7db0b283868411dc6bc8a223fd032b211d2d91f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4proc.c
+diff --cc fs/nfs/nfs4proc.c
+index 7856a039a425,a1a3b4c9a563..000000000000
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@@ -7994,8 -7874,19 +7994,14 @@@ static void nfs4_layoutget_done(struct 
+  	struct inode *inode = lgp->args.inode;
+  	struct nfs_server *server = NFS_SERVER(inode);
+  	struct pnfs_layout_hdr *lo;
+++<<<<<<< HEAD
+ +	struct nfs4_state *state = NULL;
+ +	unsigned long timeo, now, giveup;
+++=======
++ 	int nfs4err = task->tk_status;
++ 	int err, status = 0;
++ 	LIST_HEAD(head);
+++>>>>>>> f7db0b283868 (pNFS: Fix LAYOUTGET handling of NFS4ERR_BAD_STATEID and NFS4ERR_EXPIRED)
+  
+  	dprintk("--> %s tk_status => %d\n", __func__, -task->tk_status);
+  
+@@@ -8057,43 -7929,39 +8063,62 @@@
+  		break;
+  	case -NFS4ERR_EXPIRED:
+  	case -NFS4ERR_BAD_STATEID:
+ -		exception->timeout = 0;
+  		spin_lock(&inode->i_lock);
+- 		if (nfs4_stateid_match(&lgp->args.stateid,
++ 		lo = NFS_I(inode)->layout;
++ 		/* If the open stateid was bad, then recover it. */
++ 		if (!lo || test_bit(NFS_LAYOUT_INVALID_STID, &lo->plh_flags) ||
++ 		    nfs4_stateid_match_other(&lgp->args.stateid,
+  					&lgp->args.ctx->state->stateid)) {
+  			spin_unlock(&inode->i_lock);
+++<<<<<<< HEAD
+ +			/* If the open stateid was bad, then recover it. */
+ +			state = lgp->args.ctx->state;
+ +			break;
+ +		}
+ +		lo = NFS_I(inode)->layout;
+ +		if (lo && nfs4_stateid_match(&lgp->args.stateid,
+ +					&lo->plh_stateid)) {
+ +			LIST_HEAD(head);
+ +
+ +			/*
+ +			 * Mark the bad layout state as invalid, then retry
+ +			 * with the current stateid.
+ +			 */
+ +			set_bit(NFS_LAYOUT_INVALID_STID, &lo->plh_flags);
+ +			pnfs_mark_matching_lsegs_invalid(lo, &head, NULL);
+ +			spin_unlock(&inode->i_lock);
+ +			pnfs_free_lseg_list(&head);
+ +		} else
+ +			spin_unlock(&inode->i_lock);
+ +		goto out_restart;
+++=======
++ 			exception->state = lgp->args.ctx->state;
++ 			break;
++ 		}
++ 
++ 		/*
++ 		 * Mark the bad layout state as invalid, then retry
++ 		 */
++ 		set_bit(NFS_LAYOUT_INVALID_STID, &lo->plh_flags);
++ 		pnfs_mark_matching_lsegs_invalid(lo, &head, NULL, 0);
++ 		spin_unlock(&inode->i_lock);
++ 		pnfs_free_lseg_list(&head);
++ 		status = -EAGAIN;
++ 		goto out;
+++>>>>>>> f7db0b283868 (pNFS: Fix LAYOUTGET handling of NFS4ERR_BAD_STATEID and NFS4ERR_EXPIRED)
+  	}
+ -
+ -	err = nfs4_handle_exception(server, nfs4err, exception);
+ -	if (!status) {
+ -		if (exception->retry)
+ -			status = -EAGAIN;
+ -		else
+ -			status = err;
+ -	}
+ +	if (nfs4_async_handle_error(task, server, state, &lgp->timeout) == -EAGAIN)
+ +		goto out_restart;
+  out:
+  	dprintk("<-- %s\n", __func__);
+ -	return status;
+ +	return;
+ +out_restart:
+ +	task->tk_status = 0;
+ +	rpc_restart_call_prepare(task);
+ +	return;
+ +out_overflow:
+ +	task->tk_status = -EOVERFLOW;
+ +	goto out;
+  }
+  
+  static size_t max_response_pages(struct nfs_server *server)
+* Unmerged path fs/nfs/nfs4proc.c
