@@ -1,0 +1,160 @@
+blk-mq: split tag ->rqs[] into two
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [block] blk-mq: split tag ->rqs[] into two (Ming Lei) [1458104]
+Rebuild_FUZZ: 95.38%
+commit-author Jens Axboe <axboe@fb.com>
+commit 2af8cbe30531eca73c8f3ba277f155fc0020b01a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2af8cbe3.failed
+
+This is in preparation for having two sets of tags available. For
+that we need a static index, and a dynamically assignable one.
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+	Reviewed-by: Omar Sandoval <osandov@fb.com>
+(cherry picked from commit 2af8cbe30531eca73c8f3ba277f155fc0020b01a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index 5b92b7659b74,89b81254201b..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -251,15 -223,16 +251,20 @@@ __blk_mq_alloc_request(struct blk_mq_al
+  
+  	tag = blk_mq_get_tag(data);
+  	if (tag != BLK_MQ_TAG_FAIL) {
+- 		rq = data->hctx->tags->rqs[tag];
++ 		rq = data->hctx->tags->static_rqs[tag];
+  
+  		if (blk_mq_tag_busy(data->hctx)) {
+ -			rq->rq_flags = RQF_MQ_INFLIGHT;
+ +			rq->cmd_flags = REQ_MQ_INFLIGHT;
+  			atomic_inc(&data->hctx->nr_active);
+  		}
+  
+  		rq->tag = tag;
+++<<<<<<< HEAD
+ +		blk_mq_rq_ctx_init(data->q, data->ctx, rq, rw);
+++=======
++ 		data->hctx->tags->rqs[tag] = rq;
++ 		blk_mq_rq_ctx_init(data->q, data->ctx, rq, op);
+++>>>>>>> 2af8cbe30531 (blk-mq: split tag ->rqs[] into two)
+  		return rq;
+  	}
+  
+@@@ -1583,12 -1588,51 +1590,54 @@@ static void blk_mq_free_rq_map(struct b
+  		kmemleak_free(page_address(page));
+  		__free_pages(page, page->private);
+  	}
+ -}
+  
+ -void blk_mq_free_rq_map(struct blk_mq_tags *tags)
+ -{
+  	kfree(tags->rqs);
+++<<<<<<< HEAD
+++=======
++ 	tags->rqs = NULL;
++ 	kfree(tags->static_rqs);
++ 	tags->static_rqs = NULL;
+++>>>>>>> 2af8cbe30531 (blk-mq: split tag ->rqs[] into two)
+  
+  	blk_mq_free_tags(tags);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct blk_mq_tags *blk_mq_alloc_rq_map(struct blk_mq_tag_set *set,
++ 					unsigned int hctx_idx,
++ 					unsigned int nr_tags,
++ 					unsigned int reserved_tags)
++ {
++ 	struct blk_mq_tags *tags;
++ 
++ 	tags = blk_mq_init_tags(nr_tags, reserved_tags,
++ 				set->numa_node,
++ 				BLK_MQ_FLAG_TO_ALLOC_POLICY(set->flags));
++ 	if (!tags)
++ 		return NULL;
++ 
++ 	tags->rqs = kzalloc_node(nr_tags * sizeof(struct request *),
++ 				 GFP_NOIO | __GFP_NOWARN | __GFP_NORETRY,
++ 				 set->numa_node);
++ 	if (!tags->rqs) {
++ 		blk_mq_free_tags(tags);
++ 		return NULL;
++ 	}
++ 
++ 	tags->static_rqs = kzalloc_node(nr_tags * sizeof(struct request *),
++ 				 GFP_NOIO | __GFP_NOWARN | __GFP_NORETRY,
++ 				 set->numa_node);
++ 	if (!tags->static_rqs) {
++ 		kfree(tags->rqs);
++ 		blk_mq_free_tags(tags);
++ 		return NULL;
++ 	}
++ 
++ 	return tags;
++ }
++ 
+++>>>>>>> 2af8cbe30531 (blk-mq: split tag ->rqs[] into two)
+  static size_t order_to_size(unsigned int order)
+  {
+  	return (size_t)PAGE_SIZE << order;
+@@@ -1658,15 -1688,17 +1707,17 @@@ static struct blk_mq_tags *blk_mq_init_
+  		 */
+  		kmemleak_alloc(p, order_to_size(this_order), 1, GFP_NOIO);
+  		entries_per_page = order_to_size(this_order) / rq_size;
+ -		to_do = min(entries_per_page, depth - i);
+ +		to_do = min(entries_per_page, set->queue_depth - i);
+  		left -= to_do * rq_size;
+  		for (j = 0; j < to_do; j++) {
+- 			tags->rqs[i] = p;
++ 			struct request *rq = p;
++ 
++ 			tags->static_rqs[i] = rq;
+  			if (set->ops->init_request) {
+  				if (set->ops->init_request(set->driver_data,
+- 						tags->rqs[i], hctx_idx, i,
++ 						rq, hctx_idx, i,
+  						set->numa_node)) {
+- 					tags->rqs[i] = NULL;
++ 					tags->static_rqs[i] = NULL;
+  					goto fail;
+  				}
+  			}
+diff --git a/block/blk-mq-tag.c b/block/blk-mq-tag.c
+index 7e6885bccaac..201b38376220 100644
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@ -493,11 +493,11 @@ int blk_mq_reinit_tagset(struct blk_mq_tag_set *set)
+ 			continue;
+ 
+ 		for (j = 0; j < tags->nr_tags; j++) {
+-			if (!tags->rqs[j])
++			if (!tags->static_rqs[j])
+ 				continue;
+ 
+ 			ret = set->ops->reinit_request(set->driver_data,
+-						tags->rqs[j]);
++						tags->static_rqs[j]);
+ 			if (ret)
+ 				goto out;
+ 		}
+diff --git a/block/blk-mq-tag.h b/block/blk-mq-tag.h
+index 5cdeb865c8ff..186125a1f162 100644
+--- a/block/blk-mq-tag.h
++++ b/block/blk-mq-tag.h
+@@ -41,6 +41,7 @@ struct blk_mq_tags {
+ 	struct blk_mq_bitmap_tags breserved_tags;
+ 
+ 	struct request **rqs;
++	struct request **static_rqs;
+ 	struct list_head page_list;
+ 
+ 	cpumask_var_t cpumask;
+* Unmerged path block/blk-mq.c
