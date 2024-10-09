@@ -1,0 +1,413 @@
+sched/rt: Fix PI handling vs. sched_setscheduler()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.24.1.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit ff77e468535987b3d21b7bd4da15608ea3ce7d0b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.24.1.el7/ff77e468.failed
+
+Andrea Parri reported:
+
+> I found that the following scenario (with CONFIG_RT_GROUP_SCHED=y) is not
+> handled correctly:
+>
+>     T1 (prio = 20)
+>        lock(rtmutex);
+>
+>     T2 (prio = 20)
+>        blocks on rtmutex  (rt_nr_boosted = 0 on T1's rq)
+>
+>     T1 (prio = 20)
+>        sys_set_scheduler(prio = 0)
+>           [new_effective_prio == oldprio]
+>           T1 prio = 20    (rt_nr_boosted = 0 on T1's rq)
+>
+> The last step is incorrect as T1 is now boosted (c.f., rt_se_boosted());
+> in particular, if we continue with
+>
+>    T1 (prio = 20)
+>       unlock(rtmutex)
+>          wakeup(T2)
+>          adjust_prio(T1)
+>             [prio != rt_mutex_getprio(T1)]
+>	    dequeue(T1)
+>	       rt_nr_boosted = (unsigned long)(-1)
+>	       ...
+>             T1 prio = 0
+>
+> then we end up leaving rt_nr_boosted in an "inconsistent" state.
+>
+> The simple program attached could reproduce the previous scenario; note
+> that, as a consequence of the presence of this state, the "assertion"
+>
+>     WARN_ON(!rt_nr_running && rt_nr_boosted)
+>
+> from dec_rt_group() may trigger.
+
+So normally we dequeue/enqueue tasks in sched_setscheduler(), which
+would ensure the accounting stays correct. However in the early PI path
+we fail to do so.
+
+So this was introduced at around v3.14, by:
+
+  c365c292d059 ("sched: Consider pi boosting in setscheduler()")
+
+which fixed another problem exactly because that dequeue/enqueue, joy.
+
+Fix this by teaching rt about DEQUEUE_SAVE/ENQUEUE_RESTORE and have it
+preserve runqueue location with that option. This requires decoupling
+the on_rt_rq() state from being on the list.
+
+In order to allow for explicit movement during the SAVE/RESTORE,
+introduce {DE,EN}QUEUE_MOVE. We still must use SAVE/RESTORE in these
+cases to preserve other invariants.
+
+Respecting the SAVE/RESTORE flags also has the (nice) side-effect that
+things like sys_nice()/sys_sched_setaffinity() also do not reorder
+FIFO tasks (whereas they used to before this patch).
+
+	Reported-by: Andrea Parri <parri.andrea@gmail.com>
+	Tested-by: Andrea Parri <parri.andrea@gmail.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Juri Lelli <juri.lelli@arm.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Mike Galbraith <efault@gmx.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit ff77e468535987b3d21b7bd4da15608ea3ce7d0b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+#	kernel/sched/rt.c
+#	kernel/sched/sched.h
+diff --cc kernel/sched/core.c
+index 71c102c7b0a3,bb565b4663c8..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -4291,9 -3571,9 +4299,9 @@@ void rt_mutex_setprio(struct task_struc
+  	queued = task_on_rq_queued(p);
+  	running = task_current(rq, p);
+  	if (queued)
+- 		dequeue_task(rq, p, DEQUEUE_SAVE);
++ 		dequeue_task(rq, p, queue_flag);
+  	if (running)
+ -		put_prev_task(rq, p);
+ +		p->sched_class->put_prev_task(rq, p);
+  
+  	/*
+  	 * Boosting condition are:
+@@@ -4307,9 -3587,9 +4315,9 @@@
+  	if (dl_prio(prio)) {
+  		struct task_struct *pi_task = rt_mutex_get_top_task(p);
+  		if (!dl_prio(p->normal_prio) ||
+ -		    (pi_task && dl_entity_preempt(&pi_task->dl, &p->dl))) {
+ +			(pi_task && dl_entity_preempt(&pi_task->dl, &p->dl))) {
+  			p->dl.dl_boosted = 1;
+- 			enqueue_flag |= ENQUEUE_REPLENISH;
++ 			queue_flag |= ENQUEUE_REPLENISH;
+  		} else
+  			p->dl.dl_boosted = 0;
+  		p->sched_class = &dl_sched_class;
+@@@ -4666,9 -3968,10 +4674,10 @@@ static int __sched_setscheduler(struct 
+  	const struct sched_class *prev_class;
+  	struct rq *rq;
+  	int reset_on_fork;
++ 	int queue_flags = DEQUEUE_SAVE | DEQUEUE_MOVE;
+  
+ -	/* may grab non-irq protected spin_locks */
+ -	BUG_ON(in_interrupt());
+ +	/* The pi code expects interrupts enabled */
+ +	BUG_ON(pi && in_interrupt());
+  recheck:
+  	/* double check policy once rq lock held */
+  	if (policy < 0) {
+@@@ -4860,17 -4158,25 +4866,30 @@@ change
+  	queued = task_on_rq_queued(p);
+  	running = task_current(rq, p);
+  	if (queued)
+- 		dequeue_task(rq, p, DEQUEUE_SAVE);
++ 		dequeue_task(rq, p, queue_flags);
+  	if (running)
+ -		put_prev_task(rq, p);
+ +		p->sched_class->put_prev_task(rq, p);
+  
+  	prev_class = p->sched_class;
+  	__setscheduler(rq, p, attr, pi);
+  
+  	if (running)
+  		p->sched_class->set_curr_task(rq);
+++<<<<<<< HEAD
+ +	if (queued)
+ +		enqueue_task(rq, p, ENQUEUE_RESTORE);
+++=======
++ 	if (queued) {
++ 		/*
++ 		 * We enqueue to tail when the priority of a task is
++ 		 * increased (user space view).
++ 		 */
++ 		if (oldprio < p->prio)
++ 			queue_flags |= ENQUEUE_HEAD;
++ 
++ 		enqueue_task(rq, p, queue_flags);
++ 	}
+++>>>>>>> ff77e4685359 (sched/rt: Fix PI handling vs. sched_setscheduler())
+  
+  	check_class_changed(rq, p, prev_class, oldprio);
+  	preempt_disable(); /* avoid rq from going away on us */
+@@@ -9004,9 -7963,9 +9023,9 @@@ void sched_move_task(struct task_struc
+  	queued = task_on_rq_queued(tsk);
+  
+  	if (queued)
+- 		dequeue_task(rq, tsk, DEQUEUE_SAVE);
++ 		dequeue_task(rq, tsk, DEQUEUE_SAVE | DEQUEUE_MOVE);
+  	if (unlikely(running))
+ -		put_prev_task(rq, tsk);
+ +		tsk->sched_class->put_prev_task(rq, tsk);
+  
+  	/*
+  	 * All callers are synchronized by task_rq_lock(); we do not use RCU
+diff --cc kernel/sched/rt.c
+index dbb6a1933e97,406a9c20b210..000000000000
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@@ -398,9 -431,12 +398,9 @@@ static inline void queue_push_tasks(str
+  }
+  #endif /* CONFIG_SMP */
+  
+ -static void enqueue_top_rt_rq(struct rt_rq *rt_rq);
+ -static void dequeue_top_rt_rq(struct rt_rq *rt_rq);
+ -
+  static inline int on_rt_rq(struct sched_rt_entity *rt_se)
+  {
+- 	return !list_empty(&rt_se->run_list);
++ 	return rt_se->on_rq;
+  }
+  
+  #ifdef CONFIG_RT_GROUP_SCHED
+@@@ -460,8 -496,11 +460,16 @@@ static void sched_rt_rq_enqueue(struct 
+  	rt_se = rt_rq->tg->rt_se[cpu];
+  
+  	if (rt_rq->rt_nr_running) {
+++<<<<<<< HEAD
+ +		if (rt_se && !on_rt_rq(rt_se))
+ +			enqueue_rt_entity(rt_se, false);
+++=======
++ 		if (!rt_se)
++ 			enqueue_top_rt_rq(rt_rq);
++ 		else if (!on_rt_rq(rt_se))
++ 			enqueue_rt_entity(rt_se, 0);
++ 
+++>>>>>>> ff77e4685359 (sched/rt: Fix PI handling vs. sched_setscheduler())
+  		if (rt_rq->highest_prio.curr < curr->prio)
+  			resched_curr(rq);
+  	}
+@@@ -474,8 -513,15 +482,15 @@@ static void sched_rt_rq_dequeue(struct 
+  
+  	rt_se = rt_rq->tg->rt_se[cpu];
+  
+++<<<<<<< HEAD
+ +	if (rt_se && on_rt_rq(rt_se))
+ +		dequeue_rt_entity(rt_se);
+++=======
++ 	if (!rt_se)
++ 		dequeue_top_rt_rq(rt_rq);
++ 	else if (on_rt_rq(rt_se))
++ 		dequeue_rt_entity(rt_se, 0);
+ -}
+ -
+ -static inline int rt_rq_throttled(struct rt_rq *rt_rq)
+ -{
+ -	return rt_rq->rt_throttled && !rt_rq->rt_nr_boosted;
+++>>>>>>> ff77e4685359 (sched/rt: Fix PI handling vs. sched_setscheduler())
+  }
+  
+  static int rt_se_boosted(struct sched_rt_entity *rt_se)
+@@@ -1125,29 -1250,37 +1174,44 @@@ static void dequeue_rt_stack(struct sch
+  		back = rt_se;
+  	}
+  
+ -	dequeue_top_rt_rq(rt_rq_of_se(back));
+ -
+  	for (rt_se = back; rt_se; rt_se = rt_se->back) {
+  		if (on_rt_rq(rt_se))
+- 			__dequeue_rt_entity(rt_se);
++ 			__dequeue_rt_entity(rt_se, flags);
+  	}
+  }
+  
+- static void enqueue_rt_entity(struct sched_rt_entity *rt_se, bool head)
++ static void enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
+  {
+++<<<<<<< HEAD
+ +	dequeue_rt_stack(rt_se);
+ +	for_each_sched_rt_entity(rt_se)
+ +		__enqueue_rt_entity(rt_se, head);
+++=======
++ 	struct rq *rq = rq_of_rt_se(rt_se);
++ 
++ 	dequeue_rt_stack(rt_se, flags);
++ 	for_each_sched_rt_entity(rt_se)
++ 		__enqueue_rt_entity(rt_se, flags);
++ 	enqueue_top_rt_rq(&rq->rt);
+++>>>>>>> ff77e4685359 (sched/rt: Fix PI handling vs. sched_setscheduler())
+  }
+  
+- static void dequeue_rt_entity(struct sched_rt_entity *rt_se)
++ static void dequeue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
+  {
+++<<<<<<< HEAD
+ +	dequeue_rt_stack(rt_se);
+++=======
++ 	struct rq *rq = rq_of_rt_se(rt_se);
++ 
++ 	dequeue_rt_stack(rt_se, flags);
+++>>>>>>> ff77e4685359 (sched/rt: Fix PI handling vs. sched_setscheduler())
+  
+  	for_each_sched_rt_entity(rt_se) {
+  		struct rt_rq *rt_rq = group_rt_rq(rt_se);
+  
+  		if (rt_rq && rt_rq->rt_nr_running)
+- 			__enqueue_rt_entity(rt_se, false);
++ 			__enqueue_rt_entity(rt_se, flags);
+  	}
+ -	enqueue_top_rt_rq(&rq->rt);
+  }
+  
+  /*
+@@@ -1174,11 -1305,9 +1238,11 @@@ static void dequeue_task_rt(struct rq *
+  	struct sched_rt_entity *rt_se = &p->rt;
+  
+  	update_curr_rt(rq);
+- 	dequeue_rt_entity(rt_se);
++ 	dequeue_rt_entity(rt_se, flags);
+  
+  	dequeue_pushable_task(rq, p);
+ +
+ +	dec_nr_running(rq);
+  }
+  
+  /*
+diff --cc kernel/sched/sched.h
+index 3c78ba63cf7d,d3606e40ea0d..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -1211,59 -1127,43 +1211,95 @@@ static inline void update_load_set(stru
+  #define WEIGHT_IDLEPRIO                3
+  #define WMULT_IDLEPRIO         1431655765
+  
+ -extern const int sched_prio_to_weight[40];
+ -extern const u32 sched_prio_to_wmult[40];
+ +/*
+ + * Nice levels are multiplicative, with a gentle 10% change for every
+ + * nice level changed. I.e. when a CPU-bound task goes from nice 0 to
+ + * nice 1, it will get ~10% less CPU time than another CPU-bound task
+ + * that remained on nice 0.
+ + *
+ + * The "10% effect" is relative and cumulative: from _any_ nice level,
+ + * if you go up 1 level, it's -10% CPU usage, if you go down 1 level
+ + * it's +10% CPU usage. (to achieve that we use a multiplier of 1.25.
+ + * If a task goes up by ~10% and another task goes down by ~10% then
+ + * the relative distance between them is ~25%.)
+ + */
+ +static const int prio_to_weight[40] = {
+ + /* -20 */     88761,     71755,     56483,     46273,     36291,
+ + /* -15 */     29154,     23254,     18705,     14949,     11916,
+ + /* -10 */      9548,      7620,      6100,      4904,      3906,
+ + /*  -5 */      3121,      2501,      1991,      1586,      1277,
+ + /*   0 */      1024,       820,       655,       526,       423,
+ + /*   5 */       335,       272,       215,       172,       137,
+ + /*  10 */       110,        87,        70,        56,        45,
+ + /*  15 */        36,        29,        23,        18,        15,
+ +};
+ +
+ +/*
+ + * Inverse (2^32/x) values of the prio_to_weight[] array, precalculated.
+ + *
+ + * In cases where the weight does not change often, we can use the
+ + * precalculated inverse to speed up arithmetics by turning divisions
+ + * into multiplications:
+ + */
+ +static const u32 prio_to_wmult[40] = {
+ + /* -20 */     48388,     59856,     76040,     92818,    118348,
+ + /* -15 */    147320,    184698,    229616,    287308,    360437,
+ + /* -10 */    449829,    563644,    704093,    875809,   1099582,
+ + /*  -5 */   1376151,   1717300,   2157191,   2708050,   3363326,
+ + /*   0 */   4194304,   5237765,   6557202,   8165337,  10153587,
+ + /*   5 */  12820798,  15790321,  19976592,  24970740,  31350126,
+ + /*  10 */  39045157,  49367440,  61356676,  76695844,  95443717,
+ + /*  15 */ 119304647, 148102320, 186737708, 238609294, 286331153,
+ +};
+  
++ /*
++  * {de,en}queue flags:
++  *
++  * DEQUEUE_SLEEP  - task is no longer runnable
++  * ENQUEUE_WAKEUP - task just became runnable
++  *
++  * SAVE/RESTORE - an otherwise spurious dequeue/enqueue, done to ensure tasks
++  *                are in a known state which allows modification. Such pairs
++  *                should preserve as much state as possible.
++  *
++  * MOVE - paired with SAVE/RESTORE, explicitly does not preserve the location
++  *        in the runqueue.
++  *
++  * ENQUEUE_HEAD      - place at front of runqueue (tail if not specified)
++  * ENQUEUE_REPLENISH - CBS (replenish runtime and postpone deadline)
++  * ENQUEUE_WAKING    - sched_class::task_waking was called
++  *
++  */
++ 
++ #define DEQUEUE_SLEEP		0x01
++ #define DEQUEUE_SAVE		0x02 /* matches ENQUEUE_RESTORE */
++ #define DEQUEUE_MOVE		0x04 /* matches ENQUEUE_MOVE */
++ 
+  #define ENQUEUE_WAKEUP		0x01
+++<<<<<<< HEAD
+ +#define ENQUEUE_RESTORE 	0x02
+ +#ifdef CONFIG_SMP
+ +#define ENQUEUE_MIGRATED	0x04
+++=======
++ #define ENQUEUE_RESTORE		0x02
++ #define ENQUEUE_MOVE		0x04
++ 
++ #define ENQUEUE_HEAD		0x08
++ #define ENQUEUE_REPLENISH	0x10
++ #ifdef CONFIG_SMP
++ #define ENQUEUE_WAKING		0x20
+++>>>>>>> ff77e4685359 (sched/rt: Fix PI handling vs. sched_setscheduler())
+  #else
+ -#define ENQUEUE_WAKING		0x00
+ +#define ENQUEUE_MIGRATED	0x00
+  #endif
+++<<<<<<< HEAD
+ +#define ENQUEUE_HEAD		0x08
+ +#define ENQUEUE_REPLENISH	0x10
+ +
+ +#define DEQUEUE_SLEEP		0x01
+ +#define DEQUEUE_SAVE		0x02
+++=======
+++>>>>>>> ff77e4685359 (sched/rt: Fix PI handling vs. sched_setscheduler())
+  
+  #define RETRY_TASK		((void *)-1UL)
+  
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 017fe07f367d..5c2e0331676c 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1259,6 +1259,8 @@ struct sched_rt_entity {
+ 	unsigned long timeout;
+ 	unsigned long watchdog_stamp;
+ 	unsigned int time_slice;
++	unsigned short on_rq;
++	unsigned short on_list;
+ 
+ 	struct sched_rt_entity *back;
+ #ifdef CONFIG_RT_GROUP_SCHED
+* Unmerged path kernel/sched/core.c
+* Unmerged path kernel/sched/rt.c
+* Unmerged path kernel/sched/sched.h
