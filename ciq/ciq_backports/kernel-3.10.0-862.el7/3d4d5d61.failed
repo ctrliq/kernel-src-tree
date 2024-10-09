@@ -1,0 +1,185 @@
+radix tree test suite: Fix build
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Matthew Wilcox <mawilcox@microsoft.com>
+commit 3d4d5d618639c3155cfce57101d619a0935434d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3d4d5d61.failed
+
+ - Add an empty linux/compiler_types.h (now being included by kconfig.h)
+ - Add __GFP_ZERO
+ - Add kzalloc
+ - Test __GFP_DIRECT_RECLAIM instead of __GFP_NOWARN
+
+	Signed-off-by: Matthew Wilcox <mawilcox@microsoft.com>
+(cherry picked from commit 3d4d5d618639c3155cfce57101d619a0935434d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/radix-tree/linux.c
+#	tools/testing/radix-tree/linux/gfp.h
+diff --cc tools/testing/radix-tree/linux.c
+index 154823737b20,44a0d1ad4408..000000000000
+--- a/tools/testing/radix-tree/linux.c
++++ b/tools/testing/radix-tree/linux.c
+@@@ -33,19 -27,74 +33,83 @@@ mempool_t *mempool_create(int min_nr, m
+  
+  void *kmem_cache_alloc(struct kmem_cache *cachep, int flags)
+  {
+++<<<<<<< HEAD
+ +	void *ret = malloc(cachep->size);
+ +	if (cachep->ctor)
+ +		cachep->ctor(ret);
+++=======
++ 	struct radix_tree_node *node;
++ 
++ 	if (!(flags & __GFP_DIRECT_RECLAIM))
++ 		return NULL;
++ 
++ 	pthread_mutex_lock(&cachep->lock);
++ 	if (cachep->nr_objs) {
++ 		cachep->nr_objs--;
++ 		node = cachep->objs;
++ 		cachep->objs = node->parent;
++ 		pthread_mutex_unlock(&cachep->lock);
++ 		node->parent = NULL;
++ 	} else {
++ 		pthread_mutex_unlock(&cachep->lock);
++ 		node = malloc(cachep->size);
++ 		if (cachep->ctor)
++ 			cachep->ctor(node);
++ 	}
++ 
+++>>>>>>> 3d4d5d618639 (radix tree test suite: Fix build)
+  	uatomic_inc(&nr_allocated);
+ -	if (kmalloc_verbose)
+ -		printf("Allocating %p from slab\n", node);
+ -	return node;
+ +	return ret;
+  }
+  
+  void kmem_cache_free(struct kmem_cache *cachep, void *objp)
+  {
+  	assert(objp);
+  	uatomic_dec(&nr_allocated);
+++<<<<<<< HEAD
+ +	memset(objp, 0, cachep->size);
+ +	free(objp);
+++=======
++ 	if (kmalloc_verbose)
++ 		printf("Freeing %p to slab\n", objp);
++ 	pthread_mutex_lock(&cachep->lock);
++ 	if (cachep->nr_objs > 10) {
++ 		memset(objp, POISON_FREE, cachep->size);
++ 		free(objp);
++ 	} else {
++ 		struct radix_tree_node *node = objp;
++ 		cachep->nr_objs++;
++ 		node->parent = cachep->objs;
++ 		cachep->objs = node;
++ 	}
++ 	pthread_mutex_unlock(&cachep->lock);
++ }
++ 
++ void *kmalloc(size_t size, gfp_t gfp)
++ {
++ 	void *ret;
++ 
++ 	if (!(gfp & __GFP_DIRECT_RECLAIM))
++ 		return NULL;
++ 
++ 	ret = malloc(size);
++ 	uatomic_inc(&nr_allocated);
++ 	if (kmalloc_verbose)
++ 		printf("Allocating %p from malloc\n", ret);
++ 	if (gfp & __GFP_ZERO)
++ 		memset(ret, 0, size);
++ 	return ret;
++ }
++ 
++ void kfree(void *p)
++ {
++ 	if (!p)
++ 		return;
++ 	uatomic_dec(&nr_allocated);
++ 	if (kmalloc_verbose)
++ 		printf("Freeing %p to malloc\n", p);
++ 	free(p);
+++>>>>>>> 3d4d5d618639 (radix tree test suite: Fix build)
+  }
+  
+  struct kmem_cache *
+diff --cc tools/testing/radix-tree/linux/gfp.h
+index 0e37f7a760eb,e3201ccf54c3..000000000000
+--- a/tools/testing/radix-tree/linux/gfp.h
++++ b/tools/testing/radix-tree/linux/gfp.h
+@@@ -1,10 -1,32 +1,35 @@@
+  #ifndef _GFP_H
+  #define _GFP_H
+  
+ -#include <linux/types.h>
+ -
+ -#define __GFP_BITS_SHIFT 26
+ +#define __GFP_BITS_SHIFT 22
+  #define __GFP_BITS_MASK ((gfp_t)((1 << __GFP_BITS_SHIFT) - 1))
+++<<<<<<< HEAD
+ +#define __GFP_WAIT 1
+ +#define __GFP_ACCOUNT 0
+ +#define __GFP_NOWARN 0
+++=======
++ 
++ #define __GFP_HIGH		0x20u
++ #define __GFP_IO		0x40u
++ #define __GFP_FS		0x80u
++ #define __GFP_NOWARN		0x200u
++ #define __GFP_ZERO		0x8000u
++ #define __GFP_ATOMIC		0x80000u
++ #define __GFP_ACCOUNT		0x100000u
++ #define __GFP_DIRECT_RECLAIM	0x400000u
++ #define __GFP_KSWAPD_RECLAIM	0x2000000u
++ 
++ #define __GFP_RECLAIM	(__GFP_DIRECT_RECLAIM|__GFP_KSWAPD_RECLAIM)
++ 
++ #define GFP_ATOMIC	(__GFP_HIGH|__GFP_ATOMIC|__GFP_KSWAPD_RECLAIM)
++ #define GFP_KERNEL	(__GFP_RECLAIM | __GFP_IO | __GFP_FS)
++ #define GFP_NOWAIT	(__GFP_KSWAPD_RECLAIM)
++ 
++ 
++ static inline bool gfpflags_allow_blocking(const gfp_t gfp_flags)
++ {
++ 	return !!(gfp_flags & __GFP_DIRECT_RECLAIM);
++ }
+++>>>>>>> 3d4d5d618639 (radix tree test suite: Fix build)
+  
+  #endif
+* Unmerged path tools/testing/radix-tree/linux.c
+diff --git a/tools/testing/radix-tree/linux/compiler_types.h b/tools/testing/radix-tree/linux/compiler_types.h
+new file mode 100644
+index 000000000000..e69de29bb2d1
+* Unmerged path tools/testing/radix-tree/linux/gfp.h
+diff --git a/tools/testing/radix-tree/linux/slab.h b/tools/testing/radix-tree/linux/slab.h
+index 57282506c21d..dbabd82aaf99 100644
+--- a/tools/testing/radix-tree/linux/slab.h
++++ b/tools/testing/radix-tree/linux/slab.h
+@@ -2,6 +2,7 @@
+ #define SLAB_H
+ 
+ #include <linux/types.h>
++#include <linux/gfp.h>
+ 
+ #define GFP_KERNEL 1
+ #define SLAB_HWCACHE_ALIGN 1
+@@ -18,6 +19,11 @@ struct kmem_cache {
+ 	void (*ctor)(void *);
+ };
+ 
++static inline void *kzalloc(size_t size, gfp_t gfp)
++{
++        return kmalloc(size, gfp | __GFP_ZERO);
++}
++
+ void *kmem_cache_alloc(struct kmem_cache *cachep, int flags);
+ void kmem_cache_free(struct kmem_cache *cachep, void *objp);
+ 
