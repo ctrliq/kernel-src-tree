@@ -1174,7 +1174,7 @@ sbc_dif_generate(struct se_cmd *cmd)
 			sdt = paddr + offset;
 			sdt->guard_tag = cpu_to_be16(crc_t10dif(daddr + j,
 						dev->dev_attrib.block_size));
-			if (dev->dev_attrib.pi_prot_type == TARGET_DIF_TYPE1_PROT)
+			if (cmd->prot_type == TARGET_DIF_TYPE1_PROT)
 				sdt->ref_tag = cpu_to_be32(sector & 0xffffffff);
 			sdt->app_tag = 0;
 
@@ -1193,9 +1193,10 @@ sbc_dif_generate(struct se_cmd *cmd)
 }
 
 static sense_reason_t
-sbc_dif_v1_verify(struct se_device *dev, struct se_dif_v1_tuple *sdt,
+sbc_dif_v1_verify(struct se_cmd *cmd, struct se_dif_v1_tuple *sdt,
 		  const void *p, sector_t sector, unsigned int ei_lba)
 {
+	struct se_device *dev = cmd->se_dev;
 	int block_size = dev->dev_attrib.block_size;
 	__be16 csum;
 
@@ -1208,7 +1209,7 @@ sbc_dif_v1_verify(struct se_device *dev, struct se_dif_v1_tuple *sdt,
 		return TCM_LOGICAL_BLOCK_GUARD_CHECK_FAILED;
 	}
 
-	if (dev->dev_attrib.pi_prot_type == TARGET_DIF_TYPE1_PROT &&
+	if (cmd->prot_type == TARGET_DIF_TYPE1_PROT &&
 	    be32_to_cpu(sdt->ref_tag) != (sector & 0xffffffff)) {
 		pr_err("DIFv1 Type 1 reference failed on sector: %llu tag: 0x%08x"
 		       " sector MSB: 0x%08x\n", (unsigned long long)sector,
@@ -1216,7 +1217,7 @@ sbc_dif_v1_verify(struct se_device *dev, struct se_dif_v1_tuple *sdt,
 		return TCM_LOGICAL_BLOCK_REF_TAG_CHECK_FAILED;
 	}
 
-	if (dev->dev_attrib.pi_prot_type == TARGET_DIF_TYPE2_PROT &&
+	if (cmd->prot_type == TARGET_DIF_TYPE2_PROT &&
 	    be32_to_cpu(sdt->ref_tag) != ei_lba) {
 		pr_err("DIFv1 Type 2 reference failed on sector: %llu tag: 0x%08x"
 		       " ei_lba: 0x%08x\n", (unsigned long long)sector,
@@ -1300,7 +1301,7 @@ sbc_dif_verify_write(struct se_cmd *cmd, sector_t start, unsigned int sectors,
 				 (unsigned long long)sector, sdt->guard_tag,
 				 sdt->app_tag, be32_to_cpu(sdt->ref_tag));
 
-			rc = sbc_dif_v1_verify(dev, sdt, daddr + j, sector,
+			rc = sbc_dif_v1_verify(cmd, sdt, daddr + j, sector,
 					       ei_lba);
 			if (rc) {
 				kunmap_atomic(paddr);
@@ -1361,7 +1362,7 @@ __sbc_dif_verify_read(struct se_cmd *cmd, sector_t start, unsigned int sectors,
 				continue;
 			}
 
-			rc = sbc_dif_v1_verify(dev, sdt, daddr + j, sector,
+			rc = sbc_dif_v1_verify(cmd, sdt, daddr + j, sector,
 					       ei_lba);
 			if (rc) {
 				kunmap_atomic(paddr);
