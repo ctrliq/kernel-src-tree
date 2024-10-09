@@ -119,7 +119,7 @@ static void nvmet_execute_get_log_page(struct nvmet_req *req)
 	}
 
 	switch (req->cmd->get_log_page.lid) {
-	case 0x01:
+	case NVME_LOG_ERROR:
 		/*
 		 * We currently never set the More bit in the status field,
 		 * so all error log entries are invalid and can be zeroed out.
@@ -127,7 +127,7 @@ static void nvmet_execute_get_log_page(struct nvmet_req *req)
 		 * mandatory log page.
 		 */
 		break;
-	case 0x02:
+	case NVME_LOG_SMART:
 		/*
 		 * XXX: fill out actual smart log
 		 *
@@ -147,7 +147,7 @@ static void nvmet_execute_get_log_page(struct nvmet_req *req)
 			goto err;
 		}
 		break;
-	case 0x03:
+	case NVME_LOG_FW_SLOT:
 		/*
 		 * We only support a single firmware slot which always is
 		 * active, so we can zero out the whole firmware slot log and
@@ -499,9 +499,9 @@ int nvmet_parse_admin_cmd(struct nvmet_req *req)
 		req->data_len = nvmet_get_log_page_len(cmd);
 
 		switch (cmd->get_log_page.lid) {
-		case 0x01:
-		case 0x02:
-		case 0x03:
+		case NVME_LOG_ERROR:
+		case NVME_LOG_SMART:
+		case NVME_LOG_FW_SLOT:
 			req->execute = nvmet_execute_get_log_page;
 			return 0;
 		}
