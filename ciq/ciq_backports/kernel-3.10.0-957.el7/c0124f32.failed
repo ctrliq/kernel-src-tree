@@ -1,0 +1,189 @@
+xdp/qede: setup xdp_rxq_info and intro xdp_rxq_info_is_reg
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] xdp: setup xdp_rxq_info and intro xdp_rxq_info_is_reg (Neil Horman) [1569087]
+Rebuild_FUZZ: 95.50%
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit c0124f327e5cabd844a10d7e1fc5aa2a81e796a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/c0124f32.failed
+
+The driver code qede_free_fp_array() depend on kfree() can be called
+with a NULL pointer. This stems from the qede_alloc_fp_array()
+function which either (kz)alloc memory for fp->txq or fp->rxq.
+This also simplifies error handling code in case of memory allocation
+failures, but xdp_rxq_info_unreg need to know the difference.
+
+Introduce xdp_rxq_info_is_reg() to handle if a memory allocation fails
+and detect this is the failure path by seeing that xdp_rxq_info was
+not registred yet, which first happens after successful alloaction in
+qede_init_fp().
+
+Driver hook points for xdp_rxq_info:
+ * reg  : qede_init_fp
+ * unreg: qede_free_fp_array
+
+Tested on actual hardware with samples/bpf program.
+
+V2: Driver have no proper error path for failed XDP RX-queue info reg, as
+qede_init_fp() is a void function.
+
+	Cc: everest-linux-l2@cavium.com
+	Cc: Ariel Elior <Ariel.Elior@cavium.com>
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit c0124f327e5cabd844a10d7e1fc5aa2a81e796a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qede/qede.h
+#	drivers/net/ethernet/qlogic/qede/qede_fp.c
+#	include/net/xdp.h
+#	net/core/xdp.c
+diff --cc drivers/net/ethernet/qlogic/qede/qede.h
+index 9b239e0413d6,8116cfd30fad..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede.h
++++ b/drivers/net/ethernet/qlogic/qede/qede.h
+@@@ -39,6 -39,8 +39,11 @@@
+  #include <linux/bitmap.h>
+  #include <linux/kernel.h>
+  #include <linux/mutex.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/bpf.h>
++ #include <net/xdp.h>
+++>>>>>>> c0124f327e5c (xdp/qede: setup xdp_rxq_info and intro xdp_rxq_info_is_reg)
+  #include <linux/qed/qede_rdma.h>
+  #include <linux/io.h>
+  #ifdef CONFIG_RFS_ACCEL
+@@@ -336,7 -343,10 +341,8 @@@ struct qede_rx_queue 
+  	u64 rx_alloc_errors;
+  	u64 rx_ip_frags;
+  
+ -	u64 xdp_no_pass;
+ -
+  	void *handle;
++ 	struct xdp_rxq_info xdp_rxq;
+  };
+  
+  union db_prod {
+diff --cc drivers/net/ethernet/qlogic/qede/qede_fp.c
+index 976acf1028af,dafc079ab6b9..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede_fp.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_fp.c
+@@@ -921,6 -990,76 +921,79 @@@ static bool qede_pkt_is_ip_fragmented(s
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Return true iff packet is to be passed to stack */
++ static bool qede_rx_xdp(struct qede_dev *edev,
++ 			struct qede_fastpath *fp,
++ 			struct qede_rx_queue *rxq,
++ 			struct bpf_prog *prog,
++ 			struct sw_rx_data *bd,
++ 			struct eth_fast_path_rx_reg_cqe *cqe,
++ 			u16 *data_offset, u16 *len)
++ {
++ 	struct xdp_buff xdp;
++ 	enum xdp_action act;
++ 
++ 	xdp.data_hard_start = page_address(bd->data);
++ 	xdp.data = xdp.data_hard_start + *data_offset;
++ 	xdp_set_data_meta_invalid(&xdp);
++ 	xdp.data_end = xdp.data + *len;
++ 	xdp.rxq = &rxq->xdp_rxq;
++ 
++ 	/* Queues always have a full reset currently, so for the time
++ 	 * being until there's atomic program replace just mark read
++ 	 * side for map helpers.
++ 	 */
++ 	rcu_read_lock();
++ 	act = bpf_prog_run_xdp(prog, &xdp);
++ 	rcu_read_unlock();
++ 
++ 	/* Recalculate, as XDP might have changed the headers */
++ 	*data_offset = xdp.data - xdp.data_hard_start;
++ 	*len = xdp.data_end - xdp.data;
++ 
++ 	if (act == XDP_PASS)
++ 		return true;
++ 
++ 	/* Count number of packets not to be passed to stack */
++ 	rxq->xdp_no_pass++;
++ 
++ 	switch (act) {
++ 	case XDP_TX:
++ 		/* We need the replacement buffer before transmit. */
++ 		if (qede_alloc_rx_buffer(rxq, true)) {
++ 			qede_recycle_rx_bd_ring(rxq, 1);
++ 			trace_xdp_exception(edev->ndev, prog, act);
++ 			return false;
++ 		}
++ 
++ 		/* Now if there's a transmission problem, we'd still have to
++ 		 * throw current buffer, as replacement was already allocated.
++ 		 */
++ 		if (qede_xdp_xmit(edev, fp, bd, *data_offset, *len)) {
++ 			dma_unmap_page(rxq->dev, bd->mapping,
++ 				       PAGE_SIZE, DMA_BIDIRECTIONAL);
++ 			__free_page(bd->data);
++ 			trace_xdp_exception(edev->ndev, prog, act);
++ 		}
++ 
++ 		/* Regardless, we've consumed an Rx BD */
++ 		qede_rx_bd_ring_consume(rxq);
++ 		return false;
++ 
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 	case XDP_ABORTED:
++ 		trace_xdp_exception(edev->ndev, prog, act);
++ 	case XDP_DROP:
++ 		qede_recycle_rx_bd_ring(rxq, cqe->bd_num);
++ 	}
++ 
++ 	return false;
++ }
++ 
+++>>>>>>> c0124f327e5c (xdp/qede: setup xdp_rxq_info and intro xdp_rxq_info_is_reg)
+  static struct sk_buff *qede_rx_allocate_skb(struct qede_dev *edev,
+  					    struct qede_rx_queue *rxq,
+  					    struct sw_rx_data *bd, u16 len,
+* Unmerged path include/net/xdp.h
+* Unmerged path net/core/xdp.c
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede.h
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_fp.c
+diff --git a/drivers/net/ethernet/qlogic/qede/qede_main.c b/drivers/net/ethernet/qlogic/qede/qede_main.c
+index b6f3dbb9e63d..86f869eccd04 100644
+--- a/drivers/net/ethernet/qlogic/qede/qede_main.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_main.c
+@@ -735,6 +735,12 @@ static void qede_free_fp_array(struct qede_dev *edev)
+ 			fp = &edev->fp_array[i];
+ 
+ 			kfree(fp->sb_info);
++			/* Handle mem alloc failure case where qede_init_fp
++			 * didn't register xdp_rxq_info yet.
++			 * Implicit only (fp->type & QEDE_FASTPATH_RX)
++			 */
++			if (fp->rxq && xdp_rxq_info_is_reg(&fp->rxq->xdp_rxq))
++				xdp_rxq_info_unreg(&fp->rxq->xdp_rxq);
+ 			kfree(fp->rxq);
+ 			kfree(fp->txq);
+ 		}
+@@ -1419,6 +1425,10 @@ static void qede_init_fp(struct qede_dev *edev)
+ 		if (fp->type & QEDE_FASTPATH_RX) {
+ 			fp->rxq->rxq_id = rxq_index++;
+ 			fp->rxq->dev = &edev->pdev->dev;
++
++			/* Driver have no error path from here */
++			WARN_ON(xdp_rxq_info_reg(&fp->rxq->xdp_rxq, edev->ndev,
++						 fp->rxq->rxq_id) < 0);
+ 		}
+ 
+ 		if (fp->type & QEDE_FASTPATH_TX) {
+* Unmerged path include/net/xdp.h
+* Unmerged path net/core/xdp.c
