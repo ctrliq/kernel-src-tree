@@ -1,0 +1,298 @@
+mmc: block: Check return value of blk_get_request()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] block: Check return value of blk_get_request() (Gopal Tiwari) [1456570]
+Rebuild_FUZZ: 94.85%
+commit-author Adrian Hunter <adrian.hunter@intel.com>
+commit fb8e456e547ed2c699f64665bd8a3b9bde7b9728
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/fb8e456e.failed
+
+blk_get_request() can fail, always check the return value.
+
+Fixes: 0493f6fe5bde ("mmc: block: Move boot partition locking into a driver op")
+Fixes: 3ecd8cf23f88 ("mmc: block: move multi-ioctl() to use block layer")
+Fixes: 614f0388f580 ("mmc: block: move single ioctl() commands to block requests")
+Fixes: 627c3ccfb46a ("mmc: debugfs: Move block debugfs into block module")
+	Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+	Reviewed-by: Linus Walleij <linus.walleij@linaro.org>
+	Cc: stable@vger.kernel.org # 4.13+
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit fb8e456e547ed2c699f64665bd8a3b9bde7b9728)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/block.c
+diff --cc drivers/mmc/core/block.c
+index bf17147e2808,4a319ddbd956..000000000000
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@@ -190,20 -229,18 +190,33 @@@ static ssize_t power_ro_lock_store(stru
+  		return count;
+  
+  	md = mmc_blk_get(dev_to_disk(dev));
+ -	mq = &md->queue;
+ +	card = md->queue.card;
+  
+++<<<<<<< HEAD
+ +	mmc_get_card(card);
+ +
+ +	ret = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL, EXT_CSD_BOOT_WP,
+ +				card->ext_csd.boot_ro_lock |
+ +				EXT_CSD_BOOT_WP_B_PWR_WP_EN,
+ +				card->ext_csd.part_time);
+ +	if (ret)
+ +		pr_err("%s: Locking boot partition ro until next power on failed: %d\n", md->disk->disk_name, ret);
+ +	else
+ +		card->ext_csd.boot_ro_lock |= EXT_CSD_BOOT_WP_B_PWR_WP_EN;
+ +
+ +	mmc_put_card(card);
+++=======
++ 	/* Dispatch locking to the block layer */
++ 	req = blk_get_request(mq->queue, REQ_OP_DRV_OUT, __GFP_RECLAIM);
++ 	if (IS_ERR(req)) {
++ 		count = PTR_ERR(req);
++ 		goto out_put;
++ 	}
++ 	req_to_mmc_queue_req(req)->drv_op = MMC_DRV_OP_BOOT_WP;
++ 	blk_execute_rq(mq->queue, NULL, req, 0);
++ 	ret = req_to_mmc_queue_req(req)->drv_op_result;
++ 	blk_put_request(req);
+++>>>>>>> fb8e456e547e (mmc: block: Check return value of blk_get_request())
+  
+  	if (!ret) {
+  		pr_info("%s: Locking boot partition ro until next power on\n",
+@@@ -574,21 -622,28 +587,42 @@@ static int mmc_blk_ioctl_cmd(struct blo
+  		goto cmd_done;
+  	}
+  
+++<<<<<<< HEAD
+ +	mmc_get_card(card);
+ +
+ +	ioc_err = __mmc_blk_ioctl_cmd(card, md, idata);
+ +
+ +	/* Always switch back to main area after RPMB access */
+ +	if (md->area_type & MMC_BLK_DATA_AREA_RPMB)
+ +		mmc_blk_part_switch(card, dev_get_drvdata(&card->dev));
+ +
+ +	mmc_put_card(card);
+ +
+++=======
++ 	/*
++ 	 * Dispatch the ioctl() into the block request queue.
++ 	 */
++ 	mq = &md->queue;
++ 	req = blk_get_request(mq->queue,
++ 		idata->ic.write_flag ? REQ_OP_DRV_OUT : REQ_OP_DRV_IN,
++ 		__GFP_RECLAIM);
++ 	if (IS_ERR(req)) {
++ 		err = PTR_ERR(req);
++ 		goto cmd_done;
++ 	}
++ 	idatas[0] = idata;
++ 	req_to_mmc_queue_req(req)->drv_op =
++ 		rpmb ? MMC_DRV_OP_IOCTL_RPMB : MMC_DRV_OP_IOCTL;
++ 	req_to_mmc_queue_req(req)->drv_op_data = idatas;
++ 	req_to_mmc_queue_req(req)->ioc_count = 1;
++ 	blk_execute_rq(mq->queue, NULL, req, 0);
++ 	ioc_err = req_to_mmc_queue_req(req)->drv_op_result;
+++>>>>>>> fb8e456e547e (mmc: block: Check return value of blk_get_request())
+  	err = mmc_blk_ioctl_copy_to_user(ic_ptr, idata);
+ -	blk_put_request(req);
+  
+  cmd_done:
+ +	mmc_blk_put(md);
+ +cmd_err:
+  	kfree(idata->buf);
+  	kfree(idata);
+  	return ioc_err ? ioc_err : err;
+@@@ -636,19 -689,27 +670,39 @@@ static int mmc_blk_ioctl_multi_cmd(stru
+  	card = md->queue.card;
+  	if (IS_ERR(card)) {
+  		err = PTR_ERR(card);
+ -		goto cmd_err;
+ +		goto cmd_done;
+  	}
+  
+ +	mmc_get_card(card);
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < num_of_cmds && !ioc_err; i++)
+ +		ioc_err = __mmc_blk_ioctl_cmd(card, md, idata[i]);
+ +
+ +	/* Always switch back to main area after RPMB access */
+ +	if (md->area_type & MMC_BLK_DATA_AREA_RPMB)
+ +		mmc_blk_part_switch(card, dev_get_drvdata(&card->dev));
+ +
+ +	mmc_put_card(card);
+++=======
++ 	/*
++ 	 * Dispatch the ioctl()s into the block request queue.
++ 	 */
++ 	mq = &md->queue;
++ 	req = blk_get_request(mq->queue,
++ 		idata[0]->ic.write_flag ? REQ_OP_DRV_OUT : REQ_OP_DRV_IN,
++ 		__GFP_RECLAIM);
++ 	if (IS_ERR(req)) {
++ 		err = PTR_ERR(req);
++ 		goto cmd_err;
++ 	}
++ 	req_to_mmc_queue_req(req)->drv_op =
++ 		rpmb ? MMC_DRV_OP_IOCTL_RPMB : MMC_DRV_OP_IOCTL;
++ 	req_to_mmc_queue_req(req)->drv_op_data = idata;
++ 	req_to_mmc_queue_req(req)->ioc_count = num_of_cmds;
++ 	blk_execute_rq(mq->queue, NULL, req, 0);
++ 	ioc_err = req_to_mmc_queue_req(req)->drv_op_result;
+++>>>>>>> fb8e456e547e (mmc: block: Check return value of blk_get_request())
+  
+  	/* copy to user if data and response */
+  	for (i = 0; i < num_of_cmds && !err; i++)
+@@@ -2155,6 -2551,142 +2209,145 @@@ force_ro_fail
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_DEBUG_FS
++ 
++ static int mmc_dbg_card_status_get(void *data, u64 *val)
++ {
++ 	struct mmc_card *card = data;
++ 	struct mmc_blk_data *md = dev_get_drvdata(&card->dev);
++ 	struct mmc_queue *mq = &md->queue;
++ 	struct request *req;
++ 	int ret;
++ 
++ 	/* Ask the block layer about the card status */
++ 	req = blk_get_request(mq->queue, REQ_OP_DRV_IN, __GFP_RECLAIM);
++ 	if (IS_ERR(req))
++ 		return PTR_ERR(req);
++ 	req_to_mmc_queue_req(req)->drv_op = MMC_DRV_OP_GET_CARD_STATUS;
++ 	blk_execute_rq(mq->queue, NULL, req, 0);
++ 	ret = req_to_mmc_queue_req(req)->drv_op_result;
++ 	if (ret >= 0) {
++ 		*val = ret;
++ 		ret = 0;
++ 	}
++ 	blk_put_request(req);
++ 
++ 	return ret;
++ }
++ DEFINE_SIMPLE_ATTRIBUTE(mmc_dbg_card_status_fops, mmc_dbg_card_status_get,
++ 		NULL, "%08llx\n");
++ 
++ /* That is two digits * 512 + 1 for newline */
++ #define EXT_CSD_STR_LEN 1025
++ 
++ static int mmc_ext_csd_open(struct inode *inode, struct file *filp)
++ {
++ 	struct mmc_card *card = inode->i_private;
++ 	struct mmc_blk_data *md = dev_get_drvdata(&card->dev);
++ 	struct mmc_queue *mq = &md->queue;
++ 	struct request *req;
++ 	char *buf;
++ 	ssize_t n = 0;
++ 	u8 *ext_csd;
++ 	int err, i;
++ 
++ 	buf = kmalloc(EXT_CSD_STR_LEN + 1, GFP_KERNEL);
++ 	if (!buf)
++ 		return -ENOMEM;
++ 
++ 	/* Ask the block layer for the EXT CSD */
++ 	req = blk_get_request(mq->queue, REQ_OP_DRV_IN, __GFP_RECLAIM);
++ 	if (IS_ERR(req)) {
++ 		err = PTR_ERR(req);
++ 		goto out_free;
++ 	}
++ 	req_to_mmc_queue_req(req)->drv_op = MMC_DRV_OP_GET_EXT_CSD;
++ 	req_to_mmc_queue_req(req)->drv_op_data = &ext_csd;
++ 	blk_execute_rq(mq->queue, NULL, req, 0);
++ 	err = req_to_mmc_queue_req(req)->drv_op_result;
++ 	blk_put_request(req);
++ 	if (err) {
++ 		pr_err("FAILED %d\n", err);
++ 		goto out_free;
++ 	}
++ 
++ 	for (i = 0; i < 512; i++)
++ 		n += sprintf(buf + n, "%02x", ext_csd[i]);
++ 	n += sprintf(buf + n, "\n");
++ 
++ 	if (n != EXT_CSD_STR_LEN) {
++ 		err = -EINVAL;
++ 		goto out_free;
++ 	}
++ 
++ 	filp->private_data = buf;
++ 	kfree(ext_csd);
++ 	return 0;
++ 
++ out_free:
++ 	kfree(buf);
++ 	return err;
++ }
++ 
++ static ssize_t mmc_ext_csd_read(struct file *filp, char __user *ubuf,
++ 				size_t cnt, loff_t *ppos)
++ {
++ 	char *buf = filp->private_data;
++ 
++ 	return simple_read_from_buffer(ubuf, cnt, ppos,
++ 				       buf, EXT_CSD_STR_LEN);
++ }
++ 
++ static int mmc_ext_csd_release(struct inode *inode, struct file *file)
++ {
++ 	kfree(file->private_data);
++ 	return 0;
++ }
++ 
++ static const struct file_operations mmc_dbg_ext_csd_fops = {
++ 	.open		= mmc_ext_csd_open,
++ 	.read		= mmc_ext_csd_read,
++ 	.release	= mmc_ext_csd_release,
++ 	.llseek		= default_llseek,
++ };
++ 
++ static int mmc_blk_add_debugfs(struct mmc_card *card)
++ {
++ 	struct dentry *root;
++ 
++ 	if (!card->debugfs_root)
++ 		return 0;
++ 
++ 	root = card->debugfs_root;
++ 
++ 	if (mmc_card_mmc(card) || mmc_card_sd(card)) {
++ 		if (!debugfs_create_file("status", S_IRUSR, root, card,
++ 					 &mmc_dbg_card_status_fops))
++ 			return -EIO;
++ 	}
++ 
++ 	if (mmc_card_mmc(card)) {
++ 		if (!debugfs_create_file("ext_csd", S_IRUSR, root, card,
++ 					 &mmc_dbg_ext_csd_fops))
++ 			return -EIO;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ 
++ #else
++ 
++ static int mmc_blk_add_debugfs(struct mmc_card *card)
++ {
++ 	return 0;
++ }
++ 
++ #endif /* CONFIG_DEBUG_FS */
++ 
+++>>>>>>> fb8e456e547e (mmc: block: Check return value of blk_get_request())
+  static int mmc_blk_probe(struct mmc_card *card)
+  {
+  	struct mmc_blk_data *md, *part_md;
+* Unmerged path drivers/mmc/core/block.c
