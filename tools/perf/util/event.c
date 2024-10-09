@@ -1359,6 +1359,7 @@ int machine__resolve(struct machine *machine, struct addr_location *al,
 	al->sym = NULL;
 	al->cpu = sample->cpu;
 	al->socket = -1;
+	al->srcline = NULL;
 
 	if (al->cpu >= 0) {
 		struct perf_env *env = machine->env;
