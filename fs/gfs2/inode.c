@@ -719,6 +719,7 @@ static int gfs2_create_inode(struct inode *dir, struct dentry *dentry,
 	return error;
 
 fail_gunlock3:
+	glock_clear_object(io_gl, ip);
 	gfs2_glock_dq_uninit(&ip->i_iopen_gh);
 	gfs2_glock_put(io_gl);
 fail_gunlock2:
@@ -726,8 +727,10 @@ fail_gunlock2:
 		clear_bit(GLF_INODE_CREATING, &io_gl->gl_flags);
 	gfs2_glock_dq_uninit(ghs + 1);
 fail_free_inode:
-	if (ip->i_gl)
+	if (ip->i_gl) {
+		glock_clear_object(ip->i_gl, ip);
 		gfs2_glock_put(ip->i_gl);
+	}
 	gfs2_rsqa_delete(ip, NULL);
 fail_gunlock:
 	gfs2_glock_dq_uninit(ghs);
