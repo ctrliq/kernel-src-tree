@@ -1,0 +1,458 @@
+bpf: drop unnecessary context cast from BPF_PROG_RUN
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 88575199cc65de99a156888629a68180c830eff2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/88575199.failed
+
+Since long already bpf_func is not only about struct sk_buff * as
+input anymore. Make it generic as void *, so that callers don't
+need to cast for it each time they call BPF_PROG_RUN().
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 88575199cc65de99a156888629a68180c830eff2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+#	include/linux/filter.h
+#	kernel/events/core.c
+#	kernel/seccomp.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index de17d3265a77,876ab3a92ad5..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -1351,6 -1459,68 +1351,71 @@@ nfp_net_rx_drop(struct nfp_net_r_vecto
+  		dev_kfree_skb_any(skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ nfp_net_tx_xdp_buf(struct nfp_net *nn, struct nfp_net_rx_ring *rx_ring,
++ 		   struct nfp_net_tx_ring *tx_ring,
++ 		   struct nfp_net_rx_buf *rxbuf, unsigned int pkt_off,
++ 		   unsigned int pkt_len)
++ {
++ 	struct nfp_net_tx_buf *txbuf;
++ 	struct nfp_net_tx_desc *txd;
++ 	dma_addr_t new_dma_addr;
++ 	void *new_frag;
++ 	int wr_idx;
++ 
++ 	if (unlikely(nfp_net_tx_full(tx_ring, 1))) {
++ 		nfp_net_rx_drop(rx_ring->r_vec, rx_ring, rxbuf, NULL);
++ 		return;
++ 	}
++ 
++ 	new_frag = nfp_net_napi_alloc_one(nn, DMA_BIDIRECTIONAL, &new_dma_addr);
++ 	if (unlikely(!new_frag)) {
++ 		nfp_net_rx_drop(rx_ring->r_vec, rx_ring, rxbuf, NULL);
++ 		return;
++ 	}
++ 	nfp_net_rx_give_one(rx_ring, new_frag, new_dma_addr);
++ 
++ 	wr_idx = tx_ring->wr_p & (tx_ring->cnt - 1);
++ 
++ 	/* Stash the soft descriptor of the head then initialize it */
++ 	txbuf = &tx_ring->txbufs[wr_idx];
++ 	txbuf->frag = rxbuf->frag;
++ 	txbuf->dma_addr = rxbuf->dma_addr;
++ 	txbuf->fidx = -1;
++ 	txbuf->pkt_cnt = 1;
++ 	txbuf->real_len = pkt_len;
++ 
++ 	dma_sync_single_for_device(&nn->pdev->dev, rxbuf->dma_addr + pkt_off,
++ 				   pkt_len, DMA_TO_DEVICE);
++ 
++ 	/* Build TX descriptor */
++ 	txd = &tx_ring->txds[wr_idx];
++ 	txd->offset_eop = PCIE_DESC_TX_EOP;
++ 	txd->dma_len = cpu_to_le16(pkt_len);
++ 	nfp_desc_set_dma_addr(txd, rxbuf->dma_addr + pkt_off);
++ 	txd->data_len = cpu_to_le16(pkt_len);
++ 
++ 	txd->flags = 0;
++ 	txd->mss = 0;
++ 	txd->l4_offset = 0;
++ 
++ 	tx_ring->wr_p++;
++ 	tx_ring->wr_ptr_add++;
++ }
++ 
++ static int nfp_net_run_xdp(struct bpf_prog *prog, void *data, unsigned int len)
++ {
++ 	struct xdp_buff xdp;
++ 
++ 	xdp.data = data;
++ 	xdp.data_end = data + len;
++ 
++ 	return BPF_PROG_RUN(prog, &xdp);
++ }
++ 
+++>>>>>>> 88575199cc65 (bpf: drop unnecessary context cast from BPF_PROG_RUN)
+  /**
+   * nfp_net_rx() - receive up to @budget packets on @rx_ring
+   * @rx_ring:   RX ring to receive from
+diff --cc include/linux/filter.h
+index e35ca6a14c4e,7f246a281435..000000000000
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@@ -18,24 -386,168 +18,154 @@@ struct compat_sock_fprog 
+  };
+  #endif
+  
+ -struct sock_fprog_kern {
+ -	u16			len;
+ -	struct sock_filter	*filter;
+ -};
+ +struct sk_buff;
+ +struct sock;
+  
+++<<<<<<< HEAD
+ +struct sk_filter
+ +{
+ +	atomic_t		refcnt;
+ +	unsigned int         	len;	/* Number of filter blocks */
+ +	unsigned int		(*bpf_func)(const struct sk_buff *skb,
+ +					    const struct sock_filter *filter);
+ +	struct rcu_head		rcu;
+ +	struct sock_filter     	insns[0];
+++=======
++ struct bpf_binary_header {
++ 	unsigned int pages;
++ 	u8 image[];
++ };
++ 
++ struct bpf_prog {
++ 	u16			pages;		/* Number of allocated pages */
++ 	kmemcheck_bitfield_begin(meta);
++ 	u16			jited:1,	/* Is our filter JIT'ed? */
++ 				gpl_compatible:1, /* Is filter GPL compatible? */
++ 				cb_access:1,	/* Is control block accessed? */
++ 				dst_needed:1;	/* Do we need dst entry? */
++ 	kmemcheck_bitfield_end(meta);
++ 	u32			len;		/* Number of filter blocks */
++ 	enum bpf_prog_type	type;		/* Type of BPF program */
++ 	struct bpf_prog_aux	*aux;		/* Auxiliary fields */
++ 	struct sock_fprog_kern	*orig_prog;	/* Original BPF program */
++ 	unsigned int		(*bpf_func)(const void *ctx,
++ 					    const struct bpf_insn *insn);
++ 	/* Instructions for interpreter */
++ 	union {
++ 		struct sock_filter	insns[0];
++ 		struct bpf_insn		insnsi[0];
++ 	};
+++>>>>>>> 88575199cc65 (bpf: drop unnecessary context cast from BPF_PROG_RUN)
+  };
+  
+ -struct sk_filter {
+ -	atomic_t	refcnt;
+ -	struct rcu_head	rcu;
+ -	struct bpf_prog	*prog;
+ -};
+ -
+ -#define BPF_PROG_RUN(filter, ctx)  (*filter->bpf_func)(ctx, filter->insnsi)
+ -
+ -#define BPF_SKB_CB_LEN QDISC_CB_PRIV_LEN
+ -
+ -struct bpf_skb_data_end {
+ -	struct qdisc_skb_cb qdisc_cb;
+ -	void *data_end;
+ -};
+ -
+ -struct xdp_buff {
+ -	void *data;
+ -	void *data_end;
+ -};
+ -
+ -/* compute the linear packet data range [data, data_end) which
+ - * will be accessed by cls_bpf and act_bpf programs
+ - */
+ -static inline void bpf_compute_data_end(struct sk_buff *skb)
+ +static inline unsigned int sk_filter_len(const struct sk_filter *fp)
+  {
+ -	struct bpf_skb_data_end *cb = (struct bpf_skb_data_end *)skb->cb;
+ -
+ -	BUILD_BUG_ON(sizeof(*cb) > FIELD_SIZEOF(struct sk_buff, cb));
+ -	cb->data_end = skb->data + skb_headlen(skb);
+ +	return fp->len * sizeof(struct sock_filter) + sizeof(*fp);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline u8 *bpf_skb_cb(struct sk_buff *skb)
++ {
++ 	/* eBPF programs may read/write skb->cb[] area to transfer meta
++ 	 * data between tail calls. Since this also needs to work with
++ 	 * tc, that scratch memory is mapped to qdisc_skb_cb's data area.
++ 	 *
++ 	 * In some socket filter cases, the cb unfortunately needs to be
++ 	 * saved/restored so that protocol specific skb->cb[] data won't
++ 	 * be lost. In any case, due to unpriviledged eBPF programs
++ 	 * attached to sockets, we need to clear the bpf_skb_cb() area
++ 	 * to not leak previous contents to user space.
++ 	 */
++ 	BUILD_BUG_ON(FIELD_SIZEOF(struct __sk_buff, cb) != BPF_SKB_CB_LEN);
++ 	BUILD_BUG_ON(FIELD_SIZEOF(struct __sk_buff, cb) !=
++ 		     FIELD_SIZEOF(struct qdisc_skb_cb, data));
++ 
++ 	return qdisc_skb_cb(skb)->data;
++ }
++ 
++ static inline u32 bpf_prog_run_save_cb(const struct bpf_prog *prog,
++ 				       struct sk_buff *skb)
++ {
++ 	u8 *cb_data = bpf_skb_cb(skb);
++ 	u8 cb_saved[BPF_SKB_CB_LEN];
++ 	u32 res;
++ 
++ 	if (unlikely(prog->cb_access)) {
++ 		memcpy(cb_saved, cb_data, sizeof(cb_saved));
++ 		memset(cb_data, 0, sizeof(cb_saved));
++ 	}
++ 
++ 	res = BPF_PROG_RUN(prog, skb);
++ 
++ 	if (unlikely(prog->cb_access))
++ 		memcpy(cb_data, cb_saved, sizeof(cb_saved));
++ 
++ 	return res;
++ }
++ 
++ static inline u32 bpf_prog_run_clear_cb(const struct bpf_prog *prog,
++ 					struct sk_buff *skb)
++ {
++ 	u8 *cb_data = bpf_skb_cb(skb);
++ 
++ 	if (unlikely(prog->cb_access))
++ 		memset(cb_data, 0, BPF_SKB_CB_LEN);
++ 
++ 	return BPF_PROG_RUN(prog, skb);
++ }
++ 
++ static inline u32 bpf_prog_run_xdp(const struct bpf_prog *prog,
++ 				   struct xdp_buff *xdp)
++ {
++ 	u32 ret;
++ 
++ 	rcu_read_lock();
++ 	ret = BPF_PROG_RUN(prog, xdp);
++ 	rcu_read_unlock();
++ 
++ 	return ret;
++ }
++ 
++ static inline unsigned int bpf_prog_size(unsigned int proglen)
++ {
++ 	return max(sizeof(struct bpf_prog),
++ 		   offsetof(struct bpf_prog, insns[proglen]));
++ }
++ 
++ static inline bool bpf_prog_was_classic(const struct bpf_prog *prog)
++ {
++ 	/* When classic BPF programs have been loaded and the arch
++ 	 * does not have a classic BPF JIT (anymore), they have been
++ 	 * converted via bpf_migrate_filter() to eBPF and thus always
++ 	 * have an unspec program type.
++ 	 */
++ 	return prog->type == BPF_PROG_TYPE_UNSPEC;
++ }
++ 
++ #define bpf_classic_proglen(fprog) (fprog->len * sizeof(fprog->filter[0]))
++ 
++ #ifdef CONFIG_DEBUG_SET_MODULE_RONX
++ static inline void bpf_prog_lock_ro(struct bpf_prog *fp)
++ {
++ 	set_memory_ro((unsigned long)fp, fp->pages);
++ }
++ 
++ static inline void bpf_prog_unlock_ro(struct bpf_prog *fp)
++ {
++ 	set_memory_rw((unsigned long)fp, fp->pages);
++ }
++ #else
++ static inline void bpf_prog_lock_ro(struct bpf_prog *fp)
++ {
++ }
++ 
++ static inline void bpf_prog_unlock_ro(struct bpf_prog *fp)
++ {
++ }
++ #endif /* CONFIG_DEBUG_SET_MODULE_RONX */
++ 
+++>>>>>>> 88575199cc65 (bpf: drop unnecessary context cast from BPF_PROG_RUN)
+  int sk_filter_trim_cap(struct sock *sk, struct sk_buff *skb, unsigned int cap);
+  static inline int sk_filter(struct sock *sk, struct sk_buff *skb)
+  {
+diff --cc kernel/events/core.c
+index c7982922c47d,22cc734aa1b2..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -7672,6 -7711,135 +7672,138 @@@ static void perf_event_free_filter(stru
+  	ftrace_profile_free_filter(event);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_BPF_SYSCALL
++ static void bpf_overflow_handler(struct perf_event *event,
++ 				 struct perf_sample_data *data,
++ 				 struct pt_regs *regs)
++ {
++ 	struct bpf_perf_event_data_kern ctx = {
++ 		.data = data,
++ 		.regs = regs,
++ 	};
++ 	int ret = 0;
++ 
++ 	preempt_disable();
++ 	if (unlikely(__this_cpu_inc_return(bpf_prog_active) != 1))
++ 		goto out;
++ 	rcu_read_lock();
++ 	ret = BPF_PROG_RUN(event->prog, &ctx);
++ 	rcu_read_unlock();
++ out:
++ 	__this_cpu_dec(bpf_prog_active);
++ 	preempt_enable();
++ 	if (!ret)
++ 		return;
++ 
++ 	event->orig_overflow_handler(event, data, regs);
++ }
++ 
++ static int perf_event_set_bpf_handler(struct perf_event *event, u32 prog_fd)
++ {
++ 	struct bpf_prog *prog;
++ 
++ 	if (event->overflow_handler_context)
++ 		/* hw breakpoint or kernel counter */
++ 		return -EINVAL;
++ 
++ 	if (event->prog)
++ 		return -EEXIST;
++ 
++ 	prog = bpf_prog_get_type(prog_fd, BPF_PROG_TYPE_PERF_EVENT);
++ 	if (IS_ERR(prog))
++ 		return PTR_ERR(prog);
++ 
++ 	event->prog = prog;
++ 	event->orig_overflow_handler = READ_ONCE(event->overflow_handler);
++ 	WRITE_ONCE(event->overflow_handler, bpf_overflow_handler);
++ 	return 0;
++ }
++ 
++ static void perf_event_free_bpf_handler(struct perf_event *event)
++ {
++ 	struct bpf_prog *prog = event->prog;
++ 
++ 	if (!prog)
++ 		return;
++ 
++ 	WRITE_ONCE(event->overflow_handler, event->orig_overflow_handler);
++ 	event->prog = NULL;
++ 	bpf_prog_put(prog);
++ }
++ #else
++ static int perf_event_set_bpf_handler(struct perf_event *event, u32 prog_fd)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ static void perf_event_free_bpf_handler(struct perf_event *event)
++ {
++ }
++ #endif
++ 
++ static int perf_event_set_bpf_prog(struct perf_event *event, u32 prog_fd)
++ {
++ 	bool is_kprobe, is_tracepoint;
++ 	struct bpf_prog *prog;
++ 
++ 	if (event->attr.type == PERF_TYPE_HARDWARE ||
++ 	    event->attr.type == PERF_TYPE_SOFTWARE)
++ 		return perf_event_set_bpf_handler(event, prog_fd);
++ 
++ 	if (event->attr.type != PERF_TYPE_TRACEPOINT)
++ 		return -EINVAL;
++ 
++ 	if (event->tp_event->prog)
++ 		return -EEXIST;
++ 
++ 	is_kprobe = event->tp_event->flags & TRACE_EVENT_FL_UKPROBE;
++ 	is_tracepoint = event->tp_event->flags & TRACE_EVENT_FL_TRACEPOINT;
++ 	if (!is_kprobe && !is_tracepoint)
++ 		/* bpf programs can only be attached to u/kprobe or tracepoint */
++ 		return -EINVAL;
++ 
++ 	prog = bpf_prog_get(prog_fd);
++ 	if (IS_ERR(prog))
++ 		return PTR_ERR(prog);
++ 
++ 	if ((is_kprobe && prog->type != BPF_PROG_TYPE_KPROBE) ||
++ 	    (is_tracepoint && prog->type != BPF_PROG_TYPE_TRACEPOINT)) {
++ 		/* valid fd, but invalid bpf program type */
++ 		bpf_prog_put(prog);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (is_tracepoint) {
++ 		int off = trace_event_get_offsets(event->tp_event);
++ 
++ 		if (prog->aux->max_ctx_offset > off) {
++ 			bpf_prog_put(prog);
++ 			return -EACCES;
++ 		}
++ 	}
++ 	event->tp_event->prog = prog;
++ 
++ 	return 0;
++ }
++ 
++ static void perf_event_free_bpf_prog(struct perf_event *event)
++ {
++ 	struct bpf_prog *prog;
++ 
++ 	perf_event_free_bpf_handler(event);
++ 
++ 	if (!event->tp_event)
++ 		return;
++ 
++ 	prog = event->tp_event->prog;
++ 	if (prog) {
++ 		event->tp_event->prog = NULL;
++ 		bpf_prog_put(prog);
++ 	}
++ }
++ 
+++>>>>>>> 88575199cc65 (bpf: drop unnecessary context cast from BPF_PROG_RUN)
+  #else
+  
+  static inline void perf_tp_register(void)
+diff --cc kernel/seccomp.c
+index dab81904040f,bff9c774987a..000000000000
+--- a/kernel/seccomp.c
++++ b/kernel/seccomp.c
+@@@ -212,8 -194,9 +212,14 @@@ static u32 seccomp_run_filters(int sysc
+  	 * All filters in the list are evaluated and the lowest BPF return
+  	 * value always takes priority (ignoring the DATA).
+  	 */
+++<<<<<<< HEAD
+ +	for (f = current->seccomp.filter; f; f = f->prev) {
+ +		u32 cur_ret = sk_run_filter(NULL, f->insns);
+++=======
++ 	for (; f; f = f->prev) {
++ 		u32 cur_ret = BPF_PROG_RUN(f->prog, sd);
++ 
+++>>>>>>> 88575199cc65 (bpf: drop unnecessary context cast from BPF_PROG_RUN)
+  		if ((cur_ret & SECCOMP_RET_ACTION) < (ret & SECCOMP_RET_ACTION))
+  			ret = cur_ret;
+  	}
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+* Unmerged path include/linux/filter.h
+* Unmerged path kernel/events/core.c
+* Unmerged path kernel/seccomp.c
