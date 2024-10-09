@@ -1,0 +1,161 @@
+sock: add sk_dst_pending_confirm flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Julian Anastasov <ja@ssi.bg>
+commit 9b8805a325591cf5b6b9df71200de25a2bd721fd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/9b8805a3.failed
+
+Add new sock flag to allow sockets to confirm neighbour.
+When same struct dst_entry can be used for many different
+neighbours we can not use it for pending confirmations.
+As not all call paths lock the socket use full word for
+the flag.
+
+Add sk_dst_confirm as replacement for dst_confirm when
+called for received packets.
+
+	Signed-off-by: Julian Anastasov <ja@ssi.bg>
+	Acked-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9b8805a325591cf5b6b9df71200de25a2bd721fd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sock.h
+diff --cc include/net/sock.h
+index bcec73d6d06c,85d856b94b4b..000000000000
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@@ -356,39 -374,35 +357,50 @@@ struct sock 
+  	int			sk_rcvbuf;
+  
+  	struct sk_filter __rcu	*sk_filter;
+ -	union {
+ -		struct socket_wq __rcu	*sk_wq;
+ -		struct socket_wq	*sk_wq_raw;
+ -	};
+ +	struct socket_wq __rcu	*sk_wq;
+ +
+ +#ifdef CONFIG_NET_DMA_RH_KABI
+ +	RH_KABI_DEPRECATE(struct sk_buff_head,	sk_async_wait_queue)
+ +#endif
+ +
+  #ifdef CONFIG_XFRM
+ -	struct xfrm_policy __rcu *sk_policy[2];
+ +	struct xfrm_policy	*sk_policy[2];
+  #endif
+ +	unsigned long 		sk_flags;
+  	struct dst_entry	*sk_rx_dst;
+  	struct dst_entry __rcu	*sk_dst_cache;
+ +	RH_KABI_DEPRECATE(spinlock_t,	sk_dst_lock)
+ +	atomic_t		sk_wmem_alloc;
+  	atomic_t		sk_omem_alloc;
+  	int			sk_sndbuf;
+ -
+ -	/* ===== cache line for TX ===== */
+ -	int			sk_wmem_queued;
+ -	atomic_t		sk_wmem_alloc;
+ -	unsigned long		sk_tsq_flags;
+ -	struct sk_buff		*sk_send_head;
+  	struct sk_buff_head	sk_write_queue;
+++<<<<<<< HEAD
+ +	kmemcheck_bitfield_begin(flags);
+ +	unsigned int		sk_shutdown  : 2,
+ +#ifdef __GENKSYMS__
+ +				sk_no_check : 2,
+ +#else
+ +				sk_no_check_tx : 1,
+ +				sk_no_check_rx : 1,
+ +#endif
+ +				sk_userlocks : 4,
+ +				sk_protocol  : 8,
+ +#define SK_PROTOCOL_MAX U8_MAX
+ +				sk_type      : 16;
+ +	kmemcheck_bitfield_end(flags);
+ +	int			sk_wmem_queued;
+ +	gfp_t			sk_allocation;
+++=======
++ 	__s32			sk_peek_off;
++ 	int			sk_write_pending;
++ 	__u32			sk_dst_pending_confirm;
++ 	/* Note: 32bit hole on 64bit arches */
++ 	long			sk_sndtimeo;
++ 	struct timer_list	sk_timer;
++ 	__u32			sk_priority;
++ 	__u32			sk_mark;
+++>>>>>>> 9b8805a32559 (sock: add sk_dst_pending_confirm flag)
+  	u32			sk_pacing_rate; /* bytes per second */
+ -	u32			sk_max_pacing_rate;
+ -	struct page_frag	sk_frag;
+  	netdev_features_t	sk_route_caps;
+  	netdev_features_t	sk_route_nocaps;
+  	int			sk_gso_type;
+@@@ -1841,7 -1766,8 +1853,12 @@@ static inline void dst_negative_advice(
+  
+  		if (ndst != dst) {
+  			rcu_assign_pointer(sk->sk_dst_cache, ndst);
+++<<<<<<< HEAD
+ +			sk_reset_txq(sk);
+++=======
++ 			sk_tx_queue_clear(sk);
++ 			sk->sk_dst_pending_confirm = 0;
+++>>>>>>> 9b8805a32559 (sock: add sk_dst_pending_confirm flag)
+  		}
+  	}
+  }
+@@@ -1867,7 -1794,8 +1885,12 @@@ sk_dst_set(struct sock *sk, struct dst_
+  	struct dst_entry *old_dst;
+  
+  	sk_tx_queue_clear(sk);
+++<<<<<<< HEAD
+ +	old_dst = xchg(&sk->sk_dst_cache, dst);
+++=======
++ 	sk->sk_dst_pending_confirm = 0;
++ 	old_dst = xchg((__force struct dst_entry **)&sk->sk_dst_cache, dst);
+++>>>>>>> 9b8805a32559 (sock: add sk_dst_pending_confirm flag)
+  	dst_release(old_dst);
+  }
+  
+@@@ -1883,10 -1811,16 +1906,16 @@@ sk_dst_reset(struct sock *sk
+  	sk_dst_set(sk, NULL);
+  }
+  
+ -struct dst_entry *__sk_dst_check(struct sock *sk, u32 cookie);
+ +extern struct dst_entry *__sk_dst_check(struct sock *sk, u32 cookie);
+  
+ -struct dst_entry *sk_dst_check(struct sock *sk, u32 cookie);
+ +extern struct dst_entry *sk_dst_check(struct sock *sk, u32 cookie);
+  
++ static inline void sk_dst_confirm(struct sock *sk)
++ {
++ 	if (!sk->sk_dst_pending_confirm)
++ 		sk->sk_dst_pending_confirm = 1;
++ }
++ 
+  bool sk_mc_loop(struct sock *sk);
+  
+  static inline bool sk_can_gso(const struct sock *sk)
+* Unmerged path include/net/sock.h
+diff --git a/net/core/sock.c b/net/core/sock.c
+index 960b698f3aa7..53cf90eba937 100644
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -496,6 +496,7 @@ struct dst_entry *__sk_dst_check(struct sock *sk, u32 cookie)
+ 
+ 	if (dst && dst->obsolete && dst->ops->check(dst, cookie) == NULL) {
+ 		sk_tx_queue_clear(sk);
++		sk->sk_dst_pending_confirm = 0;
+ 		RCU_INIT_POINTER(sk->sk_dst_cache, NULL);
+ 		dst_release(dst);
+ 		return NULL;
+@@ -1505,6 +1506,7 @@ struct sock *sk_clone_lock(const struct sock *sk, const gfp_t priority)
+ 				af_family_clock_key_strings[newsk->sk_family]);
+ 
+ 		newsk->sk_dst_cache	= NULL;
++		newsk->sk_dst_pending_confirm = 0;
+ 		newsk->sk_wmem_queued	= 0;
+ 		newsk->sk_forward_alloc = 0;
+ 		newsk->sk_send_head	= NULL;
