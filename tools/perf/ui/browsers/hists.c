@@ -2180,7 +2180,8 @@ struct hist_browser *hist_browser__new(struct hists *hists)
 static struct hist_browser *
 perf_evsel_browser__new(struct perf_evsel *evsel,
 			struct hist_browser_timer *hbt,
-			struct perf_env *env)
+			struct perf_env *env,
+			struct annotation_options *annotation_opts)
 {
 	struct hist_browser *browser = hist_browser__new(evsel__hists(evsel));
 
@@ -2188,6 +2189,7 @@ perf_evsel_browser__new(struct perf_evsel *evsel,
 		browser->hbt   = hbt;
 		browser->env   = env;
 		browser->title = hists_browser__scnprintf_title;
+		browser->annotation_opts = annotation_opts;
 	}
 	return browser;
 }
@@ -2349,7 +2351,8 @@ do_annotate(struct hist_browser *browser, struct popup_action *act)
 		return 0;
 
 	evsel = hists_to_evsel(browser->hists);
-	err = map_symbol__tui_annotate(&act->ms, evsel, browser->hbt);
+	err = map_symbol__tui_annotate(&act->ms, evsel, browser->hbt,
+				       browser->annotation_opts);
 	he = hist_browser__selected_entry(browser);
 	/*
 	 * offer option to annotate the other branch source or target
@@ -2702,10 +2705,11 @@ static int perf_evsel__hists_browse(struct perf_evsel *evsel, int nr_events,
 				    struct hist_browser_timer *hbt,
 				    float min_pcnt,
 				    struct perf_env *env,
-				    bool warn_lost_event)
+				    bool warn_lost_event,
+				    struct annotation_options *annotation_opts)
 {
 	struct hists *hists = evsel__hists(evsel);
-	struct hist_browser *browser = perf_evsel_browser__new(evsel, hbt, env);
+	struct hist_browser *browser = perf_evsel_browser__new(evsel, hbt, env, annotation_opts);
 	struct branch_info *bi;
 #define MAX_OPTIONS  16
 	char *options[MAX_OPTIONS];
@@ -3067,6 +3071,7 @@ out:
 struct perf_evsel_menu {
 	struct ui_browser b;
 	struct perf_evsel *selection;
+	struct annotation_options *annotation_opts;
 	bool lost_events, lost_events_warned;
 	float min_pcnt;
 	struct perf_env *env;
@@ -3168,7 +3173,8 @@ browse_hists:
 						       true, hbt,
 						       menu->min_pcnt,
 						       menu->env,
-						       warn_lost_event);
+						       warn_lost_event,
+						       menu->annotation_opts);
 			ui_browser__show_title(&menu->b, title);
 			switch (key) {
 			case K_TAB:
@@ -3227,7 +3233,8 @@ static int __perf_evlist__tui_browse_hists(struct perf_evlist *evlist,
 					   struct hist_browser_timer *hbt,
 					   float min_pcnt,
 					   struct perf_env *env,
-					   bool warn_lost_event)
+					   bool warn_lost_event,
+					   struct annotation_options *annotation_opts)
 {
 	struct perf_evsel *pos;
 	struct perf_evsel_menu menu = {
@@ -3242,6 +3249,7 @@ static int __perf_evlist__tui_browse_hists(struct perf_evlist *evlist,
 		},
 		.min_pcnt = min_pcnt,
 		.env = env,
+		.annotation_opts = annotation_opts,
 	};
 
 	ui_helpline__push("Press ESC to exit");
@@ -3262,7 +3270,8 @@ int perf_evlist__tui_browse_hists(struct perf_evlist *evlist, const char *help,
 				  struct hist_browser_timer *hbt,
 				  float min_pcnt,
 				  struct perf_env *env,
-				  bool warn_lost_event)
+				  bool warn_lost_event,
+				  struct annotation_options *annotation_opts)
 {
 	int nr_entries = evlist->nr_entries;
 
@@ -3272,7 +3281,8 @@ single_entry:
 
 		return perf_evsel__hists_browse(first, nr_entries, help,
 						false, hbt, min_pcnt,
-						env, warn_lost_event);
+						env, warn_lost_event,
+						annotation_opts);
 	}
 
 	if (symbol_conf.event_group) {
@@ -3290,5 +3300,6 @@ single_entry:
 
 	return __perf_evlist__tui_browse_hists(evlist, nr_entries, help,
 					       hbt, min_pcnt, env,
-					       warn_lost_event);
+					       warn_lost_event,
+					       annotation_opts);
 }
