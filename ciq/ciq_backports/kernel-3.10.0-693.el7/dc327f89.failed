@@ -1,0 +1,114 @@
+net_sched: close another race condition in tcf_mirred_release()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] sched: close another race condition in tcf_mirred_release() (Ivan Vecera) [1428588]
+Rebuild_FUZZ: 96.72%
+commit-author WANG Cong <xiyou.wangcong@gmail.com>
+commit dc327f8931cb9d66191f489eb9a852fc04530546
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/dc327f89.failed
+
+We saw the following extra refcount release on veth device:
+
+  kernel: [7957821.463992] unregister_netdevice: waiting for mesos50284 to become free. Usage count = -1
+
+Since we heavily use mirred action to redirect packets to veth, I think
+this is caused by the following race condition:
+
+CPU0:
+tcf_mirred_release(): (in RCU callback)
+	struct net_device *dev = rcu_dereference_protected(m->tcfm_dev, 1);
+
+CPU1:
+mirred_device_event():
+        spin_lock_bh(&mirred_list_lock);
+        list_for_each_entry(m, &mirred_list, tcfm_list) {
+                if (rcu_access_pointer(m->tcfm_dev) == dev) {
+                        dev_put(dev);
+                        /* Note : no rcu grace period necessary, as
+                         * net_device are already rcu protected.
+                         */
+                        RCU_INIT_POINTER(m->tcfm_dev, NULL);
+                }
+        }
+        spin_unlock_bh(&mirred_list_lock);
+
+CPU0:
+tcf_mirred_release():
+        spin_lock_bh(&mirred_list_lock);
+        list_del(&m->tcfm_list);
+        spin_unlock_bh(&mirred_list_lock);
+        if (dev)               // <======== Stil refers to the old m->tcfm_dev
+                dev_put(dev);  // <======== dev_put() is called on it again
+
+The action init code path is good because it is impossible to modify
+an action that is being removed.
+
+So, fix this by moving everything under the spinlock.
+
+Fixes: 2ee22a90c7af ("net_sched: act_mirred: remove spinlock in fast path")
+Fixes: 6bd00b850635 ("act_mirred: fix a race condition on mirred_list")
+	Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit dc327f8931cb9d66191f489eb9a852fc04530546)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_mirred.c
+diff --cc net/sched/act_mirred.c
+index 4b6188539f6c,128942bc9e42..000000000000
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@@ -30,32 -30,21 +30,45 @@@
+  #include <linux/if_arp.h>
+  
+  #define MIRRED_TAB_MASK     7
+ +static struct tcf_common *tcf_mirred_ht[MIRRED_TAB_MASK + 1];
+ +static u32 mirred_idx_gen;
+ +static DEFINE_RWLOCK(mirred_lock);
+  static LIST_HEAD(mirred_list);
+ -static DEFINE_SPINLOCK(mirred_list_lock);
+  
+ -static void tcf_mirred_release(struct tc_action *a, int bind)
+ +static struct tcf_hashinfo mirred_hash_info = {
+ +	.htab	=	tcf_mirred_ht,
+ +	.hmask	=	MIRRED_TAB_MASK,
+ +	.lock	=	&mirred_lock,
+ +};
+ +
+ +static int tcf_mirred_release(struct tcf_mirred *m, int bind)
+  {
+++<<<<<<< HEAD
+ +	if (m) {
+ +		if (bind)
+ +			m->tcf_bindcnt--;
+ +		m->tcf_refcnt--;
+ +		if (!m->tcf_bindcnt && m->tcf_refcnt <= 0) {
+ +			list_del(&m->tcfm_list);
+ +			if (m->tcfm_dev)
+ +				dev_put(m->tcfm_dev);
+ +			tcf_hash_destroy(&m->common, &mirred_hash_info);
+ +			return 1;
+ +		}
+ +	}
+ +	return 0;
+++=======
++ 	struct tcf_mirred *m = to_mirred(a);
++ 	struct net_device *dev;
++ 
++ 	/* We could be called either in a RCU callback or with RTNL lock held. */
++ 	spin_lock_bh(&mirred_list_lock);
++ 	list_del(&m->tcfm_list);
++ 	dev = rcu_dereference_protected(m->tcfm_dev, 1);
++ 	if (dev)
++ 		dev_put(dev);
++ 	spin_unlock_bh(&mirred_list_lock);
+++>>>>>>> dc327f8931cb (net_sched: close another race condition in tcf_mirred_release())
+  }
+  
+  static const struct nla_policy mirred_policy[TCA_MIRRED_MAX + 1] = {
+* Unmerged path net/sched/act_mirred.c
