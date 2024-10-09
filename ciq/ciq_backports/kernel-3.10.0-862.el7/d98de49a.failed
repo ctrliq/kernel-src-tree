@@ -1,0 +1,980 @@
+iommu/amd: Enable vAPIC interrupt remapping mode by default
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [iommu] amd: Enable vAPIC interrupt remapping mode by default (Jerry Snitselaar) [1411581]
+Rebuild_FUZZ: 94.64%
+commit-author Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+commit d98de49a53e48f51332e97568127e722415e1232
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d98de49a.failed
+
+Introduce struct iommu_dev_data.use_vapic flag, which IOMMU driver
+uses to determine if it should enable vAPIC support, by setting
+the ga_mode bit in the device's interrupt remapping table entry.
+
+Currently, it is enabled for all pass-through device if vAPIC mode
+is enabled.
+
+	Signed-off-by: Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit d98de49a53e48f51332e97568127e722415e1232)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/amd_iommu.c
+#	drivers/iommu/amd_iommu_init.c
+#	drivers/iommu/amd_iommu_types.h
+diff --cc drivers/iommu/amd_iommu.c
+index c50870eecb8e,a7aa0e76eebd..000000000000
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@@ -3821,229 -3815,204 +3837,391 @@@ static void free_irte(u16 devid, int in
+  	iommu_completion_wait(iommu);
+  }
+  
+++<<<<<<< HEAD
+ +static int setup_ioapic_entry(int irq, struct IO_APIC_route_entry *entry,
+ +			      unsigned int destination, int vector,
+ +			      struct io_apic_irq_attr *attr)
+ +{
+ +	struct irq_remap_table *table;
+ +	struct irq_2_irte *irte_info;
+ +	struct irq_cfg *cfg;
+ +	union irte irte;
+ +	int ioapic_id;
+ +	int index;
+++=======
++ static void irte_prepare(void *entry,
++ 			 u32 delivery_mode, u32 dest_mode,
++ 			 u8 vector, u32 dest_apicid, int devid)
++ {
++ 	union irte *irte = (union irte *) entry;
++ 
++ 	irte->val                = 0;
++ 	irte->fields.vector      = vector;
++ 	irte->fields.int_type    = delivery_mode;
++ 	irte->fields.destination = dest_apicid;
++ 	irte->fields.dm          = dest_mode;
++ 	irte->fields.valid       = 1;
++ }
++ 
++ static void irte_ga_prepare(void *entry,
++ 			    u32 delivery_mode, u32 dest_mode,
++ 			    u8 vector, u32 dest_apicid, int devid)
++ {
++ 	struct irte_ga *irte = (struct irte_ga *) entry;
++ 	struct iommu_dev_data *dev_data = search_dev_data(devid);
++ 
++ 	irte->lo.val                      = 0;
++ 	irte->hi.val                      = 0;
++ 	irte->lo.fields_remap.guest_mode  = dev_data ? dev_data->use_vapic : 0;
++ 	irte->lo.fields_remap.int_type    = delivery_mode;
++ 	irte->lo.fields_remap.dm          = dest_mode;
++ 	irte->hi.fields.vector            = vector;
++ 	irte->lo.fields_remap.destination = dest_apicid;
++ 	irte->lo.fields_remap.valid       = 1;
++ }
++ 
++ static void irte_activate(void *entry, u16 devid, u16 index)
++ {
++ 	union irte *irte = (union irte *) entry;
++ 
++ 	irte->fields.valid = 1;
++ 	modify_irte(devid, index, irte);
++ }
++ 
++ static void irte_ga_activate(void *entry, u16 devid, u16 index)
++ {
++ 	struct irte_ga *irte = (struct irte_ga *) entry;
++ 
++ 	irte->lo.fields_remap.valid = 1;
++ 	modify_irte_ga(devid, index, irte, NULL);
++ }
++ 
++ static void irte_deactivate(void *entry, u16 devid, u16 index)
++ {
++ 	union irte *irte = (union irte *) entry;
++ 
++ 	irte->fields.valid = 0;
++ 	modify_irte(devid, index, irte);
++ }
++ 
++ static void irte_ga_deactivate(void *entry, u16 devid, u16 index)
++ {
++ 	struct irte_ga *irte = (struct irte_ga *) entry;
++ 
++ 	irte->lo.fields_remap.valid = 0;
++ 	modify_irte_ga(devid, index, irte, NULL);
++ }
++ 
++ static void irte_set_affinity(void *entry, u16 devid, u16 index,
++ 			      u8 vector, u32 dest_apicid)
++ {
++ 	union irte *irte = (union irte *) entry;
++ 
++ 	irte->fields.vector = vector;
++ 	irte->fields.destination = dest_apicid;
++ 	modify_irte(devid, index, irte);
++ }
++ 
++ static void irte_ga_set_affinity(void *entry, u16 devid, u16 index,
++ 				 u8 vector, u32 dest_apicid)
++ {
++ 	struct irte_ga *irte = (struct irte_ga *) entry;
++ 	struct iommu_dev_data *dev_data = search_dev_data(devid);
++ 
++ 	if (!dev_data || !dev_data->use_vapic) {
++ 		irte->hi.fields.vector = vector;
++ 		irte->lo.fields_remap.destination = dest_apicid;
++ 		irte->lo.fields_remap.guest_mode = 0;
++ 		modify_irte_ga(devid, index, irte, NULL);
++ 	}
++ }
++ 
++ #define IRTE_ALLOCATED (~1U)
++ static void irte_set_allocated(struct irq_remap_table *table, int index)
++ {
++ 	table->table[index] = IRTE_ALLOCATED;
++ }
++ 
++ static void irte_ga_set_allocated(struct irq_remap_table *table, int index)
++ {
++ 	struct irte_ga *ptr = (struct irte_ga *)table->table;
++ 	struct irte_ga *irte = &ptr[index];
++ 
++ 	memset(&irte->lo.val, 0, sizeof(u64));
++ 	memset(&irte->hi.val, 0, sizeof(u64));
++ 	irte->hi.fields.vector = 0xff;
++ }
++ 
++ static bool irte_is_allocated(struct irq_remap_table *table, int index)
++ {
++ 	union irte *ptr = (union irte *)table->table;
++ 	union irte *irte = &ptr[index];
++ 
++ 	return irte->val != 0;
++ }
++ 
++ static bool irte_ga_is_allocated(struct irq_remap_table *table, int index)
++ {
++ 	struct irte_ga *ptr = (struct irte_ga *)table->table;
++ 	struct irte_ga *irte = &ptr[index];
++ 
++ 	return irte->hi.fields.vector != 0;
++ }
++ 
++ static void irte_clear_allocated(struct irq_remap_table *table, int index)
++ {
++ 	table->table[index] = 0;
++ }
++ 
++ static void irte_ga_clear_allocated(struct irq_remap_table *table, int index)
++ {
++ 	struct irte_ga *ptr = (struct irte_ga *)table->table;
++ 	struct irte_ga *irte = &ptr[index];
++ 
++ 	memset(&irte->lo.val, 0, sizeof(u64));
++ 	memset(&irte->hi.val, 0, sizeof(u64));
++ }
++ 
++ static int get_devid(struct irq_alloc_info *info)
++ {
++ 	int devid = -1;
++ 
++ 	switch (info->type) {
++ 	case X86_IRQ_ALLOC_TYPE_IOAPIC:
++ 		devid     = get_ioapic_devid(info->ioapic_id);
++ 		break;
++ 	case X86_IRQ_ALLOC_TYPE_HPET:
++ 		devid     = get_hpet_devid(info->hpet_id);
++ 		break;
++ 	case X86_IRQ_ALLOC_TYPE_MSI:
++ 	case X86_IRQ_ALLOC_TYPE_MSIX:
++ 		devid = get_device_id(&info->msi_dev->dev);
++ 		break;
++ 	default:
++ 		BUG_ON(1);
++ 		break;
++ 	}
++ 
++ 	return devid;
++ }
++ 
++ static struct irq_domain *get_ir_irq_domain(struct irq_alloc_info *info)
++ {
++ 	struct amd_iommu *iommu;
+++>>>>>>> d98de49a53e4 (iommu/amd: Enable vAPIC interrupt remapping mode by default)
+  	int devid;
+ +	int ret;
+  
+ -	if (!info)
+ -		return NULL;
+ +	cfg = irq_get_chip_data(irq);
+ +	if (!cfg)
+ +		return -EINVAL;
+  
+ -	devid = get_devid(info);
+ -	if (devid >= 0) {
+ -		iommu = amd_iommu_rlookup_table[devid];
+ -		if (iommu)
+ -			return iommu->ir_domain;
+ -	}
+ +	irte_info = &cfg->irq_2_irte;
+ +	ioapic_id = mpc_ioapic_id(attr->ioapic);
+ +	devid     = get_ioapic_devid(ioapic_id);
+  
+ -	return NULL;
+ +	if (devid < 0)
+ +		return devid;
+ +
+ +	table = get_irq_table(devid, true);
+ +	if (table == NULL)
+ +		return -ENOMEM;
+ +
+ +	index = attr->ioapic_pin;
+ +
+ +	/* Setup IRQ remapping info */
+ +	cfg->remapped	      = 1;
+ +	irte_info->devid      = devid;
+ +	irte_info->index      = index;
+ +
+ +	/* Setup IRTE for IOMMU */
+ +	irte.val		= 0;
+ +	irte.fields.vector      = vector;
+ +	irte.fields.int_type    = apic->irq_delivery_mode;
+ +	irte.fields.destination = destination;
+ +	irte.fields.dm          = apic->irq_dest_mode;
+ +	irte.fields.valid       = 1;
+ +
+ +	ret = modify_irte(devid, index, irte);
+ +	if (ret)
+ +		return ret;
+ +
+ +	/* Setup IOAPIC entry */
+ +	memset(entry, 0, sizeof(*entry));
+ +
+ +	entry->vector        = index;
+ +	entry->mask          = 0;
+ +	entry->trigger       = attr->trigger;
+ +	entry->polarity      = attr->polarity;
+ +
+ +	/*
+ +	 * Mask level triggered irqs.
+ +	 */
+ +	if (attr->trigger)
+ +		entry->mask = 1;
+ +
+ +	return 0;
+  }
+  
+ -static struct irq_domain *get_irq_domain(struct irq_alloc_info *info)
+ +static int set_affinity(struct irq_data *data, const struct cpumask *mask,
+ +			bool force)
+  {
+ -	struct amd_iommu *iommu;
+ -	int devid;
+ +	struct irq_2_irte *irte_info;
+ +	unsigned int dest, irq;
+ +	struct irq_cfg *cfg;
+ +	union irte irte;
+ +	int err;
+  
+ -	if (!info)
+ -		return NULL;
+ +	if (!config_enabled(CONFIG_SMP))
+ +		return -1;
+  
+ -	switch (info->type) {
+ -	case X86_IRQ_ALLOC_TYPE_MSI:
+ -	case X86_IRQ_ALLOC_TYPE_MSIX:
+ -		devid = get_device_id(&info->msi_dev->dev);
+ -		if (devid < 0)
+ -			return NULL;
+ +	cfg       = data->chip_data;
+ +	irq       = data->irq;
+ +	irte_info = &cfg->irq_2_irte;
+  
+ -		iommu = amd_iommu_rlookup_table[devid];
+ -		if (iommu)
+ -			return iommu->msi_domain;
+ -		break;
+ -	default:
+ -		break;
+ +	if (!cpumask_intersects(mask, cpu_online_mask))
+ +		return -EINVAL;
+ +
+ +	if (get_irte(irte_info->devid, irte_info->index, &irte))
+ +		return -EBUSY;
+ +
+ +	if (assign_irq_vector(irq, cfg, mask))
+ +		return -EBUSY;
+ +
+ +	err = apic->cpu_mask_to_apicid_and(cfg->domain, mask, &dest);
+ +	if (err) {
+ +		if (assign_irq_vector(irq, cfg, data->affinity))
+ +			pr_err("AMD-Vi: Failed to recover vector for irq %d\n", irq);
+ +		return err;
+  	}
+  
+ -	return NULL;
+ +	irte.fields.vector      = cfg->vector;
+ +	irte.fields.destination = dest;
+ +
+ +	modify_irte(irte_info->devid, irte_info->index, irte);
+ +
+ +	if (cfg->move_in_progress)
+ +		send_cleanup_vector(cfg);
+ +
+ +	cpumask_copy(data->affinity, mask);
+ +
+ +	return 0;
+ +}
+ +
+ +static int free_irq(int irq)
+ +{
+ +	struct irq_2_irte *irte_info;
+ +	struct irq_cfg *cfg;
+ +
+ +	cfg = irq_get_chip_data(irq);
+ +	if (!cfg)
+ +		return -EINVAL;
+ +
+ +	irte_info = &cfg->irq_2_irte;
+ +
+ +	free_irte(irte_info->devid, irte_info->index);
+ +
+ +	return 0;
+ +}
+ +
+ +static void compose_msi_msg(struct pci_dev *pdev,
+ +			    unsigned int irq, unsigned int dest,
+ +			    struct msi_msg *msg, u8 hpet_id)
+ +{
+ +	struct irq_2_irte *irte_info;
+ +	struct irq_cfg *cfg;
+ +	union irte irte;
+ +
+ +	cfg = irq_get_chip_data(irq);
+ +	if (!cfg)
+ +		return;
+ +
+ +	irte_info = &cfg->irq_2_irte;
+ +
+ +	irte.val		= 0;
+ +	irte.fields.vector	= cfg->vector;
+ +	irte.fields.int_type    = apic->irq_delivery_mode;
+ +	irte.fields.destination	= dest;
+ +	irte.fields.dm		= apic->irq_dest_mode;
+ +	irte.fields.valid	= 1;
+ +
+ +	modify_irte(irte_info->devid, irte_info->index, irte);
+ +
+ +	msg->address_hi = MSI_ADDR_BASE_HI;
+ +	msg->address_lo = MSI_ADDR_BASE_LO;
+ +	msg->data       = irte_info->index;
+ +}
+ +
+ +static int msi_alloc_irq(struct pci_dev *pdev, int irq, int nvec)
+ +{
+ +	struct irq_cfg *cfg;
+ +	int index;
+ +	u16 devid;
+ +
+ +	if (!pdev)
+ +		return -EINVAL;
+ +
+ +	cfg = irq_get_chip_data(irq);
+ +	if (!cfg)
+ +		return -EINVAL;
+ +
+ +	devid = get_device_id(&pdev->dev);
+ +	index = alloc_irq_index(cfg, devid, nvec);
+ +
+ +	return index < 0 ? MAX_IRQS_PER_TABLE : index;
+ +}
+ +
+ +static int msi_setup_irq(struct pci_dev *pdev, unsigned int irq,
+ +			 int index, int offset)
+ +{
+ +	struct irq_2_irte *irte_info;
+ +	struct irq_cfg *cfg;
+ +	u16 devid;
+ +
+ +	if (!pdev)
+ +		return -EINVAL;
+ +
+ +	cfg = irq_get_chip_data(irq);
+ +	if (!cfg)
+ +		return -EINVAL;
+ +
+ +	if (index >= MAX_IRQS_PER_TABLE)
+ +		return 0;
+ +
+ +	devid		= get_device_id(&pdev->dev);
+ +	irte_info	= &cfg->irq_2_irte;
+ +
+ +	cfg->remapped	      = 1;
+ +	irte_info->devid      = devid;
+ +	irte_info->index      = index + offset;
+ +
+ +	return 0;
+ +}
+ +
+ +static int alloc_hpet_msi(unsigned int irq, unsigned int id)
+ +{
+ +	struct irq_2_irte *irte_info;
+ +	struct irq_cfg *cfg;
+ +	int index, devid;
+ +
+ +	cfg = irq_get_chip_data(irq);
+ +	if (!cfg)
+ +		return -EINVAL;
+ +
+ +	irte_info = &cfg->irq_2_irte;
+ +	devid     = get_hpet_devid(id);
+ +	if (devid < 0)
+ +		return devid;
+ +
+ +	index = alloc_irq_index(cfg, devid, 1);
+ +	if (index < 0)
+ +		return index;
+ +
+ +	cfg->remapped	      = 1;
+ +	irte_info->devid      = devid;
+ +	irte_info->index      = index;
+ +
+ +	return 0;
+  }
+  
+  struct irq_remap_ops amd_iommu_irq_ops = {
+@@@ -4052,12 -4021,379 +4230,387 @@@
+  	.disable		= amd_iommu_disable,
+  	.reenable		= amd_iommu_reenable,
+  	.enable_faulting	= amd_iommu_enable_faulting,
+ -	.get_ir_irq_domain	= get_ir_irq_domain,
+ -	.get_irq_domain		= get_irq_domain,
+ +	.setup_ioapic_entry	= setup_ioapic_entry,
+ +	.set_affinity		= set_affinity,
+ +	.free_irq		= free_irq,
+ +	.compose_msi_msg	= compose_msi_msg,
+ +	.msi_alloc_irq		= msi_alloc_irq,
+ +	.msi_setup_irq		= msi_setup_irq,
+ +	.alloc_hpet_msi		= alloc_hpet_msi,
+  };
+++<<<<<<< HEAD
+++=======
++ 
++ static void irq_remapping_prepare_irte(struct amd_ir_data *data,
++ 				       struct irq_cfg *irq_cfg,
++ 				       struct irq_alloc_info *info,
++ 				       int devid, int index, int sub_handle)
++ {
++ 	struct irq_2_irte *irte_info = &data->irq_2_irte;
++ 	struct msi_msg *msg = &data->msi_entry;
++ 	struct IO_APIC_route_entry *entry;
++ 	struct amd_iommu *iommu = amd_iommu_rlookup_table[devid];
++ 
++ 	if (!iommu)
++ 		return;
++ 
++ 	data->irq_2_irte.devid = devid;
++ 	data->irq_2_irte.index = index + sub_handle;
++ 	iommu->irte_ops->prepare(data->entry, apic->irq_delivery_mode,
++ 				 apic->irq_dest_mode, irq_cfg->vector,
++ 				 irq_cfg->dest_apicid, devid);
++ 
++ 	switch (info->type) {
++ 	case X86_IRQ_ALLOC_TYPE_IOAPIC:
++ 		/* Setup IOAPIC entry */
++ 		entry = info->ioapic_entry;
++ 		info->ioapic_entry = NULL;
++ 		memset(entry, 0, sizeof(*entry));
++ 		entry->vector        = index;
++ 		entry->mask          = 0;
++ 		entry->trigger       = info->ioapic_trigger;
++ 		entry->polarity      = info->ioapic_polarity;
++ 		/* Mask level triggered irqs. */
++ 		if (info->ioapic_trigger)
++ 			entry->mask = 1;
++ 		break;
++ 
++ 	case X86_IRQ_ALLOC_TYPE_HPET:
++ 	case X86_IRQ_ALLOC_TYPE_MSI:
++ 	case X86_IRQ_ALLOC_TYPE_MSIX:
++ 		msg->address_hi = MSI_ADDR_BASE_HI;
++ 		msg->address_lo = MSI_ADDR_BASE_LO;
++ 		msg->data = irte_info->index;
++ 		break;
++ 
++ 	default:
++ 		BUG_ON(1);
++ 		break;
++ 	}
++ }
++ 
++ struct amd_irte_ops irte_32_ops = {
++ 	.prepare = irte_prepare,
++ 	.activate = irte_activate,
++ 	.deactivate = irte_deactivate,
++ 	.set_affinity = irte_set_affinity,
++ 	.set_allocated = irte_set_allocated,
++ 	.is_allocated = irte_is_allocated,
++ 	.clear_allocated = irte_clear_allocated,
++ };
++ 
++ struct amd_irte_ops irte_128_ops = {
++ 	.prepare = irte_ga_prepare,
++ 	.activate = irte_ga_activate,
++ 	.deactivate = irte_ga_deactivate,
++ 	.set_affinity = irte_ga_set_affinity,
++ 	.set_allocated = irte_ga_set_allocated,
++ 	.is_allocated = irte_ga_is_allocated,
++ 	.clear_allocated = irte_ga_clear_allocated,
++ };
++ 
++ static int irq_remapping_alloc(struct irq_domain *domain, unsigned int virq,
++ 			       unsigned int nr_irqs, void *arg)
++ {
++ 	struct irq_alloc_info *info = arg;
++ 	struct irq_data *irq_data;
++ 	struct amd_ir_data *data = NULL;
++ 	struct irq_cfg *cfg;
++ 	int i, ret, devid;
++ 	int index = -1;
++ 
++ 	if (!info)
++ 		return -EINVAL;
++ 	if (nr_irqs > 1 && info->type != X86_IRQ_ALLOC_TYPE_MSI &&
++ 	    info->type != X86_IRQ_ALLOC_TYPE_MSIX)
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * With IRQ remapping enabled, don't need contiguous CPU vectors
++ 	 * to support multiple MSI interrupts.
++ 	 */
++ 	if (info->type == X86_IRQ_ALLOC_TYPE_MSI)
++ 		info->flags &= ~X86_IRQ_ALLOC_CONTIGUOUS_VECTORS;
++ 
++ 	devid = get_devid(info);
++ 	if (devid < 0)
++ 		return -EINVAL;
++ 
++ 	ret = irq_domain_alloc_irqs_parent(domain, virq, nr_irqs, arg);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	if (info->type == X86_IRQ_ALLOC_TYPE_IOAPIC) {
++ 		if (get_irq_table(devid, true))
++ 			index = info->ioapic_pin;
++ 		else
++ 			ret = -ENOMEM;
++ 	} else {
++ 		index = alloc_irq_index(devid, nr_irqs);
++ 	}
++ 	if (index < 0) {
++ 		pr_warn("Failed to allocate IRTE\n");
++ 		goto out_free_parent;
++ 	}
++ 
++ 	for (i = 0; i < nr_irqs; i++) {
++ 		irq_data = irq_domain_get_irq_data(domain, virq + i);
++ 		cfg = irqd_cfg(irq_data);
++ 		if (!irq_data || !cfg) {
++ 			ret = -EINVAL;
++ 			goto out_free_data;
++ 		}
++ 
++ 		ret = -ENOMEM;
++ 		data = kzalloc(sizeof(*data), GFP_KERNEL);
++ 		if (!data)
++ 			goto out_free_data;
++ 
++ 		if (!AMD_IOMMU_GUEST_IR_GA(amd_iommu_guest_ir))
++ 			data->entry = kzalloc(sizeof(union irte), GFP_KERNEL);
++ 		else
++ 			data->entry = kzalloc(sizeof(struct irte_ga),
++ 						     GFP_KERNEL);
++ 		if (!data->entry) {
++ 			kfree(data);
++ 			goto out_free_data;
++ 		}
++ 
++ 		irq_data->hwirq = (devid << 16) + i;
++ 		irq_data->chip_data = data;
++ 		irq_data->chip = &amd_ir_chip;
++ 		irq_remapping_prepare_irte(data, cfg, info, devid, index, i);
++ 		irq_set_status_flags(virq + i, IRQ_MOVE_PCNTXT);
++ 	}
++ 
++ 	return 0;
++ 
++ out_free_data:
++ 	for (i--; i >= 0; i--) {
++ 		irq_data = irq_domain_get_irq_data(domain, virq + i);
++ 		if (irq_data)
++ 			kfree(irq_data->chip_data);
++ 	}
++ 	for (i = 0; i < nr_irqs; i++)
++ 		free_irte(devid, index + i);
++ out_free_parent:
++ 	irq_domain_free_irqs_common(domain, virq, nr_irqs);
++ 	return ret;
++ }
++ 
++ static void irq_remapping_free(struct irq_domain *domain, unsigned int virq,
++ 			       unsigned int nr_irqs)
++ {
++ 	struct irq_2_irte *irte_info;
++ 	struct irq_data *irq_data;
++ 	struct amd_ir_data *data;
++ 	int i;
++ 
++ 	for (i = 0; i < nr_irqs; i++) {
++ 		irq_data = irq_domain_get_irq_data(domain, virq  + i);
++ 		if (irq_data && irq_data->chip_data) {
++ 			data = irq_data->chip_data;
++ 			irte_info = &data->irq_2_irte;
++ 			free_irte(irte_info->devid, irte_info->index);
++ 			kfree(data->entry);
++ 			kfree(data);
++ 		}
++ 	}
++ 	irq_domain_free_irqs_common(domain, virq, nr_irqs);
++ }
++ 
++ static void irq_remapping_activate(struct irq_domain *domain,
++ 				   struct irq_data *irq_data)
++ {
++ 	struct amd_ir_data *data = irq_data->chip_data;
++ 	struct irq_2_irte *irte_info = &data->irq_2_irte;
++ 	struct amd_iommu *iommu = amd_iommu_rlookup_table[irte_info->devid];
++ 
++ 	if (iommu)
++ 		iommu->irte_ops->activate(data->entry, irte_info->devid,
++ 					  irte_info->index);
++ }
++ 
++ static void irq_remapping_deactivate(struct irq_domain *domain,
++ 				     struct irq_data *irq_data)
++ {
++ 	struct amd_ir_data *data = irq_data->chip_data;
++ 	struct irq_2_irte *irte_info = &data->irq_2_irte;
++ 	struct amd_iommu *iommu = amd_iommu_rlookup_table[irte_info->devid];
++ 
++ 	if (iommu)
++ 		iommu->irte_ops->deactivate(data->entry, irte_info->devid,
++ 					    irte_info->index);
++ }
++ 
++ static struct irq_domain_ops amd_ir_domain_ops = {
++ 	.alloc = irq_remapping_alloc,
++ 	.free = irq_remapping_free,
++ 	.activate = irq_remapping_activate,
++ 	.deactivate = irq_remapping_deactivate,
++ };
++ 
++ static int amd_ir_set_vcpu_affinity(struct irq_data *data, void *vcpu_info)
++ {
++ 	struct amd_iommu *iommu;
++ 	struct amd_iommu_pi_data *pi_data = vcpu_info;
++ 	struct vcpu_data *vcpu_pi_info = pi_data->vcpu_data;
++ 	struct amd_ir_data *ir_data = data->chip_data;
++ 	struct irte_ga *irte = (struct irte_ga *) ir_data->entry;
++ 	struct irq_2_irte *irte_info = &ir_data->irq_2_irte;
++ 	struct iommu_dev_data *dev_data = search_dev_data(irte_info->devid);
++ 
++ 	/* Note:
++ 	 * This device has never been set up for guest mode.
++ 	 * we should not modify the IRTE
++ 	 */
++ 	if (!dev_data || !dev_data->use_vapic)
++ 		return 0;
++ 
++ 	pi_data->ir_data = ir_data;
++ 
++ 	/* Note:
++ 	 * SVM tries to set up for VAPIC mode, but we are in
++ 	 * legacy mode. So, we force legacy mode instead.
++ 	 */
++ 	if (!AMD_IOMMU_GUEST_IR_VAPIC(amd_iommu_guest_ir)) {
++ 		pr_debug("AMD-Vi: %s: Fall back to using intr legacy remap\n",
++ 			 __func__);
++ 		pi_data->is_guest_mode = false;
++ 	}
++ 
++ 	iommu = amd_iommu_rlookup_table[irte_info->devid];
++ 	if (iommu == NULL)
++ 		return -EINVAL;
++ 
++ 	pi_data->prev_ga_tag = ir_data->cached_ga_tag;
++ 	if (pi_data->is_guest_mode) {
++ 		/* Setting */
++ 		irte->hi.fields.ga_root_ptr = (pi_data->base >> 12);
++ 		irte->hi.fields.vector = vcpu_pi_info->vector;
++ 		irte->lo.fields_vapic.guest_mode = 1;
++ 		irte->lo.fields_vapic.ga_tag = pi_data->ga_tag;
++ 
++ 		ir_data->cached_ga_tag = pi_data->ga_tag;
++ 	} else {
++ 		/* Un-Setting */
++ 		struct irq_cfg *cfg = irqd_cfg(data);
++ 
++ 		irte->hi.val = 0;
++ 		irte->lo.val = 0;
++ 		irte->hi.fields.vector = cfg->vector;
++ 		irte->lo.fields_remap.guest_mode = 0;
++ 		irte->lo.fields_remap.destination = cfg->dest_apicid;
++ 		irte->lo.fields_remap.int_type = apic->irq_delivery_mode;
++ 		irte->lo.fields_remap.dm = apic->irq_dest_mode;
++ 
++ 		/*
++ 		 * This communicates the ga_tag back to the caller
++ 		 * so that it can do all the necessary clean up.
++ 		 */
++ 		ir_data->cached_ga_tag = 0;
++ 	}
++ 
++ 	return modify_irte_ga(irte_info->devid, irte_info->index, irte, ir_data);
++ }
++ 
++ static int amd_ir_set_affinity(struct irq_data *data,
++ 			       const struct cpumask *mask, bool force)
++ {
++ 	struct amd_ir_data *ir_data = data->chip_data;
++ 	struct irq_2_irte *irte_info = &ir_data->irq_2_irte;
++ 	struct irq_cfg *cfg = irqd_cfg(data);
++ 	struct irq_data *parent = data->parent_data;
++ 	struct amd_iommu *iommu = amd_iommu_rlookup_table[irte_info->devid];
++ 	int ret;
++ 
++ 	if (!iommu)
++ 		return -ENODEV;
++ 
++ 	ret = parent->chip->irq_set_affinity(parent, mask, force);
++ 	if (ret < 0 || ret == IRQ_SET_MASK_OK_DONE)
++ 		return ret;
++ 
++ 	/*
++ 	 * Atomically updates the IRTE with the new destination, vector
++ 	 * and flushes the interrupt entry cache.
++ 	 */
++ 	iommu->irte_ops->set_affinity(ir_data->entry, irte_info->devid,
++ 			    irte_info->index, cfg->vector, cfg->dest_apicid);
++ 
++ 	/*
++ 	 * After this point, all the interrupts will start arriving
++ 	 * at the new destination. So, time to cleanup the previous
++ 	 * vector allocation.
++ 	 */
++ 	send_cleanup_vector(cfg);
++ 
++ 	return IRQ_SET_MASK_OK_DONE;
++ }
++ 
++ static void ir_compose_msi_msg(struct irq_data *irq_data, struct msi_msg *msg)
++ {
++ 	struct amd_ir_data *ir_data = irq_data->chip_data;
++ 
++ 	*msg = ir_data->msi_entry;
++ }
++ 
++ static struct irq_chip amd_ir_chip = {
++ 	.irq_ack = ir_ack_apic_edge,
++ 	.irq_set_affinity = amd_ir_set_affinity,
++ 	.irq_set_vcpu_affinity = amd_ir_set_vcpu_affinity,
++ 	.irq_compose_msi_msg = ir_compose_msi_msg,
++ };
++ 
++ int amd_iommu_create_irq_domain(struct amd_iommu *iommu)
++ {
++ 	iommu->ir_domain = irq_domain_add_tree(NULL, &amd_ir_domain_ops, iommu);
++ 	if (!iommu->ir_domain)
++ 		return -ENOMEM;
++ 
++ 	iommu->ir_domain->parent = arch_get_ir_parent_domain();
++ 	iommu->msi_domain = arch_create_msi_irq_domain(iommu->ir_domain);
++ 
++ 	return 0;
++ }
++ 
++ int amd_iommu_update_ga(int cpu, bool is_run, void *data)
++ {
++ 	unsigned long flags;
++ 	struct amd_iommu *iommu;
++ 	struct irq_remap_table *irt;
++ 	struct amd_ir_data *ir_data = (struct amd_ir_data *)data;
++ 	int devid = ir_data->irq_2_irte.devid;
++ 	struct irte_ga *entry = (struct irte_ga *) ir_data->entry;
++ 	struct irte_ga *ref = (struct irte_ga *) ir_data->ref;
++ 
++ 	if (!AMD_IOMMU_GUEST_IR_VAPIC(amd_iommu_guest_ir) ||
++ 	    !ref || !entry || !entry->lo.fields_vapic.guest_mode)
++ 		return 0;
++ 
++ 	iommu = amd_iommu_rlookup_table[devid];
++ 	if (!iommu)
++ 		return -ENODEV;
++ 
++ 	irt = get_irq_table(devid, false);
++ 	if (!irt)
++ 		return -ENODEV;
++ 
++ 	spin_lock_irqsave(&irt->lock, flags);
++ 
++ 	if (ref->lo.fields_vapic.guest_mode) {
++ 		if (cpu >= 0)
++ 			ref->lo.fields_vapic.destination = cpu;
++ 		ref->lo.fields_vapic.is_run = is_run;
++ 		barrier();
++ 	}
++ 
++ 	spin_unlock_irqrestore(&irt->lock, flags);
++ 
++ 	iommu_flush_irt(iommu, devid);
++ 	iommu_completion_wait(iommu);
++ 	return 0;
++ }
++ EXPORT_SYMBOL(amd_iommu_update_ga);
+++>>>>>>> d98de49a53e4 (iommu/amd: Enable vAPIC interrupt remapping mode by default)
+  #endif
+diff --cc drivers/iommu/amd_iommu_init.c
+index d1b313b945cf,cd1713631a4a..000000000000
+--- a/drivers/iommu/amd_iommu_init.c
++++ b/drivers/iommu/amd_iommu_init.c
+@@@ -142,6 -146,8 +142,11 @@@ struct ivmd_header 
+  bool amd_iommu_dump;
+  bool amd_iommu_irq_remap __read_mostly;
+  
+++<<<<<<< HEAD
+++=======
++ int amd_iommu_guest_ir = AMD_IOMMU_GUEST_IR_VAPIC;
++ 
+++>>>>>>> d98de49a53e4 (iommu/amd: Enable vAPIC interrupt remapping mode by default)
+  static bool amd_iommu_detected;
+  static bool __initdata amd_iommu_disabled;
+  static int amd_iommu_target_ivhd_type;
+diff --cc drivers/iommu/amd_iommu_types.h
+index c9e00df52a4f,fa766eefd590..000000000000
+--- a/drivers/iommu/amd_iommu_types.h
++++ b/drivers/iommu/amd_iommu_types.h
+@@@ -668,4 -722,112 +668,115 @@@ static inline int get_hpet_devid(int id
+  	return -EINVAL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ enum amd_iommu_intr_mode_type {
++ 	AMD_IOMMU_GUEST_IR_LEGACY,
++ 
++ 	/* This mode is not visible to users. It is used when
++ 	 * we cannot fully enable vAPIC and fallback to only support
++ 	 * legacy interrupt remapping via 128-bit IRTE.
++ 	 */
++ 	AMD_IOMMU_GUEST_IR_LEGACY_GA,
++ 	AMD_IOMMU_GUEST_IR_VAPIC,
++ };
++ 
++ #define AMD_IOMMU_GUEST_IR_GA(x)	(x == AMD_IOMMU_GUEST_IR_VAPIC || \
++ 					 x == AMD_IOMMU_GUEST_IR_LEGACY_GA)
++ 
++ #define AMD_IOMMU_GUEST_IR_VAPIC(x)	(x == AMD_IOMMU_GUEST_IR_VAPIC)
++ 
++ union irte {
++ 	u32 val;
++ 	struct {
++ 		u32 valid	: 1,
++ 		    no_fault	: 1,
++ 		    int_type	: 3,
++ 		    rq_eoi	: 1,
++ 		    dm		: 1,
++ 		    rsvd_1	: 1,
++ 		    destination	: 8,
++ 		    vector	: 8,
++ 		    rsvd_2	: 8;
++ 	} fields;
++ };
++ 
++ union irte_ga_lo {
++ 	u64 val;
++ 
++ 	/* For int remapping */
++ 	struct {
++ 		u64 valid	: 1,
++ 		    no_fault	: 1,
++ 		    /* ------ */
++ 		    int_type	: 3,
++ 		    rq_eoi	: 1,
++ 		    dm		: 1,
++ 		    /* ------ */
++ 		    guest_mode	: 1,
++ 		    destination	: 8,
++ 		    rsvd	: 48;
++ 	} fields_remap;
++ 
++ 	/* For guest vAPIC */
++ 	struct {
++ 		u64 valid	: 1,
++ 		    no_fault	: 1,
++ 		    /* ------ */
++ 		    ga_log_intr	: 1,
++ 		    rsvd1	: 3,
++ 		    is_run	: 1,
++ 		    /* ------ */
++ 		    guest_mode	: 1,
++ 		    destination	: 8,
++ 		    rsvd2	: 16,
++ 		    ga_tag	: 32;
++ 	} fields_vapic;
++ };
++ 
++ union irte_ga_hi {
++ 	u64 val;
++ 	struct {
++ 		u64 vector	: 8,
++ 		    rsvd_1	: 4,
++ 		    ga_root_ptr	: 40,
++ 		    rsvd_2	: 12;
++ 	} fields;
++ };
++ 
++ struct irte_ga {
++ 	union irte_ga_lo lo;
++ 	union irte_ga_hi hi;
++ };
++ 
++ struct irq_2_irte {
++ 	u16 devid; /* Device ID for IRTE table */
++ 	u16 index; /* Index into IRTE table*/
++ };
++ 
++ struct amd_ir_data {
++ 	u32 cached_ga_tag;
++ 	struct irq_2_irte irq_2_irte;
++ 	struct msi_msg msi_entry;
++ 	void *entry;    /* Pointer to union irte or struct irte_ga */
++ 	void *ref;      /* Pointer to the actual irte */
++ };
++ 
++ struct amd_irte_ops {
++ 	void (*prepare)(void *, u32, u32, u8, u32, int);
++ 	void (*activate)(void *, u16, u16);
++ 	void (*deactivate)(void *, u16, u16);
++ 	void (*set_affinity)(void *, u16, u16, u8, u32);
++ 	void *(*get)(struct irq_remap_table *, int);
++ 	void (*set_allocated)(struct irq_remap_table *, int);
++ 	bool (*is_allocated)(struct irq_remap_table *, int);
++ 	void (*clear_allocated)(struct irq_remap_table *, int);
++ };
++ 
++ #ifdef CONFIG_IRQ_REMAP
++ extern struct amd_irte_ops irte_32_ops;
++ extern struct amd_irte_ops irte_128_ops;
++ #endif
++ 
+++>>>>>>> d98de49a53e4 (iommu/amd: Enable vAPIC interrupt remapping mode by default)
+  #endif /* _ASM_X86_AMD_IOMMU_TYPES_H */
+* Unmerged path drivers/iommu/amd_iommu.c
+* Unmerged path drivers/iommu/amd_iommu_init.c
+* Unmerged path drivers/iommu/amd_iommu_types.h
