@@ -33,6 +33,7 @@ int __iio_add_chan_devattr(const char *postfix,
 			   bool generic,
 			   struct device *dev,
 			   struct list_head *attr_list);
+void iio_free_chan_devattr_list(struct list_head *attr_list);
 
 /* Event interface flags */
 #define IIO_BUSY_BIT_POS 1
