@@ -1,0 +1,129 @@
+perf script: Support user regs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Andi Kleen <ak@linux.intel.com>
+commit b1491ace8eb2e92677cd9ee966763f8f53d29d16
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b1491ace.failed
+
+Teach perf script to print user regs.
+
+  % perf record --user-regs=ip,sp ...
+  % perf script -F ip,sym,uregs
+  ...
+   ffffffff9e060c24 native_write_msr ABI:2    SP:0x7ffd0ea06c38    IP:0x7fe77f55b637
+   ffffffff9e060c24 native_write_msr ABI:2    SP:0x7ffd0ea06c38    IP:0x7fe77f55b637
+   ffffffff9e060c24 native_write_msr ABI:2    SP:0x7ffd0ea06c38    IP:0x7fe77f55b637
+   ffffffff9e060c24 native_write_msr ABI:2    SP:0x7ffd0ea06c38    IP:0x7fe77f55b637
+   ffffffff9e00cc12 intel_pmu_handle_irq ABI:2    SP:0x7ffd0ea06c38    IP:0x7fe77f55b637
+
+v2: Rebased on top of phys-addr patches
+
+	Signed-off-by: Andi Kleen <ak@linux.intel.com>
+Link: http://lkml.kernel.org/r/20170905184057.26135-1-andi@firstfloor.org
+[ Use PRIu64 for regs->abi in print_sample_uregs() ]
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit b1491ace8eb2e92677cd9ee966763f8f53d29d16)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/Documentation/perf-script.txt
+#	tools/perf/builtin-script.c
+diff --cc tools/perf/Documentation/perf-script.txt
+index 66be2e69d03b,bcc1ba35a2d8..000000000000
+--- a/tools/perf/Documentation/perf-script.txt
++++ b/tools/perf/Documentation/perf-script.txt
+@@@ -116,7 -116,8 +116,12 @@@ OPTION
+  --fields::
+          Comma separated list of fields to print. Options are:
+          comm, tid, pid, time, cpu, event, trace, ip, sym, dso, addr, symoff,
+++<<<<<<< HEAD
+ +	srcline, period, iregs, brstack, brstacksym, flags, brstackinsn, insn, insnlen.
+++=======
++         srcline, period, iregs, uregs, brstack, brstacksym, flags, bpf-output, brstackinsn,
++         brstackoff, callindent, insn, insnlen, synth, phys_addr.
+++>>>>>>> b1491ace8eb2 (perf script: Support user regs)
+          Field list can be prepended with the type, trace, sw or hw,
+          to indicate to which event type the field list applies.
+          e.g., -F sw:comm,tid,time,ip,sym  and -F trace:time,cpu,trace
+diff --cc tools/perf/builtin-script.c
+index 5d6697e4eb08,725dbd3dd104..000000000000
+--- a/tools/perf/builtin-script.c
++++ b/tools/perf/builtin-script.c
+@@@ -84,6 -85,10 +84,13 @@@ enum perf_output_field 
+  	PERF_OUTPUT_INSN	    = 1U << 21,
+  	PERF_OUTPUT_INSNLEN	    = 1U << 22,
+  	PERF_OUTPUT_BRSTACKINSN	    = 1U << 23,
+++<<<<<<< HEAD
+++=======
++ 	PERF_OUTPUT_BRSTACKOFF	    = 1U << 24,
++ 	PERF_OUTPUT_SYNTH           = 1U << 25,
++ 	PERF_OUTPUT_PHYS_ADDR       = 1U << 26,
++ 	PERF_OUTPUT_UREGS	    = 1U << 27,
+++>>>>>>> b1491ace8eb2 (perf script: Support user regs)
+  };
+  
+  struct output_option {
+@@@ -375,6 -387,16 +383,19 @@@ static int perf_evsel__check_attr(struc
+  					PERF_OUTPUT_IREGS))
+  		return -EINVAL;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (PRINT_FIELD(UREGS) &&
++ 		perf_evsel__check_stype(evsel, PERF_SAMPLE_REGS_USER, "UREGS",
++ 					PERF_OUTPUT_UREGS))
++ 		return -EINVAL;
++ 
++ 	if (PRINT_FIELD(PHYS_ADDR) &&
++ 		perf_evsel__check_stype(evsel, PERF_SAMPLE_PHYS_ADDR, "PHYS_ADDR",
++ 					PERF_OUTPUT_PHYS_ADDR))
++ 		return -EINVAL;
++ 
+++>>>>>>> b1491ace8eb2 (perf script: Support user regs)
+  	return 0;
+  }
+  
+@@@ -1144,11 -1469,22 +1183,14 @@@ static void process_event(struct perf_s
+  	if (PRINT_FIELD(IREGS))
+  		print_sample_iregs(sample, attr);
+  
++ 	if (PRINT_FIELD(UREGS))
++ 		print_sample_uregs(sample, attr);
++ 
+  	if (PRINT_FIELD(BRSTACK))
+ -		print_sample_brstack(sample, thread, attr);
+ +		print_sample_brstack(sample);
+  	else if (PRINT_FIELD(BRSTACKSYM))
+ -		print_sample_brstacksym(sample, thread, attr);
+ -	else if (PRINT_FIELD(BRSTACKOFF))
+ -		print_sample_brstackoff(sample, thread, attr);
+ -
+ -	if (perf_evsel__is_bpf_output(evsel) && PRINT_FIELD(BPF_OUTPUT))
+ -		print_sample_bpf_output(sample);
+ +		print_sample_brstacksym(sample, thread);
+  	print_insn(sample, attr, thread, machine);
+ -
+ -	if (PRINT_FIELD(PHYS_ADDR))
+ -		printf("%16" PRIx64, sample->phys_addr);
+  	printf("\n");
+  }
+  
+@@@ -2393,8 -2767,8 +2435,13 @@@ int cmd_script(int argc, const char **a
+  		     "+field to add and -field to remove."
+  		     "Valid types: hw,sw,trace,raw,synth. "
+  		     "Fields: comm,tid,pid,time,cpu,event,trace,ip,sym,dso,"
+++<<<<<<< HEAD
+ +		     "addr,symoff,period,iregs,brstack,brstacksym,flags,"
+ +		     "callindent,insn,insnlen,brstackinsn",
+++=======
++ 		     "addr,symoff,period,iregs,uregs,brstack,brstacksym,flags,"
++ 		     "bpf-output,callindent,insn,insnlen,brstackinsn,synth,phys_addr",
+++>>>>>>> b1491ace8eb2 (perf script: Support user regs)
+  		     parse_output_fields),
+  	OPT_BOOLEAN('a', "all-cpus", &system_wide,
+  		    "system-wide collection from all CPUs"),
+* Unmerged path tools/perf/Documentation/perf-script.txt
+* Unmerged path tools/perf/builtin-script.c
