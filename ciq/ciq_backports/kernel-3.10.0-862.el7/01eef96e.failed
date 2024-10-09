@@ -1,0 +1,181 @@
+i2c: core: Add support for best effort block read emulation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [i2c] core: Add support for best effort block read emulation (Gopal Tiwari) [1456705]
+Rebuild_FUZZ: 95.58%
+commit-author Irina Tirdea <irina.tirdea@intel.com>
+commit 01eef96e37d77cd89156e5f51aab81a9d5c96539
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/01eef96e.failed
+
+There are devices that need to handle block transactions
+regardless of the capabilities exported by the adapter.
+For performance reasons, they need to use i2c read blocks
+if available, otherwise emulate the block transaction with word
+or byte transactions.
+
+Add support for a helper function that would read a data block
+using the best transfer available: I2C_FUNC_SMBUS_READ_I2C_BLOCK,
+I2C_FUNC_SMBUS_READ_WORD_DATA or I2C_FUNC_SMBUS_READ_BYTE_DATA.
+
+	Signed-off-by: Irina Tirdea <irina.tirdea@intel.com>
+	Signed-off-by: Wolfram Sang <wsa@the-dreams.de>
+(cherry picked from commit 01eef96e37d77cd89156e5f51aab81a9d5c96539)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/i2c/i2c-core.c
+diff --cc drivers/i2c/i2c-core.c
+index 8ce1e36d3552,98f6c75b1d18..000000000000
+--- a/drivers/i2c/i2c-core.c
++++ b/drivers/i2c/i2c-core.c
+@@@ -2682,6 -3007,129 +2682,132 @@@ s32 i2c_smbus_xfer(struct i2c_adapter *
+  }
+  EXPORT_SYMBOL(i2c_smbus_xfer);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * i2c_smbus_read_i2c_block_data_or_emulated - read block or emulate
++  * @client: Handle to slave device
++  * @command: Byte interpreted by slave
++  * @length: Size of data block; SMBus allows at most I2C_SMBUS_BLOCK_MAX bytes
++  * @values: Byte array into which data will be read; big enough to hold
++  *	the data returned by the slave.  SMBus allows at most
++  *	I2C_SMBUS_BLOCK_MAX bytes.
++  *
++  * This executes the SMBus "block read" protocol if supported by the adapter.
++  * If block read is not supported, it emulates it using either word or byte
++  * read protocols depending on availability.
++  *
++  * The addresses of the I2C slave device that are accessed with this function
++  * must be mapped to a linear region, so that a block read will have the same
++  * effect as a byte read. Before using this function you must double-check
++  * if the I2C slave does support exchanging a block transfer with a byte
++  * transfer.
++  */
++ s32 i2c_smbus_read_i2c_block_data_or_emulated(const struct i2c_client *client,
++ 					      u8 command, u8 length, u8 *values)
++ {
++ 	u8 i = 0;
++ 	int status;
++ 
++ 	if (length > I2C_SMBUS_BLOCK_MAX)
++ 		length = I2C_SMBUS_BLOCK_MAX;
++ 
++ 	if (i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_READ_I2C_BLOCK))
++ 		return i2c_smbus_read_i2c_block_data(client, command, length, values);
++ 
++ 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_READ_BYTE_DATA))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_READ_WORD_DATA)) {
++ 		while ((i + 2) <= length) {
++ 			status = i2c_smbus_read_word_data(client, command + i);
++ 			if (status < 0)
++ 				return status;
++ 			values[i] = status & 0xff;
++ 			values[i + 1] = status >> 8;
++ 			i += 2;
++ 		}
++ 	}
++ 
++ 	while (i < length) {
++ 		status = i2c_smbus_read_byte_data(client, command + i);
++ 		if (status < 0)
++ 			return status;
++ 		values[i] = status;
++ 		i++;
++ 	}
++ 
++ 	return i;
++ }
++ EXPORT_SYMBOL(i2c_smbus_read_i2c_block_data_or_emulated);
++ 
++ #if IS_ENABLED(CONFIG_I2C_SLAVE)
++ int i2c_slave_register(struct i2c_client *client, i2c_slave_cb_t slave_cb)
++ {
++ 	int ret;
++ 
++ 	if (!client || !slave_cb) {
++ 		WARN(1, "insufficent data\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!(client->flags & I2C_CLIENT_SLAVE))
++ 		dev_warn(&client->dev, "%s: client slave flag not set. You might see address collisions\n",
++ 			 __func__);
++ 
++ 	if (!(client->flags & I2C_CLIENT_TEN)) {
++ 		/* Enforce stricter address checking */
++ 		ret = i2c_check_7bit_addr_validity_strict(client->addr);
++ 		if (ret) {
++ 			dev_err(&client->dev, "%s: invalid address\n", __func__);
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	if (!client->adapter->algo->reg_slave) {
++ 		dev_err(&client->dev, "%s: not supported by adapter\n", __func__);
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	client->slave_cb = slave_cb;
++ 
++ 	i2c_lock_adapter(client->adapter);
++ 	ret = client->adapter->algo->reg_slave(client);
++ 	i2c_unlock_adapter(client->adapter);
++ 
++ 	if (ret) {
++ 		client->slave_cb = NULL;
++ 		dev_err(&client->dev, "%s: adapter returned error %d\n", __func__, ret);
++ 	}
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(i2c_slave_register);
++ 
++ int i2c_slave_unregister(struct i2c_client *client)
++ {
++ 	int ret;
++ 
++ 	if (!client->adapter->algo->unreg_slave) {
++ 		dev_err(&client->dev, "%s: not supported by adapter\n", __func__);
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	i2c_lock_adapter(client->adapter);
++ 	ret = client->adapter->algo->unreg_slave(client);
++ 	i2c_unlock_adapter(client->adapter);
++ 
++ 	if (ret == 0)
++ 		client->slave_cb = NULL;
++ 	else
++ 		dev_err(&client->dev, "%s: adapter returned error %d\n", __func__, ret);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(i2c_slave_unregister);
++ #endif
++ 
+++>>>>>>> 01eef96e37d7 (i2c: core: Add support for best effort block read emulation)
+  MODULE_AUTHOR("Simon G. Vogl <simon@tk.uni-linz.ac.at>");
+  MODULE_DESCRIPTION("I2C-Bus main module");
+  MODULE_LICENSE("GPL");
+* Unmerged path drivers/i2c/i2c-core.c
+diff --git a/include/linux/i2c.h b/include/linux/i2c.h
+index c1f71528c72e..d67eabe362f9 100644
+--- a/include/linux/i2c.h
++++ b/include/linux/i2c.h
+@@ -119,6 +119,9 @@ extern s32 i2c_smbus_read_i2c_block_data(const struct i2c_client *client,
+ extern s32 i2c_smbus_write_i2c_block_data(const struct i2c_client *client,
+ 					  u8 command, u8 length,
+ 					  const u8 *values);
++extern s32
++i2c_smbus_read_i2c_block_data_or_emulated(const struct i2c_client *client,
++					  u8 command, u8 length, u8 *values);
+ #endif /* I2C */
+ 
+ /**
