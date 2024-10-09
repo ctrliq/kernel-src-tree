@@ -1,0 +1,187 @@
+blk-mq-sched: fix crash in switch error path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Omar Sandoval <osandov@fb.com>
+commit 54d5329d425650fafaf90660a139c771d2d49cae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/54d5329d.failed
+
+In elevator_switch(), if blk_mq_init_sched() fails, we attempt to fall
+back to the original scheduler. However, at this point, we've already
+torn down the original scheduler's tags, so this causes a crash. Doing
+the fallback like the legacy elevator path is much harder for mq, so fix
+it by just falling back to none, instead.
+
+	Signed-off-by: Omar Sandoval <osandov@fb.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 54d5329d425650fafaf90660a139c771d2d49cae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-sched.c
+#	block/blk-mq-sched.h
+#	block/blk-sysfs.c
+#	block/elevator.c
+diff --cc block/blk-sysfs.c
+index 91f42f273aad,37f0b3ad635e..000000000000
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@@ -543,10 -813,10 +543,14 @@@ static void blk_release_queue(struct ko
+  	blkcg_exit_queue(q);
+  
+  	if (q->elevator) {
+ +		spin_lock_irq(q->queue_lock);
+  		ioc_clear_queue(q);
+++<<<<<<< HEAD
+ +		spin_unlock_irq(q->queue_lock);
+ +		elevator_exit(q->elevator);
+++=======
++ 		elevator_exit(q, q->elevator);
+++>>>>>>> 54d5329d4256 (blk-mq-sched: fix crash in switch error path)
+  	}
+  
+  	blk_exit_rl(&q->root_rl);
+diff --cc block/elevator.c
+index c585bf41be5d,dbeecf7be719..000000000000
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@@ -237,11 -252,13 +237,18 @@@ int elevator_init(struct request_queue 
+  }
+  EXPORT_SYMBOL(elevator_init);
+  
+- void elevator_exit(struct elevator_queue *e)
++ void elevator_exit(struct request_queue *q, struct elevator_queue *e)
+  {
+  	mutex_lock(&e->sysfs_lock);
+++<<<<<<< HEAD
+ +	if (e->type->ops.elevator_exit_fn)
+ +		e->type->ops.elevator_exit_fn(e);
+++=======
++ 	if (e->uses_mq && e->type->ops.mq.exit_sched)
++ 		blk_mq_exit_sched(q, e);
++ 	else if (!e->uses_mq && e->type->ops.sq.elevator_exit_fn)
++ 		e->type->ops.sq.elevator_exit_fn(e);
+++>>>>>>> 54d5329d4256 (blk-mq-sched: fix crash in switch error path)
+  	mutex_unlock(&e->sysfs_lock);
+  
+  	kobject_put(&e->kobj);
+@@@ -900,9 -989,12 +946,15 @@@ out
+  static int elevator_switch(struct request_queue *q, struct elevator_type *new_e)
+  {
+  	struct elevator_queue *old = q->elevator;
+ -	bool old_registered = false;
+ +	bool registered = old->registered;
+  	int err;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (q->mq_ops)
++ 		return elevator_switch_mq(q, new_e);
++ 
+++>>>>>>> 54d5329d4256 (blk-mq-sched: fix crash in switch error path)
+  	/*
+  	 * Turn on BYPASS and drain all requests w/ elevator private data.
+  	 * Block layer doesn't call into a quiesced elevator - all requests
+@@@ -910,42 -1002,46 +962,79 @@@
+  	 * using INSERT_BACK.  All requests have SOFTBARRIER set and no
+  	 * merge happens either.
+  	 */
+ -	if (old) {
+ -		old_registered = old->registered;
+ +	blk_queue_bypass_start(q);
+  
+++<<<<<<< HEAD
+ +	/* unregister and clear all auxiliary data of the old elevator */
+ +	if (registered)
+ +		elv_unregister_queue(q);
+ +
+ +	spin_lock_irq(q->queue_lock);
+ +	ioc_clear_queue(q);
+ +	spin_unlock_irq(q->queue_lock);
+ +
+ +	/* allocate, init and register new elevator */
+ +	err = new_e->ops.elevator_init_fn(q, new_e);
+ +	if (err)
+ +		goto fail_init;
+ +
+ +	if (registered) {
+ +		err = elv_register_queue(q);
+ +		if (err)
+ +			goto fail_register;
+ +	}
+ +
+ +	/* done, kill the old one and finish */
+ +	elevator_exit(old);
+ +	blk_queue_bypass_end(q);
+++=======
++ 		blk_queue_bypass_start(q);
++ 
++ 		/* unregister and clear all auxiliary data of the old elevator */
++ 		if (old_registered)
++ 			elv_unregister_queue(q);
++ 
++ 		ioc_clear_queue(q);
++ 	}
++ 
++ 	/* allocate, init and register new elevator */
++ 	err = new_e->ops.sq.elevator_init_fn(q, new_e);
++ 	if (err)
++ 		goto fail_init;
++ 
++ 	err = elv_register_queue(q);
++ 	if (err)
++ 		goto fail_register;
++ 
++ 	/* done, kill the old one and finish */
++ 	if (old) {
++ 		elevator_exit(q, old);
++ 		blk_queue_bypass_end(q);
++ 	}
+++>>>>>>> 54d5329d4256 (blk-mq-sched: fix crash in switch error path)
+  
+  	blk_add_trace_msg(q, "elv switch: %s", new_e->elevator_name);
+  
+  	return 0;
+  
+  fail_register:
+++<<<<<<< HEAD
+ +	elevator_exit(q->elevator);
+ +fail_init:
+ +	/* switch failed, restore and re-register old elevator */
+ +	q->elevator = old;
+ +	elv_register_queue(q);
+ +	blk_queue_bypass_end(q);
+++=======
++ 	elevator_exit(q, q->elevator);
++ fail_init:
++ 	/* switch failed, restore and re-register old elevator */
++ 	if (old) {
++ 		q->elevator = old;
++ 		elv_register_queue(q);
++ 		blk_queue_bypass_end(q);
++ 	}
+++>>>>>>> 54d5329d4256 (blk-mq-sched: fix crash in switch error path)
+  
+  	return err;
+  }
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk-mq-sched.h
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk-mq-sched.h
+* Unmerged path block/blk-sysfs.c
+* Unmerged path block/elevator.c
+diff --git a/include/linux/elevator.h b/include/linux/elevator.h
+index 297200f44dc5..57107fcce543 100644
+--- a/include/linux/elevator.h
++++ b/include/linux/elevator.h
+@@ -160,7 +160,7 @@ extern ssize_t elv_iosched_show(struct request_queue *, char *);
+ extern ssize_t elv_iosched_store(struct request_queue *, const char *, size_t);
+ 
+ extern int elevator_init(struct request_queue *, char *);
+-extern void elevator_exit(struct elevator_queue *);
++extern void elevator_exit(struct request_queue *, struct elevator_queue *);
+ extern int elevator_change(struct request_queue *, const char *);
+ extern bool elv_rq_merge_ok(struct request *, struct bio *);
+ extern struct elevator_queue *elevator_alloc(struct request_queue *,
