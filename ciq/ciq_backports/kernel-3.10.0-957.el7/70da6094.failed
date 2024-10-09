@@ -1,0 +1,326 @@
+nvme: implement log page low/high offset and dwords
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [nvme] implement log page low/high offset and dwords (David Milburn) [1515584]
+Rebuild_FUZZ: 93.75%
+commit-author Matias Bjørling <mb@lightnvm.io>
+commit 70da6094a646f0f2d823e077614840cf21055580
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/70da6094.failed
+
+NVMe 1.2.1 extends the get log page interface to include 64 bit
+offset and increases the number of dwords to 32 bits. Implement
+for future use.
+
+	Signed-off-by: Matias Bjørling <mb@lightnvm.io>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 70da6094a646f0f2d823e077614840cf21055580)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index d63d62bfc80f,5c729ab51911..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -68,18 -67,39 +68,13 @@@ MODULE_PARM_DESC(force_apst, "allow APS
+  struct workqueue_struct *nvme_wq;
+  EXPORT_SYMBOL_GPL(nvme_wq);
+  
+ -struct workqueue_struct *nvme_reset_wq;
+ -EXPORT_SYMBOL_GPL(nvme_reset_wq);
+ -
+ -struct workqueue_struct *nvme_delete_wq;
+ -EXPORT_SYMBOL_GPL(nvme_delete_wq);
+ -
+ -static DEFINE_IDA(nvme_subsystems_ida);
+ -static LIST_HEAD(nvme_subsystems);
+ -static DEFINE_MUTEX(nvme_subsystems_lock);
+ +static LIST_HEAD(nvme_ctrl_list);
+ +static DEFINE_SPINLOCK(dev_list_lock);
+  
+  static DEFINE_IDA(nvme_instance_ida);
+ -static dev_t nvme_chr_devt;
+ -static struct class *nvme_class;
+ -static struct class *nvme_subsys_class;
+  
+ -static void nvme_ns_remove(struct nvme_ns *ns);
+ -static int nvme_revalidate_disk(struct gendisk *disk);
+ +static struct class *nvme_class;
+  
+- static __le32 nvme_get_log_dw10(u8 lid, size_t size)
+- {
+- 	return cpu_to_le32((((size / 4) - 1) << 16) | lid);
+- }
+- 
+  int nvme_reset_ctrl(struct nvme_ctrl *ctrl)
+  {
+  	if (!nvme_change_ctrl_state(ctrl, NVME_CTRL_RESETTING))
+@@@ -1581,14 -2010,255 +1576,259 @@@ static void nvme_init_subnqn(struct nvm
+  		dev_warn(ctrl->device, "missing or invalid SUBNQN field.\n");
+  
+  	/* Generate a "fake" NQN per Figure 254 in NVMe 1.3 + ECN 001 */
+ -	off = snprintf(subsys->subnqn, NVMF_NQN_SIZE,
+ +	off = snprintf(ctrl->subnqn, NVMF_NQN_SIZE,
+  			"nqn.2014.08.org.nvmexpress:%4x%4x",
+  			le16_to_cpu(id->vid), le16_to_cpu(id->ssvid));
+ -	memcpy(subsys->subnqn + off, id->sn, sizeof(id->sn));
+ +	memcpy(ctrl->subnqn + off, id->sn, sizeof(id->sn));
+  	off += sizeof(id->sn);
+ -	memcpy(subsys->subnqn + off, id->mn, sizeof(id->mn));
+ +	memcpy(ctrl->subnqn + off, id->mn, sizeof(id->mn));
+  	off += sizeof(id->mn);
+++<<<<<<< HEAD
+ +	memset(ctrl->subnqn + off, 0, sizeof(ctrl->subnqn) - off);
+++=======
++ 	memset(subsys->subnqn + off, 0, sizeof(subsys->subnqn) - off);
++ }
++ 
++ static void __nvme_release_subsystem(struct nvme_subsystem *subsys)
++ {
++ 	ida_simple_remove(&nvme_subsystems_ida, subsys->instance);
++ 	kfree(subsys);
++ }
++ 
++ static void nvme_release_subsystem(struct device *dev)
++ {
++ 	__nvme_release_subsystem(container_of(dev, struct nvme_subsystem, dev));
++ }
++ 
++ static void nvme_destroy_subsystem(struct kref *ref)
++ {
++ 	struct nvme_subsystem *subsys =
++ 			container_of(ref, struct nvme_subsystem, ref);
++ 
++ 	mutex_lock(&nvme_subsystems_lock);
++ 	list_del(&subsys->entry);
++ 	mutex_unlock(&nvme_subsystems_lock);
++ 
++ 	ida_destroy(&subsys->ns_ida);
++ 	device_del(&subsys->dev);
++ 	put_device(&subsys->dev);
++ }
++ 
++ static void nvme_put_subsystem(struct nvme_subsystem *subsys)
++ {
++ 	kref_put(&subsys->ref, nvme_destroy_subsystem);
++ }
++ 
++ static struct nvme_subsystem *__nvme_find_get_subsystem(const char *subsysnqn)
++ {
++ 	struct nvme_subsystem *subsys;
++ 
++ 	lockdep_assert_held(&nvme_subsystems_lock);
++ 
++ 	list_for_each_entry(subsys, &nvme_subsystems, entry) {
++ 		if (strcmp(subsys->subnqn, subsysnqn))
++ 			continue;
++ 		if (!kref_get_unless_zero(&subsys->ref))
++ 			continue;
++ 		return subsys;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ #define SUBSYS_ATTR_RO(_name, _mode, _show)			\
++ 	struct device_attribute subsys_attr_##_name = \
++ 		__ATTR(_name, _mode, _show, NULL)
++ 
++ static ssize_t nvme_subsys_show_nqn(struct device *dev,
++ 				    struct device_attribute *attr,
++ 				    char *buf)
++ {
++ 	struct nvme_subsystem *subsys =
++ 		container_of(dev, struct nvme_subsystem, dev);
++ 
++ 	return snprintf(buf, PAGE_SIZE, "%s\n", subsys->subnqn);
++ }
++ static SUBSYS_ATTR_RO(subsysnqn, S_IRUGO, nvme_subsys_show_nqn);
++ 
++ #define nvme_subsys_show_str_function(field)				\
++ static ssize_t subsys_##field##_show(struct device *dev,		\
++ 			    struct device_attribute *attr, char *buf)	\
++ {									\
++ 	struct nvme_subsystem *subsys =					\
++ 		container_of(dev, struct nvme_subsystem, dev);		\
++ 	return sprintf(buf, "%.*s\n",					\
++ 		       (int)sizeof(subsys->field), subsys->field);	\
++ }									\
++ static SUBSYS_ATTR_RO(field, S_IRUGO, subsys_##field##_show);
++ 
++ nvme_subsys_show_str_function(model);
++ nvme_subsys_show_str_function(serial);
++ nvme_subsys_show_str_function(firmware_rev);
++ 
++ static struct attribute *nvme_subsys_attrs[] = {
++ 	&subsys_attr_model.attr,
++ 	&subsys_attr_serial.attr,
++ 	&subsys_attr_firmware_rev.attr,
++ 	&subsys_attr_subsysnqn.attr,
++ 	NULL,
++ };
++ 
++ static struct attribute_group nvme_subsys_attrs_group = {
++ 	.attrs = nvme_subsys_attrs,
++ };
++ 
++ static const struct attribute_group *nvme_subsys_attrs_groups[] = {
++ 	&nvme_subsys_attrs_group,
++ 	NULL,
++ };
++ 
++ static int nvme_active_ctrls(struct nvme_subsystem *subsys)
++ {
++ 	int count = 0;
++ 	struct nvme_ctrl *ctrl;
++ 
++ 	mutex_lock(&subsys->lock);
++ 	list_for_each_entry(ctrl, &subsys->ctrls, subsys_entry) {
++ 		if (ctrl->state != NVME_CTRL_DELETING &&
++ 		    ctrl->state != NVME_CTRL_DEAD)
++ 			count++;
++ 	}
++ 	mutex_unlock(&subsys->lock);
++ 
++ 	return count;
++ }
++ 
++ static int nvme_init_subsystem(struct nvme_ctrl *ctrl, struct nvme_id_ctrl *id)
++ {
++ 	struct nvme_subsystem *subsys, *found;
++ 	int ret;
++ 
++ 	subsys = kzalloc(sizeof(*subsys), GFP_KERNEL);
++ 	if (!subsys)
++ 		return -ENOMEM;
++ 	ret = ida_simple_get(&nvme_subsystems_ida, 0, 0, GFP_KERNEL);
++ 	if (ret < 0) {
++ 		kfree(subsys);
++ 		return ret;
++ 	}
++ 	subsys->instance = ret;
++ 	mutex_init(&subsys->lock);
++ 	kref_init(&subsys->ref);
++ 	INIT_LIST_HEAD(&subsys->ctrls);
++ 	INIT_LIST_HEAD(&subsys->nsheads);
++ 	nvme_init_subnqn(subsys, ctrl, id);
++ 	memcpy(subsys->serial, id->sn, sizeof(subsys->serial));
++ 	memcpy(subsys->model, id->mn, sizeof(subsys->model));
++ 	memcpy(subsys->firmware_rev, id->fr, sizeof(subsys->firmware_rev));
++ 	subsys->vendor_id = le16_to_cpu(id->vid);
++ 	subsys->cmic = id->cmic;
++ 
++ 	subsys->dev.class = nvme_subsys_class;
++ 	subsys->dev.release = nvme_release_subsystem;
++ 	subsys->dev.groups = nvme_subsys_attrs_groups;
++ 	dev_set_name(&subsys->dev, "nvme-subsys%d", subsys->instance);
++ 	device_initialize(&subsys->dev);
++ 
++ 	mutex_lock(&nvme_subsystems_lock);
++ 	found = __nvme_find_get_subsystem(subsys->subnqn);
++ 	if (found) {
++ 		/*
++ 		 * Verify that the subsystem actually supports multiple
++ 		 * controllers, else bail out.
++ 		 */
++ 		if (nvme_active_ctrls(found) && !(id->cmic & (1 << 1))) {
++ 			dev_err(ctrl->device,
++ 				"ignoring ctrl due to duplicate subnqn (%s).\n",
++ 				found->subnqn);
++ 			nvme_put_subsystem(found);
++ 			ret = -EINVAL;
++ 			goto out_unlock;
++ 		}
++ 
++ 		__nvme_release_subsystem(subsys);
++ 		subsys = found;
++ 	} else {
++ 		ret = device_add(&subsys->dev);
++ 		if (ret) {
++ 			dev_err(ctrl->device,
++ 				"failed to register subsystem device.\n");
++ 			goto out_unlock;
++ 		}
++ 		ida_init(&subsys->ns_ida);
++ 		list_add_tail(&subsys->entry, &nvme_subsystems);
++ 	}
++ 
++ 	ctrl->subsys = subsys;
++ 	mutex_unlock(&nvme_subsystems_lock);
++ 
++ 	if (sysfs_create_link(&subsys->dev.kobj, &ctrl->device->kobj,
++ 			dev_name(ctrl->device))) {
++ 		dev_err(ctrl->device,
++ 			"failed to create sysfs link from subsystem.\n");
++ 		/* the transport driver will eventually put the subsystem */
++ 		return -EINVAL;
++ 	}
++ 
++ 	mutex_lock(&subsys->lock);
++ 	list_add_tail(&ctrl->subsys_entry, &subsys->ctrls);
++ 	mutex_unlock(&subsys->lock);
++ 
++ 	return 0;
++ 
++ out_unlock:
++ 	mutex_unlock(&nvme_subsystems_lock);
++ 	put_device(&subsys->dev);
++ 	return ret;
++ }
++ 
++ static int nvme_get_log_ext(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
++ 			    u8 log_page, void *log,
++ 			    size_t size, size_t offset)
++ {
++ 	struct nvme_command c = { };
++ 	unsigned long dwlen = size / 4 - 1;
++ 
++ 	c.get_log_page.opcode = nvme_admin_get_log_page;
++ 
++ 	if (ns)
++ 		c.get_log_page.nsid = cpu_to_le32(ns->head->ns_id);
++ 	else
++ 		c.get_log_page.nsid = cpu_to_le32(NVME_NSID_ALL);
++ 
++ 	c.get_log_page.lid = log_page;
++ 	c.get_log_page.numdl = cpu_to_le16(dwlen & ((1 << 16) - 1));
++ 	c.get_log_page.numdu = cpu_to_le16(dwlen >> 16);
++ 	c.get_log_page.lpol = cpu_to_le32(offset & ((1ULL << 32) - 1));
++ 	c.get_log_page.lpou = cpu_to_le32(offset >> 32ULL);
++ 
++ 	return nvme_submit_sync_cmd(ctrl->admin_q, &c, log, size);
++ }
++ 
++ static int nvme_get_log(struct nvme_ctrl *ctrl, u8 log_page, void *log,
++ 			size_t size)
++ {
++ 	return nvme_get_log_ext(ctrl, NULL, log_page, log, size, 0);
++ }
++ 
++ static int nvme_get_effects_log(struct nvme_ctrl *ctrl)
++ {
++ 	int ret;
++ 
++ 	if (!ctrl->effects)
++ 		ctrl->effects = kzalloc(sizeof(*ctrl->effects), GFP_KERNEL);
++ 
++ 	if (!ctrl->effects)
++ 		return 0;
++ 
++ 	ret = nvme_get_log(ctrl, NVME_LOG_CMD_EFFECTS, ctrl->effects,
++ 					sizeof(*ctrl->effects));
++ 	if (ret) {
++ 		kfree(ctrl->effects);
++ 		ctrl->effects = NULL;
++ 	}
++ 	return ret;
+++>>>>>>> 70da6094a646 (nvme: implement log page low/high offset and dwords)
+  }
+  
+  /*
+* Unmerged path drivers/nvme/host/core.c
