@@ -1,0 +1,516 @@
+nfp: set config bit (ifup/ifdown) on netdev open/close
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+commit 447e9ebfc19950559ebb9aa08302a7f11ab1508c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/447e9ebf.failed
+
+When a netdev (PF netdev or representor) is opened or closed, set the
+physical port config bit appropriately - which powers UP/DOWN the PHY
+module for the physical interface.
+
+The PHY is powered first in the HW/FW configuration step when opening
+the netdev and again last in the HW/FW configuration step when closing
+the netdev.
+
+This is only applicable when there is a physical port associated with
+the netdev and if the NSP support this. Otherwise we silently ignore
+this step.
+
+The 'nfp_eth_set_configured' can actually return positive values -
+updated the function documentation appropriately.
+
+	Signed-off-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 447e9ebfc19950559ebb9aa08302a7f11ab1508c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+#	drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
+#	drivers/net/ethernet/netronome/nfp/nfp_port.c
+#	drivers/net/ethernet/netronome/nfp/nfp_port.h
+#	drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 4daa95c7c08c,ea471604450e..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -2193,6 -2668,175 +2194,178 @@@ static int nfp_net_netdev_close(struct 
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void nfp_ctrl_close(struct nfp_net *nn)
++ {
++ 	int r;
++ 
++ 	rtnl_lock();
++ 
++ 	for (r = 0; r < nn->dp.num_r_vecs; r++) {
++ 		disable_irq(nn->r_vecs[r].irq_vector);
++ 		tasklet_disable(&nn->r_vecs[r].tasklet);
++ 	}
++ 
++ 	nfp_net_clear_config_and_disable(nn);
++ 
++ 	nfp_net_close_free_all(nn);
++ 
++ 	rtnl_unlock();
++ }
++ 
++ /**
++  * nfp_net_open_stack() - Start the device from stack's perspective
++  * @nn:      NFP Net device to reconfigure
++  */
++ static void nfp_net_open_stack(struct nfp_net *nn)
++ {
++ 	unsigned int r;
++ 
++ 	for (r = 0; r < nn->dp.num_r_vecs; r++) {
++ 		napi_enable(&nn->r_vecs[r].napi);
++ 		enable_irq(nn->r_vecs[r].irq_vector);
++ 	}
++ 
++ 	netif_tx_wake_all_queues(nn->dp.netdev);
++ 
++ 	enable_irq(nn->irq_entries[NFP_NET_IRQ_LSC_IDX].vector);
++ 	nfp_net_read_link_status(nn);
++ }
++ 
++ static int nfp_net_open_alloc_all(struct nfp_net *nn)
++ {
++ 	int err, r;
++ 
++ 	err = nfp_net_aux_irq_request(nn, NFP_NET_CFG_EXN, "%s-exn",
++ 				      nn->exn_name, sizeof(nn->exn_name),
++ 				      NFP_NET_IRQ_EXN_IDX, nn->exn_handler);
++ 	if (err)
++ 		return err;
++ 	err = nfp_net_aux_irq_request(nn, NFP_NET_CFG_LSC, "%s-lsc",
++ 				      nn->lsc_name, sizeof(nn->lsc_name),
++ 				      NFP_NET_IRQ_LSC_IDX, nn->lsc_handler);
++ 	if (err)
++ 		goto err_free_exn;
++ 	disable_irq(nn->irq_entries[NFP_NET_IRQ_LSC_IDX].vector);
++ 
++ 	for (r = 0; r < nn->dp.num_r_vecs; r++) {
++ 		err = nfp_net_prepare_vector(nn, &nn->r_vecs[r], r);
++ 		if (err)
++ 			goto err_cleanup_vec_p;
++ 	}
++ 
++ 	err = nfp_net_rx_rings_prepare(nn, &nn->dp);
++ 	if (err)
++ 		goto err_cleanup_vec;
++ 
++ 	err = nfp_net_tx_rings_prepare(nn, &nn->dp);
++ 	if (err)
++ 		goto err_free_rx_rings;
++ 
++ 	for (r = 0; r < nn->max_r_vecs; r++)
++ 		nfp_net_vector_assign_rings(&nn->dp, &nn->r_vecs[r], r);
++ 
++ 	return 0;
++ 
++ err_free_rx_rings:
++ 	nfp_net_rx_rings_free(&nn->dp);
++ err_cleanup_vec:
++ 	r = nn->dp.num_r_vecs;
++ err_cleanup_vec_p:
++ 	while (r--)
++ 		nfp_net_cleanup_vector(nn, &nn->r_vecs[r]);
++ 	nfp_net_aux_irq_free(nn, NFP_NET_CFG_LSC, NFP_NET_IRQ_LSC_IDX);
++ err_free_exn:
++ 	nfp_net_aux_irq_free(nn, NFP_NET_CFG_EXN, NFP_NET_IRQ_EXN_IDX);
++ 	return err;
++ }
++ 
++ static int nfp_net_netdev_open(struct net_device *netdev)
++ {
++ 	struct nfp_net *nn = netdev_priv(netdev);
++ 	int err;
++ 
++ 	/* Step 1: Allocate resources for rings and the like
++ 	 * - Request interrupts
++ 	 * - Allocate RX and TX ring resources
++ 	 * - Setup initial RSS table
++ 	 */
++ 	err = nfp_net_open_alloc_all(nn);
++ 	if (err)
++ 		return err;
++ 
++ 	err = netif_set_real_num_tx_queues(netdev, nn->dp.num_stack_tx_rings);
++ 	if (err)
++ 		goto err_free_all;
++ 
++ 	err = netif_set_real_num_rx_queues(netdev, nn->dp.num_rx_rings);
++ 	if (err)
++ 		goto err_free_all;
++ 
++ 	/* Step 2: Configure the NFP
++ 	 * - Ifup the physical interface if it exists
++ 	 * - Enable rings from 0 to tx_rings/rx_rings - 1.
++ 	 * - Write MAC address (in case it changed)
++ 	 * - Set the MTU
++ 	 * - Set the Freelist buffer size
++ 	 * - Enable the FW
++ 	 */
++ 	err = nfp_port_configure(netdev, true);
++ 	if (err)
++ 		goto err_free_all;
++ 
++ 	err = nfp_net_set_config_and_enable(nn);
++ 	if (err)
++ 		goto err_port_disable;
++ 
++ 	/* Step 3: Enable for kernel
++ 	 * - put some freelist descriptors on each RX ring
++ 	 * - enable NAPI on each ring
++ 	 * - enable all TX queues
++ 	 * - set link state
++ 	 */
++ 	nfp_net_open_stack(nn);
++ 
++ 	return 0;
++ 
++ err_port_disable:
++ 	nfp_port_configure(netdev, false);
++ err_free_all:
++ 	nfp_net_close_free_all(nn);
++ 	return err;
++ }
++ 
++ int nfp_ctrl_open(struct nfp_net *nn)
++ {
++ 	int err, r;
++ 
++ 	/* ring dumping depends on vNICs being opened/closed under rtnl */
++ 	rtnl_lock();
++ 
++ 	err = nfp_net_open_alloc_all(nn);
++ 	if (err)
++ 		goto err_unlock;
++ 
++ 	err = nfp_net_set_config_and_enable(nn);
++ 	if (err)
++ 		goto err_free_all;
++ 
++ 	for (r = 0; r < nn->dp.num_r_vecs; r++)
++ 		enable_irq(nn->r_vecs[r].irq_vector);
++ 
++ 	rtnl_unlock();
++ 
++ 	return 0;
++ 
++ err_free_all:
++ 	nfp_net_close_free_all(nn);
++ err_unlock:
++ 	rtnl_unlock();
++ 	return err;
++ }
++ 
+++>>>>>>> 447e9ebfc199 (nfp: set config bit (ifup/ifdown) on netdev open/close)
+  static void nfp_net_set_rx_mode(struct net_device *netdev)
+  {
+  	struct nfp_net *nn = netdev_priv(netdev);
+diff --cc drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
+index f94361014b87,f6f7c085f8e0..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
+@@@ -214,22 -306,10 +214,25 @@@ err
+  	return NULL;
+  }
+  
+ -struct nfp_nsp *nfp_eth_config_start(struct nfp_cpp *cpp, unsigned int idx)
+ +/**
+ + * nfp_eth_set_mod_enable() - set PHY module enable control bit
+ + * @cpp:	NFP CPP handle
+ + * @idx:	NFP chip-wide port index
+ + * @enable:	Desired state
+ + *
+ + * Enable or disable PHY module (this usually means setting the TX lanes
+ + * disable bits).
+ + *
+-  * Return: 0 or -ERRNO.
+++ * Return:
+++ * 0 - configuration successful;
+++ * 1 - no changes were needed;
+++ * -ERRNO - configuration failed.
+ + */
+ +int nfp_eth_set_mod_enable(struct nfp_cpp *cpp, unsigned int idx, bool enable)
+  {
+ -	union eth_table_entry *entries;
+ +	struct eth_table_entry *entries;
+  	struct nfp_nsp *nsp;
+ +	u64 reg;
+  	int ret;
+  
+  	entries = kzalloc(NSP_ETH_TABLE_SIZE, GFP_KERNEL);
+@@@ -251,26 -331,236 +254,173 @@@
+  	if (!(entries[idx].port & NSP_ETH_PORT_LANES_MASK)) {
+  		nfp_warn(cpp, "trying to set port state on disabled port %d\n",
+  			 idx);
+ -		goto err;
+ +		ret = -EINVAL;
+ +		goto exit_close_nsp;
+  	}
+  
+ -	nfp_nsp_config_set_state(nsp, entries, idx);
+ -	return nsp;
+ -
+ -err:
+ -	nfp_nsp_close(nsp);
+ -	kfree(entries);
+ -	return ERR_PTR(-EIO);
+ -}
+ +	/* Check if we are already in requested state */
+ +	reg = le64_to_cpu(entries[idx].state);
+ +	if (enable == FIELD_GET(NSP_ETH_CTRL_ENABLED, reg)) {
+ +		ret = 0;
+ +		goto exit_close_nsp;
+ +	}
+  
+ -void nfp_eth_config_cleanup_end(struct nfp_nsp *nsp)
+ -{
+ -	union eth_table_entry *entries = nfp_nsp_config_entries(nsp);
+++<<<<<<< HEAD
+ +	reg = le64_to_cpu(entries[idx].control);
+ +	reg &= ~NSP_ETH_CTRL_ENABLED;
+ +	reg |= FIELD_PREP(NSP_ETH_CTRL_ENABLED, enable);
+ +	entries[idx].control = cpu_to_le64(reg);
+  
+ -	nfp_nsp_config_set_modified(nsp, false);
+ -	nfp_nsp_config_clear_state(nsp);
+ +	ret = nfp_nsp_write_eth_table(nsp, entries, NSP_ETH_TABLE_SIZE);
+ +exit_close_nsp:
+  	nfp_nsp_close(nsp);
+  	kfree(entries);
+ -}
+ -
+ -/**
+ - * nfp_eth_config_commit_end() - perform recorded configuration changes
+ - * @nsp:	NFP NSP handle returned from nfp_eth_config_start()
+ - *
+ - * Perform the configuration which was requested with __nfp_eth_set_*()
+ - * helpers and recorded in @nsp state.  If device was already configured
+ - * as requested or no __nfp_eth_set_*() operations were made no NSP command
+ - * will be performed.
+ - *
+ - * Return:
+ - * 0 - configuration successful;
+ - * 1 - no changes were needed;
+ - * -ERRNO - configuration failed.
+ - */
+ -int nfp_eth_config_commit_end(struct nfp_nsp *nsp)
+ -{
+ -	union eth_table_entry *entries = nfp_nsp_config_entries(nsp);
+ -	int ret = 1;
+ -
+ -	if (nfp_nsp_config_modified(nsp)) {
+ -		ret = nfp_nsp_write_eth_table(nsp, entries, NSP_ETH_TABLE_SIZE);
+ -		ret = ret < 0 ? ret : 0;
+ -	}
+ -
+ -	nfp_eth_config_cleanup_end(nsp);
+ -
+ -	return ret;
+ -}
+ -
+ -/**
+ - * nfp_eth_set_mod_enable() - set PHY module enable control bit
+ - * @cpp:	NFP CPP handle
+ - * @idx:	NFP chip-wide port index
+ - * @enable:	Desired state
+ - *
+ - * Enable or disable PHY module (this usually means setting the TX lanes
+ - * disable bits).
+ - *
+ - * Return:
+ - * 0 - configuration successful;
+ - * 1 - no changes were needed;
+ - * -ERRNO - configuration failed.
+ - */
+ -int nfp_eth_set_mod_enable(struct nfp_cpp *cpp, unsigned int idx, bool enable)
+ -{
+ -	union eth_table_entry *entries;
+ -	struct nfp_nsp *nsp;
+ -	u64 reg;
+ -
+ -	nsp = nfp_eth_config_start(cpp, idx);
+ -	if (IS_ERR(nsp))
+ -		return PTR_ERR(nsp);
+ -
+ -	entries = nfp_nsp_config_entries(nsp);
+ -
+ -	/* Check if we are already in requested state */
+ -	reg = le64_to_cpu(entries[idx].state);
+ -	if (enable != FIELD_GET(NSP_ETH_CTRL_ENABLED, reg)) {
+ -		reg = le64_to_cpu(entries[idx].control);
+ -		reg &= ~NSP_ETH_CTRL_ENABLED;
+ -		reg |= FIELD_PREP(NSP_ETH_CTRL_ENABLED, enable);
+ -		entries[idx].control = cpu_to_le64(reg);
+ -
+ -		nfp_nsp_config_set_modified(nsp, true);
+ -	}
+  
+ +	return ret < 0 ? ret : 0;
+++=======
++ 	return nfp_eth_config_commit_end(nsp);
++ }
++ 
++ /**
++  * nfp_eth_set_configured() - set PHY module configured control bit
++  * @cpp:	NFP CPP handle
++  * @idx:	NFP chip-wide port index
++  * @configed:	Desired state
++  *
++  * Set the ifup/ifdown state on the PHY.
++  *
++  * Return:
++  * 0 - configuration successful;
++  * 1 - no changes were needed;
++  * -ERRNO - configuration failed.
++  */
++ int nfp_eth_set_configured(struct nfp_cpp *cpp, unsigned int idx, bool configed)
++ {
++ 	union eth_table_entry *entries;
++ 	struct nfp_nsp *nsp;
++ 	u64 reg;
++ 
++ 	nsp = nfp_eth_config_start(cpp, idx);
++ 	if (IS_ERR(nsp))
++ 		return PTR_ERR(nsp);
++ 
++ 	/* Older ABI versions did support this feature, however this has only
++ 	 * been reliable since ABI 20.
++ 	 */
++ 	if (nfp_nsp_get_abi_ver_minor(nsp) < 20) {
++ 		nfp_eth_config_cleanup_end(nsp);
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	entries = nfp_nsp_config_entries(nsp);
++ 
++ 	/* Check if we are already in requested state */
++ 	reg = le64_to_cpu(entries[idx].state);
++ 	if (configed != FIELD_GET(NSP_ETH_STATE_CONFIGURED, reg)) {
++ 		reg = le64_to_cpu(entries[idx].control);
++ 		reg &= ~NSP_ETH_CTRL_CONFIGURED;
++ 		reg |= FIELD_PREP(NSP_ETH_CTRL_CONFIGURED, configed);
++ 		entries[idx].control = cpu_to_le64(reg);
++ 
++ 		nfp_nsp_config_set_modified(nsp, true);
++ 	}
++ 
++ 	return nfp_eth_config_commit_end(nsp);
++ }
++ 
++ /* Force inline, FIELD_* macroes require masks to be compilation-time known */
++ static __always_inline int
++ nfp_eth_set_bit_config(struct nfp_nsp *nsp, unsigned int raw_idx,
++ 		       const u64 mask, unsigned int val, const u64 ctrl_bit)
++ {
++ 	union eth_table_entry *entries = nfp_nsp_config_entries(nsp);
++ 	unsigned int idx = nfp_nsp_config_idx(nsp);
++ 	u64 reg;
++ 
++ 	/* Note: set features were added in ABI 0.14 but the error
++ 	 *	 codes were initially not populated correctly.
++ 	 */
++ 	if (nfp_nsp_get_abi_ver_minor(nsp) < 17) {
++ 		nfp_err(nfp_nsp_cpp(nsp),
++ 			"set operations not supported, please update flash\n");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	/* Check if we are already in requested state */
++ 	reg = le64_to_cpu(entries[idx].raw[raw_idx]);
++ 	if (val == FIELD_GET(mask, reg))
++ 		return 0;
++ 
++ 	reg &= ~mask;
++ 	reg |= FIELD_PREP(mask, val);
++ 	entries[idx].raw[raw_idx] = cpu_to_le64(reg);
++ 
++ 	entries[idx].control |= cpu_to_le64(ctrl_bit);
++ 
++ 	nfp_nsp_config_set_modified(nsp, true);
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * __nfp_eth_set_aneg() - set PHY autonegotiation control bit
++  * @nsp:	NFP NSP handle returned from nfp_eth_config_start()
++  * @mode:	Desired autonegotiation mode
++  *
++  * Allow/disallow PHY module to advertise/perform autonegotiation.
++  * Will write to hwinfo overrides in the flash (persistent config).
++  *
++  * Return: 0 or -ERRNO.
++  */
++ int __nfp_eth_set_aneg(struct nfp_nsp *nsp, enum nfp_eth_aneg mode)
++ {
++ 	return nfp_eth_set_bit_config(nsp, NSP_ETH_RAW_STATE,
++ 				      NSP_ETH_STATE_ANEG, mode,
++ 				      NSP_ETH_CTRL_SET_ANEG);
++ }
++ 
++ /**
++  * __nfp_eth_set_speed() - set interface speed/rate
++  * @nsp:	NFP NSP handle returned from nfp_eth_config_start()
++  * @speed:	Desired speed (per lane)
++  *
++  * Set lane speed.  Provided @speed value should be subport speed divided
++  * by number of lanes this subport is spanning (i.e. 10000 for 40G, 25000 for
++  * 50G, etc.)
++  * Will write to hwinfo overrides in the flash (persistent config).
++  *
++  * Return: 0 or -ERRNO.
++  */
++ int __nfp_eth_set_speed(struct nfp_nsp *nsp, unsigned int speed)
++ {
++ 	enum nfp_eth_rate rate;
++ 
++ 	rate = nfp_eth_speed2rate(speed);
++ 	if (rate == RATE_INVALID) {
++ 		nfp_warn(nfp_nsp_cpp(nsp),
++ 			 "could not find matching lane rate for speed %u\n",
++ 			 speed);
++ 		return -EINVAL;
++ 	}
++ 
++ 	return nfp_eth_set_bit_config(nsp, NSP_ETH_RAW_STATE,
++ 				      NSP_ETH_STATE_RATE, rate,
++ 				      NSP_ETH_CTRL_SET_RATE);
++ }
++ 
++ /**
++  * __nfp_eth_set_split() - set interface lane split
++  * @nsp:	NFP NSP handle returned from nfp_eth_config_start()
++  * @lanes:	Desired lanes per port
++  *
++  * Set number of lanes in the port.
++  * Will write to hwinfo overrides in the flash (persistent config).
++  *
++  * Return: 0 or -ERRNO.
++  */
++ int __nfp_eth_set_split(struct nfp_nsp *nsp, unsigned int lanes)
++ {
++ 	return nfp_eth_set_bit_config(nsp, NSP_ETH_RAW_PORT, NSP_ETH_PORT_LANES,
++ 				      lanes, NSP_ETH_CTRL_SET_LANES);
+++>>>>>>> 447e9ebfc199 (nfp: set config bit (ifup/ifdown) on netdev open/close)
+  }
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_port.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_port.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_port.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_port.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
