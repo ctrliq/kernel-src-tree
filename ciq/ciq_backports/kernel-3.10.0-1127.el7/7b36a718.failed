@@ -1,0 +1,151 @@
+block: don't call ioc_exit_icq() with the queue lock held for blk-mq
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit 7b36a7189fc320f0b783dd51bd1f541db56cfbdd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/7b36a718.failed
+
+For legacy scheduling, we always call ioc_exit_icq() with both the
+ioc and queue lock held. This poses a problem for blk-mq with
+scheduling, since the queue lock isn't what we use in the scheduler.
+And since we don't need the queue lock held for ioc exit there,
+don't grab it and leave any extra locking up to the blk-mq scheduler.
+
+	Reported-by: Paolo Valente <paolo.valente@linaro.org>
+	Tested-by: Paolo Valente <paolo.valente@linaro.org>
+	Reviewed-by: Omar Sandoval <osandov@fb.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 7b36a7189fc320f0b783dd51bd1f541db56cfbdd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-sysfs.c
+diff --cc block/blk-sysfs.c
+index c735e4ecc473,c44b321335f3..000000000000
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@@ -541,11 -810,14 +541,18 @@@ static void blk_release_queue(struct ko
+  	struct request_queue *q =
+  		container_of(kobj, struct request_queue, kobj);
+  
+ -	wbt_exit(q);
+ -	bdi_put(q->backing_dev_info);
+ -	blkcg_exit_queue(q);
+ +	if (test_bit(QUEUE_FLAG_POLL_STATS, &q->queue_flags))
+ +		blk_stat_remove_callback(q, q->poll_cb);
+ +	blk_stat_free_callback(q->poll_cb);
+  
+++<<<<<<< HEAD
+ +	blk_free_queue_stats(q->stats);
+++=======
++ 	if (q->elevator) {
++ 		ioc_clear_queue(q);
++ 		elevator_exit(q->elevator);
++ 	}
+++>>>>>>> 7b36a7189fc3 (block: don't call ioc_exit_icq() with the queue lock held for blk-mq)
+  
+  	blk_exit_rl(&q->root_rl);
+  
+diff --git a/block/blk-ioc.c b/block/blk-ioc.c
+index 9af611b0988f..c2646ccca7fd 100644
+--- a/block/blk-ioc.c
++++ b/block/blk-ioc.c
+@@ -37,8 +37,8 @@ static void icq_free_icq_rcu(struct rcu_head *head)
+ }
+ 
+ /*
+- * Exit an icq. Called with both ioc and q locked for sq, only ioc locked for
+- * mq.
++ * Exit an icq. Called with ioc locked for blk-mq, and with both ioc
++ * and queue locked for legacy.
+  */
+ static void ioc_exit_icq(struct io_cq *icq)
+ {
+@@ -55,7 +55,10 @@ static void ioc_exit_icq(struct io_cq *icq)
+ 	icq->flags |= ICQ_EXITED;
+ }
+ 
+-/* Release an icq.  Called with both ioc and q locked. */
++/*
++ * Release an icq. Called with ioc locked for blk-mq, and with both ioc
++ * and queue locked for legacy.
++ */
+ static void ioc_destroy_icq(struct io_cq *icq)
+ {
+ 	struct io_context *ioc = icq->ioc;
+@@ -63,7 +66,6 @@ static void ioc_destroy_icq(struct io_cq *icq)
+ 	struct elevator_type *et = q->elevator->type;
+ 
+ 	lockdep_assert_held(&ioc->lock);
+-	lockdep_assert_held(q->queue_lock);
+ 
+ 	radix_tree_delete(&ioc->icq_tree, icq->q->id);
+ 	hlist_del_init(&icq->ioc_node);
+@@ -222,24 +224,40 @@ void exit_io_context(struct task_struct *task)
+ 	put_io_context_active(ioc);
+ }
+ 
++static void __ioc_clear_queue(struct list_head *icq_list)
++{
++	unsigned long flags;
++
++	while (!list_empty(icq_list)) {
++		struct io_cq *icq = list_entry(icq_list->next,
++					       struct io_cq, q_node);
++		struct io_context *ioc = icq->ioc;
++
++		spin_lock_irqsave(&ioc->lock, flags);
++		ioc_destroy_icq(icq);
++		spin_unlock_irqrestore(&ioc->lock, flags);
++	}
++}
++
+ /**
+  * ioc_clear_queue - break any ioc association with the specified queue
+  * @q: request_queue being cleared
+  *
+- * Walk @q->icq_list and exit all io_cq's.  Must be called with @q locked.
++ * Walk @q->icq_list and exit all io_cq's.
+  */
+ void ioc_clear_queue(struct request_queue *q)
+ {
+-	lockdep_assert_held(q->queue_lock);
++	LIST_HEAD(icq_list);
+ 
+-	while (!list_empty(&q->icq_list)) {
+-		struct io_cq *icq = list_entry(q->icq_list.next,
+-					       struct io_cq, q_node);
+-		struct io_context *ioc = icq->ioc;
++	spin_lock_irq(q->queue_lock);
++	list_splice_init(&q->icq_list, &icq_list);
+ 
+-		spin_lock(&ioc->lock);
+-		ioc_destroy_icq(icq);
+-		spin_unlock(&ioc->lock);
++	if (q->mq_ops) {
++		spin_unlock_irq(q->queue_lock);
++		__ioc_clear_queue(&icq_list);
++	} else {
++		__ioc_clear_queue(&icq_list);
++		spin_unlock_irq(q->queue_lock);
+ 	}
+ }
+ 
+* Unmerged path block/blk-sysfs.c
+diff --git a/block/elevator.c b/block/elevator.c
+index e5019fefb0f5..8bac62c44120 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -1130,9 +1130,7 @@ static int elevator_switch(struct request_queue *q, struct elevator_type *new_e)
+ 		if (old_registered)
+ 			elv_unregister_queue(q);
+ 
+-		spin_lock_irq(q->queue_lock);
+ 		ioc_clear_queue(q);
+-		spin_unlock_irq(q->queue_lock);
+ 	}
+ 
+ 	aux = elevator_aux_find(new_e);
