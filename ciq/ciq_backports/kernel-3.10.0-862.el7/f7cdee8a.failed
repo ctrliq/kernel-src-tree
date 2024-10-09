@@ -1,0 +1,248 @@
+bridge: move to workqueue gc
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+commit f7cdee8a79a1cb03fa9ca71b825e72f880b344e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f7cdee8a.failed
+
+Move the fdb garbage collector to a workqueue which fires at least 10
+milliseconds apart and cleans chain by chain allowing for other tasks
+to run in the meantime. When having thousands of fdbs the system is much
+more responsive. Most importantly remove the need to check if the
+matched entry has expired in __br_fdb_get that causes false-sharing and
+is completely unnecessary if we cleanup entries, at worst we'll get 10ms
+of traffic for that entry before it gets deleted.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f7cdee8a79a1cb03fa9ca71b825e72f880b344e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_if.c
+#	net/bridge/br_stp.c
+diff --cc net/bridge/br_if.c
+index e2f604803613,8ac1770aa222..000000000000
+--- a/net/bridge/br_if.c
++++ b/net/bridge/br_if.c
+@@@ -311,7 -311,9 +311,13 @@@ void br_dev_delete(struct net_device *d
+  
+  	br_fdb_delete_by_port(br, NULL, 0, 1);
+  
+++<<<<<<< HEAD
+ +	del_timer_sync(&br->gc_timer);
+++=======
++ 	br_vlan_flush(br);
++ 	br_multicast_dev_del(br);
++ 	cancel_delayed_work_sync(&br->gc_work);
+++>>>>>>> f7cdee8a79a1 (bridge: move to workqueue gc)
+  
+  	br_sysfs_delbr(br->dev);
+  	unregister_netdevice_queue(br->dev, head);
+diff --cc net/bridge/br_stp.c
+index 8d7b4c7a1d54,8f56c2d1f1a7..000000000000
+--- a/net/bridge/br_stp.c
++++ b/net/bridge/br_stp.c
+@@@ -597,8 -597,12 +597,14 @@@ int br_set_ageing_time(struct net_bridg
+  	if (err)
+  		return err;
+  
+ -	spin_lock_bh(&br->lock);
+ -	br->bridge_ageing_time = t;
+  	br->ageing_time = t;
+++<<<<<<< HEAD
+ +	mod_timer(&br->gc_timer, jiffies);
+++=======
++ 	spin_unlock_bh(&br->lock);
++ 
++ 	mod_delayed_work(system_long_wq, &br->gc_work, 0);
+++>>>>>>> f7cdee8a79a1 (bridge: move to workqueue gc)
+  
+  	return 0;
+  }
+diff --git a/net/bridge/br_device.c b/net/bridge/br_device.c
+index f29f37ba5a74..59e82c406491 100644
+--- a/net/bridge/br_device.c
++++ b/net/bridge/br_device.c
+@@ -419,4 +419,5 @@ void br_dev_setup(struct net_device *dev)
+ 	br_netfilter_rtable_init(br);
+ 	br_stp_timer_init(br);
+ 	br_multicast_init(br);
++	INIT_DELAYED_WORK(&br->gc_work, br_fdb_cleanup);
+ }
+diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
+index e4a4176171c9..5cbed5c0db88 100644
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -154,7 +154,7 @@ static void fdb_delete(struct net_bridge *br, struct net_bridge_fdb_entry *f)
+ 	if (f->added_by_external_learn)
+ 		fdb_del_external_learn(f);
+ 
+-	hlist_del_rcu(&f->hlist);
++	hlist_del_init_rcu(&f->hlist);
+ 	fdb_notify(br, f, RTM_DELNEIGH);
+ 	call_rcu(&f->rcu, fdb_rcu_free);
+ }
+@@ -290,34 +290,43 @@ out:
+ 	spin_unlock_bh(&br->hash_lock);
+ }
+ 
+-void br_fdb_cleanup(unsigned long _data)
++void br_fdb_cleanup(struct work_struct *work)
+ {
+-	struct net_bridge *br = (struct net_bridge *)_data;
++	struct net_bridge *br = container_of(work, struct net_bridge,
++					     gc_work.work);
+ 	unsigned long delay = hold_time(br);
+-	unsigned long next_timer = jiffies + br->ageing_time;
++	unsigned long work_delay = delay;
++	unsigned long now = jiffies;
+ 	int i;
+ 
+-	spin_lock(&br->hash_lock);
+ 	for (i = 0; i < BR_HASH_SIZE; i++) {
+ 		struct net_bridge_fdb_entry *f;
+ 		struct hlist_node *n;
+ 
++		if (!br->hash[i].first)
++			continue;
++
++		spin_lock_bh(&br->hash_lock);
+ 		hlist_for_each_entry_safe(f, n, &br->hash[i], hlist) {
+ 			unsigned long this_timer;
++
+ 			if (f->is_static)
+ 				continue;
+ 			if (f->added_by_external_learn)
+ 				continue;
+ 			this_timer = f->updated + delay;
+-			if (time_before_eq(this_timer, jiffies))
++			if (time_after(this_timer, now))
++				work_delay = min(work_delay, this_timer - now);
++			else
+ 				fdb_delete(br, f);
+-			else if (time_before(this_timer, next_timer))
+-				next_timer = this_timer;
+ 		}
++		spin_unlock_bh(&br->hash_lock);
++		cond_resched();
+ 	}
+-	spin_unlock(&br->hash_lock);
+ 
+-	mod_timer(&br->gc_timer, round_jiffies_up(next_timer));
++	/* Cleanup minimum 10 milliseconds apart */
++	work_delay = max_t(unsigned long, work_delay, msecs_to_jiffies(10));
++	mod_delayed_work(system_long_wq, &br->gc_work, work_delay);
+ }
+ 
+ /* Completely flush all dynamic entries in forwarding database.*/
+@@ -382,8 +391,6 @@ struct net_bridge_fdb_entry *__br_fdb_get(struct net_bridge *br,
+ 				&br->hash[br_mac_hash(addr, vid)], hlist) {
+ 		if (ether_addr_equal(fdb->addr.addr, addr) &&
+ 		    fdb->vlan_id == vid) {
+-			if (unlikely(has_expired(br, fdb)))
+-				break;
+ 			return fdb;
+ 		}
+ 	}
+* Unmerged path net/bridge/br_if.c
+diff --git a/net/bridge/br_ioctl.c b/net/bridge/br_ioctl.c
+index d99b2009771a..ed0348707f96 100644
+--- a/net/bridge/br_ioctl.c
++++ b/net/bridge/br_ioctl.c
+@@ -149,7 +149,7 @@ static int old_dev_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
+ 		b.hello_timer_value = br_timer_value(&br->hello_timer);
+ 		b.tcn_timer_value = br_timer_value(&br->tcn_timer);
+ 		b.topology_change_timer_value = br_timer_value(&br->topology_change_timer);
+-		b.gc_timer_value = br_timer_value(&br->gc_timer);
++		b.gc_timer_value = br_timer_value(&br->gc_work.timer);
+ 		rcu_read_unlock();
+ 
+ 		if (copy_to_user((void __user *)args[1], &b, sizeof(b)))
+diff --git a/net/bridge/br_netlink.c b/net/bridge/br_netlink.c
+index 4c7aed5146e2..bcee33544bcf 100644
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@ -1260,7 +1260,7 @@ static int br_fill_info(struct sk_buff *skb, const struct net_device *brdev)
+ 	if (nla_put_u64_64bit(skb, IFLA_BR_TOPOLOGY_CHANGE_TIMER, clockval,
+ 			      IFLA_BR_PAD))
+ 		return -EMSGSIZE;
+-	clockval = br_timer_value(&br->gc_timer);
++	clockval = br_timer_value(&br->gc_work.timer);
+ 	if (nla_put_u64_64bit(skb, IFLA_BR_GC_TIMER, clockval, IFLA_BR_PAD))
+ 		return -EMSGSIZE;
+ 
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index f039f4f78237..a28344659ac9 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -373,7 +373,7 @@ struct net_bridge
+ 	struct timer_list		hello_timer;
+ 	struct timer_list		tcn_timer;
+ 	struct timer_list		topology_change_timer;
+-	struct timer_list		gc_timer;
++	struct delayed_work		gc_work;
+ 	struct kobject			*ifobj;
+ 	u32				auto_cnt;
+ 
+@@ -504,7 +504,7 @@ void br_fdb_find_delete_local(struct net_bridge *br,
+ 			      const unsigned char *addr, u16 vid);
+ void br_fdb_changeaddr(struct net_bridge_port *p, const unsigned char *newaddr);
+ void br_fdb_change_mac_address(struct net_bridge *br, const u8 *newaddr);
+-void br_fdb_cleanup(unsigned long arg);
++void br_fdb_cleanup(struct work_struct *work);
+ void br_fdb_delete_by_port(struct net_bridge *br,
+ 			   const struct net_bridge_port *p, u16 vid, int do_all);
+ struct net_bridge_fdb_entry *__br_fdb_get(struct net_bridge *br,
+* Unmerged path net/bridge/br_stp.c
+diff --git a/net/bridge/br_stp_if.c b/net/bridge/br_stp_if.c
+index e7bac3471234..89110319ef0f 100644
+--- a/net/bridge/br_stp_if.c
++++ b/net/bridge/br_stp_if.c
+@@ -57,7 +57,7 @@ void br_stp_enable_bridge(struct net_bridge *br)
+ 	spin_lock_bh(&br->lock);
+ 	if (br->stp_enabled == BR_KERNEL_STP)
+ 		mod_timer(&br->hello_timer, jiffies + br->hello_time);
+-	mod_timer(&br->gc_timer, jiffies + HZ/10);
++	mod_delayed_work(system_long_wq, &br->gc_work, HZ / 10);
+ 
+ 	br_config_bpdu_generation(br);
+ 
+@@ -88,7 +88,7 @@ void br_stp_disable_bridge(struct net_bridge *br)
+ 	del_timer_sync(&br->hello_timer);
+ 	del_timer_sync(&br->topology_change_timer);
+ 	del_timer_sync(&br->tcn_timer);
+-	del_timer_sync(&br->gc_timer);
++	cancel_delayed_work_sync(&br->gc_work);
+ }
+ 
+ /* called under bridge lock */
+diff --git a/net/bridge/br_stp_timer.c b/net/bridge/br_stp_timer.c
+index 9b9740d5dbcc..60b6fe277a8b 100644
+--- a/net/bridge/br_stp_timer.c
++++ b/net/bridge/br_stp_timer.c
+@@ -153,8 +153,6 @@ void br_stp_timer_init(struct net_bridge *br)
+ 	setup_timer(&br->topology_change_timer,
+ 		      br_topology_change_timer_expired,
+ 		      (unsigned long) br);
+-
+-	setup_timer(&br->gc_timer, br_fdb_cleanup, (unsigned long) br);
+ }
+ 
+ void br_stp_port_timer_init(struct net_bridge_port *p)
+diff --git a/net/bridge/br_sysfs_br.c b/net/bridge/br_sysfs_br.c
+index a18148213b08..0f4034934d56 100644
+--- a/net/bridge/br_sysfs_br.c
++++ b/net/bridge/br_sysfs_br.c
+@@ -263,7 +263,7 @@ static ssize_t gc_timer_show(struct device *d, struct device_attribute *attr,
+ 			     char *buf)
+ {
+ 	struct net_bridge *br = to_bridge(d);
+-	return sprintf(buf, "%ld\n", br_timer_value(&br->gc_timer));
++	return sprintf(buf, "%ld\n", br_timer_value(&br->gc_work.timer));
+ }
+ static DEVICE_ATTR_RO(gc_timer);
+ 
