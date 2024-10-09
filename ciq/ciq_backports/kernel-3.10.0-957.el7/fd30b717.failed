@@ -1,0 +1,146 @@
+rcu: Convert timers to use timer_setup()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [usb] usb: Convert timers to use timer_setup() (Torez Smith) [1540721]
+Rebuild_FUZZ: 95.00%
+commit-author Kees Cook <keescook@chromium.org>
+commit fd30b717b86dc30ffe25596f8de6542a02ae9401
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/fd30b717.failed
+
+In preparation for unconditionally passing the struct timer_list pointer to
+all timer callbacks, switch to using the new timer_setup() and from_timer()
+to pass the timer pointer explicitly.
+
+	Cc: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+	Cc: Josh Triplett <josh@joshtriplett.org>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+	Cc: Lai Jiangshan <jiangshanlai@gmail.com>
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+(cherry picked from commit fd30b717b86dc30ffe25596f8de6542a02ae9401)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/rcu/rcutorture.c
+#	kernel/rcutree_plugin.h
+diff --cc kernel/rcutree_plugin.h
+index 7eab8601304e,e85946d9843b..000000000000
+--- a/kernel/rcutree_plugin.h
++++ b/kernel/rcutree_plugin.h
+@@@ -2245,11 -2237,35 +2245,40 @@@ static int rcu_nocb_kthread(void *arg
+  	return 0;
+  }
+  
+ -/* Is a deferred wakeup of rcu_nocb_kthread() required? */
+ -static int rcu_nocb_need_deferred_wakeup(struct rcu_data *rdp)
+ +/* Initialize per-rcu_data variables for no-CBs CPUs. */
+ +static void __init rcu_boot_init_nocb_percpu_data(struct rcu_data *rdp)
+  {
+++<<<<<<< HEAD:kernel/rcutree_plugin.h
+ +	rdp->nocb_tail = &rdp->nocb_head;
+ +	init_waitqueue_head(&rdp->nocb_wq);
+++=======
++ 	return READ_ONCE(rdp->nocb_defer_wakeup);
++ }
++ 
++ /* Do a deferred wakeup of rcu_nocb_kthread(). */
++ static void do_nocb_deferred_wakeup_common(struct rcu_data *rdp)
++ {
++ 	unsigned long flags;
++ 	int ndw;
++ 
++ 	raw_spin_lock_irqsave(&rdp->nocb_lock, flags);
++ 	if (!rcu_nocb_need_deferred_wakeup(rdp)) {
++ 		raw_spin_unlock_irqrestore(&rdp->nocb_lock, flags);
++ 		return;
++ 	}
++ 	ndw = READ_ONCE(rdp->nocb_defer_wakeup);
++ 	WRITE_ONCE(rdp->nocb_defer_wakeup, RCU_NOCB_WAKE_NOT);
++ 	__wake_nocb_leader(rdp, ndw == RCU_NOCB_WAKE_FORCE, flags);
++ 	trace_rcu_nocb_wake(rdp->rsp->name, rdp->cpu, TPS("DeferredWake"));
++ }
++ 
++ /* Do a deferred wakeup of rcu_nocb_kthread() from a timer handler. */
++ static void do_nocb_deferred_wakeup_timer(struct timer_list *t)
++ {
++ 	struct rcu_data *rdp = from_timer(rdp, t, nocb_timer);
++ 
++ 	do_nocb_deferred_wakeup_common(rdp);
+++>>>>>>> fd30b717b86d (rcu: Convert timers to use timer_setup()):kernel/rcu/tree_plugin.h
+  }
+  
+  /*
+@@@ -2336,6 -2322,64 +2365,67 @@@ void __init rcu_init_nohz(void
+  	}
+  }
+  
+++<<<<<<< HEAD:kernel/rcutree_plugin.h
+++=======
++ /* Initialize per-rcu_data variables for no-CBs CPUs. */
++ static void __init rcu_boot_init_nocb_percpu_data(struct rcu_data *rdp)
++ {
++ 	rdp->nocb_tail = &rdp->nocb_head;
++ 	init_swait_queue_head(&rdp->nocb_wq);
++ 	rdp->nocb_follower_tail = &rdp->nocb_follower_head;
++ 	raw_spin_lock_init(&rdp->nocb_lock);
++ 	timer_setup(&rdp->nocb_timer, do_nocb_deferred_wakeup_timer, 0);
++ }
++ 
++ /*
++  * If the specified CPU is a no-CBs CPU that does not already have its
++  * rcuo kthread for the specified RCU flavor, spawn it.  If the CPUs are
++  * brought online out of order, this can require re-organizing the
++  * leader-follower relationships.
++  */
++ static void rcu_spawn_one_nocb_kthread(struct rcu_state *rsp, int cpu)
++ {
++ 	struct rcu_data *rdp;
++ 	struct rcu_data *rdp_last;
++ 	struct rcu_data *rdp_old_leader;
++ 	struct rcu_data *rdp_spawn = per_cpu_ptr(rsp->rda, cpu);
++ 	struct task_struct *t;
++ 
++ 	/*
++ 	 * If this isn't a no-CBs CPU or if it already has an rcuo kthread,
++ 	 * then nothing to do.
++ 	 */
++ 	if (!rcu_is_nocb_cpu(cpu) || rdp_spawn->nocb_kthread)
++ 		return;
++ 
++ 	/* If we didn't spawn the leader first, reorganize! */
++ 	rdp_old_leader = rdp_spawn->nocb_leader;
++ 	if (rdp_old_leader != rdp_spawn && !rdp_old_leader->nocb_kthread) {
++ 		rdp_last = NULL;
++ 		rdp = rdp_old_leader;
++ 		do {
++ 			rdp->nocb_leader = rdp_spawn;
++ 			if (rdp_last && rdp != rdp_spawn)
++ 				rdp_last->nocb_next_follower = rdp;
++ 			if (rdp == rdp_spawn) {
++ 				rdp = rdp->nocb_next_follower;
++ 			} else {
++ 				rdp_last = rdp;
++ 				rdp = rdp->nocb_next_follower;
++ 				rdp_last->nocb_next_follower = NULL;
++ 			}
++ 		} while (rdp);
++ 		rdp_spawn->nocb_next_follower = rdp_old_leader;
++ 	}
++ 
++ 	/* Spawn the kthread for this CPU and RCU flavor. */
++ 	t = kthread_run(rcu_nocb_kthread, rdp_spawn,
++ 			"rcuo%c/%d", rsp->abbr, cpu);
++ 	BUG_ON(IS_ERR(t));
++ 	WRITE_ONCE(rdp_spawn->nocb_kthread, t);
++ }
++ 
+++>>>>>>> fd30b717b86d (rcu: Convert timers to use timer_setup()):kernel/rcu/tree_plugin.h
+  /*
+   * If the specified CPU is a no-CBs CPU that does not already have its
+   * rcuo kthreads, spawn them.
+* Unmerged path kernel/rcu/rcutorture.c
+* Unmerged path kernel/rcu/rcutorture.c
+* Unmerged path kernel/rcutree_plugin.h
