@@ -1,0 +1,318 @@
+watchdog: Create watchdog device in watchdog_dev.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [watchdog] Create watchdog device in watchdog_dev.c (David Arcari) [1576173]
+Rebuild_FUZZ: 88.89%
+commit-author Guenter Roeck <linux@roeck-us.net>
+commit 32ecc6392654a0db34b310e8924b5b2c3b8bf503
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/32ecc639.failed
+
+The watchdog character device is currently created in watchdog_dev.c,
+and the watchdog device in watchdog_core.c. This results in
+cross-dependencies, since device creation needs to know the watchdog
+character device number as well as the watchdog class, both of which
+reside in watchdog_dev.c.
+
+Create the watchdog device in watchdog_dev.c to simplify the code.
+
+Inspired by earlier patch set from Damien Riegel.
+
+	Cc: Damien Riegel <damien.riegel@savoirfairelinux.com>
+	Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+	Signed-off-by: Wim Van Sebroeck <wim@iguana.be>
+(cherry picked from commit 32ecc6392654a0db34b310e8924b5b2c3b8bf503)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/watchdog/watchdog_core.c
+diff --cc drivers/watchdog/watchdog_core.c
+index ec37c78cc500,f0293f7d2b80..000000000000
+--- a/drivers/watchdog/watchdog_core.c
++++ b/drivers/watchdog/watchdog_core.c
+@@@ -137,9 -137,63 +136,9 @@@ int watchdog_init_timeout(struct watchd
+  }
+  EXPORT_SYMBOL_GPL(watchdog_init_timeout);
+  
+ -static int watchdog_reboot_notifier(struct notifier_block *nb,
+ -				    unsigned long code, void *data)
+ -{
+ -	struct watchdog_device *wdd = container_of(nb, struct watchdog_device,
+ -						   reboot_nb);
+ -
+ -	if (code == SYS_DOWN || code == SYS_HALT) {
+ -		if (watchdog_active(wdd)) {
+ -			int ret;
+ -
+ -			ret = wdd->ops->stop(wdd);
+ -			if (ret)
+ -				return NOTIFY_BAD;
+ -		}
+ -	}
+ -
+ -	return NOTIFY_DONE;
+ -}
+ -
+ -static int watchdog_restart_notifier(struct notifier_block *nb,
+ -				     unsigned long action, void *data)
+ -{
+ -	struct watchdog_device *wdd = container_of(nb, struct watchdog_device,
+ -						   restart_nb);
+ -
+ -	int ret;
+ -
+ -	ret = wdd->ops->restart(wdd);
+ -	if (ret)
+ -		return NOTIFY_BAD;
+ -
+ -	return NOTIFY_DONE;
+ -}
+ -
+ -/**
+ - * watchdog_set_restart_priority - Change priority of restart handler
+ - * @wdd: watchdog device
+ - * @priority: priority of the restart handler, should follow these guidelines:
+ - *   0:   use watchdog's restart function as last resort, has limited restart
+ - *        capabilies
+ - *   128: default restart handler, use if no other handler is expected to be
+ - *        available and/or if restart is sufficient to restart the entire system
+ - *   255: preempt all other handlers
+ - *
+ - * If a wdd->ops->restart function is provided when watchdog_register_device is
+ - * called, it will be registered as a restart handler with the priority given
+ - * here.
+ - */
+ -void watchdog_set_restart_priority(struct watchdog_device *wdd, int priority)
+ -{
+ -	wdd->restart_nb.priority = priority;
+ -}
+ -EXPORT_SYMBOL_GPL(watchdog_set_restart_priority);
+ -
+  static int __watchdog_register_device(struct watchdog_device *wdd)
+  {
+- 	int ret, id = -1, devno;
++ 	int ret, id = -1;
+  
+  	if (wdd == NULL || wdd->info == NULL || wdd->ops == NULL)
+  		return -EINVAL;
+@@@ -192,14 -246,26 +191,37 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	devno = wdd->cdev.dev;
+ +	wdd->dev = device_create(watchdog_class, wdd->parent, devno,
+ +					wdd, "watchdog%d", wdd->id);
+ +	if (IS_ERR(wdd->dev)) {
+ +		watchdog_dev_unregister(wdd);
+ +		ida_simple_remove(&watchdog_ida, id);
+ +		ret = PTR_ERR(wdd->dev);
+ +		return ret;
+++=======
++ 	if (test_bit(WDOG_STOP_ON_REBOOT, &wdd->status)) {
++ 		wdd->reboot_nb.notifier_call = watchdog_reboot_notifier;
++ 
++ 		ret = register_reboot_notifier(&wdd->reboot_nb);
++ 		if (ret) {
++ 			dev_err(wdd->dev, "Cannot register reboot notifier (%d)\n",
++ 				ret);
++ 			watchdog_dev_unregister(wdd);
++ 			ida_simple_remove(&watchdog_ida, wdd->id);
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	if (wdd->ops->restart) {
++ 		wdd->restart_nb.notifier_call = watchdog_restart_notifier;
++ 
++ 		ret = register_restart_handler(&wdd->restart_nb);
++ 		if (ret)
++ 			dev_warn(wdd->dev, "Cannot register restart handler (%d)\n",
++ 				 ret);
+++>>>>>>> 32ecc6392654 (watchdog: Create watchdog device in watchdog_dev.c)
+  	}
+  
+  	return 0;
+@@@ -235,16 -301,14 +257,22 @@@ static void __watchdog_unregister_devic
+  	if (wdd == NULL)
+  		return;
+  
+++<<<<<<< HEAD
+ +	devno = wdd->cdev.dev;
+ +	ret = watchdog_dev_unregister(wdd);
+ +	if (ret)
+ +		pr_err("error unregistering /dev/watchdog (err=%d)\n", ret);
+ +	device_destroy(watchdog_class, devno);
+++=======
++ 	if (wdd->ops->restart)
++ 		unregister_restart_handler(&wdd->restart_nb);
++ 
++ 	if (test_bit(WDOG_STOP_ON_REBOOT, &wdd->status))
++ 		unregister_reboot_notifier(&wdd->reboot_nb);
++ 
++ 	watchdog_dev_unregister(wdd);
+++>>>>>>> 32ecc6392654 (watchdog: Create watchdog device in watchdog_dev.c)
+  	ida_simple_remove(&watchdog_ida, wdd->id);
+- 	wdd->dev = NULL;
+  }
+  
+  /**
+* Unmerged path drivers/watchdog/watchdog_core.c
+diff --git a/drivers/watchdog/watchdog_core.h b/drivers/watchdog/watchdog_core.h
+index 1c8d6b0e68c7..86ff962d1e15 100644
+--- a/drivers/watchdog/watchdog_core.h
++++ b/drivers/watchdog/watchdog_core.h
+@@ -32,6 +32,6 @@
+  *	Functions/procedures to be called by the core
+  */
+ extern int watchdog_dev_register(struct watchdog_device *);
+-extern int watchdog_dev_unregister(struct watchdog_device *);
+-extern struct class * __init watchdog_dev_init(void);
++extern void watchdog_dev_unregister(struct watchdog_device *);
++extern int __init watchdog_dev_init(void);
+ extern void __exit watchdog_dev_exit(void);
+diff --git a/drivers/watchdog/watchdog_dev.c b/drivers/watchdog/watchdog_dev.c
+index f06fbcf0bea2..7ba3fc6157c7 100644
+--- a/drivers/watchdog/watchdog_dev.c
++++ b/drivers/watchdog/watchdog_dev.c
+@@ -628,17 +628,18 @@ static struct miscdevice watchdog_miscdev = {
+ };
+ 
+ /*
+- *	watchdog_dev_register: register a watchdog device
++ *	watchdog_cdev_register: register watchdog character device
+  *	@wdd: watchdog device
++ *	@devno: character device number
+  *
+- *	Register a watchdog device including handling the legacy
++ *	Register a watchdog character device including handling the legacy
+  *	/dev/watchdog node. /dev/watchdog is actually a miscdevice and
+  *	thus we set it up like that.
+  */
+ 
+-int watchdog_dev_register(struct watchdog_device *wdd)
++static int watchdog_cdev_register(struct watchdog_device *wdd, dev_t devno)
+ {
+-	int err, devno;
++	int err;
+ 
+ 	if (wdd->id == 0) {
+ 		old_wdd = wdd;
+@@ -656,7 +657,6 @@ int watchdog_dev_register(struct watchdog_device *wdd)
+ 	}
+ 
+ 	/* Fill in the data structures */
+-	devno = MKDEV(MAJOR(watchdog_devt), wdd->id);
+ 	cdev_init(&wdd->cdev, &watchdog_fops);
+ 	wdd->cdev.owner = wdd->ops->owner;
+ 
+@@ -674,13 +674,14 @@ int watchdog_dev_register(struct watchdog_device *wdd)
+ }
+ 
+ /*
+- *	watchdog_dev_unregister: unregister a watchdog device
++ *	watchdog_cdev_unregister: unregister watchdog character device
+  *	@watchdog: watchdog device
+  *
+- *	Unregister the watchdog and if needed the legacy /dev/watchdog device.
++ *	Unregister watchdog character device and if needed the legacy
++ *	/dev/watchdog device.
+  */
+ 
+-int watchdog_dev_unregister(struct watchdog_device *wdd)
++static void watchdog_cdev_unregister(struct watchdog_device *wdd)
+ {
+ 	mutex_lock(&wdd->lock);
+ 	set_bit(WDOG_UNREGISTERED, &wdd->status);
+@@ -691,7 +692,6 @@ int watchdog_dev_unregister(struct watchdog_device *wdd)
+ 		misc_deregister(&watchdog_miscdev);
+ 		old_wdd = NULL;
+ 	}
+-	return 0;
+ }
+ 
+ static struct class watchdog_class = {
+@@ -700,30 +700,77 @@ static struct class watchdog_class = {
+ 	.dev_groups =	wdt_groups,
+ };
+ 
++/*
++ *	watchdog_dev_register: register a watchdog device
++ *	@wdd: watchdog device
++ *
++ *	Register a watchdog device including handling the legacy
++ *	/dev/watchdog node. /dev/watchdog is actually a miscdevice and
++ *	thus we set it up like that.
++ */
++
++int watchdog_dev_register(struct watchdog_device *wdd)
++{
++	struct device *dev;
++	dev_t devno;
++	int ret;
++
++	devno = MKDEV(MAJOR(watchdog_devt), wdd->id);
++
++	ret = watchdog_cdev_register(wdd, devno);
++	if (ret)
++		return ret;
++
++	dev = device_create(&watchdog_class, wdd->parent, devno, wdd,
++			    "watchdog%d", wdd->id);
++	if (IS_ERR(dev)) {
++		watchdog_cdev_unregister(wdd);
++		return PTR_ERR(dev);
++	}
++	wdd->dev = dev;
++
++	return ret;
++}
++
++/*
++ *	watchdog_dev_unregister: unregister a watchdog device
++ *	@watchdog: watchdog device
++ *
++ *	Unregister watchdog device and if needed the legacy
++ *	/dev/watchdog device.
++ */
++
++void watchdog_dev_unregister(struct watchdog_device *wdd)
++{
++	watchdog_cdev_unregister(wdd);
++	device_destroy(&watchdog_class, wdd->dev->devt);
++	wdd->dev = NULL;
++}
++
+ /*
+  *	watchdog_dev_init: init dev part of watchdog core
+  *
+  *	Allocate a range of chardev nodes to use for watchdog devices
+  */
+ 
+-struct class * __init watchdog_dev_init(void)
++int __init watchdog_dev_init(void)
+ {
+ 	int err;
+ 
+ 	err = class_register(&watchdog_class);
+ 	if (err < 0) {
+ 		pr_err("couldn't register class\n");
+-		return ERR_PTR(err);
++		return err;
+ 	}
+ 
+ 	err = alloc_chrdev_region(&watchdog_devt, 0, MAX_DOGS, "watchdog");
+ 	if (err < 0) {
+ 		pr_err("watchdog: unable to allocate char dev region\n");
+ 		class_unregister(&watchdog_class);
+-		return ERR_PTR(err);
++		return err;
+ 	}
+ 
+-	return &watchdog_class;
++	return 0;
+ }
+ 
+ /*
