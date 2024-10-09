@@ -1,0 +1,184 @@
+net: busy-poll: allow preemption in sk_busy_loop()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] busy-poll: allow preemption in sk_busy_loop() (Ivan Vecera) [1489406]
+Rebuild_FUZZ: 94.74%
+commit-author Eric Dumazet <edumazet@google.com>
+commit 217f6974368188fd8bd7804bf5a036aa5762c5e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/217f6974.failed
+
+After commit 4cd13c21b207 ("softirq: Let ksoftirqd do its job"),
+sk_busy_loop() needs a bit of care :
+softirqs might be delayed since we do not allow preemption yet.
+
+This patch adds preemptiom points in sk_busy_loop(),
+and makes sure no unnecessary cache line dirtying
+or atomic operations are done while looping.
+
+A new flag is added into napi->state : NAPI_STATE_IN_BUSY_POLL
+
+This prevents napi_complete_done() from clearing NAPIF_STATE_SCHED,
+so that sk_busy_loop() does not have to grab it again.
+
+Similarly, netpoll_poll_lock() is done one time.
+
+This gives about 10 to 20 % improvement in various busy polling
+tests, especially when many threads are busy polling in
+configurations with large number of NIC queues.
+
+This should allow experimenting with bigger delays without
+hurting overall latencies.
+
+Tested:
+ On a 40Gb mlx4 NIC, 32 RX/TX queues.
+
+ echo 70 >/proc/sys/net/core/busy_read
+ for i in `seq 1 40`; do echo -n $i: ; ./super_netperf $i -H lpaa24 -t UDP_RR -- -N -n; done
+
+    Before:      After:
+ 1:   90072   92819
+ 2:  157289  184007
+ 3:  235772  213504
+ 4:  344074  357513
+ 5:  394755  458267
+ 6:  461151  487819
+ 7:  549116  625963
+ 8:  544423  716219
+ 9:  720460  738446
+10:  794686  837612
+11:  915998  923960
+12:  937507  925107
+13: 1019677  971506
+14: 1046831 1113650
+15: 1114154 1148902
+16: 1105221 1179263
+17: 1266552 1299585
+18: 1258454 1383817
+19: 1341453 1312194
+20: 1363557 1488487
+21: 1387979 1501004
+22: 1417552 1601683
+23: 1550049 1642002
+24: 1568876 1601915
+25: 1560239 1683607
+26: 1640207 1745211
+27: 1706540 1723574
+28: 1638518 1722036
+29: 1734309 1757447
+30: 1782007 1855436
+31: 1724806 1888539
+32: 1717716 1944297
+33: 1778716 1869118
+34: 1805738 1983466
+35: 1815694 2020758
+36: 1893059 2035632
+37: 1843406 2034653
+38: 1888830 2086580
+39: 1972827 2143567
+40: 1877729 2181851
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Cc: Willem de Bruijn <willemb@google.com>
+	Cc: Adam Belay <abelay@google.com>
+	Cc: Tariq Toukan <tariqt@mellanox.com>
+	Cc: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Cc: Ariel Elior <ariel.elior@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 217f6974368188fd8bd7804bf5a036aa5762c5e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+diff --cc net/core/dev.c
+index 5f3231ddea24,369dcc8efc01..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -4730,8 -4902,14 +4730,14 @@@ void __napi_complete(struct napi_struc
+  {
+  	BUG_ON(!test_bit(NAPI_STATE_SCHED, &n->state));
+  
++ 	/* Some drivers call us directly, instead of calling
++ 	 * napi_complete_done().
++ 	 */
++ 	if (unlikely(test_bit(NAPI_STATE_IN_BUSY_POLL, &n->state)))
++ 		return;
++ 
+  	list_del_init(&n->poll_list);
+ -	smp_mb__before_atomic();
+ +	smp_mb__before_clear_bit();
+  	clear_bit(NAPI_STATE_SCHED, &n->state);
+  }
+  EXPORT_SYMBOL(__napi_complete);
+@@@ -4814,22 -5016,30 +4852,45 @@@ restart
+  		local_bh_disable();
+  		if (busy_poll) {
+  			rc = busy_poll(napi);
+++<<<<<<< HEAD
+ +		} else if (napi_schedule_prep(napi)) {
+ +			void *have = netpoll_poll_lock(napi);
+ +
+ +			if (test_bit(NAPI_STATE_SCHED, &napi->state)) {
+ +				rc = napi->poll(napi, BUSY_POLL_BUDGET);
+ +				trace_napi_poll(napi);
+ +				if (rc == BUSY_POLL_BUDGET) {
+ +					napi_complete_done(napi, rc);
+ +					napi_schedule(napi);
+ +				}
+ +			}
+ +			netpoll_poll_unlock(have);
+++=======
++ 			goto count;
+++>>>>>>> 217f69743681 (net: busy-poll: allow preemption in sk_busy_loop())
+  		}
++ 		if (!napi_poll) {
++ 			unsigned long val = READ_ONCE(napi->state);
++ 
++ 			/* If multiple threads are competing for this napi,
++ 			 * we avoid dirtying napi->state as much as we can.
++ 			 */
++ 			if (val & (NAPIF_STATE_DISABLE | NAPIF_STATE_SCHED |
++ 				   NAPIF_STATE_IN_BUSY_POLL))
++ 				goto count;
++ 			if (cmpxchg(&napi->state, val,
++ 				    val | NAPIF_STATE_IN_BUSY_POLL |
++ 					  NAPIF_STATE_SCHED) != val)
++ 				goto count;
++ 			have_poll_lock = netpoll_poll_lock(napi);
++ 			napi_poll = napi->poll;
++ 		}
++ 		rc = napi_poll(napi, BUSY_POLL_BUDGET);
++ 		trace_napi_poll(napi, rc, BUSY_POLL_BUDGET);
++ count:
+  		if (rc > 0)
+ -			__NET_ADD_STATS(sock_net(sk),
+ -					LINUX_MIB_BUSYPOLLRXPACKETS, rc);
+ +			NET_ADD_STATS_BH(sock_net(sk),
+ +					 LINUX_MIB_BUSYPOLLRXPACKETS, rc);
+  		local_bh_enable();
+  
+  		if (rc == LL_FLUSH_FAILED)
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 118817028a8c..be1f302f3a42 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -353,6 +353,16 @@ enum {
+ 	NAPI_STATE_HASHED,	/* In NAPI hash */
+ 	NAPI_STATE_EXT,		/* Extended napi_struct */
+ 	NAPI_STATE_NO_BUSY_POLL,/* Do not add in napi_hash, no busy polling */
++	NAPI_STATE_IN_BUSY_POLL,/* sk_busy_loop() owns this NAPI */
++};
++
++enum {
++	NAPIF_STATE_SCHED	 = (1UL << NAPI_STATE_SCHED),
++	NAPIF_STATE_DISABLE	 = (1UL << NAPI_STATE_DISABLE),
++	NAPIF_STATE_NPSVC	 = (1UL << NAPI_STATE_NPSVC),
++	NAPIF_STATE_HASHED	 = (1UL << NAPI_STATE_HASHED),
++	NAPIF_STATE_NO_BUSY_POLL = (1UL << NAPI_STATE_NO_BUSY_POLL),
++	NAPIF_STATE_IN_BUSY_POLL = (1UL << NAPI_STATE_IN_BUSY_POLL),
+ };
+ 
+ enum gro_result {
+* Unmerged path net/core/dev.c
