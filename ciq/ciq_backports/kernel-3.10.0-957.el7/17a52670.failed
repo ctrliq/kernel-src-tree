@@ -1,0 +1,125 @@
+bpf: verifier (add verifier core)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Alexei Starovoitov <ast@plumgrid.com>
+commit 17a5267067f3c372fec9ffb798d6eaba6b5e6a4c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/17a52670.failed
+
+This patch adds verifier core which simulates execution of every insn and
+records the state of registers and program stack. Every branch instruction seen
+during simulation is pushed into state stack. When verifier reaches BPF_EXIT,
+it pops the state from the stack and continues until it reaches BPF_EXIT again.
+For program:
+1: bpf_mov r1, xxx
+2: if (r1 == 0) goto 5
+3: bpf_mov r0, 1
+4: goto 6
+5: bpf_mov r0, 2
+6: bpf_exit
+The verifier will walk insns: 1, 2, 3, 4, 6
+then it will pop the state recorded at insn#2 and will continue: 5, 6
+
+This way it walks all possible paths through the program and checks all
+possible values of registers. While doing so, it checks for:
+- invalid instructions
+- uninitialized register access
+- uninitialized stack access
+- misaligned stack access
+- out of range stack access
+- invalid calling convention
+- instruction encoding is not using reserved fields
+
+Kernel subsystem configures the verifier with two callbacks:
+
+- bool (*is_valid_access)(int off, int size, enum bpf_access_type type);
+  that provides information to the verifer which fields of 'ctx'
+  are accessible (remember 'ctx' is the first argument to eBPF program)
+
+- const struct bpf_func_proto *(*get_func_proto)(enum bpf_func_id func_id);
+  returns argument constraints of kernel helper functions that eBPF program
+  may call, so that verifier can checks that R1-R5 types match the prototype
+
+More details in Documentation/networking/filter.txt and in kernel/bpf/verifier.c
+
+	Signed-off-by: Alexei Starovoitov <ast@plumgrid.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 17a5267067f3c372fec9ffb798d6eaba6b5e6a4c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/verifier.c
+* Unmerged path kernel/bpf/verifier.c
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index d4c1f9049ad3..fe4da86aea5b 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -77,6 +77,31 @@ void bpf_map_put_with_uref(struct bpf_map *map);
+ void bpf_map_put(struct bpf_map *map);
+ struct bpf_map *bpf_map_get(struct fd f);
+ 
++/* function argument constraints */
++enum bpf_arg_type {
++	ARG_ANYTHING = 0,	/* any argument is ok */
++
++	/* the following constraints used to prototype
++	 * bpf_map_lookup/update/delete_elem() functions
++	 */
++	ARG_CONST_MAP_PTR,	/* const argument used as pointer to bpf_map */
++	ARG_PTR_TO_MAP_KEY,	/* pointer to stack used as map key */
++	ARG_PTR_TO_MAP_VALUE,	/* pointer to stack used as map value */
++
++	/* the following constraints used to prototype bpf_memcmp() and other
++	 * functions that access data on eBPF program stack
++	 */
++	ARG_PTR_TO_STACK,	/* any pointer to eBPF program stack */
++	ARG_CONST_STACK_SIZE,	/* number of bytes accessed from stack */
++};
++
++/* type of values returned from helper functions */
++enum bpf_return_type {
++	RET_INTEGER,			/* function returns integer */
++	RET_VOID,			/* function doesn't return anything */
++	RET_PTR_TO_MAP_VALUE_OR_NULL,	/* returns a pointer to map elem value or NULL */
++};
++
+ /* eBPF function prototype used by verifier to allow BPF_CALLs from eBPF programs
+  * to in-kernel helper functions and for adjusting imm32 field in BPF_CALL
+  * instructions after verifying
+@@ -84,11 +109,33 @@ struct bpf_map *bpf_map_get(struct fd f);
+ struct bpf_func_proto {
+ 	u64 (*func)(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5);
+ 	bool gpl_only;
++	enum bpf_return_type ret_type;
++	enum bpf_arg_type arg1_type;
++	enum bpf_arg_type arg2_type;
++	enum bpf_arg_type arg3_type;
++	enum bpf_arg_type arg4_type;
++	enum bpf_arg_type arg5_type;
++};
++
++/* bpf_context is intentionally undefined structure. Pointer to bpf_context is
++ * the first argument to eBPF programs.
++ * For socket filters: 'struct bpf_context *' == 'struct sk_buff *'
++ */
++struct bpf_context;
++
++enum bpf_access_type {
++	BPF_READ = 1,
++	BPF_WRITE = 2
+ };
+ 
+ struct bpf_verifier_ops {
+ 	/* return eBPF function prototype for verification */
+ 	const struct bpf_func_proto *(*get_func_proto)(enum bpf_func_id func_id);
++
++	/* return true if 'size' wide access at offset 'off' within bpf_context
++	 * with 'type' (read or write) is allowed
++	 */
++	bool (*is_valid_access)(int off, int size, enum bpf_access_type type);
+ };
+ 
+ struct bpf_prog_type_list {
+* Unmerged path kernel/bpf/verifier.c
