@@ -1034,7 +1034,6 @@ static int alloc_rbio_pages(struct btrfs_raid_bio *rbio)
 		if (!page)
 			return -ENOMEM;
 		rbio->stripe_pages[i] = page;
-		ClearPageUptodate(page);
 	}
 	return 0;
 }
@@ -2280,7 +2279,6 @@ static int alloc_rbio_essential_pages(struct btrfs_raid_bio *rbio)
 			if (!page)
 				return -ENOMEM;
 			rbio->stripe_pages[index] = page;
-			ClearPageUptodate(page);
 		}
 	}
 	return 0;
