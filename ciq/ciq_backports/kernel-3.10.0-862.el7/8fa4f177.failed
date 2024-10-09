@@ -1,0 +1,387 @@
+scsi: cxlflash: Remove port configuration assumptions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] cxlflash: Remove port configuration assumptions (Gustavo Duarte) [1456494]
+Rebuild_FUZZ: 94.00%
+commit-author Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+commit 8fa4f1770d56af6f0a5a862f1fd298a4eeea94f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8fa4f177.failed
+
+At present, the cxlflash driver only supports hardware with two FC ports. The
+code was initially designed with this assumption and is dependent on having
+two FC ports - adding more ports will break logic within the driver.
+
+To mitigate this issue, remove the existing port assumptions and transition
+the code to support more than two ports. As a side effect, clarify the
+interpretation of the DK_CXLFLASH_ALL_PORTS_ACTIVE flag.
+
+	Signed-off-by: Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+	Signed-off-by: Uma Krishnan <ukrishn@linux.vnet.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 8fa4f1770d56af6f0a5a862f1fd298a4eeea94f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/cxlflash/main.c
+#	drivers/scsi/cxlflash/vlun.c
+diff --cc drivers/scsi/cxlflash/main.c
+index c68badcfa77f,04e1a8effa76..000000000000
+--- a/drivers/scsi/cxlflash/main.c
++++ b/drivers/scsi/cxlflash/main.c
+@@@ -366,12 -365,8 +366,17 @@@ static void wait_resp(struct afu *afu, 
+   */
+  static int send_tmf(struct afu *afu, struct scsi_cmnd *scp, u64 tmfcmd)
+  {
+++<<<<<<< HEAD
+ +	struct afu_cmd *cmd;
+ +
+ +	u32 port_sel = scp->device->channel + 1;
+ +	short lflag = 0;
+ +	struct Scsi_Host *host = scp->device->host;
+ +	struct cxlflash_cfg *cfg = (struct cxlflash_cfg *)host->hostdata;
+++=======
++ 	struct cxlflash_cfg *cfg = shost_priv(scp->device->host);
++ 	struct afu_cmd *cmd = sc_to_afucz(scp);
+++>>>>>>> 8fa4f1770d56 (scsi: cxlflash: Remove port configuration assumptions)
+  	struct device *dev = &cfg->dev->dev;
+  	ulong lock_flags;
+  	int rc = 0;
+@@@ -391,28 -379,23 +396,33 @@@
+  						  !cfg->tmf_active,
+  						  cfg->tmf_slock);
+  	cfg->tmf_active = true;
+ -	spin_unlock_irqrestore(&cfg->tmf_slock, lock_flags);
+ -
+ -	cmd->scp = scp;
+ -	cmd->parent = afu;
+  	cmd->cmd_tmf = true;
+ +	spin_unlock_irqrestore(&cfg->tmf_slock, lock_flags);
+  
+  	cmd->rcb.ctx_id = afu->ctx_hndl;
+++<<<<<<< HEAD
+ +	cmd->rcb.port_sel = port_sel;
+++=======
++ 	cmd->rcb.msi = SISL_MSI_RRQ_UPDATED;
++ 	cmd->rcb.port_sel = CHAN2PORTMASK(scp->device->channel);
+++>>>>>>> 8fa4f1770d56 (scsi: cxlflash: Remove port configuration assumptions)
+  	cmd->rcb.lun_id = lun_to_lunid(scp->device->lun);
+ +
+ +	lflag = SISL_REQ_FLAGS_TMF_CMD;
+ +
+  	cmd->rcb.req_flags = (SISL_REQ_FLAGS_PORT_LUN_ID |
+ -			      SISL_REQ_FLAGS_SUP_UNDERRUN |
+ -			      SISL_REQ_FLAGS_TMF_CMD);
+ +			      SISL_REQ_FLAGS_SUP_UNDERRUN | lflag);
+ +
+ +	/* Stash the scp in the reserved field, for reuse during interrupt */
+ +	cmd->rcb.scp = scp;
+ +
+ +	/* Copy the CDB from the cmd passed in */
+  	memcpy(cmd->rcb.cdb, &tmfcmd, sizeof(tmfcmd));
+  
+ -	rc = afu->send_cmd(afu, cmd);
+ +	/* Send the command */
+ +	rc = send_cmd(afu, cmd);
+  	if (unlikely(rc)) {
+ +		cmd_checkin(cmd);
+  		spin_lock_irqsave(&cfg->tmf_slock, lock_flags);
+  		cfg->tmf_active = false;
+  		spin_unlock_irqrestore(&cfg->tmf_slock, lock_flags);
+@@@ -455,19 -438,18 +465,25 @@@ static const char *cxlflash_driver_info
+   */
+  static int cxlflash_queuecommand(struct Scsi_Host *host, struct scsi_cmnd *scp)
+  {
+ -	struct cxlflash_cfg *cfg = shost_priv(host);
+ +	struct cxlflash_cfg *cfg = (struct cxlflash_cfg *)host->hostdata;
+  	struct afu *afu = cfg->afu;
+  	struct device *dev = &cfg->dev->dev;
+++<<<<<<< HEAD
+ +	struct afu_cmd *cmd;
+ +	u32 port_sel = scp->device->channel + 1;
+ +	int nseg, i, ncount;
+ +	struct scatterlist *sg;
+++=======
++ 	struct afu_cmd *cmd = sc_to_afucz(scp);
++ 	struct scatterlist *sg = scsi_sglist(scp);
++ 	u16 req_flags = SISL_REQ_FLAGS_SUP_UNDERRUN;
+++>>>>>>> 8fa4f1770d56 (scsi: cxlflash: Remove port configuration assumptions)
+  	ulong lock_flags;
+ -	int nseg = 0;
+ +	short lflag = 0;
+  	int rc = 0;
+  
+ -	dev_dbg_ratelimited(dev, "%s: (scp=%p) %d/%d/%d/%llu "
+ -			    "cdb=(%08x-%08x-%08x-%08x)\n",
+ +	dev_dbg_ratelimited(dev, "%s: (scp=%p) %d/%d/%d/%d "
+ +			    "cdb=(%08X-%08X-%08X-%08X)\n",
+  			    __func__, scp, host->host_no, scp->device->channel,
+  			    scp->device->id, scp->device->lun,
+  			    get_unaligned_be32(&((u32 *)scp->cmnd)[0]),
+@@@ -502,15 -484,24 +518,20 @@@
+  		break;
+  	}
+  
+ -	if (likely(sg)) {
+ -		nseg = scsi_dma_map(scp);
+ -		if (unlikely(nseg < 0)) {
+ -			dev_err(dev, "%s: Fail DMA map\n", __func__);
+ -			rc = SCSI_MLQUEUE_HOST_BUSY;
+ -			goto out;
+ -		}
+ -
+ -		cmd->rcb.data_len = sg_dma_len(sg);
+ -		cmd->rcb.data_ea = sg_dma_address(sg);
+ +	cmd = cmd_checkout(afu);
+ +	if (unlikely(!cmd)) {
+ +		dev_err(dev, "%s: could not get a free command\n", __func__);
+ +		rc = SCSI_MLQUEUE_HOST_BUSY;
+ +		goto out;
+  	}
+  
+ -	cmd->scp = scp;
+ -	cmd->parent = afu;
+ -
+  	cmd->rcb.ctx_id = afu->ctx_hndl;
+++<<<<<<< HEAD
+ +	cmd->rcb.port_sel = port_sel;
+++=======
++ 	cmd->rcb.msi = SISL_MSI_RRQ_UPDATED;
++ 	cmd->rcb.port_sel = CHAN2PORTMASK(scp->device->channel);
+++>>>>>>> 8fa4f1770d56 (scsi: cxlflash: Remove port configuration assumptions)
+  	cmd->rcb.lun_id = lun_to_lunid(scp->device->lun);
+  
+  	if (scp->sc_data_direction == DMA_TO_DEVICE)
+@@@ -1517,10 -1554,11 +1538,16 @@@ static int init_global(struct cxlflash_
+  	if (afu->internal_lun) {
+  		/* Only use port 0 */
+  		writeq_be(PORT0, &afu->afu_map->global.regs.afu_port_sel);
+ -		num_ports = 0;
+ +		num_ports = NUM_FC_PORTS - 1;
+  	} else {
+++<<<<<<< HEAD
+ +		writeq_be(BOTH_PORTS, &afu->afu_map->global.regs.afu_port_sel);
+ +		num_ports = NUM_FC_PORTS;
+++=======
++ 		writeq_be(PORT_MASK(cfg->num_fc_ports),
++ 			  &afu->afu_map->global.regs.afu_port_sel);
++ 		num_ports = cfg->num_fc_ports;
+++>>>>>>> 8fa4f1770d56 (scsi: cxlflash: Remove port configuration assumptions)
+  	}
+  
+  	for (i = 0; i < num_ports; i++) {
+@@@ -2149,7 -2189,7 +2176,11 @@@ static ssize_t lun_mode_store(struct de
+  		if (afu->internal_lun)
+  			shost->max_channel = 0;
+  		else
+++<<<<<<< HEAD
+ +			shost->max_channel = NUM_FC_PORTS - 1;
+++=======
++ 			shost->max_channel = PORTNUM2CHAN(cfg->num_fc_ports);
+++>>>>>>> 8fa4f1770d56 (scsi: cxlflash: Remove port configuration assumptions)
+  
+  		afu_reset(cfg);
+  		scsi_scan_host(cfg->host);
+diff --cc drivers/scsi/cxlflash/vlun.c
+index 90c5d7f5278e,067605b80fcd..000000000000
+--- a/drivers/scsi/cxlflash/vlun.c
++++ b/drivers/scsi/cxlflash/vlun.c
+@@@ -812,9 -819,10 +812,9 @@@ int cxlflash_vlun_resize(struct scsi_de
+  void cxlflash_restore_luntable(struct cxlflash_cfg *cfg)
+  {
+  	struct llun_info *lli, *temp;
+- 	u32 chan;
+  	u32 lind;
++ 	int k;
+  	struct afu *afu = cfg->afu;
+ -	struct device *dev = &cfg->dev->dev;
+  	struct sisl_global_map __iomem *agm = &afu->afu_map->global;
+  
+  	mutex_lock(&global.mutex);
+@@@ -824,20 -832,14 +824,30 @@@
+  			continue;
+  
+  		lind = lli->lun_index;
++ 		dev_dbg(dev, "%s: Virtual LUNs on slot %d:\n", __func__, lind);
+  
+++<<<<<<< HEAD
+ +		if (lli->port_sel == BOTH_PORTS) {
+ +			writeq_be(lli->lun_id[0], &agm->fc_port[0][lind]);
+ +			writeq_be(lli->lun_id[1], &agm->fc_port[1][lind]);
+ +			pr_debug("%s: Virtual LUN on slot %d  id0=%llx, "
+ +				 "id1=%llx\n", __func__, lind,
+ +				 lli->lun_id[0], lli->lun_id[1]);
+ +		} else {
+ +			chan = PORT2CHAN(lli->port_sel);
+ +			writeq_be(lli->lun_id[chan], &agm->fc_port[chan][lind]);
+ +			pr_debug("%s: Virtual LUN on slot %d chan=%d, "
+ +				 "id=%llx\n", __func__, lind, chan,
+ +				 lli->lun_id[chan]);
+ +		}
+++=======
++ 		for (k = 0; k < cfg->num_fc_ports; k++)
++ 			if (lli->port_sel & (1 << k)) {
++ 				writeq_be(lli->lun_id[k],
++ 					  &agm->fc_port[k][lind]);
++ 				dev_dbg(dev, "\t%d=%llx\n", k, lli->lun_id[k]);
++ 			}
+++>>>>>>> 8fa4f1770d56 (scsi: cxlflash: Remove port configuration assumptions)
+  	}
+  
+  	mutex_unlock(&global.mutex);
+@@@ -858,8 -874,11 +882,10 @@@ static int init_luntable(struct cxlflas
+  {
+  	u32 chan;
+  	u32 lind;
++ 	u32 nports;
+  	int rc = 0;
++ 	int k;
+  	struct afu *afu = cfg->afu;
+ -	struct device *dev = &cfg->dev->dev;
+  	struct sisl_global_map __iomem *agm = &afu->afu_map->global;
+  
+  	mutex_lock(&global.mutex);
+@@@ -879,17 -909,23 +916,28 @@@
+  		}
+  
+  		lind = lli->lun_index = cfg->promote_lun_index;
+- 		writeq_be(lli->lun_id[0], &agm->fc_port[0][lind]);
+- 		writeq_be(lli->lun_id[1], &agm->fc_port[1][lind]);
++ 		dev_dbg(dev, "%s: Virtual LUNs on slot %d:\n", __func__, lind);
++ 
++ 		for (k = 0; k < cfg->num_fc_ports; k++) {
++ 			if (!(lli->port_sel & (1 << k)))
++ 				continue;
++ 
++ 			writeq_be(lli->lun_id[k], &agm->fc_port[k][lind]);
++ 			dev_dbg(dev, "\t%d=%llx\n", k, lli->lun_id[k]);
++ 		}
++ 
+  		cfg->promote_lun_index++;
+++<<<<<<< HEAD
+ +		pr_debug("%s: Virtual LUN on slot %d  id0=%llx, id1=%llx\n",
+ +			 __func__, lind, lli->lun_id[0], lli->lun_id[1]);
+++=======
+++>>>>>>> 8fa4f1770d56 (scsi: cxlflash: Remove port configuration assumptions)
+  	} else {
+  		/*
+- 		 * If this LUN is visible only from one port, we will put
++ 		 * When LUN is visible only from one port, we will put
+  		 * it in the bottom half of the LUN table.
+  		 */
+- 		chan = PORT2CHAN(lli->port_sel);
++ 		chan = PORTMASK2CHAN(lli->port_sel);
+  		if (cfg->promote_lun_index == cfg->last_lun_index[chan]) {
+  			rc = -ENOSPC;
+  			goto out;
+@@@ -898,8 -934,8 +946,13 @@@
+  		lind = lli->lun_index = cfg->last_lun_index[chan];
+  		writeq_be(lli->lun_id[chan], &agm->fc_port[chan][lind]);
+  		cfg->last_lun_index[chan]--;
+++<<<<<<< HEAD
+ +		pr_debug("%s: Virtual LUN on slot %d  chan=%d, id=%llx\n",
+ +			 __func__, lind, chan, lli->lun_id[chan]);
+++=======
++ 		dev_dbg(dev, "%s: Virtual LUNs on slot %d:\n\t%d=%llx\n",
++ 			__func__, lind, chan, lli->lun_id[chan]);
+++>>>>>>> 8fa4f1770d56 (scsi: cxlflash: Remove port configuration assumptions)
+  	}
+  
+  	lli->in_table = true;
+diff --git a/Documentation/powerpc/cxlflash.txt b/Documentation/powerpc/cxlflash.txt
+index 6d9a2ed32cad..66b4496d6619 100644
+--- a/Documentation/powerpc/cxlflash.txt
++++ b/Documentation/powerpc/cxlflash.txt
+@@ -239,6 +239,11 @@ DK_CXLFLASH_USER_VIRTUAL
+     resource handle that is provided is already referencing provisioned
+     storage. This is reflected by the last LBA being a non-zero value.
+ 
++    When a LUN is accessible from more than one port, this ioctl will
++    return with the DK_CXLFLASH_ALL_PORTS_ACTIVE return flag set. This
++    provides the user with a hint that I/O can be retried in the event
++    of an I/O error as the LUN can be reached over multiple paths.
++
+ DK_CXLFLASH_VLUN_RESIZE
+ -----------------------
+     This ioctl is responsible for resizing a previously created virtual
+diff --git a/drivers/scsi/cxlflash/common.h b/drivers/scsi/cxlflash/common.h
+index 811927d91c5c..79a530878460 100644
+--- a/drivers/scsi/cxlflash/common.h
++++ b/drivers/scsi/cxlflash/common.h
+@@ -25,6 +25,10 @@ extern const struct file_operations cxlflash_cxl_fops;
+ 
+ #define MAX_CONTEXT  CXLFLASH_MAX_CONTEXT       /* num contexts per afu */
+ 
++#define CHAN2PORTMASK(_x)	(1 << (_x))	/* channel to port mask */
++#define PORTMASK2CHAN(_x)	(ilog2((_x)))	/* port mask to channel */
++#define PORTNUM2CHAN(_x)	((_x) - 1)	/* port number to channel */
++
+ #define CXLFLASH_BLOCK_SIZE	4096	/* 4K blocks */
+ #define CXLFLASH_MAX_XFER_SIZE	16777216	/* 16MB transfer */
+ #define CXLFLASH_MAX_SECTORS	(CXLFLASH_MAX_XFER_SIZE/512)	/* SCSI wants
+diff --git a/drivers/scsi/cxlflash/lunmgt.c b/drivers/scsi/cxlflash/lunmgt.c
+index 6c318db90c85..2fdd2e084376 100644
+--- a/drivers/scsi/cxlflash/lunmgt.c
++++ b/drivers/scsi/cxlflash/lunmgt.c
+@@ -247,7 +247,7 @@ int cxlflash_manage_lun(struct scsi_device *sdev,
+ 		 * in unpacked, AFU-friendly format, and hang LUN reference in
+ 		 * the sdev.
+ 		 */
+-		lli->port_sel |= CHAN2PORT(chan);
++		lli->port_sel |= CHAN2PORTMASK(chan);
+ 		lli->lun_id[chan] = lun_to_lunid(sdev->lun);
+ 		sdev->hostdata = lli;
+ 	} else if (flags & DK_CXLFLASH_MANAGE_LUN_DISABLE_SUPERPIPE) {
+@@ -259,7 +259,7 @@ int cxlflash_manage_lun(struct scsi_device *sdev,
+ 			 * tracking when no more references exist.
+ 			 */
+ 			sdev->hostdata = NULL;
+-			lli->port_sel &= ~CHAN2PORT(chan);
++			lli->port_sel &= ~CHAN2PORTMASK(chan);
+ 			if (lli->port_sel == 0U)
+ 				lli->in_table = false;
+ 		}
+* Unmerged path drivers/scsi/cxlflash/main.c
+diff --git a/drivers/scsi/cxlflash/sislite.h b/drivers/scsi/cxlflash/sislite.h
+index 347fc1671975..2750f27f6950 100755
+--- a/drivers/scsi/cxlflash/sislite.h
++++ b/drivers/scsi/cxlflash/sislite.h
+@@ -461,7 +461,7 @@ struct sisl_rht_entry_f1 {
+ 
+ #define PORT0  0x01U
+ #define PORT1  0x02U
+-#define BOTH_PORTS    (PORT0 | PORT1)
++#define PORT_MASK(_n)	((1 << (_n)) - 1)
+ 
+ /* AFU Sync Mode byte */
+ #define AFU_LW_SYNC 0x0U
+diff --git a/drivers/scsi/cxlflash/superpipe.c b/drivers/scsi/cxlflash/superpipe.c
+index a4dd3ca7c750..2ed22d81d6c1 100644
+--- a/drivers/scsi/cxlflash/superpipe.c
++++ b/drivers/scsi/cxlflash/superpipe.c
+@@ -1920,7 +1920,7 @@ static int cxlflash_disk_direct_open(struct scsi_device *sdev, void *arg)
+ 	u64 lun_size = 0;
+ 	u64 last_lba = 0;
+ 	u64 rsrc_handle = -1;
+-	u32 port = CHAN2PORT(sdev->channel);
++	u32 port = CHAN2PORTMASK(sdev->channel);
+ 
+ 	int rc = 0;
+ 
+diff --git a/drivers/scsi/cxlflash/superpipe.h b/drivers/scsi/cxlflash/superpipe.h
+index 9e62ff304e4b..b4d1c95aee63 100644
+--- a/drivers/scsi/cxlflash/superpipe.h
++++ b/drivers/scsi/cxlflash/superpipe.h
+@@ -33,9 +33,6 @@ extern struct cxlflash_global global;
+ 
+ #define MAX_SECTOR_UNIT  512 /* max_sector is in 512 byte multiples */
+ 
+-#define CHAN2PORT(_x)	((_x) + 1)
+-#define PORT2CHAN(_x)	((_x) - 1)
+-
+ enum lun_mode {
+ 	MODE_NONE = 0,
+ 	MODE_VIRTUAL,
+* Unmerged path drivers/scsi/cxlflash/vlun.c
