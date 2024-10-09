@@ -1,0 +1,92 @@
+RDMA/umem: Fix potential addition overflow
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Doug Ledford <dledford@redhat.com>
+commit c6ce580716372d71cd119bacf73f14a62e9af2ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/c6ce5807.failed
+
+Given a large enough memory allocation, it is possible to wrap the
+pinned_vm counter.  Check for addition overflow to prevent such
+eventualities.
+
+Fixes: 40ddacf2dda9 ("RDMA/umem: Don't hold mmap_sem for too long")
+	Reported-by: Jason Gunthorpe <jgg@ziepe.ca>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+	Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit c6ce580716372d71cd119bacf73f14a62e9af2ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/umem.c
+diff --cc drivers/infiniband/core/umem.c
+index 097e8522c0fc,8da1cf29a69f..000000000000
+--- a/drivers/infiniband/core/umem.c
++++ b/drivers/infiniband/core/umem.c
+@@@ -84,9 -84,10 +84,10 @@@ struct ib_umem *ib_umem_get(struct ib_u
+  	struct ib_umem *umem;
+  	struct page **page_list;
+  	struct vm_area_struct **vma_list;
+ +	unsigned long locked;
+  	unsigned long lock_limit;
++ 	unsigned long new_pinned;
+  	unsigned long cur_base;
+ -	struct mm_struct *mm;
+  	unsigned long npages;
+  	int ret;
+  	int i;
+@@@ -165,21 -158,39 +166,38 @@@
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	lock_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
++ 
++ 	down_write(&mm->mmap_sem);
++ 	if (check_add_overflow(mm->pinned_vm, npages, &new_pinned) ||
++ 	    (new_pinned > lock_limit && !capable(CAP_IPC_LOCK))) {
++ 		up_write(&mm->mmap_sem);
++ 		ret = -ENOMEM;
++ 		goto out;
++ 	}
++ 	mm->pinned_vm = new_pinned;
++ 	up_write(&mm->mmap_sem);
++ 
++ 	cur_base = addr & PAGE_MASK;
++ 
+++>>>>>>> c6ce58071637 (RDMA/umem: Fix potential addition overflow)
+  	ret = sg_alloc_table(&umem->sg_head, npages, GFP_KERNEL);
+  	if (ret)
+ -		goto vma;
+ -
+ -	if (!umem->writable)
+ -		gup_flags |= FOLL_FORCE;
+ +		goto out;
+  
+ +	need_release = 1;
+  	sg_list_start = umem->sg_head.sgl;
+  
+ -	down_read(&mm->mmap_sem);
+  	while (npages) {
+  		ret = get_user_pages_longterm(cur_base,
+ -				     min_t(unsigned long, npages,
+ -					   PAGE_SIZE / sizeof (struct page *)),
+ -				     gup_flags, page_list, vma_list);
+ -		if (ret < 0) {
+ -			up_read(&mm->mmap_sem);
+ -			goto umem_release;
+ -		}
+ +				min_t(unsigned long, npages,
+ +				      PAGE_SIZE / sizeof (struct page *)),
+ +				1, !umem->writable, page_list, vma_list);
+ +
+ +		if (ret < 0)
+ +			goto out;
+  
+  		umem->npages += ret;
+  		cur_base += ret * PAGE_SIZE;
+* Unmerged path drivers/infiniband/core/umem.c
