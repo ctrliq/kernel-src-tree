@@ -1,0 +1,313 @@
+mlxsw: spectrum: Handle NETDEV_CHANGE on L3 tunnels
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Petr Machata <petrm@mellanox.com>
+commit 4cf04f3ff4da9dd536d9f70127868908a03aaf0a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/4cf04f3f.failed
+
+Changes to L3 tunnel netdevices (through `ip tunnel change' as well as
+`ip link set') lead to NETDEV_CHANGE being generated on the tunnel
+device. Because what is relevant for the tunnel in question depends on
+the tunnel type, handling of the event is dispatched to the IPIP module
+through a newly-added interface mlxsw_sp_ipip_ops.ol_netdev_change().
+
+IPIP tunnels now remember the last set of tunnel parameters in struct
+mlxsw_sp_ipip_entry.parms, and use it to figure out what exactly has
+changed.
+
+	Signed-off-by: Petr Machata <petrm@mellanox.com>
+	Reviewed-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4cf04f3ff4da9dd536d9f70127868908a03aaf0a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+index 782f252be995,c1928561c412..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+@@@ -1387,12 -1443,119 +1382,124 @@@ static int mlxsw_sp_netdevice_ipip_ol_v
+  	return 0;
+  }
+  
+ -static int mlxsw_sp_netdevice_ipip_ol_vrf_event(struct mlxsw_sp *mlxsw_sp,
+ -						struct net_device *ol_dev,
+ -						struct netlink_ext_ack *extack)
+ +int
+ +mlxsw_sp_netdevice_ipip_ol_event(struct mlxsw_sp *mlxsw_sp,
+ +				 struct net_device *ol_dev,
+ +				 unsigned long event,
+ +				 struct netdev_notifier_changeupper_info *info)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct mlxsw_sp_ipip_entry *ipip_entry =
++ 		mlxsw_sp_ipip_entry_find_by_ol_dev(mlxsw_sp, ol_dev);
++ 
++ 	if (!ipip_entry)
++ 		return 0;
++ 	return __mlxsw_sp_ipip_entry_update_tunnel(mlxsw_sp, ipip_entry,
++ 						   true, false, false, extack);
++ }
++ 
++ static int
++ mlxsw_sp_netdevice_ipip_ul_vrf_event(struct mlxsw_sp *mlxsw_sp,
++ 				     struct mlxsw_sp_ipip_entry *ipip_entry,
++ 				     struct net_device *ul_dev,
++ 				     struct netlink_ext_ack *extack)
++ {
++ 	return __mlxsw_sp_ipip_entry_update_tunnel(mlxsw_sp, ipip_entry,
++ 						   true, true, false, extack);
++ }
++ 
++ static int
++ mlxsw_sp_netdevice_ipip_ol_change_event(struct mlxsw_sp *mlxsw_sp,
++ 					struct net_device *ol_dev,
++ 					struct netlink_ext_ack *extack)
++ {
++ 	const struct mlxsw_sp_ipip_ops *ipip_ops;
++ 	struct mlxsw_sp_ipip_entry *ipip_entry;
++ 	int err;
++ 
++ 	ipip_entry = mlxsw_sp_ipip_entry_find_by_ol_dev(mlxsw_sp, ol_dev);
++ 	if (!ipip_entry)
++ 		/* A change might make a tunnel eligible for offloading, but
++ 		 * that is currently not implemented. What falls to slow path
++ 		 * stays there.
++ 		 */
++ 		return 0;
++ 
++ 	/* A change might make a tunnel not eligible for offloading. */
++ 	if (!mlxsw_sp_netdevice_ipip_can_offload(mlxsw_sp, ol_dev,
++ 						 ipip_entry->ipipt)) {
++ 		mlxsw_sp_ipip_entry_demote_tunnel(mlxsw_sp, ipip_entry);
++ 		return 0;
++ 	}
++ 
++ 	ipip_ops = mlxsw_sp->router->ipip_ops_arr[ipip_entry->ipipt];
++ 	err = ipip_ops->ol_netdev_change(mlxsw_sp, ipip_entry, extack);
++ 	return err;
++ }
++ 
++ void mlxsw_sp_ipip_entry_demote_tunnel(struct mlxsw_sp *mlxsw_sp,
++ 				       struct mlxsw_sp_ipip_entry *ipip_entry)
++ {
++ 	struct net_device *ol_dev = ipip_entry->ol_dev;
++ 
++ 	if (ol_dev->flags & IFF_UP)
++ 		mlxsw_sp_ipip_entry_ol_down_event(mlxsw_sp, ipip_entry);
++ 	mlxsw_sp_ipip_entry_destroy(mlxsw_sp, ipip_entry);
++ }
++ 
++ /* The configuration where several tunnels have the same local address in the
++  * same underlay table needs special treatment in the HW. That is currently not
++  * implemented in the driver. This function finds and demotes the first tunnel
++  * with a given source address, except the one passed in in the argument
++  * `except'.
++  */
++ bool
++ mlxsw_sp_ipip_demote_tunnel_by_saddr(struct mlxsw_sp *mlxsw_sp,
++ 				     enum mlxsw_sp_l3proto ul_proto,
++ 				     union mlxsw_sp_l3addr saddr,
++ 				     u32 ul_tb_id,
++ 				     const struct mlxsw_sp_ipip_entry *except)
++ {
++ 	struct mlxsw_sp_ipip_entry *ipip_entry, *tmp;
++ 
++ 	list_for_each_entry_safe(ipip_entry, tmp, &mlxsw_sp->router->ipip_list,
++ 				 ipip_list_node) {
++ 		if (ipip_entry != except &&
++ 		    mlxsw_sp_ipip_entry_saddr_matches(mlxsw_sp, ul_proto, saddr,
++ 						      ul_tb_id, ipip_entry)) {
++ 			mlxsw_sp_ipip_entry_demote_tunnel(mlxsw_sp, ipip_entry);
++ 			return true;
++ 		}
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static void mlxsw_sp_ipip_demote_tunnel_by_ul_netdev(struct mlxsw_sp *mlxsw_sp,
++ 						     struct net_device *ul_dev)
++ {
++ 	struct mlxsw_sp_ipip_entry *ipip_entry, *tmp;
++ 
++ 	list_for_each_entry_safe(ipip_entry, tmp, &mlxsw_sp->router->ipip_list,
++ 				 ipip_list_node) {
++ 		struct net_device *ipip_ul_dev =
++ 			__mlxsw_sp_ipip_netdev_ul_dev_get(ipip_entry->ol_dev);
++ 
++ 		if (ipip_ul_dev == ul_dev)
++ 			mlxsw_sp_ipip_entry_demote_tunnel(mlxsw_sp, ipip_entry);
++ 	}
++ }
++ 
++ int mlxsw_sp_netdevice_ipip_ol_event(struct mlxsw_sp *mlxsw_sp,
++ 				     struct net_device *ol_dev,
++ 				     unsigned long event,
++ 				     struct netdev_notifier_info *info)
++ {
++ 	struct netdev_notifier_changeupper_info *chup;
++ 	struct netlink_ext_ack *extack;
++ 
+++>>>>>>> 4cf04f3ff4da (mlxsw: spectrum: Handle NETDEV_CHANGE on L3 tunnels)
+  	switch (event) {
+  	case NETDEV_REGISTER:
+  		return mlxsw_sp_netdevice_ipip_ol_reg_event(mlxsw_sp, ol_dev);
+@@@ -1406,10 -1569,17 +1513,14 @@@
+  		mlxsw_sp_netdevice_ipip_ol_down_event(mlxsw_sp, ol_dev);
+  		return 0;
+  	case NETDEV_CHANGEUPPER:
+ -		chup = container_of(info, typeof(*chup), info);
+ -		extack = info->extack;
+ -		if (netif_is_l3_master(chup->upper_dev))
+ +		if (netif_is_l3_master(info->upper_dev))
+  			return mlxsw_sp_netdevice_ipip_ol_vrf_event(mlxsw_sp,
+ -								    ol_dev,
+ -								    extack);
+ +								    ol_dev);
+  		return 0;
++ 	case NETDEV_CHANGE:
++ 		extack = info->extack;
++ 		return mlxsw_sp_netdevice_ipip_ol_change_event(mlxsw_sp,
++ 							       ol_dev, extack);
+  	}
+  	return 0;
+  }
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_ipip.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_ipip.c
+index f3136a080a2f..cdb6fcc9570a 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_ipip.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_ipip.c
+@@ -288,6 +288,72 @@ mlxsw_sp_ipip_ol_loopback_config_gre4(struct mlxsw_sp *mlxsw_sp,
+ 	};
+ }
+ 
++static int
++mlxsw_sp_ipip_ol_netdev_change_gre4(struct mlxsw_sp *mlxsw_sp,
++				    struct mlxsw_sp_ipip_entry *ipip_entry,
++				    struct netlink_ext_ack *extack)
++{
++	union mlxsw_sp_l3addr old_saddr, new_saddr;
++	union mlxsw_sp_l3addr old_daddr, new_daddr;
++	struct ip_tunnel_parm new_parms;
++	bool update_tunnel = false;
++	bool update_decap = false;
++	bool update_nhs = false;
++	int err = 0;
++
++	new_parms = mlxsw_sp_ipip_netdev_parms(ipip_entry->ol_dev);
++
++	new_saddr = mlxsw_sp_ipip_parms_saddr(MLXSW_SP_L3_PROTO_IPV4,
++					      new_parms);
++	old_saddr = mlxsw_sp_ipip_parms_saddr(MLXSW_SP_L3_PROTO_IPV4,
++					      ipip_entry->parms);
++	new_daddr = mlxsw_sp_ipip_parms_daddr(MLXSW_SP_L3_PROTO_IPV4,
++					      new_parms);
++	old_daddr = mlxsw_sp_ipip_parms_daddr(MLXSW_SP_L3_PROTO_IPV4,
++					      ipip_entry->parms);
++
++	if (!mlxsw_sp_l3addr_eq(&new_saddr, &old_saddr)) {
++		u16 ul_tb_id = mlxsw_sp_ipip_dev_ul_tb_id(ipip_entry->ol_dev);
++
++		/* Since the local address has changed, if there is another
++		 * tunnel with a matching saddr, both need to be demoted.
++		 */
++		if (mlxsw_sp_ipip_demote_tunnel_by_saddr(mlxsw_sp,
++							 MLXSW_SP_L3_PROTO_IPV4,
++							 new_saddr, ul_tb_id,
++							 ipip_entry)) {
++			mlxsw_sp_ipip_entry_demote_tunnel(mlxsw_sp, ipip_entry);
++			return 0;
++		}
++
++		update_tunnel = true;
++	} else if (mlxsw_sp_ipip_parms_okey(ipip_entry->parms) !=
++		   mlxsw_sp_ipip_parms_okey(new_parms)) {
++		update_tunnel = true;
++	} else if (!mlxsw_sp_l3addr_eq(&new_daddr, &old_daddr)) {
++		update_nhs = true;
++	} else if (mlxsw_sp_ipip_parms_ikey(ipip_entry->parms) !=
++		   mlxsw_sp_ipip_parms_ikey(new_parms)) {
++		update_decap = true;
++	}
++
++	if (update_tunnel)
++		err = __mlxsw_sp_ipip_entry_update_tunnel(mlxsw_sp, ipip_entry,
++							  true, true, true,
++							  extack);
++	else if (update_nhs)
++		err = __mlxsw_sp_ipip_entry_update_tunnel(mlxsw_sp, ipip_entry,
++							  false, false, true,
++							  extack);
++	else if (update_decap)
++		err = __mlxsw_sp_ipip_entry_update_tunnel(mlxsw_sp, ipip_entry,
++							  false, false, false,
++							  extack);
++
++	ipip_entry->parms = new_parms;
++	return err;
++}
++
+ static const struct mlxsw_sp_ipip_ops mlxsw_sp_ipip_gre4_ops = {
+ 	.dev_type = ARPHRD_IPGRE,
+ 	.ul_proto = MLXSW_SP_L3_PROTO_IPV4,
+@@ -295,6 +361,7 @@ static const struct mlxsw_sp_ipip_ops mlxsw_sp_ipip_gre4_ops = {
+ 	.fib_entry_op = mlxsw_sp_ipip_fib_entry_op_gre4,
+ 	.can_offload = mlxsw_sp_ipip_can_offload_gre4,
+ 	.ol_loopback_config = mlxsw_sp_ipip_ol_loopback_config_gre4,
++	.ol_netdev_change = mlxsw_sp_ipip_ol_netdev_change_gre4,
+ };
+ 
+ const struct mlxsw_sp_ipip_ops *mlxsw_sp_ipip_ops_arr[] = {
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_ipip.h b/drivers/net/ethernet/mellanox/mlxsw/spectrum_ipip.h
+index 918d74b4e8d7..04b08d9d76e9 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_ipip.h
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_ipip.h
+@@ -56,6 +56,7 @@ struct mlxsw_sp_ipip_entry {
+ 	struct mlxsw_sp_rif_ipip_lb *ol_lb;
+ 	struct mlxsw_sp_fib_entry *decap_fib_entry;
+ 	struct list_head ipip_list_node;
++	struct ip_tunnel_parm parms;
+ };
+ 
+ struct mlxsw_sp_ipip_ops {
+@@ -78,6 +79,10 @@ struct mlxsw_sp_ipip_ops {
+ 			    struct mlxsw_sp_ipip_entry *ipip_entry,
+ 			    enum mlxsw_reg_ralue_op op,
+ 			    u32 tunnel_index);
++
++	int (*ol_netdev_change)(struct mlxsw_sp *mlxsw_sp,
++				struct mlxsw_sp_ipip_entry *ipip_entry,
++				struct netlink_ext_ack *extack);
+ };
+ 
+ extern const struct mlxsw_sp_ipip_ops *mlxsw_sp_ipip_ops_arr[];
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h b/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
+index 8120b01a9c36..ca1f55ac84a5 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
+@@ -69,6 +69,7 @@ struct mlxsw_sp_rif *mlxsw_sp_rif_by_index(const struct mlxsw_sp *mlxsw_sp,
+ u16 mlxsw_sp_rif_index(const struct mlxsw_sp_rif *rif);
+ u16 mlxsw_sp_ipip_lb_rif_index(const struct mlxsw_sp_rif_ipip_lb *rif);
+ u16 mlxsw_sp_ipip_lb_ul_vr_id(const struct mlxsw_sp_rif_ipip_lb *rif);
++u32 mlxsw_sp_ipip_dev_ul_tb_id(const struct net_device *ol_dev);
+ int mlxsw_sp_rif_dev_ifindex(const struct mlxsw_sp_rif *rif);
+ u8 mlxsw_sp_router_port(const struct mlxsw_sp *mlxsw_sp);
+ const struct net_device *mlxsw_sp_rif_dev(const struct mlxsw_sp_rif *rif);
+@@ -123,4 +124,10 @@ void mlxsw_sp_nexthop_counter_alloc(struct mlxsw_sp *mlxsw_sp,
+ void mlxsw_sp_nexthop_counter_free(struct mlxsw_sp *mlxsw_sp,
+ 				   struct mlxsw_sp_nexthop *nh);
+ 
++static inline bool mlxsw_sp_l3addr_eq(const union mlxsw_sp_l3addr *addr1,
++				      const union mlxsw_sp_l3addr *addr2)
++{
++	return !memcmp(addr1, addr2, sizeof(*addr1));
++}
++
+ #endif /* _MLXSW_ROUTER_H_*/
