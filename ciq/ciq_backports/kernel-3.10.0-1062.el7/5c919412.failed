@@ -1,0 +1,907 @@
+kvm/x86: Hyper-V synthetic interrupt controller
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Andrey Smetanin <asmetanin@virtuozzo.com>
+commit 5c919412fe61c35947816fdbd5f7bd09fe0dd073
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/5c919412.failed
+
+SynIC (synthetic interrupt controller) is a lapic extension,
+which is controlled via MSRs and maintains for each vCPU
+ - 16 synthetic interrupt "lines" (SINT's); each can be configured to
+   trigger a specific interrupt vector optionally with auto-EOI
+   semantics
+ - a message page in the guest memory with 16 256-byte per-SINT message
+   slots
+ - an event flag page in the guest memory with 16 2048-bit per-SINT
+   event flag areas
+
+The host triggers a SINT whenever it delivers a new message to the
+corresponding slot or flips an event flag bit in the corresponding area.
+The guest informs the host that it can try delivering a message by
+explicitly asserting EOI in lapic or writing to End-Of-Message (EOM)
+MSR.
+
+The userspace (qemu) triggers interrupts and receives EOM notifications
+via irqfd with resampler; for that, a GSI is allocated for each
+configured SINT, and irq_routing api is extended to support GSI-SINT
+mapping.
+
+Changes v4:
+* added activation of SynIC by vcpu KVM_ENABLE_CAP
+* added per SynIC active flag
+* added deactivation of APICv upon SynIC activation
+
+Changes v3:
+* added KVM_CAP_HYPERV_SYNIC and KVM_IRQ_ROUTING_HV_SINT notes into
+docs
+
+Changes v2:
+* do not use posted interrupts for Hyper-V SynIC AutoEOI vectors
+* add Hyper-V SynIC vectors into EOI exit bitmap
+* Hyper-V SyniIC SINT msr write logic simplified
+
+	Signed-off-by: Andrey Smetanin <asmetanin@virtuozzo.com>
+	Reviewed-by: Roman Kagan <rkagan@virtuozzo.com>
+	Signed-off-by: Denis V. Lunev <den@openvz.org>
+CC: Gleb Natapov <gleb@kernel.org>
+CC: Paolo Bonzini <pbonzini@redhat.com>
+CC: Roman Kagan <rkagan@virtuozzo.com>
+CC: Denis V. Lunev <den@openvz.org>
+CC: qemu-devel@nongnu.org
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 5c919412fe61c35947816fdbd5f7bd09fe0dd073)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/virtual/kvm/api.txt
+#	arch/x86/kvm/hyperv.c
+#	arch/x86/kvm/hyperv.h
+#	arch/x86/kvm/irq_comm.c
+#	arch/x86/kvm/lapic.c
+#	arch/x86/kvm/lapic.h
+#	arch/x86/kvm/x86.c
+#	include/linux/kvm_host.h
+#	include/uapi/linux/kvm.h
+diff --cc Documentation/virtual/kvm/api.txt
+index 9488596d832f,88af84675af0..000000000000
+--- a/Documentation/virtual/kvm/api.txt
++++ b/Documentation/virtual/kvm/api.txt
+@@@ -1429,6 -1450,8 +1429,11 @@@ struct kvm_irq_routing_entry 
+  	union {
+  		struct kvm_irq_routing_irqchip irqchip;
+  		struct kvm_irq_routing_msi msi;
+++<<<<<<< HEAD
+++=======
++ 		struct kvm_irq_routing_s390_adapter adapter;
++ 		struct kvm_irq_routing_hv_sint hv_sint;
+++>>>>>>> 5c919412fe61 (kvm/x86: Hyper-V synthetic interrupt controller)
+  		__u32 pad[8];
+  	} u;
+  };
+@@@ -1436,6 -1459,8 +1441,11 @@@
+  /* gsi routing entry types */
+  #define KVM_IRQ_ROUTING_IRQCHIP 1
+  #define KVM_IRQ_ROUTING_MSI 2
+++<<<<<<< HEAD
+++=======
++ #define KVM_IRQ_ROUTING_S390_ADAPTER 3
++ #define KVM_IRQ_ROUTING_HV_SINT 4
+++>>>>>>> 5c919412fe61 (kvm/x86: Hyper-V synthetic interrupt controller)
+  
+  No flags are specified so far, the corresponding field must be set to zero.
+  
+@@@ -1451,13 -1476,20 +1461,17 @@@ struct kvm_irq_routing_msi 
+  	__u32 pad;
+  };
+  
+ -struct kvm_irq_routing_s390_adapter {
+ -	__u64 ind_addr;
+ -	__u64 summary_addr;
+ -	__u64 ind_offset;
+ -	__u32 summary_offset;
+ -	__u32 adapter_id;
+ -};
+ +On x86, address_hi is ignored unless the KVM_X2APIC_API_USE_32BIT_IDS
+ +feature of KVM_CAP_X2APIC_API capability is enabled.  If it is enabled,
+ +address_hi bits 31-8 provide bits 31-8 of the destination id.  Bits 7-0 of
+ +address_hi must be zero.
+  
++ struct kvm_irq_routing_hv_sint {
++ 	__u32 vcpu;
++ 	__u32 sint;
++ };
+  
+ -4.53 KVM_ASSIGN_SET_MSIX_NR (deprecated)
+ +4.53 KVM_ASSIGN_SET_MSIX_NR
+  
+  Capability: none
+  Architectures: x86
+diff --cc arch/x86/kvm/hyperv.c
+index 457dbf00fcf1,83a3c0c9b3de..000000000000
+--- a/arch/x86/kvm/hyperv.c
++++ b/arch/x86/kvm/hyperv.c
+@@@ -30,23 -32,303 +32,323 @@@
+  
+  #include "trace.h"
+  
+++<<<<<<< HEAD
+ +static u64 get_time_ref_counter(struct kvm *kvm)
+ +{
+ +	struct kvm_hv *hv = &kvm->arch.hyperv;
+ +	struct kvm_vcpu *vcpu;
+ +	u64 tsc;
+ +
+ +	/*
+ +	 * The guest has not set up the TSC page or the clock isn't
+ +	 * stable, fall back to get_kvmclock_ns.
+ +	 */
+ +	if (!hv->tsc_ref.tsc_sequence)
+ +		return div_u64(get_kvmclock_ns(kvm), 100);
+ +
+ +	vcpu = kvm_get_vcpu(kvm, 0);
+ +	tsc = kvm_read_l1_tsc(vcpu, rdtsc());
+ +	return mul_u64_u64_shr(tsc, hv->tsc_ref.tsc_scale, 64)
+ +		+ hv->tsc_ref.tsc_offset;
+++=======
++ static inline u64 synic_read_sint(struct kvm_vcpu_hv_synic *synic, int sint)
++ {
++ 	return atomic64_read(&synic->sint[sint]);
++ }
++ 
++ static inline int synic_get_sint_vector(u64 sint_value)
++ {
++ 	if (sint_value & HV_SYNIC_SINT_MASKED)
++ 		return -1;
++ 	return sint_value & HV_SYNIC_SINT_VECTOR_MASK;
++ }
++ 
++ static bool synic_has_vector_connected(struct kvm_vcpu_hv_synic *synic,
++ 				      int vector)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(synic->sint); i++) {
++ 		if (synic_get_sint_vector(synic_read_sint(synic, i)) == vector)
++ 			return true;
++ 	}
++ 	return false;
++ }
++ 
++ static bool synic_has_vector_auto_eoi(struct kvm_vcpu_hv_synic *synic,
++ 				     int vector)
++ {
++ 	int i;
++ 	u64 sint_value;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(synic->sint); i++) {
++ 		sint_value = synic_read_sint(synic, i);
++ 		if (synic_get_sint_vector(sint_value) == vector &&
++ 		    sint_value & HV_SYNIC_SINT_AUTO_EOI)
++ 			return true;
++ 	}
++ 	return false;
++ }
++ 
++ static int synic_set_sint(struct kvm_vcpu_hv_synic *synic, int sint, u64 data)
++ {
++ 	int vector;
++ 
++ 	vector = data & HV_SYNIC_SINT_VECTOR_MASK;
++ 	if (vector < 16)
++ 		return 1;
++ 	/*
++ 	 * Guest may configure multiple SINTs to use the same vector, so
++ 	 * we maintain a bitmap of vectors handled by synic, and a
++ 	 * bitmap of vectors with auto-eoi behavior.  The bitmaps are
++ 	 * updated here, and atomically queried on fast paths.
++ 	 */
++ 
++ 	atomic64_set(&synic->sint[sint], data);
++ 
++ 	if (synic_has_vector_connected(synic, vector))
++ 		__set_bit(vector, synic->vec_bitmap);
++ 	else
++ 		__clear_bit(vector, synic->vec_bitmap);
++ 
++ 	if (synic_has_vector_auto_eoi(synic, vector))
++ 		__set_bit(vector, synic->auto_eoi_bitmap);
++ 	else
++ 		__clear_bit(vector, synic->auto_eoi_bitmap);
++ 
++ 	/* Load SynIC vectors into EOI exit bitmap */
++ 	kvm_make_request(KVM_REQ_SCAN_IOAPIC, synic_to_vcpu(synic));
++ 	return 0;
++ }
++ 
++ static struct kvm_vcpu_hv_synic *synic_get(struct kvm *kvm, u32 vcpu_id)
++ {
++ 	struct kvm_vcpu *vcpu;
++ 	struct kvm_vcpu_hv_synic *synic;
++ 
++ 	if (vcpu_id >= atomic_read(&kvm->online_vcpus))
++ 		return NULL;
++ 	vcpu = kvm_get_vcpu(kvm, vcpu_id);
++ 	if (!vcpu)
++ 		return NULL;
++ 	synic = vcpu_to_synic(vcpu);
++ 	return (synic->active) ? synic : NULL;
++ }
++ 
++ static void kvm_hv_notify_acked_sint(struct kvm_vcpu *vcpu, u32 sint)
++ {
++ 	struct kvm *kvm = vcpu->kvm;
++ 	int gsi, idx;
++ 
++ 	vcpu_debug(vcpu, "Hyper-V SynIC acked sint %d\n", sint);
++ 
++ 	idx = srcu_read_lock(&kvm->irq_srcu);
++ 	gsi = atomic_read(&vcpu_to_synic(vcpu)->sint_to_gsi[sint]);
++ 	if (gsi != -1)
++ 		kvm_notify_acked_gsi(kvm, gsi);
++ 	srcu_read_unlock(&kvm->irq_srcu, idx);
++ }
++ 
++ static int synic_set_msr(struct kvm_vcpu_hv_synic *synic,
++ 			 u32 msr, u64 data, bool host)
++ {
++ 	struct kvm_vcpu *vcpu = synic_to_vcpu(synic);
++ 	int ret;
++ 
++ 	if (!synic->active)
++ 		return 1;
++ 
++ 	vcpu_debug(vcpu, "Hyper-V SynIC set msr 0x%x 0x%llx host %d\n",
++ 		   msr, data, host);
++ 	ret = 0;
++ 	switch (msr) {
++ 	case HV_X64_MSR_SCONTROL:
++ 		synic->control = data;
++ 		break;
++ 	case HV_X64_MSR_SVERSION:
++ 		if (!host) {
++ 			ret = 1;
++ 			break;
++ 		}
++ 		synic->version = data;
++ 		break;
++ 	case HV_X64_MSR_SIEFP:
++ 		if (data & HV_SYNIC_SIEFP_ENABLE)
++ 			if (kvm_clear_guest(vcpu->kvm,
++ 					    data & PAGE_MASK, PAGE_SIZE)) {
++ 				ret = 1;
++ 				break;
++ 			}
++ 		synic->evt_page = data;
++ 		break;
++ 	case HV_X64_MSR_SIMP:
++ 		if (data & HV_SYNIC_SIMP_ENABLE)
++ 			if (kvm_clear_guest(vcpu->kvm,
++ 					    data & PAGE_MASK, PAGE_SIZE)) {
++ 				ret = 1;
++ 				break;
++ 			}
++ 		synic->msg_page = data;
++ 		break;
++ 	case HV_X64_MSR_EOM: {
++ 		int i;
++ 
++ 		for (i = 0; i < ARRAY_SIZE(synic->sint); i++)
++ 			kvm_hv_notify_acked_sint(vcpu, i);
++ 		break;
++ 	}
++ 	case HV_X64_MSR_SINT0 ... HV_X64_MSR_SINT15:
++ 		ret = synic_set_sint(synic, msr - HV_X64_MSR_SINT0, data);
++ 		break;
++ 	default:
++ 		ret = 1;
++ 		break;
++ 	}
++ 	return ret;
++ }
++ 
++ static int synic_get_msr(struct kvm_vcpu_hv_synic *synic, u32 msr, u64 *pdata)
++ {
++ 	int ret;
++ 
++ 	if (!synic->active)
++ 		return 1;
++ 
++ 	ret = 0;
++ 	switch (msr) {
++ 	case HV_X64_MSR_SCONTROL:
++ 		*pdata = synic->control;
++ 		break;
++ 	case HV_X64_MSR_SVERSION:
++ 		*pdata = synic->version;
++ 		break;
++ 	case HV_X64_MSR_SIEFP:
++ 		*pdata = synic->evt_page;
++ 		break;
++ 	case HV_X64_MSR_SIMP:
++ 		*pdata = synic->msg_page;
++ 		break;
++ 	case HV_X64_MSR_EOM:
++ 		*pdata = 0;
++ 		break;
++ 	case HV_X64_MSR_SINT0 ... HV_X64_MSR_SINT15:
++ 		*pdata = atomic64_read(&synic->sint[msr - HV_X64_MSR_SINT0]);
++ 		break;
++ 	default:
++ 		ret = 1;
++ 		break;
++ 	}
++ 	return ret;
++ }
++ 
++ int synic_set_irq(struct kvm_vcpu_hv_synic *synic, u32 sint)
++ {
++ 	struct kvm_vcpu *vcpu = synic_to_vcpu(synic);
++ 	struct kvm_lapic_irq irq;
++ 	int ret, vector;
++ 
++ 	if (sint >= ARRAY_SIZE(synic->sint))
++ 		return -EINVAL;
++ 
++ 	vector = synic_get_sint_vector(synic_read_sint(synic, sint));
++ 	if (vector < 0)
++ 		return -ENOENT;
++ 
++ 	memset(&irq, 0, sizeof(irq));
++ 	irq.dest_id = kvm_apic_id(vcpu->arch.apic);
++ 	irq.dest_mode = APIC_DEST_PHYSICAL;
++ 	irq.delivery_mode = APIC_DM_FIXED;
++ 	irq.vector = vector;
++ 	irq.level = 1;
++ 
++ 	ret = kvm_irq_delivery_to_apic(vcpu->kvm, NULL, &irq, NULL);
++ 	vcpu_debug(vcpu, "Hyper-V SynIC set irq ret %d\n", ret);
++ 	return ret;
++ }
++ 
++ int kvm_hv_synic_set_irq(struct kvm *kvm, u32 vcpu_id, u32 sint)
++ {
++ 	struct kvm_vcpu_hv_synic *synic;
++ 
++ 	synic = synic_get(kvm, vcpu_id);
++ 	if (!synic)
++ 		return -EINVAL;
++ 
++ 	return synic_set_irq(synic, sint);
++ }
++ 
++ void kvm_hv_synic_send_eoi(struct kvm_vcpu *vcpu, int vector)
++ {
++ 	struct kvm_vcpu_hv_synic *synic = vcpu_to_synic(vcpu);
++ 	int i;
++ 
++ 	vcpu_debug(vcpu, "Hyper-V SynIC send eoi vec %d\n", vector);
++ 
++ 	for (i = 0; i < ARRAY_SIZE(synic->sint); i++)
++ 		if (synic_get_sint_vector(synic_read_sint(synic, i)) == vector)
++ 			kvm_hv_notify_acked_sint(vcpu, i);
++ }
++ 
++ static int kvm_hv_set_sint_gsi(struct kvm *kvm, u32 vcpu_id, u32 sint, int gsi)
++ {
++ 	struct kvm_vcpu_hv_synic *synic;
++ 
++ 	synic = synic_get(kvm, vcpu_id);
++ 	if (!synic)
++ 		return -EINVAL;
++ 
++ 	if (sint >= ARRAY_SIZE(synic->sint_to_gsi))
++ 		return -EINVAL;
++ 
++ 	atomic_set(&synic->sint_to_gsi[sint], gsi);
++ 	return 0;
++ }
++ 
++ void kvm_hv_irq_routing_update(struct kvm *kvm)
++ {
++ 	struct kvm_irq_routing_table *irq_rt;
++ 	struct kvm_kernel_irq_routing_entry *e;
++ 	u32 gsi;
++ 
++ 	irq_rt = srcu_dereference_check(kvm->irq_routing, &kvm->irq_srcu,
++ 					lockdep_is_held(&kvm->irq_lock));
++ 
++ 	for (gsi = 0; gsi < irq_rt->nr_rt_entries; gsi++) {
++ 		hlist_for_each_entry(e, &irq_rt->map[gsi], link) {
++ 			if (e->type == KVM_IRQ_ROUTING_HV_SINT)
++ 				kvm_hv_set_sint_gsi(kvm, e->hv_sint.vcpu,
++ 						    e->hv_sint.sint, gsi);
++ 		}
++ 	}
++ }
++ 
++ static void synic_init(struct kvm_vcpu_hv_synic *synic)
++ {
++ 	int i;
++ 
++ 	memset(synic, 0, sizeof(*synic));
++ 	synic->version = HV_SYNIC_VERSION_1;
++ 	for (i = 0; i < ARRAY_SIZE(synic->sint); i++) {
++ 		atomic64_set(&synic->sint[i], HV_SYNIC_SINT_MASKED);
++ 		atomic_set(&synic->sint_to_gsi[i], -1);
++ 	}
++ }
++ 
++ void kvm_hv_vcpu_init(struct kvm_vcpu *vcpu)
++ {
++ 	synic_init(vcpu_to_synic(vcpu));
++ }
++ 
++ int kvm_hv_activate_synic(struct kvm_vcpu *vcpu)
++ {
++ 	/*
++ 	 * Hyper-V SynIC auto EOI SINT's are
++ 	 * not compatible with APICV, so deactivate APICV
++ 	 */
++ 	kvm_vcpu_deactivate_apicv(vcpu);
++ 	vcpu_to_synic(vcpu)->active = true;
++ 	return 0;
+++>>>>>>> 5c919412fe61 (kvm/x86: Hyper-V synthetic interrupt controller)
+  }
+  
+  static bool kvm_hv_msr_partition_wide(u32 msr)
+@@@ -438,12 -612,13 +747,22 @@@ static int kvm_hv_get_msr(struct kvm_vc
+  	case HV_X64_MSR_VP_RUNTIME:
+  		data = current_task_runtime_100ns() + hv->runtime_offset;
+  		break;
+++<<<<<<< HEAD
+ +	case HV_X64_MSR_TSC_FREQUENCY:
+ +		data = (u64)vcpu->arch.virtual_tsc_khz * 1000;
+ +		break;
+ +	case HV_X64_MSR_APIC_FREQUENCY:
+ +		data = APIC_BUS_FREQUENCY;
+ +		break;
+++=======
++ 	case HV_X64_MSR_SCONTROL:
++ 	case HV_X64_MSR_SVERSION:
++ 	case HV_X64_MSR_SIEFP:
++ 	case HV_X64_MSR_SIMP:
++ 	case HV_X64_MSR_EOM:
++ 	case HV_X64_MSR_SINT0 ... HV_X64_MSR_SINT15:
++ 		return synic_get_msr(vcpu_to_synic(vcpu), msr, pdata);
+++>>>>>>> 5c919412fe61 (kvm/x86: Hyper-V synthetic interrupt controller)
+  	default:
+  		vcpu_unimpl(vcpu, "Hyper-V unhandled rdmsr: 0x%x\n", msr);
+  		return 1;
+diff --cc arch/x86/kvm/hyperv.h
+index 638d4fbc7358,315af4b660f4..000000000000
+--- a/arch/x86/kvm/hyperv.h
++++ b/arch/x86/kvm/hyperv.h
+@@@ -29,7 -29,27 +29,32 @@@ int kvm_hv_get_msr_common(struct kvm_vc
+  bool kvm_hv_hypercall_enabled(struct kvm *kvm);
+  int kvm_hv_hypercall(struct kvm_vcpu *vcpu);
+  
+++<<<<<<< HEAD
+ +void kvm_hv_setup_tsc_page(struct kvm *kvm,
+ +			   struct pvclock_vcpu_time_info *hv_clock);
+++=======
++ int kvm_hv_synic_set_irq(struct kvm *kvm, u32 vcpu_id, u32 sint);
++ void kvm_hv_synic_send_eoi(struct kvm_vcpu *vcpu, int vector);
++ 
++ static inline struct kvm_vcpu_hv_synic *vcpu_to_synic(struct kvm_vcpu *vcpu)
++ {
++ 	return &vcpu->arch.hyperv.synic;
++ }
++ 
++ static inline struct kvm_vcpu *synic_to_vcpu(struct kvm_vcpu_hv_synic *synic)
++ {
++ 	struct kvm_vcpu_hv *hv;
++ 	struct kvm_vcpu_arch *arch;
++ 
++ 	hv = container_of(synic, struct kvm_vcpu_hv, synic);
++ 	arch = container_of(hv, struct kvm_vcpu_arch, hyperv);
++ 	return container_of(arch, struct kvm_vcpu, arch);
++ }
++ void kvm_hv_irq_routing_update(struct kvm *kvm);
++ 
++ void kvm_hv_vcpu_init(struct kvm_vcpu *vcpu);
++ 
++ int kvm_hv_activate_synic(struct kvm_vcpu *vcpu);
+++>>>>>>> 5c919412fe61 (kvm/x86: Hyper-V synthetic interrupt controller)
+  
+  #endif
+diff --cc arch/x86/kvm/irq_comm.c
+index 4f5da67952c5,8fc89efb5250..000000000000
+--- a/arch/x86/kvm/irq_comm.c
++++ b/arch/x86/kvm/irq_comm.c
+@@@ -33,7 -33,7 +33,11 @@@
+  
+  #include "lapic.h"
+  
+++<<<<<<< HEAD
+ +#include "x86.h"
+++=======
++ #include "hyperv.h"
+++>>>>>>> 5c919412fe61 (kvm/x86: Hyper-V synthetic interrupt controller)
+  
+  static int kvm_set_pic_irq(struct kvm_kernel_irq_routing_entry *e,
+  			   struct kvm *kvm, int irq_source_id, int level,
+@@@ -266,8 -221,17 +270,22 @@@ void kvm_fire_mask_notifiers(struct kv
+  	srcu_read_unlock(&kvm->irq_srcu, idx);
+  }
+  
+++<<<<<<< HEAD
+ +int kvm_set_routing_entry(struct kvm *kvm,
+ +			  struct kvm_kernel_irq_routing_entry *e,
+++=======
++ static int kvm_hv_set_sint(struct kvm_kernel_irq_routing_entry *e,
++ 		    struct kvm *kvm, int irq_source_id, int level,
++ 		    bool line_status)
++ {
++ 	if (!level)
++ 		return -1;
++ 
++ 	return kvm_hv_synic_set_irq(kvm, e->hv_sint.vcpu, e->hv_sint.sint);
++ }
++ 
++ int kvm_set_routing_entry(struct kvm_kernel_irq_routing_entry *e,
+++>>>>>>> 5c919412fe61 (kvm/x86: Hyper-V synthetic interrupt controller)
+  			  const struct kvm_irq_routing_entry *ue)
+  {
+  	int r = -EINVAL;
+@@@ -304,10 -268,12 +322,15 @@@
+  		e->msi.address_lo = ue->u.msi.address_lo;
+  		e->msi.address_hi = ue->u.msi.address_hi;
+  		e->msi.data = ue->u.msi.data;
+ +
+ +		if (kvm_msi_route_invalid(kvm, e))
+ +			goto out;
+  		break;
++ 	case KVM_IRQ_ROUTING_HV_SINT:
++ 		e->set = kvm_hv_set_sint;
++ 		e->hv_sint.vcpu = ue->u.hv_sint.vcpu;
++ 		e->hv_sint.sint = ue->u.hv_sint.sint;
++ 		break;
+  	default:
+  		goto out;
+  	}
+diff --cc arch/x86/kvm/lapic.c
+index 6cef5b606b11,36591faed13b..000000000000
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@@ -112,53 -129,26 +113,60 @@@ static inline int apic_enabled(struct k
+  	(LVT_MASK | APIC_MODE_MASK | APIC_INPUT_POLARITY | \
+  	 APIC_LVT_REMOTE_IRR | APIC_LVT_LEVEL_TRIGGER)
+  
+++<<<<<<< HEAD
+ +static inline u8 kvm_xapic_id(struct kvm_lapic *apic)
+ +{
+ +	return kvm_lapic_get_reg(apic, APIC_ID) >> 24;
+ +}
+ +
+ +static inline u32 kvm_x2apic_id(struct kvm_lapic *apic)
+++=======
++ /* The logical map is definitely wrong if we have multiple
++  * modes at the same time.  (Physical map is always right.)
++  */
++ static inline bool kvm_apic_logical_map_valid(struct kvm_apic_map *map)
+++>>>>>>> 5c919412fe61 (kvm/x86: Hyper-V synthetic interrupt controller)
+  {
+ -	return !(map->mode & (map->mode - 1));
+ +	return apic->vcpu->vcpu_id;
+  }
+  
+ -static inline void
+ -apic_logical_id(struct kvm_apic_map *map, u32 dest_id, u16 *cid, u16 *lid)
+ -{
+ -	unsigned lid_bits;
+ +static inline bool kvm_apic_map_get_logical_dest(struct kvm_apic_map *map,
+ +		u32 dest_id, struct kvm_lapic ***cluster, u16 *mask) {
+ +	switch (map->mode) {
+ +	case KVM_APIC_MODE_X2APIC: {
+ +		u32 offset = (dest_id >> 16) * 16;
+ +		u32 max_apic_id = map->max_apic_id;
+  
+ -	BUILD_BUG_ON(KVM_APIC_MODE_XAPIC_CLUSTER !=  4);
+ -	BUILD_BUG_ON(KVM_APIC_MODE_XAPIC_FLAT    !=  8);
+ -	BUILD_BUG_ON(KVM_APIC_MODE_X2APIC        != 16);
+ -	lid_bits = map->mode;
+ +		if (offset <= max_apic_id) {
+ +			u8 cluster_size = min(max_apic_id - offset + 1, 16U);
+  
+ -	*cid = dest_id >> lid_bits;
+ -	*lid = dest_id & ((1 << lid_bits) - 1);
+ +			*cluster = &map->phys_map[offset];
+ +			*mask = dest_id & (0xffff >> (16 - cluster_size));
+ +		} else {
+ +			*mask = 0;
+ +		}
+ +
+ +		return true;
+ +		}
+ +	case KVM_APIC_MODE_XAPIC_FLAT:
+ +		*cluster = map->xapic_flat_map;
+ +		*mask = dest_id & 0xff;
+ +		return true;
+ +	case KVM_APIC_MODE_XAPIC_CLUSTER:
+ +		*cluster = map->xapic_cluster_map[(dest_id >> 4) & 0xf];
+ +		*mask = dest_id & 0xf;
+ +		return true;
+ +	default:
+ +		/* Not optimized. */
+ +		return false;
+ +	}
+ +}
+ +
+ +static void kvm_apic_map_free(struct rcu_head *rcu)
+ +{
+ +	struct kvm_apic_map *map = container_of(rcu, struct kvm_apic_map, rcu);
+ +
+ +	kvfree(map);
+  }
+  
+  static void recalculate_apic_map(struct kvm *kvm)
+@@@ -2187,23 -1880,13 +2198,30 @@@ int kvm_get_apic_interrupt(struct kvm_v
+  	 * because the process would deliver it through the IDT.
+  	 */
+  
+ -	apic_set_isr(vector, apic);
+ -	apic_update_ppr(apic);
+  	apic_clear_irr(vector, apic);
+++<<<<<<< HEAD
+ +	if (0 /* test_bit(vector, vcpu_to_synic(vcpu)->auto_eoi_bitmap) */) {
+ +		/*
+ +		 * For auto-EOI interrupts, there might be another pending
+ +		 * interrupt above PPR, so check whether to raise another
+ +		 * KVM_REQ_EVENT.
+ +		 */
+ +		apic_update_ppr(apic);
+ +	} else {
+ +		/*
+ +		 * For normal interrupts, PPR has been raised and there cannot
+ +		 * be a higher-priority pending interrupt---except if there was
+ +		 * a concurrent interrupt injection, but that would have
+ +		 * triggered KVM_REQ_EVENT already.
+ +		 */
+ +		apic_set_isr(vector, apic);
+ +		__apic_update_ppr(apic, &ppr);
+++=======
++ 
++ 	if (test_bit(vector, vcpu_to_synic(vcpu)->auto_eoi_bitmap)) {
++ 		apic_clear_isr(vector, apic);
++ 		apic_update_ppr(apic);
+++>>>>>>> 5c919412fe61 (kvm/x86: Hyper-V synthetic interrupt controller)
+  	}
+  
+  	return vector;
+diff --cc arch/x86/kvm/lapic.h
+index 40c16ac0eb8c,41bdb35b4b67..000000000000
+--- a/arch/x86/kvm/lapic.h
++++ b/arch/x86/kvm/lapic.h
+@@@ -206,6 -159,16 +206,19 @@@ static inline bool kvm_lowest_prio_deli
+  			irq->msi_redir_hint);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline int kvm_lapic_latched_init(struct kvm_vcpu *vcpu)
++ {
++ 	return kvm_vcpu_has_lapic(vcpu) && test_bit(KVM_APIC_INIT, &vcpu->arch.apic->pending_events);
++ }
++ 
++ static inline int kvm_apic_id(struct kvm_lapic *apic)
++ {
++ 	return (kvm_apic_get_reg(apic, APIC_ID) >> 24) & 0xff;
++ }
++ 
+++>>>>>>> 5c919412fe61 (kvm/x86: Hyper-V synthetic interrupt controller)
+  bool kvm_apic_pending_eoi(struct kvm_vcpu *vcpu, int vector);
+  
+  void wait_lapic_expire(struct kvm_vcpu *vcpu);
+diff --cc arch/x86/kvm/x86.c
+index 8d92b5d9de18,eb64377edcd3..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -6481,27 -6332,31 +6506,41 @@@ static void enter_smm(struct kvm_vcpu *
+  	kvm_mmu_reset_context(vcpu);
+  }
+  
+ +static void process_smi(struct kvm_vcpu *vcpu)
+ +{
+ +	vcpu->arch.smi_pending = true;
+ +	kvm_make_request(KVM_REQ_EVENT, vcpu);
+ +}
+ +
+  static void vcpu_scan_ioapic(struct kvm_vcpu *vcpu)
+  {
++ 	u64 eoi_exit_bitmap[4];
++ 
+  	if (!kvm_apic_hw_enabled(vcpu->arch.apic))
+  		return;
+  
+ -	bitmap_zero(vcpu->arch.ioapic_handled_vectors, 256);
+ +	memset(vcpu->arch.eoi_exit_bitmap, 0, 256 / 8);
+  
+  	if (irqchip_split(vcpu->kvm))
+ -		kvm_scan_ioapic_routes(vcpu, vcpu->arch.ioapic_handled_vectors);
+ +		kvm_scan_ioapic_routes(vcpu, vcpu->arch.eoi_exit_bitmap);
+  	else {
+ -		if (vcpu->arch.apicv_active)
+ +		if (kvm_x86_ops->sync_pir_to_irr && vcpu->arch.apicv_active)
+  			kvm_x86_ops->sync_pir_to_irr(vcpu);
+ -		kvm_ioapic_scan_entry(vcpu, vcpu->arch.ioapic_handled_vectors);
+ +		kvm_ioapic_scan_entry(vcpu, vcpu->arch.eoi_exit_bitmap);
+  	}
+++<<<<<<< HEAD
+ +	kvm_x86_ops->load_eoi_exitmap(vcpu);
+++=======
++ 	bitmap_or((ulong *)eoi_exit_bitmap, vcpu->arch.ioapic_handled_vectors,
++ 		  vcpu_to_synic(vcpu)->vec_bitmap, 256);
++ 	kvm_x86_ops->load_eoi_exitmap(vcpu, eoi_exit_bitmap);
++ }
++ 
++ static void kvm_vcpu_flush_tlb(struct kvm_vcpu *vcpu)
++ {
++ 	++vcpu->stat.tlb_flush;
++ 	kvm_x86_ops->tlb_flush(vcpu);
+++>>>>>>> 5c919412fe61 (kvm/x86: Hyper-V synthetic interrupt controller)
+  }
+  
+  void kvm_vcpu_reload_apic_access_page(struct kvm_vcpu *vcpu)
+@@@ -7843,9 -7622,10 +7882,11 @@@ int kvm_arch_vcpu_init(struct kvm_vcpu 
+  
+  	vcpu->arch.pending_external_vector = -1;
+  
++ 	kvm_hv_vcpu_init(vcpu);
++ 
+  	return 0;
+ -
+ +fail_free_wbinvd_dirty_mask:
+ +	free_cpumask_var(vcpu->arch.wbinvd_dirty_mask);
+  fail_free_mce_banks:
+  	kfree(vcpu->arch.mce_banks);
+  fail_free_lapic:
+diff --cc include/linux/kvm_host.h
+index 2e1b15f53afa,ebaf2f82f712..000000000000
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@@ -318,6 -310,19 +318,22 @@@ static inline unsigned long kvm_dirty_b
+  	return ALIGN(memslot->npages, BITS_PER_LONG) / 8;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct kvm_s390_adapter_int {
++ 	u64 ind_addr;
++ 	u64 summary_addr;
++ 	u64 ind_offset;
++ 	u32 summary_offset;
++ 	u32 adapter_id;
++ };
++ 
++ struct kvm_hv_sint {
++ 	u32 vcpu;
++ 	u32 sint;
++ };
++ 
+++>>>>>>> 5c919412fe61 (kvm/x86: Hyper-V synthetic interrupt controller)
+  struct kvm_kernel_irq_routing_entry {
+  	u32 gsi;
+  	u32 type;
+@@@ -330,6 -335,8 +346,11 @@@
+  			unsigned pin;
+  		} irqchip;
+  		struct msi_msg msi;
+++<<<<<<< HEAD
+++=======
++ 		struct kvm_s390_adapter_int adapter;
++ 		struct kvm_hv_sint hv_sint;
+++>>>>>>> 5c919412fe61 (kvm/x86: Hyper-V synthetic interrupt controller)
+  	};
+  	struct hlist_node link;
+  };
+diff --cc include/uapi/linux/kvm.h
+index 6b525ccf5361,27ce4602a072..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -709,10 -831,7 +709,14 @@@ struct kvm_ppc_resize_hpt 
+  #define KVM_CAP_GUEST_DEBUG_HW_WPS 120
+  #define KVM_CAP_SPLIT_IRQCHIP 121
+  #define KVM_CAP_IOEVENTFD_ANY_LENGTH 122
+++<<<<<<< HEAD
+ +#define KVM_CAP_MAX_VCPU_ID 128
+ +#define KVM_CAP_X2APIC_API 129
+ +#define KVM_CAP_SPAPR_RESIZE_HPT 133
+ +#define KVM_CAP_PPC_GET_CPU_CHAR 151
+++=======
++ #define KVM_CAP_HYPERV_SYNIC 123
+++>>>>>>> 5c919412fe61 (kvm/x86: Hyper-V synthetic interrupt controller)
+  
+  #ifdef KVM_CAP_IRQ_ROUTING
+  
+@@@ -728,9 -847,24 +732,30 @@@ struct kvm_irq_routing_msi 
+  	__u32 pad;
+  };
+  
+++<<<<<<< HEAD
+ +/* gsi routing entry types */
+ +#define KVM_IRQ_ROUTING_IRQCHIP 1
+ +#define KVM_IRQ_ROUTING_MSI 2
+++=======
++ struct kvm_irq_routing_s390_adapter {
++ 	__u64 ind_addr;
++ 	__u64 summary_addr;
++ 	__u64 ind_offset;
++ 	__u32 summary_offset;
++ 	__u32 adapter_id;
++ };
++ 
++ struct kvm_irq_routing_hv_sint {
++ 	__u32 vcpu;
++ 	__u32 sint;
++ };
++ 
++ /* gsi routing entry types */
++ #define KVM_IRQ_ROUTING_IRQCHIP 1
++ #define KVM_IRQ_ROUTING_MSI 2
++ #define KVM_IRQ_ROUTING_S390_ADAPTER 3
++ #define KVM_IRQ_ROUTING_HV_SINT 4
+++>>>>>>> 5c919412fe61 (kvm/x86: Hyper-V synthetic interrupt controller)
+  
+  struct kvm_irq_routing_entry {
+  	__u32 gsi;
+@@@ -740,6 -874,8 +765,11 @@@
+  	union {
+  		struct kvm_irq_routing_irqchip irqchip;
+  		struct kvm_irq_routing_msi msi;
+++<<<<<<< HEAD
+++=======
++ 		struct kvm_irq_routing_s390_adapter adapter;
++ 		struct kvm_irq_routing_hv_sint hv_sint;
+++>>>>>>> 5c919412fe61 (kvm/x86: Hyper-V synthetic interrupt controller)
+  		__u32 pad[8];
+  	} u;
+  };
+* Unmerged path Documentation/virtual/kvm/api.txt
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index d78aa4d6276c..5732d3351cf5 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -25,6 +25,7 @@
+ #include <linux/pvclock_gtod.h>
+ #include <linux/clocksource.h>
+ #include <linux/irqbypass.h>
++#include <linux/hyperv.h>
+ 
+ #include <asm/pvclock-abi.h>
+ #include <asm/desc.h>
+@@ -407,10 +408,24 @@ struct kvm_mtrr {
+ 	struct list_head head;
+ };
+ 
++/* Hyper-V synthetic interrupt controller (SynIC)*/
++struct kvm_vcpu_hv_synic {
++	u64 version;
++	u64 control;
++	u64 msg_page;
++	u64 evt_page;
++	atomic64_t sint[HV_SYNIC_SINT_COUNT];
++	atomic_t sint_to_gsi[HV_SYNIC_SINT_COUNT];
++	DECLARE_BITMAP(auto_eoi_bitmap, 256);
++	DECLARE_BITMAP(vec_bitmap, 256);
++	bool active;
++};
++
+ /* Hyper-V per vcpu emulation context */
+ struct kvm_vcpu_hv {
+ 	u64 hv_vapic;
+ 	s64 runtime_offset;
++	struct kvm_vcpu_hv_synic synic;
+ };
+ 
+ struct kvm_vcpu_arch {
+* Unmerged path arch/x86/kvm/hyperv.c
+* Unmerged path arch/x86/kvm/hyperv.h
+* Unmerged path arch/x86/kvm/irq_comm.c
+* Unmerged path arch/x86/kvm/lapic.c
+* Unmerged path arch/x86/kvm/lapic.h
+* Unmerged path arch/x86/kvm/x86.c
+* Unmerged path include/linux/kvm_host.h
+* Unmerged path include/uapi/linux/kvm.h
