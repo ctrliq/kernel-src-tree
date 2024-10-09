@@ -1,0 +1,110 @@
+netfilter: ctnetlink: Fix regression in CTA_STATUS processing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Kevin Cernekee <cernekee@chromium.org>
+commit a963d710f367f68cd13d562a07db55ccb8daade9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/a963d710.failed
+
+The libnetfilter_conntrack userland library always sets IPS_CONFIRMED
+when building a CTA_STATUS attribute.  If this toggles the bit from
+0->1, the parser will return an error.  On Linux 4.4+ this will cause any
+NFQA_EXP attribute in the packet to be ignored.  This breaks conntrackd's
+userland helpers because they operate on unconfirmed connections.
+
+Instead of returning -EBUSY if the user program asks to modify an
+unchangeable bit, simply ignore the change.
+
+Also, fix the logic so that user programs are allowed to clear
+the bits that they are allowed to change.
+
+	Signed-off-by: Kevin Cernekee <cernekee@chromium.org>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit a963d710f367f68cd13d562a07db55ccb8daade9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_conntrack_netlink.c
+diff --cc net/netfilter/nf_conntrack_netlink.c
+index ab490ad8e397,bf04b7e9d6f7..000000000000
+--- a/net/netfilter/nf_conntrack_netlink.c
++++ b/net/netfilter/nf_conntrack_netlink.c
+@@@ -2186,7 -2245,56 +2186,60 @@@ nla_put_failure
+  }
+  
+  static int
+++<<<<<<< HEAD
+ +ctnetlink_nfqueue_parse_ct(const struct nlattr *cda[], struct nf_conn *ct)
+++=======
++ ctnetlink_glue_build(struct sk_buff *skb, struct nf_conn *ct,
++ 		     enum ip_conntrack_info ctinfo,
++ 		     u_int16_t ct_attr, u_int16_t ct_info_attr)
++ {
++ 	struct nlattr *nest_parms;
++ 
++ 	nest_parms = nla_nest_start(skb, ct_attr | NLA_F_NESTED);
++ 	if (!nest_parms)
++ 		goto nla_put_failure;
++ 
++ 	if (__ctnetlink_glue_build(skb, ct) < 0)
++ 		goto nla_put_failure;
++ 
++ 	nla_nest_end(skb, nest_parms);
++ 
++ 	if (nla_put_be32(skb, ct_info_attr, htonl(ctinfo)))
++ 		goto nla_put_failure;
++ 
++ 	return 0;
++ 
++ nla_put_failure:
++ 	return -ENOSPC;
++ }
++ 
++ static int
++ ctnetlink_update_status(struct nf_conn *ct, const struct nlattr * const cda[])
++ {
++ 	unsigned int status = ntohl(nla_get_be32(cda[CTA_STATUS]));
++ 	unsigned long d = ct->status ^ status;
++ 
++ 	if (d & IPS_SEEN_REPLY && !(status & IPS_SEEN_REPLY))
++ 		/* SEEN_REPLY bit can only be set */
++ 		return -EBUSY;
++ 
++ 	if (d & IPS_ASSURED && !(status & IPS_ASSURED))
++ 		/* ASSURED bit can only be set */
++ 		return -EBUSY;
++ 
++ 	/* This check is less strict than ctnetlink_change_status()
++ 	 * because callers often flip IPS_EXPECTED bits when sending
++ 	 * an NFQA_CT attribute to the kernel.  So ignore the
++ 	 * unchangeable bits but do not error out.
++ 	 */
++ 	ct->status = (status & ~IPS_UNCHANGEABLE_MASK) |
++ 		     (ct->status & IPS_UNCHANGEABLE_MASK);
++ 	return 0;
++ }
++ 
++ static int
++ ctnetlink_glue_parse_ct(const struct nlattr *cda[], struct nf_conn *ct)
+++>>>>>>> a963d710f367 (netfilter: ctnetlink: Fix regression in CTA_STATUS processing)
+  {
+  	int err;
+  
+diff --git a/include/uapi/linux/netfilter/nf_conntrack_common.h b/include/uapi/linux/netfilter/nf_conntrack_common.h
+index b18c284cbffe..41f88c918d94 100644
+--- a/include/uapi/linux/netfilter/nf_conntrack_common.h
++++ b/include/uapi/linux/netfilter/nf_conntrack_common.h
+@@ -84,6 +84,10 @@ enum ip_conntrack_status {
+ 	IPS_DYING_BIT = 9,
+ 	IPS_DYING = (1 << IPS_DYING_BIT),
+ 
++	/* Bits that cannot be altered from userland. */
++	IPS_UNCHANGEABLE_MASK = (IPS_NAT_DONE_MASK | IPS_NAT_MASK |
++				 IPS_EXPECTED | IPS_CONFIRMED | IPS_DYING),
++
+ 	/* Connection has fixed timeout. */
+ 	IPS_FIXED_TIMEOUT_BIT = 10,
+ 	IPS_FIXED_TIMEOUT = (1 << IPS_FIXED_TIMEOUT_BIT),
+* Unmerged path net/netfilter/nf_conntrack_netlink.c
