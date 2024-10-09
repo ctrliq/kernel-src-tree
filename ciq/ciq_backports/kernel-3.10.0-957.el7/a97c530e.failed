@@ -1,0 +1,275 @@
+drm/nouveau/kms/nv50-: modify overlay allocation so the code can be split
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Ben Skeggs <bskeggs@redhat.com>
+commit a97c530eb968bad8d945d4f64fb550fa37a9d362
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/a97c530e.failed
+
+	Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+(cherry picked from commit a97c530eb968bad8d945d4f64fb550fa37a9d362)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/nouveau/dispnv50/disp.c
+diff --cc drivers/gpu/drm/nouveau/dispnv50/disp.c
+index a2ea42f947c7,26caca270ec8..000000000000
+--- a/drivers/gpu/drm/nouveau/dispnv50/disp.c
++++ b/drivers/gpu/drm/nouveau/dispnv50/disp.c
+@@@ -628,40 -490,12 +577,49 @@@ nv50_base_create(struct nvif_device *de
+  				syncbuf, &base->base);
+  }
+  
+++<<<<<<< HEAD
+ +/******************************************************************************
+ + * Overlay
+ + *****************************************************************************/
+ +
+ +struct nv50_ovly {
+ +	struct nv50_dmac base;
+ +};
+ +
+ +static int
+ +nv50_ovly_create(struct nvif_device *device, struct nvif_object *disp,
+ +		 int head, u64 syncbuf, struct nv50_ovly *ovly)
+ +{
+ +	struct nv50_disp_overlay_channel_dma_v0 args = {
+ +		.pushbuf = 0xb0007e00 | head,
+ +		.head = head,
+ +	};
+ +	static const s32 oclass[] = {
+ +		GK104_DISP_OVERLAY_CONTROL_DMA,
+ +		GF110_DISP_OVERLAY_CONTROL_DMA,
+ +		GT214_DISP_OVERLAY_CHANNEL_DMA,
+ +		GT200_DISP_OVERLAY_CHANNEL_DMA,
+ +		G82_DISP_OVERLAY_CHANNEL_DMA,
+ +		NV50_DISP_OVERLAY_CHANNEL_DMA,
+ +		0
+ +	};
+ +
+ +	return nv50_dmac_create(device, disp, oclass, head, &args, sizeof(args),
+ +				syncbuf, &ovly->base);
+ +}
+ +
+ +struct nv50_head {
+ +	struct nouveau_crtc base;
+ +	struct nv50_ovly ovly;
+ +	struct nv50_oimm oimm;
+++=======
++ struct nv50_head {
++ 	struct nouveau_crtc base;
++ 	struct {
++ 		struct nouveau_bo *nvbo[2];
++ 		int next;
++ 	} lut;
+++>>>>>>> a97c530eb968 (drm/nouveau/kms/nv50-: modify overlay allocation so the code can be split)
+  };
+  
+  #define nv50_head(c) ((struct nv50_head *)nouveau_crtc(c))
+@@@ -746,10 -580,20 +704,15 @@@ evo_kick(u32 *push, void *evoc
+  
+  struct nv50_wndw {
+  	const struct nv50_wndw_func *func;
++ 	const struct nv50_wimm_func *immd;
+  	struct nv50_dmac *dmac;
++ 	int id;
+  
+ -	struct {
+ -		struct nvif_object *parent;
+ -		struct list_head list;
+ -	} ctxdma;
+ -
+  	struct drm_plane plane;
+  
++ 	struct nv50_dmac wndw;
++ 	struct nv50_dmac wimm;
++ 
+  	struct nvif_notify notify;
+  	u16 ntfy;
+  	u16 sema;
+@@@ -778,6 -622,77 +741,80 @@@ struct nv50_wndw_func 
+  	u32 (*update)(struct nv50_wndw *, u32 interlock);
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct nv50_wimm_func {
++ };
++ 
++ static void
++ nv50_wndw_ctxdma_del(struct nv50_wndw_ctxdma *ctxdma)
++ {
++ 	nvif_object_fini(&ctxdma->object);
++ 	list_del(&ctxdma->head);
++ 	kfree(ctxdma);
++ }
++ 
++ static struct nv50_wndw_ctxdma *
++ nv50_wndw_ctxdma_new(struct nv50_wndw *wndw, struct nouveau_framebuffer *fb)
++ {
++ 	struct nouveau_drm *drm = nouveau_drm(fb->base.dev);
++ 	struct nv50_wndw_ctxdma *ctxdma;
++ 	const u8    kind = fb->nvbo->kind;
++ 	const u32 handle = 0xfb000000 | kind;
++ 	struct {
++ 		struct nv_dma_v0 base;
++ 		union {
++ 			struct nv50_dma_v0 nv50;
++ 			struct gf100_dma_v0 gf100;
++ 			struct gf119_dma_v0 gf119;
++ 		};
++ 	} args = {};
++ 	u32 argc = sizeof(args.base);
++ 	int ret;
++ 
++ 	list_for_each_entry(ctxdma, &wndw->ctxdma.list, head) {
++ 		if (ctxdma->object.handle == handle)
++ 			return ctxdma;
++ 	}
++ 
++ 	if (!(ctxdma = kzalloc(sizeof(*ctxdma), GFP_KERNEL)))
++ 		return ERR_PTR(-ENOMEM);
++ 	list_add(&ctxdma->head, &wndw->ctxdma.list);
++ 
++ 	args.base.target = NV_DMA_V0_TARGET_VRAM;
++ 	args.base.access = NV_DMA_V0_ACCESS_RDWR;
++ 	args.base.start  = 0;
++ 	args.base.limit  = drm->client.device.info.ram_user - 1;
++ 
++ 	if (drm->client.device.info.chipset < 0x80) {
++ 		args.nv50.part = NV50_DMA_V0_PART_256;
++ 		argc += sizeof(args.nv50);
++ 	} else
++ 	if (drm->client.device.info.chipset < 0xc0) {
++ 		args.nv50.part = NV50_DMA_V0_PART_256;
++ 		args.nv50.kind = kind;
++ 		argc += sizeof(args.nv50);
++ 	} else
++ 	if (drm->client.device.info.chipset < 0xd0) {
++ 		args.gf100.kind = kind;
++ 		argc += sizeof(args.gf100);
++ 	} else {
++ 		args.gf119.page = GF119_DMA_V0_PAGE_LP;
++ 		args.gf119.kind = kind;
++ 		argc += sizeof(args.gf119);
++ 	}
++ 
++ 	ret = nvif_object_init(wndw->ctxdma.parent, handle, NV_DMA_IN_MEMORY,
++ 			       &args, argc, &ctxdma->object);
++ 	if (ret) {
++ 		nv50_wndw_ctxdma_del(ctxdma);
++ 		return ERR_PTR(ret);
++ 	}
++ 
++ 	return ctxdma;
++ }
++ 
+++>>>>>>> a97c530eb968 (drm/nouveau/kms/nv50-: modify overlay allocation so the code can be split)
+  static int
+  nv50_wndw_wait_armed(struct nv50_wndw *wndw, struct nv50_wndw_atom *asyw)
+  {
+@@@ -1042,9 -953,18 +1079,22 @@@ static voi
+  nv50_wndw_destroy(struct drm_plane *plane)
+  {
+  	struct nv50_wndw *wndw = nv50_wndw(plane);
+++<<<<<<< HEAD
+ +	void *data;
+++=======
++ 	struct nv50_wndw_ctxdma *ctxdma, *ctxtmp;
++ 	void *data = wndw;
++ 
++ 	list_for_each_entry_safe(ctxdma, ctxtmp, &wndw->ctxdma.list, head) {
++ 		nv50_wndw_ctxdma_del(ctxdma);
++ 	}
++ 
+++>>>>>>> a97c530eb968 (drm/nouveau/kms/nv50-: modify overlay allocation so the code can be split)
+  	nvif_notify_fini(&wndw->notify);
+- 	data = wndw->func->dtor(wndw);
++ 	if (wndw->func->dtor)
++ 		data = wndw->func->dtor(wndw);
++ 	nv50_dmac_destroy(&wndw->wimm);
++ 	nv50_dmac_destroy(&wndw->wndw);
+  	drm_plane_cleanup(&wndw->plane);
+  	kfree(data);
+  }
+@@@ -2294,17 -2437,11 +2508,22 @@@ nv50_head_reset(struct drm_crtc *crtc
+  static void
+  nv50_head_destroy(struct drm_crtc *crtc)
+  {
+ +	struct nouveau_crtc *nv_crtc = nouveau_crtc(crtc);
+ +	struct nv50_disp *disp = nv50_disp(crtc->dev);
+  	struct nv50_head *head = nv50_head(crtc);
+ -	int i;
+  
+++<<<<<<< HEAD
+ +	nv50_dmac_destroy(&head->ovly.base, disp->disp);
+ +	nv50_pioc_destroy(&head->oimm.base);
+ +
+ +	nouveau_bo_unmap(nv_crtc->lut.nvbo);
+ +	if (nv_crtc->lut.nvbo)
+ +		nouveau_bo_unpin(nv_crtc->lut.nvbo);
+ +	nouveau_bo_ref(NULL, &nv_crtc->lut.nvbo);
+++=======
++ 	for (i = 0; i < ARRAY_SIZE(head->lut.nvbo); i++)
++ 		nouveau_bo_unmap_unpin_unref(&head->lut.nvbo[i]);
+++>>>>>>> a97c530eb968 (drm/nouveau/kms/nv50-: modify overlay allocation so the code can be split)
+  
+  	drm_crtc_cleanup(crtc);
+  	kfree(crtc);
+@@@ -2328,10 -2465,9 +2547,9 @@@ nv50_head_create(struct drm_device *dev
+  	struct nv50_head *head;
+  	struct nv50_base *base;
+  	struct nv50_curs *curs;
++ 	struct nv50_wndw *wndw;
+  	struct drm_crtc *crtc;
+ -	int ret, i;
+ +	int ret;
+  
+  	head = kzalloc(sizeof(*head), GFP_KERNEL);
+  	if (!head)
+@@@ -2353,32 -2489,16 +2571,37 @@@
+  	drm_crtc_helper_add(crtc, &nv50_head_help);
+  	drm_mode_crtc_set_gamma_size(crtc, 256);
+  
+ -	for (i = 0; i < ARRAY_SIZE(head->lut.nvbo); i++) {
+ -		ret = nouveau_bo_new_pin_map(&drm->client, 1025 * 8, 0x100,
+ -					     TTM_PL_FLAG_VRAM,
+ -					     &head->lut.nvbo[i]);
+ +	ret = nouveau_bo_new(&drm->client, 8192, 0x100, TTM_PL_FLAG_VRAM,
+ +			     0, 0x0000, NULL, NULL, &head->base.lut.nvbo);
+ +	if (!ret) {
+ +		ret = nouveau_bo_pin(head->base.lut.nvbo, TTM_PL_FLAG_VRAM, true);
+ +		if (!ret) {
+ +			ret = nouveau_bo_map(head->base.lut.nvbo);
+ +			if (ret)
+ +				nouveau_bo_unpin(head->base.lut.nvbo);
+ +		}
+  		if (ret)
+ -			goto out;
+ +			nouveau_bo_ref(NULL, &head->base.lut.nvbo);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (ret)
+ +		goto out;
+ +
+ +	/* allocate overlay resources */
+ +	ret = nv50_oimm_create(device, disp->disp, index, &head->oimm);
+ +	if (ret)
+ +		goto out;
+ +
+ +	ret = nv50_ovly_create(device, disp->disp, index, disp->sync->bo.offset,
+ +			       &head->ovly);
+ +	if (ret)
+ +		goto out;
+ +
+++=======
++ 	/* allocate overlay resources */
++ 	ret = nv50_ovly_new(drm, head->base.index, &wndw);
+++>>>>>>> a97c530eb968 (drm/nouveau/kms/nv50-: modify overlay allocation so the code can be split)
+  out:
+  	if (ret)
+  		nv50_head_destroy(crtc);
+* Unmerged path drivers/gpu/drm/nouveau/dispnv50/disp.c
