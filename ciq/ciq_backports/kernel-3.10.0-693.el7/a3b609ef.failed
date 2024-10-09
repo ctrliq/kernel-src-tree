@@ -1,0 +1,147 @@
+proc read mm's {arg,env}_{start,end} with mmap semaphore taken.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [fs] proc: read mm's {arg, env}_{start, end} with mmap semaphore taken (Mateusz Guzik) [1374860]
+Rebuild_FUZZ: 96.88%
+commit-author Mateusz Guzik <mguzik@redhat.com>
+commit a3b609ef9f8b1dbfe97034ccad6cd3fe71fbe7ab
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/a3b609ef.failed
+
+Only functions doing more than one read are modified.  Consumeres
+happened to deal with possibly changing data, but it does not seem like
+a good thing to rely on.
+
+	Signed-off-by: Mateusz Guzik <mguzik@redhat.com>
+	Acked-by: Cyrill Gorcunov <gorcunov@openvz.org>
+	Cc: Alexey Dobriyan <adobriyan@gmail.com>
+	Cc: Jarod Wilson <jarod@redhat.com>
+	Cc: Jan Stancek <jstancek@redhat.com>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: Anshuman Khandual <anshuman.linux@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit a3b609ef9f8b1dbfe97034ccad6cd3fe71fbe7ab)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/util.c
+diff --cc mm/util.c
+index c13190fa2ed4,c108a6542d05..000000000000
+--- a/mm/util.c
++++ b/mm/util.c
+@@@ -516,11 -462,59 +516,70 @@@ unsigned long vm_commit_limit(void
+  	return allowed;
+  }
+  
+++<<<<<<< HEAD
+ +
+ +/* Tracepoints definitions. */
+ +EXPORT_TRACEPOINT_SYMBOL(kmalloc);
+ +EXPORT_TRACEPOINT_SYMBOL(kmem_cache_alloc);
+ +EXPORT_TRACEPOINT_SYMBOL(kmalloc_node);
+ +EXPORT_TRACEPOINT_SYMBOL(kmem_cache_alloc_node);
+ +EXPORT_TRACEPOINT_SYMBOL(kfree);
+ +EXPORT_TRACEPOINT_SYMBOL(kmem_cache_free);
+++=======
++ /**
++  * get_cmdline() - copy the cmdline value to a buffer.
++  * @task:     the task whose cmdline value to copy.
++  * @buffer:   the buffer to copy to.
++  * @buflen:   the length of the buffer. Larger cmdline values are truncated
++  *            to this length.
++  * Returns the size of the cmdline field copied. Note that the copy does
++  * not guarantee an ending NULL byte.
++  */
++ int get_cmdline(struct task_struct *task, char *buffer, int buflen)
++ {
++ 	int res = 0;
++ 	unsigned int len;
++ 	struct mm_struct *mm = get_task_mm(task);
++ 	unsigned long arg_start, arg_end, env_start, env_end;
++ 	if (!mm)
++ 		goto out;
++ 	if (!mm->arg_end)
++ 		goto out_mm;	/* Shh! No looking before we're done */
++ 
++ 	down_read(&mm->mmap_sem);
++ 	arg_start = mm->arg_start;
++ 	arg_end = mm->arg_end;
++ 	env_start = mm->env_start;
++ 	env_end = mm->env_end;
++ 	up_read(&mm->mmap_sem);
++ 
++ 	len = arg_end - arg_start;
++ 
++ 	if (len > buflen)
++ 		len = buflen;
++ 
++ 	res = access_process_vm(task, arg_start, buffer, len, 0);
++ 
++ 	/*
++ 	 * If the nul at the end of args has been overwritten, then
++ 	 * assume application is using setproctitle(3).
++ 	 */
++ 	if (res > 0 && buffer[res-1] != '\0' && len < buflen) {
++ 		len = strnlen(buffer, res);
++ 		if (len < res) {
++ 			res = len;
++ 		} else {
++ 			len = env_end - env_start;
++ 			if (len > buflen - res)
++ 				len = buflen - res;
++ 			res += access_process_vm(task, env_start,
++ 						 buffer+res, len, 0);
++ 			res = strnlen(buffer, res);
++ 		}
++ 	}
++ out_mm:
++ 	mmput(mm);
++ out:
++ 	return res;
++ }
+++>>>>>>> a3b609ef9f8b (proc read mm's {arg,env}_{start,end} with mmap semaphore taken.)
+diff --git a/fs/proc/base.c b/fs/proc/base.c
+index 1747806f7c9a..17988bbbaea8 100644
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@ -1017,6 +1017,7 @@ static ssize_t environ_read(struct file *file, char __user *buf,
+ 	unsigned long src = *ppos;
+ 	int ret = 0;
+ 	struct mm_struct *mm = file->private_data;
++	unsigned long env_start, env_end;
+ 
+ 	if (!mm)
+ 		return 0;
+@@ -1028,19 +1029,25 @@ static ssize_t environ_read(struct file *file, char __user *buf,
+ 	ret = 0;
+ 	if (!atomic_inc_not_zero(&mm->mm_users))
+ 		goto free;
++
++	down_read(&mm->mmap_sem);
++	env_start = mm->env_start;
++	env_end = mm->env_end;
++	up_read(&mm->mmap_sem);
++
+ 	while (count > 0) {
+ 		size_t this_len, max_len;
+ 		int retval;
+ 
+-		if (src >= (mm->env_end - mm->env_start))
++		if (src >= (env_end - env_start))
+ 			break;
+ 
+-		this_len = mm->env_end - (mm->env_start + src);
++		this_len = env_end - (env_start + src);
+ 
+ 		max_len = min_t(size_t, PAGE_SIZE, count);
+ 		this_len = min(max_len, this_len);
+ 
+-		retval = access_remote_vm(mm, (mm->env_start + src),
++		retval = access_remote_vm(mm, (env_start + src),
+ 			page, this_len, 0);
+ 
+ 		if (retval <= 0) {
+* Unmerged path mm/util.c
