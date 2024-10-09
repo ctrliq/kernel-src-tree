@@ -1,0 +1,131 @@
+x86/PCI/VMD: Use untracked irq handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [x86] pci/vmd: Use untracked irq handler (Myron Stowe) [1388688]
+Rebuild_FUZZ: 94.44%
+commit-author Keith Busch <keith.busch@intel.com>
+commit 30ce0350381351646ef86b64e6d3840b3869833b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/30ce0350.failed
+
+There is no way to know which device in a VMD triggered an interrupt
+without invoking every registered driver's actions. This uses the
+untracked irq handler so that a less used device does not trigger
+spurious interrupt.
+
+We have been previously recommending users to enable "noirqdebug", but do
+not want to force a system setting just to keep this domain functional.
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Acked-by: Bjorn Helgaas <bhelgaas@google.com>
+	Cc: linux-pci@vger.kernel.org
+	Cc: Jon Derrick <jonathan.derrick@intel.com>
+Link: http://lkml.kernel.org/r/1466200821-29159-2-git-send-email-keith.busch@intel.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+(cherry picked from commit 30ce0350381351646ef86b64e6d3840b3869833b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/pci/vmd.c
+diff --cc arch/x86/pci/vmd.c
+index c06f45a0a147,613cac7395c4..000000000000
+--- a/arch/x86/pci/vmd.c
++++ b/arch/x86/pci/vmd.c
+@@@ -162,56 -180,48 +162,61 @@@ static struct vmd_irq_list *vmd_next_ir
+  	return &vmd->irqs[best];
+  }
+  
+ -static int vmd_msi_init(struct irq_domain *domain, struct msi_domain_info *info,
+ -			unsigned int virq, irq_hw_number_t hwirq,
+ -			msi_alloc_info_t *arg)
+ +static int vmd_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
+  {
+ -	struct vmd_dev *vmd = vmd_from_bus(msi_desc_to_pci_dev(arg->desc)->bus);
+ -	struct vmd_irq *vmdirq = kzalloc(sizeof(*vmdirq), GFP_KERNEL);
+ +	int i = 0;
+ +	unsigned int irq, virq;
+ +	struct msi_desc *msidesc;
+ +	struct irq_desc *desc;
+ +	struct vmd_dev *vmd = vmd_from_bus(dev->bus);
+  
+ -	if (!vmdirq)
+ -		return -ENOMEM;
+ +	if (type == PCI_CAP_ID_MSI && nvec > 1)
+ +		return 1;
+ +	if (nvec > vmd->msix_count)
+ +		return vmd->msix_count;
+ +	if (nvec <= 0)
+ +		return -EINVAL;
+  
+ -	INIT_LIST_HEAD(&vmdirq->node);
+ -	vmdirq->irq = vmd_next_irq(vmd);
+ -	vmdirq->virq = virq;
+ +	irq = irq_alloc_descs(-1, 0, nvec, -1);
+ +	if (irq < 0)
+ +		return irq;
+  
+ -	irq_domain_set_info(domain, virq, vmdirq->irq->vmd_vector, info->chip,
+ -			    vmdirq, handle_untracked_irq, vmd, NULL);
+ -	return 0;
+ -}
+++<<<<<<< HEAD
+ +	list_for_each_entry(msidesc, &dev->msi_list, list) {
+ +		struct vmd_irq *vmdirq;
+ +		struct msi_msg msg;
+  
+ -static void vmd_msi_free(struct irq_domain *domain,
+ -			struct msi_domain_info *info, unsigned int virq)
+ -{
+ -	struct vmd_irq *vmdirq = irq_get_chip_data(virq);
+ +		vmdirq = kzalloc(sizeof(*vmdirq), GFP_KERNEL);
+ +		if (!vmdirq)
+ +			return -ENOMEM;
+  
+ -	/* XXX: Potential optimization to rebalance */
+ -	raw_spin_lock(&list_lock);
+ -	vmdirq->irq->count--;
+ -	raw_spin_unlock(&list_lock);
+ +		virq = i + irq;
+ +		desc = irq_to_desc(virq);
+ +		desc->irq_data.msi_desc = msidesc;
+  
+ -	kfree_rcu(vmdirq, rcu);
+ -}
+ +		INIT_LIST_HEAD(&vmdirq->node);
+ +		vmdirq->irq = vmd_next_irq(vmd, msidesc);
+ +		vmdirq->virq = virq;
+  
+ -static int vmd_msi_prepare(struct irq_domain *domain, struct device *dev,
+ -			   int nvec, msi_alloc_info_t *arg)
+ -{
+ -	struct pci_dev *pdev = to_pci_dev(dev);
+ -	struct vmd_dev *vmd = vmd_from_bus(pdev->bus);
+ +		irq_set_handler_data(virq, vmdirq);
+ +		irq_set_chip_and_handler(virq, &vmd_msi_controller,
+ +					 handle_simple_irq);
+ +		irq_set_chip_data(virq, vmdirq);
+  
+ -	if (nvec > vmd->msix_count)
+ -		return vmd->msix_count;
+ +		msg.address_hi = MSI_ADDR_BASE_HI;
+ +		msg.address_lo = MSI_ADDR_BASE_LO | MSI_ADDR_DEST_ID(vmdirq->irq->index);
+ +		msg.data = 0;
+ +
+ +		msidesc->irq = virq;
+ +		msidesc->msg = msg;
+ +		write_msi_msg(virq, &msg);
+  
+ -	memset(arg, 0, sizeof(*arg));
+ +		i++;
+ +	}
+++=======
+++	irq_domain_set_info(domain, virq, vmdirq->irq->vmd_vector, info->chip,
+++			    vmdirq, handle_untracked_irq, vmd, NULL);
+++>>>>>>> 30ce03503813 (x86/PCI/VMD: Use untracked irq handler)
+  	return 0;
+  }
+  
+* Unmerged path arch/x86/pci/vmd.c
