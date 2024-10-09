@@ -1323,14 +1323,15 @@ static int init_one(struct pci_dev *pdev,
 
 	pci_set_drvdata(pdev, dev);
 
+	dev->pdev = pdev;
+	dev->event = mlx5_core_event;
+
 	if (prof_sel < 0 || prof_sel >= ARRAY_SIZE(profile)) {
 		pr_warn("selected profile out of range, selecting default (%d)\n",
 			MLX5_DEFAULT_PROF);
 		prof_sel = MLX5_DEFAULT_PROF;
 	}
 	dev->profile = &profile[prof_sel];
-	dev->pdev = pdev;
-	dev->event = mlx5_core_event;
 
 	INIT_LIST_HEAD(&priv->ctx_list);
 	spin_lock_init(&priv->ctx_lock);
