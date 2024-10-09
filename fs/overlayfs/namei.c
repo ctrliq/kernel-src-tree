@@ -764,6 +764,7 @@ bool ovl_lower_positive(struct dentry *dentry)
 	struct ovl_entry *oe = dentry->d_fsdata;
 	struct ovl_entry *poe = dentry->d_parent->d_fsdata;
 	const struct qstr *name = &dentry->d_name;
+	const struct cred *old_cred;
 	unsigned int i;
 	bool positive = false;
 	bool done = false;
@@ -779,6 +780,7 @@ bool ovl_lower_positive(struct dentry *dentry)
 	if (!ovl_dentry_upper(dentry))
 		return true;
 
+	old_cred = ovl_override_creds(dentry->d_sb);
 	/* Positive upper -> have to look up lower to see whether it exists */
 	for (i = 0; !done && !positive && i < poe->numlower; i++) {
 		struct dentry *this;
@@ -808,6 +810,7 @@ bool ovl_lower_positive(struct dentry *dentry)
 			dput(this);
 		}
 	}
+	revert_creds(old_cred);
 
 	return positive;
 }
