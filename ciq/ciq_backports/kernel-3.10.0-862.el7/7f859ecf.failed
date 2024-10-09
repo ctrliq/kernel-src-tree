@@ -1,0 +1,170 @@
+net/mlx5e: Set SQ max rate on mlx5e_open_txqsq rather on open_channel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Set SQ max rate on mlx5e_open_txqsq rather on open_channel (Don Dutile) [1456659 1499362]
+Rebuild_FUZZ: 97.01%
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit 7f859ecfa8d6e647d6c794c8af44d209c8372e77
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7f859ecf.failed
+
+Instead of iterating over the channel SQs to set their max rate, do it
+on SQ creation per TXQ SQ.
+
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+(cherry picked from commit 7f859ecfa8d6e647d6c794c8af44d209c8372e77)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index edb21d8194bc,469d6c147db7..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -1096,50 -1181,72 +1096,99 @@@ static int mlx5e_modify_sq(struct mlx5e
+  	return err;
+  }
+  
+ -static void mlx5e_destroy_sq(struct mlx5e_priv *priv, u32 sqn)
+ +static void mlx5e_disable_sq(struct mlx5e_sq *sq)
+ +{
+++<<<<<<< HEAD
+ +	struct mlx5e_channel *c = sq->channel;
+ +	struct mlx5e_priv *priv = c->priv;
+ +	struct mlx5_core_dev *mdev = priv->mdev;
+ +
+ +	mlx5_core_destroy_sq(mdev, sq->sqn);
+ +	if (sq->rate_limit)
+ +		mlx5_rl_remove_rate(mdev, sq->rate_limit);
+ +}
+ +
+ +static int mlx5e_open_sq(struct mlx5e_channel *c,
+ +			 int tc,
+ +			 struct mlx5e_sq_param *param,
+ +			 struct mlx5e_sq *sq)
+  {
+++=======
++ 	mlx5_core_destroy_sq(priv->mdev, sqn);
++ }
++ 
++ static int mlx5e_create_sq_rdy(struct mlx5e_priv *priv,
++ 			       struct mlx5e_sq_param *param,
++ 			       struct mlx5e_create_sq_param *csp,
++ 			       u32 *sqn)
++ {
++ 	struct mlx5e_modify_sq_param msp = {0};
++ 	int err;
++ 
++ 	err = mlx5e_create_sq(priv, param, csp, sqn);
++ 	if (err)
++ 		return err;
++ 
++ 	msp.curr_state = MLX5_SQC_STATE_RST;
++ 	msp.next_state = MLX5_SQC_STATE_RDY;
++ 	err = mlx5e_modify_sq(priv, *sqn, &msp);
++ 	if (err)
++ 		mlx5e_destroy_sq(priv, *sqn);
++ 
++ 	return err;
++ }
++ 
++ static int mlx5e_set_sq_maxrate(struct net_device *dev,
++ 				struct mlx5e_txqsq *sq, u32 rate);
++ 
++ static int mlx5e_open_txqsq(struct mlx5e_channel *c,
++ 			    int tc,
++ 			    struct mlx5e_sq_param *param,
++ 			    struct mlx5e_txqsq *sq)
++ {
++ 	struct mlx5e_create_sq_param csp = {};
++ 	struct mlx5e_priv *priv = c->priv;
++ 	u32 tx_rate;
++ 	int txq_ix;
+++>>>>>>> 7f859ecfa8d6 (net/mlx5e: Set SQ max rate on mlx5e_open_txqsq rather on open_channel)
+  	int err;
+  
+ -	err = mlx5e_alloc_txqsq(c, tc, param, sq);
+ +	err = mlx5e_create_sq(c, tc, param, sq);
+  	if (err)
+  		return err;
+  
+ -	csp.tisn            = priv->tisn[sq->tc];
+ -	csp.tis_lst_sz      = 1;
+ -	csp.cqn             = sq->cq.mcq.cqn;
+ -	csp.wq_ctrl         = &sq->wq_ctrl;
+ -	csp.min_inline_mode = sq->min_inline_mode;
+ +	err = mlx5e_enable_sq(sq, param);
+ +	if (err)
+ +		goto err_destroy_sq;
+ +
+  	set_bit(MLX5E_SQ_STATE_ENABLED, &sq->state);
+ -	err = mlx5e_create_sq_rdy(c->priv, param, &csp, &sq->sqn);
+ +	err = mlx5e_modify_sq(sq, MLX5_SQC_STATE_RST, MLX5_SQC_STATE_RDY,
+ +			      false, 0);
+  	if (err)
+ -		goto err_free_txqsq;
+ +		goto err_disable_sq;
+ +
+ +	if (sq->txq) {
+ +		netdev_tx_reset_queue(sq->txq);
+ +		netif_tx_start_queue(sq->txq);
+ +	}
+  
+++<<<<<<< HEAD
+++=======
++ 	txq_ix = c->ix + tc * priv->params.num_channels;
++ 	tx_rate = priv->tx_rates[txq_ix];
++ 	if (tx_rate)
++ 		mlx5e_set_sq_maxrate(priv->netdev, sq, tx_rate);
++ 
++ 	netdev_tx_reset_queue(sq->txq);
++ 	netif_tx_start_queue(sq->txq);
+++>>>>>>> 7f859ecfa8d6 (net/mlx5e: Set SQ max rate on mlx5e_open_txqsq rather on open_channel)
+  	return 0;
+  
+ -err_free_txqsq:
+ +err_disable_sq:
+  	clear_bit(MLX5E_SQ_STATE_ENABLED, &sq->state);
+ -	mlx5e_free_txqsq(sq);
+ +	mlx5e_disable_sq(sq);
+ +err_destroy_sq:
+ +	mlx5e_destroy_sq(sq);
+  
+  	return err;
+  }
+@@@ -1471,9 -1701,7 +1520,8 @@@ static int mlx5e_open_channel(struct ml
+  	struct mlx5e_cq_moder rx_cq_profile;
+  	int cpu = mlx5e_get_cpu(priv, ix);
+  	struct mlx5e_channel *c;
+ +	struct mlx5e_sq *sq;
+  	int err;
+- 	int i;
+  
+  	c = kzalloc_node(sizeof(*c), GFP_KERNEL, cpu_to_node(cpu));
+  	if (!c)
+@@@ -1519,15 -1754,9 +1567,21 @@@
+  	if (err)
+  		goto err_close_icosq;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < priv->params.num_tc; i++) {
+ +		u32 txq_ix = priv->channeltc_to_txq_map[ix][i];
+ +
+ +		if (priv->tx_rates[txq_ix]) {
+ +			sq = priv->txq_to_sq_map[txq_ix];
+ +			mlx5e_set_sq_maxrate(priv->netdev, sq,
+ +					     priv->tx_rates[txq_ix]);
+ +		}
+ +	}
+++=======
++ 	err = c->xdp ? mlx5e_open_xdpsq(c, &cparam->xdp_sq, &c->rq.xdpsq) : 0;
++ 	if (err)
++ 		goto err_close_sqs;
+++>>>>>>> 7f859ecfa8d6 (net/mlx5e: Set SQ max rate on mlx5e_open_txqsq rather on open_channel)
+  
+  	err = mlx5e_open_rq(c, &cparam->rq, &c->rq);
+  	if (err)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
