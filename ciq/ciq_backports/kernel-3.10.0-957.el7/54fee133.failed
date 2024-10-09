@@ -1,0 +1,135 @@
+xfs: adjust allocation length in xfs_alloc_space_available
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 54fee133ad59c87ab01dd84ab3e9397134b32acb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/54fee133.failed
+
+We must decide in xfs_alloc_fix_freelist if we can perform an
+allocation from a given AG is possible or not based on the available
+space, and should not fail the allocation past that point on a
+healthy file system.
+
+But currently we have two additional places that second-guess
+xfs_alloc_fix_freelist: xfs_alloc_ag_vextent tries to adjust the
+maxlen parameter to remove the reservation before doing the
+allocation (but ignores the various minium freespace requirements),
+and xfs_alloc_fix_minleft tries to fix up the allocated length
+after we've found an extent, but ignores the reservations and also
+doesn't take the AGFL into account (and thus fails allocations
+for not matching minlen in some cases).
+
+Remove all these later fixups and just correct the maxlen argument
+inside xfs_alloc_fix_freelist once we have the AGF buffer locked.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 54fee133ad59c87ab01dd84ab3e9397134b32acb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_alloc.c
+#	fs/xfs/libxfs/xfs_alloc.h
+diff --cc fs/xfs/libxfs/xfs_alloc.c
+index ce410a9100dc,f2e7eb6e5243..000000000000
+--- a/fs/xfs/libxfs/xfs_alloc.c
++++ b/fs/xfs/libxfs/xfs_alloc.c
+@@@ -611,6 -668,7 +587,10 @@@ xfs_alloc_ag_vextent
+  	ASSERT(args->minlen <= args->maxlen);
+  	ASSERT(args->mod < args->prod);
+  	ASSERT(args->alignment > 0);
+++<<<<<<< HEAD
+++=======
++ 
+++>>>>>>> 54fee133ad59 (xfs: adjust allocation length in xfs_alloc_space_available)
+  	/*
+  	 * Branch to correct routine based on the type.
+  	 */
+@@@ -1905,12 -2010,22 +1869,27 @@@ xfs_alloc_space_available
+  	if ((args->minlen + args->alignment + args->minalignslop - 1) > longest)
+  		return false;
+  
+ -	/* do we have enough free space remaining for the allocation? */
+ +	/* do have enough free space remaining for the allocation? */
+  	available = (int)(pag->pagf_freeblks + pag->pagf_flcount -
+++<<<<<<< HEAD
+ +			  min_free - args->total);
+ +	if (available < (int)args->minleft)
+++=======
++ 			  reservation - min_free - args->minleft);
++ 	if (available < (int)args->total)
+++>>>>>>> 54fee133ad59 (xfs: adjust allocation length in xfs_alloc_space_available)
+  		return false;
+  
++ 	/*
++ 	 * Clamp maxlen to the amount of free space available for the actual
++ 	 * extent allocation.
++ 	 */
++ 	if (available < (int)args->maxlen && !(flags & XFS_ALLOC_FLAG_CHECK)) {
++ 		args->maxlen = available;
++ 		ASSERT(args->maxlen > 0);
++ 		ASSERT(args->maxlen >= args->minlen);
++ 	}
++ 
+  	return true;
+  }
+  
+diff --cc fs/xfs/libxfs/xfs_alloc.h
+index 5e53d5115f37,1d0f48a501a3..000000000000
+--- a/fs/xfs/libxfs/xfs_alloc.h
++++ b/fs/xfs/libxfs/xfs_alloc.h
+@@@ -54,42 -54,9 +54,48 @@@ typedef unsigned int xfs_alloctype_t
+   */
+  #define	XFS_ALLOC_FLAG_TRYLOCK	0x00000001  /* use trylock for buffer locking */
+  #define	XFS_ALLOC_FLAG_FREEING	0x00000002  /* indicate caller is freeing extents*/
+++<<<<<<< HEAD
+ +
+ +/*
+ + * In order to avoid ENOSPC-related deadlock caused by
+ + * out-of-order locking of AGF buffer (PV 947395), we place
+ + * constraints on the relationship among actual allocations for
+ + * data blocks, freelist blocks, and potential file data bmap
+ + * btree blocks. However, these restrictions may result in no
+ + * actual space allocated for a delayed extent, for example, a data
+ + * block in a certain AG is allocated but there is no additional
+ + * block for the additional bmap btree block due to a split of the
+ + * bmap btree of the file. The result of this may lead to an
+ + * infinite loop in xfssyncd when the file gets flushed to disk and
+ + * all delayed extents need to be actually allocated. To get around
+ + * this, we explicitly set aside a few blocks which will not be
+ + * reserved in delayed allocation. Considering the minimum number of
+ + * needed freelist blocks is 4 fsbs _per AG_, a potential split of file's bmap
+ + * btree requires 1 fsb, so we set the number of set-aside blocks
+ + * to 4 + 4*agcount.
+ + */
+ +#define XFS_ALLOC_SET_ASIDE(mp)  (4 + ((mp)->m_sb.sb_agcount * 4))
+ +
+ +/*
+ + * When deciding how much space to allocate out of an AG, we limit the
+ + * allocation maximum size to the size the AG. However, we cannot use all the
+ + * blocks in the AG - some are permanently used by metadata. These
+ + * blocks are generally:
+ + *	- the AG superblock, AGF, AGI and AGFL
+ + *	- the AGF (bno and cnt) and AGI btree root blocks
+ + *	- 4 blocks on the AGFL according to XFS_ALLOC_SET_ASIDE() limits
+ + *
+ + * The AG headers are sector sized, so the amount of space they take up is
+ + * dependent on filesystem geometry. The others are all single blocks.
+ + */
+ +#define XFS_ALLOC_AG_MAX_USABLE(mp)	\
+ +	((mp)->m_sb.sb_agblocks - XFS_BB_TO_FSB(mp, XFS_FSS_TO_BB(mp, 4)) - 7)
+ +
+++=======
++ #define	XFS_ALLOC_FLAG_NORMAP	0x00000004  /* don't modify the rmapbt */
++ #define	XFS_ALLOC_FLAG_NOSHRINK	0x00000008  /* don't shrink the freelist */
++ #define	XFS_ALLOC_FLAG_CHECK	0x00000010  /* test only, don't modify args */
+++>>>>>>> 54fee133ad59 (xfs: adjust allocation length in xfs_alloc_space_available)
+  
+  /*
+   * Argument structure for xfs_alloc routines.
+* Unmerged path fs/xfs/libxfs/xfs_alloc.c
+* Unmerged path fs/xfs/libxfs/xfs_alloc.h
