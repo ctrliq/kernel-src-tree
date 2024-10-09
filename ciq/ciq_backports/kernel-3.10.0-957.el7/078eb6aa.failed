@@ -1,0 +1,191 @@
+x86/mm/memory_hotplug: determine block size based on the end of boot memory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [x86] revert "mm/memory_hotplug: determine block size based on the end of boot memory" (Baoquan He) [1625143]
+Rebuild_FUZZ: 91.61%
+commit-author Pavel Tatashin <pasha.tatashin@oracle.com>
+commit 078eb6aa50dc50cd85f09a22226b7e238b3397ce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/078eb6aa.failed
+
+Memory sections are combined into "memory block" chunks.  These chunks
+are the units upon which memory can be added and removed.
+
+On x86, the new memory may be added after the end of the boot memory,
+therefore, if block size does not align with end of boot memory, memory
+hot-plugging/hot-removing can be broken.
+
+Memory sections are combined into "memory block" chunks.  These chunks
+are the units upon which memory can be added and removed.
+
+On x86 the new memory may be added after the end of the boot memory,
+therefore, if block size does not align with end of boot memory, memory
+hotplugging/hotremoving can be broken.
+
+Currently, whenever machine is booted with more than 64G the block size
+is unconditionally increased to 2G from the base 128M.  This is done in
+order to reduce number of memory device files in sysfs:
+
+	/sys/devices/system/memory/memoryXXX
+
+We must use the largest allowed block size that aligns to the next
+address to be able to hotplug the next block of memory.
+
+So, when memory is larger or equal to 64G, we check the end address and
+find the largest block size that is still power of two but smaller or
+equal to 2G.
+
+Before, the fix:
+Run qemu with:
+-m 64G,slots=2,maxmem=66G -object memory-backend-ram,id=mem1,size=2G
+
+(qemu) device_add pc-dimm,id=dimm1,memdev=mem1
+Block size [0x80000000] unaligned hotplug range: start 0x1040000000,
+							size 0x80000000
+acpi PNP0C80:00: add_memory failed
+acpi PNP0C80:00: acpi_memory_enable_device() error
+acpi PNP0C80:00: Enumeration failure
+
+With the fix memory is added successfully as the block size is set to
+1G, and therefore aligns with start address 0x1040000000.
+
+[pasha.tatashin@oracle.com: v4]
+  Link: http://lkml.kernel.org/r/20180215165920.8570-3-pasha.tatashin@oracle.com
+Link: http://lkml.kernel.org/r/20180213193159.14606-3-pasha.tatashin@oracle.com
+	Signed-off-by: Pavel Tatashin <pasha.tatashin@oracle.com>
+	Reviewed-by: Ingo Molnar <mingo@kernel.org>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Steven Sistare <steven.sistare@oracle.com>
+	Cc: Daniel Jordan <daniel.m.jordan@oracle.com>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Bharata B Rao <bharata@linux.vnet.ibm.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Baoquan He <bhe@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 078eb6aa50dc50cd85f09a22226b7e238b3397ce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/mm/init_64.c
+diff --cc arch/x86/mm/init_64.c
+index 25c65b6af83e,dca9abf2b85c..000000000000
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@@ -1173,65 -1329,51 +1173,103 @@@ int kern_addr_valid(unsigned long addr
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * A pseudo VMA to allow ptrace access for the vsyscall page.  This only
+ + * covers the 64bit vsyscall page now. 32bit has a real VMA now and does
+ + * not need special handling anymore:
+ + */
+ +static struct vm_area_struct gate_vma = {
+ +	.vm_start	= VSYSCALL_START,
+ +	.vm_end		= VSYSCALL_START + (VSYSCALL_MAPPED_PAGES * PAGE_SIZE),
+ +	.vm_page_prot	= PAGE_READONLY_EXEC,
+ +	.vm_flags	= VM_READ | VM_EXEC
+ +};
+ +
+ +struct vm_area_struct *get_gate_vma(struct mm_struct *mm)
+ +{
+ +#ifdef CONFIG_IA32_EMULATION
+ +	if (!mm || mm->context.ia32_compat)
+ +		return NULL;
+ +#endif
+ +	return &gate_vma;
+++=======
++  * Block size is the minimum amount of memory which can be hotplugged or
++  * hotremoved. It must be power of two and must be equal or larger than
++  * MIN_MEMORY_BLOCK_SIZE.
++  */
++ #define MAX_BLOCK_SIZE (2UL << 30)
++ 
++ /* Amount of ram needed to start using large blocks */
++ #define MEM_SIZE_FOR_LARGE_BLOCK (64UL << 30)
++ 
++ static unsigned long probe_memory_block_size(void)
++ {
++ 	unsigned long boot_mem_end = max_pfn << PAGE_SHIFT;
++ 	unsigned long bz;
++ 
++ 	/* If this is UV system, always set 2G block size */
++ 	if (is_uv_system()) {
++ 		bz = MAX_BLOCK_SIZE;
++ 		goto done;
++ 	}
++ 
++ 	/* Use regular block if RAM is smaller than MEM_SIZE_FOR_LARGE_BLOCK */
++ 	if (boot_mem_end < MEM_SIZE_FOR_LARGE_BLOCK) {
++ 		bz = MIN_MEMORY_BLOCK_SIZE;
++ 		goto done;
++ 	}
++ 
++ 	/* Find the largest allowed block size that aligns to memory end */
++ 	for (bz = MAX_BLOCK_SIZE; bz > MIN_MEMORY_BLOCK_SIZE; bz >>= 1) {
++ 		if (IS_ALIGNED(boot_mem_end, bz))
++ 			break;
++ 	}
++ done:
++ 	pr_info("x86/mm: Memory block size: %ldMB\n", bz >> 20);
++ 
++ 	return bz;
+++>>>>>>> 078eb6aa50dc (x86/mm/memory_hotplug: determine block size based on the end of boot memory)
+  }
+  
+ -static unsigned long memory_block_size_probed;
+ -unsigned long memory_block_size_bytes(void)
+ +int in_gate_area(struct mm_struct *mm, unsigned long addr)
+  {
+ -	if (!memory_block_size_probed)
+ -		memory_block_size_probed = probe_memory_block_size();
+ +	struct vm_area_struct *vma = get_gate_vma(mm);
+  
+ -	return memory_block_size_probed;
+ +	if (!vma)
+ +		return 0;
+ +
+ +	return (addr >= vma->vm_start) && (addr < vma->vm_end);
+ +}
+ +
+ +/*
+ + * Use this when you have no reliable mm, typically from interrupt
+ + * context. It is less reliable than using a task's mm and may give
+ + * false positives.
+ + */
+ +int in_gate_area_no_mm(unsigned long addr)
+ +{
+ +	return (addr >= VSYSCALL_START) && (addr < VSYSCALL_END);
+ +}
+ +
+ +const char *arch_vma_name(struct vm_area_struct *vma)
+ +{
+ +	if (vma->vm_mm && vma->vm_start == (long)vma->vm_mm->context.vdso)
+ +		return "[vdso]";
+ +	if (vma == &gate_vma)
+ +		return "[vsyscall]";
+ +	return NULL;
+ +}
+ +
+ +#ifdef CONFIG_X86_UV
+ +unsigned long memory_block_size_bytes(void)
+ +{
+ +	if (is_uv_system()) {
+ +		printk(KERN_INFO "UV: memory block size 2GB\n");
+ +		return 2UL * 1024 * 1024 * 1024;
+ +	}
+ +	return MIN_MEMORY_BLOCK_SIZE;
+  }
+ +#endif
+  
+  #ifdef CONFIG_SPARSEMEM_VMEMMAP
+  /*
+* Unmerged path arch/x86/mm/init_64.c
