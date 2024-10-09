@@ -1,0 +1,157 @@
+flow dissector: check if arp_eth is null rather than arp
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] flow_dissector: check if arp_eth is null rather than arp (Jonathan Toppins) [1393375]
+Rebuild_FUZZ: 98.21%
+commit-author Colin Ian King <colin.king@canonical.com>
+commit 57b68ec2a7be9a7e9f8999850f8ee5baa49023e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/57b68ec2.failed
+
+arp is being checked instead of arp_eth to see if the call to
+__skb_header_pointer failed. Fix this by checking arp_eth is
+null instead of arp.   Also fix to use length hlen rather than
+hlen - sizeof(_arp); thanks to Eric Dumazet for spotting
+this latter issue.
+
+CoverityScan CID#1396428 ("Logically dead code") on 2nd
+arp comparison (which should be arp_eth instead).
+
+Fixes: commit 55733350e5e8b70c5 ("flow disector: ARP support")
+	Signed-off-by: Colin Ian King <colin.king@canonical.com>
+	Acked-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 57b68ec2a7be9a7e9f8999850f8ee5baa49023e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/flow_dissector.c
+diff --cc net/core/flow_dissector.c
+index dae6e57d80c3,c35aae13c8d2..000000000000
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@@ -212,18 -335,109 +212,82 @@@ ipv6
+  		} *hdr, _hdr;
+  		hdr = __skb_header_pointer(skb, nhoff, sizeof(_hdr), data, hlen, &_hdr);
+  		if (!hdr)
+ -			goto out_bad;
+ -
+ -		if (dissector_uses_key(flow_dissector,
+ -				       FLOW_DISSECTOR_KEY_TIPC_ADDRS)) {
+ -			key_addrs = skb_flow_dissector_target(flow_dissector,
+ -							      FLOW_DISSECTOR_KEY_TIPC_ADDRS,
+ -							      target_container);
+ -			key_addrs->tipcaddrs.srcnode = hdr->srcnode;
+ -			key_control->addr_type = FLOW_DISSECTOR_KEY_TIPC_ADDRS;
+ -		}
+ -		goto out_good;
+ -	}
+ -
+ -	case htons(ETH_P_MPLS_UC):
+ -	case htons(ETH_P_MPLS_MC): {
+ -		struct mpls_label *hdr, _hdr[2];
+ -mpls:
+ -		hdr = __skb_header_pointer(skb, nhoff, sizeof(_hdr), data,
+ -					   hlen, &_hdr);
+ -		if (!hdr)
+ -			goto out_bad;
+ -
+ -		if ((ntohl(hdr[0].entry) & MPLS_LS_LABEL_MASK) >>
+ -		     MPLS_LS_LABEL_SHIFT == MPLS_LABEL_ENTROPY) {
+ -			if (dissector_uses_key(flow_dissector,
+ -					       FLOW_DISSECTOR_KEY_MPLS_ENTROPY)) {
+ -				key_keyid = skb_flow_dissector_target(flow_dissector,
+ -								      FLOW_DISSECTOR_KEY_MPLS_ENTROPY,
+ -								      target_container);
+ -				key_keyid->keyid = hdr[1].entry &
+ -					htonl(MPLS_LS_LABEL_MASK);
+ -			}
+ -
+ -			goto out_good;
+ -		}
+ -
+ -		goto out_good;
+ +			return false;
+ +		flow->src = hdr->srcnode;
+ +		flow->dst = 0;
+ +		flow->n_proto = proto;
+ +		flow->thoff = (u16)nhoff;
+ +		return true;
+  	}
+ -
+  	case htons(ETH_P_FCOE):
+++<<<<<<< HEAD
+ +		flow->thoff = (u16)(nhoff + FCOE_HEADER_LEN);
+ +		/* fall through */
+++=======
++ 		if ((hlen - nhoff) < FCOE_HEADER_LEN)
++ 			goto out_bad;
++ 
++ 		nhoff += FCOE_HEADER_LEN;
++ 		goto out_good;
++ 
++ 	case htons(ETH_P_ARP):
++ 	case htons(ETH_P_RARP): {
++ 		struct {
++ 			unsigned char ar_sha[ETH_ALEN];
++ 			unsigned char ar_sip[4];
++ 			unsigned char ar_tha[ETH_ALEN];
++ 			unsigned char ar_tip[4];
++ 		} *arp_eth, _arp_eth;
++ 		const struct arphdr *arp;
++ 		struct arphdr *_arp;
++ 
++ 		arp = __skb_header_pointer(skb, nhoff, sizeof(_arp), data,
++ 					   hlen, &_arp);
++ 		if (!arp)
++ 			goto out_bad;
++ 
++ 		if (arp->ar_hrd != htons(ARPHRD_ETHER) ||
++ 		    arp->ar_pro != htons(ETH_P_IP) ||
++ 		    arp->ar_hln != ETH_ALEN ||
++ 		    arp->ar_pln != 4 ||
++ 		    (arp->ar_op != htons(ARPOP_REPLY) &&
++ 		     arp->ar_op != htons(ARPOP_REQUEST)))
++ 			goto out_bad;
++ 
++ 		arp_eth = __skb_header_pointer(skb, nhoff + sizeof(_arp),
++ 					       sizeof(_arp_eth), data,
++ 					       hlen,
++ 					       &_arp_eth);
++ 		if (!arp_eth)
++ 			goto out_bad;
++ 
++ 		if (dissector_uses_key(flow_dissector,
++ 				       FLOW_DISSECTOR_KEY_ARP)) {
++ 
++ 			key_arp = skb_flow_dissector_target(flow_dissector,
++ 							    FLOW_DISSECTOR_KEY_ARP,
++ 							    target_container);
++ 
++ 			memcpy(&key_arp->sip, arp_eth->ar_sip,
++ 			       sizeof(key_arp->sip));
++ 			memcpy(&key_arp->tip, arp_eth->ar_tip,
++ 			       sizeof(key_arp->tip));
++ 
++ 			/* Only store the lower byte of the opcode;
++ 			 * this covers ARPOP_REPLY and ARPOP_REQUEST.
++ 			 */
++ 			key_arp->op = ntohs(arp->ar_op) & 0xff;
++ 
++ 			ether_addr_copy(key_arp->sha, arp_eth->ar_sha);
++ 			ether_addr_copy(key_arp->tha, arp_eth->ar_tha);
++ 		}
++ 
++ 		goto out_good;
++ 	}
++ 
+++>>>>>>> 57b68ec2a7be (flow dissector: check if arp_eth is null rather than arp)
+  	default:
+ -		goto out_bad;
+ +		return false;
+  	}
+  
+  ip_proto_again:
+* Unmerged path net/core/flow_dissector.c
