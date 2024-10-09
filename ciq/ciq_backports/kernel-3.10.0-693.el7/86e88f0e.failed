@@ -1,0 +1,184 @@
+HID: wacom: Call 'wacom_query_tablet_data' only after 'hid_hw_start'
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [hid] wacom: Call wacom_query_tablet_data only after hid_hw_start (Aristeu Rozanski) [1346348 1388646 1385026]
+Rebuild_FUZZ: 92.91%
+commit-author Jason Gerecke <killertofu@gmail.com>
+commit 86e88f0e7068e37d9774eb9d93515c44ffa74006
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/86e88f0e.failed
+
+When connecting the Cintiq Companion 2 as an external tablet (i.e., using
+it in "hybrid" mode) it has been seen to cause the kernel of the machine
+it is connected to to Oops. The cause has been traced to us attempting to
+switch the tablet's mode prior to actually starting HID device (resulting
+in the eventual dereference of the uninitialized control URB).
+
+Commit 3b164a0 moved the mode switch from occuring post-start to occurring
+pre-start. The change was not seen to cause issues largely due to the fact
+that most devices mode switch with 'hid_hw_raw_request' (which is safe to
+call prior to start) rather than 'hid_hw_request'.
+
+Moving the call back to its original location resolves the issue, but
+causes some touch-only Bamboo tablets (e.g. 056a:00d0) to stop working.
+The affected tablets require us to perform a mode switch on their
+vestigial pen interface prior ignoring with -ENODEV, meaning that the
+code which is responsible for doing the ignoring has to move as well.
+
+	Signed-off-by: Jason Gerecke <jason.gerecke@wacom.com>
+	Reviewed-by: Ping Cheng <pingc@wacom.com>
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+(cherry picked from commit 86e88f0e7068e37d9774eb9d93515c44ffa74006)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hid/wacom_sys.c
+diff --cc drivers/hid/wacom_sys.c
+index 527bf559d1db,e06af5b9f59e..000000000000
+--- a/drivers/hid/wacom_sys.c
++++ b/drivers/hid/wacom_sys.c
+@@@ -1364,63 -1757,89 +1364,128 @@@ static int wacom_probe(struct usb_inter
+  		}
+  	}
+  
+ -	/* set the default size in case we do not get them from hid */
+ -	wacom_set_default_phy(features);
+ +	wacom_setup_device_quirks(features);
+  
+ -	/* Retrieve the physical and logical size for touch devices */
+ -	wacom_retrieve_hid_descriptor(hdev, features);
+ -	wacom_setup_device_quirks(wacom);
+ +	/* set unit to "100th of a mm" for devices not reported by HID */
+ +	if (!features->unit) {
+ +		features->unit = 0x11;
+ +		features->unitExpo = 16 - 3;
+ +	}
+ +	wacom_calculate_res(features);
+  
+ -	if (features->device_type == WACOM_DEVICETYPE_NONE &&
+ -	    features->type != WIRELESS) {
+ -		error = features->type == HID_GENERIC ? -ENODEV : 0;
+ +	strlcpy(wacom_wac->name, features->name, sizeof(wacom_wac->name));
+  
+ -		dev_warn(&hdev->dev, "Unknown device_type for '%s'. %s.",
+ -			 hdev->name,
+ -			 error ? "Ignoring" : "Assuming pen");
+ +	if (features->quirks & WACOM_QUIRK_MULTI_INPUT) {
+ +		struct usb_device *other_dev;
+  
+ +		/* Append the device type to the name */
+ +		if (features->device_type != BTN_TOOL_FINGER)
+ +			strlcat(wacom_wac->name, " Pen", WACOM_NAME_MAX);
+ +		else if (features->touch_max)
+ +			strlcat(wacom_wac->name, " Finger", WACOM_NAME_MAX);
+ +		else
+ +			strlcat(wacom_wac->name, " Pad", WACOM_NAME_MAX);
+ +
+ +		other_dev = wacom_get_sibling(dev, features->oVid, features->oPid);
+ +		if (other_dev == NULL || wacom_get_usbdev_data(other_dev) == NULL)
+ +			other_dev = dev;
+ +		error = wacom_add_shared_data(wacom_wac, other_dev);
+  		if (error)
+ -			goto fail_shared_data;
+ +			goto fail3;
+ +	}
+ +
+ +	usb_fill_int_urb(wacom->irq, dev,
+ +			 usb_rcvintpipe(dev, endpoint->bEndpointAddress),
+ +			 wacom_wac->data, features->pktlen,
+ +			 wacom_sys_irq, wacom, endpoint->bInterval);
+ +	wacom->irq->transfer_dma = wacom->data_dma;
+ +	wacom->irq->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+  
+ -		features->device_type |= WACOM_DEVICETYPE_PEN;
+ +	error = wacom_initialize_leds(wacom);
+ +	if (error)
+ +		goto fail4;
+ +
+ +	if (!(features->quirks & WACOM_QUIRK_NO_INPUT)) {
+ +		error = wacom_register_input(wacom);
+ +		if (error)
+ +			goto fail5;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Note that if query fails it is not a hard failure */
+ +	wacom_query_tablet_data(intf, features);
+ +
+ +	usb_set_intfdata(intf, wacom);
+ +
+ +	if (features->quirks & WACOM_QUIRK_MONITOR) {
+ +		if (usb_submit_urb(wacom->irq, GFP_KERNEL)) {
+ +			error = -EIO;
+ +			goto fail5;
+ +		}
+++=======
++ 	wacom_calculate_res(features);
++ 
++ 	wacom_update_name(wacom);
++ 
++ 	error = wacom_add_shared_data(hdev);
++ 	if (error)
++ 		goto fail_shared_data;
++ 
++ 	if (!(features->device_type & WACOM_DEVICETYPE_WL_MONITOR) &&
++ 	     (features->quirks & WACOM_QUIRK_BATTERY)) {
++ 		error = wacom_initialize_battery(wacom);
++ 		if (error)
++ 			goto fail_battery;
++ 	}
++ 
++ 	error = wacom_register_inputs(wacom);
++ 	if (error)
++ 		goto fail_register_inputs;
++ 
++ 	if (hdev->bus == BUS_BLUETOOTH) {
++ 		error = device_create_file(&hdev->dev, &dev_attr_speed);
++ 		if (error)
++ 			hid_warn(hdev,
++ 				 "can't create sysfs speed attribute err: %d\n",
++ 				 error);
++ 	}
++ 
++ 	if (features->type == HID_GENERIC)
++ 		connect_mask |= HID_CONNECT_DRIVER;
++ 
++ 	/* Regular HID work starts now */
++ 	error = hid_hw_start(hdev, connect_mask);
++ 	if (error) {
++ 		hid_err(hdev, "hw start failed\n");
++ 		goto fail_hw_start;
++ 	}
++ 
++ 	/* Note that if query fails it is not a hard failure */
++ 	wacom_query_tablet_data(hdev, features);
++ 
++ 	/* touch only Bamboo doesn't support pen */
++ 	if ((features->type == BAMBOO_TOUCH) &&
++ 	    (features->device_type & WACOM_DEVICETYPE_PEN)) {
++ 		error = -ENODEV;
++ 		goto fail_hw_start;
++ 	}
++ 
++ 	/* pen only Bamboo neither support touch nor pad */
++ 	if ((features->type == BAMBOO_PEN) &&
++ 	    ((features->device_type & WACOM_DEVICETYPE_TOUCH) ||
++ 	    (features->device_type & WACOM_DEVICETYPE_PAD))) {
++ 		error = -ENODEV;
++ 		goto fail_hw_start;
++ 	}
++ 
++ 	if (features->device_type & WACOM_DEVICETYPE_WL_MONITOR)
++ 		error = hid_hw_open(hdev);
++ 
++ 	if ((wacom_wac->features.type == INTUOSHT ||
++ 	    wacom_wac->features.type == INTUOSHT2) &&
++ 	    (wacom_wac->features.device_type & WACOM_DEVICETYPE_TOUCH)) {
++ 			wacom_wac->shared->touch_input = wacom_wac->touch_input;
+++>>>>>>> 86e88f0e7068 (HID: wacom: Call 'wacom_query_tablet_data' only after 'hid_hw_start')
+  	}
+  
+  	return 0;
+* Unmerged path drivers/hid/wacom_sys.c
