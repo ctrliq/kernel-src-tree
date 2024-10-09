@@ -1,0 +1,262 @@
+bpf: add support for sys_enter_* and sys_exit_* tracepoints
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Yonghong Song <yhs@fb.com>
+commit cf5f5cea270655dd49370760576c64b228583b79
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/cf5f5cea.failed
+
+Currently, bpf programs cannot be attached to sys_enter_* and sys_exit_*
+style tracepoints. The iovisor/bcc issue #748
+(https://github.com/iovisor/bcc/issues/748) documents this issue.
+For example, if you try to attach a bpf program to tracepoints
+syscalls/sys_enter_newfstat, you will get the following error:
+   # ./tools/trace.py t:syscalls:sys_enter_newfstat
+   Ioctl(PERF_EVENT_IOC_SET_BPF): Invalid argument
+   Failed to attach BPF to tracepoint
+
+The main reason is that syscalls/sys_enter_* and syscalls/sys_exit_*
+tracepoints are treated differently from other tracepoints and there
+is no bpf hook to it.
+
+This patch adds bpf support for these syscalls tracepoints by
+  . permitting bpf attachment in ioctl PERF_EVENT_IOC_SET_BPF
+  . calling bpf programs in perf_syscall_enter and perf_syscall_exit
+
+The legality of bpf program ctx access is also checked.
+Function trace_event_get_offsets returns correct max offset for each
+specific syscall tracepoint, which is compared against the maximum offset
+access in bpf program.
+
+	Signed-off-by: Yonghong Song <yhs@fb.com>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cf5f5cea270655dd49370760576c64b228583b79)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+#	kernel/trace/trace_syscalls.c
+diff --cc kernel/events/core.c
+index e490cd411934,a7a6c1d19a49..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -7739,6 -7980,133 +7739,136 @@@ static void perf_event_free_filter(stru
+  	ftrace_profile_free_filter(event);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_BPF_SYSCALL
++ static void bpf_overflow_handler(struct perf_event *event,
++ 				 struct perf_sample_data *data,
++ 				 struct pt_regs *regs)
++ {
++ 	struct bpf_perf_event_data_kern ctx = {
++ 		.data = data,
++ 		.regs = regs,
++ 	};
++ 	int ret = 0;
++ 
++ 	preempt_disable();
++ 	if (unlikely(__this_cpu_inc_return(bpf_prog_active) != 1))
++ 		goto out;
++ 	rcu_read_lock();
++ 	ret = BPF_PROG_RUN(event->prog, &ctx);
++ 	rcu_read_unlock();
++ out:
++ 	__this_cpu_dec(bpf_prog_active);
++ 	preempt_enable();
++ 	if (!ret)
++ 		return;
++ 
++ 	event->orig_overflow_handler(event, data, regs);
++ }
++ 
++ static int perf_event_set_bpf_handler(struct perf_event *event, u32 prog_fd)
++ {
++ 	struct bpf_prog *prog;
++ 
++ 	if (event->overflow_handler_context)
++ 		/* hw breakpoint or kernel counter */
++ 		return -EINVAL;
++ 
++ 	if (event->prog)
++ 		return -EEXIST;
++ 
++ 	prog = bpf_prog_get_type(prog_fd, BPF_PROG_TYPE_PERF_EVENT);
++ 	if (IS_ERR(prog))
++ 		return PTR_ERR(prog);
++ 
++ 	event->prog = prog;
++ 	event->orig_overflow_handler = READ_ONCE(event->overflow_handler);
++ 	WRITE_ONCE(event->overflow_handler, bpf_overflow_handler);
++ 	return 0;
++ }
++ 
++ static void perf_event_free_bpf_handler(struct perf_event *event)
++ {
++ 	struct bpf_prog *prog = event->prog;
++ 
++ 	if (!prog)
++ 		return;
++ 
++ 	WRITE_ONCE(event->overflow_handler, event->orig_overflow_handler);
++ 	event->prog = NULL;
++ 	bpf_prog_put(prog);
++ }
++ #else
++ static int perf_event_set_bpf_handler(struct perf_event *event, u32 prog_fd)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ static void perf_event_free_bpf_handler(struct perf_event *event)
++ {
++ }
++ #endif
++ 
++ static int perf_event_set_bpf_prog(struct perf_event *event, u32 prog_fd)
++ {
++ 	bool is_kprobe, is_tracepoint, is_syscall_tp;
++ 	struct bpf_prog *prog;
++ 
++ 	if (event->attr.type != PERF_TYPE_TRACEPOINT)
++ 		return perf_event_set_bpf_handler(event, prog_fd);
++ 
++ 	if (event->tp_event->prog)
++ 		return -EEXIST;
++ 
++ 	is_kprobe = event->tp_event->flags & TRACE_EVENT_FL_UKPROBE;
++ 	is_tracepoint = event->tp_event->flags & TRACE_EVENT_FL_TRACEPOINT;
++ 	is_syscall_tp = is_syscall_trace_event(event->tp_event);
++ 	if (!is_kprobe && !is_tracepoint && !is_syscall_tp)
++ 		/* bpf programs can only be attached to u/kprobe or tracepoint */
++ 		return -EINVAL;
++ 
++ 	prog = bpf_prog_get(prog_fd);
++ 	if (IS_ERR(prog))
++ 		return PTR_ERR(prog);
++ 
++ 	if ((is_kprobe && prog->type != BPF_PROG_TYPE_KPROBE) ||
++ 	    (is_tracepoint && prog->type != BPF_PROG_TYPE_TRACEPOINT) ||
++ 	    (is_syscall_tp && prog->type != BPF_PROG_TYPE_TRACEPOINT)) {
++ 		/* valid fd, but invalid bpf program type */
++ 		bpf_prog_put(prog);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (is_tracepoint || is_syscall_tp) {
++ 		int off = trace_event_get_offsets(event->tp_event);
++ 
++ 		if (prog->aux->max_ctx_offset > off) {
++ 			bpf_prog_put(prog);
++ 			return -EACCES;
++ 		}
++ 	}
++ 	event->tp_event->prog = prog;
++ 
++ 	return 0;
++ }
++ 
++ static void perf_event_free_bpf_prog(struct perf_event *event)
++ {
++ 	struct bpf_prog *prog;
++ 
++ 	perf_event_free_bpf_handler(event);
++ 
++ 	if (!event->tp_event)
++ 		return;
++ 
++ 	prog = event->tp_event->prog;
++ 	if (prog) {
++ 		event->tp_event->prog = NULL;
++ 		bpf_prog_put(prog);
++ 	}
++ }
++ 
+++>>>>>>> cf5f5cea2706 (bpf: add support for sys_enter_* and sys_exit_* tracepoints)
+  #else
+  
+  static inline void perf_tp_register(void)
+diff --cc kernel/trace/trace_syscalls.c
+index 7a1e2d2a9b1a,7a1a92036563..000000000000
+--- a/kernel/trace/trace_syscalls.c
++++ b/kernel/trace/trace_syscalls.c
+@@@ -587,10 -613,19 +606,23 @@@ static void perf_syscall_enter(void *ig
+  	rec->nr = syscall_nr;
+  	syscall_get_arguments(current, regs, 0, sys_data->nb_args,
+  			       (unsigned long *)&rec->args);
+++<<<<<<< HEAD
+ +	perf_trace_buf_submit(rec, size, rctx, 0, 1, regs, head, NULL);
+++=======
++ 
++ 	if ((prog && !perf_call_bpf_enter(prog, regs, sys_data, rec)) ||
++ 	    hlist_empty(head)) {
++ 		perf_swevent_put_recursion_context(rctx);
++ 		return;
++ 	}
++ 
++ 	perf_trace_buf_submit(rec, size, rctx,
++ 			      sys_data->enter_event->event.type, 1, regs,
++ 			      head, NULL);
+++>>>>>>> cf5f5cea2706 (bpf: add support for sys_enter_* and sys_exit_* tracepoints)
+  }
+  
+ -static int perf_sysenter_enable(struct trace_event_call *call)
+ +static int perf_sysenter_enable(struct ftrace_event_call *call)
+  {
+  	int ret = 0;
+  	int num;
+@@@ -667,10 -708,18 +715,22 @@@ static void perf_syscall_exit(void *ign
+  
+  	rec->nr = syscall_nr;
+  	rec->ret = syscall_get_return_value(current, regs);
+++<<<<<<< HEAD
+ +	perf_trace_buf_submit(rec, size, rctx, 0, 1, regs, head, NULL);
+++=======
++ 
++ 	if ((prog && !perf_call_bpf_exit(prog, regs, rec)) ||
++ 	    hlist_empty(head)) {
++ 		perf_swevent_put_recursion_context(rctx);
++ 		return;
++ 	}
++ 
++ 	perf_trace_buf_submit(rec, size, rctx, sys_data->exit_event->event.type,
++ 			      1, regs, head, NULL);
+++>>>>>>> cf5f5cea2706 (bpf: add support for sys_enter_* and sys_exit_* tracepoints)
+  }
+  
+ -static int perf_sysexit_enable(struct trace_event_call *call)
+ +static int perf_sysexit_enable(struct ftrace_event_call *call)
+  {
+  	int ret = 0;
+  	int num;
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index 14a89f15b559..a98ef49aff13 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -164,8 +164,20 @@ extern struct trace_event_functions exit_syscall_print_funcs;
+ 	static struct syscall_metadata __used			\
+ 	  __attribute__((section("__syscalls_metadata")))	\
+ 	 *__p_syscall_meta_##sname = &__syscall_meta_##sname;
++
++static inline int is_syscall_trace_event(struct trace_event_call *tp_event)
++{
++	return tp_event->class == &event_class_syscall_enter ||
++	       tp_event->class == &event_class_syscall_exit;
++}
++
+ #else
+ #define SYSCALL_METADATA(sname, nb, ...)
++
++static inline int is_syscall_trace_event(struct trace_event_call *tp_event)
++{
++	return 0;
++}
+ #endif
+ 
+ #define SYSCALL_DEFINE0(sname)					\
+* Unmerged path kernel/events/core.c
+* Unmerged path kernel/trace/trace_syscalls.c
