@@ -1,0 +1,180 @@
+net_sched: introduce tcf_exts_get_net() and tcf_exts_put_net()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Cong Wang <xiyou.wangcong@gmail.com>
+commit e4b95c41df36befcfd117210900cd790bc2cd048
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e4b95c41.failed
+
+Instead of holding netns refcnt in tc actions, we can minimize
+the holding time by saving it in struct tcf_exts instead. This
+means we can just hold netns refcnt right before call_rcu() and
+release it after tcf_exts_destroy() is done.
+
+However, because on netns cleanup path we call tcf_proto_destroy()
+too, obviously we can not hold netns for a zero refcnt, in this
+case we have to do cleanup synchronously. It is fine for RCU too,
+the caller cleanup_net() already waits for a grace period.
+
+For other cases, refcnt is non-zero and we can safely grab it as
+normal and release it after we are done.
+
+This patch provides two new API for each filter to use:
+tcf_exts_get_net() and tcf_exts_put_net(). And all filters now can
+use the following pattern:
+
+void __destroy_filter() {
+  tcf_exts_destroy();
+  tcf_exts_put_net();  // <== release netns refcnt
+  kfree();
+}
+void some_work() {
+  rtnl_lock();
+  __destroy_filter();
+  rtnl_unlock();
+}
+void some_rcu_callback() {
+  tcf_queue_work(some_work);
+}
+
+if (tcf_exts_get_net())  // <== hold netns refcnt
+  call_rcu(some_rcu_callback);
+else
+  __destroy_filter();
+
+	Cc: Lucas Bates <lucasb@mojatatu.com>
+	Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+	Cc: Jiri Pirko <jiri@resnulli.us>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e4b95c41df36befcfd117210900cd790bc2cd048)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/pkt_cls.h
+diff --cc include/net/pkt_cls.h
+index db4cec05920e,8826747ef83e..000000000000
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@@ -59,7 -92,9 +59,13 @@@ tcf_unbind_filter(struct tcf_proto *tp
+  struct tcf_exts {
+  #ifdef CONFIG_NET_CLS_ACT
+  	__u32	type; /* for backward compat(TCA_OLD_COMPAT) */
+++<<<<<<< HEAD
+ +	struct list_head actions;
+++=======
++ 	int nr_actions;
++ 	struct tc_action **actions;
++ 	struct net *net;
+++>>>>>>> e4b95c41df36 (net_sched: introduce tcf_exts_get_net() and tcf_exts_put_net())
+  #endif
+  	/* Map to export classifier specific extension TLV types to the
+  	 * generic extensions API. Unsupported extensions must be set to 0.
+@@@ -72,26 -107,70 +78,92 @@@ static inline void tcf_exts_init(struc
+  {
+  #ifdef CONFIG_NET_CLS_ACT
+  	exts->type = 0;
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&exts->actions);
+++=======
++ 	exts->nr_actions = 0;
++ 	exts->net = NULL;
++ 	exts->actions = kcalloc(TCA_ACT_MAX_PRIO, sizeof(struct tc_action *),
++ 				GFP_KERNEL);
++ 	if (!exts->actions)
++ 		return -ENOMEM;
+++>>>>>>> e4b95c41df36 (net_sched: introduce tcf_exts_get_net() and tcf_exts_put_net())
+  #endif
+  	exts->action = action;
+  	exts->police = police;
+ +}
+ +
+ +/**
+ + * tcf_exts_is_predicative - check if a predicative extension is present
+ + * @exts: tc filter extensions handle
+ + *
+ + * Returns 1 if a predicative extension is present, i.e. an extension which
+ + * might cause further actions and thus overrule the regular tcf_result.
+ + */
+ +static inline int
+ +tcf_exts_is_predicative(struct tcf_exts *exts)
+ +{
+ +#ifdef CONFIG_NET_CLS_ACT
+ +	return !list_empty(&exts->actions);
+ +#else
+  	return 0;
+++<<<<<<< HEAD
+++=======
++ }
++ 
++ /* Return false if the netns is being destroyed in cleanup_net(). Callers
++  * need to do cleanup synchronously in this case, otherwise may race with
++  * tc_action_net_exit(). Return true for other cases.
++  */
++ static inline bool tcf_exts_get_net(struct tcf_exts *exts)
++ {
++ #ifdef CONFIG_NET_CLS_ACT
++ 	exts->net = maybe_get_net(exts->net);
++ 	return exts->net != NULL;
++ #else
++ 	return true;
++ #endif
++ }
++ 
++ static inline void tcf_exts_put_net(struct tcf_exts *exts)
++ {
++ #ifdef CONFIG_NET_CLS_ACT
++ 	if (exts->net)
++ 		put_net(exts->net);
++ #endif
++ }
++ 
++ static inline void tcf_exts_to_list(const struct tcf_exts *exts,
++ 				    struct list_head *actions)
++ {
++ #ifdef CONFIG_NET_CLS_ACT
++ 	int i;
++ 
++ 	for (i = 0; i < exts->nr_actions; i++) {
++ 		struct tc_action *a = exts->actions[i];
++ 
++ 		list_add_tail(&a->list, actions);
++ 	}
++ #endif
++ }
++ 
++ static inline void
++ tcf_exts_stats_update(const struct tcf_exts *exts,
++ 		      u64 bytes, u64 packets, u64 lastuse)
++ {
++ #ifdef CONFIG_NET_CLS_ACT
++ 	int i;
++ 
++ 	preempt_disable();
++ 
++ 	for (i = 0; i < exts->nr_actions; i++) {
++ 		struct tc_action *a = exts->actions[i];
++ 
++ 		tcf_action_stats_update(a, bytes, packets, lastuse);
++ 	}
++ 
++ 	preempt_enable();
+++>>>>>>> e4b95c41df36 (net_sched: introduce tcf_exts_get_net() and tcf_exts_put_net())
+  #endif
+  }
+  
+* Unmerged path include/net/pkt_cls.h
+diff --git a/net/sched/cls_api.c b/net/sched/cls_api.c
+index 1dc6d123ed94..1ee508f3f0e6 100644
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -578,6 +578,7 @@ int tcf_exts_validate(struct net *net, struct tcf_proto *tp, struct nlattr **tb,
+ 			if (err)
+ 				return err;
+ 		}
++		exts->net = net;
+ 	}
+ #else
+ 	if ((exts->action && tb[exts->action]) ||
