@@ -1,0 +1,292 @@
+sl[au]b: charge slabs to kmemcg explicitly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+Rebuild_CHGLOG: - [mm] slb: charge slabs to kmemcg explicitly (Aristeu Rozanski) [1649189 1507149]
+Rebuild_FUZZ: 95.00%
+commit-author Vladimir Davydov <vdavydov@parallels.com>
+commit 5dfb417509921eb90ee123a4d1525e8916b4ace4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/5dfb4175.failed
+
+We have only a few places where we actually want to charge kmem so
+instead of intruding into the general page allocation path with
+__GFP_KMEMCG it's better to explictly charge kmem there.  All kmem
+charges will be easier to follow that way.
+
+This is a step towards removing __GFP_KMEMCG.  It removes __GFP_KMEMCG
+from memcg caches' allocflags.  Instead it makes slab allocation path
+call memcg_charge_kmem directly getting memcg to charge from the cache's
+memcg params.
+
+This also eliminates any possibility of misaccounting an allocation
+going from one memcg's cache to another memcg, because now we always
+charge slabs against the memcg the cache belongs to.  That's why this
+patch removes the big comment to memcg_kmem_get_cache.
+
+	Signed-off-by: Vladimir Davydov <vdavydov@parallels.com>
+	Acked-by: Greg Thelen <gthelen@google.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Acked-by: Michal Hocko <mhocko@suse.cz>
+	Cc: Glauber Costa <glommer@gmail.com>
+	Cc: Christoph Lameter <cl@linux-foundation.org>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 5dfb417509921eb90ee123a4d1525e8916b4ace4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+#	mm/slab.c
+#	mm/slab_common.c
+#	mm/slub.c
+diff --cc mm/memcontrol.c
+index 16fe5606ed59,56a768b3d5a8..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -3043,29 -2953,20 +3043,33 @@@ static int mem_cgroup_slabinfo_read(str
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +static int memcg_charge_kmem(struct mem_cgroup *memcg, gfp_t gfp,
+ +			     unsigned long nr_pages)
+++=======
++ int memcg_charge_kmem(struct mem_cgroup *memcg, gfp_t gfp, u64 size)
+++>>>>>>> 5dfb41750992 (sl[au]b: charge slabs to kmemcg explicitly)
+  {
+ -	struct res_counter *fail_res;
+ +	struct page_counter *counter;
+ +	struct mem_cgroup *_memcg;
+  	int ret = 0;
+ +	bool may_oom;
+  
+ -	ret = res_counter_charge(&memcg->kmem, size, &fail_res);
+ -	if (ret)
+ -		return ret;
+ +	if (!page_counter_try_charge(&memcg->kmem, nr_pages, &counter))
+ +		return -ENOMEM;
+ +
+ +	/*
+ +	 * Conditions under which we can wait for the oom_killer. Those are
+ +	 * the same conditions tested by the core page allocator
+ +	 */
+ +	may_oom = (gfp & __GFP_FS) && !(gfp & __GFP_NORETRY);
+ +
+ +	_memcg = memcg;
+ +	ret = __mem_cgroup_try_charge(NULL, gfp, nr_pages, &_memcg, may_oom);
+  
+ -	ret = mem_cgroup_try_charge(memcg, gfp, size >> PAGE_SHIFT,
+ -				    oom_gfp_allowed(gfp));
+  	if (ret == -EINTR)  {
+  		/*
+ -		 * mem_cgroup_try_charge() chosed to bypass to root due to
+ +		 * __mem_cgroup_try_charge() chosed to bypass to root due to
+  		 * OOM kill or fatal signal.  Since our only options are to
+  		 * either fail the allocation or charge it to this cgroup, do
+  		 * it as a temporary condition. But we can't fail. From a
+@@@ -3089,19 -2991,26 +3093,23 @@@
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static void memcg_uncharge_kmem(struct mem_cgroup *memcg,
+ +				unsigned long nr_pages)
+++=======
++ void memcg_uncharge_kmem(struct mem_cgroup *memcg, u64 size)
+++>>>>>>> 5dfb41750992 (sl[au]b: charge slabs to kmemcg explicitly)
+  {
+ -	res_counter_uncharge(&memcg->res, size);
+ +	page_counter_uncharge(&memcg->memory, nr_pages);
+  	if (do_swap_account)
+ -		res_counter_uncharge(&memcg->memsw, size);
+ +		page_counter_uncharge(&memcg->memsw, nr_pages);
+  
+  	/* Not down to 0 */
+ -	if (res_counter_uncharge(&memcg->kmem, size))
+ +	if (page_counter_uncharge(&memcg->kmem, nr_pages))
+  		return;
+  
+ -	/*
+ -	 * Releases a reference taken in kmem_cgroup_css_offline in case
+ -	 * this last uncharge is racing with the offlining code or it is
+ -	 * outliving the memcg existence.
+ -	 *
+ -	 * The memory barrier imposed by test&clear is paired with the
+ -	 * explicit one in memcg_kmem_mark_dead().
+ -	 */
+  	if (memcg_kmem_test_and_clear_dead(memcg))
+ -		css_put(&memcg->css);
+ +		mem_cgroup_put(memcg);
+  }
+  
+  /*
+diff --cc mm/slab.c
+index 0a4735511ea7,944ac58cfcf8..000000000000
+--- a/mm/slab.c
++++ b/mm/slab.c
+@@@ -1743,10 -1688,13 +1743,18 @@@ static void *kmem_getpages(struct kmem_
+  	if (cachep->flags & SLAB_RECLAIM_ACCOUNT)
+  		flags |= __GFP_RECLAIMABLE;
+  
++ 	if (memcg_charge_slab(cachep, flags, cachep->gfporder))
++ 		return NULL;
++ 
+  	page = alloc_pages_exact_node(nodeid, flags | __GFP_NOTRACK, cachep->gfporder);
+  	if (!page) {
+++<<<<<<< HEAD
+ +		if (!(flags & __GFP_NOWARN) && printk_ratelimit())
+ +			slab_out_of_memory(cachep, flags, nodeid);
+++=======
++ 		memcg_uncharge_slab(cachep, cachep->gfporder);
++ 		slab_out_of_memory(cachep, flags, nodeid);
+++>>>>>>> 5dfb41750992 (sl[au]b: charge slabs to kmemcg explicitly)
+  		return NULL;
+  	}
+  
+@@@ -1808,7 -1751,8 +1816,12 @@@ static void kmem_freepages(struct kmem_
+  	memcg_release_pages(cachep, cachep->gfporder);
+  	if (current->reclaim_state)
+  		current->reclaim_state->reclaimed_slab += nr_freed;
+++<<<<<<< HEAD
+ +	free_memcg_kmem_pages((unsigned long)addr, cachep->gfporder);
+++=======
++ 	__free_pages(page, cachep->gfporder);
++ 	memcg_uncharge_slab(cachep, cachep->gfporder);
+++>>>>>>> 5dfb41750992 (sl[au]b: charge slabs to kmemcg explicitly)
+  }
+  
+  static void kmem_rcu_free(struct rcu_head *head)
+diff --cc mm/slab_common.c
+index 288b69b9b33e,06f0c6125632..000000000000
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@@ -323,13 -290,8 +323,16 @@@ struct kmem_cache *kmem_cache_create_me
+  				 root_cache->size, root_cache->align,
+  				 root_cache->flags, root_cache->ctor,
+  				 memcg, root_cache);
+- 	if (IS_ERR(s)) {
++ 	if (IS_ERR(s))
+  		kfree(cache_name);
+++<<<<<<< HEAD
+ +		s = NULL;
+ +		goto out_unlock;
+ +	}
+ +
+ +	s->allocflags |= __GFP_KMEMCG;
+++=======
+++>>>>>>> 5dfb41750992 (sl[au]b: charge slabs to kmemcg explicitly)
+  
+  out_unlock:
+  	mutex_unlock(&slab_mutex);
+diff --cc mm/slub.c
+index cfd46f5b97ec,fc9831851be6..000000000000
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@@ -1461,14 -1353,15 +1470,18 @@@ static struct page *allocate_slab(struc
+  	 */
+  	alloc_gfp = (flags | __GFP_NOWARN | __GFP_NORETRY) & ~__GFP_NOFAIL;
+  
+- 	page = alloc_slab_page(alloc_gfp, node, oo);
++ 	page = alloc_slab_page(s, alloc_gfp, node, oo);
+  	if (unlikely(!page)) {
+  		oo = s->min;
+ -		alloc_gfp = flags;
+  		/*
+  		 * Allocation may have failed due to fragmentation.
+  		 * Try a lower order alloc if possible
+  		 */
+++<<<<<<< HEAD
+ +		page = alloc_slab_page(flags, node, oo);
+++=======
++ 		page = alloc_slab_page(s, alloc_gfp, node, oo);
+++>>>>>>> 5dfb41750992 (sl[au]b: charge slabs to kmemcg explicitly)
+  
+  		if (page)
+  			stat(s, ORDER_FALLBACK);
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index 1494b9982667..490cb400ddd2 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -497,6 +497,9 @@ void memcg_update_array_size(int num_groups);
+ struct kmem_cache *
+ __memcg_kmem_get_cache(struct kmem_cache *cachep, gfp_t gfp);
+ 
++int memcg_charge_kmem(struct mem_cgroup *memcg, gfp_t gfp, u64 size);
++void memcg_uncharge_kmem(struct mem_cgroup *memcg, u64 size);
++
+ void mem_cgroup_destroy_cache(struct kmem_cache *cachep);
+ int __kmem_cache_destroy_memcg_children(struct kmem_cache *s);
+ 
+@@ -573,17 +576,7 @@ memcg_kmem_commit_charge(struct page *page, struct mem_cgroup *memcg, int order)
+  * @cachep: the original global kmem cache
+  * @gfp: allocation flags.
+  *
+- * This function assumes that the task allocating, which determines the memcg
+- * in the page allocator, belongs to the same cgroup throughout the whole
+- * process.  Misacounting can happen if the task calls memcg_kmem_get_cache()
+- * while belonging to a cgroup, and later on changes. This is considered
+- * acceptable, and should only happen upon task migration.
+- *
+- * Before the cache is created by the memcg core, there is also a possible
+- * imbalance: the task belongs to a memcg, but the cache being allocated from
+- * is the global cache, since the child cache is not yet guaranteed to be
+- * ready. This case is also fine, since in this case the GFP_KMEMCG will not be
+- * passed and the page allocator will not attempt any cgroup accounting.
++ * All memory allocated from a per-memcg cache is charged to the owner memcg.
+  */
+ static __always_inline struct kmem_cache *
+ memcg_kmem_get_cache(struct kmem_cache *cachep, gfp_t gfp)
+* Unmerged path mm/memcontrol.c
+* Unmerged path mm/slab.c
+diff --git a/mm/slab.h b/mm/slab.h
+index 229f59086a96..f6cbf7c8d2ad 100644
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@ -197,6 +197,26 @@ static inline struct kmem_cache *memcg_root_cache(struct kmem_cache *s)
+ 		return s;
+ 	return s->memcg_params->root_cache;
+ }
++
++static __always_inline int memcg_charge_slab(struct kmem_cache *s,
++					     gfp_t gfp, int order)
++{
++	if (!memcg_kmem_enabled())
++		return 0;
++	if (is_root_cache(s))
++		return 0;
++	return memcg_charge_kmem(s->memcg_params->memcg, gfp,
++				 PAGE_SIZE << order);
++}
++
++static __always_inline void memcg_uncharge_slab(struct kmem_cache *s, int order)
++{
++	if (!memcg_kmem_enabled())
++		return;
++	if (is_root_cache(s))
++		return;
++	memcg_uncharge_kmem(s->memcg_params->memcg, PAGE_SIZE << order);
++}
+ #else
+ static inline bool is_root_cache(struct kmem_cache *s)
+ {
+@@ -232,6 +252,15 @@ static inline struct kmem_cache *memcg_root_cache(struct kmem_cache *s)
+ {
+ 	return s;
+ }
++
++static inline int memcg_charge_slab(struct kmem_cache *s, gfp_t gfp, int order)
++{
++	return 0;
++}
++
++static inline void memcg_uncharge_slab(struct kmem_cache *s, int order)
++{
++}
+ #endif
+ 
+ static inline struct kmem_cache *cache_from_obj(struct kmem_cache *s, void *x)
+* Unmerged path mm/slab_common.c
+* Unmerged path mm/slub.c
