@@ -1,0 +1,175 @@
+vxlan: restore dev->mtu setting based on lower device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Alexey Kodanev <alexey.kodanev@oracle.com>
+commit f870c1ff65a6d1f3a083f277280802ee09a5b44d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f870c1ff.failed
+
+Stefano Brivio says:
+    Commit a985343ba906 ("vxlan: refactor verification and
+    application of configuration") introduced a change in the
+    behaviour of initial MTU setting: earlier, the MTU for a link
+    created on top of a given lower device, without an initial MTU
+    specification, was set to the MTU of the lower device minus
+    headroom as a result of this path in vxlan_dev_configure():
+
+	if (!conf->mtu)
+		dev->mtu = lowerdev->mtu -
+			   (use_ipv6 ? VXLAN6_HEADROOM : VXLAN_HEADROOM);
+
+    which is now gone. Now, the initial MTU, in absence of a
+    configured value, is simply set by ether_setup() to ETH_DATA_LEN
+    (1500 bytes).
+
+    This breaks userspace expectations in case the MTU of
+    the lower device is higher than 1500 bytes minus headroom.
+
+This patch restores the previous behaviour on newlink operation. Since
+max_mtu can be negative and we update dev->mtu directly, also check it
+for valid minimum.
+
+	Reported-by: Junhan Yan <juyan@redhat.com>
+Fixes: a985343ba906 ("vxlan: refactor verification and application of configuration")
+	Signed-off-by: Alexey Kodanev <alexey.kodanev@oracle.com>
+	Acked-by: Stefano Brivio <sbrivio@redhat.com>
+	Signed-off-by: Stefano Brivio <sbrivio@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f870c1ff65a6d1f3a083f277280802ee09a5b44d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+diff --cc drivers/net/vxlan.c
+index 946830c7f53c,1000b0e4ee01..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -2838,25 -3011,107 +2838,36 @@@ static int vxlan_dev_configure(struct n
+  		}
+  #endif
+  
+ -		*lower = lowerdev;
+ -	} else {
+ -		if (vxlan_addr_multicast(&conf->remote_ip)) {
+ -			NL_SET_ERR_MSG(extack,
+ -				       "Local interface required for multicast remote destination");
+ -
+ -			return -EINVAL;
+ -		}
+ -
+ -#if IS_ENABLED(CONFIG_IPV6)
+ -		if (conf->flags & VXLAN_F_IPV6_LINKLOCAL) {
+ -			NL_SET_ERR_MSG(extack,
+ -				       "Local interface required for link-local local/remote addresses");
+ -			return -EINVAL;
+ -		}
+ -#endif
+ -
+ -		*lower = NULL;
+ -	}
+ -
+ -	if (!conf->dst_port) {
+ -		if (conf->flags & VXLAN_F_GPE)
+ -			conf->dst_port = htons(4790); /* IANA VXLAN-GPE port */
+ -		else
+ -			conf->dst_port = htons(vxlan_port);
+ -	}
+ -
+ -	if (!conf->age_interval)
+ -		conf->age_interval = FDB_AGE_DEFAULT;
+ -
+ -	list_for_each_entry(tmp, &vn->vxlan_list, next) {
+ -		if (tmp == old)
+ -			continue;
+ -
+ -		if (tmp->cfg.vni != conf->vni)
+ -			continue;
+ -		if (tmp->cfg.dst_port != conf->dst_port)
+ -			continue;
+ -		if ((tmp->cfg.flags & (VXLAN_F_RCV_FLAGS | VXLAN_F_IPV6)) !=
+ -		    (conf->flags & (VXLAN_F_RCV_FLAGS | VXLAN_F_IPV6)))
+ -			continue;
+ -
+ -		if ((conf->flags & VXLAN_F_IPV6_LINKLOCAL) &&
+ -		    tmp->cfg.remote_ifindex != conf->remote_ifindex)
+ -			continue;
+ -
+ -		NL_SET_ERR_MSG(extack,
+ -			       "A VXLAN device with the specified VNI already exists");
+ -		return -EEXIST;
+ -	}
+ -
+ -	return 0;
+ -}
+ -
+ -static void vxlan_config_apply(struct net_device *dev,
+ -			       struct vxlan_config *conf,
+ -			       struct net_device *lowerdev,
+ -			       struct net *src_net,
+ -			       bool changelink)
+ -{
+ -	struct vxlan_dev *vxlan = netdev_priv(dev);
+ -	struct vxlan_rdst *dst = &vxlan->default_dst;
+ -	unsigned short needed_headroom = ETH_HLEN;
+ -	bool use_ipv6 = !!(conf->flags & VXLAN_F_IPV6);
+ -	int max_mtu = ETH_MAX_MTU;
+ -
+ -	if (!changelink) {
+ -		if (conf->flags & VXLAN_F_GPE)
+ -			vxlan_raw_setup(dev);
+ -		else
+ -			vxlan_ether_setup(dev);
+ -
+ -		if (conf->mtu)
+ -			dev->mtu = conf->mtu;
+ -
+ -		vxlan->net = src_net;
+ -	}
+ -
+ -	dst->remote_vni = conf->vni;
+ -
+ -	memcpy(&dst->remote_ip, &conf->remote_ip, sizeof(conf->remote_ip));
+ -
+ -	if (lowerdev) {
+ -		dst->remote_ifindex = conf->remote_ifindex;
+ -
+ -		dev->gso_max_size = lowerdev->gso_max_size;
+ -		dev->gso_max_segs = lowerdev->gso_max_segs;
+ +		if (!conf->mtu)
+ +			dev->mtu = lowerdev->mtu - (use_ipv6 ? VXLAN6_HEADROOM : VXLAN_HEADROOM);
+  
+  		needed_headroom = lowerdev->hard_header_len;
+++<<<<<<< HEAD
+ +	} else if (vxlan_addr_multicast(&dst->remote_ip)) {
+ +		pr_info("multicast destination requires interface to be specified\n");
+ +		return -EINVAL;
+++=======
++ 
++ 		max_mtu = lowerdev->mtu - (use_ipv6 ? VXLAN6_HEADROOM :
++ 					   VXLAN_HEADROOM);
++ 		if (max_mtu < ETH_MIN_MTU)
++ 			max_mtu = ETH_MIN_MTU;
++ 
++ 		if (!changelink && !conf->mtu)
++ 			dev->mtu = max_mtu;
+++>>>>>>> f870c1ff65a6 (vxlan: restore dev->mtu setting based on lower device)
+ +	}
+ +
+ +	if (lowerdev) {
+ +		dev->gso_max_size = lowerdev->gso_max_size;
+ +		dev->gso_max_segs = lowerdev->gso_max_segs;
+  	}
+  
+ -	if (dev->mtu > max_mtu)
+ -		dev->mtu = max_mtu;
+ +	if (conf->mtu) {
+ +		err = __vxlan_change_mtu(dev, lowerdev, dst, conf->mtu, false);
+ +		if (err)
+ +			return err;
+ +	}
+  
+  	if (use_ipv6 || conf->flags & VXLAN_F_COLLECT_METADATA)
+  		needed_headroom += VXLAN6_HEADROOM;
+* Unmerged path drivers/net/vxlan.c
