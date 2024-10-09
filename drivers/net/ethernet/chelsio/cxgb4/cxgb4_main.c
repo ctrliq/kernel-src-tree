@@ -4902,6 +4902,16 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 		goto out_free_adapter;
 	}
 
+	adapter->mbox_log = kzalloc(sizeof(*adapter->mbox_log) +
+				    (sizeof(struct mbox_cmd) *
+				     T4_OS_LOG_MBOX_CMDS),
+				    GFP_KERNEL);
+	if (!adapter->mbox_log) {
+		err = -ENOMEM;
+		goto out_free_adapter;
+	}
+	adapter->mbox_log->size = T4_OS_LOG_MBOX_CMDS;
+
 	/* PCI device has been enabled */
 	adapter->flags |= DEV_ENABLED;
 
@@ -5159,6 +5169,7 @@ sriov:
 	if (adapter->workq)
 		destroy_workqueue(adapter->workq);
 
+	kfree(adapter->mbox_log);
 	kfree(adapter);
  out_unmap_bar0:
 	iounmap(regs);
@@ -5225,6 +5236,7 @@ static void remove_one(struct pci_dev *pdev)
 			adapter->flags &= ~DEV_ENABLED;
 		}
 		pci_release_regions(pdev);
+		kfree(adapter->mbox_log);
 		synchronize_rcu();
 		kfree(adapter);
 	} else
