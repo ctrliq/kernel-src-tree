@@ -1,0 +1,207 @@
+block: rename blk_mq_freeze_queue_start()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [block] rename blk_mq_freeze_queue_start() (Ming Lei) [1445595]
+Rebuild_FUZZ: 90.67%
+commit-author Ming Lei <tom.leiming@gmail.com>
+commit 1671d522cdd9933dee7dddfcf9f62c561283824a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1671d522.failed
+
+As the .q_usage_counter is used by both legacy and
+mq path, we need to block new I/O if queue becomes
+dead in blk_queue_enter().
+
+So rename it and we can use this function in both
+paths.
+
+	Reviewed-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Ming Lei <tom.leiming@gmail.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 1671d522cdd9933dee7dddfcf9f62c561283824a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+#	drivers/nvme/host/core.c
+#	include/linux/blk-mq.h
+diff --cc block/blk-mq.c
+index 7fe295c51eb5,0ed00eca4d5a..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -73,12 -65,10 +73,12 @@@ static void blk_mq_hctx_mark_pending(st
+  static void blk_mq_hctx_clear_pending(struct blk_mq_hw_ctx *hctx,
+  				      struct blk_mq_ctx *ctx)
+  {
+ -	sbitmap_clear_bit(&hctx->ctx_map, ctx->index_hw);
+ +	struct blk_align_bitmap *bm = get_bm(hctx, ctx);
+ +
+ +	clear_bit(CTX_TO_BIT(hctx, ctx), &bm->word);
+  }
+  
+- void blk_mq_freeze_queue_start(struct request_queue *q)
++ void blk_freeze_queue_start(struct request_queue *q)
+  {
+  	int freeze_depth;
+  
+@@@ -88,9 -78,9 +88,9 @@@
+  		blk_mq_run_hw_queues(q, false);
+  	}
+  }
+- EXPORT_SYMBOL_GPL(blk_mq_freeze_queue_start);
++ EXPORT_SYMBOL_GPL(blk_freeze_queue_start);
+  
+ -void blk_mq_freeze_queue_wait(struct request_queue *q)
+ +static void blk_mq_freeze_queue_wait(struct request_queue *q)
+  {
+  	wait_event(q->mq_freeze_wq, percpu_ref_is_zero(&q->q_usage_counter));
+  }
+@@@ -2188,19 -2376,12 +2188,24 @@@ static int blk_mq_queue_reinit_notify(s
+  	 * take place in parallel.
+  	 */
+  	list_for_each_entry(q, &all_q_list, all_q_node)
+++<<<<<<< HEAD
+ +		blk_mq_freeze_queue_start(q);
+ +	list_for_each_entry(q, &all_q_list, all_q_node) {
+++=======
++ 		blk_freeze_queue_start(q);
++ 	list_for_each_entry(q, &all_q_list, all_q_node)
+++>>>>>>> 1671d522cdd9 (block: rename blk_mq_freeze_queue_start())
+  		blk_mq_freeze_queue_wait(q);
+  
+ +		/*
+ +		 * timeout handler can't touch hw queue during the
+ +		 * reinitialization
+ +		 */
+ +		del_timer_sync(&q->timeout);
+ +	}
+ +
+  	list_for_each_entry(q, &all_q_list, all_q_node)
+ -		blk_mq_queue_reinit(q, &cpuhp_online_new);
+ +		blk_mq_queue_reinit(q, &online_new);
+  
+  	list_for_each_entry(q, &all_q_list, all_q_node)
+  		blk_mq_unfreeze_queue(q);
+diff --cc drivers/nvme/host/core.c
+index 0588703d149f,4a6d7f408769..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -1523,11 -2339,57 +1523,62 @@@ void nvme_kill_queues(struct nvme_ctrl 
+  		blk_set_queue_dying(ns->queue);
+  		blk_mq_abort_requeue_list(ns->queue);
+  		blk_mq_start_stopped_hw_queues(ns->queue, true);
+ +
+ +		nvme_put_ns(ns);
+  	}
+ -	mutex_unlock(&ctrl->namespaces_mutex);
+ +	rcu_read_unlock();
+  }
+++<<<<<<< HEAD
+++=======
++ EXPORT_SYMBOL_GPL(nvme_kill_queues);
++ 
++ void nvme_unfreeze(struct nvme_ctrl *ctrl)
++ {
++ 	struct nvme_ns *ns;
++ 
++ 	mutex_lock(&ctrl->namespaces_mutex);
++ 	list_for_each_entry(ns, &ctrl->namespaces, list)
++ 		blk_mq_unfreeze_queue(ns->queue);
++ 	mutex_unlock(&ctrl->namespaces_mutex);
++ }
++ EXPORT_SYMBOL_GPL(nvme_unfreeze);
++ 
++ void nvme_wait_freeze_timeout(struct nvme_ctrl *ctrl, long timeout)
++ {
++ 	struct nvme_ns *ns;
++ 
++ 	mutex_lock(&ctrl->namespaces_mutex);
++ 	list_for_each_entry(ns, &ctrl->namespaces, list) {
++ 		timeout = blk_mq_freeze_queue_wait_timeout(ns->queue, timeout);
++ 		if (timeout <= 0)
++ 			break;
++ 	}
++ 	mutex_unlock(&ctrl->namespaces_mutex);
++ }
++ EXPORT_SYMBOL_GPL(nvme_wait_freeze_timeout);
++ 
++ void nvme_wait_freeze(struct nvme_ctrl *ctrl)
++ {
++ 	struct nvme_ns *ns;
++ 
++ 	mutex_lock(&ctrl->namespaces_mutex);
++ 	list_for_each_entry(ns, &ctrl->namespaces, list)
++ 		blk_mq_freeze_queue_wait(ns->queue);
++ 	mutex_unlock(&ctrl->namespaces_mutex);
++ }
++ EXPORT_SYMBOL_GPL(nvme_wait_freeze);
++ 
++ void nvme_start_freeze(struct nvme_ctrl *ctrl)
++ {
++ 	struct nvme_ns *ns;
++ 
++ 	mutex_lock(&ctrl->namespaces_mutex);
++ 	list_for_each_entry(ns, &ctrl->namespaces, list)
++ 		blk_freeze_queue_start(ns->queue);
++ 	mutex_unlock(&ctrl->namespaces_mutex);
++ }
++ EXPORT_SYMBOL_GPL(nvme_start_freeze);
+++>>>>>>> 1671d522cdd9 (block: rename blk_mq_freeze_queue_start())
+  
+  void nvme_stop_queues(struct nvme_ctrl *ctrl)
+  {
+diff --cc include/linux/blk-mq.h
+index ff3334170322,ea2e9dcd3aef..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -271,8 -243,13 +271,16 @@@ void blk_mq_tagset_busy_iter(struct blk
+  		busy_tag_iter_fn *fn, void *priv);
+  void blk_mq_freeze_queue(struct request_queue *q);
+  void blk_mq_unfreeze_queue(struct request_queue *q);
+++<<<<<<< HEAD
+ +void blk_mq_freeze_queue_start(struct request_queue *q);
+++=======
++ void blk_freeze_queue_start(struct request_queue *q);
++ void blk_mq_freeze_queue_wait(struct request_queue *q);
++ int blk_mq_freeze_queue_wait_timeout(struct request_queue *q,
++ 				     unsigned long timeout);
++ int blk_mq_reinit_tagset(struct blk_mq_tag_set *set);
+++>>>>>>> 1671d522cdd9 (block: rename blk_mq_freeze_queue_start())
+  
+ -int blk_mq_map_queues(struct blk_mq_tag_set *set);
+  void blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set, int nr_hw_queues);
+  
+  /*
+diff --git a/block/blk-core.c b/block/blk-core.c
+index fa3e780d0399..a2cfcf0dc70a 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -614,7 +614,7 @@ int blk_queue_enter(struct request_queue *q, gfp_t gfp)
+ 			return -EBUSY;
+ 
+ 		/*
+-		 * read pair of barrier in blk_mq_freeze_queue_start(),
++		 * read pair of barrier in blk_freeze_queue_start(),
+ 		 * we need to order reading __PERCPU_REF_DEAD flag of
+ 		 * .q_usage_counter and reading .mq_freeze_depth,
+ 		 * otherwise the following wait may never return if the
+* Unmerged path block/blk-mq.c
+diff --git a/drivers/block/mtip32xx/mtip32xx.c b/drivers/block/mtip32xx/mtip32xx.c
+index 0ac1aff3e74e..6041f18d9ba4 100644
+--- a/drivers/block/mtip32xx/mtip32xx.c
++++ b/drivers/block/mtip32xx/mtip32xx.c
+@@ -4171,7 +4171,7 @@ static int mtip_block_remove(struct driver_data *dd)
+ 		dev_info(&dd->pdev->dev, "device %s surprise removal\n",
+ 						dd->disk->disk_name);
+ 
+-	blk_mq_freeze_queue_start(dd->queue);
++	blk_freeze_queue_start(dd->queue);
+ 	blk_mq_stop_hw_queues(dd->queue);
+ 	blk_mq_tagset_busy_iter(&dd->tags, mtip_no_dev_cleanup, dd);
+ 
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path include/linux/blk-mq.h
