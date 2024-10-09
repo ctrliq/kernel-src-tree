@@ -1,0 +1,344 @@
+xfs: use rhashtable to track buffer cache
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Lucas Stach <dev@lynxeye.de>
+commit 6031e73a5b3f85ec45cac08ef90995b2d3f941c7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/6031e73a.failed
+
+On filesystems with a lot of metadata and in metadata intensive workloads
+xfs_buf_find() is showing up at the top of the CPU cycles trace. Most of
+the CPU time is spent on CPU cache misses while traversing the rbtree.
+
+As the buffer cache does not need any kind of ordering, but fast lookups
+a hashtable is the natural data structure to use. The rhashtable
+infrastructure provides a self-scaling hashtable implementation and
+allows lookups to proceed while the table is going through a resize
+operation.
+
+This reduces the CPU-time spent for the lookups to 1/3 even for small
+filesystems with a relatively small number of cached buffers, with
+possibly much larger gains on higher loaded filesystems.
+
+[dchinner: reduce minimum hash size to an acceptable size for large
+	   filesystems with many AGs with no active use.]
+[dchinner: remove stale rbtree asserts.]
+[dchinner: use xfs_buf_map for compare function argument.]
+[dchinner: make functions static.]
+[dchinner: remove redundant comments.]
+
+	Signed-off-by: Lucas Stach <dev@lynxeye.de>
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit 6031e73a5b3f85ec45cac08ef90995b2d3f941c7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_mount.h
+diff --cc fs/xfs/xfs_mount.h
+index 364cc3b0b7a2,84f785218907..000000000000
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@@ -373,8 -399,34 +373,29 @@@ typedef struct xfs_perag 
+  	/* for rcu-safe freeing */
+  	struct rcu_head	rcu_head;
+  	int		pagb_count;	/* pagb slots in use */
+ -
+ -	/* Blocks reserved for all kinds of metadata. */
+ -	struct xfs_ag_resv	pag_meta_resv;
+ -	/* Blocks reserved for just AGFL-based metadata. */
+ -	struct xfs_ag_resv	pag_agfl_resv;
+ -
+ -	/* reference count */
+ -	__uint8_t		pagf_refcount_level;
+  } xfs_perag_t;
+  
+++<<<<<<< HEAD
+++=======
++ static inline struct xfs_ag_resv *
++ xfs_perag_resv(
++ 	struct xfs_perag	*pag,
++ 	enum xfs_ag_resv_type	type)
++ {
++ 	switch (type) {
++ 	case XFS_AG_RESV_METADATA:
++ 		return &pag->pag_meta_resv;
++ 	case XFS_AG_RESV_AGFL:
++ 		return &pag->pag_agfl_resv;
++ 	default:
++ 		return NULL;
++ 	}
++ }
++ 
++ int xfs_buf_hash_init(xfs_perag_t *pag);
++ void xfs_buf_hash_destroy(xfs_perag_t *pag);
++ 
+++>>>>>>> 6031e73a5b3f (xfs: use rhashtable to track buffer cache)
+  extern void	xfs_uuid_table_free(void);
+  extern int	xfs_log_sbcount(xfs_mount_t *);
+  extern __uint64_t xfs_default_resblks(xfs_mount_t *mp);
+diff --git a/fs/xfs/xfs_buf.c b/fs/xfs/xfs_buf.c
+index caac883b37e3..77aeab3f15fb 100644
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@ -289,7 +289,6 @@ _xfs_buf_alloc(
+ 	init_completion(&bp->b_iowait);
+ 	INIT_LIST_HEAD(&bp->b_lru);
+ 	INIT_LIST_HEAD(&bp->b_list);
+-	RB_CLEAR_NODE(&bp->b_rbnode);
+ 	sema_init(&bp->b_sema, 0); /* held, no waiters */
+ 	spin_lock_init(&bp->b_lock);
+ 	XB_SET_OWNER(bp);
+@@ -544,6 +543,62 @@ _xfs_buf_map_pages(
+ /*
+  *	Finding and Reading Buffers
+  */
++static int
++_xfs_buf_obj_cmp(
++	struct rhashtable_compare_arg	*arg,
++	const void			*obj)
++{
++	const struct xfs_buf_map	*map = arg->key;
++	const struct xfs_buf		*bp = obj;
++
++	/*
++	 * The key hashing in the lookup path depends on the key being the
++	 * first element of the compare_arg, make sure to assert this.
++	 */
++	BUILD_BUG_ON(offsetof(struct xfs_buf_map, bm_bn) != 0);
++
++	if (bp->b_bn != map->bm_bn)
++		return 1;
++
++	if (unlikely(bp->b_length != map->bm_len)) {
++		/*
++		 * found a block number match. If the range doesn't
++		 * match, the only way this is allowed is if the buffer
++		 * in the cache is stale and the transaction that made
++		 * it stale has not yet committed. i.e. we are
++		 * reallocating a busy extent. Skip this buffer and
++		 * continue searching for an exact match.
++		 */
++		ASSERT(bp->b_flags & XBF_STALE);
++		return 1;
++	}
++	return 0;
++}
++
++static const struct rhashtable_params xfs_buf_hash_params = {
++	.min_size		= 32,	/* empty AGs have minimal footprint */
++	.nelem_hint		= 16,
++	.key_len		= sizeof(xfs_daddr_t),
++	.key_offset		= offsetof(struct xfs_buf, b_bn),
++	.head_offset		= offsetof(struct xfs_buf, b_rhash_head),
++	.automatic_shrinking	= true,
++	.obj_cmpfn		= _xfs_buf_obj_cmp,
++};
++
++int
++xfs_buf_hash_init(
++	struct xfs_perag	*pag)
++{
++	spin_lock_init(&pag->pag_buf_lock);
++	return rhashtable_init(&pag->pag_buf_hash, &xfs_buf_hash_params);
++}
++
++void
++xfs_buf_hash_destroy(
++	struct xfs_perag	*pag)
++{
++	rhashtable_destroy(&pag->pag_buf_hash);
++}
+ 
+ /*
+  *	Look up, and creates if absent, a lockable buffer for
+@@ -559,27 +614,24 @@ _xfs_buf_find(
+ 	xfs_buf_t		*new_bp)
+ {
+ 	struct xfs_perag	*pag;
+-	struct rb_node		**rbp;
+-	struct rb_node		*parent;
+ 	xfs_buf_t		*bp;
+-	xfs_daddr_t		blkno = map[0].bm_bn;
++	struct xfs_buf_map	cmap = { .bm_bn = map[0].bm_bn };
+ 	xfs_daddr_t		eofs;
+-	int			numblks = 0;
+ 	int			i;
+ 
+ 	for (i = 0; i < nmaps; i++)
+-		numblks += map[i].bm_len;
++		cmap.bm_len += map[i].bm_len;
+ 
+ 	/* Check for IOs smaller than the sector size / not sector aligned */
+-	ASSERT(!(BBTOB(numblks) < btp->bt_meta_sectorsize));
+-	ASSERT(!(BBTOB(blkno) & (xfs_off_t)btp->bt_meta_sectormask));
++	ASSERT(!(BBTOB(cmap.bm_len) < btp->bt_meta_sectorsize));
++	ASSERT(!(BBTOB(cmap.bm_bn) & (xfs_off_t)btp->bt_meta_sectormask));
+ 
+ 	/*
+ 	 * Corrupted block numbers can get through to here, unfortunately, so we
+ 	 * have to check that the buffer falls within the filesystem bounds.
+ 	 */
+ 	eofs = XFS_FSB_TO_BB(btp->bt_mount, btp->bt_mount->m_sb.sb_dblocks);
+-	if (blkno < 0 || blkno >= eofs) {
++	if (cmap.bm_bn < 0 || cmap.bm_bn >= eofs) {
+ 		/*
+ 		 * XXX (dgc): we should really be returning -EFSCORRUPTED here,
+ 		 * but none of the higher level infrastructure supports
+@@ -587,53 +639,29 @@ _xfs_buf_find(
+ 		 */
+ 		xfs_alert(btp->bt_mount,
+ 			  "%s: Block out of range: block 0x%llx, EOFS 0x%llx ",
+-			  __func__, blkno, eofs);
++			  __func__, cmap.bm_bn, eofs);
+ 		WARN_ON(1);
+ 		return NULL;
+ 	}
+ 
+-	/* get tree root */
+ 	pag = xfs_perag_get(btp->bt_mount,
+-				xfs_daddr_to_agno(btp->bt_mount, blkno));
++			    xfs_daddr_to_agno(btp->bt_mount, cmap.bm_bn));
+ 
+-	/* walk tree */
+ 	spin_lock(&pag->pag_buf_lock);
+-	rbp = &pag->pag_buf_tree.rb_node;
+-	parent = NULL;
+-	bp = NULL;
+-	while (*rbp) {
+-		parent = *rbp;
+-		bp = rb_entry(parent, struct xfs_buf, b_rbnode);
+-
+-		if (blkno < bp->b_bn)
+-			rbp = &(*rbp)->rb_left;
+-		else if (blkno > bp->b_bn)
+-			rbp = &(*rbp)->rb_right;
+-		else {
+-			/*
+-			 * found a block number match. If the range doesn't
+-			 * match, the only way this is allowed is if the buffer
+-			 * in the cache is stale and the transaction that made
+-			 * it stale has not yet committed. i.e. we are
+-			 * reallocating a busy extent. Skip this buffer and
+-			 * continue searching to the right for an exact match.
+-			 */
+-			if (bp->b_length != numblks) {
+-				ASSERT(bp->b_flags & XBF_STALE);
+-				rbp = &(*rbp)->rb_right;
+-				continue;
+-			}
+-			atomic_inc(&bp->b_hold);
+-			goto found;
+-		}
++	bp = rhashtable_lookup_fast(&pag->pag_buf_hash, &cmap,
++				    xfs_buf_hash_params);
++	if (bp) {
++		atomic_inc(&bp->b_hold);
++		goto found;
+ 	}
+ 
+ 	/* No match found */
+ 	if (new_bp) {
+-		rb_link_node(&new_bp->b_rbnode, parent, rbp);
+-		rb_insert_color(&new_bp->b_rbnode, &pag->pag_buf_tree);
+ 		/* the buffer keeps the perag reference until it is freed */
+ 		new_bp->b_pag = pag;
++		rhashtable_insert_fast(&pag->pag_buf_hash,
++				       &new_bp->b_rhash_head,
++				       xfs_buf_hash_params);
+ 		spin_unlock(&pag->pag_buf_lock);
+ 	} else {
+ 		XFS_STATS_INC(btp->bt_mount, xb_miss_locked);
+@@ -1001,7 +1029,6 @@ xfs_buf_rele(
+ 
+ 	if (!pag) {
+ 		ASSERT(list_empty(&bp->b_lru));
+-		ASSERT(RB_EMPTY_NODE(&bp->b_rbnode));
+ 		if (atomic_dec_and_test(&bp->b_hold)) {
+ 			xfs_buf_ioacct_dec(bp);
+ 			xfs_buf_free(bp);
+@@ -1009,8 +1036,6 @@ xfs_buf_rele(
+ 		return;
+ 	}
+ 
+-	ASSERT(!RB_EMPTY_NODE(&bp->b_rbnode));
+-
+ 	ASSERT(atomic_read(&bp->b_hold) > 0);
+ 	release = atomic_dec_and_lock(&bp->b_hold, &pag->pag_buf_lock);
+ 	spin_lock(&bp->b_lock);
+@@ -1050,7 +1075,8 @@ xfs_buf_rele(
+ 		}
+ 
+ 		ASSERT(!(bp->b_flags & _XBF_DELWRI_Q));
+-		rb_erase(&bp->b_rbnode, &pag->pag_buf_tree);
++		rhashtable_remove_fast(&pag->pag_buf_hash, &bp->b_rhash_head,
++				       xfs_buf_hash_params);
+ 		spin_unlock(&pag->pag_buf_lock);
+ 		xfs_perag_put(pag);
+ 		freebuf = true;
+diff --git a/fs/xfs/xfs_buf.h b/fs/xfs/xfs_buf.h
+index 2cfcd3873292..50b0afe08351 100644
+--- a/fs/xfs/xfs_buf.h
++++ b/fs/xfs/xfs_buf.h
+@@ -150,7 +150,7 @@ typedef struct xfs_buf {
+ 	 * which is the only bit that is touched if we hit the semaphore
+ 	 * fast-path on locking.
+ 	 */
+-	struct rb_node		b_rbnode;	/* rbtree node */
++	struct rhash_head	b_rhash_head;	/* pag buffer hash node */
+ 	xfs_daddr_t		b_bn;		/* block number of buffer */
+ 	int			b_length;	/* size of buffer in BBs */
+ 	atomic_t		b_hold;		/* reference count */
+diff --git a/fs/xfs/xfs_linux.h b/fs/xfs/xfs_linux.h
+index 5e36ee572914..91bca784cd59 100644
+--- a/fs/xfs/xfs_linux.h
++++ b/fs/xfs/xfs_linux.h
+@@ -81,6 +81,7 @@ typedef uuid_be			uuid_t;
+ #include <linux/freezer.h>
+ #include <linux/list_sort.h>
+ #include <linux/ratelimit.h>
++#include <linux/rhashtable.h>
+ 
+ #include <asm/page.h>
+ #include <asm/div64.h>
+diff --git a/fs/xfs/xfs_mount.c b/fs/xfs/xfs_mount.c
+index 416b7cb28899..2c938c30e54e 100644
+--- a/fs/xfs/xfs_mount.c
++++ b/fs/xfs/xfs_mount.c
+@@ -154,6 +154,7 @@ xfs_free_perag(
+ 		spin_unlock(&mp->m_perag_lock);
+ 		ASSERT(pag);
+ 		ASSERT(atomic_read(&pag->pag_ref) == 0);
++		xfs_buf_hash_destroy(pag);
+ 		call_rcu(&pag->rcu_head, __xfs_free_perag);
+ 	}
+ }
+@@ -209,8 +210,8 @@ xfs_initialize_perag(
+ 		spin_lock_init(&pag->pag_ici_lock);
+ 		mutex_init(&pag->pag_ici_reclaim_lock);
+ 		INIT_RADIX_TREE(&pag->pag_ici_root, GFP_ATOMIC);
+-		spin_lock_init(&pag->pag_buf_lock);
+-		pag->pag_buf_tree = RB_ROOT;
++		if (xfs_buf_hash_init(pag))
++			goto out_unwind;
+ 
+ 		if (radix_tree_preload(GFP_NOFS))
+ 			goto out_unwind;
+@@ -234,9 +235,11 @@ xfs_initialize_perag(
+ 	return 0;
+ 
+ out_unwind:
++	xfs_buf_hash_destroy(pag);
+ 	kmem_free(pag);
+ 	for (; index > first_initialised; index--) {
+ 		pag = radix_tree_delete(&mp->m_perag_tree, index);
++		xfs_buf_hash_destroy(pag);
+ 		kmem_free(pag);
+ 	}
+ 	return error;
+* Unmerged path fs/xfs/xfs_mount.h
