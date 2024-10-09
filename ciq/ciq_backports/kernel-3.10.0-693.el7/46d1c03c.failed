@@ -1,0 +1,186 @@
+s390/dasd: Improve dasd format code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [s390] dasd: Improve dasd format code (Hendrik Brueckner) [1380773]
+Rebuild_FUZZ: 92.31%
+commit-author Jan Höppner <hoeppner@linux.vnet.ibm.com>
+commit 46d1c03c82a717735dddc7a47f321abaccbcec78
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/46d1c03c.failed
+
+- Make sure a calling function can rely on data in fdata by resetting to
+  its initial values
+- Move special treatment for track 0 and 1 to dasd_eckd_build_format
+- Replace dangerous backward goto with a loop logic
+- Add define for number that specifies the maximum amount of CCWs per
+  request and is used for format_step calculation
+- Remove unused variable
+
+	Signed-off-by: Jan Höppner <hoeppner@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 46d1c03c82a717735dddc7a47f321abaccbcec78)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/block/dasd_eckd.c
+diff --cc drivers/s390/block/dasd_eckd.c
+index 75d5d21ad443,8181d6724942..000000000000
+--- a/drivers/s390/block/dasd_eckd.c
++++ b/drivers/s390/block/dasd_eckd.c
+@@@ -2347,10 -2389,9 +2347,9 @@@ dasd_eckd_build_format(struct dasd_devi
+  static int
+  dasd_eckd_format_device(struct dasd_device *base,
+  			struct format_data_t *fdata,
+ -			int enable_pav)
+ +			int enable_PAV)
+  {
+  	struct dasd_ccw_req *cqr, *n;
+- 	struct dasd_block *block;
+  	struct dasd_eckd_private *private;
+  	struct list_head format_queue;
+  	struct dasd_device *device;
+@@@ -2390,68 -2431,63 +2389,93 @@@
+  
+  	INIT_LIST_HEAD(&format_queue);
+  
++ 	old_start = fdata->start_unit;
+  	old_stop = fdata->stop_unit;
+++<<<<<<< HEAD
+ +	while (fdata->start_unit <= 1) {
+ +		fdata->stop_unit = fdata->start_unit;
+ +		cqr = dasd_eckd_build_format(base, fdata, enable_PAV);
+ +		list_add(&cqr->blocklist, &format_queue);
+++=======
+++>>>>>>> 46d1c03c82a7 (s390/dasd: Improve dasd format code)
++ 
++ 	format_step = DASD_CQR_MAX_CCW / recs_per_track(&private->rdc_data, 0,
++ 							fdata->blksize);
++ 	do {
++ 		retry = 0;
++ 		while (fdata->start_unit <= old_stop) {
++ 			step = fdata->stop_unit - fdata->start_unit + 1;
++ 			if (step > format_step) {
++ 				fdata->stop_unit =
++ 					fdata->start_unit + format_step - 1;
++ 			}
+  
+- 		fdata->stop_unit = old_stop;
+- 		fdata->start_unit++;
+- 
+- 		if (fdata->start_unit > fdata->stop_unit)
+- 			goto sleep;
+- 	}
++ 			cqr = dasd_eckd_build_format(base, fdata, enable_pav);
++ 			if (IS_ERR(cqr)) {
++ 				rc = PTR_ERR(cqr);
++ 				if (rc == -ENOMEM) {
++ 					if (list_empty(&format_queue))
++ 						goto out;
++ 					/*
++ 					 * not enough memory available, start
++ 					 * requests retry after first requests
++ 					 * were finished
++ 					 */
++ 					retry = 1;
++ 					break;
++ 				}
++ 				goto out_err;
++ 			}
++ 			list_add_tail(&cqr->blocklist, &format_queue);
+  
+++<<<<<<< HEAD
+ +retry:
+ +	format_step = 255 / recs_per_track(&private->rdc_data, 0,
+ +					   fdata->blksize);
+ +	while (fdata->start_unit <= old_stop) {
+ +		step = fdata->stop_unit - fdata->start_unit + 1;
+ +		if (step > format_step)
+ +			fdata->stop_unit = fdata->start_unit + format_step - 1;
+ +
+ +		cqr = dasd_eckd_build_format(base, fdata, enable_PAV);
+ +		if (IS_ERR(cqr)) {
+ +			if (PTR_ERR(cqr) == -ENOMEM) {
+ +				/*
+ +				 * not enough memory available
+ +				 * go to out and start requests
+ +				 * retry after first requests were finished
+ +				 */
+ +				fdata->stop_unit = old_stop;
+ +				goto sleep;
+ +			} else
+ +				return PTR_ERR(cqr);
+++=======
++ 			fdata->start_unit = fdata->stop_unit + 1;
++ 			fdata->stop_unit = old_stop;
+++>>>>>>> 46d1c03c82a7 (s390/dasd: Improve dasd format code)
+  		}
+- 		list_add(&cqr->blocklist, &format_queue);
+  
+- 		fdata->start_unit = fdata->stop_unit + 1;
+- 		fdata->stop_unit = old_stop;
+- 	}
++ 		rc = dasd_sleep_on_queue(&format_queue);
++ 
++ out_err:
++ 		list_for_each_entry_safe(cqr, n, &format_queue, blocklist) {
++ 			device = cqr->startdev;
++ 			private = (struct dasd_eckd_private *) device->private;
++ 			if (cqr->status == DASD_CQR_FAILED)
++ 				rc = -EIO;
++ 			list_del_init(&cqr->blocklist);
++ 			dasd_sfree_request(cqr, device);
++ 			private->count--;
++ 		}
+  
+- sleep:
+- 	sleep_rc = dasd_sleep_on_queue(&format_queue);
+- 
+- 	list_for_each_entry_safe(cqr, n, &format_queue, blocklist) {
+- 		device = cqr->startdev;
+- 		private = (struct dasd_eckd_private *) device->private;
+- 		if (cqr->status == DASD_CQR_FAILED)
+- 			rc = -EIO;
+- 		list_del_init(&cqr->blocklist);
+- 		dasd_sfree_request(cqr, device);
+- 		private->count--;
+- 	}
++ 		if (rc)
++ 			goto out;
+  
+- 	if (sleep_rc)
+- 		return sleep_rc;
++ 	} while (retry);
+  
+- 	/*
+- 	 * in case of ENOMEM we need to retry after
+- 	 * first requests are finished
+- 	 */
+- 	if (fdata->start_unit <= fdata->stop_unit)
+- 		goto retry;
++ out:
++ 	fdata->start_unit = old_start;
++ 	fdata->stop_unit = old_stop;
+  
+  	return rc;
+  }
+* Unmerged path drivers/s390/block/dasd_eckd.c
+diff --git a/drivers/s390/block/dasd_int.h b/drivers/s390/block/dasd_int.h
+index aa498f7fe95b..ca0b95376945 100644
+--- a/drivers/s390/block/dasd_int.h
++++ b/drivers/s390/block/dasd_int.h
+@@ -238,6 +238,13 @@ struct dasd_ccw_req {
+ /* Signature for error recovery functions. */
+ typedef struct dasd_ccw_req *(*dasd_erp_fn_t) (struct dasd_ccw_req *);
+ 
++/*
++ * A single CQR can only contain a maximum of 255 CCWs. It is limited by
++ * the locate record and locate record extended count value which can only hold
++ * 1 Byte max.
++ */
++#define DASD_CQR_MAX_CCW 255
++
+ /*
+  * Unique identifier for dasd device.
+  */
