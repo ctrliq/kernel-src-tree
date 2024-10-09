@@ -3230,6 +3230,31 @@ static const struct switchdev_ops lio_pf_switchdev_ops = {
 	.switchdev_port_attr_get = lio_pf_switchdev_attr_get,
 };
 
+static int liquidio_get_vf_stats(struct net_device *netdev, int vfidx,
+				 struct ifla_vf_stats *vf_stats)
+{
+	struct lio *lio = GET_LIO(netdev);
+	struct octeon_device *oct = lio->oct_dev;
+	struct oct_vf_stats stats;
+	int ret;
+
+	if (vfidx < 0 || vfidx >= oct->sriov_info.num_vfs_alloced)
+		return -EINVAL;
+
+	memset(&stats, 0, sizeof(struct oct_vf_stats));
+	ret = cn23xx_get_vf_stats(oct, vfidx, &stats);
+	if (!ret) {
+		vf_stats->rx_packets = stats.rx_packets;
+		vf_stats->tx_packets = stats.tx_packets;
+		vf_stats->rx_bytes = stats.rx_bytes;
+		vf_stats->tx_bytes = stats.tx_bytes;
+		vf_stats->broadcast = stats.broadcast;
+		vf_stats->multicast = stats.multicast;
+	}
+
+	return ret;
+}
+
 static const struct net_device_ops lionetdevops = {
 	.ndo_size		= sizeof(struct net_device_ops),
 	.ndo_open		= liquidio_open,
@@ -3252,6 +3277,7 @@ static const struct net_device_ops lionetdevops = {
 	.extended.ndo_set_vf_vlan	= liquidio_set_vf_vlan,
 	.ndo_get_vf_config	= liquidio_get_vf_config,
 	.ndo_set_vf_link_state  = liquidio_set_vf_link_state,
+	.ndo_get_vf_stats	= liquidio_get_vf_stats,
 };
 
 /** \brief Entry point for the liquidio module
