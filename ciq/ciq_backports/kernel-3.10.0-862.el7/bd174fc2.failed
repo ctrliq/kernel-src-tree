@@ -1,0 +1,149 @@
+IB/mlx5: Fix function updating xlt emergency path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Artemy Kovalyov <artemyko@mellanox.com>
+commit bd174fc2ca63f1c833a09f930796d789fb1f5361
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/bd174fc2.failed
+
+In memory shortage path we fall back to use spare buffer.
+mlx5_ib_update_xlt() called from ib_uverbs_reg_mr when ibmr.ucontext
+not initialized yet.
+
+Scenario how to test it:
+1. trigger memory exhaustion so __get_free_pages(GFP_KERNEL, 4) will fail
+2. register MR
+3. there should be no kernel oops
+
+Fixes: 7d0cc6edcc70 ('IB/mlx5: Add MR cache for large UMR regions')
+	Signed-off-by: Artemy Kovalyov <artemyko@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit bd174fc2ca63f1c833a09f930796d789fb1f5361)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/mr.c
+diff --cc drivers/infiniband/hw/mlx5/mr.c
+index 47de9e74f883,1f09e11fa694..000000000000
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@@ -997,60 -982,72 +997,74 @@@ int mlx5_ib_update_mtt(struct mlx5_ib_m
+  	size_t pages_mapped = 0;
+  	size_t pages_to_map = 0;
+  	size_t pages_iter = 0;
+ -	gfp_t gfp;
+ +	int use_emergency_buf = 0;
+  
+  	/* UMR copies MTTs in units of MLX5_UMR_MTT_ALIGNMENT bytes,
+ -	 * so we need to align the offset and length accordingly
+ -	 */
+ -	if (idx & page_mask) {
+ -		npages += idx & page_mask;
+ -		idx &= ~page_mask;
+ +	 * so we need to align the offset and length accordingly */
+ +	if (start_page_index & page_index_mask) {
+ +		npages += start_page_index & page_index_mask;
+ +		start_page_index &= ~page_index_mask;
+  	}
+  
+ -	gfp = flags & MLX5_IB_UPD_XLT_ATOMIC ? GFP_ATOMIC : GFP_KERNEL;
+ -	gfp |= __GFP_ZERO | __GFP_NOWARN;
+ -
+ -	pages_to_map = ALIGN(npages, page_align);
+ -	size = desc_size * pages_to_map;
+ -	size = min_t(int, size, MLX5_MAX_UMR_CHUNK);
+ +	pages_to_map = ALIGN(npages, page_index_alignment);
+  
+ -	xlt = (void *)__get_free_pages(gfp, get_order(size));
+ -	if (!xlt && size > MLX5_SPARE_UMR_CHUNK) {
+ -		mlx5_ib_dbg(dev, "Failed to allocate %d bytes of order %d. fallback to spare UMR allocation od %d bytes\n",
+ -			    size, get_order(size), MLX5_SPARE_UMR_CHUNK);
+ +	if (start_page_index + pages_to_map > MLX5_MAX_UMR_PAGES)
+ +		return -EINVAL;
+  
+ -		size = MLX5_SPARE_UMR_CHUNK;
+ -		xlt = (void *)__get_free_pages(gfp, get_order(size));
+ +	size = sizeof(struct mlx5_mtt) * pages_to_map;
+ +	size = min_t(int, PAGE_SIZE, size);
+ +	/* We allocate with GFP_ATOMIC to avoid recursion into page-reclaim
+ +	 * code, when we are called from an invalidation. The pas buffer must
+ +	 * be 2k-aligned for Connect-IB. */
+ +	pas = (__be64 *)get_zeroed_page(GFP_ATOMIC);
+ +	if (!pas) {
+ +		mlx5_ib_warn(dev, "unable to allocate memory during MTT update, falling back to slower chunked mechanism.\n");
+ +		pas = mlx5_ib_update_mtt_emergency_buffer;
+ +		size = MLX5_UMR_MTT_MIN_CHUNK_SIZE;
+ +		use_emergency_buf = 1;
+ +		mutex_lock(&mlx5_ib_update_mtt_emergency_buffer_mutex);
+ +		memset(pas, 0, size);
+  	}
+++<<<<<<< HEAD
+ +	pages_iter = size / sizeof(struct mlx5_mtt);
+ +	dma = dma_map_single(ddev, pas, size, DMA_TO_DEVICE);
+++=======
++ 
++ 	if (!xlt) {
++ 		uctx = to_mucontext(mr->ibmr.pd->uobject->context);
++ 		mlx5_ib_warn(dev, "Using XLT emergency buffer\n");
++ 		size = PAGE_SIZE;
++ 		xlt = (void *)uctx->upd_xlt_page;
++ 		mutex_lock(&uctx->upd_xlt_page_mutex);
++ 		memset(xlt, 0, size);
++ 	}
++ 	pages_iter = size / desc_size;
++ 	dma = dma_map_single(ddev, xlt, size, DMA_TO_DEVICE);
+++>>>>>>> bd174fc2ca63 (IB/mlx5: Fix function updating xlt emergency path)
+  	if (dma_mapping_error(ddev, dma)) {
+ -		mlx5_ib_err(dev, "unable to map DMA during XLT update.\n");
+ +		mlx5_ib_err(dev, "unable to map DMA during MTT update.\n");
+  		err = -ENOMEM;
+ -		goto free_xlt;
+ +		goto free_pas;
+  	}
+  
+ -	sg.addr = dma;
+ -	sg.lkey = dev->umrc.pd->local_dma_lkey;
+ -
+ -	memset(&wr, 0, sizeof(wr));
+ -	wr.wr.send_flags = MLX5_IB_SEND_UMR_UPDATE_XLT;
+ -	if (!(flags & MLX5_IB_UPD_XLT_ENABLE))
+ -		wr.wr.send_flags |= MLX5_IB_SEND_UMR_FAIL_IF_FREE;
+ -	wr.wr.sg_list = &sg;
+ -	wr.wr.num_sge = 1;
+ -	wr.wr.opcode = MLX5_IB_WR_UMR;
+ -
+ -	wr.pd = mr->ibmr.pd;
+ -	wr.mkey = mr->mmkey.key;
+ -	wr.length = mr->mmkey.size;
+ -	wr.virt_addr = mr->mmkey.iova;
+ -	wr.access_flags = mr->access_flags;
+ -	wr.page_shift = page_shift;
+ -
+  	for (pages_mapped = 0;
+  	     pages_mapped < pages_to_map && !err;
+ -	     pages_mapped += pages_iter, idx += pages_iter) {
+ +	     pages_mapped += pages_iter, start_page_index += pages_iter) {
+  		dma_sync_single_for_cpu(ddev, dma, size, DMA_TO_DEVICE);
+ -		npages = populate_xlt(mr, idx, pages_iter, xlt,
+ -				      page_shift, size, flags);
+ +
+ +		npages = min_t(size_t,
+ +			       pages_iter,
+ +			       ib_umem_num_pages(umem) - start_page_index);
+ +
+ +		if (!zap) {
+ +			__mlx5_ib_populate_pas(dev, umem, PAGE_SHIFT,
+ +					       start_page_index, npages, pas,
+ +					       MLX5_IB_MTT_PRESENT);
+ +			/* Clear padding after the pages brought from the
+ +			 * umem. */
+ +			memset(pas + npages, 0, size - npages *
+ +			       sizeof(struct mlx5_mtt));
+ +		}
+  
+  		dma_sync_single_for_device(ddev, dma, size, DMA_TO_DEVICE);
+  
+* Unmerged path drivers/infiniband/hw/mlx5/mr.c
