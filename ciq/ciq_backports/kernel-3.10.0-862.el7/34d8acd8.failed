@@ -1,0 +1,114 @@
+net: bridge: shorten ageing time on topology change
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] bridge: shorten ageing time on topology change (Ivan Vecera) [1500896]
+Rebuild_FUZZ: 94.85%
+commit-author Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+commit 34d8acd8aabb6e070b6fb718909db80458ef32ec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/34d8acd8.failed
+
+802.1D [1] specifies that the bridges must use a short value to age out
+dynamic entries in the Filtering Database for a period, once a topology
+change has been communicated by the root bridge.
+
+Add a bridge_ageing_time member in the net_bridge structure to store the
+bridge ageing time value configured by the user (ioctl/netlink/sysfs).
+
+If we are using in-kernel STP, shorten the ageing time value to twice
+the forward delay used by the topology when the topology change flag is
+set. When the flag is cleared, restore the configured ageing time.
+
+[1] "8.3.5 Notifying topology changes ",
+    http://profesores.elo.utfsm.cl/~agv/elo309/doc/802.1D-1998.pdf
+
+	Signed-off-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 34d8acd8aabb6e070b6fb718909db80458ef32ec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_device.c
+diff --cc net/bridge/br_device.c
+index f29f37ba5a74,bca5ead3e973..000000000000
+--- a/net/bridge/br_device.c
++++ b/net/bridge/br_device.c
+@@@ -414,7 -409,8 +414,12 @@@ void br_dev_setup(struct net_device *de
+  	br->bridge_max_age = br->max_age = 20 * HZ;
+  	br->bridge_hello_time = br->hello_time = 2 * HZ;
+  	br->bridge_forward_delay = br->forward_delay = 15 * HZ;
+++<<<<<<< HEAD
+ +	br->ageing_time = BR_DEFAULT_AGEING_TIME;
+++=======
++ 	br->bridge_ageing_time = br->ageing_time = BR_DEFAULT_AGEING_TIME;
++ 	dev->max_mtu = ETH_MAX_MTU;
+++>>>>>>> 34d8acd8aabb (net: bridge: shorten ageing time on topology change)
+  
+  	br_netfilter_rtable_init(br);
+  	br_stp_timer_init(br);
+* Unmerged path net/bridge/br_device.c
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index 2ad65269c1e1..916a43e54403 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -300,10 +300,11 @@ struct net_bridge
+ 	unsigned long			max_age;
+ 	unsigned long			hello_time;
+ 	unsigned long			forward_delay;
+-	unsigned long			bridge_max_age;
+ 	unsigned long			ageing_time;
++	unsigned long			bridge_max_age;
+ 	unsigned long			bridge_hello_time;
+ 	unsigned long			bridge_forward_delay;
++	unsigned long			bridge_ageing_time;
+ 
+ 	u8				group_addr[ETH_ALEN];
+ 	bool				group_addr_set;
+diff --git a/net/bridge/br_stp.c b/net/bridge/br_stp.c
+index 8d7b4c7a1d54..71fd1a4e63cc 100644
+--- a/net/bridge/br_stp.c
++++ b/net/bridge/br_stp.c
+@@ -597,7 +597,11 @@ int br_set_ageing_time(struct net_bridge *br, clock_t ageing_time)
+ 	if (err)
+ 		return err;
+ 
++	spin_lock_bh(&br->lock);
++	br->bridge_ageing_time = t;
+ 	br->ageing_time = t;
++	spin_unlock_bh(&br->lock);
++
+ 	mod_timer(&br->gc_timer, jiffies);
+ 
+ 	return 0;
+@@ -606,6 +610,29 @@ int br_set_ageing_time(struct net_bridge *br, clock_t ageing_time)
+ /* called under bridge lock */
+ void __br_set_topology_change(struct net_bridge *br, unsigned char val)
+ {
++	unsigned long t;
++	int err;
++
++	if (br->stp_enabled == BR_KERNEL_STP && br->topology_change != val) {
++		/* On topology change, set the bridge ageing time to twice the
++		 * forward delay. Otherwise, restore its default ageing time.
++		 */
++
++		if (val) {
++			t = 2 * br->forward_delay;
++			br_debug(br, "decreasing ageing time to %lu\n", t);
++		} else {
++			t = br->bridge_ageing_time;
++			br_debug(br, "restoring ageing time to %lu\n", t);
++		}
++
++		err = __set_ageing_time(br->dev, t);
++		if (err)
++			br_warn(br, "error offloading ageing time\n");
++		else
++			br->ageing_time = t;
++	}
++
+ 	br->topology_change = val;
+ }
+ 
