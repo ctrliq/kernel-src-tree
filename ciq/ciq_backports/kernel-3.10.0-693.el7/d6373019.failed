@@ -1,0 +1,446 @@
+IB/hfi1: Reserve and collapse CPU cores for contexts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Sebastian Sanchez <sebastian.sanchez@intel.com>
+commit d63730192f5914c0f6feec3d45116486be1d36e3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d6373019.failed
+
+Kernel receive queues oversubscribe CPU cores on multi-HFI systems.
+To prevent this, the kernel receive queues are separated onto
+different cores, and the SDMA engine interrupts are constrained to
+a lesser number of cores.
+
+hfi1s_on_numa_node*krcvqs is the number of CPU cores that are
+reserved for kernel receive queues for all HFIs. Each HFI initializes
+its kernel receive queues to one of the reserved CPU cores. If there
+ends up being 0 CPU cores leftover for SDMA engines, use the same
+CPU cores as receive contexts.
+
+In addition, general and control contexts are assigned to their own
+CPU core, however, both types of contexts tend to have low traffic.
+To save CPU cores, collapse general and control contexts to one CPU
+core for all HFI units. This change prevents SDMA engine interrupts
+from wrapping around general contexts.
+
+	Reviewed-by: Dean Luick <dean.luick@intel.com>
+	Signed-off-by: Sebastian Sanchez <sebastian.sanchez@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit d63730192f5914c0f6feec3d45116486be1d36e3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/affinity.c
+#	drivers/infiniband/hw/hfi1/affinity.h
+#	drivers/infiniband/hw/hfi1/init.c
+diff --cc drivers/infiniband/hw/hfi1/affinity.c
+index 1ca2154de24c,eb889270fbeb..000000000000
+--- a/drivers/infiniband/hw/hfi1/affinity.c
++++ b/drivers/infiniband/hw/hfi1/affinity.c
+@@@ -102,12 -105,96 +105,102 @@@ int init_real_cpu_mask(struct hfi1_devd
+  	 * skip any gaps.
+  	 */
+  	for (; i < possible; i++) {
+++<<<<<<< HEAD
+ +		cpumask_clear_cpu(curr_cpu, &info->real_cpu_mask);
+ +		curr_cpu = cpumask_next(curr_cpu, &info->real_cpu_mask);
+++=======
++ 		cpumask_clear_cpu(curr_cpu, &node_affinity.real_cpu_mask);
++ 		curr_cpu = cpumask_next(curr_cpu, &node_affinity.real_cpu_mask);
++ 	}
++ }
++ 
++ int node_affinity_init(void)
++ {
++ 	int node;
++ 	struct pci_dev *dev = NULL;
++ 	const struct pci_device_id *ids = hfi1_pci_tbl;
++ 
++ 	cpumask_copy(&node_affinity.proc.mask, cpu_online_mask);
++ 	/*
++ 	 * The real cpu mask is part of the affinity struct but it has to be
++ 	 * initialized early. It is needed to calculate the number of user
++ 	 * contexts in set_up_context_variables().
++ 	 */
++ 	init_real_cpu_mask();
++ 
++ 	hfi1_per_node_cntr = kcalloc(num_possible_nodes(),
++ 				     sizeof(*hfi1_per_node_cntr), GFP_KERNEL);
++ 	if (!hfi1_per_node_cntr)
++ 		return -ENOMEM;
++ 
++ 	while (ids->vendor) {
++ 		dev = NULL;
++ 		while ((dev = pci_get_device(ids->vendor, ids->device, dev))) {
++ 			node = pcibus_to_node(dev->bus);
++ 			if (node < 0)
++ 				node = numa_node_id();
++ 
++ 			hfi1_per_node_cntr[node]++;
++ 		}
++ 		ids++;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ void node_affinity_destroy(void)
++ {
++ 	struct list_head *pos, *q;
++ 	struct hfi1_affinity_node *entry;
++ 
++ 	spin_lock(&node_affinity.lock);
++ 	list_for_each_safe(pos, q, &node_affinity.list) {
++ 		entry = list_entry(pos, struct hfi1_affinity_node,
++ 				   list);
++ 		list_del(pos);
++ 		kfree(entry);
++ 	}
++ 	spin_unlock(&node_affinity.lock);
++ 	kfree(hfi1_per_node_cntr);
++ }
++ 
++ static struct hfi1_affinity_node *node_affinity_allocate(int node)
++ {
++ 	struct hfi1_affinity_node *entry;
++ 
++ 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
++ 	if (!entry)
++ 		return NULL;
++ 	entry->node = node;
++ 	INIT_LIST_HEAD(&entry->list);
++ 
++ 	return entry;
++ }
++ 
++ /*
++  * It appends an entry to the list.
++  * It *must* be called with node_affinity.lock held.
++  */
++ static void node_affinity_add_tail(struct hfi1_affinity_node *entry)
++ {
++ 	list_add_tail(&entry->list, &node_affinity.list);
++ }
++ 
++ /* It must be called with node_affinity.lock held */
++ static struct hfi1_affinity_node *node_affinity_lookup(int node)
++ {
++ 	struct list_head *pos;
++ 	struct hfi1_affinity_node *entry;
++ 
++ 	list_for_each(pos, &node_affinity.list) {
++ 		entry = list_entry(pos, struct hfi1_affinity_node, list);
++ 		if (entry->node == node)
++ 			return entry;
+++>>>>>>> d63730192f59 (IB/hfi1: Reserve and collapse CPU cores for contexts)
+  	}
+  
+ -	return NULL;
+ +	dd->affinity = info;
+ +	return 0;
+  }
+  
+  /*
+@@@ -141,47 -222,90 +234,112 @@@ void hfi1_dev_affinity_init(struct hfi1
+  	local_mask = cpumask_of_node(dd->node);
+  	if (cpumask_first(local_mask) >= nr_cpu_ids)
+  		local_mask = topology_core_cpumask(0);
+ -
+ -	spin_lock(&node_affinity.lock);
+ -	entry = node_affinity_lookup(dd->node);
+ -	spin_unlock(&node_affinity.lock);
+ -
+ -	/*
+ -	 * If this is the first time this NUMA node's affinity is used,
+ -	 * create an entry in the global affinity structure and initialize it.
+ -	 */
+ -	if (!entry) {
+ -		entry = node_affinity_allocate(node);
+ -		if (!entry) {
+ -			dd_dev_err(dd,
+ -				   "Unable to allocate global affinity node\n");
+ -			return -ENOMEM;
+ +	/* Use the "real" cpu mask of this node as the default */
+ +	cpumask_and(&info->def_intr.mask, &info->real_cpu_mask, local_mask);
+ +
+ +	/*  fill in the receive list */
+ +	possible = cpumask_weight(&info->def_intr.mask);
+ +	curr_cpu = cpumask_first(&info->def_intr.mask);
+ +	if (possible == 1) {
+ +		/*  only one CPU, everyone will use it */
+ +		cpumask_set_cpu(curr_cpu, &info->rcv_intr.mask);
+ +	} else {
+ +		/*
+ +		 * Retain the first CPU in the default list for the control
+ +		 * context.
+ +		 */
+ +		curr_cpu = cpumask_next(curr_cpu, &info->def_intr.mask);
+ +		/*
+ +		 * Remove the remaining kernel receive queues from
+ +		 * the default list and add them to the receive list.
+ +		 */
+ +		for (i = 0; i < dd->n_krcv_queues - 1; i++) {
+ +			cpumask_clear_cpu(curr_cpu, &info->def_intr.mask);
+ +			cpumask_set_cpu(curr_cpu, &info->rcv_intr.mask);
+ +			curr_cpu = cpumask_next(curr_cpu, &info->def_intr.mask);
+ +			if (curr_cpu >= nr_cpu_ids)
+ +				break;
+  		}
+++<<<<<<< HEAD
+++=======
++ 		init_cpu_mask_set(&entry->def_intr);
++ 		init_cpu_mask_set(&entry->rcv_intr);
++ 		cpumask_clear(&entry->general_intr_mask);
++ 		/* Use the "real" cpu mask of this node as the default */
++ 		cpumask_and(&entry->def_intr.mask, &node_affinity.real_cpu_mask,
++ 			    local_mask);
++ 
++ 		/* fill in the receive list */
++ 		possible = cpumask_weight(&entry->def_intr.mask);
++ 		curr_cpu = cpumask_first(&entry->def_intr.mask);
++ 
++ 		if (possible == 1) {
++ 			/* only one CPU, everyone will use it */
++ 			cpumask_set_cpu(curr_cpu, &entry->rcv_intr.mask);
++ 			cpumask_set_cpu(curr_cpu, &entry->general_intr_mask);
++ 		} else {
++ 			/*
++ 			 * The general/control context will be the first CPU in
++ 			 * the default list, so it is removed from the default
++ 			 * list and added to the general interrupt list.
++ 			 */
++ 			cpumask_clear_cpu(curr_cpu, &entry->def_intr.mask);
++ 			cpumask_set_cpu(curr_cpu, &entry->general_intr_mask);
++ 			curr_cpu = cpumask_next(curr_cpu,
++ 						&entry->def_intr.mask);
++ 
++ 			/*
++ 			 * Remove the remaining kernel receive queues from
++ 			 * the default list and add them to the receive list.
++ 			 */
++ 			for (i = 0;
++ 			     i < (dd->n_krcv_queues - 1) *
++ 				  hfi1_per_node_cntr[dd->node];
++ 			     i++) {
++ 				cpumask_clear_cpu(curr_cpu,
++ 						  &entry->def_intr.mask);
++ 				cpumask_set_cpu(curr_cpu,
++ 						&entry->rcv_intr.mask);
++ 				curr_cpu = cpumask_next(curr_cpu,
++ 							&entry->def_intr.mask);
++ 				if (curr_cpu >= nr_cpu_ids)
++ 					break;
++ 			}
++ 
++ 			/*
++ 			 * If there ends up being 0 CPU cores leftover for SDMA
++ 			 * engines, use the same CPU cores as general/control
++ 			 * context.
++ 			 */
++ 			if (cpumask_weight(&entry->def_intr.mask) == 0)
++ 				cpumask_copy(&entry->def_intr.mask,
++ 					     &entry->general_intr_mask);
++ 		}
++ 
++ 		spin_lock(&node_affinity.lock);
++ 		node_affinity_add_tail(entry);
++ 		spin_unlock(&node_affinity.lock);
+++>>>>>>> d63730192f59 (IB/hfi1: Reserve and collapse CPU cores for contexts)
+  	}
+  
+ -	return 0;
+ +	cpumask_copy(&info->proc.mask, cpu_online_mask);
+ +}
+ +
+ +void hfi1_dev_affinity_free(struct hfi1_devdata *dd)
+ +{
+ +	kfree(dd->affinity);
+  }
+  
+  int hfi1_get_irq_affinity(struct hfi1_devdata *dd, struct hfi1_msix_entry *msix)
+  {
+  	int ret;
+  	cpumask_var_t diff;
+++<<<<<<< HEAD
+ +	struct cpu_mask_set *set;
+++=======
++ 	struct hfi1_affinity_node *entry;
++ 	struct cpu_mask_set *set = NULL;
+++>>>>>>> d63730192f59 (IB/hfi1: Reserve and collapse CPU cores for contexts)
+  	struct sdma_engine *sde = NULL;
+  	struct hfi1_ctxtdata *rcd = NULL;
+  	char extra[64];
+@@@ -198,18 -326,17 +356,32 @@@
+  	case IRQ_SDMA:
+  		sde = (struct sdma_engine *)msix->arg;
+  		scnprintf(extra, 64, "engine %u", sde->this_idx);
+++<<<<<<< HEAD
+ +		/* fall through */
+ +	case IRQ_GENERAL:
+ +		set = &dd->affinity->def_intr;
+++=======
++ 		set = &entry->def_intr;
+++>>>>>>> d63730192f59 (IB/hfi1: Reserve and collapse CPU cores for contexts)
++ 		break;
++ 	case IRQ_GENERAL:
++ 		cpu = cpumask_first(&entry->general_intr_mask);
+  		break;
+  	case IRQ_RCVCTXT:
+  		rcd = (struct hfi1_ctxtdata *)msix->arg;
+++<<<<<<< HEAD
+ +		if (rcd->ctxt == HFI1_CTRL_CTXT) {
+ +			set = &dd->affinity->def_intr;
+ +			cpu = cpumask_first(&set->mask);
+ +		} else {
+ +			set = &dd->affinity->rcv_intr;
+ +		}
+++=======
++ 		if (rcd->ctxt == HFI1_CTRL_CTXT)
++ 			cpu = cpumask_first(&entry->general_intr_mask);
++ 		else
++ 			set = &entry->rcv_intr;
+++>>>>>>> d63730192f59 (IB/hfi1: Reserve and collapse CPU cores for contexts)
+  		scnprintf(extra, 64, "ctxt %u", rcd->ctxt);
+  		break;
+  	default:
+@@@ -218,12 -345,12 +390,12 @@@
+  	}
+  
+  	/*
+- 	 * The control receive context is placed on a particular CPU, which
+- 	 * is set above.  Skip accounting for it.  Everything else finds its
+- 	 * CPU here.
++ 	 * The general and control contexts are placed on a particular
++ 	 * CPU, which is set above. Skip accounting for it. Everything else
++ 	 * finds its CPU here.
+  	 */
+ -	if (cpu == -1 && set) {
+ -		spin_lock(&node_affinity.lock);
+ +	if (cpu == -1) {
+ +		spin_lock(&dd->affinity->lock);
+  		if (cpumask_equal(&set->mask, &set->used)) {
+  			/*
+  			 * We've used up all the CPUs, bump up the generation
+@@@ -266,14 -393,21 +438,21 @@@ void hfi1_put_irq_affinity(struct hfi1_
+  
+  	switch (msix->type) {
+  	case IRQ_SDMA:
+++<<<<<<< HEAD
+ +	case IRQ_GENERAL:
+ +		set = &dd->affinity->def_intr;
+++=======
++ 		set = &entry->def_intr;
+++>>>>>>> d63730192f59 (IB/hfi1: Reserve and collapse CPU cores for contexts)
++ 		break;
++ 	case IRQ_GENERAL:
++ 		/* Don't accounting for general contexts */
+  		break;
+  	case IRQ_RCVCTXT:
+  		rcd = (struct hfi1_ctxtdata *)msix->arg;
+- 		/* only do accounting for non control contexts */
++ 		/* Don't do accounting for control contexts */
+  		if (rcd->ctxt != HFI1_CTRL_CTXT)
+ -			set = &entry->rcv_intr;
+ +			set = &dd->affinity->rcv_intr;
+  		break;
+  	default:
+  		return;
+@@@ -348,13 -483,20 +527,30 @@@ int hfi1_get_proc_affinity(struct hfi1_
+  		cpumask_clear(&set->used);
+  	}
+  
+++<<<<<<< HEAD
+ +	/* CPUs used by interrupt handlers */
+ +	cpumask_copy(intrs, (dd->affinity->def_intr.gen ?
+ +			     &dd->affinity->def_intr.mask :
+ +			     &dd->affinity->def_intr.used));
+ +	cpumask_or(intrs, intrs, (dd->affinity->rcv_intr.gen ?
+ +				  &dd->affinity->rcv_intr.mask :
+ +				  &dd->affinity->rcv_intr.used));
+++=======
++ 	/*
++ 	 * If NUMA node has CPUs used by interrupt handlers, include them in the
++ 	 * interrupt handler mask.
++ 	 */
++ 	entry = node_affinity_lookup(node);
++ 	if (entry) {
++ 		cpumask_copy(intrs, (entry->def_intr.gen ?
++ 				     &entry->def_intr.mask :
++ 				     &entry->def_intr.used));
++ 		cpumask_or(intrs, intrs, (entry->rcv_intr.gen ?
++ 					  &entry->rcv_intr.mask :
++ 					  &entry->rcv_intr.used));
++ 		cpumask_or(intrs, intrs, &entry->general_intr_mask);
++ 	}
+++>>>>>>> d63730192f59 (IB/hfi1: Reserve and collapse CPU cores for contexts)
+  	hfi1_cdbg(PROC, "CPUs used by interrupts: %*pbl",
+  		  cpumask_pr_args(intrs));
+  
+diff --cc drivers/infiniband/hw/hfi1/affinity.h
+index 20f52fe74091,003860ed0d25..000000000000
+--- a/drivers/infiniband/hw/hfi1/affinity.h
++++ b/drivers/infiniband/hw/hfi1/affinity.h
+@@@ -105,4 -103,24 +105,27 @@@ int hfi1_get_proc_affinity(struct hfi1_
+  /* Release a CPU used by a user process. */
+  void hfi1_put_proc_affinity(struct hfi1_devdata *, int);
+  
+++<<<<<<< HEAD
+++=======
++ struct hfi1_affinity_node {
++ 	int node;
++ 	struct cpu_mask_set def_intr;
++ 	struct cpu_mask_set rcv_intr;
++ 	struct cpumask general_intr_mask;
++ 	struct list_head list;
++ };
++ 
++ struct hfi1_affinity_node_list {
++ 	struct list_head list;
++ 	struct cpumask real_cpu_mask;
++ 	struct cpu_mask_set proc;
++ 	/* protect affinity node list */
++ 	spinlock_t lock;
++ };
++ 
++ int node_affinity_init(void);
++ void node_affinity_destroy(void);
++ extern struct hfi1_affinity_node_list node_affinity;
++ 
+++>>>>>>> d63730192f59 (IB/hfi1: Reserve and collapse CPU cores for contexts)
+  #endif /* _HFI1_AFFINITY_H */
+diff --cc drivers/infiniband/hw/hfi1/init.c
+index 5d85c7977998,1620d6882d10..000000000000
+--- a/drivers/infiniband/hw/hfi1/init.c
++++ b/drivers/infiniband/hw/hfi1/init.c
+@@@ -1209,6 -1198,10 +1209,13 @@@ static int __init hfi1_mod_init(void
+  	if (ret)
+  		goto bail;
+  
+++<<<<<<< HEAD
+++=======
++ 	ret = node_affinity_init();
++ 	if (ret)
++ 		goto bail;
++ 
+++>>>>>>> d63730192f59 (IB/hfi1: Reserve and collapse CPU cores for contexts)
+  	/* validate max MTU before any devices start */
+  	if (!valid_opa_max_mtu(hfi1_max_mtu)) {
+  		pr_err("Invalid max_mtu 0x%x, using 0x%x instead\n",
+* Unmerged path drivers/infiniband/hw/hfi1/affinity.c
+* Unmerged path drivers/infiniband/hw/hfi1/affinity.h
+diff --git a/drivers/infiniband/hw/hfi1/hfi.h b/drivers/infiniband/hw/hfi1/hfi.h
+index e8604c7861e8..ec9b895d44c2 100644
+--- a/drivers/infiniband/hw/hfi1/hfi.h
++++ b/drivers/infiniband/hw/hfi1/hfi.h
+@@ -1247,6 +1247,8 @@ int handle_receive_interrupt_nodma_rtail(struct hfi1_ctxtdata *, int);
+ int handle_receive_interrupt_dma_rtail(struct hfi1_ctxtdata *, int);
+ void set_all_slowpath(struct hfi1_devdata *dd);
+ 
++extern const struct pci_device_id hfi1_pci_tbl[];
++
+ /* receive packet handler dispositions */
+ #define RCV_PKT_OK      0x0 /* keep going */
+ #define RCV_PKT_LIMIT   0x1 /* stop, hit limit, start thread */
+* Unmerged path drivers/infiniband/hw/hfi1/init.c
