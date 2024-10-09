@@ -1,0 +1,183 @@
+IB/core: Don't resolve IP address to the loopback device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Moni Shoua <monis@mellanox.com>
+commit cbd09aebc2d62095b05797af5c9a315e3a71dcea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/cbd09aeb.failed
+
+When resolving an IP address that is on the host of the caller the
+result from querying the routing table is the loopback device. This is
+not a valid response, because it doesn't represent the RDMA device and
+the port.
+
+Therefore, callers need to check the resolved device and if it is a
+loopback device find an alternative way to resolve it. To avoid this we
+make sure that the response from rdma_resolve_ip() will not be the
+loopback device.
+
+While that, we fix an static checker warning about dereferencing an
+unintitialized pointer using the same solution as in commit abeffce90c7f
+("net/mlx5e: Fix a -Wmaybe-uninitialized warning") as a reference.
+
+	Signed-off-by: Moni Shoua <monis@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit cbd09aebc2d62095b05797af5c9a315e3a71dcea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/cma.c
+diff --cc drivers/infiniband/core/cma.c
+index 2584e562abad,11aff923b633..000000000000
+--- a/drivers/infiniband/core/cma.c
++++ b/drivers/infiniband/core/cma.c
+@@@ -2562,29 -2558,15 +2551,32 @@@ static int cma_resolve_iboe_route(struc
+  			goto err2;
+  		}
+  
+++<<<<<<< HEAD
+ +		if (ndev->flags & IFF_LOOPBACK) {
+ +			dev_put(ndev);
+ +			if (!id_priv->id.device->get_netdev) {
+ +				ret = -EOPNOTSUPP;
+ +				goto err2;
+ +			}
+ +
+ +			ndev = id_priv->id.device->get_netdev(id_priv->id.device,
+ +							      id_priv->id.port_num);
+ +			if (!ndev) {
+ +				ret = -ENODEV;
+ +				goto err2;
+ +			}
+ +		}
+ +
+ +		route->path_rec->net = &init_net;
+ +		route->path_rec->ifindex = ndev->ifindex;
+++=======
+++>>>>>>> cbd09aebc2d6 (IB/core: Don't resolve IP address to the loopback device)
+  		supported_gids = roce_gid_type_mask_support(id_priv->id.device,
+  							    id_priv->id.port_num);
+ -		gid_type = cma_route_gid_type(addr->dev_addr.network,
+ -					      supported_gids,
+ -					      id_priv->gid_type);
+ -		route->path_rec->rec_type =
+ -			sa_conv_gid_to_pathrec_type(gid_type);
+ -		sa_path_set_ndev(route->path_rec, &init_net);
+ -		sa_path_set_ifindex(route->path_rec, ndev->ifindex);
+ +		route->path_rec->gid_type =
+ +			cma_route_gid_type(addr->dev_addr.network,
+ +					   supported_gids,
+ +					   id_priv->gid_type);
+  	}
+  	if (!ndev) {
+  		ret = -ENODEV;
+diff --git a/drivers/infiniband/core/addr.c b/drivers/infiniband/core/addr.c
+index fb4ce0394ac7..45c132cf958e 100644
+--- a/drivers/infiniband/core/addr.c
++++ b/drivers/infiniband/core/addr.c
+@@ -269,6 +269,7 @@ int rdma_translate_ip(const struct sockaddr *addr,
+ 			return ret;
+ 
+ 		ret = rdma_copy_addr(dev_addr, dev, NULL);
++		dev_addr->bound_dev_if = dev->ifindex;
+ 		if (vlan_id)
+ 			*vlan_id = rdma_vlan_dev_vlan_id(dev);
+ 		dev_put(dev);
+@@ -281,6 +282,7 @@ int rdma_translate_ip(const struct sockaddr *addr,
+ 					  &((const struct sockaddr_in6 *)addr)->sin6_addr,
+ 					  dev, 1)) {
+ 				ret = rdma_copy_addr(dev_addr, dev, NULL);
++				dev_addr->bound_dev_if = dev->ifindex;
+ 				if (vlan_id)
+ 					*vlan_id = rdma_vlan_dev_vlan_id(dev);
+ 				break;
+@@ -406,10 +408,10 @@ static int addr4_resolve(struct sockaddr_in *src_in,
+ 	fl4.saddr = src_ip;
+ 	fl4.flowi4_oif = addr->bound_dev_if;
+ 	rt = ip_route_output_key(addr->net, &fl4);
+-	if (IS_ERR(rt)) {
+-		ret = PTR_ERR(rt);
+-		goto out;
+-	}
++	ret = PTR_ERR_OR_ZERO(rt);
++	if (ret)
++		return ret;
++
+ 	src_in->sin_family = AF_INET;
+ 	src_in->sin_addr.s_addr = fl4.saddr;
+ 
+@@ -424,8 +426,6 @@ static int addr4_resolve(struct sockaddr_in *src_in,
+ 
+ 	*prt = rt;
+ 	return 0;
+-out:
+-	return ret;
+ }
+ 
+ #if IS_ENABLED(CONFIG_IPV6)
+@@ -528,8 +528,12 @@ static int addr_resolve(struct sockaddr *src_in,
+ 		if (resolve_neigh)
+ 			ret = addr_resolve_neigh(&rt->dst, dst_in, addr, seq);
+ 
+-		ndev = rt->dst.dev;
+-		dev_hold(ndev);
++		if (addr->bound_dev_if) {
++			ndev = dev_get_by_index(addr->net, addr->bound_dev_if);
++		} else {
++			ndev = rt->dst.dev;
++			dev_hold(ndev);
++		}
+ 
+ 		ip_rt_put(rt);
+ 	} else {
+@@ -545,13 +549,27 @@ static int addr_resolve(struct sockaddr *src_in,
+ 		if (resolve_neigh)
+ 			ret = addr_resolve_neigh(dst, dst_in, addr, seq);
+ 
+-		ndev = dst->dev;
+-		dev_hold(ndev);
++		if (addr->bound_dev_if) {
++			ndev = dev_get_by_index(addr->net, addr->bound_dev_if);
++		} else {
++			ndev = dst->dev;
++			dev_hold(ndev);
++		}
+ 
+ 		dst_release(dst);
+ 	}
+ 
+-	addr->bound_dev_if = ndev->ifindex;
++	if (ndev->flags & IFF_LOOPBACK) {
++		ret = rdma_translate_ip(dst_in, addr, NULL);
++		/*
++		 * Put the loopback device and get the translated
++		 * device instead.
++		 */
++		dev_put(ndev);
++		ndev = dev_get_by_index(addr->net, addr->bound_dev_if);
++	} else {
++		addr->bound_dev_if = ndev->ifindex;
++	}
+ 	dev_put(ndev);
+ 
+ 	return ret;
+* Unmerged path drivers/infiniband/core/cma.c
+diff --git a/drivers/infiniband/core/verbs.c b/drivers/infiniband/core/verbs.c
+index 7333fc0ff1bc..980ccaa33a44 100644
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@ -517,11 +517,6 @@ int ib_init_ah_from_wc(struct ib_device *device, u8 port_num,
+ 		}
+ 
+ 		resolved_dev = dev_get_by_index(&init_net, if_index);
+-		if (resolved_dev->flags & IFF_LOOPBACK) {
+-			dev_put(resolved_dev);
+-			resolved_dev = idev;
+-			dev_hold(resolved_dev);
+-		}
+ 		rcu_read_lock();
+ 		if (resolved_dev != idev && !rdma_is_upper_dev_rcu(idev,
+ 								   resolved_dev))
