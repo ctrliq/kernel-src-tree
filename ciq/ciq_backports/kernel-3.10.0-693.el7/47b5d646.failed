@@ -1,0 +1,72 @@
+btrfs: fix false enospc error when truncating heavily reflinked file
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Wang Xiaoguang <wangxg.fnst@cn.fujitsu.com>
+commit 47b5d64691350e116093c9b47b55ca6b9433bc50
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/47b5d646.failed
+
+Below test script can reveal this bug:
+    dd if=/dev/zero of=fs.img bs=$((1024*1024)) count=100
+    dev=$(losetup --show -f fs.img)
+    mkdir -p /mnt/mntpoint
+    mkfs.btrfs  -f $dev
+    mount $dev /mnt/mntpoint
+    cd /mnt/mntpoint
+
+    echo "workdir is: /mnt/mntpoint"
+    blocksize=$((128 * 1024))
+    dd if=/dev/zero of=testfile bs=$blocksize count=1
+    sync
+    count=$((17*1024*1024*1024/blocksize))
+    echo "file size is:" $((count*blocksize))
+    for ((i = 1; i <= $count; i++)); do
+        dst_offset=$((blocksize * i))
+        xfs_io -f -c "reflink testfile 0 $dst_offset $blocksize"\
+                testfile > /dev/null
+    done
+    sync
+    truncate --size 0 testfile
+
+The last truncate operation will fail for ENOSPC reason, but indeed
+it should not fail.
+
+In btrfs_truncate(), we use a temporary block_rsv to do truncate
+operation. With every btrfs_truncate_inode_items() call, we migrate space
+to this block_rsv, but forget to cleanup previous reservation, which
+will make this block_rsv's reserved bytes keep growing, and this reserved
+space will only be released in the end of btrfs_truncate(), this metadata
+leak will impact other's metadata reservation. In this case, it's
+"btrfs_start_transaction(root, 2);" fails for enospc error, which make
+this truncate operation fail.
+
+Call btrfs_block_rsv_release() to fix this bug.
+
+	Signed-off-by: Wang Xiaoguang <wangxg.fnst@cn.fujitsu.com>
+	Reviewed-by: David Sterba <dsterba@suse.com>
+	Signed-off-by: David Sterba <dsterba@suse.com>
+(cherry picked from commit 47b5d64691350e116093c9b47b55ca6b9433bc50)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/inode.c
+diff --cc fs/btrfs/inode.c
+index 6294594562c2,415a6ad5ba22..000000000000
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@@ -9173,7 -9215,8 +9173,12 @@@ static int btrfs_truncate(struct inode 
+  			break;
+  		}
+  
+++<<<<<<< HEAD
+ +		ret = btrfs_block_rsv_migrate(&root->fs_info->trans_block_rsv,
+++=======
++ 		btrfs_block_rsv_release(fs_info, rsv, -1);
++ 		ret = btrfs_block_rsv_migrate(&fs_info->trans_block_rsv,
+++>>>>>>> 47b5d6469135 (btrfs: fix false enospc error when truncating heavily reflinked file)
+  					      rsv, min_size, 0);
+  		BUG_ON(ret);	/* shouldn't happen */
+  		trans->block_rsv = rsv;
+* Unmerged path fs/btrfs/inode.c
