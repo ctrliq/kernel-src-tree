@@ -88,6 +88,7 @@ struct perf_stat_config {
 	enum aggr_mode		 aggr_mode;
 	bool			 scale;
 	bool			 no_inherit;
+	bool			 identifier;
 	FILE			*output;
 	unsigned int		 interval;
 	unsigned int		 timeout;
