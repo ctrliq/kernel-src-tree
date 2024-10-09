@@ -364,7 +364,7 @@ static __always_inline void setup_umip(struct cpuinfo_x86 *c)
 
 	set_in_cr4(X86_CR4_UMIP);
 
-	pr_info_once("x86/cpu: Intel User Mode Instruction Prevention (UMIP) activated\n");
+	pr_info_once("x86/cpu: User Mode Instruction Prevention (UMIP) activated\n");
 
 	return;
 
