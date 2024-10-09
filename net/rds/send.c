@@ -690,16 +690,16 @@ unlock_and_drop:
  * XXX It's not clear to me how this is safely serialized with socket
  * destruction.  Maybe it should bail if it sees SOCK_DEAD.
  */
-void rds_send_drop_acked(struct rds_connection *conn, u64 ack,
-			 is_acked_func is_acked)
+void rds_send_path_drop_acked(struct rds_conn_path *cp, u64 ack,
+			      is_acked_func is_acked)
 {
 	struct rds_message *rm, *tmp;
 	unsigned long flags;
 	LIST_HEAD(list);
 
-	spin_lock_irqsave(&conn->c_lock, flags);
+	spin_lock_irqsave(&cp->cp_lock, flags);
 
-	list_for_each_entry_safe(rm, tmp, &conn->c_retrans, m_conn_item) {
+	list_for_each_entry_safe(rm, tmp, &cp->cp_retrans, m_conn_item) {
 		if (!rds_send_is_acked(rm, ack, is_acked))
 			break;
 
@@ -711,10 +711,18 @@ void rds_send_drop_acked(struct rds_connection *conn, u64 ack,
 	if (!list_empty(&list))
 		smp_mb__after_clear_bit();
 
-	spin_unlock_irqrestore(&conn->c_lock, flags);
+	spin_unlock_irqrestore(&cp->cp_lock, flags);
 
 	/* now remove the messages from the sock list as needed */
 	rds_send_remove_from_sock(&list, RDS_RDMA_SUCCESS);
+}
+EXPORT_SYMBOL_GPL(rds_send_path_drop_acked);
+
+void rds_send_drop_acked(struct rds_connection *conn, u64 ack,
+			 is_acked_func is_acked)
+{
+	WARN_ON(conn->c_trans->t_mp_capable);
+	rds_send_path_drop_acked(&conn->c_path[0], ack, is_acked);
 }
 EXPORT_SYMBOL_GPL(rds_send_drop_acked);
 
