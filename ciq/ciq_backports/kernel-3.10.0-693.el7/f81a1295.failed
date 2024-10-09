@@ -1,0 +1,331 @@
+Input: wacom - prepare the driver to include BT devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Benjamin Tissoires <benjamin.tissoires@redhat.com>
+commit f81a1295cd9b6d3d3d7d7126e522d80917134b41
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f81a1295.failed
+
+Now that wacom is a hid driver, there is no point in having a separate
+driver for bluetooth devices. This patch prepares the common paths of
+Bluetooth devices in the common wacom driver. It also adds the sysfs file
+"speed" used by Bluetooth devices.
+
+	Signed-off-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+	Reviewed-by: Ping Cheng <pingc@wacom.com>
+	Tested-by: Przemo Firszt <przemo@firszt.eu>
+	Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+(cherry picked from commit f81a1295cd9b6d3d3d7d7126e522d80917134b41)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hid/wacom_sys.c
+#	drivers/hid/wacom_wac.h
+diff --cc drivers/hid/wacom_sys.c
+index 527bf559d1db,18154a5459b5..000000000000
+--- a/drivers/hid/wacom_sys.c
++++ b/drivers/hid/wacom_sys.c
+@@@ -563,8 -275,12 +569,11 @@@ static int wacom_bt_query_tablet_data(s
+   * from the tablet, it is necessary to switch the tablet out of this
+   * mode and into one which sends the full range of tablet data.
+   */
+ -static int wacom_query_tablet_data(struct hid_device *hdev,
+ -		struct wacom_features *features)
+ +static int wacom_query_tablet_data(struct usb_interface *intf, struct wacom_features *features)
+  {
++ 	if (hdev->bus == BUS_BLUETOOTH)
++ 		return wacom_bt_query_tablet_data(hdev, 1, features);
++ 
+  	if (features->device_type == BTN_TOOL_FINGER) {
+  		if (features->type > TABLETPC) {
+  			/* MT Tablet PC touch */
+@@@ -1127,31 -897,95 +1136,67 @@@ static void wacom_destroy_battery(struc
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static int wacom_register_input(struct wacom *wacom)
+++=======
++ static ssize_t wacom_show_speed(struct device *dev,
++ 				struct device_attribute
++ 				*attr, char *buf)
++ {
++ 	struct hid_device *hdev = container_of(dev, struct hid_device, dev);
++ 	struct wacom *wacom = hid_get_drvdata(hdev);
++ 
++ 	return snprintf(buf, PAGE_SIZE, "%i\n", wacom->wacom_wac.bt_high_speed);
++ }
++ 
++ static ssize_t wacom_store_speed(struct device *dev,
++ 				struct device_attribute *attr,
++ 				const char *buf, size_t count)
++ {
++ 	struct hid_device *hdev = container_of(dev, struct hid_device, dev);
++ 	struct wacom *wacom = hid_get_drvdata(hdev);
++ 	u8 new_speed;
++ 
++ 	if (kstrtou8(buf, 0, &new_speed))
++ 		return -EINVAL;
++ 
++ 	if (new_speed != 0 && new_speed != 1)
++ 		return -EINVAL;
++ 
++ 	wacom_bt_query_tablet_data(hdev, new_speed, &wacom->wacom_wac.features);
++ 
++ 	return count;
++ }
++ 
++ static DEVICE_ATTR(speed, S_IRUGO | S_IWUSR | S_IWGRP,
++ 		wacom_show_speed, wacom_store_speed);
++ 
++ static struct input_dev *wacom_allocate_input(struct wacom *wacom)
+++>>>>>>> f81a1295cd9b (Input: wacom - prepare the driver to include BT devices)
+  {
+  	struct input_dev *input_dev;
+ -	struct hid_device *hdev = wacom->hdev;
+ +	struct usb_interface *intf = wacom->intf;
+ +	struct usb_device *dev = interface_to_usbdev(intf);
+  	struct wacom_wac *wacom_wac = &(wacom->wacom_wac);
+ +	int error;
+  
+  	input_dev = input_allocate_device();
+ -	if (!input_dev)
+ -		return NULL;
+ +	if (!input_dev) {
+ +		error = -ENOMEM;
+ +		goto fail1;
+ +	}
+  
+  	input_dev->name = wacom_wac->name;
+ -	input_dev->phys = hdev->phys;
+ -	input_dev->dev.parent = &hdev->dev;
+ +	input_dev->dev.parent = &intf->dev;
+  	input_dev->open = wacom_open;
+  	input_dev->close = wacom_close;
+ -	input_dev->uniq = hdev->uniq;
+ -	input_dev->id.bustype = hdev->bus;
+ -	input_dev->id.vendor  = hdev->vendor;
+ -	input_dev->id.product = hdev->product;
+ -	input_dev->id.version = hdev->version;
+ +	usb_to_input_id(dev, &input_dev->id);
+  	input_set_drvdata(input_dev, wacom);
+  
+ -	return input_dev;
+ -}
+ -
+ -static void wacom_unregister_inputs(struct wacom *wacom)
+ -{
+ -	if (wacom->wacom_wac.input)
+ -		input_unregister_device(wacom->wacom_wac.input);
+ -	if (wacom->wacom_wac.pad_input)
+ -		input_unregister_device(wacom->wacom_wac.pad_input);
+ -	wacom->wacom_wac.input = NULL;
+ -	wacom->wacom_wac.pad_input = NULL;
+ -}
+ -
+ -static int wacom_register_inputs(struct wacom *wacom)
+ -{
+ -	struct input_dev *input_dev, *pad_input_dev;
+ -	struct wacom_wac *wacom_wac = &(wacom->wacom_wac);
+ -	int error;
+ -
+ -	input_dev = wacom_allocate_input(wacom);
+ -	pad_input_dev = wacom_allocate_input(wacom);
+ -	if (!input_dev || !pad_input_dev) {
+ -		error = -ENOMEM;
+ -		goto fail1;
+ -	}
+ -
+  	wacom_wac->input = input_dev;
+ -	wacom_wac->pad_input = pad_input_dev;
+ -	wacom_wac->pad_input->name = wacom_wac->pad_name;
+ -
+  	error = wacom_setup_input_capabilities(input_dev, wacom_wac);
+  	if (error)
+ -		goto fail2;
+ +		goto fail1;
+  
+  	error = input_register_device(input_dev);
+  	if (error)
+@@@ -1364,6 -1239,21 +1409,24 @@@ static int wacom_probe(struct usb_inter
+  		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Same thing for Bamboo 3rd gen.
++ 	 */
++ 	if ((features->type == BAMBOO_PT) &&
++ 	    (features->pktlen == WACOM_PKGLEN_BBTOUCH3) &&
++ 	    (features->device_type == BTN_TOOL_PEN)) {
++ 		features->device_type = BTN_TOOL_FINGER;
++ 
++ 		features->x_max = 4096;
++ 		features->y_max = 4096;
++ 	}
++ 
++ 	if (hdev->bus == BUS_BLUETOOTH)
++ 		features->quirks |= WACOM_QUIRK_BATTERY;
++ 
+++>>>>>>> f81a1295cd9b (Input: wacom - prepare the driver to include BT devices)
+  	wacom_setup_device_quirks(features);
+  
+  	/* set unit to "100th of a mm" for devices not reported by HID */
+@@@ -1386,69 -1276,82 +1449,121 @@@
+  		else
+  			strlcat(wacom_wac->name, " Pad", WACOM_NAME_MAX);
+  
+++<<<<<<< HEAD
+ +		other_dev = wacom_get_sibling(dev, features->oVid, features->oPid);
+ +		if (other_dev == NULL || wacom_get_usbdev_data(other_dev) == NULL)
+ +			other_dev = dev;
+ +		error = wacom_add_shared_data(wacom_wac, other_dev);
+++=======
++ 		error = wacom_add_shared_data(hdev);
++ 		if (error)
++ 			goto fail1;
++ 	}
++ 
++ 	error = wacom_initialize_leds(wacom);
++ 	if (error)
++ 		goto fail2;
++ 
++ 	if (!(features->quirks & WACOM_QUIRK_MONITOR) &&
++ 	     (features->quirks & WACOM_QUIRK_BATTERY)) {
++ 		error = wacom_initialize_battery(wacom);
+  		if (error)
+  			goto fail3;
+  	}
+  
++ 	if (!(features->quirks & WACOM_QUIRK_NO_INPUT)) {
++ 		error = wacom_register_inputs(wacom);
+++>>>>>>> f81a1295cd9b (Input: wacom - prepare the driver to include BT devices)
++ 		if (error)
++ 			goto fail4;
++ 	}
++ 
++ 	if (hdev->bus == BUS_BLUETOOTH) {
++ 		error = device_create_file(&hdev->dev, &dev_attr_speed);
++ 		if (error)
++ 			hid_warn(hdev,
++ 				 "can't create sysfs speed attribute err: %d\n",
++ 				 error);
++ 	}
++ 
+ -	/* Note that if query fails it is not a hard failure */
+ -	wacom_query_tablet_data(hdev, features);
+ +	usb_fill_int_urb(wacom->irq, dev,
+ +			 usb_rcvintpipe(dev, endpoint->bEndpointAddress),
+ +			 wacom_wac->data, features->pktlen,
+ +			 wacom_sys_irq, wacom, endpoint->bInterval);
+ +	wacom->irq->transfer_dma = wacom->data_dma;
+ +	wacom->irq->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+  
+++<<<<<<< HEAD
+ +	error = wacom_initialize_leds(wacom);
+ +	if (error)
+ +		goto fail4;
+ +
+ +	if (!(features->quirks & WACOM_QUIRK_NO_INPUT)) {
+ +		error = wacom_register_input(wacom);
+ +		if (error)
+ +			goto fail5;
+++=======
++ 	/* Regular HID work starts now */
++ 	error = hid_hw_start(hdev, HID_CONNECT_HIDRAW);
++ 	if (error) {
++ 		hid_err(hdev, "hw start failed\n");
++ 		goto fail5;
+++>>>>>>> f81a1295cd9b (Input: wacom - prepare the driver to include BT devices)
+  	}
+  
+ -	if (features->quirks & WACOM_QUIRK_MONITOR)
+ -		error = hid_hw_open(hdev);
+ +	/* Note that if query fails it is not a hard failure */
+ +	wacom_query_tablet_data(intf, features);
+  
+ -	if (wacom_wac->features.type == INTUOSHT && wacom_wac->features.touch_max) {
+ -		if (wacom_wac->features.device_type == BTN_TOOL_FINGER)
+ -			wacom_wac->shared->touch_input = wacom_wac->input;
+ +	usb_set_intfdata(intf, wacom);
+ +
+ +	if (features->quirks & WACOM_QUIRK_MONITOR) {
+ +		if (usb_submit_urb(wacom->irq, GFP_KERNEL)) {
+ +			error = -EIO;
+ +			goto fail5;
+ +		}
+  	}
+  
+  	return 0;
+  
+++<<<<<<< HEAD
+ + fail5: wacom_destroy_leds(wacom);
+ + fail4:	wacom_remove_shared_data(wacom_wac);
+ + fail3:	usb_free_urb(wacom->irq);
+ + fail2:	usb_free_coherent(dev, WACOM_PKGLEN_MAX, wacom_wac->data, wacom->data_dma);
+++=======
++  fail5:	if (hdev->bus == BUS_BLUETOOTH)
++ 		device_remove_file(&hdev->dev, &dev_attr_speed);
++ 	wacom_unregister_inputs(wacom);
++  fail4:	wacom_destroy_battery(wacom);
++  fail3:	wacom_destroy_leds(wacom);
++  fail2:	wacom_remove_shared_data(wacom_wac);
+++>>>>>>> f81a1295cd9b (Input: wacom - prepare the driver to include BT devices)
+   fail1:	kfree(wacom);
+ -	hid_set_drvdata(hdev, NULL);
+  	return error;
+  }
+  
+ -static void wacom_remove(struct hid_device *hdev)
+ +static void wacom_disconnect(struct usb_interface *intf)
+  {
+ -	struct wacom *wacom = hid_get_drvdata(hdev);
+ +	struct wacom *wacom = usb_get_intfdata(intf);
+  
+ -	hid_hw_stop(hdev);
+ +	usb_set_intfdata(intf, NULL);
+  
+ +	usb_kill_urb(wacom->irq);
+  	cancel_work_sync(&wacom->work);
+++<<<<<<< HEAD
+ +	if (wacom->wacom_wac.input)
+ +		input_unregister_device(wacom->wacom_wac.input);
+++=======
++ 	wacom_unregister_inputs(wacom);
++ 	if (hdev->bus == BUS_BLUETOOTH)
++ 		device_remove_file(&hdev->dev, &dev_attr_speed);
+++>>>>>>> f81a1295cd9b (Input: wacom - prepare the driver to include BT devices)
+  	wacom_destroy_battery(wacom);
+  	wacom_destroy_leds(wacom);
+ +	usb_free_urb(wacom->irq);
+ +	usb_free_coherent(interface_to_usbdev(intf), WACOM_PKGLEN_MAX,
+ +			wacom->wacom_wac.data, wacom->data_dma);
+  	wacom_remove_shared_data(&wacom->wacom_wac);
+ -
+ -	hid_set_drvdata(hdev, NULL);
+  	kfree(wacom);
+  }
+  
+diff --cc drivers/hid/wacom_wac.h
+index d220d069f329,6cefa1e8c14b..000000000000
+--- a/drivers/hid/wacom_wac.h
++++ b/drivers/hid/wacom_wac.h
+@@@ -149,6 -166,11 +149,13 @@@ struct wacom_wac 
+  	int pid;
+  	int battery_capacity;
+  	int num_contacts_left;
+++<<<<<<< HEAD
+++=======
++ 	int bat_charging;
++ 	int ps_connected;
++ 	u8 bt_features;
++ 	u8 bt_high_speed;
+++>>>>>>> f81a1295cd9b (Input: wacom - prepare the driver to include BT devices)
+  };
+  
+  #endif
+* Unmerged path drivers/hid/wacom_sys.c
+* Unmerged path drivers/hid/wacom_wac.h
