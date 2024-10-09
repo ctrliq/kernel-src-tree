@@ -1,0 +1,130 @@
+PCI: pciehp: Always enable occupied slot on probe
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [pci] pciehp: Always enable occupied slot on probe (Myron Stowe) [1597948]
+Rebuild_FUZZ: 94.62%
+commit-author Lukas Wunner <lukas@wunner.de>
+commit cdf6b7362108708cea83dea347b9acf81a652d5f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/cdf6b736.failed
+
+Per PCIe r4.0, sec 6.7.3.4, a "port may optionally send an MSI when
+there are hot-plug events that occur while interrupt generation is
+disabled, and interrupt generation is subsequently enabled."
+
+On probe, we currently clear all event bits in the Slot Status register
+with the notable exception of the Presence Detect Changed bit.  Thereby
+we seek to receive an interrupt for an already occupied slot once event
+notification is enabled.
+
+But because the interrupt is optional, users may have to specify the
+pciehp_force parameter on the command line, which is inconvenient.
+
+Moreover, now that pciehp's event handling has become resilient to
+missed events, a Presence Detect Changed interrupt for a slot which is
+powered on is interpreted as removal of the card.  If the slot has
+already been brought up by the BIOS, receiving such an interrupt on
+probe causes the slot to be powered off and immediately back on, which
+is likewise undesirable.
+
+Avoid both issues by making the behavior of pciehp_force the default and
+clearing the Presence Detect Changed bit on probe.
+
+Note that the stated purpose of pciehp_force per the MODULE_PARM_DESC
+("Force pciehp, even if OSHP is missing") seems nonsensical because the
+OSHP control method is only relevant for SHCP slots according to the
+PCI Firmware specification r3.0, sec 4.8.
+
+	Signed-off-by: Lukas Wunner <lukas@wunner.de>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Cc: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Cc: Mika Westerberg <mika.westerberg@linux.intel.com>
+(cherry picked from commit cdf6b7362108708cea83dea347b9acf81a652d5f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/hotplug/pciehp_core.c
+diff --cc drivers/pci/hotplug/pciehp_core.c
+index 899bcafaf945,f4eaa9944699..000000000000
+--- a/drivers/pci/hotplug/pciehp_core.c
++++ b/drivers/pci/hotplug/pciehp_core.c
+@@@ -41,16 -30,11 +41,15 @@@
+  bool pciehp_debug;
+  bool pciehp_poll_mode;
+  int pciehp_poll_time;
+- static bool pciehp_force;
+  
+ -/*
+ - * not really modular, but the easiest way to keep compat with existing
+ - * bootargs behaviour is to continue using module_param here.
+ - */
+ +#define DRIVER_VERSION	"0.4"
+ +#define DRIVER_AUTHOR	"Dan Zink <dan.zink@compaq.com>, Greg Kroah-Hartman <greg@kroah.com>, Dely Sy <dely.l.sy@intel.com>"
+ +#define DRIVER_DESC	"PCI Express Hot Plug Controller Driver"
+ +
+ +MODULE_AUTHOR(DRIVER_AUTHOR);
+ +MODULE_DESCRIPTION(DRIVER_DESC);
+ +MODULE_LICENSE("GPL");
+ +
+  module_param(pciehp_debug, bool, 0644);
+  module_param(pciehp_poll_mode, bool, 0644);
+  module_param(pciehp_poll_time, int, 0644);
+@@@ -252,15 -228,23 +249,23 @@@ static int pciehp_probe(struct pcie_dev
+  		goto err_out_free_ctrl_slot;
+  	}
+  
+ -	/* Publish to user space */
+ -	slot = ctrl->slot;
+ -	rc = pci_hp_add(slot->hotplug_slot);
+ -	if (rc) {
+ -		ctrl_err(ctrl, "Publication to user space failed (%d)\n", rc);
+ -		goto err_out_shutdown_notification;
+ -	}
+ -
+  	/* Check if slot is occupied */
+ -	mutex_lock(&slot->lock);
+ +	slot = ctrl->slot;
+  	pciehp_get_adapter_status(slot, &occupied);
+  	pciehp_get_power_status(slot, &poweron);
+++<<<<<<< HEAD
+ +	if (occupied && pciehp_force) {
+ +		mutex_lock(&slot->hotplug_lock);
+ +		pciehp_enable_slot(slot);
+ +		mutex_unlock(&slot->hotplug_lock);
+ +	}
+++=======
++ 	if ((occupied && (slot->state == OFF_STATE ||
++ 			  slot->state == BLINKINGON_STATE)) ||
++ 	    (!occupied && (slot->state == ON_STATE ||
++ 			   slot->state == BLINKINGOFF_STATE)))
++ 		pciehp_request(ctrl, PCI_EXP_SLTSTA_PDC);
+++>>>>>>> cdf6b7362108 (PCI: pciehp: Always enable occupied slot on probe)
+  	/* If empty slot's power status is on, turn power off */
+  	if (!occupied && poweron && POWER_CTRL(ctrl))
+  		pciehp_power_off_slot(slot);
+* Unmerged path drivers/pci/hotplug/pciehp_core.c
+diff --git a/drivers/pci/hotplug/pciehp_hpc.c b/drivers/pci/hotplug/pciehp_hpc.c
+index 4b4e0d2f7a42..d39708d07d68 100644
+--- a/drivers/pci/hotplug/pciehp_hpc.c
++++ b/drivers/pci/hotplug/pciehp_hpc.c
+@@ -865,16 +865,11 @@ struct controller *pcie_init(struct pcie_device *dev)
+ 	if (link_cap & PCI_EXP_LNKCAP_DLLLARC)
+ 		ctrl->link_active_reporting = 1;
+ 
+-	/*
+-	 * Clear all remaining event bits in Slot Status register except
+-	 * Presence Detect Changed. We want to make sure possible
+-	 * hotplug event is triggered when the interrupt is unmasked so
+-	 * that we don't lose that event.
+-	 */
++	/* Clear all remaining event bits in Slot Status register. */
+ 	pcie_capability_write_word(pdev, PCI_EXP_SLTSTA,
+ 		PCI_EXP_SLTSTA_ABP | PCI_EXP_SLTSTA_PFD |
+ 		PCI_EXP_SLTSTA_MRLSC | PCI_EXP_SLTSTA_CC |
+-		PCI_EXP_SLTSTA_DLLSC);
++		PCI_EXP_SLTSTA_DLLSC | PCI_EXP_SLTSTA_PDC);
+ 
+ 	ctrl_info(ctrl, "Slot #%d AttnBtn%c PwrCtrl%c MRL%c AttnInd%c PwrInd%c HotPlug%c Surprise%c Interlock%c NoCompl%c LLActRep%c\n",
+ 		(slot_cap & PCI_EXP_SLTCAP_PSN) >> 19,
