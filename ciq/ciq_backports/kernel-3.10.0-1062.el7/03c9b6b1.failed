@@ -1,0 +1,585 @@
+ALSA: hda/ca0132 - Add AE-5 regular init setup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Connor McAdams <conmanx360@gmail.com>
+commit 03c9b6b1e02e6f798d5f554e8ecdc8a37242fa17
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/03c9b6b1.failed
+
+This patch adds AE-5 specific stuff to the ca0132_alt_init function.
+
+	Signed-off-by: Connor McAdams <conmanx360@gmail.com>
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 03c9b6b1e02e6f798d5f554e8ecdc8a37242fa17)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/pci/hda/patch_ca0132.c
+diff --cc sound/pci/hda/patch_ca0132.c
+index 20ce308ff039,bd90771827ca..000000000000
+--- a/sound/pci/hda/patch_ca0132.c
++++ b/sound/pci/hda/patch_ca0132.c
+@@@ -2763,6 -3131,242 +2763,245 @@@ static bool dspload_wait_loaded(struct 
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * ca0113 related functions. The ca0113 acts as the HDA bus for the pci-e
++  * based cards, and has a second mmio region, region2, that's used for special
++  * commands.
++  */
++ 
++ /*
++  * For cards with PCI-E region2 (Sound Blaster Z/ZxR, Recon3D, and AE-5)
++  * the mmio address 0x320 is used to set GPIO pins. The format for the data
++  * The first eight bits are just the number of the pin. So far, I've only seen
++  * this number go to 7.
++  * AE-5 note: The AE-5 seems to use pins 2 and 3 to somehow set the color value
++  * of the on-card LED. It seems to use pin 2 for data, then toggles 3 to on and
++  * then off to send that bit.
++  */
++ static void ca0113_mmio_gpio_set(struct hda_codec *codec, unsigned int gpio_pin,
++ 		bool enable)
++ {
++ 	struct ca0132_spec *spec = codec->spec;
++ 	unsigned short gpio_data;
++ 
++ 	gpio_data = gpio_pin & 0xF;
++ 	gpio_data |= ((enable << 8) & 0x100);
++ 
++ 	writew(gpio_data, spec->mem_base + 0x320);
++ }
++ 
++ /*
++  * Special pci region2 commands that are only used by the AE-5. They follow
++  * a set format, and require reads at certain points to seemingly 'clear'
++  * the response data. My first tests didn't do these reads, and would cause
++  * the card to get locked up until the memory was read. These commands
++  * seem to work with three distinct values that I've taken to calling group,
++  * target-id, and value.
++  */
++ static void ca0113_mmio_command_set(struct hda_codec *codec, unsigned int group,
++ 		unsigned int target, unsigned int value)
++ {
++ 	struct ca0132_spec *spec = codec->spec;
++ 	unsigned int write_val;
++ 
++ 	writel(0x0000007e, spec->mem_base + 0x210);
++ 	readl(spec->mem_base + 0x210);
++ 	writel(0x0000005a, spec->mem_base + 0x210);
++ 	readl(spec->mem_base + 0x210);
++ 	readl(spec->mem_base + 0x210);
++ 
++ 	writel(0x00800005, spec->mem_base + 0x20c);
++ 	writel(group, spec->mem_base + 0x804);
++ 
++ 	writel(0x00800005, spec->mem_base + 0x20c);
++ 	write_val = (target & 0xff);
++ 	write_val |= (value << 8);
++ 
++ 
++ 	writel(write_val, spec->mem_base + 0x204);
++ 	/*
++ 	 * Need delay here or else it goes too fast and works inconsistently.
++ 	 */
++ 	msleep(20);
++ 
++ 	readl(spec->mem_base + 0x860);
++ 	readl(spec->mem_base + 0x854);
++ 	readl(spec->mem_base + 0x840);
++ 
++ 	writel(0x00800004, spec->mem_base + 0x20c);
++ 	writel(0x00000000, spec->mem_base + 0x210);
++ 	readl(spec->mem_base + 0x210);
++ 	readl(spec->mem_base + 0x210);
++ }
++ 
++ /*
++  * Setup GPIO for the other variants of Core3D.
++  */
++ 
++ /*
++  * Sets up the GPIO pins so that they are discoverable. If this isn't done,
++  * the card shows as having no GPIO pins.
++  */
++ static void ca0132_gpio_init(struct hda_codec *codec)
++ {
++ 	struct ca0132_spec *spec = codec->spec;
++ 
++ 	switch (spec->quirk) {
++ 	case QUIRK_SBZ:
++ 	case QUIRK_AE5:
++ 		snd_hda_codec_write(codec, 0x01, 0, 0x793, 0x00);
++ 		snd_hda_codec_write(codec, 0x01, 0, 0x794, 0x53);
++ 		snd_hda_codec_write(codec, 0x01, 0, 0x790, 0x23);
++ 		break;
++ 	case QUIRK_R3DI:
++ 		snd_hda_codec_write(codec, 0x01, 0, 0x793, 0x00);
++ 		snd_hda_codec_write(codec, 0x01, 0, 0x794, 0x5B);
++ 		break;
++ 	}
++ 
++ }
++ 
++ /* Sets the GPIO for audio output. */
++ static void ca0132_gpio_setup(struct hda_codec *codec)
++ {
++ 	struct ca0132_spec *spec = codec->spec;
++ 
++ 	switch (spec->quirk) {
++ 	case QUIRK_SBZ:
++ 		snd_hda_codec_write(codec, 0x01, 0,
++ 				AC_VERB_SET_GPIO_DIRECTION, 0x07);
++ 		snd_hda_codec_write(codec, 0x01, 0,
++ 				AC_VERB_SET_GPIO_MASK, 0x07);
++ 		snd_hda_codec_write(codec, 0x01, 0,
++ 				AC_VERB_SET_GPIO_DATA, 0x04);
++ 		snd_hda_codec_write(codec, 0x01, 0,
++ 				AC_VERB_SET_GPIO_DATA, 0x06);
++ 		break;
++ 	case QUIRK_R3DI:
++ 		snd_hda_codec_write(codec, 0x01, 0,
++ 				AC_VERB_SET_GPIO_DIRECTION, 0x1E);
++ 		snd_hda_codec_write(codec, 0x01, 0,
++ 				AC_VERB_SET_GPIO_MASK, 0x1F);
++ 		snd_hda_codec_write(codec, 0x01, 0,
++ 				AC_VERB_SET_GPIO_DATA, 0x0C);
++ 		break;
++ 	}
++ }
++ 
++ /*
++  * GPIO control functions for the Recon3D integrated.
++  */
++ 
++ enum r3di_gpio_bit {
++ 	/* Bit 1 - Switch between front/rear mic. 0 = rear, 1 = front */
++ 	R3DI_MIC_SELECT_BIT = 1,
++ 	/* Bit 2 - Switch between headphone/line out. 0 = Headphone, 1 = Line */
++ 	R3DI_OUT_SELECT_BIT = 2,
++ 	/*
++ 	 * I dunno what this actually does, but it stays on until the dsp
++ 	 * is downloaded.
++ 	 */
++ 	R3DI_GPIO_DSP_DOWNLOADING = 3,
++ 	/*
++ 	 * Same as above, no clue what it does, but it comes on after the dsp
++ 	 * is downloaded.
++ 	 */
++ 	R3DI_GPIO_DSP_DOWNLOADED = 4
++ };
++ 
++ enum r3di_mic_select {
++ 	/* Set GPIO bit 1 to 0 for rear mic */
++ 	R3DI_REAR_MIC = 0,
++ 	/* Set GPIO bit 1 to 1 for front microphone*/
++ 	R3DI_FRONT_MIC = 1
++ };
++ 
++ enum r3di_out_select {
++ 	/* Set GPIO bit 2 to 0 for headphone */
++ 	R3DI_HEADPHONE_OUT = 0,
++ 	/* Set GPIO bit 2 to 1 for speaker */
++ 	R3DI_LINE_OUT = 1
++ };
++ enum r3di_dsp_status {
++ 	/* Set GPIO bit 3 to 1 until DSP is downloaded */
++ 	R3DI_DSP_DOWNLOADING = 0,
++ 	/* Set GPIO bit 4 to 1 once DSP is downloaded */
++ 	R3DI_DSP_DOWNLOADED = 1
++ };
++ 
++ 
++ static void r3di_gpio_mic_set(struct hda_codec *codec,
++ 		enum r3di_mic_select cur_mic)
++ {
++ 	unsigned int cur_gpio;
++ 
++ 	/* Get the current GPIO Data setup */
++ 	cur_gpio = snd_hda_codec_read(codec, 0x01, 0, AC_VERB_GET_GPIO_DATA, 0);
++ 
++ 	switch (cur_mic) {
++ 	case R3DI_REAR_MIC:
++ 		cur_gpio &= ~(1 << R3DI_MIC_SELECT_BIT);
++ 		break;
++ 	case R3DI_FRONT_MIC:
++ 		cur_gpio |= (1 << R3DI_MIC_SELECT_BIT);
++ 		break;
++ 	}
++ 	snd_hda_codec_write(codec, codec->core.afg, 0,
++ 			    AC_VERB_SET_GPIO_DATA, cur_gpio);
++ }
++ 
++ static void r3di_gpio_out_set(struct hda_codec *codec,
++ 		enum r3di_out_select cur_out)
++ {
++ 	unsigned int cur_gpio;
++ 
++ 	/* Get the current GPIO Data setup */
++ 	cur_gpio = snd_hda_codec_read(codec, 0x01, 0, AC_VERB_GET_GPIO_DATA, 0);
++ 
++ 	switch (cur_out) {
++ 	case R3DI_HEADPHONE_OUT:
++ 		cur_gpio &= ~(1 << R3DI_OUT_SELECT_BIT);
++ 		break;
++ 	case R3DI_LINE_OUT:
++ 		cur_gpio |= (1 << R3DI_OUT_SELECT_BIT);
++ 		break;
++ 	}
++ 	snd_hda_codec_write(codec, codec->core.afg, 0,
++ 			    AC_VERB_SET_GPIO_DATA, cur_gpio);
++ }
++ 
++ static void r3di_gpio_dsp_status_set(struct hda_codec *codec,
++ 		enum r3di_dsp_status dsp_status)
++ {
++ 	unsigned int cur_gpio;
++ 
++ 	/* Get the current GPIO Data setup */
++ 	cur_gpio = snd_hda_codec_read(codec, 0x01, 0, AC_VERB_GET_GPIO_DATA, 0);
++ 
++ 	switch (dsp_status) {
++ 	case R3DI_DSP_DOWNLOADING:
++ 		cur_gpio |= (1 << R3DI_GPIO_DSP_DOWNLOADING);
++ 		snd_hda_codec_write(codec, codec->core.afg, 0,
++ 				AC_VERB_SET_GPIO_DATA, cur_gpio);
++ 		break;
++ 	case R3DI_DSP_DOWNLOADED:
++ 		/* Set DOWNLOADING bit to 0. */
++ 		cur_gpio &= ~(1 << R3DI_GPIO_DSP_DOWNLOADING);
++ 
++ 		snd_hda_codec_write(codec, codec->core.afg, 0,
++ 				AC_VERB_SET_GPIO_DATA, cur_gpio);
++ 
++ 		cur_gpio |= (1 << R3DI_GPIO_DSP_DOWNLOADED);
++ 		break;
++ 	}
++ 
++ 	snd_hda_codec_write(codec, codec->core.afg, 0,
++ 			    AC_VERB_SET_GPIO_DATA, cur_gpio);
++ }
++ 
++ /*
+++>>>>>>> 03c9b6b1e02e (ALSA: hda/ca0132 - Add AE-5 regular init setup)
+   * PCM callbacks
+   */
+  static int ca0132_playback_pcm_prepare(struct hda_pcm_stream *hinfo,
+@@@ -4749,6 -7142,311 +4988,314 @@@ static void ca0132_exit_chip(struct hda
+  		dsp_reset(codec);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * This fixes a problem that was hard to reproduce. Very rarely, I would
++  * boot up, and there would be no sound, but the DSP indicated it had loaded
++  * properly. I did a few memory dumps to see if anything was different, and
++  * there were a few areas of memory uninitialized with a1a2a3a4. This function
++  * checks if those areas are uninitialized, and if they are, it'll attempt to
++  * reload the card 3 times. Usually it fixes by the second.
++  */
++ static void sbz_dsp_startup_check(struct hda_codec *codec)
++ {
++ 	struct ca0132_spec *spec = codec->spec;
++ 	unsigned int dsp_data_check[4];
++ 	unsigned int cur_address = 0x390;
++ 	unsigned int i;
++ 	unsigned int failure = 0;
++ 	unsigned int reload = 3;
++ 
++ 	if (spec->startup_check_entered)
++ 		return;
++ 
++ 	spec->startup_check_entered = true;
++ 
++ 	for (i = 0; i < 4; i++) {
++ 		chipio_read(codec, cur_address, &dsp_data_check[i]);
++ 		cur_address += 0x4;
++ 	}
++ 	for (i = 0; i < 4; i++) {
++ 		if (dsp_data_check[i] == 0xa1a2a3a4)
++ 			failure = 1;
++ 	}
++ 
++ 	codec_dbg(codec, "Startup Check: %d ", failure);
++ 	if (failure)
++ 		codec_info(codec, "DSP not initialized properly. Attempting to fix.");
++ 	/*
++ 	 * While the failure condition is true, and we haven't reached our
++ 	 * three reload limit, continue trying to reload the driver and
++ 	 * fix the issue.
++ 	 */
++ 	while (failure && (reload != 0)) {
++ 		codec_info(codec, "Reloading... Tries left: %d", reload);
++ 		sbz_exit_chip(codec);
++ 		spec->dsp_state = DSP_DOWNLOAD_INIT;
++ 		codec->patch_ops.init(codec);
++ 		failure = 0;
++ 		for (i = 0; i < 4; i++) {
++ 			chipio_read(codec, cur_address, &dsp_data_check[i]);
++ 			cur_address += 0x4;
++ 		}
++ 		for (i = 0; i < 4; i++) {
++ 			if (dsp_data_check[i] == 0xa1a2a3a4)
++ 				failure = 1;
++ 		}
++ 		reload--;
++ 	}
++ 
++ 	if (!failure && reload < 3)
++ 		codec_info(codec, "DSP fixed.");
++ 
++ 	if (!failure)
++ 		return;
++ 
++ 	codec_info(codec, "DSP failed to initialize properly. Either try a full shutdown or a suspend to clear the internal memory.");
++ }
++ 
++ /*
++  * This is for the extra volume verbs 0x797 (left) and 0x798 (right). These add
++  * extra precision for decibel values. If you had the dB value in floating point
++  * you would take the value after the decimal point, multiply by 64, and divide
++  * by 2. So for 8.59, it's (59 * 64) / 100. Useful if someone wanted to
++  * implement fixed point or floating point dB volumes. For now, I'll set them
++  * to 0 just incase a value has lingered from a boot into Windows.
++  */
++ static void ca0132_alt_vol_setup(struct hda_codec *codec)
++ {
++ 	snd_hda_codec_write(codec, 0x02, 0, 0x797, 0x00);
++ 	snd_hda_codec_write(codec, 0x02, 0, 0x798, 0x00);
++ 	snd_hda_codec_write(codec, 0x03, 0, 0x797, 0x00);
++ 	snd_hda_codec_write(codec, 0x03, 0, 0x798, 0x00);
++ 	snd_hda_codec_write(codec, 0x04, 0, 0x797, 0x00);
++ 	snd_hda_codec_write(codec, 0x04, 0, 0x798, 0x00);
++ 	snd_hda_codec_write(codec, 0x07, 0, 0x797, 0x00);
++ 	snd_hda_codec_write(codec, 0x07, 0, 0x798, 0x00);
++ }
++ 
++ /*
++  * Extra commands that don't really fit anywhere else.
++  */
++ static void sbz_pre_dsp_setup(struct hda_codec *codec)
++ {
++ 	struct ca0132_spec *spec = codec->spec;
++ 
++ 	writel(0x00820680, spec->mem_base + 0x01C);
++ 	writel(0x00820680, spec->mem_base + 0x01C);
++ 
++ 	chipio_write(codec, 0x18b0a4, 0x000000c2);
++ 
++ 	snd_hda_codec_write(codec, 0x11, 0,
++ 			AC_VERB_SET_PIN_WIDGET_CONTROL, 0x44);
++ }
++ 
++ static void r3d_pre_dsp_setup(struct hda_codec *codec)
++ {
++ 	chipio_write(codec, 0x18b0a4, 0x000000c2);
++ 
++ 	snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
++ 			    VENDOR_CHIPIO_8051_ADDRESS_LOW, 0x1E);
++ 	snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
++ 			    VENDOR_CHIPIO_8051_ADDRESS_HIGH, 0x1C);
++ 	snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
++ 			    VENDOR_CHIPIO_8051_DATA_WRITE, 0x5B);
++ 
++ 	snd_hda_codec_write(codec, 0x11, 0,
++ 			AC_VERB_SET_PIN_WIDGET_CONTROL, 0x44);
++ }
++ 
++ static void r3di_pre_dsp_setup(struct hda_codec *codec)
++ {
++ 	chipio_write(codec, 0x18b0a4, 0x000000c2);
++ 
++ 	snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
++ 			    VENDOR_CHIPIO_8051_ADDRESS_LOW, 0x1E);
++ 	snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
++ 			    VENDOR_CHIPIO_8051_ADDRESS_HIGH, 0x1C);
++ 	snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
++ 			    VENDOR_CHIPIO_8051_DATA_WRITE, 0x5B);
++ 
++ 	snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
++ 			    VENDOR_CHIPIO_8051_ADDRESS_LOW, 0x20);
++ 	snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
++ 			    VENDOR_CHIPIO_8051_ADDRESS_HIGH, 0x19);
++ 	snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
++ 			    VENDOR_CHIPIO_8051_DATA_WRITE, 0x00);
++ 	snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
++ 			    VENDOR_CHIPIO_8051_DATA_WRITE, 0x40);
++ 
++ 	snd_hda_codec_write(codec, 0x11, 0,
++ 			AC_VERB_SET_PIN_WIDGET_CONTROL, 0x04);
++ }
++ 
++ /*
++  * These are sent before the DSP is downloaded. Not sure
++  * what they do, or if they're necessary. Could possibly
++  * be removed. Figure they're better to leave in.
++  */
++ static void ca0132_mmio_init(struct hda_codec *codec)
++ {
++ 	struct ca0132_spec *spec = codec->spec;
++ 
++ 	if (spec->quirk == QUIRK_AE5)
++ 		writel(0x00000001, spec->mem_base + 0x400);
++ 	else
++ 		writel(0x00000000, spec->mem_base + 0x400);
++ 
++ 	if (spec->quirk == QUIRK_AE5)
++ 		writel(0x00000001, spec->mem_base + 0x408);
++ 	else
++ 		writel(0x00000000, spec->mem_base + 0x408);
++ 
++ 	if (spec->quirk == QUIRK_AE5)
++ 		writel(0x00000001, spec->mem_base + 0x40c);
++ 	else
++ 		writel(0x00000000, spec->mem_base + 0x40C);
++ 
++ 	writel(0x00880680, spec->mem_base + 0x01C);
++ 
++ 	if (spec->quirk == QUIRK_AE5)
++ 		writel(0x00000080, spec->mem_base + 0xC0C);
++ 	else
++ 		writel(0x00000083, spec->mem_base + 0xC0C);
++ 
++ 	writel(0x00000030, spec->mem_base + 0xC00);
++ 	writel(0x00000000, spec->mem_base + 0xC04);
++ 
++ 	if (spec->quirk == QUIRK_AE5)
++ 		writel(0x00000000, spec->mem_base + 0xC0C);
++ 	else
++ 		writel(0x00000003, spec->mem_base + 0xC0C);
++ 
++ 	writel(0x00000003, spec->mem_base + 0xC0C);
++ 	writel(0x00000003, spec->mem_base + 0xC0C);
++ 	writel(0x00000003, spec->mem_base + 0xC0C);
++ 
++ 	if (spec->quirk == QUIRK_AE5)
++ 		writel(0x00000001, spec->mem_base + 0xC08);
++ 	else
++ 		writel(0x000000C1, spec->mem_base + 0xC08);
++ 
++ 	writel(0x000000F1, spec->mem_base + 0xC08);
++ 	writel(0x00000001, spec->mem_base + 0xC08);
++ 	writel(0x000000C7, spec->mem_base + 0xC08);
++ 	writel(0x000000C1, spec->mem_base + 0xC08);
++ 	writel(0x00000080, spec->mem_base + 0xC04);
++ 
++ 	if (spec->quirk == QUIRK_AE5) {
++ 		writel(0x00000000, spec->mem_base + 0x42c);
++ 		writel(0x00000000, spec->mem_base + 0x46c);
++ 		writel(0x00000000, spec->mem_base + 0x4ac);
++ 		writel(0x00000000, spec->mem_base + 0x4ec);
++ 		writel(0x00000000, spec->mem_base + 0x43c);
++ 		writel(0x00000000, spec->mem_base + 0x47c);
++ 		writel(0x00000000, spec->mem_base + 0x4bc);
++ 		writel(0x00000000, spec->mem_base + 0x4fc);
++ 		writel(0x00000600, spec->mem_base + 0x100);
++ 		writel(0x00000014, spec->mem_base + 0x410);
++ 		writel(0x0000060f, spec->mem_base + 0x100);
++ 		writel(0x0000070f, spec->mem_base + 0x100);
++ 		writel(0x00000aff, spec->mem_base + 0x830);
++ 		writel(0x00000000, spec->mem_base + 0x86c);
++ 		writel(0x0000006b, spec->mem_base + 0x800);
++ 		writel(0x00000001, spec->mem_base + 0x86c);
++ 		writel(0x0000006b, spec->mem_base + 0x800);
++ 		writel(0x00000057, spec->mem_base + 0x804);
++ 		writel(0x00800000, spec->mem_base + 0x20c);
++ 	}
++ }
++ 
++ /*
++  * This function writes to some SFR's, does some region2 writes, and then
++  * eventually resets the codec with the 0x7ff verb. Not quite sure why it does
++  * what it does.
++  */
++ static void ae5_register_set(struct hda_codec *codec)
++ {
++ 	struct ca0132_spec *spec = codec->spec;
++ 
++ 	chipio_8051_write_direct(codec, 0x93, 0x10);
++ 	snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
++ 			    VENDOR_CHIPIO_8051_ADDRESS_LOW, 0x44);
++ 	snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
++ 			    VENDOR_CHIPIO_PLL_PMU_WRITE, 0xc2);
++ 
++ 	writeb(0x0f, spec->mem_base + 0x304);
++ 	writeb(0x0f, spec->mem_base + 0x304);
++ 	writeb(0x0f, spec->mem_base + 0x304);
++ 	writeb(0x0f, spec->mem_base + 0x304);
++ 	writeb(0x0e, spec->mem_base + 0x100);
++ 	writeb(0x1f, spec->mem_base + 0x304);
++ 	writeb(0x0c, spec->mem_base + 0x100);
++ 	writeb(0x3f, spec->mem_base + 0x304);
++ 	writeb(0x08, spec->mem_base + 0x100);
++ 	writeb(0x7f, spec->mem_base + 0x304);
++ 	writeb(0x00, spec->mem_base + 0x100);
++ 	writeb(0xff, spec->mem_base + 0x304);
++ 
++ 	ca0113_mmio_command_set(codec, 0x30, 0x2d, 0x3f);
++ 
++ 	chipio_8051_write_direct(codec, 0x90, 0x00);
++ 	chipio_8051_write_direct(codec, 0x90, 0x10);
++ 
++ 	ca0113_mmio_command_set(codec, 0x48, 0x07, 0x83);
++ 
++ 	chipio_write(codec, 0x18b0a4, 0x000000c2);
++ 
++ 	snd_hda_codec_write(codec, 0x01, 0, 0x7ff, 0x00);
++ 	snd_hda_codec_write(codec, 0x01, 0, 0x7ff, 0x00);
++ }
++ 
++ /*
++  * Extra init functions for alternative ca0132 codecs. Done
++  * here so they don't clutter up the main ca0132_init function
++  * anymore than they have to.
++  */
++ static void ca0132_alt_init(struct hda_codec *codec)
++ {
++ 	struct ca0132_spec *spec = codec->spec;
++ 
++ 	ca0132_alt_vol_setup(codec);
++ 
++ 	switch (spec->quirk) {
++ 	case QUIRK_SBZ:
++ 		codec_dbg(codec, "SBZ alt_init");
++ 		ca0132_gpio_init(codec);
++ 		sbz_pre_dsp_setup(codec);
++ 		snd_hda_sequence_write(codec, spec->chip_init_verbs);
++ 		snd_hda_sequence_write(codec, spec->desktop_init_verbs);
++ 		break;
++ 	case QUIRK_R3DI:
++ 		codec_dbg(codec, "R3DI alt_init");
++ 		ca0132_gpio_init(codec);
++ 		ca0132_gpio_setup(codec);
++ 		r3di_gpio_dsp_status_set(codec, R3DI_DSP_DOWNLOADING);
++ 		r3di_pre_dsp_setup(codec);
++ 		snd_hda_sequence_write(codec, spec->chip_init_verbs);
++ 		snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0, 0x6FF, 0xC4);
++ 		break;
++ 	case QUIRK_R3D:
++ 		r3d_pre_dsp_setup(codec);
++ 		snd_hda_sequence_write(codec, spec->chip_init_verbs);
++ 		snd_hda_sequence_write(codec, spec->desktop_init_verbs);
++ 		break;
++ 	case QUIRK_AE5:
++ 		ca0132_gpio_init(codec);
++ 		snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
++ 				VENDOR_CHIPIO_8051_ADDRESS_LOW, 0x49);
++ 		snd_hda_codec_write(codec, WIDGET_CHIP_CTRL, 0,
++ 				VENDOR_CHIPIO_PLL_PMU_WRITE, 0x88);
++ 		chipio_write(codec, 0x18b030, 0x00000020);
++ 		snd_hda_sequence_write(codec, spec->chip_init_verbs);
++ 		snd_hda_sequence_write(codec, spec->desktop_init_verbs);
++ 		ca0113_mmio_command_set(codec, 0x30, 0x32, 0x3f);
++ 		break;
++ 	}
++ }
++ 
+++>>>>>>> 03c9b6b1e02e (ALSA: hda/ca0132 - Add AE-5 regular init setup)
+  static int ca0132_init(struct hda_codec *codec)
+  {
+  	struct ca0132_spec *spec = codec->spec;
+* Unmerged path sound/pci/hda/patch_ca0132.c
