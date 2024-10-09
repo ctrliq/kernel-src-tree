@@ -1,0 +1,321 @@
+sysvipc: make get_maxid O(1) again
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Davidlohr Bueso <dave@stgolabs.net>
+commit 15df03c87983660a4d1eedb4541778592bd97684
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/15df03c8.failed
+
+For a custom microbenchmark on a 3.30GHz Xeon SandyBridge, which calls
+IPC_STAT over and over, it was calculated that, on avg the cost of
+ipc_get_maxid() for increasing amounts of keys was:
+
+ 10 keys: ~900 cycles
+ 100 keys: ~15000 cycles
+ 1000 keys: ~150000 cycles
+ 10000 keys: ~2100000 cycles
+
+This is unsurprising as maxid is currently O(n).
+
+By having the max_id available in O(1) we save all those cycles for each
+semctl(_STAT) command, the idr_find can be expensive -- which some real
+(customer) workloads actually poll on.
+
+Note that this used to be the case, until commit 7ca7e564e04 ("ipc:
+store ipcs into IDRs").  The cost is the extra idr_find when doing
+RMIDs, but we simply go backwards, and should not take too many
+iterations to find the new value.
+
+[akpm@linux-foundation.org: coding-style fixes]
+Link: http://lkml.kernel.org/r/20170831172049.14576-5-dave@stgolabs.net
+	Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+	Cc: Manfred Spraul <manfred@colorfullife.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 15df03c87983660a4d1eedb4541778592bd97684)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/ipc_namespace.h
+#	ipc/util.c
+#	ipc/util.h
+diff --cc include/linux/ipc_namespace.h
+index 3077f12384f0,b5630c8eb2f3..000000000000
+--- a/include/linux/ipc_namespace.h
++++ b/include/linux/ipc_namespace.h
+@@@ -21,10 -16,14 +21,15 @@@ struct user_namespace
+  struct ipc_ids {
+  	int in_use;
+  	unsigned short seq;
+ -	bool tables_initialized;
+ +	unsigned short seq_max;
+  	struct rw_semaphore rwsem;
+  	struct idr ipcs_idr;
+++<<<<<<< HEAD
+++=======
++ 	int max_id;
++ #ifdef CONFIG_CHECKPOINT_RESTORE
+++>>>>>>> 15df03c87983 (sysvipc: make get_maxid O(1) again)
+  	int next_id;
+ -#endif
+ -	struct rhashtable key_ht;
+  };
+  
+  struct ipc_namespace {
+diff --cc ipc/util.c
+index 1df75a61612b,ff045fec8d83..000000000000
+--- a/ipc/util.c
++++ b/ipc/util.c
+@@@ -130,30 -96,37 +130,41 @@@ static int __init ipc_init(void
+  }
+  device_initcall(ipc_init);
+  
+ -static const struct rhashtable_params ipc_kht_params = {
+ -	.head_offset		= offsetof(struct kern_ipc_perm, khtnode),
+ -	.key_offset		= offsetof(struct kern_ipc_perm, key),
+ -	.key_len		= FIELD_SIZEOF(struct kern_ipc_perm, key),
+ -	.locks_mul		= 1,
+ -	.automatic_shrinking	= true,
+ -};
+ -
+  /**
+ - * ipc_init_ids	- initialise ipc identifiers
+ - * @ids: ipc identifier set
+ + *	ipc_init_ids		-	initialise IPC identifiers
+ + *	@ids: Identifier set
+   *
+ - * Set up the sequence range to use for the ipc identifier range (limited
+ - * below IPCMNI) then initialise the keys hashtable and ids idr.
+ + *	Set up the sequence range to use for the ipc identifier range (limited
+ + *	below IPCMNI) then initialise the ids idr.
+   */
+ -int ipc_init_ids(struct ipc_ids *ids)
+ + 
+ +void ipc_init_ids(struct ipc_ids *ids)
+  {
+ -	int err;
+ +	init_rwsem(&ids->rwsem);
+ +
+  	ids->in_use = 0;
+  	ids->seq = 0;
+++<<<<<<< HEAD
+++=======
++ 	init_rwsem(&ids->rwsem);
++ 	err = rhashtable_init(&ids->key_ht, &ipc_kht_params);
++ 	if (err)
++ 		return err;
++ 	idr_init(&ids->ipcs_idr);
++ 	ids->tables_initialized = true;
++ 	ids->max_id = -1;
++ #ifdef CONFIG_CHECKPOINT_RESTORE
+++>>>>>>> 15df03c87983 (sysvipc: make get_maxid O(1) again)
+  	ids->next_id = -1;
+ -#endif
+ -	return 0;
+ +	{
+ +		int seq_limit = INT_MAX/SEQ_MULTIPLIER;
+ +		if (seq_limit > USHRT_MAX)
+ +			ids->seq_max = USHRT_MAX;
+ +		 else
+ +		 	ids->seq_max = seq_limit;
+ +	}
+ +
+ +	idr_init(&ids->ipcs_idr);
+  }
+  
+  #ifdef CONFIG_PROC_FS
+@@@ -226,51 -189,60 +237,94 @@@ static struct kern_ipc_perm *ipc_findke
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + *	ipc_get_maxid 	-	get the last assigned id
+ + *	@ids: IPC identifier set
+ + *
+ + *	Called with ipc_ids.rwsem held.
+ + */
+ +
+ +int ipc_get_maxid(struct ipc_ids *ids)
+ +{
+ +	struct kern_ipc_perm *ipc;
+ +	int max_id = -1;
+ +	int total, id;
+ +
+ +	if (ids->in_use == 0)
+ +		return -1;
+ +
+ +	if (ids->in_use == IPCMNI)
+ +		return IPCMNI - 1;
+ +
+ +	/* Look for the last assigned id */
+ +	total = 0;
+ +	for (id = 0; id < IPCMNI && total < ids->in_use; id++) {
+ +		ipc = idr_find(&ids->ipcs_idr, id);
+ +		if (ipc != NULL) {
+ +			max_id = id;
+ +			total++;
+ +		}
+ +	}
+ +	return max_id;
+ +}
+ +
+++=======
++ #ifdef CONFIG_CHECKPOINT_RESTORE
++ /*
++  * Specify desired id for next allocated IPC object.
++  */
++ #define ipc_idr_alloc(ids, new)						\
++ 	idr_alloc(&(ids)->ipcs_idr, (new),				\
++ 		  (ids)->next_id < 0 ? 0 : ipcid_to_idx((ids)->next_id),\
++ 		  0, GFP_NOWAIT)
++ 
++ static inline int ipc_buildid(int id, struct ipc_ids *ids,
++ 			      struct kern_ipc_perm *new)
++ {
++ 	if (ids->next_id < 0) { /* default, behave as !CHECKPOINT_RESTORE */
++ 		new->seq = ids->seq++;
++ 		if (ids->seq > IPCID_SEQ_MAX)
++ 			ids->seq = 0;
++ 	} else {
++ 		new->seq = ipcid_to_seqx(ids->next_id);
++ 		ids->next_id = -1;
++ 	}
++ 
++ 	return SEQ_MULTIPLIER * new->seq + id;
++ }
++ 
++ #else
++ #define ipc_idr_alloc(ids, new)					\
++ 	idr_alloc(&(ids)->ipcs_idr, (new), 0, 0, GFP_NOWAIT)
++ 
++ static inline int ipc_buildid(int id, struct ipc_ids *ids,
++ 			      struct kern_ipc_perm *new)
++ {
++ 	new->seq = ids->seq++;
++ 	if (ids->seq > IPCID_SEQ_MAX)
++ 		ids->seq = 0;
++ 
++ 	return SEQ_MULTIPLIER * new->seq + id;
++ }
++ 
++ #endif /* CONFIG_CHECKPOINT_RESTORE */
++ 
+++>>>>>>> 15df03c87983 (sysvipc: make get_maxid O(1) again)
+  /**
+ - * ipc_addid - add an ipc identifier
+ - * @ids: ipc identifier set
+ - * @new: new ipc permission set
+ - * @limit: limit for the number of used ids
+ + *	ipc_addid 	-	add an IPC identifier
+ + *	@ids: IPC identifier set
+ + *	@new: new IPC permission set
+ + *	@size: limit for the number of used ids
+   *
+ - * Add an entry 'new' to the ipc ids idr. The permissions object is
+ - * initialised and the first free entry is set up and the id assigned
+ - * is returned. The 'new' entry is returned in a locked state on success.
+ - * On failure the entry is not locked and a negative err-code is returned.
+ + *	Add an entry 'new' to the IPC ids idr. The permissions object is
+ + *	initialised and the first free entry is set up and the id assigned
+ + *	is returned. The 'new' entry is returned in a locked state on success.
+ + *	On failure the entry is not locked and a negative err-code is returned.
+   *
+ - * Called with writer ipc_ids.rwsem held.
+ + *	Called with writer ipc_ids.rwsem held.
+   */
+ -int ipc_addid(struct ipc_ids *ids, struct kern_ipc_perm *new, int limit)
+ +int ipc_addid(struct ipc_ids* ids, struct kern_ipc_perm* new, int size)
+  {
+  	kuid_t euid;
+  	kgid_t egid;
+@@@ -305,17 -284,11 +359,24 @@@
+  	}
+  
+  	ids->in_use++;
+++<<<<<<< HEAD
+++=======
++ 	if (id > ids->max_id)
++ 		ids->max_id = id;
++ 
++ 	new->id = ipc_buildid(id, ids, new);
+++>>>>>>> 15df03c87983 (sysvipc: make get_maxid O(1) again)
+ +
+ +	if (next_id < 0) {
+ +		new->seq = ids->seq++;
+ +		if (ids->seq > ids->seq_max)
+ +			ids->seq = 0;
+ +	} else {
+ +		new->seq = ipcid_to_seqx(next_id);
+ +		ids->next_id = -1;
+ +	}
+  
+ +	new->id = ipc_buildid(id, new->seq);
+  	return id;
+  }
+  
+@@@ -444,12 -430,18 +505,23 @@@ void ipc_rmid(struct ipc_ids *ids, stru
+  	int lid = ipcid_to_idx(ipcp->id);
+  
+  	idr_remove(&ids->ipcs_idr, lid);
+ -	ipc_kht_remove(ids, ipcp);
+ +
+  	ids->in_use--;
+ +
+  	ipcp->deleted = true;
+  
+++<<<<<<< HEAD
+ +	return;
+++=======
++ 	if (unlikely(lid == ids->max_id)) {
++ 		do {
++ 			lid--;
++ 			if (lid == -1)
++ 				break;
++ 		} while (!idr_find(&ids->ipcs_idr, lid));
++ 		ids->max_id = lid;
++ 	}
+++>>>>>>> 15df03c87983 (sysvipc: make get_maxid O(1) again)
+  }
+  
+  /**
+diff --cc ipc/util.h
+index a1cbc3aaf25a,89b8ec176fc4..000000000000
+--- a/ipc/util.h
++++ b/ipc/util.h
+@@@ -113,11 -106,25 +111,30 @@@ void ipc_rmid(struct ipc_ids *, struct 
+  /* must be called with ipcp locked */
+  int ipcperms(struct ipc_namespace *ns, struct kern_ipc_perm *ipcp, short flg);
+  
+++<<<<<<< HEAD
+ +/* for rare, potentially huge allocations.
+ + * both function can sleep
+ + */
+ +void* ipc_alloc(int size);
+ +void ipc_free(void* ptr, int size);
+++=======
++ /**
++  * ipc_get_maxid - get the last assigned id
++  * @ids: ipc identifier set
++  *
++  * Called with ipc_ids.rwsem held for reading.
++  */
++ static inline int ipc_get_maxid(struct ipc_ids *ids)
++ {
++ 	if (ids->in_use == 0)
++ 		return -1;
++ 
++ 	if (ids->in_use == IPCMNI)
++ 		return IPCMNI - 1;
++ 
++ 	return ids->max_id;
++ }
+++>>>>>>> 15df03c87983 (sysvipc: make get_maxid O(1) again)
+  
+  /*
+   * For allocation that need to be freed by RCU.
+* Unmerged path include/linux/ipc_namespace.h
+* Unmerged path ipc/util.c
+* Unmerged path ipc/util.h
