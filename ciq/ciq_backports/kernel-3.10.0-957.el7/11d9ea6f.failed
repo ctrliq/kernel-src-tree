@@ -1,0 +1,104 @@
+nvme-loop: fix kernel oops in case of unhandled command
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 11d9ea6f2ca69237d35d6c55755beba3e006b106
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/11d9ea6f.failed
+
+When nvmet_req_init() fails, __nvmet_req_complete() is called
+to handle the target request via .queue_response(), so
+nvme_loop_queue_response() shouldn't be called again for
+handling the failure.
+
+This patch fixes this case by the following way:
+
+- move blk_mq_start_request() before nvmet_req_init(), so
+nvme_loop_queue_response() may work well to complete this
+host request
+
+- don't call nvme_cleanup_cmd() which is done in nvme_loop_complete_rq()
+
+- don't call nvme_loop_queue_response() which is done via
+.queue_response()
+
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+[trimmed changelog]
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 11d9ea6f2ca69237d35d6c55755beba3e006b106)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/target/loop.c
+diff --cc drivers/nvme/target/loop.c
+index 21dcbdab74e4,b9d5b69d8548..000000000000
+--- a/drivers/nvme/target/loop.c
++++ b/drivers/nvme/target/loop.c
+@@@ -160,42 -164,40 +160,46 @@@ static int nvme_loop_queue_rq(struct bl
+  	struct nvme_loop_queue *queue = hctx->driver_data;
+  	struct request *req = bd->rq;
+  	struct nvme_loop_iod *iod = blk_mq_rq_to_pdu(req);
+ -	blk_status_t ret;
+ -
+ -	ret = nvme_loop_is_ready(queue, req);
+ -	if (unlikely(ret))
+ -		return ret;
+ +	int ret;
+  
+  	ret = nvme_setup_cmd(ns, req, &iod->cmd);
+ -	if (ret)
+ +	if (ret != BLK_MQ_RQ_QUEUE_OK)
+  		return ret;
+  
++ 	blk_mq_start_request(req);
+  	iod->cmd.common.flags |= NVME_CMD_SGL_METABUF;
+  	iod->req.port = nvmet_loop_port;
+  	if (!nvmet_req_init(&iod->req, &queue->nvme_cq,
+++<<<<<<< HEAD
+ +			&queue->nvme_sq, &nvme_loop_ops)) {
+ +		nvme_cleanup_cmd(req);
+ +		blk_mq_start_request(req);
+ +		nvme_loop_queue_response(&iod->req);
+ +		return BLK_MQ_RQ_QUEUE_OK;
+ +	}
+++=======
++ 			&queue->nvme_sq, &nvme_loop_ops))
++ 		return BLK_STS_OK;
+++>>>>>>> 11d9ea6f2ca6 (nvme-loop: fix kernel oops in case of unhandled command)
+  
+ -	if (blk_rq_payload_bytes(req)) {
+ +	if (blk_rq_bytes(req)) {
+  		iod->sg_table.sgl = iod->first_sgl;
+ -		if (sg_alloc_table_chained(&iod->sg_table,
+ -				blk_rq_nr_phys_segments(req),
+ -				iod->sg_table.sgl))
+ -			return BLK_STS_RESOURCE;
+ +		ret = sg_alloc_table_chained(&iod->sg_table,
+ +					     req->nr_phys_segments, GFP_ATOMIC, 
+ +					     iod->sg_table.sgl);
+ +		if (ret)
+ +			return BLK_MQ_RQ_QUEUE_BUSY;
+  
+  		iod->req.sg = iod->sg_table.sgl;
+  		iod->req.sg_cnt = blk_rq_map_sg(req->q, req, iod->sg_table.sgl);
+ -		iod->req.transfer_len = blk_rq_payload_bytes(req);
+ +		BUG_ON(iod->req.sg_cnt > req->nr_phys_segments);
+  	}
+  
+- 	blk_mq_start_request(req);
+- 
+  	schedule_work(&iod->work);
+ -	return BLK_STS_OK;
+ +	return BLK_MQ_RQ_QUEUE_OK;
+  }
+  
+ -static void nvme_loop_submit_async_event(struct nvme_ctrl *arg)
+ +static void nvme_loop_submit_async_event(struct nvme_ctrl *arg, int aer_idx)
+  {
+  	struct nvme_loop_ctrl *ctrl = to_loop_ctrl(arg);
+  	struct nvme_loop_queue *queue = &ctrl->queues[0];
+* Unmerged path drivers/nvme/target/loop.c
