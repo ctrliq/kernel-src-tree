@@ -1,0 +1,1154 @@
+scsi: lpfc: add Trunking support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [scsi] lpfc: add Trunking support (Dick Kennedy) [1642905]
+Rebuild_FUZZ: 89.66%
+commit-author James Smart <jsmart2021@gmail.com>
+commit 1dc5ec2452025cc36726cdf97d813b34301fbbba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/1dc5ec24.failed
+
+Add trunking support to the driver. Trunking is found on more recent
+asics. In general, trunking appears as a single "port" to the driver
+and overall behavior doesn't differ. Link speed is reported as an
+aggregate value, while link speed control is done on a per-physical
+link basis with all links in the trunk symmetrical. Some commands
+returning port information are updated to additionally provide
+trunking information. And new ACQEs are generated to report physical
+link events relative to the trunk.
+
+This patch contains the following modifications:
+
+- Added link speed settings of 128GB and 256GB.
+
+- Added handling of trunk-related ACQEs, mainly logging and trapping
+  of physical link statuses.
+
+- Added additional bsg interface to query trunk state by applications.
+
+- Augment link_state sysfs attribtute to display trunk link status
+
+	Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+	Signed-off-by: James Smart <jsmart2021@gmail.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 1dc5ec2452025cc36726cdf97d813b34301fbbba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_bsg.c
+#	drivers/scsi/lpfc/lpfc_bsg.h
+diff --cc drivers/scsi/lpfc/lpfc_bsg.c
+index cd54eb39f32f,43dcd1daa616..000000000000
+--- a/drivers/scsi/lpfc/lpfc_bsg.c
++++ b/drivers/scsi/lpfc/lpfc_bsg.c
+@@@ -5240,6 -5307,387 +5240,390 @@@ job_error
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * lpfc_check_fwlog_support: Check FW log support on the adapter
++  * @phba: Pointer to HBA context object.
++  *
++  * Check if FW Logging support by the adapter
++  **/
++ int
++ lpfc_check_fwlog_support(struct lpfc_hba *phba)
++ {
++ 	struct lpfc_ras_fwlog *ras_fwlog = NULL;
++ 
++ 	ras_fwlog = &phba->ras_fwlog;
++ 
++ 	if (ras_fwlog->ras_hwsupport == false)
++ 		return -EACCES;
++ 	else if (ras_fwlog->ras_enabled == false)
++ 		return -EPERM;
++ 	else
++ 		return 0;
++ }
++ 
++ /**
++  * lpfc_bsg_get_ras_config: Get RAS configuration settings
++  * @job: fc_bsg_job to handle
++  *
++  * Get RAS configuration values set.
++  **/
++ static int
++ lpfc_bsg_get_ras_config(struct bsg_job *job)
++ {
++ 	struct Scsi_Host *shost = fc_bsg_to_shost(job);
++ 	struct lpfc_vport *vport = shost_priv(shost);
++ 	struct fc_bsg_reply *bsg_reply = job->reply;
++ 	struct lpfc_hba *phba = vport->phba;
++ 	struct lpfc_bsg_get_ras_config_reply *ras_reply;
++ 	struct lpfc_ras_fwlog *ras_fwlog = &phba->ras_fwlog;
++ 	int rc = 0;
++ 
++ 	if (job->request_len <
++ 	    sizeof(struct fc_bsg_request) +
++ 	    sizeof(struct lpfc_bsg_ras_req)) {
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_LIBDFC,
++ 				"6181 Received RAS_LOG request "
++ 				"below minimum size\n");
++ 		rc = -EINVAL;
++ 		goto ras_job_error;
++ 	}
++ 
++ 	/* Check FW log status */
++ 	rc = lpfc_check_fwlog_support(phba);
++ 	if (rc == -EACCES || rc == -EPERM)
++ 		goto ras_job_error;
++ 
++ 	ras_reply = (struct lpfc_bsg_get_ras_config_reply *)
++ 		bsg_reply->reply_data.vendor_reply.vendor_rsp;
++ 
++ 	/* Current logging state */
++ 	if (ras_fwlog->ras_active == true)
++ 		ras_reply->state = LPFC_RASLOG_STATE_RUNNING;
++ 	else
++ 		ras_reply->state = LPFC_RASLOG_STATE_STOPPED;
++ 
++ 	ras_reply->log_level = phba->ras_fwlog.fw_loglevel;
++ 	ras_reply->log_buff_sz = phba->cfg_ras_fwlog_buffsize;
++ 
++ ras_job_error:
++ 	/* make error code available to userspace */
++ 	bsg_reply->result = rc;
++ 
++ 	/* complete the job back to userspace */
++ 	bsg_job_done(job, bsg_reply->result, bsg_reply->reply_payload_rcv_len);
++ 	return rc;
++ }
++ 
++ /**
++  * lpfc_ras_stop_fwlog: Disable FW logging by the adapter
++  * @phba: Pointer to HBA context object.
++  *
++  * Disable FW logging into host memory on the adapter. To
++  * be done before reading logs from the host memory.
++  **/
++ static void
++ lpfc_ras_stop_fwlog(struct lpfc_hba *phba)
++ {
++ 	struct lpfc_ras_fwlog *ras_fwlog = &phba->ras_fwlog;
++ 
++ 	ras_fwlog->ras_active = false;
++ 
++ 	/* Disable FW logging to host memory */
++ 	writel(LPFC_CTL_PDEV_CTL_DDL_RAS,
++ 	       phba->sli4_hba.conf_regs_memmap_p + LPFC_CTL_PDEV_CTL_OFFSET);
++ }
++ 
++ /**
++  * lpfc_bsg_set_ras_config: Set FW logging parameters
++  * @job: fc_bsg_job to handle
++  *
++  * Set log-level parameters for FW-logging in host memory
++  **/
++ static int
++ lpfc_bsg_set_ras_config(struct bsg_job *job)
++ {
++ 	struct Scsi_Host *shost = fc_bsg_to_shost(job);
++ 	struct lpfc_vport *vport = shost_priv(shost);
++ 	struct lpfc_hba *phba = vport->phba;
++ 	struct lpfc_bsg_set_ras_config_req *ras_req;
++ 	struct fc_bsg_request *bsg_request = job->request;
++ 	struct lpfc_ras_fwlog *ras_fwlog = &phba->ras_fwlog;
++ 	struct fc_bsg_reply *bsg_reply = job->reply;
++ 	uint8_t action = 0, log_level = 0;
++ 	int rc = 0, action_status = 0;
++ 
++ 	if (job->request_len <
++ 	    sizeof(struct fc_bsg_request) +
++ 	    sizeof(struct lpfc_bsg_set_ras_config_req)) {
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_LIBDFC,
++ 				"6182 Received RAS_LOG request "
++ 				"below minimum size\n");
++ 		rc = -EINVAL;
++ 		goto ras_job_error;
++ 	}
++ 
++ 	/* Check FW log status */
++ 	rc = lpfc_check_fwlog_support(phba);
++ 	if (rc == -EACCES || rc == -EPERM)
++ 		goto ras_job_error;
++ 
++ 	ras_req = (struct lpfc_bsg_set_ras_config_req *)
++ 		bsg_request->rqst_data.h_vendor.vendor_cmd;
++ 	action = ras_req->action;
++ 	log_level = ras_req->log_level;
++ 
++ 	if (action == LPFC_RASACTION_STOP_LOGGING) {
++ 		/* Check if already disabled */
++ 		if (ras_fwlog->ras_active == false) {
++ 			rc = -ESRCH;
++ 			goto ras_job_error;
++ 		}
++ 
++ 		/* Disable logging */
++ 		lpfc_ras_stop_fwlog(phba);
++ 	} else {
++ 		/*action = LPFC_RASACTION_START_LOGGING*/
++ 
++ 		/* Even though FW-logging is active re-initialize
++ 		 * FW-logging with new log-level. Return status
++ 		 * "Logging already Running" to caller.
++ 		 **/
++ 		if (ras_fwlog->ras_active)
++ 			action_status = -EINPROGRESS;
++ 
++ 		/* Enable logging */
++ 		rc = lpfc_sli4_ras_fwlog_init(phba, log_level,
++ 					      LPFC_RAS_ENABLE_LOGGING);
++ 		if (rc) {
++ 			rc = -EINVAL;
++ 			goto ras_job_error;
++ 		}
++ 
++ 		/* Check if FW-logging is re-initialized */
++ 		if (action_status == -EINPROGRESS)
++ 			rc = action_status;
++ 	}
++ ras_job_error:
++ 	/* make error code available to userspace */
++ 	bsg_reply->result = rc;
++ 
++ 	/* complete the job back to userspace */
++ 	bsg_job_done(job, bsg_reply->result,
++ 		       bsg_reply->reply_payload_rcv_len);
++ 
++ 	return rc;
++ }
++ 
++ /**
++  * lpfc_bsg_get_ras_lwpd: Get log write position data
++  * @job: fc_bsg_job to handle
++  *
++  * Get Offset/Wrap count of the log message written
++  * in host memory
++  **/
++ static int
++ lpfc_bsg_get_ras_lwpd(struct bsg_job *job)
++ {
++ 	struct Scsi_Host *shost = fc_bsg_to_shost(job);
++ 	struct lpfc_vport *vport = shost_priv(shost);
++ 	struct lpfc_bsg_get_ras_lwpd *ras_reply;
++ 	struct lpfc_hba *phba = vport->phba;
++ 	struct lpfc_ras_fwlog *ras_fwlog = &phba->ras_fwlog;
++ 	struct fc_bsg_reply *bsg_reply = job->reply;
++ 	u32 *lwpd_ptr = NULL;
++ 	int rc = 0;
++ 
++ 	rc = lpfc_check_fwlog_support(phba);
++ 	if (rc == -EACCES || rc == -EPERM)
++ 		goto ras_job_error;
++ 
++ 	if (job->request_len <
++ 	    sizeof(struct fc_bsg_request) +
++ 	    sizeof(struct lpfc_bsg_ras_req)) {
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_LIBDFC,
++ 				"6183 Received RAS_LOG request "
++ 				"below minimum size\n");
++ 		rc = -EINVAL;
++ 		goto ras_job_error;
++ 	}
++ 
++ 	ras_reply = (struct lpfc_bsg_get_ras_lwpd *)
++ 		bsg_reply->reply_data.vendor_reply.vendor_rsp;
++ 
++ 	/* Get lwpd offset */
++ 	lwpd_ptr = (uint32_t *)(ras_fwlog->lwpd.virt);
++ 	ras_reply->offset = be32_to_cpu(*lwpd_ptr & 0xffffffff);
++ 
++ 	/* Get wrap count */
++ 	ras_reply->wrap_count = be32_to_cpu(*(++lwpd_ptr) & 0xffffffff);
++ 
++ ras_job_error:
++ 	/* make error code available to userspace */
++ 	bsg_reply->result = rc;
++ 
++ 	/* complete the job back to userspace */
++ 	bsg_job_done(job, bsg_reply->result, bsg_reply->reply_payload_rcv_len);
++ 
++ 	return rc;
++ }
++ 
++ /**
++  * lpfc_bsg_get_ras_fwlog: Read FW log
++  * @job: fc_bsg_job to handle
++  *
++  * Copy the FW log into the passed buffer.
++  **/
++ static int
++ lpfc_bsg_get_ras_fwlog(struct bsg_job *job)
++ {
++ 	struct Scsi_Host *shost = fc_bsg_to_shost(job);
++ 	struct lpfc_vport *vport = shost_priv(shost);
++ 	struct lpfc_hba *phba = vport->phba;
++ 	struct fc_bsg_request *bsg_request = job->request;
++ 	struct fc_bsg_reply *bsg_reply = job->reply;
++ 	struct lpfc_bsg_get_fwlog_req *ras_req;
++ 	u32 rd_offset, rd_index, offset;
++ 	void *src, *fwlog_buff;
++ 	struct lpfc_ras_fwlog *ras_fwlog = NULL;
++ 	struct lpfc_dmabuf *dmabuf, *next;
++ 	int rc = 0;
++ 
++ 	ras_fwlog = &phba->ras_fwlog;
++ 
++ 	rc = lpfc_check_fwlog_support(phba);
++ 	if (rc == -EACCES || rc == -EPERM)
++ 		goto ras_job_error;
++ 
++ 	/* Logging to be stopped before reading */
++ 	if (ras_fwlog->ras_active == true) {
++ 		rc = -EINPROGRESS;
++ 		goto ras_job_error;
++ 	}
++ 
++ 	if (job->request_len <
++ 	    sizeof(struct fc_bsg_request) +
++ 	    sizeof(struct lpfc_bsg_get_fwlog_req)) {
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_LIBDFC,
++ 				"6184 Received RAS_LOG request "
++ 				"below minimum size\n");
++ 		rc = -EINVAL;
++ 		goto ras_job_error;
++ 	}
++ 
++ 	ras_req = (struct lpfc_bsg_get_fwlog_req *)
++ 		bsg_request->rqst_data.h_vendor.vendor_cmd;
++ 	rd_offset = ras_req->read_offset;
++ 
++ 	/* Allocate memory to read fw log*/
++ 	fwlog_buff = vmalloc(ras_req->read_size);
++ 	if (!fwlog_buff) {
++ 		rc = -ENOMEM;
++ 		goto ras_job_error;
++ 	}
++ 
++ 	rd_index = (rd_offset / LPFC_RAS_MAX_ENTRY_SIZE);
++ 	offset = (rd_offset % LPFC_RAS_MAX_ENTRY_SIZE);
++ 
++ 	list_for_each_entry_safe(dmabuf, next,
++ 			      &ras_fwlog->fwlog_buff_list, list) {
++ 
++ 		if (dmabuf->buffer_tag < rd_index)
++ 			continue;
++ 
++ 		src = dmabuf->virt + offset;
++ 		memcpy(fwlog_buff, src, ras_req->read_size);
++ 		break;
++ 	}
++ 
++ 	bsg_reply->reply_payload_rcv_len =
++ 		sg_copy_from_buffer(job->reply_payload.sg_list,
++ 				    job->reply_payload.sg_cnt,
++ 				    fwlog_buff, ras_req->read_size);
++ 
++ 	vfree(fwlog_buff);
++ 
++ ras_job_error:
++ 	bsg_reply->result = rc;
++ 	bsg_job_done(job, bsg_reply->result, bsg_reply->reply_payload_rcv_len);
++ 
++ 	return rc;
++ }
++ 
++ static int
++ lpfc_get_trunk_info(struct bsg_job *job)
++ {
++ 	struct lpfc_vport *vport = shost_priv(fc_bsg_to_shost(job));
++ 	struct lpfc_hba *phba = vport->phba;
++ 	struct fc_bsg_reply *bsg_reply = job->reply;
++ 	struct lpfc_trunk_info *event_reply;
++ 	int rc = 0;
++ 
++ 	if (job->request_len <
++ 	    sizeof(struct fc_bsg_request) + sizeof(struct get_trunk_info_req)) {
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_LIBDFC,
++ 				"2744 Received GET TRUNK _INFO request below "
++ 				"minimum size\n");
++ 		rc = -EINVAL;
++ 		goto job_error;
++ 	}
++ 
++ 	event_reply = (struct lpfc_trunk_info *)
++ 		bsg_reply->reply_data.vendor_reply.vendor_rsp;
++ 
++ 	if (job->reply_len <
++ 	    sizeof(struct fc_bsg_request) + sizeof(struct lpfc_trunk_info)) {
++ 		lpfc_printf_log(phba, KERN_WARNING, LOG_LIBDFC,
++ 				"2728 Received GET TRUNK _INFO reply below "
++ 				"minimum size\n");
++ 		rc = -EINVAL;
++ 		goto job_error;
++ 	}
++ 	if (event_reply == NULL) {
++ 		rc = -EINVAL;
++ 		goto job_error;
++ 	}
++ 
++ 	bsg_bf_set(lpfc_trunk_info_link_status, event_reply,
++ 		   (phba->link_state >= LPFC_LINK_UP) ? 1 : 0);
++ 
++ 	bsg_bf_set(lpfc_trunk_info_trunk_active0, event_reply,
++ 		   (phba->trunk_link.link0.state == LPFC_LINK_UP) ? 1 : 0);
++ 
++ 	bsg_bf_set(lpfc_trunk_info_trunk_active1, event_reply,
++ 		   (phba->trunk_link.link1.state == LPFC_LINK_UP) ? 1 : 0);
++ 
++ 	bsg_bf_set(lpfc_trunk_info_trunk_active2, event_reply,
++ 		   (phba->trunk_link.link2.state == LPFC_LINK_UP) ? 1 : 0);
++ 
++ 	bsg_bf_set(lpfc_trunk_info_trunk_active3, event_reply,
++ 		   (phba->trunk_link.link3.state == LPFC_LINK_UP) ? 1 : 0);
++ 
++ 	bsg_bf_set(lpfc_trunk_info_trunk_config0, event_reply,
++ 		   bf_get(lpfc_conf_trunk_port0, &phba->sli4_hba));
++ 
++ 	bsg_bf_set(lpfc_trunk_info_trunk_config1, event_reply,
++ 		   bf_get(lpfc_conf_trunk_port1, &phba->sli4_hba));
++ 
++ 	bsg_bf_set(lpfc_trunk_info_trunk_config2, event_reply,
++ 		   bf_get(lpfc_conf_trunk_port2, &phba->sli4_hba));
++ 
++ 	bsg_bf_set(lpfc_trunk_info_trunk_config3, event_reply,
++ 		   bf_get(lpfc_conf_trunk_port3, &phba->sli4_hba));
++ 
++ 	event_reply->port_speed = phba->sli4_hba.link_state.speed / 1000;
++ 	event_reply->logical_speed =
++ 				phba->sli4_hba.link_state.logical_speed / 100;
++ job_error:
++ 	bsg_reply->result = rc;
++ 	bsg_job_done(job, bsg_reply->result,
++ 		       bsg_reply->reply_payload_rcv_len);
++ 	return rc;
++ 
++ }
++ 
++ /**
+++>>>>>>> 1dc5ec245202 (scsi: lpfc: add Trunking support)
+   * lpfc_bsg_hst_vendor - process a vendor-specific fc_bsg_job
+   * @job: fc_bsg_job to handle
+   **/
+@@@ -5284,11 -5734,26 +5668,29 @@@ lpfc_bsg_hst_vendor(struct fc_bsg_job *
+  	case LPFC_BSG_VENDOR_FORCED_LINK_SPEED:
+  		rc = lpfc_forced_link_speed(job);
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case LPFC_BSG_VENDOR_RAS_GET_LWPD:
++ 		rc = lpfc_bsg_get_ras_lwpd(job);
++ 		break;
++ 	case LPFC_BSG_VENDOR_RAS_GET_FWLOG:
++ 		rc = lpfc_bsg_get_ras_fwlog(job);
++ 		break;
++ 	case LPFC_BSG_VENDOR_RAS_GET_CONFIG:
++ 		rc = lpfc_bsg_get_ras_config(job);
++ 		break;
++ 	case LPFC_BSG_VENDOR_RAS_SET_CONFIG:
++ 		rc = lpfc_bsg_set_ras_config(job);
++ 		break;
++ 	case LPFC_BSG_VENDOR_GET_TRUNK_INFO:
++ 		rc = lpfc_get_trunk_info(job);
++ 		break;
+++>>>>>>> 1dc5ec245202 (scsi: lpfc: add Trunking support)
+  	default:
+  		rc = -EINVAL;
+ -		bsg_reply->reply_payload_rcv_len = 0;
+ +		job->reply->reply_payload_rcv_len = 0;
+  		/* make error code available to userspace */
+ -		bsg_reply->result = rc;
+ +		job->reply->result = rc;
+  		break;
+  	}
+  
+diff --cc drivers/scsi/lpfc/lpfc_bsg.h
+index 32347c87e3b4,9151824beea4..000000000000
+--- a/drivers/scsi/lpfc/lpfc_bsg.h
++++ b/drivers/scsi/lpfc/lpfc_bsg.h
+@@@ -38,6 -38,11 +38,14 @@@
+  #define LPFC_BSG_VENDOR_DIAG_MODE_END		10
+  #define LPFC_BSG_VENDOR_LINK_DIAG_TEST		11
+  #define LPFC_BSG_VENDOR_FORCED_LINK_SPEED	14
+++<<<<<<< HEAD
+++=======
++ #define LPFC_BSG_VENDOR_RAS_GET_LWPD		16
++ #define LPFC_BSG_VENDOR_RAS_GET_FWLOG		17
++ #define LPFC_BSG_VENDOR_RAS_GET_CONFIG		18
++ #define LPFC_BSG_VENDOR_RAS_SET_CONFIG		19
++ #define LPFC_BSG_VENDOR_GET_TRUNK_INFO		20
+++>>>>>>> 1dc5ec245202 (scsi: lpfc: add Trunking support)
+  
+  struct set_ct_event {
+  	uint32_t command;
+@@@ -296,6 -301,75 +304,78 @@@ struct forced_link_speed_support_reply 
+  	uint8_t supported;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct lpfc_bsg_ras_req {
++ 	uint32_t command;
++ };
++ 
++ struct lpfc_bsg_get_fwlog_req {
++ 	uint32_t command;
++ 	uint32_t read_size;
++ 	uint32_t read_offset;
++ };
++ 
++ struct lpfc_bsg_get_ras_lwpd {
++ 	uint32_t offset;
++ 	uint32_t wrap_count;
++ };
++ 
++ struct lpfc_bsg_set_ras_config_req {
++ 	uint32_t command;
++ 	uint8_t action;
++ #define LPFC_RASACTION_STOP_LOGGING     0x00
++ #define LPFC_RASACTION_START_LOGGING    0x01
++ 	uint8_t log_level;
++ };
++ 
++ struct lpfc_bsg_get_ras_config_reply {
++ 	uint8_t state;
++ #define LPFC_RASLOG_STATE_STOPPED 0x00
++ #define LPFC_RASLOG_STATE_RUNNING 0x01
++ 	uint8_t log_level;
++ 	uint32_t log_buff_sz;
++ };
++ 
++ struct lpfc_trunk_info {
++ 	uint32_t word0;
++ #define lpfc_trunk_info_link_status_SHIFT      0
++ #define lpfc_trunk_info_link_status_MASK       1
++ #define lpfc_trunk_info_link_status_WORD       word0
++ #define lpfc_trunk_info_trunk_active0_SHIFT    8
++ #define lpfc_trunk_info_trunk_active0_MASK     1
++ #define lpfc_trunk_info_trunk_active0_WORD     word0
++ #define lpfc_trunk_info_trunk_active1_SHIFT    9
++ #define lpfc_trunk_info_trunk_active1_MASK     1
++ #define lpfc_trunk_info_trunk_active1_WORD     word0
++ #define lpfc_trunk_info_trunk_active2_SHIFT    10
++ #define lpfc_trunk_info_trunk_active2_MASK     1
++ #define lpfc_trunk_info_trunk_active2_WORD     word0
++ #define lpfc_trunk_info_trunk_active3_SHIFT    11
++ #define lpfc_trunk_info_trunk_active3_MASK     1
++ #define lpfc_trunk_info_trunk_active3_WORD     word0
++ #define lpfc_trunk_info_trunk_config0_SHIFT    12
++ #define lpfc_trunk_info_trunk_config0_MASK     1
++ #define lpfc_trunk_info_trunk_config0_WORD     word0
++ #define lpfc_trunk_info_trunk_config1_SHIFT    13
++ #define lpfc_trunk_info_trunk_config1_MASK     1
++ #define lpfc_trunk_info_trunk_config1_WORD     word0
++ #define lpfc_trunk_info_trunk_config2_SHIFT    14
++ #define lpfc_trunk_info_trunk_config2_MASK     1
++ #define lpfc_trunk_info_trunk_config2_WORD     word0
++ #define lpfc_trunk_info_trunk_config3_SHIFT    15
++ #define lpfc_trunk_info_trunk_config3_MASK     1
++ #define lpfc_trunk_info_trunk_config3_WORD     word0
++ 	uint16_t    port_speed;
++ 	uint16_t    logical_speed;
++ 	uint32_t    reserved3;
++ };
++ 
++ struct get_trunk_info_req {
++ 	uint32_t command;
++ };
++ 
+++>>>>>>> 1dc5ec245202 (scsi: lpfc: add Trunking support)
+  /* driver only */
+  #define SLI_CONFIG_NOT_HANDLED		0
+  #define SLI_CONFIG_HANDLED		1
+diff --git a/drivers/scsi/lpfc/lpfc.h b/drivers/scsi/lpfc/lpfc.h
+index 82cbd7627dfd..e53d3f56f6b8 100644
+--- a/drivers/scsi/lpfc/lpfc.h
++++ b/drivers/scsi/lpfc/lpfc.h
+@@ -335,6 +335,18 @@ enum hba_state {
+ 	LPFC_HBA_ERROR       =  -1
+ };
+ 
++struct lpfc_trunk_link_state {
++	enum hba_state state;
++	uint8_t fault;
++};
++
++struct lpfc_trunk_link  {
++	struct lpfc_trunk_link_state link0,
++				     link1,
++				     link2,
++				     link3;
++};
++
+ struct lpfc_vport {
+ 	struct lpfc_hba *phba;
+ 	struct list_head listentry;
+@@ -665,6 +677,7 @@ struct lpfc_hba {
+ 	uint32_t iocb_cmd_size;
+ 	uint32_t iocb_rsp_size;
+ 
++	struct lpfc_trunk_link  trunk_link;
+ 	enum hba_state link_state;
+ 	uint32_t link_flag;	/* link state flags */
+ #define LS_LOOPBACK_MODE      0x1	/* NPort is in Loopback mode */
+diff --git a/drivers/scsi/lpfc/lpfc_attr.c b/drivers/scsi/lpfc/lpfc_attr.c
+index 65ae8f73a78f..7aab609c3194 100644
+--- a/drivers/scsi/lpfc/lpfc_attr.c
++++ b/drivers/scsi/lpfc/lpfc_attr.c
+@@ -883,6 +883,42 @@ lpfc_link_state_show(struct device *dev, struct device_attribute *attr,
+ 		}
+ 	}
+ 
++	if ((phba->sli_rev == LPFC_SLI_REV4) &&
++	    ((bf_get(lpfc_sli_intf_if_type,
++	     &phba->sli4_hba.sli_intf) ==
++	     LPFC_SLI_INTF_IF_TYPE_6))) {
++		struct lpfc_trunk_link link = phba->trunk_link;
++
++		if (bf_get(lpfc_conf_trunk_port0, &phba->sli4_hba))
++			len += snprintf(buf + len, PAGE_SIZE - len,
++				"Trunk port 0: Link %s %s\n",
++				(link.link0.state == LPFC_LINK_UP) ?
++				 "Up" : "Down. ",
++				trunk_errmsg[link.link0.fault]);
++
++		if (bf_get(lpfc_conf_trunk_port1, &phba->sli4_hba))
++			len += snprintf(buf + len, PAGE_SIZE - len,
++				"Trunk port 1: Link %s %s\n",
++				(link.link1.state == LPFC_LINK_UP) ?
++				 "Up" : "Down. ",
++				trunk_errmsg[link.link1.fault]);
++
++		if (bf_get(lpfc_conf_trunk_port2, &phba->sli4_hba))
++			len += snprintf(buf + len, PAGE_SIZE - len,
++				"Trunk port 2: Link %s %s\n",
++				(link.link2.state == LPFC_LINK_UP) ?
++				 "Up" : "Down. ",
++				trunk_errmsg[link.link2.fault]);
++
++		if (bf_get(lpfc_conf_trunk_port3, &phba->sli4_hba))
++			len += snprintf(buf + len, PAGE_SIZE - len,
++				"Trunk port 3: Link %s %s\n",
++				(link.link3.state == LPFC_LINK_UP) ?
++				 "Up" : "Down. ",
++				trunk_errmsg[link.link3.fault]);
++
++	}
++
+ 	return len;
+ }
+ 
+@@ -1430,6 +1466,66 @@ lpfc_nport_evt_cnt_show(struct device *dev, struct device_attribute *attr,
+ 	return snprintf(buf, PAGE_SIZE, "%d\n", phba->nport_event_cnt);
+ }
+ 
++int
++lpfc_set_trunking(struct lpfc_hba *phba, char *buff_out)
++{
++	LPFC_MBOXQ_t *mbox = NULL;
++	unsigned long val = 0;
++	char *pval = 0;
++	int rc = 0;
++
++	if (!strncmp("enable", buff_out,
++				 strlen("enable"))) {
++		pval = buff_out + strlen("enable") + 1;
++		rc = kstrtoul(pval, 0, &val);
++		if (rc)
++			return rc; /* Invalid  number */
++	} else if (!strncmp("disable", buff_out,
++				 strlen("disable"))) {
++		val = 0;
++	} else {
++		return -EINVAL;  /* Invalid command */
++	}
++
++	switch (val) {
++	case 0:
++		val = 0x0; /* Disable */
++		break;
++	case 2:
++		val = 0x1; /* Enable two port trunk */
++		break;
++	case 4:
++		val = 0x2; /* Enable four port trunk */
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	lpfc_printf_log(phba, KERN_ERR, LOG_MBOX,
++			"0070 Set trunk mode with val %ld ", val);
++
++	mbox = mempool_alloc(phba->mbox_mem_pool, GFP_KERNEL);
++	if (!mbox)
++		return -ENOMEM;
++
++	lpfc_sli4_config(phba, mbox, LPFC_MBOX_SUBSYSTEM_FCOE,
++			 LPFC_MBOX_OPCODE_FCOE_FC_SET_TRUNK_MODE,
++			 12, LPFC_SLI4_MBX_EMBED);
++
++	bf_set(lpfc_mbx_set_trunk_mode,
++	       &mbox->u.mqe.un.set_trunk_mode,
++	       val);
++	rc = lpfc_sli_issue_mbox(phba, mbox, MBX_POLL);
++	if (rc)
++		lpfc_printf_log(phba, KERN_ERR, LOG_MBOX,
++				"0071 Set trunk mode failed with status: %d",
++				rc);
++	if (rc != MBX_TIMEOUT)
++		mempool_free(mbox, phba->mbox_mem_pool);
++
++	return 0;
++}
++
+ /**
+  * lpfc_board_mode_show - Return the state of the board
+  * @dev: class device that is converted into a Scsi_host.
+@@ -1522,6 +1618,8 @@ lpfc_board_mode_store(struct device *dev, struct device_attribute *attr,
+ 		status = lpfc_sli4_pdev_reg_request(phba, LPFC_FW_RESET);
+ 	else if (strncmp(buf, "dv_reset", sizeof("dv_reset") - 1) == 0)
+ 		status = lpfc_sli4_pdev_reg_request(phba, LPFC_DV_RESET);
++	else if (strncmp(buf, "trunk", sizeof("trunk") - 1) == 0)
++		status = lpfc_set_trunking(phba, (char *)buf + sizeof("trunk"));
+ 	else
+ 		status = -EINVAL;
+ 
+@@ -6003,6 +6101,9 @@ lpfc_get_host_speed(struct Scsi_Host *shost)
+ 		case LPFC_LINK_SPEED_64GHZ:
+ 			fc_host_speed(shost) = FC_PORTSPEED_64GBIT;
+ 			break;
++		case LPFC_LINK_SPEED_128GHZ:
++			fc_host_speed(shost) = FC_PORTSPEED_128GBIT;
++			break;
+ 		default:
+ 			fc_host_speed(shost) = FC_PORTSPEED_UNKNOWN;
+ 			break;
+* Unmerged path drivers/scsi/lpfc/lpfc_bsg.c
+* Unmerged path drivers/scsi/lpfc/lpfc_bsg.h
+diff --git a/drivers/scsi/lpfc/lpfc_ct.c b/drivers/scsi/lpfc/lpfc_ct.c
+index 2b621f4023f6..d43d2680c074 100644
+--- a/drivers/scsi/lpfc/lpfc_ct.c
++++ b/drivers/scsi/lpfc/lpfc_ct.c
+@@ -2340,6 +2340,8 @@ lpfc_fdmi_port_attr_support_speed(struct lpfc_vport *vport,
+ 
+ 	ae->un.AttrInt = 0;
+ 	if (!(phba->hba_flag & HBA_FCOE_MODE)) {
++		if (phba->lmt & LMT_128Gb)
++			ae->un.AttrInt |= HBA_PORTSPEED_128GFC;
+ 		if (phba->lmt & LMT_64Gb)
+ 			ae->un.AttrInt |= HBA_PORTSPEED_64GFC;
+ 		if (phba->lmt & LMT_32Gb)
+@@ -2416,6 +2418,9 @@ lpfc_fdmi_port_attr_speed(struct lpfc_vport *vport,
+ 		case LPFC_LINK_SPEED_64GHZ:
+ 			ae->un.AttrInt = HBA_PORTSPEED_64GFC;
+ 			break;
++		case LPFC_LINK_SPEED_128GHZ:
++			ae->un.AttrInt = HBA_PORTSPEED_128GFC;
++			break;
+ 		default:
+ 			ae->un.AttrInt = HBA_PORTSPEED_UNKNOWN;
+ 			break;
+diff --git a/drivers/scsi/lpfc/lpfc_els.c b/drivers/scsi/lpfc/lpfc_els.c
+index 9a31bdeae6d8..f1232d8ec9b3 100644
+--- a/drivers/scsi/lpfc/lpfc_els.c
++++ b/drivers/scsi/lpfc/lpfc_els.c
+@@ -5375,6 +5375,8 @@ lpfc_rdp_res_speed(struct fc_rdp_port_speed_desc *desc, struct lpfc_hba *phba)
+ 
+ 	desc->info.port_speed.speed = cpu_to_be16(rdp_speed);
+ 
++	if (phba->lmt & LMT_128Gb)
++		rdp_cap |= RDP_PS_128GB;
+ 	if (phba->lmt & LMT_64Gb)
+ 		rdp_cap |= RDP_PS_64GB;
+ 	if (phba->lmt & LMT_32Gb)
+diff --git a/drivers/scsi/lpfc/lpfc_hbadisc.c b/drivers/scsi/lpfc/lpfc_hbadisc.c
+index 97ef75626013..4a517e4339c8 100644
+--- a/drivers/scsi/lpfc/lpfc_hbadisc.c
++++ b/drivers/scsi/lpfc/lpfc_hbadisc.c
+@@ -3112,6 +3112,7 @@ lpfc_mbx_process_link_up(struct lpfc_hba *phba, struct lpfc_mbx_read_top *la)
+ 		case LPFC_LINK_SPEED_16GHZ:
+ 		case LPFC_LINK_SPEED_32GHZ:
+ 		case LPFC_LINK_SPEED_64GHZ:
++		case LPFC_LINK_SPEED_128GHZ:
+ 			break;
+ 		default:
+ 			phba->fc_linkspeed = LPFC_LINK_SPEED_UNKNOWN;
+diff --git a/drivers/scsi/lpfc/lpfc_hw4.h b/drivers/scsi/lpfc/lpfc_hw4.h
+index 44bdd7404fe2..cf307cb3f330 100644
+--- a/drivers/scsi/lpfc/lpfc_hw4.h
++++ b/drivers/scsi/lpfc/lpfc_hw4.h
+@@ -1033,6 +1033,7 @@ struct mbox_header {
+ #define LPFC_MBOX_OPCODE_FCOE_SET_FCLINK_SETTINGS	0x21
+ #define LPFC_MBOX_OPCODE_FCOE_LINK_DIAG_STATE		0x22
+ #define LPFC_MBOX_OPCODE_FCOE_LINK_DIAG_LOOPBACK	0x23
++#define LPFC_MBOX_OPCODE_FCOE_FC_SET_TRUNK_MODE		0x42
+ 
+ /* Mailbox command structures */
+ struct eq_context {
+@@ -2737,6 +2738,9 @@ struct lpfc_mbx_read_config {
+ #define lpfc_mbx_rd_conf_lnk_ldv_SHIFT		8
+ #define lpfc_mbx_rd_conf_lnk_ldv_MASK		0x00000001
+ #define lpfc_mbx_rd_conf_lnk_ldv_WORD		word2
++#define lpfc_mbx_rd_conf_trunk_SHIFT		12
++#define lpfc_mbx_rd_conf_trunk_MASK		0x0000000F
++#define lpfc_mbx_rd_conf_trunk_WORD		word2
+ #define lpfc_mbx_rd_conf_topology_SHIFT		24
+ #define lpfc_mbx_rd_conf_topology_MASK		0x000000FF
+ #define lpfc_mbx_rd_conf_topology_WORD		word2
+@@ -3472,6 +3476,15 @@ struct lpfc_mbx_set_host_data {
+ 	uint8_t  data[LPFC_HOST_OS_DRIVER_VERSION_SIZE];
+ };
+ 
++struct lpfc_mbx_set_trunk_mode {
++	struct mbox_header header;
++	uint32_t word0;
++#define lpfc_mbx_set_trunk_mode_WORD      word0
++#define lpfc_mbx_set_trunk_mode_SHIFT     0
++#define lpfc_mbx_set_trunk_mode_MASK      0xFF
++	uint32_t word1;
++	uint32_t word2;
++};
+ 
+ struct lpfc_mbx_get_sli4_parameters {
+ 	struct mbox_header header;
+@@ -3871,6 +3884,7 @@ struct lpfc_mqe {
+ 		struct lpfc_mbx_set_feature  set_feature;
+ 		struct lpfc_mbx_memory_dump_type3 mem_dump_type3;
+ 		struct lpfc_mbx_set_host_data set_host_data;
++		struct lpfc_mbx_set_trunk_mode set_trunk_mode;
+ 		struct lpfc_mbx_nop nop;
+ 	} un;
+ };
+@@ -4006,6 +4020,23 @@ struct lpfc_acqe_grp5 {
+ 	uint32_t trailer;
+ };
+ 
++static char *const trunk_errmsg[] = {	/* map errcode */
++	"",	/* There is no such error code at index 0*/
++	"link negotiated speed does not match existing"
++		" trunk - link was \"low\" speed",
++	"link negotiated speed does not match"
++		" existing trunk - link was \"middle\" speed",
++	"link negotiated speed does not match existing"
++		" trunk - link was \"high\" speed",
++	"Attached to non-trunking port - F_Port",
++	"Attached to non-trunking port - N_Port",
++	"FLOGI response timeout",
++	"non-FLOGI frame received",
++	"Invalid FLOGI response",
++	"Trunking initialization protocol",
++	"Trunk peer device mismatch",
++};
++
+ struct lpfc_acqe_fc_la {
+ 	uint32_t word0;
+ #define lpfc_acqe_fc_la_speed_SHIFT		24
+@@ -4039,6 +4070,7 @@ struct lpfc_acqe_fc_la {
+ #define LPFC_FC_LA_TYPE_MDS_LINK_DOWN	0x4
+ #define LPFC_FC_LA_TYPE_MDS_LOOPBACK	0x5
+ #define LPFC_FC_LA_TYPE_UNEXP_WWPN	0x6
++#define LPFC_FC_LA_TYPE_TRUNKING_EVENT  0x7
+ #define lpfc_acqe_fc_la_port_type_SHIFT		6
+ #define lpfc_acqe_fc_la_port_type_MASK		0x00000003
+ #define lpfc_acqe_fc_la_port_type_WORD		word0
+@@ -4047,6 +4079,32 @@ struct lpfc_acqe_fc_la {
+ #define lpfc_acqe_fc_la_port_number_SHIFT	0
+ #define lpfc_acqe_fc_la_port_number_MASK	0x0000003F
+ #define lpfc_acqe_fc_la_port_number_WORD	word0
++
++/* Attention Type is 0x07 (Trunking Event) word0 */
++#define lpfc_acqe_fc_la_trunk_link_status_port0_SHIFT	16
++#define lpfc_acqe_fc_la_trunk_link_status_port0_MASK	0x0000001
++#define lpfc_acqe_fc_la_trunk_link_status_port0_WORD	word0
++#define lpfc_acqe_fc_la_trunk_link_status_port1_SHIFT	17
++#define lpfc_acqe_fc_la_trunk_link_status_port1_MASK	0x0000001
++#define lpfc_acqe_fc_la_trunk_link_status_port1_WORD	word0
++#define lpfc_acqe_fc_la_trunk_link_status_port2_SHIFT	18
++#define lpfc_acqe_fc_la_trunk_link_status_port2_MASK	0x0000001
++#define lpfc_acqe_fc_la_trunk_link_status_port2_WORD	word0
++#define lpfc_acqe_fc_la_trunk_link_status_port3_SHIFT	19
++#define lpfc_acqe_fc_la_trunk_link_status_port3_MASK	0x0000001
++#define lpfc_acqe_fc_la_trunk_link_status_port3_WORD	word0
++#define lpfc_acqe_fc_la_trunk_config_port0_SHIFT	20
++#define lpfc_acqe_fc_la_trunk_config_port0_MASK		0x0000001
++#define lpfc_acqe_fc_la_trunk_config_port0_WORD		word0
++#define lpfc_acqe_fc_la_trunk_config_port1_SHIFT	21
++#define lpfc_acqe_fc_la_trunk_config_port1_MASK		0x0000001
++#define lpfc_acqe_fc_la_trunk_config_port1_WORD		word0
++#define lpfc_acqe_fc_la_trunk_config_port2_SHIFT	22
++#define lpfc_acqe_fc_la_trunk_config_port2_MASK		0x0000001
++#define lpfc_acqe_fc_la_trunk_config_port2_WORD		word0
++#define lpfc_acqe_fc_la_trunk_config_port3_SHIFT	23
++#define lpfc_acqe_fc_la_trunk_config_port3_MASK		0x0000001
++#define lpfc_acqe_fc_la_trunk_config_port3_WORD		word0
+ 	uint32_t word1;
+ #define lpfc_acqe_fc_la_llink_spd_SHIFT		16
+ #define lpfc_acqe_fc_la_llink_spd_MASK		0x0000FFFF
+@@ -4054,6 +4112,12 @@ struct lpfc_acqe_fc_la {
+ #define lpfc_acqe_fc_la_fault_SHIFT		0
+ #define lpfc_acqe_fc_la_fault_MASK		0x000000FF
+ #define lpfc_acqe_fc_la_fault_WORD		word1
++#define lpfc_acqe_fc_la_trunk_fault_SHIFT		0
++#define lpfc_acqe_fc_la_trunk_fault_MASK		0x0000000F
++#define lpfc_acqe_fc_la_trunk_fault_WORD		word1
++#define lpfc_acqe_fc_la_trunk_linkmask_SHIFT		4
++#define lpfc_acqe_fc_la_trunk_linkmask_MASK		0x000000F
++#define lpfc_acqe_fc_la_trunk_linkmask_WORD		word1
+ #define LPFC_FC_LA_FAULT_NONE		0x0
+ #define LPFC_FC_LA_FAULT_LOCAL		0x1
+ #define LPFC_FC_LA_FAULT_REMOTE		0x2
+diff --git a/drivers/scsi/lpfc/lpfc_init.c b/drivers/scsi/lpfc/lpfc_init.c
+index f327ace8228b..63c21a440534 100644
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@ -4117,6 +4117,8 @@ void lpfc_host_supported_speeds_set(struct Scsi_Host *shost)
+ 	struct lpfc_hba   *phba = vport->phba;
+ 
+ 	fc_host_supported_speeds(shost) = 0;
++	if (phba->lmt & LMT_128Gb)
++		fc_host_supported_speeds(shost) |= FC_PORTSPEED_128GBIT;
+ 	if (phba->lmt & LMT_64Gb)
+ 		fc_host_supported_speeds(shost) |= FC_PORTSPEED_64GBIT;
+ 	if (phba->lmt & LMT_32Gb)
+@@ -4480,6 +4482,9 @@ lpfc_sli4_port_speed_parse(struct lpfc_hba *phba, uint32_t evt_code,
+ 		case LPFC_FC_LA_SPEED_64G:
+ 			port_speed = 64000;
+ 			break;
++		case LPFC_FC_LA_SPEED_128G:
++			port_speed = 128000;
++			break;
+ 		default:
+ 			port_speed = 0;
+ 		}
+@@ -4621,6 +4626,140 @@ out_free_pmb:
+ 	mempool_free(pmb, phba->mbox_mem_pool);
+ }
+ 
++/**
++ * lpfc_async_link_speed_to_read_top - Parse async evt link speed code to read
++ * topology.
++ * @phba: pointer to lpfc hba data structure.
++ * @evt_code: asynchronous event code.
++ * @speed_code: asynchronous event link speed code.
++ *
++ * This routine is to parse the giving SLI4 async event link speed code into
++ * value of Read topology link speed.
++ *
++ * Return: link speed in terms of Read topology.
++ **/
++static uint8_t
++lpfc_async_link_speed_to_read_top(struct lpfc_hba *phba, uint8_t speed_code)
++{
++	uint8_t port_speed;
++
++	switch (speed_code) {
++	case LPFC_FC_LA_SPEED_1G:
++		port_speed = LPFC_LINK_SPEED_1GHZ;
++		break;
++	case LPFC_FC_LA_SPEED_2G:
++		port_speed = LPFC_LINK_SPEED_2GHZ;
++		break;
++	case LPFC_FC_LA_SPEED_4G:
++		port_speed = LPFC_LINK_SPEED_4GHZ;
++		break;
++	case LPFC_FC_LA_SPEED_8G:
++		port_speed = LPFC_LINK_SPEED_8GHZ;
++		break;
++	case LPFC_FC_LA_SPEED_16G:
++		port_speed = LPFC_LINK_SPEED_16GHZ;
++		break;
++	case LPFC_FC_LA_SPEED_32G:
++		port_speed = LPFC_LINK_SPEED_32GHZ;
++		break;
++	case LPFC_FC_LA_SPEED_64G:
++		port_speed = LPFC_LINK_SPEED_64GHZ;
++		break;
++	case LPFC_FC_LA_SPEED_128G:
++		port_speed = LPFC_LINK_SPEED_128GHZ;
++		break;
++	case LPFC_FC_LA_SPEED_256G:
++		port_speed = LPFC_LINK_SPEED_256GHZ;
++		break;
++	default:
++		port_speed = 0;
++		break;
++	}
++
++	return port_speed;
++}
++
++#define trunk_link_status(__idx)\
++	bf_get(lpfc_acqe_fc_la_trunk_config_port##__idx, acqe_fc) ?\
++	       ((phba->trunk_link.link##__idx.state == LPFC_LINK_UP) ?\
++		"Link up" : "Link down") : "NA"
++/* Did port __idx reported an error */
++#define trunk_port_fault(__idx)\
++	bf_get(lpfc_acqe_fc_la_trunk_config_port##__idx, acqe_fc) ?\
++	       (port_fault & (1 << __idx) ? "YES" : "NO") : "NA"
++
++static void
++lpfc_update_trunk_link_status(struct lpfc_hba *phba,
++			      struct lpfc_acqe_fc_la *acqe_fc)
++{
++	uint8_t port_fault = bf_get(lpfc_acqe_fc_la_trunk_linkmask, acqe_fc);
++	uint8_t err = bf_get(lpfc_acqe_fc_la_trunk_fault, acqe_fc);
++
++	phba->sli4_hba.link_state.speed =
++		lpfc_sli4_port_speed_parse(phba, LPFC_TRAILER_CODE_FC,
++				bf_get(lpfc_acqe_fc_la_speed, acqe_fc));
++
++	phba->sli4_hba.link_state.logical_speed =
++				bf_get(lpfc_acqe_fc_la_llink_spd, acqe_fc);
++	/* We got FC link speed, convert to fc_linkspeed (READ_TOPOLOGY) */
++	phba->fc_linkspeed =
++		 lpfc_async_link_speed_to_read_top(
++				phba,
++				bf_get(lpfc_acqe_fc_la_speed, acqe_fc));
++
++	if (bf_get(lpfc_acqe_fc_la_trunk_config_port0, acqe_fc)) {
++		phba->trunk_link.link0.state =
++			bf_get(lpfc_acqe_fc_la_trunk_link_status_port0, acqe_fc)
++			? LPFC_LINK_UP : LPFC_LINK_DOWN;
++		if (port_fault & 0x1)
++			phba->trunk_link.link0.fault = err;
++	}
++	if (bf_get(lpfc_acqe_fc_la_trunk_config_port1, acqe_fc)) {
++		phba->trunk_link.link1.state =
++			bf_get(lpfc_acqe_fc_la_trunk_link_status_port1, acqe_fc)
++			? LPFC_LINK_UP : LPFC_LINK_DOWN;
++		if (port_fault & 0x2)
++			phba->trunk_link.link1.fault = err;
++	}
++	if (bf_get(lpfc_acqe_fc_la_trunk_config_port2, acqe_fc)) {
++		phba->trunk_link.link2.state =
++			bf_get(lpfc_acqe_fc_la_trunk_link_status_port2, acqe_fc)
++			? LPFC_LINK_UP : LPFC_LINK_DOWN;
++		if (port_fault & 0x4)
++			phba->trunk_link.link2.fault = err;
++	}
++	if (bf_get(lpfc_acqe_fc_la_trunk_config_port3, acqe_fc)) {
++		phba->trunk_link.link3.state =
++			bf_get(lpfc_acqe_fc_la_trunk_link_status_port3, acqe_fc)
++			? LPFC_LINK_UP : LPFC_LINK_DOWN;
++		if (port_fault & 0x8)
++			phba->trunk_link.link3.fault = err;
++	}
++
++	lpfc_printf_log(phba, KERN_ERR, LOG_SLI,
++			"2910 Async FC Trunking Event - Speed:%d\n"
++			"\tLogical speed:%d "
++			"port0: %s port1: %s port2: %s port3: %s\n",
++			phba->sli4_hba.link_state.speed,
++			phba->sli4_hba.link_state.logical_speed,
++			trunk_link_status(0), trunk_link_status(1),
++			trunk_link_status(2), trunk_link_status(3));
++
++	if (port_fault)
++		lpfc_printf_log(phba, KERN_ERR, LOG_SLI,
++				"3202 trunk error:0x%x (%s) seen on port0:%s "
++				/*
++				 * SLI-4: We have only 0xA error codes
++				 * defined as of now. print an appropriate
++				 * message in case driver needs to be updated.
++				 */
++				"port1:%s port2:%s port3:%s\n", err, err > 0xA ?
++				"UNDEFINED. update driver." : trunk_errmsg[err],
++				trunk_port_fault(0), trunk_port_fault(1),
++				trunk_port_fault(2), trunk_port_fault(3));
++}
++
++
+ /**
+  * lpfc_sli4_async_fc_evt - Process the asynchronous FC link event
+  * @phba: pointer to lpfc hba data structure.
+@@ -4646,6 +4785,13 @@ lpfc_sli4_async_fc_evt(struct lpfc_hba *phba, struct lpfc_acqe_fc_la *acqe_fc)
+ 				bf_get(lpfc_trailer_type, acqe_fc));
+ 		return;
+ 	}
++
++	if (bf_get(lpfc_acqe_fc_la_att_type, acqe_fc) ==
++	    LPFC_FC_LA_TYPE_TRUNKING_EVENT) {
++		lpfc_update_trunk_link_status(phba, acqe_fc);
++		return;
++	}
++
+ 	/* Keep the link status for extra SLI4 state machine reference */
+ 	phba->sli4_hba.link_state.speed =
+ 			lpfc_sli4_port_speed_parse(phba, LPFC_TRAILER_CODE_FC,
+@@ -7854,6 +8000,8 @@ lpfc_sli4_read_config(struct lpfc_hba *phba)
+ 			phba->sli4_hba.bbscn_params.word0 = rd_config->word8;
+ 		}
+ 
++		phba->sli4_hba.conf_trunk =
++			bf_get(lpfc_mbx_rd_conf_trunk, rd_config);
+ 		phba->sli4_hba.extents_in_use =
+ 			bf_get(lpfc_mbx_rd_conf_extnts_inuse, rd_config);
+ 		phba->sli4_hba.max_cfg_param.max_xri =
+diff --git a/drivers/scsi/lpfc/lpfc_scsi.h b/drivers/scsi/lpfc/lpfc_scsi.h
+index cc99859774ff..b759b089432c 100644
+--- a/drivers/scsi/lpfc/lpfc_scsi.h
++++ b/drivers/scsi/lpfc/lpfc_scsi.h
+@@ -194,6 +194,10 @@ struct lpfc_scsi_buf {
+ #define NO_MORE_OAS_LUN		-1
+ #define NOT_OAS_ENABLED_LUN	NO_MORE_OAS_LUN
+ 
++#ifndef FC_PORTSPEED_128GBIT
++#define FC_PORTSPEED_128GBIT	0x2000
++#endif
++
+ #define TXRDY_PAYLOAD_LEN	12
+ 
+ int lpfc_sli4_scmd_to_wqidx_distr(struct lpfc_hba *phba,
+diff --git a/drivers/scsi/lpfc/lpfc_sli.c b/drivers/scsi/lpfc/lpfc_sli.c
+index c7019547e40f..3eafe70bbecf 100644
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@ -7342,7 +7342,18 @@ lpfc_sli4_hba_setup(struct lpfc_hba *phba)
+ 	 */
+ 	spin_lock_irq(&phba->hbalock);
+ 	phba->link_state = LPFC_LINK_DOWN;
++
++	/* Check if physical ports are trunked */
++	if (bf_get(lpfc_conf_trunk_port0, &phba->sli4_hba))
++		phba->trunk_link.link0.state = LPFC_LINK_DOWN;
++	if (bf_get(lpfc_conf_trunk_port1, &phba->sli4_hba))
++		phba->trunk_link.link1.state = LPFC_LINK_DOWN;
++	if (bf_get(lpfc_conf_trunk_port2, &phba->sli4_hba))
++		phba->trunk_link.link2.state = LPFC_LINK_DOWN;
++	if (bf_get(lpfc_conf_trunk_port3, &phba->sli4_hba))
++		phba->trunk_link.link3.state = LPFC_LINK_DOWN;
+ 	spin_unlock_irq(&phba->hbalock);
++
+ 	if (!(phba->hba_flag & HBA_FCOE_MODE) &&
+ 	    (phba->hba_flag & LINK_DISABLED)) {
+ 		lpfc_printf_log(phba, KERN_ERR, LOG_INIT | LOG_SLI,
+diff --git a/drivers/scsi/lpfc/lpfc_sli4.h b/drivers/scsi/lpfc/lpfc_sli4.h
+index 9928fdfe02b1..3997ace7e52a 100644
+--- a/drivers/scsi/lpfc/lpfc_sli4.h
++++ b/drivers/scsi/lpfc/lpfc_sli4.h
+@@ -719,6 +719,19 @@ struct lpfc_sli4_hba {
+ 	uint16_t num_online_cpu;
+ 	uint16_t num_present_cpu;
+ 	uint16_t curr_disp_cpu;
++	uint32_t conf_trunk;
++#define lpfc_conf_trunk_port0_WORD	conf_trunk
++#define lpfc_conf_trunk_port0_SHIFT	0
++#define lpfc_conf_trunk_port0_MASK	0x1
++#define lpfc_conf_trunk_port1_WORD	conf_trunk
++#define lpfc_conf_trunk_port1_SHIFT	1
++#define lpfc_conf_trunk_port1_MASK	0x1
++#define lpfc_conf_trunk_port2_WORD	conf_trunk
++#define lpfc_conf_trunk_port2_SHIFT	2
++#define lpfc_conf_trunk_port2_MASK	0x1
++#define lpfc_conf_trunk_port3_WORD	conf_trunk
++#define lpfc_conf_trunk_port3_SHIFT	3
++#define lpfc_conf_trunk_port3_MASK	0x1
+ };
+ 
+ enum lpfc_sge_type {
