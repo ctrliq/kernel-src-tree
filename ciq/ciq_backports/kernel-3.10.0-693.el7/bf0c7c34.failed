@@ -1,0 +1,153 @@
+locking/pvqspinlock, x86: Enable PV qspinlock for KVM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Waiman Long <Waiman.Long@hp.com>
+commit bf0c7c34adc286bec3a5a38c00c773ba1b2d0396
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/bf0c7c34.failed
+
+This patch adds the necessary KVM specific code to allow KVM to
+support the CPU halting and kicking operations needed by the queue
+spinlock PV code.
+
+	Signed-off-by: Waiman Long <Waiman.Long@hp.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Daniel J Blueman <daniel@numascale.com>
+	Cc: David Vrabel <david.vrabel@citrix.com>
+	Cc: Douglas Hatch <doug.hatch@hp.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Paolo Bonzini <paolo.bonzini@gmail.com>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Raghavendra K T <raghavendra.kt@linux.vnet.ibm.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Scott J Norton <scott.norton@hp.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: virtualization@lists.linux-foundation.org
+	Cc: xen-devel@lists.xenproject.org
+Link: http://lkml.kernel.org/r/1429901803-29771-11-git-send-email-Waiman.Long@hp.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit bf0c7c34adc286bec3a5a38c00c773ba1b2d0396)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/Kconfig.locks
+diff --cc kernel/Kconfig.locks
+index 44511d100eaa,4379eef9334d..000000000000
+--- a/kernel/Kconfig.locks
++++ b/kernel/Kconfig.locks
+@@@ -220,6 -220,31 +220,32 @@@ config INLINE_WRITE_UNLOCK_IRQRESTOR
+  
+  endif
+  
+ -config ARCH_SUPPORTS_ATOMIC_RMW
+ -	bool
+ -
+  config MUTEX_SPIN_ON_OWNER
+  	def_bool y
+++<<<<<<< HEAD
+ +	depends on SMP && !DEBUG_MUTEXES
+++=======
++ 	depends on SMP && !DEBUG_MUTEXES && ARCH_SUPPORTS_ATOMIC_RMW
++ 
++ config RWSEM_SPIN_ON_OWNER
++        def_bool y
++        depends on SMP && RWSEM_XCHGADD_ALGORITHM && ARCH_SUPPORTS_ATOMIC_RMW
++ 
++ config LOCK_SPIN_ON_OWNER
++        def_bool y
++        depends on MUTEX_SPIN_ON_OWNER || RWSEM_SPIN_ON_OWNER
++ 
++ config ARCH_USE_QUEUED_SPINLOCK
++ 	bool
++ 
++ config QUEUED_SPINLOCK
++ 	def_bool y if ARCH_USE_QUEUED_SPINLOCK
++ 	depends on SMP && (!PARAVIRT_SPINLOCKS || !XEN)
++ 
++ config ARCH_USE_QUEUE_RWLOCK
++ 	bool
++ 
++ config QUEUE_RWLOCK
++ 	def_bool y if ARCH_USE_QUEUE_RWLOCK
++ 	depends on SMP
+++>>>>>>> bf0c7c34adc2 (locking/pvqspinlock, x86: Enable PV qspinlock for KVM)
+diff --git a/arch/x86/kernel/kvm.c b/arch/x86/kernel/kvm.c
+index d35c81117504..775d37f5a69f 100644
+--- a/arch/x86/kernel/kvm.c
++++ b/arch/x86/kernel/kvm.c
+@@ -575,6 +575,39 @@ static void kvm_kick_cpu(int cpu)
+ 	kvm_hypercall2(KVM_HC_KICK_CPU, flags, apicid);
+ }
+ 
++
++#ifdef CONFIG_QUEUED_SPINLOCK
++
++#include <asm/qspinlock.h>
++
++static void kvm_wait(u8 *ptr, u8 val)
++{
++	unsigned long flags;
++
++	if (in_nmi())
++		return;
++
++	local_irq_save(flags);
++
++	if (READ_ONCE(*ptr) != val)
++		goto out;
++
++	/*
++	 * halt until it's our turn and kicked. Note that we do safe halt
++	 * for irq enabled case to avoid hang when lock info is overwritten
++	 * in irq spinlock slowpath and no spurious interrupt occur to save us.
++	 */
++	if (arch_irqs_disabled_flags(flags))
++		halt();
++	else
++		safe_halt();
++
++out:
++	local_irq_restore(flags);
++}
++
++#else /* !CONFIG_QUEUED_SPINLOCK */
++
+ enum kvm_contention_stat {
+ 	TAKEN_SLOW,
+ 	TAKEN_SLOW_PICKUP,
+@@ -803,6 +836,8 @@ static void kvm_unlock_kick(struct arch_spinlock *lock, __ticket_t ticket)
+ 	}
+ }
+ 
++#endif /* !CONFIG_QUEUED_SPINLOCK */
++
+ /*
+  * Setup pv_lock_ops to exploit KVM_FEATURE_PV_UNHALT if present.
+  */
+@@ -814,8 +849,16 @@ void __init kvm_spinlock_init(void)
+ 	if (!kvm_para_has_feature(KVM_FEATURE_PV_UNHALT))
+ 		return;
+ 
++#ifdef CONFIG_QUEUED_SPINLOCK
++	__pv_init_lock_hash();
++	pv_lock_ops.queued_spin_lock_slowpath = __pv_queued_spin_lock_slowpath;
++	pv_lock_ops.queued_spin_unlock = PV_CALLEE_SAVE(__pv_queued_spin_unlock);
++	pv_lock_ops.wait = kvm_wait;
++	pv_lock_ops.kick = kvm_kick_cpu;
++#else /* !CONFIG_QUEUED_SPINLOCK */
+ 	pv_lock_ops.lock_spinning = PV_CALLEE_SAVE(kvm_lock_spinning);
+ 	pv_lock_ops.unlock_kick = kvm_unlock_kick;
++#endif
+ }
+ 
+ static __init int kvm_spinlock_init_jump(void)
+* Unmerged path kernel/Kconfig.locks
