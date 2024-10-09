@@ -1,0 +1,312 @@
+net/mlx5e: Keep single pre-initialized UMR WQE per RQ
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Keep single pre-initialized UMR WQE per RQ (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 96.08%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit b8a98a4cf3221d8140969e3f5bde09206a6cb623
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/b8a98a4c.failed
+
+All UMR WQEs of an RQ share many common fields. We use
+pre-initialized structures to save calculations in datapath.
+One field (xlt_offset) was the only reason we saved a pre-initialized
+copy per WQE index.
+Here we remove its initialization (move its calculation to datapath),
+and reduce the number of copies to one-per-RQ.
+
+A very small datapath calculation is added, it occurs once per a MPWQE
+(i.e. once every 256KB), but reduces memory consumption and gives
+better cache utilization.
+
+Performance testing:
+Tested packet rate, no degradation sensed.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit b8a98a4cf3221d8140969e3f5bde09206a6cb623)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index efbd1f3dfd48,30cad07be2b5..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -95,11 -83,29 +95,36 @@@
+  #define MLX5_MPWRQ_PAGES_PER_WQE		BIT(MLX5_MPWRQ_WQE_PAGE_ORDER)
+  
+  #define MLX5_MTT_OCTW(npages) (ALIGN(npages, 8) / 2)
+++<<<<<<< HEAD
+ +#define MLX5E_REQUIRED_MTTS(wqes)		\
+ +	(wqes * ALIGN(MLX5_MPWRQ_PAGES_PER_WQE, 8))
+ +#define MLX5E_VALID_NUM_MTTS(num_mtts) (MLX5_MTT_OCTW(num_mtts) - 1 <= U16_MAX)
+++=======
++ #define MLX5E_REQUIRED_WQE_MTTS		(ALIGN(MLX5_MPWRQ_PAGES_PER_WQE, 8))
++ #define MLX5E_LOG_ALIGNED_MPWQE_PPW	(ilog2(MLX5E_REQUIRED_WQE_MTTS))
++ #define MLX5E_REQUIRED_MTTS(wqes)	(wqes * MLX5E_REQUIRED_WQE_MTTS)
++ #define MLX5E_MAX_RQ_NUM_MTTS	\
++ 	((1 << 16) * 2) /* So that MLX5_MTT_OCTW(num_mtts) fits into u16 */
++ #define MLX5E_ORDER2_MAX_PACKET_MTU (order_base_2(10 * 1024))
++ #define MLX5E_PARAMS_MAXIMUM_LOG_RQ_SIZE_MPW	\
++ 		(ilog2(MLX5E_MAX_RQ_NUM_MTTS / MLX5E_REQUIRED_WQE_MTTS))
++ #define MLX5E_LOG_MAX_RQ_NUM_PACKETS_MPW \
++ 	(MLX5E_PARAMS_MAXIMUM_LOG_RQ_SIZE_MPW + \
++ 	 (MLX5_MPWRQ_LOG_WQE_SZ - MLX5E_ORDER2_MAX_PACKET_MTU))
++ 
++ #define MLX5E_PARAMS_MINIMUM_LOG_SQ_SIZE                0x6
++ #define MLX5E_PARAMS_DEFAULT_LOG_SQ_SIZE                0xa
++ #define MLX5E_PARAMS_MAXIMUM_LOG_SQ_SIZE                0xd
++ 
++ #define MLX5E_PARAMS_MINIMUM_LOG_RQ_SIZE                0x1
++ #define MLX5E_PARAMS_DEFAULT_LOG_RQ_SIZE                0xa
++ #define MLX5E_PARAMS_MAXIMUM_LOG_RQ_SIZE min_t(u8, 0xd,	\
++ 					       MLX5E_LOG_MAX_RQ_NUM_PACKETS_MPW)
++ 
++ #define MLX5E_PARAMS_MINIMUM_LOG_RQ_SIZE_MPW            0x2
+++>>>>>>> b8a98a4cf322 (net/mlx5e: Keep single pre-initialized UMR WQE per RQ)
+  
+ +#define MLX5_UMR_ALIGN				(2048)
+  #define MLX5_MPWRQ_SMALL_PACKET_THRESHOLD	(256)
+  
+  #define MLX5E_PARAMS_DEFAULT_LRO_WQE_SZ                 (64 * 1024)
+@@@ -454,10 -450,7 +479,9 @@@ struct mlx5e_wqe_frag_info 
+  };
+  
+  struct mlx5e_umr_dma_info {
+ +	__be64                *mtt;
+ +	dma_addr_t             mtt_addr;
+  	struct mlx5e_dma_info  dma_info[MLX5_MPWRQ_PAGES_PER_WQE];
+- 	struct mlx5e_umr_wqe   wqe;
+  };
+  
+  struct mlx5e_mpw_info {
+@@@ -500,8 -496,9 +524,9 @@@ struct mlx5e_rq 
+  			};
+  		} wqe;
+  		struct {
++ 			struct mlx5e_umr_wqe   umr_wqe;
+  			struct mlx5e_mpw_info *info;
+ -			mlx5e_fp_skb_from_cqe_mpwrq skb_from_cqe_mpwrq;
+ +			void                  *mtt_no_align;
+  			u16                    num_strides;
+  			u8                     log_stride_sz;
+  			bool                   umr_in_progress;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 40f65e70ce7f,0339609cfa56..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -246,107 -304,38 +246,115 @@@ static void mlx5e_disable_async_events(
+  	synchronize_irq(pci_irq_vector(priv->mdev->pdev, MLX5_EQ_VEC_ASYNC));
+  }
+  
+ +static inline int mlx5e_get_wqe_mtt_sz(void)
+ +{
+ +	/* UMR copies MTTs in units of MLX5_UMR_MTT_ALIGNMENT bytes.
+ +	 * To avoid copying garbage after the mtt array, we allocate
+ +	 * a little more.
+ +	 */
+ +	return ALIGN(MLX5_MPWRQ_PAGES_PER_WQE * sizeof(__be64),
+ +		     MLX5_UMR_MTT_ALIGNMENT);
+ +}
+ +
+  static inline void mlx5e_build_umr_wqe(struct mlx5e_rq *rq,
+  				       struct mlx5e_icosq *sq,
+- 				       struct mlx5e_umr_wqe *wqe,
+- 				       u16 ix)
++ 				       struct mlx5e_umr_wqe *wqe)
+  {
+  	struct mlx5_wqe_ctrl_seg      *cseg = &wqe->ctrl;
+  	struct mlx5_wqe_umr_ctrl_seg *ucseg = &wqe->uctrl;
+++<<<<<<< HEAD
+ +	struct mlx5_wqe_data_seg      *dseg = &wqe->data;
+ +	struct mlx5e_mpw_info *wi = &rq->mpwqe.info[ix];
+ +	u8 ds_cnt = DIV_ROUND_UP(sizeof(*wqe), MLX5_SEND_WQE_DS);
+ +	u32 umr_wqe_mtt_offset = mlx5e_get_wqe_mtt_offset(rq, ix);
+++=======
++ 	u8 ds_cnt = DIV_ROUND_UP(MLX5E_UMR_WQE_INLINE_SZ, MLX5_SEND_WQE_DS);
+++>>>>>>> b8a98a4cf322 (net/mlx5e: Keep single pre-initialized UMR WQE per RQ)
+  
+  	cseg->qpn_ds    = cpu_to_be32((sq->sqn << MLX5_WQE_CTRL_QPN_SHIFT) |
+  				      ds_cnt);
+  	cseg->fm_ce_se  = MLX5_WQE_CTRL_CQ_UPDATE;
+  	cseg->imm       = rq->mkey_be;
+  
+ -	ucseg->flags = MLX5_UMR_TRANSLATION_OFFSET_EN | MLX5_UMR_INLINE;
+ +	ucseg->flags = MLX5_UMR_TRANSLATION_OFFSET_EN;
+  	ucseg->xlt_octowords =
+  		cpu_to_be16(MLX5_MTT_OCTW(MLX5_MPWRQ_PAGES_PER_WQE));
+- 	ucseg->bsf_octowords =
+- 		cpu_to_be16(MLX5_MTT_OCTW(umr_wqe_mtt_offset));
+  	ucseg->mkey_mask     = cpu_to_be64(MLX5_MKEY_MASK_FREE);
+ +
+ +	dseg->lkey = sq->mkey_be;
+ +	dseg->addr = cpu_to_be64(wi->umr.mtt_addr);
+  }
+  
+  static int mlx5e_rq_alloc_mpwqe_info(struct mlx5e_rq *rq,
+  				     struct mlx5e_channel *c)
+  {
+  	int wq_sz = mlx5_wq_ll_get_size(&rq->wq);
+++<<<<<<< HEAD
+ +	int mtt_sz = mlx5e_get_wqe_mtt_sz();
+ +	int mtt_alloc = mtt_sz + MLX5_UMR_ALIGN - 1;
+ +	int i;
+++=======
+++>>>>>>> b8a98a4cf322 (net/mlx5e: Keep single pre-initialized UMR WQE per RQ)
+  
+  	rq->mpwqe.info = kzalloc_node(wq_sz * sizeof(*rq->mpwqe.info),
+  				      GFP_KERNEL, cpu_to_node(c->cpu));
+  	if (!rq->mpwqe.info)
+ -		return -ENOMEM;
+ +		goto err_out;
+ +
+ +	/* We allocate more than mtt_sz as we will align the pointer */
+ +	rq->mpwqe.mtt_no_align = kzalloc_node(mtt_alloc * wq_sz, GFP_KERNEL,
+ +					cpu_to_node(c->cpu));
+ +	if (unlikely(!rq->mpwqe.mtt_no_align))
+ +		goto err_free_wqe_info;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < wq_sz; i++) {
+ +		struct mlx5e_mpw_info *wi = &rq->mpwqe.info[i];
+ +
+ +		wi->umr.mtt = PTR_ALIGN(rq->mpwqe.mtt_no_align + i * mtt_alloc,
+ +					MLX5_UMR_ALIGN);
+ +		wi->umr.mtt_addr = dma_map_single(c->pdev, wi->umr.mtt, mtt_sz,
+ +						  PCI_DMA_TODEVICE);
+ +		if (unlikely(dma_mapping_error(c->pdev, wi->umr.mtt_addr)))
+ +			goto err_unmap_mtts;
+ +
+ +		mlx5e_build_umr_wqe(rq, &c->icosq, &wi->umr.wqe, i);
+ +	}
+++=======
++ 	mlx5e_build_umr_wqe(rq, &c->icosq, &rq->mpwqe.umr_wqe);
+++>>>>>>> b8a98a4cf322 (net/mlx5e: Keep single pre-initialized UMR WQE per RQ)
+  
+  	return 0;
+ +
+ +err_unmap_mtts:
+ +	while (--i >= 0) {
+ +		struct mlx5e_mpw_info *wi = &rq->mpwqe.info[i];
+ +
+ +		dma_unmap_single(c->pdev, wi->umr.mtt_addr, mtt_sz,
+ +				 PCI_DMA_TODEVICE);
+ +	}
+ +	kfree(rq->mpwqe.mtt_no_align);
+ +err_free_wqe_info:
+ +	kfree(rq->mpwqe.info);
+ +
+ +err_out:
+ +	return -ENOMEM;
+ +}
+ +
+ +static void mlx5e_rq_free_mpwqe_info(struct mlx5e_rq *rq)
+ +{
+ +	int wq_sz = mlx5_wq_ll_get_size(&rq->wq);
+ +	int mtt_sz = mlx5e_get_wqe_mtt_sz();
+ +	int i;
+ +
+ +	for (i = 0; i < wq_sz; i++) {
+ +		struct mlx5e_mpw_info *wi = &rq->mpwqe.info[i];
+ +
+ +		dma_unmap_single(rq->pdev, wi->umr.mtt_addr, mtt_sz,
+ +				 PCI_DMA_TODEVICE);
+ +	}
+ +	kfree(rq->mpwqe.mtt_no_align);
+ +	kfree(rq->mpwqe.info);
+  }
+  
+  static int mlx5e_create_umr_mkey(struct mlx5_core_dev *mdev,
+@@@ -519,9 -516,9 +532,9 @@@ static int mlx5e_alloc_rq(struct mlx5e_
+  		struct mlx5e_rx_wqe *wqe = mlx5_wq_ll_get_wqe(&rq->wq, i);
+  
+  		if (rq->wq_type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ) {
+- 			u64 dma_offset = (u64)mlx5e_get_wqe_mtt_offset(rq, i) << PAGE_SHIFT;
++ 			u64 dma_offset = mlx5e_get_mpwqe_offset(rq, i);
+  
+ -			wqe->data.addr = cpu_to_be64(dma_offset + rq->buff.headroom);
+ +			wqe->data.addr = cpu_to_be64(dma_offset);
+  		}
+  
+  		wqe->data.byte_count = cpu_to_be32(byte_count);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index 95481ee556bb,682f9ff9da34..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -436,16 -367,56 +436,53 @@@ static void mlx5e_post_rx_mpwqe(struct 
+  
+  static int mlx5e_alloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct mlx5e_mpw_info *wi = &rq->mpwqe.info[ix];
++ 	struct mlx5e_dma_info *dma_info = &wi->umr.dma_info[0];
++ 	struct mlx5e_icosq *sq = &rq->channel->icosq;
++ 	struct mlx5_wq_cyc *wq = &sq->wq;
++ 	struct mlx5e_umr_wqe *umr_wqe;
++ 	int cpy = offsetof(struct mlx5e_umr_wqe, inline_mtts);
++ 	u16 xlt_offset = ix << (MLX5E_LOG_ALIGNED_MPWQE_PPW - 1);
+++>>>>>>> b8a98a4cf322 (net/mlx5e: Keep single pre-initialized UMR WQE per RQ)
+  	int err;
+ -	u16 pi;
+ -	int i;
+  
+ -	/* fill sq edge with nops to avoid wqe wrap around */
+ -	while ((pi = (sq->pc & wq->sz_m1)) > sq->edge) {
+ -		sq->db.ico_wqe[pi].opcode = MLX5_OPCODE_NOP;
+ -		mlx5e_post_nop(wq, sq->sqn, &sq->pc);
+ +	err = mlx5e_alloc_rx_umr_mpwqe(rq, ix);
+ +	if (unlikely(err)) {
+ +		rq->stats->buff_alloc_err++;
+ +		return err;
+  	}
+++<<<<<<< HEAD
+ +	rq->mpwqe.umr_in_progress = true;
+ +	mlx5e_post_umr_wqe(rq, ix);
+++=======
++ 
++ 	umr_wqe = mlx5_wq_cyc_get_wqe(wq, pi);
++ 	memcpy(umr_wqe, &rq->mpwqe.umr_wqe, cpy);
++ 	for (i = 0; i < MLX5_MPWRQ_PAGES_PER_WQE; i++, dma_info++) {
++ 		err = mlx5e_page_alloc_mapped(rq, dma_info);
++ 		if (unlikely(err))
++ 			goto err_unmap;
++ 		umr_wqe->inline_mtts[i].ptag = cpu_to_be64(dma_info->addr | MLX5_EN_WR);
++ 	}
++ 
++ 	bitmap_zero(wi->xdp_xmit_bitmap, MLX5_MPWRQ_PAGES_PER_WQE);
++ 	wi->consumed_strides = 0;
++ 
++ 	rq->mpwqe.umr_in_progress = true;
++ 
++ 	umr_wqe->ctrl.opmod_idx_opcode =
++ 		cpu_to_be32((sq->pc << MLX5_WQE_CTRL_WQE_INDEX_SHIFT) |
++ 			    MLX5_OPCODE_UMR);
++ 	umr_wqe->uctrl.xlt_offset = cpu_to_be16(xlt_offset);
++ 
++ 	sq->db.ico_wqe[pi].opcode = MLX5_OPCODE_UMR;
++ 	sq->pc += MLX5E_UMR_WQEBBS;
++ 	mlx5e_notify_hw(&sq->wq, sq->pc, sq->uar_map, &umr_wqe->ctrl);
++ 
+++>>>>>>> b8a98a4cf322 (net/mlx5e: Keep single pre-initialized UMR WQE per RQ)
+  	return 0;
+ -
+ -err_unmap:
+ -	while (--i >= 0) {
+ -		dma_info--;
+ -		mlx5e_page_release(rq, dma_info, true);
+ -	}
+ -	rq->stats.buff_alloc_err++;
+ -
+ -	return err;
+  }
+  
+  void mlx5e_dealloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
