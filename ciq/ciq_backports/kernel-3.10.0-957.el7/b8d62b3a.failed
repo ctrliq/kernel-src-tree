@@ -1,0 +1,139 @@
+blk-mq: enable checking two part inflight counts at the same time
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jens Axboe <axboe@kernel.dk>
+commit b8d62b3a9c25d64d8de4a272314dac0c957982f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b8d62b3a.failed
+
+Modify blk_mq_in_flight() to count both a partition and root at
+the same time. Then we only have to call it once, instead of
+potentially looping the tags twice.
+
+	Reviewed-by: Omar Sandoval <osandov@fb.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit b8d62b3a9c25d64d8de4a272314dac0c957982f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+#	block/blk-mq.c
+diff --cc block/blk-core.c
+index cfbd315875ad,d836c84ad3da..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -1492,15 -1469,10 +1492,22 @@@ static void add_acct_request(struct req
+  	__elv_add_request(q, rq, where);
+  }
+  
+++<<<<<<< HEAD
+ +static void part_round_stats_single(int cpu, struct hd_struct *part,
+ +				    unsigned long now)
+ +{
+ +	int inflight;
+ +
+ +	if (now == part->stamp)
+ +		return;
+ +
+ +	inflight = part_in_flight(part);
+++=======
++ static void part_round_stats_single(struct request_queue *q, int cpu,
++ 				    struct hd_struct *part, unsigned long now,
++ 				    unsigned int inflight)
++ {
+++>>>>>>> b8d62b3a9c25 (blk-mq: enable checking two part inflight counts at the same time)
+  	if (inflight) {
+  		__part_stat_add(cpu, part, time_in_queue,
+  				inflight * (now - part->stamp));
+@@@ -1525,13 -1498,31 +1532,37 @@@
+   * /proc/diskstats.  This accounts immediately for all queue usage up to
+   * the current jiffies and restarts the counters again.
+   */
+ -void part_round_stats(struct request_queue *q, int cpu, struct hd_struct *part)
+ +void part_round_stats(int cpu, struct hd_struct *part)
+  {
++ 	struct hd_struct *part2 = NULL;
+  	unsigned long now = jiffies;
++ 	unsigned int inflight[2];
++ 	int stats = 0;
+  
+++<<<<<<< HEAD
+ +	if (part->partno)
+ +		part_round_stats_single(cpu, &part_to_disk(part)->part0, now);
+ +	part_round_stats_single(cpu, part, now);
+++=======
++ 	if (part->stamp != now)
++ 		stats |= 1;
++ 
++ 	if (part->partno) {
++ 		part2 = &part_to_disk(part)->part0;
++ 		if (part2->stamp != now)
++ 			stats |= 2;
++ 	}
++ 
++ 	if (!stats)
++ 		return;
++ 
++ 	part_in_flight(q, part, inflight);
++ 
++ 	if (stats & 2)
++ 		part_round_stats_single(q, cpu, part2, now, inflight[1]);
++ 	if (stats & 1)
++ 		part_round_stats_single(q, cpu, part, now, inflight[0]);
+++>>>>>>> b8d62b3a9c25 (blk-mq: enable checking two part inflight counts at the same time)
+  }
+  EXPORT_SYMBOL_GPL(part_round_stats);
+  
+diff --cc block/blk-mq.c
+index a8e551c0c631,fe764ca16993..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -65,6 -83,41 +65,44 @@@ static void blk_mq_hctx_clear_pending(s
+  	sbitmap_clear_bit(&hctx->ctx_map, ctx->index_hw);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct mq_inflight {
++ 	struct hd_struct *part;
++ 	unsigned int *inflight;
++ };
++ 
++ static void blk_mq_check_inflight(struct blk_mq_hw_ctx *hctx,
++ 				  struct request *rq, void *priv,
++ 				  bool reserved)
++ {
++ 	struct mq_inflight *mi = priv;
++ 
++ 	if (test_bit(REQ_ATOM_STARTED, &rq->atomic_flags) &&
++ 	    !test_bit(REQ_ATOM_COMPLETE, &rq->atomic_flags)) {
++ 		/*
++ 		 * index[0] counts the specific partition that was asked
++ 		 * for. index[1] counts the ones that are active on the
++ 		 * whole device, so increment that if mi->part is indeed
++ 		 * a partition, and not a whole device.
++ 		 */
++ 		if (rq->part == mi->part)
++ 			mi->inflight[0]++;
++ 		if (mi->part->partno)
++ 			mi->inflight[1]++;
++ 	}
++ }
++ 
++ void blk_mq_in_flight(struct request_queue *q, struct hd_struct *part,
++ 		      unsigned int inflight[2])
++ {
++ 	struct mq_inflight mi = { .part = part, .inflight = inflight, };
++ 
++ 	inflight[0] = inflight[1] = 0;
++ 	blk_mq_queue_tag_busy_iter(q, blk_mq_check_inflight, &mi);
++ }
++ 
+++>>>>>>> b8d62b3a9c25 (blk-mq: enable checking two part inflight counts at the same time)
+  void blk_freeze_queue_start(struct request_queue *q)
+  {
+  	int freeze_depth;
+* Unmerged path block/blk-core.c
+* Unmerged path block/blk-mq.c
