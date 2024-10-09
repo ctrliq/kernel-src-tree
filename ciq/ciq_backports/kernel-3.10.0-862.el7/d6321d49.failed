@@ -1,0 +1,483 @@
+KVM: x86: generalize guest_cpuid_has_ helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Radim Krčmář <rkrcmar@redhat.com>
+commit d6321d493319bfd406c484e8359c6101cbda39d3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d6321d49.failed
+
+This patch turns guest_cpuid_has_XYZ(cpuid) into guest_cpuid_has(cpuid,
+X86_FEATURE_XYZ), which gets rid of many very similar helpers.
+
+When seeing a X86_FEATURE_*, we can know which cpuid it belongs to, but
+this information isn't in common code, so we recreate it for KVM.
+
+Add some BUILD_BUG_ONs to make sure that it runs nicely.
+
+	Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+	Reviewed-by: David Hildenbrand <david@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit d6321d493319bfd406c484e8359c6101cbda39d3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/cpuid.h
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/cpuid.h
+index df84d0fbb2f9,4e9ac93b4f3a..000000000000
+--- a/arch/x86/kvm/cpuid.h
++++ b/arch/x86/kvm/cpuid.h
+@@@ -2,6 -2,8 +2,11 @@@
+  #define ARCH_X86_KVM_CPUID_H
+  
+  #include "x86.h"
+++<<<<<<< HEAD
+++=======
++ #include <asm/cpu.h>
++ #include <asm/processor.h>
+++>>>>>>> d6321d493319 (KVM: x86: generalize guest_cpuid_has_ helpers)
+  
+  int kvm_update_cpuid(struct kvm_vcpu *vcpu);
+  bool kvm_mpx_supported(void);
+@@@ -28,87 -30,78 +33,151 @@@ static inline int cpuid_maxphyaddr(stru
+  	return vcpu->arch.maxphyaddr;
+  }
+  
+- static inline bool guest_cpuid_has_xsave(struct kvm_vcpu *vcpu)
++ struct cpuid_reg {
++ 	u32 function;
++ 	u32 index;
++ 	int reg;
++ };
++ 
++ static const struct cpuid_reg reverse_cpuid[] = {
++ 	[CPUID_1_EDX]         = {         1, 0, CPUID_EDX},
++ 	[CPUID_8000_0001_EDX] = {0x80000001, 0, CPUID_EDX},
++ 	[CPUID_8086_0001_EDX] = {0x80860001, 0, CPUID_EDX},
++ 	[CPUID_1_ECX]         = {         1, 0, CPUID_ECX},
++ 	[CPUID_C000_0001_EDX] = {0xc0000001, 0, CPUID_EDX},
++ 	[CPUID_8000_0001_ECX] = {0xc0000001, 0, CPUID_ECX},
++ 	[CPUID_7_0_EBX]       = {         7, 0, CPUID_EBX},
++ 	[CPUID_D_1_EAX]       = {       0xd, 1, CPUID_EAX},
++ 	[CPUID_F_0_EDX]       = {       0xf, 0, CPUID_EDX},
++ 	[CPUID_F_1_EDX]       = {       0xf, 1, CPUID_EDX},
++ 	[CPUID_8000_0008_EBX] = {0x80000008, 0, CPUID_EBX},
++ 	[CPUID_6_EAX]         = {         6, 0, CPUID_EAX},
++ 	[CPUID_8000_000A_EDX] = {0x8000000a, 0, CPUID_EDX},
++ 	[CPUID_7_ECX]         = {         7, 0, CPUID_ECX},
++ 	[CPUID_8000_0007_EBX] = {0x80000007, 0, CPUID_EBX},
++ };
++ 
++ static __always_inline struct cpuid_reg x86_feature_cpuid(unsigned x86_feature)
+  {
+- 	struct kvm_cpuid_entry2 *best;
++ 	unsigned x86_leaf = x86_feature / 32;
+  
+- 	if (!static_cpu_has(X86_FEATURE_XSAVE))
+- 		return false;
++ 	BUILD_BUG_ON(!__builtin_constant_p(x86_leaf));
++ 	BUILD_BUG_ON(x86_leaf >= ARRAY_SIZE(reverse_cpuid));
++ 	BUILD_BUG_ON(reverse_cpuid[x86_leaf].function == 0);
+  
+- 	best = kvm_find_cpuid_entry(vcpu, 1, 0);
+- 	return best && (best->ecx & bit(X86_FEATURE_XSAVE));
++ 	return reverse_cpuid[x86_leaf];
+  }
+  
++ static __always_inline int *guest_cpuid_get_register(struct kvm_vcpu *vcpu, unsigned x86_feature)
++ {
++ 	struct kvm_cpuid_entry2 *entry;
++ 	const struct cpuid_reg cpuid = x86_feature_cpuid(x86_feature);
++ 
++ 	entry = kvm_find_cpuid_entry(vcpu, cpuid.function, cpuid.index);
++ 	if (!entry)
++ 		return NULL;
++ 
++ 	switch (cpuid.reg) {
++ 	case CPUID_EAX:
++ 		return &entry->eax;
++ 	case CPUID_EBX:
++ 		return &entry->ebx;
++ 	case CPUID_ECX:
++ 		return &entry->ecx;
++ 	case CPUID_EDX:
++ 		return &entry->edx;
++ 	default:
++ 		BUILD_BUG();
++ 		return NULL;
++ 	}
++ }
++ 
++ static __always_inline bool guest_cpuid_has(struct kvm_vcpu *vcpu, unsigned x86_feature)
++ {
++ 	int *reg;
++ 
++ 	if (x86_feature == X86_FEATURE_XSAVE &&
++ 			!static_cpu_has(X86_FEATURE_XSAVE))
++ 		return false;
++ 
++ 	reg = guest_cpuid_get_register(vcpu, x86_feature);
++ 	if (!reg)
++ 		return false;
++ 
+++<<<<<<< HEAD
+ +static inline bool guest_cpuid_has_mtrr(struct kvm_vcpu *vcpu)
+ +{
+ +	struct kvm_cpuid_entry2 *best;
+ +
+ +	best = kvm_find_cpuid_entry(vcpu, 1, 0);
+ +	return best && (best->edx & bit(X86_FEATURE_MTRR));
+ +}
+ +
+ +static inline bool guest_cpuid_has_tsc_adjust(struct kvm_vcpu *vcpu)
+ +{
+ +	struct kvm_cpuid_entry2 *best;
+ +
+ +	best = kvm_find_cpuid_entry(vcpu, 7, 0);
+ +	return best && (best->ebx & bit(X86_FEATURE_TSC_ADJUST));
+ +}
+ +
+ +static inline bool guest_cpuid_has_smep(struct kvm_vcpu *vcpu)
+ +{
+ +	struct kvm_cpuid_entry2 *best;
+ +
+ +	best = kvm_find_cpuid_entry(vcpu, 7, 0);
+ +	return best && (best->ebx & bit(X86_FEATURE_SMEP));
+ +}
+ +
+ +static inline bool guest_cpuid_has_smap(struct kvm_vcpu *vcpu)
+ +{
+ +	struct kvm_cpuid_entry2 *best;
+ +
+ +	best = kvm_find_cpuid_entry(vcpu, 7, 0);
+ +	return best && (best->ebx & bit(X86_FEATURE_SMAP));
+ +}
+ +
+ +static inline bool guest_cpuid_has_fsgsbase(struct kvm_vcpu *vcpu)
+ +{
+ +	struct kvm_cpuid_entry2 *best;
+ +
+ +	best = kvm_find_cpuid_entry(vcpu, 7, 0);
+ +	return best && (best->ebx & bit(X86_FEATURE_FSGSBASE));
+ +}
+ +
+ +static inline bool guest_cpuid_has_longmode(struct kvm_vcpu *vcpu)
+ +{
+ +	struct kvm_cpuid_entry2 *best;
+ +
+ +	best = kvm_find_cpuid_entry(vcpu, 0x80000001, 0);
+ +	return best && (best->edx & bit(X86_FEATURE_LM));
+ +}
+ +
+ +static inline bool guest_cpuid_has_osvw(struct kvm_vcpu *vcpu)
+ +{
+ +	struct kvm_cpuid_entry2 *best;
+ +
+ +	best = kvm_find_cpuid_entry(vcpu, 0x80000001, 0);
+ +	return best && (best->ecx & bit(X86_FEATURE_OSVW));
+ +}
+ +
+ +static inline bool guest_cpuid_has_pcid(struct kvm_vcpu *vcpu)
+ +{
+ +	struct kvm_cpuid_entry2 *best;
+ +
+ +	best = kvm_find_cpuid_entry(vcpu, 1, 0);
+ +	return best && (best->ecx & bit(X86_FEATURE_PCID));
+ +}
+ +
+ +static inline bool guest_cpuid_has_x2apic(struct kvm_vcpu *vcpu)
+ +{
+ +	struct kvm_cpuid_entry2 *best;
+ +
+ +	best = kvm_find_cpuid_entry(vcpu, 1, 0);
+ +	return best && (best->ecx & bit(X86_FEATURE_X2APIC));
+++=======
++ 	return *reg & bit(x86_feature);
+++>>>>>>> d6321d493319 (KVM: x86: generalize guest_cpuid_has_ helpers)
+  }
+  
+  static inline bool guest_cpuid_is_amd(struct kvm_vcpu *vcpu)
+@@@ -119,44 -112,48 +188,89 @@@
+  	return best && best->ebx == X86EMUL_CPUID_VENDOR_AuthenticAMD_ebx;
+  }
+  
+++<<<<<<< HEAD
+ +static inline bool guest_cpuid_has_gbpages(struct kvm_vcpu *vcpu)
+ +{
+ +	struct kvm_cpuid_entry2 *best;
+ +
+ +	best = kvm_find_cpuid_entry(vcpu, 0x80000001, 0);
+ +	return best && (best->edx & bit(X86_FEATURE_GBPAGES));
+ +}
+ +
+ +static inline bool guest_cpuid_has_rtm(struct kvm_vcpu *vcpu)
+ +{
+ +	struct kvm_cpuid_entry2 *best;
+ +
+ +	best = kvm_find_cpuid_entry(vcpu, 7, 0);
+ +	return best && (best->ebx & bit(X86_FEATURE_RTM));
+ +}
+ +
+ +static inline bool guest_cpuid_has_mpx(struct kvm_vcpu *vcpu)
+ +{
+ +	struct kvm_cpuid_entry2 *best;
+ +
+ +	best = kvm_find_cpuid_entry(vcpu, 7, 0);
+ +	return best && (best->ebx & bit(X86_FEATURE_MPX));
+ +}
+ +
+ +static inline bool guest_cpuid_has_rdtscp(struct kvm_vcpu *vcpu)
+ +{
+ +	struct kvm_cpuid_entry2 *best;
+ +
+ +	best = kvm_find_cpuid_entry(vcpu, 0x80000001, 0);
+ +	return best && (best->edx & bit(X86_FEATURE_RDTSCP));
+ +}
+ +
+ +static inline bool guest_cpuid_has_nrips(struct kvm_vcpu *vcpu)
+ +{
+ +	struct kvm_cpuid_entry2 *best;
+ +
+ +	best = kvm_find_cpuid_entry(vcpu, 0x8000000a, 0);
+ +	return best && (best->edx & bit(X86_FEATURE_NRIPS));
+++=======
++ static inline int guest_cpuid_family(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_cpuid_entry2 *best;
++ 
++ 	best = kvm_find_cpuid_entry(vcpu, 0x1, 0);
++ 	if (!best)
++ 		return -1;
++ 
++ 	return x86_family(best->eax);
++ }
++ 
++ static inline int guest_cpuid_model(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_cpuid_entry2 *best;
++ 
++ 	best = kvm_find_cpuid_entry(vcpu, 0x1, 0);
++ 	if (!best)
++ 		return -1;
++ 
++ 	return x86_model(best->eax);
++ }
++ 
++ static inline int guest_cpuid_stepping(struct kvm_vcpu *vcpu)
++ {
++ 	struct kvm_cpuid_entry2 *best;
++ 
++ 	best = kvm_find_cpuid_entry(vcpu, 0x1, 0);
++ 	if (!best)
++ 		return -1;
++ 
++ 	return x86_stepping(best->eax);
++ }
++ 
++ static inline bool supports_cpuid_fault(struct kvm_vcpu *vcpu)
++ {
++ 	return vcpu->arch.msr_platform_info & MSR_PLATFORM_INFO_CPUID_FAULT;
++ }
++ 
++ static inline bool cpuid_fault_enabled(struct kvm_vcpu *vcpu)
++ {
++ 	return vcpu->arch.msr_misc_features_enables &
++ 		  MSR_MISC_FEATURES_ENABLES_CPUID_FAULT;
+++>>>>>>> d6321d493319 (KVM: x86: generalize guest_cpuid_has_ helpers)
+  }
+  
+  #endif
+diff --cc arch/x86/kvm/x86.c
+index 15050eb7c19c,ee4e251c82fc..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -741,18 -754,21 +741,24 @@@ int kvm_set_cr4(struct kvm_vcpu *vcpu, 
+  	if (cr4 & CR4_RESERVED_BITS)
+  		return 1;
+  
+- 	if (!guest_cpuid_has_xsave(vcpu) && (cr4 & X86_CR4_OSXSAVE))
++ 	if (!guest_cpuid_has(vcpu, X86_FEATURE_XSAVE) && (cr4 & X86_CR4_OSXSAVE))
+  		return 1;
+  
+- 	if (!guest_cpuid_has_smep(vcpu) && (cr4 & X86_CR4_SMEP))
++ 	if (!guest_cpuid_has(vcpu, X86_FEATURE_SMEP) && (cr4 & X86_CR4_SMEP))
+  		return 1;
+  
+- 	if (!guest_cpuid_has_smap(vcpu) && (cr4 & X86_CR4_SMAP))
++ 	if (!guest_cpuid_has(vcpu, X86_FEATURE_SMAP) && (cr4 & X86_CR4_SMAP))
+  		return 1;
+  
+- 	if (!guest_cpuid_has_fsgsbase(vcpu) && (cr4 & X86_CR4_FSGSBASE))
++ 	if (!guest_cpuid_has(vcpu, X86_FEATURE_FSGSBASE) && (cr4 & X86_CR4_FSGSBASE))
+  		return 1;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!guest_cpuid_has(vcpu, X86_FEATURE_PKU) && (cr4 & X86_CR4_PKE))
++ 		return 1;
++ 
+++>>>>>>> d6321d493319 (KVM: x86: generalize guest_cpuid_has_ helpers)
+  	if (is_long_mode(vcpu)) {
+  		if (!(cr4 & X86_CR4_PAE))
+  			return 1;
+@@@ -2263,10 -2305,10 +2270,10 @@@ int kvm_set_msr_common(struct kvm_vcpu 
+  		/* Drop writes to this legacy MSR -- see rdmsr
+  		 * counterpart for further detail.
+  		 */
+ -		vcpu_unimpl(vcpu, "ignored wrmsr: 0x%x data 0x%llx\n", msr, data);
+ +		vcpu_unimpl(vcpu, "ignored wrmsr: 0x%x data %llx\n", msr, data);
+  		break;
+  	case MSR_AMD64_OSVW_ID_LENGTH:
+- 		if (!guest_cpuid_has_osvw(vcpu))
++ 		if (!guest_cpuid_has(vcpu, X86_FEATURE_OSVW))
+  			return 1;
+  		vcpu->arch.osvw.length = data;
+  		break;
+* Unmerged path arch/x86/kvm/cpuid.h
+diff --git a/arch/x86/kvm/mmu.c b/arch/x86/kvm/mmu.c
+index 54edab8c50fd..102f818cdb00 100644
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -3765,7 +3765,8 @@ static void reset_rsvds_bits_mask(struct kvm_vcpu *vcpu,
+ {
+ 	__reset_rsvds_bits_mask(vcpu, &context->guest_rsvd_check,
+ 				cpuid_maxphyaddr(vcpu), context->root_level,
+-				context->nx, guest_cpuid_has_gbpages(vcpu),
++				context->nx,
++				guest_cpuid_has(vcpu, X86_FEATURE_GBPAGES),
+ 				is_pse(vcpu), guest_cpuid_is_amd(vcpu));
+ }
+ 
+@@ -3827,8 +3828,8 @@ reset_shadow_zero_bits_mask(struct kvm_vcpu *vcpu, struct kvm_mmu *context)
+ 	__reset_rsvds_bits_mask(vcpu, &context->shadow_zero_check,
+ 				boot_cpu_data.x86_phys_bits,
+ 				context->shadow_root_level, uses_nx,
+-				guest_cpuid_has_gbpages(vcpu), is_pse(vcpu),
+-				true);
++				guest_cpuid_has(vcpu, X86_FEATURE_GBPAGES),
++				is_pse(vcpu), true);
+ }
+ EXPORT_SYMBOL_GPL(reset_shadow_zero_bits_mask);
+ 
+diff --git a/arch/x86/kvm/mtrr.c b/arch/x86/kvm/mtrr.c
+index 0149ac59c273..e9ea2d45ae66 100644
+--- a/arch/x86/kvm/mtrr.c
++++ b/arch/x86/kvm/mtrr.c
+@@ -130,7 +130,7 @@ static u8 mtrr_disabled_type(struct kvm_vcpu *vcpu)
+ 	 * enable MTRRs and it is obviously undesirable to run the
+ 	 * guest entirely with UC memory and we use WB.
+ 	 */
+-	if (guest_cpuid_has_mtrr(vcpu))
++	if (guest_cpuid_has(vcpu, X86_FEATURE_MTRR))
+ 		return MTRR_TYPE_UNCACHABLE;
+ 	else
+ 		return MTRR_TYPE_WRBACK;
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index d7fd0b8ad73c..4ba20f493d34 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -4942,7 +4942,7 @@ static void svm_cpuid_update(struct kvm_vcpu *vcpu)
+ 	struct kvm_cpuid_entry2 *entry;
+ 
+ 	/* Update nrips enabled cache */
+-	svm->nrips_enabled = !!guest_cpuid_has_nrips(&svm->vcpu);
++	svm->nrips_enabled = !!guest_cpuid_has(&svm->vcpu, X86_FEATURE_NRIPS);
+ 
+ 	if (!kvm_vcpu_apicv_active(vcpu))
+ 		return;
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 35bc7f099719..41c5ff69f75e 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -2426,7 +2426,7 @@ static void setup_msrs(struct vcpu_vmx *vmx)
+ 		if (index >= 0)
+ 			move_msr_up(vmx, index, save_nmsrs++);
+ 		index = __find_msr_index(vmx, MSR_TSC_AUX);
+-		if (index >= 0 && guest_cpuid_has_rdtscp(&vmx->vcpu))
++		if (index >= 0 && guest_cpuid_has(&vmx->vcpu, X86_FEATURE_RDTSCP))
+ 			move_msr_up(vmx, index, save_nmsrs++);
+ 		/*
+ 		 * MSR_STAR is only needed on long mode guests, and only
+@@ -2486,12 +2486,6 @@ static void vmx_write_tsc_offset(struct kvm_vcpu *vcpu, u64 offset)
+ 	}
+ }
+ 
+-static bool guest_cpuid_has_vmx(struct kvm_vcpu *vcpu)
+-{
+-	struct kvm_cpuid_entry2 *best = kvm_find_cpuid_entry(vcpu, 1, 0);
+-	return best && (best->ecx & (1 << (X86_FEATURE_VMX & 31)));
+-}
+-
+ /*
+  * nested_vmx_allowed() checks whether a guest should be allowed to use VMX
+  * instructions and MSRs (i.e., nested VMX). Nested VMX is disabled for
+@@ -2500,7 +2494,7 @@ static bool guest_cpuid_has_vmx(struct kvm_vcpu *vcpu)
+  */
+ static inline bool nested_vmx_allowed(struct kvm_vcpu *vcpu)
+ {
+-	return nested && guest_cpuid_has_vmx(vcpu);
++	return nested && guest_cpuid_has(vcpu, X86_FEATURE_VMX);
+ }
+ 
+ /*
+@@ -2844,7 +2838,8 @@ static int vmx_get_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 		break;
+ 	case MSR_IA32_BNDCFGS:
+ 		if (!kvm_mpx_supported() ||
+-		    (!msr_info->host_initiated && !guest_cpuid_has_mpx(vcpu)))
++		    (!msr_info->host_initiated &&
++		     !guest_cpuid_has(vcpu, X86_FEATURE_MPX)))
+ 			return 1;
+ 		msr_info->data = vmcs_read64(GUEST_BNDCFGS);
+ 		break;
+@@ -2863,7 +2858,8 @@ static int vmx_get_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 			return 1;
+ 		return vmx_get_vmx_msr(vcpu, msr_info->index, &msr_info->data);
+ 	case MSR_TSC_AUX:
+-		if (!guest_cpuid_has_rdtscp(vcpu) && !msr_info->host_initiated)
++		if (!msr_info->host_initiated &&
++		    !guest_cpuid_has(vcpu, X86_FEATURE_RDTSCP))
+ 			return 1;
+ 		/* Otherwise falls through */
+ 	default:
+@@ -2923,7 +2919,8 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 		break;
+ 	case MSR_IA32_BNDCFGS:
+ 		if (!kvm_mpx_supported() ||
+-		    (!msr_info->host_initiated && !guest_cpuid_has_mpx(vcpu)))
++		    (!msr_info->host_initiated &&
++		     !guest_cpuid_has(vcpu, X86_FEATURE_MPX)))
+ 			return 1;
+ 		if (is_noncanonical_address(data & PAGE_MASK) ||
+ 		    (data & MSR_IA32_BNDCFGS_RSVD))
+@@ -2966,7 +2963,8 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 	case MSR_IA32_VMX_BASIC ... MSR_IA32_VMX_VMFUNC:
+ 		return 1; /* they are read-only */
+ 	case MSR_TSC_AUX:
+-		if (!guest_cpuid_has_rdtscp(vcpu) && !msr_info->host_initiated)
++		if (!msr_info->host_initiated &&
++		    !guest_cpuid_has(vcpu, X86_FEATURE_RDTSCP))
+ 			return 1;
+ 		/* Check reserved bit, higher 32 bits should be zero */
+ 		if ((data >> 32) != 0)
+@@ -9048,7 +9046,7 @@ static void vmx_cpuid_update(struct kvm_vcpu *vcpu)
+ 	u32 secondary_exec_ctl = vmx_secondary_exec_control(vmx);
+ 
+ 	if (vmx_rdtscp_supported()) {
+-		bool rdtscp_enabled = guest_cpuid_has_rdtscp(vcpu);
++		bool rdtscp_enabled = guest_cpuid_has(vcpu, X86_FEATURE_RDTSCP);
+ 		if (!rdtscp_enabled)
+ 			secondary_exec_ctl &= ~SECONDARY_EXEC_RDTSCP;
+ 
+@@ -9067,7 +9065,7 @@ static void vmx_cpuid_update(struct kvm_vcpu *vcpu)
+ 		struct kvm_cpuid_entry2 *best = kvm_find_cpuid_entry(vcpu, 0x7, 0);
+ 		bool invpcid_enabled =
+ 			best && best->ebx & bit(X86_FEATURE_INVPCID) &&
+-			guest_cpuid_has_pcid(vcpu);
++			guest_cpuid_has(vcpu, X86_FEATURE_PCID);
+ 
+ 		if (!invpcid_enabled) {
+ 			secondary_exec_ctl &= ~SECONDARY_EXEC_ENABLE_INVPCID;
+* Unmerged path arch/x86/kvm/x86.c
