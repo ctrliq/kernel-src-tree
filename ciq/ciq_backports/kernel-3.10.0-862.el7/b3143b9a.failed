@@ -1,0 +1,158 @@
+md: move suspend_hi/lo handling into core md code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [md] move suspend_hi/lo handling into core md code (Nigel Croxon) [1506338]
+Rebuild_FUZZ: 95.74%
+commit-author NeilBrown <neilb@suse.com>
+commit b3143b9a38d5039bcd1f2d1c94039651bfba8043
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b3143b9a.failed
+
+responding to ->suspend_lo and ->suspend_hi is similar
+to responding to ->suspended.  It is best to wait in
+the common core code without incrementing ->active_io.
+This allows mddev_suspend()/mddev_resume() to work while
+requests are waiting for suspend_lo/hi to change.
+This is will be important after a subsequent patch
+which uses mddev_suspend() to synchronize updating for
+suspend_lo/hi.
+
+So move the code for testing suspend_lo/hi out of raid1.c
+and raid5.c, and place it in md.c
+
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit b3143b9a38d5039bcd1f2d1c94039651bfba8043)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+#	drivers/md/raid1.c
+diff --cc drivers/md/md.c
+index 4c75b0e4a2a4,68de2a6ee29a..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -248,25 -266,26 +248,44 @@@ static DEFINE_SPINLOCK(all_mddevs_lock)
+   * call has finished, the bio has been linked into some internal structure
+   * and so is visible to ->quiesce(), so we don't need the refcount any more.
+   */
+++<<<<<<< HEAD
+ +static void md_make_request(struct request_queue *q, struct bio *bio)
+++=======
++ static bool is_suspended(struct mddev *mddev, struct bio *bio)
++ {
++ 	if (mddev->suspended)
++ 		return true;
++ 	if (bio_data_dir(bio) != WRITE)
++ 		return false;
++ 	if (mddev->suspend_lo >= mddev->suspend_hi)
++ 		return false;
++ 	if (bio->bi_iter.bi_sector >= mddev->suspend_hi)
++ 		return false;
++ 	if (bio_end_sector(bio) < mddev->suspend_lo)
++ 		return false;
++ 	return true;
++ }
++ 
++ void md_handle_request(struct mddev *mddev, struct bio *bio)
+++>>>>>>> b3143b9a38d5 (md: move suspend_hi/lo handling into core md code)
+  {
+ +	const int rw = bio_data_dir(bio);
+ +	struct mddev *mddev = q->queuedata;
+ +	int cpu;
+ +	unsigned int sectors;
+ +
+ +	if (mddev == NULL || mddev->pers == NULL) {
+ +		bio_io_error(bio);
+ +		return;
+ +	}
+ +	if (mddev->ro == 1 && unlikely(rw == WRITE)) {
+ +		bio_endio(bio, bio_sectors(bio) == 0 ? 0 : -EROFS);
+ +		return;
+ +	}
+  check_suspended:
+ +	smp_rmb(); /* Ensure implications of  'active' are visible */
+  	rcu_read_lock();
+- 	if (mddev->suspended) {
++ 	if (is_suspended(mddev, bio)) {
+  		DEFINE_WAIT(__wait);
+  		for (;;) {
+  			prepare_to_wait(&mddev->sb_wait, &__wait,
+diff --cc drivers/md/raid1.c
+index 481b2b2701df,fb56ef79a1c3..000000000000
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@@ -1290,19 -1310,23 +1290,36 @@@ static void raid1_write_request(struct 
+  	 */
+  
+  
+++<<<<<<< HEAD
+ +	if (bio_end_sector(bio) > mddev->suspend_lo &&
+ +	    bio->bi_sector < mddev->suspend_hi) {
+ +		/* As the suspend_* range is controlled by
+ +		 * userspace, we want an interruptible
+ +		 * wait.
+++=======
++ 	if (mddev_is_clustered(mddev) &&
++ 	     md_cluster_ops->area_resyncing(mddev, WRITE,
++ 		     bio->bi_iter.bi_sector, bio_end_sector(bio))) {
++ 
++ 		/*
++ 		 * As the suspend_* range is controlled by userspace, we want
++ 		 * an interruptible wait.
+++>>>>>>> b3143b9a38d5 (md: move suspend_hi/lo handling into core md code)
+  		 */
+  		DEFINE_WAIT(w);
+  		for (;;) {
+  			sigset_t full, old;
+  			prepare_to_wait(&conf->wait_barrier,
+  					&w, TASK_INTERRUPTIBLE);
+++<<<<<<< HEAD
+ +			if (bio_end_sector(bio) <= mddev->suspend_lo ||
+ +			    bio->bi_sector >= mddev->suspend_hi)
+++=======
++ 			if (!mddev_is_clustered(mddev) ||
++ 			    !md_cluster_ops->area_resyncing(mddev, WRITE,
++ 							bio->bi_iter.bi_sector,
++ 							bio_end_sector(bio)))
+++>>>>>>> b3143b9a38d5 (md: move suspend_hi/lo handling into core md code)
+  				break;
+  			sigfillset(&full);
+  			sigprocmask(SIG_BLOCK, &full, &old);
+* Unmerged path drivers/md/md.c
+* Unmerged path drivers/md/raid1.c
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index aa86463a5e50..e3cf3115b0f2 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -5489,28 +5489,6 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
+ 				goto retry;
+ 			}
+ 
+-			if (rw == WRITE &&
+-			    logical_sector >= mddev->suspend_lo &&
+-			    logical_sector < mddev->suspend_hi) {
+-				raid5_release_stripe(sh);
+-				/* As the suspend_* range is controlled by
+-				 * userspace, we want an interruptible
+-				 * wait.
+-				 */
+-				prepare_to_wait(&conf->wait_for_overlap,
+-						&w, TASK_INTERRUPTIBLE);
+-				if (logical_sector >= mddev->suspend_lo &&
+-				    logical_sector < mddev->suspend_hi) {
+-					sigset_t full, old;
+-					sigfillset(&full);
+-					sigprocmask(SIG_BLOCK, &full, &old);
+-					schedule();
+-					sigprocmask(SIG_SETMASK, &old, NULL);
+-					do_prepare = true;
+-				}
+-				goto retry;
+-			}
+-
+ 			if (test_bit(STRIPE_EXPANDING, &sh->state) ||
+ 			    !add_stripe_bio(sh, bi, dd_idx, rw, previous)) {
+ 				/* Stripe is busy expanding or
