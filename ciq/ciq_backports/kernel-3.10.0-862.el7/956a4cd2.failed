@@ -1,0 +1,144 @@
+device-dax: switch to srcu, fix rcu_read_lock() vs pte allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [dax] switch to srcu, fix rcu_read_lock() vs pte allocation (Larry Woodman) [1471656 1457572 1457561]
+Rebuild_FUZZ: 89.83%
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 956a4cd2c957acf638ff29951aabaa9d8e92bbc2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/956a4cd2.failed
+
+The following warning triggers with a new unit test that stresses the
+device-dax interface.
+
+ ===============================
+ [ ERR: suspicious RCU usage.  ]
+ 4.11.0-rc4+ #1049 Tainted: G           O
+ -------------------------------
+ ./include/linux/rcupdate.h:521 Illegal context switch in RCU read-side critical section!
+
+ other info that might help us debug this:
+
+ rcu_scheduler_active = 2, debug_locks = 0
+ 2 locks held by fio/9070:
+  #0:  (&mm->mmap_sem){++++++}, at: [<ffffffff8d0739d7>] __do_page_fault+0x167/0x4f0
+  #1:  (rcu_read_lock){......}, at: [<ffffffffc03fbd02>] dax_dev_huge_fault+0x32/0x620 [dax]
+
+ Call Trace:
+  dump_stack+0x86/0xc3
+  lockdep_rcu_suspicious+0xd7/0x110
+  ___might_sleep+0xac/0x250
+  __might_sleep+0x4a/0x80
+  __alloc_pages_nodemask+0x23a/0x360
+  alloc_pages_current+0xa1/0x1f0
+  pte_alloc_one+0x17/0x80
+  __pte_alloc+0x1e/0x120
+  __get_locked_pte+0x1bf/0x1d0
+  insert_pfn.isra.70+0x3a/0x100
+  ? lookup_memtype+0xa6/0xd0
+  vm_insert_mixed+0x64/0x90
+  dax_dev_huge_fault+0x520/0x620 [dax]
+  ? dax_dev_huge_fault+0x32/0x620 [dax]
+  dax_dev_fault+0x10/0x20 [dax]
+  __do_fault+0x1e/0x140
+  __handle_mm_fault+0x9af/0x10d0
+  handle_mm_fault+0x16d/0x370
+  ? handle_mm_fault+0x47/0x370
+  __do_page_fault+0x28c/0x4f0
+  trace_do_page_fault+0x58/0x2a0
+  do_async_page_fault+0x1a/0xa0
+  async_page_fault+0x28/0x30
+
+Inserting a page table entry may trigger an allocation while we are
+holding a read lock to keep the device instance alive for the duration
+of the fault. Use srcu for this keep-alive protection.
+
+Fixes: dee410792419 ("/dev/dax, core: file operations and dax-mmap")
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 956a4cd2c957acf638ff29951aabaa9d8e92bbc2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dax/dax.c
+diff --cc drivers/dax/dax.c
+index 85c0bc93f989,806f180c80d8..000000000000
+--- a/drivers/dax/dax.c
++++ b/drivers/dax/dax.c
+@@@ -533,24 -557,43 +534,47 @@@ static int __dax_dev_pmd_fault(struct d
+  
+  	pfn = phys_to_pfn_t(phys, dax_region->pfn_flags);
+  
+ -	return vmf_insert_pfn_pud(vmf->vma, vmf->address, vmf->pud, pfn,
+ -			vmf->flags & FAULT_FLAG_WRITE);
+ -}
+ -#else
+ -static int __dax_dev_pud_fault(struct dax_dev *dax_dev, struct vm_fault *vmf)
+ -{
+ -	return VM_FAULT_FALLBACK;
+ +	return vmf_insert_pfn_pmd(vma, addr, pmd, pfn,
+ +			flags & FAULT_FLAG_WRITE);
+  }
+ -#endif /* !CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD */
+  
+ -static int dax_dev_huge_fault(struct vm_fault *vmf,
+ -		enum page_entry_size pe_size)
+ +static int dax_dev_pmd_fault(struct vm_area_struct *vma, unsigned long addr,
+ +		pmd_t *pmd, unsigned int flags)
+  {
+++<<<<<<< HEAD
+ +	int rc;
+ +	struct file *filp = vma->vm_file;
+++=======
++ 	int rc, id;
++ 	struct file *filp = vmf->vma->vm_file;
+++>>>>>>> 956a4cd2c957 (device-dax: switch to srcu, fix rcu_read_lock() vs pte allocation)
+  	struct dax_dev *dax_dev = filp->private_data;
+  
+  	dev_dbg(&dax_dev->dev, "%s: %s: %s (%#lx - %#lx)\n", __func__,
+ -			current->comm, (vmf->flags & FAULT_FLAG_WRITE)
+ -			? "write" : "read",
+ -			vmf->vma->vm_start, vmf->vma->vm_end);
+ -
+ +			current->comm, (flags & FAULT_FLAG_WRITE)
+ +			? "write" : "read", vma->vm_start, vma->vm_end);
+ +
+++<<<<<<< HEAD
+ +	rcu_read_lock();
+ +	rc = __dax_dev_pmd_fault(dax_dev, vma, addr, pmd, flags);
+ +	rcu_read_unlock();
+++=======
++ 	id = srcu_read_lock(&dax_srcu);
++ 	switch (pe_size) {
++ 	case PE_SIZE_PTE:
++ 		rc = __dax_dev_pte_fault(dax_dev, vmf);
++ 		break;
++ 	case PE_SIZE_PMD:
++ 		rc = __dax_dev_pmd_fault(dax_dev, vmf);
++ 		break;
++ 	case PE_SIZE_PUD:
++ 		rc = __dax_dev_pud_fault(dax_dev, vmf);
++ 		break;
++ 	default:
++ 		return VM_FAULT_FALLBACK;
++ 	}
++ 	srcu_read_unlock(&dax_srcu, id);
+++>>>>>>> 956a4cd2c957 (device-dax: switch to srcu, fix rcu_read_lock() vs pte allocation)
+  
+  	return rc;
+  }
+diff --git a/drivers/dax/Kconfig b/drivers/dax/Kconfig
+index 3e2ab3b14eea..9e95bf94eb13 100644
+--- a/drivers/dax/Kconfig
++++ b/drivers/dax/Kconfig
+@@ -2,6 +2,7 @@ menuconfig DEV_DAX
+ 	tristate "DAX: direct access to differentiated memory"
+ 	default m if NVDIMM_DAX
+ 	depends on TRANSPARENT_HUGEPAGE
++	select SRCU
+ 	help
+ 	  Support raw access to differentiated (persistence, bandwidth,
+ 	  latency...) memory via an mmap(2) capable character
+* Unmerged path drivers/dax/dax.c
