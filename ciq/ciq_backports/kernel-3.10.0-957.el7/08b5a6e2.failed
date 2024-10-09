@@ -1,0 +1,115 @@
+blk-mq: silence false positive warnings in hctx_unlock()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 08b5a6e2a769f720977b245431b45134c0bdd377
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/08b5a6e2.failed
+
+In some stupider versions of gcc, it complains:
+
+block/blk-mq.c: In function ‘blk_mq_complete_request’:
+./include/linux/srcu.h:175:2: warning: ‘srcu_idx’ may be used uninitialized in this function [-Wmaybe-uninitialized]
+  __srcu_read_unlock(sp, idx);
+  ^
+block/blk-mq.c:620:6: note: ‘srcu_idx’ was declared here
+  int srcu_idx;
+      ^
+
+which is completely bogus, since we only use srcu_idx when
+hctx->flags & BLK_MQ_F_BLOCKING is set, and that's the case where
+hctx_lock() has initialized it.
+
+Just set it to '0' in the normal path in hctx_lock() to silence
+this annoying warning.
+
+Fixes: 04ced159cec8 ("blk-mq: move hctx lock/unlock into a helper")
+Fixes: 5197c05e16b4 ("blk-mq: protect completion path with RCU")
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 08b5a6e2a769f720977b245431b45134c0bdd377)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index 1eaa154c3ecb,8de354606690..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -449,27 -559,52 +449,71 @@@ static void blk_mq_ipi_complete_request
+  	put_cpu();
+  }
+  
+ -static void hctx_unlock(struct blk_mq_hw_ctx *hctx, int srcu_idx)
+ +static void blk_mq_stat_add(struct request *rq)
+  {
+ -	if (!(hctx->flags & BLK_MQ_F_BLOCKING))
+ -		rcu_read_unlock();
+ +	if (rq->cmd_flags & REQ_STATS) {
+ +		blk_mq_poll_stats_start(rq->q);
+ +		blk_stat_add(rq);
+ +	}
+ +}
+ +
+ +static void __blk_mq_complete_request(struct request *rq)
+ +{
+ +	struct request_queue *q = rq->q;
+ +
+ +	if (rq_aux(rq)->internal_tag != -1)
+ +		blk_mq_sched_completed_request(rq);
+ +
+ +	blk_mq_stat_add(rq);
+ +
+ +	if (!q->softirq_done_fn)
+ +		blk_mq_end_request(rq, rq->errors);
+  	else
+++<<<<<<< HEAD
+ +		blk_mq_ipi_complete_request(rq);
+++=======
++ 		srcu_read_unlock(hctx->srcu, srcu_idx);
++ }
++ 
++ static void hctx_lock(struct blk_mq_hw_ctx *hctx, int *srcu_idx)
++ {
++ 	if (!(hctx->flags & BLK_MQ_F_BLOCKING)) {
++ 		/* shut up gcc false positive */
++ 		*srcu_idx = 0;
++ 		rcu_read_lock();
++ 	} else
++ 		*srcu_idx = srcu_read_lock(hctx->srcu);
++ }
++ 
++ static void blk_mq_rq_update_aborted_gstate(struct request *rq, u64 gstate)
++ {
++ 	unsigned long flags;
++ 
++ 	/*
++ 	 * blk_mq_rq_aborted_gstate() is used from the completion path and
++ 	 * can thus be called from irq context.  u64_stats_fetch in the
++ 	 * middle of update on the same CPU leads to lockup.  Disable irq
++ 	 * while updating.
++ 	 */
++ 	local_irq_save(flags);
++ 	u64_stats_update_begin(&rq->aborted_gstate_sync);
++ 	rq->aborted_gstate = gstate;
++ 	u64_stats_update_end(&rq->aborted_gstate_sync);
++ 	local_irq_restore(flags);
++ }
++ 
++ static u64 blk_mq_rq_aborted_gstate(struct request *rq)
++ {
++ 	unsigned int start;
++ 	u64 aborted_gstate;
++ 
++ 	do {
++ 		start = u64_stats_fetch_begin(&rq->aborted_gstate_sync);
++ 		aborted_gstate = rq->aborted_gstate;
++ 	} while (u64_stats_fetch_retry(&rq->aborted_gstate_sync, start));
++ 
++ 	return aborted_gstate;
+++>>>>>>> 08b5a6e2a769 (blk-mq: silence false positive warnings in hctx_unlock())
+  }
+  
+  /**
+* Unmerged path block/blk-mq.c
