@@ -560,6 +560,7 @@ bool ccp_queues_suspended(struct ccp_device *ccp)
 
 static const struct x86_cpu_id ccp_support[] = {
 	{ X86_VENDOR_AMD, 22, },
+	{ },
 };
 
 static int __init ccp_mod_init(void)
