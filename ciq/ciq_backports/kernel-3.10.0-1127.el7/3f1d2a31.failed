@@ -1,0 +1,231 @@
+sched: Fix hotplug task migration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 3f1d2a318171bf61850d4e5a72031271e5aada76
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/3f1d2a31.failed
+
+Dan Carpenter reported:
+
+> kernel/sched/rt.c:1347 pick_next_task_rt() warn: variable dereferenced before check 'prev' (see line 1338)
+> kernel/sched/deadline.c:1011 pick_next_task_dl() warn: variable dereferenced before check 'prev' (see line 1005)
+
+Kirill also spotted that migrate_tasks() will have an instant NULL
+deref because pick_next_task() will immediately deref prev.
+
+Instead of fixing all the corner cases because migrate_tasks() can
+pass in a NULL prev task in the unlikely case of hot-un-plug, provide
+a fake task such that we can remove all the NULL checks from the far
+more common paths.
+
+A further problem; not previously spotted; is that because we pushed
+pre_schedule() and idle_balance() into pick_next_task() we now need to
+avoid those getting called and pulling more tasks on our dying CPU.
+
+We avoid pull_{dl,rt}_task() by setting fake_task.prio to MAX_PRIO+1.
+We also note that since we call pick_next_task() exactly the amount of
+times we have runnable tasks present, we should never land in
+idle_balance().
+
+Fixes: 38033c37faab ("sched: Push down pre_schedule() and idle_balance()")
+	Cc: Juri Lelli <juri.lelli@gmail.com>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Reported-by: Kirill Tkhai <tkhai@yandex.ru>
+	Reported-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/20140212094930.GB3545@laptop.programming.kicks-ass.net
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 3f1d2a318171bf61850d4e5a72031271e5aada76)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+#	kernel/sched/deadline.c
+#	kernel/sched/fair.c
+#	kernel/sched/idle_task.c
+#	kernel/sched/rt.c
+#	kernel/sched/stop_task.c
+diff --cc kernel/sched/core.c
+index 9474c46ea21e,49db434a35d0..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -6206,7 -4737,7 +6222,11 @@@ static void migrate_tasks(unsigned int 
+  		if (rq->nr_running == 1)
+  			break;
+  
+++<<<<<<< HEAD
+ +		next = pick_next_task(rq);
+++=======
++ 		next = pick_next_task(rq, &fake_task);
+++>>>>>>> 3f1d2a318171 (sched: Fix hotplug task migration)
+  		BUG_ON(!next);
+  		next->sched_class->put_prev_task(rq, next);
+  
+diff --cc kernel/sched/deadline.c
+index 75f9634980d1,bfeb84ecc32b..000000000000
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@@ -1592,6 -1003,13 +1592,11 @@@ struct task_struct *pick_next_task_dl(s
+  	if (unlikely(!dl_rq->dl_nr_running))
+  		return NULL;
+  
+++<<<<<<< HEAD
+++=======
++ 	put_prev_task(rq, prev);
++ 
+++>>>>>>> 3f1d2a318171 (sched: Fix hotplug task migration)
+  	dl_se = pick_next_dl_entity(rq, dl_rq);
+  	BUG_ON(!dl_se);
+  
+diff --cc kernel/sched/fair.c
+index c5d4b4242380,e884e45982af..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -4906,11 -4685,12 +4906,11 @@@ static struct task_struct *pick_next_ta
+  	struct sched_entity *se;
+  	struct task_struct *p;
+  
+ -again:
+  #ifdef CONFIG_FAIR_GROUP_SCHED
+  	if (!cfs_rq->nr_running)
+ -		goto idle;
+ +		return NULL;
+  
+- 	if (!prev || prev->sched_class != &fair_sched_class)
++ 	if (prev->sched_class != &fair_sched_class)
+  		goto simple;
+  
+  	/*
+@@@ -4984,7 -4764,9 +4984,13 @@@ simple
+  #endif
+  
+  	if (!cfs_rq->nr_running)
+++<<<<<<< HEAD
+ +		return NULL;
+++=======
++ 		goto idle;
++ 
++ 	put_prev_task(rq, prev);
+++>>>>>>> 3f1d2a318171 (sched: Fix hotplug task migration)
+  
+  	do {
+  		se = pick_next_entity(cfs_rq, NULL);
+diff --cc kernel/sched/idle_task.c
+index 59cc67dc571a,53ff9e7c76d2..000000000000
+--- a/kernel/sched/idle_task.c
++++ b/kernel/sched/idle_task.c
+@@@ -30,15 -20,17 +30,20 @@@ static void post_schedule_idle(struct r
+   */
+  static void check_preempt_curr_idle(struct rq *rq, struct task_struct *p, int flags)
+  {
+ -	resched_task(rq->idle);
+ +	resched_curr(rq);
+  }
+  
+ -static struct task_struct *
+ -pick_next_task_idle(struct rq *rq, struct task_struct *prev)
+ +static struct task_struct *pick_next_task_idle(struct rq *rq)
+  {
+++<<<<<<< HEAD
+++=======
++ 	put_prev_task(rq, prev);
++ 
+++>>>>>>> 3f1d2a318171 (sched: Fix hotplug task migration)
+  	schedstat_inc(rq, sched_goidle);
+  #ifdef CONFIG_SMP
+ -	idle_enter_fair(rq);
+ +	/* Trigger the post schedule to do an idle_enter for CFS */
+ +	rq->post_schedule = 1;
+  #endif
+  	return rq->idle;
+  }
+diff --cc kernel/sched/rt.c
+index 6b68ceb9a68d,65c2d6881ac3..000000000000
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@@ -1370,9 -1326,27 +1370,30 @@@ static struct task_struct *_pick_next_t
+  	return p;
+  }
+  
+ -static struct task_struct *
+ -pick_next_task_rt(struct rq *rq, struct task_struct *prev)
+ +static struct task_struct *pick_next_task_rt(struct rq *rq)
+  {
+++<<<<<<< HEAD
+ +	struct task_struct *p = _pick_next_task_rt(rq);
+++=======
++ 	struct task_struct *p;
++ 	struct rt_rq *rt_rq = &rq->rt;
++ 
++ #ifdef CONFIG_SMP
++ 	/* Try to pull RT tasks here if we lower this rq's prio */
++ 	if (rq->rt.highest_prio.curr > prev->prio)
++ 		pull_rt_task(rq);
++ #endif
++ 
++ 	if (!rt_rq->rt_nr_running)
++ 		return NULL;
++ 
++ 	if (rt_rq_throttled(rt_rq))
++ 		return NULL;
++ 
++ 	put_prev_task(rq, prev);
++ 
++ 	p = _pick_next_task_rt(rq);
+++>>>>>>> 3f1d2a318171 (sched: Fix hotplug task migration)
+  
+  	/* The running task is never eligible for pushing */
+  	if (p)
+diff --cc kernel/sched/stop_task.c
+index 5d1b09cc6f74,d6ce65dde541..000000000000
+--- a/kernel/sched/stop_task.c
++++ b/kernel/sched/stop_task.c
+@@@ -27,12 -28,14 +27,20 @@@ static struct task_struct *pick_next_ta
+  {
+  	struct task_struct *stop = rq->stop;
+  
+ -	if (!stop || !stop->on_rq)
+ -		return NULL;
+ +	if (stop && task_on_rq_queued(stop)) {
+ +		stop->se.exec_start = rq_clock_task(rq);
+ +		return stop;
+ +	}
+  
+++<<<<<<< HEAD
+ +	return NULL;
+++=======
++ 	put_prev_task(rq, prev);
++ 
++ 	stop->se.exec_start = rq_clock_task(rq);
++ 
++ 	return stop;
+++>>>>>>> 3f1d2a318171 (sched: Fix hotplug task migration)
+  }
+  
+  static void
+* Unmerged path kernel/sched/core.c
+* Unmerged path kernel/sched/deadline.c
+* Unmerged path kernel/sched/fair.c
+* Unmerged path kernel/sched/idle_task.c
+* Unmerged path kernel/sched/rt.c
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 38c9ae998b34..0d0d3281cdb6 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1298,6 +1298,11 @@ struct sched_class {
+ 	RH_KABI_EXTEND(void (*task_dead) (struct task_struct *p))
+ };
+ 
++static inline void put_prev_task(struct rq *rq, struct task_struct *prev)
++{
++	prev->sched_class->put_prev_task(rq, prev);
++}
++
+ #define sched_class_highest (&stop_sched_class)
+ #define for_each_class(class) \
+    for (class = sched_class_highest; class; class = class->next)
+* Unmerged path kernel/sched/stop_task.c
