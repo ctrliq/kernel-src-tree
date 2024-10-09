@@ -1,0 +1,383 @@
+memremap: drop private struct page_map
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Logan Gunthorpe <logang@deltatee.com>
+commit e7744aa25cffe26d3767c9ffcf4e130cca1dff00
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/e7744aa2.failed
+
+'struct page_map' is a private structure of 'struct dev_pagemap' but the
+latter replicates all the same fields as the former so there isn't much
+value in it. Thus drop it in favour of a completely public struct.
+
+This is a clean up in preperation for a more generally useful
+'devm_memeremap_pages' interface.
+
+	Signed-off-by: Logan Gunthorpe <logang@deltatee.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit e7744aa25cffe26d3767c9ffcf4e130cca1dff00)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/memremap.h
+#	kernel/memremap.c
+#	mm/hmm.c
+diff --cc include/linux/memremap.h
+index c4c41ebb44e1,1cb5f39d25c1..000000000000
+--- a/include/linux/memremap.h
++++ b/include/linux/memremap.h
+@@@ -104,14 -107,15 +104,20 @@@ typedef void (*dev_page_free_t)(struct 
+   * @res: physical address range covered by @ref
+   * @ref: reference count that pins the devm_memremap_pages() mapping
+   * @dev: host device of the mapping for debug
+ - * @data: private data pointer for page_free()
+ - * @type: memory type: see MEMORY_* in memory_hotplug.h
+ + * @data: privata data pointer for page_free
+ + * @type: memory type: see MEMORY_* above
+   */
+  struct dev_pagemap {
+ +	struct vmem_altmap *altmap;
+  	dev_page_fault_t page_fault;
+  	dev_page_free_t page_free;
+++<<<<<<< HEAD
+ +	const struct resource *res;
+++=======
++ 	struct vmem_altmap altmap;
++ 	bool altmap_valid;
++ 	struct resource res;
+++>>>>>>> e7744aa25cff (memremap: drop private struct page_map)
+  	struct percpu_ref *ref;
+  	struct device *dev;
+  	void *data;
+diff --cc kernel/memremap.c
+index eca98ec515d8,9207c44cce20..000000000000
+--- a/kernel/memremap.c
++++ b/kernel/memremap.c
+@@@ -188,46 -188,39 +188,47 @@@ static RADIX_TREE(pgmap_radix, GFP_KERN
+  #define SECTION_MASK ~((1UL << PA_SECTION_SHIFT) - 1)
+  #define SECTION_SIZE (1UL << PA_SECTION_SHIFT)
+  
+ -static unsigned long order_at(struct resource *res, unsigned long pgoff)
+++<<<<<<< HEAD
+ +struct page_map {
+ +	struct resource res;
+ +	struct percpu_ref *ref;
+ +	struct dev_pagemap pgmap;
+ +	struct vmem_altmap altmap;
+ +};
+ +
+ +void get_zone_device_page(struct page *page)
+  {
+ -	unsigned long phys_pgoff = PHYS_PFN(res->start) + pgoff;
+ -	unsigned long nr_pages, mask;
+ +	percpu_ref_get(page->pgmap->ref);
+ +}
+ +EXPORT_SYMBOL(get_zone_device_page);
+  
+ -	nr_pages = PHYS_PFN(resource_size(res));
+ -	if (nr_pages == pgoff)
+ -		return ULONG_MAX;
+ +void put_zone_device_page(struct page *page)
+ +{
+ +	/*
+ +	 * ZONE_DEVICE page refcount should never reach 0 and never be freed
+ +	 * to kernel memory allocator.
+ +	 */
+ +	int count = page_ref_dec_return(page);
+  
+  	/*
+ -	 * What is the largest aligned power-of-2 range available from
+ -	 * this resource pgoff to the end of the resource range,
+ -	 * considering the alignment of the current pgoff?
+ +	 * If refcount is 1 then page is freed and refcount is stable as nobody
+ +	 * holds a reference on the page.
+  	 */
+ -	mask = phys_pgoff | rounddown_pow_of_two(nr_pages - pgoff);
+ -	if (!mask)
+ -		return ULONG_MAX;
+ +	if (page->pgmap->page_free && count == 1)
+ +		page->pgmap->page_free(page, page->pgmap->data);
+  
+ -	return find_first_bit(&mask, BITS_PER_LONG);
+ +	put_dev_pagemap(page->pgmap);
+  }
+ +EXPORT_SYMBOL(put_zone_device_page);
+  
+ -#define foreach_order_pgoff(res, order, pgoff) \
+ -	for (pgoff = 0, order = order_at((res), pgoff); order < ULONG_MAX; \
+ -			pgoff += 1UL << order, order = order_at((res), pgoff))
+ -
+ -#if IS_ENABLED(CONFIG_DEVICE_PRIVATE)
+ -int device_private_entry_fault(struct vm_area_struct *vma,
+ +#if IS_ENABLED(CONFIG_HMM)
+ +int hmm_entry_fault(struct vm_area_struct *vma,
+  		       unsigned long addr,
+  		       swp_entry_t entry,
+ -		       unsigned int flags,
+ +		       unsigned flags,
+  		       pmd_t *pmdp)
+  {
+ -	struct page *page = device_private_entry_to_page(entry);
+ +	struct page *page = hmm_entry_to_page(entry);
+  
+  	/*
+  	 * The page_fault() callback must migrate page back to system memory
+@@@ -245,33 -238,8 +246,35 @@@
+  	 */
+  	return page->pgmap->page_fault(vma, addr, page, flags, pmdp);
+  }
+ -EXPORT_SYMBOL(device_private_entry_fault);
+ -#endif /* CONFIG_DEVICE_PRIVATE */
+ +EXPORT_SYMBOL(hmm_entry_fault);
+ +#endif /* CONFIG_HMM */
+ +
+++=======
+++>>>>>>> e7744aa25cff (memremap: drop private struct page_map)
+ +static unsigned long order_at(struct resource *res, unsigned long pgoff)
+ +{
+ +	unsigned long phys_pgoff = PHYS_PFN(res->start) + pgoff;
+ +	unsigned long nr_pages, mask;
+ +
+ +	nr_pages = PHYS_PFN(resource_size(res));
+ +	if (nr_pages == pgoff)
+ +		return ULONG_MAX;
+ +
+ +	/*
+ +	 * What is the largest aligned power-of-2 range available from
+ +	 * this resource pgoff to the end of the resource range,
+ +	 * considering the alignment of the current pgoff?
+ +	 */
+ +	mask = phys_pgoff | rounddown_pow_of_two(nr_pages - pgoff);
+ +	if (!mask)
+ +		return ULONG_MAX;
+ +
+ +	return find_first_bit(&mask, BITS_PER_LONG);
+ +}
+ +
+ +#define foreach_order_pgoff(res, order, pgoff) \
+ +	for (pgoff = 0, order = order_at((res), pgoff); order < ULONG_MAX; \
+ +			pgoff += 1UL << order, order = order_at((res), pgoff))
+  
+  static void pgmap_radix_release(struct resource *res)
+  {
+@@@ -310,10 -277,13 +312,17 @@@ static unsigned long pfn_end(struct dev
+  
+  static void devm_memremap_pages_release(struct device *dev, void *data)
+  {
+- 	struct page_map *page_map = data;
+- 	struct resource *res = &page_map->res;
++ 	struct dev_pagemap *pgmap = data;
++ 	struct resource *res = &pgmap->res;
+  	resource_size_t align_start, align_size;
+++<<<<<<< HEAD
+ +	struct dev_pagemap *pgmap = &page_map->pgmap;
+++=======
++ 	unsigned long pfn;
++ 
++ 	for_each_device_pfn(pfn, pgmap)
++ 		put_page(pfn_to_page(pfn));
+++>>>>>>> e7744aa25cff (memremap: drop private struct page_map)
+  
+  	if (percpu_ref_tryget_live(pgmap->ref)) {
+  		dev_WARN(dev, "%s: page mapping is still live!\n", __func__);
+@@@ -325,23 -295,22 +334,27 @@@
+  	align_size = ALIGN(resource_size(res), SECTION_SIZE);
+  
+  	mem_hotplug_begin();
+++<<<<<<< HEAD
+ +	arch_remove_memory(align_start, align_size);
+++=======
++ 	arch_remove_memory(align_start, align_size, pgmap->altmap_valid ?
++ 			&pgmap->altmap : NULL);
++ 	mem_hotplug_done();
++ 
+++>>>>>>> e7744aa25cff (memremap: drop private struct page_map)
+  	untrack_pfn(NULL, PHYS_PFN(align_start), align_size);
+ +	mem_hotplug_done();
+  	pgmap_radix_release(res);
+- 	dev_WARN_ONCE(dev, pgmap->altmap && pgmap->altmap->alloc,
+- 			"%s: failed to free all reserved pages\n", __func__);
++ 	dev_WARN_ONCE(dev, pgmap->altmap.alloc,
++ 		      "%s: failed to free all reserved pages\n", __func__);
+  }
+  
+  /* assumes rcu_read_lock() held at entry */
+ -static struct dev_pagemap *find_dev_pagemap(resource_size_t phys)
+ +struct dev_pagemap *find_dev_pagemap(resource_size_t phys)
+  {
+- 	struct page_map *page_map;
+- 
+  	WARN_ON_ONCE(!rcu_read_lock_held());
+  
+- 	page_map = radix_tree_lookup(&pgmap_radix, PHYS_PFN(phys));
+- 	return page_map ? &page_map->pgmap : NULL;
++ 	return radix_tree_lookup(&pgmap_radix, PHYS_PFN(phys));
+  }
+  
+  /**
+@@@ -366,8 -338,7 +379,12 @@@ void *devm_memremap_pages(struct devic
+  	unsigned long pfn, pgoff, order;
+  	pgprot_t pgprot = PAGE_KERNEL;
+  	struct dev_pagemap *pgmap;
+++<<<<<<< HEAD
+ +	struct page_map *page_map;
+ +	int error, nid, is_ram;
+++=======
++ 	int error, nid, is_ram, i = 0;
+++>>>>>>> e7744aa25cff (memremap: drop private struct page_map)
+  
+  	align_start = res->start & ~(SECTION_SIZE - 1);
+  	align_size = ALIGN(res->start + resource_size(res), SECTION_SIZE)
+@@@ -402,12 -367,12 +418,21 @@@
+  
+  	pgmap->dev = dev;
+  	if (altmap) {
+++<<<<<<< HEAD
+ +		memcpy(&page_map->altmap, altmap, sizeof(*altmap));
+ +		pgmap->altmap = &page_map->altmap;
+ +	}
+ +	pgmap->ref = ref;
+ +	pgmap->res = &page_map->res;
+ +	pgmap->type = MEMORY_DEVICE_PUBLIC;
+++=======
++ 		memcpy(&pgmap->altmap, altmap, sizeof(*altmap));
++ 		pgmap->altmap_valid = true;
++ 		altmap = &pgmap->altmap;
++ 	}
++ 	pgmap->ref = ref;
++ 	pgmap->type = MEMORY_DEVICE_HOST;
+++>>>>>>> e7744aa25cff (memremap: drop private struct page_map)
+  	pgmap->page_fault = NULL;
+  	pgmap->page_free = NULL;
+  	pgmap->data = NULL;
+@@@ -454,8 -423,11 +479,8 @@@
+  		 */
+  		list_del(&page->lru);
+  		page->pgmap = pgmap;
+ -		percpu_ref_get(ref);
+ -		if (!(++i % 1024))
+ -			cond_resched();
+  	}
+- 	devres_add(dev, page_map);
++ 	devres_add(dev, pgmap);
+  	return __va(res->start);
+  
+   err_add_memory:
+@@@ -479,31 -451,59 +504,41 @@@ void vmem_altmap_free(struct vmem_altma
+  	altmap->alloc -= nr_pfns;
+  }
+  
+ -/**
+ - * get_dev_pagemap() - take a new live reference on the dev_pagemap for @pfn
+ - * @pfn: page frame number to lookup page_map
+ - * @pgmap: optional known pgmap that already has a reference
+ - *
+ - * If @pgmap is non-NULL and covers @pfn it will be returned as-is.  If @pgmap
+ - * is non-NULL but does not cover @pfn the reference to it will be released.
+ - */
+ -struct dev_pagemap *get_dev_pagemap(unsigned long pfn,
+ -		struct dev_pagemap *pgmap)
+ +#ifdef CONFIG_SPARSEMEM_VMEMMAP
+ +struct vmem_altmap *to_vmem_altmap(unsigned long memmap_start)
+  {
+ -	resource_size_t phys = PFN_PHYS(pfn);
+ +	/*
+ +	 * 'memmap_start' is the virtual address for the first "struct
+ +	 * page" in this range of the vmemmap array.  In the case of
+ +	 * CONFIG_SPARSE_VMEMMAP a page_to_pfn conversion is simple
+ +	 * pointer arithmetic, so we can perform this to_vmem_altmap()
+ +	 * conversion without concern for the initialization state of
+ +	 * the struct page fields.
+ +	 */
+ +	struct page *page = (struct page *) memmap_start;
+ +	struct dev_pagemap *pgmap;
+  
+  	/*
+ -	 * In the cached case we're already holding a live reference.
+ +	 * Uncoditionally retrieve a dev_pagemap associated with the
+ +	 * given physical address, this is only for use in the
+ +	 * arch_{add|remove}_memory() for setting up and tearing down
+ +	 * the memmap.
+  	 */
+++<<<<<<< HEAD
+++=======
++ 	if (pgmap) {
++ 		if (phys >= pgmap->res.start && phys <= pgmap->res.end)
++ 			return pgmap;
++ 		put_dev_pagemap(pgmap);
++ 	}
++ 
++ 	/* fall back to slow path lookup */
+++>>>>>>> e7744aa25cff (memremap: drop private struct page_map)
+  	rcu_read_lock();
+ -	pgmap = find_dev_pagemap(phys);
+ -	if (pgmap && !percpu_ref_tryget_live(pgmap->ref))
+ -		pgmap = NULL;
+ +	pgmap = find_dev_pagemap(__pfn_to_phys(page_to_pfn(page)));
+  	rcu_read_unlock();
+  
+ -	return pgmap;
+ +	return pgmap ? pgmap->altmap : NULL;
+  }
+ +#endif /* CONFIG_SPARSEMEM_VMEMMAP */
+  #endif /* CONFIG_ZONE_DEVICE */
+ -
+ -#if IS_ENABLED(CONFIG_DEVICE_PRIVATE) ||  IS_ENABLED(CONFIG_DEVICE_PUBLIC)
+ -void put_zone_device_private_or_public_page(struct page *page)
+ -{
+ -	int count = page_ref_dec_return(page);
+ -
+ -	/*
+ -	 * If refcount is 1 then page is freed and refcount is stable as nobody
+ -	 * holds a reference on the page.
+ -	 */
+ -	if (count == 1) {
+ -		/* Clear Active bit in case of parallel mark_page_accessed */
+ -		__ClearPageActive(page);
+ -		__ClearPageWaiters(page);
+ -
+ -		page->mapping = NULL;
+ -		mem_cgroup_uncharge(page);
+ -
+ -		page->pgmap->page_free(page, page->pgmap->data);
+ -	} else if (!count)
+ -		__put_page(page);
+ -}
+ -EXPORT_SYMBOL(put_zone_device_private_or_public_page);
+ -#endif /* CONFIG_DEVICE_PRIVATE || CONFIG_DEVICE_PUBLIC */
+diff --cc mm/hmm.c
+index 125cbd4521ca,320fdc87f064..000000000000
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@@ -860,17 -877,12 +860,21 @@@ static int hmm_devmem_pages_create(stru
+  	if (is_ram == REGION_INTERSECTS)
+  		return -ENXIO;
+  
+ -	if (devmem->resource->desc == IORES_DESC_DEVICE_PUBLIC_MEMORY)
+ -		devmem->pagemap.type = MEMORY_DEVICE_PUBLIC;
+ -	else
+ -		devmem->pagemap.type = MEMORY_DEVICE_PRIVATE;
+ +	is_ram = region_intersects_pmem(align_start, align_size);
+ +	if (is_ram == REGION_MIXED) {
+ +		WARN_ONCE(1, "%s attempted on mixed region %pr\n",
+ +				__func__, devmem->resource);
+ +		return -ENXIO;
+ +	}
+ +	if (is_ram == REGION_INTERSECTS)
+ +		return -ENXIO;
+  
+++<<<<<<< HEAD
+ +	devmem->pagemap.type = MEMORY_HMM;
+ +	devmem->pagemap.res = devmem->resource;
+++=======
++ 	devmem->pagemap.res = *devmem->resource;
+++>>>>>>> e7744aa25cff (memremap: drop private struct page_map)
+  	devmem->pagemap.page_fault = hmm_devmem_fault;
+  	devmem->pagemap.page_free = hmm_devmem_free;
+  	devmem->pagemap.dev = devmem->device;
+* Unmerged path include/linux/memremap.h
+* Unmerged path kernel/memremap.c
+* Unmerged path mm/hmm.c
