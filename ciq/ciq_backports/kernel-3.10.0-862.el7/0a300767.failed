@@ -1,0 +1,339 @@
+cpufreq: Introduce cpufreq_start_governor()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [cpufreq] Introduce cpufreq_start_governor() (Prarit Bhargava) [1465349]
+Rebuild_FUZZ: 88.31%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 0a300767e5882ad5b687966c80f9620aa0871be5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/0a300767.failed
+
+Starting a governor in cpufreq always follows the same pattern
+involving two calls to cpufreq_governor(), one with the event
+argument set to CPUFREQ_GOV_START and one with that argument set to
+CPUFREQ_GOV_LIMITS.
+
+Introduce cpufreq_start_governor() that will carry out those two
+operations and make all places where governors are started use it.
+
+That slightly modifies the behavior of cpufreq_set_policy() which
+now also will go back to the old governor if the second call to
+cpufreq_governor() (the one with event equal to CPUFREQ_GOV_LIMITS)
+fails, but that really is how it should work in the first place.
+
+Also cpufreq_resume() will now pring an error message if the
+CPUFREQ_GOV_LIMITS call to cpufreq_governor() fails, but that
+makes it follow cpufreq_add_policy_cpu() and cpufreq_offline()
+in that respect.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+(cherry picked from commit 0a300767e5882ad5b687966c80f9620aa0871be5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/cpufreq.c
+diff --cc drivers/cpufreq/cpufreq.c
+index 6ce63ca52d98,43f3912a2ac8..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -53,17 -73,10 +53,23 @@@ static inline bool has_target(void
+  	return cpufreq_driver->target_index || cpufreq_driver->target;
+  }
+  
+ +/*
+ + * rwsem to guarantee that cpufreq driver module doesn't unload during critical
+ + * sections
+ + */
+ +static DECLARE_RWSEM(cpufreq_rwsem);
+ +
+  /* internal prototypes */
+++<<<<<<< HEAD
+ +static int __cpufreq_governor(struct cpufreq_policy *policy,
+ +		unsigned int event);
+ +static unsigned int __cpufreq_get(unsigned int cpu);
+ +static void handle_update(struct work_struct *work);
+++=======
++ static int cpufreq_governor(struct cpufreq_policy *policy, unsigned int event);
++ static unsigned int __cpufreq_get(struct cpufreq_policy *policy);
++ static int cpufreq_start_governor(struct cpufreq_policy *policy);
+++>>>>>>> 0a300767e588 (cpufreq: Introduce cpufreq_start_governor())
+  
+  /**
+   * Two notifier lists: the "policy" list is involved in the
+@@@ -971,50 -962,36 +977,55 @@@ static int cpufreq_add_policy_cpu(struc
+  		}
+  	}
+  
+ +	down_write(&policy->rwsem);
+ +
+ +	write_lock_irqsave(&cpufreq_driver_lock, flags);
+ +
+  	cpumask_set_cpu(cpu, policy->cpus);
+ +	per_cpu(cpufreq_cpu_data, cpu) = policy;
+ +	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+ +
+ +	up_write(&policy->rwsem);
+  
+  	if (has_target()) {
+++<<<<<<< HEAD
+ +		ret = __cpufreq_governor(policy, CPUFREQ_GOV_START);
+ +		if (!ret)
+ +			ret = __cpufreq_governor(policy, CPUFREQ_GOV_LIMITS);
+ +
+ +		if (ret) {
+++=======
++ 		ret = cpufreq_start_governor(policy);
++ 		if (ret)
+++>>>>>>> 0a300767e588 (cpufreq: Introduce cpufreq_start_governor())
+  			pr_err("%s: Failed to start governor\n", __func__);
+ +			return ret;
+ +		}
+  	}
+  
+ -unlock:
+ -	up_write(&policy->rwsem);
+ -	return ret;
+ +	return sysfs_create_link(&dev->kobj, &policy->kobj, "cpufreq");
+  }
+ +#endif
+  
+ -static void handle_update(struct work_struct *work)
+ +static struct cpufreq_policy *cpufreq_policy_restore(unsigned int cpu)
+  {
+ -	struct cpufreq_policy *policy =
+ -		container_of(work, struct cpufreq_policy, update);
+ -	unsigned int cpu = policy->cpu;
+ -	pr_debug("handle_update for cpu %u called\n", cpu);
+ -	cpufreq_update_policy(cpu);
+ +	struct cpufreq_policy *policy;
+ +	unsigned long flags;
+ +
+ +	read_lock_irqsave(&cpufreq_driver_lock, flags);
+ +
+ +	policy = per_cpu(cpufreq_cpu_data_fallback, cpu);
+ +
+ +	read_unlock_irqrestore(&cpufreq_driver_lock, flags);
+ +
+ +	policy->governor = NULL;
+ +
+ +	return policy;
+  }
+  
+ -static struct cpufreq_policy *cpufreq_policy_alloc(unsigned int cpu)
+ +static struct cpufreq_policy *cpufreq_policy_alloc(void)
+  {
+ -	struct device *dev = get_cpu_device(cpu);
+  	struct cpufreq_policy *policy;
+ -	int ret;
+ -
+ -	if (WARN_ON(!dev))
+ -		return NULL;
+  
+  	policy = kzalloc(sizeof(*policy), GFP_KERNEL);
+  	if (!policy)
+@@@ -1424,54 -1284,58 +1435,83 @@@ static int __cpufreq_remove_dev_finish(
+  	}
+  
+  	down_write(&policy->rwsem);
+ -	if (has_target()) {
+ -		ret = cpufreq_governor(policy, CPUFREQ_GOV_STOP);
+ -		if (ret)
+ -			pr_err("%s: Failed to stop governor\n", __func__);
+ -	}
+ +	cpus = cpumask_weight(policy->cpus);
+  
+++<<<<<<< HEAD
+ +	if (cpus > 1)
+ +		cpumask_clear_cpu(cpu, policy->cpus);
+ +	up_write(&policy->rwsem);
+++=======
++ 	cpumask_clear_cpu(cpu, policy->cpus);
++ 
++ 	if (policy_is_inactive(policy)) {
++ 		if (has_target())
++ 			strncpy(policy->last_governor, policy->governor->name,
++ 				CPUFREQ_NAME_LEN);
++ 		else
++ 			policy->last_policy = policy->policy;
++ 	} else if (cpu == policy->cpu) {
++ 		/* Nominate new CPU */
++ 		policy->cpu = cpumask_any(policy->cpus);
++ 	}
++ 
++ 	/* Start governor again for active policy */
++ 	if (!policy_is_inactive(policy)) {
++ 		if (has_target()) {
++ 			ret = cpufreq_start_governor(policy);
++ 			if (ret)
++ 				pr_err("%s: Failed to start governor\n", __func__);
++ 		}
++ 
++ 		goto unlock;
++ 	}
++ 
++ 	if (cpufreq_driver->stop_cpu)
++ 		cpufreq_driver->stop_cpu(policy);
+++>>>>>>> 0a300767e588 (cpufreq: Introduce cpufreq_start_governor())
+  
+  	/* If cpu is last user of policy, free policy */
+ -	if (has_target()) {
+ -		ret = cpufreq_governor(policy, CPUFREQ_GOV_POLICY_EXIT);
+ -		if (ret)
+ -			pr_err("%s: Failed to exit governor\n", __func__);
+ -	}
+ +	if (cpus == 1) {
+ +		if (has_target()) {
+ +			ret = __cpufreq_governor(policy,
+ +					CPUFREQ_GOV_POLICY_EXIT);
+ +			if (ret) {
+ +				pr_err("%s: Failed to exit governor\n",
+ +				       __func__);
+ +				return ret;
+ +			}
+ +		}
+  
+ -	/*
+ -	 * Perform the ->exit() even during light-weight tear-down,
+ -	 * since this is a core component, and is essential for the
+ -	 * subsequent light-weight ->init() to succeed.
+ -	 */
+ -	if (cpufreq_driver->exit) {
+ -		cpufreq_driver->exit(policy);
+ -		policy->freq_table = NULL;
+ +		if (!cpufreq_suspended)
+ +			cpufreq_policy_put_kobj(policy);
+ +
+ +		/*
+ +		 * Perform the ->exit() even during light-weight tear-down,
+ +		 * since this is a core component, and is essential for the
+ +		 * subsequent light-weight ->init() to succeed.
+ +		 */
+ +		if (cpufreq_driver->exit)
+ +			cpufreq_driver->exit(policy);
+ +
+ +		/* Remove policy from list of active policies */
+ +		write_lock_irqsave(&cpufreq_driver_lock, flags);
+ +		list_del(&policy->policy_list);
+ +		write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+ +
+ +		if (!cpufreq_suspended)
+ +			cpufreq_policy_free(policy);
+ +	} else if (has_target()) {
+ +		ret = __cpufreq_governor(policy, CPUFREQ_GOV_START);
+ +		if (!ret)
+ +			ret = __cpufreq_governor(policy, CPUFREQ_GOV_LIMITS);
+ +
+ +		if (ret) {
+ +			pr_err("%s: Failed to start governor\n", __func__);
+ +			return ret;
+ +		}
+  	}
+  
+ -unlock:
+ -	up_write(&policy->rwsem);
+ +	return 0;
+  }
+  
+  /**
+@@@ -1708,25 -1580,31 +1748,32 @@@ void cpufreq_resume(void
+  
+  	pr_debug("%s: Resuming Governors\n", __func__);
+  
+ -	for_each_active_policy(policy) {
+ -		if (cpufreq_driver->resume && cpufreq_driver->resume(policy)) {
+ +	cpufreq_suspended = false;
+ +
+ +	list_for_each_entry(policy, &cpufreq_policy_list, policy_list) {
+ +		if (cpufreq_driver->resume && cpufreq_driver->resume(policy))
+  			pr_err("%s: Failed to resume driver: %p\n", __func__,
+  				policy);
+++<<<<<<< HEAD
+ +		else if (__cpufreq_governor(policy, CPUFREQ_GOV_START)
+ +		    || __cpufreq_governor(policy, CPUFREQ_GOV_LIMITS))
+ +			pr_err("%s: Failed to start governor for policy: %p\n",
+ +				__func__, policy);
+++=======
++ 		} else {
++ 			down_write(&policy->rwsem);
++ 			ret = cpufreq_start_governor(policy);
++ 			up_write(&policy->rwsem);
+++>>>>>>> 0a300767e588 (cpufreq: Introduce cpufreq_start_governor())
+  
+ -			if (ret)
+ -				pr_err("%s: Failed to start governor for policy: %p\n",
+ -				       __func__, policy);
+ -		}
+ +		/*
+ +		 * schedule call cpufreq_update_policy() for boot CPU, i.e. last
+ +		 * policy in list. It will verify that the current freq is in
+ +		 * sync with what we believe it to be.
+ +		 */
+ +		if (list_is_last(&policy->policy_list, &cpufreq_policy_list))
+ +			schedule_work(&policy->update);
+  	}
+ -
+ -	/*
+ -	 * schedule call cpufreq_update_policy() for first-online CPU, as that
+ -	 * wouldn't be hotplugged-out on suspend. It will verify that the
+ -	 * current freq is in sync with what we believe it to be.
+ -	 */
+ -	policy = cpufreq_cpu_get_raw(cpumask_first(cpu_online_mask));
+ -	if (WARN_ON(!policy))
+ -		return;
+ -
+ -	schedule_work(&policy->update);
+  }
+  
+  /**
+@@@ -2213,26 -2101,27 +2270,47 @@@ static int cpufreq_set_policy(struct cp
+  
+  	/* start new governor */
+  	policy->governor = new_policy->governor;
+++<<<<<<< HEAD
+ +	if (!__cpufreq_governor(policy, CPUFREQ_GOV_POLICY_INIT)) {
+ +		if (!__cpufreq_governor(policy, CPUFREQ_GOV_START))
+ +			goto out;
+ +
+ +		__cpufreq_governor(policy, CPUFREQ_GOV_POLICY_EXIT);
+++=======
++ 	ret = cpufreq_governor(policy, CPUFREQ_GOV_POLICY_INIT);
++ 	if (!ret) {
++ 		ret = cpufreq_start_governor(policy);
++ 		if (!ret) {
++ 			pr_debug("cpufreq: governor change\n");
++ 			return 0;
++ 		}
++ 		cpufreq_governor(policy, CPUFREQ_GOV_POLICY_EXIT);
+++>>>>>>> 0a300767e588 (cpufreq: Introduce cpufreq_start_governor())
+  	}
+  
+  	/* new governor failed, so re-start old one */
+  	pr_debug("starting governor %s failed\n", policy->governor->name);
+  	if (old_gov) {
+  		policy->governor = old_gov;
+++<<<<<<< HEAD
+ +		__cpufreq_governor(policy, CPUFREQ_GOV_POLICY_INIT);
+ +		__cpufreq_governor(policy, CPUFREQ_GOV_START);
+ +	}
+ +
+ +	return -EINVAL;
+ +
+ + out:
+ +	pr_debug("governor: change or update limits\n");
+ +	return __cpufreq_governor(policy, CPUFREQ_GOV_LIMITS);
+++=======
++ 		if (cpufreq_governor(policy, CPUFREQ_GOV_POLICY_INIT))
++ 			policy->governor = NULL;
++ 		else
++ 			cpufreq_start_governor(policy);
++ 	}
++ 
++ 	return ret;
+++>>>>>>> 0a300767e588 (cpufreq: Introduce cpufreq_start_governor())
+  }
+  
+  /**
+* Unmerged path drivers/cpufreq/cpufreq.c
