@@ -1,0 +1,171 @@
+vfio iommu: Add blocking notifier to notify DMA_UNMAP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Kirti Wankhede <kwankhede@nvidia.com>
+commit c086de818dd81c3c2f7cecff23de6585b74340c0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/c086de81.failed
+
+Added blocking notifier to IOMMU TYPE1 driver to notify vendor drivers
+about DMA_UNMAP.
+Exported two APIs vfio_register_notifier() and vfio_unregister_notifier().
+Notifier should be registered, if external user wants to use
+vfio_pin_pages()/vfio_unpin_pages() APIs to pin/unpin pages.
+Vendor driver should use VFIO_IOMMU_NOTIFY_DMA_UNMAP action to invalidate
+mappings.
+
+	Signed-off-by: Kirti Wankhede <kwankhede@nvidia.com>
+	Signed-off-by: Neo Jia <cjia@nvidia.com>
+	Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+(cherry picked from commit c086de818dd81c3c2f7cecff23de6585b74340c0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vfio/vfio_iommu_type1.c
+diff --cc drivers/vfio/vfio_iommu_type1.c
+index 644eb159cec7,51810a95416e..000000000000
+--- a/drivers/vfio/vfio_iommu_type1.c
++++ b/drivers/vfio/vfio_iommu_type1.c
+@@@ -60,7 -61,9 +61,13 @@@ struct vfio_iommu 
+  	struct vfio_domain	*external_domain; /* domain for external user */
+  	struct mutex		lock;
+  	struct rb_root		dma_list;
+++<<<<<<< HEAD
+ +	bool v2;
+++=======
++ 	struct blocking_notifier_head notifier;
++ 	bool			v2;
++ 	bool			nesting;
+++>>>>>>> c086de818dd8 (vfio iommu: Add blocking notifier to notify DMA_UNMAP)
+  };
+  
+  struct vfio_domain {
+@@@ -1386,7 -1435,20 +1420,11 @@@ static void *vfio_iommu_type1_open(unsi
+  	INIT_LIST_HEAD(&iommu->domain_list);
+  	iommu->dma_list = RB_ROOT;
+  	mutex_init(&iommu->lock);
+++<<<<<<< HEAD
+ +	iommu->v2 = (arg == VFIO_TYPE1v2_IOMMU);
+++=======
++ 	BLOCKING_INIT_NOTIFIER_HEAD(&iommu->notifier);
+++>>>>>>> c086de818dd8 (vfio iommu: Add blocking notifier to notify DMA_UNMAP)
+  
+  	return iommu;
+  }
+diff --git a/drivers/vfio/vfio.c b/drivers/vfio/vfio.c
+index 0d336fefc26d..e42a46c3f02f 100644
+--- a/drivers/vfio/vfio.c
++++ b/drivers/vfio/vfio.c
+@@ -1908,6 +1908,79 @@ err_unpin_pages:
+ }
+ EXPORT_SYMBOL(vfio_unpin_pages);
+ 
++int vfio_register_notifier(struct device *dev, struct notifier_block *nb)
++{
++	struct vfio_container *container;
++	struct vfio_group *group;
++	struct vfio_iommu_driver *driver;
++	int ret;
++
++	if (!dev || !nb)
++		return -EINVAL;
++
++	group = vfio_group_get_from_dev(dev);
++	if (IS_ERR(group))
++		return PTR_ERR(group);
++
++	ret = vfio_group_add_container_user(group);
++	if (ret)
++		goto err_register_nb;
++
++	container = group->container;
++	down_read(&container->group_lock);
++
++	driver = container->iommu_driver;
++	if (likely(driver && driver->ops->register_notifier))
++		ret = driver->ops->register_notifier(container->iommu_data, nb);
++	else
++		ret = -ENOTTY;
++
++	up_read(&container->group_lock);
++	vfio_group_try_dissolve_container(group);
++
++err_register_nb:
++	vfio_group_put(group);
++	return ret;
++}
++EXPORT_SYMBOL(vfio_register_notifier);
++
++int vfio_unregister_notifier(struct device *dev, struct notifier_block *nb)
++{
++	struct vfio_container *container;
++	struct vfio_group *group;
++	struct vfio_iommu_driver *driver;
++	int ret;
++
++	if (!dev || !nb)
++		return -EINVAL;
++
++	group = vfio_group_get_from_dev(dev);
++	if (IS_ERR(group))
++		return PTR_ERR(group);
++
++	ret = vfio_group_add_container_user(group);
++	if (ret)
++		goto err_unregister_nb;
++
++	container = group->container;
++	down_read(&container->group_lock);
++
++	driver = container->iommu_driver;
++	if (likely(driver && driver->ops->unregister_notifier))
++		ret = driver->ops->unregister_notifier(container->iommu_data,
++						       nb);
++	else
++		ret = -ENOTTY;
++
++	up_read(&container->group_lock);
++	vfio_group_try_dissolve_container(group);
++
++err_unregister_nb:
++	vfio_group_put(group);
++	return ret;
++}
++EXPORT_SYMBOL(vfio_unregister_notifier);
++
+ /**
+  * Module/class support
+  */
+* Unmerged path drivers/vfio/vfio_iommu_type1.c
+diff --git a/include/linux/vfio.h b/include/linux/vfio.h
+index 8d83480e3d5d..ec8d99b7f189 100644
+--- a/include/linux/vfio.h
++++ b/include/linux/vfio.h
+@@ -78,6 +78,10 @@ struct vfio_iommu_driver_ops {
+ 				     unsigned long *phys_pfn);
+ 	int		(*unpin_pages)(void *iommu_data,
+ 				       unsigned long *user_pfn, int npage);
++	int		(*register_notifier)(void *iommu_data,
++					     struct notifier_block *nb);
++	int		(*unregister_notifier)(void *iommu_data,
++					       struct notifier_block *nb);
+ };
+ 
+ extern int vfio_register_iommu_driver(const struct vfio_iommu_driver_ops *ops);
+@@ -101,6 +105,14 @@ extern int vfio_pin_pages(struct device *dev, unsigned long *user_pfn,
+ extern int vfio_unpin_pages(struct device *dev, unsigned long *user_pfn,
+ 			    int npage);
+ 
++#define VFIO_IOMMU_NOTIFY_DMA_UNMAP	(1)
++
++extern int vfio_register_notifier(struct device *dev,
++				  struct notifier_block *nb);
++
++extern int vfio_unregister_notifier(struct device *dev,
++				    struct notifier_block *nb);
++
+ /*
+  * Sub-module helpers
+  */
