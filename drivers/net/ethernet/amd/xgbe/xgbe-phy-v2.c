@@ -1567,6 +1567,10 @@ static unsigned int xgbe_phy_an_advertising(struct xgbe_prv_data *pdata)
 	advertising &= ~ADVERTISED_1000baseKX_Full;
 	advertising &= ~ADVERTISED_10000baseKR_Full;
 
+	/* Advertise FEC support is present */
+	if (pdata->fec_ability & MDIO_PMA_10GBR_FECABLE_ABLE)
+		XGBE_SET_ADV(dlks, 10000baseR_FEC);
+
 	switch (phy_data->port_mode) {
 	case XGBE_PORT_MODE_BACKPLANE:
 		advertising |= ADVERTISED_10000baseKR_Full;
