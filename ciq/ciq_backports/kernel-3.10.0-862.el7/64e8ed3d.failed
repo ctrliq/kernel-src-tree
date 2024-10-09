@@ -1,0 +1,302 @@
+x86/intel_rdt/mba: Add schemata file support for MBA
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] intel_rdt/mba: Add schemata file support for MBA (Jiri Olsa) [1379551]
+Rebuild_FUZZ: 96.00%
+commit-author Vikas Shivappa <vikas.shivappa@linux.intel.com>
+commit 64e8ed3d4a6dcd6139a869a3e760e625cb0d3022
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/64e8ed3d.failed
+
+Add support to update the MBA bandwidth values for the domains via the
+schemata file.
+
+ - Verify that the bandwidth value is valid
+
+ - Round to the next control step depending on the bandwidth granularity of
+   the hardware
+
+ - Convert the bandwidth to delay values and write the delay values to
+   the corresponding domain PQOS_MSRs.
+
+[ tglx: Massaged changelog ]
+
+	Signed-off-by: Vikas Shivappa <vikas.shivappa@linux.intel.com>
+	Cc: ravi.v.shankar@intel.com
+	Cc: tony.luck@intel.com
+	Cc: fenghua.yu@intel.com
+	Cc: vikas.shivappa@intel.com
+Link: http://lkml.kernel.org/r/1491611637-20417-9-git-send-email-vikas.shivappa@linux.intel.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+(cherry picked from commit 64e8ed3d4a6dcd6139a869a3e760e625cb0d3022)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/intel_rdt.h
+#	arch/x86/kernel/cpu/intel_rdt.c
+diff --cc arch/x86/include/asm/intel_rdt.h
+index 06f50d0ed14f,bd184e1fd207..000000000000
+--- a/arch/x86/include/asm/intel_rdt.h
++++ b/arch/x86/include/asm/intel_rdt.h
+@@@ -136,6 -104,85 +136,88 @@@ struct msr_param 
+  	int			high;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * struct rdt_cache - Cache allocation related data
++  * @cbm_len:		Length of the cache bit mask
++  * @min_cbm_bits:	Minimum number of consecutive bits to be set
++  * @cbm_idx_mult:	Multiplier of CBM index
++  * @cbm_idx_offset:	Offset of CBM index. CBM index is computed by:
++  *			closid * cbm_idx_multi + cbm_idx_offset
++  *			in a cache bit mask
++  */
++ struct rdt_cache {
++ 	unsigned int	cbm_len;
++ 	unsigned int	min_cbm_bits;
++ 	unsigned int	cbm_idx_mult;
++ 	unsigned int	cbm_idx_offset;
++ };
++ 
++ /**
++  * struct rdt_membw - Memory bandwidth allocation related data
++  * @max_delay:		Max throttle delay. Delay is the hardware
++  *			representation for memory bandwidth.
++  * @min_bw:		Minimum memory bandwidth percentage user can request
++  * @bw_gran:		Granularity at which the memory bandwidth is allocated
++  * @delay_linear:	True if memory B/W delay is in linear scale
++  * @mb_map:		Mapping of memory B/W percentage to memory B/W delay
++  */
++ struct rdt_membw {
++ 	u32		max_delay;
++ 	u32		min_bw;
++ 	u32		bw_gran;
++ 	u32		delay_linear;
++ 	u32		*mb_map;
++ };
++ 
++ /**
++  * struct rdt_resource - attributes of an RDT resource
++  * @enabled:		Is this feature enabled on this machine
++  * @capable:		Is this feature available on this machine
++  * @name:		Name to use in "schemata" file
++  * @num_closid:		Number of CLOSIDs available
++  * @cache_level:	Which cache level defines scope of this resource
++  * @default_ctrl:	Specifies default cache cbm or memory B/W percent.
++  * @msr_base:		Base MSR address for CBMs
++  * @msr_update:		Function pointer to update QOS MSRs
++  * @data_width:		Character width of data when displaying
++  * @domains:		All domains for this resource
++  * @cache:		Cache allocation related data
++  * @info_files:		resctrl info files for the resource
++  * @nr_info_files:	Number of info files
++  * @format_str:		Per resource format string to show domain value
++  * @parse_ctrlval:	Per resource function pointer to parse control values
++  */
++ struct rdt_resource {
++ 	bool			enabled;
++ 	bool			capable;
++ 	char			*name;
++ 	int			num_closid;
++ 	int			cache_level;
++ 	u32			default_ctrl;
++ 	unsigned int		msr_base;
++ 	void (*msr_update)	(struct rdt_domain *d, struct msr_param *m,
++ 				 struct rdt_resource *r);
++ 	int			data_width;
++ 	struct list_head	domains;
++ 	union {
++ 		struct rdt_cache	cache;
++ 		struct rdt_membw	membw;
++ 	};
++ 	struct rftype		*info_files;
++ 	int			nr_info_files;
++ 	const char		*format_str;
++ 	int (*parse_ctrlval)	(char *buf, struct rdt_resource *r,
++ 				 struct rdt_domain *d);
++ };
++ 
++ void rdt_get_cache_infofile(struct rdt_resource *r);
++ void rdt_get_mba_infofile(struct rdt_resource *r);
++ int parse_cbm(char *buf, struct rdt_resource *r, struct rdt_domain *d);
++ int parse_bw(char *buf, struct rdt_resource *r,  struct rdt_domain *d);
++ 
+++>>>>>>> 64e8ed3d4a6d (x86/intel_rdt/mba: Add schemata file support for MBA)
+  extern struct mutex rdtgroup_mutex;
+  
+  extern struct rdt_resource rdt_resources_all[];
+diff --cc arch/x86/kernel/cpu/intel_rdt.c
+index ad087dd4421e,731f70ae57d0..000000000000
+--- a/arch/x86/kernel/cpu/intel_rdt.c
++++ b/arch/x86/kernel/cpu/intel_rdt.c
+@@@ -45,42 -46,78 +45,66 @@@ DEFINE_PER_CPU_READ_MOSTLY(int, cpu_clo
+   */
+  int max_name_width, max_data_width;
+  
+ -static void
+ -mba_wrmsr(struct rdt_domain *d, struct msr_param *m, struct rdt_resource *r);
+ -static void
+ -cat_wrmsr(struct rdt_domain *d, struct msr_param *m, struct rdt_resource *r);
+ -
+ -#define domain_init(id) LIST_HEAD_INIT(rdt_resources_all[id].domains)
+ -
+  struct rdt_resource rdt_resources_all[] = {
+  	{
+ -		.name			= "L3",
+ -		.domains		= domain_init(RDT_RESOURCE_L3),
+ -		.msr_base		= IA32_L3_CBM_BASE,
+ -		.msr_update		= cat_wrmsr,
+ -		.cache_level		= 3,
+ -		.cache = {
+ -			.min_cbm_bits	= 1,
+ -			.cbm_idx_mult	= 1,
+ -			.cbm_idx_offset	= 0,
+ -		},
+ -		.parse_ctrlval		= parse_cbm,
+ -		.format_str		= "%d=%0*x",
+ +		.name		= "L3",
+ +		.domains	= domain_init(RDT_RESOURCE_L3),
+ +		.msr_base	= IA32_L3_CBM_BASE,
+ +		.min_cbm_bits	= 1,
+ +		.cache_level	= 3,
+ +		.cbm_idx_multi	= 1,
+ +		.cbm_idx_offset	= 0
+  	},
+  	{
+ -		.name			= "L3DATA",
+ -		.domains		= domain_init(RDT_RESOURCE_L3DATA),
+ -		.msr_base		= IA32_L3_CBM_BASE,
+ -		.msr_update		= cat_wrmsr,
+ -		.cache_level		= 3,
+ -		.cache = {
+ -			.min_cbm_bits	= 1,
+ -			.cbm_idx_mult	= 2,
+ -			.cbm_idx_offset	= 0,
+ -		},
+ -		.parse_ctrlval		= parse_cbm,
+ -		.format_str		= "%d=%0*x",
+ +		.name		= "L3DATA",
+ +		.domains	= domain_init(RDT_RESOURCE_L3DATA),
+ +		.msr_base	= IA32_L3_CBM_BASE,
+ +		.min_cbm_bits	= 1,
+ +		.cache_level	= 3,
+ +		.cbm_idx_multi	= 2,
+ +		.cbm_idx_offset	= 0
+  	},
+  	{
+ -		.name			= "L3CODE",
+ -		.domains		= domain_init(RDT_RESOURCE_L3CODE),
+ -		.msr_base		= IA32_L3_CBM_BASE,
+ -		.msr_update		= cat_wrmsr,
+ -		.cache_level		= 3,
+ -		.cache = {
+ -			.min_cbm_bits	= 1,
+ -			.cbm_idx_mult	= 2,
+ -			.cbm_idx_offset	= 1,
+ -		},
+ -		.parse_ctrlval		= parse_cbm,
+ -		.format_str		= "%d=%0*x",
+ +		.name		= "L3CODE",
+ +		.domains	= domain_init(RDT_RESOURCE_L3CODE),
+ +		.msr_base	= IA32_L3_CBM_BASE,
+ +		.min_cbm_bits	= 1,
+ +		.cache_level	= 3,
+ +		.cbm_idx_multi	= 2,
+ +		.cbm_idx_offset	= 1
+  	},
+  	{
+++<<<<<<< HEAD
+ +		.name		= "L2",
+ +		.domains	= domain_init(RDT_RESOURCE_L2),
+ +		.msr_base	= IA32_L2_CBM_BASE,
+ +		.min_cbm_bits	= 1,
+ +		.cache_level	= 2,
+ +		.cbm_idx_multi	= 1,
+ +		.cbm_idx_offset	= 0
+++=======
++ 		.name			= "L2",
++ 		.domains		= domain_init(RDT_RESOURCE_L2),
++ 		.msr_base		= IA32_L2_CBM_BASE,
++ 		.msr_update		= cat_wrmsr,
++ 		.cache_level		= 2,
++ 		.cache = {
++ 			.min_cbm_bits	= 1,
++ 			.cbm_idx_mult	= 1,
++ 			.cbm_idx_offset	= 0,
++ 		},
++ 		.parse_ctrlval		= parse_cbm,
++ 		.format_str		= "%d=%0*x",
++ 	},
++ 	{
++ 		.name			= "MB",
++ 		.domains		= domain_init(RDT_RESOURCE_MBA),
++ 		.msr_base		= IA32_MBA_THRTL_BASE,
++ 		.msr_update		= mba_wrmsr,
++ 		.cache_level		= 3,
++ 		.parse_ctrlval		= parse_bw,
++ 		.format_str		= "%d=%*d",
+++>>>>>>> 64e8ed3d4a6d (x86/intel_rdt/mba: Add schemata file support for MBA)
+  	},
+  };
+  
+* Unmerged path arch/x86/include/asm/intel_rdt.h
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.c
+diff --git a/arch/x86/kernel/cpu/intel_rdt_schemata.c b/arch/x86/kernel/cpu/intel_rdt_schemata.c
+index 8594db455aa1..38e6ea137f1d 100644
+--- a/arch/x86/kernel/cpu/intel_rdt_schemata.c
++++ b/arch/x86/kernel/cpu/intel_rdt_schemata.c
+@@ -28,6 +28,49 @@
+ #include <linux/slab.h>
+ #include <asm/intel_rdt.h>
+ 
++/*
++ * Check whether MBA bandwidth percentage value is correct. The value is
++ * checked against the minimum and max bandwidth values specified by the
++ * hardware. The allocated bandwidth percentage is rounded to the next
++ * control step available on the hardware.
++ */
++static bool bw_validate(char *buf, unsigned long *data, struct rdt_resource *r)
++{
++	unsigned long bw;
++	int ret;
++
++	/*
++	 * Only linear delay values is supported for current Intel SKUs.
++	 */
++	if (!r->membw.delay_linear)
++		return false;
++
++	ret = kstrtoul(buf, 10, &bw);
++	if (ret)
++		return false;
++
++	if (bw < r->membw.min_bw || bw > r->default_ctrl)
++		return false;
++
++	*data = roundup(bw, (unsigned long)r->membw.bw_gran);
++	return true;
++}
++
++int parse_bw(char *buf, struct rdt_resource *r, struct rdt_domain *d)
++{
++	unsigned long data;
++
++	if (d->have_new_ctrl)
++		return -EINVAL;
++
++	if (!bw_validate(buf, &data, r))
++		return -EINVAL;
++	d->new_ctrl = data;
++	d->have_new_ctrl = true;
++
++	return 0;
++}
++
+ /*
+  * Check whether a cache bit mask is valid. The SDM says:
+  *	Please note that all (and only) contiguous '1' combinations
