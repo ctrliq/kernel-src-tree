@@ -1,0 +1,85 @@
+nvmet: Fix use-after-free bug when a port is removed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Logan Gunthorpe <logang@deltatee.com>
+commit 3aed86731ee2b23e4dc4d2c6d943d33992cd551b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/3aed8673.failed
+
+When a port is removed through configfs, any connected controllers
+are still active and can still send commands. This causes a
+use-after-free bug which is detected by KASAN for any admin command
+that dereferences req->port (like in nvmet_execute_identify_ctrl).
+
+To fix this, disconnect all active controllers when a subsystem is
+removed from a port. This ensures there are no active controllers
+when the port is eventually removed.
+
+	Signed-off-by: Logan Gunthorpe <logang@deltatee.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: Max Gurtovoy <maxg@mellanox.com>
+	Reviewed-by : Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+(cherry picked from commit 3aed86731ee2b23e4dc4d2c6d943d33992cd551b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/target/configfs.c
+diff --cc drivers/nvme/target/configfs.c
+index e3466a32b0ef,98613a45bd3b..000000000000
+--- a/drivers/nvme/target/configfs.c
++++ b/drivers/nvme/target/configfs.c
+@@@ -563,7 -675,9 +563,13 @@@ static int nvmet_port_subsys_drop_link(
+  
+  found:
+  	list_del(&p->entry);
+++<<<<<<< HEAD
+ +	nvmet_genctr++;
+++=======
++ 	nvmet_port_del_ctrls(port, subsys);
++ 	nvmet_port_disc_changed(port, subsys);
++ 
+++>>>>>>> 3aed86731ee2 (nvmet: Fix use-after-free bug when a port is removed)
+  	if (list_empty(&port->subsystems))
+  		nvmet_disable_port(port);
+  	up_write(&nvmet_config_sem);
+* Unmerged path drivers/nvme/target/configfs.c
+diff --git a/drivers/nvme/target/core.c b/drivers/nvme/target/core.c
+index f61d566f5357..7c002f67d5be 100644
+--- a/drivers/nvme/target/core.c
++++ b/drivers/nvme/target/core.c
+@@ -212,6 +212,18 @@ void nvmet_unregister_transport(const struct nvmet_fabrics_ops *ops)
+ }
+ EXPORT_SYMBOL_GPL(nvmet_unregister_transport);
+ 
++void nvmet_port_del_ctrls(struct nvmet_port *port, struct nvmet_subsys *subsys)
++{
++	struct nvmet_ctrl *ctrl;
++
++	mutex_lock(&subsys->lock);
++	list_for_each_entry(ctrl, &subsys->ctrls, subsys_entry) {
++		if (ctrl->port == port)
++			ctrl->ops->delete_ctrl(ctrl);
++	}
++	mutex_unlock(&subsys->lock);
++}
++
+ int nvmet_enable_port(struct nvmet_port *port)
+ {
+ 	const struct nvmet_fabrics_ops *ops;
+diff --git a/drivers/nvme/target/nvmet.h b/drivers/nvme/target/nvmet.h
+index 0c5fef4713ef..6f648b8fa4d7 100644
+--- a/drivers/nvme/target/nvmet.h
++++ b/drivers/nvme/target/nvmet.h
+@@ -327,6 +327,9 @@ void nvmet_ns_free(struct nvmet_ns *ns);
+ int nvmet_register_transport(const struct nvmet_fabrics_ops *ops);
+ void nvmet_unregister_transport(const struct nvmet_fabrics_ops *ops);
+ 
++void nvmet_port_del_ctrls(struct nvmet_port *port,
++			  struct nvmet_subsys *subsys);
++
+ int nvmet_enable_port(struct nvmet_port *port);
+ void nvmet_disable_port(struct nvmet_port *port);
+ 
