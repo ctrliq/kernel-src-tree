@@ -1,0 +1,180 @@
+KVM: nVMX/nSVM: Fix bug which sets vcpu->arch.tsc_offset to L1 tsc_offset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Leonid Shatz <leonid.shatz@oracle.com>
+commit 326e742533bf0a23f0127d8ea62fb558ba665f08
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/326e7425.failed
+
+Since commit e79f245ddec1 ("X86/KVM: Properly update 'tsc_offset' to
+represent the running guest"), vcpu->arch.tsc_offset meaning was
+changed to always reflect the tsc_offset value set on active VMCS.
+Regardless if vCPU is currently running L1 or L2.
+
+However, above mentioned commit failed to also change
+kvm_vcpu_write_tsc_offset() to set vcpu->arch.tsc_offset correctly.
+This is because vmx_write_tsc_offset() could set the tsc_offset value
+in active VMCS to given offset parameter *plus vmcs12->tsc_offset*.
+However, kvm_vcpu_write_tsc_offset() just sets vcpu->arch.tsc_offset
+to given offset parameter. Without taking into account the possible
+addition of vmcs12->tsc_offset. (Same is true for SVM case).
+
+Fix this issue by changing kvm_x86_ops->write_tsc_offset() to return
+actually set tsc_offset in active VMCS and modify
+kvm_vcpu_write_tsc_offset() to set returned value in
+vcpu->arch.tsc_offset.
+In addition, rename write_tsc_offset() callback to write_l1_tsc_offset()
+to make it clear that it is meant to set L1 TSC offset.
+
+Fixes: e79f245ddec1 ("X86/KVM: Properly update 'tsc_offset' to represent the running guest")
+	Reviewed-by: Liran Alon <liran.alon@oracle.com>
+	Reviewed-by: Mihai Carabas <mihai.carabas@oracle.com>
+	Reviewed-by: Krish Sadhukhan <krish.sadhukhan@oracle.com>
+	Signed-off-by: Leonid Shatz <leonid.shatz@oracle.com>
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 326e742533bf0a23f0127d8ea62fb558ba665f08)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/svm.c
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index 86bec63d5f8a,fbda5a917c5b..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -925,7 -1093,9 +925,13 @@@ struct kvm_x86_ops 
+  
+  	bool (*has_wbinvd_exit)(void);
+  
+++<<<<<<< HEAD
+ +	void (*write_tsc_offset)(struct kvm_vcpu *vcpu, u64 offset);
+++=======
++ 	u64 (*read_l1_tsc_offset)(struct kvm_vcpu *vcpu);
++ 	/* Returns actual tsc_offset set in active VMCS */
++ 	u64 (*write_l1_tsc_offset)(struct kvm_vcpu *vcpu, u64 offset);
+++>>>>>>> 326e742533bf (KVM: nVMX/nSVM: Fix bug which sets vcpu->arch.tsc_offset to L1 tsc_offset)
+  
+  	void (*get_exit_info)(struct kvm_vcpu *vcpu, u64 *info1, u64 *info2);
+  
+diff --cc arch/x86/kvm/svm.c
+index 2abd6b8af3db,a24733aade4c..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -1278,7 -1436,17 +1278,21 @@@ static void init_sys_seg(struct vmcb_se
+  	seg->base = 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void svm_write_tsc_offset(struct kvm_vcpu *vcpu, u64 offset)
+++=======
++ static u64 svm_read_l1_tsc_offset(struct kvm_vcpu *vcpu)
++ {
++ 	struct vcpu_svm *svm = to_svm(vcpu);
++ 
++ 	if (is_guest_mode(vcpu))
++ 		return svm->nested.hsave->control.tsc_offset;
++ 
++ 	return vcpu->arch.tsc_offset;
++ }
++ 
++ static u64 svm_write_l1_tsc_offset(struct kvm_vcpu *vcpu, u64 offset)
+++>>>>>>> 326e742533bf (KVM: nVMX/nSVM: Fix bug which sets vcpu->arch.tsc_offset to L1 tsc_offset)
+  {
+  	struct vcpu_svm *svm = to_svm(vcpu);
+  	u64 g_tsc_offset = 0;
+@@@ -5810,7 -7152,8 +5825,12 @@@ static struct kvm_x86_ops svm_x86_ops 
+  
+  	.has_wbinvd_exit = svm_has_wbinvd_exit,
+  
+++<<<<<<< HEAD
+ +	.write_tsc_offset = svm_write_tsc_offset,
+++=======
++ 	.read_l1_tsc_offset = svm_read_l1_tsc_offset,
++ 	.write_l1_tsc_offset = svm_write_l1_tsc_offset,
+++>>>>>>> 326e742533bf (KVM: nVMX/nSVM: Fix bug which sets vcpu->arch.tsc_offset to L1 tsc_offset)
+  
+  	.set_tdp_cr3 = set_tdp_cr3,
+  
+diff --cc arch/x86/kvm/vmx.c
+index 5501a1957de2,764c23dc444f..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -2756,25 -3453,20 +2756,23 @@@ static void setup_msrs(struct vcpu_vmx 
+  		vmx_update_msr_bitmap(&vmx->vcpu);
+  }
+  
+ -static u64 vmx_read_l1_tsc_offset(struct kvm_vcpu *vcpu)
+ +/*
+ + * reads and returns guest's timestamp counter "register"
+ + * guest_tsc = (host_tsc * tsc multiplier) >> 48 + tsc_offset
+ + * -- Intel TSC Scaling for Virtualization White Paper, sec 1.3
+ + */
+ +static u64 guest_read_tsc(struct kvm_vcpu *vcpu)
+  {
+ -	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+ -
+ -	if (is_guest_mode(vcpu) &&
+ -	    (vmcs12->cpu_based_vm_exec_control & CPU_BASED_USE_TSC_OFFSETING))
+ -		return vcpu->arch.tsc_offset - vmcs12->tsc_offset;
+ +	u64 host_tsc, tsc_offset;
+  
+ -	return vcpu->arch.tsc_offset;
+ +	host_tsc = rdtsc();
+ +	tsc_offset = vmcs_read64(TSC_OFFSET);
+ +	return kvm_scale_tsc(vcpu, host_tsc) + tsc_offset;
+  }
+  
+- /*
+-  * writes 'offset' into guest's timestamp counter offset register
+-  */
+- static void vmx_write_tsc_offset(struct kvm_vcpu *vcpu, u64 offset)
++ static u64 vmx_write_l1_tsc_offset(struct kvm_vcpu *vcpu, u64 offset)
+  {
++ 	u64 active_offset = offset;
+  	if (is_guest_mode(vcpu)) {
+  		/*
+  		 * We're here if L1 chose not to trap WRMSR to TSC. According
+@@@ -11987,7 -15070,8 +11984,12 @@@ static struct kvm_x86_ops vmx_x86_ops 
+  
+  	.has_wbinvd_exit = cpu_has_vmx_wbinvd_exit,
+  
+++<<<<<<< HEAD
+ +	.write_tsc_offset = vmx_write_tsc_offset,
+++=======
++ 	.read_l1_tsc_offset = vmx_read_l1_tsc_offset,
++ 	.write_l1_tsc_offset = vmx_write_l1_tsc_offset,
+++>>>>>>> 326e742533bf (KVM: nVMX/nSVM: Fix bug which sets vcpu->arch.tsc_offset to L1 tsc_offset)
+  
+  	.set_tdp_cr3 = vmx_set_cr3,
+  
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/svm.c
+* Unmerged path arch/x86/kvm/vmx.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index bc19a3517278..204694d6f997 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1413,8 +1413,7 @@ EXPORT_SYMBOL_GPL(kvm_read_l1_tsc);
+ 
+ static void kvm_vcpu_write_tsc_offset(struct kvm_vcpu *vcpu, u64 offset)
+ {
+-	kvm_x86_ops->write_tsc_offset(vcpu, offset);
+-	vcpu->arch.tsc_offset = offset;
++	vcpu->arch.tsc_offset = kvm_x86_ops->write_l1_tsc_offset(vcpu, offset);
+ }
+ 
+ void kvm_write_tsc(struct kvm_vcpu *vcpu, struct msr_data *msr)
+@@ -1529,7 +1528,8 @@ EXPORT_SYMBOL_GPL(kvm_write_tsc);
+ static inline void adjust_tsc_offset_guest(struct kvm_vcpu *vcpu,
+ 					   s64 adjustment)
+ {
+-	kvm_vcpu_write_tsc_offset(vcpu, vcpu->arch.tsc_offset + adjustment);
++	u64 tsc_offset = kvm_x86_ops->read_l1_tsc_offset(vcpu);
++	kvm_vcpu_write_tsc_offset(vcpu, tsc_offset + adjustment);
+ }
+ 
+ static inline void adjust_tsc_offset_host(struct kvm_vcpu *vcpu, s64 adjustment)
