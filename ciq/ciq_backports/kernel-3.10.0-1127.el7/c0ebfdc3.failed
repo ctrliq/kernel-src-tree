@@ -1,0 +1,275 @@
+percpu: modify base_addr to be region specific
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Dennis Zhou (Facebook) <dennisszhou@gmail.com>
+commit c0ebfdc3fefdef73131c7cb431ad8079f65c714a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/c0ebfdc3.failed
+
+Originally, the first chunk was served by one or two chunks, each
+given a region they are responsible for. Despite this, the arithmetic
+was based off of the true base_addr of the chunk making it be overly
+inclusive.
+
+This patch moves the base_addr of chunks that are responsible for the
+first chunk. The base_addr must remain page aligned to keep the
+address alignment correct, so it is the beginning of the region served
+page aligned down. start_offset holds where the region served begins
+from this new base_addr.
+
+The corresponding percpu address checks are modified to be more specific
+as a result. The first chunk considers only the dynamic region and both
+first chunk and reserved chunk checks ignore the static region. The
+static region addresses should never be passed into the allocator. There
+is no impact here besides distinguishing the first chunk and making the
+checks specific.
+
+The percpu pointer to physical address is left intact as addresses are
+not given out in the non-allocated portion of percpu memory.
+
+nr_pages is added to pcpu_chunk to keep track of the size of the entire
+region served containing both start_offset and end_offset. This variable
+will be used to manage the bitmap allocator.
+
+	Signed-off-by: Dennis Zhou <dennisszhou@gmail.com>
+	Reviewed-by: Josef Bacik <jbacik@fb.com>
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+(cherry picked from commit c0ebfdc3fefdef73131c7cb431ad8079f65c714a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/percpu-internal.h
+#	mm/percpu.c
+diff --cc mm/percpu.c
+index 3c1f6f694380,7c9f0d3ad1b5..000000000000
+--- a/mm/percpu.c
++++ b/mm/percpu.c
+@@@ -190,19 -181,55 +190,60 @@@ static void pcpu_schedule_balance_work(
+  		schedule_work(&pcpu_balance_work);
+  }
+  
++ /**
++  * pcpu_addr_in_first_chunk - address check for first chunk's dynamic region
++  * @addr: percpu address of interest
++  *
++  * The first chunk is considered to be the dynamic region of the first chunk.
++  * While the true first chunk is composed of the static, dynamic, and
++  * reserved regions, it is the chunk that serves the dynamic region that is
++  * circulated in the chunk slots.
++  *
++  * The reserved chunk has a separate check and the static region addresses
++  * should never be passed into the percpu allocator.
++  *
++  * RETURNS:
++  * True if the address is in the dynamic region of the first chunk.
++  */
+  static bool pcpu_addr_in_first_chunk(void *addr)
+  {
+- 	void *first_start = pcpu_first_chunk->base_addr;
++ 	void *start_addr = pcpu_first_chunk->base_addr +
++ 			   pcpu_first_chunk->start_offset;
++ 	void *end_addr = pcpu_first_chunk->base_addr +
++ 			 pcpu_first_chunk->nr_pages * PAGE_SIZE -
++ 			 pcpu_first_chunk->end_offset;
+  
+- 	return addr >= first_start && addr < first_start + pcpu_unit_size;
++ 	return addr >= start_addr && addr < end_addr;
+  }
+  
++ /**
++  * pcpu_addr_in_reserved_chunk - address check for reserved region
++  *
++  * The reserved region is a part of the first chunk and primarily serves
++  * static percpu variables from kernel modules.
++  *
++  * RETURNS:
++  * True if the address is in the reserved region.
++  */
+  static bool pcpu_addr_in_reserved_chunk(void *addr)
+  {
+- 	void *first_start = pcpu_first_chunk->base_addr;
++ 	void *start_addr, *end_addr;
+  
+++<<<<<<< HEAD
+ +	return addr >= first_start &&
+ +		addr < first_start + pcpu_reserved_chunk_limit;
+++=======
++ 	if (!pcpu_reserved_chunk)
++ 		return false;
++ 
++ 	start_addr = pcpu_reserved_chunk->base_addr +
++ 		     pcpu_reserved_chunk->start_offset;
++ 	end_addr = pcpu_reserved_chunk->base_addr +
++ 		   pcpu_reserved_chunk->nr_pages * PAGE_SIZE -
++ 		   pcpu_reserved_chunk->end_offset;
++ 
++ 	return addr >= start_addr && addr < end_addr;
+++>>>>>>> c0ebfdc3fefd (percpu: modify base_addr to be region specific)
+  }
+  
+  static int __pcpu_size_to_slot(int size)
+@@@ -720,6 -749,63 +766,66 @@@ static void pcpu_free_area(struct pcpu_
+  	pcpu_chunk_relocate(chunk, oslot);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct pcpu_chunk * __init pcpu_alloc_first_chunk(unsigned long tmp_addr,
++ 							 int map_size,
++ 							 int *map,
++ 							 int init_map_size)
++ {
++ 	struct pcpu_chunk *chunk;
++ 	unsigned long aligned_addr;
++ 	int start_offset, region_size;
++ 
++ 	/* region calculations */
++ 	aligned_addr = tmp_addr & PAGE_MASK;
++ 
++ 	start_offset = tmp_addr - aligned_addr;
++ 
++ 	region_size = PFN_ALIGN(start_offset + map_size);
++ 
++ 	/* allocate chunk */
++ 	chunk = memblock_virt_alloc(pcpu_chunk_struct_size, 0);
++ 
++ 	INIT_LIST_HEAD(&chunk->list);
++ 	INIT_LIST_HEAD(&chunk->map_extend_list);
++ 
++ 	chunk->base_addr = (void *)aligned_addr;
++ 	chunk->start_offset = start_offset;
++ 	chunk->end_offset = region_size - chunk->start_offset - map_size;
++ 
++ 	chunk->nr_pages = pcpu_unit_pages;
++ 
++ 	chunk->map = map;
++ 	chunk->map_alloc = init_map_size;
++ 
++ 	/* manage populated page bitmap */
++ 	chunk->immutable = true;
++ 	bitmap_fill(chunk->populated, pcpu_unit_pages);
++ 	chunk->nr_populated = pcpu_unit_pages;
++ 
++ 	chunk->contig_hint = chunk->free_size = map_size;
++ 
++ 	if (chunk->start_offset) {
++ 		/* hide the beginning of the bitmap */
++ 		chunk->map[0] = 1;
++ 		chunk->map[1] = chunk->start_offset;
++ 		chunk->map_used = 1;
++ 	}
++ 
++ 	/* set chunk's free region */
++ 	chunk->map[++chunk->map_used] =
++ 		(chunk->start_offset + chunk->free_size) | 1;
++ 
++ 	if (chunk->end_offset) {
++ 		/* hide the end of the bitmap */
++ 		chunk->map[++chunk->map_used] = region_size | 1;
++ 	}
++ 
++ 	return chunk;
++ }
++ 
+++>>>>>>> c0ebfdc3fefd (percpu: modify base_addr to be region specific)
+  static struct pcpu_chunk *pcpu_alloc_chunk(void)
+  {
+  	struct pcpu_chunk *chunk;
+@@@ -1566,6 -1680,8 +1684,11 @@@ int __init pcpu_setup_first_chunk(cons
+  	unsigned int cpu;
+  	int *unit_map;
+  	int group, unit, i;
+++<<<<<<< HEAD
+++=======
++ 	int map_size;
++ 	unsigned long tmp_addr;
+++>>>>>>> c0ebfdc3fefd (percpu: modify base_addr to be region specific)
+  
+  #define PCPU_SETUP_BUG_ON(cond)	do {					\
+  	if (unlikely(cond)) {						\
+@@@ -1665,56 -1784,27 +1788,72 @@@
+  		INIT_LIST_HEAD(&pcpu_slot[i]);
+  
+  	/*
+- 	 * Initialize static chunk.  If reserved_size is zero, the
+- 	 * static chunk covers static area + dynamic allocation area
+- 	 * in the first chunk.  If reserved_size is not zero, it
+- 	 * covers static area + reserved area (mostly used for module
+- 	 * static percpu allocation).
++ 	 * Initialize first chunk.
++ 	 * If the reserved_size is non-zero, this initializes the reserved
++ 	 * chunk.  If the reserved_size is zero, the reserved chunk is NULL
++ 	 * and the dynamic region is initialized here.  The first chunk,
++ 	 * pcpu_first_chunk, will always point to the chunk that serves
++ 	 * the dynamic region.
+  	 */
+++<<<<<<< HEAD
+ +	schunk = memblock_virt_alloc(pcpu_chunk_struct_size, 0);
+ +	INIT_LIST_HEAD(&schunk->list);
+ +	INIT_LIST_HEAD(&schunk->map_extend_list);
+ +	schunk->base_addr = base_addr;
+ +	schunk->map = smap;
+ +	schunk->map_alloc = ARRAY_SIZE(smap);
+ +	schunk->immutable = true;
+ +	bitmap_fill(schunk->populated, pcpu_unit_pages);
+ +	schunk->nr_populated = pcpu_unit_pages;
+ +
+ +	if (ai->reserved_size) {
+ +		schunk->free_size = ai->reserved_size;
+ +		pcpu_reserved_chunk = schunk;
+ +		pcpu_reserved_chunk_limit = ai->static_size + ai->reserved_size;
+ +	} else {
+ +		schunk->free_size = dyn_size;
+ +		dyn_size = 0;			/* dynamic area covered */
+ +	}
+ +	schunk->contig_hint = schunk->free_size;
+ +
+ +	schunk->map[0] = 1;
+ +	schunk->map[1] = ai->static_size;
+ +	schunk->map_used = 1;
+ +	if (schunk->free_size)
+ +		schunk->map[++schunk->map_used] = ai->static_size + schunk->free_size;
+ +	schunk->map[schunk->map_used] |= 1;
+++=======
++ 	tmp_addr = (unsigned long)base_addr + ai->static_size;
++ 	map_size = ai->reserved_size ?: ai->dyn_size;
++ 	chunk = pcpu_alloc_first_chunk(tmp_addr, map_size, smap,
++ 				       ARRAY_SIZE(smap));
+++>>>>>>> c0ebfdc3fefd (percpu: modify base_addr to be region specific)
+  
+  	/* init dynamic chunk if necessary */
+ -	if (ai->reserved_size) {
+ -		pcpu_reserved_chunk = chunk;
+ -
+ +	if (dyn_size) {
+ +		dchunk = memblock_virt_alloc(pcpu_chunk_struct_size, 0);
+ +		INIT_LIST_HEAD(&dchunk->list);
+ +		INIT_LIST_HEAD(&dchunk->map_extend_list);
+ +		dchunk->base_addr = base_addr;
+ +		dchunk->map = dmap;
+ +		dchunk->map_alloc = ARRAY_SIZE(dmap);
+ +		dchunk->immutable = true;
+ +		bitmap_fill(dchunk->populated, pcpu_unit_pages);
+ +		dchunk->nr_populated = pcpu_unit_pages;
+ +
+++<<<<<<< HEAD
+ +		dchunk->contig_hint = dchunk->free_size = dyn_size;
+ +		dchunk->map[0] = 1;
+ +		dchunk->map[1] = pcpu_reserved_chunk_limit;
+ +		dchunk->map[2] = (pcpu_reserved_chunk_limit + dchunk->free_size) | 1;
+ +		dchunk->map_used = 2;
+++=======
++ 		tmp_addr = (unsigned long)base_addr + ai->static_size +
++ 			   ai->reserved_size;
++ 		map_size = ai->dyn_size;
++ 		chunk = pcpu_alloc_first_chunk(tmp_addr, map_size, dmap,
++ 					       ARRAY_SIZE(dmap));
+++>>>>>>> c0ebfdc3fefd (percpu: modify base_addr to be region specific)
+  	}
+  
+  	/* link the first chunk in */
+* Unmerged path mm/percpu-internal.h
+* Unmerged path mm/percpu-internal.h
+* Unmerged path mm/percpu.c
