@@ -1,0 +1,156 @@
+md: separate request handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [md] separate request handling (Nigel Croxon) [1506338]
+Rebuild_FUZZ: 92.59%
+commit-author Shaohua Li <shli@fb.com>
+commit 393debc23c7820211d1c8253dd6a8408a7628fe7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/393debc2.failed
+
+With commit cc27b0c78c79, pers->make_request could bail out without handling
+the bio. If that happens, we should retry.  The commit fixes md_make_request
+but not other call sites. Separate the request handling part, so other call
+sites can use it.
+
+	Reported-by: Nate Dailey <nate.dailey@stratus.com>
+Fix: cc27b0c78c79(md: fix deadlock between mddev_suspend() and md_write_start())
+	Cc: stable@vger.kernel.org
+	Reviewed-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 393debc23c7820211d1c8253dd6a8408a7628fe7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+diff --cc drivers/md/md.c
+index 4c75b0e4a2a4,1db1a22ed835..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -248,7 -266,38 +248,42 @@@ static DEFINE_SPINLOCK(all_mddevs_lock)
+   * call has finished, the bio has been linked into some internal structure
+   * and so is visible to ->quiesce(), so we don't need the refcount any more.
+   */
+++<<<<<<< HEAD
+ +static void md_make_request(struct request_queue *q, struct bio *bio)
+++=======
++ void md_handle_request(struct mddev *mddev, struct bio *bio)
++ {
++ check_suspended:
++ 	rcu_read_lock();
++ 	if (mddev->suspended) {
++ 		DEFINE_WAIT(__wait);
++ 		for (;;) {
++ 			prepare_to_wait(&mddev->sb_wait, &__wait,
++ 					TASK_UNINTERRUPTIBLE);
++ 			if (!mddev->suspended)
++ 				break;
++ 			rcu_read_unlock();
++ 			schedule();
++ 			rcu_read_lock();
++ 		}
++ 		finish_wait(&mddev->sb_wait, &__wait);
++ 	}
++ 	atomic_inc(&mddev->active_io);
++ 	rcu_read_unlock();
++ 
++ 	if (!mddev->pers->make_request(mddev, bio)) {
++ 		atomic_dec(&mddev->active_io);
++ 		wake_up(&mddev->sb_wait);
++ 		goto check_suspended;
++ 	}
++ 
++ 	if (atomic_dec_and_test(&mddev->active_io) && mddev->suspended)
++ 		wake_up(&mddev->sb_wait);
++ }
++ EXPORT_SYMBOL(md_handle_request);
++ 
++ static blk_qc_t md_make_request(struct request_queue *q, struct bio *bio)
+++>>>>>>> 393debc23c78 (md: separate request handling)
+  {
+  	const int rw = bio_data_dir(bio);
+  	struct mddev *mddev = q->queuedata;
+@@@ -257,49 -308,31 +292,63 @@@
+  
+  	if (mddev == NULL || mddev->pers == NULL) {
+  		bio_io_error(bio);
+ -		return BLK_QC_T_NONE;
+ +		return;
+  	}
+  	if (mddev->ro == 1 && unlikely(rw == WRITE)) {
+ -		if (bio_sectors(bio) != 0)
+ -			bio->bi_status = BLK_STS_IOERR;
+ -		bio_endio(bio);
+ -		return BLK_QC_T_NONE;
+ +		bio_endio(bio, bio_sectors(bio) == 0 ? 0 : -EROFS);
+ +		return;
+  	}
+++<<<<<<< HEAD
+ +check_suspended:
+ +	smp_rmb(); /* Ensure implications of  'active' are visible */
+ +	rcu_read_lock();
+ +	if (mddev->suspended) {
+ +		DEFINE_WAIT(__wait);
+ +		for (;;) {
+ +			prepare_to_wait(&mddev->sb_wait, &__wait,
+ +					TASK_UNINTERRUPTIBLE);
+ +			if (!mddev->suspended)
+ +				break;
+ +			rcu_read_unlock();
+ +			schedule();
+ +			rcu_read_lock();
+ +		}
+ +		finish_wait(&mddev->sb_wait, &__wait);
+ +	}
+ +	atomic_inc(&mddev->active_io);
+ +	rcu_read_unlock();
+++=======
+++>>>>>>> 393debc23c78 (md: separate request handling)
+  
+  	/*
+  	 * save the sectors now since our bio can
+  	 * go away inside make_request
+  	 */
+  	sectors = bio_sectors(bio);
+++<<<<<<< HEAD
+ +	if (!mddev->pers->make_request(mddev, bio)) {
+ +		atomic_dec(&mddev->active_io);
+ +		wake_up(&mddev->sb_wait);
+ +		goto check_suspended;
+ +	}
+++=======
++ 	/* bio could be mergeable after passing to underlayer */
++ 	bio->bi_opf &= ~REQ_NOMERGE;
++ 
++ 	md_handle_request(mddev, bio);
+++>>>>>>> 393debc23c78 (md: separate request handling)
+  
+  	cpu = part_stat_lock();
+  	part_stat_inc(cpu, &mddev->gendisk->part0, ios[rw]);
+  	part_stat_add(cpu, &mddev->gendisk->part0, sectors[rw], sectors);
+  	part_stat_unlock();
+  
+++<<<<<<< HEAD
+ +	if (atomic_dec_and_test(&mddev->active_io) && mddev->suspended)
+ +		wake_up(&mddev->sb_wait);
+++=======
++ 	return BLK_QC_T_NONE;
+++>>>>>>> 393debc23c78 (md: separate request handling)
+  }
+  
+  /* mddev_suspend makes sure no new requests are submitted
+* Unmerged path drivers/md/md.c
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index 0d13bf88f41f..12e19d6d3733 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -679,6 +679,7 @@ extern void md_stop_writes(struct mddev *mddev);
+ extern int md_rdev_init(struct md_rdev *rdev);
+ extern void md_rdev_clear(struct md_rdev *rdev);
+ 
++extern void md_handle_request(struct mddev *mddev, struct bio *bio);
+ extern void mddev_suspend(struct mddev *mddev);
+ extern void mddev_resume(struct mddev *mddev);
+ extern struct bio *bio_clone_mddev(struct bio *bio, gfp_t gfp_mask,
