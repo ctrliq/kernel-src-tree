@@ -1,0 +1,260 @@
+tpm: consolidate the TPM startup code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
+commit 19cbe4f680b48f950246815b891a66eeb67f7410
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/19cbe4f6.failed
+
+Consolidated all the "manual" TPM startup code to a single function
+in order to make code flows a bit cleaner and migrate to tpm_buf.
+
+	Tested-by: Stefan Berger <stefanb@linux.vnet.ibm.com>
+	Signed-off-by: Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
+	Signed-off-by: James Morris <james.l.morris@oracle.com>
+(cherry picked from commit 19cbe4f680b48f950246815b891a66eeb67f7410)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/char/tpm/tpm-interface.c
+#	drivers/char/tpm/tpm2-cmd.c
+diff --cc drivers/char/tpm/tpm-interface.c
+index 6a85d93aa7e5,3123a6e44687..000000000000
+--- a/drivers/char/tpm/tpm-interface.c
++++ b/drivers/char/tpm/tpm-interface.c
+@@@ -530,26 -627,6 +571,29 @@@ ssize_t tpm_getcap(struct tpm_chip *chi
+  }
+  EXPORT_SYMBOL_GPL(tpm_getcap);
+  
+++<<<<<<< HEAD
+ +#define TPM_ORD_STARTUP 153
+ +#define TPM_ST_CLEAR cpu_to_be16(1)
+ +#define TPM_ST_STATE cpu_to_be16(2)
+ +#define TPM_ST_DEACTIVATED cpu_to_be16(3)
+ +static const struct tpm_input_header tpm_startup_header = {
+ +	.tag = cpu_to_be16(TPM_TAG_RQU_COMMAND),
+ +	.length = cpu_to_be32(12),
+ +	.ordinal = cpu_to_be32(TPM_ORD_STARTUP)
+ +};
+ +
+ +static int tpm_startup(struct tpm_chip *chip, __be16 startup_type)
+ +{
+ +	struct tpm_cmd_t start_cmd;
+ +	start_cmd.header.in = tpm_startup_header;
+ +
+ +	start_cmd.params.startup_in.startup_type = startup_type;
+ +	return tpm_transmit_cmd(chip, &start_cmd, TPM_INTERNAL_RESULT_SIZE, 0,
+ +				0, "attempting to start the TPM");
+ +}
+ +
+++=======
+++>>>>>>> 19cbe4f680b4 (tpm: consolidate the TPM startup code)
+  int tpm_get_timeouts(struct tpm_chip *chip)
+  {
+  	cap_t cap;
+diff --cc drivers/char/tpm/tpm2-cmd.c
+index bab83b23d39b,1962c9b15cd5..000000000000
+--- a/drivers/char/tpm/tpm2-cmd.c
++++ b/drivers/char/tpm/tpm2-cmd.c
+@@@ -774,36 -779,6 +774,39 @@@ ssize_t tpm2_get_tpm_pt(struct tpm_chi
+  }
+  EXPORT_SYMBOL_GPL(tpm2_get_tpm_pt);
+  
+++<<<<<<< HEAD
+ +#define TPM2_STARTUP_IN_SIZE \
+ +	(sizeof(struct tpm_input_header) + \
+ +	 sizeof(struct tpm2_startup_in))
+ +
+ +static const struct tpm_input_header tpm2_startup_header = {
+ +	.tag = cpu_to_be16(TPM2_ST_NO_SESSIONS),
+ +	.length = cpu_to_be32(TPM2_STARTUP_IN_SIZE),
+ +	.ordinal = cpu_to_be32(TPM2_CC_STARTUP)
+ +};
+ +
+ +/**
+ + * tpm2_startup() - send startup command to the TPM chip
+ + *
+ + * @chip:		TPM chip to use.
+ + * @startup_type:	startup type. The value is either
+ + *			TPM_SU_CLEAR or TPM_SU_STATE.
+ + *
+ + * Return: Same as with tpm_transmit_cmd.
+ + */
+ +static int tpm2_startup(struct tpm_chip *chip, u16 startup_type)
+ +{
+ +	struct tpm2_cmd cmd;
+ +
+ +	cmd.header.in = tpm2_startup_header;
+ +
+ +	cmd.params.startup_in.startup_type = cpu_to_be16(startup_type);
+ +	return tpm_transmit_cmd(chip, &cmd, sizeof(cmd), 0, 0,
+ +				"attempting to start the TPM");
+ +}
+ +
+++=======
+++>>>>>>> 19cbe4f680b4 (tpm: consolidate the TPM startup code)
+  #define TPM2_SHUTDOWN_IN_SIZE \
+  	(sizeof(struct tpm_input_header) + \
+  	 sizeof(struct tpm2_startup_in))
+@@@ -1103,3 -1033,123 +1106,126 @@@ out
+  
+  	return rc;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static int tpm2_get_cc_attrs_tbl(struct tpm_chip *chip)
++ {
++ 	struct tpm_buf buf;
++ 	u32 nr_commands;
++ 	u32 *attrs;
++ 	u32 cc;
++ 	int i;
++ 	int rc;
++ 
++ 	rc = tpm2_get_tpm_pt(chip, TPM_PT_TOTAL_COMMANDS, &nr_commands, NULL);
++ 	if (rc)
++ 		goto out;
++ 
++ 	if (nr_commands > 0xFFFFF) {
++ 		rc = -EFAULT;
++ 		goto out;
++ 	}
++ 
++ 	chip->cc_attrs_tbl = devm_kzalloc(&chip->dev, 4 * nr_commands,
++ 					  GFP_KERNEL);
++ 
++ 	rc = tpm_buf_init(&buf, TPM2_ST_NO_SESSIONS, TPM2_CC_GET_CAPABILITY);
++ 	if (rc)
++ 		goto out;
++ 
++ 	tpm_buf_append_u32(&buf, TPM2_CAP_COMMANDS);
++ 	tpm_buf_append_u32(&buf, TPM2_CC_FIRST);
++ 	tpm_buf_append_u32(&buf, nr_commands);
++ 
++ 	rc = tpm_transmit_cmd(chip, NULL, buf.data, PAGE_SIZE,
++ 			      9 + 4 * nr_commands, 0, NULL);
++ 	if (rc) {
++ 		tpm_buf_destroy(&buf);
++ 		goto out;
++ 	}
++ 
++ 	if (nr_commands !=
++ 	    be32_to_cpup((__be32 *)&buf.data[TPM_HEADER_SIZE + 5])) {
++ 		tpm_buf_destroy(&buf);
++ 		goto out;
++ 	}
++ 
++ 	chip->nr_commands = nr_commands;
++ 
++ 	attrs = (u32 *)&buf.data[TPM_HEADER_SIZE + 9];
++ 	for (i = 0; i < nr_commands; i++, attrs++) {
++ 		chip->cc_attrs_tbl[i] = be32_to_cpup(attrs);
++ 		cc = chip->cc_attrs_tbl[i] & 0xFFFF;
++ 
++ 		if (cc == TPM2_CC_CONTEXT_SAVE || cc == TPM2_CC_FLUSH_CONTEXT) {
++ 			chip->cc_attrs_tbl[i] &=
++ 				~(GENMASK(2, 0) << TPM2_CC_ATTR_CHANDLES);
++ 			chip->cc_attrs_tbl[i] |= 1 << TPM2_CC_ATTR_CHANDLES;
++ 		}
++ 	}
++ 
++ 	tpm_buf_destroy(&buf);
++ 
++ out:
++ 	if (rc > 0)
++ 		rc = -ENODEV;
++ 	return rc;
++ }
++ 
++ /**
++  * tpm2_auto_startup - Perform the standard automatic TPM initialization
++  *                     sequence
++  * @chip: TPM chip to use
++  *
++  * Returns 0 on success, < 0 in case of fatal error.
++  */
++ int tpm2_auto_startup(struct tpm_chip *chip)
++ {
++ 	int rc;
++ 
++ 	rc = tpm_get_timeouts(chip);
++ 	if (rc)
++ 		goto out;
++ 
++ 	rc = tpm2_do_selftest(chip);
++ 	if (rc != 0 && rc != TPM2_RC_INITIALIZE) {
++ 		dev_err(&chip->dev, "TPM self test failed\n");
++ 		goto out;
++ 	}
++ 
++ 	if (rc == TPM2_RC_INITIALIZE) {
++ 		rc = tpm_startup(chip);
++ 		if (rc)
++ 			goto out;
++ 
++ 		rc = tpm2_do_selftest(chip);
++ 		if (rc) {
++ 			dev_err(&chip->dev, "TPM self test failed\n");
++ 			goto out;
++ 		}
++ 	}
++ 
++ 	rc = tpm2_get_pcr_allocation(chip);
++ 	if (rc)
++ 		goto out;
++ 
++ 	rc = tpm2_get_cc_attrs_tbl(chip);
++ 
++ out:
++ 	if (rc > 0)
++ 		rc = -ENODEV;
++ 	return rc;
++ }
++ 
++ int tpm2_find_cc(struct tpm_chip *chip, u32 cc)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < chip->nr_commands; i++)
++ 		if (cc == (chip->cc_attrs_tbl[i] & GENMASK(15, 0)))
++ 			return i;
++ 
++ 	return -1;
++ }
+++>>>>>>> 19cbe4f680b4 (tpm: consolidate the TPM startup code)
+* Unmerged path drivers/char/tpm/tpm-interface.c
+diff --git a/drivers/char/tpm/tpm.h b/drivers/char/tpm/tpm.h
+index 02a03cbe108b..f8d032c09a6d 100644
+--- a/drivers/char/tpm/tpm.h
++++ b/drivers/char/tpm/tpm.h
+@@ -364,10 +364,6 @@ struct tpm_getrandom_in {
+ 	__be32 num_bytes;
+ } __packed;
+ 
+-struct tpm_startup_in {
+-	__be16	startup_type;
+-} __packed;
+-
+ typedef union {
+ 	struct	tpm_getcap_params_out getcap_out;
+ 	struct	tpm_readpubek_params_out readpubek_out;
+@@ -377,7 +373,6 @@ typedef union {
+ 	struct	tpm_pcrread_out	pcrread_out;
+ 	struct	tpm_getrandom_in getrandom_in;
+ 	struct	tpm_getrandom_out getrandom_out;
+-	struct tpm_startup_in startup_in;
+ } tpm_cmd_params;
+ 
+ struct tpm_cmd_t {
+@@ -494,6 +489,7 @@ ssize_t tpm_transmit(struct tpm_chip *chip, const u8 *buf, size_t bufsiz,
+ ssize_t tpm_transmit_cmd(struct tpm_chip *chip, const void *buf, size_t bufsiz,
+ 			 size_t min_rsp_body_len, unsigned int flags,
+ 			 const char *desc);
++int tpm_startup(struct tpm_chip *chip);
+ ssize_t tpm_getcap(struct tpm_chip *chip, u32 subcap_id, cap_t *cap,
+ 		   const char *desc, size_t min_cap_length);
+ int tpm_get_timeouts(struct tpm_chip *);
+* Unmerged path drivers/char/tpm/tpm2-cmd.c
