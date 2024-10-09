@@ -1,0 +1,309 @@
+scsi: mpt3sas: Handle RDPQ DMA allocation in same 4G region
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Suganath Prabu <suganath-prabu.subramani@broadcom.com>
+commit 8012209eb26b7819385a6ec6eae4b1d0a0dbe585
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/8012209e.failed
+
+For INVADER_SERIES, each set of 8 reply queues (0 - 7, 8 - 15,..), and for
+VENTURA_SERIES, each set of 16 reply queues (0 - 15, 16 - 31,..) need to be
+within the same 4 GB boundary. Driver uses limitation of VENTURA_SERIES to
+manage INVADER_SERIES as well. The driver is allocating the DMA able
+memory for RDPQs accordingly.
+
+1) At driver load, set DMA mask to 64 and allocate memory for RDPQs
+
+2) Check if allocated resources for RDPQ are in the same 4GB range
+
+3) If #2 is true, continue with 64 bit DMA and go to #6
+
+4) If #2 is false, then free all the resources from #1
+
+5) Set DMA mask to 32 and allocate RDPQs
+
+6) Proceed with driver loading and other allocations
+
+Link: https://lore.kernel.org/r/1587626596-1044-5-git-send-email-suganath-prabu.subramani@broadcom.com
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Suganath Prabu <suganath-prabu.subramani@broadcom.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 8012209eb26b7819385a6ec6eae4b1d0a0dbe585)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/mpt3sas/mpt3sas_base.c
+#	drivers/scsi/mpt3sas/mpt3sas_base.h
+diff --cc drivers/scsi/mpt3sas/mpt3sas_base.c
+index 054e3c22f1af,e9471e501ea7..000000000000
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.c
+@@@ -2706,43 -2806,34 +2706,52 @@@ _base_build_sg_ieee(struct MPT3SAS_ADAP
+  static int
+  _base_config_dma_addressing(struct MPT3SAS_ADAPTER *ioc, struct pci_dev *pdev)
+  {
+ +	u64 required_mask, coherent_mask;
+  	struct sysinfo s;
+++<<<<<<< HEAD
+++=======
++ 	int dma_mask;
++ 
++ 	if (ioc->is_mcpu_endpoint ||
++ 	    sizeof(dma_addr_t) == 4 || ioc->use_32bit_dma ||
++ 	    dma_get_required_mask(&pdev->dev) <= 32)
++ 		dma_mask = 32;
+++>>>>>>> 8012209eb26b (scsi: mpt3sas: Handle RDPQ DMA allocation in same 4G region)
+  	/* Set 63 bit DMA mask for all SAS3 and SAS35 controllers */
+ -	else if (ioc->hba_mpi_version_belonged > MPI2_VERSION)
+ -		dma_mask = 63;
+ +	int dma_mask = (ioc->hba_mpi_version_belonged > MPI2_VERSION) ? 63 : 64;
+ +
+ +	if (ioc->is_mcpu_endpoint)
+ +		goto try_32bit;
+ +
+ +	required_mask = dma_get_required_mask(&pdev->dev);
+ +	if (sizeof(dma_addr_t) == 4 || required_mask == 32)
+ +		goto try_32bit;
+ +
+ +	if (ioc->dma_mask)
+ +		coherent_mask = DMA_BIT_MASK(dma_mask);
+  	else
+ -		dma_mask = 64;
+ +		coherent_mask = DMA_BIT_MASK(32);
+  
+  	if (dma_set_mask(&pdev->dev, DMA_BIT_MASK(dma_mask)) ||
+ -	    dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(dma_mask)))
+ -		return -ENODEV;
+ +	    dma_set_coherent_mask(&pdev->dev, coherent_mask))
+ +		goto try_32bit;
+  
+ -	if (dma_mask > 32) {
+ -		ioc->base_add_sg_single = &_base_add_sg_single_64;
+ -		ioc->sge_size = sizeof(Mpi2SGESimple64_t);
+ -	} else {
+ -		ioc->base_add_sg_single = &_base_add_sg_single_32;
+ -		ioc->sge_size = sizeof(Mpi2SGESimple32_t);
+ -	}
+ +	ioc->base_add_sg_single = &_base_add_sg_single_64;
+ +	ioc->sge_size = sizeof(Mpi2SGESimple64_t);
+ +	ioc->dma_mask = dma_mask;
+ +	goto out;
+  
+ + try_32bit:
+ +	if (dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32)))
+ +		return -ENODEV;
+ +
+ +	ioc->base_add_sg_single = &_base_add_sg_single_32;
+ +	ioc->sge_size = sizeof(Mpi2SGESimple32_t);
+ +	ioc->dma_mask = 32;
+ + out:
+  	si_meminfo(&s);
+  	ioc_info(ioc, "%d BIT PCI BUS DMA ADDRESSING SUPPORTED, total mem (%ld kB)\n",
+ -		dma_mask, convert_to_kb(s.totalram));
+ +		 ioc->dma_mask, convert_to_kb(s.totalram));
+  
+  	return 0;
+  }
+@@@ -4836,6 -4944,88 +4850,91 @@@ is_MSB_are_same(long reply_pool_start_a
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * base_alloc_rdpq_dma_pool - Allocating DMA'able memory
++  *                     for reply queues.
++  * @ioc: per adapter object
++  * @sz: DMA Pool size
++  * Return: 0 for success, non-zero for failure.
++  */
++ static int
++ base_alloc_rdpq_dma_pool(struct MPT3SAS_ADAPTER *ioc, int sz)
++ {
++ 	int i = 0;
++ 	u32 dma_alloc_count = 0;
++ 	int reply_post_free_sz = ioc->reply_post_queue_depth *
++ 		sizeof(Mpi2DefaultReplyDescriptor_t);
++ 	int count = ioc->rdpq_array_enable ? ioc->reply_queue_count : 1;
++ 
++ 	ioc->reply_post = kcalloc(count, sizeof(struct reply_post_struct),
++ 			GFP_KERNEL);
++ 	if (!ioc->reply_post)
++ 		return -ENOMEM;
++ 	/*
++ 	 *  For INVADER_SERIES each set of 8 reply queues(0-7, 8-15, ..) and
++ 	 *  VENTURA_SERIES each set of 16 reply queues(0-15, 16-31, ..) should
++ 	 *  be within 4GB boundary i.e reply queues in a set must have same
++ 	 *  upper 32-bits in their memory address. so here driver is allocating
++ 	 *  the DMA'able memory for reply queues according.
++ 	 *  Driver uses limitation of
++ 	 *  VENTURA_SERIES to manage INVADER_SERIES as well.
++ 	 */
++ 	dma_alloc_count = DIV_ROUND_UP(ioc->reply_queue_count,
++ 				RDPQ_MAX_INDEX_IN_ONE_CHUNK);
++ 	ioc->reply_post_free_dma_pool =
++ 		dma_pool_create("reply_post_free pool",
++ 		    &ioc->pdev->dev, sz, 16, 0);
++ 	if (!ioc->reply_post_free_dma_pool)
++ 		return -ENOMEM;
++ 	for (i = 0; i < ioc->reply_queue_count; i++) {
++ 		if ((i % RDPQ_MAX_INDEX_IN_ONE_CHUNK == 0) && dma_alloc_count) {
++ 			ioc->reply_post[i].reply_post_free =
++ 			    dma_pool_alloc(ioc->reply_post_free_dma_pool,
++ 				GFP_KERNEL,
++ 				&ioc->reply_post[i].reply_post_free_dma);
++ 			if (!ioc->reply_post[i].reply_post_free)
++ 				return -ENOMEM;
++ 			/*
++ 			 * Each set of RDPQ pool must satisfy 4gb boundary
++ 			 * restriction.
++ 			 * 1) Check if allocated resources for RDPQ pool are in
++ 			 *	the same 4GB range.
++ 			 * 2) If #1 is true, continue with 64 bit DMA.
++ 			 * 3) If #1 is false, return 1. which means free all the
++ 			 * resources and set DMA mask to 32 and allocate.
++ 			 */
++ 			if (!mpt3sas_check_same_4gb_region(
++ 				(long)ioc->reply_post[i].reply_post_free, sz)) {
++ 				dinitprintk(ioc,
++ 				    ioc_err(ioc, "bad Replypost free pool(0x%p)"
++ 				    "reply_post_free_dma = (0x%llx)\n",
++ 				    ioc->reply_post[i].reply_post_free,
++ 				    (unsigned long long)
++ 				    ioc->reply_post[i].reply_post_free_dma));
++ 				return -EAGAIN;
++ 			}
++ 			memset(ioc->reply_post[i].reply_post_free, 0,
++ 						RDPQ_MAX_INDEX_IN_ONE_CHUNK *
++ 						reply_post_free_sz);
++ 			dma_alloc_count--;
++ 
++ 		} else {
++ 			ioc->reply_post[i].reply_post_free =
++ 			    (Mpi2ReplyDescriptorsUnion_t *)
++ 			    ((long)ioc->reply_post[i-1].reply_post_free
++ 			    + reply_post_free_sz);
++ 			ioc->reply_post[i].reply_post_free_dma =
++ 			    (dma_addr_t)
++ 			    (ioc->reply_post[i-1].reply_post_free_dma +
++ 			    reply_post_free_sz);
++ 		}
++ 	}
++ 	return 0;
++ }
++ 
++ /**
+++>>>>>>> 8012209eb26b (scsi: mpt3sas: Handle RDPQ DMA allocation in same 4G region)
+   * _base_allocate_memory_pools - allocate start of day memory pools
+   * @ioc: per adapter object
+   *
+@@@ -5006,54 -5198,28 +5107,76 @@@ _base_allocate_memory_pools(struct MPT3
+  	/* reply post queue, 16 byte align */
+  	reply_post_free_sz = ioc->reply_post_queue_depth *
+  	    sizeof(Mpi2DefaultReplyDescriptor_t);
+- 
+- 	sz = reply_post_free_sz;
++ 	rdpq_sz = reply_post_free_sz * RDPQ_MAX_INDEX_IN_ONE_CHUNK;
+  	if (_base_is_controller_msix_enabled(ioc) && !ioc->rdpq_array_enable)
+++<<<<<<< HEAD
+ +		sz *= ioc->reply_queue_count;
+ +
+ +	ioc->reply_post = kcalloc((ioc->rdpq_array_enable) ?
+ +	    (ioc->reply_queue_count):1,
+ +	    sizeof(struct reply_post_struct), GFP_KERNEL);
+ +
+ +	if (!ioc->reply_post) {
+ +		ioc_err(ioc, "reply_post_free pool: kcalloc failed\n");
+ +		goto out;
+ +	}
+ +	ioc->reply_post_free_dma_pool = dma_pool_create("reply_post_free pool",
+ +	    &ioc->pdev->dev, sz, 16, 0);
+ +	if (!ioc->reply_post_free_dma_pool) {
+ +		ioc_err(ioc, "reply_post_free pool: dma_pool_create failed\n");
+ +		goto out;
+ +	}
+ +	i = 0;
+ +	do {
+ +		ioc->reply_post[i].reply_post_free =
+ +		    dma_pool_zalloc(ioc->reply_post_free_dma_pool,
+ +		    GFP_KERNEL,
+ +		    &ioc->reply_post[i].reply_post_free_dma);
+ +		if (!ioc->reply_post[i].reply_post_free) {
+ +			ioc_err(ioc, "reply_post_free pool: dma_pool_alloc failed\n");
+ +			goto out;
+ +		}
+ +		dinitprintk(ioc,
+ +			    ioc_info(ioc, "reply post free pool (0x%p): depth(%d), element_size(%d), pool_size(%d kB)\n",
+ +				     ioc->reply_post[i].reply_post_free,
+ +				     ioc->reply_post_queue_depth,
+ +				     8, sz / 1024));
+ +		dinitprintk(ioc,
+ +			    ioc_info(ioc, "reply_post_free_dma = (0x%llx)\n",
+ +				     (u64)ioc->reply_post[i].reply_post_free_dma));
+ +		total_sz += sz;
+ +	} while (ioc->rdpq_array_enable && (++i < ioc->reply_queue_count));
+ +
+ +	if (ioc->dma_mask > 32) {
+ +		if (_base_change_consistent_dma_mask(ioc, ioc->pdev) != 0) {
+ +			ioc_warn(ioc, "no suitable consistent DMA mask for %s\n",
+ +				 pci_name(ioc->pdev));
+ +			goto out;
+ +		}
+ +	}
+ +
+++=======
++ 		rdpq_sz = reply_post_free_sz * ioc->reply_queue_count;
++ 	ret = base_alloc_rdpq_dma_pool(ioc, rdpq_sz);
++ 	if (ret == -EAGAIN) {
++ 		/*
++ 		 * Free allocated bad RDPQ memory pools.
++ 		 * Change dma coherent mask to 32 bit and reallocate RDPQ
++ 		 */
++ 		_base_release_memory_pools(ioc);
++ 		ioc->use_32bit_dma = true;
++ 		if (_base_config_dma_addressing(ioc, ioc->pdev) != 0) {
++ 			ioc_err(ioc,
++ 			    "32 DMA mask failed %s\n", pci_name(ioc->pdev));
++ 			return -ENODEV;
++ 		}
++ 		if (base_alloc_rdpq_dma_pool(ioc, rdpq_sz))
++ 			return -ENOMEM;
++ 	} else if (ret == -ENOMEM)
++ 		return -ENOMEM;
++ 	total_sz = rdpq_sz * (!ioc->rdpq_array_enable ? 1 :
++ 	    DIV_ROUND_UP(ioc->reply_queue_count, RDPQ_MAX_INDEX_IN_ONE_CHUNK));
+++>>>>>>> 8012209eb26b (scsi: mpt3sas: Handle RDPQ DMA allocation in same 4G region)
+  	ioc->scsiio_depth = ioc->hba_queue_depth -
+  	    ioc->hi_priority_depth - ioc->internal_depth;
+  
+@@@ -6980,7 -7200,7 +7102,11 @@@ mpt3sas_base_attach(struct MPT3SAS_ADAP
+  	ioc->smp_affinity_enable = smp_affinity_enable;
+  
+  	ioc->rdpq_array_enable_assigned = 0;
+++<<<<<<< HEAD
+ +	ioc->dma_mask = 0;
+++=======
++ 	ioc->use_32bit_dma = 0;
+++>>>>>>> 8012209eb26b (scsi: mpt3sas: Handle RDPQ DMA allocation in same 4G region)
+  	if (ioc->is_aero_ioc)
+  		ioc->base_readl = &_base_readl_aero;
+  	else
+diff --cc drivers/scsi/mpt3sas/mpt3sas_base.h
+index f4a23f7fa5ec,5a83971179f2..000000000000
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.h
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.h
+@@@ -1229,6 -1253,8 +1231,11 @@@ struct MPT3SAS_ADAPTER 
+  	u16		thresh_hold;
+  	u8		high_iops_queues;
+  	u32		drv_support_bitmap;
+++<<<<<<< HEAD
+++=======
++ 	bool		enable_sdev_max_qd;
++ 	bool		use_32bit_dma;
+++>>>>>>> 8012209eb26b (scsi: mpt3sas: Handle RDPQ DMA allocation in same 4G region)
+  
+  	/* internal commands, callback index */
+  	u8		scsi_io_cb_idx;
+* Unmerged path drivers/scsi/mpt3sas/mpt3sas_base.c
+* Unmerged path drivers/scsi/mpt3sas/mpt3sas_base.h
