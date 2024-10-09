@@ -1,0 +1,251 @@
+x86/mm/ASLR: Propagate base load address calculation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [x86] mm/aslr: Propagate base load address calculation (Baoquan He) [1290840]
+Rebuild_FUZZ: 96.00%
+commit-author Jiri Kosina <jkosina@suse.cz>
+commit f47233c2d34f243ecdaac179c3408a39ff9216a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f47233c2.failed
+
+Commit:
+
+  e2b32e678513 ("x86, kaslr: randomize module base load address")
+
+makes the base address for module to be unconditionally randomized in
+case when CONFIG_RANDOMIZE_BASE is defined and "nokaslr" option isn't
+present on the commandline.
+
+This is not consistent with how choose_kernel_location() decides whether
+it will randomize kernel load base.
+
+Namely, CONFIG_HIBERNATION disables kASLR (unless "kaslr" option is
+explicitly specified on kernel commandline), which makes the state space
+larger than what module loader is looking at. IOW CONFIG_HIBERNATION &&
+CONFIG_RANDOMIZE_BASE is a valid config option, kASLR wouldn't be applied
+by default in that case, but module loader is not aware of that.
+
+Instead of fixing the logic in module.c, this patch takes more generic
+aproach. It introduces a new bootparam setup data_type SETUP_KASLR and
+uses that to pass the information whether kaslr has been applied during
+kernel decompression, and sets a global 'kaslr_enabled' variable
+accordingly, so that any kernel code (module loading, livepatching, ...)
+can make decisions based on its value.
+
+x86 module loader is converted to make use of this flag.
+
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+	Acked-by: Kees Cook <keescook@chromium.org>
+	Cc: "H. Peter Anvin" <hpa@linux.intel.com>
+Link: https://lkml.kernel.org/r/alpine.LNX.2.00.1502101411280.10719@pobox.suse.cz
+[ Always dump correct kaslr status when panicking ]
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+(cherry picked from commit f47233c2d34f243ecdaac179c3408a39ff9216a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/aslr.c
+#	arch/x86/boot/compressed/misc.c
+#	arch/x86/boot/compressed/misc.h
+#	arch/x86/kernel/module.c
+diff --cc arch/x86/boot/compressed/misc.c
+index 136cb407d4ef,5903089c818f..000000000000
+--- a/arch/x86/boot/compressed/misc.c
++++ b/arch/x86/boot/compressed/misc.c
+@@@ -397,6 -396,17 +397,20 @@@ asmlinkage void decompress_kernel(void 
+  	free_mem_ptr     = heap;	/* Heap */
+  	free_mem_end_ptr = heap + BOOT_HEAP_SIZE;
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * The memory hole needed for the kernel is the larger of either
++ 	 * the entire decompressed kernel plus relocation table, or the
++ 	 * entire decompressed kernel plus .bss and .brk sections.
++ 	 */
++ 	output = choose_kernel_location(real_mode, input_data, input_len,
++ 					output,
++ 					output_len > run_size ? output_len
++ 							      : run_size);
++ 
++ 	/* Validate memory location choices. */
+++>>>>>>> f47233c2d34f (x86/mm/ASLR: Propagate base load address calculation)
+  	if ((unsigned long)output & (MIN_KERNEL_ALIGN - 1))
+  		error("Destination address inappropriately aligned");
+  #ifdef CONFIG_X86_64
+diff --cc arch/x86/boot/compressed/misc.h
+index 674019d8e235,6d6730743024..000000000000
+--- a/arch/x86/boot/compressed/misc.h
++++ b/arch/x86/boot/compressed/misc.h
+@@@ -44,7 -51,31 +44,33 @@@ static inline void debug_putstr(const c
+  /* cmdline.c */
+  int cmdline_find_option(const char *option, char *buffer, int bufsize);
+  int cmdline_find_option_bool(const char *option);
+ -#endif
+  
+++<<<<<<< HEAD
+++=======
++ 
++ #if CONFIG_RANDOMIZE_BASE
++ /* aslr.c */
++ unsigned char *choose_kernel_location(struct boot_params *params,
++ 				      unsigned char *input,
++ 				      unsigned long input_size,
++ 				      unsigned char *output,
++ 				      unsigned long output_size);
++ /* cpuflags.c */
++ bool has_cpuflag(int flag);
++ #else
++ static inline
++ unsigned char *choose_kernel_location(struct boot_params *params,
++ 				      unsigned char *input,
++ 				      unsigned long input_size,
++ 				      unsigned char *output,
++ 				      unsigned long output_size)
++ {
++ 	return output;
++ }
++ #endif
++ 
++ #ifdef CONFIG_EARLY_PRINTK
+++>>>>>>> f47233c2d34f (x86/mm/ASLR: Propagate base load address calculation)
+  /* early_serial_console.c */
+  extern int early_serial_base;
+  void console_init(void);
+diff --cc arch/x86/kernel/module.c
+index 7c1efc437dc0,c3c59a3a14ad..000000000000
+--- a/arch/x86/kernel/module.c
++++ b/arch/x86/kernel/module.c
+@@@ -43,6 -45,35 +44,38 @@@ do {							
+  } while (0)
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_RANDOMIZE_BASE
++ static unsigned long module_load_offset;
++ 
++ /* Mutex protects the module_load_offset. */
++ static DEFINE_MUTEX(module_kaslr_mutex);
++ 
++ static unsigned long int get_module_load_offset(void)
++ {
++ 	if (kaslr_enabled) {
++ 		mutex_lock(&module_kaslr_mutex);
++ 		/*
++ 		 * Calculate the module_load_offset the first time this
++ 		 * code is called. Once calculated it stays the same until
++ 		 * reboot.
++ 		 */
++ 		if (module_load_offset == 0)
++ 			module_load_offset =
++ 				(get_random_int() % 1024 + 1) * PAGE_SIZE;
++ 		mutex_unlock(&module_kaslr_mutex);
++ 	}
++ 	return module_load_offset;
++ }
++ #else
++ static unsigned long int get_module_load_offset(void)
++ {
++ 	return 0;
++ }
++ #endif
++ 
+++>>>>>>> f47233c2d34f (x86/mm/ASLR: Propagate base load address calculation)
+  void *module_alloc(unsigned long size)
+  {
+  	if (PAGE_ALIGN(size) > MODULES_LEN)
+* Unmerged path arch/x86/boot/compressed/aslr.c
+* Unmerged path arch/x86/boot/compressed/aslr.c
+* Unmerged path arch/x86/boot/compressed/misc.c
+* Unmerged path arch/x86/boot/compressed/misc.h
+diff --git a/arch/x86/include/asm/page_types.h b/arch/x86/include/asm/page_types.h
+index c7c712f2648b..4dca5b89bfbd 100644
+--- a/arch/x86/include/asm/page_types.h
++++ b/arch/x86/include/asm/page_types.h
+@@ -3,6 +3,7 @@
+ 
+ #include <linux/const.h>
+ #include <linux/types.h>
++#include <asm/bootparam.h>
+ 
+ /* PAGE_SHIFT determines the page size */
+ #define PAGE_SHIFT	12
+@@ -53,6 +54,8 @@ extern int devmem_is_allowed(unsigned long pagenr);
+ extern unsigned long max_low_pfn_mapped;
+ extern unsigned long max_pfn_mapped;
+ 
++extern bool kaslr_enabled;
++
+ static inline phys_addr_t get_max_mapped(void)
+ {
+ 	return (phys_addr_t)max_pfn_mapped << PAGE_SHIFT;
+diff --git a/arch/x86/include/uapi/asm/bootparam.h b/arch/x86/include/uapi/asm/bootparam.h
+index b49c0cfdd694..12305386116b 100644
+--- a/arch/x86/include/uapi/asm/bootparam.h
++++ b/arch/x86/include/uapi/asm/bootparam.h
+@@ -7,6 +7,7 @@
+ #define SETUP_DTB			2
+ #define SETUP_PCI			3
+ #define SETUP_EFI			4
++#define SETUP_KASLR			5
+ 
+ /* ram_size flags */
+ #define RAMDISK_IMAGE_START_MASK	0x07FF
+* Unmerged path arch/x86/kernel/module.c
+diff --git a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
+index 7c228560d4bb..fd7a0caa105d 100644
+--- a/arch/x86/kernel/setup.c
++++ b/arch/x86/kernel/setup.c
+@@ -124,6 +124,8 @@
+ unsigned long max_low_pfn_mapped;
+ unsigned long max_pfn_mapped;
+ 
++bool __read_mostly kaslr_enabled = false;
++
+ #ifdef CONFIG_DMI
+ RESERVE_BRK(dmi_alloc, 65536);
+ #endif
+@@ -439,6 +441,11 @@ static void __init reserve_initrd(void)
+ }
+ #endif /* CONFIG_BLK_DEV_INITRD */
+ 
++static void __init parse_kaslr_setup(u64 pa_data, u32 data_len)
++{
++	kaslr_enabled = (bool)(pa_data + sizeof(struct setup_data));
++}
++
+ static void __init parse_setup_data(void)
+ {
+ 	struct setup_data *data;
+@@ -466,6 +473,9 @@ static void __init parse_setup_data(void)
+ 		case SETUP_EFI:
+ 			parse_efi_setup(pa_data, data_len);
+ 			break;
++		case SETUP_KASLR:
++			parse_kaslr_setup(pa_data, data_len);
++			break;
+ 		default:
+ 			break;
+ 		}
+@@ -934,10 +944,14 @@ static void rh_check_supported(void)
+ static int
+ dump_kernel_offset(struct notifier_block *self, unsigned long v, void *p)
+ {
+-	pr_emerg("Kernel Offset: 0x%lx from 0x%lx "
+-		 "(relocation range: 0x%lx-0x%lx)\n",
+-		 (unsigned long)&_text - __START_KERNEL, __START_KERNEL,
+-		 __START_KERNEL_map, MODULES_VADDR-1);
++	if (kaslr_enabled)
++		pr_emerg("Kernel Offset: 0x%lx from 0x%lx (relocation range: 0x%lx-0x%lx)\n",
++			 (unsigned long)&_text - __START_KERNEL,
++			 __START_KERNEL,
++			 __START_KERNEL_map,
++			 MODULES_VADDR-1);
++	else
++		pr_emerg("Kernel Offset: disabled\n");
+ 
+ 	return 0;
+ }
