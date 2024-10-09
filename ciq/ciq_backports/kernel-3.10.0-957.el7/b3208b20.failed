@@ -1,0 +1,157 @@
+net: bonding: Flip to the new dev walk API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [netdrv] bonding: Flip to the new dev walk API (Jarod Wilson) [1607939]
+Rebuild_FUZZ: 93.67%
+commit-author David Ahern <dsa@cumulusnetworks.com>
+commit b3208b2024c9089106df52ae25ebf39068d6f9fc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b3208b20.failed
+
+Convert alb_send_learning_packets and bond_has_this_ip to use the new
+netdev_walk_all_upper_dev_rcu API. In both cases this is just a code
+conversion; no functional change is intended.
+
+v2
+- removed typecast of data and simplified bond_upper_dev_walk
+
+	Signed-off-by: David Ahern <dsa@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b3208b2024c9089106df52ae25ebf39068d6f9fc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_alb.c
+diff --cc drivers/net/bonding/bond_alb.c
+index dff0f9d536d9,c80b023092dd..000000000000
+--- a/drivers/net/bonding/bond_alb.c
++++ b/drivers/net/bonding/bond_alb.c
+@@@ -950,24 -950,70 +950,86 @@@ static void alb_send_lp_vid(struct slav
+  	dev_queue_xmit(skb);
+  }
+  
+++<<<<<<< HEAD
+ +
+ +static void alb_send_learning_packets(struct slave *slave, u8 mac_addr[])
+ +{
+ +	struct bonding *bond = bond_get_bond_by_slave(slave);
+ +	struct net_device *upper;
+ +	struct list_head *iter;
+++=======
++ struct alb_walk_data {
++ 	struct bonding *bond;
++ 	struct slave *slave;
++ 	u8 *mac_addr;
++ 	bool strict_match;
++ };
++ 
++ static int alb_upper_dev_walk(struct net_device *upper, void *_data)
++ {
++ 	struct alb_walk_data *data = _data;
++ 	bool strict_match = data->strict_match;
++ 	struct bonding *bond = data->bond;
++ 	struct slave *slave = data->slave;
++ 	u8 *mac_addr = data->mac_addr;
++ 	struct bond_vlan_tag *tags;
++ 
++ 	if (is_vlan_dev(upper) && vlan_get_encap_level(upper) == 0) {
++ 		if (strict_match &&
++ 		    ether_addr_equal_64bits(mac_addr,
++ 					    upper->dev_addr)) {
++ 			alb_send_lp_vid(slave, mac_addr,
++ 					vlan_dev_vlan_proto(upper),
++ 					vlan_dev_vlan_id(upper));
++ 		} else if (!strict_match) {
++ 			alb_send_lp_vid(slave, upper->dev_addr,
++ 					vlan_dev_vlan_proto(upper),
++ 					vlan_dev_vlan_id(upper));
++ 		}
++ 	}
++ 
++ 	/* If this is a macvlan device, then only send updates
++ 	 * when strict_match is turned off.
++ 	 */
++ 	if (netif_is_macvlan(upper) && !strict_match) {
++ 		tags = bond_verify_device_path(bond->dev, upper, 0);
++ 		if (IS_ERR_OR_NULL(tags))
++ 			BUG();
++ 		alb_send_lp_vid(slave, upper->dev_addr,
++ 				tags[0].vlan_proto, tags[0].vlan_id);
++ 		kfree(tags);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void alb_send_learning_packets(struct slave *slave, u8 mac_addr[],
++ 				      bool strict_match)
++ {
++ 	struct bonding *bond = bond_get_bond_by_slave(slave);
++ 	struct alb_walk_data data = {
++ 		.strict_match = strict_match,
++ 		.mac_addr = mac_addr,
++ 		.slave = slave,
++ 		.bond = bond,
++ 	};
+++>>>>>>> b3208b2024c9 (net: bonding: Flip to the new dev walk API)
+  
+  	/* send untagged */
+  	alb_send_lp_vid(slave, mac_addr, 0, 0);
+  
+ -	/* loop through all devices and see if we need to send a packet
+ -	 * for that device.
+ -	 */
+ +	/* loop through vlans and send one packet for each */
+  	rcu_read_lock();
+++<<<<<<< HEAD
+ +	netdev_for_each_all_upper_dev_rcu(bond->dev, upper, iter) {
+ +		if (upper->priv_flags & IFF_802_1Q_VLAN)
+ +			alb_send_lp_vid(slave, mac_addr,
+ +					vlan_dev_vlan_proto(upper),
+ +					vlan_dev_vlan_id(upper));
+ +	}
+++=======
++ 	netdev_walk_all_upper_dev_rcu(bond->dev, alb_upper_dev_walk, &data);
+++>>>>>>> b3208b2024c9 (net: bonding: Flip to the new dev walk API)
+  	rcu_read_unlock();
+  }
+  
+* Unmerged path drivers/net/bonding/bond_alb.c
+diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
+index 692a0616ceeb..2474675bd570 100644
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -2304,22 +2304,23 @@ re_arm:
+ 	}
+ }
+ 
++static int bond_upper_dev_walk(struct net_device *upper, void *data)
++{
++	__be32 ip = *((__be32 *)data);
++
++	return ip == bond_confirm_addr(upper, 0, ip);
++}
++
+ static bool bond_has_this_ip(struct bonding *bond, __be32 ip)
+ {
+-	struct net_device *upper;
+-	struct list_head *iter;
+ 	bool ret = false;
+ 
+ 	if (ip == bond_confirm_addr(bond->dev, 0, ip))
+ 		return true;
+ 
+ 	rcu_read_lock();
+-	netdev_for_each_all_upper_dev_rcu(bond->dev, upper, iter) {
+-		if (ip == bond_confirm_addr(upper, 0, ip)) {
+-			ret = true;
+-			break;
+-		}
+-	}
++	if (netdev_walk_all_upper_dev_rcu(bond->dev, bond_upper_dev_walk, &ip))
++		ret = true;
+ 	rcu_read_unlock();
+ 
+ 	return ret;
