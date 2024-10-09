@@ -1,0 +1,339 @@
+phy: fixed_phy: Add gpio to determine link up/down.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Andrew Lunn <andrew@lunn.ch>
+commit a5597008dbc230876db2d344561d634f4d52ea4a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/a5597008.failed
+
+An SFP module may have a link up/down status pin which can be
+connection to a GPIO line of the host. Add support for reading such an
+GPIO in the fixed_phy driver.
+
+	Signed-off-by: Andrew Lunn <andrew@lunn.ch>
+	Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a5597008dbc230876db2d344561d634f4d52ea4a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/devicetree/bindings/net/fixed-link.txt
+#	arch/mips/bcm47xx/setup.c
+#	drivers/net/ethernet/broadcom/genet/bcmmii.c
+#	drivers/net/phy/fixed_phy.c
+#	drivers/of/of_mdio.c
+#	include/linux/phy_fixed.h
+diff --cc arch/mips/bcm47xx/setup.c
+index b2246cd9ca12,17503a05938e..000000000000
+--- a/arch/mips/bcm47xx/setup.c
++++ b/arch/mips/bcm47xx/setup.c
+@@@ -237,6 -259,11 +237,14 @@@ static int __init bcm47xx_register_bus_
+  		break;
+  #endif
+  	}
+++<<<<<<< HEAD
+++=======
++ 	bcm47xx_buttons_register();
++ 	bcm47xx_leds_register();
++ 	bcm47xx_workarounds();
++ 
++ 	fixed_phy_add(PHY_POLL, 0, &bcm47xx_fixed_phy_status, -1);
+++>>>>>>> a5597008dbc2 (phy: fixed_phy: Add gpio to determine link up/down.)
+  	return 0;
+  }
+  device_initcall(bcm47xx_register_bus_complete);
+diff --cc drivers/net/phy/fixed_phy.c
+index 0b6b5e8ee74c,1bb70e3cc03e..000000000000
+--- a/drivers/net/phy/fixed_phy.c
++++ b/drivers/net/phy/fixed_phy.c
+@@@ -264,9 -283,10 +283,16 @@@ EXPORT_SYMBOL_GPL(fixed_phy_del)
+  static int phy_fixed_addr;
+  static DEFINE_SPINLOCK(phy_fixed_addr_lock);
+  
+++<<<<<<< HEAD
+ +int fixed_phy_register(unsigned int irq,
+ +		       struct fixed_phy_status *status,
+ +		       struct device_node *np)
+++=======
++ struct phy_device *fixed_phy_register(unsigned int irq,
++ 				      struct fixed_phy_status *status,
++ 				      int link_gpio,
++ 				      struct device_node *np)
+++>>>>>>> a5597008dbc2 (phy: fixed_phy: Add gpio to determine link up/down.)
+  {
+  	struct fixed_mdio_bus *fmb = &platform_fmb;
+  	struct phy_device *phy;
+@@@ -282,9 -302,9 +308,9 @@@
+  	phy_addr = phy_fixed_addr++;
+  	spin_unlock(&phy_fixed_addr_lock);
+  
+- 	ret = fixed_phy_add(PHY_POLL, phy_addr, status);
++ 	ret = fixed_phy_add(PHY_POLL, phy_addr, status, link_gpio);
+  	if (ret < 0)
+ -		return ERR_PTR(ret);
+ +		return ret;
+  
+  	phy = get_phy_device(fmb->mii_bus, phy_addr, false);
+  	if (!phy || IS_ERR(phy)) {
+diff --cc drivers/of/of_mdio.c
+index d5a57a9e329c,1350fa25cdb0..000000000000
+--- a/drivers/of/of_mdio.c
++++ b/drivers/of/of_mdio.c
+@@@ -14,7 -14,9 +14,8 @@@
+  #include <linux/netdevice.h>
+  #include <linux/err.h>
+  #include <linux/phy.h>
+ -#include <linux/phy_fixed.h>
+  #include <linux/of.h>
++ #include <linux/of_gpio.h>
+  #include <linux/of_irq.h>
+  #include <linux/of_mdio.h>
+  #include <linux/module.h>
+@@@ -211,39 -236,113 +212,135 @@@ struct phy_device *of_phy_connect(struc
+  EXPORT_SYMBOL(of_phy_connect);
+  
+  /**
+ - * of_phy_attach - Attach to a PHY without starting the state machine
+ + * of_phy_connect_fixed_link - Parse fixed-link property and return a dummy phy
+   * @dev: pointer to net_device claiming the phy
+ - * @phy_np: Node pointer for the PHY
+ - * @flags: flags to pass to the PHY
+ + * @hndlr: Link state callback for the network device
+   * @iface: PHY data interface type
+ + *
+ + * This function is a temporary stop-gap and will be removed soon.  It is
+ + * only to support the fs_enet, ucc_geth and gianfar Ethernet drivers.  Do
+ + * not call this function from new drivers.
+   */
+ -struct phy_device *of_phy_attach(struct net_device *dev,
+ -				 struct device_node *phy_np, u32 flags,
+ -				 phy_interface_t iface)
+ +struct phy_device *of_phy_connect_fixed_link(struct net_device *dev,
+ +					     void (*hndlr)(struct net_device *),
+ +					     phy_interface_t iface)
+  {
+ -	struct phy_device *phy = of_phy_find_device(phy_np);
+ +	struct device_node *net_np;
+ +	char bus_id[MII_BUS_ID_SIZE + 3];
+ +	struct phy_device *phy;
+ +	const __be32 *phy_id;
+ +	int sz;
+  
+ -	if (!phy)
+ +	if (!dev->dev.parent)
+ +		return NULL;
+ +
+ +	net_np = dev->dev.parent->of_node;
+ +	if (!net_np)
+  		return NULL;
+  
+ -	return phy_attach_direct(dev, phy, flags, iface) ? NULL : phy;
+ +	phy_id = of_get_property(net_np, "fixed-link", &sz);
+ +	if (!phy_id || sz < sizeof(*phy_id))
+ +		return NULL;
+ +
+ +	sprintf(bus_id, PHY_ID_FMT, "fixed-0", be32_to_cpu(phy_id[0]));
+ +
+ +	phy = phy_connect(dev, bus_id, hndlr, iface);
+ +	return IS_ERR(phy) ? NULL : phy;
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL(of_phy_connect_fixed_link);
+++=======
++ EXPORT_SYMBOL(of_phy_attach);
++ 
++ #if defined(CONFIG_FIXED_PHY)
++ /*
++  * of_phy_is_fixed_link() and of_phy_register_fixed_link() must
++  * support two DT bindings:
++  * - the old DT binding, where 'fixed-link' was a property with 5
++  *   cells encoding various informations about the fixed PHY
++  * - the new DT binding, where 'fixed-link' is a sub-node of the
++  *   Ethernet device.
++  */
++ bool of_phy_is_fixed_link(struct device_node *np)
++ {
++ 	struct device_node *dn;
++ 	int len, err;
++ 	const char *managed;
++ 
++ 	/* New binding */
++ 	dn = of_get_child_by_name(np, "fixed-link");
++ 	if (dn) {
++ 		of_node_put(dn);
++ 		return true;
++ 	}
++ 
++ 	err = of_property_read_string(np, "managed", &managed);
++ 	if (err == 0 && strcmp(managed, "auto") != 0)
++ 		return true;
++ 
++ 	/* Old binding */
++ 	if (of_get_property(np, "fixed-link", &len) &&
++ 	    len == (5 * sizeof(__be32)))
++ 		return true;
++ 
++ 	return false;
++ }
++ EXPORT_SYMBOL(of_phy_is_fixed_link);
++ 
++ int of_phy_register_fixed_link(struct device_node *np)
++ {
++ 	struct fixed_phy_status status = {};
++ 	struct device_node *fixed_link_node;
++ 	const __be32 *fixed_link_prop;
++ 	int link_gpio;
++ 	int len, err;
++ 	struct phy_device *phy;
++ 	const char *managed;
++ 
++ 	err = of_property_read_string(np, "managed", &managed);
++ 	if (err == 0) {
++ 		if (strcmp(managed, "in-band-status") == 0) {
++ 			/* status is zeroed, namely its .link member */
++ 			phy = fixed_phy_register(PHY_POLL, &status, -1, np);
++ 			return IS_ERR(phy) ? PTR_ERR(phy) : 0;
++ 		}
++ 	}
++ 
++ 	/* New binding */
++ 	fixed_link_node = of_get_child_by_name(np, "fixed-link");
++ 	if (fixed_link_node) {
++ 		status.link = 1;
++ 		status.duplex = of_property_read_bool(fixed_link_node,
++ 						      "full-duplex");
++ 		if (of_property_read_u32(fixed_link_node, "speed", &status.speed))
++ 			return -EINVAL;
++ 		status.pause = of_property_read_bool(fixed_link_node, "pause");
++ 		status.asym_pause = of_property_read_bool(fixed_link_node,
++ 							  "asym-pause");
++ 		link_gpio = of_get_named_gpio_flags(fixed_link_node,
++ 						    "link-gpios", 0, NULL);
++ 		of_node_put(fixed_link_node);
++ 		if (link_gpio == -EPROBE_DEFER)
++ 			return -EPROBE_DEFER;
++ 
++ 		phy = fixed_phy_register(PHY_POLL, &status, link_gpio, np);
++ 		return IS_ERR(phy) ? PTR_ERR(phy) : 0;
++ 	}
++ 
++ 	/* Old binding */
++ 	fixed_link_prop = of_get_property(np, "fixed-link", &len);
++ 	if (fixed_link_prop && len == (5 * sizeof(__be32))) {
++ 		status.link = 1;
++ 		status.duplex = be32_to_cpu(fixed_link_prop[1]);
++ 		status.speed = be32_to_cpu(fixed_link_prop[2]);
++ 		status.pause = be32_to_cpu(fixed_link_prop[3]);
++ 		status.asym_pause = be32_to_cpu(fixed_link_prop[4]);
++ 		phy = fixed_phy_register(PHY_POLL, &status, -1, np);
++ 		return IS_ERR(phy) ? PTR_ERR(phy) : 0;
++ 	}
++ 
++ 	return -ENODEV;
++ }
++ EXPORT_SYMBOL(of_phy_register_fixed_link);
++ #endif
+++>>>>>>> a5597008dbc2 (phy: fixed_phy: Add gpio to determine link up/down.)
+diff --cc include/linux/phy_fixed.h
+index 1ae156fd15c7,2400d2ea4f34..000000000000
+--- a/include/linux/phy_fixed.h
++++ b/include/linux/phy_fixed.h
+@@@ -13,10 -13,12 +13,19 @@@ struct device_node
+  
+  #if IS_ENABLED(CONFIG_FIXED_PHY)
+  extern int fixed_phy_add(unsigned int irq, int phy_id,
+++<<<<<<< HEAD
+ +			 struct fixed_phy_status *status);
+ +extern int fixed_phy_register(unsigned int irq,
+ +			      struct fixed_phy_status *status,
+ +			      struct device_node *np);
+++=======
++ 			 struct fixed_phy_status *status,
++ 			 int link_gpio);
++ extern struct phy_device *fixed_phy_register(unsigned int irq,
++ 					     struct fixed_phy_status *status,
++ 					     int link_gpio,
++ 					     struct device_node *np);
+++>>>>>>> a5597008dbc2 (phy: fixed_phy: Add gpio to determine link up/down.)
+  extern void fixed_phy_del(int phy_addr);
+  extern int fixed_phy_set_link_update(struct phy_device *phydev,
+  			int (*link_update)(struct net_device *,
+@@@ -30,11 -33,12 +40,18 @@@ static inline int fixed_phy_add(unsigne
+  {
+  	return -ENODEV;
+  }
+++<<<<<<< HEAD
+ +static inline int fixed_phy_register(unsigned int irq,
+ +				     struct fixed_phy_status *status,
+ +				     struct device_node *np)
+++=======
++ static inline struct phy_device *fixed_phy_register(unsigned int irq,
++ 						struct fixed_phy_status *status,
++ 						int gpio_link,
++ 						struct device_node *np)
+++>>>>>>> a5597008dbc2 (phy: fixed_phy: Add gpio to determine link up/down.)
+  {
+ -	return ERR_PTR(-ENODEV);
+ +	return -ENODEV;
+  }
+  static inline int fixed_phy_del(int phy_addr)
+  {
+* Unmerged path Documentation/devicetree/bindings/net/fixed-link.txt
+* Unmerged path drivers/net/ethernet/broadcom/genet/bcmmii.c
+* Unmerged path Documentation/devicetree/bindings/net/fixed-link.txt
+diff --git a/Documentation/networking/stmmac.txt b/Documentation/networking/stmmac.txt
+index 654d2e55c8cb..29fbc99f6ec0 100644
+--- a/Documentation/networking/stmmac.txt
++++ b/Documentation/networking/stmmac.txt
+@@ -246,7 +246,7 @@ static struct fixed_phy_status stmmac0_fixed_phy_status = {
+ 
+ During the board's device_init we can configure the first
+ MAC for fixed_link by calling:
+-  fixed_phy_add(PHY_POLL, 1, &stmmac0_fixed_phy_status));)
++  fixed_phy_add(PHY_POLL, 1, &stmmac0_fixed_phy_status, -1);
+ and the second one, with a real PHY device attached to the bus,
+ by using the stmmac_mdio_bus_data structure (to provide the id, the
+ reset procedure etc).
+diff --git a/arch/m68k/platform/coldfire/m5272.c b/arch/m68k/platform/coldfire/m5272.c
+index a8c5856fe5ec..af8eda14884a 100644
+--- a/arch/m68k/platform/coldfire/m5272.c
++++ b/arch/m68k/platform/coldfire/m5272.c
+@@ -124,7 +124,7 @@ static struct fixed_phy_status nettel_fixed_phy_status __initdata = {
+ static int __init init_BSP(void)
+ {
+ 	m5272_uarts_init();
+-	fixed_phy_add(PHY_POLL, 0, &nettel_fixed_phy_status);
++	fixed_phy_add(PHY_POLL, 0, &nettel_fixed_phy_status, -1);
+ 	return 0;
+ }
+ 
+diff --git a/arch/mips/ar7/platform.c b/arch/mips/ar7/platform.c
+index 7e2356fd5fd6..08f36136f3bd 100644
+--- a/arch/mips/ar7/platform.c
++++ b/arch/mips/ar7/platform.c
+@@ -683,7 +683,8 @@ static int __init ar7_register_devices(void)
+ 	}
+ 
+ 	if (ar7_has_high_cpmac()) {
+-		res = fixed_phy_add(PHY_POLL, cpmac_high.id, &fixed_phy_status);
++		res = fixed_phy_add(PHY_POLL, cpmac_high.id,
++				    &fixed_phy_status, -1);
+ 		if (!res) {
+ 			cpmac_get_mac(1, cpmac_high_data.dev_addr);
+ 
+@@ -695,7 +696,7 @@ static int __init ar7_register_devices(void)
+ 	} else
+ 		cpmac_low_data.phy_mask = 0xffffffff;
+ 
+-	res = fixed_phy_add(PHY_POLL, cpmac_low.id, &fixed_phy_status);
++	res = fixed_phy_add(PHY_POLL, cpmac_low.id, &fixed_phy_status, -1);
+ 	if (!res) {
+ 		cpmac_get_mac(0, cpmac_low_data.dev_addr);
+ 		res = platform_device_register(&cpmac_low);
+* Unmerged path arch/mips/bcm47xx/setup.c
+* Unmerged path drivers/net/ethernet/broadcom/genet/bcmmii.c
+* Unmerged path drivers/net/phy/fixed_phy.c
+* Unmerged path drivers/of/of_mdio.c
+* Unmerged path include/linux/phy_fixed.h
