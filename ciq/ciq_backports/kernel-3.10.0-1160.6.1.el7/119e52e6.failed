@@ -1,0 +1,196 @@
+netfilter: nf_queue: place bridge physports into queue_entry struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.6.1.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit 119e52e664c57d5f7c0174dc2b3a296b1e40591d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.6.1.el7/119e52e6.failed
+
+The refcount is done via entry->skb, which does work fine.
+Major problem: When putting the refcount of the bridge ports, we
+must always put the references while the skb is still around.
+
+However, we will need to put the references after okfn() to avoid
+a possible 1 -> 0 -> 1 refcount transition, so we cannot use the
+skb pointer anymore.
+
+Place the physports in the queue entry structure instead to allow
+for refcounting changes in the next patch.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 119e52e664c57d5f7c0174dc2b3a296b1e40591d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_queue.h
+#	net/netfilter/nf_queue.c
+diff --cc include/net/netfilter/nf_queue.h
+index d81d584157e1,e770bba00066..000000000000
+--- a/include/net/netfilter/nf_queue.h
++++ b/include/net/netfilter/nf_queue.h
+@@@ -10,8 -13,11 +10,16 @@@ struct nf_queue_entry 
+  	struct list_head	list;
+  	struct sk_buff		*skb;
+  	unsigned int		id;
+++<<<<<<< HEAD
+ +
+ +	struct nf_hook_ops	*elem;
+++=======
++ 	unsigned int		hook_index;	/* index in hook_entries->hook[] */
++ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
++ 	struct net_device	*physin;
++ 	struct net_device	*physout;
++ #endif
+++>>>>>>> 119e52e664c5 (netfilter: nf_queue: place bridge physports into queue_entry struct)
+  	struct nf_hook_state	state;
+  	u16			size; /* sizeof(entry) + saved route keys */
+  
+diff --cc net/netfilter/nf_queue.c
+index 2e88032cd5ad,96eb72908467..000000000000
+--- a/net/netfilter/nf_queue.c
++++ b/net/netfilter/nf_queue.c
+@@@ -46,7 -46,7 +46,11 @@@ void nf_unregister_queue_handler(void
+  }
+  EXPORT_SYMBOL(nf_unregister_queue_handler);
+  
+++<<<<<<< HEAD
+ +void nf_queue_entry_release_refs(struct nf_queue_entry *entry)
+++=======
++ static void nf_queue_entry_release_refs(struct nf_queue_entry *entry)
+++>>>>>>> 119e52e664c5 (netfilter: nf_queue: place bridge physports into queue_entry struct)
+  {
+  	struct nf_hook_state *state = &entry->state;
+  
+@@@ -57,25 -57,41 +61,57 @@@
+  		dev_put(state->out);
+  	if (state->sk)
+  		sock_put(state->sk);
+++<<<<<<< HEAD
+ +#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ +	if (entry->skb->nf_bridge) {
+ +		struct net_device *physdev;
+ +
+ +		physdev = nf_bridge_get_physindev(entry->skb);
+ +		if (physdev)
+ +			dev_put(physdev);
+ +		physdev = nf_bridge_get_physoutdev(entry->skb);
+ +		if (physdev)
+ +			dev_put(physdev);
+++=======
++ 
++ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
++ 	if (entry->physin)
++ 		dev_put(entry->physin);
++ 	if (entry->physout)
++ 		dev_put(entry->physout);
++ #endif
++ }
++ 
++ void nf_queue_entry_free(struct nf_queue_entry *entry)
++ {
++ 	nf_queue_entry_release_refs(entry);
++ 	kfree(entry);
++ }
++ EXPORT_SYMBOL_GPL(nf_queue_entry_free);
++ 
++ static void __nf_queue_entry_init_physdevs(struct nf_queue_entry *entry)
++ {
++ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
++ 	const struct sk_buff *skb = entry->skb;
++ 	struct nf_bridge_info *nf_bridge;
++ 
++ 	nf_bridge = nf_bridge_info_get(skb);
++ 	if (nf_bridge) {
++ 		entry->physin = nf_bridge_get_physindev(skb);
++ 		entry->physout = nf_bridge_get_physoutdev(skb);
++ 	} else {
++ 		entry->physin = NULL;
++ 		entry->physout = NULL;
+++>>>>>>> 119e52e664c5 (netfilter: nf_queue: place bridge physports into queue_entry struct)
+  	}
+  #endif
+ +	/* Drop reference to owner of hook which queued us. */
+ +	module_put(entry->elem->owner);
+  }
+ +EXPORT_SYMBOL_GPL(nf_queue_entry_release_refs);
+  
+  /* Bump dev refs so they don't vanish while packet is out */
+ -void nf_queue_entry_get_refs(struct nf_queue_entry *entry)
+ +bool nf_queue_entry_get_refs(struct nf_queue_entry *entry)
+  {
+  	struct nf_hook_state *state = &entry->state;
+  
+@@@ -88,20 -101,13 +124,29 @@@
+  		dev_hold(state->out);
+  	if (state->sk)
+  		sock_hold(state->sk);
+ +#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ +	if (entry->skb->nf_bridge) {
+ +		struct net_device *physdev;
+ +
+++<<<<<<< HEAD
+ +		physdev = nf_bridge_get_physindev(entry->skb);
+ +		if (physdev)
+ +			dev_hold(physdev);
+ +		physdev = nf_bridge_get_physoutdev(entry->skb);
+ +		if (physdev)
+ +			dev_hold(physdev);
+ +	}
+ +#endif
+  
+ +	return true;
+++=======
++ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
++ 	if (entry->physin)
++ 		dev_hold(entry->physin);
++ 	if (entry->physout)
++ 		dev_hold(entry->physout);
++ #endif
+++>>>>>>> 119e52e664c5 (netfilter: nf_queue: place bridge physports into queue_entry struct)
+  }
+  EXPORT_SYMBOL_GPL(nf_queue_entry_get_refs);
+  
+@@@ -140,21 -193,26 +185,35 @@@ int nf_queue(struct sk_buff *skb
+  
+  	*entry = (struct nf_queue_entry) {
+  		.skb	= skb,
+ +		.elem	= elem,
+  		.state	= *state,
+ -		.hook_index = index,
+ -		.size	= sizeof(*entry) + route_key_size,
+ +		.size	= sizeof(*entry) + afinfo->route_key_size,
+  	};
+  
+++<<<<<<< HEAD
+ +	if (!nf_queue_entry_get_refs(entry)) {
+ +		status = -ECANCELED;
+ +		goto err_unlock;
+++=======
++ 	__nf_queue_entry_init_physdevs(entry);
++ 
++ 	nf_queue_entry_get_refs(entry);
++ 
++ 	switch (entry->state.pf) {
++ 	case AF_INET:
++ 		nf_ip_saveroute(skb, entry);
++ 		break;
++ 	case AF_INET6:
++ 		nf_ip6_saveroute(skb, entry);
++ 		break;
+++>>>>>>> 119e52e664c5 (netfilter: nf_queue: place bridge physports into queue_entry struct)
+  	}
+ -
+ +	skb_dst_force(skb);
+ +	afinfo->saveroute(skb, entry);
+  	status = qh->outfn(entry, queuenum);
+  
+ +	rcu_read_unlock();
+ +
+  	if (status < 0) {
+  		nf_queue_entry_release_refs(entry);
+  		goto err;
+* Unmerged path include/net/netfilter/nf_queue.h
+* Unmerged path net/netfilter/nf_queue.c
