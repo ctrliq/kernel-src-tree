@@ -1,0 +1,100 @@
+seccomp: Switch from atomic_t to recount_t
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Kees Cook <keescook@chromium.org>
+commit 0b5fa2290637a3235898d18dc0e7a136783f1bd2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/0b5fa229.failed
+
+This switches the seccomp usage tracking from atomic_t to refcount_t to
+gain refcount overflow protections.
+
+	Cc: Elena Reshetova <elena.reshetova@intel.com>
+	Cc: David Windsor <dwindsor@gmail.com>
+	Cc: Hans Liljestrand <hans.liljestrand@aalto.fi>
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+(cherry picked from commit 0b5fa2290637a3235898d18dc0e7a136783f1bd2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/seccomp.c
+diff --cc kernel/seccomp.c
+index 42e55449c1a5,98b59b5db90b..000000000000
+--- a/kernel/seccomp.c
++++ b/kernel/seccomp.c
+@@@ -13,10 -13,12 +13,10 @@@
+   *        of Berkeley Packet Filters/Linux Socket Filters.
+   */
+  
+- #include <linux/atomic.h>
++ #include <linux/refcount.h>
+  #include <linux/audit.h>
+  #include <linux/compat.h>
+ -#include <linux/coredump.h>
+  #include <linux/sched.h>
+ -#include <linux/sched/task_stack.h>
+  #include <linux/seccomp.h>
+  #include <linux/slab.h>
+  #include <linux/syscalls.h>
+@@@ -54,10 -56,9 +54,10 @@@
+   * to a task_struct (other than @usage).
+   */
+  struct seccomp_filter {
+- 	atomic_t usage;
++ 	refcount_t usage;
+  	struct seccomp_filter *prev;
+ -	struct bpf_prog *prog;
+ +	unsigned short len;  /* Instruction count */
+ +	struct sock_filter insns[];
+  };
+  
+  /* Limit any path through the tree to 256KB worth of instructions. */
+@@@ -388,32 -367,20 +388,36 @@@ static struct seccomp_filter *seccomp_p
+  		return ERR_PTR(-EACCES);
+  
+  	/* Allocate a new seccomp_filter */
+ -	sfilter = kzalloc(sizeof(*sfilter), GFP_KERNEL | __GFP_NOWARN);
+ -	if (!sfilter)
+ +	filter = kzalloc(sizeof(struct seccomp_filter) + fp_size,
+ +			 GFP_KERNEL|__GFP_NOWARN);
+ +	if (!filter)
+  		return ERR_PTR(-ENOMEM);
+ +	atomic_set(&filter->usage, 1);
+ +	filter->len = fprog->len;
+  
+ -	ret = bpf_prog_create_from_user(&sfilter->prog, fprog,
+ -					seccomp_check_filter, save_orig);
+ -	if (ret < 0) {
+ -		kfree(sfilter);
+ -		return ERR_PTR(ret);
+ -	}
+ +	/* Copy the instructions from fprog. */
+ +	ret = -EFAULT;
+ +	if (copy_from_user(filter->insns, fprog->filter, fp_size))
+ +		goto fail;
+  
+++<<<<<<< HEAD
+ +	/* Check and rewrite the fprog via the skb checker */
+ +	ret = sk_chk_filter(filter->insns, filter->len);
+ +	if (ret)
+ +		goto fail;
+++=======
++ 	refcount_set(&sfilter->usage, 1);
+++>>>>>>> 0b5fa2290637 (seccomp: Switch from atomic_t to recount_t)
+ +
+ +	/* Check and rewrite the fprog for seccomp use */
+ +	ret = seccomp_check_filter(filter->insns, filter->len);
+ +	if (ret)
+ +		goto fail;
+  
+ -	return sfilter;
+ +	return filter;
+ +fail:
+ +	kfree(filter);
+ +	return ERR_PTR(ret);
+  }
+  
+  /**
+* Unmerged path kernel/seccomp.c
