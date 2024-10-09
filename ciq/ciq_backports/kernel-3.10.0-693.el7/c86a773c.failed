@@ -1,0 +1,341 @@
+sctp: add dst_pending_confirm flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Julian Anastasov <ja@ssi.bg>
+commit c86a773c78025f5b825bacd7b846f4fa60dc0317
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/c86a773c.failed
+
+Add new transport flag to allow sockets to confirm neighbour.
+When same struct dst_entry can be used for many different
+neighbours we can not use it for pending confirmations.
+The flag is propagated from transport to every packet.
+It is reset when cached dst is reset.
+
+	Reported-by: YueHaibing <yuehaibing@huawei.com>
+Fixes: 5110effee8fd ("net: Do delayed neigh confirmation.")
+Fixes: f2bb4bedf35d ("ipv4: Cache output routes in fib_info nexthops.")
+	Signed-off-by: Julian Anastasov <ja@ssi.bg>
+	Acked-by: Eric Dumazet <edumazet@google.com>
+	Acked-by: Neil Horman <nhorman@tuxdriver.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c86a773c78025f5b825bacd7b846f4fa60dc0317)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sctp/output.c
+diff --cc net/sctp/output.c
+index 02b6a1b39273,814eac047467..000000000000
+--- a/net/sctp/output.c
++++ b/net/sctp/output.c
+@@@ -728,27 -513,128 +728,150 @@@ int sctp_packet_transmit(struct sctp_pa
+  			sk_setup_caps(sk, tp->dst);
+  		}
+  		rcu_read_unlock();
+++<<<<<<< HEAD
+ +	}
+ +	head->ignore_df = packet->ipfragok;
+ +	tp->af_specific->sctp_xmit(head, tp);
+ +	goto out;
+++=======
++ 		goto chksum;
++ 	}
++ 
++ 	if (sctp_checksum_disable)
++ 		return 1;
++ 
++ 	if (!(skb_dst(head)->dev->features & NETIF_F_SCTP_CRC) ||
++ 	    dst_xfrm(skb_dst(head)) || packet->ipfragok) {
++ 		struct sctphdr *sh =
++ 			(struct sctphdr *)skb_transport_header(head);
++ 
++ 		sh->checksum = sctp_compute_cksum(head, 0);
++ 	} else {
++ chksum:
++ 		head->ip_summed = CHECKSUM_PARTIAL;
++ 		head->csum_start = skb_transport_header(head) - head->head;
++ 		head->csum_offset = offsetof(struct sctphdr, checksum);
++ 	}
++ 
++ 	return pkt_count;
++ }
++ 
++ /* All packets are sent to the network through this function from
++  * sctp_outq_tail().
++  *
++  * The return value is always 0 for now.
++  */
++ int sctp_packet_transmit(struct sctp_packet *packet, gfp_t gfp)
++ {
++ 	struct sctp_transport *tp = packet->transport;
++ 	struct sctp_association *asoc = tp->asoc;
++ 	struct sctp_chunk *chunk, *tmp;
++ 	int pkt_count, gso = 0;
++ 	int confirm;
++ 	struct dst_entry *dst;
++ 	struct sk_buff *head;
++ 	struct sctphdr *sh;
++ 	struct sock *sk;
++ 
++ 	pr_debug("%s: packet:%p\n", __func__, packet);
++ 	if (list_empty(&packet->chunk_list))
++ 		return 0;
++ 	chunk = list_entry(packet->chunk_list.next, struct sctp_chunk, list);
++ 	sk = chunk->skb->sk;
++ 
++ 	/* check gso */
++ 	if (packet->size > tp->pathmtu && !packet->ipfragok) {
++ 		if (!sk_can_gso(sk)) {
++ 			pr_err_once("Trying to GSO but underlying device doesn't support it.");
++ 			goto out;
++ 		}
++ 		gso = 1;
++ 	}
++ 
++ 	/* alloc head skb */
++ 	head = alloc_skb((gso ? packet->overhead : packet->size) +
++ 			 MAX_HEADER, gfp);
++ 	if (!head)
++ 		goto out;
++ 	skb_reserve(head, packet->overhead + MAX_HEADER);
++ 	sctp_packet_set_owner_w(head, sk);
++ 
++ 	/* set sctp header */
++ 	sh = (struct sctphdr *)skb_push(head, sizeof(struct sctphdr));
++ 	skb_reset_transport_header(head);
++ 	sh->source = htons(packet->source_port);
++ 	sh->dest = htons(packet->destination_port);
++ 	sh->vtag = htonl(packet->vtag);
++ 	sh->checksum = 0;
++ 
++ 	/* update dst if in need */
++ 	if (!sctp_transport_dst_check(tp)) {
++ 		sctp_transport_route(tp, NULL, sctp_sk(sk));
++ 		if (asoc && asoc->param_flags & SPP_PMTUD_ENABLE)
++ 			sctp_assoc_sync_pmtu(sk, asoc);
++ 	}
++ 	dst = dst_clone(tp->dst);
++ 	if (!dst) {
++ 		IP_INC_STATS(sock_net(sk), IPSTATS_MIB_OUTNOROUTES);
++ 		kfree_skb(head);
++ 		goto out;
++ 	}
++ 	skb_dst_set(head, dst);
++ 
++ 	/* pack up chunks */
++ 	pkt_count = sctp_packet_pack(packet, head, gso, gfp);
++ 	if (!pkt_count) {
++ 		kfree_skb(head);
++ 		goto out;
++ 	}
++ 	pr_debug("***sctp_transmit_packet*** skb->len:%d\n", head->len);
++ 
++ 	/* start autoclose timer */
++ 	if (packet->has_data && sctp_state(asoc, ESTABLISHED) &&
++ 	    asoc->timeouts[SCTP_EVENT_TIMEOUT_AUTOCLOSE]) {
++ 		struct timer_list *timer =
++ 			&asoc->timers[SCTP_EVENT_TIMEOUT_AUTOCLOSE];
++ 		unsigned long timeout =
++ 			asoc->timeouts[SCTP_EVENT_TIMEOUT_AUTOCLOSE];
++ 
++ 		if (!mod_timer(timer, jiffies + timeout))
++ 			sctp_association_hold(asoc);
++ 	}
++ 
++ 	/* sctp xmit */
++ 	tp->af_specific->ecn_capable(sk);
++ 	if (asoc) {
++ 		asoc->stats.opackets += pkt_count;
++ 		if (asoc->peer.last_sent_to != tp)
++ 			asoc->peer.last_sent_to = tp;
++ 	}
++ 	head->ignore_df = packet->ipfragok;
++ 	confirm = tp->dst_pending_confirm;
++ 	if (confirm)
++ 		skb_set_dst_pending_confirm(head, 1);
++ 	/* neighbour should be confirmed on successful transmission or
++ 	 * positive error
++ 	 */
++ 	if (tp->af_specific->sctp_xmit(head, tp) >= 0 && confirm)
++ 		tp->dst_pending_confirm = 0;
+++>>>>>>> c86a773c7802 (sctp: add dst_pending_confirm flag)
+ +
+ +nomem:
+ +	if (packet->auth && list_empty(&packet->auth->list))
+ +		sctp_chunk_free(packet->auth);
+ +
+ +nodst:
+ +	/* FIXME: Returning the 'err' will effect all the associations
+ +	 * associated with a socket, although only one of the paths of the
+ +	 * association is unreachable.
+ +	 * The real failure of a transport or association can be passed on
+ +	 * to the user via notifications. So setting this error may not be
+ +	 * required.
+ +	 */
+ +	 /* err = -EHOSTUNREACH; */
+ +	kfree_skb(head);
+  
+ -out:
+ +err:
+  	list_for_each_entry_safe(chunk, tmp, &packet->chunk_list, list) {
+  		list_del_init(&chunk->list);
+  		if (!sctp_chunk_is_data(chunk))
+diff --git a/include/net/sctp/sctp.h b/include/net/sctp/sctp.h
+index 5e1b0dc26470..87bd66d19804 100644
+--- a/include/net/sctp/sctp.h
++++ b/include/net/sctp/sctp.h
+@@ -593,10 +593,8 @@ static inline void sctp_v4_map_v6(union sctp_addr *addr)
+  */
+ static inline struct dst_entry *sctp_transport_dst_check(struct sctp_transport *t)
+ {
+-	if (t->dst && !dst_check(t->dst, t->dst_cookie)) {
+-		dst_release(t->dst);
+-		t->dst = NULL;
+-	}
++	if (t->dst && !dst_check(t->dst, t->dst_cookie))
++		sctp_transport_dst_release(t);
+ 
+ 	return t->dst;
+ }
+diff --git a/include/net/sctp/structs.h b/include/net/sctp/structs.h
+index b400f13631ff..082f3f7f015f 100644
+--- a/include/net/sctp/structs.h
++++ b/include/net/sctp/structs.h
+@@ -842,6 +842,8 @@ struct sctp_transport {
+ 
+ 	__u32 burst_limited;	/* Holds old cwnd when max.burst is applied */
+ 
++	__u32 dst_pending_confirm;	/* need to confirm neighbour */
++
+ 	/* Destination */
+ 	struct dst_entry *dst;
+ 	/* Source address. */
+@@ -985,6 +987,8 @@ unsigned long sctp_transport_timeout(struct sctp_transport *);
+ void sctp_transport_reset(struct sctp_transport *);
+ void sctp_transport_update_pmtu(struct sock *, struct sctp_transport *, u32);
+ void sctp_transport_immediate_rtx(struct sctp_transport *);
++void sctp_transport_dst_release(struct sctp_transport *t);
++void sctp_transport_dst_confirm(struct sctp_transport *t);
+ 
+ 
+ /* This is the structure we use to queue packets as they come into
+diff --git a/net/sctp/associola.c b/net/sctp/associola.c
+index db1964d5b61c..e8b96f6bddf5 100644
+--- a/net/sctp/associola.c
++++ b/net/sctp/associola.c
+@@ -824,8 +824,7 @@ void sctp_assoc_control_transport(struct sctp_association *asoc,
+ 		if (transport->state != SCTP_UNCONFIRMED)
+ 			transport->state = SCTP_INACTIVE;
+ 		else {
+-			dst_release(transport->dst);
+-			transport->dst = NULL;
++			sctp_transport_dst_release(transport);
+ 			ulp_notify = false;
+ 		}
+ 
+* Unmerged path net/sctp/output.c
+diff --git a/net/sctp/outqueue.c b/net/sctp/outqueue.c
+index 1f13c4abebe1..c506f5124006 100644
+--- a/net/sctp/outqueue.c
++++ b/net/sctp/outqueue.c
+@@ -1652,7 +1652,7 @@ static void sctp_check_transmitted(struct sctp_outq *q,
+ 
+ 		if (forward_progress) {
+ 			if (transport->dst)
+-				dst_confirm(transport->dst);
++				sctp_transport_dst_confirm(transport);
+ 		}
+ 	}
+ 
+diff --git a/net/sctp/sm_make_chunk.c b/net/sctp/sm_make_chunk.c
+index a2d162d7ff52..7899b210c7d1 100644
+--- a/net/sctp/sm_make_chunk.c
++++ b/net/sctp/sm_make_chunk.c
+@@ -3342,8 +3342,7 @@ static void sctp_asconf_param_success(struct sctp_association *asoc,
+ 		local_bh_enable();
+ 		list_for_each_entry(transport, &asoc->peer.transport_addr_list,
+ 				transports) {
+-			dst_release(transport->dst);
+-			transport->dst = NULL;
++			sctp_transport_dst_release(transport);
+ 		}
+ 		break;
+ 	case SCTP_PARAM_DEL_IP:
+@@ -3357,8 +3356,7 @@ static void sctp_asconf_param_success(struct sctp_association *asoc,
+ 		local_bh_enable();
+ 		list_for_each_entry(transport, &asoc->peer.transport_addr_list,
+ 				transports) {
+-			dst_release(transport->dst);
+-			transport->dst = NULL;
++			sctp_transport_dst_release(transport);
+ 		}
+ 		break;
+ 	default:
+diff --git a/net/sctp/sm_sideeffect.c b/net/sctp/sm_sideeffect.c
+index aac129da1023..16f1a694841a 100644
+--- a/net/sctp/sm_sideeffect.c
++++ b/net/sctp/sm_sideeffect.c
+@@ -730,7 +730,7 @@ static void sctp_cmd_transport_on(sctp_cmd_seq_t *cmds,
+ 	 * forward progress.
+ 	 */
+ 	if (t->dst)
+-		dst_confirm(t->dst);
++		sctp_transport_dst_confirm(t);
+ 
+ 	/* The receiver of the HEARTBEAT ACK should also perform an
+ 	 * RTT measurement for that destination transport address
+diff --git a/net/sctp/socket.c b/net/sctp/socket.c
+index 8996677c592f..623b0c99e294 100644
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@ -603,7 +603,7 @@ static int sctp_send_asconf_add_ip(struct sock		*sk,
+ 			list_for_each_entry(trans,
+ 			    &asoc->peer.transport_addr_list, transports) {
+ 				/* Clear the source and route cache */
+-				dst_release(trans->dst);
++				sctp_transport_dst_release(trans);
+ 				trans->cwnd = min(4*asoc->pathmtu, max_t(__u32,
+ 				    2*asoc->pathmtu, 4380));
+ 				trans->ssthresh = asoc->peer.i.a_rwnd;
+@@ -854,7 +854,7 @@ skip_mkasconf:
+ 		 */
+ 		list_for_each_entry(transport, &asoc->peer.transport_addr_list,
+ 					transports) {
+-			dst_release(transport->dst);
++			sctp_transport_dst_release(transport);
+ 			sctp_transport_route(transport, NULL,
+ 					     sctp_sk(asoc->base.sk));
+ 		}
+diff --git a/net/sctp/transport.c b/net/sctp/transport.c
+index 545086ee3a1d..0f69dc98d665 100644
+--- a/net/sctp/transport.c
++++ b/net/sctp/transport.c
+@@ -234,7 +234,7 @@ void sctp_transport_pmtu(struct sctp_transport *transport, struct sock *sk)
+ {
+ 	/* If we don't have a fresh route, look one up */
+ 	if (!transport->dst || transport->dst->obsolete) {
+-		dst_release(transport->dst);
++		sctp_transport_dst_release(transport);
+ 		transport->af_specific->get_dst(transport, &transport->saddr,
+ 						&transport->fl, sk);
+ 	}
+@@ -667,3 +667,17 @@ void sctp_transport_immediate_rtx(struct sctp_transport *t)
+ 	}
+ 	return;
+ }
++
++/* Drop dst */
++void sctp_transport_dst_release(struct sctp_transport *t)
++{
++	dst_release(t->dst);
++	t->dst = NULL;
++	t->dst_pending_confirm = 0;
++}
++
++/* Schedule neighbour confirm */
++void sctp_transport_dst_confirm(struct sctp_transport *t)
++{
++	t->dst_pending_confirm = 1;
++}
