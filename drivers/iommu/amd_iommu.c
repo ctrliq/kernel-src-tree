@@ -125,6 +125,7 @@ struct aperture_range {
 
 	/* address allocation bitmap */
 	unsigned long *bitmap;
+	unsigned long offset;
 
 	/*
 	 * Array of PTE pages for the aperture. In this array we save all the
@@ -133,8 +134,6 @@ struct aperture_range {
 	 * just calculate its address in constant time.
 	 */
 	u64 *pte_pages[64];
-
-	unsigned long offset;
 };
 
 /*
