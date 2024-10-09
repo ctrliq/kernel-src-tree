@@ -1,0 +1,187 @@
+i40e: ensure reset occurs when disabling VF
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit d43d60e5eb9504aa6f8f390aa0313cc8e3816b82
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d43d60e5.failed
+
+It is possible although rare that we may not reset when
+i40e_vc_disable_vf() is called. This can lead to some weird
+circumstances with some values not being properly set. Modify
+i40e_reset_vf() to return a code indicating whether it reset or not.
+
+Now, i40e_vc_disable_vf() can wait until a reset actually occurs. If it
+fails to free up within a reasonable time frame we'll display a warning
+message.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit d43d60e5eb9504aa6f8f390aa0313cc8e3816b82)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+#	drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.h
+diff --cc drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+index 03267d08aeed,7742cf3d38d9..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+@@@ -1037,9 -1077,11 +1053,17 @@@ bool i40e_reset_vf(struct i40e_vf *vf, 
+  	u32 reg;
+  	int i;
+  
+++<<<<<<< HEAD
+ +	/* If VFs have been disabled, there is no need to reset */
+ +	if (test_and_set_bit(__I40E_VF_DISABLE, &pf->state))
+ +		return;
+++=======
++ 	/* If the VFs have been disabled, this means something else is
++ 	 * resetting the VF, so we shouldn't continue.
++ 	 */
++ 	if (test_and_set_bit(__I40E_VF_DISABLE, pf->state))
++ 		return false;
+++>>>>>>> d43d60e5eb95 (i40e: ensure reset occurs when disabling VF)
+  
+  	i40e_trigger_vf_reset(vf, flr);
+  
+@@@ -1075,7 -1117,113 +1099,117 @@@
+  	i40e_cleanup_reset_vf(vf);
+  
+  	i40e_flush(hw);
+++<<<<<<< HEAD
+ +	clear_bit(__I40E_VF_DISABLE, &pf->state);
+++=======
++ 	clear_bit(__I40E_VF_DISABLE, pf->state);
++ 
++ 	return true;
++ }
++ 
++ /**
++  * i40e_reset_all_vfs
++  * @pf: pointer to the PF structure
++  * @flr: VFLR was issued or not
++  *
++  * Reset all allocated VFs in one go. First, tell the hardware to reset each
++  * VF, then do all the waiting in one chunk, and finally finish restoring each
++  * VF after the wait. This is useful during PF routines which need to reset
++  * all VFs, as otherwise it must perform these resets in a serialized fashion.
++  *
++  * Returns true if any VFs were reset, and false otherwise.
++  **/
++ bool i40e_reset_all_vfs(struct i40e_pf *pf, bool flr)
++ {
++ 	struct i40e_hw *hw = &pf->hw;
++ 	struct i40e_vf *vf;
++ 	int i, v;
++ 	u32 reg;
++ 
++ 	/* If we don't have any VFs, then there is nothing to reset */
++ 	if (!pf->num_alloc_vfs)
++ 		return false;
++ 
++ 	/* If VFs have been disabled, there is no need to reset */
++ 	if (test_and_set_bit(__I40E_VF_DISABLE, pf->state))
++ 		return false;
++ 
++ 	/* Begin reset on all VFs at once */
++ 	for (v = 0; v < pf->num_alloc_vfs; v++)
++ 		i40e_trigger_vf_reset(&pf->vf[v], flr);
++ 
++ 	/* HW requires some time to make sure it can flush the FIFO for a VF
++ 	 * when it resets it. Poll the VPGEN_VFRSTAT register for each VF in
++ 	 * sequence to make sure that it has completed. We'll keep track of
++ 	 * the VFs using a simple iterator that increments once that VF has
++ 	 * finished resetting.
++ 	 */
++ 	for (i = 0, v = 0; i < 10 && v < pf->num_alloc_vfs; i++) {
++ 		usleep_range(10000, 20000);
++ 
++ 		/* Check each VF in sequence, beginning with the VF to fail
++ 		 * the previous check.
++ 		 */
++ 		while (v < pf->num_alloc_vfs) {
++ 			vf = &pf->vf[v];
++ 			reg = rd32(hw, I40E_VPGEN_VFRSTAT(vf->vf_id));
++ 			if (!(reg & I40E_VPGEN_VFRSTAT_VFRD_MASK))
++ 				break;
++ 
++ 			/* If the current VF has finished resetting, move on
++ 			 * to the next VF in sequence.
++ 			 */
++ 			v++;
++ 		}
++ 	}
++ 
++ 	if (flr)
++ 		usleep_range(10000, 20000);
++ 
++ 	/* Display a warning if at least one VF didn't manage to reset in
++ 	 * time, but continue on with the operation.
++ 	 */
++ 	if (v < pf->num_alloc_vfs)
++ 		dev_err(&pf->pdev->dev, "VF reset check timeout on VF %d\n",
++ 			pf->vf[v].vf_id);
++ 	usleep_range(10000, 20000);
++ 
++ 	/* Begin disabling all the rings associated with VFs, but do not wait
++ 	 * between each VF.
++ 	 */
++ 	for (v = 0; v < pf->num_alloc_vfs; v++) {
++ 		/* On initial reset, we don't have any queues to disable */
++ 		if (pf->vf[v].lan_vsi_idx == 0)
++ 			continue;
++ 
++ 		i40e_vsi_stop_rings_no_wait(pf->vsi[pf->vf[v].lan_vsi_idx]);
++ 	}
++ 
++ 	/* Now that we've notified HW to disable all of the VF rings, wait
++ 	 * until they finish.
++ 	 */
++ 	for (v = 0; v < pf->num_alloc_vfs; v++) {
++ 		/* On initial reset, we don't have any queues to disable */
++ 		if (pf->vf[v].lan_vsi_idx == 0)
++ 			continue;
++ 
++ 		i40e_vsi_wait_queues_disabled(pf->vsi[pf->vf[v].lan_vsi_idx]);
++ 	}
++ 
++ 	/* Hw may need up to 50ms to finish disabling the RX queues. We
++ 	 * minimize the wait by delaying only once for all VFs.
++ 	 */
++ 	mdelay(50);
++ 
++ 	/* Finish the reset on each VF */
++ 	for (v = 0; v < pf->num_alloc_vfs; v++)
++ 		i40e_cleanup_reset_vf(&pf->vf[v]);
++ 
++ 	i40e_flush(hw);
++ 	clear_bit(__I40E_VF_DISABLE, pf->state);
++ 
++ 	return true;
+++>>>>>>> d43d60e5eb95 (i40e: ensure reset occurs when disabling VF)
+  }
+  
+  /**
+diff --cc drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.h
+index 8227923dbc7f,5ea42ad094bc..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.h
++++ b/drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.h
+@@@ -125,7 -122,8 +125,12 @@@ int i40e_alloc_vfs(struct i40e_pf *pf, 
+  int i40e_vc_process_vf_msg(struct i40e_pf *pf, s16 vf_id, u32 v_opcode,
+  			   u32 v_retval, u8 *msg, u16 msglen);
+  int i40e_vc_process_vflr_event(struct i40e_pf *pf);
+++<<<<<<< HEAD
+ +void i40e_reset_vf(struct i40e_vf *vf, bool flr);
+++=======
++ bool i40e_reset_vf(struct i40e_vf *vf, bool flr);
++ bool i40e_reset_all_vfs(struct i40e_pf *pf, bool flr);
+++>>>>>>> d43d60e5eb95 (i40e: ensure reset occurs when disabling VF)
+  void i40e_vc_notify_vf_reset(struct i40e_vf *vf);
+  
+  /* VF configuration related iplink handlers */
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.h
