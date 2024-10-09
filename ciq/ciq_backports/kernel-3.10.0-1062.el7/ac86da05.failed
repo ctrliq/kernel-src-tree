@@ -1,0 +1,201 @@
+nfp: interpret extended FW load result codes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit ac86da05463dc91af3741540663d864ba9287071
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/ac86da05.failed
+
+To enable easier FW distribution NFP can now automatically
+select between FW stored on the flash and loaded from the
+kernel.
+
+If FW loading policy is set to auto it will compare the
+versions of FW from the host and from the flash and load
+the newer one.  If FW type doesn't match (e.g. one advanced
+application vs another) the FW from the host takes precedence,
+unless one of them is the basic NIC firmware, in which case
+the non-basic-NIC FW is selected.
+
+This automatic selection mechanism requires we inform user
+what the verdict was.  Print a message to the logs explaining
+the decision and the reason.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ac86da05463dc91af3741540663d864ba9287071)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c
+index 5bdba6046915,9eb7b5a91bb1..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c
+@@@ -127,6 -131,40 +130,43 @@@ struct nfp_nsp 
+  	void *entries;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * struct nfp_nsp_command_arg - NFP command argument structure
++  * @code:	NFP SP Command Code
++  * @timeout_sec:Timeout value to wait for completion in seconds
++  * @option:	NFP SP Command Argument
++  * @buff_cpp:	NFP SP Buffer CPP Address info
++  * @buff_addr:	NFP SP Buffer Host address
++  * @error_cb:	Callback for interpreting option if error occurred
++  */
++ struct nfp_nsp_command_arg {
++ 	u16 code;
++ 	unsigned int timeout_sec;
++ 	u32 option;
++ 	u32 buff_cpp;
++ 	u64 buff_addr;
++ 	void (*error_cb)(struct nfp_nsp *state, u32 ret_val);
++ };
++ 
++ /**
++  * struct nfp_nsp_command_buf_arg - NFP command with buffer argument structure
++  * @arg:	NFP command argument structure
++  * @in_buf:	Buffer with data for input
++  * @in_size:	Size of @in_buf
++  * @out_buf:	Buffer for output data
++  * @out_size:	Size of @out_buf
++  */
++ struct nfp_nsp_command_buf_arg {
++ 	struct nfp_nsp_command_arg arg;
++ 	const void *in_buf;
++ 	unsigned int in_size;
++ 	void *out_buf;
++ 	unsigned int out_size;
++ };
++ 
+++>>>>>>> ac86da05463d (nfp: interpret extended FW load result codes)
+  struct nfp_cpp *nfp_nsp_cpp(struct nfp_nsp *state)
+  {
+  	return state->cpp;
+@@@ -372,8 -405,11 +412,16 @@@ __nfp_nsp_command(struct nfp_nsp *state
+  	err = FIELD_GET(NSP_STATUS_RESULT, reg);
+  	if (err) {
+  		nfp_warn(cpp, "Result (error) code set: %d (%d) command: %d\n",
+++<<<<<<< HEAD
+ +			 -err, (int)ret_val, code);
+ +		nfp_nsp_print_extended_error(state, ret_val);
+++=======
++ 			 -err, (int)ret_val, arg->code);
++ 		if (arg->error_cb)
++ 			arg->error_cb(state, ret_val);
++ 		else
++ 			nfp_nsp_print_extended_error(state, ret_val);
+++>>>>>>> ac86da05463d (nfp: interpret extended FW load result codes)
+  		return -err;
+  	}
+  
+@@@ -506,13 -535,81 +554,86 @@@ int nfp_nsp_device_soft_reset(struct nf
+  
+  int nfp_nsp_mac_reinit(struct nfp_nsp *state)
+  {
+ -	return nfp_nsp_command(state, SPCODE_MAC_INIT);
+ +	return nfp_nsp_command(state, SPCODE_MAC_INIT, 0, 0, 0);
+  }
+  
++ static void nfp_nsp_load_fw_extended_msg(struct nfp_nsp *state, u32 ret_val)
++ {
++ 	static const char * const major_msg[] = {
++ 		/* 0 */ "Firmware from driver loaded",
++ 		/* 1 */ "Firmware from flash loaded",
++ 		/* 2 */ "Firmware loading failure",
++ 	};
++ 	static const char * const minor_msg[] = {
++ 		/*  0 */ "",
++ 		/*  1 */ "no named partition on flash",
++ 		/*  2 */ "error reading from flash",
++ 		/*  3 */ "can not deflate",
++ 		/*  4 */ "not a trusted file",
++ 		/*  5 */ "can not parse FW file",
++ 		/*  6 */ "MIP not found in FW file",
++ 		/*  7 */ "null firmware name in MIP",
++ 		/*  8 */ "FW version none",
++ 		/*  9 */ "FW build number none",
++ 		/* 10 */ "no FW selection policy HWInfo key found",
++ 		/* 11 */ "static FW selection policy",
++ 		/* 12 */ "FW version has precedence",
++ 		/* 13 */ "different FW application load requested",
++ 		/* 14 */ "development build",
++ 	};
++ 	unsigned int major, minor;
++ 	const char *level;
++ 
++ 	major = FIELD_GET(NFP_FW_LOAD_RET_MAJOR, ret_val);
++ 	minor = FIELD_GET(NFP_FW_LOAD_RET_MINOR, ret_val);
++ 
++ 	if (!nfp_nsp_has_stored_fw_load(state))
++ 		return;
++ 
++ 	/* Lower the message level in legacy case */
++ 	if (major == 0 && (minor == 0 || minor == 10))
++ 		level = KERN_DEBUG;
++ 	else if (major == 2)
++ 		level = KERN_ERR;
++ 	else
++ 		level = KERN_INFO;
++ 
++ 	if (major >= ARRAY_SIZE(major_msg))
++ 		nfp_printk(level, state->cpp, "FW loading status: %x\n",
++ 			   ret_val);
++ 	else if (minor >= ARRAY_SIZE(minor_msg))
++ 		nfp_printk(level, state->cpp, "%s, reason code: %d\n",
++ 			   major_msg[major], minor);
++ 	else
++ 		nfp_printk(level, state->cpp, "%s%c %s\n",
++ 			   major_msg[major], minor ? ',' : '.',
++ 			   minor_msg[minor]);
++ }
++ 
+  int nfp_nsp_load_fw(struct nfp_nsp *state, const struct firmware *fw)
+  {
+++<<<<<<< HEAD
+ +	return nfp_nsp_command_buf(state, SPCODE_FW_LOAD, fw->size, fw->data,
+ +				   fw->size, NULL, 0);
+++=======
++ 	struct nfp_nsp_command_buf_arg load_fw = {
++ 		{
++ 			.code		= SPCODE_FW_LOAD,
++ 			.option		= fw->size,
++ 			.error_cb	= nfp_nsp_load_fw_extended_msg,
++ 		},
++ 		.in_buf		= fw->data,
++ 		.in_size	= fw->size,
++ 	};
++ 	int ret;
++ 
++ 	ret = nfp_nsp_command_buf(state, &load_fw);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	nfp_nsp_load_fw_extended_msg(state, ret);
++ 	return 0;
+++>>>>>>> ac86da05463d (nfp: interpret extended FW load result codes)
+  }
+  
+  int nfp_nsp_write_flash(struct nfp_nsp *state, const struct firmware *fw)
+diff --git a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpp.h b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpp.h
+index 278f3035c908..b156b8bda827 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpp.h
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpp.h
+@@ -57,6 +57,9 @@
+ 	dev_info(nfp_cpp_device(cpp)->parent, NFP_SUBSYS ": " fmt, ## args)
+ #define nfp_dbg(cpp, fmt, args...) \
+ 	dev_dbg(nfp_cpp_device(cpp)->parent, NFP_SUBSYS ": " fmt, ## args)
++#define nfp_printk(level, cpp, fmt, args...) \
++	dev_printk(level, nfp_cpp_device(cpp)->parent,	\
++		   NFP_SUBSYS ": " fmt,	## args)
+ 
+ #define PCI_64BIT_BAR_COUNT             3
+ 
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c
