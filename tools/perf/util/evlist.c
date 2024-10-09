@@ -1706,7 +1706,7 @@ void perf_evlist__toggle_bkw_mmap(struct perf_evlist *evlist,
 	switch (old_state) {
 	case BKW_MMAP_NOTREADY: {
 		if (state != BKW_MMAP_RUNNING)
-			goto state_err;;
+			goto state_err;
 		break;
 	}
 	case BKW_MMAP_RUNNING: {
