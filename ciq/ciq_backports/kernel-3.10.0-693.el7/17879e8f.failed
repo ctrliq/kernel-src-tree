@@ -1,0 +1,103 @@
+xfs: fix locking for DAX writes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 17879e8f865f4ed8b6f9041a2687ad40f13ae460
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/17879e8f.failed
+
+So far DAX writes inherited the locking from direct I/O writes, but
+the direct I/O model of using shared locks for writes is actually
+wrong for DAX.  For direct I/O we're out of any standards and don't
+have to provide the Posix required exclusion between writers, but
+for DAX which gets transparently enable on applications without any
+knowledge of it we can't simply drop the requirement.  Even worse
+this only happens for aligned writes and thus doesn't show up for
+many typical use cases.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 17879e8f865f4ed8b6f9041a2687ad40f13ae460)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+diff --cc fs/xfs/xfs_file.c
+index 815d8f3721f9,62649ccdbb4d..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -869,10 -699,63 +869,67 @@@ out
+  	xfs_rw_iunlock(ip, iolock);
+  
+  	/*
+ -	 * No fallback to buffered IO on errors for XFS, direct IO will either
+ -	 * complete fully or fail.
+ +	 * No fallback to buffered IO on errors for XFS. DAX can result in
+ +	 * partial writes, but direct IO will either complete fully or fail.
+  	 */
+++<<<<<<< HEAD
+ +	ASSERT(ret < 0 || ret == count || IS_DAX(VFS_I(ip)));
+++=======
++ 	ASSERT(ret < 0 || ret == count);
++ 	return ret;
++ }
++ 
++ static noinline ssize_t
++ xfs_file_dax_write(
++ 	struct kiocb		*iocb,
++ 	struct iov_iter		*from)
++ {
++ 	struct address_space	*mapping = iocb->ki_filp->f_mapping;
++ 	struct inode		*inode = mapping->host;
++ 	struct xfs_inode	*ip = XFS_I(inode);
++ 	ssize_t			ret = 0;
++ 	int			iolock = XFS_IOLOCK_EXCL;
++ 	struct iov_iter		data;
++ 
++ 	xfs_rw_ilock(ip, iolock);
++ 	ret = xfs_file_aio_write_checks(iocb, from, &iolock);
++ 	if (ret)
++ 		goto out;
++ 
++ 	/*
++ 	 * Yes, even DAX files can have page cache attached to them:  A zeroed
++ 	 * page is inserted into the pagecache when we have to serve a write
++ 	 * fault on a hole.  It should never be dirtied and can simply be
++ 	 * dropped from the pagecache once we get real data for the page.
++ 	 *
++ 	 * XXX: This is racy against mmap, and there's nothing we can do about
++ 	 * it. dax_do_io() should really do this invalidation internally as
++ 	 * it will know if we've allocated over a holei for this specific IO and
++ 	 * if so it needs to update the mapping tree and invalidate existing
++ 	 * PTEs over the newly allocated range. Remove this invalidation when
++ 	 * dax_do_io() is fixed up.
++ 	 */
++ 	if (mapping->nrpages) {
++ 		loff_t end = iocb->ki_pos + iov_iter_count(from) - 1;
++ 
++ 		ret = invalidate_inode_pages2_range(mapping,
++ 						    iocb->ki_pos >> PAGE_SHIFT,
++ 						    end >> PAGE_SHIFT);
++ 		WARN_ON_ONCE(ret);
++ 	}
++ 
++ 	trace_xfs_file_dax_write(ip, iov_iter_count(from), iocb->ki_pos);
++ 
++ 	data = *from;
++ 	ret = dax_do_io(iocb, inode, &data, xfs_get_blocks_direct,
++ 			xfs_end_io_direct_write, 0);
++ 	if (ret > 0) {
++ 		iocb->ki_pos += ret;
++ 		iov_iter_advance(from, ret);
++ 	}
++ out:
++ 	xfs_rw_iunlock(ip, iolock);
+++>>>>>>> 17879e8f865f (xfs: fix locking for DAX writes)
+  	return ret;
+  }
+  
+* Unmerged path fs/xfs/xfs_file.c
