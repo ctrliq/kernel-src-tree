@@ -1,0 +1,339 @@
+Revert "x86/apic: Ignore secondary threads if nosmt=force"
+
+jira LE-1907
+cve CVE-2018-3620
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 506a66f374891ff08e064a058c446b336c5ac760
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/506a66f3.failed
+
+Dave Hansen reported, that it's outright dangerous to keep SMT siblings
+disabled completely so they are stuck in the BIOS and wait for SIPI.
+
+The reason is that Machine Check Exceptions are broadcasted to siblings and
+the soft disabled sibling has CR4.MCE = 0. If a MCE is delivered to a
+logical core with CR4.MCE = 0, it asserts IERR#, which shuts down or
+reboots the machine. The MCE chapter in the SDM contains the following
+blurb:
+
+    Because the logical processors within a physical package are tightly
+    coupled with respect to shared hardware resources, both logical
+    processors are notified of machine check errors that occur within a
+    given physical processor. If machine-check exceptions are enabled when
+    a fatal error is reported, all the logical processors within a physical
+    package are dispatched to the machine-check exception handler. If
+    machine-check exceptions are disabled, the logical processors enter the
+    shutdown state and assert the IERR# signal. When enabling machine-check
+    exceptions, the MCE flag in control register CR4 should be set for each
+    logical processor.
+
+Reverting the commit which ignores siblings at enumeration time solves only
+half of the problem. The core cpuhotplug logic needs to be adjusted as
+well.
+
+This thoughtful engineered mechanism also turns the boot process on all
+Intel HT enabled systems into a MCE lottery. MCE is enabled on the boot CPU
+before the secondary CPUs are brought up. Depending on the number of
+physical cores the window in which this situation can happen is smaller or
+larger. On a HSW-EX it's about 750ms:
+
+MCE is enabled on the boot CPU:
+
+[    0.244017] mce: CPU supports 22 MCE banks
+
+The corresponding sibling #72 boots:
+
+[    1.008005] .... node  #0, CPUs:    #72
+
+That means if an MCE hits on physical core 0 (logical CPUs 0 and 72)
+between these two points the machine is going to shutdown. At least it's a
+known safe state.
+
+It's obvious that the early boot can be hit by an MCE as well and then runs
+into the same situation because MCEs are not yet enabled on the boot CPU.
+But after enabling them on the boot CPU, it does not make any sense to
+prevent the kernel from recovering.
+
+Adjust the nosmt kernel parameter documentation as well.
+
+Reverts: 2207def700f9 ("x86/apic: Ignore secondary threads if nosmt=force")
+	Reported-by: Dave Hansen <dave.hansen@intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Tested-by: Tony Luck <tony.luck@intel.com>
+
+(cherry picked from commit 506a66f374891ff08e064a058c446b336c5ac760)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/kernel-parameters.txt
+#	arch/x86/include/asm/apic.h
+#	arch/x86/kernel/apic/apic.c
+diff --cc Documentation/kernel-parameters.txt
+index a0f1f1428af0,5da7b0b30432..000000000000
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@@ -2203,6 -2684,13 +2203,16 @@@ bytes respectively. Such letter suffixe
+  
+  	nohugeiomap	[KNL,x86] Disable kernel huge I/O mappings.
+  
+++<<<<<<< HEAD:Documentation/kernel-parameters.txt
+++=======
++ 	nosmt		[KNL,S390] Disable symmetric multithreading (SMT).
++ 			Equivalent to smt=1.
++ 
++ 			[KNL,x86] Disable symmetric multithreading (SMT).
++ 			nosmt=force: Force disable SMT, cannot be undone
++ 				     via the sysfs control file.
++ 
+++>>>>>>> 506a66f37489 (Revert "x86/apic: Ignore secondary threads if nosmt=force"):Documentation/admin-guide/kernel-parameters.txt
+  	nospectre_v2	[X86] Disable all mitigations for the Spectre variant 2
+  			(indirect branch prediction) vulnerability. System may
+  			allow data leaks with this option, which is equivalent
+diff --cc arch/x86/include/asm/apic.h
+index 83a199eb0bee,9362a3aae927..000000000000
+--- a/arch/x86/include/asm/apic.h
++++ b/arch/x86/include/asm/apic.h
+@@@ -561,137 -488,26 +561,144 @@@ static inline unsigned int read_apic_id
+  	return apic->get_apic_id(reg);
+  }
+  
+ -extern int default_apic_id_valid(u32 apicid);
+ +static inline int default_apic_id_valid(int apicid)
+ +{
+ +	return (apicid < 255);
+ +}
+ +
+  extern int default_acpi_madt_oem_check(char *, char *);
+ +
+  extern void default_setup_apic_routing(void);
+  
+ -extern u32 apic_default_calc_apicid(unsigned int cpu);
+ -extern u32 apic_flat_calc_apicid(unsigned int cpu);
+ +extern struct apic apic_noop;
+ +
+ +#ifdef CONFIG_X86_32
+  
+ -extern bool default_check_apicid_used(physid_mask_t *map, int apicid);
+ -extern void default_ioapic_phys_id_map(physid_mask_t *phys_map, physid_mask_t *retmap);
+ -extern int default_cpu_present_to_apicid(int mps_cpu);
+ -extern int default_check_phys_apicid_present(int phys_apicid);
+ +static inline int noop_x86_32_early_logical_apicid(int cpu)
+ +{
+ +	return BAD_APICID;
+ +}
+  
+ -#endif /* CONFIG_X86_LOCAL_APIC */
+ +/*
+ + * Set up the logical destination ID.
+ + *
+ + * Intel recommends to set DFR, LDR and TPR before enabling
+ + * an APIC.  See e.g. "AP-388 82489DX User's Manual" (Intel
+ + * document number 292116).  So here it goes...
+ + */
+ +extern void default_init_apic_ldr(void);
+  
+ +static inline int default_apic_id_registered(void)
+ +{
+ +	return physid_isset(read_apic_id(), phys_cpu_present_map);
+ +}
+ +
+ +static inline int default_phys_pkg_id(int cpuid_apic, int index_msb)
+ +{
+ +	return cpuid_apic >> index_msb;
+ +}
+ +
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_SMP
++ bool apic_id_is_primary_thread(unsigned int id);
++ #else
++ static inline bool apic_id_is_primary_thread(unsigned int id) { return false; }
+++>>>>>>> 506a66f37489 (Revert "x86/apic: Ignore secondary threads if nosmt=force")
+  #endif
+  
+ +static inline int
+ +flat_cpu_mask_to_apicid_and(const struct cpumask *cpumask,
+ +			    const struct cpumask *andmask,
+ +			    unsigned int *apicid)
+ +{
+ +	unsigned long cpu_mask = cpumask_bits(cpumask)[0] &
+ +				 cpumask_bits(andmask)[0] &
+ +				 cpumask_bits(cpu_online_mask)[0] &
+ +				 APIC_ALL_CPUS;
+ +
+ +	if (likely(cpu_mask)) {
+ +		*apicid = (unsigned int)cpu_mask;
+ +		return 0;
+ +	} else {
+ +		return -EINVAL;
+ +	}
+ +}
+ +
+ +extern int
+ +default_cpu_mask_to_apicid_and(const struct cpumask *cpumask,
+ +			       const struct cpumask *andmask,
+ +			       unsigned int *apicid);
+ +
+ +static inline void
+ +flat_vector_allocation_domain(int cpu, struct cpumask *retmask,
+ +			      const struct cpumask *mask)
+ +{
+ +	/* Careful. Some cpus do not strictly honor the set of cpus
+ +	 * specified in the interrupt destination when using lowest
+ +	 * priority interrupt delivery mode.
+ +	 *
+ +	 * In particular there was a hyperthreading cpu observed to
+ +	 * deliver interrupts to the wrong hyperthread when only one
+ +	 * hyperthread was specified in the interrupt desitination.
+ +	 */
+ +	cpumask_clear(retmask);
+ +	cpumask_bits(retmask)[0] = APIC_ALL_CPUS;
+ +}
+ +
+ +static inline void
+ +default_vector_allocation_domain(int cpu, struct cpumask *retmask,
+ +				 const struct cpumask *mask)
+ +{
+ +	cpumask_copy(retmask, cpumask_of(cpu));
+ +}
+ +
+ +static inline unsigned long default_check_apicid_used(physid_mask_t *map, int apicid)
+ +{
+ +	return physid_isset(apicid, *map);
+ +}
+ +
+ +static inline unsigned long default_check_apicid_present(int bit)
+ +{
+ +	return physid_isset(bit, phys_cpu_present_map);
+ +}
+ +
+ +static inline void default_ioapic_phys_id_map(physid_mask_t *phys_map, physid_mask_t *retmap)
+ +{
+ +	*retmap = *phys_map;
+ +}
+ +
+ +static inline int __default_cpu_present_to_apicid(int mps_cpu)
+ +{
+ +	if (mps_cpu < nr_cpu_ids && cpu_present(mps_cpu))
+ +		return (int)per_cpu(x86_bios_cpu_apicid, mps_cpu);
+ +	else
+ +		return BAD_APICID;
+ +}
+ +
+ +static inline int
+ +__default_check_phys_apicid_present(int phys_apicid)
+ +{
+ +	return physid_isset(phys_apicid, phys_cpu_present_map);
+ +}
+ +
+ +#ifdef CONFIG_X86_32
+ +static inline int default_cpu_present_to_apicid(int mps_cpu)
+ +{
+ +	return __default_cpu_present_to_apicid(mps_cpu);
+ +}
+ +
+ +static inline int
+ +default_check_phys_apicid_present(int phys_apicid)
+ +{
+ +	return __default_check_phys_apicid_present(phys_apicid);
+ +}
+ +#else
+ +extern int default_cpu_present_to_apicid(int mps_cpu);
+ +extern int default_check_phys_apicid_present(int phys_apicid);
+ +#endif
+ +
+ +#endif /* CONFIG_X86_LOCAL_APIC */
+  extern void irq_enter(void);
+  extern void irq_exit(void);
+  
+diff --cc arch/x86/kernel/apic/apic.c
+index 3cb4ee28fa8c,8703caa9d6db..000000000000
+--- a/arch/x86/kernel/apic/apic.c
++++ b/arch/x86/kernel/apic/apic.c
+@@@ -2230,6 -2172,67 +2230,70 @@@ void disconnect_bsp_APIC(int virt_wire_
+  	apic_write(APIC_LVT1, value);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * The number of allocated logical CPU IDs. Since logical CPU IDs are allocated
++  * contiguously, it equals to current allocated max logical CPU ID plus 1.
++  * All allocated CPU IDs should be in the [0, nr_logical_cpuids) range,
++  * so the maximum of nr_logical_cpuids is nr_cpu_ids.
++  *
++  * NOTE: Reserve 0 for BSP.
++  */
++ static int nr_logical_cpuids = 1;
++ 
++ /*
++  * Used to store mapping between logical CPU IDs and APIC IDs.
++  */
++ static int cpuid_to_apicid[] = {
++ 	[0 ... NR_CPUS - 1] = -1,
++ };
++ 
++ /**
++  * apic_id_is_primary_thread - Check whether APIC ID belongs to a primary thread
++  * @id:	APIC ID to check
++  */
++ bool apic_id_is_primary_thread(unsigned int apicid)
++ {
++ 	u32 mask;
++ 
++ 	if (smp_num_siblings == 1)
++ 		return true;
++ 	/* Isolate the SMT bit(s) in the APICID and check for 0 */
++ 	mask = (1U << (fls(smp_num_siblings) - 1)) - 1;
++ 	return !(apicid & mask);
++ }
++ 
++ /*
++  * Should use this API to allocate logical CPU IDs to keep nr_logical_cpuids
++  * and cpuid_to_apicid[] synchronized.
++  */
++ static int allocate_logical_cpuid(int apicid)
++ {
++ 	int i;
++ 
++ 	/*
++ 	 * cpuid <-> apicid mapping is persistent, so when a cpu is up,
++ 	 * check if the kernel has allocated a cpuid for it.
++ 	 */
++ 	for (i = 0; i < nr_logical_cpuids; i++) {
++ 		if (cpuid_to_apicid[i] == apicid)
++ 			return i;
++ 	}
++ 
++ 	/* Allocate a new cpuid. */
++ 	if (nr_logical_cpuids >= nr_cpu_ids) {
++ 		WARN_ONCE(1, "APIC: NR_CPUS/possible_cpus limit of %u reached. "
++ 			     "Processor %d/0x%x and the rest are ignored.\n",
++ 			     nr_cpu_ids, nr_logical_cpuids, apicid);
++ 		return -EINVAL;
++ 	}
++ 
++ 	cpuid_to_apicid[nr_logical_cpuids] = apicid;
++ 	return nr_logical_cpuids++;
++ }
++ 
+++>>>>>>> 506a66f37489 (Revert "x86/apic: Ignore secondary threads if nosmt=force")
+  int generic_processor_info(int apicid, int version)
+  {
+  	int cpu, max = nr_cpu_ids;
+@@@ -2297,7 -2299,6 +2361,10 @@@
+  		return -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+ +	num_processors++;
+++=======
+++>>>>>>> 506a66f37489 (Revert "x86/apic: Ignore secondary threads if nosmt=force")
+  	if (apicid == boot_cpu_physical_apicid) {
+  		/*
+  		 * x86_bios_cpu_apicid is required to have processors listed
+* Unmerged path Documentation/kernel-parameters.txt
+* Unmerged path arch/x86/include/asm/apic.h
+* Unmerged path arch/x86/kernel/apic/apic.c
