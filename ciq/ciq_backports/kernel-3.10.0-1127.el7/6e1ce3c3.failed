@@ -1,0 +1,195 @@
+af_unix: split 'u->readlock' into two: 'iolock' and 'bindlock'
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Linus Torvalds <torvalds@linux-foundation.org>
+commit 6e1ce3c3451291142a57c4f3f6f999a29fb5b3bc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/6e1ce3c3.failed
+
+Right now we use the 'readlock' both for protecting some of the af_unix
+IO path and for making the bind be single-threaded.
+
+The two are independent, but using the same lock makes for a nasty
+deadlock due to ordering with regards to filesystem locking.  The bind
+locking would want to nest outside the VSF pathname locking, but the IO
+locking wants to nest inside some of those same locks.
+
+We tried to fix this earlier with commit c845acb324aa ("af_unix: Fix
+splice-bind deadlock") which moved the readlock inside the vfs locks,
+but that caused problems with overlayfs that will then call back into
+filesystem routines that take the lock in the wrong order anyway.
+
+Splitting the locks means that we can go back to having the bind lock be
+the outermost lock, and we don't have any deadlocks with lock ordering.
+
+	Acked-by: Rainer Weikusat <rweikusat@cyberadapt.com>
+	Acked-by: Al Viro <viro@zeniv.linux.org.uk>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+	Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6e1ce3c3451291142a57c4f3f6f999a29fb5b3bc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/unix/af_unix.c
+diff --cc net/unix/af_unix.c
+index 90b2f6104917,8309687a56b0..000000000000
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@@ -2035,9 -2033,9 +2036,9 @@@ alloc_skb
+  	}
+  
+  	unix_state_unlock(other);
+- 	mutex_unlock(&unix_sk(other)->readlock);
++ 	mutex_unlock(&unix_sk(other)->iolock);
+  
+ -	other->sk_data_ready(other);
+ +	other->sk_data_ready(other, 0);
+  	scm_destroy(&scm);
+  	return size;
+  
+@@@ -2112,19 -2107,25 +2113,39 @@@ static int unix_dgram_recvmsg(struct ki
+  	if (flags&MSG_OOB)
+  		goto out;
+  
+ -	timeo = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
+ +	err = mutex_lock_interruptible(&u->readlock);
+ +	if (unlikely(err)) {
+ +		/* recvmsg() in non blocking mode is supposed to return -EAGAIN
+ +		 * sk_rcvtimeo is not honored by mutex_lock_interruptible()
+ +		 */
+ +		err = noblock ? -EAGAIN : -ERESTARTSYS;
+ +		goto out;
+ +	}
+ +
+++<<<<<<< HEAD
+ +	skip = sk_peek_offset(sk, flags);
+  
+ +	skb = __skb_recv_datagram(sk, flags, NULL, &peeked, &skip, &err);
+ +	if (!skb) {
+++=======
++ 	do {
++ 		mutex_lock(&u->iolock);
++ 
++ 		skip = sk_peek_offset(sk, flags);
++ 		skb = __skb_try_recv_datagram(sk, flags, &peeked, &skip, &err,
++ 					      &last);
++ 		if (skb)
++ 			break;
++ 
++ 		mutex_unlock(&u->iolock);
++ 
++ 		if (err != -EAGAIN)
++ 			break;
++ 	} while (timeo &&
++ 		 !__skb_wait_for_more_packets(sk, &err, &timeo, last));
++ 
++ 	if (!skb) { /* implies iolock unlocked */
+++>>>>>>> 6e1ce3c34512 (af_unix: split 'u->readlock' into two: 'iolock' and 'bindlock')
+  		unix_state_lock(sk);
+  		/* Signal EOF on disconnected non-blocking SEQPACKET socket. */
+  		if (sk->sk_type == SOCK_SEQPACKET && err == -EAGAIN &&
+@@@ -2189,8 -2190,7 +2210,12 @@@
+  
+  out_free:
+  	skb_free_datagram(sk, skb);
+++<<<<<<< HEAD
+ +out_unlock:
+ +	mutex_unlock(&u->readlock);
+++=======
++ 	mutex_unlock(&u->iolock);
+++>>>>>>> 6e1ce3c34512 (af_unix: split 'u->readlock' into two: 'iolock' and 'bindlock')
+  out:
+  	return err;
+  }
+@@@ -2291,19 -2285,12 +2316,23 @@@ static int unix_stream_read_generic(str
+  	/* Lock the socket to prevent queue disordering
+  	 * while sleeps in memcpy_tomsg
+  	 */
+++<<<<<<< HEAD
+++=======
++ 	mutex_lock(&u->iolock);
+++>>>>>>> 6e1ce3c34512 (af_unix: split 'u->readlock' into two: 'iolock' and 'bindlock')
+  
+ -	if (flags & MSG_PEEK)
+ -		skip = sk_peek_offset(sk, flags);
+ -	else
+ -		skip = 0;
+ +	if (!siocb->scm) {
+ +		siocb->scm = &tmp_scm;
+ +		memset(&tmp_scm, 0, sizeof(tmp_scm));
+ +	}
+ +	err = mutex_lock_interruptible(&u->readlock);
+ +	if (unlikely(err)) {
+ +		/* recvmsg() in non blocking mode is supposed to return -EAGAIN
+ +		 * sk_rcvtimeo is not honored by mutex_lock_interruptible()
+ +		 */
+ +		err = noblock ? -EAGAIN : -ERESTARTSYS;
+ +		goto out;
+ +	}
+  
+  	do {
+  		int chunk;
+@@@ -2334,10 -2322,12 +2363,16 @@@ again
+  				goto unlock;
+  
+  			unix_state_unlock(sk);
+ -			if (!timeo) {
+ -				err = -EAGAIN;
+ +			err = -EAGAIN;
+ +			if (!timeo)
+  				break;
+++<<<<<<< HEAD
+ +			mutex_unlock(&u->readlock);
+++=======
++ 			}
++ 
++ 			mutex_unlock(&u->iolock);
+++>>>>>>> 6e1ce3c34512 (af_unix: split 'u->readlock' into two: 'iolock' and 'bindlock')
+  
+  			timeo = unix_stream_data_wait(sk, timeo, last,
+  						      last_len);
+@@@ -2348,7 -2337,9 +2383,12 @@@
+  				goto out;
+  			}
+  
+++<<<<<<< HEAD
+ +			continue;
+++=======
++ 			mutex_lock(&u->iolock);
++ 			goto redo;
+++>>>>>>> 6e1ce3c34512 (af_unix: split 'u->readlock' into two: 'iolock' and 'bindlock')
+  unlock:
+  			unix_state_unlock(sk);
+  			break;
+@@@ -2439,11 -2441,11 +2479,11 @@@
+  		}
+  	} while (size);
+  
+- 	mutex_unlock(&u->readlock);
++ 	mutex_unlock(&u->iolock);
+  	if (state->msg)
+ -		scm_recv(sock, state->msg, &scm, flags);
+ +		scm_recv(sock, state->msg, siocb->scm, flags);
+  	else
+ -		scm_destroy(&scm);
+ +		scm_destroy(siocb->scm);
+  out:
+  	return copied ? : err;
+  }
+diff --git a/include/net/af_unix.h b/include/net/af_unix.h
+index bec811d94d68..4f975b0e6fae 100644
+--- a/include/net/af_unix.h
++++ b/include/net/af_unix.h
+@@ -53,7 +53,7 @@ struct unix_sock {
+ 	struct sock		sk;
+ 	struct unix_address     *addr;
+ 	struct path		path;
+-	struct mutex		readlock;
++	struct mutex		iolock, bindlock;
+ 	struct sock		*peer;
+ 	struct list_head	link;
+ 	atomic_long_t		inflight;
+* Unmerged path net/unix/af_unix.c
