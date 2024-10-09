@@ -1,0 +1,315 @@
+s390/zcrypt: hex string mask improvements for apmask and aqmask.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [s390] zcrypt: hex string mask improvements for apmask and aqmask (Hendrik Brueckner) [1641030]
+Rebuild_FUZZ: 95.08%
+commit-author Harald Freudenberger <freude@linux.ibm.com>
+commit 3d8f60d38e249f989a7fca9c2370c31c3d5487e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/3d8f60d3.failed
+
+The sysfs attributes /sys/bus/ap/apmask and /sys/bus/ap/aqmask
+and the kernel command line arguments ap.apm and ap.aqm get
+an improvement of the value parsing with this patch:
+
+The mask values are bitmaps in big endian order starting with bit 0.
+So adapter number 0 is the leftmost bit, mask is 0x8000... The sysfs
+attributes and the kernel command line accept 2 different formats:
+ - Absolute hex string starting with 0x like "0x12345678" does set
+   the mask starting from left to right. If the given string is shorter
+   than the mask it is padded with 0s on the right. If the string is
+   longer than the mask an error comes back (EINVAL).
+ - Relative format - a concatenation (done with ',') of the terms
+   +<bitnr>[-<bitnr>] or -<bitnr>[-<bitnr>]. <bitnr> may be any
+   valid number (hex, decimal or octal) in the range 0...255.
+   Here are some examples:
+     "+0-15,+32,-128,-0xFF"
+     "-0-255,+1-16,+0x128"
+
+	Signed-off-by: Harald Freudenberger <freude@linux.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 3d8f60d38e249f989a7fca9c2370c31c3d5487e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/ap_bus.c
+diff --cc drivers/s390/crypto/ap_bus.c
+index eec227533e4a,ec891bc7d10a..000000000000
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@@ -791,9 -856,164 +791,167 @@@ void ap_bus_force_rescan(void
+  }
+  EXPORT_SYMBOL(ap_bus_force_rescan);
+  
++ /*
++  * hex2bitmap() - parse hex mask string and set bitmap.
++  * Valid strings are "0x012345678" with at least one valid hex number.
++  * Rest of the bitmap to the right is padded with 0. No spaces allowed
++  * within the string, the leading 0x may be omitted.
++  * Returns the bitmask with exactly the bits set as given by the hex
++  * string (both in big endian order).
++  */
+++<<<<<<< HEAD
+++=======
++ static int hex2bitmap(const char *str, unsigned long *bitmap, int bits)
++ {
++ 	int i, n, b;
++ 
++ 	/* bits needs to be a multiple of 8 */
++ 	if (bits & 0x07)
++ 		return -EINVAL;
++ 
++ 	memset(bitmap, 0, bits / 8);
++ 
++ 	if (str[0] == '0' && str[1] == 'x')
++ 		str++;
++ 	if (*str == 'x')
++ 		str++;
++ 
++ 	for (i = 0; isxdigit(*str) && i < bits; str++) {
++ 		b = hex_to_bin(*str);
++ 		for (n = 0; n < 4; n++)
++ 			if (b & (0x08 >> n))
++ 				set_bit_inv(i + n, bitmap);
++ 		i += 4;
++ 	}
++ 
++ 	if (*str == '\n')
++ 		str++;
++ 	if (*str)
++ 		return -EINVAL;
++ 	return 0;
++ }
++ 
++ /*
++  * str2clrsetmasks() - parse bitmask argument and set the clear and
++  * the set bitmap mask. A concatenation (done with ',') of these terms
++  * is recognized:
++  *   +<bitnr>[-<bitnr>] or -<bitnr>[-<bitnr>]
++  * <bitnr> may be any valid number (hex, decimal or octal) in the range
++  * 0...bits-1; the leading + or - is required. Here are some examples:
++  *   +0-15,+32,-128,-0xFF
++  *   -0-255,+1-16,+0x128
++  *   +1,+2,+3,+4,-5,-7-10
++  * Returns a clear and a set bitmask. Every positive value in the string
++  * results in a bit set in the set mask and every negative value in the
++  * string results in a bit SET in the clear mask. As a bit may be touched
++  * more than once, the last 'operation' wins: +0-255,-128 = all but bit
++  * 128 set in the set mask, only bit 128 set in the clear mask.
++  */
++ static int str2clrsetmasks(const char *str,
++ 			   unsigned long *clrmap,
++ 			   unsigned long *setmap,
++ 			   int bits)
++ {
++ 	int a, i, z;
++ 	char *np, sign;
++ 
++ 	/* bits needs to be a multiple of 8 */
++ 	if (bits & 0x07)
++ 		return -EINVAL;
++ 
++ 	memset(clrmap, 0, bits / 8);
++ 	memset(setmap, 0, bits / 8);
++ 
++ 	while (*str) {
++ 		sign = *str++;
++ 		if (sign != '+' && sign != '-')
++ 			return -EINVAL;
++ 		a = z = simple_strtoul(str, &np, 0);
++ 		if (str == np || a >= bits)
++ 			return -EINVAL;
++ 		str = np;
++ 		if (*str == '-') {
++ 			z = simple_strtoul(++str, &np, 0);
++ 			if (str == np || a > z || z >= bits)
++ 				return -EINVAL;
++ 			str = np;
++ 		}
++ 		for (i = a; i <= z; i++)
++ 			if (sign == '+') {
++ 				set_bit_inv(i, setmap);
++ 				clear_bit_inv(i, clrmap);
++ 			} else {
++ 				clear_bit_inv(i, setmap);
++ 				set_bit_inv(i, clrmap);
++ 			}
++ 		while (*str == ',' || *str == '\n')
++ 			str++;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * process_mask_arg() - parse a bitmap string and clear/set the
++  * bits in the bitmap accordingly. The string may be given as
++  * absolute value, a hex string like 0x1F2E3D4C5B6A" simple over-
++  * writing the current content of the bitmap. Or as relative string
++  * like "+1-16,-32,-0x40,+128" where only single bits or ranges of
++  * bits are cleared or set. Distinction is done based on the very
++  * first character which may be '+' or '-' for the relative string
++  * and othewise assume to be an absolute value string. If parsing fails
++  * a negative errno value is returned. All arguments and bitmaps are
++  * big endian order.
++  */
++ static int process_mask_arg(const char *str,
++ 			    unsigned long *bitmap, int bits,
++ 			    struct mutex *lock)
++ {
++ 	int i;
++ 
++ 	/* bits needs to be a multiple of 8 */
++ 	if (bits & 0x07)
++ 		return -EINVAL;
++ 
++ 	if (*str == '+' || *str == '-') {
++ 		DECLARE_BITMAP(clrm, bits);
++ 		DECLARE_BITMAP(setm, bits);
++ 
++ 		i = str2clrsetmasks(str, clrm, setm, bits);
++ 		if (i)
++ 			return i;
++ 		if (mutex_lock_interruptible(lock))
++ 			return -ERESTARTSYS;
++ 		for (i = 0; i < bits; i++) {
++ 			if (test_bit_inv(i, clrm))
++ 				clear_bit_inv(i, bitmap);
++ 			if (test_bit_inv(i, setm))
++ 				set_bit_inv(i, bitmap);
++ 		}
++ 	} else {
++ 		DECLARE_BITMAP(setm, bits);
++ 
++ 		i = hex2bitmap(str, setm, bits);
++ 		if (i)
++ 			return i;
++ 		if (mutex_lock_interruptible(lock))
++ 			return -ERESTARTSYS;
++ 		for (i = 0; i < bits; i++)
++ 			if (test_bit_inv(i, setm))
++ 				set_bit_inv(i, bitmap);
++ 			else
++ 				clear_bit_inv(i, bitmap);
++ 	}
++ 	mutex_unlock(lock);
++ 
++ 	return 0;
++ }
++ 
+  /*
+   * AP bus attributes.
+   */
++ 
+++>>>>>>> 3d8f60d38e24 (s390/zcrypt: hex string mask improvements for apmask and aqmask.)
+  static ssize_t ap_domain_show(struct bus_type *bus, char *buf)
+  {
+  	return snprintf(buf, PAGE_SIZE, "%d\n", ap_domain_index);
+@@@ -940,7 -1159,69 +1098,73 @@@ static ssize_t ap_max_domain_id_show(st
+  	return snprintf(buf, PAGE_SIZE, "%d\n", max_domain_id);
+  }
+  
+++<<<<<<< HEAD
+ +static BUS_ATTR(ap_max_domain_id, 0444, ap_max_domain_id_show, NULL);
+++=======
++ static BUS_ATTR_RO(ap_max_domain_id);
++ 
++ static ssize_t apmask_show(struct bus_type *bus, char *buf)
++ {
++ 	int rc;
++ 
++ 	if (mutex_lock_interruptible(&ap_perms_mutex))
++ 		return -ERESTARTSYS;
++ 	rc = snprintf(buf, PAGE_SIZE,
++ 		      "0x%016lx%016lx%016lx%016lx\n",
++ 		      ap_perms.apm[0], ap_perms.apm[1],
++ 		      ap_perms.apm[2], ap_perms.apm[3]);
++ 	mutex_unlock(&ap_perms_mutex);
++ 
++ 	return rc;
++ }
++ 
++ static ssize_t apmask_store(struct bus_type *bus, const char *buf,
++ 			    size_t count)
++ {
++ 	int rc;
++ 
++ 	rc = process_mask_arg(buf, ap_perms.apm, AP_DEVICES, &ap_perms_mutex);
++ 	if (rc)
++ 		return rc;
++ 
++ 	ap_bus_revise_bindings();
++ 
++ 	return count;
++ }
++ 
++ static BUS_ATTR_RW(apmask);
++ 
++ static ssize_t aqmask_show(struct bus_type *bus, char *buf)
++ {
++ 	int rc;
++ 
++ 	if (mutex_lock_interruptible(&ap_perms_mutex))
++ 		return -ERESTARTSYS;
++ 	rc = snprintf(buf, PAGE_SIZE,
++ 		      "0x%016lx%016lx%016lx%016lx\n",
++ 		      ap_perms.aqm[0], ap_perms.aqm[1],
++ 		      ap_perms.aqm[2], ap_perms.aqm[3]);
++ 	mutex_unlock(&ap_perms_mutex);
++ 
++ 	return rc;
++ }
++ 
++ static ssize_t aqmask_store(struct bus_type *bus, const char *buf,
++ 			    size_t count)
++ {
++ 	int rc;
++ 
++ 	rc = process_mask_arg(buf, ap_perms.aqm, AP_DOMAINS, &ap_perms_mutex);
++ 	if (rc)
++ 		return rc;
++ 
++ 	ap_bus_revise_bindings();
++ 
++ 	return count;
++ }
++ 
++ static BUS_ATTR_RW(aqmask);
+++>>>>>>> 3d8f60d38e24 (s390/zcrypt: hex string mask improvements for apmask and aqmask.)
+  
+  static struct bus_attribute *const ap_bus_attrs[] = {
+  	&bus_attr_ap_domain,
+@@@ -1257,9 -1513,25 +1481,29 @@@ int __init ap_debug_init(void
+  	return 0;
+  }
+  
+ -static void __init ap_perms_init(void)
+ +void ap_debug_exit(void)
+  {
+++<<<<<<< HEAD
+ +	debug_unregister(ap_dbf_info);
+++=======
++ 	/* all resources useable if no kernel parameter string given */
++ 	memset(&ap_perms.apm, 0xFF, sizeof(ap_perms.apm));
++ 	memset(&ap_perms.aqm, 0xFF, sizeof(ap_perms.aqm));
++ 
++ 	/* apm kernel parameter string */
++ 	if (apm_str) {
++ 		memset(&ap_perms.apm, 0, sizeof(ap_perms.apm));
++ 		process_mask_arg(apm_str, ap_perms.apm, AP_DEVICES,
++ 				 &ap_perms_mutex);
++ 	}
++ 
++ 	/* aqm kernel parameter string */
++ 	if (aqm_str) {
++ 		memset(&ap_perms.aqm, 0, sizeof(ap_perms.aqm));
++ 		process_mask_arg(aqm_str, ap_perms.aqm, AP_DOMAINS,
++ 				 &ap_perms_mutex);
++ 	}
+++>>>>>>> 3d8f60d38e24 (s390/zcrypt: hex string mask improvements for apmask and aqmask.)
+  }
+  
+  /**
+* Unmerged path drivers/s390/crypto/ap_bus.c
