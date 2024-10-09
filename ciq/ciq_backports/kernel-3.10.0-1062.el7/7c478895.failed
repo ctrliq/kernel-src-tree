@@ -1,0 +1,378 @@
+x86/uaccess, sched/preempt: Verify access_ok() context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 7c4788950ba5922fde976d80b72baf46f14dee8d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/7c478895.failed
+
+I recently encountered wreckage because access_ok() was used where it
+should not be, add an explicit WARN when access_ok() is used wrongly.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: linux-kernel@vger.kernel.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 7c4788950ba5922fde976d80b72baf46f14dee8d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/uaccess.h
+#	include/linux/preempt.h
+diff --cc arch/x86/include/asm/uaccess.h
+index b17c2f4a26f6,ea148313570f..000000000000
+--- a/arch/x86/include/asm/uaccess.h
++++ b/arch/x86/include/asm/uaccess.h
+@@@ -49,15 -46,34 +49,21 @@@
+  
+  #define __range_not_ok(addr, size, limit)				\
+  ({									\
+ +	unsigned long flag, roksum;					\
+  	__chk_user_ptr(addr);						\
+ -	__chk_range_not_ok((unsigned long __force)(addr), size, limit); \
+ +	asm("add %3,%1 ; sbb %0,%0 ; cmp %1,%4 ; sbb $0,%0"		\
+ +	    : "=&r" (flag), "=r" (roksum)				\
+ +	    : "1" (addr), "g" ((long)(size)),				\
+ +	      "rm" (limit));						\
+ +	flag;								\
+  })
+  
++ #ifdef CONFIG_DEBUG_ATOMIC_SLEEP
++ # define WARN_ON_IN_IRQ()	WARN_ON_ONCE(!in_task())
++ #else
++ # define WARN_ON_IN_IRQ()
++ #endif
++ 
+  /**
+   * access_ok: - Checks if a user space pointer is valid
+   * @type: Type of access: %VERIFY_READ or %VERIFY_WRITE.  Note that
+@@@ -77,42 -94,11 +83,50 @@@
+   * checks that the pointer is in the user space range - after calling
+   * this function, memory access functions may still return -EFAULT.
+   */
+++<<<<<<< HEAD
+ +#define access_ok(type, addr, size) \
+ +	(likely(__range_not_ok(addr, size, user_addr_max()) == 0))
+ +
+ +/*
+ + * The exception table consists of pairs of addresses relative to the
+ + * exception table enty itself: the first is the address of an
+ + * instruction that is allowed to fault, and the second is the address
+ + * at which the program should continue.  No registers are modified,
+ + * so it is entirely up to the continuation code to figure out what to
+ + * do.
+ + *
+ + * All the routines below use bits of fixup code that are out of line
+ + * with the main instruction path.  This means when everything is well,
+ + * we don't even have to jump over them.  Further, they do not intrude
+ + * on our cache or tlb entries.
+ + */
+ +
+ +struct exception_table_entry {
+ +	int insn, fixup;
+ +};
+ +
+ +/*
+ + * Special exception table used for memcpy_mcsafe()
+ + */
+ +struct mc_exception_table_entry {
+ +	int insn, fixup, handler;
+ +};
+ +extern int mc_fixup_exception(struct pt_regs *regs, int trapnr);
+ +extern bool ex_has_fault_handler(unsigned long ip);
+ +
+ +/* This is not the generic standard exception_table_entry format */
+ +#define ARCH_HAS_SORT_EXTABLE
+ +#define ARCH_HAS_SEARCH_EXTABLE
+ +
+ +extern int fixup_exception(struct pt_regs *regs);
+ +extern int early_fixup_exception(unsigned long *ip);
+++=======
++ #define access_ok(type, addr, size)					\
++ ({									\
++ 	WARN_ON_IN_IRQ();						\
++ 	likely(!__range_not_ok(addr, size, user_addr_max()));		\
++ })
+++>>>>>>> 7c4788950ba5 (x86/uaccess, sched/preempt: Verify access_ok() context)
+  
+  /*
+   * These are the main single-value transfer routines.  They automatically
+diff --cc include/linux/preempt.h
+index f5d4723cdb3d,7eeceac52dea..000000000000
+--- a/include/linux/preempt.h
++++ b/include/linux/preempt.h
+@@@ -10,101 -9,207 +10,223 @@@
+  #include <linux/linkage.h>
+  #include <linux/list.h>
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * We put the hardirq and softirq counter into the preemption
++  * counter. The bitmask has the following meaning:
++  *
++  * - bits 0-7 are the preemption count (max preemption depth: 256)
++  * - bits 8-15 are the softirq count (max # of softirqs: 256)
++  *
++  * The hardirq count could in theory be the same as the number of
++  * interrupts in the system, but we run all interrupt handlers with
++  * interrupts disabled, so we cannot have nesting interrupts. Though
++  * there are a few palaeontologic drivers which reenable interrupts in
++  * the handler, so we need more than one bit here.
++  *
++  *         PREEMPT_MASK:	0x000000ff
++  *         SOFTIRQ_MASK:	0x0000ff00
++  *         HARDIRQ_MASK:	0x000f0000
++  *             NMI_MASK:	0x00100000
++  * PREEMPT_NEED_RESCHED:	0x80000000
++  */
++ #define PREEMPT_BITS	8
++ #define SOFTIRQ_BITS	8
++ #define HARDIRQ_BITS	4
++ #define NMI_BITS	1
++ 
++ #define PREEMPT_SHIFT	0
++ #define SOFTIRQ_SHIFT	(PREEMPT_SHIFT + PREEMPT_BITS)
++ #define HARDIRQ_SHIFT	(SOFTIRQ_SHIFT + SOFTIRQ_BITS)
++ #define NMI_SHIFT	(HARDIRQ_SHIFT + HARDIRQ_BITS)
++ 
++ #define __IRQ_MASK(x)	((1UL << (x))-1)
++ 
++ #define PREEMPT_MASK	(__IRQ_MASK(PREEMPT_BITS) << PREEMPT_SHIFT)
++ #define SOFTIRQ_MASK	(__IRQ_MASK(SOFTIRQ_BITS) << SOFTIRQ_SHIFT)
++ #define HARDIRQ_MASK	(__IRQ_MASK(HARDIRQ_BITS) << HARDIRQ_SHIFT)
++ #define NMI_MASK	(__IRQ_MASK(NMI_BITS)     << NMI_SHIFT)
++ 
++ #define PREEMPT_OFFSET	(1UL << PREEMPT_SHIFT)
++ #define SOFTIRQ_OFFSET	(1UL << SOFTIRQ_SHIFT)
++ #define HARDIRQ_OFFSET	(1UL << HARDIRQ_SHIFT)
++ #define NMI_OFFSET	(1UL << NMI_SHIFT)
++ 
++ #define SOFTIRQ_DISABLE_OFFSET	(2 * SOFTIRQ_OFFSET)
++ 
++ /* We use the MSB mostly because its available */
++ #define PREEMPT_NEED_RESCHED	0x80000000
++ 
++ /* preempt_count() and related functions, depends on PREEMPT_NEED_RESCHED */
++ #include <asm/preempt.h>
++ 
++ #define hardirq_count()	(preempt_count() & HARDIRQ_MASK)
++ #define softirq_count()	(preempt_count() & SOFTIRQ_MASK)
++ #define irq_count()	(preempt_count() & (HARDIRQ_MASK | SOFTIRQ_MASK \
++ 				 | NMI_MASK))
++ 
++ /*
++  * Are we doing bottom half or hardware interrupt processing?
++  *
++  * in_irq()       - We're in (hard) IRQ context
++  * in_softirq()   - We have BH disabled, or are processing softirqs
++  * in_interrupt() - We're in NMI,IRQ,SoftIRQ context or have BH disabled
++  * in_serving_softirq() - We're in softirq context
++  * in_nmi()       - We're in NMI context
++  * in_task()	  - We're in task context
++  *
++  * Note: due to the BH disabled confusion: in_softirq(),in_interrupt() really
++  *       should not be used in new code.
++  */
++ #define in_irq()		(hardirq_count())
++ #define in_softirq()		(softirq_count())
++ #define in_interrupt()		(irq_count())
++ #define in_serving_softirq()	(softirq_count() & SOFTIRQ_OFFSET)
++ #define in_nmi()		(preempt_count() & NMI_MASK)
++ #define in_task()		(!(preempt_count() & \
++ 				   (NMI_MASK | HARDIRQ_MASK | SOFTIRQ_OFFSET)))
++ 
++ /*
++  * The preempt_count offset after preempt_disable();
++  */
++ #if defined(CONFIG_PREEMPT_COUNT)
++ # define PREEMPT_DISABLE_OFFSET	PREEMPT_OFFSET
++ #else
++ # define PREEMPT_DISABLE_OFFSET	0
++ #endif
++ 
++ /*
++  * The preempt_count offset after spin_lock()
++  */
++ #define PREEMPT_LOCK_OFFSET	PREEMPT_DISABLE_OFFSET
++ 
++ /*
++  * The preempt_count offset needed for things like:
++  *
++  *  spin_lock_bh()
++  *
++  * Which need to disable both preemption (CONFIG_PREEMPT_COUNT) and
++  * softirqs, such that unlock sequences of:
++  *
++  *  spin_unlock();
++  *  local_bh_enable();
++  *
++  * Work as expected.
++  */
++ #define SOFTIRQ_LOCK_OFFSET (SOFTIRQ_DISABLE_OFFSET + PREEMPT_LOCK_OFFSET)
++ 
++ /*
++  * Are we running in atomic context?  WARNING: this macro cannot
++  * always detect atomic context; in particular, it cannot know about
++  * held spinlocks in non-preemptible kernels.  Thus it should not be
++  * used in the general case to determine whether sleeping is possible.
++  * Do not use in_atomic() in driver code.
++  */
++ #define in_atomic()	(preempt_count() != 0)
++ 
++ /*
++  * Check whether we were atomic before we did preempt_disable():
++  * (used by the scheduler)
++  */
++ #define in_atomic_preempt_off() (preempt_count() != PREEMPT_DISABLE_OFFSET)
++ 
+++>>>>>>> 7c4788950ba5 (x86/uaccess, sched/preempt: Verify access_ok() context)
+  #if defined(CONFIG_DEBUG_PREEMPT) || defined(CONFIG_PREEMPT_TRACER)
+ -extern void preempt_count_add(int val);
+ -extern void preempt_count_sub(int val);
+ -#define preempt_count_dec_and_test() \
+ -	({ preempt_count_sub(1); should_resched(0); })
+ +  extern void add_preempt_count(int val);
+ +  extern void sub_preempt_count(int val);
+  #else
+ -#define preempt_count_add(val)	__preempt_count_add(val)
+ -#define preempt_count_sub(val)	__preempt_count_sub(val)
+ -#define preempt_count_dec_and_test() __preempt_count_dec_and_test()
+ +# define add_preempt_count(val)	do { preempt_count() += (val); } while (0)
+ +# define sub_preempt_count(val)	do { preempt_count() -= (val); } while (0)
+  #endif
+  
+ -#define __preempt_count_inc() __preempt_count_add(1)
+ -#define __preempt_count_dec() __preempt_count_sub(1)
+ +#define inc_preempt_count() add_preempt_count(1)
+ +#define dec_preempt_count() sub_preempt_count(1)
+  
+ -#define preempt_count_inc() preempt_count_add(1)
+ -#define preempt_count_dec() preempt_count_sub(1)
+ +#define preempt_count()	(current_thread_info()->preempt_count)
+  
+ -#ifdef CONFIG_PREEMPT_COUNT
+ +#ifdef CONFIG_PREEMPT
+  
+ -#define preempt_disable() \
+ +asmlinkage void preempt_schedule(void);
+ +
+ +#define preempt_check_resched() \
+  do { \
+ -	preempt_count_inc(); \
+ -	barrier(); \
+ +	if (unlikely(test_thread_flag(TIF_NEED_RESCHED))) \
+ +		preempt_schedule(); \
+  } while (0)
+  
+ -#define sched_preempt_enable_no_resched() \
+ +#ifdef CONFIG_CONTEXT_TRACKING
+ +
+ +void preempt_schedule_context(void);
+ +
+ +#define preempt_check_resched_context() \
+  do { \
+ -	barrier(); \
+ -	preempt_count_dec(); \
+ +	if (unlikely(test_thread_flag(TIF_NEED_RESCHED))) \
+ +		preempt_schedule_context(); \
+  } while (0)
+ +#else
+  
+ -#define preempt_enable_no_resched() sched_preempt_enable_no_resched()
+ +#define preempt_check_resched_context() preempt_check_resched()
+  
+ -#define preemptible()	(preempt_count() == 0 && !irqs_disabled())
+ +#endif /* CONFIG_CONTEXT_TRACKING */
+  
+ -#ifdef CONFIG_PREEMPT
+ -#define preempt_enable() \
+ +#else /* !CONFIG_PREEMPT */
+ +
+ +#define preempt_check_resched()		do { } while (0)
+ +#define preempt_check_resched_context()	do { } while (0)
+ +
+ +#endif /* CONFIG_PREEMPT */
+ +
+ +
+ +#ifdef CONFIG_PREEMPT_COUNT
+ +
+ +#define preempt_disable() \
+  do { \
+ +	inc_preempt_count(); \
+  	barrier(); \
+ -	if (unlikely(preempt_count_dec_and_test())) \
+ -		__preempt_schedule(); \
+  } while (0)
+  
+ -#define preempt_enable_notrace() \
+ +#define sched_preempt_enable_no_resched() \
+  do { \
+  	barrier(); \
+ -	if (unlikely(__preempt_count_dec_and_test())) \
+ -		__preempt_schedule_notrace(); \
+ +	dec_preempt_count(); \
+  } while (0)
+  
+ -#define preempt_check_resched() \
+ -do { \
+ -	if (should_resched(0)) \
+ -		__preempt_schedule(); \
+ -} while (0)
+ +#define preempt_enable_no_resched()	sched_preempt_enable_no_resched()
+  
+ -#else /* !CONFIG_PREEMPT */
+  #define preempt_enable() \
+  do { \
+ +	preempt_enable_no_resched(); \
+  	barrier(); \
+ -	preempt_count_dec(); \
+ +	preempt_check_resched(); \
+  } while (0)
+  
+ -#define preempt_enable_notrace() \
+ +/* For debugging and tracer internals only! */
+ +#define add_preempt_count_notrace(val)			\
+ +	do { preempt_count() += (val); } while (0)
+ +#define sub_preempt_count_notrace(val)			\
+ +	do { preempt_count() -= (val); } while (0)
+ +#define inc_preempt_count_notrace() add_preempt_count_notrace(1)
+ +#define dec_preempt_count_notrace() sub_preempt_count_notrace(1)
+ +
+ +#define preempt_disable_notrace() \
+  do { \
+ +	inc_preempt_count_notrace(); \
+  	barrier(); \
+ -	__preempt_count_dec(); \
+  } while (0)
+  
+ -#define preempt_check_resched() do { } while (0)
+ -#endif /* CONFIG_PREEMPT */
+ -
+ -#define preempt_disable_notrace() \
+ +#define preempt_enable_no_resched_notrace() \
+  do { \
+ -	__preempt_count_inc(); \
+  	barrier(); \
+ +	dec_preempt_count_notrace(); \
+  } while (0)
+  
+ -#define preempt_enable_no_resched_notrace() \
+ +/* preempt_check_resched is OK to trace */
+ +#define preempt_enable_notrace() \
+  do { \
+ +	preempt_enable_no_resched_notrace(); \
+  	barrier(); \
+ -	__preempt_count_dec(); \
+ +	preempt_check_resched_context(); \
+  } while (0)
+  
+  #else /* !CONFIG_PREEMPT_COUNT */
+* Unmerged path arch/x86/include/asm/uaccess.h
+* Unmerged path include/linux/preempt.h
