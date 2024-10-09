@@ -1,0 +1,717 @@
+scsi: lpfc: add support to retrieve firmware logs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [scsi] lpfc: add support to retrieve firmware logs (Dick Kennedy) [1642905]
+Rebuild_FUZZ: 93.48%
+commit-author James Smart <jsmart2021@gmail.com>
+commit d2cc9bcd7fa30b6c2270c044ff6dc9e839bf779e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/d2cc9bcd.failed
+
+This patch adds the ability to read firmware logs from the adapter. The driver
+registers a buffer with the adapter that is then written to by the adapter.
+The adapter posts CQEs to indicate content updates in the buffer. While the
+adapter is writing to the buffer in a circular fashion, an application will
+poll the driver to read the next amount of log data from the buffer.
+
+Driver log buffer size is configurable via the ras_fwlog_buffsize sysfs
+attribute. Verbosity to be used by firmware when logging to host memory is
+controlled through the ras_fwlog_level attribute.  The ras_fwlog_func
+attribute enables or disables loggy by firmware.
+
+	Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit d2cc9bcd7fa30b6c2270c044ff6dc9e839bf779e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_bsg.c
+diff --cc drivers/scsi/lpfc/lpfc_bsg.c
+index cd54eb39f32f,d53a704c66d1..000000000000
+--- a/drivers/scsi/lpfc/lpfc_bsg.c
++++ b/drivers/scsi/lpfc/lpfc_bsg.c
+@@@ -26,6 -26,8 +26,11 @@@
+  #include <linux/slab.h>
+  #include <linux/delay.h>
+  #include <linux/list.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/bsg-lib.h>
++ #include <linux/vmalloc.h>
+++>>>>>>> d2cc9bcd7fa3 (scsi: lpfc: add support to retrieve firmware logs)
+  
+  #include <scsi/scsi.h>
+  #include <scsi/scsi_host.h>
+@@@ -5284,11 -5680,23 +5613,23 @@@ lpfc_bsg_hst_vendor(struct fc_bsg_job *
+  	case LPFC_BSG_VENDOR_FORCED_LINK_SPEED:
+  		rc = lpfc_forced_link_speed(job);
+  		break;
++ 	case LPFC_BSG_VENDOR_RAS_GET_LWPD:
++ 		rc = lpfc_bsg_get_ras_lwpd(job);
++ 		break;
++ 	case LPFC_BSG_VENDOR_RAS_GET_FWLOG:
++ 		rc = lpfc_bsg_get_ras_fwlog(job);
++ 		break;
++ 	case LPFC_BSG_VENDOR_RAS_GET_CONFIG:
++ 		rc = lpfc_bsg_get_ras_config(job);
++ 		break;
++ 	case LPFC_BSG_VENDOR_RAS_SET_CONFIG:
++ 		rc = lpfc_bsg_set_ras_config(job);
++ 		break;
+  	default:
+  		rc = -EINVAL;
+ -		bsg_reply->reply_payload_rcv_len = 0;
+ +		job->reply->reply_payload_rcv_len = 0;
+  		/* make error code available to userspace */
+ -		bsg_reply->result = rc;
+ +		job->reply->result = rc;
+  		break;
+  	}
+  
+@@@ -5297,11 -5705,13 +5638,11 @@@
+  
+  /**
+   * lpfc_bsg_request - handle a bsg request from the FC transport
+-  * @job: fc_bsg_job to handle
++  * @job: bsg_job to handle
+   **/
+  int
+ -lpfc_bsg_request(struct bsg_job *job)
+ +lpfc_bsg_request(struct fc_bsg_job *job)
+  {
+ -	struct fc_bsg_request *bsg_request = job->request;
+ -	struct fc_bsg_reply *bsg_reply = job->reply;
+  	uint32_t msgcode;
+  	int rc;
+  
+diff --git a/drivers/scsi/lpfc/lpfc.h b/drivers/scsi/lpfc/lpfc.h
+index 8d039cd05bac..d0d824b53f67 100644
+--- a/drivers/scsi/lpfc/lpfc.h
++++ b/drivers/scsi/lpfc/lpfc.h
+@@ -583,6 +583,25 @@ struct lpfc_mbox_ext_buf_ctx {
+ 	struct list_head ext_dmabuf_list;
+ };
+ 
++struct lpfc_ras_fwlog {
++	uint8_t *fwlog_buff;
++	uint32_t fw_buffcount; /* Buffer size posted to FW */
++#define LPFC_RAS_BUFF_ENTERIES  16      /* Each entry can hold max of 64k */
++#define LPFC_RAS_MAX_ENTRY_SIZE (64 * 1024)
++#define LPFC_RAS_MIN_BUFF_POST_SIZE (256 * 1024)
++#define LPFC_RAS_MAX_BUFF_POST_SIZE (1024 * 1024)
++	uint32_t fw_loglevel; /* Log level set */
++	struct lpfc_dmabuf lwpd;
++	struct list_head fwlog_buff_list;
++
++	/* RAS support status on adapter */
++	bool ras_hwsupport; /* RAS Support available on HW or not */
++	bool ras_enabled;   /* Ras Enabled for the function */
++#define LPFC_RAS_DISABLE_LOGGING 0x00
++#define LPFC_RAS_ENABLE_LOGGING 0x01
++	bool ras_active;    /* RAS logging running state */
++};
++
+ struct lpfc_hba {
+ 	/* SCSI interface function jump table entries */
+ 	int (*lpfc_new_scsi_buf)
+@@ -833,6 +852,9 @@ struct lpfc_hba {
+ #define LPFC_FDMI_SUPPORT	1	/* FDMI supported? */
+ 	uint32_t cfg_enable_SmartSAN;
+ 	uint32_t cfg_enable_mds_diags;
++	uint32_t cfg_ras_fwlog_level;
++	uint32_t cfg_ras_fwlog_buffsize;
++	uint32_t cfg_ras_fwlog_func;
+ 	uint32_t cfg_enable_fc4_type;
+ 	uint32_t cfg_enable_bbcr;	/* Enable BB Credit Recovery */
+ 	uint32_t cfg_enable_dpp;	/* Enable Direct Packet Push */
+@@ -1095,6 +1117,9 @@ struct lpfc_hba {
+ 	struct unsol_rcv_ct_ctx ct_ctx[LPFC_CT_CTX_MAX];
+ 	uint32_t ctx_idx;
+ 
++	/* RAS Support */
++	struct lpfc_ras_fwlog ras_fwlog;
++
+ 	uint8_t menlo_flag;	/* menlo generic flags */
+ #define HBA_MENLO_SUPPORT	0x1 /* HBA supports menlo commands */
+ 	uint32_t iocb_cnt;
+diff --git a/drivers/scsi/lpfc/lpfc_attr.c b/drivers/scsi/lpfc/lpfc_attr.c
+index c0ef14ea1908..683fb63e32d0 100644
+--- a/drivers/scsi/lpfc/lpfc_attr.c
++++ b/drivers/scsi/lpfc/lpfc_attr.c
+@@ -5441,6 +5441,31 @@ lpfc_sg_seg_cnt_init(struct lpfc_hba *phba, int val)
+  */
+ LPFC_ATTR_R(enable_mds_diags, 0, 0, 1, "Enable MDS Diagnostics");
+ 
++/*
++ * lpfc_ras_fwlog_buffsize: Firmware logging host buffer size
++ *	0 = Disable firmware logging (default)
++ *	[1-4] = Multiple of 1/4th Mb of host memory for FW logging
++ * Value range [0..4]. Default value is 0
++ */
++LPFC_ATTR_RW(ras_fwlog_buffsize, 0, 0, 4, "Host memory for FW logging");
++
++/*
++ * lpfc_ras_fwlog_level: Firmware logging verbosity level
++ * Valid only if firmware logging is enabled
++ * 0(Least Verbosity) 4 (most verbosity)
++ * Value range is [0..4]. Default value is 0
++ */
++LPFC_ATTR_RW(ras_fwlog_level, 0, 0, 4, "Firmware Logging Level");
++
++/*
++ * lpfc_ras_fwlog_func: Firmware logging enabled on function number
++ * Default function which has RAS support : 0
++ * Value Range is [0..7].
++ * FW logging is a global action and enablement is via a specific
++ * port.
++ */
++LPFC_ATTR_RW(ras_fwlog_func, 0, 0, 7, "Firmware Logging Enabled on Function");
++
+ /*
+  * lpfc_enable_bbcr: Enable BB Credit Recovery
+  *       0  = BB Credit Recovery disabled
+@@ -5567,6 +5592,9 @@ struct device_attribute *lpfc_hba_attrs[] = {
+ 	&dev_attr_protocol,
+ 	&dev_attr_lpfc_xlane_supported,
+ 	&dev_attr_lpfc_enable_mds_diags,
++	&dev_attr_lpfc_ras_fwlog_buffsize,
++	&dev_attr_lpfc_ras_fwlog_level,
++	&dev_attr_lpfc_ras_fwlog_func,
+ 	&dev_attr_lpfc_enable_bbcr,
+ 	&dev_attr_lpfc_enable_dpp,
+ 	NULL,
+@@ -6658,6 +6686,10 @@ lpfc_get_cfgparam(struct lpfc_hba *phba)
+ 	lpfc_sli_mode_init(phba, lpfc_sli_mode);
+ 	phba->cfg_enable_dss = 1;
+ 	lpfc_enable_mds_diags_init(phba, lpfc_enable_mds_diags);
++	lpfc_ras_fwlog_buffsize_init(phba, lpfc_ras_fwlog_buffsize);
++	lpfc_ras_fwlog_level_init(phba, lpfc_ras_fwlog_level);
++	lpfc_ras_fwlog_func_init(phba, lpfc_ras_fwlog_func);
++
+ 
+ 	/* If the NVME FC4 type is enabled, scale the sg_seg_cnt to
+ 	 * accommodate 512K and 1M IOs in a single nvme buf and supply
+* Unmerged path drivers/scsi/lpfc/lpfc_bsg.c
+diff --git a/drivers/scsi/lpfc/lpfc_bsg.h b/drivers/scsi/lpfc/lpfc_bsg.h
+index 32347c87e3b4..820323f1139b 100644
+--- a/drivers/scsi/lpfc/lpfc_bsg.h
++++ b/drivers/scsi/lpfc/lpfc_bsg.h
+@@ -38,6 +38,10 @@
+ #define LPFC_BSG_VENDOR_DIAG_MODE_END		10
+ #define LPFC_BSG_VENDOR_LINK_DIAG_TEST		11
+ #define LPFC_BSG_VENDOR_FORCED_LINK_SPEED	14
++#define LPFC_BSG_VENDOR_RAS_GET_LWPD		16
++#define LPFC_BSG_VENDOR_RAS_GET_FWLOG		17
++#define LPFC_BSG_VENDOR_RAS_GET_CONFIG		18
++#define LPFC_BSG_VENDOR_RAS_SET_CONFIG		19
+ 
+ struct set_ct_event {
+ 	uint32_t command;
+@@ -296,6 +300,38 @@ struct forced_link_speed_support_reply {
+ 	uint8_t supported;
+ };
+ 
++struct lpfc_bsg_ras_req {
++	uint32_t command;
++};
++
++struct lpfc_bsg_get_fwlog_req {
++	uint32_t command;
++	uint32_t read_size;
++	uint32_t read_offset;
++};
++
++struct lpfc_bsg_get_ras_lwpd {
++	uint32_t offset;
++	uint32_t wrap_count;
++};
++
++struct lpfc_bsg_set_ras_config_req {
++	uint32_t command;
++	uint8_t action;
++#define LPFC_RASACTION_STOP_LOGGING     0x00
++#define LPFC_RASACTION_START_LOGGING    0x01
++	uint8_t log_level;
++};
++
++struct lpfc_bsg_get_ras_config_reply {
++	uint8_t state;
++#define LPFC_RASLOG_STATE_STOPPED 0x00
++#define LPFC_RASLOG_STATE_RUNNING 0x01
++	uint8_t log_level;
++	uint32_t log_buff_sz;
++};
++
++
+ /* driver only */
+ #define SLI_CONFIG_NOT_HANDLED		0
+ #define SLI_CONFIG_HANDLED		1
+diff --git a/drivers/scsi/lpfc/lpfc_crtn.h b/drivers/scsi/lpfc/lpfc_crtn.h
+index 51ab88c4f311..79bdb615d49a 100644
+--- a/drivers/scsi/lpfc/lpfc_crtn.h
++++ b/drivers/scsi/lpfc/lpfc_crtn.h
+@@ -548,6 +548,13 @@ bool lpfc_find_next_oas_lun(struct lpfc_hba *, struct lpfc_name *,
+ int lpfc_sli4_dump_page_a0(struct lpfc_hba *phba, struct lpfcMboxq *mbox);
+ void lpfc_mbx_cmpl_rdp_page_a0(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb);
+ 
++/* RAS Interface */
++void lpfc_sli4_ras_init(struct lpfc_hba *phba);
++void lpfc_sli4_ras_setup(struct lpfc_hba *phba);
++int  lpfc_sli4_ras_fwlog_init(struct lpfc_hba *phba, uint32_t fwlog_level,
++			 uint32_t fwlog_enable);
++int lpfc_check_fwlog_support(struct lpfc_hba *phba);
++
+ /* NVME interfaces. */
+ void lpfc_nvme_unregister_port(struct lpfc_vport *vport,
+ 			struct lpfc_nodelist *ndlp);
+diff --git a/drivers/scsi/lpfc/lpfc_hw4.h b/drivers/scsi/lpfc/lpfc_hw4.h
+index 083f8c8706e5..bbd0a57e953f 100644
+--- a/drivers/scsi/lpfc/lpfc_hw4.h
++++ b/drivers/scsi/lpfc/lpfc_hw4.h
+@@ -186,6 +186,7 @@ struct lpfc_sli_intf {
+ #define LPFC_CTL_PDEV_CTL_FRL_ALL	0x00
+ #define LPFC_CTL_PDEV_CTL_FRL_FC_FCOE	0x10
+ #define LPFC_CTL_PDEV_CTL_FRL_NIC	0x20
++#define LPFC_CTL_PDEV_CTL_DDL_RAS	0x1000000
+ 
+ #define LPFC_FW_DUMP_REQUEST    (LPFC_CTL_PDEV_CTL_DD | LPFC_CTL_PDEV_CTL_FRST)
+ 
+@@ -964,6 +965,7 @@ struct mbox_header {
+ /* Subsystem Definitions */
+ #define LPFC_MBOX_SUBSYSTEM_NA		0x0
+ #define LPFC_MBOX_SUBSYSTEM_COMMON	0x1
++#define LPFC_MBOX_SUBSYSTEM_LOWLEVEL	0xB
+ #define LPFC_MBOX_SUBSYSTEM_FCOE	0xC
+ 
+ /* Device Specific Definitions */
+@@ -1030,6 +1032,9 @@ struct mbox_header {
+ #define LPFC_MBOX_OPCODE_FCOE_LINK_DIAG_STATE		0x22
+ #define LPFC_MBOX_OPCODE_FCOE_LINK_DIAG_LOOPBACK	0x23
+ 
++/* Low level Opcodes */
++#define LPFC_MBOX_OPCODE_SET_DIAG_LOG_OPTION		0x37
++
+ /* Mailbox command structures */
+ struct eq_context {
+ 	uint32_t word0;
+@@ -1162,6 +1167,45 @@ struct lpfc_mbx_nop {
+ 	uint32_t context[2];
+ };
+ 
++
++
++struct lpfc_mbx_set_ras_fwlog {
++	struct mbox_header header;
++	union {
++		struct {
++			uint32_t word4;
++#define lpfc_fwlog_enable_SHIFT		0
++#define lpfc_fwlog_enable_MASK		0x00000001
++#define lpfc_fwlog_enable_WORD		word4
++#define lpfc_fwlog_loglvl_SHIFT		8
++#define lpfc_fwlog_loglvl_MASK		0x0000000F
++#define lpfc_fwlog_loglvl_WORD		word4
++#define lpfc_fwlog_ra_SHIFT		15
++#define lpfc_fwlog_ra_WORD		0x00000008
++#define lpfc_fwlog_buffcnt_SHIFT	16
++#define lpfc_fwlog_buffcnt_MASK		0x000000FF
++#define lpfc_fwlog_buffcnt_WORD		word4
++#define lpfc_fwlog_buffsz_SHIFT		24
++#define lpfc_fwlog_buffsz_MASK		0x000000FF
++#define lpfc_fwlog_buffsz_WORD		word4
++			uint32_t word5;
++#define lpfc_fwlog_acqe_SHIFT		0
++#define lpfc_fwlog_acqe_MASK		0x0000FFFF
++#define lpfc_fwlog_acqe_WORD		word5
++#define lpfc_fwlog_cqid_SHIFT		16
++#define lpfc_fwlog_cqid_MASK		0x0000FFFF
++#define lpfc_fwlog_cqid_WORD		word5
++#define LPFC_MAX_FWLOG_PAGE	16
++			struct dma_address lwpd;
++			struct dma_address buff_fwlog[LPFC_MAX_FWLOG_PAGE];
++		} request;
++		struct {
++			uint32_t word0;
++		} response;
++	} u;
++};
++
++
+ struct cq_context {
+ 	uint32_t word0;
+ #define lpfc_cq_context_event_SHIFT	31
+@@ -3868,6 +3912,7 @@ struct lpfc_mqe {
+ 		struct lpfc_mbx_memory_dump_type3 mem_dump_type3;
+ 		struct lpfc_mbx_set_host_data set_host_data;
+ 		struct lpfc_mbx_nop nop;
++		struct lpfc_mbx_set_ras_fwlog ras_fwlog;
+ 	} un;
+ };
+ 
+diff --git a/drivers/scsi/lpfc/lpfc_init.c b/drivers/scsi/lpfc/lpfc_init.c
+index 7c683b6fa12b..309754012e41 100644
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@ -6249,6 +6249,9 @@ lpfc_sli4_driver_resource_setup(struct lpfc_hba *phba)
+ 	if (phba->cfg_fof)
+ 		fof_vectors = 1;
+ 
++	/* Verify RAS support on adapter */
++	lpfc_sli4_ras_init(phba);
++
+ 	/* Verify all the SLI4 queues */
+ 	rc = lpfc_sli4_queue_verify(phba);
+ 	if (rc)
+@@ -10918,6 +10921,14 @@ lpfc_sli4_hba_unset(struct lpfc_hba *phba)
+ 	/* Stop kthread signal shall trigger work_done one more time */
+ 	kthread_stop(phba->worker_thread);
+ 
++	/* Disable FW logging to host memory */
++	writel(LPFC_CTL_PDEV_CTL_DDL_RAS,
++	       phba->sli4_hba.conf_regs_memmap_p + LPFC_CTL_PDEV_CTL_OFFSET);
++
++	/* Free RAS DMA memory */
++	if (phba->ras_fwlog.ras_enabled == true)
++		lpfc_sli4_ras_dma_free(phba);
++
+ 	/* Unset the queues shared with the hardware then release all
+ 	 * allocated resources.
+ 	 */
+@@ -11163,6 +11174,7 @@ lpfc_get_sli4_parameters(struct lpfc_hba *phba, LPFC_MBOXQ_t *mboxq)
+ 		phba->mds_diags_support = 1;
+ 	else
+ 		phba->mds_diags_support = 0;
++
+ 	return 0;
+ }
+ 
+@@ -12126,6 +12138,10 @@ lpfc_pci_probe_one_s4(struct pci_dev *pdev, const struct pci_device_id *pid)
+ 
+ 	/* Check if there are static vports to be created. */
+ 	lpfc_create_static_vport(phba);
++
++	/* Enable RAS FW log support */
++	lpfc_sli4_ras_setup(phba);
++
+ 	return 0;
+ 
+ out_disable_intr:
+@@ -12855,6 +12871,30 @@ lpfc_sli4_oas_verify(struct lpfc_hba *phba)
+ 	return;
+ }
+ 
++/**
++ * lpfc_sli4_ras_init - Verify RAS-FW log is supported by this adapter
++ * @phba: pointer to lpfc hba data structure.
++ *
++ * This routine checks to see if RAS is supported by the adapter. Check the
++ * function through which RAS support enablement is to be done.
++ **/
++void
++lpfc_sli4_ras_init(struct lpfc_hba *phba)
++{
++	switch (phba->pcidev->device) {
++	case PCI_DEVICE_ID_LANCER_G6_FC:
++	case PCI_DEVICE_ID_LANCER_G7_FC:
++		phba->ras_fwlog.ras_hwsupport = true;
++		if (phba->cfg_ras_fwlog_func == PCI_FUNC(phba->pcidev->devfn))
++			phba->ras_fwlog.ras_enabled = true;
++		else
++			phba->ras_fwlog.ras_enabled = false;
++		break;
++	default:
++		phba->ras_fwlog.ras_hwsupport = false;
++	}
++}
++
+ /**
+  * lpfc_fof_queue_setup - Set up all the fof queues
+  * @phba: pointer to lpfc hba data structure.
+diff --git a/drivers/scsi/lpfc/lpfc_sli.c b/drivers/scsi/lpfc/lpfc_sli.c
+index ded3f1b8224d..c700f316187e 100644
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@ -6121,6 +6121,271 @@ lpfc_set_features(struct lpfc_hba *phba, LPFC_MBOXQ_t *mbox,
+ 	return;
+ }
+ 
++/**
++ * lpfc_sli4_ras_dma_free - Free memory allocated for FW logging.
++ * @phba: Pointer to HBA context object.
++ *
++ * This function is called to free memory allocated for RAS FW logging
++ * support in the driver.
++ **/
++void
++lpfc_sli4_ras_dma_free(struct lpfc_hba *phba)
++{
++	struct lpfc_ras_fwlog *ras_fwlog = &phba->ras_fwlog;
++	struct lpfc_dmabuf *dmabuf, *next;
++
++	if (!list_empty(&ras_fwlog->fwlog_buff_list)) {
++		list_for_each_entry_safe(dmabuf, next,
++				    &ras_fwlog->fwlog_buff_list,
++				    list) {
++			list_del(&dmabuf->list);
++			dma_free_coherent(&phba->pcidev->dev,
++					  LPFC_RAS_MAX_ENTRY_SIZE,
++					  dmabuf->virt, dmabuf->phys);
++			kfree(dmabuf);
++		}
++	}
++
++	if (ras_fwlog->lwpd.virt) {
++		dma_free_coherent(&phba->pcidev->dev,
++				  sizeof(uint32_t) * 2,
++				  ras_fwlog->lwpd.virt,
++				  ras_fwlog->lwpd.phys);
++		ras_fwlog->lwpd.virt = NULL;
++	}
++
++	ras_fwlog->ras_active = false;
++}
++
++/**
++ * lpfc_sli4_ras_dma_alloc: Allocate memory for FW support
++ * @phba: Pointer to HBA context object.
++ * @fwlog_buff_count: Count of buffers to be created.
++ *
++ * This routine DMA memory for Log Write Position Data[LPWD] and buffer
++ * to update FW log is posted to the adapter.
++ * Buffer count is calculated based on module param ras_fwlog_buffsize
++ * Size of each buffer posted to FW is 64K.
++ **/
++
++static int
++lpfc_sli4_ras_dma_alloc(struct lpfc_hba *phba,
++			uint32_t fwlog_buff_count)
++{
++	struct lpfc_ras_fwlog *ras_fwlog = &phba->ras_fwlog;
++	struct lpfc_dmabuf *dmabuf;
++	int rc = 0, i = 0;
++
++	/* Initialize List */
++	INIT_LIST_HEAD(&ras_fwlog->fwlog_buff_list);
++
++	/* Allocate memory for the LWPD */
++	ras_fwlog->lwpd.virt = dma_alloc_coherent(&phba->pcidev->dev,
++					    sizeof(uint32_t) * 2,
++					    &ras_fwlog->lwpd.phys,
++					    GFP_KERNEL);
++	if (!ras_fwlog->lwpd.virt) {
++		lpfc_printf_log(phba, KERN_WARNING, LOG_INIT,
++				"6185 LWPD Memory Alloc Failed\n");
++
++		return -ENOMEM;
++	}
++
++	ras_fwlog->fw_buffcount = fwlog_buff_count;
++	for (i = 0; i < ras_fwlog->fw_buffcount; i++) {
++		dmabuf = kzalloc(sizeof(struct lpfc_dmabuf),
++				 GFP_KERNEL);
++		if (!dmabuf) {
++			rc = -ENOMEM;
++			lpfc_printf_log(phba, KERN_WARNING, LOG_INIT,
++					"6186 Memory Alloc failed FW logging");
++			goto free_mem;
++		}
++
++		dmabuf->virt = dma_alloc_coherent(&phba->pcidev->dev,
++						  LPFC_RAS_MAX_ENTRY_SIZE,
++						  &dmabuf->phys,
++						  GFP_KERNEL);
++		if (!dmabuf->virt) {
++			kfree(dmabuf);
++			rc = -ENOMEM;
++			lpfc_printf_log(phba, KERN_WARNING, LOG_INIT,
++					"6187 DMA Alloc Failed FW logging");
++			goto free_mem;
++		}
++		memset(dmabuf->virt, 0, LPFC_RAS_MAX_ENTRY_SIZE);
++		dmabuf->buffer_tag = i;
++		list_add_tail(&dmabuf->list, &ras_fwlog->fwlog_buff_list);
++	}
++
++free_mem:
++	if (rc)
++		lpfc_sli4_ras_dma_free(phba);
++
++	return rc;
++}
++
++/**
++ * lpfc_sli4_ras_mbox_cmpl: Completion handler for RAS MBX command
++ * @phba: pointer to lpfc hba data structure.
++ * @pmboxq: pointer to the driver internal queue element for mailbox command.
++ *
++ * Completion handler for driver's RAS MBX command to the device.
++ **/
++static void
++lpfc_sli4_ras_mbox_cmpl(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
++{
++	MAILBOX_t *mb;
++	union lpfc_sli4_cfg_shdr *shdr;
++	uint32_t shdr_status, shdr_add_status;
++	struct lpfc_ras_fwlog *ras_fwlog = &phba->ras_fwlog;
++
++	mb = &pmb->u.mb;
++
++	shdr = (union lpfc_sli4_cfg_shdr *)
++		&pmb->u.mqe.un.ras_fwlog.header.cfg_shdr;
++	shdr_status = bf_get(lpfc_mbox_hdr_status, &shdr->response);
++	shdr_add_status = bf_get(lpfc_mbox_hdr_add_status, &shdr->response);
++
++	if (mb->mbxStatus != MBX_SUCCESS || shdr_status) {
++		lpfc_printf_log(phba, KERN_WARNING, LOG_MBOX,
++				"6188 FW LOG mailbox "
++				"completed with status x%x add_status x%x,"
++				" mbx status x%x\n",
++				shdr_status, shdr_add_status, mb->mbxStatus);
++		goto disable_ras;
++	}
++
++	ras_fwlog->ras_active = true;
++	mempool_free(pmb, phba->mbox_mem_pool);
++
++	return;
++
++disable_ras:
++	/* Free RAS DMA memory */
++	lpfc_sli4_ras_dma_free(phba);
++	mempool_free(pmb, phba->mbox_mem_pool);
++}
++
++/**
++ * lpfc_sli4_ras_fwlog_init: Initialize memory and post RAS MBX command
++ * @phba: pointer to lpfc hba data structure.
++ * @fwlog_level: Logging verbosity level.
++ * @fwlog_enable: Enable/Disable logging.
++ *
++ * Initialize memory and post mailbox command to enable FW logging in host
++ * memory.
++ **/
++int
++lpfc_sli4_ras_fwlog_init(struct lpfc_hba *phba,
++			 uint32_t fwlog_level,
++			 uint32_t fwlog_enable)
++{
++	struct lpfc_ras_fwlog *ras_fwlog = &phba->ras_fwlog;
++	struct lpfc_mbx_set_ras_fwlog *mbx_fwlog = NULL;
++	struct lpfc_dmabuf *dmabuf;
++	LPFC_MBOXQ_t *mbox;
++	uint32_t len = 0, fwlog_buffsize, fwlog_entry_count;
++	int rc = 0;
++
++	fwlog_buffsize = (LPFC_RAS_MIN_BUFF_POST_SIZE *
++			  phba->cfg_ras_fwlog_buffsize);
++	fwlog_entry_count = (fwlog_buffsize/LPFC_RAS_MAX_ENTRY_SIZE);
++
++	/*
++	 * If re-enabling FW logging support use earlier allocated
++	 * DMA buffers while posting MBX command.
++	 **/
++	if (!ras_fwlog->lwpd.virt) {
++		rc = lpfc_sli4_ras_dma_alloc(phba, fwlog_entry_count);
++		if (rc) {
++			lpfc_printf_log(phba, KERN_WARNING, LOG_INIT,
++					"6189 RAS FW Log Support Not Enabled");
++			return rc;
++		}
++	}
++
++	/* Setup Mailbox command */
++	mbox = mempool_alloc(phba->mbox_mem_pool, GFP_KERNEL);
++	if (!mbox) {
++		lpfc_printf_log(phba, KERN_WARNING, LOG_INIT,
++				"6190 RAS MBX Alloc Failed");
++		rc = -ENOMEM;
++		goto mem_free;
++	}
++
++	ras_fwlog->fw_loglevel = fwlog_level;
++	len = (sizeof(struct lpfc_mbx_set_ras_fwlog) -
++		sizeof(struct lpfc_sli4_cfg_mhdr));
++
++	lpfc_sli4_config(phba, mbox, LPFC_MBOX_SUBSYSTEM_LOWLEVEL,
++			 LPFC_MBOX_OPCODE_SET_DIAG_LOG_OPTION,
++			 len, LPFC_SLI4_MBX_EMBED);
++
++	mbx_fwlog = (struct lpfc_mbx_set_ras_fwlog *)&mbox->u.mqe.un.ras_fwlog;
++	bf_set(lpfc_fwlog_enable, &mbx_fwlog->u.request,
++	       fwlog_enable);
++	bf_set(lpfc_fwlog_loglvl, &mbx_fwlog->u.request,
++	       ras_fwlog->fw_loglevel);
++	bf_set(lpfc_fwlog_buffcnt, &mbx_fwlog->u.request,
++	       ras_fwlog->fw_buffcount);
++	bf_set(lpfc_fwlog_buffsz, &mbx_fwlog->u.request,
++	       LPFC_RAS_MAX_ENTRY_SIZE/SLI4_PAGE_SIZE);
++
++	/* Update DMA buffer address */
++	list_for_each_entry(dmabuf, &ras_fwlog->fwlog_buff_list, list) {
++		memset(dmabuf->virt, 0, LPFC_RAS_MAX_ENTRY_SIZE);
++
++		mbx_fwlog->u.request.buff_fwlog[dmabuf->buffer_tag].addr_lo =
++			putPaddrLow(dmabuf->phys);
++
++		mbx_fwlog->u.request.buff_fwlog[dmabuf->buffer_tag].addr_hi =
++			putPaddrHigh(dmabuf->phys);
++	}
++
++	/* Update LPWD address */
++	mbx_fwlog->u.request.lwpd.addr_lo = putPaddrLow(ras_fwlog->lwpd.phys);
++	mbx_fwlog->u.request.lwpd.addr_hi = putPaddrHigh(ras_fwlog->lwpd.phys);
++
++	mbox->vport = phba->pport;
++	mbox->mbox_cmpl = lpfc_sli4_ras_mbox_cmpl;
++
++	rc = lpfc_sli_issue_mbox(phba, mbox, MBX_NOWAIT);
++
++	if (rc == MBX_NOT_FINISHED) {
++		lpfc_printf_log(phba, KERN_WARNING, LOG_INIT,
++				"6191 RAS Mailbox failed. "
++				"status %d mbxStatus : x%x", rc,
++				bf_get(lpfc_mqe_status, &mbox->u.mqe));
++		mempool_free(mbox, phba->mbox_mem_pool);
++		rc = -EIO;
++		goto mem_free;
++	} else
++		rc = 0;
++mem_free:
++	if (rc)
++		lpfc_sli4_ras_dma_free(phba);
++
++	return rc;
++}
++
++/**
++ * lpfc_sli4_ras_setup - Check if RAS supported on the adapter
++ * @phba: Pointer to HBA context object.
++ *
++ * Check if RAS is supported on the adapter and initialize it.
++ **/
++void
++lpfc_sli4_ras_setup(struct lpfc_hba *phba)
++{
++	/* Check RAS FW Log needs to be enabled or not */
++	if (lpfc_check_fwlog_support(phba))
++		return;
++
++	lpfc_sli4_ras_fwlog_init(phba, phba->cfg_ras_fwlog_level,
++				 LPFC_RAS_ENABLE_LOGGING);
++}
++
+ /**
+  * lpfc_sli4_alloc_resource_identifiers - Allocate all SLI4 resource extents.
+  * @phba: Pointer to HBA context object.
+diff --git a/drivers/scsi/lpfc/lpfc_sli4.h b/drivers/scsi/lpfc/lpfc_sli4.h
+index 83a35d84a7e4..babee24328e5 100644
+--- a/drivers/scsi/lpfc/lpfc_sli4.h
++++ b/drivers/scsi/lpfc/lpfc_sli4.h
+@@ -887,3 +887,4 @@ int lpfc_sli4_unregister_fcf(struct lpfc_hba *);
+ int lpfc_sli4_post_status_check(struct lpfc_hba *);
+ uint8_t lpfc_sli_config_mbox_subsys_get(struct lpfc_hba *, LPFC_MBOXQ_t *);
+ uint8_t lpfc_sli_config_mbox_opcode_get(struct lpfc_hba *, LPFC_MBOXQ_t *);
++void lpfc_sli4_ras_dma_free(struct lpfc_hba *phba);
