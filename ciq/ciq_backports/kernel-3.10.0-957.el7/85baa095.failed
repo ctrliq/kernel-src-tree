@@ -1,0 +1,240 @@
+powerpc/livepatch: Add live patching support on ppc64le
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [powerpc] livepatch: Add live patching support on ppc64le (Josh Poimboeuf) [1578960]
+Rebuild_FUZZ: 92.16%
+commit-author Michael Ellerman <mpe@ellerman.id.au>
+commit 85baa095497f3e590df9f6c8932121f123efca5c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/85baa095.failed
+
+Add the kconfig logic & assembly support for handling live patched
+functions. This depends on DYNAMIC_FTRACE_WITH_REGS, which in turn
+depends on the new -mprofile-kernel ftrace ABI, which is only supported
+currently on ppc64le.
+
+Live patching is handled by a special ftrace handler. This means it runs
+from ftrace_caller(). The live patch handler modifies the NIP so as to
+redirect the return from ftrace_caller() to the new patched function.
+
+However there is one particularly tricky case we need to handle.
+
+If a function A calls another function B, and it is known at link time
+that they share the same TOC, then A will not save or restore its TOC,
+and will call the local entry point of B.
+
+When we live patch B, we replace it with a new function C, which may
+not have the same TOC as A. At live patch time it's too late to modify A
+to do the TOC save/restore, so the live patching code must interpose
+itself between A and C, and do the TOC save/restore that A omitted.
+
+An additionaly complication is that the livepatch code can not create a
+stack frame in order to save the TOC. That is because if C takes > 8
+arguments, or is varargs, A will have written the arguments for C in
+A's stack frame.
+
+To solve this, we introduce a "livepatch stack" which grows upward from
+the base of the regular stack, and is used to store the TOC & LR when
+calling a live patched function.
+
+When the patched function returns, we retrieve the real LR & TOC from
+the livepatch stack, restore them, and pop the livepatch "stack frame".
+
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+	Reviewed-by: Torsten Duwe <duwe@suse.de>
+	Reviewed-by: Balbir Singh <bsingharora@gmail.com>
+(cherry picked from commit 85baa095497f3e590df9f6c8932121f123efca5c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/Kconfig
+diff --cc arch/powerpc/Kconfig
+index 32232f9bee79,926c0eafbee3..000000000000
+--- a/arch/powerpc/Kconfig
++++ b/arch/powerpc/Kconfig
+@@@ -186,15 -144,25 +186,20 @@@ config PP
+  	select ARCH_USE_BUILTIN_BSWAP
+  	select OLD_SIGSUSPEND
+  	select OLD_SIGACTION if PPC32
+ -	select HAVE_DEBUG_STACKOVERFLOW
+  	select HAVE_IRQ_EXIT_ON_IRQ_STACK
+  	select ARCH_USE_CMPXCHG_LOCKREF if PPC64
+ -	select HAVE_ARCH_AUDITSYSCALL
+ -	select ARCH_SUPPORTS_ATOMIC_RMW
+ -	select DCACHE_WORD_ACCESS if PPC64 && CPU_LITTLE_ENDIAN
+ -	select NO_BOOTMEM
+ -	select HAVE_GENERIC_RCU_GUP
+ -	select HAVE_PERF_EVENTS_NMI if PPC64
+ -	select EDAC_SUPPORT
+ -	select EDAC_ATOMIC_SCRUB
+  	select ARCH_HAS_DMA_SET_COHERENT_MASK
+ -	select ARCH_HAS_DEVMEM_IS_ALLOWED
+  	select HAVE_ARCH_SECCOMP_FILTER
+++<<<<<<< HEAD
+ +	select HAVE_PERF_EVENTS_NMI if PPC64
+ +	select GENERIC_CPU_VULNERABILITIES	if PPC_BOOK3S_64
+++=======
++ 	select ARCH_HAS_UBSAN_SANITIZE_ALL
++ 	select HAVE_LIVEPATCH if HAVE_DYNAMIC_FTRACE_WITH_REGS
+++>>>>>>> 85baa095497f (powerpc/livepatch: Add live patching support on ppc64le)
+  
+  config GENERIC_CSUM
+ -	def_bool CPU_LITTLE_ENDIAN
+ +	def_bool n
+  
+  config EARLY_PRINTK
+  	bool
+* Unmerged path arch/powerpc/Kconfig
+diff --git a/arch/powerpc/kernel/asm-offsets.c b/arch/powerpc/kernel/asm-offsets.c
+index 45991fcceae4..436b5301e292 100644
+--- a/arch/powerpc/kernel/asm-offsets.c
++++ b/arch/powerpc/kernel/asm-offsets.c
+@@ -86,6 +86,10 @@ int main(void)
+ 	DEFINE(KSP_LIMIT, offsetof(struct thread_struct, ksp_limit));
+ #endif /* CONFIG_PPC64 */
+ 
++#ifdef CONFIG_LIVEPATCH
++	DEFINE(TI_livepatch_sp, offsetof(struct thread_info, livepatch_sp));
++#endif
++
+ 	DEFINE(KSP, offsetof(struct thread_struct, ksp));
+ 	DEFINE(PT_REGS, offsetof(struct thread_struct, regs));
+ #ifdef CONFIG_BOOKE
+diff --git a/arch/powerpc/kernel/entry_64.S b/arch/powerpc/kernel/entry_64.S
+index 232b100614fb..4bbe4a3615eb 100644
+--- a/arch/powerpc/kernel/entry_64.S
++++ b/arch/powerpc/kernel/entry_64.S
+@@ -20,6 +20,7 @@
+ 
+ #include <linux/errno.h>
+ #include <linux/err.h>
++#include <linux/magic.h>
+ #include <asm/unistd.h>
+ #include <asm/processor.h>
+ #include <asm/page.h>
+@@ -1313,6 +1314,9 @@ _GLOBAL(ftrace_caller)
+ 	addi	r3,r3,function_trace_op@toc@l
+ 	ld	r5,0(r3)
+ 
++#ifdef CONFIG_LIVEPATCH
++	mr	r14,r7		/* remember old NIP */
++#endif
+ 	/* Calculate ip from nip-4 into r3 for call below */
+ 	subi    r3, r7, MCOUNT_INSN_SIZE
+ 
+@@ -1337,6 +1341,9 @@ ftrace_call:
+ 	/* Load ctr with the possibly modified NIP */
+ 	ld	r3, _NIP(r1)
+ 	mtctr	r3
++#ifdef CONFIG_LIVEPATCH
++	cmpd	r14,r3		/* has NIP been altered? */
++#endif
+ 
+ 	/* Restore gprs */
+ 	REST_8GPRS(0,r1)
+@@ -1354,6 +1361,11 @@ ftrace_call:
+ 	ld	r0, LRSAVE(r1)
+ 	mtlr	r0
+ 
++#ifdef CONFIG_LIVEPATCH
++        /* Based on the cmpd above, if the NIP was altered handle livepatch */
++	bne-	livepatch_handler
++#endif
++
+ #ifdef CONFIG_FUNCTION_GRAPH_TRACER
+ 	stdu	r1, -112(r1)
+ .globl ftrace_graph_call
+@@ -1370,6 +1382,91 @@ _GLOBAL(ftrace_graph_stub)
+ 
+ _GLOBAL(ftrace_stub)
+ 	blr
++
++#ifdef CONFIG_LIVEPATCH
++	/*
++	 * This function runs in the mcount context, between two functions. As
++	 * such it can only clobber registers which are volatile and used in
++	 * function linkage.
++	 *
++	 * We get here when a function A, calls another function B, but B has
++	 * been live patched with a new function C.
++	 *
++	 * On entry:
++	 *  - we have no stack frame and can not allocate one
++	 *  - LR points back to the original caller (in A)
++	 *  - CTR holds the new NIP in C
++	 *  - r0 & r12 are free
++	 *
++	 * r0 can't be used as the base register for a DS-form load or store, so
++	 * we temporarily shuffle r1 (stack pointer) into r0 and then put it back.
++	 */
++livepatch_handler:
++	CURRENT_THREAD_INFO(r12, r1)
++
++	/* Save stack pointer into r0 */
++	mr	r0, r1
++
++	/* Allocate 3 x 8 bytes */
++	ld	r1, TI_livepatch_sp(r12)
++	addi	r1, r1, 24
++	std	r1, TI_livepatch_sp(r12)
++
++	/* Save toc & real LR on livepatch stack */
++	std	r2,  -24(r1)
++	mflr	r12
++	std	r12, -16(r1)
++
++	/* Store stack end marker */
++	lis     r12, STACK_END_MAGIC@h
++	ori     r12, r12, STACK_END_MAGIC@l
++	std	r12, -8(r1)
++
++	/* Restore real stack pointer */
++	mr	r1, r0
++
++	/* Put ctr in r12 for global entry and branch there */
++	mfctr	r12
++	bctrl
++
++	/*
++	 * Now we are returning from the patched function to the original
++	 * caller A. We are free to use r0 and r12, and we can use r2 until we
++	 * restore it.
++	 */
++
++	CURRENT_THREAD_INFO(r12, r1)
++
++	/* Save stack pointer into r0 */
++	mr	r0, r1
++
++	ld	r1, TI_livepatch_sp(r12)
++
++	/* Check stack marker hasn't been trashed */
++	lis     r2,  STACK_END_MAGIC@h
++	ori     r2,  r2, STACK_END_MAGIC@l
++	ld	r12, -8(r1)
++1:	tdne	r12, r2
++	EMIT_BUG_ENTRY 1b, __FILE__, __LINE__ - 1, 0
++
++	/* Restore LR & toc from livepatch stack */
++	ld	r12, -16(r1)
++	mtlr	r12
++	ld	r2,  -24(r1)
++
++	/* Pop livepatch stack frame */
++	CURRENT_THREAD_INFO(r12, r0)
++	subi	r1, r1, 24
++	std	r1, TI_livepatch_sp(r12)
++
++	/* Restore real stack pointer */
++	mr	r1, r0
++
++	/* Return to original caller of live patched function */
++	blr
++#endif
++
++
+ #else
+ _GLOBAL_TOC(_mcount)
+ 	/* Taken from output of objdump from lib64/glibc */
