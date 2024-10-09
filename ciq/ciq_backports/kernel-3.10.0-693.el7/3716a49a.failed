@@ -1,0 +1,109 @@
+hv_utils: implement Hyper-V PTP source
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 3716a49a81ba19dda7202633a68b28564ba95eb5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/3716a49a.failed
+
+With TimeSync version 4 protocol support we started updating system time
+continuously through the whole lifetime of Hyper-V guests. Every 5 seconds
+there is a time sample from the host which triggers do_settimeofday[64]().
+While the time from the host is very accurate such adjustments may cause
+issues:
+- Time is jumping forward and backward, some applications may misbehave.
+- In case an NTP server runs in parallel and uses something else for time
+  sync (network, PTP,...) system time will never converge.
+- Systemd starts annoying you by printing "Time has been changed" every 5
+  seconds to the system log.
+
+Instead of doing in-kernel time adjustments offload the work to an
+NTP client by exposing TimeSync messages as a PTP device. Users may now
+decide what they want to use as a source.
+
+I tested the solution with chrony, the config was:
+
+ refclock PHC /dev/ptp0 poll 3 dpoll -2 offset 0
+
+The result I'm seeing is accurate enough, the time delta between the guest
+and the host is almost always within [-10us, +10us], the in-kernel solution
+was giving us comparable results.
+
+I also tried implementing PPS device instead of PTP by using not currently
+used Hyper-V synthetic timers (we use only one of four for clockevent) but
+with PPS source only chrony wasn't able to give me the required accuracy,
+the delta often more that 100us.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 3716a49a81ba19dda7202633a68b28564ba95eb5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/hv_util.c
+diff --cc drivers/hv/hv_util.c
+index e7707747f56d,3076ee3ccc6c..000000000000
+--- a/drivers/hv/hv_util.c
++++ b/drivers/hv/hv_util.c
+@@@ -27,6 -27,9 +27,12 @@@
+  #include <linux/sysctl.h>
+  #include <linux/reboot.h>
+  #include <linux/hyperv.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/clockchips.h>
++ #include <linux/ptp_clock_kernel.h>
++ #include <asm/mshyperv.h>
+++>>>>>>> 3716a49a81ba (hv_utils: implement Hyper-V PTP source)
+  
+  #include "hyperv_vmbus.h"
+  
+@@@ -181,31 -212,17 +187,43 @@@ struct adj_time_work 
+  
+  static void hv_set_host_time(struct work_struct *work)
+  {
+++<<<<<<< HEAD
+ +	struct adj_time_work	*wrk;
+ +	s64 host_tns;
+ +	u64 newtime;
+ +	struct timespec host_ts;
+ +
+ +	wrk = container_of(work, struct adj_time_work, work);
+ +
+ +	newtime = wrk->host_time;
+ +	if (ts_srv_version > TS_VERSION_3) {
+ +		/*
+ +		 * Some latency has been introduced since Hyper-V generated
+ +		 * its time sample. Take that latency into account before
+ +		 * using TSC reference time sample from Hyper-V.
+ +		 *
+ +		 * This sample is given by TimeSync v4 and above hosts.
+ +		 */
+ +		u64 current_tick;
+ +
+ +		rdmsrl(HV_X64_MSR_TIME_REF_COUNT, current_tick);
+ +		newtime += (current_tick - wrk->ref_time);
+ +	}
+ +	host_tns = (newtime - WLTIMEDELTA) * 100;
+ +	host_ts = ns_to_timespec(host_tns);
+++=======
++ 	struct adj_time_work *wrk;
++ 	struct timespec64 host_ts;
++ 	u64 reftime, newtime;
++ 
++ 	wrk = container_of(work, struct adj_time_work, work);
++ 
++ 	reftime = hyperv_cs->read(hyperv_cs);
++ 	newtime = wrk->host_time + (reftime - wrk->ref_time);
++ 	host_ts = ns_to_timespec64((newtime - WLTIMEDELTA) * 100);
+++>>>>>>> 3716a49a81ba (hv_utils: implement Hyper-V PTP source)
+  
+ -	do_settimeofday64(&host_ts);
+ +	do_settimeofday(&host_ts);
+  }
+  
+  /*
+* Unmerged path drivers/hv/hv_util.c
