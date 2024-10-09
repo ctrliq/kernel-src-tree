@@ -1,0 +1,280 @@
+gfs2: Do proper error checking for go_sync family of glops functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.53.1.el7
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit 1c634f94c3da39115270d35b3075af970810a927
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.53.1.el7/1c634f94.failed
+
+Before this patch, function do_xmote would try to sync out the glock
+dirty data by calling the appropriate glops function XXX_go_sync()
+but it did not check for a good return code. If the sync was not
+possible due to an io error or whatever, do_xmote would continue on
+and call go_inval and release the glock to other cluster nodes.
+When those nodes go to replay the journal, they may already be holding
+glocks for the journal records that should have been synced, but were
+not due to the ignored error.
+
+This patch introduces proper error code checking to the go_sync
+family of glops functions.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Reviewed-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 1c634f94c3da39115270d35b3075af970810a927)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.c
+#	fs/gfs2/glops.c
+diff --cc fs/gfs2/glock.c
+index 2fe855e86afc,0bfa58e5a64e..000000000000
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@@ -577,13 -602,64 +577,43 @@@ __acquires(&gl->gl_lockref.lock
+  	    (lck_flags & (LM_FLAG_TRY|LM_FLAG_TRY_1CB)))
+  		clear_bit(GLF_BLOCKING, &gl->gl_flags);
+  	spin_unlock(&gl->gl_lockref.lock);
+++<<<<<<< HEAD
+ +	if (glops->go_sync)
+ +		glops->go_sync(gl);
+ +	if (test_bit(GLF_INVALIDATE_IN_PROGRESS, &gl->gl_flags))
+++=======
++ 	if (glops->go_sync) {
++ 		ret = glops->go_sync(gl);
++ 		/* If we had a problem syncing (due to io errors or whatever,
++ 		 * we should not invalidate the metadata or tell dlm to
++ 		 * release the glock to other nodes.
++ 		 */
++ 		if (ret) {
++ 			if (cmpxchg(&sdp->sd_log_error, 0, ret)) {
++ 				fs_err(sdp, "Error %d syncing glock \n", ret);
++ 				gfs2_dump_glock(NULL, gl, true);
++ 			}
++ 			return;
++ 		}
++ 	}
++ 	if (test_bit(GLF_INVALIDATE_IN_PROGRESS, &gl->gl_flags)) {
++ 		/*
++ 		 * The call to go_sync should have cleared out the ail list.
++ 		 * If there are still items, we have a problem. We ought to
++ 		 * withdraw, but we can't because the withdraw code also uses
++ 		 * glocks. Warn about the error, dump the glock, then fall
++ 		 * through and wait for logd to do the withdraw for us.
++ 		 */
++ 		if ((atomic_read(&gl->gl_ail_count) != 0) &&
++ 		    (!cmpxchg(&sdp->sd_log_error, 0, -EIO))) {
++ 			gfs2_assert_warn(sdp, !atomic_read(&gl->gl_ail_count));
++ 			gfs2_dump_glock(NULL, gl, true);
++ 		}
+++>>>>>>> 1c634f94c3da (gfs2: Do proper error checking for go_sync family of glops functions)
+  		glops->go_inval(gl, target == LM_ST_DEFERRED ? 0 : DIO_METADATA);
+ -		clear_bit(GLF_INVALIDATE_IN_PROGRESS, &gl->gl_flags);
+ -	}
+ +	clear_bit(GLF_INVALIDATE_IN_PROGRESS, &gl->gl_flags);
+  
+  	gfs2_glock_hold(gl);
+ -	/*
+ -	 * Check for an error encountered since we called go_sync and go_inval.
+ -	 * If so, we can't withdraw from the glock code because the withdraw
+ -	 * code itself uses glocks (see function signal_our_withdraw) to
+ -	 * change the mount to read-only. Most importantly, we must not call
+ -	 * dlm to unlock the glock until the journal is in a known good state
+ -	 * (after journal replay) otherwise other nodes may use the object
+ -	 * (rgrp or dinode) and then later, journal replay will corrupt the
+ -	 * file system. The best we can do here is wait for the logd daemon
+ -	 * to see sd_log_error and withdraw, and in the meantime, requeue the
+ -	 * work for later.
+ -	 *
+ -	 * However, if we're just unlocking the lock (say, for unmount, when
+ -	 * gfs2_gl_hash_clear calls clear_glock) and recovery is complete
+ -	 * then it's okay to tell dlm to unlock it.
+ -	 */
+ -	if (unlikely(sdp->sd_log_error && !gfs2_withdrawn(sdp)))
+ -		gfs2_withdraw_delayed(sdp);
+ -	if (glock_blocked_by_withdraw(gl)) {
+ -		if (target != LM_ST_UNLOCKED ||
+ -		    test_bit(SDF_WITHDRAW_RECOVERY, &sdp->sd_flags)) {
+ -			gfs2_glock_queue_work(gl, GL_GLOCK_DFT_HOLD);
+ -			goto out;
+ -		}
+ -	}
+ -
+  	if (sdp->sd_lockstruct.ls_ops->lm_lock)	{
+  		/* lock_dlm */
+  		ret = sdp->sd_lockstruct.ls_ops->lm_lock(gl, target, lck_flags);
+diff --cc fs/gfs2/glops.c
+index 90b93ba7dd9f,9e9c7a4b8c66..000000000000
+--- a/fs/gfs2/glops.c
++++ b/fs/gfs2/glops.c
+@@@ -90,21 -93,51 +91,66 @@@ static int gfs2_ail_empty_gl(struct gfs
+  	INIT_LIST_HEAD(&tr.tr_databuf);
+  	tr.tr_revokes = atomic_read(&gl->gl_ail_count);
+  
+++<<<<<<< HEAD
+ +	if (!tr.tr_revokes)
+ +		return;
+ +
+ +	/* A shortened, inline version of gfs2_trans_begin() */
+ +	tr.tr_reserved = 1 + gfs2_struct2blk(sdp, tr.tr_revokes, sizeof(u64));
+ +	tr.tr_ip = (unsigned long)__builtin_return_address(0);
+ +	sb_start_intwrite(sdp->sd_vfs);
+ +	gfs2_log_reserve(sdp, tr.tr_reserved);
+++=======
++ 	if (!tr.tr_revokes) {
++ 		bool have_revokes;
++ 		bool log_in_flight;
++ 
++ 		/*
++ 		 * We have nothing on the ail, but there could be revokes on
++ 		 * the sdp revoke queue, in which case, we still want to flush
++ 		 * the log and wait for it to finish.
++ 		 *
++ 		 * If the sdp revoke list is empty too, we might still have an
++ 		 * io outstanding for writing revokes, so we should wait for
++ 		 * it before returning.
++ 		 *
++ 		 * If none of these conditions are true, our revokes are all
++ 		 * flushed and we can return.
++ 		 */
++ 		gfs2_log_lock(sdp);
++ 		have_revokes = !list_empty(&sdp->sd_log_revokes);
++ 		log_in_flight = atomic_read(&sdp->sd_log_in_flight);
++ 		gfs2_log_unlock(sdp);
++ 		if (have_revokes)
++ 			goto flush;
++ 		if (log_in_flight)
++ 			log_flush_wait(sdp);
++ 		return 0;
++ 	}
++ 
++ 	/* A shortened, inline version of gfs2_trans_begin()
++          * tr->alloced is not set since the transaction structure is
++          * on the stack */
++ 	tr.tr_reserved = 1 + gfs2_struct2blk(sdp, tr.tr_revokes);
++ 	tr.tr_ip = _RET_IP_;
++ 	ret = gfs2_log_reserve(sdp, tr.tr_reserved);
++ 	if (ret < 0)
++ 		return ret;
+++>>>>>>> 1c634f94c3da (gfs2: Do proper error checking for go_sync family of glops functions)
+  	WARN_ON_ONCE(current->journal_info);
+  	current->journal_info = &tr;
+  
+  	__gfs2_ail_flush(gl, 0, tr.tr_revokes);
+  
+  	gfs2_trans_end(sdp);
+++<<<<<<< HEAD
+ +	gfs2_log_flush(sdp, NULL);
+++=======
++ flush:
++ 	gfs2_log_flush(sdp, NULL, GFS2_LOG_HEAD_FLUSH_NORMAL |
++ 		       GFS2_LFC_AIL_EMPTY_GL);
++ 	return 0;
+++>>>>>>> 1c634f94c3da (gfs2: Do proper error checking for go_sync family of glops functions)
+  }
+  
+  void gfs2_ail_flush(struct gfs2_glock *gl, bool fsync)
+@@@ -134,30 -168,28 +180,41 @@@
+   *
+   * Called when demoting or unlocking an EX glock.  We must flush
+   * to disk all dirty buffers/pages relating to this glock, and must not
+ - * return to caller to demote/unlock the glock until I/O is complete.
+ + * not return to caller to demote/unlock the glock until I/O is complete.
+   */
+  
+- static void rgrp_go_sync(struct gfs2_glock *gl)
++ static int rgrp_go_sync(struct gfs2_glock *gl)
+  {
+ -	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
+ -	struct address_space *mapping = &sdp->sd_aspace;
+ -	struct gfs2_rgrpd *rgd = gfs2_glock2rgrp(gl);
+ +	struct address_space *metamapping = gfs2_glock2aspace(gl);
+ +	struct gfs2_rgrpd *rgd;
+  	int error;
+  
+ +	spin_lock(&gl->gl_lockref.lock);
+ +	rgd = gl->gl_object;
+ +	if (rgd)
+ +		gfs2_rgrp_brelse(rgd);
+ +	spin_unlock(&gl->gl_lockref.lock);
+ +
+  	if (!test_and_clear_bit(GLF_DIRTY, &gl->gl_flags))
+- 		return;
++ 		return 0;
+  	GLOCK_BUG_ON(gl, gl->gl_state != LM_ST_EXCLUSIVE);
+  
+++<<<<<<< HEAD
+ +	gfs2_log_flush(gl->gl_name.ln_sbd, gl);
+ +	filemap_fdatawrite(metamapping);
+ +	error = filemap_fdatawait(metamapping);
+ +        mapping_set_error(metamapping, error);
+ +	gfs2_ail_empty_gl(gl);
+++=======
++ 	gfs2_log_flush(sdp, gl, GFS2_LOG_HEAD_FLUSH_NORMAL |
++ 		       GFS2_LFC_RGRP_GO_SYNC);
++ 	filemap_fdatawrite_range(mapping, gl->gl_vm.start, gl->gl_vm.end);
++ 	error = filemap_fdatawait_range(mapping, gl->gl_vm.start, gl->gl_vm.end);
++ 	WARN_ON_ONCE(error);
++ 	mapping_set_error(mapping, error);
++ 	if (!error)
++ 		error = gfs2_ail_empty_gl(gl);
+++>>>>>>> 1c634f94c3da (gfs2: Do proper error checking for go_sync family of glops functions)
+  
+  	spin_lock(&gl->gl_lockref.lock);
+  	rgd = gl->gl_object;
+@@@ -485,15 -522,29 +544,37 @@@ static int inode_go_dump(struct seq_fil
+   *
+   */
+  
+++<<<<<<< HEAD
+ +static void trans_go_sync(struct gfs2_glock *gl)
+++=======
++ static int freeze_go_sync(struct gfs2_glock *gl)
+++>>>>>>> 1c634f94c3da (gfs2: Do proper error checking for go_sync family of glops functions)
+  {
+ -	int error = 0;
+  	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
+  
+ -	if (gl->gl_state == LM_ST_SHARED && !gfs2_withdrawn(sdp) &&
+ +	if (gl->gl_state != LM_ST_UNLOCKED &&
+  	    test_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags)) {
+++<<<<<<< HEAD
+ +		gfs2_meta_syncfs(sdp);
+ +		gfs2_log_shutdown(sdp, 0);
+++=======
++ 		atomic_set(&sdp->sd_freeze_state, SFS_STARTING_FREEZE);
++ 		error = freeze_super(sdp->sd_vfs);
++ 		if (error) {
++ 			fs_info(sdp, "GFS2: couldn't freeze filesystem: %d\n",
++ 				error);
++ 			if (gfs2_withdrawn(sdp)) {
++ 				atomic_set(&sdp->sd_freeze_state, SFS_UNFROZEN);
++ 				return 0;
++ 			}
++ 			gfs2_assert_withdraw(sdp, 0);
++ 		}
++ 		queue_work(gfs2_freeze_wq, &sdp->sd_freeze_work);
++ 		gfs2_log_flush(sdp, NULL, GFS2_LOG_HEAD_FLUSH_FREEZE |
++ 			       GFS2_LFC_FREEZE_GO_SYNC);
+++>>>>>>> 1c634f94c3da (gfs2: Do proper error checking for go_sync family of glops functions)
+  	}
++ 	return 0;
+  }
+  
+  /**
+* Unmerged path fs/gfs2/glock.c
+* Unmerged path fs/gfs2/glops.c
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index 1f6f222b6802..15fc998f1a98 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -205,7 +205,7 @@ struct lm_lockname {
+ 
+ 
+ struct gfs2_glock_operations {
+-	void (*go_sync) (struct gfs2_glock *gl);
++	int (*go_sync) (struct gfs2_glock *gl);
+ 	int (*go_xmote_bh) (struct gfs2_glock *gl, struct gfs2_holder *gh);
+ 	void (*go_inval) (struct gfs2_glock *gl, int flags);
+ 	int (*go_demote_ok) (const struct gfs2_glock *gl);
