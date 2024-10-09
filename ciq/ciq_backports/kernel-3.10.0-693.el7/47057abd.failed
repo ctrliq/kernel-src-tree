@@ -1,0 +1,216 @@
+nfsd: add support for the umask attribute
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 47057abde515155a4fee53038e7772d6b387e0aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/47057abd.failed
+
+Clients can set the umask attribute when creating files to cause the
+server to apply it always except when inheriting permissions from the
+parent directory.  That way, the new files will end up with the same
+permissions as files created locally.
+
+See https://tools.ietf.org/html/draft-ietf-nfsv4-umask-02 for more
+details.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit 47057abde515155a4fee53038e7772d6b387e0aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfs4proc.c
+diff --cc fs/nfsd/nfs4proc.c
+index b945ba792c0b,74a6e573e061..000000000000
+--- a/fs/nfsd/nfs4proc.c
++++ b/fs/nfsd/nfs4proc.c
+@@@ -95,33 -96,15 +95,43 @@@ check_attr_support(struct svc_rqst *rqs
+  {
+  	struct dentry *dentry = cstate->current_fh.fh_dentry;
+  
+ -	if (!nfsd_attrs_supported(cstate->minorversion, bmval))
+ +	/*
+ +	 * Check about attributes are supported by the NFSv4 server or not.
+ +	 * According to spec, unsupported attributes return ERR_ATTRNOTSUPP.
+ +	 */
+ +	if ((bmval[0] & ~nfsd_suppattrs0(cstate->minorversion)) ||
+ +	    (bmval[1] & ~nfsd_suppattrs1(cstate->minorversion)) ||
+ +	    (bmval[2] & ~nfsd_suppattrs2(cstate->minorversion)))
+  		return nfserr_attrnotsupp;
+++<<<<<<< HEAD
+ +
+ +	/*
+ +	 * Check FATTR4_WORD0_ACL can be supported
+ +	 * in current environment or not.
+ +	 */
+ +	if (bmval[0] & FATTR4_WORD0_ACL) {
+ +		if (!IS_POSIXACL(dentry->d_inode))
+ +			return nfserr_attrnotsupp;
+ +	}
+ +
+ +	/*
+ +	 * According to spec, read-only attributes return ERR_INVAL.
+ +	 */
+ +	if (writable) {
+ +		if ((bmval[0] & ~writable[0]) || (bmval[1] & ~writable[1]) ||
+ +		    (bmval[2] & ~writable[2]))
+ +			return nfserr_inval;
+ +	}
+ +
+++=======
++ 	if ((bmval[0] & FATTR4_WORD0_ACL) && !IS_POSIXACL(d_inode(dentry)))
++ 		return nfserr_attrnotsupp;
++ 	if (writable && !bmval_is_subset(bmval, writable))
++ 		return nfserr_inval;
++ 	if (writable && (bmval[2] & FATTR4_WORD2_MODE_UMASK) &&
++ 			(bmval[1] & FATTR4_WORD1_MODE))
++ 		return nfserr_inval;
+++>>>>>>> 47057abde515 (nfsd: add support for the umask attribute)
+  	return nfs_ok;
+  }
+  
+* Unmerged path fs/nfsd/nfs4proc.c
+diff --git a/fs/nfsd/nfs4xdr.c b/fs/nfsd/nfs4xdr.c
+index fa3a6931fef1..6340ae680dcc 100644
+--- a/fs/nfsd/nfs4xdr.c
++++ b/fs/nfsd/nfs4xdr.c
+@@ -33,6 +33,7 @@
+  *  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  */
+ 
++#include <linux/fs_struct.h>
+ #include <linux/file.h>
+ #include <linux/slab.h>
+ #include <linux/namei.h>
+@@ -285,7 +286,7 @@ nfsd4_decode_bitmap(struct nfsd4_compoundargs *argp, u32 *bmval)
+ static __be32
+ nfsd4_decode_fattr(struct nfsd4_compoundargs *argp, u32 *bmval,
+ 		   struct iattr *iattr, struct nfs4_acl **acl,
+-		   struct xdr_netobj *label)
++		   struct xdr_netobj *label, int *umask)
+ {
+ 	int expected_len, len = 0;
+ 	u32 dummy32;
+@@ -443,6 +444,17 @@ nfsd4_decode_fattr(struct nfsd4_compoundargs *argp, u32 *bmval,
+ 			return nfserr_jukebox;
+ 	}
+ #endif
++	if (bmval[2] & FATTR4_WORD2_MODE_UMASK) {
++		if (!umask)
++			goto xdr_error;
++		READ_BUF(8);
++		len += 8;
++		dummy32 = be32_to_cpup(p++);
++		iattr->ia_mode = dummy32 & (S_IFMT | S_IALLUGO);
++		dummy32 = be32_to_cpup(p++);
++		*umask = dummy32 & S_IRWXUGO;
++		iattr->ia_valid |= ATTR_MODE;
++	}
+ 	if (len != expected_len)
+ 		goto xdr_error;
+ 
+@@ -637,7 +649,8 @@ nfsd4_decode_create(struct nfsd4_compoundargs *argp, struct nfsd4_create *create
+ 		return status;
+ 
+ 	status = nfsd4_decode_fattr(argp, create->cr_bmval, &create->cr_iattr,
+-				    &create->cr_acl, &create->cr_label);
++				    &create->cr_acl, &create->cr_label,
++				    &current->fs->umask);
+ 	if (status)
+ 		goto out;
+ 
+@@ -882,13 +895,15 @@ nfsd4_decode_open(struct nfsd4_compoundargs *argp, struct nfsd4_open *open)
+ 	case NFS4_OPEN_NOCREATE:
+ 		break;
+ 	case NFS4_OPEN_CREATE:
++		current->fs->umask = 0;
+ 		READ_BUF(4);
+ 		open->op_createmode = be32_to_cpup(p++);
+ 		switch (open->op_createmode) {
+ 		case NFS4_CREATE_UNCHECKED:
+ 		case NFS4_CREATE_GUARDED:
+ 			status = nfsd4_decode_fattr(argp, open->op_bmval,
+-				&open->op_iattr, &open->op_acl, &open->op_label);
++				&open->op_iattr, &open->op_acl, &open->op_label,
++				&current->fs->umask);
+ 			if (status)
+ 				goto out;
+ 			break;
+@@ -902,7 +917,8 @@ nfsd4_decode_open(struct nfsd4_compoundargs *argp, struct nfsd4_open *open)
+ 			READ_BUF(NFS4_VERIFIER_SIZE);
+ 			COPYMEM(open->op_verf.data, NFS4_VERIFIER_SIZE);
+ 			status = nfsd4_decode_fattr(argp, open->op_bmval,
+-				&open->op_iattr, &open->op_acl, &open->op_label);
++				&open->op_iattr, &open->op_acl, &open->op_label,
++				&current->fs->umask);
+ 			if (status)
+ 				goto out;
+ 			break;
+@@ -1139,7 +1155,7 @@ nfsd4_decode_setattr(struct nfsd4_compoundargs *argp, struct nfsd4_setattr *seta
+ 	if (status)
+ 		return status;
+ 	return nfsd4_decode_fattr(argp, setattr->sa_bmval, &setattr->sa_iattr,
+-				  &setattr->sa_acl, &setattr->sa_label);
++				  &setattr->sa_acl, &setattr->sa_label, NULL);
+ }
+ 
+ static __be32
+diff --git a/fs/nfsd/nfsd.h b/fs/nfsd/nfsd.h
+index 7d29741d8f4b..5c63433948ef 100644
+--- a/fs/nfsd/nfsd.h
++++ b/fs/nfsd/nfsd.h
+@@ -354,6 +354,7 @@ void		nfsd_lockd_shutdown(void);
+ 
+ #define NFSD4_2_SUPPORTED_ATTRS_WORD2 \
+ 	(NFSD4_1_SUPPORTED_ATTRS_WORD2 | \
++	FATTR4_WORD2_MODE_UMASK | \
+ 	NFSD4_2_SECURITY_ATTRS)
+ 
+ static inline u32 nfsd_suppattrs0(u32 minorversion)
+@@ -392,10 +393,14 @@ static inline u32 nfsd_suppattrs2(u32 minorversion)
+ 	(FATTR4_WORD1_MODE | FATTR4_WORD1_OWNER | FATTR4_WORD1_OWNER_GROUP \
+ 	| FATTR4_WORD1_TIME_ACCESS_SET | FATTR4_WORD1_TIME_MODIFY_SET)
+ #ifdef CONFIG_NFSD_V4_SECURITY_LABEL
+-#define NFSD_WRITEABLE_ATTRS_WORD2 FATTR4_WORD2_SECURITY_LABEL
++#define MAYBE_FATTR4_WORD2_SECURITY_LABEL \
++	FATTR4_WORD2_SECURITY_LABEL
+ #else
+-#define NFSD_WRITEABLE_ATTRS_WORD2 0
++#define MAYBE_FATTR4_WORD2_SECURITY_LABEL 0
+ #endif
++#define NFSD_WRITEABLE_ATTRS_WORD2 \
++	(FATTR4_WORD2_MODE_UMASK \
++	| MAYBE_FATTR4_WORD2_SECURITY_LABEL)
+ 
+ #define NFSD_SUPPATTR_EXCLCREAT_WORD0 \
+ 	NFSD_WRITEABLE_ATTRS_WORD0
+diff --git a/fs/nfsd/nfssvc.c b/fs/nfsd/nfssvc.c
+index a2b65fc56dd6..e6bfd96734c0 100644
+--- a/fs/nfsd/nfssvc.c
++++ b/fs/nfsd/nfssvc.c
+@@ -661,8 +661,8 @@ nfsd(void *vrqstp)
+ 	mutex_lock(&nfsd_mutex);
+ 
+ 	/* At this point, the thread shares current->fs
+-	 * with the init process. We need to create files with a
+-	 * umask of 0 instead of init's umask. */
++	 * with the init process. We need to create files with the
++	 * umask as defined by the client instead of init's umask. */
+ 	if (unshare_fs_struct() < 0) {
+ 		printk("Unable to start nfsd thread: out of memory\n");
+ 		goto out;
+diff --git a/include/linux/nfs4.h b/include/linux/nfs4.h
+index 40f13d5e824c..68b017b962b3 100644
+--- a/include/linux/nfs4.h
++++ b/include/linux/nfs4.h
+@@ -432,6 +432,7 @@ enum lock_type4 {
+ #define FATTR4_WORD2_MDSTHRESHOLD       (1UL << 4)
+ #define FATTR4_WORD2_CLONE_BLKSIZE	(1UL << 13)
+ #define FATTR4_WORD2_SECURITY_LABEL     (1UL << 16)
++#define FATTR4_WORD2_MODE_UMASK		(1UL << 17)
+ 
+ /* MDS threshold bitmap bits */
+ #define THRESHOLD_RD                    (1UL << 0)
