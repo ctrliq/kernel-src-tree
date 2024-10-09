@@ -1,0 +1,139 @@
+mnt: In umount propagation reparent in a separate pass
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit 570487d3faf2a1d8a220e6ee10f472163123d7da
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/570487d3.failed
+
+It was observed that in some pathlogical cases that the current code
+does not unmount everything it should.  After investigation it
+was determined that the issue is that mnt_change_mntpoint can
+can change which mounts are available to be unmounted during mount
+propagation which is wrong.
+
+The trivial reproducer is:
+$ cat ./pathological.sh
+
+mount -t tmpfs test-base /mnt
+cd /mnt
+mkdir 1 2 1/1
+mount --bind 1 1
+mount --make-shared 1
+mount --bind 1 2
+mount --bind 1/1 1/1
+mount --bind 1/1 1/1
+echo
+grep test-base /proc/self/mountinfo
+umount 1/1
+echo
+grep test-base /proc/self/mountinfo
+
+$ unshare -Urm ./pathological.sh
+
+The expected output looks like:
+46 31 0:25 / /mnt rw,relatime - tmpfs test-base rw,uid=1000,gid=1000
+47 46 0:25 /1 /mnt/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+48 46 0:25 /1 /mnt/2 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+49 54 0:25 /1/1 /mnt/1/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+50 53 0:25 /1/1 /mnt/2/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+51 49 0:25 /1/1 /mnt/1/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+54 47 0:25 /1/1 /mnt/1/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+53 48 0:25 /1/1 /mnt/2/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+52 50 0:25 /1/1 /mnt/2/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+
+46 31 0:25 / /mnt rw,relatime - tmpfs test-base rw,uid=1000,gid=1000
+47 46 0:25 /1 /mnt/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+48 46 0:25 /1 /mnt/2 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+
+The output without the fix looks like:
+46 31 0:25 / /mnt rw,relatime - tmpfs test-base rw,uid=1000,gid=1000
+47 46 0:25 /1 /mnt/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+48 46 0:25 /1 /mnt/2 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+49 54 0:25 /1/1 /mnt/1/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+50 53 0:25 /1/1 /mnt/2/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+51 49 0:25 /1/1 /mnt/1/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+54 47 0:25 /1/1 /mnt/1/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+53 48 0:25 /1/1 /mnt/2/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+52 50 0:25 /1/1 /mnt/2/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+
+46 31 0:25 / /mnt rw,relatime - tmpfs test-base rw,uid=1000,gid=1000
+47 46 0:25 /1 /mnt/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+48 46 0:25 /1 /mnt/2 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+52 48 0:25 /1/1 /mnt/2/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+
+That last mount in the output was in the propgation tree to be unmounted but
+was missed because the mnt_change_mountpoint changed it's parent before the walk
+through the mount propagation tree observed it.
+
+	Cc: stable@vger.kernel.org
+Fixes: 1064f874abc0 ("mnt: Tuck mounts under others instead of creating shadow/side mounts.")
+	Acked-by: Andrei Vagin <avagin@virtuozzo.com>
+	Reviewed-by: Ram Pai <linuxram@us.ibm.com>
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit 570487d3faf2a1d8a220e6ee10f472163123d7da)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namespace.c
+#	fs/pnode.c
+diff --cc fs/namespace.c
+index e6c16f498e31,51e49866e1fe..000000000000
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@@ -232,9 -236,7 +232,13 @@@ static struct mount *alloc_vfsmnt(cons
+  		INIT_LIST_HEAD(&mnt->mnt_slave_list);
+  		INIT_LIST_HEAD(&mnt->mnt_slave);
+  		INIT_HLIST_NODE(&mnt->mnt_mp_list);
+++<<<<<<< HEAD
+ +#ifdef CONFIG_FSNOTIFY
+ +		INIT_HLIST_HEAD(&mnt->mnt_fsnotify_marks);
+ +#endif
+++=======
++ 		INIT_LIST_HEAD(&mnt->mnt_reparent);
+++>>>>>>> 570487d3faf2 (mnt: In umount propagation reparent in a separate pass)
+  		init_fs_pin(&mnt->mnt_umount, drop_mountpoint);
+  	}
+  	return mnt;
+diff --cc fs/pnode.c
+index 5922b82d049b,52aca0a118ff..000000000000
+--- a/fs/pnode.c
++++ b/fs/pnode.c
+@@@ -430,8 -458,17 +430,21 @@@ static void __propagate_umount(struct m
+  		if (!child || !IS_MNT_MARKED(child))
+  			continue;
+  		CLEAR_MNT_MARK(child);
+++<<<<<<< HEAD
+ +		if (list_empty(&child->mnt_mounts)) {
+++=======
++ 
++ 		/* If there is exactly one mount covering all of child
++ 		 * replace child with that mount.
++ 		 */
++ 		topper = find_topper(child);
++ 		if (topper)
++ 			list_add_tail(&topper->mnt_reparent, to_reparent);
++ 
++ 		if (topper || list_empty(&child->mnt_mounts)) {
+++>>>>>>> 570487d3faf2 (mnt: In umount propagation reparent in a separate pass)
+  			list_del_init(&child->mnt_child);
++ 			list_del_init(&child->mnt_reparent);
+  			child->mnt.mnt_flags |= MNT_UMOUNT;
+  			list_move_tail(&child->mnt_list, &mnt->mnt_list);
+  		}
+diff --git a/fs/mount.h b/fs/mount.h
+index 21f733c2adca..eb4a5a377f4a 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -55,6 +55,7 @@ struct mount {
+ 	struct mnt_namespace *mnt_ns;	/* containing namespace */
+ 	struct mountpoint *mnt_mp;	/* where is it mounted */
+ 	struct hlist_node mnt_mp_list;	/* list mounts with the same mountpoint */
++	struct list_head mnt_reparent;	/* reparent list entry */
+ #ifdef CONFIG_FSNOTIFY
+ 	struct hlist_head mnt_fsnotify_marks;
+ 	__u32 mnt_fsnotify_mask;
+* Unmerged path fs/namespace.c
+* Unmerged path fs/pnode.c
