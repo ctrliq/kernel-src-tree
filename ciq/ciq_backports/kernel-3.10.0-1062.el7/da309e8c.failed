@@ -1,0 +1,126 @@
+ovl: factor out ovl_map_dev_ino() helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit da309e8c055de8d6461ae01764a3352c77878735
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/da309e8c.failed
+
+A helper for ovl_getattr() to map the values of st_dev and st_ino
+according to constant st_ino rules.
+
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit da309e8c055de8d6461ae01764a3352c77878735)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/inode.c
+diff --cc fs/overlayfs/inode.c
+index 24ce49ae057f,8a283ec21e34..000000000000
+--- a/fs/overlayfs/inode.c
++++ b/fs/overlayfs/inode.c
+@@@ -66,9 -59,47 +59,51 @@@ out
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +int ovl_getattr(struct vfsmount *mnt, struct dentry *dentry,
+ +		struct kstat *stat)
+++=======
++ static int ovl_map_dev_ino(struct dentry *dentry, struct kstat *stat,
++ 			   struct ovl_layer *lower_layer)
++ {
++ 	bool samefs = ovl_same_sb(dentry->d_sb);
++ 
++ 	if (samefs) {
++ 		/*
++ 		 * When all layers are on the same fs, all real inode
++ 		 * number are unique, so we use the overlay st_dev,
++ 		 * which is friendly to du -x.
++ 		 */
++ 		stat->dev = dentry->d_sb->s_dev;
++ 	} else if (S_ISDIR(dentry->d_inode->i_mode)) {
++ 		/*
++ 		 * Always use the overlay st_dev for directories, so 'find
++ 		 * -xdev' will scan the entire overlay mount and won't cross the
++ 		 * overlay mount boundaries.
++ 		 *
++ 		 * If not all layers are on the same fs the pair {real st_ino;
++ 		 * overlay st_dev} is not unique, so use the non persistent
++ 		 * overlay st_ino for directories.
++ 		 */
++ 		stat->dev = dentry->d_sb->s_dev;
++ 		stat->ino = dentry->d_inode->i_ino;
++ 	} else if (lower_layer) {
++ 		/*
++ 		 * For non-samefs setup, if we cannot map all layers st_ino
++ 		 * to a unified address space, we need to make sure that st_dev
++ 		 * is unique per layer. Upper layer uses real st_dev and lower
++ 		 * layers use the unique anonymous bdev.
++ 		 */
++ 		stat->dev = lower_layer->pseudo_dev;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int ovl_getattr(const struct path *path, struct kstat *stat,
++ 		u32 request_mask, unsigned int flags)
+++>>>>>>> da309e8c055d (ovl: factor out ovl_map_dev_ino() helper)
+  {
+ -	struct dentry *dentry = path->dentry;
+  	enum ovl_path_type type;
+  	struct path realpath;
+  	const struct cred *old_cred;
+@@@ -90,11 -122,15 +126,13 @@@
+  	 * persistent st_ino across mount cycle.
+  	 */
+  	if (!is_dir || samefs) {
+- 		if (OVL_TYPE_ORIGIN(type)) {
++ 		if (!OVL_TYPE_UPPER(type)) {
++ 			lower_layer = ovl_layer_lower(dentry);
++ 		} else if (OVL_TYPE_ORIGIN(type)) {
+  			struct kstat lowerstat;
+ -			u32 lowermask = STATX_INO | (!is_dir ? STATX_NLINK : 0);
+  
+  			ovl_path_lower(dentry, &realpath);
+ -			err = vfs_getattr(&realpath, &lowerstat,
+ -					  lowermask, flags);
+ +			err = vfs_getattr(&realpath, &lowerstat);
+  			if (err)
+  				goto out;
+  
+* Unmerged path fs/overlayfs/inode.c
+diff --git a/fs/overlayfs/overlayfs.h b/fs/overlayfs/overlayfs.h
+index 403c48960f89..d013b600aec9 100644
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@ -200,6 +200,7 @@ void ovl_path_lower(struct dentry *dentry, struct path *path);
+ enum ovl_path_type ovl_path_real(struct dentry *dentry, struct path *path);
+ struct dentry *ovl_dentry_upper(struct dentry *dentry);
+ struct dentry *ovl_dentry_lower(struct dentry *dentry);
++struct ovl_layer *ovl_layer_lower(struct dentry *dentry);
+ struct dentry *ovl_dentry_real(struct dentry *dentry);
+ struct dentry *ovl_i_dentry_upper(struct inode *inode);
+ struct inode *ovl_inode_upper(struct inode *inode);
+diff --git a/fs/overlayfs/util.c b/fs/overlayfs/util.c
+index 92f3412841eb..b5da2177d21f 100644
+--- a/fs/overlayfs/util.c
++++ b/fs/overlayfs/util.c
+@@ -154,6 +154,13 @@ struct dentry *ovl_dentry_lower(struct dentry *dentry)
+ 	return oe->numlower ? oe->lowerstack[0].dentry : NULL;
+ }
+ 
++struct ovl_layer *ovl_layer_lower(struct dentry *dentry)
++{
++	struct ovl_entry *oe = dentry->d_fsdata;
++
++	return oe->numlower ? oe->lowerstack[0].layer : NULL;
++}
++
+ struct dentry *ovl_dentry_real(struct dentry *dentry)
+ {
+ 	return ovl_dentry_upper(dentry) ?: ovl_dentry_lower(dentry);
