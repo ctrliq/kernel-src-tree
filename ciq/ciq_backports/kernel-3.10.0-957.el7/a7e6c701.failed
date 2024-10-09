@@ -1,0 +1,212 @@
+x86, memremap: fix altmap accounting at free
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [x86] memremap: fix altmap accounting at free (Jeff Moyer) [1505291]
+Rebuild_FUZZ: 93.98%
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit a7e6c7015bf3e0cb467a2f6c0e1de985ee1a0ecb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/a7e6c701.failed
+
+Commit 24b6d4164348 "mm: pass the vmem_altmap to vmemmap_free" converted
+the vmemmap_free() path to pass the altmap argument all the way through
+the call chain rather than looking it up based on the page.
+Unfortunately that ends up over freeing altmap allocated pages in some
+cases since free_pagetable() is used to free both memmap space and pte
+space, where only the memmap stored in huge pages uses altmap
+allocations.
+
+Given that altmap allocations for memmap space are special cased in
+vmemmap_populate_hugepages() add a symmetric / special case
+free_hugepage_table() to handle altmap freeing, and cleanup the unneeded
+passing of altmap to leaf functions that do not require it.
+
+Without this change the sanity check accounting in
+devm_memremap_pages_release() will throw a warning with the following
+signature.
+
+ nd_pmem pfn10.1: devm_memremap_pages_release: failed to free all reserved pages
+ WARNING: CPU: 44 PID: 3539 at kernel/memremap.c:310 devm_memremap_pages_release+0x1c7/0x220
+ CPU: 44 PID: 3539 Comm: ndctl Tainted: G             L   4.16.0-rc1-linux-stable #7
+ RIP: 0010:devm_memremap_pages_release+0x1c7/0x220
+ [..]
+ Call Trace:
+  release_nodes+0x225/0x270
+  device_release_driver_internal+0x15d/0x210
+  bus_remove_device+0xe2/0x160
+  device_del+0x130/0x310
+  ? klist_release+0x56/0x100
+  ? nd_region_notify+0xc0/0xc0 [libnvdimm]
+  device_unregister+0x16/0x60
+
+This was missed in testing since not all configurations will trigger
+this warning.
+
+Fixes: 24b6d4164348 ("mm: pass the vmem_altmap to vmemmap_free")
+	Reported-by: Jane Chu <jane.chu@oracle.com>
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit a7e6c7015bf3e0cb467a2f6c0e1de985ee1a0ecb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/mm/init_64.c
+diff --cc arch/x86/mm/init_64.c
+index 25c65b6af83e,af11a2890235..000000000000
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@@ -701,13 -804,7 +701,8 @@@ static void __meminit free_pagetable(st
+  {
+  	unsigned long magic;
+  	unsigned int nr_pages = 1 << order;
+ +	struct vmem_altmap *altmap = to_vmem_altmap((unsigned long) page);
+  
+- 	if (altmap) {
+- 		vmem_altmap_free(altmap, nr_pages);
+- 		return;
+- 	}
+- 
+  	/* bootmem page has reserved flag */
+  	if (PageReserved(page)) {
+  		__ClearPageReserved(page);
+@@@ -723,6 -820,15 +718,19 @@@
+  		free_pages((unsigned long)page_address(page), order);
+  }
+  
+++<<<<<<< HEAD
+++static void __meminit free_pte_table(pte_t *pte_start, pmd_t *pmd)
+++=======
++ static void __meminit free_hugepage_table(struct page *page,
++ 		struct vmem_altmap *altmap)
+++>>>>>>> a7e6c7015bf3 (x86, memremap: fix altmap accounting at free)
++ {
++ 	if (altmap)
++ 		vmem_altmap_free(altmap, PMD_SIZE / PAGE_SIZE);
++ 	else
++ 		free_pagetable(page, get_order(PMD_SIZE));
++ }
++ 
+  static void __meminit free_pte_table(pte_t *pte_start, pmd_t *pmd)
+  {
+  	pte_t *pte;
+@@@ -759,6 -865,24 +767,27 @@@ static void __meminit free_pmd_table(pm
+  	spin_unlock(&init_mm.page_table_lock);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void __meminit free_pud_table(pud_t *pud_start, p4d_t *p4d)
++ {
++ 	pud_t *pud;
++ 	int i;
++ 
++ 	for (i = 0; i < PTRS_PER_PUD; i++) {
++ 		pud = pud_start + i;
++ 		if (!pud_none(*pud))
++ 			return;
++ 	}
++ 
++ 	/* free a pud talbe */
++ 	free_pagetable(p4d_page(*p4d), 0);
++ 	spin_lock(&init_mm.page_table_lock);
++ 	p4d_clear(p4d);
++ 	spin_unlock(&init_mm.page_table_lock);
++ }
++ 
+++>>>>>>> a7e6c7015bf3 (x86, memremap: fix altmap accounting at free)
+  static void __meminit
+  remove_pte_table(pte_t *pte_start, unsigned long addr, unsigned long end,
+  		 bool direct)
+@@@ -851,8 -974,8 +880,13 @@@ remove_pmd_table(pmd_t *pmd_start, unsi
+  			if (IS_ALIGNED(addr, PMD_SIZE) &&
+  			    IS_ALIGNED(next, PMD_SIZE)) {
+  				if (!direct)
+++<<<<<<< HEAD
+ +					free_pagetable(pmd_page(*pmd),
+ +						       get_order(PMD_SIZE));
+++=======
++ 					free_hugepage_table(pmd_page(*pmd),
++ 							    altmap);
+++>>>>>>> a7e6c7015bf3 (x86, memremap: fix altmap accounting at free)
+  
+  				spin_lock(&init_mm.page_table_lock);
+  				pmd_clear(pmd);
+@@@ -865,8 -988,8 +899,13 @@@
+  				page_addr = page_address(pmd_page(*pmd));
+  				if (!memchr_inv(page_addr, PAGE_INUSE,
+  						PMD_SIZE)) {
+++<<<<<<< HEAD
+ +					free_pagetable(pmd_page(*pmd),
+ +						       get_order(PMD_SIZE));
+++=======
++ 					free_hugepage_table(pmd_page(*pmd),
++ 							    altmap);
+++>>>>>>> a7e6c7015bf3 (x86, memremap: fix altmap accounting at free)
+  
+  					spin_lock(&init_mm.page_table_lock);
+  					pmd_clear(pmd);
+@@@ -933,8 -1056,8 +972,13 @@@ remove_pud_table(pud_t *pud_start, unsi
+  			continue;
+  		}
+  
+++<<<<<<< HEAD
+ +		pmd_base = (pmd_t *)pud_page_vaddr(*pud);
+ +		remove_pmd_table(pmd_base, addr, next, direct);
+++=======
++ 		pmd_base = pmd_offset(pud, 0);
++ 		remove_pmd_table(pmd_base, addr, next, direct, altmap);
+++>>>>>>> a7e6c7015bf3 (x86, memremap: fix altmap accounting at free)
+  		free_pmd_table(pmd_base, pud);
+  	}
+  
+@@@ -942,9 -1065,42 +986,44 @@@
+  		update_page_count(PG_LEVEL_1G, -pages);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void __meminit
++ remove_p4d_table(p4d_t *p4d_start, unsigned long addr, unsigned long end,
++ 		 struct vmem_altmap *altmap, bool direct)
++ {
++ 	unsigned long next, pages = 0;
++ 	pud_t *pud_base;
++ 	p4d_t *p4d;
++ 
++ 	p4d = p4d_start + p4d_index(addr);
++ 	for (; addr < end; addr = next, p4d++) {
++ 		next = p4d_addr_end(addr, end);
++ 
++ 		if (!p4d_present(*p4d))
++ 			continue;
++ 
++ 		BUILD_BUG_ON(p4d_large(*p4d));
++ 
++ 		pud_base = pud_offset(p4d, 0);
++ 		remove_pud_table(pud_base, addr, next, altmap, direct);
++ 		/*
++ 		 * For 4-level page tables we do not want to free PUDs, but in the
++ 		 * 5-level case we should free them. This code will have to change
++ 		 * to adapt for boot-time switching between 4 and 5 level page tables.
++ 		 */
++ 		if (CONFIG_PGTABLE_LEVELS == 5)
++ 			free_pud_table(pud_base, p4d);
++ 	}
++ 
++ 	if (direct)
++ 		update_page_count(PG_LEVEL_512G, -pages);
++ }
++ 
+++>>>>>>> a7e6c7015bf3 (x86, memremap: fix altmap accounting at free)
+  /* start and end are both virtual address. */
+  static void __meminit
+ -remove_pagetable(unsigned long start, unsigned long end, bool direct,
+ -		struct vmem_altmap *altmap)
+ +remove_pagetable(unsigned long start, unsigned long end, bool direct)
+  {
+  	unsigned long next;
+  	unsigned long addr;
+* Unmerged path arch/x86/mm/init_64.c
