@@ -1,0 +1,165 @@
+ibmvnic: Wait until reset is complete to set carrier on
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Thomas Falcon <tlfalcon@linux.vnet.ibm.com>
+commit cc85c02edfe48a34865ae00f7d22298a3fdd17aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/cc85c02e.failed
+
+Pushes back setting the carrier on until the end of the reset
+code. This resolves a bug where a watchdog timer was detecting
+that a TX queue had stalled before the adapter reset was complete.
+
+	Signed-off-by: Thomas Falcon <tlfalcon@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cc85c02edfe48a34865ae00f7d22298a3fdd17aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index e81cc8c9e858,1a2d8d66f527..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -990,8 -1550,135 +990,135 @@@ static int ibmvnic_set_mac(struct net_d
+  	crq.change_mac_addr.first = IBMVNIC_CRQ_CMD;
+  	crq.change_mac_addr.cmd = CHANGE_MAC_ADDR;
+  	ether_addr_copy(&crq.change_mac_addr.mac_addr[0], addr->sa_data);
+ -
+ -	init_completion(&adapter->fw_done);
+  	ibmvnic_send_crq(adapter, &crq);
+ -	wait_for_completion(&adapter->fw_done);
+  	/* netdev->dev_addr is changed in handle_change_mac_rsp function */
+++<<<<<<< HEAD
+++=======
++ 	return adapter->fw_done_rc ? -EIO : 0;
++ }
++ 
++ static int ibmvnic_set_mac(struct net_device *netdev, void *p)
++ {
++ 	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
++ 	struct sockaddr *addr = p;
++ 	int rc;
++ 
++ 	if (adapter->state == VNIC_PROBED) {
++ 		memcpy(&adapter->desired.mac, addr, sizeof(struct sockaddr));
++ 		adapter->mac_change_pending = true;
++ 		return 0;
++ 	}
++ 
++ 	rc = __ibmvnic_set_mac(netdev, addr);
++ 
++ 	return rc;
++ }
++ 
++ /**
++  * do_reset returns zero if we are able to keep processing reset events, or
++  * non-zero if we hit a fatal error and must halt.
++  */
++ static int do_reset(struct ibmvnic_adapter *adapter,
++ 		    struct ibmvnic_rwi *rwi, u32 reset_state)
++ {
++ 	u64 old_num_rx_queues, old_num_tx_queues;
++ 	struct net_device *netdev = adapter->netdev;
++ 	int i, rc;
++ 
++ 	netdev_dbg(adapter->netdev, "Re-setting driver (%d)\n",
++ 		   rwi->reset_reason);
++ 
++ 	netif_carrier_off(netdev);
++ 	adapter->reset_reason = rwi->reset_reason;
++ 
++ 	old_num_rx_queues = adapter->req_rx_queues;
++ 	old_num_tx_queues = adapter->req_tx_queues;
++ 
++ 	if (rwi->reset_reason == VNIC_RESET_MOBILITY) {
++ 		rc = ibmvnic_reenable_crq_queue(adapter);
++ 		if (rc)
++ 			return 0;
++ 	}
++ 
++ 	rc = __ibmvnic_close(netdev);
++ 	if (rc)
++ 		return rc;
++ 
++ 	if (adapter->reset_reason == VNIC_RESET_CHANGE_PARAM ||
++ 	    adapter->wait_for_reset) {
++ 		release_resources(adapter);
++ 		release_sub_crqs(adapter);
++ 		release_crq_queue(adapter);
++ 	}
++ 
++ 	if (adapter->reset_reason != VNIC_RESET_NON_FATAL) {
++ 		/* remove the closed state so when we call open it appears
++ 		 * we are coming from the probed state.
++ 		 */
++ 		adapter->state = VNIC_PROBED;
++ 
++ 		rc = ibmvnic_init(adapter);
++ 		if (rc)
++ 			return IBMVNIC_INIT_FAILED;
++ 
++ 		/* If the adapter was in PROBE state prior to the reset,
++ 		 * exit here.
++ 		 */
++ 		if (reset_state == VNIC_PROBED)
++ 			return 0;
++ 
++ 		rc = ibmvnic_login(netdev);
++ 		if (rc) {
++ 			adapter->state = VNIC_PROBED;
++ 			return 0;
++ 		}
++ 
++ 		if (adapter->reset_reason == VNIC_RESET_CHANGE_PARAM ||
++ 		    adapter->wait_for_reset) {
++ 			rc = init_resources(adapter);
++ 			if (rc)
++ 				return rc;
++ 		} else if (adapter->req_rx_queues != old_num_rx_queues ||
++ 			   adapter->req_tx_queues != old_num_tx_queues) {
++ 			adapter->map_id = 1;
++ 			release_rx_pools(adapter);
++ 			release_tx_pools(adapter);
++ 			init_rx_pools(netdev);
++ 			init_tx_pools(netdev);
++ 		} else {
++ 			rc = reset_tx_pools(adapter);
++ 			if (rc)
++ 				return rc;
++ 
++ 			rc = reset_rx_pools(adapter);
++ 			if (rc)
++ 				return rc;
++ 
++ 			if (reset_state == VNIC_CLOSED)
++ 				return 0;
++ 		}
++ 	}
++ 
++ 	rc = __ibmvnic_open(netdev);
++ 	if (rc) {
++ 		if (list_empty(&adapter->rwi_list))
++ 			adapter->state = VNIC_CLOSED;
++ 		else
++ 			adapter->state = reset_state;
++ 
++ 		return 0;
++ 	}
++ 
++ 	/* kick napi */
++ 	for (i = 0; i < adapter->req_rx_queues; i++)
++ 		napi_schedule(&adapter->napi[i]);
++ 
++ 	if (adapter->reset_reason != VNIC_RESET_FAILOVER)
++ 		netdev_notify_peers(netdev);
++ 
++ 	netif_carrier_on(netdev);
++ 
+++>>>>>>> cc85c02edfe4 (ibmvnic: Wait until reset is complete to set carrier on)
+  	return 0;
+  }
+  
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
