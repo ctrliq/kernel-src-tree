@@ -449,7 +449,6 @@ int snd_card_disconnect(struct snd_card *card)
 #endif
 	return 0;	
 }
-
 EXPORT_SYMBOL(snd_card_disconnect);
 
 static int snd_card_do_free(struct snd_card *card)
@@ -715,7 +714,7 @@ int snd_card_add_dev_attr(struct snd_card *card,
 
 	dev_err(card->dev, "Too many groups assigned\n");
 	return -ENOSPC;
-};
+}
 EXPORT_SYMBOL_GPL(snd_card_add_dev_attr);
 
 /**
@@ -772,7 +771,6 @@ int snd_card_register(struct snd_card *card)
 #endif
 	return 0;
 }
-
 EXPORT_SYMBOL(snd_card_register);
 
 #ifdef CONFIG_SND_PROC_FS
@@ -892,7 +890,6 @@ int snd_component_add(struct snd_card *card, const char *component)
 	strcat(card->components, component);
 	return 0;
 }
-
 EXPORT_SYMBOL(snd_component_add);
 
 /**
@@ -927,7 +924,6 @@ int snd_card_file_add(struct snd_card *card, struct file *file)
 	spin_unlock(&card->files_lock);
 	return 0;
 }
-
 EXPORT_SYMBOL(snd_card_file_add);
 
 /**
@@ -969,7 +965,6 @@ int snd_card_file_remove(struct snd_card *card, struct file *file)
 	put_device(&card->card_dev);
 	return 0;
 }
-
 EXPORT_SYMBOL(snd_card_file_remove);
 
 #ifdef CONFIG_PM
@@ -1009,6 +1004,5 @@ int snd_power_wait(struct snd_card *card, unsigned int power_state)
 	remove_wait_queue(&card->power_sleep, &wait);
 	return result;
 }
-
 EXPORT_SYMBOL(snd_power_wait);
 #endif /* CONFIG_PM */
