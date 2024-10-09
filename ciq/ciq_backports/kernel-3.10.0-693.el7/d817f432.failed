@@ -1,0 +1,173 @@
+net/ip_tunnels: Introduce tunnel_id_to_key32() and key32_to_tunnel_id()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] ip_tunnels: Introduce tunnel_id_to_key32() and key32_to_tunnel_id() (Jonathan Toppins) [1393375]
+Rebuild_FUZZ: 97.10%
+commit-author Amir Vadai <amir@vadai.me>
+commit d817f432c2ab7639a4f69de73eafdc55e57c45ad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d817f432.failed
+
+Add utility functions to convert a 32 bits key into a 64 bits tunnel and
+vice versa.
+These functions will be used instead of cloning code in GRE and VXLAN,
+and in tc act_iptunnel which will be introduced in a following patch in
+this patchset.
+
+	Signed-off-by: Amir Vadai <amir@vadai.me>
+	Signed-off-by: Hadar Hen Zion <hadarh@mellanox.com>
+	Reviewed-by: Shmulik Ladkani <shmulik.ladkani@gmail.com>
+	Acked-by: Jiri Benc <jbenc@redhat.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d817f432c2ab7639a4f69de73eafdc55e57c45ad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/ip_gre.c
+diff --cc net/ipv4/ip_gre.c
+index 9c178e45801f,576f705d8180..000000000000
+--- a/net/ipv4/ip_gre.c
++++ b/net/ipv4/ip_gre.c
+@@@ -361,30 -246,10 +361,35 @@@ static void gre_err(struct sk_buff *skb
+  	ipgre_err(skb, info, &tpi);
+  }
+  
+++<<<<<<< HEAD
+ +static __be64 key_to_tunnel_id(__be32 key)
+ +{
+ +#ifdef __BIG_ENDIAN
+ +	return (__force __be64)((__force u32)key);
+ +#else
+ +	return (__force __be64)((__force u64)key << 32);
+ +#endif
+ +}
+ +
+ +/* Returns the least-significant 32 bits of a __be64. */
+ +static __be32 tunnel_id_to_key(__be64 x)
+ +{
+ +#ifdef __BIG_ENDIAN
+ +	return (__force __be32)x;
+ +#else
+ +	return (__force __be32)((__force u64)x >> 32);
+ +#endif
+ +}
+ +
+ +static int ipgre_rcv(struct sk_buff *skb, const struct tnl_ptk_info *tpi)
+++=======
++ static int __ipgre_rcv(struct sk_buff *skb, const struct tnl_ptk_info *tpi,
++ 		       struct ip_tunnel_net *itn, int hdr_len, bool raw_proto)
+++>>>>>>> d817f432c2ab (net/ip_tunnels: Introduce tunnel_id_to_key32() and key32_to_tunnel_id())
+  {
+ +	struct net *net = dev_net(skb->dev);
+  	struct metadata_dst *tun_dst = NULL;
+ +	struct ip_tunnel_net *itn;
+  	const struct iphdr *iph;
+  	struct ip_tunnel *tunnel;
+  
+@@@ -574,15 -422,12 +579,20 @@@ static void gre_fb_xmit(struct sk_buff 
+  	}
+  
+  	/* Push Tunnel header. */
+ -	if (gre_handle_offloads(skb, !!(tun_info->key.tun_flags & TUNNEL_CSUM)))
+ +	skb = gre_handle_offloads(skb, !!(tun_info->key.tun_flags & TUNNEL_CSUM));
+ +	if (IS_ERR(skb)) {
+ +		skb = NULL;
+  		goto err_free_rt;
+ +	}
+  
+  	flags = tun_info->key.tun_flags & (TUNNEL_CSUM | TUNNEL_KEY);
+++<<<<<<< HEAD
+ +	build_header(skb, tunnel_hlen, flags, proto,
+ +		     tunnel_id_to_key(tun_info->key.tun_id), 0);
+++=======
++ 	gre_build_header(skb, tunnel_hlen, flags, proto,
++ 			 tunnel_id_to_key32(tun_info->key.tun_id), 0);
+++>>>>>>> d817f432c2ab (net/ip_tunnels: Introduce tunnel_id_to_key32() and key32_to_tunnel_id())
+  
+  	df = key->tun_flags & TUNNEL_DONT_FRAGMENT ?  htons(IP_DF) : 0;
+  
+diff --git a/drivers/net/vxlan.c b/drivers/net/vxlan.c
+index 3b2c9ff3617e..28076a9d55eb 100644
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@ -1312,7 +1312,7 @@ static int vxlan_rcv(struct sock *sk, struct sk_buff *skb)
+ 		struct metadata_dst *tun_dst;
+ 
+ 		tun_dst = udp_tun_rx_dst(skb, vxlan_get_sk_family(vs), TUNNEL_KEY,
+-					 vxlan_vni_to_tun_id(vni), sizeof(*md));
++					 key32_to_tunnel_id(vni), sizeof(*md));
+ 
+ 		if (!tun_dst)
+ 			goto drop;
+@@ -1964,7 +1964,7 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
+ 			goto drop;
+ 		}
+ 		dst_port = info->key.tp_dst ? : vxlan->cfg.dst_port;
+-		vni = vxlan_tun_id_to_vni(info->key.tun_id);
++		vni = tunnel_id_to_key32(info->key.tun_id);
+ 		remote_ip.sa.sa_family = ip_tunnel_info_af(info);
+ 		if (remote_ip.sa.sa_family == AF_INET)
+ 			remote_ip.sin.sin_addr.s_addr = info->key.u.ipv4.dst;
+diff --git a/include/net/ip_tunnels.h b/include/net/ip_tunnels.h
+index c62b45515469..b51335af69cc 100644
+--- a/include/net/ip_tunnels.h
++++ b/include/net/ip_tunnels.h
+@@ -240,6 +240,25 @@ static inline unsigned short ip_tunnel_info_af(const struct ip_tunnel_info
+ 	return tun_info->mode & IP_TUNNEL_INFO_IPV6 ? AF_INET6 : AF_INET;
+ }
+ 
++static inline __be64 key32_to_tunnel_id(__be32 key)
++{
++#ifdef __BIG_ENDIAN
++	return (__force __be64)key;
++#else
++	return (__force __be64)((__force u64)key << 32);
++#endif
++}
++
++/* Returns the least-significant 32 bits of a __be64. */
++static inline __be32 tunnel_id_to_key32(__be64 tun_id)
++{
++#ifdef __BIG_ENDIAN
++	return (__force __be32)tun_id;
++#else
++	return (__force __be32)((__force u64)tun_id >> 32);
++#endif
++}
++
+ #ifdef CONFIG_INET
+ 
+ int ip_tunnel_init(struct net_device *dev);
+diff --git a/include/net/vxlan.h b/include/net/vxlan.h
+index d243713534f5..f5cbcaf0c7b3 100644
+--- a/include/net/vxlan.h
++++ b/include/net/vxlan.h
+@@ -353,24 +353,6 @@ static inline __be32 vxlan_vni_field(__be32 vni)
+ #endif
+ }
+ 
+-static inline __be32 vxlan_tun_id_to_vni(__be64 tun_id)
+-{
+-#if defined(__BIG_ENDIAN)
+-	return (__force __be32)tun_id;
+-#else
+-	return (__force __be32)((__force u64)tun_id >> 32);
+-#endif
+-}
+-
+-static inline __be64 vxlan_vni_to_tun_id(__be32 vni)
+-{
+-#if defined(__BIG_ENDIAN)
+-	return (__force __be64)vni;
+-#else
+-	return (__force __be64)((u64)(__force u32)vni << 32);
+-#endif
+-}
+-
+ static inline size_t vxlan_rco_start(__be32 vni_field)
+ {
+ 	return be32_to_cpu(vni_field & VXLAN_RCO_MASK) << VXLAN_RCO_SHIFT;
+* Unmerged path net/ipv4/ip_gre.c
