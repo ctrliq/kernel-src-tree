@@ -1,0 +1,86 @@
+xfs: don't screw up direct writes when freesp is fragmented
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit 6d8a45ce29c7d67cc4fc3016dc2a07660c62482a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/6d8a45ce.failed
+
+xfs_bmap_btalloc is given a range of file offset blocks that must be
+allocated to some data/attr/cow fork.  If the fork has an extent size
+hint associated with it, the request will be enlarged on both ends to
+try to satisfy the alignment hint.  If free space is fragmentated,
+sometimes we can allocate some blocks but not enough to fulfill any of
+the requested range.  Since bmapi_allocate always trims the new extent
+mapping to match the originally requested range, this results in
+bmapi_write returning zero and no mapping.
+
+The consequences of this vary -- buffered writes will simply re-call
+bmapi_write until it can satisfy at least one block from the original
+request.  Direct IO overwrites notice nmaps == 0 and return -ENOSPC
+through the dio mechanism out to userspace with the weird result that
+writes fail even when we have enough space because the ENOSPC return
+overrides any partial write status.  For direct CoW writes the situation
+was disastrous because nobody notices us returning an invalid zero-length
+wrong-offset mapping to iomap and the write goes off into space.
+
+Therefore, if free space is so fragmented that we managed to allocate
+some space but not enough to map into even a single block of the
+original allocation request range, we should break the alignment hint in
+order to guarantee at least some forward progress for the direct write.
+If we return a short allocation to iomap_apply it'll call back about the
+remaining blocks.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 6d8a45ce29c7d67cc4fc3016dc2a07660c62482a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_bmap.c
+diff --cc fs/xfs/libxfs/xfs_bmap.c
+index 59769f7334d7,daae00ed30c5..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@@ -3711,18 -3618,23 +3715,38 @@@ xfs_bmap_btalloc
+  			*ap->firstblock = args.fsbno;
+  		ASSERT(nullfb || fb_agno <= args.agno);
+  		ap->length = args.len;
+++<<<<<<< HEAD
+ +		ap->ip->i_d.di_nblocks += args.len;
+ +		xfs_trans_log_inode(ap->tp, ap->ip, XFS_ILOG_CORE);
+ +		if (ap->wasdel)
+ +			ap->ip->i_delayed_blks -= args.len;
+ +		/*
+ +		 * Adjust the disk quota also. This was reserved
+ +		 * earlier.
+ +		 */
+ +		xfs_trans_mod_dquot_byino(ap->tp, ap->ip,
+ +			ap->wasdel ? XFS_TRANS_DQ_DELBCOUNT :
+ +					XFS_TRANS_DQ_BCOUNT,
+ +			(long) args.len);
+++=======
++ 		/*
++ 		 * If the extent size hint is active, we tried to round the
++ 		 * caller's allocation request offset down to extsz and the
++ 		 * length up to another extsz boundary.  If we found a free
++ 		 * extent we mapped it in starting at this new offset.  If the
++ 		 * newly mapped space isn't long enough to cover any of the
++ 		 * range of offsets that was originally requested, move the
++ 		 * mapping up so that we can fill as much of the caller's
++ 		 * original request as possible.  Free space is apparently
++ 		 * very fragmented so we're unlikely to be able to satisfy the
++ 		 * hints anyway.
++ 		 */
++ 		if (ap->length <= orig_length)
++ 			ap->offset = orig_offset;
++ 		else if (ap->offset + ap->length < orig_offset + orig_length)
++ 			ap->offset = orig_offset + orig_length - ap->length;
++ 		xfs_bmap_btalloc_accounting(ap, &args);
+++>>>>>>> 6d8a45ce29c7 (xfs: don't screw up direct writes when freesp is fragmented)
+  	} else {
+  		ap->blkno = NULLFSBLOCK;
+  		ap->length = 0;
+* Unmerged path fs/xfs/libxfs/xfs_bmap.c
