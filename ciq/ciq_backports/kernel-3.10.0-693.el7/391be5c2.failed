@@ -1,0 +1,210 @@
+bnxt_en: Implement new scheme to reserve tx rings.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] bnxt_en: Implement new scheme to reserve tx rings (Jonathan Toppins) [1382378]
+Rebuild_FUZZ: 98.99%
+commit-author Michael Chan <michael.chan@broadcom.com>
+commit 391be5c2736456f032fe0265031ecfe17aee84a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/391be5c2.failed
+
+In order to properly support TX rate limiting in SRIOV VF functions or
+NPAR functions, firmware needs better control over tx ring allocations.
+The new scheme requires the driver to reserve the number of tx rings
+and to query to see if the requested number of tx rings is reserved.
+The driver will use the new scheme when the firmware interface spec is
+1.6.1 or newer.
+
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 391be5c2736456f032fe0265031ecfe17aee84a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.h
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index c1ee716cd1ac,d174729de761..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@@ -1219,8 -1148,17 +1219,14 @@@ int hwrm_send_message(struct bnxt *, vo
+  int hwrm_send_message_silent(struct bnxt *, void *, u32, int);
+  int bnxt_hwrm_func_rgtr_async_events(struct bnxt *bp, unsigned long *bmap,
+  				     int bmap_size);
+++<<<<<<< HEAD
+++=======
++ int bnxt_hwrm_vnic_cfg(struct bnxt *bp, u16 vnic_id);
++ int __bnxt_hwrm_get_tx_rings(struct bnxt *bp, u16 fid, int *tx_rings);
++ int bnxt_hwrm_reserve_tx_rings(struct bnxt *bp, int *tx_rings);
+++>>>>>>> 391be5c27364 (bnxt_en: Implement new scheme to reserve tx rings.)
+  int bnxt_hwrm_set_coal(struct bnxt *);
+ -unsigned int bnxt_get_max_func_stat_ctxs(struct bnxt *bp);
+ -void bnxt_set_max_func_stat_ctxs(struct bnxt *bp, unsigned int max);
+ -unsigned int bnxt_get_max_func_cp_rings(struct bnxt *bp);
+ -void bnxt_set_max_func_cp_rings(struct bnxt *bp, unsigned int max);
+ -void bnxt_set_max_func_irqs(struct bnxt *bp, unsigned int max);
+ -void bnxt_tx_disable(struct bnxt *bp);
+ -void bnxt_tx_enable(struct bnxt *bp);
+ +int bnxt_hwrm_func_qcaps(struct bnxt *);
+  int bnxt_hwrm_set_pause(struct bnxt *);
+  int bnxt_hwrm_set_link_setting(struct bnxt *, bool, bool);
+  int bnxt_hwrm_fw_set_time(struct bnxt *);
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 3d3cd9192d53..f903bd77a57c 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -4022,6 +4022,50 @@ static void bnxt_hwrm_ring_free(struct bnxt *bp, bool close_path)
+ 	}
+ }
+ 
++/* Caller must hold bp->hwrm_cmd_lock */
++int __bnxt_hwrm_get_tx_rings(struct bnxt *bp, u16 fid, int *tx_rings)
++{
++	struct hwrm_func_qcfg_output *resp = bp->hwrm_cmd_resp_addr;
++	struct hwrm_func_qcfg_input req = {0};
++	int rc;
++
++	if (bp->hwrm_spec_code < 0x10601)
++		return 0;
++
++	bnxt_hwrm_cmd_hdr_init(bp, &req, HWRM_FUNC_QCFG, -1, -1);
++	req.fid = cpu_to_le16(fid);
++	rc = _hwrm_send_message(bp, &req, sizeof(req), HWRM_CMD_TIMEOUT);
++	if (!rc)
++		*tx_rings = le16_to_cpu(resp->alloc_tx_rings);
++
++	return rc;
++}
++
++int bnxt_hwrm_reserve_tx_rings(struct bnxt *bp, int *tx_rings)
++{
++	struct hwrm_func_cfg_input req = {0};
++	int rc;
++
++	if (bp->hwrm_spec_code < 0x10601)
++		return 0;
++
++	if (BNXT_VF(bp))
++		return 0;
++
++	bnxt_hwrm_cmd_hdr_init(bp, &req, HWRM_FUNC_CFG, -1, -1);
++	req.fid = cpu_to_le16(0xffff);
++	req.enables = cpu_to_le32(FUNC_CFG_REQ_ENABLES_NUM_TX_RINGS);
++	req.num_tx_rings = cpu_to_le16(*tx_rings);
++	rc = hwrm_send_message(bp, &req, sizeof(req), HWRM_CMD_TIMEOUT);
++	if (rc)
++		return rc;
++
++	mutex_lock(&bp->hwrm_cmd_lock);
++	rc = __bnxt_hwrm_get_tx_rings(bp, 0xffff, tx_rings);
++	mutex_unlock(&bp->hwrm_cmd_lock);
++	return rc;
++}
++
+ static void bnxt_hwrm_set_coal_params(struct bnxt *bp, u32 max_bufs,
+ 	u32 buf_tmrs, u16 flags,
+ 	struct hwrm_ring_cmpl_ring_cfg_aggint_params_input *req)
+@@ -6362,10 +6406,16 @@ int bnxt_setup_mq_tc(struct net_device *dev, u8 tc)
+ 		sh = true;
+ 
+ 	if (tc) {
+-		int max_rx_rings, max_tx_rings, rc;
++		int max_rx_rings, max_tx_rings, req_tx_rings, rsv_tx_rings, rc;
+ 
++		req_tx_rings = bp->tx_nr_rings_per_tc * tc;
+ 		rc = bnxt_get_max_rings(bp, &max_rx_rings, &max_tx_rings, sh);
+-		if (rc || bp->tx_nr_rings_per_tc * tc > max_tx_rings)
++		if (rc || req_tx_rings > max_tx_rings)
++			return -ENOMEM;
++
++		rsv_tx_rings = req_tx_rings;
++		if (bnxt_hwrm_reserve_tx_rings(bp, &rsv_tx_rings) ||
++		    rsv_tx_rings < req_tx_rings)
+ 			return -ENOMEM;
+ 	}
+ 
+@@ -6794,6 +6844,11 @@ static int bnxt_set_dflt_rings(struct bnxt *bp)
+ 		return rc;
+ 	bp->rx_nr_rings = min_t(int, dflt_rings, max_rx_rings);
+ 	bp->tx_nr_rings_per_tc = min_t(int, dflt_rings, max_tx_rings);
++
++	rc = bnxt_hwrm_reserve_tx_rings(bp, &bp->tx_nr_rings_per_tc);
++	if (rc)
++		netdev_warn(bp->dev, "Unable to reserve tx rings\n");
++
+ 	bp->tx_nr_rings = bp->tx_nr_rings_per_tc;
+ 	bp->cp_nr_rings = sh ? max_t(int, bp->tx_nr_rings, bp->rx_nr_rings) :
+ 			       bp->tx_nr_rings + bp->rx_nr_rings;
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.h
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+index d8d031c95f8a..187fbb735445 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+@@ -379,6 +379,7 @@ static int bnxt_set_channels(struct net_device *dev,
+ {
+ 	struct bnxt *bp = netdev_priv(dev);
+ 	int max_rx_rings, max_tx_rings, tcs;
++	int req_tx_rings, rsv_tx_rings;
+ 	u32 rc = 0;
+ 	bool sh = false;
+ 
+@@ -414,6 +415,20 @@ static int bnxt_set_channels(struct net_device *dev,
+ 		    channel->tx_count > max_tx_rings))
+ 		return -ENOMEM;
+ 
++	req_tx_rings = sh ? channel->combined_count : channel->tx_count;
++	req_tx_rings = min_t(int, req_tx_rings, max_tx_rings);
++	if (tcs > 1)
++		req_tx_rings *= tcs;
++
++	rsv_tx_rings = req_tx_rings;
++	if (bnxt_hwrm_reserve_tx_rings(bp, &rsv_tx_rings))
++		return -ENOMEM;
++
++	if (rsv_tx_rings < req_tx_rings) {
++		netdev_warn(dev, "Unable to allocate the requested tx rings\n");
++		return -ENOMEM;
++	}
++
+ 	if (netif_running(dev)) {
+ 		if (BNXT_PF(bp)) {
+ 			/* TODO CHIMP_FW: Send message to all VF's
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_sriov.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_sriov.c
+index 93ef4bf7b92d..8083d4acffd3 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_sriov.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_sriov.c
+@@ -409,6 +409,7 @@ static int bnxt_hwrm_func_cfg(struct bnxt *bp, int num_vfs)
+ 	u16 vf_ring_grps;
+ 	struct hwrm_func_cfg_input req = {0};
+ 	struct bnxt_pf_info *pf = &bp->pf;
++	int total_vf_tx_rings = 0;
+ 
+ 	bnxt_hwrm_cmd_hdr_init(bp, &req, HWRM_FUNC_CFG, -1, -1);
+ 
+@@ -461,6 +462,8 @@ static int bnxt_hwrm_func_cfg(struct bnxt *bp, int num_vfs)
+ 
+ 	mutex_lock(&bp->hwrm_cmd_lock);
+ 	for (i = 0; i < num_vfs; i++) {
++		int vf_tx_rsvd = vf_tx_rings;
++
+ 		req.fid = cpu_to_le16(pf->first_vf_id + i);
+ 		rc = _hwrm_send_message(bp, &req, sizeof(req),
+ 					HWRM_CMD_TIMEOUT);
+@@ -468,10 +471,15 @@ static int bnxt_hwrm_func_cfg(struct bnxt *bp, int num_vfs)
+ 			break;
+ 		pf->active_vfs = i + 1;
+ 		pf->vf[i].fw_fid = le16_to_cpu(req.fid);
++		rc = __bnxt_hwrm_get_tx_rings(bp, pf->vf[i].fw_fid,
++					      &vf_tx_rsvd);
++		if (rc)
++			break;
++		total_vf_tx_rings += vf_tx_rsvd;
+ 	}
+ 	mutex_unlock(&bp->hwrm_cmd_lock);
+ 	if (!rc) {
+-		pf->max_tx_rings -= vf_tx_rings * num_vfs;
++		pf->max_tx_rings -= total_vf_tx_rings;
+ 		pf->max_rx_rings -= vf_rx_rings * num_vfs;
+ 		pf->max_hw_ring_grps -= vf_ring_grps * num_vfs;
+ 		pf->max_cp_rings -= vf_cp_rings * num_vfs;
