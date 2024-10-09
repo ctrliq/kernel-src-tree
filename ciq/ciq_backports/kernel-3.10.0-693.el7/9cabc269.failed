@@ -1,0 +1,243 @@
+ntb: add DMA error handling for TX DMA
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [ntb] add DMA error handling for TX DMA (Suravee Suthikulpanit) [1303727]
+Rebuild_FUZZ: 92.96%
+commit-author Dave Jiang <dave.jiang@intel.com>
+commit 9cabc2691e9d21b840b145a944f09299f895a7e0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/9cabc269.failed
+
+Adding support on the tx DMA path to allow recovery of errors when
+DMA responds with error status and abort all the subsequent ops.
+
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+	Acked-by: Allen Hubbe <Allen.Hubbe@emc.com>
+	Cc: Jon Mason <jdmason@kudzu.us>
+	Cc: linux-ntb@googlegroups.com
+	Signed-off-by: Vinod Koul <vinod.koul@intel.com>
+(cherry picked from commit 9cabc2691e9d21b840b145a944f09299f895a7e0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/ntb/ntb_transport.c
+diff --cc drivers/ntb/ntb_transport.c
+index cc39efa77597,e61db11e6ccc..000000000000
+--- a/drivers/ntb/ntb_transport.c
++++ b/drivers/ntb/ntb_transport.c
+@@@ -200,11 -247,27 +203,23 @@@ enum 
+  	MAX_SPAD,
+  };
+  
+ -#define dev_client_dev(__dev) \
+ -	container_of((__dev), struct ntb_transport_client_dev, dev)
+ -
+ -#define drv_client(__drv) \
+ -	container_of((__drv), struct ntb_transport_client, driver)
+ -
+ -#define QP_TO_MW(nt, qp)	((qp) % nt->mw_count)
+ +#define QP_TO_MW(ndev, qp)	((qp) % ntb_max_mw(ndev))
+  #define NTB_QP_DEF_NUM_ENTRIES	100
+  #define NTB_LINK_DOWN_TIMEOUT	10
+ -#define DMA_RETRIES		20
+ -#define DMA_OUT_RESOURCE_TO	50
+  
+++<<<<<<< HEAD
+ +static int ntb_match_bus(struct device *dev, struct device_driver *drv)
+++=======
++ static void ntb_transport_rxc_db(unsigned long data);
++ static const struct ntb_ctx_ops ntb_transport_ops;
++ static struct ntb_client ntb_transport_client;
++ static int ntb_async_tx_submit(struct ntb_transport_qp *qp,
++ 			       struct ntb_queue_entry *entry);
++ static void ntb_memcpy_tx(struct ntb_queue_entry *entry, void __iomem *offset);
++ 
++ static int ntb_transport_bus_match(struct device *dev,
++ 				   struct device_driver *drv)
+++>>>>>>> 9cabc2691e9d (ntb: add DMA error handling for TX DMA)
+  {
+  	return !strncmp(dev_name(dev), drv->name, strlen(drv->name));
+  }
+@@@ -1238,23 -1451,64 +1253,53 @@@ static int ntb_transport_rxc_db(void *d
+  			break;
+  	}
+  
+ -	if (i && qp->rx_dma_chan)
+ -		dma_async_issue_pending(qp->rx_dma_chan);
+ -
+ -	if (i == qp->rx_max_entry) {
+ -		/* there is more work to do */
+ -		if (qp->active)
+ -			tasklet_schedule(&qp->rxc_db_work);
+ -	} else if (ntb_db_read(qp->ndev) & BIT_ULL(qp->qp_num)) {
+ -		/* the doorbell bit is set: clear it */
+ -		ntb_db_clear(qp->ndev, BIT_ULL(qp->qp_num));
+ -		/* ntb_db_read ensures ntb_db_clear write is committed */
+ -		ntb_db_read(qp->ndev);
+ -
+ -		/* an interrupt may have arrived between finishing
+ -		 * ntb_process_rxc and clearing the doorbell bit:
+ -		 * there might be some more work to do.
+ -		 */
+ -		if (qp->active)
+ -			tasklet_schedule(&qp->rxc_db_work);
+ -	}
+ +	if (qp->dma_chan)
+ +		dma_async_issue_pending(qp->dma_chan);
+ +
+ +	return i;
+  }
+  
+- static void ntb_tx_copy_callback(void *data)
++ static void ntb_tx_copy_callback(void *data,
++ 				 const struct dmaengine_result *res)
+  {
+  	struct ntb_queue_entry *entry = data;
+  	struct ntb_transport_qp *qp = entry->qp;
+  	struct ntb_payload_header __iomem *hdr = entry->tx_hdr;
+  
+++<<<<<<< HEAD
+ +	/* Ensure that the data is fully copied out before setting the flags */
+ +	wmb();
+++=======
++ 	/* we need to check DMA results if we are using DMA */
++ 	if (res) {
++ 		enum dmaengine_tx_result dma_err = res->result;
++ 
++ 		switch (dma_err) {
++ 		case DMA_TRANS_READ_FAILED:
++ 		case DMA_TRANS_WRITE_FAILED:
++ 			entry->errors++;
++ 		case DMA_TRANS_ABORTED:
++ 		{
++ 			void __iomem *offset =
++ 				qp->tx_mw + qp->tx_max_frame *
++ 				entry->tx_index;
++ 
++ 			/* resubmit via CPU */
++ 			ntb_memcpy_tx(entry, offset);
++ 			qp->tx_memcpy++;
++ 			return;
++ 		}
++ 
++ 		case DMA_TRANS_NOERROR:
++ 		default:
++ 			break;
++ 		}
++ 	}
++ 
+++>>>>>>> 9cabc2691e9d (ntb: add DMA error handling for TX DMA)
+  	iowrite32(entry->flags | DESC_DONE_FLAG, &hdr->flags);
+  
+ -	ntb_peer_db_set(qp->ndev, BIT_ULL(qp->qp_num));
+ +	ntb_ring_doorbell(qp->ndev, qp->qp_num);
+  
+  	/* The entry length can only be zero if the packet is intended to be a
+  	 * "link down" or similar.  Since no payload is being sent in these
+@@@ -1273,44 -1527,40 +1318,54 @@@
+  
+  static void ntb_memcpy_tx(struct ntb_queue_entry *entry, void __iomem *offset)
+  {
+ -#ifdef ARCH_HAS_NOCACHE_UACCESS
+ -	/*
+ -	 * Using non-temporal mov to improve performance on non-cached
+ -	 * writes, even though we aren't actually copying from user space.
+ -	 */
+ -	__copy_from_user_inatomic_nocache(offset, entry->buf, entry->len);
+ -#else
+  	memcpy_toio(offset, entry->buf, entry->len);
+ -#endif
+ -
+ -	/* Ensure that the data is fully copied out before setting the flags */
+ -	wmb();
+  
+- 	ntb_tx_copy_callback(entry);
++ 	ntb_tx_copy_callback(entry, NULL);
+  }
+  
+- static void ntb_async_tx(struct ntb_transport_qp *qp,
+- 			 struct ntb_queue_entry *entry)
++ static int ntb_async_tx_submit(struct ntb_transport_qp *qp,
++ 			       struct ntb_queue_entry *entry)
+  {
+- 	struct ntb_payload_header __iomem *hdr;
+  	struct dma_async_tx_descriptor *txd;
+ -	struct dma_chan *chan = qp->tx_dma_chan;
+ +	struct dma_chan *chan = qp->dma_chan;
+  	struct dma_device *device;
++ 	size_t len = entry->len;
++ 	void *buf = entry->buf;
+  	size_t dest_off, buff_off;
+  	struct dmaengine_unmap_data *unmap;
+  	dma_addr_t dest;
+  	dma_cookie_t cookie;
+++<<<<<<< HEAD
+ +	void __iomem *offset;
+ +	size_t len = entry->len;
+ +	void *buf = entry->buf;
+ +	unsigned long flags;
+ +
+ +	offset = qp->tx_mw + qp->tx_max_frame * qp->tx_index;
+ +	hdr = offset + qp->tx_max_frame - sizeof(struct ntb_payload_header);
+ +	entry->tx_hdr = hdr;
+ +
+ +	iowrite32(entry->len, &hdr->len);
+ +	iowrite32((u32) qp->tx_pkts, &hdr->ver);
+ +
+ +	if (!chan)
+ +		goto err;
+ +
+ +	if (len < copy_bytes)
+ +		goto err;
+ +
+ +	device = chan->device;
+ +	dest = qp->tx_mw_phys + qp->tx_max_frame * qp->tx_index;
+ +	buff_off = (size_t) buf & ~PAGE_MASK;
+ +	dest_off = (size_t) dest & ~PAGE_MASK;
+++=======
++ 	int retries = 0;
++ 
++ 	device = chan->device;
++ 	dest = qp->tx_mw_phys + qp->tx_max_frame * entry->tx_index;
++ 	buff_off = (size_t)buf & ~PAGE_MASK;
++ 	dest_off = (size_t)dest & ~PAGE_MASK;
+++>>>>>>> 9cabc2691e9d (ntb: add DMA error handling for TX DMA)
+  
+  	if (!is_dma_copy_aligned(device, buff_off, dest_off, len))
+  		goto err;
+@@@ -1327,14 -1577,23 +1382,30 @@@
+  
+  	unmap->to_cnt = 1;
+  
+++<<<<<<< HEAD
+ +	flags = DMA_COMPL_SKIP_SRC_UNMAP | DMA_COMPL_SKIP_DEST_UNMAP |
+ +		DMA_PREP_INTERRUPT;
+ +	txd = device->device_prep_dma_memcpy(chan, dest, unmap->addr[0], len,
+ +					    flags);
+ +	if (!txd)
+++=======
++ 	for (retries = 0; retries < DMA_RETRIES; retries++) {
++ 		txd = device->device_prep_dma_memcpy(chan, dest,
++ 						     unmap->addr[0], len,
++ 						     DMA_PREP_INTERRUPT);
++ 		if (txd)
++ 			break;
++ 
++ 		set_current_state(TASK_INTERRUPTIBLE);
++ 		schedule_timeout(DMA_OUT_RESOURCE_TO);
++ 	}
++ 
++ 	if (!txd) {
++ 		qp->dma_tx_prep_err++;
+++>>>>>>> 9cabc2691e9d (ntb: add DMA error handling for TX DMA)
+  		goto err_get_unmap;
+ -	}
+  
+- 	txd->callback = ntb_tx_copy_callback;
++ 	txd->callback_result = ntb_tx_copy_callback;
+  	txd->callback_param = entry;
+  	dma_set_unmap(txd, unmap);
+  
+* Unmerged path drivers/ntb/ntb_transport.c
