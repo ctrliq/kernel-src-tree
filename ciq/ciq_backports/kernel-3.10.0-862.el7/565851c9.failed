@@ -1,0 +1,124 @@
+device-dax: fix sysfs attribute deadlock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 565851c972b50612f3a4542e26879ffb3e906fc2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/565851c9.failed
+
+Usage of device_lock() for dax_region attributes is unnecessary and
+deadlock prone. It's unnecessary because the order of registration /
+un-registration guarantees that drvdata is always valid. It's deadlock
+prone because it sets up this situation:
+
+ ndctl           D    0  2170   2082 0x00000000
+ Call Trace:
+  __schedule+0x31f/0x980
+  schedule+0x3d/0x90
+  schedule_preempt_disabled+0x15/0x20
+  __mutex_lock+0x402/0x980
+  ? __mutex_lock+0x158/0x980
+  ? align_show+0x2b/0x80 [dax]
+  ? kernfs_seq_start+0x2f/0x90
+  mutex_lock_nested+0x1b/0x20
+  align_show+0x2b/0x80 [dax]
+  dev_attr_show+0x20/0x50
+
+ ndctl           D    0  2186   2079 0x00000000
+ Call Trace:
+  __schedule+0x31f/0x980
+  schedule+0x3d/0x90
+  __kernfs_remove+0x1f6/0x340
+  ? kernfs_remove_by_name_ns+0x45/0xa0
+  ? remove_wait_queue+0x70/0x70
+  kernfs_remove_by_name_ns+0x45/0xa0
+  remove_files.isra.1+0x35/0x70
+  sysfs_remove_group+0x44/0x90
+  sysfs_remove_groups+0x2e/0x50
+  dax_region_unregister+0x25/0x40 [dax]
+  devm_action_release+0xf/0x20
+  release_nodes+0x16d/0x2b0
+  devres_release_all+0x3c/0x60
+  device_release_driver_internal+0x17d/0x220
+  device_release_driver+0x12/0x20
+  unbind_store+0x112/0x160
+
+ndctl/2170 is trying to acquire the device_lock() to read an attribute,
+and ndctl/2186 is holding the device_lock() while trying to drain all
+active attribute readers.
+
+Thanks to Yi Zhang for the reproduction script.
+
+Fixes: d7fe1a67f658 ("dax: add region 'id', 'size', and 'align' attributes")
+	Cc: <stable@vger.kernel.org>
+	Reported-by: Yi Zhang <yizhan@redhat.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 565851c972b50612f3a4542e26879ffb3e906fc2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dax/dax.c
+diff --cc drivers/dax/dax.c
+index 5e37741e7a4f,5e8302d3a89c..000000000000
+--- a/drivers/dax/dax.c
++++ b/drivers/dax/dax.c
+@@@ -36,48 -36,11 +36,56 @@@ static struct kmem_cache *dax_cache __r
+  static struct super_block *dax_superblock __read_mostly;
+  MODULE_PARM_DESC(nr_dax, "max number of device-dax instances");
+  
+++<<<<<<< HEAD
+ +/**
+ + * struct dax_region - mapping infrastructure for dax devices
+ + * @id: kernel-wide unique region for a memory range
+ + * @base: linear address corresponding to @res
+ + * @kref: to pin while other agents have a need to do lookups
+ + * @dev: parent device backing this region
+ + * @align: allocation and mapping alignment for child dax devices
+ + * @res: physical address range of the region
+ + * @pfn_flags: identify whether the pfns are paged back or not
+ + */
+ +struct dax_region {
+ +	int id;
+ +	struct ida ida;
+ +	void *base;
+ +	struct kref kref;
+ +	struct device *dev;
+ +	unsigned int align;
+ +	struct resource res;
+ +	unsigned long pfn_flags;
+ +};
+ +
+ +/**
+ + * struct dax_dev - subdivision of a dax region
+ + * @region - parent region
+ + * @dev - device backing the character device
+ + * @cdev - core chardev data
+ + * @alive - !alive + rcu grace period == no new mappings can be established
+ + * @id - child id in the region
+ + * @num_resources - number of physical address extents in this device
+ + * @res - array of physical address ranges
+ + */
+ +struct dax_dev {
+ +	struct dax_region *region;
+ +	struct inode *inode;
+ +	struct device dev;
+ +	struct cdev cdev;
+ +	bool alive;
+ +	int id;
+ +	int num_resources;
+ +	struct resource res[0];
+ +};
+ +
+++=======
++ /*
++  * Rely on the fact that drvdata is set before the attributes are
++  * registered, and that the attributes are unregistered before drvdata
++  * is cleared to assume that drvdata is always valid.
++  */
+++>>>>>>> 565851c972b5 (device-dax: fix sysfs attribute deadlock)
+  static ssize_t id_show(struct device *dev,
+  		struct device_attribute *attr, char *buf)
+  {
+* Unmerged path drivers/dax/dax.c
