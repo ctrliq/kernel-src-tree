@@ -1,0 +1,442 @@
+scsi: lpfc: Declare local functions static
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Bart Van Assche <bvanassche@acm.org>
+commit 3999df75bccb54722a3bbb5e2b1fa9a2af76c637
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/3999df75.failed
+
+This patch avoids that the compiler complains about missing declarations
+when building with W=1.
+
+	Cc: James Smart <james.smart@broadcom.com>
+	Signed-off-by: Bart Van Assche <bvanassche@acm.org>
+	Acked-by: James Smart <james.smart@broadcom.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 3999df75bccb54722a3bbb5e2b1fa9a2af76c637)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_init.c
+#	drivers/scsi/lpfc/lpfc_sli.c
+diff --cc drivers/scsi/lpfc/lpfc_init.c
+index c658ac05b103,8e0de4873cc4..000000000000
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@@ -3072,6 -3074,249 +3072,252 @@@ lpfc_sli4_node_prep(struct lpfc_hba *ph
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * lpfc_create_expedite_pool - create expedite pool
++  * @phba: pointer to lpfc hba data structure.
++  *
++  * This routine moves a batch of XRIs from lpfc_io_buf_list_put of HWQ 0
++  * to expedite pool. Mark them as expedite.
++  **/
++ static void lpfc_create_expedite_pool(struct lpfc_hba *phba)
++ {
++ 	struct lpfc_sli4_hdw_queue *qp;
++ 	struct lpfc_io_buf *lpfc_ncmd;
++ 	struct lpfc_io_buf *lpfc_ncmd_next;
++ 	struct lpfc_epd_pool *epd_pool;
++ 	unsigned long iflag;
++ 
++ 	epd_pool = &phba->epd_pool;
++ 	qp = &phba->sli4_hba.hdwq[0];
++ 
++ 	spin_lock_init(&epd_pool->lock);
++ 	spin_lock_irqsave(&qp->io_buf_list_put_lock, iflag);
++ 	spin_lock(&epd_pool->lock);
++ 	INIT_LIST_HEAD(&epd_pool->list);
++ 	list_for_each_entry_safe(lpfc_ncmd, lpfc_ncmd_next,
++ 				 &qp->lpfc_io_buf_list_put, list) {
++ 		list_move_tail(&lpfc_ncmd->list, &epd_pool->list);
++ 		lpfc_ncmd->expedite = true;
++ 		qp->put_io_bufs--;
++ 		epd_pool->count++;
++ 		if (epd_pool->count >= XRI_BATCH)
++ 			break;
++ 	}
++ 	spin_unlock(&epd_pool->lock);
++ 	spin_unlock_irqrestore(&qp->io_buf_list_put_lock, iflag);
++ }
++ 
++ /**
++  * lpfc_destroy_expedite_pool - destroy expedite pool
++  * @phba: pointer to lpfc hba data structure.
++  *
++  * This routine returns XRIs from expedite pool to lpfc_io_buf_list_put
++  * of HWQ 0. Clear the mark.
++  **/
++ static void lpfc_destroy_expedite_pool(struct lpfc_hba *phba)
++ {
++ 	struct lpfc_sli4_hdw_queue *qp;
++ 	struct lpfc_io_buf *lpfc_ncmd;
++ 	struct lpfc_io_buf *lpfc_ncmd_next;
++ 	struct lpfc_epd_pool *epd_pool;
++ 	unsigned long iflag;
++ 
++ 	epd_pool = &phba->epd_pool;
++ 	qp = &phba->sli4_hba.hdwq[0];
++ 
++ 	spin_lock_irqsave(&qp->io_buf_list_put_lock, iflag);
++ 	spin_lock(&epd_pool->lock);
++ 	list_for_each_entry_safe(lpfc_ncmd, lpfc_ncmd_next,
++ 				 &epd_pool->list, list) {
++ 		list_move_tail(&lpfc_ncmd->list,
++ 			       &qp->lpfc_io_buf_list_put);
++ 		lpfc_ncmd->flags = false;
++ 		qp->put_io_bufs++;
++ 		epd_pool->count--;
++ 	}
++ 	spin_unlock(&epd_pool->lock);
++ 	spin_unlock_irqrestore(&qp->io_buf_list_put_lock, iflag);
++ }
++ 
++ /**
++  * lpfc_create_multixri_pools - create multi-XRI pools
++  * @phba: pointer to lpfc hba data structure.
++  *
++  * This routine initialize public, private per HWQ. Then, move XRIs from
++  * lpfc_io_buf_list_put to public pool. High and low watermark are also
++  * Initialized.
++  **/
++ void lpfc_create_multixri_pools(struct lpfc_hba *phba)
++ {
++ 	u32 i, j;
++ 	u32 hwq_count;
++ 	u32 count_per_hwq;
++ 	struct lpfc_io_buf *lpfc_ncmd;
++ 	struct lpfc_io_buf *lpfc_ncmd_next;
++ 	unsigned long iflag;
++ 	struct lpfc_sli4_hdw_queue *qp;
++ 	struct lpfc_multixri_pool *multixri_pool;
++ 	struct lpfc_pbl_pool *pbl_pool;
++ 	struct lpfc_pvt_pool *pvt_pool;
++ 
++ 	lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
++ 			"1234 num_hdw_queue=%d num_present_cpu=%d common_xri_cnt=%d\n",
++ 			phba->cfg_hdw_queue, phba->sli4_hba.num_present_cpu,
++ 			phba->sli4_hba.io_xri_cnt);
++ 
++ 	if (phba->cfg_enable_fc4_type & LPFC_ENABLE_NVME)
++ 		lpfc_create_expedite_pool(phba);
++ 
++ 	hwq_count = phba->cfg_hdw_queue;
++ 	count_per_hwq = phba->sli4_hba.io_xri_cnt / hwq_count;
++ 
++ 	for (i = 0; i < hwq_count; i++) {
++ 		multixri_pool = kzalloc(sizeof(*multixri_pool), GFP_KERNEL);
++ 
++ 		if (!multixri_pool) {
++ 			lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
++ 					"1238 Failed to allocate memory for "
++ 					"multixri_pool\n");
++ 
++ 			if (phba->cfg_enable_fc4_type & LPFC_ENABLE_NVME)
++ 				lpfc_destroy_expedite_pool(phba);
++ 
++ 			j = 0;
++ 			while (j < i) {
++ 				qp = &phba->sli4_hba.hdwq[j];
++ 				kfree(qp->p_multixri_pool);
++ 				j++;
++ 			}
++ 			phba->cfg_xri_rebalancing = 0;
++ 			return;
++ 		}
++ 
++ 		qp = &phba->sli4_hba.hdwq[i];
++ 		qp->p_multixri_pool = multixri_pool;
++ 
++ 		multixri_pool->xri_limit = count_per_hwq;
++ 		multixri_pool->rrb_next_hwqid = i;
++ 
++ 		/* Deal with public free xri pool */
++ 		pbl_pool = &multixri_pool->pbl_pool;
++ 		spin_lock_init(&pbl_pool->lock);
++ 		spin_lock_irqsave(&qp->io_buf_list_put_lock, iflag);
++ 		spin_lock(&pbl_pool->lock);
++ 		INIT_LIST_HEAD(&pbl_pool->list);
++ 		list_for_each_entry_safe(lpfc_ncmd, lpfc_ncmd_next,
++ 					 &qp->lpfc_io_buf_list_put, list) {
++ 			list_move_tail(&lpfc_ncmd->list, &pbl_pool->list);
++ 			qp->put_io_bufs--;
++ 			pbl_pool->count++;
++ 		}
++ 		lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
++ 				"1235 Moved %d buffers from PUT list over to pbl_pool[%d]\n",
++ 				pbl_pool->count, i);
++ 		spin_unlock(&pbl_pool->lock);
++ 		spin_unlock_irqrestore(&qp->io_buf_list_put_lock, iflag);
++ 
++ 		/* Deal with private free xri pool */
++ 		pvt_pool = &multixri_pool->pvt_pool;
++ 		pvt_pool->high_watermark = multixri_pool->xri_limit / 2;
++ 		pvt_pool->low_watermark = XRI_BATCH;
++ 		spin_lock_init(&pvt_pool->lock);
++ 		spin_lock_irqsave(&pvt_pool->lock, iflag);
++ 		INIT_LIST_HEAD(&pvt_pool->list);
++ 		pvt_pool->count = 0;
++ 		spin_unlock_irqrestore(&pvt_pool->lock, iflag);
++ 	}
++ }
++ 
++ /**
++  * lpfc_destroy_multixri_pools - destroy multi-XRI pools
++  * @phba: pointer to lpfc hba data structure.
++  *
++  * This routine returns XRIs from public/private to lpfc_io_buf_list_put.
++  **/
++ static void lpfc_destroy_multixri_pools(struct lpfc_hba *phba)
++ {
++ 	u32 i;
++ 	u32 hwq_count;
++ 	struct lpfc_io_buf *lpfc_ncmd;
++ 	struct lpfc_io_buf *lpfc_ncmd_next;
++ 	unsigned long iflag;
++ 	struct lpfc_sli4_hdw_queue *qp;
++ 	struct lpfc_multixri_pool *multixri_pool;
++ 	struct lpfc_pbl_pool *pbl_pool;
++ 	struct lpfc_pvt_pool *pvt_pool;
++ 
++ 	if (phba->cfg_enable_fc4_type & LPFC_ENABLE_NVME)
++ 		lpfc_destroy_expedite_pool(phba);
++ 
++ 	if (!(phba->pport->load_flag & FC_UNLOADING)) {
++ 		lpfc_sli_flush_fcp_rings(phba);
++ 
++ 		if (phba->cfg_enable_fc4_type & LPFC_ENABLE_NVME)
++ 			lpfc_sli_flush_nvme_rings(phba);
++ 	}
++ 
++ 	hwq_count = phba->cfg_hdw_queue;
++ 
++ 	for (i = 0; i < hwq_count; i++) {
++ 		qp = &phba->sli4_hba.hdwq[i];
++ 		multixri_pool = qp->p_multixri_pool;
++ 		if (!multixri_pool)
++ 			continue;
++ 
++ 		qp->p_multixri_pool = NULL;
++ 
++ 		spin_lock_irqsave(&qp->io_buf_list_put_lock, iflag);
++ 
++ 		/* Deal with public free xri pool */
++ 		pbl_pool = &multixri_pool->pbl_pool;
++ 		spin_lock(&pbl_pool->lock);
++ 
++ 		lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
++ 				"1236 Moving %d buffers from pbl_pool[%d] TO PUT list\n",
++ 				pbl_pool->count, i);
++ 
++ 		list_for_each_entry_safe(lpfc_ncmd, lpfc_ncmd_next,
++ 					 &pbl_pool->list, list) {
++ 			list_move_tail(&lpfc_ncmd->list,
++ 				       &qp->lpfc_io_buf_list_put);
++ 			qp->put_io_bufs++;
++ 			pbl_pool->count--;
++ 		}
++ 
++ 		INIT_LIST_HEAD(&pbl_pool->list);
++ 		pbl_pool->count = 0;
++ 
++ 		spin_unlock(&pbl_pool->lock);
++ 
++ 		/* Deal with private free xri pool */
++ 		pvt_pool = &multixri_pool->pvt_pool;
++ 		spin_lock(&pvt_pool->lock);
++ 
++ 		lpfc_printf_log(phba, KERN_INFO, LOG_INIT,
++ 				"1237 Moving %d buffers from pvt_pool[%d] TO PUT list\n",
++ 				pvt_pool->count, i);
++ 
++ 		list_for_each_entry_safe(lpfc_ncmd, lpfc_ncmd_next,
++ 					 &pvt_pool->list, list) {
++ 			list_move_tail(&lpfc_ncmd->list,
++ 				       &qp->lpfc_io_buf_list_put);
++ 			qp->put_io_bufs++;
++ 			pvt_pool->count--;
++ 		}
++ 
++ 		INIT_LIST_HEAD(&pvt_pool->list);
++ 		pvt_pool->count = 0;
++ 
++ 		spin_unlock(&pvt_pool->lock);
++ 		spin_unlock_irqrestore(&qp->io_buf_list_put_lock, iflag);
++ 
++ 		kfree(multixri_pool);
++ 	}
++ }
++ 
++ /**
+++>>>>>>> 3999df75bccb (scsi: lpfc: Declare local functions static)
+   * lpfc_online - Initialize and bring a HBA online
+   * @phba: pointer to lpfc hba data structure.
+   *
+@@@ -9021,6 -9306,38 +9267,41 @@@ lpfc_create_wq_cq(struct lpfc_hba *phba
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * lpfc_setup_cq_lookup - Setup the CQ lookup table
++  * @phba: pointer to lpfc hba data structure.
++  *
++  * This routine will populate the cq_lookup table by all
++  * available CQ queue_id's.
++  **/
++ static void
++ lpfc_setup_cq_lookup(struct lpfc_hba *phba)
++ {
++ 	struct lpfc_queue *eq, *childq;
++ 	struct lpfc_sli4_hdw_queue *qp;
++ 	int qidx;
++ 
++ 	qp = phba->sli4_hba.hdwq;
++ 	memset(phba->sli4_hba.cq_lookup, 0,
++ 	       (sizeof(struct lpfc_queue *) * (phba->sli4_hba.cq_max + 1)));
++ 	for (qidx = 0; qidx < phba->cfg_irq_chann; qidx++) {
++ 		eq = qp[qidx].hba_eq;
++ 		if (!eq)
++ 			continue;
++ 		list_for_each_entry(childq, &eq->child_list, list) {
++ 			if (childq->queue_id > phba->sli4_hba.cq_max)
++ 				continue;
++ 			if ((childq->subtype == LPFC_FCP) ||
++ 			    (childq->subtype == LPFC_NVME))
++ 				phba->sli4_hba.cq_lookup[childq->queue_id] =
++ 					childq;
++ 		}
++ 	}
++ }
++ 
++ /**
+++>>>>>>> 3999df75bccb (scsi: lpfc: Declare local functions static)
+   * lpfc_sli4_queue_setup - Set up all the SLI4 queues
+   * @phba: pointer to lpfc hba data structure.
+   *
+diff --cc drivers/scsi/lpfc/lpfc_sli.c
+index ca080e127aa1,ea9bcb3431b4..000000000000
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@@ -7081,7 -7087,39 +7081,43 @@@ lpfc_sli4_repost_sgl_list(struct lpfc_h
+  	return total_cnt;
+  }
+  
+++<<<<<<< HEAD
+ +void
+++=======
++ /**
++  * lpfc_sli4_repost_io_sgl_list - Repost all the allocated nvme buffer sgls
++  * @phba: pointer to lpfc hba data structure.
++  *
++  * This routine walks the list of nvme buffers that have been allocated and
++  * repost them to the port by using SGL block post. This is needed after a
++  * pci_function_reset/warm_start or start. The lpfc_hba_down_post_s4 routine
++  * is responsible for moving all nvme buffers on the lpfc_abts_nvme_sgl_list
++  * to the lpfc_io_buf_list. If the repost fails, reject all nvme buffers.
++  *
++  * Returns: 0 = success, non-zero failure.
++  **/
++ static int
++ lpfc_sli4_repost_io_sgl_list(struct lpfc_hba *phba)
++ {
++ 	LIST_HEAD(post_nblist);
++ 	int num_posted, rc = 0;
++ 
++ 	/* get all NVME buffers need to repost to a local list */
++ 	lpfc_io_buf_flush(phba, &post_nblist);
++ 
++ 	/* post the list of nvme buffer sgls to port if available */
++ 	if (!list_empty(&post_nblist)) {
++ 		num_posted = lpfc_sli4_post_io_sgl_list(
++ 			phba, &post_nblist, phba->sli4_hba.io_xri_cnt);
++ 		/* failed to post any nvme buffer, return error */
++ 		if (num_posted == 0)
++ 			rc = -EIO;
++ 	}
++ 	return rc;
++ }
++ 
++ static void
+++>>>>>>> 3999df75bccb (scsi: lpfc: Declare local functions static)
+  lpfc_set_host_data(struct lpfc_hba *phba, LPFC_MBOXQ_t *mbox)
+  {
+  	uint32_t len;
+diff --git a/drivers/scsi/lpfc/lpfc_attr.c b/drivers/scsi/lpfc/lpfc_attr.c
+index f5919f40a134..79169a5ae975 100644
+--- a/drivers/scsi/lpfc/lpfc_attr.c
++++ b/drivers/scsi/lpfc/lpfc_attr.c
+@@ -1211,7 +1211,7 @@ out:
+  * -EBUSY,    port is not in offline state
+  *      0,    successful
+  */
+-int
++static int
+ lpfc_reset_pci_bus(struct lpfc_hba *phba)
+ {
+ 	struct pci_dev *pdev = phba->pcidev;
+@@ -1542,7 +1542,7 @@ lpfc_nport_evt_cnt_show(struct device *dev, struct device_attribute *attr,
+ 	return snprintf(buf, PAGE_SIZE, "%d\n", phba->nport_event_cnt);
+ }
+ 
+-int
++static int
+ lpfc_set_trunking(struct lpfc_hba *phba, char *buff_out)
+ {
+ 	LPFC_MBOXQ_t *mbox = NULL;
+* Unmerged path drivers/scsi/lpfc/lpfc_init.c
+diff --git a/drivers/scsi/lpfc/lpfc_nportdisc.c b/drivers/scsi/lpfc/lpfc_nportdisc.c
+index 96bc3789a166..d79b58328222 100644
+--- a/drivers/scsi/lpfc/lpfc_nportdisc.c
++++ b/drivers/scsi/lpfc/lpfc_nportdisc.c
+@@ -870,7 +870,7 @@ lpfc_disc_set_adisc(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp)
+  * This function will send a unreg_login mailbox command to the firmware
+  * to release a rpi.
+  **/
+-void
++static void
+ lpfc_release_rpi(struct lpfc_hba *phba, struct lpfc_vport *vport,
+ 		 struct lpfc_nodelist *ndlp, uint16_t rpi)
+ {
+diff --git a/drivers/scsi/lpfc/lpfc_nvme.c b/drivers/scsi/lpfc/lpfc_nvme.c
+index fb0468dd3de4..dc266fc0ebd7 100644
+--- a/drivers/scsi/lpfc/lpfc_nvme.c
++++ b/drivers/scsi/lpfc/lpfc_nvme.c
+@@ -312,7 +312,7 @@ lpfc_nvme_localport_delete(struct nvme_fc_local_port *localport)
+  * Return value :
+  * None
+  */
+-void
++static void
+ lpfc_nvme_remoteport_delete(struct nvme_fc_remote_port *remoteport)
+ {
+ 	struct lpfc_nvme_rport *rport = remoteport->private;
+@@ -2530,7 +2530,7 @@ lpfc_nvme_create_localport(struct lpfc_vport *vport)
+  * An uninterruptible wait is used because of the risk of transport-to-
+  * driver state mismatch.
+  */
+-void
++static void
+ lpfc_nvme_lport_unreg_wait(struct lpfc_vport *vport,
+ 			   struct lpfc_nvme_lport *lport,
+ 			   struct completion *lport_unreg_cmp)
+diff --git a/drivers/scsi/lpfc/lpfc_nvmet.c b/drivers/scsi/lpfc/lpfc_nvmet.c
+index 6a1265b7c114..9618ce9af579 100644
+--- a/drivers/scsi/lpfc/lpfc_nvmet.c
++++ b/drivers/scsi/lpfc/lpfc_nvmet.c
+@@ -217,7 +217,7 @@ lpfc_nvmet_cmd_template(void)
+ 	/* Word 12, 13, 14, 15 - is zero */
+ }
+ 
+-void
++static void
+ lpfc_nvmet_defer_release(struct lpfc_hba *phba, struct lpfc_nvmet_rcv_ctx *ctxp)
+ {
+ 	unsigned long iflag;
+* Unmerged path drivers/scsi/lpfc/lpfc_sli.c
