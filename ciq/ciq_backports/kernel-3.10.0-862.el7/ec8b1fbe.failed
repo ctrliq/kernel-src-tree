@@ -1,0 +1,216 @@
+nfp: support port splitting via devlink
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit ec8b1fbe682deb376062c5ed04ef9c78160ffbf0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ec8b1fbe.failed
+
+Add support for configuring port split with devlink.  Add devlink
+callbacks to validate requested config and call NSP helpers.
+Getting the right nfp_port structure can be done with simple iteration.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ec8b1fbe682deb376062c5ed04ef9c78160ffbf0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_devlink.c
+#	drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+#	drivers/net/ethernet/netronome/nfp/nfp_port.c
+#	drivers/net/ethernet/netronome/nfp/nfp_port.h
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+index acc8cfe284f3,388759e047d8..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+@@@ -454,72 -530,126 +455,152 @@@ static void nfp_net_pci_remove_finish(s
+  	nfp_net_irqs_disable(pf->pdev);
+  	kfree(pf->irq_entries);
+  
+ -	nfp_net_pf_app_clean(pf);
+ -
+  	nfp_cpp_area_release_free(pf->rx_area);
+  	nfp_cpp_area_release_free(pf->tx_area);
+ -	nfp_cpp_area_release_free(pf->data_vnic_bar);
+ +	nfp_cpp_area_release_free(pf->ctrl_area);
+  }
+  
+++<<<<<<< HEAD
+ +static void nfp_net_refresh_netdevs(struct work_struct *work)
+ +{
+ +	struct nfp_pf *pf = container_of(work, struct nfp_pf,
+ +					 port_refresh_work);
+++=======
++ static int
++ nfp_net_eth_port_update(struct nfp_cpp *cpp, struct nfp_port *port,
++ 			struct nfp_eth_table *eth_table)
++ {
++ 	struct nfp_eth_table_port *eth_port;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	eth_port = nfp_net_find_port(eth_table, port->eth_id);
++ 	if (!eth_port) {
++ 		set_bit(NFP_PORT_CHANGED, &port->flags);
++ 		nfp_warn(cpp, "Warning: port #%d not present after reconfig\n",
++ 			 port->eth_id);
++ 		return -EIO;
++ 	}
++ 	if (eth_port->override_changed) {
++ 		nfp_warn(cpp, "Port #%d config changed, unregistering. Reboot required before port will be operational again.\n", port->eth_id);
++ 		port->type = NFP_PORT_INVALID;
++ 	}
++ 
++ 	memcpy(port->eth_port, eth_port, sizeof(*eth_port));
++ 
++ 	return 0;
++ }
++ 
++ int nfp_net_refresh_port_table_sync(struct nfp_pf *pf)
++ {
++ 	struct nfp_eth_table *eth_table;
+++>>>>>>> ec8b1fbe682d (nfp: support port splitting via devlink)
+  	struct nfp_net *nn, *next;
+ -	struct nfp_port *port;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&pf->port_lock);
+ +
+ +	/* Check for nfp_net_pci_remove() racing against us */
+ +	if (list_empty(&pf->ports))
+ +		goto out;
+ +
+ +	list_for_each_entry_safe(nn, next, &pf->ports, port_list) {
+ +		if (!nn->eth_port) {
+ +			nfp_warn(pf->cpp, "Warning: port not present after reconfig\n");
+ +			continue;
+ +		}
+ +		if (!nn->eth_port->override_changed)
+++=======
++ 	lockdep_assert_held(&pf->lock);
++ 
++ 	/* Check for nfp_net_pci_remove() racing against us */
++ 	if (list_empty(&pf->vnics))
++ 		return 0;
++ 
++ 	/* Update state of all ports */
++ 	rtnl_lock();
++ 	list_for_each_entry(port, &pf->ports, port_list)
++ 		clear_bit(NFP_PORT_CHANGED, &port->flags);
++ 
++ 	eth_table = nfp_eth_read_ports(pf->cpp);
++ 	if (!eth_table) {
++ 		list_for_each_entry(port, &pf->ports, port_list)
++ 			if (__nfp_port_get_eth_port(port))
++ 				set_bit(NFP_PORT_CHANGED, &port->flags);
++ 		rtnl_unlock();
++ 		nfp_err(pf->cpp, "Error refreshing port config!\n");
++ 		return -EIO;
++ 	}
++ 
++ 	list_for_each_entry(port, &pf->ports, port_list)
++ 		if (__nfp_port_get_eth_port(port))
++ 			nfp_net_eth_port_update(pf->cpp, port, eth_table);
++ 	rtnl_unlock();
++ 
++ 	kfree(eth_table);
++ 
++ 	/* Shoot off the ports which became invalid */
++ 	list_for_each_entry_safe(nn, next, &pf->vnics, vnic_list) {
++ 		if (!nn->port || nn->port->type != NFP_PORT_INVALID)
+++>>>>>>> ec8b1fbe682d (nfp: support port splitting via devlink)
+  			continue;
+  
+ -		nfp_net_pf_clean_vnic(pf, nn);
+ -		nfp_net_pf_free_vnic(pf, nn);
+ +		nn_warn(nn, "Port config changed, unregistering. Reboot required before port will be operational again.\n");
+ +
+ +		nfp_net_debugfs_dir_clean(&nn->debugfs_dir);
+ +		nfp_net_netdev_clean(nn->dp.netdev);
+ +
+ +		list_del(&nn->port_list);
+ +		pf->num_netdevs--;
+ +		nfp_net_netdev_free(nn);
+  	}
+  
+ -	if (list_empty(&pf->vnics))
+ +	if (list_empty(&pf->ports))
+  		nfp_net_pci_remove_finish(pf);
+++<<<<<<< HEAD
+ +out:
+ +	mutex_unlock(&pf->port_lock);
+++=======
++ 
++ 	return 0;
++ }
++ 
++ static void nfp_net_refresh_vnics(struct work_struct *work)
++ {
++ 	struct nfp_pf *pf = container_of(work, struct nfp_pf,
++ 					 port_refresh_work);
++ 
++ 	mutex_lock(&pf->lock);
++ 	nfp_net_refresh_port_table_sync(pf);
++ 	mutex_unlock(&pf->lock);
+++>>>>>>> ec8b1fbe682d (nfp: support port splitting via devlink)
+  }
+  
+ -void nfp_net_refresh_port_table(struct nfp_port *port)
+ +void nfp_net_refresh_port_config(struct nfp_net *nn)
+  {
+ -	struct nfp_pf *pf = port->app->pf;
+ -
+ -	set_bit(NFP_PORT_CHANGED, &port->flags);
+ +	struct nfp_pf *pf = pci_get_drvdata(nn->pdev);
+ +	struct nfp_eth_table *old_table;
+  
+ -	schedule_work(&pf->port_refresh_work);
+ -}
+ +	ASSERT_RTNL();
+  
+ -int nfp_net_refresh_eth_port(struct nfp_port *port)
+ -{
+ -	struct nfp_cpp *cpp = port->app->cpp;
+ -	struct nfp_eth_table *eth_table;
+ -	int ret;
+ +	old_table = pf->eth_tbl;
+  
+ -	clear_bit(NFP_PORT_CHANGED, &port->flags);
+ +	list_for_each_entry(nn, &pf->ports, port_list)
+ +		nfp_net_link_changed_read_clear(nn);
+  
+ -	eth_table = nfp_eth_read_ports(cpp);
+ -	if (!eth_table) {
+ -		set_bit(NFP_PORT_CHANGED, &port->flags);
+ -		nfp_err(cpp, "Error refreshing port state table!\n");
+ -		return -EIO;
+ +	pf->eth_tbl = nfp_eth_read_ports(pf->cpp);
+ +	if (!pf->eth_tbl) {
+ +		pf->eth_tbl = old_table;
+ +		nfp_err(pf->cpp, "Error refreshing port config!\n");
+ +		return;
+  	}
+  
+ -	ret = nfp_net_eth_port_update(cpp, port, eth_table);
+ +	list_for_each_entry(nn, &pf->ports, port_list)
+ +		nn->eth_port = nfp_net_find_port(pf, nn->eth_port->eth_index);
+  
+ -	kfree(eth_table);
+ +	kfree(old_table);
+  
+ -	return ret;
+ +	schedule_work(&pf->port_refresh_work);
+  }
+  
+  /*
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_devlink.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_port.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_port.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_devlink.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_port.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_port.h
