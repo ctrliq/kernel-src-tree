@@ -1,0 +1,711 @@
+tcmu: make ring buffer timer configurable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Mike Christie <mchristi@redhat.com>
+commit 9103575ae34e9d60d40940bebf47fc9e9652067a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9103575a.failed
+
+This adds a timer, qfull_time_out, that controls how long a
+device will wait for ring buffer space to open before
+failing the commands in the queue. It is useful to separate
+this timer from the cmd_time_out and default 30 sec one,
+because for HA setups cmd_time_out may be disbled and 30
+seconds is too long to wait when some OSs like ESX will
+timeout commands after as little as 8 - 15 seconds.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 9103575ae34e9d60d40940bebf47fc9e9652067a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 5b22226ed5d2,c6a0c3198ccc..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -111,17 -132,23 +111,25 @@@ struct tcmu_dev 
+  	size_t data_off;
+  	size_t data_size;
+  
+ -	struct mutex cmdr_lock;
+ -	struct list_head cmdr_queue;
+ -
+ -	uint32_t dbi_max;
+ -	uint32_t dbi_thresh;
+  	DECLARE_BITMAP(data_bitmap, DATA_BLOCK_BITS);
+ -	struct radix_tree_root data_blocks;
+ +
+ +	wait_queue_head_t wait_cmdr;
+ +	/* TODO should this be a mutex? */
+ +	spinlock_t cmdr_lock;
+  
+  	struct idr commands;
+ +	spinlock_t commands_lock;
+  
+- 	struct timer_list timeout;
++ 	struct timer_list cmd_timer;
+  	unsigned int cmd_time_out;
+++<<<<<<< HEAD
+++=======
++ 
++ 	struct timer_list qfull_timer;
++ 	int qfull_time_out;
++ 
++ 	struct list_head timedout_entry;
+++>>>>>>> 9103575ae34e (tcmu: make ring buffer timer configurable)
+  
+  	spinlock_t nl_cmd_lock;
+  	struct tcmu_nl_cmd curr_nl_cmd;
+@@@ -511,18 -703,116 +519,110 @@@ static bool is_ring_space_avail(struct 
+  		return false;
+  	}
+  
+ -	/* try to check and get the data blocks as needed */
+ -	space = spc_bitmap_free(udev->data_bitmap, udev->dbi_thresh);
+ -	if ((space * DATA_BLOCK_SIZE) < data_needed) {
+ -		unsigned long blocks_left = DATA_BLOCK_BITS - udev->dbi_thresh +
+ -						space;
+ -
+ -		if (blocks_left < blocks_needed) {
+ -			pr_debug("no data space: only %lu available, but ask for %zu\n",
+ -					blocks_left * DATA_BLOCK_SIZE,
+ -					data_needed);
+ -			return false;
+ -		}
+ -
+ -		udev->dbi_thresh += blocks_needed;
+ -		if (udev->dbi_thresh > DATA_BLOCK_BITS)
+ -			udev->dbi_thresh = DATA_BLOCK_BITS;
+ +	space = spc_bitmap_free(udev->data_bitmap);
+ +	if (space < data_needed) {
+ +		pr_debug("no data space: only %zu available, but ask for %zu\n",
+ +				space, data_needed);
+ +		return false;
+  	}
+  
+ -	return tcmu_get_empty_blocks(udev, cmd);
+ +	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static sense_reason_t
+ +tcmu_queue_cmd_ring(struct tcmu_cmd *tcmu_cmd)
+++=======
++ static inline size_t tcmu_cmd_get_base_cmd_size(size_t iov_cnt)
++ {
++ 	return max(offsetof(struct tcmu_cmd_entry, req.iov[iov_cnt]),
++ 			sizeof(struct tcmu_cmd_entry));
++ }
++ 
++ static inline size_t tcmu_cmd_get_cmd_size(struct tcmu_cmd *tcmu_cmd,
++ 					   size_t base_command_size)
++ {
++ 	struct se_cmd *se_cmd = tcmu_cmd->se_cmd;
++ 	size_t command_size;
++ 
++ 	command_size = base_command_size +
++ 		round_up(scsi_command_size(se_cmd->t_task_cdb),
++ 				TCMU_OP_ALIGN_SIZE);
++ 
++ 	WARN_ON(command_size & (TCMU_OP_ALIGN_SIZE-1));
++ 
++ 	return command_size;
++ }
++ 
++ static int tcmu_setup_cmd_timer(struct tcmu_cmd *tcmu_cmd, unsigned int tmo,
++ 				struct timer_list *timer)
++ {
++ 	struct tcmu_dev *udev = tcmu_cmd->tcmu_dev;
++ 	int cmd_id;
++ 
++ 	if (tcmu_cmd->cmd_id)
++ 		goto setup_timer;
++ 
++ 	cmd_id = idr_alloc(&udev->commands, tcmu_cmd, 1, USHRT_MAX, GFP_NOWAIT);
++ 	if (cmd_id < 0) {
++ 		pr_err("tcmu: Could not allocate cmd id.\n");
++ 		return cmd_id;
++ 	}
++ 	tcmu_cmd->cmd_id = cmd_id;
++ 
++ 	pr_debug("allocated cmd %u for dev %s tmo %lu\n", tcmu_cmd->cmd_id,
++ 		 udev->name, tmo / MSEC_PER_SEC);
++ 
++ setup_timer:
++ 	if (!tmo)
++ 		return 0;
++ 
++ 	tcmu_cmd->deadline = round_jiffies_up(jiffies + msecs_to_jiffies(tmo));
++ 	mod_timer(timer, tcmu_cmd->deadline);
++ 	return 0;
++ }
++ 
++ static int add_to_cmdr_queue(struct tcmu_cmd *tcmu_cmd)
++ {
++ 	struct tcmu_dev *udev = tcmu_cmd->tcmu_dev;
++ 	unsigned int tmo;
++ 	int ret;
++ 
++ 	/*
++ 	 * For backwards compat if qfull_time_out is not set use
++ 	 * cmd_time_out and if that's not set use the default time out.
++ 	 */
++ 	if (!udev->qfull_time_out)
++ 		return -ETIMEDOUT;
++ 	else if (udev->qfull_time_out > 0)
++ 		tmo = udev->qfull_time_out;
++ 	else if (udev->cmd_time_out)
++ 		tmo = udev->cmd_time_out;
++ 	else
++ 		tmo = TCMU_TIME_OUT;
++ 
++ 	ret = tcmu_setup_cmd_timer(tcmu_cmd, tmo, &udev->qfull_timer);
++ 	if (ret)
++ 		return ret;
++ 
++ 	list_add_tail(&tcmu_cmd->cmdr_queue_entry, &udev->cmdr_queue);
++ 	pr_debug("adding cmd %u on dev %s to ring space wait queue\n",
++ 		 tcmu_cmd->cmd_id, udev->name);
++ 	return 0;
++ }
++ 
++ /**
++  * queue_cmd_ring - queue cmd to ring or internally
++  * @tcmu_cmd: cmd to queue
++  * @scsi_err: TCM error code if failure (-1) returned.
++  *
++  * Returns:
++  * -1 we cannot queue internally or to the ring.
++  *  0 success
++  *  1 internally queued to wait for ring memory to free.
++  */
++ static sense_reason_t queue_cmd_ring(struct tcmu_cmd *tcmu_cmd, int *scsi_err)
+++>>>>>>> 9103575ae34e (tcmu: make ring buffer timer configurable)
+  {
+  	struct tcmu_dev *udev = tcmu_cmd->tcmu_dev;
+  	struct se_cmd *se_cmd = tcmu_cmd->se_cmd;
+@@@ -639,13 -908,34 +739,36 @@@
+  
+  	/* Handle BIDI commands */
+  	iov_cnt = 0;
+ -	if (se_cmd->se_cmd_flags & SCF_BIDI) {
+ -		iov++;
+ -		scatter_data_area(udev, tcmu_cmd, se_cmd->t_bidi_data_sg,
+ -				  se_cmd->t_bidi_data_nents, &iov, &iov_cnt,
+ -				  false);
+ -	}
+ +	alloc_and_scatter_data_area(udev, se_cmd->t_bidi_data_sg,
+ +		se_cmd->t_bidi_data_nents, &iov, &iov_cnt, false);
+  	entry->req.iov_bidi_cnt = iov_cnt;
+  
+++<<<<<<< HEAD
+ +	/* cmd's data_bitmap is what changed in process */
+ +	bitmap_xor(tcmu_cmd->data_bitmap, old_bitmap, udev->data_bitmap,
+ +			DATA_BLOCK_BITS);
+++=======
++ 	ret = tcmu_setup_cmd_timer(tcmu_cmd, udev->cmd_time_out,
++ 				   &udev->cmd_timer);
++ 	if (ret) {
++ 		tcmu_cmd_free_data(tcmu_cmd, tcmu_cmd->dbi_cnt);
++ 		mutex_unlock(&udev->cmdr_lock);
++ 
++ 		*scsi_err = TCM_OUT_OF_RESOURCES;
++ 		return -1;
++ 	}
++ 	entry->hdr.cmd_id = tcmu_cmd->cmd_id;
++ 
++ 	/*
++ 	 * Recalaulate the command's base size and size according
++ 	 * to the actual needs
++ 	 */
++ 	base_command_size = tcmu_cmd_get_base_cmd_size(entry->req.iov_cnt +
++ 						       entry->req.iov_bidi_cnt);
++ 	command_size = tcmu_cmd_get_cmd_size(tcmu_cmd, base_command_size);
++ 
++ 	tcmu_hdr_set_len(&entry->hdr.len_op, command_size);
+++>>>>>>> 9103575ae34e (tcmu: make ring buffer timer configurable)
+  
+  	/* All offsets relative to mb_addr, not start of entry! */
+  	cdb_off = CMDR_OFF + cmd_head + base_command_size;
+@@@ -798,12 -1065,20 +921,29 @@@ static unsigned int tcmu_handle_complet
+  		handled++;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (mb->cmd_tail == mb->cmd_head)
+ +		del_timer(&udev->timeout); /* no more pending cmds */
+ +
+ +	spin_unlock_irqrestore(&udev->cmdr_lock, flags);
+ +
+ +	wake_up(&udev->wait_cmdr);
+++=======
++ 	if (mb->cmd_tail == mb->cmd_head) {
++ 		/* no more pending commands */
++ 		del_timer(&udev->cmd_timer);
++ 
++ 		if (list_empty(&udev->cmdr_queue)) {
++ 			/*
++ 			 * no more pending or waiting commands so try to
++ 			 * reclaim blocks if needed.
++ 			 */
++ 			if (atomic_read(&global_db_count) >
++ 			    TCMU_GLOBAL_MAX_BLOCKS)
++ 				schedule_delayed_work(&tcmu_unmap_work, 0);
++ 		}
++ 	}
+++>>>>>>> 9103575ae34e (tcmu: make ring buffer timer configurable)
+  
+  	return handled;
+  }
+@@@ -818,33 -1097,64 +958,90 @@@ static int tcmu_check_expired_cmd(int i
+  	if (!time_after(jiffies, cmd->deadline))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	set_bit(TCMU_CMD_BIT_EXPIRED, &cmd->flags);
+ +	target_complete_cmd(cmd->se_cmd, SAM_STAT_CHECK_CONDITION);
+ +	cmd->se_cmd = NULL;
+ +
+ +	return 0;
+ +}
+ +
+ +static void tcmu_device_timedout(unsigned long data)
+ +{
+ +	struct tcmu_dev *udev = (struct tcmu_dev *)data;
+ +	unsigned long flags;
+ +	int handled;
+ +
+ +	handled = tcmu_handle_completions(udev);
+ +
+ +	pr_warn("%d completions handled from timeout\n", handled);
+++=======
++ 	is_running = list_empty(&cmd->cmdr_queue_entry);
++ 
++ 	if (is_running) {
++ 		/*
++ 		 * If cmd_time_out is disabled but qfull is set deadline
++ 		 * will only reflect the qfull timeout. Ignore it.
++ 		 */
++ 		if (!udev->cmd_time_out)
++ 			return 0;
++ 
++ 		set_bit(TCMU_CMD_BIT_EXPIRED, &cmd->flags);
++ 		/*
++ 		 * target_complete_cmd will translate this to LUN COMM FAILURE
++ 		 */
++ 		scsi_status = SAM_STAT_CHECK_CONDITION;
++ 	} else {
++ 		list_del_init(&cmd->cmdr_queue_entry);
++ 
++ 		idr_remove(&udev->commands, id);
++ 		tcmu_free_cmd(cmd);
++ 		scsi_status = SAM_STAT_TASK_SET_FULL;
++ 	}
++ 
++ 	pr_debug("Timing out cmd %u on dev %s that is %s.\n",
++ 		 id, udev->name, is_running ? "inflight" : "queued");
++ 
++ 	se_cmd = cmd->se_cmd;
++ 	cmd->se_cmd = NULL;
++ 	target_complete_cmd(se_cmd, scsi_status);
++ 	return 0;
++ }
++ 
++ static void tcmu_device_timedout(struct tcmu_dev *udev)
++ {
++ 	spin_lock(&timed_out_udevs_lock);
++ 	if (list_empty(&udev->timedout_entry))
++ 		list_add_tail(&udev->timedout_entry, &timed_out_udevs);
++ 	spin_unlock(&timed_out_udevs_lock);
+++>>>>>>> 9103575ae34e (tcmu: make ring buffer timer configurable)
+  
+ -	schedule_delayed_work(&tcmu_unmap_work, 0);
+ +	spin_lock_irqsave(&udev->commands_lock, flags);
+ +	idr_for_each(&udev->commands, tcmu_check_expired_cmd, NULL);
+ +	spin_unlock_irqrestore(&udev->commands_lock, flags);
+ +
+ +	/*
+ +	 * We don't need to wakeup threads on wait_cmdr since they have their
+ +	 * own timeout.
+ +	 */
+  }
+  
++ static void tcmu_cmd_timedout(struct timer_list *t)
++ {
++ 	struct tcmu_dev *udev = from_timer(udev, t, cmd_timer);
++ 
++ 	pr_debug("%s cmd timeout has expired\n", udev->name);
++ 	tcmu_device_timedout(udev);
++ }
++ 
++ static void tcmu_qfull_timedout(struct timer_list *t)
++ {
++ 	struct tcmu_dev *udev = from_timer(udev, t, qfull_timer);
++ 
++ 	pr_debug("%s qfull timeout has expired\n", udev->name);
++ 	tcmu_device_timedout(udev);
++ }
++ 
+  static int tcmu_attach_hba(struct se_hba *hba, u32 host_id)
+  {
+  	struct tcmu_hba *tcmu_hba;
+@@@ -881,15 -1192,16 +1078,21 @@@ static struct se_device *tcmu_alloc_dev
+  
+  	udev->hba = hba;
+  	udev->cmd_time_out = TCMU_TIME_OUT;
++ 	udev->qfull_time_out = -1;
+  
+ -	mutex_init(&udev->cmdr_lock);
+ +	init_waitqueue_head(&udev->wait_cmdr);
+ +	spin_lock_init(&udev->cmdr_lock);
+  
+ -	INIT_LIST_HEAD(&udev->timedout_entry);
+ -	INIT_LIST_HEAD(&udev->cmdr_queue);
+  	idr_init(&udev->commands);
+ +	spin_lock_init(&udev->commands_lock);
+  
+++<<<<<<< HEAD
+ +	setup_timer(&udev->timeout, tcmu_device_timedout,
+ +		(unsigned long)udev);
+++=======
++ 	timer_setup(&udev->qfull_timer, tcmu_qfull_timedout, 0);
++ 	timer_setup(&udev->cmd_timer, tcmu_cmd_timedout, 0);
+++>>>>>>> 9103575ae34e (tcmu: make ring buffer timer configurable)
+  
+  	init_waitqueue_head(&udev->nl_cmd_wq);
+  	spin_lock_init(&udev->nl_cmd_lock);
+@@@ -897,11 -1209,67 +1100,65 @@@
+  	return &udev->se_dev;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool run_cmdr_queue(struct tcmu_dev *udev)
++ {
++ 	struct tcmu_cmd *tcmu_cmd, *tmp_cmd;
++ 	LIST_HEAD(cmds);
++ 	bool drained = true;
++ 	sense_reason_t scsi_ret;
++ 	int ret;
++ 
++ 	if (list_empty(&udev->cmdr_queue))
++ 		return true;
++ 
++ 	pr_debug("running %s's cmdr queue\n", udev->name);
++ 
++ 	list_splice_init(&udev->cmdr_queue, &cmds);
++ 
++ 	list_for_each_entry_safe(tcmu_cmd, tmp_cmd, &cmds, cmdr_queue_entry) {
++ 		list_del_init(&tcmu_cmd->cmdr_queue_entry);
++ 
++ 	        pr_debug("removing cmd %u on dev %s from queue\n",
++ 		         tcmu_cmd->cmd_id, udev->name);
++ 
++ 		ret = queue_cmd_ring(tcmu_cmd, &scsi_ret);
++ 		if (ret < 0) {
++ 		        pr_debug("cmd %u on dev %s failed with %u\n",
++ 			         tcmu_cmd->cmd_id, udev->name, scsi_ret);
++ 
++ 			idr_remove(&udev->commands, tcmu_cmd->cmd_id);
++ 			/*
++ 			 * Ignore scsi_ret for now. target_complete_cmd
++ 			 * drops it.
++ 			 */
++ 			target_complete_cmd(tcmu_cmd->se_cmd,
++ 					    SAM_STAT_CHECK_CONDITION);
++ 			tcmu_free_cmd(tcmu_cmd);
++ 		} else if (ret > 0) {
++ 			pr_debug("ran out of space during cmdr queue run\n");
++ 			/*
++ 			 * cmd was requeued, so just put all cmds back in
++ 			 * the queue
++ 			 */
++ 			list_splice_tail(&cmds, &udev->cmdr_queue);
++ 			drained = false;
++ 			goto done;
++ 		}
++ 	}
++ 	if (list_empty(&udev->cmdr_queue))
++ 		del_timer(&udev->qfull_timer);
++ done:
++ 	return drained;
++ }
++ 
+++>>>>>>> 9103575ae34e (tcmu: make ring buffer timer configurable)
+  static int tcmu_irqcontrol(struct uio_info *info, s32 irq_on)
+  {
+ -	struct tcmu_dev *udev = container_of(info, struct tcmu_dev, uio_info);
+ +	struct tcmu_dev *tcmu_dev = container_of(info, struct tcmu_dev, uio_info);
+  
+ -	mutex_lock(&udev->cmdr_lock);
+ -	tcmu_handle_completions(udev);
+ -	run_cmdr_queue(udev);
+ -	mutex_unlock(&udev->cmdr_lock);
+ +	tcmu_handle_completions(tcmu_dev);
+  
+  	return 0;
+  }
+@@@ -1212,35 -1756,20 +1469,36 @@@ static bool tcmu_dev_configured(struct 
+  static void tcmu_destroy_device(struct se_device *dev)
+  {
+  	struct tcmu_dev *udev = TCMU_DEV(dev);
+ +	struct tcmu_cmd *cmd;
+ +	bool all_expired = true;
+ +	int i;
+  
+- 	del_timer_sync(&udev->timeout);
++ 	del_timer_sync(&udev->cmd_timer);
++ 	del_timer_sync(&udev->qfull_timer);
+  
+ -	mutex_lock(&root_udev_mutex);
+ -	list_del(&udev->node);
+ -	mutex_unlock(&root_udev_mutex);
+ +	vfree(udev->mb_addr);
+ +
+ +	/* Upper layer should drain all requests before calling this */
+ +	spin_lock_irq(&udev->commands_lock);
+ +	idr_for_each_entry(&udev->commands, cmd, i) {
+ +		if (tcmu_check_and_free_pending_cmd(cmd) != 0)
+ +			all_expired = false;
+ +	}
+ +	idr_destroy(&udev->commands);
+ +	spin_unlock_irq(&udev->commands_lock);
+ +	WARN_ON(!all_expired);
+  
+ -	tcmu_netlink_event(udev, TCMU_CMD_REMOVED_DEVICE, 0, NULL);
+ +	if (tcmu_dev_configured(udev)) {
+ +		tcmu_netlink_event(udev, TCMU_CMD_REMOVED_DEVICE);
+  
+ -	uio_unregister_device(&udev->uio_info);
+ +		uio_unregister_device(&udev->uio_info);
+ +		kfree(udev->uio_info.name);
+ +		kfree(udev->name);
+  
+ -	/* release ref from configure */
+ -	kref_put(&udev->kref, tcmu_dev_kref_release);
+ +		mutex_lock(&device_mutex);
+ +		idr_remove(&devices_idr, udev->dev_index);
+ +		mutex_unlock(&device_mutex);
+ +	}
+  }
+  
+  enum {
+@@@ -1456,26 -1937,192 +1714,200 @@@ static ssize_t tcmu_dev_store_attr_cmd_
+  	udev->cmd_time_out = val * MSEC_PER_SEC;
+  	return count;
+  }
+ -CONFIGFS_ATTR(tcmu_, cmd_time_out);
+ +TB_DEV_ATTR(tcmu, cmd_time_out, S_IRUGO | S_IWUSR);
+  
+++<<<<<<< HEAD
+ +DEF_TB_DEV_ATTRIB_RO(tcmu, hw_pi_prot_type);
+ +TB_DEV_ATTR_RO(tcmu, hw_pi_prot_type);
+++=======
++ static ssize_t tcmu_qfull_time_out_show(struct config_item *item, char *page)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 						struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 
++ 	return snprintf(page, PAGE_SIZE, "%ld\n", udev->qfull_time_out <= 0 ?
++ 			udev->qfull_time_out :
++ 			udev->qfull_time_out / MSEC_PER_SEC);
++ }
++ 
++ static ssize_t tcmu_qfull_time_out_store(struct config_item *item,
++ 					 const char *page, size_t count)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 					struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 	s32 val;
++ 	int ret;
++ 
++ 	ret = kstrtos32(page, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	if (val >= 0) {
++ 		udev->qfull_time_out = val * MSEC_PER_SEC;
++ 	} else {
++ 		printk(KERN_ERR "Invalid qfull timeout value %d\n", val);
++ 		return -EINVAL;
++ 	}
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, qfull_time_out);
++ 
++ static ssize_t tcmu_dev_config_show(struct config_item *item, char *page)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 						struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
+++>>>>>>> 9103575ae34e (tcmu: make ring buffer timer configurable)
+  
+ -	return snprintf(page, PAGE_SIZE, "%s\n", udev->dev_config);
+ -}
+ +DEF_TB_DEV_ATTRIB_RO(tcmu, hw_block_size);
+ +TB_DEV_ATTR_RO(tcmu, hw_block_size);
+  
+ -static ssize_t tcmu_dev_config_store(struct config_item *item, const char *page,
+ -				     size_t count)
+ -{
+ -	struct se_dev_attrib *da = container_of(to_config_group(item),
+ -						struct se_dev_attrib, da_group);
+ -	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
+ -	int ret, len;
+ +DEF_TB_DEV_ATTRIB_RO(tcmu, hw_max_sectors);
+ +TB_DEV_ATTR_RO(tcmu, hw_max_sectors);
+  
+ -	len = strlen(page);
+ -	if (!len || len > TCMU_CONFIG_LEN - 1)
+ -		return -EINVAL;
+ +DEF_TB_DEV_ATTRIB_RO(tcmu, hw_queue_depth);
+ +TB_DEV_ATTR_RO(tcmu, hw_queue_depth);
+  
+++<<<<<<< HEAD
+ +static struct configfs_attribute *tcmu_backend_dev_attrs[] = {
+ +	&tcmu_dev_attrib_hw_pi_prot_type.attr,
+ +	&tcmu_dev_attrib_hw_block_size.attr,
+ +	&tcmu_dev_attrib_hw_max_sectors.attr,
+ +	&tcmu_dev_attrib_hw_queue_depth.attr,
+ +	&tcmu_dev_attrib_cmd_time_out.attr,
+++=======
++ 	/* Check if device has been configured before */
++ 	if (tcmu_dev_configured(udev)) {
++ 		ret = tcmu_netlink_event(udev, TCMU_CMD_RECONFIG_DEVICE,
++ 					 TCMU_ATTR_DEV_CFG, page);
++ 		if (ret) {
++ 			pr_err("Unable to reconfigure device\n");
++ 			return ret;
++ 		}
++ 		strlcpy(udev->dev_config, page, TCMU_CONFIG_LEN);
++ 
++ 		ret = tcmu_update_uio_info(udev);
++ 		if (ret)
++ 			return ret;
++ 		return count;
++ 	}
++ 	strlcpy(udev->dev_config, page, TCMU_CONFIG_LEN);
++ 
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, dev_config);
++ 
++ static ssize_t tcmu_dev_size_show(struct config_item *item, char *page)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 						struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 
++ 	return snprintf(page, PAGE_SIZE, "%zu\n", udev->dev_size);
++ }
++ 
++ static ssize_t tcmu_dev_size_store(struct config_item *item, const char *page,
++ 				   size_t count)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 						struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 	u64 val;
++ 	int ret;
++ 
++ 	ret = kstrtou64(page, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	/* Check if device has been configured before */
++ 	if (tcmu_dev_configured(udev)) {
++ 		ret = tcmu_netlink_event(udev, TCMU_CMD_RECONFIG_DEVICE,
++ 					 TCMU_ATTR_DEV_SIZE, &val);
++ 		if (ret) {
++ 			pr_err("Unable to reconfigure device\n");
++ 			return ret;
++ 		}
++ 	}
++ 	udev->dev_size = val;
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, dev_size);
++ 
++ static ssize_t tcmu_nl_reply_supported_show(struct config_item *item,
++ 		char *page)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 						struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 
++ 	return snprintf(page, PAGE_SIZE, "%d\n", udev->nl_reply_supported);
++ }
++ 
++ static ssize_t tcmu_nl_reply_supported_store(struct config_item *item,
++ 		const char *page, size_t count)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 						struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 	s8 val;
++ 	int ret;
++ 
++ 	ret = kstrtos8(page, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	udev->nl_reply_supported = val;
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, nl_reply_supported);
++ 
++ static ssize_t tcmu_emulate_write_cache_show(struct config_item *item,
++ 					     char *page)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 					struct se_dev_attrib, da_group);
++ 
++ 	return snprintf(page, PAGE_SIZE, "%i\n", da->emulate_write_cache);
++ }
++ 
++ static ssize_t tcmu_emulate_write_cache_store(struct config_item *item,
++ 					      const char *page, size_t count)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 					struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 	u8 val;
++ 	int ret;
++ 
++ 	ret = kstrtou8(page, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	/* Check if device has been configured before */
++ 	if (tcmu_dev_configured(udev)) {
++ 		ret = tcmu_netlink_event(udev, TCMU_CMD_RECONFIG_DEVICE,
++ 					 TCMU_ATTR_WRITECACHE, &val);
++ 		if (ret) {
++ 			pr_err("Unable to reconfigure device\n");
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	da->emulate_write_cache = val;
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, emulate_write_cache);
++ 
++ static struct configfs_attribute *tcmu_attrib_attrs[] = {
++ 	&tcmu_attr_cmd_time_out,
++ 	&tcmu_attr_qfull_time_out,
++ 	&tcmu_attr_dev_config,
++ 	&tcmu_attr_dev_size,
++ 	&tcmu_attr_emulate_write_cache,
++ 	&tcmu_attr_nl_reply_supported,
+++>>>>>>> 9103575ae34e (tcmu: make ring buffer timer configurable)
+  	NULL,
+  };
+  
+* Unmerged path drivers/target/target_core_user.c
