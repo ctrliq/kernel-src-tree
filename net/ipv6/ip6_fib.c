@@ -260,6 +260,7 @@ struct fib6_table *fib6_get_table(struct net *net, u32 id)
 
 	return NULL;
 }
+EXPORT_SYMBOL_GPL(fib6_get_table);
 
 static void __net_init fib6_tables_init(struct net *net)
 {
