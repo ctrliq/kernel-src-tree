@@ -1,0 +1,182 @@
+virtio-net: switch to use XPS to choose txq
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Jason Wang <jasowang@redhat.com>
+commit 9bb8ca86075f37d3c169b9c46f8e7c6d3165e18f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/9bb8ca86.failed
+
+We used to use a percpu structure vq_index to record the cpu to queue
+mapping, this is suboptimal since it duplicates the work of XPS and
+loses all other XPS functionality such as allowing user to configure
+their own transmission steering strategy.
+
+So this patch switches to use XPS and suggest a default mapping when
+the number of cpus is equal to the number of queues. With XPS support,
+there's no need for keeping per-cpu vq_index and .ndo_select_queue(),
+so they were removed also.
+
+	Cc: Rusty Russell <rusty@rustcorp.com.au>
+	Cc: Michael S. Tsirkin <mst@redhat.com>
+	Acked-by: Rusty Russell <rusty@rustcorp.com.au>
+	Acked-by: Michael S. Tsirkin <mst@redhat.com>
+	Signed-off-by: Jason Wang <jasowang@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9bb8ca86075f37d3c169b9c46f8e7c6d3165e18f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/virtio_net.c
+diff --cc drivers/net/virtio_net.c
+index 61c64d922114,01f4eb5c8b78..000000000000
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@@ -125,17 -124,23 +125,14 @@@ struct virtnet_info 
+  	/* Does the affinity hint is set for virtqueues? */
+  	bool affinity_hint_set;
+  
+- 	/* Per-cpu variable to show the mapping from CPU to virtqueue */
+- 	int __percpu *vq_index;
+- 
+  	/* CPU hot plug notifier */
+  	struct notifier_block nb;
+ -};
+  
+ -struct skb_vnet_hdr {
+ -	union {
+ -		struct virtio_net_hdr hdr;
+ -		struct virtio_net_hdr_mrg_rxbuf mhdr;
+ -	};
+ +	/* Maximum allowed MTU */
+ +	u16 max_mtu;
+ +
+ +	/* failover when STANDBY feature enabled */
+ +	struct failover *failover;
+  };
+  
+  struct padded_vnet_hdr {
+@@@ -1268,42 -1244,14 +1254,53 @@@ static const struct ethtool_ops virtnet
+  	.get_channels = virtnet_get_channels,
+  };
+  
+++<<<<<<< HEAD
+ +/* To avoid contending a lock hold by a vcpu who would exit to host, select the
+ + * txq based on the processor id.
+ + */
+ +static u16 virtnet_select_queue(struct net_device *dev, struct sk_buff *skb,
+ +			void *accel_priv, select_queue_fallback_t fallback)
+ +{
+ +	int txq;
+ +	struct virtnet_info *vi = netdev_priv(dev);
+ +
+ +	if (skb_rx_queue_recorded(skb)) {
+ +		txq = skb_get_rx_queue(skb);
+ +	} else {
+ +		txq = *__this_cpu_ptr(vi->vq_index);
+ +		if (txq == -1)
+ +			txq = 0;
+ +	}
+ +
+ +	while (unlikely(txq >= dev->real_num_tx_queues))
+ +		txq -= dev->real_num_tx_queues;
+ +
+ +	return txq;
+ +}
+ +
+ +static int virtnet_get_phys_port_name(struct net_device *dev, char *buf,
+ +				      size_t len)
+ +{
+ +	struct virtnet_info *vi = netdev_priv(dev);
+ +	int ret;
+ +
+ +	if (!virtio_has_feature(vi->vdev, VIRTIO_NET_F_STANDBY))
+ +		return -EOPNOTSUPP;
+ +
+ +	ret = snprintf(buf, len, "sby");
+ +	if (ret >= len)
+ +		return -EOPNOTSUPP;
+ +
+++=======
++ #define MIN_MTU 68
++ #define MAX_MTU 65535
++ 
++ static int virtnet_change_mtu(struct net_device *dev, int new_mtu)
++ {
++ 	if (new_mtu < MIN_MTU || new_mtu > MAX_MTU)
++ 		return -EINVAL;
++ 	dev->mtu = new_mtu;
+++>>>>>>> 9bb8ca86075f (virtio-net: switch to use XPS to choose txq)
+  	return 0;
+  }
+  
+@@@ -1642,10 -1576,8 +1638,15 @@@ static int virtnet_probe(struct virtio_
+  	if (vi->stats == NULL)
+  		goto free;
+  
+++<<<<<<< HEAD
+ +	vi->vq_index = alloc_percpu(int);
+ +	if (vi->vq_index == NULL)
+ +		goto free_stats;
+ +
+++=======
++ 	mutex_init(&vi->config_lock);
++ 	vi->config_enable = true;
+++>>>>>>> 9bb8ca86075f (virtio-net: switch to use XPS to choose txq)
+  	INIT_WORK(&vi->config_work, virtnet_config_changed_work);
+  
+  	/* If we can receive ANY GSO packets, we must allocate large ones. */
+@@@ -1695,18 -1602,10 +1696,18 @@@
+  	/* Allocate/initialize the rx/tx queues, and invoke find_vqs */
+  	err = init_vqs(vi);
+  	if (err)
+- 		goto free_index;
++ 		goto free_stats;
+  
+ -	netif_set_real_num_tx_queues(dev, 1);
+ -	netif_set_real_num_rx_queues(dev, 1);
+ +	netif_set_real_num_tx_queues(dev, vi->curr_queue_pairs);
+ +	netif_set_real_num_rx_queues(dev, vi->curr_queue_pairs);
+ +
+ +	if (virtio_has_feature(vdev, VIRTIO_NET_F_STANDBY)) {
+ +		vi->failover = net_failover_create(vi->dev);
+ +		if (IS_ERR(vi->failover)) {
+ +			err = PTR_ERR(vi->failover);
+ +			goto free_vqs;
+ +		}
+ +	}
+  
+  	err = register_netdev(dev);
+  	if (err) {
+@@@ -1764,8 -1653,8 +1765,13 @@@ free_failover
+  free_vqs:
+  	cancel_delayed_work_sync(&vi->refill);
+  	virtnet_del_vqs(vi);
+++<<<<<<< HEAD
+ +free_index:
+ +	free_percpu(vi->vq_index);
+++=======
++ 	if (vi->alloc_frag.page)
++ 		put_page(vi->alloc_frag.page);
+++>>>>>>> 9bb8ca86075f (virtio-net: switch to use XPS to choose txq)
+  free_stats:
+  	free_percpu(vi->stats);
+  free:
+@@@ -1796,12 -1687,12 +1802,11 @@@ static void virtnet_remove(struct virti
+  
+  	unregister_netdev(vi->dev);
+  
+ +	net_failover_destroy(vi->failover);
+ +
+  	remove_vq_common(vi);
+ -	if (vi->alloc_frag.page)
+ -		put_page(vi->alloc_frag.page);
+  
+ -	flush_work(&vi->config_work);
+  
+- 	free_percpu(vi->vq_index);
+  	free_percpu(vi->stats);
+  	free_netdev(vi->dev);
+  }
+* Unmerged path drivers/net/virtio_net.c
