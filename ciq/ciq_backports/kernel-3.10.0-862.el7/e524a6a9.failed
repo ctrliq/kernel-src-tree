@@ -1,0 +1,296 @@
+nfp: parse metadata prepend before XDP runs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit e524a6a9cdc979a45da7532645786469a48de2e3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e524a6a9.failed
+
+Calling memcpy to shift metadata out of the way for XDP to run
+seems like an overkill.  The most common metadata contents are
+8 bytes containing type and flow hash.  Simply parse the metadata
+before we run XDP.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e524a6a9cdc979a45da7532645786469a48de2e3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net.h
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net.h
+index 600c79f39fe0,8302a2d688da..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@@ -275,6 -282,14 +275,17 @@@ struct nfp_net_rx_desc 
+  	};
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define NFP_NET_META_FIELD_MASK GENMASK(NFP_NET_META_FIELD_SIZE - 1, 0)
++ 
++ struct nfp_meta_parsed {
++ 	u32 hash_type;
++ 	u32 hash;
++ 	u32 mark;
++ };
++ 
+++>>>>>>> e524a6a9cdc9 (nfp: parse metadata prepend before XDP runs)
+  struct nfp_net_rx_hash {
+  	__be32 hash_type;
+  	__be32 hash;
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 4bac97838402,3285053bece0..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -1300,50 -1402,70 +1300,107 @@@ static void nfp_net_rx_csum(struct nfp_
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * nfp_net_set_hash() - Set SKB hash data
+ + * @netdev: adapter's net_device structure
+ + * @skb:   SKB to set the hash data on
+ + * @rxd:   RX descriptor
+ + *
+ + * The RSS hash and hash-type are pre-pended to the packet data.
+ + * Extract and decode it and set the skb fields.
+ + */
+ +static void nfp_net_set_hash(struct net_device *netdev, struct sk_buff *skb,
+ +			     struct nfp_net_rx_desc *rxd)
+++=======
++ static void
++ nfp_net_set_hash(struct net_device *netdev, struct nfp_meta_parsed *meta,
++ 		 unsigned int type, __be32 *hash)
+++>>>>>>> e524a6a9cdc9 (nfp: parse metadata prepend before XDP runs)
+  {
+ -	if (!(netdev->features & NETIF_F_RXHASH))
+ +	struct nfp_net_rx_hash *rx_hash;
+ +
+ +	if (!(rxd->rxd.flags & PCIE_DESC_RX_RSS) ||
+ +	    !(netdev->features & NETIF_F_RXHASH))
+  		return;
+  
+ -	switch (type) {
+ +	rx_hash = (struct nfp_net_rx_hash *)(skb->data - sizeof(*rx_hash));
+ +
+ +	switch (be32_to_cpu(rx_hash->hash_type)) {
+  	case NFP_NET_RSS_IPV4:
+  	case NFP_NET_RSS_IPV6:
+  	case NFP_NET_RSS_IPV6_EX:
+++<<<<<<< HEAD
+ +		skb_set_hash(skb, be32_to_cpu(rx_hash->hash), PKT_HASH_TYPE_L3);
+ +		break;
+ +	default:
+ +		skb_set_hash(skb, be32_to_cpu(rx_hash->hash), PKT_HASH_TYPE_L4);
+++=======
++ 		meta->hash_type = PKT_HASH_TYPE_L3;
++ 		break;
++ 	default:
++ 		meta->hash_type = PKT_HASH_TYPE_L4;
+++>>>>>>> e524a6a9cdc9 (nfp: parse metadata prepend before XDP runs)
+  		break;
+  	}
++ 
++ 	meta->hash = get_unaligned_be32(hash);
+  }
+  
+  static void
+++<<<<<<< HEAD
+ +nfp_net_set_hash_desc(struct net_device *netdev, struct sk_buff *skb,
+ +		      struct nfp_net_rx_desc *rxd)
+++=======
++ nfp_net_set_hash_desc(struct net_device *netdev, struct nfp_meta_parsed *meta,
++ 		      void *data, struct nfp_net_rx_desc *rxd)
+++>>>>>>> e524a6a9cdc9 (nfp: parse metadata prepend before XDP runs)
+  {
+ -	struct nfp_net_rx_hash *rx_hash = data;
+ +	struct nfp_net_rx_hash *rx_hash;
+  
+  	if (!(rxd->rxd.flags & PCIE_DESC_RX_RSS))
+  		return;
+  
+++<<<<<<< HEAD
+ +	rx_hash = (struct nfp_net_rx_hash *)(skb->data - sizeof(*rx_hash));
+ +
+ +	nfp_net_set_hash(netdev, skb, rxd);
+++=======
++ 	nfp_net_set_hash(netdev, meta, get_unaligned_be32(&rx_hash->hash_type),
++ 			 &rx_hash->hash);
++ }
++ 
++ static void *
++ nfp_net_parse_meta(struct net_device *netdev, struct nfp_meta_parsed *meta,
++ 		   void *data, int meta_len)
++ {
++ 	u32 meta_info;
++ 
++ 	meta_info = get_unaligned_be32(data);
++ 	data += 4;
++ 
++ 	while (meta_info) {
++ 		switch (meta_info & NFP_NET_META_FIELD_MASK) {
++ 		case NFP_NET_META_HASH:
++ 			meta_info >>= NFP_NET_META_FIELD_SIZE;
++ 			nfp_net_set_hash(netdev, meta,
++ 					 meta_info & NFP_NET_META_FIELD_MASK,
++ 					 (__be32 *)data);
++ 			data += 4;
++ 			break;
++ 		case NFP_NET_META_MARK:
++ 			meta->mark = get_unaligned_be32(data);
++ 			data += 4;
++ 			break;
++ 		default:
++ 			return NULL;
++ 		}
++ 
++ 		meta_info >>= NFP_NET_META_FIELD_SIZE;
++ 	}
++ 
++ 	return data;
+++>>>>>>> e524a6a9cdc9 (nfp: parse metadata prepend before XDP runs)
+  }
+  
+  static void
+@@@ -1384,10 -1583,16 +1441,15 @@@ static int nfp_net_rx(struct nfp_net_rx
+  	int pkts_polled = 0;
+  	int idx;
+  
+ -	rcu_read_lock();
+ -	xdp_prog = READ_ONCE(dp->xdp_prog);
+ -	true_bufsz = xdp_prog ? PAGE_SIZE : dp->fl_bufsz;
+ -	tx_ring = r_vec->xdp_ring;
+ -
+  	while (pkts_polled < budget) {
+++<<<<<<< HEAD
+ +		unsigned int meta_len, data_len, data_off, pkt_len, pkt_off;
+++=======
++ 		unsigned int meta_len, data_len, meta_off, pkt_len, pkt_off;
+++>>>>>>> e524a6a9cdc9 (nfp: parse metadata prepend before XDP runs)
+  		struct nfp_net_rx_buf *rxbuf;
+  		struct nfp_net_rx_desc *rxd;
++ 		struct nfp_meta_parsed meta;
+  		dma_addr_t new_dma_addr;
+  		void *new_frag;
+  
+@@@ -1434,34 -1642,92 +1498,104 @@@
+  		r_vec->rx_bytes += pkt_len;
+  		u64_stats_update_end(&r_vec->rx_sync);
+  
+++<<<<<<< HEAD
+ +		skb = build_skb(rxbuf->frag, nn->fl_bufsz);
+++=======
++ 		if (unlikely(meta_len > NFP_NET_MAX_PREPEND ||
++ 			     (dp->rx_offset && meta_len > dp->rx_offset))) {
++ 			nn_dp_warn(dp, "oversized RX packet metadata %u\n",
++ 				   meta_len);
++ 			nfp_net_rx_drop(dp, r_vec, rx_ring, rxbuf, NULL);
++ 			continue;
++ 		}
++ 
++ 		nfp_net_dma_sync_cpu_rx(dp, rxbuf->dma_addr + meta_off,
++ 					data_len);
++ 
++ 		if (!dp->chained_metadata_format) {
++ 			nfp_net_set_hash_desc(dp->netdev, &meta,
++ 					      rxbuf->frag + meta_off, rxd);
++ 		} else if (meta_len) {
++ 			void *end;
++ 
++ 			end = nfp_net_parse_meta(dp->netdev, &meta,
++ 						 rxbuf->frag + meta_off,
++ 						 meta_len);
++ 			if (unlikely(end != rxbuf->frag + pkt_off)) {
++ 				nn_dp_warn(dp, "invalid RX packet metadata\n");
++ 				nfp_net_rx_drop(dp, r_vec, rx_ring, rxbuf,
++ 						NULL);
++ 				continue;
++ 			}
++ 		}
++ 
++ 		if (xdp_prog && !(rxd->rxd.flags & PCIE_DESC_RX_BPF &&
++ 				  dp->bpf_offload_xdp)) {
++ 			unsigned int dma_off;
++ 			void *hard_start;
++ 			int act;
++ 
++ 			hard_start = rxbuf->frag + NFP_NET_RX_BUF_HEADROOM;
++ 
++ 			act = nfp_net_run_xdp(xdp_prog, rxbuf->frag, hard_start,
++ 					      &pkt_off, &pkt_len);
++ 			switch (act) {
++ 			case XDP_PASS:
++ 				break;
++ 			case XDP_TX:
++ 				dma_off = pkt_off - NFP_NET_RX_BUF_HEADROOM;
++ 				if (unlikely(!nfp_net_tx_xdp_buf(dp, rx_ring,
++ 								 tx_ring, rxbuf,
++ 								 dma_off,
++ 								 pkt_len)))
++ 					trace_xdp_exception(dp->netdev,
++ 							    xdp_prog, act);
++ 				continue;
++ 			default:
++ 				bpf_warn_invalid_xdp_action(act);
++ 			case XDP_ABORTED:
++ 				trace_xdp_exception(dp->netdev, xdp_prog, act);
++ 			case XDP_DROP:
++ 				nfp_net_rx_give_one(dp, rx_ring, rxbuf->frag,
++ 						    rxbuf->dma_addr);
++ 				continue;
++ 			}
++ 		}
++ 
++ 		skb = build_skb(rxbuf->frag, true_bufsz);
+++>>>>>>> e524a6a9cdc9 (nfp: parse metadata prepend before XDP runs)
+  		if (unlikely(!skb)) {
+ -			nfp_net_rx_drop(dp, r_vec, rx_ring, rxbuf, NULL);
+ +			nfp_net_rx_drop(r_vec, rx_ring, rxbuf, NULL);
+  			continue;
+  		}
+ -		new_frag = nfp_net_napi_alloc_one(dp, &new_dma_addr);
+ +
+ +		nfp_net_set_hash(nn->netdev, skb, rxd);
+ +
+ +		new_frag = nfp_net_napi_alloc_one(nn, &new_dma_addr);
+  		if (unlikely(!new_frag)) {
+ -			nfp_net_rx_drop(dp, r_vec, rx_ring, rxbuf, skb);
+ +			nfp_net_rx_drop(r_vec, rx_ring, rxbuf, skb);
+  			continue;
+  		}
+  
+ -		nfp_net_dma_unmap_rx(dp, rxbuf->dma_addr);
+ +		nfp_net_dma_unmap_rx(nn, rx_ring->rxbufs[idx].dma_addr,
+ +				     nn->fl_bufsz, DMA_FROM_DEVICE);
+  
+ -		nfp_net_rx_give_one(dp, rx_ring, new_frag, new_dma_addr);
+ +		nfp_net_rx_give_one(rx_ring, new_frag, new_dma_addr);
+  
+ -		skb_reserve(skb, pkt_off);
+ +		skb_reserve(skb, data_off);
+  		skb_put(skb, pkt_len);
+  
+++<<<<<<< HEAD
+ +		nfp_net_set_hash_desc(nn->netdev, skb, rxd);
+++=======
++ 		skb->mark = meta.mark;
++ 		skb_set_hash(skb, meta.hash, meta.hash_type);
+++>>>>>>> e524a6a9cdc9 (nfp: parse metadata prepend before XDP runs)
+  
+  		skb_record_rx_queue(skb, rx_ring->idx);
+ -		skb->protocol = eth_type_trans(skb, dp->netdev);
+ +		skb->protocol = eth_type_trans(skb, nn->netdev);
+  
+ -		nfp_net_rx_csum(dp, r_vec, rxd, skb);
+ +		nfp_net_rx_csum(nn, r_vec, rxd, skb);
+  
+  		if (rxd->rxd.flags & PCIE_DESC_RX_VLAN)
+  			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
