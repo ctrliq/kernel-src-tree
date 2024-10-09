@@ -1,0 +1,139 @@
+dax: move all DAX radix tree defs to fs/dax.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit 527b19d0808e75fbba896beb2435c2b4d6bcd32a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/527b19d0.failed
+
+Now that we no longer insert struct page pointers in DAX radix trees the
+page cache code no longer needs to know anything about DAX exceptional
+entries.  Move all the DAX exceptional entry definitions from dax.h to
+fs/dax.c.
+
+Link: http://lkml.kernel.org/r/20170724170616.25810-6-ross.zwisler@linux.intel.com
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Suggested-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Cc: "Darrick J. Wong" <darrick.wong@oracle.com>
+	Cc: "Theodore Ts'o" <tytso@mit.edu>
+	Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+	Cc: Andreas Dilger <adilger.kernel@dilger.ca>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Matthew Wilcox <mawilcox@microsoft.com>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 527b19d0808e75fbba896beb2435c2b4d6bcd32a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/dax.h
+diff --cc include/linux/dax.h
+index b7b81d6cc271,eb0bff6f1eab..000000000000
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@@ -85,13 -82,17 +85,18 @@@ void kill_dax(struct dax_device *dax_de
+  void *dax_get_private(struct dax_device *dax_dev);
+  long dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff, long nr_pages,
+  		void **kaddr, pfn_t *pfn);
+ -size_t dax_copy_from_iter(struct dax_device *dax_dev, pgoff_t pgoff, void *addr,
+ -		size_t bytes, struct iov_iter *i);
+ -void dax_flush(struct dax_device *dax_dev, pgoff_t pgoff, void *addr,
+ -		size_t size);
+ -void dax_write_cache(struct dax_device *dax_dev, bool wc);
+ -bool dax_write_cache_enabled(struct dax_device *dax_dev);
+  
+++<<<<<<< HEAD
+ +ssize_t dax_iomap_rw(int rw, struct kiocb *iocb, const struct iovec *iov,
+ +		unsigned long nr_segs, loff_t pos,
+ +		size_t count, const struct iomap_ops *ops);
+++=======
++ ssize_t dax_iomap_rw(struct kiocb *iocb, struct iov_iter *iter,
++ 		const struct iomap_ops *ops);
+++>>>>>>> 527b19d0808e (dax: move all DAX radix tree defs to fs/dax.c)
+  int dax_iomap_fault(struct vm_fault *vmf, enum page_entry_size pe_size,
+ -		    const struct iomap_ops *ops);
+ +		const struct iomap_ops *ops);
+ +int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t);
+  int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index);
+  int dax_invalidate_mapping_entry_sync(struct address_space *mapping,
+  				      pgoff_t index);
+@@@ -111,21 -110,6 +116,24 @@@ static inline int __dax_zero_page_range
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_FS_DAX_PMD
+ +static inline unsigned int dax_radix_order(void *entry)
+ +{
+ +	if ((unsigned long)entry & RADIX_DAX_PMD)
+ +		return PMD_SHIFT - PAGE_SHIFT;
+ +	return 0;
+ +}
+ +#else
+ +static inline unsigned int dax_radix_order(void *entry)
+ +{
+ +	return 0;
+ +}
+ +#endif
+ +int dax_pfn_mkwrite(struct vm_area_struct *, struct vm_fault *);
+ +
+++=======
+++>>>>>>> 527b19d0808e (dax: move all DAX radix tree defs to fs/dax.c)
+  static inline bool dax_mapping(struct address_space *mapping)
+  {
+  	return mapping->host && IS_DAX(mapping->host);
+diff --git a/fs/dax.c b/fs/dax.c
+index 679214f8898b..7707266dfb83 100644
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@ -55,6 +55,40 @@ static int __init init_dax_wait_table(void)
+ }
+ fs_initcall(init_dax_wait_table);
+ 
++/*
++ * We use lowest available bit in exceptional entry for locking, one bit for
++ * the entry size (PMD) and two more to tell us if the entry is a zero page or
++ * an empty entry that is just used for locking.  In total four special bits.
++ *
++ * If the PMD bit isn't set the entry has size PAGE_SIZE, and if the ZERO_PAGE
++ * and EMPTY bits aren't set the entry is a normal DAX entry with a filesystem
++ * block allocation.
++ */
++#define RADIX_DAX_SHIFT		(RADIX_TREE_EXCEPTIONAL_SHIFT + 4)
++#define RADIX_DAX_ENTRY_LOCK	(1 << RADIX_TREE_EXCEPTIONAL_SHIFT)
++#define RADIX_DAX_PMD		(1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 1))
++#define RADIX_DAX_ZERO_PAGE	(1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 2))
++#define RADIX_DAX_EMPTY		(1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 3))
++
++static unsigned long dax_radix_sector(void *entry)
++{
++	return (unsigned long)entry >> RADIX_DAX_SHIFT;
++}
++
++static void *dax_radix_locked_entry(sector_t sector, unsigned long flags)
++{
++	return (void *)(RADIX_TREE_EXCEPTIONAL_ENTRY | flags |
++			((unsigned long)sector << RADIX_DAX_SHIFT) |
++			RADIX_DAX_ENTRY_LOCK);
++}
++
++static unsigned int dax_radix_order(void *entry)
++{
++	if ((unsigned long)entry & RADIX_DAX_PMD)
++		return PMD_SHIFT - PAGE_SHIFT;
++	return 0;
++}
++
+ static int dax_is_pmd_entry(void *entry)
+ {
+ 	return (unsigned long)entry & RADIX_DAX_PMD;
+* Unmerged path include/linux/dax.h
