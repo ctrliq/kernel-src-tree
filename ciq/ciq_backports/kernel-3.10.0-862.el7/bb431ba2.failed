@@ -1,0 +1,151 @@
+Thermal: initialize thermal zone device correctly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [thermal] initialize thermal zone device correctly (Lenny Szubowicz) [1487411]
+Rebuild_FUZZ: 89.89%
+commit-author Zhang Rui <rui.zhang@intel.com>
+commit bb431ba26c5cd0a17c941ca6c3a195a3a6d5d461
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/bb431ba2.failed
+
+After thermal zone device registered, as we have not read any
+temperature before, thus tz->temperature should not be 0,
+which actually means 0C, and thermal trend is not available.
+In this case, we need specially handling for the first
+thermal_zone_device_update().
+
+Both thermal core framework and step_wise governor is
+enhanced to handle this. And since the step_wise governor
+is the only one that uses trends, so it's the only thermal
+governor that needs to be updated.
+
+CC: <stable@vger.kernel.org> #3.18+
+	Tested-by: Manuel Krause <manuelkrause@netscape.net>
+	Tested-by: szegad <szegadlo@poczta.onet.pl>
+	Tested-by: prash <prash.n.rao@gmail.com>
+	Tested-by: amish <ammdispose-arch@yahoo.com>
+	Tested-by: Matthias <morpheusxyz123@yahoo.de>
+	Reviewed-by: Javi Merino <javi.merino@arm.com>
+	Signed-off-by: Zhang Rui <rui.zhang@intel.com>
+	Signed-off-by: Chen Yu <yu.c.chen@intel.com>
+(cherry picked from commit bb431ba26c5cd0a17c941ca6c3a195a3a6d5d461)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/thermal/thermal_core.c
+diff --cc drivers/thermal/thermal_core.c
+index 0dce5095a6a1,682bc1ef9c37..000000000000
+--- a/drivers/thermal/thermal_core.c
++++ b/drivers/thermal/thermal_core.c
+@@@ -435,6 -530,24 +435,27 @@@ static void update_temperature(struct t
+  	tz->last_temperature = tz->temperature;
+  	tz->temperature = temp;
+  	mutex_unlock(&tz->lock);
+++<<<<<<< HEAD
+++=======
++ 
++ 	trace_thermal_temperature(tz);
++ 	if (tz->last_temperature == THERMAL_TEMP_INVALID)
++ 		dev_dbg(&tz->device, "last_temperature N/A, current_temperature=%d\n",
++ 			tz->temperature);
++ 	else
++ 		dev_dbg(&tz->device, "last_temperature=%d, current_temperature=%d\n",
++ 			tz->last_temperature, tz->temperature);
++ }
++ 
++ static void thermal_zone_device_reset(struct thermal_zone_device *tz)
++ {
++ 	struct thermal_instance *pos;
++ 
++ 	tz->temperature = THERMAL_TEMP_INVALID;
++ 	tz->passive = 0;
++ 	list_for_each_entry(pos, &tz->thermal_instances, tz_node)
++ 		pos->initialized = false;
+++>>>>>>> bb431ba26c5c (Thermal: initialize thermal zone device correctly)
+  }
+  
+  void thermal_zone_device_update(struct thermal_zone_device *tz)
+@@@ -1723,10 -1914,10 +1744,11 @@@ struct thermal_zone_device *thermal_zon
+  
+  	INIT_DELAYED_WORK(&(tz->poll_queue), thermal_zone_device_check);
+  
++ 	thermal_zone_device_reset(tz);
+  	thermal_zone_device_update(tz);
+  
+ -	return tz;
+ +	if (!result)
+ +		return tz;
+  
+  unregister:
+  	release_idr(&thermal_tz_idr, &thermal_idr_lock, tz->id);
+diff --git a/drivers/thermal/step_wise.c b/drivers/thermal/step_wise.c
+index d89e781b0a18..23c6c11c4c98 100644
+--- a/drivers/thermal/step_wise.c
++++ b/drivers/thermal/step_wise.c
+@@ -61,6 +61,19 @@ static unsigned long get_target_state(struct thermal_instance *instance,
+ 	cdev->ops->get_cur_state(cdev, &cur_state);
+ 	next_target = instance->target;
+ 
++	if (!instance->initialized) {
++		if (throttle) {
++			next_target = (cur_state + 1) >= instance->upper ?
++					instance->upper :
++					((cur_state + 1) < instance->lower ?
++					instance->lower : (cur_state + 1));
++		} else {
++			next_target = THERMAL_NO_TARGET;
++		}
++
++		return next_target;
++	}
++
+ 	switch (trend) {
+ 	case THERMAL_TREND_RAISING:
+ 		if (throttle) {
+@@ -140,7 +153,7 @@ static void thermal_zone_trip_update(struct thermal_zone_device *tz, int trip)
+ 		old_target = instance->target;
+ 		instance->target = get_target_state(instance, trend, throttle);
+ 
+-		if (old_target == instance->target)
++		if (instance->initialized && old_target == instance->target)
+ 			continue;
+ 
+ 		/* Activate a passive thermal instance */
+@@ -152,7 +165,7 @@ static void thermal_zone_trip_update(struct thermal_zone_device *tz, int trip)
+ 			instance->target == THERMAL_NO_TARGET)
+ 			update_passive_instance(tz, trip_type, -1);
+ 
+-
++		instance->initialized = true;
+ 		instance->cdev->updated = false; /* cdev needs update */
+ 	}
+ 
+* Unmerged path drivers/thermal/thermal_core.c
+diff --git a/drivers/thermal/thermal_core.h b/drivers/thermal/thermal_core.h
+index 7cf2f6626251..ac8080d01f92 100644
+--- a/drivers/thermal/thermal_core.h
++++ b/drivers/thermal/thermal_core.h
+@@ -41,6 +41,7 @@ struct thermal_instance {
+ 	struct thermal_zone_device *tz;
+ 	struct thermal_cooling_device *cdev;
+ 	int trip;
++	bool initialized;
+ 	unsigned long upper;	/* Highest cooling state for this trip point */
+ 	unsigned long lower;	/* Lowest cooling state for this trip point */
+ 	unsigned long target;	/* expected cooling state */
+diff --git a/include/linux/thermal.h b/include/linux/thermal.h
+index a386a1cbb6e1..95454e029ba7 100644
+--- a/include/linux/thermal.h
++++ b/include/linux/thermal.h
+@@ -39,6 +39,9 @@
+ /* No upper/lower limit requirement */
+ #define THERMAL_NO_LIMIT	THERMAL_CSTATE_INVALID
+ 
++/* use value, which < 0K, to indicate an invalid/uninitialized temperature */
++#define THERMAL_TEMP_INVALID	-274000
++
+ /* Unit conversion macros */
+ #define KELVIN_TO_CELSIUS(t)	(long)(((long)t-2732 >= 0) ?	\
+ 				((long)t-2732+5)/10 : ((long)t-2732-5)/10)
