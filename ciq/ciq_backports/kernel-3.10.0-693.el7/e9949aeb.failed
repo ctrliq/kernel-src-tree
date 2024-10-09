@@ -1,0 +1,117 @@
+nfp: add buffer drop/recycle helper for RX
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit e9949aebe04a1d917a15f4dc71e77deaefe9de94
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/e9949aeb.failed
+
+nfp_net_rx() is quite long already and about to get longer.
+Move buffer drop/recycle to a helper.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e9949aebe04a1d917a15f4dc71e77deaefe9de94)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 8344e8e82257,abd4f17e89c7..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -1311,6 -1282,68 +1311,20 @@@ static void nfp_net_set_hash(struct net
+  	}
+  }
+  
+ -static void
+ -nfp_net_set_hash_desc(struct net_device *netdev, struct sk_buff *skb,
+ -		      struct nfp_net_rx_desc *rxd)
+ -{
+ -	struct nfp_net_rx_hash *rx_hash;
+ -
+ -	if (!(rxd->rxd.flags & PCIE_DESC_RX_RSS))
+ -		return;
+ -
+ -	rx_hash = (struct nfp_net_rx_hash *)(skb->data - sizeof(*rx_hash));
+ -
+ -	nfp_net_set_hash(netdev, skb, get_unaligned_be32(&rx_hash->hash_type),
+ -			 &rx_hash->hash);
+ -}
+ -
+ -static void *
+ -nfp_net_parse_meta(struct net_device *netdev, struct sk_buff *skb,
+ -		   int meta_len)
+ -{
+ -	u8 *data = skb->data - meta_len;
+ -	u32 meta_info;
+ -
+ -	meta_info = get_unaligned_be32(data);
+ -	data += 4;
+ -
+ -	while (meta_info) {
+ -		switch (meta_info & NFP_NET_META_FIELD_MASK) {
+ -		case NFP_NET_META_HASH:
+ -			meta_info >>= NFP_NET_META_FIELD_SIZE;
+ -			nfp_net_set_hash(netdev, skb,
+ -					 meta_info & NFP_NET_META_FIELD_MASK,
+ -					 (__be32 *)data);
+ -			data += 4;
+ -			break;
+ -		case NFP_NET_META_MARK:
+ -			skb->mark = get_unaligned_be32(data);
+ -			data += 4;
+ -			break;
+ -		default:
+ -			return NULL;
+ -		}
+ -
+ -		meta_info >>= NFP_NET_META_FIELD_SIZE;
+ -	}
+ -
+ -	return data;
+ -}
+ -
++ static void
++ nfp_net_rx_drop(struct nfp_net_r_vector *r_vec, struct nfp_net_rx_ring *rx_ring,
++ 		struct nfp_net_rx_buf *rxbuf, struct sk_buff *skb)
++ {
++ 	u64_stats_update_begin(&r_vec->rx_sync);
++ 	r_vec->rx_drops++;
++ 	u64_stats_update_end(&r_vec->rx_sync);
++ 
++ 	if (rxbuf)
++ 		nfp_net_rx_give_one(rx_ring, rxbuf->skb, rxbuf->dma_addr);
++ 	if (skb)
++ 		dev_kfree_skb_any(skb);
++ }
++ 
+  /**
+   * nfp_net_rx() - receive up to @budget packets on @rx_ring
+   * @rx_ring:   RX ring to receive from
+@@@ -1433,6 -1424,19 +1444,22 @@@ static int nfp_net_rx(struct nfp_net_rx
+  		r_vec->rx_bytes += skb->len;
+  		u64_stats_update_end(&r_vec->rx_sync);
+  
+++<<<<<<< HEAD
+++=======
++ 		if (nn->fw_ver.major <= 3) {
++ 			nfp_net_set_hash_desc(nn->netdev, skb, rxd);
++ 		} else if (meta_len) {
++ 			void *end;
++ 
++ 			end = nfp_net_parse_meta(nn->netdev, skb, meta_len);
++ 			if (unlikely(end != skb->data)) {
++ 				nn_warn_ratelimit(nn, "invalid RX packet metadata\n");
++ 				nfp_net_rx_drop(r_vec, rx_ring, NULL, skb);
++ 				continue;
++ 			}
++ 		}
++ 
+++>>>>>>> e9949aebe04a (nfp: add buffer drop/recycle helper for RX)
+  		skb_record_rx_queue(skb, rx_ring->idx);
+  		skb->protocol = eth_type_trans(skb, nn->netdev);
+  
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
