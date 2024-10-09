@@ -775,12 +775,16 @@ static int autofs4_dir_mkdir(struct inode *dir, struct dentry *dentry, umode_t m
 static inline int autofs4_compat_get_set_timeout(struct autofs_sb_info *sbi,
 					 compat_ulong_t __user *p)
 {
-	int rv;
 	unsigned long ntimeout;
+	int rv;
 
-	if ((rv = get_user(ntimeout, p)) ||
-	     (rv = put_user(sbi->exp_timeout/HZ, p)))
-		return rv;
+	rv = get_user(ntimeout, p);
+	if (rv)
+		goto error;
+
+	rv = put_user(sbi->exp_timeout/HZ, p);
+	if (rv)
+		goto error;
 
 	if (ntimeout > UINT_MAX/HZ)
 		sbi->exp_timeout = 0;
@@ -788,18 +792,24 @@ static inline int autofs4_compat_get_set_timeout(struct autofs_sb_info *sbi,
 		sbi->exp_timeout = ntimeout * HZ;
 
 	return 0;
+error:
+	return rv;
 }
 #endif
 
 static inline int autofs4_get_set_timeout(struct autofs_sb_info *sbi,
 					 unsigned long __user *p)
 {
-	int rv;
 	unsigned long ntimeout;
+	int rv;
 
-	if ((rv = get_user(ntimeout, p)) ||
-	     (rv = put_user(sbi->exp_timeout/HZ, p)))
-		return rv;
+	rv = get_user(ntimeout, p);
+	if (rv)
+		goto error;
+
+	rv = put_user(sbi->exp_timeout/HZ, p);
+	if (rv)
+		goto error;
 
 	if (ntimeout > ULONG_MAX/HZ)
 		sbi->exp_timeout = 0;
@@ -807,6 +817,8 @@ static inline int autofs4_get_set_timeout(struct autofs_sb_info *sbi,
 		sbi->exp_timeout = ntimeout * HZ;
 
 	return 0;
+error:
+	return rv;
 }
 
 /* Return protocol version */
