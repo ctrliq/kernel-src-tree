@@ -1,0 +1,249 @@
+net/mlx5e: Add new profile function update_carrier
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Add new profile function update_carrier (Don Dutile) [1499363 1385325]
+Rebuild_FUZZ: 95.83%
+commit-author Erez Shitrit <erezsh@mellanox.com>
+commit 7ca42c8094a4e265b8007a6776380f57cf093624
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7ca42c80.failed
+
+Updating the carrier involves specific HW setting, each profile should
+use its own function for that.
+
+Both IPoIB and VF representor don't need carrier update function, since
+VF representor has only a logical link to VF and IPoIB manages its own
+link via ib_core upper layer.
+
+	Signed-off-by: Erez Shitrit <erezsh@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 7ca42c8094a4e265b8007a6776380f57cf093624)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+#	drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index efce1dc691aa,a223a8e15ece..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -719,9 -770,29 +719,33 @@@ struct mlx5e_priv 
+  	void                      *ppriv;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct mlx5e_profile {
++ 	void	(*init)(struct mlx5_core_dev *mdev,
++ 			struct net_device *netdev,
++ 			const struct mlx5e_profile *profile, void *ppriv);
++ 	void	(*cleanup)(struct mlx5e_priv *priv);
++ 	int	(*init_rx)(struct mlx5e_priv *priv);
++ 	void	(*cleanup_rx)(struct mlx5e_priv *priv);
++ 	int	(*init_tx)(struct mlx5e_priv *priv);
++ 	void	(*cleanup_tx)(struct mlx5e_priv *priv);
++ 	void	(*enable)(struct mlx5e_priv *priv);
++ 	void	(*disable)(struct mlx5e_priv *priv);
++ 	void	(*update_stats)(struct mlx5e_priv *priv);
++ 	void	(*update_carrier)(struct mlx5e_priv *priv);
++ 	int	(*max_nch)(struct mlx5_core_dev *mdev);
++ 	struct {
++ 		mlx5e_fp_handle_rx_cqe handle_rx_cqe;
++ 		mlx5e_fp_handle_rx_cqe handle_rx_cqe_mpwqe;
++ 	} rx_handlers;
++ 	int	max_tc;
++ };
++ 
+++>>>>>>> 7ca42c8094a4 (net/mlx5e: Add new profile function update_carrier)
+  void mlx5e_build_ptys2ethtool_map(void);
+  
+ +void mlx5e_send_nop(struct mlx5e_sq *sq, bool notify_hw);
+  u16 mlx5e_select_queue(struct net_device *dev, struct sk_buff *skb,
+  		       void *accel_priv, select_queue_fallback_t fallback);
+  netdev_tx_t mlx5e_xmit(struct sk_buff *skb, struct net_device *dev);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index e2c448703ea8,343be65621db..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -2195,6 -2533,98 +2196,101 @@@ static void mlx5e_netdev_set_tcs(struc
+  		netdev_set_tc_queue(netdev, tc, nch, 0);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void mlx5e_build_channels_tx_maps(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5e_channel *c;
++ 	struct mlx5e_txqsq *sq;
++ 	int i, tc;
++ 
++ 	for (i = 0; i < priv->channels.num; i++)
++ 		for (tc = 0; tc < priv->profile->max_tc; tc++)
++ 			priv->channel_tc2txq[i][tc] = i + tc * priv->channels.num;
++ 
++ 	for (i = 0; i < priv->channels.num; i++) {
++ 		c = priv->channels.c[i];
++ 		for (tc = 0; tc < c->num_tc; tc++) {
++ 			sq = &c->sq[tc];
++ 			priv->txq2sq[sq->txq_ix] = sq;
++ 		}
++ 	}
++ }
++ 
++ static bool mlx5e_is_eswitch_vport_mngr(struct mlx5_core_dev *mdev)
++ {
++ 	return (MLX5_CAP_GEN(mdev, vport_group_manager) &&
++ 		MLX5_CAP_GEN(mdev, port_type) == MLX5_CAP_PORT_TYPE_ETH);
++ }
++ 
++ void mlx5e_activate_priv_channels(struct mlx5e_priv *priv)
++ {
++ 	int num_txqs = priv->channels.num * priv->channels.params.num_tc;
++ 	struct net_device *netdev = priv->netdev;
++ 
++ 	mlx5e_netdev_set_tcs(netdev);
++ 	netif_set_real_num_tx_queues(netdev, num_txqs);
++ 	netif_set_real_num_rx_queues(netdev, priv->channels.num);
++ 
++ 	mlx5e_build_channels_tx_maps(priv);
++ 	mlx5e_activate_channels(&priv->channels);
++ 	netif_tx_start_all_queues(priv->netdev);
++ 
++ 	if (mlx5e_is_eswitch_vport_mngr(priv->mdev))
++ 		mlx5e_add_sqs_fwd_rules(priv);
++ 
++ 	mlx5e_wait_channels_min_rx_wqes(&priv->channels);
++ 	mlx5e_redirect_rqts_to_channels(priv, &priv->channels);
++ }
++ 
++ void mlx5e_deactivate_priv_channels(struct mlx5e_priv *priv)
++ {
++ 	mlx5e_redirect_rqts_to_drop(priv);
++ 
++ 	if (mlx5e_is_eswitch_vport_mngr(priv->mdev))
++ 		mlx5e_remove_sqs_fwd_rules(priv);
++ 
++ 	/* FIXME: This is a W/A only for tx timeout watch dog false alarm when
++ 	 * polling for inactive tx queues.
++ 	 */
++ 	netif_tx_stop_all_queues(priv->netdev);
++ 	netif_tx_disable(priv->netdev);
++ 	mlx5e_deactivate_channels(&priv->channels);
++ }
++ 
++ void mlx5e_switch_priv_channels(struct mlx5e_priv *priv,
++ 				struct mlx5e_channels *new_chs,
++ 				mlx5e_fp_hw_modify hw_modify)
++ {
++ 	struct net_device *netdev = priv->netdev;
++ 	int new_num_txqs;
++ 	int carrier_ok;
++ 	new_num_txqs = new_chs->num * new_chs->params.num_tc;
++ 
++ 	carrier_ok = netif_carrier_ok(netdev);
++ 	netif_carrier_off(netdev);
++ 
++ 	if (new_num_txqs < netdev->real_num_tx_queues)
++ 		netif_set_real_num_tx_queues(netdev, new_num_txqs);
++ 
++ 	mlx5e_deactivate_priv_channels(priv);
++ 	mlx5e_close_channels(&priv->channels);
++ 
++ 	priv->channels = *new_chs;
++ 
++ 	/* New channels are ready to roll, modify HW settings if needed */
++ 	if (hw_modify)
++ 		hw_modify(priv);
++ 
++ 	mlx5e_refresh_tirs(priv, false);
++ 	mlx5e_activate_priv_channels(priv);
++ 
++ 	/* return carrier back if needed */
++ 	if (carrier_ok)
++ 		netif_carrier_on(netdev);
++ }
++ 
+++>>>>>>> 7ca42c8094a4 (net/mlx5e: Add new profile function update_carrier)
+  int mlx5e_open_locked(struct net_device *netdev)
+  {
+  	struct mlx5e_priv *priv = netdev_priv(netdev);
+@@@ -2204,28 -2632,14 +2300,35 @@@
+  
+  	set_bit(MLX5E_STATE_OPENED, &priv->state);
+  
+ -	err = mlx5e_open_channels(priv, &priv->channels);
+ -	if (err)
+ +	mlx5e_netdev_set_tcs(netdev);
+ +
+++<<<<<<< HEAD
+ +	num_txqs = priv->params.num_channels * priv->params.num_tc;
+ +	netif_set_real_num_tx_queues(netdev, num_txqs);
+ +	netif_set_real_num_rx_queues(netdev, priv->params.num_channels);
+ +
+ +	err = mlx5e_open_channels(priv);
+ +	if (err) {
+ +		netdev_err(netdev, "%s: mlx5e_open_channels failed, %d\n",
+ +			   __func__, err);
+  		goto err_clear_state_opened_flag;
+ +	}
+ +
+ +	err = mlx5e_refresh_tirs_self_loopback(priv->mdev, false);
+ +	if (err) {
+ +		netdev_err(netdev, "%s: mlx5e_refresh_tirs_self_loopback_enable failed, %d\n",
+ +			   __func__, err);
+ +		goto err_close_channels;
+ +	}
+  
+ +	mlx5e_redirect_rqts(priv);
+ +	mlx5e_update_carrier(priv);
+++=======
++ 	mlx5e_refresh_tirs(priv, false);
++ 	mlx5e_activate_priv_channels(priv);
++ 	if (priv->profile->update_carrier)
++ 		priv->profile->update_carrier(priv);
+++>>>>>>> 7ca42c8094a4 (net/mlx5e: Add new profile function update_carrier)
+  	mlx5e_timestamp_init(priv);
+  
+  	if (priv->profile->update_stats)
+@@@ -3663,8 -4218,11 +3766,14 @@@ static const struct mlx5e_profile mlx5e
+  	.cleanup_tx	   = mlx5e_cleanup_nic_tx,
+  	.enable		   = mlx5e_nic_enable,
+  	.disable	   = mlx5e_nic_disable,
+ -	.update_stats	   = mlx5e_update_ndo_stats,
+ +	.update_stats	   = mlx5e_update_stats,
+  	.max_nch	   = mlx5e_get_max_num_channels,
+++<<<<<<< HEAD
+++=======
++ 	.update_carrier	   = mlx5e_update_carrier,
++ 	.rx_handlers.handle_rx_cqe       = mlx5e_handle_rx_cqe,
++ 	.rx_handlers.handle_rx_cqe_mpwqe = mlx5e_handle_rx_cqe_mpwrq,
+++>>>>>>> 7ca42c8094a4 (net/mlx5e: Add new profile function update_carrier)
+  	.max_tc		   = MLX5E_MAX_NUM_TC,
+  };
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index abcb1976163d,a39873bd88a6..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@@ -550,6 -916,9 +550,12 @@@ static struct mlx5e_profile mlx5e_rep_p
+  	.cleanup_tx		= mlx5e_cleanup_nic_tx,
+  	.update_stats           = mlx5e_rep_update_stats,
+  	.max_nch		= mlx5e_get_rep_max_num_channels,
+++<<<<<<< HEAD
+++=======
++ 	.update_carrier		= NULL,
++ 	.rx_handlers.handle_rx_cqe       = mlx5e_handle_rx_cqe_rep,
++ 	.rx_handlers.handle_rx_cqe_mpwqe = NULL /* Not supported */,
+++>>>>>>> 7ca42c8094a4 (net/mlx5e: Add new profile function update_carrier)
+  	.max_tc			= 1,
+  };
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
