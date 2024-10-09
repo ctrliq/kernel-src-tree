@@ -1,0 +1,765 @@
+qed*: RSS indirection based on queue-handles
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Mintz, Yuval <Yuval.Mintz@cavium.com>
+commit f29ffdb65ff0eaf95d2a2b80f0dee3fbd5a64772
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f29ffdb6.failed
+
+A step toward having qede agnostic to the queue configurations
+in firmware/hardware - let the RSS indirections use queue handles
+instead of actual queue indices.
+
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f29ffdb65ff0eaf95d2a2b80f0dee3fbd5a64772)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qed/qed_l2.c
+#	drivers/net/ethernet/qlogic/qed/qed_l2.h
+#	drivers/net/ethernet/qlogic/qed/qed_sriov.c
+#	drivers/net/ethernet/qlogic/qede/qede_filter.c
+#	drivers/net/ethernet/qlogic/qede/qede_main.c
+diff --cc drivers/net/ethernet/qlogic/qed/qed_l2.c
+index 6b0e22d9fe4c,a35db6951147..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_l2.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_l2.c
+@@@ -41,6 -66,125 +41,128 @@@
+  #define QED_MAX_SGES_NUM 16
+  #define CRC32_POLY 0x1edc6f41
+  
+++<<<<<<< HEAD
+++=======
++ void qed_eth_queue_cid_release(struct qed_hwfn *p_hwfn,
++ 			       struct qed_queue_cid *p_cid)
++ {
++ 	/* VFs' CIDs are 0-based in PF-view, and uninitialized on VF */
++ 	if (!p_cid->is_vf && IS_PF(p_hwfn->cdev))
++ 		qed_cxt_release_cid(p_hwfn, p_cid->cid);
++ 	vfree(p_cid);
++ }
++ 
++ /* The internal is only meant to be directly called by PFs initializeing CIDs
++  * for their VFs.
++  */
++ struct qed_queue_cid *
++ _qed_eth_queue_to_cid(struct qed_hwfn *p_hwfn,
++ 		      u16 opaque_fid,
++ 		      u32 cid,
++ 		      u8 vf_qid,
++ 		      struct qed_queue_start_common_params *p_params)
++ {
++ 	bool b_is_same = (p_hwfn->hw_info.opaque_fid == opaque_fid);
++ 	struct qed_queue_cid *p_cid;
++ 	int rc;
++ 
++ 	p_cid = vmalloc(sizeof(*p_cid));
++ 	if (!p_cid)
++ 		return NULL;
++ 	memset(p_cid, 0, sizeof(*p_cid));
++ 
++ 	p_cid->opaque_fid = opaque_fid;
++ 	p_cid->cid = cid;
++ 	p_cid->vf_qid = vf_qid;
++ 	p_cid->rel = *p_params;
++ 	p_cid->p_owner = p_hwfn;
++ 
++ 	/* Don't try calculating the absolute indices for VFs */
++ 	if (IS_VF(p_hwfn->cdev)) {
++ 		p_cid->abs = p_cid->rel;
++ 		goto out;
++ 	}
++ 
++ 	/* Calculate the engine-absolute indices of the resources.
++ 	 * This would guarantee they're valid later on.
++ 	 * In some cases [SBs] we already have the right values.
++ 	 */
++ 	rc = qed_fw_vport(p_hwfn, p_cid->rel.vport_id, &p_cid->abs.vport_id);
++ 	if (rc)
++ 		goto fail;
++ 
++ 	rc = qed_fw_l2_queue(p_hwfn, p_cid->rel.queue_id, &p_cid->abs.queue_id);
++ 	if (rc)
++ 		goto fail;
++ 
++ 	/* In case of a PF configuring its VF's queues, the stats-id is already
++ 	 * absolute [since there's a single index that's suitable per-VF].
++ 	 */
++ 	if (b_is_same) {
++ 		rc = qed_fw_vport(p_hwfn, p_cid->rel.stats_id,
++ 				  &p_cid->abs.stats_id);
++ 		if (rc)
++ 			goto fail;
++ 	} else {
++ 		p_cid->abs.stats_id = p_cid->rel.stats_id;
++ 	}
++ 
++ 	/* SBs relevant information was already provided as absolute */
++ 	p_cid->abs.sb = p_cid->rel.sb;
++ 	p_cid->abs.sb_idx = p_cid->rel.sb_idx;
++ 
++ 	/* This is tricky - we're actually interested in whehter this is a PF
++ 	 * entry meant for the VF.
++ 	 */
++ 	if (!b_is_same)
++ 		p_cid->is_vf = true;
++ out:
++ 	DP_VERBOSE(p_hwfn,
++ 		   QED_MSG_SP,
++ 		   "opaque_fid: %04x CID %08x vport %02x [%02x] qzone %04x [%04x] stats %02x [%02x] SB %04x PI %02x\n",
++ 		   p_cid->opaque_fid,
++ 		   p_cid->cid,
++ 		   p_cid->rel.vport_id,
++ 		   p_cid->abs.vport_id,
++ 		   p_cid->rel.queue_id,
++ 		   p_cid->abs.queue_id,
++ 		   p_cid->rel.stats_id,
++ 		   p_cid->abs.stats_id, p_cid->abs.sb, p_cid->abs.sb_idx);
++ 
++ 	return p_cid;
++ 
++ fail:
++ 	vfree(p_cid);
++ 	return NULL;
++ }
++ 
++ static struct qed_queue_cid *qed_eth_queue_to_cid(struct qed_hwfn *p_hwfn,
++ 						  u16 opaque_fid, struct
++ 						  qed_queue_start_common_params
++ 						  *p_params)
++ {
++ 	struct qed_queue_cid *p_cid;
++ 	u32 cid = 0;
++ 
++ 	/* Get a unique firmware CID for this queue, in case it's a PF.
++ 	 * VF's don't need a CID as the queue configuration will be done
++ 	 * by PF.
++ 	 */
++ 	if (IS_PF(p_hwfn->cdev)) {
++ 		if (qed_cxt_acquire_cid(p_hwfn, PROTOCOLID_ETH, &cid)) {
++ 			DP_NOTICE(p_hwfn, "Failed to acquire cid\n");
++ 			return NULL;
++ 		}
++ 	}
++ 
++ 	p_cid = _qed_eth_queue_to_cid(p_hwfn, opaque_fid, cid, 0, p_params);
++ 	if (!p_cid && IS_PF(p_hwfn->cdev))
++ 		qed_cxt_release_cid(p_hwfn, cid);
++ 
++ 	return p_cid;
++ }
++ 
+++>>>>>>> f29ffdb65ff0 (qed*: RSS indirection based on queue-handles)
+  int qed_sp_eth_vport_start(struct qed_hwfn *p_hwfn,
+  			   struct qed_sp_vport_start_params *p_params)
+  {
+diff --cc drivers/net/ethernet/qlogic/qed/qed_l2.h
+index e495d62fcc03,93cb932ef663..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_l2.h
++++ b/drivers/net/ethernet/qlogic/qed/qed_l2.h
+@@@ -217,27 -266,81 +219,92 @@@ qed_sp_eth_rx_queues_update(struct qed_
+  
+  void qed_get_vport_stats(struct qed_dev *cdev, struct qed_eth_stats *stats);
+  
+ -void qed_reset_vport_stats(struct qed_dev *cdev);
+ -
+ -struct qed_queue_cid {
+ -	/* 'Relative' is a relative term ;-). Usually the indices [not counting
+ -	 * SBs] would be PF-relative, but there are some cases where that isn't
+ -	 * the case - specifically for a PF configuring its VF indices it's
+ -	 * possible some fields [E.g., stats-id] in 'rel' would already be abs.
+ -	 */
+ -	struct qed_queue_start_common_params rel;
+ -	struct qed_queue_start_common_params abs;
+ -	u32 cid;
+ -	u16 opaque_fid;
+ +int qed_sp_eth_vport_start(struct qed_hwfn *p_hwfn,
+ +			   struct qed_sp_vport_start_params *p_params);
+  
+ +int qed_sp_eth_rxq_start_ramrod(struct qed_hwfn *p_hwfn,
+ +				u16 opaque_fid,
+ +				u32 cid,
+ +				struct qed_queue_start_common_params *params,
+ +				u8 stats_id,
+ +				u16 bd_max_bytes,
+ +				dma_addr_t bd_chain_phys_addr,
+ +				dma_addr_t cqe_pbl_addr,
+ +				u16 cqe_pbl_size, bool b_use_zone_a_prod);
+ +
+++<<<<<<< HEAD
+ +int qed_sp_eth_txq_start_ramrod(struct qed_hwfn  *p_hwfn,
+ +				u16  opaque_fid,
+ +				u32  cid,
+ +				struct qed_queue_start_common_params *p_params,
+ +				u8  stats_id,
+ +				dma_addr_t pbl_addr,
+ +				u16 pbl_size,
+ +				union qed_qm_pq_params *p_pq_params);
+++=======
++ 	/* VFs queues are mapped differently, so we need to know the
++ 	 * relative queue associated with them [0-based].
++ 	 * Notice this is relevant on the *PF* queue-cid of its VF's queues,
++ 	 * and not on the VF itself.
++ 	 */
++ 	bool is_vf;
++ 	u8 vf_qid;
++ 
++ 	/* Legacy VFs might have Rx producer located elsewhere */
++ 	bool b_legacy_vf;
++ 
++ 	struct qed_hwfn *p_owner;
++ };
++ 
++ void qed_eth_queue_cid_release(struct qed_hwfn *p_hwfn,
++ 			       struct qed_queue_cid *p_cid);
++ 
++ struct qed_queue_cid *_qed_eth_queue_to_cid(struct qed_hwfn *p_hwfn,
++ 					    u16 opaque_fid,
++ 					    u32 cid,
++ 					    u8 vf_qid,
++ 					    struct qed_queue_start_common_params
++ 					    *p_params);
++ 
++ int
++ qed_sp_eth_vport_start(struct qed_hwfn *p_hwfn,
++ 		       struct qed_sp_vport_start_params *p_params);
++ 
++ /**
++  * @brief - Starts an Rx queue, when queue_cid is already prepared
++  *
++  * @param p_hwfn
++  * @param p_cid
++  * @param bd_max_bytes
++  * @param bd_chain_phys_addr
++  * @param cqe_pbl_addr
++  * @param cqe_pbl_size
++  *
++  * @return int
++  */
++ int
++ qed_eth_rxq_start_ramrod(struct qed_hwfn *p_hwfn,
++ 			 struct qed_queue_cid *p_cid,
++ 			 u16 bd_max_bytes,
++ 			 dma_addr_t bd_chain_phys_addr,
++ 			 dma_addr_t cqe_pbl_addr, u16 cqe_pbl_size);
++ 
++ /**
++  * @brief - Starts a Tx queue, where queue_cid is already prepared
++  *
++  * @param p_hwfn
++  * @param p_cid
++  * @param pbl_addr
++  * @param pbl_size
++  * @param p_pq_params - parameters for choosing the PQ for this Tx queue
++  *
++  * @return int
++  */
++ int
++ qed_eth_txq_start_ramrod(struct qed_hwfn *p_hwfn,
++ 			 struct qed_queue_cid *p_cid,
++ 			 dma_addr_t pbl_addr, u16 pbl_size, u16 pq_id);
+++>>>>>>> f29ffdb65ff0 (qed*: RSS indirection based on queue-handles)
+  
+  u8 qed_mcast_bin_from_mac(u8 *mac);
+  
+diff --cc drivers/net/ethernet/qlogic/qed/qed_sriov.c
+index d6d70462790a,b22baf5e5daf..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_sriov.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_sriov.c
+@@@ -2261,23 -2355,27 +2262,42 @@@ qed_iov_vp_update_rss_param(struct qed_
+  	table_size = min_t(u16, ARRAY_SIZE(p_rss->rss_ind_table),
+  			   (1 << p_rss_tlv->rss_table_size_log));
+  
+- 	max_q_idx = ARRAY_SIZE(vf->vf_queues);
+- 
+  	for (i = 0; i < table_size; i++) {
+- 		u16 index = vf->vf_queues[0].fw_rx_qid;
++ 		q_idx = p_rss_tlv->rss_ind_table[i];
++ 		if (!qed_iov_validate_rxq(p_hwfn, vf, q_idx)) {
++ 			DP_VERBOSE(p_hwfn,
++ 				   QED_MSG_IOV,
++ 				   "VF[%d]: Omitting RSS due to wrong queue %04x\n",
++ 				   vf->relative_vf_id, q_idx);
++ 			b_reject = true;
++ 			goto out;
++ 		}
+  
+++<<<<<<< HEAD
+ +		q_idx = p_rss->rss_ind_table[i];
+ +		if (q_idx >= max_q_idx)
+ +			DP_NOTICE(p_hwfn,
+ +				  "rss_ind_table[%d] = %d, rxq is out of range\n",
+ +				  i, q_idx);
+ +		else if (!vf->vf_queues[q_idx].rxq_active)
+ +			DP_NOTICE(p_hwfn,
+ +				  "rss_ind_table[%d] = %d, rxq is not active\n",
+ +				  i, q_idx);
+ +		else
+ +			index = vf->vf_queues[q_idx].fw_rx_qid;
+ +		p_rss->rss_ind_table[i] = index;
+++=======
++ 		if (!vf->vf_queues[q_idx].p_rx_cid) {
++ 			DP_VERBOSE(p_hwfn,
++ 				   QED_MSG_IOV,
++ 				   "VF[%d]: Omitting RSS due to inactive queue %08x\n",
++ 				   vf->relative_vf_id, q_idx);
++ 			b_reject = true;
++ 			goto out;
++ 		}
++ 
++ 		p_rss->rss_ind_table[i] = vf->vf_queues[q_idx].p_rx_cid;
+++>>>>>>> f29ffdb65ff0 (qed*: RSS indirection based on queue-handles)
+  	}
+  
+  	p_data->rss_params = p_rss;
+diff --cc drivers/net/ethernet/qlogic/qede/qede_main.c
+index 356ca114d243,88d47d6f35ac..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede_main.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_main.c
+@@@ -41,7 -59,8 +41,12 @@@
+  #include <linux/random.h>
+  #include <net/ip6_checksum.h>
+  #include <linux/bitops.h>
+++<<<<<<< HEAD
+ +
+++=======
++ #include <linux/vmalloc.h>
++ #include <linux/qed/qede_roce.h>
+++>>>>>>> f29ffdb65ff0 (qed*: RSS indirection based on queue-handles)
+  #include "qede.h"
+  
+  static char version[] =
+@@@ -3204,9 -1499,15 +3211,9 @@@ static int qede_drain_txq(struct qede_d
+  	return 0;
+  }
+  
+ -static int qede_stop_txq(struct qede_dev *edev,
+ -			 struct qede_tx_queue *txq, int rss_id)
+ -{
+ -	return edev->ops->q_tx_stop(edev->cdev, rss_id, txq->handle);
+ -}
+ -
+  static int qede_stop_queues(struct qede_dev *edev)
+  {
+- 	struct qed_update_vport_params vport_update_params;
++ 	struct qed_update_vport_params *vport_update_params;
+  	struct qed_dev *cdev = edev->cdev;
+  	struct qede_fastpath *fp;
+  	int rc, i;
+@@@ -3338,48 -1699,36 +3353,68 @@@ static int qede_start_queues(struct qed
+  			if (rc) {
+  				DP_ERR(edev, "Start RXQ #%d failed %d\n", i,
+  				       rc);
+- 				return rc;
++ 				goto out;
+  			}
+  
+ -			/* Use the return parameters */
+ -			rxq->hw_rxq_prod_addr = ret_params.p_prod;
+ -			rxq->handle = ret_params.p_handle;
+ -
+  			val = &fp->sb_info->sb_virt->pi_array[RX_PI];
+  			rxq->hw_cons_ptr = val;
+  
+  			qede_update_rx_prod(edev, rxq);
+  		}
+  
+++<<<<<<< HEAD
+ +		if (fp->type & QEDE_FASTPATH_TX) {
+ +			struct qede_tx_queue *txq = fp->txq;
+ +
+ +			p_phys_table = qed_chain_get_pbl_phys(&txq->tx_pbl);
+ +			page_cnt = qed_chain_get_page_cnt(&txq->tx_pbl);
+ +
+ +			memset(&q_params, 0, sizeof(q_params));
+ +			q_params.rss_id = i;
+ +			q_params.queue_id = txq->index;
+ +			q_params.vport_id = 0;
+ +			q_params.sb = fp->sb_info->igu_sb_id;
+ +			q_params.sb_idx = TX_PI(0);
+ +
+ +			rc = edev->ops->q_tx_start(cdev, &q_params,
+ +						   p_phys_table, page_cnt,
+ +						   &txq->doorbell_addr);
+ +			if (rc) {
+ +				DP_ERR(edev, "Start TXQ #%d failed %d\n",
+ +				       txq->index, rc);
+ +				return rc;
+++=======
++ 		if (fp->type & QEDE_FASTPATH_XDP) {
++ 			rc = qede_start_txq(edev, fp, fp->xdp_tx, i, XDP_PI);
++ 			if (rc)
++ 				goto out;
++ 
++ 			fp->rxq->xdp_prog = bpf_prog_add(edev->xdp_prog, 1);
++ 			if (IS_ERR(fp->rxq->xdp_prog)) {
++ 				rc = PTR_ERR(fp->rxq->xdp_prog);
++ 				fp->rxq->xdp_prog = NULL;
++ 				goto out;
+++>>>>>>> f29ffdb65ff0 (qed*: RSS indirection based on queue-handles)
+  			}
+ -		}
+  
+++<<<<<<< HEAD
+ +			txq->hw_cons_ptr =
+ +				&fp->sb_info->sb_virt->pi_array[TX_PI(0)];
+ +			SET_FIELD(txq->tx_db.data.params,
+ +				  ETH_DB_DATA_DEST, DB_DEST_XCM);
+ +			SET_FIELD(txq->tx_db.data.params, ETH_DB_DATA_AGG_CMD,
+ +				  DB_AGG_CMD_SET);
+ +			SET_FIELD(txq->tx_db.data.params,
+ +				  ETH_DB_DATA_AGG_VAL_SEL,
+ +				  DQ_XCM_ETH_TX_BD_PROD_CMD);
+ +
+ +			txq->tx_db.data.agg_flags = DQ_XCM_ETH_DQ_CF_CMD;
+++=======
++ 		if (fp->type & QEDE_FASTPATH_TX) {
++ 			rc = qede_start_txq(edev, fp, fp->txq, i, TX_PI(0));
++ 			if (rc)
++ 				goto out;
+++>>>>>>> f29ffdb65ff0 (qed*: RSS indirection based on queue-handles)
+  		}
+  	}
+  
+@@@ -3391,85 -1739,22 +3425,43 @@@
+  
+  	if ((qed_info->mf_mode == QED_MF_NPAR || pci_num_vf(edev->pdev)) &&
+  	    qed_info->tx_switching) {
+- 		vport_update_params.update_tx_switching_flg = 1;
+- 		vport_update_params.tx_switching_flg = 1;
++ 		vport_update_params->update_tx_switching_flg = 1;
++ 		vport_update_params->tx_switching_flg = 1;
+  	}
+  
+- 	/* Fill struct with RSS params */
+- 	if (QEDE_RSS_COUNT(edev) > 1) {
+- 		vport_update_params.update_rss_flg = 1;
+- 
+- 		/* Need to validate current RSS config uses valid entries */
+- 		for (i = 0; i < QED_RSS_IND_TABLE_SIZE; i++) {
+- 			if (edev->rss_params.rss_ind_table[i] >=
+- 			    QEDE_RSS_COUNT(edev)) {
+- 				reset_rss_indir = true;
+- 				break;
+- 			}
+- 		}
+- 
+- 		if (!(edev->rss_params_inited & QEDE_RSS_INDIR_INITED) ||
+- 		    reset_rss_indir) {
+- 			u16 val;
+- 
+- 			for (i = 0; i < QED_RSS_IND_TABLE_SIZE; i++) {
+- 				u16 indir_val;
+- 
+- 				val = QEDE_RSS_COUNT(edev);
+- 				indir_val = ethtool_rxfh_indir_default(i, val);
+- 				edev->rss_params.rss_ind_table[i] = indir_val;
+- 			}
+- 			edev->rss_params_inited |= QEDE_RSS_INDIR_INITED;
+- 		}
+- 
+- 		if (!(edev->rss_params_inited & QEDE_RSS_KEY_INITED)) {
+- 			netdev_rss_key_fill(edev->rss_params.rss_key,
+- 					    sizeof(edev->rss_params.rss_key));
+- 			edev->rss_params_inited |= QEDE_RSS_KEY_INITED;
+- 		}
++ 	qede_fill_rss_params(edev, &vport_update_params->rss_params,
++ 			     &vport_update_params->update_rss_flg);
+  
+- 		if (!(edev->rss_params_inited & QEDE_RSS_CAPS_INITED)) {
+- 			edev->rss_params.rss_caps = QED_RSS_IPV4 |
+- 						    QED_RSS_IPV6 |
+- 						    QED_RSS_IPV4_TCP |
+- 						    QED_RSS_IPV6_TCP;
+- 			edev->rss_params_inited |= QEDE_RSS_CAPS_INITED;
+- 		}
+- 
+- 		memcpy(&vport_update_params.rss_params, &edev->rss_params,
+- 		       sizeof(vport_update_params.rss_params));
+- 	} else {
+- 		memset(&vport_update_params.rss_params, 0,
+- 		       sizeof(vport_update_params.rss_params));
+- 	}
+- 
+- 	rc = edev->ops->vport_update(cdev, &vport_update_params);
+- 	if (rc) {
++ 	rc = edev->ops->vport_update(cdev, vport_update_params);
++ 	if (rc)
+  		DP_ERR(edev, "Update V-PORT failed %d\n", rc);
+- 		return rc;
+- 	}
+  
+- 	return 0;
++ out:
++ 	vfree(vport_update_params);
++ 	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +static int qede_set_mcast_rx_mac(struct qede_dev *edev,
+ +				 enum qed_filter_xcast_params_type opcode,
+ +				 unsigned char *mac, int num_macs)
+ +{
+ +	struct qed_filter_params filter_cmd;
+ +	int i;
+ +
+ +	memset(&filter_cmd, 0, sizeof(filter_cmd));
+ +	filter_cmd.type = QED_FILTER_TYPE_MCAST;
+ +	filter_cmd.filter.mcast.type = opcode;
+ +	filter_cmd.filter.mcast.num = num_macs;
+ +
+ +	for (i = 0; i < num_macs; i++, mac += ETH_ALEN)
+ +		ether_addr_copy(filter_cmd.filter.mcast.mac[i], mac);
+ +
+ +	return edev->ops->filter_config(edev->cdev, &filter_cmd);
+ +}
+ +
+++=======
+++>>>>>>> f29ffdb65ff0 (qed*: RSS indirection based on queue-handles)
+  enum qede_unload_mode {
+  	QEDE_UNLOAD_NORMAL,
+  };
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_filter.c
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_l2.c
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_l2.h
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_sriov.c
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_vf.c b/drivers/net/ethernet/qlogic/qed/qed_vf.c
+index c0bf8f105b09..64c76946ae5e 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_vf.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_vf.c
+@@ -824,6 +824,7 @@ int qed_vf_pf_vport_update(struct qed_hwfn *p_hwfn,
+ 	if (p_params->rss_params) {
+ 		struct qed_rss_params *rss_params = p_params->rss_params;
+ 		struct vfpf_vport_update_rss_tlv *p_rss_tlv;
++		int i, table_size;
+ 
+ 		size = sizeof(struct vfpf_vport_update_rss_tlv);
+ 		p_rss_tlv = qed_add_tlv(p_hwfn,
+@@ -846,8 +847,15 @@ int qed_vf_pf_vport_update(struct qed_hwfn *p_hwfn,
+ 		p_rss_tlv->rss_enable = rss_params->rss_enable;
+ 		p_rss_tlv->rss_caps = rss_params->rss_caps;
+ 		p_rss_tlv->rss_table_size_log = rss_params->rss_table_size_log;
+-		memcpy(p_rss_tlv->rss_ind_table, rss_params->rss_ind_table,
+-		       sizeof(rss_params->rss_ind_table));
++
++		table_size = min_t(int, T_ETH_INDIRECTION_TABLE_SIZE,
++				   1 << p_rss_tlv->rss_table_size_log);
++		for (i = 0; i < table_size; i++) {
++			struct qed_queue_cid *p_queue;
++
++			p_queue = rss_params->rss_ind_table[i];
++			p_rss_tlv->rss_ind_table[i] = p_queue->rel.queue_id;
++		}
+ 		memcpy(p_rss_tlv->rss_key, rss_params->rss_key,
+ 		       sizeof(rss_params->rss_key));
+ 	}
+diff --git a/drivers/net/ethernet/qlogic/qede/qede.h b/drivers/net/ethernet/qlogic/qede/qede.h
+index 1b7b1accb2cc..8a5304baa634 100644
+--- a/drivers/net/ethernet/qlogic/qede/qede.h
++++ b/drivers/net/ethernet/qlogic/qede/qede.h
+@@ -133,6 +133,7 @@ struct qede_dev {
+ 	u16				num_queues;
+ #define QEDE_QUEUE_CNT(edev)	((edev)->num_queues)
+ #define QEDE_RSS_COUNT(edev)	((edev)->num_queues - (edev)->fp_num_tx)
++#define QEDE_RX_QUEUE_IDX(edev, i)	(i)
+ #define QEDE_TSS_COUNT(edev)	((edev)->num_queues - (edev)->fp_num_rx)
+ 
+ 	struct qed_int_info		int_info;
+@@ -163,7 +164,10 @@ struct qede_dev {
+ #define QEDE_RSS_KEY_INITED	BIT(1)
+ #define QEDE_RSS_CAPS_INITED	BIT(2)
+ 	u32 rss_params_inited; /* bit-field to track initialized rss params */
+-	struct qed_update_vport_rss_params	rss_params;
++	u16 rss_ind_table[128];
++	u32 rss_key[10];
++	u8 rss_caps;
++
+ 	u16			q_num_rx_buffers; /* Must be a power of two */
+ 	u16			q_num_tx_buffers; /* Must be a power of two */
+ 
+diff --git a/drivers/net/ethernet/qlogic/qede/qede_ethtool.c b/drivers/net/ethernet/qlogic/qede/qede_ethtool.c
+index 4c5145c9f11a..db56e0825232 100644
+--- a/drivers/net/ethernet/qlogic/qede/qede_ethtool.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_ethtool.c
+@@ -14,6 +14,7 @@
+ #include <linux/string.h>
+ #include <linux/pci.h>
+ #include <linux/capability.h>
++#include <linux/vmalloc.h>
+ #include "qede.h"
+ 
+ #define QEDE_RQSTAT_OFFSET(stat_name) \
+@@ -856,8 +857,7 @@ static int qede_set_channels(struct net_device *dev,
+ 	/* Reset the indirection table if rx queue count is updated */
+ 	if ((edev->req_queues - edev->req_num_tx) != QEDE_RSS_COUNT(edev)) {
+ 		edev->rss_params_inited &= ~QEDE_RSS_INDIR_INITED;
+-		memset(&edev->rss_params.rss_ind_table, 0,
+-		       sizeof(edev->rss_params.rss_ind_table));
++		memset(edev->rss_ind_table, 0, sizeof(edev->rss_ind_table));
+ 	}
+ 
+ 	if (netif_running(dev))
+@@ -904,11 +904,11 @@ static int qede_get_rss_flags(struct qede_dev *edev, struct ethtool_rxnfc *info)
+ 		info->data |= RXH_L4_B_0_1 | RXH_L4_B_2_3;
+ 		break;
+ 	case UDP_V4_FLOW:
+-		if (edev->rss_params.rss_caps & QED_RSS_IPV4_UDP)
++		if (edev->rss_caps & QED_RSS_IPV4_UDP)
+ 			info->data |= RXH_L4_B_0_1 | RXH_L4_B_2_3;
+ 		break;
+ 	case UDP_V6_FLOW:
+-		if (edev->rss_params.rss_caps & QED_RSS_IPV6_UDP)
++		if (edev->rss_caps & QED_RSS_IPV6_UDP)
+ 			info->data |= RXH_L4_B_0_1 | RXH_L4_B_2_3;
+ 		break;
+ 	case IPV4_FLOW:
+@@ -941,8 +941,9 @@ static int qede_get_rxnfc(struct net_device *dev, struct ethtool_rxnfc *info,
+ 
+ static int qede_set_rss_flags(struct qede_dev *edev, struct ethtool_rxnfc *info)
+ {
+-	struct qed_update_vport_params vport_update_params;
++	struct qed_update_vport_params *vport_update_params;
+ 	u8 set_caps = 0, clr_caps = 0;
++	int rc = 0;
+ 
+ 	DP_VERBOSE(edev, QED_MSG_DEBUG,
+ 		   "Set rss flags command parameters: flow type = %d, data = %llu\n",
+@@ -1017,27 +1018,29 @@ static int qede_set_rss_flags(struct qede_dev *edev, struct ethtool_rxnfc *info)
+ 	}
+ 
+ 	/* No action is needed if there is no change in the rss capability */
+-	if (edev->rss_params.rss_caps == ((edev->rss_params.rss_caps &
+-					   ~clr_caps) | set_caps))
++	if (edev->rss_caps == ((edev->rss_caps & ~clr_caps) | set_caps))
+ 		return 0;
+ 
+ 	/* Update internal configuration */
+-	edev->rss_params.rss_caps = (edev->rss_params.rss_caps & ~clr_caps) |
+-				    set_caps;
++	edev->rss_caps = ((edev->rss_caps & ~clr_caps) | set_caps);
+ 	edev->rss_params_inited |= QEDE_RSS_CAPS_INITED;
+ 
+ 	/* Re-configure if possible */
+-	if (netif_running(edev->ndev)) {
+-		memset(&vport_update_params, 0, sizeof(vport_update_params));
+-		vport_update_params.update_rss_flg = 1;
+-		vport_update_params.vport_id = 0;
+-		memcpy(&vport_update_params.rss_params, &edev->rss_params,
+-		       sizeof(vport_update_params.rss_params));
+-		return edev->ops->vport_update(edev->cdev,
+-					       &vport_update_params);
++	__qede_lock(edev);
++	if (edev->state == QEDE_STATE_OPEN) {
++		vport_update_params = vzalloc(sizeof(*vport_update_params));
++		if (!vport_update_params) {
++			__qede_unlock(edev);
++			return -ENOMEM;
++		}
++		qede_fill_rss_params(edev, &vport_update_params->rss_params,
++				     &vport_update_params->update_rss_flg);
++		rc = edev->ops->vport_update(edev->cdev, vport_update_params);
++		vfree(vport_update_params);
+ 	}
++	__qede_unlock(edev);
+ 
+-	return 0;
++	return rc;
+ }
+ 
+ static int qede_set_rxnfc(struct net_device *dev, struct ethtool_rxnfc *info)
+@@ -1062,7 +1065,7 @@ static u32 qede_get_rxfh_key_size(struct net_device *dev)
+ {
+ 	struct qede_dev *edev = netdev_priv(dev);
+ 
+-	return sizeof(edev->rss_params.rss_key);
++	return sizeof(edev->rss_key);
+ }
+ 
+ static int qede_get_rxfh(struct net_device *dev, u32 *indir, u8 *key, u8 *hfunc)
+@@ -1077,11 +1080,10 @@ static int qede_get_rxfh(struct net_device *dev, u32 *indir, u8 *key, u8 *hfunc)
+ 		return 0;
+ 
+ 	for (i = 0; i < QED_RSS_IND_TABLE_SIZE; i++)
+-		indir[i] = edev->rss_params.rss_ind_table[i];
++		indir[i] = edev->rss_ind_table[i];
+ 
+ 	if (key)
+-		memcpy(key, edev->rss_params.rss_key,
+-		       qede_get_rxfh_key_size(dev));
++		memcpy(key, edev->rss_key, qede_get_rxfh_key_size(dev));
+ 
+ 	return 0;
+ }
+@@ -1089,9 +1091,9 @@ static int qede_get_rxfh(struct net_device *dev, u32 *indir, u8 *key, u8 *hfunc)
+ static int qede_set_rxfh(struct net_device *dev, const u32 *indir,
+ 			 const u8 *key, const u8 hfunc)
+ {
+-	struct qed_update_vport_params vport_update_params;
++	struct qed_update_vport_params *vport_update_params;
+ 	struct qede_dev *edev = netdev_priv(dev);
+-	int i;
++	int i, rc = 0;
+ 
+ 	if (edev->dev_info.common.num_hwfns > 1) {
+ 		DP_INFO(edev,
+@@ -1107,27 +1109,30 @@ static int qede_set_rxfh(struct net_device *dev, const u32 *indir,
+ 
+ 	if (indir) {
+ 		for (i = 0; i < QED_RSS_IND_TABLE_SIZE; i++)
+-			edev->rss_params.rss_ind_table[i] = indir[i];
++			edev->rss_ind_table[i] = indir[i];
+ 		edev->rss_params_inited |= QEDE_RSS_INDIR_INITED;
+ 	}
+ 
+ 	if (key) {
+-		memcpy(&edev->rss_params.rss_key, key,
+-		       qede_get_rxfh_key_size(dev));
++		memcpy(&edev->rss_key, key, qede_get_rxfh_key_size(dev));
+ 		edev->rss_params_inited |= QEDE_RSS_KEY_INITED;
+ 	}
+ 
+-	if (netif_running(edev->ndev)) {
+-		memset(&vport_update_params, 0, sizeof(vport_update_params));
+-		vport_update_params.update_rss_flg = 1;
+-		vport_update_params.vport_id = 0;
+-		memcpy(&vport_update_params.rss_params, &edev->rss_params,
+-		       sizeof(vport_update_params.rss_params));
+-		return edev->ops->vport_update(edev->cdev,
+-					       &vport_update_params);
++	__qede_lock(edev);
++	if (edev->state == QEDE_STATE_OPEN) {
++		vport_update_params = vzalloc(sizeof(*vport_update_params));
++		if (!vport_update_params) {
++			__qede_unlock(edev);
++			return -ENOMEM;
++		}
++		qede_fill_rss_params(edev, &vport_update_params->rss_params,
++				     &vport_update_params->update_rss_flg);
++		rc = edev->ops->vport_update(edev->cdev, vport_update_params);
++		vfree(vport_update_params);
+ 	}
++	__qede_unlock(edev);
+ 
+-	return 0;
++	return rc;
+ }
+ 
+ /* This function enables the interrupt generation and the NAPI on the device */
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_filter.c
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_main.c
+diff --git a/include/linux/qed/qed_eth_if.h b/include/linux/qed/qed_eth_if.h
+index 15130805d792..3426e2cc0342 100644
+--- a/include/linux/qed/qed_eth_if.h
++++ b/include/linux/qed/qed_eth_if.h
+@@ -30,7 +30,7 @@ struct qed_dev_eth_info {
+ };
+ 
+ struct qed_update_vport_rss_params {
+-	u16	rss_ind_table[128];
++	void	*rss_ind_table[128];
+ 	u32	rss_key[10];
+ 	u8	rss_caps;
+ };
