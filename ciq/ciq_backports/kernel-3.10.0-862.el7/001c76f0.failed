@@ -1,0 +1,236 @@
+cpufreq: intel_pstate: Generic governors support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [cpufreq] intel_pstate: Generic governors support (Prarit Bhargava) [1465349]
+Rebuild_FUZZ: 89.66%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 001c76f05b01cc8ceb2098c9ff5de2609bec7f76
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/001c76f0.failed
+
+There may be reasons to use generic cpufreq governors (eg. schedutil)
+on Intel platforms instead of the intel_pstate driver's internal
+governor.  However, that currently can only be done by disabling
+intel_pstate altogether and using the acpi-cpufreq driver instead
+of it, which is subject to limitations.
+
+First of all, acpi-cpufreq only works on systems where the _PSS
+object is present in the ACPI tables for all logical CPUs.  Second,
+on those systems acpi-cpufreq will only use frequencies listed by
+_PSS which may be suboptimal.  In particular, by convention, the
+whole turbo range is represented in _PSS as a single P-state and
+the frequency assigned to it is greater by 1 MHz than the greatest
+non-turbo frequency listed by _PSS.  That may confuse governors to
+use turbo frequencies less frequently which may lead to suboptimal
+performance.
+
+For this reason, make it possible to use the intel_pstate driver
+with generic cpufreq governors as a "normal" cpufreq driver.  That
+mode is enforced by adding intel_pstate=passive to the kernel
+command line and cannot be disabled at run time.  In that mode,
+intel_pstate provides a cpufreq driver interface including
+the ->target() and ->fast_switch() callbacks and is listed in
+scaling_driver as "intel_cpufreq".
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Tested-by: Doug Smythies <dsmythies@telus.net>
+(cherry picked from commit 001c76f05b01cc8ceb2098c9ff5de2609bec7f76)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/intel_pstate.c
+diff --cc drivers/cpufreq/intel_pstate.c
+index e7b574938221,0d82bf320838..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -31,8 -34,11 +31,10 @@@
+  #include <asm/div64.h>
+  #include <asm/msr.h>
+  #include <asm/cpu_device_id.h>
+ -#include <asm/cpufeature.h>
+  #include <asm/intel-family.h>
+  
++ #define INTEL_CPUFREQ_TRANSITION_LATENCY	20000
++ 
+  #define ATOM_RATIOS		0x66a
+  #define ATOM_VIDS		0x66b
+  #define ATOM_TURBO_RATIOS	0x66c
+@@@ -1273,11 -1364,31 +1281,36 @@@ static inline int32_t get_target_pstate
+  	} else {
+  		sample_ratio = div_fp(100 * cpu->sample.mperf, cpu->sample.tsc);
+  		if (sample_ratio < int_tofp(1))
+ -			perf_scaled = 0;
+ +			core_busy = 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	cpu->sample.busy_scaled = core_busy;
+ +	return cpu->pstate.current_pstate - pid_calc(&cpu->pid, core_busy);
+++=======
++ 	cpu->sample.busy_scaled = perf_scaled;
++ 	return cpu->pstate.current_pstate - pid_calc(&cpu->pid, perf_scaled);
++ }
++ 
++ static int intel_pstate_prepare_request(struct cpudata *cpu, int pstate)
++ {
++ 	int max_perf, min_perf;
++ 
++ 	intel_pstate_get_min_max(cpu, &min_perf, &max_perf);
++ 	pstate = clamp_t(int, pstate, min_perf, max_perf);
++ 	trace_cpu_frequency(pstate * cpu->pstate.scaling, cpu->cpu);
++ 	return pstate;
++ }
++ 
++ static void intel_pstate_update_pstate(struct cpudata *cpu, int pstate)
++ {
++ 	pstate = intel_pstate_prepare_request(cpu, pstate);
++ 	if (pstate == cpu->pstate.current_pstate)
++ 		return;
++ 
++ 	cpu->pstate.current_pstate = pstate;
++ 	wrmsrl(MSR_IA32_PERF_CTL, pstate_funcs.get_val(cpu, pstate));
+++>>>>>>> 001c76f05b01 (cpufreq: intel_pstate: Generic governors support)
+  }
+  
+  static inline void intel_pstate_adjust_busy_pstate(struct cpudata *cpu)
+@@@ -1287,12 -1398,15 +1320,18 @@@
+  
+  	from = cpu->pstate.current_pstate;
+  
+ -	target_pstate = cpu->policy == CPUFREQ_POLICY_PERFORMANCE ?
+ -		cpu->pstate.turbo_pstate : pstate_funcs.get_target_pstate(cpu);
+ +	target_pstate = pstate_funcs.get_target_pstate(cpu);
+  
+++<<<<<<< HEAD
+ +	intel_pstate_set_pstate(cpu, target_pstate);
+++=======
++ 	update_turbo_state();
++ 
++ 	intel_pstate_update_pstate(cpu, target_pstate);
+++>>>>>>> 001c76f05b01 (cpufreq: intel_pstate: Generic governors support)
+  
+  	sample = &cpu->sample;
+ -	trace_pstate_sample(mul_ext_fp(100, sample->core_avg_perf),
+ +	trace_pstate_sample(fp_toint(sample->core_pct_busy),
+  		fp_toint(sample->busy_scaled),
+  		from,
+  		cpu->pstate.current_pstate,
+@@@ -1477,21 -1684,30 +1516,43 @@@ static int intel_pstate_verify_policy(s
+  	return 0;
+  }
+  
+- static void intel_pstate_stop_cpu(struct cpufreq_policy *policy)
++ static void intel_cpufreq_stop_cpu(struct cpufreq_policy *policy)
+  {
+++<<<<<<< HEAD
+ +	int cpu_num = policy->cpu;
+ +	struct cpudata *cpu = all_cpu_data[cpu_num];
+ +
+ +	pr_info("intel_pstate CPU %d exiting\n", cpu_num);
+ +
+ +	del_timer_sync(&all_cpu_data[cpu_num]->timer);
+ +	if (hwp_active)
+ +		return;
+ +
+ +	intel_pstate_set_pstate(cpu, cpu->pstate.min_pstate);
+++=======
++ 	intel_pstate_set_min_pstate(all_cpu_data[policy->cpu]);
+++>>>>>>> 001c76f05b01 (cpufreq: intel_pstate: Generic governors support)
+  }
+  
+- static int intel_pstate_cpu_init(struct cpufreq_policy *policy)
++ static void intel_pstate_stop_cpu(struct cpufreq_policy *policy)
++ {
++ 	pr_debug("CPU %d exiting\n", policy->cpu);
++ 
++ 	intel_pstate_clear_update_util_hook(policy->cpu);
++ 	if (!hwp_active)
++ 		intel_cpufreq_stop_cpu(policy);
++ }
++ 
++ static int intel_pstate_cpu_exit(struct cpufreq_policy *policy)
++ {
++ 	intel_pstate_exit_perf_limits(policy);
++ 
++ 	policy->fast_switch_possible = false;
++ 
++ 	return 0;
++ }
++ 
++ static int __intel_pstate_cpu_init(struct cpufreq_policy *policy)
+  {
+  	struct cpudata *cpu;
+  	int rc;
+@@@ -1502,10 -1718,13 +1563,20 @@@
+  
+  	cpu = all_cpu_data[policy->cpu];
+  
+++<<<<<<< HEAD
+ +	if (limits->min_perf_pct == 100 && limits->max_perf_pct == 100)
+ +		policy->policy = CPUFREQ_POLICY_PERFORMANCE;
+ +	else
+ +		policy->policy = CPUFREQ_POLICY_POWERSAVE;
+++=======
++ 	/*
++ 	 * We need sane value in the cpu->perf_limits, so inherit from global
++ 	 * perf_limits limits, which are seeded with values based on the
++ 	 * CONFIG_CPU_FREQ_DEFAULT_GOV_*, during boot up.
++ 	 */
++ 	if (per_cpu_limits)
++ 		memcpy(cpu->perf_limits, limits, sizeof(struct perf_limits));
+++>>>>>>> 001c76f05b01 (cpufreq: intel_pstate: Generic governors support)
+  
+  	policy->min = cpu->pstate.min_pstate * cpu->pstate.scaling;
+  	policy->max = cpu->pstate.turbo_pstate * cpu->pstate.scaling;
+@@@ -1773,7 -2130,9 +1966,13 @@@ out
+  	get_online_cpus();
+  	for_each_online_cpu(cpu) {
+  		if (all_cpu_data[cpu]) {
+++<<<<<<< HEAD
+ +			del_timer_sync(&all_cpu_data[cpu]->timer);
+++=======
++ 			if (intel_pstate_driver == &intel_pstate)
++ 				intel_pstate_clear_update_util_hook(cpu);
++ 
+++>>>>>>> 001c76f05b01 (cpufreq: intel_pstate: Generic governors support)
+  			kfree(all_cpu_data[cpu]);
+  		}
+  	}
+@@@ -1789,10 -2148,15 +1988,15 @@@ static int __init intel_pstate_setup(ch
+  	if (!str)
+  		return -EINVAL;
+  
+- 	if (!strcmp(str, "disable"))
++ 	if (!strcmp(str, "disable")) {
+  		no_load = 1;
++ 	} else if (!strcmp(str, "passive")) {
++ 		pr_info("Passive mode enabled\n");
++ 		intel_pstate_driver = &intel_cpufreq;
++ 		no_hwp = 1;
++ 	}
+  	if (!strcmp(str, "no_hwp")) {
+ -		pr_info("HWP disabled\n");
+ +		pr_info("intel_pstate: HWP disabled\n");
+  		no_hwp = 1;
+  	}
+  	if (!strcmp(str, "force"))
+diff --git a/Documentation/kernel-parameters.txt b/Documentation/kernel-parameters.txt
+index bd963f8edd7c..747a6f521692 100644
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -1287,6 +1287,12 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
+ 		       disable
+ 		         Do not enable intel_pstate as the default
+ 		         scaling driver for the supported processors
++		       passive
++			 Use intel_pstate as a scaling driver, but configure it
++			 to work with generic cpufreq governors (instead of
++			 enabling its internal governor).  This mode cannot be
++			 used along with the hardware-managed P-states (HWP)
++			 feature.
+ 		       force
+ 			 Enable intel_pstate on systems that prohibit it by default
+ 			 in favor of acpi-cpufreq. Forcing the intel_pstate driver
+* Unmerged path drivers/cpufreq/intel_pstate.c
