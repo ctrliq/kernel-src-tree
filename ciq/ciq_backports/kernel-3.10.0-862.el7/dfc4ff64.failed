@@ -1,0 +1,144 @@
+i40e: don't hold RTNL lock for the entire reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit dfc4ff644674a133878aded9a86ab36c358f3138
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/dfc4ff64.failed
+
+We recently refactored i40e_do_reset() and its friends to be able to
+hold the RTNL lock only for the portions that actually need to be
+protected. However, a separate refactoring added several new callers of
+these functions during the PCIe error recovery and suspend/resume
+cycles.
+
+When merging the changes together, it was not noticed that we could
+reduce the RTNL scope by letting the reset function handle the lock
+itself, as previously it was not possible.
+
+Fix this by replacing these call sites to indicate that the reset
+function should handle its own lock. This enables multiple PFs to reset
+or resume simultaneously without serializing the resets via the RTNL
+lock. The end result is that on systems with lots of PFs and VFs the
+resets don't stall waiting for each other to finish.
+
+It is probable that we can also do the same for i40e_do_reset_safe, but
+this author did not research that change carefully enough to be
+confident.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit dfc4ff644674a133878aded9a86ab36c358f3138)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_main.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_main.c
+index fd58cc7c4ac4,2db93d3f6d23..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@@ -6508,12 -6564,10 +6508,19 @@@ static void i40e_reset_subtask(struct i
+  
+  	/* If we're already down or resetting, just bail */
+  	if (reset_flags &&
+++<<<<<<< HEAD
+ +	    !test_bit(__I40E_DOWN, &pf->state) &&
+ +	    !test_bit(__I40E_CONFIG_BUSY, &pf->state))
+ +		i40e_do_reset(pf, reset_flags);
+ +
+ +unlock:
+ +	rtnl_unlock();
+++=======
++ 	    !test_bit(__I40E_DOWN, pf->state) &&
++ 	    !test_bit(__I40E_CONFIG_BUSY, pf->state)) {
++ 		i40e_do_reset(pf, reset_flags, false);
++ 	}
+++>>>>>>> dfc4ff644674 (i40e: don't hold RTNL lock for the entire reset)
+  }
+  
+  /**
+@@@ -11773,11 -11904,8 +11780,16 @@@ static pci_ers_result_t i40e_pci_error_
+  	}
+  
+  	/* shutdown all operations */
+++<<<<<<< HEAD
+ +	if (!test_bit(__I40E_SUSPENDED, &pf->state)) {
+ +		rtnl_lock();
+ +		i40e_prep_for_reset(pf);
+ +		rtnl_unlock();
+ +	}
+++=======
++ 	if (!test_bit(__I40E_SUSPENDED, pf->state))
++ 		i40e_prep_for_reset(pf, false);
+++>>>>>>> dfc4ff644674 (i40e: don't hold RTNL lock for the entire reset)
+  
+  	/* Request a slot reset */
+  	return PCI_ERS_RESULT_NEED_RESET;
+@@@ -11840,12 -11968,10 +11852,16 @@@ static void i40e_pci_error_resume(struc
+  	struct i40e_pf *pf = pci_get_drvdata(pdev);
+  
+  	dev_dbg(&pdev->dev, "%s\n", __func__);
+ -	if (test_bit(__I40E_SUSPENDED, pf->state))
+ +	if (test_bit(__I40E_SUSPENDED, &pf->state))
+  		return;
+  
+++<<<<<<< HEAD
+ +	rtnl_lock();
+ +	i40e_handle_reset_warning(pf);
+ +	rtnl_unlock();
+++=======
++ 	i40e_handle_reset_warning(pf, false);
+++>>>>>>> dfc4ff644674 (i40e: don't hold RTNL lock for the entire reset)
+  }
+  
+  /**
+@@@ -11925,9 -12051,7 +11941,13 @@@ static void i40e_shutdown(struct pci_de
+  	if (pf->wol_en && (pf->flags & I40E_FLAG_WOL_MC_MAGIC_PKT_WAKE))
+  		i40e_enable_mc_magic_wake(pf);
+  
+++<<<<<<< HEAD
+ +	rtnl_lock();
+ +	i40e_prep_for_reset(pf);
+ +	rtnl_unlock();
+++=======
++ 	i40e_prep_for_reset(pf, false);
+++>>>>>>> dfc4ff644674 (i40e: don't hold RTNL lock for the entire reset)
+  
+  	wr32(hw, I40E_PFPM_APM,
+  	     (pf->wol_en ? I40E_PFPM_APM_APME_MASK : 0));
+@@@ -11959,9 -12083,7 +11979,13 @@@ static int i40e_suspend(struct pci_dev 
+  	if (pf->wol_en && (pf->flags & I40E_FLAG_WOL_MC_MAGIC_PKT_WAKE))
+  		i40e_enable_mc_magic_wake(pf);
+  
+++<<<<<<< HEAD
+ +	rtnl_lock();
+ +	i40e_prep_for_reset(pf);
+ +	rtnl_unlock();
+++=======
++ 	i40e_prep_for_reset(pf, false);
+++>>>>>>> dfc4ff644674 (i40e: don't hold RTNL lock for the entire reset)
+  
+  	wr32(hw, I40E_PFPM_APM, (pf->wol_en ? I40E_PFPM_APM_APME_MASK : 0));
+  	wr32(hw, I40E_PFPM_WUFC, (pf->wol_en ? I40E_PFPM_WUFC_MAG_MASK : 0));
+@@@ -12005,11 -12127,9 +12029,17 @@@ static int i40e_resume(struct pci_dev *
+  	pci_wake_from_d3(pdev, false);
+  
+  	/* handling the reset will rebuild the device state */
+++<<<<<<< HEAD
+ +	if (test_and_clear_bit(__I40E_SUSPENDED, &pf->state)) {
+ +		clear_bit(__I40E_DOWN, &pf->state);
+ +		rtnl_lock();
+ +		i40e_reset_and_rebuild(pf, false);
+ +		rtnl_unlock();
+++=======
++ 	if (test_and_clear_bit(__I40E_SUSPENDED, pf->state)) {
++ 		clear_bit(__I40E_DOWN, pf->state);
++ 		i40e_reset_and_rebuild(pf, false, false);
+++>>>>>>> dfc4ff644674 (i40e: don't hold RTNL lock for the entire reset)
+  	}
+  
+  	return 0;
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_main.c
