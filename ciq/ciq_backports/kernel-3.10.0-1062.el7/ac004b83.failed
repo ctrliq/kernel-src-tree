@@ -1,0 +1,119 @@
+net/mlx5e: E-Switch, Add peer miss rules
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: E-Switch, Add peer miss rules (Alaa Hleihel) [1642355 1642498]
+Rebuild_FUZZ: 94.74%
+commit-author Roi Dayan <roid@mellanox.com>
+commit ac004b8321281b9da7d9a99674241e60e49ffc8a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/ac004b83.failed
+
+In the sriov offloads mode, packets that are not matched by any
+other rule are sent towards the e-switch vport manager for further
+processing.
+
+Under upcoming patches (e.g for uplink LAG), packets sent from VF
+vports belonging to esw0 (e-switch related to PF0) might end up in
+esw1 (e-switch related to PF1) due to muxing logic applied by the
+FW.
+
+In such a case we still want the missed packet to be sent to the
+"base" esw manager vport in order to present the control plane a
+consistent view of the source (VF reresentor) port.
+
+	Signed-off-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Aviv Heller <avivh@mellanox.com>
+	Signed-off-by: Shahar Klein <shahark@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit ac004b8321281b9da7d9a99674241e60e49ffc8a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+#	drivers/net/ethernet/mellanox/mlx5/core/lib/devcom.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index 84864631953e,a6927ca3d4ca..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -37,6 -37,9 +37,12 @@@
+  #include <linux/mlx5/fs.h>
+  #include "mlx5_core.h"
+  #include "eswitch.h"
+++<<<<<<< HEAD
+++=======
++ #include "en.h"
++ #include "fs_core.h"
++ #include "lib/devcom.h"
+++>>>>>>> ac004b832128 (net/mlx5e: E-Switch, Add peer miss rules)
+  
+  enum {
+  	FDB_FAST_PATH = 0,
+@@@ -539,12 -891,30 +637,13 @@@ static int esw_create_offloads_fdb_tabl
+  		goto ns_err;
+  	}
+  
+ -	max_flow_counter = (MLX5_CAP_GEN(dev, max_flow_counter_31_16) << 16) |
+ -			    MLX5_CAP_GEN(dev, max_flow_counter_15_0);
+ -	fdb_max = 1 << MLX5_CAP_ESW_FLOWTABLE_FDB(dev, log_max_ft_size);
+ -
+ -	esw_debug(dev, "Create offloads FDB table, min (max esw size(2^%d), max counters(%d), groups(%d), max flow table size(2^%d))\n",
+ -		  MLX5_CAP_ESW_FLOWTABLE_FDB(dev, log_max_ft_size),
+ -		  max_flow_counter, ESW_OFFLOADS_NUM_GROUPS,
+ -		  fdb_max);
+ -
+ -	for (i = 0; i < ARRAY_SIZE(ESW_POOLS); i++)
+ -		esw->fdb_table.offloads.fdb_left[i] =
+ -			ESW_POOLS[i] <= fdb_max ? ESW_SIZE / ESW_POOLS[i] : 0;
+ +	err = esw_create_offloads_fast_fdb_table(esw);
+ +	if (err)
+ +		goto fast_fdb_err;
+  
+- 	table_size = nvports * MAX_SQ_NVPORTS + MAX_PF_SQ + 2;
++ 	table_size = nvports * MAX_SQ_NVPORTS + MAX_PF_SQ + 2 +
++ 		esw->total_vports;
+  
+ -	/* create the slow path fdb with encap set, so further table instances
+ -	 * can be created at run time while VFs are probed if the FW allows that.
+ -	 */
+ -	if (esw->offloads.encap != DEVLINK_ESWITCH_ENCAP_MODE_NONE)
+ -		flags |= (MLX5_FLOW_TABLE_TUNNEL_EN_REFORMAT |
+ -			  MLX5_FLOW_TABLE_TUNNEL_EN_DECAP);
+ -
+ -	ft_attr.flags = flags;
+  	ft_attr.max_fte = table_size;
+  	ft_attr.prio = FDB_SLOW_PATH;
+  
+@@@ -609,12 -1020,13 +736,14 @@@
+  miss_rule_err:
+  	mlx5_destroy_flow_group(esw->fdb_table.offloads.miss_grp);
+  miss_err:
++ 	mlx5_destroy_flow_group(esw->fdb_table.offloads.peer_miss_grp);
++ peer_miss_err:
+  	mlx5_destroy_flow_group(esw->fdb_table.offloads.send_to_vport_grp);
+  send_vport_err:
+ -	esw_destroy_offloads_fast_fdb_tables(esw);
+  	mlx5_destroy_flow_table(esw->fdb_table.offloads.slow_fdb);
+  slow_fdb_err:
+ +	esw_destroy_offloads_fast_fdb_table(esw);
+ +fast_fdb_err:
+  ns_err:
+  	kvfree(flow_group_in);
+  	return err;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/lib/devcom.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index 21bc97b70ed9..1c78e1228060 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@ -134,6 +134,8 @@ struct mlx5_eswitch_fdb {
+ 			struct mlx5_flow_table *fwd_fdb;
+ 			struct mlx5_flow_table *slow_fdb;
+ 			struct mlx5_flow_group *send_to_vport_grp;
++			struct mlx5_flow_group *peer_miss_grp;
++			struct mlx5_flow_handle **peer_miss_rules;
+ 			struct mlx5_flow_group *miss_grp;
+ 			struct mlx5_flow_handle *miss_rule_uni;
+ 			struct mlx5_flow_handle *miss_rule_multi;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/lib/devcom.h
