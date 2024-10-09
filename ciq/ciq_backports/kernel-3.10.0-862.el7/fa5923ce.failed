@@ -1,0 +1,235 @@
+ALSA: hda - use dell_micmute_led_set() instead of dell_app_wmi_led_set()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Michał Kępień <kernel@kempniu.pl>
+commit fa5923cea8da3b5d4eb943651922b327b1df673c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fa5923ce.failed
+
+The dell_app_wmi_led_set() method introduced in commit db6d8cc00773
+("dell-led: add mic mute led interface") was implemented as an easily
+extensible entry point for other modules to set the state of various
+LEDs.  However, almost three years later it is still only used to
+control the mic mute LED, so it will be replaced with direct calls to
+dell_micmute_led_set().
+
+	Signed-off-by: Michał Kępień <kernel@kempniu.pl>
+	Tested-by: Alex Hung <alex.hung@canonical.com>
+	Reviewed-by: Pali Rohár <pali.rohar@gmail.com>
+	Acked-by: Takashi Iwai <tiwai@suse.de>
+	Signed-off-by: Jacek Anaszewski <jacek.anaszewski@gmail.com>
+(cherry picked from commit fa5923cea8da3b5d4eb943651922b327b1df673c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/leds/dell-led.c
+diff --cc drivers/leds/dell-led.c
+index c36acaf566a6,f9002d9bb757..000000000000
+--- a/drivers/leds/dell-led.c
++++ b/drivers/leds/dell-led.c
+@@@ -59,93 -46,15 +59,97 @@@ struct app_wmi_args 
+  #define GLOBAL_MIC_MUTE_ENABLE	0x364
+  #define GLOBAL_MIC_MUTE_DISABLE	0x365
+  
+++<<<<<<< HEAD
+ +struct dell_bios_data_token {
+ +	u16 tokenid;
+ +	u16 location;
+ +	u16 value;
+ +};
+ +
+ +struct __attribute__ ((__packed__)) dell_bios_calling_interface {
+ +	struct	dmi_header header;
+ +	u16	cmd_io_addr;
+ +	u8	cmd_io_code;
+ +	u32	supported_cmds;
+ +	struct	dell_bios_data_token damap[];
+ +};
+ +
+ +static struct dell_bios_data_token dell_mic_tokens[2];
+ +
+ +static int dell_wmi_perform_query(struct app_wmi_args *args)
+ +{
+ +	struct app_wmi_args *bios_return;
+ +	union acpi_object *obj;
+ +	struct acpi_buffer input;
+ +	struct acpi_buffer output = { ACPI_ALLOCATE_BUFFER, NULL };
+ +	acpi_status status;
+ +	u32 rc = -EINVAL;
+ +
+ +	input.length = 128;
+ +	input.pointer = args;
+ +
+ +	status = wmi_evaluate_method(DELL_APP_GUID, 0, 1, &input, &output);
+ +	if (!ACPI_SUCCESS(status))
+ +		goto err_out0;
+ +
+ +	obj = output.pointer;
+ +	if (!obj)
+ +		goto err_out0;
+ +
+ +	if (obj->type != ACPI_TYPE_BUFFER)
+ +		goto err_out1;
+ +
+ +	bios_return = (struct app_wmi_args *)obj->buffer.pointer;
+ +	rc = bios_return->res1;
+ +	if (rc)
+ +		goto err_out1;
+ +
+ +	memcpy(args, bios_return, sizeof(struct app_wmi_args));
+ +	rc = 0;
+ +
+ + err_out1:
+ +	kfree(obj);
+ + err_out0:
+ +	return rc;
+ +}
+ +
+ +static void __init find_micmute_tokens(const struct dmi_header *dm, void *dummy)
+ +{
+ +	struct dell_bios_calling_interface *calling_interface;
+ +	struct dell_bios_data_token *token;
+ +	int token_size = sizeof(struct dell_bios_data_token);
+ +	int i = 0;
+ +
+ +	if (dm->type == 0xda && dm->length > 17) {
+ +		calling_interface = container_of(dm,
+ +				struct dell_bios_calling_interface, header);
+ +
+ +		token = &calling_interface->damap[i];
+ +		while (token->tokenid != 0xffff) {
+ +			if (token->tokenid == GLOBAL_MIC_MUTE_DISABLE)
+ +				memcpy(&dell_mic_tokens[0], token, token_size);
+ +			else if (token->tokenid == GLOBAL_MIC_MUTE_ENABLE)
+ +				memcpy(&dell_mic_tokens[1], token, token_size);
+ +
+ +			i++;
+ +			token = &calling_interface->damap[i];
+ +		}
+ +	}
+ +}
+ +
+ +static int dell_micmute_led_set(int state)
+++=======
++ int dell_micmute_led_set(int state)
+++>>>>>>> fa5923cea8da (ALSA: hda - use dell_micmute_led_set() instead of dell_app_wmi_led_set())
+  {
+ -	struct calling_interface_buffer *buffer;
+ -	struct calling_interface_token *token;
+ +	struct app_wmi_args args;
+ +	struct dell_bios_data_token *token;
+  
+ -	if (state == 0)
+ -		token = dell_smbios_find_token(GLOBAL_MIC_MUTE_DISABLE);
+ -	else if (state == 1)
+ -		token = dell_smbios_find_token(GLOBAL_MIC_MUTE_ENABLE);
+ +	if (!wmi_has_guid(DELL_APP_GUID))
+ +		return -ENODEV;
+ +
+ +	if (state == 0 || state == 1)
+ +		token = &dell_mic_tokens[state];
+  	else
+  		return -EINVAL;
+  
+@@@ -159,32 -69,8 +163,16 @@@
+  
+  	return state;
+  }
+- 
+- int dell_app_wmi_led_set(int whichled, int on)
+- {
+- 	int state = 0;
+- 
+- 	switch (whichled) {
+- 	case DELL_LED_MICMUTE:
+- 		state = dell_micmute_led_set(on);
+- 		break;
+- 	default:
+- 		pr_warn("led type %x is not supported\n", whichled);
+- 		break;
+- 	}
+- 
+- 	return state;
+- }
+- EXPORT_SYMBOL_GPL(dell_app_wmi_led_set);
++ EXPORT_SYMBOL_GPL(dell_micmute_led_set);
+  
+ +static int __init dell_micmute_led_init(void)
+ +{
+ +	memset(dell_mic_tokens, 0, sizeof(struct dell_bios_data_token) * 2);
+ +	dmi_walk(find_micmute_tokens, NULL);
+ +
+ +	return 0;
+ +}
+ +
+  struct bios_args {
+  	unsigned char length;
+  	unsigned char result_code;
+* Unmerged path drivers/leds/dell-led.c
+diff --git a/include/linux/dell-led.h b/include/linux/dell-led.h
+index 7009b8bec77b..3f033c48071e 100644
+--- a/include/linux/dell-led.h
++++ b/include/linux/dell-led.h
+@@ -1,10 +1,6 @@
+ #ifndef __DELL_LED_H__
+ #define __DELL_LED_H__
+ 
+-enum {
+-	DELL_LED_MICMUTE,
+-};
+-
+-int dell_app_wmi_led_set(int whichled, int on);
++int dell_micmute_led_set(int on);
+ 
+ #endif
+diff --git a/sound/pci/hda/dell_wmi_helper.c b/sound/pci/hda/dell_wmi_helper.c
+index 19d41da79f93..e128c8096772 100644
+--- a/sound/pci/hda/dell_wmi_helper.c
++++ b/sound/pci/hda/dell_wmi_helper.c
+@@ -6,7 +6,7 @@
+ #include <linux/dell-led.h>
+ 
+ static int dell_led_value;
+-static int (*dell_led_set_func)(int, int);
++static int (*dell_led_set_func)(int);
+ static void (*dell_old_cap_hook)(struct hda_codec *,
+ 			         struct snd_kcontrol *,
+ 				 struct snd_ctl_elem_value *);
+@@ -27,7 +27,7 @@ static void update_dell_wmi_micmute_led(struct hda_codec *codec,
+ 			return;
+ 		dell_led_value = val;
+ 		if (dell_led_set_func)
+-			dell_led_set_func(DELL_LED_MICMUTE, dell_led_value);
++			dell_led_set_func(dell_led_value);
+ 	}
+ }
+ 
+@@ -40,14 +40,14 @@ static void alc_fixup_dell_wmi(struct hda_codec *codec,
+ 
+ 	if (action == HDA_FIXUP_ACT_PROBE) {
+ 		if (!dell_led_set_func)
+-			dell_led_set_func = symbol_request(dell_app_wmi_led_set);
++			dell_led_set_func = symbol_request(dell_micmute_led_set);
+ 		if (!dell_led_set_func) {
+-			codec_warn(codec, "Failed to find dell wmi symbol dell_app_wmi_led_set\n");
++			codec_warn(codec, "Failed to find dell wmi symbol dell_micmute_led_set\n");
+ 			return;
+ 		}
+ 
+ 		removefunc = true;
+-		if (dell_led_set_func(DELL_LED_MICMUTE, false) >= 0) {
++		if (dell_led_set_func(false) >= 0) {
+ 			dell_led_value = 0;
+ 			if (spec->gen.num_adc_nids > 1 && !spec->gen.dyn_adc_switch)
+ 				codec_dbg(codec, "Skipping micmute LED control due to several ADCs");
+@@ -61,7 +61,7 @@ static void alc_fixup_dell_wmi(struct hda_codec *codec,
+ 	}
+ 
+ 	if (dell_led_set_func && (action == HDA_FIXUP_ACT_FREE || removefunc)) {
+-		symbol_put(dell_app_wmi_led_set);
++		symbol_put(dell_micmute_led_set);
+ 		dell_led_set_func = NULL;
+ 		dell_old_cap_hook = NULL;
+ 	}
