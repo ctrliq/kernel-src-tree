@@ -676,6 +676,7 @@ __mutex_unlock_common_slowpath(atomic_t *lock_count, int nested)
 {
 	struct mutex *lock = container_of(lock_count, struct mutex, count);
 	unsigned long flags;
+	WAKE_Q(wake_q);
 
 	/*
 	 * some architectures leave the lock unlocked in the fastpath failure
@@ -696,11 +697,11 @@ __mutex_unlock_common_slowpath(atomic_t *lock_count, int nested)
 					   struct mutex_waiter, list);
 
 		debug_mutex_wake_waiter(lock, waiter);
-
-		wake_up_process(waiter->task);
+		wake_q_add(&wake_q, waiter->task);
 	}
 
 	spin_unlock_mutex(&lock->wait_lock, flags);
+	wake_up_q(&wake_q);
 }
 
 /*
