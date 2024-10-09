@@ -1,0 +1,217 @@
+i40e: restore workaround for removing default MAC filter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 1596b5ddbf25c3dd05aed208ea0bb57eac1c5524
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1596b5dd.failed
+
+A previous commit 53cb6e9e8949 ("i40e: Removal of workaround for simple
+MAC address filter deletion") removed a workaround for some
+firmware versions which was reported to not be necessary in production
+NICs. Unfortunately this workaround is necessary in some configurations,
+specifically the Ethernet Controller XL710 for 40GbE QSFP+ (8086:1583).
+
+Without this patch, the mentioned NICs with current firmware exhibit
+issues when adding VLANs, as outlined by the following reproduction:
+
+  $modprobe i40e
+  $ip link set <device> up
+  $ip link add link <device> vlan100 type vlan id 100
+  $dmesg | tail
+  <snip>
+  kernel: i40e 0000:82:00.0: Error I40E_AQ_RC_EINVAL adding RX
+filters on PF, promiscuous mode forced on
+
+This results in filters being marked as FAILED and setting the device in
+promiscuous mode.
+
+The root cause of receiving the -EINVAL error response appears to be due
+to a conflict with the default MAC filter which still exists on the
+default firmware for this device. Attempting to add a new VLAN filter on
+the default MAC address conflicts with the IGNORE_VLAN setting on the
+default rule.
+
+Change-ID: I4d8f6d48ac5f60cfe981b3baad30eb4d7c170d61
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 1596b5ddbf25c3dd05aed208ea0bb57eac1c5524)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_main.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_main.c
+index beeec4f78000,c467cc49ce91..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@@ -1210,88 -1198,66 +1210,121 @@@ struct i40e_mac_filter *i40e_find_mac(s
+   **/
+  bool i40e_is_vsi_in_vlan(struct i40e_vsi *vsi)
+  {
+ -	/* If we have a PVID, always operate in VLAN mode */
+ -	if (vsi->info.pvid)
+ -		return true;
+ +	struct i40e_mac_filter *f;
+  
+ -	/* We need to operate in VLAN mode whenever we have any filters with
+ -	 * a VLAN other than I40E_VLAN_ALL. We could check the table each
+ -	 * time, incurring search cost repeatedly. However, we can notice two
+ -	 * things:
+ -	 *
+ -	 * 1) the only place where we can gain a VLAN filter is in
+ -	 *    i40e_add_filter.
+ -	 *
+ -	 * 2) the only place where filters are actually removed is in
+ -	 *    i40e_sync_filters_subtask.
+ -	 *
+ -	 * Thus, we can simply use a boolean value, has_vlan_filters which we
+ -	 * will set to true when we add a VLAN filter in i40e_add_filter. Then
+ -	 * we have to perform the full search after deleting filters in
+ -	 * i40e_sync_filters_subtask, but we already have to search
+ -	 * filters here and can perform the check at the same time. This
+ -	 * results in avoiding embedding a loop for VLAN mode inside another
+ -	 * loop over all the filters, and should maintain correctness as noted
+ -	 * above.
+ +	/* Only -1 for all the filters denotes not in vlan mode
+ +	 * so we have to go through all the list in order to make sure
+  	 */
+ -	return vsi->has_vlan_filter;
+ +	list_for_each_entry(f, &vsi->mac_filter_list, list) {
+ +		if (f->vlan >= 0 || vsi->info.pvid)
+ +			return true;
+ +	}
+ +
+ +	return false;
+ +}
+ +
+ +/**
+ + * i40e_put_mac_in_vlan - Make macvlan filters from macaddrs and vlans
+ + * @vsi: the VSI to be searched
+ + * @macaddr: the mac address to be filtered
+ + * @is_vf: true if it is a VF
+ + * @is_netdev: true if it is a netdev
+ + *
+ + * Goes through all the macvlan filters and adds a
+ + * macvlan filter for each unique vlan that already exists
+ + *
+ + * Returns first filter found on success, else NULL
+ + **/
+ +struct i40e_mac_filter *i40e_put_mac_in_vlan(struct i40e_vsi *vsi, u8 *macaddr,
+ +					     bool is_vf, bool is_netdev)
+ +{
+ +	struct i40e_mac_filter *f;
+ +
+ +	list_for_each_entry(f, &vsi->mac_filter_list, list) {
+ +		if (vsi->info.pvid)
+ +			f->vlan = le16_to_cpu(vsi->info.pvid);
+ +		if (!i40e_find_filter(vsi, macaddr, f->vlan,
+ +				      is_vf, is_netdev)) {
+ +			if (!i40e_add_filter(vsi, macaddr, f->vlan,
+ +					     is_vf, is_netdev))
+ +				return NULL;
+ +		}
+ +	}
+ +
+ +	return list_first_entry_or_null(&vsi->mac_filter_list,
+ +					struct i40e_mac_filter, list);
+ +}
+ +
+ +/**
+ + * i40e_del_mac_all_vlan - Remove a MAC filter from all VLANS
+ + * @vsi: the VSI to be searched
+ + * @macaddr: the mac address to be removed
+ + * @is_vf: true if it is a VF
+ + * @is_netdev: true if it is a netdev
+ + *
+ + * Removes a given MAC address from a VSI, regardless of VLAN
+ + *
+ + * Returns 0 for success, or error
+ + **/
+ +int i40e_del_mac_all_vlan(struct i40e_vsi *vsi, u8 *macaddr,
+ +			  bool is_vf, bool is_netdev)
+ +{
+ +	struct i40e_mac_filter *f = NULL;
+ +	int changed = 0;
+ +
+ +	WARN(!spin_is_locked(&vsi->mac_filter_list_lock),
+ +	     "Missing mac_filter_list_lock\n");
+ +	list_for_each_entry(f, &vsi->mac_filter_list, list) {
+ +		if ((ether_addr_equal(macaddr, f->macaddr)) &&
+ +		    (is_vf == f->is_vf) &&
+ +		    (is_netdev == f->is_netdev)) {
+ +			f->counter--;
+ +			changed = 1;
+ +			if (f->counter == 0)
+ +				f->state = I40E_FILTER_REMOVE;
+ +		}
+ +	}
+ +	if (changed) {
+ +		vsi->flags |= I40E_VSI_FLAG_FILTER_CHANGED;
+ +		vsi->back->flags |= I40E_FLAG_FILTER_SYNC;
+ +		return 0;
+ +	}
+ +	return -ENOENT;
+  }
+  
++ /**
++  * i40e_rm_default_mac_filter - Remove the default MAC filter set by NVM
++  * @vsi: the PF Main VSI - inappropriate for any other VSI
++  * @macaddr: the MAC address
++  *
++  * Remove whatever filter the firmware set up so the driver can manage
++  * its own filtering intelligently.
++  **/
++ static void i40e_rm_default_mac_filter(struct i40e_vsi *vsi, u8 *macaddr)
++ {
++ 	struct i40e_aqc_remove_macvlan_element_data element;
++ 	struct i40e_pf *pf = vsi->back;
++ 
++ 	/* Only appropriate for the PF main VSI */
++ 	if (vsi->type != I40E_VSI_MAIN)
++ 		return;
++ 
++ 	memset(&element, 0, sizeof(element));
++ 	ether_addr_copy(element.mac_addr, macaddr);
++ 	element.vlan_tag = 0;
++ 	/* Ignore error returns, some firmware does it this way... */
++ 	element.flags = I40E_AQC_MACVLAN_DEL_PERFECT_MATCH;
++ 	i40e_aq_remove_macvlan(&pf->hw, vsi->seid, &element, 1, NULL);
++ 
++ 	memset(&element, 0, sizeof(element));
++ 	ether_addr_copy(element.mac_addr, macaddr);
++ 	element.vlan_tag = 0;
++ 	/* ...and some firmware does it this way. */
++ 	element.flags = I40E_AQC_MACVLAN_DEL_PERFECT_MATCH |
++ 			I40E_AQC_MACVLAN_DEL_IGNORE_VLAN;
++ 	i40e_aq_remove_macvlan(&pf->hw, vsi->seid, &element, 1, NULL);
++ }
++ 
+  /**
+   * i40e_add_filter - Add a mac/vlan filter to the VSI
+   * @vsi: the VSI to be searched
+@@@ -9255,9 -9328,15 +9288,21 @@@ static int i40e_config_netdev(struct i4
+  	if (vsi->type == I40E_VSI_MAIN) {
+  		SET_NETDEV_DEV(netdev, &pf->pdev->dev);
+  		ether_addr_copy(mac_addr, hw->mac.perm_addr);
+++<<<<<<< HEAD
+ +		spin_lock_bh(&vsi->mac_filter_list_lock);
+ +		i40e_add_filter(vsi, mac_addr, I40E_VLAN_ANY, false, true);
+ +		spin_unlock_bh(&vsi->mac_filter_list_lock);
+++=======
++ 		/* The following steps are necessary to prevent reception
++ 		 * of tagged packets - some older NVM configurations load a
++ 		 * default a MAC-VLAN filter that accepts any tagged packet
++ 		 * which must be replaced by a normal filter.
++ 		 */
++ 		i40e_rm_default_mac_filter(vsi, mac_addr);
++ 		spin_lock_bh(&vsi->mac_filter_hash_lock);
++ 		i40e_add_filter(vsi, mac_addr, I40E_VLAN_ANY);
++ 		spin_unlock_bh(&vsi->mac_filter_hash_lock);
+++>>>>>>> 1596b5ddbf25 (i40e: restore workaround for removing default MAC filter)
+  	} else {
+  		/* relate the VSI_VMDQ name to the VSI_MAIN name */
+  		snprintf(netdev->name, IFNAMSIZ, "%sv%%d",
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_main.c
