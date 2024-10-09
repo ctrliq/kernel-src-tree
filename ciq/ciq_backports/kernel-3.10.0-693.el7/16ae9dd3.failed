@@ -1,0 +1,125 @@
+scsi: aacraid: Fix for excessive prints on EEH
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] aacraid: Fix for excessive prints on EEH (Scott Benesh) [1384213]
+Rebuild_FUZZ: 93.02%
+commit-author Raghava Aditya Renukunta <RaghavaAditya.Renukunta@microsemi.com>
+commit 16ae9dd35d374182ce955063100fce66a9974e74
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/16ae9dd3.failed
+
+This issue showed up on a kdump debug(single CPU on powerkvm), when EEH
+errors rendered the adapter unusable. The driver correctly detected the
+issue and attempted to restart the controller, in doing so the driver
+attempted to read the status registers of the controller. This triggered
+additional eeh errors which continued for a good 6 minutes.
+
+Fixed by returning without waiting when EEH error is reported.
+
+	Signed-off-by: Raghava Aditya Renukunta <RaghavaAditya.Renukunta@microsemi.com>
+	Reviewed-by: David Carroll <David.Carroll@microsemi.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 16ae9dd35d374182ce955063100fce66a9974e74)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/aacraid/commsup.c
+diff --cc drivers/scsi/aacraid/commsup.c
+index 8317949d1445,a8dd4b51b086..000000000000
+--- a/drivers/scsi/aacraid/commsup.c
++++ b/drivers/scsi/aacraid/commsup.c
+@@@ -675,6 -735,87 +707,90 @@@ int aac_fib_send(u16 command, struct fi
+  		return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int aac_hba_send(u8 command, struct fib *fibptr, fib_callback callback,
++ 		void *callback_data)
++ {
++ 	struct aac_dev *dev = fibptr->dev;
++ 	int wait;
++ 	unsigned long flags = 0;
++ 	unsigned long mflags = 0;
++ 
++ 	fibptr->flags = (FIB_CONTEXT_FLAG | FIB_CONTEXT_FLAG_NATIVE_HBA);
++ 	if (callback) {
++ 		wait = 0;
++ 		fibptr->callback = callback;
++ 		fibptr->callback_data = callback_data;
++ 	} else
++ 		wait = 1;
++ 
++ 
++ 	if (command == HBA_IU_TYPE_SCSI_CMD_REQ) {
++ 		struct aac_hba_cmd_req *hbacmd =
++ 			(struct aac_hba_cmd_req *)fibptr->hw_fib_va;
++ 
++ 		hbacmd->iu_type = command;
++ 		/* bit1 of request_id must be 0 */
++ 		hbacmd->request_id =
++ 			cpu_to_le32((((u32)(fibptr - dev->fibs)) << 2) + 1);
++ 	} else
++ 		return -EINVAL;
++ 
++ 
++ 	if (wait) {
++ 		spin_lock_irqsave(&dev->manage_lock, mflags);
++ 		if (dev->management_fib_count >= AAC_NUM_MGT_FIB) {
++ 			spin_unlock_irqrestore(&dev->manage_lock, mflags);
++ 			return -EBUSY;
++ 		}
++ 		dev->management_fib_count++;
++ 		spin_unlock_irqrestore(&dev->manage_lock, mflags);
++ 		spin_lock_irqsave(&fibptr->event_lock, flags);
++ 	}
++ 
++ 	if (aac_adapter_deliver(fibptr) != 0) {
++ 		if (wait) {
++ 			spin_unlock_irqrestore(&fibptr->event_lock, flags);
++ 			spin_lock_irqsave(&dev->manage_lock, mflags);
++ 			dev->management_fib_count--;
++ 			spin_unlock_irqrestore(&dev->manage_lock, mflags);
++ 		}
++ 		return -EBUSY;
++ 	}
++ 	FIB_COUNTER_INCREMENT(aac_config.NativeSent);
++ 
++ 	if (wait) {
++ 
++ 		spin_unlock_irqrestore(&fibptr->event_lock, flags);
++ 
++ 		if (aac_check_eeh_failure(dev))
++ 			return -EFAULT;
++ 
++ 		/* Only set for first known interruptable command */
++ 		if (down_interruptible(&fibptr->event_wait)) {
++ 			fibptr->done = 2;
++ 			up(&fibptr->event_wait);
++ 		}
++ 		spin_lock_irqsave(&fibptr->event_lock, flags);
++ 		if ((fibptr->done == 0) || (fibptr->done == 2)) {
++ 			fibptr->done = 2; /* Tell interrupt we aborted */
++ 			spin_unlock_irqrestore(&fibptr->event_lock, flags);
++ 			return -ERESTARTSYS;
++ 		}
++ 		spin_unlock_irqrestore(&fibptr->event_lock, flags);
++ 		WARN_ON(fibptr->done == 0);
++ 
++ 		if (unlikely(fibptr->flags & FIB_CONTEXT_FLAG_TIMED_OUT))
++ 			return -ETIMEDOUT;
++ 
++ 		return 0;
++ 	}
++ 
++ 	return -EINPROGRESS;
++ }
++ 
+++>>>>>>> 16ae9dd35d37 (scsi: aacraid: Fix for excessive prints on EEH)
+  /**
+   *	aac_consumer_get	-	get the top of the queue
+   *	@dev: Adapter
+* Unmerged path drivers/scsi/aacraid/commsup.c
