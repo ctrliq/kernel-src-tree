@@ -1,0 +1,253 @@
+IB/core: Reduce the places that use zgid
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Parav Pandit <parav@mellanox.com>
+commit 25e62655c79395c596601a35805c3c7376d097b6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/25e62655.failed
+
+Instead of open coding memcmp() to check whether a given GID is zero or
+not, use a helper function to do so, and replace instances of
+memcpy(z,&zgid) with memset.
+
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 25e62655c79395c596601a35805c3c7376d097b6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/cache.c
+diff --cc drivers/infiniband/core/cache.c
+index 4c2ac07789ad,82699f70e9b6..000000000000
+--- a/drivers/infiniband/core/cache.c
++++ b/drivers/infiniband/core/cache.c
+@@@ -225,32 -209,77 +235,99 @@@ static int write_gid(struct ib_device *
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int add_gid(struct ib_device *ib_dev, u8 port,
+ +		   struct ib_gid_table *table, int ix,
+ +		   const union ib_gid *gid,
+ +		   const struct ib_gid_attr *attr,
+ +		   bool  default_gid) {
+ +	return write_gid(ib_dev, port, table, ix, gid, attr,
+ +			 GID_TABLE_WRITE_ACTION_ADD, default_gid);
+ +}
+ +
+ +static int modify_gid(struct ib_device *ib_dev, u8 port,
+ +		      struct ib_gid_table *table, int ix,
+ +		      const union ib_gid *gid,
+ +		      const struct ib_gid_attr *attr,
+ +		      bool  default_gid) {
+ +	return write_gid(ib_dev, port, table, ix, gid, attr,
+ +			 GID_TABLE_WRITE_ACTION_MODIFY, default_gid);
+++=======
++ /**
++  * add_modify_gid - Add or modify GID table entry
++  *
++  * @table:	GID table in which GID to be added or modified
++  * @gid:	GID content
++  * @attr:	Attributes of the GID
++  *
++  * Returns 0 on success or appropriate error code. It accepts zero
++  * GID addition for non RoCE ports for HCA's who report them as valid
++  * GID. However such zero GIDs are not added to the cache.
++  */
++ static int add_modify_gid(struct ib_gid_table *table,
++ 			  const union ib_gid *gid,
++ 			  const struct ib_gid_attr *attr)
++ {
++ 	int ret;
++ 
++ 	if (rdma_protocol_roce(attr->device, attr->port_num)) {
++ 		ret = add_roce_gid(table, gid, attr);
++ 		if (ret)
++ 			return ret;
++ 	} else {
++ 		/*
++ 		 * Some HCA's report multiple GID entries with only one
++ 		 * valid GID, but remaining as zero GID.
++ 		 * So ignore such behavior for IB link layer and don't
++ 		 * fail the call, but don't add such entry to GID cache.
++ 		 */
++ 		if (rdma_is_zero_gid(gid))
++ 			return 0;
++ 	}
++ 
++ 	lockdep_assert_held(&table->lock);
++ 	memcpy(&table->data_vec[attr->index].gid, gid, sizeof(*gid));
++ 	memcpy(&table->data_vec[attr->index].attr, attr, sizeof(*attr));
++ 
++ 	write_lock_irq(&table->rwlock);
++ 	table->data_vec[attr->index].props &= ~GID_TABLE_ENTRY_INVALID;
++ 	write_unlock_irq(&table->rwlock);
++ 	return 0;
++ }
++ 
++ /**
++  * del_gid - Delete GID table entry
++  *
++  * @ib_dev:	IB device whose GID entry to be deleted
++  * @port:	Port number of the IB device
++  * @table:	GID table of the IB device for a port
++  * @ix:		GID entry index to delete
++  *
++  */
++ static void del_gid(struct ib_device *ib_dev, u8 port,
++ 		    struct ib_gid_table *table, int ix)
++ {
++ 	lockdep_assert_held(&table->lock);
++ 	write_lock_irq(&table->rwlock);
++ 	table->data_vec[ix].props |= GID_TABLE_ENTRY_INVALID;
++ 	write_unlock_irq(&table->rwlock);
++ 
++ 	if (rdma_protocol_roce(ib_dev, port))
++ 		del_roce_gid(ib_dev, port, table, ix);
++ 	memset(&table->data_vec[ix].gid, 0, sizeof(table->data_vec[ix].gid));
++ 	memset(&table->data_vec[ix].attr, 0, sizeof(table->data_vec[ix].attr));
++ 	table->data_vec[ix].context = NULL;
+++>>>>>>> 25e62655c793 (IB/core: Reduce the places that use zgid)
+ +}
+ +
+ +static int del_gid(struct ib_device *ib_dev, u8 port,
+ +		   struct ib_gid_table *table, int ix,
+ +		   bool  default_gid) {
+ +	return write_gid(ib_dev, port, table, ix, &zgid, &zattr,
+ +			 GID_TABLE_WRITE_ACTION_DEL, default_gid);
+  }
+  
+ -/* rwlock should be read locked, or lock should be held */
+ +/* rwlock should be read locked */
+  static int find_gid(struct ib_gid_table *table, const union ib_gid *gid,
+  		    const struct ib_gid_attr *val, bool default_gid,
+  		    unsigned long mask, int *pempty)
+@@@ -310,6 -360,49 +387,52 @@@ static void make_default_gid(struct  ne
+  	addrconf_ifid_eui48(&gid->raw[8], dev);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int __ib_cache_gid_add(struct ib_device *ib_dev, u8 port,
++ 			      union ib_gid *gid, struct ib_gid_attr *attr,
++ 			      unsigned long mask, bool default_gid)
++ {
++ 	struct ib_gid_table *table;
++ 	int ret = 0;
++ 	int empty;
++ 	int ix;
++ 
++ 	/* Do not allow adding zero GID in support of
++ 	 * IB spec version 1.3 section 4.1.1 point (6) and
++ 	 * section 12.7.10 and section 12.7.20
++ 	 */
++ 	if (rdma_is_zero_gid(gid))
++ 		return -EINVAL;
++ 
++ 	table = ib_dev->cache.ports[port - rdma_start_port(ib_dev)].gid;
++ 
++ 	mutex_lock(&table->lock);
++ 
++ 	ix = find_gid(table, gid, attr, default_gid, mask, &empty);
++ 	if (ix >= 0)
++ 		goto out_unlock;
++ 
++ 	if (empty < 0) {
++ 		ret = -ENOSPC;
++ 		goto out_unlock;
++ 	}
++ 	attr->device = ib_dev;
++ 	attr->index = empty;
++ 	attr->port_num = port;
++ 	ret = add_modify_gid(table, gid, attr);
++ 	if (!ret)
++ 		dispatch_gid_change_event(ib_dev, port);
++ 
++ out_unlock:
++ 	mutex_unlock(&table->lock);
++ 	if (ret)
++ 		pr_warn("%s: unable to add gid %pI6 error=%d\n",
++ 			__func__, gid->raw, ret);
++ 	return ret;
++ }
++ 
+++>>>>>>> 25e62655c793 (IB/core: Reduce the places that use zgid)
+  int ib_cache_gid_add(struct ib_device *ib_dev, u8 port,
+  		     union ib_gid *gid, struct ib_gid_attr *attr)
+  {
+@@@ -646,16 -732,14 +769,23 @@@ static void cleanup_gid_table_port(stru
+  	if (!table)
+  		return;
+  
+ -	mutex_lock(&table->lock);
+ +	write_lock_irq(&table->rwlock);
+  	for (i = 0; i < table->sz; ++i) {
+++<<<<<<< HEAD
+ +		if (memcmp(&table->data_vec[i].gid, &zgid,
+ +			   sizeof(table->data_vec[i].gid)))
+ +			if (!del_gid(ib_dev, port, table, i,
+ +				     table->data_vec[i].props &
+ +				     GID_ATTR_FIND_MASK_DEFAULT))
+ +				deleted = true;
+++=======
++ 		if (!rdma_is_zero_gid(&table->data_vec[i].gid)) {
++ 			del_gid(ib_dev, port, table, i);
++ 			deleted = true;
++ 		}
+++>>>>>>> 25e62655c793 (IB/core: Reduce the places that use zgid)
+  	}
+ -	mutex_unlock(&table->lock);
+ +	write_unlock_irq(&table->rwlock);
+  
+  	if (deleted)
+  		dispatch_gid_change_event(ib_dev, port);
+* Unmerged path drivers/infiniband/core/cache.c
+diff --git a/drivers/infiniband/hw/mlx4/main.c b/drivers/infiniband/hw/mlx4/main.c
+index b4ccef5847bd..5073b5d046ec 100644
+--- a/drivers/infiniband/hw/mlx4/main.c
++++ b/drivers/infiniband/hw/mlx4/main.c
+@@ -276,7 +276,7 @@ static int mlx4_ib_add_gid(struct ib_device *device,
+ 			found = i;
+ 			break;
+ 		}
+-		if (free < 0 && !memcmp(&port_gid_table->gids[i].gid, &zgid, sizeof(*gid)))
++		if (free < 0 && rdma_is_zero_gid(&port_gid_table->gids[i].gid))
+ 			free = i; /* HW has space */
+ 	}
+ 
+@@ -348,7 +348,8 @@ static int mlx4_ib_del_gid(struct ib_device *device,
+ 		if (!ctx->refcount) {
+ 			unsigned int real_index = ctx->real_index;
+ 
+-			memcpy(&port_gid_table->gids[real_index].gid, &zgid, sizeof(zgid));
++			memset(&port_gid_table->gids[real_index].gid, 0,
++			       sizeof(port_gid_table->gids[real_index].gid));
+ 			kfree(port_gid_table->gids[real_index].ctx);
+ 			port_gid_table->gids[real_index].ctx = NULL;
+ 			hw_update = 1;
+diff --git a/drivers/infiniband/hw/mlx4/qp.c b/drivers/infiniband/hw/mlx4/qp.c
+index 353e43ad2e95..10e227a52561 100644
+--- a/drivers/infiniband/hw/mlx4/qp.c
++++ b/drivers/infiniband/hw/mlx4/qp.c
+@@ -3063,7 +3063,7 @@ static int fill_gid_by_hw_index(struct mlx4_ib_dev *ibdev, u8 port_num,
+ 	memcpy(gid, &port_gid_table->gids[index].gid, sizeof(*gid));
+ 	*gid_type = port_gid_table->gids[index].gid_type;
+ 	spin_unlock_irqrestore(&iboe->lock, flags);
+-	if (!memcmp(gid, &zgid, sizeof(*gid)))
++	if (rdma_is_zero_gid(gid))
+ 		return -ENOENT;
+ 
+ 	return 0;
+diff --git a/include/rdma/ib_cache.h b/include/rdma/ib_cache.h
+index eb49cc8d1f95..a5f249828115 100644
+--- a/include/rdma/ib_cache.h
++++ b/include/rdma/ib_cache.h
+@@ -149,4 +149,5 @@ int ib_get_cached_port_state(struct ib_device *device,
+ 			      u8                port_num,
+ 			      enum ib_port_state *port_active);
+ 
++bool rdma_is_zero_gid(const union ib_gid *gid);
+ #endif /* _IB_CACHE_H */
