@@ -1,0 +1,315 @@
+ext4: convert DAX faults to iomap infrastructure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jan Kara <jack@suse.cz>
+commit e2ae766c1b030271b5099b25674e2131d1d1e8c1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e2ae766c.failed
+
+Convert DAX faults to use iomap infrastructure. We would not have to start
+transaction in ext4_dax_fault() anymore since ext4_iomap_begin takes
+care of that but so far we do that to avoid lock inversion of
+transaction start with DAX entry lock which gets acquired in
+dax_iomap_fault() before calling ->iomap_begin handler.
+
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+(cherry picked from commit e2ae766c1b030271b5099b25674e2131d1d1e8c1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/file.c
+#	fs/ext4/inode.c
+diff --cc fs/ext4/file.c
+index db1bf9992414,b5f184493c57..000000000000
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@@ -256,9 -309,10 +256,16 @@@ static int ext4_dax_pmd_fault(struct vm
+  
+  	if (IS_ERR(handle))
+  		result = VM_FAULT_SIGBUS;
+++<<<<<<< HEAD
+ +	else
+ +		result = dax_pmd_fault(vma, addr, pmd, flags,
+ +				ext4_dax_get_block);
+++=======
++ 	else {
++ 		result = dax_iomap_pmd_fault(vma, addr, pmd, flags,
++ 					     &ext4_iomap_ops);
++ 	}
+++>>>>>>> e2ae766c1b03 (ext4: convert DAX faults to iomap infrastructure)
+  
+  	if (write) {
+  		if (!IS_ERR(handle))
+diff --cc fs/ext4/inode.c
+index f49ba18669c7,9de9a5a5d2a4..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -3024,92 -3279,191 +3024,190 @@@ static int ext4_releasepage(struct pag
+  		return try_to_free_buffers(page);
+  }
+  
+ -#ifdef CONFIG_FS_DAX
+  /*
+ - * Get block function for DAX IO and mmap faults. It takes care of converting
+ - * unwritten extents to written ones and initializes new / converted blocks
+ - * to zeros.
+ + * ext4_get_block used when preparing for a DIO write or buffer write.
+ + * We allocate an uinitialized extent if blocks haven't been allocated.
+ + * The extent will be converted to initialized after the IO is complete.
+   */
+ -int ext4_dax_get_block(struct inode *inode, sector_t iblock,
+ -		       struct buffer_head *bh_result, int create)
+ +int ext4_get_block_write(struct inode *inode, sector_t iblock,
+ +		   struct buffer_head *bh_result, int create)
+  {
+ -	int ret;
+ -
+ -	ext4_debug("inode %lu, create flag %d\n", inode->i_ino, create);
+ -	if (!create)
+ -		return _ext4_get_block(inode, iblock, bh_result, 0);
+ +	ext4_debug("ext4_get_block_write: inode %lu, create flag %d\n",
+ +		   inode->i_ino, create);
+ +	return _ext4_get_block(inode, iblock, bh_result,
+ +			       EXT4_GET_BLOCKS_IO_CREATE_EXT);
+ +}
+  
+ -	ret = ext4_get_block_trans(inode, iblock, bh_result,
+ -				   EXT4_GET_BLOCKS_PRE_IO |
+ -				   EXT4_GET_BLOCKS_CREATE_ZERO);
+ -	if (ret < 0)
+ -		return ret;
+ +static int ext4_get_block_overwrite(struct inode *inode, sector_t iblock,
+ +		   struct buffer_head *bh_result, int create)
+ +{
+ +	int ret;
+  
+ -	if (buffer_unwritten(bh_result)) {
+ -		/*
+ -		 * We are protected by i_mmap_sem or i_mutex so we know block
+ -		 * cannot go away from under us even though we dropped
+ -		 * i_data_sem. Convert extent to written and write zeros there.
+ -		 */
+ -		ret = ext4_get_block_trans(inode, iblock, bh_result,
+ -					   EXT4_GET_BLOCKS_CONVERT |
+ -					   EXT4_GET_BLOCKS_CREATE_ZERO);
+ -		if (ret < 0)
+ -			return ret;
+ -	}
+ +	ext4_debug("ext4_get_block_overwrite: inode %lu, create flag %d\n",
+ +		   inode->i_ino, create);
+ +	ret = _ext4_get_block(inode, iblock, bh_result, 0);
+  	/*
+ -	 * At least for now we have to clear BH_New so that DAX code
+ -	 * doesn't attempt to zero blocks again in a racy way.
+ +	 * Blocks should have been preallocated! ext4_file_write_iter() checks
+ +	 * that.
+  	 */
+ -	clear_buffer_new(bh_result);
+ -	return 0;
+ +	WARN_ON_ONCE(!buffer_mapped(bh_result));
+ +
+ +	return ret;
+  }
+  
+ -static int ext4_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
+ -			    unsigned flags, struct iomap *iomap)
+ +#ifdef CONFIG_FS_DAX
+ +/*
+ + * Get block function for DAX IO and mmap faults. It takes care of converting
+ + * unwritten extents to written ones and initializes new / converted blocks
+ + * to zeros.
+ + */
+ +int ext4_dax_get_block(struct inode *inode, sector_t iblock,
+ +		       struct buffer_head *bh_result, int create)
+  {
+ -	unsigned int blkbits = inode->i_blkbits;
+ -	unsigned long first_block = offset >> blkbits;
+ -	unsigned long last_block = (offset + length - 1) >> blkbits;
+ +	int ret, err;
+ +	int credits;
+  	struct ext4_map_blocks map;
+ -	int ret;
+ -
+ -	if (WARN_ON_ONCE(ext4_has_inline_data(inode)))
+ -		return -ERANGE;
+ -
+ -	map.m_lblk = first_block;
+ -	map.m_len = last_block - first_block + 1;
+ -
+ -	if (!(flags & IOMAP_WRITE)) {
+ -		ret = ext4_map_blocks(NULL, inode, &map, 0);
+ -	} else {
+ -		int dio_credits;
+ -		handle_t *handle;
+ -		int retries = 0;
+ +	handle_t *handle = NULL;
+ +	int retries = 0;
+ +	int flags = 0;
+  
+ -		/* Trim mapping request to maximum we can map at once for DIO */
+ -		if (map.m_len > DIO_MAX_BLOCKS)
+ -			map.m_len = DIO_MAX_BLOCKS;
+ -		dio_credits = ext4_chunk_trans_blocks(inode, map.m_len);
+ +	ext4_debug("inode %lu, create flag %d\n", inode->i_ino, create);
+ +	map.m_lblk = iblock;
+ +	map.m_len = bh_result->b_size >> inode->i_blkbits;
+ +	credits = ext4_chunk_trans_blocks(inode, map.m_len);
+  retry:
+ -		/*
+ -		 * Either we allocate blocks and then we don't get unwritten
+ -		 * extent so we have reserved enough credits, or the blocks
+ -		 * are already allocated and unwritten and in that case
+ -		 * extent conversion fits in the credits as well.
+ -		 */
+ -		handle = ext4_journal_start(inode, EXT4_HT_MAP_BLOCKS,
+ -					    dio_credits);
+ -		if (IS_ERR(handle))
+ -			return PTR_ERR(handle);
+ -
+ -		ret = ext4_map_blocks(handle, inode, &map,
+ -				      EXT4_GET_BLOCKS_CREATE_ZERO);
+ -		if (ret < 0) {
+ -			ext4_journal_stop(handle);
+ -			if (ret == -ENOSPC &&
+ -			    ext4_should_retry_alloc(inode->i_sb, &retries))
+ -				goto retry;
+ +	if (create) {
+ +		flags |= EXT4_GET_BLOCKS_CREATE_ZERO;
+ +		handle = ext4_journal_start(inode, EXT4_HT_MAP_BLOCKS, credits);
+ +		if (IS_ERR(handle)) {
+ +			ret = PTR_ERR(handle);
+  			return ret;
+  		}
+ +	}
+  
+ +	ret = ext4_map_blocks(handle, inode, &map, flags);
+ +	if (create) {
+ +		err = ext4_journal_stop(handle);
+ +		if (ret == -ENOSPC && ext4_should_retry_alloc(inode->i_sb, &retries))
+ +			goto retry;
+ +		if (ret >= 0 && err < 0)
+ +			ret = err;
+ +	}
+ +	if (ret <= 0)
+ +		goto out;
+ +out:
+ +	WARN_ON_ONCE(ret == 0 && create);
+ +	if (ret > 0) {
+ +		map_bh(bh_result, inode->i_sb, map.m_pblk);
+  		/*
+++<<<<<<< HEAD
+ +		 * At least for now we have to clear BH_New so that DAX code
+ +		 * doesn't attempt to zero blocks again in a racy way.
+ +		 */
+ +		map.m_flags &= ~EXT4_MAP_NEW;
+ +		ext4_update_bh_state(bh_result, map.m_flags);
+ +		bh_result->b_size = map.m_len << inode->i_blkbits;
+ +		ret = 0;
+ +	} else if (ret == 0) {
+ +		/* hole case, need to fill in bh->b_size */
+ +		bh_result->b_size = map.m_len << inode->i_blkbits;
+++=======
++ 		 * If we added blocks beyond i_size, we need to make sure they
++ 		 * will get truncated if we crash before updating i_size in
++ 		 * ext4_iomap_end(). For faults we don't need to do that (and
++ 		 * even cannot because for orphan list operations inode_lock is
++ 		 * required) - if we happen to instantiate block beyond i_size,
++ 		 * it is because we race with truncate which has already added
++ 		 * the inode to the orphan list.
++ 		 */
++ 		if (!(flags & IOMAP_FAULT) && first_block + map.m_len >
++ 		    (i_size_read(inode) + (1 << blkbits) - 1) >> blkbits) {
++ 			int err;
++ 
++ 			err = ext4_orphan_add(handle, inode);
++ 			if (err < 0) {
++ 				ext4_journal_stop(handle);
++ 				return err;
++ 			}
++ 		}
++ 		ext4_journal_stop(handle);
++ 	}
++ 
++ 	iomap->flags = 0;
++ 	iomap->bdev = inode->i_sb->s_bdev;
++ 	iomap->offset = first_block << blkbits;
++ 
++ 	if (ret == 0) {
++ 		iomap->type = IOMAP_HOLE;
++ 		iomap->blkno = IOMAP_NULL_BLOCK;
++ 		iomap->length = (u64)map.m_len << blkbits;
++ 	} else {
++ 		if (map.m_flags & EXT4_MAP_MAPPED) {
++ 			iomap->type = IOMAP_MAPPED;
++ 		} else if (map.m_flags & EXT4_MAP_UNWRITTEN) {
++ 			iomap->type = IOMAP_UNWRITTEN;
++ 		} else {
++ 			WARN_ON_ONCE(1);
++ 			return -EIO;
++ 		}
++ 		iomap->blkno = (sector_t)map.m_pblk << (blkbits - 9);
++ 		iomap->length = (u64)map.m_len << blkbits;
++ 	}
++ 
++ 	if (map.m_flags & EXT4_MAP_NEW)
++ 		iomap->flags |= IOMAP_F_NEW;
++ 	return 0;
++ }
++ 
++ static int ext4_iomap_end(struct inode *inode, loff_t offset, loff_t length,
++ 			  ssize_t written, unsigned flags, struct iomap *iomap)
++ {
++ 	int ret = 0;
++ 	handle_t *handle;
++ 	int blkbits = inode->i_blkbits;
++ 	bool truncate = false;
++ 
++ 	if (!(flags & IOMAP_WRITE) || (flags & IOMAP_FAULT))
++ 		return 0;
++ 
++ 	handle = ext4_journal_start(inode, EXT4_HT_INODE, 2);
++ 	if (IS_ERR(handle)) {
++ 		ret = PTR_ERR(handle);
++ 		goto orphan_del;
++ 	}
++ 	if (ext4_update_inode_size(inode, offset + written))
++ 		ext4_mark_inode_dirty(handle, inode);
++ 	/*
++ 	 * We may need to truncate allocated but not written blocks beyond EOF.
++ 	 */
++ 	if (iomap->offset + iomap->length > 
++ 	    ALIGN(inode->i_size, 1 << blkbits)) {
++ 		ext4_lblk_t written_blk, end_blk;
++ 
++ 		written_blk = (offset + written) >> blkbits;
++ 		end_blk = (offset + length) >> blkbits;
++ 		if (written_blk < end_blk && ext4_can_truncate(inode))
++ 			truncate = true;
++ 	}
++ 	/*
++ 	 * Remove inode from orphan list if we were extending a inode and
++ 	 * everything went fine.
++ 	 */
++ 	if (!truncate && inode->i_nlink &&
++ 	    !list_empty(&EXT4_I(inode)->i_orphan))
++ 		ext4_orphan_del(handle, inode);
++ 	ext4_journal_stop(handle);
++ 	if (truncate) {
++ 		ext4_truncate_failed_write(inode);
++ orphan_del:
++ 		/*
++ 		 * If truncate failed early the inode might still be on the
++ 		 * orphan list; we need to make sure the inode is removed from
++ 		 * the orphan list in that case.
++ 		 */
++ 		if (inode->i_nlink)
++ 			ext4_orphan_del(NULL, inode);
+++>>>>>>> e2ae766c1b03 (ext4: convert DAX faults to iomap infrastructure)
+  	}
+  	return ret;
+  }
+* Unmerged path fs/ext4/file.c
+* Unmerged path fs/ext4/inode.c
