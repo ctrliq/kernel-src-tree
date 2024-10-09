@@ -1,0 +1,187 @@
+IB/mlx5: Manage indirection mkey upon DEVX flow for ODP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Yishai Hadas <yishaih@mellanox.com>
+commit 534fd7aac56a7994d16032f32123def9923e339f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/534fd7aa.failed
+
+Manage indirection mkey upon DEVX flow to support ODP.
+
+To support a page fault event on the indirection mkey it needs to be part
+of the device mkey radix tree.
+
+Both the creation and the deletion flows for a DEVX object which is
+indirection mkey were adapted to handle that.
+
+	Signed-off-by: Yishai Hadas <yishaih@mellanox.com>
+	Reviewed-by: Artemy Kovalyov <artemyko@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 534fd7aac56a7994d16032f32123def9923e339f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/devx.c
+#	drivers/infiniband/hw/mlx5/main.c
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index e944c3c2b419,ae00f994673b..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -4821,12 -5620,115 +4821,21 @@@ static void mlx5_ib_cleanup_multiport_m
+  	mlx5_nic_vport_disable_roce(dev->mdev);
+  }
+  
+ -ADD_UVERBS_ATTRIBUTES_SIMPLE(
+ -	mlx5_ib_dm,
+ -	UVERBS_OBJECT_DM,
+ -	UVERBS_METHOD_DM_ALLOC,
+ -	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_ALLOC_DM_RESP_START_OFFSET,
+ -			    UVERBS_ATTR_TYPE(u64),
+ -			    UA_MANDATORY),
+ -	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_ALLOC_DM_RESP_PAGE_INDEX,
+ -			    UVERBS_ATTR_TYPE(u16),
+ -			    UA_MANDATORY));
+ -
+ -ADD_UVERBS_ATTRIBUTES_SIMPLE(
+ -	mlx5_ib_flow_action,
+ -	UVERBS_OBJECT_FLOW_ACTION,
+ -	UVERBS_METHOD_FLOW_ACTION_ESP_CREATE,
+ -	UVERBS_ATTR_FLAGS_IN(MLX5_IB_ATTR_CREATE_FLOW_ACTION_FLAGS,
+ -			     enum mlx5_ib_uapi_flow_action_flags));
+ -
+ -static const struct uapi_definition mlx5_ib_defs[] = {
+ -#if IS_ENABLED(CONFIG_INFINIBAND_USER_ACCESS)
+ -	UAPI_DEF_CHAIN(mlx5_ib_devx_defs),
+ -	UAPI_DEF_CHAIN(mlx5_ib_flow_defs),
+ -#endif
+ -
+ -	UAPI_DEF_CHAIN_OBJ_TREE(UVERBS_OBJECT_FLOW_ACTION,
+ -				&mlx5_ib_flow_action),
+ -	UAPI_DEF_CHAIN_OBJ_TREE(UVERBS_OBJECT_DM, &mlx5_ib_dm),
+ -	{}
+ -};
+ -
+ -static int mlx5_ib_read_counters(struct ib_counters *counters,
+ -				 struct ib_counters_read_attr *read_attr,
+ -				 struct uverbs_attr_bundle *attrs)
+ -{
+ -	struct mlx5_ib_mcounters *mcounters = to_mcounters(counters);
+ -	struct mlx5_read_counters_attr mread_attr = {};
+ -	struct mlx5_ib_flow_counters_desc *desc;
+ -	int ret, i;
+ -
+ -	mutex_lock(&mcounters->mcntrs_mutex);
+ -	if (mcounters->cntrs_max_index > read_attr->ncounters) {
+ -		ret = -EINVAL;
+ -		goto err_bound;
+ -	}
+ -
+ -	mread_attr.out = kcalloc(mcounters->counters_num, sizeof(u64),
+ -				 GFP_KERNEL);
+ -	if (!mread_attr.out) {
+ -		ret = -ENOMEM;
+ -		goto err_bound;
+ -	}
+ -
+ -	mread_attr.hw_cntrs_hndl = mcounters->hw_cntrs_hndl;
+ -	mread_attr.flags = read_attr->flags;
+ -	ret = mcounters->read_counters(counters->device, &mread_attr);
+ -	if (ret)
+ -		goto err_read;
+ -
+ -	/* do the pass over the counters data array to assign according to the
+ -	 * descriptions and indexing pairs
+ -	 */
+ -	desc = mcounters->counters_data;
+ -	for (i = 0; i < mcounters->ncounters; i++)
+ -		read_attr->counters_buff[desc[i].index] += mread_attr.out[desc[i].description];
+ -
+ -err_read:
+ -	kfree(mread_attr.out);
+ -err_bound:
+ -	mutex_unlock(&mcounters->mcntrs_mutex);
+ -	return ret;
+ -}
+ -
+ -static int mlx5_ib_destroy_counters(struct ib_counters *counters)
+ -{
+ -	struct mlx5_ib_mcounters *mcounters = to_mcounters(counters);
+ -
+ -	counters_clear_description(counters);
+ -	if (mcounters->hw_cntrs_hndl)
+ -		mlx5_fc_destroy(to_mdev(counters->device)->mdev,
+ -				mcounters->hw_cntrs_hndl);
+ -
+ -	kfree(mcounters);
+ -
+ -	return 0;
+ -}
+ -
+ -static struct ib_counters *mlx5_ib_create_counters(struct ib_device *device,
+ -						   struct uverbs_attr_bundle *attrs)
+ -{
+ -	struct mlx5_ib_mcounters *mcounters;
+ -
+ -	mcounters = kzalloc(sizeof(*mcounters), GFP_KERNEL);
+ -	if (!mcounters)
+ -		return ERR_PTR(-ENOMEM);
+ -
+ -	mutex_init(&mcounters->mcntrs_mutex);
+ -
+ -	return &mcounters->ibcntrs;
+ -}
+ -
+ -void mlx5_ib_stage_init_cleanup(struct mlx5_ib_dev *dev)
+ +static void mlx5_ib_stage_init_cleanup(struct mlx5_ib_dev *dev)
+  {
+  	mlx5_ib_cleanup_multiport_master(dev);
+++<<<<<<< HEAD
+ +#ifdef CONFIG_INFINIBAND_ON_DEMAND_PAGING
+ +	cleanup_srcu_struct(&dev->mr_srcu);
+ +#endif
+++=======
++ 	if (IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING)) {
++ 		srcu_barrier(&dev->mr_srcu);
++ 		cleanup_srcu_struct(&dev->mr_srcu);
++ 		drain_workqueue(dev->advise_mr_wq);
++ 		destroy_workqueue(dev->advise_mr_wq);
++ 	}
+++>>>>>>> 534fd7aac56a (IB/mlx5: Manage indirection mkey upon DEVX flow for ODP)
+  	kfree(dev->port);
+  }
+  
+* Unmerged path drivers/infiniband/hw/mlx5/devx.c
+* Unmerged path drivers/infiniband/hw/mlx5/devx.c
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 3c57e5c58ad3..796c1439e3fc 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -550,6 +550,12 @@ struct mlx5_ib_mw {
+ 	int			ndescs;
+ };
+ 
++struct mlx5_ib_devx_mr {
++	struct mlx5_core_mkey	mmkey;
++	int			ndescs;
++	struct rcu_head		rcu;
++};
++
+ struct mlx5_ib_umr_context {
+ 	struct ib_cqe		cqe;
+ 	enum ib_wc_status	status;
+diff --git a/include/linux/mlx5/driver.h b/include/linux/mlx5/driver.h
+index 56ff7cd06062..7e5422281bd9 100644
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -425,6 +425,7 @@ struct mlx5_core_sig_ctx {
+ enum {
+ 	MLX5_MKEY_MR = 1,
+ 	MLX5_MKEY_MW,
++	MLX5_MKEY_INDIRECT_DEVX,
+ };
+ 
+ struct mlx5_core_mkey {
