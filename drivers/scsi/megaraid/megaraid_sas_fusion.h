@@ -105,12 +105,6 @@ enum MR_RAID_FLAGS_IO_SUB_TYPE {
 #define JBOD_MAPS_COUNT	2
 #define IOC_INIT_FRAME_SIZE 4096
 
-enum MR_FUSION_ADAPTER_TYPE {
-	THUNDERBOLT_SERIES = 0,
-	INVADER_SERIES = 1,
-	VENTURA_SERIES = 2,
-};
-
 /*
  * Raid Context structure which describes MegaRAID specific IO Parameters
  * This resides at offset 0x60 where the SGL normally starts in MPT IO Frames
@@ -1320,7 +1314,6 @@ struct fusion_context {
 	struct LD_LOAD_BALANCE_INFO *load_balance_info;
 	u32 load_balance_info_pages;
 	LD_SPAN_INFO log_to_span[MAX_LOGICAL_DRIVES_EXT];
-	u8 adapter_type;
 	struct LD_STREAM_DETECT **stream_detect_by_ld;
 	struct megasas_cmd *ioc_init_cmd;
 };
