@@ -1,0 +1,143 @@
+NFSv4.1: nfs4_layoutget_handle_exception handle revoked state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Trond Myklebust <trond.myklebust@primarydata.com>
+commit 26f474432a7b4be336ed40d94f5a8245781cfc67
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/26f47443.failed
+
+Handle revoked open/lock/delegation stateids when LAYOUTGET tells us
+the state was revoked.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+	Tested-by: Oleg Drokin <green@linuxhacker.ru>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 26f474432a7b4be336ed40d94f5a8245781cfc67)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4proc.c
+diff --cc fs/nfs/nfs4proc.c
+index 070248688203,446de949f960..000000000000
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@@ -8126,76 -8254,57 +8126,83 @@@ static void nfs4_layoutget_done(struct 
+  	 * NFS4ERR_LAYOUTTRYLATER is a conflict with another client
+  	 * (or clients) writing to the same RAID stripe except when
+  	 * the minlength argument is 0 (see RFC5661 section 18.43.3).
+ -	 *
+ -	 * Treat it like we would RECALLCONFLICT -- we retry for a little
+ -	 * while, and then eventually give up.
+  	 */
+  	case -NFS4ERR_LAYOUTTRYLATER:
+ -		if (lgp->args.minlength == 0) {
+ -			status = -EOVERFLOW;
+ -			goto out;
+ -		}
+ -		status = -EBUSY;
+ -		break;
+ +		if (lgp->args.minlength == 0)
+ +			goto out_overflow;
+ +	/*
+ +	 * NFS4ERR_RECALLCONFLICT is when conflict with self (must recall
+ +	 * existing layout before getting a new one).
+ +	 */
+  	case -NFS4ERR_RECALLCONFLICT:
+ -		status = -ERECALLCONFLICT;
+ +		timeo = rpc_get_timeout(task->tk_client);
+ +		giveup = lgp->args.timestamp + timeo;
+ +		now = jiffies;
+ +		if (time_after(giveup, now)) {
+ +			unsigned long delay;
+ +
+ +			/* Delay for:
+ +			 * - Not less then NFS4_POLL_RETRY_MIN.
+ +			 * - One last time a jiffie before we give up
+ +			 * - exponential backoff (time_now minus start_attempt)
+ +			 */
+ +			delay = max_t(unsigned long, NFS4_POLL_RETRY_MIN,
+ +				    min((giveup - now - 1),
+ +					now - lgp->args.timestamp));
+ +
+ +			dprintk("%s: NFS4ERR_RECALLCONFLICT waiting %lu\n",
+ +				__func__, delay);
+ +			rpc_delay(task, delay);
+ +			/* Do not call nfs4_async_handle_error() */
+ +			goto out_restart;
+ +		}
+  		break;
++ 	case -NFS4ERR_DELEG_REVOKED:
++ 	case -NFS4ERR_ADMIN_REVOKED:
+  	case -NFS4ERR_EXPIRED:
+  	case -NFS4ERR_BAD_STATEID:
+ -		exception->timeout = 0;
+  		spin_lock(&inode->i_lock);
+ -		lo = NFS_I(inode)->layout;
+ -		/* If the open stateid was bad, then recover it. */
+ -		if (!lo || test_bit(NFS_LAYOUT_INVALID_STID, &lo->plh_flags) ||
+ -		    nfs4_stateid_match_other(&lgp->args.stateid,
+ +		if (nfs4_stateid_match(&lgp->args.stateid,
+  					&lgp->args.ctx->state->stateid)) {
+  			spin_unlock(&inode->i_lock);
+++<<<<<<< HEAD
+ +			/* If the open stateid was bad, then recover it. */
+ +			state = lgp->args.ctx->state;
+++=======
++ 			exception->state = lgp->args.ctx->state;
++ 			exception->stateid = &lgp->args.stateid;
+++>>>>>>> 26f474432a7b (NFSv4.1: nfs4_layoutget_handle_exception handle revoked state)
+  			break;
+  		}
+ -
+ -		/*
+ -		 * Mark the bad layout state as invalid, then retry
+ -		 */
+ -		pnfs_mark_layout_stateid_invalid(lo, &head);
+ -		spin_unlock(&inode->i_lock);
+ -		pnfs_free_lseg_list(&head);
+ -		status = -EAGAIN;
+ -		goto out;
+ -	}
+ -
+ -	err = nfs4_handle_exception(server, nfs4err, exception);
+ -	if (!status) {
+ -		if (exception->retry)
+ -			status = -EAGAIN;
+ -		else
+ -			status = err;
+ +		lo = NFS_I(inode)->layout;
+ +		if (lo && nfs4_stateid_match(&lgp->args.stateid,
+ +					&lo->plh_stateid)) {
+ +			LIST_HEAD(head);
+ +
+ +			/*
+ +			 * Mark the bad layout state as invalid, then retry
+ +			 * with the current stateid.
+ +			 */
+ +			set_bit(NFS_LAYOUT_INVALID_STID, &lo->plh_flags);
+ +			pnfs_mark_matching_lsegs_invalid(lo, &head, NULL);
+ +			spin_unlock(&inode->i_lock);
+ +			pnfs_free_lseg_list(&head);
+ +		} else
+ +			spin_unlock(&inode->i_lock);
+ +		goto out_restart;
+  	}
+ +	if (nfs4_async_handle_error(task, server, state, &lgp->timeout) == -EAGAIN)
+ +		goto out_restart;
+  out:
+  	dprintk("<-- %s\n", __func__);
+ -	return status;
+ +	return;
+ +out_restart:
+ +	task->tk_status = 0;
+ +	rpc_restart_call_prepare(task);
+ +	return;
+ +out_overflow:
+ +	task->tk_status = -EOVERFLOW;
+ +	goto out;
+  }
+  
+  static size_t max_response_pages(struct nfs_server *server)
+* Unmerged path fs/nfs/nfs4proc.c
