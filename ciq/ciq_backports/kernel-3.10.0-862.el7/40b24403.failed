@@ -1,0 +1,185 @@
+mlx5: support ->get_vector_affinity
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Sagi Grimberg <sagi@grimberg.me>
+commit 40b24403f33ed8e9401b087e25f46d002fc8f396
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/40b24403.failed
+
+Simply refer to the generic affinity mask helper.
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Acked-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 40b24403f33ed8e9401b087e25f46d002fc8f396)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/main.c
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index 278c0964f404,a6d3bcfbf229..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -3287,6 -3429,141 +3287,144 @@@ dealloc_counters
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct rdma_hw_stats *mlx5_ib_alloc_hw_stats(struct ib_device *ibdev,
++ 						    u8 port_num)
++ {
++ 	struct mlx5_ib_dev *dev = to_mdev(ibdev);
++ 	struct mlx5_ib_port *port = &dev->port[port_num - 1];
++ 
++ 	/* We support only per port stats */
++ 	if (port_num == 0)
++ 		return NULL;
++ 
++ 	return rdma_alloc_hw_stats_struct(port->cnts.names,
++ 					  port->cnts.num_q_counters +
++ 					  port->cnts.num_cong_counters,
++ 					  RDMA_HW_STATS_DEFAULT_LIFESPAN);
++ }
++ 
++ static int mlx5_ib_query_q_counters(struct mlx5_ib_dev *dev,
++ 				    struct mlx5_ib_port *port,
++ 				    struct rdma_hw_stats *stats)
++ {
++ 	int outlen = MLX5_ST_SZ_BYTES(query_q_counter_out);
++ 	void *out;
++ 	__be32 val;
++ 	int ret, i;
++ 
++ 	out = kvzalloc(outlen, GFP_KERNEL);
++ 	if (!out)
++ 		return -ENOMEM;
++ 
++ 	ret = mlx5_core_query_q_counter(dev->mdev,
++ 					port->cnts.set_id, 0,
++ 					out, outlen);
++ 	if (ret)
++ 		goto free;
++ 
++ 	for (i = 0; i < port->cnts.num_q_counters; i++) {
++ 		val = *(__be32 *)(out + port->cnts.offsets[i]);
++ 		stats->value[i] = (u64)be32_to_cpu(val);
++ 	}
++ 
++ free:
++ 	kvfree(out);
++ 	return ret;
++ }
++ 
++ static int mlx5_ib_query_cong_counters(struct mlx5_ib_dev *dev,
++ 				       struct mlx5_ib_port *port,
++ 				       struct rdma_hw_stats *stats)
++ {
++ 	int outlen = MLX5_ST_SZ_BYTES(query_cong_statistics_out);
++ 	void *out;
++ 	int ret, i;
++ 	int offset = port->cnts.num_q_counters;
++ 
++ 	out = kvzalloc(outlen, GFP_KERNEL);
++ 	if (!out)
++ 		return -ENOMEM;
++ 
++ 	ret = mlx5_cmd_query_cong_counter(dev->mdev, false, out, outlen);
++ 	if (ret)
++ 		goto free;
++ 
++ 	for (i = 0; i < port->cnts.num_cong_counters; i++) {
++ 		stats->value[i + offset] =
++ 			be64_to_cpup((__be64 *)(out +
++ 				     port->cnts.offsets[i + offset]));
++ 	}
++ 
++ free:
++ 	kvfree(out);
++ 	return ret;
++ }
++ 
++ static int mlx5_ib_get_hw_stats(struct ib_device *ibdev,
++ 				struct rdma_hw_stats *stats,
++ 				u8 port_num, int index)
++ {
++ 	struct mlx5_ib_dev *dev = to_mdev(ibdev);
++ 	struct mlx5_ib_port *port = &dev->port[port_num - 1];
++ 	int ret, num_counters;
++ 
++ 	if (!stats)
++ 		return -EINVAL;
++ 
++ 	ret = mlx5_ib_query_q_counters(dev, port, stats);
++ 	if (ret)
++ 		return ret;
++ 	num_counters = port->cnts.num_q_counters;
++ 
++ 	if (MLX5_CAP_GEN(dev->mdev, cc_query_allowed)) {
++ 		ret = mlx5_ib_query_cong_counters(dev, port, stats);
++ 		if (ret)
++ 			return ret;
++ 		num_counters += port->cnts.num_cong_counters;
++ 	}
++ 
++ 	return num_counters;
++ }
++ 
++ static void mlx5_ib_free_rdma_netdev(struct net_device *netdev)
++ {
++ 	return mlx5_rdma_netdev_free(netdev);
++ }
++ 
++ static struct net_device*
++ mlx5_ib_alloc_rdma_netdev(struct ib_device *hca,
++ 			  u8 port_num,
++ 			  enum rdma_netdev_t type,
++ 			  const char *name,
++ 			  unsigned char name_assign_type,
++ 			  void (*setup)(struct net_device *))
++ {
++ 	struct net_device *netdev;
++ 	struct rdma_netdev *rn;
++ 
++ 	if (type != RDMA_NETDEV_IPOIB)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	netdev = mlx5_rdma_netdev_alloc(to_mdev(hca)->mdev, hca,
++ 					name, setup);
++ 	if (likely(!IS_ERR_OR_NULL(netdev))) {
++ 		rn = netdev_priv(netdev);
++ 		rn->free_rdma_netdev = mlx5_ib_free_rdma_netdev;
++ 	}
++ 	return netdev;
++ }
++ 
++ const struct cpumask *mlx5_ib_get_vector_affinity(struct ib_device *ibdev,
++ 		int comp_vector)
++ {
++ 	struct mlx5_ib_dev *dev = to_mdev(ibdev);
++ 
++ 	return mlx5_get_vector_affinity(dev->mdev, comp_vector);
++ }
++ 
+++>>>>>>> 40b24403f33e (mlx5: support ->get_vector_affinity)
+  static void *mlx5_ib_add(struct mlx5_core_dev *mdev)
+  {
+  	struct mlx5_ib_dev *dev;
+@@@ -3419,6 -3694,10 +3557,13 @@@
+  	dev->ib_dev.check_mr_status	= mlx5_ib_check_mr_status;
+  	dev->ib_dev.get_port_immutable  = mlx5_port_immutable;
+  	dev->ib_dev.get_dev_fw_str      = get_dev_fw_str;
+++<<<<<<< HEAD
+++=======
++ 	dev->ib_dev.get_vector_affinity	= mlx5_ib_get_vector_affinity;
++ 	if (MLX5_CAP_GEN(mdev, ipoib_enhanced_offloads))
++ 		dev->ib_dev.alloc_rdma_netdev	= mlx5_ib_alloc_rdma_netdev;
++ 
+++>>>>>>> 40b24403f33e (mlx5: support ->get_vector_affinity)
+  	if (mlx5_core_is_pf(mdev)) {
+  		dev->ib_dev.get_vf_config	= mlx5_ib_get_vf_config;
+  		dev->ib_dev.set_vf_link_state	= mlx5_ib_set_vf_link_state;
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
