@@ -1,0 +1,260 @@
+locking/rwsem: Scan the wait_list for readers only once
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Davidlohr Bueso <dave@stgolabs.net>
+commit 70800c3c0cc525baa38fd0fe4660f2c27f1bfeeb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/70800c3c.failed
+
+When wanting to wakeup readers, __rwsem_mark_wakeup() currently
+iterates the wait_list twice while looking to wakeup the first N
+queued reader-tasks. While this can be quite inefficient, it was
+there such that a awoken reader would be first and foremost
+acknowledged by the lock counter.
+
+Keeping the same logic, we can further benefit from the use of
+wake_qs and avoid entirely the first wait_list iteration that sets
+the counter as wake_up_process() isn't going to occur right away,
+and therefore we maintain the counter->list order of going about
+things.
+
+Other than saving cycles with O(n) "scanning", this change also
+nicely cleans up a good chunk of __rwsem_mark_wakeup(); both
+visually and less tedious to read.
+
+For example, the following improvements where seen on some will
+it scale microbenchmarks, on a 48-core Haswell:
+
+                                       v4.7              v4.7-rwsem-v1
+  Hmean    signal1-processes-8    5792691.42 (  0.00%)  5771971.04 ( -0.36%)
+  Hmean    signal1-processes-12   6081199.96 (  0.00%)  6072174.38 ( -0.15%)
+  Hmean    signal1-processes-21   3071137.71 (  0.00%)  3041336.72 ( -0.97%)
+  Hmean    signal1-processes-48   3712039.98 (  0.00%)  3708113.59 ( -0.11%)
+  Hmean    signal1-processes-79   4464573.45 (  0.00%)  4682798.66 (  4.89%)
+  Hmean    signal1-processes-110  4486842.01 (  0.00%)  4633781.71 (  3.27%)
+  Hmean    signal1-processes-141  4611816.83 (  0.00%)  4692725.38 (  1.75%)
+  Hmean    signal1-processes-172  4638157.05 (  0.00%)  4714387.86 (  1.64%)
+  Hmean    signal1-processes-203  4465077.80 (  0.00%)  4690348.07 (  5.05%)
+  Hmean    signal1-processes-224  4410433.74 (  0.00%)  4687534.43 (  6.28%)
+
+  Stddev   signal1-processes-8       6360.47 (  0.00%)     8455.31 ( 32.94%)
+  Stddev   signal1-processes-12      4004.98 (  0.00%)     9156.13 (128.62%)
+  Stddev   signal1-processes-21      3273.14 (  0.00%)     5016.80 ( 53.27%)
+  Stddev   signal1-processes-48     28420.25 (  0.00%)    26576.22 ( -6.49%)
+  Stddev   signal1-processes-79     22038.34 (  0.00%)    18992.70 (-13.82%)
+  Stddev   signal1-processes-110    23226.93 (  0.00%)    17245.79 (-25.75%)
+  Stddev   signal1-processes-141     6358.98 (  0.00%)     7636.14 ( 20.08%)
+  Stddev   signal1-processes-172     9523.70 (  0.00%)     4824.75 (-49.34%)
+  Stddev   signal1-processes-203    13915.33 (  0.00%)     9326.33 (-32.98%)
+  Stddev   signal1-processes-224    15573.94 (  0.00%)    10613.82 (-31.85%)
+
+Other runs that saw improvements include context_switch and pipe; and
+as expected, this is particularly highlighted on larger thread counts
+as it becomes more expensive to walk the list twice.
+
+No change in wakeup ordering or semantics.
+
+	Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Waiman.Long@hp.com
+	Cc: dave@stgolabs.net
+	Cc: jason.low2@hpe.com
+	Cc: wanpeng.li@hotmail.com
+Link: http://lkml.kernel.org/r/1470384285-32163-4-git-send-email-dave@stgolabs.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 70800c3c0cc525baa38fd0fe4660f2c27f1bfeeb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/rwsem.c
+diff --cc lib/rwsem.c
+index 09d8c2da4ff3,2337b4bb2366..000000000000
+--- a/lib/rwsem.c
++++ b/lib/rwsem.c
+@@@ -113,31 -114,43 +113,43 @@@ enum rwsem_wake_type 
+   *   - the 'active part' of count (&0x0000ffff) reached 0 (but may have changed)
+   *   - the 'waiting part' of count (&0xffff0000) is -ve (and will still be so)
+   * - there must be someone on the queue
+ - * - the wait_lock must be held by the caller
+ - * - tasks are marked for wakeup, the caller must later invoke wake_up_q()
+ - *   to actually wakeup the blocked task(s) and drop the reference count,
+ - *   preferably when the wait_lock is released
+ + * - the spinlock must be held by the caller
+   * - woken process blocks are discarded from the list after having task zeroed
+ - * - writers are only marked woken if downgrading is false
+ + * - writers are only woken if downgrading is false
+   */
+ -static void __rwsem_mark_wake(struct rw_semaphore *sem,
+ -			      enum rwsem_wake_type wake_type,
+ -			      struct wake_q_head *wake_q)
+ +static struct rw_semaphore *
+ +__rwsem_do_wake(struct rw_semaphore *sem, enum rwsem_wake_type wake_type)
+  {
+++<<<<<<< HEAD:lib/rwsem.c
+ +	struct rwsem_waiter *waiter;
+ +	struct task_struct *tsk;
+ +	struct list_head *next;
+ +	long oldcount, woken, loop, adjustment;
+ +
+ +	waiter = list_entry(sem->wait_list.next, struct rwsem_waiter, list);
+++=======
++ 	struct rwsem_waiter *waiter, *tmp;
++ 	long oldcount, woken = 0, adjustment = 0;
++ 
++ 	/*
++ 	 * Take a peek at the queue head waiter such that we can determine
++ 	 * the wakeup(s) to perform.
++ 	 */
++ 	waiter = list_first_entry(&sem->wait_list, struct rwsem_waiter, list);
++ 
+++>>>>>>> 70800c3c0cc5 (locking/rwsem: Scan the wait_list for readers only once):kernel/locking/rwsem-xadd.c
+  	if (waiter->type == RWSEM_WAITING_FOR_WRITE) {
+ -		if (wake_type == RWSEM_WAKE_ANY) {
+ -			/*
+ -			 * Mark writer at the front of the queue for wakeup.
+ -			 * Until the task is actually later awoken later by
+ -			 * the caller, other writers are able to steal it.
+ -			 * Readers, on the other hand, will block as they
+ -			 * will notice the queued writer.
+ +		if (wake_type == RWSEM_WAKE_ANY)
+ +			/* Wake writer at the front of the queue, but do not
+ +			 * grant it the lock yet as we want other writers
+ +			 * to be able to steal it.  Readers, on the other hand,
+ +			 * will block as they will notice the queued writer.
+  			 */
+ -			wake_q_add(wake_q, waiter->task);
+ -		}
+ -
+ -		return;
+ +			wake_up_process(waiter->task);
+ +		goto out;
+  	}
+  
+ -	/*
+ -	 * Writers might steal the lock before we grant it to the next reader.
+ +	/* Writers might steal the lock before we grant it to the next reader.
+  	 * We prefer to do the first reader grant before counting readers
+  	 * so we can bail out early if a writer stole the lock.
+  	 */
+@@@ -154,56 -172,48 +166,89 @@@
+  			/* Last active locker left. Retry waking readers. */
+  			goto try_reader_grant;
+  		}
+ -		/*
+ -		 * It is not really necessary to set it to reader-owned here,
+ -		 * but it gives the spinners an early indication that the
+ -		 * readers now have the lock.
+ -		 */
+ -		rwsem_set_reader_owned(sem);
+  	}
+  
+++<<<<<<< HEAD:lib/rwsem.c
+ +	/* Grant an infinite number of read locks to the readers at the front
+ +	 * of the queue.  Note we increment the 'active part' of the count by
+ +	 * the number of readers before waking any processes up.
+ +	 */
+ +	woken = 0;
+ +	do {
+ +		woken++;
+++=======
++ 	/*
++ 	 * Grant an infinite number of read locks to the readers at the front
++ 	 * of the queue. We know that woken will be at least 1 as we accounted
++ 	 * for above. Note we increment the 'active part' of the count by the
++ 	 * number of readers before waking any processes up.
++ 	 */
++ 	list_for_each_entry_safe(waiter, tmp, &sem->wait_list, list) {
++ 		struct task_struct *tsk;
+++>>>>>>> 70800c3c0cc5 (locking/rwsem: Scan the wait_list for readers only once):kernel/locking/rwsem-xadd.c
+  
+- 		if (waiter->list.next == &sem->wait_list)
++ 		if (waiter->type == RWSEM_WAITING_FOR_WRITE)
+  			break;
+  
+++<<<<<<< HEAD:lib/rwsem.c
+ +		waiter = list_entry(waiter->list.next,
+ +					struct rwsem_waiter, list);
+ +
+ +	} while (waiter->type != RWSEM_WAITING_FOR_WRITE);
+ +
+ +	adjustment = woken * RWSEM_ACTIVE_READ_BIAS - adjustment;
+ +	if (waiter->type != RWSEM_WAITING_FOR_WRITE)
+ +		/* hit end of list above */
+ +		adjustment -= RWSEM_WAITING_BIAS;
+ +
+ +	if (adjustment)
+ +		rwsem_atomic_add(adjustment, sem);
+ +
+ +	next = sem->wait_list.next;
+ +	loop = woken;
+ +	do {
+ +		waiter = list_entry(next, struct rwsem_waiter, list);
+ +		next = waiter->list.next;
+ +		tsk = waiter->task;
+++=======
++ 		woken++;
++ 		tsk = waiter->task;
++ 
++ 		wake_q_add(wake_q, tsk);
++ 		list_del(&waiter->list);
+++>>>>>>> 70800c3c0cc5 (locking/rwsem: Scan the wait_list for readers only once):kernel/locking/rwsem-xadd.c
+  		/*
+ -		 * Ensure that the last operation is setting the reader
+ -		 * waiter to nil such that rwsem_down_read_failed() cannot
+ -		 * race with do_exit() by always holding a reference count
+ -		 * to the task to wakeup.
+ +		 * Make sure we do not wakeup the next reader before
+ +		 * setting the nil condition to grant the next reader;
+ +		 * otherwise we could miss the wakeup on the other
+ +		 * side and end up sleeping again. See the pairing
+ +		 * in rwsem_down_read_failed().
+  		 */
+++<<<<<<< HEAD:lib/rwsem.c
+ +		smp_mb();
+ +		waiter->task = NULL;
+ +		wake_up_process(tsk);
+ +		put_task_struct(tsk);
+ +	} while (--loop);
+ +
+ +	sem->wait_list.next = next;
+ +	next->prev = &sem->wait_list;
+ +
+ + out:
+ +	return sem;
+++=======
++ 		smp_store_release(&waiter->task, NULL);
++ 	}
++ 
++ 	adjustment = woken * RWSEM_ACTIVE_READ_BIAS - adjustment;
++ 	if (list_empty(&sem->wait_list)) {
++ 		/* hit end of list above */
++ 		adjustment -= RWSEM_WAITING_BIAS;
++ 	}
++ 
++ 	if (adjustment)
++ 		atomic_long_add(adjustment, &sem->count);
+++>>>>>>> 70800c3c0cc5 (locking/rwsem: Scan the wait_list for readers only once):kernel/locking/rwsem-xadd.c
+  }
+  
+  /*
+@@@ -227,9 -236,10 +272,10 @@@ struct rw_semaphore __sched *rwsem_down
+  	list_add_tail(&waiter.list, &sem->wait_list);
+  
+  	/* we're now waiting on the lock, but no longer actively locking */
+ -	count = atomic_long_add_return(adjustment, &sem->count);
+ +	count = rwsem_atomic_update(adjustment, sem);
+  
+- 	/* If there are no active locks, wake the front queued process(es).
++ 	/*
++ 	 * If there are no active locks, wake the front queued process(es).
+  	 *
+  	 * If there are no writers and we are first in the queue,
+  	 * wake our own waiter to join the existing active readers !
+* Unmerged path lib/rwsem.c
