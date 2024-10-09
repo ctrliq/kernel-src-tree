@@ -1,0 +1,222 @@
+fs: add mode_strip_sgid() helper
+
+jira LE-1907
+cve CVE-2021-4037
+cve CVE-2018-13405
+Rebuild_History Non-Buildable kernel-3.10.0-1160.88.1.el7
+commit-author Yang Xu <xuyang2018.jy@fujitsu.com>
+commit 2b3416ceff5e6bd4922f6d1c61fb68113dd82302
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.88.1.el7/2b3416ce.failed
+
+Add a dedicated helper to handle the setgid bit when creating a new file
+in a setgid directory. This is a preparatory patch for moving setgid
+stripping into the vfs. The patch contains no functional changes.
+
+Currently the setgid stripping logic is open-coded directly in
+inode_init_owner() and the individual filesystems are responsible for
+handling setgid inheritance. Since this has proven to be brittle as
+evidenced by old issues we uncovered over the last months (see [1] to
+[3] below) we will try to move this logic into the vfs.
+
+Link: e014f37db1a2 ("xfs: use setattr_copy to set vfs inode attributes") [1]
+Link: 01ea173e103e ("xfs: fix up non-directory creation in SGID directories") [2]
+Link: fd84bfdddd16 ("ceph: fix up non-directory creation in SGID directories") [3]
+Link: https://lore.kernel.org/r/1657779088-2242-1-git-send-email-xuyang2018.jy@fujitsu.com
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+	Reviewed-by: Christian Brauner (Microsoft) <brauner@kernel.org>
+Reviewed-and-Tested-by: Jeff Layton <jlayton@kernel.org>
+	Signed-off-by: Yang Xu <xuyang2018.jy@fujitsu.com>
+	Signed-off-by: Christian Brauner (Microsoft) <brauner@kernel.org>
+(cherry picked from commit 2b3416ceff5e6bd4922f6d1c61fb68113dd82302)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/inode.c
+#	include/linux/fs.h
+diff --cc fs/inode.c
+index 2496f1be87e6,71b36afc3893..000000000000
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@@ -2015,12 -2246,10 +2015,17 @@@ void inode_init_owner(struct inode *ino
+  		/* Directories are special, and always inherit S_ISGID */
+  		if (S_ISDIR(mode))
+  			mode |= S_ISGID;
+++<<<<<<< HEAD
+ +		else if ((mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP) &&
+ +			 !in_group_p(inode->i_gid) &&
+ +			 !capable_wrt_inode_uidgid(dir, CAP_FSETID))
+ +			mode &= ~S_ISGID;
+++=======
++ 		else
++ 			mode = mode_strip_sgid(mnt_userns, dir, mode);
+++>>>>>>> 2b3416ceff5e (fs: add mode_strip_sgid() helper)
+  	} else
+ -		inode_fsgid_set(inode, mnt_userns);
+ +		inode->i_gid = current_fsgid();
+  	inode->i_mode = mode;
+  }
+  EXPORT_SYMBOL(inode_init_owner);
+@@@ -2110,13 -2337,99 +2115,108 @@@ EXPORT_SYMBOL(inode_dio_done)
+  void inode_set_flags(struct inode *inode, unsigned int flags,
+  		     unsigned int mask)
+  {
+ +	unsigned int old_flags, new_flags;
+ +
+  	WARN_ON_ONCE(flags & ~mask);
+ -	set_mask_bits(&inode->i_flags, mask, flags);
+ +	do {
+ +		old_flags = ACCESS_ONCE(inode->i_flags);
+ +		new_flags = (old_flags & ~mask) | flags;
+ +	} while (unlikely(cmpxchg(&inode->i_flags, old_flags,
+ +				  new_flags) != old_flags));
+  }
+  EXPORT_SYMBOL(inode_set_flags);
+++<<<<<<< HEAD
+++=======
++ 
++ void inode_nohighmem(struct inode *inode)
++ {
++ 	mapping_set_gfp_mask(inode->i_mapping, GFP_USER);
++ }
++ EXPORT_SYMBOL(inode_nohighmem);
++ 
++ /**
++  * timestamp_truncate - Truncate timespec to a granularity
++  * @t: Timespec
++  * @inode: inode being updated
++  *
++  * Truncate a timespec to the granularity supported by the fs
++  * containing the inode. Always rounds down. gran must
++  * not be 0 nor greater than a second (NSEC_PER_SEC, or 10^9 ns).
++  */
++ struct timespec64 timestamp_truncate(struct timespec64 t, struct inode *inode)
++ {
++ 	struct super_block *sb = inode->i_sb;
++ 	unsigned int gran = sb->s_time_gran;
++ 
++ 	t.tv_sec = clamp(t.tv_sec, sb->s_time_min, sb->s_time_max);
++ 	if (unlikely(t.tv_sec == sb->s_time_max || t.tv_sec == sb->s_time_min))
++ 		t.tv_nsec = 0;
++ 
++ 	/* Avoid division in the common cases 1 ns and 1 s. */
++ 	if (gran == 1)
++ 		; /* nothing */
++ 	else if (gran == NSEC_PER_SEC)
++ 		t.tv_nsec = 0;
++ 	else if (gran > 1 && gran < NSEC_PER_SEC)
++ 		t.tv_nsec -= t.tv_nsec % gran;
++ 	else
++ 		WARN(1, "invalid file time granularity: %u", gran);
++ 	return t;
++ }
++ EXPORT_SYMBOL(timestamp_truncate);
++ 
++ /**
++  * current_time - Return FS time
++  * @inode: inode.
++  *
++  * Return the current time truncated to the time granularity supported by
++  * the fs.
++  *
++  * Note that inode and inode->sb cannot be NULL.
++  * Otherwise, the function warns and returns time without truncation.
++  */
++ struct timespec64 current_time(struct inode *inode)
++ {
++ 	struct timespec64 now;
++ 
++ 	ktime_get_coarse_real_ts64(&now);
++ 
++ 	if (unlikely(!inode->i_sb)) {
++ 		WARN(1, "current_time() called with uninitialized super_block in the inode");
++ 		return now;
++ 	}
++ 
++ 	return timestamp_truncate(now, inode);
++ }
++ EXPORT_SYMBOL(current_time);
++ 
++ /**
++  * mode_strip_sgid - handle the sgid bit for non-directories
++  * @mnt_userns: User namespace of the mount the inode was created from
++  * @dir: parent directory inode
++  * @mode: mode of the file to be created in @dir
++  *
++  * If the @mode of the new file has both the S_ISGID and S_IXGRP bit
++  * raised and @dir has the S_ISGID bit raised ensure that the caller is
++  * either in the group of the parent directory or they have CAP_FSETID
++  * in their user namespace and are privileged over the parent directory.
++  * In all other cases, strip the S_ISGID bit from @mode.
++  *
++  * Return: the new mode to use for the file
++  */
++ umode_t mode_strip_sgid(struct user_namespace *mnt_userns,
++ 			const struct inode *dir, umode_t mode)
++ {
++ 	if ((mode & (S_ISGID | S_IXGRP)) != (S_ISGID | S_IXGRP))
++ 		return mode;
++ 	if (S_ISDIR(mode) || !dir || !(dir->i_mode & S_ISGID))
++ 		return mode;
++ 	if (in_group_p(i_gid_into_mnt(mnt_userns, dir)))
++ 		return mode;
++ 	if (capable_wrt_inode_uidgid(mnt_userns, dir, CAP_FSETID))
++ 		return mode;
++ 
++ 	return mode & ~S_ISGID;
++ }
++ EXPORT_SYMBOL(mode_strip_sgid);
+++>>>>>>> 2b3416ceff5e (fs: add mode_strip_sgid() helper)
+diff --cc include/linux/fs.h
+index 292997e7fd96,50642668c60f..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -1711,38 -1887,24 +1711,43 @@@ int vfs_mkobj(struct dentry *, umode_t
+  /*
+   * VFS file helper functions.
+   */
+ -void inode_init_owner(struct user_namespace *mnt_userns, struct inode *inode,
+ -		      const struct inode *dir, umode_t mode);
+ +extern void inode_init_owner(struct inode *inode, const struct inode *dir,
+ +			umode_t mode);
+  extern bool may_open_dev(const struct path *path);
+++<<<<<<< HEAD
+ +/*
+ + * VFS FS_IOC_FIEMAP helper definitions.
+ + */
+ +struct fiemap_extent_info {
+ +	unsigned int fi_flags;		/* Flags as passed from user */
+ +	unsigned int fi_extents_mapped;	/* Number of mapped extents */
+ +	unsigned int fi_extents_max;	/* Size of fiemap_extent array */
+ +	struct fiemap_extent __user *fi_extents_start; /* Start of
+ +							fiemap_extent array */
+ +};
+ +int fiemap_fill_next_extent(struct fiemap_extent_info *info, u64 logical,
+ +			    u64 phys, u64 len, u32 flags);
+ +int fiemap_check_flags(struct fiemap_extent_info *fieinfo, u32 fs_flags);
+ +
+ +/*
+ + * File types
+ + *
+ + * NOTE! These match bits 12..15 of stat.st_mode
+ + * (ie "(i_mode >> 12) & 15").
+ + */
+ +#define DT_UNKNOWN	0
+ +#define DT_FIFO		1
+ +#define DT_CHR		2
+ +#define DT_DIR		4
+ +#define DT_BLK		6
+ +#define DT_REG		8
+ +#define DT_LNK		10
+ +#define DT_SOCK		12
+ +#define DT_WHT		14
+++=======
++ umode_t mode_strip_sgid(struct user_namespace *mnt_userns,
++ 			const struct inode *dir, umode_t mode);
+++>>>>>>> 2b3416ceff5e (fs: add mode_strip_sgid() helper)
+  
+  /*
+   * This is the "filldir" function type, used by readdir() to let
+* Unmerged path fs/inode.c
+* Unmerged path include/linux/fs.h
