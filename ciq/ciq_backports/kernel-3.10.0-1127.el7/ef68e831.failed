@@ -1,0 +1,262 @@
+CIFS: Do not reconnect TCP session in add_credits()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Pavel Shilovsky <pshilov@microsoft.com>
+commit ef68e831840c40c7d01b328b3c0f5d8c4796c232
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/ef68e831.failed
+
+When executing add_credits() we currently call cifs_reconnect()
+if the number of credits is zero and there are no requests in
+flight. In this case we may call cifs_reconnect() recursively
+twice and cause memory corruption given the following sequence
+of functions:
+
+mid1.callback() -> add_credits() -> cifs_reconnect() ->
+-> mid2.callback() -> add_credits() -> cifs_reconnect().
+
+Fix this by avoiding to call cifs_reconnect() in add_credits()
+and checking for zero credits in the demultiplex thread.
+
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Pavel Shilovsky <pshilov@microsoft.com>
+	Reviewed-by: Ronnie Sahlberg <lsahlber@redhat.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit ef68e831840c40c7d01b328b3c0f5d8c4796c232)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/connect.c
+diff --cc fs/cifs/connect.c
+index 9a641bdd75d8,8463c940e0e5..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -520,99 -720,57 +520,141 @@@ server_unresponsive(struct TCP_Server_I
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * kvec_array_init - clone a kvec array, and advance into it
+ + * @new:	pointer to memory for cloned array
+ + * @iov:	pointer to original array
+ + * @nr_segs:	number of members in original array
+ + * @bytes:	number of bytes to advance into the cloned array
+ + *
+ + * This function will copy the array provided in iov to a section of memory
+ + * and advance the specified number of bytes into the new array. It returns
+ + * the number of segments in the new array. "new" must be at least as big as
+ + * the original iov array.
+ + */
+ +static unsigned int
+ +kvec_array_init(struct kvec *new, struct kvec *iov, unsigned int nr_segs,
+ +		size_t bytes)
+ +{
+ +	size_t base = 0;
+ +
+ +	while (bytes || !iov->iov_len) {
+ +		int copy = min(bytes, iov->iov_len);
+ +
+ +		bytes -= copy;
+ +		base += copy;
+ +		if (iov->iov_len == base) {
+ +			iov++;
+ +			nr_segs--;
+ +			base = 0;
+ +		}
+ +	}
+ +	memcpy(new, iov, sizeof(*iov) * nr_segs);
+ +	new->iov_base += base;
+ +	new->iov_len -= base;
+ +	return nr_segs;
+ +}
+ +
+ +static struct kvec *
+ +get_server_iovec(struct TCP_Server_Info *server, unsigned int nr_segs)
+ +{
+ +	struct kvec *new_iov;
+ +
+ +	if (server->iov && nr_segs <= server->nr_iov)
+ +		return server->iov;
+ +
+ +	/* not big enough -- allocate a new one and release the old */
+ +	new_iov = kmalloc(sizeof(*new_iov) * nr_segs, GFP_NOFS);
+ +	if (new_iov) {
+ +		kfree(server->iov);
+ +		server->iov = new_iov;
+ +		server->nr_iov = nr_segs;
+ +	}
+ +	return new_iov;
+ +}
+ +
+ +int
+ +cifs_readv_from_socket(struct TCP_Server_Info *server, struct kvec *iov_orig,
+ +		       unsigned int nr_segs, unsigned int to_read)
+++=======
++ static inline bool
++ zero_credits(struct TCP_Server_Info *server)
++ {
++ 	int val;
++ 
++ 	spin_lock(&server->req_lock);
++ 	val = server->credits + server->echo_credits + server->oplock_credits;
++ 	if (server->in_flight == 0 && val == 0) {
++ 		spin_unlock(&server->req_lock);
++ 		return true;
++ 	}
++ 	spin_unlock(&server->req_lock);
++ 	return false;
++ }
++ 
++ static int
++ cifs_readv_from_socket(struct TCP_Server_Info *server, struct msghdr *smb_msg)
+++>>>>>>> ef68e831840c (CIFS: Do not reconnect TCP session in add_credits())
+  {
+  	int length = 0;
+  	int total_read;
+ +	unsigned int segs;
+ +	struct msghdr smb_msg;
+ +	struct kvec *iov;
+ +
+ +	iov = get_server_iovec(server, nr_segs);
+ +	if (!iov)
+ +		return -ENOMEM;
+  
+ -	smb_msg->msg_control = NULL;
+ -	smb_msg->msg_controllen = 0;
+ +	smb_msg.msg_control = NULL;
+ +	smb_msg.msg_controllen = 0;
+  
+ -	for (total_read = 0; msg_data_left(smb_msg); total_read += length) {
+ +	for (total_read = 0; to_read; total_read += length, to_read -= length) {
+  		try_to_freeze();
+  
+++<<<<<<< HEAD
+ +		if (server_unresponsive(server)) {
+ +			total_read = -ECONNABORTED;
+ +			break;
+++=======
++ 		/* reconnect if no credits and no requests in flight */
++ 		if (zero_credits(server)) {
++ 			cifs_reconnect(server);
++ 			return -ECONNABORTED;
++ 		}
++ 
++ 		if (server_unresponsive(server))
++ 			return -ECONNABORTED;
++ 		if (cifs_rdma_enabled(server) && server->smbd_conn)
++ 			length = smbd_recv(server->smbd_conn, smb_msg);
++ 		else
++ 			length = sock_recvmsg(server->ssocket, smb_msg, 0);
++ 
++ 		if (server->tcpStatus == CifsExiting)
++ 			return -ESHUTDOWN;
++ 
++ 		if (server->tcpStatus == CifsNeedReconnect) {
++ 			cifs_reconnect(server);
++ 			return -ECONNABORTED;
+++>>>>>>> ef68e831840c (CIFS: Do not reconnect TCP session in add_credits())
+  		}
+  
+ -		if (length == -ERESTARTSYS ||
+ -		    length == -EAGAIN ||
+ -		    length == -EINTR) {
+ +		segs = kvec_array_init(iov, iov_orig, nr_segs, total_read);
+ +
+ +		length = kernel_recvmsg(server->ssocket, &smb_msg,
+ +					iov, segs, to_read, 0);
+ +
+ +		if (server->tcpStatus == CifsExiting) {
+ +			total_read = -ESHUTDOWN;
+ +			break;
+ +		} else if (server->tcpStatus == CifsNeedReconnect) {
+ +			cifs_reconnect(server);
+ +			total_read = -ECONNABORTED;
+ +			break;
+ +		} else if (length == -ERESTARTSYS ||
+ +			   length == -EAGAIN ||
+ +			   length == -EINTR) {
+  			/*
+  			 * Minimum sleep to prevent looping, allowing socket
+  			 * to clear and app threads to set tcpStatus
+* Unmerged path fs/cifs/connect.c
+diff --git a/fs/cifs/smb2ops.c b/fs/cifs/smb2ops.c
+index 56b3db9e354a..0730bcd67e56 100644
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@ -33,6 +33,7 @@
+ #include "smb2glob.h"
+ #include "cifs_ioctl.h"
+ 
++/* Change credits for different ops and return the total number of credits */
+ static int
+ change_conf(struct TCP_Server_Info *server)
+ {
+@@ -40,17 +41,15 @@ change_conf(struct TCP_Server_Info *server)
+ 	server->oplock_credits = server->echo_credits = 0;
+ 	switch (server->credits) {
+ 	case 0:
+-		return -1;
++		return 0;
+ 	case 1:
+ 		server->echoes = false;
+ 		server->oplocks = false;
+-		cifs_dbg(VFS, "disabling echoes and oplocks\n");
+ 		break;
+ 	case 2:
+ 		server->echoes = true;
+ 		server->oplocks = false;
+ 		server->echo_credits = 1;
+-		cifs_dbg(FYI, "disabling oplocks\n");
+ 		break;
+ 	default:
+ 		server->echoes = true;
+@@ -63,14 +62,15 @@ change_conf(struct TCP_Server_Info *server)
+ 		server->echo_credits = 1;
+ 	}
+ 	server->credits -= server->echo_credits + server->oplock_credits;
+-	return 0;
++	return server->credits + server->echo_credits + server->oplock_credits;
+ }
+ 
+ static void
+ smb2_add_credits(struct TCP_Server_Info *server, const unsigned int add,
+ 		 const int optype)
+ {
+-	int *val, rc = 0;
++	int *val, rc = -1;
++
+ 	spin_lock(&server->req_lock);
+ 	val = server->ops->get_credits_field(server, optype);
+ 	*val += add;
+@@ -94,8 +94,26 @@ smb2_add_credits(struct TCP_Server_Info *server, const unsigned int add,
+ 	}
+ 	spin_unlock(&server->req_lock);
+ 	wake_up(&server->request_q);
+-	if (rc)
+-		cifs_reconnect(server);
++
++	if (server->tcpStatus == CifsNeedReconnect)
++		return;
++
++	switch (rc) {
++	case -1:
++		/* change_conf hasn't been executed */
++		break;
++	case 0:
++		cifs_dbg(VFS, "Possible client or server bug - zero credits\n");
++		break;
++	case 1:
++		cifs_dbg(VFS, "disabling echoes and oplocks\n");
++		break;
++	case 2:
++		cifs_dbg(FYI, "disabling oplocks\n");
++		break;
++	default:
++		cifs_dbg(FYI, "add %u credits total=%d\n", add, rc);
++	}
+ }
+ 
+ static void
