@@ -1,0 +1,163 @@
+switch the IO-triggering parts of umount to fs_pin
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 87b95ce0964c016ede92763be9c164e49f1019e9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/87b95ce0.failed
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 87b95ce0964c016ede92763be9c164e49f1019e9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fs_pin.c
+#	fs/mount.h
+#	fs/namespace.c
+diff --cc fs/mount.h
+index e343bfffd887,6a61c2b3e385..000000000000
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@@ -1,6 -1,8 +1,11 @@@
+  #include <linux/mount.h>
+  #include <linux/seq_file.h>
+  #include <linux/poll.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/ns_common.h>
++ #include <linux/fs_pin.h>
+++>>>>>>> 87b95ce0964c (switch the IO-triggering parts of umount to fs_pin)
+  
+  struct mnt_namespace {
+  	atomic_t		count;
+@@@ -54,8 -62,9 +59,14 @@@ struct mount 
+  	int mnt_id;			/* mount identifier */
+  	int mnt_group_id;		/* peer group identifier */
+  	int mnt_expiry_mark;		/* true if marked for expiry */
+++<<<<<<< HEAD
+ +	int mnt_pinned;
+ +	struct path mnt_ex_mountpoint;
+++=======
++ 	struct hlist_head mnt_pins;
++ 	struct fs_pin mnt_umount;
++ 	struct dentry *mnt_ex_mountpoint;
+++>>>>>>> 87b95ce0964c (switch the IO-triggering parts of umount to fs_pin)
+  };
+  
+  #define MNT_NS_INTERNAL ERR_PTR(-EINVAL) /* distinct from any mnt_namespace */
+diff --cc fs/namespace.c
+index 07e51358b239,4a985ff0ddfc..000000000000
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@@ -1183,24 -1298,20 +1192,38 @@@ static LIST_HEAD(unmounted);	/* protect
+  
+  static void namespace_unlock(void)
+  {
+++<<<<<<< HEAD
+ +	struct mount *mnt;
+ +	LIST_HEAD(head);
+++=======
++ 	struct hlist_head head = unmounted;
+++>>>>>>> 87b95ce0964c (switch the IO-triggering parts of umount to fs_pin)
+  
+ -	if (likely(hlist_empty(&head))) {
+ +	if (likely(list_empty(&unmounted))) {
+  		up_write(&namespace_sem);
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	list_splice_init(&unmounted, &head);
+ +	up_write(&namespace_sem);
+ +
+ +	while (!list_empty(&head)) {
+ +		mnt = list_first_entry(&head, struct mount, mnt_hash);
+ +		list_del_init(&mnt->mnt_hash);
+ +		if (mnt->mnt_ex_mountpoint.mnt)
+ +			path_put(&mnt->mnt_ex_mountpoint);
+ +		mntput(&mnt->mnt);
+ +	}
+++=======
++ 	head.first->pprev = &head.first;
++ 	INIT_HLIST_HEAD(&unmounted);
++ 	up_write(&namespace_sem);
++ 
++ 	synchronize_rcu();
++ 
++ 	group_pin_kill(&head);
+++>>>>>>> 87b95ce0964c (switch the IO-triggering parts of umount to fs_pin)
+  }
+  
+  static inline void namespace_lock(void)
+@@@ -1209,31 -1320,45 +1232,50 @@@
+  }
+  
+  /*
+ - * mount_lock must be held
+ + * vfsmount lock must be held for write
+   * namespace_sem must be held for write
+ - * how = 0 => just this tree, don't propagate
+ - * how = 1 => propagate; we know that nobody else has reference to any victims
+ - * how = 2 => lazy umount
+   */
+ -void umount_tree(struct mount *mnt, int how)
+ +void umount_tree(struct mount *mnt, int propagate)
+  {
+ -	HLIST_HEAD(tmp_list);
+ +	LIST_HEAD(tmp_list);
+  	struct mount *p;
+  
+ -	for (p = mnt; p; p = next_mnt(p, mnt)) {
+ -		hlist_del_init_rcu(&p->mnt_hash);
+ -		hlist_add_head(&p->mnt_hash, &tmp_list);
+ -	}
+ -
+ -	hlist_for_each_entry(p, &tmp_list, mnt_hash)
+ -		list_del_init(&p->mnt_child);
+ +	for (p = mnt; p; p = next_mnt(p, mnt))
+ +		list_move(&p->mnt_hash, &tmp_list);
+  
+ -	if (how)
+ +	if (propagate)
+  		propagate_umount(&tmp_list);
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(p, &tmp_list, mnt_hash) {
+++=======
++ 	while (!hlist_empty(&tmp_list)) {
++ 		p = hlist_entry(tmp_list.first, struct mount, mnt_hash);
++ 		hlist_del_init_rcu(&p->mnt_hash);
+++>>>>>>> 87b95ce0964c (switch the IO-triggering parts of umount to fs_pin)
+  		list_del_init(&p->mnt_expire);
+  		list_del_init(&p->mnt_list);
+  		__touch_mnt_namespace(p->mnt_ns);
+  		p->mnt_ns = NULL;
+++<<<<<<< HEAD
+ +		list_del_init(&p->mnt_child);
+++=======
++ 		if (how < 2)
++ 			p->mnt.mnt_flags |= MNT_SYNC_UMOUNT;
++ 
++ 		pin_insert_group(&p->mnt_umount, &p->mnt_parent->mnt, &unmounted);
+++>>>>>>> 87b95ce0964c (switch the IO-triggering parts of umount to fs_pin)
+  		if (mnt_has_parent(p)) {
+ -			hlist_del_init(&p->mnt_mp_list);
+  			put_mountpoint(p->mnt_mp);
+++<<<<<<< HEAD
+ +			/* move the reference to mountpoint into ->mnt_ex_mountpoint */
+ +			p->mnt_ex_mountpoint.dentry = p->mnt_mountpoint;
+ +			p->mnt_ex_mountpoint.mnt = &p->mnt_parent->mnt;
+++=======
++ 			mnt_add_count(p->mnt_parent, -1);
++ 			/* old mountpoint will be dropped when we can do that */
++ 			p->mnt_ex_mountpoint = p->mnt_mountpoint;
+++>>>>>>> 87b95ce0964c (switch the IO-triggering parts of umount to fs_pin)
+  			p->mnt_mountpoint = p->mnt.mnt_root;
+  			p->mnt_parent = p;
+  			p->mnt_mp = NULL;
+* Unmerged path fs/fs_pin.c
+* Unmerged path fs/fs_pin.c
+* Unmerged path fs/mount.h
+* Unmerged path fs/namespace.c
