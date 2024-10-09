@@ -96,6 +96,7 @@ struct sym_hist_entry {
 enum {
 	PERCENT_HITS_LOCAL,
 	PERCENT_HITS_GLOBAL,
+	PERCENT_PERIOD_LOCAL,
 	PERCENT_MAX,
 };
 
