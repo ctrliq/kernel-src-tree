@@ -1,0 +1,151 @@
+ovl: whiteout orphan index entries on mount
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit 24f0b17203691d22815e842051a014e3bde7c227
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/24f0b172.failed
+
+Orphan index entries are non-dir index entries whose union nlink count
+dropped to zero. With index=on, orphan index entries are removed on
+mount. With NFS export feature enabled, orphan index entries are replaced
+with white out index entries to block future open by handle from opening
+the lower file.
+
+When dir index has a stale 'upper' xattr, we assume that the upper dir
+was removed and we treat the dir index as orphan entry that needs to be
+whited out or removed.
+
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 24f0b17203691d22815e842051a014e3bde7c227)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/namei.c
+#	fs/overlayfs/readdir.c
+diff --cc fs/overlayfs/namei.c
+index 0afb8ae29e9b,111a64f904c2..000000000000
+--- a/fs/overlayfs/namei.c
++++ b/fs/overlayfs/namei.c
+@@@ -428,19 -514,61 +428,70 @@@ int ovl_verify_index(struct dentry *ind
+  	if (err)
+  		goto fail;
+  
+++<<<<<<< HEAD
+ +	err = ovl_check_origin(index, lowerstack, numlower, &stack, &ctr);
+ +	if (!err && !ctr)
+ +		err = -ESTALE;
+++=======
++ 	/*
++ 	 * Whiteout index entries are used as an indication that an exported
++ 	 * overlay file handle should be treated as stale (i.e. after unlink
++ 	 * of the overlay inode). These entries contain no origin xattr.
++ 	 */
++ 	if (ovl_is_whiteout(index))
++ 		goto out;
++ 
++ 	/*
++ 	 * Verifying directory index entries are not stale is expensive, so
++ 	 * only verify stale dir index if NFS export is enabled.
++ 	 */
++ 	if (d_is_dir(index) && !ofs->config.nfs_export)
++ 		goto out;
++ 
++ 	/*
++ 	 * Directory index entries should have 'upper' xattr pointing to the
++ 	 * real upper dir. Non-dir index entries are hardlinks to the upper
++ 	 * real inode. For non-dir index, we can read the copy up origin xattr
++ 	 * directly from the index dentry, but for dir index we first need to
++ 	 * decode the upper directory.
++ 	 */
++ 	upper = ovl_index_upper(ofs, index);
++ 	if (IS_ERR_OR_NULL(upper)) {
++ 		err = PTR_ERR(upper);
++ 		/*
++ 		 * Directory index entries with no 'upper' xattr need to be
++ 		 * removed. When dir index entry has a stale 'upper' xattr,
++ 		 * we assume that upper dir was removed and we treat the dir
++ 		 * index as orphan entry that needs to be whited out.
++ 		 */
++ 		if (err == -ESTALE)
++ 			goto orphan;
++ 		else if (!err)
++ 			err = -ESTALE;
++ 		goto fail;
++ 	}
++ 
++ 	err = ovl_verify_fh(upper, OVL_XATTR_ORIGIN, fh);
++ 	dput(upper);
+++>>>>>>> 24f0b1720369 (ovl: whiteout orphan index entries on mount)
+  	if (err)
+  		goto fail;
+  
+ -	/* Check if non-dir index is orphan and don't warn before cleaning it */
+ -	if (!d_is_dir(index) && d_inode(index)->i_nlink == 1) {
+ -		err = ovl_check_origin_fh(ofs, fh, index, &stack);
+ -		if (err)
+ -			goto fail;
+ +	/* Check if index is orphan and don't warn before cleaning it */
+ +	if (d_inode(index)->i_nlink == 1 &&
+ +	    ovl_get_nlink(origin.dentry, index, 0) == 0)
+ +		err = -ENOENT;
+  
+++<<<<<<< HEAD
+++=======
++ 		if (ovl_get_nlink(origin.dentry, index, 0) == 0)
++ 			goto orphan;
++ 	}
++ 
++ out:
+++>>>>>>> 24f0b1720369 (ovl: whiteout orphan index entries on mount)
+  	dput(origin.dentry);
+ +out:
+  	kfree(fh);
+  	return err;
+  
+diff --cc fs/overlayfs/readdir.c
+index f15029442198,c11f5c0906c3..000000000000
+--- a/fs/overlayfs/readdir.c
++++ b/fs/overlayfs/readdir.c
+@@@ -1068,10 -1066,30 +1068,36 @@@ int ovl_indexdir_cleanup(struct dentry 
+  			index = NULL;
+  			break;
+  		}
+++<<<<<<< HEAD
+ +		err = ovl_verify_index(index, lowerstack, numlower);
+ +		/* Cleanup stale and orphan index entries */
+ +		if (err && (err == -ESTALE || err == -ENOENT))
+++=======
++ 		err = ovl_verify_index(ofs, index);
++ 		if (!err) {
++ 			goto next;
++ 		} else if (err == -ESTALE) {
++ 			/* Cleanup stale index entries */
+++>>>>>>> 24f0b1720369 (ovl: whiteout orphan index entries on mount)
+  			err = ovl_cleanup(dir, index);
++ 		} else if (err != -ENOENT) {
++ 			/*
++ 			 * Abort mount to avoid corrupting the index if
++ 			 * an incompatible index entry was found or on out
++ 			 * of memory.
++ 			 */
++ 			break;
++ 		} else if (ofs->config.nfs_export) {
++ 			/*
++ 			 * Whiteout orphan index to block future open by
++ 			 * handle after overlay nlink dropped to zero.
++ 			 */
++ 			err = ovl_cleanup_and_whiteout(indexdir, dir, index);
++ 		} else {
++ 			/* Cleanup orphan index entries */
++ 			err = ovl_cleanup(dir, index);
++ 		}
++ 
+  		if (err)
+  			break;
+  
+* Unmerged path fs/overlayfs/namei.c
+* Unmerged path fs/overlayfs/readdir.c
