@@ -1,0 +1,137 @@
+tuntap: synchronize through tfiles array instead of tun->numqueues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Jason Wang <jasowang@redhat.com>
+commit 9871a9e47a2646fe30ae7fd2e67668a8d30912f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/9871a9e4.failed
+
+When a queue(tfile) is detached through __tun_detach(), we move the
+last enabled tfile to the position where detached one sit but don't
+NULL out last position. We expect to synchronize the datapath through
+tun->numqueues. Unfortunately, this won't work since we're lacking
+sufficient mechanism to order or synchronize the access to
+tun->numqueues.
+
+To fix this, NULL out the last position during detaching and check
+RCU protected tfile against NULL instead of checking tun->numqueues in
+datapath.
+
+	Cc: YueHaibing <yuehaibing@huawei.com>
+	Cc: Cong Wang <xiyou.wangcong@gmail.com>
+	Cc: weiyongjun (A) <weiyongjun1@huawei.com>
+	Cc: Eric Dumazet <eric.dumazet@gmail.com>
+Fixes: c8d68e6be1c3b ("tuntap: multiqueue support")
+	Signed-off-by: Jason Wang <jasowang@redhat.com>
+	Reviewed-by: Wei Yongjun <weiyongjun1@huawei.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9871a9e47a2646fe30ae7fd2e67668a8d30912f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/tun.c
+diff --cc drivers/net/tun.c
+index 4cdb9597f760,abae165dcca5..000000000000
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@@ -842,12 -1086,14 +844,16 @@@ static netdev_tx_t tun_net_xmit(struct 
+  
+  	rcu_read_lock();
+  	tfile = rcu_dereference(tun->tfiles[txq]);
+ +	numqueues = ACCESS_ONCE(tun->numqueues);
+  
+  	/* Drop packet if interface is not attached */
+++<<<<<<< HEAD
+ +	if (txq >= numqueues)
+++=======
++ 	if (!tfile)
+++>>>>>>> 9871a9e47a26 (tuntap: synchronize through tfiles array instead of tun->numqueues)
+  		goto drop;
+  
+ -	if (!rcu_dereference(tun->steering_prog))
+ -		tun_automq_xmit(tun, skb);
+ -
+  	tun_debug(KERN_INFO, tun, "tun_net_xmit %d\n", skb->len);
+  
+  	BUG_ON(!tfile);
+@@@ -1015,6 -1288,74 +1021,77 @@@ static const struct net_device_ops tun_
+  	.ndo_change_carrier	= tun_net_change_carrier,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static void __tun_xdp_flush_tfile(struct tun_file *tfile)
++ {
++ 	/* Notify and wake up reader process */
++ 	if (tfile->flags & TUN_FASYNC)
++ 		kill_fasync(&tfile->fasync, SIGIO, POLL_IN);
++ 	tfile->socket.sk->sk_data_ready(tfile->socket.sk);
++ }
++ 
++ static int tun_xdp_xmit(struct net_device *dev, int n,
++ 			struct xdp_frame **frames, u32 flags)
++ {
++ 	struct tun_struct *tun = netdev_priv(dev);
++ 	struct tun_file *tfile;
++ 	u32 numqueues;
++ 	int drops = 0;
++ 	int cnt = n;
++ 	int i;
++ 
++ 	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
++ 		return -EINVAL;
++ 
++ 	rcu_read_lock();
++ 
++ resample:
++ 	numqueues = READ_ONCE(tun->numqueues);
++ 	if (!numqueues) {
++ 		rcu_read_unlock();
++ 		return -ENXIO; /* Caller will free/return all frames */
++ 	}
++ 
++ 	tfile = rcu_dereference(tun->tfiles[smp_processor_id() %
++ 					    numqueues]);
++ 	if (unlikely(!tfile))
++ 		goto resample;
++ 
++ 	spin_lock(&tfile->tx_ring.producer_lock);
++ 	for (i = 0; i < n; i++) {
++ 		struct xdp_frame *xdp = frames[i];
++ 		/* Encode the XDP flag into lowest bit for consumer to differ
++ 		 * XDP buffer from sk_buff.
++ 		 */
++ 		void *frame = tun_xdp_to_ptr(xdp);
++ 
++ 		if (__ptr_ring_produce(&tfile->tx_ring, frame)) {
++ 			this_cpu_inc(tun->pcpu_stats->tx_dropped);
++ 			xdp_return_frame_rx_napi(xdp);
++ 			drops++;
++ 		}
++ 	}
++ 	spin_unlock(&tfile->tx_ring.producer_lock);
++ 
++ 	if (flags & XDP_XMIT_FLUSH)
++ 		__tun_xdp_flush_tfile(tfile);
++ 
++ 	rcu_read_unlock();
++ 	return cnt - drops;
++ }
++ 
++ static int tun_xdp_tx(struct net_device *dev, struct xdp_buff *xdp)
++ {
++ 	struct xdp_frame *frame = convert_to_xdp_frame(xdp);
++ 
++ 	if (unlikely(!frame))
++ 		return -EOVERFLOW;
++ 
++ 	return tun_xdp_xmit(dev, 1, &frame, XDP_XMIT_FLUSH);
++ }
++ 
+++>>>>>>> 9871a9e47a26 (tuntap: synchronize through tfiles array instead of tun->numqueues)
+  static const struct net_device_ops tap_netdev_ops = {
+  	.ndo_uninit		= tun_net_uninit,
+  	.ndo_open		= tun_net_open,
+* Unmerged path drivers/net/tun.c
