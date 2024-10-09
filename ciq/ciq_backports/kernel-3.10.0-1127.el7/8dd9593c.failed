@@ -1,0 +1,158 @@
+scsi: qla2xxx: Really fix qla2xxx_eh_abort()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Bart Van Assche <bvanassche@acm.org>
+commit 8dd9593cc07ad7d999bef81b06789ef873a94881
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/8dd9593c.failed
+
+I'm not sure how this happened but the patch that was intended to fix abort
+handling was incomplete. This patch fixes that patch as follows:
+
+ - If aborting the SCSI command failed, wait until the SCSI command
+   completes.
+
+ - Return SUCCESS instead of FAILED if an abort attempt races with SCSI
+   command completion.
+
+ - Since qla2xxx_eh_abort() increments the sp reference count by calling
+   sp_get(), decrement the sp reference count before returning.
+
+	Cc: Himanshu Madhani <hmadhani@marvell.com>
+Fixes: 219d27d7147e ("scsi: qla2xxx: Fix race conditions in the code for aborting SCSI commands")
+	Signed-off-by: Bart Van Assche <bvanassche@acm.org>
+	Tested-by: Himanshu Madhani <hmadhani@marvell.com>
+	Reviewed-by: Himanshu Madhani <hmadhani@marvell.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 8dd9593cc07ad7d999bef81b06789ef873a94881)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_os.c
+diff --cc drivers/scsi/qla2xxx/qla_os.c
+index d8902b90b121,db1f1aac79f2..000000000000
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@@ -1328,11 -1269,13 +1328,12 @@@ static in
+  qla2xxx_eh_abort(struct scsi_cmnd *cmd)
+  {
+  	scsi_qla_host_t *vha = shost_priv(cmd->device->host);
++ 	DECLARE_COMPLETION_ONSTACK(comp);
+  	srb_t *sp;
+  	int ret;
+ -	unsigned int id;
+ -	uint64_t lun;
+ +	unsigned int id, lun;
+  	unsigned long flags;
+ -	int rval;
+ +	int rval, wait = 0;
+  	struct qla_hw_data *ha = vha->hw;
+  	struct qla_qpair *qpair;
+  
+@@@ -1377,61 -1320,53 +1379,91 @@@
+  	lun = cmd->device->lun;
+  
+  	ql_dbg(ql_dbg_taskm, vha, 0x8002,
+ -	    "Aborting from RISC nexus=%ld:%d:%llu sp=%p cmd=%p handle=%x\n",
+ +	    "Aborting from RISC nexus=%ld:%d:%u sp=%p cmd=%p handle=%x\n",
+  	    vha->host_no, id, lun, sp, cmd, sp->handle);
+  
+ +	/* Get a reference to the sp and drop the lock.*/
+ +
+  	rval = ha->isp_ops->abort_command(sp);
+ -	ql_dbg(ql_dbg_taskm, vha, 0x8003,
+ -	       "Abort command mbx cmd=%p, rval=%x.\n", cmd, rval);
+ +	if (rval) {
+ +		if (rval == QLA_FUNCTION_PARAMETER_ERROR)
+ +			ret = SUCCESS;
+ +		else
+ +			ret = FAILED;
+  
+ -	switch (rval) {
+ -	case QLA_SUCCESS:
+ -		/*
+ -		 * The command has been aborted. That means that the firmware
+ -		 * won't report a completion.
+ -		 */
+ -		sp->done(sp, DID_ABORT << 16);
+ +		ql_dbg(ql_dbg_taskm, vha, 0x8003,
+ +		    "Abort command mbx failed cmd=%p, rval=%x.\n", cmd, rval);
+ +	} else {
+ +		ql_dbg(ql_dbg_taskm, vha, 0x8004,
+ +		    "Abort command mbx success cmd=%p.\n", cmd);
+ +		wait = 1;
+ +	}
+ +
+ +	spin_lock_irqsave(qpair->qp_lock_ptr, flags);
+ +	/*
+ +	 * Clear the slot in the oustanding_cmds array if we can't find the
+ +	 * command to reclaim the resources.
+ +	 */
+ +	if (rval == QLA_FUNCTION_PARAMETER_ERROR)
+ +		vha->req->outstanding_cmds[sp->handle] = NULL;
+ +
+ +	/*
+ +	 * sp->done will do ref_count--
+ +	 * sp_get() took an extra count above
+ +	 */
+ +	sp->done(sp, DID_RESET << 16);
+ +
+ +	/* Did the command return during mailbox execution? */
+ +	if (ret == FAILED && !CMD_SP(cmd))
+  		ret = SUCCESS;
+++<<<<<<< HEAD
+ +
+ +	if (!CMD_SP(cmd))
+ +		wait = 0;
+ +
+ +	spin_unlock_irqrestore(qpair->qp_lock_ptr, flags);
+ +
+ +	/* Wait for the command to be returned. */
+ +	if (wait) {
+ +		if (qla2x00_eh_wait_on_command(cmd) != QLA_SUCCESS) {
+ +			ql_log(ql_log_warn, vha, 0x8006,
+ +			    "Abort handler timed out cmd=%p.\n", cmd);
+ +			ret = FAILED;
+ +		}
+++=======
++ 		break;
++ 	case QLA_FUNCTION_PARAMETER_ERROR: {
++ 		/* Wait for the command completion. */
++ 		uint32_t ratov = ha->r_a_tov/10;
++ 		uint32_t ratov_j = msecs_to_jiffies(4 * ratov * 1000);
++ 
++ 		WARN_ON_ONCE(sp->comp);
++ 		sp->comp = &comp;
++ 		if (!wait_for_completion_timeout(&comp, ratov_j)) {
++ 			ql_dbg(ql_dbg_taskm, vha, 0xffff,
++ 			    "%s: Abort wait timer (4 * R_A_TOV[%d]) expired\n",
++ 			    __func__, ha->r_a_tov);
++ 			ret = FAILED;
++ 		} else {
++ 			ret = SUCCESS;
++ 		}
++ 		break;
++ 	}
++ 	default:
++ 		/*
++ 		 * Either abort failed or abort and completion raced. Let
++ 		 * the SCSI core retry the abort in the former case.
++ 		 */
++ 		ret = FAILED;
++ 		break;
+++>>>>>>> 8dd9593cc07a (scsi: qla2xxx: Really fix qla2xxx_eh_abort())
+  	}
+  
++ 	sp->comp = NULL;
++ 	atomic_dec(&sp->ref_count);
+  	ql_log(ql_log_info, vha, 0x801c,
+ -	    "Abort command issued nexus=%ld:%d:%llu -- %x.\n",
+ -	    vha->host_no, id, lun, ret);
+ +	    "Abort command issued nexus=%ld:%d:%d --  %d %x.\n",
+ +	    vha->host_no, id, lun, wait, ret);
+  
+  	return ret;
+  }
+* Unmerged path drivers/scsi/qla2xxx/qla_os.c
