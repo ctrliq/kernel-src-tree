@@ -1,0 +1,121 @@
+fib: hook IPv4 fib for hardware offload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Scott Feldman <sfeldma@gmail.com>
+commit 8e05fd7166c6123334b7a739a697d677747aa462
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8e05fd71.failed
+
+Call into the switchdev driver any time an IPv4 fib entry is
+added/modified/deleted from the kernel's FIB.  The switchdev driver may or
+may not install the route to the offload device.  In the case where the
+driver tries to install the route and something goes wrong (device's routing
+table is full, etc), then all of the offloaded routes will be flushed from the
+device, route forwarding falls back to the kernel, and no more routes are
+offloading.
+
+We can refine this logic later.  For now, use the simplist model of offloading
+routes up to the point of failure, and then on failure, undo everything and
+mark IPv4 offloading disabled.
+
+	Signed-off-by: Scott Feldman <sfeldma@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8e05fd7166c6123334b7a739a697d677747aa462)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/switchdev.h
+#	net/ipv4/fib_trie.c
+#	net/switchdev/switchdev.c
+diff --cc net/ipv4/fib_trie.c
+index 9511456e5325,6544f1a0cfa1..000000000000
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@@ -1558,27 -1626,63 +1583,63 @@@ found
+  int fib_table_flush(struct fib_table *tb)
+  {
+  	struct trie *t = (struct trie *)tb->tb_data;
+ +	struct key_vector *pn = t->kv;
+ +	unsigned long cindex = 1;
+  	struct hlist_node *tmp;
+  	struct fib_alias *fa;
+ -	struct tnode *n, *pn;
+ -	unsigned long cindex;
+ -	unsigned char slen;
+  	int found = 0;
+  
+ -	n = rcu_dereference(t->trie);
+ -	if (!n)
+ -		goto flush_complete;
+ +	/* walk trie in reverse order */
+ +	for (;;) {
+ +		unsigned char slen = 0;
+ +		struct key_vector *n;
+  
+ -	pn = NULL;
+ -	cindex = 0;
+ +		if (!(cindex--)) {
+ +			t_key pkey = pn->key;
+  
+ -	while (IS_TNODE(n)) {
+ -		/* record pn and cindex for leaf walking */
+ -		pn = n;
+ -		cindex = 1ul << n->bits;
+ -backtrace:
+ -		/* walk trie in reverse order */
+ -		do {
+ -			while (!(cindex--)) {
+ -				t_key pkey = pn->key;
+ +			/* cannot resize the trie vector */
+ +			if (IS_TRIE(pn))
+ +				break;
+  
+++<<<<<<< HEAD
+ +			/* resize completed node */
+ +			pn = resize(t, pn);
+ +			cindex = get_index(pkey, pn);
+++=======
++ 				n = pn;
++ 				pn = node_parent(n);
++ 
++ 				/* resize completed node */
++ 				resize(t, n);
++ 
++ 				/* if we got the root we are done */
++ 				if (!pn)
++ 					goto flush_complete;
++ 
++ 				cindex = get_index(pkey, pn);
++ 			}
++ 
++ 			/* grab the next available node */
++ 			n = tnode_get_child(pn, cindex);
++ 		} while (!n);
++ 	}
++ 
++ 	/* track slen in case any prefixes survive */
++ 	slen = 0;
++ 
++ 	hlist_for_each_entry_safe(fa, tmp, &n->leaf, fa_list) {
++ 		struct fib_info *fi = fa->fa_info;
++ 
++ 		if (fi && (fi->fib_flags & RTNH_F_DEAD)) {
++ 			netdev_switch_fib_ipv4_del(n->key,
++ 						   KEYLENGTH - fa->fa_slen,
++ 						   fi, fa->fa_tos,
++ 						   fa->fa_type, tb->tb_id);
++ 			hlist_del_rcu(&fa->fa_list);
++ 			fib_release_info(fa->fa_info);
++ 			alias_free_mem_rcu(fa);
++ 			found++;
+++>>>>>>> 8e05fd7166c6 (fib: hook IPv4 fib for hardware offload)
+  
+  			continue;
+  		}
+* Unmerged path include/net/switchdev.h
+* Unmerged path net/switchdev/switchdev.c
+* Unmerged path include/net/switchdev.h
+* Unmerged path net/ipv4/fib_trie.c
+* Unmerged path net/switchdev/switchdev.c
