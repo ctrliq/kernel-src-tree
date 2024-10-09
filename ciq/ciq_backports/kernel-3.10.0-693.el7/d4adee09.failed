@@ -1,0 +1,148 @@
+NTB: fix access of free-ed pointer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [ntb] fix access of free-ed pointer (Suravee Suthikulpanit) [1303727]
+Rebuild_FUZZ: 92.06%
+commit-author Sudip Mukherjee <sudipm.mukherjee@gmail.com>
+commit d4adee09fd1cf65189cb8901eb7506aea3e869ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d4adee09.failed
+
+We were accessing nt->mw_vec after freeing it. Fix the error path so
+that we free nt->mw_vec after we have finished using it.
+
+	Signed-off-by: Sudip Mukherjee <sudip@vectorindia.org>
+	Signed-off-by: Jon Mason <jdmason@kudzu.us>
+(cherry picked from commit d4adee09fd1cf65189cb8901eb7506aea3e869ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/ntb/ntb_transport.c
+diff --cc drivers/ntb/ntb_transport.c
+index 0d5e96e60628,d09d92e05cbe..000000000000
+--- a/drivers/ntb/ntb_transport.c
++++ b/drivers/ntb/ntb_transport.c
+@@@ -936,59 -1042,87 +936,72 @@@ int ntb_transport_init(struct pci_dev *
+  		goto err;
+  	}
+  
+ -	for (i = 0; i < mw_count; i++) {
+ -		mw = &nt->mw_vec[i];
+ -
+ -		rc = ntb_mw_get_range(ndev, i, &mw->phys_addr, &mw->phys_size,
+ -				      &mw->xlat_align, &mw->xlat_align_size);
+ -		if (rc)
+ -			goto err1;
+ -
+ -		mw->vbase = ioremap_wc(mw->phys_addr, mw->phys_size);
+ -		if (!mw->vbase) {
+ -			rc = -ENOMEM;
+ -			goto err1;
+ -		}
+ -
+ -		mw->buff_size = 0;
+ -		mw->xlat_size = 0;
+ -		mw->virt_addr = NULL;
+ -		mw->dma_addr = 0;
+ +	nt->mw = kcalloc(ntb_max_mw(nt->ndev), sizeof(struct ntb_transport_mw),
+ +			 GFP_KERNEL);
+ +	if (!nt->mw) {
+ +		rc = -ENOMEM;
+ +		goto err1;
+  	}
+  
+ -	qp_bitmap = ntb_db_valid_mask(ndev);
+ -
+ -	qp_count = ilog2(qp_bitmap);
+ -	if (max_num_clients && max_num_clients < qp_count)
+ -		qp_count = max_num_clients;
+ -	else if (mw_count < qp_count)
+ -		qp_count = mw_count;
+ -
+ -	qp_bitmap &= BIT_ULL(qp_count) - 1;
+ -
+ -	nt->qp_count = qp_count;
+ -	nt->qp_bitmap = qp_bitmap;
+ -	nt->qp_bitmap_free = qp_bitmap;
+ +	if (max_num_clients)
+ +		nt->max_qps = min(ntb_max_cbs(nt->ndev), max_num_clients);
+ +	else
+ +		nt->max_qps = min(ntb_max_cbs(nt->ndev), ntb_max_mw(nt->ndev));
+  
+ -	nt->qp_vec = kzalloc_node(qp_count * sizeof(*nt->qp_vec),
+ -				  GFP_KERNEL, node);
+ -	if (!nt->qp_vec) {
+ +	nt->qps = kcalloc(nt->max_qps, sizeof(struct ntb_transport_qp),
+ +			  GFP_KERNEL);
+ +	if (!nt->qps) {
+  		rc = -ENOMEM;
+- 		goto err2;
++ 		goto err1;
+  	}
+  
+ -	if (nt_debugfs_dir) {
+ -		nt->debugfs_node_dir =
+ -			debugfs_create_dir(pci_name(ndev->pdev),
+ -					   nt_debugfs_dir);
+ -	}
+ +	nt->qp_bitmap = ((u64) 1 << nt->max_qps) - 1;
+  
+ -	for (i = 0; i < qp_count; i++) {
+ +	for (i = 0; i < nt->max_qps; i++) {
+  		rc = ntb_transport_init_queue(nt, i);
+  		if (rc)
+- 			goto err3;
++ 			goto err2;
+  	}
+  
+  	INIT_DELAYED_WORK(&nt->link_work, ntb_transport_link_work);
+  	INIT_WORK(&nt->link_cleanup, ntb_transport_link_cleanup_work);
+  
+ -	rc = ntb_set_ctx(ndev, nt, &ntb_transport_ops);
+ +	rc = ntb_register_event_callback(nt->ndev,
+ +					 ntb_transport_event_callback);
+  	if (rc)
+- 		goto err3;
++ 		goto err2;
+  
+  	INIT_LIST_HEAD(&nt->client_devs);
+  	rc = ntb_bus_init(nt);
+  	if (rc)
+- 		goto err4;
++ 		goto err3;
+  
+ -	nt->link_is_up = false;
+ -	ntb_link_enable(ndev, NTB_SPEED_AUTO, NTB_WIDTH_AUTO);
+ -	ntb_link_event(ndev);
+ +	if (ntb_hw_link_status(nt->ndev))
+ +		schedule_delayed_work(&nt->link_work, 0);
+  
+  	return 0;
+  
+++<<<<<<< HEAD
+ +err4:
+ +	ntb_unregister_event_callback(nt->ndev);
+ +err3:
+ +	kfree(nt->qps);
+ +err2:
+ +	kfree(nt->mw);
+ +err1:
+ +	ntb_unregister_transport(nt->ndev);
+++=======
++ err3:
++ 	ntb_clear_ctx(ndev);
++ err2:
++ 	kfree(nt->qp_vec);
++ err1:
++ 	while (i--) {
++ 		mw = &nt->mw_vec[i];
++ 		iounmap(mw->vbase);
++ 	}
++ 	kfree(nt->mw_vec);
+++>>>>>>> d4adee09fd1c (NTB: fix access of free-ed pointer)
+  err:
+  	kfree(nt);
+  	return rc;
+* Unmerged path drivers/ntb/ntb_transport.c
