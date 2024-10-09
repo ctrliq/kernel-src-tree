@@ -1,0 +1,187 @@
+x86/intel_rdt/cqm: Improve limbo list processing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] intel_rdt/cqm: Improve limbo list processing (Jiri Olsa) [1457533]
+Rebuild_FUZZ: 95.65%
+commit-author Vikas Shivappa <vikas.shivappa@linux.intel.com>
+commit 24247aeeabe99eab13b798ccccc2dec066dd6f07
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/24247aee.failed
+
+During a mkdir, the entire limbo list is synchronously checked on each
+package for free RMIDs by sending IPIs. With a large number of RMIDs (SKL
+has 192) this creates a intolerable amount of work in IPIs.
+
+Replace the IPI based checking of the limbo list with asynchronous worker
+threads on each package which periodically scan the limbo list and move the
+RMIDs that have:
+
+	llc_occupancy < threshold_occupancy
+
+on all packages to the free list.
+
+mkdir now returns -ENOSPC if the free list and the limbo list ere empty or
+returns -EBUSY if there are RMIDs on the limbo list and the free list is
+empty.
+
+Getting rid of the IPIs also simplifies the data structures and the
+serialization required for handling the lists.
+
+[ tglx: Rewrote changelog ... ]
+
+	Signed-off-by: Vikas Shivappa <vikas.shivappa@linux.intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: ravi.v.shankar@intel.com
+	Cc: tony.luck@intel.com
+	Cc: fenghua.yu@intel.com
+	Cc: peterz@infradead.org
+	Cc: eranian@google.com
+	Cc: vikas.shivappa@intel.com
+	Cc: ak@linux.intel.com
+	Cc: davidcc@google.com
+Link: http://lkml.kernel.org/r/1502845243-20454-3-git-send-email-vikas.shivappa@linux.intel.com
+
+(cherry picked from commit 24247aeeabe99eab13b798ccccc2dec066dd6f07)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/intel_rdt.c
+#	arch/x86/kernel/cpu/intel_rdt.h
+#	arch/x86/kernel/cpu/intel_rdt_monitor.c
+diff --cc arch/x86/kernel/cpu/intel_rdt.c
+index ad087dd4421e,6935c8ecad7f..000000000000
+--- a/arch/x86/kernel/cpu/intel_rdt.c
++++ b/arch/x86/kernel/cpu/intel_rdt.c
+@@@ -280,6 -390,70 +280,73 @@@ static struct rdt_domain *rdt_find_doma
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int domain_setup_ctrlval(struct rdt_resource *r, struct rdt_domain *d)
++ {
++ 	struct msr_param m;
++ 	u32 *dc;
++ 	int i;
++ 
++ 	dc = kmalloc_array(r->num_closid, sizeof(*d->ctrl_val), GFP_KERNEL);
++ 	if (!dc)
++ 		return -ENOMEM;
++ 
++ 	d->ctrl_val = dc;
++ 
++ 	/*
++ 	 * Initialize the Control MSRs to having no control.
++ 	 * For Cache Allocation: Set all bits in cbm
++ 	 * For Memory Allocation: Set b/w requested to 100
++ 	 */
++ 	for (i = 0; i < r->num_closid; i++, dc++)
++ 		*dc = r->default_ctrl;
++ 
++ 	m.low = 0;
++ 	m.high = r->num_closid;
++ 	r->msr_update(d, &m, r);
++ 	return 0;
++ }
++ 
++ static int domain_setup_mon_state(struct rdt_resource *r, struct rdt_domain *d)
++ {
++ 	size_t tsize;
++ 
++ 	if (is_llc_occupancy_enabled()) {
++ 		d->rmid_busy_llc = kcalloc(BITS_TO_LONGS(r->num_rmid),
++ 					   sizeof(unsigned long),
++ 					   GFP_KERNEL);
++ 		if (!d->rmid_busy_llc)
++ 			return -ENOMEM;
++ 		INIT_DELAYED_WORK(&d->cqm_limbo, cqm_handle_limbo);
++ 	}
++ 	if (is_mbm_total_enabled()) {
++ 		tsize = sizeof(*d->mbm_total);
++ 		d->mbm_total = kcalloc(r->num_rmid, tsize, GFP_KERNEL);
++ 		if (!d->mbm_total) {
++ 			kfree(d->rmid_busy_llc);
++ 			return -ENOMEM;
++ 		}
++ 	}
++ 	if (is_mbm_local_enabled()) {
++ 		tsize = sizeof(*d->mbm_local);
++ 		d->mbm_local = kcalloc(r->num_rmid, tsize, GFP_KERNEL);
++ 		if (!d->mbm_local) {
++ 			kfree(d->rmid_busy_llc);
++ 			kfree(d->mbm_total);
++ 			return -ENOMEM;
++ 		}
++ 	}
++ 
++ 	if (is_mbm_enabled()) {
++ 		INIT_DELAYED_WORK(&d->mbm_over, mbm_handle_overflow);
++ 		mbm_setup_overflow_handler(d, MBM_OVERFLOW_INTERVAL);
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 24247aeeabe9 (x86/intel_rdt/cqm: Improve limbo list processing)
+  /*
+   * domain_add_cpu - Add a cpu to a resource's domain list.
+   *
+@@@ -347,9 -524,46 +414,41 @@@ static void domain_remove_cpu(int cpu, 
+  
+  	cpumask_clear_cpu(cpu, &d->cpu_mask);
+  	if (cpumask_empty(&d->cpu_mask)) {
+ -		/*
+ -		 * If resctrl is mounted, remove all the
+ -		 * per domain monitor data directories.
+ -		 */
+ -		if (static_branch_unlikely(&rdt_mon_enable_key))
+ -			rmdir_mondata_subdir_allrdtgrp(r, d->id);
+ -		kfree(d->ctrl_val);
+ -		kfree(d->rmid_busy_llc);
+ -		kfree(d->mbm_total);
+ -		kfree(d->mbm_local);
+ +		kfree(d->cbm);
+  		list_del(&d->list);
+++<<<<<<< HEAD
+ +		kfree(d);
+++=======
++ 		if (is_mbm_enabled())
++ 			cancel_delayed_work(&d->mbm_over);
++ 		if (is_llc_occupancy_enabled() &&  has_busy_rmid(r, d)) {
++ 			/*
++ 			 * When a package is going down, forcefully
++ 			 * decrement rmid->ebusy. There is no way to know
++ 			 * that the L3 was flushed and hence may lead to
++ 			 * incorrect counts in rare scenarios, but leaving
++ 			 * the RMID as busy creates RMID leaks if the
++ 			 * package never comes back.
++ 			 */
++ 			__check_limbo(d, true);
++ 			cancel_delayed_work(&d->cqm_limbo);
++ 		}
++ 
++ 		kfree(d);
++ 		return;
++ 	}
++ 
++ 	if (r == &rdt_resources_all[RDT_RESOURCE_L3]) {
++ 		if (is_mbm_enabled() && cpu == d->mbm_work_cpu) {
++ 			cancel_delayed_work(&d->mbm_over);
++ 			mbm_setup_overflow_handler(d, 0);
++ 		}
++ 		if (is_llc_occupancy_enabled() && cpu == d->cqm_work_cpu &&
++ 		    has_busy_rmid(r, d)) {
++ 			cancel_delayed_work(&d->cqm_limbo);
++ 			cqm_setup_limbo_handler(d, 0);
++ 		}
+++>>>>>>> 24247aeeabe9 (x86/intel_rdt/cqm: Improve limbo list processing)
+  	}
+  }
+  
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.h
+* Unmerged path arch/x86/kernel/cpu/intel_rdt_monitor.c
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.c
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.h
+* Unmerged path arch/x86/kernel/cpu/intel_rdt_monitor.c
