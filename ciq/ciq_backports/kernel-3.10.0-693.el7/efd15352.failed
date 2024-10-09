@@ -1,0 +1,91 @@
+xen-blkfront: don't call talk_to_blkback when already connected to blkback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Bob Liu <bob.liu@oracle.com>
+commit efd1535270c1deb0487527bf0c3c827301a69c93
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/efd15352.failed
+
+Sometimes blkfront may twice receive blkback_changed() notification
+(XenbusStateConnected) after migration, which will cause
+talk_to_blkback() to be called twice too and confuse xen-blkback.
+
+The flow is as follow:
+   blkfront                                        blkback
+blkfront_resume()
+ > talk_to_blkback()
+  > Set blkfront to XenbusStateInitialised
+                                                front changed()
+                                                 > Connect()
+                                                  > Set blkback to XenbusStateConnected
+
+blkback_changed()
+ > Skip talk_to_blkback()
+   because frontstate == XenbusStateInitialised
+ > blkfront_connect()
+  > Set blkfront to XenbusStateConnected
+
+-----
+And here we get another XenbusStateConnected notification leading
+to:
+-----
+blkback_changed()
+ > because now frontstate != XenbusStateInitialised
+   talk_to_blkback() is also called again
+  > blkfront state changed from
+  XenbusStateConnected to XenbusStateInitialised
+    (Which is not correct!)
+
+						front_changed():
+                                                 > Do nothing because blkback
+                                                   already in XenbusStateConnected
+
+Now blkback is in XenbusStateConnected but blkfront is still
+in XenbusStateInitialised - leading to no disks.
+
+Poking of the XenbusStateConnected state is allowed (to deal with
+block disk change) and has to be dealt with. The most likely
+cause of this bug are custom udev scripts hooking up the disks
+and then validating the size.
+
+	Signed-off-by: Bob Liu <bob.liu@oracle.com>
+	Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+(cherry picked from commit efd1535270c1deb0487527bf0c3c827301a69c93)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/xen-blkfront.c
+diff --cc drivers/block/xen-blkfront.c
+index f6a97f7f4ca5,6ba8891e8efe..000000000000
+--- a/drivers/block/xen-blkfront.c
++++ b/drivers/block/xen-blkfront.c
+@@@ -1914,6 -2485,23 +1914,26 @@@ static void blkback_changed(struct xenb
+  		break;
+  
+  	case XenbusStateConnected:
+++<<<<<<< HEAD
+++=======
++ 		/*
++ 		 * talk_to_blkback sets state to XenbusStateInitialised
++ 		 * and blkfront_connect sets it to XenbusStateConnected
++ 		 * (if connection went OK).
++ 		 *
++ 		 * If the backend (or toolstack) decides to poke at backend
++ 		 * state (and re-trigger the watch by setting the state repeatedly
++ 		 * to XenbusStateConnected (4)) we need to deal with this.
++ 		 * This is allowed as this is used to communicate to the guest
++ 		 * that the size of disk has changed!
++ 		 */
++ 		if ((dev->state != XenbusStateInitialised) &&
++ 		    (dev->state != XenbusStateConnected)) {
++ 			if (talk_to_blkback(dev, info))
++ 				break;
++ 		}
++ 
+++>>>>>>> efd1535270c1 (xen-blkfront: don't call talk_to_blkback when already connected to blkback)
+  		blkfront_connect(info);
+  		break;
+  
+* Unmerged path drivers/block/xen-blkfront.c
