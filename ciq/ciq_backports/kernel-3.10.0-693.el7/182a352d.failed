@@ -1,0 +1,226 @@
+gre: Create common functions for transmit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Tom Herbert <tom@herbertland.com>
+commit 182a352d2d5e0b435f7856c0cc23d467dcec55ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/182a352d.failed
+
+Create common functions for both IPv4 and IPv6 GRE in transmit. These
+are put into gre.h.
+
+Common functions are for:
+  - GRE checksum calculation. Move gre_checksum to gre.h.
+  - Building a GRE header. Move GRE build_header and rename
+    gre_build_header.
+
+	Signed-off-by: Tom Herbert <tom@herbertland.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 182a352d2d5e0b435f7856c0cc23d467dcec55ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/gre.h
+#	net/ipv4/ip_gre.c
+diff --cc include/net/gre.h
+index 898513e436c5,29e37322c06e..000000000000
+--- a/include/net/gre.h
++++ b/include/net/gre.h
+@@@ -23,5 -23,110 +23,114 @@@ struct gre_protocol 
+  int gre_add_protocol(const struct gre_protocol *proto, u8 version);
+  int gre_del_protocol(const struct gre_protocol *proto, u8 version);
+  
+++<<<<<<< HEAD
+ +struct net_device *gretap_fb_dev_create(struct net *net, const char *name);
+++=======
++ struct net_device *gretap_fb_dev_create(struct net *net, const char *name,
++ 				       u8 name_assign_type);
++ int gre_parse_header(struct sk_buff *skb, struct tnl_ptk_info *tpi,
++ 		     bool *csum_err, int *hdr_len);
++ 
++ static inline int gre_calc_hlen(__be16 o_flags)
++ {
++ 	int addend = 4;
++ 
++ 	if (o_flags & TUNNEL_CSUM)
++ 		addend += 4;
++ 	if (o_flags & TUNNEL_KEY)
++ 		addend += 4;
++ 	if (o_flags & TUNNEL_SEQ)
++ 		addend += 4;
++ 	return addend;
++ }
++ 
++ static inline __be16 gre_flags_to_tnl_flags(__be16 flags)
++ {
++ 	__be16 tflags = 0;
++ 
++ 	if (flags & GRE_CSUM)
++ 		tflags |= TUNNEL_CSUM;
++ 	if (flags & GRE_ROUTING)
++ 		tflags |= TUNNEL_ROUTING;
++ 	if (flags & GRE_KEY)
++ 		tflags |= TUNNEL_KEY;
++ 	if (flags & GRE_SEQ)
++ 		tflags |= TUNNEL_SEQ;
++ 	if (flags & GRE_STRICT)
++ 		tflags |= TUNNEL_STRICT;
++ 	if (flags & GRE_REC)
++ 		tflags |= TUNNEL_REC;
++ 	if (flags & GRE_VERSION)
++ 		tflags |= TUNNEL_VERSION;
++ 
++ 	return tflags;
++ }
++ 
++ static inline __be16 gre_tnl_flags_to_gre_flags(__be16 tflags)
++ {
++ 	__be16 flags = 0;
++ 
++ 	if (tflags & TUNNEL_CSUM)
++ 		flags |= GRE_CSUM;
++ 	if (tflags & TUNNEL_ROUTING)
++ 		flags |= GRE_ROUTING;
++ 	if (tflags & TUNNEL_KEY)
++ 		flags |= GRE_KEY;
++ 	if (tflags & TUNNEL_SEQ)
++ 		flags |= GRE_SEQ;
++ 	if (tflags & TUNNEL_STRICT)
++ 		flags |= GRE_STRICT;
++ 	if (tflags & TUNNEL_REC)
++ 		flags |= GRE_REC;
++ 	if (tflags & TUNNEL_VERSION)
++ 		flags |= GRE_VERSION;
++ 
++ 	return flags;
++ }
++ 
++ static inline __sum16 gre_checksum(struct sk_buff *skb)
++ {
++ 	__wsum csum;
++ 
++ 	if (skb->ip_summed == CHECKSUM_PARTIAL)
++ 		csum = lco_csum(skb);
++ 	else
++ 		csum = skb_checksum(skb, 0, skb->len, 0);
++ 	return csum_fold(csum);
++ }
++ 
++ static inline void gre_build_header(struct sk_buff *skb, int hdr_len,
++ 				    __be16 flags, __be16 proto,
++ 				    __be32 key, __be32 seq)
++ {
++ 	struct gre_base_hdr *greh;
++ 
++ 	skb_push(skb, hdr_len);
++ 
++ 	skb_reset_transport_header(skb);
++ 	greh = (struct gre_base_hdr *)skb->data;
++ 	greh->flags = gre_tnl_flags_to_gre_flags(flags);
++ 	greh->protocol = proto;
++ 
++ 	if (flags & (TUNNEL_KEY | TUNNEL_CSUM | TUNNEL_SEQ)) {
++ 		__be32 *ptr = (__be32 *)(((u8 *)greh) + hdr_len - 4);
++ 
++ 		if (flags & TUNNEL_SEQ) {
++ 			*ptr = seq;
++ 			ptr--;
++ 		}
++ 		if (flags & TUNNEL_KEY) {
++ 			*ptr = key;
++ 			ptr--;
++ 		}
++ 		if (flags & TUNNEL_CSUM &&
++ 		    !(skb_shinfo(skb)->gso_type &
++ 		      (SKB_GSO_GRE | SKB_GSO_GRE_CSUM))) {
++ 			*ptr = 0;
++ 			*(__sum16 *)ptr = gre_checksum(skb);
++ 		}
++ 	}
++ }
++ 
+++>>>>>>> 182a352d2d5e (gre: Create common functions for transmit)
+  #endif
+diff --cc net/ipv4/ip_gre.c
+index 5cd0e7261a0a,2480d79b0e37..000000000000
+--- a/net/ipv4/ip_gre.c
++++ b/net/ipv4/ip_gre.c
+@@@ -441,49 -329,6 +441,52 @@@ drop
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static __sum16 gre_checksum(struct sk_buff *skb)
+ +{
+ +	__wsum csum;
+ +
+ +	if (skb->ip_summed == CHECKSUM_PARTIAL)
+ +		csum = lco_csum(skb);
+ +	else
+ +		csum = skb_checksum(skb, 0, skb->len, 0);
+ +	return csum_fold(csum);
+ +}
+ +
+ +static void build_header(struct sk_buff *skb, int hdr_len, __be16 flags,
+ +			 __be16 proto, __be32 key, __be32 seq)
+ +{
+ +	struct gre_base_hdr *greh;
+ +
+ +	skb_push(skb, hdr_len);
+ +
+ +	skb_reset_transport_header(skb);
+ +	greh = (struct gre_base_hdr *)skb->data;
+ +	greh->flags = tnl_flags_to_gre_flags(flags);
+ +	greh->protocol = proto;
+ +
+ +	if (flags & (TUNNEL_KEY | TUNNEL_CSUM | TUNNEL_SEQ)) {
+ +		__be32 *ptr = (__be32 *)(((u8 *)greh) + hdr_len - 4);
+ +
+ +		if (flags & TUNNEL_SEQ) {
+ +			*ptr = seq;
+ +			ptr--;
+ +		}
+ +		if (flags & TUNNEL_KEY) {
+ +			*ptr = key;
+ +			ptr--;
+ +		}
+ +		if (flags & TUNNEL_CSUM &&
+ +		    !(skb_shinfo(skb)->gso_type &
+ +		      (SKB_GSO_GRE | SKB_GSO_GRE_CSUM))) {
+ +			*ptr = 0;
+ +			*(__sum16 *)ptr = gre_checksum(skb);
+ +		}
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> 182a352d2d5e (gre: Create common functions for transmit)
+  static void __gre_xmit(struct sk_buff *skb, struct net_device *dev,
+  		       const struct iphdr *tnl_params,
+  		       __be16 proto)
+@@@ -571,15 -414,12 +575,20 @@@ static void gre_fb_xmit(struct sk_buff 
+  	}
+  
+  	/* Push Tunnel header. */
+ -	if (gre_handle_offloads(skb, !!(tun_info->key.tun_flags & TUNNEL_CSUM)))
+ +	skb = gre_handle_offloads(skb, !!(tun_info->key.tun_flags & TUNNEL_CSUM));
+ +	if (IS_ERR(skb)) {
+ +		skb = NULL;
+  		goto err_free_rt;
+ +	}
+  
+  	flags = tun_info->key.tun_flags & (TUNNEL_CSUM | TUNNEL_KEY);
+++<<<<<<< HEAD
+ +	build_header(skb, tunnel_hlen, flags, proto,
+ +		     tunnel_id_to_key(tun_info->key.tun_id), 0);
+++=======
++ 	gre_build_header(skb, tunnel_hlen, flags, htons(ETH_P_TEB),
++ 			 tunnel_id_to_key(tun_info->key.tun_id), 0);
+++>>>>>>> 182a352d2d5e (gre: Create common functions for transmit)
+  
+  	df = key->tun_flags & TUNNEL_DONT_FRAGMENT ?  htons(IP_DF) : 0;
+  
+* Unmerged path include/net/gre.h
+* Unmerged path net/ipv4/ip_gre.c
