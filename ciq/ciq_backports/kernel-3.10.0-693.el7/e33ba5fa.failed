@@ -1,0 +1,111 @@
+random: fix nasty entropy accounting bug
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Theodore Ts'o <tytso@mit.edu>
+commit e33ba5fa7afce1a9f159704121d4e4d110df8185
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/e33ba5fa.failed
+
+Commit 0fb7a01af5b0 "random: simplify accounting code", introduced in
+v3.15, has a very nasty accounting problem when the entropy pool has
+has fewer bytes of entropy than the number of requested reserved
+bytes.  In that case, "have_bytes - reserved" goes negative, and since
+size_t is unsigned, the expression:
+
+       ibytes = min_t(size_t, ibytes, have_bytes - reserved);
+
+... does not do the right thing.  This is rather bad, because it
+defeats the catastrophic reseeding feature in the
+xfer_secondary_pool() path.
+
+It also can cause the "BUG: spinlock trylock failure on UP" for some
+kernel configurations when prandom_reseed() calls get_random_bytes()
+in the early init, since when the entropy count gets corrupted,
+credit_entropy_bits() erroneously believes that the nonblocking pool
+has been fully initialized (when in fact it is not), and so it calls
+prandom_reseed(true) recursively leading to the spinlock BUG.
+
+The logic is *not* the same it was originally, but in the cases where
+it matters, the behavior is the same, and the resulting code is
+hopefully easier to read and understand.
+
+Fixes: 0fb7a01af5b0 "random: simplify accounting code"
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+	Cc: Greg Price <price@mit.edu>
+	Cc: stable@vger.kernel.org  #v3.15
+(cherry picked from commit e33ba5fa7afce1a9f159704121d4e4d110df8185)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/char/random.c
+diff --cc drivers/char/random.c
+index e014a74135d7,2b6e4cd8de8e..000000000000
+--- a/drivers/char/random.c
++++ b/drivers/char/random.c
+@@@ -946,9 -979,6 +946,12 @@@ static void xfer_secondary_pool(struct 
+  static size_t account(struct entropy_store *r, size_t nbytes, int min,
+  		      int reserved)
+  {
+++<<<<<<< HEAD
+ +	unsigned long flags;
+ +	int wakeup_write = 0;
+ +	int have_bytes;
+++=======
+++>>>>>>> e33ba5fa7afc (random: fix nasty entropy accounting bug)
+  	int entropy_count, orig;
+  	size_t ibytes;
+  
+@@@ -962,30 -987,26 +965,44 @@@
+  	/* Can we pull enough? */
+  retry:
+  	entropy_count = orig = ACCESS_ONCE(r->entropy_count);
+- 	have_bytes = entropy_count >> (ENTROPY_SHIFT + 3);
+  	ibytes = nbytes;
+++<<<<<<< HEAD
+ +	if (have_bytes < min + reserved) {
+ +		ibytes = 0;
+ +	} else {
+ +		/* If limited, never pull more than available */
+ +		if (r->limit)
+ +			ibytes = min_t(size_t, ibytes, have_bytes - reserved);
+ +		entropy_count = max_t(int, 0,
+ +			    entropy_count - (ibytes << (ENTROPY_SHIFT + 3)));
+ +		if (cmpxchg(&r->entropy_count, orig, entropy_count) != orig)
+ +			goto retry;
+++=======
++ 	/* If limited, never pull more than available */
++ 	if (r->limit) {
++ 		int have_bytes = entropy_count >> (ENTROPY_SHIFT + 3);
++ 
++ 		if ((have_bytes -= reserved) < 0)
++ 			have_bytes = 0;
++ 		ibytes = min_t(size_t, ibytes, have_bytes);
++ 	}
++ 	if (ibytes < min)
++ 		ibytes = 0;
++ 	if ((entropy_count -= ibytes << (ENTROPY_SHIFT + 3)) < 0)
++ 		entropy_count = 0;
+++>>>>>>> e33ba5fa7afc (random: fix nasty entropy accounting bug)
+  
+ -	if (cmpxchg(&r->entropy_count, orig, entropy_count) != orig)
+ -		goto retry;
+ +		if ((r->entropy_count >> ENTROPY_SHIFT)
+ +		    < random_write_wakeup_thresh)
+ +			wakeup_write = 1;
+ +	}
+ +
+ +	DEBUG_ENT("debiting %zu entropy credits from %s%s\n",
+ +		  ibytes * 8, r->name, r->limit ? "" : " (unlimited)");
+ +
+ +	spin_unlock_irqrestore(&r->lock, flags);
+  
+ -	trace_debit_entropy(r->name, 8 * ibytes);
+ -	if (ibytes &&
+ -	    (r->entropy_count >> ENTROPY_SHIFT) < random_write_wakeup_bits) {
+ +	if (wakeup_write) {
+  		wake_up_interruptible(&random_write_wait);
+  		kill_fasync(&fasync, SIGIO, POLL_OUT);
+  	}
+* Unmerged path drivers/char/random.c
