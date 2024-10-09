@@ -1,0 +1,146 @@
+x86/mce: Include the PPIN in MCE records when available
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Tony Luck <tony.luck@intel.com>
+commit 3f5a7896a5096fd50030a04d4c3f28a7441e30a5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3f5a7896.failed
+
+Intel Xeons from Ivy Bridge onwards support a processor identification
+number set in the factory. To the user this is a handy unique number to
+identify a particular CPU. Intel can decode this to the fab/production
+run to track errors. On systems that have it, include it in the machine
+check record. I'm told that this would be helpful for users that run
+large data centers with multi-socket servers to keep track of which CPUs
+are seeing errors.
+
+Boris:
+* Add some clarifying comments and spacing.
+* Mask out [63:2] in the disabled-but-not-locked case
+* Call the MSR variable "val" for more readability.
+
+	Signed-off-by: Tony Luck <tony.luck@intel.com>
+	Cc: Ashok Raj <ashok.raj@intel.com>
+	Cc: linux-edac <linux-edac@vger.kernel.org>
+	Cc: x86-ml <x86@kernel.org>
+Link: http://lkml.kernel.org/r/20161123114855.njguoaygp3qnbkia@pd.tnic
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 3f5a7896a5096fd50030a04d4c3f28a7441e30a5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/cpufeatures.h
+* Unmerged path arch/x86/include/asm/cpufeatures.h
+* Unmerged path arch/x86/include/asm/cpufeatures.h
+diff --git a/arch/x86/include/asm/msr-index.h b/arch/x86/include/asm/msr-index.h
+index 3ffef0a3665d..ba5f56369905 100644
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -32,6 +32,10 @@
+ #define EFER_FFXSR		(1<<_EFER_FFXSR)
+ 
+ /* Intel MSRs. Some also available on other CPUs */
++
++#define MSR_PPIN_CTL			0x0000004e
++#define MSR_PPIN			0x0000004f
++
+ #define MSR_IA32_PERFCTR0		0x000000c1
+ #define MSR_IA32_PERFCTR1		0x000000c2
+ #define MSR_FSB_FREQ			0x000000cd
+diff --git a/arch/x86/include/uapi/asm/mce.h b/arch/x86/include/uapi/asm/mce.h
+index 19ff17ff7be4..4fe37d086e2d 100644
+--- a/arch/x86/include/uapi/asm/mce.h
++++ b/arch/x86/include/uapi/asm/mce.h
+@@ -28,6 +28,7 @@ struct mce {
+ 	__u64 mcgcap;	/* MCGCAP MSR: machine check capabilities of CPU */
+ 	__u64 synd;	/* MCA_SYND MSR: only valid on SMCA systems */
+ 	__u64 ipid;	/* MCA_IPID MSR: only valid on SMCA systems */
++	__u64 ppin;	/* Protected Processor Inventory Number */
+ };
+ 
+ #define MCE_GET_RECORD_LEN   _IOR('M', 1, int)
+diff --git a/arch/x86/kernel/cpu/mcheck/mce.c b/arch/x86/kernel/cpu/mcheck/mce.c
+index 62de9881e444..d27de651c479 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce.c
++++ b/arch/x86/kernel/cpu/mcheck/mce.c
+@@ -42,6 +42,7 @@
+ #include <linux/irq_work.h>
+ #include <linux/export.h>
+ 
++#include <asm/intel-family.h>
+ #include <asm/processor.h>
+ #include <asm/mce.h>
+ #include <asm/msr.h>
+@@ -133,6 +134,9 @@ void mce_setup(struct mce *m)
+ 	m->socketid = cpu_data(m->extcpu).phys_proc_id;
+ 	m->apicid = cpu_data(m->extcpu).initial_apicid;
+ 	rdmsrl(MSR_IA32_MCG_CAP, m->mcgcap);
++
++	if (this_cpu_has(X86_FEATURE_INTEL_PPIN))
++		rdmsrl(MSR_PPIN, m->ppin);
+ }
+ 
+ DEFINE_PER_CPU(struct mce, injectm);
+diff --git a/arch/x86/kernel/cpu/mcheck/mce_intel.c b/arch/x86/kernel/cpu/mcheck/mce_intel.c
+index 69362d43d2b5..f6d04ee0a5c5 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce_intel.c
++++ b/arch/x86/kernel/cpu/mcheck/mce_intel.c
+@@ -11,6 +11,8 @@
+ #include <linux/sched.h>
+ #include <linux/cpumask.h>
+ #include <asm/apic.h>
++#include <asm/cpufeature.h>
++#include <asm/intel-family.h>
+ #include <asm/processor.h>
+ #include <asm/msr.h>
+ #include <asm/mce.h>
+@@ -464,11 +466,46 @@ static void intel_clear_lmce(void)
+ 	wrmsrl(MSR_IA32_MCG_EXT_CTL, val);
+ }
+ 
++static void intel_ppin_init(struct cpuinfo_x86 *c)
++{
++	unsigned long long val;
++
++	/*
++	 * Even if testing the presence of the MSR would be enough, we don't
++	 * want to risk the situation where other models reuse this MSR for
++	 * other purposes.
++	 */
++	switch (c->x86_model) {
++	case INTEL_FAM6_IVYBRIDGE_X:
++	case INTEL_FAM6_HASWELL_X:
++	case INTEL_FAM6_BROADWELL_XEON_D:
++	case INTEL_FAM6_BROADWELL_X:
++	case INTEL_FAM6_SKYLAKE_X:
++		if (rdmsrl_safe(MSR_PPIN_CTL, &val))
++			return;
++
++		if ((val & 3UL) == 1UL) {
++			/* PPIN available but disabled: */
++			return;
++		}
++
++		/* If PPIN is disabled, but not locked, try to enable: */
++		if (!(val & 3UL)) {
++			wrmsrl_safe(MSR_PPIN_CTL,  val | 2UL);
++			rdmsrl_safe(MSR_PPIN_CTL, &val);
++		}
++
++		if ((val & 3UL) == 2UL)
++			set_cpu_cap(c, X86_FEATURE_INTEL_PPIN);
++	}
++}
++
+ void mce_intel_feature_init(struct cpuinfo_x86 *c)
+ {
+ 	intel_init_thermal(c);
+ 	intel_init_cmci();
+ 	intel_init_lmce();
++	intel_ppin_init(c);
+ }
+ 
+ void mce_intel_feature_clear(struct cpuinfo_x86 *c)
