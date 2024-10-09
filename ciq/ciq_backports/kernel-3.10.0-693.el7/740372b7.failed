@@ -1,0 +1,154 @@
+tcmu: Allow cmd_time_out to be set to zero (disabled)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit 740372b76e7966604e0f4dd0de13135513024f0d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/740372b7.failed
+
+The new cmd_time_out configfs attribute for TCMU is allowed to
+be disabled, so go ahead and drop the tcmu_cmd_time_out_store()
+check.
+
+	Reported-by: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 740372b76e7966604e0f4dd0de13135513024f0d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 0879cc8822f7,6a17c78e4662..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -1173,92 -1164,46 +1173,101 @@@ static sector_t tcmu_get_blocks(struct 
+  static sense_reason_t
+  tcmu_parse_cdb(struct se_cmd *cmd)
+  {
+ -	return passthrough_parse_cdb(cmd, tcmu_queue_cmd);
+ -}
+ -
+ -static ssize_t tcmu_cmd_time_out_show(struct config_item *item, char *page)
+ -{
+ -	struct se_dev_attrib *da = container_of(to_config_group(item),
+ -					struct se_dev_attrib, da_group);
+ -	struct tcmu_dev *udev = container_of(da->da_dev,
+ -					struct tcmu_dev, se_dev);
+ +	unsigned char *cdb = cmd->t_task_cdb;
+  
+ -	return snprintf(page, PAGE_SIZE, "%lu\n", udev->cmd_time_out / MSEC_PER_SEC);
+ -}
+ +	/*
+ +	 * Clear a lun set in the cdb if the initiator talking to use spoke
+ +	 * and old standards version, as we can't assume the underlying device
+ +	 * won't choke up on it.
+ +	 */
+ +	switch (cdb[0]) {
+ +	case READ_10: /* SBC - RDProtect */
+ +	case READ_12: /* SBC - RDProtect */
+ +	case READ_16: /* SBC - RDProtect */
+ +	case SEND_DIAGNOSTIC: /* SPC - SELF-TEST Code */
+ +	case VERIFY: /* SBC - VRProtect */
+ +	case VERIFY_16: /* SBC - VRProtect */
+ +	case WRITE_VERIFY: /* SBC - VRProtect */
+ +	case WRITE_VERIFY_12: /* SBC - VRProtect */
+ +	case MAINTENANCE_IN: /* SPC - Parameter Data Format for SA RTPG */
+ +		break;
+ +	default:
+ +		cdb[1] &= 0x1f; /* clear logical unit number */
+ +		break;
+ +	}
+  
+ -static ssize_t tcmu_cmd_time_out_store(struct config_item *item, const char *page,
+ -				       size_t count)
+ -{
+ -	struct se_dev_attrib *da = container_of(to_config_group(item),
+ -					struct se_dev_attrib, da_group);
+ -	struct tcmu_dev *udev = container_of(da->da_dev,
+ -					struct tcmu_dev, se_dev);
+ -	u32 val;
+ -	int ret;
+++<<<<<<< HEAD
+ +	/*
+ +	 * For REPORT LUNS we always need to emulate the response, for everything
+ +	 * else, pass it up.
+ +	 */
+ +	if (cdb[0] == REPORT_LUNS) {
+ +		cmd->execute_cmd = spc_emulate_report_luns;
+ +		return TCM_NO_SENSE;
+ +	}
+  
+ -	if (da->da_dev->export_count) {
+ -		pr_err("Unable to set tcmu cmd_time_out while exports exist\n");
+ -		return -EINVAL;
+ +	/* Set DATA_CDB flag for ops that should have it */
+ +	switch (cdb[0]) {
+ +	case READ_6:
+ +	case READ_10:
+ +	case READ_12:
+ +	case READ_16:
+ +	case WRITE_6:
+ +	case WRITE_10:
+ +	case WRITE_12:
+ +	case WRITE_16:
+ +	case WRITE_VERIFY:
+ +	case WRITE_VERIFY_12:
+ +	case 0x8e: /* WRITE_VERIFY_16 */
+ +	case COMPARE_AND_WRITE:
+ +	case XDWRITEREAD_10:
+ +		cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
+ +		break;
+ +	case VARIABLE_LENGTH_CMD:
+ +		switch (get_unaligned_be16(&cdb[8])) {
+ +		case READ_32:
+ +		case WRITE_32:
+ +		case 0x0c: /* WRITE_VERIFY_32 */
+ +		case XDWRITEREAD_32:
+ +			cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
+ +			break;
+ +		}
+  	}
+  
+ +	cmd->execute_cmd = tcmu_queue_cmd;
+ +
+ +	return TCM_NO_SENSE;
+++=======
++ 	ret = kstrtou32(page, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	udev->cmd_time_out = val * MSEC_PER_SEC;
++ 	return count;
+++>>>>>>> 740372b76e79 (tcmu: Allow cmd_time_out to be set to zero (disabled))
+  }
+ -CONFIGFS_ATTR(tcmu_, cmd_time_out);
+  
+ -static struct configfs_attribute **tcmu_attrs;
+ +DEF_TB_DEV_ATTRIB_RO(tcmu, hw_pi_prot_type);
+ +TB_DEV_ATTR_RO(tcmu, hw_pi_prot_type);
+  
+ -static struct target_backend_ops tcmu_ops = {
+ +DEF_TB_DEV_ATTRIB_RO(tcmu, hw_block_size);
+ +TB_DEV_ATTR_RO(tcmu, hw_block_size);
+ +
+ +DEF_TB_DEV_ATTRIB_RO(tcmu, hw_max_sectors);
+ +TB_DEV_ATTR_RO(tcmu, hw_max_sectors);
+ +
+ +DEF_TB_DEV_ATTRIB_RO(tcmu, hw_queue_depth);
+ +TB_DEV_ATTR_RO(tcmu, hw_queue_depth);
+ +
+ +static struct configfs_attribute *tcmu_backend_dev_attrs[] = {
+ +	&tcmu_dev_attrib_hw_pi_prot_type.attr,
+ +	&tcmu_dev_attrib_hw_block_size.attr,
+ +	&tcmu_dev_attrib_hw_max_sectors.attr,
+ +	&tcmu_dev_attrib_hw_queue_depth.attr,
+ +	NULL,
+ +};
+ +
+ +static struct se_subsystem_api tcmu_template = {
+  	.name			= "user",
+  	.owner			= THIS_MODULE,
+  	.transport_flags	= TRANSPORT_FLAG_PASSTHROUGH,
+* Unmerged path drivers/target/target_core_user.c
