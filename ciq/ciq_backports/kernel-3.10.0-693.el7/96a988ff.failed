@@ -1,0 +1,150 @@
+CIFS: Fix a possible double locking of mutex during reconnect
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Pavel Shilovsky <pshilov@microsoft.com>
+commit 96a988ffeb90dba33a71c3826086fe67c897a183
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/96a988ff.failed
+
+With the current code it is possible to lock a mutex twice when
+a subsequent reconnects are triggered. On the 1st reconnect we
+reconnect sessions and tcons and then persistent file handles.
+If the 2nd reconnect happens during the reconnecting of persistent
+file handles then the following sequence of calls is observed:
+
+cifs_reopen_file -> SMB2_open -> small_smb2_init -> smb2_reconnect
+-> cifs_reopen_persistent_file_handles -> cifs_reopen_file (again!).
+
+So, we are trying to acquire the same cfile->fh_mutex twice which
+is wrong. Fix this by moving reconnecting of persistent handles to
+the delayed work (smb2_reconnect_server) and submitting this work
+every time we reconnect tcon in SMB2 commands handling codepath.
+
+This can also lead to corruption of a temporary file list in
+cifs_reopen_persistent_file_handles() because we can recursively
+call this function twice.
+
+	Cc: Stable <stable@vger.kernel.org> # v4.9+
+	Signed-off-by: Pavel Shilovsky <pshilov@microsoft.com>
+(cherry picked from commit 96a988ffeb90dba33a71c3826086fe67c897a183)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/smb2pdu.c
+diff --cc fs/cifs/smb2pdu.c
+index f096a34e5b48,87457227812c..000000000000
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@@ -1827,6 -1975,55 +1830,58 @@@ smb2_echo_callback(struct mid_q_entry *
+  	add_credits(server, credits_received, CIFS_ECHO_OP);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void smb2_reconnect_server(struct work_struct *work)
++ {
++ 	struct TCP_Server_Info *server = container_of(work,
++ 					struct TCP_Server_Info, reconnect.work);
++ 	struct cifs_ses *ses;
++ 	struct cifs_tcon *tcon, *tcon2;
++ 	struct list_head tmp_list;
++ 	int tcon_exist = false;
++ 
++ 	/* Prevent simultaneous reconnects that can corrupt tcon->rlist list */
++ 	mutex_lock(&server->reconnect_mutex);
++ 
++ 	INIT_LIST_HEAD(&tmp_list);
++ 	cifs_dbg(FYI, "Need negotiate, reconnecting tcons\n");
++ 
++ 	spin_lock(&cifs_tcp_ses_lock);
++ 	list_for_each_entry(ses, &server->smb_ses_list, smb_ses_list) {
++ 		list_for_each_entry(tcon, &ses->tcon_list, tcon_list) {
++ 			if (tcon->need_reconnect || tcon->need_reopen_files) {
++ 				tcon->tc_count++;
++ 				list_add_tail(&tcon->rlist, &tmp_list);
++ 				tcon_exist = true;
++ 			}
++ 		}
++ 	}
++ 	/*
++ 	 * Get the reference to server struct to be sure that the last call of
++ 	 * cifs_put_tcon() in the loop below won't release the server pointer.
++ 	 */
++ 	if (tcon_exist)
++ 		server->srv_count++;
++ 
++ 	spin_unlock(&cifs_tcp_ses_lock);
++ 
++ 	list_for_each_entry_safe(tcon, tcon2, &tmp_list, rlist) {
++ 		if (!smb2_reconnect(SMB2_INTERNAL_CMD, tcon))
++ 			cifs_reopen_persistent_handles(tcon);
++ 		list_del_init(&tcon->rlist);
++ 		cifs_put_tcon(tcon);
++ 	}
++ 
++ 	cifs_dbg(FYI, "Reconnecting tcons finished\n");
++ 	mutex_unlock(&server->reconnect_mutex);
++ 
++ 	/* now we can safely release srv struct */
++ 	if (tcon_exist)
++ 		cifs_put_tcp_session(server, 1);
++ }
++ 
+++>>>>>>> 96a988ffeb90 (CIFS: Fix a possible double locking of mutex during reconnect)
+  int
+  SMB2_echo(struct TCP_Server_Info *server)
+  {
+diff --git a/fs/cifs/cifsglob.h b/fs/cifs/cifsglob.h
+index a2bfa8e7862b..65bc18325c0e 100644
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -921,6 +921,7 @@ struct cifs_tcon {
+ 	bool broken_posix_open; /* e.g. Samba server versions < 3.3.2, 3.2.9 */
+ 	bool broken_sparse_sup; /* if server or share does not support sparse */
+ 	bool need_reconnect:1; /* connection reset, tid now invalid */
++	bool need_reopen_files:1; /* need to reopen tcon file handles */
+ 	bool use_resilient:1; /* use resilient instead of durable handles */
+ 	bool use_persistent:1; /* use persistent instead of durable handles */
+ #ifdef CONFIG_CIFS_SMB2
+diff --git a/fs/cifs/file.c b/fs/cifs/file.c
+index 99620b9ffbac..3534df984bce 100644
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@ -776,6 +776,11 @@ cifs_reopen_persistent_handles(struct cifs_tcon *tcon)
+ 	struct list_head *tmp1;
+ 	struct list_head tmp_list;
+ 
++	if (!tcon->use_persistent || !tcon->need_reopen_files)
++		return;
++
++	tcon->need_reopen_files = false;
++
+ 	cifs_dbg(FYI, "Reopen persistent handles");
+ 	INIT_LIST_HEAD(&tmp_list);
+ 
+@@ -792,7 +797,8 @@ cifs_reopen_persistent_handles(struct cifs_tcon *tcon)
+ 
+ 	list_for_each_safe(tmp, tmp1, &tmp_list) {
+ 		open_file = list_entry(tmp, struct cifsFileInfo, rlist);
+-		cifs_reopen_file(open_file, false /* do not flush */);
++		if (cifs_reopen_file(open_file, false /* do not flush */))
++			tcon->need_reopen_files = true;
+ 		list_del_init(&open_file->rlist);
+ 		cifsFileInfo_put(open_file);
+ 	}
+* Unmerged path fs/cifs/smb2pdu.c
+diff --git a/fs/cifs/smb2pdu.h b/fs/cifs/smb2pdu.h
+index b8f553b32dda..f84e4070d50a 100644
+--- a/fs/cifs/smb2pdu.h
++++ b/fs/cifs/smb2pdu.h
+@@ -80,6 +80,8 @@
+ #define SMB2_SET_INFO		cpu_to_le16(SMB2_SET_INFO_HE)
+ #define SMB2_OPLOCK_BREAK	cpu_to_le16(SMB2_OPLOCK_BREAK_HE)
+ 
++#define SMB2_INTERNAL_CMD	cpu_to_le16(0xFFFF)
++
+ #define NUMBER_OF_SMB2_COMMANDS	0x0013
+ 
+ /* BB FIXME - analyze following length BB */
