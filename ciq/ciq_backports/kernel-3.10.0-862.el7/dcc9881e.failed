@@ -1,0 +1,300 @@
+RDMA/(core, ulp): Convert register/unregister event handler to be void
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [infiniband] (core, ulp): Convert register/unregister event handler to be void (Don Dutile) [1499364 1456692]
+Rebuild_FUZZ: 96.30%
+commit-author Leon Romanovsky <leonro@mellanox.com>
+commit dcc9881e6767559c04faf15804ac145a2ea026cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/dcc9881e.failed
+
+The functions ib_register_event_handler() and
+ib_unregister_event_handler() always returned success and they can't fail.
+
+Let's convert those functions to be void, remove redundant checks and
+cleanup tons of goto statements.
+
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit dcc9881e6767559c04faf15804ac145a2ea026cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/uverbs_main.c
+#	drivers/infiniband/ulp/iser/iser_verbs.c
+diff --cc drivers/infiniband/core/uverbs_main.c
+index b76fb42cc8aa,defeda33e27f..000000000000
+--- a/drivers/infiniband/core/uverbs_main.c
++++ b/drivers/infiniband/core/uverbs_main.c
+@@@ -633,13 -581,20 +633,12 @@@ void ib_uverbs_free_async_event_file(st
+  	file->async_file = NULL;
+  }
+  
+ -void ib_uverbs_init_event_queue(struct ib_uverbs_event_queue *ev_queue)
+ -{
+ -	spin_lock_init(&ev_queue->lock);
+ -	INIT_LIST_HEAD(&ev_queue->event_list);
+ -	init_waitqueue_head(&ev_queue->poll_wait);
+ -	ev_queue->is_closed   = 0;
+ -	ev_queue->async_queue = NULL;
+ -}
+ -
+ -struct file *ib_uverbs_alloc_async_event_file(struct ib_uverbs_file *uverbs_file,
+ -					      struct ib_device	*ib_dev)
+ +struct file *ib_uverbs_alloc_event_file(struct ib_uverbs_file *uverbs_file,
+ +					struct ib_device	*ib_dev,
+ +					int is_async)
+  {
+ -	struct ib_uverbs_async_event_file *ev_file;
+ +	struct ib_uverbs_event_file *ev_file;
+  	struct file *filp;
+- 	int ret;
+  
+  	ev_file = kzalloc(sizeof(*ev_file), GFP_KERNEL);
+  	if (!ev_file)
+@@@ -664,32 -614,20 +663,46 @@@
+  		      &uverbs_file->device->uverbs_events_file_list);
+  	mutex_unlock(&uverbs_file->device->lists_mutex);
+  
+++<<<<<<< HEAD
+ +	if (is_async) {
+ +		WARN_ON(uverbs_file->async_file);
+ +		uverbs_file->async_file = ev_file;
+ +		kref_get(&uverbs_file->async_file->ref);
+ +		INIT_IB_EVENT_HANDLER(&uverbs_file->event_handler,
+ +				      ib_dev,
+ +				      ib_uverbs_event_handler);
+ +		ret = ib_register_event_handler(&uverbs_file->event_handler);
+ +		if (ret)
+ +			goto err_put_file;
+ +
+ +		/* At that point async file stuff was fully set */
+ +		ev_file->is_async = 1;
+ +	}
+ +
+ +	return filp;
+ +
+ +err_put_file:
+ +	fput(filp);
+ +	kref_put(&uverbs_file->async_file->ref, ib_uverbs_release_event_file);
+ +	uverbs_file->async_file = NULL;
+ +	return ERR_PTR(ret);
+ +
+++=======
++ 	WARN_ON(uverbs_file->async_file);
++ 	uverbs_file->async_file = ev_file;
++ 	kref_get(&uverbs_file->async_file->ref);
++ 	INIT_IB_EVENT_HANDLER(&uverbs_file->event_handler,
++ 			      ib_dev,
++ 			      ib_uverbs_event_handler);
++ 	ib_register_event_handler(&uverbs_file->event_handler);
++ 	/* At that point async file stuff was fully set */
++ 
++ 	return filp;
++ 
+++>>>>>>> dcc9881e6767 (RDMA/(core, ulp): Convert register/unregister event handler to be void)
+  err_put_refs:
+  	kref_put(&ev_file->uverbs_file->ref, ib_uverbs_release_file);
+ -	kref_put(&ev_file->ref, ib_uverbs_release_async_event_file);
+ +	kref_put(&ev_file->ref, ib_uverbs_release_event_file);
+  	return filp;
+  }
+  
+diff --cc drivers/infiniband/ulp/iser/iser_verbs.c
+index 37cf678bc4df,55a73b0ed4c6..000000000000
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@@ -104,11 -104,9 +104,17 @@@ static int iser_create_device_ib_res(st
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	INIT_IB_EVENT_HANDLER(&device->event_handler, device->ib_device,
+ +				iser_event_handler);
+ +	if (ib_register_event_handler(&device->event_handler))
+ +		goto cq_err;
+ +
+++=======
++ 	INIT_IB_EVENT_HANDLER(&device->event_handler, ib_dev,
++ 			      iser_event_handler);
++ 	ib_register_event_handler(&device->event_handler);
+++>>>>>>> dcc9881e6767 (RDMA/(core, ulp): Convert register/unregister event handler to be void)
+  	return 0;
+  
+  cq_err:
+diff --git a/drivers/infiniband/core/cache.c b/drivers/infiniband/core/cache.c
+index b9c0066b704e..28f6a2064fe6 100644
+--- a/drivers/infiniband/core/cache.c
++++ b/drivers/infiniband/core/cache.c
+@@ -1184,30 +1184,23 @@ int ib_cache_setup_one(struct ib_device *device)
+ 	device->cache.ports =
+ 		kzalloc(sizeof(*device->cache.ports) *
+ 			(rdma_end_port(device) - rdma_start_port(device) + 1), GFP_KERNEL);
+-	if (!device->cache.ports) {
+-		err = -ENOMEM;
+-		goto out;
+-	}
++	if (!device->cache.ports)
++		return -ENOMEM;
+ 
+ 	err = gid_table_setup_one(device);
+-	if (err)
+-		goto out;
++	if (err) {
++		kfree(device->cache.ports);
++		device->cache.ports = NULL;
++		return err;
++	}
+ 
+ 	for (p = 0; p <= rdma_end_port(device) - rdma_start_port(device); ++p)
+ 		ib_cache_update(device, p + rdma_start_port(device));
+ 
+ 	INIT_IB_EVENT_HANDLER(&device->cache.event_handler,
+ 			      device, ib_cache_event);
+-	err = ib_register_event_handler(&device->cache.event_handler);
+-	if (err)
+-		goto err;
+-
++	ib_register_event_handler(&device->cache.event_handler);
+ 	return 0;
+-
+-err:
+-	gid_table_cleanup_one(device);
+-out:
+-	return err;
+ }
+ 
+ void ib_cache_release_one(struct ib_device *device)
+diff --git a/drivers/infiniband/core/device.c b/drivers/infiniband/core/device.c
+index 50e31193a367..90b51300e0e6 100644
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@ -597,7 +597,7 @@ EXPORT_SYMBOL(ib_set_client_data);
+  * chapter 11 of the InfiniBand Architecture Specification).  This
+  * callback may occur in interrupt context.
+  */
+-int ib_register_event_handler  (struct ib_event_handler *event_handler)
++void ib_register_event_handler(struct ib_event_handler *event_handler)
+ {
+ 	unsigned long flags;
+ 
+@@ -605,8 +605,6 @@ int ib_register_event_handler  (struct ib_event_handler *event_handler)
+ 	list_add_tail(&event_handler->list,
+ 		      &event_handler->device->event_handler_list);
+ 	spin_unlock_irqrestore(&event_handler->device->event_handler_lock, flags);
+-
+-	return 0;
+ }
+ EXPORT_SYMBOL(ib_register_event_handler);
+ 
+@@ -617,15 +615,13 @@ EXPORT_SYMBOL(ib_register_event_handler);
+  * Unregister an event handler registered with
+  * ib_register_event_handler().
+  */
+-int ib_unregister_event_handler(struct ib_event_handler *event_handler)
++void ib_unregister_event_handler(struct ib_event_handler *event_handler)
+ {
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&event_handler->device->event_handler_lock, flags);
+ 	list_del(&event_handler->list);
+ 	spin_unlock_irqrestore(&event_handler->device->event_handler_lock, flags);
+-
+-	return 0;
+ }
+ EXPORT_SYMBOL(ib_unregister_event_handler);
+ 
+diff --git a/drivers/infiniband/core/sa_query.c b/drivers/infiniband/core/sa_query.c
+index 2eb90b156b94..ee31cb980256 100644
+--- a/drivers/infiniband/core/sa_query.c
++++ b/drivers/infiniband/core/sa_query.c
+@@ -1951,8 +1951,7 @@ static void ib_sa_add_one(struct ib_device *device)
+ 	 */
+ 
+ 	INIT_IB_EVENT_HANDLER(&sa_dev->event_handler, device, ib_sa_event);
+-	if (ib_register_event_handler(&sa_dev->event_handler))
+-		goto err;
++	ib_register_event_handler(&sa_dev->event_handler);
+ 
+ 	for (i = 0; i <= e - s; ++i) {
+ 		if (rdma_cap_ib_sa(device, i + 1))
+* Unmerged path drivers/infiniband/core/uverbs_main.c
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib_main.c b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 2c91d4539781..b5ca427a259f 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@ -2214,13 +2214,7 @@ static struct net_device *ipoib_add_port(const char *format,
+ 
+ 	INIT_IB_EVENT_HANDLER(&priv->event_handler,
+ 			      priv->ca, ipoib_event);
+-	result = ib_register_event_handler(&priv->event_handler);
+-	if (result < 0) {
+-		printk(KERN_WARNING "%s: ib_register_event_handler failed for "
+-		       "port %d (ret = %d)\n",
+-		       hca->name, port, result);
+-		goto event_failed;
+-	}
++	ib_register_event_handler(&priv->event_handler);
+ 
+ 	result = register_netdev(priv->dev);
+ 	if (result) {
+@@ -2253,8 +2247,6 @@ register_failed:
+ 	set_bit(IPOIB_STOP_NEIGH_GC, &priv->flags);
+ 	cancel_delayed_work(&priv->neigh_reap_task);
+ 	flush_workqueue(priv->wq);
+-
+-event_failed:
+ 	ipoib_dev_cleanup(priv->dev);
+ 
+ device_init_failed:
+* Unmerged path drivers/infiniband/ulp/iser/iser_verbs.c
+diff --git a/drivers/infiniband/ulp/opa_vnic/opa_vnic_vema.c b/drivers/infiniband/ulp/opa_vnic/opa_vnic_vema.c
+index 8c05c7f6437b..ea5190d47e3f 100644
+--- a/drivers/infiniband/ulp/opa_vnic/opa_vnic_vema.c
++++ b/drivers/infiniband/ulp/opa_vnic/opa_vnic_vema.c
+@@ -951,12 +951,7 @@ static int vema_register(struct opa_vnic_ctrl_port *cport)
+ 
+ 		INIT_IB_EVENT_HANDLER(&port->event_handler,
+ 				      cport->ibdev, opa_vnic_event);
+-		ret = ib_register_event_handler(&port->event_handler);
+-		if (ret) {
+-			c_err("port %d: event handler register failed\n", i);
+-			vema_unregister(cport);
+-			return ret;
+-		}
++		ib_register_event_handler(&port->event_handler);
+ 
+ 		idr_init(&port->vport_idr);
+ 		mutex_init(&port->lock);
+diff --git a/drivers/infiniband/ulp/srpt/ib_srpt.c b/drivers/infiniband/ulp/srpt/ib_srpt.c
+index 3832bef736f7..b5896d45e02f 100644
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.c
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.c
+@@ -2556,8 +2556,7 @@ static void srpt_add_one(struct ib_device *device)
+ 
+ 	INIT_IB_EVENT_HANDLER(&sdev->event_handler, sdev->device,
+ 			      srpt_event_handler);
+-	if (ib_register_event_handler(&sdev->event_handler))
+-		goto err_cm;
++	ib_register_event_handler(&sdev->event_handler);
+ 
+ 	sdev->ioctx_ring = (struct srpt_recv_ioctx **)
+ 		srpt_alloc_ioctx_ring(sdev, sdev->srq_size,
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index 9d98b1e7b1da..c27147fd8e35 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -2306,8 +2306,8 @@ int ib_modify_qp_is_ok(enum ib_qp_state cur_state, enum ib_qp_state next_state,
+ 		       enum ib_qp_type type, enum ib_qp_attr_mask mask,
+ 		       enum rdma_link_layer ll);
+ 
+-int ib_register_event_handler  (struct ib_event_handler *event_handler);
+-int ib_unregister_event_handler(struct ib_event_handler *event_handler);
++void ib_register_event_handler(struct ib_event_handler *event_handler);
++void ib_unregister_event_handler(struct ib_event_handler *event_handler);
+ void ib_dispatch_event(struct ib_event *event);
+ 
+ int ib_query_port(struct ib_device *device,
