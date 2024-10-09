@@ -1,0 +1,124 @@
+net/mlx5e: Fix broken CQE compression initialization
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Fix broken CQE compression initialization (Jonathan Toppins) [1448565]
+Rebuild_FUZZ: 96.00%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit b0d4660b4cc52e6477ca3a43435351d565dfcedc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/b0d4660b.failed
+
+Some of RQ type parameters are derived from CQE compression state flag,
+CQE compression flag was initialized only after RQ type parameters
+setup. This leads to load RQ with stride size smaller than what we
+want for when CQE compression is on.
+
+This bug introduces no functional damage, it only makes CQE compression
+occur less often, since in ConnectX4-LX CQE compression is performed
+only on packets smaller than stride size.
+
+Fix this by marking default status of CQE compression in PFLAG prior to
+calling mlx5e_set_rq_priv_params(), as it inits some fields based on it.
+
+Tested:
+ load driver on systems where rx CQE compress will be on (MH)
+ pktgen with  64 < pkt size < 256 and netperf TCP_STREAM (IPv4/IPv6)
+ verify `ethtool -S ethxx | grep compress` are advancing more often
+ (rapidly)
+
+Fixes: 2fc4bfb7250d ("net/mlx5e: Dynamic RQ type infrastructure")
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Cc: kernel-team@fb.com
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b0d4660b4cc52e6477ca3a43435351d565dfcedc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index ae009c7fda21,dc621bc4e173..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -2785,35 -3526,15 +2785,44 @@@ static void mlx5e_build_netdev_priv(str
+  			cqe_compress_heuristic(link_speed, pci_bw);
+  	}
+  
+++<<<<<<< HEAD
+ +	priv->params.rx_cqe_compress = priv->params.rx_cqe_compress_admin;
+++=======
++ 	MLX5E_SET_PFLAG(priv, MLX5E_PFLAG_RX_CQE_COMPRESS,
++ 			priv->params.rx_cqe_compress_def);
++ 
++ 	mlx5e_set_rq_priv_params(priv);
++ 	if (priv->params.rq_wq_type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ)
++ 		priv->params.lro_en = true;
+++>>>>>>> b0d4660b4cc5 (net/mlx5e: Fix broken CQE compression initialization)
+  
+ -	priv->params.rx_am_enabled = MLX5_CAP_GEN(mdev, cq_moderation);
+ -	mlx5e_set_rx_cq_mode_params(&priv->params, cq_period_mode);
+ +	switch (priv->params.rq_wq_type) {
+ +	case MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ:
+ +		priv->params.log_rq_size = MLX5E_PARAMS_DEFAULT_LOG_RQ_SIZE_MPW;
+ +		priv->params.mpwqe_log_stride_sz =
+ +			priv->params.rx_cqe_compress ?
+ +			MLX5_MPWRQ_LOG_STRIDE_SIZE_CQE_COMPRESS :
+ +			MLX5_MPWRQ_LOG_STRIDE_SIZE;
+ +		priv->params.mpwqe_log_num_strides = MLX5_MPWRQ_LOG_WQE_SZ -
+ +			priv->params.mpwqe_log_stride_sz;
+ +		priv->params.lro_en = true;
+ +		break;
+ +	default: /* MLX5_WQ_TYPE_LINKED_LIST */
+ +		priv->params.log_rq_size = MLX5E_PARAMS_DEFAULT_LOG_RQ_SIZE;
+ +	}
+ +
+ +	mlx5_core_info(mdev,
+ +		       "MLX5E: StrdRq(%d) RqSz(%ld) StrdSz(%ld) RxCqeCmprss(%d)\n",
+ +		       priv->params.rq_wq_type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ,
+ +		       BIT(priv->params.log_rq_size),
+ +		       BIT(priv->params.mpwqe_log_stride_sz),
+ +		       priv->params.rx_cqe_compress_admin);
+ +
+ +	priv->params.min_rx_wqes = mlx5_min_rx_wqes(priv->params.rq_wq_type,
+ +					    BIT(priv->params.log_rq_size));
+ +
+ +	mlx5e_set_rx_cq_mode_params(&priv->params,
+ +				    MLX5_CQ_PERIOD_MODE_START_FROM_EQE);
+  
+  	priv->params.tx_cq_moderation.usec =
+  		MLX5E_PARAMS_DEFAULT_TX_CQ_MODERATION_USEC;
+@@@ -2827,25 -3553,11 +2836,30 @@@
+  			    sizeof(priv->params.toeplitz_hash_key));
+  
+  	mlx5e_build_default_indir_rqt(mdev, priv->params.indirection_rqt,
+ -				      MLX5E_INDIR_RQT_SIZE, profile->max_nch(mdev));
+ +				      MLX5E_INDIR_RQT_SIZE, num_channels);
+ +
+ +	priv->params.lro_wqe_sz =
+ +		MLX5E_PARAMS_DEFAULT_LRO_WQE_SZ -
+ +		/* Extra room needed for build_skb */
+ +		MLX5_RX_HEADROOM -
+ +		SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+  
+  	/* Initialize pflags */
+++<<<<<<< HEAD
+ +	MLX5E_SET_PRIV_FLAG(priv, MLX5E_PFLAG_RX_CQE_BASED_MODER,
+ +			    priv->params.rx_cq_period_mode == MLX5_CQ_PERIOD_MODE_START_FROM_CQE);
+ +
+ +	priv->mdev                         = mdev;
+ +	priv->netdev                       = netdev;
+ +	priv->params.num_channels          = num_channels;
+ +
+ +#ifdef CONFIG_MLX5_CORE_EN_DCB
+ +	mlx5e_ets_init(priv);
+ +#endif
+++=======
++ 	MLX5E_SET_PFLAG(priv, MLX5E_PFLAG_RX_CQE_BASED_MODER,
++ 			priv->params.rx_cq_period_mode == MLX5_CQ_PERIOD_MODE_START_FROM_CQE);
+++>>>>>>> b0d4660b4cc5 (net/mlx5e: Fix broken CQE compression initialization)
+  
+  	mutex_init(&priv->state_lock);
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
