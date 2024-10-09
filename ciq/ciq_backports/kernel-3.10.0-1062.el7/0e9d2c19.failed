@@ -1,0 +1,271 @@
+RDMA/core: Consider net ns of gid attribute for RoCE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Parav Pandit <parav@mellanox.com>
+commit 0e9d2c19bff1d351005afb2f990a913e395ba6d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/0e9d2c19.failed
+
+When resolving destination address or route, when net namespace is
+unavailable, refer to the net namespace of the netdevice of the SGID
+attribute. This is typically the case for requests arriving from the
+network for RoCE ports.
+
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 0e9d2c19bff1d351005afb2f990a913e395ba6d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/addr.c
+#	drivers/infiniband/core/cma.c
+#	drivers/infiniband/core/verbs.c
+diff --cc drivers/infiniband/core/addr.c
+index c2c2ceb1cadb,7a0356c78f60..000000000000
+--- a/drivers/infiniband/core/addr.c
++++ b/drivers/infiniband/core/addr.c
+@@@ -508,10 -478,73 +509,36 @@@ static int rdma_set_src_addr(const stru
+  	if (dst->dev->flags & IFF_LOOPBACK)
+  		ret = rdma_translate_ip(dst_in, dev_addr);
+  	else
+ -		rdma_copy_src_l2_addr(dev_addr, dst->dev);
+ -
+ -	/*
+ -	 * If there's a gateway and type of device not ARPHRD_INFINIBAND,
+ -	 * we're definitely in RoCE v2 (as RoCE v1 isn't routable) set the
+ -	 * network type accordingly.
+ -	 */
+ -	if (has_gateway(dst, dst_in->sa_family) &&
+ -	    ndev->type != ARPHRD_INFINIBAND)
+ -		dev_addr->network = dst_in->sa_family == AF_INET ?
+ -						RDMA_NETWORK_IPV4 :
+ -						RDMA_NETWORK_IPV6;
+ -	else
+ -		dev_addr->network = RDMA_NETWORK_IB;
+ -}
+ -
+ -static int rdma_set_src_addr_rcu(struct rdma_dev_addr *dev_addr,
+ -				 unsigned int *ndev_flags,
+ -				 const struct sockaddr *dst_in,
+ -				 const struct dst_entry *dst)
+ -{
+ -	struct net_device *ndev = READ_ONCE(dst->dev);
+ -
+ -	*ndev_flags = ndev->flags;
+ -	/* A physical device must be the RDMA device to use */
+ -	if (ndev->flags & IFF_LOOPBACK) {
+ -		/*
+ -		 * RDMA (IB/RoCE, iWarp) doesn't run on lo interface or
+ -		 * loopback IP address. So if route is resolved to loopback
+ -		 * interface, translate that to a real ndev based on non
+ -		 * loopback IP address.
+ -		 */
+ -		ndev = rdma_find_ndev_for_src_ip_rcu(dev_net(ndev), dst_in);
+ -		if (!ndev)
+ -			return -ENODEV;
+ -	}
+ -
+ -	copy_src_l2_addr(dev_addr, dst_in, dst, ndev);
+ -	return 0;
+ +		rdma_copy_addr(dev_addr, dst->dev, NULL);
+ +	return ret;
+  }
+  
++ static int set_addr_netns_by_gid_rcu(struct rdma_dev_addr *addr)
++ {
++ 	struct net_device *ndev;
++ 
++ 	ndev = rdma_read_gid_attr_ndev_rcu(addr->sgid_attr);
++ 	if (IS_ERR(ndev))
++ 		return PTR_ERR(ndev);
++ 
++ 	/*
++ 	 * Since we are holding the rcu, reading net and ifindex
++ 	 * are safe without any additional reference; because
++ 	 * change_net_namespace() in net/core/dev.c does rcu sync
++ 	 * after it changes the state to IFF_DOWN and before
++ 	 * updating netdev fields {net, ifindex}.
++ 	 */
++ 	addr->net = dev_net(ndev);
++ 	addr->bound_dev_if = ndev->ifindex;
++ 	return 0;
++ }
++ 
++ static void rdma_addr_set_net_defaults(struct rdma_dev_addr *addr)
++ {
++ 	addr->net = &init_net;
++ 	addr->bound_dev_if = 0;
++ }
++ 
+  static int addr_resolve(struct sockaddr *src_in,
+  			const struct sockaddr *dst_in,
+  			struct rdma_dev_addr *addr,
+@@@ -527,16 -562,37 +555,46 @@@
+  		return -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	rcu_read_lock();
++ 	if (resolve_by_gid_attr) {
++ 		if (!addr->sgid_attr) {
++ 			rcu_read_unlock();
++ 			pr_warn_ratelimited("%s: missing gid_attr\n", __func__);
++ 			return -EINVAL;
++ 		}
++ 		/*
++ 		 * If the request is for a specific gid attribute of the
++ 		 * rdma_dev_addr, derive net from the netdevice of the
++ 		 * GID attribute.
++ 		 */
++ 		ret = set_addr_netns_by_gid_rcu(addr);
++ 		if (ret) {
++ 			rcu_read_unlock();
++ 			return ret;
++ 		}
++ 	}
+++>>>>>>> 0e9d2c19bff1 (RDMA/core: Consider net ns of gid attribute for RoCE)
+  	if (src_in->sa_family == AF_INET) {
+  		ret = addr4_resolve(src_in, dst_in, addr, &rt);
+  		dst = &rt->dst;
+  	} else {
+  		ret = addr6_resolve(src_in, dst_in, addr, &dst);
+  	}
+++<<<<<<< HEAD
+ +	if (ret)
+ +		return ret;
+++=======
++ 	if (ret) {
++ 		rcu_read_unlock();
++ 		goto done;
++ 	}
++ 	ret = rdma_set_src_addr_rcu(addr, &ndev_flags, dst_in, dst);
++ 	rcu_read_unlock();
+++>>>>>>> 0e9d2c19bff1 (RDMA/core: Consider net ns of gid attribute for RoCE)
+  
+ +	ret = rdma_set_src_addr(dst, dst_in, addr);
+  	/*
+  	 * Resolve neighbor destination address if requested and
+  	 * only if src addr translation didn't fail.
+@@@ -627,8 -690,7 +694,12 @@@ int rdma_resolve_ip(struct rdma_addr_cl
+  	req->addr = addr;
+  	req->callback = callback;
+  	req->context = context;
+++<<<<<<< HEAD
+ +	req->client = client;
+ +	atomic_inc(&client->refcount);
+++=======
++ 	req->resolve_by_gid_attr = resolve_by_gid_attr;
+++>>>>>>> 0e9d2c19bff1 (RDMA/core: Consider net ns of gid attribute for RoCE)
+  	INIT_DELAYED_WORK(&req->work, process_one_req);
+  	req->seq = (u32)atomic_inc_return(&ib_nl_addr_request_seq);
+  
+@@@ -764,12 -824,12 +833,17 @@@ int rdma_addr_find_l2_eth_by_grh(const 
+  	rdma_gid2ip(&dgid_addr._sockaddr, dgid);
+  
+  	memset(&dev_addr, 0, sizeof(dev_addr));
+- 	dev_addr.bound_dev_if = ndev->ifindex;
+  	dev_addr.net = &init_net;
++ 	dev_addr.sgid_attr = sgid_attr;
+  
+  	init_completion(&ctx.comp);
+++<<<<<<< HEAD
+ +	ret = rdma_resolve_ip(&self, &sgid_addr._sockaddr, &dgid_addr._sockaddr,
+ +			&dev_addr, 1000, resolve_cb, &ctx);
+++=======
++ 	ret = rdma_resolve_ip(&sgid_addr._sockaddr, &dgid_addr._sockaddr,
++ 			      &dev_addr, 1000, resolve_cb, true, &ctx);
+++>>>>>>> 0e9d2c19bff1 (RDMA/core: Consider net ns of gid attribute for RoCE)
+  	if (ret)
+  		return ret;
+  
+diff --cc drivers/infiniband/core/cma.c
+index 744a59d24274,a57c8b823302..000000000000
+--- a/drivers/infiniband/core/cma.c
++++ b/drivers/infiniband/core/cma.c
+@@@ -2974,9 -2987,10 +2974,16 @@@ int rdma_resolve_addr(struct rdma_cm_i
+  		if (dst_addr->sa_family == AF_IB) {
+  			ret = cma_resolve_ib_addr(id_priv);
+  		} else {
+++<<<<<<< HEAD
+ +			ret = rdma_resolve_ip(&addr_client, cma_src_addr(id_priv),
+ +					      dst_addr, &id->route.addr.dev_addr,
+ +					      timeout_ms, addr_handler, id_priv);
+++=======
++ 			ret = rdma_resolve_ip(cma_src_addr(id_priv), dst_addr,
++ 					      &id->route.addr.dev_addr,
++ 					      timeout_ms, addr_handler,
++ 					      false, id_priv);
+++>>>>>>> 0e9d2c19bff1 (RDMA/core: Consider net ns of gid attribute for RoCE)
+  		}
+  	}
+  	if (ret)
+diff --cc drivers/infiniband/core/verbs.c
+index a3a988e6b429,c36be384fe34..000000000000
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@@ -714,17 -702,15 +714,21 @@@ static int ib_resolve_unicast_gid_dmac(
+  	 * IP stack is not used.
+  	 */
+  	if (rdma_link_local_addr((struct in6_addr *)grh->dgid.raw) &&
+ -	    sgid_attr->gid_type == IB_GID_TYPE_ROCE) {
+ +	    sgid_attr.gid_type == IB_GID_TYPE_ROCE) {
+  		rdma_get_ll_mac((struct in6_addr *)grh->dgid.raw,
+  				ah_attr->roce.dmac);
+ -		return ret;
+ +		goto done;
+  	}
+  
+ -	ret = rdma_addr_find_l2_eth_by_grh(&sgid_attr->gid, &grh->dgid,
+ +	ret = rdma_addr_find_l2_eth_by_grh(&sgid, &grh->dgid,
+  					   ah_attr->roce.dmac,
+++<<<<<<< HEAD
+ +					   sgid_attr.ndev, &hop_limit);
+ +done:
+ +	dev_put(sgid_attr.ndev);
+++=======
++ 					   sgid_attr, &hop_limit);
+++>>>>>>> 0e9d2c19bff1 (RDMA/core: Consider net ns of gid attribute for RoCE)
+  
+  	grh->hop_limit = hop_limit;
+  	return ret;
+* Unmerged path drivers/infiniband/core/addr.c
+* Unmerged path drivers/infiniband/core/cma.c
+diff --git a/drivers/infiniband/core/core_priv.h b/drivers/infiniband/core/core_priv.h
+index 695c109b0df7..813f22f486be 100644
+--- a/drivers/infiniband/core/core_priv.h
++++ b/drivers/infiniband/core/core_priv.h
+@@ -305,7 +305,7 @@ int rdma_resolve_ip_route(struct sockaddr *src_addr,
+ 
+ int rdma_addr_find_l2_eth_by_grh(const union ib_gid *sgid,
+ 				 const union ib_gid *dgid,
+-				 u8 *dmac, const struct net_device *ndev,
++				 u8 *dmac, const struct ib_gid_attr *sgid_attr,
+ 				 int *hoplimit);
+ 
+ struct sa_path_rec;
+* Unmerged path drivers/infiniband/core/verbs.c
+diff --git a/include/rdma/ib_addr.h b/include/rdma/ib_addr.h
+index acab7b5dca8b..deddf8e8d38d 100644
+--- a/include/rdma/ib_addr.h
++++ b/include/rdma/ib_addr.h
+@@ -112,6 +112,8 @@ int rdma_translate_ip(const struct sockaddr *addr,
+  * @timeout_ms: Amount of time to wait for the address resolution to complete.
+  * @callback: Call invoked once address resolution has completed, timed out,
+  *   or been canceled.  A status of 0 indicates success.
++ * @resolve_by_gid_attr:	Resolve the ip based on the GID attribute from
++ *				rdma_dev_addr.
+  * @context: User-specified context associated with the call.
+  */
+ int rdma_resolve_ip(struct rdma_addr_client *client,
+@@ -119,6 +121,7 @@ int rdma_resolve_ip(struct rdma_addr_client *client,
+ 		    struct rdma_dev_addr *addr, int timeout_ms,
+ 		    void (*callback)(int status, struct sockaddr *src_addr,
+ 				     struct rdma_dev_addr *addr, void *context),
++		    bool resolve_by_gid_attr,
+ 		    void *context);
+ 
+ void rdma_addr_cancel(struct rdma_dev_addr *addr);
