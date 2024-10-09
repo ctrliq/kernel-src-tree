@@ -809,7 +809,7 @@ static int vfio_dma_do_unmap(struct vfio_iommu *iommu,
 	 * mappings within the range.
 	 */
 	if (iommu->v2) {
-		dma = vfio_find_dma(iommu, unmap->iova, 0);
+		dma = vfio_find_dma(iommu, unmap->iova, 1);
 		if (dma && dma->iova != unmap->iova) {
 			ret = -EINVAL;
 			goto unlock;
