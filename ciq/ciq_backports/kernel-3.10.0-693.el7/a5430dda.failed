@@ -1,0 +1,491 @@
+mm/migrate: support un-addressable ZONE_DEVICE page in migration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [mm] migrate: support un-addressable ZONE_DEVICE page in migration v2 (Jerome Glisse) [1444991]
+Rebuild_FUZZ: 95.31%
+commit-author Jérôme Glisse <jglisse@redhat.com>
+commit a5430dda8a3a1cdd532e37270e6f36436241b6e7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/a5430dda.failed
+
+Allow to unmap and restore special swap entry of un-addressable
+ZONE_DEVICE memory.
+
+Link: http://lkml.kernel.org/r/20170817000548.32038-17-jglisse@redhat.com
+	Signed-off-by: Jérôme Glisse <jglisse@redhat.com>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Aneesh Kumar <aneesh.kumar@linux.vnet.ibm.com>
+	Cc: Balbir Singh <bsingharora@gmail.com>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: David Nellans <dnellans@nvidia.com>
+	Cc: Evgeny Baskakov <ebaskakov@nvidia.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: John Hubbard <jhubbard@nvidia.com>
+	Cc: Mark Hairgrove <mhairgrove@nvidia.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: Sherry Cheung <SCheung@nvidia.com>
+	Cc: Subhash Gutti <sgutti@nvidia.com>
+	Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+	Cc: Bob Liu <liubo95@huawei.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit a5430dda8a3a1cdd532e37270e6f36436241b6e7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/migrate.c
+#	mm/page_vma_mapped.c
+#	mm/rmap.c
+diff --cc mm/migrate.c
+index 30d96a5dccef,77cb2fef08ea..000000000000
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@@ -35,8 -36,13 +35,9 @@@
+  #include <linux/hugetlb.h>
+  #include <linux/hugetlb_cgroup.h>
+  #include <linux/gfp.h>
++ #include <linux/memremap.h>
+  #include <linux/balloon_compaction.h>
+  #include <linux/mmu_notifier.h>
+ -#include <linux/page_idle.h>
+ -#include <linux/page_owner.h>
+ -#include <linux/sched/mm.h>
+ -#include <linux/ptrace.h>
+  
+  #include <asm/tlbflush.h>
+  
+@@@ -118,77 -196,82 +119,111 @@@ void putback_movable_pages(struct list_
+  /*
+   * Restore a potential migration pte to a working pte entry
+   */
+ -static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
+ +static int remove_migration_pte(struct page *new, struct vm_area_struct *vma,
+  				 unsigned long addr, void *old)
+  {
+ -	struct page_vma_mapped_walk pvmw = {
+ -		.page = old,
+ -		.vma = vma,
+ -		.address = addr,
+ -		.flags = PVMW_SYNC | PVMW_MIGRATION,
+ -	};
+ -	struct page *new;
+ -	pte_t pte;
+ +	struct mm_struct *mm = vma->vm_mm;
+  	swp_entry_t entry;
+ + 	pmd_t *pmd;
+ +	pte_t *ptep, pte;
+ + 	spinlock_t *ptl;
+  
+ -	VM_BUG_ON_PAGE(PageTail(page), page);
+ -	while (page_vma_mapped_walk(&pvmw)) {
+ -		if (PageKsm(page))
+ -			new = page;
+ -		else
+ -			new = page - pvmw.page->index +
+ -				linear_page_index(vma, pvmw.address);
+ -
+ -#ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION
+ -		/* PMD-mapped THP migration entry */
+ -		if (!pvmw.pte) {
+ -			VM_BUG_ON_PAGE(PageHuge(page) || !PageTransCompound(page), page);
+ -			remove_migration_pmd(&pvmw, new);
+ -			continue;
+ -		}
+ -#endif
+ +	if (unlikely(PageHuge(new))) {
+ +		ptep = huge_pte_offset(mm, addr);
+ +		if (!ptep)
+ +			goto out;
+ +		ptl = huge_pte_lockptr(hstate_vma(vma), mm, ptep);
+ +	} else {
+ +		pmd = mm_find_pmd(mm, addr);
+ +		if (!pmd)
+ +			goto out;
+  
+ -		get_page(new);
+ -		pte = pte_mkold(mk_pte(new, READ_ONCE(vma->vm_page_prot)));
+ -		if (pte_swp_soft_dirty(*pvmw.pte))
+ -			pte = pte_mksoft_dirty(pte);
+ +		ptep = pte_offset_map(pmd, addr);
+  
+  		/*
+ -		 * Recheck VMA as permissions can change since migration started
+ +		 * Peek to check is_swap_pte() before taking ptlock?  No, we
+ +		 * can race mremap's move_ptes(), which skips anon_vma lock.
+  		 */
+ -		entry = pte_to_swp_entry(*pvmw.pte);
+ -		if (is_write_migration_entry(entry))
+ -			pte = maybe_mkwrite(pte, vma);
+  
+++<<<<<<< HEAD
+ +		ptl = pte_lockptr(mm, pmd);
+++=======
++ 		if (unlikely(is_zone_device_page(new)) &&
++ 		    is_device_private_page(new)) {
++ 			entry = make_device_private_entry(new, pte_write(pte));
++ 			pte = swp_entry_to_pte(entry);
++ 		} else
++ 			flush_dcache_page(new);
++ 
++ #ifdef CONFIG_HUGETLB_PAGE
++ 		if (PageHuge(new)) {
++ 			pte = pte_mkhuge(pte);
++ 			pte = arch_make_huge_pte(pte, vma, new, 0);
++ 			set_huge_pte_at(vma->vm_mm, pvmw.address, pvmw.pte, pte);
++ 			if (PageAnon(new))
++ 				hugepage_add_anon_rmap(new, vma, pvmw.address);
++ 			else
++ 				page_dup_rmap(new, true);
++ 		} else
++ #endif
++ 		{
++ 			set_pte_at(vma->vm_mm, pvmw.address, pvmw.pte, pte);
++ 
++ 			if (PageAnon(new))
++ 				page_add_anon_rmap(new, vma, pvmw.address, false);
++ 			else
++ 				page_add_file_rmap(new, false);
++ 		}
++ 		if (vma->vm_flags & VM_LOCKED && !PageTransCompound(new))
++ 			mlock_vma_page(new);
++ 
++ 		/* No need to invalidate - it was non-present before */
++ 		update_mmu_cache(vma, pvmw.address, pvmw.pte);
+++>>>>>>> a5430dda8a3a (mm/migrate: support un-addressable ZONE_DEVICE page in migration)
+  	}
+  
+ -	return true;
+ + 	spin_lock(ptl);
+ +	pte = *ptep;
+ +	if (!is_swap_pte(pte))
+ +		goto unlock;
+ +
+ +	entry = pte_to_swp_entry(pte);
+ +
+ +	if (!is_migration_entry(entry) ||
+ +	    migration_entry_to_page(entry) != old)
+ +		goto unlock;
+ +
+ +	get_page(new);
+ +	pte = pte_mkold(mk_pte(new, vma->vm_page_prot));
+ +	if (pte_swp_soft_dirty(*ptep))
+ +		pte = pte_mksoft_dirty(pte);
+ +	if (is_write_migration_entry(entry))
+ +		pte = pte_mkwrite(pte);
+ +#ifdef CONFIG_HUGETLB_PAGE
+ +	if (PageHuge(new)) {
+ +		pte = pte_mkhuge(pte);
+ +		pte = arch_make_huge_pte(pte, vma, new, 0);
+ +	}
+ +#endif
+ +	flush_dcache_page(new);
+ +	set_pte_at(mm, addr, ptep, pte);
+ +
+ +	if (PageHuge(new)) {
+ +		if (PageAnon(new))
+ +			hugepage_add_anon_rmap(new, vma, addr);
+ +		else
+ +			page_dup_rmap(new);
+ +	} else if (PageAnon(new))
+ +		page_add_anon_rmap(new, vma, addr);
+ +	else
+ +		page_add_file_rmap(new);
+ +
+ +	/* No need to invalidate - it was non-present before */
+ +	update_mmu_cache(vma, addr, ptep);
+ +unlock:
+ +	pte_unmap_unlock(ptep, ptl);
+ +out:
+ +	return SWAP_AGAIN;
+  }
+  
+  /*
+diff --cc mm/rmap.c
+index 651b49d02afd,0618cd85b862..000000000000
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@@ -57,6 -62,8 +57,11 @@@
+  #include <linux/migrate.h>
+  #include <linux/hugetlb.h>
+  #include <linux/backing-dev.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/page_idle.h>
++ #include <linux/memremap.h>
+++>>>>>>> a5430dda8a3a (mm/migrate: support un-addressable ZONE_DEVICE page in migration)
+  
+  #include <asm/tlbflush.h>
+  
+@@@ -1333,75 -1326,181 +1338,167 @@@ out
+  }
+  
+  /*
+ - * @arg: enum ttu_flags will be passed to this argument
+ + * Subfunctions of try_to_unmap: try_to_unmap_one called
+ + * repeatedly from try_to_unmap_ksm, try_to_unmap_anon or try_to_unmap_file.
+   */
+ -static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
+ -		     unsigned long address, void *arg)
+ +int try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
+ +		     unsigned long address, enum ttu_flags flags)
+  {
+  	struct mm_struct *mm = vma->vm_mm;
+ -	struct page_vma_mapped_walk pvmw = {
+ -		.page = page,
+ -		.vma = vma,
+ -		.address = address,
+ -	};
+ +	pte_t *pte;
+  	pte_t pteval;
+ -	struct page *subpage;
+ -	bool ret = true;
+ -	unsigned long start = address, end;
+ -	enum ttu_flags flags = (enum ttu_flags)arg;
+ +	spinlock_t *ptl;
+ +	int ret = SWAP_AGAIN;
+  
+++<<<<<<< HEAD
+ +	pte = page_check_address(page, mm, address, &ptl, 0);
+ +	if (!pte)
+ +		goto out;
+++=======
++ 	/* munlock has nothing to gain from examining un-locked vmas */
++ 	if ((flags & TTU_MUNLOCK) && !(vma->vm_flags & VM_LOCKED))
++ 		return true;
++ 
++ 	if (IS_ENABLED(CONFIG_MIGRATION) && (flags & TTU_MIGRATION) &&
++ 	    is_zone_device_page(page) && !is_device_private_page(page))
++ 		return true;
++ 
++ 	if (flags & TTU_SPLIT_HUGE_PMD) {
++ 		split_huge_pmd_address(vma, address,
++ 				flags & TTU_SPLIT_FREEZE, page);
++ 	}
+++>>>>>>> a5430dda8a3a (mm/migrate: support un-addressable ZONE_DEVICE page in migration)
+  
+  	/*
+ -	 * We have to assume the worse case ie pmd for invalidation. Note that
+ -	 * the page can not be free in this function as call of try_to_unmap()
+ -	 * must hold a reference on the page.
+ +	 * If the page is mlock()d, we cannot swap it out.
+ +	 * If it's recently referenced (perhaps page_referenced
+ +	 * skipped over this mm) then we should reactivate it.
+  	 */
+ -	end = min(vma->vm_end, start + (PAGE_SIZE << compound_order(page)));
+ -	mmu_notifier_invalidate_range_start(vma->vm_mm, start, end);
+ +	if (!(flags & TTU_IGNORE_MLOCK)) {
+ +		if (vma->vm_flags & VM_LOCKED)
+ +			goto out_mlock;
+  
+ -	while (page_vma_mapped_walk(&pvmw)) {
+ -#ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION
+ -		/* PMD-mapped THP migration entry */
+ -		if (!pvmw.pte && (flags & TTU_MIGRATION)) {
+ -			VM_BUG_ON_PAGE(PageHuge(page) || !PageTransCompound(page), page);
+ -
+ -			if (!PageAnon(page))
+ -				continue;
+ -
+ -			set_pmd_migration_entry(&pvmw, page);
+ -			continue;
+ +		if (TTU_ACTION(flags) == TTU_MUNLOCK)
+ +			goto out_unmap;
+ +	}
+ +	if (!(flags & TTU_IGNORE_ACCESS)) {
+ +		if (ptep_clear_flush_young_notify(vma, address, pte)) {
+ +			ret = SWAP_FAIL;
+ +			goto out_unmap;
+  		}
+ -#endif
+ +  	}
+  
+ +	/* Nuke the page table entry. */
+ +	flush_cache_page(vma, address, page_to_pfn(page));
+ +	if (should_defer_flush(mm, flags)) {
+  		/*
+ -		 * If the page is mlock()d, we cannot swap it out.
+ -		 * If it's recently referenced (perhaps page_referenced
+ -		 * skipped over this mm) then we should reactivate it.
+ +		 * We clear the PTE but do not flush so potentially a remote
+ +		 * CPU could still be writing to the page. If the entry was
+ +		 * previously clean then the architecture must guarantee that
+ +		 * a clear->dirty transition on a cached TLB entry is written
+ +		 * through and traps if the PTE is unmapped.
+  		 */
+ -		if (!(flags & TTU_IGNORE_MLOCK)) {
+ -			if (vma->vm_flags & VM_LOCKED) {
+ -				/* PTE-mapped THP are never mlocked */
+ -				if (!PageTransCompound(page)) {
+ -					/*
+ -					 * Holding pte lock, we do *not* need
+ -					 * mmap_sem here
+ -					 */
+ -					mlock_vma_page(page);
+ -				}
+ -				ret = false;
+ -				page_vma_mapped_walk_done(&pvmw);
+ -				break;
+ -			}
+ -			if (flags & TTU_MUNLOCK)
+ -				continue;
+ -		}
+ +		pteval = ptep_get_and_clear(mm, address, pte);
+  
+ -		/* Unexpected PMD-mapped THP? */
+ -		VM_BUG_ON_PAGE(!pvmw.pte, page);
+ +		set_tlb_ubc_flush_pending(mm, page, pte_dirty(pteval));
+ +	} else {
+ +		pteval = ptep_clear_flush(vma, address, pte);
+ +	}
+  
+ -		subpage = page - page_to_pfn(page) + pte_pfn(*pvmw.pte);
+ -		address = pvmw.address;
+ +	/* Move the dirty bit to the physical page now the pte is gone. */
+ +	if (pte_dirty(pteval))
+ +		set_page_dirty(page);
+  
+ +	/* Update high watermark before we lower rss */
+ +	update_hiwater_rss(mm);
+  
+++<<<<<<< HEAD
+ +	if (PageHWPoison(page) && !(flags & TTU_IGNORE_HWPOISON)) {
+ +		if (!PageHuge(page))
+++=======
++ 		if (IS_ENABLED(CONFIG_MIGRATION) &&
++ 		    (flags & TTU_MIGRATION) &&
++ 		    is_zone_device_page(page)) {
++ 			swp_entry_t entry;
++ 			pte_t swp_pte;
++ 
++ 			pteval = ptep_get_and_clear(mm, pvmw.address, pvmw.pte);
++ 
++ 			/*
++ 			 * Store the pfn of the page in a special migration
++ 			 * pte. do_swap_page() will wait until the migration
++ 			 * pte is removed and then restart fault handling.
++ 			 */
++ 			entry = make_migration_entry(page, 0);
++ 			swp_pte = swp_entry_to_pte(entry);
++ 			if (pte_soft_dirty(pteval))
++ 				swp_pte = pte_swp_mksoft_dirty(swp_pte);
++ 			set_pte_at(mm, pvmw.address, pvmw.pte, swp_pte);
++ 			goto discard;
++ 		}
++ 
++ 		if (!(flags & TTU_IGNORE_ACCESS)) {
++ 			if (ptep_clear_flush_young_notify(vma, address,
++ 						pvmw.pte)) {
++ 				ret = false;
++ 				page_vma_mapped_walk_done(&pvmw);
++ 				break;
++ 			}
++ 		}
++ 
++ 		/* Nuke the page table entry. */
++ 		flush_cache_page(vma, address, pte_pfn(*pvmw.pte));
++ 		if (should_defer_flush(mm, flags)) {
++ 			/*
++ 			 * We clear the PTE but do not flush so potentially
++ 			 * a remote CPU could still be writing to the page.
++ 			 * If the entry was previously clean then the
++ 			 * architecture must guarantee that a clear->dirty
++ 			 * transition on a cached TLB entry is written through
++ 			 * and traps if the PTE is unmapped.
++ 			 */
++ 			pteval = ptep_get_and_clear(mm, address, pvmw.pte);
++ 
++ 			set_tlb_ubc_flush_pending(mm, pte_dirty(pteval));
++ 		} else {
++ 			pteval = ptep_clear_flush(vma, address, pvmw.pte);
++ 		}
++ 
++ 		/* Move the dirty bit to the page. Now the pte is gone. */
++ 		if (pte_dirty(pteval))
++ 			set_page_dirty(page);
++ 
++ 		/* Update high watermark before we lower rss */
++ 		update_hiwater_rss(mm);
++ 
++ 		if (PageHWPoison(page) && !(flags & TTU_IGNORE_HWPOISON)) {
++ 			pteval = swp_entry_to_pte(make_hwpoison_entry(subpage));
++ 			if (PageHuge(page)) {
++ 				int nr = 1 << compound_order(page);
++ 				hugetlb_count_sub(nr, mm);
++ 				set_huge_swap_pte_at(mm, address,
++ 						     pvmw.pte, pteval,
++ 						     vma_mmu_pagesize(vma));
++ 			} else {
++ 				dec_mm_counter(mm, mm_counter(page));
++ 				set_pte_at(mm, address, pvmw.pte, pteval);
++ 			}
++ 
++ 		} else if (pte_unused(pteval)) {
++ 			/*
++ 			 * The guest indicated that the page content is of no
++ 			 * interest anymore. Simply discard the pte, vmscan
++ 			 * will take care of the rest.
++ 			 */
+++>>>>>>> a5430dda8a3a (mm/migrate: support un-addressable ZONE_DEVICE page in migration)
+  			dec_mm_counter(mm, mm_counter(page));
+ -		} else if (IS_ENABLED(CONFIG_MIGRATION) &&
+ -				(flags & (TTU_MIGRATION|TTU_SPLIT_FREEZE))) {
+ -			swp_entry_t entry;
+ -			pte_t swp_pte;
+ -			/*
+ -			 * Store the pfn of the page in a special migration
+ -			 * pte. do_swap_page() will wait until the migration
+ -			 * pte is removed and then restart fault handling.
+ -			 */
+ -			entry = make_migration_entry(subpage,
+ -					pte_write(pteval));
+ -			swp_pte = swp_entry_to_pte(entry);
+ -			if (pte_soft_dirty(pteval))
+ -				swp_pte = pte_swp_mksoft_dirty(swp_pte);
+ -			set_pte_at(mm, address, pvmw.pte, swp_pte);
+ -		} else if (PageAnon(page)) {
+ -			swp_entry_t entry = { .val = page_private(subpage) };
+ -			pte_t swp_pte;
+ +		set_pte_at(mm, address, pte,
+ +			   swp_entry_to_pte(make_hwpoison_entry(page)));
+ +	} else if (PageAnon(page)) {
+ +		swp_entry_t entry = { .val = page_private(page) };
+ +		pte_t swp_pte;
+ +
+ +		if (PageSwapCache(page)) {
+  			/*
+  			 * Store the swap location in the pte.
+  			 * See handle_pte_fault() ...
+* Unmerged path mm/page_vma_mapped.c
+diff --git a/include/linux/migrate.h b/include/linux/migrate.h
+index 834ae7167ac7..6f452207d9b7 100644
+--- a/include/linux/migrate.h
++++ b/include/linux/migrate.h
+@@ -122,12 +122,18 @@ static inline int migrate_misplaced_transhuge_page(struct mm_struct *mm,
+ 
+ #ifdef CONFIG_MIGRATION
+ 
++/*
++ * Watch out for PAE architecture, which has an unsigned long, and might not
++ * have enough bits to store all physical address and flags. So far we have
++ * enough room for all our flags.
++ */
+ #define MIGRATE_PFN_VALID	(1UL << 0)
+ #define MIGRATE_PFN_MIGRATE	(1UL << 1)
+ #define MIGRATE_PFN_LOCKED	(1UL << 2)
+ #define MIGRATE_PFN_WRITE	(1UL << 3)
+-#define MIGRATE_PFN_ERROR	(1UL << 4)
+-#define MIGRATE_PFN_SHIFT	5
++#define MIGRATE_PFN_DEVICE	(1UL << 4)
++#define MIGRATE_PFN_ERROR	(1UL << 5)
++#define MIGRATE_PFN_SHIFT	6
+ 
+ static inline struct page *migrate_pfn_to_page(unsigned long mpfn)
+ {
+* Unmerged path mm/migrate.c
+* Unmerged path mm/page_vma_mapped.c
+* Unmerged path mm/rmap.c
