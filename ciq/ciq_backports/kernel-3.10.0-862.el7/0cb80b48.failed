@@ -1,0 +1,111 @@
+dax: Fix sleep in atomic contex in grab_mapping_entry()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 0cb80b4847553582830a59da2c022c37a1f4a119
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/0cb80b48.failed
+
+Commit 642261ac995e: "dax: add struct iomap based DAX PMD support" has
+introduced unmapping of page tables if huge page needs to be split in
+grab_mapping_entry(). However the unmapping happens after
+radix_tree_preload() call which disables preemption and thus
+unmap_mapping_range() tries to acquire i_mmap_lock in atomic context
+which is a bug. Fix the problem by moving unmapping before
+radix_tree_preload() call.
+
+Fixes: 642261ac995e01d7837db1f4b90181496f7e6835
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+(cherry picked from commit 0cb80b4847553582830a59da2c022c37a1f4a119)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+diff --cc fs/dax.c
+index 1dfecdfb6245,5bfd27b4a69c..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -444,19 -300,68 +444,38 @@@ static void *grab_mapping_entry(struct 
+  restart:
+  	spin_lock_irq(&mapping->tree_lock);
+  	entry = get_unlocked_mapping_entry(mapping, index, &slot);
+ -
+ -	if (entry) {
+ -		if (size_flag & RADIX_DAX_PMD) {
+ -			if (!radix_tree_exceptional_entry(entry) ||
+ -			    dax_is_pte_entry(entry)) {
+ -				put_unlocked_mapping_entry(mapping, index,
+ -						entry);
+ -				entry = ERR_PTR(-EEXIST);
+ -				goto out_unlock;
+ -			}
+ -		} else { /* trying to grab a PTE entry */
+ -			if (radix_tree_exceptional_entry(entry) &&
+ -			    dax_is_pmd_entry(entry) &&
+ -			    (dax_is_zero_entry(entry) ||
+ -			     dax_is_empty_entry(entry))) {
+ -				pmd_downgrade = true;
+ -			}
+ -		}
+ -	}
+ -
+  	/* No entry for given index? Make sure radix tree is big enough. */
+ -	if (!entry || pmd_downgrade) {
+ +	if (!entry) {
+  		int err;
+  
+ -		if (pmd_downgrade) {
+ -			/*
+ -			 * Make sure 'entry' remains valid while we drop
+ -			 * mapping->tree_lock.
+ -			 */
+ -			entry = lock_slot(mapping, slot);
+ -		}
+ -
+  		spin_unlock_irq(&mapping->tree_lock);
+++<<<<<<< HEAD
+ +		err = radix_tree_preload(
+ +				mapping_gfp_mask(mapping) & ~__GFP_HIGHMEM);
+ +		if (err)
+ +			return ERR_PTR(err);
+ +		entry = (void *)(RADIX_TREE_EXCEPTIONAL_ENTRY |
+ +			       RADIX_DAX_ENTRY_LOCK);
+++=======
++ 		/*
++ 		 * Besides huge zero pages the only other thing that gets
++ 		 * downgraded are empty entries which don't need to be
++ 		 * unmapped.
++ 		 */
++ 		if (pmd_downgrade && dax_is_zero_entry(entry))
++ 			unmap_mapping_range(mapping,
++ 				(index << PAGE_SHIFT) & PMD_MASK, PMD_SIZE, 0);
++ 
++ 		err = radix_tree_preload(
++ 				mapping_gfp_mask(mapping) & ~__GFP_HIGHMEM);
++ 		if (err) {
++ 			if (pmd_downgrade)
++ 				put_locked_mapping_entry(mapping, index, entry);
++ 			return ERR_PTR(err);
++ 		}
+++>>>>>>> 0cb80b484755 (dax: Fix sleep in atomic contex in grab_mapping_entry())
+  		spin_lock_irq(&mapping->tree_lock);
+ -
+ -		if (pmd_downgrade) {
+ -			radix_tree_delete(&mapping->page_tree, index);
+ -			mapping->nrexceptional--;
+ -			dax_wake_mapping_entry_waiter(mapping, index, entry,
+ -					true);
+ -		}
+ -
+ -		entry = dax_radix_locked_entry(0, size_flag | RADIX_DAX_EMPTY);
+ -
+ -		err = __radix_tree_insert(&mapping->page_tree, index,
+ -				dax_radix_order(entry), entry);
+ +		err = radix_tree_insert(&mapping->page_tree, index, entry);
+  		radix_tree_preload_end();
+  		if (err) {
+  			spin_unlock_irq(&mapping->tree_lock);
+* Unmerged path fs/dax.c
