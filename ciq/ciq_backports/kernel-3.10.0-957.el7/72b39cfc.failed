@@ -1,0 +1,177 @@
+mm, memory_hotplug: do not fail offlining too early
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mm] revert "memory_hotplug: do not fail offlining too early" (Baoquan He) [1625143]
+Rebuild_FUZZ: 89.72%
+commit-author Michal Hocko <mhocko@suse.com>
+commit 72b39cfc4d750e5b8c633a7a6fdd7d07927995ad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/72b39cfc.failed
+
+Patch series "mm, memory_hotplug: redefine memory offline retry logic", v2.
+
+While testing memory hotplug on a large 4TB machine we have noticed that
+memory offlining is just too eager to fail.  The primary reason is that
+the retry logic is just too easy to give up.  We have 4 ways out of the
+offline
+
+	- we have a permanent failure (isolation or memory notifiers fail,
+	  or hugetlb pages cannot be dropped)
+	- userspace sends a signal
+	- a hardcoded 120s timeout expires
+	- page migration fails 5 times
+
+This is way too convoluted and it doesn't scale very well.  We have seen
+both temporary migration failures as well as 120s being triggered.
+After removing those restrictions we were able to pass stress testing
+during memory hot remove without any other negative side effects
+observed.  Therefore I suggest dropping both hard coded policies.  I
+couldn't have found any specific reason for them in the changelog.  I
+neither didn't get any response [1] from Kamezawa.  If we need some
+upper bound - e.g.  timeout based - then we should have a proper and
+user defined policy for that.  In any case there should be a clear use
+case when introducing it.
+
+This patch (of 2):
+
+Memory offlining can fail too eagerly under heavy memory pressure.
+
+  page:ffffea22a646bd00 count:255 mapcount:252 mapping:ffff88ff926c9f38 index:0x3
+  flags: 0x9855fe40010048(uptodate|active|mappedtodisk)
+  page dumped because: isolation failed
+  page->mem_cgroup:ffff8801cd662000
+  memory offlining [mem 0x18b580000000-0x18b5ffffffff] failed
+
+Isolation has failed here because the page is not on LRU.  Most probably
+because it was on the pcp LRU cache or it has been removed from the LRU
+already but it hasn't been freed yet.  In both cases the page doesn't
+look non-migrable so retrying more makes sense.
+
+__offline_pages seems rather cluttered when it comes to the retry logic.
+We have 5 retries at maximum and a timeout.  We could argue whether the
+timeout makes sense but failing just because of a race when somebody
+isoltes a page from LRU or puts it on a pcp LRU lists is just wrong.  It
+only takes it to race with a process which unmaps some pages and remove
+them from the LRU list and we can fail the whole offline because of
+something that is a temporary condition and actually not harmful for the
+offline.
+
+Please note that unmovable pages should be already excluded during
+start_isolate_page_range.  We could argue that has_unmovable_pages is
+racy and MIGRATE_MOVABLE check doesn't provide any hard guarantee either
+but kernel zones (aka < ZONE_MOVABLE) will very likely detect unmovable
+pages in most cases and movable zone shouldn't contain unmovable pages
+at all.  Some of those pages might be pinned but not for ever because
+that would be a bug on its own.  In any case the context is still
+interruptible and so the userspace can easily bail out when the
+operation takes too long.  This is certainly better behavior than a
+hardcoded retry loop which is racy.
+
+Fix this by removing the max retry count and only rely on the timeout
+resp. interruption by a signal from the userspace.  Also retry rather
+than fail when check_pages_isolated sees some !free pages because those
+could be a result of the race as well.
+
+Link: http://lkml.kernel.org/r/20170918070834.13083-2-mhocko@kernel.org
+	Signed-off-by: Michal Hocko <mhocko@suse.com>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+	Cc: Reza Arbab <arbab@linux.vnet.ibm.com>
+	Cc: Yasuaki Ishimatsu <yasu.isimatu@gmail.com>
+	Cc: Xishi Qiu <qiuxishi@huawei.com>
+	Cc: Igor Mammedov <imammedo@redhat.com>
+	Cc: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Cc: Michael Ellerman <mpe@ellerman.id.au>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 72b39cfc4d750e5b8c633a7a6fdd7d07927995ad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memory_hotplug.c
+diff --cc mm/memory_hotplug.c
+index fc0a08f4187f,014e9090cb77..000000000000
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@@ -1747,7 -1594,9 +1747,13 @@@ static int __ref __offline_pages(unsign
+  {
+  	unsigned long pfn, nr_pages, expire;
+  	long offlined_pages;
+++<<<<<<< HEAD
+ +	int ret, drain, retry_max, node;
+++=======
++ 	int ret, node;
++ 	unsigned long flags;
++ 	unsigned long valid_start, valid_end;
+++>>>>>>> 72b39cfc4d75 (mm, memory_hotplug: do not fail offlining too early)
+  	struct zone *zone;
+  	struct memory_notify arg;
+  
+@@@ -1796,33 -1639,17 +1800,34 @@@ repeat
+  	ret = -EINTR;
+  	if (signal_pending(current))
+  		goto failed_removal;
+++<<<<<<< HEAD
+ +	ret = 0;
+ +	if (drain) {
+ +		lru_add_drain_all();
+ +		cond_resched();
+ +		drain_all_pages();
+ +	}
+++=======
++ 
++ 	cond_resched();
++ 	lru_add_drain_all_cpuslocked();
++ 	drain_all_pages(zone);
+++>>>>>>> 72b39cfc4d75 (mm, memory_hotplug: do not fail offlining too early)
+  
+  	pfn = scan_movable_pages(start_pfn, end_pfn);
+  	if (pfn) { /* We have movable pages */
+  		ret = do_migrate_range(pfn, end_pfn);
+- 		if (!ret) {
+- 			drain = 1;
+- 			goto repeat;
+- 		} else {
+- 			if (ret < 0)
+- 				if (--retry_max == 0)
+- 					goto failed_removal;
+- 			yield();
+- 			drain = 1;
+- 			goto repeat;
+- 		}
++ 		goto repeat;
+  	}
+ -
+++<<<<<<< HEAD
+ +	/* drain all zone's lru pagevec, this is asynchronous... */
+ +	lru_add_drain_all();
+ +	yield();
+ +	/* drain pcp pages, this is synchronous. */
+ +	drain_all_pages();
+++=======
+++
+++>>>>>>> 72b39cfc4d75 (mm, memory_hotplug: do not fail offlining too early)
+  	/*
+  	 * dissolve free hugepages in the memory block before doing offlining
+  	 * actually in order to make hugetlbfs's object counting consistent.
+@@@ -1832,11 -1659,9 +1837,17 @@@
+  		goto failed_removal;
+  	/* check again */
+  	offlined_pages = check_pages_isolated(start_pfn, end_pfn);
+++<<<<<<< HEAD
+ +	if (offlined_pages < 0) {
+ +		ret = -EBUSY;
+ +		goto failed_removal;
+ +	}
+ +	printk(KERN_INFO "Offlined Pages %ld\n", offlined_pages);
+++=======
++ 	if (offlined_pages < 0)
++ 		goto repeat;
++ 	pr_info("Offlined Pages %ld\n", offlined_pages);
+++>>>>>>> 72b39cfc4d75 (mm, memory_hotplug: do not fail offlining too early)
+  	/* Ok, all of our target is isolated.
+  	   We cannot do rollback at this point. */
+  	offline_isolated_pages(start_pfn, end_pfn);
+* Unmerged path mm/memory_hotplug.c
