@@ -3892,8 +3892,8 @@ out:
 		 */
 		wmb();
 
-		writel(qp->doorbell_qpn,
-		       to_mdev(ibqp->device)->uar_map + MLX4_SEND_DOORBELL);
+		writel_relaxed(qp->doorbell_qpn,
+			to_mdev(ibqp->device)->uar_map + MLX4_SEND_DOORBELL);
 
 		/*
 		 * Make sure doorbells don't leak out of SQ spinlock
