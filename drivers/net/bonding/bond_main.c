@@ -3308,8 +3308,6 @@ static int bond_open(struct net_device *bond_dev)
 		}
 	}
 
-	bond_work_init_all(bond);
-
 	if (bond_is_lb(bond)) {
 		/* bond_alb_initialize must be called before the timer
 		 * is started.
@@ -4753,6 +4751,8 @@ int bond_create(struct net *net, const char *name)
 	res = register_netdevice(bond_dev);
 
 	netif_carrier_off(bond_dev);
+
+	bond_work_init_all(bond);
 
 	rtnl_unlock();
 	if (res < 0)
