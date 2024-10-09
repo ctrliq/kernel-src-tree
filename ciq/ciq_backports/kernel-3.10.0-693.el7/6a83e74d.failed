@@ -1,0 +1,230 @@
+blk-mq: Introduce blk_mq_quiesce_queue()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Bart Van Assche <bart.vanassche@sandisk.com>
+commit 6a83e74d214a47a1371cd2e6a783264fcba7d428
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/6a83e74d.failed
+
+blk_mq_quiesce_queue() waits until ongoing .queue_rq() invocations
+have finished. This function does *not* wait until all outstanding
+requests have finished (this means invocation of request.end_io()).
+The algorithm used by blk_mq_quiesce_queue() is as follows:
+* Hold either an RCU read lock or an SRCU read lock around
+  .queue_rq() calls. The former is used if .queue_rq() does not
+  block and the latter if .queue_rq() may block.
+* blk_mq_quiesce_queue() first calls blk_mq_stop_hw_queues()
+  followed by synchronize_srcu() or synchronize_rcu(). The latter
+  call waits for .queue_rq() invocations that started before
+  blk_mq_quiesce_queue() was called.
+* The blk_mq_hctx_stopped() calls that control whether or not
+  .queue_rq() will be called are called with the (S)RCU read lock
+  held. This is necessary to avoid race conditions against
+  blk_mq_quiesce_queue().
+
+	Signed-off-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Cc: Hannes Reinecke <hare@suse.com>
+	Cc: Johannes Thumshirn <jthumshirn@suse.de>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: Ming Lei <tom.leiming@gmail.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 6a83e74d214a47a1371cd2e6a783264fcba7d428)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/Kconfig
+#	block/blk-mq.c
+#	include/linux/blk-mq.h
+diff --cc block/Kconfig
+index 6a13519cf86b,3a024440a669..000000000000
+--- a/block/Kconfig
++++ b/block/Kconfig
+@@@ -4,6 -4,8 +4,11 @@@
+  menuconfig BLOCK
+         bool "Enable the block layer" if EXPERT
+         default y
+++<<<<<<< HEAD
+++=======
++        select SBITMAP
++        select SRCU
+++>>>>>>> 6a83e74d214a (blk-mq: Introduce blk_mq_quiesce_queue())
+         help
+  	 Provide block layer support for the kernel.
+  
+diff --cc block/blk-mq.c
+index 1fb8b36f35c6,3dc323543293..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -750,12 -802,9 +777,9 @@@ static void blk_mq_process_rq_list(stru
+  	struct list_head *dptr;
+  	int queued;
+  
+ -	if (unlikely(blk_mq_hctx_stopped(hctx)))
+ +	if (unlikely(test_bit(BLK_MQ_S_STOPPED, &hctx->state)))
+  		return;
+  
+- 	WARN_ON(!cpumask_test_cpu(raw_smp_processor_id(), hctx->cpumask) &&
+- 		cpu_online(hctx->next_cpu));
+- 
+  	hctx->run++;
+  
+  	/*
+@@@ -1265,15 -1304,16 +1307,15 @@@ static int blk_mq_direct_issue_request(
+   * but will attempt to bypass the hctx queueing if we can go straight to
+   * hardware for SYNC IO.
+   */
+ -static blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio)
+ +static void blk_mq_make_request(struct request_queue *q, struct bio *bio)
+  {
+ -	const int is_sync = op_is_sync(bio->bi_opf);
+ -	const int is_flush_fua = bio->bi_opf & (REQ_PREFLUSH | REQ_FUA);
+ -	struct blk_mq_alloc_data data;
+ +	const int is_sync = rw_is_sync(bio->bi_rw);
+ +	const int is_flush_fua = bio->bi_rw & (REQ_FLUSH | REQ_FUA);
+ +	struct blk_map_ctx data;
+  	struct request *rq;
+- 	unsigned int request_count = 0;
++ 	unsigned int request_count = 0, srcu_idx;
+  	struct blk_plug *plug;
+  	struct request *same_queue_rq = NULL;
+ -	blk_qc_t cookie;
+  
+  	blk_queue_bounce(q, &bio);
+  
+@@@ -1328,11 -1372,18 +1370,26 @@@
+  			old_rq = rq;
+  		blk_mq_put_ctx(data.ctx);
+  		if (!old_rq)
+++<<<<<<< HEAD
+ +			return;
+ +		if (!blk_mq_direct_issue_request(old_rq))
+ +			return;
+ +		blk_mq_insert_request(old_rq, false, true, true);
+ +		return;
+++=======
++ 			goto done;
++ 
++ 		if (!(data.hctx->flags & BLK_MQ_F_BLOCKING)) {
++ 			rcu_read_lock();
++ 			blk_mq_try_issue_directly(data.hctx, old_rq, &cookie);
++ 			rcu_read_unlock();
++ 		} else {
++ 			srcu_idx = srcu_read_lock(&data.hctx->queue_rq_srcu);
++ 			blk_mq_try_issue_directly(data.hctx, old_rq, &cookie);
++ 			srcu_read_unlock(&data.hctx->queue_rq_srcu, srcu_idx);
++ 		}
++ 		goto done;
+++>>>>>>> 6a83e74d214a (blk-mq: Introduce blk_mq_quiesce_queue())
+  	}
+  
+  	if (!blk_mq_merge_queue_io(data.hctx, data.ctx, rq, bio)) {
+@@@ -1633,10 -1661,12 +1690,17 @@@ static void blk_mq_exit_hctx(struct req
+  	if (set->ops->exit_hctx)
+  		set->ops->exit_hctx(hctx, hctx_idx);
+  
+++<<<<<<< HEAD
+ +	blk_mq_unregister_cpu_notifier(&hctx->cpu_notifier);
+++=======
++ 	if (hctx->flags & BLK_MQ_F_BLOCKING)
++ 		cleanup_srcu_struct(&hctx->queue_rq_srcu);
++ 
++ 	blk_mq_remove_cpuhp(hctx);
+++>>>>>>> 6a83e74d214a (blk-mq: Introduce blk_mq_quiesce_queue())
+  	blk_free_flush_queue(hctx->fq);
+ -	sbitmap_free(&hctx->ctx_map);
+ +	kfree(hctx->ctxs);
+ +	blk_mq_free_bitmap(&hctx->ctx_map);
+  }
+  
+  static void blk_mq_exit_hw_queues(struct request_queue *q,
+diff --cc include/linux/blk-mq.h
+index 0e7b0244ac77,ed20ac74c62a..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -2,7 -2,8 +2,12 @@@
+  #define BLK_MQ_H
+  
+  #include <linux/blkdev.h>
+++<<<<<<< HEAD
+ +#include <linux/rh_kabi.h>
+++=======
++ #include <linux/sbitmap.h>
++ #include <linux/srcu.h>
+++>>>>>>> 6a83e74d214a (blk-mq: Introduce blk_mq_quiesce_queue())
+  
+  struct blk_mq_tags;
+  struct blk_flush_queue;
+@@@ -55,43 -36,30 +60,45 @@@ struct blk_mq_hw_ctx 
+  
+  	struct blk_mq_tags	*tags;
+  
++ 	struct srcu_struct	queue_rq_srcu;
++ 
+  	unsigned long		queued;
+  	unsigned long		run;
+ -#define BLK_MQ_MAX_DISPATCH_ORDER	7
+ +#define BLK_MQ_MAX_DISPATCH_ORDER	10
+  	unsigned long		dispatched[BLK_MQ_MAX_DISPATCH_ORDER];
+  
+ +	unsigned int		queue_depth;	/* DEPRECATED: RHEL kABI padding, repurpose? */
+  	unsigned int		numa_node;
+ -	unsigned int		queue_num;
+ +	RH_KABI_DEPRECATE(unsigned int, cmd_size)
+  
+ -	atomic_t		nr_active;
+ +	struct blk_mq_cpu_notifier	cpu_notifier;
+ +	struct kobject		kobj;
+  
+ -	struct delayed_work	delay_work;
+ +	RH_KABI_EXTEND(struct delayed_work	run_work)
+ +	RH_KABI_EXTEND(cpumask_var_t		cpumask)
+ +	RH_KABI_EXTEND(int			next_cpu)
+ +	RH_KABI_EXTEND(int			next_cpu_batch)
+  
+ -	struct hlist_node	cpuhp_dead;
+ -	struct kobject		kobj;
+ +	RH_KABI_EXTEND(struct blk_mq_ctxmap	ctx_map)
+ +
+ +	RH_KABI_EXTEND(atomic_t		nr_active)
+  
+ -	unsigned long		poll_considered;
+ -	unsigned long		poll_invoked;
+ -	unsigned long		poll_success;
+ +	RH_KABI_EXTEND(struct blk_flush_queue	*fq)
+  };
+  
+ +#ifdef __GENKSYMS__
+ +struct blk_mq_reg {
+ +	struct blk_mq_ops	*ops;
+ +	unsigned int		nr_hw_queues;
+ +	unsigned int		queue_depth;	/* max hw supported */
+ +	unsigned int		reserved_tags;
+ +	unsigned int		cmd_size;	/* per-request extra data */
+ +	int			numa_node;
+ +	unsigned int		timeout;
+ +	unsigned int		flags;		/* BLK_MQ_F_* */
+ +};
+ +#else
+  struct blk_mq_tag_set {
+ -	unsigned int		*mq_map;
+  	struct blk_mq_ops	*ops;
+  	unsigned int		nr_hw_queues;
+  	unsigned int		queue_depth;	/* max hw supported */
+* Unmerged path block/Kconfig
+* Unmerged path block/blk-mq.c
+* Unmerged path include/linux/blk-mq.h
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 04d39eb837bf..a70eb613c671 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -906,6 +906,7 @@ extern void __blk_stop_queue(struct request_queue *q);
+ extern void __blk_run_queue(struct request_queue *q);
+ extern void blk_run_queue(struct request_queue *);
+ extern void blk_run_queue_async(struct request_queue *q);
++extern void blk_mq_quiesce_queue(struct request_queue *q);
+ extern int blk_rq_map_user(struct request_queue *, struct request *,
+ 			   struct rq_map_data *, void __user *, unsigned long,
+ 			   gfp_t);
