@@ -39,17 +39,17 @@ union acpi_object {
 };
 #endif
 
-#ifdef	CONFIG_ACPI
-
 #ifndef _LINUX
 #define _LINUX
 #endif
+#include <acpi/acpi.h>
+
+#ifdef	CONFIG_ACPI
 
 #include <linux/list.h>
 #include <linux/mod_devicetable.h>
 #include <linux/dynamic_debug.h>
 
-#include <acpi/acpi.h>
 #include <acpi/acpi_bus.h>
 #include <acpi/acpi_drivers.h>
 #include <acpi/acpi_numa.h>
