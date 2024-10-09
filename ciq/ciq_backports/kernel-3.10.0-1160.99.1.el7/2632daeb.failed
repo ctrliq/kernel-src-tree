@@ -1,0 +1,516 @@
+x86/cpu: Restore AMD's DE_CFG MSR after resume
+
+jira LE-1907
+cve CVE-2023-20593
+Rebuild_History Non-Buildable kernel-3.10.0-1160.99.1.el7
+commit-author Borislav Petkov <bp@suse.de>
+commit 2632daebafd04746b4b96c2f26a6021bc38f6209
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.99.1.el7/2632daeb.failed
+
+DE_CFG contains the LFENCE serializing bit, restore it on resume too.
+This is relevant to older families due to the way how they do S3.
+
+Unify and correct naming while at it.
+
+Fixes: e4d0e84e4907 ("x86/cpu/AMD: Make LFENCE a serializing instruction")
+	Reported-by: Andrew Cooper <Andrew.Cooper3@citrix.com>
+	Reported-by: Pawan Gupta <pawan.kumar.gupta@linux.intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: <stable@kernel.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 2632daebafd04746b4b96c2f26a6021bc38f6209)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/msr-index.h
+#	arch/x86/kernel/cpu/amd.c
+#	arch/x86/kernel/cpu/hygon.c
+#	arch/x86/kvm/svm/svm.c
+#	arch/x86/kvm/x86.c
+#	arch/x86/power/cpu.c
+#	tools/arch/x86/include/asm/msr-index.h
+diff --cc arch/x86/include/asm/msr-index.h
+index 381107911851,4a2af82553e4..000000000000
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@@ -390,11 -525,21 +390,16 @@@
+  #define MSR_AMD64_TSC_RATIO		0xc0000104
+  #define MSR_AMD64_NB_CFG		0xc001001f
+  #define MSR_AMD64_PATCH_LOADER		0xc0010020
+ -#define MSR_AMD_PERF_CTL		0xc0010062
+ -#define MSR_AMD_PERF_STATUS		0xc0010063
+ -#define MSR_AMD_PSTATE_DEF_BASE		0xc0010064
+ +#define MSR_AMD64_VIRT_SPEC_CTRL	0xc001011f
+  #define MSR_AMD64_OSVW_ID_LENGTH	0xc0010140
+  #define MSR_AMD64_OSVW_STATUS		0xc0010141
+ -#define MSR_AMD_PPIN_CTL		0xc00102f0
+ -#define MSR_AMD_PPIN			0xc00102f1
+ -#define MSR_AMD64_CPUID_FN_1		0xc0011004
+  #define MSR_AMD64_LS_CFG		0xc0011020
+  #define MSR_AMD64_DC_CFG		0xc0011022
++ 
++ #define MSR_AMD64_DE_CFG		0xc0011029
++ #define MSR_AMD64_DE_CFG_LFENCE_SERIALIZE_BIT	 1
++ #define MSR_AMD64_DE_CFG_LFENCE_SERIALIZE	BIT_ULL(MSR_AMD64_DE_CFG_LFENCE_SERIALIZE_BIT)
++ 
+  #define MSR_AMD64_BU_CFG2		0xc001102a
+  #define MSR_AMD64_IBSFETCHCTL		0xc0011030
+  #define MSR_AMD64_IBSFETCHLINAD		0xc0011031
+@@@ -447,8 -645,6 +452,11 @@@
+  #define FAM10H_MMIO_CONF_BASE_MASK	0xfffffffULL
+  #define FAM10H_MMIO_CONF_BASE_SHIFT	20
+  #define MSR_FAM10H_NODE_ID		0xc001100c
+++<<<<<<< HEAD
+ +#define MSR_F10H_DECFG			0xc0011029
+ +#define MSR_F10H_DECFG_LFENCE_SERIALIZE_BIT	1
+++=======
+++>>>>>>> 2632daebafd0 (x86/cpu: Restore AMD's DE_CFG MSR after resume)
+  
+  /* K8 MSRs */
+  #define MSR_K8_TOP_MEM1			0xc001001a
+diff --cc arch/x86/kernel/cpu/amd.c
+index 619851c677bd,c75d75b9f11a..000000000000
+--- a/arch/x86/kernel/cpu/amd.c
++++ b/arch/x86/kernel/cpu/amd.c
+@@@ -634,12 -692,173 +634,178 @@@ static void early_init_amd(struct cpuin
+  		}
+  	}
+  
+ -	if (cpu_has(c, X86_FEATURE_TOPOEXT))
+ -		smp_num_siblings = ((cpuid_ebx(0x8000001e) >> 8) & 0xff) + 1;
+ +	amd_get_topology_early(c);
+  }
+  
+++<<<<<<< HEAD
+ +static const int amd_erratum_383[];
+ +static const int amd_erratum_400[];
+ +static bool cpu_has_amd_erratum(struct cpuinfo_x86 *cpu, const int *erratum);
+++=======
++ static void init_amd_k8(struct cpuinfo_x86 *c)
++ {
++ 	u32 level;
++ 	u64 value;
++ 
++ 	/* On C+ stepping K8 rep microcode works well for copy/memset */
++ 	level = cpuid_eax(1);
++ 	if ((level >= 0x0f48 && level < 0x0f50) || level >= 0x0f58)
++ 		set_cpu_cap(c, X86_FEATURE_REP_GOOD);
++ 
++ 	/*
++ 	 * Some BIOSes incorrectly force this feature, but only K8 revision D
++ 	 * (model = 0x14) and later actually support it.
++ 	 * (AMD Erratum #110, docId: 25759).
++ 	 */
++ 	if (c->x86_model < 0x14 && cpu_has(c, X86_FEATURE_LAHF_LM)) {
++ 		clear_cpu_cap(c, X86_FEATURE_LAHF_LM);
++ 		if (!rdmsrl_amd_safe(0xc001100d, &value)) {
++ 			value &= ~BIT_64(32);
++ 			wrmsrl_amd_safe(0xc001100d, value);
++ 		}
++ 	}
++ 
++ 	if (!c->x86_model_id[0])
++ 		strcpy(c->x86_model_id, "Hammer");
++ 
++ #ifdef CONFIG_SMP
++ 	/*
++ 	 * Disable TLB flush filter by setting HWCR.FFDIS on K8
++ 	 * bit 6 of msr C001_0015
++ 	 *
++ 	 * Errata 63 for SH-B3 steppings
++ 	 * Errata 122 for all steppings (F+ have it disabled by default)
++ 	 */
++ 	msr_set_bit(MSR_K7_HWCR, 6);
++ #endif
++ 	set_cpu_bug(c, X86_BUG_SWAPGS_FENCE);
++ }
++ 
++ static void init_amd_gh(struct cpuinfo_x86 *c)
++ {
++ #ifdef CONFIG_MMCONF_FAM10H
++ 	/* do this for boot cpu */
++ 	if (c == &boot_cpu_data)
++ 		check_enable_amd_mmconf_dmi();
++ 
++ 	fam10h_check_enable_mmcfg();
++ #endif
++ 
++ 	/*
++ 	 * Disable GART TLB Walk Errors on Fam10h. We do this here because this
++ 	 * is always needed when GART is enabled, even in a kernel which has no
++ 	 * MCE support built in. BIOS should disable GartTlbWlk Errors already.
++ 	 * If it doesn't, we do it here as suggested by the BKDG.
++ 	 *
++ 	 * Fixes: https://bugzilla.kernel.org/show_bug.cgi?id=33012
++ 	 */
++ 	msr_set_bit(MSR_AMD64_MCx_MASK(4), 10);
++ 
++ 	/*
++ 	 * On family 10h BIOS may not have properly enabled WC+ support, causing
++ 	 * it to be converted to CD memtype. This may result in performance
++ 	 * degradation for certain nested-paging guests. Prevent this conversion
++ 	 * by clearing bit 24 in MSR_AMD64_BU_CFG2.
++ 	 *
++ 	 * NOTE: we want to use the _safe accessors so as not to #GP kvm
++ 	 * guests on older kvm hosts.
++ 	 */
++ 	msr_clear_bit(MSR_AMD64_BU_CFG2, 24);
++ 
++ 	if (cpu_has_amd_erratum(c, amd_erratum_383))
++ 		set_cpu_bug(c, X86_BUG_AMD_TLB_MMATCH);
++ }
++ 
++ static void init_amd_ln(struct cpuinfo_x86 *c)
++ {
++ 	/*
++ 	 * Apply erratum 665 fix unconditionally so machines without a BIOS
++ 	 * fix work.
++ 	 */
++ 	msr_set_bit(MSR_AMD64_DE_CFG, 31);
++ }
++ 
++ static bool rdrand_force;
++ 
++ static int __init rdrand_cmdline(char *str)
++ {
++ 	if (!str)
++ 		return -EINVAL;
++ 
++ 	if (!strcmp(str, "force"))
++ 		rdrand_force = true;
++ 	else
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ early_param("rdrand", rdrand_cmdline);
++ 
++ static void clear_rdrand_cpuid_bit(struct cpuinfo_x86 *c)
++ {
++ 	/*
++ 	 * Saving of the MSR used to hide the RDRAND support during
++ 	 * suspend/resume is done by arch/x86/power/cpu.c, which is
++ 	 * dependent on CONFIG_PM_SLEEP.
++ 	 */
++ 	if (!IS_ENABLED(CONFIG_PM_SLEEP))
++ 		return;
++ 
++ 	/*
++ 	 * The self-test can clear X86_FEATURE_RDRAND, so check for
++ 	 * RDRAND support using the CPUID function directly.
++ 	 */
++ 	if (!(cpuid_ecx(1) & BIT(30)) || rdrand_force)
++ 		return;
++ 
++ 	msr_clear_bit(MSR_AMD64_CPUID_FN_1, 62);
++ 
++ 	/*
++ 	 * Verify that the CPUID change has occurred in case the kernel is
++ 	 * running virtualized and the hypervisor doesn't support the MSR.
++ 	 */
++ 	if (cpuid_ecx(1) & BIT(30)) {
++ 		pr_info_once("BIOS may not properly restore RDRAND after suspend, but hypervisor does not support hiding RDRAND via CPUID.\n");
++ 		return;
++ 	}
++ 
++ 	clear_cpu_cap(c, X86_FEATURE_RDRAND);
++ 	pr_info_once("BIOS may not properly restore RDRAND after suspend, hiding RDRAND via CPUID. Use rdrand=force to reenable.\n");
++ }
++ 
++ static void init_amd_jg(struct cpuinfo_x86 *c)
++ {
++ 	/*
++ 	 * Some BIOS implementations do not restore proper RDRAND support
++ 	 * across suspend and resume. Check on whether to hide the RDRAND
++ 	 * instruction support via CPUID.
++ 	 */
++ 	clear_rdrand_cpuid_bit(c);
++ }
++ 
++ static void init_amd_bd(struct cpuinfo_x86 *c)
++ {
++ 	u64 value;
++ 
++ 	/*
++ 	 * The way access filter has a performance penalty on some workloads.
++ 	 * Disable it on the affected CPUs.
++ 	 */
++ 	if ((c->x86_model >= 0x02) && (c->x86_model < 0x20)) {
++ 		if (!rdmsrl_safe(MSR_F15H_IC_CFG, &value) && !(value & 0x1E)) {
++ 			value |= 0x1E;
++ 			wrmsrl_safe(MSR_F15H_IC_CFG, value);
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * Some BIOS implementations do not restore proper RDRAND support
++ 	 * across suspend and resume. Check on whether to hide the RDRAND
++ 	 * instruction support via CPUID.
++ 	 */
++ 	clear_rdrand_cpuid_bit(c);
++ }
+++>>>>>>> 2632daebafd0 (x86/cpu: Restore AMD's DE_CFG MSR after resume)
+  
+  void init_spectral_chicken(struct cpuinfo_x86 *c)
+  {
+@@@ -809,20 -956,17 +975,32 @@@ static void init_amd(struct cpuinfo_x8
+  
+  	init_amd_cacheinfo(c);
+  
+++<<<<<<< HEAD
+ +	if (c->x86 >= 0xf)
+ +		set_cpu_cap(c, X86_FEATURE_K8);
+++=======
++ 	if (cpu_has(c, X86_FEATURE_XMM2)) {
++ 		/*
++ 		 * Use LFENCE for execution serialization.  On families which
++ 		 * don't have that MSR, LFENCE is already serializing.
++ 		 * msr_set_bit() uses the safe accessors, too, even if the MSR
++ 		 * is not present.
++ 		 */
++ 		msr_set_bit(MSR_AMD64_DE_CFG,
++ 			    MSR_AMD64_DE_CFG_LFENCE_SERIALIZE_BIT);
+++>>>>>>> 2632daebafd0 (x86/cpu: Restore AMD's DE_CFG MSR after resume)
+ +
+ +	if (cpu_has_xmm2) {
+ +		/*
+ +		 * Use LFENCE for execution serialization. On some families
+ +		 * LFENCE is already serialized and the MSR is not available,
+ +		 * but msr_set_bit() uses rdmsrl_safe() and wrmsrl_safe().
+ +		 */
+ +		if (c->x86 > 0xf)
+ +			msr_set_bit(MSR_F10H_DECFG,
+ +				    MSR_F10H_DECFG_LFENCE_SERIALIZE_BIT);
+  
+ -		/* A serializing LFENCE stops RDTSC speculation */
+ +		/* LFENCE with MSR_F10H_DECFG[1]=1 stops RDTSC speculation */
+  		set_cpu_cap(c, X86_FEATURE_LFENCE_RDTSC);
+  	}
+  
+diff --cc arch/x86/kvm/x86.c
+index 9e9c47495369,490ec23c8450..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -1051,18 -1537,61 +1051,43 @@@ static unsigned num_emulated_msrs
+   * List of msr numbers which are used to expose MSR-based features that
+   * can be used by a hypervisor to validate requested CPU features.
+   */
+++<<<<<<< HEAD
+ +static u32 msr_based_features[] = {
+++=======
++ static const u32 msr_based_features_all[] = {
++ 	MSR_IA32_VMX_BASIC,
++ 	MSR_IA32_VMX_TRUE_PINBASED_CTLS,
++ 	MSR_IA32_VMX_PINBASED_CTLS,
++ 	MSR_IA32_VMX_TRUE_PROCBASED_CTLS,
++ 	MSR_IA32_VMX_PROCBASED_CTLS,
++ 	MSR_IA32_VMX_TRUE_EXIT_CTLS,
++ 	MSR_IA32_VMX_EXIT_CTLS,
++ 	MSR_IA32_VMX_TRUE_ENTRY_CTLS,
++ 	MSR_IA32_VMX_ENTRY_CTLS,
++ 	MSR_IA32_VMX_MISC,
++ 	MSR_IA32_VMX_CR0_FIXED0,
++ 	MSR_IA32_VMX_CR0_FIXED1,
++ 	MSR_IA32_VMX_CR4_FIXED0,
++ 	MSR_IA32_VMX_CR4_FIXED1,
++ 	MSR_IA32_VMX_VMCS_ENUM,
++ 	MSR_IA32_VMX_PROCBASED_CTLS2,
++ 	MSR_IA32_VMX_EPT_VPID_CAP,
++ 	MSR_IA32_VMX_VMFUNC,
++ 
++ 	MSR_AMD64_DE_CFG,
++ 	MSR_IA32_UCODE_REV,
+++>>>>>>> 2632daebafd0 (x86/cpu: Restore AMD's DE_CFG MSR after resume)
+  	MSR_IA32_ARCH_CAPABILITIES,
+ -	MSR_IA32_PERF_CAPABILITIES,
+ +	MSR_IA32_UCODE_REV,
+  };
+  
+ -static u32 msr_based_features[ARRAY_SIZE(msr_based_features_all)];
+  static unsigned int num_msr_based_features;
+  
+ -/*
+ - * Some IA32_ARCH_CAPABILITIES bits have dependencies on MSRs that KVM
+ - * does not yet virtualize. These include:
+ - *   10 - MISC_PACKAGE_CTRLS
+ - *   11 - ENERGY_FILTERING_CTL
+ - *   12 - DOITM
+ - *   18 - FB_CLEAR_CTRL
+ - *   21 - XAPIC_DISABLE_STATUS
+ - *   23 - OVERCLOCKING_STATUS
+ - */
+ -
+ -#define KVM_SUPPORTED_ARCH_CAP \
+ -	(ARCH_CAP_RDCL_NO | ARCH_CAP_IBRS_ALL | ARCH_CAP_RSBA | \
+ -	 ARCH_CAP_SKIP_VMENTRY_L1DFLUSH | ARCH_CAP_SSB_NO | ARCH_CAP_MDS_NO | \
+ -	 ARCH_CAP_PSCHANGE_MC_NO | ARCH_CAP_TSX_CTRL_MSR | ARCH_CAP_TAA_NO | \
+ -	 ARCH_CAP_SBDR_SSDP_NO | ARCH_CAP_FBSDP_NO | ARCH_CAP_PSDP_NO | \
+ -	 ARCH_CAP_FB_CLEAR | ARCH_CAP_RRSBA | ARCH_CAP_PBRSB_NO)
+ -
+ -static u64 kvm_get_arch_capabilities(void)
+ +u64 kvm_get_arch_capabilities(void)
+  {
+ -	u64 data = 0;
+ +	u64 data;
+  
+ -	if (boot_cpu_has(X86_FEATURE_ARCH_CAPABILITIES)) {
+ -		rdmsrl(MSR_IA32_ARCH_CAPABILITIES, data);
+ -		data &= KVM_SUPPORTED_ARCH_CAP;
+ -	}
+ +	rdmsrl_safe(MSR_IA32_ARCH_CAPABILITIES, &data);
+  
+  	/*
+  	 * If nx_huge_pages is enabled, KVM's shadow paging will ensure that
+diff --cc arch/x86/power/cpu.c
+index 2d2da5785603,4cd39f304e20..000000000000
+--- a/arch/x86/power/cpu.c
++++ b/arch/x86/power/cpu.c
+@@@ -364,3 -405,133 +364,136 @@@ static int __init bsp_pm_check_init(voi
+  }
+  
+  core_initcall(bsp_pm_check_init);
+++<<<<<<< HEAD
+++=======
++ 
++ static int msr_build_context(const u32 *msr_id, const int num)
++ {
++ 	struct saved_msrs *saved_msrs = &saved_context.saved_msrs;
++ 	struct saved_msr *msr_array;
++ 	int total_num;
++ 	int i, j;
++ 
++ 	total_num = saved_msrs->num + num;
++ 
++ 	msr_array = kmalloc_array(total_num, sizeof(struct saved_msr), GFP_KERNEL);
++ 	if (!msr_array) {
++ 		pr_err("x86/pm: Can not allocate memory to save/restore MSRs during suspend.\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	if (saved_msrs->array) {
++ 		/*
++ 		 * Multiple callbacks can invoke this function, so copy any
++ 		 * MSR save requests from previous invocations.
++ 		 */
++ 		memcpy(msr_array, saved_msrs->array,
++ 		       sizeof(struct saved_msr) * saved_msrs->num);
++ 
++ 		kfree(saved_msrs->array);
++ 	}
++ 
++ 	for (i = saved_msrs->num, j = 0; i < total_num; i++, j++) {
++ 		u64 dummy;
++ 
++ 		msr_array[i].info.msr_no	= msr_id[j];
++ 		msr_array[i].valid		= !rdmsrl_safe(msr_id[j], &dummy);
++ 		msr_array[i].info.reg.q		= 0;
++ 	}
++ 	saved_msrs->num   = total_num;
++ 	saved_msrs->array = msr_array;
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * The following sections are a quirk framework for problematic BIOSen:
++  * Sometimes MSRs are modified by the BIOSen after suspended to
++  * RAM, this might cause unexpected behavior after wakeup.
++  * Thus we save/restore these specified MSRs across suspend/resume
++  * in order to work around it.
++  *
++  * For any further problematic BIOSen/platforms,
++  * please add your own function similar to msr_initialize_bdw.
++  */
++ static int msr_initialize_bdw(const struct dmi_system_id *d)
++ {
++ 	/* Add any extra MSR ids into this array. */
++ 	u32 bdw_msr_id[] = { MSR_IA32_THERM_CONTROL };
++ 
++ 	pr_info("x86/pm: %s detected, MSR saving is needed during suspending.\n", d->ident);
++ 	return msr_build_context(bdw_msr_id, ARRAY_SIZE(bdw_msr_id));
++ }
++ 
++ static const struct dmi_system_id msr_save_dmi_table[] = {
++ 	{
++ 	 .callback = msr_initialize_bdw,
++ 	 .ident = "BROADWELL BDX_EP",
++ 	 .matches = {
++ 		DMI_MATCH(DMI_PRODUCT_NAME, "GRANTLEY"),
++ 		DMI_MATCH(DMI_PRODUCT_VERSION, "E63448-400"),
++ 		},
++ 	},
++ 	{}
++ };
++ 
++ static int msr_save_cpuid_features(const struct x86_cpu_id *c)
++ {
++ 	u32 cpuid_msr_id[] = {
++ 		MSR_AMD64_CPUID_FN_1,
++ 	};
++ 
++ 	pr_info("x86/pm: family %#hx cpu detected, MSR saving is needed during suspending.\n",
++ 		c->family);
++ 
++ 	return msr_build_context(cpuid_msr_id, ARRAY_SIZE(cpuid_msr_id));
++ }
++ 
++ static const struct x86_cpu_id msr_save_cpu_table[] = {
++ 	X86_MATCH_VENDOR_FAM(AMD, 0x15, &msr_save_cpuid_features),
++ 	X86_MATCH_VENDOR_FAM(AMD, 0x16, &msr_save_cpuid_features),
++ 	{}
++ };
++ 
++ typedef int (*pm_cpu_match_t)(const struct x86_cpu_id *);
++ static int pm_cpu_check(const struct x86_cpu_id *c)
++ {
++ 	const struct x86_cpu_id *m;
++ 	int ret = 0;
++ 
++ 	m = x86_match_cpu(msr_save_cpu_table);
++ 	if (m) {
++ 		pm_cpu_match_t fn;
++ 
++ 		fn = (pm_cpu_match_t)m->driver_data;
++ 		ret = fn(m);
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static void pm_save_spec_msr(void)
++ {
++ 	u32 spec_msr_id[] = {
++ 		MSR_IA32_SPEC_CTRL,
++ 		MSR_IA32_TSX_CTRL,
++ 		MSR_TSX_FORCE_ABORT,
++ 		MSR_IA32_MCU_OPT_CTRL,
++ 		MSR_AMD64_LS_CFG,
++ 		MSR_AMD64_DE_CFG,
++ 	};
++ 
++ 	msr_build_context(spec_msr_id, ARRAY_SIZE(spec_msr_id));
++ }
++ 
++ static int pm_check_save_msr(void)
++ {
++ 	dmi_check_system(msr_save_dmi_table);
++ 	pm_cpu_check(msr_save_cpu_table);
++ 	pm_save_spec_msr();
++ 
++ 	return 0;
++ }
++ 
++ device_initcall(pm_check_save_msr);
+++>>>>>>> 2632daebafd0 (x86/cpu: Restore AMD's DE_CFG MSR after resume)
+* Unmerged path arch/x86/kernel/cpu/hygon.c
+* Unmerged path arch/x86/kvm/svm/svm.c
+* Unmerged path tools/arch/x86/include/asm/msr-index.h
+* Unmerged path arch/x86/include/asm/msr-index.h
+* Unmerged path arch/x86/kernel/cpu/amd.c
+* Unmerged path arch/x86/kernel/cpu/hygon.c
+* Unmerged path arch/x86/kvm/svm/svm.c
+* Unmerged path arch/x86/kvm/x86.c
+* Unmerged path arch/x86/power/cpu.c
+* Unmerged path tools/arch/x86/include/asm/msr-index.h
