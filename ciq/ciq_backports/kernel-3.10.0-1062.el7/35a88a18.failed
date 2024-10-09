@@ -1,0 +1,114 @@
+PCI: hv: Disable/enable IRQs rather than BH in hv_compose_msi_msg()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [pci] hv: Disable/enable IRQs rather than BH in hv_compose_msi_msg() (Mohammed Gamal) [1636237]
+Rebuild_FUZZ: 96.12%
+commit-author Dexuan Cui <decui@microsoft.com>
+commit 35a88a18d7ea58600e11590405bc93b08e16e7f5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/35a88a18.failed
+
+Commit de0aa7b2f97d ("PCI: hv: Fix 2 hang issues in hv_compose_msi_msg()")
+uses local_bh_disable()/enable(), because hv_pci_onchannelcallback() can
+also run in tasklet context as the channel event callback, so bottom halves
+should be disabled to prevent a race condition.
+
+With CONFIG_PROVE_LOCKING=y in the recent mainline, or old kernels that
+don't have commit f71b74bca637 ("irq/softirqs: Use lockdep to assert IRQs
+are disabled/enabled"), when the upper layer IRQ code calls
+hv_compose_msi_msg() with local IRQs disabled, we'll see a warning at the
+beginning of __local_bh_enable_ip():
+
+  IRQs not enabled as expected
+    WARNING: CPU: 0 PID: 408 at kernel/softirq.c:162 __local_bh_enable_ip
+
+The warning exposes an issue in de0aa7b2f97d: local_bh_enable() can
+potentially call do_softirq(), which is not supposed to run when local IRQs
+are disabled. Let's fix this by using local_irq_save()/restore() instead.
+
+Note: hv_pci_onchannelcallback() is not a hot path because it's only called
+when the PCI device is hot added and removed, which is infrequent.
+
+Fixes: de0aa7b2f97d ("PCI: hv: Fix 2 hang issues in hv_compose_msi_msg()")
+	Signed-off-by: Dexuan Cui <decui@microsoft.com>
+	Signed-off-by: Lorenzo Pieralisi <lorenzo.pieralisi@arm.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Reviewed-by: Haiyang Zhang <haiyangz@microsoft.com>
+	Cc: stable@vger.kernel.org
+	Cc: Stephen Hemminger <sthemmin@microsoft.com>
+	Cc: K. Y. Srinivasan <kys@microsoft.com>
+(cherry picked from commit 35a88a18d7ea58600e11590405bc93b08e16e7f5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/pci-hyperv.c
+diff --cc drivers/pci/pci-hyperv.c
+index 6638b7ab8c46,f6325f1a89e8..000000000000
+--- a/drivers/pci/pci-hyperv.c
++++ b/drivers/pci/pci-hyperv.c
+@@@ -1016,6 -1071,9 +1016,12 @@@ static void hv_compose_msi_msg(struct p
+  	struct hv_pcibus_device *hbus;
+  	struct hv_pci_dev *hpdev;
+  	struct pci_bus *pbus;
+++<<<<<<< HEAD:drivers/pci/pci-hyperv.c
+++=======
++ 	struct pci_dev *pdev;
++ 	struct cpumask *dest;
++ 	unsigned long flags;
+++>>>>>>> 35a88a18d7ea (PCI: hv: Disable/enable IRQs rather than BH in hv_compose_msi_msg()):drivers/pci/controller/pci-hyperv.c
+  	struct compose_comp_ctxt comp;
+  	struct tran_int_desc *int_desc;
+  	struct {
+@@@ -1083,12 -1151,43 +1089,45 @@@
+  	 * Since this function is called with IRQ locks held, can't
+  	 * do normal wait for completion; instead poll.
+  	 */
+++<<<<<<< HEAD:drivers/pci/pci-hyperv.c
+ +	while (!try_wait_for_completion(&comp.comp_pkt.host_event))
+++=======
++ 	while (!try_wait_for_completion(&comp.comp_pkt.host_event)) {
++ 		/* 0xFFFF means an invalid PCI VENDOR ID. */
++ 		if (hv_pcifront_get_vendor_id(hpdev) == 0xFFFF) {
++ 			dev_err_once(&hbus->hdev->device,
++ 				     "the device has gone\n");
++ 			goto free_int_desc;
++ 		}
++ 
++ 		/*
++ 		 * When the higher level interrupt code calls us with
++ 		 * interrupt disabled, we must poll the channel by calling
++ 		 * the channel callback directly when channel->target_cpu is
++ 		 * the current CPU. When the higher level interrupt code
++ 		 * calls us with interrupt enabled, let's add the
++ 		 * local_irq_save()/restore() to avoid race:
++ 		 * hv_pci_onchannelcallback() can also run in tasklet.
++ 		 */
++ 		local_irq_save(flags);
++ 
++ 		if (hbus->hdev->channel->target_cpu == smp_processor_id())
++ 			hv_pci_onchannelcallback(hbus);
++ 
++ 		local_irq_restore(flags);
++ 
++ 		if (hpdev->state == hv_pcichild_ejecting) {
++ 			dev_err_once(&hbus->hdev->device,
++ 				     "the device is being ejected\n");
++ 			goto free_int_desc;
++ 		}
++ 
+++>>>>>>> 35a88a18d7ea (PCI: hv: Disable/enable IRQs rather than BH in hv_compose_msi_msg()):drivers/pci/controller/pci-hyperv.c
+  		udelay(100);
+ -	}
+  
+  	if (comp.comp_pkt.completion_status < 0) {
+ -		dev_err(&hbus->hdev->device,
+ -			"Request for interrupt failed: 0x%x",
+ -			comp.comp_pkt.completion_status);
+ +		pr_err("Request for interrupt failed: 0x%x",
+ +		       comp.comp_pkt.completion_status);
+  		goto free_int_desc;
+  	}
+  
+* Unmerged path drivers/pci/pci-hyperv.c
