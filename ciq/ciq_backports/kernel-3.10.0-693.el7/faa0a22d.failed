@@ -1,0 +1,136 @@
+scsi: be2iscsi: Take iscsi_task ref in abort handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] be2iscsi: Take iscsi_task ref in abort handler (Maurizio Lombardi) [1382263]
+Rebuild_FUZZ: 93.88%
+commit-author Jitendra Bhivare <jitendra.bhivare@broadcom.com>
+commit faa0a22d54230ae9658c419e495fc1a469e191f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/faa0a22d.failed
+
+Hold the reference of iscsi_task till invalidation completes.
+This prevents use of ICD when invalidation of that ICD is being processed.
+
+	Signed-off-by: Jitendra Bhivare <jitendra.bhivare@broadcom.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit faa0a22d54230ae9658c419e495fc1a469e191f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/be2iscsi/be_main.c
+diff --cc drivers/scsi/be2iscsi/be_main.c
+index ff265d59e294,260842a1f14e..000000000000
+--- a/drivers/scsi/be2iscsi/be_main.c
++++ b/drivers/scsi/be2iscsi/be_main.c
+@@@ -219,71 -218,44 +219,103 @@@ static int beiscsi_slave_configure(stru
+  
+  static int beiscsi_eh_abort(struct scsi_cmnd *sc)
+  {
++ 	struct iscsi_task *abrt_task = (struct iscsi_task *)sc->SCp.ptr;
+  	struct iscsi_cls_session *cls_session;
+- 	struct iscsi_task *aborted_task = (struct iscsi_task *)sc->SCp.ptr;
+- 	struct beiscsi_io_task *aborted_io_task;
+- 	struct iscsi_conn *conn;
++ 	struct beiscsi_io_task *abrt_io_task;
+  	struct beiscsi_conn *beiscsi_conn;
+- 	struct beiscsi_hba *phba;
+  	struct iscsi_session *session;
+++<<<<<<< HEAD
+ +	struct invalidate_command_table *inv_tbl;
+ +	struct be_dma_mem nonemb_cmd;
+ +	unsigned int cid, tag, num_invalidate;
+++=======
++ 	struct invldt_cmd_tbl inv_tbl;
++ 	struct beiscsi_hba *phba;
++ 	struct iscsi_conn *conn;
+++>>>>>>> faa0a22d5423 (scsi: be2iscsi: Take iscsi_task ref in abort handler)
+  	int rc;
+  
+  	cls_session = starget_to_session(scsi_target(sc->device));
+  	session = cls_session->dd_data;
+  
+++<<<<<<< HEAD
+ +	spin_lock_bh(&session->lock);
+ +	if (!aborted_task || !aborted_task->sc) {
+ +		/* we raced */
+ +		spin_unlock_bh(&session->lock);
+ +		return SUCCESS;
+ +	}
+ +
+ +	aborted_io_task = aborted_task->dd_data;
+ +	if (!aborted_io_task->scsi_cmnd) {
+ +		/* raced or invalid command */
+ +		spin_unlock_bh(&session->lock);
+ +		return SUCCESS;
+ +	}
+ +	spin_unlock_bh(&session->lock);
+ +	/* Invalidate WRB Posted for this Task */
+ +	AMAP_SET_BITS(struct amap_iscsi_wrb, invld,
+ +		      aborted_io_task->pwrb_handle->pwrb,
+ +		      1);
+ +
+ +	conn = aborted_task->conn;
+ +	beiscsi_conn = conn->dd_data;
+ +	phba = beiscsi_conn->phba;
+ +
+ +	/* invalidate iocb */
+ +	cid = beiscsi_conn->beiscsi_conn_cid;
+ +	inv_tbl = phba->inv_tbl;
+ +	memset(inv_tbl, 0x0, sizeof(*inv_tbl));
+ +	inv_tbl->cid = cid;
+ +	inv_tbl->icd = aborted_io_task->psgl_handle->sgl_index;
+ +	num_invalidate = 1;
+ +	nonemb_cmd.va = pci_alloc_consistent(phba->ctrl.pdev,
+ +				sizeof(struct invalidate_commands_params_in),
+ +				&nonemb_cmd.dma);
+ +	if (nonemb_cmd.va == NULL) {
+ +		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_EH,
+ +			    "BM_%d : Failed to allocate memory for"
+ +			    "mgmt_invalidate_icds\n");
+++=======
++ 	/* check if we raced, task just got cleaned up under us */
++ 	spin_lock_bh(&session->back_lock);
++ 	if (!abrt_task || !abrt_task->sc) {
++ 		spin_unlock_bh(&session->back_lock);
++ 		return SUCCESS;
++ 	}
++ 	/* get a task ref till FW processes the req for the ICD used */
++ 	__iscsi_get_task(abrt_task);
++ 	abrt_io_task = abrt_task->dd_data;
++ 	conn = abrt_task->conn;
++ 	beiscsi_conn = conn->dd_data;
++ 	phba = beiscsi_conn->phba;
++ 	/* mark WRB invalid which have been not processed by FW yet */
++ 	AMAP_SET_BITS(struct amap_iscsi_wrb, invld,
++ 		      abrt_io_task->pwrb_handle->pwrb, 1);
++ 	inv_tbl.cid = beiscsi_conn->beiscsi_conn_cid;
++ 	inv_tbl.icd = abrt_io_task->psgl_handle->sgl_index;
++ 	spin_unlock_bh(&session->back_lock);
++ 
++ 	rc = beiscsi_mgmt_invalidate_icds(phba, &inv_tbl, 1);
++ 	iscsi_put_task(abrt_task);
++ 	if (rc) {
++ 		beiscsi_log(phba, KERN_WARNING, BEISCSI_LOG_EH,
++ 			    "BM_%d : sc %p invalidation failed %d\n",
++ 			    sc, rc);
+++>>>>>>> faa0a22d5423 (scsi: be2iscsi: Take iscsi_task ref in abort handler)
+ +		return FAILED;
+ +	}
+ +	nonemb_cmd.size = sizeof(struct invalidate_commands_params_in);
+ +
+ +	tag = mgmt_invalidate_icds(phba, inv_tbl, num_invalidate,
+ +				   cid, &nonemb_cmd);
+ +	if (!tag) {
+ +		beiscsi_log(phba, KERN_WARNING, BEISCSI_LOG_EH,
+ +			    "BM_%d : mgmt_invalidate_icds could not be"
+ +			    "submitted\n");
+ +		pci_free_consistent(phba->ctrl.pdev, nonemb_cmd.size,
+ +				    nonemb_cmd.va, nonemb_cmd.dma);
+ +
+  		return FAILED;
+  	}
+  
+* Unmerged path drivers/scsi/be2iscsi/be_main.c
