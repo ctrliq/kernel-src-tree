@@ -1,0 +1,217 @@
+KVM: SVM: Implement pause loop exit logic in SVM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Babu Moger <babu.moger@amd.com>
+commit 8566ac8b8e7cac5814fb744ff5159d1797a1a6bd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/8566ac8b.failed
+
+Bring the PLE(pause loop exit) logic to AMD svm driver.
+
+While testing, we found this helping in situations where numerous
+pauses are generated. Without these patches we could see continuos
+VMEXITS due to pause interceptions. Tested it on AMD EPYC server with
+boot parameter idle=poll on a VM with 32 vcpus to simulate extensive
+pause behaviour. Here are VMEXITS in 10 seconds interval.
+
+Pauses                  810199                  504
+Total                   882184                  325415
+
+	Signed-off-by: Babu Moger <babu.moger@amd.com>
+[Prevented the window from dropping below the initial value. - Radim]
+	Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+(cherry picked from commit 8566ac8b8e7cac5814fb744ff5159d1797a1a6bd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm.c
+diff --cc arch/x86/kvm/svm.c
+index 6bd91543d358,f66fc2ee9058..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -1056,6 -1159,129 +1104,132 @@@ static void disable_nmi_singlestep(stru
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Note:
++  * This hash table is used to map VM_ID to a struct kvm_svm,
++  * when handling AMD IOMMU GALOG notification to schedule in
++  * a particular vCPU.
++  */
++ #define SVM_VM_DATA_HASH_BITS	8
++ static DEFINE_HASHTABLE(svm_vm_data_hash, SVM_VM_DATA_HASH_BITS);
++ static u32 next_vm_id = 0;
++ static bool next_vm_id_wrapped = 0;
++ static DEFINE_SPINLOCK(svm_vm_data_hash_lock);
++ 
++ /* Note:
++  * This function is called from IOMMU driver to notify
++  * SVM to schedule in a particular vCPU of a particular VM.
++  */
++ static int avic_ga_log_notifier(u32 ga_tag)
++ {
++ 	unsigned long flags;
++ 	struct kvm_svm *kvm_svm;
++ 	struct kvm_vcpu *vcpu = NULL;
++ 	u32 vm_id = AVIC_GATAG_TO_VMID(ga_tag);
++ 	u32 vcpu_id = AVIC_GATAG_TO_VCPUID(ga_tag);
++ 
++ 	pr_debug("SVM: %s: vm_id=%#x, vcpu_id=%#x\n", __func__, vm_id, vcpu_id);
++ 
++ 	spin_lock_irqsave(&svm_vm_data_hash_lock, flags);
++ 	hash_for_each_possible(svm_vm_data_hash, kvm_svm, hnode, vm_id) {
++ 		if (kvm_svm->avic_vm_id != vm_id)
++ 			continue;
++ 		vcpu = kvm_get_vcpu_by_id(&kvm_svm->kvm, vcpu_id);
++ 		break;
++ 	}
++ 	spin_unlock_irqrestore(&svm_vm_data_hash_lock, flags);
++ 
++ 	/* Note:
++ 	 * At this point, the IOMMU should have already set the pending
++ 	 * bit in the vAPIC backing page. So, we just need to schedule
++ 	 * in the vcpu.
++ 	 */
++ 	if (vcpu)
++ 		kvm_vcpu_wake_up(vcpu);
++ 
++ 	return 0;
++ }
++ 
++ static __init int sev_hardware_setup(void)
++ {
++ 	struct sev_user_data_status *status;
++ 	int rc;
++ 
++ 	/* Maximum number of encrypted guests supported simultaneously */
++ 	max_sev_asid = cpuid_ecx(0x8000001F);
++ 
++ 	if (!max_sev_asid)
++ 		return 1;
++ 
++ 	/* Minimum ASID value that should be used for SEV guest */
++ 	min_sev_asid = cpuid_edx(0x8000001F);
++ 
++ 	/* Initialize SEV ASID bitmap */
++ 	sev_asid_bitmap = kcalloc(BITS_TO_LONGS(max_sev_asid),
++ 				sizeof(unsigned long), GFP_KERNEL);
++ 	if (!sev_asid_bitmap)
++ 		return 1;
++ 
++ 	status = kmalloc(sizeof(*status), GFP_KERNEL);
++ 	if (!status)
++ 		return 1;
++ 
++ 	/*
++ 	 * Check SEV platform status.
++ 	 *
++ 	 * PLATFORM_STATUS can be called in any state, if we failed to query
++ 	 * the PLATFORM status then either PSP firmware does not support SEV
++ 	 * feature or SEV firmware is dead.
++ 	 */
++ 	rc = sev_platform_status(status, NULL);
++ 	if (rc)
++ 		goto err;
++ 
++ 	pr_info("SEV supported\n");
++ 
++ err:
++ 	kfree(status);
++ 	return rc;
++ }
++ 
++ static void grow_ple_window(struct kvm_vcpu *vcpu)
++ {
++ 	struct vcpu_svm *svm = to_svm(vcpu);
++ 	struct vmcb_control_area *control = &svm->vmcb->control;
++ 	int old = control->pause_filter_count;
++ 
++ 	control->pause_filter_count = __grow_ple_window(old,
++ 							pause_filter_count,
++ 							pause_filter_count_grow,
++ 							pause_filter_count_max);
++ 
++ 	if (control->pause_filter_count != old)
++ 		mark_dirty(svm->vmcb, VMCB_INTERCEPTS);
++ 
++ 	trace_kvm_ple_window_grow(vcpu->vcpu_id,
++ 				  control->pause_filter_count, old);
++ }
++ 
++ static void shrink_ple_window(struct kvm_vcpu *vcpu)
++ {
++ 	struct vcpu_svm *svm = to_svm(vcpu);
++ 	struct vmcb_control_area *control = &svm->vmcb->control;
++ 	int old = control->pause_filter_count;
++ 
++ 	control->pause_filter_count =
++ 				__shrink_ple_window(old,
++ 						    pause_filter_count,
++ 						    pause_filter_count_shrink,
++ 						    pause_filter_count);
++ 	if (control->pause_filter_count != old)
++ 		mark_dirty(svm->vmcb, VMCB_INTERCEPTS);
++ 
++ 	trace_kvm_ple_window_shrink(vcpu->vcpu_id,
++ 				    control->pause_filter_count, old);
++ }
++ 
+++>>>>>>> 8566ac8b8e7c (KVM: SVM: Implement pause loop exit logic in SVM)
+  static __init int svm_hardware_setup(void)
+  {
+  	int cpu;
+@@@ -1318,9 -1577,13 +1500,18 @@@ static void init_vmcb(struct vcpu_svm *
+  	svm->nested.vmcb = 0;
+  	svm->vcpu.arch.hflags = 0;
+  
+++<<<<<<< HEAD
+ +	if (boot_cpu_has(X86_FEATURE_PAUSEFILTER)) {
+ +		control->pause_filter_count = 3000;
+++=======
++ 	if (pause_filter_count) {
++ 		control->pause_filter_count = pause_filter_count;
++ 		if (pause_filter_thresh)
++ 			control->pause_filter_thresh = pause_filter_thresh;
+++>>>>>>> 8566ac8b8e7c (KVM: SVM: Implement pause loop exit logic in SVM)
+  		set_intercept(svm, INTERCEPT_PAUSE);
++ 	} else {
++ 		clr_intercept(svm, INTERCEPT_PAUSE);
+  	}
+  
+  	if (kvm_vcpu_apicv_active(&svm->vcpu))
+@@@ -3863,7 -4380,13 +4054,17 @@@ static int interrupt_window_interceptio
+  
+  static int pause_interception(struct vcpu_svm *svm)
+  {
+++<<<<<<< HEAD
+ +	kvm_vcpu_on_spin(&(svm->vcpu));
+++=======
++ 	struct kvm_vcpu *vcpu = &svm->vcpu;
++ 	bool in_kernel = (svm_get_cpl(vcpu) == 0);
++ 
++ 	if (pause_filter_thresh)
++ 		grow_ple_window(vcpu);
++ 
++ 	kvm_vcpu_on_spin(vcpu, in_kernel);
+++>>>>>>> 8566ac8b8e7c (KVM: SVM: Implement pause loop exit logic in SVM)
+  	return 1;
+  }
+  
+* Unmerged path arch/x86/kvm/svm.c
+diff --git a/arch/x86/kvm/x86.h b/arch/x86/kvm/x86.h
+index b37cdfb481a3..24e6025fcb19 100644
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -10,6 +10,8 @@
+ #define KVM_DEFAULT_PLE_WINDOW_GROW	2
+ #define KVM_DEFAULT_PLE_WINDOW_SHRINK	0
+ #define KVM_VMX_DEFAULT_PLE_WINDOW_MAX	UINT_MAX
++#define KVM_SVM_DEFAULT_PLE_WINDOW_MAX	USHRT_MAX
++#define KVM_SVM_DEFAULT_PLE_WINDOW	3000
+ 
+ static inline unsigned int __grow_ple_window(unsigned int val,
+ 		unsigned int base, unsigned int modifier, unsigned int max)
