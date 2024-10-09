@@ -1,0 +1,287 @@
+xprtrdma: Replace DMA_BIDIRECTIONAL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 99ef4db329f1ee2413dad49346e72a6c902474d1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/99ef4db3.failed
+
+The use of DMA_BIDIRECTIONAL is discouraged by DMA-API.txt.
+Fortunately, xprtrdma now knows which direction I/O is going as
+soon as it allocates each regbuf.
+
+The RPC Call and Reply buffers are no longer the same regbuf. They
+can each be labeled correctly now. The RPC Reply buffer is never
+part of either a Send or Receive WR, but it can be part of Reply
+chunk, which is mapped and registered via ->ro_map . So it is not
+DMA mapped when it is allocated (DMA_NONE), to avoid a double-
+mapping.
+
+Since Receive buffers are no longer DMA_BIDIRECTIONAL and their
+contents are never modified by the host CPU, DMA-API-HOWTO.txt
+suggests that a DMA sync before posting each buffer should be
+unnecessary. (See my_card_interrupt_handler).
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 99ef4db329f1ee2413dad49346e72a6c902474d1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/backchannel.c
+#	net/sunrpc/xprtrdma/transport.c
+#	net/sunrpc/xprtrdma/verbs.c
+diff --cc net/sunrpc/xprtrdma/backchannel.c
+index d3cfaf281e55,ceae87206347..000000000000
+--- a/net/sunrpc/xprtrdma/backchannel.c
++++ b/net/sunrpc/xprtrdma/backchannel.c
+@@@ -45,21 -45,19 +45,31 @@@ static int rpcrdma_bc_setup_rqst(struc
+  		return PTR_ERR(req);
+  	req->rl_backchannel = true;
+  
+++<<<<<<< HEAD
+ +	size = r_xprt->rx_data.inline_wsize;
+ +	rb = rpcrdma_alloc_regbuf(ia, size, GFP_KERNEL);
+++=======
++ 	rb = rpcrdma_alloc_regbuf(ia, RPCRDMA_HDRBUF_SIZE,
++ 				  DMA_TO_DEVICE, GFP_KERNEL);
+++>>>>>>> 99ef4db329f1 (xprtrdma: Replace DMA_BIDIRECTIONAL)
+  	if (IS_ERR(rb))
+  		goto out_fail;
+  	req->rl_rdmabuf = rb;
+  
+++<<<<<<< HEAD
+ +	size += r_xprt->rx_data.inline_rsize;
+ +	rb = rpcrdma_alloc_regbuf(ia, size, GFP_KERNEL);
+++=======
++ 	size = r_xprt->rx_data.inline_rsize;
++ 	rb = rpcrdma_alloc_regbuf(ia, size, DMA_TO_DEVICE, GFP_KERNEL);
+++>>>>>>> 99ef4db329f1 (xprtrdma: Replace DMA_BIDIRECTIONAL)
+  	if (IS_ERR(rb))
+  		goto out_fail;
+ +	rb->rg_owner = req;
+  	req->rl_sendbuf = rb;
+ -	xdr_buf_init(&rqst->rq_snd_buf, rb->rg_base, size);
+ -	rpcrdma_set_xprtdata(rqst, req);
+ +	/* so that rpcr_to_rdmar works when receiving a request */
+ +	rqst->rq_buffer = (void *)req->rl_sendbuf->rg_base;
+ +	xdr_buf_init(&rqst->rq_snd_buf, rqst->rq_buffer, size);
+  	return 0;
+  
+  out_fail:
+diff --cc net/sunrpc/xprtrdma/transport.c
+index 9ac979fd4b23,34246916434b..000000000000
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@@ -477,23 -477,109 +477,116 @@@ xprt_rdma_connect(struct rpc_xprt *xprt
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +/*
+++=======
++ /* Allocate a fixed-size buffer in which to construct and send the
++  * RPC-over-RDMA header for this request.
++  */
++ static bool
++ rpcrdma_get_rdmabuf(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req,
++ 		    gfp_t flags)
++ {
++ 	size_t size = RPCRDMA_HDRBUF_SIZE;
++ 	struct rpcrdma_regbuf *rb;
++ 
++ 	if (req->rl_rdmabuf)
++ 		return true;
++ 
++ 	rb = rpcrdma_alloc_regbuf(&r_xprt->rx_ia, size, DMA_TO_DEVICE, flags);
++ 	if (IS_ERR(rb))
++ 		return false;
++ 
++ 	r_xprt->rx_stats.hardway_register_count += size;
++ 	req->rl_rdmabuf = rb;
++ 	return true;
++ }
++ 
++ /* RPC/RDMA marshaling may choose to send payload bearing ops inline,
++  * if the resulting Call message is smaller than the inline threshold.
++  * The value of the "rq_callsize" argument accounts for RPC header
++  * requirements, but not for the data payload in these cases.
++  *
++  * See rpcrdma_inline_pullup.
++  */
++ static bool
++ rpcrdma_get_sendbuf(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req,
++ 		    size_t size, gfp_t flags)
++ {
++ 	struct rpcrdma_regbuf *rb;
++ 	size_t min_size;
++ 
++ 	if (req->rl_sendbuf && rdmab_length(req->rl_sendbuf) >= size)
++ 		return true;
++ 
++ 	min_size = max_t(size_t, size, r_xprt->rx_data.inline_wsize);
++ 	rb = rpcrdma_alloc_regbuf(&r_xprt->rx_ia, min_size,
++ 				  DMA_TO_DEVICE, flags);
++ 	if (IS_ERR(rb))
++ 		return false;
++ 
++ 	rpcrdma_free_regbuf(&r_xprt->rx_ia, req->rl_sendbuf);
++ 	r_xprt->rx_stats.hardway_register_count += min_size;
++ 	req->rl_sendbuf = rb;
++ 	return true;
++ }
++ 
++ /* The rq_rcv_buf is used only if a Reply chunk is necessary.
++  * The decision to use a Reply chunk is made later in
++  * rpcrdma_marshal_req. This buffer is registered at that time.
++  *
++  * Otherwise, the associated RPC Reply arrives in a separate
++  * Receive buffer, arbitrarily chosen by the HCA. The buffer
++  * allocated here for the RPC Reply is not utilized in that
++  * case. See rpcrdma_inline_fixup.
++  *
++  * A regbuf is used here to remember the buffer size.
++  */
++ static bool
++ rpcrdma_get_recvbuf(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req,
++ 		    size_t size, gfp_t flags)
++ {
++ 	struct rpcrdma_regbuf *rb;
++ 
++ 	if (req->rl_recvbuf && rdmab_length(req->rl_recvbuf) >= size)
++ 		return true;
++ 
++ 	rb = rpcrdma_alloc_regbuf(&r_xprt->rx_ia, size, DMA_NONE, flags);
++ 	if (IS_ERR(rb))
++ 		return false;
++ 
++ 	rpcrdma_free_regbuf(&r_xprt->rx_ia, req->rl_recvbuf);
++ 	r_xprt->rx_stats.hardway_register_count += size;
++ 	req->rl_recvbuf = rb;
++ 	return true;
++ }
++ 
++ /**
++  * xprt_rdma_allocate - allocate transport resources for an RPC
++  * @task: RPC task
++  *
++  * Return values:
++  *        0:	Success; rq_buffer points to RPC buffer to use
++  *   ENOMEM:	Out of memory, call again later
++  *      EIO:	A permanent error occurred, do not retry
++  *
+++>>>>>>> 99ef4db329f1 (xprtrdma: Replace DMA_BIDIRECTIONAL)
+   * The RDMA allocate/free functions need the task structure as a place
+ - * to hide the struct rpcrdma_req, which is necessary for the actual
+ - * send/recv sequence.
+ + * to hide the struct rpcrdma_req, which is necessary for the actual send/recv
+ + * sequence.
+   *
+ - * xprt_rdma_allocate provides buffers that are already mapped for
+ - * DMA, and a local DMA lkey is provided for each.
+ + * The RPC layer allocates both send and receive buffers in the same call
+ + * (rq_send_buf and rq_rcv_buf are both part of a single contiguous buffer).
+ + * We may register rq_rcv_buf when using reply chunks.
+   */
+ -static int
+ -xprt_rdma_allocate(struct rpc_task *task)
+ +static void *
+ +xprt_rdma_allocate(struct rpc_task *task, size_t size)
+  {
+ -	struct rpc_rqst *rqst = task->tk_rqstp;
+ -	struct rpcrdma_xprt *r_xprt = rpcx_to_rdmax(rqst->rq_xprt);
+ +	struct rpc_xprt *xprt = task->tk_rqstp->rq_xprt;
+ +	struct rpcrdma_xprt *r_xprt = rpcx_to_rdmax(xprt);
+ +	struct rpcrdma_regbuf *rb;
+  	struct rpcrdma_req *req;
+ +	size_t min_size;
+  	gfp_t flags;
+  
+  	req = rpcrdma_buffer_get(&r_xprt->rx_buf);
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index 4dff498a63f2,9edea34aeb36..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -1102,17 -1198,20 +1099,25 @@@ rpcrdma_alloc_regbuf(struct rpcrdma_ia 
+  	if (rb == NULL)
+  		goto out;
+  
++ 	rb->rg_direction = direction;
+  	iov = &rb->rg_iov;
+- 	iov->addr = ib_dma_map_single(ia->ri_device,
+- 				      (void *)rb->rg_base, size,
+- 				      DMA_BIDIRECTIONAL);
+- 	if (ib_dma_mapping_error(ia->ri_device, iov->addr))
+- 		goto out_free;
+- 
+  	iov->length = size;
+  	iov->lkey = ia->ri_pd->local_dma_lkey;
+++<<<<<<< HEAD
+ +	rb->rg_size = size;
+ +	rb->rg_owner = NULL;
+++=======
++ 
++ 	if (direction != DMA_NONE) {
++ 		iov->addr = ib_dma_map_single(ia->ri_device,
++ 					      (void *)rb->rg_base,
++ 					      rdmab_length(rb),
++ 					      rb->rg_direction);
++ 		if (ib_dma_mapping_error(ia->ri_device, iov->addr))
++ 			goto out_free;
++ 	}
++ 
+++>>>>>>> 99ef4db329f1 (xprtrdma: Replace DMA_BIDIRECTIONAL)
+  	return rb;
+  
+  out_free:
+@@@ -1206,17 -1307,14 +1211,12 @@@ rpcrdma_ep_post_recv(struct rpcrdma_ia 
+  	recv_wr.sg_list = &rep->rr_rdmabuf->rg_iov;
+  	recv_wr.num_sge = 1;
+  
+- 	ib_dma_sync_single_for_cpu(ia->ri_device,
+- 				   rdmab_addr(rep->rr_rdmabuf),
+- 				   rdmab_length(rep->rr_rdmabuf),
+- 				   DMA_BIDIRECTIONAL);
+- 
+  	rc = ib_post_recv(ia->ri_id->qp, &recv_wr, &recv_wr_fail);
+ -	if (rc)
+ -		goto out_postrecv;
+ -	return 0;
+  
+ -out_postrecv:
+ -	pr_err("rpcrdma: ib_post_recv returned %i\n", rc);
+ -	return -ENOTCONN;
+ +	if (rc)
+ +		dprintk("RPC:       %s: ib_post_recv returned %i\n", __func__,
+ +			rc);
+ +	return rc;
+  }
+  
+  /**
+* Unmerged path net/sunrpc/xprtrdma/backchannel.c
+* Unmerged path net/sunrpc/xprtrdma/transport.c
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index be2bcc2ea72b..32ddd68ba1de 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -116,6 +116,7 @@ struct rpcrdma_regbuf {
+ 	size_t			rg_size;
+ 	struct rpcrdma_req	*rg_owner;
+ 	struct ib_sge		rg_iov;
++	enum dma_data_direction	rg_direction;
+ 	__be32			rg_base[0] __attribute__ ((aligned(256)));
+ };
+ 
+@@ -468,7 +469,8 @@ void rpcrdma_recv_buffer_get(struct rpcrdma_req *);
+ void rpcrdma_recv_buffer_put(struct rpcrdma_rep *);
+ 
+ struct rpcrdma_regbuf *rpcrdma_alloc_regbuf(struct rpcrdma_ia *,
+-					    size_t, gfp_t);
++					    size_t, enum dma_data_direction,
++					    gfp_t);
+ void rpcrdma_free_regbuf(struct rpcrdma_ia *,
+ 			 struct rpcrdma_regbuf *);
+ 
