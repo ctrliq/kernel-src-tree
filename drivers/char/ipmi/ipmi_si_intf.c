@@ -60,7 +60,7 @@
 #include <linux/ipmi.h>
 #include <linux/ipmi_smi.h>
 #include <asm/io.h>
-#include "ipmi_si_sm.h"
+#include "ipmi_si.h"
 #include "ipmi_dmi.h"
 #include <linux/dmi.h>
 #include <linux/string.h>
@@ -327,7 +327,6 @@ static int num_max_busy_us;
 
 static int unload_when_empty = 1;
 
-static int add_smi(struct smi_info *smi);
 static int try_smi_init(struct smi_info *smi);
 static void cleanup_one_si(struct smi_info *to_clean);
 static void cleanup_ipmi_si(void);
@@ -1304,9 +1303,6 @@ static LIST_HEAD(smi_infos);
 static DEFINE_MUTEX(smi_infos_lock);
 static int smi_num; /* Used to sequence the SMIs */
 
-#define DEFAULT_REGSPACING	1
-#define DEFAULT_REGSIZE		1
-
 #ifdef CONFIG_ACPI
 static bool          si_tryacpi = true;
 #endif
@@ -1335,8 +1331,6 @@ static unsigned int num_regshifts;
 static int slave_addrs[SI_MAX_PARMS]; /* Leaving 0 chooses the default value */
 static unsigned int num_slave_addrs;
 
-#define IPMI_IO_ADDR_SPACE  0
-#define IPMI_MEM_ADDR_SPACE 1
 static const char * const addr_space_to_str[] = { "i/o", "mem" };
 
 static int hotmod_handler(const char *val, struct kernel_param *kp);
@@ -1944,7 +1938,7 @@ static int hotmod_handler(const char *val, struct kernel_param *kp)
 				info->irq_setup = std_irq_setup;
 			info->slave_addr = ipmb;
 
-			rv = add_smi(info);
+			rv = ipmi_si_add_smi(info);
 			if (rv) {
 				kfree(info);
 				goto out;
@@ -2038,7 +2032,7 @@ static int hardcode_find_bmc(void)
 			info->irq_setup = std_irq_setup;
 		info->slave_addr = slave_addrs[i];
 
-		if (!add_smi(info)) {
+		if (!ipmi_si_add_smi(info)) {
 			mutex_lock(&smi_infos_lock);
 			if (try_smi_init(info))
 				cleanup_one_si(info);
@@ -2238,7 +2232,7 @@ static int try_init_spmi(struct SPMITable *spmi)
 		info->io.addr_data, info->io.regsize, info->io.regspacing,
 		info->irq);
 
-	rv = add_smi(info);
+	rv = ipmi_si_add_smi(info);
 	if (rv)
 		kfree(info);
 
@@ -2373,7 +2367,7 @@ static int dmi_ipmi_probe(struct platform_device *pdev)
 		info->io.addr_data, info->io.regsize, info->io.regspacing,
 		info->irq);
 
-	if (add_smi(info))
+	if (ipmi_si_add_smi(info))
 		kfree(info);
 
 	return 0;
@@ -2508,7 +2502,7 @@ static int ipmi_pci_probe(struct pci_dev *pdev,
 		&pdev->resource[0], info->io.regsize, info->io.regspacing,
 		info->irq);
 
-	rv = add_smi(info);
+	rv = ipmi_si_add_smi(info);
 	if (rv) {
 		kfree(info);
 		pci_disable_device(pdev);
@@ -2627,7 +2621,7 @@ static int of_ipmi_probe(struct platform_device *dev)
 
 	dev_set_drvdata(&dev->dev, info);
 
-	ret = add_smi(info);
+	ret = ipmi_si_add_smi(info);
 	if (ret) {
 		kfree(info);
 		return ret;
@@ -2752,7 +2746,7 @@ static int acpi_ipmi_probe(struct platform_device *dev)
 		 res, info->io.regsize, info->io.regspacing,
 		 info->irq);
 
-	rv = add_smi(info);
+	rv = ipmi_si_add_smi(info);
 	if (rv)
 		kfree(info);
 
@@ -2834,7 +2828,7 @@ static int ipmi_parisc_probe(struct parisc_device *dev)
 
 	dev_set_drvdata(&dev->dev, info);
 
-	rv = add_smi(info);
+	rv = ipmi_si_add_smi(info);
 	if (rv) {
 		kfree(info);
 		return rv;
@@ -3438,7 +3432,7 @@ static struct smi_info *find_dup_si(struct smi_info *info)
 	return NULL;
 }
 
-static int add_smi(struct smi_info *new_smi)
+int ipmi_si_add_smi(struct smi_info *new_smi)
 {
 	int rv = 0;
 	struct smi_info *dup;
