@@ -1,0 +1,129 @@
+ACPICA: Save current masks of enabled GPEs after enable register writes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit c50f13c672df758b59e026c15b9118f3ed46edc4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c50f13c6.failed
+
+There is a race condition between acpi_hw_disable_all_gpes() or
+acpi_enable_all_wakeup_gpes() and acpi_ev_asynch_enable_gpe() such
+that if the latter wins the race, it may mistakenly enable a GPE
+disabled by the former.  This may lead to premature system wakeups
+during system suspend and potentially to more serious consequences.
+
+The source of the problem is how acpi_hw_low_set_gpe() works when
+passed ACPI_GPE_CONDITIONAL_ENABLE as the second argument.  In that
+case, the GPE will be enabled if the corresponding bit is set in the
+enable_for_run mask of the GPE enable register containing that bit.
+However, acpi_hw_disable_all_gpes() and acpi_enable_all_wakeup_gpes()
+don't modify the enable_for_run masks of GPE registers when writing
+to them.  In consequence, if acpi_ev_asynch_enable_gpe(), which
+eventually calls acpi_hw_low_set_gpe() with the second argument
+equal to ACPI_GPE_CONDITIONAL_ENABLE, is executed in parallel with
+one of these functions, it may reverse changes made by them.
+
+To fix the problem, introduce a new enable_mask field in struct
+acpi_gpe_register_info in which to store the current mask of
+enabled GPEs and modify acpi_hw_low_set_gpe() to take this
+mask into account instead of enable_for_run when its second
+argument is equal to ACPI_GPE_CONDITIONAL_ENABLE.  Also modify
+the low-level routines called by acpi_hw_disable_all_gpes(),
+acpi_enable_all_wakeup_gpes() and acpi_enable_all_runtime_gpes()
+to update the enable_mask masks of GPE registers after all
+(successful) writes to those registers.
+
+	Acked-by: Lv Zheng <lv.zheng@intel.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit c50f13c672df758b59e026c15b9118f3ed46edc4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/acpica/aclocal.h
+#	drivers/acpi/acpica/evgpe.c
+#	drivers/acpi/acpica/hwgpe.c
+diff --cc drivers/acpi/acpica/aclocal.h
+index 6db027d01154,680d23bbae7c..000000000000
+--- a/drivers/acpi/acpica/aclocal.h
++++ b/drivers/acpi/acpica/aclocal.h
+@@@ -442,9 -451,10 +442,13 @@@ struct acpi_gpe_event_info 
+  struct acpi_gpe_register_info {
+  	struct acpi_generic_address status_address;	/* Address of status reg */
+  	struct acpi_generic_address enable_address;	/* Address of enable reg */
+ -	u16 base_gpe_number;	/* Base GPE number for this register */
+  	u8 enable_for_wake;	/* GPEs to keep enabled when sleeping */
+  	u8 enable_for_run;	/* GPEs to keep enabled when running */
+++<<<<<<< HEAD
+ +	u8 base_gpe_number;	/* Base GPE number for this register */
+++=======
++ 	u8 enable_mask;		/* Current mask of enabled GPEs */
+++>>>>>>> c50f13c672df (ACPICA: Save current masks of enabled GPEs after enable register writes)
+  };
+  
+  /*
+diff --cc drivers/acpi/acpica/evgpe.c
+index ca3b0369c1c0,81db932b15ee..000000000000
+--- a/drivers/acpi/acpica/evgpe.c
++++ b/drivers/acpi/acpica/evgpe.c
+@@@ -212,7 -213,7 +212,11 @@@ acpi_ev_remove_gpe_reference(struct acp
+  		if (ACPI_SUCCESS(status)) {
+  			status =
+  			    acpi_hw_low_set_gpe(gpe_event_info,
+++<<<<<<< HEAD
+ +						     ACPI_GPE_DISABLE);
+++=======
++ 						ACPI_GPE_DISABLE_SAVE);
+++>>>>>>> c50f13c672df (ACPICA: Save current masks of enabled GPEs after enable register writes)
+  		}
+  
+  		if (ACPI_FAILURE(status)) {
+diff --cc drivers/acpi/acpica/hwgpe.c
+index 96540506058f,494027f5c067..000000000000
+--- a/drivers/acpi/acpica/hwgpe.c
++++ b/drivers/acpi/acpica/hwgpe.c
+@@@ -396,15 -435,16 +428,19 @@@ acpi_hw_enable_wakeup_gpe_block(struct 
+  	/* Examine each GPE Register within the block */
+  
+  	for (i = 0; i < gpe_block->register_count; i++) {
+++<<<<<<< HEAD
+ +		if (!gpe_block->register_info[i].enable_for_wake) {
+ +			continue;
+ +		}
+++=======
++ 		gpe_register_info = &gpe_block->register_info[i];
+++>>>>>>> c50f13c672df (ACPICA: Save current masks of enabled GPEs after enable register writes)
+  
+ -		/*
+ -		 * Enable all "wake" GPEs in this register and disable the
+ -		 * remaining ones.
+ -		 */
+ +		/* Enable all "wake" GPEs in this register */
+  
+  		status =
+- 		    acpi_hw_write(gpe_block->register_info[i].enable_for_wake,
+- 				  &gpe_block->register_info[i].enable_address);
++ 		    acpi_hw_gpe_enable_write(gpe_register_info->enable_for_wake,
++ 					     gpe_register_info);
+  		if (ACPI_FAILURE(status)) {
+  			return (status);
+  		}
+* Unmerged path drivers/acpi/acpica/aclocal.h
+* Unmerged path drivers/acpi/acpica/evgpe.c
+* Unmerged path drivers/acpi/acpica/hwgpe.c
+diff --git a/include/acpi/actypes.h b/include/acpi/actypes.h
+index 50e47dab668a..2a807aaff2c5 100644
+--- a/include/acpi/actypes.h
++++ b/include/acpi/actypes.h
+@@ -720,6 +720,10 @@ typedef u32 acpi_event_status;
+ #define ACPI_GPE_ENABLE                 0
+ #define ACPI_GPE_DISABLE                1
+ #define ACPI_GPE_CONDITIONAL_ENABLE     2
++#define ACPI_GPE_SAVE_MASK              4
++
++#define ACPI_GPE_ENABLE_SAVE            (ACPI_GPE_ENABLE | ACPI_GPE_SAVE_MASK)
++#define ACPI_GPE_DISABLE_SAVE           (ACPI_GPE_DISABLE | ACPI_GPE_SAVE_MASK)
+ 
+ /*
+  * GPE info flags - Per GPE
