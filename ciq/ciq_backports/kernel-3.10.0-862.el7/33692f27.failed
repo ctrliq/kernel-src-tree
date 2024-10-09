@@ -1,0 +1,697 @@
+vm: add VM_FAULT_SIGSEGV handling support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Linus Torvalds <torvalds@linux-foundation.org>
+commit 33692f27597fcab536d7cbbcc8f52905133e4aa7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/33692f27.failed
+
+The core VM already knows about VM_FAULT_SIGBUS, but cannot return a
+"you should SIGSEGV" error, because the SIGSEGV case was generally
+handled by the caller - usually the architecture fault handler.
+
+That results in lots of duplication - all the architecture fault
+handlers end up doing very similar "look up vma, check permissions, do
+retries etc" - but it generally works.  However, there are cases where
+the VM actually wants to SIGSEGV, and applications _expect_ SIGSEGV.
+
+In particular, when accessing the stack guard page, libsigsegv expects a
+SIGSEGV.  And it usually got one, because the stack growth is handled by
+that duplicated architecture fault handler.
+
+However, when the generic VM layer started propagating the error return
+from the stack expansion in commit fee7e49d4514 ("mm: propagate error
+from stack expansion even for guard page"), that now exposed the
+existing VM_FAULT_SIGBUS result to user space.  And user space really
+expected SIGSEGV, not SIGBUS.
+
+To fix that case, we need to add a VM_FAULT_SIGSEGV, and teach all those
+duplicate architecture fault handlers about it.  They all already have
+the code to handle SIGSEGV, so it's about just tying that new return
+value to the existing code, but it's all a bit annoying.
+
+This is the mindless minimal patch to do this.  A more extensive patch
+would be to try to gather up the mostly shared fault handling logic into
+one generic helper routine, and long-term we really should do that
+cleanup.
+
+Just from this patch, you can generally see that most architectures just
+copied (directly or indirectly) the old x86 way of doing things, but in
+the meantime that original x86 model has been improved to hold the VM
+semaphore for shorter times etc and to handle VM_FAULT_RETRY and other
+"newer" things, so it would be a good idea to bring all those
+improvements to the generic case and teach other architectures about
+them too.
+
+Reported-and-tested-by: Takashi Iwai <tiwai@suse.de>
+	Tested-by: Jan Engelhardt <jengelh@inai.de>
+	Acked-by: Heiko Carstens <heiko.carstens@de.ibm.com> # "s390 still compiles and boots"
+	Cc: linux-arch@vger.kernel.org
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 33692f27597fcab536d7cbbcc8f52905133e4aa7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/nios2/mm/fault.c
+#	drivers/staging/lustre/lustre/llite/vvp_io.c
+#	mm/gup.c
+diff --cc mm/gup.c
+index 3166366affd5,8dd50ce6326f..000000000000
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@@ -254,21 -123,247 +254,180 @@@ out
+  no_page:
+  	pte_unmap_unlock(ptep, ptl);
+  	if (!pte_none(pte))
+ -		return NULL;
+ -	return no_page_table(vma, flags);
+ -}
+ -
+ -/**
+ - * follow_page_mask - look up a page descriptor from a user-virtual address
+ - * @vma: vm_area_struct mapping @address
+ - * @address: virtual address to look up
+ - * @flags: flags modifying lookup behaviour
+ - * @page_mask: on output, *page_mask is set according to the size of the page
+ - *
+ - * @flags can have FOLL_ flags set, defined in <linux/mm.h>
+ - *
+ - * Returns the mapped (struct page *), %NULL if no mapping exists, or
+ - * an error pointer if there is a mapping to something not represented
+ - * by a page descriptor (see also vm_normal_page()).
+ - */
+ -struct page *follow_page_mask(struct vm_area_struct *vma,
+ -			      unsigned long address, unsigned int flags,
+ -			      unsigned int *page_mask)
+ -{
+ -	pgd_t *pgd;
+ -	pud_t *pud;
+ -	pmd_t *pmd;
+ -	spinlock_t *ptl;
+ -	struct page *page;
+ -	struct mm_struct *mm = vma->vm_mm;
+ -
+ -	*page_mask = 0;
+ -
+ -	page = follow_huge_addr(mm, address, flags & FOLL_WRITE);
+ -	if (!IS_ERR(page)) {
+ -		BUG_ON(flags & FOLL_GET);
+  		return page;
+++<<<<<<< HEAD
+++=======
++ 	}
++ 
++ 	pgd = pgd_offset(mm, address);
++ 	if (pgd_none(*pgd) || unlikely(pgd_bad(*pgd)))
++ 		return no_page_table(vma, flags);
++ 
++ 	pud = pud_offset(pgd, address);
++ 	if (pud_none(*pud))
++ 		return no_page_table(vma, flags);
++ 	if (pud_huge(*pud) && vma->vm_flags & VM_HUGETLB) {
++ 		if (flags & FOLL_GET)
++ 			return NULL;
++ 		page = follow_huge_pud(mm, address, pud, flags & FOLL_WRITE);
++ 		return page;
++ 	}
++ 	if (unlikely(pud_bad(*pud)))
++ 		return no_page_table(vma, flags);
++ 
++ 	pmd = pmd_offset(pud, address);
++ 	if (pmd_none(*pmd))
++ 		return no_page_table(vma, flags);
++ 	if (pmd_huge(*pmd) && vma->vm_flags & VM_HUGETLB) {
++ 		page = follow_huge_pmd(mm, address, pmd, flags & FOLL_WRITE);
++ 		if (flags & FOLL_GET) {
++ 			/*
++ 			 * Refcount on tail pages are not well-defined and
++ 			 * shouldn't be taken. The caller should handle a NULL
++ 			 * return when trying to follow tail pages.
++ 			 */
++ 			if (PageHead(page))
++ 				get_page(page);
++ 			else
++ 				page = NULL;
++ 		}
++ 		return page;
++ 	}
++ 	if ((flags & FOLL_NUMA) && pmd_numa(*pmd))
++ 		return no_page_table(vma, flags);
++ 	if (pmd_trans_huge(*pmd)) {
++ 		if (flags & FOLL_SPLIT) {
++ 			split_huge_page_pmd(vma, address, pmd);
++ 			return follow_page_pte(vma, address, pmd, flags);
++ 		}
++ 		ptl = pmd_lock(mm, pmd);
++ 		if (likely(pmd_trans_huge(*pmd))) {
++ 			if (unlikely(pmd_trans_splitting(*pmd))) {
++ 				spin_unlock(ptl);
++ 				wait_split_huge_page(vma->anon_vma, pmd);
++ 			} else {
++ 				page = follow_trans_huge_pmd(vma, address,
++ 							     pmd, flags);
++ 				spin_unlock(ptl);
++ 				*page_mask = HPAGE_PMD_NR - 1;
++ 				return page;
++ 			}
++ 		} else
++ 			spin_unlock(ptl);
++ 	}
++ 	return follow_page_pte(vma, address, pmd, flags);
++ }
++ 
++ static int get_gate_page(struct mm_struct *mm, unsigned long address,
++ 		unsigned int gup_flags, struct vm_area_struct **vma,
++ 		struct page **page)
++ {
++ 	pgd_t *pgd;
++ 	pud_t *pud;
++ 	pmd_t *pmd;
++ 	pte_t *pte;
++ 	int ret = -EFAULT;
++ 
++ 	/* user gate pages are read-only */
++ 	if (gup_flags & FOLL_WRITE)
++ 		return -EFAULT;
++ 	if (address > TASK_SIZE)
++ 		pgd = pgd_offset_k(address);
++ 	else
++ 		pgd = pgd_offset_gate(mm, address);
++ 	BUG_ON(pgd_none(*pgd));
++ 	pud = pud_offset(pgd, address);
++ 	BUG_ON(pud_none(*pud));
++ 	pmd = pmd_offset(pud, address);
++ 	if (pmd_none(*pmd))
++ 		return -EFAULT;
++ 	VM_BUG_ON(pmd_trans_huge(*pmd));
++ 	pte = pte_offset_map(pmd, address);
++ 	if (pte_none(*pte))
++ 		goto unmap;
++ 	*vma = get_gate_vma(mm);
++ 	if (!page)
++ 		goto out;
++ 	*page = vm_normal_page(*vma, address, *pte);
++ 	if (!*page) {
++ 		if ((gup_flags & FOLL_DUMP) || !is_zero_pfn(pte_pfn(*pte)))
++ 			goto unmap;
++ 		*page = pte_page(*pte);
++ 	}
++ 	get_page(*page);
++ out:
++ 	ret = 0;
++ unmap:
++ 	pte_unmap(pte);
++ 	return ret;
++ }
++ 
++ /*
++  * mmap_sem must be held on entry.  If @nonblocking != NULL and
++  * *@flags does not include FOLL_NOWAIT, the mmap_sem may be released.
++  * If it is, *@nonblocking will be set to 0 and -EBUSY returned.
++  */
++ static int faultin_page(struct task_struct *tsk, struct vm_area_struct *vma,
++ 		unsigned long address, unsigned int *flags, int *nonblocking)
++ {
++ 	struct mm_struct *mm = vma->vm_mm;
++ 	unsigned int fault_flags = 0;
++ 	int ret;
++ 
++ 	/* For mlock, just skip the stack guard page. */
++ 	if ((*flags & FOLL_MLOCK) &&
++ 			(stack_guard_page_start(vma, address) ||
++ 			 stack_guard_page_end(vma, address + PAGE_SIZE)))
++ 		return -ENOENT;
++ 	if (*flags & FOLL_WRITE)
++ 		fault_flags |= FAULT_FLAG_WRITE;
++ 	if (nonblocking)
++ 		fault_flags |= FAULT_FLAG_ALLOW_RETRY;
++ 	if (*flags & FOLL_NOWAIT)
++ 		fault_flags |= FAULT_FLAG_ALLOW_RETRY | FAULT_FLAG_RETRY_NOWAIT;
++ 	if (*flags & FOLL_TRIED) {
++ 		VM_WARN_ON_ONCE(fault_flags & FAULT_FLAG_ALLOW_RETRY);
++ 		fault_flags |= FAULT_FLAG_TRIED;
++ 	}
++ 
++ 	ret = handle_mm_fault(mm, vma, address, fault_flags);
++ 	if (ret & VM_FAULT_ERROR) {
++ 		if (ret & VM_FAULT_OOM)
++ 			return -ENOMEM;
++ 		if (ret & (VM_FAULT_HWPOISON | VM_FAULT_HWPOISON_LARGE))
++ 			return *flags & FOLL_HWPOISON ? -EHWPOISON : -EFAULT;
++ 		if (ret & (VM_FAULT_SIGBUS | VM_FAULT_SIGSEGV))
++ 			return -EFAULT;
++ 		BUG();
++ 	}
++ 
++ 	if (tsk) {
++ 		if (ret & VM_FAULT_MAJOR)
++ 			tsk->maj_flt++;
++ 		else
++ 			tsk->min_flt++;
++ 	}
++ 
++ 	if (ret & VM_FAULT_RETRY) {
++ 		if (nonblocking)
++ 			*nonblocking = 0;
++ 		return -EBUSY;
++ 	}
+++>>>>>>> 33692f27597f (vm: add VM_FAULT_SIGSEGV handling support)
+  
+ +no_page_table:
+  	/*
+ -	 * The VM_FAULT_WRITE bit tells us that do_wp_page has broken COW when
+ -	 * necessary, even if maybe_mkwrite decided not to set pte_write. We
+ -	 * can thus safely do subsequent page lookups as if they were reads.
+ -	 * But only do so when looping for pte_write is futile: in some cases
+ -	 * userspace may also be wanting to write to the gotten user page,
+ -	 * which a read fault here might prevent (a readonly page might get
+ -	 * reCOWed by userspace write).
+ +	 * When core dumping an enormous anonymous area that nobody
+ +	 * has touched so far, we don't want to allocate unnecessary pages or
+ +	 * page tables.  Return error instead of NULL to skip handle_mm_fault,
+ +	 * then get_dump_page() will return NULL to leave a hole in the dump.
+ +	 * But we can only make this optimization where a hole would surely
+ +	 * be zero-filled if handle_mm_fault() actually did handle it.
+  	 */
+ -	if ((ret & VM_FAULT_WRITE) && !(vma->vm_flags & VM_WRITE))
+ -		*flags &= ~FOLL_WRITE;
+ -	return 0;
+ -}
+ -
+ -static int check_vma_flags(struct vm_area_struct *vma, unsigned long gup_flags)
+ -{
+ -	vm_flags_t vm_flags = vma->vm_flags;
+ -
+ -	if (vm_flags & (VM_IO | VM_PFNMAP))
+ -		return -EFAULT;
+ -
+ -	if (gup_flags & FOLL_WRITE) {
+ -		if (!(vm_flags & VM_WRITE)) {
+ -			if (!(gup_flags & FOLL_FORCE))
+ -				return -EFAULT;
+ -			/*
+ -			 * We used to let the write,force case do COW in a
+ -			 * VM_MAYWRITE VM_SHARED !VM_WRITE vma, so ptrace could
+ -			 * set a breakpoint in a read-only mapping of an
+ -			 * executable, without corrupting the file (yet only
+ -			 * when that file had been opened for writing!).
+ -			 * Anon pages in shared mappings are surprising: now
+ -			 * just reject it.
+ -			 */
+ -			if (!is_cow_mapping(vm_flags)) {
+ -				WARN_ON_ONCE(vm_flags & VM_MAYWRITE);
+ -				return -EFAULT;
+ -			}
+ -		}
+ -	} else if (!(vm_flags & VM_READ)) {
+ -		if (!(gup_flags & FOLL_FORCE))
+ -			return -EFAULT;
+ -		/*
+ -		 * Is there actually any vma we can reach here which does not
+ -		 * have VM_MAYREAD set?
+ -		 */
+ -		if (!(vm_flags & VM_MAYREAD))
+ -			return -EFAULT;
+ -	}
+ -	return 0;
+ +	if ((flags & FOLL_DUMP) &&
+ +	    (!vma->vm_ops || !vma->vm_ops->fault))
+ +		return ERR_PTR(-EFAULT);
+ +	return page;
+  }
+  
+  /**
+* Unmerged path arch/nios2/mm/fault.c
+* Unmerged path drivers/staging/lustre/lustre/llite/vvp_io.c
+diff --git a/arch/alpha/mm/fault.c b/arch/alpha/mm/fault.c
+index 0c4132dd3507..c9d6e878908d 100644
+--- a/arch/alpha/mm/fault.c
++++ b/arch/alpha/mm/fault.c
+@@ -155,6 +155,8 @@ retry:
+ 	if (unlikely(fault & VM_FAULT_ERROR)) {
+ 		if (fault & VM_FAULT_OOM)
+ 			goto out_of_memory;
++		else if (fault & VM_FAULT_SIGSEGV)
++			goto bad_area;
+ 		else if (fault & VM_FAULT_SIGBUS)
+ 			goto do_sigbus;
+ 		BUG();
+diff --git a/arch/arc/mm/fault.c b/arch/arc/mm/fault.c
+index 331a0846628e..1aa04e922c30 100644
+--- a/arch/arc/mm/fault.c
++++ b/arch/arc/mm/fault.c
+@@ -159,6 +159,8 @@ survive:
+ 	/* TBD: switch to pagefault_out_of_memory() */
+ 	if (fault & VM_FAULT_OOM)
+ 		goto out_of_memory;
++	else if (fault & VM_FAULT_SIGSEV)
++		goto bad_area;
+ 	else if (fault & VM_FAULT_SIGBUS)
+ 		goto do_sigbus;
+ 
+diff --git a/arch/avr32/mm/fault.c b/arch/avr32/mm/fault.c
+index b2f2d2d66849..901999fdf47b 100644
+--- a/arch/avr32/mm/fault.c
++++ b/arch/avr32/mm/fault.c
+@@ -140,6 +140,8 @@ good_area:
+ 	if (unlikely(fault & VM_FAULT_ERROR)) {
+ 		if (fault & VM_FAULT_OOM)
+ 			goto out_of_memory;
++		else if (fault & VM_FAULT_SIGSEGV)
++			goto bad_area;
+ 		else if (fault & VM_FAULT_SIGBUS)
+ 			goto do_sigbus;
+ 		BUG();
+diff --git a/arch/cris/mm/fault.c b/arch/cris/mm/fault.c
+index 73312ab6c696..4d26a1ed2dc7 100644
+--- a/arch/cris/mm/fault.c
++++ b/arch/cris/mm/fault.c
+@@ -174,6 +174,8 @@ retry:
+ 	if (unlikely(fault & VM_FAULT_ERROR)) {
+ 		if (fault & VM_FAULT_OOM)
+ 			goto out_of_memory;
++		else if (fault & VM_FAULT_SIGSEGV)
++			goto bad_area;
+ 		else if (fault & VM_FAULT_SIGBUS)
+ 			goto do_sigbus;
+ 		BUG();
+diff --git a/arch/frv/mm/fault.c b/arch/frv/mm/fault.c
+index 331c1e2cfb67..854549617dd2 100644
+--- a/arch/frv/mm/fault.c
++++ b/arch/frv/mm/fault.c
+@@ -166,6 +166,8 @@ asmlinkage void do_page_fault(int datammu, unsigned long esr0, unsigned long ear
+ 	if (unlikely(fault & VM_FAULT_ERROR)) {
+ 		if (fault & VM_FAULT_OOM)
+ 			goto out_of_memory;
++		else if (fault & VM_FAULT_SIGSEGV)
++			goto bad_area;
+ 		else if (fault & VM_FAULT_SIGBUS)
+ 			goto do_sigbus;
+ 		BUG();
+diff --git a/arch/ia64/mm/fault.c b/arch/ia64/mm/fault.c
+index 6cf0341f978e..9c25f911ce40 100644
+--- a/arch/ia64/mm/fault.c
++++ b/arch/ia64/mm/fault.c
+@@ -170,6 +170,8 @@ retry:
+ 		 */
+ 		if (fault & VM_FAULT_OOM) {
+ 			goto out_of_memory;
++		} else if (fault & VM_FAULT_SIGSEGV) {
++			goto bad_area;
+ 		} else if (fault & VM_FAULT_SIGBUS) {
+ 			signal = SIGBUS;
+ 			goto bad_area;
+diff --git a/arch/m32r/mm/fault.c b/arch/m32r/mm/fault.c
+index 3cdfa9c1d091..06827fc92bbf 100644
+--- a/arch/m32r/mm/fault.c
++++ b/arch/m32r/mm/fault.c
+@@ -198,6 +198,8 @@ good_area:
+ 	if (unlikely(fault & VM_FAULT_ERROR)) {
+ 		if (fault & VM_FAULT_OOM)
+ 			goto out_of_memory;
++		else if (fault & VM_FAULT_SIGSEGV)
++			goto bad_area;
+ 		else if (fault & VM_FAULT_SIGBUS)
+ 			goto do_sigbus;
+ 		BUG();
+diff --git a/arch/m68k/mm/fault.c b/arch/m68k/mm/fault.c
+index a563727806bf..7305fdd5abb6 100644
+--- a/arch/m68k/mm/fault.c
++++ b/arch/m68k/mm/fault.c
+@@ -151,6 +151,8 @@ good_area:
+ 	if (unlikely(fault & VM_FAULT_ERROR)) {
+ 		if (fault & VM_FAULT_OOM)
+ 			goto out_of_memory;
++		else if (fault & VM_FAULT_SIGSEGV)
++			goto map_err;
+ 		else if (fault & VM_FAULT_SIGBUS)
+ 			goto bus_err;
+ 		BUG();
+diff --git a/arch/metag/mm/fault.c b/arch/metag/mm/fault.c
+index 2c75bf7357c5..fa1901bf8e19 100644
+--- a/arch/metag/mm/fault.c
++++ b/arch/metag/mm/fault.c
+@@ -139,6 +139,8 @@ good_area:
+ 	if (unlikely(fault & VM_FAULT_ERROR)) {
+ 		if (fault & VM_FAULT_OOM)
+ 			goto out_of_memory;
++		else if (fault & VM_FAULT_SIGSEGV)
++			goto bad_area;
+ 		else if (fault & VM_FAULT_SIGBUS)
+ 			goto do_sigbus;
+ 		BUG();
+diff --git a/arch/microblaze/mm/fault.c b/arch/microblaze/mm/fault.c
+index 731f739d17a1..23f67534329a 100644
+--- a/arch/microblaze/mm/fault.c
++++ b/arch/microblaze/mm/fault.c
+@@ -221,6 +221,8 @@ good_area:
+ 	if (unlikely(fault & VM_FAULT_ERROR)) {
+ 		if (fault & VM_FAULT_OOM)
+ 			goto out_of_memory;
++		else if (fault & VM_FAULT_SIGSEGV)
++			goto bad_area;
+ 		else if (fault & VM_FAULT_SIGBUS)
+ 			goto do_sigbus;
+ 		BUG();
+diff --git a/arch/mips/mm/fault.c b/arch/mips/mm/fault.c
+index 0fead53d1c26..09d74d395d50 100644
+--- a/arch/mips/mm/fault.c
++++ b/arch/mips/mm/fault.c
+@@ -155,6 +155,8 @@ good_area:
+ 	if (unlikely(fault & VM_FAULT_ERROR)) {
+ 		if (fault & VM_FAULT_OOM)
+ 			goto out_of_memory;
++		else if (fault & VM_FAULT_SIGSEGV)
++			goto bad_area;
+ 		else if (fault & VM_FAULT_SIGBUS)
+ 			goto do_sigbus;
+ 		BUG();
+diff --git a/arch/mn10300/mm/fault.c b/arch/mn10300/mm/fault.c
+index d48a84fd7fae..106c0fa0f500 100644
+--- a/arch/mn10300/mm/fault.c
++++ b/arch/mn10300/mm/fault.c
+@@ -260,6 +260,8 @@ good_area:
+ 	if (unlikely(fault & VM_FAULT_ERROR)) {
+ 		if (fault & VM_FAULT_OOM)
+ 			goto out_of_memory;
++		else if (fault & VM_FAULT_SIGSEGV)
++			goto bad_area;
+ 		else if (fault & VM_FAULT_SIGBUS)
+ 			goto do_sigbus;
+ 		BUG();
+* Unmerged path arch/nios2/mm/fault.c
+diff --git a/arch/openrisc/mm/fault.c b/arch/openrisc/mm/fault.c
+index e2bfafce66c5..edb0de172651 100644
+--- a/arch/openrisc/mm/fault.c
++++ b/arch/openrisc/mm/fault.c
+@@ -170,6 +170,8 @@ good_area:
+ 	if (unlikely(fault & VM_FAULT_ERROR)) {
+ 		if (fault & VM_FAULT_OOM)
+ 			goto out_of_memory;
++		else if (fault & VM_FAULT_SIGSEGV)
++			goto bad_area;
+ 		else if (fault & VM_FAULT_SIGBUS)
+ 			goto do_sigbus;
+ 		BUG();
+diff --git a/arch/parisc/mm/fault.c b/arch/parisc/mm/fault.c
+index f247a3480e8e..512cc2970c0a 100644
+--- a/arch/parisc/mm/fault.c
++++ b/arch/parisc/mm/fault.c
+@@ -217,6 +217,8 @@ good_area:
+ 		 */
+ 		if (fault & VM_FAULT_OOM)
+ 			goto out_of_memory;
++		else if (fault & VM_FAULT_SIGSEGV)
++			goto bad_area;
+ 		else if (fault & VM_FAULT_SIGBUS)
+ 			goto bad_area;
+ 		BUG();
+diff --git a/arch/powerpc/mm/copro_fault.c b/arch/powerpc/mm/copro_fault.c
+index ceb99aaf11f5..9a58289c5779 100644
+--- a/arch/powerpc/mm/copro_fault.c
++++ b/arch/powerpc/mm/copro_fault.c
+@@ -76,7 +76,7 @@ int copro_handle_mm_fault(struct mm_struct *mm, unsigned long ea,
+ 		if (*flt & VM_FAULT_OOM) {
+ 			ret = -ENOMEM;
+ 			goto out_unlock;
+-		} else if (*flt & VM_FAULT_SIGBUS) {
++		} else if (*flt & (VM_FAULT_SIGBUS | VM_FAULT_SIGSEGV)) {
+ 			ret = -EFAULT;
+ 			goto out_unlock;
+ 		}
+diff --git a/arch/powerpc/mm/fault.c b/arch/powerpc/mm/fault.c
+index a633519cb63a..be64d22e5957 100644
+--- a/arch/powerpc/mm/fault.c
++++ b/arch/powerpc/mm/fault.c
+@@ -445,6 +445,8 @@ good_area:
+ 	 */
+ 	fault = handle_mm_fault(mm, vma, address, flags);
+ 	if (unlikely(fault & (VM_FAULT_RETRY|VM_FAULT_ERROR))) {
++		if (fault & VM_FAULT_SIGSEGV)
++			goto bad_area;
+ 		rc = mm_fault_error(regs, address, fault);
+ 		if (rc >= MM_FAULT_RETURN)
+ 			goto bail;
+diff --git a/arch/s390/mm/fault.c b/arch/s390/mm/fault.c
+index 9aa3443fbf65..795483e56dc5 100644
+--- a/arch/s390/mm/fault.c
++++ b/arch/s390/mm/fault.c
+@@ -242,6 +242,12 @@ static noinline void do_fault_error(struct pt_regs *regs, int fault)
+ 				do_no_context(regs);
+ 			else
+ 				pagefault_out_of_memory();
++		} else if (fault & VM_FAULT_SIGSEGV) {
++			/* Kernel mode? Handle exceptions or die */
++			if (!user_mode(regs))
++				do_no_context(regs);
++			else
++				do_sigsegv(regs, SEGV_MAPERR);
+ 		} else if (fault & VM_FAULT_SIGBUS) {
+ 			/* Kernel mode? Handle exceptions or die */
+ 			if (!user_mode(regs))
+diff --git a/arch/score/mm/fault.c b/arch/score/mm/fault.c
+index 47b600e4b2c5..b3744ca70be6 100644
+--- a/arch/score/mm/fault.c
++++ b/arch/score/mm/fault.c
+@@ -110,6 +110,8 @@ survive:
+ 	if (unlikely(fault & VM_FAULT_ERROR)) {
+ 		if (fault & VM_FAULT_OOM)
+ 			goto out_of_memory;
++		else if (fault & VM_FAULT_SIGSEGV)
++			goto bad_area;
+ 		else if (fault & VM_FAULT_SIGBUS)
+ 			goto do_sigbus;
+ 		BUG();
+diff --git a/arch/sh/mm/fault.c b/arch/sh/mm/fault.c
+index 1f49c28affa9..3174dcd4a133 100644
+--- a/arch/sh/mm/fault.c
++++ b/arch/sh/mm/fault.c
+@@ -353,6 +353,8 @@ mm_fault_error(struct pt_regs *regs, unsigned long error_code,
+ 	} else {
+ 		if (fault & VM_FAULT_SIGBUS)
+ 			do_sigbus(regs, error_code, address);
++		else if (fault & VM_FAULT_SIGSEGV)
++			bad_area(regs, error_code, address);
+ 		else
+ 			BUG();
+ 	}
+diff --git a/arch/sparc/mm/fault_32.c b/arch/sparc/mm/fault_32.c
+index e98bfda205a2..72686fb72c96 100644
+--- a/arch/sparc/mm/fault_32.c
++++ b/arch/sparc/mm/fault_32.c
+@@ -248,6 +248,8 @@ good_area:
+ 	if (unlikely(fault & VM_FAULT_ERROR)) {
+ 		if (fault & VM_FAULT_OOM)
+ 			goto out_of_memory;
++		else if (fault & VM_FAULT_SIGSEGV)
++			goto bad_area;
+ 		else if (fault & VM_FAULT_SIGBUS)
+ 			goto do_sigbus;
+ 		BUG();
+diff --git a/arch/sparc/mm/fault_64.c b/arch/sparc/mm/fault_64.c
+index 5062ff389e83..6f702ece6fdd 100644
+--- a/arch/sparc/mm/fault_64.c
++++ b/arch/sparc/mm/fault_64.c
+@@ -433,6 +433,8 @@ good_area:
+ 	if (unlikely(fault & VM_FAULT_ERROR)) {
+ 		if (fault & VM_FAULT_OOM)
+ 			goto out_of_memory;
++		else if (fault & VM_FAULT_SIGSEGV)
++			goto bad_area;
+ 		else if (fault & VM_FAULT_SIGBUS)
+ 			goto do_sigbus;
+ 		BUG();
+diff --git a/arch/tile/mm/fault.c b/arch/tile/mm/fault.c
+index 3d2b81c163a6..1ede4c757e6c 100644
+--- a/arch/tile/mm/fault.c
++++ b/arch/tile/mm/fault.c
+@@ -444,6 +444,8 @@ good_area:
+ 	if (unlikely(fault & VM_FAULT_ERROR)) {
+ 		if (fault & VM_FAULT_OOM)
+ 			goto out_of_memory;
++		else if (fault & VM_FAULT_SIGSEGV)
++			goto bad_area;
+ 		else if (fault & VM_FAULT_SIGBUS)
+ 			goto do_sigbus;
+ 		BUG();
+diff --git a/arch/um/kernel/trap.c b/arch/um/kernel/trap.c
+index 089f3987e273..6a63b605103b 100644
+--- a/arch/um/kernel/trap.c
++++ b/arch/um/kernel/trap.c
+@@ -76,6 +76,8 @@ good_area:
+ 		if (unlikely(fault & VM_FAULT_ERROR)) {
+ 			if (fault & VM_FAULT_OOM) {
+ 				goto out_of_memory;
++			} else if (fault & VM_FAULT_SIGSEGV) {
++				goto out;
+ 			} else if (fault & VM_FAULT_SIGBUS) {
+ 				err = -EACCES;
+ 				goto out;
+diff --git a/arch/x86/mm/fault.c b/arch/x86/mm/fault.c
+index 1977abf5754c..3315b1d1e3c0 100644
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -878,6 +878,8 @@ mm_fault_error(struct pt_regs *regs, unsigned long error_code,
+ 		if (fault & (VM_FAULT_SIGBUS|VM_FAULT_HWPOISON|
+ 			     VM_FAULT_HWPOISON_LARGE))
+ 			do_sigbus(regs, error_code, address, fault);
++		else if (fault & VM_FAULT_SIGSEGV)
++			bad_area_nosemaphore(regs, error_code, address);
+ 		else
+ 			BUG();
+ 	}
+diff --git a/arch/xtensa/mm/fault.c b/arch/xtensa/mm/fault.c
+index 4b7bc8db170f..1e556ff6e13a 100644
+--- a/arch/xtensa/mm/fault.c
++++ b/arch/xtensa/mm/fault.c
+@@ -115,6 +115,8 @@ good_area:
+ 	if (unlikely(fault & VM_FAULT_ERROR)) {
+ 		if (fault & VM_FAULT_OOM)
+ 			goto out_of_memory;
++		else if (fault & VM_FAULT_SIGSEGV)
++			goto bad_area;
+ 		else if (fault & VM_FAULT_SIGBUS)
+ 			goto do_sigbus;
+ 		BUG();
+* Unmerged path drivers/staging/lustre/lustre/llite/vvp_io.c
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index a0514d1e5d91..5d4535829b57 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -1111,6 +1111,7 @@ static inline void clear_page_pfmemalloc(struct page *page)
+ #define VM_FAULT_WRITE	0x0008	/* Special case for get_user_pages */
+ #define VM_FAULT_HWPOISON 0x0010	/* Hit poisoned small page */
+ #define VM_FAULT_HWPOISON_LARGE 0x0020  /* Hit poisoned large page. Index encoded in upper bits */
++#define VM_FAULT_SIGSEGV 0x0040
+ 
+ #define VM_FAULT_NOPAGE	0x0100	/* ->fault installed the pte, not return page */
+ #define VM_FAULT_LOCKED	0x0200	/* ->fault locked the returned page */
+@@ -1120,8 +1121,9 @@ static inline void clear_page_pfmemalloc(struct page *page)
+ 
+ #define VM_FAULT_HWPOISON_LARGE_MASK 0xf000 /* encodes hpage index for large hwpoison */
+ 
+-#define VM_FAULT_ERROR	(VM_FAULT_OOM | VM_FAULT_SIGBUS | VM_FAULT_HWPOISON | \
+-			 VM_FAULT_FALLBACK | VM_FAULT_HWPOISON_LARGE)
++#define VM_FAULT_ERROR	(VM_FAULT_OOM | VM_FAULT_SIGBUS | VM_FAULT_SIGSEGV | \
++			 VM_FAULT_HWPOISON | VM_FAULT_HWPOISON_LARGE | \
++			 VM_FAULT_FALLBACK)
+ 
+ /* Encode hstate index for a hwpoisoned large page */
+ #define VM_FAULT_SET_HINDEX(x) ((x) << 12)
+* Unmerged path mm/gup.c
+diff --git a/mm/ksm.c b/mm/ksm.c
+index feae14491122..67e160bf61f2 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -446,7 +446,7 @@ static int break_ksm(struct vm_area_struct *vma, unsigned long addr)
+ 		else
+ 			ret = VM_FAULT_WRITE;
+ 		put_page(page);
+-	} while (!(ret & (VM_FAULT_WRITE | VM_FAULT_SIGBUS | VM_FAULT_OOM)));
++	} while (!(ret & (VM_FAULT_WRITE | VM_FAULT_SIGBUS | VM_FAULT_SIGSEGV | VM_FAULT_OOM)));
+ 	/*
+ 	 * We must loop because handle_mm_fault() may back out if there's
+ 	 * any difficulty e.g. if pte accessed bit gets updated concurrently.
