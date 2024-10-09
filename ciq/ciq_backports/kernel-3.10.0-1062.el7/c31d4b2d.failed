@@ -1,0 +1,90 @@
+RDMA/core: Protect against changing dst->dev during destination resolve
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Parav Pandit <parav@mellanox.com>
+commit c31d4b2ddf07ba74388cb8799517a7010e3e0c89
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/c31d4b2d.failed
+
+During resolving address process, during route lookup and while performing
+src address translation in case of loopback mode, hold the rcu lock so
+that if netdevice is moving to different net namespace, or being
+unregistered, it can be synchronized with net/core/dev.c, ie
+
+change_net_namespace()
+->dev_close_many()
+  ->rt6_uncached_list_flush_dev() who would change dst->dev
+
+to loopback device of the given net namespace.
+
+Therefore, hold the rcu lock and sync with synchronize_net() of
+change_net_namespace() to ensure that netdevice cannot get freed while
+dst->dev is being used.
+
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Reviewed-by: Daniel Jurgens <danielj@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit c31d4b2ddf07ba74388cb8799517a7010e3e0c89)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/addr.c
+diff --cc drivers/infiniband/core/addr.c
+index 59eadb13bdfa,316a53f59ee8..000000000000
+--- a/drivers/infiniband/core/addr.c
++++ b/drivers/infiniband/core/addr.c
+@@@ -507,8 -476,45 +510,50 @@@ static void copy_src_l2_addr(struct rdm
+  	if (dst->dev->flags & IFF_LOOPBACK)
+  		ret = rdma_translate_ip(dst_in, dev_addr);
+  	else
+++<<<<<<< HEAD
+ +		rdma_copy_addr(dev_addr, dst->dev, NULL);
+ +	return ret;
+++=======
++ 		rdma_copy_src_l2_addr(dev_addr, dst->dev);
++ 
++ 	/*
++ 	 * If there's a gateway and type of device not ARPHRD_INFINIBAND,
++ 	 * we're definitely in RoCE v2 (as RoCE v1 isn't routable) set the
++ 	 * network type accordingly.
++ 	 */
++ 	if (has_gateway(dst, dst_in->sa_family) &&
++ 	    ndev->type != ARPHRD_INFINIBAND)
++ 		dev_addr->network = dst_in->sa_family == AF_INET ?
++ 						RDMA_NETWORK_IPV4 :
++ 						RDMA_NETWORK_IPV6;
++ 	else
++ 		dev_addr->network = RDMA_NETWORK_IB;
++ }
++ 
++ static int rdma_set_src_addr_rcu(struct rdma_dev_addr *dev_addr,
++ 				 unsigned int *ndev_flags,
++ 				 const struct sockaddr *dst_in,
++ 				 const struct dst_entry *dst)
++ {
++ 	struct net_device *ndev = READ_ONCE(dst->dev);
++ 
++ 	*ndev_flags = ndev->flags;
++ 	/* A physical device must be the RDMA device to use */
++ 	if (ndev->flags & IFF_LOOPBACK) {
++ 		/*
++ 		 * RDMA (IB/RoCE, iWarp) doesn't run on lo interface or
++ 		 * loopback IP address. So if route is resolved to loopback
++ 		 * interface, translate that to a real ndev based on non
++ 		 * loopback IP address.
++ 		 */
++ 		ndev = rdma_find_ndev_for_src_ip_rcu(dev_net(ndev), dst_in);
++ 		if (!ndev)
++ 			return -ENODEV;
++ 	}
++ 
++ 	copy_src_l2_addr(dev_addr, dst_in, dst, ndev);
++ 	return 0;
+++>>>>>>> c31d4b2ddf07 (RDMA/core: Protect against changing dst->dev during destination resolve)
+  }
+  
+  static int addr_resolve(struct sockaddr *src_in,
+* Unmerged path drivers/infiniband/core/addr.c
