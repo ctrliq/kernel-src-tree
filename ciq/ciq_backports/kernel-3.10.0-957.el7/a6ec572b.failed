@@ -1,0 +1,218 @@
+cxgb4: Add support for Inline IPSec Tx
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Atul Gupta <atul.gupta@chelsio.com>
+commit a6ec572bfa7d529be78afbb703f8d9381954cdff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/a6ec572b.failed
+
+Added Tx routine for ULD
+- define interface for ULD Tx.
+
+Export routines used for Tx data
+- Routines common for data transmit are used by cxgb4 and chcr
+  drivers.
+- EXPORT routines enable transmit from chcr driver.
+
+	Signed-off-by: Atul Gupta <atul.gupta@chelsio.com>
+	Signed-off-by: Ganesh Goudar <ganeshgr@chelsio.com>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit a6ec572bfa7d529be78afbb703f8d9381954cdff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/chelsio/cxgb4/sge.c
+diff --cc drivers/net/ethernet/chelsio/cxgb4/sge.c
+index a64f3863f5c9,6c7b0ac0b48b..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/sge.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/sge.c
+@@@ -900,10 -894,11 +891,11 @@@ void cxgb4_write_sgl(const struct sk_bu
+  	if ((uintptr_t)end & 8)           /* 0-pad to multiple of 16 */
+  		*end = 0;
+  }
++ EXPORT_SYMBOL(cxgb4_write_sgl);
+  
+  /* This function copies 64 byte coalesced work request to
+ - * memory mapped BAR2 space. For coalesced WR SGE fetches
+ - * data from the FIFO instead of from Host.
+ + * memory mapped BAR2 space(user space writes).
+ + * For coalesced WR SGE, fetches data from the FIFO instead of from Host.
+   */
+  static void cxgb_pio_copy(u64 __iomem *dst, u64 *src)
+  {
+@@@ -1177,7 -1215,17 +1177,21 @@@ out_free:	dev_kfree_skb_any(skb)
+  	}
+  	skb_tx_timestamp(skb);
+  
+++<<<<<<< HEAD
+ +	reclaim_completed_tx(adap, &q->q, true);
+++=======
++ 	cxgb4_reclaim_completed_tx(adap, &q->q, true);
++ 	cntrl = TXPKT_L4CSUM_DIS_F | TXPKT_IPCSUM_DIS_F;
++ 
++ #ifdef CONFIG_CHELSIO_T4_FCOE
++ 	err = cxgb_fcoe_offload(skb, adap, pi, &cntrl);
++ 	if (unlikely(err == -ENOTSUPP)) {
++ 		if (ptp_enabled)
++ 			spin_unlock(&adap->ptp_lock);
++ 		goto out_free;
++ 	}
++ #endif /* CONFIG_CHELSIO_T4_FCOE */
+++>>>>>>> a6ec572bfa7d (cxgb4: Add support for Inline IPSec Tx)
+  
+  	flits = calc_tx_flits(skb);
+  	ndesc = flits_to_desc(flits);
+@@@ -1289,8 -1340,8 +1302,13 @@@
+  	cpl->ctrl1 = cpu_to_be64(cntrl);
+  
+  	if (immediate) {
+++<<<<<<< HEAD
+ +		inline_tx_skb(skb, &q->q, cpl + 1);
+ +		consume_skb(skb);
+++=======
++ 		cxgb4_inline_tx_skb(skb, &q->q, cpl + 1);
++ 		dev_consume_skb_any(skb);
+++>>>>>>> a6ec572bfa7d (cxgb4: Add support for Inline IPSec Tx)
+  	} else {
+  		int last_desc;
+  
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+index 599d7313fbc4..cb28b189f61b 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+@@ -58,6 +58,13 @@
+ extern struct list_head adapter_list;
+ extern struct mutex uld_mutex;
+ 
++/* Suspend an Ethernet Tx queue with fewer available descriptors than this.
++ * This is the same as calc_tx_descs() for a TSO packet with
++ * nr_frags == MAX_SKB_FRAGS.
++ */
++#define ETHTXQ_STOP_THRES \
++	(1 + DIV_ROUND_UP((3 * MAX_SKB_FRAGS) / 2 + (MAX_SKB_FRAGS & 1), 8))
++
+ enum {
+ 	MAX_NPORTS	= 4,     /* max # of ports */
+ 	SERNUM_LEN	= 24,    /* Serial # length */
+@@ -557,6 +564,7 @@ enum {                                 /* adapter flags */
+ 
+ enum {
+ 	ULP_CRYPTO_LOOKASIDE = 1 << 0,
++	ULP_CRYPTO_IPSEC_INLINE = 1 << 1,
+ };
+ 
+ struct rx_sw_desc;
+@@ -971,6 +979,11 @@ enum {
+ 	SCHED_CLASS_RATEMODE_ABS = 1,   /* Kb/s */
+ };
+ 
++struct tx_sw_desc {                /* SW state per Tx descriptor */
++	struct sk_buff *skb;
++	struct ulptx_sgl *sgl;
++};
++
+ /* Support for "sched_queue" command to allow one or more NIC TX Queues
+  * to be bound to a TX Scheduling Class.
+  */
+@@ -1719,4 +1732,14 @@ void free_rspq_fl(struct adapter *adap, struct sge_rspq *rq, struct sge_fl *fl);
+ void free_tx_desc(struct adapter *adap, struct sge_txq *q,
+ 		  unsigned int n, bool unmap);
+ void free_txq(struct adapter *adap, struct sge_txq *q);
++void cxgb4_reclaim_completed_tx(struct adapter *adap,
++				struct sge_txq *q, bool unmap);
++int cxgb4_map_skb(struct device *dev, const struct sk_buff *skb,
++		  dma_addr_t *addr);
++void cxgb4_inline_tx_skb(const struct sk_buff *skb, const struct sge_txq *q,
++			 void *pos);
++void cxgb4_write_sgl(const struct sk_buff *skb, struct sge_txq *q,
++		     struct ulptx_sgl *sgl, u64 *end, unsigned int start,
++		     const dma_addr_t *addr);
++void cxgb4_ring_tx_db(struct adapter *adap, struct sge_txq *q, int n);
+ #endif /* __CXGB4_H__ */
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
+index f0e154138c9d..158bb10752f7 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
+@@ -2915,6 +2915,8 @@ static int chcr_show(struct seq_file *seq, void *v)
+ 		   atomic_read(&adap->chcr_stats.error));
+ 	seq_printf(seq, "Fallback: %10u \n",
+ 		   atomic_read(&adap->chcr_stats.fallback));
++	seq_printf(seq, "IPSec PDU: %10u\n",
++		   atomic_read(&adap->chcr_stats.ipsec_cnt));
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index 3053650ef892..ec72e46c9f10 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@ -4266,7 +4266,7 @@ static int adap_init0(struct adapter *adap)
+ 		} else {
+ 			adap->vres.ncrypto_fc = val[0];
+ 		}
+-		adap->params.crypto |= ULP_CRYPTO_LOOKASIDE;
++		adap->params.crypto = ntohs(caps_cmd.cryptocaps);
+ 		adap->num_uld += 1;
+ 	}
+ #undef FW_PARAM_PFVF
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.c
+index 2e7fd24ea55d..f1df5e781076 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.c
+@@ -640,6 +640,7 @@ static void uld_init(struct adapter *adap, struct cxgb4_lld_info *lld)
+ 	lld->nchan = adap->params.nports;
+ 	lld->nports = adap->params.nports;
+ 	lld->wr_cred = adap->params.ofldq_wr_cred;
++	lld->crypto = adap->params.crypto;
+ 	lld->iscsi_iolen = MAXRXDATA_G(t4_read_reg(adap, TP_PARA_REG2_A));
+ 	lld->iscsi_tagmask = t4_read_reg(adap, ULP_RX_ISCSI_TAGMASK_A);
+ 	lld->iscsi_pgsz_order = t4_read_reg(adap, ULP_RX_ISCSI_PSZ_A);
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
+index be1171426e83..2d8b5ee33c13 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
+@@ -295,6 +295,7 @@ struct chcr_stats_debug {
+ 	atomic_t complete;
+ 	atomic_t error;
+ 	atomic_t fallback;
++	atomic_t ipsec_cnt;
+ };
+ 
+ #define OCQ_WIN_OFFSET(pdev, vres) \
+@@ -320,6 +321,7 @@ struct cxgb4_lld_info {
+ 	unsigned char wr_cred;               /* WR 16-byte credits */
+ 	unsigned char adapter_type;          /* type of adapter */
+ 	unsigned char fw_api_ver;            /* FW API version */
++	unsigned char crypto;                /* crypto support */
+ 	unsigned int fw_vers;                /* FW version */
+ 	unsigned int iscsi_iolen;            /* iSCSI max I/O length */
+ 	unsigned int cclk_ps;                /* Core clock period in psec */
+@@ -368,6 +370,7 @@ struct cxgb4_uld_info {
+ 			      struct t4_lro_mgr *lro_mgr,
+ 			      struct napi_struct *napi);
+ 	void (*lro_flush)(struct t4_lro_mgr *);
++	int (*tx_handler)(struct sk_buff *skb, struct net_device *dev);
+ };
+ 
+ int cxgb4_register_uld(enum cxgb4_uld type, const struct cxgb4_uld_info *p);
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/sge.c
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4fw_api.h b/drivers/net/ethernet/chelsio/cxgb4/t4fw_api.h
+index 2baceab27790..f0992ae18f9c 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4fw_api.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4fw_api.h
+@@ -513,6 +513,13 @@ struct fw_ulptx_wr {
+ 	u64 cookie;
+ };
+ 
++#define FW_ULPTX_WR_DATA_S      28
++#define FW_ULPTX_WR_DATA_M      0x1
++#define FW_ULPTX_WR_DATA_V(x)   ((x) << FW_ULPTX_WR_DATA_S)
++#define FW_ULPTX_WR_DATA_G(x)   \
++	(((x) >> FW_ULPTX_WR_DATA_S) & FW_ULPTX_WR_DATA_M)
++#define FW_ULPTX_WR_DATA_F      FW_ULPTX_WR_DATA_V(1U)
++
+ struct fw_tp_wr {
+ 	__be32 op_to_immdlen;
+ 	__be32 flowid_len16;
