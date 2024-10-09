@@ -1,0 +1,144 @@
+pnfs/blocklayout: handle transient devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Benjamin Coddington <bcodding@redhat.com>
+commit b3dce6a2f0601be9b6781b394fdf6ceb63009a44
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b3dce6a2.failed
+
+PNFS block/SCSI layouts should gracefully handle cases where block devices
+are not available when a layout is retrieved, or the block devices are
+removed while the client holds a layout.
+
+While setting up a layout segment, keep a record of an unavailable or
+un-parsable block device in cache with a flag so that subsequent layouts do
+not spam the server with GETDEVINFO.  We can reuse the current
+NFS_DEVICEID_UNAVAILABLE handling with one variation: instead of reusing
+the device, we will discard it and send a fresh GETDEVINFO after the
+timeout, since the lookup and validation of the device occurs within the
+GETDEVINFO response handling.
+
+A lookup of a layout segment that references an unavailable device will
+return a segment with the NFS_LSEG_UNAVAILABLE flag set.  This will allow
+the pgio layer to mark the layout with the appropriate fail bit, which
+forces subsequent IO to the MDS, and prevents spamming the server with
+LAYOUTGET, LAYOUTRETURN.
+
+Finally, when IO to a block device fails, look up the block device(s)
+referenced by the pgio header, and mark them as unavailable.
+
+	Signed-off-by: Benjamin Coddington <bcodding@redhat.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit b3dce6a2f0601be9b6781b394fdf6ceb63009a44)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/blocklayout/blocklayout.c
+diff --cc fs/nfs/blocklayout/blocklayout.c
+index b7ae442cdc79,ca6cf54b54df..000000000000
+--- a/fs/nfs/blocklayout/blocklayout.c
++++ b/fs/nfs/blocklayout/blocklayout.c
+@@@ -183,7 -184,30 +183,34 @@@ retry
+  	return bio;
+  }
+  
+++<<<<<<< HEAD
+ +static void bl_end_io_read(struct bio *bio, int err)
+++=======
++ static void bl_mark_devices_unavailable(struct nfs_pgio_header *header, bool rw)
++ {
++ 	struct pnfs_block_layout *bl = BLK_LSEG2EXT(header->lseg);
++ 	size_t bytes_left = header->args.count;
++ 	sector_t isect, extent_length = 0;
++ 	struct pnfs_block_extent be;
++ 
++ 	isect = header->args.offset >> SECTOR_SHIFT;
++ 	bytes_left += header->args.offset - (isect << SECTOR_SHIFT);
++ 
++ 	while (bytes_left > 0) {
++ 		if (!ext_tree_lookup(bl, isect, &be, rw))
++ 				return;
++ 		extent_length = be.be_length - (isect - be.be_f_offset);
++ 		nfs4_mark_deviceid_unavailable(be.be_device);
++ 		isect += extent_length;
++ 		if (bytes_left > extent_length << SECTOR_SHIFT)
++ 			bytes_left -= extent_length << SECTOR_SHIFT;
++ 		else
++ 			bytes_left = 0;
++ 	}
++ }
++ 
++ static void bl_end_io_read(struct bio *bio)
+++>>>>>>> b3dce6a2f060 (pnfs/blocklayout: handle transient devices)
+  {
+  	struct parallel_io *par = bio->bi_private;
+  
+* Unmerged path fs/nfs/blocklayout/blocklayout.c
+diff --git a/fs/nfs/blocklayout/dev.c b/fs/nfs/blocklayout/dev.c
+index 3afd55aa5ad8..d2c2d449015e 100644
+--- a/fs/nfs/blocklayout/dev.c
++++ b/fs/nfs/blocklayout/dev.c
+@@ -521,14 +521,11 @@ bl_alloc_deviceid_node(struct nfs_server *server, struct pnfs_device *pdev,
+ 		goto out_free_volumes;
+ 
+ 	ret = bl_parse_deviceid(server, top, volumes, nr_volumes - 1, gfp_mask);
+-	if (ret) {
+-		bl_free_device(top);
+-		kfree(top);
+-		goto out_free_volumes;
+-	}
+ 
+ 	node = &top->node;
+ 	nfs4_init_deviceid_node(node, server, &pdev->dev_id);
++	if (ret)
++		nfs4_mark_deviceid_unavailable(node);
+ 
+ out_free_volumes:
+ 	kfree(volumes);
+diff --git a/fs/nfs/pnfs.c b/fs/nfs/pnfs.c
+index 0bfbb90d25d3..b77a7fceba64 100644
+--- a/fs/nfs/pnfs.c
++++ b/fs/nfs/pnfs.c
+@@ -679,7 +679,7 @@ pnfs_mark_matching_lsegs_invalid(struct pnfs_layout_hdr *lo,
+ 		return 0;
+ 	list_for_each_entry_safe(lseg, next, &lo->plh_segs, pls_list)
+ 		if (pnfs_match_lseg_recall(lseg, recall_range, seq)) {
+-			dprintk("%s: freeing lseg %p iomode %d seq %u"
++			dprintk("%s: freeing lseg %p iomode %d seq %u "
+ 				"offset %llu length %llu\n", __func__,
+ 				lseg, lseg->pls_range.iomode, lseg->pls_seq,
+ 				lseg->pls_range.offset, lseg->pls_range.length);
+diff --git a/fs/nfs/pnfs.h b/fs/nfs/pnfs.h
+index 22b3722d7f01..0ad31a77b7f3 100644
+--- a/fs/nfs/pnfs.h
++++ b/fs/nfs/pnfs.h
+@@ -39,6 +39,7 @@ enum {
+ 	NFS_LSEG_ROC,		/* roc bit received from server */
+ 	NFS_LSEG_LAYOUTCOMMIT,	/* layoutcommit bit set for layoutcommit */
+ 	NFS_LSEG_LAYOUTRETURN,	/* layoutreturn bit set for layoutreturn */
++	NFS_LSEG_UNAVAILABLE,	/* unavailable bit set for temporary problem */
+ };
+ 
+ /* Individual ip address */
+@@ -86,6 +87,7 @@ enum pnfs_try_status {
+  */
+ #define NFS4_DEF_DS_TIMEO   600 /* in tenths of a second */
+ #define NFS4_DEF_DS_RETRANS 5
++#define PNFS_DEVICE_RETRY_TIMEOUT (120*HZ)
+ 
+ /* error codes for internal use */
+ #define NFS4ERR_RESET_TO_MDS   12001
+diff --git a/fs/nfs/pnfs_dev.c b/fs/nfs/pnfs_dev.c
+index 2961fcd7a2df..e8a07b3f9aaa 100644
+--- a/fs/nfs/pnfs_dev.c
++++ b/fs/nfs/pnfs_dev.c
+@@ -43,7 +43,6 @@
+ #define NFS4_DEVICE_ID_HASH_SIZE	(1 << NFS4_DEVICE_ID_HASH_BITS)
+ #define NFS4_DEVICE_ID_HASH_MASK	(NFS4_DEVICE_ID_HASH_SIZE - 1)
+ 
+-#define PNFS_DEVICE_RETRY_TIMEOUT (120*HZ)
+ 
+ static struct hlist_head nfs4_deviceid_cache[NFS4_DEVICE_ID_HASH_SIZE];
+ static DEFINE_SPINLOCK(nfs4_deviceid_lock);
