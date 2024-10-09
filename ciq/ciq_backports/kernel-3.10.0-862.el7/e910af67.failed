@@ -1,0 +1,110 @@
+net_sched: use tcf_queue_work() in bpf filter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Cong Wang <xiyou.wangcong@gmail.com>
+commit e910af676b565ecc16bcd6c896ecb68157396ecc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e910af67.failed
+
+Defer the tcf_exts_destroy() in RCU callback to
+tc filter workqueue and get RTNL lock.
+
+	Reported-by: Chris Mi <chrism@mellanox.com>
+	Cc: Daniel Borkmann <daniel@iogearbox.net>
+	Cc: Jiri Pirko <jiri@resnulli.us>
+	Cc: John Fastabend <john.fastabend@gmail.com>
+	Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+	Cc: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e910af676b565ecc16bcd6c896ecb68157396ecc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_bpf.c
+diff --cc net/sched/cls_bpf.c
+index c13fb5505297,037a3ae86829..000000000000
+--- a/net/sched/cls_bpf.c
++++ b/net/sched/cls_bpf.c
+@@@ -31,15 -37,22 +31,18 @@@ struct cls_bpf_head 
+  };
+  
+  struct cls_bpf_prog {
+ -	struct bpf_prog *filter;
+ -	struct list_head link;
+ -	struct tcf_result res;
+ -	bool exts_integrated;
+ -	bool offloaded;
+ -	u32 gen_flags;
+ +	struct sk_filter *filter;
+ +	struct sock_filter *bpf_ops;
+  	struct tcf_exts exts;
+ +	struct tcf_result res;
+ +	struct list_head link;
+  	u32 handle;
+ -	u16 bpf_num_ops;
+ -	struct sock_filter *bpf_ops;
+ -	const char *bpf_name;
+ +	u16 bpf_len;
+  	struct tcf_proto *tp;
+- 	struct rcu_head rcu;
++ 	union {
++ 		struct work_struct work;
++ 		struct rcu_head rcu;
++ 	};
+  };
+  
+  static const struct nla_policy bpf_policy[TCA_BPF_MAX + 1] = {
+@@@ -100,20 -260,37 +103,38 @@@ static void cls_bpf_delete_prog(struct 
+  	kfree(prog);
+  }
+  
+++<<<<<<< HEAD
+ +static void __cls_bpf_delete_prog(struct rcu_head *rcu)
+ +{
+ +	struct cls_bpf_prog *prog = container_of(rcu, struct cls_bpf_prog, rcu);
+ +
+ +	cls_bpf_delete_prog(prog->tp, prog);
+++=======
++ static void cls_bpf_delete_prog_work(struct work_struct *work)
++ {
++ 	struct cls_bpf_prog *prog = container_of(work, struct cls_bpf_prog, work);
++ 
++ 	rtnl_lock();
++ 	__cls_bpf_delete_prog(prog);
++ 	rtnl_unlock();
++ }
++ 
++ static void cls_bpf_delete_prog_rcu(struct rcu_head *rcu)
++ {
++ 	struct cls_bpf_prog *prog = container_of(rcu, struct cls_bpf_prog, rcu);
++ 
++ 	INIT_WORK(&prog->work, cls_bpf_delete_prog_work);
++ 	tcf_queue_work(&prog->work);
+++>>>>>>> e910af676b56 (net_sched: use tcf_queue_work() in bpf filter)
+  }
+  
+ -static void __cls_bpf_delete(struct tcf_proto *tp, struct cls_bpf_prog *prog)
+ +static int cls_bpf_delete(struct tcf_proto *tp, unsigned long arg)
+  {
+ -	cls_bpf_stop_offload(tp, prog);
+ +	struct cls_bpf_prog *prog = (struct cls_bpf_prog *) arg;
+ +
+  	list_del_rcu(&prog->link);
+  	tcf_unbind_filter(tp, &prog->res);
+ -	call_rcu(&prog->rcu, cls_bpf_delete_prog_rcu);
+ -}
+ -
+ -static int cls_bpf_delete(struct tcf_proto *tp, void *arg, bool *last)
+ -{
+ -	struct cls_bpf_head *head = rtnl_dereference(tp->root);
+ -
+ -	__cls_bpf_delete(tp, arg);
+ -	*last = list_empty(&head->plist);
+ +	call_rcu(&prog->rcu, __cls_bpf_delete_prog);
+  	return 0;
+  }
+  
+* Unmerged path net/sched/cls_bpf.c
