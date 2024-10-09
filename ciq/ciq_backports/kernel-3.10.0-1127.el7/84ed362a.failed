@@ -1,0 +1,320 @@
+scsi: qla2xxx: Dual FCP-NVMe target port support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Michael Hernandez <mhernandez@marvell.com>
+commit 84ed362ac40ca44dbbbebf767301463aa72bc797
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/84ed362a.failed
+
+Some storage arrays advertise FCP LUNs and NVMe namespaces behind the same
+WWN.  The driver now offers a user option by way of NVRAM parameter to
+allow users to choose, on a per port basis, the kind of FC-4 type they
+would like to prioritize for login.
+
+Link: https://lore.kernel.org/r/20190912180918.6436-9-hmadhani@marvell.com
+	Signed-off-by: Michael Hernandez <mhernandez@marvell.com>
+	Signed-off-by: Himanshu Madhani <hmadhani@marvell.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 84ed362ac40ca44dbbbebf767301463aa72bc797)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_init.c
+diff --cc drivers/scsi/qla2xxx/qla_init.c
+index bffbdb309273,7cb7545de962..000000000000
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@@ -8316,11 -8519,10 +8321,18 @@@ qla81xx_nvram_config(scsi_qla_host_t *v
+  	/* N2N: driver will initiate Login instead of FW */
+  	icb->firmware_options_3 |= BIT_8;
+  
+++<<<<<<< HEAD
+ +	if (IS_QLA27XX(ha)) {
+ +		icb->firmware_options_3 |= BIT_8;
+ +		ql_dbg(ql_log_info, vha, 0x0075,
+ +		    "Enabling direct connection.\n");
+ +	}
+++=======
++ 	/* Determine NVMe/FCP priority for target ports */
++ 	ha->fc4_type_priority = qla2xxx_get_fc4_priority(vha);
++ 	ql_log(ql_log_info, vha, 0xffff, "FC4 priority set to %s\n",
++ 	    ha->fc4_type_priority & BIT_0 ? "FCP" : "NVMe");
+++>>>>>>> 84ed362ac40c (scsi: qla2xxx: Dual FCP-NVMe target port support)
+  
+  	if (rval) {
+  		ql_log(ql_log_warn, vha, 0x0076,
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index efa92b3b1c72..27867cec1363 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -2237,7 +2237,7 @@ typedef struct {
+ 	uint8_t fabric_port_name[WWN_SIZE];
+ 	uint16_t fp_speed;
+ 	uint8_t fc4_type;
+-	uint8_t fc4f_nvme;	/* nvme fc4 feature bits */
++	uint8_t fc4_features;
+ } sw_info_t;
+ 
+ /* FCP-4 types */
+@@ -2422,7 +2422,7 @@ typedef struct fc_port {
+ 	u32 supported_classes;
+ 
+ 	uint8_t fc4_type;
+-	uint8_t	fc4f_nvme;
++	uint8_t fc4_features;
+ 	uint8_t scan_state;
+ 
+ 	unsigned long last_queue_full;
+@@ -2453,6 +2453,9 @@ typedef struct fc_port {
+ 	u16 n2n_chip_reset;
+ } fc_port_t;
+ 
++#define FC4_PRIORITY_NVME	0
++#define FC4_PRIORITY_FCP	1
++
+ #define QLA_FCPORT_SCAN		1
+ #define QLA_FCPORT_FOUND	2
+ 
+@@ -4228,6 +4231,8 @@ struct qla_hw_data {
+ 	atomic_t        nvme_active_aen_cnt;
+ 	uint16_t        nvme_last_rptd_aen;             /* Last recorded aen count */
+ 
++	uint8_t fc4_type_priority;
++
+ 	atomic_t zio_threshold;
+ 	uint16_t last_zio_threshold;
+ #define DEFAULT_ZIO_THRESHOLD 5
+@@ -4705,6 +4710,23 @@ struct sff_8247_a0 {
+ 	 ha->current_topology == ISP_CFG_N || \
+ 	 !ha->current_topology)
+ 
++#define NVME_TYPE(fcport) \
++	(fcport->fc4_type & FS_FC4TYPE_NVME) \
++
++#define FCP_TYPE(fcport) \
++	(fcport->fc4_type & FS_FC4TYPE_FCP) \
++
++#define NVME_ONLY_TARGET(fcport) \
++	(NVME_TYPE(fcport) && !FCP_TYPE(fcport))  \
++
++#define NVME_FCP_TARGET(fcport) \
++	(FCP_TYPE(fcport) && NVME_TYPE(fcport)) \
++
++#define NVME_TARGET(ha, fcport) \
++	((NVME_FCP_TARGET(fcport) && \
++	(ha->fc4_type_priority == FC4_PRIORITY_NVME)) || \
++	NVME_ONLY_TARGET(fcport)) \
++
+ #include "qla_target.h"
+ #include "qla_gbl.h"
+ #include "qla_dbg.h"
+diff --git a/drivers/scsi/qla2xxx/qla_fw.h b/drivers/scsi/qla2xxx/qla_fw.h
+index 50c1e6c62e31..cc0a6cbdcc1e 100644
+--- a/drivers/scsi/qla2xxx/qla_fw.h
++++ b/drivers/scsi/qla2xxx/qla_fw.h
+@@ -2081,4 +2081,6 @@ struct qla_fcp_prio_cfg {
+ /* 83XX Flash locations -- occupies second 8MB region. */
+ #define FA_FLASH_LAYOUT_ADDR_83	0xFC400
+ 
++#define NVRAM_DUAL_FCP_NVME_FLAG_OFFSET	0x196
++
+ #endif
+diff --git a/drivers/scsi/qla2xxx/qla_gs.c b/drivers/scsi/qla2xxx/qla_gs.c
+index 42f41ac67abd..29bbcc86229b 100644
+--- a/drivers/scsi/qla2xxx/qla_gs.c
++++ b/drivers/scsi/qla2xxx/qla_gs.c
+@@ -256,7 +256,7 @@ qla2x00_ga_nxt(scsi_qla_host_t *vha, fc_port_t *fcport)
+ 		    WWN_SIZE);
+ 
+ 		fcport->fc4_type = (ct_rsp->rsp.ga_nxt.fc4_types[2] & BIT_0) ?
+-		    FC4_TYPE_FCP_SCSI : FC4_TYPE_OTHER;
++		    FS_FC4TYPE_FCP : FC4_TYPE_OTHER;
+ 
+ 		if (ct_rsp->rsp.ga_nxt.port_type != NS_N_PORT_TYPE &&
+ 		    ct_rsp->rsp.ga_nxt.port_type != NS_NL_PORT_TYPE)
+@@ -2913,7 +2913,7 @@ qla2x00_gff_id(scsi_qla_host_t *vha, sw_info_t *list)
+ 	struct ct_sns_req	*ct_req;
+ 	struct ct_sns_rsp	*ct_rsp;
+ 	struct qla_hw_data *ha = vha->hw;
+-	uint8_t fcp_scsi_features = 0;
++	uint8_t fcp_scsi_features = 0, nvme_features = 0;
+ 	struct ct_arg arg;
+ 
+ 	for (i = 0; i < ha->max_fibre_devices; i++) {
+@@ -2961,14 +2961,19 @@ qla2x00_gff_id(scsi_qla_host_t *vha, sw_info_t *list)
+ 			   ct_rsp->rsp.gff_id.fc4_features[GFF_FCP_SCSI_OFFSET];
+ 			fcp_scsi_features &= 0x0f;
+ 
+-			if (fcp_scsi_features)
+-				list[i].fc4_type = FC4_TYPE_FCP_SCSI;
+-			else
+-				list[i].fc4_type = FC4_TYPE_OTHER;
++			if (fcp_scsi_features) {
++				list[i].fc4_type = FS_FC4TYPE_FCP;
++				list[i].fc4_features = fcp_scsi_features;
++			}
+ 
+-			list[i].fc4f_nvme =
++			nvme_features =
+ 			    ct_rsp->rsp.gff_id.fc4_features[GFF_NVME_OFFSET];
+-			list[i].fc4f_nvme &= 0xf;
++			nvme_features &= 0xf;
++
++			if (nvme_features) {
++				list[i].fc4_type |= FS_FC4TYPE_NVME;
++				list[i].fc4_features = nvme_features;
++			}
+ 		}
+ 
+ 		/* Last device exit. */
+@@ -3505,6 +3510,8 @@ void qla24xx_async_gffid_sp_done(void *s, int res)
+ 	fc_port_t *fcport = sp->fcport;
+ 	struct ct_sns_rsp *ct_rsp;
+ 	struct event_arg ea;
++	uint8_t fc4_scsi_feat;
++	uint8_t fc4_nvme_feat;
+ 
+ 	ql_dbg(ql_dbg_disc, vha, 0x2133,
+ 	       "Async done-%s res %x ID %x. %8phC\n",
+@@ -3512,24 +3519,25 @@ void qla24xx_async_gffid_sp_done(void *s, int res)
+ 
+ 	fcport->flags &= ~FCF_ASYNC_SENT;
+ 	ct_rsp = &fcport->ct_desc.ct_sns->p.rsp;
++	fc4_scsi_feat = ct_rsp->rsp.gff_id.fc4_features[GFF_FCP_SCSI_OFFSET];
++	fc4_nvme_feat = ct_rsp->rsp.gff_id.fc4_features[GFF_NVME_OFFSET];
++
+ 	/*
+ 	 * FC-GS-7, 5.2.3.12 FC-4 Features - format
+ 	 * The format of the FC-4 Features object, as defined by the FC-4,
+ 	 * Shall be an array of 4-bit values, one for each type code value
+ 	 */
+ 	if (!res) {
+-		if (ct_rsp->rsp.gff_id.fc4_features[GFF_FCP_SCSI_OFFSET] & 0xf) {
++		if (fc4_scsi_feat & 0xf) {
+ 			/* w1 b00:03 */
+-			fcport->fc4_type =
+-			    ct_rsp->rsp.gff_id.fc4_features[GFF_FCP_SCSI_OFFSET];
+-			fcport->fc4_type &= 0xf;
+-	       }
++			fcport->fc4_type = FS_FC4TYPE_FCP;
++			fcport->fc4_features = fc4_scsi_feat & 0xf;
++		}
+ 
+-		if (ct_rsp->rsp.gff_id.fc4_features[GFF_NVME_OFFSET] & 0xf) {
++		if (fc4_nvme_feat & 0xf) {
+ 			/* w5 [00:03]/28h */
+-			fcport->fc4f_nvme =
+-			    ct_rsp->rsp.gff_id.fc4_features[GFF_NVME_OFFSET];
+-			fcport->fc4f_nvme &= 0xf;
++			fcport->fc4_type |= FS_FC4TYPE_NVME;
++			fcport->fc4_features = fc4_nvme_feat & 0xf;
+ 		}
+ 	}
+ 
+* Unmerged path drivers/scsi/qla2xxx/qla_init.c
+diff --git a/drivers/scsi/qla2xxx/qla_inline.h b/drivers/scsi/qla2xxx/qla_inline.h
+index 932b66e3ea26..18b0b0ee4328 100644
+--- a/drivers/scsi/qla2xxx/qla_inline.h
++++ b/drivers/scsi/qla2xxx/qla_inline.h
+@@ -321,3 +321,15 @@ qla_83xx_start_iocbs(struct qla_qpair *qpair)
+ 
+ 	WRT_REG_DWORD(req->req_q_in, req->ring_index);
+ }
++
++static inline int
++qla2xxx_get_fc4_priority(struct scsi_qla_host *vha)
++{
++	uint32_t data;
++
++	data =
++	    ((uint8_t *)vha->hw->nvram)[NVRAM_DUAL_FCP_NVME_FLAG_OFFSET];
++
++
++	return ((data >> 6) & BIT_0);
++}
+diff --git a/drivers/scsi/qla2xxx/qla_mbx.c b/drivers/scsi/qla2xxx/qla_mbx.c
+index 42b32851926d..08bcae973863 100644
+--- a/drivers/scsi/qla2xxx/qla_mbx.c
++++ b/drivers/scsi/qla2xxx/qla_mbx.c
+@@ -1923,7 +1923,7 @@ qla2x00_get_port_database(scsi_qla_host_t *vha, fc_port_t *fcport, uint8_t opt)
+ 		pd24 = (struct port_database_24xx *) pd;
+ 
+ 		/* Check for logged in state. */
+-		if (fcport->fc4f_nvme) {
++		if (NVME_TARGET(ha, fcport)) {
+ 			current_login_state = pd24->current_login_state >> 4;
+ 			last_login_state = pd24->last_login_state >> 4;
+ 		} else {
+@@ -3891,8 +3891,9 @@ qla24xx_report_id_acquisition(scsi_qla_host_t *vha,
+ 				fcport->scan_state = QLA_FCPORT_FOUND;
+ 				fcport->n2n_flag = 1;
+ 				fcport->keep_nport_handle = 1;
++				fcport->fc4_type = FS_FC4TYPE_FCP;
+ 				if (vha->flags.nvme_enabled)
+-					fcport->fc4f_nvme = 1;
++					fcport->fc4_type |= FS_FC4TYPE_NVME;
+ 
+ 				switch (fcport->disc_state) {
+ 				case DSC_DELETED:
+@@ -6316,7 +6317,7 @@ int __qla24xx_parse_gpdb(struct scsi_qla_host *vha, fc_port_t *fcport,
+ 	uint64_t zero = 0;
+ 	u8 current_login_state, last_login_state;
+ 
+-	if (fcport->fc4f_nvme) {
++	if (NVME_TARGET(vha->hw, fcport)) {
+ 		current_login_state = pd->current_login_state >> 4;
+ 		last_login_state = pd->last_login_state >> 4;
+ 	} else {
+@@ -6351,8 +6352,8 @@ int __qla24xx_parse_gpdb(struct scsi_qla_host *vha, fc_port_t *fcport,
+ 	fcport->d_id.b.al_pa = pd->port_id[2];
+ 	fcport->d_id.b.rsvd_1 = 0;
+ 
+-	if (fcport->fc4f_nvme) {
+-		fcport->port_type = 0;
++	if (NVME_TARGET(vha->hw, fcport)) {
++		fcport->port_type = FCT_NVME;
+ 		if ((pd->prli_svc_param_word_3[0] & BIT_5) == 0)
+ 			fcport->port_type |= FCT_NVME_INITIATOR;
+ 		if ((pd->prli_svc_param_word_3[0] & BIT_4) == 0)
+diff --git a/drivers/scsi/qla2xxx/qla_os.c b/drivers/scsi/qla2xxx/qla_os.c
+index 2d8d1482665a..56474f1ee1c7 100644
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@ -5156,19 +5156,17 @@ void qla24xx_create_new_sess(struct scsi_qla_host *vha, struct qla_work_evt *e)
+ 			fcport->d_id = e->u.new_sess.id;
+ 			fcport->flags |= FCF_FABRIC_DEVICE;
+ 			fcport->fw_login_state = DSC_LS_PLOGI_PEND;
+-			if (e->u.new_sess.fc4_type == FS_FC4TYPE_FCP)
+-				fcport->fc4_type = FC4_TYPE_FCP_SCSI;
+-
+-			if (e->u.new_sess.fc4_type == FS_FC4TYPE_NVME) {
+-				fcport->fc4_type = FC4_TYPE_OTHER;
+-				fcport->fc4f_nvme = FC4_TYPE_NVME;
+-			}
+ 
+ 			memcpy(fcport->port_name, e->u.new_sess.port_name,
+ 			    WWN_SIZE);
+ 
+-			if (e->u.new_sess.fc4_type & FS_FCP_IS_N2N)
++			fcport->fc4_type = e->u.new_sess.fc4_type;
++			if (e->u.new_sess.fc4_type & FS_FCP_IS_N2N) {
++				fcport->fc4_type = FS_FC4TYPE_FCP;
+ 				fcport->n2n_flag = 1;
++				if (vha->flags.nvme_enabled)
++					fcport->fc4_type |= FS_FC4TYPE_NVME;
++			}
+ 
+ 		} else {
+ 			ql_dbg(ql_dbg_disc, vha, 0xffff,
+@@ -5270,7 +5268,8 @@ void qla24xx_create_new_sess(struct scsi_qla_host *vha, struct qla_work_evt *e)
+ 				fcport->flags &= ~FCF_FABRIC_DEVICE;
+ 				fcport->keep_nport_handle = 1;
+ 				if (vha->flags.nvme_enabled) {
+-					fcport->fc4f_nvme = 1;
++					fcport->fc4_type =
++					    (FS_FC4TYPE_NVME | FS_FC4TYPE_FCP);
+ 					fcport->n2n_flag = 1;
+ 				}
+ 				fcport->fw_login_state = 0;
