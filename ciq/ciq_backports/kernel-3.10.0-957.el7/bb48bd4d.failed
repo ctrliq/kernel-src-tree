@@ -1,0 +1,499 @@
+ceph: optimize memory usage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Chengguang Xu <cgxu519@gmx.com>
+commit bb48bd4dc45f9ee1e44d8e9fcb01023e0d0ba80d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/bb48bd4d.failed
+
+In current code, regular file and directory use same struct
+ceph_file_info to store fs specific data so the struct has to
+include some fields which are only used for directory
+(e.g., readdir related info), when having plenty of regular files,
+it will lead to memory waste.
+
+This patch introduces dedicated ceph_dir_file_info cache for
+readdir related thins. So that regular file does not include those
+unused fields anymore.
+
+	Signed-off-by: Chengguang Xu <cgxu519@gmx.com>
+	Reviewed-by: "Yan, Zheng" <zyan@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit bb48bd4dc45f9ee1e44d8e9fcb01023e0d0ba80d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/dir.c
+#	fs/ceph/file.c
+#	fs/ceph/super.c
+#	fs/ceph/super.h
+diff --cc fs/ceph/dir.c
+index 83040cdc8671,16405e0774a6..000000000000
+--- a/fs/ceph/dir.c
++++ b/fs/ceph/dir.c
+@@@ -121,8 -102,8 +121,13 @@@ static int fpos_cmp(loff_t l, loff_t r
+   * regardless of what dir changes take place on the
+   * server.
+   */
+++<<<<<<< HEAD
+ +static int note_last_dentry(struct ceph_file_info *fi, const char *name,
+ +			    int len, unsigned next_offset)
+++=======
++ static int note_last_dentry(struct ceph_dir_file_info *dfi, const char *name,
++ 		            int len, unsigned next_offset)
+++>>>>>>> bb48bd4dc45f (ceph: optimize memory usage)
+  {
+  	char *buf = kmalloc(len+1, GFP_KERNEL);
+  	if (!buf)
+@@@ -191,13 -172,12 +196,19 @@@ __dcache_find_get_entry(struct dentry *
+   * defined IFF we hold CEPH_CAP_FILE_SHARED (which will be revoked by
+   * the MDS if/when the directory is modified).
+   */
+ -static int __dcache_readdir(struct file *file,  struct dir_context *ctx,
+ -			    int shared_gen)
+ +static int __dcache_readdir(struct file *filp,
+ +			    void *dirent, filldir_t filldir,
+ +			    u32 shared_gen)
+  {
+++<<<<<<< HEAD
+ +	struct ceph_file_info *fi = filp->private_data;
+ +	struct dentry *parent = filp->f_dentry;
+ +	struct inode *dir = parent->d_inode;
+++=======
++ 	struct ceph_dir_file_info *dfi = file->private_data;
++ 	struct dentry *parent = file->f_path.dentry;
++ 	struct inode *dir = d_inode(parent);
+++>>>>>>> bb48bd4dc45f (ceph: optimize memory usage)
+  	struct dentry *dentry, *last = NULL;
+  	struct ceph_dentry_info *di;
+  	struct ceph_readdir_cache_control cache_ctl = {};
+@@@ -302,20 -287,20 +313,25 @@@ out
+  	return err;
+  }
+  
+- static bool need_send_readdir(struct ceph_file_info *fi, loff_t pos)
++ static bool need_send_readdir(struct ceph_dir_file_info *dfi, loff_t pos)
+  {
+- 	if (!fi->last_readdir)
++ 	if (!dfi->last_readdir)
+  		return true;
+  	if (is_hash_order(pos))
+- 		return !ceph_frag_contains_value(fi->frag, fpos_hash(pos));
++ 		return !ceph_frag_contains_value(dfi->frag, fpos_hash(pos));
+  	else
+- 		return fi->frag != fpos_frag(pos);
++ 		return dfi->frag != fpos_frag(pos);
+  }
+  
+ -static int ceph_readdir(struct file *file, struct dir_context *ctx)
+ +static int ceph_readdir(struct file *filp, void *dirent, filldir_t filldir)
+  {
+++<<<<<<< HEAD
+ +	struct ceph_file_info *fi = filp->private_data;
+ +	struct inode *inode = file_inode(filp);
+++=======
++ 	struct ceph_dir_file_info *dfi = file->private_data;
++ 	struct inode *inode = file_inode(file);
+++>>>>>>> bb48bd4dc45f (ceph: optimize memory usage)
+  	struct ceph_inode_info *ci = ceph_inode(inode);
+  	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
+  	struct ceph_mds_client *mdsc = fsc->mdsc;
+@@@ -324,8 -309,8 +340,13 @@@
+  	unsigned frag = -1;
+  	struct ceph_mds_reply_info_parsed *rinfo;
+  
+++<<<<<<< HEAD
+ +	dout("readdir %p file %p pos %llx\n", inode, filp, filp->f_pos);
+ +	if (fi->flags & CEPH_F_ATEND)
+++=======
++ 	dout("readdir %p file %p pos %llx\n", inode, file, ctx->pos);
++ 	if (dfi->file_info.flags & CEPH_F_ATEND)
+++>>>>>>> bb48bd4dc45f (ceph: optimize memory usage)
+  		return 0;
+  
+  	/* always start with . and .. */
+@@@ -366,18 -351,18 +387,22 @@@
+  	/* proceed with a normal readdir */
+  more:
+  	/* do we have the correct frag content buffered? */
+++<<<<<<< HEAD
+ +	if (need_send_readdir(fi, filp->f_pos)) {
+++=======
++ 	if (need_send_readdir(dfi, ctx->pos)) {
+++>>>>>>> bb48bd4dc45f (ceph: optimize memory usage)
+  		struct ceph_mds_request *req;
+  		int op = ceph_snap(inode) == CEPH_SNAPDIR ?
+  			CEPH_MDS_OP_LSSNAP : CEPH_MDS_OP_READDIR;
+  
+  		/* discard old result, if any */
+- 		if (fi->last_readdir) {
+- 			ceph_mdsc_put_request(fi->last_readdir);
+- 			fi->last_readdir = NULL;
++ 		if (dfi->last_readdir) {
++ 			ceph_mdsc_put_request(dfi->last_readdir);
++ 			dfi->last_readdir = NULL;
+  		}
+  
+ -		if (is_hash_order(ctx->pos)) {
+ +		if (is_hash_order(filp->f_pos)) {
+  			/* fragtree isn't always accurate. choose frag
+  			 * based on previous reply when possible. */
+  			if (frag == (unsigned)-1)
+@@@ -411,15 -395,15 +436,15 @@@
+  				ceph_mdsc_put_request(req);
+  				return -ENOMEM;
+  			}
+ -		} else if (is_hash_order(ctx->pos)) {
+ +		} else if (is_hash_order(filp->f_pos)) {
+  			req->r_args.readdir.offset_hash =
+ -				cpu_to_le32(fpos_hash(ctx->pos));
+ +				cpu_to_le32(fpos_hash(filp->f_pos));
+  		}
+  
+- 		req->r_dir_release_cnt = fi->dir_release_count;
+- 		req->r_dir_ordered_cnt = fi->dir_ordered_count;
+- 		req->r_readdir_cache_idx = fi->readdir_cache_idx;
+- 		req->r_readdir_offset = fi->next_offset;
++ 		req->r_dir_release_cnt = dfi->dir_release_count;
++ 		req->r_dir_ordered_cnt = dfi->dir_ordered_count;
++ 		req->r_readdir_cache_idx = dfi->readdir_cache_idx;
++ 		req->r_readdir_offset = dfi->next_offset;
+  		req->r_args.readdir.frag = cpu_to_le32(frag);
+  		req->r_args.readdir.flags =
+  				cpu_to_le16(CEPH_READDIR_REPLY_BITFLAGS);
+@@@ -443,35 -427,35 +468,42 @@@
+  		if (le32_to_cpu(rinfo->dir_dir->frag) != frag) {
+  			frag = le32_to_cpu(rinfo->dir_dir->frag);
+  			if (!rinfo->hash_order) {
+++<<<<<<< HEAD
+ +				fi->next_offset = req->r_readdir_offset;
+ +				/* adjust f_pos to beginning of frag */
+ +				filp->f_pos = ceph_make_fpos(frag,
+ +							  fi->next_offset,
+++=======
++ 				dfi->next_offset = req->r_readdir_offset;
++ 				/* adjust ctx->pos to beginning of frag */
++ 				ctx->pos = ceph_make_fpos(frag,
++ 							  dfi->next_offset,
+++>>>>>>> bb48bd4dc45f (ceph: optimize memory usage)
+  							  false);
+  			}
+  		}
+  
+- 		fi->frag = frag;
+- 		fi->last_readdir = req;
++ 		dfi->frag = frag;
++ 		dfi->last_readdir = req;
+  
+  		if (test_bit(CEPH_MDS_R_DID_PREPOPULATE, &req->r_req_flags)) {
+- 			fi->readdir_cache_idx = req->r_readdir_cache_idx;
+- 			if (fi->readdir_cache_idx < 0) {
++ 			dfi->readdir_cache_idx = req->r_readdir_cache_idx;
++ 			if (dfi->readdir_cache_idx < 0) {
+  				/* preclude from marking dir ordered */
+- 				fi->dir_ordered_count = 0;
++ 				dfi->dir_ordered_count = 0;
+  			} else if (ceph_frag_is_leftmost(frag) &&
+- 				   fi->next_offset == 2) {
++ 				   dfi->next_offset == 2) {
+  				/* note dir version at start of readdir so
+  				 * we can tell if any dentries get dropped */
+- 				fi->dir_release_count = req->r_dir_release_cnt;
+- 				fi->dir_ordered_count = req->r_dir_ordered_cnt;
++ 				dfi->dir_release_count = req->r_dir_release_cnt;
++ 				dfi->dir_ordered_count = req->r_dir_ordered_cnt;
+  			}
+  		} else {
+ -			dout("readdir !did_prepopulate\n");
+ +			dout("readdir !did_prepopulate");
+  			/* disable readdir cache */
+- 			fi->readdir_cache_idx = -1;
++ 			dfi->readdir_cache_idx = -1;
+  			/* preclude from marking dir complete */
+- 			fi->dir_release_count = 0;
++ 			dfi->dir_release_count = 0;
+  		}
+  
+  		/* note next offset and last dentry name */
+@@@ -490,9 -474,9 +522,13 @@@
+  		}
+  	}
+  
+- 	rinfo = &fi->last_readdir->r_reply_info;
++ 	rinfo = &dfi->last_readdir->r_reply_info;
+  	dout("readdir frag %x num %d pos %llx chunk first %llx\n",
+++<<<<<<< HEAD
+ +	     fi->frag, rinfo->dir_nr, filp->f_pos,
+++=======
++ 	     dfi->frag, rinfo->dir_nr, ctx->pos,
+++>>>>>>> bb48bd4dc45f (ceph: optimize memory usage)
+  	     rinfo->dir_nr ? rinfo->dir_entries[0].offset : 0LL);
+  
+  	i = 0;
+@@@ -533,30 -517,31 +569,46 @@@
+  			dout("filldir stopping us...\n");
+  			return 0;
+  		}
+ -		ctx->pos++;
+ +		filp->f_pos++;
+  	}
+  
+- 	ceph_mdsc_put_request(fi->last_readdir);
+- 	fi->last_readdir = NULL;
++ 	ceph_mdsc_put_request(dfi->last_readdir);
++ 	dfi->last_readdir = NULL;
+  
+- 	if (fi->next_offset > 2) {
+- 		frag = fi->frag;
++ 	if (dfi->next_offset > 2) {
++ 		frag = dfi->frag;
+  		goto more;
+  	}
+  
+  	/* more frags? */
+++<<<<<<< HEAD
+ +	if (!ceph_frag_is_rightmost(fi->frag)) {
+ +		frag = ceph_frag_next(fi->frag);
+ +		if (is_hash_order(filp->f_pos)) {
+ +			loff_t new_pos = ceph_make_fpos(ceph_frag_value(frag),
+ +							fi->next_offset, true);
+ +			if (new_pos > filp->f_pos)
+ +				filp->f_pos = new_pos;
+ +			/* keep last_name */
+ +		} else {
+ +			filp->f_pos = ceph_make_fpos(frag, fi->next_offset, false);
+ +			kfree(fi->last_name);
+ +			fi->last_name = NULL;
+++=======
++ 	if (!ceph_frag_is_rightmost(dfi->frag)) {
++ 		frag = ceph_frag_next(dfi->frag);
++ 		if (is_hash_order(ctx->pos)) {
++ 			loff_t new_pos = ceph_make_fpos(ceph_frag_value(frag),
++ 							dfi->next_offset, true);
++ 			if (new_pos > ctx->pos)
++ 				ctx->pos = new_pos;
++ 			/* keep last_name */
++ 		} else {
++ 			ctx->pos = ceph_make_fpos(frag, dfi->next_offset,
++ 							false);
++ 			kfree(dfi->last_name);
++ 			dfi->last_name = NULL;
+++>>>>>>> bb48bd4dc45f (ceph: optimize memory usage)
+  		}
+  		dout("readdir next frag is %x\n", frag);
+  		goto more;
+@@@ -1381,7 -1355,7 +1435,11 @@@ static void ceph_d_prune(struct dentry 
+  static ssize_t ceph_read_dir(struct file *file, char __user *buf, size_t size,
+  			     loff_t *ppos)
+  {
+++<<<<<<< HEAD
+ +	struct ceph_file_info *cf = file->private_data;
+++=======
++ 	struct ceph_dir_file_info *dfi = file->private_data;
+++>>>>>>> bb48bd4dc45f (ceph: optimize memory usage)
+  	struct inode *inode = file_inode(file);
+  	struct ceph_inode_info *ci = ceph_inode(inode);
+  	int left;
+@@@ -1390,12 -1364,12 +1448,21 @@@
+  	if (!ceph_test_mount_opt(ceph_sb_to_client(inode->i_sb), DIRSTAT))
+  		return -EISDIR;
+  
+++<<<<<<< HEAD
+ +	if (!cf->dir_info) {
+ +		cf->dir_info = kmalloc(bufsize, GFP_KERNEL);
+ +		if (!cf->dir_info)
+ +			return -ENOMEM;
+ +		cf->dir_info_len =
+ +			snprintf(cf->dir_info, bufsize,
+++=======
++ 	if (!dfi->dir_info) {
++ 		dfi->dir_info = kmalloc(bufsize, GFP_KERNEL);
++ 		if (!dfi->dir_info)
++ 			return -ENOMEM;
++ 		dfi->dir_info_len =
++ 			snprintf(dfi->dir_info, bufsize,
+++>>>>>>> bb48bd4dc45f (ceph: optimize memory usage)
+  				"entries:   %20lld\n"
+  				" files:    %20lld\n"
+  				" subdirs:  %20lld\n"
+@@@ -1415,10 -1389,10 +1482,17 @@@
+  				(long)ci->i_rctime.tv_nsec);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (*ppos >= cf->dir_info_len)
+ +		return 0;
+ +	size = min_t(unsigned, size, cf->dir_info_len-*ppos);
+ +	left = copy_to_user(buf, cf->dir_info + *ppos, size);
+++=======
++ 	if (*ppos >= dfi->dir_info_len)
++ 		return 0;
++ 	size = min_t(unsigned, size, dfi->dir_info_len-*ppos);
++ 	left = copy_to_user(buf, dfi->dir_info + *ppos, size);
+++>>>>>>> bb48bd4dc45f (ceph: optimize memory usage)
+  	if (left == size)
+  		return -EFAULT;
+  	*ppos += (size - left);
+diff --cc fs/ceph/file.c
+index 7fa7d870dbaf,4a92acba1e9c..000000000000
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@@ -172,24 -205,17 +210,34 @@@ static int ceph_init_file_info(struct i
+   */
+  static int ceph_init_file(struct inode *inode, struct file *file, int fmode)
+  {
+++<<<<<<< HEAD
+ +	struct ceph_file_info *cf;
+++=======
+++>>>>>>> bb48bd4dc45f (ceph: optimize memory usage)
+  	int ret = 0;
+  
+  	switch (inode->i_mode & S_IFMT) {
+  	case S_IFREG:
+ -		ceph_fscache_register_inode_cookie(inode);
+ -		ceph_fscache_file_set_cookie(inode, file);
+  	case S_IFDIR:
+++<<<<<<< HEAD
+ +		dout("init_file %p %p 0%o (regular)\n", inode, file,
+ +		     inode->i_mode);
+ +		cf = kmem_cache_zalloc(ceph_file_cachep, GFP_KERNEL);
+ +		if (!cf) {
+ +			ceph_put_fmode(ceph_inode(inode), fmode); /* clean up */
+ +			return -ENOMEM;
+ +		}
+ +		cf->fmode = fmode;
+ +		cf->next_offset = 2;
+ +		cf->readdir_cache_idx = -1;
+ +		file->private_data = cf;
+ +		BUG_ON(inode->i_fop->release != ceph_release);
+++=======
++ 		ret = ceph_init_file_info(inode, file, fmode,
++ 						S_ISDIR(inode->i_mode));
++ 		if (ret)
++ 			return ret;
+++>>>>>>> bb48bd4dc45f (ceph: optimize memory usage)
+  		break;
+  
+  	case S_IFLNK:
+@@@ -463,15 -487,27 +511,39 @@@ out_acl
+  int ceph_release(struct inode *inode, struct file *file)
+  {
+  	struct ceph_inode_info *ci = ceph_inode(inode);
+++<<<<<<< HEAD
+ +	struct ceph_file_info *cf = file->private_data;
+ +
+ +	dout("release inode %p file %p\n", inode, file);
+ +	ceph_put_fmode(ci, cf->fmode);
+ +	if (cf->last_readdir)
+ +		ceph_mdsc_put_request(cf->last_readdir);
+ +	kfree(cf->last_name);
+ +	kfree(cf->dir_info);
+ +	kmem_cache_free(ceph_file_cachep, cf);
+++=======
++ 
++ 	if (S_ISDIR(inode->i_mode)) {
++ 		struct ceph_dir_file_info *dfi = file->private_data;
++ 		dout("release inode %p dir file %p\n", inode, file);
++ 		WARN_ON(!list_empty(&dfi->file_info.rw_contexts));
++ 
++ 		ceph_put_fmode(ci, dfi->file_info.fmode);
++ 
++ 		if (dfi->last_readdir)
++ 			ceph_mdsc_put_request(dfi->last_readdir);
++ 		kfree(dfi->last_name);
++ 		kfree(dfi->dir_info);
++ 		kmem_cache_free(ceph_dir_file_cachep, dfi);
++ 	} else {
++ 		struct ceph_file_info *fi = file->private_data;
++ 		dout("release inode %p regular file %p\n", inode, file);
++ 		WARN_ON(!list_empty(&fi->rw_contexts));
++ 
++ 		ceph_put_fmode(ci, fi->fmode);
++ 		kmem_cache_free(ceph_file_cachep, fi);
++ 	}
+++>>>>>>> bb48bd4dc45f (ceph: optimize memory usage)
+  
+  	/* wake up anyone waiting for caps on this inode */
+  	wake_up_all(&ci->i_cap_wq);
+diff --cc fs/ceph/super.c
+index 536dc1096e03,0fc03c456c50..000000000000
+--- a/fs/ceph/super.c
++++ b/fs/ceph/super.c
+@@@ -700,8 -716,20 +701,25 @@@ static int __init init_caches(void
+  	if (!ceph_file_cachep)
+  		goto bad_file;
+  
+++<<<<<<< HEAD
+ +	return 0;
+ +
+++=======
++ 	ceph_dir_file_cachep = KMEM_CACHE(ceph_dir_file_info, SLAB_MEM_SPREAD);
++ 	if (!ceph_dir_file_cachep)
++ 		goto bad_dir_file;
++ 
++ 	error = ceph_fscache_register();
++ 	if (error)
++ 		goto bad_fscache;
++ 
++ 	return 0;
++ 
++ bad_fscache:
++ 	kmem_cache_destroy(ceph_dir_file_cachep);
++ bad_dir_file:
++ 	kmem_cache_destroy(ceph_file_cachep);
+++>>>>>>> bb48bd4dc45f (ceph: optimize memory usage)
+  bad_file:
+  	kmem_cache_destroy(ceph_dentry_cachep);
+  bad_dentry:
+@@@ -725,6 -754,9 +743,12 @@@ static void destroy_caches(void
+  	kmem_cache_destroy(ceph_cap_flush_cachep);
+  	kmem_cache_destroy(ceph_dentry_cachep);
+  	kmem_cache_destroy(ceph_file_cachep);
+++<<<<<<< HEAD
+++=======
++ 	kmem_cache_destroy(ceph_dir_file_cachep);
++ 
++ 	ceph_fscache_unregister();
+++>>>>>>> bb48bd4dc45f (ceph: optimize memory usage)
+  }
+  
+  
+diff --cc fs/ceph/super.h
+index 2ea6359d8d08,ff49433014e9..000000000000
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@@ -655,6 -669,13 +655,16 @@@ struct ceph_file_info 
+  	short fmode;     /* initialized on open */
+  	short flags;     /* CEPH_F_* */
+  
+++<<<<<<< HEAD
+++=======
++ 	spinlock_t rw_contexts_lock;
++ 	struct list_head rw_contexts;
++ };
++ 
++ struct ceph_dir_file_info {
++ 	struct ceph_file_info file_info;
++ 
+++>>>>>>> bb48bd4dc45f (ceph: optimize memory usage)
+  	/* readdir: position within the dir */
+  	u32 frag;
+  	struct ceph_mds_request *last_readdir;
+* Unmerged path fs/ceph/dir.c
+* Unmerged path fs/ceph/file.c
+* Unmerged path fs/ceph/super.c
+* Unmerged path fs/ceph/super.h
+diff --git a/include/linux/ceph/libceph.h b/include/linux/ceph/libceph.h
+index 6b9b5a06da0d..1aa005ed5275 100644
+--- a/include/linux/ceph/libceph.h
++++ b/include/linux/ceph/libceph.h
+@@ -261,6 +261,7 @@ extern struct kmem_cache *ceph_cap_cachep;
+ extern struct kmem_cache *ceph_cap_flush_cachep;
+ extern struct kmem_cache *ceph_dentry_cachep;
+ extern struct kmem_cache *ceph_file_cachep;
++extern struct kmem_cache *ceph_dir_file_cachep;
+ 
+ /* ceph_common.c */
+ extern bool libceph_compatible(void *data);
