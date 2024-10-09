@@ -1,0 +1,172 @@
+pnfs: Fix the check for requests in range of layout segment
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Benjamin Coddington <bcodding@redhat.com>
+commit 08cb5b0f058a325fcb5305e33f572ff6d6dfa289
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/08cb5b0f.failed
+
+It's possible and acceptable for NFS to attempt to add requests beyond the
+range of the current pgio->pg_lseg, a case which should be caught and
+limited by the pg_test operation.  However, the current handling of this
+case replaces pgio->pg_lseg with a new layout segment (after a WARN) within
+that pg_test operation.  That will cause all the previously added requests
+to be submitted with this new layout segment, which may not be valid for
+those requests.
+
+Fix this problem by only returning zero for the number of bytes to coalesce
+from pg_test for this case which allows any previously added requests to
+complete on the current layout segment.  The check for requests starting
+out of range of the layout segment moves to pg_init, so that the
+replacement of pgio->pg_lseg will be done when the next request is added.
+
+	Signed-off-by: Benjamin Coddington <bcodding@redhat.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 08cb5b0f058a325fcb5305e33f572ff6d6dfa289)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/pnfs.c
+#	fs/nfs/pnfs.h
+diff --cc fs/nfs/pnfs.c
+index 1e52deed4cab,c383d0913b54..000000000000
+--- a/fs/nfs/pnfs.c
++++ b/fs/nfs/pnfs.c
+@@@ -1808,10 -2084,36 +1808,42 @@@ void pnfs_error_mark_layout_for_return(
+  EXPORT_SYMBOL_GPL(pnfs_error_mark_layout_for_return);
+  
+  void
+++<<<<<<< HEAD
+++=======
++ pnfs_generic_pg_check_layout(struct nfs_pageio_descriptor *pgio)
++ {
++ 	if (pgio->pg_lseg == NULL ||
++ 	    test_bit(NFS_LSEG_VALID, &pgio->pg_lseg->pls_flags))
++ 		return;
++ 	pnfs_put_lseg(pgio->pg_lseg);
++ 	pgio->pg_lseg = NULL;
++ }
++ EXPORT_SYMBOL_GPL(pnfs_generic_pg_check_layout);
++ 
++ /*
++  * Check for any intersection between the request and the pgio->pg_lseg,
++  * and if none, put this pgio->pg_lseg away.
++  */
++ static void
++ pnfs_generic_pg_check_range(struct nfs_pageio_descriptor *pgio, struct nfs_page *req)
++ {
++ 	if (pgio->pg_lseg && !pnfs_lseg_request_intersecting(pgio->pg_lseg, req)) {
++ 		pnfs_put_lseg(pgio->pg_lseg);
++ 		pgio->pg_lseg = NULL;
++ 	}
++ }
++ 
++ void
+++>>>>>>> 08cb5b0f058a (pnfs: Fix the check for requests in range of layout segment)
+  pnfs_generic_pg_init_read(struct nfs_pageio_descriptor *pgio, struct nfs_page *req)
+  {
+  	u64 rd_size = req->wb_bytes;
+  
+++<<<<<<< HEAD
+++=======
++ 	pnfs_generic_pg_check_layout(pgio);
++ 	pnfs_generic_pg_check_range(pgio, req);
+++>>>>>>> 08cb5b0f058a (pnfs: Fix the check for requests in range of layout segment)
+  	if (pgio->pg_lseg == NULL) {
+  		if (pgio->pg_dreq == NULL)
+  			rd_size = i_size_read(pgio->pg_inode) - req_offset(req);
+@@@ -1841,6 -2144,8 +1873,11 @@@ voi
+  pnfs_generic_pg_init_write(struct nfs_pageio_descriptor *pgio,
+  			   struct nfs_page *req, u64 wb_size)
+  {
+++<<<<<<< HEAD
+++=======
++ 	pnfs_generic_pg_check_layout(pgio);
++ 	pnfs_generic_pg_check_range(pgio, req);
+++>>>>>>> 08cb5b0f058a (pnfs: Fix the check for requests in range of layout segment)
+  	if (pgio->pg_lseg == NULL) {
+  		pgio->pg_lseg = pnfs_update_layout(pgio->pg_inode,
+  						   req->wb_context,
+@@@ -1897,19 -2203,13 +1934,13 @@@ pnfs_generic_pg_test(struct nfs_pageio_
+  	 *
+  	 */
+  	if (pgio->pg_lseg) {
+ -		seg_end = pnfs_end_offset(pgio->pg_lseg->pls_range.offset,
+ +		seg_end = end_offset(pgio->pg_lseg->pls_range.offset,
+  				     pgio->pg_lseg->pls_range.length);
+  		req_start = req_offset(req);
+- 		WARN_ON_ONCE(req_start >= seg_end);
++ 
+  		/* start of request is past the last byte of this segment */
+- 		if (req_start >= seg_end) {
+- 			/* reference the new lseg */
+- 			if (pgio->pg_ops->pg_cleanup)
+- 				pgio->pg_ops->pg_cleanup(pgio);
+- 			if (pgio->pg_ops->pg_init)
+- 				pgio->pg_ops->pg_init(pgio, req);
++ 		if (req_start >= seg_end)
+  			return 0;
+- 		}
+  
+  		/* adjust 'size' iff there are fewer bytes left in the
+  		 * segment than what nfs_generic_pg_test returned */
+diff --cc fs/nfs/pnfs.h
+index 6a045d2d2293,99731e3e332f..000000000000
+--- a/fs/nfs/pnfs.h
++++ b/fs/nfs/pnfs.h
+@@@ -564,6 -561,48 +564,51 @@@ pnfs_copy_range(struct pnfs_layout_rang
+  	memcpy(dst, src, sizeof(*dst));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline u64
++ pnfs_end_offset(u64 start, u64 len)
++ {
++ 	if (NFS4_MAX_UINT64 - start <= len)
++ 		return NFS4_MAX_UINT64;
++ 	return start + len;
++ }
++ 
++ /*
++  * Are 2 ranges intersecting?
++  *   start1                             end1
++  *   [----------------------------------)
++  *                                start2           end2
++  *                                [----------------)
++  */
++ static inline bool
++ pnfs_is_range_intersecting(u64 start1, u64 end1, u64 start2, u64 end2)
++ {
++ 	return (end1 == NFS4_MAX_UINT64 || start2 < end1) &&
++ 		(end2 == NFS4_MAX_UINT64 || start1 < end2);
++ }
++ 
++ static inline bool
++ pnfs_lseg_range_intersecting(const struct pnfs_layout_range *l1,
++ 		const struct pnfs_layout_range *l2)
++ {
++ 	u64 end1 = pnfs_end_offset(l1->offset, l1->length);
++ 	u64 end2 = pnfs_end_offset(l2->offset, l2->length);
++ 
++ 	return pnfs_is_range_intersecting(l1->offset, end1, l2->offset, end2);
++ }
++ 
++ static inline bool
++ pnfs_lseg_request_intersecting(struct pnfs_layout_segment *lseg, struct nfs_page *req)
++ {
++ 	u64 seg_last = pnfs_end_offset(lseg->pls_range.offset, lseg->pls_range.length);
++ 	u64 req_last = req_offset(req) + req->wb_bytes;
++ 
++ 	return pnfs_is_range_intersecting(lseg->pls_range.offset, seg_last,
++ 				req_offset(req), req_last);
++ }
++ 
+++>>>>>>> 08cb5b0f058a (pnfs: Fix the check for requests in range of layout segment)
+  extern unsigned int layoutstats_timer;
+  
+  #ifdef NFS_DEBUG
+* Unmerged path fs/nfs/pnfs.c
+* Unmerged path fs/nfs/pnfs.h
