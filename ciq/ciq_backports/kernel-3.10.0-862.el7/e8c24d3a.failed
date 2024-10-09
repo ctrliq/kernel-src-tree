@@ -1,0 +1,563 @@
+x86/pkeys: Allocation/free syscalls
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit e8c24d3a23a469f1f40d4de24d872ca7023ced0a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e8c24d3a.failed
+
+This patch adds two new system calls:
+
+	int pkey_alloc(unsigned long flags, unsigned long init_access_rights)
+	int pkey_free(int pkey);
+
+These implement an "allocator" for the protection keys
+themselves, which can be thought of as analogous to the allocator
+that the kernel has for file descriptors.  The kernel tracks
+which numbers are in use, and only allows operations on keys that
+are valid.  A key which was not obtained by pkey_alloc() may not,
+for instance, be passed to pkey_mprotect().
+
+These system calls are also very important given the kernel's use
+of pkeys to implement execute-only support.  These help ensure
+that userspace can never assume that it has control of a key
+unless it first asks the kernel.  The kernel does not promise to
+preserve PKRU (right register) contents except for allocated
+pkeys.
+
+The 'init_access_rights' argument to pkey_alloc() specifies the
+rights that will be established for the returned pkey.  For
+instance:
+
+	pkey = pkey_alloc(flags, PKEY_DENY_WRITE);
+
+will allocate 'pkey', but also sets the bits in PKRU[1] such that
+writing to 'pkey' is already denied.
+
+The kernel does not prevent pkey_free() from successfully freeing
+in-use pkeys (those still assigned to a memory range by
+pkey_mprotect()).  It would be expensive to implement the checks
+for this, so we instead say, "Just don't do it" since sane
+software will never do it anyway.
+
+Any piece of userspace calling pkey_alloc() needs to be prepared
+for it to fail.  Why?  pkey_alloc() returns the same error code
+(ENOSPC) when there are no pkeys and when pkeys are unsupported.
+They can be unsupported for a whole host of reasons, so apps must
+be prepared for this.  Also, libraries or LD_PRELOADs might steal
+keys before an application gets access to them.
+
+This allocation mechanism could be implemented in userspace.
+Even if we did it in userspace, we would still need additional
+user/kernel interfaces to tell userspace which keys are being
+used by the kernel internally (such as for execute-only
+mappings).  Having the kernel provide this facility completely
+removes the need for these additional interfaces, or having an
+implementation of this in userspace at all.
+
+Note that we have to make changes to all of the architectures
+that do not use mman-common.h because we use the new
+PKEY_DENY_ACCESS/WRITE macros in arch-independent code.
+
+1. PKRU is the Protection Key Rights User register.  It is a
+   usermode-accessible register that controls whether writes
+   and/or access to each individual pkey is allowed or denied.
+
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Acked-by: Mel Gorman <mgorman@techsingularity.net>
+	Cc: linux-arch@vger.kernel.org
+	Cc: Dave Hansen <dave@sr71.net>
+	Cc: arnd@arndb.de
+	Cc: linux-api@vger.kernel.org
+	Cc: linux-mm@kvack.org
+	Cc: luto@kernel.org
+	Cc: akpm@linux-foundation.org
+	Cc: torvalds@linux-foundation.org
+Link: http://lkml.kernel.org/r/20160729163015.444FE75F@viggo.jf.intel.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+(cherry picked from commit e8c24d3a23a469f1f40d4de24d872ca7023ced0a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/mmu.h
+#	arch/x86/include/asm/mmu_context.h
+#	arch/x86/include/asm/pkeys.h
+#	arch/x86/kernel/fpu/xstate.c
+#	arch/x86/mm/pkeys.c
+#	include/linux/pkeys.h
+#	mm/mprotect.c
+diff --cc arch/x86/include/asm/mmu.h
+index 5f55e6962769,72198c64e646..000000000000
+--- a/arch/x86/include/asm/mmu.h
++++ b/arch/x86/include/asm/mmu.h
+@@@ -18,7 -19,18 +18,22 @@@ typedef struct 
+  #endif
+  
+  	struct mutex lock;
+++<<<<<<< HEAD
+ +	void *vdso;
+++=======
++ 	void __user *vdso;			/* vdso base address */
++ 	const struct vdso_image *vdso_image;	/* vdso image in use */
++ 
++ 	atomic_t perf_rdpmc_allowed;	/* nonzero if rdpmc is allowed */
++ #ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS
++ 	/*
++ 	 * One bit per protection key says whether userspace can
++ 	 * use it or not.  protected by mmap_sem.
++ 	 */
++ 	u16 pkey_allocation_map;
++ 	s16 execute_only_pkey;
++ #endif
+++>>>>>>> e8c24d3a23a4 (x86/pkeys: Allocation/free syscalls)
+  } mm_context_t;
+  
+  #ifdef CONFIG_SMP
+diff --cc arch/x86/include/asm/mmu_context.h
+index a34c7d411865,8e0a9fe86de4..000000000000
+--- a/arch/x86/include/asm/mmu_context.h
++++ b/arch/x86/include/asm/mmu_context.h
+@@@ -31,83 -105,32 +31,102 @@@ static inline void enter_lazy_tlb(struc
+  #endif
+  }
+  
+ -static inline int init_new_context(struct task_struct *tsk,
+ -				   struct mm_struct *mm)
+ +static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+ +			     struct task_struct *tsk)
+  {
+++<<<<<<< HEAD
+ +	unsigned cpu = smp_processor_id();
+++=======
++ 	#ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS
++ 	if (cpu_feature_enabled(X86_FEATURE_OSPKE)) {
++ 		/* pkey 0 is the default and always allocated */
++ 		mm->context.pkey_allocation_map = 0x1;
++ 		/* -1 means unallocated or invalid */
++ 		mm->context.execute_only_pkey = -1;
++ 	}
++ 	#endif
++ 	init_new_context_ldt(tsk, mm);
++ 
++ 	return 0;
++ }
++ static inline void destroy_context(struct mm_struct *mm)
++ {
++ 	destroy_context_ldt(mm);
++ }
+++>>>>>>> e8c24d3a23a4 (x86/pkeys: Allocation/free syscalls)
+  
+ -extern void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+ -		      struct task_struct *tsk);
+ -
+ -extern void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
+ -			       struct task_struct *tsk);
+ -#define switch_mm_irqs_off switch_mm_irqs_off
+ +	if (likely(prev != next)) {
+ +#ifdef CONFIG_SMP
+ +		this_cpu_write(cpu_tlbstate.state, TLBSTATE_OK);
+ +		this_cpu_write(cpu_tlbstate.active_mm, next);
+ +#endif
+ +		cpumask_set_cpu(cpu, mm_cpumask(next));
+ +
+ +		/*
+ +		 * Re-load page tables.
+ +		 *
+ +		 * This logic has an ordering constraint:
+ +		 *
+ +		 *  CPU 0: Write to a PTE for 'next'
+ +		 *  CPU 0: load bit 1 in mm_cpumask.  if nonzero, send IPI.
+ +		 *  CPU 1: set bit 1 in next's mm_cpumask
+ +		 *  CPU 1: load from the PTE that CPU 0 writes (implicit)
+ +		 *
+ +		 * We need to prevent an outcome in which CPU 1 observes
+ +		 * the new PTE value and CPU 0 observes bit 1 clear in
+ +		 * mm_cpumask.  (If that occurs, then the IPI will never
+ +		 * be sent, and CPU 0's TLB will contain a stale entry.)
+ +		 *
+ +		 * The bad outcome can occur if either CPU's load is
+ +		 * reordered before that CPU's store, so both CPUs must
+ +		 * execute full barriers to prevent this from happening.
+ +		 *
+ +		 * Thus, switch_mm needs a full barrier between the
+ +		 * store to mm_cpumask and any operation that could load
+ +		 * from next->pgd.  TLB fills are special and can happen
+ +		 * due to instruction fetches or for no reason at all,
+ +		 * and neither LOCK nor MFENCE orders them.
+ +		 * Fortunately, load_cr3() is serializing and gives the
+ +		 * ordering guarantee we need.
+ +		 *
+ +		 */
+ +		load_cr3(next->pgd);
+ +
+ +		/* Stop flush ipis for the previous mm */
+ +		cpumask_clear_cpu(cpu, mm_cpumask(prev));
+ +
+ +		/* Load the LDT, if the LDT is different: */
+ +		if (unlikely(prev->context.ldt != next->context.ldt))
+ +			load_LDT_nolock(&next->context);
+ +	}
+ +#ifdef CONFIG_SMP
+ +	  else {
+ +		this_cpu_write(cpu_tlbstate.state, TLBSTATE_OK);
+ +		BUG_ON(this_cpu_read(cpu_tlbstate.active_mm) != next);
+ +
+ +		if (!cpumask_test_cpu(cpu, mm_cpumask(next))) {
+ +			/*
+ +			 * On established mms, the mm_cpumask is only changed
+ +			 * from irq context, from ptep_clear_flush() while in
+ +			 * lazy tlb mode, and here. Irqs are blocked during
+ +			 * schedule, protecting us from simultaneous changes.
+ +			 */
+ +			cpumask_set_cpu(cpu, mm_cpumask(next));
+ +
+ +			/*
+ +			 * We were in lazy tlb mode and leave_mm disabled
+ +			 * tlb flush IPI delivery. We must reload CR3
+ +			 * to make sure to use no freed page tables.
+ +			 *
+ +			 * As above, load_cr3() is serializing and orders TLB
+ +			 * fills with respect to the mm_cpumask write.
+ +			 */
+ +			load_cr3(next->pgd);
+ +			load_LDT_nolock(&next->context);
+ +		}
+ +	}
+ +#endif
+ +}
+  
+  #define activate_mm(prev, next)			\
+  do {						\
+@@@ -150,7 -184,92 +169,6 @@@ static inline void arch_bprm_mm_init(st
+  static inline void arch_unmap(struct mm_struct *mm, struct vm_area_struct *vma,
+  			      unsigned long start, unsigned long end)
+  {
+ -	/*
+ -	 * mpx_notify_unmap() goes and reads a rarely-hot
+ -	 * cacheline in the mm_struct.  That can be expensive
+ -	 * enough to be seen in profiles.
+ -	 *
+ -	 * The mpx_notify_unmap() call and its contents have been
+ -	 * observed to affect munmap() performance on hardware
+ -	 * where MPX is not present.
+ -	 *
+ -	 * The unlikely() optimizes for the fast case: no MPX
+ -	 * in the CPU, or no MPX use in the process.  Even if
+ -	 * we get this wrong (in the unlikely event that MPX
+ -	 * is widely enabled on some system) the overhead of
+ -	 * MPX itself (reading bounds tables) is expected to
+ -	 * overwhelm the overhead of getting this unlikely()
+ -	 * consistently wrong.
+ -	 */
+ -	if (unlikely(cpu_feature_enabled(X86_FEATURE_MPX)))
+ -		mpx_notify_unmap(mm, vma, start, end);
+ -}
+ -
+ -#ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS
+ -static inline int vma_pkey(struct vm_area_struct *vma)
+ -{
+ -	unsigned long vma_pkey_mask = VM_PKEY_BIT0 | VM_PKEY_BIT1 |
+ -				      VM_PKEY_BIT2 | VM_PKEY_BIT3;
+ -
+ -	return (vma->vm_flags & vma_pkey_mask) >> VM_PKEY_SHIFT;
+ -}
+ -#else
+ -static inline int vma_pkey(struct vm_area_struct *vma)
+ -{
+ -	return 0;
+ -}
+ -#endif
+ -
+ -static inline bool __pkru_allows_pkey(u16 pkey, bool write)
+ -{
+ -	u32 pkru = read_pkru();
+ -
+ -	if (!__pkru_allows_read(pkru, pkey))
+ -		return false;
+ -	if (write && !__pkru_allows_write(pkru, pkey))
+ -		return false;
+ -
+ -	return true;
+ -}
+ -
+ -/*
+ - * We only want to enforce protection keys on the current process
+ - * because we effectively have no access to PKRU for other
+ - * processes or any way to tell *which * PKRU in a threaded
+ - * process we could use.
+ - *
+ - * So do not enforce things if the VMA is not from the current
+ - * mm, or if we are in a kernel thread.
+ - */
+ -static inline bool vma_is_foreign(struct vm_area_struct *vma)
+ -{
+ -	if (!current->mm)
+ -		return true;
+ -	/*
+ -	 * Should PKRU be enforced on the access to this VMA?  If
+ -	 * the VMA is from another process, then PKRU has no
+ -	 * relevance and should not be enforced.
+ -	 */
+ -	if (current->mm != vma->vm_mm)
+ -		return true;
+ -
+ -	return false;
+ -}
+ -
+ -static inline bool arch_vma_access_permitted(struct vm_area_struct *vma,
+ -		bool write, bool execute, bool foreign)
+ -{
+ -	/* pkeys never affect instruction fetches */
+ -	if (execute)
+ -		return true;
+ -	/* allow access if the VMA is not one from this process */
+ -	if (foreign || vma_is_foreign(vma))
+ -		return true;
+ -	return __pkru_allows_pkey(vma_pkey(vma), write);
+ -}
+ -
+ -static inline bool arch_pte_access_permitted(pte_t pte, bool write)
+ -{
+ -	return __pkru_allows_pkey(pte_flags_pkey(pte_flags(pte)), write);
+ +	mpx_notify_unmap(mm, vma, start, end);
+  }
+- 
+  #endif /* _ASM_X86_MMU_CONTEXT_H */
+diff --cc mm/mprotect.c
+index 12cbcc768180,7b35ee3894ee..000000000000
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@@ -23,12 -23,45 +23,14 @@@
+  #include <linux/mmu_notifier.h>
+  #include <linux/migrate.h>
+  #include <linux/perf_event.h>
++ #include <linux/pkeys.h>
+  #include <linux/ksm.h>
+ -#include <linux/pkeys.h>
+  #include <asm/uaccess.h>
+  #include <asm/pgtable.h>
+  #include <asm/cacheflush.h>
++ #include <asm/mmu_context.h>
+  #include <asm/tlbflush.h>
+  
+ -#include "internal.h"
+ -
+ -/*
+ - * For a prot_numa update we only hold mmap_sem for read so there is a
+ - * potential race with faulting where a pmd was temporarily none. This
+ - * function checks for a transhuge pmd under the appropriate lock. It
+ - * returns a pte if it was successfully locked or NULL if it raced with
+ - * a transhuge insertion.
+ - */
+ -static pte_t *lock_pte_protection(struct vm_area_struct *vma, pmd_t *pmd,
+ -			unsigned long addr, int prot_numa, spinlock_t **ptl)
+ -{
+ -	pte_t *pte;
+ -	spinlock_t *pmdl;
+ -
+ -	/* !prot_numa is protected by mmap_sem held for write */
+ -	if (!prot_numa)
+ -		return pte_offset_map_lock(vma->vm_mm, pmd, addr, ptl);
+ -
+ -	pmdl = pmd_lock(vma->vm_mm, pmd);
+ -	if (unlikely(pmd_trans_huge(*pmd) || pmd_none(*pmd))) {
+ -		spin_unlock(pmdl);
+ -		return NULL;
+ -	}
+ -
+ -	pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, ptl);
+ -	spin_unlock(pmdl);
+ -	return pte;
+ -}
+ -
+  static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+  		unsigned long addr, unsigned long end, pgprot_t newprot,
+  		int dirty_accountable, int prot_numa)
+@@@ -339,6 -364,9 +341,12 @@@ SYSCALL_DEFINE3(mprotect, unsigned long
+  	struct vm_area_struct *vma, *prev;
+  	int error = -EINVAL;
+  	const int grows = prot & (PROT_GROWSDOWN|PROT_GROWSUP);
+++<<<<<<< HEAD
+++=======
++ 	const bool rier = (current->personality & READ_IMPLIES_EXEC) &&
++ 				(prot & PROT_READ);
++ 
+++>>>>>>> e8c24d3a23a4 (x86/pkeys: Allocation/free syscalls)
+  	prot &= ~(PROT_GROWSDOWN|PROT_GROWSUP);
+  	if (grows == (PROT_GROWSDOWN|PROT_GROWSUP)) /* can't be both */
+  		return -EINVAL;
+@@@ -355,16 -383,18 +363,24 @@@
+  		return -EINVAL;
+  
+  	reqprot = prot;
+ +	/*
+ +	 * Does the application expect PROT_READ to imply PROT_EXEC:
+ +	 */
+ +	if ((prot & PROT_READ) && (current->personality & READ_IMPLIES_EXEC))
+ +		prot |= PROT_EXEC;
+ +
+ +	vm_flags = calc_vm_prot_bits(prot);
+  
+ -	if (down_write_killable(&current->mm->mmap_sem))
+ -		return -EINTR;
+ +	down_write(&current->mm->mmap_sem);
+  
++ 	/*
++ 	 * If userspace did not allocate the pkey, do not let
++ 	 * them use it here.
++ 	 */
++ 	error = -EINVAL;
++ 	if ((pkey != -1) && !mm_pkey_is_allocated(current->mm, pkey))
++ 		goto out;
++ 
+  	vma = find_vma(current->mm, start);
+  	error = -ENOMEM;
+  	if (!vma)
+@@@ -431,3 -477,60 +447,63 @@@ out
+  	up_write(&current->mm->mmap_sem);
+  	return error;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ SYSCALL_DEFINE3(mprotect, unsigned long, start, size_t, len,
++ 		unsigned long, prot)
++ {
++ 	return do_mprotect_pkey(start, len, prot, -1);
++ }
++ 
++ SYSCALL_DEFINE4(pkey_mprotect, unsigned long, start, size_t, len,
++ 		unsigned long, prot, int, pkey)
++ {
++ 	return do_mprotect_pkey(start, len, prot, pkey);
++ }
++ 
++ SYSCALL_DEFINE2(pkey_alloc, unsigned long, flags, unsigned long, init_val)
++ {
++ 	int pkey;
++ 	int ret;
++ 
++ 	/* No flags supported yet. */
++ 	if (flags)
++ 		return -EINVAL;
++ 	/* check for unsupported init values */
++ 	if (init_val & ~PKEY_ACCESS_MASK)
++ 		return -EINVAL;
++ 
++ 	down_write(&current->mm->mmap_sem);
++ 	pkey = mm_pkey_alloc(current->mm);
++ 
++ 	ret = -ENOSPC;
++ 	if (pkey == -1)
++ 		goto out;
++ 
++ 	ret = arch_set_user_pkey_access(current, pkey, init_val);
++ 	if (ret) {
++ 		mm_pkey_free(current->mm, pkey);
++ 		goto out;
++ 	}
++ 	ret = pkey;
++ out:
++ 	up_write(&current->mm->mmap_sem);
++ 	return ret;
++ }
++ 
++ SYSCALL_DEFINE1(pkey_free, int, pkey)
++ {
++ 	int ret;
++ 
++ 	down_write(&current->mm->mmap_sem);
++ 	ret = mm_pkey_free(current->mm, pkey);
++ 	up_write(&current->mm->mmap_sem);
++ 
++ 	/*
++ 	 * We could provie warnings or errors if any VMA still
++ 	 * has the pkey set here.
++ 	 */
++ 	return ret;
++ }
+++>>>>>>> e8c24d3a23a4 (x86/pkeys: Allocation/free syscalls)
+* Unmerged path arch/x86/include/asm/pkeys.h
+* Unmerged path arch/x86/kernel/fpu/xstate.c
+* Unmerged path arch/x86/mm/pkeys.c
+* Unmerged path include/linux/pkeys.h
+diff --git a/arch/alpha/include/uapi/asm/mman.h b/arch/alpha/include/uapi/asm/mman.h
+index 0086b472bc2b..37737ee38a3c 100644
+--- a/arch/alpha/include/uapi/asm/mman.h
++++ b/arch/alpha/include/uapi/asm/mman.h
+@@ -74,4 +74,9 @@
+ #define MAP_HUGE_SHIFT	26
+ #define MAP_HUGE_MASK	0x3f
+ 
++#define PKEY_DISABLE_ACCESS	0x1
++#define PKEY_DISABLE_WRITE	0x2
++#define PKEY_ACCESS_MASK	(PKEY_DISABLE_ACCESS |\
++				 PKEY_DISABLE_WRITE)
++
+ #endif /* __ALPHA_MMAN_H__ */
+diff --git a/arch/mips/include/uapi/asm/mman.h b/arch/mips/include/uapi/asm/mman.h
+index cfcb876cae6b..c3879d8f78cc 100644
+--- a/arch/mips/include/uapi/asm/mman.h
++++ b/arch/mips/include/uapi/asm/mman.h
+@@ -98,4 +98,9 @@
+ #define MAP_HUGE_SHIFT	26
+ #define MAP_HUGE_MASK	0x3f
+ 
++#define PKEY_DISABLE_ACCESS	0x1
++#define PKEY_DISABLE_WRITE	0x2
++#define PKEY_ACCESS_MASK	(PKEY_DISABLE_ACCESS |\
++				 PKEY_DISABLE_WRITE)
++
+ #endif /* _ASM_MMAN_H */
+diff --git a/arch/parisc/include/uapi/asm/mman.h b/arch/parisc/include/uapi/asm/mman.h
+index 294d251ca7b2..42665c5a93a6 100644
+--- a/arch/parisc/include/uapi/asm/mman.h
++++ b/arch/parisc/include/uapi/asm/mman.h
+@@ -81,4 +81,9 @@
+ #define MAP_HUGE_SHIFT	26
+ #define MAP_HUGE_MASK	0x3f
+ 
++#define PKEY_DISABLE_ACCESS	0x1
++#define PKEY_DISABLE_WRITE	0x2
++#define PKEY_ACCESS_MASK	(PKEY_DISABLE_ACCESS |\
++				 PKEY_DISABLE_WRITE)
++
+ #endif /* __PARISC_MMAN_H__ */
+* Unmerged path arch/x86/include/asm/mmu.h
+* Unmerged path arch/x86/include/asm/mmu_context.h
+* Unmerged path arch/x86/include/asm/pkeys.h
+* Unmerged path arch/x86/kernel/fpu/xstate.c
+* Unmerged path arch/x86/mm/pkeys.c
+diff --git a/arch/xtensa/include/uapi/asm/mman.h b/arch/xtensa/include/uapi/asm/mman.h
+index 00eed6786d7e..9de1a756ce77 100644
+--- a/arch/xtensa/include/uapi/asm/mman.h
++++ b/arch/xtensa/include/uapi/asm/mman.h
+@@ -104,4 +104,9 @@
+ #define MAP_HUGE_SHIFT	26
+ #define MAP_HUGE_MASK	0x3f
+ 
++#define PKEY_DISABLE_ACCESS	0x1
++#define PKEY_DISABLE_WRITE	0x2
++#define PKEY_ACCESS_MASK	(PKEY_DISABLE_ACCESS |\
++				 PKEY_DISABLE_WRITE)
++
+ #endif /* _XTENSA_MMAN_H */
+* Unmerged path include/linux/pkeys.h
+diff --git a/include/uapi/asm-generic/mman-common.h b/include/uapi/asm-generic/mman-common.h
+index 4164529a94f9..2c8ab0e60aae 100644
+--- a/include/uapi/asm-generic/mman-common.h
++++ b/include/uapi/asm-generic/mman-common.h
+@@ -66,4 +66,9 @@
+ #define MAP_HUGE_SHIFT	26
+ #define MAP_HUGE_MASK	0x3f
+ 
++#define PKEY_DISABLE_ACCESS	0x1
++#define PKEY_DISABLE_WRITE	0x2
++#define PKEY_ACCESS_MASK	(PKEY_DISABLE_ACCESS |\
++				 PKEY_DISABLE_WRITE)
++
+ #endif /* __ASM_GENERIC_MMAN_COMMON_H */
+* Unmerged path mm/mprotect.c
