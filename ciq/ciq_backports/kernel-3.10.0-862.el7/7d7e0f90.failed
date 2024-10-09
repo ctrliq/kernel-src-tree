@@ -1,0 +1,632 @@
+blk-mq: remove ->map_queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 7d7e0f90b70f6c5367c2d1c9a7e87dd228bd0816
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7d7e0f90.failed
+
+All drivers use the default, so provide an inline version of it.  If we
+ever need other queue mapping we can add an optional method back,
+although supporting will also require major changes to the queue setup
+code.
+
+This provides better code generation, and better debugability as well.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 7d7e0f90b70f6c5367c2d1c9a7e87dd228bd0816)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/loop.c
+#	drivers/block/xen-blkfront.c
+#	drivers/mtd/ubi/block.c
+#	include/linux/blk-mq.h
+diff --cc drivers/block/loop.c
+index d5de459aa504,cbdb3b162718..000000000000
+--- a/drivers/block/loop.c
++++ b/drivers/block/loop.c
+@@@ -1619,6 -1637,75 +1619,78 @@@ int loop_unregister_transfer(int number
+  EXPORT_SYMBOL(loop_register_transfer);
+  EXPORT_SYMBOL(loop_unregister_transfer);
+  
+++<<<<<<< HEAD
+++=======
++ static int loop_queue_rq(struct blk_mq_hw_ctx *hctx,
++ 		const struct blk_mq_queue_data *bd)
++ {
++ 	struct loop_cmd *cmd = blk_mq_rq_to_pdu(bd->rq);
++ 	struct loop_device *lo = cmd->rq->q->queuedata;
++ 
++ 	blk_mq_start_request(bd->rq);
++ 
++ 	if (lo->lo_state != Lo_bound)
++ 		return -EIO;
++ 
++ 	switch (req_op(cmd->rq)) {
++ 	case REQ_OP_FLUSH:
++ 	case REQ_OP_DISCARD:
++ 		cmd->use_aio = false;
++ 		break;
++ 	default:
++ 		cmd->use_aio = lo->use_dio;
++ 		break;
++ 	}
++ 
++ 	queue_kthread_work(&lo->worker, &cmd->work);
++ 
++ 	return BLK_MQ_RQ_QUEUE_OK;
++ }
++ 
++ static void loop_handle_cmd(struct loop_cmd *cmd)
++ {
++ 	const bool write = op_is_write(req_op(cmd->rq));
++ 	struct loop_device *lo = cmd->rq->q->queuedata;
++ 	int ret = 0;
++ 
++ 	if (write && (lo->lo_flags & LO_FLAGS_READ_ONLY)) {
++ 		ret = -EIO;
++ 		goto failed;
++ 	}
++ 
++ 	ret = do_req_filebacked(lo, cmd->rq);
++  failed:
++ 	/* complete non-aio request */
++ 	if (!cmd->use_aio || ret)
++ 		blk_mq_complete_request(cmd->rq, ret ? -EIO : 0);
++ }
++ 
++ static void loop_queue_work(struct kthread_work *work)
++ {
++ 	struct loop_cmd *cmd =
++ 		container_of(work, struct loop_cmd, work);
++ 
++ 	loop_handle_cmd(cmd);
++ }
++ 
++ static int loop_init_request(void *data, struct request *rq,
++ 		unsigned int hctx_idx, unsigned int request_idx,
++ 		unsigned int numa_node)
++ {
++ 	struct loop_cmd *cmd = blk_mq_rq_to_pdu(rq);
++ 
++ 	cmd->rq = rq;
++ 	init_kthread_work(&cmd->work, loop_queue_work);
++ 
++ 	return 0;
++ }
++ 
++ static struct blk_mq_ops loop_mq_ops = {
++ 	.queue_rq       = loop_queue_rq,
++ 	.init_request	= loop_init_request,
++ };
++ 
+++>>>>>>> 7d7e0f90b70f (blk-mq: remove ->map_queue)
+  static int loop_add(struct loop_device **l, int i)
+  {
+  	struct loop_device *lo;
+diff --cc drivers/block/xen-blkfront.c
+index 5cb25b62d3a8,9908597c5209..000000000000
+--- a/drivers/block/xen-blkfront.c
++++ b/drivers/block/xen-blkfront.c
+@@@ -597,70 -866,57 +597,78 @@@ static inline bool blkif_request_flush_
+  					       struct blkfront_info *info)
+  {
+  	return ((req->cmd_type != REQ_TYPE_FS) ||
+ -		((req_op(req) == REQ_OP_FLUSH) &&
+ -		 !info->feature_flush) ||
+ +		((req->cmd_flags & REQ_FLUSH) &&
+ +		 !(info->feature_flush & REQ_FLUSH)) ||
+  		((req->cmd_flags & REQ_FUA) &&
+ -		 !info->feature_fua));
+ +		 !(info->feature_flush & REQ_FUA)));
+  }
+  
+ -static int blkif_queue_rq(struct blk_mq_hw_ctx *hctx,
+ -			  const struct blk_mq_queue_data *qd)
+ +/*
+ + * do_blkif_request
+ + *  read a block; request is in a request queue
+ + */
+ +static void do_blkif_request(struct request_queue *rq)
+  {
+ -	unsigned long flags;
+ -	int qid = hctx->queue_num;
+ -	struct blkfront_info *info = hctx->queue->queuedata;
+ -	struct blkfront_ring_info *rinfo = NULL;
+ -
+ -	BUG_ON(info->nr_rings <= qid);
+ -	rinfo = &info->rinfo[qid];
+ -	blk_mq_start_request(qd->rq);
+ -	spin_lock_irqsave(&rinfo->ring_lock, flags);
+ -	if (RING_FULL(&rinfo->ring))
+ -		goto out_busy;
+ -
+ -	if (blkif_request_flush_invalid(qd->rq, rinfo->dev_info))
+ -		goto out_err;
+ -
+ -	if (blkif_queue_request(qd->rq, rinfo))
+ -		goto out_busy;
+ -
+ -	flush_requests(rinfo);
+ -	spin_unlock_irqrestore(&rinfo->ring_lock, flags);
+ -	return BLK_MQ_RQ_QUEUE_OK;
+ -
+ -out_err:
+ -	spin_unlock_irqrestore(&rinfo->ring_lock, flags);
+ -	return BLK_MQ_RQ_QUEUE_ERROR;
+ -
+ -out_busy:
+ -	spin_unlock_irqrestore(&rinfo->ring_lock, flags);
+ -	blk_mq_stop_hw_queue(hctx);
+ -	return BLK_MQ_RQ_QUEUE_BUSY;
+ +	struct blkfront_info *info = NULL;
+ +	struct request *req;
+ +	int queued;
+ +
+ +	pr_debug("Entered do_blkif_request\n");
+ +
+ +	queued = 0;
+ +
+ +	while ((req = blk_peek_request(rq)) != NULL) {
+ +		info = req->rq_disk->private_data;
+ +
+ +		if (RING_FULL(&info->ring))
+ +			goto wait;
+ +
+ +		blk_start_request(req);
+ +
+ +		if (blkif_request_flush_invalid(req, info)) {
+ +			__blk_end_request_all(req, -EOPNOTSUPP);
+ +			continue;
+ +		}
+ +
+ +		pr_debug("do_blk_req %p: cmd %p, sec %lx, "
+ +			 "(%u/%u) buffer:%p [%s]\n",
+ +			 req, req->cmd, (unsigned long)blk_rq_pos(req),
+ +			 blk_rq_cur_sectors(req), blk_rq_sectors(req),
+ +			 req->buffer, rq_data_dir(req) ? "write" : "read");
+ +
+ +		if (blkif_queue_request(req)) {
+ +			blk_requeue_request(rq, req);
+ +wait:
+ +			/* Avoid pointless unplugs. */
+ +			blk_stop_queue(rq);
+ +			break;
+ +		}
+ +
+ +		queued++;
+ +	}
+ +
+ +	if (queued != 0)
+ +		flush_requests(info);
+  }
+  
+++<<<<<<< HEAD
+ +static int xlvbd_init_blk_queue(struct gendisk *gd, u16 sector_size,
+ +				unsigned int physical_sector_size,
+ +				unsigned int segments)
+++=======
++ static struct blk_mq_ops blkfront_mq_ops = {
++ 	.queue_rq = blkif_queue_rq,
++ };
++ 
++ static void blkif_set_queue_limits(struct blkfront_info *info)
+++>>>>>>> 7d7e0f90b70f (blk-mq: remove ->map_queue)
+  {
+ -	struct request_queue *rq = info->rq;
+ -	struct gendisk *gd = info->gd;
+ -	unsigned int segments = info->max_indirect_segments ? :
+ -				BLKIF_MAX_SEGMENTS_PER_REQUEST;
+ +	struct request_queue *rq;
+ +	struct blkfront_info *info = gd->private_data;
+ +
+ +	rq = blk_init_queue(do_blkif_request, &info->io_lock);
+ +	if (rq == NULL)
+ +		return -1;
+  
+  	queue_flag_set_unlocked(QUEUE_FLAG_VIRT, rq);
+  
+diff --cc include/linux/blk-mq.h
+index 7a19eb11b858,f01379f2b0ac..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -117,18 -90,7 +117,21 @@@ struct blk_mq_queue_data 
+  	bool last;
+  };
+  
+ +/* None of these function pointers are covered by RHEL kABI */
+ +#ifdef __GENKSYMS__
+ +typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, struct request *);
+ +#else
+  typedef int (queue_rq_fn)(struct blk_mq_hw_ctx *, const struct blk_mq_queue_data *);
+++<<<<<<< HEAD
+ +#endif
+ +
+ +typedef struct blk_mq_hw_ctx *(map_queue_fn)(struct request_queue *, const int);
+ +#ifdef __GENKSYMS__
+ +typedef struct blk_mq_hw_ctx *(alloc_hctx_fn)(struct blk_mq_reg *,unsigned int);
+ +typedef void (free_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
+ +#endif
+++=======
+++>>>>>>> 7d7e0f90b70f (blk-mq: remove ->map_queue)
+  typedef enum blk_eh_timer_return (timeout_fn)(struct request *, bool);
+  typedef int (init_hctx_fn)(struct blk_mq_hw_ctx *, void *, unsigned int);
+  typedef void (exit_hctx_fn)(struct blk_mq_hw_ctx *, unsigned int);
+@@@ -259,8 -217,6 +257,11 @@@ static inline u16 blk_mq_unique_tag_to_
+  	return unique_tag & BLK_MQ_UNIQUE_TAG_MASK;
+  }
+  
+++<<<<<<< HEAD
+ +struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *, const int ctx_index);
+ +struct blk_mq_hw_ctx *blk_mq_alloc_single_hw_queue(struct blk_mq_tag_set *, unsigned int, int);
+++=======
+++>>>>>>> 7d7e0f90b70f (blk-mq: remove ->map_queue)
+  
+  int blk_mq_request_started(struct request *rq);
+  void blk_mq_start_request(struct request *rq);
+* Unmerged path drivers/mtd/ubi/block.c
+diff --git a/block/blk-flush.c b/block/blk-flush.c
+index c1b0c5d26d78..4d69cb1d5561 100644
+--- a/block/blk-flush.c
++++ b/block/blk-flush.c
+@@ -228,7 +228,7 @@ static void flush_end_io(struct request *flush_rq, int error)
+ 
+ 		/* release the tag's ownership to the req cloned from */
+ 		spin_lock_irqsave(&fq->mq_flush_lock, flags);
+-		hctx = q->mq_ops->map_queue(q, flush_rq->mq_ctx->cpu);
++		hctx = blk_mq_map_queue(q, flush_rq->mq_ctx->cpu);
+ 		blk_mq_tag_set_rq(hctx, flush_rq->tag, fq->orig_rq);
+ 		flush_rq->tag = -1;
+ 	}
+@@ -321,7 +321,7 @@ static bool blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq)
+ 		flush_rq->tag = first_rq->tag;
+ 		fq->orig_rq = first_rq;
+ 
+-		hctx = q->mq_ops->map_queue(q, first_rq->mq_ctx->cpu);
++		hctx = blk_mq_map_queue(q, first_rq->mq_ctx->cpu);
+ 		blk_mq_tag_set_rq(hctx, first_rq->tag, flush_rq);
+ 	}
+ 
+@@ -354,7 +354,7 @@ static void mq_flush_data_end_io(struct request *rq, int error)
+ 	unsigned long flags;
+ 	struct blk_flush_queue *fq = blk_get_flush_queue(q, ctx);
+ 
+-	hctx = q->mq_ops->map_queue(q, ctx->cpu);
++	hctx = blk_mq_map_queue(q, ctx->cpu);
+ 
+ 	/*
+ 	 * After populating an empty queue, kick it to avoid stall.  Read
+diff --git a/block/blk-mq-tag.c b/block/blk-mq-tag.c
+index 7e6885bccaac..dda5e61f4c49 100644
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@ -297,8 +297,7 @@ static int bt_get(struct blk_mq_alloc_data *data,
+ 		io_schedule();
+ 
+ 		data->ctx = blk_mq_get_ctx(data->q);
+-		data->hctx = data->q->mq_ops->map_queue(data->q,
+-				data->ctx->cpu);
++		data->hctx = blk_mq_map_queue(data->q, data->ctx->cpu);
+ 		if (data->flags & BLK_MQ_REQ_RESERVED) {
+ 			bt = &data->hctx->tags->breserved_tags;
+ 		} else {
+@@ -720,7 +719,7 @@ u32 blk_mq_unique_tag(struct request *rq)
+ 	int hwq = 0;
+ 
+ 	if (q->mq_ops) {
+-		hctx = q->mq_ops->map_queue(q, rq->mq_ctx->cpu);
++		hctx = blk_mq_map_queue(q, rq->mq_ctx->cpu);
+ 		hwq = hctx->queue_num;
+ 	}
+ 
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 49418900af65..3a941704fb49 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -280,7 +280,7 @@ struct request *blk_mq_alloc_request(struct request_queue *q, int rw,
+ 		return ERR_PTR(ret);
+ 
+ 	ctx = blk_mq_get_ctx(q);
+-	hctx = q->mq_ops->map_queue(q, ctx->cpu);
++	hctx = blk_mq_map_queue(q, ctx->cpu);
+ 	blk_mq_set_alloc_data(&alloc_data, q, flags, ctx, hctx);
+ 
+ 	rq = __blk_mq_alloc_request(&alloc_data, rw);
+@@ -289,7 +289,7 @@ struct request *blk_mq_alloc_request(struct request_queue *q, int rw,
+ 		blk_mq_put_ctx(ctx);
+ 
+ 		ctx = blk_mq_get_ctx(q);
+-		hctx = q->mq_ops->map_queue(q, ctx->cpu);
++		hctx = blk_mq_map_queue(q, ctx->cpu);
+ 		blk_mq_set_alloc_data(&alloc_data, q, flags, ctx, hctx);
+ 		rq =  __blk_mq_alloc_request(&alloc_data, rw);
+ 		ctx = alloc_data.ctx;
+@@ -381,11 +381,7 @@ EXPORT_SYMBOL_GPL(blk_mq_free_hctx_request);
+ 
+ void blk_mq_free_request(struct request *rq)
+ {
+-	struct blk_mq_hw_ctx *hctx;
+-	struct request_queue *q = rq->q;
+-
+-	hctx = q->mq_ops->map_queue(q, rq->mq_ctx->cpu);
+-	blk_mq_free_hctx_request(hctx, rq);
++	blk_mq_free_hctx_request(blk_mq_map_queue(rq->q, rq->mq_ctx->cpu), rq);
+ }
+ EXPORT_SYMBOL_GPL(blk_mq_free_request);
+ 
+@@ -1153,9 +1149,7 @@ void blk_mq_insert_request(struct request *rq, bool at_head, bool run_queue,
+ {
+ 	struct blk_mq_ctx *ctx = rq->mq_ctx;
+ 	struct request_queue *q = rq->q;
+-	struct blk_mq_hw_ctx *hctx;
+-
+-	hctx = q->mq_ops->map_queue(q, ctx->cpu);
++	struct blk_mq_hw_ctx *hctx = blk_mq_map_queue(q, ctx->cpu);
+ 
+ 	spin_lock(&ctx->lock);
+ 	__blk_mq_insert_request(hctx, rq, at_head);
+@@ -1172,12 +1166,10 @@ static void blk_mq_insert_requests(struct request_queue *q,
+ 				     bool from_schedule)
+ 
+ {
+-	struct blk_mq_hw_ctx *hctx;
++	struct blk_mq_hw_ctx *hctx = blk_mq_map_queue(q, ctx->cpu);
+ 
+ 	trace_block_unplug(q, depth, !from_schedule);
+ 
+-	hctx = q->mq_ops->map_queue(q, ctx->cpu);
+-
+ 	/*
+ 	 * preemption doesn't flush plug list, so it's possible ctx->cpu is
+ 	 * offline now
+@@ -1311,7 +1303,7 @@ static struct request *blk_mq_map_request(struct request_queue *q,
+ 
+ 	blk_queue_enter_live(q);
+ 	ctx = blk_mq_get_ctx(q);
+-	hctx = q->mq_ops->map_queue(q, ctx->cpu);
++	hctx = blk_mq_map_queue(q, ctx->cpu);
+ 
+ 	if (rw_is_sync(bio->bi_rw))
+ 		rw |= REQ_SYNC;
+@@ -1325,7 +1317,7 @@ static struct request *blk_mq_map_request(struct request_queue *q,
+ 		trace_block_sleeprq(q, bio, rw);
+ 
+ 		ctx = blk_mq_get_ctx(q);
+-		hctx = q->mq_ops->map_queue(q, ctx->cpu);
++		hctx = blk_mq_map_queue(q, ctx->cpu);
+ 		blk_mq_set_alloc_data(&alloc_data, q, 0, ctx, hctx);
+ 		rq = __blk_mq_alloc_request(&alloc_data, rw);
+ 		ctx = alloc_data.ctx;
+@@ -1342,8 +1334,7 @@ static void blk_mq_try_issue_directly(struct request *rq)
+ {
+ 	int ret;
+ 	struct request_queue *q = rq->q;
+-	struct blk_mq_hw_ctx *hctx = q->mq_ops->map_queue(q,
+-			rq->mq_ctx->cpu);
++	struct blk_mq_hw_ctx *hctx = blk_mq_map_queue(q, rq->mq_ctx->cpu);
+ 	struct blk_mq_queue_data bd = {
+ 		.rq = rq,
+ 		.list = NULL,
+@@ -1539,15 +1530,6 @@ run_queue:
+ 	blk_mq_put_ctx(data.ctx);
+ }
+ 
+-/*
+- * Default mapping to a software queue, since we use one per CPU.
+- */
+-struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *q, const int cpu)
+-{
+-	return q->queue_hw_ctx[q->mq_map[cpu]];
+-}
+-EXPORT_SYMBOL(blk_mq_map_queue);
+-
+ static void blk_mq_free_rq_map(struct blk_mq_tag_set *set,
+ 		struct blk_mq_tags *tags, unsigned int hctx_idx)
+ {
+@@ -1886,7 +1868,7 @@ static void blk_mq_init_cpu_queues(struct request_queue *q,
+ 		if (!cpu_online(i))
+ 			continue;
+ 
+-		hctx = q->mq_ops->map_queue(q, i);
++		hctx = blk_mq_map_queue(q, i);
+ 
+ 		/*
+ 		 * Set local node, IFF we have more than one hw queue. If
+@@ -1939,7 +1921,7 @@ static void blk_mq_map_swqueue(struct request_queue *q,
+ 		}
+ 
+ 		ctx = per_cpu_ptr(q->queue_ctx, i);
+-		hctx = q->mq_ops->map_queue(q, i);
++		hctx = blk_mq_map_queue(q, i);
+ 
+ 		cpumask_set_cpu(i, hctx->cpumask);
+ 		ctx->index_hw = hctx->nr_ctx;
+@@ -2407,7 +2389,7 @@ int blk_mq_alloc_tag_set(struct blk_mq_tag_set *set)
+ 	if (set->queue_depth < set->reserved_tags + BLK_MQ_TAG_MIN)
+ 		return -EINVAL;
+ 
+-	if (!set->ops->queue_rq || !set->ops->map_queue)
++	if (!set->ops->queue_rq)
+ 		return -EINVAL;
+ 
+ 	if (set->queue_depth > BLK_MQ_MAX_DEPTH) {
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index 2398ba3734aa..e178b6ec4155 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -53,6 +53,12 @@ void blk_mq_disable_hotplug(void);
+ int blk_mq_map_queues(struct blk_mq_tag_set *set);
+ extern int blk_mq_hw_queue_to_node(unsigned int *map, unsigned int);
+ 
++static inline struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *q,
++		int cpu)
++{
++	return q->queue_hw_ctx[q->mq_map[cpu]];
++}
++
+ /*
+  * sysfs helpers
+  */
+diff --git a/block/blk.h b/block/blk.h
+index 4d1760d40372..a620723daf91 100644
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -41,14 +41,9 @@ extern struct ida blk_queue_ida;
+ static inline struct blk_flush_queue *blk_get_flush_queue(
+ 		struct request_queue *q, struct blk_mq_ctx *ctx)
+ {
+-	struct blk_mq_hw_ctx *hctx;
+-
+-	if (!q->mq_ops)
+-		return q->fq;
+-
+-	hctx = q->mq_ops->map_queue(q, ctx->cpu);
+-
+-	return hctx->fq;
++	if (q->mq_ops)
++		return blk_mq_map_queue(q, ctx->cpu)->fq;
++	return q->fq;
+ }
+ 
+ static inline void __blk_get_queue(struct request_queue *q)
+* Unmerged path drivers/block/loop.c
+diff --git a/drivers/block/mtip32xx/mtip32xx.c b/drivers/block/mtip32xx/mtip32xx.c
+index 20f579a4a4a2..73b48150c76f 100644
+--- a/drivers/block/mtip32xx/mtip32xx.c
++++ b/drivers/block/mtip32xx/mtip32xx.c
+@@ -3891,7 +3891,6 @@ exit_handler:
+ 
+ static struct blk_mq_ops mtip_mq_ops = {
+ 	.queue_rq	= mtip_queue_rq,
+-	.map_queue	= blk_mq_map_queue,
+ 	.init_request	= mtip_init_cmd,
+ 	.exit_request	= mtip_free_cmd,
+ 	.complete	= mtip_softirq_done_fn,
+diff --git a/drivers/block/null_blk.c b/drivers/block/null_blk.c
+index afe77ddcd8ce..974f570db9ee 100644
+--- a/drivers/block/null_blk.c
++++ b/drivers/block/null_blk.c
+@@ -351,7 +351,6 @@ static int null_init_hctx(struct blk_mq_hw_ctx *hctx, void *data,
+ 
+ static struct blk_mq_ops null_mq_ops = {
+ 	.queue_rq       = null_queue_rq,
+-	.map_queue      = blk_mq_map_queue,
+ 	.init_hctx	= null_init_hctx,
+ 	.complete	= null_softirq_done_fn,
+ };
+diff --git a/drivers/block/rbd.c b/drivers/block/rbd.c
+index 51d318e510d0..4774bbb3f6a9 100644
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -4491,7 +4491,6 @@ static int rbd_init_request(void *data, struct request *rq,
+ 
+ static struct blk_mq_ops rbd_mq_ops = {
+ 	.queue_rq	= rbd_queue_rq,
+-	.map_queue	= blk_mq_map_queue,
+ 	.init_request	= rbd_init_request,
+ };
+ 
+diff --git a/drivers/block/virtio_blk.c b/drivers/block/virtio_blk.c
+index e59436901151..8706276ef092 100644
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@ -553,7 +553,6 @@ static int virtblk_init_request(void *data, struct request *rq,
+ 
+ static struct blk_mq_ops virtio_mq_ops = {
+ 	.queue_rq	= virtio_queue_rq,
+-	.map_queue	= blk_mq_map_queue,
+ 	.complete	= virtblk_request_done,
+ 	.init_request	= virtblk_init_request,
+ };
+* Unmerged path drivers/block/xen-blkfront.c
+diff --git a/drivers/md/dm-rq.c b/drivers/md/dm-rq.c
+index 9505f762168d..6fcfa0e8fdc5 100644
+--- a/drivers/md/dm-rq.c
++++ b/drivers/md/dm-rq.c
+@@ -914,7 +914,6 @@ static int dm_mq_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 
+ static struct blk_mq_ops dm_mq_ops = {
+ 	.queue_rq = dm_mq_queue_rq,
+-	.map_queue = blk_mq_map_queue,
+ 	.complete = dm_softirq_done,
+ 	.init_request = dm_mq_init_request,
+ };
+* Unmerged path drivers/mtd/ubi/block.c
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index df7f3cbfb21f..83e7d7746baa 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -1032,7 +1032,6 @@ static int nvme_create_queue(struct nvme_queue *nvmeq, int qid)
+ static struct blk_mq_ops nvme_mq_admin_ops = {
+ 	.queue_rq	= nvme_queue_rq,
+ 	.complete	= nvme_complete_rq,
+-	.map_queue	= blk_mq_map_queue,
+ 	.init_hctx	= nvme_admin_init_hctx,
+ 	.exit_hctx      = nvme_admin_exit_hctx,
+ 	.init_request	= nvme_admin_init_request,
+@@ -1042,7 +1041,6 @@ static struct blk_mq_ops nvme_mq_admin_ops = {
+ static struct blk_mq_ops nvme_mq_ops = {
+ 	.queue_rq	= nvme_queue_rq,
+ 	.complete	= nvme_complete_rq,
+-	.map_queue	= blk_mq_map_queue,
+ 	.init_hctx	= nvme_init_hctx,
+ 	.init_request	= nvme_init_request,
+ 	.timeout	= nvme_timeout,
+diff --git a/drivers/nvme/host/rdma.c b/drivers/nvme/host/rdma.c
+index f77e67939c0e..cabfc6caaf59 100644
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@ -1504,7 +1504,6 @@ static void nvme_rdma_complete_rq(struct request *rq)
+ static struct blk_mq_ops nvme_rdma_mq_ops = {
+ 	.queue_rq	= nvme_rdma_queue_rq,
+ 	.complete	= nvme_rdma_complete_rq,
+-	.map_queue	= blk_mq_map_queue,
+ 	.init_request	= nvme_rdma_init_request,
+ 	.exit_request	= nvme_rdma_exit_request,
+ 	.reinit_request	= nvme_rdma_reinit_request,
+@@ -1515,7 +1514,6 @@ static struct blk_mq_ops nvme_rdma_mq_ops = {
+ static struct blk_mq_ops nvme_rdma_admin_mq_ops = {
+ 	.queue_rq	= nvme_rdma_queue_rq,
+ 	.complete	= nvme_rdma_complete_rq,
+-	.map_queue	= blk_mq_map_queue,
+ 	.init_request	= nvme_rdma_init_admin_request,
+ 	.exit_request	= nvme_rdma_exit_admin_request,
+ 	.reinit_request	= nvme_rdma_reinit_request,
+diff --git a/drivers/nvme/target/loop.c b/drivers/nvme/target/loop.c
+index a92ef76ead86..47a48c5f8df9 100644
+--- a/drivers/nvme/target/loop.c
++++ b/drivers/nvme/target/loop.c
+@@ -273,7 +273,6 @@ static int nvme_loop_init_admin_hctx(struct blk_mq_hw_ctx *hctx, void *data,
+ static struct blk_mq_ops nvme_loop_mq_ops = {
+ 	.queue_rq	= nvme_loop_queue_rq,
+ 	.complete	= nvme_loop_complete_rq,
+-	.map_queue	= blk_mq_map_queue,
+ 	.init_request	= nvme_loop_init_request,
+ 	.init_hctx	= nvme_loop_init_hctx,
+ 	.timeout	= nvme_loop_timeout,
+@@ -282,7 +281,6 @@ static struct blk_mq_ops nvme_loop_mq_ops = {
+ static struct blk_mq_ops nvme_loop_admin_mq_ops = {
+ 	.queue_rq	= nvme_loop_queue_rq,
+ 	.complete	= nvme_loop_complete_rq,
+-	.map_queue	= blk_mq_map_queue,
+ 	.init_request	= nvme_loop_init_admin_request,
+ 	.init_hctx	= nvme_loop_init_admin_hctx,
+ 	.timeout	= nvme_loop_timeout,
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index 09ae8ec23494..7f134e089fce 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -2003,7 +2003,6 @@ struct request_queue *scsi_alloc_queue(struct scsi_device *sdev)
+ }
+ 
+ static struct blk_mq_ops scsi_mq_ops = {
+-	.map_queue	= blk_mq_map_queue,
+ 	.queue_rq	= scsi_queue_rq,
+ 	.complete	= scsi_softirq_done,
+ 	.timeout        = scsi_timeout,
+* Unmerged path include/linux/blk-mq.h
