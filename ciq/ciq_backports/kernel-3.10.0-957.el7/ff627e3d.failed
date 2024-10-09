@@ -1,0 +1,178 @@
+nfp: bpf: reuse verifier log for debug messages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Quentin Monnet <quentin.monnet@netronome.com>
+commit ff627e3d07a07f7ed1105f459ee9586d4be7818e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/ff627e3d.failed
+
+Now that `bpf_verifier_log_write()` is exported from the verifier and
+makes it possible to reuse the verifier log to print messages to the
+standard output, use this instead of the kernel logs in the nfp driver
+for printing error messages occurring at verification time.
+
+	Signed-off-by: Quentin Monnet <quentin.monnet@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit ff627e3d07a07f7ed1105f459ee9586d4be7818e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/bpf/verifier.c
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/verifier.c
+index 0f4ae869a0f1,7890d95d4018..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
+@@@ -38,15 -36,13 +36,22 @@@
+  #include <linux/kernel.h>
+  #include <linux/pkt_cls.h>
+  
+ -#include "fw.h"
+  #include "main.h"
+  
+++<<<<<<< HEAD
+ +/* Analyzer/verifier definitions */
+ +struct nfp_bpf_analyzer_priv {
+ +	struct nfp_prog *prog;
+ +	struct nfp_insn_meta *meta;
+ +};
+ +
+ +static struct nfp_insn_meta *
+++=======
++ #define pr_vlog(env, fmt, ...)	\
++ 	bpf_verifier_log_write(env, "[nfp] " fmt, ##__VA_ARGS__)
++ 
++ struct nfp_insn_meta *
+++>>>>>>> ff627e3d07a0 (nfp: bpf: reuse verifier log for debug messages)
+  nfp_bpf_goto_meta(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
+  		  unsigned int insn_idx, unsigned int n_insns)
+  {
+@@@ -80,8 -113,22 +85,23 @@@ nfp_bpf_check_call(struct nfp_prog *nfp
+  	u32 func_id = meta->insn.imm;
+  
+  	switch (func_id) {
+++<<<<<<< HEAD
+++=======
++ 	case BPF_FUNC_xdp_adjust_head:
++ 		if (!bpf->adjust_head.off_max) {
++ 			pr_vlog(env, "adjust_head not supported by FW\n");
++ 			return -EOPNOTSUPP;
++ 		}
++ 		if (!(bpf->adjust_head.flags & NFP_BPF_ADJUST_HEAD_NO_META)) {
++ 			pr_vlog(env, "adjust_head: FW requires shifting metadata, not supported by the driver\n");
++ 			return -EOPNOTSUPP;
++ 		}
++ 
++ 		nfp_record_adjust_head(bpf, nfp_prog, meta, reg2);
++ 		break;
+++>>>>>>> ff627e3d07a0 (nfp: bpf: reuse verifier log for debug messages)
+  	default:
+- 		pr_warn("unsupported function id: %d\n", func_id);
++ 		pr_vlog(env, "unsupported function id: %d\n", func_id);
+  		return -EOPNOTSUPP;
+  	}
+  
+@@@ -90,31 -139,30 +110,50 @@@
+  
+  static int
+  nfp_bpf_check_exit(struct nfp_prog *nfp_prog,
+ -		   struct bpf_verifier_env *env)
+ +		   const struct bpf_verifier_env *env)
+  {
+ -	const struct bpf_reg_state *reg0 = cur_regs(env) + BPF_REG_0;
+ -	u64 imm;
+ +	const struct bpf_reg_state *reg0 = &env->cur_state.regs[0];
+  
+ -	if (nfp_prog->type == BPF_PROG_TYPE_XDP)
+ +	if (nfp_prog->act == NN_ACT_XDP)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	if (reg0->type != CONST_IMM) {
+ +		pr_info("unsupported exit state: %d, imm: %llx\n",
+ +			reg0->type, reg0->imm);
+ +		return -EINVAL;
+ +	}
+ +
+ +	if (nfp_prog->act != NN_ACT_DIRECT &&
+ +	    reg0->imm != 0 && (reg0->imm & ~0U) != ~0U) {
+ +		pr_info("unsupported exit state: %d, imm: %llx\n",
+ +			reg0->type, reg0->imm);
+ +		return -EINVAL;
+ +	}
+ +
+ +	if (nfp_prog->act == NN_ACT_DIRECT && reg0->imm <= TC_ACT_REDIRECT &&
+ +	    reg0->imm != TC_ACT_SHOT && reg0->imm != TC_ACT_STOLEN &&
+ +	    reg0->imm != TC_ACT_QUEUED) {
+ +		pr_info("unsupported exit state: %d, imm: %llx\n",
+ +			reg0->type, reg0->imm);
+++=======
++ 	if (!(reg0->type == SCALAR_VALUE && tnum_is_const(reg0->var_off))) {
++ 		char tn_buf[48];
++ 
++ 		tnum_strn(tn_buf, sizeof(tn_buf), reg0->var_off);
++ 		pr_vlog(env, "unsupported exit state: %d, var_off: %s\n",
++ 			reg0->type, tn_buf);
++ 		return -EINVAL;
++ 	}
++ 
++ 	imm = reg0->var_off.value;
++ 	if (nfp_prog->type == BPF_PROG_TYPE_SCHED_CLS &&
++ 	    imm <= TC_ACT_REDIRECT &&
++ 	    imm != TC_ACT_SHOT && imm != TC_ACT_STOLEN &&
++ 	    imm != TC_ACT_QUEUED) {
++ 		pr_vlog(env, "unsupported exit state: %d, imm: %llx\n",
++ 			reg0->type, imm);
+++>>>>>>> ff627e3d07a0 (nfp: bpf: reuse verifier log for debug messages)
+  		return -EINVAL;
+  	}
+  
+@@@ -122,8 -170,10 +161,15 @@@
+  }
+  
+  static int
+++<<<<<<< HEAD
+ +nfp_bpf_check_stack_access(struct nfp_insn_meta *meta,
+ +			   const struct bpf_reg_state *reg)
+++=======
++ nfp_bpf_check_stack_access(struct nfp_prog *nfp_prog,
++ 			   struct nfp_insn_meta *meta,
++ 			   const struct bpf_reg_state *reg,
++ 			   struct bpf_verifier_env *env)
+++>>>>>>> ff627e3d07a0 (nfp: bpf: reuse verifier log for debug messages)
+  {
+  	s32 old_off, new_off;
+  
+@@@ -138,10 -188,15 +184,10 @@@
+  	old_off = meta->ptr.off + meta->ptr.var_off.value;
+  	new_off = reg->off + reg->var_off.value;
+  
+ -	meta->ptr_not_const |= old_off != new_off;
+ -
+ -	if (!meta->ptr_not_const)
+ -		return 0;
+ -
+ -	if (old_off % 4 == new_off % 4)
+ +	if (old_off == new_off)
+  		return 0;
+  
+- 	pr_info("stack access changed location was:%d is:%d\n",
++ 	pr_vlog(env, "stack access changed location was:%d is:%d\n",
+  		old_off, new_off);
+  	return -EINVAL;
+  }
+@@@ -161,7 -216,7 +207,11 @@@ nfp_bpf_check_ptr(struct nfp_prog *nfp_
+  	}
+  
+  	if (reg->type == PTR_TO_STACK) {
+++<<<<<<< HEAD
+ +		err = nfp_bpf_check_stack_access(meta, reg);
+++=======
++ 		err = nfp_bpf_check_stack_access(nfp_prog, meta, reg, env);
+++>>>>>>> ff627e3d07a0 (nfp: bpf: reuse verifier log for debug messages)
+  		if (err)
+  			return err;
+  	}
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/verifier.c
