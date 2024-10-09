@@ -1,0 +1,166 @@
+IB/uverbs: Get rid of null_obj_type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Gunthorpe <jgg@mellanox.com>
+commit 3df593bfe6455f28cda879be8299b30b8601ce3b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/3df593bf.failed
+
+If the method fails after calling rdma_explicit_destroy (eg if
+copy_to_user faults) then it will trigger a kernel oops:
+
+BUG: unable to handle kernel NULL pointer dereference at 0000000000000000
+PGD 800000000548d067 P4D 800000000548d067 PUD 54a0067 PMD 0
+SMP PTI
+CPU: 0 PID: 359 Comm: ibv_rc_pingpong Not tainted 4.18.0-rc1+ #28
+Hardware name: QEMU Standard PC (Q35 + ICH9, 2009), BIOS rel-1.7.5-0-ge51488c-20140602_164612-nilsson.home.kraxel.org 04/01/2014
+RIP: 0010:          (null)
+Code: Bad RIP value.
+RSP: 0018:ffffc900001a3bf0 EFLAGS: 00010246
+RAX: 0000000000000000 RBX: ffff88000603bd00 RCX: 0000000000000003
+RDX: 0000000000000001 RSI: 0000000000000001 RDI: ffff88000603bd00
+RBP: 0000000000000001 R08: ffffc900001a3cf8 R09: 0000000000000000
+R10: 0000000000000000 R11: 0000000000000000 R12: ffffc900001a3cf0
+R13: 0000000000000000 R14: ffffc900001a3cf0 R15: 0000000000000000
+FS:  00007fb00dda8700(0000) GS:ffff880007c00000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: ffffffffffffffd6 CR3: 000000000548e004 CR4: 00000000003606b0
+DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+Call Trace:
+ ? rdma_lookup_put_uobject+0x22/0x50 [ib_uverbs]
+ ? uverbs_finalize_object+0x3b/0x60 [ib_uverbs]
+ ? uverbs_finalize_attrs+0x128/0x140 [ib_uverbs]
+ ? ib_uverbs_cmd_verbs+0x698/0x7c0 [ib_uverbs]
+ ? find_held_lock+0x2d/0x90
+ ? __might_fault+0x39/0x90
+ ? ib_uverbs_ioctl+0x111/0x1f0 [ib_uverbs]
+ ? do_vfs_ioctl+0xa0/0x6d0
+ ? trace_hardirqs_on_caller+0xed/0x180
+ ? _raw_spin_unlock_irq+0x24/0x40
+ ? syscall_trace_enter+0x138/0x1d0
+ ? ksys_ioctl+0x35/0x60
+ ? __x64_sys_ioctl+0x11/0x20
+ ? do_syscall_64+0x5b/0x1c0
+ ? entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+This is because the type was replaced with the null_type during explicit
+destroy that cannot complete the destruction.
+
+One of the side effects of replacing the type is to make the object
+handle totally unreachable - so no other command could attempt to use
+it, even though it remains on the uboject list.
+
+We can get the same end result by just fully destroying the object inside
+rdma_explicit_destroy and leaving the caller the residual kref for the
+uobj with no attached HW object, and no presence in the ubojects list.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+(cherry picked from commit 3df593bfe6455f28cda879be8299b30b8601ce3b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/rdma_core.c
+diff --cc drivers/infiniband/core/rdma_core.c
+index 586f179a9de6,aed7cc2a9e86..000000000000
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@@ -432,18 -436,23 +432,27 @@@ static void assert_uverbs_usecnt(struc
+  static int __must_check _rdma_remove_commit_uobject(struct ib_uobject *uobj,
+  						    enum rdma_remove_reason why)
+  {
+ -	struct ib_uverbs_file *ufile = uobj->ufile;
+  	int ret;
+ +	struct ib_ucontext *ucontext = uobj->context;
+  
++ 	if (!uobj->object)
++ 		return 0;
++ 
+  	ret = uobj->type->type_class->remove_commit(uobj, why);
+ -	if (ib_is_destroy_retryable(ret, why, uobj)) {
+ +	if (ret && why == RDMA_REMOVE_DESTROY) {
+  		/* We couldn't remove the object, so just unlock the uobject */
+  		atomic_set(&uobj->usecnt, 0);
+  		uobj->type->type_class->lookup_put(uobj, true);
+  	} else {
+++<<<<<<< HEAD
+ +		mutex_lock(&ucontext->uobjects_lock);
+++=======
++ 		uobj->object = NULL;
++ 
++ 		mutex_lock(&ufile->uobjects_lock);
+++>>>>>>> 3df593bfe645 (IB/uverbs: Get rid of null_obj_type)
+  		list_del(&uobj->list);
+ -		mutex_unlock(&ufile->uobjects_lock);
+ +		mutex_unlock(&ucontext->uobjects_lock);
+  		/* put the ref we took when we created the object */
+  		uverbs_uobject_put(uobj);
+  	}
+@@@ -455,35 -464,13 +464,29 @@@
+  int __must_check rdma_remove_commit_uobject(struct ib_uobject *uobj)
+  {
+  	int ret;
+++<<<<<<< HEAD
+ +	struct ib_ucontext *ucontext = uobj->context;
+ +
+ +	/* put the ref count we took at lookup_get */
+ +	uverbs_uobject_put(uobj);
+ +	/* Cleanup is running. Calling this should have been impossible */
+ +	if (!down_read_trylock(&ucontext->cleanup_rwsem)) {
+ +		WARN(true, "ib_uverbs: Cleanup is running while removing an uobject\n");
+ +		return 0;
+ +	}
+ +	assert_uverbs_usecnt(uobj, true);
+ +	ret = _rdma_remove_commit_uobject(uobj, RDMA_REMOVE_DESTROY);
+ +
+ +	up_read(&ucontext->cleanup_rwsem);
+- 	return ret;
+- }
+++=======
+  
+- static int null_obj_type_class_remove_commit(struct ib_uobject *uobj,
+- 					     enum rdma_remove_reason why)
+- {
+- 	return 0;
++ 	ret = rdma_explicit_destroy(uobj);
++ 	/* Pairs with the lookup_get done by the caller */
++ 	rdma_lookup_put_uobject(uobj, true);
+++>>>>>>> 3df593bfe645 (IB/uverbs: Get rid of null_obj_type)
++ 	return ret;
+  }
+  
+- static const struct uverbs_obj_type null_obj_type = {
+- 	.type_class = &((const struct uverbs_obj_type_class){
+- 			.remove_commit = null_obj_type_class_remove_commit,
+- 			/* be cautious */
+- 			.needs_kfree_rcu = true}),
+- };
+- 
+  int rdma_explicit_destroy(struct ib_uobject *uobject)
+  {
+  	int ret;
+@@@ -495,15 -482,9 +498,16 @@@
+  		return 0;
+  	}
+  	assert_uverbs_usecnt(uobject, true);
+- 	ret = uobject->type->type_class->remove_commit(uobject,
+- 						       RDMA_REMOVE_DESTROY);
+- 	if (ret)
+- 		goto out;
++ 	ret = _rdma_remove_commit_uobject(uobject, RDMA_REMOVE_DESTROY);
+  
+++<<<<<<< HEAD
+ +	uobject->type = &null_obj_type;
+ +
+ +out:
+ +	up_read(&ucontext->cleanup_rwsem);
+++=======
++ 	up_read(&ufile->cleanup_rwsem);
+++>>>>>>> 3df593bfe645 (IB/uverbs: Get rid of null_obj_type)
+  	return ret;
+  }
+  
+* Unmerged path drivers/infiniband/core/rdma_core.c
