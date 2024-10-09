@@ -1,0 +1,163 @@
+md: use mddev_suspend/resume instead of ->quiesce()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [md] use mddev_suspend/resume instead of ->quiesce() (Nigel Croxon) [1506338]
+Rebuild_FUZZ: 95.92%
+commit-author NeilBrown <neilb@suse.com>
+commit 9e1cc0a54556a6c63dc0cfb7cd7d60d43337bba6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9e1cc0a5.failed
+
+mddev_suspend() is a more general interface than
+calling ->quiesce() and is so more extensible.  A
+future patch will make use of this.
+
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 9e1cc0a54556a6c63dc0cfb7cd7d60d43337bba6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+diff --cc drivers/md/md.c
+index 4c75b0e4a2a4,5bd4f18763bd..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -4723,13 -4860,14 +4723,13 @@@ suspend_lo_store(struct mddev *mddev, c
+  		goto unlock;
+  	old = mddev->suspend_lo;
+  	mddev->suspend_lo = new;
+ -	if (new >= old) {
+ +	if (new >= old)
+  		/* Shrinking suspended region */
+ -		wake_up(&mddev->sb_wait);
+  		mddev->pers->quiesce(mddev, 2);
+ -	} else {
+ +	else {
+  		/* Expanding suspended region - need to wait */
+- 		mddev->pers->quiesce(mddev, 1);
+- 		mddev->pers->quiesce(mddev, 0);
++ 		mddev_suspend(mddev);
++ 		mddev_resume(mddev);
+  	}
+  	err = 0;
+  unlock:
+@@@ -4766,13 -4904,14 +4766,13 @@@ suspend_hi_store(struct mddev *mddev, c
+  		goto unlock;
+  	old = mddev->suspend_hi;
+  	mddev->suspend_hi = new;
+ -	if (new <= old) {
+ +	if (new <= old)
+  		/* Shrinking suspended region */
+ -		wake_up(&mddev->sb_wait);
+  		mddev->pers->quiesce(mddev, 2);
+ -	} else {
+ +	else {
+  		/* Expanding suspended region - need to wait */
+- 		mddev->pers->quiesce(mddev, 1);
+- 		mddev->pers->quiesce(mddev, 0);
++ 		mddev_suspend(mddev);
++ 		mddev_resume(mddev);
+  	}
+  	err = 0;
+  unlock:
+@@@ -6396,17 -6638,26 +6396,38 @@@ static int set_bitmap_file(struct mdde
+  		return -ENOENT; /* cannot remove what isn't there */
+  	err = 0;
+  	if (mddev->pers) {
+ +		mddev->pers->quiesce(mddev, 1);
+  		if (fd >= 0) {
+++<<<<<<< HEAD
+ +			err = bitmap_create(mddev);
+ +			if (!err)
+ +				err = bitmap_load(mddev);
+++=======
++ 			struct bitmap *bitmap;
++ 
++ 			bitmap = bitmap_create(mddev, -1);
++ 			mddev_suspend(mddev);
++ 			if (!IS_ERR(bitmap)) {
++ 				mddev->bitmap = bitmap;
++ 				err = bitmap_load(mddev);
++ 			} else
++ 				err = PTR_ERR(bitmap);
++ 			if (err) {
++ 				bitmap_destroy(mddev);
++ 				fd = -1;
++ 			}
++ 			mddev_resume(mddev);
++ 		} else if (fd < 0) {
++ 			mddev_suspend(mddev);
++ 			bitmap_destroy(mddev);
++ 			mddev_resume(mddev);
+++>>>>>>> 9e1cc0a54556 (md: use mddev_suspend/resume instead of ->quiesce())
+ +		}
+ +		if (fd < 0 || err) {
+ +			bitmap_destroy(mddev);
+ +			fd = -1; /* make sure to put the file */
+  		}
+ +		mddev->pers->quiesce(mddev, 0);
+  	}
+  	if (fd < 0) {
+  		struct file *f = mddev->bitmap_info.file;
+@@@ -6675,22 -6941,41 +6696,53 @@@ static int update_array_info(struct mdd
+  				mddev->bitmap_info.default_offset;
+  			mddev->bitmap_info.space =
+  				mddev->bitmap_info.default_space;
+++<<<<<<< HEAD
+ +			mddev->pers->quiesce(mddev, 1);
+ +			rv = bitmap_create(mddev);
+ +			if (!rv)
+++=======
++ 			bitmap = bitmap_create(mddev, -1);
++ 			mddev_suspend(mddev);
++ 			if (!IS_ERR(bitmap)) {
++ 				mddev->bitmap = bitmap;
+++>>>>>>> 9e1cc0a54556 (md: use mddev_suspend/resume instead of ->quiesce())
+  				rv = bitmap_load(mddev);
+ -			} else
+ -				rv = PTR_ERR(bitmap);
+  			if (rv)
+  				bitmap_destroy(mddev);
+- 			mddev->pers->quiesce(mddev, 0);
++ 			mddev_resume(mddev);
+  		} else {
+  			/* remove the bitmap */
+++<<<<<<< HEAD
+ +			if (!mddev->bitmap)
+ +				return -ENOENT;
+ +			if (mddev->bitmap->storage.file)
+ +				return -EINVAL;
+ +			mddev->pers->quiesce(mddev, 1);
+++=======
++ 			if (!mddev->bitmap) {
++ 				rv = -ENOENT;
++ 				goto err;
++ 			}
++ 			if (mddev->bitmap->storage.file) {
++ 				rv = -EINVAL;
++ 				goto err;
++ 			}
++ 			if (mddev->bitmap_info.nodes) {
++ 				/* hold PW on all the bitmap lock */
++ 				if (md_cluster_ops->lock_all_bitmaps(mddev) <= 0) {
++ 					pr_warn("md: can't change bitmap to none since the array is in use by more than one node\n");
++ 					rv = -EPERM;
++ 					md_cluster_ops->unlock_all_bitmaps(mddev);
++ 					goto err;
++ 				}
++ 
++ 				mddev->bitmap_info.nodes = 0;
++ 				md_cluster_ops->leave(mddev);
++ 			}
++ 			mddev_suspend(mddev);
+++>>>>>>> 9e1cc0a54556 (md: use mddev_suspend/resume instead of ->quiesce())
+  			bitmap_destroy(mddev);
+- 			mddev->pers->quiesce(mddev, 0);
++ 			mddev_resume(mddev);
+  			mddev->bitmap_info.offset = 0;
+  		}
+  	}
+* Unmerged path drivers/md/md.c
