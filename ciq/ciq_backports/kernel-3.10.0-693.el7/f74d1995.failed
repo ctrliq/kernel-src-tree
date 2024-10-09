@@ -1,0 +1,134 @@
+sfc: support setting RSS hash key through ethtool API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Edward Cree <ecree@solarflare.com>
+commit f74d1995192cd0834eea13a8287a3e26a7317b6d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f74d1995.failed
+
+	Signed-off-by: Edward Cree <ecree@solarflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f74d1995192cd0834eea13a8287a3e26a7317b6d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/sfc/ef10.c
+#	drivers/net/ethernet/sfc/siena.c
+diff --cc drivers/net/ethernet/sfc/ef10.c
+index b1c97d73d307,f117e0b5b5ad..000000000000
+--- a/drivers/net/ethernet/sfc/ef10.c
++++ b/drivers/net/ethernet/sfc/ef10.c
+@@@ -1325,7 -1325,8 +1325,12 @@@ static int efx_ef10_init_nic(struct efx
+  	}
+  
+  	/* don't fail init if RSS setup doesn't work */
+++<<<<<<< HEAD
+ +	efx->type->rx_push_rss_config(efx, false, efx->rx_indir_table);
+++=======
++ 	rc = efx->type->rx_push_rss_config(efx, false, efx->rx_indir_table, NULL);
++ 	efx->rss_active = (rc == 0);
+++>>>>>>> f74d1995192c (sfc: support setting RSS hash key through ethtool API)
+  
+  	return 0;
+  }
+diff --cc drivers/net/ethernet/sfc/siena.c
+index c39ec092aabe,0606aa290879..000000000000
+--- a/drivers/net/ethernet/sfc/siena.c
++++ b/drivers/net/ethernet/sfc/siena.c
+@@@ -402,7 -404,8 +404,12 @@@ static int siena_init_nic(struct efx_ni
+  			    EFX_RX_USR_BUF_SIZE >> 5);
+  	efx_writeo(efx, &temp, FR_AZ_RX_CFG);
+  
+++<<<<<<< HEAD
+ +	siena_rx_push_rss_config(efx, false, efx->rx_indir_table);
+++=======
++ 	siena_rx_push_rss_config(efx, false, efx->rx_indir_table, NULL);
++ 	efx->rss_active = true;
+++>>>>>>> f74d1995192c (sfc: support setting RSS hash key through ethtool API)
+  
+  	/* Enable event logging */
+  	rc = efx_mcdi_log_ctrl(efx, true, false, 0);
+* Unmerged path drivers/net/ethernet/sfc/ef10.c
+diff --git a/drivers/net/ethernet/sfc/ethtool.c b/drivers/net/ethernet/sfc/ethtool.c
+index 637775aea5b4..e03c56dba5ba 100644
+--- a/drivers/net/ethernet/sfc/ethtool.c
++++ b/drivers/net/ethernet/sfc/ethtool.c
+@@ -1263,6 +1263,13 @@ static u32 efx_ethtool_get_rxfh_indir_size(struct net_device *net_dev)
+ 	return (efx->n_rx_channels == 1) ? 0 : ARRAY_SIZE(efx->rx_indir_table);
+ }
+ 
++static u32 efx_ethtool_get_rxfh_key_size(struct net_device *net_dev)
++{
++	struct efx_nic *efx = netdev_priv(net_dev);
++
++	return efx->type->rx_hash_key_size;
++}
++
+ static int efx_ethtool_get_rxfh(struct net_device *net_dev, u32 *indir, u8 *key,
+ 				u8 *hfunc)
+ {
+@@ -1272,6 +1279,8 @@ static int efx_ethtool_get_rxfh(struct net_device *net_dev, u32 *indir, u8 *key,
+ 		*hfunc = ETH_RSS_HASH_TOP;
+ 	if (indir)
+ 		memcpy(indir, efx->rx_indir_table, sizeof(efx->rx_indir_table));
++	if (key)
++		memcpy(key, efx->rx_hash_key, efx->type->rx_hash_key_size);
+ 	return 0;
+ }
+ 
+@@ -1280,14 +1289,18 @@ static int efx_ethtool_set_rxfh(struct net_device *net_dev, const u32 *indir,
+ {
+ 	struct efx_nic *efx = netdev_priv(net_dev);
+ 
+-	/* We do not allow change in unsupported parameters */
+-	if (key ||
+-	    (hfunc != ETH_RSS_HASH_NO_CHANGE && hfunc != ETH_RSS_HASH_TOP))
++	/* Hash function is Toeplitz, cannot be changed */
++	if (hfunc != ETH_RSS_HASH_NO_CHANGE && hfunc != ETH_RSS_HASH_TOP)
+ 		return -EOPNOTSUPP;
+-	if (!indir)
++	if (!indir && !key)
+ 		return 0;
+ 
+-	return efx->type->rx_push_rss_config(efx, true, indir);
++	if (!key)
++		key = efx->rx_hash_key;
++	if (!indir)
++		indir = efx->rx_indir_table;
++
++	return efx->type->rx_push_rss_config(efx, true, indir, key);
+ }
+ 
+ static int efx_ethtool_get_ts_info(struct net_device *net_dev,
+@@ -1364,6 +1377,7 @@ const struct ethtool_ops efx_ethtool_ops = {
+ 	.get_rxnfc		= efx_ethtool_get_rxnfc,
+ 	.set_rxnfc		= efx_ethtool_set_rxnfc,
+ 	.get_rxfh_indir_size	= efx_ethtool_get_rxfh_indir_size,
++	.get_rxfh_key_size	= efx_ethtool_get_rxfh_key_size,
+ 	.get_rxfh		= efx_ethtool_get_rxfh,
+ 	.set_rxfh		= efx_ethtool_set_rxfh,
+ 	.get_ts_info		= efx_ethtool_get_ts_info,
+diff --git a/drivers/net/ethernet/sfc/net_driver.h b/drivers/net/ethernet/sfc/net_driver.h
+index c4c448c45d0a..94b49777a0e6 100644
+--- a/drivers/net/ethernet/sfc/net_driver.h
++++ b/drivers/net/ethernet/sfc/net_driver.h
+@@ -1309,7 +1309,7 @@ struct efx_nic_type {
+ 	unsigned int (*tx_limit_len)(struct efx_tx_queue *tx_queue,
+ 				     dma_addr_t dma_addr, unsigned int len);
+ 	int (*rx_push_rss_config)(struct efx_nic *efx, bool user,
+-				  const u32 *rx_indir_table);
++				  const u32 *rx_indir_table, const u8 *key);
+ 	int (*rx_probe)(struct efx_rx_queue *rx_queue);
+ 	void (*rx_init)(struct efx_rx_queue *rx_queue);
+ 	void (*rx_remove)(struct efx_rx_queue *rx_queue);
+@@ -1408,6 +1408,7 @@ struct efx_nic_type {
+ 	int mcdi_max_ver;
+ 	unsigned int max_rx_ip_filters;
+ 	u32 hwtstamp_filters;
++	unsigned int rx_hash_key_size;
+ };
+ 
+ /**************************************************************************
+* Unmerged path drivers/net/ethernet/sfc/siena.c
