@@ -1243,33 +1243,54 @@ void mlx5e_tc_update_neigh_used_value(struct mlx5e_neigh_hash_entry *nhe)
 	}
 }
 
-void mlx5e_encap_put(struct mlx5e_priv *priv, struct mlx5e_encap_entry *e)
+static void mlx5e_encap_dealloc(struct mlx5e_priv *priv, struct mlx5e_encap_entry *e)
 {
-	if (!refcount_dec_and_test(&e->refcnt))
-		return;
-
 	WARN_ON(!list_empty(&e->flows));
-	mlx5e_rep_encap_entry_detach(netdev_priv(e->out_dev), e);
 
-	if (e->flags & MLX5_ENCAP_ENTRY_VALID)
-		mlx5_packet_reformat_dealloc(priv->mdev, e->encap_id);
+	if (e->compl_result > 0) {
+		mlx5e_rep_encap_entry_detach(netdev_priv(e->out_dev), e);
 
-	hash_del_rcu(&e->encap_hlist);
+		if (e->flags & MLX5_ENCAP_ENTRY_VALID)
+			mlx5_packet_reformat_dealloc(priv->mdev, e->encap_id);
+	}
+
 	kfree(e->encap_header);
 	kfree(e);
+}
+
+void mlx5e_encap_put(struct mlx5e_priv *priv, struct mlx5e_encap_entry *e)
+{
+	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+
+	if (!refcount_dec_and_mutex_lock(&e->refcnt, &esw->offloads.encap_tbl_lock))
+		return;
+	hash_del_rcu(&e->encap_hlist);
+	mutex_unlock(&esw->offloads.encap_tbl_lock);
+
+	mlx5e_encap_dealloc(priv, e);
 }
 
 static void mlx5e_detach_encap(struct mlx5e_priv *priv,
 			       struct mlx5e_tc_flow *flow, int out_index)
 {
+	struct mlx5e_encap_entry *e = flow->encaps[out_index].e;
+	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+
 	/* flow wasn't fully initialized */
-	if (!flow->encaps[out_index].e)
+	if (!e)
 		return;
 
+	mutex_lock(&esw->offloads.encap_tbl_lock);
 	list_del(&flow->encaps[out_index].list);
-
-	mlx5e_encap_put(priv, flow->encaps[out_index].e);
 	flow->encaps[out_index].e = NULL;
+	if (!refcount_dec_and_test(&e->refcnt)) {
+		mutex_unlock(&esw->offloads.encap_tbl_lock);
+		return;
+	}
+	hash_del_rcu(&e->encap_hlist);
+	mutex_unlock(&esw->offloads.encap_tbl_lock);
+
+	mlx5e_encap_dealloc(priv, e);
 }
 
 static void __mlx5e_tc_del_fdb_peer_flow(struct mlx5e_tc_flow *flow)
@@ -2623,6 +2644,7 @@ static int mlx5e_attach_encap(struct mlx5e_priv *priv,
 
 	hash_key = hash_encap_info(&key);
 
+	mutex_lock(&esw->offloads.encap_tbl_lock);
 	e = mlx5e_encap_get(priv, &key, hash_key);
 
 	/* must verify if encap is valid or not */
@@ -2633,30 +2655,52 @@ static int mlx5e_attach_encap(struct mlx5e_priv *priv,
 			goto out_err;
 		}
 
+		mutex_unlock(&esw->offloads.encap_tbl_lock);
+		wait_for_completion(&e->res_ready);
+
+		/* Protect against concurrent neigh update. */
+		mutex_lock(&esw->offloads.encap_tbl_lock);
+		if (e->compl_result < 0) {
+			err = -EREMOTEIO;
+			goto out_err;
+		}
 		goto attach_flow;
 	}
 
 	e = kzalloc(sizeof(*e), GFP_KERNEL);
-	if (!e)
-		return -ENOMEM;
+	if (!e) {
+		err = -ENOMEM;
+		goto out_err;
+	}
 
 	refcount_set(&e->refcnt, 1);
+	init_completion(&e->res_ready);
+
 	e->tun_info = *tun_info;
 	err = mlx5e_tc_tun_init_encap_attr(mirred_dev, priv, e, extack);
-	if (err)
+	if (err) {
+		kfree(e);
+		e = NULL;
 		goto out_err;
+	}
 
 	INIT_LIST_HEAD(&e->flows);
+	hash_add_rcu(esw->offloads.encap_tbl, &e->encap_hlist, hash_key);
+	mutex_unlock(&esw->offloads.encap_tbl_lock);
 
 	if (family == AF_INET)
 		err = mlx5e_tc_tun_create_header_ipv4(priv, mirred_dev, e);
 	else if (family == AF_INET6)
 		err = mlx5e_tc_tun_create_header_ipv6(priv, mirred_dev, e);
 
-	if (err)
+	/* Protect against concurrent neigh update. */
+	mutex_lock(&esw->offloads.encap_tbl_lock);
+	complete_all(&e->res_ready);
+	if (err) {
+		e->compl_result = err;
 		goto out_err;
-
-	hash_add_rcu(esw->offloads.encap_tbl, &e->encap_hlist, hash_key);
+	}
+	e->compl_result = 1;
 
 attach_flow:
 	flow->encaps[out_index].e = e;
@@ -2670,11 +2714,14 @@ attach_flow:
 	} else {
 		*encap_valid = false;
 	}
+	mutex_unlock(&esw->offloads.encap_tbl_lock);
 
 	return err;
 
 out_err:
-	kfree(e);
+	mutex_unlock(&esw->offloads.encap_tbl_lock);
+	if (e)
+		mlx5e_encap_put(priv, e);
 	return err;
 }
 

@@ -615,7 +615,7 @@ static void skb_release_data(struct sk_buff *skb)
 			struct ubuf_info *uarg;
 
 			uarg = skb_shinfo(skb)->destructor_arg;
-			if (uarg->callback)
+			if (!skb_zcopy_is_nouarg(skb) && uarg->callback)
 				uarg->callback(uarg, true);
 		}
 
@@ -744,7 +744,7 @@ void skb_tx_error(struct sk_buff *skb)
 		struct ubuf_info *uarg;
 
 		uarg = skb_shinfo(skb)->destructor_arg;
-		if (uarg->callback)
+		if (!skb_zcopy_is_nouarg(skb) && uarg->callback)
 			uarg->callback(uarg, false);
 		skb_shinfo(skb)->tx_flags &= ~SKBTX_DEV_ZEROCOPY;
 	}
@@ -1040,7 +1040,8 @@ int skb_copy_ubufs(struct sk_buff *skb, gfp_t gfp_mask)
 	for (i = 0; i < num_frags; i++)
 		skb_frag_unref(skb, i);
 
-	uarg->callback(uarg, false);
+	if (!skb_zcopy_is_nouarg(skb))
+		uarg->callback(uarg, false);
 
 	/* skb frags point to kernel buffers */
 	for (i = num_frags - 1; i >= 0; i--) {

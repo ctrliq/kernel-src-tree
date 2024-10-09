@@ -1726,6 +1726,7 @@ int mlx5_eswitch_init(struct mlx5_core_dev *dev)
 	if (err)
 		goto abort;
 
+	mutex_init(&esw->offloads.encap_tbl_lock);
 	hash_init(esw->offloads.encap_tbl);
 	hash_init(esw->offloads.mod_hdr_tbl);
 	mutex_init(&esw->state_lock);
@@ -1766,6 +1767,7 @@ void mlx5_eswitch_cleanup(struct mlx5_eswitch *esw)
 	esw->dev->priv.eswitch = NULL;
 	destroy_workqueue(esw->work_queue);
 	esw_offloads_cleanup_reps(esw);
+	mutex_destroy(&esw->offloads.encap_tbl_lock);
 	kfree(esw->vports);
 	kfree(esw);
 }
