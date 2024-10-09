@@ -1,0 +1,187 @@
+cxgb4: add support for tx max rate limiting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
+commit 10a2604ea2eac8af2bf7fa5eb11e4fcb6bc336d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/10a2604e.failed
+
+Implement set_tx_maxrate NDO to perform per queue tx rate limiting.
+
+	Signed-off-by: Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
+	Signed-off-by: Hariprasad Shenai <hariprasad@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 10a2604ea2eac8af2bf7fa5eb11e4fcb6bc336d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+#	drivers/net/ethernet/chelsio/cxgb4/sched.h
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+index 70d5542c0f8b,f988c600c68d..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+@@@ -818,6 -860,55 +818,58 @@@ struct adapter 
+  	spinlock_t win0_lock ____cacheline_aligned_in_smp;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Support for "sched-class" command to allow a TX Scheduling Class to be
++  * programmed with various parameters.
++  */
++ struct ch_sched_params {
++ 	s8   type;                     /* packet or flow */
++ 	union {
++ 		struct {
++ 			s8   level;    /* scheduler hierarchy level */
++ 			s8   mode;     /* per-class or per-flow */
++ 			s8   rateunit; /* bit or packet rate */
++ 			s8   ratemode; /* %port relative or kbps absolute */
++ 			s8   channel;  /* scheduler channel [0..N] */
++ 			s8   class;    /* scheduler class [0..N] */
++ 			s32  minrate;  /* minimum rate */
++ 			s32  maxrate;  /* maximum rate */
++ 			s16  weight;   /* percent weight */
++ 			s16  pktsize;  /* average packet size */
++ 		} params;
++ 	} u;
++ };
++ 
++ enum {
++ 	SCHED_CLASS_TYPE_PACKET = 0,    /* class type */
++ };
++ 
++ enum {
++ 	SCHED_CLASS_LEVEL_CL_RL = 0,    /* class rate limiter */
++ };
++ 
++ enum {
++ 	SCHED_CLASS_MODE_CLASS = 0,     /* per-class scheduling */
++ };
++ 
++ enum {
++ 	SCHED_CLASS_RATEUNIT_BITS = 0,  /* bit rate scheduling */
++ };
++ 
++ enum {
++ 	SCHED_CLASS_RATEMODE_ABS = 1,   /* Kb/s */
++ };
++ 
++ /* Support for "sched_queue" command to allow one or more NIC TX Queues
++  * to be bound to a TX Scheduling Class.
++  */
++ struct ch_sched_queue {
++ 	s8   queue;    /* queue index */
++ 	s8   class;    /* class index */
++ };
++ 
+++>>>>>>> 10a2604ea2ea (cxgb4: add support for tx max rate limiting)
+  /* Defined bit width of user definable filter tuples
+   */
+  #define ETHTYPE_BITWIDTH 16
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/sched.h
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4.h
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+index b2bcf538138f..5f0d2307aadc 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@ -3134,6 +3134,87 @@ static void cxgb_netpoll(struct net_device *dev)
+ }
+ #endif
+ 
++static int cxgb_set_tx_maxrate(struct net_device *dev, int index, u32 rate)
++{
++	struct port_info *pi = netdev_priv(dev);
++	struct adapter *adap = pi->adapter;
++	struct sched_class *e;
++	struct ch_sched_params p;
++	struct ch_sched_queue qe;
++	u32 req_rate;
++	int err = 0;
++
++	if (!can_sched(dev))
++		return -ENOTSUPP;
++
++	if (index < 0 || index > pi->nqsets - 1)
++		return -EINVAL;
++
++	if (!(adap->flags & FULL_INIT_DONE)) {
++		dev_err(adap->pdev_dev,
++			"Failed to rate limit on queue %d. Link Down?\n",
++			index);
++		return -EINVAL;
++	}
++
++	/* Convert from Mbps to Kbps */
++	req_rate = rate << 10;
++
++	/* Max rate is 10 Gbps */
++	if (req_rate >= SCHED_MAX_RATE_KBPS) {
++		dev_err(adap->pdev_dev,
++			"Invalid rate %u Mbps, Max rate is %u Gbps\n",
++			rate, SCHED_MAX_RATE_KBPS);
++		return -ERANGE;
++	}
++
++	/* First unbind the queue from any existing class */
++	memset(&qe, 0, sizeof(qe));
++	qe.queue = index;
++	qe.class = SCHED_CLS_NONE;
++
++	err = cxgb4_sched_class_unbind(dev, (void *)(&qe), SCHED_QUEUE);
++	if (err) {
++		dev_err(adap->pdev_dev,
++			"Unbinding Queue %d on port %d fail. Err: %d\n",
++			index, pi->port_id, err);
++		return err;
++	}
++
++	/* Queue already unbound */
++	if (!req_rate)
++		return 0;
++
++	/* Fetch any available unused or matching scheduling class */
++	memset(&p, 0, sizeof(p));
++	p.type = SCHED_CLASS_TYPE_PACKET;
++	p.u.params.level    = SCHED_CLASS_LEVEL_CL_RL;
++	p.u.params.mode     = SCHED_CLASS_MODE_CLASS;
++	p.u.params.rateunit = SCHED_CLASS_RATEUNIT_BITS;
++	p.u.params.ratemode = SCHED_CLASS_RATEMODE_ABS;
++	p.u.params.channel  = pi->tx_chan;
++	p.u.params.class    = SCHED_CLS_NONE;
++	p.u.params.minrate  = 0;
++	p.u.params.maxrate  = req_rate;
++	p.u.params.weight   = 0;
++	p.u.params.pktsize  = dev->mtu;
++
++	e = cxgb4_sched_class_alloc(dev, &p);
++	if (!e)
++		return -ENOMEM;
++
++	/* Bind the queue to a scheduling class */
++	memset(&qe, 0, sizeof(qe));
++	qe.queue = index;
++	qe.class = e->idx;
++
++	err = cxgb4_sched_class_bind(dev, (void *)(&qe), SCHED_QUEUE);
++	if (err)
++		dev_err(adap->pdev_dev,
++			"Queue rate limiting failed. Err: %d\n", err);
++	return err;
++}
++
+ static const struct net_device_ops cxgb4_netdev_ops = {
+ 	.ndo_open             = cxgb_open,
+ 	.ndo_stop             = cxgb_close,
+@@ -3152,6 +3233,7 @@ static const struct net_device_ops cxgb4_netdev_ops = {
+ #ifdef CONFIG_NET_RX_BUSY_POLL
+ 	.ndo_busy_poll        = cxgb_busy_poll,
+ #endif
++	.ndo_set_tx_maxrate   = cxgb_set_tx_maxrate,
+ };
+ 
+ #ifdef CONFIG_PCI_IOV
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/sched.h
