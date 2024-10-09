@@ -1,0 +1,135 @@
+KVM: x86: replace kvm_apic_id with kvm_{x,x2}apic_id
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [x86] kvm: x86: replace kvm_apic_id with kvm_{x, x2}apic_id (Radim Krcmar) [1388961]
+Rebuild_FUZZ: 99.05%
+commit-author Radim Krčmář <rkrcmar@redhat.com>
+commit 6e50043912d9c9c119e3c9c5378869d019df70a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/6e500439.failed
+
+There were three calls sites:
+ - recalculate_apic_map and kvm_apic_match_physical_addr, where it would
+   only complicate implementation of x2APIC hotplug;
+ - in apic_debug, where it was still somewhat preserved, but keeping the
+   old function just for apic_debug was not worth it
+
+	Reviewed-by: David Hildenbrand <david@redhat.com>
+	Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 6e50043912d9c9c119e3c9c5378869d019df70a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/lapic.c
+#	arch/x86/kvm/lapic.h
+diff --cc arch/x86/kvm/lapic.c
+index 323d098efc5e,7c142f0fe9fd..000000000000
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@@ -128,15 -115,14 +128,26 @@@ static inline int apic_enabled(struct k
+  	(LVT_MASK | APIC_MODE_MASK | APIC_INPUT_POLARITY | \
+  	 APIC_LVT_REMOTE_IRR | APIC_LVT_LEVEL_TRIGGER)
+  
+++<<<<<<< HEAD
+ +static inline u32 kvm_apic_id(struct kvm_lapic *apic)
+ +{
+ +	/* To avoid a race between apic_base and following APIC_ID update when
+ +	 * switching to x2apic_mode, the x2apic mode returns initial x2apic id.
+ +	 */
+ +	if (apic_x2apic_mode(apic))
+ +		return apic->vcpu->vcpu_id;
+ +
+ +	return kvm_apic_get_reg(apic, APIC_ID) >> 24;
+++=======
++ static inline u8 kvm_xapic_id(struct kvm_lapic *apic)
++ {
++ 	return kvm_lapic_get_reg(apic, APIC_ID) >> 24;
++ }
++ 
++ static inline u32 kvm_x2apic_id(struct kvm_lapic *apic)
++ {
++ 	return apic->vcpu->vcpu_id;
+++>>>>>>> 6e50043912d9 (KVM: x86: replace kvm_apic_id with kvm_{x,x2}apic_id)
+  }
+  
+  static inline bool kvm_apic_map_get_logical_dest(struct kvm_apic_map *map,
+@@@ -182,10 -175,10 +193,10 @@@ static void recalculate_apic_map(struc
+  
+  	kvm_for_each_vcpu(i, vcpu, kvm)
+  		if (kvm_apic_present(vcpu))
+- 			max_id = max(max_id, kvm_apic_id(vcpu->arch.apic));
++ 			max_id = max(max_id, kvm_x2apic_id(vcpu->arch.apic));
+  
+ -	new = kvm_kvzalloc(sizeof(struct kvm_apic_map) +
+ -	                   sizeof(struct kvm_lapic *) * ((u64)max_id + 1));
+ +	new = kzalloc(sizeof(struct kvm_apic_map) +
+ +	              sizeof(struct kvm_lapic *) * (max_id + 1), GFP_KERNEL);
+  
+  	if (!new)
+  		goto out;
+@@@ -201,9 -194,8 +212,14 @@@
+  		if (!kvm_apic_present(vcpu))
+  			continue;
+  
+++<<<<<<< HEAD
+ +		aid = kvm_apic_id(apic);
+ +		ldr = kvm_apic_get_reg(apic, APIC_LDR);
+ +
+++=======
++ 		aid = apic_x2apic_mode(apic) ? kvm_x2apic_id(apic)
++ 		                             : kvm_xapic_id(apic);
+++>>>>>>> 6e50043912d9 (KVM: x86: replace kvm_apic_id with kvm_{x,x2}apic_id)
+  		if (aid <= new->max_apic_id)
+  			new->phys_map[aid] = apic;
+  
+@@@ -267,8 -261,10 +285,15 @@@ static inline void kvm_apic_set_x2apic_
+  {
+  	u32 ldr = ((id >> 4) << 16) | (1 << (id & 0xf));
+  
+++<<<<<<< HEAD
+ +	apic_set_reg(apic, APIC_ID, id);
+ +	apic_set_reg(apic, APIC_LDR, ldr);
+++=======
++ 	WARN_ON_ONCE(id != apic->vcpu->vcpu_id);
++ 
++ 	kvm_lapic_set_reg(apic, APIC_ID, id);
++ 	kvm_lapic_set_reg(apic, APIC_LDR, ldr);
+++>>>>>>> 6e50043912d9 (KVM: x86: replace kvm_apic_id with kvm_{x,x2}apic_id)
+  	recalculate_apic_map(apic->vcpu->kvm);
+  }
+  
+diff --cc arch/x86/kvm/lapic.h
+index b8914800e469,cb16e6fd2330..000000000000
+--- a/arch/x86/kvm/lapic.h
++++ b/arch/x86/kvm/lapic.h
+@@@ -157,17 -191,17 +157,20 @@@ static inline bool kvm_apic_has_events(
+  	return lapic_in_kernel(vcpu) && vcpu->arch.apic->pending_events;
+  }
+  
+ -static inline bool kvm_lowest_prio_delivery(struct kvm_lapic_irq *irq)
+ +static inline int kvm_lapic_latched_init(struct kvm_vcpu *vcpu)
+  {
+ -	return (irq->delivery_mode == APIC_DM_LOWEST ||
+ -			irq->msi_redir_hint);
+ +	return lapic_in_kernel(vcpu) && test_bit(KVM_APIC_INIT, &vcpu->arch.apic->pending_events);
+  }
+  
+ -static inline int kvm_lapic_latched_init(struct kvm_vcpu *vcpu)
+++<<<<<<< HEAD
+ +static inline bool kvm_lowest_prio_delivery(struct kvm_lapic_irq *irq)
+  {
+ -	return lapic_in_kernel(vcpu) && test_bit(KVM_APIC_INIT, &vcpu->arch.apic->pending_events);
+ +	return (irq->delivery_mode == APIC_DM_LOWEST ||
+ +			irq->msi_redir_hint);
+  }
+  
+++=======
+++>>>>>>> 6e50043912d9 (KVM: x86: replace kvm_apic_id with kvm_{x,x2}apic_id)
+  bool kvm_apic_pending_eoi(struct kvm_vcpu *vcpu, int vector);
+  
+  void wait_lapic_expire(struct kvm_vcpu *vcpu);
+* Unmerged path arch/x86/kvm/lapic.c
+* Unmerged path arch/x86/kvm/lapic.h
