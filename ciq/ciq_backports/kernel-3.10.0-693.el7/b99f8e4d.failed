@@ -1,0 +1,488 @@
+IB/srpt: convert to the generic RDMA READ/WRITE API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit b99f8e4d7bcd3bfbb3cd965918523299370d0cb2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/b99f8e4d.failed
+
+Replace the homegrown RDMA READ/WRITE code in srpt with the generic API.
+The only real twist here is that we need to allocate one Linux scatterlist
+per direct buffer in the SRP command, and chain them before handing them
+off to the target core.
+
+As a side-effect of the conversion the driver will also chain the SEND
+of the SRP response to the RDMA WRITE WRs for a DATA OUT command, and
+properly account for RDMA WRITE WRs instead of just for RDMA READ WRs
+like the driver previously did.
+
+We now allocate half of the SQ size to RDMA READ/WRITE contexts, assuming
+by default one RDMA READ or WRITE operation per command.  If a command
+has multiple operations it will eat into the budget but will still succeed,
+possible after waiting for WQEs to be available.
+
+Also ensure the QPs request the maximum allowed SGEs so that RDMA R/W API
+works correctly.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit b99f8e4d7bcd3bfbb3cd965918523299370d0cb2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/srpt/ib_srpt.c
+#	drivers/infiniband/ulp/srpt/ib_srpt.h
+diff --cc drivers/infiniband/ulp/srpt/ib_srpt.c
+index 316f3bbb1b05,2843f1ae75bd..000000000000
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.c
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.c
+@@@ -751,51 -765,142 +751,190 @@@ static int srpt_post_recv(struct srpt_d
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * srpt_post_send() - Post an IB send request.
+ + *
+ + * Returns zero upon success and a non-zero value upon failure.
+ + */
+ +static int srpt_post_send(struct srpt_rdma_ch *ch,
+ +			  struct srpt_send_ioctx *ioctx, int len)
+ +{
+ +	struct ib_sge list;
+ +	struct ib_send_wr wr, *bad_wr;
+ +	struct srpt_device *sdev = ch->sport->sdev;
+ +	int ret;
+ +
+ +	atomic_inc(&ch->req_lim);
+ +
+ +	ret = -ENOMEM;
+ +	if (unlikely(atomic_dec_return(&ch->sq_wr_avail) < 0)) {
+ +		pr_warn("IB send queue full (needed 1)\n");
+ +		goto out;
+ +	}
+ +
+ +	ib_dma_sync_single_for_device(sdev->device, ioctx->ioctx.dma, len,
+ +				      DMA_TO_DEVICE);
+ +
+ +	list.addr = ioctx->ioctx.dma;
+ +	list.length = len;
+ +	list.lkey = sdev->pd->local_dma_lkey;
+ +
+ +	ioctx->ioctx.cqe.done = srpt_send_done;
+ +	wr.next = NULL;
+ +	wr.wr_cqe = &ioctx->ioctx.cqe;
+ +	wr.sg_list = &list;
+ +	wr.num_sge = 1;
+ +	wr.opcode = IB_WR_SEND;
+ +	wr.send_flags = IB_SEND_SIGNALED;
+ +
+ +	ret = ib_post_send(ch->qp, &wr, &bad_wr);
+ +
+ +out:
+ +	if (ret < 0) {
+ +		atomic_inc(&ch->sq_wr_avail);
+ +		atomic_dec(&ch->req_lim);
+ +	}
+ +	return ret;
+ +}
+ +
+++=======
++  * srpt_zerolength_write() - Perform a zero-length RDMA write.
++  *
++  * A quote from the InfiniBand specification: C9-88: For an HCA responder
++  * using Reliable Connection service, for each zero-length RDMA READ or WRITE
++  * request, the R_Key shall not be validated, even if the request includes
++  * Immediate data.
++  */
++ static int srpt_zerolength_write(struct srpt_rdma_ch *ch)
++ {
++ 	struct ib_send_wr wr, *bad_wr;
++ 
++ 	memset(&wr, 0, sizeof(wr));
++ 	wr.opcode = IB_WR_RDMA_WRITE;
++ 	wr.wr_cqe = &ch->zw_cqe;
++ 	wr.send_flags = IB_SEND_SIGNALED;
++ 	return ib_post_send(ch->qp, &wr, &bad_wr);
++ }
++ 
++ static void srpt_zerolength_write_done(struct ib_cq *cq, struct ib_wc *wc)
++ {
++ 	struct srpt_rdma_ch *ch = cq->cq_context;
++ 
++ 	if (wc->status == IB_WC_SUCCESS) {
++ 		srpt_process_wait_list(ch);
++ 	} else {
++ 		if (srpt_set_ch_state(ch, CH_DISCONNECTED))
++ 			schedule_work(&ch->release_work);
++ 		else
++ 			WARN_ONCE(1, "%s-%d\n", ch->sess_name, ch->qp->qp_num);
++ 	}
++ }
++ 
++ static int srpt_alloc_rw_ctxs(struct srpt_send_ioctx *ioctx,
++ 		struct srp_direct_buf *db, int nbufs, struct scatterlist **sg,
++ 		unsigned *sg_cnt)
++ {
++ 	enum dma_data_direction dir = target_reverse_dma_direction(&ioctx->cmd);
++ 	struct srpt_rdma_ch *ch = ioctx->ch;
++ 	struct scatterlist *prev = NULL;
++ 	unsigned prev_nents;
++ 	int ret, i;
++ 
++ 	if (nbufs == 1) {
++ 		ioctx->rw_ctxs = &ioctx->s_rw_ctx;
++ 	} else {
++ 		ioctx->rw_ctxs = kmalloc_array(nbufs, sizeof(*ioctx->rw_ctxs),
++ 			GFP_KERNEL);
++ 		if (!ioctx->rw_ctxs)
++ 			return -ENOMEM;
++ 	}
++ 
++ 	for (i = ioctx->n_rw_ctx; i < nbufs; i++, db++) {
++ 		struct srpt_rw_ctx *ctx = &ioctx->rw_ctxs[i];
++ 		u64 remote_addr = be64_to_cpu(db->va);
++ 		u32 size = be32_to_cpu(db->len);
++ 		u32 rkey = be32_to_cpu(db->key);
++ 
++ 		ret = target_alloc_sgl(&ctx->sg, &ctx->nents, size, false,
++ 				i < nbufs - 1);
++ 		if (ret)
++ 			goto unwind;
++ 
++ 		ret = rdma_rw_ctx_init(&ctx->rw, ch->qp, ch->sport->port,
++ 				ctx->sg, ctx->nents, 0, remote_addr, rkey, dir);
++ 		if (ret < 0) {
++ 			target_free_sgl(ctx->sg, ctx->nents);
++ 			goto unwind;
++ 		}
++ 
++ 		ioctx->n_rdma += ret;
++ 		ioctx->n_rw_ctx++;
++ 
++ 		if (prev) {
++ 			sg_unmark_end(&prev[prev_nents - 1]);
++ 			sg_chain(prev, prev_nents + 1, ctx->sg);
++ 		} else {
++ 			*sg = ctx->sg;
++ 		}
++ 
++ 		prev = ctx->sg;
++ 		prev_nents = ctx->nents;
++ 
++ 		*sg_cnt += ctx->nents;
++ 	}
++ 
++ 	return 0;
++ 
++ unwind:
++ 	while (--i >= 0) {
++ 		struct srpt_rw_ctx *ctx = &ioctx->rw_ctxs[i];
++ 
++ 		rdma_rw_ctx_destroy(&ctx->rw, ch->qp, ch->sport->port,
++ 				ctx->sg, ctx->nents, dir);
++ 		target_free_sgl(ctx->sg, ctx->nents);
++ 	}
++ 	if (ioctx->rw_ctxs != &ioctx->s_rw_ctx)
++ 		kfree(ioctx->rw_ctxs);
++ 	return ret;
++ }
++ 
++ static void srpt_free_rw_ctxs(struct srpt_rdma_ch *ch,
++ 				    struct srpt_send_ioctx *ioctx)
++ {
++ 	enum dma_data_direction dir = target_reverse_dma_direction(&ioctx->cmd);
++ 	int i;
++ 
++ 	for (i = 0; i < ioctx->n_rw_ctx; i++) {
++ 		struct srpt_rw_ctx *ctx = &ioctx->rw_ctxs[i];
++ 
++ 		rdma_rw_ctx_destroy(&ctx->rw, ch->qp, ch->sport->port,
++ 				ctx->sg, ctx->nents, dir);
++ 		target_free_sgl(ctx->sg, ctx->nents);
++ 	}
++ 
++ 	if (ioctx->rw_ctxs != &ioctx->s_rw_ctx)
++ 		kfree(ioctx->rw_ctxs);
++ }
++ 
++ static inline void *srpt_get_desc_buf(struct srp_cmd *srp_cmd)
++ {
++ 	/*
++ 	 * The pointer computations below will only be compiled correctly
++ 	 * if srp_cmd::add_data is declared as s8*, u8*, s8[] or u8[], so check
++ 	 * whether srp_cmd::add_data has been declared as a byte pointer.
++ 	 */
++ 	BUILD_BUG_ON(!__same_type(srp_cmd->add_data[0], (s8)0) &&
++ 		     !__same_type(srp_cmd->add_data[0], (u8)0));
++ 
++ 	/*
++ 	 * According to the SRP spec, the lower two bits of the 'ADDITIONAL
++ 	 * CDB LENGTH' field are reserved and the size in bytes of this field
++ 	 * is four times the value specified in bits 3..7. Hence the "& ~3".
++ 	 */
++ 	return srp_cmd->add_data + (srp_cmd->add_cdb_len & ~3);
++ }
++ 
+++>>>>>>> b99f8e4d7bcd (IB/srpt: convert to the generic RDMA READ/WRITE API)
+  /**
+   * srpt_get_desc_tbl() - Parse the data descriptors of an SRP_CMD request.
+   * @ioctx: Pointer to the I/O context associated with the request.
+@@@ -1490,9 -1328,10 +1362,11 @@@ static int srpt_handle_cmd(struct srpt_
+  {
+  	struct se_cmd *cmd;
+  	struct srp_cmd *srp_cmd;
++ 	struct scatterlist *sg = NULL;
++ 	unsigned sg_cnt = 0;
+  	u64 data_len;
+  	enum dma_data_direction dir;
+ +	sense_reason_t ret;
+  	int rc;
+  
+  	BUG_ON(!send_ioctx);
+@@@ -1517,26 -1356,31 +1391,38 @@@
+  		break;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (srpt_get_desc_tbl(send_ioctx, srp_cmd, &dir, &data_len)) {
+ +		printk(KERN_ERR "0x%llx: parsing SRP descriptor table failed.\n",
+ +		       srp_cmd->tag);
+ +		ret = TCM_INVALID_CDB_FIELD;
+ +		goto send_sense;
+++=======
++ 	rc = srpt_get_desc_tbl(send_ioctx, srp_cmd, &dir, &sg, &sg_cnt,
++ 			&data_len);
++ 	if (rc) {
++ 		if (rc != -EAGAIN) {
++ 			pr_err("0x%llx: parsing SRP descriptor table failed.\n",
++ 			       srp_cmd->tag);
++ 		}
++ 		goto release_ioctx;
+++>>>>>>> b99f8e4d7bcd (IB/srpt: convert to the generic RDMA READ/WRITE API)
+  	}
+  
+- 	rc = target_submit_cmd(cmd, ch->sess, srp_cmd->cdb,
++ 	rc = target_submit_cmd_map_sgls(cmd, ch->sess, srp_cmd->cdb,
+  			       &send_ioctx->sense_data[0],
+  			       scsilun_to_int(&srp_cmd->lun), data_len,
+- 			       TCM_SIMPLE_TAG, dir, TARGET_SCF_ACK_KREF);
++ 			       TCM_SIMPLE_TAG, dir, TARGET_SCF_ACK_KREF,
++ 			       sg, sg_cnt, NULL, 0, NULL, 0);
+  	if (rc != 0) {
+ -		pr_debug("target_submit_cmd() returned %d for tag %#llx\n", rc,
+ -			 srp_cmd->tag);
+ -		goto release_ioctx;
+ +		ret = TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+ +		goto send_sense;
+  	}
+ -	return;
+ +	return 0;
+  
+ -release_ioctx:
+ -	send_ioctx->state = SRPT_STATE_DONE;
+ -	srpt_release_cmd(cmd);
+ +send_sense:
+ +	transport_send_check_condition_and_sense(cmd, ret, 0);
+ +	return -1;
+  }
+  
+  static int srp_tmr_to_tcm(int fn)
+@@@ -2511,38 -2206,44 +2317,78 @@@ static int srpt_write_pending_status(st
+   */
+  static int srpt_write_pending(struct se_cmd *se_cmd)
+  {
+++<<<<<<< HEAD
+ +	struct srpt_rdma_ch *ch;
+ +	struct srpt_send_ioctx *ioctx;
+ +	enum srpt_command_state new_state;
+ +	int ret;
+ +
+ +	ioctx = container_of(se_cmd, struct srpt_send_ioctx, cmd);
+++=======
++ 	struct srpt_send_ioctx *ioctx =
++ 		container_of(se_cmd, struct srpt_send_ioctx, cmd);
++ 	struct srpt_rdma_ch *ch = ioctx->ch;
++ 	struct ib_send_wr *first_wr = NULL, *bad_wr;
++ 	struct ib_cqe *cqe = &ioctx->rdma_cqe;
++ 	enum srpt_command_state new_state;
++ 	int ret, i;
+++>>>>>>> b99f8e4d7bcd (IB/srpt: convert to the generic RDMA READ/WRITE API)
+  
+  	new_state = srpt_set_cmd_state(ioctx, SRPT_STATE_NEED_DATA);
+  	WARN_ON(new_state == SRPT_STATE_DONE);
+  
+++<<<<<<< HEAD
+ +	ch = ioctx->ch;
+ +	BUG_ON(!ch);
+ +
+ +	switch (ch->state) {
+ +	case CH_CONNECTING:
+ +		WARN(true, "unexpected channel state %d\n", ch->state);
+ +		ret = -EINVAL;
+ +		goto out;
+ +	case CH_LIVE:
+ +		break;
+ +	case CH_DISCONNECTING:
+ +	case CH_DRAINING:
+ +	case CH_RELEASING:
+ +		pr_debug("cmd with tag %lld: channel disconnecting\n",
+ +			 ioctx->tag);
+ +		srpt_set_cmd_state(ioctx, SRPT_STATE_DATA_IN);
+ +		ret = -EINVAL;
+ +		goto out;
+ +	}
+ +	ret = srpt_xfer_data(ch, ioctx);
+ +
+ +out:
+++=======
++ 	if (atomic_sub_return(ioctx->n_rdma, &ch->sq_wr_avail) < 0) {
++ 		pr_warn("%s: IB send queue full (needed %d)\n",
++ 				__func__, ioctx->n_rdma);
++ 		ret = -ENOMEM;
++ 		goto out_undo;
++ 	}
++ 
++ 	cqe->done = srpt_rdma_read_done;
++ 	for (i = ioctx->n_rw_ctx - 1; i >= 0; i--) {
++ 		struct srpt_rw_ctx *ctx = &ioctx->rw_ctxs[i];
++ 
++ 		first_wr = rdma_rw_ctx_wrs(&ctx->rw, ch->qp, ch->sport->port,
++ 				cqe, first_wr);
++ 		cqe = NULL;
++ 	}
++ 	
++ 	ret = ib_post_send(ch->qp, first_wr, &bad_wr);
++ 	if (ret) {
++ 		pr_err("%s: ib_post_send() returned %d for %d (avail: %d)\n",
++ 			 __func__, ret, ioctx->n_rdma,
++ 			 atomic_read(&ch->sq_wr_avail));
++ 		goto out_undo;
++ 	}
++ 
++ 	return 0;
++ out_undo:
++ 	atomic_add(ioctx->n_rdma, &ch->sq_wr_avail);
+++>>>>>>> b99f8e4d7bcd (IB/srpt: convert to the generic RDMA READ/WRITE API)
+  	return ret;
+  }
+  
+@@@ -2602,17 -2303,19 +2448,27 @@@ static void srpt_queue_response(struct 
+  		return;
+  	}
+  
+- 	dir = ioctx->cmd.data_direction;
+- 
+  	/* For read commands, transfer the data to the initiator. */
+- 	if (dir == DMA_FROM_DEVICE && ioctx->cmd.data_length &&
++ 	if (ioctx->cmd.data_direction == DMA_FROM_DEVICE &&
++ 	    ioctx->cmd.data_length &&
+  	    !ioctx->queue_status_only) {
+++<<<<<<< HEAD
+ +		ret = srpt_xfer_data(ch, ioctx);
+ +		if (ret) {
+ +			pr_err("xfer_data failed for tag %llu\n",
+ +			       ioctx->tag);
+ +			return;
+++=======
++ 		for (i = ioctx->n_rw_ctx - 1; i >= 0; i--) {
++ 			struct srpt_rw_ctx *ctx = &ioctx->rw_ctxs[i];
++ 
++ 			first_wr = rdma_rw_ctx_wrs(&ctx->rw, ch->qp,
++ 					ch->sport->port, NULL,
++ 					first_wr ? first_wr : &send_wr);
+++>>>>>>> b99f8e4d7bcd (IB/srpt: convert to the generic RDMA READ/WRITE API)
+  		}
++ 	} else {
++ 		first_wr = &send_wr;
+  	}
+  
+  	if (state != SRPT_STATE_MGMT)
+@@@ -2622,16 -2325,48 +2478,58 @@@
+  		srp_tm_status
+  			= tcm_to_srp_tsk_mgmt_status(cmd->se_tmr_req->response);
+  		resp_len = srpt_build_tskmgmt_rsp(ch, ioctx, srp_tm_status,
+ -						 ioctx->cmd.tag);
+ +						 ioctx->tag);
+  	}
+++<<<<<<< HEAD
+ +	ret = srpt_post_send(ch, ioctx, resp_len);
+ +	if (ret) {
+ +		pr_err("sending cmd response failed for tag %llu\n",
+ +		       ioctx->tag);
+ +		srpt_unmap_sg_to_ib_sge(ch, ioctx);
+ +		srpt_set_cmd_state(ioctx, SRPT_STATE_DONE);
+ +		target_put_sess_cmd(&ioctx->cmd);
+++=======
++ 
++ 	atomic_inc(&ch->req_lim);
++ 
++ 	if (unlikely(atomic_sub_return(1 + ioctx->n_rdma,
++ 			&ch->sq_wr_avail) < 0)) {
++ 		pr_warn("%s: IB send queue full (needed %d)\n",
++ 				__func__, ioctx->n_rdma);
++ 		ret = -ENOMEM;
++ 		goto out;
+++>>>>>>> b99f8e4d7bcd (IB/srpt: convert to the generic RDMA READ/WRITE API)
+  	}
++ 
++ 	ib_dma_sync_single_for_device(sdev->device, ioctx->ioctx.dma, resp_len,
++ 				      DMA_TO_DEVICE);
++ 
++ 	sge.addr = ioctx->ioctx.dma;
++ 	sge.length = resp_len;
++ 	sge.lkey = sdev->pd->local_dma_lkey;
++ 
++ 	ioctx->ioctx.cqe.done = srpt_send_done;
++ 	send_wr.next = NULL;
++ 	send_wr.wr_cqe = &ioctx->ioctx.cqe;
++ 	send_wr.sg_list = &sge;
++ 	send_wr.num_sge = 1;
++ 	send_wr.opcode = IB_WR_SEND;
++ 	send_wr.send_flags = IB_SEND_SIGNALED;
++ 
++ 	ret = ib_post_send(ch->qp, first_wr, &bad_wr);
++ 	if (ret < 0) {
++ 		pr_err("%s: sending cmd response failed for tag %llu (%d)\n",
++ 			__func__, ioctx->cmd.tag, ret);
++ 		goto out;
++ 	}
++ 
++ 	return;
++ 
++ out:
++ 	atomic_add(1 + ioctx->n_rdma, &ch->sq_wr_avail);
++ 	atomic_dec(&ch->req_lim);
++ 	srpt_set_cmd_state(ioctx, SRPT_STATE_DONE);
++ 	target_put_sess_cmd(&ioctx->cmd);
+  }
+  
+  static int srpt_queue_data_in(struct se_cmd *cmd)
+diff --cc drivers/infiniband/ulp/srpt/ib_srpt.h
+index 886950568e7c,fee6bfd7ca21..000000000000
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.h
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.h
+@@@ -207,14 -203,10 +203,17 @@@ struct srpt_send_ioctx 
+  	enum srpt_command_state	state;
+  	struct se_cmd		cmd;
+  	struct completion	tx_done;
+++<<<<<<< HEAD
+ +	u64			tag;
+ +	int			sg_cnt;
+ +	int			mapped_sg_count;
+ +	u16			n_rdma_wrs;
+++=======
+++>>>>>>> b99f8e4d7bcd (IB/srpt: convert to the generic RDMA READ/WRITE API)
+  	u8			n_rdma;
+- 	u8			n_rbuf;
++ 	u8			n_rw_ctx;
+  	bool			queue_status_only;
+ -	u8			sense_data[TRANSPORT_SENSE_BUFFER];
+ +	u8			sense_data[SCSI_SENSE_BUFFERSIZE];
+  };
+  
+  /**
+* Unmerged path drivers/infiniband/ulp/srpt/ib_srpt.c
+* Unmerged path drivers/infiniband/ulp/srpt/ib_srpt.h
