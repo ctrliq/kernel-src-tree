@@ -1,0 +1,656 @@
+xprtrdma: Refactor MR recovery work queues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 505bbe64dd04b105c1377703252758ac56f92485
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/505bbe64.failed
+
+I found that commit ead3f26e359e ("xprtrdma: Add ro_unmap_safe
+memreg method"), which introduces ro_unmap_safe, never wired up the
+FMR recovery worker.
+
+The FMR and FRWR recovery work queues both do the same thing.
+Instead of setting up separate individual work queues for this,
+schedule a delayed worker to deal with them, since recovering MRs is
+not performance-critical.
+
+Fixes: ead3f26e359e ("xprtrdma: Add ro_unmap_safe memreg method")
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Tested-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 505bbe64dd04b105c1377703252758ac56f92485)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/fmr_ops.c
+#	net/sunrpc/xprtrdma/frwr_ops.c
+#	net/sunrpc/xprtrdma/xprt_rdma.h
+diff --cc net/sunrpc/xprtrdma/fmr_ops.c
+index ecde1e1b320a,4837ced20b65..000000000000
+--- a/net/sunrpc/xprtrdma/fmr_ops.c
++++ b/net/sunrpc/xprtrdma/fmr_ops.c
+@@@ -35,29 -28,49 +28,37 @@@
+  /* Maximum scatter/gather per FMR */
+  #define RPCRDMA_MAX_FMR_SGES	(64)
+  
+ -/* Access mode of externally registered pages */
+ -enum {
+ -	RPCRDMA_FMR_ACCESS_FLAGS	= IB_ACCESS_REMOTE_WRITE |
+ -					  IB_ACCESS_REMOTE_READ,
+ -};
+++<<<<<<< HEAD
+ +static struct workqueue_struct *fmr_recovery_wq;
+  
+ -static int
+ -__fmr_init(struct rpcrdma_mw *mw, struct ib_pd *pd)
+ -{
+ -	static struct ib_fmr_attr fmr_attr = {
+ -		.max_pages	= RPCRDMA_MAX_FMR_SGES,
+ -		.max_maps	= 1,
+ -		.page_shift	= PAGE_SHIFT
+ -	};
+ -
+ -	mw->fmr.fm_physaddrs = kcalloc(RPCRDMA_MAX_FMR_SGES,
+ -				       sizeof(u64), GFP_KERNEL);
+ -	if (!mw->fmr.fm_physaddrs)
+ -		goto out_free;
+ -
+ -	mw->mw_sg = kcalloc(RPCRDMA_MAX_FMR_SGES,
+ -			    sizeof(*mw->mw_sg), GFP_KERNEL);
+ -	if (!mw->mw_sg)
+ -		goto out_free;
+ +#define FMR_RECOVERY_WQ_FLAGS		(WQ_UNBOUND)
+  
+ -	sg_init_table(mw->mw_sg, RPCRDMA_MAX_FMR_SGES);
+ -
+ -	mw->fmr.fm_mr = ib_alloc_fmr(pd, RPCRDMA_FMR_ACCESS_FLAGS,
+ -				     &fmr_attr);
+ -	if (IS_ERR(mw->fmr.fm_mr))
+ -		goto out_fmr_err;
+ +int
+ +fmr_alloc_recovery_wq(void)
+ +{
+ +	fmr_recovery_wq = alloc_workqueue("fmr_recovery", WQ_UNBOUND, 0);
+ +	return !fmr_recovery_wq ? -ENOMEM : 0;
+ +}
+  
+ -	return 0;
+ +void
+ +fmr_destroy_recovery_wq(void)
+ +{
+ +	struct workqueue_struct *wq;
+  
+ -out_fmr_err:
+ -	dprintk("RPC:       %s: ib_alloc_fmr returned %ld\n", __func__,
+ -		PTR_ERR(mw->fmr.fm_mr));
+ +	if (!fmr_recovery_wq)
+ +		return;
+  
+ -out_free:
+ -	kfree(mw->mw_sg);
+ -	kfree(mw->fmr.fm_physaddrs);
+ -	return -ENOMEM;
+ +	wq = fmr_recovery_wq;
+ +	fmr_recovery_wq = NULL;
+ +	destroy_workqueue(wq);
+  }
+++=======
+++/* Access mode of externally registered pages */
+++enum {
+++	RPCRDMA_FMR_ACCESS_FLAGS	= IB_ACCESS_REMOTE_WRITE |
+++					  IB_ACCESS_REMOTE_READ,
+++};
+++>>>>>>> 505bbe64dd04 (xprtrdma: Refactor MR recovery work queues)
+  
+  static int
+  __fmr_unmap(struct rpcrdma_mw *mw)
+@@@ -71,29 -84,56 +72,72 @@@
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +/* Deferred reset of a single FMR. Generate a fresh rkey by
+ + * replacing the MR. There's no recovery if this fails.
+++=======
++ static void
++ __fmr_release(struct rpcrdma_mw *r)
++ {
++ 	LIST_HEAD(unmap_list);
++ 	int rc;
++ 
++ 	kfree(r->fmr.fm_physaddrs);
++ 	kfree(r->mw_sg);
++ 
++ 	/* In case this one was left mapped, try to unmap it
++ 	 * to prevent dealloc_fmr from failing with EBUSY
++ 	 */
++ 	rc = __fmr_unmap(r);
++ 	if (rc)
++ 		pr_err("rpcrdma: final ib_unmap_fmr for %p failed %i\n",
++ 		       r, rc);
++ 
++ 	rc = ib_dealloc_fmr(r->fmr.fm_mr);
++ 	if (rc)
++ 		pr_err("rpcrdma: final ib_dealloc_fmr for %p returned %i\n",
++ 		       r, rc);
++ }
++ 
++ /* Reset of a single FMR.
++  *
++  * There's no recovery if this fails. The FMR is abandoned, but
++  * remains in rb_all. It will be cleaned up when the transport is
++  * destroyed.
+++>>>>>>> 505bbe64dd04 (xprtrdma: Refactor MR recovery work queues)
+   */
+  static void
+- __fmr_recovery_worker(struct work_struct *work)
++ fmr_op_recover_mr(struct rpcrdma_mw *mw)
+  {
+++<<<<<<< HEAD
+ +	struct rpcrdma_mw *mw = container_of(work, struct rpcrdma_mw,
+ +					    mw_work);
+ +	struct rpcrdma_xprt *r_xprt = mw->mw_xprt;
+ +
+ +	__fmr_unmap(mw);
+ +	rpcrdma_put_mw(r_xprt, mw);
+ +	return;
+ +}
+++=======
++ 	struct rpcrdma_xprt *r_xprt = mw->mw_xprt;
++ 	int rc;
+  
+- /* A broken MR was discovered in a context that can't sleep.
+-  * Defer recovery to the recovery worker.
+-  */
+- static void
+- __fmr_queue_recovery(struct rpcrdma_mw *mw)
+- {
+- 	INIT_WORK(&mw->mw_work, __fmr_recovery_worker);
+- 	queue_work(fmr_recovery_wq, &mw->mw_work);
++ 	/* ORDER: invalidate first */
++ 	rc = __fmr_unmap(mw);
+++>>>>>>> 505bbe64dd04 (xprtrdma: Refactor MR recovery work queues)
++ 
++ 	/* ORDER: then DMA unmap */
++ 	ib_dma_unmap_sg(r_xprt->rx_ia.ri_device,
++ 			mw->mw_sg, mw->mw_nents, mw->mw_dir);
++ 	if (rc) {
++ 		pr_err("rpcrdma: FMR reset status %d, %p orphaned\n",
++ 		       rc, mw);
++ 		r_xprt->rx_stats.mrs_orphaned++;
++ 		return;
++ 	}
++ 
++ 	rpcrdma_put_mw(r_xprt, mw);
++ 	r_xprt->rx_stats.mrs_recovered++;
+  }
+  
+  static int
+@@@ -220,18 -248,22 +259,25 @@@ fmr_op_map(struct rpcrdma_xprt *r_xprt
+  		goto out_maperr;
+  
+  	seg1->rl_mw = mw;
+ -	seg1->mr_rkey = mw->fmr.fm_mr->rkey;
+ -	seg1->mr_base = dma_pages[0] + pageoff;
+ -	seg1->mr_nsegs = mw->mw_nents;
+ +	seg1->mr_rkey = mw->fmr.fmr->rkey;
+ +	seg1->mr_base = seg1->mr_dma + pageoff;
+ +	seg1->mr_nsegs = i;
+  	seg1->mr_len = len;
+ -	return mw->mw_nents;
+ -
+ -out_dmamap_err:
+ -	pr_err("rpcrdma: failed to dma map sg %p sg_nents %u\n",
+ -	       mw->mw_sg, mw->mw_nents);
+ -	return -ENOMEM;
+ +	return i;
+  
+  out_maperr:
+++<<<<<<< HEAD
+ +	dprintk("RPC:       %s: ib_map_phys_fmr %u@0x%llx+%i (%d) status %i\n",
+ +		__func__, len, (unsigned long long)seg1->mr_dma,
+ +		pageoff, i, rc);
+ +	while (i--)
+ +		rpcrdma_unmap_one(device, --seg);
+++=======
++ 	pr_err("rpcrdma: ib_map_phys_fmr %u@0x%llx+%i (%d) status %i\n",
++ 	       len, (unsigned long long)dma_pages[0],
++ 	       pageoff, mw->mw_nents, rc);
++ 	rpcrdma_defer_mr_recovery(mw);
+++>>>>>>> 505bbe64dd04 (xprtrdma: Refactor MR recovery work queues)
+  	return rc;
+  }
+  
+@@@ -285,9 -307,10 +331,16 @@@ fmr_op_unmap_sync(struct rpcrdma_xprt *
+  		seg = &req->rl_segments[i];
+  		mw = seg->rl_mw;
+  
+++<<<<<<< HEAD
+ +		list_del_init(&mw->fmr.fmr->list);
+ +		__fmr_dma_unmap(r_xprt, seg);
+ +		rpcrdma_put_mw(r_xprt, seg->rl_mw);
+++=======
++ 		list_del_init(&mw->fmr.fm_mr->list);
++ 		ib_dma_unmap_sg(r_xprt->rx_ia.ri_device,
++ 				mw->mw_sg, mw->mw_nents, mw->mw_dir);
++ 		rpcrdma_put_mw(r_xprt, mw);
+++>>>>>>> 505bbe64dd04 (xprtrdma: Refactor MR recovery work queues)
+  
+  		i += seg->mr_nsegs;
+  		seg->mr_nsegs = 0;
+@@@ -317,15 -349,10 +384,22 @@@ fmr_op_unmap_safe(struct rpcrdma_xprt *
+  		seg = &req->rl_segments[i];
+  		mw = seg->rl_mw;
+  
+++<<<<<<< HEAD
+ +		if (sync) {
+ +			/* ORDER */
+ +			__fmr_unmap(mw);
+ +			__fmr_dma_unmap(r_xprt, seg);
+ +			rpcrdma_put_mw(r_xprt, mw);
+ +		} else {
+ +			__fmr_dma_unmap(r_xprt, seg);
+ +			__fmr_queue_recovery(mw);
+ +		}
+++=======
++ 		if (sync)
++ 			fmr_op_recover_mr(mw);
++ 		else
++ 			rpcrdma_defer_mr_recovery(mw);
+++>>>>>>> 505bbe64dd04 (xprtrdma: Refactor MR recovery work queues)
+  
+  		i += seg->mr_nsegs;
+  		seg->mr_nsegs = 0;
+@@@ -387,7 -377,7 +461,11 @@@ const struct rpcrdma_memreg_ops rpcrdma
+  	.ro_map				= fmr_op_map,
+  	.ro_unmap_sync			= fmr_op_unmap_sync,
+  	.ro_unmap_safe			= fmr_op_unmap_safe,
+++<<<<<<< HEAD
+ +	.ro_unmap			= fmr_op_unmap,
+++=======
++ 	.ro_recover_mr			= fmr_op_recover_mr,
+++>>>>>>> 505bbe64dd04 (xprtrdma: Refactor MR recovery work queues)
+  	.ro_open			= fmr_op_open,
+  	.ro_maxpages			= fmr_op_maxpages,
+  	.ro_init			= fmr_op_init,
+diff --cc net/sunrpc/xprtrdma/frwr_ops.c
+index 144dce124c80,cbb2d05be57f..000000000000
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@@ -73,77 -73,8 +73,80 @@@
+  # define RPCDBG_FACILITY	RPCDBG_TRANS
+  #endif
+  
+++<<<<<<< HEAD
+ +static struct workqueue_struct *frwr_recovery_wq;
+ +
+ +#define FRWR_RECOVERY_WQ_FLAGS		(WQ_UNBOUND | WQ_MEM_RECLAIM)
+ +
+ +int
+ +frwr_alloc_recovery_wq(void)
+ +{
+ +	frwr_recovery_wq = alloc_workqueue("frwr_recovery",
+ +					   FRWR_RECOVERY_WQ_FLAGS, 0);
+ +	return !frwr_recovery_wq ? -ENOMEM : 0;
+ +}
+ +
+ +void
+ +frwr_destroy_recovery_wq(void)
+ +{
+ +	struct workqueue_struct *wq;
+ +
+ +	if (!frwr_recovery_wq)
+ +		return;
+ +
+ +	wq = frwr_recovery_wq;
+ +	frwr_recovery_wq = NULL;
+ +	destroy_workqueue(wq);
+ +}
+ +
+ +/* Deferred reset of a single FRMR. Generate a fresh rkey by
+ + * replacing the MR.
+ + *
+ + * There's no recovery if this fails. The FRMR is abandoned, but
+ + * remains in rb_all. It will be cleaned up when the transport is
+ + * destroyed.
+ + */
+ +static void
+ +__frwr_recovery_worker(struct work_struct *work)
+ +{
+ +	struct rpcrdma_mw *r = container_of(work, struct rpcrdma_mw,
+ +					    frmr.fr_work);
+ +	struct rpcrdma_xprt *r_xprt = r->frmr.fr_xprt;
+ +	unsigned int depth = r_xprt->rx_ia.ri_max_frmr_depth;
+ +	struct ib_pd *pd = r_xprt->rx_ia.ri_pd;
+ +
+ +	if (ib_dereg_mr(r->frmr.fr_mr))
+ +		goto out_fail;
+ +
+ +	r->frmr.fr_mr = ib_alloc_mr(pd, IB_MR_TYPE_MEM_REG, depth);
+ +	if (IS_ERR(r->frmr.fr_mr))
+ +		goto out_fail;
+ +
+ +	dprintk("RPC:       %s: recovered FRMR %p\n", __func__, r);
+ +	r->frmr.fr_state = FRMR_IS_INVALID;
+ +	rpcrdma_put_mw(r_xprt, r);
+ +	return;
+ +
+ +out_fail:
+ +	pr_warn("RPC:       %s: FRMR %p unrecovered\n",
+ +		__func__, r);
+ +}
+ +
+ +/* A broken MR was discovered in a context that can't sleep.
+ + * Defer recovery to the recovery worker.
+ + */
+ +static void
+ +__frwr_queue_recovery(struct rpcrdma_mw *r)
+ +{
+ +	INIT_WORK(&r->frmr.fr_work, __frwr_recovery_worker);
+ +	queue_work(frwr_recovery_wq, &r->frmr.fr_work);
+ +}
+ +
+++=======
+++>>>>>>> 505bbe64dd04 (xprtrdma: Refactor MR recovery work queues)
+  static int
+ -__frwr_init(struct rpcrdma_mw *r, struct ib_pd *pd, unsigned int depth)
+ +__frwr_init(struct rpcrdma_mw *r, struct ib_pd *pd, struct ib_device *device,
+ +	    unsigned int depth)
+  {
+  	struct rpcrdma_frmr *f = &r->frmr;
+  	int rc;
+@@@ -183,9 -112,61 +186,67 @@@ __frwr_release(struct rpcrdma_mw *r
+  
+  	rc = ib_dereg_mr(r->frmr.fr_mr);
+  	if (rc)
+++<<<<<<< HEAD
+ +		dprintk("RPC:       %s: ib_dereg_mr status %i\n",
+ +			__func__, rc);
+ +	kfree(r->frmr.sg);
+++=======
++ 		pr_err("rpcrdma: final ib_dereg_mr for %p returned %i\n",
++ 		       r, rc);
++ 	kfree(r->mw_sg);
++ }
++ 
++ static int
++ __frwr_reset_mr(struct rpcrdma_ia *ia, struct rpcrdma_mw *r)
++ {
++ 	struct rpcrdma_frmr *f = &r->frmr;
++ 	int rc;
++ 
++ 	rc = ib_dereg_mr(f->fr_mr);
++ 	if (rc) {
++ 		pr_warn("rpcrdma: ib_dereg_mr status %d, frwr %p orphaned\n",
++ 			rc, r);
++ 		return rc;
++ 	}
++ 
++ 	f->fr_mr = ib_alloc_mr(ia->ri_pd, IB_MR_TYPE_MEM_REG,
++ 			       ia->ri_max_frmr_depth);
++ 	if (IS_ERR(f->fr_mr)) {
++ 		pr_warn("rpcrdma: ib_alloc_mr status %ld, frwr %p orphaned\n",
++ 			PTR_ERR(f->fr_mr), r);
++ 		return PTR_ERR(f->fr_mr);
++ 	}
++ 
++ 	dprintk("RPC:       %s: recovered FRMR %p\n", __func__, r);
++ 	f->fr_state = FRMR_IS_INVALID;
++ 	return 0;
++ }
++ 
++ /* Reset of a single FRMR. Generate a fresh rkey by replacing the MR.
++  *
++  * There's no recovery if this fails. The FRMR is abandoned, but
++  * remains in rb_all. It will be cleaned up when the transport is
++  * destroyed.
++  */
++ static void
++ frwr_op_recover_mr(struct rpcrdma_mw *mw)
++ {
++ 	struct rpcrdma_xprt *r_xprt = mw->mw_xprt;
++ 	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
++ 	int rc;
++ 
++ 	rc = __frwr_reset_mr(ia, mw);
++ 	ib_dma_unmap_sg(ia->ri_device, mw->mw_sg, mw->mw_nents, mw->mw_dir);
++ 	if (rc) {
++ 		pr_err("rpcrdma: FRMR reset status %d, %p orphaned\n",
++ 		       rc, mw);
++ 		r_xprt->rx_stats.mrs_orphaned++;
++ 		return;
++ 	}
++ 
++ 	rpcrdma_put_mw(r_xprt, mw);
++ 	r_xprt->rx_stats.mrs_recovered++;
+++>>>>>>> 505bbe64dd04 (xprtrdma: Refactor MR recovery work queues)
+  }
+  
+  static int
+@@@ -459,15 -430,25 +520,34 @@@ frwr_op_map(struct rpcrdma_xprt *r_xprt
+  	seg1->rl_mw = mw;
+  	seg1->mr_rkey = mr->rkey;
+  	seg1->mr_base = mr->iova;
+ -	seg1->mr_nsegs = mw->mw_nents;
+ +	seg1->mr_nsegs = frmr->sg_nents;
+  	seg1->mr_len = mr->length;
+  
+++<<<<<<< HEAD
+ +	return frmr->sg_nents;
+ +
+ +out_senderr:
+ +	dprintk("RPC:       %s: ib_post_send status %i\n", __func__, rc);
+ +	ib_dma_unmap_sg(device, frmr->sg, dma_nents, direction);
+ +	__frwr_queue_recovery(mw);
+++=======
++ 	return mw->mw_nents;
++ 
++ out_dmamap_err:
++ 	pr_err("rpcrdma: failed to dma map sg %p sg_nents %u\n",
++ 	       mw->mw_sg, mw->mw_nents);
++ 	return -ENOMEM;
++ 
++ out_mapmr_err:
++ 	pr_err("rpcrdma: failed to map mr %p (%u/%u)\n",
++ 	       frmr->fr_mr, n, mw->mw_nents);
++ 	rc = n < 0 ? n : -EIO;
++ 	rpcrdma_defer_mr_recovery(mw);
++ 	return rc;
++ 
++ out_senderr:
++ 	rpcrdma_defer_mr_recovery(mw);
+++>>>>>>> 505bbe64dd04 (xprtrdma: Refactor MR recovery work queues)
+  	return rc;
+  }
+  
+@@@ -601,9 -587,9 +681,13 @@@ frwr_op_unmap_safe(struct rpcrdma_xprt 
+  		mw = seg->rl_mw;
+  
+  		if (sync)
+++<<<<<<< HEAD
+ +			__frwr_reset_and_unmap(r_xprt, mw);
+++=======
++ 			frwr_op_recover_mr(mw);
+++>>>>>>> 505bbe64dd04 (xprtrdma: Refactor MR recovery work queues)
+  		else
+- 			__frwr_queue_recovery(mw);
++ 			rpcrdma_defer_mr_recovery(mw);
+  
+  		i += seg->mr_nsegs;
+  		seg->mr_nsegs = 0;
+@@@ -673,7 -614,7 +754,11 @@@ const struct rpcrdma_memreg_ops rpcrdma
+  	.ro_map				= frwr_op_map,
+  	.ro_unmap_sync			= frwr_op_unmap_sync,
+  	.ro_unmap_safe			= frwr_op_unmap_safe,
+++<<<<<<< HEAD
+ +	.ro_unmap			= frwr_op_unmap,
+++=======
++ 	.ro_recover_mr			= frwr_op_recover_mr,
+++>>>>>>> 505bbe64dd04 (xprtrdma: Refactor MR recovery work queues)
+  	.ro_open			= frwr_op_open,
+  	.ro_maxpages			= frwr_op_maxpages,
+  	.ro_init			= frwr_op_init,
+diff --cc net/sunrpc/xprtrdma/xprt_rdma.h
+index 616f26ccd604,4e03037d042c..000000000000
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@@ -245,7 -245,7 +245,11 @@@ struct rpcrdma_mw 
+  		struct rpcrdma_fmr	fmr;
+  		struct rpcrdma_frmr	frmr;
+  	};
+++<<<<<<< HEAD
+ +	struct list_head	mw_list;
+++=======
++ 	struct rpcrdma_xprt	*mw_xprt;
+++>>>>>>> 505bbe64dd04 (xprtrdma: Refactor MR recovery work queues)
+  	struct list_head	mw_all;
+  };
+  
+@@@ -397,10 -403,9 +407,11 @@@ struct rpcrdma_memreg_ops 
+  				  struct rpcrdma_mr_seg *, int, bool);
+  	void		(*ro_unmap_sync)(struct rpcrdma_xprt *,
+  					 struct rpcrdma_req *);
+ +	int		(*ro_unmap)(struct rpcrdma_xprt *,
+ +				    struct rpcrdma_mr_seg *);
+  	void		(*ro_unmap_safe)(struct rpcrdma_xprt *,
+  					 struct rpcrdma_req *, bool);
++ 	void		(*ro_recover_mr)(struct rpcrdma_mw *);
+  	int		(*ro_open)(struct rpcrdma_ia *,
+  				   struct rpcrdma_ep *,
+  				   struct rpcrdma_create_data_internal *);
+* Unmerged path net/sunrpc/xprtrdma/fmr_ops.c
+* Unmerged path net/sunrpc/xprtrdma/frwr_ops.c
+diff --git a/net/sunrpc/xprtrdma/transport.c b/net/sunrpc/xprtrdma/transport.c
+index 99d2e5b72726..4c8e7f11b906 100644
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@ -660,7 +660,7 @@ void xprt_rdma_print_stats(struct rpc_xprt *xprt, struct seq_file *seq)
+ 		   xprt->stat.bad_xids,
+ 		   xprt->stat.req_u,
+ 		   xprt->stat.bklog_u);
+-	seq_printf(seq, "%lu %lu %lu %llu %llu %llu %llu %lu %lu %lu %lu\n",
++	seq_printf(seq, "%lu %lu %lu %llu %llu %llu %llu %lu %lu %lu %lu ",
+ 		   r_xprt->rx_stats.read_chunk_count,
+ 		   r_xprt->rx_stats.write_chunk_count,
+ 		   r_xprt->rx_stats.reply_chunk_count,
+@@ -672,6 +672,9 @@ void xprt_rdma_print_stats(struct rpc_xprt *xprt, struct seq_file *seq)
+ 		   r_xprt->rx_stats.failed_marshal_count,
+ 		   r_xprt->rx_stats.bad_reply_count,
+ 		   r_xprt->rx_stats.nomsg_call_count);
++	seq_printf(seq, "%lu %lu\n",
++		   r_xprt->rx_stats.mrs_recovered,
++		   r_xprt->rx_stats.mrs_orphaned);
+ }
+ 
+ static int
+@@ -741,7 +744,6 @@ void xprt_rdma_cleanup(void)
+ 			__func__, rc);
+ 
+ 	rpcrdma_destroy_wq();
+-	frwr_destroy_recovery_wq();
+ 
+ 	rc = xprt_unregister_transport(&xprt_rdma_bc);
+ 	if (rc)
+@@ -753,20 +755,13 @@ int xprt_rdma_init(void)
+ {
+ 	int rc;
+ 
+-	rc = frwr_alloc_recovery_wq();
+-	if (rc)
+-		return rc;
+-
+ 	rc = rpcrdma_alloc_wq();
+-	if (rc) {
+-		frwr_destroy_recovery_wq();
++	if (rc)
+ 		return rc;
+-	}
+ 
+ 	rc = xprt_register_transport(&xprt_rdma);
+ 	if (rc) {
+ 		rpcrdma_destroy_wq();
+-		frwr_destroy_recovery_wq();
+ 		return rc;
+ 	}
+ 
+@@ -774,7 +769,6 @@ int xprt_rdma_init(void)
+ 	if (rc) {
+ 		xprt_unregister_transport(&xprt_rdma);
+ 		rpcrdma_destroy_wq();
+-		frwr_destroy_recovery_wq();
+ 		return rc;
+ 	}
+ 
+diff --git a/net/sunrpc/xprtrdma/verbs.c b/net/sunrpc/xprtrdma/verbs.c
+index b044d98a1370..77a371d3cde8 100644
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@ -777,6 +777,41 @@ rpcrdma_ep_disconnect(struct rpcrdma_ep *ep, struct rpcrdma_ia *ia)
+ 	ib_drain_qp(ia->ri_id->qp);
+ }
+ 
++static void
++rpcrdma_mr_recovery_worker(struct work_struct *work)
++{
++	struct rpcrdma_buffer *buf = container_of(work, struct rpcrdma_buffer,
++						  rb_recovery_worker.work);
++	struct rpcrdma_mw *mw;
++
++	spin_lock(&buf->rb_recovery_lock);
++	while (!list_empty(&buf->rb_stale_mrs)) {
++		mw = list_first_entry(&buf->rb_stale_mrs,
++				      struct rpcrdma_mw, mw_list);
++		list_del_init(&mw->mw_list);
++		spin_unlock(&buf->rb_recovery_lock);
++
++		dprintk("RPC:       %s: recovering MR %p\n", __func__, mw);
++		mw->mw_xprt->rx_ia.ri_ops->ro_recover_mr(mw);
++
++		spin_lock(&buf->rb_recovery_lock);
++	};
++	spin_unlock(&buf->rb_recovery_lock);
++}
++
++void
++rpcrdma_defer_mr_recovery(struct rpcrdma_mw *mw)
++{
++	struct rpcrdma_xprt *r_xprt = mw->mw_xprt;
++	struct rpcrdma_buffer *buf = &r_xprt->rx_buf;
++
++	spin_lock(&buf->rb_recovery_lock);
++	list_add(&mw->mw_list, &buf->rb_stale_mrs);
++	spin_unlock(&buf->rb_recovery_lock);
++
++	schedule_delayed_work(&buf->rb_recovery_worker, 0);
++}
++
+ struct rpcrdma_req *
+ rpcrdma_create_req(struct rpcrdma_xprt *r_xprt)
+ {
+@@ -837,8 +872,12 @@ rpcrdma_buffer_create(struct rpcrdma_xprt *r_xprt)
+ 
+ 	buf->rb_max_requests = r_xprt->rx_data.max_requests;
+ 	buf->rb_bc_srv_max_requests = 0;
+-	spin_lock_init(&buf->rb_lock);
+ 	atomic_set(&buf->rb_credits, 1);
++	spin_lock_init(&buf->rb_lock);
++	spin_lock_init(&buf->rb_recovery_lock);
++	INIT_LIST_HEAD(&buf->rb_stale_mrs);
++	INIT_DELAYED_WORK(&buf->rb_recovery_worker,
++			  rpcrdma_mr_recovery_worker);
+ 
+ 	rc = ia->ri_ops->ro_init(r_xprt);
+ 	if (rc)
+@@ -923,6 +962,8 @@ rpcrdma_buffer_destroy(struct rpcrdma_buffer *buf)
+ {
+ 	struct rpcrdma_ia *ia = rdmab_to_ia(buf);
+ 
++	cancel_delayed_work_sync(&buf->rb_recovery_worker);
++
+ 	while (!list_empty(&buf->rb_recv_bufs)) {
+ 		struct rpcrdma_rep *rep;
+ 
+* Unmerged path net/sunrpc/xprtrdma/xprt_rdma.h
