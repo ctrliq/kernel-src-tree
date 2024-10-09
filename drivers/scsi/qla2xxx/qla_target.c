@@ -3959,12 +3959,6 @@ void qlt_async_event(uint16_t code, struct scsi_qla_host *vha,
 	if (!ha->tgt.tgt_ops)
 		return;
 
-	if (unlikely(tgt == NULL)) {
-		ql_dbg(ql_dbg_tgt, vha, 0xe03a,
-		    "ASYNC EVENT %#x, but no tgt (ha %p)\n", code, ha);
-		return;
-	}
-
 	if (((code == MBA_POINT_TO_POINT) || (code == MBA_CHG_IN_CONNECTION)) &&
 	    IS_QLA2100(ha))
 		return;
