@@ -1,0 +1,508 @@
+x86/intel_rdt/mba: Add primary support for Memory Bandwidth Allocation (MBA)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] intel_rdt/mba: Add primary support for Memory Bandwidth Allocation (MBA) (Jiri Olsa) [1379551]
+Rebuild_FUZZ: 97.30%
+commit-author Vikas Shivappa <vikas.shivappa@linux.intel.com>
+commit 05b93417ce5b924c6652de19fdcc27439ab37c90
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/05b93417.failed
+
+The MBA feature details like minimum bandwidth supported, bandwidth
+granularity etc are obtained via executing CPUID with EAX=10H ,ECX=3.
+
+Setup and initialize the MBA specific extensions to data structures like
+global list of RDT resources, RDT resource structure and RDT domain
+structure.
+
+[ tglx: Split out the seperate structure and the CBM related parts ]
+
+	Signed-off-by: Vikas Shivappa <vikas.shivappa@linux.intel.com>
+	Cc: ravi.v.shankar@intel.com
+	Cc: tony.luck@intel.com
+	Cc: fenghua.yu@intel.com
+	Cc: vikas.shivappa@intel.com
+Link: http://lkml.kernel.org/r/1491611637-20417-5-git-send-email-vikas.shivappa@linux.intel.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+(cherry picked from commit 05b93417ce5b924c6652de19fdcc27439ab37c90)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/intel_rdt.h
+#	arch/x86/kernel/cpu/intel_rdt.c
+diff --cc arch/x86/include/asm/intel_rdt.h
+index 06f50d0ed14f,0620fc957e59..000000000000
+--- a/arch/x86/include/asm/intel_rdt.h
++++ b/arch/x86/include/asm/intel_rdt.h
+@@@ -136,6 -104,71 +137,74 @@@ struct msr_param 
+  	int			high;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * struct rdt_cache - Cache allocation related data
++  * @cbm_len:		Length of the cache bit mask
++  * @min_cbm_bits:	Minimum number of consecutive bits to be set
++  * @cbm_idx_mult:	Multiplier of CBM index
++  * @cbm_idx_offset:	Offset of CBM index. CBM index is computed by:
++  *			closid * cbm_idx_multi + cbm_idx_offset
++  *			in a cache bit mask
++  */
++ struct rdt_cache {
++ 	unsigned int	cbm_len;
++ 	unsigned int	min_cbm_bits;
++ 	unsigned int	cbm_idx_mult;
++ 	unsigned int	cbm_idx_offset;
++ };
++ 
++ /**
++  * struct rdt_membw - Memory bandwidth allocation related data
++  * @max_delay:		Max throttle delay. Delay is the hardware
++  *			representation for memory bandwidth.
++  * @min_bw:		Minimum memory bandwidth percentage user can request
++  * @bw_gran:		Granularity at which the memory bandwidth is allocated
++  * @delay_linear:	True if memory B/W delay is in linear scale
++  * @mb_map:		Mapping of memory B/W percentage to memory B/W delay
++  */
++ struct rdt_membw {
++ 	u32		max_delay;
++ 	u32		min_bw;
++ 	u32		bw_gran;
++ 	u32		delay_linear;
++ 	u32		*mb_map;
++ };
++ 
++ /**
++  * struct rdt_resource - attributes of an RDT resource
++  * @enabled:		Is this feature enabled on this machine
++  * @capable:		Is this feature available on this machine
++  * @name:		Name to use in "schemata" file
++  * @num_closid:		Number of CLOSIDs available
++  * @cache_level:	Which cache level defines scope of this resource
++  * @default_ctrl:	Specifies default cache cbm or memory B/W percent.
++  * @msr_base:		Base MSR address for CBMs
++  * @msr_update:		Function pointer to update QOS MSRs
++  * @data_width:		Character width of data when displaying
++  * @domains:		All domains for this resource
++  * @cache:		Cache allocation related data
++  */
++ struct rdt_resource {
++ 	bool			enabled;
++ 	bool			capable;
++ 	char			*name;
++ 	int			num_closid;
++ 	int			cache_level;
++ 	u32			default_ctrl;
++ 	unsigned int		msr_base;
++ 	void (*msr_update)	(struct rdt_domain *d, struct msr_param *m,
++ 				 struct rdt_resource *r);
++ 	int			data_width;
++ 	struct list_head	domains;
++ 	union {
++ 		struct rdt_cache	cache;
++ 		struct rdt_membw	membw;
++ 	};
++ };
++ 
+++>>>>>>> 05b93417ce5b (x86/intel_rdt/mba: Add primary support for Memory Bandwidth Allocation (MBA))
+  extern struct mutex rdtgroup_mutex;
+  
+  extern struct rdt_resource rdt_resources_all[];
+diff --cc arch/x86/kernel/cpu/intel_rdt.c
+index ad087dd4421e,ae1aec16a674..000000000000
+--- a/arch/x86/kernel/cpu/intel_rdt.c
++++ b/arch/x86/kernel/cpu/intel_rdt.c
+@@@ -45,48 -46,74 +48,65 @@@ DEFINE_PER_CPU_READ_MOSTLY(int, cpu_clo
+   */
+  int max_name_width, max_data_width;
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ mba_wrmsr(struct rdt_domain *d, struct msr_param *m, struct rdt_resource *r);
++ static void
++ cat_wrmsr(struct rdt_domain *d, struct msr_param *m, struct rdt_resource *r);
++ 
++ #define domain_init(id) LIST_HEAD_INIT(rdt_resources_all[id].domains)
++ 
+++>>>>>>> 05b93417ce5b (x86/intel_rdt/mba: Add primary support for Memory Bandwidth Allocation (MBA))
+  struct rdt_resource rdt_resources_all[] = {
+  	{
+ -		.name			= "L3",
+ -		.domains		= domain_init(RDT_RESOURCE_L3),
+ -		.msr_base		= IA32_L3_CBM_BASE,
+ -		.msr_update		= cat_wrmsr,
+ -		.cache_level		= 3,
+ -		.cache = {
+ -			.min_cbm_bits	= 1,
+ -			.cbm_idx_mult	= 1,
+ -			.cbm_idx_offset	= 0,
+ -		},
+ +		.name		= "L3",
+ +		.domains	= domain_init(RDT_RESOURCE_L3),
+ +		.msr_base	= IA32_L3_CBM_BASE,
+ +		.min_cbm_bits	= 1,
+ +		.cache_level	= 3,
+ +		.cbm_idx_multi	= 1,
+ +		.cbm_idx_offset	= 0
+  	},
+  	{
+ -		.name			= "L3DATA",
+ -		.domains		= domain_init(RDT_RESOURCE_L3DATA),
+ -		.msr_base		= IA32_L3_CBM_BASE,
+ -		.msr_update		= cat_wrmsr,
+ -		.cache_level		= 3,
+ -		.cache = {
+ -			.min_cbm_bits	= 1,
+ -			.cbm_idx_mult	= 2,
+ -			.cbm_idx_offset	= 0,
+ -		},
+ +		.name		= "L3DATA",
+ +		.domains	= domain_init(RDT_RESOURCE_L3DATA),
+ +		.msr_base	= IA32_L3_CBM_BASE,
+ +		.min_cbm_bits	= 1,
+ +		.cache_level	= 3,
+ +		.cbm_idx_multi	= 2,
+ +		.cbm_idx_offset	= 0
+  	},
+  	{
+ -		.name			= "L3CODE",
+ -		.domains		= domain_init(RDT_RESOURCE_L3CODE),
+ -		.msr_base		= IA32_L3_CBM_BASE,
+ -		.msr_update		= cat_wrmsr,
+ -		.cache_level		= 3,
+ -		.cache = {
+ -			.min_cbm_bits	= 1,
+ -			.cbm_idx_mult	= 2,
+ -			.cbm_idx_offset	= 1,
+ -		},
+ +		.name		= "L3CODE",
+ +		.domains	= domain_init(RDT_RESOURCE_L3CODE),
+ +		.msr_base	= IA32_L3_CBM_BASE,
+ +		.min_cbm_bits	= 1,
+ +		.cache_level	= 3,
+ +		.cbm_idx_multi	= 2,
+ +		.cbm_idx_offset	= 1
+  	},
+  	{
+ -		.name			= "L2",
+ -		.domains		= domain_init(RDT_RESOURCE_L2),
+ -		.msr_base		= IA32_L2_CBM_BASE,
+ -		.msr_update		= cat_wrmsr,
+ -		.cache_level		= 2,
+ -		.cache = {
+ -			.min_cbm_bits	= 1,
+ -			.cbm_idx_mult	= 1,
+ -			.cbm_idx_offset	= 0,
+ -		},
+ +		.name		= "L2",
+ +		.domains	= domain_init(RDT_RESOURCE_L2),
+ +		.msr_base	= IA32_L2_CBM_BASE,
+ +		.min_cbm_bits	= 1,
+ +		.cache_level	= 2,
+ +		.cbm_idx_multi	= 1,
+ +		.cbm_idx_offset	= 0
+  	},
++ 	{
++ 		.name			= "MB",
++ 		.domains		= domain_init(RDT_RESOURCE_MBA),
++ 		.msr_base		= IA32_MBA_THRTL_BASE,
++ 		.msr_update		= mba_wrmsr,
++ 		.cache_level		= 3,
++ 	},
+  };
+  
+ -static unsigned int cbm_idx(struct rdt_resource *r, unsigned int closid)
+ +static int cbm_idx(struct rdt_resource *r, int closid)
+  {
+ -	return closid * r->cache.cbm_idx_mult + r->cache.cbm_idx_offset;
+ +	return closid * r->cbm_idx_multi + r->cbm_idx_offset;
+  }
+  
+  /*
+@@@ -136,10 -163,57 +156,61 @@@ static inline bool cache_alloc_hsw_prob
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+ +static void rdt_get_config(int idx, struct rdt_resource *r)
+++=======
++ /*
++  * rdt_get_mb_table() - get a mapping of bandwidth(b/w) percentage values
++  * exposed to user interface and the h/w understandable delay values.
++  *
++  * The non-linear delay values have the granularity of power of two
++  * and also the h/w does not guarantee a curve for configured delay
++  * values vs. actual b/w enforced.
++  * Hence we need a mapping that is pre calibrated so the user can
++  * express the memory b/w as a percentage value.
++  */
++ static inline bool rdt_get_mb_table(struct rdt_resource *r)
++ {
++ 	/*
++ 	 * There are no Intel SKUs as of now to support non-linear delay.
++ 	 */
++ 	pr_info("MBA b/w map not implemented for cpu:%d, model:%d",
++ 		boot_cpu_data.x86, boot_cpu_data.x86_model);
++ 
++ 	return false;
++ }
++ 
++ static bool rdt_get_mem_config(struct rdt_resource *r)
++ {
++ 	union cpuid_0x10_3_eax eax;
++ 	union cpuid_0x10_x_edx edx;
++ 	u32 ebx, ecx;
++ 
++ 	cpuid_count(0x00000010, 3, &eax.full, &ebx, &ecx, &edx.full);
++ 	r->num_closid = edx.split.cos_max + 1;
++ 	r->membw.max_delay = eax.split.max_delay + 1;
++ 	r->default_ctrl = MAX_MBA_BW;
++ 	if (ecx & MBA_IS_LINEAR) {
++ 		r->membw.delay_linear = true;
++ 		r->membw.min_bw = MAX_MBA_BW - r->membw.max_delay;
++ 		r->membw.bw_gran = MAX_MBA_BW - r->membw.max_delay;
++ 	} else {
++ 		if (!rdt_get_mb_table(r))
++ 			return false;
++ 	}
++ 	r->data_width = 3;
++ 
++ 	r->capable = true;
++ 	r->enabled = true;
++ 
++ 	return true;
++ }
++ 
++ static void rdt_get_cache_config(int idx, struct rdt_resource *r)
+++>>>>>>> 05b93417ce5b (x86/intel_rdt/mba: Add primary support for Memory Bandwidth Allocation (MBA))
+  {
+  	union cpuid_0x10_1_eax eax;
+ -	union cpuid_0x10_x_edx edx;
+ +	union cpuid_0x10_1_edx edx;
+  	u32 ebx, ecx;
+  
+  	cpuid_count(0x00000010, idx, &eax.full, &ebx, &ecx, &edx.full);
+@@@ -168,65 -242,57 +239,94 @@@ static void rdt_get_cdp_l3_config(int t
+  	r->enabled = false;
+  }
+  
+ -static int get_cache_id(int cpu, int level)
+ +/**
+ + * Choose a width for the resource name
+ + * and resource data based on the resource that has
+ + * widest name and cbm.
+ + */
+ +static void rdt_init_padding(void)
+  {
+ -	struct cpu_cacheinfo *ci = get_cpu_cacheinfo(cpu);
+ -	int i;
+ +	struct rdt_resource *r;
+ +	int cl;
+  
+ -	for (i = 0; i < ci->num_leaves; i++) {
+ -		if (ci->info_list[i].level == level)
+ -			return ci->info_list[i].id;
+ +	for_each_enabled_rdt_resource(r) {
+ +		cl = strlen(r->name);
+ +		if (cl > max_name_width)
+ +			max_name_width = cl;
+ +
+ +		if (r->data_width > max_data_width)
+ +			max_data_width = r->data_width;
+  	}
+ +}
+  
+ -	return -1;
+ +static inline bool get_rdt_resources(void)
+ +{
+ +	bool ret = false;
+ +
+ +	if (cache_alloc_hsw_probe())
+ +		return true;
+ +
+ +	if (!boot_cpu_has(X86_FEATURE_RDT_A))
+ +		return false;
+ +
+ +	if (boot_cpu_has(X86_FEATURE_CAT_L3)) {
+ +		rdt_get_config(1, &rdt_resources_all[RDT_RESOURCE_L3]);
+ +		if (boot_cpu_has(X86_FEATURE_CDP_L3)) {
+ +			rdt_get_cdp_l3_config(RDT_RESOURCE_L3DATA);
+ +			rdt_get_cdp_l3_config(RDT_RESOURCE_L3CODE);
+ +		}
+ +		ret = true;
+ +	}
+ +	if (boot_cpu_has(X86_FEATURE_CAT_L2)) {
+ +		/* CPUID 0x10.2 fields are same format at 0x10.1 */
+ +		rdt_get_config(2, &rdt_resources_all[RDT_RESOURCE_L2]);
+ +		ret = true;
+ +	}
+ +
+ +	rdt_init_padding();
+ +
+ +	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int get_cache_id(int cpu, int level)
+++=======
++ /*
++  * Map the memory b/w percentage value to delay values
++  * that can be written to QOS_MSRs.
++  * There are currently no SKUs which support non linear delay values.
++  */
++ static u32 delay_bw_map(unsigned long bw, struct rdt_resource *r)
++ {
++ 	if (r->membw.delay_linear)
++ 		return MAX_MBA_BW - bw;
++ 
++ 	pr_warn_once("Non Linear delay-bw map not supported but queried\n");
++ 	return r->default_ctrl;
++ }
++ 
++ static void
++ mba_wrmsr(struct rdt_domain *d, struct msr_param *m, struct rdt_resource *r)
++ {
++ 	unsigned int i;
++ 
++ 	/*  Write the delay values for mba. */
++ 	for (i = m->low; i < m->high; i++)
++ 		wrmsrl(r->msr_base + i, delay_bw_map(d->ctrl_val[i], r));
++ }
++ 
++ static void
++ cat_wrmsr(struct rdt_domain *d, struct msr_param *m, struct rdt_resource *r)
+++>>>>>>> 05b93417ce5b (x86/intel_rdt/mba: Add primary support for Memory Bandwidth Allocation (MBA))
+  {
+ -	unsigned int i;
+ -
+ -	for (i = m->low; i < m->high; i++)
+ -		wrmsrl(r->msr_base + cbm_idx(r, i), d->ctrl_val[i]);
+ +	return get_cpu_cache_id(cpu, level);
+  }
+  
+ -void rdt_ctrl_update(void *arg)
+ +void rdt_cbm_update(void *arg)
+  {
+ -	struct msr_param *m = arg;
+ +	struct msr_param *m = (struct msr_param *)arg;
+  	struct rdt_resource *r = m->res;
+ -	int cpu = smp_processor_id();
+ +	int i, cpu = smp_processor_id();
+  	struct rdt_domain *d;
+  
+  	list_for_each_entry(d, &r->domains, list) {
+@@@ -398,68 -471,55 +498,77 @@@ static int intel_rdt_offline_cpu(unsign
+  	return 0;
+  }
+  
+ -/*
+ - * Choose a width for the resource name and resource data based on the
+ - * resource that has widest name and cbm.
+ - */
+ -static __init void rdt_init_padding(void)
+ +static int
+ +rdt_cpu_notify(struct notifier_block *self, unsigned long action, void *hcpu)
+  {
+ -	struct rdt_resource *r;
+ -	int cl;
+ +       unsigned int cpu = (long)hcpu;
+  
+ -	for_each_enabled_rdt_resource(r) {
+ -		cl = strlen(r->name);
+ -		if (cl > max_name_width)
+ -			max_name_width = cl;
+ +       switch (action & ~CPU_TASKS_FROZEN) {
+  
+ -		if (r->data_width > max_data_width)
+ -			max_data_width = r->data_width;
+ -	}
+ +       case CPU_ONLINE:
+ +       case CPU_DOWN_FAILED:
+ +               intel_rdt_online_cpu(cpu, true);
+ +               break;
+ +
+ +       case CPU_UP_CANCELED:
+ +       case CPU_DOWN_PREPARE:
+ +               intel_rdt_offline_cpu(cpu);
+ +               break;
+ +       default:
+ +               break;
+ +       }
+ +
+ +       return NOTIFY_OK;
+  }
+  
+ -static __init bool get_rdt_resources(void)
+ +static void __init rdt_cpu_setup(void *dummy)
+  {
+ -	bool ret = false;
+ +	struct rdt_resource *r;
+ +	int i;
+  
+ -	if (cache_alloc_hsw_probe())
+ -		return true;
+ +	clear_closid(smp_processor_id());
+  
+ -	if (!boot_cpu_has(X86_FEATURE_RDT_A))
+ -		return false;
+ +	for_each_capable_rdt_resource(r) {
+ +		for (i = 0; i < r->num_closid; i++) {
+ +			int idx = cbm_idx(r, i);
+  
+ -	if (boot_cpu_has(X86_FEATURE_CAT_L3)) {
+ -		rdt_get_cache_config(1, &rdt_resources_all[RDT_RESOURCE_L3]);
+ -		if (boot_cpu_has(X86_FEATURE_CDP_L3)) {
+ -			rdt_get_cdp_l3_config(RDT_RESOURCE_L3DATA);
+ -			rdt_get_cdp_l3_config(RDT_RESOURCE_L3CODE);
+ +			wrmsrl(r->msr_base + idx, r->max_cbm);
+  		}
+ -		ret = true;
+  	}
+ -	if (boot_cpu_has(X86_FEATURE_CAT_L2)) {
+ -		/* CPUID 0x10.2 fields are same format at 0x10.1 */
+ -		rdt_get_cache_config(2, &rdt_resources_all[RDT_RESOURCE_L2]);
+ -		ret = true;
+ +}
+ +
+ +static struct notifier_block rdt_cpu_nb = {
+ +	.notifier_call  = rdt_cpu_notify,
+ +	.priority	= -INT_MAX,
+ +};
+ +
+ +static int __init rdt_notifier_init(void)
+ +{
+ +	unsigned int cpu;
+ +
+ +	for_each_online_cpu(cpu) {
+ +		intel_rdt_online_cpu(cpu, false);
+ +		/*
+ +		 * RHEL7 - The upstream hotplug notification invokes the
+ +		 *         callbacks on related cpus, but that's not the
+ +		 *         case of the RHEL7 notification support.
+ +		 *         Following call ensures we run all the msr
+ +		 *         initialization setup on related cpus.
+ +		 */
+ +		smp_call_function_single(cpu, rdt_cpu_setup, NULL, 1);
+  	}
+  
+++<<<<<<< HEAD
+ +	__register_cpu_notifier(&rdt_cpu_nb);
+ +	return 0;
+++=======
++ 	if (boot_cpu_has(X86_FEATURE_MBA)) {
++ 		if (rdt_get_mem_config(&rdt_resources_all[RDT_RESOURCE_MBA]))
++ 			ret = true;
++ 	}
++ 
++ 	return ret;
+++>>>>>>> 05b93417ce5b (x86/intel_rdt/mba: Add primary support for Memory Bandwidth Allocation (MBA))
+  }
+  
+  static int __init intel_rdt_late_init(void)
+* Unmerged path arch/x86/include/asm/intel_rdt.h
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.c
