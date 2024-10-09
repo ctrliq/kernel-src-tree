@@ -1,0 +1,196 @@
+fs: don't scan the inode cache before SB_BORN is set
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 79f546a696bff2590169fb5684e23d65f4d9f591
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/79f546a6.failed
+
+We recently had an oops reported on a 4.14 kernel in
+xfs_reclaim_inodes_count() where sb->s_fs_info pointed to garbage
+and so the m_perag_tree lookup walked into lala land.  It produces
+an oops down this path during the failed mount:
+
+  radix_tree_gang_lookup_tag+0xc4/0x130
+  xfs_perag_get_tag+0x37/0xf0
+  xfs_reclaim_inodes_count+0x32/0x40
+  xfs_fs_nr_cached_objects+0x11/0x20
+  super_cache_count+0x35/0xc0
+  shrink_slab.part.66+0xb1/0x370
+  shrink_node+0x7e/0x1a0
+  try_to_free_pages+0x199/0x470
+  __alloc_pages_slowpath+0x3a1/0xd20
+  __alloc_pages_nodemask+0x1c3/0x200
+  cache_grow_begin+0x20b/0x2e0
+  fallback_alloc+0x160/0x200
+  kmem_cache_alloc+0x111/0x4e0
+
+The problem is that the superblock shrinker is running before the
+filesystem structures it depends on have been fully set up. i.e.
+the shrinker is registered in sget(), before ->fill_super() has been
+called, and the shrinker can call into the filesystem before
+fill_super() does it's setup work. Essentially we are exposed to
+both use-after-free and use-before-initialisation bugs here.
+
+To fix this, add a check for the SB_BORN flag in super_cache_count.
+In general, this flag is not set until ->fs_mount() completes
+successfully, so we know that it is set after the filesystem
+setup has completed. This matches the trylock_super() behaviour
+which will not let super_cache_scan() run if SB_BORN is not set, and
+hence will not allow the superblock shrinker from entering the
+filesystem while it is being set up or after it has failed setup
+and is being torn down.
+
+	Cc: stable@kernel.org
+Signed-Off-By: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 79f546a696bff2590169fb5684e23d65f4d9f591)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/super.c
+diff --cc fs/super.c
+index f119305ec795,4b5b562176d0..000000000000
+--- a/fs/super.c
++++ b/fs/super.c
+@@@ -70,43 -71,80 +70,83 @@@ static int prune_super(struct shrinker 
+  	 * Deadlock avoidance.  We may hold various FS locks, and we don't want
+  	 * to recurse into the FS that called us in clear_inode() and friends..
+  	 */
+ -	if (!(sc->gfp_mask & __GFP_FS))
+ -		return SHRINK_STOP;
+ -
+ -	if (!trylock_super(sb))
+ -		return SHRINK_STOP;
+ -
+ -	if (sb->s_op->nr_cached_objects)
+ -		fs_objects = sb->s_op->nr_cached_objects(sb, sc);
+ -
+ -	inodes = list_lru_shrink_count(&sb->s_inode_lru, sc);
+ -	dentries = list_lru_shrink_count(&sb->s_dentry_lru, sc);
+ -	total_objects = dentries + inodes + fs_objects + 1;
+ -	if (!total_objects)
+ -		total_objects = 1;
+ +	if (sc->nr_to_scan && !(sc->gfp_mask & __GFP_FS))
+ +		return -1;
+  
+ -	/* proportion the scan between the caches */
+ -	dentries = mult_frac(sc->nr_to_scan, dentries, total_objects);
+ -	inodes = mult_frac(sc->nr_to_scan, inodes, total_objects);
+ -	fs_objects = mult_frac(sc->nr_to_scan, fs_objects, total_objects);
+ +	if (sb->s_op && sb->s_op->nr_cached_objects)
+ +		fs_objects = sb->s_op->nr_cached_objects(sb);
+ +
+ +	total_objects = sb->s_nr_dentry_unused +
+ +			sb->s_nr_inodes_unused + fs_objects + 1;
+ +
+ +	if (sc->nr_to_scan) {
+ +		int	dentries;
+ +		int	inodes;
+ +
+ +		/* proportion the scan between the caches */
+ +		dentries = (sc->nr_to_scan * sb->s_nr_dentry_unused) /
+ +							total_objects;
+ +		inodes = (sc->nr_to_scan * sb->s_nr_inodes_unused) /
+ +							total_objects;
+ +		if (fs_objects)
+ +			fs_objects = (sc->nr_to_scan * fs_objects) /
+ +							total_objects;
+ +		/*
+ +		 * prune the dcache first as the icache is pinned by it, then
+ +		 * prune the icache, followed by the filesystem specific caches
+ +		 */
+ +		prune_dcache_sb(sb, dentries);
+ +		prune_icache_sb(sb, inodes);
+  
+ -	/*
+ -	 * prune the dcache first as the icache is pinned by it, then
+ -	 * prune the icache, followed by the filesystem specific caches
+ -	 *
+ -	 * Ensure that we always scan at least one object - memcg kmem
+ -	 * accounting uses this to fully empty the caches.
+ -	 */
+ -	sc->nr_to_scan = dentries + 1;
+ -	freed = prune_dcache_sb(sb, sc);
+ -	sc->nr_to_scan = inodes + 1;
+ -	freed += prune_icache_sb(sb, sc);
+ -
+ -	if (fs_objects) {
+ -		sc->nr_to_scan = fs_objects + 1;
+ -		freed += sb->s_op->free_cached_objects(sb, sc);
+ +		if (fs_objects && sb->s_op->free_cached_objects) {
+ +			sb->s_op->free_cached_objects(sb, fs_objects);
+ +			fs_objects = sb->s_op->nr_cached_objects(sb);
+ +		}
+ +		total_objects = sb->s_nr_dentry_unused +
+ +				sb->s_nr_inodes_unused + fs_objects;
+  	}
+  
+++<<<<<<< HEAD
+ +	total_objects = (total_objects / 100) * sysctl_vfs_cache_pressure;
+++=======
++ 	up_read(&sb->s_umount);
++ 	return freed;
++ }
++ 
++ static unsigned long super_cache_count(struct shrinker *shrink,
++ 				       struct shrink_control *sc)
++ {
++ 	struct super_block *sb;
++ 	long	total_objects = 0;
++ 
++ 	sb = container_of(shrink, struct super_block, s_shrink);
++ 
++ 	/*
++ 	 * We don't call trylock_super() here as it is a scalability bottleneck,
++ 	 * so we're exposed to partial setup state. The shrinker rwsem does not
++ 	 * protect filesystem operations backing list_lru_shrink_count() or
++ 	 * s_op->nr_cached_objects(). Counts can change between
++ 	 * super_cache_count and super_cache_scan, so we really don't need locks
++ 	 * here.
++ 	 *
++ 	 * However, if we are currently mounting the superblock, the underlying
++ 	 * filesystem might be in a state of partial construction and hence it
++ 	 * is dangerous to access it.  trylock_super() uses a SB_BORN check to
++ 	 * avoid this situation, so do the same here. The memory barrier is
++ 	 * matched with the one in mount_fs() as we don't hold locks here.
++ 	 */
++ 	if (!(sb->s_flags & SB_BORN))
++ 		return 0;
++ 	smp_rmb();
++ 
++ 	if (sb->s_op && sb->s_op->nr_cached_objects)
++ 		total_objects = sb->s_op->nr_cached_objects(sb, sc);
++ 
++ 	total_objects += list_lru_shrink_count(&sb->s_dentry_lru, sc);
++ 	total_objects += list_lru_shrink_count(&sb->s_inode_lru, sc);
++ 
++ 	total_objects = vfs_pressure_ratio(total_objects);
+++>>>>>>> 79f546a696bf (fs: don't scan the inode cache before SB_BORN is set)
+  	return total_objects;
+  }
+  
+@@@ -1188,8 -1282,15 +1228,20 @@@ mount_fs(struct file_system_type *type
+  	sb = root->d_sb;
+  	BUG_ON(!sb);
+  	WARN_ON(!sb->s_bdi);
+++<<<<<<< HEAD
+ +	WARN_ON(sb->s_bdi == &default_backing_dev_info);
+ +	sb->s_flags |= MS_BORN;
+++=======
++ 
++ 	/*
++ 	 * Write barrier is for super_cache_count(). We place it before setting
++ 	 * SB_BORN as the data dependency between the two functions is the
++ 	 * superblock structure contents that we just set up, not the SB_BORN
++ 	 * flag.
++ 	 */
++ 	smp_wmb();
++ 	sb->s_flags |= SB_BORN;
+++>>>>>>> 79f546a696bf (fs: don't scan the inode cache before SB_BORN is set)
+  
+  	error = security_sb_kern_mount(sb, flags, secdata);
+  	if (error)
+* Unmerged path fs/super.c
