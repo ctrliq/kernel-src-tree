@@ -1,0 +1,171 @@
+ixgbe: cleanup crosstalk fix
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Don Skidmore <donald.c.skidmore@intel.com>
+commit aac9e053f1044bf21ac068eeb0e8518d080f4a66
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/aac9e053.failed
+
+This patch address a few issues with the initial crosstalk fix.  Most
+important of which is the SDP that indicates the presents of a SFP+
+module changes between HW types.  With this change that is taken in
+to consideration
+
+It also moves the check closer to the base code that checks link.  This
+makes it so we only need to do the check in one spot.
+
+	Signed-off-by: Don Skidmore <donald.c.skidmore@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit aac9e053f1044bf21ac068eeb0e8518d080f4a66)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index d20556c68593,4845c9fc0c17..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@@ -5632,7 -5625,7 +5632,11 @@@ static int ixgbe_sw_init(struct ixgbe_a
+  	struct pci_dev *pdev = adapter->pdev;
+  	unsigned int rss, fdir;
+  	u32 fwsm;
+++<<<<<<< HEAD
+ +	u16 device_caps;
+++=======
++ 	int i;
+++>>>>>>> aac9e053f104 (ixgbe: cleanup crosstalk fix)
+  
+  	/* PCI config space info */
+  
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe.h b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
+index c72c6d63f468..c64ffc164c46 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
+@@ -832,8 +832,6 @@ struct ixgbe_adapter {
+ 
+ #define IXGBE_RSS_KEY_SIZE     40  /* size of RSS Hash Key in bytes */
+ 	u32 rss_key[IXGBE_RSS_KEY_SIZE / sizeof(u32)];
+-
+-	bool need_crosstalk_fix;
+ };
+ 
+ static inline u8 ixgbe_max_rss_indices(struct ixgbe_adapter *adapter)
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_common.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_common.c
+index ce881a718abe..b4217f30e89c 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_common.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_common.c
+@@ -277,6 +277,7 @@ s32 ixgbe_start_hw_generic(struct ixgbe_hw *hw)
+ {
+ 	s32 ret_val;
+ 	u32 ctrl_ext;
++	u16 device_caps;
+ 
+ 	/* Set the media type */
+ 	hw->phy.media_type = hw->mac.ops.get_media_type(hw);
+@@ -301,6 +302,22 @@ s32 ixgbe_start_hw_generic(struct ixgbe_hw *hw)
+ 	if (ret_val)
+ 		return ret_val;
+ 
++	/* Cashe bit indicating need for crosstalk fix */
++	switch (hw->mac.type) {
++	case ixgbe_mac_82599EB:
++	case ixgbe_mac_X550EM_x:
++	case ixgbe_mac_x550em_a:
++		hw->mac.ops.get_device_caps(hw, &device_caps);
++		if (device_caps & IXGBE_DEVICE_CAPS_NO_CROSSTALK_WR)
++			hw->need_crosstalk_fix = false;
++		else
++			hw->need_crosstalk_fix = true;
++		break;
++	default:
++		hw->need_crosstalk_fix = false;
++		break;
++	}
++
+ 	/* Clear adapter stopped flag */
+ 	hw->adapter_stopped = false;
+ 
+@@ -3199,6 +3216,31 @@ s32 ixgbe_clear_vfta_generic(struct ixgbe_hw *hw)
+ 	return 0;
+ }
+ 
++/**
++ *  ixgbe_need_crosstalk_fix - Determine if we need to do cross talk fix
++ *  @hw: pointer to hardware structure
++ *
++ *  Contains the logic to identify if we need to verify link for the
++ *  crosstalk fix
++ **/
++static bool ixgbe_need_crosstalk_fix(struct ixgbe_hw *hw)
++{
++	/* Does FW say we need the fix */
++	if (!hw->need_crosstalk_fix)
++		return false;
++
++	/* Only consider SFP+ PHYs i.e. media type fiber */
++	switch (hw->mac.ops.get_media_type(hw)) {
++	case ixgbe_media_type_fiber:
++	case ixgbe_media_type_fiber_qsfp:
++		break;
++	default:
++		return false;
++	}
++
++	return true;
++}
++
+ /**
+  *  ixgbe_check_mac_link_generic - Determine link and speed status
+  *  @hw: pointer to hardware structure
+@@ -3214,6 +3256,35 @@ s32 ixgbe_check_mac_link_generic(struct ixgbe_hw *hw, ixgbe_link_speed *speed,
+ 	u32 links_reg, links_orig;
+ 	u32 i;
+ 
++	/* If Crosstalk fix enabled do the sanity check of making sure
++	 * the SFP+ cage is full.
++	 */
++	if (ixgbe_need_crosstalk_fix(hw)) {
++		u32 sfp_cage_full;
++
++		switch (hw->mac.type) {
++		case ixgbe_mac_82599EB:
++			sfp_cage_full = IXGBE_READ_REG(hw, IXGBE_ESDP) &
++					IXGBE_ESDP_SDP2;
++			break;
++		case ixgbe_mac_X550EM_x:
++		case ixgbe_mac_x550em_a:
++			sfp_cage_full = IXGBE_READ_REG(hw, IXGBE_ESDP) &
++					IXGBE_ESDP_SDP0;
++			break;
++		default:
++			/* sanity check - No SFP+ devices here */
++			sfp_cage_full = false;
++			break;
++		}
++
++		if (!sfp_cage_full) {
++			*link_up = false;
++			*speed = IXGBE_LINK_SPEED_UNKNOWN;
++			return 0;
++		}
++	}
++
+ 	/* clear the old state */
+ 	links_orig = IXGBE_READ_REG(hw, IXGBE_LINKS);
+ 
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_type.h b/drivers/net/ethernet/intel/ixgbe/ixgbe_type.h
+index 40ad96873e15..001598f65dd7 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_type.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_type.h
+@@ -3524,6 +3524,7 @@ struct ixgbe_hw {
+ 	bool				force_full_reset;
+ 	bool				allow_unsupported_sfp;
+ 	bool				wol_enabled;
++	bool				need_crosstalk_fix;
+ };
+ 
+ struct ixgbe_info {
