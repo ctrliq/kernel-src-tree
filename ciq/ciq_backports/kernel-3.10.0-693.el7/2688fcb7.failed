@@ -1,0 +1,259 @@
+xen-netfront: Factor queue-specific data into queue struct.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] xen-netfront: Factor queue-specific data into queue struct (Vitaly Kuznetsov) [1102638]
+Rebuild_FUZZ: 99.15%
+commit-author Andrew J. Bennieston <andrew.bennieston@citrix.com>
+commit 2688fcb79498246d45a0fa5900e415bc97661b6f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/2688fcb7.failed
+
+In preparation for multi-queue support in xen-netfront, move the
+queue-specific data from struct netfront_info to struct netfront_queue,
+and update the rest of the code to use this.
+
+Also adds loops over queues where appropriate, even though only one is
+configured at this point, and uses alloc_etherdev_mq() and the
+corresponding multi-queue netif wake/start/stop functions in preparation
+for multiple active queues.
+
+Finally, implements a trivial queue selection function suitable for
+ndo_select_queue, which simply returns 0, selecting the first (and
+only) queue.
+
+	Signed-off-by: Andrew J. Bennieston <andrew.bennieston@citrix.com>
+	Acked-by: Wei Liu <wei.liu2@citrix.com>
+	Reviewed-by: David Vrabel <david.vrabel@citrix.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2688fcb79498246d45a0fa5900e415bc97661b6f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/xen-netfront.c
+diff --cc drivers/net/xen-netfront.c
+index 6c33c68dceb8,af8cd95ec76b..000000000000
+--- a/drivers/net/xen-netfront.c
++++ b/drivers/net/xen-netfront.c
+@@@ -568,16 -610,12 +605,16 @@@ static int xennet_start_xmit(struct sk_
+  	slots = DIV_ROUND_UP(offset + len, PAGE_SIZE) +
+  		xennet_count_skb_frag_slots(skb);
+  	if (unlikely(slots > MAX_SKB_FRAGS + 1)) {
+ -		net_alert_ratelimited(
+ -			"xennet: skb rides the rocket: %d slots\n", slots);
+ -		goto drop;
+ +		net_dbg_ratelimited("xennet: skb rides the rocket: %d slots, %d bytes\n",
+ +				    slots, skb->len);
+ +		if (skb_linearize(skb))
+ +			goto drop;
+ +		data = skb->data;
+ +		offset = offset_in_page(data);
+ +		len = skb_headlen(skb);
+  	}
+  
+- 	spin_lock_irqsave(&np->tx_lock, flags);
++ 	spin_lock_irqsave(&queue->tx_lock, flags);
+  
+  	if (unlikely(!netif_carrier_ok(dev) ||
+  		     (slots > 1 && !xennet_can_sg(dev)) ||
+@@@ -875,63 -922,22 +918,62 @@@ static int checksum_setup(struct net_de
+  	 */
+  	if (skb->ip_summed != CHECKSUM_PARTIAL && skb_is_gso(skb)) {
+  		struct netfront_info *np = netdev_priv(dev);
+- 		np->rx_gso_checksum_fixup++;
++ 		atomic_inc(&np->rx_gso_checksum_fixup);
+  		skb->ip_summed = CHECKSUM_PARTIAL;
+ -		recalculate_partial_csum = true;
+ +		recalculate_partial_csum = 1;
+  	}
+  
+  	/* A non-CHECKSUM_PARTIAL SKB does not require setup. */
+  	if (skb->ip_summed != CHECKSUM_PARTIAL)
+  		return 0;
+  
+ -	return skb_checksum_setup(skb, recalculate_partial_csum);
+ +	if (skb->protocol != htons(ETH_P_IP))
+ +		goto out;
+ +
+ +	iph = (void *)skb->data;
+ +
+ +	switch (iph->protocol) {
+ +	case IPPROTO_TCP:
+ +		if (!skb_partial_csum_set(skb, 4 * iph->ihl,
+ +					  offsetof(struct tcphdr, check)))
+ +			goto out;
+ +
+ +		if (recalculate_partial_csum) {
+ +			struct tcphdr *tcph = tcp_hdr(skb);
+ +			tcph->check = ~csum_tcpudp_magic(iph->saddr, iph->daddr,
+ +							 skb->len - iph->ihl*4,
+ +							 IPPROTO_TCP, 0);
+ +		}
+ +		break;
+ +	case IPPROTO_UDP:
+ +		if (!skb_partial_csum_set(skb, 4 * iph->ihl,
+ +					  offsetof(struct udphdr, check)))
+ +			goto out;
+ +
+ +		if (recalculate_partial_csum) {
+ +			struct udphdr *udph = udp_hdr(skb);
+ +			udph->check = ~csum_tcpudp_magic(iph->saddr, iph->daddr,
+ +							 skb->len - iph->ihl*4,
+ +							 IPPROTO_UDP, 0);
+ +		}
+ +		break;
+ +	default:
+ +		if (net_ratelimit())
+ +			pr_err("Attempting to checksum a non-TCP/UDP packet, dropping a protocol %d packet\n",
+ +			       iph->protocol);
+ +		goto out;
+ +	}
+ +
+ +	err = 0;
+ +
+ +out:
+ +	return err;
+  }
+  
+- static int handle_incoming_queue(struct net_device *dev,
++ static int handle_incoming_queue(struct netfront_queue *queue,
+  				 struct sk_buff_head *rxq)
+  {
+- 	struct netfront_info *np = netdev_priv(dev);
+- 	struct netfront_stats *stats = this_cpu_ptr(np->stats);
++ 	struct netfront_stats *stats = this_cpu_ptr(queue->info->stats);
+  	int packets_dropped = 0;
+  	struct sk_buff *skb;
+  
+@@@ -942,12 -948,13 +984,17 @@@
+  			__pskb_pull_tail(skb, pull_to - skb_headlen(skb));
+  
+  		/* Ethernet work: Delayed to here as it peeks the header. */
+++<<<<<<< HEAD
+ +		skb->protocol = eth_type_trans(skb, dev);
+++=======
++ 		skb->protocol = eth_type_trans(skb, queue->info->netdev);
++ 		skb_reset_network_header(skb);
+++>>>>>>> 2688fcb79498 (xen-netfront: Factor queue-specific data into queue struct.)
+  
+- 		if (checksum_setup(dev, skb)) {
++ 		if (checksum_setup(queue->info->netdev, skb)) {
+  			kfree_skb(skb);
+  			packets_dropped++;
+- 			dev->stats.rx_errors++;
++ 			queue->info->netdev->stats.rx_errors++;
+  			continue;
+  		}
+  
+@@@ -976,9 -983,10 +1023,9 @@@ static int xennet_poll(struct napi_stru
+  	struct sk_buff_head rxq;
+  	struct sk_buff_head errq;
+  	struct sk_buff_head tmpq;
+ -	unsigned long flags;
+  	int err;
+  
+- 	spin_lock(&np->rx_lock);
++ 	spin_lock(&queue->rx_lock);
+  
+  	skb_queue_head_init(&rxq);
+  	skb_queue_head_init(&errq);
+@@@ -1055,14 -1063,18 +1102,22 @@@ err
+  	if (work_done < budget) {
+  		int more_to_do = 0;
+  
+ -		napi_gro_flush(napi, false);
+ -
+ -		local_irq_save(flags);
+ +		napi_complete(napi);
+  
+++<<<<<<< HEAD
+ +		RING_FINAL_CHECK_FOR_RESPONSES(&np->rx, more_to_do);
+ +		if (more_to_do)
+ +			napi_schedule(napi);
+++=======
++ 		RING_FINAL_CHECK_FOR_RESPONSES(&queue->rx, more_to_do);
++ 		if (!more_to_do)
++ 			__napi_complete(napi);
++ 
++ 		local_irq_restore(flags);
+++>>>>>>> 2688fcb79498 (xen-netfront: Factor queue-specific data into queue struct.)
+  	}
+  
+- 	spin_unlock(&np->rx_lock);
++ 	spin_unlock(&queue->rx_lock);
+  
+  	return work_done;
+  }
+@@@ -1281,58 -1323,24 +1348,54 @@@ static struct net_device *xennet_create
+  	np                   = netdev_priv(netdev);
+  	np->xbdev            = dev;
+  
+- 	spin_lock_init(&np->tx_lock);
+- 	spin_lock_init(&np->rx_lock);
+- 
+- 	skb_queue_head_init(&np->rx_batch);
+- 	np->rx_target     = RX_DFL_MIN_TARGET;
+- 	np->rx_min_target = RX_DFL_MIN_TARGET;
+- 	np->rx_max_target = RX_MAX_TARGET;
+- 
+- 	init_timer(&np->rx_refill_timer);
+- 	np->rx_refill_timer.data = (unsigned long)netdev;
+- 	np->rx_refill_timer.function = rx_refill_timeout;
++ 	/* No need to use rtnl_lock() before the call below as it
++ 	 * happens before register_netdev().
++ 	 */
++ 	netif_set_real_num_tx_queues(netdev, 0);
++ 	np->queues = NULL;
+  
+  	err = -ENOMEM;
+ -	np->stats = netdev_alloc_pcpu_stats(struct netfront_stats);
+ +	np->stats = alloc_percpu(struct netfront_stats);
+  	if (np->stats == NULL)
+  		goto exit;
+  
+++<<<<<<< HEAD
+ +	/* Initialise tx_skbs as a free chain containing every entry. */
+ +	np->tx_skb_freelist = 0;
+ +	for (i = 0; i < NET_TX_RING_SIZE; i++) {
+ +		skb_entry_set_link(&np->tx_skbs[i], i+1);
+ +		np->grant_tx_ref[i] = GRANT_INVALID_REF;
+ +	}
+ +
+ +	/* Clear out rx_skbs */
+ +	for (i = 0; i < NET_RX_RING_SIZE; i++) {
+ +		np->rx_skbs[i] = NULL;
+ +		np->grant_rx_ref[i] = GRANT_INVALID_REF;
+ +		np->grant_tx_page[i] = NULL;
+ +	}
+ +
+ +	/* A grant for every tx ring slot */
+ +	if (gnttab_alloc_grant_references(TX_MAX_TARGET,
+ +					  &np->gref_tx_head) < 0) {
+ +		pr_alert("can't alloc tx grant refs\n");
+ +		err = -ENOMEM;
+ +		goto exit_free_stats;
+ +	}
+ +	/* A grant for every rx ring slot */
+ +	if (gnttab_alloc_grant_references(RX_MAX_TARGET,
+ +					  &np->gref_rx_head) < 0) {
+ +		pr_alert("can't alloc rx grant refs\n");
+ +		err = -ENOMEM;
+ +		goto exit_free_tx;
+ +	}
+ +
+++=======
+++>>>>>>> 2688fcb79498 (xen-netfront: Factor queue-specific data into queue struct.)
+  	netdev->netdev_ops	= &xennet_netdev_ops;
+  
+- 	netif_napi_add(netdev, &np->napi, xennet_poll, 64);
+  	netdev->features        = NETIF_F_IP_CSUM | NETIF_F_RXCSUM |
+  				  NETIF_F_GSO_ROBUST;
+ -	netdev->hw_features	= NETIF_F_SG |
+ -				  NETIF_F_IPV6_CSUM |
+ -				  NETIF_F_TSO | NETIF_F_TSO6;
+ +	netdev->hw_features	= NETIF_F_IP_CSUM | NETIF_F_SG | NETIF_F_TSO;
+  
+  	/*
+           * Assume that all hw features are available for now. This set
+* Unmerged path drivers/net/xen-netfront.c
