@@ -1,0 +1,215 @@
+s390/dasd: Refactor dasd format functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [s390] dasd: Refactor dasd format functions (Hendrik Brueckner) [1380773]
+Rebuild_FUZZ: 93.51%
+commit-author Jan Höppner <hoeppner@linux.vnet.ibm.com>
+commit 570d237c19f8d0f1dfd214767f2d995b8291138a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/570d237c.failed
+
+Prepare for new format checking function by renaming functions and
+moving reusable code to separate functions:
+
+- Move sanity checks into a new function and make it reusable.
+- Move common format code to a new function called
+  dasd_eckd_format_process_data.
+- Create the generic function dasd_eckd_format_build_ccw_req, which
+  itself will then decide what ccw request is being built according to
+  the input data. (with upcoming functionality).
+
+	Signed-off-by: Jan Höppner <hoeppner@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 570d237c19f8d0f1dfd214767f2d995b8291138a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/block/dasd_eckd.c
+diff --cc drivers/s390/block/dasd_eckd.c
+index 75d5d21ad443,e679209755cf..000000000000
+--- a/drivers/s390/block/dasd_eckd.c
++++ b/drivers/s390/block/dasd_eckd.c
+@@@ -2344,23 -2386,26 +2344,42 @@@ dasd_eckd_build_format(struct dasd_devi
+  	return fcp;
+  }
+  
+++<<<<<<< HEAD
+ +static int
+ +dasd_eckd_format_device(struct dasd_device *base,
+ +			struct format_data_t *fdata,
+ +			int enable_PAV)
+ +{
+ +	struct dasd_ccw_req *cqr, *n;
+ +	struct dasd_block *block;
+ +	struct dasd_eckd_private *private;
+ +	struct list_head format_queue;
+ +	struct dasd_device *device;
+ +	int old_stop, format_step;
+ +	int step, rc = 0, sleep_rc;
+++=======
++ /*
++  * Wrapper function to build a CCW request depending on input data
++  */
++ static struct dasd_ccw_req *
++ dasd_eckd_format_build_ccw_req(struct dasd_device *base,
++ 			       struct format_data_t *fdata, int enable_pav)
++ {
++ 	return dasd_eckd_build_format(base, fdata, enable_pav);
++ }
++ 
++ /*
++  * Sanity checks on format_data
++  */
++ static int dasd_eckd_format_sanity_checks(struct dasd_device *base,
++ 					  struct format_data_t *fdata)
++ {
++ 	struct dasd_eckd_private *private;
+++>>>>>>> 570d237c19f8 (s390/dasd: Refactor dasd format functions)
+  
+ +	block = base->block;
+  	private = (struct dasd_eckd_private *) base->private;
+  
+- 	/* Sanity checks. */
+  	if (fdata->start_unit >=
+  	    (private->real_cyl * private->rdc_data.trk_per_cyl)) {
+  		dev_warn(&base->cdev->dev,
+@@@ -2390,74 -2458,80 +2432,101 @@@ static int dasd_eckd_format_process_dat
+  
+  	INIT_LIST_HEAD(&format_queue);
+  
+ -	old_start = fdata->start_unit;
+  	old_stop = fdata->stop_unit;
+ +	while (fdata->start_unit <= 1) {
+ +		fdata->stop_unit = fdata->start_unit;
+ +		cqr = dasd_eckd_build_format(base, fdata, enable_PAV);
+ +		list_add(&cqr->blocklist, &format_queue);
+  
+ -	format_step = DASD_CQR_MAX_CCW / recs_per_track(&private->rdc_data, 0,
+ -							fdata->blksize);
+ -	do {
+ -		retry = 0;
+ -		while (fdata->start_unit <= old_stop) {
+ -			step = fdata->stop_unit - fdata->start_unit + 1;
+ -			if (step > format_step) {
+ -				fdata->stop_unit =
+ -					fdata->start_unit + format_step - 1;
+ -			}
+ +		fdata->stop_unit = old_stop;
+ +		fdata->start_unit++;
+  
+++<<<<<<< HEAD
+ +		if (fdata->start_unit > fdata->stop_unit)
+ +			goto sleep;
+ +	}
+++=======
++ 			cqr = dasd_eckd_format_build_ccw_req(base, fdata,
++ 							     enable_pav);
++ 			if (IS_ERR(cqr)) {
++ 				rc = PTR_ERR(cqr);
++ 				if (rc == -ENOMEM) {
++ 					if (list_empty(&format_queue))
++ 						goto out;
++ 					/*
++ 					 * not enough memory available, start
++ 					 * requests retry after first requests
++ 					 * were finished
++ 					 */
++ 					retry = 1;
++ 					break;
++ 				}
++ 				goto out_err;
++ 			}
++ 			list_add_tail(&cqr->blocklist, &format_queue);
+ -
+ -			fdata->start_unit = fdata->stop_unit + 1;
+ -			fdata->stop_unit = old_stop;
+++>>>>>>> 570d237c19f8 (s390/dasd: Refactor dasd format functions)
+ +
+ +retry:
+ +	format_step = 255 / recs_per_track(&private->rdc_data, 0,
+ +					   fdata->blksize);
+ +	while (fdata->start_unit <= old_stop) {
+ +		step = fdata->stop_unit - fdata->start_unit + 1;
+ +		if (step > format_step)
+ +			fdata->stop_unit = fdata->start_unit + format_step - 1;
+ +
+ +		cqr = dasd_eckd_build_format(base, fdata, enable_PAV);
+ +		if (IS_ERR(cqr)) {
+ +			if (PTR_ERR(cqr) == -ENOMEM) {
+ +				/*
+ +				 * not enough memory available
+ +				 * go to out and start requests
+ +				 * retry after first requests were finished
+ +				 */
+ +				fdata->stop_unit = old_stop;
+ +				goto sleep;
+ +			} else
+ +				return PTR_ERR(cqr);
+  		}
+ +		list_add(&cqr->blocklist, &format_queue);
+  
+ -		rc = dasd_sleep_on_queue(&format_queue);
+ +		fdata->start_unit = fdata->stop_unit + 1;
+ +		fdata->stop_unit = old_stop;
+ +	}
+  
+ -out_err:
+ -		list_for_each_entry_safe(cqr, n, &format_queue, blocklist) {
+ -			device = cqr->startdev;
+ -			private = (struct dasd_eckd_private *) device->private;
+ -			if (cqr->status == DASD_CQR_FAILED)
+ -				rc = -EIO;
+ -			list_del_init(&cqr->blocklist);
+ -			dasd_sfree_request(cqr, device);
+ -			private->count--;
+ -		}
+ +sleep:
+ +	sleep_rc = dasd_sleep_on_queue(&format_queue);
+  
+ -		if (rc)
+ -			goto out;
+ +	list_for_each_entry_safe(cqr, n, &format_queue, blocklist) {
+ +		device = cqr->startdev;
+ +		private = (struct dasd_eckd_private *) device->private;
+ +		if (cqr->status == DASD_CQR_FAILED)
+ +			rc = -EIO;
+ +		list_del_init(&cqr->blocklist);
+ +		dasd_sfree_request(cqr, device);
+ +		private->count--;
+ +	}
+  
+ -	} while (retry);
+ +	if (sleep_rc)
+ +		return sleep_rc;
+  
+ -out:
+ -	fdata->start_unit = old_start;
+ -	fdata->stop_unit = old_stop;
+ +	/*
+ +	 * in case of ENOMEM we need to retry after
+ +	 * first requests are finished
+ +	 */
+ +	if (fdata->start_unit <= fdata->stop_unit)
+ +		goto retry;
+  
+  	return rc;
+  }
+  
++ static int dasd_eckd_format_device(struct dasd_device *base,
++ 				   struct format_data_t *fdata, int enable_pav)
++ {
++ 	return dasd_eckd_format_process_data(base, fdata, enable_pav);
++ }
++ 
+  static void dasd_eckd_handle_terminated_request(struct dasd_ccw_req *cqr)
+  {
+ -	if (cqr->retries < 0) {
+ -		cqr->status = DASD_CQR_FAILED;
+ -		return;
+ -	}
+  	cqr->status = DASD_CQR_FILLED;
+  	if (cqr->block && (cqr->startdev != cqr->block->base)) {
+  		dasd_eckd_reset_ccw_to_base_io(cqr);
+* Unmerged path drivers/s390/block/dasd_eckd.c
