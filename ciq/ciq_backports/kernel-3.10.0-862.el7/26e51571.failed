@@ -1,0 +1,270 @@
+PCI: Add Downstream Port Containment driver
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [pci] Add Downstream Port Containment driver (Myron Stowe) [1489540]
+Rebuild_FUZZ: 93.83%
+commit-author Keith Busch <keith.busch@intel.com>
+commit 26e515713342b6f7c553aa3c66b21c6ab7cf82af
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/26e51571.failed
+
+Add driver for the PCI Express Downstream Port Containment extended
+capability.  DPC is an optional capability to contain uncorrectable errors
+below a port.
+
+For more information on DPC, please see PCI Express Base Specification
+Revision 4, section 7.31, or view the PCI-SIG DPC ECN here:
+
+  https://pcisig.com/sites/default/files/specification_documents/ECN_DPC_2012-02-09_finalized.pdf
+
+When a DPC event is triggered, the hardware disables downstream links, so
+the DPC driver schedules removal for all devices below this port.  This may
+happen concurrently with a PCIe hotplug driver if enabled.  When all
+downstream devices are removed and the link state transitions to disabled,
+the DPC driver clears the DPC status and interrupt bits so the link may
+retrain for a newly connected device.
+
+[bhelgaas: clear (not set) DPC_CTL bits on remove, whitespace cleanup]
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Cc: Lukas Wunner <lukas@wunner.de>
+(cherry picked from commit 26e515713342b6f7c553aa3c66b21c6ab7cf82af)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/pcie/Kconfig
+diff --cc drivers/pci/pcie/Kconfig
+index 7c6ee5e4062f,22ca6412bd15..000000000000
+--- a/drivers/pci/pcie/Kconfig
++++ b/drivers/pci/pcie/Kconfig
+@@@ -80,4 -80,18 +80,22 @@@ endchoic
+  
+  config PCIE_PME
+  	def_bool y
+++<<<<<<< HEAD
+ +	depends on PCIEPORTBUS && PM_RUNTIME
+++=======
++ 	depends on PCIEPORTBUS && PM
++ 
++ config PCIE_DPC
++ 	tristate "PCIe Downstream Port Containment support"
++ 	depends on PCIEPORTBUS
++ 	default n
++ 	help
++ 	  This enables PCI Express Downstream Port Containment (DPC)
++ 	  driver support.  DPC events from Root and Downstream ports
++ 	  will be handled by the DPC driver.  If your system doesn't
++ 	  have this capability or you do not want to use this feature,
++ 	  it is safe to answer N.
++ 
++ 	  To compile this driver as a module, choose M here: the module
++ 	  will be called pcie-dpc.
+++>>>>>>> 26e515713342 (PCI: Add Downstream Port Containment driver)
+* Unmerged path drivers/pci/pcie/Kconfig
+diff --git a/drivers/pci/pcie/Makefile b/drivers/pci/pcie/Makefile
+index 00c62df5a9fc..b24525b3dec1 100644
+--- a/drivers/pci/pcie/Makefile
++++ b/drivers/pci/pcie/Makefile
+@@ -14,3 +14,5 @@ obj-$(CONFIG_PCIEPORTBUS)	+= pcieportdrv.o
+ obj-$(CONFIG_PCIEAER)		+= aer/
+ 
+ obj-$(CONFIG_PCIE_PME) += pme.o
++
++obj-$(CONFIG_PCIE_DPC) += pcie-dpc.o
+diff --git a/drivers/pci/pcie/pcie-dpc.c b/drivers/pci/pcie/pcie-dpc.c
+new file mode 100644
+index 000000000000..ab552f1bc08f
+--- /dev/null
++++ b/drivers/pci/pcie/pcie-dpc.c
+@@ -0,0 +1,163 @@
++/*
++ * PCI Express Downstream Port Containment services driver
++ * Copyright (C) 2016 Intel Corp.
++ *
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ */
++
++#include <linux/delay.h>
++#include <linux/interrupt.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/pcieport_if.h>
++
++struct dpc_dev {
++	struct pcie_device	*dev;
++	struct work_struct 	work;
++	int 			cap_pos;
++};
++
++static void dpc_wait_link_inactive(struct pci_dev *pdev)
++{
++	unsigned long timeout = jiffies + HZ;
++	u16 lnk_status;
++
++	pcie_capability_read_word(pdev, PCI_EXP_LNKSTA, &lnk_status);
++	while (lnk_status & PCI_EXP_LNKSTA_DLLLA &&
++					!time_after(jiffies, timeout)) {
++		msleep(10);
++		pcie_capability_read_word(pdev, PCI_EXP_LNKSTA, &lnk_status);
++	}
++	if (lnk_status & PCI_EXP_LNKSTA_DLLLA)
++		dev_warn(&pdev->dev, "Link state not disabled for DPC event");
++}
++
++static void interrupt_event_handler(struct work_struct *work)
++{
++	struct dpc_dev *dpc = container_of(work, struct dpc_dev, work);
++	struct pci_dev *dev, *temp, *pdev = dpc->dev->port;
++	struct pci_bus *parent = pdev->subordinate;
++
++	pci_lock_rescan_remove();
++	list_for_each_entry_safe_reverse(dev, temp, &parent->devices,
++					 bus_list) {
++		pci_dev_get(dev);
++		pci_stop_and_remove_bus_device(dev);
++		pci_dev_put(dev);
++	}
++	pci_unlock_rescan_remove();
++
++	dpc_wait_link_inactive(pdev);
++	pci_write_config_word(pdev, dpc->cap_pos + PCI_EXP_DPC_STATUS,
++		PCI_EXP_DPC_STATUS_TRIGGER | PCI_EXP_DPC_STATUS_INTERRUPT);
++}
++
++static irqreturn_t dpc_irq(int irq, void *context)
++{
++	struct dpc_dev *dpc = (struct dpc_dev *)context;
++	struct pci_dev *pdev = dpc->dev->port;
++	u16 status, source;
++
++	pci_read_config_word(pdev, dpc->cap_pos + PCI_EXP_DPC_STATUS, &status);
++	pci_read_config_word(pdev, dpc->cap_pos + PCI_EXP_DPC_SOURCE_ID,
++			     &source);
++	if (!status)
++		return IRQ_NONE;
++
++	dev_info(&dpc->dev->device, "DPC containment event, status:%#06x source:%#06x\n",
++		status, source);
++
++	if (status & PCI_EXP_DPC_STATUS_TRIGGER) {
++		u16 reason = (status >> 1) & 0x3;
++
++		dev_warn(&dpc->dev->device, "DPC %s triggered, remove downstream devices\n",
++			 (reason == 0) ? "unmasked uncorrectable error" :
++			 (reason == 1) ? "ERR_NONFATAL" :
++			 (reason == 2) ? "ERR_FATAL" : "extended error");
++		schedule_work(&dpc->work);
++	}
++	return IRQ_HANDLED;
++}
++
++#define FLAG(x, y) (((x) & (y)) ? '+' : '-')
++static int dpc_probe(struct pcie_device *dev)
++{
++	struct dpc_dev *dpc;
++	struct pci_dev *pdev = dev->port;
++	int status;
++	u16 ctl, cap;
++
++	dpc = kzalloc(sizeof(*dpc), GFP_KERNEL);
++	if (!dpc)
++		return -ENOMEM;
++
++	dpc->cap_pos = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_DPC);
++	dpc->dev = dev;
++	INIT_WORK(&dpc->work, interrupt_event_handler);
++	set_service_data(dev, dpc);
++
++	status = request_irq(dev->irq, dpc_irq, IRQF_SHARED, "pcie-dpc", dpc);
++	if (status) {
++		dev_warn(&dev->device, "request IRQ%d failed: %d\n", dev->irq,
++			 status);
++		goto out;
++	}
++
++	pci_read_config_word(pdev, dpc->cap_pos + PCI_EXP_DPC_CAP, &cap);
++	pci_read_config_word(pdev, dpc->cap_pos + PCI_EXP_DPC_CTL, &ctl);
++
++	ctl |= PCI_EXP_DPC_CTL_EN_NONFATAL | PCI_EXP_DPC_CTL_INT_EN;
++	pci_write_config_word(pdev, dpc->cap_pos + PCI_EXP_DPC_CTL, ctl);
++
++	dev_info(&dev->device, "DPC error containment capabilities: Int Msg #%d, RPExt%c PoisonedTLP%c SwTrigger%c RP PIO Log %d, DL_ActiveErr%c\n",
++		cap & 0xf, FLAG(cap, PCI_EXP_DPC_CAP_RP_EXT),
++		FLAG(cap, PCI_EXP_DPC_CAP_POISONED_TLP),
++		FLAG(cap, PCI_EXP_DPC_CAP_SW_TRIGGER), (cap >> 8) & 0xf,
++		FLAG(cap, PCI_EXP_DPC_CAP_DL_ACTIVE));
++	return status;
++ out:
++	kfree(dpc);
++	return status;
++}
++
++static void dpc_remove(struct pcie_device *dev)
++{
++	struct dpc_dev *dpc = get_service_data(dev);
++	struct pci_dev *pdev = dev->port;
++	u16 ctl;
++
++	pci_read_config_word(pdev, dpc->cap_pos + PCI_EXP_DPC_CTL, &ctl);
++	ctl &= ~(PCI_EXP_DPC_CTL_EN_NONFATAL | PCI_EXP_DPC_CTL_INT_EN);
++	pci_write_config_word(pdev, dpc->cap_pos + PCI_EXP_DPC_CTL, ctl);
++
++	free_irq(dev->irq, dpc);
++	kfree(dpc);
++}
++
++static struct pcie_port_service_driver dpcdriver = {
++	.name		= "dpc",
++	.port_type	= PCI_EXP_TYPE_ROOT_PORT | PCI_EXP_TYPE_DOWNSTREAM,
++	.service	= PCIE_PORT_SERVICE_DPC,
++	.probe		= dpc_probe,
++	.remove		= dpc_remove,
++};
++
++static int __init dpc_service_init(void)
++{
++	return pcie_port_service_register(&dpcdriver);
++}
++
++static void __exit dpc_service_exit(void)
++{
++	pcie_port_service_unregister(&dpcdriver);
++}
++
++MODULE_DESCRIPTION("PCI Express Downstream Port Containment driver");
++MODULE_AUTHOR("Keith Busch <keith.busch@intel.com>");
++MODULE_LICENSE("GPL");
++MODULE_VERSION("0.1");
++
++module_init(dpc_service_init);
++module_exit(dpc_service_exit);
+diff --git a/include/uapi/linux/pci_regs.h b/include/uapi/linux/pci_regs.h
+index 11d0eed025f3..30d66b508e95 100644
+--- a/include/uapi/linux/pci_regs.h
++++ b/include/uapi/linux/pci_regs.h
+@@ -950,4 +950,21 @@
+ #define PCI_TPH_CAP_ST_SHIFT	16	/* st table shift */
+ #define PCI_TPH_BASE_SIZEOF	12	/* size with no st table */
+ 
++/* Downstream Port Containment */
++#define PCI_EXP_DPC_CAP			4	/* DPC Capability */
++#define  PCI_EXP_DPC_CAP_RP_EXT		0x20	/* Root Port Extensions for DPC */
++#define  PCI_EXP_DPC_CAP_POISONED_TLP	0x40	/* Poisoned TLP Egress Blocking Supported */
++#define  PCI_EXP_DPC_CAP_SW_TRIGGER	0x80	/* Software Triggering Supported */
++#define  PCI_EXP_DPC_CAP_DL_ACTIVE	0x1000	/* ERR_COR signal on DL_Active supported */
++
++#define PCI_EXP_DPC_CTL			6	/* DPC control */
++#define  PCI_EXP_DPC_CTL_EN_NONFATAL 	0x02	/* Enable trigger on ERR_NONFATAL message */
++#define  PCI_EXP_DPC_CTL_INT_EN 	0x08	/* DPC Interrupt Enable */
++
++#define PCI_EXP_DPC_STATUS		8	/* DPC Status */
++#define  PCI_EXP_DPC_STATUS_TRIGGER	0x01	/* Trigger Status */
++#define  PCI_EXP_DPC_STATUS_INTERRUPT	0x08	/* Interrupt Status */
++
++#define PCI_EXP_DPC_SOURCE_ID		10	/* DPC Source Identifier */
++
+ #endif /* LINUX_PCI_REGS_H */
