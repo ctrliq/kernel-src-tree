@@ -41,6 +41,7 @@
 #define trace_hwptr(substream, pos, in_interrupt)
 #define trace_xrun(substream)
 #define trace_hw_ptr_error(substream, reason)
+#define trace_applptr(substream, prev, curr)
 #endif
 
 static int fill_silence_frames(struct snd_pcm_substream *substream,
@@ -2096,6 +2097,9 @@ int pcm_lib_apply_appl_ptr(struct snd_pcm_substream *substream,
 			return ret;
 		}
 	}
+
+	trace_applptr(substream, old_appl_ptr, appl_ptr);
+
 	return 0;
 }
 
