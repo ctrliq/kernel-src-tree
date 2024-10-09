@@ -1,0 +1,140 @@
+i40e: fix trivial typo in naming of i40e_sync_filters_subtask
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 0b7c8b5d5436317a5f4509e2a150c6cec017f348
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/0b7c8b5d.failed
+
+A comment incorrectly referred to i40e_vsi_sync_filters_subtask which
+does not actually exist. Reference the correct function instead.
+
+Change-ID: I6bd805c605741ffb6fe34377259bb0d597edfafd
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 0b7c8b5d5436317a5f4509e2a150c6cec017f348)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_main.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_main.c
+index 95692911ba12,6832ab126d41..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@@ -1210,86 -1198,31 +1210,108 @@@ struct i40e_mac_filter *i40e_find_mac(s
+   **/
+  bool i40e_is_vsi_in_vlan(struct i40e_vsi *vsi)
+  {
+ -	/* If we have a PVID, always operate in VLAN mode */
+ -	if (vsi->info.pvid)
+ -		return true;
+ +	struct i40e_mac_filter *f;
+  
+++<<<<<<< HEAD
+ +	/* Only -1 for all the filters denotes not in vlan mode
+ +	 * so we have to go through all the list in order to make sure
+++=======
++ 	/* We need to operate in VLAN mode whenever we have any filters with
++ 	 * a VLAN other than I40E_VLAN_ALL. We could check the table each
++ 	 * time, incurring search cost repeatedly. However, we can notice two
++ 	 * things:
++ 	 *
++ 	 * 1) the only place where we can gain a VLAN filter is in
++ 	 *    i40e_add_filter.
++ 	 *
++ 	 * 2) the only place where filters are actually removed is in
++ 	 *    i40e_sync_filters_subtask.
++ 	 *
++ 	 * Thus, we can simply use a boolean value, has_vlan_filters which we
++ 	 * will set to true when we add a VLAN filter in i40e_add_filter. Then
++ 	 * we have to perform the full search after deleting filters in
++ 	 * i40e_sync_filters_subtask, but we already have to search
++ 	 * filters here and can perform the check at the same time. This
++ 	 * results in avoiding embedding a loop for VLAN mode inside another
++ 	 * loop over all the filters, and should maintain correctness as noted
++ 	 * above.
+++>>>>>>> 0b7c8b5d5436 (i40e: fix trivial typo in naming of i40e_sync_filters_subtask)
+  	 */
+ -	return vsi->has_vlan_filter;
+ +	list_for_each_entry(f, &vsi->mac_filter_list, list) {
+ +		if (f->vlan >= 0 || vsi->info.pvid)
+ +			return true;
+ +	}
+ +
+ +	return false;
+ +}
+ +
+ +/**
+ + * i40e_put_mac_in_vlan - Make macvlan filters from macaddrs and vlans
+ + * @vsi: the VSI to be searched
+ + * @macaddr: the mac address to be filtered
+ + * @is_vf: true if it is a VF
+ + * @is_netdev: true if it is a netdev
+ + *
+ + * Goes through all the macvlan filters and adds a
+ + * macvlan filter for each unique vlan that already exists
+ + *
+ + * Returns first filter found on success, else NULL
+ + **/
+ +struct i40e_mac_filter *i40e_put_mac_in_vlan(struct i40e_vsi *vsi, u8 *macaddr,
+ +					     bool is_vf, bool is_netdev)
+ +{
+ +	struct i40e_mac_filter *f;
+ +
+ +	list_for_each_entry(f, &vsi->mac_filter_list, list) {
+ +		if (vsi->info.pvid)
+ +			f->vlan = le16_to_cpu(vsi->info.pvid);
+ +		if (!i40e_find_filter(vsi, macaddr, f->vlan,
+ +				      is_vf, is_netdev)) {
+ +			if (!i40e_add_filter(vsi, macaddr, f->vlan,
+ +					     is_vf, is_netdev))
+ +				return NULL;
+ +		}
+ +	}
+ +
+ +	return list_first_entry_or_null(&vsi->mac_filter_list,
+ +					struct i40e_mac_filter, list);
+ +}
+ +
+ +/**
+ + * i40e_del_mac_all_vlan - Remove a MAC filter from all VLANS
+ + * @vsi: the VSI to be searched
+ + * @macaddr: the mac address to be removed
+ + * @is_vf: true if it is a VF
+ + * @is_netdev: true if it is a netdev
+ + *
+ + * Removes a given MAC address from a VSI, regardless of VLAN
+ + *
+ + * Returns 0 for success, or error
+ + **/
+ +int i40e_del_mac_all_vlan(struct i40e_vsi *vsi, u8 *macaddr,
+ +			  bool is_vf, bool is_netdev)
+ +{
+ +	struct i40e_mac_filter *f = NULL;
+ +	int changed = 0;
+ +
+ +	WARN(!spin_is_locked(&vsi->mac_filter_list_lock),
+ +	     "Missing mac_filter_list_lock\n");
+ +	list_for_each_entry(f, &vsi->mac_filter_list, list) {
+ +		if ((ether_addr_equal(macaddr, f->macaddr)) &&
+ +		    (is_vf == f->is_vf) &&
+ +		    (is_netdev == f->is_netdev)) {
+ +			f->counter--;
+ +			changed = 1;
+ +			if (f->counter == 0)
+ +				f->state = I40E_FILTER_REMOVE;
+ +		}
+ +	}
+ +	if (changed) {
+ +		vsi->flags |= I40E_VSI_FLAG_FILTER_CHANGED;
+ +		vsi->back->flags |= I40E_FLAG_FILTER_SYNC;
+ +		return 0;
+ +	}
+ +	return -ENOENT;
+  }
+  
+  /**
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_main.c
