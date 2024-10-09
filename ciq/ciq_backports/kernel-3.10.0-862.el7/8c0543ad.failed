@@ -1,0 +1,385 @@
+ibmvnic: Reset tx/rx pools on driver reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Nathan Fontenot <nfont@linux.vnet.ibm.com>
+commit 8c0543adca2bb17808e46a24eb6e6247181a10b1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8c0543ad.failed
+
+When resetting the ibmvnic driver there is not a need to release
+and re-allocate the resources for the tx and rx pools. These
+resources can just be reset to avoid the re-allocations.
+
+	Signed-off-by: Nathan Fontenot <nfont@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8c0543adca2bb17808e46a24eb6e6247181a10b1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index 89c749947fa9,5661a043f5e5..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -160,19 -163,14 +160,30 @@@ static long h_reg_sub_crq(unsigned lon
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +/* net_device_ops functions */
+ +
+ +static void init_rx_pool(struct ibmvnic_adapter *adapter,
+ +			 struct ibmvnic_rx_pool *rx_pool, int num, int index,
+ +			 int buff_size, int active)
+ +{
+ +	netdev_dbg(adapter->netdev,
+ +		   "Initializing rx_pool %d, %d buffs, %d bytes each\n",
+ +		   index, num, buff_size);
+ +	rx_pool->size = num;
+ +	rx_pool->index = index;
+ +	rx_pool->buff_size = buff_size;
+ +	rx_pool->active = active;
+++=======
++ static void reset_long_term_buff(struct ibmvnic_adapter *adapter,
++ 				 struct ibmvnic_long_term_buff *ltb)
++ {
++ 	memset(ltb->buff, 0, ltb->size);
++ 
++ 	init_completion(&adapter->fw_done);
++ 	send_request_map(adapter, ltb->addr, ltb->size, ltb->map_id);
++ 	wait_for_completion(&adapter->fw_done);
+++>>>>>>> 8c0543adca2b (ibmvnic: Reset tx/rx pools on driver reset)
+  }
+  
+  static int alloc_long_term_buff(struct ibmvnic_adapter *adapter,
+@@@ -369,35 -332,214 +380,226 @@@ static void replenish_pools(struct ibmv
+  	}
+  }
+  
+ -static void release_stats_token(struct ibmvnic_adapter *adapter)
+ +static void free_rx_pool(struct ibmvnic_adapter *adapter,
+ +			 struct ibmvnic_rx_pool *pool)
+  {
+ -	struct device *dev = &adapter->vdev->dev;
+ +	int i;
+ +
+ +	kfree(pool->free_map);
+ +	pool->free_map = NULL;
+  
+ -	if (!adapter->stats_token)
+ +	if (!pool->rx_buff)
+  		return;
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < pool->size; i++) {
+ +		if (pool->rx_buff[i].skb) {
+ +			dev_kfree_skb_any(pool->rx_buff[i].skb);
+ +			pool->rx_buff[i].skb = NULL;
+++=======
++ 	dma_unmap_single(dev, adapter->stats_token,
++ 			 sizeof(struct ibmvnic_statistics),
++ 			 DMA_FROM_DEVICE);
++ 	adapter->stats_token = 0;
++ }
++ 
++ static int init_stats_token(struct ibmvnic_adapter *adapter)
++ {
++ 	struct device *dev = &adapter->vdev->dev;
++ 	dma_addr_t stok;
++ 
++ 	stok = dma_map_single(dev, &adapter->stats,
++ 			      sizeof(struct ibmvnic_statistics),
++ 			      DMA_FROM_DEVICE);
++ 	if (dma_mapping_error(dev, stok)) {
++ 		dev_err(dev, "Couldn't map stats buffer\n");
++ 		return -1;
++ 	}
++ 
++ 	adapter->stats_token = stok;
++ 	return 0;
++ }
++ 
++ static int reset_rx_pools(struct ibmvnic_adapter *adapter)
++ {
++ 	struct ibmvnic_rx_pool *rx_pool;
++ 	int rx_scrqs;
++ 	int i, j;
++ 
++ 	rx_scrqs = be32_to_cpu(adapter->login_rsp_buf->num_rxadd_subcrqs);
++ 	for (i = 0; i < rx_scrqs; i++) {
++ 		rx_pool = &adapter->rx_pool[i];
++ 
++ 		reset_long_term_buff(adapter, &rx_pool->long_term_buff);
++ 
++ 		for (j = 0; j < rx_pool->size; j++)
++ 			rx_pool->free_map[j] = j;
++ 
++ 		memset(rx_pool->rx_buff, 0,
++ 		       rx_pool->size * sizeof(struct ibmvnic_rx_buff));
++ 
++ 		atomic_set(&rx_pool->available, 0);
++ 		rx_pool->next_alloc = 0;
++ 		rx_pool->next_free = 0;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void release_rx_pools(struct ibmvnic_adapter *adapter)
++ {
++ 	struct ibmvnic_rx_pool *rx_pool;
++ 	int rx_scrqs;
++ 	int i, j;
++ 
++ 	if (!adapter->rx_pool)
++ 		return;
++ 
++ 	rx_scrqs = be32_to_cpu(adapter->login_rsp_buf->num_rxadd_subcrqs);
++ 	for (i = 0; i < rx_scrqs; i++) {
++ 		rx_pool = &adapter->rx_pool[i];
++ 
++ 		kfree(rx_pool->free_map);
++ 		free_long_term_buff(adapter, &rx_pool->long_term_buff);
++ 
++ 		if (!rx_pool->rx_buff)
++ 			continue;
++ 
++ 		for (j = 0; j < rx_pool->size; j++) {
++ 			if (rx_pool->rx_buff[j].skb) {
++ 				dev_kfree_skb_any(rx_pool->rx_buff[i].skb);
++ 				rx_pool->rx_buff[i].skb = NULL;
++ 			}
+++>>>>>>> 8c0543adca2b (ibmvnic: Reset tx/rx pools on driver reset)
+  		}
+ -
+ -		kfree(rx_pool->rx_buff);
+  	}
+ -
+ -	kfree(adapter->rx_pool);
+ -	adapter->rx_pool = NULL;
+ +	kfree(pool->rx_buff);
+ +	pool->rx_buff = NULL;
+  }
+  
+ -static int init_rx_pools(struct net_device *netdev)
+ +static int ibmvnic_open(struct net_device *netdev)
+  {
+  	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
+  	struct device *dev = &adapter->vdev->dev;
+ -	struct ibmvnic_rx_pool *rx_pool;
+ +	struct ibmvnic_tx_pool *tx_pool;
+ +	union ibmvnic_crq crq;
+  	int rxadd_subcrqs;
+  	u64 *size_array;
+++<<<<<<< HEAD
+++=======
++ 	int i, j;
++ 
++ 	rxadd_subcrqs =
++ 		be32_to_cpu(adapter->login_rsp_buf->num_rxadd_subcrqs);
++ 	size_array = (u64 *)((u8 *)(adapter->login_rsp_buf) +
++ 		be32_to_cpu(adapter->login_rsp_buf->off_rxadd_buff_size));
++ 
++ 	adapter->rx_pool = kcalloc(rxadd_subcrqs,
++ 				   sizeof(struct ibmvnic_rx_pool),
++ 				   GFP_KERNEL);
++ 	if (!adapter->rx_pool) {
++ 		dev_err(dev, "Failed to allocate rx pools\n");
++ 		return -1;
++ 	}
++ 
++ 	for (i = 0; i < rxadd_subcrqs; i++) {
++ 		rx_pool = &adapter->rx_pool[i];
++ 
++ 		netdev_dbg(adapter->netdev,
++ 			   "Initializing rx_pool %d, %lld buffs, %lld bytes each\n",
++ 			   i, adapter->req_rx_add_entries_per_subcrq,
++ 			   be64_to_cpu(size_array[i]));
++ 
++ 		rx_pool->size = adapter->req_rx_add_entries_per_subcrq;
++ 		rx_pool->index = i;
++ 		rx_pool->buff_size = be64_to_cpu(size_array[i]);
++ 		rx_pool->active = 1;
++ 
++ 		rx_pool->free_map = kcalloc(rx_pool->size, sizeof(int),
++ 					    GFP_KERNEL);
++ 		if (!rx_pool->free_map) {
++ 			release_rx_pools(adapter);
++ 			return -1;
++ 		}
++ 
++ 		rx_pool->rx_buff = kcalloc(rx_pool->size,
++ 					   sizeof(struct ibmvnic_rx_buff),
++ 					   GFP_KERNEL);
++ 		if (!rx_pool->rx_buff) {
++ 			dev_err(dev, "Couldn't alloc rx buffers\n");
++ 			release_rx_pools(adapter);
++ 			return -1;
++ 		}
++ 
++ 		if (alloc_long_term_buff(adapter, &rx_pool->long_term_buff,
++ 					 rx_pool->size * rx_pool->buff_size)) {
++ 			release_rx_pools(adapter);
++ 			return -1;
++ 		}
++ 
++ 		for (j = 0; j < rx_pool->size; ++j)
++ 			rx_pool->free_map[j] = j;
++ 
++ 		atomic_set(&rx_pool->available, 0);
++ 		rx_pool->next_alloc = 0;
++ 		rx_pool->next_free = 0;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int reset_tx_pools(struct ibmvnic_adapter *adapter)
++ {
++ 	struct ibmvnic_tx_pool *tx_pool;
++ 	int tx_scrqs;
++ 	int i, j;
++ 
++ 	tx_scrqs = be32_to_cpu(adapter->login_rsp_buf->num_txsubm_subcrqs);
++ 	for (i = 0; i < tx_scrqs; i++) {
++ 		tx_pool = &adapter->tx_pool[i];
++ 
++ 		reset_long_term_buff(adapter, &tx_pool->long_term_buff);
++ 
++ 		memset(tx_pool->tx_buff, 0,
++ 		       adapter->req_tx_entries_per_subcrq *
++ 		       sizeof(struct ibmvnic_tx_buff));
++ 
++ 		for (j = 0; j < adapter->req_tx_entries_per_subcrq; j++)
++ 			tx_pool->free_map[j] = j;
++ 
++ 		tx_pool->consumer_index = 0;
++ 		tx_pool->producer_index = 0;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void release_tx_pools(struct ibmvnic_adapter *adapter)
++ {
++ 	struct ibmvnic_tx_pool *tx_pool;
++ 	int i, tx_scrqs;
++ 
++ 	if (!adapter->tx_pool)
++ 		return;
++ 
++ 	tx_scrqs = be32_to_cpu(adapter->login_rsp_buf->num_txsubm_subcrqs);
++ 	for (i = 0; i < tx_scrqs; i++) {
++ 		tx_pool = &adapter->tx_pool[i];
++ 		kfree(tx_pool->tx_buff);
++ 		free_long_term_buff(adapter, &tx_pool->long_term_buff);
++ 		kfree(tx_pool->free_map);
++ 	}
++ 
++ 	kfree(adapter->tx_pool);
++ 	adapter->tx_pool = NULL;
++ }
++ 
++ static int init_tx_pools(struct net_device *netdev)
++ {
++ 	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
++ 	struct device *dev = &adapter->vdev->dev;
++ 	struct ibmvnic_tx_pool *tx_pool;
+++>>>>>>> 8c0543adca2b (ibmvnic: Reset tx/rx pools on driver reset)
+  	int tx_subcrqs;
+  	int i, j;
+  
+@@@ -971,14 -1291,82 +1173,80 @@@ static int ibmvnic_set_mac(struct net_d
+  	return 0;
+  }
+  
+ -/**
+ - * do_reset returns zero if we are able to keep processing reset events, or
+ - * non-zero if we hit a fatal error and must halt.
+ - */
+ -static int do_reset(struct ibmvnic_adapter *adapter,
+ -		    struct ibmvnic_rwi *rwi, u32 reset_state)
+ +static int ibmvnic_change_mtu(struct net_device *netdev, int new_mtu)
+  {
+ -	struct net_device *netdev = adapter->netdev;
+ -	int i, rc;
+ +	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
+  
+ -	netif_carrier_off(netdev);
+ -	adapter->reset_reason = rwi->reset_reason;
+ +	if (new_mtu > adapter->req_mtu || new_mtu < adapter->min_mtu)
+ +		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	netdev->mtu = new_mtu;
+++=======
++ 	if (rwi->reset_reason == VNIC_RESET_MOBILITY) {
++ 		rc = ibmvnic_reenable_crq_queue(adapter);
++ 		if (rc)
++ 			return 0;
++ 	}
++ 
++ 	rc = __ibmvnic_close(netdev);
++ 	if (rc)
++ 		return rc;
++ 
++ 	if (adapter->reset_reason != VNIC_RESET_NON_FATAL) {
++ 		/* remove the closed state so when we call open it appears
++ 		 * we are coming from the probed state.
++ 		 */
++ 		adapter->state = VNIC_PROBED;
++ 
++ 		release_sub_crqs(adapter);
++ 
++ 		rc = ibmvnic_init(adapter);
++ 		if (rc)
++ 			return 0;
++ 
++ 		/* If the adapter was in PROBE state prior to the reset,
++ 		 * exit here.
++ 		 */
++ 		if (reset_state == VNIC_PROBED)
++ 			return 0;
++ 
++ 		rc = ibmvnic_login(netdev);
++ 		if (rc) {
++ 			adapter->state = VNIC_PROBED;
++ 			return 0;
++ 		}
++ 
++ 		rc = reset_tx_pools(adapter);
++ 		if (rc)
++ 			return rc;
++ 
++ 		rc = reset_rx_pools(adapter);
++ 		if (rc)
++ 			return rc;
++ 
++ 		if (reset_state == VNIC_CLOSED)
++ 			return 0;
++ 	}
++ 
++ 	rc = __ibmvnic_open(netdev);
++ 	if (rc) {
++ 		if (list_empty(&adapter->rwi_list))
++ 			adapter->state = VNIC_CLOSED;
++ 		else
++ 			adapter->state = reset_state;
++ 
++ 		return 0;
++ 	}
++ 
++ 	netif_carrier_on(netdev);
++ 
++ 	/* kick napi */
++ 	for (i = 0; i < adapter->req_rx_queues; i++)
++ 		napi_schedule(&adapter->napi[i]);
++ 
++ 	netdev_notify_peers(netdev);
+++>>>>>>> 8c0543adca2b (ibmvnic: Reset tx/rx pools on driver reset)
+  	return 0;
+  }
+  
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
