@@ -1,0 +1,147 @@
+net_sched: act_mirred: remove spinlock in fast path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] sched: act_mirred: remove spinlock in fast path (Ivan Vecera) [1428588]
+Rebuild_FUZZ: 95.92%
+commit-author Eric Dumazet <edumazet@google.com>
+commit 2ee22a90c7afac265bb6f7abea610b938195e2b8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/2ee22a90.failed
+
+Like act_gact, act_mirred can be lockless in packet processing
+
+1) Use percpu stats
+2) update lastuse only every clock tick to avoid false sharing
+3) use rcu to protect tcfm_dev
+4) Remove spinlock usage, as it is no longer needed.
+
+Next step : add multi queue capability to ifb device
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Cc: Alexei Starovoitov <ast@plumgrid.com>
+	Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+	Cc: John Fastabend <john.fastabend@gmail.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Acked-by: Alexei Starovoitov <ast@plumgrid.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2ee22a90c7afac265bb6f7abea610b938195e2b8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_mirred.c
+diff --cc net/sched/act_mirred.c
+index 4b6188539f6c,19cd8904efa0..000000000000
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@@ -30,32 -30,16 +30,41 @@@
+  #include <linux/if_arp.h>
+  
+  #define MIRRED_TAB_MASK     7
+ +static struct tcf_common *tcf_mirred_ht[MIRRED_TAB_MASK + 1];
+ +static u32 mirred_idx_gen;
+ +static DEFINE_RWLOCK(mirred_lock);
+  static LIST_HEAD(mirred_list);
+  
+ -static void tcf_mirred_release(struct tc_action *a, int bind)
+ +static struct tcf_hashinfo mirred_hash_info = {
+ +	.htab	=	tcf_mirred_ht,
+ +	.hmask	=	MIRRED_TAB_MASK,
+ +	.lock	=	&mirred_lock,
+ +};
+ +
+ +static int tcf_mirred_release(struct tcf_mirred *m, int bind)
+  {
+++<<<<<<< HEAD
+ +	if (m) {
+ +		if (bind)
+ +			m->tcf_bindcnt--;
+ +		m->tcf_refcnt--;
+ +		if (!m->tcf_bindcnt && m->tcf_refcnt <= 0) {
+ +			list_del(&m->tcfm_list);
+ +			if (m->tcfm_dev)
+ +				dev_put(m->tcfm_dev);
+ +			tcf_hash_destroy(&m->common, &mirred_hash_info);
+ +			return 1;
+ +		}
+ +	}
+ +	return 0;
+++=======
++ 	struct tcf_mirred *m = to_mirred(a);
++ 	struct net_device *dev = rcu_dereference_protected(m->tcfm_dev, 1);
++ 
++ 	list_del(&m->tcfm_list);
++ 	if (dev)
++ 		dev_put(dev);
+++>>>>>>> 2ee22a90c7af (net_sched: act_mirred: remove spinlock in fast path)
+  }
+  
+  static const struct nla_policy mirred_policy[TCA_MIRRED_MAX + 1] = {
+@@@ -109,14 -92,13 +118,21 @@@ static int tcf_mirred_init(struct net *
+  		dev = NULL;
+  	}
+  
+ -	if (!tcf_hash_check(parm->index, a, bind)) {
+ +	pc = tcf_hash_check(parm->index, a, bind, &mirred_hash_info);
+ +	if (!pc) {
+  		if (dev == NULL)
+  			return -EINVAL;
+++<<<<<<< HEAD
+ +		pc = tcf_hash_create(parm->index, est, a, sizeof(*m), bind,
+ +				     &mirred_idx_gen, &mirred_hash_info);
+ +		if (IS_ERR(pc))
+ +			return PTR_ERR(pc);
+++=======
++ 		ret = tcf_hash_create(parm->index, est, a, sizeof(*m),
++ 				      bind, true);
++ 		if (ret)
++ 			return ret;
+++>>>>>>> 2ee22a90c7af (net_sched: act_mirred: remove spinlock in fast path)
+  		ret = ACT_P_CREATED;
+  	} else {
+  		if (!ovr) {
+@@@ -124,23 -106,23 +140,23 @@@
+  			return -EEXIST;
+  		}
+  	}
+ -	m = to_mirred(a);
+ +	m = to_mirred(pc);
+  
+- 	spin_lock_bh(&m->tcf_lock);
++ 	ASSERT_RTNL();
+  	m->tcf_action = parm->action;
+  	m->tcfm_eaction = parm->eaction;
+  	if (dev != NULL) {
+  		m->tcfm_ifindex = parm->ifindex;
+  		if (ret != ACT_P_CREATED)
+- 			dev_put(m->tcfm_dev);
++ 			dev_put(rcu_dereference_protected(m->tcfm_dev, 1));
+  		dev_hold(dev);
+- 		m->tcfm_dev = dev;
++ 		rcu_assign_pointer(m->tcfm_dev, dev);
+  		m->tcfm_ok_push = ok_push;
+  	}
+- 	spin_unlock_bh(&m->tcf_lock);
++ 
+  	if (ret == ACT_P_CREATED) {
+  		list_add(&m->tcfm_list, &mirred_list);
+ -		tcf_hash_insert(a);
+ +		tcf_hash_insert(pc, &mirred_hash_info);
+  	}
+  
+  	return ret;
+diff --git a/include/net/tc_act/tc_mirred.h b/include/net/tc_act/tc_mirred.h
+index cfe2943690ff..058499876c28 100644
+--- a/include/net/tc_act/tc_mirred.h
++++ b/include/net/tc_act/tc_mirred.h
+@@ -8,7 +8,7 @@ struct tcf_mirred {
+ 	int			tcfm_eaction;
+ 	int			tcfm_ifindex;
+ 	int			tcfm_ok_push;
+-	struct net_device	*tcfm_dev;
++	struct net_device __rcu	*tcfm_dev;
+ 	struct list_head	tcfm_list;
+ };
+ #define to_mirred(pc) \
+* Unmerged path net/sched/act_mirred.c
