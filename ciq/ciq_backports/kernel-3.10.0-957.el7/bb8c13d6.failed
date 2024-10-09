@@ -1,0 +1,192 @@
+x86/microcode: Fix CPU synchronization routine
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [x86] microcode: Fix CPU synchronization routine (Prarit Bhargava) [1568249]
+Rebuild_FUZZ: 95.45%
+commit-author Borislav Petkov <bp@suse.de>
+commit bb8c13d61a629276a162c1d2b1a20a815cbcfbb7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/bb8c13d6.failed
+
+Emanuel reported an issue with a hang during microcode update because my
+dumb idea to use one atomic synchronization variable for both rendezvous
+- before and after update - was simply bollocks:
+
+  microcode: microcode_reload_late: late_cpus: 4
+  microcode: __reload_late: cpu 2 entered
+  microcode: __reload_late: cpu 1 entered
+  microcode: __reload_late: cpu 3 entered
+  microcode: __reload_late: cpu 0 entered
+  microcode: __reload_late: cpu 1 left
+  microcode: Timeout while waiting for CPUs rendezvous, remaining: 1
+
+CPU1 above would finish, leave and the others will still spin waiting for
+it to join.
+
+So do two synchronization atomics instead, which makes the code a lot more
+straightforward.
+
+Also, since the update is serialized and it also takes quite some time per
+microcode engine, increase the exit timeout by the number of CPUs on the
+system.
+
+That's ok because the moment all CPUs are done, that timeout will be cut
+short.
+
+Furthermore, panic when some of the CPUs timeout when returning from a
+microcode update: we can't allow a system with not all cores updated.
+
+Also, as an optimization, do not do the exit sync if microcode wasn't
+updated.
+
+	Reported-by: Emanuel Czirai <xftroxgpx@protonmail.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Tested-by: Emanuel Czirai <xftroxgpx@protonmail.com>
+	Tested-by: Ashok Raj <ashok.raj@intel.com>
+	Tested-by: Tom Lendacky <thomas.lendacky@amd.com>
+Link: https://lkml.kernel.org/r/20180314183615.17629-2-bp@alien8.de
+
+(cherry picked from commit bb8c13d61a629276a162c1d2b1a20a815cbcfbb7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/microcode/core.c
+diff --cc arch/x86/kernel/cpu/microcode/core.c
+index 1b81185d9250,10c4fc2c91f8..000000000000
+--- a/arch/x86/kernel/cpu/microcode/core.c
++++ b/arch/x86/kernel/cpu/microcode/core.c
+@@@ -369,22 -494,114 +369,113 @@@ static void __exit microcode_dev_exit(v
+  /* fake device for request_firmware */
+  static struct platform_device	*microcode_pdev;
+  
+ -/*
+ - * Late loading dance. Why the heavy-handed stomp_machine effort?
+ - *
+ - * - HT siblings must be idle and not execute other code while the other sibling
+ - *   is loading microcode in order to avoid any negative interactions caused by
+ - *   the loading.
+ - *
+ - * - In addition, microcode update on the cores must be serialized until this
+ - *   requirement can be relaxed in the future. Right now, this is conservative
+ - *   and good.
+ - */
+ -#define SPINUNIT 100 /* 100 nsec */
+ -
+ -static int check_online_cpus(void)
+ +static int reload_for_cpu(int cpu)
+  {
+ -	if (num_online_cpus() == num_present_cpus())
+ -		return 0;
+ +	struct ucode_cpu_info *uci = ucode_cpu_info + cpu;
+ +	enum ucode_state ustate;
+ +	int err = 0;
+  
+ -	pr_err("Not all CPUs online, aborting microcode update.\n");
+ +	if (!uci->valid)
+ +		return err;
+  
+++<<<<<<< HEAD
+ +	ustate = microcode_ops->request_microcode_fw(cpu, &microcode_pdev->dev, true);
+ +	if (ustate == UCODE_OK)
+ +		apply_microcode_on_target(cpu);
+ +	else
+ +		if (ustate == UCODE_ERROR)
+ +			err = -EINVAL;
+ +	return err;
+++=======
++ 	return -EINVAL;
++ }
++ 
++ static atomic_t late_cpus_in;
++ static atomic_t late_cpus_out;
++ 
++ static int __wait_for_cpus(atomic_t *t, long long timeout)
++ {
++ 	int all_cpus = num_online_cpus();
++ 
++ 	atomic_inc(t);
++ 
++ 	while (atomic_read(t) < all_cpus) {
++ 		if (timeout < SPINUNIT) {
++ 			pr_err("Timeout while waiting for CPUs rendezvous, remaining: %d\n",
++ 				all_cpus - atomic_read(t));
++ 			return 1;
++ 		}
++ 
++ 		ndelay(SPINUNIT);
++ 		timeout -= SPINUNIT;
++ 
++ 		touch_nmi_watchdog();
++ 	}
++ 	return 0;
++ }
++ 
++ /*
++  * Returns:
++  * < 0 - on error
++  *   0 - no update done
++  *   1 - microcode was updated
++  */
++ static int __reload_late(void *info)
++ {
++ 	int cpu = smp_processor_id();
++ 	enum ucode_state err;
++ 	int ret = 0;
++ 
++ 	/*
++ 	 * Wait for all CPUs to arrive. A load will not be attempted unless all
++ 	 * CPUs show up.
++ 	 * */
++ 	if (__wait_for_cpus(&late_cpus_in, NSEC_PER_SEC))
++ 		return -1;
++ 
++ 	spin_lock(&update_lock);
++ 	apply_microcode_local(&err);
++ 	spin_unlock(&update_lock);
++ 
++ 	if (err > UCODE_NFOUND) {
++ 		pr_warn("Error reloading microcode on CPU %d\n", cpu);
++ 		return -1;
++ 	/* siblings return UCODE_OK because their engine got updated already */
++ 	} else if (err == UCODE_UPDATED || err == UCODE_OK) {
++ 		ret = 1;
++ 	} else {
++ 		return ret;
++ 	}
++ 
++ 	/*
++ 	 * Increase the wait timeout to a safe value here since we're
++ 	 * serializing the microcode update and that could take a while on a
++ 	 * large number of CPUs. And that is fine as the *actual* timeout will
++ 	 * be determined by the last CPU finished updating and thus cut short.
++ 	 */
++ 	if (__wait_for_cpus(&late_cpus_out, NSEC_PER_SEC * num_online_cpus()))
++ 		panic("Timeout during microcode update!\n");
++ 
++ 	return ret;
++ }
++ 
++ /*
++  * Reload microcode late on all CPUs. Wait for a sec until they
++  * all gather together.
++  */
++ static int microcode_reload_late(void)
++ {
++ 	int ret;
++ 
++ 	atomic_set(&late_cpus_in,  0);
++ 	atomic_set(&late_cpus_out, 0);
++ 
++ 	ret = stop_machine_cpuslocked(__reload_late, NULL, cpu_online_mask);
++ 	if (ret > 0)
++ 		microcode_check();
++ 
++ 	return ret;
+++>>>>>>> bb8c13d61a62 (x86/microcode: Fix CPU synchronization routine)
+  }
+  
+  static ssize_t reload_store(struct device *dev,
+* Unmerged path arch/x86/kernel/cpu/microcode/core.c
