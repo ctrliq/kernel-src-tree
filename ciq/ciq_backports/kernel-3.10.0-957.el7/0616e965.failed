@@ -1,0 +1,165 @@
+scsi: qla2xxx: Properly extract ADISC error codes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Properly extract ADISC error codes (Himanshu Madhani) [1547714]
+Rebuild_FUZZ: 93.48%
+commit-author Quinn Tran <quinn.tran@cavium.com>
+commit 0616e9658aca6990394cf255ad2f655194049881
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/0616e965.failed
+
+This patch fixes issue with extraction of ADISC error codes
+for decoding the error returned
+
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 0616e9658aca6990394cf255ad2f655194049881)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_init.c
+diff --cc drivers/scsi/qla2xxx/qla_init.c
+index bc98a1a62b13,75dc76587f43..000000000000
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@@ -272,16 -278,126 +272,136 @@@ done
+  	return rval;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void
++ qla2x00_async_prlo_done(struct scsi_qla_host *vha, fc_port_t *fcport,
++     uint16_t *data)
++ {
++ 	/* Don't re-login in target mode */
++ 	if (!fcport->tgt_session)
++ 		qla2x00_mark_device_lost(vha, fcport, 1, 0);
++ 	qlt_logo_completion_handler(fcport, data[0]);
++ }
++ 
++ static void
++ qla2x00_async_prlo_sp_done(void *s, int res)
++ {
++ 	srb_t *sp = (srb_t *)s;
++ 	struct srb_iocb *lio = &sp->u.iocb_cmd;
++ 	struct scsi_qla_host *vha = sp->vha;
++ 
++ 	if (!test_bit(UNLOADING, &vha->dpc_flags))
++ 		qla2x00_post_async_prlo_done_work(sp->fcport->vha, sp->fcport,
++ 		    lio->u.logio.data);
++ 	sp->free(sp);
++ }
++ 
++ int
++ qla2x00_async_prlo(struct scsi_qla_host *vha, fc_port_t *fcport)
++ {
++ 	srb_t *sp;
++ 	struct srb_iocb *lio;
++ 	int rval;
++ 
++ 	rval = QLA_FUNCTION_FAILED;
++ 	sp = qla2x00_get_sp(vha, fcport, GFP_KERNEL);
++ 	if (!sp)
++ 		goto done;
++ 
++ 	sp->type = SRB_PRLO_CMD;
++ 	sp->name = "prlo";
++ 	qla2x00_init_timer(sp, qla2x00_get_async_timeout(vha) + 2);
++ 
++ 	lio = &sp->u.iocb_cmd;
++ 	lio->timeout = qla2x00_async_iocb_timeout;
++ 	sp->done = qla2x00_async_prlo_sp_done;
++ 	rval = qla2x00_start_sp(sp);
++ 	if (rval != QLA_SUCCESS)
++ 		goto done_free_sp;
++ 
++ 	ql_dbg(ql_dbg_disc, vha, 0x2070,
++ 	    "Async-prlo - hdl=%x loop-id=%x portid=%02x%02x%02x.\n",
++ 	    sp->handle, fcport->loop_id, fcport->d_id.b.domain,
++ 	    fcport->d_id.b.area, fcport->d_id.b.al_pa);
++ 	return rval;
++ 
++ done_free_sp:
++ 	sp->free(sp);
++ done:
++ 	return rval;
++ }
++ 
++ static
++ void qla24xx_handle_adisc_event(scsi_qla_host_t *vha, struct event_arg *ea)
++ {
++ 	struct fc_port *fcport = ea->fcport;
++ 
++ 	ql_dbg(ql_dbg_disc, vha, 0x20d2,
++ 	    "%s %8phC DS %d LS %d rc %d login %d|%d rscn %d|%d lid %d\n",
++ 	    __func__, fcport->port_name, fcport->disc_state,
++ 	    fcport->fw_login_state, ea->rc, fcport->login_gen, ea->sp->gen2,
++ 	    fcport->rscn_gen, ea->sp->gen1, fcport->loop_id);
++ 
++ 	if (ea->data[0] != MBS_COMMAND_COMPLETE) {
++ 		ql_dbg(ql_dbg_disc, vha, 0x2066,
++ 		    "%s %8phC: adisc fail: post delete\n",
++ 		    __func__, ea->fcport->port_name);
++ 		qlt_schedule_sess_for_deletion(ea->fcport, 1);
++ 		return;
++ 	}
++ 
++ 	if (ea->fcport->disc_state == DSC_DELETE_PEND)
++ 		return;
++ 
++ 	if (ea->sp->gen2 != ea->fcport->login_gen) {
++ 		/* target side must have changed it. */
++ 		ql_dbg(ql_dbg_disc, vha, 0x20d3,
++ 		    "%s %8phC generation changed\n",
++ 		    __func__, ea->fcport->port_name);
++ 		return;
++ 	} else if (ea->sp->gen1 != ea->fcport->rscn_gen) {
++ 		ql_dbg(ql_dbg_disc, vha, 0x20d4, "%s %d %8phC post gidpn\n",
++ 		    __func__, __LINE__, ea->fcport->port_name);
++ 		qla24xx_post_gidpn_work(vha, ea->fcport);
++ 		return;
++ 	}
++ 
++ 	__qla24xx_handle_gpdb_event(vha, ea);
++ }
++ 
+++>>>>>>> 0616e9658aca (scsi: qla2xxx: Properly extract ADISC error codes)
+  static void
+  qla2x00_async_adisc_sp_done(void *ptr, int res)
+  {
+  	srb_t *sp = ptr;
+  	struct scsi_qla_host *vha = sp->vha;
+++<<<<<<< HEAD
+ +	struct srb_iocb *lio = &sp->u.iocb_cmd;
+++=======
++ 	struct event_arg ea;
++ 	struct srb_iocb *lio = &sp->u.iocb_cmd;
++ 
++ 	ql_dbg(ql_dbg_disc, vha, 0x2066,
++ 	    "Async done-%s res %x %8phC\n",
++ 	    sp->name, res, sp->fcport->port_name);
++ 
++ 	memset(&ea, 0, sizeof(ea));
++ 	ea.event = FCME_ADISC_DONE;
++ 	ea.rc = res;
++ 	ea.data[0] = lio->u.logio.data[0];
++ 	ea.data[1] = lio->u.logio.data[1];
++ 	ea.iop[0] = lio->u.logio.iop[0];
++ 	ea.iop[1] = lio->u.logio.iop[1];
++ 	ea.fcport = sp->fcport;
++ 	ea.sp = sp;
++ 
++ 	qla2x00_fcport_event_handler(vha, &ea);
+++>>>>>>> 0616e9658aca (scsi: qla2xxx: Properly extract ADISC error codes)
+  
+ +	if (!test_bit(UNLOADING, &vha->dpc_flags))
+ +		qla2x00_post_async_adisc_done_work(sp->vha, sp->fcport,
+ +		    lio->u.logio.data);
+  	sp->free(sp);
+  }
+  
+* Unmerged path drivers/scsi/qla2xxx/qla_init.c
