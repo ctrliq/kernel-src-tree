@@ -1,0 +1,229 @@
+kvm: x86: mmu: Lockless access tracking for Intel CPUs without EPT A bits.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] kvm: x86: mmu: Lockless access tracking for Intel CPUs without EPT A bits (Paolo Bonzini) [1469685]
+Rebuild_FUZZ: 99.32%
+commit-author Junaid Shahid <junaids@google.com>
+commit f160c7b7bb322bf079a5bb4dd34c58f17553f193
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f160c7b7.failed
+
+This change implements lockless access tracking for Intel CPUs without EPT
+A bits. This is achieved by marking the PTEs as not-present (but not
+completely clearing them) when clear_flush_young() is called after marking
+the pages as accessed. When an EPT Violation is generated as a result of
+the VM accessing those pages, the PTEs are restored to their original values.
+
+	Signed-off-by: Junaid Shahid <junaids@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit f160c7b7bb322bf079a5bb4dd34c58f17553f193)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.c
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/mmu.c
+index 7460413d4173,64821ca3a7c3..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -36,6 -37,8 +36,11 @@@
+  #include <linux/srcu.h>
+  #include <linux/slab.h>
+  #include <linux/uaccess.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/hash.h>
++ #include <linux/kern_levels.h>
+++>>>>>>> f160c7b7bb32 (kvm: x86: mmu: Lockless access tracking for Intel CPUs without EPT A bits.)
+  
+  #include <asm/page.h>
+  #include <asm/cmpxchg.h>
+@@@ -480,8 -527,11 +529,11 @@@ static bool spte_can_locklessly_be_made
+  
+  static bool spte_has_volatile_bits(u64 spte)
+  {
++ 	if (!is_shadow_present_pte(spte))
++ 		return false;
++ 
+  	/*
+ -	 * Always atomically update spte if it can be updated
+ +	 * Always atomicly update spte if it can be updated
+  	 * out of mmu-lock, it can ensure dirty bit is not lost,
+  	 * also, it can help us to get a stable is_writable_pte()
+  	 * to ensure tlb flush is not missed.
+@@@ -1628,27 -1711,8 +1733,32 @@@ static int kvm_age_rmapp(struct kvm *kv
+  	struct rmap_iterator uninitialized_var(iter);
+  	int young = 0;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * In case of absence of EPT Access and Dirty Bits supports,
+ +	 * emulate the accessed bit for EPT, by checking if this page has
+ +	 * an EPT mapping, and clearing it if it does. On the next access,
+ +	 * a new EPT mapping will be established.
+ +	 * This has some overhead, but not as much as the cost of swapping
+ +	 * out actively used pages or breaking up actively used hugepages.
+ +	 */
+ +	if (!shadow_accessed_mask) {
+ +		young = kvm_unmap_rmapp(kvm, rmap_head, slot, gfn, level, data);
+ +		goto out;
+ +	}
+ +
+ +	for_each_rmap_spte(rmap_head, &iter, sptep) {
+ +		if (*sptep & shadow_accessed_mask) {
+ +			young = 1;
+ +			clear_bit((ffs(shadow_accessed_mask) - 1),
+ +				 (unsigned long *)sptep);
+ +		}
+ +	}
+ +out:
+++=======
++ 	for_each_rmap_spte(rmap_head, &iter, sptep)
++ 		young |= mmu_spte_age(sptep);
+++>>>>>>> f160c7b7bb32 (kvm: x86: mmu: Lockless access tracking for Intel CPUs without EPT A bits.)
+  
+  	trace_kvm_age_page(gfn, level, slot, young);
+  	return young;
+@@@ -1691,9 -1755,21 +1801,25 @@@ static void rmap_recycle(struct kvm_vcp
+  	kvm_flush_remote_tlbs(vcpu->kvm);
+  }
+  
+ -int kvm_age_hva(struct kvm *kvm, unsigned long start, unsigned long end)
+ +int kvm_age_hva(struct kvm *kvm, unsigned long hva)
+  {
+++<<<<<<< HEAD
+ +	return kvm_handle_hva(kvm, hva, 0, kvm_age_rmapp);
+++=======
++ 	/*
++ 	 * In case of absence of EPT Access and Dirty Bits supports,
++ 	 * emulate the accessed bit for EPT, by checking if this page has
++ 	 * an EPT mapping, and clearing it if it does. On the next access,
++ 	 * a new EPT mapping will be established.
++ 	 * This has some overhead, but not as much as the cost of swapping
++ 	 * out actively used pages or breaking up actively used hugepages.
++ 	 */
++ 	if (!shadow_accessed_mask && !shadow_acc_track_mask)
++ 		return kvm_handle_hva_range(kvm, start, end, 0,
++ 					    kvm_unmap_rmapp);
++ 
++ 	return kvm_handle_hva_range(kvm, start, end, 0, kvm_age_rmapp);
+++>>>>>>> f160c7b7bb32 (kvm: x86: mmu: Lockless access tracking for Intel CPUs without EPT A bits.)
+  }
+  
+  int kvm_test_age_hva(struct kvm *kvm, unsigned long hva)
+diff --cc arch/x86/kvm/vmx.c
+index cf8fca1eeb6b,d2fe3a51876c..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -6305,34 -6698,27 +6318,52 @@@ static __init int hardware_setup(void
+  
+  	set_bit(0, vmx_vpid_bitmap); /* 0 is reserved for host */
+  
+ -	for (msr = 0x800; msr <= 0x8ff; msr++) {
+ -		if (msr == 0x839 /* TMCCT */)
+ -			continue;
+ -		vmx_disable_intercept_msr_x2apic(msr, MSR_TYPE_R, true);
+ -	}
+ -
+ +	if (enable_apicv) {
+ +		for (msr = 0x800; msr <= 0x8ff; msr++)
+ +			vmx_disable_intercept_msr_read_x2apic(msr);
+ +
+ +		/* According SDM, in x2apic mode, the whole id reg is used.
+ +		 * But in KVM, it only use the highest eight bits. Need to
+ +		 * intercept it */
+ +		vmx_enable_intercept_msr_read_x2apic(0x802);
+ +		/* TMCCT */
+ +		vmx_enable_intercept_msr_read_x2apic(0x839);
+ +		/* TPR */
+ +		vmx_disable_intercept_msr_write_x2apic(0x808);
+ +		/* EOI */
+ +		vmx_disable_intercept_msr_write_x2apic(0x80b);
+ +		/* SELF-IPI */
+ +		vmx_disable_intercept_msr_write_x2apic(0x83f);
+ +	}
+ +
+++<<<<<<< HEAD
+ +	if (enable_ept) {
+ +		kvm_mmu_set_mask_ptes(VMX_EPT_READABLE_MASK,
+ +			(enable_ept_ad_bits) ? VMX_EPT_ACCESS_BIT : 0ull,
+ +			(enable_ept_ad_bits) ? VMX_EPT_DIRTY_BIT : 0ull,
+ +			0ull, VMX_EPT_EXECUTABLE_MASK,
+ +			cpu_has_vmx_ept_execute_only() ?
+ +				      0ull : VMX_EPT_READABLE_MASK);
+ +		ept_set_mmio_spte_mask();
+ +		kvm_enable_tdp();
+ +	} else
+++=======
++ 	/*
++ 	 * TPR reads and writes can be virtualized even if virtual interrupt
++ 	 * delivery is not in use.
++ 	 */
++ 	vmx_disable_intercept_msr_x2apic(0x808, MSR_TYPE_W, true);
++ 	vmx_disable_intercept_msr_x2apic(0x808, MSR_TYPE_R | MSR_TYPE_W, false);
++ 
++ 	/* EOI */
++ 	vmx_disable_intercept_msr_x2apic(0x80b, MSR_TYPE_W, true);
++ 	/* SELF-IPI */
++ 	vmx_disable_intercept_msr_x2apic(0x83f, MSR_TYPE_W, true);
++ 
++ 	if (enable_ept)
++ 		vmx_enable_tdp();
++ 	else
+++>>>>>>> f160c7b7bb32 (kvm: x86: mmu: Lockless access tracking for Intel CPUs without EPT A bits.)
+  		kvm_disable_tdp();
+  
+  	update_ple_window_actual_max();
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 5c70a7e5331b..04ceea1a578e 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -985,7 +985,8 @@ void kvm_mmu_setup(struct kvm_vcpu *vcpu);
+ void kvm_mmu_init_vm(struct kvm *kvm);
+ void kvm_mmu_uninit_vm(struct kvm *kvm);
+ void kvm_mmu_set_mask_ptes(u64 user_mask, u64 accessed_mask,
+-		u64 dirty_mask, u64 nx_mask, u64 x_mask, u64 p_mask);
++		u64 dirty_mask, u64 nx_mask, u64 x_mask, u64 p_mask,
++		u64 acc_track_mask);
+ 
+ void kvm_mmu_reset_context(struct kvm_vcpu *vcpu);
+ void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
+diff --git a/arch/x86/include/asm/vmx.h b/arch/x86/include/asm/vmx.h
+index 2454c9cad6cc..d1edfd8f3868 100644
+--- a/arch/x86/include/asm/vmx.h
++++ b/arch/x86/include/asm/vmx.h
+@@ -438,11 +438,14 @@ enum vmcs_field {
+ #define VMX_EPT_IPAT_BIT    			(1ull << 6)
+ #define VMX_EPT_ACCESS_BIT			(1ull << 8)
+ #define VMX_EPT_DIRTY_BIT			(1ull << 9)
++#define VMX_EPT_RWX_MASK                        (VMX_EPT_READABLE_MASK |       \
++						 VMX_EPT_WRITABLE_MASK |       \
++						 VMX_EPT_EXECUTABLE_MASK)
++#define VMX_EPT_MT_MASK				(7ull << VMX_EPT_MT_EPTE_SHIFT)
+ 
+ /* The mask to use to trigger an EPT Misconfiguration in order to track MMIO */
+-#define VMX_EPT_MISCONFIG_WX_VALUE           (VMX_EPT_WRITABLE_MASK |       \
+-                                              VMX_EPT_EXECUTABLE_MASK)
+-
++#define VMX_EPT_MISCONFIG_WX_VALUE		(VMX_EPT_WRITABLE_MASK |       \
++						 VMX_EPT_EXECUTABLE_MASK)
+ 
+ #define VMX_EPT_IDENTITY_PAGETABLE_ADDR		0xfffbc000ul
+ 
+* Unmerged path arch/x86/kvm/mmu.c
+* Unmerged path arch/x86/kvm/vmx.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 99e230533b87..458bf19ab8fd 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -5914,7 +5914,7 @@ int kvm_arch_init(void *opaque)
+ 
+ 	kvm_mmu_set_mask_ptes(PT_USER_MASK, PT_ACCESSED_MASK,
+ 			PT_DIRTY_MASK, PT64_NX_MASK, 0,
+-			PT_PRESENT_MASK);
++			PT_PRESENT_MASK, 0);
+ 	kvm_timer_init();
+ 
+ 	perf_register_guest_info_callbacks(&kvm_guest_cbs);
