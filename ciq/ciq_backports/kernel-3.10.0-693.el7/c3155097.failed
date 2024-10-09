@@ -1,0 +1,339 @@
+xfs: sync eofblocks scans under iolock are livelock prone
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit c3155097ad89a956579bc305856a1f2878494e52
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/c3155097.failed
+
+The xfs_eofblocks.eof_scan_owner field is an internal field to
+facilitate invoking eofb scans from the kernel while under the iolock.
+This is necessary because the eofb scan acquires the iolock of each
+inode. Synchronous scans are invoked on certain buffered write failures
+while under iolock. In such cases, the scan owner indicates that the
+context for the scan already owns the particular iolock and prevents a
+double lock deadlock.
+
+eofblocks scans while under iolock are still livelock prone in the event
+of multiple parallel scans, however. If multiple buffered writes to
+different inodes fail and invoke eofblocks scans at the same time, each
+scan avoids a deadlock with its own inode by virtue of the
+eof_scan_owner field, but will never be able to acquire the iolock of
+the inode from the parallel scan. Because the low free space scans are
+invoked with SYNC_WAIT, the scan will not return until it has processed
+every tagged inode and thus both scans will spin indefinitely on the
+iolock being held across the opposite scan. This problem can be
+reproduced reliably by generic/224 on systems with higher cpu counts
+(x16).
+
+To avoid this problem, simplify the semantics of eofblocks scans to
+never invoke a scan while under iolock. This means that the buffered
+write context must drop the iolock before the scan. It must reacquire
+the lock before the write retry and also repeat the initial write
+checks, as the original state might no longer be valid once the iolock
+was dropped.
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit c3155097ad89a956579bc305856a1f2878494e52)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+#	fs/xfs/xfs_icache.c
+diff --cc fs/xfs/xfs_file.c
+index 815d8f3721f9,0a29739f785e..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -890,22 -614,23 +890,37 @@@ xfs_file_buffered_aio_write
+  	struct xfs_inode	*ip = XFS_I(inode);
+  	ssize_t			ret;
+  	int			enospc = 0;
+++<<<<<<< HEAD
+ +	int			iolock = XFS_IOLOCK_EXCL;
+ +	size_t			count = ocount;
+ +
+ +	xfs_rw_ilock(ip, iolock);
+++=======
++ 	int			iolock;
++ 
++ write_retry:
++ 	iolock = XFS_IOLOCK_EXCL;
++ 	xfs_ilock(ip, iolock);
+++>>>>>>> c3155097ad89 (xfs: sync eofblocks scans under iolock are livelock prone)
+  
+ -	ret = xfs_file_aio_write_checks(iocb, from, &iolock);
+ +	ret = xfs_file_aio_write_checks(file, &pos, &count, &iolock);
+  	if (ret)
+  		goto out;
+  
+  	/* We can write back this queue in page reclaim */
+ -	current->backing_dev_info = inode_to_bdi(inode);
+ +	current->backing_dev_info = mapping->backing_dev_info;
+  
+++<<<<<<< HEAD
+ +write_retry:
+ +	trace_xfs_file_buffered_write(ip, count, iocb->ki_pos, 0);
+ +	ret = generic_file_buffered_write(iocb, iovp, nr_segs,
+ +			pos, &iocb->ki_pos, count, 0);
+++=======
++ 	trace_xfs_file_buffered_write(ip, iov_iter_count(from), iocb->ki_pos);
++ 	ret = iomap_file_buffered_write(iocb, from, &xfs_iomap_ops);
++ 	if (likely(ret >= 0))
++ 		iocb->ki_pos += ret;
+++>>>>>>> c3155097ad89 (xfs: sync eofblocks scans under iolock are livelock prone)
+  
+  	/*
+  	 * If we hit a space limit, try to free up some lingering preallocated
+@@@ -920,6 -646,10 +936,13 @@@
+  		enospc = xfs_inode_free_quota_eofblocks(ip);
+  		if (enospc)
+  			goto write_retry;
+++<<<<<<< HEAD
+++=======
++ 		enospc = xfs_inode_free_quota_cowblocks(ip);
++ 		if (enospc)
++ 			goto write_retry;
++ 		iolock = 0;
+++>>>>>>> c3155097ad89 (xfs: sync eofblocks scans under iolock are livelock prone)
+  	} else if (ret == -ENOSPC && !enospc) {
+  		struct xfs_eofblocks eofb = {0};
+  
+@@@ -933,7 -664,8 +957,12 @@@
+  
+  	current->backing_dev_info = NULL;
+  out:
+++<<<<<<< HEAD
+ +	xfs_rw_iunlock(ip, iolock);
+++=======
++ 	if (iolock)
++ 		xfs_iunlock(ip, iolock);
+++>>>>>>> c3155097ad89 (xfs: sync eofblocks scans under iolock are livelock prone)
+  	return ret;
+  }
+  
+diff --cc fs/xfs/xfs_icache.c
+index 68b891ef61bd,7234b9748c36..000000000000
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@@ -1263,13 -1322,10 +1263,10 @@@ xfs_inode_free_eofblocks
+  	int			flags,
+  	void			*args)
+  {
+ -	int ret = 0;
+ +	int ret;
+  	struct xfs_eofblocks *eofb = args;
+- 	bool need_iolock = true;
+  	int match;
+  
+- 	ASSERT(!eofb || (eofb && eofb->eof_scan_owner != 0));
+- 
+  	if (!xfs_can_free_eofblocks(ip, false)) {
+  		/* inode could be preallocated or append-only */
+  		trace_xfs_inode_free_eofblocks_invalid(ip);
+@@@ -1297,21 -1353,19 +1294,37 @@@
+  		if (eofb->eof_flags & XFS_EOF_FLAGS_MINFILESIZE &&
+  		    XFS_ISIZE(ip) < eofb->eof_min_file_size)
+  			return 0;
+++<<<<<<< HEAD
+ +
+ +		/*
+ +		 * A scan owner implies we already hold the iolock. Skip it in
+ +		 * xfs_free_eofblocks() to avoid deadlock. This also eliminates
+ +		 * the possibility of EAGAIN being returned.
+ +		 */
+ +		if (eofb->eof_scan_owner == ip->i_ino)
+ +			need_iolock = false;
+ +	}
+ +
+ +	ret = xfs_free_eofblocks(ip->i_mount, ip, need_iolock);
+ +
+ +	/* don't revisit the inode if we're not waiting */
+ +	if (ret == -EAGAIN && !(flags & SYNC_WAIT))
+ +		ret = 0;
+++=======
++ 	}
++ 
++ 	/*
++ 	 * If the caller is waiting, return -EAGAIN to keep the background
++ 	 * scanner moving and revisit the inode in a subsequent pass.
++ 	 */
++ 	if (!xfs_ilock_nowait(ip, XFS_IOLOCK_EXCL)) {
++ 		if (flags & SYNC_WAIT)
++ 			ret = -EAGAIN;
++ 		return ret;
++ 	}
++ 	ret = xfs_free_eofblocks(ip);
++ 	xfs_iunlock(ip, XFS_IOLOCK_EXCL);
+++>>>>>>> c3155097ad89 (xfs: sync eofblocks scans under iolock are livelock prone)
+  
+  	return ret;
+  }
+@@@ -1422,14 -1515,16 +1430,15 @@@ xfs_inode_clear_eofblocks_tag
+  	struct xfs_mount *mp = ip->i_mount;
+  	struct xfs_perag *pag;
+  
+ -	spin_lock(&ip->i_flags_lock);
+ -	ip->i_flags &= ~XFS_IEOFBLOCKS;
+ -	spin_unlock(&ip->i_flags_lock);
+ -
+  	pag = xfs_perag_get(mp, XFS_INO_TO_AGNO(mp, ip->i_ino));
+  	spin_lock(&pag->pag_ici_lock);
+ +	trace_xfs_inode_clear_eofblocks_tag(ip);
+  
+++<<<<<<< HEAD
+  	radix_tree_tag_clear(&pag->pag_ici_root,
+ -			     XFS_INO_TO_AGINO(ip->i_mount, ip->i_ino), tag);
+ -	if (!radix_tree_tagged(&pag->pag_ici_root, tag)) {
+ +			     XFS_INO_TO_AGINO(ip->i_mount, ip->i_ino),
+ +			     XFS_ICI_EOFBLOCKS_TAG);
+ +	if (!radix_tree_tagged(&pag->pag_ici_root, XFS_ICI_EOFBLOCKS_TAG)) {
+  		/* clear the eofblocks tag from the perag radix tree */
+  		spin_lock(&ip->i_mount->m_perag_lock);
+  		radix_tree_tag_clear(&ip->i_mount->m_perag_tree,
+@@@ -1442,5 -1536,117 +1451,74 @@@
+  
+  	spin_unlock(&pag->pag_ici_lock);
+  	xfs_perag_put(pag);
+ -}
+ -
+ -void
+ -xfs_inode_clear_eofblocks_tag(
+ -	xfs_inode_t	*ip)
+ -{
+ -	trace_xfs_inode_clear_eofblocks_tag(ip);
+ -	return __xfs_inode_clear_eofblocks_tag(ip,
+ -			trace_xfs_perag_clear_eofblocks, XFS_ICI_EOFBLOCKS_TAG);
+ -}
+ -
+++=======
++ /*
++  * Automatic CoW Reservation Freeing
++  *
++  * These functions automatically garbage collect leftover CoW reservations
++  * that were made on behalf of a cowextsize hint when we start to run out
++  * of quota or when the reservations sit around for too long.  If the file
++  * has dirty pages or is undergoing writeback, its CoW reservations will
++  * be retained.
++  *
++  * The actual garbage collection piggybacks off the same code that runs
++  * the speculative EOF preallocation garbage collector.
++  */
++ STATIC int
++ xfs_inode_free_cowblocks(
++ 	struct xfs_inode	*ip,
++ 	int			flags,
++ 	void			*args)
++ {
++ 	int ret;
++ 	struct xfs_eofblocks *eofb = args;
++ 	int match;
++ 	struct xfs_ifork	*ifp = XFS_IFORK_PTR(ip, XFS_COW_FORK);
++ 
++ 	/*
++ 	 * Just clear the tag if we have an empty cow fork or none at all. It's
++ 	 * possible the inode was fully unshared since it was originally tagged.
++ 	 */
++ 	if (!xfs_is_reflink_inode(ip) || !ifp->if_bytes) {
++ 		trace_xfs_inode_free_cowblocks_invalid(ip);
++ 		xfs_inode_clear_cowblocks_tag(ip);
++ 		return 0;
++ 	}
++ 
++ 	/*
++ 	 * If the mapping is dirty or under writeback we cannot touch the
++ 	 * CoW fork.  Leave it alone if we're in the midst of a directio.
++ 	 */
++ 	if ((VFS_I(ip)->i_state & I_DIRTY_PAGES) ||
++ 	    mapping_tagged(VFS_I(ip)->i_mapping, PAGECACHE_TAG_DIRTY) ||
++ 	    mapping_tagged(VFS_I(ip)->i_mapping, PAGECACHE_TAG_WRITEBACK) ||
++ 	    atomic_read(&VFS_I(ip)->i_dio_count))
++ 		return 0;
++ 
++ 	if (eofb) {
++ 		if (eofb->eof_flags & XFS_EOF_FLAGS_UNION)
++ 			match = xfs_inode_match_id_union(ip, eofb);
++ 		else
++ 			match = xfs_inode_match_id(ip, eofb);
++ 		if (!match)
++ 			return 0;
++ 
++ 		/* skip the inode if the file size is too small */
++ 		if (eofb->eof_flags & XFS_EOF_FLAGS_MINFILESIZE &&
++ 		    XFS_ISIZE(ip) < eofb->eof_min_file_size)
++ 			return 0;
++ 	}
++ 
++ 	/* Free the CoW blocks */
++ 	xfs_ilock(ip, XFS_IOLOCK_EXCL);
++ 	xfs_ilock(ip, XFS_MMAPLOCK_EXCL);
++ 
++ 	ret = xfs_reflink_cancel_cow_range(ip, 0, NULLFILEOFF);
++ 
++ 	xfs_iunlock(ip, XFS_MMAPLOCK_EXCL);
++ 	xfs_iunlock(ip, XFS_IOLOCK_EXCL);
++ 
++ 	return ret;
+++>>>>>>> c3155097ad89 (xfs: sync eofblocks scans under iolock are livelock prone)
+  }
+  
+ -int
+ -xfs_icache_free_cowblocks(
+ -	struct xfs_mount	*mp,
+ -	struct xfs_eofblocks	*eofb)
+ -{
+ -	return __xfs_icache_free_eofblocks(mp, eofb, xfs_inode_free_cowblocks,
+ -			XFS_ICI_COWBLOCKS_TAG);
+ -}
+ -
+ -int
+ -xfs_inode_free_quota_cowblocks(
+ -	struct xfs_inode *ip)
+ -{
+ -	return __xfs_inode_free_quota_eofblocks(ip, xfs_icache_free_cowblocks);
+ -}
+ -
+ -void
+ -xfs_inode_set_cowblocks_tag(
+ -	xfs_inode_t	*ip)
+ -{
+ -	trace_xfs_inode_set_cowblocks_tag(ip);
+ -	return __xfs_inode_set_eofblocks_tag(ip, xfs_queue_cowblocks,
+ -			trace_xfs_perag_set_cowblocks,
+ -			XFS_ICI_COWBLOCKS_TAG);
+ -}
+ -
+ -void
+ -xfs_inode_clear_cowblocks_tag(
+ -	xfs_inode_t	*ip)
+ -{
+ -	trace_xfs_inode_clear_cowblocks_tag(ip);
+ -	return __xfs_inode_clear_eofblocks_tag(ip,
+ -			trace_xfs_perag_clear_cowblocks, XFS_ICI_COWBLOCKS_TAG);
+ -}
+* Unmerged path fs/xfs/xfs_file.c
+* Unmerged path fs/xfs/xfs_icache.c
+diff --git a/fs/xfs/xfs_icache.h b/fs/xfs/xfs_icache.h
+index 2c2a749bfe2d..e7198caad733 100644
+--- a/fs/xfs/xfs_icache.h
++++ b/fs/xfs/xfs_icache.h
+@@ -27,7 +27,6 @@ struct xfs_eofblocks {
+ 	kgid_t		eof_gid;
+ 	prid_t		eof_prid;
+ 	__u64		eof_min_file_size;
+-	xfs_ino_t	eof_scan_owner;
+ };
+ 
+ #define SYNC_WAIT		0x0001	/* wait for i/o to complete */
+@@ -95,7 +94,6 @@ xfs_fs_eofblocks_from_user(
+ 	dst->eof_flags = src->eof_flags;
+ 	dst->eof_prid = src->eof_prid;
+ 	dst->eof_min_file_size = src->eof_min_file_size;
+-	dst->eof_scan_owner = NULLFSINO;
+ 
+ 	dst->eof_uid = INVALID_UID;
+ 	if (src->eof_flags & XFS_EOF_FLAGS_UID) {
