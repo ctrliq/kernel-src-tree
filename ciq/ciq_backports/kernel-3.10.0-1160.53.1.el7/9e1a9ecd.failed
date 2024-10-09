@@ -1,0 +1,185 @@
+gfs2: Don't withdraw under a spin lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.53.1.el7
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 9e1a9ecd13b9bb421c88135b178577caf4d54f6a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.53.1.el7/9e1a9ecd.failed
+
+In two places, the gfs2_io_error_bh macro is called while holding the
+sd_ail_lock spin lock.  This isn't allowed because gfs2_io_error_bh
+withdraws the filesystem, which can sleep because it issues a uevent.
+To fix that, add a gfs2_io_error_bh_wd macro that does withdraw the
+filesystem and change gfs2_io_error_bh to not withdraw the filesystem.
+In those places where the new gfs2_io_error_bh is used, withdraw the
+filesystem after releasing sd_ail_lock.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Reviewed-by: Andrew Price <anprice@redhat.com>
+(cherry picked from commit 9e1a9ecd13b9bb421c88135b178577caf4d54f6a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/log.c
+#	fs/gfs2/util.c
+diff --cc fs/gfs2/log.c
+index 78f81ccc8357,a767fad02386..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -145,8 -150,11 +148,13 @@@ void gfs2_ail1_flush(struct gfs2_sbd *s
+  {
+  	struct list_head *head = &sdp->sd_ail1_list;
+  	struct gfs2_trans *tr;
+++<<<<<<< HEAD
+++=======
++ 	struct blk_plug plug;
++ 	bool withdraw = false;
+++>>>>>>> 9e1a9ecd13b9 (gfs2: Don't withdraw under a spin lock)
+  
+  	trace_gfs2_ail_flush(sdp, wbc, 1);
+ -	blk_start_plug(&plug);
+  	spin_lock(&sdp->sd_ail_lock);
+  restart:
+  	list_for_each_entry_reverse(tr, head, tr_list) {
+@@@ -156,6 -164,9 +164,12 @@@
+  			goto restart;
+  	}
+  	spin_unlock(&sdp->sd_ail_lock);
+++<<<<<<< HEAD
+++=======
++ 	blk_finish_plug(&plug);
++ 	if (withdraw)
++ 		gfs2_lm_withdraw(sdp, NULL);
+++>>>>>>> 9e1a9ecd13b9 (gfs2: Don't withdraw under a spin lock)
+  	trace_gfs2_ail_flush(sdp, wbc, 0);
+  }
+  
+diff --cc fs/gfs2/util.c
+index d62797b79ef2,59c811de0dc7..000000000000
+--- a/fs/gfs2/util.c
++++ b/fs/gfs2/util.c
+@@@ -45,9 -46,16 +45,22 @@@ int gfs2_lm_withdraw(struct gfs2_sbd *s
+  	    test_and_set_bit(SDF_SHUTDOWN, &sdp->sd_flags))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	va_start(args, fmt);
+ +	vprintk(fmt, args);
+ +	va_end(args);
+++=======
++ 	if (fmt) {
++ 		va_start(args, fmt);
++ 
++ 		vaf.fmt = fmt;
++ 		vaf.va = &args;
++ 
++ 		fs_err(sdp, "%pV", &vaf);
++ 
++ 		va_end(args);
++ 	}
+++>>>>>>> 9e1a9ecd13b9 (gfs2: Don't withdraw under a spin lock)
+  
+  	if (sdp->sd_args.ar_errors == GFS2_ERRORS_WITHDRAW) {
+  		fs_err(sdp, "about to withdraw this file system\n");
+@@@ -253,21 -248,21 +266,32 @@@ int gfs2_io_error_i(struct gfs2_sbd *sd
+  }
+  
+  /**
+-  * gfs2_io_error_bh_i - Flag a buffer I/O error and withdraw
+-  * Returns: -1 if this call withdrew the machine,
+-  *          0 if it was already withdrawn
++  * gfs2_io_error_bh_i - Flag a buffer I/O error
++  * @withdraw: withdraw the filesystem
+   */
+  
+- int gfs2_io_error_bh_i(struct gfs2_sbd *sdp, struct buffer_head *bh,
+- 		       const char *function, char *file, unsigned int line)
++ void gfs2_io_error_bh_i(struct gfs2_sbd *sdp, struct buffer_head *bh,
++ 			const char *function, char *file, unsigned int line,
++ 			bool withdraw)
+  {
+++<<<<<<< HEAD
+ +	int rv;
+ +	rv = gfs2_lm_withdraw(sdp,
+ +		"GFS2: fsid=%s: fatal: I/O error\n"
+ +		"GFS2: fsid=%s:   block = %llu\n"
+ +		"GFS2: fsid=%s:   function = %s, file = %s, line = %u\n",
+ +		sdp->sd_fsname,
+ +		sdp->sd_fsname, (unsigned long long)bh->b_blocknr,
+ +		sdp->sd_fsname, function, file, line);
+ +	return rv;
+++=======
++ 	fs_err(sdp,
++ 	       "fatal: I/O error\n"
++ 	       "  block = %llu\n"
++ 	       "  function = %s, file = %s, line = %u\n",
++ 	       (unsigned long long)bh->b_blocknr,
++ 	       function, file, line);
++ 	if (withdraw)
++ 		gfs2_lm_withdraw(sdp, NULL);
+++>>>>>>> 9e1a9ecd13b9 (gfs2: Don't withdraw under a spin lock)
+  }
+ -
+* Unmerged path fs/gfs2/log.c
+diff --git a/fs/gfs2/lops.c b/fs/gfs2/lops.c
+index d0eb75854277..01de90379802 100644
+--- a/fs/gfs2/lops.c
++++ b/fs/gfs2/lops.c
+@@ -48,7 +48,7 @@ void gfs2_pin(struct gfs2_sbd *sdp, struct buffer_head *bh)
+ 	if (test_set_buffer_pinned(bh))
+ 		gfs2_assert_withdraw(sdp, 0);
+ 	if (!buffer_uptodate(bh))
+-		gfs2_io_error_bh(sdp, bh);
++		gfs2_io_error_bh_wd(sdp, bh);
+ 	bd = bh->b_private;
+ 	/* If this buffer is in the AIL and it has already been written
+ 	 * to in-place disk block, remove it from the AIL.
+diff --git a/fs/gfs2/meta_io.c b/fs/gfs2/meta_io.c
+index 8efc17222f4f..08bd32f5609f 100644
+--- a/fs/gfs2/meta_io.c
++++ b/fs/gfs2/meta_io.c
+@@ -303,7 +303,7 @@ int gfs2_meta_read(struct gfs2_glock *gl, u64 blkno, int flags,
+ 	if (unlikely(!buffer_uptodate(bh))) {
+ 		struct gfs2_trans *tr = current->journal_info;
+ 		if (tr && test_bit(TR_TOUCHED, &tr->tr_flags))
+-			gfs2_io_error_bh(sdp, bh);
++			gfs2_io_error_bh_wd(sdp, bh);
+ 		brelse(bh);
+ 		*bhp = NULL;
+ 		return -EIO;
+@@ -330,7 +330,7 @@ int gfs2_meta_wait(struct gfs2_sbd *sdp, struct buffer_head *bh)
+ 	if (!buffer_uptodate(bh)) {
+ 		struct gfs2_trans *tr = current->journal_info;
+ 		if (tr && test_bit(TR_TOUCHED, &tr->tr_flags))
+-			gfs2_io_error_bh(sdp, bh);
++			gfs2_io_error_bh_wd(sdp, bh);
+ 		return -EIO;
+ 	}
+ 	if (unlikely(test_bit(SDF_SHUTDOWN, &sdp->sd_flags)))
+* Unmerged path fs/gfs2/util.c
+diff --git a/fs/gfs2/util.h b/fs/gfs2/util.h
+index 136b196396ef..fb90038c4331 100644
+--- a/fs/gfs2/util.h
++++ b/fs/gfs2/util.h
+@@ -135,11 +135,15 @@ int gfs2_io_error_i(struct gfs2_sbd *sdp, const char *function,
+ gfs2_io_error_i((sdp), __func__, __FILE__, __LINE__);
+ 
+ 
+-int gfs2_io_error_bh_i(struct gfs2_sbd *sdp, struct buffer_head *bh,
+-		       const char *function, char *file, unsigned int line);
++void gfs2_io_error_bh_i(struct gfs2_sbd *sdp, struct buffer_head *bh,
++			const char *function, char *file, unsigned int line,
++			bool withdraw);
++
++#define gfs2_io_error_bh_wd(sdp, bh) \
++gfs2_io_error_bh_i((sdp), (bh), __func__, __FILE__, __LINE__, true);
+ 
+ #define gfs2_io_error_bh(sdp, bh) \
+-gfs2_io_error_bh_i((sdp), (bh), __func__, __FILE__, __LINE__);
++gfs2_io_error_bh_i((sdp), (bh), __func__, __FILE__, __LINE__, false);
+ 
+ 
+ extern struct kmem_cache *gfs2_glock_cachep;
