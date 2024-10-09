@@ -1,0 +1,134 @@
+mm: change return values of finish_mkwrite_fault()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [mm] change return values of finish_mkwrite_fault() (Larry Woodman) [1457569 1383493 1457572]
+Rebuild_FUZZ: 95.83%
+commit-author Jan Kara <jack@suse.cz>
+commit a19e25536ed3a20845f642ce531e10c27fb2add5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a19e2553.failed
+
+Currently finish_mkwrite_fault() returns 0 when PTE got changed before
+we acquired PTE lock and VM_FAULT_WRITE when we succeeded in modifying
+the PTE.  This is somewhat confusing since 0 generally means success, it
+is also inconsistent with finish_fault() which returns 0 on success.
+Change finish_mkwrite_fault() to return 0 on success and VM_FAULT_NOPAGE
+when PTE changed.  Practically, there should be no behavioral difference
+since we bail out from the fault the same way regardless whether we
+return 0, VM_FAULT_NOPAGE, or VM_FAULT_WRITE.  Also note that
+VM_FAULT_WRITE has no effect for shared mappings since the only two
+places that check it - KSM and GUP - care about private mappings only.
+Generally the meaning of VM_FAULT_WRITE for shared mappings is not well
+defined and we should probably clean that up.
+
+Link: http://lkml.kernel.org/r/1479460644-25076-17-git-send-email-jack@suse.cz
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit a19e25536ed3a20845f642ce531e10c27fb2add5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memory.c
+diff --cc mm/memory.c
+index 2fc5b28b6782,8b7f0656a921..000000000000
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@@ -2272,6 -2269,38 +2272,41 @@@ oom
+  	return VM_FAULT_OOM;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * finish_mkwrite_fault - finish page fault for a shared mapping, making PTE
++  *			  writeable once the page is prepared
++  *
++  * @vmf: structure describing the fault
++  *
++  * This function handles all that is needed to finish a write page fault in a
++  * shared mapping due to PTE being read-only once the mapped page is prepared.
++  * It handles locking of PTE and modifying it. The function returns
++  * VM_FAULT_WRITE on success, 0 when PTE got changed before we acquired PTE
++  * lock.
++  *
++  * The function expects the page to be locked or other protection against
++  * concurrent faults / writeback (such as DAX radix tree locks).
++  */
++ int finish_mkwrite_fault(struct vm_fault *vmf)
++ {
++ 	WARN_ON_ONCE(!(vmf->vma->vm_flags & VM_SHARED));
++ 	vmf->pte = pte_offset_map_lock(vmf->vma->vm_mm, vmf->pmd, vmf->address,
++ 				       &vmf->ptl);
++ 	/*
++ 	 * We might have raced with another page fault while we released the
++ 	 * pte_offset_map_lock.
++ 	 */
++ 	if (!pte_same(*vmf->pte, vmf->orig_pte)) {
++ 		pte_unmap_unlock(vmf->pte, vmf->ptl);
++ 		return VM_FAULT_NOPAGE;
++ 	}
++ 	wp_page_reuse(vmf);
++ 	return 0;
++ }
++ 
+++>>>>>>> a19e25536ed3 (mm: change return values of finish_mkwrite_fault())
+  /*
+   * Handle write page faults for VM_MIXEDMAP or VM_PFNMAP for a VM_SHARED
+   * mapping
+@@@ -2326,32 -2333,27 +2361,40 @@@ static int wp_page_shared(struct mm_str
+  	if (vma->vm_ops && vma->vm_ops->page_mkwrite) {
+  		int tmp;
+  
+ -		pte_unmap_unlock(vmf->pte, vmf->ptl);
+ -		tmp = do_page_mkwrite(vmf);
+ +		pte_unmap_unlock(page_table, ptl);
+ +		tmp = do_page_mkwrite(vma, old_page, address);
+  		if (unlikely(!tmp || (tmp &
+  				      (VM_FAULT_ERROR | VM_FAULT_NOPAGE)))) {
+ -			put_page(vmf->page);
+ +			page_cache_release(old_page);
+  			return tmp;
+  		}
+++<<<<<<< HEAD
+ +		/*
+ +		 * Since we dropped the lock we need to revalidate
+ +		 * the PTE as someone else may have changed it.  If
+ +		 * they did, we just return, as we can count on the
+ +		 * MMU to tell us if they didn't also make it writable.
+ +		 */
+ +		page_table = pte_offset_map_lock(mm, pmd, address,
+ +						 &ptl);
+ +		if (!pte_same(*page_table, orig_pte)) {
+ +			unlock_page(old_page);
+ +			pte_unmap_unlock(page_table, ptl);
+ +			page_cache_release(old_page);
+ +			return 0;
+++=======
++ 		tmp = finish_mkwrite_fault(vmf);
++ 		if (unlikely(tmp & (VM_FAULT_ERROR | VM_FAULT_NOPAGE))) {
++ 			unlock_page(vmf->page);
++ 			put_page(vmf->page);
++ 			return tmp;
+++>>>>>>> a19e25536ed3 (mm: change return values of finish_mkwrite_fault())
+  		}
+ -	} else {
+ -		wp_page_reuse(vmf);
+ -		lock_page(vmf->page);
+ +		page_mkwrite = 1;
+  	}
+ -	fault_dirty_shared_page(vma, vmf->page);
+ -	put_page(vmf->page);
+  
+ -	return VM_FAULT_WRITE;
+ +	return wp_page_reuse(mm, vma, address, page_table, ptl,
+ +			     orig_pte, old_page, page_mkwrite, 1);
+  }
+  
+  /*
+* Unmerged path mm/memory.c
