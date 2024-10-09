@@ -1,0 +1,200 @@
+netfilter: nf_tables: deactivate anonymous set from preparation phase
+
+jira LE-1907
+cve CVE-2023-32233
+Rebuild_History Non-Buildable kernel-3.10.0-1160.95.1.el7
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit c1592a89942e9678f7d9c8030efa777c0d57edab
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.95.1.el7/c1592a89.failed
+
+Toggle deleted anonymous sets as inactive in the next generation, so
+users cannot perform any update on it. Clear the generation bitmask
+in case the transaction is aborted.
+
+The following KASAN splat shows a set element deletion for a bound
+anonymous set that has been already removed in the same transaction.
+
+[   64.921510] ==================================================================
+[   64.923123] BUG: KASAN: wild-memory-access in nf_tables_commit+0xa24/0x1490 [nf_tables]
+[   64.924745] Write of size 8 at addr dead000000000122 by task test/890
+[   64.927903] CPU: 3 PID: 890 Comm: test Not tainted 6.3.0+ #253
+[   64.931120] Call Trace:
+[   64.932699]  <TASK>
+[   64.934292]  dump_stack_lvl+0x33/0x50
+[   64.935908]  ? nf_tables_commit+0xa24/0x1490 [nf_tables]
+[   64.937551]  kasan_report+0xda/0x120
+[   64.939186]  ? nf_tables_commit+0xa24/0x1490 [nf_tables]
+[   64.940814]  nf_tables_commit+0xa24/0x1490 [nf_tables]
+[   64.942452]  ? __kasan_slab_alloc+0x2d/0x60
+[   64.944070]  ? nf_tables_setelem_notify+0x190/0x190 [nf_tables]
+[   64.945710]  ? kasan_set_track+0x21/0x30
+[   64.947323]  nfnetlink_rcv_batch+0x709/0xd90 [nfnetlink]
+[   64.948898]  ? nfnetlink_rcv_msg+0x480/0x480 [nfnetlink]
+
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit c1592a89942e9678f7d9c8030efa777c0d57edab)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_tables.h
+#	net/netfilter/nf_tables_api.c
+#	net/netfilter/nft_dynset.c
+#	net/netfilter/nft_lookup.c
+#	net/netfilter/nft_objref.c
+diff --cc include/net/netfilter/nf_tables.h
+index 2ea0683b5860,2e24ea1d744c..000000000000
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@@ -413,10 -618,14 +413,18 @@@ struct nft_set_binding 
+  	u32				flags;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum nft_trans_phase;
++ void nf_tables_activate_set(const struct nft_ctx *ctx, struct nft_set *set);
++ void nf_tables_deactivate_set(const struct nft_ctx *ctx, struct nft_set *set,
++ 			      struct nft_set_binding *binding,
++ 			      enum nft_trans_phase phase);
+++>>>>>>> c1592a89942e (netfilter: nf_tables: deactivate anonymous set from preparation phase)
+  int nf_tables_bind_set(const struct nft_ctx *ctx, struct nft_set *set,
+  		       struct nft_set_binding *binding);
+ -void nf_tables_destroy_set(const struct nft_ctx *ctx, struct nft_set *set);
+ +void nf_tables_unbind_set(const struct nft_ctx *ctx, struct nft_set *set,
+ +			  struct nft_set_binding *binding);
+  
+  /**
+   *	enum nft_set_extensions - set extension type IDs
+diff --cc net/netfilter/nf_tables_api.c
+index b68b666195ea,59fb8320ab4d..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -3010,11 -5119,52 +3010,52 @@@ void nf_tables_unbind_set(const struct 
+  {
+  	list_del_rcu(&binding->list);
+  
+ -	if (list_empty(&set->bindings) && nft_set_is_anonymous(set)) {
+ -		list_del_rcu(&set->list);
+ -		if (event)
+ -			nf_tables_set_notify(ctx, set, NFT_MSG_DELSET,
+ -					     GFP_KERNEL);
+ -	}
+ +	if (list_empty(&set->bindings) && set->flags & NFT_SET_ANONYMOUS &&
+ +	    !(set->flags & NFT_SET_INACTIVE))
+ +		nf_tables_set_destroy(ctx, set);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void nf_tables_activate_set(const struct nft_ctx *ctx, struct nft_set *set)
++ {
++ 	if (nft_set_is_anonymous(set))
++ 		nft_clear(ctx->net, set);
++ 
++ 	set->use++;
++ }
++ EXPORT_SYMBOL_GPL(nf_tables_activate_set);
++ 
++ void nf_tables_deactivate_set(const struct nft_ctx *ctx, struct nft_set *set,
++ 			      struct nft_set_binding *binding,
++ 			      enum nft_trans_phase phase)
++ {
++ 	switch (phase) {
++ 	case NFT_TRANS_PREPARE:
++ 		if (nft_set_is_anonymous(set))
++ 			nft_deactivate_next(ctx->net, set);
++ 
++ 		set->use--;
++ 		return;
++ 	case NFT_TRANS_ABORT:
++ 	case NFT_TRANS_RELEASE:
++ 		set->use--;
++ 		fallthrough;
++ 	default:
++ 		nf_tables_unbind_set(ctx, set, binding,
++ 				     phase == NFT_TRANS_COMMIT);
++ 	}
++ }
++ EXPORT_SYMBOL_GPL(nf_tables_deactivate_set);
++ 
++ void nf_tables_destroy_set(const struct nft_ctx *ctx, struct nft_set *set)
++ {
++ 	if (list_empty(&set->bindings) && nft_set_is_anonymous(set))
++ 		nft_set_destroy(ctx, set);
++ }
++ EXPORT_SYMBOL_GPL(nf_tables_destroy_set);
++ 
+++>>>>>>> c1592a89942e (netfilter: nf_tables: deactivate anonymous set from preparation phase)
+  const struct nft_set_ext_type nft_set_ext_types[] = {
+  	[NFT_SET_EXT_KEY]		= {
+  		.align	= __alignof__(u32),
+diff --cc net/netfilter/nft_dynset.c
+index 0cf187230050,bd19c7aec92e..000000000000
+--- a/net/netfilter/nft_dynset.c
++++ b/net/netfilter/nft_dynset.c
+@@@ -204,6 -328,23 +204,26 @@@ err1
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nft_dynset_deactivate(const struct nft_ctx *ctx,
++ 				  const struct nft_expr *expr,
++ 				  enum nft_trans_phase phase)
++ {
++ 	struct nft_dynset *priv = nft_expr_priv(expr);
++ 
++ 	nf_tables_deactivate_set(ctx, priv->set, &priv->binding, phase);
++ }
++ 
++ static void nft_dynset_activate(const struct nft_ctx *ctx,
++ 				const struct nft_expr *expr)
++ {
++ 	struct nft_dynset *priv = nft_expr_priv(expr);
++ 
++ 	nf_tables_activate_set(ctx, priv->set);
++ }
++ 
+++>>>>>>> c1592a89942e (netfilter: nf_tables: deactivate anonymous set from preparation phase)
+  static void nft_dynset_destroy(const struct nft_ctx *ctx,
+  			       const struct nft_expr *expr)
+  {
+diff --cc net/netfilter/nft_lookup.c
+index c9ce7d60cd73,03ef4fdaa460..000000000000
+--- a/net/netfilter/nft_lookup.c
++++ b/net/netfilter/nft_lookup.c
+@@@ -125,6 -153,23 +125,26 @@@ static int nft_lookup_init(const struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nft_lookup_deactivate(const struct nft_ctx *ctx,
++ 				  const struct nft_expr *expr,
++ 				  enum nft_trans_phase phase)
++ {
++ 	struct nft_lookup *priv = nft_expr_priv(expr);
++ 
++ 	nf_tables_deactivate_set(ctx, priv->set, &priv->binding, phase);
++ }
++ 
++ static void nft_lookup_activate(const struct nft_ctx *ctx,
++ 				const struct nft_expr *expr)
++ {
++ 	struct nft_lookup *priv = nft_expr_priv(expr);
++ 
++ 	nf_tables_activate_set(ctx, priv->set);
++ }
++ 
+++>>>>>>> c1592a89942e (netfilter: nf_tables: deactivate anonymous set from preparation phase)
+  static void nft_lookup_destroy(const struct nft_ctx *ctx,
+  			       const struct nft_expr *expr)
+  {
+* Unmerged path net/netfilter/nft_objref.c
+* Unmerged path include/net/netfilter/nf_tables.h
+* Unmerged path net/netfilter/nf_tables_api.c
+* Unmerged path net/netfilter/nft_dynset.c
+* Unmerged path net/netfilter/nft_lookup.c
+* Unmerged path net/netfilter/nft_objref.c
