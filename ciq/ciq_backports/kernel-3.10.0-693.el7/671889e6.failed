@@ -1,0 +1,712 @@
+i40e: avoid race condition when sending filters to firmware for addition
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 671889e6740ac7ab84d1420525b50d1d47001102
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/671889e6.failed
+
+Refactor how we add new filters to firmware to avoid a race condition
+that can occur due to removing filters from the hash temporarily.
+
+To understand the race condition, suppose that you have a number of MAC
+filters, but have not yet added any VLANs. Now, add two VLANs in rapid
+succession. A possible resulting flow would look something like the
+following:
+
+(1) lock hash for add VLAN
+(2) add the new MAC/VLAN combos for each current MAC filter
+(3) unlock hash
+(4) lock hash for filter sync
+(5) notice that we have a VLAN, so prepare to update all MAC filters
+    with VLAN=-1 to be VLAN=0.
+(6) move NEW and REMOVE filters to temporary list
+(7) unlock hash
+(8) lock hash for add VLAN
+(9) add new MAC/VLAN combos. Notice that no MAC filters are currently in
+    the hash list, so we don't add any VLANs <--- BUG!
+(10) unlock hash
+(11) sync the temporary lists to firmware
+(12) lock hash for post-sync
+(13) move the temporary elements back to the main list
+....
+
+Because we take filters out of the main hash into temporary lists, we
+introduce a narrow window where it is possible that other callers to the
+list will not see some of the filters which were previously added but
+have not yet been finalized. This results in sometimes dropping VLAN
+additions, and could also result in failing to add a MAC address on the
+newly added VLAN.
+
+One obvious way to avoid this race condition would be to lock the entire
+firmware process. Unfortunately this does not work because adminq
+firmware commands take a mutex which results in a sleep while atomic
+BUG(). So, we can't use the simplest approach.
+
+An alternative approach is to simply not remove the filters from the
+hash list while adding. Instead, add an i40e_new_mac_filter structure
+which we will use to track added filters. This avoids the need to remove
+the filter from the hash list. We'll store a pointer to the original
+i40e_mac_filter, along with our own copy of the state.
+
+We won't update the state directly, so as to avoid race with other code
+that may modify the state while under the lock. We are safe to read
+f->macaddr and f->vlan since these only change in two locations. The
+first is on filter creation, which must have already occurred. The
+second is inside i40e_correct_vlan_filters which was previously run
+after creation of this object and can't be run again until after. Thus,
+we should be safe to read the MAC address and VLAN while outside the
+lock.
+
+We also aren't going to run into a use-after-free issue because the only
+place where we free filters is when they are marked FAILED or when we
+remove them inside the sync subtask. Since the subtask has its own
+critical flag to prevent duplicate runs, we know this won't happen. We
+also know that the only location to transition a filter from NEW to
+FAILED is inside the subtask also, so we aren't worried about that
+either.
+
+Use the wrapper i40e_new_mac_filter for additions, and once we've
+finalized the addition to firmware, we will update the filter state
+inside a lock, and then free the wrapper structure.
+
+In order to avoid a possible race condition with filter deletion, we
+won't update the original filter state unless it is still
+I40E_FILTER_NEW when we finish the firmware sync.
+
+This approach is more complex, but avoids race conditions related to
+filters being temporarily removed from the list. We do not need the same
+behavior for deletion because we always unconditionally removed the
+filters from the list regardless of the firmware status.
+
+Change-Id: I14b74bc2301f8e69433fbe77ebca532db20c5317
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 671889e6740ac7ab84d1420525b50d1d47001102)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_main.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_main.c
+index e910f71bdc92,e83a8ca5dd65..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@@ -1223,30 -1221,106 +1223,100 @@@ bool i40e_is_vsi_in_vlan(struct i40e_vs
+  }
+  
+  /**
+ - * i40e_correct_mac_vlan_filters - Correct non-VLAN filters if necessary
+ - * @vsi: the VSI to configure
+ - * @tmp_add_list: list of filters ready to be added
+ - * @tmp_del_list: list of filters ready to be deleted
+ - * @vlan_filters: the number of active VLAN filters
+ - *
+ - * Update VLAN=0 and VLAN=-1 (I40E_VLAN_ANY) filters properly so that they
+ - * behave as expected. If we have any active VLAN filters remaining or about
+ - * to be added then we need to update non-VLAN filters to be marked as VLAN=0
+ - * so that they only match against untagged traffic. If we no longer have any
+ - * active VLAN filters, we need to make all non-VLAN filters marked as VLAN=-1
+ - * so that they match against both tagged and untagged traffic. In this way,
+ - * we ensure that we correctly receive the desired traffic. This ensures that
+ - * when we have an active VLAN we will receive only untagged traffic and
+ - * traffic matching active VLANs. If we have no active VLANs then we will
+ - * operate in non-VLAN mode and receive all traffic, tagged or untagged.
+ - *
+ - * Finally, in a similar fashion, this function also corrects filters when
+ - * there is an active PVID assigned to this VSI.
+ - *
+ - * In case of memory allocation failure return -ENOMEM. Otherwise, return 0.
+ + * i40e_put_mac_in_vlan - Make macvlan filters from macaddrs and vlans
+ + * @vsi: the VSI to be searched
+ + * @macaddr: the mac address to be filtered
+ + * @is_vf: true if it is a VF
+ + * @is_netdev: true if it is a netdev
+   *
+ - * This function is only expected to be called from within
+ - * i40e_sync_vsi_filters.
+ + * Goes through all the macvlan filters and adds a
+ + * macvlan filter for each unique vlan that already exists
+   *
+ - * NOTE: This function expects to be called while under the
+ - * mac_filter_hash_lock
+ - */
+ -static int i40e_correct_mac_vlan_filters(struct i40e_vsi *vsi,
+ -					 struct hlist_head *tmp_add_list,
+ -					 struct hlist_head *tmp_del_list,
+ -					 int vlan_filters)
+ + * Returns first filter found on success, else NULL
+ + **/
+ +struct i40e_mac_filter *i40e_put_mac_in_vlan(struct i40e_vsi *vsi, u8 *macaddr,
+ +					     bool is_vf, bool is_netdev)
+  {
+++<<<<<<< HEAD
+ +	struct i40e_mac_filter *f;
+ +
+ +	list_for_each_entry(f, &vsi->mac_filter_list, list) {
+ +		if (vsi->info.pvid)
+ +			f->vlan = le16_to_cpu(vsi->info.pvid);
+ +		if (!i40e_find_filter(vsi, macaddr, f->vlan,
+ +				      is_vf, is_netdev)) {
+ +			if (!i40e_add_filter(vsi, macaddr, f->vlan,
+ +					     is_vf, is_netdev))
+ +				return NULL;
+++=======
++ 	struct i40e_mac_filter *f, *add_head;
++ 	struct i40e_new_mac_filter *new;
++ 	struct hlist_node *h;
++ 	int bkt, new_vlan;
++ 
++ 	/* To determine if a particular filter needs to be replaced we
++ 	 * have the three following conditions:
++ 	 *
++ 	 * a) if we have a PVID assigned, then all filters which are
++ 	 *    not marked as VLAN=PVID must be replaced with filters that
++ 	 *    are.
++ 	 * b) otherwise, if we have any active VLANS, all filters
++ 	 *    which are marked as VLAN=-1 must be replaced with
++ 	 *    filters marked as VLAN=0
++ 	 * c) finally, if we do not have any active VLANS, all filters
++ 	 *    which are marked as VLAN=0 must be replaced with filters
++ 	 *    marked as VLAN=-1
++ 	 */
++ 
++ 	/* Update the filters about to be added in place */
++ 	hlist_for_each_entry(new, tmp_add_list, hlist) {
++ 		if (vsi->info.pvid && new->f->vlan != vsi->info.pvid)
++ 			new->f->vlan = vsi->info.pvid;
++ 		else if (vlan_filters && new->f->vlan == I40E_VLAN_ANY)
++ 			new->f->vlan = 0;
++ 		else if (!vlan_filters && new->f->vlan == 0)
++ 			new->f->vlan = I40E_VLAN_ANY;
++ 	}
++ 
++ 	/* Update the remaining active filters */
++ 	hash_for_each_safe(vsi->mac_filter_hash, bkt, h, f, hlist) {
++ 		/* Combine the checks for whether a filter needs to be changed
++ 		 * and then determine the new VLAN inside the if block, in
++ 		 * order to avoid duplicating code for adding the new filter
++ 		 * then deleting the old filter.
++ 		 */
++ 		if ((vsi->info.pvid && f->vlan != vsi->info.pvid) ||
++ 		    (vlan_filters && f->vlan == I40E_VLAN_ANY) ||
++ 		    (!vlan_filters && f->vlan == 0)) {
++ 			/* Determine the new vlan we will be adding */
++ 			if (vsi->info.pvid)
++ 				new_vlan = vsi->info.pvid;
++ 			else if (vlan_filters)
++ 				new_vlan = 0;
++ 			else
++ 				new_vlan = I40E_VLAN_ANY;
++ 
++ 			/* Create the new filter */
++ 			add_head = i40e_add_filter(vsi, f->macaddr, new_vlan);
++ 			if (!add_head)
++ 				return -ENOMEM;
++ 
++ 			/* Create a temporary i40e_new_mac_filter */
++ 			new = kzalloc(sizeof(*new), GFP_ATOMIC);
++ 			if (!new)
++ 				return -ENOMEM;
++ 
++ 			new->f = add_head;
++ 			new->state = add_head->state;
++ 
++ 			/* Add the new filter to the tmp list */
++ 			hlist_add_head(&new->hlist, tmp_add_list);
++ 
++ 			/* Put the original filter into the delete list */
++ 			f->state = I40E_FILTER_REMOVE;
++ 			hash_del(&f->hlist);
++ 			hlist_add_head(&f->hlist, tmp_del_list);
+++>>>>>>> 671889e6740a (i40e: avoid race condition when sending filters to firmware for addition)
+  		}
+  	}
+  
+@@@ -1712,24 -1828,75 +1782,85 @@@ bottom_of_search_loop
+  
+  /**
+   * i40e_undo_del_filter_entries - Undo the changes made to MAC filter entries
+++<<<<<<< HEAD
+ + * @vsi: pointer to vsi struct
+ + * @from: Pointer to list which contains MAC filter entries - changes to
+ + *        those entries needs to be undone.
+ + *
+ + * MAC filter entries from list were slated to be removed from device.
+ + **/
+ +static void i40e_undo_del_filter_entries(struct i40e_vsi *vsi,
+ +					 struct list_head *from)
+++=======
++  * @vsi: Pointer to VSI struct
++  * @from: Pointer to list which contains MAC filter entries - changes to
++  *        those entries needs to be undone.
++  *
++  * MAC filter entries from this list were slated for deletion.
++  **/
++ static void i40e_undo_del_filter_entries(struct i40e_vsi *vsi,
++ 					 struct hlist_head *from)
+++>>>>>>> 671889e6740a (i40e: avoid race condition when sending filters to firmware for addition)
+  {
+ -	struct i40e_mac_filter *f;
+ -	struct hlist_node *h;
+ -
+ -	hlist_for_each_entry_safe(f, h, from, hlist) {
+ -		u64 key = i40e_addr_to_hkey(f->macaddr);
+ +	struct i40e_mac_filter *f, *ftmp;
+  
+ +	list_for_each_entry_safe(f, ftmp, from, list) {
+  		/* Move the element back into MAC filter list*/
+ -		hlist_del(&f->hlist);
+ -		hash_add(vsi->mac_filter_hash, &f->hlist, key);
+ +		list_move_tail(&f->list, &vsi->mac_filter_list);
+  	}
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * i40e_undo_add_filter_entries - Undo the changes made to MAC filter entries
++  * @vsi: Pointer to vsi struct
++  * @from: Pointer to list which contains MAC filter entries - changes to
++  *        those entries needs to be undone.
++  *
++  * MAC filter entries from this list were slated for addition.
++  **/
++ static void i40e_undo_add_filter_entries(struct i40e_vsi *vsi,
++ 					 struct hlist_head *from)
++ {
++ 	struct i40e_new_mac_filter *new;
++ 	struct hlist_node *h;
++ 
++ 	hlist_for_each_entry_safe(new, h, from, hlist) {
++ 		/* We can simply free the wrapper structure */
++ 		hlist_del(&new->hlist);
++ 		kfree(new);
++ 	}
++ }
++ 
++ /**
++  * i40e_next_entry - Get the next non-broadcast filter from a list
++  * @next: pointer to filter in list
++  *
++  * Returns the next non-broadcast filter in the list. Required so that we
++  * ignore broadcast filters within the list, since these are not handled via
++  * the normal firmware update path.
++  */
++ static
++ struct i40e_new_mac_filter *i40e_next_filter(struct i40e_new_mac_filter *next)
++ {
++ 	while (next) {
++ 		next = hlist_entry(next->hlist.next,
++ 				   typeof(struct i40e_new_mac_filter),
++ 				   hlist);
++ 
++ 		/* keep going if we found a broadcast filter */
++ 		if (next && is_broadcast_ether_addr(next->f->macaddr))
++ 			continue;
++ 
++ 		break;
++ 	}
++ 
++ 	return next;
++ }
++ 
++ /**
+++>>>>>>> 671889e6740a (i40e: avoid race condition when sending filters to firmware for addition)
+   * i40e_update_filter_state - Update filter state based on return data
+   * from firmware
+   * @count: Number of filters added
+@@@ -1743,42 -1909,143 +1874,168 @@@
+  static int
+  i40e_update_filter_state(int count,
+  			 struct i40e_aqc_add_macvlan_element_data *add_list,
+++<<<<<<< HEAD
+ +			 struct i40e_mac_filter *add_head, int aq_err)
+++=======
++ 			 struct i40e_new_mac_filter *add_head)
+++>>>>>>> 671889e6740a (i40e: avoid race condition when sending filters to firmware for addition)
+  {
+  	int retval = 0;
+  	int i;
+  
+ -	for (i = 0; i < count; i++) {
+ -		/* Always check status of each filter. We don't need to check
+ -		 * the firmware return status because we pre-set the filter
+ -		 * status to I40E_AQC_MM_ERR_NO_RES when sending the filter
+ -		 * request to the adminq. Thus, if it no longer matches then
+ -		 * we know the filter is active.
+ +
+ +	if (!aq_err) {
+ +		retval = count;
+ +		/* Everything's good, mark all filters active. */
+ +		for (i = 0; i < count ; i++) {
+ +			add_head->state = I40E_FILTER_ACTIVE;
+ +			add_head = list_next_entry(add_head, list);
+ +		}
+ +	} else if (aq_err == I40E_AQ_RC_ENOSPC) {
+ +		/* Device ran out of filter space. Check the return value
+ +		 * for each filter to see which ones are active.
+  		 */
+ -		if (add_list[i].match_method == I40E_AQC_MM_ERR_NO_RES) {
+ +		for (i = 0; i < count ; i++) {
+ +			if (add_list[i].match_method ==
+ +			    I40E_AQC_MM_ERR_NO_RES) {
+ +				add_head->state = I40E_FILTER_FAILED;
+ +			} else {
+ +				add_head->state = I40E_FILTER_ACTIVE;
+ +				retval++;
+ +			}
+ +			add_head = list_next_entry(add_head, list);
+ +		}
+++<<<<<<< HEAD
+ +	} else {
+ +		/* Some other horrible thing happened, fail all filters */
+ +		retval = 0;
+ +		for (i = 0; i < count ; i++) {
+  			add_head->state = I40E_FILTER_FAILED;
+ -		} else {
+ -			add_head->state = I40E_FILTER_ACTIVE;
+ -			retval++;
+ +			add_head = list_next_entry(add_head, list);
+  		}
+ +	}
+ +	return retval;
+++=======
++ 
++ 		add_head = i40e_next_filter(add_head);
++ 		if (!add_head)
++ 			break;
++ 	}
++ 
++ 	return retval;
++ }
++ 
++ /**
++  * i40e_aqc_del_filters - Request firmware to delete a set of filters
++  * @vsi: ptr to the VSI
++  * @vsi_name: name to display in messages
++  * @list: the list of filters to send to firmware
++  * @num_del: the number of filters to delete
++  * @retval: Set to -EIO on failure to delete
++  *
++  * Send a request to firmware via AdminQ to delete a set of filters. Uses
++  * *retval instead of a return value so that success does not force ret_val to
++  * be set to 0. This ensures that a sequence of calls to this function
++  * preserve the previous value of *retval on successful delete.
++  */
++ static
++ void i40e_aqc_del_filters(struct i40e_vsi *vsi, const char *vsi_name,
++ 			  struct i40e_aqc_remove_macvlan_element_data *list,
++ 			  int num_del, int *retval)
++ {
++ 	struct i40e_hw *hw = &vsi->back->hw;
++ 	i40e_status aq_ret;
++ 	int aq_err;
++ 
++ 	aq_ret = i40e_aq_remove_macvlan(hw, vsi->seid, list, num_del, NULL);
++ 	aq_err = hw->aq.asq_last_status;
++ 
++ 	/* Explicitly ignore and do not report when firmware returns ENOENT */
++ 	if (aq_ret && !(aq_err == I40E_AQ_RC_ENOENT)) {
++ 		*retval = -EIO;
++ 		dev_info(&vsi->back->pdev->dev,
++ 			 "ignoring delete macvlan error on %s, err %s, aq_err %s\n",
++ 			 vsi_name, i40e_stat_str(hw, aq_ret),
++ 			 i40e_aq_str(hw, aq_err));
++ 	}
++ }
++ 
++ /**
++  * i40e_aqc_add_filters - Request firmware to add a set of filters
++  * @vsi: ptr to the VSI
++  * @vsi_name: name to display in messages
++  * @list: the list of filters to send to firmware
++  * @add_head: Position in the add hlist
++  * @num_add: the number of filters to add
++  * @promisc_change: set to true on exit if promiscuous mode was forced on
++  *
++  * Send a request to firmware via AdminQ to add a chunk of filters. Will set
++  * promisc_changed to true if the firmware has run out of space for more
++  * filters.
++  */
++ static
++ void i40e_aqc_add_filters(struct i40e_vsi *vsi, const char *vsi_name,
++ 			  struct i40e_aqc_add_macvlan_element_data *list,
++ 			  struct i40e_new_mac_filter *add_head,
++ 			  int num_add, bool *promisc_changed)
++ {
++ 	struct i40e_hw *hw = &vsi->back->hw;
++ 	int aq_err, fcnt;
++ 
++ 	i40e_aq_add_macvlan(hw, vsi->seid, list, num_add, NULL);
++ 	aq_err = hw->aq.asq_last_status;
++ 	fcnt = i40e_update_filter_state(num_add, list, add_head);
++ 
++ 	if (fcnt != num_add) {
++ 		*promisc_changed = true;
++ 		set_bit(__I40E_FILTER_OVERFLOW_PROMISC, &vsi->state);
++ 		dev_warn(&vsi->back->pdev->dev,
++ 			 "Error %s adding RX filters on %s, promiscuous mode forced on\n",
++ 			 i40e_aq_str(hw, aq_err),
++ 			 vsi_name);
++ 	}
++ }
++ 
++ /**
++  * i40e_aqc_broadcast_filter - Set promiscuous broadcast flags
++  * @vsi: pointer to the VSI
++  * @f: filter data
++  *
++  * This function sets or clears the promiscuous broadcast flags for VLAN
++  * filters in order to properly receive broadcast frames. Assumes that only
++  * broadcast filters are passed.
++  *
++  * Returns status indicating success or failure;
++  **/
++ static i40e_status
++ i40e_aqc_broadcast_filter(struct i40e_vsi *vsi, const char *vsi_name,
++ 			  struct i40e_mac_filter *f)
++ {
++ 	bool enable = f->state == I40E_FILTER_NEW;
++ 	struct i40e_hw *hw = &vsi->back->hw;
++ 	i40e_status aq_ret;
++ 
++ 	if (f->vlan == I40E_VLAN_ANY) {
++ 		aq_ret = i40e_aq_set_vsi_broadcast(hw,
++ 						   vsi->seid,
++ 						   enable,
++ 						   NULL);
++ 	} else {
++ 		aq_ret = i40e_aq_set_vsi_bc_promisc_on_vlan(hw,
++ 							    vsi->seid,
++ 							    enable,
++ 							    f->vlan,
++ 							    NULL);
++ 	}
++ 
++ 	if (aq_ret)
++ 		dev_warn(&vsi->back->pdev->dev,
++ 			 "Error %s setting broadcast promiscuous mode on %s\n",
++ 			 i40e_aq_str(hw, hw->aq.asq_last_status),
++ 			 vsi_name);
++ 
++ 	return aq_ret;
+++>>>>>>> 671889e6740a (i40e: avoid race condition when sending filters to firmware for addition)
+  }
+  
+  /**
+@@@ -1791,9 -2058,12 +2048,15 @@@
+   **/
+  int i40e_sync_vsi_filters(struct i40e_vsi *vsi)
+  {
+++<<<<<<< HEAD
+ +	struct i40e_mac_filter *f, *ftmp, *add_head = NULL;
+ +	struct list_head tmp_add_list, tmp_del_list;
+++=======
++ 	struct hlist_head tmp_add_list, tmp_del_list;
++ 	struct i40e_mac_filter *f;
++ 	struct i40e_new_mac_filter *new, *add_head = NULL;
+++>>>>>>> 671889e6740a (i40e: avoid race condition when sending filters to firmware for addition)
+  	struct i40e_hw *hw = &vsi->back->hw;
+ -	unsigned int failed_filters = 0;
+ -	unsigned int vlan_filters = 0;
+  	bool promisc_changed = false;
+  	char vsi_name[16] = "PF";
+  	int filter_list_len = 0;
+@@@ -1832,22 -2102,47 +2095,36 @@@
+  	if (vsi->flags & I40E_VSI_FLAG_FILTER_CHANGED) {
+  		vsi->flags &= ~I40E_VSI_FLAG_FILTER_CHANGED;
+  
+ -		spin_lock_bh(&vsi->mac_filter_hash_lock);
+ +		spin_lock_bh(&vsi->mac_filter_list_lock);
+  		/* Create a list of filters to delete. */
+ -		hash_for_each_safe(vsi->mac_filter_hash, bkt, h, f, hlist) {
+ +		list_for_each_entry_safe(f, ftmp, &vsi->mac_filter_list, list) {
+  			if (f->state == I40E_FILTER_REMOVE) {
+ +				WARN_ON(f->counter != 0);
+  				/* Move the element into temporary del_list */
+ -				hash_del(&f->hlist);
+ -				hlist_add_head(&f->hlist, &tmp_del_list);
+ -
+ -				/* Avoid counting removed filters */
+ -				continue;
+ +				list_move_tail(&f->list, &tmp_del_list);
+ +				vsi->active_filters--;
+  			}
+  			if (f->state == I40E_FILTER_NEW) {
+++<<<<<<< HEAD
+ +				WARN_ON(f->counter == 0);
+ +				/* Move the element into temporary add_list */
+ +				list_move_tail(&f->list, &tmp_add_list);
+++=======
++ 				/* Create a temporary i40e_new_mac_filter */
++ 				new = kzalloc(sizeof(*new), GFP_ATOMIC);
++ 				if (!new)
++ 					goto err_no_memory_locked;
++ 
++ 				/* Store pointer to the real filter */
++ 				new->f = f;
++ 				new->state = f->state;
++ 
++ 				/* Add it to the hash list */
++ 				hlist_add_head(&new->hlist, &tmp_add_list);
+++>>>>>>> 671889e6740a (i40e: avoid race condition when sending filters to firmware for addition)
+  			}
+ -
+ -			/* Count the number of active (current and new) VLAN
+ -			 * filters we have now. Does not count filters which
+ -			 * are marked for deletion.
+ -			 */
+ -			if (f->vlan > 0)
+ -				vlan_filters++;
+  		}
+ -
+ -		retval = i40e_correct_mac_vlan_filters(vsi,
+ -						       &tmp_add_list,
+ -						       &tmp_del_list,
+ -						       vlan_filters);
+ -		if (retval)
+ -			goto err_no_memory_locked;
+ -
+ -		spin_unlock_bh(&vsi->mac_filter_hash_lock);
+ +		spin_unlock_bh(&vsi->mac_filter_list_lock);
+  	}
+  
+  	/* Now process 'del_list' outside the lock */
+@@@ -1941,30 -2213,45 +2218,51 @@@
+  		list_size = filter_list_len *
+  			       sizeof(struct i40e_aqc_add_macvlan_element_data);
+  		add_list = kzalloc(list_size, GFP_ATOMIC);
+ -		if (!add_list)
+ -			goto err_no_memory;
+ -
+ +		if (!add_list) {
+ +			retval = -ENOMEM;
+ +			goto out;
+ +		}
+  		num_add = 0;
+++<<<<<<< HEAD
+ +		list_for_each_entry(f, &tmp_add_list, list) {
+++=======
++ 		hlist_for_each_entry_safe(new, h, &tmp_add_list, hlist) {
+++>>>>>>> 671889e6740a (i40e: avoid race condition when sending filters to firmware for addition)
+  			if (test_bit(__I40E_FILTER_OVERFLOW_PROMISC,
+  				     &vsi->state)) {
+- 				f->state = I40E_FILTER_FAILED;
++ 				new->state = I40E_FILTER_FAILED;
++ 				continue;
++ 			}
+++<<<<<<< HEAD
+++=======
++ 
++ 			/* handle broadcast filters by updating the broadcast
++ 			 * promiscuous flag instead of adding a MAC filter.
++ 			 */
++ 			if (is_broadcast_ether_addr(new->f->macaddr)) {
++ 				if (i40e_aqc_broadcast_filter(vsi, vsi_name,
++ 							      new->f))
++ 					new->state = I40E_FILTER_FAILED;
++ 				else
++ 					new->state = I40E_FILTER_ACTIVE;
+  				continue;
+  			}
++ 
+++>>>>>>> 671889e6740a (i40e: avoid race condition when sending filters to firmware for addition)
+  			/* add to add array */
+  			if (num_add == 0)
+- 				add_head = f;
++ 				add_head = new;
+  			cmd_flags = 0;
+- 			ether_addr_copy(add_list[num_add].mac_addr, f->macaddr);
+- 			if (f->vlan == I40E_VLAN_ANY) {
++ 			ether_addr_copy(add_list[num_add].mac_addr,
++ 					new->f->macaddr);
++ 			if (new->f->vlan == I40E_VLAN_ANY) {
+  				add_list[num_add].vlan_tag = 0;
+  				cmd_flags |= I40E_AQC_MACVLAN_ADD_IGNORE_VLAN;
+  			} else {
+  				add_list[num_add].vlan_tag =
+- 					cpu_to_le16((u16)(f->vlan));
++ 					cpu_to_le16((u16)(new->f->vlan));
+  			}
+  			add_list[num_add].queue_number = 0;
+ -			/* set invalid match method for later detection */
+ -			add_list[num_add].match_method = I40E_AQC_MM_ERR_NO_RES;
+  			cmd_flags |= I40E_AQC_MACVLAN_ADD_PERFECT_MATCH;
+  			add_list[num_add].flags = cpu_to_le16(cmd_flags);
+  			num_add++;
+@@@ -2017,11 -2272,15 +2315,21 @@@
+  		/* Now move all of the filters from the temp add list back to
+  		 * the VSI's list.
+  		 */
+++<<<<<<< HEAD
+ +		spin_lock_bh(&vsi->mac_filter_list_lock);
+ +		list_for_each_entry_safe(f, ftmp, &tmp_add_list, list) {
+ +			list_move_tail(&f->list, &vsi->mac_filter_list);
+++=======
++ 		spin_lock_bh(&vsi->mac_filter_hash_lock);
++ 		hlist_for_each_entry_safe(new, h, &tmp_add_list, hlist) {
++ 			/* Only update the state if we're still NEW */
++ 			if (new->f->state == I40E_FILTER_NEW)
++ 				new->f->state = new->state;
++ 			hlist_del(&new->hlist);
++ 			kfree(new);
+++>>>>>>> 671889e6740a (i40e: avoid race condition when sending filters to firmware for addition)
+  		}
+ -		spin_unlock_bh(&vsi->mac_filter_hash_lock);
+ +		spin_unlock_bh(&vsi->mac_filter_list_lock);
+  		kfree(add_list);
+  		add_list = NULL;
+  	}
+@@@ -2166,6 -2434,18 +2474,21 @@@ out
+  
+  	clear_bit(__I40E_CONFIG_BUSY, &vsi->state);
+  	return retval;
+++<<<<<<< HEAD
+++=======
++ 
++ err_no_memory:
++ 	/* Restore elements on the temporary add and delete lists */
++ 	spin_lock_bh(&vsi->mac_filter_hash_lock);
++ err_no_memory_locked:
++ 	i40e_undo_del_filter_entries(vsi, &tmp_del_list);
++ 	i40e_undo_add_filter_entries(vsi, &tmp_add_list);
++ 	spin_unlock_bh(&vsi->mac_filter_hash_lock);
++ 
++ 	vsi->flags |= I40E_VSI_FLAG_FILTER_CHANGED;
++ 	clear_bit(__I40E_CONFIG_BUSY, &vsi->state);
++ 	return -ENOMEM;
+++>>>>>>> 671889e6740a (i40e: avoid race condition when sending filters to firmware for addition)
+  }
+  
+  /**
+diff --git a/drivers/net/ethernet/intel/i40e/i40e.h b/drivers/net/ethernet/intel/i40e/i40e.h
+index 6480f1d21034..af43917dfe71 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e.h
++++ b/drivers/net/ethernet/intel/i40e/i40e.h
+@@ -469,6 +469,22 @@ struct i40e_mac_filter {
+ 	enum i40e_filter_state state;
+ };
+ 
++/* Wrapper structure to keep track of filters while we are preparing to send
++ * firmware commands. We cannot send firmware commands while holding a
++ * spinlock, since it might sleep. To avoid this, we wrap the added filters in
++ * a separate structure, which will track the state change and update the real
++ * filter while under lock. We can't simply hold the filters in a separate
++ * list, as this opens a window for a race condition when adding new MAC
++ * addresses to all VLANs, or when adding new VLANs to all MAC addresses.
++ */
++struct i40e_new_mac_filter {
++	struct hlist_node hlist;
++	struct i40e_mac_filter *f;
++
++	/* Track future changes to state separately */
++	enum i40e_filter_state state;
++};
++
+ struct i40e_veb {
+ 	struct i40e_pf *pf;
+ 	u16 idx;
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_main.c
