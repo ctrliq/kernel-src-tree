@@ -1,0 +1,296 @@
+dm crypt: allow unaligned bv_offset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mikulas Patocka <mpatocka@redhat.com>
+commit 0440d5c0ca9744b92a07aeb6df0a9a75db6f4280
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/0440d5c0.failed
+
+When slub_debug is enabled kmalloc returns unaligned memory. XFS uses
+this unaligned memory for its buffers (if an unaligned buffer crosses a
+page, XFS frees it and allocates a full page instead - see the function
+xfs_buf_allocate_memory).
+
+dm-crypt checks if bv_offset is aligned on page size and these checks
+fail with slub_debug and XFS.
+
+Fix this bug by removing the bv_offset checks. Switch to checking if
+bv_len is aligned instead of bv_offset (this check should be sufficient
+to prevent overruns if a bio with too small bv_len is received).
+
+Fixes: 8f0009a22517 ("dm crypt: optionally support larger encryption sector size")
+	Cc: stable@vger.kernel.org # v4.12+
+	Reported-by: Bruno Prémont <bonbons@sysophe.eu>
+	Tested-by: Bruno Prémont <bonbons@sysophe.eu>
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+	Reviewed-by: Milan Broz <gmazyland@gmail.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 0440d5c0ca9744b92a07aeb6df0a9a75db6f4280)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-crypt.c
+diff --cc drivers/md/dm-crypt.c
+index 91e9c1daa9b3,9fc12f556534..000000000000
+--- a/drivers/md/dm-crypt.c
++++ b/drivers/md/dm-crypt.c
+@@@ -838,61 -1015,215 +838,162 @@@ static struct ablkcipher_request *req_o
+  static u8 *iv_of_dmreq(struct crypt_config *cc,
+  		       struct dm_crypt_request *dmreq)
+  {
+ -	if (crypt_integrity_aead(cc))
+ -		return (u8 *)ALIGN((unsigned long)(dmreq + 1),
+ -			crypto_aead_alignmask(any_tfm_aead(cc)) + 1);
+ -	else
+ -		return (u8 *)ALIGN((unsigned long)(dmreq + 1),
+ -			crypto_skcipher_alignmask(any_tfm(cc)) + 1);
+ -}
+ -
+ -static u8 *org_iv_of_dmreq(struct crypt_config *cc,
+ -		       struct dm_crypt_request *dmreq)
+ -{
+ -	return iv_of_dmreq(cc, dmreq) + cc->iv_size;
+ -}
+ -
+ -static uint64_t *org_sector_of_dmreq(struct crypt_config *cc,
+ -		       struct dm_crypt_request *dmreq)
+ -{
+ -	u8 *ptr = iv_of_dmreq(cc, dmreq) + cc->iv_size + cc->iv_size;
+ -	return (uint64_t*) ptr;
+ -}
+ -
+ -static unsigned int *org_tag_of_dmreq(struct crypt_config *cc,
+ -		       struct dm_crypt_request *dmreq)
+ -{
+ -	u8 *ptr = iv_of_dmreq(cc, dmreq) + cc->iv_size +
+ -		  cc->iv_size + sizeof(uint64_t);
+ -	return (unsigned int*)ptr;
+ -}
+ -
+ -static void *tag_from_dmreq(struct crypt_config *cc,
+ -				struct dm_crypt_request *dmreq)
+ -{
+ -	struct convert_context *ctx = dmreq->ctx;
+ -	struct dm_crypt_io *io = container_of(ctx, struct dm_crypt_io, ctx);
+ -
+ -	return &io->integrity_metadata[*org_tag_of_dmreq(cc, dmreq) *
+ -		cc->on_disk_tag_size];
+ -}
+ -
+ -static void *iv_tag_from_dmreq(struct crypt_config *cc,
+ -			       struct dm_crypt_request *dmreq)
+ -{
+ -	return tag_from_dmreq(cc, dmreq) + cc->integrity_tag_size;
+ +	return (u8 *)ALIGN((unsigned long)(dmreq + 1),
+ +		crypto_ablkcipher_alignmask(any_tfm(cc)) + 1);
+  }
+  
+ -static int crypt_convert_block_aead(struct crypt_config *cc,
+ -				     struct convert_context *ctx,
+ -				     struct aead_request *req,
+ -				     unsigned int tag_offset)
+ +static int crypt_convert_block(struct crypt_config *cc,
+ +			       struct convert_context *ctx,
+ +			       struct ablkcipher_request *req)
+  {
+ -	struct bio_vec bv_in = bio_iter_iovec(ctx->bio_in, ctx->iter_in);
+ -	struct bio_vec bv_out = bio_iter_iovec(ctx->bio_out, ctx->iter_out);
+ +	struct bio_vec *bv_in = bio_iovec_idx(ctx->bio_in, ctx->idx_in);
+ +	struct bio_vec *bv_out = bio_iovec_idx(ctx->bio_out, ctx->idx_out);
+  	struct dm_crypt_request *dmreq;
+++<<<<<<< HEAD
+ +	u8 *iv;
+ +	int r;
+++=======
++ 	u8 *iv, *org_iv, *tag_iv, *tag;
++ 	uint64_t *sector;
++ 	int r = 0;
++ 
++ 	BUG_ON(cc->integrity_iv_size && cc->integrity_iv_size != cc->iv_size);
++ 
++ 	/* Reject unexpected unaligned bio. */
++ 	if (unlikely(bv_in.bv_len & (cc->sector_size - 1)))
++ 		return -EIO;
+++>>>>>>> 0440d5c0ca97 (dm crypt: allow unaligned bv_offset)
+  
+  	dmreq = dmreq_of_req(cc, req);
+ +	iv = iv_of_dmreq(cc, dmreq);
+ +
+  	dmreq->iv_sector = ctx->cc_sector;
+ -	if (test_bit(CRYPT_IV_LARGE_SECTORS, &cc->cipher_flags))
+ -		dmreq->iv_sector >>= cc->sector_shift;
+  	dmreq->ctx = ctx;
+ +	sg_init_table(&dmreq->sg_in, 1);
+ +	sg_set_page(&dmreq->sg_in, bv_in->bv_page, 1 << SECTOR_SHIFT,
+ +		    bv_in->bv_offset + ctx->offset_in);
+  
+ -	*org_tag_of_dmreq(cc, dmreq) = tag_offset;
+ -
+ -	sector = org_sector_of_dmreq(cc, dmreq);
+ -	*sector = cpu_to_le64(ctx->cc_sector - cc->iv_offset);
+ +	sg_init_table(&dmreq->sg_out, 1);
+ +	sg_set_page(&dmreq->sg_out, bv_out->bv_page, 1 << SECTOR_SHIFT,
+ +		    bv_out->bv_offset + ctx->offset_out);
+  
+ -	iv = iv_of_dmreq(cc, dmreq);
+ -	org_iv = org_iv_of_dmreq(cc, dmreq);
+ -	tag = tag_from_dmreq(cc, dmreq);
+ -	tag_iv = iv_tag_from_dmreq(cc, dmreq);
+ +	ctx->offset_in += 1 << SECTOR_SHIFT;
+ +	if (ctx->offset_in >= bv_in->bv_len) {
+ +		ctx->offset_in = 0;
+ +		ctx->idx_in++;
+ +	}
+  
+ -	/* AEAD request:
+ -	 *  |----- AAD -------|------ DATA -------|-- AUTH TAG --|
+ -	 *  | (authenticated) | (auth+encryption) |              |
+ -	 *  | sector_LE |  IV |  sector in/out    |  tag in/out  |
+ -	 */
+ -	sg_init_table(dmreq->sg_in, 4);
+ -	sg_set_buf(&dmreq->sg_in[0], sector, sizeof(uint64_t));
+ -	sg_set_buf(&dmreq->sg_in[1], org_iv, cc->iv_size);
+ -	sg_set_page(&dmreq->sg_in[2], bv_in.bv_page, cc->sector_size, bv_in.bv_offset);
+ -	sg_set_buf(&dmreq->sg_in[3], tag, cc->integrity_tag_size);
+ -
+ -	sg_init_table(dmreq->sg_out, 4);
+ -	sg_set_buf(&dmreq->sg_out[0], sector, sizeof(uint64_t));
+ -	sg_set_buf(&dmreq->sg_out[1], org_iv, cc->iv_size);
+ -	sg_set_page(&dmreq->sg_out[2], bv_out.bv_page, cc->sector_size, bv_out.bv_offset);
+ -	sg_set_buf(&dmreq->sg_out[3], tag, cc->integrity_tag_size);
+ +	ctx->offset_out += 1 << SECTOR_SHIFT;
+ +	if (ctx->offset_out >= bv_out->bv_len) {
+ +		ctx->offset_out = 0;
+ +		ctx->idx_out++;
+ +	}
+  
+  	if (cc->iv_gen_ops) {
+ -		/* For READs use IV stored in integrity metadata */
+ -		if (cc->integrity_iv_size && bio_data_dir(ctx->bio_in) != WRITE) {
+ -			memcpy(org_iv, tag_iv, cc->iv_size);
+ -		} else {
+ -			r = cc->iv_gen_ops->generator(cc, org_iv, dmreq);
+ -			if (r < 0)
+ -				return r;
+ -			/* Store generated IV in integrity metadata */
+ -			if (cc->integrity_iv_size)
+ -				memcpy(tag_iv, org_iv, cc->iv_size);
+ -		}
+ -		/* Working copy of IV, to be modified in crypto API */
+ -		memcpy(iv, org_iv, cc->iv_size);
+ +		r = cc->iv_gen_ops->generator(cc, iv, dmreq);
+ +		if (r < 0)
+ +			return r;
+  	}
+  
+++<<<<<<< HEAD
+ +	ablkcipher_request_set_crypt(req, &dmreq->sg_in, &dmreq->sg_out,
+ +				     1 << SECTOR_SHIFT, iv);
+++=======
++ 	aead_request_set_ad(req, sizeof(uint64_t) + cc->iv_size);
++ 	if (bio_data_dir(ctx->bio_in) == WRITE) {
++ 		aead_request_set_crypt(req, dmreq->sg_in, dmreq->sg_out,
++ 				       cc->sector_size, iv);
++ 		r = crypto_aead_encrypt(req);
++ 		if (cc->integrity_tag_size + cc->integrity_iv_size != cc->on_disk_tag_size)
++ 			memset(tag + cc->integrity_tag_size + cc->integrity_iv_size, 0,
++ 			       cc->on_disk_tag_size - (cc->integrity_tag_size + cc->integrity_iv_size));
++ 	} else {
++ 		aead_request_set_crypt(req, dmreq->sg_in, dmreq->sg_out,
++ 				       cc->sector_size + cc->integrity_tag_size, iv);
++ 		r = crypto_aead_decrypt(req);
++ 	}
++ 
++ 	if (r == -EBADMSG)
++ 		DMERR_LIMIT("INTEGRITY AEAD ERROR, sector %llu",
++ 			    (unsigned long long)le64_to_cpu(*sector));
++ 
++ 	if (!r && cc->iv_gen_ops && cc->iv_gen_ops->post)
++ 		r = cc->iv_gen_ops->post(cc, org_iv, dmreq);
++ 
++ 	bio_advance_iter(ctx->bio_in, &ctx->iter_in, cc->sector_size);
++ 	bio_advance_iter(ctx->bio_out, &ctx->iter_out, cc->sector_size);
++ 
++ 	return r;
++ }
++ 
++ static int crypt_convert_block_skcipher(struct crypt_config *cc,
++ 					struct convert_context *ctx,
++ 					struct skcipher_request *req,
++ 					unsigned int tag_offset)
++ {
++ 	struct bio_vec bv_in = bio_iter_iovec(ctx->bio_in, ctx->iter_in);
++ 	struct bio_vec bv_out = bio_iter_iovec(ctx->bio_out, ctx->iter_out);
++ 	struct scatterlist *sg_in, *sg_out;
++ 	struct dm_crypt_request *dmreq;
++ 	u8 *iv, *org_iv, *tag_iv;
++ 	uint64_t *sector;
++ 	int r = 0;
++ 
++ 	/* Reject unexpected unaligned bio. */
++ 	if (unlikely(bv_in.bv_len & (cc->sector_size - 1)))
++ 		return -EIO;
++ 
++ 	dmreq = dmreq_of_req(cc, req);
++ 	dmreq->iv_sector = ctx->cc_sector;
++ 	if (test_bit(CRYPT_IV_LARGE_SECTORS, &cc->cipher_flags))
++ 		dmreq->iv_sector >>= cc->sector_shift;
++ 	dmreq->ctx = ctx;
++ 
++ 	*org_tag_of_dmreq(cc, dmreq) = tag_offset;
++ 
++ 	iv = iv_of_dmreq(cc, dmreq);
++ 	org_iv = org_iv_of_dmreq(cc, dmreq);
++ 	tag_iv = iv_tag_from_dmreq(cc, dmreq);
++ 
++ 	sector = org_sector_of_dmreq(cc, dmreq);
++ 	*sector = cpu_to_le64(ctx->cc_sector - cc->iv_offset);
++ 
++ 	/* For skcipher we use only the first sg item */
++ 	sg_in  = &dmreq->sg_in[0];
++ 	sg_out = &dmreq->sg_out[0];
++ 
++ 	sg_init_table(sg_in, 1);
++ 	sg_set_page(sg_in, bv_in.bv_page, cc->sector_size, bv_in.bv_offset);
++ 
++ 	sg_init_table(sg_out, 1);
++ 	sg_set_page(sg_out, bv_out.bv_page, cc->sector_size, bv_out.bv_offset);
++ 
++ 	if (cc->iv_gen_ops) {
++ 		/* For READs use IV stored in integrity metadata */
++ 		if (cc->integrity_iv_size && bio_data_dir(ctx->bio_in) != WRITE) {
++ 			memcpy(org_iv, tag_iv, cc->integrity_iv_size);
++ 		} else {
++ 			r = cc->iv_gen_ops->generator(cc, org_iv, dmreq);
++ 			if (r < 0)
++ 				return r;
++ 			/* Store generated IV in integrity metadata */
++ 			if (cc->integrity_iv_size)
++ 				memcpy(tag_iv, org_iv, cc->integrity_iv_size);
++ 		}
++ 		/* Working copy of IV, to be modified in crypto API */
++ 		memcpy(iv, org_iv, cc->iv_size);
++ 	}
++ 
++ 	skcipher_request_set_crypt(req, sg_in, sg_out, cc->sector_size, iv);
+++>>>>>>> 0440d5c0ca97 (dm crypt: allow unaligned bv_offset)
+  
+  	if (bio_data_dir(ctx->bio_in) == WRITE)
+ -		r = crypto_skcipher_encrypt(req);
+ +		r = crypto_ablkcipher_encrypt(req);
+  	else
+ -		r = crypto_skcipher_decrypt(req);
+ +		r = crypto_ablkcipher_decrypt(req);
+  
+  	if (!r && cc->iv_gen_ops && cc->iv_gen_ops->post)
+ -		r = cc->iv_gen_ops->post(cc, org_iv, dmreq);
+ -
+ -	bio_advance_iter(ctx->bio_in, &ctx->iter_in, cc->sector_size);
+ -	bio_advance_iter(ctx->bio_out, &ctx->iter_out, cc->sector_size);
+ +		r = cc->iv_gen_ops->post(cc, iv, dmreq);
+  
+  	return r;
+  }
+* Unmerged path drivers/md/dm-crypt.c
