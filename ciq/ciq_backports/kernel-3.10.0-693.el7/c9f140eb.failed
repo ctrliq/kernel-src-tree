@@ -1,0 +1,444 @@
+amd-xgbe: Separate Tx/Rx ring data fields into new structs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit c9f140ebb00891c5bfd6b5cdd0552493bcbeac20
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/c9f140eb.failed
+
+Move the Tx and Rx related fields within the xgbe_ring_data struct into
+their own structs in order to more easily see what fields are used for
+each operation.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c9f140ebb00891c5bfd6b5cdd0552493bcbeac20)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+#	drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+#	drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+#	drivers/net/ethernet/amd/xgbe/xgbe.h
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+index a9ce56d5e988,3c7c3869d867..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-desc.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+@@@ -234,6 -255,96 +234,99 @@@ err_ring
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int xgbe_alloc_pages(struct xgbe_prv_data *pdata,
++ 			    struct xgbe_page_alloc *pa, gfp_t gfp, int order)
++ {
++ 	struct page *pages = NULL;
++ 	dma_addr_t pages_dma;
++ 	int ret;
++ 
++ 	/* Try to obtain pages, decreasing order if necessary */
++ 	gfp |= __GFP_COLD | __GFP_COMP;
++ 	while (order >= 0) {
++ 		pages = alloc_pages(gfp, order);
++ 		if (pages)
++ 			break;
++ 
++ 		order--;
++ 	}
++ 	if (!pages)
++ 		return -ENOMEM;
++ 
++ 	/* Map the pages */
++ 	pages_dma = dma_map_page(pdata->dev, pages, 0,
++ 				 PAGE_SIZE << order, DMA_FROM_DEVICE);
++ 	ret = dma_mapping_error(pdata->dev, pages_dma);
++ 	if (ret) {
++ 		put_page(pages);
++ 		return ret;
++ 	}
++ 
++ 	pa->pages = pages;
++ 	pa->pages_len = PAGE_SIZE << order;
++ 	pa->pages_offset = 0;
++ 	pa->pages_dma = pages_dma;
++ 
++ 	return 0;
++ }
++ 
++ static void xgbe_set_buffer_data(struct xgbe_buffer_data *bd,
++ 				 struct xgbe_page_alloc *pa,
++ 				 unsigned int len)
++ {
++ 	get_page(pa->pages);
++ 	bd->pa = *pa;
++ 
++ 	bd->dma = pa->pages_dma + pa->pages_offset;
++ 	bd->dma_len = len;
++ 
++ 	pa->pages_offset += len;
++ 	if ((pa->pages_offset + len) > pa->pages_len) {
++ 		/* This data descriptor is responsible for unmapping page(s) */
++ 		bd->pa_unmap = *pa;
++ 
++ 		/* Get a new allocation next time */
++ 		pa->pages = NULL;
++ 		pa->pages_len = 0;
++ 		pa->pages_offset = 0;
++ 		pa->pages_dma = 0;
++ 	}
++ }
++ 
++ static int xgbe_map_rx_buffer(struct xgbe_prv_data *pdata,
++ 			      struct xgbe_ring *ring,
++ 			      struct xgbe_ring_data *rdata)
++ {
++ 	int order, ret;
++ 
++ 	if (!ring->rx_hdr_pa.pages) {
++ 		ret = xgbe_alloc_pages(pdata, &ring->rx_hdr_pa, GFP_ATOMIC, 0);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	if (!ring->rx_buf_pa.pages) {
++ 		order = max_t(int, PAGE_ALLOC_COSTLY_ORDER - 1, 0);
++ 		ret = xgbe_alloc_pages(pdata, &ring->rx_buf_pa, GFP_ATOMIC,
++ 				       order);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	/* Set up the header page info */
++ 	xgbe_set_buffer_data(&rdata->rx.hdr, &ring->rx_hdr_pa,
++ 			     XGBE_SKB_ALLOC_SIZE);
++ 
++ 	/* Set up the buffer page info */
++ 	xgbe_set_buffer_data(&rdata->rx.buf, &ring->rx_buf_pa,
++ 			     pdata->rx_buf_size);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> c9f140ebb008 (amd-xgbe: Separate Tx/Rx ring data fields into new structs)
+  static void xgbe_wrapper_tx_descriptor_init(struct xgbe_prv_data *pdata)
+  {
+  	struct xgbe_hw_if *hw_if = &pdata->hw_if;
+@@@ -355,10 -451,40 +448,36 @@@ static void xgbe_unmap_skb(struct xgbe_
+  		rdata->skb = NULL;
+  	}
+  
+++<<<<<<< HEAD
+ +	rdata->tso_header = 0;
+ +	rdata->len = 0;
+++=======
++ 	if (rdata->rx.hdr.pa.pages)
++ 		put_page(rdata->rx.hdr.pa.pages);
++ 
++ 	if (rdata->rx.hdr.pa_unmap.pages) {
++ 		dma_unmap_page(pdata->dev, rdata->rx.hdr.pa_unmap.pages_dma,
++ 			       rdata->rx.hdr.pa_unmap.pages_len,
++ 			       DMA_FROM_DEVICE);
++ 		put_page(rdata->rx.hdr.pa_unmap.pages);
++ 	}
++ 
++ 	if (rdata->rx.buf.pa.pages)
++ 		put_page(rdata->rx.buf.pa.pages);
++ 
++ 	if (rdata->rx.buf.pa_unmap.pages) {
++ 		dma_unmap_page(pdata->dev, rdata->rx.buf.pa_unmap.pages_dma,
++ 			       rdata->rx.buf.pa_unmap.pages_len,
++ 			       DMA_FROM_DEVICE);
++ 		put_page(rdata->rx.buf.pa_unmap.pages);
++ 	}
++ 
++ 	memset(&rdata->tx, 0, sizeof(rdata->tx));
++ 	memset(&rdata->rx, 0, sizeof(rdata->rx));
++ 
+++>>>>>>> c9f140ebb008 (amd-xgbe: Separate Tx/Rx ring data fields into new structs)
+  	rdata->interrupt = 0;
+  	rdata->mapped_as_page = 0;
+ -
+ -	if (rdata->state_saved) {
+ -		rdata->state_saved = 0;
+ -		rdata->state.incomplete = 0;
+ -		rdata->state.context_next = 0;
+ -		rdata->state.skb = NULL;
+ -		rdata->state.len = 0;
+ -		rdata->state.error = 0;
+ -	}
+  }
+  
+  static int xgbe_map_tx_skb(struct xgbe_channel *channel, struct sk_buff *skb)
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+index 81bd491c7d02,2908ad181538..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+@@@ -805,19 -1079,19 +805,26 @@@ static void xgbe_rx_desc_reset(struct x
+  	struct xgbe_ring_desc *rdesc = rdata->rdesc;
+  
+  	/* Reset the Rx descriptor
+ -	 *   Set buffer 1 (lo) address to header dma address (lo)
+ -	 *   Set buffer 1 (hi) address to header dma address (hi)
+ -	 *   Set buffer 2 (lo) address to buffer dma address (lo)
+ -	 *   Set buffer 2 (hi) address to buffer dma address (hi) and
+ -	 *     set control bits OWN and INTE
+ +	 *   Set buffer 1 (lo) address to dma address (lo)
+ +	 *   Set buffer 1 (hi) address to dma address (hi)
+ +	 *   Set buffer 2 (lo) address to zero
+ +	 *   Set buffer 2 (hi) address to zero and set control bits
+ +	 *     OWN and INTE
+  	 */
+++<<<<<<< HEAD
+ +	rdesc->desc0 = cpu_to_le32(lower_32_bits(rdata->skb_dma));
+ +	rdesc->desc1 = cpu_to_le32(upper_32_bits(rdata->skb_dma));
+ +	rdesc->desc2 = 0;
+++=======
++ 	rdesc->desc0 = cpu_to_le32(lower_32_bits(rdata->rx.hdr.dma));
++ 	rdesc->desc1 = cpu_to_le32(upper_32_bits(rdata->rx.hdr.dma));
++ 	rdesc->desc2 = cpu_to_le32(lower_32_bits(rdata->rx.buf.dma));
++ 	rdesc->desc3 = cpu_to_le32(upper_32_bits(rdata->rx.buf.dma));
+++>>>>>>> c9f140ebb008 (amd-xgbe: Separate Tx/Rx ring data fields into new structs)
+  
+ -	XGMAC_SET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, INTE,
+ -			  rdata->interrupt ? 1 : 0);
+ +	rdesc->desc3 = 0;
+ +	if (rdata->interrupt)
+ +		XGMAC_SET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, INTE, 1);
+  
+  	/* Since the Rx DMA engine is likely running, make sure everything
+  	 * is written to the descriptor(s) before setting the OWN bit
+@@@ -1132,8 -1565,52 +1139,55 @@@ static int xgbe_dev_read(struct xgbe_ch
+  	xgbe_dump_rx_desc(ring, rdesc, ring->cur);
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ 	if (XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, CTXT)) {
++ 		/* Timestamp Context Descriptor */
++ 		xgbe_get_rx_tstamp(packet, rdesc);
++ 
++ 		XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES,
++ 			       CONTEXT, 1);
++ 		XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES,
++ 			       CONTEXT_NEXT, 0);
++ 		return 0;
++ 	}
++ 
++ 	/* Normal Descriptor, be sure Context Descriptor bit is off */
++ 	XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES, CONTEXT, 0);
++ 
++ 	/* Indicate if a Context Descriptor is next */
++ 	if (XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, CDA))
++ 		XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES,
++ 			       CONTEXT_NEXT, 1);
++ 
++ 	/* Get the header length */
++ 	if (XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, FD))
++ 		rdata->rx.hdr_len = XGMAC_GET_BITS_LE(rdesc->desc2,
++ 						      RX_NORMAL_DESC2, HL);
++ 
++ 	/* Get the RSS hash */
++ 	if (XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, RSV)) {
++ 		XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES,
++ 			       RSS_HASH, 1);
++ 
++ 		packet->rss_hash = le32_to_cpu(rdesc->desc1);
++ 
++ 		l34t = XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, L34T);
++ 		switch (l34t) {
++ 		case RX_DESC3_L34T_IPV4_TCP:
++ 		case RX_DESC3_L34T_IPV4_UDP:
++ 		case RX_DESC3_L34T_IPV6_TCP:
++ 		case RX_DESC3_L34T_IPV6_UDP:
++ 			packet->rss_hash_type = PKT_HASH_TYPE_L4;
++ 			break;
++ 		default:
++ 			packet->rss_hash_type = PKT_HASH_TYPE_L3;
++ 		}
++ 	}
++ 
+++>>>>>>> c9f140ebb008 (amd-xgbe: Separate Tx/Rx ring data fields into new structs)
+  	/* Get the packet length */
+- 	rdata->len = XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, PL);
++ 	rdata->rx.len = XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, PL);
+  
+  	if (!XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, LD)) {
+  		/* Not all the data has been transferred for this packet */
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index f42678309ce8,46ea423f9a08..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@@ -1098,6 -1738,31 +1098,34 @@@ static void xgbe_rx_refresh(struct xgbe
+  			  lower_32_bits(rdata->rdesc_dma));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct sk_buff *xgbe_create_skb(struct xgbe_prv_data *pdata,
++ 				       struct xgbe_ring_data *rdata,
++ 				       unsigned int *len)
++ {
++ 	struct net_device *netdev = pdata->netdev;
++ 	struct sk_buff *skb;
++ 	u8 *packet;
++ 	unsigned int copy_len;
++ 
++ 	skb = netdev_alloc_skb_ip_align(netdev, rdata->rx.hdr.dma_len);
++ 	if (!skb)
++ 		return NULL;
++ 
++ 	packet = page_address(rdata->rx.hdr.pa.pages) +
++ 		 rdata->rx.hdr.pa.pages_offset;
++ 	copy_len = (rdata->rx.hdr_len) ? rdata->rx.hdr_len : *len;
++ 	copy_len = min(rdata->rx.hdr.dma_len, copy_len);
++ 	skb_copy_to_linear_data(skb, packet, copy_len);
++ 	skb_put(skb, copy_len);
++ 
++ 	*len -= copy_len;
++ 
++ 	return skb;
++ }
++ 
+++>>>>>>> c9f140ebb008 (amd-xgbe: Separate Tx/Rx ring data fields into new structs)
+  static int xgbe_tx_poll(struct xgbe_channel *channel)
+  {
+  	struct xgbe_prv_data *pdata = channel->pdata;
+@@@ -1213,33 -1896,47 +1241,62 @@@ read_again
+  			if (packet->errors)
+  				DBGPR("Error in received packet\n");
+  			dev_kfree_skb(skb);
+ -			goto next_packet;
+ +			continue;
+  		}
+  
+++<<<<<<< HEAD
+ +		put_len = rdata->len - cur_len;
+ +		if (skb) {
+ +			if (pskb_expand_head(skb, 0, put_len, GFP_ATOMIC)) {
+ +				DBGPR("pskb_expand_head error\n");
+ +				if (incomplete) {
+++=======
++ 		if (!context) {
++ 			put_len = rdata->rx.len - len;
++ 			len += put_len;
++ 
++ 			if (!skb) {
++ 				dma_sync_single_for_cpu(pdata->dev,
++ 							rdata->rx.hdr.dma,
++ 							rdata->rx.hdr.dma_len,
++ 							DMA_FROM_DEVICE);
++ 
++ 				skb = xgbe_create_skb(pdata, rdata, &put_len);
++ 				if (!skb) {
+++>>>>>>> c9f140ebb008 (amd-xgbe: Separate Tx/Rx ring data fields into new structs)
+  					error = 1;
+ -					goto skip_data;
+ +					goto read_again;
+  				}
+ -			}
+  
+++<<<<<<< HEAD
+ +				dev_kfree_skb(skb);
+ +				continue;
+++=======
++ 			if (put_len) {
++ 				dma_sync_single_for_cpu(pdata->dev,
++ 							rdata->rx.buf.dma,
++ 							rdata->rx.buf.dma_len,
++ 							DMA_FROM_DEVICE);
++ 
++ 				skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
++ 						rdata->rx.buf.pa.pages,
++ 						rdata->rx.buf.pa.pages_offset,
++ 						put_len, rdata->rx.buf.dma_len);
++ 				rdata->rx.buf.pa.pages = NULL;
+++>>>>>>> c9f140ebb008 (amd-xgbe: Separate Tx/Rx ring data fields into new structs)
+  			}
+ +			memcpy(skb_tail_pointer(skb), rdata->skb->data,
+ +			       put_len);
+ +		} else {
+ +			skb = rdata->skb;
+ +			rdata->skb = NULL;
+  		}
+ +		skb_put(skb, put_len);
+ +		cur_len += put_len;
+  
+ -skip_data:
+ -		if (incomplete || context_next)
+ +		if (incomplete)
+  			goto read_again;
+  
+ -		if (!skb)
+ -			goto next_packet;
+ -
+  		/* Be sure we don't exceed the configured MTU */
+  		max_len = netdev->mtu + ETH_HLEN;
+  		if (!(netdev->features & NETIF_F_HW_VLAN_CTAG_RX) &&
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe.h
+index 1d8899bca25d,41ce6e3eb9e6..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe.h
+@@@ -221,6 -253,38 +221,41 @@@ struct xgbe_ring_desc 
+  	__le32 desc3;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Page allocation related values */
++ struct xgbe_page_alloc {
++ 	struct page *pages;
++ 	unsigned int pages_len;
++ 	unsigned int pages_offset;
++ 
++ 	dma_addr_t pages_dma;
++ };
++ 
++ /* Ring entry buffer data */
++ struct xgbe_buffer_data {
++ 	struct xgbe_page_alloc pa;
++ 	struct xgbe_page_alloc pa_unmap;
++ 
++ 	dma_addr_t dma;
++ 	unsigned int dma_len;
++ };
++ 
++ /* Tx-related ring data */
++ struct xgbe_tx_ring_data {
++ 	unsigned int tso_header;	/* TSO header indicator */
++ };
++ 
++ /* Rx-related ring data */
++ struct xgbe_rx_ring_data {
++ 	struct xgbe_buffer_data hdr;	/* Header locations */
++ 	struct xgbe_buffer_data buf;	/* Payload locations */
++ 
++ 	unsigned short hdr_len;		/* Length of received header */
++ 	unsigned short len;		/* Length of received packet */
++ };
++ 
+++>>>>>>> c9f140ebb008 (amd-xgbe: Separate Tx/Rx ring data fields into new structs)
+  /* Structure used to hold information related to the descriptor
+   * and the packet associated with the descriptor (always use
+   * use the XGBE_GET_DESC_DATA macro to access this data from the ring)
+@@@ -232,9 -296,9 +267,13 @@@ struct xgbe_ring_data 
+  	struct sk_buff *skb;		/* Virtual address of SKB */
+  	dma_addr_t skb_dma;		/* DMA address of SKB data */
+  	unsigned int skb_dma_len;	/* Length of SKB DMA area */
+- 	unsigned int tso_header;        /* TSO header indicator */
+  
+++<<<<<<< HEAD
+ +	unsigned short len;		/* Length of received Rx packet */
+++=======
++ 	struct xgbe_tx_ring_data tx;	/* Tx-related data */
++ 	struct xgbe_rx_ring_data rx;	/* Rx-related data */
+++>>>>>>> c9f140ebb008 (amd-xgbe: Separate Tx/Rx ring data fields into new structs)
+  
+  	unsigned int interrupt;		/* Interrupt indicator */
+  
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe.h
