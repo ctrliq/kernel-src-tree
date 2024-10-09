@@ -1,0 +1,686 @@
+mmc: core: Allocate per-request data using the block layer core
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] core: Allocate per-request data using the block layer core (Gopal Tiwari) [1456570]
+Rebuild_FUZZ: 95.87%
+commit-author Linus Walleij <linus.walleij@linaro.org>
+commit 304419d8a7e9204c5d19b704467b814df8c8f5b1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/304419d8.failed
+
+The mmc_queue_req is a per-request state container the MMC core uses
+to carry bounce buffers, pointers to asynchronous requests and so on.
+Currently allocated as a static array of objects, then as a request
+comes in, a mmc_queue_req is assigned to it, and used during the
+lifetime of the request.
+
+This is backwards compared to how other block layer drivers work:
+they usally let the block core provide a per-request struct that get
+allocated right beind the struct request, and which can be obtained
+using the blk_mq_rq_to_pdu() helper. (The _mq_ infix in this function
+name is misleading: it is used by both the old and the MQ block
+layer.)
+
+The per-request struct gets allocated to the size stored in the queue
+variable .cmd_size initialized using the .init_rq_fn() and
+cleaned up using .exit_rq_fn().
+
+The block layer code makes the MMC core rely on this mechanism to
+allocate the per-request mmc_queue_req state container.
+
+Doing this make a lot of complicated queue handling go away. We only
+need to keep the .qnct that keeps count of how many request are
+currently being processed by the MMC layer. The MQ block layer will
+replace also this once we transition to it.
+
+Doing this refactoring is necessary to move the ioctl() operations
+into custom block layer requests tagged with REQ_OP_DRV_[IN|OUT]
+instead of the custom code using the BigMMCHostLock that we have
+today: those require that per-request data be obtainable easily from
+a request after creating a custom request with e.g.:
+
+struct request *rq = blk_get_request(q, REQ_OP_DRV_IN, __GFP_RECLAIM);
+struct mmc_queue_req *mq_rq = req_to_mq_rq(rq);
+
+And this is not possible with the current construction, as the request
+is not immediately assigned the per-request state container, but
+instead it gets assigned when the request finally enters the MMC
+queue, which is way too late for custom requests.
+
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+[Ulf: Folded in the fix to drop a call to blk_cleanup_queue()]
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+	Tested-by: Heiner Kallweit <hkallweit1@gmail.com>
+(cherry picked from commit 304419d8a7e9204c5d19b704467b814df8c8f5b1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/block.c
+#	drivers/mmc/core/queue.c
+#	drivers/mmc/core/queue.h
+#	include/linux/mmc/card.h
+diff --cc drivers/mmc/core/block.c
+index 464c6675a10f,5f29b5625216..000000000000
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@@ -1604,32 -1618,75 +1604,81 @@@ static int mmc_blk_cmd_err(struct mmc_b
+  		int err;
+  
+  		err = mmc_sd_num_wr_blocks(card, &blocks);
+ -		if (err)
+ -			req_pending = old_req_pending;
+ -		else
+ -			req_pending = blk_end_request(req, 0, blocks << 9);
+ +		if (!err) {
+ +			ret = blk_end_request(req, 0, blocks << 9);
+ +		}
+  	} else {
+ -		req_pending = blk_end_request(req, 0, brq->data.bytes_xfered);
+ +		ret = blk_end_request(req, 0, brq->data.bytes_xfered);
+  	}
+ -	return req_pending;
+ +	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
+++=======
++ static void mmc_blk_rw_cmd_abort(struct mmc_queue *mq, struct mmc_card *card,
++ 				 struct request *req,
++ 				 struct mmc_queue_req *mqrq)
++ {
++ 	if (mmc_card_removed(card))
++ 		req->rq_flags |= RQF_QUIET;
++ 	while (blk_end_request(req, -EIO, blk_rq_cur_bytes(req)));
++ 	mq->qcnt--;
++ }
++ 
++ /**
++  * mmc_blk_rw_try_restart() - tries to restart the current async request
++  * @mq: the queue with the card and host to restart
++  * @req: a new request that want to be started after the current one
++  */
++ static void mmc_blk_rw_try_restart(struct mmc_queue *mq, struct request *req,
++ 				   struct mmc_queue_req *mqrq)
++ {
++ 	if (!req)
++ 		return;
++ 
++ 	/*
++ 	 * If the card was removed, just cancel everything and return.
++ 	 */
++ 	if (mmc_card_removed(mq->card)) {
++ 		req->rq_flags |= RQF_QUIET;
++ 		blk_end_request_all(req, -EIO);
++ 		mq->qcnt--; /* FIXME: just set to 0? */
++ 		return;
++ 	}
++ 	/* Else proceed and try to restart the current async request */
++ 	mmc_blk_rw_rq_prep(mqrq, mq->card, 0, mq);
++ 	mmc_start_areq(mq->card->host, &mqrq->areq, NULL);
++ }
++ 
++ static void mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *new_req)
+++>>>>>>> 304419d8a7e9 (mmc: core: Allocate per-request data using the block layer core)
+  {
+  	struct mmc_blk_data *md = mq->blkdata;
+  	struct mmc_card *card = md->queue.card;
+  	struct mmc_blk_request *brq;
+ -	int disable_multi = 0, retry = 0, type, retune_retry_done = 0;
+ +	int ret = 1, disable_multi = 0, retry = 0, type, retune_retry_done = 0;
+  	enum mmc_blk_status status;
+ -	struct mmc_queue_req *mqrq_cur = NULL;
+  	struct mmc_queue_req *mq_rq;
+ -	struct request *old_req;
+ +	struct request *req;
+  	struct mmc_async_req *new_areq;
+  	struct mmc_async_req *old_areq;
+ -	bool req_pending = true;
+  
+++<<<<<<< HEAD
+ +	if (!rqc && !mq->mqrq_prev->req)
+ +		return 0;
+++=======
++ 	if (new_req) {
++ 		mqrq_cur = req_to_mmc_queue_req(new_req);
++ 		mq->qcnt++;
++ 	}
++ 
++ 	if (!mq->qcnt)
++ 		return;
+++>>>>>>> 304419d8a7e9 (mmc: core: Allocate per-request data using the block layer core)
+  
+  	do {
+ -		if (new_req) {
+ +		if (rqc) {
+  			/*
+  			 * When 4KB native sector is enabled, only 8 blocks
+  			 * multiple read or write is allowed
+@@@ -1694,11 -1748,20 +1743,28 @@@
+  			}
+  			break;
+  		case MMC_BLK_CMD_ERR:
+++<<<<<<< HEAD
+ +			ret = mmc_blk_cmd_err(md, card, brq, req, ret);
+ +			if (mmc_blk_reset(md, card->host, type))
+ +				goto cmd_abort;
+ +			if (!ret)
+ +				goto start_new_req;
+++=======
++ 			req_pending = mmc_blk_rw_cmd_err(md, card, brq, old_req, req_pending);
++ 			if (mmc_blk_reset(md, card->host, type)) {
++ 				if (req_pending)
++ 					mmc_blk_rw_cmd_abort(mq, card, old_req, mq_rq);
++ 				else
++ 					mq->qcnt--;
++ 				mmc_blk_rw_try_restart(mq, new_req, mqrq_cur);
++ 				return;
++ 			}
++ 			if (!req_pending) {
++ 				mq->qcnt--;
++ 				mmc_blk_rw_try_restart(mq, new_req, mqrq_cur);
++ 				return;
++ 			}
+++>>>>>>> 304419d8a7e9 (mmc: core: Allocate per-request data using the block layer core)
+  			break;
+  		case MMC_BLK_RETRY:
+  			retune_retry_done = brq->retune_retry_done;
+@@@ -1732,57 -1800,43 +1798,71 @@@
+  			 * time, so we only reach here after trying to
+  			 * read a single sector.
+  			 */
+++<<<<<<< HEAD
+ +			ret = blk_end_request(req, -EIO,
+ +						brq->data.blksz);
+ +			if (!ret)
+ +				goto start_new_req;
+++=======
++ 			req_pending = blk_end_request(old_req, -EIO,
++ 						      brq->data.blksz);
++ 			if (!req_pending) {
++ 				mq->qcnt--;
++ 				mmc_blk_rw_try_restart(mq, new_req, mqrq_cur);
++ 				return;
++ 			}
+++>>>>>>> 304419d8a7e9 (mmc: core: Allocate per-request data using the block layer core)
+  			break;
+  		case MMC_BLK_NOMEDIUM:
+ -			mmc_blk_rw_cmd_abort(mq, card, old_req, mq_rq);
+ -			mmc_blk_rw_try_restart(mq, new_req, mqrq_cur);
+ -			return;
+ +			goto cmd_abort;
+  		default:
+  			pr_err("%s: Unhandled return value (%d)",
+ -					old_req->rq_disk->disk_name, status);
+ -			mmc_blk_rw_cmd_abort(mq, card, old_req, mq_rq);
+ -			mmc_blk_rw_try_restart(mq, new_req, mqrq_cur);
+ -			return;
+ +					req->rq_disk->disk_name, status);
+ +			goto cmd_abort;
+  		}
+  
+ -		if (req_pending) {
+ +		if (ret) {
+  			/*
+  			 * In case of a incomplete request
+  			 * prepare it again and resend.
+  			 */
+  			mmc_blk_rw_rq_prep(mq_rq, card,
+  					disable_multi, mq);
+ -			mmc_start_areq(card->host,
+ -					&mq_rq->areq, NULL);
+ +			mmc_start_req(card->host,
+ +					&mq_rq->mmc_active, NULL);
+  			mq_rq->brq.retune_retry_done = retune_retry_done;
+  		}
+ -	} while (req_pending);
+ +	} while (ret);
+ +
+++<<<<<<< HEAD
+ +	return 1;
+  
+ + cmd_abort:
+ +	if (mmc_card_removed(card))
+ +		req->cmd_flags |= REQ_QUIET;
+ +	while (ret)
+ +		ret = blk_end_request(req, -EIO,
+ +				blk_rq_cur_bytes(req));
+ +
+ + start_new_req:
+ +	if (rqc) {
+ +		if (mmc_card_removed(card)) {
+ +			rqc->cmd_flags |= REQ_QUIET;
+ +			blk_end_request_all(rqc, -EIO);
+ +		} else {
+ +			mmc_blk_rw_rq_prep(mq->mqrq_cur, card, 0, mq);
+ +			mmc_start_req(card->host,
+ +				      &mq->mqrq_cur->mmc_active, NULL);
+ +		}
+ +	}
+ +
+ +	return 0;
+++=======
++ 	mq->qcnt--;
+++>>>>>>> 304419d8a7e9 (mmc: core: Allocate per-request data using the block layer core)
+  }
+  
+ -void mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
+ +int mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
+  {
+  	int ret;
+  	struct mmc_blk_data *md = mq->blkdata;
+diff --cc drivers/mmc/core/queue.c
+index b0ae9d688e28,d6c7b4cde4db..000000000000
+--- a/drivers/mmc/core/queue.c
++++ b/drivers/mmc/core/queue.c
+@@@ -148,17 -120,13 +148,26 @@@ static void mmc_request_fn(struct reque
+  		wake_up_process(mq->thread);
+  }
+  
+++<<<<<<< HEAD
+ +static struct scatterlist *mmc_alloc_sg(int sg_len, int *err)
+ +{
+ +	struct scatterlist *sg;
+ +
+ +	sg = kmalloc_array(sg_len, sizeof(*sg), GFP_KERNEL);
+ +	if (!sg)
+ +		*err = -ENOMEM;
+ +	else {
+ +		*err = 0;
+++=======
++ static struct scatterlist *mmc_alloc_sg(int sg_len, gfp_t gfp)
++ {
++ 	struct scatterlist *sg;
++ 
++ 	sg = kmalloc_array(sg_len, sizeof(*sg), gfp);
++ 	if (sg)
+++>>>>>>> 304419d8a7e9 (mmc: core: Allocate per-request data using the block layer core)
+  		sg_init_table(sg, sg_len);
+ +	}
+  
+  	return sg;
+  }
+@@@ -179,83 -147,84 +188,161 @@@ static void mmc_queue_setup_discard(str
+  	if (card->pref_erase > max_discard)
+  		q->limits.discard_granularity = 0;
+  	if (mmc_can_secure_erase_trim(card))
+ -		queue_flag_set_unlocked(QUEUE_FLAG_SECERASE, q);
+ +		queue_flag_set_unlocked(QUEUE_FLAG_SECDISCARD, q);
+ +}
+ +
+ +#ifdef CONFIG_MMC_BLOCK_BOUNCE
+ +static bool mmc_queue_alloc_bounce_bufs(struct mmc_queue *mq,
+ +					unsigned int bouncesz)
+ +{
+ +	int i;
+ +
+ +	for (i = 0; i < mq->qdepth; i++) {
+ +		mq->mqrq[i].bounce_buf = kmalloc(bouncesz, GFP_KERNEL);
+ +		if (!mq->mqrq[i].bounce_buf)
+ +			goto out_err;
+ +	}
+ +
+ +	return true;
+ +
+ +out_err:
+ +	while (--i >= 0) {
+ +		kfree(mq->mqrq[i].bounce_buf);
+ +		mq->mqrq[i].bounce_buf = NULL;
+ +	}
+ +	pr_warn("%s: unable to allocate bounce buffers\n",
+ +		mmc_card_name(mq->card));
+ +	return false;
+ +}
+ +
+ +static int mmc_queue_alloc_bounce_sgs(struct mmc_queue *mq,
+ +				      unsigned int bouncesz)
+ +{
+ +	int i, ret;
+ +
+ +	for (i = 0; i < mq->qdepth; i++) {
+ +		mq->mqrq[i].sg = mmc_alloc_sg(1, &ret);
+ +		if (ret)
+ +			return ret;
+ +
+ +		mq->mqrq[i].bounce_sg = mmc_alloc_sg(bouncesz / 512, &ret);
+ +		if (ret)
+ +			return ret;
+ +	}
+ +
+ +	return 0;
+  }
+ +#endif
+ +
+ +static int mmc_queue_alloc_sgs(struct mmc_queue *mq, int max_segs)
+ +{
+ +	int i, ret;
+  
+ +	for (i = 0; i < mq->qdepth; i++) {
+ +		mq->mqrq[i].sg = mmc_alloc_sg(max_segs, &ret);
+ +		if (ret)
+ +			return ret;
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+++<<<<<<< HEAD
+ +static void mmc_queue_req_free_bufs(struct mmc_queue_req *mqrq)
+ +{
+ +	kfree(mqrq->bounce_sg);
+ +	mqrq->bounce_sg = NULL;
+ +
+ +	kfree(mqrq->sg);
+ +	mqrq->sg = NULL;
+ +
+ +	kfree(mqrq->bounce_buf);
+ +	mqrq->bounce_buf = NULL;
+ +}
+ +
+ +static void mmc_queue_reqs_free_bufs(struct mmc_queue *mq)
+ +{
+ +	int i;
+ +
+ +	for (i = 0; i < mq->qdepth; i++)
+ +		mmc_queue_req_free_bufs(&mq->mqrq[i]);
+++=======
++ static unsigned int mmc_queue_calc_bouncesz(struct mmc_host *host)
++ {
++ 	unsigned int bouncesz = MMC_QUEUE_BOUNCESZ;
++ 
++ 	if (host->max_segs != 1 || (host->caps & MMC_CAP_NO_BOUNCE_BUFF))
++ 		return 0;
++ 
++ 	if (bouncesz > host->max_req_size)
++ 		bouncesz = host->max_req_size;
++ 	if (bouncesz > host->max_seg_size)
++ 		bouncesz = host->max_seg_size;
++ 	if (bouncesz > host->max_blk_count * 512)
++ 		bouncesz = host->max_blk_count * 512;
++ 
++ 	if (bouncesz <= 512)
++ 		return 0;
++ 
++ 	return bouncesz;
++ }
++ 
++ /**
++  * mmc_init_request() - initialize the MMC-specific per-request data
++  * @q: the request queue
++  * @req: the request
++  * @gfp: memory allocation policy
++  */
++ static int mmc_init_request(struct request_queue *q, struct request *req,
++ 			    gfp_t gfp)
++ {
++ 	struct mmc_queue_req *mq_rq = req_to_mmc_queue_req(req);
++ 	struct mmc_queue *mq = q->queuedata;
++ 	struct mmc_card *card = mq->card;
++ 	struct mmc_host *host = card->host;
++ 
++ 	mq_rq->req = req;
++ 
++ 	if (card->bouncesz) {
++ 		mq_rq->bounce_buf = kmalloc(card->bouncesz, gfp);
++ 		if (!mq_rq->bounce_buf)
++ 			return -ENOMEM;
++ 		if (card->bouncesz > 512) {
++ 			mq_rq->sg = mmc_alloc_sg(1, gfp);
++ 			if (!mq_rq->sg)
++ 				return -ENOMEM;
++ 			mq_rq->bounce_sg = mmc_alloc_sg(card->bouncesz / 512,
++ 							gfp);
++ 			if (!mq_rq->bounce_sg)
++ 				return -ENOMEM;
++ 		}
++ 	} else {
++ 		mq_rq->bounce_buf = NULL;
++ 		mq_rq->bounce_sg = NULL;
++ 		mq_rq->sg = mmc_alloc_sg(host->max_segs, gfp);
++ 		if (!mq_rq->sg)
++ 			return -ENOMEM;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void mmc_exit_request(struct request_queue *q, struct request *req)
++ {
++ 	struct mmc_queue_req *mq_rq = req_to_mmc_queue_req(req);
++ 
++ 	/* It is OK to kfree(NULL) so this will be smooth */
++ 	kfree(mq_rq->bounce_sg);
++ 	mq_rq->bounce_sg = NULL;
++ 
++ 	kfree(mq_rq->bounce_buf);
++ 	mq_rq->bounce_buf = NULL;
++ 
++ 	kfree(mq_rq->sg);
++ 	mq_rq->sg = NULL;
++ 
++ 	mq_rq->req = NULL;
+++>>>>>>> 304419d8a7e9 (mmc: core: Allocate per-request data using the block layer core)
+  }
+  
+  /**
+@@@ -276,21 -244,24 +363,35 @@@ int mmc_init_queue(struct mmc_queue *mq
+  	int ret = -ENOMEM;
+  
+  	if (mmc_dev(host)->dma_mask && *mmc_dev(host)->dma_mask)
+ -		limit = (u64)dma_max_pfn(mmc_dev(host)) << PAGE_SHIFT;
+ +		limit = *mmc_dev(host)->dma_mask;
+  
+  	mq->card = card;
+- 	mq->queue = blk_init_queue(mmc_request_fn, lock);
++ 	mq->queue = blk_alloc_queue(GFP_KERNEL);
+  	if (!mq->queue)
+  		return -ENOMEM;
+++<<<<<<< HEAD
+ +
+ +	mq->qdepth = 2;
+ +	mq->mqrq = kcalloc(mq->qdepth, sizeof(struct mmc_queue_req),
+ +			   GFP_KERNEL);
+ +	if (!mq->mqrq)
+ +		goto blk_cleanup;
+ +	mq->mqrq_cur = &mq->mqrq[0];
+ +	mq->mqrq_prev = &mq->mqrq[1];
+++=======
++ 	mq->queue->queue_lock = lock;
++ 	mq->queue->request_fn = mmc_request_fn;
++ 	mq->queue->init_rq_fn = mmc_init_request;
++ 	mq->queue->exit_rq_fn = mmc_exit_request;
++ 	mq->queue->cmd_size = sizeof(struct mmc_queue_req);
+++>>>>>>> 304419d8a7e9 (mmc: core: Allocate per-request data using the block layer core)
+  	mq->queue->queuedata = mq;
++ 	mq->qcnt = 0;
++ 	ret = blk_init_allocated_queue(mq->queue);
++ 	if (ret) {
++ 		blk_cleanup_queue(mq->queue);
++ 		return ret;
++ 	}
+  
+  	blk_queue_prep_rq(mq->queue, mmc_prep_request);
+  	queue_flag_set_unlocked(QUEUE_FLAG_NONROT, mq->queue);
+@@@ -298,35 -269,13 +399,45 @@@
+  	if (mmc_can_erase(card))
+  		mmc_queue_setup_discard(mq->queue, card);
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_MMC_BLOCK_BOUNCE
+ +	if (host->max_segs == 1) {
+ +		unsigned int bouncesz;
+ +
+ +		bouncesz = MMC_QUEUE_BOUNCESZ;
+ +
+ +		if (bouncesz > host->max_req_size)
+ +			bouncesz = host->max_req_size;
+ +		if (bouncesz > host->max_seg_size)
+ +			bouncesz = host->max_seg_size;
+ +		if (bouncesz > (host->max_blk_count * 512))
+ +			bouncesz = host->max_blk_count * 512;
+ +
+ +		if (bouncesz > 512 &&
+ +		    mmc_queue_alloc_bounce_bufs(mq, bouncesz)) {
+ +			blk_queue_bounce_limit(mq->queue, BLK_BOUNCE_ANY);
+ +			blk_queue_max_hw_sectors(mq->queue, bouncesz / 512);
+ +			blk_queue_max_segments(mq->queue, bouncesz / 512);
+ +			blk_queue_max_segment_size(mq->queue, bouncesz);
+ +
+ +			ret = mmc_queue_alloc_bounce_sgs(mq, bouncesz);
+ +			if (ret)
+ +				goto cleanup_queue;
+ +			bounce = true;
+ +		}
+ +	}
+ +#endif
+ +
+ +	if (!bounce) {
+++=======
++ 	card->bouncesz = mmc_queue_calc_bouncesz(host);
++ 	if (card->bouncesz) {
++ 		blk_queue_bounce_limit(mq->queue, BLK_BOUNCE_ANY);
++ 		blk_queue_max_hw_sectors(mq->queue, card->bouncesz / 512);
++ 		blk_queue_max_segments(mq->queue, card->bouncesz / 512);
++ 		blk_queue_max_segment_size(mq->queue, card->bouncesz);
++ 	} else {
+++>>>>>>> 304419d8a7e9 (mmc: core: Allocate per-request data using the block layer core)
+  		blk_queue_bounce_limit(mq->queue, limit);
+  		blk_queue_max_hw_sectors(mq->queue,
+  			min(host->max_blk_count, host->max_req_size / 512));
+@@@ -350,11 -295,7 +461,15 @@@
+  
+  	return 0;
+  
+++<<<<<<< HEAD
+ + cleanup_queue:
+ +	mmc_queue_reqs_free_bufs(mq);
+ +	kfree(mq->mqrq);
+ +	mq->mqrq = NULL;
+ +blk_cleanup:
+++=======
++ cleanup_queue:
+++>>>>>>> 304419d8a7e9 (mmc: core: Allocate per-request data using the block layer core)
+  	blk_cleanup_queue(mq->queue);
+  	return ret;
+  }
+@@@ -376,10 -317,6 +491,13 @@@ void mmc_cleanup_queue(struct mmc_queu
+  	blk_start_queue(q);
+  	spin_unlock_irqrestore(q->queue_lock, flags);
+  
+++<<<<<<< HEAD
+ +	mmc_queue_reqs_free_bufs(mq);
+ +	kfree(mq->mqrq);
+ +	mq->mqrq = NULL;
+ +
+++=======
+++>>>>>>> 304419d8a7e9 (mmc: core: Allocate per-request data using the block layer core)
+  	mq->card = NULL;
+  }
+  EXPORT_SYMBOL(mmc_cleanup_queue);
+diff --cc drivers/mmc/core/queue.h
+index a61f88199573,dae31bc0c2d3..000000000000
+--- a/drivers/mmc/core/queue.h
++++ b/drivers/mmc/core/queue.h
+@@@ -1,9 -1,25 +1,30 @@@
+  #ifndef MMC_QUEUE_H
+  #define MMC_QUEUE_H
+  
+++<<<<<<< HEAD
+ +#define MMC_REQ_SPECIAL_MASK	(REQ_DISCARD | REQ_FLUSH)
+++=======
++ #include <linux/types.h>
++ #include <linux/blkdev.h>
++ #include <linux/blk-mq.h>
++ #include <linux/mmc/core.h>
++ #include <linux/mmc/host.h>
++ 
++ static inline struct mmc_queue_req *req_to_mmc_queue_req(struct request *rq)
++ {
++ 	return blk_mq_rq_to_pdu(rq);
++ }
++ 
++ static inline bool mmc_req_is_special(struct request *req)
++ {
++ 	return req &&
++ 		(req_op(req) == REQ_OP_FLUSH ||
++ 		 req_op(req) == REQ_OP_DISCARD ||
++ 		 req_op(req) == REQ_OP_SECURE_ERASE);
++ }
+++>>>>>>> 304419d8a7e9 (mmc: core: Allocate per-request data using the block layer core)
+  
+ +struct request;
+  struct task_struct;
+  struct mmc_blk_data;
+  
+@@@ -23,7 -39,7 +44,11 @@@ struct mmc_queue_req 
+  	char			*bounce_buf;
+  	struct scatterlist	*bounce_sg;
+  	unsigned int		bounce_sg_len;
+++<<<<<<< HEAD
+ +	struct mmc_async_req	mmc_active;
+++=======
++ 	struct mmc_async_req	areq;
+++>>>>>>> 304419d8a7e9 (mmc: core: Allocate per-request data using the block layer core)
+  };
+  
+  struct mmc_queue {
+@@@ -36,10 -50,13 +61,20 @@@
+  	bool			asleep;
+  	struct mmc_blk_data	*blkdata;
+  	struct request_queue	*queue;
+++<<<<<<< HEAD
+ +	struct mmc_queue_req	*mqrq;
+ +	struct mmc_queue_req	*mqrq_cur;
+ +	struct mmc_queue_req	*mqrq_prev;
+ +	int			qdepth;
+++=======
++ 	/*
++ 	 * FIXME: this counter is not a very reliable way of keeping
++ 	 * track of how many requests that are ongoing. Switch to just
++ 	 * letting the block core keep track of requests and per-request
++ 	 * associated mmc_queue_req data.
++ 	 */
++ 	int			qcnt;
+++>>>>>>> 304419d8a7e9 (mmc: core: Allocate per-request data using the block layer core)
+  };
+  
+  extern int mmc_init_queue(struct mmc_queue *, struct mmc_card *, spinlock_t *,
+diff --cc include/linux/mmc/card.h
+index e3f1031064a7,46c73e97e61f..000000000000
+--- a/include/linux/mmc/card.h
++++ b/include/linux/mmc/card.h
+@@@ -310,23 -304,10 +310,28 @@@ struct mmc_card 
+  	struct dentry		*debugfs_root;
+  	struct mmc_part	part[MMC_NUM_PHY_PARTITION]; /* physical partitions */
+  	unsigned int    nr_parts;
+++<<<<<<< HEAD
+++=======
++ 
++ 	unsigned int		bouncesz;	/* Bounce buffer size */
+++>>>>>>> 304419d8a7e9 (mmc: core: Allocate per-request data using the block layer core)
+  };
+  
+ +/*
+ + * This function fill contents in mmc_part.
+ + */
+ +static inline void mmc_part_add(struct mmc_card *card, unsigned int size,
+ +			unsigned int part_cfg, char *name, int idx, bool ro,
+ +			int area_type)
+ +{
+ +	card->part[card->nr_parts].size = size;
+ +	card->part[card->nr_parts].part_cfg = part_cfg;
+ +	sprintf(card->part[card->nr_parts].name, name, idx);
+ +	card->part[card->nr_parts].force_ro = ro;
+ +	card->part[card->nr_parts].area_type = area_type;
+ +	card->nr_parts++;
+ +}
+ +
+  static inline bool mmc_large_sector(struct mmc_card *card)
+  {
+  	return card->ext_csd.data_sector_size == 4096;
+* Unmerged path drivers/mmc/core/block.c
+* Unmerged path drivers/mmc/core/queue.c
+* Unmerged path drivers/mmc/core/queue.h
+* Unmerged path include/linux/mmc/card.h
