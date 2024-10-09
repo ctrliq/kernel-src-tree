@@ -1,0 +1,117 @@
+vmbus: eliminate duplicate cached index
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Stephen Hemminger <stephen@networkplumber.org>
+commit 05d00bc94ac27d220d8a78e365d7fa3a26dcca17
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/05d00bc9.failed
+
+Don't need cached read index anymore now that packet iterator
+is used. The iterator has the original read index until the
+visible read_index is updated.
+
+	Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
+	Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 05d00bc94ac27d220d8a78e365d7fa3a26dcca17)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/ring_buffer.c
+diff --cc drivers/hv/ring_buffer.c
+index 480f1a09972c,b0f79526b86a..000000000000
+--- a/drivers/hv/ring_buffer.c
++++ b/drivers/hv/ring_buffer.c
+@@@ -464,9 -358,6 +464,12 @@@ struct vmpacket_descriptor *hv_pkt_iter
+  {
+  	struct hv_ring_buffer_info *rbi = &channel->inbound;
+  
+++<<<<<<< HEAD
+ +	/* set state for later hv_signal_on_read() */
+ +	init_cached_read_index(rbi);
+ +
+++=======
+++>>>>>>> 05d00bc94ac2 (vmbus: eliminate duplicate cached index)
+  	if (hv_pkt_iter_avail(rbi) < sizeof(struct vmpacket_descriptor))
+  		return NULL;
+  
+@@@ -507,6 -395,8 +507,11 @@@ EXPORT_SYMBOL_GPL(__hv_pkt_iter_next)
+  void hv_pkt_iter_close(struct vmbus_channel *channel)
+  {
+  	struct hv_ring_buffer_info *rbi = &channel->inbound;
+++<<<<<<< HEAD
+++=======
++ 	u32 orig_write_sz = hv_get_bytes_to_write(rbi);
++ 	u32 pending_sz;
+++>>>>>>> 05d00bc94ac2 (vmbus: eliminate duplicate cached index)
+  
+  	/*
+  	 * Make sure all reads are done before we update the read index since
+@@@ -516,6 -406,28 +521,32 @@@
+  	virt_rmb();
+  	rbi->ring_buffer->read_index = rbi->priv_read_index;
+  
+++<<<<<<< HEAD
+ +	hv_signal_on_read(channel);
+++=======
++ 	/*
++ 	 * Issue a full memory barrier before making the signaling decision.
++ 	 * Here is the reason for having this barrier:
++ 	 * If the reading of the pend_sz (in this function)
++ 	 * were to be reordered and read before we commit the new read
++ 	 * index (in the calling function)  we could
++ 	 * have a problem. If the host were to set the pending_sz after we
++ 	 * have sampled pending_sz and go to sleep before we commit the
++ 	 * read index, we could miss sending the interrupt. Issue a full
++ 	 * memory barrier to address this.
++ 	 */
++ 	virt_mb();
++ 
++ 	pending_sz = READ_ONCE(rbi->ring_buffer->pending_send_sz);
++ 	/* If the other end is not blocked on write don't bother. */
++ 	if (pending_sz == 0)
++ 		return;
++ 
++ 	if (hv_get_bytes_to_write(rbi) < pending_sz)
++ 		return;
++ 
++ 	if (orig_write_sz < pending_sz)
++ 		vmbus_setevent(channel);
+++>>>>>>> 05d00bc94ac2 (vmbus: eliminate duplicate cached index)
+  }
+  EXPORT_SYMBOL_GPL(hv_pkt_iter_close);
+* Unmerged path drivers/hv/ring_buffer.c
+diff --git a/include/linux/hyperv.h b/include/linux/hyperv.h
+index 24e1840de3ae..65ec11248b04 100644
+--- a/include/linux/hyperv.h
++++ b/include/linux/hyperv.h
+@@ -127,7 +127,6 @@ struct hv_ring_buffer_info {
+ 	u32 ring_data_startoffset;
+ 	u32 priv_write_index;
+ 	u32 priv_read_index;
+-	u32 cached_read_index;
+ };
+ 
+ 
+@@ -158,19 +157,6 @@ static inline u32 hv_get_bytes_to_write(const struct hv_ring_buffer_info *rbi)
+ 	return write;
+ }
+ 
+-static inline u32 hv_get_cached_bytes_to_write(
+-	const struct hv_ring_buffer_info *rbi)
+-{
+-	u32 read_loc, write_loc, dsize, write;
+-
+-	dsize = rbi->ring_datasize;
+-	read_loc = rbi->cached_read_index;
+-	write_loc = rbi->ring_buffer->write_index;
+-
+-	write = write_loc >= read_loc ? dsize - (write_loc - read_loc) :
+-		read_loc - write_loc;
+-	return write;
+-}
+ /*
+  * VMBUS version is 32 bit entity broken up into
+  * two 16 bit quantities: major_number. minor_number.
