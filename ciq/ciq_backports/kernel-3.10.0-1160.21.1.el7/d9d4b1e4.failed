@@ -1,0 +1,1430 @@
+HID: Fix assumption that devices have inputs
+
+jira LE-1907
+cve CVE-2019-19532
+Rebuild_History Non-Buildable kernel-3.10.0-1160.21.1.el7
+Rebuild_CHGLOG: - [hid] Fix assumption that devices have inputs (Chris von Recklinghausen) [1821870] {CVE-2019-19532}
+Rebuild_FUZZ: 93.98%
+commit-author Alan Stern <stern@rowland.harvard.edu>
+commit d9d4b1e46d9543a82c23f6df03f4ad697dab361b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.21.1.el7/d9d4b1e4.failed
+
+The syzbot fuzzer found a slab-out-of-bounds write bug in the hid-gaff
+driver.  The problem is caused by the driver's assumption that the
+device must have an input report.  While this will be true for all
+normal HID input devices, a suitably malicious device can violate the
+assumption.
+
+The same assumption is present in over a dozen other HID drivers.
+This patch fixes them by checking that the list of hid_inputs for the
+hid_device is nonempty before allowing it to be used.
+
+Reported-and-tested-by: syzbot+403741a091bf41d4ae79@syzkaller.appspotmail.com
+	Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+CC: <stable@vger.kernel.org>
+	Signed-off-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+(cherry picked from commit d9d4b1e46d9543a82c23f6df03f4ad697dab361b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hid/hid-lg4ff.c
+#	drivers/hid/hid-logitech-hidpp.c
+#	drivers/hid/hid-microsoft.c
+#	drivers/hid/hid-sony.c
+diff --cc drivers/hid/hid-lg4ff.c
+index 10c503a0e944,5e6a0cef2a06..000000000000
+--- a/drivers/hid/hid-lg4ff.c
++++ b/drivers/hid/hid-lg4ff.c
+@@@ -513,16 -1177,102 +513,33 @@@ static enum led_brightness lg4ff_led_ge
+  }
+  #endif
+  
+ -static u16 lg4ff_identify_multimode_wheel(struct hid_device *hid, const u16 reported_product_id, const u16 bcdDevice)
+ -{
+ -	u32 current_mode;
+ -	int i;
+ -
+ -	/* identify current mode from USB PID */
+ -	for (i = 1; i < ARRAY_SIZE(lg4ff_alternate_modes); i++) {
+ -		dbg_hid("Testing whether PID is %X\n", lg4ff_alternate_modes[i].product_id);
+ -		if (reported_product_id == lg4ff_alternate_modes[i].product_id)
+ -			break;
+ -	}
+ -
+ -	if (i == ARRAY_SIZE(lg4ff_alternate_modes))
+ -		return 0;
+ -
+ -	current_mode = BIT(i);
+ -
+ -	for (i = 0; i < ARRAY_SIZE(lg4ff_main_checklist); i++) {
+ -		const u16 mask = lg4ff_main_checklist[i]->mask;
+ -		const u16 result = lg4ff_main_checklist[i]->result;
+ -		const u16 real_product_id = lg4ff_main_checklist[i]->real_product_id;
+ -
+ -		if ((current_mode & lg4ff_main_checklist[i]->modes) && \
+ -				(bcdDevice & mask) == result) {
+ -			dbg_hid("Found wheel with real PID %X whose reported PID is %X\n", real_product_id, reported_product_id);
+ -			return real_product_id;
+ -		}
+ -	}
+ -
+ -	/* No match found. This is either Driving Force or an unknown
+ -	 * wheel model, do not touch it */
+ -	dbg_hid("Wheel with bcdDevice %X was not recognized as multimode wheel, leaving in its current mode\n", bcdDevice);
+ -	return 0;
+ -}
+ -
+ -static int lg4ff_handle_multimode_wheel(struct hid_device *hid, u16 *real_product_id, const u16 bcdDevice)
+ -{
+ -	const u16 reported_product_id = hid->product;
+ -	int ret;
+ -
+ -	*real_product_id = lg4ff_identify_multimode_wheel(hid, reported_product_id, bcdDevice);
+ -	/* Probed wheel is not a multimode wheel */
+ -	if (!*real_product_id) {
+ -		*real_product_id = reported_product_id;
+ -		dbg_hid("Wheel is not a multimode wheel\n");
+ -		return LG4FF_MMODE_NOT_MULTIMODE;
+ -	}
+ -
+ -	/* Switch from "Driving Force" mode to native mode automatically.
+ -	 * Otherwise keep the wheel in its current mode */
+ -	if (reported_product_id == USB_DEVICE_ID_LOGITECH_WHEEL &&
+ -	    reported_product_id != *real_product_id &&
+ -	    !lg4ff_no_autoswitch) {
+ -		const struct lg4ff_compat_mode_switch *s = lg4ff_get_mode_switch_command(*real_product_id, *real_product_id);
+ -
+ -		if (!s) {
+ -			hid_err(hid, "Invalid product id %X\n", *real_product_id);
+ -			return LG4FF_MMODE_NOT_MULTIMODE;
+ -		}
+ -
+ -		ret = lg4ff_switch_compatibility_mode(hid, s);
+ -		if (ret) {
+ -			/* Wheel could not have been switched to native mode,
+ -			 * leave it in "Driving Force" mode and continue */
+ -			hid_err(hid, "Unable to switch wheel mode, errno %d\n", ret);
+ -			return LG4FF_MMODE_IS_MULTIMODE;
+ -		}
+ -		return LG4FF_MMODE_SWITCHED;
+ -	}
+ -
+ -	return LG4FF_MMODE_IS_MULTIMODE;
+ -}
+ -
+ -
+  int lg4ff_init(struct hid_device *hid)
+  {
+++<<<<<<< HEAD
+ +	struct hid_input *hidinput = list_entry(hid->inputs.next, struct hid_input, list);
+ +	struct input_dev *dev = hidinput->input;
+++=======
++ 	struct hid_input *hidinput;
++ 	struct input_dev *dev;
++ 	struct list_head *report_list = &hid->report_enum[HID_OUTPUT_REPORT].report_list;
++ 	struct hid_report *report = list_entry(report_list->next, struct hid_report, list);
++ 	const struct usb_device_descriptor *udesc = &(hid_to_usb_dev(hid)->descriptor);
++ 	const u16 bcdDevice = le16_to_cpu(udesc->bcdDevice);
++ 	const struct lg4ff_multimode_wheel *mmode_wheel = NULL;
+++>>>>>>> d9d4b1e46d95 (HID: Fix assumption that devices have inputs)
+  	struct lg4ff_device_entry *entry;
+  	struct lg_drv_data *drv_data;
+ +	struct usb_device_descriptor *udesc;
+  	int error, i, j;
+ -	int mmode_ret, mmode_idx = -1;
+ -	u16 real_product_id;
+ +	__u16 bcdDevice, rev_maj, rev_min;
+  
++ 	if (list_empty(&hid->inputs)) {
++ 		hid_err(hid, "no inputs found\n");
++ 		return -ENODEV;
++ 	}
++ 	hidinput = list_entry(hid->inputs.next, struct hid_input, list);
++ 	dev = hidinput->input;
++ 
+  	/* Check that the report looks ok */
+  	if (!hid_validate_values(hid, HID_OUTPUT_REPORT, 0, 0, 7))
+  		return -1;
+diff --cc drivers/hid/hid-microsoft.c
+index 52cd311293fe,2d8b589201a4..000000000000
+--- a/drivers/hid/hid-microsoft.c
++++ b/drivers/hid/hid-microsoft.c
+@@@ -165,6 -281,90 +165,93 @@@ static int ms_event(struct hid_device *
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void ms_ff_worker(struct work_struct *work)
++ {
++ 	struct ms_data *ms = container_of(work, struct ms_data, ff_worker);
++ 	struct hid_device *hdev = ms->hdev;
++ 	struct xb1s_ff_report *r = ms->output_report_dmabuf;
++ 	int ret;
++ 
++ 	memset(r, 0, sizeof(*r));
++ 
++ 	r->report_id = XB1S_FF_REPORT;
++ 	r->enable = ENABLE_WEAK | ENABLE_STRONG;
++ 	/*
++ 	 * Specifying maximum duration and maximum loop count should
++ 	 * cover maximum duration of a single effect, which is 65536
++ 	 * ms
++ 	 */
++ 	r->duration_10ms = U8_MAX;
++ 	r->loop_count = U8_MAX;
++ 	r->magnitude[MAGNITUDE_STRONG] = ms->strong; /* left actuator */
++ 	r->magnitude[MAGNITUDE_WEAK] = ms->weak;     /* right actuator */
++ 
++ 	ret = hid_hw_output_report(hdev, (__u8 *)r, sizeof(*r));
++ 	if (ret < 0)
++ 		hid_warn(hdev, "failed to send FF report\n");
++ }
++ 
++ static int ms_play_effect(struct input_dev *dev, void *data,
++ 			  struct ff_effect *effect)
++ {
++ 	struct hid_device *hid = input_get_drvdata(dev);
++ 	struct ms_data *ms = hid_get_drvdata(hid);
++ 
++ 	if (effect->type != FF_RUMBLE)
++ 		return 0;
++ 
++ 	/*
++ 	 * Magnitude is 0..100 so scale the 16-bit input here
++ 	 */
++ 	ms->strong = ((u32) effect->u.rumble.strong_magnitude * 100) / U16_MAX;
++ 	ms->weak = ((u32) effect->u.rumble.weak_magnitude * 100) / U16_MAX;
++ 
++ 	schedule_work(&ms->ff_worker);
++ 	return 0;
++ }
++ 
++ static int ms_init_ff(struct hid_device *hdev)
++ {
++ 	struct hid_input *hidinput;
++ 	struct input_dev *input_dev;
++ 	struct ms_data *ms = hid_get_drvdata(hdev);
++ 
++ 	if (list_empty(&hdev->inputs)) {
++ 		hid_err(hdev, "no inputs found\n");
++ 		return -ENODEV;
++ 	}
++ 	hidinput = list_entry(hdev->inputs.next, struct hid_input, list);
++ 	input_dev = hidinput->input;
++ 
++ 	if (!(ms->quirks & MS_QUIRK_FF))
++ 		return 0;
++ 
++ 	ms->hdev = hdev;
++ 	INIT_WORK(&ms->ff_worker, ms_ff_worker);
++ 
++ 	ms->output_report_dmabuf = devm_kzalloc(&hdev->dev,
++ 						sizeof(struct xb1s_ff_report),
++ 						GFP_KERNEL);
++ 	if (ms->output_report_dmabuf == NULL)
++ 		return -ENOMEM;
++ 
++ 	input_set_capability(input_dev, EV_FF, FF_RUMBLE);
++ 	return input_ff_create_memless(input_dev, NULL, ms_play_effect);
++ }
++ 
++ static void ms_remove_ff(struct hid_device *hdev)
++ {
++ 	struct ms_data *ms = hid_get_drvdata(hdev);
++ 
++ 	if (!(ms->quirks & MS_QUIRK_FF))
++ 		return;
++ 
++ 	cancel_work_sync(&ms->ff_worker);
++ }
++ 
+++>>>>>>> d9d4b1e46d95 (HID: Fix assumption that devices have inputs)
+  static int ms_probe(struct hid_device *hdev, const struct hid_device_id *id)
+  {
+  	unsigned long quirks = id->driver_data;
+diff --cc drivers/hid/hid-sony.c
+index 6b28b4814cad,4c6ed6ef31f1..000000000000
+--- a/drivers/hid/hid-sony.c
++++ b/drivers/hid/hid-sony.c
+@@@ -133,56 -1736,874 +133,774 @@@ static int sixaxis_set_operational_usb(
+  	if (!buf)
+  		return -ENOMEM;
+  
+ -	ret = hid_hw_raw_request(sc->hdev, 0xA3, buf,
+ -				 DS4_FEATURE_REPORT_0xA3_SIZE,
+ -				 HID_FEATURE_REPORT,
+ -				 HID_REQ_GET_REPORT);
+ -	if (ret < 0) {
+ -		kfree(buf);
+ -		return ret;
+ -	}
+ -
+ -	sc->hw_version = get_unaligned_le16(&buf[35]);
+ -	sc->fw_version = get_unaligned_le16(&buf[41]);
+ +	ret = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0),
+ +				 HID_REQ_GET_REPORT,
+ +				 USB_DIR_IN | USB_TYPE_CLASS |
+ +				 USB_RECIP_INTERFACE,
+ +				 (3 << 8) | 0xf2, ifnum, buf, 17,
+ +				 USB_CTRL_GET_TIMEOUT);
+ +	if (ret < 0)
+ +		hid_err(hdev, "can't set operational mode\n");
+  
+  	kfree(buf);
+ -	return 0;
+ -}
+  
+ -static void sixaxis_set_leds_from_id(struct sony_sc *sc)
+ -{
+ -	static const u8 sixaxis_leds[10][4] = {
+ -				{ 0x01, 0x00, 0x00, 0x00 },
+ -				{ 0x00, 0x01, 0x00, 0x00 },
+ -				{ 0x00, 0x00, 0x01, 0x00 },
+ -				{ 0x00, 0x00, 0x00, 0x01 },
+ -				{ 0x01, 0x00, 0x00, 0x01 },
+ -				{ 0x00, 0x01, 0x00, 0x01 },
+ -				{ 0x00, 0x00, 0x01, 0x01 },
+ -				{ 0x01, 0x00, 0x01, 0x01 },
+ -				{ 0x00, 0x01, 0x01, 0x01 },
+ -				{ 0x01, 0x01, 0x01, 0x01 }
+ -	};
+ -
+ -	int id = sc->device_id;
+ -
+ -	BUILD_BUG_ON(MAX_LEDS < ARRAY_SIZE(sixaxis_leds[0]));
+ -
+ -	if (id < 0)
+ -		return;
+ -
+ -	id %= 10;
+ -	memcpy(sc->led_state, sixaxis_leds[id], sizeof(sixaxis_leds[id]));
+ -}
+ -
+ -static void dualshock4_set_leds_from_id(struct sony_sc *sc)
+ -{
+ -	/* The first 4 color/index entries match what the PS4 assigns */
+ -	static const u8 color_code[7][3] = {
+ -			/* Blue   */	{ 0x00, 0x00, 0x40 },
+ -			/* Red	  */	{ 0x40, 0x00, 0x00 },
+ -			/* Green  */	{ 0x00, 0x40, 0x00 },
+ -			/* Pink   */	{ 0x20, 0x00, 0x20 },
+ -			/* Orange */	{ 0x02, 0x01, 0x00 },
+ -			/* Teal   */	{ 0x00, 0x01, 0x01 },
+ -			/* White  */	{ 0x01, 0x01, 0x01 }
+ -	};
+ -
+ -	int id = sc->device_id;
+ -
+ -	BUILD_BUG_ON(MAX_LEDS < ARRAY_SIZE(color_code[0]));
+ -
+ -	if (id < 0)
+ -		return;
+ -
+ -	id %= 7;
+ -	memcpy(sc->led_state, color_code[id], sizeof(color_code[id]));
+ -}
+ -
+ -static void buzz_set_leds(struct sony_sc *sc)
+ -{
+ -	struct hid_device *hdev = sc->hdev;
+ -	struct list_head *report_list =
+ -		&hdev->report_enum[HID_OUTPUT_REPORT].report_list;
+ -	struct hid_report *report = list_entry(report_list->next,
+ -		struct hid_report, list);
+ -	s32 *value = report->field[0]->value;
+ -
+ -	BUILD_BUG_ON(MAX_LEDS < 4);
+ -
+ -	value[0] = 0x00;
+ -	value[1] = sc->led_state[0] ? 0xff : 0x00;
+ -	value[2] = sc->led_state[1] ? 0xff : 0x00;
+ -	value[3] = sc->led_state[2] ? 0xff : 0x00;
+ -	value[4] = sc->led_state[3] ? 0xff : 0x00;
+ -	value[5] = 0x00;
+ -	value[6] = 0x00;
+ -	hid_hw_request(hdev, report, HID_REQ_SET_REPORT);
+ +	return ret;
+  }
+  
+ -static void sony_set_leds(struct sony_sc *sc)
+ +static int sixaxis_set_operational_bt(struct hid_device *hdev)
+  {
+ -	if (!(sc->quirks & BUZZ_CONTROLLER))
+ -		sony_schedule_work(sc, SONY_WORKER_STATE);
+ -	else
+ -		buzz_set_leds(sc);
+ +	unsigned char buf[] = { 0xf4,  0x42, 0x03, 0x00, 0x00 };
+ +	return hid_hw_raw_request(hdev, buf[0], buf, sizeof(buf),
+ +				  HID_FEATURE_REPORT, HID_REQ_SET_REPORT);
+  }
+  
+ -static void sony_led_set_brightness(struct led_classdev *led,
+ -				    enum led_brightness value)
+ +static int sony_probe(struct hid_device *hdev, const struct hid_device_id *id)
+  {
+ -	struct device *dev = led->dev->parent;
+ -	struct hid_device *hdev = to_hid_device(dev);
+ -	struct sony_sc *drv_data;
+ -
+ -	int n;
+ -	int force_update;
+ +	int ret;
+ +	unsigned long quirks = id->driver_data;
+ +	struct sony_sc *sc;
+  
+ -	drv_data = hid_get_drvdata(hdev);
+ -	if (!drv_data) {
+ -		hid_err(hdev, "No device data\n");
+ -		return;
+ +	sc = kzalloc(sizeof(*sc), GFP_KERNEL);
+ +	if (sc == NULL) {
+ +		hid_err(hdev, "can't alloc sony descriptor\n");
+ +		return -ENOMEM;
+  	}
+  
+ -	/*
+ -	 * The Sixaxis on USB will override any LED settings sent to it
+ -	 * and keep flashing all of the LEDs until the PS button is pressed.
+ -	 * Updates, even if redundant, must be always be sent to the
+ -	 * controller to avoid having to toggle the state of an LED just to
+ -	 * stop the flashing later on.
+ -	 */
+ -	force_update = !!(drv_data->quirks & SIXAXIS_CONTROLLER_USB);
+ -
+ -	for (n = 0; n < drv_data->led_count; n++) {
+ -		if (led == drv_data->leds[n] && (force_update ||
+ -			(value != drv_data->led_state[n] ||
+ -			drv_data->led_delay_on[n] ||
+ -			drv_data->led_delay_off[n]))) {
+ -
+ -			drv_data->led_state[n] = value;
+ -
+ -			/* Setting the brightness stops the blinking */
+ -			drv_data->led_delay_on[n] = 0;
+ -			drv_data->led_delay_off[n] = 0;
+ +	sc->quirks = quirks;
+ +	hid_set_drvdata(hdev, sc);
+  
+ -			sony_set_leds(drv_data);
+ -			break;
+ -		}
+ +	ret = hid_parse(hdev);
+ +	if (ret) {
+ +		hid_err(hdev, "parse failed\n");
+ +		goto err_free;
+  	}
+ -}
+ -
+ -static enum led_brightness sony_led_get_brightness(struct led_classdev *led)
+ -{
+ -	struct device *dev = led->dev->parent;
+ -	struct hid_device *hdev = to_hid_device(dev);
+ -	struct sony_sc *drv_data;
+ -
+ -	int n;
+  
+ -	drv_data = hid_get_drvdata(hdev);
+ -	if (!drv_data) {
+ -		hid_err(hdev, "No device data\n");
+ -		return LED_OFF;
+ +	ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT |
+ +			HID_CONNECT_HIDDEV_FORCE);
+ +	if (ret) {
+ +		hid_err(hdev, "hw start failed\n");
+ +		goto err_free;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (sc->quirks & SIXAXIS_CONTROLLER_USB) {
+++=======
++ 	for (n = 0; n < drv_data->led_count; n++) {
++ 		if (led == drv_data->leds[n])
++ 			return drv_data->led_state[n];
++ 	}
++ 
++ 	return LED_OFF;
++ }
++ 
++ static int sony_led_blink_set(struct led_classdev *led, unsigned long *delay_on,
++ 				unsigned long *delay_off)
++ {
++ 	struct device *dev = led->dev->parent;
++ 	struct hid_device *hdev = to_hid_device(dev);
++ 	struct sony_sc *drv_data = hid_get_drvdata(hdev);
++ 	int n;
++ 	u8 new_on, new_off;
++ 
++ 	if (!drv_data) {
++ 		hid_err(hdev, "No device data\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* Max delay is 255 deciseconds or 2550 milliseconds */
++ 	if (*delay_on > 2550)
++ 		*delay_on = 2550;
++ 	if (*delay_off > 2550)
++ 		*delay_off = 2550;
++ 
++ 	/* Blink at 1 Hz if both values are zero */
++ 	if (!*delay_on && !*delay_off)
++ 		*delay_on = *delay_off = 500;
++ 
++ 	new_on = *delay_on / 10;
++ 	new_off = *delay_off / 10;
++ 
++ 	for (n = 0; n < drv_data->led_count; n++) {
++ 		if (led == drv_data->leds[n])
++ 			break;
++ 	}
++ 
++ 	/* This LED is not registered on this device */
++ 	if (n >= drv_data->led_count)
++ 		return -EINVAL;
++ 
++ 	/* Don't schedule work if the values didn't change */
++ 	if (new_on != drv_data->led_delay_on[n] ||
++ 		new_off != drv_data->led_delay_off[n]) {
++ 		drv_data->led_delay_on[n] = new_on;
++ 		drv_data->led_delay_off[n] = new_off;
++ 		sony_schedule_work(drv_data, SONY_WORKER_STATE);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int sony_leds_init(struct sony_sc *sc)
++ {
++ 	struct hid_device *hdev = sc->hdev;
++ 	int n, ret = 0;
++ 	int use_ds4_names;
++ 	struct led_classdev *led;
++ 	size_t name_sz;
++ 	char *name;
++ 	size_t name_len;
++ 	const char *name_fmt;
++ 	static const char * const ds4_name_str[] = { "red", "green", "blue",
++ 						  "global" };
++ 	u8 max_brightness[MAX_LEDS] = { [0 ... (MAX_LEDS - 1)] = 1 };
++ 	u8 use_hw_blink[MAX_LEDS] = { 0 };
++ 
++ 	BUG_ON(!(sc->quirks & SONY_LED_SUPPORT));
++ 
++ 	if (sc->quirks & BUZZ_CONTROLLER) {
++ 		sc->led_count = 4;
++ 		use_ds4_names = 0;
++ 		name_len = strlen("::buzz#");
++ 		name_fmt = "%s::buzz%d";
++ 		/* Validate expected report characteristics. */
++ 		if (!hid_validate_values(hdev, HID_OUTPUT_REPORT, 0, 0, 7))
++ 			return -ENODEV;
++ 	} else if (sc->quirks & DUALSHOCK4_CONTROLLER) {
++ 		dualshock4_set_leds_from_id(sc);
++ 		sc->led_state[3] = 1;
++ 		sc->led_count = 4;
++ 		memset(max_brightness, 255, 3);
++ 		use_hw_blink[3] = 1;
++ 		use_ds4_names = 1;
++ 		name_len = 0;
++ 		name_fmt = "%s:%s";
++ 	} else if (sc->quirks & MOTION_CONTROLLER) {
++ 		sc->led_count = 3;
++ 		memset(max_brightness, 255, 3);
++ 		use_ds4_names = 1;
++ 		name_len = 0;
++ 		name_fmt = "%s:%s";
++ 	} else if (sc->quirks & NAVIGATION_CONTROLLER) {
++ 		static const u8 navigation_leds[4] = {0x01, 0x00, 0x00, 0x00};
++ 
++ 		memcpy(sc->led_state, navigation_leds, sizeof(navigation_leds));
++ 		sc->led_count = 1;
++ 		memset(use_hw_blink, 1, 4);
++ 		use_ds4_names = 0;
++ 		name_len = strlen("::sony#");
++ 		name_fmt = "%s::sony%d";
++ 	} else {
++ 		sixaxis_set_leds_from_id(sc);
++ 		sc->led_count = 4;
++ 		memset(use_hw_blink, 1, 4);
++ 		use_ds4_names = 0;
++ 		name_len = strlen("::sony#");
++ 		name_fmt = "%s::sony%d";
++ 	}
++ 
++ 	/*
++ 	 * Clear LEDs as we have no way of reading their initial state. This is
++ 	 * only relevant if the driver is loaded after somebody actively set the
++ 	 * LEDs to on
++ 	 */
++ 	sony_set_leds(sc);
++ 
++ 	name_sz = strlen(dev_name(&hdev->dev)) + name_len + 1;
++ 
++ 	for (n = 0; n < sc->led_count; n++) {
++ 
++ 		if (use_ds4_names)
++ 			name_sz = strlen(dev_name(&hdev->dev)) + strlen(ds4_name_str[n]) + 2;
++ 
++ 		led = devm_kzalloc(&hdev->dev, sizeof(struct led_classdev) + name_sz, GFP_KERNEL);
++ 		if (!led) {
++ 			hid_err(hdev, "Couldn't allocate memory for LED %d\n", n);
++ 			return -ENOMEM;
++ 		}
++ 
++ 		name = (void *)(&led[1]);
++ 		if (use_ds4_names)
++ 			snprintf(name, name_sz, name_fmt, dev_name(&hdev->dev),
++ 			ds4_name_str[n]);
++ 		else
++ 			snprintf(name, name_sz, name_fmt, dev_name(&hdev->dev), n + 1);
++ 		led->name = name;
++ 		led->brightness = sc->led_state[n];
++ 		led->max_brightness = max_brightness[n];
++ 		led->flags = LED_CORE_SUSPENDRESUME;
++ 		led->brightness_get = sony_led_get_brightness;
++ 		led->brightness_set = sony_led_set_brightness;
++ 
++ 		if (use_hw_blink[n])
++ 			led->blink_set = sony_led_blink_set;
++ 
++ 		sc->leds[n] = led;
++ 
++ 		ret = devm_led_classdev_register(&hdev->dev, led);
++ 		if (ret) {
++ 			hid_err(hdev, "Failed to register LED %d\n", n);
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void sixaxis_send_output_report(struct sony_sc *sc)
++ {
++ 	static const union sixaxis_output_report_01 default_report = {
++ 		.buf = {
++ 			0x01,
++ 			0x01, 0xff, 0x00, 0xff, 0x00,
++ 			0x00, 0x00, 0x00, 0x00, 0x00,
++ 			0xff, 0x27, 0x10, 0x00, 0x32,
++ 			0xff, 0x27, 0x10, 0x00, 0x32,
++ 			0xff, 0x27, 0x10, 0x00, 0x32,
++ 			0xff, 0x27, 0x10, 0x00, 0x32,
++ 			0x00, 0x00, 0x00, 0x00, 0x00
++ 		}
++ 	};
++ 	struct sixaxis_output_report *report =
++ 		(struct sixaxis_output_report *)sc->output_report_dmabuf;
++ 	int n;
++ 
++ 	/* Initialize the report with default values */
++ 	memcpy(report, &default_report, sizeof(struct sixaxis_output_report));
++ 
++ #ifdef CONFIG_SONY_FF
++ 	report->rumble.right_motor_on = sc->right ? 1 : 0;
++ 	report->rumble.left_motor_force = sc->left;
++ #endif
++ 
++ 	report->leds_bitmap |= sc->led_state[0] << 1;
++ 	report->leds_bitmap |= sc->led_state[1] << 2;
++ 	report->leds_bitmap |= sc->led_state[2] << 3;
++ 	report->leds_bitmap |= sc->led_state[3] << 4;
++ 
++ 	/* Set flag for all leds off, required for 3rd party INTEC controller */
++ 	if ((report->leds_bitmap & 0x1E) == 0)
++ 		report->leds_bitmap |= 0x20;
++ 
++ 	/*
++ 	 * The LEDs in the report are indexed in reverse order to their
++ 	 * corresponding light on the controller.
++ 	 * Index 0 = LED 4, index 1 = LED 3, etc...
++ 	 *
++ 	 * In the case of both delay values being zero (blinking disabled) the
++ 	 * default report values should be used or the controller LED will be
++ 	 * always off.
++ 	 */
++ 	for (n = 0; n < 4; n++) {
++ 		if (sc->led_delay_on[n] || sc->led_delay_off[n]) {
++ 			report->led[3 - n].duty_off = sc->led_delay_off[n];
++ 			report->led[3 - n].duty_on = sc->led_delay_on[n];
++ 		}
++ 	}
++ 
++ 	/* SHANWAN controllers require output reports via intr channel */
++ 	if (sc->quirks & SHANWAN_GAMEPAD)
++ 		hid_hw_output_report(sc->hdev, (u8 *)report,
++ 				sizeof(struct sixaxis_output_report));
++ 	else
++ 		hid_hw_raw_request(sc->hdev, report->report_id, (u8 *)report,
++ 				sizeof(struct sixaxis_output_report),
++ 				HID_OUTPUT_REPORT, HID_REQ_SET_REPORT);
++ }
++ 
++ static void dualshock4_send_output_report(struct sony_sc *sc)
++ {
++ 	struct hid_device *hdev = sc->hdev;
++ 	u8 *buf = sc->output_report_dmabuf;
++ 	int offset;
++ 
++ 	/*
++ 	 * NOTE: The lower 6 bits of buf[1] field of the Bluetooth report
++ 	 * control the interval at which Dualshock 4 reports data:
++ 	 * 0x00 - 1ms
++ 	 * 0x01 - 1ms
++ 	 * 0x02 - 2ms
++ 	 * 0x3E - 62ms
++ 	 * 0x3F - disabled
++ 	 */
++ 	if (sc->quirks & (DUALSHOCK4_CONTROLLER_USB | DUALSHOCK4_DONGLE)) {
++ 		memset(buf, 0, DS4_OUTPUT_REPORT_0x05_SIZE);
++ 		buf[0] = 0x05;
++ 		buf[1] = 0x07; /* blink + LEDs + motor */
++ 		offset = 4;
++ 	} else {
++ 		memset(buf, 0, DS4_OUTPUT_REPORT_0x11_SIZE);
++ 		buf[0] = 0x11;
++ 		buf[1] = 0xC0 /* HID + CRC */ | sc->ds4_bt_poll_interval;
++ 		buf[3] = 0x07; /* blink + LEDs + motor */
++ 		offset = 6;
++ 	}
++ 
++ #ifdef CONFIG_SONY_FF
++ 	buf[offset++] = sc->right;
++ 	buf[offset++] = sc->left;
++ #else
++ 	offset += 2;
++ #endif
++ 
++ 	/* LED 3 is the global control */
++ 	if (sc->led_state[3]) {
++ 		buf[offset++] = sc->led_state[0];
++ 		buf[offset++] = sc->led_state[1];
++ 		buf[offset++] = sc->led_state[2];
++ 	} else {
++ 		offset += 3;
++ 	}
++ 
++ 	/* If both delay values are zero the DualShock 4 disables blinking. */
++ 	buf[offset++] = sc->led_delay_on[3];
++ 	buf[offset++] = sc->led_delay_off[3];
++ 
++ 	if (sc->quirks & (DUALSHOCK4_CONTROLLER_USB | DUALSHOCK4_DONGLE))
++ 		hid_hw_output_report(hdev, buf, DS4_OUTPUT_REPORT_0x05_SIZE);
++ 	else {
++ 		/* CRC generation */
++ 		u8 bthdr = 0xA2;
++ 		u32 crc;
++ 
++ 		crc = crc32_le(0xFFFFFFFF, &bthdr, 1);
++ 		crc = ~crc32_le(crc, buf, DS4_OUTPUT_REPORT_0x11_SIZE-4);
++ 		put_unaligned_le32(crc, &buf[74]);
++ 		hid_hw_output_report(hdev, buf, DS4_OUTPUT_REPORT_0x11_SIZE);
++ 	}
++ }
++ 
++ static void motion_send_output_report(struct sony_sc *sc)
++ {
++ 	struct hid_device *hdev = sc->hdev;
++ 	struct motion_output_report_02 *report =
++ 		(struct motion_output_report_02 *)sc->output_report_dmabuf;
++ 
++ 	memset(report, 0, MOTION_REPORT_0x02_SIZE);
++ 
++ 	report->type = 0x02; /* set leds */
++ 	report->r = sc->led_state[0];
++ 	report->g = sc->led_state[1];
++ 	report->b = sc->led_state[2];
++ 
++ #ifdef CONFIG_SONY_FF
++ 	report->rumble = max(sc->right, sc->left);
++ #endif
++ 
++ 	hid_hw_output_report(hdev, (u8 *)report, MOTION_REPORT_0x02_SIZE);
++ }
++ 
++ static inline void sony_send_output_report(struct sony_sc *sc)
++ {
++ 	if (sc->send_output_report)
++ 		sc->send_output_report(sc);
++ }
++ 
++ static void sony_state_worker(struct work_struct *work)
++ {
++ 	struct sony_sc *sc = container_of(work, struct sony_sc, state_worker);
++ 
++ 	sc->send_output_report(sc);
++ }
++ 
++ static int sony_allocate_output_report(struct sony_sc *sc)
++ {
++ 	if ((sc->quirks & SIXAXIS_CONTROLLER) ||
++ 			(sc->quirks & NAVIGATION_CONTROLLER))
++ 		sc->output_report_dmabuf =
++ 			devm_kmalloc(&sc->hdev->dev,
++ 				sizeof(union sixaxis_output_report_01),
++ 				GFP_KERNEL);
++ 	else if (sc->quirks & DUALSHOCK4_CONTROLLER_BT)
++ 		sc->output_report_dmabuf = devm_kmalloc(&sc->hdev->dev,
++ 						DS4_OUTPUT_REPORT_0x11_SIZE,
++ 						GFP_KERNEL);
++ 	else if (sc->quirks & (DUALSHOCK4_CONTROLLER_USB | DUALSHOCK4_DONGLE))
++ 		sc->output_report_dmabuf = devm_kmalloc(&sc->hdev->dev,
++ 						DS4_OUTPUT_REPORT_0x05_SIZE,
++ 						GFP_KERNEL);
++ 	else if (sc->quirks & MOTION_CONTROLLER)
++ 		sc->output_report_dmabuf = devm_kmalloc(&sc->hdev->dev,
++ 						MOTION_REPORT_0x02_SIZE,
++ 						GFP_KERNEL);
++ 	else
++ 		return 0;
++ 
++ 	if (!sc->output_report_dmabuf)
++ 		return -ENOMEM;
++ 
++ 	return 0;
++ }
++ 
++ #ifdef CONFIG_SONY_FF
++ static int sony_play_effect(struct input_dev *dev, void *data,
++ 			    struct ff_effect *effect)
++ {
++ 	struct hid_device *hid = input_get_drvdata(dev);
++ 	struct sony_sc *sc = hid_get_drvdata(hid);
++ 
++ 	if (effect->type != FF_RUMBLE)
++ 		return 0;
++ 
++ 	sc->left = effect->u.rumble.strong_magnitude / 256;
++ 	sc->right = effect->u.rumble.weak_magnitude / 256;
++ 
++ 	sony_schedule_work(sc, SONY_WORKER_STATE);
++ 	return 0;
++ }
++ 
++ static int sony_init_ff(struct sony_sc *sc)
++ {
++ 	struct hid_input *hidinput;
++ 	struct input_dev *input_dev;
++ 
++ 	if (list_empty(&sc->hdev->inputs)) {
++ 		hid_err(sc->hdev, "no inputs found\n");
++ 		return -ENODEV;
++ 	}
++ 	hidinput = list_entry(sc->hdev->inputs.next, struct hid_input, list);
++ 	input_dev = hidinput->input;
++ 
++ 	input_set_capability(input_dev, EV_FF, FF_RUMBLE);
++ 	return input_ff_create_memless(input_dev, NULL, sony_play_effect);
++ }
++ 
++ #else
++ static int sony_init_ff(struct sony_sc *sc)
++ {
++ 	return 0;
++ }
++ 
++ #endif
++ 
++ static int sony_battery_get_property(struct power_supply *psy,
++ 				     enum power_supply_property psp,
++ 				     union power_supply_propval *val)
++ {
++ 	struct sony_sc *sc = power_supply_get_drvdata(psy);
++ 	unsigned long flags;
++ 	int ret = 0;
++ 	u8 battery_charging, battery_capacity, cable_state;
++ 
++ 	spin_lock_irqsave(&sc->lock, flags);
++ 	battery_charging = sc->battery_charging;
++ 	battery_capacity = sc->battery_capacity;
++ 	cable_state = sc->cable_state;
++ 	spin_unlock_irqrestore(&sc->lock, flags);
++ 
++ 	switch (psp) {
++ 	case POWER_SUPPLY_PROP_PRESENT:
++ 		val->intval = 1;
++ 		break;
++ 	case POWER_SUPPLY_PROP_SCOPE:
++ 		val->intval = POWER_SUPPLY_SCOPE_DEVICE;
++ 		break;
++ 	case POWER_SUPPLY_PROP_CAPACITY:
++ 		val->intval = battery_capacity;
++ 		break;
++ 	case POWER_SUPPLY_PROP_STATUS:
++ 		if (battery_charging)
++ 			val->intval = POWER_SUPPLY_STATUS_CHARGING;
++ 		else
++ 			if (battery_capacity == 100 && cable_state)
++ 				val->intval = POWER_SUPPLY_STATUS_FULL;
++ 			else
++ 				val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
++ 		break;
++ 	default:
++ 		ret = -EINVAL;
++ 		break;
++ 	}
++ 	return ret;
++ }
++ 
++ static int sony_battery_probe(struct sony_sc *sc, int append_dev_id)
++ {
++ 	const char *battery_str_fmt = append_dev_id ?
++ 		"sony_controller_battery_%pMR_%i" :
++ 		"sony_controller_battery_%pMR";
++ 	struct power_supply_config psy_cfg = { .drv_data = sc, };
++ 	struct hid_device *hdev = sc->hdev;
++ 	int ret;
++ 
++ 	/*
++ 	 * Set the default battery level to 100% to avoid low battery warnings
++ 	 * if the battery is polled before the first device report is received.
++ 	 */
++ 	sc->battery_capacity = 100;
++ 
++ 	sc->battery_desc.properties = sony_battery_props;
++ 	sc->battery_desc.num_properties = ARRAY_SIZE(sony_battery_props);
++ 	sc->battery_desc.get_property = sony_battery_get_property;
++ 	sc->battery_desc.type = POWER_SUPPLY_TYPE_BATTERY;
++ 	sc->battery_desc.use_for_apm = 0;
++ 	sc->battery_desc.name = devm_kasprintf(&hdev->dev, GFP_KERNEL,
++ 					  battery_str_fmt, sc->mac_address, sc->device_id);
++ 	if (!sc->battery_desc.name)
++ 		return -ENOMEM;
++ 
++ 	sc->battery = devm_power_supply_register(&hdev->dev, &sc->battery_desc,
++ 					    &psy_cfg);
++ 	if (IS_ERR(sc->battery)) {
++ 		ret = PTR_ERR(sc->battery);
++ 		hid_err(hdev, "Unable to register battery device\n");
++ 		return ret;
++ 	}
++ 
++ 	power_supply_powers(sc->battery, &hdev->dev);
++ 	return 0;
++ }
++ 
++ /*
++  * If a controller is plugged in via USB while already connected via Bluetooth
++  * it will show up as two devices. A global list of connected controllers and
++  * their MAC addresses is maintained to ensure that a device is only connected
++  * once.
++  *
++  * Some USB-only devices masquerade as Sixaxis controllers and all have the
++  * same dummy Bluetooth address, so a comparison of the connection type is
++  * required.  Devices are only rejected in the case where two devices have
++  * matching Bluetooth addresses on different bus types.
++  */
++ static inline int sony_compare_connection_type(struct sony_sc *sc0,
++ 						struct sony_sc *sc1)
++ {
++ 	const int sc0_not_bt = !(sc0->quirks & SONY_BT_DEVICE);
++ 	const int sc1_not_bt = !(sc1->quirks & SONY_BT_DEVICE);
++ 
++ 	return sc0_not_bt == sc1_not_bt;
++ }
++ 
++ static int sony_check_add_dev_list(struct sony_sc *sc)
++ {
++ 	struct sony_sc *entry;
++ 	unsigned long flags;
++ 	int ret;
++ 
++ 	spin_lock_irqsave(&sony_dev_list_lock, flags);
++ 
++ 	list_for_each_entry(entry, &sony_device_list, list_node) {
++ 		ret = memcmp(sc->mac_address, entry->mac_address,
++ 				sizeof(sc->mac_address));
++ 		if (!ret) {
++ 			if (sony_compare_connection_type(sc, entry)) {
++ 				ret = 1;
++ 			} else {
++ 				ret = -EEXIST;
++ 				hid_info(sc->hdev,
++ 				"controller with MAC address %pMR already connected\n",
++ 				sc->mac_address);
++ 			}
++ 			goto unlock;
++ 		}
++ 	}
++ 
++ 	ret = 0;
++ 	list_add(&(sc->list_node), &sony_device_list);
++ 
++ unlock:
++ 	spin_unlock_irqrestore(&sony_dev_list_lock, flags);
++ 	return ret;
++ }
++ 
++ static void sony_remove_dev_list(struct sony_sc *sc)
++ {
++ 	unsigned long flags;
++ 
++ 	if (sc->list_node.next) {
++ 		spin_lock_irqsave(&sony_dev_list_lock, flags);
++ 		list_del(&(sc->list_node));
++ 		spin_unlock_irqrestore(&sony_dev_list_lock, flags);
++ 	}
++ }
++ 
++ static int sony_get_bt_devaddr(struct sony_sc *sc)
++ {
++ 	int ret;
++ 
++ 	/* HIDP stores the device MAC address as a string in the uniq field. */
++ 	ret = strlen(sc->hdev->uniq);
++ 	if (ret != 17)
++ 		return -EINVAL;
++ 
++ 	ret = sscanf(sc->hdev->uniq,
++ 		"%02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx",
++ 		&sc->mac_address[5], &sc->mac_address[4], &sc->mac_address[3],
++ 		&sc->mac_address[2], &sc->mac_address[1], &sc->mac_address[0]);
++ 
++ 	if (ret != 6)
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ 
++ static int sony_check_add(struct sony_sc *sc)
++ {
++ 	u8 *buf = NULL;
++ 	int n, ret;
++ 
++ 	if ((sc->quirks & DUALSHOCK4_CONTROLLER_BT) ||
++ 	    (sc->quirks & MOTION_CONTROLLER_BT) ||
++ 	    (sc->quirks & NAVIGATION_CONTROLLER_BT) ||
++ 	    (sc->quirks & SIXAXIS_CONTROLLER_BT)) {
++ 		/*
++ 		 * sony_get_bt_devaddr() attempts to parse the Bluetooth MAC
++ 		 * address from the uniq string where HIDP stores it.
++ 		 * As uniq cannot be guaranteed to be a MAC address in all cases
++ 		 * a failure of this function should not prevent the connection.
++ 		 */
++ 		if (sony_get_bt_devaddr(sc) < 0) {
++ 			hid_warn(sc->hdev, "UNIQ does not contain a MAC address; duplicate check skipped\n");
++ 			return 0;
++ 		}
++ 	} else if (sc->quirks & (DUALSHOCK4_CONTROLLER_USB | DUALSHOCK4_DONGLE)) {
++ 		buf = kmalloc(DS4_FEATURE_REPORT_0x81_SIZE, GFP_KERNEL);
++ 		if (!buf)
++ 			return -ENOMEM;
++ 
++ 		/*
++ 		 * The MAC address of a DS4 controller connected via USB can be
++ 		 * retrieved with feature report 0x81. The address begins at
++ 		 * offset 1.
++ 		 */
++ 		ret = hid_hw_raw_request(sc->hdev, 0x81, buf,
++ 				DS4_FEATURE_REPORT_0x81_SIZE, HID_FEATURE_REPORT,
++ 				HID_REQ_GET_REPORT);
++ 
++ 		if (ret != DS4_FEATURE_REPORT_0x81_SIZE) {
++ 			hid_err(sc->hdev, "failed to retrieve feature report 0x81 with the DualShock 4 MAC address\n");
++ 			ret = ret < 0 ? ret : -EINVAL;
++ 			goto out_free;
++ 		}
++ 
++ 		memcpy(sc->mac_address, &buf[1], sizeof(sc->mac_address));
++ 
++ 		snprintf(sc->hdev->uniq, sizeof(sc->hdev->uniq),
++ 			 "%pMR", sc->mac_address);
++ 	} else if ((sc->quirks & SIXAXIS_CONTROLLER_USB) ||
++ 			(sc->quirks & NAVIGATION_CONTROLLER_USB)) {
++ 		buf = kmalloc(SIXAXIS_REPORT_0xF2_SIZE, GFP_KERNEL);
++ 		if (!buf)
++ 			return -ENOMEM;
++ 
++ 		/*
++ 		 * The MAC address of a Sixaxis controller connected via USB can
++ 		 * be retrieved with feature report 0xf2. The address begins at
++ 		 * offset 4.
++ 		 */
++ 		ret = hid_hw_raw_request(sc->hdev, 0xf2, buf,
++ 				SIXAXIS_REPORT_0xF2_SIZE, HID_FEATURE_REPORT,
++ 				HID_REQ_GET_REPORT);
++ 
++ 		if (ret != SIXAXIS_REPORT_0xF2_SIZE) {
++ 			hid_err(sc->hdev, "failed to retrieve feature report 0xf2 with the Sixaxis MAC address\n");
++ 			ret = ret < 0 ? ret : -EINVAL;
++ 			goto out_free;
++ 		}
++ 
++ 		/*
++ 		 * The Sixaxis device MAC in the report is big-endian and must
++ 		 * be byte-swapped.
++ 		 */
++ 		for (n = 0; n < 6; n++)
++ 			sc->mac_address[5-n] = buf[4+n];
++ 
++ 		snprintf(sc->hdev->uniq, sizeof(sc->hdev->uniq),
++ 			 "%pMR", sc->mac_address);
++ 	} else {
++ 		return 0;
++ 	}
++ 
++ 	ret = sony_check_add_dev_list(sc);
++ 
++ out_free:
++ 
++ 	kfree(buf);
++ 
++ 	return ret;
++ }
++ 
++ static int sony_set_device_id(struct sony_sc *sc)
++ {
++ 	int ret;
++ 
++ 	/*
++ 	 * Only DualShock 4 or Sixaxis controllers get an id.
++ 	 * All others are set to -1.
++ 	 */
++ 	if ((sc->quirks & SIXAXIS_CONTROLLER) ||
++ 	    (sc->quirks & DUALSHOCK4_CONTROLLER)) {
++ 		ret = ida_simple_get(&sony_device_id_allocator, 0, 0,
++ 					GFP_KERNEL);
++ 		if (ret < 0) {
++ 			sc->device_id = -1;
++ 			return ret;
++ 		}
++ 		sc->device_id = ret;
++ 	} else {
++ 		sc->device_id = -1;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void sony_release_device_id(struct sony_sc *sc)
++ {
++ 	if (sc->device_id >= 0) {
++ 		ida_simple_remove(&sony_device_id_allocator, sc->device_id);
++ 		sc->device_id = -1;
++ 	}
++ }
++ 
++ static inline void sony_init_output_report(struct sony_sc *sc,
++ 				void (*send_output_report)(struct sony_sc *))
++ {
++ 	sc->send_output_report = send_output_report;
++ 
++ 	if (!sc->state_worker_initialized)
++ 		INIT_WORK(&sc->state_worker, sony_state_worker);
++ 
++ 	sc->state_worker_initialized = 1;
++ }
++ 
++ static inline void sony_cancel_work_sync(struct sony_sc *sc)
++ {
++ 	unsigned long flags;
++ 
++ 	if (sc->hotplug_worker_initialized)
++ 		cancel_work_sync(&sc->hotplug_worker);
++ 	if (sc->state_worker_initialized) {
++ 		spin_lock_irqsave(&sc->lock, flags);
++ 		sc->state_worker_initialized = 0;
++ 		spin_unlock_irqrestore(&sc->lock, flags);
++ 		cancel_work_sync(&sc->state_worker);
++ 	}
++ }
++ 
++ static int sony_input_configured(struct hid_device *hdev,
++ 					struct hid_input *hidinput)
++ {
++ 	struct sony_sc *sc = hid_get_drvdata(hdev);
++ 	int append_dev_id;
++ 	int ret;
++ 
++ 	ret = sony_set_device_id(sc);
++ 	if (ret < 0) {
++ 		hid_err(hdev, "failed to allocate the device id\n");
++ 		goto err_stop;
++ 	}
++ 
++ 	ret = append_dev_id = sony_check_add(sc);
++ 	if (ret < 0)
++ 		goto err_stop;
++ 
++ 	ret = sony_allocate_output_report(sc);
++ 	if (ret < 0) {
++ 		hid_err(hdev, "failed to allocate the output report buffer\n");
++ 		goto err_stop;
++ 	}
++ 
++ 	if (sc->quirks & NAVIGATION_CONTROLLER_USB) {
+++>>>>>>> d9d4b1e46d95 (HID: Fix assumption that devices have inputs)
+  		/*
+  		 * The Sony Sixaxis does not handle HID Output Reports on the
+  		 * Interrupt EP like it could, so we need to force HID Output
+* Unmerged path drivers/hid/hid-logitech-hidpp.c
+diff --git a/drivers/hid/hid-axff.c b/drivers/hid/hid-axff.c
+index a594e478a1e2..843aed4dec80 100644
+--- a/drivers/hid/hid-axff.c
++++ b/drivers/hid/hid-axff.c
+@@ -75,13 +75,20 @@ static int axff_init(struct hid_device *hid)
+ {
+ 	struct axff_device *axff;
+ 	struct hid_report *report;
+-	struct hid_input *hidinput = list_first_entry(&hid->inputs, struct hid_input, list);
++	struct hid_input *hidinput;
+ 	struct list_head *report_list =&hid->report_enum[HID_OUTPUT_REPORT].report_list;
+-	struct input_dev *dev = hidinput->input;
++	struct input_dev *dev;
+ 	int field_count = 0;
+ 	int i, j;
+ 	int error;
+ 
++	if (list_empty(&hid->inputs)) {
++		hid_err(hid, "no inputs found\n");
++		return -ENODEV;
++	}
++	hidinput = list_first_entry(&hid->inputs, struct hid_input, list);
++	dev = hidinput->input;
++
+ 	if (list_empty(report_list)) {
+ 		hid_err(hid, "no output reports found\n");
+ 		return -ENODEV;
+diff --git a/drivers/hid/hid-dr.c b/drivers/hid/hid-dr.c
+index 887c1a965e44..ca18c33c596c 100644
+--- a/drivers/hid/hid-dr.c
++++ b/drivers/hid/hid-dr.c
+@@ -87,13 +87,19 @@ static int drff_init(struct hid_device *hid)
+ {
+ 	struct drff_device *drff;
+ 	struct hid_report *report;
+-	struct hid_input *hidinput = list_first_entry(&hid->inputs,
+-						struct hid_input, list);
++	struct hid_input *hidinput;
+ 	struct list_head *report_list =
+ 			&hid->report_enum[HID_OUTPUT_REPORT].report_list;
+-	struct input_dev *dev = hidinput->input;
++	struct input_dev *dev;
+ 	int error;
+ 
++	if (list_empty(&hid->inputs)) {
++		hid_err(hid, "no inputs found\n");
++		return -ENODEV;
++	}
++	hidinput = list_first_entry(&hid->inputs, struct hid_input, list);
++	dev = hidinput->input;
++
+ 	if (list_empty(report_list)) {
+ 		hid_err(hid, "no output reports found\n");
+ 		return -ENODEV;
+diff --git a/drivers/hid/hid-emsff.c b/drivers/hid/hid-emsff.c
+index d82d75bb11f7..80f9a02dfa69 100644
+--- a/drivers/hid/hid-emsff.c
++++ b/drivers/hid/hid-emsff.c
+@@ -59,13 +59,19 @@ static int emsff_init(struct hid_device *hid)
+ {
+ 	struct emsff_device *emsff;
+ 	struct hid_report *report;
+-	struct hid_input *hidinput = list_first_entry(&hid->inputs,
+-						struct hid_input, list);
++	struct hid_input *hidinput;
+ 	struct list_head *report_list =
+ 			&hid->report_enum[HID_OUTPUT_REPORT].report_list;
+-	struct input_dev *dev = hidinput->input;
++	struct input_dev *dev;
+ 	int error;
+ 
++	if (list_empty(&hid->inputs)) {
++		hid_err(hid, "no inputs found\n");
++		return -ENODEV;
++	}
++	hidinput = list_first_entry(&hid->inputs, struct hid_input, list);
++	dev = hidinput->input;
++
+ 	if (list_empty(report_list)) {
+ 		hid_err(hid, "no output reports found\n");
+ 		return -ENODEV;
+diff --git a/drivers/hid/hid-gaff.c b/drivers/hid/hid-gaff.c
+index 2d8cead3adca..5a02c50443cb 100644
+--- a/drivers/hid/hid-gaff.c
++++ b/drivers/hid/hid-gaff.c
+@@ -77,14 +77,20 @@ static int gaff_init(struct hid_device *hid)
+ {
+ 	struct gaff_device *gaff;
+ 	struct hid_report *report;
+-	struct hid_input *hidinput = list_entry(hid->inputs.next,
+-						struct hid_input, list);
++	struct hid_input *hidinput;
+ 	struct list_head *report_list =
+ 			&hid->report_enum[HID_OUTPUT_REPORT].report_list;
+ 	struct list_head *report_ptr = report_list;
+-	struct input_dev *dev = hidinput->input;
++	struct input_dev *dev;
+ 	int error;
+ 
++	if (list_empty(&hid->inputs)) {
++		hid_err(hid, "no inputs found\n");
++		return -ENODEV;
++	}
++	hidinput = list_entry(hid->inputs.next, struct hid_input, list);
++	dev = hidinput->input;
++
+ 	if (list_empty(report_list)) {
+ 		hid_err(hid, "no output reports found\n");
+ 		return -ENODEV;
+diff --git a/drivers/hid/hid-holtekff.c b/drivers/hid/hid-holtekff.c
+index 9a8f05124525..c6f9942142f8 100644
+--- a/drivers/hid/hid-holtekff.c
++++ b/drivers/hid/hid-holtekff.c
+@@ -140,13 +140,19 @@ static int holtekff_init(struct hid_device *hid)
+ {
+ 	struct holtekff_device *holtekff;
+ 	struct hid_report *report;
+-	struct hid_input *hidinput = list_entry(hid->inputs.next,
+-						struct hid_input, list);
++	struct hid_input *hidinput;
+ 	struct list_head *report_list =
+ 			&hid->report_enum[HID_OUTPUT_REPORT].report_list;
+-	struct input_dev *dev = hidinput->input;
++	struct input_dev *dev;
+ 	int error;
+ 
++	if (list_empty(&hid->inputs)) {
++		hid_err(hid, "no inputs found\n");
++		return -ENODEV;
++	}
++	hidinput = list_entry(hid->inputs.next, struct hid_input, list);
++	dev = hidinput->input;
++
+ 	if (list_empty(report_list)) {
+ 		hid_err(hid, "no output report found\n");
+ 		return -ENODEV;
+diff --git a/drivers/hid/hid-lg2ff.c b/drivers/hid/hid-lg2ff.c
+index 0e3fb1a7e421..6909d9c2fc67 100644
+--- a/drivers/hid/hid-lg2ff.c
++++ b/drivers/hid/hid-lg2ff.c
+@@ -62,11 +62,17 @@ int lg2ff_init(struct hid_device *hid)
+ {
+ 	struct lg2ff_device *lg2ff;
+ 	struct hid_report *report;
+-	struct hid_input *hidinput = list_entry(hid->inputs.next,
+-						struct hid_input, list);
+-	struct input_dev *dev = hidinput->input;
++	struct hid_input *hidinput;
++	struct input_dev *dev;
+ 	int error;
+ 
++	if (list_empty(&hid->inputs)) {
++		hid_err(hid, "no inputs found\n");
++		return -ENODEV;
++	}
++	hidinput = list_entry(hid->inputs.next, struct hid_input, list);
++	dev = hidinput->input;
++
+ 	/* Check that the report looks ok */
+ 	report = hid_validate_values(hid, HID_OUTPUT_REPORT, 0, 0, 7);
+ 	if (!report)
+diff --git a/drivers/hid/hid-lg3ff.c b/drivers/hid/hid-lg3ff.c
+index 8c2da183d3bc..acf739fc4060 100644
+--- a/drivers/hid/hid-lg3ff.c
++++ b/drivers/hid/hid-lg3ff.c
+@@ -129,12 +129,19 @@ static const signed short ff3_joystick_ac[] = {
+ 
+ int lg3ff_init(struct hid_device *hid)
+ {
+-	struct hid_input *hidinput = list_entry(hid->inputs.next, struct hid_input, list);
+-	struct input_dev *dev = hidinput->input;
++	struct hid_input *hidinput;
++	struct input_dev *dev;
+ 	const signed short *ff_bits = ff3_joystick_ac;
+ 	int error;
+ 	int i;
+ 
++	if (list_empty(&hid->inputs)) {
++		hid_err(hid, "no inputs found\n");
++		return -ENODEV;
++	}
++	hidinput = list_entry(hid->inputs.next, struct hid_input, list);
++	dev = hidinput->input;
++
+ 	/* Check that the report looks ok */
+ 	if (!hid_validate_values(hid, HID_OUTPUT_REPORT, 0, 0, 35))
+ 		return -ENODEV;
+* Unmerged path drivers/hid/hid-lg4ff.c
+diff --git a/drivers/hid/hid-lgff.c b/drivers/hid/hid-lgff.c
+index e1394af0ae7b..1871cdcd1e0a 100644
+--- a/drivers/hid/hid-lgff.c
++++ b/drivers/hid/hid-lgff.c
+@@ -127,12 +127,19 @@ static void hid_lgff_set_autocenter(struct input_dev *dev, u16 magnitude)
+ 
+ int lgff_init(struct hid_device* hid)
+ {
+-	struct hid_input *hidinput = list_entry(hid->inputs.next, struct hid_input, list);
+-	struct input_dev *dev = hidinput->input;
++	struct hid_input *hidinput;
++	struct input_dev *dev;
+ 	const signed short *ff_bits = ff_joystick;
+ 	int error;
+ 	int i;
+ 
++	if (list_empty(&hid->inputs)) {
++		hid_err(hid, "no inputs found\n");
++		return -ENODEV;
++	}
++	hidinput = list_entry(hid->inputs.next, struct hid_input, list);
++	dev = hidinput->input;
++
+ 	/* Check that the report looks ok */
+ 	if (!hid_validate_values(hid, HID_OUTPUT_REPORT, 0, 0, 7))
+ 		return -ENODEV;
+* Unmerged path drivers/hid/hid-logitech-hidpp.c
+* Unmerged path drivers/hid/hid-microsoft.c
+* Unmerged path drivers/hid/hid-sony.c
+diff --git a/drivers/hid/hid-tmff.c b/drivers/hid/hid-tmff.c
+index b83376077d72..9e908d94cc4c 100644
+--- a/drivers/hid/hid-tmff.c
++++ b/drivers/hid/hid-tmff.c
+@@ -126,12 +126,18 @@ static int tmff_init(struct hid_device *hid, const signed short *ff_bits)
+ 	struct tmff_device *tmff;
+ 	struct hid_report *report;
+ 	struct list_head *report_list;
+-	struct hid_input *hidinput = list_entry(hid->inputs.next,
+-							struct hid_input, list);
+-	struct input_dev *input_dev = hidinput->input;
++	struct hid_input *hidinput;
++	struct input_dev *input_dev;
+ 	int error;
+ 	int i;
+ 
++	if (list_empty(&hid->inputs)) {
++		hid_err(hid, "no inputs found\n");
++		return -ENODEV;
++	}
++	hidinput = list_entry(hid->inputs.next, struct hid_input, list);
++	input_dev = hidinput->input;
++
+ 	tmff = kzalloc(sizeof(struct tmff_device), GFP_KERNEL);
+ 	if (!tmff)
+ 		return -ENOMEM;
+diff --git a/drivers/hid/hid-zpff.c b/drivers/hid/hid-zpff.c
+index a29756c6ca02..4e7e01be99b1 100644
+--- a/drivers/hid/hid-zpff.c
++++ b/drivers/hid/hid-zpff.c
+@@ -66,11 +66,17 @@ static int zpff_init(struct hid_device *hid)
+ {
+ 	struct zpff_device *zpff;
+ 	struct hid_report *report;
+-	struct hid_input *hidinput = list_entry(hid->inputs.next,
+-						struct hid_input, list);
+-	struct input_dev *dev = hidinput->input;
++	struct hid_input *hidinput;
++	struct input_dev *dev;
+ 	int i, error;
+ 
++	if (list_empty(&hid->inputs)) {
++		hid_err(hid, "no inputs found\n");
++		return -ENODEV;
++	}
++	hidinput = list_entry(hid->inputs.next, struct hid_input, list);
++	dev = hidinput->input;
++
+ 	for (i = 0; i < 4; i++) {
+ 		report = hid_validate_values(hid, HID_OUTPUT_REPORT, 0, i, 1);
+ 		if (!report)
