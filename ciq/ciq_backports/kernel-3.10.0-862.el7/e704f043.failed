@@ -1,0 +1,224 @@
+ibmvnic: Remove debugfs support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Nathan Fontenot <nfont@linux.vnet.ibm.com>
+commit e704f0434ea60adedc07c847b46910d4840a7ecf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e704f043.failed
+
+The debugfs support in the ibmvnic driver is not, and never has been,
+supported. Just remove it.
+
+The work done in the debugfs code for the driver was part of the original
+spec for the ibmvnic driver. The corresponding support for this from the
+server side was never supported and has been dropped.
+
+	Signed-off-by: Nathan Fontenot <nfont@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e704f0434ea60adedc07c847b46910d4840a7ecf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index 6a325c61534d,1e8ba784ec92..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -538,6 -590,50 +537,53 @@@ static int ibmvnic_close(struct net_dev
+  		adapter->bounce_buffer = NULL;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	tx_scrqs = be32_to_cpu(adapter->login_rsp_buf->num_txsubm_subcrqs);
++ 	for (i = 0; i < tx_scrqs; i++) {
++ 		struct ibmvnic_tx_pool *tx_pool = &adapter->tx_pool[i];
++ 
++ 		kfree(tx_pool->tx_buff);
++ 		free_long_term_buff(adapter, &tx_pool->long_term_buff);
++ 		kfree(tx_pool->free_map);
++ 	}
++ 	kfree(adapter->tx_pool);
++ 	adapter->tx_pool = NULL;
++ 
++ 	rx_scrqs = be32_to_cpu(adapter->login_rsp_buf->num_rxadd_subcrqs);
++ 	for (i = 0; i < rx_scrqs; i++) {
++ 		struct ibmvnic_rx_pool *rx_pool = &adapter->rx_pool[i];
++ 
++ 		free_rx_pool(adapter, rx_pool);
++ 		free_long_term_buff(adapter, &rx_pool->long_term_buff);
++ 	}
++ 	kfree(adapter->rx_pool);
++ 	adapter->rx_pool = NULL;
++ 
++ 	release_sub_crqs(adapter);
++ 	ibmvnic_release_crq_queue(adapter);
++ 
++ 	if (adapter->stats_token)
++ 		dma_unmap_single(dev, adapter->stats_token,
++ 				 sizeof(struct ibmvnic_statistics),
++ 				 DMA_FROM_DEVICE);
++ }
++ 
++ static int ibmvnic_close(struct net_device *netdev)
++ {
++ 	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
++ 	union ibmvnic_crq crq;
++ 	int i;
++ 
++ 	adapter->closing = true;
++ 
++ 	for (i = 0; i < adapter->req_rx_queues; i++)
++ 		napi_disable(&adapter->napi[i]);
++ 
++ 	if (!adapter->failover)
++ 		netif_tx_stop_all_queues(netdev);
++ 
+++>>>>>>> e704f0434ea6 (ibmvnic: Remove debugfs support)
+  	memset(&crq, 0, sizeof(crq));
+  	crq.logical_link_state.first = IBMVNIC_CRQ_CMD;
+  	crq.logical_link_state.cmd = LOGICAL_LINK_STATE;
+@@@ -3426,27 -2962,8 +2934,9 @@@ static void ibmvnic_handle_crq(union ib
+  		dma_unmap_single(dev, adapter->ip_offload_ctrl_tok,
+  				 sizeof(adapter->ip_offload_ctrl),
+  				 DMA_TO_DEVICE);
+ -		complete(&adapter->init_done);
+ +		/* We're done with the queries, perform the login */
+ +		send_login(adapter);
+  		break;
+- 	case REQUEST_RAS_COMP_NUM_RSP:
+- 		netdev_dbg(netdev, "Got Request RAS Comp Num Response\n");
+- 		if (crq->request_ras_comp_num_rsp.rc.code == 10) {
+- 			netdev_dbg(netdev, "Request RAS Comp Num not supported\n");
+- 			break;
+- 		}
+- 		adapter->ras_comp_num =
+- 		    be32_to_cpu(crq->request_ras_comp_num_rsp.num_components);
+- 		handle_request_ras_comp_num_rsp(crq, adapter);
+- 		break;
+- 	case REQUEST_RAS_COMPS_RSP:
+- 		netdev_dbg(netdev, "Got Request RAS Comps Response\n");
+- 		handle_request_ras_comps_rsp(crq, adapter);
+- 		break;
+- 	case CONTROL_RAS_RSP:
+- 		netdev_dbg(netdev, "Got Control RAS Response\n");
+- 		handle_control_ras_rsp(crq, adapter);
+- 		break;
+  	case COLLECT_FW_TRACE_RSP:
+  		netdev_dbg(netdev, "Got Collect firmware trace Response\n");
+  		complete(&adapter->fw_done);
+@@@ -3758,9 -3216,40 +3209,44 @@@ task_failed
+  	dev_err(dev, "Passive initialization was not successful\n");
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int ibmvnic_init(struct ibmvnic_adapter *adapter)
++ {
++ 	struct device *dev = &adapter->vdev->dev;
++ 	unsigned long timeout = msecs_to_jiffies(30000);
++ 	int rc;
++ 
++ 	rc = ibmvnic_init_crq_queue(adapter);
++ 	if (rc) {
++ 		dev_err(dev, "Couldn't initialize crq. rc=%d\n", rc);
++ 		return rc;
++ 	}
++ 
++ 	adapter->stats_token = dma_map_single(dev, &adapter->stats,
++ 				      sizeof(struct ibmvnic_statistics),
++ 				      DMA_FROM_DEVICE);
++ 	if (dma_mapping_error(dev, adapter->stats_token)) {
++ 		ibmvnic_release_crq_queue(adapter);
++ 		dev_err(dev, "Couldn't map stats buffer\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	init_completion(&adapter->init_done);
++ 	ibmvnic_send_crq_init(adapter);
++ 	if (!wait_for_completion_timeout(&adapter->init_done, timeout)) {
++ 		dev_err(dev, "Initialization sequence timed out\n");
++ 		ibmvnic_release_crq_queue(adapter);
++ 		return -1;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> e704f0434ea6 (ibmvnic: Remove debugfs support)
+  static int ibmvnic_probe(struct vio_dev *dev, const struct vio_device_id *id)
+  {
+ +	unsigned long timeout = msecs_to_jiffies(30000);
+  	struct ibmvnic_adapter *adapter;
+  	struct net_device *netdev;
+  	unsigned char *mac_addr_p;
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
+diff --git a/drivers/net/ethernet/ibm/ibmvnic.h b/drivers/net/ethernet/ibm/ibmvnic.h
+index 5fd2788823f6..635cd77f6d46 100644
+--- a/drivers/net/ethernet/ibm/ibmvnic.h
++++ b/drivers/net/ethernet/ibm/ibmvnic.h
+@@ -772,20 +772,10 @@ enum ibmvnic_commands {
+ 	ERROR_INDICATION = 0x08,
+ 	REQUEST_ERROR_INFO = 0x09,
+ 	REQUEST_ERROR_RSP = 0x89,
+-	REQUEST_DUMP_SIZE = 0x0A,
+-	REQUEST_DUMP_SIZE_RSP = 0x8A,
+-	REQUEST_DUMP = 0x0B,
+-	REQUEST_DUMP_RSP = 0x8B,
+ 	LOGICAL_LINK_STATE = 0x0C,
+ 	LOGICAL_LINK_STATE_RSP = 0x8C,
+ 	REQUEST_STATISTICS = 0x0D,
+ 	REQUEST_STATISTICS_RSP = 0x8D,
+-	REQUEST_RAS_COMP_NUM = 0x0E,
+-	REQUEST_RAS_COMP_NUM_RSP = 0x8E,
+-	REQUEST_RAS_COMPS = 0x0F,
+-	REQUEST_RAS_COMPS_RSP = 0x8F,
+-	CONTROL_RAS = 0x10,
+-	CONTROL_RAS_RSP = 0x90,
+ 	COLLECT_FW_TRACE = 0x11,
+ 	COLLECT_FW_TRACE_RSP = 0x91,
+ 	LINK_STATE_INDICATION = 0x12,
+@@ -806,8 +796,6 @@ enum ibmvnic_commands {
+ 	ACL_CHANGE_INDICATION = 0x1A,
+ 	ACL_QUERY = 0x1B,
+ 	ACL_QUERY_RSP = 0x9B,
+-	REQUEST_DEBUG_STATS = 0x1C,
+-	REQUEST_DEBUG_STATS_RSP = 0x9C,
+ 	QUERY_MAP = 0x1D,
+ 	QUERY_MAP_RSP = 0x9D,
+ 	REQUEST_MAP = 0x1E,
+@@ -925,13 +913,6 @@ struct ibmvnic_error_buff {
+ 	__be32 error_id;
+ };
+ 
+-struct ibmvnic_fw_comp_internal {
+-	struct ibmvnic_adapter *adapter;
+-	int num;
+-	struct debugfs_blob_wrapper desc_blob;
+-	int paused;
+-};
+-
+ struct ibmvnic_inflight_cmd {
+ 	union ibmvnic_crq crq;
+ 	struct list_head list;
+@@ -995,18 +976,7 @@ struct ibmvnic_adapter {
+ 	struct list_head errors;
+ 	spinlock_t error_list_lock;
+ 
+-	/* debugfs */
+-	struct dentry *debugfs_dir;
+-	struct dentry *debugfs_dump;
+ 	struct completion fw_done;
+-	char *dump_data;
+-	dma_addr_t dump_data_token;
+-	int dump_data_size;
+-	int ras_comp_num;
+-	struct ibmvnic_fw_component *ras_comps;
+-	struct ibmvnic_fw_comp_internal *ras_comp_int;
+-	dma_addr_t ras_comps_tok;
+-	struct dentry *ras_comps_ent;
+ 
+ 	/* in-flight commands that allocate and/or map memory*/
+ 	struct list_head inflight;
