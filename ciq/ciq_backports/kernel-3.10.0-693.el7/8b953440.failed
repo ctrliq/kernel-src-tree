@@ -1,0 +1,157 @@
+KVM: x86: do not go through vcpu in __get_kvmclock_ns
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 8b9534406456313beb7bf9051150b50c63049ab7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8b953440.failed
+
+Going through the first VCPU is wrong if you follow a KVM_SET_CLOCK with
+a KVM_GET_CLOCK immediately after, without letting the VCPU run and
+call kvm_guest_time_update.
+
+To fix this, compute the kvmclock value ourselves, using the master
+clock (tsc, nsec) pair as the base and the host CPU frequency as
+the scale.
+
+	Reported-by: Marcelo Tosatti <mtosatti@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+	Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+(cherry picked from commit 8b9534406456313beb7bf9051150b50c63049ab7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index 4d5a959967aa,7d3d9d4d6124..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -1698,9 -1722,96 +1698,10 @@@ static void kvm_gen_update_masterclock(
+  #endif
+  }
+  
+ -static u64 __get_kvmclock_ns(struct kvm *kvm)
+ -{
+ -	struct kvm_arch *ka = &kvm->arch;
+ -	struct pvclock_vcpu_time_info hv_clock;
+ -
+ -	spin_lock(&ka->pvclock_gtod_sync_lock);
+ -	if (!ka->use_master_clock) {
+ -		spin_unlock(&ka->pvclock_gtod_sync_lock);
+ -		return ktime_get_boot_ns() + ka->kvmclock_offset;
+ -	}
+ -
+ -	hv_clock.tsc_timestamp = ka->master_cycle_now;
+ -	hv_clock.system_time = ka->master_kernel_ns + ka->kvmclock_offset;
+ -	spin_unlock(&ka->pvclock_gtod_sync_lock);
+ -
+ -	kvm_get_time_scale(NSEC_PER_SEC, __this_cpu_read(cpu_tsc_khz) * 1000LL,
+ -			   &hv_clock.tsc_shift,
+ -			   &hv_clock.tsc_to_system_mul);
+ -	return __pvclock_read_cycles(&hv_clock, rdtsc());
+ -}
+ -
+ -u64 get_kvmclock_ns(struct kvm *kvm)
+ -{
+ -	unsigned long flags;
+ -	s64 ns;
+ -
+ -	local_irq_save(flags);
+ -	ns = __get_kvmclock_ns(kvm);
+ -	local_irq_restore(flags);
+ -
+ -	return ns;
+ -}
+ -
+ -static void kvm_setup_pvclock_page(struct kvm_vcpu *v)
+ -{
+ -	struct kvm_vcpu_arch *vcpu = &v->arch;
+ -	struct pvclock_vcpu_time_info guest_hv_clock;
+ -
+ -	if (unlikely(kvm_read_guest_cached(v->kvm, &vcpu->pv_time,
+ -		&guest_hv_clock, sizeof(guest_hv_clock))))
+ -		return;
+ -
+ -	/* This VCPU is paused, but it's legal for a guest to read another
+ -	 * VCPU's kvmclock, so we really have to follow the specification where
+ -	 * it says that version is odd if data is being modified, and even after
+ -	 * it is consistent.
+ -	 *
+ -	 * Version field updates must be kept separate.  This is because
+ -	 * kvm_write_guest_cached might use a "rep movs" instruction, and
+ -	 * writes within a string instruction are weakly ordered.  So there
+ -	 * are three writes overall.
+ -	 *
+ -	 * As a small optimization, only write the version field in the first
+ -	 * and third write.  The vcpu->pv_time cache is still valid, because the
+ -	 * version field is the first in the struct.
+ -	 */
+ -	BUILD_BUG_ON(offsetof(struct pvclock_vcpu_time_info, version) != 0);
+ -
+ -	vcpu->hv_clock.version = guest_hv_clock.version + 1;
+ -	kvm_write_guest_cached(v->kvm, &vcpu->pv_time,
+ -				&vcpu->hv_clock,
+ -				sizeof(vcpu->hv_clock.version));
+ -
+ -	smp_wmb();
+ -
+ -	/* retain PVCLOCK_GUEST_STOPPED if set in guest copy */
+ -	vcpu->hv_clock.flags |= (guest_hv_clock.flags & PVCLOCK_GUEST_STOPPED);
+ -
+ -	if (vcpu->pvclock_set_guest_stopped_request) {
+ -		vcpu->hv_clock.flags |= PVCLOCK_GUEST_STOPPED;
+ -		vcpu->pvclock_set_guest_stopped_request = false;
+ -	}
+ -
+ -	trace_kvm_pvclock_update(v->vcpu_id, &vcpu->hv_clock);
+ -
+ -	kvm_write_guest_cached(v->kvm, &vcpu->pv_time,
+ -				&vcpu->hv_clock,
+ -				sizeof(vcpu->hv_clock));
+ -
+ -	smp_wmb();
+ -
+ -	vcpu->hv_clock.version++;
+ -	kvm_write_guest_cached(v->kvm, &vcpu->pv_time,
+ -				&vcpu->hv_clock,
+ -				sizeof(vcpu->hv_clock.version));
+ -}
+ -
+  static int kvm_guest_time_update(struct kvm_vcpu *v)
+  {
+ -	unsigned long flags, tgt_tsc_khz;
+++<<<<<<< HEAD
+ +	unsigned long flags, this_tsc_khz, tgt_tsc_khz;
+  	struct kvm_vcpu_arch *vcpu = &v->arch;
+  	struct kvm_arch *ka = &v->kvm->arch;
+  	s64 kernel_ns;
+@@@ -1738,6 -1848,6 +1739,26 @@@
+  	}
+  
+  	tsc_timestamp = kvm_read_l1_tsc(v, host_tsc);
+++=======
+++	struct kvm_arch *ka = &kvm->arch;
+++	struct pvclock_vcpu_time_info hv_clock;
+++
+++	spin_lock(&ka->pvclock_gtod_sync_lock);
+++	if (!ka->use_master_clock) {
+++		spin_unlock(&ka->pvclock_gtod_sync_lock);
+++		return ktime_get_boot_ns() + ka->kvmclock_offset;
+++	}
+++
+++	hv_clock.tsc_timestamp = ka->master_cycle_now;
+++	hv_clock.system_time = ka->master_kernel_ns + ka->kvmclock_offset;
+++	spin_unlock(&ka->pvclock_gtod_sync_lock);
+++
+++	kvm_get_time_scale(NSEC_PER_SEC, __this_cpu_read(cpu_tsc_khz) * 1000LL,
+++			   &hv_clock.tsc_shift,
+++			   &hv_clock.tsc_to_system_mul);
+++	return __pvclock_read_cycles(&hv_clock, rdtsc());
+++}
+++>>>>>>> 8b9534406456 (KVM: x86: do not go through vcpu in __get_kvmclock_ns)
+  
+  	/*
+  	 * We may have to catch up the TSC to match elapsed wall clock
+* Unmerged path arch/x86/kvm/x86.c
