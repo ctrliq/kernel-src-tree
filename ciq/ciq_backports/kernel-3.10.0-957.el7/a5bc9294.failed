@@ -1,0 +1,99 @@
+ipv4: ipmr: Don't forward packets already forwarded by hardware
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Yotam Gigi <yotamg@mellanox.com>
+commit a5bc9294d70fe85729bb343eef281ccbe78ff119
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/a5bc9294.failed
+
+Change the ipmr module to not forward packets if:
+ - The packet is marked with the offload_mr_fwd_mark, and
+ - Both input interface and output interface share the same parent ID.
+
+This way, a packet can go through partial multicast forwarding in the
+hardware, where it will be forwarded only to the devices that share the
+same parent ID (AKA, reside inside the same hardware). The kernel will
+forward the packet to all other interfaces.
+
+To do this, add the ipmr_offload_forward helper, which per skb, ingress VIF
+and egress VIF, returns whether the forwarding was offloaded to hardware.
+The ipmr_queue_xmit frees the skb and does not forward it if the result is
+a true value.
+
+All the forwarding path code compiles out when the CONFIG_NET_SWITCHDEV is
+not set.
+
+	Signed-off-by: Yotam Gigi <yotamg@mellanox.com>
+	Reviewed-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Reviewed-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a5bc9294d70fe85729bb343eef281ccbe78ff119)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/ipmr.c
+diff --cc net/ipv4/ipmr.c
+index 7e81f71f5624,b3ee01b0551b..000000000000
+--- a/net/ipv4/ipmr.c
++++ b/net/ipv4/ipmr.c
+@@@ -1691,15 -1856,36 +1691,42 @@@ static inline int ipmr_forward_finish(s
+  	if (unlikely(opt->optlen))
+  		ip_forward_options(skb);
+  
+ -	return dst_output(net, sk, skb);
+ +	return dst_output_sk(sk, skb);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + *	Processing handlers for ipmr_forward
+ + */
+++=======
++ #ifdef CONFIG_NET_SWITCHDEV
++ static bool ipmr_forward_offloaded(struct sk_buff *skb, struct mr_table *mrt,
++ 				   int in_vifi, int out_vifi)
++ {
++ 	struct vif_device *out_vif = &mrt->vif_table[out_vifi];
++ 	struct vif_device *in_vif = &mrt->vif_table[in_vifi];
++ 
++ 	if (!skb->offload_mr_fwd_mark)
++ 		return false;
++ 	if (!out_vif->dev_parent_id.id_len || !in_vif->dev_parent_id.id_len)
++ 		return false;
++ 	return netdev_phys_item_id_same(&out_vif->dev_parent_id,
++ 					&in_vif->dev_parent_id);
++ }
++ #else
++ static bool ipmr_forward_offloaded(struct sk_buff *skb, struct mr_table *mrt,
++ 				   int in_vifi, int out_vifi)
++ {
++ 	return false;
++ }
++ #endif
++ 
++ /* Processing handlers for ipmr_forward */
+++>>>>>>> a5bc9294d70f (ipv4: ipmr: Don't forward packets already forwarded by hardware)
+  
+  static void ipmr_queue_xmit(struct net *net, struct mr_table *mrt,
+- 			    struct sk_buff *skb, struct mfc_cache *c, int vifi)
++ 			    int in_vifi, struct sk_buff *skb,
++ 			    struct mfc_cache *c, int vifi)
+  {
+  	const struct iphdr *iph = ip_hdr(skb);
+  	struct vif_device *vif = &mrt->vif_table[vifi];
+@@@ -1720,8 -1905,10 +1747,11 @@@
+  		ipmr_cache_report(mrt, skb, vifi, IGMPMSG_WHOLEPKT);
+  		goto out_free;
+  	}
+ +#endif
+  
++ 	if (ipmr_forward_offloaded(skb, mrt, in_vifi, vifi))
++ 		goto out_free;
++ 
+  	if (vif->flags & VIFF_TUNNEL) {
+  		rt = ip_route_output_ports(net, &fl4, NULL,
+  					   vif->remote, vif->local,
+* Unmerged path net/ipv4/ipmr.c
