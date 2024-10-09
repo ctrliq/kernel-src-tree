@@ -1,0 +1,529 @@
+sched: Transform resched_task() into resched_curr()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Kirill Tkhai <tkhai@yandex.ru>
+commit 8875125efe8402c4d84b08291e68f1281baba8e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8875125e.failed
+
+We always use resched_task() with rq->curr argument.
+It's not possible to reschedule any task but rq's current.
+
+The patch introduces resched_curr(struct rq *) to
+replace all of the repeating patterns. The main aim
+is cleanup, but there is a little size profit too:
+
+  (before)
+	$ size kernel/sched/built-in.o
+	   text	   data	    bss	    dec	    hex	filename
+	155274	  16445	   7042	 178761	  2ba49	kernel/sched/built-in.o
+
+	$ size vmlinux
+	   text	   data	    bss	    dec	    hex	filename
+	7411490	1178376	 991232	9581098	 92322a	vmlinux
+
+  (after)
+	$ size kernel/sched/built-in.o
+	   text	   data	    bss	    dec	    hex	filename
+	155130	  16445	   7042	 178617	  2b9b9	kernel/sched/built-in.o
+
+	$ size vmlinux
+	   text	   data	    bss	    dec	    hex	filename
+	7411362	1178376	 991232	9580970	 9231aa	vmlinux
+
+	I was choosing between resched_curr() and resched_rq(),
+	and the first name looks better for me.
+
+A little lie in Documentation/trace/ftrace.txt. I have not
+actually collected the tracing again. With a hope the patch
+won't make execution times much worse :)
+
+	Signed-off-by: Kirill Tkhai <tkhai@yandex.ru>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Randy Dunlap <rdunlap@infradead.org>
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+Link: http://lkml.kernel.org/r/20140628200219.1778.18735.stgit@localhost
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 8875125efe8402c4d84b08291e68f1281baba8e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched.h
+#	kernel/sched/core.c
+#	kernel/sched/deadline.c
+#	kernel/sched/rt.c
+diff --cc include/linux/sched.h
+index 02fc1f8f117b,41a195385081..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -2994,11 -2786,9 +2994,15 @@@ static inline bool __must_check current
+  
+  	/*
+  	 * Polling state must be visible before we test NEED_RESCHED,
+++<<<<<<< HEAD
+ +	 * paired by resched_task()
+ +	 *
+ +	 * XXX: assumes set/clear bit are identical barrier wise.
+++=======
++ 	 * paired by resched_curr()
+++>>>>>>> 8875125efe84 (sched: Transform resched_task() into resched_curr())
+  	 */
+ -	smp_mb__after_atomic();
+ +	smp_mb__after_clear_bit();
+  
+  	return unlikely(tif_need_resched());
+  }
+@@@ -3014,9 -2804,9 +3018,9 @@@ static inline bool __must_check current
+  
+  	/*
+  	 * Polling state must be visible before we test NEED_RESCHED,
+- 	 * paired by resched_task()
++ 	 * paired by resched_curr()
+  	 */
+ -	smp_mb__after_atomic();
+ +	smp_mb__after_clear_bit();
+  
+  	return unlikely(tif_need_resched());
+  }
+@@@ -3036,6 -2826,26 +3040,29 @@@ static inline bool __must_check current
+  }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ static inline void current_clr_polling(void)
++ {
++ 	__current_clr_polling();
++ 
++ 	/*
++ 	 * Ensure we check TIF_NEED_RESCHED after we clear the polling bit.
++ 	 * Once the bit is cleared, we'll get IPIs with every new
++ 	 * TIF_NEED_RESCHED and the IPI handler, scheduler_ipi(), will also
++ 	 * fold.
++ 	 */
++ 	smp_mb(); /* paired with resched_curr() */
++ 
++ 	preempt_fold_need_resched();
++ }
++ 
++ static __always_inline bool need_resched(void)
++ {
++ 	return unlikely(tif_need_resched());
++ }
++ 
+++>>>>>>> 8875125efe84 (sched: Transform resched_task() into resched_curr())
+  /*
+   * Thread group CPU time accounting.
+   */
+diff --cc kernel/sched/core.c
+index 6c5896d873a7,2f960813c582..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -537,72 -588,28 +537,89 @@@ static bool set_nr_if_polling(struct ta
+  #endif
+  #endif
+  
+ +void wake_q_add(struct wake_q_head *head, struct task_struct *task)
+ +{
+ +	struct wake_q_node *node = &task->wake_q;
+ +
+ +	/*
+ +	 * Atomically grab the task, if ->wake_q is !nil already it means
+ +	 * its already queued (either by us or someone else) and will get the
+ +	 * wakeup due to that.
+ +	 *
+ +	 * This cmpxchg() implies a full barrier, which pairs with the write
+ +	 * barrier implied by the wakeup in wake_up_list().
+ +	 */
+ +	if (cmpxchg(&node->next, NULL, WAKE_Q_TAIL))
+ +		return;
+ +
+ +	get_task_struct(task);
+ +
+ +	/*
+ +	 * The head is context local, there can be no concurrency.
+ +	 */
+ +	*head->lastp = node;
+ +	head->lastp = &node->next;
+ +}
+ +
+ +void wake_up_q(struct wake_q_head *head)
+ +{
+ +	struct wake_q_node *node = head->first;
+ +
+ +	while (node != WAKE_Q_TAIL) {
+ +		struct task_struct *task;
+ +
+ +		task = container_of(node, struct task_struct, wake_q);
+ +		BUG_ON(!task);
+ +		/* task can safely be re-inserted now */
+ +		node = node->next;
+ +		task->wake_q.next = NULL;
+ +
+ +		/*
+ +		 * wake_up_process() implies a wmb() to pair with the queueing
+ +		 * in wake_q_add() so as not to miss wakeups.
+ +		 */
+ +		wake_up_process(task);
+ +		put_task_struct(task);
+ +	}
+ +}
+ +
+  /*
+-  * resched_task - mark a task 'to be rescheduled now'.
++  * resched_curr - mark rq's current task 'to be rescheduled now'.
+   *
+   * On UP this means the setting of the need_resched flag, on SMP it
+   * might also involve a cross-CPU call to trigger the scheduler on
+   * the target CPU.
+   */
+++<<<<<<< HEAD
+ +#ifdef CONFIG_SMP
+ +void resched_task(struct task_struct *p)
+++=======
++ void resched_curr(struct rq *rq)
+++>>>>>>> 8875125efe84 (sched: Transform resched_task() into resched_curr())
+  {
++ 	struct task_struct *curr = rq->curr;
+  	int cpu;
+  
+++<<<<<<< HEAD
+ +	assert_raw_spin_locked(&task_rq(p)->lock);
+++=======
++ 	lockdep_assert_held(&rq->lock);
+++>>>>>>> 8875125efe84 (sched: Transform resched_task() into resched_curr())
+  
+- 	if (test_tsk_need_resched(p))
++ 	if (test_tsk_need_resched(curr))
+  		return;
+  
+++<<<<<<< HEAD
+ +	cpu = task_cpu(p);
+ +	if (cpu == smp_processor_id()) {
+ +		set_tsk_need_resched(p);
+++=======
++ 	cpu = cpu_of(rq);
++ 
++ 	if (cpu == smp_processor_id()) {
++ 		set_tsk_need_resched(curr);
++ 		set_preempt_need_resched();
+++>>>>>>> 8875125efe84 (sched: Transform resched_task() into resched_curr())
+  		return;
+  	}
+  
+diff --cc kernel/sched/deadline.c
+index 4913e4fed8f8,df0b77a8caca..000000000000
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@@ -580,62 -528,25 +580,81 @@@ static enum hrtimer_restart dl_task_tim
+  
+  	sched_clock_tick();
+  	update_rq_clock(rq);
+++<<<<<<< HEAD
+ +
+ +	/*
+ +	 * If the throttle happened during sched-out; like:
+ +	 *
+ +	 *   schedule()
+ +	 *     deactivate_task()
+ +	 *       dequeue_task_dl()
+ +	 *         update_curr_dl()
+ +	 *           start_dl_timer()
+ +	 *         __dequeue_task_dl()
+ +	 *     prev->on_rq = 0;
+ +	 *
+ +	 * We can be both throttled and !queued. Replenish the counter
+ +	 * but do not enqueue -- wait for our wakeup to do that.
+ +	 */
+ +	if (!p->on_rq) {
+ +		replenish_dl_entity(dl_se, dl_se);
+ +		goto unlock;
+++=======
++ 	dl_se->dl_throttled = 0;
++ 	dl_se->dl_yielded = 0;
++ 	if (p->on_rq) {
++ 		enqueue_task_dl(rq, p, ENQUEUE_REPLENISH);
++ 		if (task_has_dl_policy(rq->curr))
++ 			check_preempt_curr_dl(rq, p, 0);
++ 		else
++ 			resched_curr(rq);
++ #ifdef CONFIG_SMP
++ 		/*
++ 		 * Queueing this task back might have overloaded rq,
++ 		 * check if we need to kick someone away.
++ 		 */
++ 		if (has_pushable_dl_tasks(rq))
++ 			push_dl_task(rq);
++ #endif
+++>>>>>>> 8875125efe84 (sched: Transform resched_task() into resched_curr())
+  	}
+ +
+ +	enqueue_task_dl(rq, p, ENQUEUE_REPLENISH);
+ +	if (dl_task(rq->curr))
+ +		check_preempt_curr_dl(rq, p, 0);
+ +	else
+ +		resched_task(rq->curr);
+ +
+ +#ifdef CONFIG_SMP
+ +	/*
+ +	 * Perform balancing operations here; after the replenishments.  We
+ +	 * cannot drop rq->lock before this, otherwise the assertion in
+ +	 * start_dl_timer() about not missing updates is not true.
+ +	 *
+ +	 * If we find that the rq the task was on is no longer available, we
+ +	 * need to select a new rq.
+ +	 *
+ +	 * XXX figure out if select_task_rq_dl() deals with offline cpus.
+ +	 */
+ +	if (unlikely(!rq->online))
+ +		rq = dl_task_offline_migration(rq, p);
+ +
+ +	/*
+ +	 * Queueing this task back might have overloaded rq, check if we need
+ +	 * to kick someone away.
+ +	 */
+ +	if (has_pushable_dl_tasks(rq))
+ +		push_dl_task(rq);
+ +#endif
+ +
+  unlock:
+ -	raw_spin_unlock(&rq->lock);
+ +	task_rq_unlock(rq, p, &flags);
+ +
+ +	/*
+ +	 * This can free the task_struct, including this hrtimer, do not touch
+ +	 * anything related to that after this.
+ +	 */
+ +	put_task_struct(p);
+  
+  	return HRTIMER_NORESTART;
+  }
+@@@ -1026,9 -964,11 +1045,9 @@@ static void check_preempt_equal_dl(stru
+  	    cpudl_find(&rq->rd->cpudl, p, NULL) != -1)
+  		return;
+  
+- 	resched_task(rq->curr);
++ 	resched_curr(rq);
+  }
+  
+ -static int pull_dl_task(struct rq *this_rq);
+ -
+  #endif /* CONFIG_SMP */
+  
+  /*
+@@@ -1433,9 -1372,8 +1452,9 @@@ retry
+  	deactivate_task(rq, next_task, 0);
+  	set_task_cpu(next_task, later_rq->cpu);
+  	activate_task(later_rq, next_task, 0);
+ +	ret = 1;
+  
+- 	resched_task(later_rq->curr);
++ 	resched_curr(later_rq);
+  
+  	double_unlock_balance(rq, later_rq);
+  
+@@@ -1737,9 -1639,10 +1756,9 @@@ static void prio_changed_dl(struct rq *
+  		 * or later deadline, so let's blindly set a
+  		 * (maybe not needed) rescheduling point.
+  		 */
+- 		resched_task(p);
++ 		resched_curr(rq);
+  #endif /* CONFIG_SMP */
+ -	} else
+ -		switched_to_dl(rq, p);
+ +	}
+  }
+  
+  const struct sched_class dl_sched_class = {
+diff --cc kernel/sched/rt.c
+index 12441ec4210e,5f6edca4fafd..000000000000
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@@ -434,10 -471,13 +435,10 @@@ static void sched_rt_rq_enqueue(struct 
+  	rt_se = rt_rq->tg->rt_se[cpu];
+  
+  	if (rt_rq->rt_nr_running) {
+ -		if (!rt_se)
+ -			enqueue_top_rt_rq(rt_rq);
+ -		else if (!on_rt_rq(rt_se))
+ +		if (rt_se && !on_rt_rq(rt_se))
+  			enqueue_rt_entity(rt_se, false);
+ -
+  		if (rt_rq->highest_prio.curr < curr->prio)
+- 			resched_task(curr);
++ 			resched_curr(rq);
+  	}
+  }
+  
+@@@ -530,8 -561,13 +531,18 @@@ static inline struct rt_rq *group_rt_rq
+  
+  static inline void sched_rt_rq_enqueue(struct rt_rq *rt_rq)
+  {
+++<<<<<<< HEAD
+ +	if (rt_rq->rt_nr_running)
+ +		resched_task(rq_of_rt_rq(rt_rq)->curr);
+++=======
++ 	struct rq *rq = rq_of_rt_rq(rt_rq);
++ 
++ 	if (!rt_rq->rt_nr_running)
++ 		return;
++ 
++ 	enqueue_top_rt_rq(rt_rq);
++ 	resched_curr(rq);
+++>>>>>>> 8875125efe84 (sched: Transform resched_task() into resched_curr())
+  }
+  
+  static inline void sched_rt_rq_dequeue(struct rt_rq *rt_rq)
+@@@ -1882,10 -1940,10 +1893,10 @@@ static void switched_from_rt(struct rq 
+  		return;
+  
+  	if (pull_rt_task(rq))
+- 		resched_task(rq->curr);
++ 		resched_curr(rq);
+  }
+  
+ -void __init init_sched_rt_class(void)
+ +void init_sched_rt_class(void)
+  {
+  	unsigned int i;
+  
+diff --git a/Documentation/trace/ftrace.txt b/Documentation/trace/ftrace.txt
+index 4501cfe59339..0902e839bebe 100644
+--- a/Documentation/trace/ftrace.txt
++++ b/Documentation/trace/ftrace.txt
+@@ -1516,7 +1516,7 @@ Doing the same with chrt -r 5 and function-trace set.
+   <idle>-0       3d.h4    1us+:      0:120:R   + [003]  2448: 94:R sleep
+   <idle>-0       3d.h4    2us : ttwu_do_activate.constprop.87 <-try_to_wake_up
+   <idle>-0       3d.h3    3us : check_preempt_curr <-ttwu_do_wakeup
+-  <idle>-0       3d.h3    3us : resched_task <-check_preempt_curr
++  <idle>-0       3d.h3    3us : resched_curr <-check_preempt_curr
+   <idle>-0       3dNh3    4us : task_woken_rt <-ttwu_do_wakeup
+   <idle>-0       3dNh3    4us : _raw_spin_unlock <-try_to_wake_up
+   <idle>-0       3dNh3    4us : sub_preempt_count <-_raw_spin_unlock
+* Unmerged path include/linux/sched.h
+* Unmerged path kernel/sched/core.c
+* Unmerged path kernel/sched/deadline.c
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 163712a85701..4af8b78b8398 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -2922,7 +2922,7 @@ check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+ 	ideal_runtime = sched_slice(cfs_rq, curr);
+ 	delta_exec = curr->sum_exec_runtime - curr->prev_sum_exec_runtime;
+ 	if (delta_exec > ideal_runtime) {
+-		resched_task(rq_of(cfs_rq)->curr);
++		resched_curr(rq_of(cfs_rq));
+ 		/*
+ 		 * The current task ran long enough, ensure it doesn't get
+ 		 * re-elected due to buddy favours.
+@@ -2946,7 +2946,7 @@ check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+ 		return;
+ 
+ 	if (delta > ideal_runtime)
+-		resched_task(rq_of(cfs_rq)->curr);
++		resched_curr(rq_of(cfs_rq));
+ }
+ 
+ static void
+@@ -3072,7 +3072,7 @@ entity_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr, int queued)
+ 	 * validating it and just reschedule.
+ 	 */
+ 	if (queued) {
+-		resched_task(rq_of(cfs_rq)->curr);
++		resched_curr(rq_of(cfs_rq));
+ 		return;
+ 	}
+ 	/*
+@@ -3263,7 +3263,7 @@ static void __account_cfs_rq_runtime(struct cfs_rq *cfs_rq, u64 delta_exec)
+ 	 * hierarchy can be throttled
+ 	 */
+ 	if (!assign_cfs_rq_runtime(cfs_rq) && likely(cfs_rq->curr))
+-		resched_task(rq_of(cfs_rq)->curr);
++		resched_curr(rq_of(cfs_rq));
+ }
+ 
+ static __always_inline
+@@ -3421,7 +3421,7 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
+ 
+ 	/* determine whether we need to wake up potentially idle cpu */
+ 	if (rq->curr == rq->idle && rq->cfs.nr_running)
+-		resched_task(rq->curr);
++		resched_curr(rq);
+ }
+ 
+ static u64 distribute_cfs_runtime(struct cfs_bandwidth *cfs_b,
+@@ -3881,7 +3881,7 @@ static void hrtick_start_fair(struct rq *rq, struct task_struct *p)
+ 
+ 		if (delta < 0) {
+ 			if (rq->curr == p)
+-				resched_task(p);
++				resched_curr(rq);
+ 			return;
+ 		}
+ 		hrtick_start(rq, delta);
+@@ -4742,7 +4742,7 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
+ 	return;
+ 
+ preempt:
+-	resched_task(curr);
++	resched_curr(rq);
+ 	/*
+ 	 * Only set the backward buddy when the current task is still
+ 	 * on the rq. This can happen when a wakeup gets interleaved
+@@ -7347,7 +7347,7 @@ static void task_fork_fair(struct task_struct *p)
+ 		 * 'current' within the tree based on its new key value.
+ 		 */
+ 		swap(curr->vruntime, se->vruntime);
+-		resched_task(rq->curr);
++		resched_curr(rq);
+ 	}
+ 
+ 	se->vruntime -= cfs_rq->min_vruntime;
+@@ -7372,7 +7372,7 @@ prio_changed_fair(struct rq *rq, struct task_struct *p, int oldprio)
+ 	 */
+ 	if (rq->curr == p) {
+ 		if (p->prio > oldprio)
+-			resched_task(rq->curr);
++			resched_curr(rq);
+ 	} else
+ 		check_preempt_curr(rq, p, 0);
+ }
+@@ -7429,7 +7429,7 @@ static void switched_to_fair(struct rq *rq, struct task_struct *p)
+ 	 * if we can still preempt the current task.
+ 	 */
+ 	if (rq->curr == p)
+-		resched_task(rq->curr);
++		resched_curr(rq);
+ 	else
+ 		check_preempt_curr(rq, p, 0);
+ }
+diff --git a/kernel/sched/idle_task.c b/kernel/sched/idle_task.c
+index cc4e075fe82e..59cc67dc571a 100644
+--- a/kernel/sched/idle_task.c
++++ b/kernel/sched/idle_task.c
+@@ -30,7 +30,7 @@ static void post_schedule_idle(struct rq *rq)
+  */
+ static void check_preempt_curr_idle(struct rq *rq, struct task_struct *p, int flags)
+ {
+-	resched_task(rq->idle);
++	resched_curr(rq);
+ }
+ 
+ static struct task_struct *pick_next_task_idle(struct rq *rq)
+* Unmerged path kernel/sched/rt.c
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index bbc574cc84b2..3e0ea93b25ef 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1268,7 +1268,7 @@ extern void init_sched_dl_class(void);
+ extern void init_sched_rt_class(void);
+ extern void init_sched_fair_class(void);
+ 
+-extern void resched_task(struct task_struct *p);
++extern void resched_curr(struct rq *rq);
+ extern void resched_cpu(int cpu);
+ 
+ extern struct rt_bandwidth def_rt_bandwidth;
