@@ -1,0 +1,663 @@
+misc: rtsx: Add support for RTS5260
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [misc] rtsx: Add support for RTS5260 (Daniel Bristot de Oliveira) [1457800]
+Rebuild_FUZZ: 90.62%
+commit-author Rui Feng <rui_feng@realsil.com.cn>
+commit 5da4e04ae480aac5274dd020af3dfa21935028f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5da4e04a.failed
+
+Add support for new chip rts5260.
+In order to support rts5260, the definitions of
+some internal registers and workflow have to be
+modified and are different from its predecessors
+and OCP function is added for RTS5260. So we need
+this patch to ensure RTS5260 can work.
+
+	Signed-off-by: Rui Feng <rui_feng@realsil.com.cn>
+	Reviewed-by: Daniel Bristot de Oliveira <bristot@redhat.com>
+	Tested-by: Perry Yuan <perry_yuan@dell.com>
+	Signed-off-by: Lee Jones <lee.jones@linaro.org>
+(cherry picked from commit 5da4e04ae480aac5274dd020af3dfa21935028f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mfd/rts5260.c
+#	drivers/mfd/rts5260.h
+#	drivers/misc/cardreader/Kconfig
+#	drivers/misc/cardreader/Makefile
+* Unmerged path drivers/mfd/rts5260.c
+* Unmerged path drivers/mfd/rts5260.h
+* Unmerged path drivers/misc/cardreader/Kconfig
+* Unmerged path drivers/misc/cardreader/Makefile
+* Unmerged path drivers/mfd/rts5260.c
+* Unmerged path drivers/mfd/rts5260.h
+diff --git a/drivers/mfd/rtsx_pcr.c b/drivers/mfd/rtsx_pcr.c
+index c77a7642abbe..d03e4fe76c21 100644
+--- a/drivers/mfd/rtsx_pcr.c
++++ b/drivers/mfd/rtsx_pcr.c
+@@ -62,6 +62,7 @@ static const struct pci_device_id rtsx_pci_ids[] = {
+ 	{ PCI_DEVICE(0x10EC, 0x5286), PCI_CLASS_OTHERS << 16, 0xFF0000 },
+ 	{ PCI_DEVICE(0x10EC, 0x524A), PCI_CLASS_OTHERS << 16, 0xFF0000 },
+ 	{ PCI_DEVICE(0x10EC, 0x525A), PCI_CLASS_OTHERS << 16, 0xFF0000 },
++	{ PCI_DEVICE(0x10EC, 0x5260), PCI_CLASS_OTHERS << 16, 0xFF0000 },
+ 	{ 0, }
+ };
+ 
+@@ -334,6 +335,9 @@ EXPORT_SYMBOL_GPL(rtsx_pci_read_phy_register);
+ 
+ void rtsx_pci_stop_cmd(struct rtsx_pcr *pcr)
+ {
++	if (pcr->ops->stop_cmd)
++		return pcr->ops->stop_cmd(pcr);
++
+ 	rtsx_pci_writel(pcr, RTSX_HCBCTLR, STOP_CMD);
+ 	rtsx_pci_writel(pcr, RTSX_HDBCTLR, STOP_DMA);
+ 
+@@ -826,7 +830,7 @@ int rtsx_pci_switch_clock(struct rtsx_pcr *pcr, unsigned int card_clock,
+ 		return err;
+ 
+ 	/* Wait SSC clock stable */
+-	udelay(10);
++	udelay(SSC_CLOCK_STABLE_WAIT);
+ 	err = rtsx_pci_write_register(pcr, CLK_CTL, CLK_LOW_FREQ, 0);
+ 	if (err < 0)
+ 		return err;
+@@ -963,6 +967,20 @@ static void rtsx_pci_card_detect(struct work_struct *work)
+ 				pcr->slots[RTSX_MS_CARD].p_dev);
+ }
+ 
++void rtsx_pci_process_ocp(struct rtsx_pcr *pcr)
++{
++	if (pcr->ops->process_ocp)
++		pcr->ops->process_ocp(pcr);
++}
++
++int rtsx_pci_process_ocp_interrupt(struct rtsx_pcr *pcr)
++{
++	if (pcr->option.ocp_en)
++		rtsx_pci_process_ocp(pcr);
++
++	return 0;
++}
++
+ static irqreturn_t rtsx_pci_isr(int irq, void *dev_id)
+ {
+ 	struct rtsx_pcr *pcr = dev_id;
+@@ -987,6 +1005,9 @@ static irqreturn_t rtsx_pci_isr(int irq, void *dev_id)
+ 
+ 	int_reg &= (pcr->bier | 0x7FFFFF);
+ 
++	if (int_reg & SD_OC_INT)
++		rtsx_pci_process_ocp_interrupt(pcr);
++
+ 	if (int_reg & SD_INT) {
+ 		if (int_reg & SD_EXIST) {
+ 			pcr->card_inserted |= SD_EXIST;
+@@ -1119,6 +1140,102 @@ static void rtsx_pci_power_off(struct rtsx_pcr *pcr, u8 pm_state)
+ }
+ #endif
+ 
++void rtsx_pci_enable_ocp(struct rtsx_pcr *pcr)
++{
++	u8 val = SD_OCP_INT_EN | SD_DETECT_EN;
++
++	if (pcr->ops->enable_ocp)
++		pcr->ops->enable_ocp(pcr);
++	else
++		rtsx_pci_write_register(pcr, REG_OCPCTL, 0xFF, val);
++
++}
++
++void rtsx_pci_disable_ocp(struct rtsx_pcr *pcr)
++{
++	u8 mask = SD_OCP_INT_EN | SD_DETECT_EN;
++
++	if (pcr->ops->disable_ocp)
++		pcr->ops->disable_ocp(pcr);
++	else
++		rtsx_pci_write_register(pcr, REG_OCPCTL, mask, 0);
++}
++
++void rtsx_pci_init_ocp(struct rtsx_pcr *pcr)
++{
++	if (pcr->ops->init_ocp) {
++		pcr->ops->init_ocp(pcr);
++	} else {
++		struct rtsx_cr_option *option = &(pcr->option);
++
++		if (option->ocp_en) {
++			u8 val = option->sd_400mA_ocp_thd;
++
++			rtsx_pci_write_register(pcr, FPDCTL, OC_POWER_DOWN, 0);
++			rtsx_pci_write_register(pcr, REG_OCPPARA1,
++				SD_OCP_TIME_MASK, SD_OCP_TIME_800);
++			rtsx_pci_write_register(pcr, REG_OCPPARA2,
++				SD_OCP_THD_MASK, val);
++			rtsx_pci_write_register(pcr, REG_OCPGLITCH,
++				SD_OCP_GLITCH_MASK, pcr->hw_param.ocp_glitch);
++			rtsx_pci_enable_ocp(pcr);
++		} else {
++			/* OC power down */
++			rtsx_pci_write_register(pcr, FPDCTL, OC_POWER_DOWN,
++				OC_POWER_DOWN);
++		}
++	}
++}
++
++int rtsx_pci_get_ocpstat(struct rtsx_pcr *pcr, u8 *val)
++{
++	if (pcr->ops->get_ocpstat)
++		return pcr->ops->get_ocpstat(pcr, val);
++	else
++		return rtsx_pci_read_register(pcr, REG_OCPSTAT, val);
++}
++
++void rtsx_pci_clear_ocpstat(struct rtsx_pcr *pcr)
++{
++	if (pcr->ops->clear_ocpstat) {
++		pcr->ops->clear_ocpstat(pcr);
++	} else {
++		u8 mask = SD_OCP_INT_CLR | SD_OC_CLR;
++		u8 val = SD_OCP_INT_CLR | SD_OC_CLR;
++
++		rtsx_pci_write_register(pcr, REG_OCPCTL, mask, val);
++		rtsx_pci_write_register(pcr, REG_OCPCTL, mask, 0);
++	}
++}
++
++int sd_power_off_card3v3(struct rtsx_pcr *pcr)
++{
++	rtsx_pci_write_register(pcr, CARD_CLK_EN, SD_CLK_EN |
++		MS_CLK_EN | SD40_CLK_EN, 0);
++	rtsx_pci_write_register(pcr, CARD_OE, SD_OUTPUT_EN, 0);
++
++	rtsx_pci_card_power_off(pcr, RTSX_SD_CARD);
++
++	msleep(50);
++
++	rtsx_pci_card_pull_ctl_disable(pcr, RTSX_SD_CARD);
++
++	return 0;
++}
++
++int ms_power_off_card3v3(struct rtsx_pcr *pcr)
++{
++	rtsx_pci_write_register(pcr, CARD_CLK_EN, SD_CLK_EN |
++		MS_CLK_EN | SD40_CLK_EN, 0);
++
++	rtsx_pci_card_pull_ctl_disable(pcr, RTSX_MS_CARD);
++
++	rtsx_pci_write_register(pcr, CARD_OE, MS_OUTPUT_EN, 0);
++	rtsx_pci_card_power_off(pcr, RTSX_MS_CARD);
++
++	return 0;
++}
++
+ static int rtsx_pci_init_hw(struct rtsx_pcr *pcr)
+ {
+ 	int err;
+@@ -1189,6 +1306,7 @@ static int rtsx_pci_init_hw(struct rtsx_pcr *pcr)
+ 	case PID_5250:
+ 	case PID_524A:
+ 	case PID_525A:
++	case PID_5260:
+ 		rtsx_pci_write_register(pcr, PM_CLK_FORCE_CTL, 1, 1);
+ 		break;
+ 	default:
+@@ -1265,6 +1383,9 @@ static int rtsx_pci_init_chip(struct rtsx_pcr *pcr)
+ 	case 0x5286:
+ 		rtl8402_init_params(pcr);
+ 		break;
++	case 0x5260:
++		rts5260_init_params(pcr);
++		break;
+ 	}
+ 
+ 	pcr_dbg(pcr, "PID: 0x%04x, IC version: 0x%02x\n",
+diff --git a/drivers/mfd/rtsx_pcr.h b/drivers/mfd/rtsx_pcr.h
+index ec784e04fe20..016e85edcd40 100644
+--- a/drivers/mfd/rtsx_pcr.h
++++ b/drivers/mfd/rtsx_pcr.h
+@@ -44,6 +44,8 @@
+ #define ASPM_MASK_NEG		0xFC
+ #define MASK_8_BIT_DEF		0xFF
+ 
++#define SSC_CLOCK_STABLE_WAIT	130
++
+ int __rtsx_pci_write_phy_register(struct rtsx_pcr *pcr, u8 addr, u16 val);
+ int __rtsx_pci_read_phy_register(struct rtsx_pcr *pcr, u8 addr, u16 *val);
+ 
+@@ -57,6 +59,7 @@ void rts5249_init_params(struct rtsx_pcr *pcr);
+ void rts524a_init_params(struct rtsx_pcr *pcr);
+ void rts525a_init_params(struct rtsx_pcr *pcr);
+ void rtl8411b_init_params(struct rtsx_pcr *pcr);
++void rts5260_init_params(struct rtsx_pcr *pcr);
+ 
+ static inline u8 map_sd_drive(int idx)
+ {
+@@ -99,5 +102,12 @@ do {									\
+ int rtsx_gops_pm_reset(struct rtsx_pcr *pcr);
+ int rtsx_set_ltr_latency(struct rtsx_pcr *pcr, u32 latency);
+ int rtsx_set_l1off_sub(struct rtsx_pcr *pcr, u8 val);
++void rtsx_pci_init_ocp(struct rtsx_pcr *pcr);
++void rtsx_pci_disable_ocp(struct rtsx_pcr *pcr);
++void rtsx_pci_enable_ocp(struct rtsx_pcr *pcr);
++int rtsx_pci_get_ocpstat(struct rtsx_pcr *pcr, u8 *val);
++void rtsx_pci_clear_ocpstat(struct rtsx_pcr *pcr);
++int sd_power_off_card3v3(struct rtsx_pcr *pcr);
++int ms_power_off_card3v3(struct rtsx_pcr *pcr);
+ 
+ #endif
+* Unmerged path drivers/misc/cardreader/Kconfig
+* Unmerged path drivers/misc/cardreader/Makefile
+diff --git a/include/linux/mfd/rtsx_pci.h b/include/linux/mfd/rtsx_pci.h
+index 57e23ad1c2bc..d086acca0bb0 100644
+--- a/include/linux/mfd/rtsx_pci.h
++++ b/include/linux/mfd/rtsx_pci.h
+@@ -203,6 +203,7 @@
+ #define   SD_DDR_MODE			0x04
+ #define   SD_30_MODE			0x08
+ #define   SD_CLK_DIVIDE_MASK		0xC0
++#define   SD_MODE_SELECT_MASK		0x0C
+ #define SD_CFG2				0xFDA1
+ #define   SD_CALCULATE_CRC7		0x00
+ #define   SD_NO_CALCULATE_CRC7		0x80
+@@ -226,6 +227,7 @@
+ #define   SD_RSP_TYPE_R6		0x01
+ #define   SD_RSP_TYPE_R7		0x01
+ #define SD_CFG3				0xFDA2
++#define   SD30_CLK_END_EN		0x10
+ #define   SD_RSP_80CLK_TIMEOUT_EN	0x01
+ 
+ #define SD_STAT1			0xFDA3
+@@ -309,6 +311,12 @@
+ 
+ #define SD_DATA_STATE			0xFDB6
+ #define   SD_DATA_IDLE			0x80
++#define REG_SD_STOP_SDCLK_CFG		0xFDB8
++#define   SD30_CLK_STOP_CFG_EN		0x04
++#define   SD30_CLK_STOP_CFG1		0x02
++#define   SD30_CLK_STOP_CFG0		0x01
++#define REG_PRE_RW_MODE			0xFD70
++#define EN_INFINITE_MODE		0x01
+ 
+ #define SRCTL				0xFC13
+ 
+@@ -433,6 +441,7 @@
+ #define CARD_CLK_EN			0xFD69
+ #define   SD_CLK_EN			0x04
+ #define   MS_CLK_EN			0x08
++#define   SD40_CLK_EN		0x10
+ #define SDIO_CTRL			0xFD6B
+ #define CD_PAD_CTL			0xFD73
+ #define   CD_DISABLE_MASK		0x07
+@@ -452,8 +461,8 @@
+ #define FPDCTL				0xFC00
+ #define   SSC_POWER_DOWN		0x01
+ #define   SD_OC_POWER_DOWN		0x02
+-#define   ALL_POWER_DOWN		0x07
+-#define   OC_POWER_DOWN			0x06
++#define   ALL_POWER_DOWN		0x03
++#define   OC_POWER_DOWN			0x02
+ #define PDINFO				0xFC01
+ 
+ #define CLK_CTL				0xFC02
+@@ -489,6 +498,9 @@
+ 
+ #define FPGA_PULL_CTL			0xFC1D
+ #define OLT_LED_CTL			0xFC1E
++#define   LED_SHINE_MASK		0x08
++#define   LED_SHINE_EN			0x08
++#define   LED_SHINE_DISABLE		0x00
+ #define GPIO_CTL			0xFC1F
+ 
+ #define LDO_CTL				0xFC1E
+@@ -510,7 +522,11 @@
+ #define   BPP_LDO_ON			0x00
+ #define   BPP_LDO_SUSPEND		0x02
+ #define   BPP_LDO_OFF			0x03
++#define EFUSE_CTL			0xFC30
++#define EFUSE_ADD			0xFC31
+ #define SYS_VER				0xFC32
++#define EFUSE_DATAL			0xFC34
++#define EFUSE_DATAH			0xFC35
+ 
+ #define CARD_PULL_CTL1			0xFD60
+ #define CARD_PULL_CTL2			0xFD61
+@@ -552,6 +568,9 @@
+ #define RBBC1				0xFE2F
+ #define RBDAT				0xFE30
+ #define RBCTL				0xFE34
++#define   U_AUTO_DMA_EN_MASK		0x20
++#define   U_AUTO_DMA_DISABLE		0x00
++#define   RB_FLUSH			0x80
+ #define CFGADDR0			0xFE35
+ #define CFGADDR1			0xFE36
+ #define CFGDATA0			0xFE37
+@@ -580,6 +599,8 @@
+ #define LTR_LATENCY_MODE_HW		0
+ #define LTR_LATENCY_MODE_SW		BIT(6)
+ #define OBFF_CFG			0xFE4C
++#define   OBFF_EN_MASK			0x03
++#define   OBFF_DISABLE			0x00
+ 
+ #define CDRESUMECTL			0xFE52
+ #define WAKE_SEL_CTL			0xFE54
+@@ -594,6 +615,7 @@
+ #define   FORCE_ASPM_L0_EN		0x01
+ #define   FORCE_ASPM_NO_ASPM		0x00
+ #define PM_CLK_FORCE_CTL		0xFE58
++#define   CLK_PM_EN			0x01
+ #define FUNC_FORCE_CTL			0xFE59
+ #define   FUNC_FORCE_UPME_XMT_DBG	0x02
+ #define PERST_GLITCH_WIDTH		0xFE5C
+@@ -619,14 +641,23 @@
+ #define LDO_PWR_SEL			0xFE78
+ 
+ #define L1SUB_CONFIG1			0xFE8D
++#define   AUX_CLK_ACTIVE_SEL_MASK	0x01
++#define   MAC_CKSW_DONE			0x00
+ #define L1SUB_CONFIG2			0xFE8E
+ #define   L1SUB_AUTO_CFG		0x02
+ #define L1SUB_CONFIG3			0xFE8F
+ #define   L1OFF_MBIAS2_EN_5250		BIT(7)
+ 
+ #define DUMMY_REG_RESET_0		0xFE90
++#define   IC_VERSION_MASK		0x0F
+ 
++#define REG_VREF			0xFE97
++#define   PWD_SUSPND_EN			0x10
++#define RTS5260_DMA_RST_CTL_0		0xFEBF
++#define   RTS5260_DMA_RST		0x80
++#define   RTS5260_ADMA3_RST		0x40
+ #define AUTOLOAD_CFG_BASE		0xFF00
++#define RELINK_TIME_MASK		0x01
+ #define PETXCFG				0xFF03
+ #define FORCE_CLKREQ_DELINK_MASK	BIT(7)
+ #define FORCE_CLKREQ_LOW	0x80
+@@ -666,15 +697,24 @@
+ #define LDO_DV18_CFG			0xFF70
+ #define   LDO_DV18_SR_MASK		0xC0
+ #define   LDO_DV18_SR_DF		0x40
++#define   DV331812_MASK			0x70
++#define   DV331812_33			0x70
++#define   DV331812_17			0x30
+ 
+ #define LDO_CONFIG2			0xFF71
+ #define   LDO_D3318_MASK		0x07
+ #define   LDO_D3318_33V			0x07
+ #define   LDO_D3318_18V			0x02
++#define   DV331812_VDD1			0x04
++#define   DV331812_POWERON		0x08
++#define   DV331812_POWEROFF		0x00
+ 
+ #define LDO_VCC_CFG0			0xFF72
+ #define   LDO_VCC_LMTVTH_MASK		0x30
+ #define   LDO_VCC_LMTVTH_2A		0x10
++/*RTS5260*/
++#define   RTS5260_DVCC_TUNE_MASK	0x70
++#define   RTS5260_DVCC_33		0x70
+ 
+ #define LDO_VCC_CFG1			0xFF73
+ #define   LDO_VCC_REF_TUNE_MASK		0x30
+@@ -683,6 +723,10 @@
+ #define   LDO_VCC_1V8			0x04
+ #define   LDO_VCC_3V3			0x07
+ #define   LDO_VCC_LMT_EN		0x08
++/*RTS5260*/
++#define	  LDO_POW_SDVDD1_MASK		0x08
++#define	  LDO_POW_SDVDD1_ON		0x08
++#define	  LDO_POW_SDVDD1_OFF		0x00
+ 
+ #define LDO_VIO_CFG			0xFF75
+ #define   LDO_VIO_SR_MASK		0xC0
+@@ -710,6 +754,160 @@
+ #define   SD_VIO_LDO_1V8		0x40
+ #define   SD_VIO_LDO_3V3		0x70
+ 
++#define RTS5260_AUTOLOAD_CFG4		0xFF7F
++#define   RTS5260_MIMO_DISABLE		0x8A
++
++#define RTS5260_REG_GPIO_CTL0		0xFC1A
++#define   RTS5260_REG_GPIO_MASK		0x01
++#define   RTS5260_REG_GPIO_ON		0x01
++#define   RTS5260_REG_GPIO_OFF		0x00
++
++#define PWR_GLOBAL_CTRL			0xF200
++#define PCIE_L1_2_EN			0x0C
++#define PCIE_L1_1_EN			0x0A
++#define PCIE_L1_0_EN			0x09
++#define PWR_FE_CTL			0xF201
++#define PCIE_L1_2_PD_FE_EN		0x0C
++#define PCIE_L1_1_PD_FE_EN		0x0A
++#define PCIE_L1_0_PD_FE_EN		0x09
++#define CFG_PCIE_APHY_OFF_0		0xF204
++#define CFG_PCIE_APHY_OFF_0_DEFAULT	0xBF
++#define CFG_PCIE_APHY_OFF_1		0xF205
++#define CFG_PCIE_APHY_OFF_1_DEFAULT	0xFF
++#define CFG_PCIE_APHY_OFF_2		0xF206
++#define CFG_PCIE_APHY_OFF_2_DEFAULT	0x01
++#define CFG_PCIE_APHY_OFF_3		0xF207
++#define CFG_PCIE_APHY_OFF_3_DEFAULT	0x00
++#define CFG_L1_0_PCIE_MAC_RET_VALUE	0xF20C
++#define CFG_L1_0_PCIE_DPHY_RET_VALUE	0xF20E
++#define CFG_L1_0_SYS_RET_VALUE		0xF210
++#define CFG_L1_0_CRC_MISC_RET_VALUE	0xF212
++#define CFG_L1_0_CRC_SD30_RET_VALUE	0xF214
++#define CFG_L1_0_CRC_SD40_RET_VALUE	0xF216
++#define CFG_LP_FPWM_VALUE		0xF219
++#define CFG_LP_FPWM_VALUE_DEFAULT	0x18
++#define PWC_CDR				0xF253
++#define PWC_CDR_DEFAULT			0x03
++#define CFG_L1_0_RET_VALUE_DEFAULT	0x1B
++#define CFG_L1_0_CRC_MISC_RET_VALUE_DEFAULT	0x0C
++
++/* OCPCTL */
++#define SD_DETECT_EN			0x08
++#define SD_OCP_INT_EN			0x04
++#define SD_OCP_INT_CLR			0x02
++#define SD_OC_CLR			0x01
++
++#define SDVIO_DETECT_EN			(1 << 7)
++#define SDVIO_OCP_INT_EN		(1 << 6)
++#define SDVIO_OCP_INT_CLR		(1 << 5)
++#define SDVIO_OC_CLR			(1 << 4)
++
++/* OCPSTAT */
++#define SD_OCP_DETECT			0x08
++#define SD_OC_NOW			0x04
++#define SD_OC_EVER			0x02
++
++#define SDVIO_OC_NOW			(1 << 6)
++#define SDVIO_OC_EVER			(1 << 5)
++
++#define REG_OCPCTL			0xFD6A
++#define REG_OCPSTAT			0xFD6E
++#define REG_OCPGLITCH			0xFD6C
++#define REG_OCPPARA1			0xFD6B
++#define REG_OCPPARA2			0xFD6D
++
++/* rts5260 DV3318 OCP-related registers */
++#define REG_DV3318_OCPCTL		0xFD89
++#define DV3318_OCP_TIME_MASK	0xF0
++#define DV3318_DETECT_EN		0x08
++#define DV3318_OCP_INT_EN		0x04
++#define DV3318_OCP_INT_CLR		0x02
++#define DV3318_OCP_CLR			0x01
++
++#define REG_DV3318_OCPSTAT		0xFD8A
++#define DV3318_OCP_GlITCH_TIME_MASK	0xF0
++#define DV3318_OCP_DETECT		0x08
++#define DV3318_OCP_NOW			0x04
++#define DV3318_OCP_EVER			0x02
++
++#define SD_OCP_GLITCH_MASK		0x0F
++
++/* OCPPARA1 */
++#define SDVIO_OCP_TIME_60		0x00
++#define SDVIO_OCP_TIME_100		0x10
++#define SDVIO_OCP_TIME_200		0x20
++#define SDVIO_OCP_TIME_400		0x30
++#define SDVIO_OCP_TIME_600		0x40
++#define SDVIO_OCP_TIME_800		0x50
++#define SDVIO_OCP_TIME_1100		0x60
++#define SDVIO_OCP_TIME_MASK		0x70
++
++#define SD_OCP_TIME_60			0x00
++#define SD_OCP_TIME_100			0x01
++#define SD_OCP_TIME_200			0x02
++#define SD_OCP_TIME_400			0x03
++#define SD_OCP_TIME_600			0x04
++#define SD_OCP_TIME_800			0x05
++#define SD_OCP_TIME_1100		0x06
++#define SD_OCP_TIME_MASK		0x07
++
++/* OCPPARA2 */
++#define SDVIO_OCP_THD_190		0x00
++#define SDVIO_OCP_THD_250		0x10
++#define SDVIO_OCP_THD_320		0x20
++#define SDVIO_OCP_THD_380		0x30
++#define SDVIO_OCP_THD_440		0x40
++#define SDVIO_OCP_THD_500		0x50
++#define SDVIO_OCP_THD_570		0x60
++#define SDVIO_OCP_THD_630		0x70
++#define SDVIO_OCP_THD_MASK		0x70
++
++#define SD_OCP_THD_450			0x00
++#define SD_OCP_THD_550			0x01
++#define SD_OCP_THD_650			0x02
++#define SD_OCP_THD_750			0x03
++#define SD_OCP_THD_850			0x04
++#define SD_OCP_THD_950			0x05
++#define SD_OCP_THD_1050			0x06
++#define SD_OCP_THD_1150			0x07
++#define SD_OCP_THD_MASK			0x07
++
++#define SDVIO_OCP_GLITCH_MASK		0xF0
++#define SDVIO_OCP_GLITCH_NONE		0x00
++#define SDVIO_OCP_GLITCH_50U		0x10
++#define SDVIO_OCP_GLITCH_100U		0x20
++#define SDVIO_OCP_GLITCH_200U		0x30
++#define SDVIO_OCP_GLITCH_600U		0x40
++#define SDVIO_OCP_GLITCH_800U		0x50
++#define SDVIO_OCP_GLITCH_1M		0x60
++#define SDVIO_OCP_GLITCH_2M		0x70
++#define SDVIO_OCP_GLITCH_3M		0x80
++#define SDVIO_OCP_GLITCH_4M		0x90
++#define SDVIO_OCP_GLIVCH_5M		0xA0
++#define SDVIO_OCP_GLITCH_6M		0xB0
++#define SDVIO_OCP_GLITCH_7M		0xC0
++#define SDVIO_OCP_GLITCH_8M		0xD0
++#define SDVIO_OCP_GLITCH_9M		0xE0
++#define SDVIO_OCP_GLITCH_10M		0xF0
++
++#define SD_OCP_GLITCH_MASK		0x0F
++#define SD_OCP_GLITCH_NONE		0x00
++#define SD_OCP_GLITCH_50U		0x01
++#define SD_OCP_GLITCH_100U		0x02
++#define SD_OCP_GLITCH_200U		0x03
++#define SD_OCP_GLITCH_600U		0x04
++#define SD_OCP_GLITCH_800U		0x05
++#define SD_OCP_GLITCH_1M		0x06
++#define SD_OCP_GLITCH_2M		0x07
++#define SD_OCP_GLITCH_3M		0x08
++#define SD_OCP_GLITCH_4M		0x09
++#define SD_OCP_GLIVCH_5M		0x0A
++#define SD_OCP_GLITCH_6M		0x0B
++#define SD_OCP_GLITCH_7M		0x0C
++#define SD_OCP_GLITCH_8M		0x0D
++#define SD_OCP_GLITCH_9M		0x0E
++#define SD_OCP_GLITCH_10M		0x0F
++
+ /* Phy register */
+ #define PHY_PCR				0x00
+ #define   PHY_PCR_FORCE_CODE		0xB000
+@@ -856,6 +1054,7 @@
+ 
+ #define PCR_ASPM_SETTING_REG1		0x160
+ #define PCR_ASPM_SETTING_REG2		0x168
++#define PCR_ASPM_SETTING_5260		0x178
+ 
+ #define PCR_SETTING_REG1		0x724
+ #define PCR_SETTING_REG2		0x814
+@@ -889,6 +1088,7 @@ struct pcr_ops {
+ 	int		(*conv_clk_and_div_n)(int clk, int dir);
+ 	void		(*fetch_vendor_settings)(struct rtsx_pcr *pcr);
+ 	void		(*force_power_down)(struct rtsx_pcr *pcr, u8 pm_state);
++	void		(*stop_cmd)(struct rtsx_pcr *pcr);
+ 
+ 	void (*set_aspm)(struct rtsx_pcr *pcr, bool enable);
+ 	int (*set_ltr_latency)(struct rtsx_pcr *pcr, u32 latency);
+@@ -896,6 +1096,12 @@ struct pcr_ops {
+ 	void (*set_l1off_cfg_sub_d0)(struct rtsx_pcr *pcr, int active);
+ 	void (*full_on)(struct rtsx_pcr *pcr);
+ 	void (*power_saving)(struct rtsx_pcr *pcr);
++	void (*enable_ocp)(struct rtsx_pcr *pcr);
++	void (*disable_ocp)(struct rtsx_pcr *pcr);
++	void (*init_ocp)(struct rtsx_pcr *pcr);
++	void (*process_ocp)(struct rtsx_pcr *pcr);
++	int (*get_ocpstat)(struct rtsx_pcr *pcr, u8 *val);
++	void (*clear_ocpstat)(struct rtsx_pcr *pcr);
+ };
+ 
+ enum PDEV_STAT  {PDEV_STAT_IDLE, PDEV_STAT_RUN};
+@@ -934,6 +1140,9 @@ enum dev_aspm_mode {
+  * @l1_snooze_delay: l1 snooze delay
+  * @ltr_l1off_sspwrgate: ltr l1off sspwrgate
+  * @ltr_l1off_snooze_sspwrgate: ltr l1off snooze sspwrgate
++ * @ocp_en: enable ocp flag
++ * @sd_400mA_ocp_thd: 400mA ocp thd
++ * @sd_800mA_ocp_thd: 800mA ocp thd
+  */
+ struct rtsx_cr_option {
+ 	u32 dev_flags;
+@@ -948,6 +1157,19 @@ struct rtsx_cr_option {
+ 	u32 l1_snooze_delay;
+ 	u8 ltr_l1off_sspwrgate;
+ 	u8 ltr_l1off_snooze_sspwrgate;
++	bool ocp_en;
++	u8 sd_400mA_ocp_thd;
++	u8 sd_800mA_ocp_thd;
++};
++
++/*
++ * struct rtsx_hw_param  - card reader hardware param
++ * @interrupt_en: indicate which interrutp enable
++ * @ocp_glitch: ocp glitch time
++ */
++struct rtsx_hw_param {
++	u32 interrupt_en;
++	u8 ocp_glitch;
+ };
+ 
+ #define rtsx_set_dev_flag(cr, flag) \
+@@ -962,6 +1184,7 @@ struct rtsx_pcr {
+ 	unsigned int			id;
+ 	int				pcie_cap;
+ 	struct rtsx_cr_option	option;
++	struct rtsx_hw_param hw_param;
+ 
+ 	/* pci resources */
+ 	unsigned long			addr;
+@@ -1041,12 +1264,15 @@ struct rtsx_pcr {
+ 	struct rtsx_slot		*slots;
+ 
+ 	u8				dma_error_count;
++	u8			ocp_stat;
++	u8			ocp_stat2;
+ };
+ 
+ #define PID_524A	0x524A
+-#define PID_5249		0x5249
+-#define PID_5250		0x5250
++#define PID_5249	0x5249
++#define PID_5250	0x5250
+ #define PID_525A	0x525A
++#define PID_5260	0x5260
+ 
+ #define CHK_PCI_PID(pcr, pid)		((pcr)->pci->device == (pid))
+ #define PCI_VID(pcr)			((pcr)->pci->vendor)
