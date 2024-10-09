@@ -188,4 +188,9 @@ static inline int pci_get_hp_params(struct pci_dev *dev,
 }
 static inline bool pciehp_is_native(struct pci_dev *pdev) { return true; }
 #endif
+
+static inline bool hotplug_is_native(struct pci_dev *bridge)
+{
+	return pciehp_is_native(bridge) || shpchp_is_native(bridge);
+}
 #endif
