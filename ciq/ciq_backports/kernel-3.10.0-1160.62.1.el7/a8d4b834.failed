@@ -1,0 +1,172 @@
+introduce __fcheck_files() to fix rcu_dereference_check_fdtable(), kill rcu_my_thread_group_empty()
+
+jira LE-1907
+cve CVE-2021-4083
+Rebuild_History Non-Buildable kernel-3.10.0-1160.62.1.el7
+commit-author Oleg Nesterov <oleg@redhat.com>
+commit a8d4b8345e0ee48b732126d980efaf0dc373e2b0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.62.1.el7/a8d4b834.failed
+
+rcu_dereference_check_fdtable() looks very wrong,
+
+1. rcu_my_thread_group_empty() was added by 844b9a8707f1 "vfs: fix
+   RCU-lockdep false positive due to /proc" but it doesn't really
+   fix the problem. A CLONE_THREAD (without CLONE_FILES) task can
+   hit the same race with get_files_struct().
+
+   And otoh rcu_my_thread_group_empty() can suppress the correct
+   warning if the caller is the CLONE_FILES (without CLONE_THREAD)
+   task.
+
+2. files->count == 1 check is not really right too. Even if this
+   files_struct is not shared it is not safe to access it lockless
+   unless the caller is the owner.
+
+   Otoh, this check is sub-optimal. files->count == 0 always means
+   it is safe to use it lockless even if files != current->files,
+   but put_files_struct() has to take rcu_read_lock(). See the next
+   patch.
+
+This patch removes the buggy checks and turns fcheck_files() into
+__fcheck_files() which uses rcu_dereference_raw(), the "unshared"
+callers, fget_light() and fget_raw_light(), can use it to avoid
+the warning from RCU-lockdep.
+
+fcheck_files() is trivially reimplemented as rcu_lockdep_assert()
+plus __fcheck_files().
+
+	Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit a8d4b8345e0ee48b732126d980efaf0dc373e2b0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/fdtable.h
+diff --cc include/linux/fdtable.h
+index 88d74ca9418f,70e8e21c0a30..000000000000
+--- a/include/linux/fdtable.h
++++ b/include/linux/fdtable.h
+@@@ -66,33 -57,38 +66,52 @@@ struct files_struct 
+  	unsigned long close_on_exec_init[1];
+  	unsigned long open_fds_init[1];
+  	struct file __rcu * fd_array[NR_OPEN_DEFAULT];
+ +	RH_KABI_EXTEND(unsigned long full_fds_bits_init[1])
+ +	RH_KABI_EXTEND(wait_queue_head_t resize_wait)
+  };
+  
+- #define rcu_dereference_check_fdtable(files, fdtfd) \
+- 	(rcu_dereference_check((fdtfd), \
+- 			       lockdep_is_held(&(files)->file_lock) || \
+- 			       atomic_read(&(files)->count) == 1 || \
+- 			       rcu_my_thread_group_empty()))
+- 
+- #define files_fdtable(files) \
+- 		(rcu_dereference_check_fdtable((files), (files)->fdt))
+- 
+  struct file_operations;
+  struct vfsmount;
+  struct dentry;
+  
+++<<<<<<< HEAD
+ +static inline struct file * fcheck_files(struct files_struct *files, unsigned int fd)
+++=======
++ extern void __init files_defer_init(void);
++ 
++ #define rcu_dereference_check_fdtable(files, fdtfd) \
++ 	rcu_dereference_check((fdtfd), lockdep_is_held(&(files)->file_lock))
++ 
++ #define files_fdtable(files) \
++ 	rcu_dereference_check_fdtable((files), (files)->fdt)
++ 
++ /*
++  * The caller must ensure that fd table isn't shared or hold rcu or file lock
++  */
++ static inline struct file *__fcheck_files(struct files_struct *files, unsigned int fd)
+++>>>>>>> a8d4b8345e0e (introduce __fcheck_files() to fix rcu_dereference_check_fdtable(), kill rcu_my_thread_group_empty())
+  {
+- 	struct file * file = NULL;
+- 	struct fdtable *fdt = files_fdtable(files);
++ 	struct fdtable *fdt = rcu_dereference_raw(files->fdt);
+  
+++<<<<<<< HEAD
+ +	if (fd < fdt->max_fds) {
+ +		fd = array_index_nospec(fd, fdt->max_fds);
+ +		file = rcu_dereference_check_fdtable(files, fdt->fd[fd]);
+ +	}
+ +	return file;
+++=======
++ 	if (fd < fdt->max_fds)
++ 		return rcu_dereference_raw(fdt->fd[fd]);
++ 	return NULL;
++ }
++ 
++ static inline struct file *fcheck_files(struct files_struct *files, unsigned int fd)
++ {
++ 	rcu_lockdep_assert(rcu_read_lock_held() ||
++ 			   lockdep_is_held(&files->file_lock),
++ 			   "suspicious rcu_dereference_check() usage");
++ 	return __fcheck_files(files, fd);
+++>>>>>>> a8d4b8345e0e (introduce __fcheck_files() to fix rcu_dereference_check_fdtable(), kill rcu_my_thread_group_empty())
+  }
+  
+  /*
+diff --git a/fs/file.c b/fs/file.c
+index 44bd634b636a..59ce86eed1b5 100644
+--- a/fs/file.c
++++ b/fs/file.c
+@@ -779,7 +779,7 @@ struct file *fget_light(unsigned int fd, int *fput_needed)
+ 
+ 	*fput_needed = 0;
+ 	if (atomic_read(&files->count) == 1) {
+-		file = fcheck_files(files, fd);
++		file = __fcheck_files(files, fd);
+ 		if (file && (file->f_mode & FMODE_PATH))
+ 			file = NULL;
+ 	} else {
+@@ -807,7 +807,7 @@ struct file *fget_raw_light(unsigned int fd, int *fput_needed)
+ 
+ 	*fput_needed = 0;
+ 	if (atomic_read(&files->count) == 1) {
+-		file = fcheck_files(files, fd);
++		file = __fcheck_files(files, fd);
+ 	} else {
+ 		rcu_read_lock();
+ 		file = fcheck_files(files, fd);
+* Unmerged path include/linux/fdtable.h
+diff --git a/include/linux/rcupdate.h b/include/linux/rcupdate.h
+index 74b7be56c0b1..c783ecaf1458 100644
+--- a/include/linux/rcupdate.h
++++ b/include/linux/rcupdate.h
+@@ -483,8 +483,6 @@ static inline int rcu_read_lock_sched_held(void)
+ 
+ #ifdef CONFIG_PROVE_RCU
+ 
+-extern int rcu_my_thread_group_empty(void);
+-
+ /**
+  * rcu_lockdep_assert - emit lockdep splat if specified condition not met
+  * @c: condition to check
+diff --git a/kernel/rcupdate.c b/kernel/rcupdate.c
+index 5f5712d875a9..be8579481f09 100644
+--- a/kernel/rcupdate.c
++++ b/kernel/rcupdate.c
+@@ -216,17 +216,6 @@ void wait_rcu_gp(call_rcu_func_t crf)
+ }
+ EXPORT_SYMBOL_GPL(wait_rcu_gp);
+ 
+-#ifdef CONFIG_PROVE_RCU
+-/*
+- * wrapper function to avoid #include problems.
+- */
+-int rcu_my_thread_group_empty(void)
+-{
+-	return thread_group_empty(current);
+-}
+-EXPORT_SYMBOL_GPL(rcu_my_thread_group_empty);
+-#endif /* #ifdef CONFIG_PROVE_RCU */
+-
+ #ifdef CONFIG_DEBUG_OBJECTS_RCU_HEAD
+ void init_rcu_head(struct rcu_head *head)
+ {
