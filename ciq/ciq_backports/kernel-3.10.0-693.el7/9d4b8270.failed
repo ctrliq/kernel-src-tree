@@ -1,0 +1,168 @@
+fsl/usb: Workarourd for USB erratum-A005697
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Changming Huang <jerry.huang@nxp.com>
+commit 9d4b82706357f2eb23f45309227fc94d11eea255
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/9d4b8270.failed
+
+The EHCI specification states the following in the SUSP bit description:
+In the Suspend state, the port is sensitive to resume detection.
+Note that the bit status does not change until the port is suspended and
+that there may be a delay in suspending a port if there is a transaction
+currently in progress on the USB.
+
+However, in NXP USBDR controller, the PORTSCx[SUSP] bit changes immediately
+when the application sets it and not when the port is actually suspended.
+
+So the application must wait for at least 10 milliseconds after a port
+indicates that it is suspended, to make sure this port has entered
+suspended state before initiating this port resume using the Force Port
+Resume bit. This bit is for NXP controller, not EHCI compatible.
+
+	Signed-off-by: Changming Huang <jerry.huang@nxp.com>
+	Signed-off-by: Ramneek Mehresh <ramneek.mehresh@nxp.com>
+	Acked-by: Alan Stern <stern@rowland.harvard.edu>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 9d4b82706357f2eb23f45309227fc94d11eea255)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/host/ehci-fsl.c
+#	drivers/usb/host/fsl-mph-dr-of.c
+diff --cc drivers/usb/host/ehci-fsl.c
+index 1d866120aa2e,91701cc68082..000000000000
+--- a/drivers/usb/host/ehci-fsl.c
++++ b/drivers/usb/host/ehci-fsl.c
+@@@ -296,11 -275,20 +296,21 @@@ static int ehci_fsl_usb_setup(struct eh
+  
+  		/* Setup Snooping for all the 4GB space */
+  		/* SNOOP1 starts from 0x0, size 2G */
+ -		iowrite32be(0x0 | SNOOP_SIZE_2GB,
+ -			    non_ehci + FSL_SOC_USB_SNOOP1);
+ +		out_be32(non_ehci + FSL_SOC_USB_SNOOP1, 0x0 | SNOOP_SIZE_2GB);
+  		/* SNOOP2 starts from 0x80000000, size 2G */
+ -		iowrite32be(0x80000000 | SNOOP_SIZE_2GB,
+ -			    non_ehci + FSL_SOC_USB_SNOOP2);
+ +		out_be32(non_ehci + FSL_SOC_USB_SNOOP2, 0x80000000 | SNOOP_SIZE_2GB);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Deal with USB erratum A-005275 */
++ 	if (pdata->has_fsl_erratum_a005275 == 1)
++ 		ehci->has_fsl_hs_errata = 1;
++ 
++ 	if (pdata->has_fsl_erratum_a005697 == 1)
++ 		ehci->has_fsl_susp_errata = 1;
++ 
+++>>>>>>> 9d4b82706357 (fsl/usb: Workarourd for USB erratum-A005697)
+  	if ((pdata->operating_mode == FSL_USB2_DR_HOST) ||
+  			(pdata->operating_mode == FSL_USB2_DR_OTG))
+  		if (ehci_fsl_setup_phy(hcd, pdata->phy_mode, 0))
+diff --cc drivers/usb/host/fsl-mph-dr-of.c
+index 11e0b79ff9d5,e90ddb530765..000000000000
+--- a/drivers/usb/host/fsl-mph-dr-of.c
++++ b/drivers/usb/host/fsl-mph-dr-of.c
+@@@ -206,8 -221,23 +206,26 @@@ static int fsl_usb2_mph_dr_of_probe(str
+  	pdata->phy_mode = determine_usb_phy(prop);
+  	pdata->controller_ver = usb_get_ver_info(np);
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Activate Erratum by reading property in device tree */
++ 	pdata->has_fsl_erratum_a007792 =
++ 		of_property_read_bool(np, "fsl,usb-erratum-a007792");
++ 	pdata->has_fsl_erratum_a005275 =
++ 		of_property_read_bool(np, "fsl,usb-erratum-a005275");
++ 	pdata->has_fsl_erratum_a005697 =
++ 		of_property_read_bool(np, "fsl,usb_erratum-a005697");
++ 
++ 	/*
++ 	 * Determine whether phy_clk_valid needs to be checked
++ 	 * by reading property in device tree
++ 	 */
++ 	pdata->check_phy_clk_valid =
++ 		of_property_read_bool(np, "phy-clk-valid");
++ 
+++>>>>>>> 9d4b82706357 (fsl/usb: Workarourd for USB erratum-A005697)
+  	if (pdata->have_sysif_regs) {
+ -		if (pdata->controller_ver == FSL_USB_VER_NONE) {
+ +		if (pdata->controller_ver < 0) {
+  			dev_warn(&ofdev->dev, "Could not get controller version\n");
+  			return -ENODEV;
+  		}
+* Unmerged path drivers/usb/host/ehci-fsl.c
+diff --git a/drivers/usb/host/ehci-hub.c b/drivers/usb/host/ehci-hub.c
+index 74f62d68f013..df169c8e7225 100644
+--- a/drivers/usb/host/ehci-hub.c
++++ b/drivers/usb/host/ehci-hub.c
+@@ -310,6 +310,14 @@ static int ehci_bus_suspend (struct usb_hcd *hcd)
+ 	}
+ 	spin_unlock_irq(&ehci->lock);
+ 
++	if (changed && ehci_has_fsl_susp_errata(ehci))
++		/*
++		 * Wait for at least 10 millisecondes to ensure the controller
++		 * enter the suspend status before initiating a port resume
++		 * using the Force Port Resume bit (Not-EHCI compatible).
++		 */
++		usleep_range(10000, 20000);
++
+ 	if ((changed && ehci->has_tdi_phy_lpm) || fs_idle_delay) {
+ 		/*
+ 		 * Wait for HCD to enter low-power mode or for the bus
+@@ -1200,6 +1208,12 @@ int ehci_hub_control(
+ 					wIndex, (temp1 & HOSTPC_PHCD) ?
+ 					"succeeded" : "failed");
+ 			}
++			if (ehci_has_fsl_susp_errata(ehci)) {
++				/* 10ms for HCD enter suspend */
++				spin_unlock_irqrestore(&ehci->lock, flags);
++				usleep_range(10000, 20000);
++				spin_lock_irqsave(&ehci->lock, flags);
++			}
+ 			set_bit(wIndex, &ehci->suspended_ports);
+ 			break;
+ 		case USB_PORT_FEAT_POWER:
+diff --git a/drivers/usb/host/ehci.h b/drivers/usb/host/ehci.h
+index 3f3b74aeca97..a8e36170d8b8 100644
+--- a/drivers/usb/host/ehci.h
++++ b/drivers/usb/host/ehci.h
+@@ -219,6 +219,7 @@ struct ehci_hcd {			/* one per controller */
+ 	unsigned		no_selective_suspend:1;
+ 	unsigned		has_fsl_port_bug:1; /* FreeScale */
+ 	unsigned		has_fsl_hs_errata:1;	/* Freescale HS quirk */
++	unsigned		has_fsl_susp_errata:1;	/* NXP SUSP quirk */
+ 	unsigned		big_endian_mmio:1;
+ 	unsigned		big_endian_desc:1;
+ 	unsigned		big_endian_capbase:1;
+@@ -709,6 +710,13 @@ ehci_port_speed(struct ehci_hcd *ehci, unsigned int portsc)
+ #define ehci_has_fsl_hs_errata(e)	(0)
+ #endif
+ 
++/*
++ * Some Freescale/NXP processors have an erratum (USB A-005697)
++ * in which we need to wait for 10ms for bus to enter suspend mode
++ * after setting SUSP bit.
++ */
++#define ehci_has_fsl_susp_errata(e)	((e)->has_fsl_susp_errata)
++
+ /*
+  * While most USB host controllers implement their registers in
+  * little-endian format, a minority (celleb companion chip) implement
+* Unmerged path drivers/usb/host/fsl-mph-dr-of.c
+diff --git a/include/linux/fsl_devices.h b/include/linux/fsl_devices.h
+index f2912914141a..60cef8227534 100644
+--- a/include/linux/fsl_devices.h
++++ b/include/linux/fsl_devices.h
+@@ -100,6 +100,7 @@ struct fsl_usb2_platform_data {
+ 	unsigned	already_suspended:1;
+ 	unsigned        has_fsl_erratum_a007792:1;
+ 	unsigned        has_fsl_erratum_a005275:1;
++	unsigned	has_fsl_erratum_a005697:1;
+ 	unsigned        check_phy_clk_valid:1;
+ 
+ 	/* register save area for suspend/resume */
