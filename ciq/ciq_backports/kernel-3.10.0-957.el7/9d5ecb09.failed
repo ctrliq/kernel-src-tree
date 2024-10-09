@@ -1,0 +1,87 @@
+bpf: change back to orig prog on too many passes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 9d5ecb09d525469abd1a10c096cb5a17206523f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/9d5ecb09.failed
+
+If after too many passes still no image could be emitted, then
+swap back to the original program as we do in all other cases
+and don't use the one with blinding.
+
+Fixes: 959a75791603 ("bpf, x86: add support for constant blinding")
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9d5ecb09d525469abd1a10c096cb5a17206523f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/net/bpf_jit_comp.c
+diff --cc arch/x86/net/bpf_jit_comp.c
+index 76c7b3a140ad,bb660e53cbd6..000000000000
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@@ -738,31 -1165,37 +738,40 @@@ cond_branch:			f_offset = addrs[i + fil
+  	}
+  
+  	if (bpf_jit_enable > 1)
+ -		bpf_jit_dump(prog->len, proglen, pass + 1, image);
+ +		bpf_jit_dump(flen, proglen, pass, image);
+  
+  	if (image) {
+++<<<<<<< HEAD
+ +		bpf_flush_icache(image, image + proglen);
+ +		fp->bpf_func = (void *)image;
+++=======
++ 		bpf_flush_icache(header, image + proglen);
++ 		set_memory_ro((unsigned long)header, header->pages);
++ 		prog->bpf_func = (void *)image;
++ 		prog->jited = 1;
++ 	} else {
++ 		prog = orig_prog;
+++>>>>>>> 9d5ecb09d525 (bpf: change back to orig prog on too many passes)
+  	}
+ -
+ -out_addrs:
+ -	kfree(addrs);
+  out:
+ -	if (tmp_blinded)
+ -		bpf_jit_prog_release_other(prog, prog == orig_prog ?
+ -					   tmp : orig_prog);
+ -	return prog;
+ +	kfree(addrs);
+ +	return;
+  }
+  
+ -void bpf_jit_free(struct bpf_prog *fp)
+ +static void jit_free_defer(struct work_struct *arg)
+  {
+ -	unsigned long addr = (unsigned long)fp->bpf_func & PAGE_MASK;
+ -	struct bpf_binary_header *header = (void *)addr;
+ -
+ -	if (!fp->jited)
+ -		goto free_filter;
+ +	module_free(NULL, arg);
+ +}
+  
+ -	set_memory_rw(addr, header->pages);
+ -	bpf_jit_binary_free(header);
+ +/* run from softirq, we must use a work_struct to call
+ + * module_free() from process context
+ + */
+ +void bpf_jit_free(struct sk_filter *fp)
+ +{
+ +	if (fp->bpf_func != sk_run_filter) {
+ +		struct work_struct *work = (struct work_struct *)fp->bpf_func;
+  
+ -free_filter:
+ -	bpf_prog_unlock_free(fp);
+ +		INIT_WORK(work, jit_free_defer);
+ +		schedule_work(work);
+ +	}
+  }
+* Unmerged path arch/x86/net/bpf_jit_comp.c
