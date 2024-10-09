@@ -1,0 +1,496 @@
+ovl: change order of setup in ovl_fill_super()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Miklos Szeredi <mszeredi@redhat.com>
+commit c6fe62549313555ed56b83bb8338383d78e768cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/c6fe6254.failed
+
+Move ovl_get_upper() immediately after ovl_get_upperpath(),
+ovl_get_workdir() immediately after ovl_get_workdir() and
+ovl_get_lower_layers() immediately after ovl_get_lowerstack().
+
+Also move prepare_creds() up to where other allocations are happening.
+
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit c6fe62549313555ed56b83bb8338383d78e768cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/super.c
+diff --cc fs/overlayfs/super.c
+index 19e9eb0f1d4f,c695ea569a99..000000000000
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@@ -870,116 -834,195 +870,125 @@@ static const struct xattr_handler *ovl_
+  	NULL
+  };
+  
+ -static int ovl_get_upperpath(struct ovl_fs *ufs, struct path *upperpath)
+ +static int ovl_fill_super(struct super_block *sb, void *data, int silent)
+  {
+ +	struct path upperpath = { };
+ +	struct path workpath = { };
+ +	struct dentry *root_dentry;
+ +	struct ovl_entry *oe;
+ +	struct ovl_fs *ufs;
+ +	const int *upper_stack_depth;
+ +	int *overlay_stack_depth;
+ +	struct path *stack = NULL;
+ +	char *lowertmp;
+ +	char *lower;
+ +	unsigned int numlower;
+ +	unsigned int stacklen = 0;
+ +	unsigned int i;
+ +	bool remote = false;
+ +	struct cred *cred;
+  	int err;
+  
+ -	err = ovl_mount_dir(ufs->config.upperdir, upperpath);
+ -	if (err)
+ -		goto out;
+ -
+ -	/* Upper fs should not be r/o */
+ -	if (sb_rdonly(upperpath->mnt->mnt_sb)) {
+ -		pr_err("overlayfs: upper fs is r/o, try multi-lower layers mount\n");
+ -		err = -EINVAL;
+ -		goto out;
+ -	}
+ -
+ -	err = ovl_check_namelen(upperpath, ufs, ufs->config.upperdir);
+ -	if (err)
+ -		goto out;
+ -
+ -	err = -EBUSY;
+ -	if (ovl_inuse_trylock(upperpath->dentry)) {
+ -		ufs->upperdir_locked = true;
+ -	} else if (ufs->config.index) {
+ -		pr_err("overlayfs: upperdir is in-use by another mount, mount with '-o index=off' to override exclusive upperdir protection.\n");
+ +	err = -ENOMEM;
+ +	ufs = kzalloc(sizeof(struct ovl_fs), GFP_KERNEL);
+ +	if (!ufs)
+  		goto out;
+ -	} else {
+ -		pr_warn("overlayfs: upperdir is in-use by another mount, accessing files from both mounts will result in undefined behavior.\n");
+ -	}
+ -	err = 0;
+ -out:
+ -	return err;
+ -}
+  
+ -static int ovl_get_workpath(struct ovl_fs *ufs, struct path *upperpath,
+ -			    struct path *workpath)
+ -{
+ -	int err;
+++<<<<<<< HEAD
+++=======
+++	ufs->creator_cred = cred = prepare_creds();
+++	if (!cred)
+++		goto out_err;
++ 
+ -	err = ovl_mount_dir(ufs->config.workdir, workpath);
+++	ufs->config.redirect_dir = ovl_redirect_dir_def;
+++>>>>>>> c6fe62549313 (ovl: change order of setup in ovl_fill_super())
+ +	ufs->config.index = ovl_index_def;
+ +	err = ovl_parse_opt((char *) data, &ufs->config);
+  	if (err)
+ -		goto out;
+ +		goto out_free_config;
+  
+  	err = -EINVAL;
+ -	if (upperpath->mnt != workpath->mnt) {
+ -		pr_err("overlayfs: workdir and upperdir must reside under the same mount\n");
+ -		goto out;
+ -	}
+ -	if (!ovl_workdir_ok(workpath->dentry, upperpath->dentry)) {
+ -		pr_err("overlayfs: workdir and upperdir must be separate subtrees\n");
+ -		goto out;
+ -	}
+ -
+ -	err = -EBUSY;
+ -	if (ovl_inuse_trylock(workpath->dentry)) {
+ -		ufs->workdir_locked = true;
+ -	} else if (ufs->config.index) {
+ -		pr_err("overlayfs: workdir is in-use by another mount, mount with '-o index=off' to override exclusive workdir protection.\n");
+ -		goto out;
+ -	} else {
+ -		pr_warn("overlayfs: workdir is in-use by another mount, accessing files from both mounts will result in undefined behavior.\n");
+ +	if (!ufs->config.lowerdir) {
+ +		if (!silent)
+ +			pr_err("overlayfs: missing 'lowerdir'\n");
+ +		goto out_free_config;
+  	}
+  
+ -	ufs->workbasedir = dget(workpath->dentry);
+ -	err = 0;
+ -out:
+ -	return err;
+ -}
+ -
+ -static int ovl_get_upper(struct ovl_fs *ufs, struct path *upperpath)
+ -{
+ -	struct vfsmount *upper_mnt;
+ -
+ -	upper_mnt = clone_private_mount(upperpath);
+ -	if (IS_ERR(upper_mnt)) {
+ -		pr_err("overlayfs: failed to clone upperpath\n");
+ -		return PTR_ERR(upper_mnt);
+ +	overlay_stack_depth = get_s_stack_depth(sb);
+ +	err = -EOPNOTSUPP;
+ +	if (!overlay_stack_depth) {
+ +		pr_err("overlayfs: superblock missing extension wrapper (old kernel?)\n");
+ +		goto out_free_config;
+  	}
+ +	*overlay_stack_depth = 0;
+  
+ -	/* Don't inherit atime flags */
+ -	upper_mnt->mnt_flags &= ~(MNT_NOATIME | MNT_NODIRATIME | MNT_RELATIME);
+ -	ufs->upper_mnt = upper_mnt;
+ -
+ -	return 0;
+ -}
+ -
+ -static int ovl_get_workdir(struct super_block *sb, struct ovl_fs *ufs,
+ -			   struct path *workpath)
+ -{
+ -	struct dentry *temp;
+ -	int err;
+ -
+ -	ufs->workdir = ovl_workdir_create(sb, ufs, ufs->workbasedir,
+ -					  OVL_WORKDIR_NAME, false);
+ -	if (!ufs->workdir)
+ -		return 0;
+ -
+ -	/*
+ -	 * Upper should support d_type, else whiteouts are visible.  Given
+ -	 * workdir and upper are on same fs, we can do iterate_dir() on
+ -	 * workdir. This check requires successful creation of workdir in
+ -	 * previous step.
+ -	 */
+ -	err = ovl_check_d_type_supported(workpath);
+ -	if (err < 0)
+ -		return err;
+ -
+ -	/*
+ -	 * We allowed this configuration and don't want to break users over
+ -	 * kernel upgrade. So warn instead of erroring out.
+ -	 */
+ -	if (!err)
+ -		pr_warn("overlayfs: upper fs needs to support d_type.\n");
+ -
+ -	/* Check if upper/work fs supports O_TMPFILE */
+ -	temp = ovl_do_tmpfile(ufs->workdir, S_IFREG | 0);
+ -	ufs->tmpfile = !IS_ERR(temp);
+ -	if (ufs->tmpfile)
+ -		dput(temp);
+ -	else
+ -		pr_warn("overlayfs: upper fs does not support tmpfile.\n");
+ +	sb->s_maxbytes = MAX_LFS_FILESIZE;
+ +	if (ufs->config.upperdir) {
+ +		if (!ufs->config.workdir) {
+ +			pr_err("overlayfs: missing 'workdir'\n");
+ +			goto out_free_config;
+ +		}
+  
+ -	/*
+ -	 * Check if upper/work fs supports trusted.overlay.* xattr
+ -	 */
+ -	err = ovl_do_setxattr(ufs->workdir, OVL_XATTR_OPAQUE, "0", 1, 0);
+ -	if (err) {
+ -		ufs->noxattr = true;
+ -		pr_warn("overlayfs: upper fs does not support xattr.\n");
+ -	} else {
+ -		vfs_removexattr(ufs->workdir, OVL_XATTR_OPAQUE);
+ -	}
+ +		err = ovl_mount_dir(ufs->config.upperdir, &upperpath);
+ +		if (err)
+ +			goto out_free_config;
+ +
+++<<<<<<< HEAD
+ +		/* Upper fs should not be r/o */
+ +		if (upperpath.mnt->mnt_sb->s_flags & MS_RDONLY) {
+ +			pr_err("overlayfs: upper fs is r/o, try multi-lower layers mount\n");
+ +			err = -EINVAL;
+ +			goto out_put_upperpath;
+ +		}
+  
+ -	/* Check if upper/work fs supports file handles */
+ -	if (ufs->config.index &&
+ -	    !ovl_can_decode_fh(ufs->workdir->d_sb)) {
+ -		ufs->config.index = false;
+ -		pr_warn("overlayfs: upper fs does not support file handles, falling back to index=off.\n");
+ -	}
+ +		err = ovl_check_namelen(&upperpath, ufs, ufs->config.upperdir);
+ +		if (err)
+ +			goto out_put_upperpath;
+ +
+ +		err = -EBUSY;
+ +		if (ovl_inuse_trylock(upperpath.dentry)) {
+ +			ufs->upperdir_locked = true;
+ +		} else if (ufs->config.index) {
+ +			pr_err("overlayfs: upperdir is in-use by another mount, mount with '-o index=off' to override exclusive upperdir protection.\n");
+ +			goto out_put_upperpath;
+ +		} else {
+ +			pr_warn("overlayfs: upperdir is in-use by another mount, accessing files from both mounts will result in undefined behavior.\n");
+ +		}
+  
+ -	return 0;
+ -}
+ +		err = ovl_mount_dir(ufs->config.workdir, &workpath);
+ +		if (err)
+ +			goto out_unlock_upperdentry;
+  
+ -static int ovl_get_indexdir(struct super_block *sb, struct ovl_fs *ufs,
+ -			    struct ovl_entry *oe,
+ -			    struct path *upperpath)
+ -{
+ -	int err;
+ +		err = -EINVAL;
+ +		if (upperpath.mnt != workpath.mnt) {
+ +			pr_err("overlayfs: workdir and upperdir must reside under the same mount\n");
+ +			goto out_put_workpath;
+ +		}
+ +		if (!ovl_workdir_ok(workpath.dentry, upperpath.dentry)) {
+ +			pr_err("overlayfs: workdir and upperdir must be separate subtrees\n");
+ +			goto out_put_workpath;
+ +		}
+  
+ -	/* Verify lower root is upper root origin */
+ -	err = ovl_verify_origin(upperpath->dentry,
+ -				oe->lowerstack[0].layer->mnt,
+ -				oe->lowerstack[0].dentry,
+ -				false, true);
+ -	if (err) {
+ -		pr_err("overlayfs: failed to verify upper root origin\n");
+ -		goto out;
+ -	}
+ +		err = -EBUSY;
+ +		if (ovl_inuse_trylock(workpath.dentry)) {
+ +			ufs->workdir_locked = true;
+ +		} else if (ufs->config.index) {
+ +			pr_err("overlayfs: workdir is in-use by another mount, mount with '-o index=off' to override exclusive workdir protection.\n");
+ +			goto out_put_workpath;
+ +		} else {
+ +			pr_warn("overlayfs: workdir is in-use by another mount, accessing files from both mounts will result in undefined behavior.\n");
+ +		}
+  
+ -	ufs->indexdir = ovl_workdir_create(sb, ufs, ufs->workbasedir,
+ -					   OVL_INDEXDIR_NAME, true);
+ -	if (ufs->indexdir) {
+ -		/* Verify upper root is index dir origin */
+ -		err = ovl_verify_origin(ufs->indexdir, ufs->upper_mnt,
+ -					upperpath->dentry, true, true);
+ -		if (err)
+ -			pr_err("overlayfs: failed to verify index dir origin\n");
+ +		ufs->workbasedir = workpath.dentry;
+ +		upper_stack_depth = get_s_stack_depth(upperpath.mnt->mnt_sb);
+ +		err = -EOPNOTSUPP;
+ +		if (!upper_stack_depth) {
+ +			pr_err("overlayfs: superblock missing extension wrapper (old kernel?)\n");
+ +			goto out_put_workpath;
+ +		}
+  
+ -		/* Cleanup bad/stale/orphan index entries */
+ -		if (!err)
+ -			err = ovl_indexdir_cleanup(ufs->indexdir,
+ -						   ufs->upper_mnt,
+ -						   oe->lowerstack,
+ -						   oe->numlower);
+ +		*overlay_stack_depth = *upper_stack_depth;
+  	}
+ -	if (err || !ufs->indexdir)
+ -		pr_warn("overlayfs: try deleting index dir or mounting with '-o index=off' to disable inodes index.\n");
+ -
+ -out:
+ -	return err;
+ -}
+ -
+ -static int ovl_get_lowerstack(struct super_block *sb, struct ovl_fs *ufs,
+ -			      struct path **stackp, unsigned int *stacklenp)
+ -{
+ -	int err;
+ -	char *lowertmp, *lower;
+ -	struct path *stack;
+ -	unsigned int stacklen, numlower, i;
+ -	bool remote = false;
+  
+  	err = -ENOMEM;
+  	lowertmp = kstrdup(ufs->config.lowerdir, GFP_KERNEL);
+@@@ -1014,84 -1057,55 +1023,104 @@@
+  	}
+  
+  	err = -EINVAL;
+ -	sb->s_stack_depth++;
+ -	if (sb->s_stack_depth > FILESYSTEM_MAX_STACK_DEPTH) {
+ +	*overlay_stack_depth += 1;
+ +	if (*overlay_stack_depth > FILESYSTEM_MAX_STACK_DEPTH) {
+  		pr_err("overlayfs: maximum fs stacking depth exceeded\n");
+ -		goto out_free_stack;
+ +		goto out_put_lowerpath;
+  	}
+  
+ -	*stackp = stack;
+ -	*stacklenp = numlower;
+ +	if (ufs->config.upperdir) {
+ +		ufs->upper_mnt = clone_private_mount(&upperpath);
+ +		err = PTR_ERR(ufs->upper_mnt);
+ +		if (IS_ERR(ufs->upper_mnt)) {
+ +			pr_err("overlayfs: failed to clone upperpath\n");
+ +			goto out_put_lowerpath;
+ +		}
+  
+ -	if (remote)
+ -		sb->s_d_op = &ovl_reval_dentry_operations;
+ -	else
+ -		sb->s_d_op = &ovl_dentry_operations;
+ +		/* Don't inherit atime flags */
+ +		ufs->upper_mnt->mnt_flags &= ~(MNT_NOATIME | MNT_NODIRATIME | MNT_RELATIME);
+++=======
+++		err = ovl_get_upper(ufs, &upperpath);
+++		if (err)
+++			goto out_err;
+++>>>>>>> c6fe62549313 (ovl: change order of setup in ovl_fill_super())
+  
+- 		sb->s_time_gran = ufs->upper_mnt->mnt_sb->s_time_gran;
+ -	err = 0;
+++		err = ovl_get_workpath(ufs, &upperpath, &workpath);
+++		if (err)
+++			goto out_err;
+  
+ -out:
+ -	kfree(lowertmp);
+ -	return err;
+++<<<<<<< HEAD
+ +		ufs->workdir = ovl_workdir_create(sb, ufs, workpath.dentry,
+ +						  OVL_WORKDIR_NAME, false);
+ +		/*
+ +		 * Upper should support d_type, else whiteouts are visible.
+ +		 * Given workdir and upper are on same fs, we can do
+ +		 * iterate_dir() on workdir. This check requires successful
+ +		 * creation of workdir in previous step.
+ +		 */
+ +		if (ufs->workdir) {
+ +			struct dentry *temp;
+ +
+ +			err = ovl_check_d_type_supported(&workpath);
+ +			if (err < 0)
+ +				goto out_put_workdir;
+ +
+ +			/*
+ +			 * Warn instead of error to avoid breaking previously
+ +			 * working configurations over upgrade. If d_type
+ +			 * is not supported, whiteouts will become visible
+ +			 * to user space.
+ +			 */
+ +			if (!err)
+ +				pr_warn("overlayfs: upper fs needs to support d_type. This is an invalid configuration.\n");
+ +
+ +			/* Check if upper/work fs supports O_TMPFILE */
+ +			temp = ovl_do_tmpfile(ufs->workdir, S_IFREG | 0);
+ +			ufs->tmpfile = !IS_ERR(temp);
+ +			if (ufs->tmpfile)
+ +				dput(temp);
+ +
+ +			/*
+ +			 * Check if upper/work fs supports trusted.overlay.*
+ +			 * xattr
+ +			 */
+ +			err = ovl_do_setxattr(ufs->workdir, OVL_XATTR_OPAQUE,
+ +					      "0", 1, 0);
+ +			if (err) {
+ +				ufs->noxattr = true;
+ +				pr_warn("overlayfs: upper fs does not support xattr.\n");
+ +			} else {
+ +				vfs_removexattr(ufs->workdir, OVL_XATTR_OPAQUE);
+ +			}
+  
+ -out_free_stack:
+ -	for (i = 0; i < numlower; i++)
+ -		path_put(&stack[i]);
+ -	kfree(stack);
+ -	goto out;
+ -}
+ +			/* Check if upper/work fs supports file handles */
+ +			if (ufs->config.index &&
+ +			    !ovl_can_decode_fh(ufs->workdir->d_sb)) {
+ +				ufs->config.index = false;
+ +				pr_warn("overlayfs: upper fs does not support file handles, falling back to index=off.\n");
+ +			}
+ +		}
+++=======
+++		err = ovl_get_workdir(sb, ufs, &workpath);
+++		if (err)
+++			goto out_err;
++ 
+ -static int ovl_get_lower_layers(struct ovl_fs *ufs, struct path *stack,
+ -				unsigned int numlower)
+ -{
+ -	int err;
+ -	unsigned int i;
+++		sb->s_stack_depth = ufs->upper_mnt->mnt_sb->s_stack_depth;
+++		sb->s_time_gran = ufs->upper_mnt->mnt_sb->s_time_gran;
+++
+++>>>>>>> c6fe62549313 (ovl: change order of setup in ovl_fill_super())
+ +	}
+++	err = ovl_get_lowerstack(sb, ufs, &stack, &numlower);
+++	if (err)
+++		goto out_err;
+  
+  	err = -ENOMEM;
+ -	ufs->lower_layers = kcalloc(numlower, sizeof(struct ovl_layer),
+ -				    GFP_KERNEL);
+ -	if (ufs->lower_layers == NULL)
+ -		goto out;
+ +	ufs->lower_mnt = kcalloc(numlower, sizeof(struct vfsmount *), GFP_KERNEL);
+ +	if (ufs->lower_mnt == NULL)
+ +		goto out_put_workdir;
+  	for (i = 0; i < numlower; i++) {
+ -		struct vfsmount *mnt;
+ -		dev_t dev;
+ -
+ -		err = get_anon_bdev(&dev);
+ -		if (err) {
+ -			pr_err("overlayfs: failed to get anonymous bdev for lowerpath\n");
+ -			goto out;
+ -		}
+ +		struct vfsmount *mnt = clone_private_mount(&stack[i]);
+  
+ -		mnt = clone_private_mount(&stack[i]);
+  		err = PTR_ERR(mnt);
+  		if (IS_ERR(mnt)) {
+  			pr_err("overlayfs: failed to clone lowerpath\n");
+@@@ -1153,16 -1230,6 +1182,19 @@@
+  	if (!ufs->indexdir)
+  		ufs->config.index = false;
+  
+++<<<<<<< HEAD
+ +	if (remote)
+ +		sb->s_d_op = &ovl_reval_dentry_operations.ops;
+ +	else
+ +		sb->s_d_op = &ovl_dentry_operations.ops;
+ +
+ +	err = -ENOMEM;
+ +	ufs->creator_cred = cred = prepare_creds();
+ +	if (!cred)
+ +		goto out_put_indexdir;
+ +
+++=======
+++>>>>>>> c6fe62549313 (ovl: change order of setup in ovl_fill_super())
+  	/* Never override disk quota limits or use reserved space */
+  	cap_lower(cred->cap_effective, CAP_SYS_RESOURCE);
+  
+@@@ -1177,9 -1239,10 +1209,10 @@@
+  	sb->s_fs_info = ufs;
+  	sb->s_flags |= MS_POSIXACL | MS_NOREMOTELOCK;
+  
++ 	err = -ENOMEM;
+  	root_dentry = d_make_root(ovl_new_inode(sb, S_IFDIR, 0));
+  	if (!root_dentry)
+ -		goto out_err;
+ +		goto out_free_oe;
+  
+  	mntput(upperpath.mnt);
+  	for (i = 0; i < numlower; i++)
+* Unmerged path fs/overlayfs/super.c
