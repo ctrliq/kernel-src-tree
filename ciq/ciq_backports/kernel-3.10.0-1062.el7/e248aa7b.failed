@@ -1,0 +1,275 @@
+svcrdma: Remove max_sge check at connect time
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit e248aa7be86e8179f20ac0931774ecd746f3f5bf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/e248aa7b.failed
+
+Two and a half years ago, the client was changed to use gathered
+Send for larger inline messages, in commit 655fec6987b ("xprtrdma:
+Use gathered Send for large inline messages"). Several fixes were
+required because there are a few in-kernel device drivers whose
+max_sge is 3, and these were broken by the change.
+
+Apparently my memory is going, because some time later, I submitted
+commit 25fd86eca11c ("svcrdma: Don't overrun the SGE array in
+svc_rdma_send_ctxt"), and after that, commit f3c1fd0ee294 ("svcrdma:
+Reduce max_send_sges"). These too incorrectly assumed in-kernel
+device drivers would have more than a few Send SGEs available.
+
+The fix for the server side is not the same. This is because the
+fundamental problem on the server is that, whether or not the client
+has provisioned a chunk for the RPC reply, the server must squeeze
+even the most complex RPC replies into a single RDMA Send. Failing
+in the send path because of Send SGE exhaustion should never be an
+option.
+
+Therefore, instead of failing when the send path runs out of SGEs,
+switch to using a bounce buffer mechanism to handle RPC replies that
+are too complex for the device to send directly. That allows us to
+remove the max_sge check to enable drivers with small max_sge to
+work again.
+
+	Reported-by: Don Dutile <ddutile@redhat.com>
+Fixes: 25fd86eca11c ("svcrdma: Don't overrun the SGE array in ...")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit e248aa7be86e8179f20ac0931774ecd746f3f5bf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/svc_rdma_sendto.c
+#	net/sunrpc/xprtrdma/svc_rdma_transport.c
+diff --cc net/sunrpc/xprtrdma/svc_rdma_sendto.c
+index 00a497c70989,1f200119268c..000000000000
+--- a/net/sunrpc/xprtrdma/svc_rdma_sendto.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_sendto.c
+@@@ -357,29 -507,136 +357,132 @@@ out_maperr
+  	return -EIO;
+  }
+  
+ -/* ib_dma_map_page() is used here because svc_rdma_dma_unmap()
+ - * handles DMA-unmap and it uses ib_dma_unmap_page() exclusively.
+ - */
+ -static int svc_rdma_dma_map_buf(struct svcxprt_rdma *rdma,
+ -				struct svc_rdma_send_ctxt *ctxt,
+ -				unsigned char *base,
+ -				unsigned int len)
+ -{
+ -	return svc_rdma_dma_map_page(rdma, ctxt, virt_to_page(base),
+ -				     offset_in_page(base), len);
+ -}
+ -
+  /**
+ - * svc_rdma_sync_reply_hdr - DMA sync the transport header buffer
+ + * svc_rdma_map_reply_hdr - DMA map the transport header buffer
+   * @rdma: controlling transport
+ - * @ctxt: send_ctxt for the Send WR
+ + * @ctxt: op_ctxt for the Send WR
+ + * @rdma_resp: buffer containing transport header
+   * @len: length of transport header
+   *
+ + * Returns:
+ + *	%0 if the header is DMA mapped,
+ + *	%-EIO if DMA mapping failed.
+   */
+ -void svc_rdma_sync_reply_hdr(struct svcxprt_rdma *rdma,
+ -			     struct svc_rdma_send_ctxt *ctxt,
+ -			     unsigned int len)
+ +int svc_rdma_map_reply_hdr(struct svcxprt_rdma *rdma,
+ +			   struct svc_rdma_op_ctxt *ctxt,
+ +			   __be32 *rdma_resp,
+ +			   unsigned int len)
+  {
+ -	ctxt->sc_sges[0].length = len;
+ -	ctxt->sc_send_wr.num_sge++;
+ -	ib_dma_sync_single_for_device(rdma->sc_pd->device,
+ -				      ctxt->sc_sges[0].addr, len,
+ -				      DMA_TO_DEVICE);
+ +	ctxt->direction = DMA_TO_DEVICE;
+ +	ctxt->pages[0] = virt_to_page(rdma_resp);
+ +	ctxt->count = 1;
+ +	return svc_rdma_dma_map_page(rdma, ctxt, 0, ctxt->pages[0], 0, len);
+  }
+  
+++<<<<<<< HEAD
+ +/* Load the xdr_buf into the ctxt's sge array, and DMA map each
+++=======
++ /* If the xdr_buf has more elements than the device can
++  * transmit in a single RDMA Send, then the reply will
++  * have to be copied into a bounce buffer.
++  */
++ static bool svc_rdma_pull_up_needed(struct svcxprt_rdma *rdma,
++ 				    struct xdr_buf *xdr,
++ 				    __be32 *wr_lst)
++ {
++ 	int elements;
++ 
++ 	/* xdr->head */
++ 	elements = 1;
++ 
++ 	/* xdr->pages */
++ 	if (!wr_lst) {
++ 		unsigned int remaining;
++ 		unsigned long pageoff;
++ 
++ 		pageoff = xdr->page_base & ~PAGE_MASK;
++ 		remaining = xdr->page_len;
++ 		while (remaining) {
++ 			++elements;
++ 			remaining -= min_t(u32, PAGE_SIZE - pageoff,
++ 					   remaining);
++ 			pageoff = 0;
++ 		}
++ 	}
++ 
++ 	/* xdr->tail */
++ 	if (xdr->tail[0].iov_len)
++ 		++elements;
++ 
++ 	/* assume 1 SGE is needed for the transport header */
++ 	return elements >= rdma->sc_max_send_sges;
++ }
++ 
++ /* The device is not capable of sending the reply directly.
++  * Assemble the elements of @xdr into the transport header
++  * buffer.
++  */
++ static int svc_rdma_pull_up_reply_msg(struct svcxprt_rdma *rdma,
++ 				      struct svc_rdma_send_ctxt *ctxt,
++ 				      struct xdr_buf *xdr, __be32 *wr_lst)
++ {
++ 	unsigned char *dst, *tailbase;
++ 	unsigned int taillen;
++ 
++ 	dst = ctxt->sc_xprt_buf;
++ 	dst += ctxt->sc_sges[0].length;
++ 
++ 	memcpy(dst, xdr->head[0].iov_base, xdr->head[0].iov_len);
++ 	dst += xdr->head[0].iov_len;
++ 
++ 	tailbase = xdr->tail[0].iov_base;
++ 	taillen = xdr->tail[0].iov_len;
++ 	if (wr_lst) {
++ 		u32 xdrpad;
++ 
++ 		xdrpad = xdr_padsize(xdr->page_len);
++ 		if (taillen && xdrpad) {
++ 			tailbase += xdrpad;
++ 			taillen -= xdrpad;
++ 		}
++ 	} else {
++ 		unsigned int len, remaining;
++ 		unsigned long pageoff;
++ 		struct page **ppages;
++ 
++ 		ppages = xdr->pages + (xdr->page_base >> PAGE_SHIFT);
++ 		pageoff = xdr->page_base & ~PAGE_MASK;
++ 		remaining = xdr->page_len;
++ 		while (remaining) {
++ 			len = min_t(u32, PAGE_SIZE - pageoff, remaining);
++ 
++ 			memcpy(dst, page_address(*ppages), len);
++ 			remaining -= len;
++ 			dst += len;
++ 			pageoff = 0;
++ 		}
++ 	}
++ 
++ 	if (taillen)
++ 		memcpy(dst, tailbase, taillen);
++ 
++ 	ctxt->sc_sges[0].length += xdr->len;
++ 	ib_dma_sync_single_for_device(rdma->sc_pd->device,
++ 				      ctxt->sc_sges[0].addr,
++ 				      ctxt->sc_sges[0].length,
++ 				      DMA_TO_DEVICE);
++ 
++ 	return 0;
++ }
++ 
++ /* svc_rdma_map_reply_msg - Map the buffer holding RPC message
++  * @rdma: controlling transport
++  * @ctxt: send_ctxt for the Send WR
++  * @xdr: prepared xdr_buf containing RPC message
++  * @wr_lst: pointer to Call header's Write list, or NULL
++  *
++  * Load the xdr_buf into the ctxt's sge array, and DMA map each
+++>>>>>>> e248aa7be86e (svcrdma: Remove max_sge check at connect time)
+   * element as it is added.
+   *
+   * Returns zero on success, or a negative errno on failure.
+@@@ -394,9 -652,11 +497,17 @@@ static int svc_rdma_map_reply_msg(struc
+  	u32 xdr_pad;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	sge_no = 1;
+ +
+ +	ret = svc_rdma_dma_map_buf(rdma, ctxt, sge_no++,
+++=======
++ 	if (svc_rdma_pull_up_needed(rdma, xdr, wr_lst))
++ 		return svc_rdma_pull_up_reply_msg(rdma, ctxt, xdr, wr_lst);
++ 
++ 	++ctxt->sc_cur_sge_no;
++ 	ret = svc_rdma_dma_map_buf(rdma, ctxt,
+++>>>>>>> e248aa7be86e (svcrdma: Remove max_sge check at connect time)
+  				   xdr->head[0].iov_base,
+  				   xdr->head[0].iov_len);
+  	if (ret < 0)
+@@@ -426,8 -686,9 +537,14 @@@
+  	while (remaining) {
+  		len = min_t(u32, PAGE_SIZE - page_off, remaining);
+  
+++<<<<<<< HEAD
+ +		ret = svc_rdma_dma_map_page(rdma, ctxt, sge_no++,
+ +					    *ppages++, page_off, len);
+++=======
++ 		++ctxt->sc_cur_sge_no;
++ 		ret = svc_rdma_dma_map_page(rdma, ctxt, *ppages++,
++ 					    page_off, len);
+++>>>>>>> e248aa7be86e (svcrdma: Remove max_sge check at connect time)
+  		if (ret < 0)
+  			return ret;
+  
+@@@ -439,7 -700,8 +556,12 @@@
+  	len = xdr->tail[0].iov_len;
+  tail:
+  	if (len) {
+++<<<<<<< HEAD
+ +		ret = svc_rdma_dma_map_buf(rdma, ctxt, sge_no++, base, len);
+++=======
++ 		++ctxt->sc_cur_sge_no;
++ 		ret = svc_rdma_dma_map_buf(rdma, ctxt, base, len);
+++>>>>>>> e248aa7be86e (svcrdma: Remove max_sge check at connect time)
+  		if (ret < 0)
+  			return ret;
+  	}
+diff --cc net/sunrpc/xprtrdma/svc_rdma_transport.c
+index d3dc1550457a,57f86c63a463..000000000000
+--- a/net/sunrpc/xprtrdma/svc_rdma_transport.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_transport.c
+@@@ -722,8 -416,12 +722,17 @@@ static struct svc_xprt *svc_rdma_accept
+  
+  	/* Qualify the transport resource defaults with the
+  	 * capabilities of this particular device */
+++<<<<<<< HEAD
+ +	newxprt->sc_max_sge = min((size_t)dev->attrs.max_sge,
+ +				  (size_t)RPCSVC_MAXPAGES);
+++=======
++ 	/* Transport header, head iovec, tail iovec */
++ 	newxprt->sc_max_send_sges = 3;
++ 	/* Add one SGE per page list entry */
++ 	newxprt->sc_max_send_sges += (svcrdma_max_req_size / PAGE_SIZE) + 1;
++ 	if (newxprt->sc_max_send_sges > dev->attrs.max_send_sge)
++ 		newxprt->sc_max_send_sges = dev->attrs.max_send_sge;
+++>>>>>>> e248aa7be86e (svcrdma: Remove max_sge check at connect time)
+  	newxprt->sc_max_req_size = svcrdma_max_req_size;
+  	newxprt->sc_max_requests = svcrdma_max_requests;
+  	newxprt->sc_max_bc_requests = svcrdma_max_bc_requests;
+* Unmerged path net/sunrpc/xprtrdma/svc_rdma_sendto.c
+* Unmerged path net/sunrpc/xprtrdma/svc_rdma_transport.c
