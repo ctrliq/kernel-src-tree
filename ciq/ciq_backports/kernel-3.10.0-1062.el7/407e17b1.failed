@@ -1,0 +1,75 @@
+net/mlx5e: XDP, fix redirect resources availability check
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: XDP, fix redirect resources availability check (Alaa Hleihel) [1688717]
+Rebuild_FUZZ: 96.36%
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit 407e17b1a69a51ba9a512a04342da56c1f931df4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/407e17b1.failed
+
+Currently mlx5 driver creates xdp redirect hw queues unconditionally on
+netdevice open, This is great until someone starts redirecting XDP traffic
+via ndo_xdp_xmit on mlx5 device and changes the device configuration at
+the same time, this might cause crashes, since the other device's napi
+is not aware of the mlx5 state change (resources un-availability).
+
+To fix this we must synchronize with other devices napi's on the system.
+Added a new flag under mlx5e_priv to determine XDP TX resources are
+available, set/clear it up when necessary and use synchronize_rcu()
+when the flag is turned off, so other napi's are in-sync with it, before
+we actually cleanup the hw resources.
+
+The flag is tested prior to committing to transmit on mlx5e_xdp_xmit, and
+it is sufficient to determine if it safe to transmit or not. The other
+two internal flags (MLX5E_STATE_OPENED and MLX5E_SQ_STATE_ENABLED) become
+unnecessary. Thus, they are removed from data path.
+
+Fixes: 58b99ee3e3eb ("net/mlx5e: Add support for XDP_REDIRECT in device-out side")
+	Reported-by: Toke Høiland-Jørgensen <toke@redhat.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 407e17b1a69a51ba9a512a04342da56c1f931df4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 4a9c2819d01c..2991440a0359 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -600,6 +600,7 @@ enum {
+ 	MLX5E_STATE_ASYNC_EVENTS_ENABLED,
+ 	MLX5E_STATE_OPENED,
+ 	MLX5E_STATE_DESTROYING,
++	MLX5E_STATE_XDP_TX_ENABLED,
+ };
+ 
+ struct mlx5e_vxlan_db {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 48dde39aa588..d825d46e0946 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -2513,6 +2513,7 @@ void mlx5e_activate_priv_channels(struct mlx5e_priv *priv)
+ 
+ 	mlx5e_build_tx2sq_maps(priv);
+ 	mlx5e_activate_channels(&priv->channels);
++	mlx5e_xdp_tx_enable(priv);
+ 	netif_tx_start_all_queues(priv->netdev);
+ 
+ 	if (MLX5_ESWITCH_MANAGER(priv->mdev))
+@@ -2534,6 +2535,7 @@ void mlx5e_deactivate_priv_channels(struct mlx5e_priv *priv)
+ 	 */
+ 	netif_tx_stop_all_queues(priv->netdev);
+ 	netif_tx_disable(priv->netdev);
++	mlx5e_xdp_tx_disable(priv);
+ 	mlx5e_deactivate_channels(&priv->channels);
+ }
+ 
