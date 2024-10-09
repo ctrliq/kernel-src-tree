@@ -1,0 +1,131 @@
+x86/speculation/l1tf: Protect swap entries against L1TF
+
+jira LE-1907
+cve CVE-2018-3620
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [x86] l1tf: Protect swap entries against L1TF (Christoph von Recklinghausen) [1593384] {CVE-2018-3620}
+Rebuild_FUZZ: 82.98%
+commit-author Linus Torvalds <torvalds@linux-foundation.org>
+commit 2f22b4cd45b67b3496f4aa4c7180a1271c6452f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/2f22b4cd.failed
+
+With L1 terminal fault the CPU speculates into unmapped PTEs, and resulting
+side effects allow to read the memory the PTE is pointing too, if its
+values are still in the L1 cache.
+
+For swapped out pages Linux uses unmapped PTEs and stores a swap entry into
+them.
+
+To protect against L1TF it must be ensured that the swap entry is not
+pointing to valid memory, which requires setting higher bits (between bit
+36 and bit 45) that are inside the CPUs physical address space, but outside
+any real memory.
+
+To do this invert the offset to make sure the higher bits are always set,
+as long as the swap file is not too big.
+
+Note there is no workaround for 32bit !PAE, or on systems which have more
+than MAX_PA/2 worth of memory. The later case is very unlikely to happen on
+real systems.
+
+[AK: updated description and minor tweaks by. Split out from the original
+     patch ]
+
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+	Signed-off-by: Andi Kleen <ak@linux.intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Tested-by: Andi Kleen <ak@linux.intel.com>
+	Reviewed-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Acked-by: Dave Hansen <dave.hansen@intel.com>
+
+
+(cherry picked from commit 2f22b4cd45b67b3496f4aa4c7180a1271c6452f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/pgtable_64.h
+diff --cc arch/x86/include/asm/pgtable_64.h
+index 1c528b8b0542,009d3be3cc19..000000000000
+--- a/arch/x86/include/asm/pgtable_64.h
++++ b/arch/x86/include/asm/pgtable_64.h
+@@@ -335,31 -271,53 +335,67 @@@ static inline int pgd_large(pgd_t pgd) 
+  /*
+   * Encode and de-code a swap entry
+   *
+++<<<<<<< HEAD
+ + * |     ...            | 11| 10|  9|8|7|6|5| 4| 3|2|1|0| <- bit number
+ + * |     ...            |SW3|SW2|SW1|G|L|D|A|CD|WT|U|W|P| <- bit names
+ + * | OFFSET (14->63) | TYPE (9-13)  |0|X|X|X| X| X|X|X|0| <- swp entry
+++=======
++  * |     ...            | 11| 10|  9|8|7|6|5| 4| 3|2| 1|0| <- bit number
++  * |     ...            |SW3|SW2|SW1|G|L|D|A|CD|WT|U| W|P| <- bit names
++  * | TYPE (59-63) | ~OFFSET (9-58)  |0|0|X|X| X| X|X|SD|0| <- swp entry
+++>>>>>>> 2f22b4cd45b6 (x86/speculation/l1tf: Protect swap entries against L1TF)
+   *
+   * G (8) is aliased and used as a PROT_NONE indicator for
+   * !present ptes.  We need to start storing swap entries above
+   * there.  We also need to avoid using A and D because of an
+   * erratum where they can be incorrectly set by hardware on
+   * non-present PTEs.
+++<<<<<<< HEAD
+++=======
++  *
++  * SD (1) in swp entry is used to store soft dirty bit, which helps us
++  * remember soft dirty over page migration
++  *
++  * Bit 7 in swp entry should be 0 because pmd_present checks not only P,
++  * but also L and G.
++  *
++  * The offset is inverted by a binary not operation to make the high
++  * physical bits set.
+++>>>>>>> 2f22b4cd45b6 (x86/speculation/l1tf: Protect swap entries against L1TF)
+   */
+ -#define SWP_TYPE_BITS		5
+ -
+ -#define SWP_OFFSET_FIRST_BIT	(_PAGE_BIT_PROTNONE + 1)
+ -
+ -/* We always extract/encode the offset by shifting it all the way up, and then down again */
+ -#define SWP_OFFSET_SHIFT	(SWP_OFFSET_FIRST_BIT+SWP_TYPE_BITS)
+ +#define SWP_TYPE_FIRST_BIT (_PAGE_BIT_PROTNONE + 1)
+ +#define SWP_TYPE_BITS	5
+ +/* Place the offset above the type: */
+ +#define SWP_OFFSET_FIRST_BIT (SWP_TYPE_FIRST_BIT + SWP_TYPE_BITS)
+  
+  #define MAX_SWAPFILES_CHECK() BUILD_BUG_ON(MAX_SWAPFILES_SHIFT > SWP_TYPE_BITS)
+  
+++<<<<<<< HEAD
+ +#define __swp_type(x)			(((x).val >> (SWP_TYPE_FIRST_BIT)) \
+ +					 & ((1U << SWP_TYPE_BITS) - 1))
+ +#define __swp_offset(x)			((x).val >> SWP_OFFSET_FIRST_BIT)
+ +#define __swp_entry(type, offset)	((swp_entry_t) { \
+ +					 ((type) << (SWP_TYPE_FIRST_BIT)) \
+ +					 | ((offset) << SWP_OFFSET_FIRST_BIT) })
+++=======
++ /* Extract the high bits for type */
++ #define __swp_type(x) ((x).val >> (64 - SWP_TYPE_BITS))
++ 
++ /* Shift up (to get rid of type), then down to get value */
++ #define __swp_offset(x) (~(x).val << SWP_TYPE_BITS >> SWP_OFFSET_SHIFT)
++ 
++ /*
++  * Shift the offset up "too far" by TYPE bits, then down again
++  * The offset is inverted by a binary not operation to make the high
++  * physical bits set.
++  */
++ #define __swp_entry(type, offset) ((swp_entry_t) { \
++ 	(~(unsigned long)(offset) << SWP_OFFSET_SHIFT >> SWP_TYPE_BITS) \
++ 	| ((unsigned long)(type) << (64-SWP_TYPE_BITS)) })
++ 
+++>>>>>>> 2f22b4cd45b6 (x86/speculation/l1tf: Protect swap entries against L1TF)
+  #define __pte_to_swp_entry(pte)		((swp_entry_t) { pte_val((pte)) })
+ -#define __pmd_to_swp_entry(pmd)		((swp_entry_t) { pmd_val((pmd)) })
+  #define __swp_entry_to_pte(x)		((pte_t) { .pte = (x).val })
+ -#define __swp_entry_to_pmd(x)		((pmd_t) { .pmd = (x).val })
+  
+  extern int kern_addr_valid(unsigned long addr);
+  extern void cleanup_highmap(void);
+* Unmerged path arch/x86/include/asm/pgtable_64.h
