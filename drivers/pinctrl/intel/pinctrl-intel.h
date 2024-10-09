@@ -56,6 +56,7 @@ struct intel_function {
  * @ie_offset: Register offset of GPI_IE from @regs.
  * @pin_base: Starting pin of pins in this community
  * @npins: Number of pins in this community
+ * @features: Additional features supported by the hardware
  * @regs: Community specific common registers (reserved for core driver)
  * @pad_regs: Community specific pad registers (reserved for core driver)
  * @ngpps: Number of groups (hw groups) in this community (reserved for
@@ -69,10 +70,14 @@ struct intel_community {
 	unsigned ie_offset;
 	unsigned pin_base;
 	size_t npins;
+	unsigned features;
 	void __iomem *regs;
 	void __iomem *pad_regs;
 	size_t ngpps;
 };
+
+/* Additional features supported by the hardware */
+#define PINCTRL_FEATURE_DEBOUNCE	BIT(0)
 
 #define PIN_GROUP(n, p, m)			\
 	{					\
