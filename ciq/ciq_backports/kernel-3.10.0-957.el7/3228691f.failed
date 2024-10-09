@@ -1,0 +1,168 @@
+scsi: tcmu: track nl commands
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mike Christie <mchristi@redhat.com>
+commit 3228691ffec134353cb5bf6fb4342283e0243412
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/3228691f.failed
+
+The next patch is going to fix the hung nl command issue so this adds a
+list of outstanding nl commands that we can later abort when the daemon is
+restarted.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 3228691ffec134353cb5bf6fb4342283e0243412)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 5534ef1b341c,73a57681e312..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -114,20 -146,24 +121,25 @@@ struct tcmu_dev 
+  	uint32_t max_blocks;
+  	size_t ring_size;
+  
+ -	struct mutex cmdr_lock;
+ -	struct list_head cmdr_queue;
+ -
+ -	uint32_t dbi_max;
+ -	uint32_t dbi_thresh;
+  	unsigned long *data_bitmap;
+ -	struct radix_tree_root data_blocks;
+ +
+ +	wait_queue_head_t wait_cmdr;
+ +	/* TODO should this be a mutex? */
+ +	spinlock_t cmdr_lock;
+  
+  	struct idr commands;
+ +	spinlock_t commands_lock;
+  
+ -	struct timer_list cmd_timer;
+ +	struct timer_list timeout;
+  	unsigned int cmd_time_out;
+ -
+ -	struct timer_list qfull_timer;
+  	int qfull_time_out;
+  
+++<<<<<<< HEAD
+ +	spinlock_t nl_cmd_lock;
+++=======
++ 	struct list_head timedout_entry;
++ 
+++>>>>>>> 3228691ffec1 (scsi: tcmu: track nl commands)
+  	struct tcmu_nl_cmd curr_nl_cmd;
+  	/* wake up threads waiting on curr_nl_cmd */
+  	wait_queue_head_t nl_cmd_wq;
+@@@ -193,33 -289,36 +204,52 @@@ static int tcmu_genl_cmd_done(struct ge
+  	dev_id = nla_get_u32(info->attrs[TCMU_ATTR_DEVICE_ID]);
+  	rc = nla_get_s32(info->attrs[TCMU_ATTR_CMD_STATUS]);
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&device_mutex);
+ +	dev = idr_find(&devices_idr, dev_id);
+ +	mutex_unlock(&device_mutex);
+ +	if (!dev) {
+ +		printk(KERN_ERR "tcmu nl cmd %u/%u completion could not find device with dev id %u.\n",
+ +		       completed_cmd, rc, dev_id);
+ +		return -ENODEV;
+++=======
++ 	mutex_lock(&tcmu_nl_cmd_mutex);
++ 	list_for_each_entry(nl_cmd, &tcmu_nl_cmd_list, nl_list) {
++ 		if (nl_cmd->udev->se_dev.dev_index == dev_id) {
++ 			udev = nl_cmd->udev;
++ 			break;
++ 		}
+++>>>>>>> 3228691ffec1 (scsi: tcmu: track nl commands)
+  	}
+- 	udev = TCMU_DEV(dev);
+  
+- 	spin_lock(&udev->nl_cmd_lock);
+- 	nl_cmd = &udev->curr_nl_cmd;
++ 	if (!udev) {
++ 		pr_err(KERN_ERR "tcmu nl cmd %u/%d completion could not find device with dev id %u.\n",
++ 		       completed_cmd, rc, dev_id);
++ 		ret = -ENODEV;
++ 		goto unlock;
++ 	}
++ 	list_del(&nl_cmd->nl_list);
+  
+- 	pr_debug("genl cmd done got id %d curr %d done %d rc %d\n", dev_id,
+- 		 nl_cmd->cmd, completed_cmd, rc);
++ 	pr_debug("%s genl cmd done got id %d curr %d done %d rc %d\n",
++ 		 udev->name, dev_id, nl_cmd->cmd, completed_cmd, rc);
+  
+  	if (nl_cmd->cmd != completed_cmd) {
+- 		printk(KERN_ERR "Mismatched commands (Expecting reply for %d. Current %d).\n",
+- 		       completed_cmd, nl_cmd->cmd);
++ 		pr_err("Mismatched commands on %s (Expecting reply for %d. Current %d).\n",
++ 		       udev->name, completed_cmd, nl_cmd->cmd);
+  		ret = -EINVAL;
+- 	} else {
+- 		nl_cmd->status = rc;
++ 		goto unlock;
+  	}
+  
+++<<<<<<< HEAD
+ +	spin_unlock(&udev->nl_cmd_lock);
+ +	if (!ret)
+ +		complete(&nl_cmd->complete);
+++=======
++ 	nl_cmd->status = rc;
++ 	complete(&nl_cmd->complete);
++ unlock:
++ 	mutex_unlock(&tcmu_nl_cmd_mutex);
+++>>>>>>> 3228691ffec1 (scsi: tcmu: track nl commands)
+  	return ret;
+  }
+  
+@@@ -957,19 -1255,19 +987,18 @@@ static struct se_device *tcmu_alloc_dev
+  	udev->qfull_time_out = -1;
+  
+  	udev->max_blocks = DATA_BLOCK_BITS_DEF;
+ -	mutex_init(&udev->cmdr_lock);
+  
+ -	INIT_LIST_HEAD(&udev->timedout_entry);
+ -	INIT_LIST_HEAD(&udev->cmdr_queue);
+ +	init_waitqueue_head(&udev->wait_cmdr);
+ +	spin_lock_init(&udev->cmdr_lock);
+ +
+  	idr_init(&udev->commands);
+ +	spin_lock_init(&udev->commands_lock);
+  
+ -	timer_setup(&udev->qfull_timer, tcmu_qfull_timedout, 0);
+ -	timer_setup(&udev->cmd_timer, tcmu_cmd_timedout, 0);
+ +	setup_timer(&udev->timeout, tcmu_device_timedout,
+ +		(unsigned long)udev);
+  
+  	init_waitqueue_head(&udev->nl_cmd_wq);
+- 	spin_lock_init(&udev->nl_cmd_lock);
+  
+ -	INIT_RADIX_TREE(&udev->data_blocks, GFP_KERNEL);
+ -
+  	return &udev->se_dev;
+  }
+  
+@@@ -1077,11 -1545,15 +1106,11 @@@ static void tcmu_init_genl_cmd_reply(st
+  
+  	if (!tcmu_kern_cmd_reply_supported)
+  		return;
+ -
+ -	if (udev->nl_reply_supported <= 0)
+ -		return;
+ -
+  relock:
+- 	spin_lock(&udev->nl_cmd_lock);
++ 	mutex_lock(&tcmu_nl_cmd_mutex);
+  
+  	if (nl_cmd->cmd != TCMU_CMD_UNSPEC) {
+- 		spin_unlock(&udev->nl_cmd_lock);
++ 		mutex_unlock(&tcmu_nl_cmd_mutex);
+  		pr_debug("sleeping for open nl cmd\n");
+  		wait_event(udev->nl_cmd_wq, (nl_cmd->cmd == TCMU_CMD_UNSPEC));
+  		goto relock;
+* Unmerged path drivers/target/target_core_user.c
