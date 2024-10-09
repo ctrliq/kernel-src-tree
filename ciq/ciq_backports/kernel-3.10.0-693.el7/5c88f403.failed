@@ -1,0 +1,221 @@
+md/raid5-cache: fix crc in rewrite_data_only_stripes()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [md] raid5-cache: fix crc in rewrite_data_only_stripes() (Jes Sorensen) [1380016]
+Rebuild_FUZZ: 97.14%
+commit-author Song Liu <songliubraving@fb.com>
+commit 5c88f403a5d2bd75911c6faaacc9bea97ac7d121
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/5c88f403.failed
+
+r5l_recovery_create_empty_meta_block() creates crc for the empty
+metablock. After the metablock is updated, we need clear the
+checksum before recalculate it.
+
+Shaohua: moved checksum calculation out of
+r5l_recovery_create_empty_meta_block. We should calculate it after all fields
+are updated.
+
+	Signed-off-by: Song Liu <songliubraving@fb.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 5c88f403a5d2bd75911c6faaacc9bea97ac7d121)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid5-cache.c
+diff --cc drivers/md/raid5-cache.c
+index c6ed6dc6889f,aa990bde1fe2..000000000000
+--- a/drivers/md/raid5-cache.c
++++ b/drivers/md/raid5-cache.c
+@@@ -909,163 -1516,37 +909,182 @@@ static int r5l_read_meta_block(struct r
+  	return 0;
+  }
+  
+ -static void
+ -r5l_recovery_create_empty_meta_block(struct r5l_log *log,
+ -				     struct page *page,
+ -				     sector_t pos, u64 seq)
+ +static int r5l_recovery_flush_one_stripe(struct r5l_log *log,
+ +					 struct r5l_recovery_ctx *ctx,
+ +					 sector_t stripe_sect,
+ +					 int *offset, sector_t *log_offset)
+ +{
+ +	struct r5conf *conf = log->rdev->mddev->private;
+ +	struct stripe_head *sh;
+ +	struct r5l_payload_data_parity *payload;
+ +	int disk_index;
+ +
+ +	sh = raid5_get_active_stripe(conf, stripe_sect, 0, 0, 0);
+ +	while (1) {
+ +		payload = page_address(ctx->meta_page) + *offset;
+ +
+ +		if (le16_to_cpu(payload->header.type) == R5LOG_PAYLOAD_DATA) {
+ +			raid5_compute_sector(conf,
+ +					     le64_to_cpu(payload->location), 0,
+ +					     &disk_index, sh);
+ +
+ +			sync_page_io(log->rdev, *log_offset, PAGE_SIZE,
+ +				     sh->dev[disk_index].page, READ, false);
+ +			sh->dev[disk_index].log_checksum =
+ +				le32_to_cpu(payload->checksum[0]);
+ +			set_bit(R5_Wantwrite, &sh->dev[disk_index].flags);
+ +			ctx->meta_total_blocks += BLOCK_SECTORS;
+ +		} else {
+ +			disk_index = sh->pd_idx;
+ +			sync_page_io(log->rdev, *log_offset, PAGE_SIZE,
+ +				     sh->dev[disk_index].page, READ, false);
+ +			sh->dev[disk_index].log_checksum =
+ +				le32_to_cpu(payload->checksum[0]);
+ +			set_bit(R5_Wantwrite, &sh->dev[disk_index].flags);
+ +
+ +			if (sh->qd_idx >= 0) {
+ +				disk_index = sh->qd_idx;
+ +				sync_page_io(log->rdev,
+ +					     r5l_ring_add(log, *log_offset, BLOCK_SECTORS),
+ +					     PAGE_SIZE, sh->dev[disk_index].page,
+ +					     READ, false);
+ +				sh->dev[disk_index].log_checksum =
+ +					le32_to_cpu(payload->checksum[1]);
+ +				set_bit(R5_Wantwrite,
+ +					&sh->dev[disk_index].flags);
+ +			}
+ +			ctx->meta_total_blocks += BLOCK_SECTORS * conf->max_degraded;
+ +		}
+ +
+ +		*log_offset = r5l_ring_add(log, *log_offset,
+ +					   le32_to_cpu(payload->size));
+ +		*offset += sizeof(struct r5l_payload_data_parity) +
+ +			sizeof(__le32) *
+ +			(le32_to_cpu(payload->size) >> (PAGE_SHIFT - 9));
+ +		if (le16_to_cpu(payload->header.type) == R5LOG_PAYLOAD_PARITY)
+ +			break;
+ +	}
+ +
+ +	for (disk_index = 0; disk_index < sh->disks; disk_index++) {
+ +		void *addr;
+ +		u32 checksum;
+ +
+ +		if (!test_bit(R5_Wantwrite, &sh->dev[disk_index].flags))
+ +			continue;
+ +		addr = kmap_atomic(sh->dev[disk_index].page);
+ +		checksum = crc32c_le(log->uuid_checksum, addr, PAGE_SIZE);
+ +		kunmap_atomic(addr);
+ +		if (checksum != sh->dev[disk_index].log_checksum)
+ +			goto error;
+ +	}
+ +
+ +	for (disk_index = 0; disk_index < sh->disks; disk_index++) {
+ +		struct md_rdev *rdev, *rrdev;
+ +
+ +		if (!test_and_clear_bit(R5_Wantwrite,
+ +					&sh->dev[disk_index].flags))
+ +			continue;
+ +
+ +		/* in case device is broken */
+ +		rdev = rcu_dereference(conf->disks[disk_index].rdev);
+ +		if (rdev)
+ +			sync_page_io(rdev, stripe_sect, PAGE_SIZE,
+ +				     sh->dev[disk_index].page, WRITE, false);
+ +		rrdev = rcu_dereference(conf->disks[disk_index].replacement);
+ +		if (rrdev)
+ +			sync_page_io(rrdev, stripe_sect, PAGE_SIZE,
+ +				     sh->dev[disk_index].page, WRITE, false);
+ +	}
+ +	raid5_release_stripe(sh);
+ +	return 0;
+ +
+ +error:
+ +	for (disk_index = 0; disk_index < sh->disks; disk_index++)
+ +		sh->dev[disk_index].flags = 0;
+ +	raid5_release_stripe(sh);
+ +	return -EINVAL;
+ +}
+ +
+ +static int r5l_recovery_flush_one_meta(struct r5l_log *log,
+ +				       struct r5l_recovery_ctx *ctx)
+ +{
+ +	struct r5conf *conf = log->rdev->mddev->private;
+ +	struct r5l_payload_data_parity *payload;
+ +	struct r5l_meta_block *mb;
+ +	int offset;
+ +	sector_t log_offset;
+ +	sector_t stripe_sector;
+ +
+ +	mb = page_address(ctx->meta_page);
+ +	offset = sizeof(struct r5l_meta_block);
+ +	log_offset = r5l_ring_add(log, ctx->pos, BLOCK_SECTORS);
+ +
+ +	while (offset < le32_to_cpu(mb->meta_size)) {
+ +		int dd;
+ +
+ +		payload = (void *)mb + offset;
+ +		stripe_sector = raid5_compute_sector(conf,
+ +						     le64_to_cpu(payload->location), 0, &dd, NULL);
+ +		if (r5l_recovery_flush_one_stripe(log, ctx, stripe_sector,
+ +						  &offset, &log_offset))
+ +			return -EINVAL;
+ +	}
+ +	return 0;
+ +}
+ +
+ +/* copy data/parity from log to raid disks */
+ +static void r5l_recovery_flush_log(struct r5l_log *log,
+ +				   struct r5l_recovery_ctx *ctx)
+ +{
+ +	while (1) {
+ +		if (r5l_read_meta_block(log, ctx))
+ +			return;
+ +		if (r5l_recovery_flush_one_meta(log, ctx))
+ +			return;
+ +		ctx->seq++;
+ +		ctx->pos = r5l_ring_add(log, ctx->pos, ctx->meta_total_blocks);
+ +	}
+ +}
+ +
+ +static int r5l_log_write_empty_meta_block(struct r5l_log *log, sector_t pos,
+ +					  u64 seq)
+  {
+ +	struct page *page;
+  	struct r5l_meta_block *mb;
+- 	u32 crc;
+  
+ +	page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+ +	if (!page)
+ +		return -ENOMEM;
+  	mb = page_address(page);
+ -	clear_page(mb);
+  	mb->magic = cpu_to_le32(R5LOG_MAGIC);
+  	mb->version = R5LOG_VERSION;
+  	mb->meta_size = cpu_to_le32(sizeof(struct r5l_meta_block));
+  	mb->seq = cpu_to_le64(seq);
+  	mb->position = cpu_to_le64(pos);
+++<<<<<<< HEAD
+ +	crc = crc32c_le(log->uuid_checksum, mb, PAGE_SIZE);
+ +	mb->checksum = cpu_to_le32(crc);
+ +
+ +	if (!sync_page_io(log->rdev, pos, PAGE_SIZE, page, WRITE_FUA, false)) {
+++=======
++ }
++ 
++ static int r5l_log_write_empty_meta_block(struct r5l_log *log, sector_t pos,
++ 					  u64 seq)
++ {
++ 	struct page *page;
++ 	struct r5l_meta_block *mb;
++ 
++ 	page = alloc_page(GFP_KERNEL);
++ 	if (!page)
++ 		return -ENOMEM;
++ 	r5l_recovery_create_empty_meta_block(log, page, pos, seq);
++ 	mb = page_address(page);
++ 	mb->checksum = cpu_to_le32(crc32c_le(log->uuid_checksum,
++ 					     mb, PAGE_SIZE));
++ 	if (!sync_page_io(log->rdev, pos, PAGE_SIZE, page, REQ_OP_WRITE,
++ 			  WRITE_FUA, false)) {
+++>>>>>>> 5c88f403a5d2 (md/raid5-cache: fix crc in rewrite_data_only_stripes())
+  		__free_page(page);
+  		return -EIO;
+  	}
+* Unmerged path drivers/md/raid5-cache.c
