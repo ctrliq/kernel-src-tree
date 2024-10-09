@@ -1,0 +1,334 @@
+xprtrdma: Eliminate "ia" argument in rpcrdma_{alloc, free}_regbuf
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 13650c23f10603154d989cff70b5c8a889e69fc2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/13650c23.failed
+
+Clean up. The "ia" argument is no longer used.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 13650c23f10603154d989cff70b5c8a889e69fc2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/backchannel.c
+#	net/sunrpc/xprtrdma/transport.c
+#	net/sunrpc/xprtrdma/verbs.c
+#	net/sunrpc/xprtrdma/xprt_rdma.h
+diff --cc net/sunrpc/xprtrdma/backchannel.c
+index d3cfaf281e55,a19530d56c66..000000000000
+--- a/net/sunrpc/xprtrdma/backchannel.c
++++ b/net/sunrpc/xprtrdma/backchannel.c
+@@@ -45,21 -44,19 +44,31 @@@ static int rpcrdma_bc_setup_rqst(struc
+  		return PTR_ERR(req);
+  	req->rl_backchannel = true;
+  
+++<<<<<<< HEAD
+ +	size = r_xprt->rx_data.inline_wsize;
+ +	rb = rpcrdma_alloc_regbuf(ia, size, GFP_KERNEL);
+++=======
++ 	rb = rpcrdma_alloc_regbuf(RPCRDMA_HDRBUF_SIZE,
++ 				  DMA_TO_DEVICE, GFP_KERNEL);
+++>>>>>>> 13650c23f106 (xprtrdma: Eliminate "ia" argument in rpcrdma_{alloc, free}_regbuf)
+  	if (IS_ERR(rb))
+  		goto out_fail;
+  	req->rl_rdmabuf = rb;
+  
+++<<<<<<< HEAD
+ +	size += r_xprt->rx_data.inline_rsize;
+ +	rb = rpcrdma_alloc_regbuf(ia, size, GFP_KERNEL);
+++=======
++ 	size = r_xprt->rx_data.inline_rsize;
++ 	rb = rpcrdma_alloc_regbuf(size, DMA_TO_DEVICE, GFP_KERNEL);
+++>>>>>>> 13650c23f106 (xprtrdma: Eliminate "ia" argument in rpcrdma_{alloc, free}_regbuf)
+  	if (IS_ERR(rb))
+  		goto out_fail;
+ +	rb->rg_owner = req;
+  	req->rl_sendbuf = rb;
+ -	xdr_buf_init(&rqst->rq_snd_buf, rb->rg_base, size);
+ -	rpcrdma_set_xprtdata(rqst, req);
+ +	/* so that rpcr_to_rdmar works when receiving a request */
+ +	rqst->rq_buffer = (void *)req->rl_sendbuf->rg_base;
+ +	xdr_buf_init(&rqst->rq_snd_buf, rqst->rq_buffer, size);
+  	return 0;
+  
+  out_fail:
+diff --cc net/sunrpc/xprtrdma/transport.c
+index 9ac979fd4b23,5adaa1d3d1e7..000000000000
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@@ -477,23 -477,108 +477,115 @@@ xprt_rdma_connect(struct rpc_xprt *xprt
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +/*
+++=======
++ /* Allocate a fixed-size buffer in which to construct and send the
++  * RPC-over-RDMA header for this request.
++  */
++ static bool
++ rpcrdma_get_rdmabuf(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req,
++ 		    gfp_t flags)
++ {
++ 	size_t size = RPCRDMA_HDRBUF_SIZE;
++ 	struct rpcrdma_regbuf *rb;
++ 
++ 	if (req->rl_rdmabuf)
++ 		return true;
++ 
++ 	rb = rpcrdma_alloc_regbuf(size, DMA_TO_DEVICE, flags);
++ 	if (IS_ERR(rb))
++ 		return false;
++ 
++ 	r_xprt->rx_stats.hardway_register_count += size;
++ 	req->rl_rdmabuf = rb;
++ 	return true;
++ }
++ 
++ /* RPC/RDMA marshaling may choose to send payload bearing ops inline,
++  * if the resulting Call message is smaller than the inline threshold.
++  * The value of the "rq_callsize" argument accounts for RPC header
++  * requirements, but not for the data payload in these cases.
++  *
++  * See rpcrdma_inline_pullup.
++  */
++ static bool
++ rpcrdma_get_sendbuf(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req,
++ 		    size_t size, gfp_t flags)
++ {
++ 	struct rpcrdma_regbuf *rb;
++ 	size_t min_size;
++ 
++ 	if (req->rl_sendbuf && rdmab_length(req->rl_sendbuf) >= size)
++ 		return true;
++ 
++ 	min_size = max_t(size_t, size, r_xprt->rx_data.inline_wsize);
++ 	rb = rpcrdma_alloc_regbuf(min_size, DMA_TO_DEVICE, flags);
++ 	if (IS_ERR(rb))
++ 		return false;
++ 
++ 	rpcrdma_free_regbuf(req->rl_sendbuf);
++ 	r_xprt->rx_stats.hardway_register_count += min_size;
++ 	req->rl_sendbuf = rb;
++ 	return true;
++ }
++ 
++ /* The rq_rcv_buf is used only if a Reply chunk is necessary.
++  * The decision to use a Reply chunk is made later in
++  * rpcrdma_marshal_req. This buffer is registered at that time.
++  *
++  * Otherwise, the associated RPC Reply arrives in a separate
++  * Receive buffer, arbitrarily chosen by the HCA. The buffer
++  * allocated here for the RPC Reply is not utilized in that
++  * case. See rpcrdma_inline_fixup.
++  *
++  * A regbuf is used here to remember the buffer size.
++  */
++ static bool
++ rpcrdma_get_recvbuf(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req,
++ 		    size_t size, gfp_t flags)
++ {
++ 	struct rpcrdma_regbuf *rb;
++ 
++ 	if (req->rl_recvbuf && rdmab_length(req->rl_recvbuf) >= size)
++ 		return true;
++ 
++ 	rb = rpcrdma_alloc_regbuf(size, DMA_NONE, flags);
++ 	if (IS_ERR(rb))
++ 		return false;
++ 
++ 	rpcrdma_free_regbuf(req->rl_recvbuf);
++ 	r_xprt->rx_stats.hardway_register_count += size;
++ 	req->rl_recvbuf = rb;
++ 	return true;
++ }
++ 
++ /**
++  * xprt_rdma_allocate - allocate transport resources for an RPC
++  * @task: RPC task
++  *
++  * Return values:
++  *        0:	Success; rq_buffer points to RPC buffer to use
++  *   ENOMEM:	Out of memory, call again later
++  *      EIO:	A permanent error occurred, do not retry
++  *
+++>>>>>>> 13650c23f106 (xprtrdma: Eliminate "ia" argument in rpcrdma_{alloc, free}_regbuf)
+   * The RDMA allocate/free functions need the task structure as a place
+ - * to hide the struct rpcrdma_req, which is necessary for the actual
+ - * send/recv sequence.
+ + * to hide the struct rpcrdma_req, which is necessary for the actual send/recv
+ + * sequence.
+   *
+ - * xprt_rdma_allocate provides buffers that are already mapped for
+ - * DMA, and a local DMA lkey is provided for each.
+ + * The RPC layer allocates both send and receive buffers in the same call
+ + * (rq_send_buf and rq_rcv_buf are both part of a single contiguous buffer).
+ + * We may register rq_rcv_buf when using reply chunks.
+   */
+ -static int
+ -xprt_rdma_allocate(struct rpc_task *task)
+ +static void *
+ +xprt_rdma_allocate(struct rpc_task *task, size_t size)
+  {
+ -	struct rpc_rqst *rqst = task->tk_rqstp;
+ -	struct rpcrdma_xprt *r_xprt = rpcx_to_rdmax(rqst->rq_xprt);
+ +	struct rpc_xprt *xprt = task->tk_rqstp->rq_xprt;
+ +	struct rpcrdma_xprt *r_xprt = rpcx_to_rdmax(xprt);
+ +	struct rpcrdma_regbuf *rb;
+  	struct rpcrdma_req *req;
+ +	size_t min_size;
+  	gfp_t flags;
+  
+  	req = rpcrdma_buffer_get(&r_xprt->rx_buf);
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index 4dff498a63f2,1f7f4a9623de..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -810,8 -865,8 +810,13 @@@ rpcrdma_create_rep(struct rpcrdma_xprt 
+  	if (rep == NULL)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	rep->rr_rdmabuf = rpcrdma_alloc_regbuf(ia, cdata->inline_rsize,
+ +					       GFP_KERNEL);
+++=======
++ 	rep->rr_rdmabuf = rpcrdma_alloc_regbuf(cdata->inline_rsize,
++ 					       DMA_FROM_DEVICE, GFP_KERNEL);
+++>>>>>>> 13650c23f106 (xprtrdma: Eliminate "ia" argument in rpcrdma_{alloc, free}_regbuf)
+  	if (IS_ERR(rep->rr_rdmabuf)) {
+  		rc = PTR_ERR(rep->rr_rdmabuf);
+  		goto out_free;
+@@@ -912,17 -973,44 +917,27 @@@ rpcrdma_destroy_rep(struct rpcrdma_rep 
+  }
+  
+  void
+- rpcrdma_destroy_req(struct rpcrdma_ia *ia, struct rpcrdma_req *req)
++ rpcrdma_destroy_req(struct rpcrdma_req *req)
+  {
+++<<<<<<< HEAD
+ +	rpcrdma_free_regbuf(ia, req->rl_sendbuf);
+ +	rpcrdma_free_regbuf(ia, req->rl_rdmabuf);
+++=======
++ 	rpcrdma_free_regbuf(req->rl_recvbuf);
++ 	rpcrdma_free_regbuf(req->rl_sendbuf);
++ 	rpcrdma_free_regbuf(req->rl_rdmabuf);
+++>>>>>>> 13650c23f106 (xprtrdma: Eliminate "ia" argument in rpcrdma_{alloc, free}_regbuf)
+  	kfree(req);
+  }
+  
+  void
+  rpcrdma_buffer_destroy(struct rpcrdma_buffer *buf)
+  {
+++<<<<<<< HEAD
+ +	struct rpcrdma_ia *ia = rdmab_to_ia(buf);
+++=======
++ 	cancel_delayed_work_sync(&buf->rb_recovery_worker);
+++>>>>>>> 13650c23f106 (xprtrdma: Eliminate "ia" argument in rpcrdma_{alloc, free}_regbuf)
+  
+  	while (!list_empty(&buf->rb_recv_bufs)) {
+  		struct rpcrdma_rep *rep;
+@@@ -1073,30 -1170,24 +1088,39 @@@ rpcrdma_recv_buffer_put(struct rpcrdma_
+  	spin_unlock(&buffers->rb_lock);
+  }
+  
+ +/*
+ + * Wrappers for internal-use kmalloc memory registration, used by buffer code.
+ + */
+ +
+  /**
+++<<<<<<< HEAD
+ + * rpcrdma_alloc_regbuf - kmalloc and register memory for SEND/RECV buffers
+ + * @ia: controlling rpcrdma_ia
+++=======
++  * rpcrdma_alloc_regbuf - allocate and DMA-map memory for SEND/RECV buffers
+++>>>>>>> 13650c23f106 (xprtrdma: Eliminate "ia" argument in rpcrdma_{alloc, free}_regbuf)
+   * @size: size of buffer to be allocated, in bytes
+ - * @direction: direction of data movement
+   * @flags: GFP flags
+   *
+ - * Returns an ERR_PTR, or a pointer to a regbuf, a buffer that
+ - * can be persistently DMA-mapped for I/O.
+ + * Returns pointer to private header of an area of internally
+ + * registered memory, or an ERR_PTR. The registered buffer follows
+ + * the end of the private header.
+   *
+   * xprtrdma uses a regbuf for posting an outgoing RDMA SEND, or for
+ - * receiving the payload of RDMA RECV operations. During Long Calls
+ - * or Replies they may be registered externally via ro_map.
+ + * receiving the payload of RDMA RECV operations. regbufs are not
+ + * used for RDMA READ/WRITE operations, thus are registered only for
+ + * LOCAL access.
+   */
+  struct rpcrdma_regbuf *
+++<<<<<<< HEAD
+ +rpcrdma_alloc_regbuf(struct rpcrdma_ia *ia, size_t size, gfp_t flags)
+++=======
++ rpcrdma_alloc_regbuf(size_t size, enum dma_data_direction direction,
++ 		     gfp_t flags)
+++>>>>>>> 13650c23f106 (xprtrdma: Eliminate "ia" argument in rpcrdma_{alloc, free}_regbuf)
+  {
+  	struct rpcrdma_regbuf *rb;
+ +	struct ib_sge *iov;
+  
+  	rb = kmalloc(sizeof(*rb) + size, flags);
+  	if (rb == NULL)
+@@@ -1126,11 -1239,8 +1150,10 @@@ out
+   * @rb: regbuf to be deregistered and freed
+   */
+  void
+- rpcrdma_free_regbuf(struct rpcrdma_ia *ia, struct rpcrdma_regbuf *rb)
++ rpcrdma_free_regbuf(struct rpcrdma_regbuf *rb)
+  {
+ +	struct ib_sge *iov;
+ +
+  	if (!rb)
+  		return;
+  
+diff --cc net/sunrpc/xprtrdma/xprt_rdma.h
+index be2bcc2ea72b,4875af772735..000000000000
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@@ -467,10 -476,26 +467,19 @@@ void rpcrdma_buffer_put(struct rpcrdma_
+  void rpcrdma_recv_buffer_get(struct rpcrdma_req *);
+  void rpcrdma_recv_buffer_put(struct rpcrdma_rep *);
+  
+++<<<<<<< HEAD
+ +struct rpcrdma_regbuf *rpcrdma_alloc_regbuf(struct rpcrdma_ia *,
+ +					    size_t, gfp_t);
+ +void rpcrdma_free_regbuf(struct rpcrdma_ia *,
+ +			 struct rpcrdma_regbuf *);
+++=======
++ void rpcrdma_defer_mr_recovery(struct rpcrdma_mw *);
++ 
++ struct rpcrdma_regbuf *rpcrdma_alloc_regbuf(size_t, enum dma_data_direction,
++ 					    gfp_t);
++ bool __rpcrdma_dma_map_regbuf(struct rpcrdma_ia *, struct rpcrdma_regbuf *);
++ void rpcrdma_free_regbuf(struct rpcrdma_regbuf *);
+ -
+ -static inline bool
+ -rpcrdma_regbuf_is_mapped(struct rpcrdma_regbuf *rb)
+ -{
+ -	return rb->rg_device != NULL;
+ -}
+ -
+ -static inline bool
+ -rpcrdma_dma_map_regbuf(struct rpcrdma_ia *ia, struct rpcrdma_regbuf *rb)
+ -{
+ -	if (likely(rpcrdma_regbuf_is_mapped(rb)))
+ -		return true;
+ -	return __rpcrdma_dma_map_regbuf(ia, rb);
+ -}
+++>>>>>>> 13650c23f106 (xprtrdma: Eliminate "ia" argument in rpcrdma_{alloc, free}_regbuf)
+  
+  int rpcrdma_ep_post_extra_recv(struct rpcrdma_xprt *, unsigned int);
+  
+* Unmerged path net/sunrpc/xprtrdma/backchannel.c
+* Unmerged path net/sunrpc/xprtrdma/transport.c
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
+* Unmerged path net/sunrpc/xprtrdma/xprt_rdma.h
