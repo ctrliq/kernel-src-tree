@@ -1,0 +1,281 @@
+ALSA: seq: Allow the modular sequencer registration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Takashi Iwai <tiwai@suse.de>
+commit 111b0cdb97d44cfe5dec1338a78ba8aff65c32e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/111b0cdb.failed
+
+Many drivers bind the sequencer stuff in off-load by another driver
+module, so that it's loaded only on demand.  In the current code, this
+mechanism doesn't work when the driver is built-in while the sequencer
+is module.  We check with IS_REACHABLE() and enable only when the
+sequencer is in the same level of build.
+
+However, this is basically a overshoot.  The binder code
+(snd-seq-device) is an individual module from the sequencer core
+(snd-seq), and we just have to make the former a built-in while
+keeping the latter a module for allowing the scenario like the above.
+
+This patch achieves that by rewriting Kconfig slightly.  Now, a driver
+that provides the manual sequencer device binding should select
+CONFIG_SND_SEQ_DEVICE in a way as
+	select SND_SEQ_DEVICE if SND_SEQUENCER != n
+
+Note that the "!=n" is needed here to avoid the influence of the
+sequencer core is module while the driver is built-in.
+
+Also, since rawmidi.o may be linked with snd_seq_device.o when
+built-in, we have to shuffle the code to make the linker happy.
+(the kernel linker isn't smart enough yet to handle such a case.)
+That is, snd_seq_device.c is moved to sound/core from sound/core/seq,
+as well as Makefile.
+
+Last but not least, the patch replaces the code using IS_REACHABLE()
+with IS_ENABLED(), since now the condition meets always when enabled.
+
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 111b0cdb97d44cfe5dec1338a78ba8aff65c32e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/core/Makefile
+#	sound/isa/sb/emu8000.c
+#	sound/isa/sb/sb16.c
+diff --cc sound/core/Makefile
+index f1eade2e73f2,e2066e2ef9f8..000000000000
+--- a/sound/core/Makefile
++++ b/sound/core/Makefile
+@@@ -37,6 -40,8 +38,11 @@@ obj-$(CONFIG_SND_HWDEP)		+= snd-hwdep.
+  obj-$(CONFIG_SND_TIMER)		+= snd-timer.o
+  obj-$(CONFIG_SND_HRTIMER)	+= snd-hrtimer.o
+  obj-$(CONFIG_SND_PCM)		+= snd-pcm.o
+++<<<<<<< HEAD
+++=======
++ obj-$(CONFIG_SND_DMAENGINE_PCM)	+= snd-pcm-dmaengine.o
++ obj-$(CONFIG_SND_SEQ_DEVICE)	+= snd-seq-device.o
+++>>>>>>> 111b0cdb97d4 (ALSA: seq: Allow the modular sequencer registration)
+  obj-$(CONFIG_SND_RAWMIDI)	+= snd-rawmidi.o
+  
+  obj-$(CONFIG_SND_OSSEMUL)	+= oss/
+diff --cc sound/isa/sb/emu8000.c
+index ba628286ad17,d56973b770c7..000000000000
+--- a/sound/isa/sb/emu8000.c
++++ b/sound/isa/sb/emu8000.c
+@@@ -1139,7 -1138,7 +1139,11 @@@ snd_emu8000_new(struct snd_card *card, 
+  		snd_emu8000_free(hw);
+  		return err;
+  	}
+++<<<<<<< HEAD
+ +#if defined(CONFIG_SND_SEQUENCER) || (defined(MODULE) && defined(CONFIG_SND_SEQUENCER_MODULE))
+++=======
++ #if IS_ENABLED(CONFIG_SND_SEQUENCER)
+++>>>>>>> 111b0cdb97d4 (ALSA: seq: Allow the modular sequencer registration)
+  	if (snd_seq_device_new(card, index, SNDRV_SEQ_DEV_ID_EMU8000,
+  			       sizeof(struct snd_emu8000*), &awe) >= 0) {
+  		strcpy(awe->name, "EMU-8000");
+diff --cc sound/isa/sb/sb16.c
+index 926c8e026c91,917a93d696c3..000000000000
+--- a/sound/isa/sb/sb16.c
++++ b/sound/isa/sb/sb16.c
+@@@ -62,7 -62,7 +62,11 @@@ MODULE_SUPPORTED_DEVICE("{{Creative Lab
+  #define SNDRV_DEBUG_IRQ
+  #endif
+  
+++<<<<<<< HEAD
+ +#if defined(SNDRV_SBAWE) && (defined(CONFIG_SND_SEQUENCER) || (defined(MODULE) && defined(CONFIG_SND_SEQUENCER_MODULE)))
+++=======
++ #if defined(SNDRV_SBAWE) && IS_ENABLED(CONFIG_SND_SEQUENCER)
+++>>>>>>> 111b0cdb97d4 (ALSA: seq: Allow the modular sequencer registration)
+  #define SNDRV_SBAWE_EMU8000
+  #endif
+  
+diff --git a/sound/core/Kconfig b/sound/core/Kconfig
+index 918f7a3b91d0..a7cc820be2dd 100644
+--- a/sound/core/Kconfig
++++ b/sound/core/Kconfig
+@@ -15,8 +15,12 @@ config SND_PCM_IEC958
+ config SND_HWDEP
+ 	tristate
+ 
++config SND_SEQ_DEVICE
++	tristate
++
+ config SND_RAWMIDI
+ 	tristate
++	select SND_SEQ_DEVICE if SND_SEQUENCER != n
+ 
+ config SND_COMPRESS_OFFLOAD
+ 	tristate
+* Unmerged path sound/core/Makefile
+diff --git a/sound/core/rawmidi.c b/sound/core/rawmidi.c
+index 8da9cb245d01..b6130ad43040 100644
+--- a/sound/core/rawmidi.c
++++ b/sound/core/rawmidi.c
+@@ -1610,7 +1610,7 @@ static int snd_rawmidi_dev_free(struct snd_device *device)
+ 	return snd_rawmidi_free(rmidi);
+ }
+ 
+-#if IS_REACHABLE(CONFIG_SND_SEQUENCER)
++#if IS_ENABLED(CONFIG_SND_SEQUENCER)
+ static void snd_rawmidi_dev_seq_free(struct snd_seq_device *device)
+ {
+ 	struct snd_rawmidi *rmidi = device->private_data;
+@@ -1691,7 +1691,7 @@ static int snd_rawmidi_dev_register(struct snd_device *device)
+ 		}
+ 	}
+ 	rmidi->proc_entry = entry;
+-#if IS_REACHABLE(CONFIG_SND_SEQUENCER)
++#if IS_ENABLED(CONFIG_SND_SEQUENCER)
+ 	if (!rmidi->ops || !rmidi->ops->dev_register) { /* own registration mechanism */
+ 		if (snd_seq_device_new(rmidi->card, rmidi->device, SNDRV_SEQ_DEV_ID_MIDISYNTH, 0, &rmidi->seq_dev) >= 0) {
+ 			rmidi->seq_dev->private_data = rmidi;
+diff --git a/sound/core/seq/Kconfig b/sound/core/seq/Kconfig
+index 140e640e62a6..a536760a94c2 100644
+--- a/sound/core/seq/Kconfig
++++ b/sound/core/seq/Kconfig
+@@ -1,6 +1,7 @@
+ config SND_SEQUENCER
+ 	tristate "Sequencer support"
+ 	select SND_TIMER
++	select SND_SEQ_DEVICE
+ 	help
+ 	  Say Y or M to enable MIDI sequencer and router support.  This
+ 	  feature allows routing and enqueueing of MIDI events.  Events
+@@ -59,4 +60,3 @@ config SND_SEQ_VIRMIDI
+ 	tristate
+ 
+ endif # SND_SEQUENCER
+-
+diff --git a/sound/core/seq/Makefile b/sound/core/seq/Makefile
+index 81a8ea537209..68fd367ac39c 100644
+--- a/sound/core/seq/Makefile
++++ b/sound/core/seq/Makefile
+@@ -3,7 +3,6 @@
+ # Copyright (c) 1999 by Jaroslav Kysela <perex@perex.cz>
+ #
+ 
+-snd-seq-device-objs := seq_device.o
+ snd-seq-objs := seq.o seq_lock.o seq_clientmgr.o seq_memory.o seq_queue.o \
+                 seq_fifo.o seq_prioq.o seq_timer.o \
+                 seq_system.o seq_ports.o
+@@ -14,7 +13,7 @@ snd-seq-midi-event-objs := seq_midi_event.o
+ snd-seq-dummy-objs := seq_dummy.o
+ snd-seq-virmidi-objs := seq_virmidi.o
+ 
+-obj-$(CONFIG_SND_SEQUENCER) += snd-seq.o snd-seq-device.o
++obj-$(CONFIG_SND_SEQUENCER) += snd-seq.o
+ obj-$(CONFIG_SND_SEQUENCER_OSS) += oss/
+ 
+ obj-$(CONFIG_SND_SEQ_DUMMY) += snd-seq-dummy.o
+diff --git a/sound/core/seq/seq_device.c b/sound/core/seq_device.c
+similarity index 100%
+rename from sound/core/seq/seq_device.c
+rename to sound/core/seq_device.c
+diff --git a/sound/drivers/Kconfig b/sound/drivers/Kconfig
+index 0e3dc80a7262..7144cc36e8ae 100644
+--- a/sound/drivers/Kconfig
++++ b/sound/drivers/Kconfig
+@@ -6,11 +6,13 @@ config SND_OPL3_LIB
+ 	tristate
+ 	select SND_TIMER
+ 	select SND_HWDEP
++	select SND_SEQ_DEVICE if SND_SEQUENCER != n
+ 
+ config SND_OPL4_LIB
+ 	tristate
+ 	select SND_TIMER
+ 	select SND_HWDEP
++	select SND_SEQ_DEVICE if SND_SEQUENCER != n
+ 
+ # select SEQ stuff to min(SND_SEQUENCER,SND_XXX)
+ config SND_OPL3_LIB_SEQ
+diff --git a/sound/drivers/opl3/opl3_lib.c b/sound/drivers/opl3/opl3_lib.c
+index cd9e9f31720f..d5e5b4657b4b 100644
+--- a/sound/drivers/opl3/opl3_lib.c
++++ b/sound/drivers/opl3/opl3_lib.c
+@@ -528,7 +528,7 @@ int snd_opl3_hwdep_new(struct snd_opl3 * opl3,
+ 
+ 	opl3->hwdep = hw;
+ 	opl3->seq_dev_num = seq_device;
+-#if IS_REACHABLE(CONFIG_SND_SEQUENCER)
++#if IS_ENABLED(CONFIG_SND_SEQUENCER)
+ 	if (snd_seq_device_new(card, seq_device, SNDRV_SEQ_DEV_ID_OPL3,
+ 			       sizeof(struct snd_opl3 *), &opl3->seq_dev) >= 0) {
+ 		strcpy(opl3->seq_dev->name, hw->name);
+diff --git a/sound/drivers/opl4/opl4_lib.c b/sound/drivers/opl4/opl4_lib.c
+index 240656e54400..bc345d564f8d 100644
+--- a/sound/drivers/opl4/opl4_lib.c
++++ b/sound/drivers/opl4/opl4_lib.c
+@@ -153,7 +153,7 @@ static int snd_opl4_detect(struct snd_opl4 *opl4)
+ 	return 0;
+ }
+ 
+-#if IS_REACHABLE(CONFIG_SND_SEQUENCER)
++#if IS_ENABLED(CONFIG_SND_SEQUENCER)
+ static void snd_opl4_seq_dev_free(struct snd_seq_device *seq_dev)
+ {
+ 	struct snd_opl4 *opl4 = seq_dev->private_data;
+@@ -249,7 +249,7 @@ int snd_opl4_create(struct snd_card *card,
+ 	snd_opl4_create_mixer(opl4);
+ 	snd_opl4_create_proc(opl4);
+ 
+-#if IS_REACHABLE(CONFIG_SND_SEQUENCER)
++#if IS_ENABLED(CONFIG_SND_SEQUENCER)
+ 	opl4->seq_client = -1;
+ 	if (opl4->hardware < OPL3_HW_OPL4_ML)
+ 		snd_opl4_create_seq_dev(opl4, seq_device);
+diff --git a/sound/drivers/opl4/opl4_local.h b/sound/drivers/opl4/opl4_local.h
+index d5bac93f8245..a16b4677c1e9 100644
+--- a/sound/drivers/opl4/opl4_local.h
++++ b/sound/drivers/opl4/opl4_local.h
+@@ -184,7 +184,7 @@ struct snd_opl4 {
+ #endif
+ 	struct mutex access_mutex;
+ 
+-#if IS_REACHABLE(CONFIG_SND_SEQUENCER)
++#if IS_ENABLED(CONFIG_SND_SEQUENCER)
+ 	int used;
+ 
+ 	int seq_dev_num;
+diff --git a/sound/isa/Kconfig b/sound/isa/Kconfig
+index 83623992b098..8e1aa580f528 100644
+--- a/sound/isa/Kconfig
++++ b/sound/isa/Kconfig
+@@ -377,6 +377,7 @@ config SND_SBAWE
+ 	select SND_OPL3_LIB
+ 	select SND_MPU401_UART
+ 	select SND_SB16_DSP
++	select SND_SEQ_DEVICE if SND_SEQUENCER != n
+ 	help
+ 	  Say Y here to include support for Sound Blaster AWE soundcards
+ 	  (including the Plug and Play version).
+* Unmerged path sound/isa/sb/emu8000.c
+* Unmerged path sound/isa/sb/sb16.c
+diff --git a/sound/pci/Kconfig b/sound/pci/Kconfig
+index 0b73d0d21a07..aa7bd1464ebc 100644
+--- a/sound/pci/Kconfig
++++ b/sound/pci/Kconfig
+@@ -469,6 +469,7 @@ config SND_EMU10K1
+ 	select SND_RAWMIDI
+ 	select SND_AC97_CODEC
+ 	select SND_TIMER
++	select SND_SEQ_DEVICE if SND_SEQUENCER != n
+ 	depends on ZONE_DMA
+ 	help
+ 	  Say Y to include support for Sound Blaster PCI 512, Live!,
+diff --git a/sound/pci/emu10k1/emu10k1.c b/sound/pci/emu10k1/emu10k1.c
+index 6a0e49ac5273..d3203df50a1a 100644
+--- a/sound/pci/emu10k1/emu10k1.c
++++ b/sound/pci/emu10k1/emu10k1.c
+@@ -37,7 +37,7 @@ MODULE_LICENSE("GPL");
+ MODULE_SUPPORTED_DEVICE("{{Creative Labs,SB Live!/PCI512/E-mu APS},"
+ 	       "{Creative Labs,SB Audigy}}");
+ 
+-#if IS_REACHABLE(CONFIG_SND_SEQUENCER)
++#if IS_ENABLED(CONFIG_SND_SEQUENCER)
+ #define ENABLE_SYNTH
+ #include <sound/emu10k1_synth.h>
+ #endif
