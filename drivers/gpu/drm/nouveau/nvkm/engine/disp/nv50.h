@@ -31,6 +31,9 @@ struct nv50_disp {
 		u8 type[3];
 	} pior;
 
+	struct nvkm_gpuobj *inst;
+	struct nvkm_ramht *ramht;
+
 	struct nv50_disp_chan *chan[21];
 };
 
@@ -45,6 +48,8 @@ int nv50_disp_new_(const struct nv50_disp_func *, struct nvkm_device *,
 		   int index, struct nvkm_disp **);
 
 struct nv50_disp_func {
+	int (*init)(struct nv50_disp *);
+	void (*fini)(struct nv50_disp *);
 	void (*intr)(struct nv50_disp *);
 	void (*intr_error)(struct nv50_disp *, int chid);
 
@@ -59,9 +64,13 @@ struct nv50_disp_func {
 	} head, dac, sor, pior;
 };
 
+int nv50_disp_init(struct nv50_disp *);
+void nv50_disp_fini(struct nv50_disp *);
 void nv50_disp_intr(struct nv50_disp *);
 void nv50_disp_super(struct work_struct *);
 
+int gf119_disp_init(struct nv50_disp *);
+void gf119_disp_fini(struct nv50_disp *);
 void gf119_disp_intr(struct nv50_disp *);
 void gf119_disp_super(struct work_struct *);
 void gf119_disp_intr_error(struct nv50_disp *, int);
