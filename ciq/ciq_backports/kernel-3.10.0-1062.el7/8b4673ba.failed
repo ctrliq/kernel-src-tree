@@ -1,0 +1,260 @@
+scsi: qla2xxx: Add support for ZIO6 interrupt threshold
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Add support for ZIO6 interrupt threshold (Himanshu Madhani) [1628301]
+Rebuild_FUZZ: 94.23%
+commit-author Quinn Tran <quinn.tran@cavium.com>
+commit 8b4673ba3a1b992b757a32667d2d3adae80e11fd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/8b4673ba.failed
+
+Add sysfs support to control zio6 interrupt threshold. Using this sysfs hook
+user can set when to generate interrupts. This value will be used to tell
+firmware to generate interrupt at a certain interval.  If the number of
+exchanges/commands fall below defined setting, then the interrupt will be
+generated immediately by the firmware.
+
+By default ZIO6 will coalesce interrupts to a specified interval
+regardless of low traffic or high traffic.
+
+[mkp: fixed several typos]
+
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 8b4673ba3a1b992b757a32667d2d3adae80e11fd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_mbx.c
+diff --cc drivers/scsi/qla2xxx/qla_mbx.c
+index 68c3b8af334a,3213017658a6..000000000000
+--- a/drivers/scsi/qla2xxx/qla_mbx.c
++++ b/drivers/scsi/qla2xxx/qla_mbx.c
+@@@ -59,6 -59,8 +59,11 @@@ struct rom_cmd 
+  	{ MBC_IOCB_COMMAND_A64 },
+  	{ MBC_GET_ADAPTER_LOOP_ID },
+  	{ MBC_READ_SFP },
+++<<<<<<< HEAD
+++=======
++ 	{ MBC_GET_RNID_PARAMS },
++ 	{ MBC_GET_SET_ZIO_THRESHOLD },
+++>>>>>>> 8b4673ba3a1b (scsi: qla2xxx: Add support for ZIO6 interrupt threshold)
+  };
+  
+  static int is_rom_cmd(uint16_t cmd)
+diff --git a/drivers/scsi/qla2xxx/qla_attr.c b/drivers/scsi/qla2xxx/qla_attr.c
+index 6fff0cceac31..2acb3f34e9dd 100644
+--- a/drivers/scsi/qla2xxx/qla_attr.c
++++ b/drivers/scsi/qla2xxx/qla_attr.c
+@@ -1141,6 +1141,34 @@ qla2x00_zio_timer_store(struct device *dev, struct device_attribute *attr,
+ 	return strlen(buf);
+ }
+ 
++static ssize_t
++qla_zio_threshold_show(struct device *dev, struct device_attribute *attr,
++		       char *buf)
++{
++	scsi_qla_host_t *vha = shost_priv(class_to_shost(dev));
++
++	return scnprintf(buf, PAGE_SIZE, "%d exchanges\n",
++	    vha->hw->last_zio_threshold);
++}
++
++static ssize_t
++qla_zio_threshold_store(struct device *dev, struct device_attribute *attr,
++    const char *buf, size_t count)
++{
++	scsi_qla_host_t *vha = shost_priv(class_to_shost(dev));
++	int val = 0;
++
++	if (vha->hw->zio_mode != QLA_ZIO_MODE_6)
++		return -EINVAL;
++	if (sscanf(buf, "%d", &val) != 1)
++		return -EINVAL;
++	if (val > 256)
++		return -ERANGE;
++
++	atomic_set(&vha->hw->zio_threshold, val);
++	return strlen(buf);
++}
++
+ static ssize_t
+ qla2x00_beacon_show(struct device *dev, struct device_attribute *attr,
+ 		    char *buf)
+@@ -1564,6 +1592,9 @@ static DEVICE_ATTR(allow_cna_fw_dump, S_IRUGO | S_IWUSR,
+ static DEVICE_ATTR(pep_version, S_IRUGO, qla2x00_pep_version_show, NULL);
+ static DEVICE_ATTR(min_link_speed, S_IRUGO, qla2x00_min_link_speed_show, NULL);
+ static DEVICE_ATTR(max_speed_sup, S_IRUGO, qla2x00_max_speed_sup_show, NULL);
++static DEVICE_ATTR(zio_threshold, 0644,
++    qla_zio_threshold_show,
++    qla_zio_threshold_store);
+ 
+ struct device_attribute *qla2x00_host_attrs[] = {
+ 	&dev_attr_driver_version,
+@@ -1600,6 +1631,7 @@ struct device_attribute *qla2x00_host_attrs[] = {
+ 	&dev_attr_pep_version,
+ 	&dev_attr_min_link_speed,
+ 	&dev_attr_max_speed_sup,
++	&dev_attr_zio_threshold,
+ 	NULL,
+ };
+ 
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 3d4cdf4444af..be46f2845ded 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -4183,6 +4183,10 @@ struct qla_hw_data {
+ 
+ 	atomic_t        nvme_active_aen_cnt;
+ 	uint16_t        nvme_last_rptd_aen;             /* Last recorded aen count */
++
++	atomic_t zio_threshold;
++	uint16_t last_zio_threshold;
++#define DEFAULT_ZIO_THRESHOLD 64
+ };
+ 
+ #define FW_ABILITY_MAX_SPEED_MASK	0xFUL
+@@ -4262,10 +4266,11 @@ typedef struct scsi_qla_host {
+ #define FX00_CRITEMP_RECOVERY	25
+ #define FX00_HOST_INFO_RESEND	26
+ #define QPAIR_ONLINE_CHECK_NEEDED	27
+-#define SET_ZIO_THRESHOLD_NEEDED	28
++#define SET_NVME_ZIO_THRESHOLD_NEEDED	28
+ #define DETECT_SFP_CHANGE	29
+ #define N2N_LOGIN_NEEDED	30
+ #define IOCB_WORK_ACTIVE	31
++#define SET_ZIO_THRESHOLD_NEEDED 32
+ 
+ 	unsigned long	pci_flags;
+ #define PFLG_DISCONNECTED	0	/* PCI device removed */
+diff --git a/drivers/scsi/qla2xxx/qla_init.c b/drivers/scsi/qla2xxx/qla_init.c
+index ace3dc961882..35fa1dc1d084 100644
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@ -3351,6 +3351,11 @@ qla2x00_setup_chip(scsi_qla_host_t *vha)
+ 			if (rval == QLA_SUCCESS) {
+ 				qla24xx_detect_sfp(vha);
+ 
++				if ((IS_QLA83XX(ha) || IS_QLA27XX(ha)) &&
++				    (ha->zio_mode == QLA_ZIO_MODE_6))
++					qla27xx_set_zio_threshold(vha,
++					    ha->last_zio_threshold);
++
+ 				rval = qla2x00_set_exlogins_buffer(vha);
+ 				if (rval != QLA_SUCCESS)
+ 					goto failed;
+* Unmerged path drivers/scsi/qla2xxx/qla_mbx.c
+diff --git a/drivers/scsi/qla2xxx/qla_os.c b/drivers/scsi/qla2xxx/qla_os.c
+index 2f76757b3740..527ee959bab2 100644
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@ -2889,6 +2889,8 @@ qla2x00_probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	atomic_set(&ha->num_pend_mbx_stage1, 0);
+ 	atomic_set(&ha->num_pend_mbx_stage2, 0);
+ 	atomic_set(&ha->num_pend_mbx_stage3, 0);
++	atomic_set(&ha->zio_threshold, DEFAULT_ZIO_THRESHOLD);
++	ha->last_zio_threshold = DEFAULT_ZIO_THRESHOLD;
+ 
+ 	/* Assign ISP specific operations. */
+ 	if (IS_QLA2100(ha)) {
+@@ -6258,17 +6260,28 @@ intr_on_check:
+ 			mutex_unlock(&ha->mq_lock);
+ 		}
+ 
+-		if (test_and_clear_bit(SET_ZIO_THRESHOLD_NEEDED, &base_vha->dpc_flags)) {
++		if (test_and_clear_bit(SET_NVME_ZIO_THRESHOLD_NEEDED,
++		    &base_vha->dpc_flags)) {
+ 			ql_log(ql_log_info, base_vha, 0xffffff,
+ 				"nvme: SET ZIO Activity exchange threshold to %d.\n",
+ 						ha->nvme_last_rptd_aen);
+-			if (qla27xx_set_zio_threshold(base_vha, ha->nvme_last_rptd_aen)) {
++			if (qla27xx_set_zio_threshold(base_vha,
++			    ha->nvme_last_rptd_aen)) {
+ 				ql_log(ql_log_info, base_vha, 0xffffff,
+-					"nvme: Unable to SET ZIO Activity exchange threshold to %d.\n",
+-						ha->nvme_last_rptd_aen);
++				    "nvme: Unable to SET ZIO Activity exchange threshold to %d.\n",
++				    ha->nvme_last_rptd_aen);
+ 			}
+ 		}
+ 
++		if (test_and_clear_bit(SET_ZIO_THRESHOLD_NEEDED,
++		    &base_vha->dpc_flags)) {
++			ql_log(ql_log_info, base_vha, 0xffffff,
++			    "SET ZIO Activity exchange threshold to %d.\n",
++			    ha->last_zio_threshold);
++			qla27xx_set_zio_threshold(base_vha,
++			    ha->last_zio_threshold);
++		}
++
+ 		if (!IS_QLAFX00(ha))
+ 			qla2x00_do_dpc_all_vps(base_vha);
+ 
+@@ -6475,13 +6488,24 @@ qla2x00_timer(scsi_qla_host_t *vha)
+ 	 * FC-NVME
+ 	 * see if the active AEN count has changed from what was last reported.
+ 	 */
+-	if (!vha->vp_idx &&
+-		atomic_read(&ha->nvme_active_aen_cnt) != ha->nvme_last_rptd_aen &&
+-		ha->zio_mode == QLA_ZIO_MODE_6) {
++	if (!vha->vp_idx && (atomic_read(&ha->nvme_active_aen_cnt) !=
++	    ha->nvme_last_rptd_aen) && ha->zio_mode == QLA_ZIO_MODE_6) {
+ 		ql_log(ql_log_info, vha, 0x3002,
+-			"nvme: Sched: Set ZIO exchange threshold to %d.\n",
+-			ha->nvme_last_rptd_aen);
++		    "nvme: Sched: Set ZIO exchange threshold to %d.\n",
++		    ha->nvme_last_rptd_aen);
+ 		ha->nvme_last_rptd_aen = atomic_read(&ha->nvme_active_aen_cnt);
++		set_bit(SET_NVME_ZIO_THRESHOLD_NEEDED, &vha->dpc_flags);
++		start_dpc++;
++	}
++
++	if (!vha->vp_idx &&
++	    (atomic_read(&ha->zio_threshold) != ha->last_zio_threshold) &&
++	    (ha->zio_mode == QLA_ZIO_MODE_6) &&
++	    (IS_QLA83XX(ha) || IS_QLA27XX(ha))) {
++		ql_log(ql_log_info, vha, 0x3002,
++		    "Sched: Set ZIO exchange threshold to %d.\n",
++		    ha->last_zio_threshold);
++		ha->last_zio_threshold = atomic_read(&ha->zio_threshold);
+ 		set_bit(SET_ZIO_THRESHOLD_NEEDED, &vha->dpc_flags);
+ 		start_dpc++;
+ 	}
+diff --git a/drivers/scsi/qla2xxx/qla_target.c b/drivers/scsi/qla2xxx/qla_target.c
+index 1de1bf228cff..45b8ca190b0d 100644
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@ -6817,14 +6817,6 @@ qlt_24xx_config_nvram_stage2(struct scsi_qla_host *vha,
+ 		memcpy(icb->node_name, ha->tgt.tgt_node_name, WWN_SIZE);
+ 		icb->firmware_options_1 |= cpu_to_le32(BIT_14);
+ 	}
+-
+-	/* disable ZIO at start time. */
+-	if (!vha->flags.init_done) {
+-		uint32_t tmp;
+-		tmp = le32_to_cpu(icb->firmware_options_2);
+-		tmp &= ~(BIT_3 | BIT_2 | BIT_1 | BIT_0);
+-		icb->firmware_options_2 = cpu_to_le32(tmp);
+-	}
+ }
+ 
+ void
+@@ -6928,15 +6920,6 @@ qlt_81xx_config_nvram_stage2(struct scsi_qla_host *vha,
+ 		memcpy(icb->node_name, ha->tgt.tgt_node_name, WWN_SIZE);
+ 		icb->firmware_options_1 |= cpu_to_le32(BIT_14);
+ 	}
+-
+-	/* disable ZIO at start time. */
+-	if (!vha->flags.init_done) {
+-		uint32_t tmp;
+-		tmp = le32_to_cpu(icb->firmware_options_2);
+-		tmp &= ~(BIT_3 | BIT_2 | BIT_1 | BIT_0);
+-		icb->firmware_options_2 = cpu_to_le32(tmp);
+-	}
+-
+ }
+ 
+ void
