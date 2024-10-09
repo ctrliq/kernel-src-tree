@@ -1,0 +1,293 @@
+ip6_gre: add ip6 gre and gretap collect_md mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author William Tu <u9012063@gmail.com>
+commit 6712abc168ebac90b46088b89798aa31a1bc79f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/6712abc1.failed
+
+Similar to gre, vxlan, geneve, ipip tunnels, allow ip6 gre and gretap
+tunnels to operate in collect metadata mode.  bpf_skb_[gs]et_tunnel_key()
+helpers can make use of it right away.  OVS can use it as well in the
+future.
+
+	Signed-off-by: William Tu <u9012063@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6712abc168ebac90b46088b89798aa31a1bc79f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/ip6_gre.c
+diff --cc net/ipv6/ip6_gre.c
+index d333143106be,1510ce9a4e4e..000000000000
+--- a/net/ipv6/ip6_gre.c
++++ b/net/ipv6/ip6_gre.c
+@@@ -55,6 -55,8 +55,11 @@@
+  #include <net/ip6_route.h>
+  #include <net/ip6_tunnel.h>
+  #include <net/gre.h>
+++<<<<<<< HEAD
+++=======
++ #include <net/erspan.h>
++ #include <net/dst_metadata.h>
+++>>>>>>> 6712abc168eb (ip6_gre: add ip6 gre and gretap collect_md mode)
+  
+  
+  static bool log_ecn_error = true;
+@@@ -223,9 -228,13 +229,13 @@@ static struct ip6_tnl *ip6gre_tunnel_lo
+  		}
+  	}
+  
+ -	if (cand)
+ +	if (cand != NULL)
+  		return cand;
+  
++ 	t = rcu_dereference(ign->collect_md_tun);
++ 	if (t && t->dev->flags & IFF_UP)
++ 		return t;
++ 
+  	dev = ign->fb_tunnel_dev;
+  	if (dev->flags & IFF_UP)
+  		return netdev_priv(dev);
+@@@ -536,27 -700,17 +597,33 @@@ static netdev_tx_t __gre6_xmit(struct s
+  static inline int ip6gre_xmit_ipv4(struct sk_buff *skb, struct net_device *dev)
+  {
+  	struct ip6_tnl *t = netdev_priv(dev);
+ +	const struct iphdr  *iph = ip_hdr(skb);
+  	int encap_limit = -1;
+  	struct flowi6 fl6;
+- 	__u8 dsfield;
++ 	__u8 dsfield = 0;
+  	__u32 mtu;
+  	int err;
+  
+  	memset(&(IPCB(skb)->opt), 0, sizeof(IPCB(skb)->opt));
+  
+++<<<<<<< HEAD
+ +	if (!(t->parms.flags & IP6_TNL_F_IGN_ENCAP_LIMIT))
+ +		encap_limit = t->parms.encap_limit;
+ +
+ +	memcpy(&fl6, &t->fl.u.ip6, sizeof(fl6));
+ +
+ +	dsfield = ipv4_get_dsfield(iph);
+ +
+ +	if (t->parms.flags & IP6_TNL_F_USE_ORIG_TCLASS)
+ +		fl6.flowlabel |= htonl((__u32)iph->tos << IPV6_TCLASS_SHIFT)
+ +					  & IPV6_TCLASS_MASK;
+ +	if (t->parms.flags & IP6_TNL_F_USE_ORIG_FWMARK)
+ +		fl6.flowi6_mark = skb->mark;
+++=======
++ 	if (!t->parms.collect_md)
++ 		prepare_ip6gre_xmit_ipv4(skb, dev, &fl6,
++ 					 &dsfield, &encap_limit);
+++>>>>>>> 6712abc168eb (ip6_gre: add ip6 gre and gretap collect_md mode)
+  
+  	err = gre_handle_offloads(skb, !!(t->parms.o_flags & TUNNEL_CSUM));
+  	if (err)
+@@@ -580,40 -734,17 +647,46 @@@ static inline int ip6gre_xmit_ipv6(stru
+  	struct ip6_tnl *t = netdev_priv(dev);
+  	struct ipv6hdr *ipv6h = ipv6_hdr(skb);
+  	int encap_limit = -1;
+ +	__u16 offset;
+  	struct flowi6 fl6;
+- 	__u8 dsfield;
++ 	__u8 dsfield = 0;
+  	__u32 mtu;
+  	int err;
+  
+  	if (ipv6_addr_equal(&t->parms.raddr, &ipv6h->saddr))
+  		return -1;
+  
+++<<<<<<< HEAD
+ +	offset = ip6_tnl_parse_tlv_enc_lim(skb, skb_network_header(skb));
+ +	/* ip6_tnl_parse_tlv_enc_lim() might have reallocated skb->head */
+ +	ipv6h = ipv6_hdr(skb);
+ +
+ +	if (offset > 0) {
+ +		struct ipv6_tlv_tnl_enc_lim *tel;
+ +		tel = (struct ipv6_tlv_tnl_enc_lim *)&skb_network_header(skb)[offset];
+ +		if (tel->encap_limit == 0) {
+ +			icmpv6_send(skb, ICMPV6_PARAMPROB,
+ +				    ICMPV6_HDR_FIELD, offset + 2);
+ +			return -1;
+ +		}
+ +		encap_limit = tel->encap_limit - 1;
+ +	} else if (!(t->parms.flags & IP6_TNL_F_IGN_ENCAP_LIMIT))
+ +		encap_limit = t->parms.encap_limit;
+ +
+ +	memcpy(&fl6, &t->fl.u.ip6, sizeof(fl6));
+ +
+ +	dsfield = ipv6_get_dsfield(ipv6h);
+ +	if (t->parms.flags & IP6_TNL_F_USE_ORIG_TCLASS)
+ +		fl6.flowlabel |= (*(__be32 *) ipv6h & IPV6_TCLASS_MASK);
+ +	if (t->parms.flags & IP6_TNL_F_USE_ORIG_FLOWLABEL)
+ +		fl6.flowlabel |= ip6_flowlabel(ipv6h);
+ +	if (t->parms.flags & IP6_TNL_F_USE_ORIG_FWMARK)
+ +		fl6.flowi6_mark = skb->mark;
+++=======
++ 	if (!t->parms.collect_md &&
++ 	    prepare_ip6gre_xmit_ipv6(skb, dev, &fl6, &dsfield, &encap_limit))
++ 		return -1;
+++>>>>>>> 6712abc168eb (ip6_gre: add ip6 gre and gretap collect_md mode)
+  
+  	if (gre_handle_offloads(skb, !!(t->parms.o_flags & TUNNEL_CSUM)))
+  		return -1;
+@@@ -1255,6 -1527,15 +1337,18 @@@ static void ip6gre_netlink_parms(struc
+  
+  	if (data[IFLA_GRE_FLAGS])
+  		parms->flags = nla_get_u32(data[IFLA_GRE_FLAGS]);
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (data[IFLA_GRE_FWMARK])
++ 		parms->fwmark = nla_get_u32(data[IFLA_GRE_FWMARK]);
++ 
++ 	if (data[IFLA_GRE_ERSPAN_INDEX])
++ 		parms->index = nla_get_u32(data[IFLA_GRE_ERSPAN_INDEX]);
++ 
++ 	if (data[IFLA_GRE_COLLECT_METADATA])
++ 		parms->collect_md = true;
+++>>>>>>> 6712abc168eb (ip6_gre: add ip6 gre and gretap collect_md mode)
+  }
+  
+  static int ip6gre_tap_init(struct net_device *dev)
+@@@ -1311,10 -1683,24 +1405,15 @@@ static int ip6gre_newlink(struct net *s
+  	int err;
+  
+  	nt = netdev_priv(dev);
+ -
+ -	if (ip6gre_netlink_encap_parms(data, &ipencap)) {
+ -		int err = ip6_tnl_encap_setup(nt, &ipencap);
+ -
+ -		if (err < 0)
+ -			return err;
+ -	}
+ -
+  	ip6gre_netlink_parms(data, &nt->parms);
+  
+- 	if (ip6gre_tunnel_find(net, &nt->parms, dev->type))
+- 		return -EEXIST;
++ 	if (nt->parms.collect_md) {
++ 		if (rtnl_dereference(ign->collect_md_tun))
++ 			return -EEXIST;
++ 	} else {
++ 		if (ip6gre_tunnel_find(net, &nt->parms, dev->type))
++ 			return -EEXIST;
++ 	}
+  
+  	if (dev->type == ARPHRD_ETHER && !tb[IFLA_ADDRESS])
+  		eth_hw_addr_random(dev);
+@@@ -1416,6 -1811,20 +1515,23 @@@ static size_t ip6gre_get_size(const str
+  		nla_total_size(4) +
+  		/* IFLA_GRE_FLAGS */
+  		nla_total_size(4) +
+++<<<<<<< HEAD
+++=======
++ 		/* IFLA_GRE_ENCAP_TYPE */
++ 		nla_total_size(2) +
++ 		/* IFLA_GRE_ENCAP_FLAGS */
++ 		nla_total_size(2) +
++ 		/* IFLA_GRE_ENCAP_SPORT */
++ 		nla_total_size(2) +
++ 		/* IFLA_GRE_ENCAP_DPORT */
++ 		nla_total_size(2) +
++ 		/* IFLA_GRE_COLLECT_METADATA */
++ 		nla_total_size(0) +
++ 		/* IFLA_GRE_FWMARK */
++ 		nla_total_size(4) +
++ 		/* IFLA_GRE_ERSPAN_INDEX */
++ 		nla_total_size(4) +
+++>>>>>>> 6712abc168eb (ip6_gre: add ip6 gre and gretap collect_md mode)
+  		0;
+  }
+  
+@@@ -1436,8 -1845,26 +1552,27 @@@ static int ip6gre_fill_info(struct sk_b
+  	    nla_put_u8(skb, IFLA_GRE_TTL, p->hop_limit) ||
+  	    nla_put_u8(skb, IFLA_GRE_ENCAP_LIMIT, p->encap_limit) ||
+  	    nla_put_be32(skb, IFLA_GRE_FLOWINFO, p->flowinfo) ||
+ -	    nla_put_u32(skb, IFLA_GRE_FLAGS, p->flags) ||
+ -	    nla_put_u32(skb, IFLA_GRE_FWMARK, p->fwmark) ||
+ -	    nla_put_u32(skb, IFLA_GRE_ERSPAN_INDEX, p->index))
+ +	    nla_put_u32(skb, IFLA_GRE_FLAGS, p->flags))
+  		goto nla_put_failure;
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (nla_put_u16(skb, IFLA_GRE_ENCAP_TYPE,
++ 			t->encap.type) ||
++ 	    nla_put_be16(skb, IFLA_GRE_ENCAP_SPORT,
++ 			 t->encap.sport) ||
++ 	    nla_put_be16(skb, IFLA_GRE_ENCAP_DPORT,
++ 			 t->encap.dport) ||
++ 	    nla_put_u16(skb, IFLA_GRE_ENCAP_FLAGS,
++ 			t->encap.flags))
++ 		goto nla_put_failure;
++ 
++ 	if (p->collect_md) {
++ 		if (nla_put_flag(skb, IFLA_GRE_COLLECT_METADATA))
++ 			goto nla_put_failure;
++ 	}
++ 
+++>>>>>>> 6712abc168eb (ip6_gre: add ip6 gre and gretap collect_md mode)
+  	return 0;
+  
+  nla_put_failure:
+@@@ -1456,8 -1883,29 +1591,18 @@@ static const struct nla_policy ip6gre_p
+  	[IFLA_GRE_ENCAP_LIMIT] = { .type = NLA_U8 },
+  	[IFLA_GRE_FLOWINFO]    = { .type = NLA_U32 },
+  	[IFLA_GRE_FLAGS]       = { .type = NLA_U32 },
+++<<<<<<< HEAD
+++=======
++ 	[IFLA_GRE_ENCAP_TYPE]   = { .type = NLA_U16 },
++ 	[IFLA_GRE_ENCAP_FLAGS]  = { .type = NLA_U16 },
++ 	[IFLA_GRE_ENCAP_SPORT]  = { .type = NLA_U16 },
++ 	[IFLA_GRE_ENCAP_DPORT]  = { .type = NLA_U16 },
++ 	[IFLA_GRE_COLLECT_METADATA] = { .type = NLA_FLAG },
++ 	[IFLA_GRE_FWMARK]       = { .type = NLA_U32 },
++ 	[IFLA_GRE_ERSPAN_INDEX] = { .type = NLA_U32 },
+++>>>>>>> 6712abc168eb (ip6_gre: add ip6 gre and gretap collect_md mode)
+  };
+  
+ -static void ip6erspan_tap_setup(struct net_device *dev)
+ -{
+ -	ether_setup(dev);
+ -
+ -	dev->netdev_ops = &ip6erspan_netdev_ops;
+ -	dev->needs_free_netdev = true;
+ -	dev->priv_destructor = ip6gre_dev_free;
+ -
+ -	dev->features |= NETIF_F_NETNS_LOCAL;
+ -	dev->priv_flags &= ~IFF_TX_SKB_SHARING;
+ -	dev->priv_flags |= IFF_LIVE_ADDR_CHANGE;
+ -	netif_keep_dst(dev);
+ -}
+ -
+  static struct rtnl_link_ops ip6gre_link_ops __read_mostly = {
+  	.kind		= "ip6gre",
+  	.maxtype	= IFLA_GRE_MAX,
+* Unmerged path net/ipv6/ip6_gre.c
+diff --git a/net/ipv6/ip6_tunnel.c b/net/ipv6/ip6_tunnel.c
+index 5663d90448eb..d487e3f9660c 100644
+--- a/net/ipv6/ip6_tunnel.c
++++ b/net/ipv6/ip6_tunnel.c
+@@ -845,7 +845,7 @@ int ip6_tnl_rcv(struct ip6_tnl *t, struct sk_buff *skb,
+ 		struct metadata_dst *tun_dst,
+ 		bool log_ecn_err)
+ {
+-	return __ip6_tnl_rcv(t, skb, tpi, NULL, ip6ip6_dscp_ecn_decapsulate,
++	return __ip6_tnl_rcv(t, skb, tpi, tun_dst, ip6ip6_dscp_ecn_decapsulate,
+ 			     log_ecn_err);
+ }
+ EXPORT_SYMBOL(ip6_tnl_rcv);
+@@ -958,6 +958,9 @@ int ip6_tnl_xmit_ctl(struct ip6_tnl *t,
+ 	int ret = 0;
+ 	struct net *net = t->net;
+ 
++	if (t->parms.collect_md)
++		return 1;
++
+ 	if ((p->flags & IP6_TNL_F_CAP_XMIT) ||
+ 	    ((p->flags & IP6_TNL_F_CAP_PER_PACKET) &&
+ 	     (ip6_tnl_get_cap(t, laddr, raddr) & IP6_TNL_F_CAP_XMIT))) {
