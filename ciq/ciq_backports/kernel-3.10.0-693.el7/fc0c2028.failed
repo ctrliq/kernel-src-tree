@@ -1,0 +1,380 @@
+x86, pmem: use memcpy_mcsafe() for memcpy_from_pmem()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit fc0c2028135c7f75fce36b90e44efb8003a9173b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/fc0c2028.failed
+
+Update the definition of memcpy_from_pmem() to return 0 or a negative
+error code.  Implement x86/arch_memcpy_from_pmem() with memcpy_mcsafe().
+
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Acked-by: Ingo Molnar <mingo@kernel.org>
+	Reviewed-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit fc0c2028135c7f75fce36b90e44efb8003a9173b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvdimm/pmem.c
+#	include/linux/pmem.h
+diff --cc drivers/nvdimm/pmem.c
+index c66d94ebde57,cc31c6f1f88e..000000000000
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@@ -307,9 -280,264 +307,264 @@@ static int pmem_attach_disk(struct devi
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int pmem_rw_bytes(struct nd_namespace_common *ndns,
++ 		resource_size_t offset, void *buf, size_t size, int rw)
++ {
++ 	struct pmem_device *pmem = dev_get_drvdata(ndns->claim);
++ 
++ 	if (unlikely(offset + size > pmem->size)) {
++ 		dev_WARN_ONCE(&ndns->dev, 1, "request out of range\n");
++ 		return -EFAULT;
++ 	}
++ 
++ 	if (rw == READ) {
++ 		unsigned int sz_align = ALIGN(size + (offset & (512 - 1)), 512);
++ 
++ 		if (unlikely(is_bad_pmem(&pmem->bb, offset / 512, sz_align)))
++ 			return -EIO;
++ 		return memcpy_from_pmem(buf, pmem->virt_addr + offset, size);
++ 	} else {
++ 		memcpy_to_pmem(pmem->virt_addr + offset, buf, size);
++ 		wmb_pmem();
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int nd_pfn_init(struct nd_pfn *nd_pfn)
++ {
++ 	struct nd_pfn_sb *pfn_sb = kzalloc(sizeof(*pfn_sb), GFP_KERNEL);
++ 	struct pmem_device *pmem = dev_get_drvdata(&nd_pfn->dev);
++ 	struct nd_namespace_common *ndns = nd_pfn->ndns;
++ 	u32 start_pad = 0, end_trunc = 0;
++ 	resource_size_t start, size;
++ 	struct nd_namespace_io *nsio;
++ 	struct nd_region *nd_region;
++ 	unsigned long npfns;
++ 	phys_addr_t offset;
++ 	u64 checksum;
++ 	int rc;
++ 
++ 	if (!pfn_sb)
++ 		return -ENOMEM;
++ 
++ 	nd_pfn->pfn_sb = pfn_sb;
++ 	rc = nd_pfn_validate(nd_pfn);
++ 	if (rc == -ENODEV)
++ 		/* no info block, do init */;
++ 	else
++ 		return rc;
++ 
++ 	nd_region = to_nd_region(nd_pfn->dev.parent);
++ 	if (nd_region->ro) {
++ 		dev_info(&nd_pfn->dev,
++ 				"%s is read-only, unable to init metadata\n",
++ 				dev_name(&nd_region->dev));
++ 		goto err;
++ 	}
++ 
++ 	memset(pfn_sb, 0, sizeof(*pfn_sb));
++ 
++ 	/*
++ 	 * Check if pmem collides with 'System RAM' when section aligned and
++ 	 * trim it accordingly
++ 	 */
++ 	nsio = to_nd_namespace_io(&ndns->dev);
++ 	start = PHYS_SECTION_ALIGN_DOWN(nsio->res.start);
++ 	size = resource_size(&nsio->res);
++ 	if (region_intersects(start, size, IORESOURCE_SYSTEM_RAM,
++ 				IORES_DESC_NONE) == REGION_MIXED) {
++ 
++ 		start = nsio->res.start;
++ 		start_pad = PHYS_SECTION_ALIGN_UP(start) - start;
++ 	}
++ 
++ 	start = nsio->res.start;
++ 	size = PHYS_SECTION_ALIGN_UP(start + size) - start;
++ 	if (region_intersects(start, size, IORESOURCE_SYSTEM_RAM,
++ 				IORES_DESC_NONE) == REGION_MIXED) {
++ 		size = resource_size(&nsio->res);
++ 		end_trunc = start + size - PHYS_SECTION_ALIGN_DOWN(start + size);
++ 	}
++ 
++ 	if (start_pad + end_trunc)
++ 		dev_info(&nd_pfn->dev, "%s section collision, truncate %d bytes\n",
++ 				dev_name(&ndns->dev), start_pad + end_trunc);
++ 
++ 	/*
++ 	 * Note, we use 64 here for the standard size of struct page,
++ 	 * debugging options may cause it to be larger in which case the
++ 	 * implementation will limit the pfns advertised through
++ 	 * ->direct_access() to those that are included in the memmap.
++ 	 */
++ 	start += start_pad;
++ 	npfns = (pmem->size - start_pad - end_trunc - SZ_8K) / SZ_4K;
++ 	if (nd_pfn->mode == PFN_MODE_PMEM)
++ 		offset = ALIGN(start + SZ_8K + 64 * npfns, nd_pfn->align)
++ 			- start;
++ 	else if (nd_pfn->mode == PFN_MODE_RAM)
++ 		offset = ALIGN(start + SZ_8K, nd_pfn->align) - start;
++ 	else
++ 		goto err;
++ 
++ 	if (offset + start_pad + end_trunc >= pmem->size) {
++ 		dev_err(&nd_pfn->dev, "%s unable to satisfy requested alignment\n",
++ 				dev_name(&ndns->dev));
++ 		goto err;
++ 	}
++ 
++ 	npfns = (pmem->size - offset - start_pad - end_trunc) / SZ_4K;
++ 	pfn_sb->mode = cpu_to_le32(nd_pfn->mode);
++ 	pfn_sb->dataoff = cpu_to_le64(offset);
++ 	pfn_sb->npfns = cpu_to_le64(npfns);
++ 	memcpy(pfn_sb->signature, PFN_SIG, PFN_SIG_LEN);
++ 	memcpy(pfn_sb->uuid, nd_pfn->uuid, 16);
++ 	memcpy(pfn_sb->parent_uuid, nd_dev_to_uuid(&ndns->dev), 16);
++ 	pfn_sb->version_major = cpu_to_le16(1);
++ 	pfn_sb->version_minor = cpu_to_le16(1);
++ 	pfn_sb->start_pad = cpu_to_le32(start_pad);
++ 	pfn_sb->end_trunc = cpu_to_le32(end_trunc);
++ 	checksum = nd_sb_checksum((struct nd_gen_sb *) pfn_sb);
++ 	pfn_sb->checksum = cpu_to_le64(checksum);
++ 
++ 	rc = nvdimm_write_bytes(ndns, SZ_4K, pfn_sb, sizeof(*pfn_sb));
++ 	if (rc)
++ 		goto err;
++ 
++ 	return 0;
++  err:
++ 	nd_pfn->pfn_sb = NULL;
++ 	kfree(pfn_sb);
++ 	return -ENXIO;
++ }
++ 
++ static int nvdimm_namespace_detach_pfn(struct nd_namespace_common *ndns)
++ {
++ 	struct nd_pfn *nd_pfn = to_nd_pfn(ndns->claim);
++ 	struct pmem_device *pmem;
++ 
++ 	/* free pmem disk */
++ 	pmem = dev_get_drvdata(&nd_pfn->dev);
++ 	pmem_detach_disk(pmem);
++ 
++ 	/* release nd_pfn resources */
++ 	kfree(nd_pfn->pfn_sb);
++ 	nd_pfn->pfn_sb = NULL;
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * We hotplug memory at section granularity, pad the reserved area from
++  * the previous section base to the namespace base address.
++  */
++ static unsigned long init_altmap_base(resource_size_t base)
++ {
++ 	unsigned long base_pfn = PHYS_PFN(base);
++ 
++ 	return PFN_SECTION_ALIGN_DOWN(base_pfn);
++ }
++ 
++ static unsigned long init_altmap_reserve(resource_size_t base)
++ {
++ 	unsigned long reserve = PHYS_PFN(SZ_8K);
++ 	unsigned long base_pfn = PHYS_PFN(base);
++ 
++ 	reserve += base_pfn - PFN_SECTION_ALIGN_DOWN(base_pfn);
++ 	return reserve;
++ }
++ 
++ static int __nvdimm_namespace_attach_pfn(struct nd_pfn *nd_pfn)
++ {
++ 	int rc;
++ 	struct resource res;
++ 	struct request_queue *q;
++ 	struct pmem_device *pmem;
++ 	struct vmem_altmap *altmap;
++ 	struct device *dev = &nd_pfn->dev;
++ 	struct nd_pfn_sb *pfn_sb = nd_pfn->pfn_sb;
++ 	struct nd_namespace_common *ndns = nd_pfn->ndns;
++ 	u32 start_pad = __le32_to_cpu(pfn_sb->start_pad);
++ 	u32 end_trunc = __le32_to_cpu(pfn_sb->end_trunc);
++ 	struct nd_namespace_io *nsio = to_nd_namespace_io(&ndns->dev);
++ 	resource_size_t base = nsio->res.start + start_pad;
++ 	struct vmem_altmap __altmap = {
++ 		.base_pfn = init_altmap_base(base),
++ 		.reserve = init_altmap_reserve(base),
++ 	};
++ 
++ 	pmem = dev_get_drvdata(dev);
++ 	pmem->data_offset = le64_to_cpu(pfn_sb->dataoff);
++ 	pmem->pfn_pad = start_pad + end_trunc;
++ 	nd_pfn->mode = le32_to_cpu(nd_pfn->pfn_sb->mode);
++ 	if (nd_pfn->mode == PFN_MODE_RAM) {
++ 		if (pmem->data_offset < SZ_8K)
++ 			return -EINVAL;
++ 		nd_pfn->npfns = le64_to_cpu(pfn_sb->npfns);
++ 		altmap = NULL;
++ 	} else if (nd_pfn->mode == PFN_MODE_PMEM) {
++ 		nd_pfn->npfns = (pmem->size - pmem->pfn_pad - pmem->data_offset)
++ 			/ PAGE_SIZE;
++ 		if (le64_to_cpu(nd_pfn->pfn_sb->npfns) > nd_pfn->npfns)
++ 			dev_info(&nd_pfn->dev,
++ 					"number of pfns truncated from %lld to %ld\n",
++ 					le64_to_cpu(nd_pfn->pfn_sb->npfns),
++ 					nd_pfn->npfns);
++ 		altmap = & __altmap;
++ 		altmap->free = PHYS_PFN(pmem->data_offset - SZ_8K);
++ 		altmap->alloc = 0;
++ 	} else {
++ 		rc = -ENXIO;
++ 		goto err;
++ 	}
++ 
++ 	/* establish pfn range for lookup, and switch to direct map */
++ 	q = pmem->pmem_queue;
++ 	memcpy(&res, &nsio->res, sizeof(res));
++ 	res.start += start_pad;
++ 	res.end -= end_trunc;
++ 	devm_memunmap(dev, (void __force *) pmem->virt_addr);
++ 	pmem->virt_addr = (void __pmem *) devm_memremap_pages(dev, &res,
++ 			&q->q_usage_counter, altmap);
++ 	pmem->pfn_flags |= PFN_MAP;
++ 	if (IS_ERR(pmem->virt_addr)) {
++ 		rc = PTR_ERR(pmem->virt_addr);
++ 		goto err;
++ 	}
++ 
++ 	/* attach pmem disk in "pfn-mode" */
++ 	rc = pmem_attach_disk(dev, ndns, pmem);
++ 	if (rc)
++ 		goto err;
++ 
++ 	return rc;
++  err:
++ 	nvdimm_namespace_detach_pfn(ndns);
++ 	return rc;
++ 
++ }
++ 
++ static int nvdimm_namespace_attach_pfn(struct nd_namespace_common *ndns)
++ {
++ 	struct nd_pfn *nd_pfn = to_nd_pfn(ndns->claim);
++ 	int rc;
++ 
++ 	if (!nd_pfn->uuid || !nd_pfn->ndns)
++ 		return -ENODEV;
++ 
++ 	rc = nd_pfn_init(nd_pfn);
++ 	if (rc)
++ 		return rc;
++ 	/* we need a valid pfn_sb before we can init a vmem_altmap */
++ 	return __nvdimm_namespace_attach_pfn(nd_pfn);
++ }
++ 
+++>>>>>>> fc0c2028135c (x86, pmem: use memcpy_mcsafe() for memcpy_from_pmem())
+  static int nd_pmem_probe(struct device *dev)
+  {
+ -	struct nd_region *nd_region = to_nd_region(dev->parent);
+  	struct nd_namespace_common *ndns;
+ -	struct nd_namespace_io *nsio;
+ -	struct pmem_device *pmem;
+  
+  	ndns = nvdimm_namespace_common_probe(dev);
+  	if (IS_ERR(ndns))
+diff --cc include/linux/pmem.h
+index 537f89cec0ca,ac6d872ce067..000000000000
+--- a/include/linux/pmem.h
++++ b/include/linux/pmem.h
+@@@ -32,7 -42,21 +32,25 @@@ static inline void arch_memcpy_to_pmem(
+  	BUG();
+  }
+  
+++<<<<<<< HEAD
+ +static inline void arch_clear_pmem(void *addr, size_t size)
+++=======
++ static inline int arch_memcpy_from_pmem(void *dst, const void __pmem *src,
++ 		size_t n)
++ {
++ 	BUG();
++ 	return -EFAULT;
++ }
++ 
++ static inline size_t arch_copy_from_iter_pmem(void __pmem *addr, size_t bytes,
++ 		struct iov_iter *i)
++ {
++ 	BUG();
++ 	return 0;
++ }
++ 
++ static inline void arch_clear_pmem(void __pmem *addr, size_t size)
+++>>>>>>> fc0c2028135c (x86, pmem: use memcpy_mcsafe() for memcpy_from_pmem())
+  {
+  	BUG();
+  }
+@@@ -49,14 -73,17 +67,21 @@@ static inline void arch_invalidate_pmem
+  #endif
+  
+  /*
+-  * Architectures that define ARCH_HAS_PMEM_API must provide
+-  * implementations for arch_memcpy_to_pmem(), arch_wmb_pmem(),
+-  * arch_copy_from_iter_pmem(), arch_clear_pmem(), arch_wb_cache_pmem()
+-  * and arch_has_wmb_pmem().
++  * memcpy_from_pmem - read from persistent memory with error handling
++  * @dst: destination buffer
++  * @src: source buffer
++  * @size: transfer length
++  *
++  * Returns 0 on success negative error code on failure.
+   */
+++<<<<<<< HEAD
+ +static inline void memcpy_from_pmem(void *dst, void const *src, size_t size)
+++=======
++ static inline int memcpy_from_pmem(void *dst, void __pmem const *src,
++ 		size_t size)
+++>>>>>>> fc0c2028135c (x86, pmem: use memcpy_mcsafe() for memcpy_from_pmem())
+  {
+- 	memcpy(dst, (void __force const *) src, size);
++ 	return arch_memcpy_from_pmem(dst, src, size);
+  }
+  
+  static inline bool arch_has_pmem_api(void)
+diff --git a/arch/x86/include/asm/pmem.h b/arch/x86/include/asm/pmem.h
+index 0ca5e693f4a2..cf380982cc55 100644
+--- a/arch/x86/include/asm/pmem.h
++++ b/arch/x86/include/asm/pmem.h
+@@ -44,6 +44,15 @@ static inline void arch_memcpy_to_pmem(void *dst, const void *src, size_t n)
+ 		BUG();
+ }
+ 
++static inline int arch_memcpy_from_pmem(void *dst, const void __pmem *src,
++		size_t n)
++{
++	if (static_cpu_has(X86_FEATURE_MCE_RECOVERY))
++		return memcpy_mcsafe(dst, (void __force *) src, n);
++	memcpy(dst, (void __force *) src, n);
++	return 0;
++}
++
+ /**
+  * arch_wb_cache_pmem - write back a cache range with CLWB
+  * @vaddr:	virtual start address
+* Unmerged path drivers/nvdimm/pmem.c
+* Unmerged path include/linux/pmem.h
