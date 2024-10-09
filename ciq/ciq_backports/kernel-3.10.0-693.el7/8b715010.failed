@@ -1,0 +1,179 @@
+xen-netfront: initialise queue name in xennet_init_queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Wei Liu <wei.liu2@citrix.com>
+commit 8b715010aaf912423b20daf79cf52ade39348157
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8b715010.failed
+
+	Signed-off-by: Wei Liu <wei.liu2@citrix.com>
+	Reviewed-by: David Vrabel <david.vrabel@citrix.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8b715010aaf912423b20daf79cf52ade39348157)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/xen-netfront.c
+diff --cc drivers/net/xen-netfront.c
+index 6c33c68dceb8,5a7872ac3566..000000000000
+--- a/drivers/net/xen-netfront.c
++++ b/drivers/net/xen-netfront.c
+@@@ -1630,6 -1644,152 +1630,155 @@@ fail
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Queue-specific initialisation
++  * This used to be done in xennet_create_dev() but must now
++  * be run per-queue.
++  */
++ static int xennet_init_queue(struct netfront_queue *queue)
++ {
++ 	unsigned short i;
++ 	int err = 0;
++ 
++ 	spin_lock_init(&queue->tx_lock);
++ 	spin_lock_init(&queue->rx_lock);
++ 
++ 	skb_queue_head_init(&queue->rx_batch);
++ 	queue->rx_target     = RX_DFL_MIN_TARGET;
++ 	queue->rx_min_target = RX_DFL_MIN_TARGET;
++ 	queue->rx_max_target = RX_MAX_TARGET;
++ 
++ 	init_timer(&queue->rx_refill_timer);
++ 	queue->rx_refill_timer.data = (unsigned long)queue;
++ 	queue->rx_refill_timer.function = rx_refill_timeout;
++ 
++ 	snprintf(queue->name, sizeof(queue->name), "%s-q%u",
++ 		 queue->info->netdev->name, queue->id);
++ 
++ 	/* Initialise tx_skbs as a free chain containing every entry. */
++ 	queue->tx_skb_freelist = 0;
++ 	for (i = 0; i < NET_TX_RING_SIZE; i++) {
++ 		skb_entry_set_link(&queue->tx_skbs[i], i+1);
++ 		queue->grant_tx_ref[i] = GRANT_INVALID_REF;
++ 		queue->grant_tx_page[i] = NULL;
++ 	}
++ 
++ 	/* Clear out rx_skbs */
++ 	for (i = 0; i < NET_RX_RING_SIZE; i++) {
++ 		queue->rx_skbs[i] = NULL;
++ 		queue->grant_rx_ref[i] = GRANT_INVALID_REF;
++ 	}
++ 
++ 	/* A grant for every tx ring slot */
++ 	if (gnttab_alloc_grant_references(TX_MAX_TARGET,
++ 					  &queue->gref_tx_head) < 0) {
++ 		pr_alert("can't alloc tx grant refs\n");
++ 		err = -ENOMEM;
++ 		goto exit;
++ 	}
++ 
++ 	/* A grant for every rx ring slot */
++ 	if (gnttab_alloc_grant_references(RX_MAX_TARGET,
++ 					  &queue->gref_rx_head) < 0) {
++ 		pr_alert("can't alloc rx grant refs\n");
++ 		err = -ENOMEM;
++ 		goto exit_free_tx;
++ 	}
++ 
++ 	netif_napi_add(queue->info->netdev, &queue->napi, xennet_poll, 64);
++ 
++ 	return 0;
++ 
++  exit_free_tx:
++ 	gnttab_free_grant_references(queue->gref_tx_head);
++  exit:
++ 	return err;
++ }
++ 
++ static int write_queue_xenstore_keys(struct netfront_queue *queue,
++ 			   struct xenbus_transaction *xbt, int write_hierarchical)
++ {
++ 	/* Write the queue-specific keys into XenStore in the traditional
++ 	 * way for a single queue, or in a queue subkeys for multiple
++ 	 * queues.
++ 	 */
++ 	struct xenbus_device *dev = queue->info->xbdev;
++ 	int err;
++ 	const char *message;
++ 	char *path;
++ 	size_t pathsize;
++ 
++ 	/* Choose the correct place to write the keys */
++ 	if (write_hierarchical) {
++ 		pathsize = strlen(dev->nodename) + 10;
++ 		path = kzalloc(pathsize, GFP_KERNEL);
++ 		if (!path) {
++ 			err = -ENOMEM;
++ 			message = "out of memory while writing ring references";
++ 			goto error;
++ 		}
++ 		snprintf(path, pathsize, "%s/queue-%u",
++ 				dev->nodename, queue->id);
++ 	} else {
++ 		path = (char *)dev->nodename;
++ 	}
++ 
++ 	/* Write ring references */
++ 	err = xenbus_printf(*xbt, path, "tx-ring-ref", "%u",
++ 			queue->tx_ring_ref);
++ 	if (err) {
++ 		message = "writing tx-ring-ref";
++ 		goto error;
++ 	}
++ 
++ 	err = xenbus_printf(*xbt, path, "rx-ring-ref", "%u",
++ 			queue->rx_ring_ref);
++ 	if (err) {
++ 		message = "writing rx-ring-ref";
++ 		goto error;
++ 	}
++ 
++ 	/* Write event channels; taking into account both shared
++ 	 * and split event channel scenarios.
++ 	 */
++ 	if (queue->tx_evtchn == queue->rx_evtchn) {
++ 		/* Shared event channel */
++ 		err = xenbus_printf(*xbt, path,
++ 				"event-channel", "%u", queue->tx_evtchn);
++ 		if (err) {
++ 			message = "writing event-channel";
++ 			goto error;
++ 		}
++ 	} else {
++ 		/* Split event channels */
++ 		err = xenbus_printf(*xbt, path,
++ 				"event-channel-tx", "%u", queue->tx_evtchn);
++ 		if (err) {
++ 			message = "writing event-channel-tx";
++ 			goto error;
++ 		}
++ 
++ 		err = xenbus_printf(*xbt, path,
++ 				"event-channel-rx", "%u", queue->rx_evtchn);
++ 		if (err) {
++ 			message = "writing event-channel-rx";
++ 			goto error;
++ 		}
++ 	}
++ 
++ 	if (write_hierarchical)
++ 		kfree(path);
++ 	return 0;
++ 
++ error:
++ 	if (write_hierarchical)
++ 		kfree(path);
++ 	xenbus_dev_fatal(dev, err, "%s", message);
++ 	return err;
++ }
++ 
+++>>>>>>> 8b715010aaf9 (xen-netfront: initialise queue name in xennet_init_queue)
+  /* Common code used when first setting up, and when resuming. */
+  static int talk_to_netback(struct xenbus_device *dev,
+  			   struct netfront_info *info)
+* Unmerged path drivers/net/xen-netfront.c
