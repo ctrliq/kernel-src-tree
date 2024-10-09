@@ -1,0 +1,140 @@
+slab: clean up kmem_cache_create_memcg() error handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Vladimir Davydov <vdavydov@parallels.com>
+commit 3965fc3652244651006ebb31c8c45318ce84818f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/3965fc36.failed
+
+Currently kmem_cache_create_memcg() backoffs on failure inside
+conditionals, without using gotos.  This results in the rollback code
+duplication, which makes the function look cumbersome even though on
+error we should only free the allocated cache.  Since in the next patch
+I am going to add yet another rollback function call on error path
+there, let's employ labels instead of conditionals for undoing any
+changes on failure to keep things clean.
+
+	Signed-off-by: Vladimir Davydov <vdavydov@parallels.com>
+	Reviewed-by: Pekka Enberg <penberg@kernel.org>
+	Cc: Michal Hocko <mhocko@suse.cz>
+	Cc: Glauber Costa <glommer@gmail.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Christoph Lameter <cl@linux.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 3965fc3652244651006ebb31c8c45318ce84818f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slab_common.c
+diff --cc mm/slab_common.c
+index 84ed8dc5b2d8,f70df3ef6f1a..000000000000
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@@ -217,21 -176,10 +217,22 @@@ kmem_cache_create_memcg(struct mem_cgro
+  	get_online_cpus();
+  	mutex_lock(&slab_mutex);
+  
+- 	if (!kmem_cache_sanity_check(memcg, name, size) == 0)
+- 		goto out_locked;
++ 	err = kmem_cache_sanity_check(memcg, name, size);
++ 	if (err)
++ 		goto out_unlock;
+  
+ +	if (memcg) {
+ +		/*
+ +		 * Since per-memcg caches are created asynchronously on first
+ +		 * allocation (see memcg_kmem_get_cache()), several threads can
+ +		 * try to create the same cache, but only one of them may
+ +		 * succeed. Therefore if we get here and see the cache has
+ +		 * already been created, we silently return NULL.
+ +		 */
+ +		if (cache_from_memcg(parent_cache, memcg_cache_id(memcg)))
+ +			goto out_locked;
+ +	}
+ +
+  	/*
+  	 * Some allocators will constraint the set of valid flags to a subset
+  	 * of all flags. We expect them to define CACHE_CREATE_MASK in this
+@@@ -240,46 -188,36 +241,73 @@@
+  	 */
+  	flags &= CACHE_CREATE_MASK;
+  
+++<<<<<<< HEAD
+ +	if (!memcg) {
+ +		s = __kmem_cache_alias(name, size, align, flags, ctor);
+ +		if (s)
+ +			goto out_locked;
+ +	}
+++=======
++ 	s = __kmem_cache_alias(memcg, name, size, align, flags, ctor);
++ 	if (s)
++ 		goto out_unlock;
+++>>>>>>> 3965fc365224 (slab: clean up kmem_cache_create_memcg() error handling)
+  
++ 	err = -ENOMEM;
+  	s = kmem_cache_zalloc(kmem_cache, GFP_KERNEL);
+- 	if (s) {
+- 		s->object_size = s->size = size;
+- 		s->align = calculate_alignment(flags, align, size);
+- 		s->ctor = ctor;
++ 	if (!s)
++ 		goto out_unlock;
+  
+++<<<<<<< HEAD
+ +		err = memcg_alloc_cache_params(memcg, s, parent_cache);
+ +		if (err) {
+ +			kmem_cache_free(kmem_cache, s);
+ +			goto out_locked;
+ +		}
+ +
+ +		s->name = kstrdup(name, GFP_KERNEL);
+ +		if (!s->name) {
+ +			memcg_free_cache_params(s);
+ +			kmem_cache_free(kmem_cache, s);
+ +			err = -ENOMEM;
+ +			goto out_locked;
+ +		}
+ +
+ +		err = __kmem_cache_create(s, flags);
+ +		if (!err) {
+ +			s->refcount = 1;
+ +			list_add(&s->list, &slab_caches);
+ +			memcg_register_cache(s);
+ +		} else {
+ +			memcg_free_cache_params(s);
+ +			kfree(s->name);
+ +			kmem_cache_free(kmem_cache, s);
+ +		}
+ +	} else
+ +		err = -ENOMEM;
+++=======
++ 	s->object_size = s->size = size;
++ 	s->align = calculate_alignment(flags, align, size);
++ 	s->ctor = ctor;
+  
+- out_locked:
++ 	s->name = kstrdup(name, GFP_KERNEL);
++ 	if (!s->name)
++ 		goto out_free_cache;
++ 
++ 	err = memcg_register_cache(memcg, s, parent_cache);
++ 	if (err)
++ 		goto out_free_cache;
+++>>>>>>> 3965fc365224 (slab: clean up kmem_cache_create_memcg() error handling)
++ 
++ 	err = __kmem_cache_create(s, flags);
++ 	if (err)
++ 		goto out_free_cache;
++ 
++ 	s->refcount = 1;
++ 	list_add(&s->list, &slab_caches);
++ 	memcg_cache_list_add(memcg, s);
++ 
++ out_unlock:
+  	mutex_unlock(&slab_mutex);
+  	put_online_cpus();
+  
+* Unmerged path mm/slab_common.c
