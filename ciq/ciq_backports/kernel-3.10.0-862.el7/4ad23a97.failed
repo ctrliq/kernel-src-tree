@@ -1,0 +1,213 @@
+MD: use per-cpu counter for writes_pending
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [md] use per-cpu counter for writes_pending (Nigel Croxon) [1506338]
+Rebuild_FUZZ: 95.00%
+commit-author NeilBrown <neilb@suse.com>
+commit 4ad23a976413aa57fe5ba7a25953dc35ccca5b71
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4ad23a97.failed
+
+The 'writes_pending' counter is used to determine when the
+array is stable so that it can be marked in the superblock
+as "Clean".  Consequently it needs to be updated frequently
+but only checked for zero occasionally.  Recent changes to
+raid5 cause the count to be updated even more often - once
+per 4K rather than once per bio.  This provided
+justification for making the updates more efficient.
+
+So we replace the atomic counter a percpu-refcount.
+This can be incremented and decremented cheaply most of the
+time, and can be switched to "atomic" mode when more
+precise counting is needed.  As it is possible for multiple
+threads to want a precise count, we introduce a
+"sync_checker" counter to count the number of threads
+in "set_in_sync()", and only switch the refcount back
+to percpu mode when that is zero.
+
+We need to be careful about races between set_in_sync()
+setting ->in_sync to 1, and md_write_start() setting it
+to zero.  md_write_start() holds the rcu_read_lock()
+while checking if the refcount is in percpu mode.  If
+it is, then we know a switch to 'atomic' will not happen until
+after we call rcu_read_unlock(), in which case set_in_sync()
+will see the elevated count, and not set in_sync to 1.
+If it is not in percpu mode, we take the mddev->lock to
+ensure proper synchronization.
+
+It is no longer possible to quickly check if the count is zero, which
+we previously did to update a timer or to schedule the md_thread.
+So now we do these every time we decrement that counter, but make
+sure they are fast.
+
+mod_timer() already optimizes the case where the timeout value doesn't
+actually change.  We leverage that further by always rounding off the
+jiffies to the timeout value.  This may delay the marking of 'clean'
+slightly, but ensure we only perform atomic operation here when absolutely
+needed.
+
+md_wakeup_thread() current always calls wake_up(), even if
+THREAD_WAKEUP is already set.  That too can be optimised to avoid
+calls to wake_up().
+
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 4ad23a976413aa57fe5ba7a25953dc35ccca5b71)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+diff --cc drivers/md/md.c
+index 4c75b0e4a2a4,1db88d79549a..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -64,8 -65,12 +64,14 @@@
+  #include <linux/raid/md_p.h>
+  #include <linux/raid/md_u.h>
+  #include <linux/slab.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/percpu-refcount.h>
++ 
++ #include <trace/events/block.h>
+++>>>>>>> 4ad23a976413 (MD: use per-cpu counter for writes_pending)
+  #include "md.h"
+  #include "bitmap.h"
+ -#include "md-cluster.h"
+  
+  #ifndef MODULE
+  static void autostart_arrays(int part);
+@@@ -2287,6 -2254,33 +2293,36 @@@ static void export_array(struct mddev *
+  	mddev->major_version = 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool set_in_sync(struct mddev *mddev)
++ {
++ 	WARN_ON_ONCE(!spin_is_locked(&mddev->lock));
++ 	if (!mddev->in_sync) {
++ 		mddev->sync_checkers++;
++ 		spin_unlock(&mddev->lock);
++ 		percpu_ref_switch_to_atomic_sync(&mddev->writes_pending);
++ 		spin_lock(&mddev->lock);
++ 		if (!mddev->in_sync &&
++ 		    percpu_ref_is_zero(&mddev->writes_pending)) {
++ 			mddev->in_sync = 1;
++ 			/*
++ 			 * Ensure ->in_sync is visible before we clear
++ 			 * ->sync_checkers.
++ 			 */
++ 			smp_mb();
++ 			set_bit(MD_SB_CHANGE_CLEAN, &mddev->sb_flags);
++ 			sysfs_notify_dirent_safe(mddev->sysfs_state);
++ 		}
++ 		if (--mddev->sync_checkers == 0)
++ 			percpu_ref_switch_to_percpu(&mddev->writes_pending);
++ 	}
++ 	if (mddev->safemode == 1)
++ 		mddev->safemode = 0;
++ 	return mddev->in_sync;
++ }
++ 
+++>>>>>>> 4ad23a976413 (MD: use per-cpu counter for writes_pending)
+  static void sync_sbs(struct mddev *mddev, int nospares)
+  {
+  	/* Update each superblock (in-memory image), but
+@@@ -5064,8 -5130,7 +5100,12 @@@ static void md_free(struct kobject *ko
+  		del_gendisk(mddev->gendisk);
+  		put_disk(mddev->gendisk);
+  	}
+++<<<<<<< HEAD
+ +	if (mddev->queue)
+ +		blk_cleanup_queue(mddev->queue);
+++=======
++ 	percpu_ref_exit(&mddev->writes_pending);
+++>>>>>>> 4ad23a976413 (MD: use per-cpu counter for writes_pending)
+  
+  	kfree(mddev);
+  }
+@@@ -7692,10 -7905,13 +7736,17 @@@ bool md_write_start(struct mddev *mddev
+  		md_wakeup_thread(mddev->sync_thread);
+  		did_change = 1;
+  	}
+++<<<<<<< HEAD
+ +	atomic_inc(&mddev->writes_pending);
+++=======
++ 	rcu_read_lock();
++ 	percpu_ref_get(&mddev->writes_pending);
++ 	smp_mb(); /* Match smp_mb in set_in_sync() */
+++>>>>>>> 4ad23a976413 (MD: use per-cpu counter for writes_pending)
+  	if (mddev->safemode == 1)
+  		mddev->safemode = 0;
+- 	if (mddev->in_sync) {
++ 	/* sync_checkers is always 0 when writes_pending is in per-cpu mode */
++ 	if (mddev->in_sync || !mddev->sync_checkers) {
+  		spin_lock(&mddev->lock);
+  		if (mddev->in_sync) {
+  			mddev->in_sync = 0;
+@@@ -7718,15 -7930,38 +7770,41 @@@
+  }
+  EXPORT_SYMBOL(md_write_start);
+  
+++<<<<<<< HEAD
+++=======
++ /* md_write_inc can only be called when md_write_start() has
++  * already been called at least once of the current request.
++  * It increments the counter and is useful when a single request
++  * is split into several parts.  Each part causes an increment and
++  * so needs a matching md_write_end().
++  * Unlike md_write_start(), it is safe to call md_write_inc() inside
++  * a spinlocked region.
++  */
++ void md_write_inc(struct mddev *mddev, struct bio *bi)
++ {
++ 	if (bio_data_dir(bi) != WRITE)
++ 		return;
++ 	WARN_ON_ONCE(mddev->in_sync || mddev->ro);
++ 	percpu_ref_get(&mddev->writes_pending);
++ }
++ EXPORT_SYMBOL(md_write_inc);
++ 
+++>>>>>>> 4ad23a976413 (MD: use per-cpu counter for writes_pending)
+  void md_write_end(struct mddev *mddev)
+  {
+- 	if (atomic_dec_and_test(&mddev->writes_pending)) {
+- 		if (mddev->safemode == 2)
+- 			md_wakeup_thread(mddev->thread);
+- 		else if (mddev->safemode_delay)
+- 			mod_timer(&mddev->safemode_timer, jiffies + mddev->safemode_delay);
+- 	}
++ 	percpu_ref_put(&mddev->writes_pending);
++ 
++ 	if (mddev->safemode == 2)
++ 		md_wakeup_thread(mddev->thread);
++ 	else if (mddev->safemode_delay)
++ 		/* The roundup() ensures this only performs locking once
++ 		 * every ->safemode_delay jiffies
++ 		 */
++ 		mod_timer(&mddev->safemode_timer,
++ 			  roundup(jiffies, mddev->safemode_delay) +
++ 			  mddev->safemode_delay);
+  }
++ 
+  EXPORT_SYMBOL(md_write_end);
+  
+  /* md_allow_write(mddev)
+* Unmerged path drivers/md/md.c
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index 0d13bf88f41f..aa1d0bad4873 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -433,7 +433,8 @@ struct mddev {
+ 							 */
+ 	unsigned int			safemode_delay;
+ 	struct timer_list		safemode_timer;
+-	atomic_t			writes_pending;
++	struct percpu_ref		writes_pending;
++	int				sync_checkers;	/* # of threads checking writes_pending */
+ 	struct request_queue		*queue;	/* for plugging ... */
+ 
+ 	struct bitmap			*bitmap; /* the bitmap for the device */
