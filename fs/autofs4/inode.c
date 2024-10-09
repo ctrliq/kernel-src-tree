@@ -340,7 +340,7 @@ fail_dput:
 	dput(root);
 	goto fail_free;
 fail_ino:
-	kfree(ino);
+	autofs4_free_ino(ino);
 fail_free:
 	put_pid(sbi->oz_pgrp);
 	kfree(sbi);
