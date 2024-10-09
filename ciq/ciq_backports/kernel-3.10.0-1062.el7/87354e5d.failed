@@ -1,0 +1,104 @@
+buffer: set errors in mapping at the time that the error occurs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jeff Layton <jlayton@redhat.com>
+commit 87354e5de04fe727227ff619af164202adcfa4d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/87354e5d.failed
+
+I noticed on xfs that I could still sometimes get back an error on fsync
+on a fd that was opened after the error condition had been cleared.
+
+The problem is that the buffer code sets the write_io_error flag and
+then later checks that flag to set the error in the mapping. That flag
+perisists for quite a while however. If the file is later opened with
+O_TRUNC, the buffers will then be invalidated and the mapping's error
+set such that a subsequent fsync will return error. I think this is
+incorrect, as there was no writeback between the open and fsync.
+
+Add a new mark_buffer_write_io_error operation that sets the flag and
+the error in the mapping at the same time. Replace all calls to
+set_buffer_write_io_error with mark_buffer_write_io_error, and remove
+the places that check this flag in order to set the error in the
+mapping.
+
+This sets the error in the mapping earlier, at the time that it's first
+detected.
+
+	Signed-off-by: Jeff Layton <jlayton@redhat.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Carlos Maiolino <cmaiolino@redhat.com>
+(cherry picked from commit 87354e5de04fe727227ff619af164202adcfa4d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/buffer.c
+diff --cc fs/buffer.c
+index 0742e1701750,b946149e8214..000000000000
+--- a/fs/buffer.c
++++ b/fs/buffer.c
+@@@ -353,8 -352,7 +353,12 @@@ void end_buffer_async_write(struct buff
+  		set_buffer_uptodate(bh);
+  	} else {
+  		buffer_io_error(bh, ", lost async page write");
+++<<<<<<< HEAD
+ +		set_bit(AS_EIO, &page->mapping->flags);
+ +		set_buffer_write_io_error(bh);
+++=======
++ 		mark_buffer_write_io_error(bh);
+++>>>>>>> 87354e5de04f (buffer: set errors in mapping at the time that the error occurs)
+  		clear_buffer_uptodate(bh);
+  		SetPageError(page);
+  	}
+@@@ -482,8 -480,6 +486,11 @@@ static void __remove_assoc_queue(struc
+  {
+  	list_del_init(&bh->b_assoc_buffers);
+  	WARN_ON(!bh->b_assoc_map);
+++<<<<<<< HEAD
+ +	if (buffer_write_io_error(bh))
+ +		set_bit(AS_EIO, &bh->b_assoc_map->flags);
+++=======
+++>>>>>>> 87354e5de04f (buffer: set errors in mapping at the time that the error occurs)
+  	bh->b_assoc_map = NULL;
+  }
+  
+@@@ -3215,8 -3287,6 +3233,11 @@@ drop_buffers(struct page *page, struct 
+  
+  	bh = head;
+  	do {
+++<<<<<<< HEAD
+ +		if (buffer_write_io_error(bh) && page->mapping)
+ +			set_bit(AS_EIO, &page->mapping->flags);
+++=======
+++>>>>>>> 87354e5de04f (buffer: set errors in mapping at the time that the error occurs)
+  		if (buffer_busy(bh))
+  			goto failed;
+  		bh = bh->b_this_page;
+* Unmerged path fs/buffer.c
+diff --git a/fs/gfs2/lops.c b/fs/gfs2/lops.c
+index 4da6055af2de..d34d08639ce8 100644
+--- a/fs/gfs2/lops.c
++++ b/fs/gfs2/lops.c
+@@ -181,7 +181,7 @@ static void gfs2_end_log_write_bh(struct gfs2_sbd *sdp, struct bio_vec *bvec,
+ 		bh = bh->b_this_page;
+ 	do {
+ 		if (error)
+-			set_buffer_write_io_error(bh);
++			mark_buffer_write_io_error(bh);
+ 		unlock_buffer(bh);
+ 		next = bh->b_this_page;
+ 		size -= bh->b_size;
+diff --git a/include/linux/buffer_head.h b/include/linux/buffer_head.h
+index 22502875b939..ab09b3c22c22 100644
+--- a/include/linux/buffer_head.h
++++ b/include/linux/buffer_head.h
+@@ -150,6 +150,7 @@ void buffer_check_dirty_writeback(struct page *page,
+  */
+ 
+ void mark_buffer_dirty(struct buffer_head *bh);
++void mark_buffer_write_io_error(struct buffer_head *bh);
+ void init_buffer(struct buffer_head *, bh_end_io_t *, void *);
+ void touch_buffer(struct buffer_head *bh);
+ void set_bh_page(struct buffer_head *bh,
