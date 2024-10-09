@@ -1,0 +1,175 @@
+nfp: add support for reporting CRC32 hash function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 9ff304bfaf58c119ef8ba3e20326edeed9983aef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9ff304bf.failed
+
+Some firmware images may reuse CRC32 hardware to compute RXHASH.
+Make sure we report the correct hash function.  Note that we don't
+support changing functions at runtime.  That would also require
+a few more additions to the way the key is set because different
+functions have different key sizes.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9ff304bfaf58c119ef8ba3e20326edeed9983aef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index de17d3265a77,e72468d65c28..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -41,6 -41,9 +41,12 @@@
+   *          Chris Telfer <chris.telfer@netronome.com>
+   */
+  
+++<<<<<<< HEAD
+++=======
++ #include <linux/bitfield.h>
++ #include <linux/bpf.h>
++ #include <linux/bpf_trace.h>
+++>>>>>>> 9ff304bfaf58 (nfp: add support for reporting CRC32 hash function)
+  #include <linux/module.h>
+  #include <linux/kernel.h>
+  #include <linux/init.h>
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net.h b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+index 1826ee93d1da..c049711fe145 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@ -429,6 +429,7 @@ static inline bool nfp_net_fw_ver_eq(struct nfp_net_fw_version *fw_ver,
+  * @fw_ver:             Firmware version
+  * @cap:                Capabilities advertised by the Firmware
+  * @max_mtu:            Maximum support MTU advertised by the Firmware
++ * @rss_hfunc:		RSS selected hash function
+  * @rss_cfg:            RSS configuration
+  * @rss_key:            RSS secret key
+  * @rss_itbl:           RSS indirection table
+@@ -492,6 +493,7 @@ struct nfp_net {
+ 	u32 cap;
+ 	u32 max_mtu;
+ 
++	u8 rss_hfunc;
+ 	u32 rss_cfg;
+ 	u8 rss_key[NFP_NET_CFG_RSS_KEY_SZ];
+ 	u8 rss_itbl[NFP_NET_CFG_RSS_ITBL_SZ];
+@@ -744,6 +746,7 @@ void nfp_net_netdev_clean(struct net_device *netdev);
+ void nfp_net_set_ethtool_ops(struct net_device *netdev);
+ void nfp_net_info(struct nfp_net *nn);
+ int nfp_net_reconfig(struct nfp_net *nn, u32 update);
++unsigned int nfp_net_rss_key_sz(struct nfp_net *nn);
+ void nfp_net_rss_write_itbl(struct nfp_net *nn);
+ void nfp_net_rss_write_key(struct nfp_net *nn);
+ void nfp_net_coalesce_write_cfg(struct nfp_net *nn);
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_ctrl.h b/drivers/net/ethernet/netronome/nfp/nfp_net_ctrl.h
+index 12afff29a681..7c94d4e89fff 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_ctrl.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_ctrl.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2015 Netronome Systems, Inc.
++ * Copyright (C) 2015-2017 Netronome Systems, Inc.
+  *
+  * This software is dual licensed under the GNU General License Version 2,
+  * June 1991 as shown in the file COPYING in the top-level directory of this
+@@ -182,6 +182,14 @@
+ #define NFP_NET_CFG_RX_OFFSET		0x0050
+ #define NFP_NET_CFG_RX_OFFSET_DYNAMIC		0	/* Prepend mode */
+ 
++/**
++ * RSS capabilities
++ * @NFP_NET_CFG_RSS_CAP_HFUNC:	supported hash functions (same bits as
++ *				@NFP_NET_CFG_RSS_HFUNC)
++ */
++#define NFP_NET_CFG_RSS_CAP		0x0054
++#define   NFP_NET_CFG_RSS_CAP_HFUNC	  0xff000000
++
+ /**
+  * VXLAN/UDP encap configuration
+  * @NFP_NET_CFG_VXLAN_PORT:	Base address of table of tunnels' UDP dst ports
+@@ -213,7 +221,11 @@
+ #define   NFP_NET_CFG_RSS_IPV4_UDP        (1 << 11) /* RSS for IPv4/UDP */
+ #define   NFP_NET_CFG_RSS_IPV6_TCP        (1 << 12) /* RSS for IPv6/TCP */
+ #define   NFP_NET_CFG_RSS_IPV6_UDP        (1 << 13) /* RSS for IPv6/UDP */
++#define   NFP_NET_CFG_RSS_HFUNC		  0xff000000
+ #define   NFP_NET_CFG_RSS_TOEPLITZ        (1 << 24) /* Use Toeplitz hash */
++#define   NFP_NET_CFG_RSS_XOR		  (1 << 25) /* Use XOR as hash */
++#define   NFP_NET_CFG_RSS_CRC32		  (1 << 26) /* Use CRC32 as hash */
++#define   NFP_NET_CFG_RSS_HFUNCS	  3
+ #define NFP_NET_CFG_RSS_KEY             (NFP_NET_CFG_RSS_BASE + 0x4)
+ #define NFP_NET_CFG_RSS_KEY_SZ          0x28
+ #define NFP_NET_CFG_RSS_ITBL            (NFP_NET_CFG_RSS_BASE + 0x4 + \
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c b/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+index dfbf6b94ff5b..2505a5760262 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_ethtool.c
+@@ -40,6 +40,7 @@
+  *          Brad Petrus <brad.petrus@netronome.com>
+  */
+ 
++#include <linux/bitfield.h>
+ #include <linux/kernel.h>
+ #include <linux/netdevice.h>
+ #include <linux/etherdevice.h>
+@@ -441,7 +442,7 @@ static int nfp_net_set_rss_hash_opt(struct nfp_net *nn,
+ 		return -EINVAL;
+ 	}
+ 
+-	new_rss_cfg |= NFP_NET_CFG_RSS_TOEPLITZ;
++	new_rss_cfg |= FIELD_PREP(NFP_NET_CFG_RSS_HFUNC, nn->rss_hfunc);
+ 	new_rss_cfg |= NFP_NET_CFG_RSS_MASK;
+ 
+ 	if (new_rss_cfg == nn->rss_cfg)
+@@ -483,7 +484,12 @@ static u32 nfp_net_get_rxfh_indir_size(struct net_device *netdev)
+ 
+ static u32 nfp_net_get_rxfh_key_size(struct net_device *netdev)
+ {
+-	return NFP_NET_CFG_RSS_KEY_SZ;
++	struct nfp_net *nn = netdev_priv(netdev);
++
++	if (!(nn->cap & NFP_NET_CFG_CTRL_RSS))
++		return -EOPNOTSUPP;
++
++	return nfp_net_rss_key_sz(nn);
+ }
+ 
+ static int nfp_net_get_rxfh(struct net_device *netdev, u32 *indir, u8 *key,
+@@ -499,9 +505,12 @@ static int nfp_net_get_rxfh(struct net_device *netdev, u32 *indir, u8 *key,
+ 		for (i = 0; i < ARRAY_SIZE(nn->rss_itbl); i++)
+ 			indir[i] = nn->rss_itbl[i];
+ 	if (key)
+-		memcpy(key, nn->rss_key, NFP_NET_CFG_RSS_KEY_SZ);
+-	if (hfunc)
+-		*hfunc = ETH_RSS_HASH_TOP;
++		memcpy(key, nn->rss_key, nfp_net_rss_key_sz(nn));
++	if (hfunc) {
++		*hfunc = nn->rss_hfunc;
++		if (*hfunc >= 1 << ETH_RSS_HASH_FUNCS_COUNT)
++			*hfunc = ETH_RSS_HASH_UNKNOWN;
++	}
+ 
+ 	return 0;
+ }
+@@ -514,14 +523,14 @@ static int nfp_net_set_rxfh(struct net_device *netdev,
+ 	int i;
+ 
+ 	if (!(nn->cap & NFP_NET_CFG_CTRL_RSS) ||
+-	    !(hfunc == ETH_RSS_HASH_NO_CHANGE || hfunc == ETH_RSS_HASH_TOP))
++	    !(hfunc == ETH_RSS_HASH_NO_CHANGE || hfunc == nn->rss_hfunc))
+ 		return -EOPNOTSUPP;
+ 
+ 	if (!key && !indir)
+ 		return 0;
+ 
+ 	if (key) {
+-		memcpy(nn->rss_key, key, NFP_NET_CFG_RSS_KEY_SZ);
++		memcpy(nn->rss_key, key, nfp_net_rss_key_sz(nn));
+ 		nfp_net_rss_write_key(nn);
+ 	}
+ 	if (indir) {
