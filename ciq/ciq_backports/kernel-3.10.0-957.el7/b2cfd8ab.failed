@@ -1,0 +1,178 @@
+ipmi: Rework device id and guid handling to catch changing BMCs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Corey Minyard <cminyard@mvista.com>
+commit b2cfd8ab4add53c2070367bfee2f5b738f51698d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b2cfd8ab.failed
+
+A BMC's guid or device id info may change dynamically, this could
+result in a different configuration that needs to be done.  Adjust
+the BMCs dynamically.
+
+	Signed-off-by: Corey Minyard <cminyard@mvista.com>
+(cherry picked from commit b2cfd8ab4add53c2070367bfee2f5b738f51698d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/char/ipmi/ipmi_msghandler.c
+diff --cc drivers/char/ipmi/ipmi_msghandler.c
+index ac86372bf4bd,1da0b3cca6aa..000000000000
+--- a/drivers/char/ipmi/ipmi_msghandler.c
++++ b/drivers/char/ipmi/ipmi_msghandler.c
+@@@ -273,10 -277,12 +278,11 @@@ struct bmc_device 
+  	struct ipmi_device_id  fetch_id;
+  	int                    dyn_id_set;
+  	unsigned long          dyn_id_expiry;
+- 	struct mutex           dyn_mutex; /* protects id & dyn* fields */
++ 	struct mutex           dyn_mutex; /* Protects id, intfs, & dyn* */
+  	u8                     guid[16];
+ -	u8                     fetch_guid[16];
+ -	int                    dyn_guid_set;
+ +	int                    guid_set;
+  	struct kref	       usecount;
++ 	struct work_struct     remove_work;
+  };
+  #define to_bmc_device(x) container_of((x), struct bmc_device, pdev.dev)
+  
+@@@ -545,12 -544,12 +549,21 @@@ struct ipmi_smi 
+  };
+  #define to_si_intf_from_dev(device) container_of(device, struct ipmi_smi, dev)
+  
+++<<<<<<< HEAD
+ +struct ipmi_shadow_smi_handlers shadow_smi_handlers;
+ +struct ipmi_shadow_smi_handlers *ipmi_get_shadow_smi_handlers(void)
+ +{
+ +	return &shadow_smi_handlers;
+ +}
+ +EXPORT_SYMBOL_GPL(ipmi_get_shadow_smi_handlers);
+++=======
++ static void __get_guid(ipmi_smi_t intf);
++ static void __ipmi_bmc_unregister(ipmi_smi_t intf);
++ static int __ipmi_bmc_register(ipmi_smi_t intf,
++ 			       struct ipmi_device_id *id,
++ 			       bool guid_set, u8 *guid, int intf_num);
++ 
+++>>>>>>> b2cfd8ab4add (ipmi: Rework device id and guid handling to catch changing BMCs)
+  
+  /**
+   * The driver model view of the IPMI messaging driver.
+@@@ -2209,12 -2204,13 +2220,17 @@@ static int __get_device_id(ipmi_smi_t i
+   * Except for the first time this is called (in ipmi_register_smi()),
+   * this will always return good data;
+   */
+- static int bmc_get_device_id(ipmi_smi_t intf, struct bmc_device *bmc,
+- 			     struct ipmi_device_id *id,
+- 			     bool *guid_set, u8 *guid)
++ static int __bmc_get_device_id(ipmi_smi_t intf, struct bmc_device *bmc,
++ 			       struct ipmi_device_id *id,
++ 			       bool *guid_set, u8 *guid, int intf_num)
+  {
+  	int rv = 0;
+++<<<<<<< HEAD
+ +	int prev_dyn_id_set;
+++=======
++ 	int prev_dyn_id_set, prev_guid_set;
++ 	bool intf_set = intf != NULL;
+++>>>>>>> b2cfd8ab4add (ipmi: Rework device id and guid handling to catch changing BMCs)
+  
+  	if (!intf) {
+  		mutex_lock(&bmc->dyn_mutex);
+@@@ -2243,11 -2239,14 +2259,18 @@@ retry_bmc_lock
+  	}
+  
+  	/* If we have a valid and current ID, just return that. */
+- 	if (bmc->dyn_id_set && time_is_after_jiffies(bmc->dyn_id_expiry))
+- 		goto out;
++ 	if (intf->in_bmc_register ||
++ 	    (bmc->dyn_id_set && time_is_after_jiffies(bmc->dyn_id_expiry)))
++ 		goto out_noprocessing;
++ 
+++<<<<<<< HEAD
+++=======
++ 	prev_guid_set = bmc->dyn_guid_set;
++ 	__get_guid(intf);
+  
+++>>>>>>> b2cfd8ab4add (ipmi: Rework device id and guid handling to catch changing BMCs)
+  	prev_dyn_id_set = bmc->dyn_id_set;
+ +
+  	rv = __get_device_id(intf, bmc);
+  	if (rv)
+  		goto out;
+@@@ -2261,15 -2301,28 +2325,36 @@@ out
+  		rv = 0; /* Ignore failures if we have previous data. */
+  		bmc->dyn_id_set = prev_dyn_id_set;
+  	}
++ 	if (!rv) {
++ 		bmc->id = bmc->fetch_id;
++ 		if (bmc->dyn_guid_set)
++ 			memcpy(bmc->guid, bmc->fetch_guid, 16);
++ 		else if (prev_guid_set)
++ 			/*
++ 			 * The guid used to be valid and it failed to fetch,
++ 			 * just use the cached value.
++ 			 */
++ 			bmc->dyn_guid_set = prev_guid_set;
++ 	}
++ out_noprocessing:
++ 	if (!rv) {
++ 		if (id)
++ 			*id = bmc->id;
+  
+- 	if (id)
+- 		*id = bmc->id;
++ 		if (guid_set)
++ 			*guid_set = bmc->dyn_guid_set;
+  
+++<<<<<<< HEAD
+ +	if (guid_set)
+ +		*guid_set = bmc->guid_set;
+ +
+ +	if (guid && bmc->guid_set)
+ +		memcpy(guid, bmc->guid, 16);
+++=======
++ 		if (guid && bmc->dyn_guid_set)
++ 			memcpy(guid, bmc->guid, 16);
++ 	}
+++>>>>>>> b2cfd8ab4add (ipmi: Rework device id and guid handling to catch changing BMCs)
+  
+  	mutex_unlock(&bmc->dyn_mutex);
+  	mutex_unlock(&intf->bmc_reg_mutex);
+@@@ -2861,13 -2943,12 +2975,17 @@@ static int __ipmi_bmc_register(ipmi_smi
+  	 * representing the interfaced BMC already
+  	 */
+  	mutex_lock(&ipmidriver_mutex);
+++<<<<<<< HEAD
+ +	if (bmc->guid_set)
+ +		old_bmc = ipmi_find_bmc_guid(&ipmidriver.driver, bmc->guid);
+++=======
++ 	if (guid_set)
++ 		old_bmc = ipmi_find_bmc_guid(&ipmidriver.driver, guid);
+++>>>>>>> b2cfd8ab4add (ipmi: Rework device id and guid handling to catch changing BMCs)
+  	else
+  		old_bmc = ipmi_find_bmc_prod_dev_id(&ipmidriver.driver,
+- 						    bmc->id.product_id,
+- 						    bmc->id.device_id);
+- 	mutex_unlock(&ipmidriver_mutex);
++ 						    id->product_id,
++ 						    id->device_id);
+  
+  	/*
+  	 * If there is already an bmc_device, free the new one,
+@@@ -3276,9 -3379,7 +3408,13 @@@ int ipmi_register_smi(struct ipmi_smi_h
+  	if (rv)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	get_guid(intf);
+ +
+ +	rv = bmc_get_device_id(intf, NULL, &id, NULL, NULL);
+++=======
++ 	rv = __bmc_get_device_id(intf, NULL, &id, NULL, NULL, i);
+++>>>>>>> b2cfd8ab4add (ipmi: Rework device id and guid handling to catch changing BMCs)
+  	if (rv) {
+  		dev_err(si_dev, "Unable to get the device id: %d\n", rv);
+  		goto out;
+* Unmerged path drivers/char/ipmi/ipmi_msghandler.c
