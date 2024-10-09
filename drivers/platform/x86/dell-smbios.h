@@ -20,8 +20,8 @@
  * system management mode, hence the volatiles */
 
 struct calling_interface_buffer {
-	u16 class;
-	u16 select;
+	u16 cmd_class;
+	u16 cmd_select;
 	volatile u32 input[4];
 	volatile u32 output[4];
 } __packed;
