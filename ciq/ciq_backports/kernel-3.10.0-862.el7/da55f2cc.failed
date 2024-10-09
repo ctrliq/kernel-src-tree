@@ -1,0 +1,297 @@
+blk-mq: use sbq wait queues instead of restart for driver tags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Omar Sandoval <osandov@fb.com>
+commit da55f2cc78418dee88400aafbbaed19d7ac8188e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/da55f2cc.failed
+
+Commit 50e1dab86aa2 ("blk-mq-sched: fix starvation for multiple hardware
+queues and shared tags") fixed one starvation issue for shared tags.
+However, we can still get into a situation where we fail to allocate a
+tag because all tags are allocated but we don't have any pending
+requests on any hardware queue.
+
+One solution for this would be to restart all queues that share a tag
+map, but that really sucks. Ideally, we could just block and wait for a
+tag, but that isn't always possible from blk_mq_dispatch_rq_list().
+
+However, we can still use the struct sbitmap_queue wait queues with a
+custom callback instead of blocking. This has a few benefits:
+
+1. It avoids iterating over all hardware queues when completing an I/O,
+   which the current restart code has to do.
+2. It benefits from the existing rolling wakeup code.
+3. It avoids punting to another thread just to have it block.
+
+	Signed-off-by: Omar Sandoval <osandov@fb.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit da55f2cc78418dee88400aafbbaed19d7ac8188e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+#	include/linux/blk-mq.h
+diff --cc block/blk-mq.c
+index 1b06c94aa73d,9e6b064e5339..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -824,6 -836,112 +824,115 @@@ static inline unsigned int queued_to_in
+  	return min(BLK_MQ_MAX_DISPATCH_ORDER - 1, ilog2(queued) + 1);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ bool blk_mq_get_driver_tag(struct request *rq, struct blk_mq_hw_ctx **hctx,
++ 			   bool wait)
++ {
++ 	struct blk_mq_alloc_data data = {
++ 		.q = rq->q,
++ 		.hctx = blk_mq_map_queue(rq->q, rq->mq_ctx->cpu),
++ 		.flags = wait ? 0 : BLK_MQ_REQ_NOWAIT,
++ 	};
++ 
++ 	if (rq->tag != -1) {
++ done:
++ 		if (hctx)
++ 			*hctx = data.hctx;
++ 		return true;
++ 	}
++ 
++ 	rq->tag = blk_mq_get_tag(&data);
++ 	if (rq->tag >= 0) {
++ 		if (blk_mq_tag_busy(data.hctx)) {
++ 			rq->rq_flags |= RQF_MQ_INFLIGHT;
++ 			atomic_inc(&data.hctx->nr_active);
++ 		}
++ 		data.hctx->tags->rqs[rq->tag] = rq;
++ 		goto done;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static void blk_mq_put_driver_tag(struct blk_mq_hw_ctx *hctx,
++ 				  struct request *rq)
++ {
++ 	if (rq->tag == -1 || rq->internal_tag == -1)
++ 		return;
++ 
++ 	blk_mq_put_tag(hctx, hctx->tags, rq->mq_ctx, rq->tag);
++ 	rq->tag = -1;
++ 
++ 	if (rq->rq_flags & RQF_MQ_INFLIGHT) {
++ 		rq->rq_flags &= ~RQF_MQ_INFLIGHT;
++ 		atomic_dec(&hctx->nr_active);
++ 	}
++ }
++ 
++ /*
++  * If we fail getting a driver tag because all the driver tags are already
++  * assigned and on the dispatch list, BUT the first entry does not have a
++  * tag, then we could deadlock. For that case, move entries with assigned
++  * driver tags to the front, leaving the set of tagged requests in the
++  * same order, and the untagged set in the same order.
++  */
++ static bool reorder_tags_to_front(struct list_head *list)
++ {
++ 	struct request *rq, *tmp, *first = NULL;
++ 
++ 	list_for_each_entry_safe_reverse(rq, tmp, list, queuelist) {
++ 		if (rq == first)
++ 			break;
++ 		if (rq->tag != -1) {
++ 			list_move(&rq->queuelist, list);
++ 			if (!first)
++ 				first = rq;
++ 		}
++ 	}
++ 
++ 	return first != NULL;
++ }
++ 
++ static int blk_mq_dispatch_wake(wait_queue_t *wait, unsigned mode, int flags,
++ 				void *key)
++ {
++ 	struct blk_mq_hw_ctx *hctx;
++ 
++ 	hctx = container_of(wait, struct blk_mq_hw_ctx, dispatch_wait);
++ 
++ 	list_del(&wait->task_list);
++ 	clear_bit_unlock(BLK_MQ_S_TAG_WAITING, &hctx->state);
++ 	blk_mq_run_hw_queue(hctx, true);
++ 	return 1;
++ }
++ 
++ static bool blk_mq_dispatch_wait_add(struct blk_mq_hw_ctx *hctx)
++ {
++ 	struct sbq_wait_state *ws;
++ 
++ 	/*
++ 	 * The TAG_WAITING bit serves as a lock protecting hctx->dispatch_wait.
++ 	 * The thread which wins the race to grab this bit adds the hardware
++ 	 * queue to the wait queue.
++ 	 */
++ 	if (test_bit(BLK_MQ_S_TAG_WAITING, &hctx->state) ||
++ 	    test_and_set_bit_lock(BLK_MQ_S_TAG_WAITING, &hctx->state))
++ 		return false;
++ 
++ 	init_waitqueue_func_entry(&hctx->dispatch_wait, blk_mq_dispatch_wake);
++ 	ws = bt_wait_ptr(&hctx->tags->bitmap_tags, hctx);
++ 
++ 	/*
++ 	 * As soon as this returns, it's no longer safe to fiddle with
++ 	 * hctx->dispatch_wait, since a completion can wake up the wait queue
++ 	 * and unlock the bit.
++ 	 */
++ 	add_wait_queue(&ws->wait, &hctx->dispatch_wait);
++ 	return true;
++ }
++ 
+++>>>>>>> da55f2cc7841 (blk-mq: use sbq wait queues instead of restart for driver tags)
+  bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *hctx, struct list_head *list)
+  {
+  	struct request_queue *q = hctx->queue;
+@@@ -846,6 -964,27 +955,30 @@@
+  		struct blk_mq_queue_data bd;
+  
+  		rq = list_first_entry(list, struct request, queuelist);
+++<<<<<<< HEAD
+++=======
++ 		if (!blk_mq_get_driver_tag(rq, &hctx, false)) {
++ 			if (!queued && reorder_tags_to_front(list))
++ 				continue;
++ 
++ 			/*
++ 			 * The initial allocation attempt failed, so we need to
++ 			 * rerun the hardware queue when a tag is freed.
++ 			 */
++ 			if (blk_mq_dispatch_wait_add(hctx)) {
++ 				/*
++ 				 * It's possible that a tag was freed in the
++ 				 * window between the allocation failure and
++ 				 * adding the hardware queue to the wait queue.
++ 				 */
++ 				if (!blk_mq_get_driver_tag(rq, &hctx, false))
++ 					break;
++ 			} else {
++ 				break;
++ 			}
++ 		}
++ 
+++>>>>>>> da55f2cc7841 (blk-mq: use sbq wait queues instead of restart for driver tags)
+  		list_del_init(&rq->queuelist);
+  
+  		bd.rq = rq;
+@@@ -900,46 -1039,16 +1033,56 @@@
+  		 * the requests in rq_list might get lost.
+  		 *
+  		 * blk_mq_run_hw_queue() already checks the STOPPED bit
+++<<<<<<< HEAD
+ +		 **/
+ +		blk_mq_run_hw_queue(hctx, true);
+++=======
++ 		 *
++ 		 * If RESTART or TAG_WAITING is set, then let completion restart
++ 		 * the queue instead of potentially looping here.
++ 		 */
++ 		if (!blk_mq_sched_needs_restart(hctx) &&
++ 		    !test_bit(BLK_MQ_S_TAG_WAITING, &hctx->state))
++ 			blk_mq_run_hw_queue(hctx, true);
+++>>>>>>> da55f2cc7841 (blk-mq: use sbq wait queues instead of restart for driver tags)
+ +	}
+ +
+ +	return (queued + errors) != 0;
+ +}
+ +
+ +/*
+ + * Run this hardware queue, pulling any software queues mapped to it in.
+ + * Note that this function currently has various problems around ordering
+ + * of IO. In particular, we'd like FIFO behaviour on handling existing
+ + * items on the hctx->dispatch list. Ignore that for now.
+ + */
+ +static void blk_mq_process_rq_list(struct blk_mq_hw_ctx *hctx)
+ +{
+ +	LIST_HEAD(rq_list);
+ +	LIST_HEAD(driver_list);
+ +
+ +	if (unlikely(blk_mq_hctx_stopped(hctx)))
+ +		return;
+ +
+ +	hctx->run++;
+ +
+ +	/*
+ +	 * Touch any software queue that has pending entries.
+ +	 */
+ +	flush_busy_ctxs(hctx, &rq_list);
+ +
+ +	/*
+ +	 * If we have previous entries on our dispatch list, grab them
+ +	 * and stuff them at the front for more fair dispatch.
+ +	 */
+ +	if (!list_empty_careful(&hctx->dispatch)) {
+ +		spin_lock(&hctx->lock);
+ +		if (!list_empty(&hctx->dispatch))
+ +			list_splice_init(&hctx->dispatch, &rq_list);
+ +		spin_unlock(&hctx->lock);
+  	}
+  
+ -	return queued != 0;
+ +	blk_mq_dispatch_rq_list(hctx, &rq_list);
+  }
+  
+  static void __blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx)
+diff --cc include/linux/blk-mq.h
+index e0a594c33528,001d30d727c5..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -38,22 -28,18 +38,27 @@@ struct blk_mq_hw_ctx 
+  
+  	void			*driver_data;
+  
+ -	struct sbitmap		ctx_map;
+ -
+ -	struct blk_mq_ctx	**ctxs;
+  	unsigned int		nr_ctx;
+ +	struct blk_mq_ctx	**ctxs;
+ +
+++<<<<<<< HEAD
+ +	RH_KABI_REPLACE(unsigned int		nr_ctx_map,
+ +			atomic_t		wait_index)
+  
+ +	RH_KABI_REPLACE(unsigned long		*ctx_map,
+ +			unsigned long		*padding1)
+ +
+ +	RH_KABI_REPLACE(struct request		**rqs,
+ +			struct request		**padding2)
+ +
+ +	RH_KABI_REPLACE(struct list_head	page_list,
+ +			struct list_head	padding3)
+++=======
++ 	wait_queue_t		dispatch_wait;
++ 	atomic_t		wait_index;
+++>>>>>>> da55f2cc7841 (blk-mq: use sbq wait queues instead of restart for driver tags)
+  
+  	struct blk_mq_tags	*tags;
+ -	struct blk_mq_tags	*sched_tags;
+ -
+ -	struct srcu_struct	queue_rq_srcu;
+  
+  	unsigned long		queued;
+  	unsigned long		run;
+@@@ -208,6 -160,8 +213,11 @@@ enum 
+  
+  	BLK_MQ_S_STOPPED	= 0,
+  	BLK_MQ_S_TAG_ACTIVE	= 1,
+++<<<<<<< HEAD
+++=======
++ 	BLK_MQ_S_SCHED_RESTART	= 2,
++ 	BLK_MQ_S_TAG_WAITING	= 3,
+++>>>>>>> da55f2cc7841 (blk-mq: use sbq wait queues instead of restart for driver tags)
+  
+  	BLK_MQ_MAX_DEPTH	= 10240,
+  
+* Unmerged path block/blk-mq.c
+* Unmerged path include/linux/blk-mq.h
