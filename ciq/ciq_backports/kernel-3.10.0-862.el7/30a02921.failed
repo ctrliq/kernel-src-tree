@@ -1,0 +1,286 @@
+nfp: allow multi-stage NSP configuration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 30a029217de994db889b7e598b54b674b2ad86b4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/30a02921.failed
+
+NSP commands may be slow to respond, we should try to avoid doing
+a command-per-item when user requested to change multiple parameters
+for instance with an ethtool .set_settings() command.
+
+Introduce a way of internal NSP code to carry state in NSP structure
+and add start/finish calls to perform the initialization and kick off
+of the configuration request, with potentially many parameters being
+modified in between.
+
+nfp_eth_set_mod_enable() will make use of the new code internally,
+other "set" functions to follow.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 30a029217de994db889b7e598b54b674b2ad86b4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfpcore/nfp.h
+diff --cc drivers/net/ethernet/netronome/nfp/nfpcore/nfp.h
+index f7ca8e374923,8afef7593f13..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp.h
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp.h
+@@@ -48,18 -48,18 +48,29 @@@
+  
+  const char *nfp_hwinfo_lookup(struct nfp_cpp *cpp, const char *lookup);
+  
+ -/* Implemented in nfp_nsp.c, low level functions */
+ +/* Implemented in nfp_nsp.c */
+  
+  struct nfp_nsp;
+ +struct firmware;
+  
+++<<<<<<< HEAD
+ +struct nfp_nsp *nfp_nsp_open(struct nfp_cpp *cpp);
+ +void nfp_nsp_close(struct nfp_nsp *state);
+ +u16 nfp_nsp_get_abi_ver_major(struct nfp_nsp *state);
+ +u16 nfp_nsp_get_abi_ver_minor(struct nfp_nsp *state);
+ +int nfp_nsp_wait(struct nfp_nsp *state);
+ +int nfp_nsp_device_soft_reset(struct nfp_nsp *state);
+ +int nfp_nsp_load_fw(struct nfp_nsp *state, const struct firmware *fw);
+++=======
++ struct nfp_cpp *nfp_nsp_cpp(struct nfp_nsp *state);
++ bool nfp_nsp_config_modified(struct nfp_nsp *state);
++ void nfp_nsp_config_set_modified(struct nfp_nsp *state, bool modified);
++ void *nfp_nsp_config_entries(struct nfp_nsp *state);
++ unsigned int nfp_nsp_config_idx(struct nfp_nsp *state);
++ void nfp_nsp_config_set_state(struct nfp_nsp *state, void *entries,
++ 			      unsigned int idx);
++ void nfp_nsp_config_clear_state(struct nfp_nsp *state);
+++>>>>>>> 30a029217de9 (nfp: allow multi-stage NSP configuration)
+  int nfp_nsp_read_eth_table(struct nfp_nsp *state, void *buf, unsigned int size);
+  int nfp_nsp_write_eth_table(struct nfp_nsp *state,
+  			    const void *buf, unsigned int size);
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfpcore/nfp.h
+diff --git a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c
+index 17822ae4a17f..8bce5a7bb68c 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c
+@@ -103,8 +103,51 @@ struct nfp_nsp {
+ 		u16 major;
+ 		u16 minor;
+ 	} ver;
++
++	/* Eth table config state */
++	bool modified;
++	unsigned int idx;
++	void *entries;
+ };
+ 
++struct nfp_cpp *nfp_nsp_cpp(struct nfp_nsp *state)
++{
++	return state->cpp;
++}
++
++bool nfp_nsp_config_modified(struct nfp_nsp *state)
++{
++	return state->modified;
++}
++
++void nfp_nsp_config_set_modified(struct nfp_nsp *state, bool modified)
++{
++	state->modified = modified;
++}
++
++void *nfp_nsp_config_entries(struct nfp_nsp *state)
++{
++	return state->entries;
++}
++
++unsigned int nfp_nsp_config_idx(struct nfp_nsp *state)
++{
++	return state->idx;
++}
++
++void
++nfp_nsp_config_set_state(struct nfp_nsp *state, void *entries, unsigned int idx)
++{
++	state->entries = entries;
++	state->idx = idx;
++}
++
++void nfp_nsp_config_clear_state(struct nfp_nsp *state)
++{
++	state->entries = NULL;
++	state->idx = 0;
++}
++
+ static int nfp_nsp_check(struct nfp_nsp *state)
+ {
+ 	struct nfp_cpp *cpp = state->cpp;
+diff --git a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
+index f94361014b87..44cdaa0e9afe 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
+@@ -214,63 +214,115 @@ err:
+ 	return NULL;
+ }
+ 
+-/**
+- * nfp_eth_set_mod_enable() - set PHY module enable control bit
+- * @cpp:	NFP CPP handle
+- * @idx:	NFP chip-wide port index
+- * @enable:	Desired state
+- *
+- * Enable or disable PHY module (this usually means setting the TX lanes
+- * disable bits).
+- *
+- * Return: 0 or -ERRNO.
+- */
+-int nfp_eth_set_mod_enable(struct nfp_cpp *cpp, unsigned int idx, bool enable)
++struct nfp_nsp *nfp_eth_config_start(struct nfp_cpp *cpp, unsigned int idx)
+ {
+ 	struct eth_table_entry *entries;
+ 	struct nfp_nsp *nsp;
+-	u64 reg;
+ 	int ret;
+ 
+ 	entries = kzalloc(NSP_ETH_TABLE_SIZE, GFP_KERNEL);
+ 	if (!entries)
+-		return -ENOMEM;
++		return ERR_PTR(-ENOMEM);
+ 
+ 	nsp = nfp_nsp_open(cpp);
+ 	if (IS_ERR(nsp)) {
+ 		kfree(entries);
+-		return PTR_ERR(nsp);
++		return nsp;
+ 	}
+ 
+ 	ret = nfp_nsp_read_eth_table(nsp, entries, NSP_ETH_TABLE_SIZE);
+ 	if (ret < 0) {
+ 		nfp_err(cpp, "reading port table failed %d\n", ret);
+-		goto exit_close_nsp;
++		goto err;
+ 	}
+ 
+ 	if (!(entries[idx].port & NSP_ETH_PORT_LANES_MASK)) {
+ 		nfp_warn(cpp, "trying to set port state on disabled port %d\n",
+ 			 idx);
+-		ret = -EINVAL;
+-		goto exit_close_nsp;
++		goto err;
+ 	}
+ 
+-	/* Check if we are already in requested state */
+-	reg = le64_to_cpu(entries[idx].state);
+-	if (enable == FIELD_GET(NSP_ETH_CTRL_ENABLED, reg)) {
+-		ret = 0;
+-		goto exit_close_nsp;
+-	}
++	nfp_nsp_config_set_state(nsp, entries, idx);
++	return nsp;
++
++err:
++	nfp_nsp_close(nsp);
++	kfree(entries);
++	return ERR_PTR(-EIO);
++}
+ 
+-	reg = le64_to_cpu(entries[idx].control);
+-	reg &= ~NSP_ETH_CTRL_ENABLED;
+-	reg |= FIELD_PREP(NSP_ETH_CTRL_ENABLED, enable);
+-	entries[idx].control = cpu_to_le64(reg);
++void nfp_eth_config_cleanup_end(struct nfp_nsp *nsp)
++{
++	struct eth_table_entry *entries = nfp_nsp_config_entries(nsp);
+ 
+-	ret = nfp_nsp_write_eth_table(nsp, entries, NSP_ETH_TABLE_SIZE);
+-exit_close_nsp:
++	nfp_nsp_config_set_modified(nsp, false);
++	nfp_nsp_config_clear_state(nsp);
+ 	nfp_nsp_close(nsp);
+ 	kfree(entries);
++}
++
++/**
++ * nfp_eth_config_commit_end() - perform recorded configuration changes
++ * @nsp:	NFP NSP handle returned from nfp_eth_config_start()
++ *
++ * Perform the configuration which was requested with __nfp_eth_set_*()
++ * helpers and recorded in @nsp state.  If device was already configured
++ * as requested or no __nfp_eth_set_*() operations were made no NSP command
++ * will be performed.
++ *
++ * Return:
++ * 0 - configuration successful;
++ * 1 - no changes were needed;
++ * -ERRNO - configuration failed.
++ */
++int nfp_eth_config_commit_end(struct nfp_nsp *nsp)
++{
++	struct eth_table_entry *entries = nfp_nsp_config_entries(nsp);
++	int ret = 1;
++
++	if (nfp_nsp_config_modified(nsp)) {
++		ret = nfp_nsp_write_eth_table(nsp, entries, NSP_ETH_TABLE_SIZE);
++		ret = ret < 0 ? ret : 0;
++	}
++
++	nfp_eth_config_cleanup_end(nsp);
++
++	return ret;
++}
++
++/**
++ * nfp_eth_set_mod_enable() - set PHY module enable control bit
++ * @cpp:	NFP CPP handle
++ * @idx:	NFP chip-wide port index
++ * @enable:	Desired state
++ *
++ * Enable or disable PHY module (this usually means setting the TX lanes
++ * disable bits).
++ *
++ * Return: 0 or -ERRNO.
++ */
++int nfp_eth_set_mod_enable(struct nfp_cpp *cpp, unsigned int idx, bool enable)
++{
++	struct eth_table_entry *entries;
++	struct nfp_nsp *nsp;
++	u64 reg;
++
++	nsp = nfp_eth_config_start(cpp, idx);
++	if (IS_ERR(nsp))
++		return PTR_ERR(nsp);
++
++	entries = nfp_nsp_config_entries(nsp);
++
++	/* Check if we are already in requested state */
++	reg = le64_to_cpu(entries[idx].state);
++	if (enable != FIELD_GET(NSP_ETH_CTRL_ENABLED, reg)) {
++		reg = le64_to_cpu(entries[idx].control);
++		reg &= ~NSP_ETH_CTRL_ENABLED;
++		reg |= FIELD_PREP(NSP_ETH_CTRL_ENABLED, enable);
++		entries[idx].control = cpu_to_le64(reg);
++
++		nfp_nsp_config_set_modified(nsp, true);
++	}
+ 
+-	return ret < 0 ? ret : 0;
++	return nfp_eth_config_commit_end(nsp);
+ }
+diff --git a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.h b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.h
+index edf703d319c8..788317019a6b 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.h
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.h
+@@ -78,4 +78,8 @@ struct nfp_eth_table *
+ __nfp_eth_read_ports(struct nfp_cpp *cpp, struct nfp_nsp *nsp);
+ int nfp_eth_set_mod_enable(struct nfp_cpp *cpp, unsigned int idx, bool enable);
+ 
++struct nfp_nsp *nfp_eth_config_start(struct nfp_cpp *cpp, unsigned int idx);
++int nfp_eth_config_commit_end(struct nfp_nsp *nsp);
++void nfp_eth_config_cleanup_end(struct nfp_nsp *nsp);
++
+ #endif
