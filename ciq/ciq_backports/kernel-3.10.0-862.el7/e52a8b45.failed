@@ -1,0 +1,84 @@
+qla2xxx: drop cmds/tmrs arrived while session is being deleted
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Alexei Potashnik <alexei@purestorage.com>
+commit e52a8b45b9c782937f74b701f8c656d4e5619eb5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e52a8b45.failed
+
+If a new initiator (different WWN) shows up on the same fcport, old
+initiator's session is scheduled for deletion. But there is a small
+window between it being marked with QLA_SESS_DELETION_IN_PROGRESS
+and qlt_unret_sess getting called when new session's commands will
+keep finding old session in the fcport map.
+
+This patch drops cmds/tmrs if they find session in the progress of
+being deleted.
+
+	Cc: <stable@vger.kernel.org> # v3.18+
+	Signed-off-by: Alexei Potashnik <alexei@purestorage.com>
+	Acked-by: Quinn Tran <quinn.tran@qlogic.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@qlogic.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit e52a8b45b9c782937f74b701f8c656d4e5619eb5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_target.c
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 4e0d4c3c5146,b60f9075e9f7..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -2737,10 -3755,44 +2742,47 @@@ static int qlt_handle_cmd_for_atio(stru
+  		return -EFAULT;
+  	}
+  
+++<<<<<<< HEAD
+ +	cmd = kmem_cache_zalloc(qla_tgt_cmd_cachep, GFP_ATOMIC);
+++=======
++ 	sess = ha->tgt.tgt_ops->find_sess_by_s_id(vha, atio->u.isp24.fcp_hdr.s_id);
++ 	if (unlikely(!sess)) {
++ 		struct qla_tgt_sess_op *op = kzalloc(sizeof(struct qla_tgt_sess_op),
++ 						     GFP_ATOMIC);
++ 		if (!op)
++ 			return -ENOMEM;
++ 
++ 		memcpy(&op->atio, atio, sizeof(*atio));
++ 		op->vha = vha;
++ 
++ 		spin_lock(&vha->cmd_list_lock);
++ 		list_add_tail(&op->cmd_list, &vha->qla_sess_op_cmd_list);
++ 		spin_unlock(&vha->cmd_list_lock);
++ 
++ 		INIT_WORK(&op->work, qlt_create_sess_from_atio);
++ 		queue_work(qla_tgt_wq, &op->work);
++ 		return 0;
++ 	}
++ 
++ 	/* Another WWN used to have our s_id. Our PLOGI scheduled its
++ 	 * session deletion, but it's still in sess_del_work wq */
++ 	if (sess->deleted == QLA_SESS_DELETION_IN_PROGRESS) {
++ 		ql_dbg(ql_dbg_io, vha, 0x3061,
++ 		    "New command while old session %p is being deleted\n",
++ 		    sess);
++ 		return -EFAULT;
++ 	}
++ 
++ 	/*
++ 	 * Do kref_get() before returning + dropping qla_hw_data->hardware_lock.
++ 	 */
++ 	kref_get(&sess->se_sess->sess_kref);
++ 
++ 	cmd = qlt_get_tag(vha, sess, atio);
+++>>>>>>> e52a8b45b9c7 (qla2xxx: drop cmds/tmrs arrived while session is being deleted)
+  	if (!cmd) {
+ -		ql_dbg(ql_dbg_io, vha, 0x3062,
+ +		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf05e,
+  		    "qla_target(%d): Allocation of cmd failed\n", vha->vp_idx);
+ -		ha->tgt.tgt_ops->put_sess(sess);
+  		return -ENOMEM;
+  	}
+  
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
