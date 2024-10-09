@@ -1,0 +1,515 @@
+net: sched: add termination action to allow goto chain
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] sched: add termination action to allow goto chain (Ivan Vecera) [1445420]
+Rebuild_FUZZ: 95.15%
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit db50514f9a9c7ef1f17e9921b1cc0902746872f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/db50514f.failed
+
+Introduce new type of termination action called "goto_chain". This allows
+user to specify a chain to be processed. This action type is
+then processed as a return value in tcf_classify loop in similar
+way as "reclassify" is, only it does not reset to the first filter
+in chain but rather reset to the first filter of the desired chain.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit db50514f9a9c7ef1f17e9921b1cc0902746872f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/act_api.h
+#	include/uapi/linux/pkt_cls.h
+#	net/sched/act_api.c
+#	net/sched/cls_api.c
+diff --cc include/net/act_api.h
+index 7eba1aba336b,26ffd8333f50..000000000000
+--- a/include/net/act_api.h
++++ b/include/net/act_api.h
+@@@ -45,6 -18,45 +45,48 @@@ struct tcf_hashinfo 
+  	u32			index;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct tc_action_ops;
++ 
++ struct tc_action {
++ 	const struct tc_action_ops	*ops;
++ 	__u32				type; /* for backward compat(TCA_OLD_COMPAT) */
++ 	__u32				order;
++ 	struct list_head		list;
++ 	struct tcf_hashinfo		*hinfo;
++ 
++ 	struct hlist_node		tcfa_head;
++ 	u32				tcfa_index;
++ 	int				tcfa_refcnt;
++ 	int				tcfa_bindcnt;
++ 	u32				tcfa_capab;
++ 	int				tcfa_action;
++ 	struct tcf_t			tcfa_tm;
++ 	struct gnet_stats_basic_packed	tcfa_bstats;
++ 	struct gnet_stats_queue		tcfa_qstats;
++ 	struct net_rate_estimator __rcu *tcfa_rate_est;
++ 	spinlock_t			tcfa_lock;
++ 	struct rcu_head			tcfa_rcu;
++ 	struct gnet_stats_basic_cpu __percpu *cpu_bstats;
++ 	struct gnet_stats_queue __percpu *cpu_qstats;
++ 	struct tc_cookie	*act_cookie;
++ 	struct tcf_chain	*goto_chain;
++ };
++ #define tcf_head	common.tcfa_head
++ #define tcf_index	common.tcfa_index
++ #define tcf_refcnt	common.tcfa_refcnt
++ #define tcf_bindcnt	common.tcfa_bindcnt
++ #define tcf_capab	common.tcfa_capab
++ #define tcf_action	common.tcfa_action
++ #define tcf_tm		common.tcfa_tm
++ #define tcf_bstats	common.tcfa_bstats
++ #define tcf_qstats	common.tcfa_qstats
++ #define tcf_rate_est	common.tcfa_rate_est
++ #define tcf_lock	common.tcfa_lock
++ #define tcf_rcu		common.tcfa_rcu
++ 
+++>>>>>>> db50514f9a9c (net: sched: add termination action to allow goto chain)
+  static inline unsigned int tcf_hash(u32 index, unsigned int hmask)
+  {
+  	return index & hmask;
+diff --cc include/uapi/linux/pkt_cls.h
+index 0e7cb6bf3619,1b9aa9e6b4fd..000000000000
+--- a/include/uapi/linux/pkt_cls.h
++++ b/include/uapi/linux/pkt_cls.h
+@@@ -113,7 -36,22 +113,26 @@@ enum 
+  #define TC_ACT_STOLEN		4
+  #define TC_ACT_QUEUED		5
+  #define TC_ACT_REPEAT		6
+++<<<<<<< HEAD
+ +#define TC_ACT_JUMP		0x10000000
+++=======
++ #define TC_ACT_REDIRECT		7
++ 
++ /* There is a special kind of actions called "extended actions",
++  * which need a value parameter. These have a local opcode located in
++  * the highest nibble, starting from 1. The rest of the bits
++  * are used to carry the value. These two parts together make
++  * a combined opcode.
++  */
++ #define __TC_ACT_EXT_SHIFT 28
++ #define __TC_ACT_EXT(local) ((local) << __TC_ACT_EXT_SHIFT)
++ #define TC_ACT_EXT_VAL_MASK ((1 << __TC_ACT_EXT_SHIFT) - 1)
++ #define TC_ACT_EXT_CMP(combined, opcode) \
++ 	(((combined) & (~TC_ACT_EXT_VAL_MASK)) == opcode)
++ 
++ #define TC_ACT_JUMP __TC_ACT_EXT(1)
++ #define TC_ACT_GOTO_CHAIN __TC_ACT_EXT(2)
+++>>>>>>> db50514f9a9c (net: sched: add termination action to allow goto chain)
+  
+  /* Action type identifiers*/
+  enum {
+diff --cc net/sched/act_api.c
+index 19022d7219af,0ecf2a858767..000000000000
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@@ -28,9 -28,34 +28,34 @@@
+  #include <net/act_api.h>
+  #include <net/netlink.h>
+  
++ static int tcf_action_goto_chain_init(struct tc_action *a, struct tcf_proto *tp)
++ {
++ 	u32 chain_index = a->tcfa_action & TC_ACT_EXT_VAL_MASK;
++ 
++ 	if (!tp)
++ 		return -EINVAL;
++ 	a->goto_chain = tcf_chain_get(tp->chain->block, chain_index);
++ 	if (!a->goto_chain)
++ 		return -ENOMEM;
++ 	return 0;
++ }
++ 
++ static void tcf_action_goto_chain_fini(struct tc_action *a)
++ {
++ 	tcf_chain_put(a->goto_chain);
++ }
++ 
++ static void tcf_action_goto_chain_exec(const struct tc_action *a,
++ 				       struct tcf_result *res)
++ {
++ 	const struct tcf_chain *chain = a->goto_chain;
++ 
++ 	res->goto_tp = rcu_dereference_bh(chain->filter_chain);
++ }
++ 
+  static void free_tcf(struct rcu_head *head)
+  {
+ -	struct tc_action *p = container_of(head, struct tc_action, tcfa_rcu);
+ +	struct tcf_common *p = container_of(head, struct tcf_common, tcfc_rcu);
+  
+  	free_percpu(p->cpu_bstats);
+  	free_percpu(p->cpu_qstats);
+@@@ -452,10 -479,27 +479,30 @@@ repeat
+  		ret = a->ops->act(skb, a, res);
+  		if (ret == TC_ACT_REPEAT)
+  			goto repeat;	/* we need a ttl - JHS */
+++<<<<<<< HEAD
+++=======
++ 
++ 		if (TC_ACT_EXT_CMP(ret, TC_ACT_JUMP)) {
++ 			jmp_prgcnt = ret & TCA_ACT_MAX_PRIO_MASK;
++ 			if (!jmp_prgcnt || (jmp_prgcnt > nr_actions)) {
++ 				/* faulty opcode, stop pipeline */
++ 				return TC_ACT_OK;
++ 			} else {
++ 				jmp_ttl -= 1;
++ 				if (jmp_ttl > 0)
++ 					goto restart_act_graph;
++ 				else /* faulty graph, stop pipeline */
++ 					return TC_ACT_OK;
++ 			}
++ 		} else if (TC_ACT_EXT_CMP(ret, TC_ACT_GOTO_CHAIN)) {
++ 			tcf_action_goto_chain_exec(a, res);
++ 		}
++ 
+++>>>>>>> db50514f9a9c (net: sched: add termination action to allow goto chain)
+  		if (ret != TC_ACT_PIPE)
+ -			break;
+ +			goto exec_done;
+  	}
+ -
+ +exec_done:
+  	return ret;
+  }
+  EXPORT_SYMBOL(tcf_action_exec);
+@@@ -657,10 -686,19 +704,21 @@@ struct tc_action *tcf_action_init_1(str
+  	if (err != ACT_P_CREATED)
+  		module_put(a_o->owner);
+  
++ 	if (TC_ACT_EXT_CMP(a->tcfa_action, TC_ACT_GOTO_CHAIN)) {
++ 		err = tcf_action_goto_chain_init(a, tp);
++ 		if (err) {
++ 			LIST_HEAD(actions);
++ 
++ 			list_add_tail(&a->list, &actions);
++ 			tcf_action_destroy(&actions, bind);
++ 			return ERR_PTR(err);
++ 		}
++ 	}
++ 
+  	return a;
+  
+ +err_free:
+ +	kfree(a);
+  err_mod:
+  	module_put(a_o->owner);
+  err_out:
+diff --cc net/sched/cls_api.c
+index 1dc6d123ed94,4020b8d932a1..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -124,7 -124,274 +124,278 @@@ static inline u32 tcf_auto_prio(struct 
+  	if (tp)
+  		first = tp->prio - 1;
+  
+++<<<<<<< HEAD
+ +	return first;
+++=======
++ 	return TC_H_MAJ(first);
++ }
++ 
++ static struct tcf_proto *tcf_proto_create(const char *kind, u32 protocol,
++ 					  u32 prio, u32 parent, struct Qdisc *q,
++ 					  struct tcf_chain *chain)
++ {
++ 	struct tcf_proto *tp;
++ 	int err;
++ 
++ 	tp = kzalloc(sizeof(*tp), GFP_KERNEL);
++ 	if (!tp)
++ 		return ERR_PTR(-ENOBUFS);
++ 
++ 	err = -ENOENT;
++ 	tp->ops = tcf_proto_lookup_ops(kind);
++ 	if (!tp->ops) {
++ #ifdef CONFIG_MODULES
++ 		rtnl_unlock();
++ 		request_module("cls_%s", kind);
++ 		rtnl_lock();
++ 		tp->ops = tcf_proto_lookup_ops(kind);
++ 		/* We dropped the RTNL semaphore in order to perform
++ 		 * the module load. So, even if we succeeded in loading
++ 		 * the module we have to replay the request. We indicate
++ 		 * this using -EAGAIN.
++ 		 */
++ 		if (tp->ops) {
++ 			module_put(tp->ops->owner);
++ 			err = -EAGAIN;
++ 		} else {
++ 			err = -ENOENT;
++ 		}
++ 		goto errout;
++ #endif
++ 	}
++ 	tp->classify = tp->ops->classify;
++ 	tp->protocol = protocol;
++ 	tp->prio = prio;
++ 	tp->classid = parent;
++ 	tp->q = q;
++ 	tp->chain = chain;
++ 
++ 	err = tp->ops->init(tp);
++ 	if (err) {
++ 		module_put(tp->ops->owner);
++ 		goto errout;
++ 	}
++ 	return tp;
++ 
++ errout:
++ 	kfree(tp);
++ 	return ERR_PTR(err);
++ }
++ 
++ static void tcf_proto_destroy(struct tcf_proto *tp)
++ {
++ 	tp->ops->destroy(tp);
++ 	module_put(tp->ops->owner);
++ 	kfree_rcu(tp, rcu);
++ }
++ 
++ static struct tcf_chain *tcf_chain_create(struct tcf_block *block,
++ 					  u32 chain_index)
++ {
++ 	struct tcf_chain *chain;
++ 
++ 	chain = kzalloc(sizeof(*chain), GFP_KERNEL);
++ 	if (!chain)
++ 		return NULL;
++ 	list_add_tail(&chain->list, &block->chain_list);
++ 	chain->block = block;
++ 	chain->index = chain_index;
++ 	chain->refcnt = 1;
++ 	return chain;
++ }
++ 
++ static void tcf_chain_destroy(struct tcf_chain *chain)
++ {
++ 	struct tcf_proto *tp;
++ 
++ 	list_del(&chain->list);
++ 	while ((tp = rtnl_dereference(chain->filter_chain)) != NULL) {
++ 		RCU_INIT_POINTER(chain->filter_chain, tp->next);
++ 		tcf_proto_destroy(tp);
++ 	}
++ 	kfree(chain);
++ }
++ 
++ struct tcf_chain *tcf_chain_get(struct tcf_block *block, u32 chain_index)
++ {
++ 	struct tcf_chain *chain;
++ 
++ 	list_for_each_entry(chain, &block->chain_list, list) {
++ 		if (chain->index == chain_index) {
++ 			chain->refcnt++;
++ 			return chain;
++ 		}
++ 	}
++ 	return tcf_chain_create(block, chain_index);
++ }
++ EXPORT_SYMBOL(tcf_chain_get);
++ 
++ void tcf_chain_put(struct tcf_chain *chain)
++ {
++ 	/* Destroy unused chain, with exception of chain 0, which is the
++ 	 * default one and has to be always present.
++ 	 */
++ 	if (--chain->refcnt == 0 && !chain->filter_chain && chain->index != 0)
++ 		tcf_chain_destroy(chain);
++ }
++ EXPORT_SYMBOL(tcf_chain_put);
++ 
++ static void
++ tcf_chain_filter_chain_ptr_set(struct tcf_chain *chain,
++ 			       struct tcf_proto __rcu **p_filter_chain)
++ {
++ 	chain->p_filter_chain = p_filter_chain;
++ }
++ 
++ int tcf_block_get(struct tcf_block **p_block,
++ 		  struct tcf_proto __rcu **p_filter_chain)
++ {
++ 	struct tcf_block *block = kzalloc(sizeof(*block), GFP_KERNEL);
++ 	struct tcf_chain *chain;
++ 	int err;
++ 
++ 	if (!block)
++ 		return -ENOMEM;
++ 	INIT_LIST_HEAD(&block->chain_list);
++ 	/* Create chain 0 by default, it has to be always present. */
++ 	chain = tcf_chain_create(block, 0);
++ 	if (!chain) {
++ 		err = -ENOMEM;
++ 		goto err_chain_create;
++ 	}
++ 	tcf_chain_filter_chain_ptr_set(chain, p_filter_chain);
++ 	*p_block = block;
++ 	return 0;
++ 
++ err_chain_create:
++ 	kfree(block);
++ 	return err;
++ }
++ EXPORT_SYMBOL(tcf_block_get);
++ 
++ void tcf_block_put(struct tcf_block *block)
++ {
++ 	struct tcf_chain *chain, *tmp;
++ 
++ 	if (!block)
++ 		return;
++ 
++ 	list_for_each_entry_safe(chain, tmp, &block->chain_list, list)
++ 		tcf_chain_destroy(chain);
++ 	kfree(block);
++ }
++ EXPORT_SYMBOL(tcf_block_put);
++ 
++ /* Main classifier routine: scans classifier chain attached
++  * to this qdisc, (optionally) tests for protocol and asks
++  * specific classifiers.
++  */
++ int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
++ 		 struct tcf_result *res, bool compat_mode)
++ {
++ 	__be16 protocol = tc_skb_protocol(skb);
++ #ifdef CONFIG_NET_CLS_ACT
++ 	const int max_reclassify_loop = 4;
++ 	const struct tcf_proto *old_tp = tp;
++ 	int limit = 0;
++ 
++ reclassify:
++ #endif
++ 	for (; tp; tp = rcu_dereference_bh(tp->next)) {
++ 		int err;
++ 
++ 		if (tp->protocol != protocol &&
++ 		    tp->protocol != htons(ETH_P_ALL))
++ 			continue;
++ 
++ 		err = tp->classify(skb, tp, res);
++ #ifdef CONFIG_NET_CLS_ACT
++ 		if (unlikely(err == TC_ACT_RECLASSIFY && !compat_mode)) {
++ 			goto reset;
++ 		} else if (unlikely(TC_ACT_EXT_CMP(err, TC_ACT_GOTO_CHAIN))) {
++ 			old_tp = res->goto_tp;
++ 			goto reset;
++ 		}
++ #endif
++ 		if (err >= 0)
++ 			return err;
++ 	}
++ 
++ 	return TC_ACT_UNSPEC; /* signal: continue lookup */
++ #ifdef CONFIG_NET_CLS_ACT
++ reset:
++ 	if (unlikely(limit++ >= max_reclassify_loop)) {
++ 		net_notice_ratelimited("%s: reclassify loop, rule prio %u, protocol %02x\n",
++ 				       tp->q->ops->id, tp->prio & 0xffff,
++ 				       ntohs(tp->protocol));
++ 		return TC_ACT_SHOT;
++ 	}
++ 
++ 	tp = old_tp;
++ 	protocol = tc_skb_protocol(skb);
++ 	goto reclassify;
++ #endif
++ }
++ EXPORT_SYMBOL(tcf_classify);
++ 
++ struct tcf_chain_info {
++ 	struct tcf_proto __rcu **pprev;
++ 	struct tcf_proto __rcu *next;
++ };
++ 
++ static struct tcf_proto *tcf_chain_tp_prev(struct tcf_chain_info *chain_info)
++ {
++ 	return rtnl_dereference(*chain_info->pprev);
++ }
++ 
++ static void tcf_chain_tp_insert(struct tcf_chain *chain,
++ 				struct tcf_chain_info *chain_info,
++ 				struct tcf_proto *tp)
++ {
++ 	if (chain->p_filter_chain &&
++ 	    *chain_info->pprev == chain->filter_chain)
++ 		*chain->p_filter_chain = tp;
++ 	RCU_INIT_POINTER(tp->next, tcf_chain_tp_prev(chain_info));
++ 	rcu_assign_pointer(*chain_info->pprev, tp);
++ }
++ 
++ static void tcf_chain_tp_remove(struct tcf_chain *chain,
++ 				struct tcf_chain_info *chain_info,
++ 				struct tcf_proto *tp)
++ {
++ 	struct tcf_proto *next = rtnl_dereference(chain_info->next);
++ 
++ 	if (chain->p_filter_chain && tp == chain->filter_chain)
++ 		*chain->p_filter_chain = next;
++ 	RCU_INIT_POINTER(*chain_info->pprev, next);
++ }
++ 
++ static struct tcf_proto *tcf_chain_tp_find(struct tcf_chain *chain,
++ 					   struct tcf_chain_info *chain_info,
++ 					   u32 protocol, u32 prio,
++ 					   bool prio_allocate)
++ {
++ 	struct tcf_proto **pprev;
++ 	struct tcf_proto *tp;
++ 
++ 	/* Check the chain for existence of proto-tcf with this priority */
++ 	for (pprev = &chain->filter_chain;
++ 	     (tp = rtnl_dereference(*pprev)); pprev = &tp->next) {
++ 		if (tp->prio >= prio) {
++ 			if (tp->prio == prio) {
++ 				if (prio_allocate ||
++ 				    (tp->protocol != protocol && protocol))
++ 					return ERR_PTR(-EINVAL);
++ 			} else {
++ 				tp = NULL;
++ 			}
++ 			break;
++ 		}
++ 	}
++ 	chain_info->pprev = pprev;
++ 	chain_info->next = tp ? tp->next : NULL;
++ 	return tp;
+++>>>>>>> db50514f9a9c (net: sched: add termination action to allow goto chain)
+  }
+  
+  /* Add/change/delete/get a filter node */
+* Unmerged path include/net/act_api.h
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index 7b71681b10fc..2284ba079547 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -183,8 +183,13 @@ struct Qdisc_ops {
+ 
+ 
+ struct tcf_result {
+-	unsigned long	class;
+-	u32		classid;
++	union {
++		struct {
++			unsigned long	class;
++			u32		classid;
++		};
++		const struct tcf_proto *goto_tp;
++	};
+ };
+ 
+ struct tcf_proto_ops {
+* Unmerged path include/uapi/linux/pkt_cls.h
+* Unmerged path net/sched/act_api.c
+* Unmerged path net/sched/cls_api.c
