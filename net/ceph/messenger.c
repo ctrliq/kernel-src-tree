@@ -2043,6 +2043,8 @@ static int process_connect(struct ceph_connection *con)
 	dout("process_connect on %p tag %d\n", con, (int)con->in_tag);
 
 	if (con->auth) {
+		int len = le32_to_cpu(con->in_reply.authorizer_len);
+
 		/*
 		 * Any connection that defines ->get_authorizer()
 		 * should also define ->add_authorizer_challenge() and
@@ -2052,8 +2054,7 @@ static int process_connect(struct ceph_connection *con)
 		 */
 		if (con->in_reply.tag == CEPH_MSGR_TAG_CHALLENGE_AUTHORIZER) {
 			ret = con->ops->add_authorizer_challenge(
-				    con, con->auth->authorizer_reply_buf,
-				    le32_to_cpu(con->in_reply.authorizer_len));
+				    con, con->auth->authorizer_reply_buf, len);
 			if (ret < 0)
 				return ret;
 
@@ -2063,10 +2064,12 @@ static int process_connect(struct ceph_connection *con)
 			return 0;
 		}
 
-		ret = con->ops->verify_authorizer_reply(con);
-		if (ret < 0) {
-			con->error_msg = "bad authorize reply";
-			return ret;
+		if (len) {
+			ret = con->ops->verify_authorizer_reply(con);
+			if (ret < 0) {
+				con->error_msg = "bad authorize reply";
+				return ret;
+			}
 		}
 	}
 
