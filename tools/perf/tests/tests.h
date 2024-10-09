@@ -92,6 +92,7 @@ int test__is_printable_array(struct test *test, int subtest);
 int test__bitmap_print(struct test *test, int subtest);
 int test__perf_hooks(struct test *test, int subtest);
 int test__unit_number__scnprint(struct test *test, int subtest);
+int test__mem2node(struct test *t, int subtest);
 
 bool test__bp_signal_is_supported(void);
 
