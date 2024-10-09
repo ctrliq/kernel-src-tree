@@ -1,0 +1,836 @@
+qla2xxx: Wait for all conflicts before ack'ing PLOGI
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Alexei Potashnik <alexei@purestorage.com>
+commit b7bd104e6f1c3be2bf881dc1ca7db40da3ee65fd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b7bd104e.failed
+
+Until now ack'ing of a new PLOGI has only been delayed if there
+was an existing session for the same WWN. Ack was released when
+the session deletion completed.
+
+If there was another WWN session with the same fc_id/loop_id pair
+(aka "conflicting session"), PLOGI was still ack'ed immediately.
+This potentially caused a problem when old session deletion logged
+fc_id/loop_id out of FW after new session has been established.
+
+Two work-arounds were attempted before:
+1. Dropping PLOGIs until conflicting session goes away.
+2. Detecting initiator being logged out of FW and issuing LOGO
+to force re-login.
+
+This patch introduces proper solution to the problem where PLOGI
+is held until either existing session with same WWN or any
+conflicting session goes away. Mechanism supports one session holding
+two PLOGI acks as well as one PLOGI ack being held by many sessions.
+
+	Signed-off-by: Alexei Potashnik <alexei@purestorage.com>
+	Acked-by: Quinn Tran <quinn.tran@qlogic.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@qlogic.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit b7bd104e6f1c3be2bf881dc1ca7db40da3ee65fd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_dbg.c
+#	drivers/scsi/qla2xxx/qla_def.h
+#	drivers/scsi/qla2xxx/qla_os.c
+#	drivers/scsi/qla2xxx/qla_target.c
+#	drivers/scsi/qla2xxx/qla_target.h
+diff --cc drivers/scsi/qla2xxx/qla_dbg.c
+index 866e7a991a8e,cd0d94ea7f74..000000000000
+--- a/drivers/scsi/qla2xxx/qla_dbg.c
++++ b/drivers/scsi/qla2xxx/qla_dbg.c
+@@@ -28,13 -26,12 +28,17 @@@
+   * |                              |                    | 0x3036,0x3038  |
+   * |                              |                    | 0x303a		|
+   * | DPC Thread                   |       0x4023       | 0x4002,0x4013  |
+++<<<<<<< HEAD
+ + * | Async Events                 |       0x5090       | 0x502b-0x502f  |
+ + * |				  | 		       | 0x5047         |
+++=======
++  * | Async Events                 |       0x5089       | 0x502b-0x502f  |
+++>>>>>>> b7bd104e6f1c (qla2xxx: Wait for all conflicts before ack'ing PLOGI)
+   * |                              |                    | 0x5084,0x5075	|
+   * |                              |                    | 0x503d,0x5044  |
+ - * |                              |                    | 0x507b,0x505f	|
+ + * |                              |                    | 0x505f		|
+   * | Timer Routines               |       0x6012       |                |
+ - * | User Space Interactions      |       0x70e65      | 0x7018,0x702e  |
+ + * | User Space Interactions      |       0x70e3       | 0x7018,0x702e  |
+   * |				  |		       | 0x7020,0x7024  |
+   * |                              |                    | 0x7039,0x7045  |
+   * |                              |                    | 0x7073-0x7075  |
+@@@ -61,18 -58,14 +65,24 @@@
+   * |                              |                    | 0xb13a,0xb142  |
+   * |                              |                    | 0xb13c-0xb140  |
+   * |                              |                    | 0xb149		|
+ - * | MultiQ                       |       0xc00c       |		|
+ - * | Misc                         |       0xd301       | 0xd031-0xd0ff	|
+ + * | MultiQ                       |       0xc010       |		|
+ + * | Misc                         |       0xd300       | 0xd016-0xd017	|
+ + * |                              |                    | 0xd021,0xd024	|
+ + * |                              |                    | 0xd025,0xd029	|
+ + * |                              |                    | 0xd02a,0xd02e	|
+ + * |                              |                    | 0xd031-0xd0ff	|
+   * |                              |                    | 0xd101-0xd1fe	|
+++<<<<<<< HEAD
+ + * |                              |                    | 0xd213-0xd2fe	|
+ + * | Target Mode		  |	  0xe070       | 0xe021		|
+ + * | Target Mode Management	  |	  0xf072       | 0xf002-0xf003	|
+++=======
++  * |                              |                    | 0xd214-0xd2fe	|
++  * | Target Mode		  |	  0xe080       |		|
++  * | Target Mode Management	  |	  0xf09b       | 0xf002		|
+++>>>>>>> b7bd104e6f1c (qla2xxx: Wait for all conflicts before ack'ing PLOGI)
+   * |                              |                    | 0xf046-0xf049  |
+ - * | Target Mode Task Management  |	  0x1000d      |		|
+ + * | Target Mode Task Management  |	  0x1000b      |		|
+   * ----------------------------------------------------------------------
+   */
+  
+diff --cc drivers/scsi/qla2xxx/qla_def.h
+index 9cf0dee11112,734524f5cf7d..000000000000
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@@ -3656,7 -3643,19 +3656,23 @@@ typedef struct scsi_qla_host 
+  	uint16_t	fcoe_fcf_idx;
+  	uint8_t		fcoe_vn_port_mac[6];
+  
+++<<<<<<< HEAD
+ +	struct list_head	qp_list;
+++=======
++ 	/* list of commands waiting on workqueue */
++ 	struct list_head	qla_cmd_list;
++ 	struct list_head	qla_sess_op_cmd_list;
++ 	spinlock_t		cmd_list_lock;
++ 
++ 	/* Counter to detect races between ELS and RSCN events */
++ 	atomic_t		generation_tick;
++ 	/* Time when global fcport update has been scheduled */
++ 	int			total_fcport_update_gen;
++ 	/* List of pending LOGOs, protected by tgt_mutex */
++ 	struct list_head	logo_list;
++ 	/* List of pending PLOGI acks, protected by hw lock */
++ 	struct list_head	plogi_ack_list;
+++>>>>>>> b7bd104e6f1c (qla2xxx: Wait for all conflicts before ack'ing PLOGI)
+  
+  	uint32_t	vp_abort_cnt;
+  
+diff --cc drivers/scsi/qla2xxx/qla_os.c
+index c679c5766696,00ea902b2a42..000000000000
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@@ -4121,10 -3918,13 +4121,17 @@@ struct scsi_qla_host *qla2x00_create_ho
+  	INIT_LIST_HEAD(&vha->vp_fcports);
+  	INIT_LIST_HEAD(&vha->work_list);
+  	INIT_LIST_HEAD(&vha->list);
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&vha->qp_list);
+++=======
++ 	INIT_LIST_HEAD(&vha->qla_cmd_list);
++ 	INIT_LIST_HEAD(&vha->qla_sess_op_cmd_list);
++ 	INIT_LIST_HEAD(&vha->logo_list);
++ 	INIT_LIST_HEAD(&vha->plogi_ack_list);
+++>>>>>>> b7bd104e6f1c (qla2xxx: Wait for all conflicts before ack'ing PLOGI)
+  
+  	spin_lock_init(&vha->work_lock);
+ -	spin_lock_init(&vha->cmd_list_lock);
+ +	init_waitqueue_head(&vha->vref_waitq);
+  
+  	sprintf(vha->host_str, "%s_%ld", QLA2XXX_DRIVER_NAME, vha->host_no);
+  	ql_dbg(ql_dbg_init, vha, 0x0041,
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 4e0d4c3c5146,2b218b6e9268..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -101,11 -108,23 +101,27 @@@ static void qlt_send_term_exchange(stru
+  	*cmd, struct atio_from_isp *atio, int ha_locked);
+  static void qlt_reject_free_srr_imm(struct scsi_qla_host *ha,
+  	struct qla_tgt_srr_imm *imm, int ha_lock);
+++<<<<<<< HEAD
+++=======
++ static void qlt_abort_cmd_on_host_reset(struct scsi_qla_host *vha,
++ 	struct qla_tgt_cmd *cmd);
++ static void qlt_alloc_qfull_cmd(struct scsi_qla_host *vha,
++ 	struct atio_from_isp *atio, uint16_t status, int qfull);
++ static void qlt_disable_vha(struct scsi_qla_host *vha);
++ static void qlt_clear_tgt_db(struct qla_tgt *tgt);
++ static void qlt_send_notify_ack(struct scsi_qla_host *vha,
++ 	struct imm_ntfy_from_isp *ntfy,
++ 	uint32_t add_flags, uint16_t resp_code, int resp_code_valid,
++ 	uint16_t srr_flags, uint16_t srr_reject_code, uint8_t srr_explan);
++ static void qlt_send_term_imm_notif(struct scsi_qla_host *vha,
++ 	struct imm_ntfy_from_isp *imm, int ha_locked);
+++>>>>>>> b7bd104e6f1c (qla2xxx: Wait for all conflicts before ack'ing PLOGI)
+  /*
+   * Global Variables
+   */
+ +static struct kmem_cache *qla_tgt_cmd_cachep;
+  static struct kmem_cache *qla_tgt_mgmt_cmd_cachep;
++ static struct kmem_cache *qla_tgt_plogi_cachep;
+  static mempool_t *qla_tgt_mgmt_cmd_mempool;
+  static struct workqueue_struct *qla_tgt_wq;
+  static DEFINE_MUTEX(qla_tgt_mutex);
+@@@ -333,6 -392,131 +349,134 @@@ void qlt_response_pkt_all_vps(struct sc
+  
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * All qlt_plogi_ack_t operations are protected by hardware_lock
++  */
++ 
++ /*
++  * This is a zero-base ref-counting solution, since hardware_lock
++  * guarantees that ref_count is not modified concurrently.
++  * Upon successful return content of iocb is undefined
++  */
++ static qlt_plogi_ack_t *
++ qlt_plogi_ack_find_add(struct scsi_qla_host *vha, port_id_t *id,
++ 		       struct imm_ntfy_from_isp *iocb)
++ {
++ 	qlt_plogi_ack_t *pla;
++ 
++ 	list_for_each_entry(pla, &vha->plogi_ack_list, list) {
++ 		if (pla->id.b24 == id->b24) {
++ 			qlt_send_term_imm_notif(vha, &pla->iocb, 1);
++ 			pla->iocb = *iocb;
++ 			return pla;
++ 		}
++ 	}
++ 
++ 	pla = kmem_cache_zalloc(qla_tgt_plogi_cachep, GFP_ATOMIC);
++ 	if (!pla) {
++ 		ql_dbg(ql_dbg_async, vha, 0x5088,
++ 		       "qla_target(%d): Allocation of plogi_ack failed\n",
++ 		       vha->vp_idx);
++ 		return NULL;
++ 	}
++ 
++ 	pla->iocb = *iocb;
++ 	pla->id = *id;
++ 	list_add_tail(&pla->list, &vha->plogi_ack_list);
++ 
++ 	return pla;
++ }
++ 
++ static void qlt_plogi_ack_unref(struct scsi_qla_host *vha, qlt_plogi_ack_t *pla)
++ {
++ 	BUG_ON(!pla->ref_count);
++ 	pla->ref_count--;
++ 
++ 	if (pla->ref_count)
++ 		return;
++ 
++ 	ql_dbg(ql_dbg_async, vha, 0x5089,
++ 	    "Sending PLOGI ACK to wwn %8phC s_id %02x:%02x:%02x loop_id %#04x"
++ 	    " exch %#x ox_id %#x\n", pla->iocb.u.isp24.port_name,
++ 	    pla->iocb.u.isp24.port_id[2], pla->iocb.u.isp24.port_id[1],
++ 	    pla->iocb.u.isp24.port_id[0],
++ 	    le16_to_cpu(pla->iocb.u.isp24.nport_handle),
++ 	    pla->iocb.u.isp24.exchange_address, pla->iocb.ox_id);
++ 	qlt_send_notify_ack(vha, &pla->iocb, 0, 0, 0, 0, 0, 0);
++ 
++ 	list_del(&pla->list);
++ 	kmem_cache_free(qla_tgt_plogi_cachep, pla);
++ }
++ 
++ static void
++ qlt_plogi_ack_link(struct scsi_qla_host *vha, qlt_plogi_ack_t *pla,
++     struct qla_tgt_sess *sess, qlt_plogi_link_t link)
++ {
++ 	/* Inc ref_count first because link might already be pointing at pla */
++ 	pla->ref_count++;
++ 
++ 	if (sess->plogi_link[link])
++ 		qlt_plogi_ack_unref(vha, sess->plogi_link[link]);
++ 
++ 	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf097,
++ 	    "Linking sess %p [%d] wwn %8phC with PLOGI ACK to wwn %8phC"
++ 	    " s_id %02x:%02x:%02x, ref=%d\n", sess, link, sess->port_name,
++ 	    pla->iocb.u.isp24.port_name, pla->iocb.u.isp24.port_id[2],
++ 	    pla->iocb.u.isp24.port_id[1], pla->iocb.u.isp24.port_id[0],
++ 	    pla->ref_count);
++ 
++ 	sess->plogi_link[link] = pla;
++ }
++ 
++ typedef struct {
++ 	/* These fields must be initialized by the caller */
++ 	port_id_t id;
++ 	/*
++ 	 * number of cmds dropped while we were waiting for
++ 	 * initiator to ack LOGO initialize to 1 if LOGO is
++ 	 * triggered by a command, otherwise, to 0
++ 	 */
++ 	int cmd_count;
++ 
++ 	/* These fields are used by callee */
++ 	struct list_head list;
++ } qlt_port_logo_t;
++ 
++ static void
++ qlt_send_first_logo(struct scsi_qla_host *vha, qlt_port_logo_t *logo)
++ {
++ 	qlt_port_logo_t *tmp;
++ 	int res;
++ 
++ 	mutex_lock(&vha->vha_tgt.tgt_mutex);
++ 
++ 	list_for_each_entry(tmp, &vha->logo_list, list) {
++ 		if (tmp->id.b24 == logo->id.b24) {
++ 			tmp->cmd_count += logo->cmd_count;
++ 			mutex_unlock(&vha->vha_tgt.tgt_mutex);
++ 			return;
++ 		}
++ 	}
++ 
++ 	list_add_tail(&logo->list, &vha->logo_list);
++ 
++ 	mutex_unlock(&vha->vha_tgt.tgt_mutex);
++ 
++ 	res = qla24xx_els_dcmd_iocb(vha, ELS_DCMD_LOGO, logo->id);
++ 
++ 	mutex_lock(&vha->vha_tgt.tgt_mutex);
++ 	list_del(&logo->list);
++ 	mutex_unlock(&vha->vha_tgt.tgt_mutex);
++ 
++ 	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf098,
++ 	    "Finished LOGO to %02x:%02x:%02x, dropped %d cmds, res = %#x\n",
++ 	    logo->id.b.domain, logo->id.b.area, logo->id.b.al_pa,
++ 	    logo->cmd_count, res);
++ }
++ 
+++>>>>>>> b7bd104e6f1c (qla2xxx: Wait for all conflicts before ack'ing PLOGI)
+  static void qlt_free_session_done(struct work_struct *work)
+  {
+  	struct qla_tgt_sess *sess = container_of(work, struct qla_tgt_sess,
+@@@ -340,14 -524,105 +484,84 @@@
+  	struct qla_tgt *tgt = sess->tgt;
+  	struct scsi_qla_host *vha = sess->vha;
+  	struct qla_hw_data *ha = vha->hw;
+++<<<<<<< HEAD
+++=======
++ 	unsigned long flags;
++ 	bool logout_started = false;
++ 	fc_port_t fcport;
++ 
++ 	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf084,
++ 		"%s: se_sess %p / sess %p from port %8phC loop_id %#04x"
++ 		" s_id %02x:%02x:%02x logout %d keep %d els_logo %d\n",
++ 		__func__, sess->se_sess, sess, sess->port_name, sess->loop_id,
++ 		sess->s_id.b.domain, sess->s_id.b.area, sess->s_id.b.al_pa,
++ 		sess->logout_on_delete, sess->keep_nport_handle,
++ 		sess->send_els_logo);
+++>>>>>>> b7bd104e6f1c (qla2xxx: Wait for all conflicts before ack'ing PLOGI)
+  
+  	BUG_ON(!tgt);
+ -
+ -	if (sess->send_els_logo) {
+ -		qlt_port_logo_t logo;
+ -		logo.id = sess->s_id;
+ -		logo.cmd_count = 0;
+ -		qlt_send_first_logo(vha, &logo);
+ -	}
+ -
+ -	if (sess->logout_on_delete) {
+ -		int rc;
+ -
+ -		memset(&fcport, 0, sizeof(fcport));
+ -		fcport.loop_id = sess->loop_id;
+ -		fcport.d_id = sess->s_id;
+ -		memcpy(fcport.port_name, sess->port_name, WWN_SIZE);
+ -		fcport.vha = vha;
+ -		fcport.tgt_session = sess;
+ -
+ -		rc = qla2x00_post_async_logout_work(vha, &fcport, NULL);
+ -		if (rc != QLA_SUCCESS)
+ -			ql_log(ql_log_warn, vha, 0xf085,
+ -			       "Schedule logo failed sess %p rc %d\n",
+ -			       sess, rc);
+ -		else
+ -			logout_started = true;
+ -	}
+ -
+  	/*
+  	 * Release the target session for FC Nexus from fabric module code.
+  	 */
+  	if (sess->se_sess != NULL)
+  		ha->tgt.tgt_ops->free_session(sess);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (logout_started) {
++ 		bool traced = false;
++ 
++ 		while (!ACCESS_ONCE(sess->logout_completed)) {
++ 			if (!traced) {
++ 				ql_dbg(ql_dbg_tgt_mgt, vha, 0xf086,
++ 					"%s: waiting for sess %p logout\n",
++ 					__func__, sess);
++ 				traced = true;
++ 			}
++ 			msleep(100);
++ 		}
++ 
++ 		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf087,
++ 			"%s: sess %p logout completed\n",
++ 			__func__, sess);
++ 	}
++ 
++ 	spin_lock_irqsave(&ha->hardware_lock, flags);
++ 
++ 	{
++ 		qlt_plogi_ack_t *own =
++ 		    sess->plogi_link[QLT_PLOGI_LINK_SAME_WWN];
++ 		qlt_plogi_ack_t *con =
++ 		    sess->plogi_link[QLT_PLOGI_LINK_CONFLICT];
++ 
++ 		if (con) {
++ 			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf099,
++ 			    "se_sess %p / sess %p port %8phC is gone,"
++ 			    " %s (ref=%d), releasing PLOGI for %8phC (ref=%d)\n",
++ 			    sess->se_sess, sess, sess->port_name,
++ 			    own ? "releasing own PLOGI" :
++ 			    "no own PLOGI pending",
++ 			    own ? own->ref_count : -1,
++ 			    con->iocb.u.isp24.port_name, con->ref_count);
++ 			qlt_plogi_ack_unref(vha, con);
++ 		} else {
++ 			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf09a,
++ 			    "se_sess %p / sess %p port %8phC is gone, %s (ref=%d)\n",
++ 			    sess->se_sess, sess, sess->port_name,
++ 			    own ? "releasing own PLOGI" :
++ 			    "no own PLOGI pending",
++ 			    own ? own->ref_count : -1);
++ 		}
++ 
++ 		if (own)
++ 			qlt_plogi_ack_unref(vha, own);
++ 	}
++ 
++ 	list_del(&sess->sess_list_entry);
++ 
++ 	spin_unlock_irqrestore(&ha->hardware_lock, flags);
++ 
+++>>>>>>> b7bd104e6f1c (qla2xxx: Wait for all conflicts before ack'ing PLOGI)
+  	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf001,
+  	    "Unregistration of sess %p finished\n", sess);
+  
+@@@ -2955,23 -4179,275 +3169,273 @@@ static int qlt_abort_task(struct scsi_q
+  	return __qlt_abort_task(vha, iocb, sess);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void qlt_logo_completion_handler(fc_port_t *fcport, int rc)
++ {
++ 	if (fcport->tgt_session) {
++ 		if (rc != MBS_COMMAND_COMPLETE) {
++ 			ql_dbg(ql_dbg_tgt_mgt, fcport->vha, 0xf093,
++ 				"%s: se_sess %p / sess %p from"
++ 				" port %8phC loop_id %#04x s_id %02x:%02x:%02x"
++ 				" LOGO failed: %#x\n",
++ 				__func__,
++ 				fcport->tgt_session->se_sess,
++ 				fcport->tgt_session,
++ 				fcport->port_name, fcport->loop_id,
++ 				fcport->d_id.b.domain, fcport->d_id.b.area,
++ 				fcport->d_id.b.al_pa, rc);
++ 		}
++ 
++ 		fcport->tgt_session->logout_completed = 1;
++ 	}
++ }
++ 
++ /*
++ * ha->hardware_lock supposed to be held on entry (to protect tgt->sess_list)
++ *
++ * Schedules sessions with matching port_id/loop_id but different wwn for
++ * deletion. Returns existing session with matching wwn if present.
++ * Null otherwise.
++ */
++ static struct qla_tgt_sess *
++ qlt_find_sess_invalidate_other(struct qla_tgt *tgt, uint64_t wwn,
++     port_id_t port_id, uint16_t loop_id, struct qla_tgt_sess **conflict_sess)
++ {
++ 	struct qla_tgt_sess *sess = NULL, *other_sess;
++ 	uint64_t other_wwn;
++ 
++ 	*conflict_sess = NULL;
++ 
++ 	list_for_each_entry(other_sess, &tgt->sess_list, sess_list_entry) {
++ 
++ 		other_wwn = wwn_to_u64(other_sess->port_name);
++ 
++ 		if (wwn == other_wwn) {
++ 			WARN_ON(sess);
++ 			sess = other_sess;
++ 			continue;
++ 		}
++ 
++ 		/* find other sess with nport_id collision */
++ 		if (port_id.b24 == other_sess->s_id.b24) {
++ 			if (loop_id != other_sess->loop_id) {
++ 				ql_dbg(ql_dbg_tgt_tmr, tgt->vha, 0x1000c,
++ 				    "Invalidating sess %p loop_id %d wwn %llx.\n",
++ 				    other_sess, other_sess->loop_id, other_wwn);
++ 
++ 				/*
++ 				 * logout_on_delete is set by default, but another
++ 				 * session that has the same s_id/loop_id combo
++ 				 * might have cleared it when requested this session
++ 				 * deletion, so don't touch it
++ 				 */
++ 				qlt_schedule_sess_for_deletion(other_sess, true);
++ 			} else {
++ 				/*
++ 				 * Another wwn used to have our s_id/loop_id
++ 				 * kill the session, but don't free the loop_id
++ 				 */
++ 				other_sess->keep_nport_handle = 1;
++ 				*conflict_sess = other_sess;
++ 				qlt_schedule_sess_for_deletion(other_sess,
++ 				    true);
++ 			}
++ 			continue;
++ 		}
++ 
++ 		/* find other sess with nport handle collision */
++ 		if (loop_id == other_sess->loop_id) {
++ 			ql_dbg(ql_dbg_tgt_tmr, tgt->vha, 0x1000d,
++ 			       "Invalidating sess %p loop_id %d wwn %llx.\n",
++ 			       other_sess, other_sess->loop_id, other_wwn);
++ 
++ 			/* Same loop_id but different s_id
++ 			 * Ok to kill and logout */
++ 			qlt_schedule_sess_for_deletion(other_sess, true);
++ 		}
++ 	}
++ 
++ 	return sess;
++ }
++ 
++ /* Abort any commands for this s_id waiting on qla_tgt_wq workqueue */
++ static int abort_cmds_for_s_id(struct scsi_qla_host *vha, port_id_t *s_id)
++ {
++ 	struct qla_tgt_sess_op *op;
++ 	struct qla_tgt_cmd *cmd;
++ 	uint32_t key;
++ 	int count = 0;
++ 
++ 	key = (((u32)s_id->b.domain << 16) |
++ 	       ((u32)s_id->b.area   <<  8) |
++ 	       ((u32)s_id->b.al_pa));
++ 
++ 	spin_lock(&vha->cmd_list_lock);
++ 	list_for_each_entry(op, &vha->qla_sess_op_cmd_list, cmd_list) {
++ 		uint32_t op_key = sid_to_key(op->atio.u.isp24.fcp_hdr.s_id);
++ 		if (op_key == key) {
++ 			op->aborted = true;
++ 			count++;
++ 		}
++ 	}
++ 	list_for_each_entry(cmd, &vha->qla_cmd_list, cmd_list) {
++ 		uint32_t cmd_key = sid_to_key(cmd->atio.u.isp24.fcp_hdr.s_id);
++ 		if (cmd_key == key) {
++ 			cmd->state = QLA_TGT_STATE_ABORTED;
++ 			count++;
++ 		}
++ 	}
++ 	spin_unlock(&vha->cmd_list_lock);
++ 
++ 	return count;
++ }
++ 
+++>>>>>>> b7bd104e6f1c (qla2xxx: Wait for all conflicts before ack'ing PLOGI)
+  /*
+   * ha->hardware_lock supposed to be held on entry. Might drop it, then reaquire
+   */
+  static int qlt_24xx_handle_els(struct scsi_qla_host *vha,
+  	struct imm_ntfy_from_isp *iocb)
+  {
+ -	struct qla_tgt *tgt = vha->vha_tgt.qla_tgt;
+  	struct qla_hw_data *ha = vha->hw;
+++<<<<<<< HEAD
+++=======
++ 	struct qla_tgt_sess *sess = NULL, *conflict_sess = NULL;
++ 	uint64_t wwn;
++ 	port_id_t port_id;
++ 	uint16_t loop_id;
++ 	uint16_t wd3_lo;
+++>>>>>>> b7bd104e6f1c (qla2xxx: Wait for all conflicts before ack'ing PLOGI)
+  	int res = 0;
++ 	qlt_plogi_ack_t *pla;
+  
+ -	wwn = wwn_to_u64(iocb->u.isp24.port_name);
+ -
+ -	port_id.b.domain = iocb->u.isp24.port_id[2];
+ -	port_id.b.area   = iocb->u.isp24.port_id[1];
+ -	port_id.b.al_pa  = iocb->u.isp24.port_id[0];
+ -	port_id.b.rsvd_1 = 0;
+ -
+ -	loop_id = le16_to_cpu(iocb->u.isp24.nport_handle);
+ -
+  	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf026,
+  	    "qla_target(%d): Port ID: 0x%3phC ELS opcode: 0x%02x\n",
+  	    vha->vp_idx, iocb->u.isp24.port_id, iocb->u.isp24.status_subcode);
+  
+ -	/* res = 1 means ack at the end of thread
+ -	 * res = 0 means ack async/later.
+ -	 */
+  	switch (iocb->u.isp24.status_subcode) {
+  	case ELS_PLOGI:
+++<<<<<<< HEAD
+ +	case ELS_FLOGI:
+ +	case ELS_PRLI:
+++=======
++ 
++ 		/* Mark all stale commands in qla_tgt_wq for deletion */
++ 		abort_cmds_for_s_id(vha, &port_id);
++ 
++ 		if (wwn)
++ 			sess = qlt_find_sess_invalidate_other(tgt, wwn,
++ 			    port_id, loop_id, &conflict_sess);
++ 
++ 		if (IS_SW_RESV_ADDR(port_id) || (!sess && !conflict_sess)) {
++ 			res = 1;
++ 			break;
++ 		}
++ 
++ 		pla = qlt_plogi_ack_find_add(vha, &port_id, iocb);
++ 		if (!pla) {
++ 			qlt_send_term_imm_notif(vha, iocb, 1);
++ 
++ 			res = 0;
++ 			break;
++ 		}
++ 
++ 		res = 0;
++ 
++ 		if (conflict_sess)
++ 			qlt_plogi_ack_link(vha, pla, conflict_sess,
++ 			    QLT_PLOGI_LINK_CONFLICT);
++ 
++ 		if (!sess)
++ 			break;
++ 
++ 		qlt_plogi_ack_link(vha, pla, sess, QLT_PLOGI_LINK_SAME_WWN);
++ 		 /*
++ 		  * Under normal circumstances we want to release nport handle
++ 		  * during LOGO process to avoid nport handle leaks inside FW.
++ 		  * The exception is when LOGO is done while another PLOGI with
++ 		  * the same nport handle is waiting as might be the case here.
++ 		  * Note: there is always a possibily of a race where session
++ 		  * deletion has already started for other reasons (e.g. ACL
++ 		  * removal) and now PLOGI arrives:
++ 		  * 1. if PLOGI arrived in FW after nport handle has been freed,
++ 		  *    FW must have assigned this PLOGI a new/same handle and we
++ 		  *    can proceed ACK'ing it as usual when session deletion
++ 		  *    completes.
++ 		  * 2. if PLOGI arrived in FW before LOGO with LCF_FREE_NPORT
++ 		  *    bit reached it, the handle has now been released. We'll
++ 		  *    get an error when we ACK this PLOGI. Nothing will be sent
++ 		  *    back to initiator. Initiator should eventually retry
++ 		  *    PLOGI and situation will correct itself.
++ 		  */
++ 		sess->keep_nport_handle = ((sess->loop_id == loop_id) &&
++ 					   (sess->s_id.b24 == port_id.b24));
++ 		qlt_schedule_sess_for_deletion(sess, true);
++ 		break;
++ 
++ 	case ELS_PRLI:
++ 		wd3_lo = le16_to_cpu(iocb->u.isp24.u.prli.wd3_lo);
++ 
++ 		if (wwn)
++ 			sess = qlt_find_sess_invalidate_other(tgt, wwn, port_id,
++ 			    loop_id, &conflict_sess);
++ 
++ 		if (conflict_sess) {
++ 			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf09b,
++ 			    "PRLI with conflicting sess %p port %8phC\n",
++ 			    conflict_sess, conflict_sess->port_name);
++ 			qlt_send_term_imm_notif(vha, iocb, 1);
++ 			res = 0;
++ 			break;
++ 		}
++ 
++ 		if (sess != NULL) {
++ 			if (sess->deleted) {
++ 				/*
++ 				 * Impatient initiator sent PRLI before last
++ 				 * PLOGI could finish. Will force him to re-try,
++ 				 * while last one finishes.
++ 				 */
++ 				ql_log(ql_log_warn, sess->vha, 0xf095,
++ 				    "sess %p PRLI received, before plogi ack.\n",
++ 				    sess);
++ 				qlt_send_term_imm_notif(vha, iocb, 1);
++ 				res = 0;
++ 				break;
++ 			}
++ 
++ 			/*
++ 			 * This shouldn't happen under normal circumstances,
++ 			 * since we have deleted the old session during PLOGI
++ 			 */
++ 			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf096,
++ 			    "PRLI (loop_id %#04x) for existing sess %p (loop_id %#04x)\n",
++ 			    sess->loop_id, sess, iocb->u.isp24.nport_handle);
++ 
++ 			sess->local = 0;
++ 			sess->loop_id = loop_id;
++ 			sess->s_id = port_id;
++ 
++ 			if (wd3_lo & BIT_7)
++ 				sess->conf_compl_supported = 1;
++ 
++ 		}
++ 		res = 1; /* send notify ack */
++ 
++ 		/* Make session global (not used in fabric mode) */
++ 		if (ha->current_topology != ISP_CFG_F) {
++ 			set_bit(LOOP_RESYNC_NEEDED, &vha->dpc_flags);
++ 			set_bit(LOCAL_LOOP_UPDATE, &vha->dpc_flags);
++ 			qla2xxx_wake_dpc(vha);
++ 		} else {
++ 			/* todo: else - create sess here. */
++ 			res = 1; /* send notify ack */
++ 		}
++ 
++ 		break;
++ 
+++>>>>>>> b7bd104e6f1c (qla2xxx: Wait for all conflicts before ack'ing PLOGI)
+  	case ELS_LOGO:
+  	case ELS_PRLO:
+  		res = qlt_reset(vha, iocb, QLA_TGT_NEXUS_LOSS_SESS);
+@@@ -5049,10 -6714,21 +5513,22 @@@ int __init qlt_init(void
+  	if (!qla_tgt_mgmt_cmd_cachep) {
+  		ql_log(ql_log_fatal, NULL, 0xe06d,
+  		    "kmem_cache_create for qla_tgt_mgmt_cmd_cachep failed\n");
+ -		return -ENOMEM;
+ +		ret = -ENOMEM;
+ +		goto out;
+  	}
+  
++ 	qla_tgt_plogi_cachep = kmem_cache_create("qla_tgt_plogi_cachep",
++ 						 sizeof(qlt_plogi_ack_t),
++ 						 __alignof__(qlt_plogi_ack_t),
++ 						 0, NULL);
++ 
++ 	if (!qla_tgt_plogi_cachep) {
++ 		ql_log(ql_log_fatal, NULL, 0xe06d,
++ 		    "kmem_cache_create for qla_tgt_plogi_cachep failed\n");
++ 		ret = -ENOMEM;
++ 		goto out_mgmt_cmd_cachep;
++ 	}
++ 
+  	qla_tgt_mgmt_cmd_mempool = mempool_create(25, mempool_alloc_slab,
+  	    mempool_free_slab, qla_tgt_mgmt_cmd_cachep);
+  	if (!qla_tgt_mgmt_cmd_mempool) {
+@@@ -5076,10 -6752,10 +5552,12 @@@
+  
+  out_cmd_mempool:
+  	mempool_destroy(qla_tgt_mgmt_cmd_mempool);
++ out_plogi_cachep:
++ 	kmem_cache_destroy(qla_tgt_plogi_cachep);
+  out_mgmt_cmd_cachep:
+  	kmem_cache_destroy(qla_tgt_mgmt_cmd_cachep);
+ +out:
+ +	kmem_cache_destroy(qla_tgt_cmd_cachep);
+  	return ret;
+  }
+  
+@@@ -5090,6 -6766,6 +5568,7 @@@ void qlt_exit(void
+  
+  	destroy_workqueue(qla_tgt_wq);
+  	mempool_destroy(qla_tgt_mgmt_cmd_mempool);
++ 	kmem_cache_destroy(qla_tgt_plogi_cachep);
+  	kmem_cache_destroy(qla_tgt_mgmt_cmd_cachep);
+ +	kmem_cache_destroy(qla_tgt_cmd_cachep);
+  }
+diff --cc drivers/scsi/qla2xxx/qla_target.h
+index b33e411f28a0,0a7854568f97..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.h
++++ b/drivers/scsi/qla2xxx/qla_target.h
+@@@ -805,6 -881,34 +805,37 @@@ struct qla_tgt 
+  	struct list_head tgt_list_entry;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct qla_tgt_sess_op {
++ 	struct scsi_qla_host *vha;
++ 	struct atio_from_isp atio;
++ 	struct work_struct work;
++ 	struct list_head cmd_list;
++ 	bool aborted;
++ };
++ 
++ enum qla_sess_deletion {
++ 	QLA_SESS_DELETION_NONE		= 0,
++ 	QLA_SESS_DELETION_PENDING	= 1, /* hopefully we can get rid of
++ 					      * this one */
++ 	QLA_SESS_DELETION_IN_PROGRESS	= 2,
++ };
++ 
++ typedef enum {
++ 	QLT_PLOGI_LINK_SAME_WWN,
++ 	QLT_PLOGI_LINK_CONFLICT,
++ 	QLT_PLOGI_LINK_MAX
++ } qlt_plogi_link_t;
++ 
++ typedef struct {
++ 	struct list_head		list;
++ 	struct imm_ntfy_from_isp	iocb;
++ 	port_id_t			id;
++ 	int				ref_count;
++ } qlt_plogi_ack_t;
++ 
+++>>>>>>> b7bd104e6f1c (qla2xxx: Wait for all conflicts before ack'ing PLOGI)
+  /*
+   * Equivilant to IT Nexus (Initiator-Target)
+   */
+@@@ -813,8 -917,15 +844,18 @@@ struct qla_tgt_sess 
+  	port_id_t s_id;
+  
+  	unsigned int conf_compl_supported:1;
+ -	unsigned int deleted:2;
+ +	unsigned int deleted:1;
+  	unsigned int local:1;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int logout_on_delete:1;
++ 	unsigned int keep_nport_handle:1;
++ 	unsigned int send_els_logo:1;
++ 
++ 	unsigned char logout_completed;
++ 
++ 	int generation;
+++>>>>>>> b7bd104e6f1c (qla2xxx: Wait for all conflicts before ack'ing PLOGI)
+  
+  	struct se_session *se_sess;
+  	struct scsi_qla_host *vha;
+@@@ -826,6 -937,8 +867,11 @@@
+  
+  	uint8_t port_name[WWN_SIZE];
+  	struct work_struct free_work;
+++<<<<<<< HEAD
+++=======
++ 
++ 	qlt_plogi_ack_t *plogi_link[QLT_PLOGI_LINK_MAX];
+++>>>>>>> b7bd104e6f1c (qla2xxx: Wait for all conflicts before ack'ing PLOGI)
+  };
+  
+  struct qla_tgt_cmd {
+* Unmerged path drivers/scsi/qla2xxx/qla_dbg.c
+* Unmerged path drivers/scsi/qla2xxx/qla_def.h
+* Unmerged path drivers/scsi/qla2xxx/qla_os.c
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
+* Unmerged path drivers/scsi/qla2xxx/qla_target.h
