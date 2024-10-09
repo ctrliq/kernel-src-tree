@@ -1,0 +1,660 @@
+userns: When the per user per user namespace limit is reached return ENOSPC
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit df75e7748bae1c7098bfa358485389b897f71305
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/df75e774.failed
+
+The current error codes returned when a the per user per user
+namespace limit are hit (EINVAL, EUSERS, and ENFILE) are wrong.  I
+asked for advice on linux-api and it we made clear that those were
+the wrong error code, but a correct effor code was not suggested.
+
+The best general error code I have found for hitting a resource limit
+is ENOSPC.  It is not perfect but as it is unambiguous it will serve
+until someone comes up with a better error code.
+
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit df75e7748bae1c7098bfa358485389b897f71305)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namespace.c
+#	ipc/namespace.c
+#	kernel/cgroup.c
+#	kernel/pid_namespace.c
+#	kernel/user_namespace.c
+#	kernel/utsname.c
+#	net/core/net_namespace.c
+diff --cc fs/namespace.c
+index 5bfed5a73a95,cf2cc234c8b4..000000000000
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@@ -2459,16 -2749,25 +2459,23 @@@ static atomic64_t mnt_ns_seq = ATOMIC64
+  static struct mnt_namespace *alloc_mnt_ns(struct user_namespace *user_ns)
+  {
+  	struct mnt_namespace *new_ns;
+ -	struct ucounts *ucounts;
+  	int ret;
+  
+++<<<<<<< HEAD
+++=======
++ 	ucounts = inc_mnt_namespaces(user_ns);
++ 	if (!ucounts)
++ 		return ERR_PTR(-ENOSPC);
++ 
+++>>>>>>> df75e7748bae (userns: When the per user per user namespace limit is reached return ENOSPC)
+  	new_ns = kmalloc(sizeof(struct mnt_namespace), GFP_KERNEL);
+ -	if (!new_ns) {
+ -		dec_mnt_namespaces(ucounts);
+ +	if (!new_ns)
+  		return ERR_PTR(-ENOMEM);
+ -	}
+ -	ret = ns_alloc_inum(&new_ns->ns);
+ +	ret = proc_alloc_inum(&new_ns->proc_inum);
+  	if (ret) {
+  		kfree(new_ns);
+ -		dec_mnt_namespaces(ucounts);
+  		return ERR_PTR(ret);
+  	}
+ -	new_ns->ns.ops = &mntns_operations;
+  	new_ns->seq = atomic64_add_return(1, &mnt_ns_seq);
+  	atomic_set(&new_ns->count, 1);
+  	new_ns->root = NULL;
+diff --cc ipc/namespace.c
+index b54468e48e32,fab727d9fe09..000000000000
+--- a/ipc/namespace.c
++++ b/ipc/namespace.c
+@@@ -20,26 -30,31 +20,35 @@@ static struct ipc_namespace *create_ipc
+  					   struct ipc_namespace *old_ns)
+  {
+  	struct ipc_namespace *ns;
+ -	struct ucounts *ucounts;
+  	int err;
+  
+++<<<<<<< HEAD
+++=======
++ 	err = -ENOSPC;
++ 	ucounts = inc_ipc_namespaces(user_ns);
++ 	if (!ucounts)
++ 		goto fail;
++ 
++ 	err = -ENOMEM;
+++>>>>>>> df75e7748bae (userns: When the per user per user namespace limit is reached return ENOSPC)
+  	ns = kmalloc(sizeof(struct ipc_namespace), GFP_KERNEL);
+  	if (ns == NULL)
+ -		goto fail_dec;
+ +		return ERR_PTR(-ENOMEM);
+  
+ -	err = ns_alloc_inum(&ns->ns);
+ -	if (err)
+ -		goto fail_free;
+ -	ns->ns.ops = &ipcns_operations;
+ +	err = proc_alloc_inum(&ns->proc_inum);
+ +	if (err) {
+ +		kfree(ns);
+ +		return ERR_PTR(err);
+ +	}
+  
+  	atomic_set(&ns->count, 1);
+ -	ns->user_ns = get_user_ns(user_ns);
+ -	ns->ucounts = ucounts;
+ -
+  	err = mq_init_ns(ns);
+ -	if (err)
+ -		goto fail_put;
+ +	if (err) {
+ +		proc_free_inum(ns->proc_inum);
+ +		kfree(ns);
+ +		return ERR_PTR(err);
+ +	}
+ +	atomic_inc(&nr_ipc_ns);
+  
+  	sem_init_ns(ns);
+  	msg_init_ns(ns);
+diff --cc kernel/cgroup.c
+index 2f8b053194d3,f1dd4b076210..000000000000
+--- a/kernel/cgroup.c
++++ b/kernel/cgroup.c
+@@@ -5206,174 -6116,286 +5206,208 @@@ static int __init cgroup_disable(char *
+  	}
+  	return 1;
+  }
+ -__setup("cgroup_no_v1=", cgroup_no_v1);
+ +__setup("cgroup_disable=", cgroup_disable);
+  
+ -/**
+ - * css_tryget_online_from_dir - get corresponding css from a cgroup dentry
+ - * @dentry: directory dentry of interest
+ - * @ss: subsystem of interest
+ - *
+ - * If @dentry is a directory for a cgroup which has @ss enabled on it, try
+ - * to get the corresponding css and return it.  If such css doesn't exist
+ - * or can't be pinned, an ERR_PTR value is returned.
+ +/*
+ + * Functons for CSS ID.
+   */
+ -struct cgroup_subsys_state *css_tryget_online_from_dir(struct dentry *dentry,
+ -						       struct cgroup_subsys *ss)
+ -{
+ -	struct kernfs_node *kn = kernfs_node_from_dentry(dentry);
+ -	struct file_system_type *s_type = dentry->d_sb->s_type;
+ -	struct cgroup_subsys_state *css = NULL;
+ -	struct cgroup *cgrp;
+ -
+ -	/* is @dentry a cgroup dir? */
+ -	if ((s_type != &cgroup_fs_type && s_type != &cgroup2_fs_type) ||
+ -	    !kn || kernfs_type(kn) != KERNFS_DIR)
+ -		return ERR_PTR(-EBADF);
+  
+ -	rcu_read_lock();
+ +/*
+ + *To get ID other than 0, this should be called when !cgroup_is_removed().
+ + */
+ +unsigned short css_id(struct cgroup_subsys_state *css)
+ +{
+ +	struct css_id *cssid;
+  
+  	/*
+ -	 * This path doesn't originate from kernfs and @kn could already
+ -	 * have been or be removed at any point.  @kn->priv is RCU
+ -	 * protected for this access.  See css_release_work_fn() for details.
+ +	 * This css_id() can return correct value when somone has refcnt
+ +	 * on this or this is under rcu_read_lock(). Once css->id is allocated,
+ +	 * it's unchanged until freed.
+  	 */
+ -	cgrp = rcu_dereference(kn->priv);
+ -	if (cgrp)
+ -		css = cgroup_css(cgrp, ss);
+ -
+ -	if (!css || !css_tryget_online(css))
+ -		css = ERR_PTR(-ENOENT);
+ -
+ -	rcu_read_unlock();
+ -	return css;
+ -}
+ +	cssid = rcu_dereference_check(css->id, css_refcnt(css));
+  
+ -/**
+ - * css_from_id - lookup css by id
+ - * @id: the cgroup id
+ - * @ss: cgroup subsys to be looked into
+ - *
+ - * Returns the css if there's valid one with @id, otherwise returns NULL.
+ - * Should be called under rcu_read_lock().
+ - */
+ -struct cgroup_subsys_state *css_from_id(int id, struct cgroup_subsys *ss)
+ -{
+ -	WARN_ON_ONCE(!rcu_read_lock_held());
+ -	return idr_find(&ss->css_idr, id);
+ +	if (cssid)
+ +		return cssid->id;
+ +	return 0;
+  }
+ +EXPORT_SYMBOL_GPL(css_id);
+  
+ -/**
+ - * cgroup_get_from_path - lookup and get a cgroup from its default hierarchy path
+ - * @path: path on the default hierarchy
+ - *
+ - * Find the cgroup at @path on the default hierarchy, increment its
+ - * reference count and return it.  Returns pointer to the found cgroup on
+ - * success, ERR_PTR(-ENOENT) if @path doens't exist and ERR_PTR(-ENOTDIR)
+ - * if @path points to a non-directory.
+ - */
+ -struct cgroup *cgroup_get_from_path(const char *path)
+ +unsigned short css_depth(struct cgroup_subsys_state *css)
+  {
+ -	struct kernfs_node *kn;
+ -	struct cgroup *cgrp;
+ -
+ -	mutex_lock(&cgroup_mutex);
+ +	struct css_id *cssid;
+  
+ -	kn = kernfs_walk_and_get(cgrp_dfl_root.cgrp.kn, path);
+ -	if (kn) {
+ -		if (kernfs_type(kn) == KERNFS_DIR) {
+ -			cgrp = kn->priv;
+ -			cgroup_get(cgrp);
+ -		} else {
+ -			cgrp = ERR_PTR(-ENOTDIR);
+ -		}
+ -		kernfs_put(kn);
+ -	} else {
+ -		cgrp = ERR_PTR(-ENOENT);
+ -	}
+ +	cssid = rcu_dereference_check(css->id, css_refcnt(css));
+  
+ -	mutex_unlock(&cgroup_mutex);
+ -	return cgrp;
+ +	if (cssid)
+ +		return cssid->depth;
+ +	return 0;
+  }
+ -EXPORT_SYMBOL_GPL(cgroup_get_from_path);
+ +EXPORT_SYMBOL_GPL(css_depth);
+  
+  /**
+ - * cgroup_get_from_fd - get a cgroup pointer from a fd
+ - * @fd: fd obtained by open(cgroup2_dir)
+ - *
+ - * Find the cgroup from a fd which should be obtained
+ - * by opening a cgroup directory.  Returns a pointer to the
+ - * cgroup on success. ERR_PTR is returned if the cgroup
+ - * cannot be found.
+ - */
+ -struct cgroup *cgroup_get_from_fd(int fd)
+ -{
+ -	struct cgroup_subsys_state *css;
+ -	struct cgroup *cgrp;
+ -	struct file *f;
+ -
+ -	f = fget_raw(fd);
+ -	if (!f)
+ -		return ERR_PTR(-EBADF);
+ -
+ -	css = css_tryget_online_from_dir(f->f_path.dentry, NULL);
+ -	fput(f);
+ -	if (IS_ERR(css))
+ -		return ERR_CAST(css);
+ -
+ -	cgrp = css->cgroup;
+ -	if (!cgroup_on_dfl(cgrp)) {
+ -		cgroup_put(cgrp);
+ -		return ERR_PTR(-EBADF);
+ -	}
+ -
+ -	return cgrp;
+ -}
+ -EXPORT_SYMBOL_GPL(cgroup_get_from_fd);
+ -
+ -/*
+ - * sock->sk_cgrp_data handling.  For more info, see sock_cgroup_data
+ - * definition in cgroup-defs.h.
+ + *  css_is_ancestor - test "root" css is an ancestor of "child"
+ + * @child: the css to be tested.
+ + * @root: the css supporsed to be an ancestor of the child.
+ + *
+ + * Returns true if "root" is an ancestor of "child" in its hierarchy. Because
+ + * this function reads css->id, the caller must hold rcu_read_lock().
+ + * But, considering usual usage, the csses should be valid objects after test.
+ + * Assuming that the caller will do some action to the child if this returns
+ + * returns true, the caller must take "child";s reference count.
+ + * If "child" is valid object and this returns true, "root" is valid, too.
+   */
+ -#ifdef CONFIG_SOCK_CGROUP_DATA
+ -
+ -#if defined(CONFIG_CGROUP_NET_PRIO) || defined(CONFIG_CGROUP_NET_CLASSID)
+ -
+ -DEFINE_SPINLOCK(cgroup_sk_update_lock);
+ -static bool cgroup_sk_alloc_disabled __read_mostly;
+  
+ -void cgroup_sk_alloc_disable(void)
+ +bool css_is_ancestor(struct cgroup_subsys_state *child,
+ +		    const struct cgroup_subsys_state *root)
+  {
+ -	if (cgroup_sk_alloc_disabled)
+ -		return;
+ -	pr_info("cgroup: disabling cgroup2 socket matching due to net_prio or net_cls activation\n");
+ -	cgroup_sk_alloc_disabled = true;
+ -}
+ -
+ -#else
+ +	struct css_id *child_id;
+ +	struct css_id *root_id;
+  
+ -#define cgroup_sk_alloc_disabled	false
+ -
+ -#endif
+ +	child_id  = rcu_dereference(child->id);
+ +	if (!child_id)
+ +		return false;
+ +	root_id = rcu_dereference(root->id);
+ +	if (!root_id)
+ +		return false;
+ +	if (child_id->depth < root_id->depth)
+ +		return false;
+ +	if (child_id->stack[root_id->depth] != root_id->id)
+ +		return false;
+ +	return true;
+ +}
+  
+ -void cgroup_sk_alloc(struct sock_cgroup_data *skcd)
+ +void free_css_id(struct cgroup_subsys *ss, struct cgroup_subsys_state *css)
+  {
+ -	if (cgroup_sk_alloc_disabled)
+ +	struct css_id *id = css->id;
+ +	/* When this is called before css_id initialization, id can be NULL */
+ +	if (!id)
+  		return;
+  
+ -	rcu_read_lock();
+ -
+ -	while (true) {
+ -		struct css_set *cset;
+ -
+ -		cset = task_css_set(current);
+ -		if (likely(cgroup_tryget(cset->dfl_cgrp))) {
+ -			skcd->val = (unsigned long)cset->dfl_cgrp;
+ -			break;
+ -		}
+ -		cpu_relax();
+ -	}
+ +	BUG_ON(!ss->use_id);
+  
+ -	rcu_read_unlock();
+ +	rcu_assign_pointer(id->css, NULL);
+ +	rcu_assign_pointer(css->id, NULL);
+ +	spin_lock(&ss->id_lock);
+ +	idr_remove(&ss->idr, id->id);
+ +	spin_unlock(&ss->id_lock);
+ +	kfree_rcu(id, rcu_head);
+  }
+ +EXPORT_SYMBOL_GPL(free_css_id);
+ +
+ +/*
+ + * This is called by init or create(). Then, calls to this function are
+ + * always serialized (By cgroup_mutex() at create()).
+ + */
+  
+ -void cgroup_sk_free(struct sock_cgroup_data *skcd)
+ +static struct css_id *get_new_cssid(struct cgroup_subsys *ss, int depth)
+  {
+ -	cgroup_put(sock_cgroup_ptr(skcd));
+ -}
+ +	struct css_id *newid;
+ +	int ret, size;
+  
+ -#endif	/* CONFIG_SOCK_CGROUP_DATA */
+ +	BUG_ON(!ss->use_id);
+  
+ -/* cgroup namespaces */
+ +	size = sizeof(*newid) + sizeof(unsigned short) * (depth + 1);
+ +	newid = kzalloc(size, GFP_KERNEL);
+ +	if (!newid)
+ +		return ERR_PTR(-ENOMEM);
+  
+ -static struct ucounts *inc_cgroup_namespaces(struct user_namespace *ns)
+ -{
+ -	return inc_ucount(ns, current_euid(), UCOUNT_CGROUP_NAMESPACES);
+ -}
+ +	idr_preload(GFP_KERNEL);
+ +	spin_lock(&ss->id_lock);
+ +	/* Don't use 0. allocates an ID of 1-65535 */
+ +	ret = idr_alloc(&ss->idr, newid, 1, CSS_ID_MAX + 1, GFP_NOWAIT);
+ +	spin_unlock(&ss->id_lock);
+ +	idr_preload_end();
+  
+ -static void dec_cgroup_namespaces(struct ucounts *ucounts)
+ -{
+ -	dec_ucount(ucounts, UCOUNT_CGROUP_NAMESPACES);
+ -}
+ +	/* Returns error when there are no free spaces for new ID.*/
+ +	if (ret < 0)
+ +		goto err_out;
+  
+ -static struct cgroup_namespace *alloc_cgroup_ns(void)
+ -{
+ -	struct cgroup_namespace *new_ns;
+ -	int ret;
+ +	newid->id = ret;
+ +	newid->depth = depth;
+ +	return newid;
+ +err_out:
+ +	kfree(newid);
+ +	return ERR_PTR(ret);
+  
+ -	new_ns = kzalloc(sizeof(struct cgroup_namespace), GFP_KERNEL);
+ -	if (!new_ns)
+ -		return ERR_PTR(-ENOMEM);
+ -	ret = ns_alloc_inum(&new_ns->ns);
+ -	if (ret) {
+ -		kfree(new_ns);
+ -		return ERR_PTR(ret);
+ -	}
+ -	atomic_set(&new_ns->count, 1);
+ -	new_ns->ns.ops = &cgroupns_operations;
+ -	return new_ns;
+  }
+  
+ -void free_cgroup_ns(struct cgroup_namespace *ns)
+ +static int __init_or_module cgroup_init_idr(struct cgroup_subsys *ss,
+ +					    struct cgroup_subsys_state *rootcss)
+  {
+ -	put_css_set(ns->root_cset);
+ -	dec_cgroup_namespaces(ns->ucounts);
+ -	put_user_ns(ns->user_ns);
+ -	ns_free_inum(&ns->ns);
+ -	kfree(ns);
+ -}
+ -EXPORT_SYMBOL(free_cgroup_ns);
+ +	struct css_id *newid;
+  
+ -struct cgroup_namespace *copy_cgroup_ns(unsigned long flags,
+ -					struct user_namespace *user_ns,
+ -					struct cgroup_namespace *old_ns)
+ -{
+ -	struct cgroup_namespace *new_ns;
+ -	struct ucounts *ucounts;
+ -	struct css_set *cset;
+ +	spin_lock_init(&ss->id_lock);
+ +	idr_init(&ss->idr);
+  
+ -	BUG_ON(!old_ns);
+ +	newid = get_new_cssid(ss, 0);
+ +	if (IS_ERR(newid))
+ +		return PTR_ERR(newid);
+  
+++<<<<<<< HEAD
+ +	newid->stack[0] = newid->id;
+ +	newid->css = rootcss;
+ +	rootcss->id = newid;
+ +	return 0;
+++=======
++ 	if (!(flags & CLONE_NEWCGROUP)) {
++ 		get_cgroup_ns(old_ns);
++ 		return old_ns;
++ 	}
++ 
++ 	/* Allow only sysadmin to create cgroup namespace. */
++ 	if (!ns_capable(user_ns, CAP_SYS_ADMIN))
++ 		return ERR_PTR(-EPERM);
++ 
++ 	ucounts = inc_cgroup_namespaces(user_ns);
++ 	if (!ucounts)
++ 		return ERR_PTR(-ENOSPC);
++ 
++ 	/* It is not safe to take cgroup_mutex here */
++ 	spin_lock_irq(&css_set_lock);
++ 	cset = task_css_set(current);
++ 	get_css_set(cset);
++ 	spin_unlock_irq(&css_set_lock);
++ 
++ 	new_ns = alloc_cgroup_ns();
++ 	if (IS_ERR(new_ns)) {
++ 		put_css_set(cset);
++ 		dec_cgroup_namespaces(ucounts);
++ 		return new_ns;
++ 	}
++ 
++ 	new_ns->user_ns = get_user_ns(user_ns);
++ 	new_ns->ucounts = ucounts;
++ 	new_ns->root_cset = cset;
++ 
++ 	return new_ns;
+++>>>>>>> df75e7748bae (userns: When the per user per user namespace limit is reached return ENOSPC)
+  }
+  
+ -static inline struct cgroup_namespace *to_cg_ns(struct ns_common *ns)
+ -{
+ -	return container_of(ns, struct cgroup_namespace, ns);
+ -}
+ -
+ -static int cgroupns_install(struct nsproxy *nsproxy, struct ns_common *ns)
+ +static int alloc_css_id(struct cgroup_subsys *ss, struct cgroup *parent,
+ +			struct cgroup *child)
+  {
+ -	struct cgroup_namespace *cgroup_ns = to_cg_ns(ns);
+ +	int subsys_id, i, depth = 0;
+ +	struct cgroup_subsys_state *parent_css, *child_css;
+ +	struct css_id *child_id, *parent_id;
+  
+ -	if (!ns_capable(current_user_ns(), CAP_SYS_ADMIN) ||
+ -	    !ns_capable(cgroup_ns->user_ns, CAP_SYS_ADMIN))
+ -		return -EPERM;
+ +	subsys_id = ss->subsys_id;
+ +	parent_css = parent->subsys[subsys_id];
+ +	child_css = child->subsys[subsys_id];
+ +	parent_id = parent_css->id;
+ +	depth = parent_id->depth + 1;
+  
+ -	/* Don't need to do anything if we are attaching to our own cgroupns. */
+ -	if (cgroup_ns == nsproxy->cgroup_ns)
+ -		return 0;
+ +	child_id = get_new_cssid(ss, depth);
+ +	if (IS_ERR(child_id))
+ +		return PTR_ERR(child_id);
+  
+ -	get_cgroup_ns(cgroup_ns);
+ -	put_cgroup_ns(nsproxy->cgroup_ns);
+ -	nsproxy->cgroup_ns = cgroup_ns;
+ +	for (i = 0; i < depth; i++)
+ +		child_id->stack[i] = parent_id->stack[i];
+ +	child_id->stack[depth] = child_id->id;
+ +	/*
+ +	 * child_id->css pointer will be set after this cgroup is available
+ +	 * see cgroup_populate_dir()
+ +	 */
+ +	rcu_assign_pointer(child_css->id, child_id);
+  
+  	return 0;
+  }
+diff --cc kernel/pid_namespace.c
+index 710b724f760b,7542b28cc929..000000000000
+--- a/kernel/pid_namespace.c
++++ b/kernel/pid_namespace.c
+@@@ -87,10 -97,13 +87,18 @@@ static struct pid_namespace *create_pid
+  	int i;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	if (level > MAX_PID_NS_LEVEL) {
+ +		err = -EINVAL;
+++=======
++ 	err = -ENOSPC;
++ 	if (level > MAX_PID_NS_LEVEL)
++ 		goto out;
++ 	ucounts = inc_pid_namespaces(user_ns);
++ 	if (!ucounts)
+++>>>>>>> df75e7748bae (userns: When the per user per user namespace limit is reached return ENOSPC)
+  		goto out;
+ +	}
+  
+  	err = -ENOMEM;
+  	ns = kmem_cache_zalloc(pid_ns_cachep, GFP_KERNEL);
+diff --cc kernel/user_namespace.c
+index 57f036cb8f03,f2c5ba5505f1..000000000000
+--- a/kernel/user_namespace.c
++++ b/kernel/user_namespace.c
+@@@ -68,17 -73,16 +68,21 @@@ int create_user_ns(struct cred *new
+  	struct user_namespace *ns, *parent_ns = new->user_ns;
+  	kuid_t owner = new->euid;
+  	kgid_t group = new->egid;
+ -	struct ucounts *ucounts;
+ -	int ret, i;
+ +	int ret;
+ +	static int __read_mostly called_mark_tech_preview = 0;
+  
+ +	if (!enable_user_ns_creation)
+ +		return -EINVAL;
+ +
+ +	if (!called_mark_tech_preview && !xchg(&called_mark_tech_preview, 1))
+ +		mark_tech_preview("user namespace", NULL);
+ +
+++<<<<<<< HEAD
+++=======
++ 	ret = -ENOSPC;
+++>>>>>>> df75e7748bae (userns: When the per user per user namespace limit is reached return ENOSPC)
+  	if (parent_ns->level > 32)
+ -		goto fail;
+ -
+ -	ucounts = inc_user_namespaces(parent_ns, owner);
+ -	if (!ucounts)
+ -		goto fail;
+ +		return -EUSERS;
+  
+  	/*
+  	 * Verify that we can not violate the policy of which files
+diff --cc kernel/utsname.c
+index 883aaaa7de8a,35587b76faa3..000000000000
+--- a/kernel/utsname.c
++++ b/kernel/utsname.c
+@@@ -36,17 -46,25 +36,26 @@@ static struct uts_namespace *clone_uts_
+  					  struct uts_namespace *old_ns)
+  {
+  	struct uts_namespace *ns;
+ -	struct ucounts *ucounts;
+  	int err;
+  
+++<<<<<<< HEAD
+++=======
++ 	err = -ENOSPC;
++ 	ucounts = inc_uts_namespaces(user_ns);
++ 	if (!ucounts)
++ 		goto fail;
++ 
++ 	err = -ENOMEM;
+++>>>>>>> df75e7748bae (userns: When the per user per user namespace limit is reached return ENOSPC)
+  	ns = create_uts_ns();
+  	if (!ns)
+ -		goto fail_dec;
+ -
+ -	err = ns_alloc_inum(&ns->ns);
+ -	if (err)
+ -		goto fail_free;
+ +		return ERR_PTR(-ENOMEM);
+  
+ -	ns->ucounts = ucounts;
+ -	ns->ns.ops = &utsns_operations;
+ +	err = proc_alloc_inum(&ns->proc_inum);
+ +	if (err) {
+ +		kfree(ns);
+ +		return ERR_PTR(err);
+ +	}
+  
+  	down_read(&uts_sem);
+  	memcpy(&ns->name, &old_ns->name, sizeof(ns->name));
+diff --cc net/core/net_namespace.c
+index cdb169b3f290,06af5d6a883c..000000000000
+--- a/net/core/net_namespace.c
++++ b/net/core/net_namespace.c
+@@@ -359,9 -368,15 +359,16 @@@ struct net *copy_net_ns(unsigned long f
+  	if (!(flags & CLONE_NEWNET))
+  		return get_net(old_net);
+  
+++<<<<<<< HEAD
+++=======
++ 	ucounts = inc_net_namespaces(user_ns);
++ 	if (!ucounts)
++ 		return ERR_PTR(-ENOSPC);
++ 
+++>>>>>>> df75e7748bae (userns: When the per user per user namespace limit is reached return ENOSPC)
+  	net = net_alloc();
+ -	if (!net) {
+ -		dec_net_namespaces(ucounts);
+ +	if (!net)
+  		return ERR_PTR(-ENOMEM);
+ -	}
+  
+  	get_user_ns(user_ns);
+  
+* Unmerged path fs/namespace.c
+* Unmerged path ipc/namespace.c
+* Unmerged path kernel/cgroup.c
+* Unmerged path kernel/pid_namespace.c
+* Unmerged path kernel/user_namespace.c
+* Unmerged path kernel/utsname.c
+* Unmerged path net/core/net_namespace.c
