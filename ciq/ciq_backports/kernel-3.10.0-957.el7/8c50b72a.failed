@@ -1,0 +1,152 @@
+powerpc/ftrace: Add Kconfig & Make glue for mprofile-kernel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [powerpc] ftrace: Add Kconfig & Make glue for mprofile-kernel (Josh Poimboeuf) [1578960]
+Rebuild_FUZZ: 92.73%
+commit-author Torsten Duwe <duwe@lst.de>
+commit 8c50b72a3b4f1f7cdfdfebd233b1cbd121262e65
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/8c50b72a.failed
+
+Firstly we add logic to Kconfig to allow a user to choose if they want
+mprofile-kernel. This has to be user-selectable because only some
+current toolchains support it. If we enabled it unconditionally we would
+prevent some users from building the kernel entirely.
+
+Arguably it would be nice if we could detect if mprofile-kernel was
+available, and use it then. However that would violate the principle of
+least surprise because a user having choosen options such as live
+patching, would then see them quietly disabled at build time.
+
+We also make the user selectable option negative, ie. it disables when
+selected, so that allyesconfig continues to build on old toolchains.
+
+Once we've decided we do want to use mprofile-kernel, we then add a
+script which checks it actually works. That is because there are
+versions of gcc that accept the flag but don't generate correct code.
+
+Due to the way kconfig works, we can't error out when we detect a
+non-working toolchain. If we did a user would never be able to modify
+their config and run oldconfig - because the check would block oldconfig
+from running. Instead we emit a warning and add a bogus flag to CFLAGS
+so that the build will fail.
+
+	Signed-off-by: Torsten Duwe <duwe@suse.de>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 8c50b72a3b4f1f7cdfdfebd233b1cbd121262e65)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/Kconfig
+diff --cc arch/powerpc/Kconfig
+index 32232f9bee79,91da283cd658..000000000000
+--- a/arch/powerpc/Kconfig
++++ b/arch/powerpc/Kconfig
+@@@ -131,10 -91,10 +131,11 @@@ config PP
+  	select ARCH_HAS_ELF_RANDOMIZE
+  	select OF
+  	select OF_EARLY_FLATTREE
+ -	select OF_RESERVED_MEM
+  	select HAVE_FTRACE_MCOUNT_RECORD
+ +	select HAVE_ARCH_MMAP_RND_BITS
+ +	select HAVE_ARCH_MMAP_RND_COMPAT_BITS	if COMPAT
+  	select HAVE_DYNAMIC_FTRACE
++ 	select HAVE_DYNAMIC_FTRACE_WITH_REGS if MPROFILE_KERNEL
+  	select HAVE_FUNCTION_TRACER
+  	select HAVE_FUNCTION_GRAPH_TRACER
+  	select SYSCTL_EXCEPTION_TRACE
+@@@ -382,16 -374,23 +383,36 @@@ config PPC_TRANSACTIONAL_ME
+         ---help---
+           Support user-mode Transactional Memory on POWERPC.
+  
+++<<<<<<< HEAD
+ +config 8XX_MINIMAL_FPEMU
+ +	bool "Minimal math emulation for 8xx"
+ +	depends on 8xx && !MATH_EMULATION
+ +	help
+ +	  Older arch/ppc kernels still emulated a few floating point
+ +	  instructions such as load and store, even when full math
+ +	  emulation is disabled.  Say "Y" here if you want to preserve
+ +	  this behavior.
+ +
+ +	  It is recommended that you build a soft-float userspace instead.
+++=======
++ config DISABLE_MPROFILE_KERNEL
++ 	bool "Disable use of mprofile-kernel for kernel tracing"
++ 	depends on PPC64 && CPU_LITTLE_ENDIAN
++ 	default y
++ 	help
++ 	  Selecting this options disables use of the mprofile-kernel ABI for
++ 	  kernel tracing. That will cause options such as live patching
++ 	  (CONFIG_LIVEPATCH) which depend on CONFIG_DYNAMIC_FTRACE_WITH_REGS to
++ 	  be disabled also.
++ 
++ 	  If you have a toolchain which supports mprofile-kernel, then you can
++ 	  enable this. Otherwise leave it disabled. If you're not sure, say
++ 	  "N".
++ 
++ config MPROFILE_KERNEL
++ 	depends on PPC64 && CPU_LITTLE_ENDIAN
++ 	def_bool !DISABLE_MPROFILE_KERNEL
+++>>>>>>> 8c50b72a3b4f (powerpc/ftrace: Add Kconfig & Make glue for mprofile-kernel)
+  
+  config IOMMU_HELPER
+  	def_bool PPC64
+* Unmerged path arch/powerpc/Kconfig
+diff --git a/arch/powerpc/Makefile b/arch/powerpc/Makefile
+index cb2511182973..0ef98fdfc1fe 100644
+--- a/arch/powerpc/Makefile
++++ b/arch/powerpc/Makefile
+@@ -130,6 +130,21 @@ else
+ CFLAGS-$(CONFIG_GENERIC_CPU) += -mcpu=powerpc64
+ endif
+ 
++ifdef CONFIG_MPROFILE_KERNEL
++    ifeq ($(shell $(srctree)/arch/powerpc/scripts/gcc-check-mprofile-kernel.sh $(CC) -I$(srctree)/include -D__KERNEL__),OK)
++        CC_FLAGS_FTRACE := -pg -mprofile-kernel
++        KBUILD_CPPFLAGS += -DCC_USING_MPROFILE_KERNEL
++    else
++        # If the user asked for mprofile-kernel but the toolchain doesn't
++        # support it, emit a warning and deliberately break the build later
++        # with mprofile-kernel-not-supported. We would prefer to make this an
++        # error right here, but then the user would never be able to run
++        # oldconfig to change their configuration.
++        $(warning Compiler does not support mprofile-kernel, set CONFIG_DISABLE_MPROFILE_KERNEL)
++        CC_FLAGS_FTRACE := -mprofile-kernel-not-supported
++    endif
++endif
++
+ CFLAGS-$(CONFIG_CELL_CPU) += $(call cc-option,-mcpu=cell)
+ CFLAGS-$(CONFIG_POWER4_CPU) += $(call cc-option,-mcpu=power4)
+ CFLAGS-$(CONFIG_POWER5_CPU) += $(call cc-option,-mcpu=power5)
+diff --git a/arch/powerpc/scripts/gcc-check-mprofile-kernel.sh b/arch/powerpc/scripts/gcc-check-mprofile-kernel.sh
+new file mode 100755
+index 000000000000..c658d8cf760b
+--- /dev/null
++++ b/arch/powerpc/scripts/gcc-check-mprofile-kernel.sh
+@@ -0,0 +1,23 @@
++#!/bin/bash
++
++set -e
++set -o pipefail
++
++# To debug, uncomment the following line
++# set -x
++
++# Test whether the compile option -mprofile-kernel exists and generates
++# profiling code (ie. a call to _mcount()).
++echo "int func() { return 0; }" | \
++    $* -S -x c -O2 -p -mprofile-kernel - -o - 2> /dev/null | \
++    grep -q "_mcount"
++
++# Test whether the notrace attribute correctly suppresses calls to _mcount().
++
++echo -e "#include <linux/compiler.h>\nnotrace int func() { return 0; }" | \
++    $* -S -x c -O2 -p -mprofile-kernel - -o - 2> /dev/null | \
++    grep -q "_mcount" && \
++    exit 1
++
++echo "OK"
++exit 0
