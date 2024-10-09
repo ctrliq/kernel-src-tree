@@ -1,0 +1,128 @@
+mm/memory_hotplug.c: only respect mem= parameter during boot stage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Baoquan He <bhe@redhat.com>
+commit f3cd4c865b8ad61ff6dc61feba759a98ca06f039
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/f3cd4c86.failed
+
+In commit 357b4da50a62 ("x86: respect memory size limiting via mem=
+parameter") a global varialbe max_mem_size is added to store the value
+parsed from 'mem= ', then checked when memory region is added.  This truly
+stops those DIMMs from being added into system memory during boot-time.
+
+However, it also limits the later memory hotplug functionality.  Any DIMM
+can't be hotplugged any more if its region is beyond the max_mem_size.  We
+will get errors like:
+
+[  216.387164] acpi PNP0C80:02: add_memory failed
+[  216.389301] acpi PNP0C80:02: acpi_memory_enable_device() error
+[  216.392187] acpi PNP0C80:02: Enumeration failure
+
+This will cause issue in a known use case where 'mem=' is added to the
+hypervisor.  The memory that lies after 'mem=' boundary will be assigned
+to KVM guests.  After commit 357b4da50a62 merged, memory can't be extended
+dynamically if system memory on hypervisor is not sufficient.
+
+So fix it by also checking if it's during boot-time restricting to add
+memory.  Otherwise, skip the restriction.
+
+And also add this use case to document of 'mem=' kernel parameter.
+
+Fixes: 357b4da50a62 ("x86: respect memory size limiting via mem= parameter")
+	Signed-off-by: Baoquan He <bhe@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Juergen Gross <jgross@suse.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: William Kucharski <william.kucharski@oracle.com>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: Balbir Singh <bsingharora@gmail.com>
+Link: http://lkml.kernel.org/r/20200204050643.20925-1-bhe@redhat.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit f3cd4c865b8ad61ff6dc61feba759a98ca06f039)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memory_hotplug.c
+diff --cc mm/memory_hotplug.c
+index 0352de66ba23,d6f813cc12c1..000000000000
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@@ -138,17 -102,30 +138,41 @@@ void mem_hotplug_done(void
+  static struct resource *register_memory_resource(u64 start, u64 size)
+  {
+  	struct resource *res;
+ -	unsigned long flags =  IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY;
+ -	char *resource_name = "System RAM";
+ -
+ +	res = kzalloc(sizeof(struct resource), GFP_KERNEL);
+ +	BUG_ON(!res);
+ +
+++<<<<<<< HEAD
+ +	res->name = "System RAM";
+ +	res->start = start;
+ +	res->end = start + size - 1;
+ +	res->flags = IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY;
+ +	if (request_resource(&iomem_resource, res) < 0) {
+ +		pr_debug("System RAM resource %pR cannot be added\n", res);
+ +		kfree(res);
+ +		res = NULL;
+++=======
++ 	/*
++ 	 * Make sure value parsed from 'mem=' only restricts memory adding
++ 	 * while booting, so that memory hotplug won't be impacted. Please
++ 	 * refer to document of 'mem=' in kernel-parameters.txt for more
++ 	 * details.
++ 	 */
++ 	if (start + size > max_mem_size && system_state < SYSTEM_RUNNING)
++ 		return ERR_PTR(-E2BIG);
++ 
++ 	/*
++ 	 * Request ownership of the new memory range.  This might be
++ 	 * a child of an existing resource that was present but
++ 	 * not marked as busy.
++ 	 */
++ 	res = __request_region(&iomem_resource, start, size,
++ 			       resource_name, flags);
++ 
++ 	if (!res) {
++ 		pr_debug("Unable to reserve System RAM region: %016llx->%016llx\n",
++ 				start, start + size);
++ 		return ERR_PTR(-EEXIST);
+++>>>>>>> f3cd4c865b8a (mm/memory_hotplug.c: only respect mem= parameter during boot stage)
+  	}
+  	return res;
+  }
+diff --git a/Documentation/kernel-parameters.txt b/Documentation/kernel-parameters.txt
+index 25318ee68938..c24eb8bf8cd9 100644
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -1911,13 +1911,22 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
+ 			For details see: Documentation/admin-guide/hw-vuln/mds.rst
+ 
+ 	mem=nn[KMG]	[KNL,BOOT] Force usage of a specific amount of memory
+-			Amount of memory to be used when the kernel is not able
+-			to see the whole system memory or for test.
++			Amount of memory to be used in cases as follows:
++
++			1 for test;
++			2 when the kernel is not able to see the whole system memory;
++			3 memory that lies after 'mem=' boundary is excluded from
++			 the hypervisor, then assigned to KVM guests.
++
+ 			[X86] Work as limiting max address. Use together
+ 			with memmap= to avoid physical address space collisions.
+ 			Without memmap= PCI devices could be placed at addresses
+ 			belonging to unused RAM.
+ 
++			Note that this only takes effects during boot time since
++			in above case 3, memory may need be hot added after boot
++			if system memory of hypervisor is not sufficient.
++
+ 	mem=nopentium	[BUGS=X86-32] Disable usage of 4MB pages for kernel
+ 			memory.
+ 
+* Unmerged path mm/memory_hotplug.c
