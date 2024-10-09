@@ -1,0 +1,131 @@
+md: don't return -EAGAIN in md_allow_write for external metadata arrays
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [md] don't return -EAGAIN in md_allow_write for external metadata arrays (Nigel Croxon) [1455932]
+Rebuild_FUZZ: 97.10%
+commit-author Artur Paszkiewicz <artur.paszkiewicz@intel.com>
+commit 2214c260c72b0bd94e6c1c19bf451686212025d3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2214c260.failed
+
+This essentially reverts commit b5470dc5fc18 ("md: resolve external
+metadata handling deadlock in md_allow_write") with some adjustments.
+
+Since commit 6791875e2e53 ("md: make reconfig_mutex optional for writes
+to md sysfs files.") changing array_state to 'active' does not use
+mddev_lock() and will not cause a deadlock with md_allow_write(). This
+revert simplifies userspace tools that write to sysfs attributes like
+"stripe_cache_size" or "consistency_policy" because it removes the need
+for special handling for external metadata arrays, checking for EAGAIN
+and retrying the write.
+
+	Signed-off-by: Artur Paszkiewicz <artur.paszkiewicz@intel.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit 2214c260c72b0bd94e6c1c19bf451686212025d3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid1.c
+#	drivers/md/raid5.c
+diff --cc drivers/md/raid1.c
+index 0e63e69d3bfb,7c1f73398800..000000000000
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@@ -3226,9 -3209,8 +3226,14 @@@ static int raid1_reshape(struct mddev *
+  		return -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+ +	err = md_allow_write(mddev);
+ +	if (err)
+ +		return err;
+++=======
++ 	if (!mddev_is_clustered(mddev))
++ 		md_allow_write(mddev);
+++>>>>>>> 2214c260c72b (md: don't return -EAGAIN in md_allow_write for external metadata arrays)
+  
+  	raid_disks = mddev->raid_disks + mddev->delta_disks;
+  
+diff --cc drivers/md/raid5.c
+index f4fb9b347bff,f8055a7abb4b..000000000000
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@@ -2199,12 -2314,7 +2199,16 @@@ static int resize_stripes(struct r5con
+  	int i;
+  	int hash, cnt;
+  
+++<<<<<<< HEAD
+ +	if (newsize <= conf->pool_size)
+ +		return 0; /* never bother to shrink */
+ +
+ +	err = md_allow_write(conf->mddev);
+ +	if (err)
+ +		return err;
+++=======
++ 	md_allow_write(conf->mddev);
+++>>>>>>> 2214c260c72b (md: don't return -EAGAIN in md_allow_write for external metadata arrays)
+  
+  	/* Step 1 */
+  	sc = kmem_cache_create(conf->cache_name[1-conf->active_name],
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 85fe7a992903..b869978f5966 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -7732,18 +7732,15 @@ EXPORT_SYMBOL(md_write_end);
+  * may proceed without blocking.  It is important to call this before
+  * attempting a GFP_KERNEL allocation while holding the mddev lock.
+  * Must be called with mddev_lock held.
+- *
+- * In the ->external case MD_SB_CHANGE_PENDING can not be cleared until mddev->lock
+- * is dropped, so return -EAGAIN after notifying userspace.
+  */
+-int md_allow_write(struct mddev *mddev)
++void md_allow_write(struct mddev *mddev)
+ {
+ 	if (!mddev->pers)
+-		return 0;
++		return;
+ 	if (mddev->ro)
+-		return 0;
++		return;
+ 	if (!mddev->pers->sync_request)
+-		return 0;
++		return;
+ 
+ 	spin_lock(&mddev->lock);
+ 	if (mddev->in_sync) {
+@@ -7756,13 +7753,12 @@ int md_allow_write(struct mddev *mddev)
+ 		spin_unlock(&mddev->lock);
+ 		md_update_sb(mddev, 0);
+ 		sysfs_notify_dirent_safe(mddev->sysfs_state);
++		/* wait for the dirty state to be recorded in the metadata */
++		wait_event(mddev->sb_wait,
++			   !test_bit(MD_SB_CHANGE_CLEAN, &mddev->sb_flags) &&
++			   !test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags));
+ 	} else
+ 		spin_unlock(&mddev->lock);
+-
+-	if (test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags))
+-		return -EAGAIN;
+-	else
+-		return 0;
+ }
+ EXPORT_SYMBOL_GPL(md_allow_write);
+ 
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index 0d13bf88f41f..5710637bc0b6 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -664,7 +664,7 @@ extern int sync_page_io(struct md_rdev *rdev, sector_t sector, int size,
+ 			struct page *page, int rw, bool metadata_op);
+ extern void md_do_sync(struct md_thread *thread);
+ extern void md_new_event(struct mddev *mddev);
+-extern int md_allow_write(struct mddev *mddev);
++extern void md_allow_write(struct mddev *mddev);
+ extern void md_wait_for_blocked_rdev(struct md_rdev *rdev, struct mddev *mddev);
+ extern void md_set_array_sectors(struct mddev *mddev, sector_t array_sectors);
+ extern int md_check_no_bitmap(struct mddev *mddev);
+* Unmerged path drivers/md/raid1.c
+* Unmerged path drivers/md/raid5.c
