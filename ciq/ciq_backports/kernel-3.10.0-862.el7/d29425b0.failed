@@ -1,0 +1,319 @@
+scsi: scsi_dh_alua: Fix RCU annotations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] scsi_dh_alua: Fix RCU annotations (Mike Snitzer) [1499107]
+Rebuild_FUZZ: 91.67%
+commit-author Bart Van Assche <bart.vanassche@sandisk.com>
+commit d29425b065cdab5c5e65a48108adde5ea72d4656
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d29425b0.failed
+
+This patch avoids that sparse complains about RCU pointer dereferences.
+
+	Signed-off-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Cc: tang.junhui <tang.junhui@zte.com.cn>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit d29425b065cdab5c5e65a48108adde5ea72d4656)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/device_handler/scsi_dh_alua.c
+diff --cc drivers/scsi/device_handler/scsi_dh_alua.c
+index 2f054f24112a,32e48cc4cf71..000000000000
+--- a/drivers/scsi/device_handler/scsi_dh_alua.c
++++ b/drivers/scsi/device_handler/scsi_dh_alua.c
+@@@ -72,11 -84,27 +72,27 @@@ struct alua_dh_data 
+  	int			state;
+  	int			pref;
+  	unsigned		flags; /* used for optimizing STPG */
+ +	unsigned char		inq[ALUA_INQUIRY_SIZE];
+ +	unsigned char		*buff;
+ +	int			bufflen;
+  	unsigned char		transition_tmo;
+++<<<<<<< HEAD
+++=======
++ 	unsigned long		expiry;
++ 	unsigned long		interval;
++ 	struct delayed_work	rtpg_work;
++ 	spinlock_t		lock;
++ 	struct list_head	rtpg_list;
++ 	struct scsi_device	*rtpg_sdev;
++ };
++ 
++ struct alua_dh_data {
++ 	struct list_head	node;
++ 	struct alua_port_group __rcu *pg;
++ 	int			group_id;
++ 	spinlock_t		pg_lock;
+++>>>>>>> d29425b065cd (scsi: scsi_dh_alua: Fix RCU annotations)
+  	struct scsi_device	*sdev;
+ -	int			init_error;
+ -	struct mutex		init_mutex;
+ -};
+ -
+ -struct alua_queue_data {
+ -	struct list_head	entry;
+  	activate_complete	callback_fn;
+  	void			*callback_data;
+  };
+@@@ -240,32 -350,71 +256,65 @@@ static int alua_check_vpd(struct scsi_d
+  			    ALUA_DH_NAME);
+  		return SCSI_DH_DEV_UNSUPP;
+  	}
+ +	h->state = TPGS_STATE_OPTIMIZED;
+ +	h->group_id = group_id;
+  
+ -	pg = alua_alloc_pg(sdev, group_id, tpgs);
+ -	if (IS_ERR(pg)) {
+ -		if (PTR_ERR(pg) == -ENOMEM)
+ -			return SCSI_DH_NOMEM;
+ -		return SCSI_DH_DEV_UNSUPP;
+ -	}
+ -	if (pg->device_id_len)
+ -		sdev_printk(KERN_INFO, sdev,
+ -			    "%s: device %s port group %x rel port %x\n",
+ -			    ALUA_DH_NAME, pg->device_id_str,
+ -			    group_id, rel_port);
+ -	else
+ -		sdev_printk(KERN_INFO, sdev,
+ -			    "%s: port group %x rel port %x\n",
+ -			    ALUA_DH_NAME, group_id, rel_port);
+ +	sdev_printk(KERN_INFO, sdev,
+ +		    "%s: port group %02x rel port %02x\n",
+ +		    ALUA_DH_NAME, h->group_id, h->rel_port);
+  
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ 	/* Check for existing port group references */
++ 	spin_lock(&h->pg_lock);
++ 	old_pg = rcu_dereference_protected(h->pg, lockdep_is_held(&h->pg_lock));
++ 	if (old_pg != pg) {
++ 		/* port group has changed. Update to new port group */
++ 		if (h->pg) {
++ 			spin_lock_irqsave(&old_pg->lock, flags);
++ 			list_del_rcu(&h->node);
++ 			spin_unlock_irqrestore(&old_pg->lock, flags);
++ 		}
++ 		rcu_assign_pointer(h->pg, pg);
++ 		pg_updated = true;
++ 	}
++ 
++ 	spin_lock_irqsave(&pg->lock, flags);
++ 	if (sdev->synchronous_alua)
++ 		pg->flags |= ALUA_SYNC_STPG;
++ 	if (pg_updated)
++ 		list_add_rcu(&h->node, &pg->dh_list);
++ 	spin_unlock_irqrestore(&pg->lock, flags);
++ 
++ 	alua_rtpg_queue(rcu_dereference_protected(h->pg,
++ 						  lockdep_is_held(&h->pg_lock)),
++ 			sdev, NULL, true);
++ 	spin_unlock(&h->pg_lock);
++ 
++ 	if (old_pg)
++ 		kref_put(&old_pg->kref, release_port_group);
++ 
++ 	return SCSI_DH_OK;
+++>>>>>>> d29425b065cd (scsi: scsi_dh_alua: Fix RCU annotations)
+  }
+  
+ -static char print_alua_state(unsigned char state)
+ +static char print_alua_state(int state)
+  {
+  	switch (state) {
+ -	case SCSI_ACCESS_STATE_OPTIMAL:
+ +	case TPGS_STATE_OPTIMIZED:
+  		return 'A';
+ -	case SCSI_ACCESS_STATE_ACTIVE:
+ +	case TPGS_STATE_NONOPTIMIZED:
+  		return 'N';
+ -	case SCSI_ACCESS_STATE_STANDBY:
+ +	case TPGS_STATE_STANDBY:
+  		return 'S';
+ -	case SCSI_ACCESS_STATE_UNAVAILABLE:
+ +	case TPGS_STATE_UNAVAILABLE:
+  		return 'U';
+ -	case SCSI_ACCESS_STATE_LBA:
+ +	case TPGS_STATE_LBA_DEPENDENT:
+  		return 'L';
+ -	case SCSI_ACCESS_STATE_OFFLINE:
+ +	case TPGS_STATE_OFFLINE:
+  		return 'O';
+ -	case SCSI_ACCESS_STATE_TRANSITIONING:
+ +	case TPGS_STATE_TRANSITIONING:
+  		return 'T';
+  	default:
+  		return 'X';
+@@@ -578,7 -938,8 +627,12 @@@ out
+   */
+  static int alua_set_params(struct scsi_device *sdev, const char *params)
+  {
+++<<<<<<< HEAD
+ +	struct alua_dh_data *h = get_alua_data(sdev);
+++=======
++ 	struct alua_dh_data *h = sdev->handler_data;
++ 	struct alua_port_group *pg = NULL;
+++>>>>>>> d29425b065cd (scsi: scsi_dh_alua: Fix RCU annotations)
+  	unsigned int optimize = 0, argc;
+  	const char *p = params;
+  	int result = SCSI_DH_OK;
+@@@ -616,19 -983,35 +670,24 @@@ MODULE_PARM_DESC(optimize_stpg, "Allow 
+  static int alua_activate(struct scsi_device *sdev,
+  			activate_complete fn, void *data)
+  {
+ -	struct alua_dh_data *h = sdev->handler_data;
+ +	struct alua_dh_data *h = get_alua_data(sdev);
+  	int err = SCSI_DH_OK;
+++<<<<<<< HEAD
+++=======
++ 	struct alua_queue_data *qdata;
++ 	struct alua_port_group *pg;
+++>>>>>>> d29425b065cd (scsi: scsi_dh_alua: Fix RCU annotations)
+  
+ -	qdata = kzalloc(sizeof(*qdata), GFP_KERNEL);
+ -	if (!qdata) {
+ -		err = SCSI_DH_RES_TEMP_UNAVAIL;
+ +	err = alua_rtpg(sdev, h, 1);
+ +	if (err != SCSI_DH_OK)
+  		goto out;
+ -	}
+ -	qdata->callback_fn = fn;
+ -	qdata->callback_data = data;
+ -
+ -	mutex_lock(&h->init_mutex);
+ -	rcu_read_lock();
+ -	pg = rcu_dereference(h->pg);
+ -	if (!pg || !kref_get_unless_zero(&pg->kref)) {
+ -		rcu_read_unlock();
+ -		kfree(qdata);
+ -		err = h->init_error;
+ -		mutex_unlock(&h->init_mutex);
+ -		goto out;
+ -	}
+ -	fn = NULL;
+ -	rcu_read_unlock();
+ -	mutex_unlock(&h->init_mutex);
+  
+ -	alua_rtpg_queue(pg, sdev, qdata, true);
+ -	kref_put(&pg->kref, release_port_group);
+ +	if (optimize_stpg)
+ +		h->flags |= ALUA_OPTIMIZE_STPG;
+ +
+ +	err = alua_stpg(sdev, h);
+ +	if (err == SCSI_DH_RETRY)
+ +		err = alua_rtpg(sdev, h, 1);
+  out:
+  	if (fn)
+  		fn(data, err);
+@@@ -643,14 -1049,21 +702,20 @@@
+   */
+  static int alua_prep_fn(struct scsi_device *sdev, struct request *req)
+  {
+++<<<<<<< HEAD
+ +	struct alua_dh_data *h = get_alua_data(sdev);
+++=======
++ 	struct alua_dh_data *h = sdev->handler_data;
++ 	struct alua_port_group *pg;
++ 	unsigned char state = SCSI_ACCESS_STATE_OPTIMAL;
+++>>>>>>> d29425b065cd (scsi: scsi_dh_alua: Fix RCU annotations)
+  	int ret = BLKPREP_OK;
+  
+ -	rcu_read_lock();
+ -	pg = rcu_dereference(h->pg);
+ -	if (pg)
+ -		state = pg->state;
+ -	rcu_read_unlock();
+ -	if (state == SCSI_ACCESS_STATE_TRANSITIONING)
+ +	if (h->state == TPGS_STATE_TRANSITIONING)
+  		ret = BLKPREP_DEFER;
+ -	else if (state != SCSI_ACCESS_STATE_OPTIMAL &&
+ -		 state != SCSI_ACCESS_STATE_ACTIVE &&
+ -		 state != SCSI_ACCESS_STATE_LBA) {
+ +	else if (h->state != TPGS_STATE_OPTIMIZED &&
+ +		 h->state != TPGS_STATE_NONOPTIMIZED &&
+ +		 h->state != TPGS_STATE_LBA_DEPENDENT) {
+  		ret = BLKPREP_KILL;
+  		req->cmd_flags |= REQ_QUIET;
+  	}
+@@@ -658,13 -1071,68 +723,71 @@@
+  
+  }
+  
+ -static void alua_rescan(struct scsi_device *sdev)
+ +static bool alua_match(struct scsi_device *sdev)
+  {
+ -	struct alua_dh_data *h = sdev->handler_data;
+ -
+ -	alua_initialize(sdev, h);
+ +	return (scsi_device_tpgs(sdev) != 0);
+  }
+  
+++<<<<<<< HEAD
+ +static int alua_bus_attach(struct scsi_device *sdev);
+ +static void alua_bus_detach(struct scsi_device *sdev);
+++=======
++ /*
++  * alua_bus_attach - Attach device handler
++  * @sdev: device to be attached to
++  */
++ static int alua_bus_attach(struct scsi_device *sdev)
++ {
++ 	struct alua_dh_data *h;
++ 	int err, ret = -EINVAL;
++ 
++ 	h = kzalloc(sizeof(*h) , GFP_KERNEL);
++ 	if (!h)
++ 		return -ENOMEM;
++ 	spin_lock_init(&h->pg_lock);
++ 	rcu_assign_pointer(h->pg, NULL);
++ 	h->init_error = SCSI_DH_OK;
++ 	h->sdev = sdev;
++ 	INIT_LIST_HEAD(&h->node);
++ 
++ 	mutex_init(&h->init_mutex);
++ 	err = alua_initialize(sdev, h);
++ 	if (err == SCSI_DH_NOMEM)
++ 		ret = -ENOMEM;
++ 	if (err != SCSI_DH_OK && err != SCSI_DH_DEV_OFFLINED)
++ 		goto failed;
++ 
++ 	sdev->handler_data = h;
++ 	return 0;
++ failed:
++ 	kfree(h);
++ 	return ret;
++ }
++ 
++ /*
++  * alua_bus_detach - Detach device handler
++  * @sdev: device to be detached from
++  */
++ static void alua_bus_detach(struct scsi_device *sdev)
++ {
++ 	struct alua_dh_data *h = sdev->handler_data;
++ 	struct alua_port_group *pg;
++ 
++ 	spin_lock(&h->pg_lock);
++ 	pg = rcu_dereference_protected(h->pg, lockdep_is_held(&h->pg_lock));
++ 	rcu_assign_pointer(h->pg, NULL);
++ 	h->sdev = NULL;
++ 	spin_unlock(&h->pg_lock);
++ 	if (pg) {
++ 		spin_lock_irq(&pg->lock);
++ 		list_del_rcu(&h->node);
++ 		spin_unlock_irq(&pg->lock);
++ 		kref_put(&pg->kref, release_port_group);
++ 	}
++ 	sdev->handler_data = NULL;
++ 	kfree(h);
++ }
+++>>>>>>> d29425b065cd (scsi: scsi_dh_alua: Fix RCU annotations)
+  
+  static struct scsi_device_handler alua_dh = {
+  	.name = ALUA_DH_NAME,
+* Unmerged path drivers/scsi/device_handler/scsi_dh_alua.c
