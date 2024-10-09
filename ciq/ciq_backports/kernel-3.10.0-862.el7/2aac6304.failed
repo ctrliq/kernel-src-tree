@@ -1,0 +1,219 @@
+iommu/vt-d: change intel-iommu to use IOVA frame numbers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [iommu] vt-d: change intel-iommu to use IOVA frame numbers (Jerry Snitselaar) [1499325]
+Rebuild_FUZZ: 94.34%
+commit-author Omer Peleg <omer@cs.technion.ac.il>
+commit 2aac630429d986a43ac59525a4cff47a624dc58e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2aac6304.failed
+
+Make intel-iommu map/unmap/invalidate work with IOVA pfns instead of
+pointers to "struct iova". This avoids using the iova struct from the IOVA
+red-black tree and the resulting explicit find_iova() on unmap.
+
+This patch will allow us to cache IOVAs in the next patch, in order to
+avoid rbtree operations for the majority of map/unmap operations.
+
+Note: In eliminating the find_iova() operation, we have also eliminated
+the sanity check previously done in the unmap flow. Arguably, this was
+overhead that is better avoided in production code, but it could be
+brought back as a debug option for driver development.
+
+	Signed-off-by: Omer Peleg <omer@cs.technion.ac.il>
+[mad@cs.technion.ac.il: rebased, fixed to not break iova api, and reworded
+ the commit message]
+	Signed-off-by: Adam Morrison <mad@cs.technion.ac.il>
+	Reviewed-by: Shaohua Li <shli@fb.com>
+	Reviewed-by: Ben Serebrin <serebrin@google.com>
+	Signed-off-by: David Woodhouse <David.Woodhouse@intel.com>
+(cherry picked from commit 2aac630429d986a43ac59525a4cff47a624dc58e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-iommu.c
+diff --cc drivers/iommu/intel-iommu.c
+index ae278e3a91b2,a8babc43e6d4..000000000000
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@@ -452,10 -458,9 +452,15 @@@ static LIST_HEAD(dmar_rmrr_units)
+  
+  static void flush_unmaps_timeout(unsigned long data);
+  
+ +static DEFINE_TIMER(unmap_timer,  flush_unmaps_timeout, 0, 0);
+ +
+  struct deferred_flush_entry {
+++<<<<<<< HEAD
+ +	struct iova *iova;
+++=======
++ 	unsigned long iova_pfn;
++ 	unsigned long nrpages;
+++>>>>>>> 2aac630429d9 (iommu/vt-d: change intel-iommu to use IOVA frame numbers)
+  	struct dmar_domain *domain;
+  	struct page *freelist;
+  };
+@@@ -3465,45 -3572,47 +3470,61 @@@ static void flush_unmaps(void
+  		if (!cap_caching_mode(iommu->cap))
+  			iommu->flush.flush_iotlb(iommu, 0, 0, 0,
+  					 DMA_TLB_GLOBAL_FLUSH);
+ -		for (j = 0; j < flush_table->next; j++) {
+ +		for (j = 0; j < deferred_flush[i].next; j++) {
+  			unsigned long mask;
+  			struct deferred_flush_entry *entry =
+++<<<<<<< HEAD
+ +						&deferred_flush->entries[j];
+ +			struct iova *iova = entry->iova;
+++=======
++ 						&flush_table->entries[j];
++ 			unsigned long iova_pfn = entry->iova_pfn;
++ 			unsigned long nrpages = entry->nrpages;
+++>>>>>>> 2aac630429d9 (iommu/vt-d: change intel-iommu to use IOVA frame numbers)
+  			struct dmar_domain *domain = entry->domain;
+  			struct page *freelist = entry->freelist;
+  
+  			/* On real hardware multiple invalidations are expensive */
+  			if (cap_caching_mode(iommu->cap))
+  				iommu_flush_iotlb_psi(iommu, domain,
+++<<<<<<< HEAD
+ +					mm_to_dma_pfn(iova->pfn_lo),
+ +					mm_to_dma_pfn(iova_size(iova)),
+ +					!freelist, 0);
+++=======
++ 					mm_to_dma_pfn(iova_pfn),
++ 					nrpages, !freelist, 0);
+++>>>>>>> 2aac630429d9 (iommu/vt-d: change intel-iommu to use IOVA frame numbers)
+  			else {
+ -				mask = ilog2(nrpages);
+ +				mask = ilog2(mm_to_dma_pfn(iova_size(iova)));
+  				iommu_flush_dev_iotlb(domain,
+- 						(uint64_t)iova->pfn_lo << PAGE_SHIFT, mask);
++ 						(uint64_t)iova_pfn << PAGE_SHIFT, mask);
+  			}
+- 			__free_iova(&domain->iovad, iova);
++ 			free_iova(&domain->iovad, iova_pfn);
+  			if (freelist)
+  				dma_free_pagelist(freelist);
+  		}
+ -		flush_table->next = 0;
+ +		deferred_flush[i].next = 0;
+  	}
+  
+ -	flush_data->size = 0;
+ +	list_size = 0;
+  }
+  
+ -static void flush_unmaps_timeout(unsigned long cpuid)
+ +static void flush_unmaps_timeout(unsigned long data)
+  {
+ -	struct deferred_flush_data *flush_data = per_cpu_ptr(&deferred_flush, cpuid);
+  	unsigned long flags;
+  
+ -	spin_lock_irqsave(&flush_data->lock, flags);
+ -	flush_unmaps(flush_data);
+ -	spin_unlock_irqrestore(&flush_data->lock, flags);
+ +	spin_lock_irqsave(&async_umap_flush_lock, flags);
+ +	flush_unmaps();
+ +	spin_unlock_irqrestore(&async_umap_flush_lock, flags);
+  }
+  
+++<<<<<<< HEAD
+ +static void add_unmap(struct dmar_domain *dom, struct iova *iova, struct page *freelist)
+++=======
++ static void add_unmap(struct dmar_domain *dom, unsigned long iova_pfn,
++ 		      unsigned long nrpages, struct page *freelist)
+++>>>>>>> 2aac630429d9 (iommu/vt-d: change intel-iommu to use IOVA frame numbers)
+  {
+  	unsigned long flags;
+  	int entry_id, iommu_id;
+@@@ -3517,27 -3640,31 +3538,37 @@@
+  	iommu = domain_get_iommu(dom);
+  	iommu_id = iommu->seq_id;
+  
+ -	entry_id = flush_data->tables[iommu_id].next;
+ -	++(flush_data->tables[iommu_id].next);
+ +	entry_id = deferred_flush[iommu_id].next;
+ +	++(deferred_flush[iommu_id].next);
+  
+ -	entry = &flush_data->tables[iommu_id].entries[entry_id];
+ +	entry = &deferred_flush[iommu_id].entries[entry_id];
+  	entry->domain = dom;
+++<<<<<<< HEAD
+ +	entry->iova = iova;
+++=======
++ 	entry->iova_pfn = iova_pfn;
++ 	entry->nrpages = nrpages;
+++>>>>>>> 2aac630429d9 (iommu/vt-d: change intel-iommu to use IOVA frame numbers)
+  	entry->freelist = freelist;
+  
+ -	if (!flush_data->timer_on) {
+ -		mod_timer(&flush_data->timer, jiffies + msecs_to_jiffies(10));
+ -		flush_data->timer_on = 1;
+ +	if (!timer_on) {
+ +		mod_timer(&unmap_timer, jiffies + msecs_to_jiffies(10));
+ +		timer_on = 1;
+  	}
+ -	flush_data->size++;
+ -	spin_unlock_irqrestore(&flush_data->lock, flags);
+ -
+ -	put_cpu();
+ +	list_size++;
+ +	spin_unlock_irqrestore(&async_umap_flush_lock, flags);
+  }
+  
+ -static void intel_unmap(struct device *dev, dma_addr_t dev_addr, size_t size)
+ +static void intel_unmap(struct device *dev, dma_addr_t dev_addr)
+  {
+  	struct dmar_domain *domain;
+  	unsigned long start_pfn, last_pfn;
+++<<<<<<< HEAD
+ +	struct iova *iova;
+++=======
++ 	unsigned long nrpages;
++ 	unsigned long iova_pfn;
+++>>>>>>> 2aac630429d9 (iommu/vt-d: change intel-iommu to use IOVA frame numbers)
+  	struct intel_iommu *iommu;
+  	struct page *freelist;
+  
+@@@ -3549,13 -3676,11 +3580,16 @@@
+  
+  	iommu = domain_get_iommu(domain);
+  
+- 	iova = find_iova(&domain->iovad, IOVA_PFN(dev_addr));
+- 	if (WARN_ONCE(!iova, "Driver unmaps unmatched page at PFN %llx\n",
+- 		      (unsigned long long)dev_addr))
+- 		return;
++ 	iova_pfn = IOVA_PFN(dev_addr);
+  
+++<<<<<<< HEAD
+ +	start_pfn = mm_to_dma_pfn(iova->pfn_lo);
+ +	last_pfn = mm_to_dma_pfn(iova->pfn_hi + 1) - 1;
+++=======
++ 	nrpages = aligned_nrpages(dev_addr, size);
++ 	start_pfn = mm_to_dma_pfn(iova_pfn);
++ 	last_pfn = start_pfn + nrpages - 1;
+++>>>>>>> 2aac630429d9 (iommu/vt-d: change intel-iommu to use IOVA frame numbers)
+  
+  	pr_debug("Device %s unmapping: pfn %lx-%lx\n",
+  		 dev_name(dev), start_pfn, last_pfn);
+@@@ -3564,12 -3689,12 +3598,16 @@@
+  
+  	if (intel_iommu_strict) {
+  		iommu_flush_iotlb_psi(iommu, domain, start_pfn,
+ -				      nrpages, !freelist, 0);
+ +				      last_pfn - start_pfn + 1, !freelist, 0);
+  		/* free iova */
+- 		__free_iova(&domain->iovad, iova);
++ 		free_iova(&domain->iovad, iova_pfn);
+  		dma_free_pagelist(freelist);
+  	} else {
+++<<<<<<< HEAD
+ +		add_unmap(domain, iova, freelist);
+++=======
++ 		add_unmap(domain, iova_pfn, nrpages, freelist);
+++>>>>>>> 2aac630429d9 (iommu/vt-d: change intel-iommu to use IOVA frame numbers)
+  		/*
+  		 * queue up the release of the unmap to save the 1/6th of the
+  		 * cpu used up by the iotlb flush operation...
+* Unmerged path drivers/iommu/intel-iommu.c
