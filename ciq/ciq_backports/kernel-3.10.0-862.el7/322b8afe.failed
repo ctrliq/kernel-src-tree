@@ -1,0 +1,147 @@
+mm, swap: Fix a race in free_swap_and_cache()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [mm] swap: Fix a race in free_swap_and_cache() (Jerome Marchand) [1400689]
+Rebuild_FUZZ: 95.35%
+commit-author Huang Ying <ying.huang@intel.com>
+commit 322b8afe4a65906c133102532e63a278775cc5f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/322b8afe.failed
+
+Before using cluster lock in free_swap_and_cache(), the
+swap_info_struct->lock will be held during freeing the swap entry and
+acquiring page lock, so the page swap count will not change when testing
+page information later.  But after using cluster lock, the cluster lock
+(or swap_info_struct->lock) will be held only during freeing the swap
+entry.  So before acquiring the page lock, the page swap count may be
+changed in another thread.  If the page swap count is not 0, we should
+not delete the page from the swap cache.  This is fixed via checking
+page swap count again after acquiring the page lock.
+
+I found the race when I review the code, so I didn't trigger the race
+via a test program.  If the race occurs for an anonymous page shared by
+multiple processes via fork, multiple pages will be allocated and
+swapped in from the swap device for the previously shared one page.
+That is, the user-visible runtime effect is more memory will be used and
+the access latency for the page will be higher, that is, the performance
+regression.
+
+Link: http://lkml.kernel.org/r/20170301143905.12846-1-ying.huang@intel.com
+	Signed-off-by: "Huang, Ying" <ying.huang@intel.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Shaohua Li <shli@kernel.org>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Tim Chen <tim.c.chen@intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 322b8afe4a65906c133102532e63a278775cc5f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/swapfile.c
+diff --cc mm/swapfile.c
+index 44c2eac6b890,6b6bb1bb6209..000000000000
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@@ -675,7 -1111,81 +675,84 @@@ int page_swapcount(struct page *page
+  	return count;
+  }
+  
++ static int swap_swapcount(struct swap_info_struct *si, swp_entry_t entry)
++ {
++ 	int count = 0;
++ 	pgoff_t offset = swp_offset(entry);
++ 	struct swap_cluster_info *ci;
++ 
++ 	ci = lock_cluster_or_swap_info(si, offset);
++ 	count = swap_count(si->swap_map[offset]);
++ 	unlock_cluster_or_swap_info(si, ci);
++ 	return count;
++ }
++ 
++ /*
+++<<<<<<< HEAD
+++=======
++  * How many references to @entry are currently swapped out?
++  * This does not give an exact answer when swap count is continued,
++  * but does include the high COUNT_CONTINUED flag to allow for that.
++  */
++ int __swp_swapcount(swp_entry_t entry)
++ {
++ 	int count = 0;
++ 	struct swap_info_struct *si;
++ 
++ 	si = __swap_info_get(entry);
++ 	if (si)
++ 		count = swap_swapcount(si, entry);
++ 	return count;
++ }
++ 
++ /*
++  * How many references to @entry are currently swapped out?
++  * This considers COUNT_CONTINUED so it returns exact answer.
++  */
++ int swp_swapcount(swp_entry_t entry)
++ {
++ 	int count, tmp_count, n;
++ 	struct swap_info_struct *p;
++ 	struct swap_cluster_info *ci;
++ 	struct page *page;
++ 	pgoff_t offset;
++ 	unsigned char *map;
++ 
++ 	p = _swap_info_get(entry);
++ 	if (!p)
++ 		return 0;
++ 
++ 	offset = swp_offset(entry);
++ 
++ 	ci = lock_cluster_or_swap_info(p, offset);
++ 
++ 	count = swap_count(p->swap_map[offset]);
++ 	if (!(count & COUNT_CONTINUED))
++ 		goto out;
++ 
++ 	count &= ~COUNT_CONTINUED;
++ 	n = SWAP_MAP_MAX + 1;
++ 
++ 	page = vmalloc_to_page(p->swap_map + offset);
++ 	offset &= ~PAGE_MASK;
++ 	VM_BUG_ON(page_private(page) != SWP_CONTINUED);
++ 
++ 	do {
++ 		page = list_next_entry(page, lru);
++ 		map = kmap_atomic(page);
++ 		tmp_count = map[offset];
++ 		kunmap_atomic(map);
++ 
++ 		count += (tmp_count & ~COUNT_CONTINUED) * n;
++ 		n *= (SWAP_CONT_MAX + 1);
++ 	} while (tmp_count & COUNT_CONTINUED);
++ out:
++ 	unlock_cluster_or_swap_info(p, ci);
++ 	return count;
++ }
++ 
+  /*
+++>>>>>>> 322b8afe4a65 (mm, swap: Fix a race in free_swap_and_cache())
+   * We can write to an anon page without COW if there are no other references
+   * to it.  And as a side-effect, free up its swap: because the old content
+   * on disk will never be read, and seeking back there to write new content
+@@@ -767,7 -1297,8 +844,12 @@@ int free_swap_and_cache(swp_entry_t ent
+  		 * Also recheck PageSwapCache now page is locked (above).
+  		 */
+  		if (PageSwapCache(page) && !PageWriteback(page) &&
+++<<<<<<< HEAD
+ +				(!page_mapped(page) || vm_swap_full())) {
+++=======
++ 		    (!page_mapped(page) || mem_cgroup_swap_full(page)) &&
++ 		    !swap_swapcount(p, entry)) {
+++>>>>>>> 322b8afe4a65 (mm, swap: Fix a race in free_swap_and_cache())
+  			delete_from_swap_cache(page);
+  			SetPageDirty(page);
+  		}
+* Unmerged path mm/swapfile.c
