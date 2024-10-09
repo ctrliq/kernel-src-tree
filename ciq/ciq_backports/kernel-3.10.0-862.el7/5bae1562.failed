@@ -1,0 +1,227 @@
+x86/tsc: Force TSC_ADJUST register to value >= zero
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] tsc: Force TSC_ADJUST register to value >= zero (Prarit Bhargava) [1497055]
+Rebuild_FUZZ: 95.92%
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 5bae156241e05d25171b18ee43e49f103c3f8097
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5bae1562.failed
+
+Roland reported that his DELL T5810 sports a value add BIOS which
+completely wreckages the TSC. The squirmware [(TM) Ingo Molnar] boots with
+random negative TSC_ADJUST values, different on all CPUs. That renders the
+TSC useless because the sycnchronization check fails.
+
+Roland tested the new TSC_ADJUST mechanism. While it manages to readjust
+the TSCs he needs to disable the TSC deadline timer, otherwise the machine
+just stops booting.
+
+Deeper investigation unearthed that the TSC deadline timer is sensitive to
+the TSC_ADJUST value. Writing TSC_ADJUST to a negative value results in an
+interrupt storm caused by the TSC deadline timer.
+
+This does not make any sense and it's hard to imagine what kind of hardware
+wreckage is behind that misfeature, but it's reliably reproducible on other
+systems which have TSC_ADJUST and TSC deadline timer.
+
+While it would be understandable that a big enough negative value which
+moves the resulting TSC readout into the negative space could have the
+described effect, this happens even with a adjust value of -1, which keeps
+the TSC readout definitely in the positive space. The compare register for
+the TSC deadline timer is set to a positive value larger than the TSC, but
+despite not having reached the deadline the interrupt is raised
+immediately. If this happens on the boot CPU, then the machine dies
+silently because this setup happens before the NMI watchdog is armed.
+
+Further experiments showed that any other adjustment of TSC_ADJUST works as
+expected as long as it stays in the positive range. The direction of the
+adjustment has no influence either. See the lkml link for further analysis.
+
+Yet another proof for the theory that timers are designed by janitors and
+the underlying (obviously undocumented) mechanisms which allow BIOSes to
+wreckage them are considered a feature. Well done Intel - NOT!
+
+To address this wreckage add the following sanity measures:
+
+- If the TSC_ADJUST value on the boot cpu is not 0, set it to 0
+
+- If the TSC_ADJUST value on any cpu is negative, set it to 0
+
+- Prevent the cross package synchronization mechanism from setting negative
+  TSC_ADJUST values.
+
+Reported-and-tested-by: Roland Scheidegger <rscheidegger_lists@hispeed.ch>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Bruce Schlobohm <bruce.schlobohm@intel.com>
+	Cc: Kevin Stanton <kevin.b.stanton@intel.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Allen Hung <allen_hung@dell.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+Link: http://lkml.kernel.org/r/20161213131211.397588033@linutronix.de
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+(cherry picked from commit 5bae156241e05d25171b18ee43e49f103c3f8097)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/tsc.h
+diff --cc arch/x86/include/asm/tsc.h
+index 43f6163d09b9,abb1fdcc545a..000000000000
+--- a/arch/x86/include/asm/tsc.h
++++ b/arch/x86/include/asm/tsc.h
+@@@ -46,15 -45,16 +46,28 @@@ extern int tsc_clocksource_reliable
+   * Boot-time check whether the TSCs are synchronized across
+   * all CPUs/cores:
+   */
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_X86_TSC
++ extern bool tsc_store_and_check_tsc_adjust(bool bootcpu);
++ extern void tsc_verify_tsc_adjust(bool resume);
+++>>>>>>> 5bae156241e0 (x86/tsc: Force TSC_ADJUST register to value >= zero)
+  extern void check_tsc_sync_source(int cpu);
+  extern void check_tsc_sync_target(void);
+ +
+ +#ifdef CONFIG_X86_TSC
+ +extern bool tsc_store_and_check_tsc_adjust(void);
+ +extern void tsc_verify_tsc_adjust(void);
+  #else
+++<<<<<<< HEAD
+ +static inline bool tsc_store_and_check_tsc_adjust(void) { }
+ +static inline void tsc_verify_tsc_adjust(void) { }
+++=======
++ static inline bool tsc_store_and_check_tsc_adjust(bool bootcpu) { return false; }
++ static inline void tsc_verify_tsc_adjust(bool resume) { }
++ static inline void check_tsc_sync_source(int cpu) { }
++ static inline void check_tsc_sync_target(void) { }
+++>>>>>>> 5bae156241e0 (x86/tsc: Force TSC_ADJUST register to value >= zero)
+  #endif
+  
+  extern int notsc_setup(char *);
+* Unmerged path arch/x86/include/asm/tsc.h
+diff --git a/arch/x86/kernel/tsc.c b/arch/x86/kernel/tsc.c
+index 4716e80b8b60..cfe7fce1fbff 100644
+--- a/arch/x86/kernel/tsc.c
++++ b/arch/x86/kernel/tsc.c
+@@ -1385,7 +1385,7 @@ void __init tsc_init(void)
+ 	if (unsynchronized_tsc())
+ 		mark_tsc_unstable("TSCs unsynchronized");
+ 	else
+-		tsc_store_and_check_tsc_adjust();
++		tsc_store_and_check_tsc_adjust(true);
+ 
+ 	check_system_tsc_reliable();
+ 
+diff --git a/arch/x86/kernel/tsc_sync.c b/arch/x86/kernel/tsc_sync.c
+index 68270eb35526..9e25ccf4ee8e 100644
+--- a/arch/x86/kernel/tsc_sync.c
++++ b/arch/x86/kernel/tsc_sync.c
+@@ -58,8 +58,33 @@ void tsc_verify_tsc_adjust(void)
+ 	}
+ }
+ 
++static void tsc_sanitize_first_cpu(struct tsc_adjust *cur, s64 bootval,
++				   unsigned int cpu, bool bootcpu)
++{
++	/*
++	 * First online CPU in a package stores the boot value in the
++	 * adjustment value. This value might change later via the sync
++	 * mechanism. If that fails we still can yell about boot values not
++	 * being consistent.
++	 *
++	 * On the boot cpu we just force set the ADJUST value to 0 if it's
++	 * non zero. We don't do that on non boot cpus because physical
++	 * hotplug should have set the ADJUST register to a value > 0 so
++	 * the TSC is in sync with the already running cpus.
++	 *
++	 * But we always force positive ADJUST values. Otherwise the TSC
++	 * deadline timer creates an interrupt storm. Sigh!
++	 */
++	if ((bootcpu && bootval != 0) || (!bootcpu && bootval < 0)) {
++		pr_warn("TSC ADJUST: CPU%u: %lld force to 0\n", cpu, bootval);
++		wrmsrl(MSR_IA32_TSC_ADJUST, 0);
++		bootval = 0;
++	}
++	cur->adjusted = bootval;
++}
++
+ #ifndef CONFIG_SMP
+-bool __init tsc_store_and_check_tsc_adjust(void)
++bool __init tsc_store_and_check_tsc_adjust(bool bootcpu)
+ {
+ 	struct tsc_adjust *ref, *cur = this_cpu_ptr(&tsc_adjust);
+ 	s64 bootval;
+@@ -69,9 +94,8 @@ bool __init tsc_store_and_check_tsc_adjust(void)
+ 
+ 	rdmsrl(MSR_IA32_TSC_ADJUST, bootval);
+ 	cur->bootval = bootval;
+-	cur->adjusted = bootval;
+ 	cur->nextcheck = jiffies + HZ;
+-	pr_info("TSC ADJUST: Boot CPU0: %lld\n", bootval);
++	tsc_sanitize_first_cpu(cur, bootval, smp_processor_id(), bootcpu);
+ 	return false;
+ }
+ 
+@@ -80,7 +104,7 @@ bool __init tsc_store_and_check_tsc_adjust(void)
+ /*
+  * Store and check the TSC ADJUST MSR if available
+  */
+-bool tsc_store_and_check_tsc_adjust(void)
++bool tsc_store_and_check_tsc_adjust(bool bootcpu)
+ {
+ 	struct tsc_adjust *ref, *cur = this_cpu_ptr(&tsc_adjust);
+ 	unsigned int refcpu, cpu = smp_processor_id();
+@@ -98,22 +122,16 @@ bool tsc_store_and_check_tsc_adjust(void)
+ 	/*
+ 	 * Check whether this CPU is the first in a package to come up. In
+ 	 * this case do not check the boot value against another package
+-	 * because the package might have been physically hotplugged, where
+-	 * TSC_ADJUST is expected to be different. When called on the boot
+-	 * CPU topology_core_cpumask() might not be available yet.
++	 * because the new package might have been physically hotplugged,
++	 * where TSC_ADJUST is expected to be different. When called on the
++	 * boot CPU topology_core_cpumask() might not be available yet.
+ 	 */
+ 	mask = topology_core_cpumask(cpu);
+ 	refcpu = mask ? cpumask_any_but(mask, cpu) : nr_cpu_ids;
+ 
+ 	if (refcpu >= nr_cpu_ids) {
+-		/*
+-		 * First online CPU in a package stores the boot value in
+-		 * the adjustment value. This value might change later via
+-		 * the sync mechanism. If that fails we still can yell
+-		 * about boot values not being consistent.
+-		 */
+-		cur->adjusted = bootval;
+-		pr_info_once("TSC ADJUST: Boot CPU%u: %lld\n", cpu,  bootval);
++		tsc_sanitize_first_cpu(cur, bootval, smp_processor_id(),
++				       bootcpu);
+ 		return false;
+ 	}
+ 
+@@ -366,7 +384,7 @@ void check_tsc_sync_target(void)
+ 	 * Store, verify and sanitize the TSC adjust register. If
+ 	 * successful skip the test.
+ 	 */
+-	if (tsc_store_and_check_tsc_adjust()) {
++	if (tsc_store_and_check_tsc_adjust(false)) {
+ 		atomic_inc(&skip_test);
+ 		return;
+ 	}
+@@ -429,8 +447,13 @@ retry:
+ 	 * that the warp is not longer detectable when the observed warp
+ 	 * value is used. In the worst case the adjustment needs to go
+ 	 * through a 3rd run for fine tuning.
++	 *
++	 * But we must make sure that the value doesn't become negative
++	 * otherwise TSC deadline timer will create an interrupt storm.
+ 	 */
+ 	cur->adjusted += cur_max_warp;
++	if (cur->adjusted < 0)
++		cur->adjusted = 0;
+ 
+ 	pr_warn("TSC ADJUST compensate: CPU%u observed %lld warp. Adjust: %lld\n",
+ 		cpu, cur_max_warp, cur->adjusted);
