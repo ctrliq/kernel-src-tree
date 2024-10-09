@@ -1,0 +1,211 @@
+scsi: qla2xxx: Retry PLOGI on FC-NVMe PRLI failure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Quinn Tran <qutran@marvell.com>
+commit 983f127603fac650fa34ee69db363e4615eaf9e7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/983f1276.failed
+
+Current code will send PRLI with FC-NVMe bit set for the targets which
+support only FCP. This may result into issue with targets which do not
+understand NVMe and will go into a strange state. This patch would restart
+the login process by going back to PLOGI state. The PLOGI state will force
+the target to respond to correct PRLI request.
+
+Fixes: c76ae845ea836 ("scsi: qla2xxx: Add error handling for PLOGI ELS passthrough")
+	Cc: stable@vger.kernel.org # 5.4
+Link: https://lore.kernel.org/r/20191105150657.8092-2-hmadhani@marvell.com
+	Reviewed-by: Ewan D. Milne <emilne@redhat.com>
+	Signed-off-by: Quinn Tran <qutran@marvell.com>
+	Signed-off-by: Himanshu Madhani <hmadhani@marvell.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 983f127603fac650fa34ee69db363e4615eaf9e7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_init.c
+#	drivers/scsi/qla2xxx/qla_iocb.c
+diff --cc drivers/scsi/qla2xxx/qla_init.c
+index bffbdb309273,5db8ad832893..000000000000
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@@ -1925,38 -1859,26 +1925,36 @@@ qla24xx_handle_prli_done_event(struct s
+  			break;
+  		}
+  
+++<<<<<<< HEAD
+ +		if (ea->fcport->fc4f_nvme) {
+ +			ql_dbg(ql_dbg_disc, vha, 0x2118,
+ +				"%s %d %8phC post fc4 prli\n",
+ +				__func__, __LINE__, ea->fcport->port_name);
+ +			ea->fcport->fc4f_nvme = 0;
+ +			qla24xx_post_prli_work(vha, ea->fcport);
+ +			return;
+++=======
++ 		/*
++ 		 * Retry PRLI with other FC-4 type if failure occurred on dual
++ 		 * FCP/NVMe port
++ 		 */
++ 		if (NVME_FCP_TARGET(ea->fcport)) {
++ 			ql_dbg(ql_dbg_disc, vha, 0x2118,
++ 				"%s %d %8phC post %s prli\n",
++ 				__func__, __LINE__, ea->fcport->port_name,
++ 				(ea->fcport->fc4_type & FS_FC4TYPE_NVME) ?
++ 				"NVMe" : "FCP");
++ 			if (vha->hw->fc4_type_priority == FC4_PRIORITY_NVME)
++ 				ea->fcport->fc4_type &= ~FS_FC4TYPE_NVME;
++ 			else
++ 				ea->fcport->fc4_type &= ~FS_FC4TYPE_FCP;
+++>>>>>>> 983f127603fa (scsi: qla2xxx: Retry PLOGI on FC-NVMe PRLI failure)
+  		}
+  
+- 		/* at this point both PRLI NVME & PRLI FCP failed */
+- 		if (N2N_TOPO(vha->hw)) {
+- 			if (ea->fcport->n2n_link_reset_cnt < 3) {
+- 				ea->fcport->n2n_link_reset_cnt++;
+- 				/*
+- 				 * remote port is not sending Plogi. Reset
+- 				 * link to kick start his state machine
+- 				 */
+- 				set_bit(N2N_LINK_RESET, &vha->dpc_flags);
+- 			} else {
+- 				ql_log(ql_log_warn, vha, 0x2119,
+- 				    "%s %d %8phC Unable to reconnect\n",
+- 				    __func__, __LINE__, ea->fcport->port_name);
+- 			}
+- 		} else {
+- 			/*
+- 			 * switch connect. login failed. Take connection
+- 			 * down and allow relogin to retrigger
+- 			 */
+- 			ea->fcport->flags &= ~FCF_ASYNC_SENT;
+- 			ea->fcport->keep_nport_handle = 0;
+- 			qlt_schedule_sess_for_deletion(ea->fcport);
+- 		}
++ 		ea->fcport->flags &= ~FCF_ASYNC_SENT;
++ 		ea->fcport->keep_nport_handle = 0;
++ 		ea->fcport->logout_on_delete = 1;
++ 		qlt_schedule_sess_for_deletion(ea->fcport);
+  		break;
+  	}
+  }
+diff --cc drivers/scsi/qla2xxx/qla_iocb.c
+index 347a91c0bc3a,2b675da34bda..000000000000
+--- a/drivers/scsi/qla2xxx/qla_iocb.c
++++ b/drivers/scsi/qla2xxx/qla_iocb.c
+@@@ -2855,14 -2755,102 +2855,108 @@@ qla2x00_els_dcmd2_sp_done(void *ptr, in
+  	if (sp->flags & SRB_WAKEUP_ON_COMP)
+  		complete(&lio->u.els_plogi.comp);
+  	else {
+ -		switch (fw_status[0]) {
+ -		case CS_DATA_UNDERRUN:
+ -		case CS_COMPLETE:
+ +		if (res) {
+ +			set_bit(RELOGIN_NEEDED, &vha->dpc_flags);
+ +		} else {
+  			memset(&ea, 0, sizeof(ea));
+  			ea.fcport = fcport;
+++<<<<<<< HEAD
+ +			ea.rc = res;
+ +			ea.event = FCME_ELS_PLOGI_DONE;
+ +			qla2x00_fcport_event_handler(vha, &ea);
+++=======
++ 			ea.data[0] = MBS_COMMAND_COMPLETE;
++ 			ea.sp = sp;
++ 			qla24xx_handle_plogi_done_event(vha, &ea);
++ 			break;
++ 
++ 		case CS_IOCB_ERROR:
++ 			switch (fw_status[1]) {
++ 			case LSC_SCODE_PORTID_USED:
++ 				lid = fw_status[2] & 0xffff;
++ 				qlt_find_sess_invalidate_other(vha,
++ 				    wwn_to_u64(fcport->port_name),
++ 				    fcport->d_id, lid, &conflict_fcport);
++ 				if (conflict_fcport) {
++ 					/*
++ 					 * Another fcport shares the same
++ 					 * loop_id & nport id; conflict
++ 					 * fcport needs to finish cleanup
++ 					 * before this fcport can proceed
++ 					 * to login.
++ 					 */
++ 					conflict_fcport->conflict = fcport;
++ 					fcport->login_pause = 1;
++ 					ql_dbg(ql_dbg_disc, vha, 0x20ed,
++ 					    "%s %d %8phC pid %06x inuse with lid %#x post gidpn\n",
++ 					    __func__, __LINE__,
++ 					    fcport->port_name,
++ 					    fcport->d_id.b24, lid);
++ 				} else {
++ 					ql_dbg(ql_dbg_disc, vha, 0x20ed,
++ 					    "%s %d %8phC pid %06x inuse with lid %#x sched del\n",
++ 					    __func__, __LINE__,
++ 					    fcport->port_name,
++ 					    fcport->d_id.b24, lid);
++ 					qla2x00_clear_loop_id(fcport);
++ 					set_bit(lid, vha->hw->loop_id_map);
++ 					fcport->loop_id = lid;
++ 					fcport->keep_nport_handle = 0;
++ 					qlt_schedule_sess_for_deletion(fcport);
++ 				}
++ 				break;
++ 
++ 			case LSC_SCODE_NPORT_USED:
++ 				cid.b.domain = (fw_status[2] >> 16) & 0xff;
++ 				cid.b.area   = (fw_status[2] >>  8) & 0xff;
++ 				cid.b.al_pa  = fw_status[2] & 0xff;
++ 				cid.b.rsvd_1 = 0;
++ 
++ 				ql_dbg(ql_dbg_disc, vha, 0x20ec,
++ 				    "%s %d %8phC lid %#x in use with pid %06x post gnl\n",
++ 				    __func__, __LINE__, fcport->port_name,
++ 				    fcport->loop_id, cid.b24);
++ 				set_bit(fcport->loop_id,
++ 				    vha->hw->loop_id_map);
++ 				fcport->loop_id = FC_NO_LOOP_ID;
++ 				qla24xx_post_gnl_work(vha, fcport);
++ 				break;
++ 
++ 			case LSC_SCODE_NOXCB:
++ 				vha->hw->exch_starvation++;
++ 				if (vha->hw->exch_starvation > 5) {
++ 					ql_log(ql_log_warn, vha, 0xd046,
++ 					    "Exchange starvation. Resetting RISC\n");
++ 					vha->hw->exch_starvation = 0;
++ 					set_bit(ISP_ABORT_NEEDED,
++ 					    &vha->dpc_flags);
++ 					qla2xxx_wake_dpc(vha);
++ 				}
++ 				/* fall through */
++ 			default:
++ 				ql_dbg(ql_dbg_disc, vha, 0x20eb,
++ 				    "%s %8phC cmd error fw_status 0x%x 0x%x 0x%x\n",
++ 				    __func__, sp->fcport->port_name,
++ 				    fw_status[0], fw_status[1], fw_status[2]);
++ 
++ 				fcport->flags &= ~FCF_ASYNC_SENT;
++ 				fcport->disc_state = DSC_LOGIN_FAILED;
++ 				set_bit(RELOGIN_NEEDED, &vha->dpc_flags);
++ 				break;
++ 			}
++ 			break;
++ 
++ 		default:
++ 			ql_dbg(ql_dbg_disc, vha, 0x20eb,
++ 			    "%s %8phC cmd error 2 fw_status 0x%x 0x%x 0x%x\n",
++ 			    __func__, sp->fcport->port_name,
++ 			    fw_status[0], fw_status[1], fw_status[2]);
++ 
++ 			sp->fcport->flags &= ~FCF_ASYNC_SENT;
++ 			sp->fcport->disc_state = DSC_LOGIN_FAILED;
++ 			set_bit(RELOGIN_NEEDED, &vha->dpc_flags);
++ 			break;
+++>>>>>>> 983f127603fa (scsi: qla2xxx: Retry PLOGI on FC-NVMe PRLI failure)
+  		}
+  
+  		e = qla2x00_alloc_work(vha, QLA_EVT_UNMAP);
+* Unmerged path drivers/scsi/qla2xxx/qla_init.c
+* Unmerged path drivers/scsi/qla2xxx/qla_iocb.c
