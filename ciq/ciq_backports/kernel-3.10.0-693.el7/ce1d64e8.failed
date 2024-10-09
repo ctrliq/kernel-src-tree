@@ -1,0 +1,204 @@
+dm cache policy smq: allow demotions to happen even during continuous IO
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Joe Thornber <ejt@redhat.com>
+commit ce1d64e84dbea98d41deaf5db0fe91fd729ad2cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/ce1d64e8.failed
+
+dm-cache's smq policy tries hard to do it's work during the idle periods
+when there is no IO.  But if there are no idle periods (eg, a long fio
+run) we still need to allow some demotions and promotions to occur.
+
+To achieve this, pass @idle=true to queue_promotion()'s
+free_target_met() call so that free_target_met() doesn't short-circuit
+the possibility of demotion simply because it isn't an idle period.
+
+Fixes: b29d4986d0 ("dm cache: significant rework to leverage dm-bio-prison-v2")
+	Reported-by: John Harrigan <jharriga@redhat.com>
+	Signed-off-by: Joe Thornber <ejt@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit ce1d64e84dbea98d41deaf5db0fe91fd729ad2cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-cache-policy-smq.c
+diff --cc drivers/md/dm-cache-policy-smq.c
+index c33f4a6e1d7d,d13d9edf8dfe..000000000000
+--- a/drivers/md/dm-cache-policy-smq.c
++++ b/drivers/md/dm-cache-policy-smq.c
+@@@ -1095,34 -1101,146 +1095,146 @@@ static void end_cache_period(struct smq
+  	}
+  }
+  
+ -/*----------------------------------------------------------------*/
+ -
+ -/*
+ - * Targets are given as a percentage.
+ - */
+ -#define CLEAN_TARGET 25u
+ -#define FREE_TARGET 25u
+ -
+ -static unsigned percent_to_target(struct smq_policy *mq, unsigned p)
+ +static int demote_cblock(struct smq_policy *mq,
+ +			 struct policy_locker *locker,
+ +			 dm_oblock_t *oblock)
+  {
+ -	return from_cblock(mq->cache_size) * p / 100u;
+ -}
+ -
+ -static bool clean_target_met(struct smq_policy *mq, bool idle)
+ -{
+ -	/*
+ -	 * Cache entries may not be populated.  So we cannot rely on the
+ -	 * size of the clean queue.
+ -	 */
+ -	unsigned nr_clean = from_cblock(mq->cache_size) - q_size(&mq->dirty);
+ +	struct entry *demoted = q_peek(&mq->clean, mq->clean.nr_levels, false);
+ +	if (!demoted)
+ +		/*
+ +		 * We could get a block from mq->dirty, but that
+ +		 * would add extra latency to the triggering bio as it
+ +		 * waits for the writeback.  Better to not promote this
+ +		 * time and hope there's a clean block next time this block
+ +		 * is hit.
+ +		 */
+ +		return -ENOSPC;
+  
+ -	if (idle)
+ +	if (locker->fn(locker, demoted->oblock))
+  		/*
+ -		 * We'd like to clean everything.
+ +		 * We couldn't lock this block.
+  		 */
+ -		return q_size(&mq->dirty) == 0u;
+ -	else
+ -		return (nr_clean + btracker_nr_writebacks_queued(mq->bg_work)) >=
+ -		       percent_to_target(mq, CLEAN_TARGET);
+ +		return -EBUSY;
+ +
+ +	del(mq, demoted);
+ +	*oblock = demoted->oblock;
+ +	free_entry(&mq->cache_alloc, demoted);
+ +
+ +	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool free_target_met(struct smq_policy *mq, bool idle)
++ {
++ 	unsigned nr_free = from_cblock(mq->cache_size) -
++ 			   mq->cache_alloc.nr_allocated;
++ 
++ 	if (idle)
++ 		return (nr_free + btracker_nr_demotions_queued(mq->bg_work)) >=
++ 		       percent_to_target(mq, FREE_TARGET);
++ 	else
++ 		return true;
++ }
++ 
++ /*----------------------------------------------------------------*/
++ 
++ static void mark_pending(struct smq_policy *mq, struct entry *e)
++ {
++ 	BUG_ON(e->sentinel);
++ 	BUG_ON(!e->allocated);
++ 	BUG_ON(e->pending_work);
++ 	e->pending_work = true;
++ }
++ 
++ static void clear_pending(struct smq_policy *mq, struct entry *e)
++ {
++ 	BUG_ON(!e->pending_work);
++ 	e->pending_work = false;
++ }
++ 
++ static void queue_writeback(struct smq_policy *mq)
++ {
++ 	int r;
++ 	struct policy_work work;
++ 	struct entry *e;
++ 
++ 	e = q_peek(&mq->dirty, mq->dirty.nr_levels, !mq->migrations_allowed);
++ 	if (e) {
++ 		mark_pending(mq, e);
++ 		q_del(&mq->dirty, e);
++ 
++ 		work.op = POLICY_WRITEBACK;
++ 		work.oblock = e->oblock;
++ 		work.cblock = infer_cblock(mq, e);
++ 
++ 		r = btracker_queue(mq->bg_work, &work, NULL);
++ 		WARN_ON_ONCE(r); // FIXME: finish, I think we have to get rid of this race.
++ 	}
++ }
++ 
++ static void queue_demotion(struct smq_policy *mq)
++ {
++ 	struct policy_work work;
++ 	struct entry *e;
++ 
++ 	if (unlikely(WARN_ON_ONCE(!mq->migrations_allowed)))
++ 		return;
++ 
++ 	e = q_peek(&mq->clean, mq->clean.nr_levels, true);
++ 	if (!e) {
++ 		if (!clean_target_met(mq, false))
++ 			queue_writeback(mq);
++ 		return;
++ 	}
++ 
++ 	mark_pending(mq, e);
++ 	q_del(&mq->clean, e);
++ 
++ 	work.op = POLICY_DEMOTE;
++ 	work.oblock = e->oblock;
++ 	work.cblock = infer_cblock(mq, e);
++ 	btracker_queue(mq->bg_work, &work, NULL);
++ }
++ 
++ static void queue_promotion(struct smq_policy *mq, dm_oblock_t oblock,
++ 			    struct policy_work **workp)
++ {
++ 	struct entry *e;
++ 	struct policy_work work;
++ 
++ 	if (!mq->migrations_allowed)
++ 		return;
++ 
++ 	if (allocator_empty(&mq->cache_alloc)) {
++ 		/*
++ 		 * We always claim to be 'idle' to ensure some demotions happen
++ 		 * with continuous loads.
++ 		 */
++ 		if (!free_target_met(mq, true))
++ 			queue_demotion(mq);
++ 		return;
++ 	}
++ 
++ 	if (btracker_promotion_already_present(mq->bg_work, oblock))
++ 		return;
++ 
++ 	/*
++ 	 * We allocate the entry now to reserve the cblock.  If the
++ 	 * background work is aborted we must remember to free it.
++ 	 */
++ 	e = alloc_entry(&mq->cache_alloc);
++ 	BUG_ON(!e);
++ 	e->pending_work = true;
++ 	work.op = POLICY_PROMOTE;
++ 	work.oblock = oblock;
++ 	work.cblock = infer_cblock(mq, e);
++ 	btracker_queue(mq->bg_work, &work, workp);
++ }
++ 
++ /*----------------------------------------------------------------*/
++ 
+++>>>>>>> ce1d64e84dbe (dm cache policy smq: allow demotions to happen even during continuous IO)
+  enum promote_result {
+  	PROMOTE_NOT,
+  	PROMOTE_TEMPORARY,
+* Unmerged path drivers/md/dm-cache-policy-smq.c
