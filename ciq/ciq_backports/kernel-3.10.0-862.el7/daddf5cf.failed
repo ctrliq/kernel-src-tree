@@ -1,0 +1,288 @@
+qla2xxx: Abort stale cmds on qla_tgt_wq when plogi arrives
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Alexei Potashnik <alexei@purestorage.com>
+commit daddf5cf9b5c68b81b2bb7133f1dd0fda4552d0b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/daddf5cf.failed
+
+cancel any commands from initiator's s_id that are still waiting
+on qla_tgt_wq when PLOGI arrives.
+
+	Cc: <stable@vger.kernel.org> # v3.18+
+	Signed-off-by: Alexei Potashnik <alexei@purestorage.com>
+	Acked-by: Quinn Tran <quinn.tran@qlogic.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@qlogic.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit daddf5cf9b5c68b81b2bb7133f1dd0fda4552d0b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_target.c
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 4e0d4c3c5146,0b08bebea538..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -2955,6 -3966,132 +2955,135 @@@ static int qlt_abort_task(struct scsi_q
+  	return __qlt_abort_task(vha, iocb, sess);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void qlt_logo_completion_handler(fc_port_t *fcport, int rc)
++ {
++ 	if (fcport->tgt_session) {
++ 		if (rc != MBS_COMMAND_COMPLETE) {
++ 			ql_dbg(ql_dbg_tgt_mgt, fcport->vha, 0xf088,
++ 				"%s: se_sess %p / sess %p from"
++ 				" port %8phC loop_id %#04x s_id %02x:%02x:%02x"
++ 				" LOGO failed: %#x\n",
++ 				__func__,
++ 				fcport->tgt_session->se_sess,
++ 				fcport->tgt_session,
++ 				fcport->port_name, fcport->loop_id,
++ 				fcport->d_id.b.domain, fcport->d_id.b.area,
++ 				fcport->d_id.b.al_pa, rc);
++ 		}
++ 
++ 		fcport->tgt_session->logout_completed = 1;
++ 	}
++ }
++ 
++ static void qlt_swap_imm_ntfy_iocb(struct imm_ntfy_from_isp *a,
++     struct imm_ntfy_from_isp *b)
++ {
++ 	struct imm_ntfy_from_isp tmp;
++ 	memcpy(&tmp, a, sizeof(struct imm_ntfy_from_isp));
++ 	memcpy(a, b, sizeof(struct imm_ntfy_from_isp));
++ 	memcpy(b, &tmp, sizeof(struct imm_ntfy_from_isp));
++ }
++ 
++ /*
++ * ha->hardware_lock supposed to be held on entry (to protect tgt->sess_list)
++ *
++ * Schedules sessions with matching port_id/loop_id but different wwn for
++ * deletion. Returns existing session with matching wwn if present.
++ * Null otherwise.
++ */
++ static struct qla_tgt_sess *
++ qlt_find_sess_invalidate_other(struct qla_tgt *tgt, uint64_t wwn,
++     port_id_t port_id, uint16_t loop_id)
++ {
++ 	struct qla_tgt_sess *sess = NULL, *other_sess;
++ 	uint64_t other_wwn;
++ 
++ 	list_for_each_entry(other_sess, &tgt->sess_list, sess_list_entry) {
++ 
++ 		other_wwn = wwn_to_u64(other_sess->port_name);
++ 
++ 		if (wwn == other_wwn) {
++ 			WARN_ON(sess);
++ 			sess = other_sess;
++ 			continue;
++ 		}
++ 
++ 		/* find other sess with nport_id collision */
++ 		if (port_id.b24 == other_sess->s_id.b24) {
++ 			if (loop_id != other_sess->loop_id) {
++ 				ql_dbg(ql_dbg_tgt_tmr, tgt->vha, 0x1000c,
++ 				    "Invalidating sess %p loop_id %d wwn %llx.\n",
++ 				    other_sess, other_sess->loop_id, other_wwn);
++ 
++ 				/*
++ 				 * logout_on_delete is set by default, but another
++ 				 * session that has the same s_id/loop_id combo
++ 				 * might have cleared it when requested this session
++ 				 * deletion, so don't touch it
++ 				 */
++ 				qlt_schedule_sess_for_deletion(other_sess, true);
++ 			} else {
++ 				/*
++ 				 * Another wwn used to have our s_id/loop_id
++ 				 * combo - kill the session, but don't log out
++ 				 */
++ 				sess->logout_on_delete = 0;
++ 				qlt_schedule_sess_for_deletion(other_sess,
++ 				    true);
++ 			}
++ 			continue;
++ 		}
++ 
++ 		/* find other sess with nport handle collision */
++ 		if (loop_id == other_sess->loop_id) {
++ 			ql_dbg(ql_dbg_tgt_tmr, tgt->vha, 0x1000d,
++ 			       "Invalidating sess %p loop_id %d wwn %llx.\n",
++ 			       other_sess, other_sess->loop_id, other_wwn);
++ 
++ 			/* Same loop_id but different s_id
++ 			 * Ok to kill and logout */
++ 			qlt_schedule_sess_for_deletion(other_sess, true);
++ 		}
++ 	}
++ 
++ 	return sess;
++ }
++ 
++ /* Abort any commands for this s_id waiting on qla_tgt_wq workqueue */
++ static int abort_cmds_for_s_id(struct scsi_qla_host *vha, port_id_t *s_id)
++ {
++ 	struct qla_tgt_sess_op *op;
++ 	struct qla_tgt_cmd *cmd;
++ 	uint32_t key;
++ 	int count = 0;
++ 
++ 	key = (((u32)s_id->b.domain << 16) |
++ 	       ((u32)s_id->b.area   <<  8) |
++ 	       ((u32)s_id->b.al_pa));
++ 
++ 	spin_lock(&vha->cmd_list_lock);
++ 	list_for_each_entry(op, &vha->qla_sess_op_cmd_list, cmd_list) {
++ 		uint32_t op_key = sid_to_key(op->atio.u.isp24.fcp_hdr.s_id);
++ 		if (op_key == key) {
++ 			op->aborted = true;
++ 			count++;
++ 		}
++ 	}
++ 	list_for_each_entry(cmd, &vha->qla_cmd_list, cmd_list) {
++ 		uint32_t cmd_key = sid_to_key(cmd->atio.u.isp24.fcp_hdr.s_id);
++ 		if (cmd_key == key) {
++ 			cmd->state = QLA_TGT_STATE_ABORTED;
++ 			count++;
++ 		}
++ 	}
++ 	spin_unlock(&vha->cmd_list_lock);
++ 
++ 	return count;
++ }
++ 
+++>>>>>>> daddf5cf9b5c (qla2xxx: Abort stale cmds on qla_tgt_wq when plogi arrives)
+  /*
+   * ha->hardware_lock supposed to be held on entry. Might drop it, then reaquire
+   */
+@@@ -2968,10 -4119,119 +3097,76 @@@ static int qlt_24xx_handle_els(struct s
+  	    "qla_target(%d): Port ID: 0x%3phC ELS opcode: 0x%02x\n",
+  	    vha->vp_idx, iocb->u.isp24.port_id, iocb->u.isp24.status_subcode);
+  
+ -	/* res = 1 means ack at the end of thread
+ -	 * res = 0 means ack async/later.
+ -	 */
+  	switch (iocb->u.isp24.status_subcode) {
+  	case ELS_PLOGI:
+++<<<<<<< HEAD
+ +	case ELS_FLOGI:
+++=======
++ 
++ 		/* Mark all stale commands in qla_tgt_wq for deletion */
++ 		abort_cmds_for_s_id(vha, &port_id);
++ 
++ 		if (wwn)
++ 			sess = qlt_find_sess_invalidate_other(tgt, wwn,
++ 			    port_id, loop_id);
++ 
++ 		if (!sess || IS_SW_RESV_ADDR(sess->s_id)) {
++ 			res = 1;
++ 			break;
++ 		}
++ 
++ 		if (sess->plogi_ack_needed) {
++ 			/*
++ 			 * Initiator sent another PLOGI before last PLOGI could
++ 			 * finish. Swap plogi iocbs and terminate old one
++ 			 * without acking, new one will get acked when session
++ 			 * deletion completes.
++ 			 */
++ 			ql_log(ql_log_warn, sess->vha, 0xf089,
++ 			    "sess %p received double plogi.\n", sess);
++ 
++ 			qlt_swap_imm_ntfy_iocb(iocb, &sess->tm_iocb);
++ 
++ 			qlt_send_term_imm_notif(vha, iocb, 1);
++ 
++ 			res = 0;
++ 			break;
++ 		}
++ 
++ 		res = 0;
++ 
++ 		/*
++ 		 * Save immediate Notif IOCB for Ack when sess is done
++ 		 * and being deleted.
++ 		 */
++ 		memcpy(&sess->tm_iocb, iocb, sizeof(sess->tm_iocb));
++ 		sess->plogi_ack_needed  = 1;
++ 
++ 		 /*
++ 		  * Under normal circumstances we want to release nport handle
++ 		  * during LOGO process to avoid nport handle leaks inside FW.
++ 		  * The exception is when LOGO is done while another PLOGI with
++ 		  * the same nport handle is waiting as might be the case here.
++ 		  * Note: there is always a possibily of a race where session
++ 		  * deletion has already started for other reasons (e.g. ACL
++ 		  * removal) and now PLOGI arrives:
++ 		  * 1. if PLOGI arrived in FW after nport handle has been freed,
++ 		  *    FW must have assigned this PLOGI a new/same handle and we
++ 		  *    can proceed ACK'ing it as usual when session deletion
++ 		  *    completes.
++ 		  * 2. if PLOGI arrived in FW before LOGO with LCF_FREE_NPORT
++ 		  *    bit reached it, the handle has now been released. We'll
++ 		  *    get an error when we ACK this PLOGI. Nothing will be sent
++ 		  *    back to initiator. Initiator should eventually retry
++ 		  *    PLOGI and situation will correct itself.
++ 		  */
++ 		sess->keep_nport_handle = ((sess->loop_id == loop_id) &&
++ 					   (sess->s_id.b24 == port_id.b24));
++ 		qlt_schedule_sess_for_deletion(sess, true);
++ 		break;
++ 
+++>>>>>>> daddf5cf9b5c (qla2xxx: Abort stale cmds on qla_tgt_wq when plogi arrives)
+  	case ELS_PRLI:
+ -		wd3_lo = le16_to_cpu(iocb->u.isp24.u.prli.wd3_lo);
+ -
+ -		if (wwn)
+ -			sess = qlt_find_sess_invalidate_other(tgt, wwn, port_id,
+ -			    loop_id);
+ -
+ -		if (sess != NULL) {
+ -			if (sess->deleted) {
+ -				/*
+ -				 * Impatient initiator sent PRLI before last
+ -				 * PLOGI could finish. Will force him to re-try,
+ -				 * while last one finishes.
+ -				 */
+ -				ql_log(ql_log_warn, sess->vha, 0xf090,
+ -				    "sess %p PRLI received, before plogi ack.\n",
+ -				    sess);
+ -				qlt_send_term_imm_notif(vha, iocb, 1);
+ -				res = 0;
+ -				break;
+ -			}
+ -
+ -			/*
+ -			 * This shouldn't happen under normal circumstances,
+ -			 * since we have deleted the old session during PLOGI
+ -			 */
+ -			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf091,
+ -			    "PRLI (loop_id %#04x) for existing sess %p (loop_id %#04x)\n",
+ -			    sess->loop_id, sess, iocb->u.isp24.nport_handle);
+ -
+ -			sess->local = 0;
+ -			sess->loop_id = loop_id;
+ -			sess->s_id = port_id;
+ -
+ -			if (wd3_lo & BIT_7)
+ -				sess->conf_compl_supported = 1;
+ -
+ -			res = 1;
+ -		} else {
+ -			/* todo: else - create sess here. */
+ -			res = 1; /* send notify ack */
+ -		}
+ -
+ -		break;
+ -
+  	case ELS_LOGO:
+  	case ELS_PRLO:
+  		res = qlt_reset(vha, iocb, QLA_TGT_NEXUS_LOSS_SESS);
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
