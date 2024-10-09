@@ -1,0 +1,512 @@
+nfp: bpf: add verification and codegen for map lookups
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 77a3d3113ba2aa5919af2335c05bf9505f4241db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/77a3d311.failed
+
+Verify our current constraints on the location of the key are
+met and generate the code for calling map lookup on the datapath.
+
+New relocation types have to be added - for helpers and return
+addresses.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 77a3d3113ba2aa5919af2335c05bf9505f4241db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/bpf/jit.c
+#	drivers/net/ethernet/netronome/nfp/bpf/main.h
+#	drivers/net/ethernet/netronome/nfp/bpf/verifier.c
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/jit.c
+index 2a38b8e187f7,77a5f35d7809..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/jit.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/jit.c
+@@@ -963,6 -1214,136 +978,139 @@@ static void wrp_end32(struct nfp_prog *
+  		      SHF_SC_R_ROT, 16);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int adjust_head(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
++ {
++ 	swreg tmp = imm_a(nfp_prog), tmp_len = imm_b(nfp_prog);
++ 	struct nfp_bpf_cap_adjust_head *adjust_head;
++ 	u32 ret_einval, end;
++ 
++ 	adjust_head = &nfp_prog->bpf->adjust_head;
++ 
++ 	/* Optimized version - 5 vs 14 cycles */
++ 	if (nfp_prog->adjust_head_location != UINT_MAX) {
++ 		if (WARN_ON_ONCE(nfp_prog->adjust_head_location != meta->n))
++ 			return -EINVAL;
++ 
++ 		emit_alu(nfp_prog, pptr_reg(nfp_prog),
++ 			 reg_a(2 * 2), ALU_OP_ADD, pptr_reg(nfp_prog));
++ 		emit_alu(nfp_prog, plen_reg(nfp_prog),
++ 			 plen_reg(nfp_prog), ALU_OP_SUB, reg_a(2 * 2));
++ 		emit_alu(nfp_prog, pv_len(nfp_prog),
++ 			 pv_len(nfp_prog), ALU_OP_SUB, reg_a(2 * 2));
++ 
++ 		wrp_immed(nfp_prog, reg_both(0), 0);
++ 		wrp_immed(nfp_prog, reg_both(1), 0);
++ 
++ 		/* TODO: when adjust head is guaranteed to succeed we can
++ 		 * also eliminate the following if (r0 == 0) branch.
++ 		 */
++ 
++ 		return 0;
++ 	}
++ 
++ 	ret_einval = nfp_prog_current_offset(nfp_prog) + 14;
++ 	end = ret_einval + 2;
++ 
++ 	/* We need to use a temp because offset is just a part of the pkt ptr */
++ 	emit_alu(nfp_prog, tmp,
++ 		 reg_a(2 * 2), ALU_OP_ADD_2B, pptr_reg(nfp_prog));
++ 
++ 	/* Validate result will fit within FW datapath constraints */
++ 	emit_alu(nfp_prog, reg_none(),
++ 		 tmp, ALU_OP_SUB, reg_imm(adjust_head->off_min));
++ 	emit_br(nfp_prog, BR_BLO, ret_einval, 0);
++ 	emit_alu(nfp_prog, reg_none(),
++ 		 reg_imm(adjust_head->off_max), ALU_OP_SUB, tmp);
++ 	emit_br(nfp_prog, BR_BLO, ret_einval, 0);
++ 
++ 	/* Validate the length is at least ETH_HLEN */
++ 	emit_alu(nfp_prog, tmp_len,
++ 		 plen_reg(nfp_prog), ALU_OP_SUB, reg_a(2 * 2));
++ 	emit_alu(nfp_prog, reg_none(),
++ 		 tmp_len, ALU_OP_SUB, reg_imm(ETH_HLEN));
++ 	emit_br(nfp_prog, BR_BMI, ret_einval, 0);
++ 
++ 	/* Load the ret code */
++ 	wrp_immed(nfp_prog, reg_both(0), 0);
++ 	wrp_immed(nfp_prog, reg_both(1), 0);
++ 
++ 	/* Modify the packet metadata */
++ 	emit_ld_field(nfp_prog, pptr_reg(nfp_prog), 0x3, tmp, SHF_SC_NONE, 0);
++ 
++ 	/* Skip over the -EINVAL ret code (defer 2) */
++ 	emit_br(nfp_prog, BR_UNC, end, 2);
++ 
++ 	emit_alu(nfp_prog, plen_reg(nfp_prog),
++ 		 plen_reg(nfp_prog), ALU_OP_SUB, reg_a(2 * 2));
++ 	emit_alu(nfp_prog, pv_len(nfp_prog),
++ 		 pv_len(nfp_prog), ALU_OP_SUB, reg_a(2 * 2));
++ 
++ 	/* return -EINVAL target */
++ 	if (!nfp_prog_confirm_current_offset(nfp_prog, ret_einval))
++ 		return -EINVAL;
++ 
++ 	wrp_immed(nfp_prog, reg_both(0), -22);
++ 	wrp_immed(nfp_prog, reg_both(1), ~0);
++ 
++ 	if (!nfp_prog_confirm_current_offset(nfp_prog, end))
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ 
++ static int
++ map_lookup_stack(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
++ {
++ 	struct bpf_offloaded_map *offmap;
++ 	struct nfp_bpf_map *nfp_map;
++ 	bool load_lm_ptr;
++ 	u32 ret_tgt;
++ 	s64 lm_off;
++ 	swreg tid;
++ 
++ 	offmap = (struct bpf_offloaded_map *)meta->arg1.map_ptr;
++ 	nfp_map = offmap->dev_priv;
++ 
++ 	/* We only have to reload LM0 if the key is not at start of stack */
++ 	lm_off = nfp_prog->stack_depth;
++ 	lm_off += meta->arg2.var_off.value + meta->arg2.off;
++ 	load_lm_ptr = meta->arg2_var_off || lm_off;
++ 
++ 	/* Set LM0 to start of key */
++ 	if (load_lm_ptr)
++ 		emit_csr_wr(nfp_prog, reg_b(2 * 2), NFP_CSR_ACT_LM_ADDR0);
++ 
++ 	/* Load map ID into a register, it should actually fit as an immediate
++ 	 * but in case it doesn't deal with it here, not in the delay slots.
++ 	 */
++ 	tid = ur_load_imm_any(nfp_prog, nfp_map->tid, imm_a(nfp_prog));
++ 
++ 	emit_br_relo(nfp_prog, BR_UNC, BR_OFF_RELO + BPF_FUNC_map_lookup_elem,
++ 		     2, RELO_BR_HELPER);
++ 	ret_tgt = nfp_prog_current_offset(nfp_prog) + 2;
++ 
++ 	/* Load map ID into A0 */
++ 	wrp_mov(nfp_prog, reg_a(0), tid);
++ 
++ 	/* Load the return address into B0 */
++ 	wrp_immed_relo(nfp_prog, reg_b(0), ret_tgt, RELO_IMMED_REL);
++ 
++ 	if (!nfp_prog_confirm_current_offset(nfp_prog, ret_tgt))
++ 		return -EINVAL;
++ 
++ 	/* Reset the LM0 pointer */
++ 	if (!load_lm_ptr)
++ 		return 0;
++ 
++ 	emit_csr_wr(nfp_prog, stack_reg(nfp_prog),  NFP_CSR_ACT_LM_ADDR0);
++ 	wrp_nops(nfp_prog, 3);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 77a3d3113ba2 (nfp: bpf: add verification and codegen for map lookups)
+  /* --- Callbacks --- */
+  static int mov_reg64(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
+  {
+@@@ -1722,6 -2121,10 +1870,13 @@@ static int jne_reg(struct nfp_prog *nfp
+  static int call(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
+  {
+  	switch (meta->insn.imm) {
+++<<<<<<< HEAD
+++=======
++ 	case BPF_FUNC_xdp_adjust_head:
++ 		return adjust_head(nfp_prog, meta);
++ 	case BPF_FUNC_map_lookup_elem:
++ 		return map_lookup_stack(nfp_prog, meta);
+++>>>>>>> 77a3d3113ba2 (nfp: bpf: add verification and codegen for map lookups)
+  	default:
+  		WARN_ONCE(1, "verifier allowed unsupported function\n");
+  		return -EOPNOTSUPP;
+@@@ -2575,3 -2824,93 +2730,96 @@@ out
+  
+  	return ret;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ void nfp_bpf_jit_prepare(struct nfp_prog *nfp_prog, unsigned int cnt)
++ {
++ 	struct nfp_insn_meta *meta;
++ 
++ 	/* Another pass to record jump information. */
++ 	list_for_each_entry(meta, &nfp_prog->insns, l) {
++ 		u64 code = meta->insn.code;
++ 
++ 		if (BPF_CLASS(code) == BPF_JMP && BPF_OP(code) != BPF_EXIT &&
++ 		    BPF_OP(code) != BPF_CALL) {
++ 			struct nfp_insn_meta *dst_meta;
++ 			unsigned short dst_indx;
++ 
++ 			dst_indx = meta->n + 1 + meta->insn.off;
++ 			dst_meta = nfp_bpf_goto_meta(nfp_prog, meta, dst_indx,
++ 						     cnt);
++ 
++ 			meta->jmp_dst = dst_meta;
++ 			dst_meta->flags |= FLAG_INSN_IS_JUMP_DST;
++ 		}
++ 	}
++ }
++ 
++ void *nfp_bpf_relo_for_vnic(struct nfp_prog *nfp_prog, struct nfp_bpf_vnic *bv)
++ {
++ 	unsigned int i;
++ 	u64 *prog;
++ 	int err;
++ 
++ 	prog = kmemdup(nfp_prog->prog, nfp_prog->prog_len * sizeof(u64),
++ 		       GFP_KERNEL);
++ 	if (!prog)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	for (i = 0; i < nfp_prog->prog_len; i++) {
++ 		enum nfp_relo_type special;
++ 		u32 val;
++ 
++ 		special = FIELD_GET(OP_RELO_TYPE, prog[i]);
++ 		switch (special) {
++ 		case RELO_NONE:
++ 			continue;
++ 		case RELO_BR_REL:
++ 			br_add_offset(&prog[i], bv->start_off);
++ 			break;
++ 		case RELO_BR_GO_OUT:
++ 			br_set_offset(&prog[i],
++ 				      nfp_prog->tgt_out + bv->start_off);
++ 			break;
++ 		case RELO_BR_GO_ABORT:
++ 			br_set_offset(&prog[i],
++ 				      nfp_prog->tgt_abort + bv->start_off);
++ 			break;
++ 		case RELO_BR_NEXT_PKT:
++ 			br_set_offset(&prog[i], bv->tgt_done);
++ 			break;
++ 		case RELO_BR_HELPER:
++ 			val = br_get_offset(prog[i]);
++ 			val -= BR_OFF_RELO;
++ 			switch (val) {
++ 			case BPF_FUNC_map_lookup_elem:
++ 				val = nfp_prog->bpf->helpers.map_lookup;
++ 				break;
++ 			default:
++ 				pr_err("relocation of unknown helper %d\n",
++ 				       val);
++ 				err = -EINVAL;
++ 				goto err_free_prog;
++ 			}
++ 			br_set_offset(&prog[i], val);
++ 			break;
++ 		case RELO_IMMED_REL:
++ 			immed_add_value(&prog[i], bv->start_off);
++ 			break;
++ 		}
++ 
++ 		prog[i] &= ~OP_RELO_TYPE;
++ 	}
++ 
++ 	err = nfp_bpf_ustore_calc(prog, nfp_prog->prog_len);
++ 	if (err)
++ 		goto err_free_prog;
++ 
++ 	return prog;
++ 
++ err_free_prog:
++ 	kfree(prog);
++ 	return ERR_PTR(err);
++ }
+++>>>>>>> 77a3d3113ba2 (nfp: bpf: add verification and codegen for map lookups)
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 5212b54abaf7,59197535c465..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@@ -37,22 -37,40 +37,37 @@@
+  #include <linux/bitfield.h>
+  #include <linux/bpf.h>
+  #include <linux/bpf_verifier.h>
+ -#include <linux/kernel.h>
+  #include <linux/list.h>
+ -#include <linux/skbuff.h>
+  #include <linux/types.h>
+ -#include <linux/wait.h>
+  
+  #include "../nfp_asm.h"
+ -#include "fw.h"
+  
+ -/* For relocation logic use up-most byte of branch instruction as scratch
+ +/* For branch fixup logic use up-most byte of branch instruction as scratch
+   * area.  Remember to clear this before sending instructions to HW!
+   */
+ -#define OP_RELO_TYPE	0xff00000000000000ULL
+ -
+ +#define OP_BR_SPECIAL	0xff00000000000000ULL
+ +
+++<<<<<<< HEAD
+ +enum br_special {
+ +	OP_BR_NORMAL = 0,
+ +	OP_BR_GO_OUT,
+ +	OP_BR_GO_ABORT,
+++=======
++ enum nfp_relo_type {
++ 	RELO_NONE = 0,
++ 	/* standard internal jumps */
++ 	RELO_BR_REL,
++ 	/* internal jumps to parts of the outro */
++ 	RELO_BR_GO_OUT,
++ 	RELO_BR_GO_ABORT,
++ 	/* external jumps to fixed addresses */
++ 	RELO_BR_NEXT_PKT,
++ 	RELO_BR_HELPER,
++ 	/* immediate relocation against load address */
++ 	RELO_IMMED_REL,
+++>>>>>>> 77a3d3113ba2 (nfp: bpf: add verification and codegen for map lookups)
+  };
+  
+ -/* To make absolute relocated branches (branches other than RELO_BR_REL)
+ - * distinguishable in user space dumps from normal jumps, add a large offset
+ - * to them.
+ - */
+ -#define BR_OFF_RELO		15000
+ -
+  enum static_regs {
+  	STATIC_REG_IMM		= 21, /* Bank AB */
+  	STATIC_REG_STACK	= 22, /* Bank A */
+@@@ -100,17 -192,41 +115,46 @@@ typedef int (*instr_cb_t)(struct nfp_pr
+   * struct nfp_insn_meta - BPF instruction wrapper
+   * @insn: BPF instruction
+   * @ptr: pointer type for memory operations
+++<<<<<<< HEAD
+++=======
++  * @ldst_gather_len: memcpy length gathered from load/store sequence
++  * @paired_st: the paired store insn at the head of the sequence
++  * @ptr_not_const: pointer is not always constant
++  * @jmp_dst: destination info for jump instructions
++  * @func_id: function id for call instructions
++  * @arg1: arg1 for call instructions
++  * @arg2: arg2 for call instructions
++  * @arg2_var_off: arg2 changes stack offset on different paths
+++>>>>>>> 77a3d3113ba2 (nfp: bpf: add verification and codegen for map lookups)
+   * @off: index of first generated machine instruction (in nfp_prog.prog)
+   * @n: eBPF instruction number
+ - * @flags: eBPF instruction extra optimization flags
+   * @skip: skip this instruction (optimized out)
+   * @double_cb: callback for second part of the instruction
+   * @l: link on nfp_prog->insns list
+   */
+  struct nfp_insn_meta {
+  	struct bpf_insn insn;
+++<<<<<<< HEAD
+ +	struct bpf_reg_state ptr;
+++=======
++ 	union {
++ 		struct {
++ 			struct bpf_reg_state ptr;
++ 			struct bpf_insn *paired_st;
++ 			s16 ldst_gather_len;
++ 			bool ptr_not_const;
++ 		};
++ 		struct nfp_insn_meta *jmp_dst;
++ 		struct {
++ 			u32 func_id;
++ 			struct bpf_reg_state arg1;
++ 			struct bpf_reg_state arg2;
++ 			bool arg2_var_off;
++ 		};
++ 	};
+++>>>>>>> 77a3d3113ba2 (nfp: bpf: add verification and codegen for map lookups)
+  	unsigned int off;
+  	unsigned short n;
+ -	unsigned short flags;
+  	bool skip;
+  	instr_cb_t double_cb;
+  
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/verifier.c
+index 0f4ae869a0f1,f867577cc315..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
+@@@ -74,17 -70,109 +74,81 @@@ nfp_bpf_goto_meta(struct nfp_prog *nfp_
+  	return meta;
+  }
+  
+ -static void
+ -nfp_record_adjust_head(struct nfp_app_bpf *bpf, struct nfp_prog *nfp_prog,
+ -		       struct nfp_insn_meta *meta,
+ -		       const struct bpf_reg_state *reg2)
+ -{
+ -	unsigned int location =	UINT_MAX;
+ -	int imm;
+ -
+ -	/* Datapath usually can give us guarantees on how much adjust head
+ -	 * can be done without the need for any checks.  Optimize the simple
+ -	 * case where there is only one adjust head by a constant.
+ -	 */
+ -	if (reg2->type != SCALAR_VALUE || !tnum_is_const(reg2->var_off))
+ -		goto exit_set_location;
+ -	imm = reg2->var_off.value;
+ -	/* Translator will skip all checks, we need to guarantee min pkt len */
+ -	if (imm > ETH_ZLEN - ETH_HLEN)
+ -		goto exit_set_location;
+ -	if (imm > (int)bpf->adjust_head.guaranteed_add ||
+ -	    imm < -bpf->adjust_head.guaranteed_sub)
+ -		goto exit_set_location;
+ -
+ -	if (nfp_prog->adjust_head_location) {
+ -		/* Only one call per program allowed */
+ -		if (nfp_prog->adjust_head_location != meta->n)
+ -			goto exit_set_location;
+ -
+ -		if (meta->arg2.var_off.value != imm)
+ -			goto exit_set_location;
+ -	}
+ -
+ -	location = meta->n;
+ -exit_set_location:
+ -	nfp_prog->adjust_head_location = location;
+ -}
+ -
+  static int
+ -nfp_bpf_check_call(struct nfp_prog *nfp_prog, struct bpf_verifier_env *env,
+ -		   struct nfp_insn_meta *meta)
+ +nfp_bpf_check_call(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta)
+  {
+++<<<<<<< HEAD
+++=======
++ 	const struct bpf_reg_state *reg1 = cur_regs(env) + BPF_REG_1;
++ 	const struct bpf_reg_state *reg2 = cur_regs(env) + BPF_REG_2;
++ 	struct nfp_app_bpf *bpf = nfp_prog->bpf;
+++>>>>>>> 77a3d3113ba2 (nfp: bpf: add verification and codegen for map lookups)
+  	u32 func_id = meta->insn.imm;
++ 	s64 off, old_off;
+  
+  	switch (func_id) {
+++<<<<<<< HEAD
+++=======
++ 	case BPF_FUNC_xdp_adjust_head:
++ 		if (!bpf->adjust_head.off_max) {
++ 			pr_vlog(env, "adjust_head not supported by FW\n");
++ 			return -EOPNOTSUPP;
++ 		}
++ 		if (!(bpf->adjust_head.flags & NFP_BPF_ADJUST_HEAD_NO_META)) {
++ 			pr_vlog(env, "adjust_head: FW requires shifting metadata, not supported by the driver\n");
++ 			return -EOPNOTSUPP;
++ 		}
++ 
++ 		nfp_record_adjust_head(bpf, nfp_prog, meta, reg2);
++ 		break;
++ 
++ 	case BPF_FUNC_map_lookup_elem:
++ 		if (!bpf->helpers.map_lookup) {
++ 			pr_info("map_lookup: not supported by FW\n");
++ 			return -EOPNOTSUPP;
++ 		}
++ 		if (reg2->type != PTR_TO_STACK) {
++ 			pr_info("map_lookup: unsupported key ptr type %d\n",
++ 				reg2->type);
++ 			return -EOPNOTSUPP;
++ 		}
++ 		if (!tnum_is_const(reg2->var_off)) {
++ 			pr_info("map_lookup: variable key pointer\n");
++ 			return -EOPNOTSUPP;
++ 		}
++ 
++ 		off = reg2->var_off.value + reg2->off;
++ 		if (-off % 4) {
++ 			pr_info("map_lookup: unaligned stack pointer %lld\n",
++ 				-off);
++ 			return -EOPNOTSUPP;
++ 		}
++ 
++ 		/* Rest of the checks is only if we re-parse the same insn */
++ 		if (!meta->func_id)
++ 			break;
++ 
++ 		old_off = meta->arg2.var_off.value + meta->arg2.off;
++ 		meta->arg2_var_off |= off != old_off;
++ 
++ 		if (meta->arg1.map_ptr != reg1->map_ptr) {
++ 			pr_info("map_lookup: called for different map\n");
++ 			return -EOPNOTSUPP;
++ 		}
++ 		break;
+++>>>>>>> 77a3d3113ba2 (nfp: bpf: add verification and codegen for map lookups)
+  	default:
+ -		pr_vlog(env, "unsupported function id: %d\n", func_id);
+ +		pr_warn("unsupported function id: %d\n", func_id);
+  		return -EOPNOTSUPP;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	meta->func_id = func_id;
++ 	meta->arg1 = *reg1;
++ 	meta->arg2 = *reg2;
++ 
+++>>>>>>> 77a3d3113ba2 (nfp: bpf: add verification and codegen for map lookups)
+  	return 0;
+  }
+  
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/jit.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/main.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/verifier.c
