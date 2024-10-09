@@ -1,0 +1,121 @@
+perf bpf: Don't warn about unavailability of builtin clang, just fallback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit 872523233d640c21ce13ea51269c5c031ebb2f78
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/87252323.failed
+
+When clang is not linked with 'perf' we should just add a debug message
+about that before doing the fallback to calling the external compiler.
+
+I.e. just the "-95" warning below gets turned into a debug message:
+
+  # cat sys_enter_open.c
+  #include "bpf.h"
+
+  SEC("syscalls:sys_enter_open")
+  int func(void *ctx)
+  {
+	struct {
+		char *ptr;
+		char path[256];
+	} filename = {
+		.ptr = *((char **)(ctx + 16)),
+	};
+	int len = bpf_probe_read_str(filename.path, sizeof(filename.path), filename.ptr);
+	if (len > 0) {
+		if (len == 1)
+			perf_event_output(ctx, &__bpf_stdout__, BPF_F_CURRENT_CPU, &filename, len + sizeof(filename.ptr));
+		else if (len < 256)
+			perf_event_output(ctx, &__bpf_stdout__, BPF_F_CURRENT_CPU, &filename, len + sizeof(filename.ptr));
+        }
+	return 0;
+  }
+  # trace -e open,sys_enter_open.c
+  bpf: builtin compilation failed: -95, try external compiler
+     0.000 (         ): __bpf_stdout__:@......./proc/self/task/11160/comm..)
+     0.014 ( 0.116 ms): qemu-system-x8/6721 open(filename: /proc/self/task/11160/comm, flags: RDWR) = 91
+  2335.411 (         ): __bpf_stdout__:FB..~.../etc/resolv.conf....)
+  2335.421 ( 0.030 ms): chronyd/883 open(filename: /etc/resolv.conf, flags: CLOEXEC) = 5
+^C#
+
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Wang Nan <wangnan0@huawei.com>
+Link: https://lkml.kernel.org/n/tip-z5aak9oay448ffj37giz94yr@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 872523233d640c21ce13ea51269c5c031ebb2f78)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/bpf-loader.c
+diff --cc tools/perf/util/bpf-loader.c
+index 39bf9252ae96,ab2598af91eb..000000000000
+--- a/tools/perf/util/bpf-loader.c
++++ b/tools/perf/util/bpf-loader.c
+@@@ -39,10 -65,53 +39,58 @@@ struct bpf_object *bpf__prepare_load(co
+  		libbpf_initialized = true;
+  	}
+  
+++<<<<<<< HEAD
+ +	obj = bpf_object__open(filename);
+ +	if (!obj) {
+++=======
++ 	obj = bpf_object__open_buffer(obj_buf, obj_buf_sz, name);
++ 	if (IS_ERR(obj)) {
++ 		pr_debug("bpf: failed to load buffer\n");
++ 		return ERR_PTR(-EINVAL);
++ 	}
++ 
++ 	return obj;
++ }
++ 
++ struct bpf_object *bpf__prepare_load(const char *filename, bool source)
++ {
++ 	struct bpf_object *obj;
++ 
++ 	if (!libbpf_initialized) {
++ 		libbpf_set_print(libbpf_warning,
++ 				 libbpf_info,
++ 				 libbpf_debug);
++ 		libbpf_initialized = true;
++ 	}
++ 
++ 	if (source) {
++ 		int err;
++ 		void *obj_buf;
++ 		size_t obj_buf_sz;
++ 
++ 		perf_clang__init();
++ 		err = perf_clang__compile_bpf(filename, &obj_buf, &obj_buf_sz);
++ 		perf_clang__cleanup();
++ 		if (err) {
++ 			pr_debug("bpf: builtin compilation failed: %d, try external compiler\n", err);
++ 			err = llvm__compile_bpf(filename, &obj_buf, &obj_buf_sz);
++ 			if (err)
++ 				return ERR_PTR(-BPF_LOADER_ERRNO__COMPILE);
++ 		} else
++ 			pr_debug("bpf: successfull builtin compilation\n");
++ 		obj = bpf_object__open_buffer(obj_buf, obj_buf_sz, filename);
++ 
++ 		if (!IS_ERR(obj) && llvm_param.dump_obj)
++ 			llvm__dump_obj(filename, obj_buf, obj_buf_sz);
++ 
++ 		free(obj_buf);
++ 	} else
++ 		obj = bpf_object__open(filename);
++ 
++ 	if (IS_ERR(obj)) {
+++>>>>>>> 872523233d64 (perf bpf: Don't warn about unavailability of builtin clang, just fallback)
+  		pr_debug("bpf: failed to load %s\n", filename);
+ -		return obj;
+ +		return ERR_PTR(-EINVAL);
+  	}
+  
+  	return obj;
+* Unmerged path tools/perf/util/bpf-loader.c
