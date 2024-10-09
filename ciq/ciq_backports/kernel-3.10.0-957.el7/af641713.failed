@@ -1,0 +1,157 @@
+mlxsw: spectrum_router: Onload conflicting tunnels
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Petr Machata <petrm@mellanox.com>
+commit af641713e97da4126439c3fb1dee031f7e497654
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/af641713.failed
+
+The approach for offloading IP tunnels implemented currently by mlxsw
+doesn't allow two tunnels that have the same local IP address in the
+same (underlay) VRF. Previously, offloads were introduced on demand as
+encap routes were formed. When such a route was created that would cause
+offload of a conflicting tunnel, mlxsw_sp_ipip_entry_create() would
+detect it and return -EEXIST, which would propagate up and cause FIB
+abort.
+
+Now however IPIP entries are created as soon as an offloadable netdevice
+is created, and the failure prevents creation of such device.
+Furthermore, if the driver is installed at the point where such
+conflicting tunnels exist, the failure actually prevents successful
+modprobe.
+
+Furthermore, follow-up patches implement handling of NETDEV_CHANGE due
+to the local address change. However, NETDEV_CHANGE can't be vetoed. The
+failure merely means that the offloads weren't updated, but the change
+in Linux configuration is not rolled back. It is thus desirable to have
+a robust way of handling these conflicts, which can later be reused for
+handling NETDEV_CHANGE as well.
+
+To fix this, when a conflicting tunnel is created, instead of failing,
+simply pull the old tunnel to slow path and reject offloading the
+new one.
+
+Introduce two functions: mlxsw_sp_ipip_entry_demote_tunnel() and
+mlxsw_sp_ipip_demote_tunnel_by_saddr() to handle this. Make them both
+public, because they will be useful later on in this patchset.
+
+	Signed-off-by: Petr Machata <petrm@mellanox.com>
+	Reviewed-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit af641713e97da4126439c3fb1dee031f7e497654)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+index 782f252be995,832bfa125512..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+@@@ -1387,12 -1421,65 +1380,70 @@@ static int mlxsw_sp_netdevice_ipip_ol_v
+  	return 0;
+  }
+  
+ -static int mlxsw_sp_netdevice_ipip_ol_vrf_event(struct mlxsw_sp *mlxsw_sp,
+ -						struct net_device *ol_dev,
+ -						struct netlink_ext_ack *extack)
+ +int
+ +mlxsw_sp_netdevice_ipip_ol_event(struct mlxsw_sp *mlxsw_sp,
+ +				 struct net_device *ol_dev,
+ +				 unsigned long event,
+ +				 struct netdev_notifier_changeupper_info *info)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct mlxsw_sp_ipip_entry *ipip_entry =
++ 		mlxsw_sp_ipip_entry_find_by_ol_dev(mlxsw_sp, ol_dev);
++ 
++ 	if (!ipip_entry)
++ 		return 0;
++ 	return __mlxsw_sp_ipip_entry_update_tunnel(mlxsw_sp, ipip_entry,
++ 						   true, false, false, extack);
++ }
++ 
++ void mlxsw_sp_ipip_entry_demote_tunnel(struct mlxsw_sp *mlxsw_sp,
++ 				       struct mlxsw_sp_ipip_entry *ipip_entry)
++ {
++ 	struct net_device *ol_dev = ipip_entry->ol_dev;
++ 
++ 	if (ol_dev->flags & IFF_UP)
++ 		mlxsw_sp_ipip_entry_ol_down_event(mlxsw_sp, ipip_entry);
++ 	mlxsw_sp_ipip_entry_destroy(mlxsw_sp, ipip_entry);
++ }
++ 
++ /* The configuration where several tunnels have the same local address in the
++  * same underlay table needs special treatment in the HW. That is currently not
++  * implemented in the driver. This function finds and demotes the first tunnel
++  * with a given source address, except the one passed in in the argument
++  * `except'.
++  */
++ bool
++ mlxsw_sp_ipip_demote_tunnel_by_saddr(struct mlxsw_sp *mlxsw_sp,
++ 				     enum mlxsw_sp_l3proto ul_proto,
++ 				     union mlxsw_sp_l3addr saddr,
++ 				     u32 ul_tb_id,
++ 				     const struct mlxsw_sp_ipip_entry *except)
++ {
++ 	struct mlxsw_sp_ipip_entry *ipip_entry, *tmp;
++ 
++ 	list_for_each_entry_safe(ipip_entry, tmp, &mlxsw_sp->router->ipip_list,
++ 				 ipip_list_node) {
++ 		if (ipip_entry != except &&
++ 		    mlxsw_sp_ipip_entry_saddr_matches(mlxsw_sp, ul_proto, saddr,
++ 						      ul_tb_id, ipip_entry)) {
++ 			mlxsw_sp_ipip_entry_demote_tunnel(mlxsw_sp, ipip_entry);
++ 			return true;
++ 		}
++ 	}
++ 
++ 	return false;
++ }
++ 
++ int mlxsw_sp_netdevice_ipip_ol_event(struct mlxsw_sp *mlxsw_sp,
++ 				     struct net_device *ol_dev,
++ 				     unsigned long event,
++ 				     struct netdev_notifier_info *info)
++ {
++ 	struct netdev_notifier_changeupper_info *chup;
++ 	struct netlink_ext_ack *extack;
++ 
+++>>>>>>> af641713e97d (mlxsw: spectrum_router: Onload conflicting tunnels)
+  	switch (event) {
+  	case NETDEV_REGISTER:
+  		return mlxsw_sp_netdevice_ipip_ol_reg_event(mlxsw_sp, ol_dev);
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
+index 8120b01a9c36,5dd650bdcff6..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
+@@@ -103,6 -104,20 +103,23 @@@ mlxsw_sp_neigh_entry_counter_update(str
+  				    struct mlxsw_sp_neigh_entry *neigh_entry,
+  				    bool adding);
+  bool mlxsw_sp_neigh_ipv6_ignore(struct mlxsw_sp_neigh_entry *neigh_entry);
+++<<<<<<< HEAD
+++=======
++ int __mlxsw_sp_ipip_entry_update_tunnel(struct mlxsw_sp *mlxsw_sp,
++ 					struct mlxsw_sp_ipip_entry *ipip_entry,
++ 					bool recreate_loopback,
++ 					bool keep_encap,
++ 					bool update_nexthops,
++ 					struct netlink_ext_ack *extack);
++ void mlxsw_sp_ipip_entry_demote_tunnel(struct mlxsw_sp *mlxsw_sp,
++ 				       struct mlxsw_sp_ipip_entry *ipip_entry);
++ bool
++ mlxsw_sp_ipip_demote_tunnel_by_saddr(struct mlxsw_sp *mlxsw_sp,
++ 				     enum mlxsw_sp_l3proto ul_proto,
++ 				     union mlxsw_sp_l3addr saddr,
++ 				     u32 ul_tb_id,
++ 				     const struct mlxsw_sp_ipip_entry *except);
+++>>>>>>> af641713e97d (mlxsw: spectrum_router: Onload conflicting tunnels)
+  struct mlxsw_sp_nexthop *mlxsw_sp_nexthop_next(struct mlxsw_sp_router *router,
+  					       struct mlxsw_sp_nexthop *nh);
+  bool mlxsw_sp_nexthop_offload(struct mlxsw_sp_nexthop *nh);
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
