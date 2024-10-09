@@ -1,0 +1,170 @@
+blk-mq: add callback of .cleanup_rq
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 226b4fc75c78f9c497c5182d939101b260cfb9f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/226b4fc7.failed
+
+SCSI maintains its own driver private data hooked off of each SCSI
+request, and the pridate data won't be freed after scsi_queue_rq()
+returns BLK_STS_RESOURCE or BLK_STS_DEV_RESOURCE. An upper layer driver
+(e.g. dm-rq) may need to retry these SCSI requests, before SCSI has
+fully dispatched them, due to a lower level SCSI driver's resource
+limitation identified in scsi_queue_rq(). Currently SCSI's per-request
+private data is leaked when the upper layer driver (dm-rq) frees and
+then retries these requests in response to BLK_STS_RESOURCE or
+BLK_STS_DEV_RESOURCE returns from scsi_queue_rq().
+
+This usecase is so specialized that it doesn't warrant training an
+existing blk-mq interface (e.g. blk_mq_free_request) to allow SCSI to
+account for freeing its driver private data -- doing so would add an
+extra branch for handling a special case that all other consumers of
+SCSI (and blk-mq) won't ever need to worry about.
+
+So the most pragmatic way forward is to delegate freeing SCSI driver
+private data to the upper layer driver (dm-rq).  Do so by adding
+new .cleanup_rq callback and calling a new blk_mq_cleanup_rq() method
+from dm-rq.  A following commit will implement the .cleanup_rq() hook
+in scsi_mq_ops.
+
+	Cc: Ewan D. Milne <emilne@redhat.com>
+	Cc: Bart Van Assche <bvanassche@acm.org>
+	Cc: Hannes Reinecke <hare@suse.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Mike Snitzer <snitzer@redhat.com>
+	Cc: dm-devel@redhat.com
+	Cc: <stable@vger.kernel.org>
+Fixes: 396eaf21ee17 ("blk-mq: improve DM's blk-mq IO merging via blk_insert_cloned_request feedback")
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 226b4fc75c78f9c497c5182d939101b260cfb9f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/blk-mq.h
+diff --cc include/linux/blk-mq.h
+index e38d80728ec7,21cebe901ac0..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -159,16 -132,31 +159,22 @@@ typedef int (init_request_fn)(struct bl
+  		unsigned int, unsigned int);
+  typedef void (exit_request_fn)(struct blk_mq_tag_set *set, struct request *,
+  		unsigned int);
+ +typedef int (reinit_request_fn)(void *, struct request *);
+  
+ -typedef bool (busy_iter_fn)(struct blk_mq_hw_ctx *, struct request *, void *,
+ +typedef void (busy_iter_fn)(struct blk_mq_hw_ctx *, struct request *, void *,
+  		bool);
+ -typedef bool (busy_tag_iter_fn)(struct request *, void *, bool);
+ -typedef int (poll_fn)(struct blk_mq_hw_ctx *);
+ +typedef void (busy_tag_iter_fn)(struct request *, void *, bool);
+  typedef int (map_queues_fn)(struct blk_mq_tag_set *set);
+++<<<<<<< HEAD
+++=======
++ typedef bool (busy_fn)(struct request_queue *);
++ typedef void (complete_fn)(struct request *);
++ typedef void (cleanup_rq_fn)(struct request *);
+++>>>>>>> 226b4fc75c78 (blk-mq: add callback of .cleanup_rq)
+  
+ -
+ -struct blk_mq_ops {
+ -	/*
+ -	 * Queue request
+ -	 */
+ -	queue_rq_fn		*queue_rq;
+ -
+ -	/*
+ -	 * If a driver uses bd->last to judge when to submit requests to
+ -	 * hardware, it must define this function. In case of errors that
+ -	 * make us stop issuing further requests, this hook serves the
+ -	 * purpose of kicking the hardware (which the last request otherwise
+ -	 * would have done).
+ -	 */
+ -	commit_rqs_fn		*commit_rqs;
+ +struct blk_mq_aux_ops {
+ +	reinit_request_fn	*reinit_request;
+ +	map_queues_fn		*map_queues;
+  
+  	/*
+  	 * Reserve budget before queue request, once .queue_rq is
+@@@ -219,15 -198,29 +225,40 @@@ struct blk_mq_ops 
+  	 */
+  	init_request_fn		*init_request;
+  	exit_request_fn		*exit_request;
+++<<<<<<< HEAD
+++=======
++ 	/* Called from inside blk_get_request() */
++ 	void (*initialize_rq_fn)(struct request *rq);
++ 
++ 	/*
++ 	 * Called before freeing one request which isn't completed yet,
++ 	 * and usually for freeing the driver private data
++ 	 */
++ 	cleanup_rq_fn		*cleanup_rq;
++ 
++ 	/*
++ 	 * If set, returns whether or not this queue currently is busy
++ 	 */
++ 	busy_fn			*busy;
++ 
++ 	map_queues_fn		*map_queues;
++ 
++ #ifdef CONFIG_BLK_DEBUG_FS
++ 	/*
++ 	 * Used by the debugfs implementation to show driver-specific
++ 	 * information about a request.
++ 	 */
++ 	void (*show_rq)(struct seq_file *m, struct request *rq);
+++>>>>>>> 226b4fc75c78 (blk-mq: add callback of .cleanup_rq)
+  #endif
+ +
+ +	/*
+ +	 * Called when the block layer side of a hardware queue has been
+ +	 * set up, allowing the driver to allocate/init matching structures.
+ +	 * Ditto for exit/teardown.
+ +	 */
+ +	init_hctx_fn		*init_hctx;
+ +	exit_hctx_fn		*exit_hctx;
+  };
+  
+  enum {
+@@@ -398,4 -364,20 +429,23 @@@ static inline struct request_aux *rq_au
+  	for ((i) = 0; (i) < (hctx)->nr_ctx &&				\
+  	     ({ ctx = (hctx)->ctxs[(i)]; 1; }); (i)++)
+  
+++<<<<<<< HEAD
+++=======
++ static inline blk_qc_t request_to_qc_t(struct blk_mq_hw_ctx *hctx,
++ 		struct request *rq)
++ {
++ 	if (rq->tag != -1)
++ 		return rq->tag | (hctx->queue_num << BLK_QC_T_SHIFT);
++ 
++ 	return rq->internal_tag | (hctx->queue_num << BLK_QC_T_SHIFT) |
++ 			BLK_QC_T_INTERNAL;
++ }
++ 
++ static inline void blk_mq_cleanup_rq(struct request *rq)
++ {
++ 	if (rq->q->mq_ops->cleanup_rq)
++ 		rq->q->mq_ops->cleanup_rq(rq);
++ }
++ 
+++>>>>>>> 226b4fc75c78 (blk-mq: add callback of .cleanup_rq)
+  #endif
+diff --git a/drivers/md/dm-rq.c b/drivers/md/dm-rq.c
+index 9c69af8e11bb..2967292acf13 100644
+--- a/drivers/md/dm-rq.c
++++ b/drivers/md/dm-rq.c
+@@ -669,6 +669,7 @@ check_again:
+ 		ret = dm_dispatch_clone_request(clone, rq);
+ 		if (ret == BLK_MQ_RQ_QUEUE_BUSY || r == BLK_MQ_RQ_QUEUE_DEV_BUSY) {
+ 			blk_rq_unprep_clone(clone);
++			blk_mq_cleanup_rq(clone);
+ 			tio->ti->type->release_clone_rq(clone, &tio->info);
+ 			tio->clone = NULL;
+ 			if (!rq->q->mq_ops)
+* Unmerged path include/linux/blk-mq.h
