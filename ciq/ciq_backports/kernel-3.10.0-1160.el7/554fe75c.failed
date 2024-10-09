@@ -1,0 +1,696 @@
+net/mlx5e: Avoid duplicating rule destinations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Dmytro Linkin <dmitrolin@mellanox.com>
+commit 554fe75c1b3f679b1eebf193a4e56492837d3f5a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/554fe75c.failed
+
+Following scenario easily break driver logic and crash the kernel:
+1. Add rule with mirred actions to same device.
+2. Delete this rule.
+In described scenario rule is not added to database and on deletion
+driver access invalid entry.
+Example:
+
+ $ tc filter add dev ens1f0_0 ingress protocol ip prio 1 \
+       flower skip_sw \
+       action mirred egress mirror dev ens1f0_1 pipe \
+       action mirred egress redirect dev ens1f0_1
+ $ tc filter del dev ens1f0_0 ingress protocol ip prio 1
+
+Dmesg output:
+
+[  376.634396] mlx5_core 0000:82:00.0: mlx5_cmd_check:756:(pid 3439): DESTROY_FLOW_GROUP(0x934) op_mod(0x0) failed, status bad resource state(0x9), syndrome (0x563e2f)
+[  376.654983] mlx5_core 0000:82:00.0: del_hw_flow_group:567:(pid 3439): flow steering can't destroy fg 89 of ft 3145728
+[  376.673433] kasan: CONFIG_KASAN_INLINE enabled
+[  376.683769] kasan: GPF could be caused by NULL-ptr deref or user memory access
+[  376.695229] general protection fault: 0000 [#1] PREEMPT SMP KASAN PTI
+[  376.705069] CPU: 7 PID: 3439 Comm: tc Not tainted 5.4.0-rc5+ #76
+[  376.714959] Hardware name: Supermicro SYS-2028TP-DECTR/X10DRT-PT, BIOS 2.0a 08/12/2016
+[  376.726371] RIP: 0010:mlx5_del_flow_rules+0x105/0x960 [mlx5_core]
+[  376.735817] Code: 01 00 00 00 48 83 eb 08 e8 28 d9 ff ff 4c 39 e3 75 d8 4c 8d bd c0 02 00 00 48 b8 00 00 00 00 00 fc ff df 4c 89 fa 48 c1 ea 03 <0f> b6 04 02 84 c0 74 08 3c 03 0f 8e 84 04 00 00 48 8d 7d 28 8b 9 d
+[  376.761261] RSP: 0018:ffff888847c56db8 EFLAGS: 00010202
+[  376.770054] RAX: dffffc0000000000 RBX: ffff8888582a6da0 RCX: ffff888847c56d60
+[  376.780743] RDX: 0000000000000058 RSI: 0000000000000008 RDI: 0000000000000282
+[  376.791328] RBP: 0000000000000000 R08: fffffbfff0c60ea6 R09: fffffbfff0c60ea6
+[  376.802050] R10: fffffbfff0c60ea5 R11: ffffffff8630752f R12: ffff8888582a6da0
+[  376.812798] R13: dffffc0000000000 R14: ffff8888582a6da0 R15: 00000000000002c0
+[  376.823445] FS:  00007f675f9a8840(0000) GS:ffff88886d200000(0000) knlGS:0000000000000000
+[  376.834971] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[  376.844179] CR2: 00000000007d9640 CR3: 00000007d3f26003 CR4: 00000000001606e0
+[  376.854843] Call Trace:
+[  376.868542]  __mlx5_eswitch_del_rule+0x49/0x300 [mlx5_core]
+[  376.877735]  mlx5e_tc_del_fdb_flow+0x6ec/0x9e0 [mlx5_core]
+[  376.921549]  mlx5e_flow_put+0x2b/0x50 [mlx5_core]
+[  376.929813]  mlx5e_delete_flower+0x5b6/0xbd0 [mlx5_core]
+[  376.973030]  tc_setup_cb_reoffload+0x29/0xc0
+[  376.980619]  fl_reoffload+0x50a/0x770 [cls_flower]
+[  377.015087]  tcf_block_playback_offloads+0xbd/0x250
+[  377.033400]  tcf_block_setup+0x1b2/0xc60
+[  377.057247]  tcf_block_offload_cmd+0x195/0x240
+[  377.098826]  tcf_block_offload_unbind+0xe7/0x180
+[  377.107056]  __tcf_block_put+0xe5/0x400
+[  377.114528]  ingress_destroy+0x3d/0x60 [sch_ingress]
+[  377.122894]  qdisc_destroy+0xf1/0x5a0
+[  377.129993]  qdisc_graft+0xa3d/0xe50
+[  377.151227]  tc_get_qdisc+0x48e/0xa20
+[  377.165167]  rtnetlink_rcv_msg+0x35d/0x8d0
+[  377.199528]  netlink_rcv_skb+0x11e/0x340
+[  377.219638]  netlink_unicast+0x408/0x5b0
+[  377.239913]  netlink_sendmsg+0x71b/0xb30
+[  377.267505]  sock_sendmsg+0xb1/0xf0
+[  377.273801]  ___sys_sendmsg+0x635/0x900
+[  377.312784]  __sys_sendmsg+0xd3/0x170
+[  377.338693]  do_syscall_64+0x95/0x460
+[  377.344833]  entry_SYSCALL_64_after_hwframe+0x49/0xbe
+[  377.352321] RIP: 0033:0x7f675e58e090
+
+To avoid this, for every mirred action check if output device was
+already processed. If so - drop rule with EOPNOTSUPP error.
+
+	Signed-off-by: Dmytro Linkin <dmitrolin@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Reviewed-by: Vlad Buslov <vladbu@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 554fe75c1b3f679b1eebf193a4e56492837d3f5a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 296b48b15344,fe83886f5435..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -2535,134 -2967,173 +2535,476 @@@ static bool is_merged_eswitch_dev(struc
+  
+  
+  
+ -bool mlx5e_encap_take(struct mlx5e_encap_entry *e)
+ +static int mlx5e_attach_encap(struct mlx5e_priv *priv,
+ +			      struct mlx5e_tc_flow *flow,
+ +			      struct net_device *mirred_dev,
+ +			      int out_index,
+ +			      struct netlink_ext_ack *extack,
+ +			      struct net_device **encap_dev,
+ +			      bool *encap_valid)
+  {
+ -	return refcount_inc_not_zero(&e->refcnt);
+ -}
+ -
+ +	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+ +	struct mlx5_esw_flow_attr *attr = flow->esw_attr;
+ +	struct mlx5e_tc_flow_parse_attr *parse_attr;
+ +	struct ip_tunnel_info *tun_info;
+ +	struct encap_key key, e_key;
+ +	struct mlx5e_encap_entry *e;
+ +	unsigned short family;
+ +	uintptr_t hash_key;
+ +	bool found = false;
+ +	int err = 0;
+ +
+ +	parse_attr = attr->parse_attr;
+ +	tun_info = &parse_attr->tun_info[out_index];
+ +	family = ip_tunnel_info_af(tun_info);
+ +	key.ip_tun_key = &tun_info->key;
+ +	key.tunnel_type = mlx5e_tc_tun_get_type(mirred_dev);
+ +
+ +	hash_key = hash_encap_info(&key);
+ +
+ +	hash_for_each_possible_rcu(esw->offloads.encap_tbl, e,
+ +				   encap_hlist, hash_key) {
+ +		e_key.ip_tun_key = &e->tun_info.key;
+ +		e_key.tunnel_type = e->tunnel_type;
+ +		if (!cmp_encap_info(&e_key, &key)) {
+ +			found = true;
+ +			break;
+ +		}
+ +	}
+ +
+ +	/* must verify if encap is valid or not */
+ +	if (found)
+ +		goto attach_flow;
+ +
+ +	e = kzalloc(sizeof(*e), GFP_KERNEL);
+ +	if (!e)
+ +		return -ENOMEM;
+ +
+ +	e->tun_info = *tun_info;
+ +	err = mlx5e_tc_tun_init_encap_attr(mirred_dev, priv, e, extack);
+ +	if (err)
+ +		goto out_err;
+ +
+ +	INIT_LIST_HEAD(&e->flows);
+ +
+ +	if (family == AF_INET)
+ +		err = mlx5e_tc_tun_create_header_ipv4(priv, mirred_dev, e);
+ +	else if (family == AF_INET6)
+ +		err = mlx5e_tc_tun_create_header_ipv6(priv, mirred_dev, e);
+ +
+ +	if (err)
+ +		goto out_err;
+ +
+ +	hash_add_rcu(esw->offloads.encap_tbl, &e->encap_hlist, hash_key);
+ +
+ +attach_flow:
+ +	list_add(&flow->encaps[out_index].list, &e->flows);
+ +	flow->encaps[out_index].index = out_index;
+ +	*encap_dev = e->out_dev;
+ +	if (e->flags & MLX5_ENCAP_ENTRY_VALID) {
+ +		attr->dests[out_index].encap_id = e->encap_id;
+ +		attr->dests[out_index].flags |= MLX5_ESW_DEST_ENCAP_VALID;
+ +		*encap_valid = true;
+ +	} else {
+ +		*encap_valid = false;
+ +	}
+ +
+ +	return err;
+ +
+ +out_err:
+ +	kfree(e);
+ +	return err;
+ +}
+ +
+ +static int add_vlan_rewrite_action(struct mlx5e_priv *priv,
+ +				   const struct tc_action *a,
+ +				   struct mlx5_esw_flow_attr *attr,
+ +				   struct mlx5e_tc_flow_parse_attr *parse_attr,
+ +				   u32 *action, struct netlink_ext_ack *extack)
+ +{
+ +	u8 match_prio_mask, match_prio_val;
+ +	void *headers_c, *headers_v;
+ +	int err;
+ +	struct tcf_pedit_key_ex pedit_key_ex = {
+ +		.htype = TCA_PEDIT_KEY_EX_HDR_TYPE_ETH,
+ +		.cmd = TCA_PEDIT_KEY_EX_CMD_SET,
+ +	};
+ +	u16 mask16 = VLAN_VID_MASK;
+ +	u16 val16 = tcf_vlan_push_vid(a) & VLAN_VID_MASK;
+ +	struct tc_pedit_key pedit_key = {
+ +		.mask = ~(u32)be16_to_cpu(*(__be16 *)&mask16),
+ +		.val = (u32)be16_to_cpu(*(__be16 *)&val16),
+ +		.off = offsetof(struct vlan_ethhdr, h_vlan_TCI),
+ +	};
+ +	const struct tcf_pedit pedit_act = {
+ +		.tcfp_nkeys = 1,
+ +		.tcfp_keys = &pedit_key,
+ +		.tcfp_keys_ex = &pedit_key_ex,
+ +	};
+ +
+ +	headers_c = get_match_headers_criteria(*action, &parse_attr->spec);
+ +	headers_v = get_match_headers_value(*action, &parse_attr->spec);
+ +
+ +	if (!(MLX5_GET(fte_match_set_lyr_2_4, headers_c, cvlan_tag) &&
+ +	      MLX5_GET(fte_match_set_lyr_2_4, headers_v, cvlan_tag))) {
+ +		NL_SET_ERR_MSG_MOD(extack,
+ +				   "VLAN rewrite action must have VLAN protocol match");
+ +		return -EOPNOTSUPP;
+ +	}
+ +
+ +	match_prio_mask = MLX5_GET(fte_match_set_lyr_2_4, headers_c, first_prio);
+ +	match_prio_val = MLX5_GET(fte_match_set_lyr_2_4, headers_v, first_prio);
+ +	if (tcf_vlan_push_prio(a) != (match_prio_val & match_prio_mask)) {
+ +		NL_SET_ERR_MSG_MOD(extack,
+ +				   "Changing VLAN prio is not supported");
+ +		return -EOPNOTSUPP;
+ +	}
+ +
+ +	err = parse_tc_pedit_action(priv, (const struct tc_action *)&pedit_act,
+ +				    MLX5_FLOW_NAMESPACE_FDB, parse_attr, action, NULL);
+ +	*action |= MLX5_FLOW_CONTEXT_ACTION_MOD_HDR;
+++<<<<<<< HEAD
+++=======
+++
+++	return err;
+++}
+++
+++static int
+++add_vlan_prio_tag_rewrite_action(struct mlx5e_priv *priv,
+++				 struct mlx5e_tc_flow_parse_attr *parse_attr,
+++				 struct pedit_headers_action *hdrs,
+++				 u32 *action, struct netlink_ext_ack *extack)
+++{
+++	const struct flow_action_entry prio_tag_act = {
+++		.vlan.vid = 0,
+++		.vlan.prio =
+++			MLX5_GET(fte_match_set_lyr_2_4,
+++				 get_match_headers_value(*action,
+++							 &parse_attr->spec),
+++				 first_prio) &
+++			MLX5_GET(fte_match_set_lyr_2_4,
+++				 get_match_headers_criteria(*action,
+++							    &parse_attr->spec),
+++				 first_prio),
+++	};
+++
+++	return add_vlan_rewrite_action(priv, MLX5_FLOW_NAMESPACE_FDB,
+++				       &prio_tag_act, parse_attr, hdrs, action,
+++				       extack);
+++}
+++
+++static int parse_tc_nic_actions(struct mlx5e_priv *priv,
+++				struct flow_action *flow_action,
+++				struct mlx5e_tc_flow_parse_attr *parse_attr,
+++				struct mlx5e_tc_flow *flow,
+++				struct netlink_ext_ack *extack)
+++{
+++	struct mlx5_nic_flow_attr *attr = flow->nic_attr;
+++	struct pedit_headers_action hdrs[2] = {};
+++	const struct flow_action_entry *act;
+++	u32 action = 0;
+++	int err, i;
+++
+++	if (!flow_action_has_entries(flow_action))
+++		return -EINVAL;
+++
+++	attr->flow_tag = MLX5_FS_DEFAULT_FLOW_TAG;
+++
+++	flow_action_for_each(i, act, flow_action) {
+++		switch (act->id) {
+++		case FLOW_ACTION_DROP:
+++			action |= MLX5_FLOW_CONTEXT_ACTION_DROP;
+++			if (MLX5_CAP_FLOWTABLE(priv->mdev,
+++					       flow_table_properties_nic_receive.flow_counter))
+++				action |= MLX5_FLOW_CONTEXT_ACTION_COUNT;
+++			break;
+++		case FLOW_ACTION_MANGLE:
+++		case FLOW_ACTION_ADD:
+++			err = parse_tc_pedit_action(priv, act, MLX5_FLOW_NAMESPACE_KERNEL,
+++						    parse_attr, hdrs, extack);
+++			if (err)
+++				return err;
+++
+++			action |= MLX5_FLOW_CONTEXT_ACTION_MOD_HDR |
+++				  MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
+++			break;
+++		case FLOW_ACTION_VLAN_MANGLE:
+++			err = add_vlan_rewrite_action(priv,
+++						      MLX5_FLOW_NAMESPACE_KERNEL,
+++						      act, parse_attr, hdrs,
+++						      &action, extack);
+++			if (err)
+++				return err;
+++
+++			break;
+++		case FLOW_ACTION_CSUM:
+++			if (csum_offload_supported(priv, action,
+++						   act->csum_flags,
+++						   extack))
+++				break;
+++
+++			return -EOPNOTSUPP;
+++		case FLOW_ACTION_REDIRECT: {
+++			struct net_device *peer_dev = act->dev;
+++
+++			if (priv->netdev->netdev_ops == peer_dev->netdev_ops &&
+++			    same_hw_devs(priv, netdev_priv(peer_dev))) {
+++				parse_attr->mirred_ifindex[0] = peer_dev->ifindex;
+++				flow_flag_set(flow, HAIRPIN);
+++				action |= MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
+++					  MLX5_FLOW_CONTEXT_ACTION_COUNT;
+++			} else {
+++				NL_SET_ERR_MSG_MOD(extack,
+++						   "device is not on same HW, can't offload");
+++				netdev_warn(priv->netdev, "device %s not on same HW, can't offload\n",
+++					    peer_dev->name);
+++				return -EINVAL;
+++			}
+++			}
+++			break;
+++		case FLOW_ACTION_MARK: {
+++			u32 mark = act->mark;
+++
+++			if (mark & ~MLX5E_TC_FLOW_ID_MASK) {
+++				NL_SET_ERR_MSG_MOD(extack,
+++						   "Bad flow mark - only 16 bit is supported");
+++				return -EINVAL;
+++			}
+++
+++			attr->flow_tag = mark;
+++			action |= MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
+++			}
+++			break;
+++		default:
+++			NL_SET_ERR_MSG_MOD(extack, "The offload action is not supported");
+++			return -EOPNOTSUPP;
+++		}
+++	}
+++
+++	if (hdrs[TCA_PEDIT_KEY_EX_CMD_SET].pedits ||
+++	    hdrs[TCA_PEDIT_KEY_EX_CMD_ADD].pedits) {
+++		err = alloc_tc_pedit_action(priv, MLX5_FLOW_NAMESPACE_KERNEL,
+++					    parse_attr, hdrs, &action, extack);
+++		if (err)
+++			return err;
+++		/* in case all pedit actions are skipped, remove the MOD_HDR
+++		 * flag.
+++		 */
+++		if (parse_attr->num_mod_hdr_actions == 0) {
+++			action &= ~MLX5_FLOW_CONTEXT_ACTION_MOD_HDR;
+++			kfree(parse_attr->mod_hdr_actions);
+++		}
+++	}
+++
+++	attr->action = action;
+++	if (!actions_match_supported(priv, flow_action, parse_attr, flow, extack))
+++		return -EOPNOTSUPP;
+++
+++	return 0;
+++}
+++
+++struct encap_key {
+++	const struct ip_tunnel_key *ip_tun_key;
+++	struct mlx5e_tc_tunnel *tc_tunnel;
+++};
+++
+++static inline int cmp_encap_info(struct encap_key *a,
+++				 struct encap_key *b)
+++{
+++	return memcmp(a->ip_tun_key, b->ip_tun_key, sizeof(*a->ip_tun_key)) ||
+++	       a->tc_tunnel->tunnel_type != b->tc_tunnel->tunnel_type;
+++}
+++
+++static inline int hash_encap_info(struct encap_key *key)
+++{
+++	return jhash(key->ip_tun_key, sizeof(*key->ip_tun_key),
+++		     key->tc_tunnel->tunnel_type);
+++}
+++
+++
+++static bool is_merged_eswitch_dev(struct mlx5e_priv *priv,
+++				  struct net_device *peer_netdev)
+++{
+++	struct mlx5e_priv *peer_priv;
+++
+++	peer_priv = netdev_priv(peer_netdev);
+++
+++	return (MLX5_CAP_ESW(priv->mdev, merged_eswitch) &&
+++		mlx5e_eswitch_rep(priv->netdev) &&
+++		mlx5e_eswitch_rep(peer_netdev) &&
+++		same_hw_devs(priv, peer_priv));
+++}
+++
+++
+++
+++bool mlx5e_encap_take(struct mlx5e_encap_entry *e)
+++{
+++	return refcount_inc_not_zero(&e->refcnt);
+++}
+++
++ static struct mlx5e_encap_entry *
++ mlx5e_encap_get(struct mlx5e_priv *priv, struct encap_key *key,
++ 		uintptr_t hash_key)
++ {
++ 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
++ 	struct mlx5e_encap_entry *e;
++ 	struct encap_key e_key;
++ 
++ 	hash_for_each_possible_rcu(esw->offloads.encap_tbl, e,
++ 				   encap_hlist, hash_key) {
++ 		e_key.ip_tun_key = &e->tun_info->key;
++ 		e_key.tc_tunnel = e->tunnel;
++ 		if (!cmp_encap_info(&e_key, key) &&
++ 		    mlx5e_encap_take(e))
++ 			return e;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ static struct ip_tunnel_info *dup_tun_info(const struct ip_tunnel_info *tun_info)
++ {
++ 	size_t tun_size = sizeof(*tun_info) + tun_info->options_len;
++ 
++ 	return kmemdup(tun_info, tun_size, GFP_KERNEL);
++ }
++ 
++ static bool is_duplicated_encap_entry(struct mlx5e_priv *priv,
++ 				      struct mlx5e_tc_flow *flow,
++ 				      int out_index,
++ 				      struct mlx5e_encap_entry *e,
++ 				      struct netlink_ext_ack *extack)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < out_index; i++) {
++ 		if (flow->encaps[i].e != e)
++ 			continue;
++ 		NL_SET_ERR_MSG_MOD(extack, "can't duplicate encap action");
++ 		netdev_err(priv->netdev, "can't duplicate encap action\n");
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static int mlx5e_attach_encap(struct mlx5e_priv *priv,
++ 			      struct mlx5e_tc_flow *flow,
++ 			      struct net_device *mirred_dev,
++ 			      int out_index,
++ 			      struct netlink_ext_ack *extack,
++ 			      struct net_device **encap_dev,
++ 			      bool *encap_valid)
++ {
++ 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
++ 	struct mlx5_esw_flow_attr *attr = flow->esw_attr;
++ 	struct mlx5e_tc_flow_parse_attr *parse_attr;
++ 	const struct ip_tunnel_info *tun_info;
++ 	struct encap_key key;
++ 	struct mlx5e_encap_entry *e;
++ 	unsigned short family;
++ 	uintptr_t hash_key;
++ 	int err = 0;
++ 
++ 	parse_attr = attr->parse_attr;
++ 	tun_info = parse_attr->tun_info[out_index];
++ 	family = ip_tunnel_info_af(tun_info);
++ 	key.ip_tun_key = &tun_info->key;
++ 	key.tc_tunnel = mlx5e_get_tc_tun(mirred_dev);
++ 	if (!key.tc_tunnel) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Unsupported tunnel");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	hash_key = hash_encap_info(&key);
++ 
++ 	mutex_lock(&esw->offloads.encap_tbl_lock);
++ 	e = mlx5e_encap_get(priv, &key, hash_key);
++ 
++ 	/* must verify if encap is valid or not */
++ 	if (e) {
++ 		/* Check that entry was not already attached to this flow */
++ 		if (is_duplicated_encap_entry(priv, flow, out_index, e, extack)) {
++ 			err = -EOPNOTSUPP;
++ 			goto out_err;
++ 		}
++ 
++ 		mutex_unlock(&esw->offloads.encap_tbl_lock);
++ 		wait_for_completion(&e->res_ready);
++ 
++ 		/* Protect against concurrent neigh update. */
++ 		mutex_lock(&esw->offloads.encap_tbl_lock);
++ 		if (e->compl_result < 0) {
++ 			err = -EREMOTEIO;
++ 			goto out_err;
++ 		}
++ 		goto attach_flow;
++ 	}
++ 
++ 	e = kzalloc(sizeof(*e), GFP_KERNEL);
++ 	if (!e) {
++ 		err = -ENOMEM;
++ 		goto out_err;
++ 	}
++ 
++ 	refcount_set(&e->refcnt, 1);
++ 	init_completion(&e->res_ready);
++ 
++ 	tun_info = dup_tun_info(tun_info);
++ 	if (!tun_info) {
++ 		err = -ENOMEM;
++ 		goto out_err_init;
++ 	}
++ 	e->tun_info = tun_info;
++ 	err = mlx5e_tc_tun_init_encap_attr(mirred_dev, priv, e, extack);
++ 	if (err)
++ 		goto out_err_init;
++ 
++ 	INIT_LIST_HEAD(&e->flows);
++ 	hash_add_rcu(esw->offloads.encap_tbl, &e->encap_hlist, hash_key);
++ 	mutex_unlock(&esw->offloads.encap_tbl_lock);
++ 
++ 	if (family == AF_INET)
++ 		err = mlx5e_tc_tun_create_header_ipv4(priv, mirred_dev, e);
++ 	else if (family == AF_INET6)
++ 		err = mlx5e_tc_tun_create_header_ipv6(priv, mirred_dev, e);
++ 
++ 	/* Protect against concurrent neigh update. */
++ 	mutex_lock(&esw->offloads.encap_tbl_lock);
++ 	complete_all(&e->res_ready);
++ 	if (err) {
++ 		e->compl_result = err;
++ 		goto out_err;
++ 	}
++ 	e->compl_result = 1;
++ 
++ attach_flow:
++ 	flow->encaps[out_index].e = e;
++ 	list_add(&flow->encaps[out_index].list, &e->flows);
++ 	flow->encaps[out_index].index = out_index;
++ 	*encap_dev = e->out_dev;
++ 	if (e->flags & MLX5_ENCAP_ENTRY_VALID) {
++ 		attr->dests[out_index].pkt_reformat = e->pkt_reformat;
++ 		attr->dests[out_index].flags |= MLX5_ESW_DEST_ENCAP_VALID;
++ 		*encap_valid = true;
++ 	} else {
++ 		*encap_valid = false;
++ 	}
++ 	mutex_unlock(&esw->offloads.encap_tbl_lock);
++ 
++ 	return err;
++ 
++ out_err:
++ 	mutex_unlock(&esw->offloads.encap_tbl_lock);
++ 	if (e)
++ 		mlx5e_encap_put(priv, e);
++ 	return err;
++ 
++ out_err_init:
++ 	mutex_unlock(&esw->offloads.encap_tbl_lock);
++ 	kfree(tun_info);
++ 	kfree(e);
+++>>>>>>> 554fe75c1b3f (net/mlx5e: Avoid duplicating rule destinations)
+  	return err;
+  }
+  
+@@@ -2765,38 -3245,57 +3107,73 @@@ bool mlx5e_is_valid_eswitch_fwd_dev(str
+  	       same_hw_devs(priv, netdev_priv(out_dev));
+  }
+  
+++<<<<<<< HEAD
+ +static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
+ +				struct mlx5e_tc_flow_parse_attr *parse_attr,
+++=======
++ static bool is_duplicated_output_device(struct net_device *dev,
++ 					struct net_device *out_dev,
++ 					int *ifindexes, int if_count,
++ 					struct netlink_ext_ack *extack)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < if_count; i++) {
++ 		if (ifindexes[i] == out_dev->ifindex) {
++ 			NL_SET_ERR_MSG_MOD(extack,
++ 					   "can't duplicate output to same device");
++ 			netdev_err(dev, "can't duplicate output to same device: %s\n",
++ 				   out_dev->name);
++ 			return true;
++ 		}
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static int parse_tc_fdb_actions(struct mlx5e_priv *priv,
++ 				struct flow_action *flow_action,
+++>>>>>>> 554fe75c1b3f (net/mlx5e: Avoid duplicating rule destinations)
+  				struct mlx5e_tc_flow *flow,
+  				struct netlink_ext_ack *extack)
+  {
+ -	struct pedit_headers_action hdrs[2] = {};
+  	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+  	struct mlx5_esw_flow_attr *attr = flow->esw_attr;
+ -	struct mlx5e_tc_flow_parse_attr *parse_attr = attr->parse_attr;
+  	struct mlx5e_rep_priv *rpriv = priv->ppriv;
+++<<<<<<< HEAD
+ +	struct ip_tunnel_info *info = NULL;
+ +	const struct tc_action *a;
+ +	LIST_HEAD(actions);
+ +	bool encap = false;
+ +	u32 action = 0;
+ +	int err;
+++=======
++ 	const struct ip_tunnel_info *info = NULL;
++ 	int ifindexes[MLX5_MAX_FLOW_FWD_VPORTS];
++ 	bool ft_flow = mlx5e_is_ft_flow(flow);
++ 	const struct flow_action_entry *act;
++ 	int err, i, if_count = 0;
++ 	bool encap = false;
++ 	u32 action = 0;
+++>>>>>>> 554fe75c1b3f (net/mlx5e: Avoid duplicating rule destinations)
+  
+ -	if (!flow_action_has_entries(flow_action))
+ +	if (!tcf_exts_has_actions(exts))
+  		return -EINVAL;
+  
+ -	flow_action_for_each(i, act, flow_action) {
+ -		switch (act->id) {
+ -		case FLOW_ACTION_DROP:
+ +	attr->in_rep = rpriv->rep;
+ +	attr->in_mdev = priv->mdev;
+ +
+ +	tcf_exts_to_list(exts, &actions);
+ +	list_for_each_entry(a, &actions, list) {
+ +		if (is_tcf_gact_shot(a)) {
+  			action |= MLX5_FLOW_CONTEXT_ACTION_DROP |
+  				  MLX5_FLOW_CONTEXT_ACTION_COUNT;
+ -			break;
+ -		case FLOW_ACTION_MANGLE:
+ -		case FLOW_ACTION_ADD:
+ -			err = parse_tc_pedit_action(priv, act, MLX5_FLOW_NAMESPACE_FDB,
+ -						    parse_attr, hdrs, extack);
+ +			continue;
+ +		}
+ +
+ +		if (is_tcf_pedit(a)) {
+ +			err = parse_tc_pedit_action(priv, a, MLX5_FLOW_NAMESPACE_FDB,
+ +						    parse_attr, &action, extack);
+  			if (err)
+  				return err;
+  
+@@@ -2837,11 -3340,37 +3214,27 @@@
+  
+  			action |= MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
+  				  MLX5_FLOW_CONTEXT_ACTION_COUNT;
+ -			if (encap) {
+ -				parse_attr->mirred_ifindex[attr->out_count] =
+ -					out_dev->ifindex;
+ -				parse_attr->tun_info[attr->out_count] = dup_tun_info(info);
+ -				if (!parse_attr->tun_info[attr->out_count])
+ -					return -ENOMEM;
+ -				encap = false;
+ -				attr->dests[attr->out_count].flags |=
+ -					MLX5_ESW_DEST_ENCAP;
+ -				attr->out_count++;
+ -				/* attr->dests[].rep is resolved when we
+ -				 * handle encap
+ -				 */
+ -			} else if (netdev_port_same_parent_id(priv->netdev, out_dev)) {
+ +			if (switchdev_port_same_parent_id(priv->netdev, out_dev)) {
+  				struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+  				struct net_device *uplink_dev = mlx5_eswitch_uplink_get_proto_dev(esw, REP_ETH);
+ -				struct net_device *uplink_upper;
+ +				struct net_device *uplink_upper = netdev_master_upper_dev_get(uplink_dev);
+  
+++<<<<<<< HEAD
+++=======
++ 				if (is_duplicated_output_device(priv->netdev,
++ 								out_dev,
++ 								ifindexes,
++ 								if_count,
++ 								extack))
++ 					return -EOPNOTSUPP;
++ 
++ 				ifindexes[if_count] = out_dev->ifindex;
++ 				if_count++;
++ 
++ 				rcu_read_lock();
++ 				uplink_upper =
++ 					netdev_master_upper_dev_get_rcu(uplink_dev);
+++>>>>>>> 554fe75c1b3f (net/mlx5e: Avoid duplicating rule destinations)
+  				if (uplink_upper &&
+  				    netif_is_lag_master(uplink_upper) &&
+  				    uplink_upper == out_dev)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
