@@ -696,6 +696,7 @@ static void vmd_remove(struct pci_dev *dev)
 	sysfs_remove_link(&vmd->dev->dev.kobj, "domain");
 	pci_stop_root_bus(vmd->bus);
 	pci_remove_root_bus(vmd->bus);
+	vmd_cleanup_srcu(vmd);
 	vmd_teardown_dma_ops(vmd);
 }
 
