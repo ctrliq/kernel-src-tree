@@ -1,0 +1,76 @@
+nvme-pci: fix surprise removal
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Igor Konopko <igor.j.konopko@intel.com>
+commit 751a0cc0cd3a0d51e6aaf6fd3b8bd31f4ecfaf3e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/751a0cc0.failed
+
+When a PCIe NVMe device is not present, nvme_dev_remove_admin() calls
+blk_cleanup_queue() on the admin queue, which frees the hctx for that
+queue.  Moments later, on the same path nvme_kill_queues() calls
+blk_mq_unquiesce_queue() on admin queue and tries to access hctx of it,
+which leads to following OOPS:
+
+Oops: 0000 [#1] SMP PTI
+RIP: 0010:sbitmap_any_bit_set+0xb/0x40
+Call Trace:
+ blk_mq_run_hw_queue+0xd5/0x150
+ blk_mq_run_hw_queues+0x3a/0x50
+ nvme_kill_queues+0x26/0x50
+ nvme_remove_namespaces+0xb2/0xc0
+ nvme_remove+0x60/0x140
+ pci_device_remove+0x3b/0xb0
+
+Fixes: cb4bfda62afa2 ("nvme-pci: fix hot removal during error handling")
+	Signed-off-by: Igor Konopko <igor.j.konopko@intel.com>
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 751a0cc0cd3a0d51e6aaf6fd3b8bd31f4ecfaf3e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index b16721a7ff48,bb39b91253c2..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -2876,27 -3606,13 +2876,33 @@@ void nvme_kill_queues(struct nvme_ctrl 
+  
+  	down_read(&ctrl->namespaces_rwsem);
+  
+++<<<<<<< HEAD
+ +	/* Forcibly start all queues to avoid having stuck requests */
+ +	if (ctrl->admin_q)
+ +		blk_mq_start_hw_queues(ctrl->admin_q);
+++=======
++ 	/* Forcibly unquiesce queues to avoid blocking dispatch */
++ 	if (ctrl->admin_q && !blk_queue_dying(ctrl->admin_q))
++ 		blk_mq_unquiesce_queue(ctrl->admin_q);
+++>>>>>>> 751a0cc0cd3a (nvme-pci: fix surprise removal)
+  
+ -	list_for_each_entry(ns, &ctrl->namespaces, list)
+ -		nvme_set_queue_dying(ns);
+ +	list_for_each_entry(ns, &ctrl->namespaces, list) {
+ +		/*
+ +		 * Revalidating a dead namespace sets capacity to 0. This will
+ +		 * end buffered writers dirtying pages that can't be synced.
+ +		 */
+ +		if (test_and_set_bit(NVME_NS_DEAD, &ns->flags))
+ +			continue;
+ +		revalidate_disk(ns->disk);
+ +		blk_set_queue_dying(ns->queue);
+  
+ +		/*
+ +		 * Forcibly start all queues to avoid having stuck requests.
+ +		 * Note that we must ensure the queues are not stopped
+ +		 * when the final removal happens.
+ +		 */
+ +		blk_mq_start_hw_queues(ns->queue);
+ +	}
+  	up_read(&ctrl->namespaces_rwsem);
+  }
+  EXPORT_SYMBOL_GPL(nvme_kill_queues);
+* Unmerged path drivers/nvme/host/core.c
