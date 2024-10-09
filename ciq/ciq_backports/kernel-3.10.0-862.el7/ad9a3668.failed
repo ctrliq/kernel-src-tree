@@ -1,0 +1,102 @@
+IB/mlx5: Serialize access to the VMA list
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Majd Dibbiny <majd@mellanox.com>
+commit ad9a3668a434faca1339789ed2f043d679199309
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ad9a3668.failed
+
+User-space applications can do mmap and munmap directly at
+any time.
+
+Since the VMA list is not protected with a mutex, concurrent
+accesses to the VMA list from the mmap and munmap can cause
+data corruption. Add a mutex around the list.
+
+	Cc: <stable@vger.kernel.org> # v4.7
+Fixes: 7c2344c3bbf9 ("IB/mlx5: Implements disassociate_ucontext API")
+	Reviewed-by: Yishai Hadas <yishaih@mellanox.com>
+	Signed-off-by: Majd Dibbiny <majd@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit ad9a3668a434faca1339789ed2f043d679199309)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index b1e62cddc5f2,2c5f3533bbc9..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -130,6 -131,13 +132,16 @@@ struct mlx5_ib_ucontext 
+  	/* Transport Domain number */
+  	u32			tdn;
+  	struct list_head	vma_private_list;
+++<<<<<<< HEAD
+++=======
++ 	/* protect vma_private_list add/del */
++ 	struct mutex		vma_private_list_mutex;
++ 
++ 	unsigned long		upd_xlt_page;
++ 	/* protect ODP/KSM */
++ 	struct mutex		upd_xlt_page_mutex;
++ 	u64			lib_caps;
+++>>>>>>> ad9a3668a434 (IB/mlx5: Serialize access to the VMA list)
+  };
+  
+  static inline struct mlx5_ib_ucontext *to_mucontext(struct ib_ucontext *ibucontext)
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index d8c47db31d06..d4e289fa1520 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -1257,6 +1257,7 @@ static struct ib_ucontext *mlx5_ib_alloc_ucontext(struct ib_device *ibdev,
+ 	}
+ 
+ 	INIT_LIST_HEAD(&context->vma_private_list);
++	mutex_init(&context->vma_private_list_mutex);
+ 	INIT_LIST_HEAD(&context->db_page_list);
+ 	mutex_init(&context->db_page_mutex);
+ 
+@@ -1408,7 +1409,9 @@ static void  mlx5_ib_vma_close(struct vm_area_struct *area)
+ 	 * mlx5_ib_disassociate_ucontext().
+ 	 */
+ 	mlx5_ib_vma_priv_data->vma = NULL;
++	mutex_lock(mlx5_ib_vma_priv_data->vma_private_list_mutex);
+ 	list_del(&mlx5_ib_vma_priv_data->list);
++	mutex_unlock(mlx5_ib_vma_priv_data->vma_private_list_mutex);
+ 	kfree(mlx5_ib_vma_priv_data);
+ }
+ 
+@@ -1428,10 +1431,13 @@ static int mlx5_ib_set_vma_data(struct vm_area_struct *vma,
+ 		return -ENOMEM;
+ 
+ 	vma_prv->vma = vma;
++	vma_prv->vma_private_list_mutex = &ctx->vma_private_list_mutex;
+ 	vma->vm_private_data = vma_prv;
+ 	vma->vm_ops =  &mlx5_ib_vm_ops;
+ 
++	mutex_lock(&ctx->vma_private_list_mutex);
+ 	list_add(&vma_prv->list, vma_head);
++	mutex_unlock(&ctx->vma_private_list_mutex);
+ 
+ 	return 0;
+ }
+@@ -1474,6 +1480,7 @@ static void mlx5_ib_disassociate_ucontext(struct ib_ucontext *ibcontext)
+ 	 * mlx5_ib_vma_close.
+ 	 */
+ 	down_write(&owning_mm->mmap_sem);
++	mutex_lock(&context->vma_private_list_mutex);
+ 	list_for_each_entry_safe(vma_private, n, &context->vma_private_list,
+ 				 list) {
+ 		vma = vma_private->vma;
+@@ -1488,6 +1495,7 @@ static void mlx5_ib_disassociate_ucontext(struct ib_ucontext *ibcontext)
+ 		list_del(&vma_private->list);
+ 		kfree(vma_private);
+ 	}
++	mutex_unlock(&context->vma_private_list_mutex);
+ 	up_write(&owning_mm->mmap_sem);
+ 	mmput(owning_mm);
+ 	put_task_struct(owning_process);
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
