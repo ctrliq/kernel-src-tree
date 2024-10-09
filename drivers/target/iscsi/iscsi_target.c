@@ -1518,7 +1518,7 @@ __iscsit_check_dataout_hdr(struct iscsi_conn *conn, void *buf,
 		}
 	}
 	/*
-	 * Preform DataSN, DataSequenceInOrder, DataPDUInOrder, and
+	 * Perform DataSN, DataSequenceInOrder, DataPDUInOrder, and
 	 * within-command recovery checks before receiving the payload.
 	 */
 	rc = iscsit_check_pre_dataout(cmd, buf);
