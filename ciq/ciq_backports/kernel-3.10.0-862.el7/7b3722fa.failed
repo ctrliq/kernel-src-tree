@@ -1,0 +1,475 @@
+net/mlx5e: Support RSS for GRE tunneled packets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Support RSS for GRE tunneled packets (Kamal Heib) [1467198 1456694]
+Rebuild_FUZZ: 95.56%
+commit-author Gal Pressman <galp@mellanox.com>
+commit 7b3722fa9ef647eb1ae6a60a5d46f7c67ab09a33
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7b3722fa.failed
+
+Introduce a new flow table and indirect TIRs which are used to hash the
+inner packet headers of GRE tunneled packets.
+
+When a GRE tunneled packet is received, the TTC flow table will match
+the new IPv4/6->GRE rules which will forward it to the inner TTC table.
+The inner TTC is similar to its counterpart outer TTC table, but
+matching the inner packet headers instead of the outer ones (and does
+not include the new IPv4/6->GRE rules).
+The new rules will not add steering hops since they are added to an
+already existing flow group which will be matched regardless of this
+patch. Non GRE traffic will not be affected.
+
+The inner flow table will forward the packet to inner indirect TIRs
+which hash the inner packet and thus result in RSS for the tunneled
+packets.
+
+Testing 8 TCP streams bandwidth over GRE:
+System: Intel(R) Xeon(R) CPU E5-2680 v3 @ 2.50GHz
+NIC: Mellanox Technologies MT28800 Family [ConnectX-5 Ex]
+Before: 21.3 Gbps (Single RQ)
+Now   : 90.5 Gbps (RSS spread on 8 RQs)
+
+	Signed-off-by: Gal Pressman <galp@mellanox.com>
+	Reviewed-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 7b3722fa9ef647eb1ae6a60a5d46f7c67ab09a33)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_fs.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 819a88f4cbad,a31912415264..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -696,8 -778,10 +705,9 @@@ struct mlx5e_priv 
+  	u32                        tisn[MLX5E_MAX_NUM_TC];
+  	struct mlx5e_rqt           indir_rqt;
+  	struct mlx5e_tir           indir_tir[MLX5E_NUM_INDIR_TIRS];
++ 	struct mlx5e_tir           inner_indir_tir[MLX5E_NUM_INDIR_TIRS];
+  	struct mlx5e_tir           direct_tir[MLX5E_MAX_NUM_CHANNELS];
+  	u32                        tx_rates[MLX5E_MAX_NUM_SQS];
+ -	int                        hard_mtu;
+  
+  	struct mlx5e_flow_steering fs;
+  	struct mlx5e_vxlan_db      vxlan;
+@@@ -791,11 -898,22 +801,19 @@@ int mlx5e_vlan_rx_kill_vid(struct net_d
+  void mlx5e_enable_vlan_filter(struct mlx5e_priv *priv);
+  void mlx5e_disable_vlan_filter(struct mlx5e_priv *priv);
+  
+ -struct mlx5e_redirect_rqt_param {
+ -	bool is_rss;
+ -	union {
+ -		u32 rqn; /* Direct RQN (Non-RSS) */
+ -		struct {
+ -			u8 hfunc;
+ -			struct mlx5e_channels *channels;
+ -		} rss; /* RSS data */
+ -	};
+ -};
+ +int mlx5e_modify_rqs_vsd(struct mlx5e_priv *priv, bool vsd);
+  
+++<<<<<<< HEAD
+ +int mlx5e_redirect_rqt(struct mlx5e_priv *priv, u32 rqtn, int sz, int ix);
+ +void mlx5e_build_indir_tir_ctx_hash(struct mlx5e_priv *priv, void *tirc,
+ +				    enum mlx5e_traffic_types tt);
+++=======
++ int mlx5e_redirect_rqt(struct mlx5e_priv *priv, u32 rqtn, int sz,
++ 		       struct mlx5e_redirect_rqt_param rrp);
++ void mlx5e_build_indir_tir_ctx_hash(struct mlx5e_params *params,
++ 				    enum mlx5e_traffic_types tt,
++ 				    void *tirc, bool inner);
+++>>>>>>> 7b3722fa9ef6 (net/mlx5e: Support RSS for GRE tunneled packets)
+  
+  int mlx5e_open_locked(struct net_device *netdev);
+  int mlx5e_close_locked(struct net_device *netdev);
+@@@ -806,13 -939,38 +824,24 @@@ int mlx5e_get_max_linkspeed(struct mlx5
+  
+  void mlx5e_set_rx_cq_mode_params(struct mlx5e_params *params,
+  				 u8 cq_period_mode);
+ -void mlx5e_set_rq_type_params(struct mlx5_core_dev *mdev,
+ -			      struct mlx5e_params *params, u8 rq_type);
+ +void mlx5e_set_rq_type_params(struct mlx5e_priv *priv, u8 rq_type);
+  
+++<<<<<<< HEAD
+ +static inline void mlx5e_tx_notify_hw(struct mlx5e_sq *sq,
+ +				      struct mlx5_wqe_ctrl_seg *ctrl, int bf_sz)
+++=======
++ static inline bool mlx5e_tunnel_inner_ft_supported(struct mlx5_core_dev *mdev)
++ {
++ 	return (MLX5_CAP_ETH(mdev, tunnel_stateless_gre) &&
++ 		MLX5_CAP_FLOWTABLE_NIC_RX(mdev, ft_field_support.inner_ip_version));
++ }
++ 
++ static inline
++ struct mlx5e_tx_wqe *mlx5e_post_nop(struct mlx5_wq_cyc *wq, u32 sqn, u16 *pc)
+++>>>>>>> 7b3722fa9ef6 (net/mlx5e: Support RSS for GRE tunneled packets)
+  {
+ -	u16                         pi   = *pc & wq->sz_m1;
+ -	struct mlx5e_tx_wqe        *wqe  = mlx5_wq_cyc_get_wqe(wq, pi);
+ -	struct mlx5_wqe_ctrl_seg   *cseg = &wqe->ctrl;
+ -
+ -	memset(cseg, 0, sizeof(*cseg));
+ -
+ -	cseg->opmod_idx_opcode = cpu_to_be32((*pc << 8) | MLX5_OPCODE_NOP);
+ -	cseg->qpn_ds           = cpu_to_be32((sqn << 8) | 0x01);
+ +	u16 ofst = MLX5_BF_OFFSET + sq->bf_offset;
+  
+ -	(*pc)++;
+ -
+ -	return wqe;
+ -}
+ -
+ -static inline
+ -void mlx5e_notify_hw(struct mlx5_wq_cyc *wq, u16 pc,
+ -		     void __iomem *uar_map,
+ -		     struct mlx5_wqe_ctrl_seg *ctrl)
+ -{
+ -	ctrl->fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
+  	/* ensure wqe is visible to device before updating doorbell record */
+  	dma_wmb();
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+index a12add73652e,c6ec90e9c95b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+@@@ -1111,9 -1212,18 +1111,22 @@@ static void mlx5e_modify_tirs_hash(stru
+  
+  	for (tt = 0; tt < MLX5E_NUM_INDIR_TIRS; tt++) {
+  		memset(tirc, 0, ctxlen);
+++<<<<<<< HEAD
+ +		mlx5e_build_indir_tir_ctx_hash(priv, tirc, tt);
+++=======
++ 		mlx5e_build_indir_tir_ctx_hash(&priv->channels.params, tt, tirc, false);
+++>>>>>>> 7b3722fa9ef6 (net/mlx5e: Support RSS for GRE tunneled packets)
+  		mlx5_core_modify_tir(mdev, priv->indir_tir[tt].tirn, in, inlen);
+  	}
++ 
++ 	if (!mlx5e_tunnel_inner_ft_supported(priv->mdev))
++ 		return;
++ 
++ 	for (tt = 0; tt < MLX5E_NUM_INDIR_TIRS; tt++) {
++ 		memset(tirc, 0, ctxlen);
++ 		mlx5e_build_indir_tir_ctx_hash(&priv->channels.params, tt, tirc, true);
++ 		mlx5_core_modify_tir(mdev, priv->inner_indir_tir[tt].tirn, in, inlen);
++ 	}
+  }
+  
+  static int mlx5e_set_rxfh(struct net_device *dev, const u32 *indir,
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_fs.c
+index a357cee0328f,f11fd07ac4dd..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_fs.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_fs.c
+@@@ -816,7 -868,191 +858,195 @@@ err
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +static void mlx5e_destroy_ttc_table(struct mlx5e_priv *priv)
+++=======
++ static struct mlx5_flow_handle *
++ mlx5e_generate_inner_ttc_rule(struct mlx5e_priv *priv,
++ 			      struct mlx5_flow_table *ft,
++ 			      struct mlx5_flow_destination *dest,
++ 			      u16 etype, u8 proto)
++ {
++ 	MLX5_DECLARE_FLOW_ACT(flow_act);
++ 	struct mlx5_flow_handle *rule;
++ 	struct mlx5_flow_spec *spec;
++ 	int err = 0;
++ 	u8 ipv;
++ 
++ 	spec = kvzalloc(sizeof(*spec), GFP_KERNEL);
++ 	if (!spec)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	ipv = mlx5e_etype_to_ipv(etype);
++ 	if (etype && ipv) {
++ 		spec->match_criteria_enable = MLX5_MATCH_INNER_HEADERS;
++ 		MLX5_SET_TO_ONES(fte_match_param, spec->match_criteria, inner_headers.ip_version);
++ 		MLX5_SET(fte_match_param, spec->match_value, inner_headers.ip_version, ipv);
++ 	}
++ 
++ 	if (proto) {
++ 		spec->match_criteria_enable = MLX5_MATCH_INNER_HEADERS;
++ 		MLX5_SET_TO_ONES(fte_match_param, spec->match_criteria, inner_headers.ip_protocol);
++ 		MLX5_SET(fte_match_param, spec->match_value, inner_headers.ip_protocol, proto);
++ 	}
++ 
++ 	rule = mlx5_add_flow_rules(ft, spec, &flow_act, dest, 1);
++ 	if (IS_ERR(rule)) {
++ 		err = PTR_ERR(rule);
++ 		netdev_err(priv->netdev, "%s: add rule failed\n", __func__);
++ 	}
++ 
++ 	kvfree(spec);
++ 	return err ? ERR_PTR(err) : rule;
++ }
++ 
++ static int mlx5e_generate_inner_ttc_table_rules(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5_flow_destination dest;
++ 	struct mlx5_flow_handle **rules;
++ 	struct mlx5e_ttc_table *ttc;
++ 	struct mlx5_flow_table *ft;
++ 	int err;
++ 	int tt;
++ 
++ 	ttc =  &priv->fs.inner_ttc;
++ 	ft = ttc->ft.t;
++ 	rules = ttc->rules;
++ 
++ 	dest.type = MLX5_FLOW_DESTINATION_TYPE_TIR;
++ 	for (tt = 0; tt < MLX5E_NUM_TT; tt++) {
++ 		if (tt == MLX5E_TT_ANY)
++ 			dest.tir_num = priv->direct_tir[0].tirn;
++ 		else
++ 			dest.tir_num = priv->inner_indir_tir[tt].tirn;
++ 
++ 		rules[tt] = mlx5e_generate_inner_ttc_rule(priv, ft, &dest,
++ 							  ttc_rules[tt].etype,
++ 							  ttc_rules[tt].proto);
++ 		if (IS_ERR(rules[tt]))
++ 			goto del_rules;
++ 	}
++ 
++ 	return 0;
++ 
++ del_rules:
++ 	err = PTR_ERR(rules[tt]);
++ 	rules[tt] = NULL;
++ 	mlx5e_cleanup_ttc_rules(ttc);
++ 	return err;
++ }
++ 
++ static int mlx5e_create_inner_ttc_table_groups(struct mlx5e_ttc_table *ttc)
++ {
++ 	int inlen = MLX5_ST_SZ_BYTES(create_flow_group_in);
++ 	struct mlx5e_flow_table *ft = &ttc->ft;
++ 	int ix = 0;
++ 	u32 *in;
++ 	int err;
++ 	u8 *mc;
++ 
++ 	ft->g = kcalloc(MLX5E_INNER_TTC_NUM_GROUPS, sizeof(*ft->g), GFP_KERNEL);
++ 	if (!ft->g)
++ 		return -ENOMEM;
++ 	in = kvzalloc(inlen, GFP_KERNEL);
++ 	if (!in) {
++ 		kfree(ft->g);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	/* L4 Group */
++ 	mc = MLX5_ADDR_OF(create_flow_group_in, in, match_criteria);
++ 	MLX5_SET_TO_ONES(fte_match_param, mc, inner_headers.ip_protocol);
++ 	MLX5_SET_TO_ONES(fte_match_param, mc, inner_headers.ip_version);
++ 	MLX5_SET_CFG(in, match_criteria_enable, MLX5_MATCH_INNER_HEADERS);
++ 	MLX5_SET_CFG(in, start_flow_index, ix);
++ 	ix += MLX5E_INNER_TTC_GROUP1_SIZE;
++ 	MLX5_SET_CFG(in, end_flow_index, ix - 1);
++ 	ft->g[ft->num_groups] = mlx5_create_flow_group(ft->t, in);
++ 	if (IS_ERR(ft->g[ft->num_groups]))
++ 		goto err;
++ 	ft->num_groups++;
++ 
++ 	/* L3 Group */
++ 	MLX5_SET(fte_match_param, mc, inner_headers.ip_protocol, 0);
++ 	MLX5_SET_CFG(in, start_flow_index, ix);
++ 	ix += MLX5E_INNER_TTC_GROUP2_SIZE;
++ 	MLX5_SET_CFG(in, end_flow_index, ix - 1);
++ 	ft->g[ft->num_groups] = mlx5_create_flow_group(ft->t, in);
++ 	if (IS_ERR(ft->g[ft->num_groups]))
++ 		goto err;
++ 	ft->num_groups++;
++ 
++ 	/* Any Group */
++ 	memset(in, 0, inlen);
++ 	MLX5_SET_CFG(in, start_flow_index, ix);
++ 	ix += MLX5E_INNER_TTC_GROUP3_SIZE;
++ 	MLX5_SET_CFG(in, end_flow_index, ix - 1);
++ 	ft->g[ft->num_groups] = mlx5_create_flow_group(ft->t, in);
++ 	if (IS_ERR(ft->g[ft->num_groups]))
++ 		goto err;
++ 	ft->num_groups++;
++ 
++ 	kvfree(in);
++ 	return 0;
++ 
++ err:
++ 	err = PTR_ERR(ft->g[ft->num_groups]);
++ 	ft->g[ft->num_groups] = NULL;
++ 	kvfree(in);
++ 
++ 	return err;
++ }
++ 
++ static int mlx5e_create_inner_ttc_table(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5e_ttc_table *ttc = &priv->fs.inner_ttc;
++ 	struct mlx5_flow_table_attr ft_attr = {};
++ 	struct mlx5e_flow_table *ft = &ttc->ft;
++ 	int err;
++ 
++ 	if (!mlx5e_tunnel_inner_ft_supported(priv->mdev))
++ 		return 0;
++ 
++ 	ft_attr.max_fte = MLX5E_INNER_TTC_TABLE_SIZE;
++ 	ft_attr.level   = MLX5E_INNER_TTC_FT_LEVEL;
++ 	ft_attr.prio    = MLX5E_NIC_PRIO;
++ 
++ 	ft->t = mlx5_create_flow_table(priv->fs.ns, &ft_attr);
++ 	if (IS_ERR(ft->t)) {
++ 		err = PTR_ERR(ft->t);
++ 		ft->t = NULL;
++ 		return err;
++ 	}
++ 
++ 	err = mlx5e_create_inner_ttc_table_groups(ttc);
++ 	if (err)
++ 		goto err;
++ 
++ 	err = mlx5e_generate_inner_ttc_table_rules(priv);
++ 	if (err)
++ 		goto err;
++ 
++ 	return 0;
++ 
++ err:
++ 	mlx5e_destroy_flow_table(ft);
++ 	return err;
++ }
++ 
++ static void mlx5e_destroy_inner_ttc_table(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5e_ttc_table *ttc = &priv->fs.inner_ttc;
++ 
++ 	if (!mlx5e_tunnel_inner_ft_supported(priv->mdev))
++ 		return;
++ 
++ 	mlx5e_cleanup_ttc_rules(ttc);
++ 	mlx5e_destroy_flow_table(&ttc->ft);
++ }
++ 
++ void mlx5e_destroy_ttc_table(struct mlx5e_priv *priv)
+++>>>>>>> 7b3722fa9ef6 (net/mlx5e: Support RSS for GRE tunneled packets)
+  {
+  	struct mlx5e_ttc_table *ttc = &priv->fs.ttc;
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 582cfccdbde3,111c7523d448..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -1975,15 -2343,16 +1975,22 @@@ static void mlx5e_build_tir_ctx_lro(voi
+  		 MLX5_TIRC_LRO_ENABLE_MASK_IPV4_LRO |
+  		 MLX5_TIRC_LRO_ENABLE_MASK_IPV6_LRO);
+  	MLX5_SET(tirc, tirc, lro_max_ip_payload_size,
+ -		 (params->lro_wqe_sz - ROUGH_MAX_L2_L3_HDR_SZ) >> 8);
+ -	MLX5_SET(tirc, tirc, lro_timeout_period_usecs, params->lro_timeout);
+ +		 (priv->params.lro_wqe_sz -
+ +		  ROUGH_MAX_L2_L3_HDR_SZ) >> 8);
+ +	MLX5_SET(tirc, tirc, lro_timeout_period_usecs, priv->params.lro_timeout);
+  }
+  
+++<<<<<<< HEAD
+ +void mlx5e_build_indir_tir_ctx_hash(struct mlx5e_priv *priv, void *tirc,
+ +				    enum mlx5e_traffic_types tt)
+++=======
++ void mlx5e_build_indir_tir_ctx_hash(struct mlx5e_params *params,
++ 				    enum mlx5e_traffic_types tt,
++ 				    void *tirc, bool inner)
+++>>>>>>> 7b3722fa9ef6 (net/mlx5e: Support RSS for GRE tunneled packets)
+  {
+- 	void *hfso = MLX5_ADDR_OF(tirc, tirc, rx_hash_field_selector_outer);
++ 	void *hfso = inner ? MLX5_ADDR_OF(tirc, tirc, rx_hash_field_selector_inner) :
++ 			     MLX5_ADDR_OF(tirc, tirc, rx_hash_field_selector_outer);
+  
+  #define MLX5_HASH_IP            (MLX5_HASH_FIELD_SEL_SRC_IP   |\
+  				 MLX5_HASH_FIELD_SEL_DST_IP)
+@@@ -2463,11 -2881,10 +2485,15 @@@ static void mlx5e_build_indir_tir_ctx(s
+  
+  	MLX5_SET(tirc, tirc, disp_type, MLX5_TIRC_DISP_TYPE_INDIRECT);
+  	MLX5_SET(tirc, tirc, indirect_table, priv->indir_rqt.rqtn);
+++<<<<<<< HEAD
+ +	mlx5e_build_indir_tir_ctx_hash(priv, tirc, tt);
+++=======
++ 	mlx5e_build_indir_tir_ctx_hash(&priv->channels.params, tt, tirc, false);
+++>>>>>>> 7b3722fa9ef6 (net/mlx5e: Support RSS for GRE tunneled packets)
+  }
+  
+ -static void mlx5e_build_direct_tir_ctx(struct mlx5e_priv *priv, u32 rqtn, u32 *tirc)
+ +static void mlx5e_build_direct_tir_ctx(struct mlx5e_priv *priv, u32 *tirc,
+ +				       u32 rqtn)
+  {
+  	MLX5_SET(tirc, tirc, transport_domain, priv->mdev->mlx5e_res.td.tdn);
+  
+@@@ -2496,17 -2914,38 +2523,42 @@@ static int mlx5e_create_indirect_tirs(s
+  		memset(in, 0, inlen);
+  		tir = &priv->indir_tir[tt];
+  		tirc = MLX5_ADDR_OF(create_tir_in, in, ctx);
+ -		mlx5e_build_indir_tir_ctx(priv, tt, tirc);
+ +		mlx5e_build_indir_tir_ctx(priv, tirc, tt);
+  		err = mlx5e_create_tir(priv->mdev, tir, in, inlen);
+- 		if (err)
+- 			goto err_destroy_tirs;
++ 		if (err) {
++ 			mlx5_core_warn(priv->mdev, "create indirect tirs failed, %d\n", err);
++ 			goto err_destroy_inner_tirs;
++ 		}
++ 	}
++ 
++ 	if (!mlx5e_tunnel_inner_ft_supported(priv->mdev))
++ 		goto out;
++ 
++ 	for (i = 0; i < MLX5E_NUM_INDIR_TIRS; i++) {
++ 		memset(in, 0, inlen);
++ 		tir = &priv->inner_indir_tir[i];
++ 		tirc = MLX5_ADDR_OF(create_tir_in, in, ctx);
++ 		mlx5e_build_inner_indir_tir_ctx(priv, i, tirc);
++ 		err = mlx5e_create_tir(priv->mdev, tir, in, inlen);
++ 		if (err) {
++ 			mlx5_core_warn(priv->mdev, "create inner indirect tirs failed, %d\n", err);
++ 			goto err_destroy_inner_tirs;
++ 		}
+  	}
+  
++ out:
+  	kvfree(in);
+  
+  	return 0;
+  
+++<<<<<<< HEAD
+ +err_destroy_tirs:
+++=======
++ err_destroy_inner_tirs:
++ 	for (i--; i >= 0; i--)
++ 		mlx5e_destroy_tir(priv->mdev, &priv->inner_indir_tir[i]);
++ 
+++>>>>>>> 7b3722fa9ef6 (net/mlx5e: Support RSS for GRE tunneled packets)
+  	for (tt--; tt >= 0; tt--)
+  		mlx5e_destroy_tir(priv->mdev, &priv->indir_tir[tt]);
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_fs.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+index bdd564dcef53..3dc16db9d0e0 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+@@ -82,8 +82,8 @@
+ #define ETHTOOL_PRIO_NUM_LEVELS 1
+ #define ETHTOOL_NUM_PRIOS 11
+ #define ETHTOOL_MIN_LEVEL (KERNEL_MIN_LEVEL + ETHTOOL_NUM_PRIOS)
+-/* Vlan, mac, ttc, aRFS */
+-#define KERNEL_NIC_PRIO_NUM_LEVELS 4
++/* Vlan, mac, ttc, inner ttc, aRFS */
++#define KERNEL_NIC_PRIO_NUM_LEVELS 5
+ #define KERNEL_NIC_NUM_PRIOS 1
+ /* One more level for tc */
+ #define KERNEL_MIN_LEVEL (KERNEL_NIC_PRIO_NUM_LEVELS + 1)
