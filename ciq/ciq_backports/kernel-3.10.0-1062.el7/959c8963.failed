@@ -1,0 +1,117 @@
+memcg, slab: fix barrier usage when accessing memcg_caches
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Vladimir Davydov <vdavydov@parallels.com>
+commit 959c8963fc6c8c9b97e80c55ce77105247040e7d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/959c8963.failed
+
+Each root kmem_cache has pointers to per-memcg caches stored in its
+memcg_params::memcg_caches array.  Whenever we want to allocate a slab
+for a memcg, we access this array to get per-memcg cache to allocate
+from (see memcg_kmem_get_cache()).  The access must be lock-free for
+performance reasons, so we should use barriers to assert the kmem_cache
+is up-to-date.
+
+First, we should place a write barrier immediately before setting the
+pointer to it in the memcg_caches array in order to make sure nobody
+will see a partially initialized object.  Second, we should issue a read
+barrier before dereferencing the pointer to conform to the write
+barrier.
+
+However, currently the barrier usage looks rather strange.  We have a
+write barrier *after* setting the pointer and a read barrier *before*
+reading the pointer, which is incorrect.  This patch fixes this.
+
+	Signed-off-by: Vladimir Davydov <vdavydov@parallels.com>
+	Cc: Michal Hocko <mhocko@suse.cz>
+	Cc: Glauber Costa <glommer@gmail.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Balbir Singh <bsingharora@gmail.com>
+	Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: Christoph Lameter <cl@linux.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 959c8963fc6c8c9b97e80c55ce77105247040e7d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+diff --cc mm/memcontrol.c
+index 5a271ae6c0ad,322d18dc17f0..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -3259,13 -3274,14 +3259,19 @@@ void memcg_register_cache(struct kmem_c
+  	list_add(&s->memcg_params->list, &memcg->memcg_slab_caches);
+  	mutex_unlock(&memcg->slab_caches_mutex);
+  
+++<<<<<<< HEAD
+ +	VM_BUG_ON(root->memcg_params->memcg_caches[id]);
+ +	root->memcg_params->memcg_caches[id] = s;
+++=======
+++>>>>>>> 959c8963fc6c (memcg, slab: fix barrier usage when accessing memcg_caches)
+  	/*
+- 	 * the readers won't lock, make sure everybody sees the updated value,
+- 	 * so they won't put stuff in the queue again for no reason
++ 	 * Since readers won't lock (see cache_from_memcg_idx()), we need a
++ 	 * barrier here to ensure nobody will see the kmem_cache partially
++ 	 * initialized.
+  	 */
+- 	wmb();
++ 	smp_wmb();
++ 
++ 	root->memcg_params->memcg_caches[id] = s;
+  }
+  
+  void memcg_unregister_cache(struct kmem_cache *s)
+@@@ -3618,15 -3621,9 +3624,21 @@@ struct kmem_cache *__memcg_kmem_get_cac
+  	if (!memcg_can_account_kmem(memcg))
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	idx = memcg_cache_id(memcg);
+ +
+ +	/*
+ +	 * barrier to mare sure we're always seeing the up to date value.  The
+ +	 * code updating memcg_caches will issue a write barrier to match this.
+ +	 */
+ +	read_barrier_depends();
+ +	if (likely(cachep->memcg_params->memcg_caches[idx])) {
+ +		cachep = cachep->memcg_params->memcg_caches[idx];
+++=======
++ 	memcg_cachep = cache_from_memcg_idx(cachep, memcg_cache_id(memcg));
++ 	if (likely(memcg_cachep)) {
++ 		cachep = memcg_cachep;
+++>>>>>>> 959c8963fc6c (memcg, slab: fix barrier usage when accessing memcg_caches)
+  		goto out;
+  	}
+  
+* Unmerged path mm/memcontrol.c
+diff --git a/mm/slab.h b/mm/slab.h
+index 6a02fdac0ff7..28ef770a3c29 100644
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@ -165,9 +165,19 @@ static inline const char *cache_name(struct kmem_cache *s)
+ static inline struct kmem_cache *
+ cache_from_memcg_idx(struct kmem_cache *s, int idx)
+ {
++	struct kmem_cache *cachep;
++
+ 	if (!s->memcg_params)
+ 		return NULL;
+-	return s->memcg_params->memcg_caches[idx];
++	cachep = s->memcg_params->memcg_caches[idx];
++
++	/*
++	 * Make sure we will access the up-to-date value. The code updating
++	 * memcg_caches issues a write barrier to match this (see
++	 * memcg_register_cache()).
++	 */
++	smp_read_barrier_depends();
++	return cachep;
+ }
+ 
+ static inline struct kmem_cache *memcg_root_cache(struct kmem_cache *s)
