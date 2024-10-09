@@ -1,0 +1,214 @@
+block: add code to track actual device queue depth
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [block] add code to track actual device queue depth (Ming Lei) [1458104]
+Rebuild_FUZZ: 92.47%
+commit-author Jens Axboe <axboe@fb.com>
+commit d278d4a8892f13b6a9eb6102b356402f0e062324
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d278d4a8.failed
+
+For blk-mq, ->nr_requests does track queue depth, at least at init
+time. But for the older queue paths, it's simply a soft setting.
+On top of that, it's generally larger than the hardware setting
+on purpose, to allow backup of requests for merging.
+
+Fill a hole in struct request with a 'queue_depth' member, that
+drivers can call to more closely inform the block layer of the
+real queue depth.
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit d278d4a8892f13b6a9eb6102b356402f0e062324)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-settings.c
+#	drivers/scsi/scsi.c
+diff --cc block/blk-settings.c
+index e88316791131,9cf053759363..000000000000
+--- a/block/blk-settings.c
++++ b/block/blk-settings.c
+@@@ -878,6 -836,41 +878,44 @@@ void blk_queue_flush_queueable(struct r
+  }
+  EXPORT_SYMBOL_GPL(blk_queue_flush_queueable);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * blk_set_queue_depth - tell the block layer about the device queue depth
++  * @q:		the request queue for the device
++  * @depth:		queue depth
++  *
++  */
++ void blk_set_queue_depth(struct request_queue *q, unsigned int depth)
++ {
++ 	q->queue_depth = depth;
++ }
++ EXPORT_SYMBOL(blk_set_queue_depth);
++ 
++ /**
++  * blk_queue_write_cache - configure queue's write cache
++  * @q:		the request queue for the device
++  * @wc:		write back cache on or off
++  * @fua:	device supports FUA writes, if true
++  *
++  * Tell the block layer about the write cache of @q.
++  */
++ void blk_queue_write_cache(struct request_queue *q, bool wc, bool fua)
++ {
++ 	spin_lock_irq(q->queue_lock);
++ 	if (wc)
++ 		queue_flag_set(QUEUE_FLAG_WC, q);
++ 	else
++ 		queue_flag_clear(QUEUE_FLAG_WC, q);
++ 	if (fua)
++ 		queue_flag_set(QUEUE_FLAG_FUA, q);
++ 	else
++ 		queue_flag_clear(QUEUE_FLAG_FUA, q);
++ 	spin_unlock_irq(q->queue_lock);
++ }
++ EXPORT_SYMBOL_GPL(blk_queue_write_cache);
++ 
+++>>>>>>> d278d4a8892f (block: add code to track actual device queue depth)
+  static int __init blk_settings_init(void)
+  {
+  	blk_max_low_pfn = max_low_pfn - 1;
+diff --cc drivers/scsi/scsi.c
+index 0c4c5ef6a693,75455d4dab68..000000000000
+--- a/drivers/scsi/scsi.c
++++ b/drivers/scsi/scsi.c
+@@@ -725,78 -606,27 +725,85 @@@ void scsi_finish_command(struct scsi_cm
+  	}
+  	scsi_io_completion(cmd, good_bytes);
+  }
+ +EXPORT_SYMBOL(scsi_finish_command);
+  
+  /**
+ - * scsi_change_queue_depth - change a device's queue depth
+ + * scsi_adjust_queue_depth - Let low level drivers change a device's queue depth
+   * @sdev: SCSI Device in question
+ - * @depth: number of commands allowed to be queued to the driver
+ + * @tagged: Do we use tagged queueing (non-0) or do we treat
+ + *          this device as an untagged device (0)
+ + * @tags: Number of tags allowed if tagged queueing enabled,
+ + *        or number of commands the low level driver can
+ + *        queue up in non-tagged mode (as per cmd_per_lun).
+   *
+ - * Sets the device queue depth and returns the new value.
+ + * Returns:	Nothing
+ + *
+ + * Lock Status:	None held on entry
+ + *
+ + * Notes:	Low level drivers may call this at any time and we will do
+ + * 		the right thing depending on whether or not the device is
+ + * 		currently active and whether or not it even has the
+ + * 		command blocks built yet.
+   */
+ -int scsi_change_queue_depth(struct scsi_device *sdev, int depth)
+ +void scsi_adjust_queue_depth(struct scsi_device *sdev, int tagged, int tags)
+  {
+ -	if (depth > 0) {
+ -		sdev->queue_depth = depth;
+ -		wmb();
+ +	unsigned long flags;
+ +
+ +	/*
+ +	 * refuse to set tagged depth to an unworkable size
+ +	 */
+ +	if (tags <= 0)
+ +		return;
+ +
+ +	spin_lock_irqsave(sdev->request_queue->queue_lock, flags);
+ +
+ +	/*
+ +	 * Check to see if the queue is managed by the block layer.
+ +	 * If it is, and we fail to adjust the depth, exit.
+ +	 *
+ +	 * Do not resize the tag map if it is a host wide share bqt,
+ +	 * because the size should be the hosts's can_queue. If there
+ +	 * is more IO than the LLD's can_queue (so there are not enuogh
+ +	 * tags) request_fn's host queue ready check will handle it.
+ +	 */
+ +	if (!shost_use_blk_mq(sdev->host) && !sdev->host->bqt) {
+ +		if (blk_queue_tagged(sdev->request_queue) &&
+ +		    blk_queue_resize_tags(sdev->request_queue, tags) != 0)
+ +			goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	sdev->queue_depth = tags;
+ +	switch (tagged) {
+ +		case 0:
+ +			sdev->ordered_tags = 0;
+ +			sdev->simple_tags = 0;
+ +			break;
+ +		case MSG_ORDERED_TAG:
+ +			sdev->ordered_tags = 1;
+ +			sdev->simple_tags = 1;
+ +			break;
+ +		case MSG_SIMPLE_TAG:
+ +			sdev->ordered_tags = 0;
+ +			sdev->simple_tags = 1;
+ +			break;
+ +		default:
+ +			sdev->ordered_tags = 0;
+ +			sdev->simple_tags = 0;
+ +			sdev_printk(KERN_WARNING, sdev,
+ +				    "scsi_adjust_queue_depth, bad queue type, "
+ +				    "disabled\n");
+ +	}
+ + out:
+ +	spin_unlock_irqrestore(sdev->request_queue->queue_lock, flags);
+++=======
++ 	if (sdev->request_queue)
++ 		blk_set_queue_depth(sdev->request_queue, depth);
++ 
++ 	return sdev->queue_depth;
+++>>>>>>> d278d4a8892f (block: add code to track actual device queue depth)
+  }
+ -EXPORT_SYMBOL(scsi_change_queue_depth);
+ +EXPORT_SYMBOL(scsi_adjust_queue_depth);
+  
+  /**
+   * scsi_track_queue_full - track QUEUE_FULL events to adjust queue depth
+* Unmerged path block/blk-settings.c
+* Unmerged path drivers/scsi/scsi.c
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index ba3405333171..2786aaa6b266 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -386,6 +386,8 @@ struct request_queue {
+ 
+ 	unsigned int		nr_queues;
+ 
++	unsigned int		queue_depth;
++
+ 	/* hw dispatch queues */
+ 	struct blk_mq_hw_ctx	**queue_hw_ctx;
+ 	unsigned int		nr_hw_queues;
+@@ -767,6 +769,14 @@ static inline bool blk_write_same_mergeable(struct bio *a, struct bio *b)
+ 	return false;
+ }
+ 
++static inline unsigned int blk_queue_depth(struct request_queue *q)
++{
++	if (q->queue_depth)
++		return q->queue_depth;
++
++	return q->nr_requests;
++}
++
+ /*
+  * q->prep_rq_fn return values
+  */
+@@ -1094,6 +1104,7 @@ extern void blk_limits_io_min(struct queue_limits *limits, unsigned int min);
+ extern void blk_queue_io_min(struct request_queue *q, unsigned int min);
+ extern void blk_limits_io_opt(struct queue_limits *limits, unsigned int opt);
+ extern void blk_queue_io_opt(struct request_queue *q, unsigned int opt);
++extern void blk_set_queue_depth(struct request_queue *q, unsigned int depth);
+ extern void blk_set_default_limits(struct queue_limits *lim);
+ extern void blk_set_stacking_limits(struct queue_limits *lim);
+ extern int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
