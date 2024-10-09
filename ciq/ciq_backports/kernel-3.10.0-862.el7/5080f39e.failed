@@ -1,0 +1,95 @@
+netem: apply correct delay when rate throttling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Nik Unger <njunger@uwaterloo.ca>
+commit 5080f39e8c72e01cf37e8359023e7018e2a4901e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5080f39e.failed
+
+I recently reported on the netem list that iperf network benchmarks
+show unexpected results when a bandwidth throttling rate has been
+configured for netem. Specifically:
+
+1) The measured link bandwidth *increases* when a higher delay is added
+2) The measured link bandwidth appears higher than the specified limit
+3) The measured link bandwidth for the same very slow settings varies significantly across
+  machines
+
+The issue can be reproduced by using tc to configure netem with a
+512kbit rate and various (none, 1us, 50ms, 100ms, 200ms) delays on a
+veth pair between network namespaces, and then using iperf (or any
+other network benchmarking tool) to test throughput. Complete detailed
+instructions are in the original email chain here:
+https://lists.linuxfoundation.org/pipermail/netem/2017-February/001672.html
+
+There appear to be two underlying bugs causing these effects:
+
+- The first issue causes long delays when the rate is slow and no
+  delay is configured (e.g., "rate 512kbit"). This is because SKBs are
+  not orphaned when no delay is configured, so orphaning does not
+  occur until *after* the rate-induced delay has been applied. For
+  this reason, adding a tiny delay (e.g., "rate 512kbit delay 1us")
+  dramatically increases the measured bandwidth.
+
+- The second issue is that rate-induced delays are not correctly
+  applied, allowing SKB delays to occur in parallel. The indended
+  approach is to compute the delay for an SKB and to add this delay to
+  the end of the current queue. However, the code does not detect
+  existing SKBs in the queue due to improperly testing sch->q.qlen,
+  which is nonzero even when packets exist only in the
+  rbtree. Consequently, new SKBs do not wait for the current queue to
+  empty. When packet delays vary significantly (e.g., if packet sizes
+  are different), then this also causes unintended reordering.
+
+I modified the code to expect a delay (and orphan the SKB) when a rate
+is configured. I also added some defensive tests that correctly find
+the latest scheduled delivery time, even if it is (unexpectedly) for a
+packet in sch->q. I have tested these changes on the latest kernel
+(4.11.0-rc1+) and the iperf / ping test results are as expected.
+
+	Signed-off-by: Nik Unger <njunger@uwaterloo.ca>
+	Signed-off-by: Stephen Hemminger <stephen@networkplumber.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5080f39e8c72e01cf37e8359023e7018e2a4901e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/sch_netem.c
+diff --cc net/sched/sch_netem.c
+index e8a216075f50,94b4928ad413..000000000000
+--- a/net/sched/sch_netem.c
++++ b/net/sched/sch_netem.c
+@@@ -527,12 -530,22 +527,29 @@@ static int netem_enqueue(struct sk_buf
+  		now = psched_get_time();
+  
+  		if (q->rate) {
+- 			struct sk_buff *last;
++ 			struct netem_skb_cb *last = NULL;
++ 
++ 			if (sch->q.tail)
++ 				last = netem_skb_cb(sch->q.tail);
++ 			if (q->t_root.rb_node) {
++ 				struct sk_buff *t_skb;
++ 				struct netem_skb_cb *t_last;
++ 
++ 				t_skb = netem_rb_to_skb(rb_last(&q->t_root));
++ 				t_last = netem_skb_cb(t_skb);
++ 				if (!last ||
++ 				    t_last->time_to_send > last->time_to_send) {
++ 					last = t_last;
++ 				}
++ 			}
+  
+++<<<<<<< HEAD
+ +			if (!skb_queue_empty(&sch->q))
+ +				last = skb_peek_tail(&sch->q);
+ +			else
+ +				last = netem_rb_to_skb(rb_last(&q->t_root));
+++=======
+++>>>>>>> 5080f39e8c72 (netem: apply correct delay when rate throttling)
+  			if (last) {
+  				/*
+  				 * Last packet in queue is reference point (now),
+* Unmerged path net/sched/sch_netem.c
