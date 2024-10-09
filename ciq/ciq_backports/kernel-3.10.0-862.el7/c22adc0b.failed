@@ -1,0 +1,215 @@
+tcmu: fix crash when removing the tcmu device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Xiubo Li <lixiubo@cmss.chinamobile.com>
+commit c22adc0b0cbe3768619eedc240bf58d88a1d6ed7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c22adc0b.failed
+
+Before the nl REMOVE msg has been sent to the userspace, the ring's
+and other resources have been released, but the userspace maybe still
+using them. And then we can see the crash messages like:
+
+ring broken, not handling completions
+BUG: unable to handle kernel paging request at ffffffffffffffd0
+IP: tcmu_handle_completions+0x134/0x2f0 [target_core_user]
+PGD 11bdc0c067
+P4D 11bdc0c067
+PUD 11bdc0e067
+PMD 0
+
+Oops: 0000 [#1] SMP
+cmd_id not found, ring is broken
+RIP: 0010:tcmu_handle_completions+0x134/0x2f0 [target_core_user]
+RSP: 0018:ffffb8a2d8983d88 EFLAGS: 00010296
+RAX: 0000000000000000 RBX: ffffb8a2aaa4e000 RCX: 00000000ffffffff
+RDX: 0000000000000000 RSI: 0000000000000000 RDI: 0000000000000000
+RBP: 0000000000000000 R08: 0000000000000000 R09: 0000000000000220
+R10: 0000000076c71401 R11: ffff8d2e76c713f0 R12: ffffb8a2aad56bc0
+R13: 000000000000001c R14: ffff8d2e32c90000 R15: ffff8d2e76c713f0
+FS:  00007f411ffff700(0000) GS:ffff8d1e7fdc0000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: ffffffffffffffd0 CR3: 0000001027070000 CR4:
+00000000001406e0
+Call Trace:
+? tcmu_irqcontrol+0x2a/0x40 [target_core_user]
+? uio_write+0x7b/0xc0 [uio]
+? __vfs_write+0x37/0x150
+? __getnstimeofday64+0x3b/0xd0
+? vfs_write+0xb2/0x1b0
+? syscall_trace_enter+0x1d0/0x2b0
+? SyS_write+0x55/0xc0
+? do_syscall_64+0x67/0x150
+? entry_SYSCALL64_slow_path+0x25/0x25
+Code: 41 5d 41 5e 41 5f 5d c3 83 f8 01 0f 85 cf 01 00
+00 48 8b 7d d0 e8 dd 5c 1d f3 41 0f b7 74 24 04 48 8b
+7d c8 31 d2 e8 5c c7 1b f3 <48> 8b 7d d0 49 89 c7 c6 07
+00 0f 1f 40 00 4d 85 ff 0f 84 82 01  RIP:
+tcmu_handle_completions+0x134/0x2f0 [target_core_user]
+RSP: ffffb8a2d8983d88
+CR2: ffffffffffffffd0
+
+And the crash also could happen in tcmu_page_fault and other places.
+
+	Signed-off-by: Zhang Zhuoyu <zhangzhuoyu@cmss.chinamobile.com>
+	Signed-off-by: Xiubo Li <lixiubo@cmss.chinamobile.com>
+	Reviewed-by: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit c22adc0b0cbe3768619eedc240bf58d88a1d6ed7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 5b22226ed5d2,8b9ec0fc91c2..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -984,6 -1272,68 +986,71 @@@ static int tcmu_open(struct uio_info *i
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void tcmu_dev_call_rcu(struct rcu_head *p)
++ {
++ 	struct se_device *dev = container_of(p, struct se_device, rcu_head);
++ 	struct tcmu_dev *udev = TCMU_DEV(dev);
++ 
++ 	kfree(udev->uio_info.name);
++ 	kfree(udev->name);
++ 	kfree(udev);
++ }
++ 
++ static int tcmu_check_and_free_pending_cmd(struct tcmu_cmd *cmd)
++ {
++ 	if (test_bit(TCMU_CMD_BIT_EXPIRED, &cmd->flags)) {
++ 		kmem_cache_free(tcmu_cmd_cache, cmd);
++ 		return 0;
++ 	}
++ 	return -EINVAL;
++ }
++ 
++ static void tcmu_blocks_release(struct tcmu_dev *udev)
++ {
++ 	int i;
++ 	struct page *page;
++ 
++ 	/* Try to release all block pages */
++ 	mutex_lock(&udev->cmdr_lock);
++ 	for (i = 0; i <= udev->dbi_max; i++) {
++ 		page = radix_tree_delete(&udev->data_blocks, i);
++ 		if (page) {
++ 			__free_page(page);
++ 			atomic_dec(&global_db_count);
++ 		}
++ 	}
++ 	mutex_unlock(&udev->cmdr_lock);
++ }
++ 
++ static void tcmu_dev_kref_release(struct kref *kref)
++ {
++ 	struct tcmu_dev *udev = container_of(kref, struct tcmu_dev, kref);
++ 	struct se_device *dev = &udev->se_dev;
++ 	struct tcmu_cmd *cmd;
++ 	bool all_expired = true;
++ 	int i;
++ 
++ 	vfree(udev->mb_addr);
++ 	udev->mb_addr = NULL;
++ 
++ 	/* Upper layer should drain all requests before calling this */
++ 	spin_lock_irq(&udev->commands_lock);
++ 	idr_for_each_entry(&udev->commands, cmd, i) {
++ 		if (tcmu_check_and_free_pending_cmd(cmd) != 0)
++ 			all_expired = false;
++ 	}
++ 	idr_destroy(&udev->commands);
++ 	spin_unlock_irq(&udev->commands_lock);
++ 	WARN_ON(!all_expired);
++ 
++ 	tcmu_blocks_release(udev);
++ 
++ 	call_rcu(&dev->rcu_head, tcmu_dev_call_rcu);
++ }
++ 
+++>>>>>>> c22adc0b0cbe (tcmu: fix crash when removing the tcmu device)
+  static int tcmu_release(struct uio_info *info, struct inode *inode)
+  {
+  	struct tcmu_dev *udev = container_of(info, struct tcmu_dev, uio_info);
+@@@ -1178,23 -1570,18 +1245,30 @@@ err_netlink
+  	uio_unregister_device(&udev->uio_info);
+  err_register:
+  	vfree(udev->mb_addr);
++ 	udev->mb_addr = NULL;
+  err_vzalloc:
+  	kfree(info->name);
+ -	info->name = NULL;
+ +err_kmalloc:
+ +	mutex_lock(&device_mutex);
+ +	idr_remove(&devices_idr, udev->dev_index);
+ +	mutex_unlock(&device_mutex);
+  
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int tcmu_check_and_free_pending_cmd(struct tcmu_cmd *cmd)
+ +{
+ +	if (test_bit(TCMU_CMD_BIT_EXPIRED, &cmd->flags)) {
+ +		kmem_cache_free(tcmu_cmd_cache, cmd);
+ +		return 0;
+ +	}
+ +	return -EINVAL;
+++=======
++ static bool tcmu_dev_configured(struct tcmu_dev *udev)
++ {
++ 	return udev->uio_info.uio_dev ? true : false;
+++>>>>>>> c22adc0b0cbe (tcmu: fix crash when removing the tcmu device)
+  }
+  
+  static void tcmu_free_device(struct se_device *dev)
+@@@ -1215,32 -1598,16 +1289,37 @@@ static void tcmu_destroy_device(struct 
+  
+  	del_timer_sync(&udev->timeout);
+  
+++<<<<<<< HEAD
+ +	vfree(udev->mb_addr);
+ +
+ +	/* Upper layer should drain all requests before calling this */
+ +	spin_lock_irq(&udev->commands_lock);
+ +	idr_for_each_entry(&udev->commands, cmd, i) {
+ +		if (tcmu_check_and_free_pending_cmd(cmd) != 0)
+ +			all_expired = false;
+ +	}
+ +	idr_destroy(&udev->commands);
+ +	spin_unlock_irq(&udev->commands_lock);
+ +	WARN_ON(!all_expired);
+ +
+ +	if (tcmu_dev_configured(udev)) {
+ +		tcmu_netlink_event(udev, TCMU_CMD_REMOVED_DEVICE);
+ +
+ +		uio_unregister_device(&udev->uio_info);
+ +		kfree(udev->uio_info.name);
+ +		kfree(udev->name);
+++=======
++ 	mutex_lock(&root_udev_mutex);
++ 	list_del(&udev->node);
++ 	mutex_unlock(&root_udev_mutex);
++ 
++ 	tcmu_netlink_event(udev, TCMU_CMD_REMOVED_DEVICE, 0, NULL);
+++>>>>>>> c22adc0b0cbe (tcmu: fix crash when removing the tcmu device)
+  
+ -	uio_unregister_device(&udev->uio_info);
+ -
+ -	/* release ref from configure */
+ -	kref_put(&udev->kref, tcmu_dev_kref_release);
+ +		mutex_lock(&device_mutex);
+ +		idr_remove(&devices_idr, udev->dev_index);
+ +		mutex_unlock(&device_mutex);
+ +	}
+  }
+  
+  enum {
+* Unmerged path drivers/target/target_core_user.c
