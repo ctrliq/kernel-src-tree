@@ -1,0 +1,306 @@
+mm: refactor TLB gathering API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [mm] refactor TLB gathering API (Aaron Tomlin) [1677343]
+Rebuild_FUZZ: 92.86%
+commit-author Minchan Kim <minchan@kernel.org>
+commit 56236a59556cfd3bae7bffb7e5f438b5ef0af880
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/56236a59.failed
+
+This patch is a preparatory patch for solving race problems caused by
+TLB batch.  For that, we will increase/decrease TLB flush pending count
+of mm_struct whenever tlb_[gather|finish]_mmu is called.
+
+Before making it simple, this patch separates architecture specific part
+and rename it to arch_tlb_[gather|finish]_mmu and generic part just
+calls it.
+
+It shouldn't change any behavior.
+
+Link: http://lkml.kernel.org/r/20170802000818.4760-5-namit@vmware.com
+	Signed-off-by: Minchan Kim <minchan@kernel.org>
+	Signed-off-by: Nadav Amit <namit@vmware.com>
+	Acked-by: Mel Gorman <mgorman@techsingularity.net>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Russell King <linux@armlinux.org.uk>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+	Cc: "David S. Miller" <davem@davemloft.net>
+	Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Cc: Yoshinori Sato <ysato@users.sourceforge.jp>
+	Cc: Jeff Dike <jdike@addtoit.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Nadav Amit <nadav.amit@gmail.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 56236a59556cfd3bae7bffb7e5f438b5ef0af880)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/asm-generic/tlb.h
+diff --cc include/asm-generic/tlb.h
+index c3b25d4ce7d7,8f71521e7a44..000000000000
+--- a/include/asm-generic/tlb.h
++++ b/include/asm-generic/tlb.h
+@@@ -112,11 -112,43 +112,49 @@@ struct mmu_gather 
+  
+  #define HAVE_GENERIC_MMU_GATHER
+  
+- void tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm, unsigned long start, unsigned long end);
++ void arch_tlb_gather_mmu(struct mmu_gather *tlb,
++ 	struct mm_struct *mm, unsigned long start, unsigned long end);
+  void tlb_flush_mmu(struct mmu_gather *tlb);
+++<<<<<<< HEAD
+ +void tlb_finish_mmu(struct mmu_gather *tlb, unsigned long start,
+ +							unsigned long end);
+ +int __tlb_remove_page(struct mmu_gather *tlb, struct page *page);
+++=======
++ void arch_tlb_finish_mmu(struct mmu_gather *tlb,
++ 			 unsigned long start, unsigned long end);
++ extern bool __tlb_remove_page_size(struct mmu_gather *tlb, struct page *page,
++ 				   int page_size);
++ 
++ static inline void __tlb_adjust_range(struct mmu_gather *tlb,
++ 				      unsigned long address,
++ 				      unsigned int range_size)
++ {
++ 	tlb->start = min(tlb->start, address);
++ 	tlb->end = max(tlb->end, address + range_size);
++ }
++ 
++ static inline void __tlb_reset_range(struct mmu_gather *tlb)
++ {
++ 	if (tlb->fullmm) {
++ 		tlb->start = tlb->end = ~0;
++ 	} else {
++ 		tlb->start = TASK_SIZE;
++ 		tlb->end = 0;
++ 	}
++ }
++ 
++ static inline void tlb_remove_page_size(struct mmu_gather *tlb,
++ 					struct page *page, int page_size)
++ {
++ 	if (__tlb_remove_page_size(tlb, page, page_size))
++ 		tlb_flush_mmu(tlb);
++ }
++ 
++ static inline bool __tlb_remove_page(struct mmu_gather *tlb, struct page *page)
++ {
++ 	return __tlb_remove_page_size(tlb, page, PAGE_SIZE);
++ }
+++>>>>>>> 56236a59556c (mm: refactor TLB gathering API)
+  
+  /* tlb_remove_page
+   *	Similar to __tlb_remove_page but will call tlb_flush_mmu() itself when
+diff --git a/arch/arm/include/asm/tlb.h b/arch/arm/include/asm/tlb.h
+index aa9b4ac3fdf6..62a53432618e 100644
+--- a/arch/arm/include/asm/tlb.h
++++ b/arch/arm/include/asm/tlb.h
+@@ -108,7 +108,8 @@ static inline void tlb_flush_mmu(struct mmu_gather *tlb)
+ }
+ 
+ static inline void
+-tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm, unsigned long start, unsigned long end)
++arch_tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm,
++			unsigned long start, unsigned long end)
+ {
+ 	tlb->mm = mm;
+ 	tlb->fullmm = !(start | (end+1));
+@@ -122,7 +123,8 @@ tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm, unsigned long start
+ }
+ 
+ static inline void
+-tlb_finish_mmu(struct mmu_gather *tlb, unsigned long start, unsigned long end)
++arch_tlb_finish_mmu(struct mmu_gather *tlb,
++			unsigned long start, unsigned long end)
+ {
+ 	tlb_flush_mmu(tlb);
+ 
+diff --git a/arch/ia64/include/asm/tlb.h b/arch/ia64/include/asm/tlb.h
+index bc5efc7c3f3f..2777a5606823 100644
+--- a/arch/ia64/include/asm/tlb.h
++++ b/arch/ia64/include/asm/tlb.h
+@@ -156,7 +156,8 @@ static inline void __tlb_alloc_page(struct mmu_gather *tlb)
+ 
+ 
+ static inline void
+-tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm, unsigned long start, unsigned long end)
++arch_tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm,
++			unsigned long start, unsigned long end)
+ {
+ 	tlb->mm = mm;
+ 	tlb->max = ARRAY_SIZE(tlb->local);
+@@ -173,7 +174,8 @@ tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm, unsigned long start
+  * collected.
+  */
+ static inline void
+-tlb_finish_mmu(struct mmu_gather *tlb, unsigned long start, unsigned long end)
++arch_tlb_finish_mmu(struct mmu_gather *tlb,
++			unsigned long start, unsigned long end)
+ {
+ 	/*
+ 	 * Note: tlb->nr may be 0 at this point, so we can't rely on tlb->start_addr and
+diff --git a/arch/s390/include/asm/tlb.h b/arch/s390/include/asm/tlb.h
+index 6d6d92b4ea11..035d6d13ddd1 100644
+--- a/arch/s390/include/asm/tlb.h
++++ b/arch/s390/include/asm/tlb.h
+@@ -47,10 +47,9 @@ struct mmu_table_batch {
+ extern void tlb_table_flush(struct mmu_gather *tlb);
+ extern void tlb_remove_table(struct mmu_gather *tlb, void *table);
+ 
+-static inline void tlb_gather_mmu(struct mmu_gather *tlb,
+-				  struct mm_struct *mm,
+-				  unsigned long start,
+-				  unsigned long end)
++static inline void
++arch_tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm,
++			unsigned long start, unsigned long end)
+ {
+ 	tlb->mm = mm;
+ 	tlb->start = start;
+@@ -66,8 +65,9 @@ static inline void tlb_flush_mmu(struct mmu_gather *tlb)
+ 	tlb_table_flush(tlb);
+ }
+ 
+-static inline void tlb_finish_mmu(struct mmu_gather *tlb,
+-				  unsigned long start, unsigned long end)
++static inline void
++arch_tlb_finish_mmu(struct mmu_gather *tlb,
++		unsigned long start, unsigned long end)
+ {
+ 	tlb_table_flush(tlb);
+ }
+diff --git a/arch/sh/include/asm/tlb.h b/arch/sh/include/asm/tlb.h
+index 362192ed12fe..fb949a02ec2b 100644
+--- a/arch/sh/include/asm/tlb.h
++++ b/arch/sh/include/asm/tlb.h
+@@ -36,7 +36,8 @@ static inline void init_tlb_gather(struct mmu_gather *tlb)
+ }
+ 
+ static inline void
+-tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm, unsigned long start, unsigned long end)
++arch_tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm,
++		unsigned long start, unsigned long end)
+ {
+ 	tlb->mm = mm;
+ 	tlb->start = start;
+@@ -47,7 +48,8 @@ tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm, unsigned long start
+ }
+ 
+ static inline void
+-tlb_finish_mmu(struct mmu_gather *tlb, unsigned long start, unsigned long end)
++arch_tlb_finish_mmu(struct mmu_gather *tlb,
++		unsigned long start, unsigned long end)
+ {
+ 	if (tlb->fullmm)
+ 		flush_tlb_mm(tlb->mm);
+diff --git a/arch/um/include/asm/tlb.h b/arch/um/include/asm/tlb.h
+index 29b0301c18aa..1ae8e2ad7e9f 100644
+--- a/arch/um/include/asm/tlb.h
++++ b/arch/um/include/asm/tlb.h
+@@ -45,7 +45,8 @@ static inline void init_tlb_gather(struct mmu_gather *tlb)
+ }
+ 
+ static inline void
+-tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm, unsigned long start, unsigned long end)
++arch_tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm,
++		unsigned long start, unsigned long end)
+ {
+ 	tlb->mm = mm;
+ 	tlb->start = start;
+@@ -68,12 +69,13 @@ tlb_flush_mmu(struct mmu_gather *tlb)
+ 	init_tlb_gather(tlb);
+ }
+ 
+-/* tlb_finish_mmu
++/* arch_tlb_finish_mmu
+  *	Called at the end of the shootdown operation to free up any resources
+  *	that were required.
+  */
+ static inline void
+-tlb_finish_mmu(struct mmu_gather *tlb, unsigned long start, unsigned long end)
++arch_tlb_finish_mmu(struct mmu_gather *tlb,
++		unsigned long start, unsigned long end)
+ {
+ 	tlb_flush_mmu(tlb);
+ 
+* Unmerged path include/asm-generic/tlb.h
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index ff35333d8d6c..9c346950137e 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -568,6 +568,12 @@ static inline cpumask_t *mm_cpumask(struct mm_struct *mm)
+ 	return mm->cpu_vm_mask_var;
+ }
+ 
++struct mmu_gather;
++extern void tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm,
++				unsigned long start, unsigned long end);
++extern void tlb_finish_mmu(struct mmu_gather *tlb,
++				unsigned long start, unsigned long end);
++
+ #if defined(CONFIG_NUMA_BALANCING) || defined(CONFIG_COMPACTION)
+ /*
+  * Memory barriers to keep this state in sync are graciously provided by
+diff --git a/mm/memory.c b/mm/memory.c
+index 992044080678..6cfae018ca1e 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -221,12 +221,8 @@ static int tlb_next_batch(struct mmu_gather *tlb)
+ 	return 1;
+ }
+ 
+-/* tlb_gather_mmu
+- *	Called to initialize an (on-stack) mmu_gather structure for page-table
+- *	tear-down from @mm. The @fullmm argument is used when @mm is without
+- *	users and we're going to destroy the full address space (exit/execve).
+- */
+-void tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm, unsigned long start, unsigned long end)
++void arch_tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm,
++				unsigned long start, unsigned long end)
+ {
+ 	tlb->mm = mm;
+ 
+@@ -271,7 +267,8 @@ void tlb_flush_mmu(struct mmu_gather *tlb)
+  *	Called at the end of the shootdown operation to free up any resources
+  *	that were required.
+  */
+-void tlb_finish_mmu(struct mmu_gather *tlb, unsigned long start, unsigned long end)
++void arch_tlb_finish_mmu(struct mmu_gather *tlb,
++		unsigned long start, unsigned long end)
+ {
+ 	struct mmu_gather_batch *batch, *next;
+ 
+@@ -390,6 +387,23 @@ void tlb_remove_table(struct mmu_gather *tlb, void *table)
+ 
+ #endif /* CONFIG_HAVE_RCU_TABLE_FREE */
+ 
++/* tlb_gather_mmu
++ *	Called to initialize an (on-stack) mmu_gather structure for page-table
++ *	tear-down from @mm. The @fullmm argument is used when @mm is without
++ *	users and we're going to destroy the full address space (exit/execve).
++ */
++void tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm,
++			unsigned long start, unsigned long end)
++{
++	arch_tlb_gather_mmu(tlb, mm, start, end);
++}
++
++void tlb_finish_mmu(struct mmu_gather *tlb,
++		unsigned long start, unsigned long end)
++{
++	arch_tlb_finish_mmu(tlb, start, end);
++}
++
+ /*
+  * If a p?d_bad entry is found while walking page tables, report
+  * the error, before resetting entry to p?d_none.  Usually (but
