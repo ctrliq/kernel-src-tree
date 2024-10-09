@@ -1,0 +1,216 @@
+new helpers: lock_mount_hash/unlock_mount_hash
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 719ea2fbb553ab3f61a174a4b5861289dcc46cb1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/719ea2fb.failed
+
+aka br_write_{lock,unlock} of vfsmount_lock.  Inlines in fs/mount.h,
+vfsmount_lock extern moved over there as well.
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 719ea2fbb553ab3f61a174a4b5861289dcc46cb1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namespace.c
+#	fs/pnode.c
+diff --cc fs/namespace.c
+index 70671f980657,5cbe8cefadb5..000000000000
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@@ -1608,14 -1567,16 +1608,25 @@@ static int attach_recursive_mnt(struct 
+  		err = invent_group_ids(source_mnt, true);
+  		if (err)
+  			goto out;
+++<<<<<<< HEAD
+ +		err = propagate_mnt(dest_mnt, dest_mp, source_mnt, &tree_list);
+ +		br_write_lock(&vfsmount_lock);
+ +		if (err)
+ +			goto out_cleanup_ids;
+++=======
++ 	}
++ 	err = propagate_mnt(dest_mnt, dest_mp, source_mnt, &tree_list);
++ 	if (err)
++ 		goto out_cleanup_ids;
++ 
++ 	lock_mount_hash();
++ 
++ 	if (IS_MNT_SHARED(dest_mnt)) {
+++>>>>>>> 719ea2fbb553 (new helpers: lock_mount_hash/unlock_mount_hash)
+  		for (p = source_mnt; p; p = next_mnt(p, source_mnt))
+  			set_mnt_shared(p);
+ +	} else {
+ +		br_write_lock(&vfsmount_lock);
+  	}
+  	if (parent_path) {
+  		detach_mnt(source_mnt, parent_path);
+diff --cc fs/pnode.c
+index 43d86ec28503,58933fd149ad..000000000000
+--- a/fs/pnode.c
++++ b/fs/pnode.c
+@@@ -278,49 -222,54 +278,58 @@@ static int propagate_one(struct mount *
+  int propagate_mnt(struct mount *dest_mnt, struct mountpoint *dest_mp,
+  		    struct mount *source_mnt, struct list_head *tree_list)
+  {
+ -	struct user_namespace *user_ns = current->nsproxy->mnt_ns->user_ns;
+ -	struct mount *m, *child;
+ +	struct mount *m, *n;
+  	int ret = 0;
+ -	struct mount *prev_dest_mnt = dest_mnt;
+ -	struct mount *prev_src_mnt  = source_mnt;
+ -	LIST_HEAD(tmp_list);
+ -
+ -	for (m = propagation_next(dest_mnt, dest_mnt); m;
+ -			m = propagation_next(m, dest_mnt)) {
+ -		int type;
+ -		struct mount *source;
+ -
+ -		if (IS_MNT_NEW(m))
+ -			continue;
+ -
+ -		source =  get_source(m, prev_dest_mnt, prev_src_mnt, &type);
+ -
+ -		/* Notice when we are propagating across user namespaces */
+ -		if (m->mnt_ns->user_ns != user_ns)
+ -			type |= CL_UNPRIVILEGED;
+  
+ -		child = copy_tree(source, source->mnt.mnt_root, type);
+ -		if (IS_ERR(child)) {
+ -			ret = PTR_ERR(child);
+ -			list_splice(tree_list, tmp_list.prev);
+ +	/*
+ +	 * we don't want to bother passing tons of arguments to
+ +	 * propagate_one(); everything is serialized by namespace_sem,
+ +	 * so globals will do just fine.
+ +	 */
+ +	user_ns = current->nsproxy->mnt_ns->user_ns;
+ +	last_dest = dest_mnt;
+ +	first_source = source_mnt;
+ +	last_source = source_mnt;
+ +	mp = dest_mp;
+ +	list = tree_list;
+ +	dest_master = dest_mnt->mnt_master;
+ +
+ +	/* all peers of dest_mnt, except dest_mnt itself */
+ +	for (n = next_peer(dest_mnt); n != dest_mnt; n = next_peer(n)) {
+ +		ret = propagate_one(n);
+ +		if (ret)
+  			goto out;
+ -		}
+ +	}
+  
+ -		if (is_subdir(dest_mp->m_dentry, m->mnt.mnt_root)) {
+ -			mnt_set_mountpoint(m, dest_mp, child);
+ -			list_add_tail(&child->mnt_hash, tree_list);
+ -		} else {
+ -			/*
+ -			 * This can happen if the parent mount was bind mounted
+ -			 * on some subdirectory of a shared/slave mount.
+ -			 */
+ -			list_add_tail(&child->mnt_hash, &tmp_list);
+ -		}
+ -		prev_dest_mnt = m;
+ -		prev_src_mnt  = child;
+ +	/* all slave groups */
+ +	for (m = next_group(dest_mnt, dest_mnt); m;
+ +			m = next_group(m, dest_mnt)) {
+ +		/* everything in that slave group */
+ +		n = m;
+ +		do {
+ +			ret = propagate_one(n);
+ +			if (ret)
+ +				goto out;
+ +			n = next_peer(n);
+ +		} while (n != m);
+  	}
+  out:
+++<<<<<<< HEAD
+ +	br_read_lock(&vfsmount_lock);
+ +	list_for_each_entry(n, tree_list, mnt_hash) {
+ +		m = n->mnt_parent;
+ +		if (m->mnt_master != dest_mnt->mnt_master)
+ +			CLEAR_MNT_MARK(m->mnt_master);
+ +	}
+ +	br_read_unlock(&vfsmount_lock);
+++=======
++ 	lock_mount_hash();
++ 	while (!list_empty(&tmp_list)) {
++ 		child = list_first_entry(&tmp_list, struct mount, mnt_hash);
++ 		umount_tree(child, 0);
++ 	}
++ 	unlock_mount_hash();
+++>>>>>>> 719ea2fbb553 (new helpers: lock_mount_hash/unlock_mount_hash)
+  	return ret;
+  }
+  
+diff --git a/fs/fs-writeback.c b/fs/fs-writeback.c
+index 278c1c2fba0d..204141e64775 100644
+--- a/fs/fs-writeback.c
++++ b/fs/fs-writeback.c
+@@ -26,6 +26,7 @@
+ #include <linux/blkdev.h>
+ #include <linux/backing-dev.h>
+ #include <linux/tracepoint.h>
++#include <linux/device.h>
+ #include "internal.h"
+ 
+ /*
+diff --git a/fs/internal.h b/fs/internal.h
+index 3b41f3e8a80a..4a14dab99fd3 100644
+--- a/fs/internal.h
++++ b/fs/internal.h
+@@ -9,8 +9,6 @@
+  * 2 of the License, or (at your option) any later version.
+  */
+ 
+-#include <linux/lglock.h>
+-
+ struct super_block;
+ struct file_system_type;
+ struct linux_binprm;
+@@ -61,8 +59,6 @@ extern int sb_prepare_remount_readonly(struct super_block *);
+ 
+ extern void __init mnt_init(void);
+ 
+-extern struct lglock vfsmount_lock;
+-
+ extern int __mnt_want_write(struct vfsmount *);
+ extern int __mnt_want_write_file(struct file *);
+ extern void __mnt_drop_write(struct vfsmount *);
+diff --git a/fs/mount.h b/fs/mount.h
+index 8456cc96af6f..df882345412f 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -1,6 +1,7 @@
+ #include <linux/mount.h>
+ #include <linux/seq_file.h>
+ #include <linux/poll.h>
++#include <linux/lglock.h>
+ 
+ struct mnt_namespace {
+ 	atomic_t		count;
+@@ -83,6 +84,18 @@ static inline void get_mnt_ns(struct mnt_namespace *ns)
+ 	atomic_inc(&ns->count);
+ }
+ 
++extern struct lglock vfsmount_lock;
++
++static inline void lock_mount_hash(void)
++{
++	br_write_lock(&vfsmount_lock);
++}
++
++static inline void unlock_mount_hash(void)
++{
++	br_write_unlock(&vfsmount_lock);
++}
++
+ struct proc_mounts {
+ 	struct seq_file m;
+ 	struct mnt_namespace *ns;
+* Unmerged path fs/namespace.c
+* Unmerged path fs/pnode.c
