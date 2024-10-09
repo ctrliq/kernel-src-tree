@@ -1012,8 +1012,8 @@ int perf_evsel__set_filter(struct perf_evsel *evsel, const char *filter)
 	return -1;
 }
 
-int perf_evsel__append_filter(struct perf_evsel *evsel,
-			      const char *fmt, const char *filter)
+static int perf_evsel__append_filter(struct perf_evsel *evsel,
+				     const char *fmt, const char *filter)
 {
 	char *new_filter;
 
@@ -1027,6 +1027,11 @@ int perf_evsel__append_filter(struct perf_evsel *evsel,
 	}
 
 	return -1;
+}
+
+int perf_evsel__append_tp_filter(struct perf_evsel *evsel, const char *filter)
+{
+	return perf_evsel__append_filter(evsel, "(%s) && (%s)", filter);
 }
 
 int perf_evsel__enable(struct perf_evsel *evsel)
