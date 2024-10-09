@@ -1,0 +1,202 @@
+powerpc/pseries: Don't give a warning when HPT resizing isn't available
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [powerpc] pseries: Don't give a warning when HPT resizing isn't available (David Gibson) [1431922]
+Rebuild_FUZZ: 94.03%
+commit-author Michael Ellerman <michael@ellerman.id.au>
+commit 8971e1c79d3f6c9a5e6f7a65c50c41f434a4dae6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8971e1c7.failed
+
+As of commit 438cc81a41e8 ("powerpc/pseries: Automatically resize HPT
+for memory hot add/remove"), when running on the pseries platform, we
+always attempt to use the PAPR extension to resize the hashed page
+table (HPT) when we add or remove memory.
+
+This is fine, but when the extension is not available we'll give a
+harmless, but scary warning. Instead check if the firmware supports HPT
+resizing before populating the mmu_hash_ops.resize_hpt pointer.
+
+	Signed-off-by: David Gibson <david@gibson.dropbear.id.au>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 8971e1c79d3f6c9a5e6f7a65c50c41f434a4dae6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/pseries/lpar.c
+diff --cc arch/powerpc/platforms/pseries/lpar.c
+index e53d396f4601,8b1fe895daa3..000000000000
+--- a/arch/powerpc/platforms/pseries/lpar.c
++++ b/arch/powerpc/platforms/pseries/lpar.c
+@@@ -591,17 -611,155 +591,160 @@@ static int __init disable_bulk_remove(c
+  
+  __setup("bulk_remove=", disable_bulk_remove);
+  
+ -#define HPT_RESIZE_TIMEOUT	10000 /* ms */
+ -
+ -struct hpt_resize_state {
+ -	unsigned long shift;
+ -	int commit_rc;
+ -};
+ -
+ -static int pseries_lpar_resize_hpt_commit(void *data)
+ +void __init hpte_init_lpar(void)
+  {
+++<<<<<<< HEAD
+ +	ppc_md.hpte_invalidate	= pSeries_lpar_hpte_invalidate;
+ +	ppc_md.hpte_updatepp	= pSeries_lpar_hpte_updatepp;
+ +	ppc_md.hpte_updateboltedpp = pSeries_lpar_hpte_updateboltedpp;
+ +	ppc_md.hpte_insert	= pSeries_lpar_hpte_insert;
+ +	ppc_md.hpte_remove	= pSeries_lpar_hpte_remove;
+ +	ppc_md.hpte_removebolted = pSeries_lpar_hpte_removebolted;
+ +	ppc_md.flush_hash_range	= pSeries_lpar_flush_hash_range;
+ +	ppc_md.hpte_clear_all   = pSeries_lpar_hptab_clear;
+ +	ppc_md.hugepage_invalidate = pSeries_lpar_hugepage_invalidate;
+++=======
++ 	struct hpt_resize_state *state = data;
++ 
++ 	state->commit_rc = plpar_resize_hpt_commit(0, state->shift);
++ 	if (state->commit_rc != H_SUCCESS)
++ 		return -EIO;
++ 
++ 	/* Hypervisor has transitioned the HTAB, update our globals */
++ 	ppc64_pft_size = state->shift;
++ 	htab_size_bytes = 1UL << ppc64_pft_size;
++ 	htab_hash_mask = (htab_size_bytes >> 7) - 1;
++ 
++ 	return 0;
++ }
++ 
++ /* Must be called in user context */
++ static int pseries_lpar_resize_hpt(unsigned long shift)
++ {
++ 	struct hpt_resize_state state = {
++ 		.shift = shift,
++ 		.commit_rc = H_FUNCTION,
++ 	};
++ 	unsigned int delay, total_delay = 0;
++ 	int rc;
++ 	ktime_t t0, t1, t2;
++ 
++ 	might_sleep();
++ 
++ 	if (!firmware_has_feature(FW_FEATURE_HPT_RESIZE))
++ 		return -ENODEV;
++ 
++ 	printk(KERN_INFO "lpar: Attempting to resize HPT to shift %lu\n",
++ 	       shift);
++ 
++ 	t0 = ktime_get();
++ 
++ 	rc = plpar_resize_hpt_prepare(0, shift);
++ 	while (H_IS_LONG_BUSY(rc)) {
++ 		delay = get_longbusy_msecs(rc);
++ 		total_delay += delay;
++ 		if (total_delay > HPT_RESIZE_TIMEOUT) {
++ 			/* prepare with shift==0 cancels an in-progress resize */
++ 			rc = plpar_resize_hpt_prepare(0, 0);
++ 			if (rc != H_SUCCESS)
++ 				printk(KERN_WARNING
++ 				       "lpar: Unexpected error %d cancelling timed out HPT resize\n",
++ 				       rc);
++ 			return -ETIMEDOUT;
++ 		}
++ 		msleep(delay);
++ 		rc = plpar_resize_hpt_prepare(0, shift);
++ 	};
++ 
++ 	switch (rc) {
++ 	case H_SUCCESS:
++ 		/* Continue on */
++ 		break;
++ 
++ 	case H_PARAMETER:
++ 		return -EINVAL;
++ 	case H_RESOURCE:
++ 		return -EPERM;
++ 	default:
++ 		printk(KERN_WARNING
++ 		       "lpar: Unexpected error %d from H_RESIZE_HPT_PREPARE\n",
++ 		       rc);
++ 		return -EIO;
++ 	}
++ 
++ 	t1 = ktime_get();
++ 
++ 	rc = stop_machine(pseries_lpar_resize_hpt_commit, &state, NULL);
++ 
++ 	t2 = ktime_get();
++ 
++ 	if (rc != 0) {
++ 		switch (state.commit_rc) {
++ 		case H_PTEG_FULL:
++ 			printk(KERN_WARNING
++ 			       "lpar: Hash collision while resizing HPT\n");
++ 			return -ENOSPC;
++ 
++ 		default:
++ 			printk(KERN_WARNING
++ 			       "lpar: Unexpected error %d from H_RESIZE_HPT_COMMIT\n",
++ 			       state.commit_rc);
++ 			return -EIO;
++ 		};
++ 	}
++ 
++ 	printk(KERN_INFO
++ 	       "lpar: HPT resize to shift %lu complete (%lld ms / %lld ms)\n",
++ 	       shift, (long long) ktime_ms_delta(t1, t0),
++ 	       (long long) ktime_ms_delta(t2, t1));
++ 
++ 	return 0;
++ }
++ 
++ /* Actually only used for radix, so far */
++ static int pseries_lpar_register_process_table(unsigned long base,
++ 			unsigned long page_size, unsigned long table_size)
++ {
++ 	long rc;
++ 	unsigned long flags = PROC_TABLE_NEW;
++ 
++ 	if (radix_enabled())
++ 		flags |= PROC_TABLE_RADIX | PROC_TABLE_GTSE;
++ 	for (;;) {
++ 		rc = plpar_hcall_norets(H_REGISTER_PROC_TBL, flags, base,
++ 					page_size, table_size);
++ 		if (!H_IS_LONG_BUSY(rc))
++ 			break;
++ 		mdelay(get_longbusy_msecs(rc));
++ 	}
++ 	if (rc != H_SUCCESS) {
++ 		pr_err("Failed to register process table (rc=%ld)\n", rc);
++ 		BUG();
++ 	}
++ 	return rc;
++ }
++ 
++ void __init hpte_init_pseries(void)
++ {
++ 	mmu_hash_ops.hpte_invalidate	 = pSeries_lpar_hpte_invalidate;
++ 	mmu_hash_ops.hpte_updatepp	 = pSeries_lpar_hpte_updatepp;
++ 	mmu_hash_ops.hpte_updateboltedpp = pSeries_lpar_hpte_updateboltedpp;
++ 	mmu_hash_ops.hpte_insert	 = pSeries_lpar_hpte_insert;
++ 	mmu_hash_ops.hpte_remove	 = pSeries_lpar_hpte_remove;
++ 	mmu_hash_ops.hpte_removebolted   = pSeries_lpar_hpte_removebolted;
++ 	mmu_hash_ops.flush_hash_range	 = pSeries_lpar_flush_hash_range;
++ 	mmu_hash_ops.hpte_clear_all      = pseries_hpte_clear_all;
++ 	mmu_hash_ops.hugepage_invalidate = pSeries_lpar_hugepage_invalidate;
++ 
++ 	if (firmware_has_feature(FW_FEATURE_HPT_RESIZE))
++ 		mmu_hash_ops.resize_hpt = pseries_lpar_resize_hpt;
++ }
++ 
++ void radix_init_pseries(void)
++ {
++ 	pr_info("Using radix MMU under hypervisor\n");
++ 	register_process_table = pseries_lpar_register_process_table;
+++>>>>>>> 8971e1c79d3f (powerpc/pseries: Don't give a warning when HPT resizing isn't available)
+  }
+  
+  #ifdef CONFIG_PPC_SMLPAR
+* Unmerged path arch/powerpc/platforms/pseries/lpar.c
