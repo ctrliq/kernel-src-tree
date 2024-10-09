@@ -1,0 +1,540 @@
+fs: Better permission checking for submounts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [fs] Better permission checking for submounts ("Eric W. Biederman") [1487751]
+Rebuild_FUZZ: 95.24%
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit 93faccbbfa958a9668d3ab4e30f38dd205cee8d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/93faccbb.failed
+
+To support unprivileged users mounting filesystems two permission
+checks have to be performed: a test to see if the user allowed to
+create a mount in the mount namespace, and a test to see if
+the user is allowed to access the specified filesystem.
+
+The automount case is special in that mounting the original filesystem
+grants permission to mount the sub-filesystems, to any user who
+happens to stumble across the their mountpoint and satisfies the
+ordinary filesystem permission checks.
+
+Attempting to handle the automount case by using override_creds
+almost works.  It preserves the idea that permission to mount
+the original filesystem is permission to mount the sub-filesystem.
+Unfortunately using override_creds messes up the filesystems
+ordinary permission checks.
+
+Solve this by being explicit that a mount is a submount by introducing
+vfs_submount, and using it where appropriate.
+
+vfs_submount uses a new mount internal mount flags MS_SUBMOUNT, to let
+sget and friends know that a mount is a submount so they can take appropriate
+action.
+
+sget and sget_userns are modified to not perform any permission checks
+on submounts.
+
+follow_automount is modified to stop using override_creds as that
+has proven problemantic.
+
+do_mount is modified to always remove the new MS_SUBMOUNT flag so
+that we know userspace will never by able to specify it.
+
+autofs4 is modified to stop using current_real_cred that was put in
+there to handle the previous version of submount permission checking.
+
+cifs is modified to pass the mountpoint all of the way down to vfs_submount.
+
+debugfs is modified to pass the mountpoint all of the way down to
+trace_automount by adding a new parameter.  To make this change easier
+a new typedef debugfs_automount_t is introduced to capture the type of
+the debugfs automount function.
+
+	Cc: stable@vger.kernel.org
+Fixes: 069d5ac9ae0d ("autofs:  Fix automounts by using current_real_cred()->uid")
+Fixes: aeaa4a79ff6a ("fs: Call d_automount with the filesystems creds")
+	Reviewed-by: Trond Myklebust <trond.myklebust@primarydata.com>
+	Reviewed-by: Seth Forshee <seth.forshee@canonical.com>
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit 93faccbbfa958a9668d3ab4e30f38dd205cee8d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/autofs4/waitq.c
+#	fs/debugfs/inode.c
+#	fs/super.c
+#	include/linux/debugfs.h
+#	kernel/trace/trace.c
+diff --cc fs/autofs4/waitq.c
+index 6d2c44463a84,79fbd85db4ba..000000000000
+--- a/fs/autofs4/waitq.c
++++ b/fs/autofs4/waitq.c
+@@@ -436,8 -436,8 +436,13 @@@ int autofs4_wait(struct autofs_sb_info 
+  		memcpy(&wq->name, &qstr, sizeof(struct qstr));
+  		wq->dev = autofs4_get_dev(sbi);
+  		wq->ino = autofs4_get_ino(sbi);
+++<<<<<<< HEAD
+ +		wq->uid = current_uid();
+ +		wq->gid = current_gid();
+++=======
++ 		wq->uid = current_cred()->uid;
++ 		wq->gid = current_cred()->gid;
+++>>>>>>> 93faccbbfa95 (fs: Better permission checking for submounts)
+  		wq->pid = pid;
+  		wq->tgid = tgid;
+  		wq->status = -EINTR; /* Status return if interrupted */
+diff --cc fs/debugfs/inode.c
+index c7c83ff0f752,1e30f74a9527..000000000000
+--- a/fs/debugfs/inode.c
++++ b/fs/debugfs/inode.c
+@@@ -249,6 -182,19 +249,22 @@@ static const struct super_operations de
+  	.statfs		= simple_statfs,
+  	.remount_fs	= debugfs_remount,
+  	.show_options	= debugfs_show_options,
+++<<<<<<< HEAD
+++=======
++ 	.evict_inode	= debugfs_evict_inode,
++ };
++ 
++ static struct vfsmount *debugfs_automount(struct path *path)
++ {
++ 	debugfs_automount_t f;
++ 	f = (debugfs_automount_t)path->dentry->d_fsdata;
++ 	return f(path->dentry, d_inode(path->dentry)->i_private);
++ }
++ 
++ static const struct dentry_operations debugfs_dops = {
++ 	.d_delete = always_delete_dentry,
++ 	.d_automount = debugfs_automount,
+++>>>>>>> 93faccbbfa95 (fs: Better permission checking for submounts)
+  };
+  
+  static int debug_fill_super(struct super_block *sb, void *data, int silent)
+@@@ -421,6 -492,45 +437,48 @@@ struct dentry *debugfs_create_dir(cons
+  EXPORT_SYMBOL_GPL(debugfs_create_dir);
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * debugfs_create_automount - create automount point in the debugfs filesystem
++  * @name: a pointer to a string containing the name of the file to create.
++  * @parent: a pointer to the parent dentry for this file.  This should be a
++  *          directory dentry if set.  If this parameter is NULL, then the
++  *          file will be created in the root of the debugfs filesystem.
++  * @f: function to be called when pathname resolution steps on that one.
++  * @data: opaque argument to pass to f().
++  *
++  * @f should return what ->d_automount() would.
++  */
++ struct dentry *debugfs_create_automount(const char *name,
++ 					struct dentry *parent,
++ 					debugfs_automount_t f,
++ 					void *data)
++ {
++ 	struct dentry *dentry = start_creating(name, parent);
++ 	struct inode *inode;
++ 
++ 	if (IS_ERR(dentry))
++ 		return NULL;
++ 
++ 	inode = debugfs_get_inode(dentry->d_sb);
++ 	if (unlikely(!inode))
++ 		return failed_creating(dentry);
++ 
++ 	make_empty_dir_inode(inode);
++ 	inode->i_flags |= S_AUTOMOUNT;
++ 	inode->i_private = data;
++ 	dentry->d_fsdata = (void *)f;
++ 	/* directory inodes start off with i_nlink == 2 (for "." entry) */
++ 	inc_nlink(inode);
++ 	d_instantiate(dentry, inode);
++ 	inc_nlink(d_inode(dentry->d_parent));
++ 	fsnotify_mkdir(d_inode(dentry->d_parent), dentry);
++ 	return end_creating(dentry);
++ }
++ EXPORT_SYMBOL(debugfs_create_automount);
++ 
++ /**
+++>>>>>>> 93faccbbfa95 (fs: Better permission checking for submounts)
+   * debugfs_create_symlink- create a symbolic link in the debugfs filesystem
+   * @name: a pointer to a string containing the name of the symbolic link to
+   *        create.
+diff --cc fs/super.c
+index 8a24c3f5ff79,4185844f7a12..000000000000
+--- a/fs/super.c
++++ b/fs/super.c
+@@@ -425,7 -499,7 +425,11 @@@ retry
+  	}
+  	if (!s) {
+  		spin_unlock(&sb_lock);
+++<<<<<<< HEAD
+ +		s = alloc_super(type, flags);
+++=======
++ 		s = alloc_super(type, (flags & ~MS_SUBMOUNT), user_ns);
+++>>>>>>> 93faccbbfa95 (fs: Better permission checking for submounts)
+  		if (!s)
+  			return ERR_PTR(-ENOMEM);
+  		goto retry;
+@@@ -448,6 -522,38 +452,41 @@@
+  	return s;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ EXPORT_SYMBOL(sget_userns);
++ 
++ /**
++  *	sget	-	find or create a superblock
++  *	@type:	  filesystem type superblock should belong to
++  *	@test:	  comparison callback
++  *	@set:	  setup callback
++  *	@flags:	  mount flags
++  *	@data:	  argument to each of them
++  */
++ struct super_block *sget(struct file_system_type *type,
++ 			int (*test)(struct super_block *,void *),
++ 			int (*set)(struct super_block *,void *),
++ 			int flags,
++ 			void *data)
++ {
++ 	struct user_namespace *user_ns = current_user_ns();
++ 
++ 	/* We don't yet pass the user namespace of the parent
++ 	 * mount through to here so always use &init_user_ns
++ 	 * until that changes.
++ 	 */
++ 	if (flags & MS_SUBMOUNT)
++ 		user_ns = &init_user_ns;
++ 
++ 	/* Ensure the requestor has permissions over the target filesystem */
++ 	if (!(flags & (MS_KERNMOUNT|MS_SUBMOUNT)) && !ns_capable(user_ns, CAP_SYS_ADMIN))
++ 		return ERR_PTR(-EPERM);
++ 
++ 	return sget_userns(type, test, set, flags, user_ns, data);
++ }
++ 
+++>>>>>>> 93faccbbfa95 (fs: Better permission checking for submounts)
+  EXPORT_SYMBOL(sget);
+  
+  void drop_super(struct super_block *sb)
+diff --cc include/linux/debugfs.h
+index fef98de75d0d,233006be30aa..000000000000
+--- a/include/linux/debugfs.h
++++ b/include/linux/debugfs.h
+@@@ -55,6 -97,12 +55,15 @@@ struct dentry *debugfs_create_dir(cons
+  struct dentry *debugfs_create_symlink(const char *name, struct dentry *parent,
+  				      const char *dest);
+  
+++<<<<<<< HEAD
+++=======
++ typedef struct vfsmount *(*debugfs_automount_t)(struct dentry *, void *);
++ struct dentry *debugfs_create_automount(const char *name,
++ 					struct dentry *parent,
++ 					debugfs_automount_t f,
++ 					void *data);
++ 
+++>>>>>>> 93faccbbfa95 (fs: Better permission checking for submounts)
+  void debugfs_remove(struct dentry *dentry);
+  void debugfs_remove_recursive(struct dentry *dentry);
+  
+diff --cc kernel/trace/trace.c
+index a14bc0a4b959,310f0ea0d1a2..000000000000
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@@ -6384,11 -7498,152 +6384,155 @@@ init_tracer_debugfs(struct trace_array 
+  #endif
+  
+  	for_each_tracing_cpu(cpu)
+ -		tracing_init_tracefs_percpu(tr, cpu);
+ +		tracing_init_debugfs_percpu(tr, cpu);
+  
+ -	ftrace_init_tracefs(tr, d_tracer);
+  }
+  
+++<<<<<<< HEAD
+ +static __init int tracer_init_debugfs(void)
+++=======
++ static struct vfsmount *trace_automount(struct dentry *mntpt, void *ingore)
++ {
++ 	struct vfsmount *mnt;
++ 	struct file_system_type *type;
++ 
++ 	/*
++ 	 * To maintain backward compatibility for tools that mount
++ 	 * debugfs to get to the tracing facility, tracefs is automatically
++ 	 * mounted to the debugfs/tracing directory.
++ 	 */
++ 	type = get_fs_type("tracefs");
++ 	if (!type)
++ 		return NULL;
++ 	mnt = vfs_submount(mntpt, type, "tracefs", NULL);
++ 	put_filesystem(type);
++ 	if (IS_ERR(mnt))
++ 		return NULL;
++ 	mntget(mnt);
++ 
++ 	return mnt;
++ }
++ 
++ /**
++  * tracing_init_dentry - initialize top level trace array
++  *
++  * This is called when creating files or directories in the tracing
++  * directory. It is called via fs_initcall() by any of the boot up code
++  * and expects to return the dentry of the top level tracing directory.
++  */
++ struct dentry *tracing_init_dentry(void)
++ {
++ 	struct trace_array *tr = &global_trace;
++ 
++ 	/* The top level trace array uses  NULL as parent */
++ 	if (tr->dir)
++ 		return NULL;
++ 
++ 	if (WARN_ON(!tracefs_initialized()) ||
++ 		(IS_ENABLED(CONFIG_DEBUG_FS) &&
++ 		 WARN_ON(!debugfs_initialized())))
++ 		return ERR_PTR(-ENODEV);
++ 
++ 	/*
++ 	 * As there may still be users that expect the tracing
++ 	 * files to exist in debugfs/tracing, we must automount
++ 	 * the tracefs file system there, so older tools still
++ 	 * work with the newer kerenl.
++ 	 */
++ 	tr->dir = debugfs_create_automount("tracing", NULL,
++ 					   trace_automount, NULL);
++ 	if (!tr->dir) {
++ 		pr_warn_once("Could not create debugfs directory 'tracing'\n");
++ 		return ERR_PTR(-ENOMEM);
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ extern struct trace_enum_map *__start_ftrace_enum_maps[];
++ extern struct trace_enum_map *__stop_ftrace_enum_maps[];
++ 
++ static void __init trace_enum_init(void)
++ {
++ 	int len;
++ 
++ 	len = __stop_ftrace_enum_maps - __start_ftrace_enum_maps;
++ 	trace_insert_enum_map(NULL, __start_ftrace_enum_maps, len);
++ }
++ 
++ #ifdef CONFIG_MODULES
++ static void trace_module_add_enums(struct module *mod)
++ {
++ 	if (!mod->num_trace_enums)
++ 		return;
++ 
++ 	/*
++ 	 * Modules with bad taint do not have events created, do
++ 	 * not bother with enums either.
++ 	 */
++ 	if (trace_module_has_bad_taint(mod))
++ 		return;
++ 
++ 	trace_insert_enum_map(mod, mod->trace_enums, mod->num_trace_enums);
++ }
++ 
++ #ifdef CONFIG_TRACE_ENUM_MAP_FILE
++ static void trace_module_remove_enums(struct module *mod)
++ {
++ 	union trace_enum_map_item *map;
++ 	union trace_enum_map_item **last = &trace_enum_maps;
++ 
++ 	if (!mod->num_trace_enums)
++ 		return;
++ 
++ 	mutex_lock(&trace_enum_mutex);
++ 
++ 	map = trace_enum_maps;
++ 
++ 	while (map) {
++ 		if (map->head.mod == mod)
++ 			break;
++ 		map = trace_enum_jmp_to_tail(map);
++ 		last = &map->tail.next;
++ 		map = map->tail.next;
++ 	}
++ 	if (!map)
++ 		goto out;
++ 
++ 	*last = trace_enum_jmp_to_tail(map)->tail.next;
++ 	kfree(map);
++  out:
++ 	mutex_unlock(&trace_enum_mutex);
++ }
++ #else
++ static inline void trace_module_remove_enums(struct module *mod) { }
++ #endif /* CONFIG_TRACE_ENUM_MAP_FILE */
++ 
++ static int trace_module_notify(struct notifier_block *self,
++ 			       unsigned long val, void *data)
++ {
++ 	struct module *mod = data;
++ 
++ 	switch (val) {
++ 	case MODULE_STATE_COMING:
++ 		trace_module_add_enums(mod);
++ 		break;
++ 	case MODULE_STATE_GOING:
++ 		trace_module_remove_enums(mod);
++ 		break;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static struct notifier_block trace_module_nb = {
++ 	.notifier_call = trace_module_notify,
++ 	.priority = 0,
++ };
++ #endif /* CONFIG_MODULES */
++ 
++ static __init int tracer_init_tracefs(void)
+++>>>>>>> 93faccbbfa95 (fs: Better permission checking for submounts)
+  {
+  	struct dentry *d_tracer;
+  
+diff --git a/fs/afs/mntpt.c b/fs/afs/mntpt.c
+index 9682c33d5daf..96c2db4032d5 100644
+--- a/fs/afs/mntpt.c
++++ b/fs/afs/mntpt.c
+@@ -216,7 +216,7 @@ static struct vfsmount *afs_mntpt_do_automount(struct dentry *mntpt)
+ 
+ 	/* try and do the mount */
+ 	_debug("--- attempting mount %s -o %s ---", devname, options);
+-	mnt = vfs_kern_mount(&afs_fs_type, 0, devname, options);
++	mnt = vfs_submount(mntpt, &afs_fs_type, devname, options);
+ 	_debug("--- mount result %p ---", mnt);
+ 
+ 	free_page((unsigned long) devname);
+* Unmerged path fs/autofs4/waitq.c
+diff --git a/fs/cifs/cifs_dfs_ref.c b/fs/cifs/cifs_dfs_ref.c
+index 8a9ebfd7e8ed..6b61df117fd4 100644
+--- a/fs/cifs/cifs_dfs_ref.c
++++ b/fs/cifs/cifs_dfs_ref.c
+@@ -245,7 +245,8 @@ compose_mount_options_err:
+  * @fullpath:		full path in UNC format
+  * @ref:		server's referral
+  */
+-static struct vfsmount *cifs_dfs_do_refmount(struct cifs_sb_info *cifs_sb,
++static struct vfsmount *cifs_dfs_do_refmount(struct dentry *mntpt,
++		struct cifs_sb_info *cifs_sb,
+ 		const char *fullpath, const struct dfs_info3_param *ref)
+ {
+ 	struct vfsmount *mnt;
+@@ -259,7 +260,7 @@ static struct vfsmount *cifs_dfs_do_refmount(struct cifs_sb_info *cifs_sb,
+ 	if (IS_ERR(mountdata))
+ 		return (struct vfsmount *)mountdata;
+ 
+-	mnt = vfs_kern_mount(&cifs_fs_type, 0, devname, mountdata);
++	mnt = vfs_submount(mntpt, &cifs_fs_type, devname, mountdata);
+ 	kfree(mountdata);
+ 	kfree(devname);
+ 	return mnt;
+@@ -336,7 +337,7 @@ static struct vfsmount *cifs_dfs_do_automount(struct dentry *mntpt)
+ 			mnt = ERR_PTR(-EINVAL);
+ 			break;
+ 		}
+-		mnt = cifs_dfs_do_refmount(cifs_sb,
++		mnt = cifs_dfs_do_refmount(mntpt, cifs_sb,
+ 				full_path, referrals + i);
+ 		cifs_dbg(FYI, "%s: cifs_dfs_do_refmount:%s , mnt:%p\n",
+ 			 __func__, referrals[i].node_name, mnt);
+* Unmerged path fs/debugfs/inode.c
+diff --git a/fs/namespace.c b/fs/namespace.c
+index 58001128375d..a817e4627174 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -987,6 +987,21 @@ vfs_kern_mount(struct file_system_type *type, int flags, const char *name, void
+ }
+ EXPORT_SYMBOL_GPL(vfs_kern_mount);
+ 
++struct vfsmount *
++vfs_submount(const struct dentry *mountpoint, struct file_system_type *type,
++	     const char *name, void *data)
++{
++	/* Until it is worked out how to pass the user namespace
++	 * through from the parent mount to the submount don't support
++	 * unprivileged mounts with submounts.
++	 */
++	if (mountpoint->d_sb->s_user_ns != &init_user_ns)
++		return ERR_PTR(-EPERM);
++
++	return vfs_kern_mount(type, MS_SUBMOUNT, name, data);
++}
++EXPORT_SYMBOL_GPL(vfs_submount);
++
+ static struct mount *clone_mnt(struct mount *old, struct dentry *root,
+ 					int flag)
+ {
+@@ -2759,7 +2774,7 @@ long do_mount(const char *dev_name, const char __user *dir_name,
+ 
+ 	flags &= ~(MS_NOSUID | MS_NOEXEC | MS_NODEV | MS_ACTIVE | MS_BORN |
+ 		   MS_NOATIME | MS_NODIRATIME | MS_RELATIME| MS_KERNMOUNT |
+-		   MS_STRICTATIME | MS_NOREMOTELOCK);
++		   MS_STRICTATIME | MS_NOREMOTELOCK | MS_SUBMOUNT);
+ 
+ 	if (flags & MS_REMOUNT)
+ 		retval = do_remount(&path, flags & ~MS_REMOUNT, mnt_flags,
+diff --git a/fs/nfs/namespace.c b/fs/nfs/namespace.c
+index c08f53bf36e0..23e89bf3ee1e 100644
+--- a/fs/nfs/namespace.c
++++ b/fs/nfs/namespace.c
+@@ -226,7 +226,7 @@ static struct vfsmount *nfs_do_clone_mount(struct nfs_server *server,
+ 					   const char *devname,
+ 					   struct nfs_clone_mount *mountdata)
+ {
+-	return vfs_kern_mount(&nfs_xdev_fs_type, 0, devname, mountdata);
++	return vfs_submount(mountdata->dentry, &nfs_xdev_fs_type, devname, mountdata);
+ }
+ 
+ /**
+diff --git a/fs/nfs/nfs4namespace.c b/fs/nfs/nfs4namespace.c
+index 3d83cb1fdc70..0afd93a1c793 100644
+--- a/fs/nfs/nfs4namespace.c
++++ b/fs/nfs/nfs4namespace.c
+@@ -279,7 +279,7 @@ static struct vfsmount *try_location(struct nfs_clone_mount *mountdata,
+ 				mountdata->hostname,
+ 				mountdata->mnt_path);
+ 
+-		mnt = vfs_kern_mount(&nfs4_referral_fs_type, 0, page, mountdata);
++		mnt = vfs_submount(mountdata->dentry, &nfs4_referral_fs_type, page, mountdata);
+ 		if (!IS_ERR(mnt))
+ 			break;
+ 	}
+* Unmerged path fs/super.c
+* Unmerged path include/linux/debugfs.h
+diff --git a/include/linux/mount.h b/include/linux/mount.h
+index 952d044c1eba..2996221adfa3 100644
+--- a/include/linux/mount.h
++++ b/include/linux/mount.h
+@@ -89,6 +89,9 @@ struct file_system_type;
+ extern struct vfsmount *vfs_kern_mount(struct file_system_type *type,
+ 				      int flags, const char *name,
+ 				      void *data);
++extern struct vfsmount *vfs_submount(const struct dentry *mountpoint,
++				     struct file_system_type *type,
++				     const char *name, void *data);
+ 
+ extern void mnt_set_expiry(struct vfsmount *mnt, struct list_head *expiry_list);
+ extern void mark_mounts_for_expiry(struct list_head *mounts);
+diff --git a/include/uapi/linux/fs.h b/include/uapi/linux/fs.h
+index 966eb629b3f1..40392bd158ba 100644
+--- a/include/uapi/linux/fs.h
++++ b/include/uapi/linux/fs.h
+@@ -99,6 +99,7 @@ struct inodes_stat_t {
+ #define MS_STRICTATIME	(1<<24) /* Always perform atime updates */
+ 
+ /* These sb flags are internal to the kernel */
++#define MS_SUBMOUNT     (1<<26)
+ #define MS_NOREMOTELOCK	(1<<27)
+ #define MS_NOSEC	(1<<28)
+ #define MS_BORN		(1<<29)
+* Unmerged path kernel/trace/trace.c
