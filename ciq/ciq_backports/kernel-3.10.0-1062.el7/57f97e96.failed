@@ -1,0 +1,367 @@
+IB/hfi1: Get the hfi1_devdata structure as early as possible
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Michael J. Ruhl <michael.j.ruhl@intel.com>
+commit 57f97e96625fe89246827ebb4d129741a4f83c40
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/57f97e96.failed
+
+Currently several things occur before the hfi1_devdata structure is
+allocated.  This leads to an inconsistent logging ability and makes
+it more difficult to restructure some code paths.
+
+Allocate (and do a minimal init) the structure as soon as possible.
+
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Reviewed-by: Sadanand Warrier <sadanand.warrier@intel.com>
+	Signed-off-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 57f97e96625fe89246827ebb4d129741a4f83c40)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/chip.c
+diff --cc drivers/infiniband/hw/hfi1/chip.c
+index 82f2710fc5bc,eab25d54e136..000000000000
+--- a/drivers/infiniband/hw/hfi1/chip.c
++++ b/drivers/infiniband/hw/hfi1/chip.c
+@@@ -65,9 -65,8 +65,7 @@@
+  #include "aspm.h"
+  #include "affinity.h"
+  #include "debugfs.h"
+ -#include "fault.h"
+  
+- #define NUM_IB_PORTS 1
+- 
+  uint kdeth_qp;
+  module_param_named(kdeth_qp, kdeth_qp, uint, S_IRUGO);
+  MODULE_PARM_DESC(kdeth_qp, "Set the KDETH queue pair prefix");
+@@@ -15001,11 -14932,8 +14995,16 @@@ int hfi1_init_dd(struct hfi1_devdata *d
+  		"Functional simulator"
+  	};
+  	struct pci_dev *parent = pdev->bus->self;
+++<<<<<<< HEAD
+ +
+ +	dd = hfi1_alloc_devdata(pdev, NUM_IB_PORTS *
+ +				sizeof(struct hfi1_pportdata));
+ +	if (IS_ERR(dd))
+ +		goto bail;
+++=======
++ 	u32 sdma_engines = chip_sdma_engines(dd);
++ 
+++>>>>>>> 57f97e96625f (IB/hfi1: Get the hfi1_devdata structure as early as possible)
+  	ppd = dd->pport;
+  	for (i = 0; i < dd->num_pports; i++, ppd++) {
+  		int vl;
+* Unmerged path drivers/infiniband/hw/hfi1/chip.c
+diff --git a/drivers/infiniband/hw/hfi1/hfi.h b/drivers/infiniband/hw/hfi1/hfi.h
+index d83062c16532..34c3eeae624a 100644
+--- a/drivers/infiniband/hw/hfi1/hfi.h
++++ b/drivers/infiniband/hw/hfi1/hfi.h
+@@ -1904,10 +1904,8 @@ struct cc_state *get_cc_state_protected(struct hfi1_pportdata *ppd)
+ #define HFI1_CTXT_WAITING_URG 4
+ 
+ /* free up any allocated data at closes */
+-struct hfi1_devdata *hfi1_init_dd(struct pci_dev *pdev,
+-				  const struct pci_device_id *ent);
++int hfi1_init_dd(struct hfi1_devdata *dd);
+ void hfi1_free_devdata(struct hfi1_devdata *dd);
+-struct hfi1_devdata *hfi1_alloc_devdata(struct pci_dev *pdev, size_t extra);
+ 
+ /* LED beaconing functions */
+ void hfi1_start_led_override(struct hfi1_pportdata *ppd, unsigned int timeon,
+@@ -1991,7 +1989,7 @@ void hfi1_verbs_unregister_sysfs(struct hfi1_devdata *dd);
+ /* Hook for sysfs read of QSFP */
+ int qsfp_dump(struct hfi1_pportdata *ppd, char *buf, int len);
+ 
+-int hfi1_pcie_init(struct pci_dev *pdev, const struct pci_device_id *ent);
++int hfi1_pcie_init(struct hfi1_devdata *dd);
+ void hfi1_clean_up_interrupts(struct hfi1_devdata *dd);
+ void hfi1_pcie_cleanup(struct pci_dev *pdev);
+ int hfi1_pcie_ddinit(struct hfi1_devdata *dd, struct pci_dev *pdev);
+@@ -2135,19 +2133,6 @@ static inline u64 hfi1_pkt_base_sdma_integrity(struct hfi1_devdata *dd)
+ 	return base_sdma_integrity;
+ }
+ 
+-/*
+- * hfi1_early_err is used (only!) to print early errors before devdata is
+- * allocated, or when dd->pcidev may not be valid, and at the tail end of
+- * cleanup when devdata may have been freed, etc.  hfi1_dev_porterr is
+- * the same as dd_dev_err, but is used when the message really needs
+- * the IB port# to be definitive as to what's happening..
+- */
+-#define hfi1_early_err(dev, fmt, ...) \
+-	dev_err(dev, fmt, ##__VA_ARGS__)
+-
+-#define hfi1_early_info(dev, fmt, ...) \
+-	dev_info(dev, fmt, ##__VA_ARGS__)
+-
+ #define dd_dev_emerg(dd, fmt, ...) \
+ 	dev_emerg(&(dd)->pcidev->dev, "%s: " fmt, \
+ 		  rvt_get_ibdev_name(&(dd)->verbs_dev.rdi), ##__VA_ARGS__)
+diff --git a/drivers/infiniband/hw/hfi1/init.c b/drivers/infiniband/hw/hfi1/init.c
+index d0f1408a5fdc..cfb98d64f597 100644
+--- a/drivers/infiniband/hw/hfi1/init.c
++++ b/drivers/infiniband/hw/hfi1/init.c
+@@ -83,6 +83,8 @@
+ #define HFI1_MIN_EAGER_BUFFER_SIZE (4 * 1024) /* 4KB */
+ #define HFI1_MAX_EAGER_BUFFER_SIZE (256 * 1024) /* 256KB */
+ 
++#define NUM_IB_PORTS 1
++
+ /*
+  * Number of user receive contexts we are configured to use (to allow for more
+  * pio buffers per ctxt, etc.)  Zero means use one user context per CPU.
+@@ -654,9 +656,8 @@ void hfi1_init_pportdata(struct pci_dev *pdev, struct hfi1_pportdata *ppd,
+ 	ppd->part_enforce |= HFI1_PART_ENFORCE_IN;
+ 
+ 	if (loopback) {
+-		hfi1_early_err(&pdev->dev,
+-			       "Faking data partition 0x8001 in idx %u\n",
+-			       !default_pkey_idx);
++		dd_dev_err(dd, "Faking data partition 0x8001 in idx %u\n",
++			   !default_pkey_idx);
+ 		ppd->pkeys[!default_pkey_idx] = 0x8001;
+ 	}
+ 
+@@ -702,9 +703,7 @@ void hfi1_init_pportdata(struct pci_dev *pdev, struct hfi1_pportdata *ppd,
+ 	return;
+ 
+ bail:
+-
+-	hfi1_early_err(&pdev->dev,
+-		       "Congestion Control Agent disabled for port %d\n", port);
++	dd_dev_err(dd, "Congestion Control Agent disabled for port %d\n", port);
+ }
+ 
+ /*
+@@ -1244,15 +1243,19 @@ void hfi1_free_devdata(struct hfi1_devdata *dd)
+ 	kobject_put(&dd->kobj);
+ }
+ 
+-/*
+- * Allocate our primary per-unit data structure.  Must be done via verbs
+- * allocator, because the verbs cleanup process both does cleanup and
+- * free of the data structure.
++/**
++ * hfi1_alloc_devdata - Allocate our primary per-unit data structure.
++ * @pdev: Valid PCI device
++ * @extra: How many bytes to alloc past the default
++ *
++ * Must be done via verbs allocator, because the verbs cleanup process
++ * both does cleanup and free of the data structure.
+  * "extra" is for chip-specific data.
+  *
+  * Use the idr mechanism to get a unit number for this unit.
+  */
+-struct hfi1_devdata *hfi1_alloc_devdata(struct pci_dev *pdev, size_t extra)
++static struct hfi1_devdata *hfi1_alloc_devdata(struct pci_dev *pdev,
++					       size_t extra)
+ {
+ 	unsigned long flags;
+ 	struct hfi1_devdata *dd;
+@@ -1284,8 +1287,8 @@ struct hfi1_devdata *hfi1_alloc_devdata(struct pci_dev *pdev, size_t extra)
+ 	idr_preload_end();
+ 
+ 	if (ret < 0) {
+-		hfi1_early_err(&pdev->dev,
+-			       "Could not allocate unit ID: error %d\n", -ret);
++		dev_err(&pdev->dev,
++			"Could not allocate unit ID: error %d\n", -ret);
+ 		goto bail;
+ 	}
+ 	rvt_set_ibdev_name(&dd->verbs_dev.rdi, "%s_%d", class_name(), dd->unit);
+@@ -1593,23 +1596,23 @@ static void postinit_cleanup(struct hfi1_devdata *dd)
+ 	hfi1_free_devdata(dd);
+ }
+ 
+-static int init_validate_rcvhdrcnt(struct device *dev, uint thecnt)
++static int init_validate_rcvhdrcnt(struct hfi1_devdata *dd, uint thecnt)
+ {
+ 	if (thecnt <= HFI1_MIN_HDRQ_EGRBUF_CNT) {
+-		hfi1_early_err(dev, "Receive header queue count too small\n");
++		dd_dev_err(dd, "Receive header queue count too small\n");
+ 		return -EINVAL;
+ 	}
+ 
+ 	if (thecnt > HFI1_MAX_HDRQ_EGRBUF_CNT) {
+-		hfi1_early_err(dev,
+-			       "Receive header queue count cannot be greater than %u\n",
+-			       HFI1_MAX_HDRQ_EGRBUF_CNT);
++		dd_dev_err(dd,
++			   "Receive header queue count cannot be greater than %u\n",
++			   HFI1_MAX_HDRQ_EGRBUF_CNT);
+ 		return -EINVAL;
+ 	}
+ 
+ 	if (thecnt % HDRQ_INCREMENT) {
+-		hfi1_early_err(dev, "Receive header queue count %d must be divisible by %lu\n",
+-			       thecnt, HDRQ_INCREMENT);
++		dd_dev_err(dd, "Receive header queue count %d must be divisible by %lu\n",
++			   thecnt, HDRQ_INCREMENT);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -1628,22 +1631,29 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	/* Validate dev ids */
+ 	if (!(ent->device == PCI_DEVICE_ID_INTEL0 ||
+ 	      ent->device == PCI_DEVICE_ID_INTEL1)) {
+-		hfi1_early_err(&pdev->dev,
+-			       "Failing on unknown Intel deviceid 0x%x\n",
+-			       ent->device);
++		dev_err(&pdev->dev, "Failing on unknown Intel deviceid 0x%x\n",
++			ent->device);
+ 		ret = -ENODEV;
+ 		goto bail;
+ 	}
+ 
++	/* Allocate the dd so we can get to work */
++	dd = hfi1_alloc_devdata(pdev, NUM_IB_PORTS *
++				sizeof(struct hfi1_pportdata));
++	if (IS_ERR(dd)) {
++		ret = PTR_ERR(dd);
++		goto bail;
++	}
++
+ 	/* Validate some global module parameters */
+-	ret = init_validate_rcvhdrcnt(&pdev->dev, rcvhdrcnt);
++	ret = init_validate_rcvhdrcnt(dd, rcvhdrcnt);
+ 	if (ret)
+ 		goto bail;
+ 
+ 	/* use the encoding function as a sanitization check */
+ 	if (!encode_rcv_header_entry_size(hfi1_hdrq_entsize)) {
+-		hfi1_early_err(&pdev->dev, "Invalid HdrQ Entry size %u\n",
+-			       hfi1_hdrq_entsize);
++		dd_dev_err(dd, "Invalid HdrQ Entry size %u\n",
++			   hfi1_hdrq_entsize);
+ 		ret = -EINVAL;
+ 		goto bail;
+ 	}
+@@ -1665,10 +1675,10 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 			clamp_val(eager_buffer_size,
+ 				  MIN_EAGER_BUFFER * 8,
+ 				  MAX_EAGER_BUFFER_TOTAL);
+-		hfi1_early_info(&pdev->dev, "Eager buffer size %u\n",
+-				eager_buffer_size);
++		dd_dev_info(dd, "Eager buffer size %u\n",
++			    eager_buffer_size);
+ 	} else {
+-		hfi1_early_err(&pdev->dev, "Invalid Eager buffer size of 0\n");
++		dd_dev_err(dd, "Invalid Eager buffer size of 0\n");
+ 		ret = -EINVAL;
+ 		goto bail;
+ 	}
+@@ -1676,7 +1686,7 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	/* restrict value of hfi1_rcvarr_split */
+ 	hfi1_rcvarr_split = clamp_val(hfi1_rcvarr_split, 0, 100);
+ 
+-	ret = hfi1_pcie_init(pdev, ent);
++	ret = hfi1_pcie_init(dd);
+ 	if (ret)
+ 		goto bail;
+ 
+@@ -1684,12 +1694,9 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	 * Do device-specific initialization, function table setup, dd
+ 	 * allocation, etc.
+ 	 */
+-	dd = hfi1_init_dd(pdev, ent);
+-
+-	if (IS_ERR(dd)) {
+-		ret = PTR_ERR(dd);
++	ret = hfi1_init_dd(dd);
++	if (ret)
+ 		goto clean_bail; /* error already printed */
+-	}
+ 
+ 	ret = create_workqueues(dd);
+ 	if (ret)
+diff --git a/drivers/infiniband/hw/hfi1/pcie.c b/drivers/infiniband/hw/hfi1/pcie.c
+index 87bd6b60cb53..6da263c98225 100644
+--- a/drivers/infiniband/hw/hfi1/pcie.c
++++ b/drivers/infiniband/hw/hfi1/pcie.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright(c) 2015 - 2017 Intel Corporation.
++ * Copyright(c) 2015 - 2018 Intel Corporation.
+  *
+  * This file is provided under a dual BSD/GPLv2 license.  When using or
+  * redistributing this file, you may do so under either license.
+@@ -72,13 +72,11 @@ static void tune_pcie_caps(struct hfi1_devdata *);
+ 
+ /*
+  * Do all the common PCIe setup and initialization.
+- * devdata is not yet allocated, and is not allocated until after this
+- * routine returns success.  Therefore dd_dev_err() can't be used for error
+- * printing.
+  */
+-int hfi1_pcie_init(struct pci_dev *pdev, const struct pci_device_id *ent)
++int hfi1_pcie_init(struct hfi1_devdata *dd)
+ {
+ 	int ret;
++	struct pci_dev *pdev = dd->pcidev;
+ 
+ 	ret = pci_enable_device(pdev);
+ 	if (ret) {
+@@ -94,15 +92,13 @@ int hfi1_pcie_init(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 		 * about that, it appears.  If the original BAR was retained
+ 		 * in the kernel data structures, this may be OK.
+ 		 */
+-		hfi1_early_err(&pdev->dev, "pci enable failed: error %d\n",
+-			       -ret);
+-		goto done;
++		dd_dev_err(dd, "pci enable failed: error %d\n", -ret);
++		return ret;
+ 	}
+ 
+ 	ret = pci_request_regions(pdev, DRIVER_NAME);
+ 	if (ret) {
+-		hfi1_early_err(&pdev->dev,
+-			       "pci_request_regions fails: err %d\n", -ret);
++		dd_dev_err(dd, "pci_request_regions fails: err %d\n", -ret);
+ 		goto bail;
+ 	}
+ 
+@@ -115,8 +111,7 @@ int hfi1_pcie_init(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 		 */
+ 		ret = pci_set_dma_mask(pdev, DMA_BIT_MASK(32));
+ 		if (ret) {
+-			hfi1_early_err(&pdev->dev,
+-				       "Unable to set DMA mask: %d\n", ret);
++			dd_dev_err(dd, "Unable to set DMA mask: %d\n", ret);
+ 			goto bail;
+ 		}
+ 		ret = pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(32));
+@@ -124,18 +119,16 @@ int hfi1_pcie_init(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 		ret = pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(64));
+ 	}
+ 	if (ret) {
+-		hfi1_early_err(&pdev->dev,
+-			       "Unable to set DMA consistent mask: %d\n", ret);
++		dd_dev_err(dd, "Unable to set DMA consistent mask: %d\n", ret);
+ 		goto bail;
+ 	}
+ 
+ 	pci_set_master(pdev);
+ 	(void)pci_enable_pcie_error_reporting(pdev);
+-	goto done;
++	return 0;
+ 
+ bail:
+ 	hfi1_pcie_cleanup(pdev);
+-done:
+ 	return ret;
+ }
+ 
+@@ -210,7 +203,7 @@ int hfi1_pcie_ddinit(struct hfi1_devdata *dd, struct pci_dev *pdev)
+ 		dd_dev_err(dd, "WC mapping of send buffers failed\n");
+ 		goto nomem;
+ 	}
+-	dd_dev_info(dd, "WC piobase: %p\n for %x", dd->piobase, TXE_PIO_SIZE);
++	dd_dev_info(dd, "WC piobase: %p for %x\n", dd->piobase, TXE_PIO_SIZE);
+ 
+ 	dd->physaddr = addr;        /* used for io_remap, etc. */
+ 
