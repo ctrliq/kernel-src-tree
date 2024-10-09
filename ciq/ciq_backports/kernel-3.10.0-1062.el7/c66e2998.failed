@@ -1,0 +1,134 @@
+nvme-rdma: centralize controller setup sequence
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Sagi Grimberg <sagi@grimberg.me>
+commit c66e2998c8ca4d5da85d4915612dca29e054ad21
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/c66e2998.failed
+
+Centralize controller sequence to a single routine that correctly cleans
+up after failures instead of having multiple apperances in several flows
+(create, reset, reconnect).
+
+One thing that we also gain here are the sanity/boundary checks also
+when connecting back to a dynamic controller.
+
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit c66e2998c8ca4d5da85d4915612dca29e054ad21)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/rdma.c
+diff --cc drivers/nvme/host/rdma.c
+index b11728c55613,c22125c5661b..000000000000
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@@ -937,21 -917,44 +937,41 @@@ static void nvme_rdma_reconnect_or_remo
+  	}
+  }
+  
+- static void nvme_rdma_reconnect_ctrl_work(struct work_struct *work)
++ static int nvme_rdma_setup_ctrl(struct nvme_rdma_ctrl *ctrl, bool new)
+  {
+- 	struct nvme_rdma_ctrl *ctrl = container_of(to_delayed_work(work),
+- 			struct nvme_rdma_ctrl, reconnect_work);
++ 	int ret = -EINVAL;
+  	bool changed;
+- 	int ret;
+  
+- 	++ctrl->ctrl.nr_reconnects;
+- 
+- 	ret = nvme_rdma_configure_admin_queue(ctrl, false);
++ 	ret = nvme_rdma_configure_admin_queue(ctrl, new);
+  	if (ret)
+- 		goto requeue;
++ 		return ret;
++ 
++ 	if (ctrl->ctrl.icdoff) {
++ 		dev_err(ctrl->ctrl.device, "icdoff is not supported!\n");
++ 		goto destroy_admin;
++ 	}
++ 
++ 	if (!(ctrl->ctrl.sgls & (1 << 2))) {
++ 		dev_err(ctrl->ctrl.device,
++ 			"Mandatory keyed sgls are not supported!\n");
++ 		goto destroy_admin;
++ 	}
++ 
++ 	if (ctrl->ctrl.opts->queue_size > ctrl->ctrl.sqsize + 1) {
++ 		dev_warn(ctrl->ctrl.device,
++ 			"queue_size %zu > ctrl sqsize %u, clamping down\n",
++ 			ctrl->ctrl.opts->queue_size, ctrl->ctrl.sqsize + 1);
++ 	}
++ 
++ 	if (ctrl->ctrl.sqsize + 1 > ctrl->ctrl.maxcmd) {
++ 		dev_warn(ctrl->ctrl.device,
++ 			"sqsize %u > ctrl maxcmd %u, clamping down\n",
++ 			ctrl->ctrl.sqsize + 1, ctrl->ctrl.maxcmd);
++ 		ctrl->ctrl.sqsize = ctrl->ctrl.maxcmd - 1;
++ 	}
+  
+ -	if (ctrl->ctrl.sgls & (1 << 20))
+ -		ctrl->use_inline_data = true;
+ -
+  	if (ctrl->ctrl.queue_count > 1) {
+- 		ret = nvme_rdma_configure_io_queues(ctrl, false);
++ 		ret = nvme_rdma_configure_io_queues(ctrl, new);
+  		if (ret)
+  			goto destroy_admin;
+  	}
+@@@ -1967,46 -2003,7 +1987,50 @@@ static struct nvme_ctrl *nvme_rdma_crea
+  	if (ret)
+  		goto out_uninit_ctrl;
+  
+++<<<<<<< HEAD
+ +	/* sanity check icdoff */
+ +	if (ctrl->ctrl.icdoff) {
+ +		dev_err(ctrl->ctrl.device, "icdoff is not supported!\n");
+ +		ret = -EINVAL;
+ +		goto out_remove_admin_queue;
+ +	}
+ +
+ +	/* sanity check keyed sgls */
+ +	if (!(ctrl->ctrl.sgls & (1 << 2))) {
+ +		dev_err(ctrl->ctrl.device,
+ +			"Mandatory keyed sgls are not supported!\n");
+ +		ret = -EINVAL;
+ +		goto out_remove_admin_queue;
+ +	}
+ +
+ +	/* only warn if argument is too large here, will clamp later */
+ +	if (opts->queue_size > ctrl->ctrl.sqsize + 1) {
+ +		dev_warn(ctrl->ctrl.device,
+ +			"queue_size %zu > ctrl sqsize %u, clamping down\n",
+ +			opts->queue_size, ctrl->ctrl.sqsize + 1);
+ +	}
+ +
+ +	/* warn if maxcmd is lower than sqsize+1 */
+ +	if (ctrl->ctrl.sqsize + 1 > ctrl->ctrl.maxcmd) {
+ +		dev_warn(ctrl->ctrl.device,
+ +			"sqsize %u > ctrl maxcmd %u, clamping down\n",
+ +			ctrl->ctrl.sqsize + 1, ctrl->ctrl.maxcmd);
+ +		ctrl->ctrl.sqsize = ctrl->ctrl.maxcmd - 1;
+ +	}
+ +
+ +	if (opts->nr_io_queues) {
+ +		ret = nvme_rdma_configure_io_queues(ctrl, true);
+ +		if (ret)
+ +			goto out_remove_admin_queue;
+ +	}
+ +
+ +	changed = nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_LIVE);
+ +	WARN_ON_ONCE(!changed);
+ +
+ +	dev_info(ctrl->ctrl.device, "new ctrl: NQN \"%s\", addr %pISp\n",
+++=======
++ 	dev_info(ctrl->ctrl.device, "new ctrl: NQN \"%s\", addr %pISpcs\n",
+++>>>>>>> c66e2998c8ca (nvme-rdma: centralize controller setup sequence)
+  		ctrl->ctrl.opts->subsysnqn, &ctrl->addr);
+  
+  	nvme_get_ctrl(&ctrl->ctrl);
+* Unmerged path drivers/nvme/host/rdma.c
