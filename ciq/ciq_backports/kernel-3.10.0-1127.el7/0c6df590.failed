@@ -1,0 +1,140 @@
+scsi: qla2xxx: Fix abort timeout race condition.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+Rebuild_CHGLOG: - [scsi] scsi: qla2xxx: Fix abort timeout race condition (Himanshu Madhani) [1729270]
+Rebuild_FUZZ: 98.95%
+commit-author Quinn Tran <qutran@marvell.com>
+commit 0c6df59061b23c7a951836d23977be34e896d3da
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/0c6df590.failed
+
+If an abort times out, the Abort IOCB completion and Abort timer can race
+against each other. This patch provides unique error code for timer path to
+allow proper cleanup.
+
+[mkp: typo]
+
+	Signed-off-by: Quinn Tran <qutran@marvell.com>
+	Signed-off-by: Himanshu Madhani <hmadhani@marvell.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 0c6df59061b23c7a951836d23977be34e896d3da)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_init.c
+diff --cc drivers/scsi/qla2xxx/qla_init.c
+index c48c2b8df642,68d7496a8aff..000000000000
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@@ -95,6 -95,93 +95,96 @@@ qla2x00_get_async_timeout(struct scsi_q
+  	return tmo;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void qla24xx_abort_iocb_timeout(void *data)
++ {
++ 	srb_t *sp = data;
++ 	struct srb_iocb *abt = &sp->u.iocb_cmd;
++ 	struct qla_qpair *qpair = sp->qpair;
++ 	u32 handle;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(qpair->qp_lock_ptr, flags);
++ 	for (handle = 1; handle < qpair->req->num_outstanding_cmds; handle++) {
++ 		/* removing the abort */
++ 		if (qpair->req->outstanding_cmds[handle] == sp) {
++ 			qpair->req->outstanding_cmds[handle] = NULL;
++ 			break;
++ 		}
++ 	}
++ 	spin_unlock_irqrestore(qpair->qp_lock_ptr, flags);
++ 
++ 	abt->u.abt.comp_status = CS_TIMEOUT;
++ 	sp->done(sp, QLA_OS_TIMER_EXPIRED);
++ }
++ 
++ static void qla24xx_abort_sp_done(void *ptr, int res)
++ {
++ 	srb_t *sp = ptr;
++ 	struct srb_iocb *abt = &sp->u.iocb_cmd;
++ 
++ 	if ((res == QLA_OS_TIMER_EXPIRED) ||
++ 	    del_timer(&sp->u.iocb_cmd.timer)) {
++ 		if (sp->flags & SRB_WAKEUP_ON_COMP)
++ 			complete(&abt->u.abt.comp);
++ 		else
++ 			sp->free(sp);
++ 	}
++ }
++ 
++ static int qla24xx_async_abort_cmd(srb_t *cmd_sp, bool wait)
++ {
++ 	scsi_qla_host_t *vha = cmd_sp->vha;
++ 	struct srb_iocb *abt_iocb;
++ 	srb_t *sp;
++ 	int rval = QLA_FUNCTION_FAILED;
++ 
++ 	sp = qla2xxx_get_qpair_sp(cmd_sp->vha, cmd_sp->qpair, cmd_sp->fcport,
++ 				  GFP_ATOMIC);
++ 	if (!sp)
++ 		goto done;
++ 
++ 	abt_iocb = &sp->u.iocb_cmd;
++ 	sp->type = SRB_ABT_CMD;
++ 	sp->name = "abort";
++ 	sp->qpair = cmd_sp->qpair;
++ 	if (wait)
++ 		sp->flags = SRB_WAKEUP_ON_COMP;
++ 
++ 	abt_iocb->timeout = qla24xx_abort_iocb_timeout;
++ 	init_completion(&abt_iocb->u.abt.comp);
++ 	/* FW can send 2 x ABTS's timeout/20s */
++ 	qla2x00_init_timer(sp, 42);
++ 
++ 	abt_iocb->u.abt.cmd_hndl = cmd_sp->handle;
++ 	abt_iocb->u.abt.req_que_no = cpu_to_le16(cmd_sp->qpair->req->id);
++ 
++ 	sp->done = qla24xx_abort_sp_done;
++ 
++ 	ql_dbg(ql_dbg_async, vha, 0x507c,
++ 	       "Abort command issued - hdl=%x, type=%x\n", cmd_sp->handle,
++ 	       cmd_sp->type);
++ 
++ 	rval = qla2x00_start_sp(sp);
++ 	if (rval != QLA_SUCCESS)
++ 		goto done_free_sp;
++ 
++ 	if (wait) {
++ 		wait_for_completion(&abt_iocb->u.abt.comp);
++ 		rval = abt_iocb->u.abt.comp_status == CS_COMPLETE ?
++ 			QLA_SUCCESS : QLA_FUNCTION_FAILED;
++ 	} else {
++ 		goto done;
++ 	}
++ 
++ done_free_sp:
++ 	sp->free(sp);
++ done:
++ 	return rval;
++ }
++ 
+++>>>>>>> 0c6df59061b2 (scsi: qla2xxx: Fix abort timeout race condition.)
+  void
+  qla2x00_async_iocb_timeout(void *data)
+  {
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index e658b52fa060..9e71c34c21a1 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -4580,6 +4580,7 @@ struct qla2_sgx {
+ #define QLA_SUSPENDED			0x106
+ #define QLA_BUSY			0x107
+ #define QLA_ALREADY_REGISTERED		0x109
++#define QLA_OS_TIMER_EXPIRED		0x10a
+ 
+ #define NVRAM_DELAY()		udelay(10)
+ 
+* Unmerged path drivers/scsi/qla2xxx/qla_init.c
