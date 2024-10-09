@@ -1,0 +1,217 @@
+fsnotify: pass connp and object type to fsnotify_add_mark()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit b812a9f5896379b6cff2ac168ddb5b89037d8e78
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/b812a9f5.failed
+
+Instead of passing inode and vfsmount arguments to fsnotify_add_mark()
+and its _locked variant, pass an abstract object pointer and the object
+type.
+
+The helpers fsnotify_obj_{inode,mount} are added to get the concrete
+object pointer from abstract object pointer.
+
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit b812a9f5896379b6cff2ac168ddb5b89037d8e78)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/fsnotify.h
+#	fs/notify/mark.c
+#	include/linux/fsnotify_backend.h
+diff --cc fs/notify/fsnotify.h
+index 2ce7101951ac,caeee042d1cc..000000000000
+--- a/fs/notify/fsnotify.h
++++ b/fs/notify/fsnotify.h
+@@@ -8,11 -9,15 +8,23 @@@
+  
+  #include "../mount.h"
+  
+++<<<<<<< HEAD
+ +struct fsnotify_iter_info {
+ +	struct fsnotify_mark *inode_mark;
+ +	struct fsnotify_mark *vfsmount_mark;
+ +	int srcu_idx;
+ +};
+++=======
++ static inline struct inode *fsnotify_obj_inode(fsnotify_connp_t *connp)
++ {
++ 	return container_of(connp, struct inode, i_fsnotify_marks);
++ }
++ 
++ static inline struct mount *fsnotify_obj_mount(fsnotify_connp_t *connp)
++ {
++ 	return container_of(connp, struct mount, mnt_fsnotify_marks);
++ }
+++>>>>>>> b812a9f58963 (fsnotify: pass connp and object type to fsnotify_add_mark())
+  
+  /* destroy all events sitting in this groups notification queue */
+  extern void fsnotify_flush_notify(struct fsnotify_group *group);
+diff --cc fs/notify/mark.c
+index 76c708e59bfa,7abb73b5beba..000000000000
+--- a/fs/notify/mark.c
++++ b/fs/notify/mark.c
+@@@ -440,13 -447,11 +440,21 @@@ static int fsnotify_attach_connector_to
+  		return -ENOMEM;
+  	spin_lock_init(&conn->lock);
+  	INIT_HLIST_HEAD(&conn->list);
+++<<<<<<< HEAD
+ +	if (inode) {
+ +		conn->flags = FSNOTIFY_OBJ_TYPE_INODE;
+ +		conn->inode = igrab(inode);
+ +	} else {
+ +		conn->flags = FSNOTIFY_OBJ_TYPE_VFSMOUNT;
+ +		conn->mnt = mnt;
+ +	}
+++=======
++ 	conn->type = type;
++ 	if (conn->type == FSNOTIFY_OBJ_TYPE_INODE)
++ 		inode = conn->inode = igrab(fsnotify_obj_inode(connp));
++ 	else if (conn->type == FSNOTIFY_OBJ_TYPE_VFSMOUNT)
++ 		conn->mnt = &fsnotify_obj_mount(connp)->mnt;
+++>>>>>>> b812a9f58963 (fsnotify: pass connp and object type to fsnotify_add_mark())
+  	/*
+  	 * cmpxchg() provides the barrier so that readers of *connp can see
+  	 * only initialized structure
+diff --cc include/linux/fsnotify_backend.h
+index 6305bebac1c3,8efb8663453d..000000000000
+--- a/include/linux/fsnotify_backend.h
++++ b/include/linux/fsnotify_backend.h
+@@@ -200,6 -199,62 +200,65 @@@ struct fsnotify_group 
+  #define FSNOTIFY_EVENT_PATH	1
+  #define FSNOTIFY_EVENT_INODE	2
+  
+++<<<<<<< HEAD
+++=======
++ enum fsnotify_obj_type {
++ 	FSNOTIFY_OBJ_TYPE_INODE,
++ 	FSNOTIFY_OBJ_TYPE_VFSMOUNT,
++ 	FSNOTIFY_OBJ_TYPE_COUNT,
++ 	FSNOTIFY_OBJ_TYPE_DETACHED = FSNOTIFY_OBJ_TYPE_COUNT
++ };
++ 
++ #define FSNOTIFY_OBJ_TYPE_INODE_FL	(1U << FSNOTIFY_OBJ_TYPE_INODE)
++ #define FSNOTIFY_OBJ_TYPE_VFSMOUNT_FL	(1U << FSNOTIFY_OBJ_TYPE_VFSMOUNT)
++ #define FSNOTIFY_OBJ_ALL_TYPES_MASK	((1U << FSNOTIFY_OBJ_TYPE_COUNT) - 1)
++ 
++ static inline bool fsnotify_valid_obj_type(unsigned int type)
++ {
++ 	return (type < FSNOTIFY_OBJ_TYPE_COUNT);
++ }
++ 
++ struct fsnotify_iter_info {
++ 	struct fsnotify_mark *marks[FSNOTIFY_OBJ_TYPE_COUNT];
++ 	unsigned int report_mask;
++ 	int srcu_idx;
++ };
++ 
++ static inline bool fsnotify_iter_should_report_type(
++ 		struct fsnotify_iter_info *iter_info, int type)
++ {
++ 	return (iter_info->report_mask & (1U << type));
++ }
++ 
++ static inline void fsnotify_iter_set_report_type(
++ 		struct fsnotify_iter_info *iter_info, int type)
++ {
++ 	iter_info->report_mask |= (1U << type);
++ }
++ 
++ static inline void fsnotify_iter_set_report_type_mark(
++ 		struct fsnotify_iter_info *iter_info, int type,
++ 		struct fsnotify_mark *mark)
++ {
++ 	iter_info->marks[type] = mark;
++ 	iter_info->report_mask |= (1U << type);
++ }
++ 
++ #define FSNOTIFY_ITER_FUNCS(name, NAME) \
++ static inline struct fsnotify_mark *fsnotify_iter_##name##_mark( \
++ 		struct fsnotify_iter_info *iter_info) \
++ { \
++ 	return (iter_info->report_mask & FSNOTIFY_OBJ_TYPE_##NAME##_FL) ? \
++ 		iter_info->marks[FSNOTIFY_OBJ_TYPE_##NAME] : NULL; \
++ }
++ 
++ FSNOTIFY_ITER_FUNCS(inode, INODE)
++ FSNOTIFY_ITER_FUNCS(vfsmount, VFSMOUNT)
++ 
++ #define fsnotify_foreach_obj_type(type) \
++ 	for (type = 0; type < FSNOTIFY_OBJ_TYPE_COUNT; type++)
++ 
+++>>>>>>> b812a9f58963 (fsnotify: pass connp and object type to fsnotify_add_mark())
+  /*
+   * Inode / vfsmount point to this structure which tracks all marks attached to
+   * the inode / vfsmount. The reference to inode / vfsmount is held by this
+diff --git a/fs/notify/fanotify/fanotify_user.c b/fs/notify/fanotify/fanotify_user.c
+index 30656ee73280..5ffd4ecb570f 100644
+--- a/fs/notify/fanotify/fanotify_user.c
++++ b/fs/notify/fanotify/fanotify_user.c
+@@ -622,8 +622,8 @@ static __u32 fanotify_mark_add_to_mask(struct fsnotify_mark *fsn_mark,
+ }
+ 
+ static struct fsnotify_mark *fanotify_add_new_mark(struct fsnotify_group *group,
+-						   struct inode *inode,
+-						   struct vfsmount *mnt)
++						   fsnotify_connp_t *connp,
++						   unsigned int type)
+ {
+ 	struct fsnotify_mark *mark;
+ 	int ret;
+@@ -636,7 +636,7 @@ static struct fsnotify_mark *fanotify_add_new_mark(struct fsnotify_group *group,
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	fsnotify_init_mark(mark, group);
+-	ret = fsnotify_add_mark_locked(mark, inode, mnt, 0);
++	ret = fsnotify_add_mark_locked(mark, connp, type, 0);
+ 	if (ret) {
+ 		fsnotify_put_mark(mark);
+ 		return ERR_PTR(ret);
+@@ -650,14 +650,15 @@ static int fanotify_add_vfsmount_mark(struct fsnotify_group *group,
+ 				      struct vfsmount *mnt, __u32 mask,
+ 				      unsigned int flags)
+ {
++	fsnotify_connp_t *connp = &real_mount(mnt)->mnt_fsnotify_marks;
+ 	struct fsnotify_mark *fsn_mark;
+ 	__u32 added;
+ 
+ 	mutex_lock(&group->mark_mutex);
+-	fsn_mark = fsnotify_find_mark(&real_mount(mnt)->mnt_fsnotify_marks,
+-				      group);
++	fsn_mark = fsnotify_find_mark(connp, group);
+ 	if (!fsn_mark) {
+-		fsn_mark = fanotify_add_new_mark(group, NULL, mnt);
++		fsn_mark = fanotify_add_new_mark(group, connp,
++						 FSNOTIFY_OBJ_TYPE_VFSMOUNT);
+ 		if (IS_ERR(fsn_mark)) {
+ 			mutex_unlock(&group->mark_mutex);
+ 			return PTR_ERR(fsn_mark);
+@@ -676,6 +677,7 @@ static int fanotify_add_inode_mark(struct fsnotify_group *group,
+ 				   struct inode *inode, __u32 mask,
+ 				   unsigned int flags)
+ {
++	fsnotify_connp_t *connp = &inode->i_fsnotify_marks;
+ 	struct fsnotify_mark *fsn_mark;
+ 	__u32 added;
+ 
+@@ -692,9 +694,10 @@ static int fanotify_add_inode_mark(struct fsnotify_group *group,
+ 		return 0;
+ 
+ 	mutex_lock(&group->mark_mutex);
+-	fsn_mark = fsnotify_find_mark(&inode->i_fsnotify_marks, group);
++	fsn_mark = fsnotify_find_mark(connp, group);
+ 	if (!fsn_mark) {
+-		fsn_mark = fanotify_add_new_mark(group, inode, NULL);
++		fsn_mark = fanotify_add_new_mark(group, connp,
++						 FSNOTIFY_OBJ_TYPE_INODE);
+ 		if (IS_ERR(fsn_mark)) {
+ 			mutex_unlock(&group->mark_mutex);
+ 			return PTR_ERR(fsn_mark);
+* Unmerged path fs/notify/fsnotify.h
+* Unmerged path fs/notify/mark.c
+* Unmerged path include/linux/fsnotify_backend.h
