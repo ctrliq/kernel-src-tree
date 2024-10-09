@@ -547,6 +547,7 @@ struct r5worker {
 
 struct r5worker_group {
 	struct list_head handle_list;
+	struct list_head loprio_list;
 	struct r5conf *conf;
 	struct r5worker *workers;
 	int stripes_cnt;
@@ -623,6 +624,7 @@ struct r5conf {
 						  */
 
 	struct list_head	handle_list; /* stripes needing handling */
+	struct list_head	loprio_list; /* low priority stripes */
 	struct list_head	hold_list; /* preread ready stripes */
 	struct list_head	delayed_list; /* stripes that have plugged requests */
 	struct list_head	bitmap_list; /* stripes delaying awaiting bitmap update */
