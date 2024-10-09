@@ -1,0 +1,358 @@
+cls_flower: Support multiple masks per priority
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Paul Blakey <paulb@mellanox.com>
+commit 05cd271fd61a0bb64fc20c46c9c87b8272fb980c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/05cd271f.failed
+
+Currently flower doesn't support inserting filters with different masks
+on a single priority, even if the actual flows (key + mask) inserted
+aren't overlapping, as with the use case of offloading openvswitch
+datapath flows. Instead one must go up one level, and assign different
+priorities for each mask, which will create a different flower
+instances.
+
+This patch opens flower to support more than one mask per priority,
+and a single flower instance. It does so by adding another hash table
+on top of the existing one which will store the different masks,
+and the filters that share it.
+
+The user is left with the responsibility of ensuring non overlapping
+flows, otherwise precedence is not guaranteed.
+
+	Signed-off-by: Paul Blakey <paulb@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 05cd271fd61a0bb64fc20c46c9c87b8272fb980c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_flower.c
+diff --cc net/sched/cls_flower.c
+index eb4e6a91f3e1,eacaaf803914..000000000000
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@@ -93,8 -94,16 +96,15 @@@ struct cls_fl_filter 
+  		struct work_struct work;
+  		struct rcu_head	rcu;
+  	};
+ -	struct net_device *hw_dev;
+  };
+  
++ static const struct rhashtable_params mask_ht_params = {
++ 	.key_offset = offsetof(struct fl_flow_mask, key),
++ 	.key_len = sizeof(struct fl_flow_key),
++ 	.head_offset = offsetof(struct fl_flow_mask, ht_node),
++ 	.automatic_shrinking = true,
++ };
++ 
+  static unsigned short int fl_mask_range(const struct fl_flow_mask *mask)
+  {
+  	return mask->range.end - mask->range.start;
+@@@ -154,52 -168,28 +169,62 @@@ static int fl_classify(struct sk_buff *
+  {
+  	struct cls_fl_head *head = rcu_dereference_bh(tp->root);
+  	struct cls_fl_filter *f;
++ 	struct fl_flow_mask *mask;
+  	struct fl_flow_key skb_key;
+  	struct fl_flow_key skb_mkey;
+ +	struct ip_tunnel_info *info;
+  
+- 	if (!atomic_read(&head->ht.nelems))
+- 		return -1;
++ 	list_for_each_entry_rcu(mask, &head->masks, list) {
++ 		fl_clear_masked_range(&skb_key, mask);
+  
+- 	fl_clear_masked_range(&skb_key, &head->mask);
++ 		skb_key.indev_ifindex = skb->skb_iif;
++ 		/* skb_flow_dissect() does not set n_proto in case an unknown
++ 		 * protocol, so do it rather here.
++ 		 */
++ 		skb_key.basic.n_proto = skb->protocol;
++ 		skb_flow_dissect_tunnel_info(skb, &mask->dissector, &skb_key);
++ 		skb_flow_dissect(skb, &mask->dissector, &skb_key, 0);
+  
+++<<<<<<< HEAD
+ +	info = skb_tunnel_info(skb);
+ +	if (info) {
+ +		struct ip_tunnel_key *key = &info->key;
+ +
+ +		switch (ip_tunnel_info_af(info)) {
+ +		case AF_INET:
+ +			skb_key.enc_control.addr_type =
+ +				FLOW_DISSECTOR_KEY_IPV4_ADDRS;
+ +			skb_key.enc_ipv4.src = key->u.ipv4.src;
+ +			skb_key.enc_ipv4.dst = key->u.ipv4.dst;
+ +			break;
+ +		case AF_INET6:
+ +			skb_key.enc_control.addr_type =
+ +				FLOW_DISSECTOR_KEY_IPV6_ADDRS;
+ +			skb_key.enc_ipv6.src = key->u.ipv6.src;
+ +			skb_key.enc_ipv6.dst = key->u.ipv6.dst;
+ +			break;
+ +		}
+ +
+ +		skb_key.enc_key_id.keyid = tunnel_id_to_key32(key->tun_id);
+ +		skb_key.enc_tp.src = key->tp_src;
+ +		skb_key.enc_tp.dst = key->tp_dst;
+ +	}
+ +
+ +	skb_key.indev_ifindex = skb->skb_iif;
+ +	/* skb_flow_dissect() does not set n_proto in case an unknown protocol,
+ +	 * so do it rather here.
+ +	 */
+ +	skb_key.basic.n_proto = skb->protocol;
+ +	skb_flow_dissect(skb, &head->dissector, &skb_key, 0);
+- 
+- 	fl_set_masked_key(&skb_mkey, &skb_key, &head->mask);
+- 
+- 	f = fl_lookup(head, &skb_mkey);
+- 	if (f && !tc_skip_sw(f->flags)) {
+- 		*res = f->res;
+- 		return tcf_exts_exec(skb, &f->exts, res);
+++=======
++ 		fl_set_masked_key(&skb_mkey, &skb_key, mask);
+++>>>>>>> 05cd271fd61a (cls_flower: Support multiple masks per priority)
++ 
++ 		f = fl_lookup(mask, &skb_mkey);
++ 		if (f && !tc_skip_sw(f->flags)) {
++ 			*res = f->res;
++ 			return tcf_exts_exec(skb, &f->exts, res);
++ 		}
+  	}
+  	return -1;
+  }
+@@@ -212,11 -202,28 +237,28 @@@ static int fl_init(struct tcf_proto *tp
+  	if (!head)
+  		return -ENOBUFS;
+  
+- 	INIT_LIST_HEAD_RCU(&head->filters);
++ 	INIT_LIST_HEAD_RCU(&head->masks);
+  	rcu_assign_pointer(tp->root, head);
+ -	idr_init(&head->handle_idr);
+ +	idr_init_ext(&head->handle_idr);
+  
+- 	return 0;
++ 	return rhashtable_init(&head->ht, &mask_ht_params);
++ }
++ 
++ static bool fl_mask_put(struct cls_fl_head *head, struct fl_flow_mask *mask,
++ 			bool async)
++ {
++ 	if (!list_empty(&mask->filters))
++ 		return false;
++ 
++ 	rhashtable_remove_fast(&head->ht, &mask->ht_node, mask_ht_params);
++ 	rhashtable_destroy(&mask->ht);
++ 	list_del_rcu(&mask->list);
++ 	if (async)
++ 		kfree_rcu(mask, rcu);
++ 	else
++ 		kfree(mask);
++ 
++ 	return true;
+  }
+  
+  static void __fl_destroy_filter(struct cls_fl_filter *f)
+@@@ -258,20 -266,19 +300,25 @@@ static void fl_hw_destroy_filter(struc
+  }
+  
+  static int fl_hw_replace_filter(struct tcf_proto *tp,
+++<<<<<<< HEAD
+ +				struct flow_dissector *dissector,
+ +				struct fl_flow_key *mask,
+ +				struct cls_fl_filter *f)
+++=======
++ 				struct cls_fl_filter *f,
++ 				struct netlink_ext_ack *extack)
+++>>>>>>> 05cd271fd61a (cls_flower: Support multiple masks per priority)
+  {
+  	struct tc_cls_flower_offload cls_flower = {};
+  	struct tcf_block *block = tp->chain->block;
+  	bool skip_sw = tc_skip_sw(f->flags);
+  	int err;
+  
+ -	tc_cls_common_offload_init(&cls_flower.common, tp, f->flags, extack);
+ +	tc_cls_common_offload_init(&cls_flower.common, tp);
+  	cls_flower.command = TC_CLSFLOWER_REPLACE;
+  	cls_flower.cookie = (unsigned long) f;
+- 	cls_flower.dissector = dissector;
+- 	cls_flower.mask = mask;
++ 	cls_flower.dissector = &f->mask->dissector;
++ 	cls_flower.mask = &f->mask->key;
+  	cls_flower.key = &f->mkey;
+  	cls_flower.exts = &f->exts;
+  	cls_flower.classid = f->res.classid;
+@@@ -306,16 -313,20 +353,24 @@@ static void fl_hw_update_stats(struct t
+  			 &cls_flower, false);
+  }
+  
+++<<<<<<< HEAD
+ +static void __fl_delete(struct tcf_proto *tp, struct cls_fl_filter *f)
+++=======
++ static bool __fl_delete(struct tcf_proto *tp, struct cls_fl_filter *f,
++ 			struct netlink_ext_ack *extack)
+++>>>>>>> 05cd271fd61a (cls_flower: Support multiple masks per priority)
+  {
+  	struct cls_fl_head *head = rtnl_dereference(tp->root);
++ 	bool async = tcf_exts_get_net(&f->exts);
++ 	bool last;
+  
+ -	idr_remove(&head->handle_idr, f->handle);
+ +	idr_remove_ext(&head->handle_idr, f->handle);
+  	list_del_rcu(&f->list);
++ 	last = fl_mask_put(head, f->mask, async);
+  	if (!tc_skip_hw(f->flags))
+ -		fl_hw_destroy_filter(tp, f, extack);
+ +		fl_hw_destroy_filter(tp, f);
+  	tcf_unbind_filter(tp, &f->res);
+- 	if (tcf_exts_get_net(&f->exts))
++ 	if (async)
+  		call_rcu(&f->rcu, fl_destroy_filter);
+  	else
+  		__fl_destroy_filter(f);
+@@@ -339,14 -350,19 +394,25 @@@ static void fl_destroy_rcu(struct rcu_h
+  	schedule_work(&head->work);
+  }
+  
+ -static void fl_destroy(struct tcf_proto *tp, struct netlink_ext_ack *extack)
+ +static void fl_destroy(struct tcf_proto *tp)
+  {
+  	struct cls_fl_head *head = rtnl_dereference(tp->root);
++ 	struct fl_flow_mask *mask, *next_mask;
+  	struct cls_fl_filter *f, *next;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry_safe(f, next, &head->filters, list)
+ +		__fl_delete(tp, f);
+ +	idr_destroy_ext(&head->handle_idr);
+++=======
++ 	list_for_each_entry_safe(mask, next_mask, &head->masks, list) {
++ 		list_for_each_entry_safe(f, next, &mask->filters, list) {
++ 			if (__fl_delete(tp, f, extack))
++ 				break;
++ 		}
++ 	}
++ 	idr_destroy(&head->handle_idr);
+++>>>>>>> 05cd271fd61a (cls_flower: Support multiple masks per priority)
+  
+  	__module_get(THIS_MODULE);
+  	call_rcu(&head->rcu, fl_destroy_rcu);
+@@@ -853,10 -837,45 +917,47 @@@ static void fl_init_dissector(struct fl
+  			   enc_control);
+  	FL_KEY_SET_IF_MASKED(&mask->key, keys, cnt,
+  			     FLOW_DISSECTOR_KEY_ENC_PORTS, enc_tp);
+ +	FL_KEY_SET_IF_MASKED(&mask->key, keys, cnt,
+ +			     FLOW_DISSECTOR_KEY_ENC_IP, enc_ip);
+  
+- 	skb_flow_dissector_init(&head->dissector, keys, cnt);
++ 	skb_flow_dissector_init(&mask->dissector, keys, cnt);
++ }
++ 
++ static struct fl_flow_mask *fl_create_new_mask(struct cls_fl_head *head,
++ 					       struct fl_flow_mask *mask)
++ {
++ 	struct fl_flow_mask *newmask;
++ 	int err;
++ 
++ 	newmask = kzalloc(sizeof(*newmask), GFP_KERNEL);
++ 	if (!newmask)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	fl_mask_copy(newmask, mask);
++ 
++ 	err = fl_init_mask_hashtable(newmask);
++ 	if (err)
++ 		goto errout_free;
++ 
++ 	fl_init_dissector(newmask);
++ 
++ 	INIT_LIST_HEAD_RCU(&newmask->filters);
++ 
++ 	err = rhashtable_insert_fast(&head->ht, &newmask->ht_node,
++ 				     mask_ht_params);
++ 	if (err)
++ 		goto errout_destroy;
++ 
++ 	list_add_tail_rcu(&newmask->list, &head->masks);
++ 
++ 	return newmask;
++ 
++ errout_destroy:
++ 	rhashtable_destroy(&newmask->ht);
++ errout_free:
++ 	kfree(newmask);
++ 
++ 	return ERR_PTR(err);
+  }
+  
+  static int fl_check_assign_mask(struct cls_fl_head *head,
+@@@ -997,12 -1012,9 +1096,16 @@@ static int fl_change(struct net *net, s
+  	}
+  
+  	if (!tc_skip_hw(fnew->flags)) {
+++<<<<<<< HEAD
+ +		err = fl_hw_replace_filter(tp,
+ +					   &head->dissector,
+ +					   &mask.key,
+ +					   fnew);
+++=======
++ 		err = fl_hw_replace_filter(tp, fnew, extack);
+++>>>>>>> 05cd271fd61a (cls_flower: Support multiple masks per priority)
+  		if (err)
+- 			goto errout_idr;
++ 			goto errout_mask;
+  	}
+  
+  	if (!tc_in_hw(fnew->flags))
+@@@ -1010,10 -1022,11 +1113,11 @@@
+  
+  	if (fold) {
+  		if (!tc_skip_sw(fold->flags))
+- 			rhashtable_remove_fast(&head->ht, &fold->ht_node,
+- 					       head->ht_params);
++ 			rhashtable_remove_fast(&fold->mask->ht,
++ 					       &fold->ht_node,
++ 					       fold->mask->filter_ht_params);
+  		if (!tc_skip_hw(fold->flags))
+ -			fl_hw_destroy_filter(tp, fold, NULL);
+ +			fl_hw_destroy_filter(tp, fold);
+  	}
+  
+  	*arg = fnew;
+@@@ -1032,9 -1044,12 +1136,12 @@@
+  	kfree(tb);
+  	return 0;
+  
++ errout_mask:
++ 	fl_mask_put(head, fnew->mask, false);
++ 
+  errout_idr:
+  	if (fnew->handle)
+ -		idr_remove(&head->handle_idr, fnew->handle);
+ +		idr_remove_ext(&head->handle_idr, fnew->handle);
+  errout:
+  	tcf_exts_destroy(&fnew->exts);
+  	kfree(fnew);
+@@@ -1049,10 -1065,10 +1156,17 @@@ static int fl_delete(struct tcf_proto *
+  	struct cls_fl_filter *f = arg;
+  
+  	if (!tc_skip_sw(f->flags))
+++<<<<<<< HEAD
+ +		rhashtable_remove_fast(&head->ht, &f->ht_node,
+ +				       head->ht_params);
+ +	__fl_delete(tp, f);
+ +	*last = list_empty(&head->filters);
+++=======
++ 		rhashtable_remove_fast(&f->mask->ht, &f->ht_node,
++ 				       f->mask->filter_ht_params);
++ 	__fl_delete(tp, f, extack);
++ 	*last = list_empty(&head->masks);
+++>>>>>>> 05cd271fd61a (cls_flower: Support multiple masks per priority)
+  	return 0;
+  }
+  
+* Unmerged path net/sched/cls_flower.c
