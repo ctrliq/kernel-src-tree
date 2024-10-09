@@ -1,0 +1,171 @@
+security/selinux: allow security_sb_clone_mnt_opts to enable/disable native labeling behavior
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [security] selinux: allow security_sb_clone_mnt_opts to enable/disable native labeling behavior (Scott Mayhew) [1454617]
+Rebuild_FUZZ: 94.92%
+commit-author Scott Mayhew <smayhew@redhat.com>
+commit 0b4d3452b8b4a5309b4445b900e3cec022cca95a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/0b4d3452.failed
+
+When an NFSv4 client performs a mount operation, it first mounts the
+NFSv4 root and then does path walk to the exported path and performs a
+submount on that, cloning the security mount options from the root's
+superblock to the submount's superblock in the process.
+
+Unless the NFS server has an explicit fsid=0 export with the
+"security_label" option, the NFSv4 root superblock will not have
+SBLABEL_MNT set, and neither will the submount superblock after cloning
+the security mount options.  As a result, setxattr's of security labels
+over NFSv4.2 will fail.  In a similar fashion, NFSv4.2 mounts mounted
+with the context= mount option will not show the correct labels because
+the nfs_server->caps flags of the cloned superblock will still have
+NFS_CAP_SECURITY_LABEL set.
+
+Allowing the NFSv4 client to enable or disable SECURITY_LSM_NATIVE_LABELS
+behavior will ensure that the SBLABEL_MNT flag has the correct value
+when the client traverses from an exported path without the
+"security_label" option to one with the "security_label" option and
+vice versa.  Similarly, checking to see if SECURITY_LSM_NATIVE_LABELS is
+set upon return from security_sb_clone_mnt_opts() and clearing
+NFS_CAP_SECURITY_LABEL if necessary will allow the correct labels to
+be displayed for NFSv4.2 mounts mounted with the context= mount option.
+
+Resolves: https://github.com/SELinuxProject/selinux-kernel/issues/35
+
+	Signed-off-by: Scott Mayhew <smayhew@redhat.com>
+	Reviewed-by: Stephen Smalley <sds@tycho.nsa.gov>
+	Tested-by: Stephen Smalley <sds@tycho.nsa.gov>
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit 0b4d3452b8b4a5309b4445b900e3cec022cca95a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/lsm_hooks.h
+#	security/security.c
+#	security/selinux/hooks.c
+diff --cc security/security.c
+index 2031746a708e,30132378d103..000000000000
+--- a/security/security.c
++++ b/security/security.c
+@@@ -304,9 -420,12 +304,16 @@@ int security_sb_set_mnt_opts(struct sup
+  EXPORT_SYMBOL(security_sb_set_mnt_opts);
+  
+  int security_sb_clone_mnt_opts(const struct super_block *oldsb,
+- 				struct super_block *newsb)
++ 				struct super_block *newsb,
++ 				unsigned long kern_flags,
++ 				unsigned long *set_kern_flags)
+  {
+++<<<<<<< HEAD
+ +	return security_ops->sb_clone_mnt_opts(oldsb, newsb);
+++=======
++ 	return call_int_hook(sb_clone_mnt_opts, 0, oldsb, newsb,
++ 				kern_flags, set_kern_flags);
+++>>>>>>> 0b4d3452b8b4 (security/selinux: allow security_sb_clone_mnt_opts to enable/disable native labeling behavior)
+  }
+  EXPORT_SYMBOL(security_sb_clone_mnt_opts);
+  
+diff --cc security/selinux/hooks.c
+index 2e8d9da677e0,9cc042df10d1..000000000000
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@@ -416,21 -524,17 +416,35 @@@ static int sb_finish_set_opts(struct su
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	sbsec->flags |= (SE_SBINITIALIZED | SE_SBLABELSUPP);
+ +
+ +	if (sbsec->behavior > ARRAY_SIZE(labeling_behaviors))
+ +		printk(KERN_ERR "SELinux: initialized (dev %s, type %s), unknown behavior\n",
+ +		       sb->s_id, sb->s_type->name);
+ +
+ +	if (sbsec->behavior == SECURITY_FS_USE_GENFS ||
+ +	    sbsec->behavior == SECURITY_FS_USE_MNTPOINT ||
+ +	    sbsec->behavior == SECURITY_FS_USE_NONE ||
+ +	    sbsec->behavior > ARRAY_SIZE(labeling_behaviors))
+ +		sbsec->flags &= ~SE_SBLABELSUPP;
+ +
+ +	/* Special handling for sysfs. Is genfs but also has setxattr handler*/
+ +	if (strncmp(sb->s_type->name, "sysfs", sizeof("sysfs")) == 0)
+ +		sbsec->flags |= SE_SBLABELSUPP;
+++=======
++ 	sbsec->flags |= SE_SBINITIALIZED;
++ 
++ 	/*
++ 	 * Explicitly set or clear SBLABEL_MNT.  It's not sufficient to simply
++ 	 * leave the flag untouched because sb_clone_mnt_opts might be handing
++ 	 * us a superblock that needs the flag to be cleared.
++ 	 */
++ 	if (selinux_is_sblabel_mnt(sb))
++ 		sbsec->flags |= SBLABEL_MNT;
++ 	else
++ 		sbsec->flags &= ~SBLABEL_MNT;
+++>>>>>>> 0b4d3452b8b4 (security/selinux: allow security_sb_clone_mnt_opts to enable/disable native labeling behavior)
+  
+  	/* Initialize the root inode. */
+  	rc = inode_doinit_with_dentry(root_inode, root);
+* Unmerged path include/linux/lsm_hooks.h
+diff --git a/fs/nfs/super.c b/fs/nfs/super.c
+index f136e5c6a7e1..2aac609c103a 100644
+--- a/fs/nfs/super.c
++++ b/fs/nfs/super.c
+@@ -2542,10 +2542,25 @@ EXPORT_SYMBOL_GPL(nfs_set_sb_security);
+ int nfs_clone_sb_security(struct super_block *s, struct dentry *mntroot,
+ 			  struct nfs_mount_info *mount_info)
+ {
++	int error;
++	unsigned long kflags = 0, kflags_out = 0;
++
+ 	/* clone any lsm security options from the parent to the new sb */
+ 	if (mntroot->d_inode->i_op != NFS_SB(s)->nfs_client->rpc_ops->dir_inode_ops)
+ 		return -ESTALE;
+-	return security_sb_clone_mnt_opts(mount_info->cloned->sb, s);
++
++	if (NFS_SB(s)->caps & NFS_CAP_SECURITY_LABEL)
++		kflags |= SECURITY_LSM_NATIVE_LABELS;
++
++	error = security_sb_clone_mnt_opts(mount_info->cloned->sb, s, kflags,
++			&kflags_out);
++	if (error)
++		return error;
++
++	if (NFS_SB(s)->caps & NFS_CAP_SECURITY_LABEL &&
++		!(kflags_out & SECURITY_LSM_NATIVE_LABELS))
++		NFS_SB(s)->caps &= ~NFS_CAP_SECURITY_LABEL;
++	return 0;
+ }
+ EXPORT_SYMBOL_GPL(nfs_clone_sb_security);
+ 
+* Unmerged path include/linux/lsm_hooks.h
+diff --git a/include/linux/security.h b/include/linux/security.h
+index 0dea8b51ab59..de36a38290e0 100644
+--- a/include/linux/security.h
++++ b/include/linux/security.h
+@@ -1758,7 +1758,9 @@ int security_sb_set_mnt_opts(struct super_block *sb,
+ 				unsigned long kern_flags,
+ 				unsigned long *set_kern_flags);
+ int security_sb_clone_mnt_opts(const struct super_block *oldsb,
+-				struct super_block *newsb);
++				struct super_block *newsb,
++				unsigned long kern_flags,
++				unsigned long *set_kern_flags);
+ int security_sb_parse_opts_str(char *options, struct security_mnt_opts *opts);
+ int security_dentry_init_security(struct dentry *dentry, int mode,
+ 					struct qstr *name, void **ctx,
+@@ -2055,7 +2057,9 @@ static inline int security_sb_set_mnt_opts(struct super_block *sb,
+ }
+ 
+ static inline int security_sb_clone_mnt_opts(const struct super_block *oldsb,
+-					      struct super_block *newsb)
++					      struct super_block *newsb,
++					      unsigned long kern_flags,
++					      unsigned long *set_kern_flags)
+ {
+ 	return 0;
+ }
+* Unmerged path security/security.c
+* Unmerged path security/selinux/hooks.c
