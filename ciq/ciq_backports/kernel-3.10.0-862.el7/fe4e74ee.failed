@@ -1,0 +1,138 @@
+IB/hfi1: Initialize TID lists to avoid crash on cleanup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Michael J. Ruhl <michael.j.ruhl@intel.com>
+commit fe4e74eeb24286c730672e776ac4c2c3caa19137
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fe4e74ee.failed
+
+The expected receive lists (tid_xxx_list) are not initialized until
+late in the receive context initialization.  If an error happens
+before the initialization, a NULL pointer access will occur during
+cleanup.
+
+Initialized the lists sooner rather than later to avoid this Oops:
+
+IP: unlock_exp_tids.isra.11+0x26/0xd0 [hfi1]
+RIP: 0010:unlock_exp_tids.isra.11+0x26/0xd0 [hfi1]
+Call Trace:
+ hfi1_user_exp_rcv_free+0x79/0xb0 [hfi1]
+ hfi1_file_close+0x87/0x360 [hfi1]
+ __fput+0xe7/0x210
+ ____fput+0xe/0x10
+
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Reviewed-by: Sebastian Sanchez <sebastian.sanchez@intel.com>
+	Signed-off-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit fe4e74eeb24286c730672e776ac4c2c3caa19137)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rdmavt/dma.h
+diff --cc drivers/infiniband/sw/rdmavt/dma.h
+index 979f07e09195,0af91675acc6..000000000000
+--- a/drivers/infiniband/sw/rdmavt/dma.h
++++ b/drivers/infiniband/sw/rdmavt/dma.h
+@@@ -48,6 -45,70 +48,73 @@@
+   *
+   */
+  
+ -#include "exp_rcv.h"
+ -#include "trace.h"
+ +extern struct ib_dma_mapping_ops rvt_default_dma_mapping_ops;
+  
+++<<<<<<< HEAD:drivers/infiniband/sw/rdmavt/dma.h
+ +#endif          /* DEF_RDMAVTDMA_H */
+++=======
++ /**
++  * exp_tid_group_init - initialize exp_tid_set
++  * @set - the set
++  */
++ void hfi1_exp_tid_group_init(struct exp_tid_set *set)
++ {
++ 	INIT_LIST_HEAD(&set->list);
++ 	set->count = 0;
++ }
++ 
++ /**
++  * alloc_ctxt_rcv_groups - initialize expected receive groups
++  * @rcd - the context to add the groupings to
++  */
++ int hfi1_alloc_ctxt_rcv_groups(struct hfi1_ctxtdata *rcd)
++ {
++ 	struct hfi1_devdata *dd = rcd->dd;
++ 	u32 tidbase;
++ 	struct tid_group *grp;
++ 	int i;
++ 
++ 	tidbase = rcd->expected_base;
++ 	for (i = 0; i < rcd->expected_count /
++ 		     dd->rcv_entries.group_size; i++) {
++ 		grp = kzalloc(sizeof(*grp), GFP_KERNEL);
++ 		if (!grp)
++ 			goto bail;
++ 		grp->size = dd->rcv_entries.group_size;
++ 		grp->base = tidbase;
++ 		tid_group_add_tail(grp, &rcd->tid_group_list);
++ 		tidbase += dd->rcv_entries.group_size;
++ 	}
++ 
++ 	return 0;
++ bail:
++ 	hfi1_free_ctxt_rcv_groups(rcd);
++ 	return -ENOMEM;
++ }
++ 
++ /**
++  * free_ctxt_rcv_groups - free  expected receive groups
++  * @rcd - the context to free
++  *
++  * The routine dismantles the expect receive linked
++  * list and clears any tids associated with the receive
++  * context.
++  *
++  * This should only be called for kernel contexts and the
++  * a base user context.
++  */
++ void hfi1_free_ctxt_rcv_groups(struct hfi1_ctxtdata *rcd)
++ {
++ 	struct tid_group *grp, *gptr;
++ 
++ 	WARN_ON(!EXP_TID_SET_EMPTY(rcd->tid_full_list));
++ 	WARN_ON(!EXP_TID_SET_EMPTY(rcd->tid_used_list));
++ 
++ 	list_for_each_entry_safe(grp, gptr, &rcd->tid_group_list.list, list) {
++ 		tid_group_remove(grp, &rcd->tid_group_list);
++ 		kfree(grp);
++ 	}
++ 
++ 	hfi1_clear_tids(rcd);
++ }
+++>>>>>>> fe4e74eeb242 (IB/hfi1: Initialize TID lists to avoid crash on cleanup):drivers/infiniband/hw/hfi1/exp_rcv.c
+diff --git a/drivers/infiniband/hw/hfi1/init.c b/drivers/infiniband/hw/hfi1/init.c
+index d1e1227c533d..fde3b68fe24c 100644
+--- a/drivers/infiniband/hw/hfi1/init.c
++++ b/drivers/infiniband/hw/hfi1/init.c
+@@ -66,6 +66,7 @@
+ #include "aspm.h"
+ #include "affinity.h"
+ #include "vnic.h"
++#include "exp_rcv.h"
+ 
+ #undef pr_fmt
+ #define pr_fmt(fmt) DRIVER_NAME ": " fmt
+@@ -226,6 +227,9 @@ struct hfi1_ctxtdata *hfi1_create_ctxtdata(struct hfi1_pportdata *ppd, u32 ctxt,
+ 		hfi1_cdbg(PROC, "setting up context %u\n", ctxt);
+ 
+ 		INIT_LIST_HEAD(&rcd->qp_wait_list);
++		hfi1_exp_tid_group_init(&rcd->tid_group_list);
++		hfi1_exp_tid_group_init(&rcd->tid_used_list);
++		hfi1_exp_tid_group_init(&rcd->tid_full_list);
+ 		rcd->ppd = ppd;
+ 		rcd->dd = dd;
+ 		rcd->cnt = 1;
+* Unmerged path drivers/infiniband/sw/rdmavt/dma.h
