@@ -1,0 +1,118 @@
+libata: use blk taging
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Shaohua Li <shli@fb.com>
+commit 12cb5ce101abfaf74421f8cc9f196e708209eb79
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/12cb5ce1.failed
+
+libata uses its own tag management which is duplication and the
+implementation is poor. And if we switch to blk-mq, tag is build-in.
+It's time to switch to generic taging.
+
+The SAS driver has its own tag management, and looks we can't directly
+map the host controler tag to SATA tag. So I just bypassed the SAS case.
+
+I changed the code/variable name for the tag management of libata to
+make it self contained. Only sas will use it. Later if libsas implements
+its tag management, the tag management code in libata can be deleted
+easily.
+
+	Cc: Jens Axboe <axboe@fb.com>
+	Cc: Christoph Hellwig <hch@infradead.org>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+	Acked-by: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 12cb5ce101abfaf74421f8cc9f196e708209eb79)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/ata/libata-core.c
+diff --cc drivers/ata/libata-core.c
+index 1470de734945,695d33df3df5..000000000000
+--- a/drivers/ata/libata-core.c
++++ b/drivers/ata/libata-core.c
+@@@ -4824,15 -4751,8 +4832,20 @@@ static struct ata_queued_cmd *sas_ata_q
+  	unsigned int max_queue = ap->host->n_tags;
+  	unsigned int i, tag;
+  
+++<<<<<<< HEAD
+ +	/* no command while frozen */
+ +	if (unlikely(ap->pflags & ATA_PFLAG_FROZEN))
+ +		return NULL;
+ +
+ +	for (i = 0, tag = ap->last_tag + 1; i < max_queue; i++, tag++) {
+ +		if (ap->flags & ATA_FLAG_LOWTAG)
+ +			tag = i;
+ +		else
+ +			tag = tag < max_queue ? tag : 0;
+++=======
++ 	for (i = 0, tag = ap->sas_last_tag + 1; i < max_queue; i++, tag++) {
++ 		tag = tag < max_queue ? tag : 0;
+++>>>>>>> 12cb5ce101ab (libata: use blk taging)
+  
+  		/* the last tag is reserved for internal command. */
+  		if (tag == ATA_TAG_INTERNAL)
+* Unmerged path drivers/ata/libata-core.c
+diff --git a/drivers/ata/libata-scsi.c b/drivers/ata/libata-scsi.c
+index c16221998a89..6df1b2a49d1a 100644
+--- a/drivers/ata/libata-scsi.c
++++ b/drivers/ata/libata-scsi.c
+@@ -752,7 +752,7 @@ static struct ata_queued_cmd *ata_scsi_qc_new(struct ata_device *dev,
+ {
+ 	struct ata_queued_cmd *qc;
+ 
+-	qc = ata_qc_new_init(dev);
++	qc = ata_qc_new_init(dev, cmd->request->tag);
+ 	if (qc) {
+ 		qc->scsicmd = cmd;
+ 		qc->scsidone = cmd->scsi_done;
+@@ -3676,6 +3676,8 @@ int ata_scsi_add_hosts(struct ata_host *host, struct scsi_host_template *sht)
+ 		 */
+ 		shost->max_host_blocked = 1;
+ 
++		scsi_init_shared_tag_map(shost, host->n_tags);
++
+ 		rc = scsi_add_host_with_dma(ap->scsi_host,
+ 						&ap->tdev, ap->host->dev);
+ 		if (rc)
+diff --git a/drivers/ata/libata.h b/drivers/ata/libata.h
+index 497c490309d2..32813a1fedf2 100644
+--- a/drivers/ata/libata.h
++++ b/drivers/ata/libata.h
+@@ -63,7 +63,7 @@ extern struct ata_link *ata_dev_phys_link(struct ata_device *dev);
+ extern void ata_force_cbl(struct ata_port *ap);
+ extern u64 ata_tf_to_lba(const struct ata_taskfile *tf);
+ extern u64 ata_tf_to_lba48(const struct ata_taskfile *tf);
+-extern struct ata_queued_cmd *ata_qc_new_init(struct ata_device *dev);
++extern struct ata_queued_cmd *ata_qc_new_init(struct ata_device *dev, int tag);
+ extern int ata_build_rw_tf(struct ata_taskfile *tf, struct ata_device *dev,
+ 			   u64 block, u32 n_block, unsigned int tf_flags,
+ 			   unsigned int tag);
+diff --git a/include/linux/libata.h b/include/linux/libata.h
+index a582960a428c..577a93caa4c0 100644
+--- a/include/linux/libata.h
++++ b/include/linux/libata.h
+@@ -836,10 +836,10 @@ struct ata_port {
+ 	unsigned int		cbl;	/* cable type; ATA_CBL_xxx */
+ 
+ 	struct ata_queued_cmd	qcmd[ATA_MAX_QUEUE];
+-	unsigned long		qc_allocated;
++	unsigned long		sas_tag_allocated; /* for sas tag allocation only */
+ 	unsigned int		qc_active;
+ 	int			nr_active_links; /* #links with active qcs */
+-	unsigned int		last_tag;	/* track next tag hw expects */
++	unsigned int		sas_last_tag;	/* track next tag hw expects */
+ 
+ 	struct ata_link		link;		/* host default link */
+ 	struct ata_link		*slave_link;	/* see ata_slave_link_init() */
+@@ -1360,6 +1360,7 @@ extern struct device_attribute *ata_common_sdev_attrs[];
+ 	.ioctl			= ata_scsi_ioctl,		\
+ 	.queuecommand		= ata_scsi_queuecmd,		\
+ 	.can_queue		= ATA_DEF_QUEUE,		\
++	.tag_alloc_policy	= BLK_TAG_ALLOC_RR,		\
+ 	.this_id		= ATA_SHT_THIS_ID,		\
+ 	.cmd_per_lun		= ATA_SHT_CMD_PER_LUN,		\
+ 	.emulated		= ATA_SHT_EMULATED,		\
