@@ -1,0 +1,189 @@
+NFS: Make trace_nfs4_setup_sequence() available to NFS v4.0
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Anna Schumaker <Anna.Schumaker@Netapp.com>
+commit ad05cc0f04341216923895c05e2c364ef34f1bb4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/ad05cc0f.failed
+
+This tracepoint displays information about the slot that was chosen for
+the RPC, in addition to session information.  This could be useful
+information for debugging, and we can set the session id hash to 0 to
+indicate that there is no session.
+
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit ad05cc0f04341216923895c05e2c364ef34f1bb4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4proc.c
+diff --cc fs/nfs/nfs4proc.c
+index 0a1efaa4e649,ae03f976fbd3..000000000000
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@@ -1015,6 -884,64 +1015,67 @@@ EXPORT_SYMBOL_GPL(nfs4_sequence_done)
+  
+  #endif	/* !CONFIG_NFS_V4_1 */
+  
+++<<<<<<< HEAD
+++=======
++ int nfs4_setup_sequence(const struct nfs_client *client,
++ 			struct nfs4_sequence_args *args,
++ 			struct nfs4_sequence_res *res,
++ 			struct rpc_task *task)
++ {
++ 	struct nfs4_session *session = nfs4_get_session(client);
++ 	struct nfs4_slot_table *tbl  = client->cl_slot_tbl;
++ 	struct nfs4_slot *slot;
++ 
++ 	/* slot already allocated? */
++ 	if (res->sr_slot != NULL)
++ 		goto out_start;
++ 
++ 	if (session) {
++ 		tbl = &session->fc_slot_table;
++ 		task->tk_timeout = 0;
++ 	}
++ 
++ 	spin_lock(&tbl->slot_tbl_lock);
++ 	/* The state manager will wait until the slot table is empty */
++ 	if (nfs4_slot_tbl_draining(tbl) && !args->sa_privileged)
++ 		goto out_sleep;
++ 
++ 	slot = nfs4_alloc_slot(tbl);
++ 	if (IS_ERR(slot)) {
++ 		/* Try again in 1/4 second */
++ 		if (slot == ERR_PTR(-ENOMEM))
++ 			task->tk_timeout = HZ >> 2;
++ 		goto out_sleep;
++ 	}
++ 	spin_unlock(&tbl->slot_tbl_lock);
++ 
++ 	slot->privileged = args->sa_privileged ? 1 : 0;
++ 	args->sa_slot = slot;
++ 
++ 	res->sr_slot = slot;
++ 	if (session) {
++ 		res->sr_timestamp = jiffies;
++ 		res->sr_status_flags = 0;
++ 		res->sr_status = 1;
++ 	}
++ 
++ 	trace_nfs4_setup_sequence(session, args);
++ out_start:
++ 	rpc_call_start(task);
++ 	return 0;
++ 
++ out_sleep:
++ 	if (args->sa_privileged)
++ 		rpc_sleep_on_priority(&tbl->slot_tbl_waitq, task,
++ 				NULL, RPC_PRIORITY_PRIVILEGED);
++ 	else
++ 		rpc_sleep_on(&tbl->slot_tbl_waitq, task, NULL);
++ 	spin_unlock(&tbl->slot_tbl_lock);
++ 	return -EAGAIN;
++ }
++ EXPORT_SYMBOL_GPL(nfs4_setup_sequence);
++ 
+++>>>>>>> ad05cc0f0434 (NFS: Make trace_nfs4_setup_sequence() available to NFS v4.0)
+  static void nfs40_call_sync_prepare(struct rpc_task *task, void *calldata)
+  {
+  	struct nfs4_call_sync_data *data = calldata;
+* Unmerged path fs/nfs/nfs4proc.c
+diff --git a/fs/nfs/nfs4session.h b/fs/nfs/nfs4session.h
+index 5e563e7a7f7b..f7a388a8acde 100644
+--- a/fs/nfs/nfs4session.h
++++ b/fs/nfs/nfs4session.h
+@@ -174,6 +174,8 @@ static inline int nfs4_has_persistent_session(const struct nfs_client *clp)
+ 	return 0;
+ }
+ 
++#define nfs_session_id_hash(session) (0)
++
+ #endif /* defined(CONFIG_NFS_V4_1) */
+ #endif /* IS_ENABLED(CONFIG_NFS_V4) */
+ #endif /* __LINUX_FS_NFS_NFS4SESSION_H */
+diff --git a/fs/nfs/nfs4trace.h b/fs/nfs/nfs4trace.h
+index e114051b6b6f..e1bf026123f3 100644
+--- a/fs/nfs/nfs4trace.h
++++ b/fs/nfs/nfs4trace.h
+@@ -241,38 +241,6 @@ DEFINE_NFS4_CLIENTID_EVENT(nfs4_bind_conn_to_session);
+ DEFINE_NFS4_CLIENTID_EVENT(nfs4_sequence);
+ DEFINE_NFS4_CLIENTID_EVENT(nfs4_reclaim_complete);
+ 
+-TRACE_EVENT(nfs4_setup_sequence,
+-		TP_PROTO(
+-			const struct nfs4_session *session,
+-			const struct nfs4_sequence_args *args
+-		),
+-		TP_ARGS(session, args),
+-
+-		TP_STRUCT__entry(
+-			__field(unsigned int, session)
+-			__field(unsigned int, slot_nr)
+-			__field(unsigned int, seq_nr)
+-			__field(unsigned int, highest_used_slotid)
+-		),
+-
+-		TP_fast_assign(
+-			const struct nfs4_slot *sa_slot = args->sa_slot;
+-			__entry->session = nfs_session_id_hash(&session->sess_id);
+-			__entry->slot_nr = sa_slot->slot_nr;
+-			__entry->seq_nr = sa_slot->seq_nr;
+-			__entry->highest_used_slotid =
+-					sa_slot->table->highest_used_slotid;
+-		),
+-		TP_printk(
+-			"session=0x%08x slot_nr=%u seq_nr=%u "
+-			"highest_used_slotid=%u",
+-			__entry->session,
+-			__entry->slot_nr,
+-			__entry->seq_nr,
+-			__entry->highest_used_slotid
+-		)
+-);
+-
+ #define show_nfs4_sequence_status_flags(status) \
+ 	__print_flags((unsigned long)status, "|", \
+ 		{ SEQ4_STATUS_CB_PATH_DOWN, "CB_PATH_DOWN" }, \
+@@ -382,6 +350,38 @@ TRACE_EVENT(nfs4_cb_sequence,
+ );
+ #endif /* CONFIG_NFS_V4_1 */
+ 
++TRACE_EVENT(nfs4_setup_sequence,
++		TP_PROTO(
++			const struct nfs4_session *session,
++			const struct nfs4_sequence_args *args
++		),
++		TP_ARGS(session, args),
++
++		TP_STRUCT__entry(
++			__field(unsigned int, session)
++			__field(unsigned int, slot_nr)
++			__field(unsigned int, seq_nr)
++			__field(unsigned int, highest_used_slotid)
++		),
++
++		TP_fast_assign(
++			const struct nfs4_slot *sa_slot = args->sa_slot;
++			__entry->session = session ? nfs_session_id_hash(&session->sess_id) : 0;
++			__entry->slot_nr = sa_slot->slot_nr;
++			__entry->seq_nr = sa_slot->seq_nr;
++			__entry->highest_used_slotid =
++					sa_slot->table->highest_used_slotid;
++		),
++		TP_printk(
++			"session=0x%08x slot_nr=%u seq_nr=%u "
++			"highest_used_slotid=%u",
++			__entry->session,
++			__entry->slot_nr,
++			__entry->seq_nr,
++			__entry->highest_used_slotid
++		)
++);
++
+ DECLARE_EVENT_CLASS(nfs4_open_event,
+ 		TP_PROTO(
+ 			const struct nfs_open_context *ctx,
