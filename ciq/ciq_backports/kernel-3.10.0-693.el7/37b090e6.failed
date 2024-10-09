@@ -1,0 +1,529 @@
+net: bridge: remove _deliver functions and consolidate forward code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] bridge: remove _deliver functions and consolidate forward code (Ivan Vecera) [1352289]
+Rebuild_FUZZ: 96.12%
+commit-author Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+commit 37b090e6be2dc98ccb55bb663931546282abf2e8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/37b090e6.failed
+
+Before this patch we had two flavors of most forwarding functions -
+_forward and _deliver, the difference being that the latter are used
+when the packets are locally originated. Instead of all this function
+pointer passing and code duplication, we can just pass a boolean noting
+that the packet was locally originated and use that to perform the
+necessary checks in __br_forward. This gives a minor performance
+improvement but more importantly consolidates the forwarding paths.
+Also add a kernel doc comment to explain the exported br_forward()'s
+arguments.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 37b090e6be2dc98ccb55bb663931546282abf2e8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_forward.c
+#	net/bridge/br_input.c
+#	net/bridge/br_private.h
+diff --cc net/bridge/br_forward.c
+index 20c11b41fe6a,63a83d8d7da3..000000000000
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@@ -78,82 -70,51 +73,111 @@@ int br_forward_finish(struct sock *sk, 
+  }
+  EXPORT_SYMBOL_GPL(br_forward_finish);
+  
+++<<<<<<< HEAD
+ +static void __br_deliver(const struct net_bridge_port *to, struct sk_buff *skb)
+ +{
+ +	skb = br_handle_vlan(to->br, nbp_get_vlan_info(to), skb);
+ +	if (!skb)
+ +		return;
+ +
+ +	skb->dev = to->dev;
+ +
+ +	if (unlikely(netpoll_tx_running(to->br->dev))) {
+ +		if (packet_length(skb) > skb->dev->mtu && !skb_is_gso(skb))
+ +			kfree_skb(skb);
+ +		else {
+ +			skb_push(skb, ETH_HLEN);
+ +			br_netpoll_send_skb(to, skb);
+ +		}
+ +		return;
+ +	}
+ +
+ +	NF_HOOK(NFPROTO_BRIDGE, NF_BR_LOCAL_OUT, NULL, skb,
+ +		NULL, skb->dev,
+ +		br_forward_finish);
+ +}
+ +
+ +static void __br_forward(const struct net_bridge_port *to, struct sk_buff *skb)
+++=======
++ static void __br_forward(const struct net_bridge_port *to,
++ 			 struct sk_buff *skb, bool local_orig)
+++>>>>>>> 37b090e6be2d (net: bridge: remove _deliver functions and consolidate forward code)
+  {
+ -	struct net_bridge_vlan_group *vg;
+  	struct net_device *indev;
+- 
+- 	if (skb_warn_if_lro(skb)) {
+- 		kfree_skb(skb);
+- 		return;
+- 	}
++ 	struct net *net;
++ 	int br_hook;
+  
+ -	vg = nbp_vlan_group_rcu(to);
+ -	skb = br_handle_vlan(to->br, vg, skb);
+ +	skb = br_handle_vlan(to->br, nbp_get_vlan_info(to), skb);
+  	if (!skb)
+  		return;
+  
+  	indev = skb->dev;
+  	skb->dev = to->dev;
+- 	skb_forward_csum(skb);
++ 	if (!local_orig) {
++ 		if (skb_warn_if_lro(skb)) {
++ 			kfree_skb(skb);
++ 			return;
++ 		}
++ 		br_hook = NF_BR_FORWARD;
++ 		skb_forward_csum(skb);
++ 		net = dev_net(indev);
++ 	} else {
++ 		if (unlikely(netpoll_tx_running(to->br->dev))) {
++ 			if (!is_skb_forwardable(skb->dev, skb)) {
++ 				kfree_skb(skb);
++ 			} else {
++ 				skb_push(skb, ETH_HLEN);
++ 				br_netpoll_send_skb(to, skb);
++ 			}
++ 			return;
++ 		}
++ 		br_hook = NF_BR_LOCAL_OUT;
++ 		net = dev_net(skb->dev);
++ 		indev = NULL;
++ 	}
+  
+++<<<<<<< HEAD
+ +	NF_HOOK(NFPROTO_BRIDGE, NF_BR_FORWARD, NULL, skb,
+ +		indev, skb->dev,
+ +		br_forward_finish);
+ +}
+ +
+ +/* called with rcu_read_lock */
+ +void br_deliver(const struct net_bridge_port *to, struct sk_buff *skb)
+ +{
+ +	if (to && should_deliver(to, skb)) {
+ +		__br_deliver(to, skb);
+ +		return;
+ +	}
+ +
+ +	kfree_skb(skb);
+ +}
+ +EXPORT_SYMBOL_GPL(br_deliver);
+ +
+ +/* called with rcu_read_lock */
+ +void br_forward(const struct net_bridge_port *to, struct sk_buff *skb, struct sk_buff *skb0)
+ +{
+ +	if (should_deliver(to, skb)) {
+ +		if (skb0)
+ +			deliver_clone(to, skb, __br_forward);
+ +		else
+ +			__br_forward(to, skb);
+ +		return;
+ +	}
+ +
+ +	if (!skb0)
+ +		kfree_skb(skb);
+ +}
+ +
+++=======
++ 	NF_HOOK(NFPROTO_BRIDGE, br_hook,
++ 		net, NULL, skb, indev, skb->dev,
++ 		br_forward_finish);
++ }
++ 
+++>>>>>>> 37b090e6be2d (net: bridge: remove _deliver functions and consolidate forward code)
+  static int deliver_clone(const struct net_bridge_port *prev,
+- 			 struct sk_buff *skb,
+- 			 void (*__packet_hook)(const struct net_bridge_port *p,
+- 					       struct sk_buff *skb))
++ 			 struct sk_buff *skb, bool local_orig)
+  {
+  	struct net_device *dev = BR_INPUT_SKB_CB(skb)->brdev;
+  
+@@@ -189,34 -173,41 +236,58 @@@ out
+  	return p;
+  }
+  
+++<<<<<<< HEAD
+ +/* called under bridge lock */
+ +static void br_flood(struct net_bridge *br, struct sk_buff *skb,
+ +		     struct sk_buff *skb0,
+ +		     void (*__packet_hook)(const struct net_bridge_port *p,
+ +					   struct sk_buff *skb),
+ +		     bool unicast)
+ +{
+++=======
++ /* called under rcu_read_lock */
++ void br_flood(struct net_bridge *br, struct sk_buff *skb,
++ 	      bool unicast, bool local_rcv, bool local_orig)
++ {
++ 	u8 igmp_type = br_multicast_igmp_type(skb);
++ 	struct net_bridge_port *prev = NULL;
+++>>>>>>> 37b090e6be2d (net: bridge: remove _deliver functions and consolidate forward code)
+  	struct net_bridge_port *p;
+ +	struct net_bridge_port *prev;
+  
+- 	prev = NULL;
+- 
+  	list_for_each_entry_rcu(p, &br->port_list, list) {
+  		/* Do not flood unicast traffic to ports that turn it off */
+  		if (unicast && !(p->flags & BR_FLOOD))
+  			continue;
+++<<<<<<< HEAD
+ +		prev = maybe_deliver(prev, p, skb, __packet_hook);
+++=======
++ 
++ 		/* Do not flood to ports that enable proxy ARP */
++ 		if (p->flags & BR_PROXYARP)
++ 			continue;
++ 		if ((p->flags & BR_PROXYARP_WIFI) &&
++ 		    BR_INPUT_SKB_CB(skb)->proxyarp_replied)
++ 			continue;
++ 
++ 		prev = maybe_deliver(prev, p, skb, local_orig);
+++>>>>>>> 37b090e6be2d (net: bridge: remove _deliver functions and consolidate forward code)
+  		if (IS_ERR(prev))
+  			goto out;
+ -		if (prev == p)
+ -			br_multicast_count(p->br, p, skb, igmp_type,
+ -					   BR_MCAST_DIR_TX);
+  	}
+  
+  	if (!prev)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	if (skb0)
+ +		deliver_clone(prev, skb, __packet_hook);
+++=======
++ 	if (local_rcv)
++ 		deliver_clone(prev, skb, local_orig);
+++>>>>>>> 37b090e6be2d (net: bridge: remove _deliver functions and consolidate forward code)
+  	else
+- 		__packet_hook(prev, skb);
++ 		__br_forward(prev, skb, local_orig);
+  	return;
+  
+  out:
+@@@ -224,29 -215,14 +295,37 @@@
+  		kfree_skb(skb);
+  }
+  
+++<<<<<<< HEAD
+ +
+ +/* called with rcu_read_lock */
+ +void br_flood_deliver(struct net_bridge *br, struct sk_buff *skb, bool unicast)
+ +{
+ +	br_flood(br, skb, NULL, __br_deliver, unicast);
+ +}
+ +
+ +/* called under bridge lock */
+ +void br_flood_forward(struct net_bridge *br, struct sk_buff *skb,
+ +		      struct sk_buff *skb2, bool unicast)
+ +{
+ +	br_flood(br, skb, skb2, __br_forward, unicast);
+ +}
+ +
+ +#ifdef CONFIG_BRIDGE_IGMP_SNOOPING
+ +/* called with rcu_read_lock */
+ +static void br_multicast_flood(struct net_bridge_mdb_entry *mdst,
+ +			       struct sk_buff *skb, struct sk_buff *skb0,
+ +			       void (*__packet_hook)(
+ +					const struct net_bridge_port *p,
+ +					struct sk_buff *skb))
+++=======
++ #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
++ /* called with rcu_read_lock */
++ void br_multicast_flood(struct net_bridge_mdb_entry *mdst,
++ 			struct sk_buff *skb,
++ 			bool local_rcv, bool local_orig)
+++>>>>>>> 37b090e6be2d (net: bridge: remove _deliver functions and consolidate forward code)
+  {
+  	struct net_device *dev = BR_INPUT_SKB_CB(skb)->brdev;
+ -	u8 igmp_type = br_multicast_igmp_type(skb);
+  	struct net_bridge *br = netdev_priv(dev);
+  	struct net_bridge_port *prev = NULL;
+  	struct net_bridge_port_group *p;
+@@@ -264,9 -240,12 +343,9 @@@
+  		port = (unsigned long)lport > (unsigned long)rport ?
+  		       lport : rport;
+  
+- 		prev = maybe_deliver(prev, port, skb, __packet_hook);
++ 		prev = maybe_deliver(prev, port, skb, local_orig);
+  		if (IS_ERR(prev))
+  			goto out;
+ -		if (prev == port)
+ -			br_multicast_count(port->br, port, skb, igmp_type,
+ -					   BR_MCAST_DIR_TX);
+  
+  		if ((unsigned long)lport >= (unsigned long)port)
+  			p = rcu_dereference(p->next);
+@@@ -277,28 -256,14 +356,36 @@@
+  	if (!prev)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	if (skb0)
+ +		deliver_clone(prev, skb, __packet_hook);
+++=======
++ 	if (local_rcv)
++ 		deliver_clone(prev, skb, local_orig);
+++>>>>>>> 37b090e6be2d (net: bridge: remove _deliver functions and consolidate forward code)
+  	else
+- 		__packet_hook(prev, skb);
++ 		__br_forward(prev, skb, local_orig);
+  	return;
+  
+  out:
+ -	if (!local_rcv)
+ +	if (!skb0)
+  		kfree_skb(skb);
+  }
+++<<<<<<< HEAD
+ +
+ +/* called with rcu_read_lock */
+ +void br_multicast_deliver(struct net_bridge_mdb_entry *mdst,
+ +			  struct sk_buff *skb)
+ +{
+ +	br_multicast_flood(mdst, skb, NULL, __br_deliver);
+ +}
+ +
+ +/* called with rcu_read_lock */
+ +void br_multicast_forward(struct net_bridge_mdb_entry *mdst,
+ +			  struct sk_buff *skb, struct sk_buff *skb2)
+ +{
+ +	br_multicast_flood(mdst, skb, skb2, __br_forward);
+ +}
+++=======
+++>>>>>>> 37b090e6be2d (net: bridge: remove _deliver functions and consolidate forward code)
+  #endif
+diff --cc net/bridge/br_input.c
+index ddc6cbe6269c,8b08eec763a5..000000000000
+--- a/net/bridge/br_input.c
++++ b/net/bridge/br_input.c
+@@@ -106,34 -172,33 +106,45 @@@ int br_handle_frame_finish(struct sock 
+  		if ((mdst || BR_INPUT_SKB_CB_MROUTERS_ONLY(skb)) &&
+  		    br_multicast_querier_exists(br, eth_hdr(skb))) {
+  			if ((mdst && mdst->mglist) ||
+ -			    br_multicast_is_router(br)) {
+ -				local_rcv = true;
+ -				br->dev->stats.multicast++;
+ -			}
+ -			mcast_hit = true;
+ -		} else {
+ -			local_rcv = true;
+ -			br->dev->stats.multicast++;
+ -		}
+ +			    br_multicast_is_router(br))
+ +				skb2 = skb;
+ +			br_multicast_forward(mdst, skb, skb2);
+ +			skb = NULL;
+ +			if (!skb2)
+ +				goto out;
+ +		} else
+ +			skb2 = skb;
+ +
+  		unicast = false;
+ -	} else if ((dst = __br_fdb_get(br, dest, vid)) && dst->is_local) {
+ +		br->dev->stats.multicast++;
+ +	} else if ((dst = __br_fdb_get(br, dest, vid)) &&
+ +			dst->is_local) {
+ +		skb2 = skb;
+  		/* Do not forward the packet since it's local. */
+ -		return br_pass_frame_up(skb);
+ +		skb = NULL;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (skb) {
+ +		if (dst) {
+ +			dst->used = jiffies;
+ +			br_forward(dst->dst, skb, skb2);
+ +		} else
+ +			br_flood_forward(br, skb, skb2, unicast);
+++=======
++ 	if (dst) {
++ 		dst->used = jiffies;
++ 		br_forward(dst->dst, skb, local_rcv, false);
++ 	} else {
++ 		if (!mcast_hit)
++ 			br_flood(br, skb, unicast, local_rcv, false);
++ 		else
++ 			br_multicast_flood(mdst, skb, local_rcv, false);
+++>>>>>>> 37b090e6be2d (net: bridge: remove _deliver functions and consolidate forward code)
+  	}
+  
+ -	if (local_rcv)
+ -		return br_pass_frame_up(skb);
+ +	if (skb2)
+ +		return br_pass_frame_up(skb2);
+  
+  out:
+  	return 0;
+diff --cc net/bridge/br_private.h
+index 1e1daa30e106,b3088264f844..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -395,16 -499,18 +395,25 @@@ int br_fdb_dump(struct sk_buff *skb, st
+  		struct net_device *dev, struct net_device *fdev, int idx);
+  int br_fdb_sync_static(struct net_bridge *br, struct net_bridge_port *p);
+  void br_fdb_unsync_static(struct net_bridge *br, struct net_bridge_port *p);
+ -int br_fdb_external_learn_add(struct net_bridge *br, struct net_bridge_port *p,
+ -			      const unsigned char *addr, u16 vid);
+ -int br_fdb_external_learn_del(struct net_bridge *br, struct net_bridge_port *p,
+ -			      const unsigned char *addr, u16 vid);
+  
+  /* br_forward.c */
+++<<<<<<< HEAD
+ +void br_deliver(const struct net_bridge_port *to, struct sk_buff *skb);
+ +int br_dev_queue_push_xmit(struct sock *sk, struct sk_buff *skb);
+ +void br_forward(const struct net_bridge_port *to,
+ +		struct sk_buff *skb, struct sk_buff *skb0);
+ +int br_forward_finish(struct sock *sk, struct sk_buff *skb);
+ +void br_flood_deliver(struct net_bridge *br, struct sk_buff *skb, bool unicast);
+ +void br_flood_forward(struct net_bridge *br, struct sk_buff *skb,
+ +		      struct sk_buff *skb2, bool unicast);
+++=======
++ int br_dev_queue_push_xmit(struct net *net, struct sock *sk, struct sk_buff *skb);
++ void br_forward(const struct net_bridge_port *to, struct sk_buff *skb,
++ 		bool local_rcv, bool local_orig);
++ int br_forward_finish(struct net *net, struct sock *sk, struct sk_buff *skb);
++ void br_flood(struct net_bridge *br, struct sk_buff *skb,
++ 	      bool unicast, bool local_rcv, bool local_orig);
+++>>>>>>> 37b090e6be2d (net: bridge: remove _deliver functions and consolidate forward code)
+  
+  /* br_if.c */
+  void br_port_carrier_check(struct net_bridge_port *p);
+@@@ -453,10 -558,8 +462,15 @@@ void br_multicast_init(struct net_bridg
+  void br_multicast_open(struct net_bridge *br);
+  void br_multicast_stop(struct net_bridge *br);
+  void br_multicast_dev_del(struct net_bridge *br);
+++<<<<<<< HEAD
+ +void br_multicast_deliver(struct net_bridge_mdb_entry *mdst,
+ +			  struct sk_buff *skb);
+ +void br_multicast_forward(struct net_bridge_mdb_entry *mdst,
+ +			 struct sk_buff *skb, struct sk_buff *skb2);
+++=======
++ void br_multicast_flood(struct net_bridge_mdb_entry *mdst,
++ 			struct sk_buff *skb, bool local_rcv, bool local_orig);
+++>>>>>>> 37b090e6be2d (net: bridge: remove _deliver functions and consolidate forward code)
+  int br_multicast_set_router(struct net_bridge *br, unsigned long val);
+  int br_multicast_set_port_router(struct net_bridge_port *p, unsigned long val);
+  int br_multicast_toggle(struct net_bridge *br, unsigned long val);
+@@@ -575,11 -693,6 +590,14 @@@ static inline void br_multicast_flood(s
+  {
+  }
+  
+++<<<<<<< HEAD
+ +static inline void br_multicast_forward(struct net_bridge_mdb_entry *mdst,
+ +					struct sk_buff *skb,
+ +					struct sk_buff *skb2)
+ +{
+ +}
+++=======
+++>>>>>>> 37b090e6be2d (net: bridge: remove _deliver functions and consolidate forward code)
+  static inline bool br_multicast_is_router(struct net_bridge *br)
+  {
+  	return 0;
+diff --git a/net/bridge/br_device.c b/net/bridge/br_device.c
+index 59112a1972e0..c3e60580c216 100644
+--- a/net/bridge/br_device.c
++++ b/net/bridge/br_device.c
+@@ -61,11 +61,11 @@ netdev_tx_t br_dev_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	if (!br_allowed_ingress(br, br_get_vlan_info(br), skb, &vid))
+ 		goto out;
+ 
+-	if (is_broadcast_ether_addr(dest))
+-		br_flood_deliver(br, skb, false);
+-	else if (is_multicast_ether_addr(dest)) {
++	if (is_broadcast_ether_addr(dest)) {
++		br_flood(br, skb, false, false, true);
++	} else if (is_multicast_ether_addr(dest)) {
+ 		if (unlikely(netpoll_tx_running(dev))) {
+-			br_flood_deliver(br, skb, false);
++			br_flood(br, skb, false, false, true);
+ 			goto out;
+ 		}
+ 		if (br_multicast_rcv(br, NULL, skb, vid)) {
+@@ -76,14 +76,14 @@ netdev_tx_t br_dev_xmit(struct sk_buff *skb, struct net_device *dev)
+ 		mdst = br_mdb_get(br, skb, vid);
+ 		if ((mdst || BR_INPUT_SKB_CB_MROUTERS_ONLY(skb)) &&
+ 		    br_multicast_querier_exists(br, eth_hdr(skb)))
+-			br_multicast_deliver(mdst, skb);
++			br_multicast_flood(mdst, skb, false, true);
+ 		else
+-			br_flood_deliver(br, skb, false);
+-	} else if ((dst = __br_fdb_get(br, dest, vid)) != NULL)
+-		br_deliver(dst->dst, skb);
+-	else
+-		br_flood_deliver(br, skb, true);
+-
++			br_flood(br, skb, false, false, true);
++	} else if ((dst = __br_fdb_get(br, dest, vid)) != NULL) {
++		br_forward(dst->dst, skb, false, true);
++	} else {
++		br_flood(br, skb, true, false, true);
++	}
+ out:
+ 	rcu_read_unlock();
+ 	return NETDEV_TX_OK;
+* Unmerged path net/bridge/br_forward.c
+* Unmerged path net/bridge/br_input.c
+* Unmerged path net/bridge/br_private.h
+diff --git a/net/bridge/netfilter/nft_reject_bridge.c b/net/bridge/netfilter/nft_reject_bridge.c
+index cee92612b2cc..d0acfe36b2b9 100644
+--- a/net/bridge/netfilter/nft_reject_bridge.c
++++ b/net/bridge/netfilter/nft_reject_bridge.c
+@@ -71,7 +71,7 @@ static void nft_reject_br_send_v4_tcp_reset(struct sk_buff *oldskb,
+ 
+ 	nft_reject_br_push_etherhdr(oldskb, nskb);
+ 
+-	br_deliver(br_port_get_rcu(dev), nskb);
++	br_forward(br_port_get_rcu(dev), nskb, false, true);
+ }
+ 
+ static void nft_reject_br_send_v4_unreach(struct sk_buff *oldskb,
+@@ -138,7 +138,7 @@ static void nft_reject_br_send_v4_unreach(struct sk_buff *oldskb,
+ 
+ 	nft_reject_br_push_etherhdr(oldskb, nskb);
+ 
+-	br_deliver(br_port_get_rcu(dev), nskb);
++	br_forward(br_port_get_rcu(dev), nskb, false, true);
+ }
+ 
+ static void nft_reject_br_send_v6_tcp_reset(struct net *net,
+@@ -172,7 +172,7 @@ static void nft_reject_br_send_v6_tcp_reset(struct net *net,
+ 
+ 	nft_reject_br_push_etherhdr(oldskb, nskb);
+ 
+-	br_deliver(br_port_get_rcu(dev), nskb);
++	br_forward(br_port_get_rcu(dev), nskb, false, true);
+ }
+ 
+ static bool reject6_br_csum_ok(struct sk_buff *skb, int hook)
+@@ -253,7 +253,7 @@ static void nft_reject_br_send_v6_unreach(struct net *net,
+ 
+ 	nft_reject_br_push_etherhdr(oldskb, nskb);
+ 
+-	br_deliver(br_port_get_rcu(dev), nskb);
++	br_forward(br_port_get_rcu(dev), nskb, false, true);
+ }
+ 
+ static void nft_reject_bridge_eval(const struct nft_expr *expr,
