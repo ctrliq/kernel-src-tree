@@ -1,0 +1,230 @@
+random: convert DEBUG_ENT to tracepoints
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Theodore Ts'o <tytso@mit.edu>
+commit f80bbd8b92987f55f26691cd53785c4a54622eb0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f80bbd8b.failed
+
+Instead of using the random driver's ad-hoc DEBUG_ENT() mechanism, use
+tracepoints instead.  This allows for a much more fine-grained control
+of which debugging mechanism which a developer might need, and unifies
+the debugging messages with all of the existing tracepoints.
+
+	Signed-off-by: "Theodore Ts'o" <tytso@mit.edu>
+(cherry picked from commit f80bbd8b92987f55f26691cd53785c4a54622eb0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/char/random.c
+#	include/trace/events/random.h
+diff --cc drivers/char/random.c
+index 8af0249a0366,f126bd2f69fe..000000000000
+--- a/drivers/char/random.c
++++ b/drivers/char/random.c
+@@@ -861,12 -880,9 +851,10 @@@ void add_disk_randomness(struct gendis
+  	if (!disk || !disk->random)
+  		return;
+  	/* first major is 1, so we get >= 0x200 here */
+- 	DEBUG_ENT("disk event %d:%d\n",
+- 		  MAJOR(disk_devt(disk)), MINOR(disk_devt(disk)));
+- 
+  	add_timer_randomness(disk->random, 0x100 + disk_devt(disk));
++ 	trace_add_disk_randomness(disk_devt(disk), ENTROPY_BITS(&input_pool));
+  }
+ +EXPORT_SYMBOL_GPL(add_disk_randomness);
+  #endif
+  
+  /*********************************************************************
+@@@ -897,26 -912,45 +885,56 @@@ static void xfer_secondary_pool(struct 
+  	}
+  	if (r->pull &&
+  	    r->entropy_count < (nbytes << (ENTROPY_SHIFT + 3)) &&
+ -	    r->entropy_count < r->poolinfo->poolfracbits)
+ -		_xfer_secondary_pool(r, nbytes);
+ -}
+ -
+ -static void _xfer_secondary_pool(struct entropy_store *r, size_t nbytes)
+ -{
+ -	__u32	tmp[OUTPUT_POOL_WORDS];
+ -
+ -	/* For /dev/random's pool, always leave two wakeup worth's BITS */
+ -	int rsvd = r->limit ? 0 : random_read_wakeup_thresh/4;
+ -	int bytes = nbytes;
+ -
+ +	    r->entropy_count < r->poolinfo->poolfracbits) {
+ +		/* If we're limited, always leave two wakeup worth's BITS */
+ +		int rsvd = r->limit ? 0 : random_read_wakeup_thresh/4;
+ +		int bytes = nbytes;
+ +
+ +		/* pull at least as many as BYTES as wakeup BITS */
+ +		bytes = max_t(int, bytes, random_read_wakeup_thresh / 8);
+ +		/* but never more than the buffer size */
+ +		bytes = min_t(int, bytes, sizeof(tmp));
+ +
+ +		DEBUG_ENT("going to reseed %s with %d bits "
+ +			  "(%zu of %d requested)\n",
+ +			  r->name, bytes * 8, nbytes * 8,
+ +			  r->entropy_count >> ENTROPY_SHIFT);
+ +
+++<<<<<<< HEAD
+ +		bytes = extract_entropy(r->pull, tmp, bytes,
+ +					random_read_wakeup_thresh / 8, rsvd);
+ +		mix_pool_bytes(r, tmp, bytes, NULL);
+ +		credit_entropy_bits(r, bytes*8);
+ +	}
+++=======
++ 	/* pull at least as many as BYTES as wakeup BITS */
++ 	bytes = max_t(int, bytes, random_read_wakeup_thresh / 8);
++ 	/* but never more than the buffer size */
++ 	bytes = min_t(int, bytes, sizeof(tmp));
++ 
++ 	trace_xfer_secondary_pool(r->name, bytes * 8, nbytes * 8,
++ 				  ENTROPY_BITS(r), ENTROPY_BITS(r->pull));
++ 	bytes = extract_entropy(r->pull, tmp, bytes,
++ 				random_read_wakeup_thresh / 8, rsvd);
++ 	mix_pool_bytes(r, tmp, bytes, NULL);
++ 	credit_entropy_bits(r, bytes*8);
++ }
++ 
++ /*
++  * Used as a workqueue function so that when the input pool is getting
++  * full, we can "spill over" some entropy to the output pools.  That
++  * way the output pools can store some of the excess entropy instead
++  * of letting it go to waste.
++  */
++ static void push_to_pool(struct work_struct *work)
++ {
++ 	struct entropy_store *r = container_of(work, struct entropy_store,
++ 					      push_work);
++ 	BUG_ON(!r);
++ 	_xfer_secondary_pool(r, random_read_wakeup_thresh/8);
++ 	trace_push_to_pool(r->name, r->entropy_count >> ENTROPY_SHIFT,
++ 			   r->pull->entropy_count >> ENTROPY_SHIFT);
+++>>>>>>> f80bbd8b9298 (random: convert DEBUG_ENT to tracepoints)
+  }
+  
+  /*
+diff --cc include/trace/events/random.h
+index 2ffcaec5860a,805af6db41cc..000000000000
+--- a/include/trace/events/random.h
++++ b/include/trace/events/random.h
+@@@ -87,6 -87,111 +87,114 @@@ TRACE_EVENT(credit_entropy_bits
+  		  (void *)__entry->IP)
+  );
+  
+++<<<<<<< HEAD
+++=======
++ TRACE_EVENT(push_to_pool,
++ 	TP_PROTO(const char *pool_name, int pool_bits, int input_bits),
++ 
++ 	TP_ARGS(pool_name, pool_bits, input_bits),
++ 
++ 	TP_STRUCT__entry(
++ 		__field( const char *,	pool_name		)
++ 		__field(	  int,	pool_bits		)
++ 		__field(	  int,	input_bits		)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		__entry->pool_name	= pool_name;
++ 		__entry->pool_bits	= pool_bits;
++ 		__entry->input_bits	= input_bits;
++ 	),
++ 
++ 	TP_printk("%s: pool_bits %d input_pool_bits %d",
++ 		  __entry->pool_name, __entry->pool_bits,
++ 		  __entry->input_bits)
++ );
++ 
++ TRACE_EVENT(debit_entropy,
++ 	TP_PROTO(const char *pool_name, int debit_bits),
++ 
++ 	TP_ARGS(pool_name, debit_bits),
++ 
++ 	TP_STRUCT__entry(
++ 		__field( const char *,	pool_name		)
++ 		__field(	  int,	debit_bits		)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		__entry->pool_name	= pool_name;
++ 		__entry->debit_bits	= debit_bits;
++ 	),
++ 
++ 	TP_printk("%s: debit_bits %d", __entry->pool_name,
++ 		  __entry->debit_bits)
++ );
++ 
++ TRACE_EVENT(add_input_randomness,
++ 	TP_PROTO(int input_bits),
++ 
++ 	TP_ARGS(input_bits),
++ 
++ 	TP_STRUCT__entry(
++ 		__field(	  int,	input_bits		)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		__entry->input_bits	= input_bits;
++ 	),
++ 
++ 	TP_printk("input_pool_bits %d", __entry->input_bits)
++ );
++ 
++ TRACE_EVENT(add_disk_randomness,
++ 	TP_PROTO(dev_t dev, int input_bits),
++ 
++ 	TP_ARGS(dev, input_bits),
++ 
++ 	TP_STRUCT__entry(
++ 		__field(	dev_t,	dev			)
++ 		__field(	  int,	input_bits		)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		__entry->dev		= dev;
++ 		__entry->input_bits	= input_bits;
++ 	),
++ 
++ 	TP_printk("dev %d,%d input_pool_bits %d", MAJOR(__entry->dev),
++ 		  MINOR(__entry->dev), __entry->input_bits)
++ );
++ 
++ TRACE_EVENT(xfer_secondary_pool,
++ 	TP_PROTO(const char *pool_name, int xfer_bits, int request_bits,
++ 		 int pool_entropy, int input_entropy),
++ 
++ 	TP_ARGS(pool_name, xfer_bits, request_bits, pool_entropy,
++ 		input_entropy),
++ 
++ 	TP_STRUCT__entry(
++ 		__field( const char *,	pool_name		)
++ 		__field(	  int,	xfer_bits		)
++ 		__field(	  int,	request_bits		)
++ 		__field(	  int,	pool_entropy		)
++ 		__field(	  int,	input_entropy		)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		__entry->pool_name	= pool_name;
++ 		__entry->xfer_bits	= xfer_bits;
++ 		__entry->request_bits	= request_bits;
++ 		__entry->pool_entropy	= pool_entropy;
++ 		__entry->input_entropy	= input_entropy;
++ 	),
++ 
++ 	TP_printk("pool %s xfer_bits %d request_bits %d pool_entropy %d "
++ 		  "input_entropy %d", __entry->pool_name, __entry->xfer_bits,
++ 		  __entry->request_bits, __entry->pool_entropy,
++ 		  __entry->input_entropy)
++ );
++ 
+++>>>>>>> f80bbd8b9298 (random: convert DEBUG_ENT to tracepoints)
+  DECLARE_EVENT_CLASS(random__get_random_bytes,
+  	TP_PROTO(int nbytes, unsigned long IP),
+  
+* Unmerged path drivers/char/random.c
+* Unmerged path include/trace/events/random.h
