@@ -1,0 +1,262 @@
+mm, swap: use kvzalloc to allocate some swap data structures
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [mm] swap: use kvzalloc to allocate some swap data structures (Don Dutile) [1511159]
+Rebuild_FUZZ: 96.55%
+commit-author Huang Ying <ying.huang@intel.com>
+commit 54f180d3c181277457fb003dd9524c2aa1ef8160
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/54f180d3.failed
+
+Now vzalloc() is used in swap code to allocate various data structures,
+such as swap cache, swap slots cache, cluster info, etc.  Because the
+size may be too large on some system, so that normal kzalloc() may fail.
+But using kzalloc() has some advantages, for example, less memory
+fragmentation, less TLB pressure, etc.  So change the data structure
+allocation in swap code to use kvzalloc() which will try kzalloc()
+firstly, and fallback to vzalloc() if kzalloc() failed.
+
+In general, although kmalloc() will reduce the number of high-order
+pages in short term, vmalloc() will cause more pain for memory
+fragmentation in the long term.  And the swap data structure allocation
+that is changed in this patch is expected to be long term allocation.
+
+From Dave Hansen:
+ "for example, we have a two-page data structure. vmalloc() takes two
+  effectively random order-0 pages, probably from two different 2M pages
+  and pins them. That "kills" two 2M pages. kmalloc(), allocating two
+  *contiguous* pages, will not cross a 2M boundary. That means it will
+  only "kill" the possibility of a single 2M page. More 2M pages == less
+  fragmentation.
+
+The allocation in this patch occurs during swap on time, which is
+usually done during system boot, so usually we have high opportunity to
+allocate the contiguous pages successfully.
+
+The allocation for swap_map[] in struct swap_info_struct is not changed,
+because that is usually quite large and vmalloc_to_page() is used for
+it.  That makes it a little harder to change.
+
+Link: http://lkml.kernel.org/r/20170407064911.25447-1-ying.huang@intel.com
+	Signed-off-by: Huang Ying <ying.huang@intel.com>
+	Acked-by: Tim Chen <tim.c.chen@intel.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Acked-by: Rik van Riel <riel@redhat.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Shaohua Li <shli@kernel.org>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 54f180d3c181277457fb003dd9524c2aa1ef8160)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/swap_slots.c
+#	mm/swap_state.c
+#	mm/swapfile.c
+diff --cc mm/swap_state.c
+index 8ead62769c81,539b8885e3d1..000000000000
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@@ -448,5 -513,41 +448,43 @@@ struct page *swapin_readahead(swp_entry
+  	blk_finish_plug(&plug);
+  
+  	lru_add_drain();	/* Push any new pages onto the LRU now */
+ -skip:
+  	return read_swap_cache_async(entry, gfp_mask, vma, addr);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int init_swap_address_space(unsigned int type, unsigned long nr_pages)
++ {
++ 	struct address_space *spaces, *space;
++ 	unsigned int i, nr;
++ 
++ 	nr = DIV_ROUND_UP(nr_pages, SWAP_ADDRESS_SPACE_PAGES);
++ 	spaces = kvzalloc(sizeof(struct address_space) * nr, GFP_KERNEL);
++ 	if (!spaces)
++ 		return -ENOMEM;
++ 	for (i = 0; i < nr; i++) {
++ 		space = spaces + i;
++ 		INIT_RADIX_TREE(&space->page_tree, GFP_ATOMIC|__GFP_NOWARN);
++ 		atomic_set(&space->i_mmap_writable, 0);
++ 		space->a_ops = &swap_aops;
++ 		/* swap cache doesn't use writeback related tags */
++ 		mapping_set_no_writeback_tags(space);
++ 		spin_lock_init(&space->tree_lock);
++ 	}
++ 	nr_swapper_spaces[type] = nr;
++ 	rcu_assign_pointer(swapper_spaces[type], spaces);
++ 
++ 	return 0;
++ }
++ 
++ void exit_swap_address_space(unsigned int type)
++ {
++ 	struct address_space *spaces;
++ 
++ 	spaces = swapper_spaces[type];
++ 	nr_swapper_spaces[type] = 0;
++ 	rcu_assign_pointer(swapper_spaces[type], NULL);
++ 	synchronize_rcu();
++ 	kvfree(spaces);
++ }
+++>>>>>>> 54f180d3c181 (mm, swap: use kvzalloc to allocate some swap data structures)
+diff --cc mm/swapfile.c
+index 44c2eac6b890,4f6cba1b6632..000000000000
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@@ -1691,11 -2265,16 +1691,17 @@@ SYSCALL_DEFINE1(swapoff, const char __u
+  	spin_unlock(&p->lock);
+  	spin_unlock(&swap_lock);
+  	frontswap_invalidate_area(p->type);
+ -	frontswap_map_set(p, NULL);
+  	mutex_unlock(&swapon_mutex);
+ -	free_percpu(p->percpu_cluster);
+ -	p->percpu_cluster = NULL;
+  	vfree(swap_map);
+++<<<<<<< HEAD
+ +	vfree(frontswap_map);
+ +	/* Destroy swap account informatin */
+++=======
++ 	kvfree(cluster_info);
++ 	kvfree(frontswap_map);
++ 	/* Destroy swap account information */
+++>>>>>>> 54f180d3c181 (mm, swap: use kvzalloc to allocate some swap data structures)
+  	swap_cgroup_swapoff(p->type);
+ -	exit_swap_address_space(p->type);
+  
+  	inode = mapping->host;
+  	if (S_ISBLK(inode->i_mode)) {
+@@@ -2144,6 -2779,43 +2150,46 @@@ SYSCALL_DEFINE2(swapon, const char __us
+  		goto bad_swap;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (bdi_cap_stable_pages_required(inode_to_bdi(inode)))
++ 		p->flags |= SWP_STABLE_WRITES;
++ 
++ 	if (p->bdev && blk_queue_nonrot(bdev_get_queue(p->bdev))) {
++ 		int cpu;
++ 		unsigned long ci, nr_cluster;
++ 
++ 		p->flags |= SWP_SOLIDSTATE;
++ 		/*
++ 		 * select a random position to start with to help wear leveling
++ 		 * SSD
++ 		 */
++ 		p->cluster_next = 1 + (prandom_u32() % p->highest_bit);
++ 		nr_cluster = DIV_ROUND_UP(maxpages, SWAPFILE_CLUSTER);
++ 
++ 		cluster_info = kvzalloc(nr_cluster * sizeof(*cluster_info),
++ 					GFP_KERNEL);
++ 		if (!cluster_info) {
++ 			error = -ENOMEM;
++ 			goto bad_swap;
++ 		}
++ 
++ 		for (ci = 0; ci < nr_cluster; ci++)
++ 			spin_lock_init(&((cluster_info + ci)->lock));
++ 
++ 		p->percpu_cluster = alloc_percpu(struct percpu_cluster);
++ 		if (!p->percpu_cluster) {
++ 			error = -ENOMEM;
++ 			goto bad_swap;
++ 		}
++ 		for_each_possible_cpu(cpu) {
++ 			struct percpu_cluster *cluster;
++ 			cluster = per_cpu_ptr(p->percpu_cluster, cpu);
++ 			cluster_set_null(&cluster->index);
++ 		}
++ 	}
++ 
+++>>>>>>> 54f180d3c181 (mm, swap: use kvzalloc to allocate some swap data structures)
+  	error = swap_cgroup_swapon(p->type, maxpages);
+  	if (error)
+  		goto bad_swap;
+@@@ -2155,44 -2827,37 +2201,50 @@@
+  		goto bad_swap;
+  	}
+  	/* frontswap enabled? set up bit-per-page map for frontswap */
+++<<<<<<< HEAD
+ +	if (frontswap_enabled)
+ +		frontswap_map = vzalloc(BITS_TO_LONGS(maxpages) * sizeof(long));
+++=======
++ 	if (IS_ENABLED(CONFIG_FRONTSWAP))
++ 		frontswap_map = kvzalloc(BITS_TO_LONGS(maxpages) * sizeof(long),
++ 					 GFP_KERNEL);
+++>>>>>>> 54f180d3c181 (mm, swap: use kvzalloc to allocate some swap data structures)
+  
+ -	if (p->bdev &&(swap_flags & SWAP_FLAG_DISCARD) && swap_discardable(p)) {
+ -		/*
+ -		 * When discard is enabled for swap with no particular
+ -		 * policy flagged, we set all swap discard flags here in
+ -		 * order to sustain backward compatibility with older
+ -		 * swapon(8) releases.
+ -		 */
+ -		p->flags |= (SWP_DISCARDABLE | SWP_AREA_DISCARD |
+ -			     SWP_PAGE_DISCARD);
+ +	if (p->bdev) {
+ +		if (blk_queue_nonrot(bdev_get_queue(p->bdev))) {
+ +			p->flags |= SWP_SOLIDSTATE;
+ +			p->cluster_next = 1 + (prandom_u32() % p->highest_bit);
+ +		}
+  
+ -		/*
+ -		 * By flagging sys_swapon, a sysadmin can tell us to
+ -		 * either do single-time area discards only, or to just
+ -		 * perform discards for released swap page-clusters.
+ -		 * Now it's time to adjust the p->flags accordingly.
+ -		 */
+ -		if (swap_flags & SWAP_FLAG_DISCARD_ONCE)
+ -			p->flags &= ~SWP_PAGE_DISCARD;
+ -		else if (swap_flags & SWAP_FLAG_DISCARD_PAGES)
+ -			p->flags &= ~SWP_AREA_DISCARD;
+ -
+ -		/* issue a swapon-time discard if it's still required */
+ -		if (p->flags & SWP_AREA_DISCARD) {
+ -			int err = discard_swap(p);
+ -			if (unlikely(err))
+ -				pr_err("swapon: discard_swap(%p): %d\n",
+ -					p, err);
+ +		if ((swap_flags & SWAP_FLAG_DISCARD) && swap_discardable(p)) {
+ +			/*
+ +			 * When discard is enabled for swap with no particular
+ +			 * policy flagged, we set all swap discard flags here in
+ +			 * order to sustain backward compatibility with older
+ +			 * swapon(8) releases.
+ +			 */
+ +			p->flags |= (SWP_DISCARDABLE | SWP_AREA_DISCARD |
+ +				     SWP_PAGE_DISCARD);
+ +
+ +			/*
+ +			 * By flagging sys_swapon, a sysadmin can tell us to
+ +			 * either do single-time area discards only, or to just
+ +			 * perform discards for released swap page-clusters.
+ +			 * Now it's time to adjust the p->flags accordingly.
+ +			 */
+ +			if (swap_flags & SWAP_FLAG_DISCARD_ONCE)
+ +				p->flags &= ~SWP_PAGE_DISCARD;
+ +			else if (swap_flags & SWAP_FLAG_DISCARD_PAGES)
+ +				p->flags &= ~SWP_AREA_DISCARD;
+ +
+ +			/* issue a swapon-time discard if it's still required */
+ +			if (p->flags & SWP_AREA_DISCARD) {
+ +				int err = discard_swap(p);
+ +				if (unlikely(err))
+ +					printk(KERN_ERR
+ +					       "swapon: discard_swap(%p): %d\n",
+ +						p, err);
+ +			}
+  		}
+  	}
+  
+* Unmerged path mm/swap_slots.c
+* Unmerged path mm/swap_slots.c
+* Unmerged path mm/swap_state.c
+* Unmerged path mm/swapfile.c
