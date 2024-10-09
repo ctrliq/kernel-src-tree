@@ -1,0 +1,125 @@
+net/mlx5e: Optimize update stats work
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Optimize update stats work (Kamal Heib) [1456694]
+Rebuild_FUZZ: 94.29%
+commit-author Gal Pressman <galp@mellanox.com>
+commit 3834a5e62617603673474ada9831aa4bda955e03
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3834a5e6.failed
+
+Unlike ethtool stats, get_stats ndo provides information cached by
+update stats work that is running in the background without updating
+them explicitly.
+We cannot update all counters inside the ndo because some
+updates require firmware commands that cannot be performed under a
+spinlock.
+
+update_stats work does not need to update ALL counters, since only
+some of them are needed by ndo_get_stats.
+This patch will allow for a minimal run of update_stats using an extra
+parameter which will update necessary counters only and cut 13
+firmware commands in each iteration of the work.
+
+Work duration previous to this patch: ~4200us.
+Work duration after this patch: ~700us (17% of the original time).
+
+	Signed-off-by: Gal Pressman <galp@mellanox.com>
+	Reviewed-by: Eran Ben Elisha <eranbe@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Cc: kernel-team@fb.com
+(cherry picked from commit 3834a5e62617603673474ada9831aa4bda955e03)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+index 869954ad016e,216752070391..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+@@@ -319,7 -311,8 +319,12 @@@ static void mlx5e_get_ethtool_stats(str
+  
+  	mutex_lock(&priv->state_lock);
+  	if (test_bit(MLX5E_STATE_OPENED, &priv->state))
+++<<<<<<< HEAD
+ +		mlx5e_update_stats(priv);
+++=======
++ 		mlx5e_update_stats(priv, true);
++ 	channels = &priv->channels;
+++>>>>>>> 3834a5e62617 (net/mlx5e: Optimize update stats work)
+  	mutex_unlock(&priv->state_lock);
+  
+  	for (i = 0; i < NUM_SW_COUNTERS; i++)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 08e121a5e7e2..b87160bf9703 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -752,7 +752,7 @@ void mlx5e_rx_am(struct mlx5e_rq *rq);
+ void mlx5e_rx_am_work(struct work_struct *work);
+ struct mlx5e_cq_moder mlx5e_am_get_def_profile(u8 rx_cq_period_mode);
+ 
+-void mlx5e_update_stats(struct mlx5e_priv *priv);
++void mlx5e_update_stats(struct mlx5e_priv *priv, bool full);
+ 
+ int mlx5e_create_flow_steering(struct mlx5e_priv *priv);
+ void mlx5e_destroy_flow_steering(struct mlx5e_priv *priv);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 950c1d21ad52..6e6a17c88d4b 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -236,7 +236,7 @@ static void mlx5e_update_vport_counters(struct mlx5e_priv *priv)
+ 	mlx5_cmd_exec(mdev, in, sizeof(in), out, outlen);
+ }
+ 
+-static void mlx5e_update_pport_counters(struct mlx5e_priv *priv)
++static void mlx5e_update_pport_counters(struct mlx5e_priv *priv, bool full)
+ {
+ 	struct mlx5e_pport_stats *pstats = &priv->stats.pport;
+ 	struct mlx5_core_dev *mdev = priv->mdev;
+@@ -255,6 +255,9 @@ static void mlx5e_update_pport_counters(struct mlx5e_priv *priv)
+ 	MLX5_SET(ppcnt_reg, in, grp, MLX5_IEEE_802_3_COUNTERS_GROUP);
+ 	mlx5_core_access_reg(mdev, in, sz, out, sz, MLX5_REG_PPCNT, 0, 0);
+ 
++	if (!full)
++		return;
++
+ 	out = pstats->RFC_2863_counters;
+ 	MLX5_SET(ppcnt_reg, in, grp, MLX5_RFC_2863_COUNTERS_GROUP);
+ 	mlx5_core_access_reg(mdev, in, sz, out, sz, MLX5_REG_PPCNT, 0, 0);
+@@ -318,15 +321,21 @@ static void mlx5e_update_pcie_counters(struct mlx5e_priv *priv)
+ 	kvfree(in);
+ }
+ 
+-void mlx5e_update_stats(struct mlx5e_priv *priv)
++void mlx5e_update_stats(struct mlx5e_priv *priv, bool full)
+ {
+-	mlx5e_update_pcie_counters(priv);
+-	mlx5e_update_pport_counters(priv);
++	if (full)
++		mlx5e_update_pcie_counters(priv);
++	mlx5e_update_pport_counters(priv, full);
+ 	mlx5e_update_vport_counters(priv);
+ 	mlx5e_update_q_counter(priv);
+ 	mlx5e_update_sw_counters(priv);
+ }
+ 
++static void mlx5e_update_ndo_stats(struct mlx5e_priv *priv)
++{
++	mlx5e_update_stats(priv, false);
++}
++
+ void mlx5e_update_stats_work(struct work_struct *work)
+ {
+ 	struct delayed_work *dwork = to_delayed_work(work);
+@@ -3653,7 +3662,7 @@ static const struct mlx5e_profile mlx5e_nic_profile = {
+ 	.cleanup_tx	   = mlx5e_cleanup_nic_tx,
+ 	.enable		   = mlx5e_nic_enable,
+ 	.disable	   = mlx5e_nic_disable,
+-	.update_stats	   = mlx5e_update_stats,
++	.update_stats	   = mlx5e_update_ndo_stats,
+ 	.max_nch	   = mlx5e_get_max_num_channels,
+ 	.max_tc		   = MLX5E_MAX_NUM_TC,
+ };
