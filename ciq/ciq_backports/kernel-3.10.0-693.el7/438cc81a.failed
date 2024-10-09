@@ -1,0 +1,132 @@
+powerpc/pseries: Automatically resize HPT for memory hot add/remove
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [powerpc] pseries: Automatically resize HPT for memory hot add/remove (David Gibson) [1305399]
+Rebuild_FUZZ: 93.65%
+commit-author David Gibson <david@gibson.dropbear.id.au>
+commit 438cc81a41e8c2905d0f4f300d4690445b2ab240
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/438cc81a.failed
+
+We've now implemented code in the pseries platform to use the new PAPR
+interface to allow resizing the hash page table (HPT) at runtime.
+
+This patch uses that interface to automatically attempt to resize the HPT
+when memory is hot added or removed.  This tries to always keep the HPT at
+a reasonable size for our current memory size.
+
+	Signed-off-by: David Gibson <david@gibson.dropbear.id.au>
+	Reviewed-by: Paul Mackerras <paulus@samba.org>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 438cc81a41e8c2905d0f4f300d4690445b2ab240)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/mm/hash_utils_64.c
+diff --cc arch/powerpc/mm/hash_utils_64.c
+index 4274d60dabfc,12d679df50bd..000000000000
+--- a/arch/powerpc/mm/hash_utils_64.c
++++ b/arch/powerpc/mm/hash_utils_64.c
+@@@ -619,17 -749,55 +619,50 @@@ static unsigned long __init htab_get_ta
+  }
+  
+  #ifdef CONFIG_MEMORY_HOTPLUG
+++<<<<<<< HEAD
+ +int create_section_mapping(unsigned long start, unsigned long end)
+++=======
++ void resize_hpt_for_hotplug(unsigned long new_mem_size)
++ {
++ 	unsigned target_hpt_shift;
++ 
++ 	if (!mmu_hash_ops.resize_hpt)
++ 		return;
++ 
++ 	target_hpt_shift = htab_shift_for_mem_size(new_mem_size);
++ 
++ 	/*
++ 	 * To avoid lots of HPT resizes if memory size is fluctuating
++ 	 * across a boundary, we deliberately have some hysterisis
++ 	 * here: we immediately increase the HPT size if the target
++ 	 * shift exceeds the current shift, but we won't attempt to
++ 	 * reduce unless the target shift is at least 2 below the
++ 	 * current shift
++ 	 */
++ 	if ((target_hpt_shift > ppc64_pft_size)
++ 	    || (target_hpt_shift < (ppc64_pft_size - 1))) {
++ 		int rc;
++ 
++ 		rc = mmu_hash_ops.resize_hpt(target_hpt_shift);
++ 		if (rc)
++ 			printk(KERN_WARNING
++ 			       "Unable to resize hash page table to target order %d: %d\n",
++ 			       target_hpt_shift, rc);
++ 	}
++ }
++ 
++ int hash__create_section_mapping(unsigned long start, unsigned long end)
+++>>>>>>> 438cc81a41e8 (powerpc/pseries: Automatically resize HPT for memory hot add/remove)
+  {
+ -	int rc = htab_bolt_mapping(start, end, __pa(start),
+ -				   pgprot_val(PAGE_KERNEL), mmu_linear_psize,
+ -				   mmu_kernel_ssize);
+ -
+ -	if (rc < 0) {
+ -		int rc2 = htab_remove_mapping(start, end, mmu_linear_psize,
+ -					      mmu_kernel_ssize);
+ -		BUG_ON(rc2 && (rc2 != -ENOENT));
+ -	}
+ -	return rc;
+ +	return htab_bolt_mapping(start, end, __pa(start),
+ +				 pgprot_val(PAGE_KERNEL), mmu_linear_psize,
+ +				 mmu_kernel_ssize);
+  }
+  
+ -int hash__remove_section_mapping(unsigned long start, unsigned long end)
+ +int remove_section_mapping(unsigned long start, unsigned long end)
+  {
+ -	int rc = htab_remove_mapping(start, end, mmu_linear_psize,
+ -				     mmu_kernel_ssize);
+ -	WARN_ON(rc < 0);
+ -	return rc;
+ +	return htab_remove_mapping(start, end, mmu_linear_psize,
+ +			mmu_kernel_ssize);
+  }
+  #endif /* CONFIG_MEMORY_HOTPLUG */
+  
+diff --git a/arch/powerpc/include/asm/sparsemem.h b/arch/powerpc/include/asm/sparsemem.h
+index f6fc0ee813d7..737335c891e4 100644
+--- a/arch/powerpc/include/asm/sparsemem.h
++++ b/arch/powerpc/include/asm/sparsemem.h
+@@ -16,6 +16,7 @@
+ #endif /* CONFIG_SPARSEMEM */
+ 
+ #ifdef CONFIG_MEMORY_HOTPLUG
++extern void resize_hpt_for_hotplug(unsigned long new_mem_size);
+ extern int create_section_mapping(unsigned long start, unsigned long end);
+ extern int remove_section_mapping(unsigned long start, unsigned long end);
+ #ifdef CONFIG_NUMA
+* Unmerged path arch/powerpc/mm/hash_utils_64.c
+diff --git a/arch/powerpc/mm/mem.c b/arch/powerpc/mm/mem.c
+index d1db37486ff2..9b3bbcb05d86 100644
+--- a/arch/powerpc/mm/mem.c
++++ b/arch/powerpc/mm/mem.c
+@@ -121,6 +121,8 @@ int arch_add_memory(int nid, u64 start, u64 size, bool for_device)
+ 	unsigned long start_pfn = start >> PAGE_SHIFT;
+ 	unsigned long nr_pages = size >> PAGE_SHIFT;
+ 
++	resize_hpt_for_hotplug(memblock_phys_mem_size());
++
+ 	pgdata = NODE_DATA(nid);
+ 
+ 	start = (unsigned long)__va(start);
+@@ -147,6 +149,8 @@ int arch_remove_memory(u64 start, u64 size)
+ 	if (!ret && (ppc_md.remove_memory))
+ 		ret = ppc_md.remove_memory(start, size);
+ 
++	resize_hpt_for_hotplug(memblock_phys_mem_size());
++
+ 	return ret;
+ }
+ #endif
