@@ -1,0 +1,345 @@
+x86/process: Allow runtime control of Speculative Store Bypass
+
+jira LE-1907
+cve CVE-2018-3639
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [x86] process: Allow runtime control of Speculative Store Bypass (Waiman Long) [1566905] {CVE-2018-3639}
+Rebuild_FUZZ: 96.67%
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 885f82bfbc6fefb6664ea27965c3ab9ac4194b8c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/885f82bf.failed
+
+The Speculative Store Bypass vulnerability can be mitigated with the
+Reduced Data Speculation (RDS) feature. To allow finer grained control of
+this eventually expensive mitigation a per task mitigation control is
+required.
+
+Add a new TIF_RDS flag and put it into the group of TIF flags which are
+evaluated for mismatch in switch_to(). If these bits differ in the previous
+and the next task, then the slow path function __switch_to_xtra() is
+invoked. Implement the TIF_RDS dependent mitigation control in the slow
+path.
+
+If the prctl for controlling Speculative Store Bypass is disabled or no
+task uses the prctl then there is no overhead in the switch_to() fast
+path.
+
+Update the KVM related speculation control functions to take TID_RDS into
+account as well.
+
+Based on a patch from Tim Chen. Completely rewritten.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Ingo Molnar <mingo@kernel.org>
+	Reviewed-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+
+(cherry picked from commit 885f82bfbc6fefb6664ea27965c3ab9ac4194b8c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/msr-index.h
+#	arch/x86/include/asm/spec-ctrl.h
+#	arch/x86/include/asm/thread_info.h
+#	arch/x86/kernel/cpu/bugs.c
+#	arch/x86/kernel/process.c
+diff --cc arch/x86/include/asm/msr-index.h
+index e2029f6c9386,810f50bb338d..000000000000
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@@ -33,8 -39,14 +33,19 @@@
+  
+  /* Intel MSRs. Some also available on other CPUs */
+  
+++<<<<<<< HEAD
+ +#define MSR_IA32_SPEC_CTRL		0x00000048
+ +#define MSR_IA32_PRED_CMD		0x00000049
+++=======
++ #define MSR_IA32_SPEC_CTRL		0x00000048 /* Speculation Control */
++ #define SPEC_CTRL_IBRS			(1 << 0)   /* Indirect Branch Restricted Speculation */
++ #define SPEC_CTRL_STIBP			(1 << 1)   /* Single Thread Indirect Branch Predictors */
++ #define SPEC_CTRL_RDS_SHIFT		2	   /* Reduced Data Speculation bit */
++ #define SPEC_CTRL_RDS			(1 << SPEC_CTRL_RDS_SHIFT)   /* Reduced Data Speculation */
++ 
++ #define MSR_IA32_PRED_CMD		0x00000049 /* Prediction Command */
++ #define PRED_CMD_IBPB			(1 << 0)   /* Indirect Branch Prediction Barrier */
+++>>>>>>> 885f82bfbc6f (x86/process: Allow runtime control of Speculative Store Bypass)
+  
+  #define MSR_PPIN_CTL			0x0000004e
+  #define MSR_PPIN			0x0000004f
+diff --cc arch/x86/include/asm/thread_info.h
+index 2fcd0a3d04a2,e5c26cc59619..000000000000
+--- a/arch/x86/include/asm/thread_info.h
++++ b/arch/x86/include/asm/thread_info.h
+@@@ -152,16 -146,13 +154,20 @@@ struct thread_info 
+  
+  /* flags to check in __switch_to() */
+  #define _TIF_WORK_CTXSW							\
+++<<<<<<< HEAD
+ +	(_TIF_IO_BITMAP|_TIF_NOTSC|_TIF_BLOCKSTEP)
+++=======
++ 	(_TIF_IO_BITMAP|_TIF_NOCPUID|_TIF_NOTSC|_TIF_BLOCKSTEP|_TIF_RDS)
+++>>>>>>> 885f82bfbc6f (x86/process: Allow runtime control of Speculative Store Bypass)
+  
+  #define _TIF_WORK_CTXSW_PREV (_TIF_WORK_CTXSW|_TIF_USER_RETURN_NOTIFY)
+ -#define _TIF_WORK_CTXSW_NEXT (_TIF_WORK_CTXSW)
+ +#define _TIF_WORK_CTXSW_NEXT (_TIF_WORK_CTXSW|_TIF_DEBUG)
+  
+ -#define STACK_WARN		(THREAD_SIZE/8)
+ +#define PREEMPT_ACTIVE		0x10000000
+  
+ +#ifdef CONFIG_X86_32
+ +
+ +#define STACK_WARN	(THREAD_SIZE/8)
+  /*
+   * macros/functions for gaining access to the thread information structure
+   *
+diff --cc arch/x86/kernel/cpu/bugs.c
+index 29b8876b1f95,2bc109d0f8ae..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -21,10 -23,30 +21,33 @@@
+  #include <asm/paravirt.h>
+  #include <asm/alternative.h>
+  #include <asm/pgtable.h>
+ -#include <asm/set_memory.h>
+ -#include <asm/intel-family.h>
+ +#include <asm/cacheflush.h>
+ +#include <asm/spec_ctrl.h>
+  
+  static void __init spectre_v2_select_mitigation(void);
+++<<<<<<< HEAD
+++=======
++ static void __init ssb_select_mitigation(void);
++ 
++ /*
++  * Our boot-time value of the SPEC_CTRL MSR. We read it once so that any
++  * writes to SPEC_CTRL contain whatever reserved bits have been set.
++  */
++ u64 __ro_after_init x86_spec_ctrl_base;
++ 
++ /*
++  * The vendor and possibly platform specific bits which can be modified in
++  * x86_spec_ctrl_base.
++  */
++ static u64 __ro_after_init x86_spec_ctrl_mask = ~SPEC_CTRL_IBRS;
++ 
++ /*
++  * AMD specific MSR info for Speculative Store Bypass control.
++  * x86_amd_ls_cfg_rds_mask is initialized in identify_boot_cpu().
++  */
++ u64 __ro_after_init x86_amd_ls_cfg_base;
++ u64 __ro_after_init x86_amd_ls_cfg_rds_mask;
+++>>>>>>> 885f82bfbc6f (x86/process: Allow runtime control of Speculative Store Bypass)
+  
+  void __init check_bugs(void)
+  {
+@@@ -104,6 -127,103 +127,106 @@@ enum spectre_v2_mitigation_cmd spectre_
+  #undef pr_fmt
+  #define pr_fmt(fmt)     "Spectre V2 : " fmt
+  
+++<<<<<<< HEAD
+++=======
++ static enum spectre_v2_mitigation spectre_v2_enabled = SPECTRE_V2_NONE;
++ 
++ void x86_spec_ctrl_set(u64 val)
++ {
++ 	if (val & x86_spec_ctrl_mask)
++ 		WARN_ONCE(1, "SPEC_CTRL MSR value 0x%16llx is unknown.\n", val);
++ 	else
++ 		wrmsrl(MSR_IA32_SPEC_CTRL, x86_spec_ctrl_base | val);
++ }
++ EXPORT_SYMBOL_GPL(x86_spec_ctrl_set);
++ 
++ u64 x86_spec_ctrl_get_default(void)
++ {
++ 	u64 msrval = x86_spec_ctrl_base;
++ 
++ 	if (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL)
++ 		msrval |= rds_tif_to_spec_ctrl(current_thread_info()->flags);
++ 	return msrval;
++ }
++ EXPORT_SYMBOL_GPL(x86_spec_ctrl_get_default);
++ 
++ void x86_spec_ctrl_set_guest(u64 guest_spec_ctrl)
++ {
++ 	u64 host = x86_spec_ctrl_base;
++ 
++ 	if (!boot_cpu_has(X86_FEATURE_IBRS))
++ 		return;
++ 
++ 	if (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL)
++ 		host |= rds_tif_to_spec_ctrl(current_thread_info()->flags);
++ 
++ 	if (host != guest_spec_ctrl)
++ 		wrmsrl(MSR_IA32_SPEC_CTRL, guest_spec_ctrl);
++ }
++ EXPORT_SYMBOL_GPL(x86_spec_ctrl_set_guest);
++ 
++ void x86_spec_ctrl_restore_host(u64 guest_spec_ctrl)
++ {
++ 	u64 host = x86_spec_ctrl_base;
++ 
++ 	if (!boot_cpu_has(X86_FEATURE_IBRS))
++ 		return;
++ 
++ 	if (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL)
++ 		host |= rds_tif_to_spec_ctrl(current_thread_info()->flags);
++ 
++ 	if (host != guest_spec_ctrl)
++ 		wrmsrl(MSR_IA32_SPEC_CTRL, host);
++ }
++ EXPORT_SYMBOL_GPL(x86_spec_ctrl_restore_host);
++ 
++ static void x86_amd_rds_enable(void)
++ {
++ 	u64 msrval = x86_amd_ls_cfg_base | x86_amd_ls_cfg_rds_mask;
++ 
++ 	if (boot_cpu_has(X86_FEATURE_AMD_RDS))
++ 		wrmsrl(MSR_AMD64_LS_CFG, msrval);
++ }
++ 
++ #ifdef RETPOLINE
++ static bool spectre_v2_bad_module;
++ 
++ bool retpoline_module_ok(bool has_retpoline)
++ {
++ 	if (spectre_v2_enabled == SPECTRE_V2_NONE || has_retpoline)
++ 		return true;
++ 
++ 	pr_err("System may be vulnerable to spectre v2\n");
++ 	spectre_v2_bad_module = true;
++ 	return false;
++ }
++ 
++ static inline const char *spectre_v2_module_string(void)
++ {
++ 	return spectre_v2_bad_module ? " - vulnerable module loaded" : "";
++ }
++ #else
++ static inline const char *spectre_v2_module_string(void) { return ""; }
++ #endif
++ 
++ static void __init spec2_print_if_insecure(const char *reason)
++ {
++ 	if (boot_cpu_has_bug(X86_BUG_SPECTRE_V2))
++ 		pr_info("%s selected on command line.\n", reason);
++ }
++ 
++ static void __init spec2_print_if_secure(const char *reason)
++ {
++ 	if (!boot_cpu_has_bug(X86_BUG_SPECTRE_V2))
++ 		pr_info("%s selected on command line.\n", reason);
++ }
++ 
++ static inline bool retp_compiler(void)
++ {
++ 	return __is_defined(RETPOLINE);
++ }
++ 
+++>>>>>>> 885f82bfbc6f (x86/process: Allow runtime control of Speculative Store Bypass)
+  static inline bool match_option(const char *arg, int arglen, const char *opt)
+  {
+  	int len = strlen(opt);
+diff --cc arch/x86/kernel/process.c
+index f741d66041de,397342725046..000000000000
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@@ -22,13 -27,18 +22,21 @@@
+  #include <asm/cpu.h>
+  #include <asm/apic.h>
+  #include <asm/syscalls.h>
+ -#include <linux/uaccess.h>
+ -#include <asm/mwait.h>
+ -#include <asm/fpu/internal.h>
+ +#include <asm/idle.h>
+ +#include <asm/uaccess.h>
+ +#include <asm/i387.h>
+ +#include <asm/fpu-internal.h>
+  #include <asm/debugreg.h>
+  #include <asm/nmi.h>
+ -#include <asm/tlbflush.h>
+  #include <asm/mce.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/vm86.h>
++ #include <asm/switch_to.h>
++ #include <asm/desc.h>
++ #include <asm/prctl.h>
++ #include <asm/spec-ctrl.h>
+++>>>>>>> 885f82bfbc6f (x86/process: Allow runtime control of Speculative Store Bypass)
+  
+  /*
+   * per-CPU TSS segments. Threads are completely 'soft' on Linux,
+@@@ -237,7 -277,60 +245,64 @@@ void __switch_to_xtra(struct task_struc
+  		 */
+  		memset(tss->io_bitmap, 0xff, prev->io_bitmap_max);
+  	}
+++<<<<<<< HEAD
+ +	propagate_user_return_notify(prev_p, next_p);
+++=======
++ }
++ 
++ static __always_inline void __speculative_store_bypass_update(unsigned long tifn)
++ {
++ 	u64 msr;
++ 
++ 	if (static_cpu_has(X86_FEATURE_AMD_RDS)) {
++ 		msr = x86_amd_ls_cfg_base | rds_tif_to_amd_ls_cfg(tifn);
++ 		wrmsrl(MSR_AMD64_LS_CFG, msr);
++ 	} else {
++ 		msr = x86_spec_ctrl_base | rds_tif_to_spec_ctrl(tifn);
++ 		wrmsrl(MSR_IA32_SPEC_CTRL, msr);
++ 	}
++ }
++ 
++ void speculative_store_bypass_update(void)
++ {
++ 	__speculative_store_bypass_update(current_thread_info()->flags);
++ }
++ 
++ void __switch_to_xtra(struct task_struct *prev_p, struct task_struct *next_p,
++ 		      struct tss_struct *tss)
++ {
++ 	struct thread_struct *prev, *next;
++ 	unsigned long tifp, tifn;
++ 
++ 	prev = &prev_p->thread;
++ 	next = &next_p->thread;
++ 
++ 	tifn = READ_ONCE(task_thread_info(next_p)->flags);
++ 	tifp = READ_ONCE(task_thread_info(prev_p)->flags);
++ 	switch_to_bitmap(tss, prev, next, tifp, tifn);
++ 
++ 	propagate_user_return_notify(prev_p, next_p);
++ 
++ 	if ((tifp & _TIF_BLOCKSTEP || tifn & _TIF_BLOCKSTEP) &&
++ 	    arch_has_block_step()) {
++ 		unsigned long debugctl, msk;
++ 
++ 		rdmsrl(MSR_IA32_DEBUGCTLMSR, debugctl);
++ 		debugctl &= ~DEBUGCTLMSR_BTF;
++ 		msk = tifn & _TIF_BLOCKSTEP;
++ 		debugctl |= (msk >> TIF_BLOCKSTEP) << DEBUGCTLMSR_BTF_SHIFT;
++ 		wrmsrl(MSR_IA32_DEBUGCTLMSR, debugctl);
++ 	}
++ 
++ 	if ((tifp ^ tifn) & _TIF_NOTSC)
++ 		cr4_toggle_bits_irqsoff(X86_CR4_TSD);
++ 
++ 	if ((tifp ^ tifn) & _TIF_NOCPUID)
++ 		set_cpuid_faulting(!!(tifn & _TIF_NOCPUID));
++ 
++ 	if ((tifp ^ tifn) & _TIF_RDS)
++ 		__speculative_store_bypass_update(tifn);
+++>>>>>>> 885f82bfbc6f (x86/process: Allow runtime control of Speculative Store Bypass)
+  }
+  
+  /*
+* Unmerged path arch/x86/include/asm/spec-ctrl.h
+* Unmerged path arch/x86/include/asm/msr-index.h
+* Unmerged path arch/x86/include/asm/spec-ctrl.h
+* Unmerged path arch/x86/include/asm/thread_info.h
+* Unmerged path arch/x86/kernel/cpu/bugs.c
+* Unmerged path arch/x86/kernel/process.c
