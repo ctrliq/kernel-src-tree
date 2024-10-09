@@ -1,0 +1,93 @@
+scsi: hpsa: correct device resets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [scsi] hpsa: correct device resets (Joseph Szczypek) [1710594]
+Rebuild_FUZZ: 90.00%
+commit-author Don Brace <don.brace@microsemi.com>
+commit c5dfd106414f3e038fee5c6f0800fd55ed07b41d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/c5dfd106.failed
+
+Correct a race condition that occurs between the reset handler and the
+completion handler. There are times when the wait_event condition is
+never met due to this race condition and the reset never completes.
+
+The reset_pending field is NULL initially.
+
+  t  Reset Handler Thread     Completion Thread
+  -- --------------------     -----------------
+  t1                          if (c->reset_pending)
+  t2 c->reset_pending = dev;     if (atomic_dev_and_test(counter))
+  t3 atomic_inc(counter)             wait_up_all(event_sync_wait_queue)
+  t4
+  t5 wait_event(...counter == 0)
+
+Kernel.org Bugzilla:
+           https://bugzilla.kernel.org/show_bug.cgi?id=1994350
+           Bug 199435 - HPSA + P420i resetting logical Direct-Access
+                        never complete
+
+	Reviewed-by: Justin Lindley <justin.lindley@microsemi.com>
+	Reviewed-by: David Carroll <david.carroll@microsemi.com>
+	Reviewed-by: Scott Teel <scott.teel@microsemi.com>
+	Signed-off-by: Don Brace <don.brace@microsemi.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit c5dfd106414f3e038fee5c6f0800fd55ed07b41d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/hpsa.c
+diff --cc drivers/scsi/hpsa.c
+index 228d3470c852,b4df2475ce9c..000000000000
+--- a/drivers/scsi/hpsa.c
++++ b/drivers/scsi/hpsa.c
+@@@ -5594,9 -5653,9 +5578,15 @@@ static int hpsa_scsi_queue_command(stru
+  	 * Retries always go down the normal I/O path.
+  	 */
+  	if (likely(cmd->retries == 0 &&
+++<<<<<<< HEAD
+ +		cmd->request->cmd_type == REQ_TYPE_FS &&
+ +		h->acciopath_status)) {
+ +		rc = hpsa_ioaccel_submit(h, c, cmd, scsi3addr);
+++=======
++ 			!blk_rq_is_passthrough(cmd->request) &&
++ 			h->acciopath_status)) {
++ 		rc = hpsa_ioaccel_submit(h, c, cmd);
+++>>>>>>> c5dfd106414f (scsi: hpsa: correct device resets)
+  		if (rc == 0)
+  			return 0;
+  		if (rc == SCSI_MLQUEUE_HOST_BUSY) {
+* Unmerged path drivers/scsi/hpsa.c
+diff --git a/drivers/scsi/hpsa.h b/drivers/scsi/hpsa.h
+index ef2676456046..d815ad59eb08 100644
+--- a/drivers/scsi/hpsa.h
++++ b/drivers/scsi/hpsa.h
+@@ -75,11 +75,12 @@ struct hpsa_scsi_dev_t {
+ 	unsigned char raid_level;	/* from inquiry page 0xC1 */
+ 	unsigned char volume_offline;	/* discovered via TUR or VPD */
+ 	u16 queue_depth;		/* max queue_depth for this device */
+-	atomic_t reset_cmds_out;	/* Count of commands to-be affected */
++	atomic_t commands_outstanding;	/* track commands sent to device */
+ 	atomic_t ioaccel_cmds_out;	/* Only used for physical devices
+ 					 * counts commands sent to physical
+ 					 * device via "ioaccel" path.
+ 					 */
++	bool in_reset;
+ 	u32 ioaccel_handle;
+ 	u8 active_path_index;
+ 	u8 path_map;
+diff --git a/drivers/scsi/hpsa_cmd.h b/drivers/scsi/hpsa_cmd.h
+index 21a726e2eec6..2daf08f81d80 100644
+--- a/drivers/scsi/hpsa_cmd.h
++++ b/drivers/scsi/hpsa_cmd.h
+@@ -448,7 +448,7 @@ struct CommandList {
+ 	struct hpsa_scsi_dev_t *phys_disk;
+ 
+ 	int abort_pending;
+-	struct hpsa_scsi_dev_t *reset_pending;
++	struct hpsa_scsi_dev_t *device;
+ 	atomic_t refcount; /* Must be last to avoid memset in hpsa_cmd_init() */
+ } __aligned(COMMANDLIST_ALIGNMENT);
+ 
