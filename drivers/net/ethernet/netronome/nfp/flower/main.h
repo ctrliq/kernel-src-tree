@@ -68,6 +68,7 @@ struct nfp_app;
 /* Extra features bitmap. */
 #define NFP_FL_FEATS_GENEVE		BIT(0)
 #define NFP_FL_NBI_MTU_SETTING		BIT(1)
+#define NFP_FL_FEATS_GENEVE_OPT		BIT(2)
 #define NFP_FL_FEATS_LAG		BIT(31)
 
 #define NFP_FLOWER_GOLDEN_RATIO_64	0x61C8864680B583EBull
