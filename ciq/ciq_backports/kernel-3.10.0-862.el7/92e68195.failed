@@ -1,0 +1,490 @@
+nfp: do simple XDP TX buffer recycling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 92e68195ebe914ae8b34cfb92148385a50454806
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/92e68195.failed
+
+On the RX path we follow the "drop if allocation of replacement
+buffer fails" rule.  With XDP we extended that to the TX action,
+so if XDP prog returned TX but allocation of replacement RX buffer
+failed, we will drop the packet.
+
+To improve our XDP TX performance extend the idea of rings being
+always full to XDP TX rings.  Pre-fill the XDP TX rings with RX
+buffers, and when XDP prog returns TX action swap the RX buffer
+with the next buffer from the TX ring.
+
+XDP TX complete will no longer free the buffers but let them
+sit on the TX ring and wait for swap with RX buffer, instead.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 92e68195ebe914ae8b34cfb92148385a50454806)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 4bac97838402,4fbda0eb4776..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -971,9 -994,47 +974,50 @@@ static void nfp_net_tx_complete(struct 
+  		  tx_ring->rd_p, tx_ring->wr_p, tx_ring->cnt);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nfp_net_xdp_complete(struct nfp_net_tx_ring *tx_ring)
++ {
++ 	struct nfp_net_r_vector *r_vec = tx_ring->r_vec;
++ 	u32 done_pkts = 0, done_bytes = 0;
++ 	int idx, todo;
++ 	u32 qcp_rd_p;
++ 
++ 	/* Work out how many descriptors have been transmitted */
++ 	qcp_rd_p = nfp_qcp_rd_ptr_read(tx_ring->qcp_q);
++ 
++ 	if (qcp_rd_p == tx_ring->qcp_rd_p)
++ 		return;
++ 
++ 	if (qcp_rd_p > tx_ring->qcp_rd_p)
++ 		todo = qcp_rd_p - tx_ring->qcp_rd_p;
++ 	else
++ 		todo = qcp_rd_p + tx_ring->cnt - tx_ring->qcp_rd_p;
++ 
++ 	done_pkts = todo;
++ 	while (todo--) {
++ 		idx = tx_ring->rd_p & (tx_ring->cnt - 1);
++ 		tx_ring->rd_p++;
++ 
++ 		done_bytes += tx_ring->txbufs[idx].real_len;
++ 	}
++ 
++ 	tx_ring->qcp_rd_p = qcp_rd_p;
++ 
++ 	u64_stats_update_begin(&r_vec->tx_sync);
++ 	r_vec->tx_bytes += done_bytes;
++ 	r_vec->tx_pkts += done_pkts;
++ 	u64_stats_update_end(&r_vec->tx_sync);
++ 
++ 	WARN_ONCE(tx_ring->wr_p - tx_ring->rd_p > tx_ring->cnt,
++ 		  "TX ring corruption rd_p=%u wr_p=%u cnt=%u\n",
++ 		  tx_ring->rd_p, tx_ring->wr_p, tx_ring->cnt);
++ }
++ 
+++>>>>>>> 92e68195ebe9 (nfp: do simple XDP TX buffer recycling)
+  /**
+   * nfp_net_tx_ring_reset() - Free any untransmitted buffers and reset pointers
+ - * @dp:		NFP Net data path struct
+ + * @nn:		NFP Net device
+   * @tx_ring:	TX ring structure
+   *
+   * Assumes that the device is stopped
+@@@ -983,37 -1044,36 +1027,67 @@@ nfp_net_tx_ring_reset(struct nfp_net *n
+  {
+  	const struct skb_frag_struct *frag;
+  	struct netdev_queue *nd_q;
+ +	struct pci_dev *pdev = nn->pdev;
+  
+++<<<<<<< HEAD
+ +	while (tx_ring->rd_p != tx_ring->wr_p) {
+ +		int nr_frags, fidx, idx;
+ +		struct sk_buff *skb;
+++=======
++ 	while (!tx_ring->is_xdp && tx_ring->rd_p != tx_ring->wr_p) {
++ 		struct nfp_net_tx_buf *tx_buf;
++ 		struct sk_buff *skb;
++ 		int idx, nr_frags;
+++>>>>>>> 92e68195ebe9 (nfp: do simple XDP TX buffer recycling)
+  
+  		idx = tx_ring->rd_p & (tx_ring->cnt - 1);
+ -		tx_buf = &tx_ring->txbufs[idx];
+ +		skb = tx_ring->txbufs[idx].skb;
+ +		nr_frags = skb_shinfo(skb)->nr_frags;
+ +		fidx = tx_ring->txbufs[idx].fidx;
+  
+++<<<<<<< HEAD
+ +		if (fidx == -1) {
+ +			/* unmap head */
+ +			dma_unmap_single(&pdev->dev,
+ +					 tx_ring->txbufs[idx].dma_addr,
+ +					 skb_headlen(skb), DMA_TO_DEVICE);
+ +		} else {
+ +			/* unmap fragment */
+ +			frag = &skb_shinfo(skb)->frags[fidx];
+ +			dma_unmap_page(&pdev->dev,
+ +				       tx_ring->txbufs[idx].dma_addr,
+++=======
++ 		skb = tx_ring->txbufs[idx].skb;
++ 		nr_frags = skb_shinfo(skb)->nr_frags;
++ 
++ 		if (tx_buf->fidx == -1) {
++ 			/* unmap head */
++ 			dma_unmap_single(dp->dev, tx_buf->dma_addr,
++ 					 skb_headlen(skb), DMA_TO_DEVICE);
++ 		} else {
++ 			/* unmap fragment */
++ 			frag = &skb_shinfo(skb)->frags[tx_buf->fidx];
++ 			dma_unmap_page(dp->dev, tx_buf->dma_addr,
+++>>>>>>> 92e68195ebe9 (nfp: do simple XDP TX buffer recycling)
+  				       skb_frag_size(frag), DMA_TO_DEVICE);
+  		}
+  
+  		/* check for last gather fragment */
+++<<<<<<< HEAD
+ +		if (fidx == nr_frags - 1)
+ +			dev_kfree_skb_any(skb);
+ +
+ +		tx_ring->txbufs[idx].dma_addr = 0;
+ +		tx_ring->txbufs[idx].skb = NULL;
+ +		tx_ring->txbufs[idx].fidx = -2;
+++=======
++ 		if (tx_buf->fidx == nr_frags - 1)
++ 			dev_kfree_skb_any(skb);
++ 
++ 		tx_buf->dma_addr = 0;
++ 		tx_buf->skb = NULL;
++ 		tx_buf->fidx = -2;
+++>>>>>>> 92e68195ebe9 (nfp: do simple XDP TX buffer recycling)
+  
+  		tx_ring->qcp_rd_p++;
+  		tx_ring->rd_p++;
+@@@ -1025,7 -1085,10 +1099,14 @@@
+  	tx_ring->qcp_rd_p = 0;
+  	tx_ring->wr_ptr_add = 0;
+  
+++<<<<<<< HEAD
+ +	nd_q = netdev_get_tx_queue(nn->netdev, tx_ring->idx);
+++=======
++ 	if (tx_ring->is_xdp)
++ 		return;
++ 
++ 	nd_q = netdev_get_tx_queue(dp->netdev, tx_ring->idx);
+++>>>>>>> 92e68195ebe9 (nfp: do simple XDP TX buffer recycling)
+  	netdev_tx_reset_queue(nd_q);
+  }
+  
+@@@ -1365,6 -1469,73 +1446,76 @@@ nfp_net_rx_drop(struct nfp_net_r_vecto
+  		dev_kfree_skb_any(skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool
++ nfp_net_tx_xdp_buf(struct nfp_net_dp *dp, struct nfp_net_rx_ring *rx_ring,
++ 		   struct nfp_net_tx_ring *tx_ring,
++ 		   struct nfp_net_rx_buf *rxbuf, unsigned int dma_off,
++ 		   unsigned int pkt_len)
++ {
++ 	struct nfp_net_tx_buf *txbuf;
++ 	struct nfp_net_tx_desc *txd;
++ 	int wr_idx;
++ 
++ 	if (unlikely(nfp_net_tx_full(tx_ring, 1))) {
++ 		nfp_net_rx_drop(dp, rx_ring->r_vec, rx_ring, rxbuf, NULL);
++ 		return false;
++ 	}
++ 
++ 	wr_idx = tx_ring->wr_p & (tx_ring->cnt - 1);
++ 
++ 	/* Stash the soft descriptor of the head then initialize it */
++ 	txbuf = &tx_ring->txbufs[wr_idx];
++ 
++ 	nfp_net_rx_give_one(dp, rx_ring, txbuf->frag, txbuf->dma_addr);
++ 
++ 	txbuf->frag = rxbuf->frag;
++ 	txbuf->dma_addr = rxbuf->dma_addr;
++ 	txbuf->fidx = -1;
++ 	txbuf->pkt_cnt = 1;
++ 	txbuf->real_len = pkt_len;
++ 
++ 	dma_sync_single_for_device(dp->dev, rxbuf->dma_addr + dma_off,
++ 				   pkt_len, DMA_BIDIRECTIONAL);
++ 
++ 	/* Build TX descriptor */
++ 	txd = &tx_ring->txds[wr_idx];
++ 	txd->offset_eop = PCIE_DESC_TX_EOP;
++ 	txd->dma_len = cpu_to_le16(pkt_len);
++ 	nfp_desc_set_dma_addr(txd, rxbuf->dma_addr + dma_off);
++ 	txd->data_len = cpu_to_le16(pkt_len);
++ 
++ 	txd->flags = 0;
++ 	txd->mss = 0;
++ 	txd->l4_offset = 0;
++ 
++ 	tx_ring->wr_p++;
++ 	tx_ring->wr_ptr_add++;
++ 	return true;
++ }
++ 
++ static int nfp_net_run_xdp(struct bpf_prog *prog, void *data, void *hard_start,
++ 			   unsigned int *off, unsigned int *len)
++ {
++ 	struct xdp_buff xdp;
++ 	void *orig_data;
++ 	int ret;
++ 
++ 	xdp.data_hard_start = hard_start;
++ 	xdp.data = data + *off;
++ 	xdp.data_end = data + *off + *len;
++ 
++ 	orig_data = xdp.data;
++ 	ret = bpf_prog_run_xdp(prog, &xdp);
++ 
++ 	*len -= xdp.data - orig_data;
++ 	*off += xdp.data - orig_data;
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> 92e68195ebe9 (nfp: do simple XDP TX buffer recycling)
+  /**
+   * nfp_net_rx() - receive up to @budget packets on @rx_ring
+   * @rx_ring:   RX ring to receive from
+@@@ -1526,22 -1773,21 +1677,30 @@@ static void nfp_net_tx_ring_free(struc
+  
+  /**
+   * nfp_net_tx_ring_alloc() - Allocate resource for a TX ring
+ - * @dp:        NFP Net data path struct
+   * @tx_ring:   TX Ring structure to allocate
+++<<<<<<< HEAD
+ + * @cnt:       Ring buffer count
+ + *
+ + * Return: 0 on success, negative errno otherwise.
+ + */
+ +static int nfp_net_tx_ring_alloc(struct nfp_net_tx_ring *tx_ring, u32 cnt)
+++=======
++  *
++  * Return: 0 on success, negative errno otherwise.
++  */
++ static int
++ nfp_net_tx_ring_alloc(struct nfp_net_dp *dp, struct nfp_net_tx_ring *tx_ring)
+++>>>>>>> 92e68195ebe9 (nfp: do simple XDP TX buffer recycling)
+  {
+  	struct nfp_net_r_vector *r_vec = tx_ring->r_vec;
+ +	struct nfp_net *nn = r_vec->nfp_net;
+ +	struct pci_dev *pdev = nn->pdev;
+  	int sz;
+  
+ -	tx_ring->cnt = dp->txd_cnt;
+ +	tx_ring->cnt = cnt;
+  
+  	tx_ring->size = sizeof(*tx_ring->txds) * tx_ring->cnt;
+ -	tx_ring->txds = dma_zalloc_coherent(dp->dev, tx_ring->size,
+ +	tx_ring->txds = dma_zalloc_coherent(&pdev->dev, tx_ring->size,
+  					    &tx_ring->dma, GFP_KERNEL);
+  	if (!tx_ring->txds)
+  		goto err_alloc;
+@@@ -1551,11 -1797,9 +1710,17 @@@
+  	if (!tx_ring->txbufs)
+  		goto err_alloc;
+  
+++<<<<<<< HEAD
+ +	netif_set_xps_queue(nn->netdev, &r_vec->affinity_mask, tx_ring->idx);
+ +
+ +	nn_dbg(nn, "TxQ%02d: QCidx=%02d cnt=%d dma=%#llx host=%p\n",
+ +	       tx_ring->idx, tx_ring->qcidx,
+ +	       tx_ring->cnt, (unsigned long long)tx_ring->dma, tx_ring->txds);
+++=======
++ 	if (!tx_ring->is_xdp)
++ 		netif_set_xps_queue(dp->netdev, &r_vec->affinity_mask,
++ 				    tx_ring->idx);
+++>>>>>>> 92e68195ebe9 (nfp: do simple XDP TX buffer recycling)
+  
+  	return 0;
+  
+@@@ -1564,56 -1808,92 +1729,129 @@@ err_alloc
+  	return -ENOMEM;
+  }
+  
+++<<<<<<< HEAD
+ +static struct nfp_net_tx_ring *
+ +nfp_net_tx_ring_set_prepare(struct nfp_net *nn, struct nfp_net_ring_set *s)
+++=======
++ static void
++ nfp_net_tx_ring_bufs_free(struct nfp_net_dp *dp,
++ 			  struct nfp_net_tx_ring *tx_ring)
++ {
++ 	unsigned int i;
++ 
++ 	if (!tx_ring->is_xdp)
++ 		return;
++ 
++ 	for (i = 0; i < tx_ring->cnt; i++) {
++ 		if (!tx_ring->txbufs[i].frag)
++ 			return;
++ 
++ 		nfp_net_dma_unmap_rx(dp, tx_ring->txbufs[i].dma_addr);
++ 		__free_page(virt_to_page(tx_ring->txbufs[i].frag));
++ 	}
++ }
++ 
++ static int
++ nfp_net_tx_ring_bufs_alloc(struct nfp_net_dp *dp,
++ 			   struct nfp_net_tx_ring *tx_ring)
++ {
++ 	struct nfp_net_tx_buf *txbufs = tx_ring->txbufs;
++ 	unsigned int i;
++ 
++ 	if (!tx_ring->is_xdp)
++ 		return 0;
++ 
++ 	for (i = 0; i < tx_ring->cnt; i++) {
++ 		txbufs[i].frag = nfp_net_rx_alloc_one(dp, &txbufs[i].dma_addr);
++ 		if (!txbufs[i].frag) {
++ 			nfp_net_tx_ring_bufs_free(dp, tx_ring);
++ 			return -ENOMEM;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int nfp_net_tx_rings_prepare(struct nfp_net *nn, struct nfp_net_dp *dp)
+++>>>>>>> 92e68195ebe9 (nfp: do simple XDP TX buffer recycling)
+  {
+ +	struct nfp_net_tx_ring *rings;
+  	unsigned int r;
+  
+ -	dp->tx_rings = kcalloc(dp->num_tx_rings, sizeof(*dp->tx_rings),
+ -			       GFP_KERNEL);
+ -	if (!dp->tx_rings)
+ -		return -ENOMEM;
+ +	rings = kcalloc(s->n_rings, sizeof(*rings), GFP_KERNEL);
+ +	if (!rings)
+ +		return NULL;
+  
+ -	for (r = 0; r < dp->num_tx_rings; r++) {
+ -		int bias = 0;
+ +	for (r = 0; r < s->n_rings; r++) {
+ +		nfp_net_tx_ring_init(&rings[r], &nn->r_vecs[r], r);
+  
+++<<<<<<< HEAD
+ +		if (nfp_net_tx_ring_alloc(&rings[r], s->dcnt))
+++=======
++ 		if (r >= dp->num_stack_tx_rings)
++ 			bias = dp->num_stack_tx_rings;
++ 
++ 		nfp_net_tx_ring_init(&dp->tx_rings[r], &nn->r_vecs[r - bias],
++ 				     r, bias);
++ 
++ 		if (nfp_net_tx_ring_alloc(dp, &dp->tx_rings[r]))
+++>>>>>>> 92e68195ebe9 (nfp: do simple XDP TX buffer recycling)
+  			goto err_free_prev;
++ 
++ 		if (nfp_net_tx_ring_bufs_alloc(dp, &dp->tx_rings[r]))
++ 			goto err_free_ring;
+  	}
+  
+ -	return 0;
+ +	return s->rings = rings;
+  
+  err_free_prev:
+++<<<<<<< HEAD
+ +	while (r--)
+ +		nfp_net_tx_ring_free(&rings[r]);
+ +	kfree(rings);
+ +	return NULL;
+++=======
++ 	while (r--) {
++ 		nfp_net_tx_ring_bufs_free(dp, &dp->tx_rings[r]);
++ err_free_ring:
++ 		nfp_net_tx_ring_free(&dp->tx_rings[r]);
++ 	}
++ 	kfree(dp->tx_rings);
++ 	return -ENOMEM;
+++>>>>>>> 92e68195ebe9 (nfp: do simple XDP TX buffer recycling)
+  }
+  
+ -static void nfp_net_tx_rings_free(struct nfp_net_dp *dp)
+ +static void
+ +nfp_net_tx_ring_set_swap(struct nfp_net *nn, struct nfp_net_ring_set *s)
+ +{
+ +	struct nfp_net_ring_set new = *s;
+ +
+ +	s->dcnt = nn->txd_cnt;
+ +	s->rings = nn->tx_rings;
+ +	s->n_rings = nn->num_tx_rings;
+ +
+ +	nn->txd_cnt = new.dcnt;
+ +	nn->tx_rings = new.rings;
+ +	nn->num_tx_rings = new.n_rings;
+ +}
+ +
+ +static void
+ +nfp_net_tx_ring_set_free(struct nfp_net *nn, struct nfp_net_ring_set *s)
+  {
+ +	struct nfp_net_tx_ring *rings = s->rings;
+  	unsigned int r;
+  
+++<<<<<<< HEAD
+ +	for (r = 0; r < s->n_rings; r++)
+ +		nfp_net_tx_ring_free(&rings[r]);
+++=======
++ 	for (r = 0; r < dp->num_tx_rings; r++) {
++ 		nfp_net_tx_ring_bufs_free(dp, &dp->tx_rings[r]);
++ 		nfp_net_tx_ring_free(&dp->tx_rings[r]);
++ 	}
+++>>>>>>> 92e68195ebe9 (nfp: do simple XDP TX buffer recycling)
+  
+ -	kfree(dp->tx_rings);
+ +	kfree(rings);
+  }
+  
+  /**
+@@@ -2151,17 -2385,19 +2389,25 @@@ static void nfp_net_close_free_all(stru
+  {
+  	unsigned int r;
+  
+ -	for (r = 0; r < nn->dp.num_rx_rings; r++) {
+ -		nfp_net_rx_ring_bufs_free(&nn->dp, &nn->dp.rx_rings[r]);
+ -		nfp_net_rx_ring_free(&nn->dp.rx_rings[r]);
+ +	for (r = 0; r < nn->num_rx_rings; r++) {
+ +		nfp_net_rx_ring_bufs_free(nn, &nn->rx_rings[r]);
+ +		nfp_net_rx_ring_free(&nn->rx_rings[r]);
+  	}
+++<<<<<<< HEAD
+ +	for (r = 0; r < nn->num_tx_rings; r++)
+ +		nfp_net_tx_ring_free(&nn->tx_rings[r]);
+ +	for (r = 0; r < nn->num_r_vecs; r++)
+++=======
++ 	for (r = 0; r < nn->dp.num_tx_rings; r++) {
++ 		nfp_net_tx_ring_bufs_free(&nn->dp, &nn->dp.tx_rings[r]);
++ 		nfp_net_tx_ring_free(&nn->dp.tx_rings[r]);
++ 	}
++ 	for (r = 0; r < nn->dp.num_r_vecs; r++)
+++>>>>>>> 92e68195ebe9 (nfp: do simple XDP TX buffer recycling)
+  		nfp_net_cleanup_vector(nn, &nn->r_vecs[r]);
+  
+ -	kfree(nn->dp.rx_rings);
+ -	kfree(nn->dp.tx_rings);
+ +	kfree(nn->rx_rings);
+ +	kfree(nn->tx_rings);
+  
+  	nfp_net_aux_irq_free(nn, NFP_NET_CFG_LSC, NFP_NET_IRQ_LSC_IDX);
+  	nfp_net_aux_irq_free(nn, NFP_NET_CFG_EXN, NFP_NET_IRQ_EXN_IDX);
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net.h b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+index 600c79f39fe0..507d01547538 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net.h
+@@ -194,6 +194,7 @@ struct nfp_net_tx_buf {
+  * @txds:       Virtual address of TX ring in host memory
+  * @dma:        DMA address of the TX ring
+  * @size:       Size, in bytes, of the TX ring (needed to free)
++ * @is_xdp:	Is this a XDP TX ring?
+  */
+ struct nfp_net_tx_ring {
+ 	struct nfp_net_r_vector *r_vec;
+@@ -214,6 +215,7 @@ struct nfp_net_tx_ring {
+ 
+ 	dma_addr_t dma;
+ 	unsigned int size;
++	bool is_xdp;
+ } ____cacheline_aligned;
+ 
+ /* RX and freelist descriptor format */
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
