@@ -1,0 +1,437 @@
+net: ipv4: add support for ECMP hash policy choice
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] ipv4: add support for ECMP hash policy choice (Hangbin Liu) [1511351]
+Rebuild_FUZZ: 94.74%
+commit-author Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+commit bf4e0a3db97eb882368fd82980b3b1fa0b5b9778
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/bf4e0a3d.failed
+
+This patch adds support for ECMP hash policy choice via a new sysctl
+called fib_multipath_hash_policy and also adds support for L4 hashes.
+The current values for fib_multipath_hash_policy are:
+ 0 - layer 3 (default)
+ 1 - layer 4
+If there's an skb hash already set and it matches the chosen policy then it
+will be used instead of being calculated (currently only for L4).
+In L3 mode we always calculate the hash due to the ICMP error special
+case, the flow dissector's field consistentification should handle the
+address order thus we can remove the address reversals.
+If the skb is provided we always use it for the hash calculation,
+otherwise we fallback to fl4, that is if skb is NULL fl4 has to be set.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bf4e0a3db97eb882368fd82980b3b1fa0b5b9778)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/networking/ip-sysctl.txt
+#	include/net/ip_fib.h
+#	include/net/netns/ipv4.h
+#	include/net/route.h
+#	net/ipv4/fib_semantics.c
+#	net/ipv4/route.c
+#	net/ipv4/sysctl_net_ipv4.c
+diff --cc Documentation/networking/ip-sysctl.txt
+index 5a927c32a077,b57308e76b1d..000000000000
+--- a/Documentation/networking/ip-sysctl.txt
++++ b/Documentation/networking/ip-sysctl.txt
+@@@ -52,6 -63,24 +52,27 @@@ fwmark_reflect - BOOLEA
+  	fwmark of the packet they are replying to.
+  	Default: 0
+  
+++<<<<<<< HEAD
+++=======
++ fib_multipath_use_neigh - BOOLEAN
++ 	Use status of existing neighbor entry when determining nexthop for
++ 	multipath routes. If disabled, neighbor information is not used and
++ 	packets could be directed to a failed nexthop. Only valid for kernels
++ 	built with CONFIG_IP_ROUTE_MULTIPATH enabled.
++ 	Default: 0 (disabled)
++ 	Possible values:
++ 	0 - disabled
++ 	1 - enabled
++ 
++ fib_multipath_hash_policy - INTEGER
++ 	Controls which hash policy to use for multipath routes. Only valid
++ 	for kernels built with CONFIG_IP_ROUTE_MULTIPATH enabled.
++ 	Default: 0 (Layer 3)
++ 	Possible values:
++ 	0 - Layer 3
++ 	1 - Layer 4
++ 
+++>>>>>>> bf4e0a3db97e (net: ipv4: add support for ECMP hash policy choice)
+  route/max_size - INTEGER
+  	Maximum number of routes allowed in the kernel.  Increase
+  	this when using large numbers of interfaces and/or routes.
+diff --cc include/net/ip_fib.h
+index 81968d1d3054,6692c5758b33..000000000000
+--- a/include/net/ip_fib.h
++++ b/include/net/ip_fib.h
+@@@ -376,19 -391,17 +376,20 @@@ int fib_unmerge(struct net *net)
+  
+  /* Exported by fib_semantics.c */
+  int ip_fib_check_default(__be32 gw, struct net_device *dev);
+ -int fib_sync_down_dev(struct net_device *dev, unsigned long event, bool force);
+ -int fib_sync_down_addr(struct net_device *dev, __be32 local);
+ -int fib_sync_up(struct net_device *dev, unsigned int nh_flags);
+ +int fib_sync_down_dev(struct net_device *dev, int force);
+ +int fib_sync_down_addr(struct net *net, __be32 local);
+ +int fib_sync_up(struct net_device *dev);
+  
+- extern u32 fib_multipath_secret __read_mostly;
+- 
+- static inline int fib_multipath_hash(__be32 saddr, __be32 daddr)
+- {
+- 	return jhash_2words((__force u32)saddr, (__force u32)daddr,
+- 			    fib_multipath_secret) >> 1;
+- }
+- 
++ #ifdef CONFIG_IP_ROUTE_MULTIPATH
++ int fib_multipath_hash(const struct fib_info *fi, const struct flowi4 *fl4,
++ 		       const struct sk_buff *skb);
++ #endif
+  void fib_select_multipath(struct fib_result *res, int hash);
+++<<<<<<< HEAD
+++=======
++ void fib_select_path(struct net *net, struct fib_result *res,
++ 		     struct flowi4 *fl4, const struct sk_buff *skb);
+++>>>>>>> bf4e0a3db97e (net: ipv4: add support for ECMP hash policy choice)
+  
+  /* Exported by fib_trie.c */
+  void fib_trie_init(void);
+diff --cc include/net/netns/ipv4.h
+index 79c995f4a025,a0e89190a3e9..000000000000
+--- a/include/net/netns/ipv4.h
++++ b/include/net/netns/ipv4.h
+@@@ -86,5 -149,13 +86,16 @@@ struct netns_ipv4 
+  	struct fib_rules_ops	*mr_rules_ops;
+  #endif
+  #endif
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_IP_ROUTE_MULTIPATH
++ 	int sysctl_fib_multipath_use_neigh;
++ 	int sysctl_fib_multipath_hash_policy;
++ #endif
++ 
++ 	unsigned int	fib_seq;	/* protected by rtnl_mutex */
++ 
++ 	atomic_t	rt_genid;
+++>>>>>>> bf4e0a3db97e (net: ipv4: add support for ECMP hash policy choice)
+  };
+  #endif
+diff --cc include/net/route.h
+index 79ebe28e40b2,2cc0e14c6359..000000000000
+--- a/include/net/route.h
++++ b/include/net/route.h
+@@@ -104,21 -109,23 +104,30 @@@ struct rt_cache_stat 
+  extern struct ip_rt_acct __percpu *ip_rt_acct;
+  
+  struct in_device;
+++<<<<<<< HEAD
+ +extern int		ip_rt_init(void);
+ +extern void		rt_cache_flush(struct net *net);
+ +extern void		rt_flush_dev(struct net_device *dev);
+ +struct rtable *__ip_route_output_key_hash(struct net *, struct flowi4 *flp,
+ +					  int mp_hash);
+++=======
++ 
++ int ip_rt_init(void);
++ void rt_cache_flush(struct net *net);
++ void rt_flush_dev(struct net_device *dev);
++ struct rtable *__ip_route_output_key_hash(struct net *net, struct flowi4 *flp,
++ 					  const struct sk_buff *skb);
+++>>>>>>> bf4e0a3db97e (net: ipv4: add support for ECMP hash policy choice)
+  
+  static inline struct rtable *__ip_route_output_key(struct net *net,
+  						   struct flowi4 *flp)
+  {
+- 	return __ip_route_output_key_hash(net, flp, -1);
++ 	return __ip_route_output_key_hash(net, flp, NULL);
+  }
+  
+ -struct rtable *ip_route_output_flow(struct net *, struct flowi4 *flp,
+ -				    const struct sock *sk);
+ -struct dst_entry *ipv4_blackhole_route(struct net *net,
+ -				       struct dst_entry *dst_orig);
+ +extern struct rtable *ip_route_output_flow(struct net *, struct flowi4 *flp,
+ +					   struct sock *sk);
+ +extern struct dst_entry *ipv4_blackhole_route(struct net *net, struct dst_entry *dst_orig);
+  
+  static inline struct rtable *ip_route_output_key(struct net *net, struct flowi4 *flp)
+  {
+diff --cc net/ipv4/fib_semantics.c
+index 8a694b72dc21,da449ddb8cc1..000000000000
+--- a/net/ipv4/fib_semantics.c
++++ b/net/ipv4/fib_semantics.c
+@@@ -1535,11 -1623,41 +1531,40 @@@ void fib_select_multipath(struct fib_re
+  		if (hash > atomic_read(&nh->nh_upper_bound))
+  			continue;
+  
+ -		if (!net->ipv4.sysctl_fib_multipath_use_neigh ||
+ -		    fib_good_nh(nh)) {
+ -			res->nh_sel = nhsel;
+ -			return;
+ -		}
+ -		if (!first) {
+ -			res->nh_sel = nhsel;
+ -			first = true;
+ -		}
+ +		res->nh_sel = nhsel;
+ +		return;
+  	} endfor_nexthops(fi);
+ +
+ +	/* Race condition: route has just become dead. */
+ +	res->nh_sel = 0;
+  }
+  #endif
+++<<<<<<< HEAD
+++=======
++ 
++ void fib_select_path(struct net *net, struct fib_result *res,
++ 		     struct flowi4 *fl4, const struct sk_buff *skb)
++ {
++ 	bool oif_check;
++ 
++ 	oif_check = (fl4->flowi4_oif == 0 ||
++ 		     fl4->flowi4_flags & FLOWI_FLAG_SKIP_NH_OIF);
++ 
++ #ifdef CONFIG_IP_ROUTE_MULTIPATH
++ 	if (res->fi->fib_nhs > 1 && oif_check) {
++ 		int h = fib_multipath_hash(res->fi, fl4, skb);
++ 
++ 		fib_select_multipath(res, h);
++ 	}
++ 	else
++ #endif
++ 	if (!res->prefixlen &&
++ 	    res->table->tb_num_default > 1 &&
++ 	    res->type == RTN_UNICAST && oif_check)
++ 		fib_select_default(fl4, res);
++ 
++ 	if (!fl4->saddr)
++ 		fl4->saddr = FIB_RES_PREFSRC(net, *res);
++ }
++ EXPORT_SYMBOL_GPL(fib_select_path);
+++>>>>>>> bf4e0a3db97e (net: ipv4: add support for ECMP hash policy choice)
+diff --cc net/ipv4/route.c
+index c62c5860782f,5dda1ef81c7e..000000000000
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@@ -2308,22 -2413,7 +2356,26 @@@ struct rtable *__ip_route_output_key_ha
+  		goto make_route;
+  	}
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_IP_ROUTE_MULTIPATH
+ +	if (res.fi->fib_nhs > 1 && fl4->flowi4_oif == 0) {
+ +		if (mp_hash < 0)
+ +			mp_hash = get_hash_from_flowi4(fl4) >> 1;
+ +
+ +		fib_select_multipath(&res, mp_hash);
+ +	}
+ +	else
+ +#endif
+ +	if (!res.prefixlen &&
+ +	    res.table->tb_num_default > 1 &&
+ +	    res.type == RTN_UNICAST && !fl4->flowi4_oif)
+ +		fib_select_default(&res);
+ +
+ +	if (!fl4->saddr)
+ +		fl4->saddr = FIB_RES_PREFSRC(net, res);
+++=======
++ 	fib_select_path(net, &res, fl4, skb);
+++>>>>>>> bf4e0a3db97e (net: ipv4: add support for ECMP hash policy choice)
+  
+  	dev_out = FIB_RES_DEV(res);
+  	fl4->flowi4_oif = dev_out->ifindex;
+diff --cc net/ipv4/sysctl_net_ipv4.c
+index 12b498f653f9,711c3e2e17b1..000000000000
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@@ -926,6 -898,133 +926,136 @@@ static struct ctl_table ipv4_net_table[
+  		.mode		= 0644,
+  		.proc_handler	= proc_dointvec_jiffies,
+  	},
+++<<<<<<< HEAD
+++=======
++ 	{
++ 		.procname	= "tcp_syn_retries",
++ 		.data		= &init_net.ipv4.sysctl_tcp_syn_retries,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec_minmax,
++ 		.extra1		= &tcp_syn_retries_min,
++ 		.extra2		= &tcp_syn_retries_max
++ 	},
++ 	{
++ 		.procname	= "tcp_synack_retries",
++ 		.data		= &init_net.ipv4.sysctl_tcp_synack_retries,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec
++ 	},
++ #ifdef CONFIG_SYN_COOKIES
++ 	{
++ 		.procname	= "tcp_syncookies",
++ 		.data		= &init_net.ipv4.sysctl_tcp_syncookies,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec
++ 	},
++ #endif
++ 	{
++ 		.procname	= "tcp_reordering",
++ 		.data		= &init_net.ipv4.sysctl_tcp_reordering,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec
++ 	},
++ 	{
++ 		.procname	= "tcp_retries1",
++ 		.data		= &init_net.ipv4.sysctl_tcp_retries1,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec_minmax,
++ 		.extra2		= &tcp_retr1_max
++ 	},
++ 	{
++ 		.procname	= "tcp_retries2",
++ 		.data		= &init_net.ipv4.sysctl_tcp_retries2,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec
++ 	},
++ 	{
++ 		.procname	= "tcp_orphan_retries",
++ 		.data		= &init_net.ipv4.sysctl_tcp_orphan_retries,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec
++ 	},
++ 	{
++ 		.procname	= "tcp_fin_timeout",
++ 		.data		= &init_net.ipv4.sysctl_tcp_fin_timeout,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec_jiffies,
++ 	},
++ 	{
++ 		.procname	= "tcp_notsent_lowat",
++ 		.data		= &init_net.ipv4.sysctl_tcp_notsent_lowat,
++ 		.maxlen		= sizeof(unsigned int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_douintvec,
++ 	},
++ 	{
++ 		.procname	= "tcp_tw_reuse",
++ 		.data		= &init_net.ipv4.sysctl_tcp_tw_reuse,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec
++ 	},
++ 	{
++ 		.procname	= "tcp_max_tw_buckets",
++ 		.data		= &init_net.ipv4.tcp_death_row.sysctl_max_tw_buckets,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec
++ 	},
++ 	{
++ 		.procname	= "tcp_max_syn_backlog",
++ 		.data		= &init_net.ipv4.sysctl_max_syn_backlog,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec
++ 	},
++ #ifdef CONFIG_IP_ROUTE_MULTIPATH
++ 	{
++ 		.procname	= "fib_multipath_use_neigh",
++ 		.data		= &init_net.ipv4.sysctl_fib_multipath_use_neigh,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec_minmax,
++ 		.extra1		= &zero,
++ 		.extra2		= &one,
++ 	},
++ 	{
++ 		.procname	= "fib_multipath_hash_policy",
++ 		.data		= &init_net.ipv4.sysctl_fib_multipath_hash_policy,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec_minmax,
++ 		.extra1		= &zero,
++ 		.extra2		= &one,
++ 	},
++ #endif
++ 	{
++ 		.procname	= "ip_unprivileged_port_start",
++ 		.maxlen		= sizeof(int),
++ 		.data		= &init_net.ipv4.sysctl_ip_prot_sock,
++ 		.mode		= 0644,
++ 		.proc_handler	= ipv4_privileged_ports,
++ 	},
++ #ifdef CONFIG_NET_L3_MASTER_DEV
++ 	{
++ 		.procname	= "udp_l3mdev_accept",
++ 		.data		= &init_net.ipv4.sysctl_udp_l3mdev_accept,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec_minmax,
++ 		.extra1		= &zero,
++ 		.extra2		= &one,
++ 	},
++ #endif
+++>>>>>>> bf4e0a3db97e (net: ipv4: add support for ECMP hash policy choice)
+  	{ }
+  };
+  
+* Unmerged path Documentation/networking/ip-sysctl.txt
+* Unmerged path include/net/ip_fib.h
+* Unmerged path include/net/netns/ipv4.h
+* Unmerged path include/net/route.h
+* Unmerged path net/ipv4/fib_semantics.c
+diff --git a/net/ipv4/icmp.c b/net/ipv4/icmp.c
+index 56b13715ad8b..e2e49d48799a 100644
+--- a/net/ipv4/icmp.c
++++ b/net/ipv4/icmp.c
+@@ -459,22 +459,6 @@ out_bh_enable:
+ 	local_bh_enable();
+ }
+ 
+-#ifdef CONFIG_IP_ROUTE_MULTIPATH
+-
+-/* Source and destination is swapped. See ip_multipath_icmp_hash */
+-static int icmp_multipath_hash_skb(const struct sk_buff *skb)
+-{
+-	const struct iphdr *iph = ip_hdr(skb);
+-
+-	return fib_multipath_hash(iph->daddr, iph->saddr);
+-}
+-
+-#else
+-
+-#define icmp_multipath_hash_skb(skb) (-1)
+-
+-#endif
+-
+ static struct rtable *icmp_route_lookup(struct net *net,
+ 					struct flowi4 *fl4,
+ 					struct sk_buff *skb_in,
+@@ -497,8 +481,7 @@ static struct rtable *icmp_route_lookup(struct net *net,
+ 	fl4->fl4_icmp_type = type;
+ 	fl4->fl4_icmp_code = code;
+ 	security_skb_classify_flow(skb_in, flowi4_to_flowi(fl4));
+-	rt = __ip_route_output_key_hash(net, fl4,
+-					icmp_multipath_hash_skb(skb_in));
++	rt = __ip_route_output_key_hash(net, fl4, skb_in);
+ 	if (IS_ERR(rt))
+ 		return rt;
+ 
+* Unmerged path net/ipv4/route.c
+* Unmerged path net/ipv4/sysctl_net_ipv4.c
