@@ -1,0 +1,159 @@
+dm raid: avoid passing array_in_sync variable to raid_status() callees
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Heinz Mauelshagen <heinzm@redhat.com>
+commit 242ea5ad11a03f2fbdfc2fe422d8e1b0601a8073
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/242ea5ad.failed
+
+The raid_status() function passes the bool array_in_sync variable around
+providing synchronization state of the MD array.  Replace it with a
+runtime flag.  This will avoid a pattern of having to pass discrete
+variables to various functions.
+
+	Signed-off-by: Heinz Mauelshagen <heinzm@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 242ea5ad11a03f2fbdfc2fe422d8e1b0601a8073)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-raid.c
+diff --cc drivers/md/dm-raid.c
+index a5a315efdf86,5730b32034aa..000000000000
+--- a/drivers/md/dm-raid.c
++++ b/drivers/md/dm-raid.c
+@@@ -3261,34 -3332,35 +3262,55 @@@ static const char *decipher_sync_action
+   * Status characters:
+   *
+   *  'D' = Dead/Failed raid set component or raid4/5/6 journal device
+ - *  'a' = Alive but not in-sync raid set component _or_ alive raid4/5/6 'write_back' journal device
+ - *  'A' = Alive and in-sync raid set component _or_ alive raid4/5/6 'write_through' journal device
+ + *  'a' = Alive but not in-sync
+ + *  'A' = Alive and in-sync raid set component or alive raid4/5/6 journal device
+   *  '-' = Non-existing device (i.e. uspace passed '- -' into the ctr)
+   */
+++<<<<<<< HEAD
+ +static const char *__raid_dev_status(struct md_rdev *rdev, bool array_in_sync)
+++=======
++ static const char *__raid_dev_status(struct raid_set *rs, struct md_rdev *rdev)
+++>>>>>>> 242ea5ad11a0 (dm raid: avoid passing array_in_sync variable to raid_status() callees)
+  {
+  	if (!rdev->bdev)
+  		return "-";
+  	else if (test_bit(Faulty, &rdev->flags))
+  		return "D";
+  	else if (test_bit(Journal, &rdev->flags))
+++<<<<<<< HEAD
+ +		return "A";
+ +	else if (!array_in_sync || !test_bit(In_sync, &rdev->flags))
+++=======
++ 		return (rs->journal_dev.mode == R5C_JOURNAL_MODE_WRITE_THROUGH) ? "A" : "a";
++ 	else if (!test_bit(RT_FLAG_RS_IN_SYNC, &rs->runtime_flags) &&
++ 		 !test_bit(In_sync, &rdev->flags))
+++>>>>>>> 242ea5ad11a0 (dm raid: avoid passing array_in_sync variable to raid_status() callees)
+  		return "a";
+  	else
+  		return "A";
+  }
+  
+++<<<<<<< HEAD
+ +/* Helper to return resync/reshape progress for @rs and @array_in_sync */
+ +static sector_t rs_get_progress(struct raid_set *rs,
+ +				sector_t resync_max_sectors, bool *array_in_sync)
+++=======
++ /* Helper to return resync/reshape progress for @rs and runtime flags for raid set in sync / resynching */
++ static sector_t rs_get_progress(struct raid_set *rs, unsigned long recovery,
++ 				sector_t resync_max_sectors)
+++>>>>>>> 242ea5ad11a0 (dm raid: avoid passing array_in_sync variable to raid_status() callees)
+  {
+ -	sector_t r, curr_resync_completed;
+ +	sector_t r, recovery_cp, curr_resync_completed;
+  	struct mddev *mddev = &rs->md;
+  
++ 	clear_bit(RT_FLAG_RS_IN_SYNC, &rs->runtime_flags);
++ 
+  	curr_resync_completed = mddev->curr_resync_completed ?: mddev->recovery_cp;
+++<<<<<<< HEAD
+ +	recovery_cp = mddev->recovery_cp;
+ +	*array_in_sync = false;
+++=======
+++>>>>>>> 242ea5ad11a0 (dm raid: avoid passing array_in_sync variable to raid_status() callees)
+  
+  	if (rs_is_raid0(rs)) {
+  		r = resync_max_sectors;
+@@@ -3298,10 -3370,10 +3320,10 @@@
+  		r = mddev->reshape_position;
+  
+  		/* Reshape is relative to the array size */
+ -		if (test_bit(MD_RECOVERY_RESHAPE, &recovery) ||
+ +		if (test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery) ||
+  		    r != MaxSector) {
+  			if (r == MaxSector) {
+- 				*array_in_sync = true;
++ 				set_bit(RT_FLAG_RS_IN_SYNC, &rs->runtime_flags);
+  				r = resync_max_sectors;
+  			} else {
+  				/* Got to reverse on backward reshape */
+@@@ -3322,9 -3396,9 +3344,9 @@@
+  			/*
+  			 * Sync complete.
+  			 */
+- 			*array_in_sync = true;
++ 			set_bit(RT_FLAG_RS_IN_SYNC, &rs->runtime_flags);
+  			r = resync_max_sectors;
+ -		} else if (test_bit(MD_RECOVERY_REQUESTED, &recovery)) {
+ +		} else if (test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery)) {
+  			/*
+  			 * If "check" or "repair" is occurring, the raid set has
+  			 * undergone an initial sync and the health characters
+@@@ -3366,7 -3440,7 +3388,11 @@@ static void raid_status(struct dm_targe
+  	struct mddev *mddev = &rs->md;
+  	struct r5conf *conf = mddev->private;
+  	int i, max_nr_stripes = conf ? conf->max_nr_stripes : 0;
+++<<<<<<< HEAD
+ +	bool array_in_sync;
+++=======
++ 	unsigned long recovery;
+++>>>>>>> 242ea5ad11a0 (dm raid: avoid passing array_in_sync variable to raid_status() callees)
+  	unsigned int raid_param_cnt = 1; /* at least 1 for chunksize */
+  	unsigned int sz = 0;
+  	unsigned int rebuild_disks;
+@@@ -3389,14 -3463,15 +3415,22 @@@
+  		/* Get sensible max sectors even if raid set not yet started */
+  		resync_max_sectors = test_bit(RT_FLAG_RS_PRERESUMED, &rs->runtime_flags) ?
+  				      mddev->resync_max_sectors : mddev->dev_sectors;
+++<<<<<<< HEAD
+ +		progress = rs_get_progress(rs, resync_max_sectors, &array_in_sync);
+++=======
++ 		progress = rs_get_progress(rs, recovery, resync_max_sectors);
+++>>>>>>> 242ea5ad11a0 (dm raid: avoid passing array_in_sync variable to raid_status() callees)
+  		resync_mismatches = (mddev->last_sync_action && !strcasecmp(mddev->last_sync_action, "check")) ?
+  				    atomic64_read(&mddev->resync_mismatches) : 0;
+ -		sync_action = decipher_sync_action(&rs->md, recovery);
+ +		sync_action = decipher_sync_action(&rs->md);
+  
+  		/* HM FIXME: do we want another state char for raid0? It shows 'D'/'A'/'-' now */
+  		for (i = 0; i < rs->raid_disks; i++)
+++<<<<<<< HEAD
+ +			DMEMIT(__raid_dev_status(&rs->dev[i].rdev, array_in_sync));
+++=======
++ 			DMEMIT(__raid_dev_status(rs, &rs->dev[i].rdev));
+++>>>>>>> 242ea5ad11a0 (dm raid: avoid passing array_in_sync variable to raid_status() callees)
+  
+  		/*
+  		 * In-sync/Reshape ratio:
+@@@ -3447,7 -3522,7 +3481,11 @@@
+  		 * v1.10.0+:
+  		 */
+  		DMEMIT(" %s", test_bit(__CTR_FLAG_JOURNAL_DEV, &rs->ctr_flags) ?
+++<<<<<<< HEAD
+ +			      __raid_dev_status(&rs->journal_dev.rdev, 0) : "-");
+++=======
++ 			      __raid_dev_status(rs, &rs->journal_dev.rdev) : "-");
+++>>>>>>> 242ea5ad11a0 (dm raid: avoid passing array_in_sync variable to raid_status() callees)
+  		break;
+  
+  	case STATUSTYPE_TABLE:
+* Unmerged path drivers/md/dm-raid.c
