@@ -1,0 +1,181 @@
+ALSA: usb-audio: Allow non-vmalloc buffer for PCM buffers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Takashi Iwai <tiwai@suse.de>
+commit f274baa49be67dd8a9f318cd95da6ef9f565d06b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/f274baa4.failed
+
+Currently, USB-audio driver allocates the PCM buffer via vmalloc(), as
+this serves merely as an intermediate buffer that is copied to each
+URB transfer buffer.  This works well in general on x86, but on some
+archs this may result in cache coherency issues when mmap is used.
+OTOH, it works also on such arch unless mmap is used.
+
+This patch is a step for mitigating the inconvenience; a new module
+option "use_vmalloc" is provided so that user can choose to allocate
+the DMA coherent buffer instead of the existing vmalloc buffer.
+The drawback is that it'd be the standard dma_alloc_coherent() calls
+and the system would require contiguous pages on non-x86 archs.
+
+Note that it's a global option and not dynamically switchable since
+the buffer is pre-allocated at the probe time.  In theory, it's
+possible to be switchable, but it'd be trickier and racier.
+
+As default use_vmalloc option is set to true, so that the old behavior
+is kept.  For allowing the coherent mmap on ARM or MIPS, pass
+use_vmalloc=0 option explicitly.
+
+Reported-and-tested-by: Daniel Danzberger <daniel@dd-wrt.com>
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit f274baa49be67dd8a9f318cd95da6ef9f565d06b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/sound/alsa-configuration.rst
+* Unmerged path Documentation/sound/alsa-configuration.rst
+* Unmerged path Documentation/sound/alsa-configuration.rst
+diff --git a/sound/usb/card.c b/sound/usb/card.c
+index c80224807e8f..a1ed798a1c6b 100644
+--- a/sound/usb/card.c
++++ b/sound/usb/card.c
+@@ -86,6 +86,8 @@ static bool ignore_ctl_error;
+ static bool autoclock = true;
+ static char *quirk_alias[SNDRV_CARDS];
+ 
++bool snd_usb_use_vmalloc = true;
++
+ module_param_array(index, int, NULL, 0444);
+ MODULE_PARM_DESC(index, "Index value for the USB audio adapter.");
+ module_param_array(id, charp, NULL, 0444);
+@@ -105,6 +107,8 @@ module_param(autoclock, bool, 0444);
+ MODULE_PARM_DESC(autoclock, "Enable auto-clock selection for UAC2 devices (default: yes).");
+ module_param_array(quirk_alias, charp, NULL, 0444);
+ MODULE_PARM_DESC(quirk_alias, "Quirk aliases, e.g. 0123abcd:5678beef.");
++module_param_named(use_vmalloc, snd_usb_use_vmalloc, bool, 0444);
++MODULE_PARM_DESC(use_vmalloc, "Use vmalloc for PCM intermediate buffers (default: yes).");
+ 
+ /*
+  * we keep the snd_usb_audio_t instances by ourselves for merging
+diff --git a/sound/usb/pcm.c b/sound/usb/pcm.c
+index 4155db8703a2..2f1606be712e 100644
+--- a/sound/usb/pcm.c
++++ b/sound/usb/pcm.c
+@@ -729,7 +729,11 @@ static int snd_usb_hw_params(struct snd_pcm_substream *substream,
+ 	struct audioformat *fmt;
+ 	int ret;
+ 
+-	ret = snd_pcm_lib_alloc_vmalloc_buffer(substream,
++	if (snd_usb_use_vmalloc)
++		ret = snd_pcm_lib_alloc_vmalloc_buffer(substream,
++						       params_buffer_bytes(hw_params));
++	else
++		ret = snd_pcm_lib_malloc_pages(substream,
+ 					       params_buffer_bytes(hw_params));
+ 	if (ret < 0)
+ 		return ret;
+@@ -782,7 +786,11 @@ static int snd_usb_hw_free(struct snd_pcm_substream *substream)
+ 		snd_usb_endpoint_deactivate(subs->data_endpoint);
+ 		snd_usb_unlock_shutdown(subs->stream->chip);
+ 	}
+-	return snd_pcm_lib_free_vmalloc_buffer(substream);
++
++	if (snd_usb_use_vmalloc)
++		return snd_pcm_lib_free_vmalloc_buffer(substream);
++	else
++		return snd_pcm_lib_free_pages(substream);
+ }
+ 
+ /*
+@@ -1719,9 +1727,50 @@ static const struct snd_pcm_ops snd_usb_capture_ops = {
+ 	.mmap =		snd_pcm_lib_mmap_vmalloc,
+ };
+ 
++static const struct snd_pcm_ops snd_usb_playback_dev_ops = {
++	.open =		snd_usb_pcm_open,
++	.close =	snd_usb_pcm_close,
++	.ioctl =	snd_pcm_lib_ioctl,
++	.hw_params =	snd_usb_hw_params,
++	.hw_free =	snd_usb_hw_free,
++	.prepare =	snd_usb_pcm_prepare,
++	.trigger =	snd_usb_substream_playback_trigger,
++	.pointer =	snd_usb_pcm_pointer,
++	.page =		snd_pcm_sgbuf_ops_page,
++};
++
++static const struct snd_pcm_ops snd_usb_capture_dev_ops = {
++	.open =		snd_usb_pcm_open,
++	.close =	snd_usb_pcm_close,
++	.ioctl =	snd_pcm_lib_ioctl,
++	.hw_params =	snd_usb_hw_params,
++	.hw_free =	snd_usb_hw_free,
++	.prepare =	snd_usb_pcm_prepare,
++	.trigger =	snd_usb_substream_capture_trigger,
++	.pointer =	snd_usb_pcm_pointer,
++	.page =		snd_pcm_sgbuf_ops_page,
++};
++
+ void snd_usb_set_pcm_ops(struct snd_pcm *pcm, int stream)
+ {
+-	snd_pcm_set_ops(pcm, stream,
+-			stream == SNDRV_PCM_STREAM_PLAYBACK ?
+-			&snd_usb_playback_ops : &snd_usb_capture_ops);
++	const struct snd_pcm_ops *ops;
++
++	if (snd_usb_use_vmalloc)
++		ops = stream == SNDRV_PCM_STREAM_PLAYBACK ?
++			&snd_usb_playback_ops : &snd_usb_capture_ops;
++	else
++		ops = stream == SNDRV_PCM_STREAM_PLAYBACK ?
++			&snd_usb_playback_dev_ops : &snd_usb_capture_dev_ops;
++	snd_pcm_set_ops(pcm, stream, ops);
++}
++
++void snd_usb_preallocate_buffer(struct snd_usb_substream *subs)
++{
++	struct snd_pcm *pcm = subs->stream->pcm;
++	struct snd_pcm_substream *s = pcm->streams[subs->direction].substream;
++	struct device *dev = subs->dev->bus->controller;
++
++	if (!snd_usb_use_vmalloc)
++		snd_pcm_lib_preallocate_pages(s, SNDRV_DMA_TYPE_DEV_SG,
++					      dev, 64*1024, 512*1024);
+ }
+diff --git a/sound/usb/pcm.h b/sound/usb/pcm.h
+index 35740d5ef268..f77ec58bf1a1 100644
+--- a/sound/usb/pcm.h
++++ b/sound/usb/pcm.h
+@@ -10,6 +10,7 @@ void snd_usb_set_pcm_ops(struct snd_pcm *pcm, int stream);
+ int snd_usb_init_pitch(struct snd_usb_audio *chip, int iface,
+ 		       struct usb_host_interface *alts,
+ 		       struct audioformat *fmt);
++void snd_usb_preallocate_buffer(struct snd_usb_substream *subs);
+ 
+ 
+ #endif /* __USBAUDIO_PCM_H */
+diff --git a/sound/usb/stream.c b/sound/usb/stream.c
+index de8bbb304199..b680cb1f273a 100644
+--- a/sound/usb/stream.c
++++ b/sound/usb/stream.c
+@@ -106,6 +106,8 @@ static void snd_usb_init_substream(struct snd_usb_stream *as,
+ 	subs->ep_num = fp->endpoint;
+ 	if (fp->channels > subs->channels_max)
+ 		subs->channels_max = fp->channels;
++
++	snd_usb_preallocate_buffer(subs);
+ }
+ 
+ /* kctl callbacks for usb-audio channel maps */
+diff --git a/sound/usb/usbaudio.h b/sound/usb/usbaudio.h
+index 7b28cbde22c0..b9faeca645fd 100644
+--- a/sound/usb/usbaudio.h
++++ b/sound/usb/usbaudio.h
+@@ -127,4 +127,6 @@ struct snd_usb_audio_quirk {
+ int snd_usb_lock_shutdown(struct snd_usb_audio *chip);
+ void snd_usb_unlock_shutdown(struct snd_usb_audio *chip);
+ 
++extern bool snd_usb_use_vmalloc;
++
+ #endif /* __USBAUDIO_H */
