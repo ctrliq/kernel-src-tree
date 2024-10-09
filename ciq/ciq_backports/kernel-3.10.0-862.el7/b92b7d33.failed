@@ -1,0 +1,164 @@
+netvsc: don't access netdev->num_rx_queues directly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Arnd Bergmann <arnd@arndb.de>
+commit b92b7d3312033a08cae2c879b9243c42ad7de94b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b92b7d33.failed
+
+This structure member is hidden behind CONFIG_SYSFS, and we
+get a build error when that is disabled:
+
+drivers/net/hyperv/netvsc_drv.c: In function 'netvsc_set_channels':
+drivers/net/hyperv/netvsc_drv.c:754:49: error: 'struct net_device' has no member named 'num_rx_queues'; did you mean 'num_tx_queues'?
+drivers/net/hyperv/netvsc_drv.c: In function 'netvsc_set_rxfh':
+drivers/net/hyperv/netvsc_drv.c:1181:25: error: 'struct net_device' has no member named 'num_rx_queues'; did you mean 'num_tx_queues'?
+
+As the value is only set once to the argument of alloc_netdev_mq(),
+we can compare against that constant directly.
+
+Fixes: ff4a44199012 ("netvsc: allow get/set of RSS indirection table")
+Fixes: 2b01888d1b45 ("netvsc: allow more flexible setting of number of channels")
+	Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+	Reviewed-by: Haiyang Zhang <haiyangz@microsoft.com>
+	Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b92b7d3312033a08cae2c879b9243c42ad7de94b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/netvsc_drv.c
+diff --cc drivers/net/hyperv/netvsc_drv.c
+index 3c74e15d0280,643c539a08ba..000000000000
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@@ -717,84 -766,46 +717,96 @@@ static int netvsc_set_channels(struct n
+  {
+  	struct net_device_context *net_device_ctx = netdev_priv(net);
+  	struct hv_device *dev = net_device_ctx->device_ctx;
+ -	struct netvsc_device *nvdev = rtnl_dereference(net_device_ctx->nvdev);
+ -	unsigned int count = channels->combined_count;
+ -	bool was_running;
+ -	int ret;
+ +	struct netvsc_device *nvdev = net_device_ctx->nvdev;
+ +	struct netvsc_device_info device_info;
+ +	u32 num_chn;
+ +	u32 max_chn;
+ +	int ret = 0;
+ +	bool recovering = false;
+  
+++<<<<<<< HEAD
+ +	if (net_device_ctx->start_remove || !nvdev || nvdev->destroy)
+++=======
++ 	/* We do not support separate count for rx, tx, or other */
++ 	if (count == 0 ||
++ 	    channels->rx_count || channels->tx_count || channels->other_count)
++ 		return -EINVAL;
++ 
++ 	if (count > net->num_tx_queues || count > VRSS_CHANNEL_MAX)
++ 		return -EINVAL;
++ 
++ 	if (!nvdev || nvdev->destroy)
+++>>>>>>> b92b7d331203 (netvsc: don't access netdev->num_rx_queues directly)
+  		return -ENODEV;
+  
+ -	if (nvdev->nvsp_version < NVSP_PROTOCOL_VERSION_5)
+ +	num_chn = nvdev->num_chn;
+ +	max_chn = min_t(u32, nvdev->max_chn, num_online_cpus());
+ +
+ +	if (nvdev->nvsp_version < NVSP_PROTOCOL_VERSION_5) {
+ +		pr_info("vRSS unsupported before NVSP Version 5\n");
+  		return -EINVAL;
+ +	}
+  
+ -	if (count > nvdev->max_chn)
+ +	/* We do not support rx, tx, or other */
+ +	if (!channels ||
+ +	    channels->rx_count ||
+ +	    channels->tx_count ||
+ +	    channels->other_count ||
+ +	    (channels->combined_count < 1))
+  		return -EINVAL;
+  
+ -	was_running = netif_running(net);
+ -	if (was_running) {
+ -		ret = netvsc_close(net);
+ -		if (ret)
+ +	if (channels->combined_count > max_chn) {
+ +		pr_info("combined channels too high, using %d\n", max_chn);
+ +		channels->combined_count = max_chn;
+ +	}
+ +
+ +	ret = netvsc_close(net);
+ +	if (ret)
+ +		goto out;
+ +
+ + do_set:
+ +	net_device_ctx->start_remove = true;
+ +	rndis_filter_device_remove(dev);
+ +
+ +	nvdev->num_chn = channels->combined_count;
+ +
+ +	memset(&device_info, 0, sizeof(device_info));
+ +	device_info.num_chn = nvdev->num_chn; /* passed to RNDIS */
+ +	device_info.ring_size = ring_size;
+ +	device_info.max_num_vrss_chns = max_num_vrss_chns;
+ +
+ +	ret = rndis_filter_device_add(dev, &device_info);
+ +	if (ret) {
+ +		if (recovering) {
+ +			netdev_err(net, "unable to add netvsc device (ret %d)\n", ret);
+  			return ret;
+ +		}
+ +		goto recover;
+  	}
+  
+ -	rndis_filter_device_remove(dev, nvdev);
+ +	nvdev = net_device_ctx->nvdev;
+  
+ -	ret = netvsc_set_queues(net, dev, count);
+ -	if (ret == 0)
+ -		nvdev->num_chn = count;
+ -	else
+ -		netvsc_set_queues(net, dev, nvdev->num_chn);
+ +	ret = netif_set_real_num_tx_queues(net, nvdev->num_chn);
+ +	if (ret) {
+ +		if (recovering) {
+ +			netdev_err(net, "could not set tx queue count (ret %d)\n", ret);
+ +			return ret;
+ +		}
+ +		goto recover;
+ +	}
+  
+ -	if (was_running)
+ -		ret = netvsc_open(net);
+ +	ret = netif_set_real_num_rx_queues(net, nvdev->num_chn);
+ +	if (ret) {
+ +		if (recovering) {
+ +			netdev_err(net, "could not set rx queue count (ret %d)\n", ret);
+ +			return ret;
+ +		}
+ +		goto recover;
+ +	}
+  
+ + out:
+ +	netvsc_open(net);
+ +	net_device_ctx->start_remove = false;
+  	/* We may have missed link change notifications */
+  	schedule_delayed_work(&net_device_ctx->dwork, 0);
+  
+@@@ -1128,9 -1197,13 +1140,9 @@@ static int netvsc_set_rxfh(struct net_d
+  	if (hfunc != ETH_RSS_HASH_NO_CHANGE && hfunc != ETH_RSS_HASH_TOP)
+  		return -EOPNOTSUPP;
+  
+ -	rndis_dev = ndev->extension;
+  	if (indir) {
+  		for (i = 0; i < ITAB_NUM; i++)
+- 			if (indir[i] >= dev->num_rx_queues)
++ 			if (indir[i] >= VRSS_CHANNEL_MAX)
+  				return -EINVAL;
+  
+  		for (i = 0; i < ITAB_NUM; i++)
+* Unmerged path drivers/net/hyperv/netvsc_drv.c
