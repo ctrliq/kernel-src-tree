@@ -1,0 +1,139 @@
+iio:event: Fix and cleanup locking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [iio] event: Fix and cleanup locking (Tony Camuso) [1559170]
+Rebuild_FUZZ: 93.75%
+commit-author Lars-Peter Clausen <lars@metafoo.de>
+commit b91accafbb1031b80d22ad83576877ff2f8b4774
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b91accaf.failed
+
+The event code currently holds a spinlock with IRQs disabled while calling
+kfifo_to_user(). kfifo_to_user() can generate a page fault though, which means
+we have to be able to sleep, which is not possible if the interrupts are
+disabled. The good thing is that kfifo handles concurrent read and write access
+just fine as long as there is only one reader and one writer, so we do not any
+locking to protect against concurrent access from the read and writer thread. It
+is possible though that userspace is trying to read from the event FIFO from
+multiple concurrent threads, so we need to add locking to protect against this.
+This is done using a mutex. The mutex will only protect the kfifo_to_user()
+call, it will not protect the waitqueue. This means that multiple threads can be
+waiting for new data and once a new event is added to the FIFO all waiting
+threads will be woken up. If one of those threads is unable to read any data
+(because another thread already read all the data) it will go back to sleep. The
+only remaining issue is that now that the clearing of the BUSY flag and the
+emptying of the FIFO does no longer happen in one atomic step it is possible
+that a event is added to the FIFO after it has been emptied and this sample will
+be visible the next time a new event file descriptor is created. To avoid this
+rather move the emptying of the FIFO from iio_event_chrdev_release to
+iio_event_getfd().
+
+	Signed-off-by: Lars-Peter Clausen <lars@metafoo.de>
+	Signed-off-by: Jonathan Cameron <jic23@kernel.org>
+(cherry picked from commit b91accafbb1031b80d22ad83576877ff2f8b4774)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iio/industrialio-event.c
+diff --cc drivers/iio/industrialio-event.c
+index f27d4aeabaf4,ea6e06b9c7d4..000000000000
+--- a/drivers/iio/industrialio-event.c
++++ b/drivers/iio/industrialio-event.c
+@@@ -40,8 -40,18 +40,21 @@@ struct iio_event_interface 
+  	struct list_head	dev_attr_list;
+  	unsigned long		flags;
+  	struct attribute_group	group;
++ 	struct mutex		read_lock;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * iio_push_event() - try to add event to the list for userspace reading
++  * @indio_dev:		IIO device structure
++  * @ev_code:		What event
++  * @timestamp:		When the event occurred
++  *
++  * Note: The caller must make sure that this function is not running
++  * concurrently for the same indio_dev more than once.
++  **/
+++>>>>>>> b91accafbb10 (iio:event: Fix and cleanup locking)
+  int iio_push_event(struct iio_dev *indio_dev, u64 ev_code, s64 timestamp)
+  {
+  	struct iio_event_interface *ev_int = indio_dev->event_interface;
+@@@ -56,11 -64,10 +67,10 @@@
+  		ev.id = ev_code;
+  		ev.timestamp = timestamp;
+  
+ -		copied = kfifo_put(&ev_int->det_events, ev);
+ +		copied = kfifo_put(&ev_int->det_events, &ev);
+  		if (copied != 0)
+- 			wake_up_locked_poll(&ev_int->wait, POLLIN);
++ 			wake_up_poll(&ev_int->wait, POLLIN);
+  	}
+- 	spin_unlock_irqrestore(&ev_int->wait.lock, flags);
+  
+  	return 0;
+  }
+@@@ -132,18 -148,13 +149,10 @@@ static ssize_t iio_event_chrdev_read(st
+  
+  static int iio_event_chrdev_release(struct inode *inode, struct file *filep)
+  {
+ -	struct iio_dev *indio_dev = filep->private_data;
+ -	struct iio_event_interface *ev_int = indio_dev->event_interface;
+ +	struct iio_event_interface *ev_int = filep->private_data;
+  
+- 	spin_lock_irq(&ev_int->wait.lock);
+- 	__clear_bit(IIO_BUSY_BIT_POS, &ev_int->flags);
+- 	/*
+- 	 * In order to maintain a clean state for reopening,
+- 	 * clear out any awaiting events. The mask will prevent
+- 	 * any new __iio_push_event calls running.
+- 	 */
+- 	kfifo_reset_out(&ev_int->det_events);
+- 	spin_unlock_irq(&ev_int->wait.lock);
++ 	clear_bit(IIO_BUSY_BIT_POS, &ev_int->flags);
+  
+ -	iio_device_put(indio_dev);
+ -
+  	return 0;
+  }
+  
+@@@ -163,19 -174,20 +172,31 @@@ int iio_event_getfd(struct iio_dev *ind
+  	if (ev_int == NULL)
+  		return -ENODEV;
+  
+- 	spin_lock_irq(&ev_int->wait.lock);
+- 	if (__test_and_set_bit(IIO_BUSY_BIT_POS, &ev_int->flags)) {
+- 		spin_unlock_irq(&ev_int->wait.lock);
++ 	if (test_and_set_bit(IIO_BUSY_BIT_POS, &ev_int->flags))
+  		return -EBUSY;
+++<<<<<<< HEAD
+ +	}
+ +	spin_unlock_irq(&ev_int->wait.lock);
+ +	fd = anon_inode_getfd("iio:event",
+ +				&iio_event_chrdev_fileops, ev_int, O_RDONLY | O_CLOEXEC);
+ +	if (fd < 0) {
+ +		spin_lock_irq(&ev_int->wait.lock);
+ +		__clear_bit(IIO_BUSY_BIT_POS, &ev_int->flags);
+ +		spin_unlock_irq(&ev_int->wait.lock);
+++=======
++ 
++ 	iio_device_get(indio_dev);
++ 
++ 	fd = anon_inode_getfd("iio:event", &iio_event_chrdev_fileops,
++ 				indio_dev, O_RDONLY | O_CLOEXEC);
++ 	if (fd < 0) {
++ 		clear_bit(IIO_BUSY_BIT_POS, &ev_int->flags);
++ 		iio_device_put(indio_dev);
++ 	} else {
++ 		kfifo_reset_out(&ev_int->det_events);
+++>>>>>>> b91accafbb10 (iio:event: Fix and cleanup locking)
+  	}
++ 
+  	return fd;
+  }
+  
+* Unmerged path drivers/iio/industrialio-event.c
