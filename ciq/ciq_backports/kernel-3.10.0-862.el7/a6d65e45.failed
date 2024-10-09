@@ -1,0 +1,170 @@
+drm/i915: Report -EFAULT before pwrite fast path into shmemfs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Chris Wilson <chris@chris-wilson.co.uk>
+commit a6d65e451cc4e7127698384868a4447ee7be7d16
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a6d65e45.failed
+
+When pwriting into shmemfs, the fast path pagecache_write does not
+notice when it is writing to beyond the end of the truncated shmemfs
+inode. Report -EFAULT directly when we try to use pwrite into the
+!I915_MADV_WILLNEED object.
+
+Fixes: 7c55e2c5772d ("drm/i915: Use pagecache write to prepopulate shmemfs from pwrite-ioctl")
+Testcase: igt/gem_madvise/dontneed-before-pwrite
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+	Cc: Matthew Auld <matthew.william.auld@gmail.com>
+	Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+	Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+	Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20171016202732.25459-1-chris@chris-wilson.co.uk
+(cherry picked from commit a6d65e451cc4e7127698384868a4447ee7be7d16)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_gem.c
+diff --cc drivers/gpu/drm/i915/i915_gem.c
+index a2f7d83d21a7,d699ea3ab80b..000000000000
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@@ -2641,35 -2710,110 +2641,116 @@@ err_unlock
+  	goto out_unlock;
+  }
+  
+ -static int
+ -i915_gem_object_pwrite_gtt(struct drm_i915_gem_object *obj,
+ -			   const struct drm_i915_gem_pwrite *arg)
+ +static bool i915_context_is_banned(const struct i915_gem_context *ctx)
+  {
+ -	struct address_space *mapping = obj->base.filp->f_mapping;
+ -	char __user *user_data = u64_to_user_ptr(arg->data_ptr);
+ -	u64 remain, offset;
+ -	unsigned int pg;
+ -
+ -	/* Before we instantiate/pin the backing store for our use, we
+ -	 * can prepopulate the shmemfs filp efficiently using a write into
+ -	 * the pagecache. We avoid the penalty of instantiating all the
+ -	 * pages, important if the user is just writing to a few and never
+ -	 * uses the object on the GPU, and using a direct write into shmemfs
+ -	 * allows it to avoid the cost of retrieving a page (either swapin
+ -	 * or clearing-before-use) before it is overwritten.
+ -	 */
+ -	if (i915_gem_object_has_pages(obj))
+ -		return -ENODEV;
+ +	unsigned long elapsed;
+  
+ +	if (ctx->hang_stats.banned)
+ +		return true;
+ +
+++<<<<<<< HEAD
+ +	elapsed = get_seconds() - ctx->hang_stats.guilty_ts;
+ +	if (ctx->hang_stats.ban_period_seconds &&
+ +	    elapsed <= ctx->hang_stats.ban_period_seconds) {
+ +		DRM_DEBUG("context hanging too fast, banning!\n");
+ +		return true;
+++=======
++ 	if (obj->mm.madv != I915_MADV_WILLNEED)
++ 		return -EFAULT;
++ 
++ 	/* Before the pages are instantiated the object is treated as being
++ 	 * in the CPU domain. The pages will be clflushed as required before
++ 	 * use, and we can freely write into the pages directly. If userspace
++ 	 * races pwrite with any other operation; corruption will ensue -
++ 	 * that is userspace's prerogative!
++ 	 */
++ 
++ 	remain = arg->size;
++ 	offset = arg->offset;
++ 	pg = offset_in_page(offset);
++ 
++ 	do {
++ 		unsigned int len, unwritten;
++ 		struct page *page;
++ 		void *data, *vaddr;
++ 		int err;
++ 
++ 		len = PAGE_SIZE - pg;
++ 		if (len > remain)
++ 			len = remain;
++ 
++ 		err = pagecache_write_begin(obj->base.filp, mapping,
++ 					    offset, len, 0,
++ 					    &page, &data);
++ 		if (err < 0)
++ 			return err;
++ 
++ 		vaddr = kmap(page);
++ 		unwritten = copy_from_user(vaddr + pg, user_data, len);
++ 		kunmap(page);
++ 
++ 		err = pagecache_write_end(obj->base.filp, mapping,
++ 					  offset, len, len - unwritten,
++ 					  page, data);
++ 		if (err < 0)
++ 			return err;
++ 
++ 		if (unwritten)
++ 			return -EFAULT;
++ 
++ 		remain -= len;
++ 		user_data += len;
++ 		offset += len;
++ 		pg = 0;
++ 	} while (remain);
++ 
++ 	return 0;
++ }
++ 
++ static bool ban_context(const struct i915_gem_context *ctx,
++ 			unsigned int score)
++ {
++ 	return (i915_gem_context_is_bannable(ctx) &&
++ 		score >= CONTEXT_SCORE_BAN_THRESHOLD);
++ }
++ 
++ static void i915_gem_context_mark_guilty(struct i915_gem_context *ctx)
++ {
++ 	unsigned int score;
++ 	bool banned;
++ 
++ 	atomic_inc(&ctx->guilty_count);
++ 
++ 	score = atomic_add_return(CONTEXT_SCORE_GUILTY, &ctx->ban_score);
++ 	banned = ban_context(ctx, score);
++ 	DRM_DEBUG_DRIVER("context %s marked guilty (score %d) banned? %s\n",
++ 			 ctx->name, score, yesno(banned));
++ 	if (!banned)
++ 		return;
++ 
++ 	i915_gem_context_set_banned(ctx);
++ 	if (!IS_ERR_OR_NULL(ctx->file_priv)) {
++ 		atomic_inc(&ctx->file_priv->context_bans);
++ 		DRM_DEBUG_DRIVER("client %s has had %d context banned\n",
++ 				 ctx->name, atomic_read(&ctx->file_priv->context_bans));
+++>>>>>>> a6d65e451cc4 (drm/i915: Report -EFAULT before pwrite fast path into shmemfs)
+  	}
+ +
+ +	return false;
+  }
+  
+ -static void i915_gem_context_mark_innocent(struct i915_gem_context *ctx)
+ +static void i915_set_reset_status(struct i915_gem_context *ctx,
+ +				  const bool guilty)
+  {
+ -	atomic_inc(&ctx->active_count);
+ +	struct i915_ctx_hang_stats *hs = &ctx->hang_stats;
+ +
+ +	if (guilty) {
+ +		hs->banned = i915_context_is_banned(ctx);
+ +		hs->batch_active++;
+ +		hs->guilty_ts = get_seconds();
+ +	} else {
+ +		hs->batch_pending++;
+ +	}
+  }
+  
+  struct drm_i915_gem_request *
+* Unmerged path drivers/gpu/drm/i915/i915_gem.c
