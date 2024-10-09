@@ -1,0 +1,177 @@
+pNFS: return status from nfs4_pnfs_ds_connect
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Weston Andros Adamson <dros@monkey.org>
+commit a33e4b036d4612f62220f37a9fa29d273b6fd0ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/a33e4b03.failed
+
+The nfs4_pnfs_ds_connect path can call rpc_create which can fail or it
+can wait on another context to reach the same failure.
+
+This checks that the rpc_create succeeded and returns the error to the
+caller.
+
+When an error is returned, both the files and flexfiles layouts will return
+NULL from _prepare_ds(). The flexfiles layout will also return the layout
+with the error NFS4ERR_NXIO.
+
+	Signed-off-by: Weston Andros Adamson <dros@primarydata.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit a33e4b036d4612f62220f37a9fa29d273b6fd0ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/filelayout/filelayoutdev.c
+diff --cc fs/nfs/filelayout/filelayoutdev.c
+index 4946ef40ba87,188120626179..000000000000
+--- a/fs/nfs/filelayout/filelayoutdev.c
++++ b/fs/nfs/filelayout/filelayoutdev.c
+@@@ -277,13 -278,17 +278,21 @@@ nfs4_fl_prepare_ds(struct pnfs_layout_s
+  	if (ds->ds_clp)
+  		goto out_test_devid;
+  
+- 	nfs4_pnfs_ds_connect(s, ds, devid, dataserver_timeo,
++ 	status = nfs4_pnfs_ds_connect(s, ds, devid, dataserver_timeo,
+  			     dataserver_retrans, 4,
+++<<<<<<< HEAD
+ +			     s->nfs_client->cl_minorversion,
+ +			     s->nfs_client->cl_rpcclient->cl_auth->au_flavor);
+++=======
++ 			     s->nfs_client->cl_minorversion);
++ 	if (status) {
++ 		ret = NULL;
++ 		goto out;
++ 	}
+++>>>>>>> a33e4b036d46 (pNFS: return status from nfs4_pnfs_ds_connect)
+  
+  out_test_devid:
+ -	if (ret->ds_clp == NULL ||
+ -	    filelayout_test_devid_unavailable(devid))
+ +	if (filelayout_test_devid_unavailable(devid))
+  		ret = NULL;
+  out:
+  	return ret;
+diff --git a/fs/nfs/client.c b/fs/nfs/client.c
+index 9560533d36c6..b078b527e9ab 100644
+--- a/fs/nfs/client.c
++++ b/fs/nfs/client.c
+@@ -325,10 +325,33 @@ static struct nfs_client *nfs_match_client(const struct nfs_client_initdata *dat
+ 	return NULL;
+ }
+ 
+-static bool nfs_client_init_is_complete(const struct nfs_client *clp)
++/*
++ * Return true if @clp is done initializing, false if still working on it.
++ *
++ * Use nfs_client_init_status to check if it was successful.
++ */
++bool nfs_client_init_is_complete(const struct nfs_client *clp)
+ {
+ 	return clp->cl_cons_state <= NFS_CS_READY;
+ }
++EXPORT_SYMBOL_GPL(nfs_client_init_is_complete);
++
++/*
++ * Return 0 if @clp was successfully initialized, -errno otherwise.
++ *
++ * This must be called *after* nfs_client_init_is_complete() returns true,
++ * otherwise it will pop WARN_ON_ONCE and return -EINVAL
++ */
++int nfs_client_init_status(const struct nfs_client *clp)
++{
++	/* called without checking nfs_client_init_is_complete */
++	if (clp->cl_cons_state > NFS_CS_READY) {
++		WARN_ON_ONCE(1);
++		return -EINVAL;
++	}
++	return clp->cl_cons_state;
++}
++EXPORT_SYMBOL_GPL(nfs_client_init_status);
+ 
+ int nfs_wait_client_init_complete(const struct nfs_client *clp)
+ {
+* Unmerged path fs/nfs/filelayout/filelayoutdev.c
+diff --git a/fs/nfs/flexfilelayout/flexfilelayoutdev.c b/fs/nfs/flexfilelayout/flexfilelayoutdev.c
+index 5c7432f2d053..f924382af9d3 100644
+--- a/fs/nfs/flexfilelayout/flexfilelayoutdev.c
++++ b/fs/nfs/flexfilelayout/flexfilelayoutdev.c
+@@ -391,6 +391,7 @@ nfs4_ff_layout_prepare_ds(struct pnfs_layout_segment *lseg, u32 ds_idx,
+ 	struct inode *ino = lseg->pls_layout->plh_inode;
+ 	struct nfs_server *s = NFS_SERVER(ino);
+ 	unsigned int max_payload;
++	int status;
+ 
+ 	if (!ff_layout_mirror_valid(lseg, mirror, true)) {
+ 		pr_err_ratelimited("NFS: %s: No data server for offset index %d\n",
+@@ -411,7 +412,7 @@ nfs4_ff_layout_prepare_ds(struct pnfs_layout_segment *lseg, u32 ds_idx,
+ 	/* FIXME: For now we assume the server sent only one version of NFS
+ 	 * to use for the DS.
+ 	 */
+-	nfs4_pnfs_ds_connect(s, ds, devid, dataserver_timeo,
++	status = nfs4_pnfs_ds_connect(s, ds, devid, dataserver_timeo,
+ 			     dataserver_retrans,
+ 			     mirror->mirror_ds->ds_versions[0].version,
+ 			     mirror->mirror_ds->ds_versions[0].minor_version,
+diff --git a/fs/nfs/internal.h b/fs/nfs/internal.h
+index b446709f1269..c427ea472a79 100644
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@ -187,6 +187,8 @@ extern struct nfs_server *nfs_clone_server(struct nfs_server *,
+ 					   struct nfs_fh *,
+ 					   struct nfs_fattr *,
+ 					   rpc_authflavor_t);
++extern bool nfs_client_init_is_complete(const struct nfs_client *clp);
++extern int nfs_client_init_status(const struct nfs_client *clp);
+ extern int nfs_wait_client_init_complete(const struct nfs_client *clp);
+ extern void nfs_mark_client_ready(struct nfs_client *clp, int state);
+ extern struct nfs_client *nfs4_set_ds_client(struct nfs_server *mds_srv,
+diff --git a/fs/nfs/pnfs.h b/fs/nfs/pnfs.h
+index 6a045d2d2293..0c07698cacba 100644
+--- a/fs/nfs/pnfs.h
++++ b/fs/nfs/pnfs.h
+@@ -358,7 +358,7 @@ void nfs4_pnfs_ds_put(struct nfs4_pnfs_ds *ds);
+ struct nfs4_pnfs_ds *nfs4_pnfs_ds_add(struct list_head *dsaddrs,
+ 				      gfp_t gfp_flags);
+ void nfs4_pnfs_v3_ds_connect_unload(void);
+-void nfs4_pnfs_ds_connect(struct nfs_server *mds_srv, struct nfs4_pnfs_ds *ds,
++int nfs4_pnfs_ds_connect(struct nfs_server *mds_srv, struct nfs4_pnfs_ds *ds,
+ 			  struct nfs4_deviceid_node *devid, unsigned int timeo,
+ 			  unsigned int retrans, u32 version, u32 minor_version,
+ 			  rpc_authflavor_t au_flavor);
+diff --git a/fs/nfs/pnfs_nfs.c b/fs/nfs/pnfs_nfs.c
+index ec4f898615ec..0b1f78d6c1a5 100644
+--- a/fs/nfs/pnfs_nfs.c
++++ b/fs/nfs/pnfs_nfs.c
+@@ -754,9 +754,9 @@ out:
+ /*
+  * Create an rpc connection to the nfs4_pnfs_ds data server.
+  * Currently only supports IPv4 and IPv6 addresses.
+- * If connection fails, make devid unavailable.
++ * If connection fails, make devid unavailable and return a -errno.
+  */
+-void nfs4_pnfs_ds_connect(struct nfs_server *mds_srv, struct nfs4_pnfs_ds *ds,
++int nfs4_pnfs_ds_connect(struct nfs_server *mds_srv, struct nfs4_pnfs_ds *ds,
+ 			  struct nfs4_deviceid_node *devid, unsigned int timeo,
+ 			  unsigned int retrans, u32 version,
+ 			  u32 minor_version, rpc_authflavor_t au_flavor)
+@@ -783,6 +783,17 @@ void nfs4_pnfs_ds_connect(struct nfs_server *mds_srv, struct nfs4_pnfs_ds *ds,
+ 	} else {
+ 		nfs4_wait_ds_connect(ds);
+ 	}
++
++	/*
++	 * At this point the ds->ds_clp should be ready, but it might have
++	 * hit an error.
++	 */
++	if (!ds->ds_clp || !nfs_client_init_is_complete(ds->ds_clp)) {
++		WARN_ON_ONCE(1);
++		return -EINVAL;
++	}
++
++	return nfs_client_init_status(ds->ds_clp);
+ }
+ EXPORT_SYMBOL_GPL(nfs4_pnfs_ds_connect);
+ 
