@@ -1,0 +1,695 @@
+mlxsw: spectrum_router: Support GRE tunnels
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Petr Machata <petrm@mellanox.com>
+commit ee954d1a91b2bb71defb17697f0a2263f46235d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ee954d1a.failed
+
+This patch introduces callbacks and tunnel type to offload GRE tunnels.
+
+	Signed-off-by: Petr Machata <petrm@mellanox.com>
+	Reviewed-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ee954d1a91b2bb71defb17697f0a2263f46235d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
+#	net/tipc/node_subscr.h
+#	net/tipc/ref.h
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+index 2055c8543e7b,f0fb898533fb..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+@@@ -587,7 -908,375 +587,379 @@@ static void mlxsw_sp_vrs_fini(struct ml
+  	 */
+  	mlxsw_core_flush_owq();
+  	mlxsw_sp_router_fib_flush(mlxsw_sp);
+++<<<<<<< HEAD
+ +	kfree(mlxsw_sp->router.vrs);
+++=======
++ 	kfree(mlxsw_sp->router->vrs);
++ }
++ 
++ static struct net_device *
++ __mlxsw_sp_ipip_netdev_ul_dev_get(const struct net_device *ol_dev)
++ {
++ 	struct ip_tunnel *tun = netdev_priv(ol_dev);
++ 	struct net *net = dev_net(ol_dev);
++ 
++ 	return __dev_get_by_index(net, tun->parms.link);
++ }
++ 
++ static u32 mlxsw_sp_ipip_dev_ul_tb_id(const struct net_device *ol_dev)
++ {
++ 	struct net_device *d = __mlxsw_sp_ipip_netdev_ul_dev_get(ol_dev);
++ 
++ 	if (d)
++ 		return l3mdev_fib_table(d) ? : RT_TABLE_MAIN;
++ 	else
++ 		return l3mdev_fib_table(ol_dev) ? : RT_TABLE_MAIN;
++ }
++ 
++ static struct mlxsw_sp_rif *
++ mlxsw_sp_rif_create(struct mlxsw_sp *mlxsw_sp,
++ 		    const struct mlxsw_sp_rif_params *params);
++ 
++ static struct mlxsw_sp_rif_ipip_lb *
++ mlxsw_sp_ipip_ol_ipip_lb_create(struct mlxsw_sp *mlxsw_sp,
++ 				enum mlxsw_sp_ipip_type ipipt,
++ 				struct net_device *ol_dev)
++ {
++ 	struct mlxsw_sp_rif_params_ipip_lb lb_params;
++ 	const struct mlxsw_sp_ipip_ops *ipip_ops;
++ 	struct mlxsw_sp_rif *rif;
++ 
++ 	ipip_ops = mlxsw_sp->router->ipip_ops_arr[ipipt];
++ 	lb_params = (struct mlxsw_sp_rif_params_ipip_lb) {
++ 		.common.dev = ol_dev,
++ 		.common.lag = false,
++ 		.lb_config = ipip_ops->ol_loopback_config(mlxsw_sp, ol_dev),
++ 	};
++ 
++ 	rif = mlxsw_sp_rif_create(mlxsw_sp, &lb_params.common);
++ 	if (IS_ERR(rif))
++ 		return ERR_CAST(rif);
++ 	return container_of(rif, struct mlxsw_sp_rif_ipip_lb, common);
++ }
++ 
++ static struct mlxsw_sp_ipip_entry *
++ mlxsw_sp_ipip_entry_alloc(struct mlxsw_sp *mlxsw_sp,
++ 			  enum mlxsw_sp_ipip_type ipipt,
++ 			  struct net_device *ol_dev)
++ {
++ 	struct mlxsw_sp_ipip_entry *ipip_entry;
++ 	struct mlxsw_sp_ipip_entry *ret = NULL;
++ 
++ 	ipip_entry = kzalloc(sizeof(*ipip_entry), GFP_KERNEL);
++ 	if (!ipip_entry)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	ipip_entry->ol_lb = mlxsw_sp_ipip_ol_ipip_lb_create(mlxsw_sp, ipipt,
++ 							    ol_dev);
++ 	if (IS_ERR(ipip_entry->ol_lb)) {
++ 		ret = ERR_CAST(ipip_entry->ol_lb);
++ 		goto err_ol_ipip_lb_create;
++ 	}
++ 
++ 	ipip_entry->ipipt = ipipt;
++ 	ipip_entry->ol_dev = ol_dev;
++ 
++ 	return ipip_entry;
++ 
++ err_ol_ipip_lb_create:
++ 	kfree(ipip_entry);
++ 	return ret;
++ }
++ 
++ static void
++ mlxsw_sp_ipip_entry_destroy(struct mlxsw_sp_ipip_entry *ipip_entry)
++ {
++ 	WARN_ON(ipip_entry->ref_count > 0);
++ 	mlxsw_sp_rif_destroy(&ipip_entry->ol_lb->common);
++ 	kfree(ipip_entry);
++ }
++ 
++ static __be32
++ mlxsw_sp_ipip_netdev_saddr4(const struct net_device *ol_dev)
++ {
++ 	struct ip_tunnel *tun = netdev_priv(ol_dev);
++ 
++ 	return tun->parms.iph.saddr;
++ }
++ 
++ union mlxsw_sp_l3addr
++ mlxsw_sp_ipip_netdev_saddr(enum mlxsw_sp_l3proto proto,
++ 			   const struct net_device *ol_dev)
++ {
++ 	switch (proto) {
++ 	case MLXSW_SP_L3_PROTO_IPV4:
++ 		return (union mlxsw_sp_l3addr) {
++ 			.addr4 = mlxsw_sp_ipip_netdev_saddr4(ol_dev),
++ 		};
++ 	case MLXSW_SP_L3_PROTO_IPV6:
++ 		break;
++ 	};
++ 
++ 	WARN_ON(1);
++ 	return (union mlxsw_sp_l3addr) {
++ 		.addr4 = 0,
++ 	};
++ }
++ 
++ __be32 mlxsw_sp_ipip_netdev_daddr4(const struct net_device *ol_dev)
++ {
++ 	struct ip_tunnel *tun = netdev_priv(ol_dev);
++ 
++ 	return tun->parms.iph.daddr;
++ }
++ 
++ union mlxsw_sp_l3addr
++ mlxsw_sp_ipip_netdev_daddr(enum mlxsw_sp_l3proto proto,
++ 			   const struct net_device *ol_dev)
++ {
++ 	switch (proto) {
++ 	case MLXSW_SP_L3_PROTO_IPV4:
++ 		return (union mlxsw_sp_l3addr) {
++ 			.addr4 = mlxsw_sp_ipip_netdev_daddr4(ol_dev),
++ 		};
++ 	case MLXSW_SP_L3_PROTO_IPV6:
++ 		break;
++ 	};
++ 
++ 	WARN_ON(1);
++ 	return (union mlxsw_sp_l3addr) {
++ 		.addr4 = 0,
++ 	};
++ }
++ 
++ static bool mlxsw_sp_l3addr_eq(const union mlxsw_sp_l3addr *addr1,
++ 			       const union mlxsw_sp_l3addr *addr2)
++ {
++ 	return !memcmp(addr1, addr2, sizeof(*addr1));
++ }
++ 
++ static bool
++ mlxsw_sp_ipip_entry_saddr_matches(struct mlxsw_sp *mlxsw_sp,
++ 				  const enum mlxsw_sp_l3proto ul_proto,
++ 				  union mlxsw_sp_l3addr saddr,
++ 				  u32 ul_tb_id,
++ 				  struct mlxsw_sp_ipip_entry *ipip_entry)
++ {
++ 	u32 tun_ul_tb_id = mlxsw_sp_ipip_dev_ul_tb_id(ipip_entry->ol_dev);
++ 	enum mlxsw_sp_ipip_type ipipt = ipip_entry->ipipt;
++ 	union mlxsw_sp_l3addr tun_saddr;
++ 
++ 	if (mlxsw_sp->router->ipip_ops_arr[ipipt]->ul_proto != ul_proto)
++ 		return false;
++ 
++ 	tun_saddr = mlxsw_sp_ipip_netdev_saddr(ul_proto, ipip_entry->ol_dev);
++ 	return tun_ul_tb_id == ul_tb_id &&
++ 	       mlxsw_sp_l3addr_eq(&tun_saddr, &saddr);
++ }
++ 
++ static int
++ mlxsw_sp_fib_entry_decap_init(struct mlxsw_sp *mlxsw_sp,
++ 			      struct mlxsw_sp_fib_entry *fib_entry,
++ 			      struct mlxsw_sp_ipip_entry *ipip_entry)
++ {
++ 	u32 tunnel_index;
++ 	int err;
++ 
++ 	err = mlxsw_sp_kvdl_alloc(mlxsw_sp, 1, &tunnel_index);
++ 	if (err)
++ 		return err;
++ 
++ 	ipip_entry->decap_fib_entry = fib_entry;
++ 	fib_entry->decap.ipip_entry = ipip_entry;
++ 	fib_entry->decap.tunnel_index = tunnel_index;
++ 	return 0;
++ }
++ 
++ static void mlxsw_sp_fib_entry_decap_fini(struct mlxsw_sp *mlxsw_sp,
++ 					  struct mlxsw_sp_fib_entry *fib_entry)
++ {
++ 	/* Unlink this node from the IPIP entry that it's the decap entry of. */
++ 	fib_entry->decap.ipip_entry->decap_fib_entry = NULL;
++ 	fib_entry->decap.ipip_entry = NULL;
++ 	mlxsw_sp_kvdl_free(mlxsw_sp, fib_entry->decap.tunnel_index);
++ }
++ 
++ static struct mlxsw_sp_fib_node *
++ mlxsw_sp_fib_node_lookup(struct mlxsw_sp_fib *fib, const void *addr,
++ 			 size_t addr_len, unsigned char prefix_len);
++ static int mlxsw_sp_fib_entry_update(struct mlxsw_sp *mlxsw_sp,
++ 				     struct mlxsw_sp_fib_entry *fib_entry);
++ 
++ static void
++ mlxsw_sp_ipip_entry_demote_decap(struct mlxsw_sp *mlxsw_sp,
++ 				 struct mlxsw_sp_ipip_entry *ipip_entry)
++ {
++ 	struct mlxsw_sp_fib_entry *fib_entry = ipip_entry->decap_fib_entry;
++ 
++ 	mlxsw_sp_fib_entry_decap_fini(mlxsw_sp, fib_entry);
++ 	fib_entry->type = MLXSW_SP_FIB_ENTRY_TYPE_TRAP;
++ 
++ 	mlxsw_sp_fib_entry_update(mlxsw_sp, fib_entry);
++ }
++ 
++ static void
++ mlxsw_sp_ipip_entry_promote_decap(struct mlxsw_sp *mlxsw_sp,
++ 				  struct mlxsw_sp_ipip_entry *ipip_entry,
++ 				  struct mlxsw_sp_fib_entry *decap_fib_entry)
++ {
++ 	if (mlxsw_sp_fib_entry_decap_init(mlxsw_sp, decap_fib_entry,
++ 					  ipip_entry))
++ 		return;
++ 	decap_fib_entry->type = MLXSW_SP_FIB_ENTRY_TYPE_IPIP_DECAP;
++ 
++ 	if (mlxsw_sp_fib_entry_update(mlxsw_sp, decap_fib_entry))
++ 		mlxsw_sp_ipip_entry_demote_decap(mlxsw_sp, ipip_entry);
++ }
++ 
++ /* Given an IPIP entry, find the corresponding decap route. */
++ static struct mlxsw_sp_fib_entry *
++ mlxsw_sp_ipip_entry_find_decap(struct mlxsw_sp *mlxsw_sp,
++ 			       struct mlxsw_sp_ipip_entry *ipip_entry)
++ {
++ 	static struct mlxsw_sp_fib_node *fib_node;
++ 	const struct mlxsw_sp_ipip_ops *ipip_ops;
++ 	struct mlxsw_sp_fib_entry *fib_entry;
++ 	unsigned char saddr_prefix_len;
++ 	union mlxsw_sp_l3addr saddr;
++ 	struct mlxsw_sp_fib *ul_fib;
++ 	struct mlxsw_sp_vr *ul_vr;
++ 	const void *saddrp;
++ 	size_t saddr_len;
++ 	u32 ul_tb_id;
++ 	u32 saddr4;
++ 
++ 	ipip_ops = mlxsw_sp->router->ipip_ops_arr[ipip_entry->ipipt];
++ 
++ 	ul_tb_id = mlxsw_sp_ipip_dev_ul_tb_id(ipip_entry->ol_dev);
++ 	ul_vr = mlxsw_sp_vr_find(mlxsw_sp, ul_tb_id);
++ 	if (!ul_vr)
++ 		return NULL;
++ 
++ 	ul_fib = mlxsw_sp_vr_fib(ul_vr, ipip_ops->ul_proto);
++ 	saddr = mlxsw_sp_ipip_netdev_saddr(ipip_ops->ul_proto,
++ 					   ipip_entry->ol_dev);
++ 
++ 	switch (ipip_ops->ul_proto) {
++ 	case MLXSW_SP_L3_PROTO_IPV4:
++ 		saddr4 = be32_to_cpu(saddr.addr4);
++ 		saddrp = &saddr4;
++ 		saddr_len = 4;
++ 		saddr_prefix_len = 32;
++ 		break;
++ 	case MLXSW_SP_L3_PROTO_IPV6:
++ 		WARN_ON(1);
++ 		return NULL;
++ 	}
++ 
++ 	fib_node = mlxsw_sp_fib_node_lookup(ul_fib, saddrp, saddr_len,
++ 					    saddr_prefix_len);
++ 	if (!fib_node || list_empty(&fib_node->entry_list))
++ 		return NULL;
++ 
++ 	fib_entry = list_first_entry(&fib_node->entry_list,
++ 				     struct mlxsw_sp_fib_entry, list);
++ 	if (fib_entry->type != MLXSW_SP_FIB_ENTRY_TYPE_TRAP)
++ 		return NULL;
++ 
++ 	return fib_entry;
++ }
++ 
++ static struct mlxsw_sp_ipip_entry *
++ mlxsw_sp_ipip_entry_get(struct mlxsw_sp *mlxsw_sp,
++ 			enum mlxsw_sp_ipip_type ipipt,
++ 			struct net_device *ol_dev)
++ {
++ 	u32 ul_tb_id = mlxsw_sp_ipip_dev_ul_tb_id(ol_dev);
++ 	struct mlxsw_sp_router *router = mlxsw_sp->router;
++ 	struct mlxsw_sp_fib_entry *decap_fib_entry;
++ 	struct mlxsw_sp_ipip_entry *ipip_entry;
++ 	enum mlxsw_sp_l3proto ul_proto;
++ 	union mlxsw_sp_l3addr saddr;
++ 
++ 	list_for_each_entry(ipip_entry, &mlxsw_sp->router->ipip_list,
++ 			    ipip_list_node) {
++ 		if (ipip_entry->ol_dev == ol_dev)
++ 			goto inc_ref_count;
++ 
++ 		/* The configuration where several tunnels have the same local
++ 		 * address in the same underlay table needs special treatment in
++ 		 * the HW. That is currently not implemented in the driver.
++ 		 */
++ 		ul_proto = router->ipip_ops_arr[ipip_entry->ipipt]->ul_proto;
++ 		saddr = mlxsw_sp_ipip_netdev_saddr(ul_proto, ol_dev);
++ 		if (mlxsw_sp_ipip_entry_saddr_matches(mlxsw_sp, ul_proto, saddr,
++ 						      ul_tb_id, ipip_entry))
++ 			return ERR_PTR(-EEXIST);
++ 	}
++ 
++ 	ipip_entry = mlxsw_sp_ipip_entry_alloc(mlxsw_sp, ipipt, ol_dev);
++ 	if (IS_ERR(ipip_entry))
++ 		return ipip_entry;
++ 
++ 	decap_fib_entry = mlxsw_sp_ipip_entry_find_decap(mlxsw_sp, ipip_entry);
++ 	if (decap_fib_entry)
++ 		mlxsw_sp_ipip_entry_promote_decap(mlxsw_sp, ipip_entry,
++ 						  decap_fib_entry);
++ 
++ 	list_add_tail(&ipip_entry->ipip_list_node,
++ 		      &mlxsw_sp->router->ipip_list);
++ 
++ inc_ref_count:
++ 	++ipip_entry->ref_count;
++ 	return ipip_entry;
++ }
++ 
++ static void
++ mlxsw_sp_ipip_entry_put(struct mlxsw_sp *mlxsw_sp,
++ 			struct mlxsw_sp_ipip_entry *ipip_entry)
++ {
++ 	if (--ipip_entry->ref_count == 0) {
++ 		list_del(&ipip_entry->ipip_list_node);
++ 		if (ipip_entry->decap_fib_entry)
++ 			mlxsw_sp_ipip_entry_demote_decap(mlxsw_sp, ipip_entry);
++ 		mlxsw_sp_ipip_entry_destroy(ipip_entry);
++ 	}
++ }
++ 
++ static bool
++ mlxsw_sp_ipip_entry_matches_decap(struct mlxsw_sp *mlxsw_sp,
++ 				  const struct net_device *ul_dev,
++ 				  enum mlxsw_sp_l3proto ul_proto,
++ 				  union mlxsw_sp_l3addr ul_dip,
++ 				  struct mlxsw_sp_ipip_entry *ipip_entry)
++ {
++ 	u32 ul_tb_id = l3mdev_fib_table(ul_dev) ? : RT_TABLE_MAIN;
++ 	enum mlxsw_sp_ipip_type ipipt = ipip_entry->ipipt;
++ 	struct net_device *ipip_ul_dev;
++ 
++ 	if (mlxsw_sp->router->ipip_ops_arr[ipipt]->ul_proto != ul_proto)
++ 		return false;
++ 
++ 	ipip_ul_dev = __mlxsw_sp_ipip_netdev_ul_dev_get(ipip_entry->ol_dev);
++ 	return mlxsw_sp_ipip_entry_saddr_matches(mlxsw_sp, ul_proto, ul_dip,
++ 						 ul_tb_id, ipip_entry) &&
++ 	       (!ipip_ul_dev || ipip_ul_dev == ul_dev);
++ }
++ 
++ /* Given decap parameters, find the corresponding IPIP entry. */
++ static struct mlxsw_sp_ipip_entry *
++ mlxsw_sp_ipip_entry_find_by_decap(struct mlxsw_sp *mlxsw_sp,
++ 				  const struct net_device *ul_dev,
++ 				  enum mlxsw_sp_l3proto ul_proto,
++ 				  union mlxsw_sp_l3addr ul_dip)
++ {
++ 	struct mlxsw_sp_ipip_entry *ipip_entry;
++ 
++ 	list_for_each_entry(ipip_entry, &mlxsw_sp->router->ipip_list,
++ 			    ipip_list_node)
++ 		if (mlxsw_sp_ipip_entry_matches_decap(mlxsw_sp, ul_dev,
++ 						      ul_proto, ul_dip,
++ 						      ipip_entry))
++ 			return ipip_entry;
++ 
++ 	return NULL;
+++>>>>>>> ee954d1a91b2 (mlxsw: spectrum_router: Support GRE tunnels)
+  }
+  
+  struct mlxsw_sp_neigh_key {
+diff --cc net/tipc/node_subscr.h
+index c95d20727ded,1c2db831d83b..000000000000
+--- a/net/tipc/node_subscr.h
++++ b/net/tipc/node_subscr.h
+@@@ -34,30 -32,48 +34,36 @@@
+   * POSSIBILITY OF SUCH DAMAGE.
+   */
+  
+ -#ifndef _MLXSW_IPIP_H_
+ -#define _MLXSW_IPIP_H_
+ +#ifndef _TIPC_NODE_SUBSCR_H
+ +#define _TIPC_NODE_SUBSCR_H
+ +
+ +#include "addr.h"
+  
+ -#include "spectrum_router.h"
+ -#include <net/ip_fib.h>
+++<<<<<<< HEAD:net/tipc/node_subscr.h
+ +typedef void (*net_ev_handler) (void *usr_handle);
+  
+ +/**
+ + * struct tipc_node_subscr - "node down" subscription entry
+ + * @node: ptr to node structure of interest (or NULL, if none)
+ + * @handle_node_down: routine to invoke when node fails
+ + * @usr_handle: argument to pass to routine when node fails
+ + * @nodesub_list: adjacent entries in list of subscriptions for the node
+ + */
+ +struct tipc_node_subscr {
+ +	struct tipc_node *node;
+ +	net_ev_handler handle_node_down;
+ +	void *usr_handle;
+ +	struct list_head nodesub_list;
+++=======
++ enum mlxsw_sp_ipip_type {
++ 	MLXSW_SP_IPIP_TYPE_GRE4,
++ 	MLXSW_SP_IPIP_TYPE_MAX,
+++>>>>>>> ee954d1a91b2 (mlxsw: spectrum_router: Support GRE tunnels):drivers/net/ethernet/mellanox/mlxsw/spectrum_ipip.h
+  };
+  
+ -struct mlxsw_sp_ipip_entry {
+ -	enum mlxsw_sp_ipip_type ipipt;
+ -	struct net_device *ol_dev; /* Overlay. */
+ -	struct mlxsw_sp_rif_ipip_lb *ol_lb;
+ -	unsigned int ref_count; /* Number of next hops using the tunnel. */
+ -	struct mlxsw_sp_fib_entry *decap_fib_entry;
+ -	struct list_head ipip_list_node;
+ -};
+ -
+ -struct mlxsw_sp_ipip_ops {
+ -	int dev_type;
+ -	enum mlxsw_sp_l3proto ul_proto; /* Underlay. */
+ -
+ -	int (*nexthop_update)(struct mlxsw_sp *mlxsw_sp, u32 adj_index,
+ -			      struct mlxsw_sp_ipip_entry *ipip_entry);
+ -
+ -	bool (*can_offload)(const struct mlxsw_sp *mlxsw_sp,
+ -			    const struct net_device *ol_dev,
+ -			    enum mlxsw_sp_l3proto ol_proto);
+ -
+ -	/* Return a configuration for creating an overlay loopback RIF. */
+ -	struct mlxsw_sp_rif_ipip_lb_config
+ -	(*ol_loopback_config)(struct mlxsw_sp *mlxsw_sp,
+ -			      const struct net_device *ol_dev);
+ -
+ -	int (*fib_entry_op)(struct mlxsw_sp *mlxsw_sp,
+ -			    struct mlxsw_sp_ipip_entry *ipip_entry,
+ -			    enum mlxsw_reg_ralue_op op,
+ -			    u32 tunnel_index);
+ -};
+ -
+ -extern const struct mlxsw_sp_ipip_ops *mlxsw_sp_ipip_ops_arr[];
+ +void tipc_nodesub_subscribe(struct tipc_node_subscr *node_sub, u32 addr,
+ +			    void *usr_handle, net_ev_handler handle_down);
+ +void tipc_nodesub_unsubscribe(struct tipc_node_subscr *node_sub);
+ +void tipc_nodesub_notify(struct tipc_node *node);
+  
+ -#endif /* _MLXSW_IPIP_H_*/
+ +#endif
+diff --cc net/tipc/ref.h
+index 5bc8e7ab84de,702fe945227c..000000000000
+--- a/net/tipc/ref.h
++++ b/net/tipc/ref.h
+@@@ -34,16 -32,183 +34,199 @@@
+   * POSSIBILITY OF SUCH DAMAGE.
+   */
+  
+++<<<<<<< HEAD:net/tipc/ref.h
+ +#ifndef _TIPC_REF_H
+ +#define _TIPC_REF_H
+ +
+ +int tipc_ref_table_init(u32 requested_size, u32 start);
+ +void tipc_ref_table_stop(void);
+ +
+ +u32 tipc_ref_acquire(void *object, spinlock_t **lock);
+ +void tipc_ref_discard(u32 ref);
+ +
+ +void *tipc_ref_lock(u32 ref);
+ +void *tipc_ref_deref(u32 ref);
+ +
+ +#endif
+++=======
++ #include <net/ip_tunnels.h>
++ 
++ #include "spectrum_ipip.h"
++ 
++ static bool
++ mlxsw_sp_ipip_netdev_has_ikey(const struct net_device *ol_dev)
++ {
++ 	struct ip_tunnel *tun = netdev_priv(ol_dev);
++ 
++ 	return !!(tun->parms.i_flags & TUNNEL_KEY);
++ }
++ 
++ static bool
++ mlxsw_sp_ipip_netdev_has_okey(const struct net_device *ol_dev)
++ {
++ 	struct ip_tunnel *tun = netdev_priv(ol_dev);
++ 
++ 	return !!(tun->parms.o_flags & TUNNEL_KEY);
++ }
++ 
++ static u32 mlxsw_sp_ipip_netdev_ikey(const struct net_device *ol_dev)
++ {
++ 	struct ip_tunnel *tun = netdev_priv(ol_dev);
++ 
++ 	return mlxsw_sp_ipip_netdev_has_ikey(ol_dev) ?
++ 		be32_to_cpu(tun->parms.i_key) : 0;
++ }
++ 
++ static u32 mlxsw_sp_ipip_netdev_okey(const struct net_device *ol_dev)
++ {
++ 	struct ip_tunnel *tun = netdev_priv(ol_dev);
++ 
++ 	return mlxsw_sp_ipip_netdev_has_okey(ol_dev) ?
++ 		be32_to_cpu(tun->parms.o_key) : 0;
++ }
++ 
++ static int
++ mlxsw_sp_ipip_nexthop_update_gre4(struct mlxsw_sp *mlxsw_sp, u32 adj_index,
++ 				  struct mlxsw_sp_ipip_entry *ipip_entry)
++ {
++ 	u16 rif_index = mlxsw_sp_ipip_lb_rif_index(ipip_entry->ol_lb);
++ 	__be32 daddr4 = mlxsw_sp_ipip_netdev_daddr4(ipip_entry->ol_dev);
++ 	char ratr_pl[MLXSW_REG_RATR_LEN];
++ 
++ 	mlxsw_reg_ratr_pack(ratr_pl, MLXSW_REG_RATR_OP_WRITE_WRITE_ENTRY,
++ 			    true, MLXSW_REG_RATR_TYPE_IPIP,
++ 			    adj_index, rif_index);
++ 	mlxsw_reg_ratr_ipip4_entry_pack(ratr_pl, be32_to_cpu(daddr4));
++ 
++ 	return mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(ratr), ratr_pl);
++ }
++ 
++ static int
++ mlxsw_sp_ipip_fib_entry_op_gre4_rtdp(struct mlxsw_sp *mlxsw_sp,
++ 				     u32 tunnel_index,
++ 				     struct mlxsw_sp_ipip_entry *ipip_entry)
++ {
++ 	bool has_ikey = mlxsw_sp_ipip_netdev_has_ikey(ipip_entry->ol_dev);
++ 	u16 rif_index = mlxsw_sp_ipip_lb_rif_index(ipip_entry->ol_lb);
++ 	u32 ikey = mlxsw_sp_ipip_netdev_ikey(ipip_entry->ol_dev);
++ 	char rtdp_pl[MLXSW_REG_RTDP_LEN];
++ 	unsigned int type_check;
++ 	u32 daddr4;
++ 
++ 	mlxsw_reg_rtdp_pack(rtdp_pl, MLXSW_REG_RTDP_TYPE_IPIP, tunnel_index);
++ 
++ 	type_check = has_ikey ?
++ 		MLXSW_REG_RTDP_IPIP_TYPE_CHECK_ALLOW_GRE_KEY :
++ 		MLXSW_REG_RTDP_IPIP_TYPE_CHECK_ALLOW_GRE;
++ 
++ 	/* Linux demuxes tunnels based on packet SIP (which must match tunnel
++ 	 * remote IP). Thus configure decap so that it filters out packets that
++ 	 * are not IPv4 or have the wrong SIP. IPIP_DECAP_ERROR trap is
++ 	 * generated for packets that fail this criterion. Linux then handles
++ 	 * such packets in slow path and generates ICMP destination unreachable.
++ 	 */
++ 	daddr4 = be32_to_cpu(mlxsw_sp_ipip_netdev_daddr4(ipip_entry->ol_dev));
++ 	mlxsw_reg_rtdp_ipip4_pack(rtdp_pl, rif_index,
++ 				  MLXSW_REG_RTDP_IPIP_SIP_CHECK_FILTER_IPV4,
++ 				  type_check, has_ikey, daddr4, ikey);
++ 
++ 	return mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(rtdp), rtdp_pl);
++ }
++ 
++ static int
++ mlxsw_sp_ipip_fib_entry_op_gre4_ralue(struct mlxsw_sp *mlxsw_sp,
++ 				      u32 dip, u8 prefix_len, u16 ul_vr_id,
++ 				      enum mlxsw_reg_ralue_op op,
++ 				      u32 tunnel_index)
++ {
++ 	char ralue_pl[MLXSW_REG_RALUE_LEN];
++ 
++ 	mlxsw_reg_ralue_pack4(ralue_pl, MLXSW_REG_RALXX_PROTOCOL_IPV4, op,
++ 			      ul_vr_id, prefix_len, dip);
++ 	mlxsw_reg_ralue_act_ip2me_tun_pack(ralue_pl, tunnel_index);
++ 	return mlxsw_reg_write(mlxsw_sp->core, MLXSW_REG(ralue), ralue_pl);
++ }
++ 
++ static int mlxsw_sp_ipip_fib_entry_op_gre4(struct mlxsw_sp *mlxsw_sp,
++ 					struct mlxsw_sp_ipip_entry *ipip_entry,
++ 					enum mlxsw_reg_ralue_op op,
++ 					u32 tunnel_index)
++ {
++ 	u16 ul_vr_id = mlxsw_sp_ipip_lb_ul_vr_id(ipip_entry->ol_lb);
++ 	__be32 dip;
++ 	int err;
++ 
++ 	err = mlxsw_sp_ipip_fib_entry_op_gre4_rtdp(mlxsw_sp, tunnel_index,
++ 						   ipip_entry);
++ 	if (err)
++ 		return err;
++ 
++ 	dip = mlxsw_sp_ipip_netdev_saddr(MLXSW_SP_L3_PROTO_IPV4,
++ 					 ipip_entry->ol_dev).addr4;
++ 	return mlxsw_sp_ipip_fib_entry_op_gre4_ralue(mlxsw_sp, be32_to_cpu(dip),
++ 						     32, ul_vr_id, op,
++ 						     tunnel_index);
++ }
++ 
++ static bool mlxsw_sp_ipip_tunnel_complete(enum mlxsw_sp_l3proto proto,
++ 					  const struct net_device *ol_dev)
++ {
++ 	union mlxsw_sp_l3addr saddr = mlxsw_sp_ipip_netdev_saddr(proto, ol_dev);
++ 	union mlxsw_sp_l3addr daddr = mlxsw_sp_ipip_netdev_daddr(proto, ol_dev);
++ 	union mlxsw_sp_l3addr naddr = {0};
++ 
++ 	/* Tunnels with unset local or remote address are valid in Linux and
++ 	 * used for lightweight tunnels (LWT) and Non-Broadcast Multi-Access
++ 	 * (NBMA) tunnels. In principle these can be offloaded, but the driver
++ 	 * currently doesn't support this. So punt.
++ 	 */
++ 	return memcmp(&saddr, &naddr, sizeof(naddr)) &&
++ 	       memcmp(&daddr, &naddr, sizeof(naddr));
++ }
++ 
++ static bool mlxsw_sp_ipip_can_offload_gre4(const struct mlxsw_sp *mlxsw_sp,
++ 					   const struct net_device *ol_dev,
++ 					   enum mlxsw_sp_l3proto ol_proto)
++ {
++ 	struct ip_tunnel *tunnel = netdev_priv(ol_dev);
++ 	__be16 okflags = TUNNEL_KEY; /* We can't offload any other features. */
++ 	bool inherit_ttl = tunnel->parms.iph.ttl == 0;
++ 	bool inherit_tos = tunnel->parms.iph.tos & 0x1;
++ 
++ 	return (tunnel->parms.i_flags & ~okflags) == 0 &&
++ 	       (tunnel->parms.o_flags & ~okflags) == 0 &&
++ 	       inherit_ttl && inherit_tos &&
++ 	       mlxsw_sp_ipip_tunnel_complete(MLXSW_SP_L3_PROTO_IPV4, ol_dev);
++ }
++ 
++ static struct mlxsw_sp_rif_ipip_lb_config
++ mlxsw_sp_ipip_ol_loopback_config_gre4(struct mlxsw_sp *mlxsw_sp,
++ 				      const struct net_device *ol_dev)
++ {
++ 	enum mlxsw_reg_ritr_loopback_ipip_type lb_ipipt;
++ 
++ 	lb_ipipt = mlxsw_sp_ipip_netdev_has_okey(ol_dev) ?
++ 		MLXSW_REG_RITR_LOOPBACK_IPIP_TYPE_IP_IN_GRE_KEY_IN_IP :
++ 		MLXSW_REG_RITR_LOOPBACK_IPIP_TYPE_IP_IN_GRE_IN_IP;
++ 	return (struct mlxsw_sp_rif_ipip_lb_config){
++ 		.lb_ipipt = lb_ipipt,
++ 		.okey = mlxsw_sp_ipip_netdev_okey(ol_dev),
++ 		.ul_protocol = MLXSW_SP_L3_PROTO_IPV4,
++ 		.saddr = mlxsw_sp_ipip_netdev_saddr(MLXSW_SP_L3_PROTO_IPV4,
++ 						    ol_dev),
++ 	};
++ }
++ 
++ static const struct mlxsw_sp_ipip_ops mlxsw_sp_ipip_gre4_ops = {
++ 	.dev_type = ARPHRD_IPGRE,
++ 	.ul_proto = MLXSW_SP_L3_PROTO_IPV4,
++ 	.nexthop_update = mlxsw_sp_ipip_nexthop_update_gre4,
++ 	.fib_entry_op = mlxsw_sp_ipip_fib_entry_op_gre4,
++ 	.can_offload = mlxsw_sp_ipip_can_offload_gre4,
++ 	.ol_loopback_config = mlxsw_sp_ipip_ol_loopback_config_gre4,
++ };
++ 
++ const struct mlxsw_sp_ipip_ops *mlxsw_sp_ipip_ops_arr[] = {
++ 	[MLXSW_SP_IPIP_TYPE_GRE4] = &mlxsw_sp_ipip_gre4_ops,
++ };
+++>>>>>>> ee954d1a91b2 (mlxsw: spectrum_router: Support GRE tunnels):drivers/net/ethernet/mellanox/mlxsw/spectrum_ipip.c
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_router.h
+* Unmerged path net/tipc/node_subscr.h
+* Unmerged path net/tipc/ref.h
