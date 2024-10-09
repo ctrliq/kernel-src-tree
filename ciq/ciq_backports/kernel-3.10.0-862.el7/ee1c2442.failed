@@ -1,0 +1,186 @@
+genetlink: synchronize socket closing and family removal
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit ee1c244219fd652964710a6cc3e4f922e86aa492
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/ee1c2442.failed
+
+In addition to the problem Jeff Layton reported, I looked at the code
+and reproduced the same warning by subscribing and removing the genl
+family with a socket still open. This is a fairly tricky race which
+originates in the fact that generic netlink allows the family to go
+away while sockets are still open - unlike regular netlink which has
+a module refcount for every open socket so in general this cannot be
+triggered.
+
+Trying to resolve this issue by the obvious locking isn't possible as
+it will result in deadlocks between unregistration and group unbind
+notification (which incidentally lockdep doesn't find due to the home
+grown locking in the netlink table.)
+
+To really resolve this, introduce a "closing socket" reference counter
+(for generic netlink only, as it's the only affected family) in the
+core netlink code and use that in generic netlink to wait for all the
+sockets that are being closed at the same time as a generic netlink
+family is removed.
+
+This fixes the race that when a socket is closed, it will should call
+the unbind, but if the family is removed at the same time the unbind
+will not find it, leading to the warning. The real problem though is
+that in this case the unbind could actually find a new family that is
+registered to have a multicast group with the same ID, and call its
+mcast_unbind() leading to confusing.
+
+Also remove the warning since it would still trigger, but is now no
+longer a problem.
+
+This also moves the code in af_netlink.c to before unreferencing the
+module to avoid having the same problem in the normal non-genl case.
+
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ee1c244219fd652964710a6cc3e4f922e86aa492)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/genetlink.h
+#	net/netlink/af_netlink.c
+#	net/netlink/genetlink.c
+diff --cc include/net/genetlink.h
+index f37e06abcb6d,6c92415311ca..000000000000
+--- a/include/net/genetlink.h
++++ b/include/net/genetlink.h
+@@@ -35,6 -33,12 +35,15 @@@ struct genl_info
+   *	do additional, common, filtering and return an error
+   * @post_doit: called after an operation's doit callback, it may
+   *	undo operations done by pre_doit, for example release locks
+++<<<<<<< HEAD
+++=======
++  * @mcast_bind: a socket bound to the given multicast group (which
++  *	is given as the offset into the groups array)
++  * @mcast_unbind: a socket was unbound from the given multicast group.
++  *	Note that unbind() will not be called symmetrically if the
++  *	generic netlink family is removed while there are still open
++  *	sockets.
+++>>>>>>> ee1c244219fd (genetlink: synchronize socket closing and family removal)
+   * @attrbuf: buffer to store parsed attributes
+   * @family_list: family list
+   * @mcgrps: multicast groups used by this family (private)
+diff --cc net/netlink/af_netlink.c
+index cf3466cd071d,02fdde28dada..000000000000
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@@ -1278,13 -1263,6 +1295,16 @@@ static int netlink_release(struct socke
+  		netlink_table_ungrab();
+  	}
+  
+++<<<<<<< HEAD
+ +	if (nlk->netlink_unbind) {
+ +		int i;
+ +
+ +		for (i = 0; i < nlk->ngroups; i++)
+ +			if (test_bit(i, nlk->groups))
+ +				nlk->netlink_unbind(i + 1);
+ +	}
+++=======
+++>>>>>>> ee1c244219fd (genetlink: synchronize socket closing and family removal)
+  	kfree(nlk->groups);
+  	nlk->groups = NULL;
+  
+diff --cc net/netlink/genetlink.c
+index a93aabe188f7,ee57459fc258..000000000000
+--- a/net/netlink/genetlink.c
++++ b/net/netlink/genetlink.c
+@@@ -989,6 -989,56 +995,59 @@@ static struct genl_multicast_group genl
+  	{ .name = "notify", },
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int genl_bind(struct net *net, int group)
++ {
++ 	int i, err = -ENOENT;
++ 
++ 	down_read(&cb_lock);
++ 	for (i = 0; i < GENL_FAM_TAB_SIZE; i++) {
++ 		struct genl_family *f;
++ 
++ 		list_for_each_entry(f, genl_family_chain(i), family_list) {
++ 			if (group >= f->mcgrp_offset &&
++ 			    group < f->mcgrp_offset + f->n_mcgrps) {
++ 				int fam_grp = group - f->mcgrp_offset;
++ 
++ 				if (!f->netnsok && net != &init_net)
++ 					err = -ENOENT;
++ 				else if (f->mcast_bind)
++ 					err = f->mcast_bind(net, fam_grp);
++ 				else
++ 					err = 0;
++ 				break;
++ 			}
++ 		}
++ 	}
++ 	up_read(&cb_lock);
++ 
++ 	return err;
++ }
++ 
++ static void genl_unbind(struct net *net, int group)
++ {
++ 	int i;
++ 
++ 	down_read(&cb_lock);
++ 	for (i = 0; i < GENL_FAM_TAB_SIZE; i++) {
++ 		struct genl_family *f;
++ 
++ 		list_for_each_entry(f, genl_family_chain(i), family_list) {
++ 			if (group >= f->mcgrp_offset &&
++ 			    group < f->mcgrp_offset + f->n_mcgrps) {
++ 				int fam_grp = group - f->mcgrp_offset;
++ 
++ 				if (f->mcast_unbind)
++ 					f->mcast_unbind(net, fam_grp);
++ 				break;
++ 			}
++ 		}
++ 	}
++ 	up_read(&cb_lock);
++ }
++ 
+++>>>>>>> ee1c244219fd (genetlink: synchronize socket closing and family removal)
+  static int __net_init genl_pernet_init(struct net *net)
+  {
+  	struct netlink_kernel_cfg cfg = {
+diff --git a/include/linux/genetlink.h b/include/linux/genetlink.h
+index 55b685719d52..09460d6d6682 100644
+--- a/include/linux/genetlink.h
++++ b/include/linux/genetlink.h
+@@ -11,6 +11,10 @@ extern void genl_unlock(void);
+ extern int lockdep_genl_is_held(void);
+ #endif
+ 
++/* for synchronisation between af_netlink and genetlink */
++extern atomic_t genl_sk_destructing_cnt;
++extern wait_queue_head_t genl_sk_destructing_waitq;
++
+ /**
+  * rcu_dereference_genl - rcu_dereference with debug checking
+  * @p: The pointer to read, prior to dereferencing
+* Unmerged path include/net/genetlink.h
+* Unmerged path net/netlink/af_netlink.c
+diff --git a/net/netlink/af_netlink.h b/net/netlink/af_netlink.h
+index 113e12c41909..1a78b55f59a2 100644
+--- a/net/netlink/af_netlink.h
++++ b/net/netlink/af_netlink.h
+@@ -2,6 +2,7 @@
+ #define _AF_NETLINK_H
+ 
+ #include <linux/rhashtable.h>
++#include <linux/atomic.h>
+ #include <net/sock.h>
+ 
+ #define NLGRPSZ(x)	(ALIGN(x, sizeof(unsigned long) * 8) / 8)
+* Unmerged path net/netlink/genetlink.c
