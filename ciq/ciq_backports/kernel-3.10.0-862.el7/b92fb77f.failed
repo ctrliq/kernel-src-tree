@@ -1,0 +1,163 @@
+nfp: prepare metadata handling for xdp_adjust_head()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit b92fb77f27af90d3ee785eedc326f80cb6190597
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b92fb77f.failed
+
+XDP may require us to move metadata to make room for pushing
+headers.  Track meta data location with a pointer and pass
+it explicitly to functions.
+
+While at it validate that meta_len from the descriptor is not
+bogus.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b92fb77f27af90d3ee785eedc326f80cb6190597)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index e0a7eb1db7a9,fe7c3f6d820d..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -1327,9 -1392,40 +1327,46 @@@ nfp_net_set_hash_desc(struct net_devic
+  	if (!(rxd->rxd.flags & PCIE_DESC_RX_RSS))
+  		return;
+  
+++<<<<<<< HEAD
+ +	rx_hash = (struct nfp_net_rx_hash *)(skb->data - sizeof(*rx_hash));
+ +
+ +	nfp_net_set_hash(netdev, skb, rxd);
+++=======
++ 	nfp_net_set_hash(netdev, skb, get_unaligned_be32(&rx_hash->hash_type),
++ 			 &rx_hash->hash);
++ }
++ 
++ static void *
++ nfp_net_parse_meta(struct net_device *netdev, struct sk_buff *skb,
++ 		   void *data, int meta_len)
++ {
++ 	u32 meta_info;
++ 
++ 	meta_info = get_unaligned_be32(data);
++ 	data += 4;
++ 
++ 	while (meta_info) {
++ 		switch (meta_info & NFP_NET_META_FIELD_MASK) {
++ 		case NFP_NET_META_HASH:
++ 			meta_info >>= NFP_NET_META_FIELD_SIZE;
++ 			nfp_net_set_hash(netdev, skb,
++ 					 meta_info & NFP_NET_META_FIELD_MASK,
++ 					 (__be32 *)data);
++ 			data += 4;
++ 			break;
++ 		case NFP_NET_META_MARK:
++ 			skb->mark = get_unaligned_be32(data);
++ 			data += 4;
++ 			break;
++ 		default:
++ 			return NULL;
++ 		}
++ 
++ 		meta_info >>= NFP_NET_META_FIELD_SIZE;
++ 	}
++ 
++ 	return data;
+++>>>>>>> b92fb77f27af (nfp: prepare metadata handling for xdp_adjust_head())
+  }
+  
+  static void
+@@@ -1420,7 -1587,51 +1458,55 @@@ static int nfp_net_rx(struct nfp_net_rx
+  		r_vec->rx_bytes += pkt_len;
+  		u64_stats_update_end(&r_vec->rx_sync);
+  
+++<<<<<<< HEAD
+ +		skb = build_skb(rxbuf->frag, nn->fl_bufsz);
+++=======
++ 		/* Pointer to start of metadata */
++ 		meta = rxbuf->frag + data_off - meta_len;
++ 
++ 		if (unlikely(meta_len > NFP_NET_MAX_PREPEND ||
++ 			     (dp->rx_offset && meta_len > dp->rx_offset))) {
++ 			nn_dp_warn(dp, "oversized RX packet metadata %u\n",
++ 				   meta_len);
++ 			nfp_net_rx_drop(r_vec, rx_ring, rxbuf, NULL);
++ 			continue;
++ 		}
++ 
++ 		if (xdp_prog && !(rxd->rxd.flags & PCIE_DESC_RX_BPF &&
++ 				  dp->bpf_offload_xdp)) {
++ 			unsigned int dma_off;
++ 			int act;
++ 
++ 			dma_off = data_off - NFP_NET_RX_BUF_HEADROOM;
++ 			dma_sync_single_for_cpu(dp->dev,
++ 						rxbuf->dma_addr + dma_off,
++ 						pkt_len, DMA_BIDIRECTIONAL);
++ 			act = nfp_net_run_xdp(xdp_prog, rxbuf->frag + data_off,
++ 					      pkt_len);
++ 			switch (act) {
++ 			case XDP_PASS:
++ 				break;
++ 			case XDP_TX:
++ 				if (unlikely(!nfp_net_tx_xdp_buf(dp, rx_ring,
++ 								 tx_ring, rxbuf,
++ 								 dma_off,
++ 								 pkt_len)))
++ 					trace_xdp_exception(dp->netdev,
++ 							    xdp_prog, act);
++ 				continue;
++ 			default:
++ 				bpf_warn_invalid_xdp_action(act);
++ 			case XDP_ABORTED:
++ 				trace_xdp_exception(dp->netdev, xdp_prog, act);
++ 			case XDP_DROP:
++ 				nfp_net_rx_give_one(rx_ring, rxbuf->frag,
++ 						    rxbuf->dma_addr);
++ 				continue;
++ 			}
++ 		}
++ 
++ 		skb = build_skb(rxbuf->frag, true_bufsz);
+++>>>>>>> b92fb77f27af (nfp: prepare metadata handling for xdp_adjust_head())
+  		if (unlikely(!skb)) {
+  			nfp_net_rx_drop(r_vec, rx_ring, rxbuf, NULL);
+  			continue;
+@@@ -1442,12 -1649,24 +1528,28 @@@
+  		skb_reserve(skb, data_off);
+  		skb_put(skb, pkt_len);
+  
+++<<<<<<< HEAD
+ +		nfp_net_set_hash_desc(nn->netdev, skb, rxd);
+++=======
++ 		if (!dp->chained_metadata_format) {
++ 			nfp_net_set_hash_desc(dp->netdev, skb, meta, rxd);
++ 		} else if (meta_len) {
++ 			void *end;
++ 
++ 			end = nfp_net_parse_meta(dp->netdev, skb, meta,
++ 						 meta_len);
++ 			if (unlikely(end != meta + meta_len)) {
++ 				nn_dp_warn(dp, "invalid RX packet metadata\n");
++ 				nfp_net_rx_drop(r_vec, rx_ring, NULL, skb);
++ 				continue;
++ 			}
++ 		}
+++>>>>>>> b92fb77f27af (nfp: prepare metadata handling for xdp_adjust_head())
+  
+  		skb_record_rx_queue(skb, rx_ring->idx);
+ -		skb->protocol = eth_type_trans(skb, dp->netdev);
+ +		skb->protocol = eth_type_trans(skb, nn->netdev);
+  
+ -		nfp_net_rx_csum(dp, r_vec, rxd, skb);
+ +		nfp_net_rx_csum(nn, r_vec, rxd, skb);
+  
+  		if (rxd->rxd.flags & PCIE_DESC_RX_VLAN)
+  			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
