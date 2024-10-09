@@ -1,0 +1,234 @@
+x86/mm: Add support to encrypt the kernel in-place
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] mm: Add support to encrypt the kernel in-place (Suravee Suthikulpanit) [1361287]
+Rebuild_FUZZ: 95.83%
+commit-author Tom Lendacky <thomas.lendacky@amd.com>
+commit 6ebcb060713f614c92216482eed501b31cee74ec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6ebcb060.failed
+
+Add the support to encrypt the kernel in-place. This is done by creating
+new page mappings for the kernel - a decrypted write-protected mapping
+and an encrypted mapping. The kernel is encrypted by copying it through
+a temporary buffer.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brijesh Singh <brijesh.singh@amd.com>
+	Cc: Dave Young <dyoung@redhat.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Larry Woodman <lwoodman@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Matt Fleming <matt@codeblueprint.co.uk>
+	Cc: Michael S. Tsirkin <mst@redhat.com>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Radim Krčmář <rkrcmar@redhat.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Toshimitsu Kani <toshi.kani@hpe.com>
+	Cc: kasan-dev@googlegroups.com
+	Cc: kvm@vger.kernel.org
+	Cc: linux-arch@vger.kernel.org
+	Cc: linux-doc@vger.kernel.org
+	Cc: linux-efi@vger.kernel.org
+	Cc: linux-mm@kvack.org
+Link: http://lkml.kernel.org/r/c039bf9412ef95e1e6bf4fdf8facab95e00c717b.1500319216.git.thomas.lendacky@amd.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 6ebcb060713f614c92216482eed501b31cee74ec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/mem_encrypt.h
+#	arch/x86/mm/Makefile
+#	arch/x86/mm/mem_encrypt.c
+diff --cc arch/x86/mm/Makefile
+index cd47e2b6065c,72bf8c01c6e3..000000000000
+--- a/arch/x86/mm/Makefile
++++ b/arch/x86/mm/Makefile
+@@@ -29,9 -35,9 +29,14 @@@ obj-$(CONFIG_AMD_NUMA)		+= amdtopology.
+  obj-$(CONFIG_ACPI_NUMA)		+= srat.o
+  obj-$(CONFIG_NUMA_EMU)		+= numa_emulation.o
+  
+ +obj-$(CONFIG_MEMTEST)		+= memtest.o
+ +
+++<<<<<<< HEAD
+  obj-$(CONFIG_X86_INTEL_MPX)	+= mpx.o
+ -obj-$(CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS) += pkeys.o
+ -obj-$(CONFIG_RANDOMIZE_MEMORY) += kaslr.o
+ +obj-$(CONFIG_RANDOMIZE_MEMORY)	+= kaslr.o
+  
+ +obj-$(CONFIG_TRACK_DIRTY_PAGES)	+= track.o
+++=======
++ obj-$(CONFIG_AMD_MEM_ENCRYPT)	+= mem_encrypt.o
++ obj-$(CONFIG_AMD_MEM_ENCRYPT)	+= mem_encrypt_boot.o
+++>>>>>>> 6ebcb060713f (x86/mm: Add support to encrypt the kernel in-place)
+* Unmerged path arch/x86/include/asm/mem_encrypt.h
+* Unmerged path arch/x86/mm/mem_encrypt.c
+* Unmerged path arch/x86/include/asm/mem_encrypt.h
+* Unmerged path arch/x86/mm/Makefile
+* Unmerged path arch/x86/mm/mem_encrypt.c
+diff --git a/arch/x86/mm/mem_encrypt_boot.S b/arch/x86/mm/mem_encrypt_boot.S
+new file mode 100644
+index 000000000000..b327e0472448
+--- /dev/null
++++ b/arch/x86/mm/mem_encrypt_boot.S
+@@ -0,0 +1,149 @@
++/*
++ * AMD Memory Encryption Support
++ *
++ * Copyright (C) 2016 Advanced Micro Devices, Inc.
++ *
++ * Author: Tom Lendacky <thomas.lendacky@amd.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/linkage.h>
++#include <asm/pgtable.h>
++#include <asm/page.h>
++#include <asm/processor-flags.h>
++#include <asm/msr-index.h>
++#include <asm/frame.h>
++
++	.text
++	.code64
++ENTRY(sme_encrypt_execute)
++
++	/*
++	 * Entry parameters:
++	 *   RDI - virtual address for the encrypted kernel mapping
++	 *   RSI - virtual address for the decrypted kernel mapping
++	 *   RDX - length of kernel
++	 *   RCX - virtual address of the encryption workarea, including:
++	 *     - stack page (PAGE_SIZE)
++	 *     - encryption routine page (PAGE_SIZE)
++	 *     - intermediate copy buffer (PMD_PAGE_SIZE)
++	 *    R8 - physcial address of the pagetables to use for encryption
++	 */
++
++	FRAME_BEGIN			/* RBP now has original stack pointer */
++
++	/* Set up a one page stack in the non-encrypted memory area */
++	movq	%rcx, %rax		/* Workarea stack page */
++	leaq	PAGE_SIZE(%rax), %rsp	/* Set new stack pointer */
++	addq	$PAGE_SIZE, %rax	/* Workarea encryption routine */
++
++	push	%r12
++	movq	%rdi, %r10		/* Encrypted kernel */
++	movq	%rsi, %r11		/* Decrypted kernel */
++	movq	%rdx, %r12		/* Kernel length */
++
++	/* Copy encryption routine into the workarea */
++	movq	%rax, %rdi				/* Workarea encryption routine */
++	leaq	__enc_copy(%rip), %rsi			/* Encryption routine */
++	movq	$(.L__enc_copy_end - __enc_copy), %rcx	/* Encryption routine length */
++	rep	movsb
++
++	/* Setup registers for call */
++	movq	%r10, %rdi		/* Encrypted kernel */
++	movq	%r11, %rsi		/* Decrypted kernel */
++	movq	%r8, %rdx		/* Pagetables used for encryption */
++	movq	%r12, %rcx		/* Kernel length */
++	movq	%rax, %r8		/* Workarea encryption routine */
++	addq	$PAGE_SIZE, %r8		/* Workarea intermediate copy buffer */
++
++	call	*%rax			/* Call the encryption routine */
++
++	pop	%r12
++
++	movq	%rbp, %rsp		/* Restore original stack pointer */
++	FRAME_END
++
++	ret
++ENDPROC(sme_encrypt_execute)
++
++ENTRY(__enc_copy)
++/*
++ * Routine used to encrypt kernel.
++ *   This routine must be run outside of the kernel proper since
++ *   the kernel will be encrypted during the process. So this
++ *   routine is defined here and then copied to an area outside
++ *   of the kernel where it will remain and run decrypted
++ *   during execution.
++ *
++ *   On entry the registers must be:
++ *     RDI - virtual address for the encrypted kernel mapping
++ *     RSI - virtual address for the decrypted kernel mapping
++ *     RDX - address of the pagetables to use for encryption
++ *     RCX - length of kernel
++ *      R8 - intermediate copy buffer
++ *
++ *     RAX - points to this routine
++ *
++ * The kernel will be encrypted by copying from the non-encrypted
++ * kernel space to an intermediate buffer and then copying from the
++ * intermediate buffer back to the encrypted kernel space. The physical
++ * addresses of the two kernel space mappings are the same which
++ * results in the kernel being encrypted "in place".
++ */
++	/* Enable the new page tables */
++	mov	%rdx, %cr3
++
++	/* Flush any global TLBs */
++	mov	%cr4, %rdx
++	andq	$~X86_CR4_PGE, %rdx
++	mov	%rdx, %cr4
++	orq	$X86_CR4_PGE, %rdx
++	mov	%rdx, %cr4
++
++	/* Set the PAT register PA5 entry to write-protect */
++	push	%rcx
++	movl	$MSR_IA32_CR_PAT, %ecx
++	rdmsr
++	push	%rdx			/* Save original PAT value */
++	andl	$0xffff00ff, %edx	/* Clear PA5 */
++	orl	$0x00000500, %edx	/* Set PA5 to WP */
++	wrmsr
++	pop	%rdx			/* RDX contains original PAT value */
++	pop	%rcx
++
++	movq	%rcx, %r9		/* Save kernel length */
++	movq	%rdi, %r10		/* Save encrypted kernel address */
++	movq	%rsi, %r11		/* Save decrypted kernel address */
++
++	wbinvd				/* Invalidate any cache entries */
++
++	/* Copy/encrypt 2MB at a time */
++1:
++	movq	%r11, %rsi		/* Source - decrypted kernel */
++	movq	%r8, %rdi		/* Dest   - intermediate copy buffer */
++	movq	$PMD_PAGE_SIZE, %rcx	/* 2MB length */
++	rep	movsb
++
++	movq	%r8, %rsi		/* Source - intermediate copy buffer */
++	movq	%r10, %rdi		/* Dest   - encrypted kernel */
++	movq	$PMD_PAGE_SIZE, %rcx	/* 2MB length */
++	rep	movsb
++
++	addq	$PMD_PAGE_SIZE, %r11
++	addq	$PMD_PAGE_SIZE, %r10
++	subq	$PMD_PAGE_SIZE, %r9	/* Kernel length decrement */
++	jnz	1b			/* Kernel length not zero? */
++
++	/* Restore PAT register */
++	push	%rdx			/* Save original PAT value */
++	movl	$MSR_IA32_CR_PAT, %ecx
++	rdmsr
++	pop	%rdx			/* Restore original PAT value */
++	wrmsr
++
++	ret
++.L__enc_copy_end:
++ENDPROC(__enc_copy)
