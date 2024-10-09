@@ -1,0 +1,251 @@
+ib_srpt: Convert acl lookup to modern get_initiator_node_acl usage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit f246c941549c715a66a4477c3053569b2f5b8823
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f246c941.failed
+
+This patch does a simple conversion of ib_srpt code to use
+proper modern core_tpg_get_initiator_node_acl() lookup using
+se_node_acl->acl_kref, and drops the legacy internal list
+usage from srpt_lookup_acl().
+
+This involves doing transport_init_session() earlier, and
+making sure transport_free_session() is called during
+a se_node_acl lookup failure to drop the last ->acl_kref.
+
+Also, it adds a minor backwards-compat hack to avoid the
+potential for user-space wrt node-acl WWPN formatting by
+simply stripping off '0x' prefix from ch->sess_name, and
+retrying once if core_tpg_get_initiator_node_acl() fails.
+
+Finally, go ahead and drop port_acl_list port_acl_lock
+since they are no longer used.
+
+	Cc: Vu Pham <vu@mellanox.com>
+	Cc: Sagi Grimberg <sagig@mellanox.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Cc: Andy Grover <agrover@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit f246c941549c715a66a4477c3053569b2f5b8823)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/srpt/ib_srpt.c
+#	drivers/infiniband/ulp/srpt/ib_srpt.h
+diff --cc drivers/infiniband/ulp/srpt/ib_srpt.c
+index 72146d165e84,bc5470c43d26..000000000000
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.c
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.c
+@@@ -1829,34 -2367,9 +1829,9 @@@ static void srpt_release_channel_work(s
+  
+  	wake_up(&sdev->ch_releaseQ);
+  
+ -	kfree(ch);
+ +	kref_put(&ch->kref, srpt_free_ch);
+  }
+  
+- static struct srpt_node_acl *__srpt_lookup_acl(struct srpt_port *sport,
+- 					       u8 i_port_id[16])
+- {
+- 	struct srpt_node_acl *nacl;
+- 
+- 	list_for_each_entry(nacl, &sport->port_acl_list, list)
+- 		if (memcmp(nacl->i_port_id, i_port_id,
+- 			   sizeof(nacl->i_port_id)) == 0)
+- 			return nacl;
+- 
+- 	return NULL;
+- }
+- 
+- static struct srpt_node_acl *srpt_lookup_acl(struct srpt_port *sport,
+- 					     u8 i_port_id[16])
+- {
+- 	struct srpt_node_acl *nacl;
+- 
+- 	spin_lock_irq(&sport->port_acl_lock);
+- 	nacl = __srpt_lookup_acl(sport, i_port_id);
+- 	spin_unlock_irq(&sport->port_acl_lock);
+- 
+- 	return nacl;
+- }
+- 
+  /**
+   * srpt_cm_req_recv() - Process the event IB_CM_REQ_RECEIVED.
+   *
+@@@ -2088,10 -2622,8 +2077,8 @@@ try_again
+  	goto out;
+  
+  release_channel:
+ -	srpt_set_ch_state(ch, CH_RELEASING);
+ +	srpt_disconnect_ch(ch);
+  	transport_deregister_session_configfs(ch->sess);
+- 
+- deregister_session:
+  	transport_deregister_session(ch->sess);
+  	ch->sess = NULL;
+  
+@@@ -2888,76 -3491,21 +2873,87 @@@ out
+   * configfs callback function invoked for
+   * mkdir /sys/kernel/config/target/$driver/$port/$tpg/acls/$i_port_id
+   */
+ -static int srpt_init_nodeacl(struct se_node_acl *se_nacl, const char *name)
+ +static struct se_node_acl *srpt_make_nodeacl(struct se_portal_group *tpg,
+ +					     struct config_group *group,
+ +					     const char *name)
+  {
+++<<<<<<< HEAD
+ +	struct srpt_port *sport = container_of(tpg, struct srpt_port, port_tpg_1);
+ +	struct se_node_acl *se_nacl, *se_nacl_new;
+ +	struct srpt_node_acl *nacl;
+ +	int ret = 0;
+ +	u32 nexus_depth = 1;
+++=======
+++>>>>>>> f246c941549c (ib_srpt: Convert acl lookup to modern get_initiator_node_acl usage)
+  	u8 i_port_id[16];
+  
+  	if (srpt_parse_i_port_id(i_port_id, name) < 0) {
+  		pr_err("invalid initiator port ID %s\n", name);
+ -		return -EINVAL;
+ +		ret = -EINVAL;
+ +		goto err;
+ +	}
+++<<<<<<< HEAD
+ +
+ +	se_nacl_new = srpt_alloc_fabric_acl(tpg);
+ +	if (!se_nacl_new) {
+ +		ret = -ENOMEM;
+ +		goto err;
+ +	}
+ +	/*
+ +	 * nacl_new may be released by core_tpg_add_initiator_node_acl()
+ +	 * when converting a node ACL from demo mode to explict
+ +	 */
+ +	se_nacl = core_tpg_add_initiator_node_acl(tpg, se_nacl_new, name,
+ +						  nexus_depth);
+ +	if (IS_ERR(se_nacl)) {
+ +		ret = PTR_ERR(se_nacl);
+ +		goto err;
+  	}
+ +	/* Locate our struct srpt_node_acl and set sdev and i_port_id. */
+ +	nacl = container_of(se_nacl, struct srpt_node_acl, nacl);
+ +	memcpy(&nacl->i_port_id[0], &i_port_id[0], 16);
+ +	nacl->sport = sport;
+ +
+ +	spin_lock_irq(&sport->port_acl_lock);
+ +	list_add_tail(&nacl->list, &sport->port_acl_list);
+ +	spin_unlock_irq(&sport->port_acl_lock);
+ +
+ +	return se_nacl;
+ +err:
+ +	return ERR_PTR(ret);
+ +}
+ +
+ +/*
+ + * configfs callback function invoked for
+ + * rmdir /sys/kernel/config/target/$driver/$port/$tpg/acls/$i_port_id
+ + */
+ +static void srpt_drop_nodeacl(struct se_node_acl *se_nacl)
+ +{
+ +	struct srpt_node_acl *nacl;
+ +	struct srpt_device *sdev;
+ +	struct srpt_port *sport;
+ +
+ +	nacl = container_of(se_nacl, struct srpt_node_acl, nacl);
+ +	sport = nacl->sport;
+ +	sdev = sport->sdev;
+ +	spin_lock_irq(&sport->port_acl_lock);
+ +	list_del(&nacl->list);
+ +	spin_unlock_irq(&sport->port_acl_lock);
+ +	core_tpg_del_initiator_node_acl(&sport->port_tpg_1, se_nacl, 1);
+ +	srpt_release_fabric_acl(NULL, se_nacl);
+ +}
+ +
+ +static ssize_t srpt_tpg_attrib_show_srp_max_rdma_size(
+ +	struct se_portal_group *se_tpg,
+ +	char *page)
+++=======
++ 	return 0;
++ }
++ 
++ static ssize_t srpt_tpg_attrib_srp_max_rdma_size_show(struct config_item *item,
++ 		char *page)
+++>>>>>>> f246c941549c (ib_srpt: Convert acl lookup to modern get_initiator_node_acl usage)
+  {
+ -	struct se_portal_group *se_tpg = attrib_to_tpg(item);
+  	struct srpt_port *sport = container_of(se_tpg, struct srpt_port, port_tpg_1);
+  
+  	return sprintf(page, "%u\n", sport->port_attrib.srp_max_rdma_size);
+@@@ -3258,12 -3777,11 +3254,20 @@@ static struct target_core_fabric_ops sr
+  	.fabric_drop_wwn		= srpt_drop_tport,
+  	.fabric_make_tpg		= srpt_make_tpg,
+  	.fabric_drop_tpg		= srpt_drop_tpg,
+++<<<<<<< HEAD
+ +	.fabric_post_link		= NULL,
+ +	.fabric_pre_unlink		= NULL,
+ +	.fabric_make_np			= NULL,
+ +	.fabric_drop_np			= NULL,
+ +	.fabric_make_nodeacl		= srpt_make_nodeacl,
+ +	.fabric_drop_nodeacl		= srpt_drop_nodeacl,
+++=======
++ 	.fabric_init_nodeacl		= srpt_init_nodeacl,
++ 
++ 	.tfc_wwn_attrs			= srpt_wwn_attrs,
++ 	.tfc_tpg_base_attrs		= srpt_tpg_attrs,
++ 	.tfc_tpg_attrib_attrs		= srpt_tpg_attrib_attrs,
+++>>>>>>> f246c941549c (ib_srpt: Convert acl lookup to modern get_initiator_node_acl usage)
+  };
+  
+  /**
+diff --cc drivers/infiniband/ulp/srpt/ib_srpt.h
+index 9077ca1e51ce,5366e0a9fd6d..000000000000
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.h
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.h
+@@@ -367,34 -406,10 +365,41 @@@ struct srpt_device 
+  
+  /**
+   * struct srpt_node_acl - Per-initiator ACL data (managed via configfs).
+++<<<<<<< HEAD
+ + * @i_port_id: 128-bit SRP initiator port ID.
+ + * @sport:     port information.
+   * @nacl:      Target core node ACL information.
+ + * @list:      Element of the per-HCA ACL list.
+   */
+  struct srpt_node_acl {
+ +	u8			i_port_id[16];
+ +	struct srpt_port	*sport;
+  	struct se_node_acl	nacl;
+ +	struct list_head	list;
+++=======
+++ * @nacl:      Target core node ACL information.
+++ */
+++struct srpt_node_acl {
+++	struct se_node_acl	nacl;
+++>>>>>>> f246c941549c (ib_srpt: Convert acl lookup to modern get_initiator_node_acl usage)
+ +};
+ +
+ +/*
+ + * SRP-releated SCSI persistent reservation definitions.
+ + *
+ + * See also SPC4r28, section 7.6.1 (Protocol specific parameters introduction).
+ + * See also SPC4r28, section 7.6.4.5 (TransportID for initiator ports using
+ + * SCSI over an RDMA interface).
+ + */
+ +
+ +enum {
+ +	SCSI_TRANSPORTID_PROTOCOLID_SRP	= 4,
+ +};
+ +
+ +struct spc_rdma_transport_id {
+ +	uint8_t protocol_identifier;
+ +	uint8_t reserved[7];
+ +	uint8_t i_port_id[16];
+  };
+  
+  #endif				/* IB_SRPT_H */
+* Unmerged path drivers/infiniband/ulp/srpt/ib_srpt.c
+* Unmerged path drivers/infiniband/ulp/srpt/ib_srpt.h
