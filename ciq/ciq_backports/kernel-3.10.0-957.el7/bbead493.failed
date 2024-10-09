@@ -1,0 +1,165 @@
+scsi: qla2xxx: Chip reset uses wrong lock during IO flush.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Chip reset uses wrong lock during IO flush (Himanshu Madhani) [1547714]
+Rebuild_FUZZ: 93.58%
+commit-author Quinn Tran <quinn.tran@cavium.com>
+commit bbead493a3b98dd11372cbdb5405ae9017cab367
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/bbead493.failed
+
+As part of chip reset, all commands from all QPairs are
+flushed. This patch fixes code to use Q Pair lock for flush
+instead of using old hardware_lock.
+
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit bbead493a3b98dd11372cbdb5405ae9017cab367)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_os.c
+diff --cc drivers/scsi/qla2xxx/qla_os.c
+index 75f3e94a56ff,2e4bfb7aabf7..000000000000
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@@ -1695,69 -1717,70 +1696,135 @@@ __qla2x00_abort_all_cmds(struct qla_qpa
+  	struct qla_tgt_cmd *cmd;
+  	uint8_t trace = 0;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&ha->hardware_lock, flags);
+ +	for (que = 0; que < ha->max_req_queues; que++) {
+ +		req = ha->req_q_map[que];
+ +		if (!req)
+ +			continue;
+ +		if (!req->outstanding_cmds)
+ +			continue;
+ +		for (cnt = 1; cnt < req->num_outstanding_cmds; cnt++) {
+ +			sp = req->outstanding_cmds[cnt];
+ +			if (sp) {
+ +				req->outstanding_cmds[cnt] = NULL;
+ +				if (sp->cmd_type == TYPE_SRB) {
+ +					/*
+ +					 * Don't abort commands in adapter
+ +					 * during EEH recovery as it's not
+ +					 * accessible/responding.
+ +					 */
+ +					if (GET_CMD_SP(sp) &&
+ +					    !ha->flags.eeh_busy &&
+ +					    (!test_bit(ABORT_ISP_ACTIVE,
+ +						&vha->dpc_flags)) &&
+ +					    (sp->type == SRB_SCSI_CMD)) {
+ +						/*
+ +						 * Get a reference to the sp
+ +						 * and drop the lock. The
+ +						 * reference ensures this
+ +						 * sp->done() call and not the
+ +						 * call in qla2xxx_eh_abort()
+ +						 * ends the SCSI command (with
+ +						 * result 'res').
+ +						 */
+ +						sp_get(sp);
+ +						spin_unlock_irqrestore(
+ +						    &ha->hardware_lock, flags);
+ +						status = qla2xxx_eh_abort(
+ +						    GET_CMD_SP(sp));
+ +						spin_lock_irqsave(
+ +						    &ha->hardware_lock, flags);
+ +						/*
+ +						 * Get rid of extra reference
+ +						 * if immediate exit from
+ +						 * ql2xxx_eh_abort
+ +						 */
+ +						if (status == FAILED &&
+ +						    (qla2x00_isp_reg_stat(ha)))
+ +							atomic_dec(
+ +							    &sp->ref_count);
+ +					}
+ +					sp->done(sp, res);
+ +				} else {
+ +					if (!vha->hw->tgt.tgt_ops || !tgt ||
+ +					    qla_ini_mode_enabled(vha)) {
+ +						if (!trace)
+ +							ql_dbg(ql_dbg_tgt_mgt,
+ +							    vha, 0xf003,
+ +							    "HOST-ABORT-HNDLR: dpc_flags=%lx. Target mode disabled\n",
+ +							    vha->dpc_flags);
+ +						continue;
+ +					}
+ +					cmd = (struct qla_tgt_cmd *)sp;
+ +					qlt_abort_cmd_on_host_reset(cmd->vha,
+ +					    cmd);
+++=======
++ 	spin_lock_irqsave(qp->qp_lock_ptr, flags);
++ 	req = qp->req;
++ 	for (cnt = 1; cnt < req->num_outstanding_cmds; cnt++) {
++ 		sp = req->outstanding_cmds[cnt];
++ 		if (sp) {
++ 			req->outstanding_cmds[cnt] = NULL;
++ 			if (sp->cmd_type == TYPE_SRB) {
++ 				if (sp->type == SRB_NVME_CMD ||
++ 				    sp->type == SRB_NVME_LS) {
++ 					sp_get(sp);
++ 					spin_unlock_irqrestore(qp->qp_lock_ptr,
++ 					    flags);
++ 					qla_nvme_abort(ha, sp);
++ 					spin_lock_irqsave(qp->qp_lock_ptr,
++ 					    flags);
++ 				} else if (GET_CMD_SP(sp) &&
++ 				    !ha->flags.eeh_busy &&
++ 				    (!test_bit(ABORT_ISP_ACTIVE,
++ 					&vha->dpc_flags)) &&
++ 				    (sp->type == SRB_SCSI_CMD)) {
++ 					/*
++ 					 * Don't abort commands in
++ 					 * adapter during EEH
++ 					 * recovery as it's not
++ 					 * accessible/responding.
++ 					 *
++ 					 * Get a reference to the sp
++ 					 * and drop the lock. The
++ 					 * reference ensures this
++ 					 * sp->done() call and not the
++ 					 * call in qla2xxx_eh_abort()
++ 					 * ends the SCSI command (with
++ 					 * result 'res').
++ 					 */
++ 					sp_get(sp);
++ 					spin_unlock_irqrestore(qp->qp_lock_ptr,
++ 					    flags);
++ 					status = qla2xxx_eh_abort(
++ 					    GET_CMD_SP(sp));
++ 					spin_lock_irqsave(qp->qp_lock_ptr,
++ 					    flags);
++ 					/*
++ 					 * Get rid of extra reference
++ 					 * if immediate exit from
++ 					 * ql2xxx_eh_abort
++ 					 */
++ 					if (status == FAILED &&
++ 					    (qla2x00_isp_reg_stat(ha)))
++ 						atomic_dec(
++ 						    &sp->ref_count);
+++>>>>>>> bbead493a3b9 (scsi: qla2xxx: Chip reset uses wrong lock during IO flush.)
+  				}
++ 				sp->done(sp, res);
++ 			} else {
++ 				if (!vha->hw->tgt.tgt_ops || !tgt ||
++ 				    qla_ini_mode_enabled(vha)) {
++ 					if (!trace)
++ 						ql_dbg(ql_dbg_tgt_mgt,
++ 						    vha, 0xf003,
++ 						    "HOST-ABORT-HNDLR: dpc_flags=%lx. Target mode disabled\n",
++ 						    vha->dpc_flags);
++ 					continue;
++ 				}
++ 				cmd = (struct qla_tgt_cmd *)sp;
++ 				qlt_abort_cmd_on_host_reset(cmd->vha, cmd);
+  			}
+  		}
+  	}
+* Unmerged path drivers/scsi/qla2xxx/qla_os.c
