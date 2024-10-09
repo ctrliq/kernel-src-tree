@@ -1,0 +1,62 @@
+scsi: mpt3sas: fix memory ordering on 64bit writes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [scsi] mpt3sas: fix memory ordering on 64bit writes (Tomas Henzl) [1660791]
+Rebuild_FUZZ: 93.62%
+commit-author Stephan Günther <moepi@moepi.net>
+commit 23c3828aa2f84edec7020c7397a22931e7a879e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/23c3828a.failed
+
+With commit 09c2f95ad404 ("scsi: mpt3sas: Swap I/O memory read value back
+to cpu endianness"), 64bit writes in _base_writeq() were rewritten to use
+__raw_writeq() instad of writeq().
+
+This introduced a bug apparent on powerpc64 systems such as the Raptor
+Talos II that causes the HBA to drop from the PCIe bus under heavy load and
+being reinitialized after a couple of seconds.
+
+It can easily be triggered on affacted systems by using something like
+
+  fio --name=random-write --iodepth=4 --rw=randwrite --bs=4k --direct=0 \
+    --size=128M --numjobs=64 --end_fsync=1
+  fio --name=random-write --iodepth=4 --rw=randwrite --bs=64k --direct=0 \
+    --size=128M --numjobs=64 --end_fsync=1
+
+a couple of times. In my case I tested it on both a ZFS raidz2 and a btrfs
+raid6 using LSI 9300-8i and 9400-8i controllers.
+
+The fix consists in resembling the write ordering of writeq() by adding a
+mandatory write memory barrier before device access and a compiler barrier
+afterwards. The additional MMIO barrier is superfluous.
+
+	Signed-off-by: Stephan Günther <moepi@moepi.net>
+	Reported-by: Matt Corallo <linux@bluematt.me>
+	Acked-by: Sreekanth Reddy <Sreekanth.Reddy@broadcom.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 23c3828aa2f84edec7020c7397a22931e7a879e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/mpt3sas/mpt3sas_base.c
+diff --cc drivers/scsi/mpt3sas/mpt3sas_base.c
+index 47ce8385aae2,0a6cb8f0680c..000000000000
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.c
+@@@ -2613,7 -3345,9 +2613,13 @@@ mpt3sas_base_free_smid(struct MPT3SAS_A
+  static inline void
+  _base_writeq(__u64 b, volatile void __iomem *addr, spinlock_t *writeq_lock)
+  {
+++<<<<<<< HEAD
+ +	writeq(cpu_to_le64(b), addr);
+++=======
++ 	wmb();
++ 	__raw_writeq(b, addr);
++ 	barrier();
+++>>>>>>> 23c3828aa2f8 (scsi: mpt3sas: fix memory ordering on 64bit writes)
+  }
+  #else
+  static inline void
+* Unmerged path drivers/scsi/mpt3sas/mpt3sas_base.c
