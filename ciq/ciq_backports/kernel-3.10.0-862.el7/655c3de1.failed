@@ -1,0 +1,236 @@
+vxlan: improve vxlan route lookup checks.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] vxlan: improve vxlan route lookup checks (Jiri Benc) [1467280]
+Rebuild_FUZZ: 98.77%
+commit-author pravin shelar <pshelar@ovn.org>
+commit 655c3de16540b8496273514658a6ad4cb31e01b4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/655c3de1.failed
+
+Move route sanity check to respective vxlan[4/6]_get_route functions.
+This allows us to perform all sanity checks before caching the dst so
+that we can avoid these checks on subsequent packets.
+This give move accurate metadata information for packet from
+fill_metadata_dst().
+
+	Signed-off-by: Pravin B Shelar <pshelar@ovn.org>
+	Acked-by: Jiri Benc <jbenc@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 655c3de16540b8496273514658a6ad4cb31e01b4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+diff --cc drivers/net/vxlan.c
+index f909b180e18b,d8fe4b84d150..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1768,13 -1789,10 +1768,14 @@@ static int vxlan_build_skb(struct sk_bu
+  
+  	skb_set_inner_protocol(skb, inner_protocol);
+  	return 0;
+ +
+ +out_free:
+ +	kfree_skb(skb);
+ +	return err;
+  }
+  
+- static struct rtable *vxlan_get_route(struct vxlan_dev *vxlan,
++ static struct rtable *vxlan_get_route(struct vxlan_dev *vxlan, struct net_device *dev,
++ 				      struct vxlan_sock *sock4,
+  				      struct sk_buff *skb, int oif, u8 tos,
+  				      __be32 daddr, __be32 *saddr,
+  				      struct dst_cache *dst_cache,
+@@@ -1811,6 -1841,8 +1824,11 @@@
+  
+  #if IS_ENABLED(CONFIG_IPV6)
+  static struct dst_entry *vxlan6_get_route(struct vxlan_dev *vxlan,
+++<<<<<<< HEAD
+++=======
++ 					  struct net_device *dev,
++ 					  struct vxlan_sock *sock6,
+++>>>>>>> 655c3de16540 (vxlan: improve vxlan route lookup checks.)
+  					  struct sk_buff *skb, int oif, u8 tos,
+  					  __be32 label,
+  					  const struct in6_addr *daddr,
+@@@ -1840,10 -1875,18 +1858,18 @@@
+  	fl6.flowi6_proto = IPPROTO_UDP;
+  
+  	err = ipv6_stub->ipv6_dst_lookup(vxlan->net,
+ -					 sock6->sock->sk,
+ +					 vxlan->vn6_sock->sock->sk,
+  					 &ndst, &fl6);
+- 	if (err < 0)
+- 		return ERR_PTR(err);
++ 	if (unlikely(err < 0)) {
++ 		netdev_dbg(dev, "no route to %pI6\n", daddr);
++ 		return ERR_PTR(-ENETUNREACH);
++ 	}
++ 
++ 	if (unlikely(ndst->dev == dev)) {
++ 		netdev_dbg(dev, "circular route to %pI6\n", daddr);
++ 		dst_release(ndst);
++ 		return ERR_PTR(-ELOOP);
++ 	}
+  
+  	*saddr = fl6.saddr;
+  	if (use_cache)
+@@@ -1985,28 -2028,17 +2012,36 @@@ static void vxlan_xmit_one(struct sk_bu
+  	}
+  
+  	if (dst->sa.sa_family == AF_INET) {
+++<<<<<<< HEAD
+ +		if (!vxlan->vn4_sock)
+ +			goto drop;
+ +		sk = vxlan->vn4_sock->sock->sk;
+ +
+ +		rt = vxlan_get_route(vxlan, skb,
+++=======
++ 		struct vxlan_sock *sock4 = rcu_dereference(vxlan->vn4_sock);
++ 		struct rtable *rt;
++ 
++ 		rt = vxlan_get_route(vxlan, dev, sock4, skb,
+++>>>>>>> 655c3de16540 (vxlan: improve vxlan route lookup checks.)
+  				     rdst ? rdst->remote_ifindex : 0, tos,
+  				     dst->sin.sin_addr.s_addr,
+  				     &src->sin.sin_addr.s_addr,
+  				     dst_cache, info);
+- 		if (IS_ERR(rt)) {
+- 			netdev_dbg(dev, "no route to %pI4\n",
+- 				   &dst->sin.sin_addr.s_addr);
+- 			dev->stats.tx_carrier_errors++;
++ 		if (IS_ERR(rt))
+  			goto tx_error;
+++<<<<<<< HEAD
+ +		}
+ +
+ +		if (rt->dst.dev == dev) {
+ +			netdev_dbg(dev, "circular route to %pI4\n",
+ +				   &dst->sin.sin_addr.s_addr);
+ +			dev->stats.collisions++;
+ +			goto rt_tx_error;
+ +		}
+++=======
++ 		sk = sock4->sock->sk;
+++>>>>>>> 655c3de16540 (vxlan: improve vxlan route lookup checks.)
+  
+  		/* Bypass encapsulation if the destination is local */
+  		if (!info && rt->rt_flags & RTCF_LOCAL &&
+@@@ -2040,32 -2073,19 +2075,43 @@@
+  				    src_port, dst_port, xnet, !udp_sum);
+  #if IS_ENABLED(CONFIG_IPV6)
+  	} else {
+ -		struct vxlan_sock *sock6 = rcu_dereference(vxlan->vn6_sock);
+ +		struct dst_entry *ndst;
+  		u32 rt6i_flags;
+  
+++<<<<<<< HEAD
+ +		if (!vxlan->vn6_sock)
+ +			goto drop;
+ +		sk = vxlan->vn6_sock->sock->sk;
+ +
+ +		ndst = vxlan6_get_route(vxlan, skb,
+++=======
++ 		ndst = vxlan6_get_route(vxlan, dev, sock6, skb,
+++>>>>>>> 655c3de16540 (vxlan: improve vxlan route lookup checks.)
+  					rdst ? rdst->remote_ifindex : 0, tos,
+  					label, &dst->sin6.sin6_addr,
+  					&src->sin6.sin6_addr,
+  					dst_cache, info);
+  		if (IS_ERR(ndst)) {
+++<<<<<<< HEAD
+ +			netdev_dbg(dev, "no route to %pI6\n",
+ +				   &dst->sin6.sin6_addr);
+ +			dev->stats.tx_carrier_errors++;
+ +			goto tx_error;
+ +		}
+ +
+ +		if (ndst->dev == dev) {
+ +			netdev_dbg(dev, "circular route to %pI6\n",
+ +				   &dst->sin6.sin6_addr);
+ +			dst_release(ndst);
+ +			dev->stats.collisions++;
+ +			goto tx_error;
+ +		}
+++=======
++ 			ndst = NULL;
++ 			goto tx_error;
++ 		}
++ 		sk = sock6->sock->sk;
+++>>>>>>> 655c3de16540 (vxlan: improve vxlan route lookup checks.)
+  
+  		/* Bypass encapsulation if the destination is local */
+  		rt6i_flags = ((struct rt6_info *)ndst)->rt6i_flags;
+@@@ -2107,17 -2125,17 +2153,25 @@@
+  
+  drop:
+  	dev->stats.tx_dropped++;
+ -	dev_kfree_skb(skb);
+ -	return;
+ +	goto tx_free;
+  
+ +xmit_tx_error:
+ +	/* skb is already freed. */
+ +	skb = NULL;
+ +rt_tx_error:
+ +	ip_rt_put(rt);
+  tx_error:
+++<<<<<<< HEAD
+++=======
++ 	if (err == -ELOOP)
++ 		dev->stats.collisions++;
++ 	else if (err == -ENETUNREACH)
++ 		dev->stats.tx_carrier_errors++;
++ 	dst_release(ndst);
+++>>>>>>> 655c3de16540 (vxlan: improve vxlan route lookup checks.)
+  	dev->stats.tx_errors++;
+ -	kfree_skb(skb);
+ +tx_free:
+ +	dev_kfree_skb(skb);
+  }
+  
+  /* Transmit local packets over Vxlan
+@@@ -2419,27 -2411,23 +2473,35 @@@ static int vxlan_fill_metadata_dst(stru
+  	dport = info->key.tp_dst ? : vxlan->cfg.dst_port;
+  
+  	if (ip_tunnel_info_af(info) == AF_INET) {
+ -		struct vxlan_sock *sock4 = rcu_dereference(vxlan->vn4_sock);
+  		struct rtable *rt;
+  
+++<<<<<<< HEAD
+ +		if (!vxlan->vn4_sock)
+ +			return -EINVAL;
+ +		rt = vxlan_get_route(vxlan, skb, 0, info->key.tos,
+++=======
++ 		rt = vxlan_get_route(vxlan, dev, sock4, skb, 0, info->key.tos,
+++>>>>>>> 655c3de16540 (vxlan: improve vxlan route lookup checks.)
+  				     info->key.u.ipv4.dst,
+ -				     &info->key.u.ipv4.src, NULL, info);
+ +				     &info->key.u.ipv4.src,
+ +				     &info->dst_cache, info);
+  		if (IS_ERR(rt))
+  			return PTR_ERR(rt);
+  		ip_rt_put(rt);
+  	} else {
+  #if IS_ENABLED(CONFIG_IPV6)
+ -		struct vxlan_sock *sock6 = rcu_dereference(vxlan->vn6_sock);
+  		struct dst_entry *ndst;
+  
+++<<<<<<< HEAD
+ +		if (!vxlan->vn6_sock)
+ +			return -EINVAL;
+ +		ndst = vxlan6_get_route(vxlan, skb, 0, info->key.tos,
+++=======
++ 		ndst = vxlan6_get_route(vxlan, dev, sock6, skb, 0, info->key.tos,
+++>>>>>>> 655c3de16540 (vxlan: improve vxlan route lookup checks.)
+  					info->key.label, &info->key.u.ipv6.dst,
+ -					&info->key.u.ipv6.src, NULL, info);
+ +					&info->key.u.ipv6.src,
+ +					&info->dst_cache, info);
+  		if (IS_ERR(ndst))
+  			return PTR_ERR(ndst);
+  		dst_release(ndst);
+* Unmerged path drivers/net/vxlan.c
