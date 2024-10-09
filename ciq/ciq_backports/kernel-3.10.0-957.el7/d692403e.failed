@@ -1,0 +1,550 @@
+nfp: forbid disabling hw-tc-offload on representors while offload active
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit d692403e5cf8008f31f5664a6f3ce3e65d54f458
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/d692403e.failed
+
+All netdevs which can accept TC offloads must implement
+.ndo_set_features().  nfp_reprs currently do not do that, which
+means hw-tc-offload can be turned on and off even when offloads
+are active.
+
+Whether the offloads are active is really a question to nfp_ports,
+so remove the per-app tc_busy callback indirection thing, and
+simply count the number of offloaded items in nfp_port structure.
+
+Fixes: 8a2768732a4d ("nfp: provide infrastructure for offloading flower based TC filters")
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Tested-by: Pieter Jansen van Vuuren <pieter.jansenvanvuuren@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d692403e5cf8008f31f5664a6f3ce3e65d54f458)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/bpf/main.c
+#	drivers/net/ethernet/netronome/nfp/flower/offload.c
+#	drivers/net/ethernet/netronome/nfp/nfp_app.h
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/main.c
+index 60a7af297852,34e98aa6b956..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.c
+@@@ -109,38 -122,286 +109,311 @@@ nfp_bpf_vnic_alloc(struct nfp_app *app
+  
+  static void nfp_bpf_vnic_free(struct nfp_app *app, struct nfp_net *nn)
+  {
+++<<<<<<< HEAD
+ +	if (nn->dp.bpf_offload_xdp)
+ +		nfp_bpf_xdp_offload(app, nn, NULL);
+ +	kfree(nn->app_priv);
+++=======
++ 	struct nfp_bpf_vnic *bv = nn->app_priv;
++ 
++ 	WARN_ON(bv->tc_prog);
++ 	kfree(bv);
++ }
++ 
++ static int nfp_bpf_setup_tc_block_cb(enum tc_setup_type type,
++ 				     void *type_data, void *cb_priv)
++ {
++ 	struct tc_cls_bpf_offload *cls_bpf = type_data;
++ 	struct nfp_net *nn = cb_priv;
++ 	struct bpf_prog *oldprog;
++ 	struct nfp_bpf_vnic *bv;
++ 	int err;
++ 
++ 	if (type != TC_SETUP_CLSBPF) {
++ 		NL_SET_ERR_MSG_MOD(cls_bpf->common.extack,
++ 				   "only offload of BPF classifiers supported");
++ 		return -EOPNOTSUPP;
++ 	}
++ 	if (!tc_cls_can_offload_and_chain0(nn->dp.netdev, &cls_bpf->common))
++ 		return -EOPNOTSUPP;
++ 	if (!nfp_net_ebpf_capable(nn)) {
++ 		NL_SET_ERR_MSG_MOD(cls_bpf->common.extack,
++ 				   "NFP firmware does not support eBPF offload");
++ 		return -EOPNOTSUPP;
++ 	}
++ 	if (cls_bpf->common.protocol != htons(ETH_P_ALL)) {
++ 		NL_SET_ERR_MSG_MOD(cls_bpf->common.extack,
++ 				   "only ETH_P_ALL supported as filter protocol");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	/* Only support TC direct action */
++ 	if (!cls_bpf->exts_integrated ||
++ 	    tcf_exts_has_actions(cls_bpf->exts)) {
++ 		NL_SET_ERR_MSG_MOD(cls_bpf->common.extack,
++ 				   "only direct action with no legacy actions supported");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	if (cls_bpf->command != TC_CLSBPF_OFFLOAD)
++ 		return -EOPNOTSUPP;
++ 
++ 	bv = nn->app_priv;
++ 	oldprog = cls_bpf->oldprog;
++ 
++ 	/* Don't remove if oldprog doesn't match driver's state */
++ 	if (bv->tc_prog != oldprog) {
++ 		oldprog = NULL;
++ 		if (!cls_bpf->prog)
++ 			return 0;
++ 	}
++ 
++ 	err = nfp_net_bpf_offload(nn, cls_bpf->prog, oldprog,
++ 				  cls_bpf->common.extack);
++ 	if (err)
++ 		return err;
++ 
++ 	bv->tc_prog = cls_bpf->prog;
++ 	nn->port->tc_offload_cnt = !!bv->tc_prog;
++ 	return 0;
++ }
++ 
++ static int nfp_bpf_setup_tc_block(struct net_device *netdev,
++ 				  struct tc_block_offload *f)
++ {
++ 	struct nfp_net *nn = netdev_priv(netdev);
++ 
++ 	if (f->binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (f->command) {
++ 	case TC_BLOCK_BIND:
++ 		return tcf_block_cb_register(f->block,
++ 					     nfp_bpf_setup_tc_block_cb,
++ 					     nn, nn);
++ 	case TC_BLOCK_UNBIND:
++ 		tcf_block_cb_unregister(f->block,
++ 					nfp_bpf_setup_tc_block_cb,
++ 					nn);
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
+++>>>>>>> d692403e5cf8 (nfp: forbid disabling hw-tc-offload on representors while offload active)
+  }
+  
+  static int nfp_bpf_setup_tc(struct nfp_app *app, struct net_device *netdev,
+  			    enum tc_setup_type type, void *type_data)
+  {
+ -	switch (type) {
+ -	case TC_SETUP_BLOCK:
+ -		return nfp_bpf_setup_tc_block(netdev, type_data);
+ -	default:
+ +#if 0 /* Not in RHEL7 */
+ +	struct nfp_net *nn = netdev_priv(netdev);
+ +
+ +	if (TC_H_MAJ(handle) != TC_H_MAJ(TC_H_INGRESS))
+  		return -EOPNOTSUPP;
+ +	if (proto != htons(ETH_P_ALL))
+ +		return -EOPNOTSUPP;
+ +
+ +	if (tc->type == TC_SETUP_CLSBPF && nfp_net_ebpf_capable(nn)) {
+ +		if (!nn->dp.bpf_offload_xdp)
+ +			return nfp_net_bpf_offload(nn, tc->cls_bpf);
+ +		else
+ +			return -EBUSY;
+  	}
+ +#endif
+ +
+ +	return -EINVAL;
+  }
+  
+++<<<<<<< HEAD
+ +static bool nfp_bpf_tc_busy(struct nfp_app *app, struct nfp_net *nn)
+ +{
+ +	struct nfp_bpf_vnic *bv = nn->app_priv;
+ +
+ +	return !!bv->tc_prog;
+++=======
++ static int
++ nfp_bpf_change_mtu(struct nfp_app *app, struct net_device *netdev, int new_mtu)
++ {
++ 	struct nfp_net *nn = netdev_priv(netdev);
++ 	unsigned int max_mtu;
++ 
++ 	if (~nn->dp.ctrl & NFP_NET_CFG_CTRL_BPF)
++ 		return 0;
++ 
++ 	max_mtu = nn_readb(nn, NFP_NET_CFG_BPF_INL_MTU) * 64 - 32;
++ 	if (new_mtu > max_mtu) {
++ 		nn_info(nn, "BPF offload active, MTU over %u not supported\n",
++ 			max_mtu);
++ 		return -EBUSY;
++ 	}
++ 	return 0;
++ }
++ 
++ static int
++ nfp_bpf_parse_cap_adjust_head(struct nfp_app_bpf *bpf, void __iomem *value,
++ 			      u32 length)
++ {
++ 	struct nfp_bpf_cap_tlv_adjust_head __iomem *cap = value;
++ 	struct nfp_cpp *cpp = bpf->app->pf->cpp;
++ 
++ 	if (length < sizeof(*cap)) {
++ 		nfp_err(cpp, "truncated adjust_head TLV: %d\n", length);
++ 		return -EINVAL;
++ 	}
++ 
++ 	bpf->adjust_head.flags = readl(&cap->flags);
++ 	bpf->adjust_head.off_min = readl(&cap->off_min);
++ 	bpf->adjust_head.off_max = readl(&cap->off_max);
++ 	bpf->adjust_head.guaranteed_sub = readl(&cap->guaranteed_sub);
++ 	bpf->adjust_head.guaranteed_add = readl(&cap->guaranteed_add);
++ 
++ 	if (bpf->adjust_head.off_min > bpf->adjust_head.off_max) {
++ 		nfp_err(cpp, "invalid adjust_head TLV: min > max\n");
++ 		return -EINVAL;
++ 	}
++ 	if (!FIELD_FIT(UR_REG_IMM_MAX, bpf->adjust_head.off_min) ||
++ 	    !FIELD_FIT(UR_REG_IMM_MAX, bpf->adjust_head.off_max)) {
++ 		nfp_warn(cpp, "disabling adjust_head - driver expects min/max to fit in as immediates\n");
++ 		memset(&bpf->adjust_head, 0, sizeof(bpf->adjust_head));
++ 		return 0;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int
++ nfp_bpf_parse_cap_func(struct nfp_app_bpf *bpf, void __iomem *value, u32 length)
++ {
++ 	struct nfp_bpf_cap_tlv_func __iomem *cap = value;
++ 
++ 	if (length < sizeof(*cap)) {
++ 		nfp_err(bpf->app->cpp, "truncated function TLV: %d\n", length);
++ 		return -EINVAL;
++ 	}
++ 
++ 	switch (readl(&cap->func_id)) {
++ 	case BPF_FUNC_map_lookup_elem:
++ 		bpf->helpers.map_lookup = readl(&cap->func_addr);
++ 		break;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int
++ nfp_bpf_parse_cap_maps(struct nfp_app_bpf *bpf, void __iomem *value, u32 length)
++ {
++ 	struct nfp_bpf_cap_tlv_maps __iomem *cap = value;
++ 
++ 	if (length < sizeof(*cap)) {
++ 		nfp_err(bpf->app->cpp, "truncated maps TLV: %d\n", length);
++ 		return -EINVAL;
++ 	}
++ 
++ 	bpf->maps.types = readl(&cap->types);
++ 	bpf->maps.max_maps = readl(&cap->max_maps);
++ 	bpf->maps.max_elems = readl(&cap->max_elems);
++ 	bpf->maps.max_key_sz = readl(&cap->max_key_sz);
++ 	bpf->maps.max_val_sz = readl(&cap->max_val_sz);
++ 	bpf->maps.max_elem_sz = readl(&cap->max_elem_sz);
++ 
++ 	return 0;
++ }
++ 
++ static int nfp_bpf_parse_capabilities(struct nfp_app *app)
++ {
++ 	struct nfp_cpp *cpp = app->pf->cpp;
++ 	struct nfp_cpp_area *area;
++ 	u8 __iomem *mem, *start;
++ 
++ 	mem = nfp_rtsym_map(app->pf->rtbl, "_abi_bpf_capabilities", "bpf.cap",
++ 			    8, &area);
++ 	if (IS_ERR(mem))
++ 		return PTR_ERR(mem) == -ENOENT ? 0 : PTR_ERR(mem);
++ 
++ 	start = mem;
++ 	while (mem - start + 8 < nfp_cpp_area_size(area)) {
++ 		u8 __iomem *value;
++ 		u32 type, length;
++ 
++ 		type = readl(mem);
++ 		length = readl(mem + 4);
++ 		value = mem + 8;
++ 
++ 		mem += 8 + length;
++ 		if (mem - start > nfp_cpp_area_size(area))
++ 			goto err_release_free;
++ 
++ 		switch (type) {
++ 		case NFP_BPF_CAP_TYPE_FUNC:
++ 			if (nfp_bpf_parse_cap_func(app->priv, value, length))
++ 				goto err_release_free;
++ 			break;
++ 		case NFP_BPF_CAP_TYPE_ADJUST_HEAD:
++ 			if (nfp_bpf_parse_cap_adjust_head(app->priv, value,
++ 							  length))
++ 				goto err_release_free;
++ 			break;
++ 		case NFP_BPF_CAP_TYPE_MAPS:
++ 			if (nfp_bpf_parse_cap_maps(app->priv, value, length))
++ 				goto err_release_free;
++ 			break;
++ 		default:
++ 			nfp_dbg(cpp, "unknown BPF capability: %d\n", type);
++ 			break;
++ 		}
++ 	}
++ 	if (mem - start != nfp_cpp_area_size(area)) {
++ 		nfp_err(cpp, "BPF capabilities left after parsing, parsed:%zd total length:%zu\n",
++ 			mem - start, nfp_cpp_area_size(area));
++ 		goto err_release_free;
++ 	}
++ 
++ 	nfp_cpp_area_release_free(area);
++ 
++ 	return 0;
++ 
++ err_release_free:
++ 	nfp_err(cpp, "invalid BPF capabilities at offset:%zd\n", mem - start);
++ 	nfp_cpp_area_release_free(area);
++ 	return -EINVAL;
++ }
++ 
++ static int nfp_bpf_init(struct nfp_app *app)
++ {
++ 	struct nfp_app_bpf *bpf;
++ 	int err;
++ 
++ 	bpf = kzalloc(sizeof(*bpf), GFP_KERNEL);
++ 	if (!bpf)
++ 		return -ENOMEM;
++ 	bpf->app = app;
++ 	app->priv = bpf;
++ 
++ 	skb_queue_head_init(&bpf->cmsg_replies);
++ 	init_waitqueue_head(&bpf->cmsg_wq);
++ 	INIT_LIST_HEAD(&bpf->map_list);
++ 
++ 	err = nfp_bpf_parse_capabilities(app);
++ 	if (err)
++ 		goto err_free_bpf;
++ 
++ 	return 0;
++ 
++ err_free_bpf:
++ 	kfree(bpf);
++ 	return err;
++ }
++ 
++ static void nfp_bpf_clean(struct nfp_app *app)
++ {
++ 	struct nfp_app_bpf *bpf = app->priv;
++ 
++ 	WARN_ON(!skb_queue_empty(&bpf->cmsg_replies));
++ 	WARN_ON(!list_empty(&bpf->map_list));
++ 	WARN_ON(bpf->maps_in_use || bpf->map_elems_in_use);
++ 	kfree(bpf);
+++>>>>>>> d692403e5cf8 (nfp: forbid disabling hw-tc-offload on representors while offload active)
+  }
+  
+  const struct nfp_app_type app_bpf = {
+@@@ -152,7 -420,9 +425,11 @@@
+  	.vnic_alloc	= nfp_bpf_vnic_alloc,
+  	.vnic_free	= nfp_bpf_vnic_free,
+  
+ -	.ctrl_msg_rx	= nfp_bpf_ctrl_msg_rx,
+ -
+  	.setup_tc	= nfp_bpf_setup_tc,
+++<<<<<<< HEAD
+ +	.tc_busy	= nfp_bpf_tc_busy,
+++=======
++ 	.bpf		= nfp_ndo_bpf,
+++>>>>>>> d692403e5cf8 (nfp: forbid disabling hw-tc-offload on representors while offload active)
+  	.xdp_offload	= nfp_bpf_xdp_offload,
+  };
+diff --cc drivers/net/ethernet/netronome/nfp/flower/offload.c
+index 4a2f6a2fef04,eb5c13dea8f5..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+@@@ -321,8 -346,10 +321,13 @@@ err_free_flow
+   */
+  static int
+  nfp_flower_add_offload(struct nfp_app *app, struct net_device *netdev,
+ -		       struct tc_cls_flower_offload *flow, bool egress)
+ +		       struct tc_cls_flower_offload *flow)
+  {
+++<<<<<<< HEAD
+++=======
++ 	enum nfp_flower_tun_type tun_type = NFP_FL_TUNNEL_NONE;
++ 	struct nfp_port *port = nfp_port_from_netdev(netdev);
+++>>>>>>> d692403e5cf8 (nfp: forbid disabling hw-tc-offload on representors while offload active)
+  	struct nfp_flower_priv *priv = app->priv;
+  	struct nfp_fl_payload *flow_pay;
+  	struct nfp_fl_key_ls *key_layer;
+@@@ -362,8 -390,8 +367,13 @@@
+  
+  	INIT_HLIST_NODE(&flow_pay->link);
+  	flow_pay->tc_flower_cookie = flow->cookie;
+++<<<<<<< HEAD
+ +	fl_key = nfp_flower_fl_key(flow->cookie);
+ +	hash_add_rcu(priv->flow_table, &flow_pay->link, fl_key);
+++=======
++ 	hash_add_rcu(priv->flow_table, &flow_pay->link, flow->cookie);
++ 	port->tc_offload_cnt++;
+++>>>>>>> d692403e5cf8 (nfp: forbid disabling hw-tc-offload on representors while offload active)
+  
+  	/* Deallocate flow payload when flower rule has been destroyed. */
+  	kfree(key_layer);
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_app.h
+index 96318a0e48d5,20546ae67909..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_app.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_app.h
+@@@ -82,7 -92,7 +82,11 @@@ extern const struct nfp_app_type app_fl
+   * @stop:	stop application logic
+   * @ctrl_msg_rx:    control message handler
+   * @setup_tc:	setup TC ndo
+++<<<<<<< HEAD
+ + * @tc_busy:	TC HW offload busy (rules loaded)
+++=======
++  * @bpf:	BPF ndo offload-related calls
+++>>>>>>> d692403e5cf8 (nfp: forbid disabling hw-tc-offload on representors while offload active)
+   * @xdp_offload:    offload an XDP program
+   * @eswitch_mode_get:    get SR-IOV eswitch mode
+   * @sriov_enable: app-specific sriov initialisation
+@@@ -116,9 -134,11 +120,14 @@@ struct nfp_app_type 
+  
+  	int (*setup_tc)(struct nfp_app *app, struct net_device *netdev,
+  			enum tc_setup_type type, void *type_data);
+++<<<<<<< HEAD
+ +	bool (*tc_busy)(struct nfp_app *app, struct nfp_net *nn);
+++=======
++ 	int (*bpf)(struct nfp_app *app, struct nfp_net *nn,
++ 		   struct netdev_bpf *xdp);
+++>>>>>>> d692403e5cf8 (nfp: forbid disabling hw-tc-offload on representors while offload active)
+  	int (*xdp_offload)(struct nfp_app *app, struct nfp_net *nn,
+ -			   struct bpf_prog *prog,
+ -			   struct netlink_ext_ack *extack);
+ +			   struct bpf_prog *prog);
+  
+  	int (*sriov_enable)(struct nfp_app *app, int num_vfs);
+  	void (*sriov_disable)(struct nfp_app *app);
+@@@ -248,17 -299,9 +257,10 @@@ static inline bool nfp_app_has_tc(struc
+  	return app && app->type->setup_tc;
+  }
+  
+- static inline bool nfp_app_tc_busy(struct nfp_app *app, struct nfp_net *nn)
+- {
+- 	if (!app || !app->type->tc_busy)
+- 		return false;
+- 	return app->type->tc_busy(app, nn);
+- }
+- 
+  static inline int nfp_app_setup_tc(struct nfp_app *app,
+  				   struct net_device *netdev,
+ -				   enum tc_setup_type type, void *type_data)
+ +				   enum tc_setup_type type,
+ +				   void *type_data)
+  {
+  	if (!app || !app->type->setup_tc)
+  		return -EOPNOTSUPP;
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/main.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/offload.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_app.h
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 9d4fd0a5bf40..1c24dc3f4cb2 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@ -3207,10 +3207,9 @@ static int nfp_net_set_features(struct net_device *netdev,
+ 			new_ctrl &= ~NFP_NET_CFG_CTRL_GATHER;
+ 	}
+ 
+-	if (changed & NETIF_F_HW_TC && nfp_app_tc_busy(nn->app, nn)) {
+-		nn_err(nn, "Cannot disable HW TC offload while in use\n");
+-		return -EBUSY;
+-	}
++	err = nfp_port_set_features(netdev, features);
++	if (err)
++		return err;
+ 
+ 	nn_dbg(nn, "Feature change 0x%llx -> 0x%llx (changed=0x%llx)\n",
+ 	       netdev->features, features, changed);
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_repr.c b/drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
+index 82a6593712ce..e7d3490b15a5 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_repr.c
+@@ -250,6 +250,7 @@ const struct net_device_ops nfp_repr_netdev_ops = {
+ 	.ndo_set_vf_spoofchk	= nfp_app_set_vf_spoofchk,
+ 	.ndo_get_vf_config	= nfp_app_get_vf_config,
+ 	.ndo_set_vf_link_state	= nfp_app_set_vf_link_state,
++	.ndo_set_features	= nfp_port_set_features,
+ };
+ 
+ static void nfp_repr_clean(struct nfp_repr *repr)
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_port.c b/drivers/net/ethernet/netronome/nfp/nfp_port.c
+index 34a6e035fe9a..7bd8be5c833b 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_port.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_port.c
+@@ -32,6 +32,7 @@
+  */
+ 
+ #include <linux/lockdep.h>
++#include <linux/netdevice.h>
+ #include <net/switchdev.h>
+ 
+ #include "nfpcore/nfp_cpp.h"
+@@ -100,6 +101,23 @@ int nfp_port_setup_tc(struct net_device *netdev, enum tc_setup_type type,
+ 	return nfp_app_setup_tc(port->app, netdev, type, type_data);
+ }
+ 
++int nfp_port_set_features(struct net_device *netdev, netdev_features_t features)
++{
++	struct nfp_port *port;
++
++	port = nfp_port_from_netdev(netdev);
++	if (!port)
++		return 0;
++
++	if ((netdev->features & NETIF_F_HW_TC) > (features & NETIF_F_HW_TC) &&
++	    port->tc_offload_cnt) {
++		netdev_err(netdev, "Cannot disable HW TC offload while offloads active\n");
++		return -EBUSY;
++	}
++
++	return 0;
++}
++
+ struct nfp_port *
+ nfp_port_from_id(struct nfp_pf *pf, enum nfp_port_type type, unsigned int id)
+ {
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_port.h b/drivers/net/ethernet/netronome/nfp/nfp_port.h
+index 08dec9adc318..d3d6607d0a18 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_port.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_port.h
+@@ -73,6 +73,8 @@ enum nfp_port_flags {
+  * @netdev:	backpointer to associated netdev
+  * @type:	what port type does the entity represent
+  * @flags:	port flags
++ * @tc_offload_cnt:	number of active TC offloads, how offloads are counted
++ *			is not defined, use as a boolean
+  * @app:	backpointer to the app structure
+  * @dl_port:	devlink port structure
+  * @eth_id:	for %NFP_PORT_PHYS_PORT port ID in NFP enumeration scheme
+@@ -88,6 +90,7 @@ struct nfp_port {
+ 	enum nfp_port_type type;
+ 
+ 	unsigned long flags;
++	unsigned long tc_offload_cnt;
+ 
+ 	struct nfp_app *app;
+ 
+@@ -122,6 +125,9 @@ static inline bool nfp_port_is_vnic(const struct nfp_port *port)
+ 	return port->type == NFP_PORT_PF_PORT || port->type == NFP_PORT_VF_PORT;
+ }
+ 
++int
++nfp_port_set_features(struct net_device *netdev, netdev_features_t features);
++
+ struct nfp_port *nfp_port_from_netdev(struct net_device *netdev);
+ struct nfp_port *
+ nfp_port_from_id(struct nfp_pf *pf, enum nfp_port_type type, unsigned int id);
