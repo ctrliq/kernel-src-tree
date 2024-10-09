@@ -1,0 +1,168 @@
+ASoC: Intel: bytcr_rt5651: Add support for Bay Trail CR / SSP0 using boards
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [sound] alsa: asoc: intel: bytcr_rt5651: Add support for Bay Trail CR / SSP0 using boards (Jaroslav Kysela) [1535427]
+Rebuild_FUZZ: 96.15%
+commit-author Hans de Goede <hdegoede@redhat.com>
+commit 8a880a2014e3ab50e66252335bd71d61b0487a30
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/8a880a20.failed
+
+Despite its name being prefixed with bytcr, before this commit the
+bytcr_rt5651 machine driver could not work with Bay Trail CR boards,
+as those only have SSP0 and it only supported SSP0-AIF1 setups.
+
+This commit adds support for this, autodetecting AIF1 vs AIF2 based on
+BIOS tables.
+
+While at it also add support for SSP2-AIF2 setups, as that requires only
+minimal extra code on top of the code adding SSP0-AIF1 / SSP0-AIF2 support.
+
+Note this code is all copy-pasted from bytcr_rt5640.c. I've looked into
+merging the 2 machine drivers into 1 to avoid copy-pasting, but there are
+enough subtile differences to make this hard *and* with all the quirks the
+machine driver already is full with if (variant-foo) then ... else ...
+constructs adding more of these is going to make the code unreadable.
+
+	Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 8a880a2014e3ab50e66252335bd71d61b0487a30)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/intel/boards/bytcr_rt5651.c
+diff --cc sound/soc/intel/boards/bytcr_rt5651.c
+index 63d4e02a2080,103c4b0e6505..000000000000
+--- a/sound/soc/intel/boards/bytcr_rt5651.c
++++ b/sound/soc/intel/boards/bytcr_rt5651.c
+@@@ -604,13 -680,33 +680,37 @@@ static struct snd_soc_card byt_rt5651_c
+  	.fully_routed = true,
+  };
+  
+++<<<<<<< HEAD
+ +static char byt_rt5651_codec_name[16]; /* i2c-<HID>:00 with HID being 8 chars */
+++=======
++ static char byt_rt5651_codec_name[SND_ACPI_I2C_ID_LEN];
++ static char byt_rt5651_codec_aif_name[12]; /*  = "rt5651-aif[1|2]" */
++ static char byt_rt5651_cpu_dai_name[10]; /*  = "ssp[0|2]-port" */
++ 
++ static bool is_valleyview(void)
++ {
++ 	static const struct x86_cpu_id cpu_ids[] = {
++ 		{ X86_VENDOR_INTEL, 6, 55 }, /* Valleyview, Bay Trail */
++ 		{}
++ 	};
++ 
++ 	if (!x86_match_cpu(cpu_ids))
++ 		return false;
++ 	return true;
++ }
++ 
++ struct acpi_chan_package {   /* ACPICA seems to require 64 bit integers */
++ 	u64 aif_value;       /* 1: AIF1, 2: AIF2 */
++ 	u64 mclock_value;    /* usually 25MHz (0x17d7940), ignored */
++ };
+++>>>>>>> 8a880a2014e3 (ASoC: Intel: bytcr_rt5651: Add support for Bay Trail CR / SSP0 using boards)
+  
+  static int snd_byt_rt5651_mc_probe(struct platform_device *pdev)
+  {
+  	struct byt_rt5651_private *priv;
+ -	struct snd_soc_acpi_mach *mach;
+ +	struct sst_acpi_mach *mach;
+  	const char *i2c_name = NULL;
++ 	bool is_bytcr = false;
+  	int ret_val = 0;
+  	int dai_index = 0;
+  	int i;
+@@@ -634,14 -730,82 +734,81 @@@
+  	}
+  
+  	/* fixup codec name based on HID */
+ -	i2c_name = acpi_dev_get_first_match_name(mach->id, NULL, -1);
+ -	if (!i2c_name) {
+ -		dev_err(&pdev->dev, "Error cannot find '%s' dev\n", mach->id);
+ -		return -ENODEV;
+ +	i2c_name = sst_acpi_find_name_from_hid(mach->id);
+ +	if (i2c_name) {
+ +		snprintf(byt_rt5651_codec_name, sizeof(byt_rt5651_codec_name),
+ +			"%s%s", "i2c-", i2c_name);
+ +
+ +		byt_rt5651_dais[dai_index].codec_name = byt_rt5651_codec_name;
+  	}
+ -	snprintf(byt_rt5651_codec_name, sizeof(byt_rt5651_codec_name),
+ -		"%s%s", "i2c-", i2c_name);
+ -	byt_rt5651_dais[dai_index].codec_name = byt_rt5651_codec_name;
+  
++ 	/*
++ 	 * swap SSP0 if bytcr is detected
++ 	 * (will be overridden if DMI quirk is detected)
++ 	 */
++ 	if (is_valleyview()) {
++ 		struct sst_platform_info *p_info = mach->pdata;
++ 		const struct sst_res_info *res_info = p_info->res_info;
++ 
++ 		if (res_info->acpi_ipc_irq_index == 0)
++ 			is_bytcr = true;
++ 	}
++ 
++ 	if (is_bytcr) {
++ 		/*
++ 		 * Baytrail CR platforms may have CHAN package in BIOS, try
++ 		 * to find relevant routing quirk based as done on Windows
++ 		 * platforms. We have to read the information directly from the
++ 		 * BIOS, at this stage the card is not created and the links
++ 		 * with the codec driver/pdata are non-existent
++ 		 */
++ 
++ 		struct acpi_chan_package chan_package;
++ 
++ 		/* format specified: 2 64-bit integers */
++ 		struct acpi_buffer format = {sizeof("NN"), "NN"};
++ 		struct acpi_buffer state = {0, NULL};
++ 		struct snd_soc_acpi_package_context pkg_ctx;
++ 		bool pkg_found = false;
++ 
++ 		state.length = sizeof(chan_package);
++ 		state.pointer = &chan_package;
++ 
++ 		pkg_ctx.name = "CHAN";
++ 		pkg_ctx.length = 2;
++ 		pkg_ctx.format = &format;
++ 		pkg_ctx.state = &state;
++ 		pkg_ctx.data_valid = false;
++ 
++ 		pkg_found = snd_soc_acpi_find_package_from_hid(mach->id,
++ 							       &pkg_ctx);
++ 		if (pkg_found) {
++ 			if (chan_package.aif_value == 1) {
++ 				dev_info(&pdev->dev, "BIOS Routing: AIF1 connected\n");
++ 				byt_rt5651_quirk |= BYT_RT5651_SSP0_AIF1;
++ 			} else  if (chan_package.aif_value == 2) {
++ 				dev_info(&pdev->dev, "BIOS Routing: AIF2 connected\n");
++ 				byt_rt5651_quirk |= BYT_RT5651_SSP0_AIF2;
++ 			} else {
++ 				dev_info(&pdev->dev, "BIOS Routing isn't valid, ignored\n");
++ 				pkg_found = false;
++ 			}
++ 		}
++ 
++ 		if (!pkg_found) {
++ 			/* no BIOS indications, assume SSP0-AIF2 connection */
++ 			byt_rt5651_quirk |= BYT_RT5651_SSP0_AIF2;
++ 		}
++ 
++ 		/* change defaults for Baytrail-CR capture */
++ 		byt_rt5651_quirk |= BYT_RT5651_JD1_1 |
++ 				    BYT_RT5651_OVCD_TH_2000UA |
++ 				    BYT_RT5651_OVCD_SF_0P75 |
++ 				    BYT_RT5651_IN2_HS_IN3_MAP;
++ 	} else {
++ 		byt_rt5651_quirk |= BYT_RT5651_DMIC_MAP;
++ 	}
++ 
+  	/* check quirks before creating card */
+  	dmi_check_system(byt_rt5651_quirk_table);
+  
+* Unmerged path sound/soc/intel/boards/bytcr_rt5651.c
