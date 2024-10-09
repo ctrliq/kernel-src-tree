@@ -51,10 +51,6 @@ static inline unsigned int tcf_hash(u32 index, unsigned int hmask)
 #define ACT_P_CREATED 1
 #define ACT_P_DELETED 1
 
-struct tcf_act_hdr {
-	struct tcf_common	common;
-};
-
 struct tc_action {
 	void			*priv;
 	const struct tc_action_ops	*ops;
