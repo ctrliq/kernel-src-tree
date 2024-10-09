@@ -1,0 +1,445 @@
+perf stat: Output JSON MetricExpr metric
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Andi Kleen <ak@linux.intel.com>
+commit 37932c188ef1b471eae29249df045c8e567772d0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/37932c18.failed
+
+Add generic infrastructure to perf stat to output ratios for
+"MetricExpr" entries in the event lists. Many events are more useful as
+ratios than in raw form, typically some count in relation to total
+ticks.
+
+Transfer the MetricExpr information from the alias to the evsel.
+
+We mark the events that need to be collected for MetricExpr, and also
+link the events using them with a pointer. The code is careful to always
+prefer the right event in the same group to minimize multiplexing
+errors. At the moment only a single relation is supported.
+
+Then add a rblist to the stat shadow code that remembers stats based on
+the cpu and context.
+
+Then finally update and retrieve and print these values similarly to the
+existing hardcoded perf metrics. We use the simple expression parser
+added earlier to evaluate the expression.
+
+Normally we just output the result without further commentary, but for
+--metric-only this would lead to empty columns. So for this case use the
+original event as description.
+
+There is no attempt to automatically add the MetricExpr event, if it is
+missing, however we suggest it to the user, because the user tool
+doesn't have enough information to reliably construct a group that is
+guaranteed to schedule. So we leave that to the user.
+
+  % perf stat -a -I 1000 -e '{unc_p_clockticks,unc_p_freq_max_os_cycles}'
+       1.000147889        800,085,181      unc_p_clockticks
+       1.000147889         93,126,241      unc_p_freq_max_os_cycles  #     11.6
+       2.000448381        800,218,217      unc_p_clockticks
+       2.000448381        142,516,095      unc_p_freq_max_os_cycles  #     17.8
+       3.000639852        800,243,057      unc_p_clockticks
+       3.000639852        162,292,689      unc_p_freq_max_os_cycles  #     20.3
+
+  % perf stat -a -I 1000 -e '{unc_p_clockticks,unc_p_freq_max_os_cycles}' --metric-only
+  #    time         freq_max_os_cycles %
+       1.000127077      0.9
+       2.000301436      0.7
+       3.000456379      0.0
+
+v2: Change from DivideBy to MetricExpr
+v3: Use expr__ prefix.  Support more than one other event.
+v4: Update description
+v5: Only print warning message once for multiple PMUs.
+
+	Signed-off-by: Andi Kleen <ak@linux.intel.com>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+Link: http://lkml.kernel.org/r/20170320201711.14142-11-andi@firstfloor.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 37932c188ef1b471eae29249df045c8e567772d0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/evsel.h
+diff --cc tools/perf/util/evsel.h
+index 8e15288107c4,8f1f61826fdf..000000000000
+--- a/tools/perf/util/evsel.h
++++ b/tools/perf/util/evsel.h
+@@@ -128,6 -130,11 +128,14 @@@ struct perf_evsel 
+  	char			*group_name;
+  	bool			cmdline_group_boundary;
+  	struct list_head	config_terms;
+++<<<<<<< HEAD
+++=======
++ 	int			bpf_fd;
++ 	bool			merged_stat;
++ 	const char *		metric_expr;
++ 	struct perf_evsel	**metric_events;
++ 	bool			collect_stat;
+++>>>>>>> 37932c188ef1 (perf stat: Output JSON MetricExpr metric)
+  };
+  
+  union u64_swap {
+diff --git a/tools/perf/builtin-stat.c b/tools/perf/builtin-stat.c
+index 5e791d50f97c..ca0175925e55 100644
+--- a/tools/perf/builtin-stat.c
++++ b/tools/perf/builtin-stat.c
+@@ -1144,6 +1144,7 @@ static void printout(int id, int nr, struct perf_evsel *counter, double uval,
+ 	out.print_metric = pm;
+ 	out.new_line = nl;
+ 	out.ctx = &os;
++	out.force_header = false;
+ 
+ 	if (csv_output && !metric_only) {
+ 		print_noise(counter, noise);
+@@ -1451,6 +1452,7 @@ static void print_metric_headers(const char *prefix, bool no_indent)
+ 		out.ctx = &os;
+ 		out.print_metric = print_metric_header;
+ 		out.new_line = new_line_metric;
++		out.force_header = true;
+ 		os.evsel = counter;
+ 		perf_stat__print_shadow_stats(counter, 0,
+ 					      0,
+@@ -2468,6 +2470,7 @@ int cmd_stat(int argc, const char **argv, const char *prefix __maybe_unused)
+ 	argc = parse_options_subcommand(argc, argv, stat_options, stat_subcommands,
+ 					(const char **) stat_usage,
+ 					PARSE_OPT_STOP_AT_NON_OPTION);
++	perf_stat__collect_metric_expr(evsel_list);
+ 	perf_stat__init_shadow_stats();
+ 
+ 	if (csv_sep) {
+diff --git a/tools/perf/util/evsel.c b/tools/perf/util/evsel.c
+index 4966d6462cb1..acb0721392d8 100644
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@ -235,6 +235,9 @@ void perf_evsel__init(struct perf_evsel *evsel,
+ 	evsel->sample_size = __perf_evsel__sample_size(attr->sample_type);
+ 	perf_evsel__calc_id_pos(evsel);
+ 	evsel->cmdline_group_boundary = false;
++	evsel->metric_expr   = NULL;
++	evsel->metric_events = NULL;
++	evsel->collect_stat  = false;
+ }
+ 
+ struct perf_evsel *perf_evsel__new_idx(struct perf_event_attr *attr, int idx)
+* Unmerged path tools/perf/util/evsel.h
+diff --git a/tools/perf/util/parse-events.c b/tools/perf/util/parse-events.c
+index 3c6f7bbf0303..9fcb9396cd55 100644
+--- a/tools/perf/util/parse-events.c
++++ b/tools/perf/util/parse-events.c
+@@ -1021,6 +1021,7 @@ int parse_events_add_pmu(struct parse_events_evlist *data,
+ 		evsel->scale = info.scale;
+ 		evsel->per_pkg = info.per_pkg;
+ 		evsel->snapshot = info.snapshot;
++		evsel->metric_expr = info.metric_expr;
+ 	}
+ 
+ 	return evsel ? 0 : -ENOMEM;
+diff --git a/tools/perf/util/pmu.c b/tools/perf/util/pmu.c
+index 0583e1bdc762..4d9632390ab1 100644
+--- a/tools/perf/util/pmu.c
++++ b/tools/perf/util/pmu.c
+@@ -985,6 +985,7 @@ int perf_pmu__check_alias(struct perf_pmu *pmu, struct list_head *head_terms,
+ 	info->unit     = NULL;
+ 	info->scale    = 0.0;
+ 	info->snapshot = false;
++	info->metric_expr = NULL;
+ 
+ 	list_for_each_entry_safe(term, h, head_terms, list) {
+ 		alias = pmu_find_alias(pmu, term);
+@@ -1000,6 +1001,7 @@ int perf_pmu__check_alias(struct perf_pmu *pmu, struct list_head *head_terms,
+ 
+ 		if (alias->per_pkg)
+ 			info->per_pkg = true;
++		info->metric_expr = alias->metric_expr;
+ 
+ 		list_del(&term->list);
+ 		free(term);
+diff --git a/tools/perf/util/pmu.h b/tools/perf/util/pmu.h
+index 3dccb15f29e9..27f078ccc594 100644
+--- a/tools/perf/util/pmu.h
++++ b/tools/perf/util/pmu.h
+@@ -31,6 +31,7 @@ struct perf_pmu {
+ 
+ struct perf_pmu_info {
+ 	const char *unit;
++	const char *metric_expr;
+ 	double scale;
+ 	bool per_pkg;
+ 	bool snapshot;
+diff --git a/tools/perf/util/stat-shadow.c b/tools/perf/util/stat-shadow.c
+index 8a2bbd2a4d82..c323cce97d98 100644
+--- a/tools/perf/util/stat-shadow.c
++++ b/tools/perf/util/stat-shadow.c
+@@ -3,6 +3,9 @@
+ #include "stat.h"
+ #include "color.h"
+ #include "pmu.h"
++#include "rblist.h"
++#include "evlist.h"
++#include "expr.h"
+ 
+ enum {
+ 	CTX_BIT_USER	= 1 << 0,
+@@ -41,13 +44,73 @@ static struct stats runtime_topdown_slots_issued[NUM_CTX][MAX_NR_CPUS];
+ static struct stats runtime_topdown_slots_retired[NUM_CTX][MAX_NR_CPUS];
+ static struct stats runtime_topdown_fetch_bubbles[NUM_CTX][MAX_NR_CPUS];
+ static struct stats runtime_topdown_recovery_bubbles[NUM_CTX][MAX_NR_CPUS];
++static struct rblist runtime_saved_values;
+ static bool have_frontend_stalled;
+ 
+ struct stats walltime_nsecs_stats;
+ 
++struct saved_value {
++	struct rb_node rb_node;
++	struct perf_evsel *evsel;
++	int cpu;
++	int ctx;
++	struct stats stats;
++};
++
++static int saved_value_cmp(struct rb_node *rb_node, const void *entry)
++{
++	struct saved_value *a = container_of(rb_node,
++					     struct saved_value,
++					     rb_node);
++	const struct saved_value *b = entry;
++
++	if (a->ctx != b->ctx)
++		return a->ctx - b->ctx;
++	if (a->cpu != b->cpu)
++		return a->cpu - b->cpu;
++	return a->evsel - b->evsel;
++}
++
++static struct rb_node *saved_value_new(struct rblist *rblist __maybe_unused,
++				     const void *entry)
++{
++	struct saved_value *nd = malloc(sizeof(struct saved_value));
++
++	if (!nd)
++		return NULL;
++	memcpy(nd, entry, sizeof(struct saved_value));
++	return &nd->rb_node;
++}
++
++static struct saved_value *saved_value_lookup(struct perf_evsel *evsel,
++					      int cpu, int ctx,
++					      bool create)
++{
++	struct rb_node *nd;
++	struct saved_value dm = {
++		.cpu = cpu,
++		.ctx = ctx,
++		.evsel = evsel,
++	};
++	nd = rblist__find(&runtime_saved_values, &dm);
++	if (nd)
++		return container_of(nd, struct saved_value, rb_node);
++	if (create) {
++		rblist__add_node(&runtime_saved_values, &dm);
++		nd = rblist__find(&runtime_saved_values, &dm);
++		if (nd)
++			return container_of(nd, struct saved_value, rb_node);
++	}
++	return NULL;
++}
++
+ void perf_stat__init_shadow_stats(void)
+ {
+ 	have_frontend_stalled = pmu_have_event("cpu", "stalled-cycles-frontend");
++	rblist__init(&runtime_saved_values);
++	runtime_saved_values.node_cmp = saved_value_cmp;
++	runtime_saved_values.node_new = saved_value_new;
++	/* No delete for now */
+ }
+ 
+ static int evsel_context(struct perf_evsel *evsel)
+@@ -70,6 +133,8 @@ static int evsel_context(struct perf_evsel *evsel)
+ 
+ void perf_stat__reset_shadow_stats(void)
+ {
++	struct rb_node *pos, *next;
++
+ 	memset(runtime_nsecs_stats, 0, sizeof(runtime_nsecs_stats));
+ 	memset(runtime_cycles_stats, 0, sizeof(runtime_cycles_stats));
+ 	memset(runtime_stalled_cycles_front_stats, 0, sizeof(runtime_stalled_cycles_front_stats));
+@@ -92,6 +157,15 @@ void perf_stat__reset_shadow_stats(void)
+ 	memset(runtime_topdown_slots_issued, 0, sizeof(runtime_topdown_slots_issued));
+ 	memset(runtime_topdown_fetch_bubbles, 0, sizeof(runtime_topdown_fetch_bubbles));
+ 	memset(runtime_topdown_recovery_bubbles, 0, sizeof(runtime_topdown_recovery_bubbles));
++
++	next = rb_first(&runtime_saved_values.entries);
++	while (next) {
++		pos = next;
++		next = rb_next(pos);
++		memset(&container_of(pos, struct saved_value, rb_node)->stats,
++		       0,
++		       sizeof(struct stats));
++	}
+ }
+ 
+ /*
+@@ -143,6 +217,12 @@ void perf_stat__update_shadow_stats(struct perf_evsel *counter, u64 *count,
+ 		update_stats(&runtime_dtlb_cache_stats[ctx][cpu], count[0]);
+ 	else if (perf_evsel__match(counter, HW_CACHE, HW_CACHE_ITLB))
+ 		update_stats(&runtime_itlb_cache_stats[ctx][cpu], count[0]);
++
++	if (counter->collect_stat) {
++		struct saved_value *v = saved_value_lookup(counter, cpu, ctx,
++							   true);
++		update_stats(&v->stats, count[0]);
++	}
+ }
+ 
+ /* used for get_ratio_color() */
+@@ -172,6 +252,95 @@ static const char *get_ratio_color(enum grc_type type, double ratio)
+ 	return color;
+ }
+ 
++static struct perf_evsel *perf_stat__find_event(struct perf_evlist *evsel_list,
++						const char *name)
++{
++	struct perf_evsel *c2;
++
++	evlist__for_each_entry (evsel_list, c2) {
++		if (!strcasecmp(c2->name, name))
++			return c2;
++	}
++	return NULL;
++}
++
++/* Mark MetricExpr target events and link events using them to them. */
++void perf_stat__collect_metric_expr(struct perf_evlist *evsel_list)
++{
++	struct perf_evsel *counter, *leader, **metric_events, *oc;
++	bool found;
++	const char **metric_names;
++	int i;
++	int num_metric_names;
++
++	evlist__for_each_entry(evsel_list, counter) {
++		bool invalid = false;
++
++		leader = counter->leader;
++		if (!counter->metric_expr)
++			continue;
++		metric_events = counter->metric_events;
++		if (!metric_events) {
++			if (expr__find_other(counter->metric_expr, counter->name,
++						&metric_names, &num_metric_names) < 0)
++				continue;
++
++			metric_events = calloc(sizeof(struct perf_evsel *),
++					       num_metric_names + 1);
++			if (!metric_events)
++				return;
++			counter->metric_events = metric_events;
++		}
++
++		for (i = 0; i < num_metric_names; i++) {
++			found = false;
++			if (leader) {
++				/* Search in group */
++				for_each_group_member (oc, leader) {
++					if (!strcasecmp(oc->name, metric_names[i])) {
++						found = true;
++						break;
++					}
++				}
++			}
++			if (!found) {
++				/* Search ignoring groups */
++				oc = perf_stat__find_event(evsel_list, metric_names[i]);
++			}
++			if (!oc) {
++				/* Deduping one is good enough to handle duplicated PMUs. */
++				static char *printed;
++
++				/*
++				 * Adding events automatically would be difficult, because
++				 * it would risk creating groups that are not schedulable.
++				 * perf stat doesn't understand all the scheduling constraints
++				 * of events. So we ask the user instead to add the missing
++				 * events.
++				 */
++				if (!printed || strcasecmp(printed, metric_names[i])) {
++					fprintf(stderr,
++						"Add %s event to groups to get metric expression for %s\n",
++						metric_names[i],
++						counter->name);
++					printed = strdup(metric_names[i]);
++				}
++				invalid = true;
++				continue;
++			}
++			metric_events[i] = oc;
++			oc->collect_stat = true;
++		}
++		metric_events[i] = NULL;
++		free(metric_names);
++		if (invalid) {
++			free(metric_events);
++			counter->metric_events = NULL;
++			counter->metric_expr = NULL;
++		}
++	}
++}
++
+ static void print_stalled_cycles_frontend(int cpu,
+ 					  struct perf_evsel *evsel, double avg,
+ 					  struct perf_stat_output_ctx *out)
+@@ -614,6 +783,32 @@ void perf_stat__print_shadow_stats(struct perf_evsel *evsel,
+ 					be_bound * 100.);
+ 		else
+ 			print_metric(ctxp, NULL, NULL, name, 0);
++	} else if (evsel->metric_expr) {
++		struct parse_ctx pctx;
++		int i;
++
++		expr__ctx_init(&pctx);
++		expr__add_id(&pctx, evsel->name, avg);
++		for (i = 0; evsel->metric_events[i]; i++) {
++			struct saved_value *v;
++
++			v = saved_value_lookup(evsel->metric_events[i], cpu, ctx, false);
++			if (!v)
++				break;
++			expr__add_id(&pctx, evsel->metric_events[i]->name,
++					     avg_stats(&v->stats));
++		}
++		if (!evsel->metric_events[i]) {
++			const char *p = evsel->metric_expr;
++
++			if (expr__parse(&ratio, &pctx, &p) == 0)
++				print_metric(ctxp, NULL, "%8.1f",
++					out->force_header ? evsel->name : "",
++					ratio);
++			else
++				print_metric(ctxp, NULL, NULL, "", 0);
++		} else
++			print_metric(ctxp, NULL, NULL, "", 0);
+ 	} else if (runtime_nsecs_stats[cpu].n != 0) {
+ 		char unit = 'M';
+ 		char unit_buf[10];
+diff --git a/tools/perf/util/stat.h b/tools/perf/util/stat.h
+index c29bb94c48a4..0a65ae23f495 100644
+--- a/tools/perf/util/stat.h
++++ b/tools/perf/util/stat.h
+@@ -85,11 +85,13 @@ struct perf_stat_output_ctx {
+ 	void *ctx;
+ 	print_metric_t print_metric;
+ 	new_line_t new_line;
++	bool force_header;
+ };
+ 
+ void perf_stat__print_shadow_stats(struct perf_evsel *evsel,
+ 				   double avg, int cpu,
+ 				   struct perf_stat_output_ctx *out);
++void perf_stat__collect_metric_expr(struct perf_evlist *);
+ 
+ int perf_evlist__alloc_stats(struct perf_evlist *evlist, bool alloc_raw);
+ void perf_evlist__free_stats(struct perf_evlist *evlist);
