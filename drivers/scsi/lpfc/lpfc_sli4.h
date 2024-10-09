@@ -645,6 +645,7 @@ struct lpfc_rpi_hdr {
 	struct lpfc_dmabuf *dmabuf;
 	uint32_t page_count;
 	uint32_t start_rpi;
+	uint16_t next_rpi;
 };
 
 struct lpfc_rsrc_blks {
