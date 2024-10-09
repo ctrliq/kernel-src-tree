@@ -1,0 +1,145 @@
+bpf: add faked "ending" subprog
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jiong Wang <jiong.wang@netronome.com>
+commit 4cb3d99c84ccbf728ff0e381c7c9815c3fa2bd5e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/4cb3d99c.failed
+
+There are quite a few code snippet like the following in verifier:
+
+       subprog_start = 0;
+       if (env->subprog_cnt == cur_subprog + 1)
+               subprog_end = insn_cnt;
+       else
+               subprog_end = env->subprog_info[cur_subprog + 1].start;
+
+The reason is there is no marker in subprog_info array to tell the end of
+it.
+
+We could resolve this issue by introducing a faked "ending" subprog.
+The special "ending" subprog is with "insn_cnt" as start offset, so it is
+serving as the end mark whenever we iterate over all subprogs.
+
+	Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 4cb3d99c84ccbf728ff0e381c7c9815c3fa2bd5e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/verifier.c
+diff --cc kernel/bpf/verifier.c
+index 9f1b98f148a8,37e0affa515e..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -810,16 -810,18 +810,26 @@@ static int check_subprogs(struct bpf_ve
+  			return ret;
+  	}
+  
++ 	/* Add a fake 'exit' subprog which could simplify subprog iteration
++ 	 * logic. 'subprog_cnt' should not be increased.
++ 	 */
++ 	subprog[env->subprog_cnt].start = insn_cnt;
++ 
+  	if (env->log.level > 1)
+  		for (i = 0; i < env->subprog_cnt; i++)
+ -			verbose(env, "func#%d @%d\n", i, subprog[i].start);
+ +			verbose(env, "func#%d @%d\n", i, env->subprog_starts[i]);
+  
+  	/* now check that all jumps are within the same subprog */
+++<<<<<<< HEAD
+ +	subprog_start = 0;
+ +	if (env->subprog_cnt == cur_subprog)
+ +		subprog_end = insn_cnt;
+ +	else
+ +		subprog_end = env->subprog_starts[cur_subprog++];
+++=======
++ 	subprog_start = subprog[cur_subprog].start;
++ 	subprog_end = subprog[cur_subprog + 1].start;
+++>>>>>>> 4cb3d99c84cc (bpf: add faked "ending" subprog)
+  	for (i = 0; i < insn_cnt; i++) {
+  		u8 code = insn[i].code;
+  
+@@@ -844,10 -846,9 +854,16 @@@ next
+  				return -EINVAL;
+  			}
+  			subprog_start = subprog_end;
+++<<<<<<< HEAD
+ +			if (env->subprog_cnt == cur_subprog)
+ +				subprog_end = insn_cnt;
+ +			else
+ +				subprog_end = env->subprog_starts[cur_subprog++];
+++=======
++ 			cur_subprog++;
++ 			if (cur_subprog < env->subprog_cnt)
++ 				subprog_end = subprog[cur_subprog + 1].start;
+++>>>>>>> 4cb3d99c84cc (bpf: add faked "ending" subprog)
+  		}
+  	}
+  	return 0;
+@@@ -1524,9 -1499,9 +1540,8 @@@ static int update_stack_depth(struct bp
+   */
+  static int check_max_stack_depth(struct bpf_verifier_env *env)
+  {
+ -	int depth = 0, frame = 0, idx = 0, i = 0, subprog_end;
+ -	struct bpf_subprog_info *subprog = env->subprog_info;
+ +	int depth = 0, frame = 0, subprog = 0, i = 0, subprog_end;
+  	struct bpf_insn *insn = env->prog->insnsi;
+- 	int insn_cnt = env->prog->len;
+  	int ret_insn[MAX_CALL_FRAMES];
+  	int ret_prog[MAX_CALL_FRAMES];
+  
+@@@ -1541,10 -1516,7 +1556,14 @@@ process_func
+  		return -EACCES;
+  	}
+  continue_func:
+++<<<<<<< HEAD
+ +	if (env->subprog_cnt == subprog)
+ +		subprog_end = insn_cnt;
+ +	else
+ +		subprog_end = env->subprog_starts[subprog];
+++=======
++ 	subprog_end = subprog[idx + 1].start;
+++>>>>>>> 4cb3d99c84cc (bpf: add faked "ending" subprog)
+  	for (; i < subprog_end; i++) {
+  		if (insn[i].code != (BPF_JMP | BPF_CALL))
+  			continue;
+@@@ -5083,10 -5137,11 +5102,16 @@@ static void adjust_subprog_starts(struc
+  
+  	if (len == 1)
+  		return;
+++<<<<<<< HEAD
+ +	for (i = 0; i < env->subprog_cnt; i++) {
+ +		if (env->subprog_starts[i] < off)
+++=======
++ 	/* NOTE: fake 'exit' subprog should be updated as well. */
++ 	for (i = 0; i <= env->subprog_cnt; i++) {
++ 		if (env->subprog_info[i].start < off)
+++>>>>>>> 4cb3d99c84cc (bpf: add faked "ending" subprog)
+  			continue;
+ -		env->subprog_info[i].start += len - 1;
+ +		env->subprog_starts[i] += len - 1;
+  	}
+  }
+  
+@@@ -5307,12 -5334,9 +5332,16 @@@ static int jit_subprogs(struct bpf_veri
+  	if (!func)
+  		return -ENOMEM;
+  
+ -	for (i = 0; i < env->subprog_cnt; i++) {
+ +	for (i = 0; i <= env->subprog_cnt; i++) {
+  		subprog_start = subprog_end;
+++<<<<<<< HEAD
+ +		if (env->subprog_cnt == i)
+ +			subprog_end = prog->len;
+ +		else
+ +			subprog_end = env->subprog_starts[i];
+++=======
++ 		subprog_end = env->subprog_info[i + 1].start;
+++>>>>>>> 4cb3d99c84cc (bpf: add faked "ending" subprog)
+  
+  		len = subprog_end - subprog_start;
+  		func[i] = bpf_prog_alloc(bpf_prog_size(len), GFP_USER);
+* Unmerged path kernel/bpf/verifier.c
