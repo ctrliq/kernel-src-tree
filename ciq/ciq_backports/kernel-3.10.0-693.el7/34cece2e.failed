@@ -1,0 +1,186 @@
+take count and rcu_head out of fs_pin
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 34cece2e8a1d2b66f00e153a19b80b4d4cec4eb8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/34cece2e.failed
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 34cece2e8a1d2b66f00e153a19b80b4d4cec4eb8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/fs_pin.h
+#	kernel/acct.c
+diff --cc kernel/acct.c
+index 7ffb48430dba,b8fbefb8678f..000000000000
+--- a/kernel/acct.c
++++ b/kernel/acct.c
+@@@ -78,7 -79,9 +78,13 @@@ int acct_parm[3] = {4, 2, 30}
+  static void do_acct_process(struct bsd_acct_struct *acct);
+  
+  struct bsd_acct_struct {
+++<<<<<<< HEAD
+ +	long			count;
+++=======
++ 	struct fs_pin		pin;
++ 	atomic_long_t		count;
++ 	struct rcu_head		rcu;
+++>>>>>>> 34cece2e8a1d (take count and rcu_head out of fs_pin)
+  	struct mutex		lock;
+  	int			active;
+  	unsigned long		needcheck;
+@@@ -155,30 -128,32 +161,56 @@@ out
+  
+  static void acct_put(struct bsd_acct_struct *p)
+  {
+++<<<<<<< HEAD
+ +	spin_lock(&acct_lock);
+ +	if (!--p->count)
+ +		kfree(p);
+ +	spin_unlock(&acct_lock);
+++=======
++ 	if (atomic_long_dec_and_test(&p->count))
++ 		kfree_rcu(p, rcu);
+++>>>>>>> 34cece2e8a1d (take count and rcu_head out of fs_pin)
+  }
+  
+ -static struct bsd_acct_struct *acct_get(struct pid_namespace *ns)
+ +static struct bsd_acct_struct *acct_get(struct bsd_acct_struct **p)
+  {
+  	struct bsd_acct_struct *res;
+ +	spin_lock(&acct_lock);
+  again:
+++<<<<<<< HEAD
+ +	res = *p;
+ +	if (res)
+ +		res->count++;
+ +	spin_unlock(&acct_lock);
+ +	if (res) {
+ +		mutex_lock(&res->lock);
+ +		if (!res->ns) {
+ +			mutex_unlock(&res->lock);
+ +			spin_lock(&acct_lock);
+ +			if (!--res->count)
+ +				kfree(res);
+ +			goto again;
+ +		}
+++=======
++ 	smp_rmb();
++ 	rcu_read_lock();
++ 	res = ACCESS_ONCE(ns->bacct);
++ 	if (!res) {
++ 		rcu_read_unlock();
++ 		return NULL;
++ 	}
++ 	if (!atomic_long_inc_not_zero(&res->count)) {
++ 		rcu_read_unlock();
++ 		cpu_relax();
++ 		goto again;
++ 	}
++ 	rcu_read_unlock();
++ 	mutex_lock(&res->lock);
++ 	if (!res->ns) {
++ 		mutex_unlock(&res->lock);
++ 		acct_put(res);
++ 		goto again;
+++>>>>>>> 34cece2e8a1d (take count and rcu_head out of fs_pin)
+  	}
+  	return res;
+  }
+@@@ -187,28 -172,40 +219,54 @@@ static void acct_kill(struct bsd_acct_s
+  		      struct bsd_acct_struct *new)
+  {
+  	if (acct) {
+ +		struct file *file = acct->file;
+  		struct pid_namespace *ns = acct->ns;
+ +		spin_lock(&acct_lock);
+ +		list_del(&acct->list);
+ +		mnt_unpin(file->f_path.mnt);
+ +		spin_unlock(&acct_lock);
+  		do_acct_process(acct);
+ -		INIT_WORK(&acct->work, close_work);
+ -		init_completion(&acct->done);
+ -		schedule_work(&acct->work);
+ -		wait_for_completion(&acct->done);
+ -		pin_remove(&acct->pin);
+ +		filp_close(file, NULL);
+ +		spin_lock(&acct_lock);
+  		ns->bacct = new;
+ +		if (new) {
+ +			mnt_pin(new->file->f_path.mnt);
+ +			list_add(&new->list, &acct_list);
+ +		}
+  		acct->ns = NULL;
+++<<<<<<< HEAD
+++=======
++ 		atomic_long_dec(&acct->count);
+++>>>>>>> 34cece2e8a1d (take count and rcu_head out of fs_pin)
+  		mutex_unlock(&acct->lock);
+ -		acct_put(acct);
+ +		if (!(acct->count -= 2))
+ +			kfree(acct);
+ +		spin_unlock(&acct_lock);
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void acct_pin_kill(struct fs_pin *pin)
++ {
++ 	struct bsd_acct_struct *acct;
++ 	acct = container_of(pin, struct bsd_acct_struct, pin);
++ 	if (!atomic_long_inc_not_zero(&acct->count)) {
++ 		rcu_read_unlock();
++ 		cpu_relax();
++ 		return;
++ 	}
++ 	rcu_read_unlock();
++ 	mutex_lock(&acct->lock);
++ 	if (!acct->ns) {
++ 		mutex_unlock(&acct->lock);
++ 		acct_put(acct);
++ 		acct = NULL;
++ 	}
++ 	acct_kill(acct, NULL);
++ }
++ 
+++>>>>>>> 34cece2e8a1d (take count and rcu_head out of fs_pin)
+  static int acct_on(struct filename *pathname)
+  {
+  	struct file *file;
+@@@ -238,8 -236,24 +296,13 @@@
+  		filp_close(file, NULL);
+  		return -EIO;
+  	}
+ -	internal = mnt_clone_internal(&file->f_path);
+ -	if (IS_ERR(internal)) {
+ -		kfree(acct);
+ -		filp_close(file, NULL);
+ -		return PTR_ERR(internal);
+ -	}
+ -	err = mnt_want_write(internal);
+ -	if (err) {
+ -		mntput(internal);
+ -		kfree(acct);
+ -		filp_close(file, NULL);
+ -		return err;
+ -	}
+ -	mnt = file->f_path.mnt;
+ -	file->f_path.mnt = internal;
+  
+++<<<<<<< HEAD
+ +	acct->count = 1;
+++=======
++ 	atomic_long_set(&acct->count, 1);
++ 	acct->pin.kill = acct_pin_kill;
+++>>>>>>> 34cece2e8a1d (take count and rcu_head out of fs_pin)
+  	acct->file = file;
+  	acct->needcheck = jiffies;
+  	acct->ns = ns;
+* Unmerged path include/linux/fs_pin.h
+* Unmerged path include/linux/fs_pin.h
+* Unmerged path kernel/acct.c
