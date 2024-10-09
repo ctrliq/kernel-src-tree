@@ -148,7 +148,7 @@ struct hist_entry {
 
 static __pure inline bool hist_entry__has_callchains(struct hist_entry *he)
 {
-	return hists__has_callchains(he->hists);
+	return he->callchain_size != 0;
 }
 
 static inline bool hist_entry__has_pairs(struct hist_entry *he)
