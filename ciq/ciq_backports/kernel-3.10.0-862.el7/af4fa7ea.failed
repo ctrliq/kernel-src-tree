@@ -1,0 +1,633 @@
+nfp: remove automatic caching of RTsym table
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit af4fa7eac770720d5edb9337ab0bccb843936364
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/af4fa7ea.failed
+
+The fact that RTsym table is cached inside nfp_cpp handle is
+a relic of old times when nfpcore was a library module.  All
+the nfp_cpp "caches" are awkward to deal with because of
+concurrency and prone to keeping stale information.  Make
+the run time symbol table be an object read out from the device
+and managed by whoever requested it.  Since the driver loads
+FW at ->probe() and never reloads, we can hold onto the table
+for ever.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit af4fa7eac770720d5edb9337ab0bccb843936364)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_main.c
+#	drivers/net/ethernet/netronome/nfp/nfp_main.h
+#	drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_main.c
+index 813e29b99369,51fe8de34b67..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_main.c
+@@@ -360,10 -365,16 +360,12 @@@ static int nfp_pci_probe(struct pci_de
+  		 nfp_hwinfo_lookup(pf->cpp, "assembly.revision"),
+  		 nfp_hwinfo_lookup(pf->cpp, "cpld.version"));
+  
+ -	err = devlink_register(devlink, &pdev->dev);
+ -	if (err)
+ -		goto err_cpp_free;
+ -
+  	err = nfp_nsp_init(pdev, pf);
+  	if (err)
+ -		goto err_devlink_unreg;
+ +		goto err_cpp_free;
+  
++ 	pf->rtbl = nfp_rtsym_table_read(pf->cpp);
++ 
+  	err = nfp_pcie_sriov_read_nfd_limit(pf);
+  	if (err)
+  		goto err_fw_unload;
+@@@ -402,6 -431,9 +405,12 @@@ static void nfp_pci_remove(struct pci_d
+  	nfp_pcie_sriov_disable(pdev);
+  	pci_sriov_set_totalvfs(pf->pdev, 0);
+  
+++<<<<<<< HEAD
+++=======
++ 	devlink_unregister(devlink);
++ 
++ 	kfree(pf->rtbl);
+++>>>>>>> af4fa7eac770 (nfp: remove automatic caching of RTsym table)
+  	if (pf->fw_loaded)
+  		nfp_fw_unload(pf);
+  
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_main.h
+index 1ac430fbaa18,907852f00423..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_main.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_main.h
+@@@ -52,6 -54,9 +52,12 @@@ struct pci_dev
+  struct nfp_cpp;
+  struct nfp_cpp_area;
+  struct nfp_eth_table;
+++<<<<<<< HEAD
+++=======
++ struct nfp_net;
++ struct nfp_nsp_identify;
++ struct nfp_rtsym_table;
+++>>>>>>> af4fa7eac770 (nfp: remove automatic caching of RTsym table)
+  
+  /**
+   * struct nfp_pf - NFP PF-specific device structure
+@@@ -64,12 -70,18 +70,17 @@@
+   * @limit_vfs:		Number of VFs supported by firmware (~0 for PCI limit)
+   * @num_vfs:		Number of SR-IOV VFs enabled
+   * @fw_loaded:		Is the firmware loaded?
+++<<<<<<< HEAD
+++=======
++  * @ctrl_vnic:		Pointer to the control vNIC if available
++  * @rtbl:		RTsym table
+++>>>>>>> af4fa7eac770 (nfp: remove automatic caching of RTsym table)
+   * @eth_tbl:		NSP ETH table
+ - * @nspi:		NSP identification info
+ - * @hwmon_dev:		pointer to hwmon device
+   * @ddir:		Per-device debugfs directory
+ - * @max_data_vnics:	Number of data vNICs app firmware supports
+ - * @num_vnics:		Number of vNICs spawned
+ - * @vnics:		Linked list of vNIC structures (struct nfp_net)
+ - * @ports:		Linked list of port structures (struct nfp_port)
+ + * @num_ports:		Number of adapter ports
+ + * @ports:		Linked list of port structures (struct nfp_net)
+ + * @port_lock:		Protects @ports, @num_ports, @num_netdevs
+   * @port_refresh_work:	Work entry for taking netdevs out
+ - * @lock:		Protects all fields which may change after probe
+   */
+  struct nfp_pf {
+  	struct pci_dev *pdev;
+@@@ -87,7 -101,13 +98,13 @@@
+  
+  	bool fw_loaded;
+  
+++<<<<<<< HEAD
+++=======
++ 	struct nfp_net *ctrl_vnic;
++ 
++ 	struct nfp_rtsym_table *rtbl;
+++>>>>>>> af4fa7eac770 (nfp: remove automatic caching of RTsym table)
+  	struct nfp_eth_table *eth_tbl;
+ -	struct nfp_nsp_identify *nspi;
+ -
+ -	struct device *hwmon_dev;
+  
+  	struct dentry *ddir;
+  
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+index 092c7d18f2ec,c845049fcff2..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+@@@ -193,91 -199,78 +193,102 @@@ static unsigned int nfp_net_pf_get_num_
+  	int err = 0;
+  	u64 val;
+  
+ -	snprintf(name, sizeof(name), format, nfp_cppcore_pcie_unit(pf->cpp));
+ +	snprintf(name, sizeof(name), "nfd_cfg_pf%u_num_ports",
+ +		 nfp_cppcore_pcie_unit(pf->cpp));
+  
+++<<<<<<< HEAD
+ +	val = nfp_rtsym_read_le(pf->cpp, name, &err);
+ +	/* Default to one port */
+++=======
++ 	val = nfp_rtsym_read_le(pf->rtbl, name, &err);
+++>>>>>>> af4fa7eac770 (nfp: remove automatic caching of RTsym table)
+  	if (err) {
+ -		if (err == -ENOENT)
+ -			return default_val;
+ -		nfp_err(pf->cpp, "Unable to read symbol %s\n", name);
+ -		return err;
+ +		if (err != -ENOENT)
+ +			nfp_err(pf->cpp, "Unable to read adapter port count\n");
+ +		val = 1;
+  	}
+  
+  	return val;
+  }
+  
+ -static int nfp_net_pf_get_num_ports(struct nfp_pf *pf)
+ +static unsigned int
+ +nfp_net_pf_total_qcs(struct nfp_pf *pf, void __iomem *ctrl_bar,
+ +		     unsigned int stride, u32 start_off, u32 num_off)
+  {
+ -	return nfp_net_pf_rtsym_read_optional(pf, "nfd_cfg_pf%u_num_ports", 1);
+ -}
+ +	unsigned int i, min_qc, max_qc;
+  
+ -static int nfp_net_pf_get_app_id(struct nfp_pf *pf)
+ -{
+ -	return nfp_net_pf_rtsym_read_optional(pf, "_pf%u_net_app_id",
+ -					      NFP_APP_CORE_NIC);
+ +	min_qc = readl(ctrl_bar + start_off);
+ +	max_qc = min_qc;
+ +
+ +	for (i = 0; i < pf->num_ports; i++) {
+ +		/* To make our lives simpler only accept configuration where
+ +		 * queues are allocated to PFs in order (queues of PFn all have
+ +		 * indexes lower than PFn+1).
+ +		 */
+ +		if (max_qc > readl(ctrl_bar + start_off))
+ +			return 0;
+ +
+ +		max_qc = readl(ctrl_bar + start_off);
+ +		max_qc += readl(ctrl_bar + num_off) * stride;
+ +		ctrl_bar += NFP_PF_CSR_SLICE_SIZE;
+ +	}
+ +
+ +	return max_qc - min_qc;
+  }
+  
+ -static u8 __iomem *
+ -nfp_net_pf_map_rtsym(struct nfp_pf *pf, const char *name, const char *sym_fmt,
+ -		     unsigned int min_size, struct nfp_cpp_area **area)
+ +static u8 __iomem *nfp_net_pf_map_ctrl_bar(struct nfp_pf *pf)
+  {
+ -	const struct nfp_rtsym *sym;
+ +	const struct nfp_rtsym *ctrl_sym;
+ +	u8 __iomem *ctrl_bar;
+  	char pf_symbol[256];
+ -	u8 __iomem *mem;
+  
+ -	snprintf(pf_symbol, sizeof(pf_symbol), sym_fmt,
+ +	snprintf(pf_symbol, sizeof(pf_symbol), "_pf%u_net_bar0",
+  		 nfp_cppcore_pcie_unit(pf->cpp));
+  
+++<<<<<<< HEAD
+ +	ctrl_sym = nfp_rtsym_lookup(pf->cpp, pf_symbol);
+ +	if (!ctrl_sym) {
+ +		dev_err(&pf->pdev->dev,
+ +			"Failed to find PF BAR0 symbol %s\n", pf_symbol);
+ +		return NULL;
+++=======
++ 	sym = nfp_rtsym_lookup(pf->rtbl, pf_symbol);
++ 	if (!sym) {
++ 		nfp_err(pf->cpp, "Failed to find PF symbol %s\n", pf_symbol);
++ 		return (u8 __iomem *)ERR_PTR(-ENOENT);
+++>>>>>>> af4fa7eac770 (nfp: remove automatic caching of RTsym table)
+  	}
+  
+ -	if (sym->size < min_size) {
+ -		nfp_err(pf->cpp, "PF symbol %s too small\n", pf_symbol);
+ -		return (u8 __iomem *)ERR_PTR(-EINVAL);
+ +	if (ctrl_sym->size < pf->num_ports * NFP_PF_CSR_SLICE_SIZE) {
+ +		dev_err(&pf->pdev->dev,
+ +			"PF BAR0 too small to contain %d ports\n",
+ +			pf->num_ports);
+ +		return NULL;
+  	}
+  
+ -	mem = nfp_net_map_area(pf->cpp, name, sym->domain, sym->target,
+ -			       sym->addr, sym->size, area);
+ -	if (IS_ERR(mem)) {
+ -		nfp_err(pf->cpp, "Failed to map PF symbol %s: %ld\n",
+ -			pf_symbol, PTR_ERR(mem));
+ -		return mem;
+ +	ctrl_bar = nfp_net_map_area(pf->cpp, "net.ctrl",
+ +				    ctrl_sym->domain, ctrl_sym->target,
+ +				    ctrl_sym->addr, ctrl_sym->size,
+ +				    &pf->ctrl_area);
+ +	if (IS_ERR(ctrl_bar)) {
+ +		dev_err(&pf->pdev->dev, "Failed to map PF BAR0: %ld\n",
+ +			PTR_ERR(ctrl_bar));
+ +		return NULL;
+  	}
+  
+ -	return mem;
+ +	return ctrl_bar;
+  }
+  
+ -static void nfp_net_pf_free_vnic(struct nfp_pf *pf, struct nfp_net *nn)
+ +static void nfp_net_pf_free_netdevs(struct nfp_pf *pf)
+  {
+ -	nfp_port_free(nn->port);
+ -	list_del(&nn->vnic_list);
+ -	pf->num_vnics--;
+ -	nfp_net_free(nn);
+ -}
+ +	struct nfp_net *nn;
+  
+ -static void nfp_net_pf_free_vnics(struct nfp_pf *pf)
+ -{
+ -	struct nfp_net *nn, *next;
+ +	while (!list_empty(&pf->ports)) {
+ +		nn = list_first_entry(&pf->ports, struct nfp_net, port_list);
+ +		list_del(&nn->port_list);
+  
+ -	list_for_each_entry_safe(nn, next, &pf->vnics, vnic_list)
+ -		if (nfp_net_is_data_vnic(nn))
+ -			nfp_net_pf_free_vnic(pf, nn);
+ +		nfp_net_netdev_free(nn);
+ +	}
+  }
+  
+  static struct nfp_net *
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_main.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_main.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpp.h b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpp.h
+index 2aa8e5566012..f21d26a634e7 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpp.h
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cpp.h
+@@ -222,10 +222,6 @@ int nfp_cpp_serial(struct nfp_cpp *cpp, const u8 **serial);
+ 
+ void *nfp_hwinfo_cache(struct nfp_cpp *cpp);
+ void nfp_hwinfo_cache_set(struct nfp_cpp *cpp, void *val);
+-void *nfp_rtsym_cache(struct nfp_cpp *cpp);
+-void nfp_rtsym_cache_set(struct nfp_cpp *cpp, void *val);
+-
+-void nfp_nffw_cache_flush(struct nfp_cpp *cpp);
+ 
+ struct nfp_cpp_area *nfp_cpp_area_alloc_with_name(struct nfp_cpp *cpp,
+ 						  u32 cpp_id,
+diff --git a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cppcore.c b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cppcore.c
+index d56f0eb94c21..fdd5523ab9e7 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cppcore.c
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_cppcore.c
+@@ -79,7 +79,6 @@ struct nfp_cpp_resource {
+  *
+  * Following fields can be used only in probe() or with rtnl held:
+  * @hwinfo:		HWInfo database fetched from the device
+- * @rtsym:		firmware run time symbols
+  *
+  * Following fields use explicit locking:
+  * @resource_list:	NFP CPP resource list
+@@ -110,7 +109,6 @@ struct nfp_cpp {
+ 	struct list_head area_cache_list;
+ 
+ 	void *hwinfo;
+-	void *rtsym;
+ };
+ 
+ /* Element of the area_cache_list */
+@@ -235,7 +233,6 @@ void nfp_cpp_free(struct nfp_cpp *cpp)
+ 		cpp->op->free(cpp);
+ 
+ 	kfree(cpp->hwinfo);
+-	kfree(cpp->rtsym);
+ 
+ 	device_unregister(&cpp->dev);
+ 
+@@ -287,29 +284,6 @@ void nfp_hwinfo_cache_set(struct nfp_cpp *cpp, void *val)
+ 	cpp->hwinfo = val;
+ }
+ 
+-void *nfp_rtsym_cache(struct nfp_cpp *cpp)
+-{
+-	return cpp->rtsym;
+-}
+-
+-void nfp_rtsym_cache_set(struct nfp_cpp *cpp, void *val)
+-{
+-	cpp->rtsym = val;
+-}
+-
+-/**
+- * nfp_nffw_cache_flush() - Flush cached firmware information
+- * @cpp:	NFP CPP handle
+- *
+- * Flush cached firmware information.  This function should be called
+- * every time firmware is loaded on unloaded.
+- */
+-void nfp_nffw_cache_flush(struct nfp_cpp *cpp)
+-{
+-	kfree(nfp_rtsym_cache(cpp));
+-	nfp_rtsym_cache_set(cpp, NULL);
+-}
+-
+ /**
+  * nfp_cpp_area_alloc_with_name() - allocate a new CPP area
+  * @cpp:	CPP device handle
+diff --git a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nffw.h b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nffw.h
+index 988badd230d1..f845cf5dd762 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nffw.h
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nffw.h
+@@ -87,9 +87,14 @@ struct nfp_rtsym {
+ 	int domain;
+ };
+ 
+-int nfp_rtsym_count(struct nfp_cpp *cpp);
+-const struct nfp_rtsym *nfp_rtsym_get(struct nfp_cpp *cpp, int idx);
+-const struct nfp_rtsym *nfp_rtsym_lookup(struct nfp_cpp *cpp, const char *name);
+-u64 nfp_rtsym_read_le(struct nfp_cpp *cpp, const char *name, int *error);
++struct nfp_rtsym_table;
++
++struct nfp_rtsym_table *nfp_rtsym_table_read(struct nfp_cpp *cpp);
++int nfp_rtsym_count(struct nfp_rtsym_table *rtbl);
++const struct nfp_rtsym *nfp_rtsym_get(struct nfp_rtsym_table *rtbl, int idx);
++const struct nfp_rtsym *
++nfp_rtsym_lookup(struct nfp_rtsym_table *rtbl, const char *name);
++u64 nfp_rtsym_read_le(struct nfp_rtsym_table *rtbl, const char *name,
++		      int *error);
+ 
+ #endif /* NFP_NFFW_H */
+diff --git a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c
+index a4628d7b561d..90cb4bf2561c 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp.c
+@@ -404,13 +404,7 @@ int nfp_nsp_wait(struct nfp_nsp *state)
+ 
+ int nfp_nsp_device_soft_reset(struct nfp_nsp *state)
+ {
+-	int err;
+-
+-	err = nfp_nsp_command(state, SPCODE_SOFT_RESET, 0, 0, 0);
+-
+-	nfp_nffw_cache_flush(state->cpp);
+-
+-	return err;
++	return nfp_nsp_command(state, SPCODE_SOFT_RESET, 0, 0, 0);
+ }
+ 
+ int nfp_nsp_load_fw(struct nfp_nsp *state, const struct firmware *fw)
+diff --git a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_rtsym.c b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_rtsym.c
+index bdfbfe4752ce..efe30cc560d4 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_rtsym.c
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_rtsym.c
+@@ -64,7 +64,8 @@ struct nfp_rtsym_entry {
+ 	__le32	size_lo;
+ };
+ 
+-struct nfp_rtsym_cache {
++struct nfp_rtsym_table {
++	struct nfp_cpp *cpp;
+ 	int num;
+ 	char *strtab;
+ 	struct nfp_rtsym symtab[];
+@@ -77,7 +78,7 @@ static int nfp_meid(u8 island_id, u8 menum)
+ }
+ 
+ static void
+-nfp_rtsym_sw_entry_init(struct nfp_rtsym_cache *cache, u32 strtab_size,
++nfp_rtsym_sw_entry_init(struct nfp_rtsym_table *cache, u32 strtab_size,
+ 			struct nfp_rtsym *sw, struct nfp_rtsym_entry *fw)
+ {
+ 	sw->type = fw->type;
+@@ -105,26 +106,26 @@ nfp_rtsym_sw_entry_init(struct nfp_rtsym_cache *cache, u32 strtab_size,
+ 		sw->domain = -1;
+ }
+ 
+-static int nfp_rtsymtab_probe(struct nfp_cpp *cpp)
++struct nfp_rtsym_table *nfp_rtsym_table_read(struct nfp_cpp *cpp)
+ {
+ 	const u32 dram = NFP_CPP_ID(NFP_CPP_TARGET_MU, NFP_CPP_ACTION_RW, 0) |
+ 		NFP_ISL_EMEM0;
+ 	u32 strtab_addr, symtab_addr, strtab_size, symtab_size;
+ 	struct nfp_rtsym_entry *rtsymtab;
+-	struct nfp_rtsym_cache *cache;
++	struct nfp_rtsym_table *cache;
+ 	const struct nfp_mip *mip;
+ 	int err, n, size;
+ 
+ 	mip = nfp_mip_open(cpp);
+ 	if (!mip)
+-		return -EIO;
++		return NULL;
+ 
+ 	nfp_mip_strtab(mip, &strtab_addr, &strtab_size);
+ 	nfp_mip_symtab(mip, &symtab_addr, &symtab_size);
+ 	nfp_mip_close(mip);
+ 
+ 	if (!symtab_size || !strtab_size || symtab_size % sizeof(*rtsymtab))
+-		return -ENXIO;
++		return NULL;
+ 
+ 	/* Align to 64 bits */
+ 	symtab_size = round_up(symtab_size, 8);
+@@ -132,27 +133,26 @@ static int nfp_rtsymtab_probe(struct nfp_cpp *cpp)
+ 
+ 	rtsymtab = kmalloc(symtab_size, GFP_KERNEL);
+ 	if (!rtsymtab)
+-		return -ENOMEM;
++		return NULL;
+ 
+ 	size = sizeof(*cache);
+ 	size += symtab_size / sizeof(*rtsymtab) * sizeof(struct nfp_rtsym);
+ 	size +=	strtab_size + 1;
+ 	cache = kmalloc(size, GFP_KERNEL);
+-	if (!cache) {
+-		err = -ENOMEM;
+-		goto err_free_rtsym_raw;
+-	}
++	if (!cache)
++		goto exit_free_rtsym_raw;
+ 
++	cache->cpp = cpp;
+ 	cache->num = symtab_size / sizeof(*rtsymtab);
+ 	cache->strtab = (void *)&cache->symtab[cache->num];
+ 
+ 	err = nfp_cpp_read(cpp, dram, symtab_addr, rtsymtab, symtab_size);
+ 	if (err != symtab_size)
+-		goto err_free_cache;
++		goto exit_free_cache;
+ 
+ 	err = nfp_cpp_read(cpp, dram, strtab_addr, cache->strtab, strtab_size);
+ 	if (err != strtab_size)
+-		goto err_free_cache;
++		goto exit_free_cache;
+ 	cache->strtab[strtab_size] = '\0';
+ 
+ 	for (n = 0; n < cache->num; n++)
+@@ -160,97 +160,71 @@ static int nfp_rtsymtab_probe(struct nfp_cpp *cpp)
+ 					&cache->symtab[n], &rtsymtab[n]);
+ 
+ 	kfree(rtsymtab);
+-	nfp_rtsym_cache_set(cpp, cache);
+-	return 0;
+ 
+-err_free_cache:
++	return cache;
++
++exit_free_cache:
+ 	kfree(cache);
+-err_free_rtsym_raw:
++exit_free_rtsym_raw:
+ 	kfree(rtsymtab);
+-	return err;
+-}
+-
+-static struct nfp_rtsym_cache *nfp_rtsym(struct nfp_cpp *cpp)
+-{
+-	struct nfp_rtsym_cache *cache;
+-	int err;
+-
+-	cache = nfp_rtsym_cache(cpp);
+-	if (cache)
+-		return cache;
+-
+-	err = nfp_rtsymtab_probe(cpp);
+-	if (err < 0)
+-		return ERR_PTR(err);
+-
+-	return nfp_rtsym_cache(cpp);
++	return NULL;
+ }
+ 
+ /**
+  * nfp_rtsym_count() - Get the number of RTSYM descriptors
+- * @cpp:	NFP CPP handle
++ * @rtbl:	NFP RTsym table
+  *
+- * Return: Number of RTSYM descriptors, or -ERRNO
++ * Return: Number of RTSYM descriptors
+  */
+-int nfp_rtsym_count(struct nfp_cpp *cpp)
++int nfp_rtsym_count(struct nfp_rtsym_table *rtbl)
+ {
+-	struct nfp_rtsym_cache *cache;
+-
+-	cache = nfp_rtsym(cpp);
+-	if (IS_ERR(cache))
+-		return PTR_ERR(cache);
+-
+-	return cache->num;
++	if (!rtbl)
++		return -EINVAL;
++	return rtbl->num;
+ }
+ 
+ /**
+  * nfp_rtsym_get() - Get the Nth RTSYM descriptor
+- * @cpp:	NFP CPP handle
++ * @rtbl:	NFP RTsym table
+  * @idx:	Index (0-based) of the RTSYM descriptor
+  *
+  * Return: const pointer to a struct nfp_rtsym descriptor, or NULL
+  */
+-const struct nfp_rtsym *nfp_rtsym_get(struct nfp_cpp *cpp, int idx)
++const struct nfp_rtsym *nfp_rtsym_get(struct nfp_rtsym_table *rtbl, int idx)
+ {
+-	struct nfp_rtsym_cache *cache;
+-
+-	cache = nfp_rtsym(cpp);
+-	if (IS_ERR(cache))
++	if (!rtbl)
+ 		return NULL;
+-
+-	if (idx >= cache->num)
++	if (idx >= rtbl->num)
+ 		return NULL;
+ 
+-	return &cache->symtab[idx];
++	return &rtbl->symtab[idx];
+ }
+ 
+ /**
+  * nfp_rtsym_lookup() - Return the RTSYM descriptor for a symbol name
+- * @cpp:	NFP CPP handle
++ * @rtbl:	NFP RTsym table
+  * @name:	Symbol name
+  *
+  * Return: const pointer to a struct nfp_rtsym descriptor, or NULL
+  */
+-const struct nfp_rtsym *nfp_rtsym_lookup(struct nfp_cpp *cpp, const char *name)
++const struct nfp_rtsym *
++nfp_rtsym_lookup(struct nfp_rtsym_table *rtbl, const char *name)
+ {
+-	struct nfp_rtsym_cache *cache;
+ 	int n;
+ 
+-	cache = nfp_rtsym(cpp);
+-	if (IS_ERR(cache))
++	if (!rtbl)
+ 		return NULL;
+ 
+-	for (n = 0; n < cache->num; n++) {
+-		if (strcmp(name, cache->symtab[n].name) == 0)
+-			return &cache->symtab[n];
+-	}
++	for (n = 0; n < rtbl->num; n++)
++		if (strcmp(name, rtbl->symtab[n].name) == 0)
++			return &rtbl->symtab[n];
+ 
+ 	return NULL;
+ }
+ 
+ /**
+  * nfp_rtsym_read_le() - Read a simple unsigned scalar value from symbol
+- * @cpp:	NFP CPP handle
++ * @rtbl:	NFP RTsym table
+  * @name:	Symbol name
+  * @error:	Poniter to error code (optional)
+  *
+@@ -260,14 +234,15 @@ const struct nfp_rtsym *nfp_rtsym_lookup(struct nfp_cpp *cpp, const char *name)
+  *
+  * Return: value read, on error sets the error and returns ~0ULL.
+  */
+-u64 nfp_rtsym_read_le(struct nfp_cpp *cpp, const char *name, int *error)
++u64 nfp_rtsym_read_le(struct nfp_rtsym_table *rtbl, const char *name,
++		      int *error)
+ {
+ 	const struct nfp_rtsym *sym;
+ 	u32 val32, id;
+ 	u64 val;
+ 	int err;
+ 
+-	sym = nfp_rtsym_lookup(cpp, name);
++	sym = nfp_rtsym_lookup(rtbl, name);
+ 	if (!sym) {
+ 		err = -ENOENT;
+ 		goto exit;
+@@ -277,14 +252,14 @@ u64 nfp_rtsym_read_le(struct nfp_cpp *cpp, const char *name, int *error)
+ 
+ 	switch (sym->size) {
+ 	case 4:
+-		err = nfp_cpp_readl(cpp, id, sym->addr, &val32);
++		err = nfp_cpp_readl(rtbl->cpp, id, sym->addr, &val32);
+ 		val = val32;
+ 		break;
+ 	case 8:
+-		err = nfp_cpp_readq(cpp, id, sym->addr, &val);
++		err = nfp_cpp_readq(rtbl->cpp, id, sym->addr, &val);
+ 		break;
+ 	default:
+-		nfp_err(cpp,
++		nfp_err(rtbl->cpp,
+ 			"rtsym '%s' unsupported or non-scalar size: %lld\n",
+ 			name, sym->size);
+ 		err = -EINVAL;
