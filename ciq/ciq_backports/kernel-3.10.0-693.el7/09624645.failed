@@ -1,0 +1,236 @@
+scsi: aacraid: Save adapter fib log before an IOP reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] aacraid: Save adapter fib log before an IOP reset (Scott Benesh) [1384213]
+Rebuild_FUZZ: 94.23%
+commit-author Raghava Aditya Renukunta <RaghavaAditya.Renukunta@microsemi.com>
+commit 09624645e1e85df8d68b04de6e0607d696268333
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/09624645.failed
+
+Currently  the adapter firmware does not save outstanding I/O's log
+information  when an IOP reset is triggered. This is problematic when
+trying to root cause and debug issues.
+
+Fixed by adding sync command to trigger I/O log file save in the adapter
+firmware before issuing an IOP reset.
+
+	Signed-off-by: Raghava Aditya Renukunta <RaghavaAditya.Renukunta@microsemi.com>
+	Reviewed-by: David Carroll <David.Carroll@microsemi.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 09624645e1e85df8d68b04de6e0607d696268333)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/aacraid/src.c
+diff --cc drivers/scsi/aacraid/src.c
+index 471115346451,2e5338dec621..000000000000
+--- a/drivers/scsi/aacraid/src.c
++++ b/drivers/scsi/aacraid/src.c
+@@@ -587,44 -670,123 +587,119 @@@ static int aac_srcv_ioremap(struct aac_
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int aac_src_restart_adapter(struct aac_dev *dev, int bled)
+ +{
+ +	u32 var, reset_mask;
+ +
+ +	if (bled >= 0) {
+ +		if (bled)
+ +			printk(KERN_ERR "%s%d: adapter kernel panic'd %x.\n",
+++=======
++ void aac_set_intx_mode(struct aac_dev *dev)
++ {
++ 	if (dev->msi_enabled) {
++ 		aac_src_access_devreg(dev, AAC_ENABLE_INTX);
++ 		dev->msi_enabled = 0;
++ 		msleep(5000); /* Delay 5 seconds */
++ 	}
++ }
++ 
++ static void aac_dump_fw_fib_iop_reset(struct aac_dev *dev)
++ {
++ 	__le32 supported_options3;
++ 
++ 	if (!aac_fib_dump)
++ 		return;
++ 
++ 	supported_options3  = dev->supplement_adapter_info.supported_options3;
++ 	if (!(supported_options3 & AAC_OPTION_SUPPORTED3_IOP_RESET_FIB_DUMP))
++ 		return;
++ 
++ 	aac_adapter_sync_cmd(dev, IOP_RESET_FW_FIB_DUMP,
++ 			0, 0, 0,  0, 0, 0, NULL, NULL, NULL, NULL, NULL);
++ }
++ 
++ static void aac_send_iop_reset(struct aac_dev *dev, int bled)
++ {
++ 	u32 var, reset_mask;
++ 
++ 	aac_dump_fw_fib_iop_reset(dev);
++ 
++ 	bled = aac_adapter_sync_cmd(dev, IOP_RESET_ALWAYS,
++ 				    0, 0, 0, 0, 0, 0, &var,
++ 				    &reset_mask, NULL, NULL, NULL);
++ 
++ 	if ((bled || var != 0x00000001) && !dev->doorbell_mask)
++ 		bled = -EINVAL;
++ 	else if (dev->doorbell_mask) {
++ 		reset_mask = dev->doorbell_mask;
++ 		bled = 0;
++ 		var = 0x00000001;
++ 	}
++ 
++ 	aac_set_intx_mode(dev);
++ 
++ 	if (!bled && (dev->supplement_adapter_info.supported_options2 &
++ 	    AAC_OPTION_DOORBELL_RESET)) {
++ 		src_writel(dev, MUnit.IDR, reset_mask);
++ 	} else {
++ 		src_writel(dev, MUnit.IDR, 0x100);
++ 	}
++ 	msleep(30000);
++ }
++ 
++ static void aac_send_hardware_soft_reset(struct aac_dev *dev)
++ {
++ 	u_int32_t val;
++ 
++ 	val = readl(((char *)(dev->base) + IBW_SWR_OFFSET));
++ 	val |= 0x01;
++ 	writel(val, ((char *)(dev->base) + IBW_SWR_OFFSET));
++ 	msleep_interruptible(20000);
++ }
++ 
++ static int aac_src_restart_adapter(struct aac_dev *dev, int bled, u8 reset_type)
++ {
++ 	unsigned long status, start;
++ 
++ 	if (bled < 0)
++ 		goto invalid_out;
++ 
++ 	if (bled)
++ 		pr_err("%s%d: adapter kernel panic'd %x.\n",
+++>>>>>>> 09624645e1e8 (scsi: aacraid: Save adapter fib log before an IOP reset)
+  				dev->name, dev->id, bled);
+ +		dev->a_ops.adapter_enable_int = aac_src_disable_interrupt;
+ +		bled = aac_adapter_sync_cmd(dev, IOP_RESET_ALWAYS,
+ +			0, 0, 0, 0, 0, 0, &var, &reset_mask, NULL, NULL, NULL);
+ +		if ((bled || (var != 0x00000001)) &&
+ +		    !dev->doorbell_mask)
+ +			return -EINVAL;
+ +		else if (dev->doorbell_mask) {
+ +			reset_mask = dev->doorbell_mask;
+ +			bled = 0;
+ +			var = 0x00000001;
+ +		}
+  
+ -	/*
+ -	 * When there is a BlinkLED, IOP_RESET has not effect
+ -	 */
+ -	if (bled >= 2 && dev->sa_firmware && reset_type & HW_IOP_RESET)
+ -		reset_type &= ~HW_IOP_RESET;
+ -
+ -	dev->a_ops.adapter_enable_int = aac_src_disable_interrupt;
+ -
+ -	switch (reset_type) {
+ -	case IOP_HWSOFT_RESET:
+ -		aac_send_iop_reset(dev, bled);
+ -		/*
+ -		 * Check to see if KERNEL_UP_AND_RUNNING
+ -		 * Wait for the adapter to be up and running.
+ -		 * If !KERNEL_UP_AND_RUNNING issue HW Soft Reset
+ -		 */
+ -		status = src_readl(dev, MUnit.OMR);
+ -		if (dev->sa_firmware
+ -		 && !(status & KERNEL_UP_AND_RUNNING)) {
+ -			start = jiffies;
+ -			do {
+ -				status = src_readl(dev, MUnit.OMR);
+ -				if (time_after(jiffies,
+ -				 start+HZ*SOFT_RESET_TIME)) {
+ -					aac_send_hardware_soft_reset(dev);
+ -					start = jiffies;
+ -				}
+ -			} while (!(status & KERNEL_UP_AND_RUNNING));
+ +		if ((dev->pdev->device == PMC_DEVICE_S7 ||
+ +		    dev->pdev->device == PMC_DEVICE_S8 ||
+ +		    dev->pdev->device == PMC_DEVICE_S9) && dev->msi_enabled) {
+ +			aac_src_access_devreg(dev, AAC_ENABLE_INTX);
+ +			dev->msi_enabled = 0;
+ +			msleep(5000); /* Delay 5 seconds */
+  		}
+ -		break;
+ -	case HW_SOFT_RESET:
+ -		if (dev->sa_firmware) {
+ -			aac_send_hardware_soft_reset(dev);
+ -			aac_set_intx_mode(dev);
+ +
+ +		if (!bled && (dev->supplement_adapter_info.SupportedOptions2 &
+ +		    AAC_OPTION_DOORBELL_RESET)) {
+ +			src_writel(dev, MUnit.IDR, reset_mask);
+ +			ssleep(45);
+ +		} else {
+ +			src_writel(dev, MUnit.IDR, 0x100);
+ +			ssleep(45);
+  		}
+ -		break;
+ -	default:
+ -		aac_send_iop_reset(dev, bled);
+ -		break;
+  	}
+  
+ -invalid_out:
+ -
+  	if (src_readl(dev, MUnit.OMR) & KERNEL_PANIC)
+  		return -ENODEV;
+  
+diff --git a/drivers/scsi/aacraid/aachba.c b/drivers/scsi/aacraid/aachba.c
+index ec3c2aac4dc5..40cdc1af4143 100644
+--- a/drivers/scsi/aacraid/aachba.c
++++ b/drivers/scsi/aacraid/aachba.c
+@@ -294,6 +294,10 @@ MODULE_PARM_DESC(aif_timeout, "The duration of time in seconds to wait for"
+ 	"deregistering them. This is typically adjusted for heavily burdened"
+ 	" systems.");
+ 
++int aac_fib_dump;
++module_param(aac_fib_dump, int, 0644);
++MODULE_PARM_DESC(aac_fib_dump, "Dump controller fibs prior to IOP_RESET 0=off, 1=on");
++
+ int numacb = -1;
+ module_param(numacb, int, S_IRUGO|S_IWUSR);
+ MODULE_PARM_DESC(numacb, "Request a limit to the number of adapter control"
+diff --git a/drivers/scsi/aacraid/aacraid.h b/drivers/scsi/aacraid/aacraid.h
+index 12890356f33d..8d9c1a86e1de 100644
+--- a/drivers/scsi/aacraid/aacraid.h
++++ b/drivers/scsi/aacraid/aacraid.h
+@@ -1251,6 +1251,10 @@ struct aac_supplement_adapter_info
+ #define AAC_OPTION_VARIABLE_BLOCK_SIZE	cpu_to_le32(0x00040000)
+ /* 240 simple volume support */
+ #define AAC_OPTION_SUPPORTED_240_VOLUMES cpu_to_le32(0x10000000)
++/*
++ * Supports FIB dump sync command send prior to IOP_RESET
++ */
++#define AAC_OPTION_SUPPORTED3_IOP_RESET_FIB_DUMP	cpu_to_le32(0x00004000)
+ #define AAC_SIS_VERSION_V3	3
+ #define AAC_SIS_SLOT_UNKNOWN	0xFF
+ 
+@@ -2224,6 +2228,7 @@ extern struct aac_common aac_config;
+ #define GET_DRIVER_BUFFER_PROPERTIES	0x00000023
+ #define RCV_TEMP_READINGS		0x00000025
+ #define GET_COMM_PREFERRED_SETTINGS	0x00000026
++#define IOP_RESET_FW_FIB_DUMP		0x00000034
+ #define IOP_RESET			0x00001000
+ #define IOP_RESET_ALWAYS		0x00001001
+ #define RE_INIT_ADAPTER			0x000000ee
+@@ -2423,4 +2428,5 @@ extern int aac_commit;
+ extern int update_interval;
+ extern int check_interval;
+ extern int aac_check_reset;
++extern int aac_fib_dump;
+ #endif
+* Unmerged path drivers/scsi/aacraid/src.c
