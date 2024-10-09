@@ -1872,7 +1872,7 @@ static int try_init_spmi(struct SPMITable *spmi)
 		return -EIO;
 	}
 
-	myaddr = spmi->addr.address >> 1;
+	myaddr = spmi->addr.address & 0x7f;
 
 	return new_ssif_client(myaddr, NULL, 0, 0, SI_SPMI);
 }
