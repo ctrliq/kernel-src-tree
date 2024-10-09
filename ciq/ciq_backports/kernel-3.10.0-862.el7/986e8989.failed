@@ -1,0 +1,154 @@
+libceph: make encode_request_*() work with r_mempool requests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ilya Dryomov <idryomov@gmail.com>
+commit 986e89898acb3d8f750f259a90cb73afca426b58
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/986e8989.failed
+
+Messages allocated out of ceph_msgpool have a fixed front length
+(pool->front_len).  Asserting that the entire front has been filled
+while encoding is thus wrong.
+
+Fixes: 8cb441c0545d ("libceph: MOSDOp v8 encoding (actual spgid + full hash)")
+	Reported-by: "Yan, Zheng" <zyan@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+	Reviewed-by: "Yan, Zheng" <zyan@redhat.com>
+(cherry picked from commit 986e89898acb3d8f750f259a90cb73afca426b58)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ceph/osd_client.c
+diff --cc net/ceph/osd_client.c
+index ad98fe36def9,b5f016cb9569..000000000000
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@@ -1878,10 -1918,11 +1878,18 @@@ static void encode_request(struct ceph_
+  	}
+  
+  	ceph_encode_32(&p, req->r_attempts); /* retry_attempt */
+++<<<<<<< HEAD
+ +
+ +	BUG_ON(p > end);
+ +	msg->front.iov_len = p - msg->front.iov_base;
+ +	msg->hdr.version = cpu_to_le16(4); /* MOSDOp v4 */
+++=======
++ 	BUG_ON(p > end - 8); /* space for features */
++ 
++ 	msg->hdr.version = cpu_to_le16(8); /* MOSDOp v8 */
++ 	/* front_len is finalized in encode_request_finish() */
++ 	msg->front.iov_len = p - msg->front.iov_base;
+++>>>>>>> 986e89898acb (libceph: make encode_request_*() work with r_mempool requests)
+  	msg->hdr.front_len = cpu_to_le32(msg->front.iov_len);
+  	msg->hdr.data_len = cpu_to_le32(data_len);
+  	/*
+@@@ -1891,9 -1932,100 +1899,106 @@@
+  	 */
+  	msg->hdr.data_off = cpu_to_le16(req->r_data_offset);
+  
+++<<<<<<< HEAD
+ +	dout("%s req %p oid %s oid_len %d front %zu data %u\n", __func__,
+ +	     req, req->r_t.target_oid.name, req->r_t.target_oid.name_len,
+ +	     msg->front.iov_len, data_len);
+++=======
++ 	dout("%s req %p msg %p oid %s oid_len %d\n", __func__, req, msg,
++ 	     req->r_t.target_oid.name, req->r_t.target_oid.name_len);
++ }
++ 
++ static void encode_request_finish(struct ceph_msg *msg)
++ {
++ 	void *p = msg->front.iov_base;
++ 	void *const partial_end = p + msg->front.iov_len;
++ 	void *const end = p + msg->front_alloc_len;
++ 
++ 	if (CEPH_HAVE_FEATURE(msg->con->peer_features, RESEND_ON_SPLIT)) {
++ 		/* luminous OSD -- encode features and be done */
++ 		p = partial_end;
++ 		ceph_encode_64(&p, msg->con->peer_features);
++ 	} else {
++ 		struct {
++ 			char spgid[CEPH_ENCODING_START_BLK_LEN +
++ 				   CEPH_PGID_ENCODING_LEN + 1];
++ 			__le32 hash;
++ 			__le32 epoch;
++ 			__le32 flags;
++ 			char reqid[CEPH_ENCODING_START_BLK_LEN +
++ 				   sizeof(struct ceph_osd_reqid)];
++ 			char trace[sizeof(struct ceph_blkin_trace_info)];
++ 			__le32 client_inc;
++ 			struct ceph_timespec mtime;
++ 		} __packed head;
++ 		struct ceph_pg pgid;
++ 		void *oloc, *oid, *tail;
++ 		int oloc_len, oid_len, tail_len;
++ 		int len;
++ 
++ 		/*
++ 		 * Pre-luminous OSD -- reencode v8 into v4 using @head
++ 		 * as a temporary buffer.  Encode the raw PG; the rest
++ 		 * is just a matter of moving oloc, oid and tail blobs
++ 		 * around.
++ 		 */
++ 		memcpy(&head, p, sizeof(head));
++ 		p += sizeof(head);
++ 
++ 		oloc = p;
++ 		p += CEPH_ENCODING_START_BLK_LEN;
++ 		pgid.pool = ceph_decode_64(&p);
++ 		p += 4 + 4; /* preferred, key len */
++ 		len = ceph_decode_32(&p);
++ 		p += len;   /* nspace */
++ 		oloc_len = p - oloc;
++ 
++ 		oid = p;
++ 		len = ceph_decode_32(&p);
++ 		p += len;
++ 		oid_len = p - oid;
++ 
++ 		tail = p;
++ 		tail_len = partial_end - p;
++ 
++ 		p = msg->front.iov_base;
++ 		ceph_encode_copy(&p, &head.client_inc, sizeof(head.client_inc));
++ 		ceph_encode_copy(&p, &head.epoch, sizeof(head.epoch));
++ 		ceph_encode_copy(&p, &head.flags, sizeof(head.flags));
++ 		ceph_encode_copy(&p, &head.mtime, sizeof(head.mtime));
++ 
++ 		/* reassert_version */
++ 		memset(p, 0, sizeof(struct ceph_eversion));
++ 		p += sizeof(struct ceph_eversion);
++ 
++ 		BUG_ON(p >= oloc);
++ 		memmove(p, oloc, oloc_len);
++ 		p += oloc_len;
++ 
++ 		pgid.seed = le32_to_cpu(head.hash);
++ 		encode_pgid(&p, &pgid); /* raw pg */
++ 
++ 		BUG_ON(p >= oid);
++ 		memmove(p, oid, oid_len);
++ 		p += oid_len;
++ 
++ 		/* tail -- ops, snapid, snapc, retry_attempt */
++ 		BUG_ON(p >= tail);
++ 		memmove(p, tail, tail_len);
++ 		p += tail_len;
++ 
++ 		msg->hdr.version = cpu_to_le16(4); /* MOSDOp v4 */
++ 	}
++ 
++ 	BUG_ON(p > end);
++ 	msg->front.iov_len = p - msg->front.iov_base;
++ 	msg->hdr.front_len = cpu_to_le32(msg->front.iov_len);
++ 
++ 	dout("%s msg %p tid %llu %u+%u+%u v%d\n", __func__, msg,
++ 	     le64_to_cpu(msg->hdr.tid), le32_to_cpu(msg->hdr.front_len),
++ 	     le32_to_cpu(msg->hdr.middle_len), le32_to_cpu(msg->hdr.data_len),
++ 	     le16_to_cpu(msg->hdr.version));
+++>>>>>>> 986e89898acb (libceph: make encode_request_*() work with r_mempool requests)
+  }
+  
+  /*
+* Unmerged path net/ceph/osd_client.c
