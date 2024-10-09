@@ -650,7 +650,7 @@ static void cmd_work_handler(struct work_struct *work)
 	lay->status_own = CMD_OWNER_HW;
 	set_signature(ent, !cmd->checksum_disabled);
 	dump_command(dev, ent, 1);
-	ktime_get_ts(&ent->ts1);
+	ent->ts1 = ktime_get_ns();
 
 	/* ring doorbell after the descriptor is valid */
 	mlx5_core_dbg(dev, "writing 0x%x to command doorbell\n", 1 << ent->idx);
@@ -750,7 +750,6 @@ static int mlx5_cmd_invoke(struct mlx5_core_dev *dev, struct mlx5_cmd_msg *in,
 {
 	struct mlx5_cmd *cmd = &dev->cmd;
 	struct mlx5_cmd_work_ent *ent;
-	ktime_t t1, t2, delta;
 	struct mlx5_cmd_stats *stats;
 	int err = 0;
 	s64 ds;
@@ -781,10 +780,7 @@ static int mlx5_cmd_invoke(struct mlx5_core_dev *dev, struct mlx5_cmd_msg *in,
 		if (err == -ETIMEDOUT)
 			goto out;
 
-		t1 = timespec_to_ktime(ent->ts1);
-		t2 = timespec_to_ktime(ent->ts2);
-		delta = ktime_sub(t2, t1);
-		ds = ktime_to_ns(delta);
+		ds = ent->ts2 - ent->ts1;
 		op = be16_to_cpu(((struct mlx5_inbox_hdr *)in->first.data)->opcode);
 		if (op < ARRAY_SIZE(cmd->stats)) {
 			stats = &cmd->stats[op];
@@ -1248,7 +1244,6 @@ void mlx5_cmd_comp_handler(struct mlx5_core_dev *dev, u64 vec)
 	void *context;
 	int err;
 	int i;
-	ktime_t t1, t2, delta;
 	s64 ds;
 	struct mlx5_cmd_stats *stats;
 	unsigned long flags;
@@ -1265,7 +1260,7 @@ void mlx5_cmd_comp_handler(struct mlx5_core_dev *dev, u64 vec)
 				sem = &cmd->pages_sem;
 			else
 				sem = &cmd->sem;
-			ktime_get_ts(&ent->ts2);
+			ent->ts2 = ktime_get_ns();
 			memcpy(ent->out->first.data, ent->lay->out, sizeof(ent->lay->out));
 			dump_command(dev, ent, 0);
 			if (!ent->ret) {
@@ -1284,10 +1279,7 @@ void mlx5_cmd_comp_handler(struct mlx5_core_dev *dev, u64 vec)
 			free_ent(cmd, ent->idx);
 
 			if (ent->callback) {
-				t1 = timespec_to_ktime(ent->ts1);
-				t2 = timespec_to_ktime(ent->ts2);
-				delta = ktime_sub(t2, t1);
-				ds = ktime_to_ns(delta);
+				ds = ent->ts2 - ent->ts1;
 				if (ent->op < ARRAY_SIZE(cmd->stats)) {
 					stats = &cmd->stats[ent->op];
 					spin_lock_irqsave(&stats->lock, flags);
