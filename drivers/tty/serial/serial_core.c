@@ -1520,6 +1520,16 @@ static void uart_dtr_rts(struct tty_port *port, int onoff)
 		uart_clear_mctrl(uport, TIOCM_DTR | TIOCM_RTS);
 }
 
+static int uart_install(struct tty_driver *driver, struct tty_struct *tty)
+{
+	struct uart_driver *drv = driver->driver_state;
+	struct uart_state *state = drv->state + tty->index;
+
+	tty->driver_data = state;
+
+	return tty_standard_install(driver, tty);
+}
+
 /*
  * Calls to uart_open are serialised by the tty_lock in
  *   drivers/tty/tty_io.c:tty_open()
@@ -1532,9 +1542,8 @@ static void uart_dtr_rts(struct tty_port *port, int onoff)
  */
 static int uart_open(struct tty_struct *tty, struct file *filp)
 {
-	struct uart_driver *drv = (struct uart_driver *)tty->driver->driver_state;
+	struct uart_state *state = tty->driver_data;
 	int retval, line = tty->index;
-	struct uart_state *state = drv->state + line;
 	struct tty_port *port = &state->port;
 
 	pr_debug("uart_open(%d) called\n", line);
@@ -1562,7 +1571,6 @@ static int uart_open(struct tty_struct *tty, struct file *filp)
 	 * uart_close() will decrement the driver module use count.
 	 * Any failures from here onwards should not touch the count.
 	 */
-	tty->driver_data = state;
 	state->uart_port->state = state;
 	state->port.low_latency =
 		(state->uart_port->flags & UPF_LOW_LATENCY) ? 1 : 0;
@@ -2229,6 +2237,7 @@ static void uart_poll_put_char(struct tty_driver *driver, int line, char ch)
 #endif
 
 static const struct tty_operations uart_ops = {
+	.install	= uart_install,
 	.open		= uart_open,
 	.close		= uart_close,
 	.write		= uart_write,

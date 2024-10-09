@@ -110,7 +110,6 @@
  */
 
 struct menu_device {
-	int		last_state_idx;
 	int             needs_update;
 
 	unsigned int	expected_us;
@@ -299,7 +298,7 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev)
 	get_typical_interval(data);
 
 	if (CPUIDLE_DRIVER_STATE_START > 0) {
-		data->last_state_idx = CPUIDLE_DRIVER_STATE_START - 1;
+		dev->last_state_idx = CPUIDLE_DRIVER_STATE_START - 1;
 		/*
 		 * We want to default to C1 (hlt), not to busy polling
 		 * unless the timer is happening really really soon.
@@ -307,9 +306,9 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev)
 		if (data->expected_us > 5 &&
 		    !drv->states[CPUIDLE_DRIVER_STATE_START].disabled &&
 			dev->states_usage[CPUIDLE_DRIVER_STATE_START].disable == 0)
-			data->last_state_idx = CPUIDLE_DRIVER_STATE_START;
+			dev->last_state_idx = CPUIDLE_DRIVER_STATE_START;
 	} else {
-		data->last_state_idx = CPUIDLE_DRIVER_STATE_START;
+		dev->last_state_idx = CPUIDLE_DRIVER_STATE_START;
 	}
 
 	/*
@@ -329,11 +328,11 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev)
 		if (s->exit_latency * multiplier > data->predicted_us)
 			continue;
 
-		data->last_state_idx = i;
+		dev->last_state_idx = i;
 		data->exit_us = s->exit_latency;
 	}
 
-	return data->last_state_idx;
+	return dev->last_state_idx;
 }
 
 /**
@@ -347,7 +346,7 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev)
 static void menu_reflect(struct cpuidle_device *dev, int index)
 {
 	struct menu_device *data = &__get_cpu_var(menu_devices);
-	data->last_state_idx = index;
+	dev->last_state_idx = index;
 	if (index >= 0)
 		data->needs_update = 1;
 }
@@ -360,7 +359,7 @@ static void menu_reflect(struct cpuidle_device *dev, int index)
 static void menu_update(struct cpuidle_driver *drv, struct cpuidle_device *dev)
 {
 	struct menu_device *data = &__get_cpu_var(menu_devices);
-	int last_idx = data->last_state_idx;
+	int last_idx = dev->last_state_idx;
 	unsigned int last_idle_us = cpuidle_get_last_residency(dev);
 	struct cpuidle_state *target = &drv->states[last_idx];
 	unsigned int measured_us;

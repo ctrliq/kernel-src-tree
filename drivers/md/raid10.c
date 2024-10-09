@@ -25,6 +25,7 @@
 #include <linux/seq_file.h>
 #include <linux/ratelimit.h>
 #include <linux/kthread.h>
+#include <trace/events/block.h>
 #include "md.h"
 #include "raid10.h"
 #include "raid0.h"
@@ -105,6 +106,9 @@ static sector_t reshape_request(struct mddev *mddev, sector_t sector_nr,
 static void reshape_request_write(struct mddev *mddev, struct r10bio *r10_bio);
 static void end_reshape_write(struct bio *bio, int error);
 static void end_reshape(struct r10conf *conf);
+
+#define raid10_log(md, fmt, args...)				\
+	do { if ((md)->queue) blk_add_trace_msg((md)->queue, "raid10 " fmt, ##args); } while (0)
 
 /*
  * 'strct resync_pages' stores actual pages used for doing the resync
@@ -1106,6 +1110,7 @@ static void wait_barrier(struct r10conf *conf)
 		 * that queue to get the nr_pending
 		 * count down.
 		 */
+		raid10_log(conf->mddev, "wait barrier");
 		wait_event_lock_irq(conf->wait_barrier,
 				    !conf->barrier ||
 				    (atomic_read(&conf->nr_pending) &&
@@ -1272,6 +1277,11 @@ read_again:
 		read_bio->bi_rw |= MD_FAILFAST;
 	read_bio->bi_private = r10_bio;
 
+	if (mddev->gendisk)
+		trace_block_bio_remap(bdev_get_queue(read_bio->bi_bdev),
+					read_bio, disk_devt(mddev->gendisk),
+					r10_bio->sector);
+
 	if (max_sectors < r10_bio->sectors) {
 		/* Could not read all from this device, so we will
 		 * need another r10_bio.
@@ -1338,7 +1348,7 @@ static void raid10_write_one_disk(struct mddev *mddev, struct r10bio *r10_bio,
 
 	mbio->bi_sector = (r10_bio->devs[n_copy].addr +
 				   choose_data_offset(r10_bio, rdev));
-	mbio->bi_bdev = (void*)rdev;
+	mbio->bi_bdev = rdev->bdev;
 	mbio->bi_end_io = raid10_end_write_request;
 	mbio->bi_rw =
 		WRITE | do_sync | do_fua | do_discard | do_same;
@@ -1348,6 +1358,10 @@ static void raid10_write_one_disk(struct mddev *mddev, struct r10bio *r10_bio,
 		mbio->bi_rw |= MD_FAILFAST;
 	mbio->bi_private = r10_bio;
 
+	if (mddev->gendisk)
+		trace_block_bio_remap(bdev_get_queue(mbio->bi_bdev),
+				      mbio, disk_devt(conf->mddev->gendisk),
+				      r10_bio->sector);
 	/* flush_pending_writes() needs access to the rdev so...*/
 	mbio->bi_bdev = (void *)rdev;
 
@@ -1403,6 +1417,7 @@ static void raid10_write_request(struct mddev *mddev, struct bio *bio,
 
 	if (conf->pending_count >= max_queued_requests) {
 		md_wakeup_thread(mddev->thread);
+		raid10_log(mddev, "wait queued");
 		wait_event(conf->wait_barrier,
 			   conf->pending_count < max_queued_requests);
 	}
@@ -1533,6 +1548,7 @@ retry_write:
 			}
 		}
 		allow_barrier(conf);
+		raid10_log(conf->mddev, "wait rdev %d blocked", blocked_rdev->raid_disk);
 		md_wait_for_blocked_rdev(blocked_rdev, mddev);
 		wait_barrier(conf);
 		goto retry_write;
@@ -1592,10 +1608,9 @@ static bool raid10_make_request(struct mddev *mddev, struct bio * bio)
 	int chunk_sects = chunk_mask + 1;
 	int sectors;
 
-	if (unlikely(bio->bi_rw & REQ_FLUSH)) {
-		md_flush_request(mddev, bio);
+	if (unlikely(bio->bi_rw & REQ_FLUSH)
+	    && md_flush_request(mddev, bio))
 		return true;
-	}
 
 	/* If this request crosses a chunk boundary, we need to
 	 * split it.  This will only happen for 1 PAGE (or less) requests.
@@ -1659,6 +1674,7 @@ static bool raid10_make_request(struct mddev *mddev, struct bio * bio)
 		/* IO spans the reshape position.  Need to wait for
 		 * reshape to pass
 		 */
+		raid10_log(conf->mddev, "wait reshape");
 		allow_barrier(conf);
 		wait_event(conf->wait_barrier,
 			   conf->reshape_progress <= bio->bi_sector ||
@@ -2756,6 +2772,8 @@ static void handle_read_error(struct mddev *mddev, struct r10bio *r10_bio)
 	char b[BDEVNAME_SIZE];
 	unsigned long do_sync;
 	int max_sectors;
+	dev_t bio_dev;
+	sector_t bio_last_sector;
 
 	/* we got a read error. Maybe the drive is bad.  Maybe just
 	 * the block and we can fix it.
@@ -2767,6 +2785,8 @@ static void handle_read_error(struct mddev *mddev, struct r10bio *r10_bio)
 	 */
 	bio = r10_bio->devs[slot].bio;
 	bdevname(bio->bi_bdev, b);
+	bio_dev = bio->bi_bdev->bd_dev;
+	bio_last_sector = r10_bio->devs[slot].addr + rdev->data_offset + r10_bio->sectors;
 	bio_put(bio);
 	r10_bio->devs[slot].bio = NULL;
 
@@ -2811,6 +2831,10 @@ read_more:
 		bio->bi_rw |= MD_FAILFAST;
 	bio->bi_private = r10_bio;
 	bio->bi_end_io = raid10_end_read_request;
+	trace_block_bio_remap(bdev_get_queue(bio->bi_bdev),
+			      bio, bio_dev,
+			      bio_last_sector - r10_bio->sectors);
+
 	if (max_sectors < r10_bio->sectors) {
 		/* Drat - have to split this up more */
 		struct bio *mbio = r10_bio->master_bio;
@@ -3876,6 +3900,7 @@ static int raid10_run(struct mddev *mddev)
 	sector_t min_offset_diff = 0;
 	int first = 1;
 	bool discard_supported = false;
+	bool no_sg_merge = false;
 
 	if (mddev_init_writes_pending(mddev) < 0)
 		return -ENOMEM;
@@ -3946,6 +3971,9 @@ static int raid10_run(struct mddev *mddev)
 
 		if (blk_queue_discard(bdev_get_queue(rdev->bdev)))
 			discard_supported = true;
+		if (test_bit(QUEUE_FLAG_NO_SG_MERGE,
+		    &bdev_get_queue(rdev->bdev)->queue_flags))
+			no_sg_merge = true;
 		first = 0;
 	}
 
@@ -3956,6 +3984,12 @@ static int raid10_run(struct mddev *mddev)
 		else
 			queue_flag_clear_unlocked(QUEUE_FLAG_DISCARD,
 						  mddev->queue);
+		if (no_sg_merge)
+			queue_flag_set_unlocked(QUEUE_FLAG_NO_SG_MERGE,
+						mddev->queue);
+		else
+			queue_flag_clear_unlocked(QUEUE_FLAG_NO_SG_MERGE,
+						mddev->queue);
 	}
 	/* need to check that every block has at least one working mirror */
 	if (!enough(conf, -1)) {

@@ -15,9 +15,11 @@
 #include <linux/mutex.h>
 #include <linux/rculist.h>
 #include <linux/slab.h>
+#include <linux/dma-mapping.h>
 
 #include <asm/airq.h>
 #include <asm/isc.h>
+#include <asm/cio.h>
 
 #include "cio.h"
 #include "cio_debug.h"
@@ -94,6 +96,11 @@ void do_adapter_IO(u8 isc)
 	rcu_read_unlock();
 }
 
+static inline unsigned long iv_size(unsigned long bits)
+{
+	return BITS_TO_LONGS(bits) * sizeof(unsigned long);
+}
+
 /**
  * airq_iv_create - create an interrupt vector
  * @bits: number of bits in the interrupt vector
@@ -110,8 +117,8 @@ struct airq_iv *airq_iv_create(unsigned long bits, unsigned long flags)
 	if (!iv)
 		goto out;
 	iv->bits = bits;
-	size = BITS_TO_LONGS(bits) * sizeof(unsigned long);
-	iv->vector = kzalloc(size, GFP_KERNEL);
+	size = iv_size(bits);
+	iv->vector = cio_dma_zalloc(size);
 	if (!iv->vector)
 		goto out_free;
 	if (flags & AIRQ_IV_ALLOC) {
@@ -146,7 +153,7 @@ out_free:
 	kfree(iv->ptr);
 	kfree(iv->bitlock);
 	kfree(iv->avail);
-	kfree(iv->vector);
+	cio_dma_free(iv->vector, size);
 	kfree(iv);
 out:
 	return NULL;
@@ -162,7 +169,7 @@ void airq_iv_release(struct airq_iv *iv)
 	kfree(iv->data);
 	kfree(iv->ptr);
 	kfree(iv->bitlock);
-	kfree(iv->vector);
+	cio_dma_free(iv->vector, iv_size(iv->bits));
 	kfree(iv->avail);
 	kfree(iv);
 }

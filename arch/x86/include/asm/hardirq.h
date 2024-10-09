@@ -39,6 +39,7 @@ DECLARE_PER_CPU_SHARED_ALIGNED(irq_cpustat_t, irq_stat);
 
 typedef struct {
 	unsigned int irq_hv_callback_count;
+	unsigned int hyperv_stimer0_count;
 #ifdef CONFIG_X86_MCE_AMD
 	unsigned int irq_deferred_error_count;
 #endif

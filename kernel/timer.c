@@ -451,7 +451,7 @@ __internal_add_timer(struct tvec_base *base, struct timer_list *timer)
 static void internal_add_timer(struct tvec_base *base, struct timer_list *timer)
 {
 	/* Advance base->jiffies, if the base is empty */
-	if (!base->all_timers++)
+	if (!base->all_timers++ && time_before(base->timer_jiffies, jiffies))
 		base->timer_jiffies = jiffies;
 
 	__internal_add_timer(base, timer);
@@ -777,7 +777,7 @@ static int detach_if_pending(struct timer_list *timer, struct tvec_base *base,
 			base->next_timer = base->timer_jiffies;
 	}
 	/* If this was the last timer, advance base->jiffies */
-	if (!--base->all_timers)
+	if (!--base->all_timers && time_before(base->timer_jiffies, jiffies))
 		base->timer_jiffies = jiffies;
 	return 1;
 }

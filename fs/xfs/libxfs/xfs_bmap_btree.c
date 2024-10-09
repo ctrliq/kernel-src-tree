@@ -400,7 +400,7 @@ xfs_bmbt_key_diff(
 				      cur->bc_rec.b.br_startoff;
 }
 
-static bool
+static xfs_failaddr_t
 xfs_bmbt_verify(
 	struct xfs_buf		*bp)
 {
@@ -411,22 +411,22 @@ xfs_bmbt_verify(
 	switch (block->bb_magic) {
 	case cpu_to_be32(XFS_BMAP_CRC_MAGIC):
 		if (!xfs_sb_version_hascrc(&mp->m_sb))
-			return false;
+			return __this_address;
 		if (!uuid_equal(&block->bb_u.l.bb_uuid, &mp->m_sb.sb_meta_uuid))
-			return false;
+			return __this_address;
 		if (be64_to_cpu(block->bb_u.l.bb_blkno) != bp->b_bn)
-			return false;
+			return __this_address;
 		/*
 		 * XXX: need a better way of verifying the owner here. Right now
 		 * just make sure there has been one set.
 		 */
 		if (be64_to_cpu(block->bb_u.l.bb_owner) == 0)
-			return false;
+			return __this_address;
 		/* fall through */
 	case cpu_to_be32(XFS_BMAP_MAGIC):
 		break;
 	default:
-		return false;
+		return __this_address;
 	}
 
 	/*
@@ -438,46 +438,51 @@ xfs_bmbt_verify(
 	 */
 	level = be16_to_cpu(block->bb_level);
 	if (level > max(mp->m_bm_maxlevels[0], mp->m_bm_maxlevels[1]))
-		return false;
+		return __this_address;
 	if (be16_to_cpu(block->bb_numrecs) > mp->m_bmap_dmxr[level != 0])
-		return false;
+		return __this_address;
 
 	/* sibling pointer verification */
 	if (!block->bb_u.l.bb_leftsib ||
 	    (block->bb_u.l.bb_leftsib != cpu_to_be64(NULLFSBLOCK) &&
 	     !xfs_verify_fsbno(mp, be64_to_cpu(block->bb_u.l.bb_leftsib))))
-		return false;
+		return __this_address;
 	if (!block->bb_u.l.bb_rightsib ||
 	    (block->bb_u.l.bb_rightsib != cpu_to_be64(NULLFSBLOCK) &&
 	     !xfs_verify_fsbno(mp, be64_to_cpu(block->bb_u.l.bb_rightsib))))
-		return false;
+		return __this_address;
 
-	return true;
+	return NULL;
 }
 
 static void
 xfs_bmbt_read_verify(
 	struct xfs_buf	*bp)
 {
-	if (!xfs_btree_lblock_verify_crc(bp))
-		xfs_buf_ioerror(bp, -EFSBADCRC);
-	else if (!xfs_bmbt_verify(bp))
-		xfs_buf_ioerror(bp, -EFSCORRUPTED);
+	xfs_failaddr_t	fa;
 
-	if (bp->b_error) {
-		trace_xfs_btree_corrupt(bp, _RET_IP_);
-		xfs_verifier_error(bp);
+	if (!xfs_btree_lblock_verify_crc(bp))
+		xfs_verifier_error(bp, -EFSBADCRC, __this_address);
+	else {
+		fa = xfs_bmbt_verify(bp);
+		if (fa)
+			xfs_verifier_error(bp, -EFSCORRUPTED, fa);
 	}
+
+	if (bp->b_error)
+		trace_xfs_btree_corrupt(bp, _RET_IP_);
 }
 
 static void
 xfs_bmbt_write_verify(
 	struct xfs_buf	*bp)
 {
-	if (!xfs_bmbt_verify(bp)) {
+	xfs_failaddr_t	fa;
+
+	fa = xfs_bmbt_verify(bp);
+	if (fa) {
 		trace_xfs_btree_corrupt(bp, _RET_IP_);
-		xfs_buf_ioerror(bp, -EFSCORRUPTED);
-		xfs_verifier_error(bp);
+		xfs_verifier_error(bp, -EFSCORRUPTED, fa);
 		return;
 	}
 	xfs_btree_lblock_calc_crc(bp);
@@ -487,6 +492,7 @@ const struct xfs_buf_ops xfs_bmbt_buf_ops = {
 	.name = "xfs_bmbt",
 	.verify_read = xfs_bmbt_read_verify,
 	.verify_write = xfs_bmbt_write_verify,
+	.verify_struct = xfs_bmbt_verify,
 };
 
 

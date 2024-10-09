@@ -295,8 +295,21 @@ static int __process_buffer(journal_t *journal, struct journal_head *jh,
 			       "Waiting for Godot: block %llu\n",
 			       journal->j_devname,
 			       (unsigned long long) bh->b_blocknr);
+
+		if (*batch_count)
+			__flush_batch(journal, batch_count);
 		jbd2_log_start_commit(journal, tid);
+		/*
+		 * jbd2_journal_commit_transaction() may want
+		 * to take the checkpoint_mutex if JBD2_FLUSHED
+		 * is set, jbd2_update_log_tail() called by
+		 * jbd2_journal_commit_transaction() may also take
+		 * checkpoint_mutex.  So we need to temporarily
+		 * drop it.
+		 */
+		mutex_unlock(&journal->j_checkpoint_mutex);
 		jbd2_log_wait_commit(journal, tid);
+		mutex_lock(&journal->j_checkpoint_mutex);
 		ret = 1;
 	} else if (!buffer_dirty(bh)) {
 		ret = 1;

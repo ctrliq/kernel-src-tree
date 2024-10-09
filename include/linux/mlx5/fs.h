@@ -47,6 +47,7 @@ enum {
 enum {
 	MLX5_FLOW_TABLE_TUNNEL_EN_REFORMAT = BIT(0),
 	MLX5_FLOW_TABLE_TUNNEL_EN_DECAP = BIT(1),
+	MLX5_FLOW_TABLE_TERMINATION = BIT(2),
 };
 
 #define LEFTOVERS_RULE_NUM	 2
@@ -73,6 +74,11 @@ enum mlx5_flow_namespace_type {
 	MLX5_FLOW_NAMESPACE_SNIFFER_RX,
 	MLX5_FLOW_NAMESPACE_SNIFFER_TX,
 	MLX5_FLOW_NAMESPACE_EGRESS,
+};
+
+enum {
+	FDB_FAST_PATH,
+	FDB_SLOW_PATH,
 };
 
 struct mlx5_flow_table;
@@ -192,7 +198,7 @@ struct mlx5_flow_act {
  */
 struct mlx5_flow_handle *
 mlx5_add_flow_rules(struct mlx5_flow_table *ft,
-		    struct mlx5_flow_spec *spec,
+		    const struct mlx5_flow_spec *spec,
 		    struct mlx5_flow_act *flow_act,
 		    struct mlx5_flow_destination *dest,
 		    int num_dest);

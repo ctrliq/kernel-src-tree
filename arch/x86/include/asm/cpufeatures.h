@@ -192,15 +192,18 @@
  */
 
 #define X86_FEATURE_RING3MWAIT	(7*32+ 0) /* Ring 3 MONITOR/MWAIT */
+#define X86_FEATURE_FENCE_SWAPGS_USER	(7*32+ 1) /* "" LFENCE in user entry SWAPGS path */
 #define X86_FEATURE_CPB		(7*32+ 2) /* AMD Core Performance Boost */
 #define X86_FEATURE_EPB		(7*32+ 3) /* IA32_ENERGY_PERF_BIAS support */
 #define X86_FEATURE_CAT_L3	(7*32+ 4) /* Cache Allocation Technology L3 */
 #define X86_FEATURE_CAT_L2	(7*32+ 5) /* Cache Allocation Technology L2 */
 #define X86_FEATURE_CDP_L3	(7*32+ 6) /* Code and Data Prioritization L3 */
+#define X86_FEATURE_INVPCID_SINGLE ( 7*32+ 7) /* Effectively INVPCID && CR4.PCIDE=1 */
 #define X86_FEATURE_HW_PSTATE	(7*32+ 8) /* AMD HW-PState */
 #define X86_FEATURE_PROC_FEEDBACK (7*32+ 9) /* AMD ProcFeedbackInterface */
 #define X86_FEATURE_SME		( 7*32+10) /* AMD Secure Memory Encryption */
 #define X86_FEATURE_MSR_SPEC_CTRL ( 7*32+11) /* "" MSR SPEC_CTRL is implemented */
+#define X86_FEATURE_FENCE_SWAPGS_KERNEL	(7*32+12) /* "" LFENCE in kernel entry SWAPGS path */
 #define X86_FEATURE_RETPOLINE_AMD (7*32+13) /* AMD Retpoline mitigation for Spectre variant 2 */
 #define X86_FEATURE_INTEL_PPIN	( 7*32+14) /* Intel Processor Inventory Number */
 #define X86_FEATURE_INTEL_PT	( 7*32+15) /* Intel Processor Trace */
@@ -358,5 +361,8 @@
 #define X86_BUG_L1TF			X86_BUG(18) /* CPU is affected by L1 Terminal Fault */
 #define X86_BUG_MDS			X86_BUG(19) /* CPU is affected by Microarchitectural data sampling */
 #define X86_BUG_MSBDS_ONLY		X86_BUG(20) /* CPU is only affected by the  MSDBS variant of BUG_MDS */
+#define X86_BUG_SWAPGS			X86_BUG(21) /* CPU is affected by speculation through SWAPGS */
+#define X86_BUG_TAA			X86_BUG(22) /* CPU is affected by TSX Async Abort(TAA) */
+#define X86_BUG_ITLB_MULTIHIT		X86_BUG(23) /* CPU may incur MCE during certain page attribute changes */
 
 #endif /* _ASM_X86_CPUFEATURES_H */

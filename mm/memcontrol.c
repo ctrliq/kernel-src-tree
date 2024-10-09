@@ -3043,7 +3043,7 @@ static int mem_cgroup_slabinfo_read(struct cgroup *cont, struct cftype *cft,
 }
 #endif
 
-static int memcg_charge_kmem(struct mem_cgroup *memcg, gfp_t gfp,
+int memcg_charge_kmem(struct mem_cgroup *memcg, gfp_t gfp,
 			     unsigned long nr_pages)
 {
 	struct page_counter *counter;
@@ -3089,7 +3089,7 @@ static int memcg_charge_kmem(struct mem_cgroup *memcg, gfp_t gfp,
 	return ret;
 }
 
-static void memcg_uncharge_kmem(struct mem_cgroup *memcg,
+void memcg_uncharge_kmem(struct mem_cgroup *memcg,
 				unsigned long nr_pages)
 {
 	page_counter_uncharge(&memcg->memory, nr_pages);
@@ -3408,7 +3408,7 @@ static void mem_cgroup_destroy_all_caches(struct mem_cgroup *memcg)
 	mutex_lock(&memcg_slab_mutex);
 	list_for_each_entry_safe(params, tmp, &memcg->memcg_slab_caches, list) {
 		cachep = memcg_params_to_cache(params);
-		kmem_cache_shrink(cachep);
+		__kmemcg_cache_deactivate(cachep);
 		if (atomic_read(&cachep->memcg_params->nr_pages) == 0)
 			memcg_kmem_destroy_cache(cachep);
 	}
@@ -3495,6 +3495,12 @@ struct kmem_cache *__memcg_kmem_get_cache(struct kmem_cache *cachep,
 
 	VM_BUG_ON(!cachep->memcg_params);
 	VM_BUG_ON(!cachep->memcg_params->is_root_cache);
+
+	if (cachep->flags & SLAB_ACCOUNT)
+		gfp |= __GFP_ACCOUNT;
+
+	if (!(gfp & __GFP_ACCOUNT))
+		return cachep;
 
 	if (!current->mm || current->memcg_kmem_skip_account)
 		return cachep;
@@ -5180,7 +5186,9 @@ static int memcg_propagate_kmem(struct mem_cgroup *memcg)
 	static_key_slow_inc(&memcg_kmem_enabled_key);
 
 	mutex_lock(&memcg_limit_mutex);
+	memcg_stop_kmem_account();
 	ret = memcg_update_cache_sizes(memcg);
+	memcg_resume_kmem_account();
 	mutex_unlock(&memcg_limit_mutex);
 out:
 	return ret;

@@ -1246,6 +1246,9 @@ struct bio *bio_copy_user_iov(struct request_queue *q,
 		ret = __bio_copy_iov(bio, bio->bi_io_vec, iov, iov_count, 0, 1, 0);
 		if (ret)
 			goto cleanup;
+	} else {
+		if (!map_data)	/* we alloc kernel pages for !map_data */
+			zero_fill_bio(bio);
 	}
 
 	bio_set_map_data(bmd, bio, iov, iov_count, map_data ? 0 : 1);
@@ -1838,6 +1841,11 @@ static inline bool bio_remaining_done(struct bio *bio)
  *   something went wrong. No one should call bi_end_io() directly on a
  *   bio unless they own it and thus know that it has an end_io
  *   function.
+ *
+ *   bio_endio() can be called several times on a bio that has been chained
+ *   using bio_chain().  The ->bi_end_io() function will only be called the
+ *   last time.  At this point the BLK_TA_COMPLETE tracing event will be
+ *   generated if BIO_TRACE_COMPLETION is set.
  **/
 void bio_endio(struct bio *bio, int error)
 {
@@ -1863,6 +1871,12 @@ void bio_endio(struct bio *bio, int error)
 			bio_put(bio);
 			bio = parent;
 		} else {
+			if (bio->bi_bdev && bio_flagged(bio, BIO_TRACE_COMPLETION)) {
+				trace_block_bio_complete(bdev_get_queue(bio->bi_bdev),
+							 bio, error);
+				clear_bit(BIO_TRACE_COMPLETION, &bio->bi_flags);
+			}
+
 			if (bio->bi_end_io)
 				bio->bi_end_io(bio, error);
 			bio = NULL;

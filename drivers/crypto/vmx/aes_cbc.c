@@ -55,8 +55,6 @@ static int p8_aes_cbc_init(struct crypto_tfm *tfm)
 		       alg, PTR_ERR(fallback));
 		return PTR_ERR(fallback);
 	}
-	printk(KERN_INFO "Using '%s' as fallback implementation.\n",
-	       crypto_tfm_alg_driver_name((struct crypto_tfm *) fallback));
 
 	crypto_blkcipher_set_flags(
 		fallback,
@@ -87,6 +85,7 @@ static int p8_aes_cbc_setkey(struct crypto_tfm *tfm, const u8 *key,
 	enable_kernel_vsx();
 	ret = aes_p8_set_encrypt_key(key, keylen * 8, &ctx->enc_key);
 	ret += aes_p8_set_decrypt_key(key, keylen * 8, &ctx->dec_key);
+	disable_kernel_vsx();
 	pagefault_enable();
 	preempt_enable();
 
@@ -127,6 +126,7 @@ static int p8_aes_cbc_encrypt(struct blkcipher_desc *desc,
 			ret = blkcipher_walk_done(desc, &walk, nbytes);
 		}
 
+		disable_kernel_vsx();
 		pagefault_enable();
 		preempt_enable();
 	}
@@ -167,6 +167,7 @@ static int p8_aes_cbc_decrypt(struct blkcipher_desc *desc,
 			ret = blkcipher_walk_done(desc, &walk, nbytes);
 		}
 
+		disable_kernel_vsx();
 		pagefault_enable();
 		preempt_enable();
 	}

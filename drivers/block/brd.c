@@ -19,11 +19,6 @@
 #include <linux/radix-tree.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
-#ifdef CONFIG_BLK_DEV_RAM_DAX
-#include <linux/pfn_t.h>
-#include <linux/dax.h>
-#include <linux/socket.h> /* memcpy_fromiovecend_partial */
-#endif
 
 #include <asm/uaccess.h>
 
@@ -43,9 +38,6 @@ struct brd_device {
 
 	struct request_queue	*brd_queue;
 	struct gendisk		*brd_disk;
-#ifdef CONFIG_BLK_DEV_RAM_DAX
-	struct dax_device	*dax_dev;
-#endif
 	struct list_head	brd_list;
 
 	/*
@@ -104,16 +96,8 @@ static struct page *brd_insert_page(struct brd_device *brd, sector_t sector)
 	/*
 	 * Must use NOIO because we don't want to recurse back into the
 	 * block or filesystem layers from page reclaim.
-	 *
-	 * Cannot support DAX and highmem, because our ->direct_access
-	 * routine for DAX must return memory that is always addressable.
-	 * If DAX was reworked to use pfns and kmap throughout, this
-	 * restriction might be able to be lifted.
 	 */
-	gfp_flags = GFP_NOIO | __GFP_ZERO;
-#ifndef CONFIG_BLK_DEV_RAM_DAX
-	gfp_flags |= __GFP_HIGHMEM;
-#endif
+	gfp_flags = GFP_NOIO | __GFP_ZERO | __GFP_HIGHMEM;
 	page = alloc_page(gfp_flags);
 	if (!page)
 		return NULL;
@@ -377,44 +361,6 @@ static int brd_rw_page(struct block_device *bdev, sector_t sector,
 	return err;
 }
 
-#ifdef CONFIG_BLK_DEV_RAM_DAX
-static long __brd_direct_access(struct brd_device *brd, pgoff_t pgoff,
-		long nr_pages, void **kaddr, pfn_t *pfn)
-{
-	struct page *page;
-
-	if (!brd)
-		return -ENODEV;
-	page = brd_insert_page(brd, PFN_PHYS(pgoff) / 512);
-	if (!page)
-		return -ENOSPC;
-	*kaddr = page_address(page);
-	*pfn = page_to_pfn_t(page);
-
-	return 1;
-}
-
-static long brd_dax_direct_access(struct dax_device *dax_dev,
-		pgoff_t pgoff, long nr_pages, void **kaddr, pfn_t *pfn)
-{
-	struct brd_device *brd = dax_get_private(dax_dev);
-
-	return __brd_direct_access(brd, pgoff, nr_pages, kaddr, pfn);
-}
-
-static int brd_dax_memcpy_fromiovecend(struct dax_device *dax_dev,
-		pgoff_t pgoff, void *addr, const struct iovec *iov,
-		int offset, int len)
-{
-	return memcpy_fromiovecend_partial_flushcache(addr, iov, offset, len);
-}
-
-static const struct dax_operations brd_dax_ops = {
-	.direct_access = brd_dax_direct_access,
-	.memcpy_fromiovecend = brd_dax_memcpy_fromiovecend,
-};
-#endif
-
 static int brd_ioctl(struct block_device *bdev, fmode_t mode,
 			unsigned int cmd, unsigned long arg)
 {
@@ -524,21 +470,8 @@ static struct brd_device *brd_alloc(int i)
 	sprintf(disk->disk_name, "ram%d", i);
 	set_capacity(disk, rd_size * 2);
 
-#ifdef CONFIG_BLK_DEV_RAM_DAX
-	queue_flag_set_unlocked(QUEUE_FLAG_DAX, brd->brd_queue);
-	brd->dax_dev = alloc_dax(brd, disk->disk_name, &brd_dax_ops);
-	if (!brd->dax_dev)
-		goto out_free_inode;
-#endif
-
-
 	return brd;
 
-#ifdef CONFIG_BLK_DEV_RAM_DAX
-out_free_inode:
-	kill_dax(brd->dax_dev);
-	put_dax(brd->dax_dev);
-#endif
 out_free_queue:
 	blk_cleanup_queue(brd->brd_queue);
 out_free_dev:
@@ -576,10 +509,6 @@ out:
 static void brd_del_one(struct brd_device *brd)
 {
 	list_del(&brd->brd_list);
-#ifdef CONFIG_BLK_DEV_RAM_DAX
-	kill_dax(brd->dax_dev);
-	put_dax(brd->dax_dev);
-#endif
 	del_gendisk(brd->brd_disk);
 	brd_free(brd);
 }

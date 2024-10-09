@@ -281,6 +281,8 @@
 #include <linux/fcntl.h>
 #include <linux/blkdev.h>
 #include <linux/times.h>
+#include <scsi/scsi_cmnd.h>
+#include <scsi/scsi_eh.h>
 
 #include <asm/uaccess.h>
 
@@ -2142,6 +2144,7 @@ static int cdrom_read_cdda_bpc(struct cdrom_device_info *cdi, __u8 __user *ubuf,
 	struct bio *bio;
 	unsigned int len;
 	int nr, ret = 0;
+	char sense[SCSI_SENSE_BUFFERSIZE];
 
 	if (!q)
 		return -ENXIO;
@@ -2185,10 +2188,17 @@ static int cdrom_read_cdda_bpc(struct cdrom_device_info *cdi, __u8 __user *ubuf,
 		rq->timeout = 60 * HZ;
 		bio = rq->bio;
 
+		memset(sense, 0, sizeof(sense));
+		rq->sense = sense;
+		rq->sense_len = 0;
+
 		if (blk_execute_rq(q, cdi->disk, rq, 0)) {
-			struct request_sense *s = rq->sense;
+			struct scsi_sense_hdr sshdr;
+
 			ret = -EIO;
-			cdi->last_sense = s->sense_key;
+			if (scsi_normalize_sense(rq->sense, rq->sense_len,
+						&sshdr))
+				cdi->last_sense = sshdr.sense_key;
 		}
 
 		if (blk_rq_unmap_user(bio))

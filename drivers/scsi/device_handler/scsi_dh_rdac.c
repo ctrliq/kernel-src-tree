@@ -808,6 +808,7 @@ static const struct {
 	{"NETAPP", "INF-01-00"},
 	{"LSI", "INF-01-00"},
 	{"ENGENIO", "INF-01-00"},
+	{"LENOVO", "DE_Series"},
 	{NULL, NULL},
 };
 

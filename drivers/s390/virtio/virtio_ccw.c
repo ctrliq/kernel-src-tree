@@ -35,6 +35,7 @@
 #include <asm/virtio-ccw.h>
 #include <asm/isc.h>
 #include <asm/airq.h>
+#include <linux/dma-mapping.h>
 
 /*
  * virtio related functions
@@ -48,9 +49,15 @@ struct vq_config_block {
 #define VIRTIO_CCW_CONFIG_SIZE 0x100
 /* same as PCI config space size, should be enough for all drivers */
 
+struct vcdev_dma_area {
+	unsigned long indicators;
+	unsigned long indicators2;
+	struct vq_config_block config_block;
+	__u8 status;
+};
+
 struct virtio_ccw_device {
 	struct virtio_device vdev;
-	__u8 *status;
 	__u8 config[VIRTIO_CCW_CONFIG_SIZE];
 	struct ccw_device *cdev;
 	__u32 curr_io;
@@ -59,24 +66,22 @@ struct virtio_ccw_device {
 	wait_queue_head_t wait_q;
 	spinlock_t lock;
 	struct list_head virtqueues;
-	unsigned long indicators;
-	unsigned long indicators2;
-	struct vq_config_block *config_block;
 	bool is_thinint;
 	bool going_away;
 	bool device_lost;
 	unsigned int config_ready;
 	void *airq_info;
+	struct vcdev_dma_area *dma_area;
 };
 
 static inline unsigned long *indicators(struct virtio_ccw_device *vcdev)
 {
-	return &vcdev->indicators;
+	return &vcdev->dma_area->indicators;
 }
 
 static inline unsigned long *indicators2(struct virtio_ccw_device *vcdev)
 {
-	return &vcdev->indicators2;
+	return &vcdev->dma_area->indicators2;
 }
 
 struct vq_info_block_legacy {
@@ -119,7 +124,6 @@ struct virtio_rev_info {
 struct virtio_ccw_vq_info {
 	struct virtqueue *vq;
 	int num;
-	void *queue;
 	union {
 		struct vq_info_block s;
 		struct vq_info_block_legacy l;
@@ -345,8 +349,8 @@ static void virtio_ccw_drop_indicator(struct virtio_ccw_device *vcdev,
 	struct airq_info *airq_info = vcdev->airq_info;
 
 	if (vcdev->is_thinint) {
-		thinint_area = kzalloc(sizeof(*thinint_area),
-				       GFP_DMA | GFP_KERNEL);
+		thinint_area = ccw_device_dma_zalloc(vcdev->cdev,
+						     sizeof(*thinint_area));
 		if (!thinint_area)
 			return;
 		thinint_area->summary_indicator =
@@ -357,8 +361,8 @@ static void virtio_ccw_drop_indicator(struct virtio_ccw_device *vcdev,
 		ccw->cda = (__u32)(unsigned long) thinint_area;
 	} else {
 		/* payload is the address of the indicators */
-		indicatorp = kmalloc(sizeof(indicators(vcdev)),
-				     GFP_DMA | GFP_KERNEL);
+		indicatorp = ccw_device_dma_zalloc(vcdev->cdev,
+						   sizeof(indicators(vcdev)));
 		if (!indicatorp)
 			return;
 		*indicatorp = 0;
@@ -378,8 +382,8 @@ static void virtio_ccw_drop_indicator(struct virtio_ccw_device *vcdev,
 			 "Failed to deregister indicators (%d)\n", ret);
 	else if (vcdev->is_thinint)
 		virtio_ccw_drop_indicators(vcdev);
-	kfree(indicatorp);
-	kfree(thinint_area);
+	ccw_device_dma_free(vcdev->cdev, indicatorp, sizeof(indicators(vcdev)));
+	ccw_device_dma_free(vcdev->cdev, thinint_area, sizeof(*thinint_area));
 }
 
 static inline long do_kvm_notify(struct subchannel_id schid,
@@ -418,15 +422,15 @@ static int virtio_ccw_read_vq_conf(struct virtio_ccw_device *vcdev,
 {
 	int ret;
 
-	vcdev->config_block->index = index;
+	vcdev->dma_area->config_block.index = index;
 	ccw->cmd_code = CCW_CMD_READ_VQ_CONF;
 	ccw->flags = 0;
 	ccw->count = sizeof(struct vq_config_block);
-	ccw->cda = (__u32)(unsigned long)(vcdev->config_block);
+	ccw->cda = (__u32)(unsigned long)(&vcdev->dma_area->config_block);
 	ret = ccw_io_helper(vcdev, ccw, VIRTIO_CCW_DOING_READ_VQ_CONF);
 	if (ret)
 		return ret;
-	return vcdev->config_block->num ?: -ENOENT;
+	return vcdev->dma_area->config_block.num ?: -ENOENT;
 }
 
 static void virtio_ccw_del_vq(struct virtqueue *vq, struct ccw1 *ccw)
@@ -434,7 +438,6 @@ static void virtio_ccw_del_vq(struct virtqueue *vq, struct ccw1 *ccw)
 	struct virtio_ccw_device *vcdev = to_vc_device(vq->vdev);
 	struct virtio_ccw_vq_info *info = vq->priv;
 	unsigned long flags;
-	unsigned long size;
 	int ret;
 	unsigned int index = vq->index;
 
@@ -472,9 +475,8 @@ static void virtio_ccw_del_vq(struct virtqueue *vq, struct ccw1 *ccw)
 			 ret, index);
 
 	vring_del_virtqueue(vq);
-	size = PAGE_ALIGN(vring_size(info->num, KVM_VIRTIO_CCW_RING_ALIGN));
-	free_pages_exact(info->queue, size);
-	kfree(info->info_block);
+	ccw_device_dma_free(vcdev->cdev, info->info_block,
+			    sizeof(*info->info_block));
 	kfree(info);
 }
 
@@ -484,7 +486,7 @@ static void virtio_ccw_del_vqs(struct virtio_device *vdev)
 	struct ccw1 *ccw;
 	struct virtio_ccw_device *vcdev = to_vc_device(vdev);
 
-	ccw = kzalloc(sizeof(*ccw), GFP_DMA | GFP_KERNEL);
+	ccw = ccw_device_dma_zalloc(vcdev->cdev, sizeof(*ccw));
 	if (!ccw)
 		return;
 
@@ -493,7 +495,7 @@ static void virtio_ccw_del_vqs(struct virtio_device *vdev)
 	list_for_each_entry_safe(vq, n, &vdev->vqs, list)
 		virtio_ccw_del_vq(vq, ccw);
 
-	kfree(ccw);
+	ccw_device_dma_free(vcdev->cdev, ccw, sizeof(*ccw));
 }
 
 static struct virtqueue *virtio_ccw_setup_vq(struct virtio_device *vdev,
@@ -505,8 +507,9 @@ static struct virtqueue *virtio_ccw_setup_vq(struct virtio_device *vdev,
 	int err;
 	struct virtqueue *vq = NULL;
 	struct virtio_ccw_vq_info *info;
-	unsigned long size = 0; /* silence the compiler */
+	u64 queue;
 	unsigned long flags;
+	bool may_reduce;
 
 	/* Allocate queue. */
 	info = kzalloc(sizeof(struct virtio_ccw_vq_info), GFP_KERNEL);
@@ -515,8 +518,8 @@ static struct virtqueue *virtio_ccw_setup_vq(struct virtio_device *vdev,
 		err = -ENOMEM;
 		goto out_err;
 	}
-	info->info_block = kzalloc(sizeof(*info->info_block),
-				   GFP_DMA | GFP_KERNEL);
+	info->info_block = ccw_device_dma_zalloc(vcdev->cdev,
+						 sizeof(*info->info_block));
 	if (!info->info_block) {
 		dev_warn(&vcdev->cdev->dev, "no info block\n");
 		err = -ENOMEM;
@@ -527,37 +530,33 @@ static struct virtqueue *virtio_ccw_setup_vq(struct virtio_device *vdev,
 		err = info->num;
 		goto out_err;
 	}
-	size = PAGE_ALIGN(vring_size(info->num, KVM_VIRTIO_CCW_RING_ALIGN));
-	info->queue = alloc_pages_exact(size, GFP_KERNEL | __GFP_ZERO);
-	if (info->queue == NULL) {
-		dev_warn(&vcdev->cdev->dev, "no queue\n");
-		err = -ENOMEM;
-		goto out_err;
-	}
-
-	vq = vring_new_virtqueue(i, info->num, KVM_VIRTIO_CCW_RING_ALIGN, vdev,
-				 true, info->queue, virtio_ccw_kvm_notify,
-				 callback, name);
+	may_reduce = vcdev->revision > 0;
+	vq = vring_create_virtqueue(i, info->num, KVM_VIRTIO_CCW_RING_ALIGN,
+				    vdev, true, may_reduce,
+				    virtio_ccw_kvm_notify, callback, name);
 	if (!vq) {
 		/* For now, we fail if we can't get the requested size. */
 		dev_warn(&vcdev->cdev->dev, "no vq\n");
 		err = -ENOMEM;
 		goto out_err;
 	}
+	/* it may have been reduced */
+	info->num = virtqueue_get_vring_size(vq);
 
 	/* Register it with the host. */
+	queue = virtqueue_get_desc_addr(vq);
 	if (vcdev->revision == 0) {
-		info->info_block->l.queue = (__u64)info->queue;
+		info->info_block->l.queue = queue;
 		info->info_block->l.align = KVM_VIRTIO_CCW_RING_ALIGN;
 		info->info_block->l.index = i;
 		info->info_block->l.num = info->num;
 		ccw->count = sizeof(info->info_block->l);
 	} else {
-		info->info_block->s.desc = (__u64)info->queue;
+		info->info_block->s.desc = queue;
 		info->info_block->s.index = i;
 		info->info_block->s.num = info->num;
-		info->info_block->s.avail = (__u64)virtqueue_get_avail(vq);
-		info->info_block->s.used = (__u64)virtqueue_get_used(vq);
+		info->info_block->s.avail = (__u64)virtqueue_get_avail_addr(vq);
+		info->info_block->s.used = (__u64)virtqueue_get_used_addr(vq);
 		ccw->count = sizeof(info->info_block->s);
 	}
 	ccw->cmd_code = CCW_CMD_SET_VQ;
@@ -583,9 +582,8 @@ out_err:
 	if (vq)
 		vring_del_virtqueue(vq);
 	if (info) {
-		if (info->queue)
-			free_pages_exact(info->queue, size);
-		kfree(info->info_block);
+		ccw_device_dma_free(vcdev->cdev, info->info_block,
+				    sizeof(*info->info_block));
 	}
 	kfree(info);
 	return ERR_PTR(err);
@@ -599,7 +597,8 @@ static int virtio_ccw_register_adapter_ind(struct virtio_ccw_device *vcdev,
 	struct virtio_thinint_area *thinint_area = NULL;
 	struct airq_info *info;
 
-	thinint_area = kzalloc(sizeof(*thinint_area), GFP_DMA | GFP_KERNEL);
+	thinint_area = ccw_device_dma_zalloc(vcdev->cdev,
+					     sizeof(*thinint_area));
 	if (!thinint_area) {
 		ret = -ENOMEM;
 		goto out;
@@ -635,7 +634,7 @@ static int virtio_ccw_register_adapter_ind(struct virtio_ccw_device *vcdev,
 		virtio_ccw_drop_indicators(vcdev);
 	}
 out:
-	kfree(thinint_area);
+	ccw_device_dma_free(vcdev->cdev, thinint_area, sizeof(*thinint_area));
 	return ret;
 }
 
@@ -649,7 +648,7 @@ static int virtio_ccw_find_vqs(struct virtio_device *vdev, unsigned nvqs,
 	int ret, i;
 	struct ccw1 *ccw;
 
-	ccw = kzalloc(sizeof(*ccw), GFP_DMA | GFP_KERNEL);
+	ccw = ccw_device_dma_zalloc(vcdev->cdev, sizeof(*ccw));
 	if (!ccw)
 		return -ENOMEM;
 
@@ -667,7 +666,8 @@ static int virtio_ccw_find_vqs(struct virtio_device *vdev, unsigned nvqs,
 	 * We need a data area under 2G to communicate. Our payload is
 	 * the address of the indicators.
 	*/
-	indicatorp = kmalloc(sizeof(indicators(vcdev)), GFP_DMA | GFP_KERNEL);
+	indicatorp = ccw_device_dma_zalloc(vcdev->cdev,
+					   sizeof(indicators(vcdev)));
 	if (!indicatorp)
 		goto out;
 	*indicatorp = (unsigned long) indicators(vcdev);
@@ -699,12 +699,16 @@ static int virtio_ccw_find_vqs(struct virtio_device *vdev, unsigned nvqs,
 	if (ret)
 		goto out;
 
-	kfree(indicatorp);
-	kfree(ccw);
+	if (indicatorp)
+		ccw_device_dma_free(vcdev->cdev, indicatorp,
+				    sizeof(indicators(vcdev)));
+	ccw_device_dma_free(vcdev->cdev, ccw, sizeof(*ccw));
 	return 0;
 out:
-	kfree(indicatorp);
-	kfree(ccw);
+	if (indicatorp)
+		ccw_device_dma_free(vcdev->cdev, indicatorp,
+				    sizeof(indicators(vcdev)));
+	ccw_device_dma_free(vcdev->cdev, ccw, sizeof(*ccw));
 	virtio_ccw_del_vqs(vdev);
 	return ret;
 }
@@ -714,12 +718,12 @@ static void virtio_ccw_reset(struct virtio_device *vdev)
 	struct virtio_ccw_device *vcdev = to_vc_device(vdev);
 	struct ccw1 *ccw;
 
-	ccw = kzalloc(sizeof(*ccw), GFP_DMA | GFP_KERNEL);
+	ccw = ccw_device_dma_zalloc(vcdev->cdev, sizeof(*ccw));
 	if (!ccw)
 		return;
 
 	/* Zero status bits. */
-	*vcdev->status = 0;
+	vcdev->dma_area->status = 0;
 
 	/* Send a reset ccw on device. */
 	ccw->cmd_code = CCW_CMD_VDEV_RESET;
@@ -727,7 +731,7 @@ static void virtio_ccw_reset(struct virtio_device *vdev)
 	ccw->count = 0;
 	ccw->cda = 0;
 	ccw_io_helper(vcdev, ccw, VIRTIO_CCW_DOING_RESET);
-	kfree(ccw);
+	ccw_device_dma_free(vcdev->cdev, ccw, sizeof(*ccw));
 }
 
 static u64 virtio_ccw_get_features(struct virtio_device *vdev)
@@ -738,11 +742,11 @@ static u64 virtio_ccw_get_features(struct virtio_device *vdev)
 	u64 rc;
 	struct ccw1 *ccw;
 
-	ccw = kzalloc(sizeof(*ccw), GFP_DMA | GFP_KERNEL);
+	ccw = ccw_device_dma_zalloc(vcdev->cdev, sizeof(*ccw));
 	if (!ccw)
 		return 0;
 
-	features = kzalloc(sizeof(*features), GFP_DMA | GFP_KERNEL);
+	features = ccw_device_dma_zalloc(vcdev->cdev, sizeof(*features));
 	if (!features) {
 		rc = 0;
 		goto out_free;
@@ -775,8 +779,8 @@ static u64 virtio_ccw_get_features(struct virtio_device *vdev)
 		rc |= (u64)le32_to_cpu(features->features) << 32;
 
 out_free:
-	kfree(features);
-	kfree(ccw);
+	ccw_device_dma_free(vcdev->cdev, features, sizeof(*features));
+	ccw_device_dma_free(vcdev->cdev, ccw, sizeof(*ccw));
 	return rc;
 }
 
@@ -794,11 +798,11 @@ static int virtio_ccw_finalize_features(struct virtio_device *vdev)
 		return -EINVAL;
 	}
 
-	ccw = kzalloc(sizeof(*ccw), GFP_DMA | GFP_KERNEL);
+	ccw = ccw_device_dma_zalloc(vcdev->cdev, sizeof(*ccw));
 	if (!ccw)
 		return -ENOMEM;
 
-	features = kzalloc(sizeof(*features), GFP_DMA | GFP_KERNEL);
+	features = ccw_device_dma_zalloc(vcdev->cdev, sizeof(*features));
 	if (!features) {
 		ret = -ENOMEM;
 		goto out_free;
@@ -830,8 +834,8 @@ static int virtio_ccw_finalize_features(struct virtio_device *vdev)
 	ret = ccw_io_helper(vcdev, ccw, VIRTIO_CCW_DOING_WRITE_FEAT);
 
 out_free:
-	kfree(features);
-	kfree(ccw);
+	ccw_device_dma_free(vcdev->cdev, features, sizeof(*features));
+	ccw_device_dma_free(vcdev->cdev, ccw, sizeof(*ccw));
 
 	return ret;
 }
@@ -844,11 +848,12 @@ static void virtio_ccw_get_config(struct virtio_device *vdev,
 	struct ccw1 *ccw;
 	void *config_area;
 
-	ccw = kzalloc(sizeof(*ccw), GFP_DMA | GFP_KERNEL);
+	ccw = ccw_device_dma_zalloc(vcdev->cdev, sizeof(*ccw));
 	if (!ccw)
 		return;
 
-	config_area = kzalloc(VIRTIO_CCW_CONFIG_SIZE, GFP_DMA | GFP_KERNEL);
+	config_area = ccw_device_dma_zalloc(vcdev->cdev,
+					    VIRTIO_CCW_CONFIG_SIZE);
 	if (!config_area)
 		goto out_free;
 
@@ -868,8 +873,8 @@ static void virtio_ccw_get_config(struct virtio_device *vdev,
 		vcdev->config_ready = offset + len;
 
 out_free:
-	kfree(config_area);
-	kfree(ccw);
+	ccw_device_dma_free(vcdev->cdev, config_area, VIRTIO_CCW_CONFIG_SIZE);
+	ccw_device_dma_free(vcdev->cdev, ccw, sizeof(*ccw));
 }
 
 static void virtio_ccw_set_config(struct virtio_device *vdev,
@@ -880,11 +885,12 @@ static void virtio_ccw_set_config(struct virtio_device *vdev,
 	struct ccw1 *ccw;
 	void *config_area;
 
-	ccw = kzalloc(sizeof(*ccw), GFP_DMA | GFP_KERNEL);
+	ccw = ccw_device_dma_zalloc(vcdev->cdev, sizeof(*ccw));
 	if (!ccw)
 		return;
 
-	config_area = kzalloc(VIRTIO_CCW_CONFIG_SIZE, GFP_DMA | GFP_KERNEL);
+	config_area = ccw_device_dma_zalloc(vcdev->cdev,
+					    VIRTIO_CCW_CONFIG_SIZE);
 	if (!config_area)
 		goto out_free;
 
@@ -901,61 +907,61 @@ static void virtio_ccw_set_config(struct virtio_device *vdev,
 	ccw_io_helper(vcdev, ccw, VIRTIO_CCW_DOING_WRITE_CONFIG);
 
 out_free:
-	kfree(config_area);
-	kfree(ccw);
+	ccw_device_dma_free(vcdev->cdev, config_area, VIRTIO_CCW_CONFIG_SIZE);
+	ccw_device_dma_free(vcdev->cdev, ccw, sizeof(*ccw));
 }
 
 static u8 virtio_ccw_get_status(struct virtio_device *vdev)
 {
 	struct virtio_ccw_device *vcdev = to_vc_device(vdev);
-	u8 old_status = *vcdev->status;
+	u8 old_status = vcdev->dma_area->status;
 	struct ccw1 *ccw;
 
 	if (vcdev->revision < 1)
-		return *vcdev->status;
+		return vcdev->dma_area->status;
 
-	ccw = kzalloc(sizeof(*ccw), GFP_DMA | GFP_KERNEL);
+	ccw = ccw_device_dma_zalloc(vcdev->cdev, sizeof(*ccw));
 	if (!ccw)
 		return old_status;
 
 	ccw->cmd_code = CCW_CMD_READ_STATUS;
 	ccw->flags = 0;
-	ccw->count = sizeof(*vcdev->status);
-	ccw->cda = (__u32)(unsigned long)vcdev->status;
+	ccw->count = sizeof(vcdev->dma_area->status);
+	ccw->cda = (__u32)(unsigned long)&vcdev->dma_area->status;
 	ccw_io_helper(vcdev, ccw, VIRTIO_CCW_DOING_READ_STATUS);
 /*
  * If the channel program failed (should only happen if the device
  * was hotunplugged, and then we clean up via the machine check
- * handler anyway), vcdev->status was not overwritten and we just
+ * handler anyway), vcdev->dma_area->status was not overwritten and we just
  * return the old status, which is fine.
 */
-	kfree(ccw);
+	ccw_device_dma_free(vcdev->cdev, ccw, sizeof(*ccw));
 
-	return *vcdev->status;
+	return vcdev->dma_area->status;
 }
 
 static void virtio_ccw_set_status(struct virtio_device *vdev, u8 status)
 {
 	struct virtio_ccw_device *vcdev = to_vc_device(vdev);
-	u8 old_status = *vcdev->status;
+	u8 old_status = vcdev->dma_area->status;
 	struct ccw1 *ccw;
 	int ret;
 
-	ccw = kzalloc(sizeof(*ccw), GFP_DMA | GFP_KERNEL);
+	ccw = ccw_device_dma_zalloc(vcdev->cdev, sizeof(*ccw));
 	if (!ccw)
 		return;
 
 	/* Write the status to the host. */
-	*vcdev->status = status;
+	vcdev->dma_area->status = status;
 	ccw->cmd_code = CCW_CMD_WRITE_STATUS;
 	ccw->flags = 0;
 	ccw->count = sizeof(status);
-	ccw->cda = (__u32)(unsigned long)vcdev->status;
+	ccw->cda = (__u32)(unsigned long)&vcdev->dma_area->status;
 	ret = ccw_io_helper(vcdev, ccw, VIRTIO_CCW_DOING_WRITE_STATUS);
 	/* Write failed? We assume status is unchanged. */
 	if (ret)
-		*vcdev->status = old_status;
-	kfree(ccw);
+		vcdev->dma_area->status = old_status;
+	ccw_device_dma_free(vcdev->cdev, ccw, sizeof(*ccw));
 }
 
 static const struct virtio_config_ops virtio_ccw_config_ops = {
@@ -980,8 +986,8 @@ static void virtio_ccw_release_dev(struct device *_d)
 	struct virtio_device *dev = dev_to_virtio(_d);
 	struct virtio_ccw_device *vcdev = to_vc_device(dev);
 
-	kfree(vcdev->status);
-	kfree(vcdev->config_block);
+	ccw_device_dma_free(vcdev->cdev, vcdev->dma_area,
+			    sizeof(*vcdev->dma_area));
 	kfree(vcdev);
 }
 
@@ -1189,12 +1195,12 @@ static int virtio_ccw_set_transport_rev(struct virtio_ccw_device *vcdev)
 	struct ccw1 *ccw;
 	int ret;
 
-	ccw = kzalloc(sizeof(*ccw), GFP_DMA | GFP_KERNEL);
+	ccw = ccw_device_dma_zalloc(vcdev->cdev, sizeof(*ccw));
 	if (!ccw)
 		return -ENOMEM;
-	rev = kzalloc(sizeof(*rev), GFP_DMA | GFP_KERNEL);
+	rev = ccw_device_dma_zalloc(vcdev->cdev, sizeof(*rev));
 	if (!rev) {
-		kfree(ccw);
+		ccw_device_dma_free(vcdev->cdev, ccw, sizeof(*ccw));
 		return -ENOMEM;
 	}
 
@@ -1224,8 +1230,8 @@ static int virtio_ccw_set_transport_rev(struct virtio_ccw_device *vcdev)
 		}
 	} while (ret == -EOPNOTSUPP);
 
-	kfree(ccw);
-	kfree(rev);
+	ccw_device_dma_free(vcdev->cdev, ccw, sizeof(*ccw));
+	ccw_device_dma_free(vcdev->cdev, rev, sizeof(*rev));
 	return ret;
 }
 
@@ -1241,24 +1247,19 @@ static int virtio_ccw_online(struct ccw_device *cdev)
 		ret = -ENOMEM;
 		goto out_free;
 	}
-	vcdev->config_block = kzalloc(sizeof(*vcdev->config_block),
-				   GFP_DMA | GFP_KERNEL);
-	if (!vcdev->config_block) {
-		ret = -ENOMEM;
-		goto out_free;
-	}
-	vcdev->status = kzalloc(sizeof(*vcdev->status), GFP_DMA | GFP_KERNEL);
-	if (!vcdev->status) {
+	vcdev->vdev.dev.parent = &cdev->dev;
+	vcdev->cdev = cdev;
+	vcdev->dma_area = ccw_device_dma_zalloc(vcdev->cdev,
+						sizeof(*vcdev->dma_area));
+	if (!vcdev->dma_area) {
 		ret = -ENOMEM;
 		goto out_free;
 	}
 
 	vcdev->is_thinint = virtio_ccw_use_airq; /* at least try */
 
-	vcdev->vdev.dev.parent = &cdev->dev;
 	vcdev->vdev.dev.release = virtio_ccw_release_dev;
 	vcdev->vdev.config = &virtio_ccw_config_ops;
-	vcdev->cdev = cdev;
 	init_waitqueue_head(&vcdev->wait_q);
 	INIT_LIST_HEAD(&vcdev->virtqueues);
 	spin_lock_init(&vcdev->lock);
@@ -1288,8 +1289,8 @@ out_put:
 	return ret;
 out_free:
 	if (vcdev) {
-		kfree(vcdev->status);
-		kfree(vcdev->config_block);
+		ccw_device_dma_free(vcdev->cdev, vcdev->dma_area,
+				    sizeof(*vcdev->dma_area));
 	}
 	kfree(vcdev);
 	return ret;

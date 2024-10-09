@@ -555,7 +555,8 @@ static int get_reg_offset_16(struct insn *insn, struct pt_regs *regs,
 }
 
 /**
- * get_desc() - Obtain pointer to a segment descriptor
+ * get_desc() - Obtain contents of a segment descriptor
+ * @out:	Segment descriptor contents on success
  * @sel:	Segment selector
  *
  * Given a segment selector, obtain a pointer to the segment descriptor.
@@ -563,17 +564,17 @@ static int get_reg_offset_16(struct insn *insn, struct pt_regs *regs,
  *
  * Returns:
  *
- * Pointer to segment descriptor on success.
+ * True on success, false on failure.
  *
  * NULL on error.
  */
-static struct desc_struct *get_desc(unsigned short sel)
+static bool get_desc(struct desc_struct *out, unsigned short sel)
 {
 	struct desc_ptr gdt_desc = {0, 0};
 	unsigned long desc_base;
 
 	if ((sel & SEGMENT_TI_MASK) == SEGMENT_LDT) {
-		struct desc_struct *desc = NULL;
+		bool success = false;
 		struct ldt_struct *ldt;
 
 		/* Bits [15:3] contain the index of the desired entry. */
@@ -581,12 +582,14 @@ static struct desc_struct *get_desc(unsigned short sel)
 
 		mutex_lock(&current->active_mm->context.lock);
 		ldt = current->active_mm->context.ldt;
-		if (ldt && sel < ldt->size)
-			desc = &ldt->entries[sel];
+		if (ldt && sel < ldt->size) {
+			*out = ldt->entries[sel];
+			success = true;
+		}
 
 		mutex_unlock(&current->active_mm->context.lock);
 
-		return desc;
+		return success;
 	}
 
 	native_store_gdt(&gdt_desc);
@@ -601,9 +604,10 @@ static struct desc_struct *get_desc(unsigned short sel)
 	desc_base = sel & ~(SEGMENT_RPL_MASK | SEGMENT_TI_MASK);
 
 	if (desc_base > gdt_desc.size)
-		return NULL;
+		return false;
 
-	return (struct desc_struct *)(gdt_desc.address + desc_base);
+	*out = *(struct desc_struct *)(gdt_desc.address + desc_base);
+	return true;
 }
 
 /**
@@ -625,7 +629,7 @@ static struct desc_struct *get_desc(unsigned short sel)
  */
 unsigned long insn_get_seg_base(struct pt_regs *regs, int seg_reg_idx)
 {
-	struct desc_struct *desc;
+	struct desc_struct desc;
 	short sel;
 
 	sel = get_segment_selector(regs, seg_reg_idx);
@@ -663,11 +667,10 @@ unsigned long insn_get_seg_base(struct pt_regs *regs, int seg_reg_idx)
 	if (!sel)
 		return -1L;
 
-	desc = get_desc(sel);
-	if (!desc)
+	if (!get_desc(&desc, sel))
 		return -1L;
 
-	return get_desc_base(desc);
+	return get_desc_base(&desc);
 }
 
 /**
@@ -689,7 +692,7 @@ unsigned long insn_get_seg_base(struct pt_regs *regs, int seg_reg_idx)
  */
 static unsigned long get_seg_limit(struct pt_regs *regs, int seg_reg_idx)
 {
-	struct desc_struct *desc;
+	struct desc_struct desc;
 	unsigned long limit;
 	short sel;
 
@@ -703,8 +706,7 @@ static unsigned long get_seg_limit(struct pt_regs *regs, int seg_reg_idx)
 	if (!sel)
 		return 0;
 
-	desc = get_desc(sel);
-	if (!desc)
+	if (!get_desc(&desc, sel))
 		return 0;
 
 	/*
@@ -713,8 +715,8 @@ static unsigned long get_seg_limit(struct pt_regs *regs, int seg_reg_idx)
 	 * not tested when checking the segment limits. In practice,
 	 * this means that the segment ends in (limit << 12) + 0xfff.
 	 */
-	limit = get_desc_limit(desc);
-	if (desc->g)
+	limit = get_desc_limit(&desc);
+	if (desc.g)
 		limit = (limit << 12) + 0xfff;
 
 	return limit;
@@ -738,7 +740,7 @@ static unsigned long get_seg_limit(struct pt_regs *regs, int seg_reg_idx)
  */
 char insn_get_code_seg_params(struct pt_regs *regs)
 {
-	struct desc_struct *desc;
+	struct desc_struct desc;
 	short sel;
 
 	if (v8086_mode(regs))
@@ -749,8 +751,7 @@ char insn_get_code_seg_params(struct pt_regs *regs)
 	if (sel < 0)
 		return sel;
 
-	desc = get_desc(sel);
-	if (!desc)
+	if (!get_desc(&desc, sel))
 		return -EINVAL;
 
 	/*
@@ -758,10 +759,10 @@ char insn_get_code_seg_params(struct pt_regs *regs)
 	 * determines whether a segment contains data or code. If this is a data
 	 * segment, return error.
 	 */
-	if (!(desc->type & BIT(3)))
+	if (!(desc.type & BIT(3)))
 		return -EINVAL;
 
-	switch ((desc->l << 1) | desc->d) {
+	switch ((desc.l << 1) | desc.d) {
 	case 0: /*
 		 * Legacy mode. CS.L=0, CS.D=0. Address and operand size are
 		 * both 16-bit.

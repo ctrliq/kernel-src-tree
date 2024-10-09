@@ -28,16 +28,40 @@ static int fscache_attach_object(struct fscache_cookie *cookie,
 				 struct fscache_object *object);
 
 /*
- * initialise an cookie jar slab element prior to any use
+ * Allocate a cookie.
  */
-void fscache_cookie_init_once(void *_cookie)
+struct fscache_cookie *fscache_alloc_cookie(
+	struct fscache_cookie *parent,
+	const struct fscache_cookie_def *def,
+	void *netfs_data)
 {
-	struct fscache_cookie *cookie = _cookie;
+	struct fscache_cookie *cookie;
 
-	memset(cookie, 0, sizeof(*cookie));
+	/* allocate and initialise a cookie */
+	cookie = kmem_cache_zalloc(fscache_cookie_jar, GFP_KERNEL);
+	if (!cookie)
+		return NULL;
+
+	atomic_set(&cookie->usage, 1);
+	atomic_set(&cookie->n_children, 0);
+
+	/* We keep the active count elevated until relinquishment to prevent an
+	 * attempt to wake up every time the object operations queue quiesces.
+	 */
+	atomic_set(&cookie->n_active, 1);
+
+	cookie->def		= def;
+	cookie->parent		= parent;
+	cookie->netfs_data	= netfs_data;
+	cookie->flags		= (1 << FSCACHE_COOKIE_NO_DATA_YET);
 	spin_lock_init(&cookie->lock);
 	spin_lock_init(&cookie->stores_lock);
 	INIT_HLIST_HEAD(&cookie->backing_objects);
+
+	/* radix tree insertion won't use the preallocation pool unless it's
+	 * told it may not wait */
+	INIT_RADIX_TREE(&cookie->stores, GFP_NOFS & ~__GFP_WAIT);
+	return cookie;
 }
 
 /*
@@ -86,32 +110,15 @@ struct fscache_cookie *__fscache_acquire_cookie(
 	       parent->def->type != FSCACHE_COOKIE_TYPE_INDEX);
 
 	/* allocate and initialise a cookie */
-	cookie = kmem_cache_alloc(fscache_cookie_jar, GFP_KERNEL);
+	cookie = fscache_alloc_cookie(parent, def, netfs_data);
 	if (!cookie) {
 		fscache_stat(&fscache_n_acquires_oom);
 		_leave(" [ENOMEM]");
 		return NULL;
 	}
 
-	atomic_set(&cookie->usage, 1);
-	atomic_set(&cookie->n_children, 0);
-
-	/* We keep the active count elevated until relinquishment to prevent an
-	 * attempt to wake up every time the object operations queue quiesces.
-	 */
-	atomic_set(&cookie->n_active, 1);
-
 	atomic_inc(&parent->usage);
 	atomic_inc(&parent->n_children);
-
-	cookie->def		= def;
-	cookie->parent		= parent;
-	cookie->netfs_data	= netfs_data;
-	cookie->flags		= (1 << FSCACHE_COOKIE_NO_DATA_YET);
-
-	/* radix tree insertion won't use the preallocation pool unless it's
-	 * told it may not wait */
-	INIT_RADIX_TREE(&cookie->stores, GFP_NOFS & ~__GFP_WAIT);
 
 	switch (cookie->def->type) {
 	case FSCACHE_COOKIE_TYPE_INDEX:

@@ -9724,6 +9724,8 @@ static int bnxt_setup_tc_block(struct net_device *dev,
 	}
 }
 
+LIST_HEAD(bnxt_block_cb_list);
+
 static int bnxt_setup_tc(struct net_device *dev, enum tc_setup_type type,
 			 void *type_data)
 {

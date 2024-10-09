@@ -563,6 +563,7 @@ static int nvmet_port_subsys_drop_link(struct config_item *parent,
 
 found:
 	list_del(&p->entry);
+	nvmet_port_del_ctrls(port, subsys);
 	nvmet_genctr++;
 	if (list_empty(&port->subsystems))
 		nvmet_disable_port(port);

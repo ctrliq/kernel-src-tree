@@ -357,8 +357,7 @@ static void igc_clean_rx_ring(struct igc_ring *rx_ring)
 {
 	u16 i = rx_ring->next_to_clean;
 
-	if (rx_ring->skb)
-		dev_kfree_skb(rx_ring->skb);
+	dev_kfree_skb(rx_ring->skb);
 	rx_ring->skb = NULL;
 
 	/* Free all the Rx ring sk_buffs */
@@ -866,8 +865,8 @@ static void igc_tx_ctxtdesc(struct igc_ring *tx_ring,
 	 * should have been handled by the upper layers.
 	 */
 	if (tx_ring->launchtime_enable) {
-		ts = ns_to_timespec64(first->skb->tstamp);
-		first->skb->tstamp = 0;
+		ts = ns_to_timespec64(first->skb->tstamp.tv64);
+		first->skb->tstamp.tv64 = 0;
 		context_desc->launch_time = cpu_to_le32(ts.tv_nsec / 32);
 	} else {
 		context_desc->launch_time = 0;

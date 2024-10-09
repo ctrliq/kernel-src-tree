@@ -2387,6 +2387,7 @@ static void ice_pci_err_resume(struct pci_dev *pdev)
 	mod_timer(&pf->serv_tmr, round_jiffies(jiffies + pf->serv_tmr_period));
 }
 
+#if 0
 /**
  * ice_pci_err_reset_prepare - prepare device driver for PCI reset
  * @pdev: PCI device information struct
@@ -2413,6 +2414,7 @@ static void ice_pci_err_reset_done(struct pci_dev *pdev)
 {
 	ice_pci_err_resume(pdev);
 }
+#endif
 
 /* ice_pci_tbl - PCI Device ID Table
  *
@@ -2434,8 +2436,10 @@ MODULE_DEVICE_TABLE(pci, ice_pci_tbl);
 static const struct pci_error_handlers ice_pci_err_handler = {
 	.error_detected = ice_pci_err_detected,
 	.slot_reset = ice_pci_err_slot_reset,
+#if 0 /* RHEL-7 doesn't support these calls */
 	.reset_prepare = ice_pci_err_reset_prepare,
 	.reset_done = ice_pci_err_reset_done,
+#endif
 	.resume = ice_pci_err_resume
 };
 
@@ -4200,6 +4204,7 @@ out_rm_features:
 }
 
 static const struct net_device_ops ice_netdev_ops = {
+	.ndo_size = sizeof(struct net_device_ops),
 	.ndo_open = ice_open,
 	.ndo_stop = ice_stop,
 	.ndo_start_xmit = ice_start_xmit,

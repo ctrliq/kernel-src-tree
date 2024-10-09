@@ -66,6 +66,7 @@
 #include <linux/slab.h>
 #include <linux/percpu-refcount.h>
 
+#include <trace/events/block.h>
 #include "md.h"
 #include "md-bitmap.h"
 
@@ -501,7 +502,13 @@ static void md_submit_flush_data(struct work_struct *ws)
 	}
 }
 
-void md_flush_request(struct mddev *mddev, struct bio *bio)
+/*
+ * Manages consolidation of flushes and submitting any flushes needed for
+ * a bio with REQ_PREFLUSH.  Returns true if the bio is finished or is
+ * being finished in another context.  Returns false if the flushing is
+ * complete but still needs the I/O portion of the bio to be processed.
+ */
+bool md_flush_request(struct mddev *mddev, struct bio *bio)
 {
 	ktime_t start = ktime_get_boottime();
 	spin_lock_irq(&mddev->lock);
@@ -526,9 +533,10 @@ void md_flush_request(struct mddev *mddev, struct bio *bio)
 			bio_endio(bio, 0);
 		else {
 			bio->bi_rw &= ~REQ_FLUSH;
-			mddev->pers->make_request(mddev, bio);
+			return false;
 		}
 	}
+	return true;
 }
 EXPORT_SYMBOL(md_flush_request);
 
@@ -2531,6 +2539,8 @@ repeat:
 	pr_debug("md: updating %s RAID superblock on device (in sync %d)\n",
 		 mdname(mddev), mddev->in_sync);
 
+	if (mddev->queue)
+		blk_add_trace_msg(mddev->queue, "md md_update_sb");
 rewrite:
 	bitmap_update_sb(mddev->bitmap);
 	rdev_for_each(rdev, mddev) {

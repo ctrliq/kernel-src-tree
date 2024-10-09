@@ -69,6 +69,7 @@ static void mlx5i_build_nic_params(struct mlx5_core_dev *mdev,
 
 	params->lro_en = false;
 	params->hard_mtu = MLX5_IB_GRH_BYTES + MLX5_IPOIB_HARD_LEN;
+	params->tunneled_offload_en = false;
 }
 
 /* Called directly after IPoIB netdevice was created to initialize SW structs */
@@ -88,7 +89,7 @@ int mlx5i_init(struct mlx5_core_dev *mdev,
 	mlx5_query_port_max_mtu(mdev, &max_mtu, 1);
 	netdev->mtu = max_mtu;
 
-	mlx5e_build_nic_params(mdev, &priv->channels.params,
+	mlx5e_build_nic_params(mdev, &priv->rss_params, &priv->channels.params,
 			       mlx5e_get_netdev_max_channels(netdev),
 			       netdev->mtu);
 	mlx5i_build_nic_params(mdev, &priv->channels.params);
@@ -282,7 +283,7 @@ static int mlx5i_init_tx(struct mlx5e_priv *priv)
 		return err;
 	}
 
-	err = mlx5i_create_tis(priv->mdev, ipriv->qp.qpn, &priv->tisn[0]);
+	err = mlx5i_create_tis(priv->mdev, ipriv->qp.qpn, &priv->tisn[0][0]);
 	if (err) {
 		mlx5_core_warn(priv->mdev, "create tis failed, %d\n", err);
 		goto err_destroy_underlay_qp;
@@ -299,7 +300,7 @@ static void mlx5i_cleanup_tx(struct mlx5e_priv *priv)
 {
 	struct mlx5i_priv *ipriv = priv->ppriv;
 
-	mlx5e_destroy_tis(priv->mdev, priv->tisn[0]);
+	mlx5e_destroy_tis(priv->mdev, priv->tisn[0][0]);
 	mlx5i_destroy_underlay_qp(priv->mdev, &ipriv->qp);
 }
 

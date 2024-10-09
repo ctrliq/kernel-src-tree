@@ -251,6 +251,7 @@ nft_target_destroy(const struct nft_ctx *ctx, const struct nft_expr *expr)
 {
 	struct xt_target *target = expr->ops->data;
 	void *info = nft_expr_priv(expr);
+	struct module *me = target->me;
 	struct xt_tgdtor_param par;
 
 	par.net = ctx->net;
@@ -260,7 +261,7 @@ nft_target_destroy(const struct nft_ctx *ctx, const struct nft_expr *expr)
 	if (par.target->destroy != NULL)
 		par.target->destroy(&par);
 
-	module_put(target->me);
+	module_put(me);
 }
 
 static int nft_target_dump(struct sk_buff *skb, const struct nft_expr *expr)
@@ -433,6 +434,7 @@ nft_match_destroy(const struct nft_ctx *ctx, const struct nft_expr *expr)
 {
 	struct xt_match *match = expr->ops->data;
 	void *info = nft_expr_priv(expr);
+	struct module *me = match->me;
 	struct xt_mtdtor_param par;
 
 	par.net = ctx->net;
@@ -442,7 +444,7 @@ nft_match_destroy(const struct nft_ctx *ctx, const struct nft_expr *expr)
 	if (par.match->destroy != NULL)
 		par.match->destroy(&par);
 
-	module_put(match->me);
+	module_put(me);
 }
 
 static int nft_match_dump(struct sk_buff *skb, const struct nft_expr *expr)

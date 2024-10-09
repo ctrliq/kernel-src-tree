@@ -288,32 +288,21 @@ static const struct ethtool_ops mlx5e_rep_ethtool_ops = {
 
 int mlx5e_attr_get(struct net_device *dev, struct switchdev_attr *attr)
 {
-	struct mlx5e_priv *priv = netdev_priv(dev);
-	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
-	struct net_device *uplink_upper = NULL;
-	struct mlx5e_priv *uplink_priv = NULL;
-	struct net_device *uplink_dev;
+	struct mlx5_eswitch *esw;
+	struct mlx5e_priv *priv;
+	u64 parent_id;
+
+	priv = netdev_priv(dev);
+	esw = priv->mdev->priv.eswitch;
 
 	if (esw->mode == SRIOV_NONE)
 		return -EOPNOTSUPP;
 
-	uplink_dev = mlx5_eswitch_uplink_get_proto_dev(esw, REP_ETH);
-	if (uplink_dev) {
-		uplink_upper = netdev_master_upper_dev_get(uplink_dev);
-		uplink_priv = netdev_priv(uplink_dev);
-	}
-
 	switch (attr->id) {
 	case SWITCHDEV_ATTR_ID_PORT_PARENT_ID:
-		attr->u.ppid.id_len = ETH_ALEN;
-		if (uplink_upper && mlx5_lag_is_sriov(uplink_priv->mdev)) {
-			ether_addr_copy(attr->u.ppid.id, uplink_upper->dev_addr);
-		} else {
-			struct mlx5e_rep_priv *rpriv = priv->ppriv;
-			struct mlx5_eswitch_rep *rep = rpriv->rep;
-
-			ether_addr_copy(attr->u.ppid.id, rep->hw_id);
-		}
+		parent_id = mlx5_query_nic_system_image_guid(priv->mdev);
+		attr->u.ppid.id_len = sizeof(parent_id);
+		memcpy(attr->u.ppid.id, &parent_id, sizeof(parent_id));
 		break;
 	default:
 		return -EOPNOTSUPP;
@@ -1225,7 +1214,9 @@ bool mlx5e_eswitch_rep(struct net_device *netdev)
 }
 
 static void mlx5e_build_rep_params(struct mlx5_core_dev *mdev,
-				   struct mlx5e_params *params, u16 mtu)
+				   struct mlx5e_params *params,
+				   struct mlx5e_rss_params *rss_params,
+				   u16 mtu)
 {
 	u8 cq_period_mode = MLX5_CAP_GEN(mdev, cq_period_start_from_cqe) ?
 					 MLX5_CQ_PERIOD_MODE_START_FROM_CQE :
@@ -1243,11 +1234,12 @@ static void mlx5e_build_rep_params(struct mlx5_core_dev *mdev,
 	mlx5e_set_rx_cq_mode_params(params, cq_period_mode);
 
 	params->num_tc                = 1;
+	params->tunneled_offload_en = false;
 
 	mlx5_query_min_inline(mdev, &params->tx_min_inline_mode);
 
 	/* RSS */
-	mlx5e_build_rss_params(params);
+	mlx5e_build_rss_params(rss_params, params->num_channels);
 }
 
 static void mlx5e_build_rep_netdev(struct net_device *netdev)
@@ -1298,7 +1290,8 @@ static int mlx5e_init_rep(struct mlx5_core_dev *mdev,
 
 	priv->channels.params.num_channels = MLX5E_REP_PARAMS_DEF_NUM_CHANNELS;
 
-	mlx5e_build_rep_params(mdev, &priv->channels.params, netdev->mtu);
+	mlx5e_build_rep_params(mdev, &priv->channels.params,
+			       &priv->rss_params, netdev->mtu);
 	mlx5e_build_rep_netdev(netdev);
 
 	mlx5e_timestamp_init(priv);

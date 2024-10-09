@@ -355,7 +355,7 @@ SYSCALL(sys_kcmp,sys_kcmp,sys_kcmp_wrapper)
 SYSCALL(sys_finit_module,sys_finit_module,sys_finit_module_wrapper)
 SYSCALL(sys_sched_setattr,sys_sched_setattr,sys_sched_setattr_wrapper) /* 345 */
 SYSCALL(sys_sched_getattr,sys_sched_getattr,sys_sched_getattr_wrapper)
-NI_SYSCALL					/* 347 sys_renameat2 */
+SYSCALL(sys_renameat2,sys_renameat2,sys_renameat2_wrapper)
 SYSCALL(sys_seccomp,sys_seccomp,sys_seccomp_wrapper)
 SYSCALL(sys_getrandom,sys_getrandom,sys_getrandom_wrapper)
 SYSCALL(sys_memfd_create,sys_memfd_create,sys_memfd_create_wrapper) /* 350 */

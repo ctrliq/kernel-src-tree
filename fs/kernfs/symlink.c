@@ -100,7 +100,7 @@ static int kernfs_get_target_path(struct kernfs_node *parent,
 
 static int kernfs_getlink(struct dentry *dentry, char *path)
 {
-	struct kernfs_node *kn = dentry->d_fsdata;
+	struct kernfs_node *kn = kernfs_dentry_node(dentry);
 	struct kernfs_node *parent = kn->parent;
 	struct kernfs_node *target = kn->symlink.target_kn;
 	int error;

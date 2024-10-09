@@ -206,7 +206,7 @@ ch_do_scsi(scsi_changer *ch, unsigned char *cmd, int cmd_len,
 				  MAX_RETRIES, NULL);
 
 	DPRINTK("result: 0x%x\n",result);
-	if (driver_byte(result) & DRIVER_SENSE) {
+	if (driver_byte(result) == DRIVER_SENSE) {
 		if (debug)
 			scsi_print_sense_hdr(ch->device, ch->name, &sshdr);
 		errno = ch_find_errno(&sshdr);

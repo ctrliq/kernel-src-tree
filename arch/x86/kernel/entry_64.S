@@ -265,12 +265,16 @@ ENDPROC(native_usergs_sysret64)
 	testl $3, CS-RBP(%rsi)
 	je 1f
 	SWAPGS
+	FENCE_SWAPGS_USER_ENTRY
 	SWITCH_TO_KERNEL_CR3
 	IBRS_ENTRY_CLOBBER /* no indirect jump allowed before IBRS */
 	movq PER_CPU_VAR(kernel_stack), %rsp
 	FILL_RETURN_BUFFER_CLOBBER /* no ret allowed before stuffing the RSB */
 	movq %rsi, %rsp
+	jmp 2f
 1:
+	FENCE_SWAPGS_KERNEL_ENTRY
+2:
 	/* Check to see if we're on the trampoline stack. */
 	movq PER_CPU_VAR(init_tss + TSS_sp0), %rcx
 	cmpq %rcx, %rsp
@@ -355,8 +359,12 @@ ENTRY(save_paranoid)
 	testl %edx,%edx
 	js 1f	/* negative -> in kernel */
 	SWAPGS
+	FENCE_SWAPGS_USER_ENTRY
 	xorl %ebx,%ebx
+	jmp 2f
 1:
+	FENCE_SWAPGS_KERNEL_ENTRY
+2:
 	SAVE_AND_SWITCH_TO_KERNEL_CR3 scratch_reg=%rax save_reg=%r14
 	IBRS_ENTRY_SAVE_AND_CLOBBER save_reg=%r13d /* no indirect jump allowed before IBRS */
 	FILL_RETURN_BUFFER_CLOBBER /* no ret allowed before stuffing the RSB */
@@ -1400,6 +1408,9 @@ apicinterrupt3 HYPERVISOR_CALLBACK_VECTOR \
 #if IS_ENABLED(CONFIG_HYPERV)
 apicinterrupt3 HYPERVISOR_CALLBACK_VECTOR \
 	hyperv_callback_vector hyperv_vector_handler
+
+apicinterrupt3 HYPERV_STIMER0_VECTOR \
+	hv_stimer0_callback_vector hv_stimer0_vector_handler
 #endif /* CONFIG_HYPERV */
 
 /*
@@ -1525,6 +1536,7 @@ ENTRY(error_entry)
 	je error_kernelspace
 error_swapgs:
 	SWAPGS
+	FENCE_SWAPGS_USER_ENTRY
 	SWITCH_TO_KERNEL_CR3
 	movq %rsp, %rsi
 	movq PER_CPU_VAR(kernel_stack), %rsp
@@ -1572,6 +1584,7 @@ error_kernelspace:
 	je bstep_iret
 	cmpq $gs_change,RIP+8(%rsp)
 	je error_swapgs
+	FENCE_SWAPGS_KERNEL_ENTRY
 	jmp error_sti
 
 bstep_iret:
@@ -1685,6 +1698,7 @@ ENTRY(nmi)
 	 */
 
 	SWAPGS_UNSAFE_STACK
+	FENCE_SWAPGS_USER_ENTRY
 	SWITCH_TO_KERNEL_CR3
 	cld
 	movq	%rsp, %rsi
@@ -1920,6 +1934,9 @@ end_repeat_nmi:
 	 * Even with normal interrupts enabled. An NMI should not be
 	 * setting NEED_RESCHED or anything that normal interrupts and
 	 * exceptions might do.
+	 *
+	 * save_paranoid provides the necessary swapgs fencing. So no
+	 * explicit FENCE_SWAPGS_KERNEL_ENTRY is needed.
 	 */
 	call save_paranoid
 	DEFAULT_FRAME 0

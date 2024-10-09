@@ -177,7 +177,8 @@ qla27xx_dump_mpi_ram(struct qla_hw_data *ha, uint32_t addr, uint32_t *ram,
 			return rval;
 		}
 		for (j = 0; j < dwords; j++) {
-			ram[i + j] = IS_QLA27XX(ha) ?
+			ram[i + j] =
+			    (IS_QLA27XX(ha) || IS_QLA28XX(ha)) ?
 			    chunk[j] : swab32(chunk[j]);
 		}
 	}
@@ -252,7 +253,8 @@ qla24xx_dump_ram(struct qla_hw_data *ha, uint32_t addr, uint32_t *ram,
 			return rval;
 		}
 		for (j = 0; j < dwords; j++) {
-			ram[i + j] = IS_QLA27XX(ha) ?
+			ram[i + j] =
+			    (IS_QLA27XX(ha) || IS_QLA28XX(ha)) ?
 			    chunk[j] : swab32(chunk[j]);
 		}
 	}
@@ -444,7 +446,7 @@ qla2xxx_dump_ram(struct qla_hw_data *ha, uint32_t addr, uint16_t *ram,
 		}
 	}
 
-	*nxt = rval == QLA_SUCCESS ? &ram[cnt]: NULL;
+	*nxt = rval == QLA_SUCCESS ? &ram[cnt] : NULL;
 	return rval;
 }
 
@@ -666,7 +668,8 @@ qla25xx_copy_mq(struct qla_hw_data *ha, void *ptr, uint32_t **last_chain)
 	struct qla2xxx_mq_chain *mq = ptr;
 	device_reg_t *reg;
 
-	if (!ha->mqenable || IS_QLA83XX(ha) || IS_QLA27XX(ha))
+	if (!ha->mqenable || IS_QLA83XX(ha) || IS_QLA27XX(ha) ||
+	    IS_QLA28XX(ha))
 		return ptr;
 
 	mq = ptr;
@@ -2517,12 +2520,6 @@ qla83xx_fw_dump_failed:
 /*                         Driver Debug Functions.                          */
 /****************************************************************************/
 
-static inline int
-ql_mask_match(uint32_t level)
-{
-	return (level & ql2xextended_error_logging) == level;
-}
-
 /*
  * This function is for formatting and logging debug information.
  * It is to be used when vha is available. It formats the message
@@ -2537,7 +2534,7 @@ ql_mask_match(uint32_t level)
  * msg:   The message to be displayed.
  */
 void
-ql_dbg(uint32_t level, scsi_qla_host_t *vha, int32_t id, const char *fmt, ...)
+ql_dbg(uint level, scsi_qla_host_t *vha, uint id, const char *fmt, ...)
 {
 	va_list va;
 	struct va_format vaf;
@@ -2580,8 +2577,7 @@ ql_dbg(uint32_t level, scsi_qla_host_t *vha, int32_t id, const char *fmt, ...)
  * msg:   The message to be displayed.
  */
 void
-ql_dbg_pci(uint32_t level, struct pci_dev *pdev, int32_t id,
-	   const char *fmt, ...)
+ql_dbg_pci(uint level, struct pci_dev *pdev, uint id, const char *fmt, ...)
 {
 	va_list va;
 	struct va_format vaf;
@@ -2617,7 +2613,7 @@ ql_dbg_pci(uint32_t level, struct pci_dev *pdev, int32_t id,
  * msg:   The message to be displayed.
  */
 void
-ql_log(uint32_t level, scsi_qla_host_t *vha, int32_t id, const char *fmt, ...)
+ql_log(uint level, scsi_qla_host_t *vha, uint id, const char *fmt, ...)
 {
 	va_list va;
 	struct va_format vaf;
@@ -2675,8 +2671,7 @@ ql_log(uint32_t level, scsi_qla_host_t *vha, int32_t id, const char *fmt, ...)
  * msg:   The message to be displayed.
  */
 void
-ql_log_pci(uint32_t level, struct pci_dev *pdev, int32_t id,
-	   const char *fmt, ...)
+ql_log_pci(uint level, struct pci_dev *pdev, uint id, const char *fmt, ...)
 {
 	va_list va;
 	struct va_format vaf;
@@ -2716,7 +2711,7 @@ ql_log_pci(uint32_t level, struct pci_dev *pdev, int32_t id,
 }
 
 void
-ql_dump_regs(uint32_t level, scsi_qla_host_t *vha, int32_t id)
+ql_dump_regs(uint level, scsi_qla_host_t *vha, uint id)
 {
 	int i;
 	struct qla_hw_data *ha = vha->hw;
@@ -2738,13 +2733,12 @@ ql_dump_regs(uint32_t level, scsi_qla_host_t *vha, int32_t id)
 	ql_dbg(level, vha, id, "Mailbox registers:\n");
 	for (i = 0; i < 6; i++, mbx_reg++)
 		ql_dbg(level, vha, id,
-		    "mbox[%d] 0x%04x\n", i, RD_REG_WORD(mbx_reg));
+		    "mbox[%d] %#04x\n", i, RD_REG_WORD(mbx_reg));
 }
 
 
 void
-ql_dump_buffer(uint32_t level, scsi_qla_host_t *vha, int32_t id,
-	uint8_t *buf, uint size)
+ql_dump_buffer(uint level, scsi_qla_host_t *vha, uint id, void *buf, uint size)
 {
 	uint cnt;
 

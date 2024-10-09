@@ -64,9 +64,12 @@ struct cpuidle_state {
 struct cpuidle_device {
 	unsigned int		registered:1;
 	unsigned int		enabled:1;
+	unsigned int		poll_time_limit:1;
 	unsigned int		cpu;
 
+	int			last_state_idx;
 	int			last_residency;
+	u64			poll_limit_ns;
 	int			state_count;
 	struct cpuidle_state_usage	states_usage[CPUIDLE_STATE_MAX];
 	struct cpuidle_state_kobj *kobjs[CPUIDLE_STATE_MAX];
@@ -120,6 +123,9 @@ struct cpuidle_driver {
 extern void disable_cpuidle(void);
 extern int cpuidle_idle_call(void);
 extern int cpuidle_register_driver(struct cpuidle_driver *drv);
+extern u64 cpuidle_poll_time(struct cpuidle_driver *drv,
+                            struct cpuidle_device *dev);
+
 extern struct cpuidle_driver *cpuidle_get_driver(void);
 extern struct cpuidle_driver *cpuidle_driver_ref(void);
 extern void cpuidle_driver_unref(void);
@@ -143,6 +149,9 @@ static inline void disable_cpuidle(void) { }
 static inline int cpuidle_idle_call(void) { return -ENODEV; }
 static inline int cpuidle_register_driver(struct cpuidle_driver *drv)
 {return -ENODEV; }
+extern u64 cpuidle_poll_time(struct cpuidle_driver *drv,
+                            struct cpuidle_device *dev)
+{return 0; }
 static inline struct cpuidle_driver *cpuidle_get_driver(void) {return NULL; }
 static inline struct cpuidle_driver *cpuidle_driver_ref(void) {return NULL; }
 static inline void cpuidle_driver_unref(void) {}
@@ -170,6 +179,10 @@ void cpuidle_coupled_parallel_barrier(struct cpuidle_device *dev, atomic_t *a);
 static inline void cpuidle_coupled_parallel_barrier(struct cpuidle_device *dev, atomic_t *a)
 {
 }
+#endif
+
+#ifdef CONFIG_ARCH_HAS_CPU_RELAX
+void poll_idle_init(struct cpuidle_driver *drv);
 #endif
 
 /******************************

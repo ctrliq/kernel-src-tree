@@ -809,6 +809,7 @@ static inline bool put_devmap_managed_page(struct page *page)
 	switch (page->pgmap->type) {
 	case MEMORY_HMM:
 	case MEMORY_DEVICE_FS_DAX:
+	case MEMORY_DEVICE_DEV_DAX:
 		__put_devmap_managed_page(page);
 		return true;
 	default:

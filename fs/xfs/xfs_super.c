@@ -1572,6 +1572,30 @@ xfs_destroy_percpu_counters(
 	percpu_counter_destroy(&mp->m_fdblocks);
 }
 
+static struct xfs_mount *
+xfs_mount_alloc(
+	struct super_block	*sb)
+{
+	struct xfs_mount	*mp;
+
+	mp = kzalloc(sizeof(struct xfs_mount), GFP_KERNEL);
+	if (!mp)
+		return NULL;
+
+	mp->m_super = sb;
+	spin_lock_init(&mp->m_sb_lock);
+	spin_lock_init(&mp->m_agirotor_lock);
+	INIT_RADIX_TREE(&mp->m_perag_tree, GFP_ATOMIC);
+	spin_lock_init(&mp->m_perag_lock);
+	mutex_init(&mp->m_growlock);
+	atomic_set(&mp->m_active_trans, 0);
+	INIT_DELAYED_WORK(&mp->m_reclaim_work, xfs_reclaim_worker);
+	INIT_DELAYED_WORK(&mp->m_eofblocks_work, xfs_eofblocks_worker);
+	mp->m_kobj.kobject.kset = xfs_kset;
+	return mp;
+}
+
+
 STATIC int
 xfs_fs_fill_super(
 	struct super_block	*sb,
@@ -1582,18 +1606,13 @@ xfs_fs_fill_super(
 	struct xfs_mount	*mp = NULL;
 	int			flags = 0, error = -ENOMEM;
 
-	mp = kzalloc(sizeof(struct xfs_mount), GFP_KERNEL);
+	/*
+	 * allocate mp and do all low-level struct initializations before we
+	 * attach it to the super
+	 */
+	mp = xfs_mount_alloc(sb);
 	if (!mp)
 		goto out;
-
-	spin_lock_init(&mp->m_sb_lock);
-	mutex_init(&mp->m_growlock);
-	atomic_set(&mp->m_active_trans, 0);
-	INIT_DELAYED_WORK(&mp->m_reclaim_work, xfs_reclaim_worker);
-	INIT_DELAYED_WORK(&mp->m_eofblocks_work, xfs_eofblocks_worker);
-	mp->m_kobj.kobject.kset = xfs_kset;
-
-	mp->m_super = sb;
 	sb->s_fs_info = mp;
 
 	error = xfs_parseargs(mp, (char *)data);
@@ -1915,8 +1934,8 @@ xfs_init_zones(void)
 
 	xfs_inode_zone =
 		kmem_zone_init_flags(sizeof(xfs_inode_t), "xfs_inode",
-			KM_ZONE_HWALIGN | KM_ZONE_RECLAIM | KM_ZONE_SPREAD,
-			xfs_fs_inode_init_once);
+			KM_ZONE_HWALIGN | KM_ZONE_RECLAIM | KM_ZONE_SPREAD |
+			KM_ZONE_ACCOUNT, xfs_fs_inode_init_once);
 	if (!xfs_inode_zone)
 		goto out_destroy_efi_zone;
 

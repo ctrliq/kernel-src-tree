@@ -618,7 +618,9 @@ resizefs_out:
 		 * We haven't replayed the journal, so we cannot use our
 		 * block-bitmap-guided storage zapping commands.
 		 */
-		if (test_opt(sb, NOLOAD) && ext4_has_feature_journal(sb))
+		if (test_opt(sb, NOLOAD) &&
+		    EXT4_HAS_COMPAT_FEATURE(sb,
+					    EXT4_FEATURE_COMPAT_HAS_JOURNAL))
 			return -EROFS;
 
 		if (copy_from_user(&range, (struct fstrim_range __user *)arg,

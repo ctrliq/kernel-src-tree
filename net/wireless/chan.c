@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * This file contains helper code to handle channel
  * settings and keeping track of what is possible at
@@ -5,6 +6,7 @@
  *
  * Copyright 2009	Johannes Berg <johannes@sipsolutions.net>
  * Copyright 2013-2014  Intel Mobile Communications GmbH
+ * Copyright 2018       Intel Corporation
  */
 
 #include <linux/export.h>
@@ -464,7 +466,7 @@ bool cfg80211_is_sub_chan(struct cfg80211_chan_def *chandef,
 			  struct ieee80211_channel *chan)
 {
 	int width;
-	u32 cf_offset, freq;
+	u32 freq;
 
 	if (chandef->chan->center_freq == chan->center_freq)
 		return true;
@@ -472,8 +474,6 @@ bool cfg80211_is_sub_chan(struct cfg80211_chan_def *chandef,
 	width = cfg80211_chandef_get_width(chandef);
 	if (width <= 20)
 		return false;
-
-	cf_offset = width / 2 - 10;
 
 	for (freq = chandef->center_freq1 - width / 2 + 10;
 	     freq <= chandef->center_freq1 + width / 2 - 10; freq += 20) {
@@ -580,6 +580,10 @@ static bool cfg80211_get_chans_dfs_available(struct wiphy *wiphy,
 {
 	struct ieee80211_channel *c;
 	u32 freq, start_freq, end_freq;
+	bool dfs_offload;
+
+	dfs_offload = wiphy_ext_feature_isset(wiphy,
+					      NL80211_EXT_FEATURE_DFS_OFFLOAD);
 
 	start_freq = cfg80211_get_start_freq(center_freq, bandwidth);
 	end_freq = cfg80211_get_end_freq(center_freq, bandwidth);
@@ -597,8 +601,9 @@ static bool cfg80211_get_chans_dfs_available(struct wiphy *wiphy,
 		if (c->flags & IEEE80211_CHAN_DISABLED)
 			return false;
 
-		if ((c->flags & IEEE80211_CHAN_RADAR)  &&
-		    (c->dfs_state != NL80211_DFS_AVAILABLE))
+		if ((c->flags & IEEE80211_CHAN_RADAR) &&
+		    (c->dfs_state != NL80211_DFS_AVAILABLE) &&
+		    !(c->dfs_state == NL80211_DFS_USABLE && dfs_offload))
 			return false;
 	}
 
@@ -743,6 +748,7 @@ bool cfg80211_chandef_usable(struct wiphy *wiphy,
 	case NL80211_CHAN_WIDTH_20:
 		if (!ht_cap->ht_supported)
 			return false;
+		/* fall through */
 	case NL80211_CHAN_WIDTH_20_NOHT:
 		prohibited_flags |= IEEE80211_CHAN_NO_20MHZ;
 		width = 20;
@@ -765,6 +771,7 @@ bool cfg80211_chandef_usable(struct wiphy *wiphy,
 		cap = vht_cap->cap & IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_MASK;
 		if (cap != IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_160_80PLUS80MHZ)
 			return false;
+		/* fall through */
 	case NL80211_CHAN_WIDTH_80:
 		if (!vht_cap->vht_supported)
 			return false;

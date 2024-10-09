@@ -1063,6 +1063,7 @@ static unsigned int userns_inum(void *ns)
 	struct user_namespace *user_ns = ns;
 	return user_ns->proc_inum;
 }
+EXPORT_SYMBOL(current_in_userns);
 
 const struct proc_ns_operations userns_operations = {
 	.name		= "user",

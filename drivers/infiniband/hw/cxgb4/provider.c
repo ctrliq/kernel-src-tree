@@ -344,18 +344,24 @@ static int c4iw_query_port(struct ib_device *ibdev, u8 port,
 	props->max_mtu = IB_MTU_4096;
 	props->active_mtu = ib_mtu_int_to_enum(netdev->mtu);
 
-	if (!netif_carrier_ok(netdev))
+	if (!netif_carrier_ok(netdev)) {
 		props->state = IB_PORT_DOWN;
-	else {
+		props->phys_state = 3;
+	} else {
 		inetdev = in_dev_get(netdev);
 		if (inetdev) {
-			if (inetdev->ifa_list)
+			if (inetdev->ifa_list) {
 				props->state = IB_PORT_ACTIVE;
-			else
+				props->phys_state = 5;
+			} else {
 				props->state = IB_PORT_INIT;
+				props->phys_state = 4;
+			}
 			in_dev_put(inetdev);
-		} else
+		} else {
 			props->state = IB_PORT_INIT;
+			props->phys_state = 4;
+		}
 	}
 
 	props->port_cap_flags =

@@ -464,8 +464,6 @@ static bool memremap_should_map_decrypted(resource_size_t phys_addr,
 			if (efi_mem_attributes(phys_addr) & EFI_MEMORY_NV)
 				return true;
 			break;
-		case -EINVAL:
-			return true;
 		default:
 			break;
 		}

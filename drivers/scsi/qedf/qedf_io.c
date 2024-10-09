@@ -1826,6 +1826,7 @@ int qedf_initiate_abts(struct qedf_ioreq *io_req, bool return_scsi_cmd_on_abts)
 		goto out;
 	}
 
+	qedf = fcport->qedf;
 	rdata = fcport->rdata;
 
 	if (!rdata || !kref_get_unless_zero(&rdata->kref)) {
@@ -1835,32 +1836,31 @@ int qedf_initiate_abts(struct qedf_ioreq *io_req, bool return_scsi_cmd_on_abts)
 	}
 
 	r_a_tov = rdata->r_a_tov;
-	qedf = fcport->qedf;
 	lport = qedf->lport;
 
 	if (lport->state != LPORT_ST_READY || !(lport->link_up)) {
 		QEDF_ERR(&(qedf->dbg_ctx), "link is not ready\n");
 		rc = 1;
-		goto out;
+		goto drop_rdata_kref;
 	}
 
 	if (atomic_read(&qedf->link_down_tmo_valid) > 0) {
 		QEDF_ERR(&(qedf->dbg_ctx), "link_down_tmo active.\n");
 		rc = 1;
-		goto out;
+		goto drop_rdata_kref;
 	}
 
 	/* Ensure room on SQ */
 	if (!atomic_read(&fcport->free_sqes)) {
 		QEDF_ERR(&(qedf->dbg_ctx), "No SQ entries available\n");
 		rc = 1;
-		goto out;
+		goto drop_rdata_kref;
 	}
 
 	if (test_bit(QEDF_RPORT_UPLOADING_CONNECTION, &fcport->flags)) {
 		QEDF_ERR(&qedf->dbg_ctx, "fcport is uploading.\n");
 		rc = 1;
-		goto out;
+		goto drop_rdata_kref;
 	}
 
 	if (!test_bit(QEDF_CMD_OUTSTANDING, &io_req->flags) ||
@@ -1870,7 +1870,7 @@ int qedf_initiate_abts(struct qedf_ioreq *io_req, bool return_scsi_cmd_on_abts)
 			 "io_req xid=0x%x sc_cmd=%p already in cleanup or abort processing or already completed.\n",
 			 io_req->xid, io_req->sc_cmd);
 		rc = 1;
-		goto out;
+		goto drop_rdata_kref;
 	}
 
 	kref_get(&io_req->refcount);
@@ -1903,6 +1903,8 @@ int qedf_initiate_abts(struct qedf_ioreq *io_req, bool return_scsi_cmd_on_abts)
 
 	spin_unlock_irqrestore(&fcport->rport_lock, flags);
 
+drop_rdata_kref:
+	kref_put(&rdata->kref, lport->tt.rport_destroy);
 out:
 	return rc;
 }
@@ -2256,17 +2258,14 @@ static int qedf_execute_tmf(struct qedf_rport *fcport, struct scsi_cmnd *sc_cmd,
 	if (!test_bit(QEDF_RPORT_SESSION_READY, &fcport->flags)) {
 		QEDF_ERR(&(qedf->dbg_ctx), "fcport not offloaded\n");
 		rc = FAILED;
-		return FAILED;
+		goto no_flush;
 	}
-
-	QEDF_INFO(&(qedf->dbg_ctx), QEDF_LOG_SCSI_TM, "portid = 0x%x "
-		   "tm_flags = %d\n", fcport->rdata->ids.port_id, tm_flags);
 
 	io_req = qedf_alloc_cmd(fcport, QEDF_TASK_MGMT_CMD);
 	if (!io_req) {
 		QEDF_ERR(&(qedf->dbg_ctx), "Failed TMF");
 		rc = -EAGAIN;
-		goto reset_tmf_err;
+		goto no_flush;
 	}
 
 	if (tm_flags == FCP_TMF_LUN_RESET)
@@ -2355,7 +2354,6 @@ no_flush:
 		QEDF_ERR(&(qedf->dbg_ctx), "task mgmt command success...\n");
 		rc = SUCCESS;
 	}
-reset_tmf_err:
 	return rc;
 }
 
@@ -2403,7 +2401,7 @@ int qedf_initiate_tmf(struct scsi_cmnd *sc_cmd, u8 tm_flags)
 
 	rc = fc_block_scsi_eh(sc_cmd);
 	if (rc)
-		return rc;
+		goto tmf_err;
 
 	if (!fcport) {
 		QEDF_ERR(NULL, "device_reset: rport is NULL\n");
@@ -2438,7 +2436,13 @@ int qedf_initiate_tmf(struct scsi_cmnd *sc_cmd, u8 tm_flags)
 	}
 
 	if (test_bit(QEDF_RPORT_UPLOADING_CONNECTION, &fcport->flags)) {
-		QEDF_ERR(&qedf->dbg_ctx, "fcport is uploading.\n");
+		if (!fcport->rdata)
+			QEDF_ERR(&qedf->dbg_ctx, "fcport %p is uploading.\n",
+				 fcport);
+		else
+			QEDF_ERR(&qedf->dbg_ctx,
+				 "fcport %p port_id=%06x is uploading.\n",
+				 fcport, fcport->rdata->ids.port_id);
 		rc = FAILED;
 		goto tmf_err;
 	}
@@ -2446,6 +2450,7 @@ int qedf_initiate_tmf(struct scsi_cmnd *sc_cmd, u8 tm_flags)
 	rc = qedf_execute_tmf(fcport, sc_cmd, tm_flags);
 
 tmf_err:
+	kref_put(&rdata->kref, lport->tt.rport_destroy);
 	return rc;
 }
 

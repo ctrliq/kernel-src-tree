@@ -554,7 +554,6 @@ static int gfs2_create_inode(struct inode *dir, struct dentry *dentry,
 	struct gfs2_inode *dip = GFS2_I(dir), *ip;
 	struct gfs2_sbd *sdp = GFS2_SB(&dip->i_inode);
 	struct gfs2_glock *io_gl = NULL;
-	struct dentry *d;
 	int error, free_vfs_inode = 1;
 	u32 aflags = 0;
 	int arq;
@@ -587,22 +586,13 @@ static int gfs2_create_inode(struct inode *dir, struct dentry *dentry,
 			inode = ERR_PTR(-EISDIR);
 			goto fail_gunlock;
 		}
-		d = d_splice_alias(inode, dentry);
-		error = PTR_ERR(d);
-		if (IS_ERR(d)) {
-			inode = ERR_CAST(d);
-			goto fail_gunlock;
-		}
+		d_instantiate(dentry, inode);
 		error = 0;
 		if (file) {
-			if (S_ISREG(inode->i_mode)) {
-				WARN_ON(d != NULL);
+			if (S_ISREG(inode->i_mode))
 				error = finish_open(file, dentry, gfs2_open_common, opened);
-			} else {
-				error = finish_no_open(file, d);
-			}
-		} else {
-			dput(d);
+			else
+				error = finish_no_open(file, NULL);
 		}
 		gfs2_glock_dq_uninit(ghs);
 		return error;
@@ -805,10 +795,13 @@ static struct dentry *__gfs2_lookup(struct inode *dir, struct dentry *dentry,
 		return ERR_PTR(error);
 	}
 
-	d = d_splice_alias(inode, dentry);
-	if (IS_ERR(d)) {
-		gfs2_glock_dq_uninit(&gh);
-		return d;
+	d = d_materialise_unique(dentry, inode);
+	if (d) {
+		if (IS_ERR(d)) {
+			gfs2_glock_dq_uninit(&gh);
+			return d;
+		}
+		dentry = d;
 	}
 	if (file && S_ISREG(inode->i_mode))
 		error = finish_open(file, dentry, gfs2_open_common, opened);
@@ -1309,7 +1302,7 @@ static int gfs2_rename(struct inode *odir, struct dentry *odentry,
 	struct gfs2_inode *ip = GFS2_I(odentry->d_inode);
 	struct gfs2_inode *nip = NULL;
 	struct gfs2_sbd *sdp = GFS2_SB(odir);
-	struct gfs2_holder ghs[5], r_gh;
+	struct gfs2_holder ghs[4], r_gh, rd_gh;
 	struct gfs2_rgrpd *nrgd;
 	unsigned int num_gh;
 	int dir_rename = 0;
@@ -1318,6 +1311,7 @@ static int gfs2_rename(struct inode *odir, struct dentry *odentry,
 	int error;
 
 	gfs2_holder_mark_uninitialized(&r_gh);
+	gfs2_holder_mark_uninitialized(&rd_gh);
 	if (ndentry->d_inode) {
 		nip = GFS2_I(ndentry->d_inode);
 		if (ip == nip)
@@ -1361,13 +1355,6 @@ static int gfs2_rename(struct inode *odir, struct dentry *odentry,
 		gfs2_holder_init(nip->i_gl, LM_ST_EXCLUSIVE, GL_ASYNC,
 				 ghs + num_gh);
 		num_gh++;
-		/* grab the resource lock for unlink flag twiddling 
-		 * this is the case of the target file already existing
-		 * so we unlink before doing the rename
-		 */
-		nrgd = gfs2_blk2rgrpd(sdp, nip->i_no_addr, 1);
-		if (nrgd)
-			gfs2_holder_init(nrgd->rd_gl, LM_ST_EXCLUSIVE, 0, ghs + num_gh++);
 	}
 
 	for (x = 0; x < num_gh; x++) {
@@ -1378,6 +1365,22 @@ static int gfs2_rename(struct inode *odir, struct dentry *odentry,
 	error = gfs2_glock_async_wait(num_gh, ghs);
 	if (error)
 		goto out_gunlock;
+
+	if (nip) {
+		/* Grab the resource group glock for unlink flag twiddling.
+		 * This is the case where the target dinode already exists
+		 * so we unlink before doing the rename.
+		 */
+		nrgd = gfs2_blk2rgrpd(sdp, nip->i_no_addr, 1);
+		if (!nrgd) {
+			error = -ENOENT;
+			goto out_gunlock;
+		}
+		error = gfs2_glock_nq_init(nrgd->rd_gl, LM_ST_EXCLUSIVE, 0,
+					   &rd_gh);
+		if (error)
+			goto out_gunlock;
+	}
 
 	error = -ENOENT;
 	if (ip->i_inode.i_nlink == 0)
@@ -1508,6 +1511,9 @@ out_gunlock_q:
 	if (alloc_required)
 		gfs2_quota_unlock(ndip);
 out_gunlock:
+	if (gfs2_holder_initialized(&rd_gh))
+		gfs2_glock_dq_uninit(&rd_gh);
+
 	while (x--) {
 		if (gfs2_holder_queued(ghs + x))
 			gfs2_glock_dq(ghs + x);

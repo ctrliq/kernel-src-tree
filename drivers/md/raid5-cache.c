@@ -223,6 +223,8 @@ struct r5l_io_unit {
 	struct page *meta_page;	/* store meta block */
 	int meta_offset;	/* current offset in meta_page */
 
+	struct bio_list bios;
+	atomic_t pending_io;    /* pending bios not written to log yet */
 	struct bio *current_bio;/* current_bio accepting new data */
 
 	atomic_t pending_stripe;/* how many stripes not flushed to raid */
@@ -233,8 +235,6 @@ struct r5l_io_unit {
 	struct list_head stripe_list; /* stripes added to the io_unit */
 
 	int state;
-	bool need_split_bio;
-	struct bio *split_bio;
 
 	unsigned int has_flush:1;		/* include flush request */
 	unsigned int has_fua:1;			/* include fua request */
@@ -586,6 +586,9 @@ static void r5l_log_endio(struct bio *bio, int error)
 
 	bio_put(bio);
 
+	if (!atomic_dec_and_test(&io->pending_io))
+		return;
+
 	spin_lock_irqsave(&log->io_list_lock, flags);
 	__r5l_set_io_unit_state(io, IO_UNIT_IO_END);
 
@@ -640,6 +643,7 @@ static void r5l_log_endio(struct bio *bio, int error)
 static void r5l_do_submit_io(struct r5l_log *log, struct r5l_io_unit *io)
 {
 	unsigned long flags;
+	struct bio *bio;
 
 	spin_lock_irqsave(&log->io_list_lock, flags);
 	__r5l_set_io_unit_state(io, IO_UNIT_IO_START);
@@ -656,19 +660,13 @@ static void r5l_do_submit_io(struct r5l_log *log, struct r5l_io_unit *io)
 	 * split_bio first to avoid the issue.
 	 */
 
-	if (io->split_bio) {
+	while ((bio = bio_list_pop(&io->bios))) {
 		if (io->has_flush)
-			io->split_bio->bi_rw = WRITE | REQ_FLUSH;
+			bio_set_op_attrs(bio, WRITE, REQ_FLUSH);
 		if (io->has_fua)
-			io->split_bio->bi_rw = WRITE | REQ_FUA;
-		submit_bio(WRITE, io->split_bio);
+			bio_set_op_attrs(bio, WRITE, REQ_FUA);
+		submit_bio(WRITE, bio);
 	}
-
-	if (io->has_flush)
-		bio_set_op_attrs(io->current_bio, WRITE, REQ_FLUSH);
-	if (io->has_fua)
-		bio_set_op_attrs(io->current_bio, WRITE, REQ_FUA);
-	submit_bio(WRITE, io->current_bio);
 }
 
 /* deferred io_unit will be dispatched here */
@@ -750,13 +748,18 @@ static void r5l_submit_current_io(struct r5l_log *log)
 		r5l_do_submit_io(log, io);
 }
 
-static struct bio *r5l_bio_alloc(struct r5l_log *log)
+static struct bio *r5l_bio_alloc(struct r5l_log *log, struct r5l_io_unit *io)
 {
 	struct bio *bio = bio_alloc_bioset(GFP_NOIO, BIO_MAX_PAGES, log->bs);
 
 	bio->bi_rw = WRITE;
 	bio->bi_bdev = log->rdev->bdev;
 	bio->bi_sector = log->rdev->data_offset + log->log_start;
+	bio->bi_end_io = r5l_log_endio;
+	bio->bi_private = io;
+
+	bio_list_add(&io->bios, bio);
+	atomic_inc(&io->pending_io);
 
 	return bio;
 }
@@ -774,7 +777,7 @@ static void r5_reserve_log_entry(struct r5l_log *log, struct r5l_io_unit *io)
 	 * of BLOCK_SECTORS.
 	 */
 	if (log->log_start == 0)
-		io->need_split_bio = true;
+		io->current_bio = NULL;
 
 	io->log_end = log->log_start;
 }
@@ -790,6 +793,7 @@ static struct r5l_io_unit *r5l_new_meta(struct r5l_log *log)
 	memset(io, 0, sizeof(*io));
 
 	io->log = log;
+	bio_list_init(&io->bios);
 	INIT_LIST_HEAD(&io->log_sibling);
 	INIT_LIST_HEAD(&io->stripe_list);
 	bio_list_init(&io->flush_barriers);
@@ -807,9 +811,7 @@ static struct r5l_io_unit *r5l_new_meta(struct r5l_log *log)
 	io->meta_offset = sizeof(struct r5l_meta_block);
 	io->seq = log->seq++;
 
-	io->current_bio = r5l_bio_alloc(log);
-	io->current_bio->bi_end_io = r5l_log_endio;
-	io->current_bio->bi_private = io;
+	io->current_bio = r5l_bio_alloc(log, io);
 	bio_add_page(io->current_bio, io->meta_page, PAGE_SIZE, 0);
 
 	r5_reserve_log_entry(log, io);
@@ -862,16 +864,14 @@ static void r5l_append_payload_page(struct r5l_log *log, struct page *page)
 {
 	struct r5l_io_unit *io = log->current_io;
 
-	if (io->need_split_bio) {
-		BUG_ON(io->split_bio);
-		io->split_bio = io->current_bio;
-		io->current_bio = r5l_bio_alloc(log);
-		bio_chain(io->current_bio, io->split_bio);
-		io->need_split_bio = false;
-	}
+alloc_bio:
+	if (!io->current_bio)
+		io->current_bio = r5l_bio_alloc(log, io);
 
-	if (!bio_add_page(io->current_bio, page, PAGE_SIZE, 0))
-		BUG();
+	if (!bio_add_page(io->current_bio, page, PAGE_SIZE, 0)) {
+		io->current_bio = NULL;
+		goto alloc_bio;
+	}
 
 	r5_reserve_log_entry(log, io);
 }

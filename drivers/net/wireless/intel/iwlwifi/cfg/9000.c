@@ -6,6 +6,7 @@
  * GPL LICENSE SUMMARY
  *
  * Copyright(c) 2015-2017 Intel Deutschland GmbH
+ * Copyright (C) 2018 - 2019 Intel Corporation
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of version 2 of the GNU General Public License as
@@ -19,6 +20,7 @@
  * BSD LICENSE
  *
  * Copyright(c) 2015-2017 Intel Deutschland GmbH
+ * Copyright (C) 2018 - 2019 Intel Corporation
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -52,18 +54,16 @@
 #include <linux/module.h>
 #include <linux/stringify.h>
 #include "iwl-config.h"
-#include "iwl-agn-hw.h"
 #include "fw/file.h"
 
 /* Highest firmware API version supported */
-#define IWL9000_UCODE_API_MAX	34
+#define IWL9000_UCODE_API_MAX	46
 
 /* Lowest firmware API version supported */
 #define IWL9000_UCODE_API_MIN	30
 
 /* NVM versions */
 #define IWL9000_NVM_VERSION		0x0a1d
-#define IWL9000_TX_POWER_VERSION	0xffff /* meaningless */
 
 /* Memory offsets and lengths */
 #define IWL9000_DCCM_OFFSET		0x800000
@@ -80,11 +80,10 @@
 #define IWL9260_MODULE_FIRMWARE(api) \
 	IWL9260_FW_PRE __stringify(api) ".ucode"
 
-#define NVM_HW_SECTION_NUM_FAMILY_9000		10
-
 static const struct iwl_base_params iwl9000_base_params = {
-	.eeprom_size = OTP_LOW_IMAGE_SIZE_FAMILY_9000,
+	.eeprom_size = OTP_LOW_IMAGE_SIZE_32K,
 	.num_of_queues = 31,
+	.max_tfd_queue_size = 256,
 	.shadow_ram_support = true,
 	.led_compensation = 57,
 	.wd_timeout = IWL_LONG_WD_TIMEOUT,
@@ -124,12 +123,10 @@ static const struct iwl_tt_params iwl9000_tt_params = {
 	.ucode_api_max = IWL9000_UCODE_API_MAX,				\
 	.ucode_api_min = IWL9000_UCODE_API_MIN,				\
 	.device_family = IWL_DEVICE_FAMILY_9000,			\
-	.max_inst_size = IWL60_RTC_INST_SIZE,				\
-	.max_data_size = IWL60_RTC_DATA_SIZE,				\
 	.base_params = &iwl9000_base_params,				\
 	.led_mode = IWL_LED_RF_STATE,					\
-	.nvm_hw_section_num = NVM_HW_SECTION_NUM_FAMILY_9000,		\
-	.non_shared_ant = ANT_A,					\
+	.nvm_hw_section_num = 10,					\
+	.non_shared_ant = ANT_B,					\
 	.dccm_offset = IWL9000_DCCM_OFFSET,				\
 	.dccm_len = IWL9000_DCCM_LEN,					\
 	.dccm2_offset = IWL9000_DCCM2_OFFSET,				\
@@ -145,10 +142,18 @@ static const struct iwl_tt_params iwl9000_tt_params = {
 	.rf_id = true,							\
 	.nvm_type = IWL_NVM_EXT,					\
 	.dbgc_supported = true,						\
+	.min_umac_error_event_table = 0x800000,				\
+	.csr = &iwl_csr_v1,						\
+	.d3_debug_data_base_addr = 0x401000,				\
+	.d3_debug_data_length = 92 * 1024,				\
 	.ht_params = &iwl9000_ht_params,				\
 	.nvm_ver = IWL9000_NVM_VERSION,					\
-	.nvm_calib_ver = IWL9000_TX_POWER_VERSION,			\
-	.max_ht_ampdu_exponent = IEEE80211_HT_MAX_AMPDU_64K
+	.max_ht_ampdu_exponent = IEEE80211_HT_MAX_AMPDU_64K,		\
+	.fw_mon_smem_write_ptr_addr = 0xa0476c,				\
+	.fw_mon_smem_write_ptr_msk = 0xfffff,				\
+	.fw_mon_smem_cycle_cnt_ptr_addr = 0xa04774,			\
+	.fw_mon_smem_cycle_cnt_ptr_msk = 0xfffff
+
 
 const struct iwl_cfg iwl9160_2ac_cfg = {
 	.name = "Intel(R) Dual Band Wireless AC 9160",

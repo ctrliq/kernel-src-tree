@@ -2070,11 +2070,6 @@ static int resolve_lbr_callchain_sample(struct thread *thread,
 		 */
 		int mix_chain_nr = i + 1 + lbr_nr + 1;
 
-		if (mix_chain_nr > (int)sysctl_perf_event_max_stack + PERF_MAX_BRANCH_DEPTH) {
-			pr_warning("corrupted callchain. skipping...\n");
-			return 0;
-		}
-
 		for (j = 0; j < mix_chain_nr; j++) {
 			int err;
 			branch = false;
@@ -2126,6 +2121,27 @@ static int resolve_lbr_callchain_sample(struct thread *thread,
 	return 0;
 }
 
+static int find_prev_cpumode(struct ip_callchain *chain, struct thread *thread,
+			     struct callchain_cursor *cursor,
+			     struct symbol **parent,
+			     struct addr_location *root_al,
+			     u8 *cpumode, int ent)
+{
+	int err = 0;
+
+	while (--ent >= 0) {
+		u64 ip = chain->ips[ent];
+
+		if (ip >= PERF_CONTEXT_MAX) {
+			err = add_callchain_ip(thread, cursor, parent,
+					       root_al, cpumode, ip,
+					       false, NULL, NULL, 0);
+			break;
+		}
+	}
+	return err;
+}
+
 static int thread__resolve_callchain_sample(struct thread *thread,
 					    struct callchain_cursor *cursor,
 					    struct perf_evsel *evsel,
@@ -2138,7 +2154,7 @@ static int thread__resolve_callchain_sample(struct thread *thread,
 	struct ip_callchain *chain = sample->callchain;
 	int chain_nr = 0;
 	u8 cpumode = PERF_RECORD_MISC_USER;
-	int i, j, err;
+	int i, j, err, nr_entries;
 	int skip_idx = -1;
 	int first_call = 0;
 
@@ -2156,8 +2172,7 @@ static int thread__resolve_callchain_sample(struct thread *thread,
 	 * Based on DWARF debug information, some architectures skip
 	 * a callchain entry saved by the kernel.
 	 */
-	if (chain->nr < sysctl_perf_event_max_stack)
-		skip_idx = arch_skip_callchain_idx(thread, chain);
+	skip_idx = arch_skip_callchain_idx(thread, chain);
 
 	/*
 	 * Add branches to call stack for easier browsing. This gives
@@ -2233,12 +2248,14 @@ static int thread__resolve_callchain_sample(struct thread *thread,
 	}
 
 check_calls:
-	if (chain->nr > sysctl_perf_event_max_stack && (int)chain->nr > max_stack) {
-		pr_warning("corrupted callchain. skipping...\n");
-		return 0;
+	if (callchain_param.order != ORDER_CALLEE) {
+		err = find_prev_cpumode(chain, thread, cursor, parent, root_al,
+					&cpumode, chain->nr - first_call);
+		if (err)
+			return (err < 0) ? err : 0;
 	}
-
-	for (i = first_call; i < chain_nr; i++) {
+	for (i = first_call, nr_entries = 0;
+	     i < chain_nr && nr_entries < max_stack; i++) {
 		u64 ip;
 
 		if (callchain_param.order == ORDER_CALLEE)
@@ -2251,6 +2268,15 @@ check_calls:
 			continue;
 #endif
 		ip = chain->ips[j];
+		if (ip < PERF_CONTEXT_MAX)
+                       ++nr_entries;
+		else if (callchain_param.order != ORDER_CALLEE) {
+			err = find_prev_cpumode(chain, thread, cursor, parent,
+						root_al, &cpumode, j);
+			if (err)
+				return (err < 0) ? err : 0;
+			continue;
+		}
 
 		err = add_callchain_ip(thread, cursor, parent,
 				       root_al, &cpumode, ip,

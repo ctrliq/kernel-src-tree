@@ -137,20 +137,6 @@ static void nvme_loop_execute_work(struct work_struct *work)
 	nvmet_req_execute(&iod->req);
 }
 
-static enum blk_eh_timer_return
-nvme_loop_timeout(struct request *rq, bool reserved)
-{
-	struct nvme_loop_iod *iod = blk_mq_rq_to_pdu(rq);
-
-	/* queue error recovery */
-	nvme_reset_ctrl(&iod->queue->ctrl->ctrl);
-
-	/* fail with DNR on admin cmd timeout */
-	nvme_req(rq)->status = NVME_SC_ABORT_REQ | NVME_SC_DNR;
-
-	return BLK_EH_HANDLED;
-}
-
 static int nvme_loop_queue_rq(struct blk_mq_hw_ctx *hctx,
 		const struct blk_mq_queue_data *bd)
 {
@@ -263,7 +249,6 @@ static struct blk_mq_ops nvme_loop_mq_ops = {
 	.complete	= nvme_loop_complete_rq,
 	.init_request	= nvme_loop_init_request,
 	.init_hctx	= nvme_loop_init_hctx,
-	.timeout	= nvme_loop_timeout,
 };
 
 static struct blk_mq_ops nvme_loop_admin_mq_ops = {
@@ -271,7 +256,6 @@ static struct blk_mq_ops nvme_loop_admin_mq_ops = {
 	.complete	= nvme_loop_complete_rq,
 	.init_request	= nvme_loop_init_request,
 	.init_hctx	= nvme_loop_init_admin_hctx,
-	.timeout	= nvme_loop_timeout,
 };
 
 static void nvme_loop_destroy_admin_queue(struct nvme_loop_ctrl *ctrl)
@@ -279,6 +263,7 @@ static void nvme_loop_destroy_admin_queue(struct nvme_loop_ctrl *ctrl)
 	clear_bit(NVME_LOOP_Q_LIVE, &ctrl->queues[0].flags);
 	nvmet_sq_destroy(&ctrl->queues[0].nvme_sq);
 	blk_cleanup_queue(ctrl->ctrl.admin_q);
+	blk_cleanup_queue(ctrl->ctrl.fabrics_q);
 	blk_mq_free_tag_set(&ctrl->admin_tag_set);
 }
 
@@ -383,10 +368,16 @@ static int nvme_loop_configure_admin_queue(struct nvme_loop_ctrl *ctrl)
 		goto out_free_sq;
 	ctrl->ctrl.admin_tagset = &ctrl->admin_tag_set;
 
+	ctrl->ctrl.fabrics_q = blk_mq_init_queue(&ctrl->admin_tag_set);
+	if (IS_ERR(ctrl->ctrl.fabrics_q)) {
+		error = PTR_ERR(ctrl->ctrl.fabrics_q);
+		goto out_free_tagset;
+	}
+
 	ctrl->ctrl.admin_q = blk_mq_init_queue(&ctrl->admin_tag_set);
 	if (IS_ERR(ctrl->ctrl.admin_q)) {
 		error = PTR_ERR(ctrl->ctrl.admin_q);
-		goto out_free_tagset;
+		goto out_cleanup_fabrics_q;
 	}
 
 	error = nvmf_connect_admin_queue(&ctrl->ctrl);
@@ -412,6 +403,8 @@ static int nvme_loop_configure_admin_queue(struct nvme_loop_ctrl *ctrl)
 	ctrl->ctrl.max_hw_sectors =
 		(NVME_LOOP_MAX_SEGMENTS - 1) << (PAGE_SHIFT - 9);
 
+	blk_mq_unquiesce_queue(ctrl->ctrl.admin_q);
+
 	error = nvme_init_identify(&ctrl->ctrl);
 	if (error)
 		goto out_cleanup_queue;
@@ -420,6 +413,8 @@ static int nvme_loop_configure_admin_queue(struct nvme_loop_ctrl *ctrl)
 
 out_cleanup_queue:
 	blk_cleanup_queue(ctrl->ctrl.admin_q);
+out_cleanup_fabrics_q:
+	blk_cleanup_queue(ctrl->ctrl.fabrics_q);
 out_free_tagset:
 	blk_mq_free_tag_set(&ctrl->admin_tag_set);
 out_free_sq:
@@ -433,16 +428,17 @@ static void nvme_loop_shutdown_ctrl(struct nvme_loop_ctrl *ctrl)
 		nvme_stop_queues(&ctrl->ctrl);
 		blk_mq_tagset_busy_iter(&ctrl->tag_set,
 					nvme_cancel_request, &ctrl->ctrl);
+		blk_mq_tagset_wait_completed_request(&ctrl->tag_set);
 		nvme_loop_destroy_io_queues(ctrl);
 	}
 
+	blk_mq_quiesce_queue(ctrl->ctrl.admin_q);
 	if (ctrl->ctrl.state == NVME_CTRL_LIVE)
 		nvme_shutdown_ctrl(&ctrl->ctrl);
 
-	blk_mq_quiesce_queue(ctrl->ctrl.admin_q);
 	blk_mq_tagset_busy_iter(&ctrl->admin_tag_set,
 				nvme_cancel_request, &ctrl->ctrl);
-	blk_mq_unquiesce_queue(ctrl->ctrl.admin_q);
+	blk_mq_tagset_wait_completed_request(&ctrl->admin_tag_set);
 	nvme_loop_destroy_admin_queue(ctrl);
 }
 
@@ -558,6 +554,9 @@ static int nvme_loop_create_io_queues(struct nvme_loop_ctrl *ctrl)
 	ret = nvme_loop_connect_io_queues(ctrl);
 	if (ret)
 		goto out_cleanup_connect_q;
+
+	/* target only accepts single-page sg list */
+	ctrl->ctrl.segment_boundary = PAGE_SIZE - 1;
 
 	return 0;
 

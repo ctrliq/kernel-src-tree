@@ -1,11 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright 2002-2004, Instant802 Networks, Inc.
  * Copyright 2008, Jouni Malinen <j@w1.fi>
- * Copyright (C) 2016 Intel Deutschland GmbH
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
+ * Copyright (C) 2016-2017 Intel Deutschland GmbH
  */
 
 #include <linux/netdevice.h>
@@ -59,8 +56,9 @@ ieee80211_tx_h_michael_mic_add(struct ieee80211_tx_data *tx)
 	if (info->control.hw_key &&
 	    (info->flags & IEEE80211_TX_CTL_DONTFRAG ||
 	     ieee80211_hw_check(&tx->local->hw, SUPPORTS_TX_FRAG)) &&
-	    !(tx->key->conf.flags & IEEE80211_KEY_FLAG_GENERATE_MMIC)) {
-		/* hwaccel - with no need for SW-generated MMIC */
+	    !(tx->key->conf.flags & (IEEE80211_KEY_FLAG_GENERATE_MMIC |
+				     IEEE80211_KEY_FLAG_PUT_MIC_SPACE))) {
+		/* hwaccel - with no need for SW-generated MMIC or MIC space */
 		return TX_CONTINUE;
 	}
 
@@ -75,8 +73,15 @@ ieee80211_tx_h_michael_mic_add(struct ieee80211_tx_data *tx)
 		 skb_tailroom(skb), tail))
 		return TX_DROP;
 
-	key = &tx->key->conf.key[NL80211_TKIP_DATA_OFFSET_TX_MIC_KEY];
 	mic = skb_put(skb, MICHAEL_MIC_LEN);
+
+	if (tx->key->conf.flags & IEEE80211_KEY_FLAG_PUT_MIC_SPACE) {
+		/* Zeroed MIC can help with debug */
+		memset(mic, 0, MICHAEL_MIC_LEN);
+		return TX_CONTINUE;
+	}
+
+	key = &tx->key->conf.key[NL80211_TKIP_DATA_OFFSET_TX_MIC_KEY];
 	michael_mic(key, hdr, data, data_len, mic);
 	if (unlikely(info->flags & IEEE80211_TX_INTFL_TKIP_MIC_FAILURE))
 		mic[0]++;
@@ -332,7 +337,7 @@ static void ccmp_special_blocks(struct sk_buff *skb, u8 *pn, u8 *b_0, u8 *aad)
 	a4_included = ieee80211_has_a4(hdr->frame_control);
 
 	if (ieee80211_is_data_qos(hdr->frame_control))
-		qos_tid = *ieee80211_get_qos_ctl(hdr) & IEEE80211_QOS_CTL_TID_MASK;
+		qos_tid = ieee80211_get_tid(hdr);
 	else
 		qos_tid = 0;
 
@@ -463,6 +468,7 @@ static int ccmp_encrypt_skb(struct ieee80211_tx_data *tx, struct sk_buff *skb,
 
 	pos += IEEE80211_CCMP_HDR_LEN;
 	ccmp_special_blocks(skb, pn, b_0, aad);
+
 	ieee80211_aes_ccm_encrypt(key->u.ccmp.tfm, b_0, aad, pos, len,
 				  skb_put(skb, mic_len), mic_len);
 
@@ -595,8 +601,7 @@ static void gcmp_special_blocks(struct sk_buff *skb, u8 *pn, u8 *j_0, u8 *aad)
 	aad[23] = 0;
 
 	if (ieee80211_is_data_qos(hdr->frame_control))
-		qos_tid = *ieee80211_get_qos_ctl(hdr) &
-			IEEE80211_QOS_CTL_TID_MASK;
+		qos_tid = ieee80211_get_tid(hdr);
 	else
 		qos_tid = 0;
 
@@ -863,8 +868,7 @@ ieee80211_crypto_cs_decrypt(struct ieee80211_rx_data *rx)
 		return RX_DROP_UNUSABLE;
 
 	if (ieee80211_is_data_qos(hdr->frame_control))
-		qos_tid = *ieee80211_get_qos_ctl(hdr) &
-				IEEE80211_QOS_CTL_TID_MASK;
+		qos_tid = ieee80211_get_tid(hdr);
 	else
 		qos_tid = 0;
 

@@ -76,43 +76,12 @@ static int newque(struct ipc_namespace *, struct ipc_params *);
 static int sysvipc_msg_proc_show(struct seq_file *s, void *it);
 #endif
 
-/*
- * Scale msgmni with the available lowmem size: the memory dedicated to msg
- * queues should occupy at most 1/MSG_MEM_SCALE of lowmem.
- * Also take into account the number of nsproxies created so far.
- * This should be done staying within the (MSGMNI , IPCMNI/nr_ipc_ns) range.
- */
-void recompute_msgmni(struct ipc_namespace *ns)
-{
-	struct sysinfo i;
-	unsigned long allowed;
-	int nb_ns;
-
-	si_meminfo(&i);
-	allowed = (((i.totalram - i.totalhigh) / MSG_MEM_SCALE) * i.mem_unit)
-		/ MSGMNB;
-	nb_ns = atomic_read(&nr_ipc_ns);
-	allowed /= nb_ns;
-
-	if (allowed < MSGMNI) {
-		ns->msg_ctlmni = MSGMNI;
-		return;
-	}
-
-	if (allowed > IPCMNI / nb_ns) {
-		ns->msg_ctlmni = IPCMNI / nb_ns;
-		return;
-	}
-
-	ns->msg_ctlmni = allowed;
-}
 
 void msg_init_ns(struct ipc_namespace *ns)
 {
 	ns->msg_ctlmax = MSGMAX;
 	ns->msg_ctlmnb = MSGMNB;
-
-	recompute_msgmni(ns);
+	ns->msg_ctlmni = MSGMNI;
 
 	atomic_set(&ns->msg_bytes, 0);
 	atomic_set(&ns->msg_hdrs, 0);
@@ -130,9 +99,6 @@ void msg_exit_ns(struct ipc_namespace *ns)
 void __init msg_init(void)
 {
 	msg_init_ns(&init_ipc_ns);
-
-	printk(KERN_INFO "msgmni has been set to %d\n",
-		init_ipc_ns.msg_ctlmni);
 
 	ipc_init_proc_interface("sysvipc/msg",
 				"       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid      stime      rtime      ctime\n",
@@ -318,7 +284,7 @@ SYSCALL_DEFINE2(msgget, key_t, key, int, msgflg)
 static inline unsigned long
 copy_msqid_to_user(void __user *buf, struct msqid64_ds *in, int version)
 {
-	switch(version) {
+	switch (version) {
 	case IPC_64:
 		return copy_to_user(buf, in, sizeof(*in));
 	case IPC_OLD:
@@ -363,7 +329,7 @@ copy_msqid_to_user(void __user *buf, struct msqid64_ds *in, int version)
 static inline unsigned long
 copy_msqid_from_user(struct msqid64_ds *out, void __user *buf, int version)
 {
-	switch(version) {
+	switch (version) {
 	case IPC_64:
 		if (copy_from_user(out, buf, sizeof(*out)))
 			return -EFAULT;
@@ -375,9 +341,9 @@ copy_msqid_from_user(struct msqid64_ds *out, void __user *buf, int version)
 		if (copy_from_user(&tbuf_old, buf, sizeof(tbuf_old)))
 			return -EFAULT;
 
-		out->msg_perm.uid      	= tbuf_old.msg_perm.uid;
-		out->msg_perm.gid      	= tbuf_old.msg_perm.gid;
-		out->msg_perm.mode     	= tbuf_old.msg_perm.mode;
+		out->msg_perm.uid	= tbuf_old.msg_perm.uid;
+		out->msg_perm.gid	= tbuf_old.msg_perm.gid;
+		out->msg_perm.mode	= tbuf_old.msg_perm.mode;
 
 		if (tbuf_old.msg_qbytes == 0)
 			out->msg_qbytes	= tbuf_old.msg_lqbytes;
@@ -480,7 +446,7 @@ static int msgctl_nolock(struct ipc_namespace *ns, int msqid,
 	case MSG_INFO:
 	{
 		struct msginfo msginfo;
-		int max_id;
+		int max_idx;
 
 		if (!buf)
 			return -EFAULT;
@@ -510,11 +476,11 @@ static int msgctl_nolock(struct ipc_namespace *ns, int msqid,
 			msginfo.msgpool = MSGPOOL;
 			msginfo.msgtql = MSGTQL;
 		}
-		max_id = ipc_get_maxid(&msg_ids(ns));
+		max_idx = ipc_get_maxidx(&msg_ids(ns));
 		up_read(&msg_ids(ns).rwsem);
 		if (copy_to_user(buf, &msginfo, sizeof(struct msginfo)))
 			return -EFAULT;
-		return (max_id < 0) ? 0 : max_id;
+		return (max_idx < 0) ? 0 : max_idx;
 	}
 
 	case MSG_STAT:
@@ -613,13 +579,13 @@ SYSCALL_DEFINE3(msgctl, int, msqid, int, cmd, struct msqid_ds __user *, buf)
 
 static int testmsg(struct msg_msg *msg, long type, int mode)
 {
-	switch(mode)
+	switch (mode)
 	{
 		case SEARCH_ANY:
 		case SEARCH_NUMBER:
 			return 1;
 		case SEARCH_LESSEQUAL:
-			if (msg->m_type <=type)
+			if (msg->m_type <= type)
 				return 1;
 			break;
 		case SEARCH_EQUAL:
@@ -993,7 +959,7 @@ long do_msgrcv(int msqid, void __user *buf, size_t bufsz, long msgtyp, int msgfl
 		 * wake_up_process(). There is a race with exit(), see
 		 * ipc/mqueue.c for the details.
 		 */
-		msg = (struct msg_msg*)msr_d.r_msg;
+		msg = (struct msg_msg *)msr_d.r_msg;
 		while (msg == NULL) {
 			cpu_relax();
 			msg = (struct msg_msg *)msr_d.r_msg;
@@ -1014,7 +980,7 @@ long do_msgrcv(int msqid, void __user *buf, size_t bufsz, long msgtyp, int msgfl
 		/* Lockless receive, part 4:
 		 * Repeat test after acquiring the spinlock.
 		 */
-		msg = (struct msg_msg*)msr_d.r_msg;
+		msg = (struct msg_msg *)msr_d.r_msg;
 		if (msg != ERR_PTR(-EAGAIN))
 			goto out_unlock0;
 

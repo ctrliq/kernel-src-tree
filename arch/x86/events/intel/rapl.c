@@ -707,7 +707,7 @@ static int __init rapl_prepare_cpus(void)
 	int ret;
 
 	for_each_online_cpu(cpu) {
-		pkg = topology_logical_package_id(cpu);
+		pkg = topology_logical_die_id(cpu);
 		if (rapl_pmus->pmus[pkg])
 			continue;
 

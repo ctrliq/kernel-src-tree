@@ -33,8 +33,8 @@
 /*
  * MegaRAID SAS Driver meta data
  */
-#define MEGASAS_VERSION				"07.707.50.00-rh1"
-#define MEGASAS_RELDATE				"December 18, 2018"
+#define MEGASAS_VERSION				"07.710.50.00-rh1"
+#define MEGASAS_RELDATE				"June 28, 2019"
 
 /*
  * Device IDs
@@ -1530,7 +1530,9 @@ struct megasas_ctrl_info {
 #define MEGASAS_FW_BUSY				1
 
 /* Driver's internal Logging levels*/
-#define OCR_LOGS    (1 << 0)
+#define OCR_DEBUG    (1 << 0)
+#define TM_DEBUG     (1 << 1)
+#define LD_PD_DEBUG    (1 << 2)
 
 #define SCAN_PD_CHANNEL	0x1
 #define SCAN_VD_CHANNEL	0x2
@@ -2709,4 +2711,5 @@ int megasas_adp_reset_wait_for_ready(struct megasas_instance *instance,
 				     bool do_adp_reset,
 				     int ocr_context);
 int megasas_irqpoll(struct irq_poll *irqpoll, int budget);
+void megasas_dump_fusion_io(struct scsi_cmnd *scmd);
 #endif				/*LSI_MEGARAID_SAS_H */

@@ -330,7 +330,7 @@ static int construct_get_dest_keyring(struct key **_dest_keyring)
 		 */
 		if (dest_keyring && do_perm_check) {
 			ret = key_permission(make_key_ref(dest_keyring, 1),
-					     KEY_NEED_WRITE);
+					     KEY_WRITE);
 			if (ret) {
 				key_put(dest_keyring);
 				return ret;

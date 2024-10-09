@@ -493,4 +493,6 @@ do { \
 
 extern struct kmem_zone	*xfs_inode_zone;
 
+bool xfs_inode_verify_forks(struct xfs_inode *ip);
+
 #endif	/* __XFS_INODE_H__ */

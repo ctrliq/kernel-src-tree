@@ -599,7 +599,8 @@ static inline int __do_cpuid_ent(struct kvm_cpuid_entry2 *entry, u32 function,
 			     (1 << KVM_FEATURE_ASYNC_PF) |
 			     (1 << KVM_FEATURE_PV_EOI) |
 			     (1 << KVM_FEATURE_CLOCKSOURCE_STABLE_BIT) |
-			     (1 << KVM_FEATURE_PV_UNHALT);
+			     (1 << KVM_FEATURE_PV_UNHALT) |
+			     (1 << KVM_FEATURE_POLL_CONTROL);
 
 		if (sched_info_on())
 			entry->eax |= (1 << KVM_FEATURE_STEAL_TIME);
@@ -703,8 +704,6 @@ static int do_cpuid_ent(struct kvm_cpuid_entry2 *entry, u32 func,
 
 	return __do_cpuid_ent(entry, func, idx, nent, maxnent);
 }
-
-#undef F
 
 struct kvm_cpuid_param {
 	u32 func;
@@ -900,6 +899,12 @@ void kvm_cpuid(struct kvm_vcpu *vcpu, u32 *eax, u32 *ebx, u32 *ecx, u32 *edx)
 		*ebx = best->ebx;
 		*ecx = best->ecx;
 		*edx = best->edx;
+		if (function == 7 && index == 0) {
+			u64 data;
+		        if (!__kvm_get_msr(vcpu, MSR_IA32_TSX_CTRL, &data, true) &&
+			    (data & TSX_CTRL_CPUID_CLEAR))
+				*ebx &= ~(F(RTM) | F(HLE));
+		}
 	} else
 		*eax = *ebx = *ecx = *edx = 0;
 	trace_kvm_cpuid(function, *eax, *ebx, *ecx, *edx);

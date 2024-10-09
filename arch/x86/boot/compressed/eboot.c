@@ -12,6 +12,7 @@
 #include <asm/efi.h>
 #include <asm/setup.h>
 #include <asm/desc.h>
+#include <asm/boot.h>
 #include <asm/bootparam_utils.h>
 
 #undef memcpy			/* Use memcpy from misc.c */
@@ -1491,7 +1492,7 @@ struct boot_params *efi_main(struct efi_config *c,
 	 * address, relocate it.
 	 */
 	if (hdr->pref_address != hdr->code32_start) {
-		status = relocate_kernel(hdr);
+		status = relocate_kernel(hdr, LOAD_PHYSICAL_ADDR);
 
 		if (status != EFI_SUCCESS)
 			goto fail;

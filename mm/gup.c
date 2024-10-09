@@ -220,7 +220,10 @@ split_fallthrough:
 	}
 
 	if (flags & FOLL_GET) {
-		get_page_foll(page);
+		if (!get_page_foll(page)) {
+			page = ERR_PTR(-ENOMEM);
+			goto unlock;
+		}
 
 		/* drop the pgmap reference now that we hold the page */
 		if (pgmap) {
@@ -478,6 +481,10 @@ long __get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
 						pte_unmap(pte);
 						return i ? : -EFAULT;
 					}
+				}
+				if (unlikely(WARN_ON_ONCE(page_ref_count(page) <= 0))) {
+					pte_unmap(pte);
+					return i ? : -ENOMEM;
 				}
 				pages[i] = page;
 				get_page(page);

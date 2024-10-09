@@ -314,7 +314,7 @@ void post_mobility_fixup(void)
 	 * We don't want CPUs to go online/offline while the device
 	 * tree is being updated.
 	 */
-	cpus_read_lock();
+	cpu_hotplug_disable();
 
 	/*
 	 * It's common for the destination firmware to replace cache
@@ -330,7 +330,7 @@ void post_mobility_fixup(void)
 
 	cacheinfo_rebuild();
 
-	cpus_read_unlock();
+	cpu_hotplug_enable();
 
 	/* Possibly switch to a new RFI flush type */
 	pseries_setup_rfi_flush();

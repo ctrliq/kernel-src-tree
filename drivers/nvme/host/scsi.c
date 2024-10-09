@@ -523,7 +523,7 @@ static int nvme_trans_standard_inquiry_page(struct nvme_ns *ns,
 	u8 resp_data_format = 0x02;
 	u8 protect;
 	u8 cmdque = 0x01 << 1;
-	u8 fw_offset = sizeof(ctrl->firmware_rev);
+	u8 fw_offset = sizeof(ctrl->subsys->firmware_rev);
 
 	/* nvme ns identify - use DPS value for PROTECT field */
 	nvme_sc = nvme_identify_ns(ctrl, ns->ns_id, &id_ns);
@@ -544,12 +544,13 @@ static int nvme_trans_standard_inquiry_page(struct nvme_ns *ns,
 	inq_response[5] = protect;	/* sccs=0 | acc=0 | tpgs=0 | pc3=0 */
 	inq_response[7] = cmdque;	/* wbus16=0 | sync=0 | vs=0 */
 	strncpy(&inq_response[8], "NVMe    ", 8);
-	strncpy(&inq_response[16], ctrl->model, 16);
+	strncpy(&inq_response[16], ctrl->subsys->model, 16);
 
-	while (ctrl->firmware_rev[fw_offset - 1] == ' ' && fw_offset > 4)
+	while (ctrl->subsys->firmware_rev[fw_offset - 1]
+			== ' ' && fw_offset > 4)
 		fw_offset--;
 	fw_offset -= 4;
-	strncpy(&inq_response[32], ctrl->firmware_rev + fw_offset, 4);
+	strncpy(&inq_response[32], ctrl->subsys->firmware_rev + fw_offset, 4);
 
 	xfer_len = min(alloc_len, STANDARD_INQUIRY_LENGTH);
 	return nvme_trans_copy_to_user(hdr, inq_response, xfer_len);
@@ -584,7 +585,8 @@ static int nvme_trans_unit_serial_page(struct nvme_ns *ns,
 	memset(inq_response, 0, STANDARD_INQUIRY_LENGTH);
 	inq_response[1] = INQ_UNIT_SERIAL_NUMBER_PAGE; /* Page Code */
 	inq_response[3] = INQ_SERIAL_NUMBER_LENGTH;    /* Page Length */
-	strncpy(&inq_response[4], ns->ctrl->serial, INQ_SERIAL_NUMBER_LENGTH);
+	strncpy(&inq_response[4], ns->ctrl->subsys->serial,
+					INQ_SERIAL_NUMBER_LENGTH);
 
 	xfer_len = min(alloc_len, STANDARD_INQUIRY_LENGTH);
 	return nvme_trans_copy_to_user(hdr, inq_response, xfer_len);
@@ -665,9 +667,11 @@ static int nvme_fill_device_id_scsi_string(struct nvme_ns *ns,
 	inq_response[7] = 0x44;	/* Designator Length */
 
 	sprintf(&inq_response[8], "%04x", le16_to_cpu(id_ctrl->vid));
-	memcpy(&inq_response[12], ctrl->model, sizeof(ctrl->model));
+	memcpy(&inq_response[12], ctrl->subsys->model,
+			sizeof(ctrl->subsys->model));
 	sprintf(&inq_response[52], "%04x", cpu_to_be32(ns->ns_id));
-	memcpy(&inq_response[56], ctrl->serial, sizeof(ctrl->serial));
+	memcpy(&inq_response[56], ctrl->subsys->serial,
+			sizeof(ctrl->subsys->serial));
 
 	res = nvme_trans_copy_to_user(hdr, inq_response, alloc_len);
 	kfree(id_ctrl);

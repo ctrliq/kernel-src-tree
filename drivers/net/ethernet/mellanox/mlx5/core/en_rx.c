@@ -779,8 +779,14 @@ static inline void mlx5e_handle_csum(struct net_device *netdev,
 		if (unlikely(get_ip_proto(skb, network_depth, proto) == IPPROTO_SCTP))
 			goto csum_unnecessary;
 
+		stats->csum_complete++;
 		skb->ip_summed = CHECKSUM_COMPLETE;
 		skb->csum = csum_unfold((__force __sum16)cqe->check_sum);
+
+		if (test_bit(MLX5E_RQ_STATE_CSUM_FULL, &rq->state))
+			return; /* CQE csum covers all received bytes */
+
+		/* csum might need some fixups ...*/
 		if (network_depth > ETH_HLEN)
 			/* CQE csum is calculated from the IP header and does
 			 * not cover VLAN headers (if present). This will add
@@ -793,7 +799,6 @@ static inline void mlx5e_handle_csum(struct net_device *netdev,
 			skb->csum = csum_block_add(skb->csum,
 						   (__force __wsum)mlx5e_get_fcs(skb),
 						   skb->len - ETH_FCS_LEN);
-		stats->csum_complete++;
 		return;
 	}
 

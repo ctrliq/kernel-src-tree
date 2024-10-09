@@ -146,8 +146,7 @@ static DEVICE_ATTR_RO(hw_rev);
 static ssize_t hca_type_show(struct device *device,
 			     struct device_attribute *attr, char *buf)
 {
-	struct qedr_dev *dev =
-		rdma_device_to_drv_device(device, struct qedr_dev, ibdev);
+	struct qedr_dev *dev = dev_get_drvdata(device);
 
 	return scnprintf(buf, PAGE_SIZE, "FastLinQ QL%x %s\n",
 			 dev->pdev->device,

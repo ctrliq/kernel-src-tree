@@ -177,7 +177,7 @@ static int __dead_end_function(struct objtool_file *file, struct symbol *func,
 		"lbug_with_loc"
 	};
 
-	if (func->bind == STB_WEAK)
+	if (!func || func->bind == STB_WEAK)
 		return 0;
 
 	if (func->bind == STB_GLOBAL)
@@ -416,11 +416,14 @@ static int add_call_destinations(struct objtool_file *file)
 			dest_off = insn->offset + insn->len + insn->immediate;
 			insn->call_dest = find_symbol_by_offset(insn->sec,
 								dest_off);
-			if (!insn->call_dest && !insn->visited) {
-				WARN_FUNC("can't find call dest symbol at offset 0x%lx",
-					  insn->sec, insn->offset, dest_off);
-				return -1;
-			}
+
+			/*
+			 * RHEL: This is a retpoline.  We don't have retpoline
+			 * annotation on RHEL7, so don't warn about the missing
+			 * call dest symbol.  Also disable any "unreachable
+			 * instruction" warnings caused by the retpoline.
+			 */
+			file->ignore_unreachables = true;
 		} else if (rela->sym->type == STT_SECTION) {
 			insn->call_dest = find_symbol_by_offset(rela->sym->sec,
 								rela->addend+4);
@@ -847,7 +850,7 @@ static int decode_sections(struct objtool_file *file)
 
 static bool is_fentry_call(struct instruction *insn)
 {
-	if (insn->type == INSN_CALL &&
+	if (insn->type == INSN_CALL && insn->call_dest &&
 	    insn->call_dest->type == STT_NOTYPE &&
 	    !strcmp(insn->call_dest->name, "__fentry__"))
 		return true;
@@ -1065,13 +1068,13 @@ static bool is_gcov_insn(struct instruction *insn)
 
 static bool is_kasan_insn(struct instruction *insn)
 {
-	return (insn->type == INSN_CALL &&
+	return (insn->type == INSN_CALL && insn->call_dest &&
 		!strcmp(insn->call_dest->name, "__asan_handle_no_return"));
 }
 
 static bool is_ubsan_insn(struct instruction *insn)
 {
-	return (insn->type == INSN_CALL &&
+	return (insn->type == INSN_CALL && insn->call_dest &&
 		!strcmp(insn->call_dest->name,
 			"__ubsan_handle_builtin_unreachable"));
 }

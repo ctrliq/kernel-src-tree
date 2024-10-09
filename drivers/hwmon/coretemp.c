@@ -434,7 +434,7 @@ static int chk_ucode_version(unsigned int cpu)
 
 static struct platform_device *coretemp_get_pdev(unsigned int cpu)
 {
-	int pkgid = topology_logical_package_id(cpu);
+	int pkgid = topology_logical_die_id(cpu);
 	struct pdev_entry *p;
 
 	mutex_lock(&pdev_list_mutex);
@@ -604,7 +604,7 @@ static struct platform_driver coretemp_driver = {
 
 static int coretemp_device_add(unsigned int cpu)
 {
-	int err, pkgid = topology_logical_package_id(cpu);
+	int err, pkgid = topology_logical_die_id(cpu);
 	struct platform_device *pdev;
 	struct pdev_entry *pdev_entry;
 
@@ -652,7 +652,7 @@ exit:
 static void coretemp_device_remove(unsigned int cpu)
 {
 	struct pdev_entry *p, *n;
-	int pkg_id = topology_logical_package_id(cpu);
+	int pkg_id = topology_logical_die_id(cpu);
 
 	mutex_lock(&pdev_list_mutex);
 	list_for_each_entry_safe(p, n, &pdev_list, list) {

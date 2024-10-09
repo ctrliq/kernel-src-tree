@@ -304,7 +304,7 @@ struct page *dma_alloc_from_contiguous(struct device *dev, size_t count,
 			break;
 
 		pfn = cma->base_pfn + pageno;
-		ret = alloc_contig_range(pfn, pfn + count, MIGRATE_CMA);
+		ret = alloc_contig_range(pfn, pfn + count, MIGRATE_CMA, GFP_KERNEL);
 		if (ret == 0) {
 			bitmap_set(cma->bitmap, pageno, count);
 			page = pfn_to_page(pfn);

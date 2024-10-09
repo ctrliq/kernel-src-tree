@@ -140,6 +140,13 @@ int arch_show_interrupts(struct seq_file *p, int prec)
 				   rh_irq_stats(j)->irq_hv_callback_count);
 		seq_printf(p, "  Hypervisor callback interrupts\n");
 	}
+	if (test_bit(HYPERV_STIMER0_VECTOR, used_vectors)) {
+		seq_printf(p, "%*s: ", prec, "HVS");
+		for_each_online_cpu(j)
+			seq_printf(p, "%10u ",
+				   rh_irq_stats(j)->hyperv_stimer0_count);
+		seq_puts(p, "  Hyper-V stimer0 interrupts\n");
+	}
 	seq_printf(p, "%*s: %10u\n", prec, "ERR", atomic_read(&irq_err_count));
 #if defined(CONFIG_X86_IO_APIC)
 	seq_printf(p, "%*s: %10u\n", prec, "MIS", atomic_read(&irq_mis_count));

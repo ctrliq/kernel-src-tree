@@ -846,7 +846,7 @@ xfs_log_unmount_write(xfs_mount_t *mp)
 		return 0;
 	}
 
-	error = _xfs_log_force(mp, XFS_LOG_SYNC, NULL);
+	error = xfs_log_force(mp, XFS_LOG_SYNC);
 	ASSERT(error || !(XLOG_FORCED_SHUTDOWN(log)));
 
 #ifdef DEBUG
@@ -2109,7 +2109,7 @@ xlog_print_trans(
 
 		xfs_warn(mp, "log item: ");
 		xfs_warn(mp, "  type	= 0x%x", lip->li_type);
-		xfs_warn(mp, "  flags	= 0x%x", lip->li_flags);
+		xfs_warn(mp, "  flags	= 0x%lx", lip->li_flags);
 		if (!lv)
 			continue;
 		xfs_warn(mp, "  niovecs	= %d", lv->lv_niovecs);
@@ -3280,129 +3280,95 @@ xlog_state_switch_iclogs(
  *		not in the active nor dirty state.
  */
 int
-_xfs_log_force(
+xfs_log_force(
 	struct xfs_mount	*mp,
-	uint			flags,
-	int			*log_flushed)
+	uint			flags)
 {
 	struct xlog		*log = mp->m_log;
 	struct xlog_in_core	*iclog;
 	xfs_lsn_t		lsn;
 
 	XFS_STATS_INC(mp, xs_log_force);
+	trace_xfs_log_force(mp, 0, _RET_IP_);
 
 	xlog_cil_force(log);
 
 	spin_lock(&log->l_icloglock);
-
 	iclog = log->l_iclog;
-	if (iclog->ic_state & XLOG_STATE_IOERROR) {
-		spin_unlock(&log->l_icloglock);
-		return -EIO;
-	}
+	if (iclog->ic_state & XLOG_STATE_IOERROR)
+		goto out_error;
 
-	/* If the head iclog is not active nor dirty, we just attach
-	 * ourselves to the head and go to sleep.
-	 */
-	if (iclog->ic_state == XLOG_STATE_ACTIVE ||
-	    iclog->ic_state == XLOG_STATE_DIRTY) {
+	if (iclog->ic_state == XLOG_STATE_DIRTY ||
+	    (iclog->ic_state == XLOG_STATE_ACTIVE &&
+	     atomic_read(&iclog->ic_refcnt) == 0 && iclog->ic_offset == 0)) {
 		/*
-		 * If the head is dirty or (active and empty), then
-		 * we need to look at the previous iclog.  If the previous
-		 * iclog is active or dirty we are done.  There is nothing
-		 * to sync out.  Otherwise, we attach ourselves to the
+		 * If the head is dirty or (active and empty), then we need to
+		 * look at the previous iclog.
+		 *
+		 * If the previous iclog is active or dirty we are done.  There
+		 * is nothing to sync out. Otherwise, we attach ourselves to the
 		 * previous iclog and go to sleep.
 		 */
-		if (iclog->ic_state == XLOG_STATE_DIRTY ||
-		    (atomic_read(&iclog->ic_refcnt) == 0
-		     && iclog->ic_offset == 0)) {
-			iclog = iclog->ic_prev;
-			if (iclog->ic_state == XLOG_STATE_ACTIVE ||
-			    iclog->ic_state == XLOG_STATE_DIRTY)
-				goto no_sleep;
-			else
-				goto maybe_sleep;
-		} else {
-			if (atomic_read(&iclog->ic_refcnt) == 0) {
-				/* We are the only one with access to this
-				 * iclog.  Flush it out now.  There should
-				 * be a roundoff of zero to show that someone
-				 * has already taken care of the roundoff from
-				 * the previous sync.
-				 */
-				atomic_inc(&iclog->ic_refcnt);
-				lsn = be64_to_cpu(iclog->ic_header.h_lsn);
-				xlog_state_switch_iclogs(log, iclog, 0);
-				spin_unlock(&log->l_icloglock);
-
-				if (xlog_state_release_iclog(log, iclog))
-					return -EIO;
-
-				if (log_flushed)
-					*log_flushed = 1;
-				spin_lock(&log->l_icloglock);
-				if (be64_to_cpu(iclog->ic_header.h_lsn) == lsn &&
-				    iclog->ic_state != XLOG_STATE_DIRTY)
-					goto maybe_sleep;
-				else
-					goto no_sleep;
-			} else {
-				/* Someone else is writing to this iclog.
-				 * Use its call to flush out the data.  However,
-				 * the other thread may not force out this LR,
-				 * so we mark it WANT_SYNC.
-				 */
-				xlog_state_switch_iclogs(log, iclog, 0);
-				goto maybe_sleep;
-			}
-		}
-	}
-
-	/* By the time we come around again, the iclog could've been filled
-	 * which would give it another lsn.  If we have a new lsn, just
-	 * return because the relevant data has been flushed.
-	 */
-maybe_sleep:
-	if (flags & XFS_LOG_SYNC) {
-		/*
-		 * We must check if we're shutting down here, before
-		 * we wait, while we're holding the l_icloglock.
-		 * Then we check again after waking up, in case our
-		 * sleep was disturbed by a bad news.
-		 */
-		if (iclog->ic_state & XLOG_STATE_IOERROR) {
+		iclog = iclog->ic_prev;
+		if (iclog->ic_state == XLOG_STATE_ACTIVE ||
+		    iclog->ic_state == XLOG_STATE_DIRTY)
+			goto out_unlock;
+	} else if (iclog->ic_state == XLOG_STATE_ACTIVE) {
+		if (atomic_read(&iclog->ic_refcnt) == 0) {
+			/*
+			 * We are the only one with access to this iclog.
+			 *
+			 * Flush it out now.  There should be a roundoff of zero
+			 * to show that someone has already taken care of the
+			 * roundoff from the previous sync.
+			 */
+			atomic_inc(&iclog->ic_refcnt);
+			lsn = be64_to_cpu(iclog->ic_header.h_lsn);
+			xlog_state_switch_iclogs(log, iclog, 0);
 			spin_unlock(&log->l_icloglock);
-			return -EIO;
+
+			if (xlog_state_release_iclog(log, iclog))
+				return -EIO;
+
+			spin_lock(&log->l_icloglock);
+			if (be64_to_cpu(iclog->ic_header.h_lsn) != lsn ||
+			    iclog->ic_state == XLOG_STATE_DIRTY)
+				goto out_unlock;
+		} else {
+			/*
+			 * Someone else is writing to this iclog.
+			 *
+			 * Use its call to flush out the data.  However, the
+			 * other thread may not force out this LR, so we mark
+			 * it WANT_SYNC.
+			 */
+			xlog_state_switch_iclogs(log, iclog, 0);
 		}
-		XFS_STATS_INC(mp, xs_log_force_sleep);
-		xlog_wait(&iclog->ic_force_wait, &log->l_icloglock);
-		/*
-		 * No need to grab the log lock here since we're
-		 * only deciding whether or not to return EIO
-		 * and the memory read should be atomic.
-		 */
-		if (iclog->ic_state & XLOG_STATE_IOERROR)
-			return -EIO;
 	} else {
-
-no_sleep:
-		spin_unlock(&log->l_icloglock);
+		/*
+		 * If the head iclog is not active nor dirty, we just attach
+		 * ourselves to the head and go to sleep if necessary.
+		 */
+		;
 	}
-	return 0;
-}
 
-/*
- * Wrapper for _xfs_log_force(), to be used when caller doesn't care
- * about errors or whether the log was flushed or not. This is the normal
- * interface to use when trying to unpin items or move the log forward.
- */
-void
-xfs_log_force(
-	xfs_mount_t	*mp,
-	uint		flags)
-{
-	trace_xfs_log_force(mp, 0, _RET_IP_);
-	_xfs_log_force(mp, flags, NULL);
+	if (!(flags & XFS_LOG_SYNC))
+		goto out_unlock;
+
+	if (iclog->ic_state & XLOG_STATE_IOERROR)
+		goto out_error;
+	XFS_STATS_INC(mp, xs_log_force_sleep);
+	xlog_wait(&iclog->ic_force_wait, &log->l_icloglock);
+	if (iclog->ic_state & XLOG_STATE_IOERROR)
+		return -EIO;
+	return 0;
+
+out_unlock:
+	spin_unlock(&log->l_icloglock);
+	return 0;
+out_error:
+	spin_unlock(&log->l_icloglock);
+	return -EIO;
 }
 
 /*
@@ -3420,7 +3386,7 @@ xfs_log_force(
  * to disk, that thread will wake up all threads waiting on the queue.
  */
 int
-_xfs_log_force_lsn(
+xfs_log_force_lsn(
 	struct xfs_mount	*mp,
 	xfs_lsn_t		lsn,
 	uint			flags,
@@ -3433,6 +3399,7 @@ _xfs_log_force_lsn(
 	ASSERT(lsn != 0);
 
 	XFS_STATS_INC(mp, xs_log_force);
+	trace_xfs_log_force(mp, lsn, _RET_IP_);
 
 	lsn = xlog_cil_force_lsn(log, lsn);
 	if (lsn == NULLCOMMITLSN)
@@ -3510,21 +3477,6 @@ out_unlock:
 out_error:
 	spin_unlock(&log->l_icloglock);
 	return -EIO;
-}
-
-/*
- * Wrapper for _xfs_log_force_lsn(), to be used when caller doesn't care
- * about errors or whether the log was flushed or not. This is the normal
- * interface to use when trying to unpin items or move the log forward.
- */
-void
-xfs_log_force_lsn(
-	xfs_mount_t	*mp,
-	xfs_lsn_t	lsn,
-	uint		flags)
-{
-	trace_xfs_log_force(mp, lsn, _RET_IP_);
-	_xfs_log_force_lsn(mp, lsn, flags, NULL);
 }
 
 /*
@@ -3993,7 +3945,7 @@ xfs_log_force_umount(
 	 * to guarantee this.
 	 */
 	if (!logerror)
-		_xfs_log_force(mp, XFS_LOG_SYNC, NULL);
+		xfs_log_force(mp, XFS_LOG_SYNC);
 
 	/*
 	 * mark the filesystem and the as in a shutdown state and wake

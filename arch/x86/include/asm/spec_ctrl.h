@@ -18,6 +18,7 @@
 #ifdef __ASSEMBLY__
 
 #include <asm/msr-index.h>
+#include <asm/jump_label.h>
 
 .macro __IBRS_ENTRY
 	movl IBRS_HI32_PCP, %edx
@@ -26,10 +27,16 @@
 	wrmsr
 .endm
 
+/*
+ * IBRS_ENTRY is used only in the syscall paths. We can use dynamic patching
+ * without problem. In interrupt/exception/nmi paths, dynamic patching
+ * can be problematic and so per-cpu variable check is still being done.
+ */
 .macro IBRS_ENTRY
-	testl $SPEC_CTRL_PCP_IBRS_ENTRY, IBRS_ENABLED_PCP
-	jz .Lskip_\@
+	STATIC_JUMP .Librs_\@, ibrs_entry_key
+	jmp .Lend_\@
 
+.Librs_\@:
 	pushq %rax
 	pushq %rcx
 	pushq %rdx
@@ -37,10 +44,6 @@
 	popq %rdx
 	popq %rcx
 	popq %rax
-	jmp .Lend_\@
-
-.Lskip_\@:
-	lfence
 .Lend_\@:
 .endm
 
@@ -103,9 +106,10 @@
 .endm
 
 .macro IBRS_EXIT
-	testl $SPEC_CTRL_PCP_IBRS_EXIT, IBRS_ENABLED_PCP
-	jz .Lskip_\@
+	STATIC_JUMP .Librs_\@, ibrs_exit_key
+	jmp .Lend_\@
 
+.Librs_\@:
 	pushq %rax
 	pushq %rcx
 	pushq %rdx
@@ -114,7 +118,7 @@
 	popq %rcx
 	popq %rax
 
-.Lskip_\@:
+.Lend_\@:
 .endm
 
 .macro IBRS_EXIT_RESTORE_CLOBBER save_reg:req

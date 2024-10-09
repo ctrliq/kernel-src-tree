@@ -316,6 +316,12 @@ replay:
 		return kfree_skb(skb);
 	}
 
+	if (!try_module_get(ss->owner)) {
+		nfnl_unlock(subsys_id);
+		netlink_ack(oskb, nlh, -EOPNOTSUPP);
+		return kfree_skb(skb);
+	}
+
 	while (skb->len >= nlmsg_total_size(0)) {
 		int msglen, type;
 
@@ -384,7 +390,7 @@ replay:
 			 */
 			if (err == -EAGAIN) {
 				status |= NFNL_BATCH_REPLAY;
-				goto next;
+				goto done;
 			}
 		}
 ack:
@@ -410,7 +416,7 @@ ack:
 			if (err)
 				status |= NFNL_BATCH_FAILURE;
 		}
-next:
+
 		msglen = NLMSG_ALIGN(nlh->nlmsg_len);
 		if (msglen > skb->len)
 			msglen = skb->len;
@@ -418,10 +424,16 @@ next:
 	}
 done:
 	if (status & NFNL_BATCH_REPLAY) {
-		ss->abort(oskb);
+		const struct nfnetlink_subsystem *ss2;
+
+		ss2 = rcu_dereference_protected(table[subsys_id].subsys,
+			lockdep_is_held(&table[subsys_id].mutex));
+		if (ss2 == ss)
+			ss->abort(oskb);
 		nfnl_err_reset(&err_list);
 		nfnl_unlock(subsys_id);
 		kfree_skb(skb);
+		module_put(ss->owner);
 		goto replay;
 	} else if (status == NFNL_BATCH_DONE) {
 		ss->commit(oskb);
@@ -432,6 +444,7 @@ done:
 	nfnl_err_deliver(&err_list, oskb);
 	nfnl_unlock(subsys_id);
 	kfree_skb(nskb);
+	module_put(ss->owner);
 }
 
 static void nfnetlink_rcv(struct sk_buff *skb)

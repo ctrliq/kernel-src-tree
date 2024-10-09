@@ -124,7 +124,7 @@ _decode_session6(struct sk_buff *skb, struct flowi *fl, int reverse)
 	u8 nexthdr = nh[IP6CB(skb)->nhoff];
 	int oif = 0;
 
-	if (skb_dst(skb))
+	if (skb_dst(skb) && skb_dst(skb)->dev)
 		oif = skb_dst(skb)->dev->ifindex;
 
 	memset(fl6, 0, sizeof(struct flowi6));

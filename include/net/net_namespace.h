@@ -196,6 +196,8 @@ struct net {
 	RH_KABI_EXTEND(struct fib_notifier_ops	*ipv4_ipmr_notifier_ops)
 	RH_KABI_EXTEND(unsigned int ipv4_ipmr_seq)	/* protected by rtnl_mutex */
 	RH_KABI_EXTEND(int ipv4_sysctl_tcp_min_snd_mss)
+	RH_KABI_EXTEND(u32 hash_mix)
+	RH_KABI_EXTEND(siphash_key_t ip_id_key)
 };
 
 /*

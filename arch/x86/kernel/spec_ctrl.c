@@ -29,6 +29,8 @@ static unsigned int ibrs_mode __read_mostly;
 struct static_key ssbd_userset_key = STATIC_KEY_INIT_FALSE;
 struct static_key retp_enabled_key = STATIC_KEY_INIT_FALSE;
 struct static_key ibrs_present_key = STATIC_KEY_INIT_FALSE;
+struct static_key ibrs_entry_key   = STATIC_KEY_INIT_FALSE;
+struct static_key ibrs_exit_key    = STATIC_KEY_INIT_FALSE;
 EXPORT_SYMBOL(ssbd_userset_key);
 EXPORT_SYMBOL(retp_enabled_key);
 EXPORT_SYMBOL(ibrs_present_key);
@@ -77,6 +79,17 @@ u64 __read_mostly x86_amd_ls_cfg_ssbd_mask;
 static inline bool ssb_is_user_settable(unsigned int mode)
 {
 	return mode >= SPEC_STORE_BYPASS_PRCTL;
+}
+
+/*
+ * Set the static key to match the given boolean flag
+ */
+static inline void set_static_key(struct static_key *key, bool enable)
+{
+	if (enable && !static_key_enabled(key))
+		static_key_slow_inc(key);
+	else if (!enable && static_key_enabled(key))
+		static_key_slow_dec(key);
 }
 
 void spec_ctrl_save_msr(void)
@@ -181,6 +194,12 @@ static void set_spec_ctrl_pcp(bool entry, bool exit)
 		enabled = SPEC_CTRL_PCP_IBRS_ENTRY|SPEC_CTRL_PCP_IBRS_EXIT;
 	else
 		enabled = 0;
+
+	/*
+	 * Set ibrs_entry_key and ibrs_exit_key to match the enabled flag.
+	 */
+	set_static_key(&ibrs_entry_key, enabled & SPEC_CTRL_PCP_IBRS_ENTRY);
+	set_static_key(&ibrs_exit_key , enabled & SPEC_CTRL_PCP_IBRS_EXIT);
 
 	if (entry)
 		entry_val |= SPEC_CTRL_IBRS;
@@ -313,10 +332,7 @@ static void sync_all_cpus_ibp(bool enable)
 
 static void set_spec_ctrl_retp(bool enable)
 {
-	if (!static_key_enabled(&retp_enabled_key) && enable)
-		static_key_slow_inc(&retp_enabled_key);
-	else if (static_key_enabled(&retp_enabled_key) && !enable)
-		static_key_slow_dec(&retp_enabled_key);
+	set_static_key(&retp_enabled_key, enable);
 }
 
 static void spec_ctrl_disable_all(void)
@@ -553,10 +569,7 @@ static void spec_ctrl_reinit_all_cpus(void)
 
 void spec_ctrl_init(void)
 {
-	if (!static_key_enabled(&ibrs_present_key) && boot_cpu_has(X86_FEATURE_IBRS))
-		static_key_slow_inc(&ibrs_present_key);
-	else if (static_key_enabled(&ibrs_present_key) && !boot_cpu_has(X86_FEATURE_IBRS))
-		static_key_slow_dec(&ibrs_present_key);
+	set_static_key(&ibrs_present_key, boot_cpu_has(X86_FEATURE_IBRS));
 	spec_ctrl_print_features();
 }
 

@@ -6,7 +6,7 @@
  *
  * Spinlocks:               Mohamed Abbas           (abbas.mohamed@intel.com)
  * Lockless receive & send, fd based notify:
- * 			    Manfred Spraul	    (manfred@colorfullife.com)
+ *			    Manfred Spraul	    (manfred@colorfullife.com)
  *
  * Audit:                   George Wilson           (ltcgcw@us.ibm.com)
  *
@@ -73,7 +73,7 @@ struct mqueue_inode_info {
 	struct mq_attr attr;
 
 	struct sigevent notify;
-	struct pid* notify_owner;
+	struct pid *notify_owner;
 	struct user_namespace *notify_user_ns;
 	struct user_struct *user;	/* user who created, for accounting */
 	struct sock *notify_sock;
@@ -92,7 +92,7 @@ static void remove_notification(struct mqueue_inode_info *info);
 
 static struct kmem_cache *mqueue_inode_cachep;
 
-static struct ctl_table_header * mq_sysctl_table;
+static struct ctl_table_header *mq_sysctl_table;
 
 static inline struct mqueue_inode_info *MQUEUE_I(struct inode *inode)
 {
@@ -464,13 +464,13 @@ out_unlock:
 
 static int mqueue_unlink(struct inode *dir, struct dentry *dentry)
 {
-  	struct inode *inode = dentry->d_inode;
+	struct inode *inode = dentry->d_inode;
 
 	dir->i_ctime = dir->i_mtime = dir->i_atime = CURRENT_TIME;
 	dir->i_size -= DIRENT_SIZE;
-  	drop_nlink(inode);
-  	dput(dentry);
-  	return 0;
+	drop_nlink(inode);
+	dput(dentry);
+	return 0;
 }
 
 /*
@@ -620,7 +620,7 @@ static struct ext_wait_queue *wq_get_first_waiter(
 
 static inline void set_cookie(struct sk_buff *skb, char code)
 {
-	((char*)skb->data)[NOTIFY_COOKIE_LEN-1] = code;
+	((char *)skb->data)[NOTIFY_COOKIE_LEN-1] = code;
 }
 
 /*
@@ -1431,7 +1431,7 @@ static int __init init_mqueue_fs(void)
 
 	mqueue_inode_cachep = kmem_cache_create("mqueue_inode_cache",
 				sizeof(struct mqueue_inode_info), 0,
-				SLAB_HWCACHE_ALIGN, init_once);
+				SLAB_HWCACHE_ALIGN|SLAB_ACCOUNT, init_once);
 	if (mqueue_inode_cachep == NULL)
 		return -ENOMEM;
 

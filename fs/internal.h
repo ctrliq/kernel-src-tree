@@ -44,9 +44,6 @@ static inline int __sync_blockdev(struct block_device *bdev, int wait)
 extern void guard_bio_eod(int rw, struct bio *bio);
 extern int __block_write_begin_int(struct page *page, loff_t pos, unsigned len,
 		get_block_t *get_block, struct iomap *iomap);
-extern int __generic_write_end(struct file *file, struct address_space *mapping,
-			       loff_t pos, unsigned len, unsigned copied,
-			       struct page *page, void *fsdata);
 
 /*
  * char_dev.c
@@ -146,6 +143,7 @@ extern int invalidate_inodes(struct super_block *, bool);
  */
 extern struct dentry *__d_alloc(struct super_block *, const struct qstr *);
 extern int d_set_mounted(struct dentry *dentry);
+extern struct dentry *d_alloc_cursor(struct dentry *);
 
 /*
  * read_write.c

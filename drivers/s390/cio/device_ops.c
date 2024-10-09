@@ -429,7 +429,7 @@ ccw_device_call_handler(struct ccw_device *cdev)
 	 *  - fast notification was requested (primary status)
 	 *  - unsolicited interrupts
 	 */
-	stctl = scsw_stctl(&cdev->private->irb.scsw);
+	stctl = scsw_stctl(&cdev->private->dma_area->irb.scsw);
 	ending_status = (stctl & SCSW_STCTL_SEC_STATUS) ||
 		(stctl == (SCSW_STCTL_ALERT_STATUS | SCSW_STCTL_STATUS_PEND)) ||
 		(stctl == SCSW_STCTL_STATUS_PEND);
@@ -448,12 +448,12 @@ ccw_device_call_handler(struct ccw_device *cdev)
 	 */
 	if (cdev->handler)
 		cdev->handler(cdev, cdev->private->intparm,
-			      &cdev->private->irb);
+			      &cdev->private->dma_area->irb);
 
 	/*
 	 * Clear the old and now useless interrupt response block.
 	 */
-	memset(&cdev->private->irb, 0, sizeof(struct irb));
+	memset(&cdev->private->dma_area->irb, 0, sizeof(struct irb));
 
 	return 1;
 }
@@ -479,8 +479,8 @@ struct ciw *ccw_device_get_ciw(struct ccw_device *cdev, __u32 ct)
 	if (cdev->private->flags.esid == 0)
 		return NULL;
 	for (ciw_cnt = 0; ciw_cnt < MAX_CIWS; ciw_cnt++)
-		if (cdev->private->senseid.ciw[ciw_cnt].ct == ct)
-			return cdev->private->senseid.ciw + ciw_cnt;
+		if (cdev->private->dma_area->senseid.ciw[ciw_cnt].ct == ct)
+			return cdev->private->dma_area->senseid.ciw + ciw_cnt;
 	return NULL;
 }
 
@@ -782,6 +782,23 @@ void ccw_device_get_schid(struct ccw_device *cdev, struct subchannel_id *schid)
 	*schid = sch->schid;
 }
 EXPORT_SYMBOL_GPL(ccw_device_get_schid);
+
+/*
+ * Allocate zeroed dma coherent 31 bit addressable memory using
+ * the subchannels dma pool. Maximal size of allocation supported
+ * is PAGE_SIZE.
+ */
+void *ccw_device_dma_zalloc(struct ccw_device *cdev, size_t size)
+{
+	return cio_gp_dma_zalloc(cdev->private->dma_pool, &cdev->dev, size);
+}
+EXPORT_SYMBOL(ccw_device_dma_zalloc);
+
+void ccw_device_dma_free(struct ccw_device *cdev, void *cpu_addr, size_t size)
+{
+	cio_gp_dma_free(cdev->private->dma_pool, cpu_addr, size);
+}
+EXPORT_SYMBOL(ccw_device_dma_free);
 
 MODULE_LICENSE("GPL");
 EXPORT_SYMBOL(ccw_device_set_options_mask);

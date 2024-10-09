@@ -70,7 +70,7 @@ netlink_kernel_create(struct net *net, int unit, struct netlink_kernel_cfg *cfg)
  */
 #define NL_SET_ERR_MSG(unused, msg) do {		\
 	static const char __msg[] = msg;		\
-	pr_debug("%s", __msg);				\
+	pr_debug("%s\n", __msg);			\
 } while(0)
 
 #define NL_SET_ERR_MSG_MOD(unused, msg)	NL_SET_ERR_MSG(unused, msg)

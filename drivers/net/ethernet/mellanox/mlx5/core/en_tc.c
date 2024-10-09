@@ -347,7 +347,7 @@ static void mlx5e_hairpin_fill_rqt_rqns(struct mlx5e_hairpin *hp, void *rqtc)
 
 	for (i = 0; i < sz; i++) {
 		ix = i;
-		if (priv->channels.params.rss_hfunc == ETH_RSS_HASH_XOR)
+		if (priv->rss_params.hfunc == ETH_RSS_HASH_XOR)
 			ix = mlx5e_bits_invert(i, ilog2(sz));
 		ix = indirection_rqt[ix];
 		rqn = hp->pair->rqn[ix];
@@ -399,7 +399,8 @@ static int mlx5e_hairpin_create_indirect_tirs(struct mlx5e_hairpin *hp)
 		MLX5_SET(tirc, tirc, transport_domain, hp->tdn);
 		MLX5_SET(tirc, tirc, disp_type, MLX5_TIRC_DISP_TYPE_INDIRECT);
 		MLX5_SET(tirc, tirc, indirect_table, hp->indir_rqt.rqtn);
-		mlx5e_build_indir_tir_ctx_hash(&priv->channels.params, &ttconfig, tirc, false);
+		mlx5e_build_indir_tir_ctx_hash(&priv->rss_params, &ttconfig, tirc, false);
+
 		err = mlx5_core_create_tir(hp->func_mdev, in,
 					   MLX5_ST_SZ_BYTES(create_tir_in), &hp->indir_tirn[tt]);
 		if (err) {
@@ -1419,6 +1420,26 @@ static int parse_tunnel_attr(struct mlx5e_priv *priv,
 	return 0;
 }
 
+static void *get_match_headers_criteria(u32 flags,
+					struct mlx5_flow_spec *spec)
+{
+	return (flags & MLX5_FLOW_CONTEXT_ACTION_DECAP) ?
+		MLX5_ADDR_OF(fte_match_param, spec->match_criteria,
+			     inner_headers) :
+		MLX5_ADDR_OF(fte_match_param, spec->match_criteria,
+			     outer_headers);
+}
+
+static void *get_match_headers_value(u32 flags,
+				     struct mlx5_flow_spec *spec)
+{
+	return (flags & MLX5_FLOW_CONTEXT_ACTION_DECAP) ?
+		MLX5_ADDR_OF(fte_match_param, spec->match_value,
+			     inner_headers) :
+		MLX5_ADDR_OF(fte_match_param, spec->match_value,
+			     outer_headers);
+}
+
 static int __parse_cls_flower(struct mlx5e_priv *priv,
 			      struct mlx5_flow_spec *spec,
 			      struct tc_cls_flower_offload *f,
@@ -1484,10 +1505,10 @@ static int __parse_cls_flower(struct mlx5e_priv *priv,
 		/* In decap flow, header pointers should point to the inner
 		 * headers, outer header were already set by parse_tunnel_attr
 		 */
-		headers_c = MLX5_ADDR_OF(fte_match_param, spec->match_criteria,
-					 inner_headers);
-		headers_v = MLX5_ADDR_OF(fte_match_param, spec->match_value,
-					 inner_headers);
+		headers_c = get_match_headers_criteria(MLX5_FLOW_CONTEXT_ACTION_DECAP,
+						       spec);
+		headers_v = get_match_headers_value(MLX5_FLOW_CONTEXT_ACTION_DECAP,
+						    spec);
 	}
 
 	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_BASIC)) {
@@ -1900,39 +1921,83 @@ struct mlx5_fields {
 	u8  field;
 	u8  size;
 	u32 offset;
+	u32 match_offset;
 };
 
-#define OFFLOAD(fw_field, size, field, off) \
-		{MLX5_ACTION_IN_FIELD_OUT_ ## fw_field, size, offsetof(struct pedit_headers, field) + (off)}
+#define OFFLOAD(fw_field, size, field, off, match_field) \
+		{MLX5_ACTION_IN_FIELD_OUT_ ## fw_field, size, \
+		 offsetof(struct pedit_headers, field) + (off), \
+		 MLX5_BYTE_OFF(fte_match_set_lyr_2_4, match_field)}
+
+/* masked values are the same and there are no rewrites that do not have a
+ * match.
+ */
+#define SAME_VAL_MASK(type, valp, maskp, matchvalp, matchmaskp) ({ \
+	type matchmaskx = *(type *)(matchmaskp); \
+	type matchvalx = *(type *)(matchvalp); \
+	type maskx = *(type *)(maskp); \
+	type valx = *(type *)(valp); \
+	\
+	(valx & maskx) == (matchvalx & matchmaskx) && !(maskx & (maskx ^ \
+								 matchmaskx)); \
+})
+
+static bool cmp_val_mask(void *valp, void *maskp, void *matchvalp,
+			 void *matchmaskp, int size)
+{
+	bool same = false;
+
+	switch (size) {
+	case sizeof(u8):
+		same = SAME_VAL_MASK(u8, valp, maskp, matchvalp, matchmaskp);
+		break;
+	case sizeof(u16):
+		same = SAME_VAL_MASK(u16, valp, maskp, matchvalp, matchmaskp);
+		break;
+	case sizeof(u32):
+		same = SAME_VAL_MASK(u32, valp, maskp, matchvalp, matchmaskp);
+		break;
+	}
+
+	return same;
+}
 
 static struct mlx5_fields fields[] = {
-	OFFLOAD(DMAC_47_16, 4, eth.h_dest[0], 0),
-	OFFLOAD(DMAC_15_0,  2, eth.h_dest[4], 0),
-	OFFLOAD(SMAC_47_16, 4, eth.h_source[0], 0),
-	OFFLOAD(SMAC_15_0,  2, eth.h_source[4], 0),
-	OFFLOAD(ETHERTYPE,  2, eth.h_proto, 0),
-	OFFLOAD(FIRST_VID,  2, vlan.h_vlan_TCI, 0),
+	OFFLOAD(DMAC_47_16, 4, eth.h_dest[0], 0, dmac_47_16),
+	OFFLOAD(DMAC_15_0,  2, eth.h_dest[4], 0, dmac_15_0),
+	OFFLOAD(SMAC_47_16, 4, eth.h_source[0], 0, smac_47_16),
+	OFFLOAD(SMAC_15_0,  2, eth.h_source[4], 0, smac_15_0),
+	OFFLOAD(ETHERTYPE,  2, eth.h_proto, 0, ethertype),
+	OFFLOAD(FIRST_VID,  2, vlan.h_vlan_TCI, 0, first_vid),
 
-	OFFLOAD(IP_TTL, 1, ip4.ttl,   0),
-	OFFLOAD(SIPV4,  4, ip4.saddr, 0),
-	OFFLOAD(DIPV4,  4, ip4.daddr, 0),
+	OFFLOAD(IP_TTL, 1, ip4.ttl,   0, ttl_hoplimit),
+	OFFLOAD(SIPV4,  4, ip4.saddr, 0, src_ipv4_src_ipv6.ipv4_layout.ipv4),
+	OFFLOAD(DIPV4,  4, ip4.daddr, 0, dst_ipv4_dst_ipv6.ipv4_layout.ipv4),
 
-	OFFLOAD(SIPV6_127_96, 4, ip6.saddr.s6_addr32[0], 0),
-	OFFLOAD(SIPV6_95_64,  4, ip6.saddr.s6_addr32[1], 0),
-	OFFLOAD(SIPV6_63_32,  4, ip6.saddr.s6_addr32[2], 0),
-	OFFLOAD(SIPV6_31_0,   4, ip6.saddr.s6_addr32[3], 0),
-	OFFLOAD(DIPV6_127_96, 4, ip6.daddr.s6_addr32[0], 0),
-	OFFLOAD(DIPV6_95_64,  4, ip6.daddr.s6_addr32[1], 0),
-	OFFLOAD(DIPV6_63_32,  4, ip6.daddr.s6_addr32[2], 0),
-	OFFLOAD(DIPV6_31_0,   4, ip6.daddr.s6_addr32[3], 0),
-	OFFLOAD(IPV6_HOPLIMIT, 1, ip6.hop_limit, 0),
+	OFFLOAD(SIPV6_127_96, 4, ip6.saddr.s6_addr32[0], 0,
+		src_ipv4_src_ipv6.ipv6_layout.ipv6[0]),
+	OFFLOAD(SIPV6_95_64,  4, ip6.saddr.s6_addr32[1], 0,
+		src_ipv4_src_ipv6.ipv6_layout.ipv6[4]),
+	OFFLOAD(SIPV6_63_32,  4, ip6.saddr.s6_addr32[2], 0,
+		src_ipv4_src_ipv6.ipv6_layout.ipv6[8]),
+	OFFLOAD(SIPV6_31_0,   4, ip6.saddr.s6_addr32[3], 0,
+		src_ipv4_src_ipv6.ipv6_layout.ipv6[12]),
+	OFFLOAD(DIPV6_127_96, 4, ip6.daddr.s6_addr32[0], 0,
+		dst_ipv4_dst_ipv6.ipv6_layout.ipv6[0]),
+	OFFLOAD(DIPV6_95_64,  4, ip6.daddr.s6_addr32[1], 0,
+		dst_ipv4_dst_ipv6.ipv6_layout.ipv6[4]),
+	OFFLOAD(DIPV6_63_32,  4, ip6.daddr.s6_addr32[2], 0,
+		dst_ipv4_dst_ipv6.ipv6_layout.ipv6[8]),
+	OFFLOAD(DIPV6_31_0,   4, ip6.daddr.s6_addr32[3], 0,
+		dst_ipv4_dst_ipv6.ipv6_layout.ipv6[12]),
+	OFFLOAD(IPV6_HOPLIMIT, 1, ip6.hop_limit, 0, ttl_hoplimit),
 
-	OFFLOAD(TCP_SPORT, 2, tcp.source,  0),
-	OFFLOAD(TCP_DPORT, 2, tcp.dest,    0),
-	OFFLOAD(TCP_FLAGS, 1, tcp.ack_seq, 5),
+	OFFLOAD(TCP_SPORT, 2, tcp.source,  0, tcp_sport),
+	OFFLOAD(TCP_DPORT, 2, tcp.dest,    0, tcp_dport),
+	OFFLOAD(TCP_FLAGS, 1, tcp.ack_seq, 5, tcp_flags),
 
-	OFFLOAD(UDP_SPORT, 2, udp.source, 0),
-	OFFLOAD(UDP_DPORT, 2, udp.dest,   0),
+	OFFLOAD(UDP_SPORT, 2, udp.source, 0, udp_sport),
+	OFFLOAD(UDP_DPORT, 2, udp.dest,   0, udp_dport),
 };
 
 /* On input attr->max_mod_hdr_actions tells how many HW actions can be parsed at
@@ -1942,9 +2007,14 @@ static struct mlx5_fields fields[] = {
 static int offload_pedit_fields(struct pedit_headers *masks,
 				struct pedit_headers *vals,
 				struct mlx5e_tc_flow_parse_attr *parse_attr,
+				u32 *action_flags,
 				struct netlink_ext_ack *extack)
 {
 	struct pedit_headers *set_masks, *add_masks, *set_vals, *add_vals;
+	void *headers_c = get_match_headers_criteria(*action_flags,
+						     &parse_attr->spec);
+	void *headers_v = get_match_headers_value(*action_flags,
+						  &parse_attr->spec);
 	int i, action_size, nactions, max_actions, first, last, next_z;
 	void *s_masks_p, *a_masks_p, *vals_p;
 	struct mlx5_fields *f;
@@ -1968,6 +2038,8 @@ static int offload_pedit_fields(struct pedit_headers *masks,
 	nactions = parse_attr->num_mod_hdr_actions;
 
 	for (i = 0; i < ARRAY_SIZE(fields); i++) {
+		bool skip;
+
 		f = &fields[i];
 		/* avoid seeing bits set from previous iterations */
 		s_mask = 0;
@@ -1996,19 +2068,34 @@ static int offload_pedit_fields(struct pedit_headers *masks,
 			return -EOPNOTSUPP;
 		}
 
+		skip = false;
 		if (s_mask) {
+			void *match_mask = headers_c + f->match_offset;
+			void *match_val = headers_v + f->match_offset;
+
 			cmd  = MLX5_ACTION_TYPE_SET;
 			mask = s_mask;
 			vals_p = (void *)set_vals + f->offset;
+			/* don't rewrite if we have a match on the same value */
+			if (cmp_val_mask(vals_p, s_masks_p, match_val,
+					 match_mask, f->size))
+				skip = true;
 			/* clear to denote we consumed this field */
 			memset(s_masks_p, 0, f->size);
 		} else {
+			u32 zero = 0;
+
 			cmd  = MLX5_ACTION_TYPE_ADD;
 			mask = a_mask;
 			vals_p = (void *)add_vals + f->offset;
+			/* add 0 is no change */
+			if (!memcmp(vals_p, &zero, f->size))
+				skip = true;
 			/* clear to denote we consumed this field */
 			memset(a_masks_p, 0, f->size);
 		}
+		if (skip)
+			continue;
 
 		field_bsize = f->size * BITS_PER_BYTE;
 
@@ -2085,6 +2172,7 @@ static const struct pedit_headers zero_masks = {};
 static int parse_tc_pedit_action(struct mlx5e_priv *priv,
 				 const struct tc_action *a, int namespace,
 				 struct mlx5e_tc_flow_parse_attr *parse_attr,
+				 u32 *action_flags,
 				 struct netlink_ext_ack *extack)
 {
 	struct pedit_headers masks[__PEDIT_CMD_MAX], vals[__PEDIT_CMD_MAX], *cmd_masks;
@@ -2128,7 +2216,7 @@ static int parse_tc_pedit_action(struct mlx5e_priv *priv,
 			goto out_err;
 	}
 
-	err = offload_pedit_fields(masks, vals, parse_attr, extack);
+	err = offload_pedit_fields(masks, vals, parse_attr, action_flags, extack);
 	if (err < 0)
 		goto out_dealloc_parsed_actions;
 
@@ -2182,6 +2270,55 @@ static bool csum_offload_supported(struct mlx5e_priv *priv,
 	return true;
 }
 
+struct ip_ttl_word {
+	__u8	ttl;
+	__u8	protocol;
+	__sum16	check;
+};
+
+struct ipv6_hoplimit_word {
+	__be16	payload_len;
+	__u8	nexthdr;
+	__u8	hop_limit;
+};
+
+static bool is_action_keys_supported(const struct tc_action *a, int nkeys)
+{
+	u32 mask, offset;
+	u8 htype;
+	int k;
+
+	for (k = 0; k < nkeys; k++) {
+		mask = ~tcf_pedit_mask(a, k);
+		offset = tcf_pedit_offset(a, k);
+		htype = tcf_pedit_htype(a, k);
+		/* For IPv4 & IPv6 header check 4 byte word,
+		 * to determine that modified fields
+		 * are NOT ttl & hop_limit only.
+		 */
+		if (htype == TCA_PEDIT_KEY_EX_HDR_TYPE_IP4) {
+			struct ip_ttl_word *ttl_word =
+				(struct ip_ttl_word *)&mask;
+
+			if (offset != offsetof(struct iphdr, ttl) ||
+			    ttl_word->protocol ||
+			    ttl_word->check) {
+				return true;
+			}
+		} else if (htype == TCA_PEDIT_KEY_EX_HDR_TYPE_IP6) {
+			struct ipv6_hoplimit_word *hoplimit_word =
+				(struct ipv6_hoplimit_word *)&mask;
+
+			if (offset != offsetof(struct ipv6hdr, payload_len) ||
+			    hoplimit_word->payload_len ||
+			    hoplimit_word->nexthdr) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 static bool modify_header_match_supported(struct mlx5_flow_spec *spec,
 					  struct tcf_exts *exts,
 					  u32 actions2,
@@ -2190,16 +2327,11 @@ static bool modify_header_match_supported(struct mlx5_flow_spec *spec,
 	const struct tc_action *a;
 	bool modify_ip_header;
 	LIST_HEAD(actions);
-	u8 htype, ip_proto;
 	void *headers_v;
 	u16 ethertype;
-	int nkeys, i;
+	u8 ip_proto;
 
-	if (actions2 & MLX5_FLOW_CONTEXT_ACTION_DECAP)
-		headers_v = MLX5_ADDR_OF(fte_match_param, spec->match_value, inner_headers);
-	else
-		headers_v = MLX5_ADDR_OF(fte_match_param, spec->match_value, outer_headers);
-
+	headers_v = get_match_headers_value(actions2, spec);
 	ethertype = MLX5_GET(fte_match_set_lyr_2_4, headers_v, ethertype);
 
 	/* for non-IP we only re-write MACs, so we're okay */
@@ -2212,15 +2344,7 @@ static bool modify_header_match_supported(struct mlx5_flow_spec *spec,
 		if (!is_tcf_pedit(a))
 			continue;
 
-		nkeys = tcf_pedit_nkeys(a);
-		for (i = 0; i < nkeys; i++) {
-			htype = tcf_pedit_htype(a, i);
-			if (htype == TCA_PEDIT_KEY_EX_HDR_TYPE_IP4 ||
-			    htype == TCA_PEDIT_KEY_EX_HDR_TYPE_IP6) {
-				modify_ip_header = true;
-				break;
-			}
-		}
+		modify_ip_header = is_action_keys_supported(a, tcf_pedit_nkeys(a));
 	}
 
 	ip_proto = MLX5_GET(fte_match_set_lyr_2_4, headers_v, ip_protocol);
@@ -2302,7 +2426,7 @@ static int parse_tc_nic_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
 
 		if (is_tcf_pedit(a)) {
 			err = parse_tc_pedit_action(priv, a, MLX5_FLOW_NAMESPACE_KERNEL,
-						    parse_attr, extack);
+						    parse_attr, &action, extack);
 			if (err)
 				return err;
 
@@ -2354,6 +2478,14 @@ static int parse_tc_nic_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
 		}
 
 		return -EINVAL;
+	}
+
+	/* in case all pedit actions are skipped, remove the MOD_HDR
+	 * flag.
+	 */
+	if (parse_attr->num_mod_hdr_actions == 0) {
+		action &= ~MLX5_FLOW_CONTEXT_ACTION_MOD_HDR;
+		kfree(parse_attr->mod_hdr_actions);
 	}
 
 	attr->action = action;
@@ -2483,6 +2615,8 @@ static int add_vlan_rewrite_action(struct mlx5e_priv *priv,
 				   struct mlx5e_tc_flow_parse_attr *parse_attr,
 				   u32 *action, struct netlink_ext_ack *extack)
 {
+	u8 match_prio_mask, match_prio_val;
+	void *headers_c, *headers_v;
 	int err;
 	struct tcf_pedit_key_ex pedit_key_ex = {
 		.htype = TCA_PEDIT_KEY_EX_HDR_TYPE_ETH,
@@ -2501,15 +2635,27 @@ static int add_vlan_rewrite_action(struct mlx5e_priv *priv,
 		.tcfp_keys_ex = &pedit_key_ex,
 	};
 
-	if (tcf_vlan_push_prio(a)) {
-		NL_SET_ERR_MSG_MOD(extack, "Setting VLAN prio is not supported");
+	headers_c = get_match_headers_criteria(*action, &parse_attr->spec);
+	headers_v = get_match_headers_value(*action, &parse_attr->spec);
+
+	if (!(MLX5_GET(fte_match_set_lyr_2_4, headers_c, cvlan_tag) &&
+	      MLX5_GET(fte_match_set_lyr_2_4, headers_v, cvlan_tag))) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "VLAN rewrite action must have VLAN protocol match");
+		return -EOPNOTSUPP;
+	}
+
+	match_prio_mask = MLX5_GET(fte_match_set_lyr_2_4, headers_c, first_prio);
+	match_prio_val = MLX5_GET(fte_match_set_lyr_2_4, headers_v, first_prio);
+	if (tcf_vlan_push_prio(a) != (match_prio_val & match_prio_mask)) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Changing VLAN prio is not supported");
 		return -EOPNOTSUPP;
 	}
 
 	err = parse_tc_pedit_action(priv, (const struct tc_action *)&pedit_act,
-				    MLX5_FLOW_NAMESPACE_FDB, parse_attr, NULL);
+				    MLX5_FLOW_NAMESPACE_FDB, parse_attr, action, NULL);
 	*action |= MLX5_FLOW_CONTEXT_ACTION_MOD_HDR;
-	attr->split_count = attr->out_count;
 	return err;
 }
 
@@ -2563,13 +2709,53 @@ static int parse_tc_vlan_action(struct mlx5e_priv *priv,
 			*action |= MLX5_FLOW_CONTEXT_ACTION_VLAN_PUSH;
 		}
 	} else { /* action is TCA_VLAN_ACT_MODIFY */
-		return add_vlan_rewrite_action(priv, a, attr, parse_attr,
-					       action, extack);
+		int err;
+
+		err = add_vlan_rewrite_action(priv, a, attr, parse_attr,
+					      action, extack);
+		if (err)
+			return err;
+
+		attr->split_count = attr->out_count;
+		return err;
 	}
 
 	attr->total_vlan = vlan_idx + 1;
 
 	return 0;
+}
+
+static int
+add_vlan_prio_tag_rewrite_action(struct mlx5e_priv *priv,
+				 struct mlx5e_tc_flow_parse_attr *parse_attr,
+				 struct mlx5_esw_flow_attr * attr,
+				 u32 *action, struct netlink_ext_ack *extack)
+{
+	struct tcf_vlan vlan = {
+		.tcfv_push_vid = 0,
+		.tcfv_push_prio =
+			MLX5_GET(fte_match_set_lyr_2_4,
+				 get_match_headers_value(*action,
+							 &parse_attr->spec),
+				 first_prio) &
+			MLX5_GET(fte_match_set_lyr_2_4,
+				 get_match_headers_criteria(*action,
+							    &parse_attr->spec),
+				 first_prio),
+	};
+
+	return add_vlan_rewrite_action(priv, (struct tc_action *)&vlan,
+				       attr, parse_attr, action, extack);
+}
+
+bool mlx5e_is_valid_eswitch_fwd_dev(struct mlx5e_priv *priv,
+				    struct net_device *out_dev)
+{
+	if (is_merged_eswitch_dev(priv, out_dev))
+		return true;
+
+	return mlx5e_eswitch_rep(out_dev) &&
+	       same_hw_devs(priv, netdev_priv(out_dev));
 }
 
 static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
@@ -2603,7 +2789,7 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
 
 		if (is_tcf_pedit(a)) {
 			err = parse_tc_pedit_action(priv, a, MLX5_FLOW_NAMESPACE_FDB,
-						    parse_attr, extack);
+						    parse_attr, &action, extack);
 			if (err)
 				return err;
 
@@ -2644,9 +2830,7 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
 
 			action |= MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
 				  MLX5_FLOW_CONTEXT_ACTION_COUNT;
-			if (switchdev_port_same_parent_id(priv->netdev,
-							  out_dev) ||
-			    is_merged_eswitch_dev(priv, out_dev)) {
+			if (switchdev_port_same_parent_id(priv->netdev, out_dev)) {
 				struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
 				struct net_device *uplink_dev = mlx5_eswitch_uplink_get_proto_dev(esw, REP_ETH);
 				struct net_device *uplink_upper = netdev_master_upper_dev_get(uplink_dev);
@@ -2656,8 +2840,13 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
 				    uplink_upper == out_dev)
 					out_dev = uplink_dev;
 
-				if (!mlx5e_eswitch_rep(out_dev))
+				if (!mlx5e_is_valid_eswitch_fwd_dev(priv, out_dev)) {
+					NL_SET_ERR_MSG_MOD(extack,
+							   "devices are not on same switch HW, can't offload forwarding");
+					pr_err("devices %s %s not on same switch HW, can't offload forwarding\n",
+					       priv->netdev->name, out_dev->name);
 					return -EOPNOTSUPP;
+				}
 
 				out_priv = netdev_priv(out_dev);
 				rpriv = out_priv->ppriv;
@@ -2737,6 +2926,30 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv, struct tcf_exts *exts,
 		}
 
 		return -EINVAL;
+	}
+
+	if (MLX5_CAP_GEN(esw->dev, prio_tag_required) &&
+	    action & MLX5_FLOW_CONTEXT_ACTION_VLAN_POP) {
+		/* For prio tag mode, replace vlan pop with rewrite vlan prio
+		 * tag rewrite.
+		 */
+		action &= ~MLX5_FLOW_CONTEXT_ACTION_VLAN_POP;
+		err = add_vlan_prio_tag_rewrite_action(priv, parse_attr, attr,
+						       &action, extack);
+		if (err)
+			return err;
+	}
+
+	/* in case all pedit actions are skipped, remove the MOD_HDR
+	 * flag. we might have set split_count either by pedit or
+	 * pop/push. if there is no pop/push either, reset it too.
+	 */
+	if (parse_attr->num_mod_hdr_actions == 0) {
+		action &= ~MLX5_FLOW_CONTEXT_ACTION_MOD_HDR;
+		kfree(parse_attr->mod_hdr_actions);
+		if (!((action & MLX5_FLOW_CONTEXT_ACTION_VLAN_POP) ||
+		      (action & MLX5_FLOW_CONTEXT_ACTION_VLAN_PUSH)))
+			attr->split_count = 0;
 	}
 
 	attr->action = action;

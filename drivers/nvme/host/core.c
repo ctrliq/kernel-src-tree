@@ -262,11 +262,29 @@ void nvme_cancel_request(struct request *req, void *data, bool reserved)
 	dev_dbg_ratelimited(((struct nvme_ctrl *) data)->device,
 				"Cancelling I/O %d", req->tag);
 
+	/*
+	 * RHEL7 only.
+	 *
+	 * Don't handle timed out request specially
+	 *
+	 * It is safe to clear the compelte flag since hardware
+	 * has been shutdown now.
+	 *
+	 * This way may let us keep aligned with upstream kernel
+	 * wrt. timeout handling.
+	 */
+	if (req->cmd_flags & REQ_TIMEOUT)
+		blk_mq_clear_rq_complete(req);
+
+	/* don't abort one completed request */
+	if (blk_mq_request_completed(req))
+		return;
+
 	status = NVME_SC_ABORT_REQ;
 	if (blk_queue_dying(req->q))
 		status |= NVME_SC_DNR;
 	nvme_req(req)->status = status;
-	blk_mq_complete_request_sync(req, 0);
+	blk_mq_complete_request(req, 0);
 
 }
 EXPORT_SYMBOL_GPL(nvme_cancel_request);
@@ -1564,6 +1582,9 @@ EXPORT_SYMBOL_GPL(nvme_shutdown_ctrl);
 static void nvme_set_queue_limits(struct nvme_ctrl *ctrl,
 		struct request_queue *q)
 {
+	if (ctrl->segment_boundary)
+		blk_queue_segment_boundary(q, ctrl->segment_boundary);
+
 	if (ctrl->max_hw_sectors) {
 		u32 max_segments =
 			(ctrl->max_hw_sectors / (ctrl->page_size >> 9)) + 1;
@@ -1979,7 +2000,8 @@ static int nvme_init_subsystem(struct nvme_ctrl *ctrl, struct nvme_id_ctrl *id)
 		 * Verify that the subsystem actually supports multiple
 		 * controllers, else bail out.
 		 */
-		if (nvme_active_ctrls(found) && !(id->cmic & (1 << 1))) {
+		if (!(ctrl->opts && ctrl->opts->discovery_nqn) &&
+		    nvme_active_ctrls(found) && !(id->cmic & (1 << 1))) {
 			dev_err(ctrl->device,
 				"ignoring ctrl due to duplicate subnqn (%s).\n",
 				found->subnqn);
@@ -2646,6 +2668,13 @@ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid)
 	disk->flags = GENHD_FL_EXT_DEVT;
 	sprintf(disk->disk_name, "nvme%dn%d", ctrl->instance, ns->instance);
 
+	/*
+	 * Initialize capacity to 0 until we establish the namespace format and
+	 * setup integrity extentions if necessary. The revalidate_disk after
+	 * add_disk allows the driver to register with integrity if the format
+	 * requires it.
+	 */
+	set_capacity(disk, 0);
 	if (nvme_revalidate_disk(ns->disk))
 		goto out_free_disk;
 
@@ -2656,6 +2685,17 @@ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid)
 	nvme_get_ctrl(ctrl);
 
 	add_disk_with_attributes(ns->disk, nvme_ns_id_attr_groups);
+	if (ns->ms) {
+		struct block_device *bd = bdget_disk(ns->disk, 0);
+		if (!bd)
+			return;
+		if (blkdev_get(bd, FMODE_READ, NULL)) {
+			bdput(bd);
+			return;
+		}
+		blkdev_reread_part(bd);
+		blkdev_put(bd, FMODE_READ);
+	}
 	return;
  out_free_disk:
 	kfree(disk);
@@ -2990,8 +3030,6 @@ void nvme_stop_ctrl(struct nvme_ctrl *ctrl)
 	nvme_stop_keep_alive(ctrl);
 	flush_work(&ctrl->async_event_work);
 	cancel_work_sync(&ctrl->fw_act_work);
-	if (ctrl->ops->stop_ctrl)
-		ctrl->ops->stop_ctrl(ctrl);
 }
 EXPORT_SYMBOL_GPL(nvme_stop_ctrl);
 

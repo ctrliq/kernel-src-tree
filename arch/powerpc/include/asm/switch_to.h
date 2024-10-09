@@ -47,6 +47,8 @@ static inline void discard_lazy_cpu_state(void)
 }
 #endif
 
+static inline void disable_kernel_vsx(void) { }
+
 #ifdef CONFIG_PPC_FPU
 extern void flush_fp_to_thread(struct task_struct *);
 #else

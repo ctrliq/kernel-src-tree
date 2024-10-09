@@ -1456,6 +1456,7 @@ static void esw_apply_vport_conf(struct mlx5_eswitch *esw,
 				 struct mlx5_vport *vport)
 {
 	int vport_num = vport->vport;
+	int flags;
 
 	if (!vport_num)
 		return;
@@ -1466,8 +1467,10 @@ static void esw_apply_vport_conf(struct mlx5_eswitch *esw,
 				      vport->info.link_state);
 	mlx5_modify_nic_vport_mac_address(esw->dev, vport_num, vport->info.mac);
 	mlx5_modify_nic_vport_node_guid(esw->dev, vport_num, vport->info.node_guid);
+	flags = (vport->info.vlan || vport->info.qos) ?
+		SET_VLAN_STRIP | SET_VLAN_INSERT : 0;
 	modify_esw_vport_cvlan(esw->dev, vport_num, vport->info.vlan, vport->info.qos,
-			       (vport->info.vlan || vport->info.qos));
+			       flags);
 
 	/* Only legacy mode needs ACLs */
 	if (esw->mode == SRIOV_LEGACY) {
@@ -1616,7 +1619,8 @@ int mlx5_eswitch_enable_sriov(struct mlx5_eswitch *esw, int nvfs, int mode)
 	} else {
 		mlx5_reload_interface(esw->dev, MLX5_INTERFACE_PROTOCOL_IB);
 
-		err = esw_offloads_init(esw, nvfs + 1);
+		err = esw_offloads_init(esw, nvfs,
+					nvfs + 1);
 	}
 
 	if (err)
@@ -1651,7 +1655,6 @@ void mlx5_eswitch_disable_sriov(struct mlx5_eswitch *esw)
 {
 	struct esw_mc_addr *mc_promisc;
 	int old_mode;
-	int nvports;
 	int i;
 
 	if (!ESW_ALLOWED(esw) || esw->mode == SRIOV_NONE)
@@ -1661,7 +1664,6 @@ void mlx5_eswitch_disable_sriov(struct mlx5_eswitch *esw)
 		 esw->enabled_vports, esw->mode);
 
 	mc_promisc = &esw->mc_promisc;
-	nvports = esw->enabled_vports;
 
 	for (i = 0; i < esw->total_vports; i++)
 		esw_disable_vport(esw, i);
@@ -1674,7 +1676,7 @@ void mlx5_eswitch_disable_sriov(struct mlx5_eswitch *esw)
 	if (esw->mode == SRIOV_LEGACY)
 		esw_destroy_legacy_fdb_table(esw);
 	else if (esw->mode == SRIOV_OFFLOADS)
-		esw_offloads_cleanup(esw, nvports);
+		esw_offloads_cleanup(esw);
 
 	old_mode = esw->mode;
 	esw->mode = SRIOV_NONE;
@@ -1742,11 +1744,6 @@ int mlx5_eswitch_init(struct mlx5_core_dev *dev)
 	esw->enabled_vports = 0;
 	esw->mode = SRIOV_NONE;
 	esw->offloads.inline_mode = MLX5_INLINE_MODE_NONE;
-	if (MLX5_CAP_ESW_FLOWTABLE_FDB(dev, reformat) &&
-	    MLX5_CAP_ESW_FLOWTABLE_FDB(dev, decap))
-		esw->offloads.encap = DEVLINK_ESWITCH_ENCAP_MODE_BASIC;
-	else
-		esw->offloads.encap = DEVLINK_ESWITCH_ENCAP_MODE_NONE;
 
 	dev->priv.eswitch = esw;
 	return 0;

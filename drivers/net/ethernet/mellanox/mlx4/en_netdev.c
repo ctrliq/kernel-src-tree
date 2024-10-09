@@ -3045,6 +3045,10 @@ void mlx4_en_set_stats_bitmap(struct mlx4_dev *dev,
 
 	if (!mlx4_is_slave(dev))
 		bitmap_set(stats_bitmap->bitmap, last_i, NUM_PKT_STATS);
+	last_i += NUM_PKT_STATS;
+
+	bitmap_set(stats_bitmap->bitmap, last_i, NUM_XDP_STATS);
+	last_i += NUM_XDP_STATS;
 
 	if (!mlx4_is_slave(dev))
 		bitmap_set(stats_bitmap->bitmap, last_i, NUM_PHY_STATS);

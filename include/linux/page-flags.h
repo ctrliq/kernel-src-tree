@@ -113,6 +113,8 @@ enum pageflags {
 	PG_young,
 	PG_idle,
 #endif
+	PG_kmemcg,
+
 	__NR_PAGEFLAGS,
 
 	/* Filesystems */
@@ -293,6 +295,9 @@ TESTSCFLAG(HWPoison, hwpoison)
 PAGEFLAG_FALSE(HWPoison)
 #define __PG_HWPOISON 0
 #endif
+
+PAGEFLAG(Kmemcg, kmemcg)
+#define __PG_KMEMCG (1UL << PG_kmemcg)
 
 /*
  * On an anonymous page mapped into a user virtual memory area,

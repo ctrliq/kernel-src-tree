@@ -72,6 +72,12 @@
 #define MMIO_PPR_LOG_OFFSET	0x0038
 #define MMIO_GA_LOG_BASE_OFFSET	0x00e0
 #define MMIO_GA_LOG_TAIL_OFFSET	0x00e8
+#define MMIO_MSI_ADDR_LO_OFFSET	0x015C
+#define MMIO_MSI_ADDR_HI_OFFSET	0x0160
+#define MMIO_MSI_DATA_OFFSET	0x0164
+#define MMIO_INTCAPXT_EVT_OFFSET	0x0170
+#define MMIO_INTCAPXT_PPR_OFFSET	0x0178
+#define MMIO_INTCAPXT_GALOG_OFFSET	0x0180
 #define MMIO_CMD_HEAD_OFFSET	0x2000
 #define MMIO_CMD_TAIL_OFFSET	0x2008
 #define MMIO_EVT_HEAD_OFFSET	0x2010
@@ -160,6 +166,7 @@
 #define CONTROL_GALOG_EN        0x1CULL
 #define CONTROL_GAINT_EN        0x1DULL
 #define CONTROL_XT_EN           0x32ULL
+#define CONTROL_INTCAPXT_EN     0x33ULL
 
 #define CTRL_INV_TO_MASK	(7 << CONTROL_INV_TIMEOUT)
 #define CTRL_INV_TO_NONE	0
@@ -343,7 +350,6 @@
 
 #define DTE_FLAG_MASK	(0x3ffULL << 32)
 #define DTE_FLAG_IOTLB	(1ULL << 32)
-#define DTE_FLAG_SA	(1ULL << 34)
 #define DTE_FLAG_GV	(1ULL << 55)
 #define DTE_GLX_SHIFT	(56)
 #define DTE_GLX_MASK	(3)
@@ -592,6 +598,8 @@ struct amd_iommu {
 	volatile u64 __aligned(8) cmd_sem;
 
 	struct amd_irte_ops *irte_ops;
+	/* IRQ notifier for IntCapXT interrupt */
+	struct irq_affinity_notify intcapxt_notify;
 };
 
 #define ACPIHID_UID_LEN 256

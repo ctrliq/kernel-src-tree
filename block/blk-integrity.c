@@ -191,8 +191,8 @@ bool blk_integrity_merge_rq(struct request_queue *q, struct request *req,
 	if (blk_integrity_rq(req) == 0 || blk_integrity_rq(next) == 0)
 		return false;
 
-	if (bio_integrity(req->bio)->bip_flags !=
-	    bio_integrity(next->bio)->bip_flags)
+	if ((req->bio->bi_flags & BIP_FLAGS_MASK) !=
+	    (next->bio->bi_flags & BIP_FLAGS_MASK))
 		return false;
 
 	if (req->nr_integrity_segments + next->nr_integrity_segments >
@@ -209,13 +209,14 @@ bool blk_integrity_merge_bio(struct request_queue *q, struct request *req,
 	int nr_integrity_segs;
 	struct bio *next = bio->bi_next;
 
-	if (blk_integrity_rq(req) == 0 && bio_integrity(bio) == NULL)
+	if (blk_integrity_rq(req) == 0 && bio_integrity(bio) == 0)
 		return true;
 
-	if (blk_integrity_rq(req) == 0 || bio_integrity(bio) == NULL)
+	if (blk_integrity_rq(req) == 0 || bio_integrity(bio) == 0)
 		return false;
 
-	if (bio_integrity(req->bio)->bip_flags != bio_integrity(bio)->bip_flags)
+	if ((req->bio->bi_flags & BIP_FLAGS_MASK) !=
+	    (bio->bi_flags & BIP_FLAGS_MASK))
 		return false;
 
 	bio->bi_next = NULL;

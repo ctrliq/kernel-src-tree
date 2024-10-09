@@ -450,13 +450,14 @@ struct hv_pcibus_device {
 	spinlock_t device_list_lock;	/* Protect lists below */
 	void __iomem *cfg_addr;
 
-	struct semaphore enum_sem;
 	struct list_head resources_for_children;
 
 	struct list_head children;
 	struct list_head dr_list;
 
 	spinlock_t retarget_msi_interrupt_lock;
+
+	struct workqueue_struct *wq;
 
 	/* hypercall arg, must not cross page boundary */
 	struct retarget_msi_interrupt retarget_msi_interrupt_params;
@@ -488,17 +489,6 @@ enum hv_pcichild_state {
 	hv_pcichild_resourced,
 	hv_pcichild_ejecting,
 	hv_pcichild_maximum
-};
-
-enum hv_pcidev_ref_reason {
-	hv_pcidev_ref_invalid = 0,
-	hv_pcidev_ref_initial,
-	hv_pcidev_ref_by_slot,
-	hv_pcidev_ref_packet,
-	hv_pcidev_ref_pnp,
-	hv_pcidev_ref_childlist,
-	hv_pcidev_irqdata,
-	hv_pcidev_ref_max
 };
 
 struct hv_pci_dev {
@@ -553,10 +543,17 @@ static void hv_pci_generic_compl(void *context, struct pci_response *resp,
 
 static struct hv_pci_dev *get_pcichild_wslot(struct hv_pcibus_device *hbus,
 						u32 wslot);
-static void get_pcichild(struct hv_pci_dev *hv_pcidev,
-			 enum hv_pcidev_ref_reason reason);
-static void put_pcichild(struct hv_pci_dev *hv_pcidev,
-			 enum hv_pcidev_ref_reason reason);
+
+static void get_pcichild(struct hv_pci_dev *hpdev)
+{
+	refcount_inc(&hpdev->refs);
+}
+
+static void put_pcichild(struct hv_pci_dev *hpdev)
+{
+	if (refcount_dec_and_test(&hpdev->refs))
+		kfree(hpdev);
+}
 
 static void get_hvpcibus(struct hv_pcibus_device *hv_pcibus);
 static void put_hvpcibus(struct hv_pcibus_device *hv_pcibus);
@@ -787,7 +784,7 @@ static int hv_pcifront_read_config(struct pci_bus *bus, unsigned int devfn,
 
 	_hv_pcifront_read_config(hpdev, where, size, val);
 
-	put_pcichild(hpdev, hv_pcidev_ref_by_slot);
+	put_pcichild(hpdev);
 	return PCIBIOS_SUCCESSFUL;
 }
 
@@ -815,7 +812,7 @@ static int hv_pcifront_write_config(struct pci_bus *bus, unsigned int devfn,
 
 	_hv_pcifront_write_config(hpdev, where, size, val);
 
-	put_pcichild(hpdev, hv_pcidev_ref_by_slot);
+	put_pcichild(hpdev);
 	return PCIBIOS_SUCCESSFUL;
 }
 
@@ -1158,13 +1155,13 @@ static void hv_compose_msi_msg(struct pci_dev *pdev, unsigned int irq,
 	msg->address_lo = comp.int_desc.address & 0xffffffff;
 	msg->data = comp.int_desc.data;
 
-	put_pcichild(hpdev, hv_pcidev_ref_by_slot);
+	put_pcichild(hpdev);
 	return;
 
 free_int_desc:
 	kfree(int_desc);
 drop_reference:
-	put_pcichild(hpdev, hv_pcidev_ref_by_slot);
+	put_pcichild(hpdev);
 return_null_message:
 	msg->address_hi = 0;
 	msg->address_lo = 0;
@@ -1202,7 +1199,7 @@ void hv_teardown_msi_irqs(struct pci_dev *pdev)
 				 0);
 	}
 
-	put_pcichild(hpdev, hv_pcidev_ref_by_slot);
+	put_pcichild(hpdev);
 
 msi_teardown:
 	hv_msi.teardown_msi_irqs(pdev);
@@ -1505,19 +1502,6 @@ static void q_resource_requirements(void *context, struct pci_response *resp,
 	complete(&completion->host_event);
 }
 
-static void get_pcichild(struct hv_pci_dev *hpdev,
-			    enum hv_pcidev_ref_reason reason)
-{
-	refcount_inc(&hpdev->refs);
-}
-
-static void put_pcichild(struct hv_pci_dev *hpdev,
-			    enum hv_pcidev_ref_reason reason)
-{
-	if (refcount_dec_and_test(&hpdev->refs))
-		kfree(hpdev);
-}
-
 /**
  * new_pcichild_device() - Create a new child device
  * @hbus:	The internal struct tracking this root PCI bus.
@@ -1570,7 +1554,7 @@ static struct hv_pci_dev *new_pcichild_device(struct hv_pcibus_device *hbus,
 
 	hpdev->desc = *desc;
 	refcount_set(&hpdev->refs, 1);
-	get_pcichild(hpdev, hv_pcidev_ref_childlist);
+	get_pcichild(hpdev);
 	spin_lock_irqsave(&hbus->device_list_lock, flags);
 
 	list_add_tail(&hpdev->list_entry, &hbus->children);
@@ -1605,7 +1589,7 @@ static struct hv_pci_dev *get_pcichild_wslot(struct hv_pcibus_device *hbus,
 	list_for_each_entry(iter, &hbus->children, list_entry) {
 		if (iter->desc.win_slot.slot == wslot) {
 			hpdev = iter;
-			get_pcichild(hpdev, hv_pcidev_ref_by_slot);
+			get_pcichild(hpdev);
 			break;
 		}
 	}
@@ -1634,12 +1618,8 @@ static struct hv_pci_dev *get_pcichild_wslot(struct hv_pcibus_device *hbus,
  * It must also treat the omission of a previously observed device as
  * notification that the device no longer exists.
  *
- * Note that this function is a work item, and it may not be
- * invoked in the order that it was queued.  Back to back
- * updates of the list of present devices may involve queuing
- * multiple work items, and this one may run before ones that
- * were sent later. As such, this function only does something
- * if is the last one in the queue.
+ * Note that this function is serialized with hv_eject_device_work(),
+ * because both are pushed to the ordered workqueue hbus->wq.
  */
 static void pci_devices_present_work(struct work_struct *work)
 {
@@ -1660,11 +1640,6 @@ static void pci_devices_present_work(struct work_struct *work)
 
 	INIT_LIST_HEAD(&removed);
 
-	if (down_interruptible(&hbus->enum_sem)) {
-		put_hvpcibus(hbus);
-		return;
-	}
-
 	/* Pull this off the queue and process it if it was the last one. */
 	spin_lock_irqsave(&hbus->device_list_lock, flags);
 	while (!list_empty(&hbus->dr_list)) {
@@ -1681,7 +1656,6 @@ static void pci_devices_present_work(struct work_struct *work)
 	spin_unlock_irqrestore(&hbus->device_list_lock, flags);
 
 	if (!dr) {
-		up(&hbus->enum_sem);
 		put_hvpcibus(hbus);
 		return;
 	}
@@ -1732,7 +1706,7 @@ static void pci_devices_present_work(struct work_struct *work)
 					     list_entry);
 			if (hpdev->reported_missing) {
 				found = true;
-				put_pcichild(hpdev, hv_pcidev_ref_childlist);
+				put_pcichild(hpdev);
 				list_move_tail(&hpdev->list_entry, &removed);
 				break;
 			}
@@ -1745,7 +1719,11 @@ static void pci_devices_present_work(struct work_struct *work)
 		hpdev = list_first_entry(&removed, struct hv_pci_dev,
 					 list_entry);
 		list_del(&hpdev->list_entry);
-		put_pcichild(hpdev, hv_pcidev_ref_initial);
+
+		if (hpdev->pci_slot)
+			pci_destroy_slot(hpdev->pci_slot);
+
+		put_pcichild(hpdev);
 	}
 
 	switch (hbus->state) {
@@ -1769,7 +1747,6 @@ static void pci_devices_present_work(struct work_struct *work)
 		break;
 	}
 
-	up(&hbus->enum_sem);
 	put_hvpcibus(hbus);
 	kfree(dr);
 }
@@ -1815,7 +1792,7 @@ static void hv_pci_devices_present(struct hv_pcibus_device *hbus,
 	spin_unlock_irqrestore(&hbus->device_list_lock, flags);
 
 	get_hvpcibus(hbus);
-	schedule_work(&dr_wrk->wrk);
+	queue_work(hbus->wq, &dr_wrk->wrk);
 }
 
 /**
@@ -1830,6 +1807,7 @@ static void hv_pci_devices_present(struct hv_pcibus_device *hbus,
 static void hv_eject_device_work(struct work_struct *work)
 {
 	struct pci_eject_response *ejct_pkt;
+	struct hv_pcibus_device *hbus;
 	struct hv_pci_dev *hpdev;
 	struct pci_dev *pdev;
 	unsigned long flags;
@@ -1840,6 +1818,7 @@ static void hv_eject_device_work(struct work_struct *work)
 	} ctxt;
 
 	hpdev = container_of(work, struct hv_pci_dev, wrk);
+	hbus = hpdev->hbus;
 
 	WARN_ON(hpdev->state != hv_pcichild_ejecting);
 
@@ -1850,8 +1829,7 @@ static void hv_eject_device_work(struct work_struct *work)
 	 * because hbus->pci_bus may not exist yet.
 	 */
 	wslot = wslot_to_devfn(hpdev->desc.win_slot.slot);
-	pdev = pci_get_domain_bus_and_slot(hpdev->hbus->sysdata.domain, 0,
-					   wslot);
+	pdev = pci_get_domain_bus_and_slot(hbus->sysdata.domain, 0, wslot);
 	if (pdev) {
 		pci_lock_rescan_remove();
 		pci_stop_and_remove_bus_device(pdev);
@@ -1859,9 +1837,9 @@ static void hv_eject_device_work(struct work_struct *work)
 		pci_unlock_rescan_remove();
 	}
 
-	spin_lock_irqsave(&hpdev->hbus->device_list_lock, flags);
+	spin_lock_irqsave(&hbus->device_list_lock, flags);
 	list_del(&hpdev->list_entry);
-	spin_unlock_irqrestore(&hpdev->hbus->device_list_lock, flags);
+	spin_unlock_irqrestore(&hbus->device_list_lock, flags);
 
 	if (hpdev->pci_slot)
 		pci_destroy_slot(hpdev->pci_slot);
@@ -1870,13 +1848,18 @@ static void hv_eject_device_work(struct work_struct *work)
 	ejct_pkt = (struct pci_eject_response *)&ctxt.pkt.message;
 	ejct_pkt->message_type.type = PCI_EJECTION_COMPLETE;
 	ejct_pkt->wslot.slot = hpdev->desc.win_slot.slot;
-	vmbus_sendpacket(hpdev->hbus->hdev->channel, ejct_pkt,
+	vmbus_sendpacket(hbus->hdev->channel, ejct_pkt,
 			 sizeof(*ejct_pkt), (unsigned long)&ctxt.pkt,
 			 VM_PKT_DATA_INBAND, 0);
 
-	put_pcichild(hpdev, hv_pcidev_ref_childlist);
-	put_pcichild(hpdev, hv_pcidev_ref_pnp);
-	put_hvpcibus(hpdev->hbus);
+	/* For the get_pcichild() in hv_pci_eject_device() */
+	put_pcichild(hpdev);
+	/* For the two refs got in new_pcichild_device() */
+	put_pcichild(hpdev);
+	put_pcichild(hpdev);
+	/* hpdev has been freed. Do not use it any more. */
+
+	put_hvpcibus(hbus);
 }
 
 /**
@@ -1890,10 +1873,10 @@ static void hv_eject_device_work(struct work_struct *work)
 static void hv_pci_eject_device(struct hv_pci_dev *hpdev)
 {
 	hpdev->state = hv_pcichild_ejecting;
-	get_pcichild(hpdev, hv_pcidev_ref_pnp);
+	get_pcichild(hpdev);
 	INIT_WORK(&hpdev->wrk, hv_eject_device_work);
 	get_hvpcibus(hpdev->hbus);
-	schedule_work(&hpdev->wrk);
+	queue_work(hpdev->hbus->wq, &hpdev->wrk);
 }
 
 /**
@@ -1990,8 +1973,7 @@ static void hv_pci_onchannelcallback(void *context)
 						      dev_message->wslot.slot);
 				if (hpdev) {
 					hv_pci_eject_device(hpdev);
-					put_pcichild(hpdev,
-							hv_pcidev_ref_by_slot);
+					put_pcichild(hpdev);
 				}
 				break;
 
@@ -2390,7 +2372,7 @@ static int hv_send_resources_allocated(struct hv_device *hdev)
 				PCI_RESOURCES_ASSIGNED2;
 			res_assigned2->wslot.slot = hpdev->desc.win_slot.slot;
 		}
-		put_pcichild(hpdev, hv_pcidev_ref_by_slot);
+		put_pcichild(hpdev);
 
 		ret = vmbus_sendpacket(hdev->channel, &pkt->message,
 				size_res, (unsigned long)pkt,
@@ -2438,7 +2420,7 @@ static int hv_send_resources_released(struct hv_device *hdev)
 		pkt.message_type.type = PCI_RESOURCES_RELEASED;
 		pkt.wslot.slot = hpdev->desc.win_slot.slot;
 
-		put_pcichild(hpdev, hv_pcidev_ref_by_slot);
+		put_pcichild(hpdev);
 
 		ret = vmbus_sendpacket(hdev->channel, &pkt, sizeof(pkt), 0,
 				       VM_PKT_DATA_INBAND, 0);
@@ -2460,6 +2442,48 @@ static void put_hvpcibus(struct hv_pcibus_device *hbus)
 		complete(&hbus->remove_event);
 }
 
+#define HVPCI_DOM_MAP_SIZE (64 * 1024)
+static DECLARE_BITMAP(hvpci_dom_map, HVPCI_DOM_MAP_SIZE);
+
+/*
+ * PCI domain number 0 is used by emulated devices on Gen1 VMs, so define 0
+ * as invalid for passthrough PCI devices of this driver.
+ */
+#define HVPCI_DOM_INVALID 0
+
+/**
+ * hv_get_dom_num() - Get a valid PCI domain number
+ * Check if the PCI domain number is in use, and return another number if
+ * it is in use.
+ *
+ * @dom: Requested domain number
+ *
+ * return: domain number on success, HVPCI_DOM_INVALID on failure
+ */
+static u16 hv_get_dom_num(u16 dom)
+{
+	unsigned int i;
+
+	if (test_and_set_bit(dom, hvpci_dom_map) == 0)
+		return dom;
+
+	for_each_clear_bit(i, hvpci_dom_map, HVPCI_DOM_MAP_SIZE) {
+		if (test_and_set_bit(i, hvpci_dom_map) == 0)
+			return i;
+	}
+
+	return HVPCI_DOM_INVALID;
+}
+
+/**
+ * hv_put_dom_num() - Mark the PCI domain number as free
+ * @dom: Domain number to be freed
+ */
+static void hv_put_dom_num(u16 dom)
+{
+	clear_bit(dom, hvpci_dom_map);
+}
+
 /**
  * hv_pci_probe() - New VMBus channel probe, for a root PCI bus
  * @hdev:	VMBus's tracking struct for this root PCI bus
@@ -2471,6 +2495,7 @@ static int hv_pci_probe(struct hv_device *hdev,
 			const struct hv_vmbus_device_id *dev_id)
 {
 	struct hv_pcibus_device *hbus;
+	u16 dom_req, dom;
 	int ret;
 
 	/*
@@ -2485,19 +2510,34 @@ static int hv_pci_probe(struct hv_device *hdev,
 	hbus->state = hv_pcibus_init;
 
 	/*
-	 * The PCI bus "domain" is what is called "segment" in ACPI and
-	 * other specs.  Pull it from the instance ID, to get something
-	 * unique.  Bytes 8 and 9 are what is used in Windows guests, so
-	 * do the same thing for consistency.  Note that, since this code
-	 * only runs in a Hyper-V VM, Hyper-V can (and does) guarantee
-	 * that (1) the only domain in use for something that looks like
-	 * a physical PCI bus (which is actually emulated by the
-	 * hypervisor) is domain 0 and (2) there will be no overlap
-	 * between domains derived from these instance IDs in the same
-	 * VM.
+	 * The PCI bus "domain" is what is called "segment" in ACPI and other
+	 * specs. Pull it from the instance ID, to get something usually
+	 * unique. In rare cases of collision, we will find out another number
+	 * not in use.
+	 *
+	 * Note that, since this code only runs in a Hyper-V VM, Hyper-V
+	 * together with this guest driver can guarantee that (1) The only
+	 * domain used by Gen1 VMs for something that looks like a physical
+	 * PCI bus (which is actually emulated by the hypervisor) is domain 0.
+	 * (2) There will be no overlap between domains (after fixing possible
+	 * collisions) in the same VM.
 	 */
-	hbus->sysdata.domain = hdev->dev_instance.b[9] |
-			       hdev->dev_instance.b[8] << 8;
+	dom_req = hdev->dev_instance.b[5] << 8 | hdev->dev_instance.b[4];
+	dom = hv_get_dom_num(dom_req);
+
+	if (dom == HVPCI_DOM_INVALID) {
+		dev_err(&hdev->device,
+			"Unable to use dom# 0x%hx or other numbers", dom_req);
+		ret = -EINVAL;
+		goto free_bus;
+	}
+
+	if (dom != dom_req)
+		dev_info(&hdev->device,
+			 "PCI dom# 0x%hx has collision, using 0x%hx",
+			 dom_req, dom);
+
+	hbus->sysdata.domain = dom;
 
 	hbus->hdev = hdev;
 	atomic_inc(&hbus->remove_lock);
@@ -2507,13 +2547,18 @@ static int hv_pci_probe(struct hv_device *hdev,
 	spin_lock_init(&hbus->config_lock);
 	spin_lock_init(&hbus->device_list_lock);
 	spin_lock_init(&hbus->retarget_msi_interrupt_lock);
-	sema_init(&hbus->enum_sem, 1);
 	init_completion(&hbus->remove_event);
+	hbus->wq = alloc_ordered_workqueue("hv_pci_%x", 0,
+					   hbus->sysdata.domain);
+	if (!hbus->wq) {
+		ret = -ENOMEM;
+		goto free_dom;
+	}
 
 	ret = vmbus_open(hdev->channel, pci_ring_size, pci_ring_size, NULL, 0,
 			 hv_pci_onchannelcallback, hbus);
 	if (ret)
-		goto free_bus;
+		goto destroy_wq;
 
 	hv_set_drvdata(hdev, hbus);
 
@@ -2568,6 +2613,10 @@ release:
 	hv_free_config_window(hbus);
 close:
 	vmbus_close(hdev->channel);
+destroy_wq:
+	destroy_workqueue(hbus->wq);
+free_dom:
+	hv_put_dom_num(hbus->sysdata.domain);
 free_bus:
 	free_page((unsigned long)hbus);
 	return ret;
@@ -2646,6 +2695,10 @@ static int hv_pci_remove(struct hv_device *hdev)
 	hv_pci_free_bridge_windows(hbus);
 	put_hvpcibus(hbus);
 	wait_for_completion(&hbus->remove_event);
+	destroy_workqueue(hbus->wq);
+
+	hv_put_dom_num(hbus->sysdata.domain);
+
 	free_page((unsigned long)hbus);
 	return 0;
 }
@@ -2712,6 +2765,9 @@ static int __init init_hv_pci_drv(void)
 	 */
 
 	hyperv_install_interrupt_translation(&hv_msi);
+
+	/* Set the invalid domain number's bit, so it will not be used */
+	set_bit(HVPCI_DOM_INVALID, hvpci_dom_map);
 
 	/* Register this driver with VMBus. */
 	return vmbus_driver_register(&hv_pci_drv);

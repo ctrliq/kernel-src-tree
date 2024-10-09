@@ -41,6 +41,7 @@ static int
 qla2x00_dfs_tgt_sess_open(struct inode *inode, struct file *file)
 {
 	scsi_qla_host_t *vha = inode->i_private;
+
 	return single_open(file, qla2x00_dfs_tgt_sess_show, vha);
 }
 
@@ -161,6 +162,7 @@ static int
 qla_dfs_fw_resource_cnt_open(struct inode *inode, struct file *file)
 {
 	struct scsi_qla_host *vha = inode->i_private;
+
 	return single_open(file, qla_dfs_fw_resource_cnt_show, vha);
 }
 
@@ -250,6 +252,7 @@ static int
 qla_dfs_tgt_counters_open(struct inode *inode, struct file *file)
 {
 	struct scsi_qla_host *vha = inode->i_private;
+
 	return single_open(file, qla_dfs_tgt_counters_show, vha);
 }
 
@@ -363,7 +366,7 @@ qla2x00_dfs_setup(scsi_qla_host_t *vha)
 	struct qla_hw_data *ha = vha->hw;
 
 	if (!IS_QLA25XX(ha) && !IS_QLA81XX(ha) && !IS_QLA83XX(ha) &&
-	    !IS_QLA27XX(ha))
+	    !IS_QLA27XX(ha) && !IS_QLA28XX(ha))
 		goto out;
 	if (!ha->fce)
 		goto out;
@@ -373,11 +376,6 @@ qla2x00_dfs_setup(scsi_qla_host_t *vha)
 
 	atomic_set(&qla2x00_dfs_root_count, 0);
 	qla2x00_dfs_root = debugfs_create_dir(QLA2XXX_DRIVER_NAME, NULL);
-	if (!qla2x00_dfs_root) {
-		ql_log(ql_log_warn, vha, 0x00f7,
-		    "Unable to create debugfs root directory.\n");
-		goto out;
-	}
 
 create_dir:
 	if (ha->dfs_dir)
@@ -385,54 +383,24 @@ create_dir:
 
 	mutex_init(&ha->fce_mutex);
 	ha->dfs_dir = debugfs_create_dir(vha->host_str, qla2x00_dfs_root);
-	if (!ha->dfs_dir) {
-		ql_log(ql_log_warn, vha, 0x00f8,
-		    "Unable to create debugfs ha directory.\n");
-		goto out;
-	}
 
 	atomic_inc(&qla2x00_dfs_root_count);
 
 create_nodes:
 	ha->dfs_fw_resource_cnt = debugfs_create_file("fw_resource_count",
 	    S_IRUSR, ha->dfs_dir, vha, &dfs_fw_resource_cnt_ops);
-	if (!ha->dfs_fw_resource_cnt) {
-		ql_log(ql_log_warn, vha, 0x00fd,
-		    "Unable to create debugFS fw_resource_count node.\n");
-		goto out;
-	}
 
 	ha->dfs_tgt_counters = debugfs_create_file("tgt_counters", S_IRUSR,
 	    ha->dfs_dir, vha, &dfs_tgt_counters_ops);
-	if (!ha->dfs_tgt_counters) {
-		ql_log(ql_log_warn, vha, 0xd301,
-		    "Unable to create debugFS tgt_counters node.\n");
-		goto out;
-	}
 
 	ha->tgt.dfs_tgt_port_database = debugfs_create_file("tgt_port_database",
 	    S_IRUSR,  ha->dfs_dir, vha, &dfs_tgt_port_database_ops);
-	if (!ha->tgt.dfs_tgt_port_database) {
-		ql_log(ql_log_warn, vha, 0xd03f,
-		    "Unable to create debugFS tgt_port_database node.\n");
-		goto out;
-	}
 
 	ha->dfs_fce = debugfs_create_file("fce", S_IRUSR, ha->dfs_dir, vha,
 	    &dfs_fce_ops);
-	if (!ha->dfs_fce) {
-		ql_log(ql_log_warn, vha, 0x00f9,
-		    "Unable to create debugfs fce node.\n");
-		goto out;
-	}
 
 	ha->tgt.dfs_tgt_sess = debugfs_create_file("tgt_sess",
 		S_IRUSR, ha->dfs_dir, vha, &dfs_tgt_sess_ops);
-	if (!ha->tgt.dfs_tgt_sess) {
-		ql_log(ql_log_warn, vha, 0xd040,
-		    "Unable to create debugFS tgt_sess node.\n");
-		goto out;
-	}
 
 out:
 	return 0;

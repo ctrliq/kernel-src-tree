@@ -61,6 +61,7 @@
 unsigned int num_processors;
 
 unsigned disabled_cpus;
+unsigned rh_invalid_cpus;
 
 /* Processor that is doing the boot up */
 unsigned int boot_cpu_physical_apicid = -1U;

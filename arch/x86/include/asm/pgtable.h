@@ -1139,10 +1139,6 @@ static inline void pudp_set_wrprotect(struct mm_struct *mm,
 }
 #endif
 
-#define __HAVE_ARCH_PMDP_INVALIDATE
-extern void pmdp_invalidate(struct vm_area_struct *vma, unsigned long address,
-			    pmd_t *pmdp);
-
 /*
  * clone_pgd_range(pgd_t *dst, pgd_t *src, int count);
  *

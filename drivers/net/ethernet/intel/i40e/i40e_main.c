@@ -27,7 +27,7 @@ static const char i40e_driver_string[] =
 
 #define DRV_VERSION_MAJOR 2
 #define DRV_VERSION_MINOR 8
-#define DRV_VERSION_BUILD 10
+#define DRV_VERSION_BUILD 20
 #define DRV_VERSION __stringify(DRV_VERSION_MAJOR) "." \
 	     __stringify(DRV_VERSION_MINOR) "." \
 	     __stringify(DRV_VERSION_BUILD)    DRV_KERN
@@ -12270,9 +12270,6 @@ static int __maybe_unused i40e_xdp(struct net_device *dev,
 	case XDP_QUERY_PROG:
 		xdp->prog_id = vsi->xdp_prog ? vsi->xdp_prog->aux->id : 0;
 		return 0;
-	case XDP_QUERY_XSK_UMEM:
-		return i40e_xsk_umem_query(vsi, &xdp->xsk.umem,
-					   xdp->xsk.queue_id);
 	case XDP_SETUP_XSK_UMEM:
 		return i40e_xsk_umem_setup(vsi, xdp->xsk.umem,
 					   xdp->xsk.queue_id);

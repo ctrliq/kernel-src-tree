@@ -38,12 +38,55 @@
 #include <asm/sections.h>
 #include <asm/ctl_reg.h>
 #include <asm/sclp.h>
+#include <linux/dma-mapping.h>
+#include <asm/dma-mapping.h>
+#include <linux/swiotlb.h>
+#include <asm/uv.h>
 
 pgd_t swapper_pg_dir[PTRS_PER_PGD] __section(.bss..swapper_pg_dir);
 
 unsigned long empty_zero_page, zero_page_mask;
 EXPORT_SYMBOL(empty_zero_page);
 EXPORT_SYMBOL(zero_page_mask);
+
+static void *s390_dma_noop_alloc(struct device *dev, size_t size,
+			    dma_addr_t *dma_handle, gfp_t gfp,
+			    struct dma_attrs *attrs);
+
+struct dma_map_ops s390_dma_noop_ops = {
+	.alloc			= s390_dma_noop_alloc,
+	.free			= dma_noop_free,
+	.map_page		= dma_noop_map_page,
+	.map_sg			= dma_noop_map_sg,
+	.mapping_error		= dma_noop_mapping_error,
+	.dma_supported		= dma_noop_supported,
+};
+
+
+struct dma_map_ops *s390_dma_ops =  &s390_dma_noop_ops;
+EXPORT_SYMBOL(s390_dma_ops);
+
+static void *s390_dma_noop_alloc(struct device *dev, size_t size,
+			    dma_addr_t *dma_handle, gfp_t gfp,
+			    struct dma_attrs *attrs)
+{
+	void *ret;
+
+	/* dma_noop_ops.alloc() disregards dev->.*dma_mask which is a problem
+	 * for us. Here comes the workaraund.
+	 */
+	if (dev->coherent_dma_mask != DMA_BIT_MASK(64)
+			&& dev->coherent_dma_mask <= DMA_BIT_MASK(31))
+		gfp |= GFP_DMA;
+
+	ret = dma_noop_alloc(dev, size, dma_handle, gfp, attrs);
+	if (((unsigned long) ret) + size -1 < dev->coherent_dma_mask)
+		return ret;
+	/* Failed. Clean up the mess. */
+	dma_noop_free(dev, size, ret, *dma_handle, attrs);
+	*dma_handle = DMA_ERROR_CODE;
+	return NULL;
+}
 
 static void __init setup_zero_pages(void)
 {
@@ -139,12 +182,120 @@ void __init paging_init(void)
 	free_area_init_nodes(max_zone_pfns);
 }
 
+#ifdef CONFIG_SWIOTLB
+
+int set_memory_encrypted(unsigned long addr, int numpages)
+{
+	int i;
+
+	/* make specified pages unshared, (swiotlb, dma_free) */
+	for (i = 0; i < numpages; ++i) {
+		uv_remove_shared(addr);
+		addr += PAGE_SIZE;
+	}
+	return 0;
+}
+
+int set_memory_decrypted(unsigned long addr, int numpages)
+{
+	int i;
+	/* make specified pages shared (swiotlb, dma_alloca) */
+	for (i = 0; i < numpages; ++i) {
+		uv_set_shared(addr);
+		addr += PAGE_SIZE;
+	}
+	return 0;
+}
+
+/* are we a protected virtualization guest? */
+bool sev_active(void)
+{
+	return is_prot_virt_guest();
+}
+
+static void *s390_pv_alloc_coherent(struct device *dev, size_t size,
+					 dma_addr_t *dma_handle, gfp_t gfp,
+					 struct dma_attrs *attrs)
+{
+	void *ret;
+
+	if (dev->coherent_dma_mask != DMA_BIT_MASK(64))
+		gfp |= GFP_DMA;
+	ret = swiotlb_alloc_coherent(dev, size, dma_handle, gfp);
+
+	/* share */
+	if (ret)
+		set_memory_decrypted((unsigned long)ret, 1 << get_order(size));
+
+	return ret;
+}
+
+static void s390_pv_free_coherent(struct device *dev, size_t size,
+				       void *vaddr, dma_addr_t dma_addr,
+				       struct dma_attrs *attrs)
+{
+	if (!vaddr)
+		return;
+
+	/* unshare */
+	set_memory_encrypted((unsigned long)vaddr, 1 << get_order(size));
+
+	swiotlb_free_coherent(dev, size, vaddr, dma_addr);
+}
+
+static struct dma_map_ops s390_pv_dma_ops = {
+	.alloc = s390_pv_alloc_coherent,
+	.free = s390_pv_free_coherent,
+	.map_page = swiotlb_map_page,
+	.unmap_page = swiotlb_unmap_page,
+	.map_sg = swiotlb_map_sg_attrs,
+	.unmap_sg = swiotlb_unmap_sg_attrs,
+	.sync_single_for_cpu = swiotlb_sync_single_for_cpu,
+	.sync_single_for_device = swiotlb_sync_single_for_device,
+	.sync_sg_for_cpu = swiotlb_sync_sg_for_cpu,
+	.sync_sg_for_device = swiotlb_sync_sg_for_device,
+	.dma_supported = swiotlb_dma_supported,
+	.mapping_error = swiotlb_dma_mapping_error,
+	.max_mapping_size = swiotlb_max_mapping_size,
+};
+
+void swiotlb_set_mem_attributes(void *vaddr, unsigned long size)
+{
+	WARN(PAGE_ALIGN(size) != size,
+	     "size is not page-aligned (%#lx)\n", size);
+
+	/* Make the SWIOTLB buffer area decrypted */
+	set_memory_decrypted((unsigned long)vaddr, size >> PAGE_SHIFT);
+}
+
+/* protected virtualization */
+static void pv_init(void)
+{
+	if (!is_prot_virt_guest())
+		return;
+
+	/* make sure bounce buffers are shared */
+	swiotlb_init(1);
+	swiotlb_update_mem_attributes();
+	swiotlb_force = 1;
+	/* use swiotlb_dma_ops */
+	s390_dma_ops = &s390_pv_dma_ops;
+}
+
+#else
+
+static void pv_init(void) {}
+
+#endif /* CONFIG_SWIOTLB */
+
 void __init mem_init(void)
 {
 	unsigned long codesize, reservedpages, datasize, initsize;
 
         max_mapnr = num_physpages = max_low_pfn;
         high_memory = (void *) __va(max_low_pfn * PAGE_SIZE);
+
+	pv_init();
 
 	/* Setup guest page hinting */
 	cmma_init();

@@ -214,37 +214,6 @@ mutex_trylock_recursive(struct mutex *lock)
 }
 
 
-/*
- * On x86 PAT systems we have memory tracking that keeps track of
- * the allowed mappings on memory ranges. This tracking works for
- * all the in-kernel mapping APIs (ioremap*), but where the user
- * wishes to map a range from a physical device into user memory
- * the tracking won't be updated. This API is to be used by
- * drivers which remap physical device pages into userspace,
- * and wants to make sure they are mapped WC and not UC.
- *
- * BACKPORT NOTES:  If:
- *
- *   87744ab3832b mm: fix cache mode tracking in vm_insert_mixed()
- *
- * gets backported, then we want to backport:
- *
- *   8ef4227615e1 x86/io: add interface to reserve io memtype for a resource range. (v1.1)
- *
- * and drop these next two stubs
- */
-static inline int arch_io_reserve_memtype_wc(resource_size_t base,
-					     resource_size_t size)
-{
-	return 0;
-}
-
-static inline void arch_io_free_memtype_wc(resource_size_t base,
-					   resource_size_t size)
-{
-}
-
-
 static inline int __must_check down_write_killable(struct rw_semaphore *sem)
 {
 	down_write(sem);

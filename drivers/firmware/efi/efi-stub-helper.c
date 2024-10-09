@@ -162,11 +162,11 @@ fail:
 }
 
 /*
- * Allocate at the lowest possible address.
+ * Allocate at the lowest possible address that is not below 'min'.
  */
-static efi_status_t efi_low_alloc(efi_system_table_t *sys_table_arg,
-			      unsigned long size, unsigned long align,
-			      unsigned long *addr)
+static efi_status_t efi_low_alloc_above(efi_system_table_t *sys_table_arg,
+					unsigned long size, unsigned long align,
+					unsigned long *addr, unsigned long min)
 {
 	unsigned long map_size, desc_size;
 	efi_memory_desc_t *map;
@@ -196,13 +196,8 @@ static efi_status_t efi_low_alloc(efi_system_table_t *sys_table_arg,
 		start = desc->phys_addr;
 		end = start + desc->num_pages * (1UL << EFI_PAGE_SHIFT);
 
-		/*
-		 * Don't allocate at 0x0. It will confuse code that
-		 * checks pointers against NULL. Skip the first 8
-		 * bytes so we start at a nice even number.
-		 */
-		if (start == 0x0)
-			start += 8;
+		if (start < min)
+			start = min;
 
 		start = round_up(start, align);
 		if ((start + size) > end)
@@ -223,6 +218,19 @@ static efi_status_t efi_low_alloc(efi_system_table_t *sys_table_arg,
 	efi_call_early(free_pool, map);
 fail:
 	return status;
+}
+
+static inline
+efi_status_t efi_low_alloc(efi_system_table_t *sys_table_arg,
+			   unsigned long size, unsigned long align,
+			   unsigned long *addr)
+{
+	/*
+	 * Don't allocate at 0x0. It will confuse code that
+	 * checks pointers against NULL. Skip the first 8
+	 * bytes so we start at a nice even number.
+	 */
+	return efi_low_alloc_above(sys_table_arg, size, align, addr, 0x8);
 }
 
 static void efi_free(efi_system_table_t *sys_table_arg, unsigned long size,
@@ -423,7 +431,8 @@ fail:
 	return status;
 }
 
-static efi_status_t relocate_kernel(struct setup_header *hdr)
+static efi_status_t relocate_kernel(struct setup_header *hdr,
+				    unsigned long min_addr)
 {
 	unsigned long start, nr_pages;
 	efi_status_t status;
@@ -442,8 +451,9 @@ static efi_status_t relocate_kernel(struct setup_header *hdr)
 				EFI_ALLOCATE_ADDRESS, EFI_LOADER_DATA,
 				nr_pages, &start);
 	if (status != EFI_SUCCESS) {
-		status = efi_low_alloc(sys_table, hdr->init_size,
-				   hdr->kernel_alignment, &start);
+		status = efi_low_alloc_above(sys_table, hdr->init_size,
+					     hdr->kernel_alignment,
+					     &start, min_addr);
 		if (status != EFI_SUCCESS)
 			pr_efi_err(sys_table, "Failed to alloc mem for kernel\n");
 	}

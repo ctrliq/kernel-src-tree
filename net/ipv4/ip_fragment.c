@@ -559,6 +559,11 @@ err:
 	return err;
 }
 
+static bool ip_frag_coalesce_ok(const struct ipq *qp)
+{
+	return qp->user == IP_DEFRAG_LOCAL_DELIVER;
+}
+
 /* Build a new IP datagram from all its fragments. */
 static int ip_frag_reasm(struct ipq *qp, struct sk_buff *skb,
 			 struct sk_buff *prev_tail, struct net_device *dev)
@@ -568,6 +573,7 @@ static int ip_frag_reasm(struct ipq *qp, struct sk_buff *skb,
 	struct sk_buff *fp, *head = skb_rb_first(&qp->q.rb_fragments);
 	struct sk_buff **nextp; /* To build frag_list. */
 	struct rb_node *rbn;
+	int sum_truesize;
 	int len;
 	int ihlen;
 	int err;
@@ -645,24 +651,40 @@ static int ip_frag_reasm(struct ipq *qp, struct sk_buff *skb,
 	fp = FRAG_CB(head)->next_frag;
 	rbn = rb_next(&head->rbnode);
 	rb_erase(&head->rbnode, &qp->q.rb_fragments);
+
+	sum_truesize = head->truesize;
 	while (rbn || fp) {
 		/* fp points to the next sk_buff in the current run;
 		 * rbn points to the next run.
 		 */
 		/* Go through the current run. */
 		while (fp) {
-			*nextp = fp;
-			nextp = &fp->next;
-			fp->prev = NULL;
-			memset(&fp->rbnode, 0, sizeof(fp->rbnode));
-			head->data_len += fp->len;
-			head->len += fp->len;
+			struct sk_buff *next_frag = FRAG_CB(fp)->next_frag;
+			bool stolen;
+			int delta;
+
+			sum_truesize += fp->truesize;
 			if (head->ip_summed != fp->ip_summed)
 				head->ip_summed = CHECKSUM_NONE;
 			else if (head->ip_summed == CHECKSUM_COMPLETE)
 				head->csum = csum_add(head->csum, fp->csum);
-			head->truesize += fp->truesize;
-			fp = FRAG_CB(fp)->next_frag;
+
+			if (ip_frag_coalesce_ok(qp) &&
+			    skb_try_coalesce(head, fp, &stolen, &delta)) {
+				kfree_skb_partial(fp, stolen);
+			} else {
+				fp->prev = NULL;
+				memset(&fp->rbnode, 0, sizeof(fp->rbnode));
+
+				head->data_len += fp->len;
+				head->len += fp->len;
+				head->truesize += fp->truesize;
+
+				*nextp = fp;
+				nextp = &fp->next;
+			}
+
+			fp = next_frag;
 		}
 		/* Move to the next run. */
 		if (rbn) {
@@ -673,7 +695,7 @@ static int ip_frag_reasm(struct ipq *qp, struct sk_buff *skb,
 			rbn = rbnext;
 		}
 	}
-	sub_frag_mem_limit(&qp->q, head->truesize);
+	sub_frag_mem_limit(&qp->q, sum_truesize);
 
 	*nextp = NULL;
 	head->next = NULL;

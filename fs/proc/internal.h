@@ -77,6 +77,7 @@ struct proc_inode {
 	struct proc_dir_entry *pde;
 	struct ctl_table_header *sysctl;
 	struct ctl_table *sysctl_entry;
+	struct hlist_node sysctl_inodes;
 	struct proc_ns ns;
 	struct inode vfs_inode;
 };
@@ -270,10 +271,12 @@ extern int proc_setup_self(struct super_block *);
  */
 #ifdef CONFIG_PROC_SYSCTL
 extern int proc_sys_init(void);
-extern void sysctl_head_put(struct ctl_table_header *);
+extern void proc_sys_evict_inode(struct inode *inode,
+				 struct ctl_table_header *head);
 #else
 static inline void proc_sys_init(void) { }
-static inline void sysctl_head_put(struct ctl_table_header *head) { }
+static inline void proc_sys_evict_inode(struct  inode *inode,
+					struct ctl_table_header *head) { }
 #endif
 
 /*

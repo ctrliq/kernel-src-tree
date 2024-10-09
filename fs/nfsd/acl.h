@@ -53,7 +53,8 @@ __be32 nfs4_acl_write_who(struct xdr_stream *xdr, int who);
 #define NFS4_ACL_DIR		0x02
 #define NFS4_ACL_OWNER		0x04
 
-struct nfs4_acl *nfs4_acl_posix_to_nfsv4(struct posix_acl *,
+struct nfs4_acl *nfs4_acl_posix_to_nfsv4(struct dentry *dentry,
+				struct posix_acl *,
 				struct posix_acl *, unsigned int flags);
 int nfs4_acl_nfsv4_to_posix(struct nfs4_acl *, struct posix_acl **,
 				struct posix_acl **, unsigned int flags);

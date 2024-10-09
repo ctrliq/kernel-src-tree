@@ -989,6 +989,9 @@ static int rfc4106_set_authsize(struct crypto_aead *parent,
 static int generic_gcmaes_set_authsize(struct crypto_aead *tfm,
 				       unsigned int authsize)
 {
+	struct generic_gcmaes_ctx *ctx = generic_gcmaes_ctx_get(tfm);
+	struct crypto_aead *cryptd_child = cryptd_aead_child(ctx->cryptd_tfm);
+
 	switch (authsize) {
 	case 4:
 	case 8:
@@ -1001,6 +1004,9 @@ static int generic_gcmaes_set_authsize(struct crypto_aead *tfm,
 	default:
 		return -EINVAL;
 	}
+
+	crypto_aead_crt(tfm)->authsize = authsize;
+	crypto_aead_crt(cryptd_child)->authsize = authsize;
 
 	return 0;
 }
@@ -1417,10 +1423,20 @@ static int generic_gcmaes_set_key(struct crypto_aead *aead, const u8 *key,
 				  unsigned int key_len)
 {
 	struct generic_gcmaes_ctx *ctx = generic_gcmaes_ctx_get(aead);
+	struct crypto_aead *cryptd_child = cryptd_aead_child(ctx->cryptd_tfm);
+	struct generic_gcmaes_ctx *child_ctx = generic_gcmaes_ctx_get(cryptd_child);
+	int err;
 
-	return aes_set_key_common(crypto_aead_tfm(aead),
-				  &ctx->aes_key_expanded, key, key_len) ?:
-	       rfc4106_set_hash_subkey(ctx->hash_subkey, key, key_len);
+	err = aes_set_key_common(crypto_aead_tfm(aead),
+				&ctx->aes_key_expanded, key, key_len);
+	if (err)
+		return err;
+
+	err = rfc4106_set_hash_subkey(ctx->hash_subkey, key, key_len);
+
+	memcpy(child_ctx, ctx, sizeof(*ctx));
+
+	return err;
 }
 
 static int __generic_gcmaes_encrypt(struct aead_request *req)

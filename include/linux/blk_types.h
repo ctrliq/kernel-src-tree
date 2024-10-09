@@ -138,11 +138,19 @@ struct bio {
 #define BIO_SNAP_STABLE	12	/* bio data must be snapshotted during write */
 
 /*
+ * Cover all integrity related flags, such there is only
+ * BIO_FS_INTEGRITY & BIO_MAPPED_INTEGRITY
+ */
+#define BIP_FLAGS_MASK  ((1 << BIO_FS_INTEGRITY) | (1 << BIO_MAPPED_INTEGRITY))
+
+/*
  * Flags starting here get preserved by bio_reset() - this includes
  * BIO_POOL_IDX()
  */
-#define BIO_RESET_BITS	13
 #define BIO_OWNS_VEC	13	/* bio_free() should free bvec */
+#define BIO_TRACE_COMPLETION 14	/* bio_endio() should trace the final completion
+				 * of this bio. */
+#define BIO_RESET_BITS	14
 
 #define bio_flagged(bio, flag)	((bio)->bi_flags & (1 << (flag)))
 
@@ -203,6 +211,9 @@ enum rq_flag_bits {
 	__REQ_KERNEL, 		/* direct IO to kernel pages */
 	__REQ_PM,		/* runtime pm request */
 	__REQ_END,		/* OBSOLETE */
+#ifndef __GENKSYMS__
+	__REQ_TIMEOUT = __REQ_END, /* request is timed out, transisent state */
+#endif
 	__REQ_HASHED,		/* on IO scheduler merge hash */
 	__REQ_MQ_INFLIGHT,	/* track inflight for MQ */
 #ifdef __GENKSYMS__
@@ -265,6 +276,9 @@ enum rq_flag_bits {
 #define REQ_MQ_INFLIGHT		(1ULL << __REQ_MQ_INFLIGHT)
 /* IO stats tracking on */
 #define REQ_STATS		(1ULL << __REQ_STATS)
+
+/* set when this request is timed out */
+#define REQ_TIMEOUT		(1ULL << __REQ_TIMEOUT)
 
 enum req_op {
 	REQ_OP_READ,

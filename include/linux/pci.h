@@ -376,6 +376,9 @@ struct pci_dev {
 	RH_KABI_FILL_HOLE(unsigned int non_compliant_bars:1) /* broken BARs; ignore them */
 	RH_KABI_FILL_HOLE(unsigned int is_thunderbolt:1) /* Thunderbolt controller */
 	RH_KABI_FILL_HOLE(unsigned int shpc_managed:1) /* SHPC owned by shpchp */
+	RH_KABI_FILL_HOLE(unsigned int    io_window:1)      /* Bridge has I/O window */
+	RH_KABI_FILL_HOLE(unsigned int    pref_window:1)    /* Bridge has pref mem window */
+	RH_KABI_FILL_HOLE(unsigned int    pref_64_window:1) /* Pref mem window is 64-bit */
 	pci_dev_flags_t dev_flags;
 	atomic_t	enable_cnt;	/* pci_enable_device has been called */
 

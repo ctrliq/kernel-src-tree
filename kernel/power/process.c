@@ -115,7 +115,7 @@ static bool check_frozen_processes(void)
 	struct task_struct *g, *p;
 	bool ret = true;
 
-	read_lock(&tasklist_lock);
+	qread_lock(&tasklist_lock);
 	for_each_process_thread(g, p) {
 		if (p != current && !freezer_should_skip(p) &&
 		    !frozen(p)) {
@@ -124,7 +124,7 @@ static bool check_frozen_processes(void)
 		}
 	}
 done:
-	read_unlock(&tasklist_lock);
+	qread_unlock(&tasklist_lock);
 
 	return ret;
 }

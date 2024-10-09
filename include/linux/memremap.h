@@ -46,6 +46,7 @@ struct vmem_altmap {
 enum memory_type {
 	MEMORY_HMM = 1,
 	MEMORY_DEVICE_FS_DAX,
+	MEMORY_DEVICE_DEV_DAX,
 };
 
 /*

@@ -91,20 +91,26 @@ xfs_inode_buf_verify(
 	bool		readahead)
 {
 	struct xfs_mount *mp = bp->b_target->bt_mount;
+	xfs_agnumber_t	agno;
 	int		i;
 	int		ni;
 
 	/*
 	 * Validate the magic number and version of every inode in the buffer
 	 */
+	agno = xfs_daddr_to_agno(mp, XFS_BUF_ADDR(bp));
 	ni = XFS_BB_TO_FSB(mp, bp->b_length) * mp->m_sb.sb_inopblock;
 	for (i = 0; i < ni; i++) {
 		int		di_ok;
 		xfs_dinode_t	*dip;
+		xfs_agino_t	unlinked_ino;
 
 		dip = xfs_buf_offset(bp, (i << mp->m_sb.sb_inodelog));
+		unlinked_ino = be32_to_cpu(dip->di_next_unlinked);
 		di_ok = dip->di_magic == cpu_to_be16(XFS_DINODE_MAGIC) &&
-			xfs_dinode_good_version(mp, dip->di_version);
+			xfs_dinode_good_version(mp, dip->di_version) &&
+			(unlinked_ino == NULLAGINO ||
+			 xfs_verify_agino(mp, agno, unlinked_ino));
 		if (unlikely(XFS_TEST_ERROR(!di_ok, mp,
 						XFS_ERRTAG_ITOBP_INOTOBP))) {
 			if (readahead) {
@@ -113,17 +119,18 @@ xfs_inode_buf_verify(
 				return;
 			}
 
-			xfs_buf_ioerror(bp, -EFSCORRUPTED);
-			xfs_verifier_error(bp);
 #ifdef DEBUG
 			xfs_alert(mp,
 				"bad inode magic/vsn daddr %lld #%d (magic=%x)",
 				(unsigned long long)bp->b_bn, i,
 				be16_to_cpu(dip->di_magic));
 #endif
+			xfs_buf_verifier_error(bp, -EFSCORRUPTED,
+					__func__, dip, sizeof(*dip),
+					NULL);
+			return;
 		}
 	}
-	xfs_inobp_check(mp, bp);
 }
 
 
@@ -374,45 +381,100 @@ xfs_log_dinode_to_disk(
 	}
 }
 
-bool
+static xfs_failaddr_t
+xfs_dinode_verify_fork(
+	struct xfs_dinode	*dip,
+	struct xfs_mount	*mp,
+	int			whichfork)
+{
+	uint32_t		di_nextents = XFS_DFORK_NEXTENTS(dip, whichfork);
+
+	switch (XFS_DFORK_FORMAT(dip, whichfork)) {
+	case XFS_DINODE_FMT_LOCAL:
+		/*
+		 * no local regular files yet
+		 */
+		if (whichfork == XFS_DATA_FORK) {
+			if (S_ISREG(be16_to_cpu(dip->di_mode)))
+				return __this_address;
+			if (be64_to_cpu(dip->di_size) >
+					XFS_DFORK_SIZE(dip, mp, whichfork))
+				return __this_address;
+		}
+		if (di_nextents)
+			return __this_address;
+		break;
+	case XFS_DINODE_FMT_EXTENTS:
+		if (di_nextents > XFS_DFORK_MAXEXT(dip, mp, whichfork))
+			return __this_address;
+		break;
+	case XFS_DINODE_FMT_BTREE:
+		if (whichfork == XFS_ATTR_FORK) {
+			if (di_nextents > MAXAEXTNUM)
+				return __this_address;
+		} else if (di_nextents > MAXEXTNUM) {
+			return __this_address;
+		}
+		break;
+	default:
+		return __this_address;
+	}
+	return NULL;
+}
+
+xfs_failaddr_t
 xfs_dinode_verify(
 	struct xfs_mount	*mp,
 	xfs_ino_t		ino,
 	struct xfs_dinode	*dip)
 {
+	xfs_failaddr_t		fa;
 	uint16_t		mode;
 	uint16_t		flags;
 	uint64_t		di_size;
 
 	if (dip->di_magic != cpu_to_be16(XFS_DINODE_MAGIC))
-		return false;
+		return __this_address;
+
+	/* Verify v3 integrity information first */
+	if (dip->di_version >= 3) {
+		if (!xfs_sb_version_hascrc(&mp->m_sb))
+			return __this_address;
+		if (!xfs_verify_cksum((char *)dip, mp->m_sb.sb_inodesize,
+				      XFS_DINODE_CRC_OFF))
+			return __this_address;
+		if (be64_to_cpu(dip->di_ino) != ino)
+			return __this_address;
+		if (!uuid_equal(&dip->di_uuid, &mp->m_sb.sb_meta_uuid))
+			return __this_address;
+	}
 
 	/* don't allow invalid i_size */
 	di_size = be64_to_cpu(dip->di_size);
 	if (di_size & (1ULL << 63))
-		return false;
+		return __this_address;
 
 	mode = be16_to_cpu(dip->di_mode);
 	if (mode && xfs_mode_to_ftype(mode) == XFS_DIR3_FT_UNKNOWN)
-		return false;
+		return __this_address;
 
 	/* No zero-length symlinks/dirs. */
 	if ((S_ISLNK(mode) || S_ISDIR(mode)) && di_size == 0)
-		return false;
+		return __this_address;
 
 	/* Fork checks carried over from xfs_iformat_fork */
 	if (mode &&
 	    be32_to_cpu(dip->di_nextents) + be16_to_cpu(dip->di_anextents) >
 			be64_to_cpu(dip->di_nblocks))
-		return false;
+		return __this_address;
 
 	if (mode && XFS_DFORK_BOFF(dip) > mp->m_sb.sb_inodesize)
-		return false;
+		return __this_address;
 
 	flags = be16_to_cpu(dip->di_flags);
 
 	if (mode && (flags & XFS_DIFLAG_REALTIME) && !mp->m_rtdev_targp)
-		return false;
+		return __this_address;
 
 	/* Do we have appropriate data fork formats for the mode? */
 	switch (mode & S_IFMT) {
@@ -421,49 +483,26 @@ xfs_dinode_verify(
 	case S_IFBLK:
 	case S_IFSOCK:
 		if (dip->di_format != XFS_DINODE_FMT_DEV)
-			return false;
+			return __this_address;
 		break;
 	case S_IFREG:
 	case S_IFLNK:
 	case S_IFDIR:
-		switch (dip->di_format) {
-		case XFS_DINODE_FMT_LOCAL:
-			/*
-			 * no local regular files yet
-			 */
-			if (S_ISREG(mode))
-				return false;
-			if (di_size > XFS_DFORK_DSIZE(dip, mp))
-				return false;
-			if (dip->di_nextents)
-				return false;
-			/* fall through */
-		case XFS_DINODE_FMT_EXTENTS:
-		case XFS_DINODE_FMT_BTREE:
-			break;
-		default:
-			return false;
-		}
+		fa = xfs_dinode_verify_fork(dip, mp, XFS_DATA_FORK);
+		if (fa)
+			return fa;
 		break;
 	case 0:
 		/* Uninitialized inode ok. */
 		break;
 	default:
-		return false;
+		return __this_address;
 	}
 
 	if (XFS_DFORK_Q(dip)) {
-		switch (dip->di_aformat) {
-		case XFS_DINODE_FMT_LOCAL:
-			if (dip->di_anextents)
-				return false;
-		/* fall through */
-		case XFS_DINODE_FMT_EXTENTS:
-		case XFS_DINODE_FMT_BTREE:
-			break;
-		default:
-			return false;
-		}
+		fa = xfs_dinode_verify_fork(dip, mp, XFS_ATTR_FORK);
+		if (fa)
+			return fa;
 	} else {
 		/*
 		 * If there is no fork offset, this may be a freshly-made inode
@@ -476,25 +515,13 @@ xfs_dinode_verify(
 		case XFS_DINODE_FMT_EXTENTS:
 			break;
 		default:
-			return false;
+			return __this_address;
 		}
 		if (dip->di_anextents)
-			return false;
+			return __this_address;
 	}
-	/* only version 3 or greater inodes are extensively verified here */
-	if (dip->di_version < 3)
-		return true;
 
-	if (!xfs_sb_version_hascrc(&mp->m_sb))
-		return false;
-	if (!xfs_verify_cksum((char *)dip, mp->m_sb.sb_inodesize,
-			      XFS_DINODE_CRC_OFF))
-		return false;
-	if (be64_to_cpu(dip->di_ino) != ino)
-		return false;
-	if (!uuid_equal(&dip->di_uuid, &mp->m_sb.sb_meta_uuid))
-		return false;
-	return true;
+	return NULL;
 }
 
 void
@@ -534,6 +561,7 @@ xfs_iread(
 {
 	xfs_buf_t	*bp;
 	xfs_dinode_t	*dip;
+	xfs_failaddr_t	fa;
 	int		error;
 
 	/*
@@ -562,11 +590,10 @@ xfs_iread(
 		return error;
 
 	/* even unallocated inodes are verified */
-	if (!xfs_dinode_verify(mp, ip->i_ino, dip)) {
-		xfs_alert(mp, "%s: validation failed for inode %lld",
-				__func__, ip->i_ino);
-
-		XFS_CORRUPTION_ERROR(__func__, XFS_ERRLEVEL_LOW, mp, dip);
+	fa = xfs_dinode_verify(mp, ip->i_ino, dip);
+	if (fa) {
+		xfs_inode_verifier_error(ip, -EFSCORRUPTED, "dinode", dip,
+				sizeof(*dip), fa);
 		error = -EFSCORRUPTED;
 		goto out_brelse;
 	}

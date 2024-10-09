@@ -756,7 +756,7 @@ int sk_attach_filter(struct sock_fprog *fprog, struct sock *sk)
 	}
 
 	old_fp = rcu_dereference_protected(sk->sk_filter,
-					   sock_owned_by_user(sk));
+					   lockdep_sock_is_held(sk));
 	rcu_assign_pointer(sk->sk_filter, fp);
 
 	if (old_fp)
@@ -774,7 +774,7 @@ int sk_detach_filter(struct sock *sk)
 		return -EPERM;
 
 	filter = rcu_dereference_protected(sk->sk_filter,
-					   sock_owned_by_user(sk));
+					   lockdep_sock_is_held(sk));
 	if (filter) {
 		RCU_INIT_POINTER(sk->sk_filter, NULL);
 		sk_filter_uncharge(sk, filter);
@@ -869,7 +869,7 @@ int sk_get_filter(struct sock *sk, struct sock_filter __user *ubuf, unsigned int
 
 	lock_sock(sk);
 	filter = rcu_dereference_protected(sk->sk_filter,
-			sock_owned_by_user(sk));
+					   lockdep_sock_is_held(sk));
 	ret = 0;
 	if (!filter)
 		goto out;

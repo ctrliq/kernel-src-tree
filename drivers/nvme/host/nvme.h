@@ -132,6 +132,7 @@ struct nvme_ctrl {
 	const struct nvme_ctrl_ops *ops;
 	struct request_queue *admin_q;
 	struct request_queue *connect_q;
+	struct request_queue *fabrics_q;
 	struct device *dev;
 	int instance;
 	struct blk_mq_tag_set *tagset;
@@ -149,9 +150,6 @@ struct nvme_ctrl {
 	struct list_head subsys_entry;
 
 	char name[12];
-	char serial[20];
-	char model[40];
-	char firmware_rev[8];
 	u16 cntlid;
 
 	u32 ctrl_config;
@@ -204,6 +202,9 @@ struct nvme_ctrl {
 	u16 maxcmd;
 	int nr_reconnects;
 	struct nvmf_ctrl_options *opts;
+
+	/* NVMe loop only */
+	u64 segment_boundary;
 };
 
 struct nvme_subsystem {
@@ -265,7 +266,6 @@ struct nvme_ctrl_ops {
 	void (*submit_async_event)(struct nvme_ctrl *ctrl);
 	void (*delete_ctrl)(struct nvme_ctrl *ctrl);
 	int (*get_address)(struct nvme_ctrl *ctrl, char *buf, int size);
-	void (*stop_ctrl)(struct nvme_ctrl *ctrl);
 };
 
 static inline bool nvme_ctrl_ready(struct nvme_ctrl *ctrl)

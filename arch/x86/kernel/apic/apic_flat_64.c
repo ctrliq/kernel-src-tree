@@ -264,7 +264,8 @@ static void physflat_send_IPI_all(int vector)
 
 static int physflat_probe(void)
 {
-	if (apic == &apic_physflat || num_possible_cpus() > 8)
+	if (apic == &apic_physflat ||
+	    (num_possible_cpus() + rh_invalid_cpus) > 8)
 		return 1;
 
 	return 0;

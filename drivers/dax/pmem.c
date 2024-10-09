@@ -111,6 +111,7 @@ static int dax_pmem_probe(struct device *dev)
 		return rc;
 	}
 
+	dax_pmem->pgmap.type = MEMORY_DEVICE_DEV_DAX;
 	dax_pmem->pgmap.ref = &dax_pmem->ref;
 	addr = devm_memremap_pages(dev, &dax_pmem->pgmap);
 	if (IS_ERR(addr)) {

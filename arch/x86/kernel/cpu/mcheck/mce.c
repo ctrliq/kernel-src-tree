@@ -48,6 +48,7 @@
 #include <asm/mce.h>
 #include <asm/msr.h>
 #include <asm/reboot.h>
+#include <asm/cacheflush.h>
 
 #include "mce-internal.h"
 
@@ -565,7 +566,8 @@ static int srao_decode_notifier(struct notifier_block *nb, unsigned long val,
 
 	if (mce_usable_address(mce) && (mce->severity == MCE_AO_SEVERITY)) {
 		pfn = mce->addr >> PAGE_SHIFT;
-		memory_failure(pfn, MCE_VECTOR, 0);
+		if (!memory_failure(pfn, MCE_VECTOR, 0))
+			set_mce_nospec(pfn);
 	}
 
 	return NOTIFY_OK;
@@ -1085,6 +1087,8 @@ static int do_memory_failure(struct mce *m)
 	ret = memory_failure(m->addr >> PAGE_SHIFT, MCE_VECTOR, flags);
 	if (ret)
 		pr_err("Memory error not recovered");
+	else
+		set_mce_nospec(m->addr >> PAGE_SHIFT);
 	return ret;
 }
 

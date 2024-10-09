@@ -55,6 +55,7 @@
 #include <scsi/scsi_device.h>
 #include <scsi/scsi_host.h>
 #include <scsi/scsi_tcq.h>
+#include <scsi/scsi_dbg.h>
 #include "megaraid_sas_fusion.h"
 #include "megaraid_sas.h"
 
@@ -2872,21 +2873,85 @@ blk_eh_timer_return megasas_reset_timer(struct scsi_cmnd *scmd)
 }
 
 /**
- * megasas_dump_frame -	This function will dump MPT/MFI frame
+ * megasas_dump -	This function will print hexdump of provided buffer.
+ * @buf:		Buffer to be dumped
+ * @sz:		Size in bytes
+ * @format:		Different formats of dumping e.g. format=n will
+ *			cause only 'n' 32 bit words to be dumped in a single
+ *			line.
  */
-static inline void
-megasas_dump_frame(void *mpi_request, int sz)
+inline void
+megasas_dump(void *buf, int sz, int format)
 {
 	int i;
-	__le32 *mfp = (__le32 *)mpi_request;
+	__le32 *buf_loc = (__le32 *)buf;
 
-	printk(KERN_INFO "IO request frame:\n\t");
-	for (i = 0; i < sz / sizeof(__le32); i++) {
-		if (i && ((i % 8) == 0))
-			printk("\n\t");
-		printk("%08x ", le32_to_cpu(mfp[i]));
+	for (i = 0; i < (sz / sizeof(__le32)); i++) {
+		if ((i % format) == 0) {
+			if (i != 0)
+				printk(KERN_CONT "\n");
+			printk(KERN_CONT "%08x: ", (i * 4));
+		}
+		printk(KERN_CONT "%08x ", le32_to_cpu(buf_loc[i]));
 	}
-	printk("\n");
+	printk(KERN_CONT "\n");
+}
+
+/**
+ * megasas_dump_reg_set -	This function will print hexdump of register set
+ * @buf:			Buffer to be dumped
+ * @sz:				Size in bytes
+ * @format:			Different formats of dumping e.g. format=n will
+ *				cause only 'n' 32 bit words to be dumped in a
+ *				single line.
+ */
+inline void
+megasas_dump_reg_set(void __iomem *reg_set)
+{
+	unsigned int i, sz = 256;
+	u32 __iomem *reg = (u32 __iomem *)reg_set;
+
+	for (i = 0; i < (sz / sizeof(u32)); i++)
+		printk("%08x: %08x\n", (i * 4), readl(&reg[i]));
+}
+
+/**
+ * megasas_dump_fusion_io -	This function will print key details
+ *				of SCSI IO
+ * @scmd:			SCSI command pointer of SCSI IO
+ */
+void
+megasas_dump_fusion_io(struct scsi_cmnd *scmd)
+{
+	struct megasas_cmd_fusion *cmd;
+	union MEGASAS_REQUEST_DESCRIPTOR_UNION *req_desc;
+	struct megasas_instance *instance;
+
+	cmd = (struct megasas_cmd_fusion *)scmd->SCp.ptr;
+	instance = (struct megasas_instance *)scmd->device->host->hostdata;
+
+	scmd_printk(KERN_INFO, scmd,
+		    "scmd: (0x%p)  retries: 0x%x  allowed: 0x%x\n",
+		    scmd, scmd->retries, scmd->allowed);
+	scsi_print_command(scmd);
+
+	if (cmd) {
+		req_desc = (union MEGASAS_REQUEST_DESCRIPTOR_UNION *)cmd->request_desc;
+		scmd_printk(KERN_INFO, scmd, "Request descriptor details:\n");
+		scmd_printk(KERN_INFO, scmd,
+			    "RequestFlags:0x%x  MSIxIndex:0x%x  SMID:0x%x  LMID:0x%x  DevHandle:0x%x\n",
+			    req_desc->SCSIIO.RequestFlags,
+			    req_desc->SCSIIO.MSIxIndex, req_desc->SCSIIO.SMID,
+			    req_desc->SCSIIO.LMID, req_desc->SCSIIO.DevHandle);
+
+		printk(KERN_INFO "IO request frame:\n");
+		megasas_dump(cmd->io_request,
+			     MEGA_MPI2_RAID_DEFAULT_IO_FRAME_SIZE, 8);
+		printk(KERN_INFO "Chain frame:\n");
+		megasas_dump(cmd->sg_frame,
+			     instance->max_chain_frame_sz, 8);
+	}
+
 }
 
 /*
@@ -2923,24 +2988,20 @@ static int megasas_reset_bus_host(struct scsi_cmnd *scmd)
 	instance = (struct megasas_instance *)scmd->device->host->hostdata;
 
 	scmd_printk(KERN_INFO, scmd,
-		"Controller reset is requested due to IO timeout\n"
-		"SCSI command pointer: (%p)\t SCSI host state: %d\t"
-		" SCSI host busy: %d\t FW outstanding: %d\n",
-		scmd, scmd->device->host->shost_state,
+		"OCR is requested due to IO timeout!!\n");
+
+	scmd_printk(KERN_INFO, scmd,
+		"SCSI host state: %d  SCSI host busy: %d  FW outstanding: %d\n",
+		scmd->device->host->shost_state,
 		atomic_read((atomic_t *)&scmd->device->host->host_busy),
 		atomic_read(&instance->fw_outstanding));
-
 	/*
 	 * First wait for all commands to complete
 	 */
 	if (instance->adapter_type == MFI_SERIES) {
 		ret = megasas_generic_reset(scmd);
 	} else {
-		struct megasas_cmd_fusion *cmd;
-		cmd = (struct megasas_cmd_fusion *)scmd->SCp.ptr;
-		if (cmd)
-			megasas_dump_frame(cmd->io_request,
-				MEGA_MPI2_RAID_DEFAULT_IO_FRAME_SIZE);
+		megasas_dump_fusion_io(scmd);
 		ret = megasas_reset_fusion(scmd->device->host,
 				SCSIIO_TIMEOUT_OCR);
 	}
@@ -3904,8 +3965,11 @@ megasas_transition_to_ready(struct megasas_instance *instance, int ocr)
 			if (ocr) {
 				max_wait = MEGASAS_RESET_WAIT_TIME;
 				break;
-			} else
+			} else {
+				dev_printk(KERN_DEBUG, &instance->pdev->dev, "System Register set:\n");
+				megasas_dump_reg_set(instance->reg_set);
 				return -ENODEV;
+			}
 
 		case MFI_STATE_WAIT_HANDSHAKE:
 			/*
@@ -4004,6 +4068,8 @@ megasas_transition_to_ready(struct megasas_instance *instance, int ocr)
 		default:
 			dev_printk(KERN_DEBUG, &instance->pdev->dev, "Unknown state 0x%x\n",
 			       fw_state);
+			dev_printk(KERN_DEBUG, &instance->pdev->dev, "System Register set:\n");
+			megasas_dump_reg_set(instance->reg_set);
 			return -ENODEV;
 		}
 
@@ -4026,6 +4092,8 @@ megasas_transition_to_ready(struct megasas_instance *instance, int ocr)
 		if (curr_abs_state == abs_state) {
 			dev_printk(KERN_DEBUG, &instance->pdev->dev, "FW state [%d] hasn't changed "
 			       "in %d secs\n", fw_state, max_wait);
+			dev_printk(KERN_DEBUG, &instance->pdev->dev, "System Register set:\n");
+			megasas_dump_reg_set(instance->reg_set);
 			return -ENODEV;
 		}
 
@@ -4462,6 +4530,9 @@ megasas_get_pd_list(struct megasas_instance *instance)
 
 	case DCMD_SUCCESS:
 		pd_addr = ci->addr;
+		if (megasas_dbg_lvl & LD_PD_DEBUG)
+			dev_info(&instance->pdev->dev, "%s, sysPD count: 0x%x\n",
+				 __func__, le32_to_cpu(ci->count));
 
 		if ((le32_to_cpu(ci->count) >
 			(MEGASAS_MAX_PD_CHANNELS * MEGASAS_MAX_DEV_PER_CHANNEL)))
@@ -4477,6 +4548,11 @@ megasas_get_pd_list(struct megasas_instance *instance)
 					pd_addr->scsiDevType;
 			instance->local_pd_list[le16_to_cpu(pd_addr->deviceId)].driveState	=
 					MR_PD_STATE_SYSTEM;
+			if (megasas_dbg_lvl & LD_PD_DEBUG)
+				dev_info(&instance->pdev->dev,
+					 "PD%d: targetID: 0x%03x deviceType:0x%x\n",
+					 pd_index, le16_to_cpu(pd_addr->deviceId),
+					 pd_addr->scsiDevType);
 			pd_addr++;
 		}
 
@@ -4580,6 +4656,10 @@ megasas_get_ld_list(struct megasas_instance *instance)
 		break;
 
 	case DCMD_SUCCESS:
+		if (megasas_dbg_lvl & LD_PD_DEBUG)
+			dev_info(&instance->pdev->dev, "%s, LD count: 0x%x\n",
+				 __func__, ld_count);
+
 		if (ld_count > instance->fw_supported_vd_count)
 			break;
 
@@ -4589,6 +4669,10 @@ megasas_get_ld_list(struct megasas_instance *instance)
 			if (ci->ldList[ld_index].state != 0) {
 				ids = ci->ldList[ld_index].ref.targetId;
 				instance->ld_ids[ids] = ci->ldList[ld_index].ref.targetId;
+				if (megasas_dbg_lvl & LD_PD_DEBUG)
+					dev_info(&instance->pdev->dev,
+						 "LD%d: targetID: 0x%03x\n",
+						 ld_index, ids);
 			}
 		}
 
@@ -4692,6 +4776,10 @@ megasas_ld_list_query(struct megasas_instance *instance, u8 query_type)
 	case DCMD_SUCCESS:
 		tgtid_count = le32_to_cpu(ci->count);
 
+		if (megasas_dbg_lvl & LD_PD_DEBUG)
+			dev_info(&instance->pdev->dev, "%s, LD count: 0x%x\n",
+				 __func__, tgtid_count);
+
 		if ((tgtid_count > (instance->fw_supported_vd_count)))
 			break;
 
@@ -4699,6 +4787,9 @@ megasas_ld_list_query(struct megasas_instance *instance, u8 query_type)
 		for (ld_index = 0; ld_index < tgtid_count; ld_index++) {
 			ids = ci->targetId[ld_index];
 			instance->ld_ids[ids] = ci->targetId[ld_index];
+			if (megasas_dbg_lvl & LD_PD_DEBUG)
+				dev_info(&instance->pdev->dev, "LD%d: targetID: 0x%03x\n",
+					 ld_index, ci->targetId[ld_index]);
 		}
 
 		break;
@@ -4778,6 +4869,13 @@ megasas_host_device_list_query(struct megasas_instance *instance,
 		 */
 		count = le32_to_cpu(ci->count);
 
+		if (count > (MEGASAS_MAX_PD + MAX_LOGICAL_DRIVES_EXT))
+			break;
+
+		if (megasas_dbg_lvl & LD_PD_DEBUG)
+			dev_info(&instance->pdev->dev, "%s, Device count: 0x%x\n",
+				 __func__, count);
+
 		memset(instance->local_pd_list, 0,
 		       MEGASAS_MAX_PD * sizeof(struct megasas_pd_list));
 		memset(instance->ld_ids, 0xff, MAX_LOGICAL_DRIVES_EXT);
@@ -4789,8 +4887,16 @@ megasas_host_device_list_query(struct megasas_instance *instance,
 						ci->host_device_list[i].scsi_type;
 				instance->local_pd_list[target_id].driveState =
 						MR_PD_STATE_SYSTEM;
+				if (megasas_dbg_lvl & LD_PD_DEBUG)
+					dev_info(&instance->pdev->dev,
+						 "Device %d: PD targetID: 0x%03x deviceType:0x%x\n",
+						 i, target_id, ci->host_device_list[i].scsi_type);
 			} else {
 				instance->ld_ids[target_id] = target_id;
+				if (megasas_dbg_lvl & LD_PD_DEBUG)
+					dev_info(&instance->pdev->dev,
+						 "Device %d: LD targetID: 0x%03x\n",
+						 i, target_id);
 			}
 		}
 
@@ -6747,7 +6853,6 @@ static inline void megasas_set_adapter_type(struct megasas_instance *instance)
 		case PCI_DEVICE_ID_LSI_AERO_10E5:
 		case PCI_DEVICE_ID_LSI_AERO_10E6:
 			instance->adapter_type = AERO_SERIES;
-			mark_tech_preview("Avago MegaRAID SAS Driver", THIS_MODULE);
 			break;
 		case PCI_DEVICE_ID_LSI_VENTURA:
 		case PCI_DEVICE_ID_LSI_CRUSADER:

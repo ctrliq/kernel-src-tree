@@ -155,7 +155,7 @@ static noinline int gup_pte_range(pmd_t pmd, unsigned long addr,
 		 * when IPIs are not send on TLB shootdown.
 		 */
 		if (rh_flush_tlb_others_IPI_less()) {
-			if (!page_cache_get_speculative(page)) {
+			if (!try_get_compound_head(page, 1)) {
 				put_dev_pagemap(pgmap);
 				return 0;
 			}
@@ -165,6 +165,10 @@ static noinline int gup_pte_range(pmd_t pmd, unsigned long addr,
 				return 0;
 			}
 		} else {
+			if (WARN_ON_ONCE(page_ref_count(page) < 0)) {
+				put_dev_pagemap(pgmap);
+				return 0;
+			}
 			get_page(page);
 		}
 		SetPageReferenced(page);
@@ -183,6 +187,16 @@ static inline void get_head_page_multiple(struct page *page, int nr)
 {
 	VM_BUG_ON_PAGE(page != compound_head(page), page);
 	VM_BUG_ON_PAGE(page_count(page) == 0, page);
+
+	/*
+	 * RHEL note: if this triggers in normal workloads after being
+	 * already checked in gup_huge_pud() and gup_huge_pmd(), we
+	 * might have to proactively check for overflows. Currently
+	 * overflows can only happen with malicious page referencing
+	 * workloads (CVE-2019-11487)
+	 */
+	if (WARN_ON_ONCE(page_ref_count(compound_head(page)) < 0))
+		return;
 	page_ref_add(page, nr);
 	SetPageReferenced(page);
 }
@@ -269,7 +283,8 @@ static noinline int gup_huge_pmd(pmd_t orig, pmd_t *pmdp, unsigned long addr,
 
 	/* RHEL-only. See gup_pte_range() */
 	if (rh_flush_tlb_others_IPI_less()) {
-		if (!page_cache_get_speculative(head))
+		head = try_get_compound_head(head, 1);
+		if (!head)
 			return 0;
 		if (unlikely(pte_val(pte) != pte_val(*(pte_t *)&orig))) {
 			put_page(head);
@@ -278,6 +293,9 @@ static noinline int gup_huge_pmd(pmd_t orig, pmd_t *pmdp, unsigned long addr,
 
 		/* Don't take ref to the head page twice */
 		refs--;
+	} else {
+		if (WARN_ON_ONCE(page_ref_count(head) < 0))
+			return 0;
 	}
 
 	page = head + ((addr & ~PMD_MASK) >> PAGE_SHIFT);
@@ -361,7 +379,8 @@ static noinline int gup_huge_pud(pud_t orig, pud_t *pudp, unsigned long addr,
 
 	/* RHEL-only. See gup_pte_range() */
 	if (rh_flush_tlb_others_IPI_less()) {
-		if (!page_cache_get_speculative(head))
+		head = try_get_compound_head(head, 1);
+		if (!head)
 			return 0;
 		if (unlikely(pte_val(pte) != pte_val(*(pte_t *)&orig))) {
 			put_page(head);
@@ -370,6 +389,9 @@ static noinline int gup_huge_pud(pud_t orig, pud_t *pudp, unsigned long addr,
 
 		/* Don't take ref to the head page twice */
 		refs--;
+	} else {
+		if (WARN_ON_ONCE(page_ref_count(head) < 0))
+			return 0;
 	}
 
 	page = head + ((addr & ~PUD_MASK) >> PAGE_SHIFT);

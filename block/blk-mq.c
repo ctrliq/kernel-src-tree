@@ -549,7 +549,7 @@ static void blk_mq_stat_add(struct request *rq)
 	}
 }
 
-static void __blk_mq_complete_request(struct request *rq, bool sync)
+static void __blk_mq_complete_request(struct request *rq)
 {
 	struct request_queue *q = rq->q;
 
@@ -560,8 +560,6 @@ static void __blk_mq_complete_request(struct request *rq, bool sync)
 
 	if (!q->softirq_done_fn)
 		blk_mq_end_request(rq, rq->errors);
-	else if (sync)
-		rq->q->softirq_done_fn(rq);
 	else
 		blk_mq_ipi_complete_request(rq);
 }
@@ -602,19 +600,10 @@ void blk_mq_complete_request(struct request *rq, int error)
 		return;
 	if (!blk_mark_rq_complete(rq)) {
 		rq->errors = error;
-		__blk_mq_complete_request(rq, false);
+		__blk_mq_complete_request(rq);
 	}
 }
 EXPORT_SYMBOL(blk_mq_complete_request);
-
-void blk_mq_complete_request_sync(struct request *rq, int error)
-{
-	if (!blk_mark_rq_complete(rq)) {
-		rq->errors = error;
-		__blk_mq_complete_request(rq, true);
-	}
-}
-EXPORT_SYMBOL_GPL(blk_mq_complete_request_sync);
 
 int blk_mq_request_started(struct request *rq)
 {
@@ -624,9 +613,24 @@ EXPORT_SYMBOL_GPL(blk_mq_request_started);
 
 int blk_mq_request_completed(struct request *rq)
 {
-	return blk_mq_rq_state(rq) == MQ_RQ_COMPLETE;
+	return test_bit(REQ_ATOM_COMPLETE, &rq->atomic_flags);
 }
 EXPORT_SYMBOL_GPL(blk_mq_request_completed);
+
+
+/*
+ * This API is for implementing same timeout handling for drivers compared
+ * with upstream kernel without backporting big & kabi-breaking blk-mq
+ * & dirver timeout handling re-work.
+ *
+ * Driver can call this API to mark the timed-out request as not-completed,
+ * then handle it same with other in-flight requests.
+ */
+void blk_mq_clear_rq_complete(struct request *rq)
+{
+	blk_clear_rq_complete(rq);
+}
+EXPORT_SYMBOL_GPL(blk_mq_clear_rq_complete);
 
 void blk_mq_start_request(struct request *rq)
 {
@@ -723,12 +727,20 @@ static void blk_mq_requeue_work(struct work_struct *work)
 	spin_unlock_irqrestore(&q->requeue_lock, flags);
 
 	list_for_each_entry_safe(rq, next, &rq_list, queuelist) {
-		if (!(rq->cmd_flags & REQ_SOFTBARRIER))
+		if (!(rq->cmd_flags & (REQ_SOFTBARRIER | REQ_DONTPREP)))
 			continue;
 
 		rq->cmd_flags &= ~REQ_SOFTBARRIER;
 		list_del_init(&rq->queuelist);
-		blk_mq_sched_insert_request(rq, true, false, false);
+		/*
+		 * If RQF_DONTPREP, rq has contained some driver specific
+		 * data, so insert it to hctx dispatch list to avoid any
+		 * merge.
+		 */
+		if (rq->cmd_flags & REQ_DONTPREP)
+			blk_mq_request_bypass_insert(rq, false);
+		else
+			blk_mq_sched_insert_request(rq, true, false, false);
 	}
 
 	while (!list_empty(&rq_list)) {
@@ -811,12 +823,15 @@ void blk_mq_rq_timed_out(struct request *req, bool reserved)
 	if (!test_bit(REQ_ATOM_STARTED, &req->atomic_flags))
 		return;
 
-	if (ops->timeout)
+	if (ops->timeout) {
+		req->cmd_flags |= REQ_TIMEOUT;
 		ret = ops->timeout(req, reserved);
+		req->cmd_flags &= ~REQ_TIMEOUT;
+	}
 
 	switch (ret) {
 	case BLK_EH_HANDLED:
-		__blk_mq_complete_request(req, false);
+		__blk_mq_complete_request(req);
 		break;
 	case BLK_EH_RESET_TIMER:
 		blk_add_timer(req);
@@ -3074,6 +3089,10 @@ static void __blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set,
 
 	list_for_each_entry(q, &set->tag_list, tag_set_list)
 		blk_mq_freeze_queue(q);
+	/*
+	 * Sync with blk_mq_queue_tag_busy_iter.
+	 */
+	synchronize_rcu();
 
 	set->nr_hw_queues = nr_hw_queues;
 	blk_mq_update_queue_map(set);

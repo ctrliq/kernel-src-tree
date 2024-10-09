@@ -3513,7 +3513,6 @@ static int devlink_nl_cmd_region_read_dumpit(struct sk_buff *skb,
 	if (IS_ERR(devlink))
 		goto out_dev;
 
-	mutex_lock(&devlink_mutex);
 	mutex_lock(&devlink->lock);
 
 	if (!attrs[DEVLINK_ATTR_REGION_NAME] ||

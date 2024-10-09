@@ -2916,6 +2916,7 @@ static int enable_msix(struct adapter *adapter)
 }
 
 static const struct net_device_ops cxgb4vf_netdev_ops	= {
+	.ndo_size		= sizeof(struct net_device_ops),
 	.ndo_open		= cxgb4vf_open,
 	.ndo_stop		= cxgb4vf_stop,
 	.ndo_start_xmit		= t4vf_eth_xmit,

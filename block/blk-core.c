@@ -624,9 +624,7 @@ void blk_cleanup_queue(struct request_queue *q)
 	 * cgroup controller.
 	 */
 	if (q->elevator) {
-		spin_lock_irq(q->queue_lock);
 		ioc_clear_queue(q);
-		spin_unlock_irq(q->queue_lock);
 
 		elevator_exit(q, q->elevator);
 		q->elevator = NULL;
@@ -2190,7 +2188,13 @@ generic_make_request_checks(struct bio *bio)
 	if (blk_throtl_bio(q, bio))
 		return false;	/* throttled, will be resubmitted later */
 
-	trace_block_bio_queue(q, bio);
+	if (!bio_flagged(bio, BIO_TRACE_COMPLETION)) {
+		trace_block_bio_queue(q, bio);
+		/* Now that enqueuing has been traced, we need to trace
+		 * completion as well.
+		 */
+		set_bit(BIO_TRACE_COMPLETION, &bio->bi_flags);
+	}
 	return true;
 
 end_io:
@@ -2877,6 +2881,8 @@ bool blk_update_request(struct request *req, int error, unsigned int nr_bytes)
 		if (bio_bytes == bio->bi_size)
 			req->bio = bio->bi_next;
 
+		/* Completion has already been traced */
+		clear_bit(BIO_TRACE_COMPLETION, &bio->bi_flags);
 		req_bio_endio(req, bio, bio_bytes, error);
 
 		total_bytes += bio_bytes;

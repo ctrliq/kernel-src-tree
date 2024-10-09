@@ -221,20 +221,6 @@ qla2x00_rel_sp(srb_t *sp)
 	qla2xxx_rel_qpair_sp(sp->qpair, sp);
 }
 
-static inline void
-qla2x00_init_timer(srb_t *sp, unsigned long tmo)
-{
-	init_timer(&sp->u.iocb_cmd.timer);
-	sp->u.iocb_cmd.timer.expires = jiffies + tmo * HZ;
-	sp->u.iocb_cmd.timer.data = (unsigned long)sp;
-	sp->u.iocb_cmd.timer.function = qla2x00_sp_timeout;
-	sp->free = qla2x00_sp_free;
-	init_completion(&sp->comp);
-	if (IS_QLAFX00(sp->vha->hw) && (sp->type == SRB_FXIOCB_DCMD))
-		init_completion(&sp->u.iocb_cmd.u.fxiocb.fxiocb_comp);
-	add_timer(&sp->u.iocb_cmd.timer);
-}
-
 static inline int
 qla2x00_gid_list_size(struct qla_hw_data *ha)
 {
@@ -320,4 +306,16 @@ qla_83xx_start_iocbs(struct qla_qpair *qpair)
 		req->ring_ptr++;
 
 	WRT_REG_DWORD(req->req_q_in, req->ring_index);
+}
+
+static inline int
+qla2xxx_get_fc4_priority(struct scsi_qla_host *vha)
+{
+	uint32_t data;
+
+	data =
+	    ((uint8_t *)vha->hw->nvram)[NVRAM_DUAL_FCP_NVME_FLAG_OFFSET];
+
+
+	return ((data >> 6) & BIT_0);
 }

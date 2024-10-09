@@ -12,13 +12,43 @@
 
 #include <linux/unistd.h>
 #include <linux/err.h>
+#include <linux/ipc_namespace.h>
 
-#define IPCMNI 32768  /* <= MAX_INT limit for ipc arrays (including sysctl changes) */
-#define SEQ_MULTIPLIER	(IPCMNI)
+/*
+ * The IPC ID contains 2 separate numbers - index and sequence number.
+ * By default,
+ *   bits  0-14: index (32k, 15 bits)
+ *   bits 15-30: sequence number (64k, 16 bits)
+ *
+ * When IPCMNI extension mode is turned on, the composition changes:
+ *   bits  0-23: index (16M, 24 bits)
+ *   bits 24-30: sequence number (128, 7 bits)
+ */
+#define IPCMNI_SHIFT		15
+#define IPCMNI_EXTEND_SHIFT	24
+#define IPCMNI_EXTEND_MIN_CYCLE	(RADIX_TREE_MAP_SIZE * RADIX_TREE_MAP_SIZE)
+#define IPCMNI			(1 << IPCMNI_SHIFT)
+#define IPCMNI_EXTEND		(1 << IPCMNI_EXTEND_SHIFT)
 
-void sem_init (void);
-void msg_init (void);
-void shm_init (void);
+#ifdef CONFIG_SYSVIPC_SYSCTL
+extern int ipc_mni;
+extern int ipc_mni_shift;
+extern int ipc_min_cycle;
+
+#define ipcmni_seq_shift()	ipc_mni_shift
+#define IPCMNI_IDX_MASK		((1 << ipc_mni_shift) - 1)
+
+#else /* CONFIG_SYSVIPC_SYSCTL */
+
+#define ipc_mni			IPCMNI
+#define ipc_min_cycle		((int)RADIX_TREE_MAP_SIZE)
+#define ipcmni_seq_shift()	IPCMNI_SHIFT
+#define IPCMNI_IDX_MASK		((1 << IPCMNI_SHIFT) - 1)
+#endif /* CONFIG_SYSVIPC_SYSCTL */
+
+void sem_init(void);
+void msg_init(void);
+void shm_init(void);
 
 struct ipc_namespace;
 
@@ -99,14 +129,12 @@ void __init ipc_init_proc_interface(const char *path, const char *header,
 #define IPC_MSG_IDS	1
 #define IPC_SHM_IDS	2
 
-#define ipcid_to_idx(id) ((id) % SEQ_MULTIPLIER)
-#define ipcid_to_seqx(id) ((id) / SEQ_MULTIPLIER)
+#define ipcid_to_idx(id)  ((id) & IPCMNI_IDX_MASK)
+#define ipcid_to_seqx(id) ((id) >> ipcmni_seq_shift())
+#define ipcid_seq_max()	  (INT_MAX >> ipcmni_seq_shift())
 
 /* must be called with ids->rwsem acquired for writing */
 int ipc_addid(struct ipc_ids *, struct kern_ipc_perm *, int);
-
-/* must be called with ids->rwsem acquired for reading */
-int ipc_get_maxid(struct ipc_ids *);
 
 /* must be called with both locks acquired. */
 void ipc_rmid(struct ipc_ids *, struct kern_ipc_perm *);
@@ -114,11 +142,22 @@ void ipc_rmid(struct ipc_ids *, struct kern_ipc_perm *);
 /* must be called with ipcp locked */
 int ipcperms(struct ipc_namespace *ns, struct kern_ipc_perm *ipcp, short flg);
 
-/* for rare, potentially huge allocations.
- * both function can sleep
+/**
+ * ipc_get_maxidx - get the highest assigned index
+ * @ids: ipc identifier set
+ *
+ * Called with ipc_ids.rwsem held for reading.
  */
-void* ipc_alloc(int size);
-void ipc_free(void* ptr, int size);
+static inline int ipc_get_maxidx(struct ipc_ids *ids)
+{
+	if (ids->in_use == 0)
+		return -1;
+
+	if (ids->in_use == ipc_mni)
+		return ipc_mni - 1;
+
+	return ids->max_idx;
+}
 
 /*
  * For allocation that need to be freed by RCU.
@@ -126,7 +165,7 @@ void ipc_free(void* ptr, int size);
  * getref increases the refcount, the putref call that reduces the recount
  * to 0 schedules the rcu destruction. Caller must guarantee locking.
  */
-void* ipc_rcu_alloc(int size);
+void *ipc_rcu_alloc(int size);
 int ipc_rcu_getref(void *ptr);
 void ipc_rcu_putref(void *ptr, void (*func)(struct rcu_head *head));
 void ipc_rcu_free(struct rcu_head *head);
@@ -145,7 +184,7 @@ struct kern_ipc_perm *ipcctl_pre_down_nolock(struct ipc_namespace *ns,
   /* On IA-64, we always use the "64-bit version" of the IPC structures.  */ 
 # define ipc_parse_version(cmd)	IPC_64
 #else
-int ipc_parse_version (int *cmd);
+int ipc_parse_version(int *cmd);
 #endif
 
 extern void free_msg(struct msg_msg *msg);
@@ -155,14 +194,9 @@ extern int store_msg(void __user *dest, struct msg_msg *msg, size_t len);
 
 extern void recompute_msgmni(struct ipc_namespace *);
 
-static inline int ipc_buildid(int id, int seq)
+static inline int ipc_checkid(struct kern_ipc_perm *ipcp, int id)
 {
-	return SEQ_MULTIPLIER * seq + id;
-}
-
-static inline int ipc_checkid(struct kern_ipc_perm *ipcp, int uid)
-{
-	return uid / SEQ_MULTIPLIER != ipcp->seq;
+	return ipcid_to_seqx(id) != ipcp->seq;
 }
 
 static inline void ipc_lock_object(struct kern_ipc_perm *perm)
@@ -204,4 +238,13 @@ int ipcget(struct ipc_namespace *ns, struct ipc_ids *ids,
 			struct ipc_ops *ops, struct ipc_params *params);
 void free_ipcs(struct ipc_namespace *ns, struct ipc_ids *ids,
 		void (*free)(struct ipc_namespace *, struct kern_ipc_perm *));
+
+static inline int sem_check_semmni(struct ipc_namespace *ns) {
+	/*
+	 * Check semmni range [0, ipc_mni]
+	 * semmni is the last element of sem_ctls[4] array
+	 */
+	return ((ns->sem_ctls[3] < 0) || (ns->sem_ctls[3] > ipc_mni))
+		? -ERANGE : 0;
+}
 #endif

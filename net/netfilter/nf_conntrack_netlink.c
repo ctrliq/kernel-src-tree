@@ -1385,6 +1385,24 @@ ctnetlink_parse_nat_setup(struct nf_conn *ct,
 }
 #endif
 
+static void
+__ctnetlink_change_status(struct nf_conn *ct, unsigned long on,
+			  unsigned long off)
+{
+	unsigned int bit;
+
+	/* Ignore these unchangable bits */
+	on &= ~IPS_UNCHANGEABLE_MASK;
+	off &= ~IPS_UNCHANGEABLE_MASK;
+
+	for (bit = 0; bit < __IPS_MAX_BIT; bit++) {
+		if (on & (1 << bit))
+			set_bit(bit, &ct->status);
+		else if (off & (1 << bit))
+			clear_bit(bit, &ct->status);
+	}
+}
+
 static int
 ctnetlink_change_status(struct nf_conn *ct, const struct nlattr * const cda[])
 {
@@ -1404,10 +1422,7 @@ ctnetlink_change_status(struct nf_conn *ct, const struct nlattr * const cda[])
 		/* ASSURED bit can only be set */
 		return -EBUSY;
 
-	/* Be careful here, modifying NAT bits can screw up things,
-	 * so don't let users modify them directly if they don't pass
-	 * nf_nat_range. */
-	ct->status |= status & ~(IPS_NAT_DONE_MASK | IPS_NAT_MASK);
+	__ctnetlink_change_status(ct, status, 0);
 	return 0;
 }
 
@@ -1462,23 +1477,29 @@ ctnetlink_change_helper(struct nf_conn *ct, const struct nlattr * const cda[])
 		return 0;
 	}
 
+	rcu_read_lock();
 	helper = __nf_conntrack_helper_find(helpname, nf_ct_l3num(ct),
 					    nf_ct_protonum(ct));
-	if (helper == NULL)
+	if (helper == NULL) {
+		rcu_read_unlock();
 		return -EOPNOTSUPP;
+	}
 
 	if (help) {
 		if (help->helper == helper) {
 			/* update private helper data if allowed. */
 			if (helper->from_nlattr)
 				helper->from_nlattr(helpinfo, ct);
-			return 0;
+			err = 0;
 		} else
-			return -EBUSY;
+			err = -EBUSY;
+	} else {
+		/* we cannot set a helper for an existing conntrack */
+		err = -EOPNOTSUPP;
 	}
 
-	/* we cannot set a helper for an existing conntrack */
-	return -EOPNOTSUPP;
+	rcu_read_unlock();
+	return err;
 }
 
 static inline int
@@ -1575,7 +1596,7 @@ ctnetlink_change_seq_adj(struct nf_conn *ct,
 		if (ret < 0)
 			return ret;
 
-		ct->status |= IPS_SEQ_ADJUST;
+		set_bit(IPS_SEQ_ADJUST_BIT, &ct->status);
 	}
 
 	if (cda[CTA_SEQ_ADJ_REPLY]) {
@@ -1584,7 +1605,7 @@ ctnetlink_change_seq_adj(struct nf_conn *ct,
 		if (ret < 0)
 			return ret;
 
-		ct->status |= IPS_SEQ_ADJUST;
+		set_bit(IPS_SEQ_ADJUST_BIT, &ct->status);
 	}
 
 	return 0;
@@ -1898,9 +1919,7 @@ ctnetlink_new_conntrack(struct sock *ctnl, struct sk_buff *skb,
 	err = -EEXIST;
 	ct = nf_ct_tuplehash_to_ctrack(h);
 	if (!(nlh->nlmsg_flags & NLM_F_EXCL)) {
-		spin_lock_bh(&nf_conntrack_expect_lock);
 		err = ctnetlink_change_conntrack(ct, cda);
-		spin_unlock_bh(&nf_conntrack_expect_lock);
 		if (err == 0) {
 			nf_conntrack_eventmask_report((1 << IPCT_REPLY) |
 						      (1 << IPCT_ASSURED) |
@@ -2191,6 +2210,30 @@ nla_put_failure:
 }
 
 static int
+ctnetlink_update_status(struct nf_conn *ct, const struct nlattr * const cda[])
+{
+	unsigned int status = ntohl(nla_get_be32(cda[CTA_STATUS]));
+	unsigned long d = ct->status ^ status;
+
+	if (d & IPS_SEEN_REPLY && !(status & IPS_SEEN_REPLY))
+		/* SEEN_REPLY bit can only be set */
+		return -EBUSY;
+
+	if (d & IPS_ASSURED && !(status & IPS_ASSURED))
+		/* ASSURED bit can only be set */
+		return -EBUSY;
+
+	/* This check is less strict than ctnetlink_change_status()
+	 * because callers often flip IPS_EXPECTED bits when sending
+	 * an NFQA_CT attribute to the kernel.  So ignore the
+	 * unchangeable bits but do not error out. Also user programs
+	 * are allowed to clear the bits that they are allowed to change.
+	 */
+	__ctnetlink_change_status(ct, status, ~status);
+	return 0;
+}
+
+static int
 ctnetlink_nfqueue_parse_ct(const struct nlattr *cda[], struct nf_conn *ct)
 {
 	int err;
@@ -2201,7 +2244,7 @@ ctnetlink_nfqueue_parse_ct(const struct nlattr *cda[], struct nf_conn *ct)
 			return err;
 	}
 	if (cda[CTA_STATUS]) {
-		err = ctnetlink_change_status(ct, cda);
+		err = ctnetlink_update_status(ct, cda);
 		if (err < 0)
 			return err;
 	}
@@ -2232,11 +2275,7 @@ ctnetlink_nfqueue_parse(const struct nlattr *attr, struct nf_conn *ct)
 	if (ret < 0)
 		return ret;
 
-	spin_lock_bh(&nf_conntrack_expect_lock);
-	ret = ctnetlink_nfqueue_parse_ct((const struct nlattr **)cda, ct);
-	spin_unlock_bh(&nf_conntrack_expect_lock);
-
-	return ret;
+	return ctnetlink_nfqueue_parse_ct((const struct nlattr **)cda, ct);
 }
 
 static int ctnetlink_nfqueue_exp_parse(const struct nlattr * const *cda,

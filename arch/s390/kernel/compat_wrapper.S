@@ -1424,6 +1424,14 @@ ENTRY(sys_sched_getattr_wrapper)
 	llgfr	%r4,%r4			# unsigned int
 	jg	sys_sched_getattr
 
+ENTRY(sys_renameat2_wrapper)
+	lgfr	%r2,%r2			# int
+	llgtr	%r3,%r3			# const char *
+	lgfr	%r4,%r4			# int
+	llgtr	%r5,%r5			# const char *
+	llgfr	%r6,%r6			# unsigned int
+	jg	sys_renameat2
+
 ENTRY(sys_s390_pci_mmio_write_wrapper)
 	llgfr   %r2,%r2                 # unsigned long
 	llgtr   %r3,%r3                 # void __user *

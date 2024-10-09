@@ -93,6 +93,7 @@ static void lpfc_sli4_cq_event_release_all(struct lpfc_hba *);
 static void lpfc_sli4_disable_intr(struct lpfc_hba *);
 static uint32_t lpfc_sli4_enable_intr(struct lpfc_hba *, uint32_t);
 static void lpfc_sli4_oas_verify(struct lpfc_hba *phba);
+static void lpfc_setup_bg(struct lpfc_hba *, struct Scsi_Host *);
 
 static struct scsi_transport_template *lpfc_transport_template = NULL;
 static struct scsi_transport_template *lpfc_vport_transport_template = NULL;
@@ -4003,6 +4004,9 @@ lpfc_create_port(struct lpfc_hba *phba, int instance, struct device *dev)
 	setup_timer(&vport->delayed_disc_tmo, lpfc_delayed_disc_tmo,
 			(unsigned long)vport);
 
+	if (phba->sli3_options & LPFC_SLI3_BG_ENABLED)
+		lpfc_setup_bg(phba, shost);
+
 	error = scsi_add_host_with_dma(shost, dev, &phba->pcidev->dev);
 	if (error)
 		goto out_put_shost;
@@ -4121,7 +4125,7 @@ finished:
 	return stat;
 }
 
-void lpfc_host_supported_speeds_set(struct Scsi_Host *shost)
+static void lpfc_host_supported_speeds_set(struct Scsi_Host *shost)
 {
 	struct lpfc_vport *vport = (struct lpfc_vport *)shost->hostdata;
 	struct lpfc_hba   *phba = vport->phba;
@@ -7374,8 +7378,6 @@ lpfc_post_init_setup(struct lpfc_hba *phba)
 	 */
 	shost = pci_get_drvdata(phba->pcidev);
 	shost->can_queue = phba->cfg_hba_queue_depth - 10;
-	if (phba->sli3_options & LPFC_SLI3_BG_ENABLED)
-		lpfc_setup_bg(phba, shost);
 
 	lpfc_host_attrib_init(shost);
 
@@ -8872,6 +8874,19 @@ lpfc_sli4_queue_destroy(struct lpfc_hba *phba)
 {
 	if (phba->cfg_fof)
 		lpfc_fof_queue_destroy(phba);
+	/*
+	 * Set FREE_INIT before beginning to free the queues.
+	 * Wait until the users of queues to acknowledge to
+	 * release queues by clearing FREE_WAIT.
+	 */
+	spin_lock_irq(&phba->hbalock);
+	phba->sli.sli_flag |= LPFC_QUEUE_FREE_INIT;
+	while (phba->sli.sli_flag & LPFC_QUEUE_FREE_WAIT) {
+		spin_unlock_irq(&phba->hbalock);
+		msleep(20);
+		spin_lock_irq(&phba->hbalock);
+	}
+	spin_unlock_irq(&phba->hbalock);
 
 	/* Release HBA eqs */
 	lpfc_sli4_release_queues(&phba->sli4_hba.hba_eq, phba->io_channel_irqs);
@@ -8932,6 +8947,11 @@ lpfc_sli4_queue_destroy(struct lpfc_hba *phba)
 
 	/* Everything on this list has been freed */
 	INIT_LIST_HEAD(&phba->sli4_hba.lpfc_wq_list);
+
+	/* Done with freeing the queues */
+	spin_lock_irq(&phba->hbalock);
+	phba->sli.sli_flag &= ~LPFC_QUEUE_FREE_INIT;
+	spin_unlock_irq(&phba->hbalock);
 }
 
 int
@@ -9805,12 +9825,12 @@ lpfc_sli4_pci_mem_setup(struct lpfc_hba *phba)
 {
 	struct pci_dev *pdev;
 	unsigned long bar0map_len, bar1map_len, bar2map_len;
-	int error = -ENODEV;
+	int error;
 	uint32_t if_type;
 
 	/* Obtain PCI device reference */
 	if (!phba->pcidev)
-		return error;
+		return -ENODEV;
 	else
 		pdev = phba->pcidev;
 
@@ -9819,7 +9839,7 @@ lpfc_sli4_pci_mem_setup(struct lpfc_hba *phba)
 	 || pci_set_consistent_dma_mask(pdev,DMA_BIT_MASK(64)) != 0) {
 		if (pci_set_dma_mask(pdev, DMA_BIT_MASK(32)) != 0
 		 || pci_set_consistent_dma_mask(pdev,DMA_BIT_MASK(32)) != 0) {
-			return error;
+			return -ENODEV;
 		}
 	}
 
@@ -9829,7 +9849,7 @@ lpfc_sli4_pci_mem_setup(struct lpfc_hba *phba)
 	 */
 	if (pci_read_config_dword(pdev, LPFC_SLI_INTF,
 				  &phba->sli4_hba.sli_intf.word0)) {
-		return error;
+		return -ENODEV;
 	}
 
 	/* There is no SLI3 failback for SLI4 devices. */
@@ -9839,7 +9859,7 @@ lpfc_sli4_pci_mem_setup(struct lpfc_hba *phba)
 				"2894 SLI_INTF reg contents invalid "
 				"sli_intf reg 0x%x\n",
 				phba->sli4_hba.sli_intf.word0);
-		return error;
+		return -ENODEV;
 	}
 
 	if_type = bf_get(lpfc_sli_intf_if_type, &phba->sli4_hba.sli_intf);
@@ -9863,7 +9883,7 @@ lpfc_sli4_pci_mem_setup(struct lpfc_hba *phba)
 			dev_printk(KERN_ERR, &pdev->dev,
 				   "ioremap failed for SLI4 PCI config "
 				   "registers.\n");
-			goto out;
+			return -ENODEV;
 		}
 		phba->pci_bar0_memmap_p = phba->sli4_hba.conf_regs_memmap_p;
 		/* Set up BAR0 PCI config space register memory map */
@@ -9874,7 +9894,7 @@ lpfc_sli4_pci_mem_setup(struct lpfc_hba *phba)
 		if (if_type >= LPFC_SLI_INTF_IF_TYPE_2) {
 			dev_printk(KERN_ERR, &pdev->dev,
 			   "FATAL - No BAR0 mapping for SLI4, if_type 2\n");
-			goto out;
+			return -ENODEV;
 		}
 		phba->sli4_hba.conf_regs_memmap_p =
 				ioremap(phba->pci_bar0_map, bar0map_len);
@@ -9882,7 +9902,7 @@ lpfc_sli4_pci_mem_setup(struct lpfc_hba *phba)
 			dev_printk(KERN_ERR, &pdev->dev,
 				"ioremap failed for SLI4 PCI config "
 				"registers.\n");
-				goto out;
+			return -ENODEV;
 		}
 		lpfc_sli4_bar0_register_memmap(phba, if_type);
 	}
@@ -9928,6 +9948,7 @@ lpfc_sli4_pci_mem_setup(struct lpfc_hba *phba)
 		if (!phba->sli4_hba.drbl_regs_memmap_p) {
 			dev_err(&pdev->dev,
 			   "ioremap failed for SLI4 HBA doorbell registers.\n");
+			error = -ENOMEM;
 			goto out_iounmap_conf;
 		}
 		phba->pci_bar2_memmap_p = phba->sli4_hba.drbl_regs_memmap_p;
@@ -9977,6 +9998,7 @@ lpfc_sli4_pci_mem_setup(struct lpfc_hba *phba)
 		if (!phba->sli4_hba.dpp_regs_memmap_p) {
 			dev_err(&pdev->dev,
 			   "ioremap failed for SLI4 HBA dpp registers.\n");
+			error = -ENOMEM;
 			goto out_iounmap_ctrl;
 		}
 		phba->pci_bar4_memmap_p = phba->sli4_hba.dpp_regs_memmap_p;
@@ -10007,7 +10029,7 @@ out_iounmap_ctrl:
 	iounmap(phba->sli4_hba.ctrl_regs_memmap_p);
 out_iounmap_conf:
 	iounmap(phba->sli4_hba.conf_regs_memmap_p);
-out:
+
 	return error;
 }
 
@@ -11281,26 +11303,44 @@ lpfc_get_sli4_parameters(struct lpfc_hba *phba, LPFC_MBOXQ_t *mboxq)
 					   mbx_sli4_parameters);
 	phba->sli4_hba.extents_in_use = bf_get(cfg_ext, mbx_sli4_parameters);
 	phba->sli4_hba.rpi_hdrs_in_use = bf_get(cfg_hdrr, mbx_sli4_parameters);
-	phba->nvme_support = (bf_get(cfg_nvme, mbx_sli4_parameters) &&
-			      bf_get(cfg_xib, mbx_sli4_parameters));
 
-	if ((phba->cfg_enable_fc4_type == LPFC_ENABLE_FCP) ||
-	    !phba->nvme_support) {
-		phba->nvme_support = 0;
-		phba->nvmet_support = 0;
-		phba->cfg_nvmet_mrq = LPFC_NVMET_MRQ_OFF;
-		phba->cfg_nvme_io_channel = 0;
-		phba->io_channel_irqs = phba->cfg_fcp_io_channel;
-		lpfc_printf_log(phba, KERN_ERR, LOG_INIT | LOG_NVME,
-				"6101 Disabling NVME support: "
-				"Not supported by firmware: %d %d\n",
-				bf_get(cfg_nvme, mbx_sli4_parameters),
-				bf_get(cfg_xib, mbx_sli4_parameters));
+	/* Check for firmware nvme support */
+	rc = (bf_get(cfg_nvme, mbx_sli4_parameters) &&
+		     bf_get(cfg_xib, mbx_sli4_parameters));
 
-		/* If firmware doesn't support NVME, just use SCSI support */
-		if (!(phba->cfg_enable_fc4_type & LPFC_ENABLE_FCP))
-			return -ENODEV;
-		phba->cfg_enable_fc4_type = LPFC_ENABLE_FCP;
+	if (rc) {
+		/* Save this to indicate the Firmware supports NVME */
+		sli4_params->nvme = 1;
+
+		/* Firmware NVME support, check driver FC4 NVME support */
+		if (phba->cfg_enable_fc4_type == LPFC_ENABLE_FCP) {
+			lpfc_printf_log(phba, KERN_INFO, LOG_INIT | LOG_NVME,
+					"6133 Disabling NVME support: "
+					"FC4 type not supported: x%x\n",
+					phba->cfg_enable_fc4_type);
+			goto fcponly;
+		}
+	} else {
+		/* No firmware NVME support, check driver FC4 NVME support */
+		sli4_params->nvme = 0;
+		if (phba->cfg_enable_fc4_type & LPFC_ENABLE_NVME) {
+			lpfc_printf_log(phba, KERN_ERR, LOG_INIT | LOG_NVME,
+					"6101 Disabling NVME support: Not "
+					"supported by firmware (%d %d) x%x\n",
+					bf_get(cfg_nvme, mbx_sli4_parameters),
+					bf_get(cfg_xib, mbx_sli4_parameters),
+					phba->cfg_enable_fc4_type);
+fcponly:
+			phba->nvme_support = 0;
+			phba->nvmet_support = 0;
+			phba->cfg_nvmet_mrq = 0;
+			phba->cfg_nvme_io_channel = 0;
+
+			/* If no FC4 type support, move to just SCSI support */
+			if (!(phba->cfg_enable_fc4_type & LPFC_ENABLE_FCP))
+				return -ENODEV;
+			phba->cfg_enable_fc4_type = LPFC_ENABLE_FCP;
+		}
 	}
 
 	/* Only embed PBDE for if_type 6, PBDE support requires xib be set */

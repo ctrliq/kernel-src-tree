@@ -939,6 +939,7 @@ enum perf_event_type {
 	PERF_RECORD_MAX,			/* non-ABI */
 };
 
+#define PERF_MAX_CONTEXTS_PER_STACK		8
 #define PERF_MAX_STACK_DEPTH		127
 
 enum perf_callchain_context {

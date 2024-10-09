@@ -192,7 +192,7 @@ static inline const void *choose_neigh_daddr(struct rt6_info *rt,
 					     struct sk_buff *skb,
 					     const void *daddr)
 {
-	struct in6_addr *p = &rt->rt6i_gateway;
+	const struct in6_addr *p = rt6_nexthop(rt, &in6addr_any);
 
 	if (!ipv6_addr_any(p))
 		return (const void *) p;

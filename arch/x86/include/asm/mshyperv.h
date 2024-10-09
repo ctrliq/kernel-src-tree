@@ -161,6 +161,7 @@ static inline void vmbus_signal_eom(struct hv_message *msg, u32 old_msg_type)
 void hyperv_callback_vector(void);
 #ifdef CONFIG_TRACING
 #define trace_hyperv_callback_vector hyperv_callback_vector
+#define trace_hv_stimer0_callback_vector hv_stimer0_callback_vector
 #endif
 void hyperv_vector_handler(struct pt_regs *regs);
 void hv_setup_vmbus_irq(void (*handler)(void));
@@ -170,6 +171,19 @@ void hv_setup_kexec_handler(void (*handler)(void));
 void hv_remove_kexec_handler(void);
 void hv_setup_crash_handler(void (*handler)(struct pt_regs *regs));
 void hv_remove_crash_handler(void);
+
+/*
+ * Routines for stimer0 Direct Mode handling.
+ * On x86/x64, there are no percpu actions to take.
+ */
+void hv_stimer0_vector_handler(struct pt_regs *regs);
+void hv_stimer0_callback_vector(void);
+int hv_setup_stimer0_irq(int *irq, int *vector, void (*handler)(void));
+void hv_remove_stimer0_irq(int irq);
+
+static inline void hv_enable_stimer0_percpu_irq(int irq) {}
+static inline void hv_disable_stimer0_percpu_irq(int irq) {}
+
 
 #if IS_ENABLED(CONFIG_HYPERV)
 extern struct clocksource *hyperv_cs;

@@ -117,18 +117,18 @@ MODULE_PARM_DESC(logging_level,
 
 
 static ushort max_sectors = 0xFFFF;
-module_param(max_sectors, ushort, 0);
+module_param(max_sectors, ushort, 0444);
 MODULE_PARM_DESC(max_sectors, "max sectors, range 64 to 32767  default=32767");
 
 
 static int missing_delay[2] = {-1, -1};
-module_param_array(missing_delay, int, NULL, 0);
+module_param_array(missing_delay, int, NULL, 0444);
 MODULE_PARM_DESC(missing_delay, " device missing delay , io missing delay");
 
 /* scsi-mid layer global parmeter is max_report_luns, which is 511 */
 #define MPT3SAS_MAX_LUN (16895)
 static int max_lun = MPT3SAS_MAX_LUN;
-module_param(max_lun, int, 0);
+module_param(max_lun, int, 0444);
 MODULE_PARM_DESC(max_lun, " max lun, default=16895 ");
 
 /* diag_buffer_enable is bitwise
@@ -139,17 +139,17 @@ MODULE_PARM_DESC(max_lun, " max lun, default=16895 ");
  * Either bit can be set, or both
  */
 static int diag_buffer_enable = -1;
-module_param(diag_buffer_enable, int, 0);
+module_param(diag_buffer_enable, int, 0444);
 MODULE_PARM_DESC(diag_buffer_enable,
 	" post diag buffers (TRACE=1/SNAPSHOT=2/EXTENDED=4/default=0)");
 static int disable_discovery = -1;
-module_param(disable_discovery, int, 0);
+module_param(disable_discovery, int, 0444);
 MODULE_PARM_DESC(disable_discovery, " disable discovery ");
 
 
 /* permit overriding the host protection capabilities mask (EEDP/T10 PI) */
 static int prot_mask = -1;
-module_param(prot_mask, int, 0);
+module_param(prot_mask, int, 0444);
 MODULE_PARM_DESC(prot_mask, " host protection capabilities mask, def=7 ");
 
 
@@ -10522,7 +10522,6 @@ _scsih_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		case MPI26_MFGPAGE_DEVID_HARD_SEC_3816:
 		case MPI26_MFGPAGE_DEVID_HARD_SEC_3916:
 			ioc->is_aero_ioc = ioc->is_gen35_ioc = 1;
-			mark_tech_preview("LSI MPT Fusion SAS 3.0 Device Driver", THIS_MODULE);
 			break;
 		default:
 			ioc->is_gen35_ioc = ioc->is_aero_ioc = 0;

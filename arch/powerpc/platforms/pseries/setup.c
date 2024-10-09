@@ -373,6 +373,9 @@ static void pseries_lpar_idle(void)
 		 * low power mode by cedeing processor to hypervisor
 		 */
 
+	if (!prep_irq_for_idle())
+		return;
+
 		/* Indicate to hypervisor that we are idle. */
 		get_lppaca()->idle = 1;
 
@@ -631,6 +634,7 @@ static void __init pSeries_setup_arch(void)
 
 	pseries_setup_rfi_flush();
 	setup_stf_barrier();
+	pseries_lpar_read_hblkrm_characteristics();
 
 	/* By default, only probe PCI (can be overriden by rtas_pci) */
 	pci_add_flags(PCI_PROBE_ONLY);

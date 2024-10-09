@@ -65,6 +65,27 @@ static inline void invpcid_flush_all_nonglobals(void)
 }
 
 #ifdef CONFIG_PAGE_TABLE_ISOLATION
+
+/*
+ * RHEL7 Only
+ */
+#ifdef CONFIG_EFI
+/*
+ * Test whether this is the EFI pgd_t CR3 value used for EFI runtime services
+ */
+static inline bool is_efi_pgd_cr3(unsigned long cr3)
+{
+	extern unsigned long efi_pgd_cr3;
+	return cr3 == efi_pgd_cr3;
+}
+#else
+
+static inline bool is_efi_pgd_cr3(unsigned long cr3)
+{
+	return false;
+}
+#endif
+
 static __always_inline void __load_cr3(unsigned long cr3)
 {
 	if (static_cpu_has(X86_FEATURE_PCID) && kaiser_active()) {
@@ -75,6 +96,19 @@ static __always_inline void __load_cr3(unsigned long cr3)
 
 		if (this_cpu_has(X86_FEATURE_INVPCID_SINGLE)) {
 			invpcid_flush_single_context(KAISER_SHADOW_PCID_ASID);
+			write_cr3(cr3);
+			return;
+		}
+
+		/*
+		 * RHEL7 Only
+		 * The EFI pgd, which maps UEFI runtime services code and data
+		 * in addition to kernel space but no userspace, does not have
+		 * a shadow pgd. This exclusion is "RHEL7 Only" because the
+		 * subsequent performance optimization for processors with the
+		 * PCID feature but without INVPCID_SINGLE is also RHEL7 only.
+		 */
+		if (is_efi_pgd_cr3(cr3)) {
 			write_cr3(cr3);
 			return;
 		}

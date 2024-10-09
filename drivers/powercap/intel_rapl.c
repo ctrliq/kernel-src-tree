@@ -1162,6 +1162,7 @@ static const struct x86_cpu_id rapl_ids[] __initconst = {
 	RAPL_CPU(INTEL_FAM6_KABYLAKE_DESKTOP,	rapl_defaults_core),
 	RAPL_CPU(INTEL_FAM6_CANNONLAKE_MOBILE,	rapl_defaults_core),
 	RAPL_CPU(INTEL_FAM6_ICELAKE_MOBILE,	rapl_defaults_core),
+	RAPL_CPU(INTEL_FAM6_ICELAKE_X,		rapl_defaults_hsw_server),
 
 	RAPL_CPU(INTEL_FAM6_ATOM_SILVERMONT,	rapl_defaults_byt),
 	RAPL_CPU(INTEL_FAM6_ATOM_AIRMONT,	rapl_defaults_cht),
@@ -1463,19 +1464,19 @@ static bool is_package_new(int package)
 static int rapl_detect_topology(void)
 {
 	int i;
-	int phy_package_id;
+	int id;
 	struct rapl_package *new_package, *rp;
 
 	for_each_online_cpu(i) {
-		phy_package_id = topology_physical_package_id(i);
-		if (is_package_new(phy_package_id)) {
+		id = topology_logical_die_id(i);
+		if (is_package_new(id)) {
 			new_package = kzalloc(sizeof(*rp), GFP_KERNEL);
 			if (!new_package) {
 				rapl_cleanup_data();
 				return -ENOMEM;
 			}
 			/* add the new package to the list */
-			new_package->id = phy_package_id;
+			new_package->id = id;
 			new_package->nr_cpus = 1;
 			/* use the first active cpu of the package to access */
 			new_package->lead_cpu = i;
@@ -1491,7 +1492,7 @@ static int rapl_detect_topology(void)
 			INIT_LIST_HEAD(&new_package->plist);
 			list_add(&new_package->plist, &rapl_packages);
 		} else {
-			rp = find_package_by_id(phy_package_id);
+			rp = find_package_by_id(id);
 			if (rp)
 				++rp->nr_cpus;
 		}
@@ -1523,15 +1524,15 @@ static void rapl_remove_package(struct rapl_package *rp)
 static int rapl_add_package(int cpu)
 {
 	struct rapl_package *rp;
-	int ret, phy_package_id;
+	int ret, id;
 
-	phy_package_id = topology_physical_package_id(cpu);
+	id = topology_logical_die_id(cpu);
 	rp = kzalloc(sizeof(struct rapl_package), GFP_KERNEL);
 	if (!rp)
 		return -ENOMEM;
 
 	/* add the new package to the list */
-	rp->id = phy_package_id;
+	rp->id = id;
 	rp->nr_cpus = 1;
 	rp->lead_cpu = cpu;
 
@@ -1565,11 +1566,11 @@ err_free_package:
 static int rapl_cpu_online(unsigned int cpu)
 {
 	struct rapl_package *rp;
-	int phy_package_id;
+	int id;
 
-	phy_package_id = topology_physical_package_id(cpu);
+	id = topology_logical_die_id(cpu);
 
-	rp = find_package_by_id(phy_package_id);
+	rp = find_package_by_id(id);
 	if (rp)
 		rp->nr_cpus++;
 	else
@@ -1579,12 +1580,12 @@ static int rapl_cpu_online(unsigned int cpu)
 
 static int rapl_cpu_down_prep(unsigned int cpu)
 {
-	int phy_package_id;
+	int id;
 	struct rapl_package *rp;
 	int lead_cpu;
 
-	phy_package_id = topology_physical_package_id(cpu);
-	rp = find_package_by_id(phy_package_id);
+	id = topology_logical_die_id(cpu);
+	rp = find_package_by_id(id);
 	if (!rp)
 		return 0;
 	if (--rp->nr_cpus == 0) {
@@ -1597,7 +1598,7 @@ static int rapl_cpu_down_prep(unsigned int cpu)
 		} else {
 			/* should never go here */
 			pr_err("no active cpu available for package %d\n",
-			       phy_package_id);
+			       id);
 		}
 	}
 	return 0;

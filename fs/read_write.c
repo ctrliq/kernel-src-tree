@@ -1394,12 +1394,15 @@ ssize_t vfs_copy_file_range(struct file *file_in, loff_t pos_in,
 	if (fop_out && fop_out->copy_file_range) {
 		ret = fop_out->copy_file_range(file_in, pos_in, file_out,
 						      pos_out, len, flags);
-		if (ret != -EOPNOTSUPP)
-			goto done;
+	} else {
+		/* Userspace callers all understand -ENOSYS */
+		ret = -ENOSYS;
 	}
 
+#if 0	/* splice is broken on RHEL7, don't allow this fallback, ENOSYS above */
 	ret = do_splice_direct(file_in, &pos_in, file_out, &pos_out,
 			len > MAX_RW_COUNT ? MAX_RW_COUNT : len, 0);
+#endif
 
 done:
 	if (ret > 0) {

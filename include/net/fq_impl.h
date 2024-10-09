@@ -224,6 +224,7 @@ static void fq_flow_filter(struct fq *fq,
 	fq_rejigger_backlog(fq, flow);
 }
 
+__maybe_unused /* RHEL: Avoid build error */
 static void fq_tin_filter(struct fq *fq,
 			  struct fq_tin *tin,
 			  fq_skb_filter_t filter_func,

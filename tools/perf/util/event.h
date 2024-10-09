@@ -807,6 +807,7 @@ void event_attr_init(struct perf_event_attr *attr);
 
 int perf_event_paranoid(void);
 
-extern unsigned int sysctl_perf_event_max_stack;
+extern int sysctl_perf_event_max_stack;
+extern int sysctl_perf_event_max_contexts_per_stack;
 
 #endif /* __PERF_RECORD_H */

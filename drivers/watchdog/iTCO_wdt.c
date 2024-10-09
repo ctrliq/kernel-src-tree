@@ -52,7 +52,7 @@
 
 /* Includes */
 #include <linux/acpi.h>			/* For ACPI support */
-#include <linux/bits.h>			/* For BIT() */
+#include <linux/bitops.h>			/* For BIT() */
 #include <linux/module.h>		/* For module specific items */
 #include <linux/moduleparam.h>		/* For new moduleparam's */
 #include <linux/types.h>		/* For standard types (like size_t) */

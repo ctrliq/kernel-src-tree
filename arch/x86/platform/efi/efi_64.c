@@ -31,6 +31,7 @@
 #include <linux/reboot.h>
 #include <linux/slab.h>
 #include <linux/mem_encrypt.h>
+#include <linux/sched/task.h>
 
 #include <asm/pgalloc.h>
 #include <asm/setup.h>
@@ -53,6 +54,14 @@
 static u64 efi_va = EFI_VA_START;
 
 struct efi_scratch efi_scratch;
+
+/*
+ * RHEL7 Only
+ * Saved value of CR3 value corresponding to efi_mm.pgd
+ * Used in __load_cr3() for special case handling when the processor has
+ * the PCID feature without INVPCID_SINGLE.
+ */
+unsigned long efi_pgd_cr3;
 
 static void __init early_code_mapping_set_exec(int executable)
 {
@@ -82,9 +91,8 @@ pgd_t * __init efi_call_phys_prolog(void)
 	int n_pgds, j;
 
 	if (!efi_enabled(EFI_OLD_MEMMAP)) {
-		save_pgd = (pgd_t *)read_cr3();
-		write_cr3((unsigned long)efi_scratch.efi_pgt);
-		goto out;
+		efi_switch_mm(&efi_mm);
+		return NULL;
 	}
 
 	early_code_mapping_set_exec(1);
@@ -122,7 +130,7 @@ pgd_t * __init efi_call_phys_prolog(void)
 			pud[j] = *pud_offset(pgd_k, vaddr);
 		}
 	}
-out:
+
 	__flush_tlb_all();
 
 	return save_pgd;
@@ -137,8 +145,7 @@ void __init efi_call_phys_epilog(pgd_t *save_pgd)
 	int nr_pgds;
 
 	if (!efi_enabled(EFI_OLD_MEMMAP)) {
-		write_cr3((unsigned long)save_pgd);
-		__flush_tlb_all();
+		efi_switch_mm(efi_scratch.prev_mm);
 		return;
 	}
 
@@ -153,7 +160,7 @@ void __init efi_call_phys_epilog(pgd_t *save_pgd)
 	early_code_mapping_set_exec(0);
 }
 
-static pgd_t *efi_pgd;
+EXPORT_SYMBOL_GPL(efi_mm);
 
 /*
  * We need our own copy of the higher levels of the page tables
@@ -163,7 +170,7 @@ static pgd_t *efi_pgd;
  */
 int __init efi_alloc_page_tables(void)
 {
-	pgd_t *pgd;
+	pgd_t *pgd, *efi_pgd;
 	pud_t *pud;
 	gfp_t gfp_mask;
 
@@ -185,6 +192,10 @@ int __init efi_alloc_page_tables(void)
 
 	pgd_populate(NULL, pgd, pud);
 
+	efi_mm.pgd = efi_pgd;
+	mm_init_cpumask(&efi_mm);
+	init_new_context(NULL, &efi_mm);
+
 	return 0;
 }
 
@@ -196,6 +207,7 @@ void efi_sync_low_kernel_mappings(void)
 	unsigned num_entries;
 	pgd_t *pgd_k, *pgd_efi;
 	pud_t *pud_k, *pud_efi;
+	pgd_t *efi_pgd = efi_mm.pgd;
 
 	if (efi_enabled(EFI_OLD_MEMMAP))
 		return;
@@ -246,18 +258,17 @@ int __init efi_setup_page_tables(unsigned long pa_memmap, unsigned num_pages)
 	unsigned long pfn, text, pf;
 	unsigned npages;
 	struct page *page;
-	pgd_t *pgd;
+	pgd_t *pgd = efi_mm.pgd;
 
 	if (efi_enabled(EFI_OLD_MEMMAP))
 		return 0;
 
 	/*
-	 * Since the PGD is encrypted, set the encryption mask so that when
-	 * this value is loaded into cr3 the PGD will be decrypted during
-	 * the pagetable walk.
+	 * RHEL7 Only
+	 * Used in __load_cr3() for special case handling when the processor has
+	 * the PCID feature without INVPCID_SINGLE.
 	 */
-	efi_scratch.efi_pgt = (pgd_t *)__sme_pa(efi_pgd);
-	pgd = efi_pgd;
+	efi_pgd_cr3 = __sme_pa(pgd);
 
 	/*
 	 * It can happen that the physical address of new_memmap lands in memory
@@ -271,8 +282,6 @@ int __init efi_setup_page_tables(unsigned long pa_memmap, unsigned num_pages)
 		pr_err("Error ident-mapping new memmap (0x%lx)!\n", pa_memmap);
 		return 1;
 	}
-
-	efi_scratch.use_pgd = true;
 
 	/*
 	 * When making calls to the firmware everything needs to be 1:1
@@ -306,7 +315,7 @@ static void __init __map_region(efi_memory_desc_t *md, u64 va)
 {
 	unsigned long flags = _PAGE_RW;
 	unsigned long pfn;
-	pgd_t *pgd = efi_pgd;
+	pgd_t *pgd = efi_mm.pgd;
 
 	if (!(md->attribute & EFI_MEMORY_WB))
 		flags |= _PAGE_PCD;
@@ -414,6 +423,20 @@ void __init efi_dump_pagetable(void)
 #endif
 }
 
+/*
+ * Makes the calling thread switch to/from efi_mm context. Can be used
+ * in a kernel thread and user context. Preemption needs to remain disabled
+ * while the EFI-mm is borrowed. mmgrab()/mmdrop() is not used because the mm
+ * can not change under us.
+ * It should be ensured that there are no concurent calls to this function.
+ */
+void efi_switch_mm(struct mm_struct *mm)
+{
+	efi_scratch.prev_mm = current->active_mm;
+	current->active_mm = mm;
+	switch_mm(efi_scratch.prev_mm, mm, NULL);
+}
+
 #ifdef CONFIG_EFI_MIXED
 extern efi_status_t efi64_thunk(u32, ...);
 
@@ -440,14 +463,15 @@ extern efi_status_t efi64_thunk(u32, ...);
 	efi_status_t __s;						\
 	unsigned long __flags;						\
 	u32 __func;							\
+	bool __ibrs_on;							\
 									\
 	local_irq_save(__flags);					\
-	arch_efi_call_virt_setup();					\
+	__ibrs_on = arch_efi_call_virt_setup();				\
 									\
 	__func = runtime_service32(f);					\
 	__s = efi64_thunk(__func, __VA_ARGS__);				\
 									\
-	arch_efi_call_virt_teardown();					\
+	arch_efi_call_virt_teardown(__ibrs_on);				\
 	local_irq_restore(__flags);					\
 									\
 	__s;								\
@@ -467,16 +491,13 @@ efi_status_t efi_thunk_set_virtual_address_map(
 	efi_sync_low_kernel_mappings();
 	local_irq_save(flags);
 
-	efi_scratch.prev_cr3 = read_cr3();
-	write_cr3((unsigned long)efi_scratch.efi_pgt);
-	__flush_tlb_all();
+	efi_switch_mm(&efi_mm);
 
 	func = (u32)(unsigned long)phys_set_virtual_address_map;
 	status = efi64_thunk(func, memory_map_size, descriptor_size,
 			     descriptor_version, virtual_map);
 
-	write_cr3(efi_scratch.prev_cr3);
-	__flush_tlb_all();
+	efi_switch_mm(efi_scratch.prev_mm);
 	local_irq_restore(flags);
 
 	return status;

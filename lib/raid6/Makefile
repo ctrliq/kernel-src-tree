@@ -1,3 +1,6 @@
+OBJECT_FILES_NON_STANDARD_avx512.o := y
+OBJECT_FILES_NON_STANDARD_recov_avx512.o := y
+
 obj-$(CONFIG_RAID6_PQ)	+= raid6_pq.o
 
 raid6_pq-y	+= algos.o recov.o tables.o int1.o int2.o int4.o \

@@ -47,6 +47,8 @@ For 32-bit we have the following conventions - kernel is built with
 */
 
 #include <asm/dwarf2.h>
+#include <asm/cpufeatures.h>
+#include <asm/nops.h>
 
 /*
  * 64-bit system call stack frame layout defines and helpers,
@@ -220,4 +222,40 @@ For 32-bit we have the following conventions - kernel is built with
 	.pushsection __unwind_unsafe_stack, "a"
 		.quad 417b
 	.popsection
+.endm
+
+/*
+ * Mitigate Spectre v1 for conditional swapgs code paths.
+ *
+ * FENCE_SWAPGS_USER_ENTRY is used in the user entry swapgs code path, to
+ * prevent a speculative swapgs when coming from kernel space.
+ *
+ * FENCE_SWAPGS_KERNEL_ENTRY is used in the kernel entry non-swapgs code path,
+ * to prevent the swapgs from getting speculatively skipped when coming from
+ * user space.
+ *
+ * RHEL7 uses gs-indexed per-cpu variables for dynamic PTI enabling/disabling.
+ * So that on/off state of PTI doesn't matter in determining if fencing should
+ * be used or not. We have to properly fence swapgs before the invocation
+ * of the PTI macros.
+ *
+ * RHEL7 also doesn't have the ALTERNATIVE asm macro. So we have to open-code
+ * it. The lfence instruction is 3 bytes long.
+ */
+ .macro _FENCE_SWAPGS feature
+	661: ASM_NOP3; 662:
+	.pushsection .altinstr_replacement, "ax"
+	663: lfence; 664:
+	.popsection
+	.pushsection .altinstructions, "a"
+	altinstruction_entry 661b, 663b, \feature, 662b-661b, 664b-663b
+	.popsection
+.endm
+
+.macro FENCE_SWAPGS_USER_ENTRY
+	_FENCE_SWAPGS X86_FEATURE_FENCE_SWAPGS_USER
+.endm
+
+.macro FENCE_SWAPGS_KERNEL_ENTRY
+	_FENCE_SWAPGS X86_FEATURE_FENCE_SWAPGS_KERNEL
 .endm

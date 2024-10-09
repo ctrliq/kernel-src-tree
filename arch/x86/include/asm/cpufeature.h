@@ -5,7 +5,6 @@
 #define _ASM_X86_CPUFEATURE_H
 
 #include <asm/processor.h>
-#define X86_FEATURE_INVPCID_SINGLE ( 7*32+ 7) /* Effectively INVPCID && CR4.PCIDE=1 */
 
 #if defined(__KERNEL__) && !defined(__ASSEMBLY__)
 

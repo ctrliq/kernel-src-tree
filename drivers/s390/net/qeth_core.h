@@ -157,6 +157,7 @@ struct qeth_perf_stats {
 	unsigned int sg_alloc_page_rx;
 	unsigned int tx_csum;
 	unsigned int tx_lin;
+	unsigned int rx_dropped_runt;
 };
 
 /* Routing stuff */
@@ -850,6 +851,14 @@ struct qeth_card {
 	int reclaim_index;
 	struct work_struct close_dev_work;
 };
+
+#define QETH_CARD_STAT_INC(__c, __stat)		\
+({						\
+	struct qeth_card *__card = __c;		\
+						\
+	if (__card->options.performance_stats)	\
+		(__card->perf_stats.__stat)++;	\
+})
 
 struct qeth_card_list_struct {
 	struct list_head list;

@@ -10,6 +10,7 @@
 
 #include <linux/mutex.h>
 #include <linux/module.h>
+#include <linux/sched.h>
 #include <linux/cpuidle.h>
 #include <linux/cpumask.h>
 #include <linux/clockchips.h>
@@ -217,6 +218,10 @@ static int __cpuidle_register_driver(struct cpuidle_driver *drv)
 	if (drv->bctimer)
 		on_each_cpu_mask(drv->cpumask, cpuidle_setup_broadcast_timer,
 				 (void *)CLOCK_EVT_NOTIFY_BROADCAST_ON, 1);
+
+#ifdef CONFIG_ARCH_HAS_CPU_RELAX
+	poll_idle_init(drv);
+#endif
 
 	return 0;
 }

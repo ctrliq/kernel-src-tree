@@ -607,7 +607,7 @@ nfsd4_get_nfs4_acl(struct svc_rqst *rqstp, struct dentry *dentry, struct nfs4_ac
 		flags = NFS4_ACL_DIR;
 	}
 
-	*acl = nfs4_acl_posix_to_nfsv4(pacl, dpacl, flags);
+	*acl = nfs4_acl_posix_to_nfsv4(dentry, pacl, dpacl, flags);
 	if (IS_ERR(*acl)) {
 		error = PTR_ERR(*acl);
 		*acl = NULL;
@@ -677,22 +677,6 @@ __be32 nfsd4_clone_file_range(struct file *src, u64 src_pos, struct file *dst,
 {
 	return nfserrno(vfs_clone_file_range(src, src_pos, dst, dst_pos,
 			count));
-}
-
-ssize_t nfsd_copy_file_range(struct file *src, u64 src_pos, struct file *dst,
-			     u64 dst_pos, u64 count)
-{
-
-	/*
-	 * Limit copy to 4MB to prevent indefinitely blocking an nfsd
-	 * thread and client rpc slot.  The choice of 4MB is somewhat
-	 * arbitrary.  We might instead base this on r/wsize, or make it
-	 * tunable, or use a time instead of a byte limit, or implement
-	 * asynchronous copy.  In theory a client could also recognize a
-	 * limit like this and pipeline multiple COPY requests.
-	 */
-	count = min_t(u64, count, 1 << 22);
-	return vfs_copy_file_range(src, src_pos, dst, dst_pos, count, 0);
 }
 
 __be32 nfsd4_vfs_fallocate(struct svc_rqst *rqstp, struct svc_fh *fhp,

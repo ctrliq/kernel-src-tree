@@ -5219,8 +5219,6 @@ static void raid5_align_endio(struct bio *bi, int error)
 	rdev_dec_pending(rdev, conf->mddev);
 
 	if (!error && uptodate) {
-		trace_block_bio_complete(bdev_get_queue(raid_bi->bi_bdev),
-					 raid_bi, 0);
 		bio_endio(raid_bi, 0);
 		if (atomic_dec_and_test(&conf->active_aligned_reads))
 			wake_up(&conf->wait_for_quiescent);
@@ -5623,8 +5621,8 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
 		if (ret == 0)
 			return true;
 		if (ret == -ENODEV) {
-			md_flush_request(mddev, bi);
-			return true;
+			if (md_flush_request(mddev, bi))
+				return true;
 		}
 		/* ret == -EAGAIN, fallback */
 		/*
@@ -7210,6 +7208,7 @@ static int raid5_run(struct mddev *mddev)
 	int i;
 	long long min_offset_diff = 0;
 	int first = 1;
+	bool no_sg_merge = false;
 
 	if (mddev_init_writes_pending(mddev) < 0)
 		return -ENOMEM;
@@ -7237,6 +7236,9 @@ static int raid5_run(struct mddev *mddev)
 		else if (!mddev->reshape_backwards &&
 			 diff > min_offset_diff)
 			min_offset_diff = diff;
+		if (test_bit(QUEUE_FLAG_NO_SG_MERGE,
+		    &bdev_get_queue(rdev->bdev)->queue_flags))
+			no_sg_merge = true;
 	}
 
 	if ((test_bit(MD_HAS_JOURNAL, &mddev->flags) || journal_dev) &&
@@ -7549,7 +7551,12 @@ static int raid5_run(struct mddev *mddev)
 		else
 			queue_flag_clear_unlocked(QUEUE_FLAG_DISCARD,
 						mddev->queue);
-
+		if (no_sg_merge)
+			queue_flag_set_unlocked(QUEUE_FLAG_NO_SG_MERGE,
+						mddev->queue);
+		else
+			queue_flag_clear_unlocked(QUEUE_FLAG_NO_SG_MERGE,
+						mddev->queue);
 		blk_queue_max_hw_sectors(mddev->queue, UINT_MAX);
 	}
 

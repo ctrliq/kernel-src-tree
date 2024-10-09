@@ -289,7 +289,7 @@ EXPORT_SYMBOL(panic);
 const struct taint_flag taint_flags[TAINT_FLAGS_COUNT] = {
 	{ 'P', 'G', true },	/* TAINT_PROPRIETARY_MODULE */
 	{ 'F', ' ', true },	/* TAINT_FORCED_MODULE */
-	{ 'S', ' ', false },	/* TAINT_CPU_OUT_OF_SPEC */
+	{ 'S', ' ', false },	/* TAINT_UNSAFE_SMP */
 	{ 'R', ' ', false },	/* TAINT_FORCED_RMMOD */
 	{ 'M', ' ', false },	/* TAINT_MACHINE_CHECK */
 	{ 'B', ' ', false },	/* TAINT_BAD_PAGE */

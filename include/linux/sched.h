@@ -1248,9 +1248,9 @@ struct sched_entity {
 #endif
 
 	RH_KABI_USE(1, struct sched_statistics *statistics)
+	RH_KABI_USE(2, int depth)
 
 	/* reserved for Red Hat */
-	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
 };

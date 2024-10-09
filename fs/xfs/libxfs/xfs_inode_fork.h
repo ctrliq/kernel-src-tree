@@ -172,4 +172,18 @@ static inline bool xfs_iext_peek_prev_extent(struct xfs_ifork *ifp,
 
 extern struct kmem_zone	*xfs_ifork_zone;
 
+typedef xfs_failaddr_t (*xfs_ifork_verifier_t)(struct xfs_inode *);
+
+struct xfs_ifork_ops {
+	xfs_ifork_verifier_t	verify_symlink;
+	xfs_ifork_verifier_t	verify_dir;
+	xfs_ifork_verifier_t	verify_attr;
+};
+extern struct xfs_ifork_ops	xfs_default_ifork_ops;
+
+xfs_failaddr_t xfs_ifork_verify_data(struct xfs_inode *ip,
+		struct xfs_ifork_ops *ops);
+xfs_failaddr_t xfs_ifork_verify_attr(struct xfs_inode *ip,
+		struct xfs_ifork_ops *ops);
+
 #endif	/* __XFS_INODE_FORK_H__ */

@@ -48,10 +48,14 @@ static long probe_kernel_write_odd(void *dst, const void *src, size_t size)
 	return rc ? rc : count;
 }
 
+static DEFINE_SPINLOCK(s390_kernel_write_lock);
+
 long probe_kernel_write(void *dst, const void *src, size_t size)
 {
+	unsigned long flags;
 	long copied = 0;
 
+	spin_lock_irqsave(&s390_kernel_write_lock, flags);
 	while (size) {
 		copied = probe_kernel_write_odd(dst, src, size);
 		if (copied < 0)
@@ -60,6 +64,7 @@ long probe_kernel_write(void *dst, const void *src, size_t size)
 		src += copied;
 		size -= copied;
 	}
+	spin_unlock_irqrestore(&s390_kernel_write_lock, flags);
 	return copied < 0 ? -EFAULT : 0;
 }
 

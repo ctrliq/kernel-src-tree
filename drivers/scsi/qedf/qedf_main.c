@@ -156,7 +156,8 @@ static void qedf_handle_link_update(struct work_struct *work)
 	    container_of(work, struct qedf_ctx, link_update.work);
 	int rc;
 
-	QEDF_INFO(&(qedf->dbg_ctx), QEDF_LOG_DISC, "Entered.\n");
+	QEDF_INFO(&qedf->dbg_ctx, QEDF_LOG_DISC, "Entered. link_state=%d.\n",
+		  atomic_read(&qedf->link_state));
 
 	if (atomic_read(&qedf->link_state) == QEDF_LINK_UP) {
 		rc = qedf_initiate_fipvlan_req(qedf);
@@ -194,7 +195,9 @@ static void qedf_handle_link_update(struct work_struct *work)
 		QEDF_INFO(&(qedf->dbg_ctx), QEDF_LOG_DISC,
 		    "Calling fcoe_ctlr_link_down().\n");
 		fcoe_ctlr_link_down(&qedf->ctlr);
-		qedf_wait_for_upload(qedf);
+		if (qedf_wait_for_upload(qedf) == false)
+			QEDF_ERR(&qedf->dbg_ctx,
+				 "Could not upload all sessions.\n");
 		/* Reset the number of FIP VLAN retries */
 		qedf->fipvlan_retries = qedf_fipvlan_retries;
 	}
@@ -758,7 +761,7 @@ static int qedf_eh_abort(struct scsi_cmnd *sc_cmd)
 			  io_req->xid);
 
 drop_rdata_kref:
-	kref_put(&rdata->kref, fc_rport_destroy);
+	kref_put(&rdata->kref, lport->tt.rport_destroy);
 out:
 	if (got_ref)
 		kref_put(&io_req->refcount, qedf_release_cmd);
@@ -781,22 +784,44 @@ static int qedf_eh_device_reset(struct scsi_cmnd *sc_cmd)
 	return qedf_initiate_tmf(sc_cmd, FCP_TMF_LUN_RESET);
 }
 
-void qedf_wait_for_upload(struct qedf_ctx *qedf)
+bool qedf_wait_for_upload(struct qedf_ctx *qedf)
 {
-	while (1) {
+	struct qedf_rport *fcport = NULL;
+	int wait_cnt = 120;
+
+	while (wait_cnt--) {
 		if (atomic_read(&qedf->num_offloads))
-			QEDF_INFO(&(qedf->dbg_ctx), QEDF_LOG_DISC,
-			    "Waiting for all uploads to complete.\n");
+			QEDF_INFO(&qedf->dbg_ctx, QEDF_LOG_DISC,
+				  "Waiting for all uploads to complete num_offloads = 0x%x.\n",
+				  atomic_read(&qedf->num_offloads));
 		else
-			break;
+			return true;
 		msleep(500);
 	}
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(fcport, &qedf->fcports, peers) {
+		if (fcport && test_bit(QEDF_RPORT_SESSION_READY,
+				       &fcport->flags)) {
+			if (fcport->rdata)
+				QEDF_ERR(&qedf->dbg_ctx,
+					 "Waiting for fcport %p portid=%06x.\n",
+					 fcport, fcport->rdata->ids.port_id);
+			} else {
+				QEDF_ERR(&qedf->dbg_ctx,
+					 "Waiting for fcport %p.\n", fcport);
+			}
+	}
+	rcu_read_unlock();
+	return false;
+
 }
 
 /* Performs soft reset of qedf_ctx by simulating a link down/up */
-static void qedf_ctx_soft_reset(struct fc_lport *lport)
+void qedf_ctx_soft_reset(struct fc_lport *lport)
 {
 	struct qedf_ctx *qedf;
+	struct qed_link_output if_link;
 
 	if (lport->vport) {
 		QEDF_ERR(NULL, "Cannot issue host reset on NPIV port.\n");
@@ -807,11 +832,32 @@ static void qedf_ctx_soft_reset(struct fc_lport *lport)
 
 	/* For host reset, essentially do a soft link up/down */
 	atomic_set(&qedf->link_state, QEDF_LINK_DOWN);
+	QEDF_INFO(&qedf->dbg_ctx, QEDF_LOG_DISC,
+		  "Queuing link down work.\n");
 	queue_delayed_work(qedf->link_update_wq, &qedf->link_update,
 	    0);
-	qedf_wait_for_upload(qedf);
+
+	if (qedf_wait_for_upload(qedf) == false) {
+		QEDF_ERR(&qedf->dbg_ctx, "Could not upload all sessions.\n");
+		WARN_ON(atomic_read(&qedf->num_offloads));
+	}
+
+	/* Before setting link up query physical link state */
+	qed_ops->common->get_link(qedf->cdev, &if_link);
+	/* Bail if the physical link is not up */
+	if (!if_link.link_up) {
+		QEDF_INFO(&qedf->dbg_ctx, QEDF_LOG_DISC,
+			  "Physical link is not up.\n");
+		return;
+	}
+	/* Flush and wait to make sure link down is processed */
+	flush_delayed_work(&qedf->link_update);
+	msleep(500);
+
 	atomic_set(&qedf->link_state, QEDF_LINK_UP);
 	qedf->vlan_id  = 0;
+	QEDF_INFO(&qedf->dbg_ctx, QEDF_LOG_DISC,
+		  "Queue link up work.\n");
 	queue_delayed_work(qedf->link_update_wq, &qedf->link_update,
 	    0);
 }
@@ -976,8 +1022,10 @@ static int qedf_xmit(struct fc_lport *lport, struct fc_frame *fp)
 		    "Dropping FCoE frame to %06x.\n", ntoh24(fh->fh_d_id));
 		kfree_skb(skb);
 		rdata = lport->tt.rport_lookup(lport, ntoh24(fh->fh_d_id));
-		if (rdata)
+		if (rdata) {
 			rdata->retries = lport->max_rport_retry_count;
+			kref_put(&rdata->kref, lport->tt.rport_destroy);
+		}
 		return -EINVAL;
 	}
 	/* End NPIV filtering */
@@ -1297,6 +1345,8 @@ static void qedf_upload_connection(struct qedf_ctx *qedf,
 static void qedf_cleanup_fcport(struct qedf_ctx *qedf,
 	struct qedf_rport *fcport)
 {
+	struct fc_rport_priv *rdata = fcport->rdata;
+
 	QEDF_INFO(&(qedf->dbg_ctx), QEDF_LOG_CONN, "Cleaning up portid=%06x.\n",
 	    fcport->rdata->ids.port_id);
 
@@ -1308,6 +1358,7 @@ static void qedf_cleanup_fcport(struct qedf_ctx *qedf,
 	qedf_free_sq(qedf, fcport);
 	fcport->rdata = NULL;
 	fcport->qedf = NULL;
+	kref_put(&rdata->kref, qedf->lport->tt.rport_destroy);
 }
 
 /**
@@ -1383,6 +1434,8 @@ static void qedf_rport_event_handler(struct fc_lport *lport,
 			break;
 		}
 
+		/* Initial reference held on entry, so this can't fail */
+		kref_get(&rdata->kref);
 		fcport->rdata = rdata;
 		fcport->rport = rport;
 
@@ -1728,6 +1781,7 @@ static int qedf_vport_create(struct fc_vport *vport, bool disabled)
 	fc_exch_init(vn_port);
 	fc_elsct_init(vn_port);
 	fc_lport_init(vn_port);
+	fc_rport_init(vn_port);
 	fc_disc_init(vn_port);
 	fc_disc_config(vn_port, vn_port);
 
@@ -3465,7 +3519,9 @@ static void __qedf_remove(struct pci_dev *pdev, int mode)
 		fcoe_ctlr_link_down(&qedf->ctlr);
 	else
 		fc_fabric_logoff(qedf->lport);
-	qedf_wait_for_upload(qedf);
+
+	if (qedf_wait_for_upload(qedf) == false)
+		QEDF_ERR(&qedf->dbg_ctx, "Could not upload all sessions.\n");
 
 #ifdef CONFIG_DEBUG_FS
 	qedf_dbg_host_exit(&(qedf->dbg_ctx));

@@ -9,6 +9,7 @@
 #include <linux/sched.h>
 #include <linux/node.h>
 #include <linux/fs.h>
+#include <linux/mm.h>
 #include <linux/atomic.h>
 #include <linux/page-flags.h>
 #include <asm/page.h>
@@ -283,6 +284,7 @@ struct swap_info_struct {
 	RH_KABI_EXTEND(struct work_struct discard_work) /* discard worker */
 	RH_KABI_EXTEND(struct swap_cluster_list discard_clusters) /* discard clusters list */
 	RH_KABI_EXTEND(struct percpu_cluster __percpu *percpu_cluster) /* per cpu's swap location */
+	RH_KABI_EXTEND(spinlock_t cont_lock) /* protect swap count continuation page list. */
 };
 
 #ifdef CONFIG_64BIT
@@ -480,15 +482,8 @@ extern struct page *__read_swap_cache_async(swp_entry_t, gfp_t,
 			bool *new_page_allocated);
 extern struct page *swapin_readahead(swp_entry_t, gfp_t,
 			struct vm_area_struct *vma, unsigned long addr);
-
-extern struct page *swap_readahead_detect(struct vm_area_struct *vma,
-					  struct vma_swap_readahead *swap_ra,
-					  pte_t *page_table, pte_t orig_pte,
-					  unsigned long address);
 extern struct page *do_swap_page_readahead(swp_entry_t fentry, gfp_t gfp_mask,
-					   struct vm_area_struct *vma,
-					   unsigned long address,
-					   struct vma_swap_readahead *swap_ra);
+					   struct vm_fault *vmf);
 
 /* linux/mm/swapfile.c */
 extern atomic_long_t nr_swap_pages;
@@ -607,17 +602,8 @@ static inline bool swap_use_vma_readahead(void)
 	return false;
 }
 
-static inline struct page *swap_readahead_detect(
-	struct vm_area_struct *vma, struct vma_swap_readahead *swap_ra,
-	pte_t *page_table, pte_t orig_pte, unsigned long address)
-{
-	return NULL;
-}
-
-static inline struct page *do_swap_page_readahead(
-	swp_entry_t fentry, gfp_t gfp_mask,
-	struct vm_area_struct *vma, unsigned long address,
-	struct vma_swap_readahead *swap_ra)
+static inline struct page *do_swap_page_readahead(swp_entry_t fentry,
+				gfp_t gfp_mask, struct vm_fault *vmf)
 {
 	return NULL;
 }

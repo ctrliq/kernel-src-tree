@@ -1026,6 +1026,7 @@ extern void perf_callchain_kernel(struct perf_callchain_entry *entry, struct pt_
 extern struct perf_callchain_entry *
 get_perf_callchain(struct pt_regs *regs, u32 init_nr, bool kernel, bool user,
 		   bool crosstask, bool add_mark);
+extern struct perf_callchain_entry *perf_callchain(struct perf_event *event, struct pt_regs *regs);
 extern int get_callchain_buffers(void);
 extern void put_callchain_buffers(void);
 

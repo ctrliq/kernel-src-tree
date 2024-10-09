@@ -282,7 +282,7 @@
 #define __NR_finit_module	344
 #define __NR_sched_setattr 345
 #define __NR_sched_getattr 346
-/* Number 347 is reserved for sys_renameat2 */
+#define __NR_renameat2		347
 #define __NR_seccomp		348
 #define __NR_getrandom		349
 #define __NR_memfd_create	350

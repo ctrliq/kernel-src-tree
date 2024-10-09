@@ -17,6 +17,7 @@
 #include <net/tc_act/tc_mirred.h>
 #include <net/tc_act/tc_vlan.h>
 #include <net/tc_act/tc_tunnel_key.h>
+#include <net/vxlan.h>
 
 #include "bnxt_hsi.h"
 #include "bnxt.h"
@@ -1639,6 +1640,139 @@ int bnxt_tc_setup_flower(struct bnxt *bp, u16 src_fid,
 	}
 }
 
+static int bnxt_tc_setup_indr_block_cb(enum tc_setup_type type,
+				       void *type_data, void *cb_priv)
+{
+	struct bnxt_flower_indr_block_cb_priv *priv = cb_priv;
+	struct tc_cls_flower_offload *flower = type_data;
+	struct bnxt *bp = priv->bp;
+
+	if (flower->common.chain_index)
+		return -EOPNOTSUPP;
+
+	switch (type) {
+	case TC_SETUP_CLSFLOWER:
+		return bnxt_tc_setup_flower(bp, bp->pf.fw_fid, flower);
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static struct bnxt_flower_indr_block_cb_priv *
+bnxt_tc_indr_block_cb_lookup(struct bnxt *bp, struct net_device *netdev)
+{
+	struct bnxt_flower_indr_block_cb_priv *cb_priv;
+
+	/* All callback list access should be protected by RTNL. */
+	ASSERT_RTNL();
+
+	list_for_each_entry(cb_priv, &bp->tc_indr_block_list, list)
+		if (cb_priv->tunnel_netdev == netdev)
+			return cb_priv;
+
+	return NULL;
+}
+
+static void bnxt_tc_setup_indr_rel(void *cb_priv)
+{
+	struct bnxt_flower_indr_block_cb_priv *priv = cb_priv;
+
+	list_del(&priv->list);
+	kfree(priv);
+}
+
+static int bnxt_tc_setup_indr_block(struct net_device *netdev, struct bnxt *bp,
+				    struct tc_block_offload *f)
+{
+	struct bnxt_flower_indr_block_cb_priv *cb_priv;
+	int err;
+
+	if (f->binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
+		return -EOPNOTSUPP;
+
+	switch (f->command) {
+	case TC_BLOCK_BIND:
+		cb_priv = kmalloc(sizeof(*cb_priv), GFP_KERNEL);
+		if (!cb_priv)
+			return -ENOMEM;
+
+		cb_priv->tunnel_netdev = netdev;
+		cb_priv->bp = bp;
+		list_add(&cb_priv->list, &bp->tc_indr_block_list);
+
+		err = tcf_block_cb_register(f->block,
+					    bnxt_tc_setup_indr_block_cb,
+					    cb_priv,
+					    cb_priv);
+		if (err) {
+			bnxt_tc_setup_indr_rel(cb_priv);
+			return err;
+		}
+		break;
+	case TC_BLOCK_UNBIND:
+		cb_priv = bnxt_tc_indr_block_cb_lookup(bp, netdev);
+		if (!cb_priv)
+			return -ENOENT;
+
+		tcf_block_cb_unregister(f->block,
+                                       bnxt_tc_setup_indr_block_cb, cb_priv);
+		bnxt_tc_setup_indr_rel(cb_priv);
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+	return 0;
+}
+
+static int bnxt_tc_setup_indr_cb(struct net_device *netdev, void *cb_priv,
+				 enum tc_setup_type type, void *type_data)
+{
+	switch (type) {
+	case TC_SETUP_BLOCK:
+		return bnxt_tc_setup_indr_block(netdev, cb_priv, type_data);
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static bool bnxt_is_netdev_indr_offload(struct net_device *netdev)
+{
+	return netif_is_vxlan(netdev);
+}
+
+static int bnxt_tc_indr_block_event(struct notifier_block *nb,
+				    unsigned long event, void *ptr)
+{
+	struct net_device *netdev;
+	struct bnxt *bp;
+	int rc;
+
+	netdev = netdev_notifier_info_to_dev(ptr);
+	if (!bnxt_is_netdev_indr_offload(netdev))
+		return NOTIFY_OK;
+
+	bp = container_of(nb, struct bnxt, tc_netdev_nb);
+
+	switch (event) {
+	case NETDEV_REGISTER:
+		rc = __tc_indr_block_cb_register(netdev, bp,
+						 bnxt_tc_setup_indr_cb,
+						 netdev);
+		if (rc)
+			netdev_info(bp->dev,
+				    "Failed to register indirect blk: dev: %s",
+				    netdev->name);
+		break;
+	case NETDEV_UNREGISTER:
+		__tc_indr_block_cb_unregister(netdev,
+					      bnxt_tc_setup_indr_cb,
+					      netdev);
+		break;
+	}
+
+	return NOTIFY_OK;
+}
+
 static const struct rhashtable_params bnxt_tc_flow_ht_params = {
 	.head_offset = offsetof(struct bnxt_tc_flow_node, node),
 	.key_offset = offsetof(struct bnxt_tc_flow_node, cookie),
@@ -1722,7 +1856,15 @@ int bnxt_init_tc(struct bnxt *bp)
 	bp->dev->hw_features |= NETIF_F_HW_TC;
 	bp->dev->features |= NETIF_F_HW_TC;
 	bp->tc_info = tc_info;
-	return 0;
+
+	/* init indirect block notifications */
+	INIT_LIST_HEAD(&bp->tc_indr_block_list);
+	bp->tc_netdev_nb.notifier_call = bnxt_tc_indr_block_event;
+	rc = register_netdevice_notifier_rh(&bp->tc_netdev_nb);
+	if (!rc)
+		return 0;
+
+	rhashtable_destroy(&tc_info->encap_table);
 
 destroy_decap_table:
 	rhashtable_destroy(&tc_info->decap_table);
@@ -1744,6 +1886,7 @@ void bnxt_shutdown_tc(struct bnxt *bp)
 	if (!bnxt_tc_flower_enabled(bp))
 		return;
 
+	unregister_netdevice_notifier_rh(&bp->tc_netdev_nb);
 	rhashtable_destroy(&tc_info->flow_table);
 	rhashtable_destroy(&tc_info->l2_table);
 	rhashtable_destroy(&tc_info->decap_l2_table);

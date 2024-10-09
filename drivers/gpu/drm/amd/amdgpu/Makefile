@@ -1,3 +1,5 @@
+OBJECT_FILES_NON_STANDARD_vi.o := y
+
 #
 # Copyright 2017 Advanced Micro Devices, Inc.
 #

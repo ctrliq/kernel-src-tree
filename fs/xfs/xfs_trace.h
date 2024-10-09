@@ -384,7 +384,7 @@ DEFINE_BUF_FLAGS_EVENT(xfs_buf_get);
 DEFINE_BUF_FLAGS_EVENT(xfs_buf_read);
 
 TRACE_EVENT(xfs_buf_ioerror,
-	TP_PROTO(struct xfs_buf *bp, int error, unsigned long caller_ip),
+	TP_PROTO(struct xfs_buf *bp, int error, xfs_failaddr_t caller_ip),
 	TP_ARGS(bp, error, caller_ip),
 	TP_STRUCT__entry(
 		__field(dev_t, dev)
@@ -395,7 +395,7 @@ TRACE_EVENT(xfs_buf_ioerror,
 		__field(int, pincount)
 		__field(unsigned, lockval)
 		__field(int, error)
-		__field(unsigned long, caller_ip)
+		__field(xfs_failaddr_t, caller_ip)
 	),
 	TP_fast_assign(
 		__entry->dev = bp->b_target->bt_dev;
@@ -409,7 +409,7 @@ TRACE_EVENT(xfs_buf_ioerror,
 		__entry->caller_ip = caller_ip;
 	),
 	TP_printk("dev %d:%d bno 0x%llx len 0x%zx hold %d pincount %d "
-		  "lock %d error %d flags %s caller %ps",
+		  "lock %d error %d flags %s caller %pS",
 		  MAJOR(__entry->dev), MINOR(__entry->dev),
 		  (unsigned long long)__entry->bno,
 		  __entry->buffer_length,
@@ -436,7 +436,7 @@ DECLARE_EVENT_CLASS(xfs_buf_item_class,
 		__field(int, bli_refcount)
 		__field(unsigned, bli_flags)
 		__field(void *, li_desc)
-		__field(unsigned, li_flags)
+		__field(unsigned long, li_flags)
 	),
 	TP_fast_assign(
 		__entry->dev = bip->bli_buf->b_target->bt_dev;
@@ -483,7 +483,6 @@ DEFINE_BUF_ITEM_EVENT(xfs_buf_item_pin);
 DEFINE_BUF_ITEM_EVENT(xfs_buf_item_unpin);
 DEFINE_BUF_ITEM_EVENT(xfs_buf_item_unpin_stale);
 DEFINE_BUF_ITEM_EVENT(xfs_buf_item_unlock);
-DEFINE_BUF_ITEM_EVENT(xfs_buf_item_unlock_stale);
 DEFINE_BUF_ITEM_EVENT(xfs_buf_item_committed);
 DEFINE_BUF_ITEM_EVENT(xfs_buf_item_push);
 DEFINE_BUF_ITEM_EVENT(xfs_trans_get_buf);
@@ -1009,7 +1008,7 @@ DECLARE_EVENT_CLASS(xfs_log_item_class,
 		__field(dev_t, dev)
 		__field(void *, lip)
 		__field(uint, type)
-		__field(uint, flags)
+		__field(unsigned long, flags)
 		__field(xfs_lsn_t, lsn)
 	),
 	TP_fast_assign(
@@ -1061,7 +1060,7 @@ DECLARE_EVENT_CLASS(xfs_ail_class,
 		__field(dev_t, dev)
 		__field(void *, lip)
 		__field(uint, type)
-		__field(uint, flags)
+		__field(unsigned long, flags)
 		__field(xfs_lsn_t, old_lsn)
 		__field(xfs_lsn_t, new_lsn)
 	),

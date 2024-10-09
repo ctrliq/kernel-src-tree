@@ -88,7 +88,17 @@ static int tcf_sample_init(struct net *net, struct nlattr *nla,
 		tcf_idr_release(*a, bind);
 		return -ENOMEM;
 	}
-	RCU_INIT_POINTER(s->psample_group, psample_group);
+	/*
+	 * RHEL: open-code rcu_swap_protected(). Unlike upstream linux, that
+	 * uses action spinlock, here read/update is protected by RTNL lock.
+	 */
+	do {
+		struct psample_group *tmp = rtnl_dereference(s->psample_group);
+
+		rcu_assign_pointer(s->psample_group, psample_group);
+		if (tmp)
+			psample_group_put(tmp);
+	} while(0);
 
 	if (tb[TCA_SAMPLE_TRUNC_SIZE]) {
 		s->truncate = true;

@@ -1889,7 +1889,11 @@ ceph_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
 	struct inode *inode = file_inode(out);
 	struct ceph_inode_info *ci = ceph_inode(inode);
 	struct ceph_file_info *fi = out->private_data;
+	struct ceph_cap_flush *prealloc_cf;
 	int got, want;
+
+	if (ci->i_inline_version == CEPH_INLINE_NONE)
+		return default_file_splice_write(pipe, out, ppos, len, flags);
 
 	if (fi->fmode & CEPH_FILE_MODE_LAZY)
 		want = CEPH_CAP_FILE_BUFFER | CEPH_CAP_FILE_LAZYIO;
@@ -1905,8 +1909,28 @@ ceph_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
 		return default_file_splice_write(pipe, out, ppos, len, flags);
 	}
 
+	prealloc_cf = ceph_alloc_cap_flush();
+	if (!prealloc_cf) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
 	ret = generic_file_splice_write(pipe, out, ppos, len, flags);
+	if (ret >= 0) {
+		int dirty;
+		spin_lock(&ci->i_ceph_lock);
+		ci->i_inline_version = CEPH_INLINE_NONE;
+		dirty = __ceph_mark_dirty_caps(ci, CEPH_CAP_FILE_WR,
+					       &prealloc_cf);
+		spin_unlock(&ci->i_ceph_lock);
+		if (dirty)
+			__mark_inode_dirty(inode, dirty);
+		if (ceph_quota_is_max_bytes_approaching(inode, *ppos))
+			ceph_check_caps(ci, CHECK_CAPS_NODELAY, NULL);
+	}
+out:
 	ceph_put_cap_refs(ci, got);
+	ceph_free_cap_flush(prealloc_cf);
 	return ret;
 }
 

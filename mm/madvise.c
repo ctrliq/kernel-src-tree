@@ -624,6 +624,7 @@ static int madvise_hwpoison(int bhv, unsigned long start, unsigned long end)
 		return -EPERM;
 	for (; start < end; start += PAGE_SIZE <<
 				compound_order(compound_head(p))) {
+		unsigned long pfn;
 		int ret = get_user_pages_fast(start, 1, 0, &p);
 		if (ret != 1)
 			return ret;
@@ -631,17 +632,27 @@ static int madvise_hwpoison(int bhv, unsigned long start, unsigned long end)
 			put_page(p);
 			continue;
 		}
+		pfn = page_to_pfn(p);
 		if (bhv == MADV_SOFT_OFFLINE) {
 			printk(KERN_INFO "Soft offlining page %lx at %lx\n",
-				page_to_pfn(p), start);
+				pfn, start);
 			ret = soft_offline_page(p, MF_COUNT_INCREASED);
 			if (ret)
 				break;
 			continue;
 		}
+
 		printk(KERN_INFO "Injecting memory failure for page %lx at %lx\n",
-		       page_to_pfn(p), start);
-		ret = memory_failure(page_to_pfn(p), 0, MF_COUNT_INCREASED);
+		       pfn, start);
+
+		/*
+		 * Drop the page reference taken by get_user_pages_fast(). In
+		 * the absence of MF_COUNT_INCREASED the memory_failure()
+		 * routine is responsible for pinning the page to prevent it
+		 * from being released back to the page allocator.
+		 */
+		put_page(p);
+		ret = memory_failure(pfn, 0, 0);
 		if (ret)
 			return ret;
 	}

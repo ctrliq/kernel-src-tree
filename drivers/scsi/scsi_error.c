@@ -248,6 +248,9 @@ int scsi_eh_scmd_add(struct scsi_cmnd *scmd, int eh_flag)
 	scmd->eh_eflags |= eh_flag;
 	list_add_tail(&scmd->eh_entry, &shost->eh_cmd_q);
 	shost->host_failed++;
+
+	mb();
+
 	scsi_eh_wakeup(shost);
  out_unlock:
 	spin_unlock_irqrestore(shost->host_lock, flags);
@@ -410,6 +413,12 @@ static void scsi_report_sense(struct scsi_device *sdev,
 				    "Warning! Received an indication that the "
 				    "LUN reached a thin provisioning soft "
 				    "threshold.\n");
+		}
+
+		if (sshdr->asc == 0x29) {
+			evt_type = SDEV_EVT_POWER_ON_RESET_OCCURRED;
+			sdev_printk(KERN_WARNING, sdev,
+				    "Power-on or device reset occurred\n");
 		}
 
 		if (sshdr->asc == 0x2a && sshdr->ascq == 0x01) {

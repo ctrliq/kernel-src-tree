@@ -102,7 +102,8 @@ xfs_inode_free_callback(
 		xfs_idestroy_fork(ip, XFS_ATTR_FORK);
 
 	if (ip->i_itemp) {
-		ASSERT(!(ip->i_itemp->ili_item.li_flags & XFS_LI_IN_AIL));
+		ASSERT(!test_bit(XFS_LI_IN_AIL,
+				 &ip->i_itemp->ili_item.li_flags));
 		xfs_inode_item_destroy(ip);
 		ip->i_itemp = NULL;
 	}
@@ -510,6 +511,11 @@ xfs_iget_cache_miss(
 	error = xfs_iread(mp, tp, ip, flags);
 	if (error)
 		goto out_destroy;
+
+	if (!xfs_inode_verify_forks(ip)) {
+		error = -EFSCORRUPTED;
+		goto out_destroy;
+	}
 
 	trace_xfs_iget_miss(ip);
 

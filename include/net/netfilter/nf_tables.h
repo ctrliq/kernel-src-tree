@@ -260,7 +260,7 @@ enum nft_set_class {
  *	@class: lookup performance class
  */
 struct nft_set_estimate {
-	unsigned int		size;
+	u64			size;
 	enum nft_set_class	class;
 };
 
@@ -312,7 +312,7 @@ struct nft_set_ops {
 						struct nft_set *set,
 						struct nft_set_iter *iter);
 
-	unsigned int			(*privsize)(const struct nlattr * const nla[]);
+	u64				(*privsize)(const struct nlattr * const nla[]);
 	bool				(*estimate)(const struct nft_set_desc *desc,
 						    u32 features,
 						    struct nft_set_estimate *est);
@@ -570,7 +570,8 @@ void *nft_set_elem_init(const struct nft_set *set,
 			const struct nft_set_ext_tmpl *tmpl,
 			const u32 *key, const u32 *data,
 			u64 timeout, gfp_t gfp);
-void nft_set_elem_destroy(const struct nft_set *set, void *elem);
+void nft_set_elem_destroy(const struct nft_set *set, void *elem,
+			  bool destroy_expr);
 
 /**
  *	struct nft_set_gc_batch_head - nf_tables set garbage collection batch
@@ -721,7 +722,6 @@ static inline int nft_expr_clone(struct nft_expr *dst, struct nft_expr *src)
 {
 	int err;
 
-	__module_get(src->ops->type->owner);
 	if (src->ops->clone) {
 		dst->ops = src->ops;
 		err = src->ops->clone(dst, src);
@@ -730,6 +730,8 @@ static inline int nft_expr_clone(struct nft_expr *dst, struct nft_expr *src)
 	} else {
 		memcpy(dst, src, src->ops->size);
 	}
+
+	__module_get(src->ops->type->owner);
 	return 0;
 }
 

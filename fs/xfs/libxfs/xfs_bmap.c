@@ -1255,11 +1255,15 @@ xfs_iread_extents(
 		 */
 		frp = XFS_BMBT_REC_ADDR(mp, block, 1);
 		for (j = 0; j < num_recs; j++, frp++, i++) {
+			xfs_failaddr_t	fa;
+
 			xfs_bmbt_disk_get_all(frp, &new);
-			if (!xfs_bmbt_validate_extent(mp, whichfork, &new)) {
-				XFS_ERROR_REPORT("xfs_bmap_read_extents(2)",
-						 XFS_ERRLEVEL_LOW, mp);
+			fa = xfs_bmap_validate_extent(ip, whichfork, &new);
+			if (fa) {
 				error = -EFSCORRUPTED;
+				xfs_inode_verifier_error(ip, error,
+						"xfs_iread_extents(2)",
+						frp, sizeof(*frp), fa);
 				goto out_brelse;
 			}
 			xfs_iext_insert(ip, &icur, &new, state);
@@ -3785,6 +3789,19 @@ xfs_bmapi_read(
 
 	ifp = XFS_IFORK_PTR(ip, whichfork);
 
+	if (!ifp) {
+		/*
+		 * A missing attr ifork implies that the inode says we're in
+		 * extents or btree format but failed to pass the inode fork
+		 * verifier while trying to load it.  Treat that as a file
+		 * corruption too.
+		 */
+#ifdef DEBUG
+		xfs_alert(mp, "%s: inode %llu missing fork %d",
+				__func__, ip->i_ino, whichfork);
+#endif /* DEBUG */
+		return -EFSCORRUPTED;
+	}
 	if (!(ifp->if_flags & XFS_IFEXTENTS)) {
 		error = xfs_iread_extents(NULL, ip, whichfork);
 		if (error)
@@ -5739,4 +5756,40 @@ out:
 	xfs_defer_cancel(&dfops);
 	xfs_trans_cancel(tp);
 	return error;
+}
+
+/* Check that an inode's extent does not have invalid flags or bad ranges. */
+xfs_failaddr_t
+xfs_bmap_validate_extent(
+	struct xfs_inode	*ip,
+	int			whichfork,
+	struct xfs_bmbt_irec	*irec)
+{
+	struct xfs_mount	*mp = ip->i_mount;
+	xfs_fsblock_t		endfsb;
+	bool			isrt;
+
+	isrt = XFS_IS_REALTIME_INODE(ip);
+	endfsb = irec->br_startblock + irec->br_blockcount - 1;
+	if (isrt) {
+		if (!xfs_verify_rtbno(mp, irec->br_startblock))
+			return __this_address;
+		if (!xfs_verify_rtbno(mp, endfsb))
+			return __this_address;
+	} else {
+		if (!xfs_verify_fsbno(mp, irec->br_startblock))
+			return __this_address;
+		if (!xfs_verify_fsbno(mp, endfsb))
+			return __this_address;
+		if (XFS_FSB_TO_AGNO(mp, irec->br_startblock) !=
+		    XFS_FSB_TO_AGNO(mp, endfsb))
+			return __this_address;
+	}
+	if (irec->br_state != XFS_EXT_NORM) {
+		if (whichfork != XFS_DATA_FORK)
+			return __this_address;
+		if (!xfs_sb_version_hasextflgbit(&mp->m_sb))
+			return __this_address;
+	}
+	return NULL;
 }

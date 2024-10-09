@@ -67,6 +67,7 @@ obj-$(CONFIG_PERF_EVENTS)	+= perf_event.o perf_cpum_cf.o perf_cpum_sf.o \
 						perf_cpum_cf_events.o
 obj-y				+= runtime_instr.o cache.o
 endif
+obj-$(CONFIG_PROTECTED_VIRTUALIZATION_GUEST)	+= uv.o
 
 # vdso
 obj-$(CONFIG_64BIT)		+= vdso64/

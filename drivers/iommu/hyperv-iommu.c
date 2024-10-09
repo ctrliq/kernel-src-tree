@@ -113,11 +113,24 @@ static int __init hyperv_enable_irq_remapping(void)
 	return IRQ_REMAP_X2APIC_MODE;
 }
 
+static int hyperv_msi_setup_irq(struct pci_dev *pdev, unsigned int irq,
+				int index, int sub_handle)
+{
+	return 0;
+}
+
+static int hyperv_msi_alloc_irq(struct pci_dev *dev, int irq, int nvec)
+{
+	return 0;
+}
+
 struct irq_remap_ops hyperv_irq_remap_ops = {
 	.prepare		= hyperv_prepare_irq_remapping,
 	.enable			= hyperv_enable_irq_remapping,
 	.set_affinity		= hyperv_ir_set_affinity,
 	.setup_ioapic_entry	= hyperv_ir_setup_ioapic_entry,
+	.msi_setup_irq          = hyperv_msi_setup_irq,
+	.msi_alloc_irq          = hyperv_msi_alloc_irq,
 };
 
 #endif

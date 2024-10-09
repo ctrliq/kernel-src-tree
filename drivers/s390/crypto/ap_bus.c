@@ -296,19 +296,37 @@ static inline int ap_test_config_card_id(unsigned int id)
 }
 
 /*
- * ap_test_config_domain(): Test, whether an AP usage domain is configured.
+ * ap_test_config_usage_domain(): Test, whether an AP usage domain
+ * is configured.
  * @domain AP usage domain ID
  *
  * Returns 0 if the usage domain is not configured
  *	   1 if the usage domain is configured or
  *	     if the configuration information is not available
  */
-static inline int ap_test_config_domain(unsigned int domain)
+int ap_test_config_usage_domain(unsigned int domain)
 {
 	if (!ap_configuration)	/* QCI not supported */
 		return domain < 16;
 	return ap_test_config(ap_configuration->aqm, domain);
 }
+EXPORT_SYMBOL(ap_test_config_usage_domain);
+
+/*
+ * ap_test_config_ctrl_domain(): Test, whether an AP control domain
+ * is configured.
+ * @domain AP control domain ID
+ *
+ * Returns 1 if the control domain is configured
+ *	   0 in all other cases
+ */
+int ap_test_config_ctrl_domain(unsigned int domain)
+{
+	if (!ap_configuration)	/* QCI not supported */
+		return 0;
+	return ap_test_config(ap_configuration->adm, domain);
+}
+EXPORT_SYMBOL(ap_test_config_ctrl_domain);
 
 /**
  * ap_query_queue(): Check if an AP queue is available.
@@ -1273,7 +1291,7 @@ static void ap_select_domain(void)
 	best_domain = -1;
 	max_count = 0;
 	for (i = 0; i < AP_DOMAINS; i++) {
-		if (!ap_test_config_domain(i) ||
+		if (!ap_test_config_usage_domain(i) ||
 		    !test_bit_inv(i, ap_perms.aqm))
 			continue;
 		count = 0;
@@ -1408,7 +1426,7 @@ static void ap_scan_bus(struct work_struct *unused)
 					      (void *)(long) qid,
 					      __match_queue_device_with_qid);
 			aq = dev ? to_ap_queue(dev) : NULL;
-			if (!ap_test_config_domain(dom)) {
+			if (!ap_test_config_usage_domain(dom)) {
 				if (dev) {
 					/* Queue device exists but has been
 					 * removed from configuration.
@@ -1512,7 +1530,8 @@ static void ap_reset_domain(void)
 {
 	int i;
 
-	if (ap_domain_index == -1 || !ap_test_config_domain(ap_domain_index))
+	if (ap_domain_index == -1
+	    || !ap_test_config_usage_domain(ap_domain_index))
 		return;
 	for (i = 0; i < AP_DEVICES; i++)
 		ap_rapq(AP_MKQID(i, ap_domain_index));
@@ -1523,7 +1542,7 @@ static void ap_reset_all(void)
 	int i, j;
 
 	for (i = 0; i < AP_DOMAINS; i++) {
-		if (!ap_test_config_domain(i))
+		if (!ap_test_config_usage_domain(i))
 			continue;
 		for (j = 0; j < AP_DEVICES; j++) {
 			if (!ap_test_config_card_id(j))

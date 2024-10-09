@@ -27,6 +27,7 @@
 #include <linux/if_vlan.h>
 #include <linux/slab.h>
 #include <linux/cpu.h>
+#include <net/net_failover.h>
 
 static int napi_weight = NAPI_POLL_WEIGHT;
 module_param(napi_weight, int, 0444);
@@ -132,6 +133,9 @@ struct virtnet_info {
 
 	/* Maximum allowed MTU */
 	u16 max_mtu;
+
+	/* failover when STANDBY feature enabled */
+	struct failover *failover;
 };
 
 struct padded_vnet_hdr {
@@ -882,6 +886,9 @@ static int virtnet_set_mac_address(struct net_device *dev, void *p)
 	struct sockaddr *addr = p;
 	struct scatterlist sg;
 
+	if (virtio_has_feature(vi->vdev, VIRTIO_NET_F_STANDBY))
+		return -EOPNOTSUPP;
+
 	ret = eth_prepare_mac_addr_change(dev, p);
 	if (ret)
 		return ret;
@@ -1284,6 +1291,22 @@ static u16 virtnet_select_queue(struct net_device *dev, struct sk_buff *skb,
 	return txq;
 }
 
+static int virtnet_get_phys_port_name(struct net_device *dev, char *buf,
+				      size_t len)
+{
+	struct virtnet_info *vi = netdev_priv(dev);
+	int ret;
+
+	if (!virtio_has_feature(vi->vdev, VIRTIO_NET_F_STANDBY))
+		return -EOPNOTSUPP;
+
+	ret = snprintf(buf, len, "sby");
+	if (ret >= len)
+		return -EOPNOTSUPP;
+
+	return 0;
+}
+
 static const struct net_device_ops virtnet_netdev = {
 	.ndo_open            = virtnet_open,
 	.ndo_stop   	     = virtnet_close,
@@ -1299,6 +1322,7 @@ static const struct net_device_ops virtnet_netdev = {
 	.ndo_poll_controller = virtnet_netpoll,
 #endif
 	.ndo_features_check	= passthru_features_check,
+	.extended.ndo_get_phys_port_name	= virtnet_get_phys_port_name,
 };
 
 static void virtnet_config_changed_work(struct work_struct *work)
@@ -1676,10 +1700,18 @@ static int virtnet_probe(struct virtio_device *vdev)
 	netif_set_real_num_tx_queues(dev, vi->curr_queue_pairs);
 	netif_set_real_num_rx_queues(dev, vi->curr_queue_pairs);
 
+	if (virtio_has_feature(vdev, VIRTIO_NET_F_STANDBY)) {
+		vi->failover = net_failover_create(vi->dev);
+		if (IS_ERR(vi->failover)) {
+			err = PTR_ERR(vi->failover);
+			goto free_vqs;
+		}
+	}
+
 	err = register_netdev(dev);
 	if (err) {
 		pr_debug("virtio_net: registering device failed\n");
-		goto free_vqs;
+		goto free_failover;
 	}
 
 	virtio_device_ready(vdev);
@@ -1727,6 +1759,8 @@ free_recv_bufs:
 
 	free_receive_bufs(vi);
 	unregister_netdev(dev);
+free_failover:
+	net_failover_destroy(vi->failover);
 free_vqs:
 	cancel_delayed_work_sync(&vi->refill);
 	virtnet_del_vqs(vi);
@@ -1761,6 +1795,8 @@ static void virtnet_remove(struct virtio_device *vdev)
 	flush_work(&vi->config_work);
 
 	unregister_netdev(vi->dev);
+
+	net_failover_destroy(vi->failover);
 
 	remove_vq_common(vi);
 
@@ -1846,6 +1882,7 @@ static unsigned int features[] = {
 	VIRTIO_NET_F_CTRL_MAC_ADDR,
 	VIRTIO_F_ANY_LAYOUT,
 	VIRTIO_NET_F_MTU,
+	VIRTIO_NET_F_STANDBY,
 };
 
 static struct virtio_driver virtio_net_driver = {

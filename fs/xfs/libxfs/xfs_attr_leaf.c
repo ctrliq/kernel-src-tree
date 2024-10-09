@@ -247,7 +247,7 @@ xfs_attr3_leaf_hdr_to_disk(
 	}
 }
 
-static bool
+static xfs_failaddr_t
 xfs_attr3_leaf_verify(
 	struct xfs_buf			*bp)
 {
@@ -263,17 +263,17 @@ xfs_attr3_leaf_verify(
 		struct xfs_da3_node_hdr *hdr3 = bp->b_addr;
 
 		if (ichdr.magic != XFS_ATTR3_LEAF_MAGIC)
-			return false;
+			return __this_address;
 
 		if (!uuid_equal(&hdr3->info.uuid, &mp->m_sb.sb_meta_uuid))
-			return false;
+			return __this_address;
 		if (be64_to_cpu(hdr3->info.blkno) != bp->b_bn)
-			return false;
+			return __this_address;
 		if (!xfs_log_check_lsn(mp, be64_to_cpu(hdr3->info.lsn)))
-			return false;
+			return __this_address;
 	} else {
 		if (ichdr.magic != XFS_ATTR_LEAF_MAGIC)
-			return false;
+			return __this_address;
 	}
 	/*
 	 * In recovery there is a transient state where count == 0 is valid
@@ -281,7 +281,7 @@ xfs_attr3_leaf_verify(
 	 * if the attr didn't fit in shortform.
 	 */
 	if (pag && pag->pagf_init && ichdr.count == 0)
-		return false;
+		return __this_address;
 
 	/*
 	 * firstused is the block offset of the first name info structure.
@@ -301,7 +301,7 @@ xfs_attr3_leaf_verify(
 	/* XXX: need to range check rest of attr header values */
 	/* XXX: hash order check? */
 
-	return true;
+	return NULL;
 }
 
 static void
@@ -311,10 +311,11 @@ xfs_attr3_leaf_write_verify(
 	struct xfs_mount	*mp = bp->b_target->bt_mount;
 	struct xfs_buf_log_item	*bip = bp->b_fspriv;
 	struct xfs_attr3_leaf_hdr *hdr3 = bp->b_addr;
+	xfs_failaddr_t		fa;
 
-	if (!xfs_attr3_leaf_verify(bp)) {
-		xfs_buf_ioerror(bp, -EFSCORRUPTED);
-		xfs_verifier_error(bp);
+	fa = xfs_attr3_leaf_verify(bp);
+	if (fa) {
+		xfs_verifier_error(bp, -EFSCORRUPTED, fa);
 		return;
 	}
 
@@ -338,21 +339,23 @@ xfs_attr3_leaf_read_verify(
 	struct xfs_buf		*bp)
 {
 	struct xfs_mount	*mp = bp->b_target->bt_mount;
+	xfs_failaddr_t		fa;
 
 	if (xfs_sb_version_hascrc(&mp->m_sb) &&
 	     !xfs_buf_verify_cksum(bp, XFS_ATTR3_LEAF_CRC_OFF))
-		xfs_buf_ioerror(bp, -EFSBADCRC);
-	else if (!xfs_attr3_leaf_verify(bp))
-		xfs_buf_ioerror(bp, -EFSCORRUPTED);
-
-	if (bp->b_error)
-		xfs_verifier_error(bp);
+		xfs_verifier_error(bp, -EFSBADCRC, __this_address);
+	else {
+		fa = xfs_attr3_leaf_verify(bp);
+		if (fa)
+			xfs_verifier_error(bp, -EFSCORRUPTED, fa);
+	}
 }
 
 const struct xfs_buf_ops xfs_attr3_leaf_buf_ops = {
 	.name = "xfs_attr3_leaf",
 	.verify_read = xfs_attr3_leaf_read_verify,
 	.verify_write = xfs_attr3_leaf_write_verify,
+	.verify_struct = xfs_attr3_leaf_verify,
 };
 
 int

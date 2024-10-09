@@ -165,7 +165,8 @@ static int init_inodecache(void)
 	udf_inode_cachep = kmem_cache_create("udf_inode_cache",
 					     sizeof(struct udf_inode_info),
 					     0, (SLAB_RECLAIM_ACCOUNT |
-						 SLAB_MEM_SPREAD),
+						 SLAB_MEM_SPREAD |
+						 SLAB_ACCOUNT),
 					     init_once);
 	if (!udf_inode_cachep)
 		return -ENOMEM;
@@ -911,13 +912,13 @@ out1:
 }
 
 struct inode *udf_find_metadata_inode_efe(struct super_block *sb,
-					u32 meta_file_loc, u32 partition_num)
+					u32 meta_file_loc, u32 partition_ref)
 {
 	struct kernel_lb_addr addr;
 	struct inode *metadata_fe;
 
 	addr.logicalBlockNum = meta_file_loc;
-	addr.partitionReferenceNum = partition_num;
+	addr.partitionReferenceNum = partition_ref;
 
 	metadata_fe = udf_iget(sb, &addr);
 
@@ -932,7 +933,8 @@ struct inode *udf_find_metadata_inode_efe(struct super_block *sb,
 	return metadata_fe;
 }
 
-static int udf_load_metadata_files(struct super_block *sb, int partition)
+static int udf_load_metadata_files(struct super_block *sb, int partition,
+				   int type1_index)
 {
 	struct udf_sb_info *sbi = UDF_SB(sb);
 	struct udf_part_map *map;
@@ -941,21 +943,22 @@ static int udf_load_metadata_files(struct super_block *sb, int partition)
 
 	map = &sbi->s_partmaps[partition];
 	mdata = &map->s_type_specific.s_metadata;
+	mdata->s_phys_partition_ref = type1_index;
 
 	/* metadata address */
 	udf_debug("Metadata file location: block = %d part = %d\n",
-		  mdata->s_meta_file_loc, map->s_partition_num);
+		  mdata->s_meta_file_loc, mdata->s_phys_partition_ref);
 
 	mdata->s_metadata_fe = udf_find_metadata_inode_efe(sb,
-		mdata->s_meta_file_loc, map->s_partition_num);
+		mdata->s_meta_file_loc, mdata->s_phys_partition_ref);
 
 	if (mdata->s_metadata_fe == NULL) {
 		/* mirror file entry */
 		udf_debug("Mirror metadata file location: block = %d part = %d\n",
-			  mdata->s_mirror_file_loc, map->s_partition_num);
+			  mdata->s_mirror_file_loc, mdata->s_phys_partition_ref);
 
 		mdata->s_mirror_fe = udf_find_metadata_inode_efe(sb,
-			mdata->s_mirror_file_loc, map->s_partition_num);
+			mdata->s_mirror_file_loc, mdata->s_phys_partition_ref);
 
 		if (mdata->s_mirror_fe == NULL) {
 			udf_err(sb, "Both metadata and mirror metadata inode efe can not found\n");
@@ -970,7 +973,7 @@ static int udf_load_metadata_files(struct super_block *sb, int partition)
 	*/
 	if (mdata->s_bitmap_file_loc != 0xFFFFFFFF) {
 		addr.logicalBlockNum = mdata->s_bitmap_file_loc;
-		addr.partitionReferenceNum = map->s_partition_num;
+		addr.partitionReferenceNum = mdata->s_phys_partition_ref;
 
 		udf_debug("Bitmap file location: block = %d part = %d\n",
 			  addr.logicalBlockNum, addr.partitionReferenceNum);
@@ -1230,7 +1233,7 @@ static int udf_load_partdesc(struct super_block *sb, sector_t block)
 	p = (struct partitionDesc *)bh->b_data;
 	partitionNumber = le16_to_cpu(p->partitionNumber);
 
-	/* First scan for TYPE1, SPARABLE and METADATA partitions */
+	/* First scan for TYPE1 and SPARABLE partitions */
 	for (i = 0; i < sbi->s_partitions; i++) {
 		map = &sbi->s_partmaps[i];
 		udf_debug("Searching map: (%d == %d)\n",
@@ -1277,7 +1280,7 @@ static int udf_load_partdesc(struct super_block *sb, sector_t block)
 		goto out_bh;
 
 	if (map->s_partition_type == UDF_METADATA_MAP25) {
-		ret = udf_load_metadata_files(sb, i);
+		ret = udf_load_metadata_files(sb, i, type1_idx);
 		if (ret < 0) {
 			udf_err(sb, "error loading MetaData partition map %d\n",
 				i);

@@ -28,8 +28,10 @@ extern const struct gfs2_log_operations gfs2_databuf_lops;
 
 extern const struct gfs2_log_operations *gfs2_log_ops[];
 extern void gfs2_log_write_page(struct gfs2_sbd *sdp, struct page *page);
-extern void gfs2_log_flush_bio(struct gfs2_sbd *sdp, int rw);
+extern void gfs2_log_submit_bio(struct bio **biop, int rw);
 extern void gfs2_pin(struct gfs2_sbd *sdp, struct buffer_head *bh);
+extern int gfs2_find_jhead(struct gfs2_jdesc *jd,
+			   struct gfs2_log_header_host *head, bool keep_cache);
 
 static inline unsigned int buf_limit(struct gfs2_sbd *sdp)
 {

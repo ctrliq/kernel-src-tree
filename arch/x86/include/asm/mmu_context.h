@@ -10,8 +10,6 @@
 #include <linux/pkeys.h>
 #include <asm/spec_ctrl.h>
 #ifndef CONFIG_PARAVIRT
-#include <asm-generic/mm_hooks.h>
-
 static inline void paravirt_activate_mm(struct mm_struct *prev,
 					struct mm_struct *next)
 {
@@ -82,12 +80,16 @@ static inline void load_cr3(pgd_t *pgdir)
 	__load_cr3(__sme_pa(pgdir));
 }
 
+/*
+ * Init a new mm.  Used on mm copies, like at fork()
+ * and on mm's that are brand-new, like at execve().
+ */
 static inline int init_new_context(struct task_struct *tsk,
 				       struct mm_struct *mm)
 {
 	#ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS
 	if (cpu_feature_enabled(X86_FEATURE_OSPKE)) {
-		/* pkey 0 is the default and always allocated */
+		/* pkey 0 is the default and allocated implicitly */
 		mm->pkey_allocation_map = 0x1;
 		/* -1 means unallocated or invalid */
 		mm->execute_only_pkey = -1;
@@ -219,6 +221,31 @@ static inline bool is_64bit_mm(struct mm_struct *mm)
 	return false;
 }
 #endif
+
+static inline void arch_dup_pkeys(struct mm_struct *oldmm,
+				  struct mm_struct *mm)
+{
+#ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS
+	if (!cpu_feature_enabled(X86_FEATURE_OSPKE))
+		return;
+
+	/* Duplicate the oldmm pkey state in mm: */
+	mm->pkey_allocation_map = oldmm->pkey_allocation_map;
+	mm->execute_only_pkey   = oldmm->execute_only_pkey;
+#endif
+}
+
+static inline void arch_dup_mmap(struct mm_struct *oldmm,
+				 struct mm_struct *mm)
+{
+	arch_dup_pkeys(oldmm, mm);
+	paravirt_arch_dup_mmap(oldmm, mm);
+}
+
+static inline void arch_exit_mmap(struct mm_struct *mm)
+{
+	paravirt_arch_exit_mmap(mm);
+}
 
 static inline void arch_bprm_mm_init(struct mm_struct *mm,
 		struct vm_area_struct *vma)

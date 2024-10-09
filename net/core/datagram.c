@@ -823,8 +823,9 @@ int skb_copy_and_csum_datagram_iovec(struct sk_buff *skb,
 			goto fault;
 		if (csum_fold(csum))
 			goto csum_error;
-		if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE))
-			netdev_rx_csum_fault(skb->dev);
+		if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE) &&
+		    !skb->csum_complete_sw)
+			netdev_rx_csum_fault(NULL);
 		iov->iov_len -= chunk;
 		iov->iov_base += chunk;
 	}

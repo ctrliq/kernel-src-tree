@@ -36,6 +36,7 @@
 #include <linux/debugfs.h>
 #include <linux/ratelimit.h>
 #include <linux/context_tracking.h>
+#include <linux/kmsg_dump.h>
 
 #include <asm/emulated_ops.h>
 #include <asm/pgtable.h>

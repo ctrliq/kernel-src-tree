@@ -6,6 +6,7 @@
 
 #include <linux/spinlock.h>
 #include <linux/bitops.h>
+#include <linux/genalloc.h>
 #include <asm/types.h>
 
 #define LPM_ANYPATH 0xff
@@ -318,6 +319,16 @@ struct cio_iplinfo {
 };
 
 extern int cio_get_iplinfo(struct cio_iplinfo *iplinfo);
+
+extern void *cio_dma_zalloc(size_t size);
+extern void cio_dma_free(void *cpu_addr, size_t size);
+extern struct device *cio_get_dma_css_dev(void);
+
+void *cio_gp_dma_zalloc(struct gen_pool *gp_dma, struct device *dma_dev,
+			size_t size);
+void cio_gp_dma_free(struct gen_pool *gp_dma, void *cpu_addr, size_t size);
+void cio_gp_dma_destroy(struct gen_pool *gp_dma, struct device *dma_dev);
+struct gen_pool *cio_gp_dma_create(struct device *dma_dev, int nr_pages);
 
 /* Function from drivers/s390/cio/chsc.c */
 int chsc_sstpc(void *page, unsigned int op, u16 ctrl);

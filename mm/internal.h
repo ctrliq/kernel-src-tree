@@ -57,8 +57,10 @@ static inline void __get_page_tail_foll(struct page *page,
  * follow_page() and it must be called while holding the proper PT
  * lock while the pte (or pmd_trans_huge) is still mapping the page.
  */
-static inline void get_page_foll(struct page *page)
+static inline __must_check bool get_page_foll(struct page *page)
 {
+	bool rc = true;
+
 	if (unlikely(PageTail(page)))
 		/*
 		 * This is safe only because
@@ -71,12 +73,15 @@ static inline void get_page_foll(struct page *page)
 		 * Getting a normal page or the head of a compound page
 		 * requires to already have an elevated page->_count.
 		 */
-		VM_BUG_ON_PAGE(atomic_read(&page->_count) <= 0, page);
-		atomic_inc(&page->_count);
+		rc = !WARN_ON_ONCE(atomic_read(&page->_count) <= 0);
+		if (rc)
+			atomic_inc(&page->_count);
 	}
 
 	if (unlikely(is_zone_device_page(page)))
 		get_zone_device_page(page);
+
+	return rc;
 }
 
 extern unsigned long highest_memmap_pfn;
@@ -131,7 +136,7 @@ struct compact_control {
 	bool finished_update_migrate;
 
 	int order;			/* order a direct compactor needs */
-	int migratetype;		/* MOVABLE, RECLAIMABLE etc */
+	const gfp_t gfp_mask;           /* gfp mask of a direct compactor */
 	struct zone *zone;
 	bool contended;			/* True if a lock was contended, or
 					 * need_resched() true during async

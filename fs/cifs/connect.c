@@ -382,9 +382,11 @@ cifs_reconnect(struct TCP_Server_Info *server)
 	spin_lock(&GlobalMid_Lock);
 	list_for_each_safe(tmp, tmp2, &server->pending_mid_q) {
 		mid_entry = list_entry(tmp, struct mid_q_entry, qhead);
+		kref_get(&mid_entry->refcount);
 		if (mid_entry->mid_state == MID_REQUEST_SUBMITTED)
 			mid_entry->mid_state = MID_RETRY_NEEDED;
 		list_move(&mid_entry->qhead, &retry_list);
+		mid_entry->mid_flags |= MID_DELETED;
 	}
 	spin_unlock(&GlobalMid_Lock);
 	mutex_unlock(&server->srv_mutex);
@@ -394,6 +396,7 @@ cifs_reconnect(struct TCP_Server_Info *server)
 		mid_entry = list_entry(tmp, struct mid_q_entry, qhead);
 		list_del_init(&mid_entry->qhead);
 		mid_entry->callback(mid_entry);
+		cifs_mid_q_entry_release(mid_entry);
 	}
 
 	do {
@@ -573,6 +576,21 @@ get_server_iovec(struct TCP_Server_Info *server, unsigned int nr_segs)
 	return new_iov;
 }
 
+static inline bool
+zero_credits(struct TCP_Server_Info *server)
+{
+	int val;
+
+	spin_lock(&server->req_lock);
+	val = server->credits + server->echo_credits + server->oplock_credits;
+	if (server->in_flight == 0 && val == 0) {
+		spin_unlock(&server->req_lock);
+		return true;
+	}
+	spin_unlock(&server->req_lock);
+	return false;
+}
+
 int
 cifs_readv_from_socket(struct TCP_Server_Info *server, struct kvec *iov_orig,
 		       unsigned int nr_segs, unsigned int to_read)
@@ -592,6 +610,12 @@ cifs_readv_from_socket(struct TCP_Server_Info *server, struct kvec *iov_orig,
 
 	for (total_read = 0; to_read; total_read += length, to_read -= length) {
 		try_to_freeze();
+
+		/* reconnect if no credits and no requests in flight */
+		if (zero_credits(server)) {
+			cifs_reconnect(server);
+			return -ECONNABORTED;
+		}
 
 		if (server_unresponsive(server)) {
 			total_read = -ECONNABORTED;
@@ -721,8 +745,10 @@ dequeue_mid(struct mid_q_entry *mid, bool malformed)
 	if (mid->mid_flags & MID_DELETED)
 		printk_once(KERN_WARNING
 			    "trying to dequeue a deleted mid\n");
-	else
+	else {
 		list_del_init(&mid->qhead);
+		mid->mid_flags |= MID_DELETED;
+	}
 	spin_unlock(&GlobalMid_Lock);
 }
 
@@ -791,8 +817,10 @@ static void clean_demultiplex_info(struct TCP_Server_Info *server)
 		list_for_each_safe(tmp, tmp2, &server->pending_mid_q) {
 			mid_entry = list_entry(tmp, struct mid_q_entry, qhead);
 			cifs_dbg(FYI, "Clearing mid 0x%llx\n", mid_entry->mid);
+			kref_get(&mid_entry->refcount);
 			mid_entry->mid_state = MID_SHUTDOWN;
 			list_move(&mid_entry->qhead, &dispose_list);
+			mid_entry->mid_flags |= MID_DELETED;
 		}
 		spin_unlock(&GlobalMid_Lock);
 
@@ -802,6 +830,7 @@ static void clean_demultiplex_info(struct TCP_Server_Info *server)
 			cifs_dbg(FYI, "Callback mid 0x%llx\n", mid_entry->mid);
 			list_del_init(&mid_entry->qhead);
 			mid_entry->callback(mid_entry);
+			cifs_mid_q_entry_release(mid_entry);
 		}
 		/* 1/8th of sec is more than enough time for them to exit */
 		msleep(125);
@@ -967,6 +996,7 @@ cifs_demultiplex_thread(void *p)
 			continue;
 		server->total_read += length;
 
+		mid_entry = NULL;
 		if (server->ops->is_transform_hdr &&
 		    server->ops->receive_transform &&
 		    server->ops->is_transform_hdr(buf)) {
@@ -981,8 +1011,11 @@ cifs_demultiplex_thread(void *p)
 				length = mid_entry->receive(server, mid_entry);
 		}
 
-		if (length < 0)
+		if (length < 0) {
+			if (mid_entry)
+				cifs_mid_q_entry_release(mid_entry);
 			continue;
+		}
 
 		if (server->large_buf)
 			buf = server->bigbuf;
@@ -998,6 +1031,8 @@ cifs_demultiplex_thread(void *p)
 
 			if (!mid_entry->multiRsp || mid_entry->multiEnd)
 				mid_entry->callback(mid_entry);
+
+			cifs_mid_q_entry_release(mid_entry);
 		} else if (server->ops->is_oplock_break &&
 			   server->ops->is_oplock_break(buf, server)) {
 			cifs_dbg(FYI, "Received oplock break\n");
@@ -2562,7 +2597,7 @@ cifs_find_smb_ses(struct TCP_Server_Info *server, struct smb_vol *vol)
 	return NULL;
 }
 
-static void
+void
 cifs_put_smb_ses(struct cifs_ses *ses)
 {
 	unsigned int rc, xid;
@@ -3811,11 +3846,13 @@ cifs_are_all_path_components_accessible(struct TCP_Server_Info *server,
 					unsigned int xid,
 					struct cifs_tcon *tcon,
 					struct cifs_sb_info *cifs_sb,
-					char *full_path)
+					char *full_path,
+					int added_treename)
 {
 	int rc;
 	char *s;
 	char sep, tmp;
+	int skip = added_treename ? 1 : 0;
 
 	sep = CIFS_DIR_SEP(cifs_sb);
 	s = full_path;
@@ -3830,7 +3867,14 @@ cifs_are_all_path_components_accessible(struct TCP_Server_Info *server,
 		/* next separator */
 		while (*s && *s != sep)
 			s++;
-
+		/*
+		 * if the treename is added, we then have to skip the first
+		 * part within the separators
+		 */
+		if (skip) {
+			skip = 0;
+			continue;
+		}
 		/*
 		 * temporarily null-terminate the path at the end of
 		 * the current component
@@ -3989,9 +4033,8 @@ remote_path_check:
 		}
 
 		if (rc != -EREMOTE) {
-			rc = cifs_are_all_path_components_accessible(server,
-							     xid, tcon, cifs_sb,
-							     full_path);
+			rc = cifs_are_all_path_components_accessible(server, xid, tcon,
+				cifs_sb, full_path, tcon->Flags & SMB_SHARE_IS_IN_DFS);
 			if (rc != 0) {
 				cifs_dbg(VFS, "cannot query dirs between root and final path, "
 					 "enabling CIFS_MOUNT_USE_PREFIX_PATH\n");

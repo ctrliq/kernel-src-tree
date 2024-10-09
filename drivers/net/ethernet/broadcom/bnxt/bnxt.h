@@ -27,6 +27,8 @@
 #include <net/xdp.h>
 #include <linux/net_dim.h>
 
+extern struct list_head bnxt_block_cb_list;
+
 struct tx_bd {
 	__le32 tx_bd_len_flags_type;
 	#define TX_BD_TYPE					(0x3f << 0)
@@ -1133,6 +1135,14 @@ struct bnxt_tc_flow_stats {
 	u64		bytes;
 };
 
+#ifdef CONFIG_BNXT_FLOWER_OFFLOAD
+struct bnxt_flower_indr_block_cb_priv {
+	struct net_device *tunnel_netdev;
+	struct bnxt *bp;
+	struct list_head list;
+};
+#endif
+
 struct bnxt_tc_info {
 	bool				enabled;
 
@@ -1620,6 +1630,8 @@ struct bnxt {
 	u16			*cfa_code_map; /* cfa_code -> vf_idx map */
 	u8			switch_id[8];
 	struct bnxt_tc_info	*tc_info;
+	struct list_head	tc_indr_block_list;
+	struct notifier_block	tc_netdev_nb;
 	struct dentry		*debugfs_pdev;
 	struct dentry		*debugfs_dim;
 	struct device		*hwmon_dev;

@@ -214,6 +214,20 @@ struct task_struct *rt_mutex_get_top_task(struct task_struct *task)
 }
 
 /*
+ * Called by sched_setscheduler() to get the priority which will be
+ * effective after the change.
+ */
+int rt_mutex_get_effective_prio(struct task_struct *task, int newprio)
+{
+	if (!task_has_pi_waiters(task))
+		return newprio;
+
+	if (task_top_pi_waiter(task)->task->prio <= newprio)
+		return task_top_pi_waiter(task)->task->prio;
+	return newprio;
+}
+
+/*
  * Adjust the priority of a task, after its pi_waiters got modified.
  *
  * This can be both boosting and unboosting. task->pi_lock must be held.

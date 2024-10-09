@@ -20,15 +20,15 @@ static void nvmet_bio_done(struct bio *bio, int err)
 {
 	struct nvmet_req *req = bio->bi_private;
 
-	if (err)
-		nvmet_req_complete(req, NVME_SC_INTERNAL | NVME_SC_DNR);
-	else
-		nvmet_req_complete(req, 0);
-
 	if (bio != &req->inline_bio)
 		bio_put(bio);
 	else
 		kfree(bio->bio_aux);
+
+	if (err)
+		nvmet_req_complete(req, NVME_SC_INTERNAL | NVME_SC_DNR);
+	else
+		nvmet_req_complete(req, 0);
 }
 
 static inline u32 nvmet_rw_len(struct nvmet_req *req)

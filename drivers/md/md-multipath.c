@@ -117,10 +117,9 @@ static bool multipath_make_request(struct mddev *mddev, struct bio * bio)
 					  & (REQ_DISCARD | REQ_SECURE));
 	const unsigned long do_same = (bio->bi_rw & REQ_WRITE_SAME);
 
-	if (unlikely(bio->bi_rw & REQ_FLUSH)) {
-		md_flush_request(mddev, bio);
+	if (unlikely(bio->bi_rw & REQ_FLUSH)
+	    && md_flush_request(mddev, bio))
 		return true;
-	}
 
 	if (!do_discard && !do_same && bio_sectors(bio) > max_sectors) {
 		struct bio_pair2 *bp = bio_split2(bio, max_sectors);

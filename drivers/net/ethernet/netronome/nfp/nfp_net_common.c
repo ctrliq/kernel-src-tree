@@ -26,6 +26,7 @@
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <linux/overflow.h>
+#include <linux/mm.h>
 #include <linux/page_ref.h>
 #include <linux/pci.h>
 #include <linux/pci_regs.h>
@@ -2174,7 +2175,7 @@ static void nfp_net_tx_ring_free(struct nfp_net_tx_ring *tx_ring)
 	struct nfp_net_r_vector *r_vec = tx_ring->r_vec;
 	struct nfp_net_dp *dp = &r_vec->nfp_net->dp;
 
-	kfree(tx_ring->txbufs);
+	kvfree(tx_ring->txbufs);
 
 	if (tx_ring->txds)
 		dma_free_coherent(dp->dev, tx_ring->size,
@@ -2198,7 +2199,6 @@ static int
 nfp_net_tx_ring_alloc(struct nfp_net_dp *dp, struct nfp_net_tx_ring *tx_ring)
 {
 	struct nfp_net_r_vector *r_vec = tx_ring->r_vec;
-	int sz;
 
 	tx_ring->cnt = dp->txd_cnt;
 
@@ -2212,8 +2212,8 @@ nfp_net_tx_ring_alloc(struct nfp_net_dp *dp, struct nfp_net_tx_ring *tx_ring)
 		goto err_alloc;
 	}
 
-	sz = sizeof(*tx_ring->txbufs) * tx_ring->cnt;
-	tx_ring->txbufs = kzalloc(sz, GFP_KERNEL);
+	tx_ring->txbufs = kvcalloc(tx_ring->cnt, sizeof(*tx_ring->txbufs),
+				   GFP_KERNEL);
 	if (!tx_ring->txbufs)
 		goto err_alloc;
 
@@ -2327,7 +2327,7 @@ static void nfp_net_rx_ring_free(struct nfp_net_rx_ring *rx_ring)
 
 	if (dp->netdev)
 		xdp_rxq_info_unreg(&rx_ring->xdp_rxq);
-	kfree(rx_ring->rxbufs);
+	kvfree(rx_ring->rxbufs);
 
 	if (rx_ring->rxds)
 		dma_free_coherent(dp->dev, rx_ring->size,
@@ -2350,7 +2350,7 @@ static void nfp_net_rx_ring_free(struct nfp_net_rx_ring *rx_ring)
 static int
 nfp_net_rx_ring_alloc(struct nfp_net_dp *dp, struct nfp_net_rx_ring *rx_ring)
 {
-	int sz, err;
+	int err;
 
 	if (dp->netdev) {
 		err = xdp_rxq_info_reg(&rx_ring->xdp_rxq, dp->netdev,
@@ -2370,8 +2370,8 @@ nfp_net_rx_ring_alloc(struct nfp_net_dp *dp, struct nfp_net_rx_ring *rx_ring)
 		goto err_alloc;
 	}
 
-	sz = sizeof(*rx_ring->rxbufs) * rx_ring->cnt;
-	rx_ring->rxbufs = kzalloc(sz, GFP_KERNEL);
+	rx_ring->rxbufs = kvcalloc(rx_ring->cnt, sizeof(*rx_ring->rxbufs),
+				   GFP_KERNEL);
 	if (!rx_ring->rxbufs)
 		goto err_alloc;
 

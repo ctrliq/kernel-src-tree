@@ -26,6 +26,7 @@ struct nfnetlink_subsystem {
 	__u8 subsys_id;			/* nfnetlink subsystem ID */
 	__u8 cb_count;			/* number of callbacks */
 	const struct nfnl_callback *cb;	/* callback for individual types */
+	struct module *owner;
 	int (*commit)(struct sk_buff *skb);
 	int (*abort)(struct sk_buff *skb);
 };

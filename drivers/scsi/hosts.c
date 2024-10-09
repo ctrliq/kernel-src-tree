@@ -308,6 +308,8 @@ int scsi_add_host_with_dma(struct Scsi_Host *shost, struct device *dev,
  out_destroy_tags:
 	if (shost_use_blk_mq(shost))
 		scsi_mq_destroy_tags(shost);
+	else if (shost->bqt)
+		blk_free_tags(shost->bqt);
  fail:
 	return error;
 }

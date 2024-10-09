@@ -592,7 +592,7 @@ static int __init reserve_crashkernel_low(void)
 
 static void __init reserve_crashkernel(void)
 {
-	unsigned long long crash_size, crash_base, total_mem;
+	unsigned long long crash_size, crash_base, total_mem, mem_enc_req = 0;
 	bool high = false;
 	int ret;
 
@@ -612,12 +612,20 @@ static void __init reserve_crashkernel(void)
 	/* 0 means: find the address automatically */
 	if (crash_base <= 0) {
 		/*
+		 * When SME/SEV is active, it will always require an extra SWIOTLB
+		 * region.
+		 */
+		if (mem_encrypt_active() && !high)
+			mem_enc_req = ALIGN(swiotlb_size_or_default(), SZ_1M);
+
+		/*
 		 *  kexec want bzImage is below CRASH_KERNEL_ADDR_MAX
 		 */
 		crash_base = memblock_find_in_range(CRASH_ALIGN,
 						    high ? CRASH_ADDR_HIGH_MAX
 							 : CRASH_ADDR_LOW_MAX,
-						    crash_size, CRASH_ALIGN);
+						    crash_size + mem_enc_req,
+						    CRASH_ALIGN);
 #ifdef CONFIG_X86_64
 		/*
 		 * crashkernel=X reserve below 896M fails? Try below 4G
@@ -625,14 +633,23 @@ static void __init reserve_crashkernel(void)
 		if (!high && !crash_base)
 			crash_base = memblock_find_in_range(CRASH_ALIGN,
 						(1ULL << 32),
-						crash_size, CRASH_ALIGN);
+						crash_size + mem_enc_req,
+						CRASH_ALIGN);
 		/*
 		 * crashkernel=X reserve below 4G fails? Try MAXMEM
 		 */
-		if (!high && !crash_base)
+		if (!high && !crash_base) {
+			/*
+			 * For high reservation, an extra low memory for SWIOTLB will
+			 * always be reserved later, so no need to reserve extra
+			 * memory for memory encryption case here.
+			 */
+			mem_enc_req = 0;
+
 			crash_base = memblock_find_in_range(CRASH_ALIGN,
 						CRASH_ADDR_HIGH_MAX,
 						crash_size, CRASH_ALIGN);
+		}
 #endif
 		if (!crash_base) {
 			pr_info("crashkernel reservation failed - No suitable area found.\n");
@@ -650,6 +667,13 @@ static void __init reserve_crashkernel(void)
 			return;
 		}
 	}
+
+	if (mem_enc_req) {
+		pr_info("Memory encryption is active, crashkernel needs %ldMB extra memory\n",
+			(unsigned long)(mem_enc_req / SZ_1M));
+		crash_size += mem_enc_req;
+	}
+
 	ret = memblock_reserve(crash_base, crash_size);
 	if (ret) {
 		pr_err("%s: Error reserving crashkernel memblock.\n", __func__);

@@ -1175,7 +1175,7 @@ svc_process_common(struct svc_rqst *rqstp, struct kvec *argv, struct kvec *resv)
 	 * for lower versions. RPC_PROG_MISMATCH seems to be the closest
 	 * fit.
 	 */
-	if (versp->vs_need_cong_ctrl &&
+	if (versp->vs_need_cong_ctrl && rqstp->rq_xprt &&
 	    !test_bit(XPT_CONG_CTRL, &rqstp->rq_xprt->xpt_flags))
 		goto err_bad_vers;
 

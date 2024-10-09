@@ -430,7 +430,7 @@ int smp_vcpu_scheduled(int cpu)
 
 void smp_yield(void)
 {
-	if (MACHINE_HAS_DIAG44)
+	if (!smp_cpu_mtid && MACHINE_HAS_DIAG44)
 		asm volatile("diag 0,0,0x44");
 }
 

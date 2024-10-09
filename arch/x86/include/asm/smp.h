@@ -31,6 +31,7 @@ static inline bool cpu_has_ht_siblings(void)
 
 DECLARE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_sibling_map);
 DECLARE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_core_map);
+DECLARE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_die_map);
 /* cpus sharing the last level cache: */
 DECLARE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_llc_shared_map);
 DECLARE_PER_CPU_READ_MOSTLY(u16, cpu_llc_id);
@@ -180,6 +181,7 @@ static inline int wbinvd_on_all_cpus(void)
 #endif /* CONFIG_SMP */
 
 extern unsigned disabled_cpus;
+extern unsigned rh_invalid_cpus;
 
 #ifdef CONFIG_X86_32_SMP
 /*

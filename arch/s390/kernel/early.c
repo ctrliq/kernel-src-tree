@@ -28,6 +28,7 @@
 #include <asm/cpcmd.h>
 #include <asm/sclp.h>
 #include <asm/facility.h>
+#include <asm/uv.h>
 #include "entry.h"
 
 /*
@@ -480,6 +481,9 @@ static void __init setup_boot_command_line(void)
 	strlcpy(boot_command_line, strstrip(COMMAND_LINE),
 		ARCH_COMMAND_LINE_SIZE);
 
+	if (is_prot_virt_guest())
+		return;
+
 	/* append IPL PARM data to the boot command line */
 	if (MACHINE_IS_VM)
 		append_to_cmdline(append_ipl_vmparm);
@@ -497,12 +501,13 @@ void __init startup_init(void)
 	ipl_save_parameters();
 	rescue_initrd();
 	clear_bss_section();
+	setup_facility_list();
+	uv_query_info();
 	ptff_init();
 	init_kernel_storage_key();
 	lockdep_init();
 	lockdep_off();
 	setup_lowcore_early();
-	setup_facility_list();
 	detect_machine_type();
 	ipl_update_parameters();
 	setup_boot_command_line();

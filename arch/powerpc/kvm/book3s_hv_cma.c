@@ -131,7 +131,7 @@ struct page *kvm_alloc_cma(unsigned long nr_pages, unsigned long align_pages)
 			break;
 
 		pfn = cma->base_pfn + (pageno << (KVM_CMA_CHUNK_ORDER - PAGE_SHIFT));
-		ret = alloc_contig_range(pfn, pfn + nr_pages, MIGRATE_CMA);
+		ret = alloc_contig_range(pfn, pfn + nr_pages, MIGRATE_CMA, GFP_KERNEL);
 		if (ret == 0) {
 			bitmap_set(cma->bitmap, pageno, nr_chunk);
 			page = pfn_to_page(pfn);

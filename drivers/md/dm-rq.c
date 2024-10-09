@@ -243,7 +243,7 @@ static void free_rq_clone(struct request *clone)
 	 */
 	if (clone->q && clone->q->mq_ops)
 		/* stacked on blk-mq queue(s) */
-		tio->ti->type->release_clone_rq(clone);
+		tio->ti->type->release_clone_rq(clone, NULL);
 	else if (!md->queue->mq_ops)
 		/* request_fn queue stacked on request_fn queue(s) */
 		free_old_clone_request(md, clone);
@@ -482,7 +482,8 @@ static int dm_dispatch_clone_request(struct request *clone, struct request *rq)
 
 	clone->start_time = jiffies;
 	r = blk_insert_cloned_request(clone->q, clone);
-	if (r != BLK_MQ_RQ_QUEUE_OK && r != BLK_MQ_RQ_QUEUE_BUSY)
+	if (r != BLK_MQ_RQ_QUEUE_OK && r != BLK_MQ_RQ_QUEUE_BUSY &&
+			r != BLK_MQ_RQ_QUEUE_DEV_BUSY)
 		/* must complete clone in terms of original request */
 		dm_complete_request(rq, r);
 	return r;
@@ -652,7 +653,7 @@ static int map_request(struct dm_rq_target_io *tio)
 		if (r == DM_MAPIO_REMAPPED &&
 		    setup_clone(clone, rq, tio, GFP_ATOMIC)) {
 			/* -ENOMEM */
-			ti->type->release_clone_rq(clone);
+			ti->type->release_clone_rq(clone, &tio->info);
 			return DM_MAPIO_REQUEUE;
 		}
 	}
@@ -666,9 +667,9 @@ check_again:
 		trace_block_rq_remap(clone->q, clone, disk_devt(dm_disk(md)),
 				     blk_rq_pos(rq));
 		ret = dm_dispatch_clone_request(clone, rq);
-		if (ret == BLK_MQ_RQ_QUEUE_BUSY) {
+		if (ret == BLK_MQ_RQ_QUEUE_BUSY || r == BLK_MQ_RQ_QUEUE_DEV_BUSY) {
 			blk_rq_unprep_clone(clone);
-			tio->ti->type->release_clone_rq(clone);
+			tio->ti->type->release_clone_rq(clone, &tio->info);
 			tio->clone = NULL;
 			if (!rq->q->mq_ops)
 				r = DM_MAPIO_DELAY_REQUEUE;

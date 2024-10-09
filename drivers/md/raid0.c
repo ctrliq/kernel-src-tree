@@ -21,6 +21,7 @@
 #include <linux/seq_file.h>
 #include <linux/module.h>
 #include <linux/slab.h>
+#include <trace/events/block.h>
 #include "md.h"
 #include "raid0.h"
 #include "raid5.h"
@@ -417,6 +418,7 @@ static int raid0_run(struct mddev *mddev)
 {
 	struct r0conf *conf;
 	int ret;
+	bool no_sg_merge = false;
 
 	if (mddev->chunk_sectors == 0) {
 		pr_warn("md/raid0:%s: chunk size must be set.\n", mdname(mddev));
@@ -450,12 +452,21 @@ static int raid0_run(struct mddev *mddev)
 					  rdev->data_offset << 9);
 			if (blk_queue_discard(bdev_get_queue(rdev->bdev)))
 				discard_supported = true;
+			if (test_bit(QUEUE_FLAG_NO_SG_MERGE,
+			    &bdev_get_queue(rdev->bdev)->queue_flags))
+				no_sg_merge = true;
 		}
 
 		if (!discard_supported)
 			queue_flag_clear_unlocked(QUEUE_FLAG_DISCARD, mddev->queue);
 		else
 			queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, mddev->queue);
+		if (no_sg_merge)
+			queue_flag_set_unlocked(QUEUE_FLAG_NO_SG_MERGE,
+						mddev->queue);
+		else
+			queue_flag_clear_unlocked(QUEUE_FLAG_NO_SG_MERGE,
+						mddev->queue);
 	}
 
 	/* calculate array device size */
@@ -692,10 +703,9 @@ static bool raid0_make_request(struct mddev *mddev, struct bio *bio)
 	struct strip_zone *zone;
 	struct md_rdev *tmp_dev;
 
-	if (unlikely(bio->bi_rw & REQ_FLUSH)) {
-		md_flush_request(mddev, bio);
+	if (unlikely(bio->bi_rw & REQ_FLUSH)
+	    && md_flush_request(mddev, bio))
 		return true;
-	}
 
 	if (unlikely((bio_op(bio) == REQ_OP_DISCARD))) {
 		raid0_handle_discard(mddev, bio);
@@ -733,6 +743,10 @@ static bool raid0_make_request(struct mddev *mddev, struct bio *bio)
 		tmp_dev->data_offset;
 
 	mddev_check_writesame(mddev, bio);
+	if (mddev->gendisk)
+		trace_block_bio_remap(bdev_get_queue(bio->bi_bdev),
+				      bio, disk_devt(mddev->gendisk),
+				      bio->bi_sector);
 	generic_make_request(bio);
 	return true;
 

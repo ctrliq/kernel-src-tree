@@ -362,7 +362,7 @@ SYSCALL(kcmp) /* sys_kcmp */
 SYSCALL_SPU(sched_setattr)
 SYSCALL_SPU(sched_getattr)
 SYSCALL_SPU(renameat2)
-SYSCALL(ni_syscall) /* sys_seccomp */
+SYSCALL_SPU(seccomp)
 SYSCALL_SPU(getrandom)
 SYSCALL_SPU(memfd_create) /* sys_memfd_create */
 SYSCALL(bpf)

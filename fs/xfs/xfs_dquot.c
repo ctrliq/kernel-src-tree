@@ -923,9 +923,9 @@ xfs_qm_dqflush_done(
 	 * since it's cheaper, and then we recheck while
 	 * holding the lock before removing the dquot from the AIL.
 	 */
-	if ((lip->li_flags & XFS_LI_IN_AIL) &&
+	if (test_bit(XFS_LI_IN_AIL, &lip->li_flags) &&
 	    ((lip->li_lsn == qip->qli_flush_lsn) ||
-	     (lip->li_flags & XFS_LI_FAILED))) {
+	     test_bit(XFS_LI_FAILED, &lip->li_flags))) {
 
 		/* xfs_trans_ail_delete() drops the AIL lock. */
 		spin_lock(&ailp->xa_lock);
@@ -936,8 +936,7 @@ xfs_qm_dqflush_done(
 			 * Clear the failed state since we are about to drop the
 			 * flush lock
 			 */
-			if (lip->li_flags & XFS_LI_FAILED)
-				xfs_clear_li_failed(lip);
+			xfs_clear_li_failed(lip);
 			spin_unlock(&ailp->xa_lock);
 		}
 	}
@@ -963,7 +962,9 @@ xfs_qm_dqflush(
 {
 	struct xfs_mount	*mp = dqp->q_mount;
 	struct xfs_buf		*bp;
+	struct xfs_dqblk	*dqb;
 	struct xfs_disk_dquot	*ddqp;
+	xfs_failaddr_t		fa;
 	int			error;
 
 	ASSERT(XFS_DQ_IS_LOCKED(dqp));
@@ -1005,14 +1006,16 @@ xfs_qm_dqflush(
 	/*
 	 * Calculate the location of the dquot inside the buffer.
 	 */
-	ddqp = bp->b_addr + dqp->q_bufoffset;
+	dqb = bp->b_addr + dqp->q_bufoffset;
+	ddqp = &dqb->dd_diskdq;
 
 	/*
-	 * A simple sanity check in case we got a corrupted dquot..
+	 * A simple sanity check in case we got a corrupted dquot.
 	 */
-	error = xfs_dqcheck(mp, &dqp->q_core, be32_to_cpu(ddqp->d_id), 0,
-			   XFS_QMOPT_DOWARN, "dqflush (incore copy)");
-	if (error) {
+	fa = xfs_dqblk_verify(mp, dqb, be32_to_cpu(ddqp->d_id), 0);
+	if (fa) {
+		xfs_alert(mp, "corrupt dquot ID 0x%x in memory at %pS",
+				be32_to_cpu(ddqp->d_id), fa);
 		xfs_buf_relse(bp);
 		xfs_dqfunlock(dqp);
 		xfs_force_shutdown(mp, SHUTDOWN_CORRUPT_INCORE);
@@ -1040,8 +1043,6 @@ xfs_qm_dqflush(
 	 * of a dquot without an up-to-date CRC getting to disk.
 	 */
 	if (xfs_sb_version_hascrc(&mp->m_sb)) {
-		struct xfs_dqblk *dqb = (struct xfs_dqblk *)ddqp;
-
 		dqb->dd_lsn = cpu_to_be64(dqp->q_logitem.qli_item.li_lsn);
 		xfs_update_cksum((char *)dqb, sizeof(struct xfs_dqblk),
 				 XFS_DQUOT_CRC_OFF);
