@@ -1,0 +1,204 @@
+nfp: reorganize nfp_net_rx() to get packet offsets early
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 13df4c666c551bba97618d7e3908c2ecd03ceefb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/13df4c66.failed
+
+Calculate packet offsets early in nfp_net_rx() so that we will be
+able to use them in upcoming XDP handler.  While at it move relevant
+variables into the loop scope.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 13df4c666c551bba97618d7e3908c2ecd03ceefb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 2a625a67a222,2ab63661a6fd..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -1340,42 -1383,23 +1340,57 @@@ static int nfp_net_rx(struct nfp_net_rx
+  {
+  	struct nfp_net_r_vector *r_vec = rx_ring->r_vec;
+  	struct nfp_net *nn = r_vec->nfp_net;
+++<<<<<<< HEAD
+ +	unsigned int data_len, meta_len;
+ +	int avail = 0, pkts_polled = 0;
+ +	struct sk_buff *skb, *new_skb;
+ +	struct nfp_net_rx_desc *rxd;
+ +	dma_addr_t new_dma_addr;
+ +	u32 qcp_wr_p;
+ +	int idx;
+ +
+ +	if (nn->is_nfp3200) {
+ +		/* Work out how many packets arrived */
+ +		qcp_wr_p = nfp_qcp_wr_ptr_read(rx_ring->qcp_rx);
+ +		idx = rx_ring->rd_p % rx_ring->cnt;
+ +
+ +		if (qcp_wr_p == idx)
+ +			/* No new packets */
+ +			return 0;
+ +
+ +		if (qcp_wr_p > idx)
+ +			avail = qcp_wr_p - idx;
+ +		else
+ +			avail = qcp_wr_p + rx_ring->cnt - idx;
+ +	} else {
+ +		avail = budget + 1;
+ +	}
+ +
+ +	while (avail > 0 && pkts_polled < budget) {
+ +		idx = rx_ring->rd_p % rx_ring->cnt;
+++=======
++ 	struct sk_buff *skb;
++ 	int pkts_polled = 0;
++ 	int idx;
++ 
++ 	while (pkts_polled < budget) {
++ 		unsigned int meta_len, data_len, data_off, pkt_len, pkt_off;
++ 		struct nfp_net_rx_buf *rxbuf;
++ 		struct nfp_net_rx_desc *rxd;
++ 		dma_addr_t new_dma_addr;
++ 		void *new_frag;
++ 
++ 		idx = rx_ring->rd_p & (rx_ring->cnt - 1);
+++>>>>>>> 13df4c666c55 (nfp: reorganize nfp_net_rx() to get packet offsets early)
+  
+  		rxd = &rx_ring->rxds[idx];
+ -		if (!(rxd->rxd.meta_len_dd & PCIE_DESC_RX_DD))
+ +		if (!(rxd->rxd.meta_len_dd & PCIE_DESC_RX_DD)) {
+ +			if (nn->is_nfp3200)
+ +				nn_dbg(nn, "RX descriptor not valid (DD)%d:%u rxd[0]=%#x rxd[1]=%#x\n",
+ +				       rx_ring->idx, idx,
+ +				       rxd->vals[0], rxd->vals[1]);
+  			break;
+ -
+ +		}
+  		/* Memory barrier to ensure that we won't do other reads
+  		 * before the DD bit.
+  		 */
+@@@ -1383,55 -1407,67 +1398,100 @@@
+  
+  		rx_ring->rd_p++;
+  		pkts_polled++;
+ -
+ +		avail--;
+ +
+++<<<<<<< HEAD
+ +		skb = rx_ring->rxbufs[idx].skb;
+ +
+ +		new_skb = nfp_net_rx_alloc_one(rx_ring, &new_dma_addr,
+ +					       nn->fl_bufsz);
+ +		if (!new_skb) {
+ +			nfp_net_rx_give_one(rx_ring, rx_ring->rxbufs[idx].skb,
+ +					    rx_ring->rxbufs[idx].dma_addr);
+ +			u64_stats_update_begin(&r_vec->rx_sync);
+ +			r_vec->rx_drops++;
+ +			u64_stats_update_end(&r_vec->rx_sync);
+++=======
++ 		rxbuf =	&rx_ring->rxbufs[idx];
++ 		/*         < meta_len >
++ 		 *  <-- [rx_offset] -->
++ 		 *  ---------------------------------------------------------
++ 		 * | [XX] |  metadata  |             packet           | XXXX |
++ 		 *  ---------------------------------------------------------
++ 		 *         <---------------- data_len --------------->
++ 		 *
++ 		 * The rx_offset is fixed for all packets, the meta_len can vary
++ 		 * on a packet by packet basis. If rx_offset is set to zero
++ 		 * (_RX_OFFSET_DYNAMIC) metadata starts at the beginning of the
++ 		 * buffer and is immediately followed by the packet (no [XX]).
++ 		 */
++ 		meta_len = rxd->rxd.meta_len_dd & PCIE_DESC_RX_META_LEN_MASK;
++ 		data_len = le16_to_cpu(rxd->rxd.data_len);
++ 		pkt_len = data_len - meta_len;
++ 
++ 		if (nn->rx_offset == NFP_NET_CFG_RX_OFFSET_DYNAMIC)
++ 			pkt_off = meta_len;
++ 		else
++ 			pkt_off = nn->rx_offset;
++ 		data_off = NFP_NET_RX_BUF_HEADROOM + pkt_off;
++ 
++ 		/* Stats update */
++ 		u64_stats_update_begin(&r_vec->rx_sync);
++ 		r_vec->rx_pkts++;
++ 		r_vec->rx_bytes += pkt_len;
++ 		u64_stats_update_end(&r_vec->rx_sync);
++ 
++ 		skb = build_skb(rxbuf->frag, nn->fl_bufsz);
++ 		if (unlikely(!skb)) {
++ 			nfp_net_rx_drop(r_vec, rx_ring, rxbuf, NULL);
++ 			continue;
++ 		}
++ 		new_frag = nfp_net_napi_alloc_one(nn, &new_dma_addr);
++ 		if (unlikely(!new_frag)) {
++ 			nfp_net_rx_drop(r_vec, rx_ring, rxbuf, skb);
+++>>>>>>> 13df4c666c55 (nfp: reorganize nfp_net_rx() to get packet offsets early)
+  			continue;
+  		}
+  
+ -		nfp_net_dma_unmap_rx(nn, rx_ring->rxbufs[idx].dma_addr,
+ -				     nn->fl_bufsz, DMA_FROM_DEVICE);
+ +		dma_unmap_single(&nn->pdev->dev,
+ +				 rx_ring->rxbufs[idx].dma_addr,
+ +				 nn->fl_bufsz, DMA_FROM_DEVICE);
+ +
+ +		nfp_net_rx_give_one(rx_ring, new_skb, new_dma_addr);
+ +
+++<<<<<<< HEAD
+ +		/*         < meta_len >
+ +		 *  <-- [rx_offset] -->
+ +		 *  ---------------------------------------------------------
+ +		 * | [XX] |  metadata  |             packet           | XXXX |
+ +		 *  ---------------------------------------------------------
+ +		 *         <---------------- data_len --------------->
+ +		 *
+ +		 * The rx_offset is fixed for all packets, the meta_len can vary
+ +		 * on a packet by packet basis. If rx_offset is set to zero
+ +		 * (_RX_OFFSET_DYNAMIC) metadata starts at the beginning of the
+ +		 * buffer and is immediately followed by the packet (no [XX]).
+ +		 */
+ +		meta_len = rxd->rxd.meta_len_dd & PCIE_DESC_RX_META_LEN_MASK;
+ +		data_len = le16_to_cpu(rxd->rxd.data_len);
+ +
+ +		if (nn->rx_offset == NFP_NET_CFG_RX_OFFSET_DYNAMIC)
+ +			skb_reserve(skb, meta_len);
+ +		else
+ +			skb_reserve(skb, nn->rx_offset);
+ +		skb_put(skb, data_len - meta_len);
+  
+ -		nfp_net_rx_give_one(rx_ring, new_frag, new_dma_addr);
+ +		nfp_net_set_hash(nn->netdev, skb, rxd);
+  
+ +		/* Stats update */
+ +		u64_stats_update_begin(&r_vec->rx_sync);
+ +		r_vec->rx_pkts++;
+ +		r_vec->rx_bytes += skb->len;
+ +		u64_stats_update_end(&r_vec->rx_sync);
+++=======
++ 		skb_reserve(skb, data_off);
++ 		skb_put(skb, pkt_len);
+ -
+ -		if (nn->fw_ver.major <= 3) {
+ -			nfp_net_set_hash_desc(nn->netdev, skb, rxd);
+ -		} else if (meta_len) {
+ -			void *end;
+ -
+ -			end = nfp_net_parse_meta(nn->netdev, skb, meta_len);
+ -			if (unlikely(end != skb->data)) {
+ -				nn_warn_ratelimit(nn, "invalid RX packet metadata\n");
+ -				nfp_net_rx_drop(r_vec, rx_ring, NULL, skb);
+ -				continue;
+ -			}
+ -		}
+++>>>>>>> 13df4c666c55 (nfp: reorganize nfp_net_rx() to get packet offsets early)
+  
+  		skb_record_rx_queue(skb, rx_ring->idx);
+  		skb->protocol = eth_type_trans(skb, nn->netdev);
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
