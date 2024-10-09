@@ -1,0 +1,116 @@
+openvswitch: add processing of L3 packets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jiri Benc <jbenc@redhat.com>
+commit 5108bbaddc37c1c8583f0cf2562d7d3463cd12cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5108bbad.failed
+
+Support receiving, extracting flow key and sending of L3 packets (packets
+without an Ethernet header).
+
+Note that even after this patch, non-Ethernet interfaces are still not
+allowed to be added to bridges. Similarly, netlink interface for sending and
+receiving L3 packets to/from user space is not in place yet.
+
+Based on previous versions by Lorand Jakab and Simon Horman.
+
+	Signed-off-by: Lorand Jakab <lojakab@cisco.com>
+	Signed-off-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: Jiri Benc <jbenc@redhat.com>
+	Acked-by: Pravin B Shelar <pshelar@ovn.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5108bbaddc37c1c8583f0cf2562d7d3463cd12cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/openvswitch/flow.c
+diff --cc net/openvswitch/flow.c
+index f677cc12bd8c,08aa926cd5cf..000000000000
+--- a/net/openvswitch/flow.c
++++ b/net/openvswitch/flow.c
+@@@ -749,6 -780,10 +778,13 @@@ int ovs_flow_key_extract(const struct i
+  	key->phy.skb_mark = skb->mark;
+  	ovs_ct_fill_key(skb, key);
+  	key->ovs_flow_hash = 0;
+++<<<<<<< HEAD
+++=======
++ 	res = key_extract_mac_proto(skb);
++ 	if (res < 0)
++ 		return res;
++ 	key->mac_proto = res;
+++>>>>>>> 5108bbaddc37 (openvswitch: add processing of L3 packets)
+  	key->recirc_id = 0;
+  
+  	return key_extract(skb, key);
+diff --git a/net/openvswitch/datapath.c b/net/openvswitch/datapath.c
+index 848e43f8c688..736392d4a77b 100644
+--- a/net/openvswitch/datapath.c
++++ b/net/openvswitch/datapath.c
+@@ -561,7 +561,6 @@ static int ovs_packet_cmd_execute(struct sk_buff *skb, struct genl_info *info)
+ 	struct sw_flow *flow;
+ 	struct sw_flow_actions *sf_acts;
+ 	struct datapath *dp;
+-	struct ethhdr *eth;
+ 	struct vport *input_vport;
+ 	u16 mru = 0;
+ 	int len;
+@@ -582,17 +581,6 @@ static int ovs_packet_cmd_execute(struct sk_buff *skb, struct genl_info *info)
+ 
+ 	nla_memcpy(__skb_put(packet, len), a[OVS_PACKET_ATTR_PACKET], len);
+ 
+-	skb_reset_mac_header(packet);
+-	eth = eth_hdr(packet);
+-
+-	/* Normally, setting the skb 'protocol' field would be handled by a
+-	 * call to eth_type_trans(), but it assumes there's a sending
+-	 * device, which we may not have. */
+-	if (eth_proto_is_802_3(eth->h_proto))
+-		packet->protocol = eth->h_proto;
+-	else
+-		packet->protocol = htons(ETH_P_802_2);
+-
+ 	/* Set packet's mru */
+ 	if (a[OVS_PACKET_ATTR_MRU]) {
+ 		mru = nla_get_u16(a[OVS_PACKET_ATTR_MRU]);
+@@ -619,6 +607,7 @@ static int ovs_packet_cmd_execute(struct sk_buff *skb, struct genl_info *info)
+ 	rcu_assign_pointer(flow->sf_acts, acts);
+ 	packet->priority = flow->key.phy.priority;
+ 	packet->mark = flow->key.phy.skb_mark;
++	packet->protocol = flow->key.eth.type;
+ 
+ 	rcu_read_lock();
+ 	dp = get_dp_rcu(net, ovs_header->dp_ifindex);
+* Unmerged path net/openvswitch/flow.c
+diff --git a/net/openvswitch/vport.c b/net/openvswitch/vport.c
+index 3e131f6868f2..86fffe91ef05 100644
+--- a/net/openvswitch/vport.c
++++ b/net/openvswitch/vport.c
+@@ -485,6 +485,25 @@ void ovs_vport_send(struct vport *vport, struct sk_buff *skb)
+ {
+ 	int mtu = vport->dev->mtu;
+ 
++	switch (vport->dev->type) {
++	case ARPHRD_NONE:
++		if (mac_proto == MAC_PROTO_ETHERNET) {
++			skb_reset_network_header(skb);
++			skb_reset_mac_len(skb);
++			skb->protocol = htons(ETH_P_TEB);
++		} else if (mac_proto != MAC_PROTO_NONE) {
++			WARN_ON_ONCE(1);
++			goto drop;
++		}
++		break;
++	case ARPHRD_ETHER:
++		if (mac_proto != MAC_PROTO_ETHERNET)
++			goto drop;
++		break;
++	default:
++		goto drop;
++	}
++
+ 	if (unlikely(packet_length(skb, vport->dev) > mtu &&
+ 		     !skb_is_gso(skb))) {
+ 		net_warn_ratelimited("%s: dropped over-mtu packet: %d > %d\n",
