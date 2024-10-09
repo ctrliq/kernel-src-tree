@@ -1,0 +1,140 @@
+x86/MCE/AMD: Read MCx_MISC block addresses on any CPU
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [x86] mce/amd: Read MCx_MISC block addresses on any CPU (Gary Hook) [1685269]
+Rebuild_FUZZ: 96.08%
+commit-author Borislav Petkov <bp@suse.de>
+commit fbf96cf904dc154a28338fe68f72902e9af57afc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/fbf96cf9.failed
+
+We used rdmsr_safe_on_cpu() to make sure we're reading the proper CPU's
+MISC block addresses. However, that caused trouble with CPU hotplug due to
+the _on_cpu() helper issuing an IPI while IRQs are disabled.
+
+But we don't have to do that: the block addresses are the same on any CPU
+so we can read them on any CPU. (What practically happens is, we read them
+on the BSP and cache them, and for later reads, we service them from the
+cache).
+
+	Suggested-by: Yazen Ghannam <Yazen.Ghannam@amd.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit fbf96cf904dc154a28338fe68f72902e9af57afc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/mcheck/mce_amd.c
+diff --cc arch/x86/kernel/cpu/mcheck/mce_amd.c
+index 6cf441f79966,f591b01930db..000000000000
+--- a/arch/x86/kernel/cpu/mcheck/mce_amd.c
++++ b/arch/x86/kernel/cpu/mcheck/mce_amd.c
+@@@ -369,7 -436,41 +369,45 @@@ static void deferred_error_interrupt_en
+  	wrmsr(MSR_CU_DEF_ERR, low, high);
+  }
+  
+++<<<<<<< HEAD
+ +static u32 get_block_address(unsigned int cpu, u32 current_addr, u32 low, u32 high,
+++=======
++ static u32 smca_get_block_address(unsigned int bank, unsigned int block)
++ {
++ 	u32 low, high;
++ 	u32 addr = 0;
++ 
++ 	if (smca_get_bank_type(bank) == SMCA_RESERVED)
++ 		return addr;
++ 
++ 	if (!block)
++ 		return MSR_AMD64_SMCA_MCx_MISC(bank);
++ 
++ 	/* Check our cache first: */
++ 	if (smca_bank_addrs[bank][block] != -1)
++ 		return smca_bank_addrs[bank][block];
++ 
++ 	/*
++ 	 * For SMCA enabled processors, BLKPTR field of the first MISC register
++ 	 * (MCx_MISC0) indicates presence of additional MISC regs set (MISC1-4).
++ 	 */
++ 	if (rdmsr_safe(MSR_AMD64_SMCA_MCx_CONFIG(bank), &low, &high))
++ 		goto out;
++ 
++ 	if (!(low & MCI_CONFIG_MCAX))
++ 		goto out;
++ 
++ 	if (!rdmsr_safe(MSR_AMD64_SMCA_MCx_MISC(bank), &low, &high) &&
++ 	    (low & MASK_BLKPTR_LO))
++ 		addr = MSR_AMD64_SMCA_MCx_MISCy(bank, block - 1);
++ 
++ out:
++ 	smca_bank_addrs[bank][block] = addr;
++ 	return addr;
++ }
++ 
++ static u32 get_block_address(u32 current_addr, u32 low, u32 high,
+++>>>>>>> fbf96cf904dc (x86/MCE/AMD: Read MCx_MISC block addresses on any CPU)
+  			     unsigned int bank, unsigned int block)
+  {
+  	u32 addr = 0, offset = 0;
+@@@ -377,41 -478,8 +415,46 @@@
+  	if ((bank >= mca_cfg.banks) || (block >= NR_BLOCKS))
+  		return addr;
+  
+++<<<<<<< HEAD
+ +	/* Get address from already initialized block. */
+ +	if (per_cpu(threshold_banks, cpu)) {
+ +		struct threshold_bank *bankp = per_cpu(threshold_banks, cpu)[bank];
+ +
+ +		if (bankp && bankp->blocks) {
+ +			struct threshold_block *blockp = &bankp->blocks[block];
+ +
+ +			if (blockp)
+ +				return blockp->address;
+ +		}
+ +	}
+ +
+ +	if (mce_flags.smca) {
+ +		if (!block) {
+ +			addr = MSR_AMD64_SMCA_MCx_MISC(bank);
+ +		} else {
+ +			/*
+ +			 * For SMCA enabled processors, BLKPTR field of the
+ +			 * first MISC register (MCx_MISC0) indicates presence of
+ +			 * additional MISC register set (MISC1-4).
+ +			 */
+ +			u32 low, high;
+ +
+ +			if (rdmsr_safe_on_cpu(cpu, MSR_AMD64_SMCA_MCx_CONFIG(bank), &low, &high))
+ +				return addr;
+ +
+ +			if (!(low & MCI_CONFIG_MCAX))
+ +				return addr;
+ +
+ +			if (!rdmsr_safe_on_cpu(cpu, MSR_AMD64_SMCA_MCx_MISC(bank), &low, &high) &&
+ +			    (low & MASK_BLKPTR_LO))
+ +				addr = MSR_AMD64_SMCA_MCx_MISCy(bank, block - 1);
+ +		}
+ +		return addr;
+ +	}
+++=======
++ 	if (mce_flags.smca)
++ 		return smca_get_block_address(bank, block);
+++>>>>>>> fbf96cf904dc (x86/MCE/AMD: Read MCx_MISC block addresses on any CPU)
+  
+  	/* Fall back to method we used for older processors: */
+  	switch (block) {
+@@@ -531,10 -554,10 +574,10 @@@ void mce_amd_feature_init(struct cpuinf
+  
+  	for (bank = 0; bank < mca_cfg.banks; ++bank) {
+  		if (mce_flags.smca)
+ -			smca_configure(bank, cpu);
+ +			get_smca_bank_info(bank);
+  
+  		for (block = 0; block < NR_BLOCKS; ++block) {
+- 			address = get_block_address(cpu, address, low, high, bank, block);
++ 			address = get_block_address(address, low, high, bank, block);
+  			if (!address)
+  				break;
+  
+* Unmerged path arch/x86/kernel/cpu/mcheck/mce_amd.c
