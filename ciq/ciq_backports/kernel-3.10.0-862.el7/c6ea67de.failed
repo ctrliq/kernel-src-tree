@@ -1,0 +1,338 @@
+x86/intel_rdt: Make schemata file parsers resource specific
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] intel_rdt: Make schemata file parsers resource specific (Jiri Olsa) [1379551]
+Rebuild_FUZZ: 96.49%
+commit-author Vikas Shivappa <vikas.shivappa@linux.intel.com>
+commit c6ea67de52c29a8b45e5fc7569fc4336bfd557b0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c6ea67de.failed
+
+The schemata files are the user space interface to update resource
+controls. The parser is hardwired to support only cache resources, which do
+not fit the requirements of memory resources.
+
+Add a function pointer for a parser to the struct rdt_resource and switch
+the cache parsing over.
+
+[ tglx: Massaged changelog ]
+
+	Signed-off-by: Vikas Shivappa <vikas.shivappa@linux.intel.com>
+	Cc: ravi.v.shankar@intel.com
+	Cc: tony.luck@intel.com
+	Cc: fenghua.yu@intel.com
+	Cc: vikas.shivappa@intel.com
+Link: http://lkml.kernel.org/r/1491611637-20417-8-git-send-email-vikas.shivappa@linux.intel.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+(cherry picked from commit c6ea67de52c29a8b45e5fc7569fc4336bfd557b0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/intel_rdt.h
+#	arch/x86/kernel/cpu/intel_rdt.c
+#	arch/x86/kernel/cpu/intel_rdt_schemata.c
+diff --cc arch/x86/include/asm/intel_rdt.h
+index 06f50d0ed14f,4a9005766d96..000000000000
+--- a/arch/x86/include/asm/intel_rdt.h
++++ b/arch/x86/include/asm/intel_rdt.h
+@@@ -136,6 -104,84 +136,87 @@@ struct msr_param 
+  	int			high;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * struct rdt_cache - Cache allocation related data
++  * @cbm_len:		Length of the cache bit mask
++  * @min_cbm_bits:	Minimum number of consecutive bits to be set
++  * @cbm_idx_mult:	Multiplier of CBM index
++  * @cbm_idx_offset:	Offset of CBM index. CBM index is computed by:
++  *			closid * cbm_idx_multi + cbm_idx_offset
++  *			in a cache bit mask
++  */
++ struct rdt_cache {
++ 	unsigned int	cbm_len;
++ 	unsigned int	min_cbm_bits;
++ 	unsigned int	cbm_idx_mult;
++ 	unsigned int	cbm_idx_offset;
++ };
++ 
++ /**
++  * struct rdt_membw - Memory bandwidth allocation related data
++  * @max_delay:		Max throttle delay. Delay is the hardware
++  *			representation for memory bandwidth.
++  * @min_bw:		Minimum memory bandwidth percentage user can request
++  * @bw_gran:		Granularity at which the memory bandwidth is allocated
++  * @delay_linear:	True if memory B/W delay is in linear scale
++  * @mb_map:		Mapping of memory B/W percentage to memory B/W delay
++  */
++ struct rdt_membw {
++ 	u32		max_delay;
++ 	u32		min_bw;
++ 	u32		bw_gran;
++ 	u32		delay_linear;
++ 	u32		*mb_map;
++ };
++ 
++ /**
++  * struct rdt_resource - attributes of an RDT resource
++  * @enabled:		Is this feature enabled on this machine
++  * @capable:		Is this feature available on this machine
++  * @name:		Name to use in "schemata" file
++  * @num_closid:		Number of CLOSIDs available
++  * @cache_level:	Which cache level defines scope of this resource
++  * @default_ctrl:	Specifies default cache cbm or memory B/W percent.
++  * @msr_base:		Base MSR address for CBMs
++  * @msr_update:		Function pointer to update QOS MSRs
++  * @data_width:		Character width of data when displaying
++  * @domains:		All domains for this resource
++  * @cache:		Cache allocation related data
++  * @info_files:		resctrl info files for the resource
++  * @nr_info_files:	Number of info files
++  * @format_str:		Per resource format string to show domain value
++  * @parse_ctrlval:	Per resource function pointer to parse control values
++  */
++ struct rdt_resource {
++ 	bool			enabled;
++ 	bool			capable;
++ 	char			*name;
++ 	int			num_closid;
++ 	int			cache_level;
++ 	u32			default_ctrl;
++ 	unsigned int		msr_base;
++ 	void (*msr_update)	(struct rdt_domain *d, struct msr_param *m,
++ 				 struct rdt_resource *r);
++ 	int			data_width;
++ 	struct list_head	domains;
++ 	union {
++ 		struct rdt_cache	cache;
++ 		struct rdt_membw	membw;
++ 	};
++ 	struct rftype		*info_files;
++ 	int			nr_info_files;
++ 	const char		*format_str;
++ 	int (*parse_ctrlval)	(char *buf, struct rdt_resource *r,
++ 				 struct rdt_domain *d);
++ };
++ 
++ void rdt_get_cache_infofile(struct rdt_resource *r);
++ void rdt_get_mba_infofile(struct rdt_resource *r);
++ int parse_cbm(char *buf, struct rdt_resource *r, struct rdt_domain *d);
++ 
+++>>>>>>> c6ea67de52c2 (x86/intel_rdt: Make schemata file parsers resource specific)
+  extern struct mutex rdtgroup_mutex;
+  
+  extern struct rdt_resource rdt_resources_all[];
+diff --cc arch/x86/kernel/cpu/intel_rdt.c
+index ad087dd4421e,1e410ea6905e..000000000000
+--- a/arch/x86/kernel/cpu/intel_rdt.c
++++ b/arch/x86/kernel/cpu/intel_rdt.c
+@@@ -45,42 -46,76 +45,106 @@@ DEFINE_PER_CPU_READ_MOSTLY(int, cpu_clo
+   */
+  int max_name_width, max_data_width;
+  
+ -static void
+ -mba_wrmsr(struct rdt_domain *d, struct msr_param *m, struct rdt_resource *r);
+ -static void
+ -cat_wrmsr(struct rdt_domain *d, struct msr_param *m, struct rdt_resource *r);
+ -
+ -#define domain_init(id) LIST_HEAD_INIT(rdt_resources_all[id].domains)
+ -
+  struct rdt_resource rdt_resources_all[] = {
+  	{
+++<<<<<<< HEAD
+ +		.name		= "L3",
+ +		.domains	= domain_init(RDT_RESOURCE_L3),
+ +		.msr_base	= IA32_L3_CBM_BASE,
+ +		.min_cbm_bits	= 1,
+ +		.cache_level	= 3,
+ +		.cbm_idx_multi	= 1,
+ +		.cbm_idx_offset	= 0
+ +	},
+ +	{
+ +		.name		= "L3DATA",
+ +		.domains	= domain_init(RDT_RESOURCE_L3DATA),
+ +		.msr_base	= IA32_L3_CBM_BASE,
+ +		.min_cbm_bits	= 1,
+ +		.cache_level	= 3,
+ +		.cbm_idx_multi	= 2,
+ +		.cbm_idx_offset	= 0
+ +	},
+ +	{
+ +		.name		= "L3CODE",
+ +		.domains	= domain_init(RDT_RESOURCE_L3CODE),
+ +		.msr_base	= IA32_L3_CBM_BASE,
+ +		.min_cbm_bits	= 1,
+ +		.cache_level	= 3,
+ +		.cbm_idx_multi	= 2,
+ +		.cbm_idx_offset	= 1
+ +	},
+ +	{
+ +		.name		= "L2",
+ +		.domains	= domain_init(RDT_RESOURCE_L2),
+ +		.msr_base	= IA32_L2_CBM_BASE,
+ +		.min_cbm_bits	= 1,
+ +		.cache_level	= 2,
+ +		.cbm_idx_multi	= 1,
+ +		.cbm_idx_offset	= 0
+++=======
++ 		.name			= "L3",
++ 		.domains		= domain_init(RDT_RESOURCE_L3),
++ 		.msr_base		= IA32_L3_CBM_BASE,
++ 		.msr_update		= cat_wrmsr,
++ 		.cache_level		= 3,
++ 		.cache = {
++ 			.min_cbm_bits	= 1,
++ 			.cbm_idx_mult	= 1,
++ 			.cbm_idx_offset	= 0,
++ 		},
++ 		.parse_ctrlval		= parse_cbm,
++ 		.format_str		= "%d=%0*x",
++ 	},
++ 	{
++ 		.name			= "L3DATA",
++ 		.domains		= domain_init(RDT_RESOURCE_L3DATA),
++ 		.msr_base		= IA32_L3_CBM_BASE,
++ 		.msr_update		= cat_wrmsr,
++ 		.cache_level		= 3,
++ 		.cache = {
++ 			.min_cbm_bits	= 1,
++ 			.cbm_idx_mult	= 2,
++ 			.cbm_idx_offset	= 0,
++ 		},
++ 		.parse_ctrlval		= parse_cbm,
++ 		.format_str		= "%d=%0*x",
++ 	},
++ 	{
++ 		.name			= "L3CODE",
++ 		.domains		= domain_init(RDT_RESOURCE_L3CODE),
++ 		.msr_base		= IA32_L3_CBM_BASE,
++ 		.msr_update		= cat_wrmsr,
++ 		.cache_level		= 3,
++ 		.cache = {
++ 			.min_cbm_bits	= 1,
++ 			.cbm_idx_mult	= 2,
++ 			.cbm_idx_offset	= 1,
++ 		},
++ 		.parse_ctrlval		= parse_cbm,
++ 		.format_str		= "%d=%0*x",
++ 	},
++ 	{
++ 		.name			= "L2",
++ 		.domains		= domain_init(RDT_RESOURCE_L2),
++ 		.msr_base		= IA32_L2_CBM_BASE,
++ 		.msr_update		= cat_wrmsr,
++ 		.cache_level		= 2,
++ 		.cache = {
++ 			.min_cbm_bits	= 1,
++ 			.cbm_idx_mult	= 1,
++ 			.cbm_idx_offset	= 0,
++ 		},
++ 		.parse_ctrlval		= parse_cbm,
++ 		.format_str		= "%d=%0*x",
++ 	},
++ 	{
++ 		.name			= "MB",
++ 		.domains		= domain_init(RDT_RESOURCE_MBA),
++ 		.msr_base		= IA32_MBA_THRTL_BASE,
++ 		.msr_update		= mba_wrmsr,
++ 		.cache_level		= 3,
+++>>>>>>> c6ea67de52c2 (x86/intel_rdt: Make schemata file parsers resource specific)
+  	},
+  };
+  
+diff --cc arch/x86/kernel/cpu/intel_rdt_schemata.c
+index 8594db455aa1,c72c9cc17aac..000000000000
+--- a/arch/x86/kernel/cpu/intel_rdt_schemata.c
++++ b/arch/x86/kernel/cpu/intel_rdt_schemata.c
+@@@ -34,21 -34,29 +34,41 @@@
+   *	are allowed (e.g. FFFFH, 0FF0H, 003CH, etc.).
+   * Additionally Haswell requires at least two bits set.
+   */
+- static bool cbm_validate(unsigned long var, struct rdt_resource *r)
++ static bool cbm_validate(char *buf, unsigned long *data, struct rdt_resource *r)
+  {
+++<<<<<<< HEAD
+ +	unsigned long first_bit, zero_bit;
+ +
+ +	if (var == 0 || var > r->max_cbm)
+ +		return false;
+ +
+ +	first_bit = find_first_bit(&var, r->cbm_len);
+ +	zero_bit = find_next_zero_bit(&var, r->cbm_len, first_bit);
+ +
+ +	if (find_next_bit(&var, r->cbm_len, zero_bit) < r->cbm_len)
+++=======
++ 	unsigned long first_bit, zero_bit, val;
++ 	unsigned int cbm_len = r->cache.cbm_len;
++ 	int ret;
++ 
++ 	ret = kstrtoul(buf, 16, &val);
++ 	if (ret)
++ 		return false;
++ 
++ 	if (val == 0 || val > r->default_ctrl)
++ 		return false;
++ 
++ 	first_bit = find_first_bit(&val, cbm_len);
++ 	zero_bit = find_next_zero_bit(&val, cbm_len, first_bit);
++ 
++ 	if (find_next_bit(&val, cbm_len, zero_bit) < cbm_len)
+++>>>>>>> c6ea67de52c2 (x86/intel_rdt: Make schemata file parsers resource specific)
+  		return false;
+  
+ -	if ((zero_bit - first_bit) < r->cache.min_cbm_bits)
+ +	if ((zero_bit - first_bit) < r->min_cbm_bits)
+  		return false;
++ 
++ 	*data = val;
+  	return true;
+  }
+  
+@@@ -56,21 -64,17 +76,17 @@@
+   * Read one cache bit mask (hex). Check that it is valid for the current
+   * resource type.
+   */
+- static int parse_cbm(char *buf, struct rdt_resource *r, struct rdt_domain *d)
++ int parse_cbm(char *buf, struct rdt_resource *r, struct rdt_domain *d)
+  {
+  	unsigned long data;
+- 	int ret;
+  
+ -	if (d->have_new_ctrl)
+ +	if (d->have_new_cbm)
+  		return -EINVAL;
+  
+- 	ret = kstrtoul(buf, 16, &data);
+- 	if (ret)
+- 		return ret;
+- 	if (!cbm_validate(data, r))
++ 	if(!cbm_validate(buf, &data, r))
+  		return -EINVAL;
+ -	d->new_ctrl = data;
+ -	d->have_new_ctrl = true;
+ +	d->new_cbm = data;
+ +	d->have_new_cbm = true;
+  
+  	return 0;
+  }
+@@@ -207,8 -211,8 +223,13 @@@ static void show_doms(struct seq_file *
+  	list_for_each_entry(dom, &r->domains, list) {
+  		if (sep)
+  			seq_puts(s, ";");
+++<<<<<<< HEAD
+ +		seq_printf(s, "%d=%0*x", dom->id, max_data_width,
+ +			   dom->cbm[closid]);
+++=======
++ 		seq_printf(s, r->format_str, dom->id, max_data_width,
++ 			   dom->ctrl_val[closid]);
+++>>>>>>> c6ea67de52c2 (x86/intel_rdt: Make schemata file parsers resource specific)
+  		sep = true;
+  	}
+  	seq_puts(s, "\n");
+* Unmerged path arch/x86/include/asm/intel_rdt.h
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.c
+* Unmerged path arch/x86/kernel/cpu/intel_rdt_schemata.c
