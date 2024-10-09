@@ -1,0 +1,202 @@
+net/mlx5e: RX, verify received packet size in Linear Striding RQ
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: RX, verify received packet size in Linear Striding RQ (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 96.77%
+commit-author Moshe Shemesh <moshe@mellanox.com>
+commit 0073c8f72736b423aade8a817587a5f3e4df4ad8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/0073c8f7.failed
+
+In case of striding RQ, we use  MPWRQ (Multi Packet WQE RQ), which means
+that WQE (RX descriptor) can be used for many packets and so the WQE is
+much bigger than MTU.  In virtualization setups where the port mtu can
+be larger than the vf mtu, if received packet is bigger than MTU, it
+won't be dropped by HW on too small receive WQE. If we use linear SKB in
+striding RQ, since each stride has room for mtu size payload and skb
+info, an oversized packet can lead to crash for crossing allocated page
+boundary upon the call to build_skb. So driver needs to check packet
+size and drop it.
+
+Introduce new SW rx counter, rx_oversize_pkts_sw_drop, which counts the
+number of packets dropped by the driver for being too large.
+
+As a new field is added to the RQ struct, re-open the channels whenever
+this field is being used in datapath (i.e., in the case of linear
+Striding RQ).
+
+Fixes: 619a8f2a42f1 ("net/mlx5e: Use linear SKB in Striding RQ")
+	Signed-off-by: Moshe Shemesh <moshe@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 0073c8f72736b423aade8a817587a5f3e4df4ad8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 489704305daa,871313d6b34d..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -3339,11 -3751,29 +3339,33 @@@ int mlx5e_change_mtu(struct net_device 
+  	mutex_lock(&priv->state_lock);
+  
+  	params = &priv->channels.params;
+ +	reset = !params->lro_en &&
+ +		(params->rq_wq_type != MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ);
+  
+ -	reset = !params->lro_en;
+  	reset = reset && test_bit(MLX5E_STATE_OPENED, &priv->state);
+  
+++<<<<<<< HEAD
+++=======
++ 	new_channels.params = *params;
++ 	new_channels.params.sw_mtu = new_mtu;
++ 
++ 	if (params->xdp_prog &&
++ 	    !mlx5e_rx_is_linear_skb(priv->mdev, &new_channels.params)) {
++ 		netdev_err(netdev, "MTU(%d) > %d is not allowed while XDP enabled\n",
++ 			   new_mtu, MLX5E_XDP_MAX_MTU);
++ 		err = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	if (params->rq_wq_type == MLX5_WQ_TYPE_LINKED_LIST_STRIDING_RQ) {
++ 		bool is_linear = mlx5e_rx_mpwqe_is_linear_skb(priv->mdev, &new_channels.params);
++ 		u8 ppw_old = mlx5e_mpwqe_log_pkts_per_wqe(params);
++ 		u8 ppw_new = mlx5e_mpwqe_log_pkts_per_wqe(&new_channels.params);
++ 
++ 		reset = reset && (is_linear || (ppw_old != ppw_new));
++ 	}
++ 
+++>>>>>>> 0073c8f72736 (net/mlx5e: RX, verify received packet size in Linear Striding RQ)
+  	if (!reset) {
+  		params->sw_mtu = new_mtu;
+  		if (set_mtu_cb)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index a60ee24e6b99,16985ca3248d..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -1044,6 -1088,54 +1044,57 @@@ static inline void mlx5e_mpwqe_fill_rx_
+  	/* skb linear part was allocated with headlen and aligned to long */
+  	skb->tail += headlen;
+  	skb->len  += headlen;
+++<<<<<<< HEAD
+++=======
++ 
++ 	return skb;
++ }
++ 
++ struct sk_buff *
++ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
++ 				u16 cqe_bcnt, u32 head_offset, u32 page_idx)
++ {
++ 	struct mlx5e_dma_info *di = &wi->umr.dma_info[page_idx];
++ 	u16 rx_headroom = rq->buff.headroom;
++ 	u32 cqe_bcnt32 = cqe_bcnt;
++ 	struct sk_buff *skb;
++ 	void *va, *data;
++ 	u32 frag_size;
++ 	bool consumed;
++ 
++ 	/* Check packet size. Note LRO doesn't use linear SKB */
++ 	if (unlikely(cqe_bcnt > rq->hw_mtu)) {
++ 		rq->stats->oversize_pkts_sw_drop++;
++ 		return NULL;
++ 	}
++ 
++ 	va             = page_address(di->page) + head_offset;
++ 	data           = va + rx_headroom;
++ 	frag_size      = MLX5_SKB_FRAG_SZ(rx_headroom + cqe_bcnt32);
++ 
++ 	dma_sync_single_range_for_cpu(rq->pdev, di->addr, head_offset,
++ 				      frag_size, DMA_FROM_DEVICE);
++ 	prefetchw(va); /* xdp_frame data area */
++ 	prefetch(data);
++ 
++ 	rcu_read_lock();
++ 	consumed = mlx5e_xdp_handle(rq, di, va, &rx_headroom, &cqe_bcnt32);
++ 	rcu_read_unlock();
++ 	if (consumed) {
++ 		if (__test_and_clear_bit(MLX5E_RQ_FLAG_XDP_XMIT, rq->flags))
++ 			__set_bit(page_idx, wi->xdp_xmit_bitmap); /* non-atomic */
++ 		return NULL; /* page/packet was consumed by XDP */
++ 	}
++ 
++ 	skb = mlx5e_build_linear_skb(rq, va, frag_size, rx_headroom, cqe_bcnt32);
++ 	if (unlikely(!skb))
++ 		return NULL;
++ 
++ 	/* queue up for recycling/reuse */
++ 	page_ref_inc(di->page);
++ 
++ 	return skb;
+++>>>>>>> 0073c8f72736 (net/mlx5e: RX, verify received packet size in Linear Striding RQ)
+  }
+  
+  void mlx5e_handle_rx_cqe_mpwrq(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 4a9c2819d01c..a9c5b50c26cf 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -520,6 +520,7 @@ struct mlx5e_rq {
+ 
+ 	unsigned long          state;
+ 	int                    ix;
++	unsigned int           hw_mtu;
+ 
+ 	struct net_dim         dim; /* Dynamic Interrupt Moderation */
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+index 525df44c9b3c..735f0ba91392 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+@@ -65,6 +65,7 @@ static const struct counter_desc sw_stats_desc[] = {
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_wqe_err) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_mpwqe_filler_cqes) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_mpwqe_filler_strides) },
++	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_oversize_pkts_sw_drop) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_buff_alloc_err) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_cqe_compress_blks) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_cqe_compress_pkts) },
+@@ -132,6 +133,7 @@ static void mlx5e_grp_sw_update_stats(struct mlx5e_priv *priv)
+ 		s->rx_wqe_err   += rq_stats->wqe_err;
+ 		s->rx_mpwqe_filler_cqes    += rq_stats->mpwqe_filler_cqes;
+ 		s->rx_mpwqe_filler_strides += rq_stats->mpwqe_filler_strides;
++		s->rx_oversize_pkts_sw_drop += rq_stats->oversize_pkts_sw_drop;
+ 		s->rx_buff_alloc_err += rq_stats->buff_alloc_err;
+ 		s->rx_cqe_compress_blks += rq_stats->cqe_compress_blks;
+ 		s->rx_cqe_compress_pkts += rq_stats->cqe_compress_pkts;
+@@ -1082,6 +1084,7 @@ static const struct counter_desc rq_stats_desc[] = {
+ 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, wqe_err) },
+ 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, mpwqe_filler_cqes) },
+ 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, mpwqe_filler_strides) },
++	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, oversize_pkts_sw_drop) },
+ 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, buff_alloc_err) },
+ 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, cqe_compress_blks) },
+ 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, cqe_compress_pkts) },
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+index 9c603217203a..228ffb8f68b0 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+@@ -83,6 +83,7 @@ struct mlx5e_sw_stats {
+ 	u64 rx_wqe_err;
+ 	u64 rx_mpwqe_filler_cqes;
+ 	u64 rx_mpwqe_filler_strides;
++	u64 rx_oversize_pkts_sw_drop;
+ 	u64 rx_buff_alloc_err;
+ 	u64 rx_cqe_compress_blks;
+ 	u64 rx_cqe_compress_pkts;
+@@ -173,6 +174,7 @@ struct mlx5e_rq_stats {
+ 	u64 wqe_err;
+ 	u64 mpwqe_filler_cqes;
+ 	u64 mpwqe_filler_strides;
++	u64 oversize_pkts_sw_drop;
+ 	u64 buff_alloc_err;
+ 	u64 cqe_compress_blks;
+ 	u64 cqe_compress_pkts;
