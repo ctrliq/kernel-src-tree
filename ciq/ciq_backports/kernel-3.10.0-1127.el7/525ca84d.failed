@@ -1,0 +1,400 @@
+percpu: use metadata blocks to update the chunk contig hint
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Dennis Zhou (Facebook) <dennisszhou@gmail.com>
+commit 525ca84daec01825b0d037f5fcf60adb7f510118
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/525ca84d.failed
+
+The largest free region will either be a block level contig hint or an
+aggregate over the left_free and right_free areas of blocks. This is a
+much smaller set of free areas that need to be checked than a full
+traverse.
+
+	Signed-off-by: Dennis Zhou <dennisszhou@gmail.com>
+	Reviewed-by: Josef Bacik <jbacik@fb.com>
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+(cherry picked from commit 525ca84daec01825b0d037f5fcf60adb7f510118)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/percpu.c
+diff --cc mm/percpu.c
+index 3c1f6f694380,0f05647d9547..000000000000
+--- a/mm/percpu.c
++++ b/mm/percpu.c
+@@@ -265,21 -266,106 +265,82 @@@ static void __maybe_unused pcpu_next_po
+  }
+  
+  /*
+ - * Bitmap region iterators.  Iterates over the bitmap between
+ - * [@start, @end) in @chunk.  @rs and @re should be integer variables
+ - * and will be set to start and end index of the current free region.
+ - */
+ -#define pcpu_for_each_unpop_region(bitmap, rs, re, start, end)		     \
+ -	for ((rs) = (start), pcpu_next_unpop((bitmap), &(rs), &(re), (end)); \
+ -	     (rs) < (re);						     \
+ -	     (rs) = (re) + 1, pcpu_next_unpop((bitmap), &(rs), &(re), (end)))
+ -
+ -#define pcpu_for_each_pop_region(bitmap, rs, re, start, end)		     \
+ -	for ((rs) = (start), pcpu_next_pop((bitmap), &(rs), &(re), (end));   \
+ -	     (rs) < (re);						     \
+ -	     (rs) = (re) + 1, pcpu_next_pop((bitmap), &(rs), &(re), (end)))
+ -
+ -/*
+ - * The following are helper functions to help access bitmaps and convert
+ - * between bitmap offsets to address offsets.
+ + * (Un)populated page region iterators.  Iterate over (un)populated
+ + * page regions between @start and @end in @chunk.  @rs and @re should
+ + * be integer variables and will be set to start and end page index of
+ + * the current region.
+   */
+ -static unsigned long *pcpu_index_alloc_map(struct pcpu_chunk *chunk, int index)
+ -{
+ -	return chunk->alloc_map +
+ -	       (index * PCPU_BITMAP_BLOCK_BITS / BITS_PER_LONG);
+ -}
+ -
+ -static unsigned long pcpu_off_to_block_index(int off)
+ -{
+ -	return off / PCPU_BITMAP_BLOCK_BITS;
+ -}
+ -
+ -static unsigned long pcpu_off_to_block_off(int off)
+ -{
+ -	return off & (PCPU_BITMAP_BLOCK_BITS - 1);
+ -}
+ +#define pcpu_for_each_unpop_region(chunk, rs, re, start, end)		    \
+ +	for ((rs) = (start), pcpu_next_unpop((chunk), &(rs), &(re), (end)); \
+ +	     (rs) < (re);						    \
+ +	     (rs) = (re) + 1, pcpu_next_unpop((chunk), &(rs), &(re), (end)))
+  
+ -static unsigned long pcpu_block_off_to_off(int index, int off)
+ -{
+ -	return index * PCPU_BITMAP_BLOCK_BITS + off;
+ -}
+ +#define pcpu_for_each_pop_region(chunk, rs, re, start, end)		    \
+ +	for ((rs) = (start), pcpu_next_pop((chunk), &(rs), &(re), (end));   \
+ +	     (rs) < (re);						    \
+ +	     (rs) = (re) + 1, pcpu_next_pop((chunk), &(rs), &(re), (end)))
+  
++ /**
++  * pcpu_next_md_free_region - finds the next hint free area
++  * @chunk: chunk of interest
++  * @bit_off: chunk offset
++  * @bits: size of free area
++  *
++  * Helper function for pcpu_for_each_md_free_region.  It checks
++  * block->contig_hint and performs aggregation across blocks to find the
++  * next hint.  It modifies bit_off and bits in-place to be consumed in the
++  * loop.
++  */
++ static void pcpu_next_md_free_region(struct pcpu_chunk *chunk, int *bit_off,
++ 				     int *bits)
++ {
++ 	int i = pcpu_off_to_block_index(*bit_off);
++ 	int block_off = pcpu_off_to_block_off(*bit_off);
++ 	struct pcpu_block_md *block;
++ 
++ 	*bits = 0;
++ 	for (block = chunk->md_blocks + i; i < pcpu_chunk_nr_blocks(chunk);
++ 	     block++, i++) {
++ 		/* handles contig area across blocks */
++ 		if (*bits) {
++ 			*bits += block->left_free;
++ 			if (block->left_free == PCPU_BITMAP_BLOCK_BITS)
++ 				continue;
++ 			return;
++ 		}
++ 
++ 		/*
++ 		 * This checks three things.  First is there a contig_hint to
++ 		 * check.  Second, have we checked this hint before by
++ 		 * comparing the block_off.  Third, is this the same as the
++ 		 * right contig hint.  In the last case, it spills over into
++ 		 * the next block and should be handled by the contig area
++ 		 * across blocks code.
++ 		 */
++ 		*bits = block->contig_hint;
++ 		if (*bits && block->contig_hint_start >= block_off &&
++ 		    *bits + block->contig_hint_start < PCPU_BITMAP_BLOCK_BITS) {
++ 			*bit_off = pcpu_block_off_to_off(i,
++ 					block->contig_hint_start);
++ 			return;
++ 		}
++ 
++ 		*bits = block->right_free;
++ 		*bit_off = (i + 1) * PCPU_BITMAP_BLOCK_BITS - block->right_free;
++ 	}
++ }
++ 
++ /*
++  * Metadata free area iterators.  These perform aggregation of free areas
++  * based on the metadata blocks and return the offset @bit_off and size in
++  * bits of the free area @bits.
++  */
++ #define pcpu_for_each_md_free_region(chunk, bit_off, bits)		\
++ 	for (pcpu_next_md_free_region((chunk), &(bit_off), &(bits));	\
++ 	     (bit_off) < pcpu_chunk_map_bits((chunk));			\
++ 	     (bit_off) += (bits) + 1,					\
++ 	     pcpu_next_md_free_region((chunk), &(bit_off), &(bits)))
++ 
+  /**
+   * pcpu_mem_zalloc - allocate memory
+   * @size: bytes to allocate
+@@@ -481,52 -483,204 +542,210 @@@ out_unlock
+  }
+  
+  /**
+ - * pcpu_chunk_refresh_hint - updates metadata about a chunk
+ - * @chunk: chunk of interest
+ - *
+ + * pcpu_fit_in_area - try to fit the requested allocation in a candidate area
+ + * @chunk: chunk the candidate area belongs to
+ + * @off: the offset to the start of the candidate area
+ + * @this_size: the size of the candidate area
+ + * @size: the size of the target allocation
+ + * @align: the alignment of the target allocation
+ + * @pop_only: only allocate from already populated region
+ + *
+++<<<<<<< HEAD
+ + * We're trying to allocate @size bytes aligned at @align.  @chunk's area
+ + * at @off sized @this_size is a candidate.  This function determines
+ + * whether the target allocation fits in the candidate area and returns the
+ + * number of bytes to pad after @off.  If the target area doesn't fit, -1
+ + * is returned.
+ + *
+ + * If @pop_only is %true, this function only considers the already
+ + * populated part of the candidate area.
+++=======
++  * Iterates over the metadata blocks to find the largest contig area.
++  * It also counts the populated pages and uses the delta to update the
++  * global count.
++  *
++  * Updates:
++  *      chunk->contig_bits
++  *      chunk->contig_bits_start
++  *      nr_empty_pop_pages (chunk and global)
+++>>>>>>> 525ca84daec0 (percpu: use metadata blocks to update the chunk contig hint)
+   */
+ -static void pcpu_chunk_refresh_hint(struct pcpu_chunk *chunk)
+ +static int pcpu_fit_in_area(struct pcpu_chunk *chunk, int off, int this_size,
+ +			    int size, int align, bool pop_only)
+  {
+++<<<<<<< HEAD
+ +	int cand_off = off;
+++=======
++ 	int bit_off, bits, nr_empty_pop_pages;
+++>>>>>>> 525ca84daec0 (percpu: use metadata blocks to update the chunk contig hint)
+ +
+ +	while (true) {
+ +		int head = ALIGN(cand_off, align) - off;
+ +		int page_start, page_end, rs, re;
+  
+ -	/* clear metadata */
+ -	chunk->contig_bits = 0;
+++<<<<<<< HEAD
+ +		if (this_size < head + size)
+ +			return -1;
+  
+ +		if (!pop_only)
+ +			return head;
+ +
+++=======
++ 	bit_off = chunk->first_bit;
++ 	bits = nr_empty_pop_pages = 0;
++ 	pcpu_for_each_md_free_region(chunk, bit_off, bits) {
++ 		pcpu_chunk_update(chunk, bit_off, bits);
++ 
++ 		nr_empty_pop_pages += pcpu_cnt_pop_pages(chunk, bit_off, bits);
++ 	}
++ 
++ 	/*
++ 	 * Keep track of nr_empty_pop_pages.
++ 	 *
++ 	 * The chunk maintains the previous number of free pages it held,
++ 	 * so the delta is used to update the global counter.  The reserved
++ 	 * chunk is not part of the free page count as they are populated
++ 	 * at init and are special to serving reserved allocations.
++ 	 */
++ 	if (chunk != pcpu_reserved_chunk)
++ 		pcpu_nr_empty_pop_pages +=
++ 			(nr_empty_pop_pages - chunk->nr_empty_pop_pages);
++ 
++ 	chunk->nr_empty_pop_pages = nr_empty_pop_pages;
++ }
++ 
++ /**
++  * pcpu_block_update - updates a block given a free area
++  * @block: block of interest
++  * @start: start offset in block
++  * @end: end offset in block
++  *
++  * Updates a block given a known free area.  The region [start, end) is
++  * expected to be the entirety of the free area within a block.  Chooses
++  * the best starting offset if the contig hints are equal.
++  */
++ static void pcpu_block_update(struct pcpu_block_md *block, int start, int end)
++ {
++ 	int contig = end - start;
++ 
++ 	block->first_free = min(block->first_free, start);
++ 	if (start == 0)
++ 		block->left_free = contig;
++ 
++ 	if (end == PCPU_BITMAP_BLOCK_BITS)
++ 		block->right_free = contig;
++ 
++ 	if (contig > block->contig_hint) {
++ 		block->contig_hint_start = start;
++ 		block->contig_hint = contig;
++ 	} else if (block->contig_hint_start && contig == block->contig_hint &&
++ 		   (!start || __ffs(start) > __ffs(block->contig_hint_start))) {
++ 		/* use the start with the best alignment */
++ 		block->contig_hint_start = start;
++ 	}
++ }
++ 
++ /**
++  * pcpu_block_refresh_hint
++  * @chunk: chunk of interest
++  * @index: index of the metadata block
++  *
++  * Scans over the block beginning at first_free and updates the block
++  * metadata accordingly.
++  */
++ static void pcpu_block_refresh_hint(struct pcpu_chunk *chunk, int index)
++ {
++ 	struct pcpu_block_md *block = chunk->md_blocks + index;
++ 	unsigned long *alloc_map = pcpu_index_alloc_map(chunk, index);
++ 	int rs, re;	/* region start, region end */
++ 
++ 	/* clear hints */
++ 	block->contig_hint = 0;
++ 	block->left_free = block->right_free = 0;
++ 
++ 	/* iterate over free areas and update the contig hints */
++ 	pcpu_for_each_unpop_region(alloc_map, rs, re, block->first_free,
++ 				   PCPU_BITMAP_BLOCK_BITS) {
++ 		pcpu_block_update(block, rs, re);
++ 	}
++ }
++ 
++ /**
++  * pcpu_block_update_hint_alloc - update hint on allocation path
++  * @chunk: chunk of interest
++  * @bit_off: chunk offset
++  * @bits: size of request
++  *
++  * Updates metadata for the allocation path.  The metadata only has to be
++  * refreshed by a full scan iff the chunk's contig hint is broken.  Block level
++  * scans are required if the block's contig hint is broken.
++  */
++ static void pcpu_block_update_hint_alloc(struct pcpu_chunk *chunk, int bit_off,
++ 					 int bits)
++ {
++ 	struct pcpu_block_md *s_block, *e_block, *block;
++ 	int s_index, e_index;	/* block indexes of the freed allocation */
++ 	int s_off, e_off;	/* block offsets of the freed allocation */
++ 
++ 	/*
++ 	 * Calculate per block offsets.
++ 	 * The calculation uses an inclusive range, but the resulting offsets
++ 	 * are [start, end).  e_index always points to the last block in the
++ 	 * range.
++ 	 */
++ 	s_index = pcpu_off_to_block_index(bit_off);
++ 	e_index = pcpu_off_to_block_index(bit_off + bits - 1);
++ 	s_off = pcpu_off_to_block_off(bit_off);
++ 	e_off = pcpu_off_to_block_off(bit_off + bits - 1) + 1;
++ 
++ 	s_block = chunk->md_blocks + s_index;
++ 	e_block = chunk->md_blocks + e_index;
++ 
++ 	/*
++ 	 * Update s_block.
++ 	 * block->first_free must be updated if the allocation takes its place.
++ 	 * If the allocation breaks the contig_hint, a scan is required to
++ 	 * restore this hint.
++ 	 */
++ 	if (s_off == s_block->first_free)
++ 		s_block->first_free = find_next_zero_bit(
++ 					pcpu_index_alloc_map(chunk, s_index),
++ 					PCPU_BITMAP_BLOCK_BITS,
++ 					s_off + bits);
++ 
++ 	if (s_off >= s_block->contig_hint_start &&
++ 	    s_off < s_block->contig_hint_start + s_block->contig_hint) {
++ 		/* block contig hint is broken - scan to fix it */
++ 		pcpu_block_refresh_hint(chunk, s_index);
++ 	} else {
++ 		/* update left and right contig manually */
++ 		s_block->left_free = min(s_block->left_free, s_off);
++ 		if (s_index == e_index)
++ 			s_block->right_free = min_t(int, s_block->right_free,
++ 					PCPU_BITMAP_BLOCK_BITS - e_off);
++ 		else
++ 			s_block->right_free = 0;
++ 	}
++ 
++ 	/*
++ 	 * Update e_block.
++ 	 */
++ 	if (s_index != e_index) {
+++>>>>>>> 525ca84daec0 (percpu: use metadata blocks to update the chunk contig hint)
+  		/*
+ -		 * When the allocation is across blocks, the end is along
+ -		 * the left part of the e_block.
+ +		 * If the first unpopulated page is beyond the end of the
+ +		 * allocation, the whole allocation is populated;
+ +		 * otherwise, retry from the end of the unpopulated area.
+  		 */
+ -		e_block->first_free = find_next_zero_bit(
+ -				pcpu_index_alloc_map(chunk, e_index),
+ -				PCPU_BITMAP_BLOCK_BITS, e_off);
+ -
+ -		if (e_off == PCPU_BITMAP_BLOCK_BITS) {
+ -			/* reset the block */
+ -			e_block++;
+ -		} else {
+ -			if (e_off > e_block->contig_hint_start) {
+ -				/* contig hint is broken - scan to fix it */
+ -				pcpu_block_refresh_hint(chunk, e_index);
+ -			} else {
+ -				e_block->left_free = 0;
+ -				e_block->right_free =
+ -					min_t(int, e_block->right_free,
+ -					      PCPU_BITMAP_BLOCK_BITS - e_off);
+ -			}
+ -		}
+ -
+ -		/* update in-between md_blocks */
+ -		for (block = s_block + 1; block < e_block; block++) {
+ -			block->contig_hint = 0;
+ -			block->left_free = 0;
+ -			block->right_free = 0;
+ -		}
+ +		page_start = PFN_DOWN(head + off);
+ +		page_end = PFN_UP(head + off + size);
+ +
+ +		rs = page_start;
+ +		pcpu_next_unpop(chunk, &rs, &re, PFN_UP(off + this_size));
+ +		if (rs >= page_end)
+ +			return head;
+ +		cand_off = re * PAGE_SIZE;
+  	}
+ -
+ -	/*
+ -	 * The only time a full chunk scan is required is if the chunk
+ -	 * contig hint is broken.  Otherwise, it means a smaller space
+ -	 * was used and therefore the chunk contig hint is still correct.
+ -	 */
+ -	if (bit_off >= chunk->contig_bits_start  &&
+ -	    bit_off < chunk->contig_bits_start + chunk->contig_bits)
+ -		pcpu_chunk_refresh_hint(chunk);
+  }
+  
+  /**
+* Unmerged path mm/percpu.c
