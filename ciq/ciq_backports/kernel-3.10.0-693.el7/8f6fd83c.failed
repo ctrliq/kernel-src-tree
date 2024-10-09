@@ -1,0 +1,218 @@
+rhashtable: accept GFP flags in rhashtable_walk_init
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Bob Copeland <me@bobcopeland.com>
+commit 8f6fd83c6c5ec66a4a70c728535ddcdfef4f3697
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8f6fd83c.failed
+
+In certain cases, the 802.11 mesh pathtable code wants to
+iterate over all of the entries in the forwarding table from
+the receive path, which is inside an RCU read-side critical
+section.  Enable walks inside atomic sections by allowing
+GFP_ATOMIC allocations for the walker state.
+
+Change all existing callsites to pass in GFP_KERNEL.
+
+	Acked-by: Thomas Graf <tgraf@suug.ch>
+	Signed-off-by: Bob Copeland <me@bobcopeland.com>
+[also adjust gfs2/glock.c and rhashtable tests]
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 8f6fd83c6c5ec66a4a70c728535ddcdfef4f3697)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/ila/ila_xlat.c
+#	net/sctp/proc.c
+diff --cc net/sctp/proc.c
+index 6343aa3d9479,6d45d53321e6..000000000000
+--- a/net/sctp/proc.c
++++ b/net/sctp/proc.c
+@@@ -287,23 -280,56 +287,53 @@@ void sctp_eps_proc_exit(struct net *net
+  struct sctp_ht_iter {
+  	struct seq_net_private p;
+  	struct rhashtable_iter hti;
+ +	int start_fail;
+  };
+  
+ -static struct sctp_transport *sctp_transport_get_next(struct seq_file *seq)
+ +static void *sctp_transport_seq_start(struct seq_file *seq, loff_t *pos)
+  {
+  	struct sctp_ht_iter *iter = seq->private;
+ -	struct sctp_transport *t;
+ -
+ -	t = rhashtable_walk_next(&iter->hti);
+ -	for (; t; t = rhashtable_walk_next(&iter->hti)) {
+ -		if (IS_ERR(t)) {
+ -			if (PTR_ERR(t) == -EAGAIN)
+ -				continue;
+ -			break;
+ -		}
+ +	int err = sctp_transport_walk_start(&iter->hti);
+  
+ -		if (net_eq(sock_net(t->asoc->base.sk), seq_file_net(seq)) &&
+ -		    t->asoc->peer.primary_path == t)
+ -			break;
+ +	if (err) {
+ +		iter->start_fail = 1;
+ +		return ERR_PTR(err);
+  	}
+  
+ -	return t;
+ +	return sctp_transport_get_idx(seq_file_net(seq), &iter->hti, *pos);
+  }
+  
+++<<<<<<< HEAD
+ +static void sctp_transport_seq_stop(struct seq_file *seq, void *v)
+++=======
++ static struct sctp_transport *sctp_transport_get_idx(struct seq_file *seq,
++ 						     loff_t pos)
++ {
++ 	void *obj = SEQ_START_TOKEN;
++ 
++ 	while (pos && (obj = sctp_transport_get_next(seq)) && !IS_ERR(obj))
++ 		pos--;
++ 
++ 	return obj;
++ }
++ 
++ static int sctp_transport_walk_start(struct seq_file *seq)
++ {
++ 	struct sctp_ht_iter *iter = seq->private;
++ 	int err;
++ 
++ 	err = rhashtable_walk_init(&sctp_transport_hashtable, &iter->hti,
++ 				   GFP_KERNEL);
++ 	if (err)
++ 		return err;
++ 
++ 	err = rhashtable_walk_start(&iter->hti);
++ 
++ 	return err == -EAGAIN ? 0 : err;
++ }
++ 
++ static void sctp_transport_walk_stop(struct seq_file *seq)
+++>>>>>>> 8f6fd83c6c5e (rhashtable: accept GFP flags in rhashtable_walk_init)
+  {
+  	struct sctp_ht_iter *iter = seq->private;
+  
+* Unmerged path net/ipv6/ila/ila_xlat.c
+diff --git a/fs/gfs2/glock.c b/fs/gfs2/glock.c
+index 1c186f9ec4d1..69dbedd24541 100644
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@ -1923,7 +1923,7 @@ static int gfs2_glocks_open(struct inode *inode, struct file *file)
+ 		if (seq->buf)
+ 			seq->size = GFS2_SEQ_GOODSIZE;
+ 		gi->gl = NULL;
+-		ret = rhashtable_walk_init(&gl_hash_table, &gi->hti);
++		ret = rhashtable_walk_init(&gl_hash_table, &gi->hti, GFP_KERNEL);
+ 	}
+ 	return ret;
+ }
+@@ -1951,7 +1951,7 @@ static int gfs2_glstats_open(struct inode *inode, struct file *file)
+ 		if (seq->buf)
+ 			seq->size = GFS2_SEQ_GOODSIZE;
+ 		gi->gl = NULL;
+-		ret = rhashtable_walk_init(&gl_hash_table, &gi->hti);
++		ret = rhashtable_walk_init(&gl_hash_table, &gi->hti, GFP_KERNEL);
+ 	}
+ 	return ret;
+ }
+diff --git a/include/linux/rhashtable.h b/include/linux/rhashtable.h
+index 63bd7601b6de..3eef0802a0cd 100644
+--- a/include/linux/rhashtable.h
++++ b/include/linux/rhashtable.h
+@@ -346,7 +346,8 @@ struct bucket_table *rhashtable_insert_slow(struct rhashtable *ht,
+ 					    struct bucket_table *old_tbl);
+ int rhashtable_insert_rehash(struct rhashtable *ht, struct bucket_table *tbl);
+ 
+-int rhashtable_walk_init(struct rhashtable *ht, struct rhashtable_iter *iter);
++int rhashtable_walk_init(struct rhashtable *ht, struct rhashtable_iter *iter,
++			 gfp_t gfp);
+ void rhashtable_walk_exit(struct rhashtable_iter *iter);
+ int rhashtable_walk_start(struct rhashtable_iter *iter) __acquires(RCU);
+ void *rhashtable_walk_next(struct rhashtable_iter *iter);
+diff --git a/lib/rhashtable.c b/lib/rhashtable.c
+index cc808707d1cf..5d845ffd7982 100644
+--- a/lib/rhashtable.c
++++ b/lib/rhashtable.c
+@@ -487,6 +487,7 @@ EXPORT_SYMBOL_GPL(rhashtable_insert_slow);
+  * rhashtable_walk_init - Initialise an iterator
+  * @ht:		Table to walk over
+  * @iter:	Hash table Iterator
++ * @gfp:	GFP flags for allocations
+  *
+  * This function prepares a hash table walk.
+  *
+@@ -504,14 +505,15 @@ EXPORT_SYMBOL_GPL(rhashtable_insert_slow);
+  * You must call rhashtable_walk_exit if this function returns
+  * successfully.
+  */
+-int rhashtable_walk_init(struct rhashtable *ht, struct rhashtable_iter *iter)
++int rhashtable_walk_init(struct rhashtable *ht, struct rhashtable_iter *iter,
++			 gfp_t gfp)
+ {
+ 	iter->ht = ht;
+ 	iter->p = NULL;
+ 	iter->slot = 0;
+ 	iter->skip = 0;
+ 
+-	iter->walker = kmalloc(sizeof(*iter->walker), GFP_KERNEL);
++	iter->walker = kmalloc(sizeof(*iter->walker), gfp);
+ 	if (!iter->walker)
+ 		return -ENOMEM;
+ 
+diff --git a/lib/test_rhashtable.c b/lib/test_rhashtable.c
+index c92a7f480ab5..2a2a100504da 100644
+--- a/lib/test_rhashtable.c
++++ b/lib/test_rhashtable.c
+@@ -118,7 +118,7 @@ static void test_bucket_stats(struct rhashtable *ht)
+ 	struct rhashtable_iter hti;
+ 	struct rhash_head *pos;
+ 
+-	err = rhashtable_walk_init(ht, &hti);
++	err = rhashtable_walk_init(ht, &hti, GFP_KERNEL);
+ 	if (err) {
+ 		pr_warn("Test failed: allocation error");
+ 		return;
+* Unmerged path net/ipv6/ila/ila_xlat.c
+diff --git a/net/netfilter/nft_hash.c b/net/netfilter/nft_hash.c
+index 3f9d45d3d9b7..6fa016564f90 100644
+--- a/net/netfilter/nft_hash.c
++++ b/net/netfilter/nft_hash.c
+@@ -192,7 +192,7 @@ static void nft_hash_walk(const struct nft_ctx *ctx, const struct nft_set *set,
+ 	u8 genmask = nft_genmask_cur(read_pnet(&set->pnet));
+ 	int err;
+ 
+-	err = rhashtable_walk_init(&priv->ht, &hti);
++	err = rhashtable_walk_init(&priv->ht, &hti, GFP_KERNEL);
+ 	iter->err = err;
+ 	if (err)
+ 		return;
+@@ -248,7 +248,7 @@ static void nft_hash_gc(struct work_struct *work)
+ 	priv = container_of(work, struct nft_hash, gc_work.work);
+ 	set  = nft_set_container_of(priv);
+ 
+-	err = rhashtable_walk_init(&priv->ht, &hti);
++	err = rhashtable_walk_init(&priv->ht, &hti, GFP_KERNEL);
+ 	if (err)
+ 		goto schedule;
+ 
+diff --git a/net/netlink/af_netlink.c b/net/netlink/af_netlink.c
+index 0fd422065eb1..72d0649f170a 100644
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@ -2986,7 +2986,8 @@ static int netlink_walk_start(struct nl_seq_iter *iter)
+ {
+ 	int err;
+ 
+-	err = rhashtable_walk_init(&nl_table[iter->link].hash, &iter->hti);
++	err = rhashtable_walk_init(&nl_table[iter->link].hash, &iter->hti,
++				   GFP_KERNEL);
+ 	if (err) {
+ 		iter->link = MAX_LINKS;
+ 		return err;
+* Unmerged path net/sctp/proc.c
