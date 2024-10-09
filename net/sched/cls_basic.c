@@ -84,16 +84,21 @@ static int basic_init(struct tcf_proto *tp)
 	return 0;
 }
 
+static void __basic_delete_filter(struct basic_filter *f)
+{
+	tcf_exts_destroy(&f->exts);
+	tcf_em_tree_destroy(&f->ematches);
+	tcf_exts_put_net(&f->exts);
+	kfree(f);
+}
+
 static void basic_delete_filter_work(struct work_struct *work)
 {
 	struct basic_filter *f = container_of(work, struct basic_filter, work);
 
 	rtnl_lock();
-	tcf_exts_destroy(&f->exts);
-	tcf_em_tree_destroy(&f->ematches);
+	__basic_delete_filter(f);
 	rtnl_unlock();
-
-	kfree(f);
 }
 
 static void basic_delete_filter(struct rcu_head *head)
@@ -115,7 +120,10 @@ static bool basic_destroy(struct tcf_proto *tp, bool force)
 	list_for_each_entry_safe(f, n, &head->flist, link) {
 		list_del_rcu(&f->link);
 		tcf_unbind_filter(tp, &f->res);
-		call_rcu(&f->rcu, basic_delete_filter);
+		if (tcf_exts_get_net(&f->exts))
+			call_rcu(&f->rcu, basic_delete_filter);
+		else
+			__basic_delete_filter(f);
 	}
 	kfree_rcu(head, rcu);
 	return true;
@@ -127,6 +135,7 @@ static int basic_delete(struct tcf_proto *tp, unsigned long arg)
 
 	list_del_rcu(&f->link);
 	tcf_unbind_filter(tp, &f->res);
+	tcf_exts_get_net(&f->exts);
 	call_rcu(&f->rcu, basic_delete_filter);
 	return 0;
 }
@@ -226,6 +235,7 @@ static int basic_change(struct net *net, struct sk_buff *in_skb,
 	if (fold) {
 		list_replace_rcu(&fold->link, &fnew->link);
 		tcf_unbind_filter(tp, &fold->res);
+		tcf_exts_get_net(&fold->exts);
 		call_rcu(&fold->rcu, basic_delete_filter);
 	} else {
 		list_add_rcu(&fnew->link, &head->flist);
