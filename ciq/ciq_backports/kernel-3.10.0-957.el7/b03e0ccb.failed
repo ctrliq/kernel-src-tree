@@ -1,0 +1,285 @@
+md: remove special meaning of ->quiesce(.., 2)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [md] remove special meaning of ->quiesce(.., 2) (Nigel Croxon) [1494474]
+Rebuild_FUZZ: 95.45%
+commit-author NeilBrown <neilb@suse.com>
+commit b03e0ccb5ab9df3efbe51c87843a1ffbecbafa1f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b03e0ccb.failed
+
+The '2' argument means "wake up anything that is waiting".
+This is an inelegant part of the design and was added
+to help support management of suspend_lo/suspend_hi setting.
+Now that suspend_lo/hi is managed in mddev_suspend/resume,
+that need is gone.
+These is still a couple of places where we call 'quiesce'
+with an argument of '2', but they can safely be changed to
+call ->quiesce(.., 1); ->quiesce(.., 0) which
+achieve the same result at the small cost of pausing IO
+briefly.
+
+This removes a small "optimization" from suspend_{hi,lo}_store,
+but it isn't clear that optimization served a useful purpose.
+The code now is a lot clearer.
+
+	Suggested-by: Shaohua Li <shli@kernel.org>
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit b03e0ccb5ab9df3efbe51c87843a1ffbecbafa1f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md-cluster.c
+* Unmerged path drivers/md/md-cluster.c
+* Unmerged path drivers/md/md-cluster.c
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index f5afb2e75494..6a50152e314c 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -4774,7 +4774,7 @@ suspend_lo_show(struct mddev *mddev, char *page)
+ static ssize_t
+ suspend_lo_store(struct mddev *mddev, const char *buf, size_t len)
+ {
+-	unsigned long long old, new;
++	unsigned long long new;
+ 	int err;
+ 
+ 	err = kstrtoull(buf, 10, &new);
+@@ -4790,17 +4790,10 @@ suspend_lo_store(struct mddev *mddev, const char *buf, size_t len)
+ 	if (mddev->pers == NULL ||
+ 	    mddev->pers->quiesce == NULL)
+ 		goto unlock;
+-	old = mddev->suspend_lo;
++	mddev_suspend(mddev);
+ 	mddev->suspend_lo = new;
+-	if (new >= old) {
+-		/* Shrinking suspended region */
+-		wake_up(&mddev->sb_wait);
+-		mddev->pers->quiesce(mddev, 2);
+-	} else {
+-		/* Expanding suspended region - need to wait */
+-		mddev_suspend(mddev);
+-		mddev_resume(mddev);
+-	}
++	mddev_resume(mddev);
++
+ 	err = 0;
+ unlock:
+ 	mddev_unlock(mddev);
+@@ -4818,7 +4811,7 @@ suspend_hi_show(struct mddev *mddev, char *page)
+ static ssize_t
+ suspend_hi_store(struct mddev *mddev, const char *buf, size_t len)
+ {
+-	unsigned long long old, new;
++	unsigned long long new;
+ 	int err;
+ 
+ 	err = kstrtoull(buf, 10, &new);
+@@ -4831,20 +4824,13 @@ suspend_hi_store(struct mddev *mddev, const char *buf, size_t len)
+ 	if (err)
+ 		return err;
+ 	err = -EINVAL;
+-	if (mddev->pers == NULL ||
+-	    mddev->pers->quiesce == NULL)
++	if (mddev->pers == NULL)
+ 		goto unlock;
+-	old = mddev->suspend_hi;
++
++	mddev_suspend(mddev);
+ 	mddev->suspend_hi = new;
+-	if (new <= old) {
+-		/* Shrinking suspended region */
+-		wake_up(&mddev->sb_wait);
+-		mddev->pers->quiesce(mddev, 2);
+-	} else {
+-		/* Expanding suspended region - need to wait */
+-		mddev_suspend(mddev);
+-		mddev_resume(mddev);
+-	}
++	mddev_resume(mddev);
++
+ 	err = 0;
+ unlock:
+ 	mddev_unlock(mddev);
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index 6f7f96f635fa..e48d0fcf4a62 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -540,12 +540,11 @@ struct md_personality
+ 	int (*check_reshape) (struct mddev *mddev);
+ 	int (*start_reshape) (struct mddev *mddev);
+ 	void (*finish_reshape) (struct mddev *mddev);
+-	/* quiesce moves between quiescence states
+-	 * 0 - fully active
+-	 * 1 - no new requests allowed
+-	 * others - reserved
++	/* quiesce suspends or resumes internal processing.
++	 * 1 - stop new actions and wait for action io to complete
++	 * 0 - return to normal behaviour
+ 	 */
+-	void (*quiesce) (struct mddev *mddev, int state);
++	void (*quiesce) (struct mddev *mddev, int quiesce);
+ 	/* takeover is used to transition an array from one
+ 	 * personality to another.  The new personality must be able
+ 	 * to handle the data in the current layout.
+diff --git a/drivers/md/raid0.c b/drivers/md/raid0.c
+index 084297c45268..f01d75eeed47 100644
+--- a/drivers/md/raid0.c
++++ b/drivers/md/raid0.c
+@@ -910,7 +910,7 @@ static void *raid0_takeover(struct mddev *mddev)
+ 	return ERR_PTR(-EINVAL);
+ }
+ 
+-static void raid0_quiesce(struct mddev *mddev, int state)
++static void raid0_quiesce(struct mddev *mddev, int quiesce)
+ {
+ }
+ 
+diff --git a/drivers/md/raid1.c b/drivers/md/raid1.c
+index e54d0416ed5a..f02b128b836d 100644
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -3274,21 +3274,14 @@ static int raid1_reshape(struct mddev *mddev)
+ 	return 0;
+ }
+ 
+-static void raid1_quiesce(struct mddev *mddev, int state)
++static void raid1_quiesce(struct mddev *mddev, int quiesce)
+ {
+ 	struct r1conf *conf = mddev->private;
+ 
+-	switch(state) {
+-	case 2: /* wake for suspend */
+-		wake_up(&conf->wait_barrier);
+-		break;
+-	case 1:
++	if (quiesce)
+ 		freeze_array(conf, 0);
+-		break;
+-	case 0:
++	else
+ 		unfreeze_array(conf);
+-		break;
+-	}
+ }
+ 
+ static void *raid1_takeover(struct mddev *mddev)
+diff --git a/drivers/md/raid10.c b/drivers/md/raid10.c
+index 17d84aee79e2..7e0232b99193 100644
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -3976,18 +3976,14 @@ static void raid10_free(struct mddev *mddev, void *priv)
+ 	kfree(conf);
+ }
+ 
+-static void raid10_quiesce(struct mddev *mddev, int state)
++static void raid10_quiesce(struct mddev *mddev, int quiesce)
+ {
+ 	struct r10conf *conf = mddev->private;
+ 
+-	switch(state) {
+-	case 1:
++	if (quiesce)
+ 		raise_barrier(conf, 0);
+-		break;
+-	case 0:
++	else
+ 		lower_barrier(conf);
+-		break;
+-	}
+ }
+ 
+ static int raid10_resize(struct mddev *mddev, sector_t sectors)
+diff --git a/drivers/md/raid5-cache.c b/drivers/md/raid5-cache.c
+index 8cb40e6ec97c..01adcb8523f5 100644
+--- a/drivers/md/raid5-cache.c
++++ b/drivers/md/raid5-cache.c
+@@ -1357,21 +1357,21 @@ void r5l_wake_reclaim(struct r5l_log *log, sector_t space)
+ 	md_wakeup_thread(log->reclaim_thread);
+ }
+ 
+-void r5l_quiesce(struct r5l_log *log, int state)
++void r5l_quiesce(struct r5l_log *log, int quiesce)
+ {
+ 	struct mddev *mddev;
+-	if (!log || state == 2)
++	if (!log)
+ 		return;
+-	if (state == 0)
+-		kthread_unpark(log->reclaim_thread->tsk);
+-	else if (state == 1) {
++
++	if (quiesce) {
+ 		/* make sure r5l_write_super_and_discard_space exits */
+ 		mddev = log->rdev->mddev;
+ 		wake_up(&mddev->sb_wait);
+ 		kthread_park(log->reclaim_thread->tsk);
+ 		r5l_wake_reclaim(log, MaxSector);
+ 		r5l_do_reclaim(log);
+-	}
++	} else
++		kthread_unpark(log->reclaim_thread->tsk);
+ }
+ 
+ bool r5l_log_disk_error(struct r5conf *conf)
+diff --git a/drivers/md/raid5-log.h b/drivers/md/raid5-log.h
+index dccbe0ceaf4b..d8ec05972ff2 100644
+--- a/drivers/md/raid5-log.h
++++ b/drivers/md/raid5-log.h
+@@ -8,7 +8,7 @@ extern void r5l_write_stripe_run(struct r5l_log *log);
+ extern void r5l_flush_stripe_to_raid(struct r5l_log *log);
+ extern void r5l_stripe_write_finished(struct stripe_head *sh);
+ extern int r5l_handle_flush_request(struct r5l_log *log, struct bio *bio);
+-extern void r5l_quiesce(struct r5l_log *log, int state);
++extern void r5l_quiesce(struct r5l_log *log, int quiesce);
+ extern bool r5l_log_disk_error(struct r5conf *conf);
+ 
+ extern struct dma_async_tx_descriptor *
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index dcf6af70c0ff..c36762442e7e 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -7963,16 +7963,12 @@ static void raid5_finish_reshape(struct mddev *mddev)
+ 	}
+ }
+ 
+-static void raid5_quiesce(struct mddev *mddev, int state)
++static void raid5_quiesce(struct mddev *mddev, int quiesce)
+ {
+ 	struct r5conf *conf = mddev->private;
+ 
+-	switch(state) {
+-	case 2: /* resume for a suspend */
+-		wake_up(&conf->wait_for_overlap);
+-		break;
+-
+-	case 1: /* stop all writes */
++	if (quiesce) {
++		/* stop all writes */
+ 		lock_all_device_hash_locks_irq(conf);
+ 		/* '2' tells resync/reshape to pause so that all
+ 		 * active stripes can drain
+@@ -7988,17 +7984,15 @@ static void raid5_quiesce(struct mddev *mddev, int state)
+ 		unlock_all_device_hash_locks_irq(conf);
+ 		/* allow reshape to continue */
+ 		wake_up(&conf->wait_for_overlap);
+-		break;
+-
+-	case 0: /* re-enable writes */
++	} else {
++		/* re-enable writes */
+ 		lock_all_device_hash_locks_irq(conf);
+ 		conf->quiesce = 0;
+ 		wake_up(&conf->wait_for_quiescent);
+ 		wake_up(&conf->wait_for_overlap);
+ 		unlock_all_device_hash_locks_irq(conf);
+-		break;
+ 	}
+-	r5l_quiesce(conf->log, state);
++	r5l_quiesce(conf->log, quiesce);
+ }
+ 
+ static void *raid45_takeover_raid0(struct mddev *mddev, int level)
