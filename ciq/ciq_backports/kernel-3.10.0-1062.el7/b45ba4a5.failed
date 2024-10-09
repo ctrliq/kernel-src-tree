@@ -1,0 +1,225 @@
+powerpc/lib: fix book3s/32 boot failure due to code patching
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [powerpc] lib: fix book3s/32 boot failure due to code patching (Desnes Augusto Nunes do Rosario) [1637841]
+Rebuild_FUZZ: 92.86%
+commit-author Christophe Leroy <christophe.leroy@c-s.fr>
+commit b45ba4a51cde29b2939365ef0c07ad34c8321789
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/b45ba4a5.failed
+
+Commit 51c3c62b58b3 ("powerpc: Avoid code patching freed init
+sections") accesses 'init_mem_is_free' flag too early, before the
+kernel is relocated. This provokes early boot failure (before the
+console is active).
+
+As it is not necessary to do this verification that early, this
+patch moves the test into patch_instruction() instead of
+__patch_instruction().
+
+This modification also has the advantage of avoiding unnecessary
+remappings.
+
+Fixes: 51c3c62b58b3 ("powerpc: Avoid code patching freed init sections")
+	Cc: stable@vger.kernel.org # 4.13+
+	Signed-off-by: Christophe Leroy <christophe.leroy@c-s.fr>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit b45ba4a51cde29b2939365ef0c07ad34c8321789)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/lib/code-patching.c
+diff --cc arch/powerpc/lib/code-patching.c
+index 74b351ac15dc,5ffee298745f..000000000000
+--- a/arch/powerpc/lib/code-patching.c
++++ b/arch/powerpc/lib/code-patching.c
+@@@ -20,13 -28,178 +20,182 @@@ int patch_instruction(unsigned int *add
+  {
+  	int err;
+  
+++<<<<<<< HEAD
+ +	__put_user_size(instr, addr, 4, err);
+++=======
++ 	__put_user_size(instr, patch_addr, 4, err);
+++>>>>>>> b45ba4a51cde (powerpc/lib: fix book3s/32 boot failure due to code patching)
+  	if (err)
+  		return err;
+ -
+ -	asm ("dcbst 0, %0; sync; icbi 0,%1; sync; isync" :: "r" (patch_addr),
+ -							    "r" (exec_addr));
+ -
+ +	asm ("dcbst 0, %0; sync; icbi 0,%0; sync; isync" : : "r" (addr));
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int raw_patch_instruction(unsigned int *addr, unsigned int instr)
++ {
++ 	return __patch_instruction(addr, instr, addr);
++ }
++ 
++ #ifdef CONFIG_STRICT_KERNEL_RWX
++ static DEFINE_PER_CPU(struct vm_struct *, text_poke_area);
++ 
++ static int text_area_cpu_up(unsigned int cpu)
++ {
++ 	struct vm_struct *area;
++ 
++ 	area = get_vm_area(PAGE_SIZE, VM_ALLOC);
++ 	if (!area) {
++ 		WARN_ONCE(1, "Failed to create text area for cpu %d\n",
++ 			cpu);
++ 		return -1;
++ 	}
++ 	this_cpu_write(text_poke_area, area);
++ 
++ 	return 0;
++ }
++ 
++ static int text_area_cpu_down(unsigned int cpu)
++ {
++ 	free_vm_area(this_cpu_read(text_poke_area));
++ 	return 0;
++ }
++ 
++ /*
++  * Run as a late init call. This allows all the boot time patching to be done
++  * simply by patching the code, and then we're called here prior to
++  * mark_rodata_ro(), which happens after all init calls are run. Although
++  * BUG_ON() is rude, in this case it should only happen if ENOMEM, and we judge
++  * it as being preferable to a kernel that will crash later when someone tries
++  * to use patch_instruction().
++  */
++ static int __init setup_text_poke_area(void)
++ {
++ 	BUG_ON(!cpuhp_setup_state(CPUHP_AP_ONLINE_DYN,
++ 		"powerpc/text_poke:online", text_area_cpu_up,
++ 		text_area_cpu_down));
++ 
++ 	return 0;
++ }
++ late_initcall(setup_text_poke_area);
++ 
++ /*
++  * This can be called for kernel text or a module.
++  */
++ static int map_patch_area(void *addr, unsigned long text_poke_addr)
++ {
++ 	unsigned long pfn;
++ 	int err;
++ 
++ 	if (is_vmalloc_addr(addr))
++ 		pfn = vmalloc_to_pfn(addr);
++ 	else
++ 		pfn = __pa_symbol(addr) >> PAGE_SHIFT;
++ 
++ 	err = map_kernel_page(text_poke_addr, (pfn << PAGE_SHIFT),
++ 				pgprot_val(PAGE_KERNEL));
++ 
++ 	pr_devel("Mapped addr %lx with pfn %lx:%d\n", text_poke_addr, pfn, err);
++ 	if (err)
++ 		return -1;
++ 
++ 	return 0;
++ }
++ 
++ static inline int unmap_patch_area(unsigned long addr)
++ {
++ 	pte_t *ptep;
++ 	pmd_t *pmdp;
++ 	pud_t *pudp;
++ 	pgd_t *pgdp;
++ 
++ 	pgdp = pgd_offset_k(addr);
++ 	if (unlikely(!pgdp))
++ 		return -EINVAL;
++ 
++ 	pudp = pud_offset(pgdp, addr);
++ 	if (unlikely(!pudp))
++ 		return -EINVAL;
++ 
++ 	pmdp = pmd_offset(pudp, addr);
++ 	if (unlikely(!pmdp))
++ 		return -EINVAL;
++ 
++ 	ptep = pte_offset_kernel(pmdp, addr);
++ 	if (unlikely(!ptep))
++ 		return -EINVAL;
++ 
++ 	pr_devel("clearing mm %p, pte %p, addr %lx\n", &init_mm, ptep, addr);
++ 
++ 	/*
++ 	 * In hash, pte_clear flushes the tlb, in radix, we have to
++ 	 */
++ 	pte_clear(&init_mm, addr, ptep);
++ 	flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
++ 
++ 	return 0;
++ }
++ 
++ static int do_patch_instruction(unsigned int *addr, unsigned int instr)
++ {
++ 	int err;
++ 	unsigned int *patch_addr = NULL;
++ 	unsigned long flags;
++ 	unsigned long text_poke_addr;
++ 	unsigned long kaddr = (unsigned long)addr;
++ 
++ 	/*
++ 	 * During early early boot patch_instruction is called
++ 	 * when text_poke_area is not ready, but we still need
++ 	 * to allow patching. We just do the plain old patching
++ 	 */
++ 	if (!this_cpu_read(text_poke_area))
++ 		return raw_patch_instruction(addr, instr);
++ 
++ 	local_irq_save(flags);
++ 
++ 	text_poke_addr = (unsigned long)__this_cpu_read(text_poke_area)->addr;
++ 	if (map_patch_area(addr, text_poke_addr)) {
++ 		err = -1;
++ 		goto out;
++ 	}
++ 
++ 	patch_addr = (unsigned int *)(text_poke_addr) +
++ 			((kaddr & ~PAGE_MASK) / sizeof(unsigned int));
++ 
++ 	__patch_instruction(addr, instr, patch_addr);
++ 
++ 	err = unmap_patch_area(text_poke_addr);
++ 	if (err)
++ 		pr_warn("failed to unmap %lx\n", text_poke_addr);
++ 
++ out:
++ 	local_irq_restore(flags);
++ 
++ 	return err;
++ }
++ #else /* !CONFIG_STRICT_KERNEL_RWX */
++ 
++ static int do_patch_instruction(unsigned int *addr, unsigned int instr)
++ {
++ 	return raw_patch_instruction(addr, instr);
++ }
++ 
++ #endif /* CONFIG_STRICT_KERNEL_RWX */
++ 
++ int patch_instruction(unsigned int *addr, unsigned int instr)
++ {
++ 	/* Make sure we aren't patching a freed init section */
++ 	if (init_mem_is_free && init_section_contains(addr, 4)) {
++ 		pr_debug("Skipping init section patching addr: 0x%px\n", addr);
++ 		return 0;
++ 	}
++ 	return do_patch_instruction(addr, instr);
++ }
++ NOKPROBE_SYMBOL(patch_instruction);
++ 
+++>>>>>>> b45ba4a51cde (powerpc/lib: fix book3s/32 boot failure due to code patching)
+  int patch_branch(unsigned int *addr, unsigned long target, int flags)
+  {
+  	return patch_instruction(addr, create_branch(addr, target, flags));
+* Unmerged path arch/powerpc/lib/code-patching.c
