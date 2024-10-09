@@ -1,0 +1,206 @@
+x86/KASLR: Randomize virtual address separately
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [x86] kaslr: Randomize virtual address separately (Baoquan He) [1290840]
+Rebuild_FUZZ: 95.56%
+commit-author Baoquan He <bhe@redhat.com>
+commit 8391c73c96f28d4e8c40fd401fd0c9c04391b44a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8391c73c.failed
+
+The current KASLR implementation randomizes the physical and virtual
+addresses of the kernel together (both are offset by the same amount). It
+calculates the delta of the physical address where vmlinux was linked
+to load and where it is finally loaded. If the delta is not equal to 0
+(i.e. the kernel was relocated), relocation handling needs be done.
+
+On 64-bit, this patch randomizes both the physical address where kernel
+is decompressed and the virtual address where kernel text is mapped and
+will execute from. We now have two values being chosen, so the function
+arguments are reorganized to pass by pointer so they can be directly
+updated. Since relocation handling only depends on the virtual address,
+we must check the virtual delta, not the physical delta for processing
+kernel relocations. This also populates the page table for the new
+virtual address range. 32-bit does not support a separate virtual address,
+so it continues to use the physical offset for its virtual offset.
+
+Additionally updates the sanity checks done on the resulting kernel
+addresses since they are potentially separate now.
+
+[kees: rewrote changelog, limited virtual split to 64-bit only, update checks]
+[kees: fix CONFIG_RANDOMIZE_BASE=n boot failure]
+	Signed-off-by: Baoquan He <bhe@redhat.com>
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: H.J. Lu <hjl.tools@gmail.com>
+	Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Yinghai Lu <yinghai@kernel.org>
+Link: http://lkml.kernel.org/r/1464216334-17200-4-git-send-email-keescook@chromium.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 8391c73c96f28d4e8c40fd401fd0c9c04391b44a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/kaslr.c
+#	arch/x86/boot/compressed/misc.c
+#	arch/x86/boot/compressed/misc.h
+diff --cc arch/x86/boot/compressed/misc.c
+index 243fb14b38e2,b3c5a5f030ce..000000000000
+--- a/arch/x86/boot/compressed/misc.c
++++ b/arch/x86/boot/compressed/misc.c
+@@@ -374,13 -337,18 +385,18 @@@ asmlinkage void decompress_kernel(void 
+  				  unsigned char *output,
+  				  unsigned long output_len)
+  {
+++<<<<<<< HEAD
+ +	unsigned char *output_orig = output;
+++=======
++ 	const unsigned long kernel_total_size = VO__end - VO__text;
++ 	unsigned long virt_addr = (unsigned long)output;
+++>>>>>>> 8391c73c96f2 (x86/KASLR: Randomize virtual address separately)
+  
+ -	/* Retain x86 boot parameters pointer passed from startup_32/64. */
+ -	boot_params = rmode;
+ -
+ -	/* Clear flags intended for solely in-kernel use. */
+ -	boot_params->hdr.loadflags &= ~KASLR_FLAG;
+ +	real_mode = rmode;
+  
+ -	sanitize_boot_params(boot_params);
+ +	sanitize_boot_params(real_mode);
+  
+ -	if (boot_params->screen_info.orig_video_mode == 7) {
+ +	if (real_mode->screen_info.orig_video_mode == 7) {
+  		vidmem = (char *) 0xb0000;
+  		vidport = 0x3b4;
+  	} else {
+@@@ -397,8 -365,28 +413,31 @@@
+  	free_mem_ptr     = heap;	/* Heap */
+  	free_mem_end_ptr = heap + BOOT_HEAP_SIZE;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Report initial kernel position details. */
++ 	debug_putaddr(input_data);
++ 	debug_putaddr(input_len);
++ 	debug_putaddr(output);
++ 	debug_putaddr(output_len);
++ 	debug_putaddr(kernel_total_size);
++ 
++ 	/*
++ 	 * The memory hole needed for the kernel is the larger of either
++ 	 * the entire decompressed kernel plus relocation table, or the
++ 	 * entire decompressed kernel plus .bss and .brk sections.
++ 	 */
++ 	choose_random_location((unsigned long)input_data, input_len,
++ 				(unsigned long *)&output,
++ 				max(output_len, kernel_total_size),
++ 				&virt_addr);
++ 
++ 	/* Validate memory location choices. */
+++>>>>>>> 8391c73c96f2 (x86/KASLR: Randomize virtual address separately)
+  	if ((unsigned long)output & (MIN_KERNEL_ALIGN - 1))
+- 		error("Destination address inappropriately aligned");
++ 		error("Destination physical address inappropriately aligned");
++ 	if (virt_addr & (MIN_KERNEL_ALIGN - 1))
++ 		error("Destination virtual address inappropriately aligned");
+  #ifdef CONFIG_X86_64
+  	if (heap > 0x3fffffffffffUL)
+  		error("Destination address too large");
+@@@ -412,14 -402,10 +453,9 @@@
+  #endif
+  
+  	debug_putstr("\nDecompressing Linux... ");
+ -	__decompress(input_data, input_len, NULL, NULL, output, output_len,
+ -			NULL, error);
+ +	decompress(input_data, input_len, NULL, NULL, output, NULL, error);
+  	parse_elf(output);
+- 	/*
+- 	 * 32-bit always performs relocations. 64-bit relocations are only
+- 	 * needed if kASLR has chosen a different load address.
+- 	 */
+- 	if (!IS_ENABLED(CONFIG_X86_64) || output != output_orig)
+- 		handle_relocations(output, output_len);
++ 	handle_relocations(output, output_len, virt_addr);
+  	debug_putstr("done.\nBooting the kernel.\n");
+ -	return output;
+ +	return;
+  }
+diff --cc arch/x86/boot/compressed/misc.h
+index 674019d8e235,1c8355eadbd1..000000000000
+--- a/arch/x86/boot/compressed/misc.h
++++ b/arch/x86/boot/compressed/misc.h
+@@@ -39,12 -55,52 +39,57 @@@ static inline void debug_putstr(const c
+  
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #if CONFIG_EARLY_PRINTK || CONFIG_RANDOMIZE_BASE
++ /* cmdline.c */
++ int cmdline_find_option(const char *option, char *buffer, int bufsize);
++ int cmdline_find_option_bool(const char *option);
++ #endif
++ 
++ 
++ #if CONFIG_RANDOMIZE_BASE
++ /* kaslr.c */
++ void choose_random_location(unsigned long input,
++ 			    unsigned long input_size,
++ 			    unsigned long *output,
++ 			    unsigned long output_size,
++ 			    unsigned long *virt_addr);
++ /* cpuflags.c */
++ bool has_cpuflag(int flag);
++ #else
++ static inline void choose_random_location(unsigned long input,
++ 					  unsigned long input_size,
++ 					  unsigned long *output,
++ 					  unsigned long output_size,
++ 					  unsigned long *virt_addr)
++ {
++ 	/* No change from existing output location. */
++ 	*virt_addr = *output;
++ }
++ #endif
++ 
++ #ifdef CONFIG_X86_64
++ void initialize_identity_maps(void);
++ void add_identity_map(unsigned long start, unsigned long size);
++ void finalize_identity_maps(void);
++ extern unsigned char _pgtable[];
++ #else
++ static inline void initialize_identity_maps(void)
++ { }
++ static inline void add_identity_map(unsigned long start, unsigned long size)
++ { }
++ static inline void finalize_identity_maps(void)
++ { }
++ #endif
++ 
+++>>>>>>> 8391c73c96f2 (x86/KASLR: Randomize virtual address separately)
+  #ifdef CONFIG_EARLY_PRINTK
+ +
+ +/* cmdline.c */
+ +int cmdline_find_option(const char *option, char *buffer, int bufsize);
+ +int cmdline_find_option_bool(const char *option);
+ +
+  /* early_serial_console.c */
+  extern int early_serial_base;
+  void console_init(void);
+* Unmerged path arch/x86/boot/compressed/kaslr.c
+* Unmerged path arch/x86/boot/compressed/kaslr.c
+* Unmerged path arch/x86/boot/compressed/misc.c
+* Unmerged path arch/x86/boot/compressed/misc.h
