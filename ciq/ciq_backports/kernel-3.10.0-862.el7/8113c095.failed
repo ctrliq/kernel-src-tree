@@ -1,0 +1,879 @@
+net_sched: use void pointer for filter handle
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author WANG Cong <xiyou.wangcong@gmail.com>
+commit 8113c095672f6504b23eba6edf4a57b5f7f744af
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8113c095.failed
+
+Now we use 'unsigned long fh' as a pointer in every place,
+it is safe to convert it to a void pointer now. This gets
+rid of many casts to pointer.
+
+	Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+	Cc: Jiri Pirko <jiri@resnulli.us>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8113c095672f6504b23eba6edf4a57b5f7f744af)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sch_generic.h
+#	net/sched/cls_api.c
+#	net/sched/cls_basic.c
+#	net/sched/cls_bpf.c
+#	net/sched/cls_cgroup.c
+#	net/sched/cls_flow.c
+#	net/sched/cls_flower.c
+#	net/sched/cls_fw.c
+#	net/sched/cls_matchall.c
+#	net/sched/cls_route.c
+#	net/sched/cls_rsvp.h
+#	net/sched/cls_tcindex.c
+#	net/sched/cls_u32.c
+diff --cc include/net/sch_generic.h
+index 7b71681b10fc,e79f5ad1c5f3..000000000000
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@@ -196,29 -211,19 +196,43 @@@ struct tcf_proto_ops 
+  					    const struct tcf_proto *,
+  					    struct tcf_result *);
+  	int			(*init)(struct tcf_proto*);
+ -	void			(*destroy)(struct tcf_proto*);
+ +	RH_KABI_REPLACE(void	(*destroy)(struct tcf_proto*),
+ +			bool	(*destroy)(struct tcf_proto*, bool))
+  
+++<<<<<<< HEAD
+ +	unsigned long		(*get)(struct tcf_proto*, u32 handle);
+ +	RH_KABI_DEPRECATE_FN(void, put, struct tcf_proto*, unsigned long)
+ +	RH_KABI_REPLACE(int	(*change)(struct net *net, struct sk_buff *,
+ +					struct tcf_proto*, unsigned long,
+ +					u32 handle, struct nlattr **,
+ +					unsigned long *),
+ +			int	(*change)(struct net *net, struct sk_buff *,
+ +					struct tcf_proto*, unsigned long,
+ +					u32 handle, struct nlattr **,
+ +					unsigned long *, bool))
+ +	int			(*delete)(struct tcf_proto*, unsigned long);
+ +	void			(*walk)(struct tcf_proto*, struct tcf_walker *arg);
+ +
+ +	/* rtnetlink specific */
+ +	RH_KABI_REPLACE(
+ +			int	(*dump)(struct tcf_proto*, unsigned long,
+ +					struct sk_buff *skb, struct tcmsg*),
+ +			int	(*dump)(struct net*, struct tcf_proto*, unsigned long,
+ +					struct sk_buff *skb, struct tcmsg*)
+ +		       )
+++=======
++ 	void*			(*get)(struct tcf_proto*, u32 handle);
++ 	int			(*change)(struct net *net, struct sk_buff *,
++ 					struct tcf_proto*, unsigned long,
++ 					u32 handle, struct nlattr **,
++ 					void **, bool);
++ 	int			(*delete)(struct tcf_proto*, void *, bool*);
++ 	void			(*walk)(struct tcf_proto*, struct tcf_walker *arg);
++ 
++ 	/* rtnetlink specific */
++ 	int			(*dump)(struct net*, struct tcf_proto*, void *,
++ 					struct sk_buff *skb, struct tcmsg*);
+++>>>>>>> 8113c095672f (net_sched: use void pointer for filter handle)
+  
+  	struct module		*owner;
+  };
+diff --cc net/sched/cls_api.c
+index 1dc6d123ed94,668afb6e9885..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -101,17 -102,20 +101,24 @@@ EXPORT_SYMBOL(unregister_tcf_proto_ops)
+  
+  static int tfilter_notify(struct net *net, struct sk_buff *oskb,
+  			  struct nlmsghdr *n, struct tcf_proto *tp,
+- 			  unsigned long fh, int event, bool unicast);
++ 			  void *fh, int event, bool unicast);
+  
+++<<<<<<< HEAD
+++=======
++ static int tfilter_del_notify(struct net *net, struct sk_buff *oskb,
++ 			      struct nlmsghdr *n, struct tcf_proto *tp,
++ 			      void *fh, bool unicast, bool *last);
++ 
+++>>>>>>> 8113c095672f (net_sched: use void pointer for filter handle)
+  static void tfilter_notify_chain(struct net *net, struct sk_buff *oskb,
+  				 struct nlmsghdr *n,
+ -				 struct tcf_chain *chain, int event)
+ +				 struct tcf_proto __rcu **chain, int event)
+  {
+ +	struct tcf_proto __rcu **it_chain;
+  	struct tcf_proto *tp;
+  
+ -	for (tp = rtnl_dereference(chain->filter_chain);
+ -	     tp; tp = rtnl_dereference(tp->next))
+ +	for (it_chain = chain; (tp = rtnl_dereference(*it_chain)) != NULL;
+ +	     it_chain = &tp->next)
+  		tfilter_notify(net, oskb, n, tp, 0, event, false);
+  }
+  
+@@@ -136,18 -421,18 +143,18 @@@ static int tc_ctl_tfilter(struct sk_buf
+  	struct tcmsg *t;
+  	u32 protocol;
+  	u32 prio;
+ -	bool prio_allocate;
+ +	u32 nprio;
+  	u32 parent;
+ -	u32 chain_index;
+  	struct net_device *dev;
+  	struct Qdisc  *q;
+ -	struct tcf_chain_info chain_info;
+ -	struct tcf_chain *chain = NULL;
+ -	struct tcf_block *block;
+ +	struct tcf_proto __rcu **back;
+ +	struct tcf_proto __rcu **chain;
+ +	struct tcf_proto *next;
+  	struct tcf_proto *tp;
+ +	const struct tcf_proto_ops *tp_ops;
+  	const struct Qdisc_class_ops *cops;
+  	unsigned long cl;
+- 	unsigned long fh;
++ 	void *fh;
+  	int err;
+  	int tp_created;
+  
+@@@ -315,13 -570,13 +322,13 @@@ replay
+  
+  	fh = tp->ops->get(tp, t->tcm_handle);
+  
+- 	if (fh == 0) {
++ 	if (!fh) {
+  		if (n->nlmsg_type == RTM_DELTFILTER && t->tcm_handle == 0) {
+ -			tcf_chain_tp_remove(chain, &chain_info, tp);
+ +			next = rtnl_dereference(tp->next);
+ +			RCU_INIT_POINTER(*back, next);
+  			tfilter_notify(net, skb, n, tp, fh,
+  				       RTM_DELTFILTER, false);
+ -			tcf_proto_destroy(tp);
+ +			tcf_proto_destroy(tp, true);
+  			err = 0;
+  			goto errout;
+  		}
+@@@ -441,6 -701,37 +448,40 @@@ static int tfilter_notify(struct net *n
+  			      n->nlmsg_flags & NLM_F_ECHO);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int tfilter_del_notify(struct net *net, struct sk_buff *oskb,
++ 			      struct nlmsghdr *n, struct tcf_proto *tp,
++ 			      void *fh, bool unicast, bool *last)
++ {
++ 	struct sk_buff *skb;
++ 	u32 portid = oskb ? NETLINK_CB(oskb).portid : 0;
++ 	int err;
++ 
++ 	skb = alloc_skb(NLMSG_GOODSIZE, GFP_KERNEL);
++ 	if (!skb)
++ 		return -ENOBUFS;
++ 
++ 	if (tcf_fill_node(net, skb, tp, fh, portid, n->nlmsg_seq,
++ 			  n->nlmsg_flags, RTM_DELTFILTER) <= 0) {
++ 		kfree_skb(skb);
++ 		return -EINVAL;
++ 	}
++ 
++ 	err = tp->ops->delete(tp, fh, last);
++ 	if (err) {
++ 		kfree_skb(skb);
++ 		return err;
++ 	}
++ 
++ 	if (unicast)
++ 		return netlink_unicast(net->rtnl, skb, portid, MSG_DONTWAIT);
++ 
++ 	return rtnetlink_send(skb, net, portid, RTNLGRP_TC,
++ 			      n->nlmsg_flags & NLM_F_ECHO);
++ }
++ 
+++>>>>>>> 8113c095672f (net_sched: use void pointer for filter handle)
+  struct tcf_dump_args {
+  	struct tcf_walker w;
+  	struct sk_buff *skb;
+diff --cc net/sched/cls_basic.c
+index 9d68a920c5a4,73cc7f167a38..000000000000
+--- a/net/sched/cls_basic.c
++++ b/net/sched/cls_basic.c
+@@@ -61,12 -61,13 +61,19 @@@ static void *basic_get(struct tcf_prot
+  	struct basic_head *head = rtnl_dereference(tp->root);
+  	struct basic_filter *f;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(f, &head->flist, link)
+ +		if (f->handle == handle)
+ +			l = (unsigned long) f;
+++=======
++ 	list_for_each_entry(f, &head->flist, link) {
++ 		if (f->handle == handle) {
++ 			return f;
++ 		}
++ 	}
+++>>>>>>> 8113c095672f (net_sched: use void pointer for filter handle)
+  
+- 	return l;
++ 	return NULL;
+  }
+  
+  static int basic_init(struct tcf_proto *tp)
+@@@ -104,12 -102,12 +111,19 @@@ static bool basic_destroy(struct tcf_pr
+  		call_rcu(&f->rcu, basic_delete_filter);
+  	}
+  	kfree_rcu(head, rcu);
+ +	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static int basic_delete(struct tcf_proto *tp, unsigned long arg)
+ +{
+ +	struct basic_filter *f = (struct basic_filter *) arg;
+++=======
++ static int basic_delete(struct tcf_proto *tp, void *arg, bool *last)
++ {
++ 	struct basic_head *head = rtnl_dereference(tp->root);
++ 	struct basic_filter *f = arg;
+++>>>>>>> 8113c095672f (net_sched: use void pointer for filter handle)
+  
+  	list_del_rcu(&f->link);
+  	tcf_unbind_filter(tp, &f->res);
+diff --cc net/sched/cls_bpf.c
+index c13fb5505297,db17b68df94e..000000000000
+--- a/net/sched/cls_bpf.c
++++ b/net/sched/cls_bpf.c
+@@@ -100,20 -257,25 +100,32 @@@ static void cls_bpf_delete_prog(struct 
+  	kfree(prog);
+  }
+  
+ -static void cls_bpf_delete_prog_rcu(struct rcu_head *rcu)
+ +static void __cls_bpf_delete_prog(struct rcu_head *rcu)
+  {
+ -	__cls_bpf_delete_prog(container_of(rcu, struct cls_bpf_prog, rcu));
+ +	struct cls_bpf_prog *prog = container_of(rcu, struct cls_bpf_prog, rcu);
+ +
+ +	cls_bpf_delete_prog(prog->tp, prog);
+  }
+  
+ -static void __cls_bpf_delete(struct tcf_proto *tp, struct cls_bpf_prog *prog)
+ +static int cls_bpf_delete(struct tcf_proto *tp, unsigned long arg)
+  {
+ -	cls_bpf_stop_offload(tp, prog);
+ +	struct cls_bpf_prog *prog = (struct cls_bpf_prog *) arg;
+ +
+  	list_del_rcu(&prog->link);
+  	tcf_unbind_filter(tp, &prog->res);
+++<<<<<<< HEAD
+ +	call_rcu(&prog->rcu, __cls_bpf_delete_prog);
+++=======
++ 	call_rcu(&prog->rcu, cls_bpf_delete_prog_rcu);
++ }
++ 
++ static int cls_bpf_delete(struct tcf_proto *tp, void *arg, bool *last)
++ {
++ 	struct cls_bpf_head *head = rtnl_dereference(tp->root);
++ 
++ 	__cls_bpf_delete(tp, arg);
++ 	*last = list_empty(&head->plist);
+++>>>>>>> 8113c095672f (net_sched: use void pointer for filter handle)
+  	return 0;
+  }
+  
+@@@ -122,98 -284,141 +134,95 @@@ static bool cls_bpf_destroy(struct tcf_
+  	struct cls_bpf_head *head = rtnl_dereference(tp->root);
+  	struct cls_bpf_prog *prog, *tmp;
+  
+ -	list_for_each_entry_safe(prog, tmp, &head->plist, link)
+ -		__cls_bpf_delete(tp, prog);
+ +	if (!force && !list_empty(&head->plist))
+ +		return false;
+ +
+ +	list_for_each_entry_safe(prog, tmp, &head->plist, link) {
+ +		list_del_rcu(&prog->link);
+ +		tcf_unbind_filter(tp, &prog->res);
+ +		call_rcu(&prog->rcu, __cls_bpf_delete_prog);
+ +	}
+  
+  	kfree_rcu(head, rcu);
+ +	return true;
+  }
+  
+- static unsigned long cls_bpf_get(struct tcf_proto *tp, u32 handle)
++ static void *cls_bpf_get(struct tcf_proto *tp, u32 handle)
+  {
+  	struct cls_bpf_head *head = rtnl_dereference(tp->root);
+  	struct cls_bpf_prog *prog;
+- 	unsigned long ret = 0UL;
+  
+  	list_for_each_entry(prog, &head->plist, link) {
+- 		if (prog->handle == handle) {
+- 			ret = (unsigned long) prog;
+- 			break;
+- 		}
++ 		if (prog->handle == handle)
++ 			return prog;
+  	}
+  
+- 	return ret;
++ 	return NULL;
+  }
+  
+ -static int cls_bpf_prog_from_ops(struct nlattr **tb, struct cls_bpf_prog *prog)
+ +static int cls_bpf_modify_existing(struct net *net, struct tcf_proto *tp,
+ +				   struct cls_bpf_prog *prog,
+ +				   unsigned long base, struct nlattr **tb,
+ +				   struct nlattr *est, bool ovr)
+  {
+  	struct sock_filter *bpf_ops;
+ -	struct sock_fprog_kern fprog_tmp;
+ -	struct bpf_prog *fp;
+ -	u16 bpf_size, bpf_num_ops;
+ +	struct tcf_exts exts;
+ +	struct sock_fprog tmp;
+ +	struct sk_filter *fp;
+ +	u16 bpf_size, bpf_len;
+ +	u32 classid;
+  	int ret;
+  
+ -	bpf_num_ops = nla_get_u16(tb[TCA_BPF_OPS_LEN]);
+ -	if (bpf_num_ops > BPF_MAXINSNS || bpf_num_ops == 0)
+ -		return -EINVAL;
+ -
+ -	bpf_size = bpf_num_ops * sizeof(*bpf_ops);
+ -	if (bpf_size != nla_len(tb[TCA_BPF_OPS]))
+ +	if (!tb[TCA_BPF_OPS_LEN] || !tb[TCA_BPF_OPS] || !tb[TCA_BPF_CLASSID])
+  		return -EINVAL;
+  
+ -	bpf_ops = kzalloc(bpf_size, GFP_KERNEL);
+ -	if (bpf_ops == NULL)
+ -		return -ENOMEM;
+ -
+ -	memcpy(bpf_ops, nla_data(tb[TCA_BPF_OPS]), bpf_size);
+ -
+ -	fprog_tmp.len = bpf_num_ops;
+ -	fprog_tmp.filter = bpf_ops;
+ -
+ -	ret = bpf_prog_create(&fp, &fprog_tmp);
+ -	if (ret < 0) {
+ -		kfree(bpf_ops);
+ +	tcf_exts_init(&exts, TCA_BPF_ACT, TCA_BPF_POLICE);
+ +	ret = tcf_exts_validate(net, tp, tb, est, &exts, ovr);
+ +	if (ret < 0)
+  		return ret;
+ -	}
+  
+ -	prog->bpf_ops = bpf_ops;
+ -	prog->bpf_num_ops = bpf_num_ops;
+ -	prog->bpf_name = NULL;
+ -	prog->filter = fp;
+ -
+ -	return 0;
+ -}
+ -
+ -static int cls_bpf_prog_from_efd(struct nlattr **tb, struct cls_bpf_prog *prog,
+ -				 const struct tcf_proto *tp)
+ -{
+ -	struct bpf_prog *fp;
+ -	char *name = NULL;
+ -	u32 bpf_fd;
+ -
+ -	bpf_fd = nla_get_u32(tb[TCA_BPF_FD]);
+ -
+ -	fp = bpf_prog_get_type(bpf_fd, BPF_PROG_TYPE_SCHED_CLS);
+ -	if (IS_ERR(fp))
+ -		return PTR_ERR(fp);
+ -
+ -	if (tb[TCA_BPF_NAME]) {
+ -		name = nla_memdup(tb[TCA_BPF_NAME], GFP_KERNEL);
+ -		if (!name) {
+ -			bpf_prog_put(fp);
+ -			return -ENOMEM;
+ -		}
+ +	classid = nla_get_u32(tb[TCA_BPF_CLASSID]);
+ +	bpf_len = nla_get_u16(tb[TCA_BPF_OPS_LEN]);
+ +	if (bpf_len > BPF_MAXINSNS || bpf_len == 0) {
+ +		ret = -EINVAL;
+ +		goto errout;
+  	}
+  
+ -	prog->bpf_ops = NULL;
+ -	prog->bpf_name = name;
+ -	prog->filter = fp;
+ -
+ -	if (fp->dst_needed && !(tp->q->flags & TCQ_F_INGRESS))
+ -		netif_keep_dst(qdisc_dev(tp->q));
+ -
+ -	return 0;
+ -}
+ -
+ -static int cls_bpf_set_parms(struct net *net, struct tcf_proto *tp,
+ -			     struct cls_bpf_prog *prog, unsigned long base,
+ -			     struct nlattr **tb, struct nlattr *est, bool ovr)
+ -{
+ -	bool is_bpf, is_ebpf, have_exts = false;
+ -	u32 gen_flags = 0;
+ -	int ret;
+ -
+ -	is_bpf = tb[TCA_BPF_OPS_LEN] && tb[TCA_BPF_OPS];
+ -	is_ebpf = tb[TCA_BPF_FD];
+ -	if ((!is_bpf && !is_ebpf) || (is_bpf && is_ebpf))
+ -		return -EINVAL;
+ +	bpf_size = bpf_len * sizeof(*bpf_ops);
+ +	if (bpf_size != nla_len(tb[TCA_BPF_OPS])) {
+ +		ret = -EINVAL;
+ +		goto errout;
+ +	}
+  
+ -	ret = tcf_exts_validate(net, tp, tb, est, &prog->exts, ovr);
+ -	if (ret < 0)
+ -		return ret;
+ +	bpf_ops = kzalloc(bpf_size, GFP_KERNEL);
+ +	if (bpf_ops == NULL) {
+ +		ret = -ENOMEM;
+ +		goto errout;
+ +	}
+  
+ -	if (tb[TCA_BPF_FLAGS]) {
+ -		u32 bpf_flags = nla_get_u32(tb[TCA_BPF_FLAGS]);
+ +	memcpy(bpf_ops, nla_data(tb[TCA_BPF_OPS]), bpf_size);
+  
+ -		if (bpf_flags & ~TCA_BPF_FLAG_ACT_DIRECT)
+ -			return -EINVAL;
+ +	tmp.len = bpf_len;
+ +	tmp.filter = (struct sock_filter __user *) bpf_ops;
+  
+ -		have_exts = bpf_flags & TCA_BPF_FLAG_ACT_DIRECT;
+ -	}
+ -	if (tb[TCA_BPF_FLAGS_GEN]) {
+ -		gen_flags = nla_get_u32(tb[TCA_BPF_FLAGS_GEN]);
+ -		if (gen_flags & ~CLS_BPF_SUPPORTED_GEN_FLAGS ||
+ -		    !tc_flags_valid(gen_flags))
+ -			return -EINVAL;
+ -	}
+ -
+ -	prog->exts_integrated = have_exts;
+ -	prog->gen_flags = gen_flags;
+ +	ret = sk_unattached_filter_create(&fp, &tmp);
+ +	if (ret)
+ +		goto errout_free;
+  
+ -	ret = is_bpf ? cls_bpf_prog_from_ops(tb, prog) :
+ -		       cls_bpf_prog_from_efd(tb, prog, tp);
+ -	if (ret < 0)
+ -		return ret;
+ +	prog->bpf_len = bpf_len;
+ +	prog->bpf_ops = bpf_ops;
+ +	prog->filter = fp;
+ +	prog->res.classid = classid;
+  
+ -	if (tb[TCA_BPF_CLASSID]) {
+ -		prog->res.classid = nla_get_u32(tb[TCA_BPF_CLASSID]);
+ -		tcf_bind_filter(tp, &prog->res, base);
+ -	}
+ +	tcf_bind_filter(tp, &prog->res, base);
+ +	tcf_exts_change(tp, &prog->exts, &exts);
+  
+  	return 0;
+ +errout_free:
+ +	kfree(bpf_ops);
+ +errout:
+ +	tcf_exts_destroy(&exts);
+ +	return ret;
+  }
+  
+  static u32 cls_bpf_grab_new_handle(struct tcf_proto *tp,
+@@@ -290,19 -506,61 +299,68 @@@ static int cls_bpf_change(struct net *n
+  		list_add_rcu(&prog->link, &head->plist);
+  	}
+  
+- 	*arg = (unsigned long) prog;
++ 	*arg = prog;
+  	return 0;
+ -
+  errout:
+ -	tcf_exts_destroy(&prog->exts);
+  	kfree(prog);
+ +
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int cls_bpf_dump(struct net *net, struct tcf_proto *tp, unsigned long fh,
+ +			struct sk_buff *skb, struct tcmsg *tm)
+ +{
+ +	struct cls_bpf_prog *prog = (struct cls_bpf_prog *) fh;
+ +	struct nlattr *nest, *nla;
+++=======
++ static int cls_bpf_dump_bpf_info(const struct cls_bpf_prog *prog,
++ 				 struct sk_buff *skb)
++ {
++ 	struct nlattr *nla;
++ 
++ 	if (nla_put_u16(skb, TCA_BPF_OPS_LEN, prog->bpf_num_ops))
++ 		return -EMSGSIZE;
++ 
++ 	nla = nla_reserve(skb, TCA_BPF_OPS, prog->bpf_num_ops *
++ 			  sizeof(struct sock_filter));
++ 	if (nla == NULL)
++ 		return -EMSGSIZE;
++ 
++ 	memcpy(nla_data(nla), prog->bpf_ops, nla_len(nla));
++ 
++ 	return 0;
++ }
++ 
++ static int cls_bpf_dump_ebpf_info(const struct cls_bpf_prog *prog,
++ 				  struct sk_buff *skb)
++ {
++ 	struct nlattr *nla;
++ 
++ 	if (prog->bpf_name &&
++ 	    nla_put_string(skb, TCA_BPF_NAME, prog->bpf_name))
++ 		return -EMSGSIZE;
++ 
++ 	if (nla_put_u32(skb, TCA_BPF_ID, prog->filter->aux->id))
++ 		return -EMSGSIZE;
++ 
++ 	nla = nla_reserve(skb, TCA_BPF_TAG, sizeof(prog->filter->tag));
++ 	if (nla == NULL)
++ 		return -EMSGSIZE;
++ 
++ 	memcpy(nla_data(nla), prog->filter->tag, nla_len(nla));
++ 
++ 	return 0;
++ }
++ 
++ static int cls_bpf_dump(struct net *net, struct tcf_proto *tp, void *fh,
++ 			struct sk_buff *skb, struct tcmsg *tm)
++ {
++ 	struct cls_bpf_prog *prog = fh;
++ 	struct nlattr *nest;
++ 	u32 bpf_flags = 0;
++ 	int ret;
+++>>>>>>> 8113c095672f (net_sched: use void pointer for filter handle)
+  
+  	if (prog == NULL)
+  		return skb->len;
+diff --cc net/sched/cls_cgroup.c
+index 1e87931dbe99,d48452f87975..000000000000
+--- a/net/sched/cls_cgroup.c
++++ b/net/sched/cls_cgroup.c
+@@@ -246,10 -126,9 +246,14 @@@ static bool cls_cgroup_destroy(struct t
+  	/* Head can still be NULL due to cls_cgroup_init(). */
+  	if (head)
+  		call_rcu(&head->rcu, cls_cgroup_destroy_rcu);
+ +	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static int cls_cgroup_delete(struct tcf_proto *tp, unsigned long arg)
+++=======
++ static int cls_cgroup_delete(struct tcf_proto *tp, void *arg, bool *last)
+++>>>>>>> 8113c095672f (net_sched: use void pointer for filter handle)
+  {
+  	return -EOPNOTSUPP;
+  }
+diff --cc net/sched/cls_flow.c
+index 109b18b99cbb,2a3a60ec5b86..000000000000
+--- a/net/sched/cls_flow.c
++++ b/net/sched/cls_flow.c
+@@@ -427,14 -431,15 +427,14 @@@ static int flow_change(struct net *net
+  	if (err < 0)
+  		goto err1;
+  
+ -	err = tcf_exts_init(&fnew->exts, TCA_FLOW_ACT, TCA_FLOW_POLICE);
+ -	if (err < 0)
+ +	err = -ENOBUFS;
+ +	fnew = kzalloc(sizeof(*fnew), GFP_KERNEL);
+ +	if (!fnew)
+  		goto err2;
+  
+ -	err = tcf_exts_validate(net, tp, tb, tca[TCA_RATE], &fnew->exts, ovr);
+ -	if (err < 0)
+ -		goto err2;
+ +	tcf_exts_init(&fnew->exts, TCA_FLOW_ACT, TCA_FLOW_POLICE);
+  
+- 	fold = (struct flow_filter *)*arg;
++ 	fold = *arg;
+  	if (fold) {
+  		err = -EINVAL;
+  		if (fold->handle != handle && handle)
+@@@ -549,9 -551,10 +549,16 @@@ err1
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +static int flow_delete(struct tcf_proto *tp, unsigned long arg)
+ +{
+ +	struct flow_filter *f = (struct flow_filter *)arg;
+++=======
++ static int flow_delete(struct tcf_proto *tp, void *arg, bool *last)
++ {
++ 	struct flow_head *head = rtnl_dereference(tp->root);
++ 	struct flow_filter *f = arg;
+++>>>>>>> 8113c095672f (net_sched: use void pointer for filter handle)
+  
+  	list_del_rcu(&f->list);
+  	call_rcu(&f->rcu, flow_destroy_filter);
+@@@ -583,10 -584,9 +590,10 @@@ static bool flow_destroy(struct tcf_pro
+  		call_rcu(&f->rcu, flow_destroy_filter);
+  	}
+  	kfree_rcu(head, rcu);
+ +	return true;
+  }
+  
+- static unsigned long flow_get(struct tcf_proto *tp, u32 handle)
++ static void *flow_get(struct tcf_proto *tp, u32 handle)
+  {
+  	struct flow_head *head = rtnl_dereference(tp->root);
+  	struct flow_filter *f;
+diff --cc net/sched/cls_flower.c
+index 92a3092a522f,d2551a03c542..000000000000
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@@ -345,10 -330,9 +345,10 @@@ static bool fl_destroy(struct tcf_prot
+  
+  	__module_get(THIS_MODULE);
+  	call_rcu(&head->rcu, fl_destroy_rcu);
+ +	return true;
+  }
+  
+- static unsigned long fl_get(struct tcf_proto *tp, u32 handle)
++ static void *fl_get(struct tcf_proto *tp, u32 handle)
+  {
+  	struct cls_fl_head *head = rtnl_dereference(tp->root);
+  	struct cls_fl_filter *f;
+@@@ -1017,10 -998,10 +1017,14 @@@ errout_tb
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +static int fl_delete(struct tcf_proto *tp, unsigned long arg)
+++=======
++ static int fl_delete(struct tcf_proto *tp, void *arg, bool *last)
+++>>>>>>> 8113c095672f (net_sched: use void pointer for filter handle)
+  {
+  	struct cls_fl_head *head = rtnl_dereference(tp->root);
+- 	struct cls_fl_filter *f = (struct cls_fl_filter *) arg;
++ 	struct cls_fl_filter *f = arg;
+  
+  	if (!tc_skip_sw(f->flags))
+  		rhashtable_remove_fast(&head->ht, &f->ht_node,
+diff --cc net/sched/cls_fw.c
+index f11733402ade,192255ec50bd..000000000000
+--- a/net/sched/cls_fw.c
++++ b/net/sched/cls_fw.c
+@@@ -151,15 -145,16 +151,19 @@@ static bool fw_destroy(struct tcf_prot
+  		}
+  	}
+  	kfree_rcu(head, rcu);
+ +	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static int fw_delete(struct tcf_proto *tp, unsigned long arg)
+++=======
++ static int fw_delete(struct tcf_proto *tp, void *arg, bool *last)
+++>>>>>>> 8113c095672f (net_sched: use void pointer for filter handle)
+  {
+  	struct fw_head *head = rtnl_dereference(tp->root);
+- 	struct fw_filter *f = (struct fw_filter *)arg;
++ 	struct fw_filter *f = arg;
+  	struct fw_filter __rcu **fp;
+  	struct fw_filter *pfp;
+ -	int ret = -EINVAL;
+ -	int h;
+  
+  	if (head == NULL || f == NULL)
+  		goto out;
+diff --cc net/sched/cls_matchall.c
+index f7bc58777169,d44e26fdae84..000000000000
+--- a/net/sched/cls_matchall.c
++++ b/net/sched/cls_matchall.c
+@@@ -103,12 -96,11 +103,12 @@@ static bool mall_destroy(struct tcf_pro
+  		mall_destroy_hw_filter(tp, head, (unsigned long) head);
+  
+  	call_rcu(&head->rcu, mall_destroy_rcu);
+ +	return true;
+  }
+  
+- static unsigned long mall_get(struct tcf_proto *tp, u32 handle)
++ static void *mall_get(struct tcf_proto *tp, u32 handle)
+  {
+- 	return 0UL;
++ 	return NULL;
+  }
+  
+  static const struct nla_policy mall_policy[TCA_MATCHALL_MAX + 1] = {
+@@@ -217,7 -197,7 +217,11 @@@ err_exts_init
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +static int mall_delete(struct tcf_proto *tp, unsigned long arg)
+++=======
++ static int mall_delete(struct tcf_proto *tp, void *arg, bool *last)
+++>>>>>>> 8113c095672f (net_sched: use void pointer for filter handle)
+  {
+  	return -EOPNOTSUPP;
+  }
+diff --cc net/sched/cls_route.c
+index ddc332f8bc11,3b70982394ce..000000000000
+--- a/net/sched/cls_route.c
++++ b/net/sched/cls_route.c
+@@@ -299,13 -292,12 +299,17 @@@ static bool route4_destroy(struct tcf_p
+  		}
+  	}
+  	kfree_rcu(head, rcu);
+ +	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static int route4_delete(struct tcf_proto *tp, unsigned long arg)
+++=======
++ static int route4_delete(struct tcf_proto *tp, void *arg, bool *last)
+++>>>>>>> 8113c095672f (net_sched: use void pointer for filter handle)
+  {
+  	struct route4_head *head = rtnl_dereference(tp->root);
+- 	struct route4_filter *f = (struct route4_filter *)arg;
++ 	struct route4_filter *f = arg;
+  	struct route4_filter __rcu **fp;
+  	struct route4_filter *nf;
+  	struct route4_bucket *b;
+diff --cc net/sched/cls_rsvp.h
+index 29d6409252c7,26203ff817f3..000000000000
+--- a/net/sched/cls_rsvp.h
++++ b/net/sched/cls_rsvp.h
+@@@ -333,13 -326,12 +333,17 @@@ static bool rsvp_destroy(struct tcf_pro
+  		}
+  	}
+  	kfree_rcu(data, rcu);
+ +	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static int rsvp_delete(struct tcf_proto *tp, unsigned long arg)
+++=======
++ static int rsvp_delete(struct tcf_proto *tp, void *arg, bool *last)
+++>>>>>>> 8113c095672f (net_sched: use void pointer for filter handle)
+  {
+  	struct rsvp_head *head = rtnl_dereference(tp->root);
+- 	struct rsvp_filter *nfp, *f = (struct rsvp_filter *)arg;
++ 	struct rsvp_filter *nfp, *f = arg;
+  	struct rsvp_filter __rcu **fp;
+  	unsigned int h = f->handle;
+  	struct rsvp_session __rcu **sp;
+@@@ -484,12 -486,14 +488,12 @@@ static int rsvp_change(struct net *net
+  	if (err < 0)
+  		return err;
+  
+ -	err = tcf_exts_init(&e, TCA_RSVP_ACT, TCA_RSVP_POLICE);
+ -	if (err < 0)
+ -		return err;
+ +	tcf_exts_init(&e, TCA_RSVP_ACT, TCA_RSVP_POLICE);
+  	err = tcf_exts_validate(net, tp, tb, tca[TCA_RATE], &e, ovr);
+  	if (err < 0)
+ -		goto errout2;
+ +		return err;
+  
+- 	f = (struct rsvp_filter *)*arg;
++ 	f = *arg;
+  	if (f) {
+  		/* Node exists: adjust only classid */
+  		struct rsvp_filter *n;
+diff --cc net/sched/cls_tcindex.c
+index 5f0af005d12e,fb281b9b2c52..000000000000
+--- a/net/sched/cls_tcindex.c
++++ b/net/sched/cls_tcindex.c
+@@@ -149,10 -150,10 +149,14 @@@ static void tcindex_destroy_fexts(struc
+  	kfree(f);
+  }
+  
+++<<<<<<< HEAD
+ +static int tcindex_delete(struct tcf_proto *tp, unsigned long arg)
+++=======
++ static int tcindex_delete(struct tcf_proto *tp, void *arg, bool *last)
+++>>>>>>> 8113c095672f (net_sched: use void pointer for filter handle)
+  {
+  	struct tcindex_data *p = rtnl_dereference(tp->root);
+- 	struct tcindex_filter_result *r = (struct tcindex_filter_result *) arg;
++ 	struct tcindex_filter_result *r = arg;
+  	struct tcindex_filter __rcu **walk;
+  	struct tcindex_filter *f = NULL;
+  
+@@@ -189,10 -192,11 +193,9 @@@ found
+  }
+  
+  static int tcindex_destroy_element(struct tcf_proto *tp,
+- 				   unsigned long arg,
+- 				   struct tcf_walker *walker)
++ 				   void *arg, struct tcf_walker *walker)
+  {
+ -	bool last;
+ -
+ -	return tcindex_delete(tp, arg, &last);
+ +	return tcindex_delete(tp, arg);
+  }
+  
+  static void __tcindex_destroy(struct rcu_head *head)
+diff --cc net/sched/cls_u32.c
+index dfc76f51e07c,5a3f78181526..000000000000
+--- a/net/sched/cls_u32.c
++++ b/net/sched/cls_u32.c
+@@@ -640,16 -603,17 +640,20 @@@ static bool u32_destroy(struct tcf_prot
+  	}
+  
+  	tp->data = NULL;
+ +	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static int u32_delete(struct tcf_proto *tp, unsigned long arg)
+++=======
++ static int u32_delete(struct tcf_proto *tp, void *arg, bool *last)
+++>>>>>>> 8113c095672f (net_sched: use void pointer for filter handle)
+  {
+- 	struct tc_u_hnode *ht = (struct tc_u_hnode *)arg;
++ 	struct tc_u_hnode *ht = arg;
+  	struct tc_u_hnode *root_ht = rtnl_dereference(tp->root);
+ -	struct tc_u_common *tp_c = tp->data;
+ -	int ret = 0;
+  
+  	if (ht == NULL)
+ -		goto out;
+ +		return 0;
+  
+  	if (TC_U32_KEY(ht->handle)) {
+  		u32_remove_hw_knode(tp, ht->handle);
+diff --git a/include/net/pkt_cls.h b/include/net/pkt_cls.h
+index 09f92f9cf4d7..5603ad305248 100644
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -11,7 +11,7 @@ struct tcf_walker {
+ 	int	stop;
+ 	int	skip;
+ 	int	count;
+-	int	(*fn)(struct tcf_proto *, unsigned long node, struct tcf_walker *);
++	int	(*fn)(struct tcf_proto *, void *node, struct tcf_walker *);
+ };
+ 
+ int register_tcf_proto_ops(struct tcf_proto_ops *ops);
+* Unmerged path include/net/sch_generic.h
+* Unmerged path net/sched/cls_api.c
+* Unmerged path net/sched/cls_basic.c
+* Unmerged path net/sched/cls_bpf.c
+* Unmerged path net/sched/cls_cgroup.c
+* Unmerged path net/sched/cls_flow.c
+* Unmerged path net/sched/cls_flower.c
+* Unmerged path net/sched/cls_fw.c
+* Unmerged path net/sched/cls_matchall.c
+* Unmerged path net/sched/cls_route.c
+* Unmerged path net/sched/cls_rsvp.h
+* Unmerged path net/sched/cls_tcindex.c
+* Unmerged path net/sched/cls_u32.c
