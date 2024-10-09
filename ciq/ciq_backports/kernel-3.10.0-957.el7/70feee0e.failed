@@ -1,0 +1,153 @@
+mlock: fix mlock count can not decrease in race condition
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Yisheng Xie <xieyisheng1@huawei.com>
+commit 70feee0e1ef331b22cc51f383d532a0d043fbdcc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/70feee0e.failed
+
+Kefeng reported that when running the follow test, the mlock count in
+meminfo will increase permanently:
+
+ [1] testcase
+ linux:~ # cat test_mlockal
+ grep Mlocked /proc/meminfo
+  for j in `seq 0 10`
+  do
+ 	for i in `seq 4 15`
+ 	do
+ 		./p_mlockall >> log &
+ 	done
+ 	sleep 0.2
+ done
+ # wait some time to let mlock counter decrease and 5s may not enough
+ sleep 5
+ grep Mlocked /proc/meminfo
+
+ linux:~ # cat p_mlockall.c
+ #include <sys/mman.h>
+ #include <stdlib.h>
+ #include <stdio.h>
+
+ #define SPACE_LEN	4096
+
+ int main(int argc, char ** argv)
+ {
+	 	int ret;
+	 	void *adr = malloc(SPACE_LEN);
+	 	if (!adr)
+	 		return -1;
+
+	 	ret = mlockall(MCL_CURRENT | MCL_FUTURE);
+	 	printf("mlcokall ret = %d\n", ret);
+
+	 	ret = munlockall();
+	 	printf("munlcokall ret = %d\n", ret);
+
+	 	free(adr);
+	 	return 0;
+	 }
+
+In __munlock_pagevec() we should decrement NR_MLOCK for each page where
+we clear the PageMlocked flag.  Commit 1ebb7cc6a583 ("mm: munlock: batch
+NR_MLOCK zone state updates") has introduced a bug where we don't
+decrement NR_MLOCK for pages where we clear the flag, but fail to
+isolate them from the lru list (e.g.  when the pages are on some other
+cpu's percpu pagevec).  Since PageMlocked stays cleared, the NR_MLOCK
+accounting gets permanently disrupted by this.
+
+Fix it by counting the number of page whose PageMlock flag is cleared.
+
+Fixes: 1ebb7cc6a583 (" mm: munlock: batch NR_MLOCK zone state updates")
+Link: http://lkml.kernel.org/r/1495678405-54569-1-git-send-email-xieyisheng1@huawei.com
+	Signed-off-by: Yisheng Xie <xieyisheng1@huawei.com>
+	Reported-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+	Tested-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Joern Engel <joern@logfs.org>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Michel Lespinasse <walken@google.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@suse.cz>
+	Cc: Xishi Qiu <qiuxishi@huawei.com>
+	Cc: zhongjiang <zhongjiang@huawei.com>
+	Cc: Hanjun Guo <guohanjun@huawei.com>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 70feee0e1ef331b22cc51f383d532a0d043fbdcc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/mlock.c
+diff --cc mm/mlock.c
+index 51bce8fdbf14,b562b5523a65..000000000000
+--- a/mm/mlock.c
++++ b/mm/mlock.c
+@@@ -300,38 -296,29 +300,51 @@@ static void __munlock_pagevec(struct pa
+  		struct page *page = pvec->pages[i];
+  
+  		if (TestClearPageMlocked(page)) {
+++<<<<<<< HEAD
+ +			struct lruvec *lruvec;
+ +			int lru;
+++=======
++ 			/*
++ 			 * We already have pin from follow_page_mask()
++ 			 * so we can spare the get_page() here.
++ 			 */
++ 			if (__munlock_isolate_lru_page(page, false))
++ 				continue;
++ 			else
++ 				__munlock_isolation_failed(page);
++ 		} else {
++ 			delta_munlocked++;
++ 		}
+++>>>>>>> 70feee0e1ef3 (mlock: fix mlock count can not decrease in race condition)
+  
+ -		/*
+ -		 * We won't be munlocking this page in the next phase
+ -		 * but we still need to release the follow_page_mask()
+ -		 * pin. We cannot do it under lru_lock however. If it's
+ -		 * the last pin, __page_cache_release() would deadlock.
+ -		 */
+ -		pagevec_add(&pvec_putback, pvec->pages[i]);
+ -		pvec->pages[i] = NULL;
+ +			if (PageLRU(page)) {
+ +				lruvec = mem_cgroup_page_lruvec(page, zone);
+ +				lru = page_lru(page);
+ +				/*
+ +				 * We already have pin from follow_page_mask()
+ +				 * so we can spare the get_page() here.
+ +				 */
+ +				ClearPageLRU(page);
+ +				del_page_from_lru_list(page, lruvec, lru);
+ +			} else {
+ +				__munlock_isolation_failed(page);
+ +				goto skip_munlock;
+ +			}
+ +
+ +		} else {
+ +skip_munlock:
+ +			/*
+ +			 * We won't be munlocking this page in the next phase
+ +			 * but we still need to release the follow_page_mask()
+ +			 * pin. We cannot do it under lru_lock however. If it's
+ +			 * the last pin, __page_cache_release would deadlock.
+ +			 */
+ +			pagevec_add(&pvec_putback, pvec->pages[i]);
+ +			pvec->pages[i] = NULL;
+ +		}
+  	}
+- 	delta_munlocked = -nr + pagevec_count(&pvec_putback);
+  	__mod_zone_page_state(zone, NR_MLOCK, delta_munlocked);
+ -	spin_unlock_irq(zone_lru_lock(zone));
+ +	spin_unlock_irq(&zone->lru_lock);
+  
+  	/* Now we can release pins of pages that we are not munlocking */
+  	pagevec_release(&pvec_putback);
+* Unmerged path mm/mlock.c
