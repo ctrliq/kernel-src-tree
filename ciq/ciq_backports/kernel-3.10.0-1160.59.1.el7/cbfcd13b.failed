@@ -1,0 +1,359 @@
+selinux: fix race condition when computing ocontext SIDs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.59.1.el7
+commit-author Ondrej Mosnacek <omosnace@redhat.com>
+commit cbfcd13be5cb2a07868afe67520ed181956579a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.59.1.el7/cbfcd13b.failed
+
+Current code contains a lot of racy patterns when converting an
+ocontext's context structure to an SID. This is being done in a "lazy"
+fashion, such that the SID is looked up in the SID table only when it's
+first needed and then cached in the "sid" field of the ocontext
+structure. However, this is done without any locking or memory barriers
+and is thus unsafe.
+
+Between commits 24ed7fdae669 ("selinux: use separate table for initial
+SID lookup") and 66f8e2f03c02 ("selinux: sidtab reverse lookup hash
+table"), this race condition lead to an actual observable bug, because a
+pointer to the shared sid field was passed directly to
+sidtab_context_to_sid(), which was using this location to also store an
+intermediate value, which could have been read by other threads and
+interpreted as an SID. In practice this caused e.g. new mounts to get a
+wrong (seemingly random) filesystem context, leading to strange denials.
+This bug has been spotted in the wild at least twice, see [1] and [2].
+
+Fix the race condition by making all the racy functions use a common
+helper that ensures the ocontext::sid accesses are made safely using the
+appropriate SMP constructs.
+
+Note that security_netif_sid() was populating the sid field of both
+contexts stored in the ocontext, but only the first one was actually
+used. The SELinux wiki's documentation on the "netifcon" policy
+statement [3] suggests that using only the first context is intentional.
+I kept only the handling of the first context here, as there is really
+no point in doing the SID lookup for the unused one.
+
+I wasn't able to reproduce the bug mentioned above on any kernel that
+includes commit 66f8e2f03c02, even though it has been reported that the
+issue occurs with that commit, too, just less frequently. Thus, I wasn't
+able to verify that this patch fixes the issue, but it makes sense to
+avoid the race condition regardless.
+
+[1] https://github.com/containers/container-selinux/issues/89
+[2] https://lists.fedoraproject.org/archives/list/selinux@lists.fedoraproject.org/thread/6DMTAMHIOAOEMUAVTULJD45JZU7IBAFM/
+[3] https://selinuxproject.org/page/NetworkStatements#netifcon
+
+	Cc: stable@vger.kernel.org
+	Cc: Xinjie Zheng <xinjie@google.com>
+	Reported-by: Sujithra Periasamy <sujithra@google.com>
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+	Signed-off-by: Ondrej Mosnacek <omosnace@redhat.com>
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit cbfcd13be5cb2a07868afe67520ed181956579a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/selinux/ss/services.c
+diff --cc security/selinux/ss/services.c
+index 0f6147434b4d,c4931bf6f92a..000000000000
+--- a/security/selinux/ss/services.c
++++ b/security/selinux/ss/services.c
+@@@ -2139,19 -2376,46 +2139,56 @@@ out
+  	return rc;
+  }
+  
+ +size_t security_policydb_len(void)
+ +{
+ +	size_t len;
+ +
+ +	read_lock(&policy_rwlock);
+ +	len = policydb.len;
+ +	read_unlock(&policy_rwlock);
+ +
+ +	return len;
+ +}
+ +
++ /**
++  * ocontext_to_sid - Helper to safely get sid for an ocontext
++  * @sidtab: SID table
++  * @c: ocontext structure
++  * @index: index of the context entry (0 or 1)
++  * @out_sid: pointer to the resulting SID value
++  *
++  * For all ocontexts except OCON_ISID the SID fields are populated
++  * on-demand when needed. Since updating the SID value is an SMP-sensitive
++  * operation, this helper must be used to do that safely.
++  *
++  * WARNING: This function may return -ESTALE, indicating that the caller
++  * must retry the operation after re-acquiring the policy pointer!
++  */
++ static int ocontext_to_sid(struct sidtab *sidtab, struct ocontext *c,
++ 			   size_t index, u32 *out_sid)
++ {
++ 	int rc;
++ 	u32 sid;
++ 
++ 	/* Ensure the associated sidtab entry is visible to this thread. */
++ 	sid = smp_load_acquire(&c->sid[index]);
++ 	if (!sid) {
++ 		rc = sidtab_context_to_sid(sidtab, &c->context[index], &sid);
++ 		if (rc)
++ 			return rc;
++ 
++ 		/*
++ 		 * Ensure the new sidtab entry is visible to other threads
++ 		 * when they see the SID.
++ 		 */
++ 		smp_store_release(&c->sid[index], sid);
++ 	}
++ 	*out_sid = sid;
++ 	return 0;
++ }
++ 
+  /**
+   * security_port_sid - Obtain the SID for a port.
+ - * @state: SELinux state
+   * @protocol: protocol number
+   * @port: port number
+   * @out_sid: security identifier
+@@@ -2173,14 -2451,13 +2210,22 @@@ int security_port_sid(u8 protocol, u16 
+  	}
+  
+  	if (c) {
+++<<<<<<< HEAD
+ +		if (!c->sid[0]) {
+ +			rc = sidtab_context_to_sid(sidtab,
+ +						   &c->context[0],
+ +						   &c->sid[0]);
+ +			if (rc)
+ +				goto out;
+++=======
++ 		rc = ocontext_to_sid(sidtab, c, 0, out_sid);
++ 		if (rc == -ESTALE) {
++ 			rcu_read_unlock();
++ 			goto retry;
+++>>>>>>> cbfcd13be5cb (selinux: fix race condition when computing ocontext SIDs)
+  		}
+- 		*out_sid = c->sid[0];
++ 		if (rc)
++ 			goto out;
+  	} else {
+  		*out_sid = SECINITSID_PORT;
+  	}
+@@@ -2214,14 -2506,13 +2259,22 @@@ int security_ib_pkey_sid(u64 subnet_pre
+  	}
+  
+  	if (c) {
+++<<<<<<< HEAD
+ +		if (!c->sid[0]) {
+ +			rc = sidtab_context_to_sid(sidtab,
+ +						   &c->context[0],
+ +						   &c->sid[0]);
+ +			if (rc)
+ +				goto out;
+++=======
++ 		rc = ocontext_to_sid(sidtab, c, 0, out_sid);
++ 		if (rc == -ESTALE) {
++ 			rcu_read_unlock();
++ 			goto retry;
+++>>>>>>> cbfcd13be5cb (selinux: fix race condition when computing ocontext SIDs)
+  		}
+- 		*out_sid = c->sid[0];
++ 		if (rc)
++ 			goto out;
+  	} else
+  		*out_sid = SECINITSID_UNLABELED;
+  
+@@@ -2255,14 -2561,13 +2308,22 @@@ int security_ib_endport_sid(const char 
+  	}
+  
+  	if (c) {
+++<<<<<<< HEAD
+ +		if (!c->sid[0]) {
+ +			rc = sidtab_context_to_sid(sidtab,
+ +						   &c->context[0],
+ +						   &c->sid[0]);
+ +			if (rc)
+ +				goto out;
+++=======
++ 		rc = ocontext_to_sid(sidtab, c, 0, out_sid);
++ 		if (rc == -ESTALE) {
++ 			rcu_read_unlock();
++ 			goto retry;
+++>>>>>>> cbfcd13be5cb (selinux: fix race condition when computing ocontext SIDs)
+  		}
+- 		*out_sid = c->sid[0];
++ 		if (rc)
++ 			goto out;
+  	} else
+  		*out_sid = SECINITSID_UNLABELED;
+  
+@@@ -2291,19 -2611,13 +2352,27 @@@ int security_netif_sid(char *name, u32 
+  	}
+  
+  	if (c) {
+++<<<<<<< HEAD
+ +		if (!c->sid[0] || !c->sid[1]) {
+ +			rc = sidtab_context_to_sid(sidtab,
+ +						  &c->context[0],
+ +						  &c->sid[0]);
+ +			if (rc)
+ +				goto out;
+ +			rc = sidtab_context_to_sid(sidtab,
+ +						   &c->context[1],
+ +						   &c->sid[1]);
+ +			if (rc)
+ +				goto out;
+++=======
++ 		rc = ocontext_to_sid(sidtab, c, 0, if_sid);
++ 		if (rc == -ESTALE) {
++ 			rcu_read_unlock();
++ 			goto retry;
+++>>>>>>> cbfcd13be5cb (selinux: fix race condition when computing ocontext SIDs)
+  		}
+- 		*if_sid = c->sid[0];
++ 		if (rc)
++ 			goto out;
+  	} else
+  		*if_sid = SECINITSID_NETIF;
+  
+@@@ -2381,14 -2709,13 +2450,22 @@@ int security_node_sid(u16 domain
+  	}
+  
+  	if (c) {
+++<<<<<<< HEAD
+ +		if (!c->sid[0]) {
+ +			rc = sidtab_context_to_sid(sidtab,
+ +						   &c->context[0],
+ +						   &c->sid[0]);
+ +			if (rc)
+ +				goto out;
+++=======
++ 		rc = ocontext_to_sid(sidtab, c, 0, out_sid);
++ 		if (rc == -ESTALE) {
++ 			rcu_read_unlock();
++ 			goto retry;
+++>>>>>>> cbfcd13be5cb (selinux: fix race condition when computing ocontext SIDs)
+  		}
+- 		*out_sid = c->sid[0];
++ 		if (rc)
++ 			goto out;
+  	} else {
+  		*out_sid = SECINITSID_NODE;
+  	}
+@@@ -2561,21 -2904,55 +2637,24 @@@ int security_genfs_sid(const char *fsty
+  			break;
+  	}
+  
+- 	rc = -ENOENT;
+  	if (!c)
+- 		goto out;
++ 		return -ENOENT;
+  
+ -	return ocontext_to_sid(sidtab, c, 0, sid);
+ -}
+ -
+ -/**
+ - * security_genfs_sid - Obtain a SID for a file in a filesystem
+ - * @state: SELinux state
+ - * @fstype: filesystem type
+ - * @path: path from root of mount
+ - * @sclass: file security class
+ - * @sid: SID for path
+ - *
+ - * Acquire policy_rwlock before calling __security_genfs_sid() and release
+ - * it afterward.
+ - */
+ -int security_genfs_sid(struct selinux_state *state,
+ -		       const char *fstype,
+ -		       char *path,
+ -		       u16 orig_sclass,
+ -		       u32 *sid)
+ -{
+ -	struct selinux_policy *policy;
+ -	int retval;
+ -
+ -	if (!selinux_initialized(state)) {
+ -		*sid = SECINITSID_UNLABELED;
+ -		return 0;
+++<<<<<<< HEAD
+ +	if (!c->sid[0]) {
+ +		rc = sidtab_context_to_sid(sidtab, &c->context[0], &c->sid[0]);
+ +		if (rc)
+ +			goto out;
+  	}
+  
+ -	do {
+ -		rcu_read_lock();
+ -		policy = rcu_dereference(state->policy);
+ -		retval = __security_genfs_sid(policy, fstype, path,
+ -					      orig_sclass, sid);
+ -		rcu_read_unlock();
+ -	} while (retval == -ESTALE);
+ -	return retval;
+ -}
+ -
+ -int selinux_policy_genfs_sid(struct selinux_policy *policy,
+ -			const char *fstype,
+ -			char *path,
+ -			u16 orig_sclass,
+ -			u32 *sid)
+ -{
+ -	/* no lock required, policy is not yet accessible by other threads */
+ -	return __security_genfs_sid(policy, fstype, path, orig_sclass, sid);
+ +	*sid = c->sid[0];
+ +	rc = 0;
+ +out:
+ +	read_unlock(&policy_rwlock);
+ +	return rc;
+++=======
+++	return ocontext_to_sid(sidtab, c, 0, sid);
+++>>>>>>> cbfcd13be5cb (selinux: fix race condition when computing ocontext SIDs)
+  }
+  
+  /**
+@@@ -2602,21 -2991,26 +2681,32 @@@ int security_fs_use
+  	}
+  
+  	if (c) {
+++<<<<<<< HEAD
+ +		*behavior = c->v.behavior;
+ +		if (!c->sid[0]) {
+ +			rc = sidtab_context_to_sid(sidtab, &c->context[0],
+ +						   &c->sid[0]);
+ +			if (rc)
+ +				goto out;
+ +		}
+ +		*sid = c->sid[0];
+++=======
++ 		sbsec->behavior = c->v.behavior;
++ 		rc = ocontext_to_sid(sidtab, c, 0, &sbsec->sid);
++ 		if (rc == -ESTALE) {
++ 			rcu_read_unlock();
++ 			goto retry;
++ 		}
++ 		if (rc)
++ 			goto out;
+++>>>>>>> cbfcd13be5cb (selinux: fix race condition when computing ocontext SIDs)
+  	} else {
+ -		rc = __security_genfs_sid(policy, fstype, "/",
+ -					SECCLASS_DIR, &sbsec->sid);
+ -		if (rc == -ESTALE) {
+ -			rcu_read_unlock();
+ -			goto retry;
+ -		}
+ +		rc = security_genfs_sid(fstype, "/", SECCLASS_DIR, sid);
+  		if (rc) {
+ -			sbsec->behavior = SECURITY_FS_USE_NONE;
+ +			*behavior = SECURITY_FS_USE_NONE;
+  			rc = 0;
+  		} else {
+ -			sbsec->behavior = SECURITY_FS_USE_GENFS;
+ +			*behavior = SECURITY_FS_USE_GENFS;
+  		}
+  	}
+  
+* Unmerged path security/selinux/ss/services.c
