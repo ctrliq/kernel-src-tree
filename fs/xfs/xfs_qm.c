@@ -110,6 +110,9 @@ restart:
 			skipped = 0;
 			break;
 		}
+		/* we're done if id overflows back to zero */
+		if (!next_index)
+			break;
 	}
 
 	if (skipped) {
