@@ -1,0 +1,96 @@
+svcrdma: Preserve Receive buffer until svc_rdma_sendto
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 3a88092ee319b88cf30a2dc89b9edf2ef5518750
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/3a88092e.failed
+
+Rather than releasing the incoming svc_rdma_recv_ctxt at the end of
+svc_rdma_recvfrom, hold onto it until svc_rdma_sendto.
+
+This permits the contents of the Receive buffer to be preserved
+through svc_process and then referenced directly in sendto as it
+constructs Write and Reply chunks to return to the client.
+
+The real changes will come in subsequent patches.
+
+Note: I cannot use ->xpo_release_rqst for this purpose because that
+is called _before_ ->xpo_sendto. svc_rdma_sendto uses information in
+the received Call transport header to construct the Reply transport
+header, which is preserved in the RPC's Receive buffer.
+
+The historical comment in svc_send() isn't helpful: it is already
+obvious that ->xpo_release_rqst is being called before ->xpo_sendto,
+but there is no explanation for this ordering going back to the
+beginning of the git era.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit 3a88092ee319b88cf30a2dc89b9edf2ef5518750)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
+diff --cc net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
+index 330d542fd96e,d9fef5211116..000000000000
+--- a/net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
+@@@ -554,7 -789,7 +554,11 @@@ int svc_rdma_recvfrom(struct svc_rqst *
+  		goto out_readchunk;
+  
+  complete:
+++<<<<<<< HEAD
+ +	svc_rdma_put_context(ctxt, 0);
+++=======
++ 	rqstp->rq_xprt_ctxt = ctxt;
+++>>>>>>> 3a88092ee319 (svcrdma: Preserve Receive buffer until svc_rdma_sendto)
+  	rqstp->rq_prot = IPPROTO_MAX;
+  	svc_xprt_copy_addrs(rqstp, xprt);
+  	return rqstp->rq_arg.len;
+* Unmerged path net/sunrpc/xprtrdma/svc_rdma_recvfrom.c
+diff --git a/net/sunrpc/xprtrdma/svc_rdma_sendto.c b/net/sunrpc/xprtrdma/svc_rdma_sendto.c
+index fed28de78d37..5d628a9ff801 100644
+--- a/net/sunrpc/xprtrdma/svc_rdma_sendto.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_sendto.c
+@@ -623,6 +623,7 @@ int svc_rdma_sendto(struct svc_rqst *rqstp)
+ 	struct svc_xprt *xprt = rqstp->rq_xprt;
+ 	struct svcxprt_rdma *rdma =
+ 		container_of(xprt, struct svcxprt_rdma, sc_xprt);
++	struct svc_rdma_recv_ctxt *rctxt = rqstp->rq_xprt_ctxt;
+ 	__be32 *p, *rdma_argp, *rdma_resp, *wr_lst, *rp_ch;
+ 	struct xdr_buf *xdr = &rqstp->rq_res;
+ 	struct page *res_page;
+@@ -675,7 +676,12 @@ int svc_rdma_sendto(struct svc_rqst *rqstp)
+ 				      wr_lst, rp_ch);
+ 	if (ret < 0)
+ 		goto err0;
+-	return 0;
++	ret = 0;
++
++out:
++	rqstp->rq_xprt_ctxt = NULL;
++	svc_rdma_recv_ctxt_put(rdma, rctxt);
++	return ret;
+ 
+  err2:
+ 	if (ret != -E2BIG && ret != -EINVAL)
+@@ -684,12 +690,14 @@ int svc_rdma_sendto(struct svc_rqst *rqstp)
+ 	ret = svc_rdma_send_error_msg(rdma, rdma_resp, rqstp);
+ 	if (ret < 0)
+ 		goto err0;
+-	return 0;
++	ret = 0;
++	goto out;
+ 
+  err1:
+ 	put_page(res_page);
+  err0:
+ 	trace_svcrdma_send_failed(rqstp, ret);
+ 	set_bit(XPT_CLOSE, &xprt->xpt_flags);
+-	return -ENOTCONN;
++	ret = -ENOTCONN;
++	goto out;
+ }
