@@ -1,0 +1,269 @@
+net: sched: introduce per-block callbacks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [net] sched: introduce per-block callbacks (Ivan Vecera) [1572720]
+Rebuild_FUZZ: 93.51%
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit acb674428c3d57bccbe3f4a1a7a009f6d73e9f41
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/acb67442.failed
+
+Introduce infrastructure that allows drivers to register callbacks that
+are called whenever tc would offload inserted rule for a specific block.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit acb674428c3d57bccbe3f4a1a7a009f6d73e9f41)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sch_generic.h
+diff --cc include/net/sch_generic.h
+index 3ef0057615ac,031dffd5836c..000000000000
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@@ -286,6 -270,9 +286,12 @@@ struct tcf_chain 
+  
+  struct tcf_block {
+  	struct list_head chain_list;
+++<<<<<<< HEAD
+++=======
++ 	struct net *net;
++ 	struct Qdisc *q;
++ 	struct list_head cb_list;
+++>>>>>>> acb674428c3d (net: sched: introduce per-block callbacks)
+  };
+  
+  static inline void qdisc_cb_private_validate(const struct sk_buff *skb, int sz)
+diff --git a/include/net/pkt_cls.h b/include/net/pkt_cls.h
+index 43b9922037a8..fcef80deb826 100644
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -20,6 +20,8 @@ int unregister_tcf_proto_ops(struct tcf_proto_ops *ops);
+ 
+ bool tcf_queue_work(struct work_struct *work);
+ 
++struct tcf_block_cb;
++
+ #ifdef CONFIG_NET_CLS
+ struct tcf_chain *tcf_chain_get(struct tcf_block *block, u32 chain_index,
+ 				bool create);
+@@ -38,6 +40,21 @@ static inline struct net_device *tcf_block_dev(struct tcf_block *block)
+ 	return tcf_block_q(block)->dev_queue->dev;
+ }
+ 
++void *tcf_block_cb_priv(struct tcf_block_cb *block_cb);
++struct tcf_block_cb *tcf_block_cb_lookup(struct tcf_block *block,
++					 tc_setup_cb_t *cb, void *cb_ident);
++void tcf_block_cb_incref(struct tcf_block_cb *block_cb);
++unsigned int tcf_block_cb_decref(struct tcf_block_cb *block_cb);
++struct tcf_block_cb *__tcf_block_cb_register(struct tcf_block *block,
++					     tc_setup_cb_t *cb, void *cb_ident,
++					     void *cb_priv);
++int tcf_block_cb_register(struct tcf_block *block,
++			  tc_setup_cb_t *cb, void *cb_ident,
++			  void *cb_priv);
++void __tcf_block_cb_unregister(struct tcf_block_cb *block_cb);
++void tcf_block_cb_unregister(struct tcf_block *block,
++			     tc_setup_cb_t *cb, void *cb_ident);
++
+ int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
+ 		 struct tcf_result *res, bool compat_mode);
+ 
+@@ -63,6 +80,70 @@ static inline struct net_device *tcf_block_dev(struct tcf_block *block)
+ 	return NULL;
+ }
+ 
++static inline
++int tc_setup_cb_block_register(struct tcf_block *block, tc_setup_cb_t *cb,
++			       void *cb_priv)
++{
++	return 0;
++}
++
++static inline
++void tc_setup_cb_block_unregister(struct tcf_block *block, tc_setup_cb_t *cb,
++				  void *cb_priv)
++{
++}
++
++static inline
++void *tcf_block_cb_priv(struct tcf_block_cb *block_cb)
++{
++	return NULL;
++}
++
++static inline
++struct tcf_block_cb *tcf_block_cb_lookup(struct tcf_block *block,
++					 tc_setup_cb_t *cb, void *cb_ident)
++{
++	return NULL;
++}
++
++static inline
++void tcf_block_cb_incref(struct tcf_block_cb *block_cb)
++{
++}
++
++static inline
++unsigned int tcf_block_cb_decref(struct tcf_block_cb *block_cb)
++{
++	return 0;
++}
++
++static inline
++struct tcf_block_cb *__tcf_block_cb_register(struct tcf_block *block,
++					     tc_setup_cb_t *cb, void *cb_ident,
++					     void *cb_priv)
++{
++	return NULL;
++}
++
++static inline
++int tcf_block_cb_register(struct tcf_block *block,
++			  tc_setup_cb_t *cb, void *cb_ident,
++			  void *cb_priv)
++{
++	return 0;
++}
++
++static inline
++void __tcf_block_cb_unregister(struct tcf_block_cb *block_cb)
++{
++}
++
++static inline
++void tcf_block_cb_unregister(struct tcf_block *block,
++			     tc_setup_cb_t *cb, void *cb_ident)
++{
++}
++
+ static inline int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
+ 			       struct tcf_result *res, bool compat_mode)
+ {
+* Unmerged path include/net/sch_generic.h
+diff --git a/net/sched/cls_api.c b/net/sched/cls_api.c
+index 0e9c21220742..81fb74dbd4ac 100644
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -264,6 +264,8 @@ int tcf_block_get(struct tcf_block **p_block,
+ 	if (!block)
+ 		return -ENOMEM;
+ 	INIT_LIST_HEAD(&block->chain_list);
++	INIT_LIST_HEAD(&block->cb_list);
++
+ 	/* Create chain 0 by default, it has to be always present. */
+ 	chain = tcf_chain_create(block, 0);
+ 	if (!chain) {
+@@ -309,6 +311,109 @@ void tcf_block_put(struct tcf_block *block)
+ }
+ EXPORT_SYMBOL(tcf_block_put);
+ 
++struct tcf_block_cb {
++	struct list_head list;
++	tc_setup_cb_t *cb;
++	void *cb_ident;
++	void *cb_priv;
++	unsigned int refcnt;
++};
++
++void *tcf_block_cb_priv(struct tcf_block_cb *block_cb)
++{
++	return block_cb->cb_priv;
++}
++EXPORT_SYMBOL(tcf_block_cb_priv);
++
++struct tcf_block_cb *tcf_block_cb_lookup(struct tcf_block *block,
++					 tc_setup_cb_t *cb, void *cb_ident)
++{	struct tcf_block_cb *block_cb;
++
++	list_for_each_entry(block_cb, &block->cb_list, list)
++		if (block_cb->cb == cb && block_cb->cb_ident == cb_ident)
++			return block_cb;
++	return NULL;
++}
++EXPORT_SYMBOL(tcf_block_cb_lookup);
++
++void tcf_block_cb_incref(struct tcf_block_cb *block_cb)
++{
++	block_cb->refcnt++;
++}
++EXPORT_SYMBOL(tcf_block_cb_incref);
++
++unsigned int tcf_block_cb_decref(struct tcf_block_cb *block_cb)
++{
++	return --block_cb->refcnt;
++}
++EXPORT_SYMBOL(tcf_block_cb_decref);
++
++struct tcf_block_cb *__tcf_block_cb_register(struct tcf_block *block,
++					     tc_setup_cb_t *cb, void *cb_ident,
++					     void *cb_priv)
++{
++	struct tcf_block_cb *block_cb;
++
++	block_cb = kzalloc(sizeof(*block_cb), GFP_KERNEL);
++	if (!block_cb)
++		return NULL;
++	block_cb->cb = cb;
++	block_cb->cb_ident = cb_ident;
++	block_cb->cb_priv = cb_priv;
++	list_add(&block_cb->list, &block->cb_list);
++	return block_cb;
++}
++EXPORT_SYMBOL(__tcf_block_cb_register);
++
++int tcf_block_cb_register(struct tcf_block *block,
++			  tc_setup_cb_t *cb, void *cb_ident,
++			  void *cb_priv)
++{
++	struct tcf_block_cb *block_cb;
++
++	block_cb = __tcf_block_cb_register(block, cb, cb_ident, cb_priv);
++	return block_cb ? 0 : -ENOMEM;
++}
++EXPORT_SYMBOL(tcf_block_cb_register);
++
++void __tcf_block_cb_unregister(struct tcf_block_cb *block_cb)
++{
++	list_del(&block_cb->list);
++	kfree(block_cb);
++}
++EXPORT_SYMBOL(__tcf_block_cb_unregister);
++
++void tcf_block_cb_unregister(struct tcf_block *block,
++			     tc_setup_cb_t *cb, void *cb_ident)
++{
++	struct tcf_block_cb *block_cb;
++
++	block_cb = tcf_block_cb_lookup(block, cb, cb_ident);
++	if (!block_cb)
++		return;
++	__tcf_block_cb_unregister(block_cb);
++}
++EXPORT_SYMBOL(tcf_block_cb_unregister);
++
++static int tcf_block_cb_call(struct tcf_block *block, enum tc_setup_type type,
++			     void *type_data, bool err_stop)
++{
++	struct tcf_block_cb *block_cb;
++	int ok_count = 0;
++	int err;
++
++	list_for_each_entry(block_cb, &block->cb_list, list) {
++		err = block_cb->cb(type, type_data, block_cb->cb_priv);
++		if (err) {
++			if (err_stop)
++				return err;
++		} else {
++			ok_count++;
++		}
++	}
++	return ok_count;
++}
++
+ /* Main classifier routine: scans classifier chain attached
+  * to this qdisc, (optionally) tests for protocol and asks
+  * specific classifiers.
