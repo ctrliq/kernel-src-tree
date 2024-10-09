@@ -1,0 +1,103 @@
+netfilter: ipset: Fix sleeping memory allocation in atomic context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Nikolay Borisov <kernel@kyup.com>
+commit 00db674bedd68ff8b5afae9030ff5e04d45d1b4a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/00db674b.failed
+
+Commit 00590fdd5be0 introduced RCU locking in list type and in
+doing so introduced a memory allocation in list_set_add, which
+is done in an atomic context, due to the fact that ipset rcu
+list modifications are serialised with a spin lock. The reason
+why we can't use a mutex is that in addition to modifying the
+list with ipset commands, it's also being modified when a
+particular ipset rule timeout expires aka garbage collection.
+This gc is triggered from set_cleanup_entries, which in turn
+is invoked from a timer thus requiring the lock to be bh-safe.
+
+Concretely the following call chain can lead to "sleeping function
+called in atomic context" splat:
+call_ad -> list_set_uadt -> list_set_uadd -> kzalloc(, GFP_KERNEL).
+And since GFP_KERNEL allows initiating direct reclaim thus
+potentially sleeping in the allocation path.
+
+To fix the issue change the allocation type to GFP_ATOMIC, to
+correctly reflect that it is occuring in an atomic context.
+
+Fixes: 00590fdd5be0 ("netfilter: ipset: Introduce RCU locking in list type")
+	Signed-off-by: Nikolay Borisov <kernel@kyup.com>
+	Acked-by: Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 00db674bedd68ff8b5afae9030ff5e04d45d1b4a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/ipset/ip_set_list_set.c
+diff --cc net/netfilter/ipset/ip_set_list_set.c
+index a9a97c07ecb4,5a30ce6e8c90..000000000000
+--- a/net/netfilter/ipset/ip_set_list_set.c
++++ b/net/netfilter/ipset/ip_set_list_set.c
+@@@ -328,22 -277,42 +328,41 @@@ list_set_uadd(struct ip_set *set, void 
+  		ip_set_put_byindex(map->net, d->id);
+  		return 0;
+  	}
+ -	/* Add new entry */
+ -	if (d->before == 0) {
+ -		/* Append  */
+ -		n = list_empty(&map->members) ? NULL :
+ -		    list_last_entry(&map->members, struct set_elem, list);
+ -	} else if (d->before > 0) {
+ -		/* Insert after next element */
+ -		if (!list_is_last(&next->list, &map->members))
+ -			n = list_next_entry(next, list);
+ -	} else {
+ -		/* Insert before prev element */
+ -		if (prev->list.prev != &map->members)
+ -			n = list_prev_entry(prev, list);
+ +insert:
+ +	ret = -IPSET_ERR_LIST_FULL;
+ +	for (i = 0; i < map->size && ret == -IPSET_ERR_LIST_FULL; i++) {
+ +		e = list_set_elem(map, i);
+ +		if (e->id == IPSET_INVALID_ID)
+ +			ret = d->before != 0 ? -IPSET_ERR_REF_EXIST
+ +				: list_set_add(set, i, d, ext);
+ +		else if (e->id != d->refid)
+ +			continue;
+ +		else if (d->before > 0)
+ +			ret = list_set_add(set, i, d, ext);
+ +		else if (i + 1 < map->size)
+ +			ret = list_set_add(set, i + 1, d, ext);
+  	}
+ -	/* Can we replace a timed out entry? */
+ -	if (n &&
+ -	    !(SET_WITH_TIMEOUT(set) &&
+ -	      ip_set_timeout_expired(ext_timeout(n, set))))
+ -		n =  NULL;
+  
+++<<<<<<< HEAD
+ +	return ret;
+++=======
++ 	e = kzalloc(set->dsize, GFP_ATOMIC);
++ 	if (!e)
++ 		return -ENOMEM;
++ 	e->id = d->id;
++ 	INIT_LIST_HEAD(&e->list);
++ 	list_set_init_extensions(set, ext, e);
++ 	if (n)
++ 		list_set_replace(set, e, n);
++ 	else if (next)
++ 		list_add_tail_rcu(&e->list, &next->list);
++ 	else if (prev)
++ 		list_add_rcu(&e->list, &prev->list);
++ 	else
++ 		list_add_tail_rcu(&e->list, &map->members);
++ 
++ 	return 0;
+++>>>>>>> 00db674bedd6 (netfilter: ipset: Fix sleeping memory allocation in atomic context)
+  }
+  
+  static int
+* Unmerged path net/netfilter/ipset/ip_set_list_set.c
