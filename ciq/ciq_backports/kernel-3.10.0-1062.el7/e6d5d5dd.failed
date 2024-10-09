@@ -1,0 +1,172 @@
+IB/uverbs: Clarify and revise uverbs_close_fd
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Gunthorpe <jgg@mellanox.com>
+commit e6d5d5ddd0869cf44a554289cd213007ccc0afde
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/e6d5d5dd.failed
+
+The locking requirements here have changed slightly now that we can rely
+on the ib_uverbs_file always existing and containing all the necessary
+locking infrastructure.
+
+That means we can get rid of the cleanup_mutex usage (this was protecting
+the check on !uboj->context).
+
+Otherwise, follow the same pattern that IDR uses for destroy, acquire
+exclusive write access, then call destroy and the undo the 'lookup'.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit e6d5d5ddd0869cf44a554289cd213007ccc0afde)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/rdma_core.c
+diff --cc drivers/infiniband/core/rdma_core.c
+index 586f179a9de6,a55646cbf9b1..000000000000
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@@ -623,46 -646,106 +623,86 @@@ const struct uverbs_obj_type_class uver
+  	 */
+  	.needs_kfree_rcu = true,
+  };
+ -EXPORT_SYMBOL(uverbs_idr_class);
+  
+ -static void _uverbs_close_fd(struct ib_uobject *uobj)
+ +static void _uverbs_close_fd(struct ib_uobject_file *uobj_file)
+  {
+++<<<<<<< HEAD
+ +	struct ib_ucontext *ucontext;
+ +	struct ib_uverbs_file *ufile = uobj_file->ufile;
+ +	int ret;
+ +
+ +	mutex_lock(&uobj_file->ufile->cleanup_mutex);
+ +
+ +	/* uobject was either already cleaned up or is cleaned up right now anyway */
+ +	if (!uobj_file->uobj.context ||
+ +	    !down_read_trylock(&uobj_file->uobj.context->cleanup_rwsem))
+ +		goto unlock;
+ +
+ +	ucontext = uobj_file->uobj.context;
+ +	ret = _rdma_remove_commit_uobject(&uobj_file->uobj, RDMA_REMOVE_CLOSE);
+ +	up_read(&ucontext->cleanup_rwsem);
+++=======
++ 	int ret;
++ 
++ 	/*
++ 	 * uobject was already cleaned up, remove_commit_fd_uobject
++ 	 * sets this
++ 	 */
++ 	if (!uobj->context)
++ 		return;
++ 
++ 	/*
++ 	 * lookup_get_fd_uobject holds the kref on the struct file any time a
++ 	 * FD uobj is locked, which prevents this release method from being
++ 	 * invoked. Meaning we can always get the write lock here, or we have
++ 	 * a kernel bug. If so dangle the pointers and bail.
++ 	 */
++ 	ret = uverbs_try_lock_object(uobj, true);
++ 	if (WARN(ret, "uverbs_close_fd() racing with lookup_get_fd_uobject()"))
++ 		return;
++ 
++ 	ret = _rdma_remove_commit_uobject(uobj, RDMA_REMOVE_CLOSE);
+++>>>>>>> e6d5d5ddd086 (IB/uverbs: Clarify and revise uverbs_close_fd)
+  	if (ret)
+- 		pr_warn("uverbs: unable to clean up uobject file in uverbs_close_fd.\n");
+- unlock:
+- 	mutex_unlock(&ufile->cleanup_mutex);
++ 		pr_warn("Unable to clean up uobject file in %s\n", __func__);
++ 
++ 	atomic_set(&uobj->usecnt, 0);
+  }
+  
+  void uverbs_close_fd(struct file *f)
+  {
+++<<<<<<< HEAD
+ +	struct ib_uobject_file *uobj_file = f->private_data;
+ +	struct kref *uverbs_file_ref = &uobj_file->ufile->ref;
+ +
+ +	_uverbs_close_fd(uobj_file);
+ +	uverbs_uobject_put(&uobj_file->uobj);
+ +	kref_put(uverbs_file_ref, ib_uverbs_release_file);
+++=======
++ 	struct ib_uobject *uobj = f->private_data;
++ 	struct ib_uverbs_file *ufile = uobj->ufile;
++ 
++ 	if (down_read_trylock(&ufile->cleanup_rwsem)) {
++ 		_uverbs_close_fd(uobj);
++ 		up_read(&ufile->cleanup_rwsem);
++ 	}
++ 
++ 	uobj->object = NULL;
++ 	/* Matches the get in alloc_begin_fd_uobject */
++ 	kref_put(&ufile->ref, ib_uverbs_release_file);
++ 
++ 	/* Pairs with filp->private_data in alloc_begin_fd_uobject */
++ 	uverbs_uobject_put(uobj);
+++>>>>>>> e6d5d5ddd086 (IB/uverbs: Clarify and revise uverbs_close_fd)
+  }
+  
+ -static int __uverbs_cleanup_ufile(struct ib_uverbs_file *ufile,
+ -				  enum rdma_remove_reason reason)
+ -{
+ -	struct ib_uobject *obj, *next_obj;
+ -	int ret = -EINVAL;
+ -	int err = 0;
+ -
+ -	/*
+ -	 * This shouldn't run while executing other commands on this
+ -	 * context. Thus, the only thing we should take care of is
+ -	 * releasing a FD while traversing this list. The FD could be
+ -	 * closed and released from the _release fop of this FD.
+ -	 * In order to mitigate this, we add a lock.
+ -	 * We take and release the lock per traversal in order to let
+ -	 * other threads (which might still use the FDs) chance to run.
+ -	 */
+ -	mutex_lock(&ufile->uobjects_lock);
+ -	ufile->cleanup_reason = reason;
+ -	list_for_each_entry_safe(obj, next_obj, &ufile->uobjects, list) {
+ -		/*
+ -		 * if we hit this WARN_ON, that means we are
+ -		 * racing with a lookup_get.
+ -		 */
+ -		WARN_ON(uverbs_try_lock_object(obj, true));
+ -		err = obj->type->type_class->remove_commit(obj, reason);
+ -
+ -		if (ib_is_destroy_retryable(err, reason, obj)) {
+ -			pr_debug("ib_uverbs: failed to remove uobject id %d err %d\n",
+ -				 obj->id, err);
+ -			atomic_set(&obj->usecnt, 0);
+ -			continue;
+ -		}
+ -
+ -		if (err)
+ -			pr_err("ib_uverbs: unable to remove uobject id %d err %d\n",
+ -				obj->id, err);
+ -
+ -		list_del(&obj->list);
+ -		/* Pairs with the get in rdma_alloc_commit_uobject() */
+ -		uverbs_uobject_put(obj);
+ -		ret = 0;
+ -	}
+ -	mutex_unlock(&ufile->uobjects_lock);
+ -	return ret;
+ -}
+ -
+ -void uverbs_cleanup_ufile(struct ib_uverbs_file *ufile, bool device_removed)
+ +void uverbs_cleanup_ucontext(struct ib_ucontext *ucontext, bool device_removed)
+  {
+  	enum rdma_remove_reason reason = device_removed ?
+ -					RDMA_REMOVE_DRIVER_REMOVE :
+ -					RDMA_REMOVE_CLOSE;
+ +		RDMA_REMOVE_DRIVER_REMOVE : RDMA_REMOVE_CLOSE;
+ +	unsigned int cur_order = 0;
+  
+ +	ucontext->cleanup_reason = reason;
+  	/*
+  	 * Waits for all remove_commit and alloc_commit to finish. Logically, We
+  	 * want to hold this forever as the context is going to be destroyed,
+* Unmerged path drivers/infiniband/core/rdma_core.c
