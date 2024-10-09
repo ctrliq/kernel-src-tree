@@ -1,0 +1,208 @@
+sfc: read back RX hash config from the NIC when querying it with ethtool -x
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Edward Cree <ecree@solarflare.com>
+commit a707d18851a3bab517e21a6449806e468703bc3d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/a707d188.failed
+
+Ensures that we report the key and indirection table the NIC is using,
+ rather than (if setting them failed earlier) what we wanted it to use.
+
+	Signed-off-by: Edward Cree <ecree@solarflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a707d18851a3bab517e21a6449806e468703bc3d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/sfc/net_driver.h
+diff --cc drivers/net/ethernet/sfc/net_driver.h
+index c4c448c45d0a,5927c20ba43f..000000000000
+--- a/drivers/net/ethernet/sfc/net_driver.h
++++ b/drivers/net/ethernet/sfc/net_driver.h
+@@@ -1309,7 -1312,8 +1310,12 @@@ struct efx_nic_type 
+  	unsigned int (*tx_limit_len)(struct efx_tx_queue *tx_queue,
+  				     dma_addr_t dma_addr, unsigned int len);
+  	int (*rx_push_rss_config)(struct efx_nic *efx, bool user,
+++<<<<<<< HEAD
+ +				  const u32 *rx_indir_table);
+++=======
++ 				  const u32 *rx_indir_table, const u8 *key);
++ 	int (*rx_pull_rss_config)(struct efx_nic *efx);
+++>>>>>>> a707d18851a3 (sfc: read back RX hash config from the NIC when querying it with ethtool -x)
+  	int (*rx_probe)(struct efx_rx_queue *rx_queue);
+  	void (*rx_init)(struct efx_rx_queue *rx_queue);
+  	void (*rx_remove)(struct efx_rx_queue *rx_queue);
+diff --git a/drivers/net/ethernet/sfc/ef10.c b/drivers/net/ethernet/sfc/ef10.c
+index b1c97d73d307..06fc62c90b16 100644
+--- a/drivers/net/ethernet/sfc/ef10.c
++++ b/drivers/net/ethernet/sfc/ef10.c
+@@ -2550,6 +2550,56 @@ fail1:
+ 	return rc;
+ }
+ 
++static int efx_ef10_rx_pull_rss_config(struct efx_nic *efx)
++{
++	struct efx_ef10_nic_data *nic_data = efx->nic_data;
++	MCDI_DECLARE_BUF(inbuf, MC_CMD_RSS_CONTEXT_GET_TABLE_IN_LEN);
++	MCDI_DECLARE_BUF(tablebuf, MC_CMD_RSS_CONTEXT_GET_TABLE_OUT_LEN);
++	MCDI_DECLARE_BUF(keybuf, MC_CMD_RSS_CONTEXT_GET_KEY_OUT_LEN);
++	size_t outlen;
++	int rc, i;
++
++	BUILD_BUG_ON(MC_CMD_RSS_CONTEXT_GET_TABLE_IN_LEN !=
++		     MC_CMD_RSS_CONTEXT_GET_KEY_IN_LEN);
++
++	if (nic_data->rx_rss_context == EFX_EF10_RSS_CONTEXT_INVALID)
++		return -ENOENT;
++
++	MCDI_SET_DWORD(inbuf, RSS_CONTEXT_GET_TABLE_IN_RSS_CONTEXT_ID,
++		       nic_data->rx_rss_context);
++	BUILD_BUG_ON(ARRAY_SIZE(efx->rx_indir_table) !=
++		     MC_CMD_RSS_CONTEXT_GET_TABLE_OUT_INDIRECTION_TABLE_LEN);
++	rc = efx_mcdi_rpc(efx, MC_CMD_RSS_CONTEXT_GET_TABLE, inbuf, sizeof(inbuf),
++			  tablebuf, sizeof(tablebuf), &outlen);
++	if (rc != 0)
++		return rc;
++
++	if (WARN_ON(outlen != MC_CMD_RSS_CONTEXT_GET_TABLE_OUT_LEN))
++		return -EIO;
++
++	for (i = 0; i < ARRAY_SIZE(efx->rx_indir_table); i++)
++		efx->rx_indir_table[i] = MCDI_PTR(tablebuf,
++				RSS_CONTEXT_GET_TABLE_OUT_INDIRECTION_TABLE)[i];
++
++	MCDI_SET_DWORD(inbuf, RSS_CONTEXT_GET_KEY_IN_RSS_CONTEXT_ID,
++		       nic_data->rx_rss_context);
++	BUILD_BUG_ON(ARRAY_SIZE(efx->rx_hash_key) !=
++		     MC_CMD_RSS_CONTEXT_SET_KEY_IN_TOEPLITZ_KEY_LEN);
++	rc = efx_mcdi_rpc(efx, MC_CMD_RSS_CONTEXT_GET_KEY, inbuf, sizeof(inbuf),
++			  keybuf, sizeof(keybuf), &outlen);
++	if (rc != 0)
++		return rc;
++
++	if (WARN_ON(outlen != MC_CMD_RSS_CONTEXT_GET_KEY_OUT_LEN))
++		return -EIO;
++
++	for (i = 0; i < ARRAY_SIZE(efx->rx_hash_key); ++i)
++		efx->rx_hash_key[i] = MCDI_PTR(
++				keybuf, RSS_CONTEXT_GET_KEY_OUT_TOEPLITZ_KEY)[i];
++
++	return 0;
++}
++
+ static int efx_ef10_pf_rx_push_rss_config(struct efx_nic *efx, bool user,
+ 					  const u32 *rx_indir_table)
+ {
+@@ -5544,6 +5594,7 @@ const struct efx_nic_type efx_hunt_a0_vf_nic_type = {
+ 	.tx_write = efx_ef10_tx_write,
+ 	.tx_limit_len = efx_ef10_tx_limit_len,
+ 	.rx_push_rss_config = efx_ef10_vf_rx_push_rss_config,
++	.rx_pull_rss_config = efx_ef10_rx_pull_rss_config,
+ 	.rx_probe = efx_ef10_rx_probe,
+ 	.rx_init = efx_ef10_rx_init,
+ 	.rx_remove = efx_ef10_rx_remove,
+@@ -5651,6 +5702,7 @@ const struct efx_nic_type efx_hunt_a0_nic_type = {
+ 	.tx_write = efx_ef10_tx_write,
+ 	.tx_limit_len = efx_ef10_tx_limit_len,
+ 	.rx_push_rss_config = efx_ef10_pf_rx_push_rss_config,
++	.rx_pull_rss_config = efx_ef10_rx_pull_rss_config,
+ 	.rx_probe = efx_ef10_rx_probe,
+ 	.rx_init = efx_ef10_rx_init,
+ 	.rx_remove = efx_ef10_rx_remove,
+diff --git a/drivers/net/ethernet/sfc/ethtool.c b/drivers/net/ethernet/sfc/ethtool.c
+index 637775aea5b4..e59ec36c929f 100644
+--- a/drivers/net/ethernet/sfc/ethtool.c
++++ b/drivers/net/ethernet/sfc/ethtool.c
+@@ -1267,6 +1267,11 @@ static int efx_ethtool_get_rxfh(struct net_device *net_dev, u32 *indir, u8 *key,
+ 				u8 *hfunc)
+ {
+ 	struct efx_nic *efx = netdev_priv(net_dev);
++	int rc;
++
++	rc = efx->type->rx_pull_rss_config(efx);
++	if (rc)
++		return rc;
+ 
+ 	if (hfunc)
+ 		*hfunc = ETH_RSS_HASH_TOP;
+diff --git a/drivers/net/ethernet/sfc/farch.c b/drivers/net/ethernet/sfc/farch.c
+index e4ca2161af70..ba45150f53c7 100644
+--- a/drivers/net/ethernet/sfc/farch.c
++++ b/drivers/net/ethernet/sfc/farch.c
+@@ -1649,6 +1649,22 @@ void efx_farch_rx_push_indir_table(struct efx_nic *efx)
+ 	}
+ }
+ 
++void efx_farch_rx_pull_indir_table(struct efx_nic *efx)
++{
++	size_t i = 0;
++	efx_dword_t dword;
++
++	BUILD_BUG_ON(ARRAY_SIZE(efx->rx_indir_table) !=
++		     FR_BZ_RX_INDIRECTION_TBL_ROWS);
++
++	for (i = 0; i < FR_BZ_RX_INDIRECTION_TBL_ROWS; i++) {
++		efx_readd(efx, &dword,
++			   FR_BZ_RX_INDIRECTION_TBL +
++			   FR_BZ_RX_INDIRECTION_TBL_STEP * i);
++		efx->rx_indir_table[i] = EFX_DWORD_FIELD(dword, FRF_BZ_IT_QUEUE);
++	}
++}
++
+ /* Looks at available SRAM resources and works out how many queues we
+  * can support, and where things like descriptor caches should live.
+  *
+* Unmerged path drivers/net/ethernet/sfc/net_driver.h
+diff --git a/drivers/net/ethernet/sfc/nic.h b/drivers/net/ethernet/sfc/nic.h
+index 383ff6e1e647..85cf131288b7 100644
+--- a/drivers/net/ethernet/sfc/nic.h
++++ b/drivers/net/ethernet/sfc/nic.h
+@@ -626,6 +626,7 @@ void efx_farch_dimension_resources(struct efx_nic *efx, unsigned sram_lim_qw);
+ void efx_farch_init_common(struct efx_nic *efx);
+ void efx_ef10_handle_drain_event(struct efx_nic *efx);
+ void efx_farch_rx_push_indir_table(struct efx_nic *efx);
++void efx_farch_rx_pull_indir_table(struct efx_nic *efx);
+ 
+ int efx_nic_alloc_buffer(struct efx_nic *efx, struct efx_buffer *buffer,
+ 			 unsigned int len, gfp_t gfp_flags);
+diff --git a/drivers/net/ethernet/sfc/siena.c b/drivers/net/ethernet/sfc/siena.c
+index c39ec092aabe..91b7401290ac 100644
+--- a/drivers/net/ethernet/sfc/siena.c
++++ b/drivers/net/ethernet/sfc/siena.c
+@@ -332,6 +332,25 @@ fail1:
+ 	return rc;
+ }
+ 
++static int siena_rx_pull_rss_config(struct efx_nic *efx)
++{
++	efx_oword_t temp;
++
++	/* Read from IPv6 RSS key as that's longer (the IPv4 key is just the
++	 * first 128 bits of the same key, assuming it's been set by
++	 * siena_rx_push_rss_config, below)
++	 */
++	efx_reado(efx, &temp, FR_CZ_RX_RSS_IPV6_REG1);
++	memcpy(efx->rx_hash_key, &temp, sizeof(temp));
++	efx_reado(efx, &temp, FR_CZ_RX_RSS_IPV6_REG2);
++	memcpy(efx->rx_hash_key + sizeof(temp), &temp, sizeof(temp));
++	efx_reado(efx, &temp, FR_CZ_RX_RSS_IPV6_REG3);
++	memcpy(efx->rx_hash_key + 2 * sizeof(temp), &temp,
++	       FRF_CZ_RX_RSS_IPV6_TKEY_HI_WIDTH / 8);
++	efx_farch_rx_pull_indir_table(efx);
++	return 0;
++}
++
+ static int siena_rx_push_rss_config(struct efx_nic *efx, bool user,
+ 				    const u32 *rx_indir_table)
+ {
+@@ -978,6 +997,7 @@ const struct efx_nic_type siena_a0_nic_type = {
+ 	.tx_write = efx_farch_tx_write,
+ 	.tx_limit_len = efx_farch_tx_limit_len,
+ 	.rx_push_rss_config = siena_rx_push_rss_config,
++	.rx_pull_rss_config = siena_rx_pull_rss_config,
+ 	.rx_probe = efx_farch_rx_probe,
+ 	.rx_init = efx_farch_rx_init,
+ 	.rx_remove = efx_farch_rx_remove,
