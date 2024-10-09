@@ -1,0 +1,106 @@
+packet: hold bind lock when rebinding to fanout hook
+
+jira LE-1907
+cve CVE-2017-15649
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Willem de Bruijn <willemb@google.com>
+commit 008ba2a13f2d04c947adc536d19debb8fe66f110
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/008ba2a1.failed
+
+Packet socket bind operations must hold the po->bind_lock. This keeps
+po->running consistent with whether the socket is actually on a ptype
+list to receive packets.
+
+fanout_add unbinds a socket and its packet_rcv/tpacket_rcv call, then
+binds the fanout object to receive through packet_rcv_fanout.
+
+Make it hold the po->bind_lock when testing po->running and rebinding.
+Else, it can race with other rebind operations, such as that in
+packet_set_ring from packet_rcv to tpacket_rcv. Concurrent updates
+can result in a socket being added to a fanout group twice, causing
+use-after-free KASAN bug reports, among others.
+
+Reported independently by both trinity and syzkaller.
+Verified that the syzkaller reproducer passes after this patch.
+
+Fixes: dc99f600698d ("packet: Add fanout support.")
+	Reported-by: nixioaming <nixiaoming@huawei.com>
+	Signed-off-by: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 008ba2a13f2d04c947adc536d19debb8fe66f110)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/packet/af_packet.c
+diff --cc net/packet/af_packet.c
+index 4908358f9312,d288f52c53f7..000000000000
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@@ -1379,13 -1682,37 +1379,19 @@@ static int fanout_add(struct sock *sk, 
+  		return -EINVAL;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!po->running)
+ +		return -EINVAL;
+ +
+++=======
++ 	mutex_lock(&fanout_mutex);
++ 
++ 	err = -EALREADY;
+++>>>>>>> 008ba2a13f2d (packet: hold bind lock when rebinding to fanout hook)
+  	if (po->fanout)
+ -		goto out;
+ -
+ -	if (type == PACKET_FANOUT_ROLLOVER ||
+ -	    (type_flags & PACKET_FANOUT_FLAG_ROLLOVER)) {
+ -		err = -ENOMEM;
+ -		rollover = kzalloc(sizeof(*rollover), GFP_KERNEL);
+ -		if (!rollover)
+ -			goto out;
+ -		atomic_long_set(&rollover->num, 0);
+ -		atomic_long_set(&rollover->num_huge, 0);
+ -		atomic_long_set(&rollover->num_failed, 0);
+ -		po->rollover = rollover;
+ -	}
+ -
+ -	if (type_flags & PACKET_FANOUT_FLAG_UNIQUEID) {
+ -		if (id != 0) {
+ -			err = -EINVAL;
+ -			goto out;
+ -		}
+ -		if (!fanout_find_new_id(sk, &id)) {
+ -			err = -ENOMEM;
+ -			goto out;
+ -		}
+ -		/* ephemeral flag for the first socket in the group: drop it */
+ -		flags &= ~(PACKET_FANOUT_FLAG_UNIQUEID >> 8);
+ -	}
+ +		return -EALREADY;
+  
+ +	mutex_lock(&fanout_mutex);
+  	match = NULL;
+  	list_for_each_entry(f, &fanout_list, list) {
+  		if (f->id == id &&
+@@@ -1431,7 -1760,18 +1440,14 @@@
+  			err = 0;
+  		}
+  	}
++ 	spin_unlock(&po->bind_lock);
++ 
++ 	if (err && !refcount_read(&match->sk_ref)) {
++ 		list_del(&match->list);
++ 		kfree(match);
++ 	}
++ 
+  out:
+ -	if (err && rollover) {
+ -		kfree(rollover);
+ -		po->rollover = NULL;
+ -	}
+  	mutex_unlock(&fanout_mutex);
+  	return err;
+  }
+* Unmerged path net/packet/af_packet.c
