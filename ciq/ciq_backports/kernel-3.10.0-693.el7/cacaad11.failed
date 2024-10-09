@@ -1,0 +1,120 @@
+ipv4: fib: Allow for consistent FIB dumping
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit cacaad11f43aefbbe5fca00af3b9c16e6aee1ba4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/cacaad11.failed
+
+The next patch will enable listeners of the FIB notification chain to
+request a dump of the FIB tables. However, since RTNL isn't taken during
+the dump, it's possible for the FIB tables to change mid-dump, which
+will result in inconsistency between the listener's table and the
+kernel's.
+
+Allow listeners to know about changes that occurred mid-dump, by adding
+a change sequence counter to each net namespace. The counter is
+incremented just before a notification is sent in the FIB chain.
+
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cacaad11f43aefbbe5fca00af3b9c16e6aee1ba4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netns/ipv4.h
+#	net/ipv4/fib_trie.c
+diff --cc include/net/netns/ipv4.h
+index 30d218f86ad9,f0cf5a1b777e..000000000000
+--- a/include/net/netns/ipv4.h
++++ b/include/net/netns/ipv4.h
+@@@ -84,5 -132,12 +84,15 @@@ struct netns_ipv4 
+  	struct fib_rules_ops	*mr_rules_ops;
+  #endif
+  #endif
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_IP_ROUTE_MULTIPATH
++ 	int sysctl_fib_multipath_use_neigh;
++ #endif
++ 
++ 	unsigned int	fib_seq;	/* protected by rtnl_mutex */
++ 
++ 	atomic_t	rt_genid;
+++>>>>>>> cacaad11f43a (ipv4: fib: Allow for consistent FIB dumping)
+  };
+  #endif
+diff --cc net/ipv4/fib_trie.c
+index a731822edc22,28913563e7cd..000000000000
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@@ -79,8 -81,48 +79,50 @@@
+  #include <net/tcp.h>
+  #include <net/sock.h>
+  #include <net/ip_fib.h>
+ -#include <trace/events/fib.h>
+  #include "fib_lookup.h"
+  
+++<<<<<<< HEAD
+++=======
++ static ATOMIC_NOTIFIER_HEAD(fib_chain);
++ 
++ int register_fib_notifier(struct notifier_block *nb)
++ {
++ 	return atomic_notifier_chain_register(&fib_chain, nb);
++ }
++ EXPORT_SYMBOL(register_fib_notifier);
++ 
++ int unregister_fib_notifier(struct notifier_block *nb)
++ {
++ 	return atomic_notifier_chain_unregister(&fib_chain, nb);
++ }
++ EXPORT_SYMBOL(unregister_fib_notifier);
++ 
++ int call_fib_notifiers(struct net *net, enum fib_event_type event_type,
++ 		       struct fib_notifier_info *info)
++ {
++ 	net->ipv4.fib_seq++;
++ 	info->net = net;
++ 	return atomic_notifier_call_chain(&fib_chain, event_type, info);
++ }
++ 
++ static int call_fib_entry_notifiers(struct net *net,
++ 				    enum fib_event_type event_type, u32 dst,
++ 				    int dst_len, struct fib_info *fi,
++ 				    u8 tos, u8 type, u32 tb_id, u32 nlflags)
++ {
++ 	struct fib_entry_notifier_info info = {
++ 		.dst = dst,
++ 		.dst_len = dst_len,
++ 		.fi = fi,
++ 		.tos = tos,
++ 		.type = type,
++ 		.tb_id = tb_id,
++ 		.nlflags = nlflags,
++ 	};
++ 	return call_fib_notifiers(net, event_type, &info.info);
++ }
++ 
+++>>>>>>> cacaad11f43a (ipv4: fib: Allow for consistent FIB dumping)
+  #define MAX_STAT_DEPTH 32
+  
+  #define KEYLENGTH	(8*sizeof(t_key))
+* Unmerged path include/net/netns/ipv4.h
+diff --git a/net/ipv4/fib_frontend.c b/net/ipv4/fib_frontend.c
+index d0911d951370..1804531e5b74 100644
+--- a/net/ipv4/fib_frontend.c
++++ b/net/ipv4/fib_frontend.c
+@@ -1112,6 +1112,8 @@ static int __net_init ip_fib_net_init(struct net *net)
+ 	int err;
+ 	size_t size = sizeof(struct hlist_head) * FIB_TABLE_HASHSZ;
+ 
++	net->ipv4.fib_seq = 0;
++
+ 	/* Avoid false sharing : Use at least a full cache line */
+ 	size = max_t(size_t, size, L1_CACHE_BYTES);
+ 
+* Unmerged path net/ipv4/fib_trie.c
