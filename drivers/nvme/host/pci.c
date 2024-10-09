@@ -2096,9 +2096,6 @@ static const struct pci_error_handlers nvme_err_handler = {
 	.resume		= nvme_error_resume,
 };
 
-/* Move to pci_ids.h later */
-#define PCI_CLASS_STORAGE_EXPRESS	0x010802
-
 static const struct pci_device_id nvme_id_table[] = {
 	{ PCI_VDEVICE(INTEL, 0x0953),
 		.driver_data = NVME_QUIRK_STRIPE_SIZE |
