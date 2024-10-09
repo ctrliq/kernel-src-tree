@@ -1,0 +1,233 @@
+blk-mq: use the right hctx when getting a driver tag fails
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Omar Sandoval <osandov@fb.com>
+commit 81380ca10778b99dce98940cfc993214712df335
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/81380ca1.failed
+
+While dispatching requests, if we fail to get a driver tag, we mark the
+hardware queue as waiting for a tag and put the requests on a
+hctx->dispatch list to be run later when a driver tag is freed. However,
+blk_mq_dispatch_rq_list() may dispatch requests from multiple hardware
+queues if using a single-queue scheduler with a multiqueue device. If
+blk_mq_get_driver_tag() fails, it doesn't update the hardware queue we
+are processing. This means we end up using the hardware queue of the
+previous request, which may or may not be the same as that of the
+current request. If it isn't, the wrong hardware queue will end up
+waiting for a tag, and the requests will be on the wrong dispatch list,
+leading to a hang.
+
+The fix is twofold:
+
+1. Make sure we save which hardware queue we were trying to get a
+   request for in blk_mq_get_driver_tag() regardless of whether it
+   succeeds or not.
+2. Make blk_mq_dispatch_rq_list() take a request_queue instead of a
+   blk_mq_hw_queue to make it clear that it must handle multiple
+   hardware queues, since I've already messed this up on a couple of
+   occasions.
+
+This didn't appear in testing with nvme and mq-deadline because nvme has
+more driver tags than the default number of scheduler tags. However,
+with the blk_mq_update_nr_hw_queues() fix, it showed up with nbd.
+
+	Signed-off-by: Omar Sandoval <osandov@fb.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 81380ca10778b99dce98940cfc993214712df335)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-sched.c
+#	block/blk-mq.c
+#	block/blk-mq.h
+diff --cc block/blk-mq.c
+index 8e2b66f2220e,828f4bd193f2..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -824,9 -836,133 +824,137 @@@ static inline unsigned int queued_to_in
+  	return min(BLK_MQ_MAX_DISPATCH_ORDER - 1, ilog2(queued) + 1);
+  }
+  
+++<<<<<<< HEAD
+ +bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *hctx, struct list_head *list)
+++=======
++ bool blk_mq_get_driver_tag(struct request *rq, struct blk_mq_hw_ctx **hctx,
++ 			   bool wait)
+  {
+- 	struct request_queue *q = hctx->queue;
++ 	struct blk_mq_alloc_data data = {
++ 		.q = rq->q,
++ 		.hctx = blk_mq_map_queue(rq->q, rq->mq_ctx->cpu),
++ 		.flags = wait ? 0 : BLK_MQ_REQ_NOWAIT,
++ 	};
++ 
++ 	if (rq->tag != -1)
++ 		goto done;
++ 
++ 	if (blk_mq_tag_is_reserved(data.hctx->sched_tags, rq->internal_tag))
++ 		data.flags |= BLK_MQ_REQ_RESERVED;
++ 
++ 	rq->tag = blk_mq_get_tag(&data);
++ 	if (rq->tag >= 0) {
++ 		if (blk_mq_tag_busy(data.hctx)) {
++ 			rq->rq_flags |= RQF_MQ_INFLIGHT;
++ 			atomic_inc(&data.hctx->nr_active);
++ 		}
++ 		data.hctx->tags->rqs[rq->tag] = rq;
++ 	}
++ 
++ done:
++ 	if (hctx)
++ 		*hctx = data.hctx;
++ 	return rq->tag != -1;
++ }
++ 
++ static void __blk_mq_put_driver_tag(struct blk_mq_hw_ctx *hctx,
++ 				    struct request *rq)
++ {
++ 	blk_mq_put_tag(hctx, hctx->tags, rq->mq_ctx, rq->tag);
++ 	rq->tag = -1;
++ 
++ 	if (rq->rq_flags & RQF_MQ_INFLIGHT) {
++ 		rq->rq_flags &= ~RQF_MQ_INFLIGHT;
++ 		atomic_dec(&hctx->nr_active);
++ 	}
++ }
++ 
++ static void blk_mq_put_driver_tag_hctx(struct blk_mq_hw_ctx *hctx,
++ 				       struct request *rq)
++ {
++ 	if (rq->tag == -1 || rq->internal_tag == -1)
++ 		return;
++ 
++ 	__blk_mq_put_driver_tag(hctx, rq);
++ }
++ 
++ static void blk_mq_put_driver_tag(struct request *rq)
++ {
++ 	struct blk_mq_hw_ctx *hctx;
++ 
++ 	if (rq->tag == -1 || rq->internal_tag == -1)
++ 		return;
++ 
++ 	hctx = blk_mq_map_queue(rq->q, rq->mq_ctx->cpu);
++ 	__blk_mq_put_driver_tag(hctx, rq);
++ }
++ 
++ /*
++  * If we fail getting a driver tag because all the driver tags are already
++  * assigned and on the dispatch list, BUT the first entry does not have a
++  * tag, then we could deadlock. For that case, move entries with assigned
++  * driver tags to the front, leaving the set of tagged requests in the
++  * same order, and the untagged set in the same order.
++  */
++ static bool reorder_tags_to_front(struct list_head *list)
++ {
++ 	struct request *rq, *tmp, *first = NULL;
++ 
++ 	list_for_each_entry_safe_reverse(rq, tmp, list, queuelist) {
++ 		if (rq == first)
++ 			break;
++ 		if (rq->tag != -1) {
++ 			list_move(&rq->queuelist, list);
++ 			if (!first)
++ 				first = rq;
++ 		}
++ 	}
++ 
++ 	return first != NULL;
++ }
++ 
++ static int blk_mq_dispatch_wake(wait_queue_t *wait, unsigned mode, int flags,
++ 				void *key)
++ {
++ 	struct blk_mq_hw_ctx *hctx;
++ 
++ 	hctx = container_of(wait, struct blk_mq_hw_ctx, dispatch_wait);
++ 
++ 	list_del(&wait->task_list);
++ 	clear_bit_unlock(BLK_MQ_S_TAG_WAITING, &hctx->state);
++ 	blk_mq_run_hw_queue(hctx, true);
++ 	return 1;
++ }
++ 
++ static bool blk_mq_dispatch_wait_add(struct blk_mq_hw_ctx *hctx)
++ {
++ 	struct sbq_wait_state *ws;
++ 
++ 	/*
++ 	 * The TAG_WAITING bit serves as a lock protecting hctx->dispatch_wait.
++ 	 * The thread which wins the race to grab this bit adds the hardware
++ 	 * queue to the wait queue.
++ 	 */
++ 	if (test_bit(BLK_MQ_S_TAG_WAITING, &hctx->state) ||
++ 	    test_and_set_bit_lock(BLK_MQ_S_TAG_WAITING, &hctx->state))
++ 		return false;
++ 
++ 	init_waitqueue_func_entry(&hctx->dispatch_wait, blk_mq_dispatch_wake);
++ 	ws = bt_wait_ptr(&hctx->tags->bitmap_tags, hctx);
++ 
++ 	/*
++ 	 * As soon as this returns, it's no longer safe to fiddle with
++ 	 * hctx->dispatch_wait, since a completion can wake up the wait queue
++ 	 * and unlock the bit.
++ 	 */
++ 	add_wait_queue(&ws->wait, &hctx->dispatch_wait);
++ 	return true;
++ }
++ 
++ bool blk_mq_dispatch_rq_list(struct request_queue *q, struct list_head *list)
+++>>>>>>> 81380ca10778 (blk-mq: use the right hctx when getting a driver tag fails)
++ {
++ 	struct blk_mq_hw_ctx *hctx;
+  	struct request *rq;
+  	LIST_HEAD(driver_list);
+  	struct list_head *dptr;
+diff --cc block/blk-mq.h
+index 2d50f02667c4,660a17e1d033..000000000000
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@@ -33,8 -31,32 +33,16 @@@ void blk_mq_freeze_queue(struct request
+  void blk_mq_free_queue(struct request_queue *q);
+  int blk_mq_update_nr_requests(struct request_queue *q, unsigned int nr);
+  void blk_mq_wake_waiters(struct request_queue *q);
+++<<<<<<< HEAD
+ +bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *, struct list_head *);
+++=======
++ bool blk_mq_dispatch_rq_list(struct request_queue *, struct list_head *);
++ void blk_mq_flush_busy_ctxs(struct blk_mq_hw_ctx *hctx, struct list_head *list);
++ bool blk_mq_hctx_has_pending(struct blk_mq_hw_ctx *hctx);
++ bool blk_mq_get_driver_tag(struct request *rq, struct blk_mq_hw_ctx **hctx,
++ 				bool wait);
+++>>>>>>> 81380ca10778 (blk-mq: use the right hctx when getting a driver tag fails)
+  
+ -/*
+ - * Internal helpers for allocating/freeing the request map
+ - */
+ -void blk_mq_free_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
+ -		     unsigned int hctx_idx);
+ -void blk_mq_free_rq_map(struct blk_mq_tags *tags);
+ -struct blk_mq_tags *blk_mq_alloc_rq_map(struct blk_mq_tag_set *set,
+ -					unsigned int hctx_idx,
+ -					unsigned int nr_tags,
+ -					unsigned int reserved_tags);
+ -int blk_mq_alloc_rqs(struct blk_mq_tag_set *set, struct blk_mq_tags *tags,
+ -		     unsigned int hctx_idx, unsigned int depth);
+ -
+ -/*
+ - * Internal helpers for request insertion into sw queues
+ - */
+ -void __blk_mq_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
+ -				bool at_head);
+ -void blk_mq_insert_requests(struct blk_mq_hw_ctx *hctx, struct blk_mq_ctx *ctx,
+ -				struct list_head *list);
+  /*
+   * CPU hotplug helpers
+   */
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk-mq.c
+* Unmerged path block/blk-mq.h
