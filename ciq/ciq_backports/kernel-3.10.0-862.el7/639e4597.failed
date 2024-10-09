@@ -1,0 +1,139 @@
+KVM: PPC: Book3S HV: Create kvmppc_unmap_hpte_helper()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author David Gibson <david@gibson.dropbear.id.au>
+commit 639e459768845924705933db9142baef545ff5fc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/639e4597.failed
+
+The kvm_unmap_rmapp() function, called from certain MMU notifiers, is used
+to force all guest mappings of a particular host page to be set ABSENT, and
+removed from the reverse mappings.
+
+For HPT resizing, we will have some cases where we want to set just a
+single guest HPTE ABSENT and remove its reverse mappings.  To prepare with
+this, we split out the logic from kvm_unmap_rmapp() to evict a single HPTE,
+moving it to a new helper function.
+
+	Signed-off-by: David Gibson <david@gibson.dropbear.id.au>
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+(cherry picked from commit 639e459768845924705933db9142baef545ff5fc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_64_mmu_hv.c
+diff --cc arch/powerpc/kvm/book3s_64_mmu_hv.c
+index 283e37e10f56,6d70989686a7..000000000000
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@@ -711,14 -742,56 +711,65 @@@ static int kvm_handle_hva(struct kvm *k
+  	return kvm_handle_hva_range(kvm, hva, hva + 1, handler);
+  }
+  
+++<<<<<<< HEAD
+ +static int kvm_unmap_rmapp(struct kvm *kvm, unsigned long *rmapp,
+ +			   unsigned long gfn)
+ +{
+ +	struct revmap_entry *rev = kvm->arch.revmap;
+ +	unsigned long h, i, j;
+ +	__be64 *hptep;
+ +	unsigned long ptel, psize, rcbits;
+++=======
++ /* Must be called with both HPTE and rmap locked */
++ static void kvmppc_unmap_hpte(struct kvm *kvm, unsigned long i,
++ 			      unsigned long *rmapp, unsigned long gfn)
++ {
++ 	__be64 *hptep = (__be64 *) (kvm->arch.hpt.virt + (i << 4));
++ 	struct revmap_entry *rev = kvm->arch.hpt.rev;
++ 	unsigned long j, h;
++ 	unsigned long ptel, psize, rcbits;
++ 
++ 	j = rev[i].forw;
++ 	if (j == i) {
++ 		/* chain is now empty */
++ 		*rmapp &= ~(KVMPPC_RMAP_PRESENT | KVMPPC_RMAP_INDEX);
++ 	} else {
++ 		/* remove i from chain */
++ 		h = rev[i].back;
++ 		rev[h].forw = j;
++ 		rev[j].back = h;
++ 		rev[i].forw = rev[i].back = i;
++ 		*rmapp = (*rmapp & ~KVMPPC_RMAP_INDEX) | j;
++ 	}
++ 
++ 	/* Now check and modify the HPTE */
++ 	ptel = rev[i].guest_rpte;
++ 	psize = hpte_page_size(be64_to_cpu(hptep[0]), ptel);
++ 	if ((be64_to_cpu(hptep[0]) & HPTE_V_VALID) &&
++ 	    hpte_rpn(ptel, psize) == gfn) {
++ 		hptep[0] |= cpu_to_be64(HPTE_V_ABSENT);
++ 		kvmppc_invalidate_hpte(kvm, hptep, i);
++ 		hptep[1] &= ~cpu_to_be64(HPTE_R_KEY_HI | HPTE_R_KEY_LO);
++ 		/* Harvest R and C */
++ 		rcbits = be64_to_cpu(hptep[1]) & (HPTE_R_R | HPTE_R_C);
++ 		*rmapp |= rcbits << KVMPPC_RMAP_RC_SHIFT;
++ 		if (rcbits & HPTE_R_C)
++ 			kvmppc_update_rmap_change(rmapp, psize);
++ 		if (rcbits & ~rev[i].guest_rpte) {
++ 			rev[i].guest_rpte = ptel | rcbits;
++ 			note_hpte_modification(kvm, &rev[i]);
++ 		}
++ 	}
++ }
++ 
++ static int kvm_unmap_rmapp(struct kvm *kvm, struct kvm_memory_slot *memslot,
++ 			   unsigned long gfn)
++ {
++ 	unsigned long i;
++ 	__be64 *hptep;
++ 	unsigned long *rmapp;
+++>>>>>>> 639e45976884 (KVM: PPC: Book3S HV: Create kvmppc_unmap_hpte_helper())
+  
+ -	rmapp = &memslot->arch.rmap[gfn - memslot->base_gfn];
+  	for (;;) {
+  		lock_rmap(rmapp);
+  		if (!(*rmapp & KVMPPC_RMAP_PRESENT)) {
+@@@ -740,36 -813,8 +791,28 @@@
+  				cpu_relax();
+  			continue;
+  		}
+- 		j = rev[i].forw;
+- 		if (j == i) {
+- 			/* chain is now empty */
+- 			*rmapp &= ~(KVMPPC_RMAP_PRESENT | KVMPPC_RMAP_INDEX);
+- 		} else {
+- 			/* remove i from chain */
+- 			h = rev[i].back;
+- 			rev[h].forw = j;
+- 			rev[j].back = h;
+- 			rev[i].forw = rev[i].back = i;
+- 			*rmapp = (*rmapp & ~KVMPPC_RMAP_INDEX) | j;
+- 		}
+  
+++<<<<<<< HEAD
+ +		/* Now check and modify the HPTE */
+ +		ptel = rev[i].guest_rpte;
+ +		psize = hpte_page_size(be64_to_cpu(hptep[0]), ptel);
+ +		if ((be64_to_cpu(hptep[0]) & HPTE_V_VALID) &&
+ +		    hpte_rpn(ptel, psize) == gfn) {
+ +			hptep[0] |= cpu_to_be64(HPTE_V_ABSENT);
+ +			kvmppc_invalidate_hpte(kvm, hptep, i);
+ +			/* Harvest R and C */
+ +			rcbits = be64_to_cpu(hptep[1]) & (HPTE_R_R | HPTE_R_C);
+ +			*rmapp |= rcbits << KVMPPC_RMAP_RC_SHIFT;
+ +			if (rcbits & HPTE_R_C)
+ +				kvmppc_update_rmap_change(rmapp, psize);
+ +			if (rcbits & ~rev[i].guest_rpte) {
+ +				rev[i].guest_rpte = ptel | rcbits;
+ +				note_hpte_modification(kvm, &rev[i]);
+ +			}
+ +		}
+++=======
++ 		kvmppc_unmap_hpte(kvm, i, rmapp, gfn);
+++>>>>>>> 639e45976884 (KVM: PPC: Book3S HV: Create kvmppc_unmap_hpte_helper())
+  		unlock_rmap(rmapp);
+  		__unlock_hpte(hptep, be64_to_cpu(hptep[0]));
+  	}
+* Unmerged path arch/powerpc/kvm/book3s_64_mmu_hv.c
