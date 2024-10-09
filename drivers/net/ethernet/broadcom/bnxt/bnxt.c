@@ -5960,7 +5960,7 @@ static bool bnxt_rfs_capable(struct bnxt *bp)
 	struct bnxt_pf_info *pf = &bp->pf;
 	int vnics;
 
-	if (BNXT_VF(bp) || !(bp->flags & BNXT_FLAG_MSIX_CAP))
+	if (!(bp->flags & BNXT_FLAG_MSIX_CAP))
 		return false;
 
 	vnics = 1 + bp->rx_nr_rings;
