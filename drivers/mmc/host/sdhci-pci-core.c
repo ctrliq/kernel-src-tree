@@ -1315,12 +1315,6 @@ static int sdhci_pci_runtime_suspend(struct device *dev)
 			goto err_pci_runtime_suspend;
 	}
 
-	if (chip->fixes && chip->fixes->suspend) {
-		ret = chip->fixes->suspend(chip);
-		if (ret)
-			goto err_pci_runtime_suspend;
-	}
-
 	return 0;
 
 err_pci_runtime_suspend:
@@ -1339,12 +1333,6 @@ static int sdhci_pci_runtime_resume(struct device *dev)
 	chip = pci_get_drvdata(pdev);
 	if (!chip)
 		return 0;
-
-	if (chip->fixes && chip->fixes->resume) {
-		ret = chip->fixes->resume(chip);
-		if (ret)
-			return ret;
-	}
 
 	for (i = 0; i < chip->num_slots; i++) {
 		slot = chip->slots[i];
