@@ -1,0 +1,225 @@
+seccomp: dump core when using SECCOMP_RET_KILL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mike Frysinger <vapier@chromium.org>
+commit b25e67161c295c98acda92123b2dd1e7d8642901
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b25e6716.failed
+
+The SECCOMP_RET_KILL mode is documented as immediately killing the
+process as if a SIGSYS had been sent and not caught (similar to a
+SIGKILL).  However, a SIGSYS is documented as triggering a coredump
+which does not happen today.
+
+This has the advantage of being able to more easily debug a process
+that fails a seccomp filter.  Today, most apps need to recompile and
+change their filter in order to get detailed info out, or manually run
+things through strace, or enable detailed kernel auditing.  Now we get
+coredumps that fit into existing system-wide crash reporting setups.
+
+From a security pov, this shouldn't be a problem.  Unhandled signals
+can already be sent externally which trigger a coredump independent of
+the status of the seccomp filter.  The act of dumping core itself does
+not cause change in execution of the program.
+
+URL: https://crbug.com/676357
+	Signed-off-by: Mike Frysinger <vapier@chromium.org>
+	Acked-by: Jorge Lucangeli Obes <jorgelo@chromium.org>
+	Acked-by: Kees Cook <keescook@chromium.org>
+	Signed-off-by: James Morris <james.l.morris@oracle.com>
+(cherry picked from commit b25e67161c295c98acda92123b2dd1e7d8642901)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/seccomp.c
+diff --cc kernel/seccomp.c
+index 42e55449c1a5,f8f88ebcb3ba..000000000000
+--- a/kernel/seccomp.c
++++ b/kernel/seccomp.c
+@@@ -570,70 -573,117 +576,179 @@@ int __secure_computing(int this_syscall
+  	 */
+  	rmb();
+  
+++<<<<<<< HEAD
+ +	switch (current->seccomp.mode) {
+++=======
++ 	filter_ret = seccomp_run_filters(sd);
++ 	data = filter_ret & SECCOMP_RET_DATA;
++ 	action = filter_ret & SECCOMP_RET_ACTION;
++ 
++ 	switch (action) {
++ 	case SECCOMP_RET_ERRNO:
++ 		/* Set low-order bits as an errno, capped at MAX_ERRNO. */
++ 		if (data > MAX_ERRNO)
++ 			data = MAX_ERRNO;
++ 		syscall_set_return_value(current, task_pt_regs(current),
++ 					 -data, 0);
++ 		goto skip;
++ 
++ 	case SECCOMP_RET_TRAP:
++ 		/* Show the handler the original registers. */
++ 		syscall_rollback(current, task_pt_regs(current));
++ 		/* Let the filter pass back 16 bits of data. */
++ 		seccomp_send_sigsys(this_syscall, data);
++ 		goto skip;
++ 
++ 	case SECCOMP_RET_TRACE:
++ 		/* We've been put in this state by the ptracer already. */
++ 		if (recheck_after_trace)
++ 			return 0;
++ 
++ 		/* ENOSYS these calls if there is no tracer attached. */
++ 		if (!ptrace_event_enabled(current, PTRACE_EVENT_SECCOMP)) {
++ 			syscall_set_return_value(current,
++ 						 task_pt_regs(current),
++ 						 -ENOSYS, 0);
++ 			goto skip;
++ 		}
++ 
++ 		/* Allow the BPF to provide the event message */
++ 		ptrace_event(PTRACE_EVENT_SECCOMP, data);
++ 		/*
++ 		 * The delivery of a fatal signal during event
++ 		 * notification may silently skip tracer notification,
++ 		 * which could leave us with a potentially unmodified
++ 		 * syscall that the tracer would have liked to have
++ 		 * changed. Since the process is about to die, we just
++ 		 * force the syscall to be skipped and let the signal
++ 		 * kill the process and correctly handle any tracer exit
++ 		 * notifications.
++ 		 */
++ 		if (fatal_signal_pending(current))
++ 			goto skip;
++ 		/* Check if the tracer forced the syscall to be skipped. */
++ 		this_syscall = syscall_get_nr(current, task_pt_regs(current));
++ 		if (this_syscall < 0)
++ 			goto skip;
++ 
++ 		/*
++ 		 * Recheck the syscall, since it may have changed. This
++ 		 * intentionally uses a NULL struct seccomp_data to force
++ 		 * a reload of all registers. This does not goto skip since
++ 		 * a skip would have already been reported.
++ 		 */
++ 		if (__seccomp_filter(this_syscall, NULL, true))
++ 			return -1;
++ 
++ 		return 0;
++ 
++ 	case SECCOMP_RET_ALLOW:
++ 		return 0;
++ 
++ 	case SECCOMP_RET_KILL:
++ 	default: {
++ 		siginfo_t info;
++ 		audit_seccomp(this_syscall, SIGSYS, action);
++ 		/* Show the original registers in the dump. */
++ 		syscall_rollback(current, task_pt_regs(current));
++ 		/* Trigger a manual coredump since do_exit skips it. */
++ 		seccomp_init_siginfo(&info, this_syscall, data);
++ 		do_coredump(&info);
++ 		do_exit(SIGSYS);
++ 	}
++ 	}
++ 
++ 	unreachable();
++ 
++ skip:
++ 	audit_seccomp(this_syscall, 0, action);
++ 	return -1;
++ }
++ #else
++ static int __seccomp_filter(int this_syscall, const struct seccomp_data *sd,
++ 			    const bool recheck_after_trace)
++ {
++ 	BUG();
++ }
++ #endif
++ 
++ int __secure_computing(const struct seccomp_data *sd)
++ {
++ 	int mode = current->seccomp.mode;
++ 	int this_syscall;
++ 
++ 	if (IS_ENABLED(CONFIG_CHECKPOINT_RESTORE) &&
++ 	    unlikely(current->ptrace & PT_SUSPEND_SECCOMP))
++ 		return 0;
++ 
++ 	this_syscall = sd ? sd->nr :
++ 		syscall_get_nr(current, task_pt_regs(current));
++ 
++ 	switch (mode) {
+++>>>>>>> b25e67161c29 (seccomp: dump core when using SECCOMP_RET_KILL)
+  	case SECCOMP_MODE_STRICT:
+ -		__secure_computing_strict(this_syscall);  /* may call do_exit */
+ -		return 0;
+ -	case SECCOMP_MODE_FILTER:
+ -		return __seccomp_filter(this_syscall, sd, false);
+ +		syscall = mode1_syscalls;
+ +#ifdef CONFIG_COMPAT
+ +		if (is_compat_task())
+ +			syscall = mode1_syscalls_32;
+ +#endif
+ +		do {
+ +			if (*syscall == this_syscall)
+ +				return 0;
+ +		} while (*++syscall);
+ +		exit_sig = SIGKILL;
+ +		ret = SECCOMP_RET_KILL;
+ +		break;
+ +#ifdef CONFIG_SECCOMP_FILTER
+ +	case SECCOMP_MODE_FILTER: {
+ +		int data;
+ +		struct pt_regs *regs = task_pt_regs(current);
+ +		ret = seccomp_run_filters(this_syscall);
+ +		data = ret & SECCOMP_RET_DATA;
+ +		ret &= SECCOMP_RET_ACTION;
+ +		switch (ret) {
+ +		case SECCOMP_RET_ERRNO:
+ +			/* Set the low-order 16-bits as a errno. */
+ +			syscall_set_return_value(current, regs,
+ +						 -data, 0);
+ +			goto skip;
+ +		case SECCOMP_RET_TRAP:
+ +			/* Show the handler the original registers. */
+ +			syscall_rollback(current, regs);
+ +			/* Let the filter pass back 16 bits of data. */
+ +			seccomp_send_sigsys(this_syscall, data);
+ +			goto skip;
+ +		case SECCOMP_RET_TRACE:
+ +			/* Skip these calls if there is no tracer. */
+ +			if (!ptrace_event_enabled(current, PTRACE_EVENT_SECCOMP)) {
+ +				syscall_set_return_value(current, regs,
+ +							 -ENOSYS, 0);
+ +				goto skip;
+ +			}
+ +			/* Allow the BPF to provide the event message */
+ +			ptrace_event(PTRACE_EVENT_SECCOMP, data);
+ +			/*
+ +			 * The delivery of a fatal signal during event
+ +			 * notification may silently skip tracer notification.
+ +			 * Terminating the task now avoids executing a system
+ +			 * call that may not be intended.
+ +			 */
+ +			if (fatal_signal_pending(current))
+ +				break;
+ +			if (syscall_get_nr(current, regs) < 0)
+ +				goto skip;  /* Explicit request to skip. */
+ +
+ +			return 0;
+ +		case SECCOMP_RET_ALLOW:
+ +			return 0;
+ +		case SECCOMP_RET_KILL:
+ +		default:
+ +			break;
+ +		}
+ +		exit_sig = SIGSYS;
+ +		break;
+ +	}
+ +#endif
+  	default:
+  		BUG();
+  	}
+* Unmerged path kernel/seccomp.c
