@@ -1,0 +1,221 @@
+netvsc: eliminate per-device outstanding send counter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author stephen hemminger <stephen@networkplumber.org>
+commit 46b4f7f5d1f7410de48128540ef2d1aab913a619
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/46b4f7f5.failed
+
+Since now keep track of per-queue outstanding sends, we can avoid
+one atomic update by removing no longer needed per-device atomic.
+
+	Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 46b4f7f5d1f7410de48128540ef2d1aab913a619)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/netvsc.c
+diff --cc drivers/net/hyperv/netvsc.c
+index ddbecb3cda7d,bd055146f098..000000000000
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@@ -638,11 -623,10 +631,16 @@@ static void netvsc_send_tx_complete(str
+  		dev_consume_skb_any(skb);
+  	}
+  
+++<<<<<<< HEAD
+ +	num_outstanding_sends =
+ +		atomic_dec_return(&net_device->num_outstanding_sends);
+ +	queue_sends = atomic_dec_return(&net_device->queue_sends[q_idx]);
+++=======
++ 	queue_sends =
++ 		atomic_dec_return(&net_device->chan_table[q_idx].queue_sends);
+++>>>>>>> 46b4f7f5d1f7 (netvsc: eliminate per-device outstanding send counter)
+  
+- 	if (net_device->destroy && num_outstanding_sends == 0)
++ 	if (net_device->destroy && queue_sends == 0)
+  		wake_up(&net_device->wait_drain);
+  
+  	if (netif_tx_queue_stopped(netdev_get_tx_queue(ndev, q_idx)) &&
+@@@ -812,23 -813,14 +810,30 @@@ static inline int netvsc_send_pkt
+  	}
+  
+  	if (ret == 0) {
+++<<<<<<< HEAD
+ +		atomic_inc(&net_device->num_outstanding_sends);
+ +		atomic_inc(&net_device->queue_sends[q_idx]);
+ +
+ +		if (ring_avail < RING_AVAIL_PERCENT_LOWATER) {
+ +			netif_tx_stop_queue(netdev_get_tx_queue(ndev, q_idx));
+ +
+ +			if (atomic_read(&net_device->
+ +				queue_sends[q_idx]) < 1)
+ +				netif_tx_wake_queue(netdev_get_tx_queue(
+ +						    ndev, q_idx));
+ +		}
+++=======
++ 		atomic_inc_return(&nvchan->queue_sends);
++ 
++ 		if (ring_avail < RING_AVAIL_PERCENT_LOWATER)
++ 			netif_tx_stop_queue(txq);
+++>>>>>>> 46b4f7f5d1f7 (netvsc: eliminate per-device outstanding send counter)
+  	} else if (ret == -EAGAIN) {
+ -		netif_tx_stop_queue(txq);
+ -		if (atomic_read(&nvchan->queue_sends) < 1) {
+ -			netif_tx_wake_queue(txq);
+ +		netif_tx_stop_queue(netdev_get_tx_queue(
+ +				    ndev, q_idx));
+ +		if (atomic_read(&net_device->queue_sends[q_idx]) < 1) {
+ +			netif_tx_wake_queue(netdev_get_tx_queue(
+ +					    ndev, q_idx));
+  			ret = -ENOSPC;
+  		}
+  	} else {
+@@@ -1258,74 -1244,25 +1263,82 @@@ void netvsc_channel_cb(void *context
+  	else
+  		device = channel->device_obj;
+  
+- 	net_device = get_inbound_net_device(device);
+- 	if (!net_device)
++ 	ndev = hv_get_drvdata(device);
++ 	if (unlikely(!ndev))
+  		return;
+++<<<<<<< HEAD
+ +	ndev = hv_get_drvdata(device);
+ +	buffer = get_per_channel_state(channel);
+++=======
++ 
++ 	net_device = net_device_to_netvsc_device(ndev);
++ 	if (unlikely(net_device->destroy) &&
++ 	    netvsc_channel_idle(net_device, q_idx))
++ 		return;
+++>>>>>>> 46b4f7f5d1f7 (netvsc: eliminate per-device outstanding send counter)
+ +
+ +	/* commit_rd_index() -> hv_signal_on_read() needs this. */
+ +	init_cached_read_index(channel);
+ +
+ +	do {
+ +		desc = get_next_pkt_raw(channel);
+ +		if (desc != NULL) {
+ +			netvsc_process_raw_pkt(device,
+ +					       channel,
+ +					       net_device,
+ +					       ndev,
+ +					       desc->trans_id,
+ +					       desc);
+ +
+ +			put_pkt_raw(channel, desc);
+ +			need_to_commit = true;
+ +			continue;
+ +		}
+ +		if (need_to_commit) {
+ +			need_to_commit = false;
+ +			commit_rd_index(channel);
+ +		}
+  
+ -	while ((desc = get_next_pkt_raw(channel)) != NULL) {
+ -		netvsc_process_raw_pkt(device, channel, net_device,
+ -				       ndev, desc->trans_id, desc);
+ +		ret = vmbus_recvpacket_raw(channel, buffer, bufferlen,
+ +					   &bytes_recvd, &request_id);
+ +		if (ret == 0) {
+ +			if (bytes_recvd > 0) {
+ +				desc = (struct vmpacket_descriptor *)buffer;
+ +				netvsc_process_raw_pkt(device,
+ +						       channel,
+ +						       net_device,
+ +						       ndev,
+ +						       request_id,
+ +						       desc);
+ +			} else {
+ +				/*
+ +				 * We are done for this pass.
+ +				 */
+ +				break;
+ +			}
+ +
+ +		} else if (ret == -ENOBUFS) {
+ +			if (bufferlen > NETVSC_PACKET_SIZE)
+ +				kfree(buffer);
+ +			/* Handle large packet */
+ +			buffer = kmalloc(bytes_recvd, GFP_ATOMIC);
+ +			if (buffer == NULL) {
+ +				/* Try again next time around */
+ +				netdev_err(ndev,
+ +					   "unable to allocate buffer of size "
+ +					   "(%d)!!\n", bytes_recvd);
+ +				break;
+ +			}
+ +
+ +			bufferlen = bytes_recvd;
+ +		}
+  
+ -		put_pkt_raw(channel, desc);
+ -		need_to_commit = true;
+ -	}
+ +		init_cached_read_index(channel);
+  
+ -	if (need_to_commit)
+ -		commit_rd_index(channel);
+ +	} while (1);
+ +
+ +	if (bufferlen > NETVSC_PACKET_SIZE)
+ +		kfree(buffer);
+  
+  	netvsc_chk_recv_comp(net_device, channel, q_idx);
+  }
+diff --git a/drivers/net/hyperv/hyperv_net.h b/drivers/net/hyperv/hyperv_net.h
+index abe1d5a39289..eef27e016ffb 100644
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@ -717,7 +717,6 @@ struct net_device_context {
+ struct netvsc_device {
+ 	u32 nvsp_version;
+ 
+-	atomic_t num_outstanding_sends;
+ 	wait_queue_head_t wait_drain;
+ 	bool destroy;
+ 
+* Unmerged path drivers/net/hyperv/netvsc.c
+diff --git a/drivers/net/hyperv/rndis_filter.c b/drivers/net/hyperv/rndis_filter.c
+index ba9979a91e02..79c3efc879e5 100644
+--- a/drivers/net/hyperv/rndis_filter.c
++++ b/drivers/net/hyperv/rndis_filter.c
+@@ -837,6 +837,23 @@ cleanup:
+ 	return ret;
+ }
+ 
++static bool netvsc_device_idle(const struct netvsc_device *nvdev)
++{
++	int i;
++
++	if (atomic_read(&nvdev->num_outstanding_recvs) > 0)
++		return false;
++
++	for (i = 0; i < nvdev->num_chn; i++) {
++		const struct netvsc_channel *nvchan = &nvdev->chan_table[i];
++
++		if (atomic_read(&nvchan->queue_sends) > 0)
++			return false;
++	}
++
++	return true;
++}
++
+ static void rndis_filter_halt_device(struct rndis_device *dev)
+ {
+ 	struct rndis_request *request;
+@@ -867,9 +884,7 @@ cleanup:
+ 	spin_unlock_irqrestore(&hdev->channel->inbound_lock, flags);
+ 
+ 	/* Wait for all send completions */
+-	wait_event(nvdev->wait_drain,
+-		   atomic_read(&nvdev->num_outstanding_sends) == 0 &&
+-		   atomic_read(&nvdev->num_outstanding_recvs) == 0);
++	wait_event(nvdev->wait_drain, netvsc_device_idle(nvdev));
+ 
+ 	if (request)
+ 		put_rndis_request(dev, request);
