@@ -1,0 +1,110 @@
+net/mlx5e: Avoid encap flows deletion attempt the 1st time a neigh is resolved
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Avoid encap flows deletion attempt the 1st time a neigh is resolved (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 97.37%
+commit-author Or Gerlitz <ogerlitz@mellanox.com>
+commit 61c806dafe81c58f41fec10fb5cad0d3a4390e3e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/61c806da.failed
+
+Currently, we are deleting offloaded encap flows in case the relevant neigh
+becomes unconnected while the encap is valid (a sign that it used to be
+connected), or if the curr neigh mac is different from the cached mac
+(a sign that the remote side changed their mac).
+
+The 2nd check also applies when the neigh becomes connected on the 1st
+time (we start with zero mac). Before the offending commit, the deleting
+handler was practically no op, as no flows were offloaded. But since
+that commit, we offload neigh-less encap flows to slow path.
+
+Under mirroring scheme, we go into the delete handler, attempt to unoffload a
+mirror rule which was never set (as we were offloading to slow path) and crash.
+
+Fix that by calling the delete handler only when the encap is valid,
+which covers both cases mentioned above.
+
+Fixes: 5dbe906ff1d5 ('net/mlx5e: Use a slow path rule instead if vxlan neighbour isn't available')
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Eli Britstein <elibr@mellanox.com>
+	Reviewed-by: Paul Blakey <paulb@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 61c806dafe81c58f41fec10fb5cad0d3a4390e3e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 0b52a07ef281,9dabe9d4b279..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -938,19 -1072,41 +938,25 @@@ void mlx5e_tc_encap_flows_del(struct ml
+  			      struct mlx5e_encap_entry *e)
+  {
+  	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+ -	struct mlx5_esw_flow_attr slow_attr;
+ -	struct mlx5_flow_handle *rule;
+ -	struct mlx5_flow_spec *spec;
+  	struct mlx5e_tc_flow *flow;
+ -	int err;
+  
+  	list_for_each_entry(flow, &e->flows, encap) {
+ -		spec = &flow->esw_attr->parse_attr->spec;
+ -
+ -		/* update from encap rule to slow path rule */
+ -		rule = mlx5e_tc_offload_to_slow_path(esw, flow, spec, &slow_attr);
+ -
+ -		if (IS_ERR(rule)) {
+ -			err = PTR_ERR(rule);
+ -			mlx5_core_warn(priv->mdev, "Failed to update slow path (encap) flow, %d\n",
+ -				       err);
+ -			continue;
+ +		if (flow->flags & MLX5E_TC_FLOW_OFFLOADED) {
+ +			flow->flags &= ~MLX5E_TC_FLOW_OFFLOADED;
+ +			mlx5_eswitch_del_offloaded_rule(esw, flow->rule, flow->esw_attr);
+  		}
+ -
+ -		mlx5e_tc_unoffload_fdb_rules(esw, flow, flow->esw_attr);
+ -		flow->flags |= MLX5E_TC_FLOW_OFFLOADED; /* was unset when fast path rule removed */
+ -		flow->rule[0] = rule;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (e->flags & MLX5_ENCAP_ENTRY_VALID) {
+ +		e->flags &= ~MLX5_ENCAP_ENTRY_VALID;
+ +		mlx5_encap_dealloc(priv->mdev, e->encap_id);
+ +	}
+++=======
++ 	/* we know that the encap is valid */
++ 	e->flags &= ~MLX5_ENCAP_ENTRY_VALID;
++ 	mlx5_packet_reformat_dealloc(priv->mdev, e->encap_id);
+ -}
+ -
+ -static struct mlx5_fc *mlx5e_tc_get_counter(struct mlx5e_tc_flow *flow)
+ -{
+ -	if (flow->flags & MLX5E_TC_FLOW_ESWITCH)
+ -		return flow->esw_attr->counter;
+ -	else
+ -		return flow->nic_attr->counter;
+++>>>>>>> 61c806dafe81 (net/mlx5e: Avoid encap flows deletion attempt the 1st time a neigh is resolved)
+  }
+  
+  void mlx5e_tc_update_neigh_used_value(struct mlx5e_neigh_hash_entry *nhe)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index 0e446984afa7..4dfadbb9e728 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@ -378,8 +378,8 @@ static void mlx5e_rep_update_flows(struct mlx5e_priv *priv,
+ 
+ 	ASSERT_RTNL();
+ 
+-	if ((!neigh_connected && (e->flags & MLX5_ENCAP_ENTRY_VALID)) ||
+-	    !ether_addr_equal(e->h_dest, ha))
++	if ((e->flags & MLX5_ENCAP_ENTRY_VALID) &&
++	    (!neigh_connected || !ether_addr_equal(e->h_dest, ha)))
+ 		mlx5e_tc_encap_flows_del(priv, e);
+ 
+ 	if (neigh_connected && !(e->flags & MLX5_ENCAP_ENTRY_VALID)) {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
