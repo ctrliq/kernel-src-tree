@@ -1,0 +1,156 @@
+xfs: clarify units in the failed metadata io message
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit c219b01579b204be007d26b6f484a7a26d620799
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/c219b015.failed
+
+If a metadata IO error happens, we report the location of the failed IO
+request in units of daddrs.  However, the printk message misleads people
+into thinking that the units are fs blocks, so fix the reported units.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+(cherry picked from commit c219b01579b204be007d26b6f484a7a26d620799)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_buf.c
+diff --cc fs/xfs/xfs_buf.c
+index fdf9227ebab1,0820c1ccf97c..000000000000
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@@ -588,8 -585,8 +588,13 @@@ _xfs_buf_find
+  		 * returning a specific error on buffer lookup failures.
+  		 */
+  		xfs_alert(btp->bt_mount,
+++<<<<<<< HEAD
+ +			  "%s: Block out of range: block 0x%llx, EOFS 0x%llx ",
+ +			  __func__, blkno, eofs);
+++=======
++ 			  "%s: daddr 0x%llx out of range, EOFS 0x%llx",
++ 			  __func__, cmap.bm_bn, eofs);
+++>>>>>>> c219b01579b2 (xfs: clarify units in the failed metadata io message)
+  		WARN_ON(1);
+  		return NULL;
+  	}
+@@@ -1402,9 -1380,10 +1408,9 @@@ _xfs_buf_ioapply
+  			 */
+  			if (xfs_sb_version_hascrc(&mp->m_sb)) {
+  				xfs_warn(mp,
+- 					"%s: no ops on block 0x%llx/0x%x",
++ 					"%s: no buf ops on daddr 0x%llx len %d",
+  					__func__, bp->b_bn, bp->b_length);
+ -				xfs_hex_dump(bp->b_addr,
+ -						XFS_CORRUPTION_DUMP_LEN);
+ +				xfs_hex_dump(bp->b_addr, 64);
+  				dump_stack();
+  			}
+  		}
+@@@ -1651,49 -1663,63 +1657,71 @@@ xfs_wait_buftarg
+  		delay(100);
+  	flush_workqueue(btp->bt_mount->m_buf_workqueue);
+  
+++<<<<<<< HEAD
+ +restart:
+ +	spin_lock(&btp->bt_lru_lock);
+ +	while (!list_empty(&btp->bt_lru)) {
+ +		bp = list_first_entry(&btp->bt_lru, struct xfs_buf, b_lru);
+ +		if (atomic_read(&bp->b_hold) > 1) {
+ +			/* need to wait, so skip it this pass */
+ +			trace_xfs_buf_wait_buftarg(bp, _RET_IP_);
+ +skip:
+ +			list_move_tail(&bp->b_lru, &btp->bt_lru);
+ +			spin_unlock(&btp->bt_lru_lock);
+++=======
++ 	/* loop until there is nothing left on the lru list. */
++ 	while (list_lru_count(&btp->bt_lru)) {
++ 		list_lru_walk(&btp->bt_lru, xfs_buftarg_wait_rele,
++ 			      &dispose, LONG_MAX);
++ 
++ 		while (!list_empty(&dispose)) {
++ 			struct xfs_buf *bp;
++ 			bp = list_first_entry(&dispose, struct xfs_buf, b_lru);
++ 			list_del_init(&bp->b_lru);
++ 			if (bp->b_flags & XBF_WRITE_FAIL) {
++ 				xfs_alert(btp->bt_mount,
++ "Corruption Alert: Buffer at daddr 0x%llx had permanent write failures!",
++ 					(long long)bp->b_bn);
++ 				xfs_alert(btp->bt_mount,
++ "Please run xfs_repair to determine the extent of the problem.");
++ 			}
++ 			xfs_buf_rele(bp);
++ 		}
++ 		if (loop++ != 0)
+++>>>>>>> c219b01579b2 (xfs: clarify units in the failed metadata io message)
+  			delay(100);
+ -	}
+ -}
+ -
+ -static enum lru_status
+ -xfs_buftarg_isolate(
+ -	struct list_head	*item,
+ -	struct list_lru_one	*lru,
+ -	spinlock_t		*lru_lock,
+ -	void			*arg)
+ -{
+ -	struct xfs_buf		*bp = container_of(item, struct xfs_buf, b_lru);
+ -	struct list_head	*dispose = arg;
+ +			goto restart;
+ +		}
+ +		if (!spin_trylock(&bp->b_lock))
+ +			goto skip;
+  
+ -	/*
+ -	 * we are inverting the lru lock/bp->b_lock here, so use a trylock.
+ -	 * If we fail to get the lock, just skip it.
+ -	 */
+ -	if (!spin_trylock(&bp->b_lock))
+ -		return LRU_SKIP;
+ -	/*
+ -	 * Decrement the b_lru_ref count unless the value is already
+ -	 * zero. If the value is already zero, we need to reclaim the
+ -	 * buffer, otherwise it gets another trip through the LRU.
+ -	 */
+ -	if (!atomic_add_unless(&bp->b_lru_ref, -1, 0)) {
+ +		/*
+ +		 * clear the LRU reference count so the buffer doesn't get
+ +		 * ignored in xfs_buf_rele().
+ +		 */
+ +		atomic_set(&bp->b_lru_ref, 0);
+ +		if (bp->b_flags & XBF_WRITE_FAIL) {
+ +			xfs_alert(btp->bt_mount,
+ +"Corruption Alert: Buffer at block 0x%llx had permanent write failures!",
+ +				(long long)bp->b_bn);
+ +			xfs_alert(btp->bt_mount,
+ +"Please run xfs_repair to determine the extent of the problem.");
+ +		}
+ +		bp->b_state |= XFS_BSTATE_DISPOSE;
+ +		list_move_tail(&bp->b_lru, &dispose);
+  		spin_unlock(&bp->b_lock);
+ -		return LRU_ROTATE;
+  	}
+ +	spin_unlock(&btp->bt_lru_lock);
+  
+ -	bp->b_state |= XFS_BSTATE_DISPOSE;
+ -	list_lru_isolate_move(lru, item, dispose);
+ -	spin_unlock(&bp->b_lock);
+ -	return LRU_REMOVED;
+ +	while (!list_empty(&dispose)) {
+ +		bp = list_first_entry(&dispose, struct xfs_buf, b_lru);
+ +		list_del_init(&bp->b_lru);
+ +		xfs_buf_rele(bp);
+ +	}
+  }
+  
+ -static unsigned long
+ -xfs_buftarg_shrink_scan(
+ +int
+ +xfs_buftarg_shrink(
+  	struct shrinker		*shrink,
+  	struct shrink_control	*sc)
+  {
+* Unmerged path fs/xfs/xfs_buf.c
