@@ -89,6 +89,7 @@ struct annotation_line {
 	s64			 offset;
 	char			*line;
 	int			 line_nr;
+	int			 jump_sources;
 	float			 ipc;
 	u64			 cycles;
 	size_t			 privsize;
@@ -114,6 +115,8 @@ static inline bool disasm_line__has_offset(const struct disasm_line *dl)
 {
 	return dl->ops.target.offset_avail;
 }
+
+bool disasm_line__is_valid_jump(struct disasm_line *dl, struct symbol *sym);
 
 void disasm_line__free(struct disasm_line *dl);
 struct annotation_line *
@@ -183,6 +186,7 @@ static inline int annotation__pcnt_width(struct annotation *notes)
 }
 
 void annotation__compute_ipc(struct annotation *notes, size_t size);
+void annotation__mark_jump_targets(struct annotation *notes, struct symbol *sym);
 
 static inline struct sym_hist *annotation__histogram(struct annotation *notes, int idx)
 {
