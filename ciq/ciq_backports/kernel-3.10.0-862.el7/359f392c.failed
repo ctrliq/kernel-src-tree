@@ -1,0 +1,271 @@
+ovl: lookup index entry for copy up origin
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit 359f392ca53e9122cafa5fc103545558b0b85d54
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/359f392c.failed
+
+When inodes index feature is enabled, lookup in indexdir for the index
+entry of lower real inode or copy up origin inode. The index entry name
+is the hex representation of the lower inode file handle.
+
+If the index dentry in negative, then either no lower aliases have been
+copied up yet, or aliases have been copied up in older kernels and are
+not indexed.
+
+If the index dentry for a copy up origin inode is positive, but points
+to an inode different than the upper inode, then either the upper inode
+has been copied up and not indexed or it was indexed, but since then
+index dir was cleared. Either way, that index cannot be used to indentify
+the overlay inode.
+
+If a positive dentry that matches the upper inode was found, then it is
+safe to use the copy up origin st_ino for upper hardlinks, because all
+indexed upper hardlinks are represented by the same overlay inode as the
+copy up origin.
+
+Set the INDEX type flag on an indexed upper dentry. A non-upper dentry
+may also have a positive index from copy up of another lower hardlink.
+This situation will be handled by following patches.
+
+Index lookup is going to be used to prevent breaking hardlinks on copy up.
+
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 359f392ca53e9122cafa5fc103545558b0b85d54)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/inode.c
+#	fs/overlayfs/namei.c
+#	fs/overlayfs/overlayfs.h
+diff --cc fs/overlayfs/inode.c
+index e60c6d748742,35bb956af8e8..000000000000
+--- a/fs/overlayfs/inode.c
++++ b/fs/overlayfs/inode.c
+@@@ -78,17 -57,82 +78,82 @@@ out
+  	return err;
+  }
+  
+ -int ovl_getattr(const struct path *path, struct kstat *stat,
+ -		u32 request_mask, unsigned int flags)
+ +static int ovl_getattr(struct vfsmount *mnt, struct dentry *dentry,
+ +			 struct kstat *stat)
+  {
+ -	struct dentry *dentry = path->dentry;
+ -	enum ovl_path_type type;
+  	struct path realpath;
+  	const struct cred *old_cred;
+ -	bool is_dir = S_ISDIR(dentry->d_inode->i_mode);
+  	int err;
+  
+ -	type = ovl_path_real(dentry, &realpath);
+ +	ovl_path_real(dentry, &realpath);
+  	old_cred = ovl_override_creds(dentry->d_sb);
+++<<<<<<< HEAD
+ +	err = vfs_getattr(&realpath, stat);
+++=======
++ 	err = vfs_getattr(&realpath, stat, request_mask, flags);
++ 	if (err)
++ 		goto out;
++ 
++ 	/*
++ 	 * When all layers are on the same fs, all real inode number are
++ 	 * unique, so we use the overlay st_dev, which is friendly to du -x.
++ 	 *
++ 	 * We also use st_ino of the copy up origin, if we know it.
++ 	 * This guaranties constant st_dev/st_ino across copy up.
++ 	 *
++ 	 * If filesystem supports NFS export ops, this also guaranties
++ 	 * persistent st_ino across mount cycle.
++ 	 */
++ 	if (ovl_same_sb(dentry->d_sb)) {
++ 		if (OVL_TYPE_ORIGIN(type)) {
++ 			struct kstat lowerstat;
++ 			u32 lowermask = STATX_INO | (!is_dir ? STATX_NLINK : 0);
++ 
++ 			ovl_path_lower(dentry, &realpath);
++ 			err = vfs_getattr(&realpath, &lowerstat,
++ 					  lowermask, flags);
++ 			if (err)
++ 				goto out;
++ 
++ 			WARN_ON_ONCE(stat->dev != lowerstat.dev);
++ 			/*
++ 			 * Lower hardlinks may be broken on copy up to different
++ 			 * upper files, so we cannot use the lower origin st_ino
++ 			 * for those different files, even for the same fs case.
++ 			 * With inodes index enabled, it is safe to use st_ino
++ 			 * of an indexed hardlinked origin. The index validates
++ 			 * that the upper hardlink is not broken.
++ 			 */
++ 			if (is_dir || lowerstat.nlink == 1 ||
++ 			    ovl_test_flag(OVL_INDEX, d_inode(dentry)))
++ 				stat->ino = lowerstat.ino;
++ 		}
++ 		stat->dev = dentry->d_sb->s_dev;
++ 	} else if (is_dir) {
++ 		/*
++ 		 * If not all layers are on the same fs the pair {real st_ino;
++ 		 * overlay st_dev} is not unique, so use the non persistent
++ 		 * overlay st_ino.
++ 		 *
++ 		 * Always use the overlay st_dev for directories, so 'find
++ 		 * -xdev' will scan the entire overlay mount and won't cross the
++ 		 * overlay mount boundaries.
++ 		 */
++ 		stat->dev = dentry->d_sb->s_dev;
++ 		stat->ino = dentry->d_inode->i_ino;
++ 	}
++ 
++ 	/*
++ 	 * It's probably not worth it to count subdirs to get the
++ 	 * correct link count.  nlink=1 seems to pacify 'find' and
++ 	 * other utilities.
++ 	 */
++ 	if (is_dir && OVL_TYPE_MERGE(type))
++ 		stat->nlink = 1;
++ 
++ out:
+++>>>>>>> 359f392ca53e (ovl: lookup index entry for copy up origin)
+  	revert_creds(old_cred);
+ -
+  	return err;
+  }
+  
+diff --cc fs/overlayfs/overlayfs.h
+index 952ccab31629,437a0301e1b6..000000000000
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@@ -24,8 -22,50 +24,51 @@@ enum ovl_path_type 
+  
+  #define OVL_XATTR_PREFIX XATTR_TRUSTED_PREFIX "overlay."
+  #define OVL_XATTR_OPAQUE OVL_XATTR_PREFIX "opaque"
+ -#define OVL_XATTR_REDIRECT OVL_XATTR_PREFIX "redirect"
+ -#define OVL_XATTR_ORIGIN OVL_XATTR_PREFIX "origin"
+ -#define OVL_XATTR_IMPURE OVL_XATTR_PREFIX "impure"
+  
+++<<<<<<< HEAD
+ +#define OVL_ISUPPER_MASK 1UL
+++=======
++ enum ovl_flag {
++ 	OVL_IMPURE,
++ 	OVL_INDEX,
++ };
++ 
++ /*
++  * The tuple (fh,uuid) is a universal unique identifier for a copy up origin,
++  * where:
++  * origin.fh	- exported file handle of the lower file
++  * origin.uuid	- uuid of the lower filesystem
++  */
++ #define OVL_FH_VERSION	0
++ #define OVL_FH_MAGIC	0xfb
++ 
++ /* CPU byte order required for fid decoding:  */
++ #define OVL_FH_FLAG_BIG_ENDIAN	(1 << 0)
++ #define OVL_FH_FLAG_ANY_ENDIAN	(1 << 1)
++ /* Is the real inode encoded in fid an upper inode? */
++ #define OVL_FH_FLAG_PATH_UPPER	(1 << 2)
++ 
++ #define OVL_FH_FLAG_ALL (OVL_FH_FLAG_BIG_ENDIAN | OVL_FH_FLAG_ANY_ENDIAN)
++ 
++ #if defined(__LITTLE_ENDIAN)
++ #define OVL_FH_FLAG_CPU_ENDIAN 0
++ #elif defined(__BIG_ENDIAN)
++ #define OVL_FH_FLAG_CPU_ENDIAN OVL_FH_FLAG_BIG_ENDIAN
++ #else
++ #error Endianness not defined
++ #endif
++ 
++ /* On-disk and in-memeory format for redirect by file handle */
++ struct ovl_fh {
++ 	u8 version;	/* 0 */
++ 	u8 magic;	/* 0xfb */
++ 	u8 len;		/* size of this header + size of fid */
++ 	u8 flags;	/* OVL_FH_FLAG_* */
++ 	u8 type;	/* fid_type of fid */
++ 	uuid_t uuid;	/* uuid of filesystem */
++ 	u8 fid[0];	/* file identifier */
++ } __packed;
+++>>>>>>> 359f392ca53e (ovl: lookup index entry for copy up origin)
+  
+  static inline int ovl_do_rmdir(struct inode *dir, struct dentry *dentry)
+  {
+@@@ -151,27 -198,49 +194,66 @@@ int ovl_path_next(int idx, struct dentr
+  struct dentry *ovl_dentry_upper(struct dentry *dentry);
+  struct dentry *ovl_dentry_lower(struct dentry *dentry);
+  struct dentry *ovl_dentry_real(struct dentry *dentry);
+ -struct inode *ovl_inode_upper(struct inode *inode);
+ -struct inode *ovl_inode_lower(struct inode *inode);
+ -struct inode *ovl_inode_real(struct inode *inode);
+ +struct vfsmount *ovl_entry_mnt_real(struct ovl_entry *oe, struct inode *inode,
+ +				    bool is_upper);
+  struct ovl_dir_cache *ovl_dir_cache(struct dentry *dentry);
+  void ovl_set_dir_cache(struct dentry *dentry, struct ovl_dir_cache *cache);
+ +struct dentry *ovl_workdir(struct dentry *dentry);
+ +int ovl_want_write(struct dentry *dentry);
+ +void ovl_drop_write(struct dentry *dentry);
+  bool ovl_dentry_is_opaque(struct dentry *dentry);
+++<<<<<<< HEAD
+++=======
++ bool ovl_dentry_is_whiteout(struct dentry *dentry);
++ void ovl_dentry_set_opaque(struct dentry *dentry);
++ bool ovl_redirect_dir(struct super_block *sb);
++ const char *ovl_dentry_get_redirect(struct dentry *dentry);
++ void ovl_dentry_set_redirect(struct dentry *dentry, const char *redirect);
++ void ovl_inode_init(struct inode *inode, struct dentry *upperdentry,
++ 		    struct dentry *lowerdentry);
++ void ovl_inode_update(struct inode *inode, struct dentry *upperdentry);
++ void ovl_dentry_version_inc(struct dentry *dentry);
++ u64 ovl_dentry_version_get(struct dentry *dentry);
++ bool ovl_is_whiteout(struct dentry *dentry);
++ struct file *ovl_path_open(struct path *path, int flags);
++ int ovl_copy_up_start(struct dentry *dentry);
++ void ovl_copy_up_end(struct dentry *dentry);
++ bool ovl_check_dir_xattr(struct dentry *dentry, const char *name);
++ int ovl_check_setxattr(struct dentry *dentry, struct dentry *upperdentry,
++ 		       const char *name, const void *value, size_t size,
++ 		       int xerr);
++ int ovl_set_impure(struct dentry *dentry, struct dentry *upperdentry);
++ void ovl_set_flag(unsigned long flag, struct inode *inode);
++ bool ovl_test_flag(unsigned long flag, struct inode *inode);
++ bool ovl_inuse_trylock(struct dentry *dentry);
++ void ovl_inuse_unlock(struct dentry *dentry);
++ 
++ static inline bool ovl_is_impuredir(struct dentry *dentry)
++ {
++ 	return ovl_check_dir_xattr(dentry, OVL_XATTR_IMPURE);
++ }
++ 
++ 
++ /* namei.c */
++ int ovl_verify_origin(struct dentry *dentry, struct vfsmount *mnt,
++ 		      struct dentry *origin, bool is_upper, bool set);
++ int ovl_get_index_name(struct dentry *origin, struct qstr *name);
++ int ovl_path_next(int idx, struct dentry *dentry, struct path *path);
++ struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags);
+++>>>>>>> 359f392ca53e (ovl: lookup index entry for copy up origin)
+  bool ovl_lower_positive(struct dentry *dentry);
+ +bool ovl_dentry_is_whiteout(struct dentry *dentry);
+ +void ovl_dentry_set_opaque(struct dentry *dentry, bool opaque);
+ +bool ovl_is_whiteout(struct dentry *dentry);
+ +const struct cred *ovl_override_creds(struct super_block *sb);
+ +void ovl_dentry_update(struct dentry *dentry, struct dentry *upperdentry);
+ +void ovl_inode_update(struct inode *inode, struct inode *upperinode);
+ +struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry,
+ +			  unsigned int flags);
+ +struct file *ovl_path_open(struct path *path, int flags);
+ +
+ +struct dentry *ovl_upper_create(struct dentry *upperdir, struct dentry *dentry,
+ +				struct kstat *stat, const char *link);
+  
+  /* readdir.c */
+  extern const struct file_operations ovl_dir_operations;
+* Unmerged path fs/overlayfs/namei.c
+* Unmerged path fs/overlayfs/inode.c
+* Unmerged path fs/overlayfs/namei.c
+* Unmerged path fs/overlayfs/overlayfs.h
