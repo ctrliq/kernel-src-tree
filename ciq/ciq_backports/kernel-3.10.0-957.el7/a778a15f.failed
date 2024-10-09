@@ -1,0 +1,137 @@
+netfilter: ipset: add resched points during set listing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Florian Westphal <fw@strlen.de>
+commit a778a15fa5cf5f632cd55845f548189a29e9b57b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/a778a15f.failed
+
+When sets are extremely large we can get softlockup during ipset -L.
+We could fix this by adding cond_resched_rcu() at the right location
+during iteration, but this only works if RCU nesting depth is 1.
+
+At this time entire variant->list() is called under under rcu_read_lock_bh.
+This used to be a read_lock_bh() but as rcu doesn't really lock anything,
+it does not appear to be needed, so remove it (ipset increments set
+reference count before this, so a set deletion should not be possible).
+
+	Reported-by: Li Shuang <shuali@redhat.com>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Acked-by: Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit a778a15fa5cf5f632cd55845f548189a29e9b57b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/ipset/ip_set_bitmap_gen.h
+#	net/netfilter/ipset/ip_set_core.c
+#	net/netfilter/ipset/ip_set_hash_gen.h
+diff --cc net/netfilter/ipset/ip_set_bitmap_gen.h
+index 01a340ce9e94,8afe882f846d..000000000000
+--- a/net/netfilter/ipset/ip_set_bitmap_gen.h
++++ b/net/netfilter/ipset/ip_set_bitmap_gen.h
+@@@ -178,9 -223,13 +178,19 @@@ mtype_list(const struct ip_set *set
+  	adt = ipset_nest_start(skb, IPSET_ATTR_ADT);
+  	if (!adt)
+  		return -EMSGSIZE;
+++<<<<<<< HEAD
+ +	for (; cb->args[2] < map->elements; cb->args[2]++) {
+ +		id = cb->args[2];
+ +		x = get_ext(map, id);
+++=======
++ 	/* Extensions may be replaced */
++ 	rcu_read_lock();
++ 	for (; cb->args[IPSET_CB_ARG0] < map->elements;
++ 	     cb->args[IPSET_CB_ARG0]++) {
++ 		cond_resched_rcu();
++ 		id = cb->args[IPSET_CB_ARG0];
++ 		x = get_ext(set, map, id);
+++>>>>>>> a778a15fa5cf (netfilter: ipset: add resched points during set listing)
+  		if (!test_bit(id, map->members) ||
+  		    (SET_WITH_TIMEOUT(set) &&
+  #ifdef IP_SET_BITMAP_STORED_TIMEOUT
+diff --cc net/netfilter/ipset/ip_set_core.c
+index 8f5256a53627,89b44458a761..000000000000
+--- a/net/netfilter/ipset/ip_set_core.c
++++ b/net/netfilter/ipset/ip_set_core.c
+@@@ -1269,12 -1384,12 +1269,17 @@@ dump_last
+  				goto release_refcount;
+  			if (dump_flags & IPSET_FLAG_LIST_HEADER)
+  				goto next_set;
+ -			if (set->variant->uref)
+ -				set->variant->uref(set, cb, true);
+ -			/* fall through */
+ +			/* Fall through and add elements */
+  		default:
+++<<<<<<< HEAD
+ +			read_lock_bh(&set->lock);
+ +			ret = set->variant->list(set, skb, cb);
+ +			read_unlock_bh(&set->lock);
+ +			if (!cb->args[2])
+++=======
++ 			ret = set->variant->list(set, skb, cb);
++ 			if (!cb->args[IPSET_CB_ARG0])
+++>>>>>>> a778a15fa5cf (netfilter: ipset: add resched points during set listing)
+  				/* Set is done, proceed with next one */
+  				goto next_set;
+  			goto release_refcount;
+diff --cc net/netfilter/ipset/ip_set_hash_gen.h
+index 9ce28af662bf,8ef079db7d34..000000000000
+--- a/net/netfilter/ipset/ip_set_hash_gen.h
++++ b/net/netfilter/ipset/ip_set_hash_gen.h
+@@@ -866,25 -1136,37 +866,34 @@@ mtype_list(const struct ip_set *set
+  	atd = ipset_nest_start(skb, IPSET_ATTR_ADT);
+  	if (!atd)
+  		return -EMSGSIZE;
+ -
+  	pr_debug("list hash set %s\n", set->name);
+++<<<<<<< HEAD
+ +	for (; cb->args[2] < jhash_size(t->htable_bits); cb->args[2]++) {
+++=======
++ 	t = (const struct htable *)cb->args[IPSET_CB_PRIVATE];
++ 	/* Expire may replace a hbucket with another one */
++ 	rcu_read_lock();
++ 	for (; cb->args[IPSET_CB_ARG0] < jhash_size(t->htable_bits);
++ 	     cb->args[IPSET_CB_ARG0]++) {
++ 		cond_resched_rcu();
+++>>>>>>> a778a15fa5cf (netfilter: ipset: add resched points during set listing)
+  		incomplete = skb_tail_pointer(skb);
+ -		n = rcu_dereference(hbucket(t, cb->args[IPSET_CB_ARG0]));
+ -		pr_debug("cb->arg bucket: %lu, t %p n %p\n",
+ -			 cb->args[IPSET_CB_ARG0], t, n);
+ -		if (!n)
+ -			continue;
+ +		n = hbucket(t, cb->args[2]);
+ +		pr_debug("cb->args[2]: %lu, t %p n %p\n", cb->args[2], t, n);
+  		for (i = 0; i < n->pos; i++) {
+ -			if (!test_bit(i, n->used))
+ -				continue;
+ -			e = ahash_data(n, i, set->dsize);
+ +			e = ahash_data(n, i, h->dsize);
+  			if (SET_WITH_TIMEOUT(set) &&
+ -			    ip_set_timeout_expired(ext_timeout(e, set)))
+ +			    ip_set_timeout_expired(ext_timeout(e, h)))
+  				continue;
+  			pr_debug("list hash %lu hbucket %p i %u, data %p\n",
+ -				 cb->args[IPSET_CB_ARG0], n, i, e);
+ +				 cb->args[2], n, i, e);
+  			nested = ipset_nest_start(skb, IPSET_ATTR_DATA);
+  			if (!nested) {
+ -				if (cb->args[IPSET_CB_ARG0] == first) {
+ +				if (cb->args[2] == first) {
+  					nla_nest_cancel(skb, atd);
+ -					ret = -EMSGSIZE;
+ -					goto out;
+ -				}
+ -				goto nla_put_failure;
+ +					return -EMSGSIZE;
+ +				} else
+ +					goto nla_put_failure;
+  			}
+  			if (mtype_data_list(skb, e))
+  				goto nla_put_failure;
+* Unmerged path net/netfilter/ipset/ip_set_bitmap_gen.h
+* Unmerged path net/netfilter/ipset/ip_set_core.c
+* Unmerged path net/netfilter/ipset/ip_set_hash_gen.h
