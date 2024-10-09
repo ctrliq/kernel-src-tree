@@ -1,0 +1,215 @@
+HID: hid-sensor-hub: Fix debug lock warning
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [hid] hid-sensor-hub: Fix debug lock warning (Tony Camuso) [1559170]
+Rebuild_FUZZ: 93.83%
+commit-author Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+commit 2d94e5224e81c58986a8cf44a3bf4830ce5cb96e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/2d94e522.failed
+
+When CONFIG_DEBUG_LOCK_ALLOC is defined, mutex magic is compared and
+warned for (l->magic != l), here l is the address of mutex pointer.
+In hid-sensor-hub as part of hsdev creation, a per hsdev mutex is
+initialized during MFD cell creation. This hsdev, which contains, mutex
+is part of platform data for the a cell. But platform_data is copied
+in platform_device_add_data() in platform.c. This copy will copy the
+whole hsdev structure including mutex. But once copied the magic
+will no longer match. So when client driver call
+sensor_hub_input_attr_get_raw_value, this will trigger mutex warning.
+So to avoid this allocate mutex dynamically. This will be same even
+after copy.
+
+	Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+(cherry picked from commit 2d94e5224e81c58986a8cf44a3bf4830ce5cb96e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hid/hid-sensor-hub.c
+#	include/linux/hid-sensor-hub.h
+diff --cc drivers/hid/hid-sensor-hub.c
+index 59b65b9a5de2,090a1ba0abb6..000000000000
+--- a/drivers/hid/hid-sensor-hub.c
++++ b/drivers/hid/hid-sensor-hub.c
+@@@ -279,40 -289,46 +279,64 @@@ int sensor_hub_input_attr_get_raw_value
+  	struct hid_report *report;
+  	int ret_val = 0;
+  
+++<<<<<<< HEAD
+++=======
++ 	report = sensor_hub_report(report_id, hsdev->hdev,
++ 				   HID_INPUT_REPORT);
++ 	if (!report)
++ 		return -EINVAL;
++ 
++ 	mutex_lock(hsdev->mutex_ptr);
++ 	if (flag == SENSOR_HUB_SYNC) {
++ 		memset(&hsdev->pending, 0, sizeof(hsdev->pending));
++ 		init_completion(&hsdev->pending.ready);
++ 		hsdev->pending.usage_id = usage_id;
++ 		hsdev->pending.attr_usage_id = attr_usage_id;
++ 		hsdev->pending.raw_size = 0;
++ 
++ 		spin_lock_irqsave(&data->lock, flags);
++ 		hsdev->pending.status = true;
++ 		spin_unlock_irqrestore(&data->lock, flags);
++ 	}
+++>>>>>>> 2d94e5224e81 (HID: hid-sensor-hub: Fix debug lock warning)
+  	mutex_lock(&data->mutex);
+ +	memset(&data->pending, 0, sizeof(data->pending));
+ +	init_completion(&data->pending.ready);
+ +	data->pending.usage_id = usage_id;
+ +	data->pending.attr_usage_id = attr_usage_id;
+ +	data->pending.raw_size = 0;
+ +
+ +	spin_lock_irqsave(&data->lock, flags);
+ +	data->pending.status = true;
+ +	spin_unlock_irqrestore(&data->lock, flags);
+ +	report = sensor_hub_report(report_id, hsdev->hdev, HID_INPUT_REPORT);
+ +	if (!report)
+ +		goto err_free;
+ +
+  	hid_hw_request(hsdev->hdev, report, HID_REQ_GET_REPORT);
+ -	mutex_unlock(&data->mutex);
+ -	if (flag == SENSOR_HUB_SYNC) {
+ -		wait_for_completion_interruptible_timeout(
+ -						&hsdev->pending.ready, HZ*5);
+ -		switch (hsdev->pending.raw_size) {
+ -		case 1:
+ -			ret_val = *(u8 *)hsdev->pending.raw_data;
+ -			break;
+ -		case 2:
+ -			ret_val = *(u16 *)hsdev->pending.raw_data;
+ -			break;
+ -		case 4:
+ -			ret_val = *(u32 *)hsdev->pending.raw_data;
+ -			break;
+ -		default:
+ -			ret_val = 0;
+ -		}
+ -		kfree(hsdev->pending.raw_data);
+ -		hsdev->pending.status = false;
+ +	wait_for_completion_interruptible_timeout(&data->pending.ready, HZ*5);
+ +	switch (data->pending.raw_size) {
+ +	case 1:
+ +		ret_val = *(u8 *)data->pending.raw_data;
+ +		break;
+ +	case 2:
+ +		ret_val = *(u16 *)data->pending.raw_data;
+ +		break;
+ +	case 4:
+ +		ret_val = *(u32 *)data->pending.raw_data;
+ +		break;
+ +	default:
+ +		ret_val = 0;
+  	}
+++<<<<<<< HEAD
+ +	kfree(data->pending.raw_data);
+ +
+ +err_free:
+ +	data->pending.status = false;
+ +	mutex_unlock(&data->mutex);
+++=======
++ 	mutex_unlock(hsdev->mutex_ptr);
+++>>>>>>> 2d94e5224e81 (HID: hid-sensor-hub: Fix debug lock warning)
+  
+  	return ret_val;
+  }
+@@@ -587,20 -649,44 +611,57 @@@ static int sensor_hub_probe(struct hid_
+  			ret = -ENOMEM;
+  			goto err_stop_hw;
+  	}
+++<<<<<<< HEAD
+ +	list_for_each_entry(report, &report_enum->report_list, list) {
+ +		hid_dbg(hdev, "Report id:%x\n", report->id);
+ +		field = report->field[0];
+ +		if (report->maxfield && field &&
+ +					field->physical) {
+ +			name = kasprintf(GFP_KERNEL, "HID-SENSOR-%x",
+ +						field->physical);
+ +			if (name  == NULL) {
+++=======
++ 
++ 	for (i = 0; i < hdev->maxcollection; ++i) {
++ 		struct hid_collection *collection = &hdev->collection[i];
++ 
++ 		if (collection->type == HID_COLLECTION_PHYSICAL ||
++ 		    collection->type == HID_COLLECTION_APPLICATION) {
++ 
++ 			hsdev = devm_kzalloc(&hdev->dev, sizeof(*hsdev),
++ 					     GFP_KERNEL);
++ 			if (!hsdev) {
++ 				hid_err(hdev, "cannot allocate hid_sensor_hub_device\n");
++ 				ret = -ENOMEM;
++ 				goto err_stop_hw;
++ 			}
++ 			hsdev->hdev = hdev;
++ 			hsdev->vendor_id = hdev->vendor;
++ 			hsdev->product_id = hdev->product;
++ 			hsdev->usage = collection->usage;
++ 			hsdev->mutex_ptr = devm_kzalloc(&hdev->dev,
++ 							sizeof(struct mutex),
++ 							GFP_KERNEL);
++ 			if (!hsdev->mutex_ptr) {
++ 				ret = -ENOMEM;
++ 				goto err_stop_hw;
++ 			}
++ 			mutex_init(hsdev->mutex_ptr);
++ 			hsdev->start_collection_index = i;
++ 			if (last_hsdev)
++ 				last_hsdev->end_collection_index = i;
++ 			last_hsdev = hsdev;
++ 			name = devm_kasprintf(&hdev->dev, GFP_KERNEL,
++ 					      "HID-SENSOR-%x",
++ 					      collection->usage);
++ 			if (name == NULL) {
+++>>>>>>> 2d94e5224e81 (HID: hid-sensor-hub: Fix debug lock warning)
+  				hid_err(hdev, "Failed MFD device name\n");
+  					ret = -ENOMEM;
+ -					goto err_stop_hw;
+ +					goto err_free_names;
+  			}
+ +			sd->hid_sensor_hub_client_devs[
+ +				sd->hid_sensor_client_cnt].id = PLATFORM_DEVID_AUTO;
+  			sd->hid_sensor_hub_client_devs[
+  				sd->hid_sensor_client_cnt].name = name;
+  			sd->hid_sensor_hub_client_devs[
+diff --cc include/linux/hid-sensor-hub.h
+index 8fc2444454a4,0042bf330b99..000000000000
+--- a/include/linux/hid-sensor-hub.h
++++ b/include/linux/hid-sensor-hub.h
+@@@ -53,13 -71,21 +53,29 @@@ struct hid_sensor_hub_attribute_info 
+   * @hdev:		Stores the hid instance.
+   * @vendor_id:		Vendor id of hub device.
+   * @product_id:		Product id of hub device.
+++<<<<<<< HEAD
+ + * @ref_cnt:		Number of MFD clients have opened this device
+++=======
++  * @usage:		Usage id for this hub device instance.
++  * @start_collection_index: Starting index for a phy type collection
++  * @end_collection_index: Last index for a phy type collection
++  * @mutex_ptr:		synchronizing mutex pointer.
++  * @pending:		Holds information of pending sync read request.
+++>>>>>>> 2d94e5224e81 (HID: hid-sensor-hub: Fix debug lock warning)
+   */
+  struct hid_sensor_hub_device {
+  	struct hid_device *hdev;
+  	u32 vendor_id;
+  	u32 product_id;
+++<<<<<<< HEAD
+ +	int ref_cnt;
+++=======
++ 	u32 usage;
++ 	int start_collection_index;
++ 	int end_collection_index;
++ 	struct mutex *mutex_ptr;
++ 	struct sensor_hub_pending pending;
+++>>>>>>> 2d94e5224e81 (HID: hid-sensor-hub: Fix debug lock warning)
+  };
+  
+  /**
+* Unmerged path drivers/hid/hid-sensor-hub.c
+* Unmerged path include/linux/hid-sensor-hub.h
