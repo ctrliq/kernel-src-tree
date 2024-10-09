@@ -1,0 +1,253 @@
+net/mlx5: Use flow counter IDs and not the wrapping cache object
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5: Use flow counter IDs and not the wrapping cache object (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 96.77%
+commit-author Mark Bloch <markb@mellanox.com>
+commit 171c7625bef999848ee6032c6dde96e7330c4d15
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/171c7625.failed
+
+Currently, when a flow rule is created using the FS core layer, the caller
+has to pass the entire flow counter object and not just the counter HW
+handle (ID). This requires both the FS core and the caller to have
+knowledge about the inner implementation of the FS layer flow counters
+cache and limits the possible users.
+
+Move to use the counter ID across the place when dealing with flows.
+
+Doing this decoupling, now can we privatize the inner implementation
+of the flow counters.
+
+	Signed-off-by: Mark Bloch <markb@mellanox.com>
+	Reviewed-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 171c7625bef999848ee6032c6dde96e7330c4d15)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+#	drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index b529cb4f76e1,5ced0cc46ba1..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -3076,9 -3319,27 +3076,28 @@@ static struct mlx5_ib_flow_handler *_cr
+  		goto free;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (flow_act.action & MLX5_FLOW_CONTEXT_ACTION_COUNT) {
++ 		struct mlx5_ib_mcounters *mcounters;
++ 
++ 		err = flow_counters_set_data(flow_act.counters, ucmd);
++ 		if (err)
++ 			goto free;
++ 
++ 		mcounters = to_mcounters(flow_act.counters);
++ 		handler->ibcounters = flow_act.counters;
++ 		dest_arr[dest_num].type =
++ 			MLX5_FLOW_DESTINATION_TYPE_COUNTER;
++ 		dest_arr[dest_num].counter_id =
++ 			mlx5_fc_id(mcounters->hw_cntrs_hndl);
++ 		dest_num++;
++ 	}
++ 
+++>>>>>>> 171c7625bef9 (net/mlx5: Use flow counter IDs and not the wrapping cache object)
+  	if (flow_act.action & MLX5_FLOW_CONTEXT_ACTION_DROP) {
+ -		if (!(flow_act.action & MLX5_FLOW_CONTEXT_ACTION_COUNT)) {
+ -			rule_dst = NULL;
+ -			dest_num = 0;
+ -		}
+ +		rule_dst = NULL;
+ +		dest_num = 0;
+  	} else {
+  		if (is_egress)
+  			flow_act.action |= MLX5_FLOW_CONTEXT_ACTION_ALLOW;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index 84864631953e,39932dce15cb..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -70,23 -80,18 +70,27 @@@ mlx5_eswitch_add_offloaded_rule(struct 
+  	}
+  
+  	if (flow_act.action & MLX5_FLOW_CONTEXT_ACTION_FWD_DEST) {
+ -		for (j = attr->mirror_count; j < attr->out_count; j++) {
+ -			dest[i].type = MLX5_FLOW_DESTINATION_TYPE_VPORT;
+ -			dest[i].vport.num = attr->out_rep[j]->vport;
+ +		dest[i].type = MLX5_FLOW_DESTINATION_TYPE_VPORT;
+ +		dest[i].vport.num = attr->out_rep->vport;
+ +		if (MLX5_CAP_ESW(esw->dev, merged_eswitch)) {
+  			dest[i].vport.vhca_id =
+ -				MLX5_CAP_GEN(attr->out_mdev[j], vhca_id);
+ -			dest[i].vport.vhca_id_valid = !!MLX5_CAP_ESW(esw->dev, merged_eswitch);
+ -			i++;
+ +				MLX5_CAP_GEN(attr->out_mdev, vhca_id);
+ +			dest[i].vport.vhca_id_valid = 1;
+  		}
+ +		i++;
+  	}
+  	if (flow_act.action & MLX5_FLOW_CONTEXT_ACTION_COUNT) {
+ +		counter = mlx5_fc_create(esw->dev, true);
+ +		if (IS_ERR(counter)) {
+ +			rule = ERR_CAST(counter);
+ +			goto err_counter_alloc;
+ +		}
+  		dest[i].type = MLX5_FLOW_DESTINATION_TYPE_COUNTER;
+++<<<<<<< HEAD
+ +		dest[i].counter = counter;
+++=======
++ 		dest[i].counter_id = mlx5_fc_id(attr->counter);
+++>>>>>>> 171c7625bef9 (net/mlx5: Use flow counter IDs and not the wrapping cache object)
+  		i++;
+  	}
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+index 72297c31a849,cdcbf9d0ae6c..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+@@@ -1453,29 -1474,8 +1453,27 @@@ static struct mlx5_flow_handle *add_rul
+  	return handle;
+  }
+  
+++<<<<<<< HEAD
+ +struct mlx5_fc *mlx5_flow_rule_counter(struct mlx5_flow_handle *handle)
+ +{
+ +	struct mlx5_flow_rule *dst;
+ +	struct fs_fte *fte;
+ +
+ +	fs_get_obj(fte, handle->rule[0]->node.parent);
+ +
+ +	fs_for_each_dst(dst, fte) {
+ +		if (dst->dest_attr.type == MLX5_FLOW_DESTINATION_TYPE_COUNTER)
+ +			return dst->dest_attr.counter;
+ +	}
+ +
+ +	return NULL;
+ +}
+ +
+ +static bool counter_is_valid(struct mlx5_fc *counter, u32 action)
+++=======
++ static bool counter_is_valid(u32 action)
+++>>>>>>> 171c7625bef9 (net/mlx5: Use flow counter IDs and not the wrapping cache object)
+  {
+- 	if (!(action & MLX5_FLOW_CONTEXT_ACTION_COUNT))
+- 		return !counter;
+- 
+- 	if (!counter)
+- 		return false;
+- 
+  	return (action & (MLX5_FLOW_CONTEXT_ACTION_DROP |
+  			  MLX5_FLOW_CONTEXT_ACTION_FWD_DEST));
+  }
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/diag/fs_tracepoint.h b/drivers/net/ethernet/mellanox/mlx5/core/diag/fs_tracepoint.h
+index 09f178a3fcab..e0510c316354 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/diag/fs_tracepoint.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/diag/fs_tracepoint.h
+@@ -250,10 +250,10 @@ TRACE_EVENT(mlx5_fs_add_rule,
+ 			   memcpy(__entry->destination,
+ 				  &rule->dest_attr,
+ 				  sizeof(__entry->destination));
+-			   if (rule->dest_attr.type & MLX5_FLOW_DESTINATION_TYPE_COUNTER &&
+-			       rule->dest_attr.counter)
++			   if (rule->dest_attr.type &
++			       MLX5_FLOW_DESTINATION_TYPE_COUNTER)
+ 				__entry->counter_id =
+-				rule->dest_attr.counter->id;
++					rule->dest_attr.counter_id;
+ 	    ),
+ 	    TP_printk("rule=%p fte=%p index=%u sw_action=<%s> [dst] %s\n",
+ 		      __entry->rule, __entry->fte, __entry->index,
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 3a01f0d3c372..ea944a979f8b 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@ -712,7 +712,7 @@ mlx5e_tc_add_nic_flow(struct mlx5e_priv *priv,
+ 			goto err_fc_create;
+ 		}
+ 		dest[dest_ix].type = MLX5_FLOW_DESTINATION_TYPE_COUNTER;
+-		dest[dest_ix].counter = counter;
++		dest[dest_ix].counter_id = mlx5_fc_id(counter);
+ 		dest_ix++;
+ 	}
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index 8798f4084ee6..c20cda9df084 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@ -1198,7 +1198,7 @@ static int esw_vport_ingress_config(struct mlx5_eswitch *esw,
+ 	if (counter) {
+ 		flow_act.action |= MLX5_FLOW_CONTEXT_ACTION_COUNT;
+ 		drop_ctr_dst.type = MLX5_FLOW_DESTINATION_TYPE_COUNTER;
+-		drop_ctr_dst.counter = counter;
++		drop_ctr_dst.counter_id = mlx5_fc_id(counter);
+ 		dst = &drop_ctr_dst;
+ 		dest_num++;
+ 	}
+@@ -1285,7 +1285,7 @@ static int esw_vport_egress_config(struct mlx5_eswitch *esw,
+ 	if (counter) {
+ 		flow_act.action |= MLX5_FLOW_CONTEXT_ACTION_COUNT;
+ 		drop_ctr_dst.type = MLX5_FLOW_DESTINATION_TYPE_COUNTER;
+-		drop_ctr_dst.counter = counter;
++		drop_ctr_dst.counter_id = mlx5_fc_id(counter);
+ 		dst = &drop_ctr_dst;
+ 		dest_num++;
+ 	}
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c b/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c
+index 684c8251931c..91576db3cfe3 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_cmd.c
+@@ -412,7 +412,7 @@ static int mlx5_cmd_set_fte(struct mlx5_core_dev *dev,
+ 				continue;
+ 
+ 			MLX5_SET(flow_counter_list, in_dests, flow_counter_id,
+-				 dst->dest_attr.counter->id);
++				 dst->dest_attr.counter_id);
+ 			in_dests += MLX5_ST_SZ_BYTES(dest_format_struct);
+ 			list_size++;
+ 		}
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/fs_counters.c b/drivers/net/ethernet/mellanox/mlx5/core/fs_counters.c
+index 09206c4acd9a..1329bc5b7969 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_counters.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_counters.c
+@@ -258,6 +258,12 @@ err_out:
+ }
+ EXPORT_SYMBOL(mlx5_fc_create);
+ 
++u32 mlx5_fc_id(struct mlx5_fc *counter)
++{
++	return counter->id;
++}
++EXPORT_SYMBOL(mlx5_fc_id);
++
+ void mlx5_fc_destroy(struct mlx5_core_dev *dev, struct mlx5_fc *counter)
+ {
+ 	struct mlx5_fc_stats *fc_stats = &dev->priv.fc_stats;
+diff --git a/include/linux/mlx5/fs.h b/include/linux/mlx5/fs.h
+index 7035fec2adf8..ed74f4b3e2dd 100644
+--- a/include/linux/mlx5/fs.h
++++ b/include/linux/mlx5/fs.h
+@@ -90,7 +90,7 @@ struct mlx5_flow_destination {
+ 		u32			tir_num;
+ 		u32			ft_num;
+ 		struct mlx5_flow_table	*ft;
+-		struct mlx5_fc		*counter;
++		u32			counter_id;
+ 		struct {
+ 			u16		num;
+ 			u16		vhca_id;
+@@ -187,6 +187,7 @@ void mlx5_fc_query_cached(struct mlx5_fc *counter,
+ 			  u64 *bytes, u64 *packets, u64 *lastuse);
+ int mlx5_fc_query(struct mlx5_core_dev *dev, struct mlx5_fc *counter,
+ 		  u64 *packets, u64 *bytes);
++u32 mlx5_fc_id(struct mlx5_fc *counter);
+ 
+ int mlx5_fs_add_rx_underlay_qpn(struct mlx5_core_dev *dev, u32 underlay_qpn);
+ int mlx5_fs_remove_rx_underlay_qpn(struct mlx5_core_dev *dev, u32 underlay_qpn);
