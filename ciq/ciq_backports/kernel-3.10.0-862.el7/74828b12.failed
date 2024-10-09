@@ -1,0 +1,88 @@
+bnxt_re: Remove RTNL lock dependency in bnxt_re_query_port
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Somnath Kotur <somnath.kotur@broadcom.com>
+commit 74828b128115033ff25d4140d732a05a36eaeaf0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/74828b12.failed
+
+When there is a NETDEV_UNREGISTER event, bnxt_re driver calls
+ib_unregister_device() (RTNL lock held).
+ib_unregister_device attempts to flush a worker queue scheduled by
+ib_core and that queue might have a pending ib_query_port().
+ib_query_port in turn calls bnxt_re_query_port(), which while querying the
+link speed using ib_get_eth_speed(), tries to acquire the rtnl_lock() which
+was already held by NETDEV_UNREGISTER.
+Fixing the issue by removing the link speed query from bnxt_re_query_port()
+Now the speed is queried post a successful ib_register_device or whenever
+there is a NETDEV_CHANGE event.
+
+	Signed-off-by: Somnath Kotur <somnath.kotur@broadcom.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 74828b128115033ff25d4140d732a05a36eaeaf0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/bnxt_re/ib_verbs.c
+diff --cc drivers/infiniband/hw/bnxt_re/ib_verbs.c
+index 0277e43fc9a8,7430ef07a0e1..000000000000
+--- a/drivers/infiniband/hw/bnxt_re/ib_verbs.c
++++ b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+@@@ -303,13 -259,9 +303,19 @@@ int bnxt_re_query_port(struct ib_devic
+  	port_attr->sm_sl = 0;
+  	port_attr->subnet_timeout = 0;
+  	port_attr->init_type_reply = 0;
+++<<<<<<< HEAD
+ +	/* call the underlying netdev's ethtool hooks to query speed settings
+ +	 * for which we acquire rtnl_lock _only_ if it's registered with
+ +	 * IB stack to avoid race in the NETDEV_UNREG path
+ +	 */
+ +	if (test_bit(BNXT_RE_FLAG_IBDEV_REGISTERED, &rdev->flags))
+ +		__to_ib_speed_width(rdev->netdev, &port_attr->active_speed,
+ +				    &port_attr->active_width);
+++=======
++ 	port_attr->active_speed = rdev->active_speed;
++ 	port_attr->active_width = rdev->active_width;
++ 
+++>>>>>>> 74828b128115 (bnxt_re: Remove RTNL lock dependency in bnxt_re_query_port)
+  	return 0;
+  }
+  
+diff --git a/drivers/infiniband/hw/bnxt_re/bnxt_re.h b/drivers/infiniband/hw/bnxt_re/bnxt_re.h
+index a25f9d240880..ecbac91b2e14 100644
+--- a/drivers/infiniband/hw/bnxt_re/bnxt_re.h
++++ b/drivers/infiniband/hw/bnxt_re/bnxt_re.h
+@@ -110,6 +110,8 @@ struct bnxt_re_dev {
+ 
+ 	struct delayed_work		worker;
+ 	u8				cur_prio_map;
++	u8				active_speed;
++	u8				active_width;
+ 
+ 	/* FP Notification Queue (CQ & SRQ) */
+ 	struct tasklet_struct		nq_task;
+* Unmerged path drivers/infiniband/hw/bnxt_re/ib_verbs.c
+diff --git a/drivers/infiniband/hw/bnxt_re/main.c b/drivers/infiniband/hw/bnxt_re/main.c
+index e0b47fdc6dff..96dbb3e15af2 100644
+--- a/drivers/infiniband/hw/bnxt_re/main.c
++++ b/drivers/infiniband/hw/bnxt_re/main.c
+@@ -1158,6 +1158,8 @@ static int bnxt_re_ib_reg(struct bnxt_re_dev *rdev)
+ 		}
+ 	}
+ 	set_bit(BNXT_RE_FLAG_IBDEV_REGISTERED, &rdev->flags);
++	ib_get_eth_speed(&rdev->ibdev, 1, &rdev->active_speed,
++			 &rdev->active_width);
+ 	bnxt_re_dispatch_event(&rdev->ibdev, NULL, 1, IB_EVENT_PORT_ACTIVE);
+ 	bnxt_re_dispatch_event(&rdev->ibdev, NULL, 1, IB_EVENT_GID_CHANGE);
+ 
+@@ -1252,6 +1254,8 @@ static void bnxt_re_task(struct work_struct *work)
+ 		else if (netif_carrier_ok(rdev->netdev))
+ 			bnxt_re_dispatch_event(&rdev->ibdev, NULL, 1,
+ 					       IB_EVENT_PORT_ACTIVE);
++		ib_get_eth_speed(&rdev->ibdev, 1, &rdev->active_speed,
++				 &rdev->active_width);
+ 		break;
+ 	default:
+ 		break;
