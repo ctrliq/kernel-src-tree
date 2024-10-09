@@ -1,0 +1,118 @@
+drm/i915: Fix runtime PM for LPE audio
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [sound] alsa: drm/i915: Fix runtime PM for LPE audio (Jaroslav Kysela) [1463624]
+Rebuild_FUZZ: 92.68%
+commit-author Ville Syrjälä <ville.syrjala@linux.intel.com>
+commit 183c00350ccda86781f6695840e6c5f5b22efbd1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/183c0035.failed
+
+Not calling pm_runtime_enable() means that runtime PM can't be
+enabled at all via sysfs. So we definitely need to call it
+from somewhere.
+
+Calling it from the driver seems like a bad idea because it
+would have to be paired with a pm_runtime_disable() at driver
+unload time, otherwise the core gets upset. Also if there's
+no LPE audio driver loaded then we couldn't runtime suspend
+i915 either.
+
+So it looks like a better plan is to call it from i915 when
+we register the platform device. That seems to match how
+pci generally does things. I cargo culted the
+pm_runtime_forbid() and pm_runtime_set_active() calls from
+pci as well.
+
+The exposed runtime PM API is massive an thorougly misleading, so
+I don't actually know if this is how you're supposed to use the API
+or not. But it seems to work. I can now runtime suspend i915 again
+with or without the LPE audio driver loaded, and reloading the
+LPE audio driver also seems to work.
+
+Note that powertop won't auto-tune runtime PM for platform devices,
+which is a little annoying. So I'm not sure that leaving runtime
+PM in "on" mode by default is the best choice here. But I've left
+it like that for now at least.
+
+Also remove the comment about there not being much benefit from
+LPE audio runtime PM. Not allowing runtime PM blocks i915 runtime
+PM, which will also block s0ix, and that could have a measurable
+impact on power consumption.
+
+	Cc: stable@vger.kernel.org
+	Cc: Takashi Iwai <tiwai@suse.de>
+	Cc: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Fixes: 0b6b524f3915 ("ALSA: x86: Don't enable runtime PM as default")
+	Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170427160231.13337-2-ville.syrjala@linux.intel.com
+	Reviewed-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit 183c00350ccda86781f6695840e6c5f5b22efbd1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_lpe_audio.c
+#	sound/x86/intel_hdmi_audio.c
+diff --cc sound/x86/intel_hdmi_audio.c
+index 3dd33e089501,bfac6f21ae5e..000000000000
+--- a/sound/x86/intel_hdmi_audio.c
++++ b/sound/x86/intel_hdmi_audio.c
+@@@ -1680,28 -1792,35 +1680,46 @@@ int hdmi_audio_probe(struct platform_de
+  	init_channel_allocations();
+  
+  	/* Register channel map controls */
+ -	ret = had_register_chmap_ctls(ctx, pcm);
+ -	if (ret < 0)
+ +	retval = had_register_chmap_ctls(intelhaddata, pcm);
+ +	if (retval < 0)
+  		goto err;
+  
+ -	ret = had_create_jack(ctx);
+ -	if (ret < 0)
+ -		goto err;
+ +	intelhaddata->dev = &devptr->dev;
+ +	pm_runtime_set_active(intelhaddata->dev);
+ +	pm_runtime_enable(intelhaddata->dev);
+  
+++<<<<<<< HEAD
+ +	*had_ret = intelhaddata;
+++=======
++ 	ret = snd_card_register(card);
++ 	if (ret)
++ 		goto err;
++ 
++ 	spin_lock_irq(&pdata->lpe_audio_slock);
++ 	pdata->notify_audio_lpe = notify_audio_lpe;
++ 	pdata->notify_pending = false;
++ 	spin_unlock_irq(&pdata->lpe_audio_slock);
++ 
++ 	pm_runtime_use_autosuspend(&pdev->dev);
++ 	pm_runtime_mark_last_busy(&pdev->dev);
++ 	pm_runtime_set_active(&pdev->dev);
++ 
++ 	dev_dbg(&pdev->dev, "%s: handle pending notification\n", __func__);
++ 	schedule_work(&ctx->hdmi_audio_wq);
+++>>>>>>> 183c00350ccd (drm/i915: Fix runtime PM for LPE audio)
+  
+  	return 0;
+ -
+  err:
+  	snd_card_free(card);
+ -	return ret;
+ +free_hadstream:
+ +	kfree(had_stream);
+ +	pm_runtime_disable(intelhaddata->dev);
+ +	intelhaddata->dev = NULL;
+ +free_haddata:
+ +	kfree(intelhaddata);
+ +	intelhaddata = NULL;
+ +	pr_err("Error returned from %s api %#x\n", __func__, retval);
+ +	return retval;
+  }
+  
+  /*
+* Unmerged path drivers/gpu/drm/i915/intel_lpe_audio.c
+* Unmerged path drivers/gpu/drm/i915/intel_lpe_audio.c
+* Unmerged path sound/x86/intel_hdmi_audio.c
