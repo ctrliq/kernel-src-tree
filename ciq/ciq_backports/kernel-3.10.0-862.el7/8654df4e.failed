@@ -1,0 +1,380 @@
+mnt: Refactor fs_fully_visible into mount_too_revealing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit 8654df4e2ac9704905198d63845554c2ddf6a93f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8654df4e.failed
+
+Replace the call of fs_fully_visible in do_new_mount from before the
+new superblock is allocated with a call of mount_too_revealing after
+the superblock is allocated.   This winds up being a much better location
+for maintainability of the code.
+
+The first change this enables is the replacement of FS_USERNS_VISIBLE
+with SB_I_USERNS_VISIBLE.  Moving the flag from struct filesystem_type
+to sb_iflags on the superblock.
+
+Unfortunately mount_too_revealing fundamentally needs to touch
+mnt_flags adding several MNT_LOCKED_XXX flags at the appropriate
+times.  If the mnt_flags did not need to be touched the code
+could be easily moved into the filesystem specific mount code.
+
+	Acked-by: Seth Forshee <seth.forshee@canonical.com>
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit 8654df4e2ac9704905198d63845554c2ddf6a93f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namespace.c
+#	fs/sysfs/mount.c
+#	include/linux/fs.h
+diff --cc fs/namespace.c
+index edd7c5e218b1,1a69aa786975..000000000000
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@@ -2425,6 -2375,8 +2425,11 @@@ unlock
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool mount_too_revealing(struct vfsmount *mnt, int *new_mnt_flags);
++ 
+++>>>>>>> 8654df4e2ac9 (mnt: Refactor fs_fully_visible into mount_too_revealing)
+  /*
+   * create a new mount for userspace and request it to be added into the
+   * namespace's tree
+@@@ -3293,30 -3215,104 +3303,116 @@@ bool current_chrooted(void
+  	return chrooted;
+  }
+  
+++<<<<<<< HEAD
+ +void update_mnt_policy(struct user_namespace *userns)
+ +{
+ +	struct mnt_namespace *ns = current->nsproxy->mnt_ns;
+ +	struct mount *mnt;
+ +
+ +	down_read(&namespace_sem);
+ +	list_for_each_entry(mnt, &ns->list, mnt_list) {
+ +		switch (mnt->mnt.mnt_sb->s_magic) {
+ +		case SYSFS_MAGIC:
+ +			userns->may_mount_sysfs = true;
+ +			break;
+ +		case PROC_SUPER_MAGIC:
+ +			userns->may_mount_proc = true;
+ +			break;
+++=======
++ static bool mnt_already_visible(struct mnt_namespace *ns, struct vfsmount *new,
++ 				int *new_mnt_flags)
++ {
++ 	int new_flags = *new_mnt_flags;
++ 	struct mount *mnt;
++ 	bool visible = false;
++ 
++ 	down_read(&namespace_sem);
++ 	list_for_each_entry(mnt, &ns->list, mnt_list) {
++ 		struct mount *child;
++ 		int mnt_flags;
++ 
++ 		if (mnt->mnt.mnt_sb->s_type != new->mnt_sb->s_type)
++ 			continue;
++ 
++ 		/* This mount is not fully visible if it's root directory
++ 		 * is not the root directory of the filesystem.
++ 		 */
++ 		if (mnt->mnt.mnt_root != mnt->mnt.mnt_sb->s_root)
++ 			continue;
++ 
++ 		/* Read the mount flags and filter out flags that
++ 		 * may safely be ignored.
++ 		 */
++ 		mnt_flags = mnt->mnt.mnt_flags;
++ 		if (mnt->mnt.mnt_sb->s_iflags & SB_I_NOEXEC)
++ 			mnt_flags &= ~(MNT_LOCK_NOSUID | MNT_LOCK_NOEXEC);
++ 
++ 		/* Don't miss readonly hidden in the superblock flags */
++ 		if (mnt->mnt.mnt_sb->s_flags & MS_RDONLY)
++ 			mnt_flags |= MNT_LOCK_READONLY;
++ 
++ 		/* Verify the mount flags are equal to or more permissive
++ 		 * than the proposed new mount.
++ 		 */
++ 		if ((mnt_flags & MNT_LOCK_READONLY) &&
++ 		    !(new_flags & MNT_READONLY))
++ 			continue;
++ 		if ((mnt_flags & MNT_LOCK_NODEV) &&
++ 		    !(new_flags & MNT_NODEV))
++ 			continue;
++ 		if ((mnt_flags & MNT_LOCK_NOSUID) &&
++ 		    !(new_flags & MNT_NOSUID))
++ 			continue;
++ 		if ((mnt_flags & MNT_LOCK_NOEXEC) &&
++ 		    !(new_flags & MNT_NOEXEC))
++ 			continue;
++ 		if ((mnt_flags & MNT_LOCK_ATIME) &&
++ 		    ((mnt_flags & MNT_ATIME_MASK) != (new_flags & MNT_ATIME_MASK)))
++ 			continue;
++ 
++ 		/* This mount is not fully visible if there are any
++ 		 * locked child mounts that cover anything except for
++ 		 * empty directories.
++ 		 */
++ 		list_for_each_entry(child, &mnt->mnt_mounts, mnt_child) {
++ 			struct inode *inode = child->mnt_mountpoint->d_inode;
++ 			/* Only worry about locked mounts */
++ 			if (!(child->mnt.mnt_flags & MNT_LOCKED))
++ 				continue;
++ 			/* Is the directory permanetly empty? */
++ 			if (!is_empty_dir_inode(inode))
++ 				goto next;
+++>>>>>>> 8654df4e2ac9 (mnt: Refactor fs_fully_visible into mount_too_revealing)
+  		}
+ -		/* Preserve the locked attributes */
+ -		*new_mnt_flags |= mnt_flags & (MNT_LOCK_READONLY | \
+ -					       MNT_LOCK_NODEV    | \
+ -					       MNT_LOCK_NOSUID   | \
+ -					       MNT_LOCK_NOEXEC   | \
+ -					       MNT_LOCK_ATIME);
+ -		visible = true;
+ -		goto found;
+ -	next:	;
+ -	}
+ -found:
+ +		if (userns->may_mount_sysfs && userns->may_mount_proc)
+ +			break;
+ +	}
+  	up_read(&namespace_sem);
+ -	return visible;
+  }
+  
+++<<<<<<< HEAD
+ +static void *mntns_get(struct task_struct *task)
+++=======
++ static bool mount_too_revealing(struct vfsmount *mnt, int *new_mnt_flags)
++ {
++ 	struct mnt_namespace *ns = current->nsproxy->mnt_ns;
++ 	unsigned long s_iflags;
++ 
++ 	if (ns->user_ns == &init_user_ns)
++ 		return false;
++ 
++ 	/* Can this filesystem be too revealing? */
++ 	s_iflags = mnt->mnt_sb->s_iflags;
++ 	if (!(s_iflags & SB_I_USERNS_VISIBLE))
++ 		return false;
++ 
++ 	return !mnt_already_visible(ns, mnt, new_mnt_flags);
++ }
++ 
++ static struct ns_common *mntns_get(struct task_struct *task)
+++>>>>>>> 8654df4e2ac9 (mnt: Refactor fs_fully_visible into mount_too_revealing)
+  {
+ -	struct ns_common *ns = NULL;
+ +	struct mnt_namespace *ns = NULL;
+  	struct nsproxy *nsproxy;
+  
+  	task_lock(task);
+diff --cc fs/sysfs/mount.c
+index 59ee03fe48e1,f31e36994dfb..000000000000
+--- a/fs/sysfs/mount.c
++++ b/fs/sysfs/mount.c
+@@@ -23,121 -20,31 +23,134 @@@
+  
+  #include "sysfs.h"
+  
+ -static struct kernfs_root *sysfs_root;
+ -struct kernfs_node *sysfs_root_kn;
+  
+ -static struct dentry *sysfs_mount(struct file_system_type *fs_type,
+ -	int flags, const char *dev_name, void *data)
+ +struct kmem_cache *sysfs_dir_cachep;
+ +
+ +static const struct super_operations sysfs_ops = {
+ +	.statfs		= simple_statfs,
+ +	.drop_inode	= generic_delete_inode,
+ +	.evict_inode	= sysfs_evict_inode,
+ +};
+ +
+ +static struct sysfs_dirent sysfs_root = {
+ +	.s_name		= "",
+ +	.s_count	= ATOMIC_INIT(1),
+ +	.s_flags	= SYSFS_DIR | (KOBJ_NS_TYPE_NONE << SYSFS_NS_TYPE_SHIFT),
+ +	.s_mode		= S_IFDIR | S_IRUGO | S_IXUGO,
+ +	.s_ino		= 1,
+ +};
+ +
+ +struct sysfs_dirent *sysfs_root_sd = &sysfs_root;
+ +
+ +static int sysfs_fill_super(struct super_block *sb)
+  {
+ +	struct inode *inode;
+  	struct dentry *root;
+ -	void *ns;
+ -	bool new_sb;
+  
+ -	if (!(flags & MS_KERNMOUNT)) {
+ -		if (!kobj_ns_current_may_mount(KOBJ_NS_TYPE_NET))
+ -			return ERR_PTR(-EPERM);
+ +	sb->s_blocksize = PAGE_CACHE_SIZE;
+ +	sb->s_blocksize_bits = PAGE_CACHE_SHIFT;
+ +	sb->s_magic = SYSFS_MAGIC;
+ +	sb->s_op = &sysfs_ops;
+ +	sb->s_time_gran = 1;
+ +
+ +	/* get root inode, initialize and unlock it */
+ +	mutex_lock(&sysfs_mutex);
+ +	inode = sysfs_get_inode(sb, sysfs_root_sd);
+ +	mutex_unlock(&sysfs_mutex);
+ +	if (!inode) {
+ +		pr_debug("sysfs: could not get root inode\n");
+ +		return -ENOMEM;
+ +	}
+ +
+ +	/* instantiate and link root dentry */
+ +	root = d_make_root(inode);
+ +	if (!root) {
+ +		pr_debug("%s: could not get root dentry!\n",__func__);
+ +		return -ENOMEM;
+ +	}
+ +	root->d_fsdata = sysfs_root_sd;
+ +	sb->s_root = root;
+ +	sb->s_d_op = &sysfs_dentry_ops;
+ +	return 0;
+ +}
+ +
+ +static int sysfs_test_super(struct super_block *sb, void *data)
+ +{
+ +	struct sysfs_super_info *sb_info = sysfs_info(sb);
+ +	struct sysfs_super_info *info = data;
+ +	enum kobj_ns_type type;
+ +	int found = 1;
+ +
+ +	for (type = KOBJ_NS_TYPE_NONE; type < KOBJ_NS_TYPES; type++) {
+ +		if (sb_info->ns[type] != info->ns[type])
+ +			found = 0;
+ +	}
+ +	return found;
+ +}
+ +
+ +static int sysfs_set_super(struct super_block *sb, void *data)
+ +{
+ +	int error;
+ +	error = set_anon_super(sb, data);
+ +	if (!error)
+ +		sb->s_fs_info = data;
+ +	return error;
+ +}
+ +
+ +static void free_sysfs_super_info(struct sysfs_super_info *info)
+ +{
+ +	int type;
+ +	for (type = KOBJ_NS_TYPE_NONE; type < KOBJ_NS_TYPES; type++)
+ +		kobj_ns_drop(type, info->ns[type]);
+ +	kfree(info);
+ +}
+ +
+ +static struct dentry *sysfs_mount(struct file_system_type *fs_type,
+ +	int flags, const char *dev_name, void *data)
+ +{
+ +	struct sysfs_super_info *info;
+ +	enum kobj_ns_type type;
+ +	struct super_block *sb;
+ +	int error;
+ +
+ +	if (!(flags & MS_KERNMOUNT) && !current_user_ns()->may_mount_sysfs)
+ +		return ERR_PTR(-EPERM);
+ +
+ +	info = kzalloc(sizeof(*info), GFP_KERNEL);
+ +	if (!info)
+ +		return ERR_PTR(-ENOMEM);
+ +
+ +	for (type = KOBJ_NS_TYPE_NONE; type < KOBJ_NS_TYPES; type++)
+ +		info->ns[type] = kobj_ns_grab_current(type);
+ +
+ +	sb = sget(fs_type, sysfs_test_super, sysfs_set_super, flags, info);
+ +	if (IS_ERR(sb) || sb->s_fs_info != info)
+ +		free_sysfs_super_info(info);
+ +	if (IS_ERR(sb))
+ +		return ERR_CAST(sb);
+ +	if (!sb->s_root) {
+ +		error = sysfs_fill_super(sb);
+ +		if (error) {
+ +			deactivate_locked_super(sb);
+ +			return ERR_PTR(error);
+ +		}
+ +		sb->s_flags |= MS_ACTIVE;
+  	}
+  
+++<<<<<<< HEAD
+ +	return dget(sb->s_root);
+++=======
++ 	ns = kobj_ns_grab_current(KOBJ_NS_TYPE_NET);
++ 	root = kernfs_mount_ns(fs_type, flags, sysfs_root,
++ 				SYSFS_MAGIC, &new_sb, ns);
++ 	if (IS_ERR(root) || !new_sb)
++ 		kobj_ns_drop(KOBJ_NS_TYPE_NET, ns);
++ 	else if (new_sb)
++ 		/* Userspace would break if executables appear on sysfs */
++ 		root->d_sb->s_iflags |= SB_I_USERNS_VISIBLE | SB_I_NOEXEC;
++ 
++ 	return root;
+++>>>>>>> 8654df4e2ac9 (mnt: Refactor fs_fully_visible into mount_too_revealing)
+  }
+  
+  static void sysfs_kill_sb(struct super_block *sb)
+diff --cc include/linux/fs.h
+index ecd81bb56cab,71988dd3af95..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -1396,9 -1324,13 +1396,12 @@@ struct mm_struct
+  #define UMOUNT_NOFOLLOW	0x00000008	/* Don't follow symlink on umount */
+  #define UMOUNT_UNUSED	0x80000000	/* Flag guaranteed to be unused */
+  
+ -/* sb->s_iflags */
+ -#define SB_I_CGROUPWB	0x00000001	/* cgroup-aware writeback enabled */
+ -#define SB_I_NOEXEC	0x00000002	/* Ignore executables on this fs */
+ +extern struct list_head super_blocks;
+ +extern spinlock_t sb_lock;
+  
++ /* sb->s_iflags to limit user namespace mounts */
++ #define SB_I_USERNS_VISIBLE		0x00000010 /* fstype already mounted */
++ 
+  /* Possible states of 'frozen' field */
+  enum {
+  	SB_UNFROZEN = 0,		/* FS is unfrozen */
+@@@ -2094,14 -2014,7 +2097,17 @@@ struct file_system_type 
+  #define FS_HAS_SUBTYPE		4
+  #define FS_USERNS_MOUNT		8	/* Can be mounted by userns root */
+  #define FS_USERNS_DEV_MOUNT	16 /* A userns mount does not imply MNT_NODEV */
+++<<<<<<< HEAD
+ +#define FS_HAS_RM_XQUOTA	256	/* KABI: fs has the rm_xquota quota op */
+ +#define FS_HAS_INVALIDATE_RANGE	512	/* FS has new ->invalidatepage with length arg */
+ +#define FS_HAS_DIO_IODONE2	1024	/* KABI: fs supports new iodone */
+ +#define FS_HAS_NEXTDQBLK	2048	/* KABI: fs has the ->get_nextdqblk op */
+ +#define FS_HAS_DOPS_WRAPPER	4096	/* kabi: fs is using dentry_operations_wrapper. sb->s_d_op points to
+ +dentry_operations_wrapper */
+++=======
+++>>>>>>> 8654df4e2ac9 (mnt: Refactor fs_fully_visible into mount_too_revealing)
+  #define FS_RENAME_DOES_D_MOVE	32768	/* FS will handle d_move() during rename() internally. */
+ +#define FS_HAS_FO_EXTEND	65536 	/* fs is using the file_operations_extend struture */
+  	struct dentry *(*mount) (struct file_system_type *, int,
+  		       const char *, void *);
+  	void (*kill_sb) (struct super_block *);
+* Unmerged path fs/namespace.c
+diff --git a/fs/proc/inode.c b/fs/proc/inode.c
+index 8d35dac92daf..5677d03854ce 100644
+--- a/fs/proc/inode.c
++++ b/fs/proc/inode.c
+@@ -415,6 +415,7 @@ int proc_fill_super(struct super_block *s)
+ {
+ 	struct inode *root_inode;
+ 
++	s->s_iflags |= SB_I_USERNS_VISIBLE;
+ 	s->s_flags |= MS_NODIRATIME | MS_NOSUID | MS_NOEXEC;
+ 	s->s_blocksize = 1024;
+ 	s->s_blocksize_bits = 10;
+* Unmerged path fs/sysfs/mount.c
+* Unmerged path include/linux/fs.h
