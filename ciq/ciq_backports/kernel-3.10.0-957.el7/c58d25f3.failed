@@ -1,0 +1,156 @@
+sched/fair: Move record_wakee()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit c58d25f371f5e4b2dfbec3a7bd6f3c24dd79095b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/c58d25f3.failed
+
+Since I want to make ->task_woken() conditional on the task getting
+migrated, we cannot use it to call record_wakee().
+
+Move it to select_task_rq_fair(), which gets called in almost all the
+same conditions. The only exception is if the woken task (@p) is
+CPU-bound (as per the nr_cpus_allowed test in select_task_rq()).
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Andrew Hunter <ahh@google.com>
+	Cc: Ben Segall <bsegall@google.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Matt Fleming <matt@codeblueprint.co.uk>
+	Cc: Mike Galbraith <efault@gmx.de>
+	Cc: Mike Galbraith <umgwanakikbuti@gmail.com>
+	Cc: Morten Rasmussen <morten.rasmussen@arm.com>
+	Cc: Paul Turner <pjt@google.com>
+	Cc: Pavan Kondeti <pkondeti@codeaurora.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: byungchul.park@lge.com
+	Cc: linux-kernel@vger.kernel.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit c58d25f371f5e4b2dfbec3a7bd6f3c24dd79095b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+diff --cc kernel/sched/fair.c
+index a455c3157828,48633a1c3b46..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -4098,24 -4810,6 +4098,27 @@@ static unsigned long cpu_avg_load_per_t
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void record_wakee(struct task_struct *p)
+ +{
+ +	/*
+ +	 * Rough decay (wiping) for cost saving, don't worry
+ +	 * about the boundary, really active task won't care
+ +	 * about the loss.
+ +	 */
+ +	if (jiffies > current->wakee_flip_decay_ts + HZ) {
+ +		current->wakee_flips = 0;
+ +		current->wakee_flip_decay_ts = jiffies;
+ +	}
+ +
+ +	if (current->last_wakee != p) {
+ +		current->last_wakee = p;
+ +		current->wakee_flips++;
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> c58d25f371f5 (sched/fair: Move record_wakee())
+  static void task_waking_fair(struct task_struct *p)
+  {
+  	struct sched_entity *se = &p->se;
+@@@ -4253,26 -4946,51 +4255,63 @@@ static long effective_load(struct task_
+  
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ static void record_wakee(struct task_struct *p)
++ {
++ 	/*
++ 	 * Only decay a single time; tasks that have less then 1 wakeup per
++ 	 * jiffy will not have built up many flips.
++ 	 */
++ 	if (time_after(jiffies, current->wakee_flip_decay_ts + HZ)) {
++ 		current->wakee_flips >>= 1;
++ 		current->wakee_flip_decay_ts = jiffies;
++ 	}
++ 
++ 	if (current->last_wakee != p) {
++ 		current->last_wakee = p;
++ 		current->wakee_flips++;
++ 	}
++ }
++ 
++ /*
++  * Detect M:N waker/wakee relationships via a switching-frequency heuristic.
++  *
++  * A waker of many should wake a different task than the one last awakened
++  * at a frequency roughly N times higher than one of its wakees.
++  *
++  * In order to determine whether we should let the load spread vs consolidating
++  * to shared cache, we look for a minimum 'flip' frequency of llc_size in one
++  * partner, and a factor of lls_size higher frequency in the other.
++  *
++  * With both conditions met, we can be relatively sure that the relationship is
++  * non-monogamous, with partner count exceeding socket size.
++  *
++  * Waker/wakee being client/server, worker/dispatcher, interrupt source or
++  * whatever is irrelevant, spread criteria is apparent partner count exceeds
++  * socket size.
++  */
+++>>>>>>> c58d25f371f5 (sched/fair: Move record_wakee())
+  static int wake_wide(struct task_struct *p)
+  {
+ -	unsigned int master = current->wakee_flips;
+ -	unsigned int slave = p->wakee_flips;
+  	int factor = this_cpu_read(sd_llc_size);
+  
+ -	if (master < slave)
+ -		swap(master, slave);
+ -	if (slave < factor || master < slave * factor)
+ -		return 0;
+ -	return 1;
+ +	/*
+ +	 * Yeah, it's the switching-frequency, could means many wakee or
+ +	 * rapidly switch, use factor here will just help to automatically
+ +	 * adjust the loose-degree, so bigger node will lead to more pull.
+ +	 */
+ +	if (p->wakee_flips > factor) {
+ +		/*
+ +		 * wakee is somewhat hot, it needs certain amount of cpu
+ +		 * resource, so if waker is far more hot, prefer to leave
+ +		 * it alone.
+ +		 */
+ +		if (current->wakee_flips > (factor * p->wakee_flips))
+ +			return 1;
+ +	}
+ +
+ +	return 0;
+  }
+  
+  static int wake_affine(struct sched_domain *sd, struct task_struct *p, int sync)
+@@@ -4508,9 -5284,8 +4547,14 @@@ select_task_rq_fair(struct task_struct 
+  	int sync = wake_flags & WF_SYNC;
+  
+  	if (sd_flag & SD_BALANCE_WAKE) {
+++<<<<<<< HEAD
+ +		if (cpumask_test_cpu(cpu, tsk_cpus_allowed(p)))
+ +			want_affine = 1;
+ +		new_cpu = prev_cpu;
+++=======
++ 		record_wakee(p);
++ 		want_affine = !wake_wide(p) && cpumask_test_cpu(cpu, tsk_cpus_allowed(p));
+++>>>>>>> c58d25f371f5 (sched/fair: Move record_wakee())
+  	}
+  
+  	rcu_read_lock();
+* Unmerged path kernel/sched/fair.c
