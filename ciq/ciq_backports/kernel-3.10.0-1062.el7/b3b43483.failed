@@ -1,0 +1,337 @@
+RDMA/qedr: remove set but not used variable 'ctx'
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author YueHaibing <yuehaibing@huawei.com>
+commit b3b43483a26dbb7b05fce1c21f6807d299888617
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/b3b43483.failed
+
+Fixes gcc '-Wunused-but-set-variable' warning:
+
+drivers/infiniband/hw/qedr/verbs.c: In function 'qedr_create_srq':
+drivers/infiniband/hw/qedr/verbs.c:1450:24: warning:
+ variable 'ctx' set but not used [-Wunused-but-set-variable]
+
+	Signed-off-by: YueHaibing <yuehaibing@huawei.com>
+	Acked-by: Rahul Verma <rahul.verma@cavium.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit b3b43483a26dbb7b05fce1c21f6807d299888617)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/qedr/verbs.c
+diff --cc drivers/infiniband/hw/qedr/verbs.c
+index c505fbd86b17,9d4d165014d9..000000000000
+--- a/drivers/infiniband/hw/qedr/verbs.c
++++ b/drivers/infiniband/hw/qedr/verbs.c
+@@@ -1299,9 -1306,301 +1299,307 @@@ static void qedr_set_roce_db_info(struc
+  	qp->sq.db = dev->db_addr +
+  		    DB_ADDR_SHIFT(DQ_PWM_OFFSET_XCM_RDMA_SQ_PROD);
+  	qp->sq.db_data.data.icid = qp->icid + 1;
+++<<<<<<< HEAD
+ +	qp->rq.db = dev->db_addr +
+ +		    DB_ADDR_SHIFT(DQ_PWM_OFFSET_TCM_ROCE_RQ_PROD);
+ +	qp->rq.db_data.data.icid = qp->icid;
+++=======
++ 	if (!qp->srq) {
++ 		qp->rq.db = dev->db_addr +
++ 			    DB_ADDR_SHIFT(DQ_PWM_OFFSET_TCM_ROCE_RQ_PROD);
++ 		qp->rq.db_data.data.icid = qp->icid;
++ 	}
++ }
++ 
++ static int qedr_check_srq_params(struct ib_pd *ibpd, struct qedr_dev *dev,
++ 				 struct ib_srq_init_attr *attrs,
++ 				 struct ib_udata *udata)
++ {
++ 	struct qedr_device_attr *qattr = &dev->attr;
++ 
++ 	if (attrs->attr.max_wr > qattr->max_srq_wr) {
++ 		DP_ERR(dev,
++ 		       "create srq: unsupported srq_wr=0x%x requested (max_srq_wr=0x%x)\n",
++ 		       attrs->attr.max_wr, qattr->max_srq_wr);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (attrs->attr.max_sge > qattr->max_sge) {
++ 		DP_ERR(dev,
++ 		       "create srq: unsupported sge=0x%x requested (max_srq_sge=0x%x)\n",
++ 		       attrs->attr.max_sge, qattr->max_sge);
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void qedr_free_srq_user_params(struct qedr_srq *srq)
++ {
++ 	qedr_free_pbl(srq->dev, &srq->usrq.pbl_info, srq->usrq.pbl_tbl);
++ 	ib_umem_release(srq->usrq.umem);
++ 	ib_umem_release(srq->prod_umem);
++ }
++ 
++ static void qedr_free_srq_kernel_params(struct qedr_srq *srq)
++ {
++ 	struct qedr_srq_hwq_info *hw_srq = &srq->hw_srq;
++ 	struct qedr_dev *dev = srq->dev;
++ 
++ 	dev->ops->common->chain_free(dev->cdev, &hw_srq->pbl);
++ 
++ 	dma_free_coherent(&dev->pdev->dev, sizeof(struct rdma_srq_producers),
++ 			  hw_srq->virt_prod_pair_addr,
++ 			  hw_srq->phy_prod_pair_addr);
++ }
++ 
++ static int qedr_init_srq_user_params(struct ib_ucontext *ib_ctx,
++ 				     struct qedr_srq *srq,
++ 				     struct qedr_create_srq_ureq *ureq,
++ 				     int access, int dmasync)
++ {
++ 	struct scatterlist *sg;
++ 	int rc;
++ 
++ 	rc = qedr_init_user_queue(ib_ctx, srq->dev, &srq->usrq, ureq->srq_addr,
++ 				  ureq->srq_len, access, dmasync, 1);
++ 	if (rc)
++ 		return rc;
++ 
++ 	srq->prod_umem = ib_umem_get(ib_ctx, ureq->prod_pair_addr,
++ 				     sizeof(struct rdma_srq_producers),
++ 				     access, dmasync);
++ 	if (IS_ERR(srq->prod_umem)) {
++ 		qedr_free_pbl(srq->dev, &srq->usrq.pbl_info, srq->usrq.pbl_tbl);
++ 		ib_umem_release(srq->usrq.umem);
++ 		DP_ERR(srq->dev,
++ 		       "create srq: failed ib_umem_get for producer, got %ld\n",
++ 		       PTR_ERR(srq->prod_umem));
++ 		return PTR_ERR(srq->prod_umem);
++ 	}
++ 
++ 	sg = srq->prod_umem->sg_head.sgl;
++ 	srq->hw_srq.phy_prod_pair_addr = sg_dma_address(sg);
++ 
++ 	return 0;
++ }
++ 
++ static int qedr_alloc_srq_kernel_params(struct qedr_srq *srq,
++ 					struct qedr_dev *dev,
++ 					struct ib_srq_init_attr *init_attr)
++ {
++ 	struct qedr_srq_hwq_info *hw_srq = &srq->hw_srq;
++ 	dma_addr_t phy_prod_pair_addr;
++ 	u32 num_elems;
++ 	void *va;
++ 	int rc;
++ 
++ 	va = dma_alloc_coherent(&dev->pdev->dev,
++ 				sizeof(struct rdma_srq_producers),
++ 				&phy_prod_pair_addr, GFP_KERNEL);
++ 	if (!va) {
++ 		DP_ERR(dev,
++ 		       "create srq: failed to allocate dma memory for producer\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	hw_srq->phy_prod_pair_addr = phy_prod_pair_addr;
++ 	hw_srq->virt_prod_pair_addr = va;
++ 
++ 	num_elems = init_attr->attr.max_wr * RDMA_MAX_SRQ_WQE_SIZE;
++ 	rc = dev->ops->common->chain_alloc(dev->cdev,
++ 					   QED_CHAIN_USE_TO_CONSUME_PRODUCE,
++ 					   QED_CHAIN_MODE_PBL,
++ 					   QED_CHAIN_CNT_TYPE_U32,
++ 					   num_elems,
++ 					   QEDR_SRQ_WQE_ELEM_SIZE,
++ 					   &hw_srq->pbl, NULL);
++ 	if (rc)
++ 		goto err0;
++ 
++ 	hw_srq->num_elems = num_elems;
++ 
++ 	return 0;
++ 
++ err0:
++ 	dma_free_coherent(&dev->pdev->dev, sizeof(struct rdma_srq_producers),
++ 			  va, phy_prod_pair_addr);
++ 	return rc;
++ }
++ 
++ static int qedr_idr_add(struct qedr_dev *dev, struct qedr_idr *qidr,
++ 			void *ptr, u32 id);
++ static void qedr_idr_remove(struct qedr_dev *dev,
++ 			    struct qedr_idr *qidr, u32 id);
++ 
++ struct ib_srq *qedr_create_srq(struct ib_pd *ibpd,
++ 			       struct ib_srq_init_attr *init_attr,
++ 			       struct ib_udata *udata)
++ {
++ 	struct qed_rdma_destroy_srq_in_params destroy_in_params;
++ 	struct qed_rdma_create_srq_in_params in_params = {};
++ 	struct qedr_dev *dev = get_qedr_dev(ibpd->device);
++ 	struct qed_rdma_create_srq_out_params out_params;
++ 	struct qedr_pd *pd = get_qedr_pd(ibpd);
++ 	struct qedr_create_srq_ureq ureq = {};
++ 	u64 pbl_base_addr, phy_prod_pair_addr;
++ 	struct ib_ucontext *ib_ctx = NULL;
++ 	struct qedr_srq_hwq_info *hw_srq;
++ 	u32 page_cnt, page_size;
++ 	struct qedr_srq *srq;
++ 	int rc = 0;
++ 
++ 	DP_DEBUG(dev, QEDR_MSG_QP,
++ 		 "create SRQ called from %s (pd %p)\n",
++ 		 (udata) ? "User lib" : "kernel", pd);
++ 
++ 	rc = qedr_check_srq_params(ibpd, dev, init_attr, udata);
++ 	if (rc)
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	srq = kzalloc(sizeof(*srq), GFP_KERNEL);
++ 	if (!srq)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	srq->dev = dev;
++ 	hw_srq = &srq->hw_srq;
++ 	spin_lock_init(&srq->lock);
++ 
++ 	hw_srq->max_wr = init_attr->attr.max_wr;
++ 	hw_srq->max_sges = init_attr->attr.max_sge;
++ 
++ 	if (udata && ibpd->uobject && ibpd->uobject->context) {
++ 		ib_ctx = ibpd->uobject->context;
++ 
++ 		if (ib_copy_from_udata(&ureq, udata, sizeof(ureq))) {
++ 			DP_ERR(dev,
++ 			       "create srq: problem copying data from user space\n");
++ 			goto err0;
++ 		}
++ 
++ 		rc = qedr_init_srq_user_params(ib_ctx, srq, &ureq, 0, 0);
++ 		if (rc)
++ 			goto err0;
++ 
++ 		page_cnt = srq->usrq.pbl_info.num_pbes;
++ 		pbl_base_addr = srq->usrq.pbl_tbl->pa;
++ 		phy_prod_pair_addr = hw_srq->phy_prod_pair_addr;
++ 		page_size = BIT(srq->usrq.umem->page_shift);
++ 	} else {
++ 		struct qed_chain *pbl;
++ 
++ 		rc = qedr_alloc_srq_kernel_params(srq, dev, init_attr);
++ 		if (rc)
++ 			goto err0;
++ 
++ 		pbl = &hw_srq->pbl;
++ 		page_cnt = qed_chain_get_page_cnt(pbl);
++ 		pbl_base_addr = qed_chain_get_pbl_phys(pbl);
++ 		phy_prod_pair_addr = hw_srq->phy_prod_pair_addr;
++ 		page_size = QED_CHAIN_PAGE_SIZE;
++ 	}
++ 
++ 	in_params.pd_id = pd->pd_id;
++ 	in_params.pbl_base_addr = pbl_base_addr;
++ 	in_params.prod_pair_addr = phy_prod_pair_addr;
++ 	in_params.num_pages = page_cnt;
++ 	in_params.page_size = page_size;
++ 
++ 	rc = dev->ops->rdma_create_srq(dev->rdma_ctx, &in_params, &out_params);
++ 	if (rc)
++ 		goto err1;
++ 
++ 	srq->srq_id = out_params.srq_id;
++ 
++ 	if (udata) {
++ 		rc = qedr_copy_srq_uresp(dev, srq, udata);
++ 		if (rc)
++ 			goto err2;
++ 	}
++ 
++ 	rc = qedr_idr_add(dev, &dev->srqidr, srq, srq->srq_id);
++ 	if (rc)
++ 		goto err2;
++ 
++ 	DP_DEBUG(dev, QEDR_MSG_SRQ,
++ 		 "create srq: created srq with srq_id=0x%0x\n", srq->srq_id);
++ 	return &srq->ibsrq;
++ 
++ err2:
++ 	destroy_in_params.srq_id = srq->srq_id;
++ 
++ 	dev->ops->rdma_destroy_srq(dev->rdma_ctx, &destroy_in_params);
++ err1:
++ 	if (udata)
++ 		qedr_free_srq_user_params(srq);
++ 	else
++ 		qedr_free_srq_kernel_params(srq);
++ err0:
++ 	kfree(srq);
++ 
++ 	return ERR_PTR(-EFAULT);
++ }
++ 
++ int qedr_destroy_srq(struct ib_srq *ibsrq)
++ {
++ 	struct qed_rdma_destroy_srq_in_params in_params = {};
++ 	struct qedr_dev *dev = get_qedr_dev(ibsrq->device);
++ 	struct qedr_srq *srq = get_qedr_srq(ibsrq);
++ 
++ 	qedr_idr_remove(dev, &dev->srqidr, srq->srq_id);
++ 	in_params.srq_id = srq->srq_id;
++ 	dev->ops->rdma_destroy_srq(dev->rdma_ctx, &in_params);
++ 
++ 	if (ibsrq->pd->uobject)
++ 		qedr_free_srq_user_params(srq);
++ 	else
++ 		qedr_free_srq_kernel_params(srq);
++ 
++ 	DP_DEBUG(dev, QEDR_MSG_SRQ,
++ 		 "destroy srq: destroyed srq with srq_id=0x%0x\n",
++ 		 srq->srq_id);
++ 	kfree(srq);
++ 
++ 	return 0;
++ }
++ 
++ int qedr_modify_srq(struct ib_srq *ibsrq, struct ib_srq_attr *attr,
++ 		    enum ib_srq_attr_mask attr_mask, struct ib_udata *udata)
++ {
++ 	struct qed_rdma_modify_srq_in_params in_params = {};
++ 	struct qedr_dev *dev = get_qedr_dev(ibsrq->device);
++ 	struct qedr_srq *srq = get_qedr_srq(ibsrq);
++ 	int rc;
++ 
++ 	if (attr_mask & IB_SRQ_MAX_WR) {
++ 		DP_ERR(dev,
++ 		       "modify srq: invalid attribute mask=0x%x specified for %p\n",
++ 		       attr_mask, srq);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (attr_mask & IB_SRQ_LIMIT) {
++ 		if (attr->srq_limit >= srq->hw_srq.max_wr) {
++ 			DP_ERR(dev,
++ 			       "modify srq: invalid srq_limit=0x%x (max_srq_limit=0x%x)\n",
++ 			       attr->srq_limit, srq->hw_srq.max_wr);
++ 			return -EINVAL;
++ 		}
++ 
++ 		in_params.srq_id = srq->srq_id;
++ 		in_params.wqe_limit = attr->srq_limit;
++ 		rc = dev->ops->rdma_modify_srq(dev->rdma_ctx, &in_params);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 
++ 	srq->srq_limit = attr->srq_limit;
++ 
++ 	DP_DEBUG(dev, QEDR_MSG_SRQ,
++ 		 "modify srq: modified srq with srq_id=0x%0x\n", srq->srq_id);
++ 
++ 	return 0;
+++>>>>>>> b3b43483a26d (RDMA/qedr: remove set but not used variable 'ctx')
+  }
+  
+  static inline void
+* Unmerged path drivers/infiniband/hw/qedr/verbs.c
