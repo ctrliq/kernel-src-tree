@@ -289,6 +289,7 @@ struct ahci_em_priv {
 	unsigned long saved_activity;
 	unsigned long activity;
 	unsigned long led_state;
+	struct ata_link *link;
 };
 
 struct ahci_port_priv {
