@@ -1,0 +1,185 @@
+amd-xgbe: Fix napi Rx budget accounting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit 55ca6bcd733b739d5667d48d7591899f376dcfb8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/55ca6bcd.failed
+
+Currently the amd-xgbe driver increments the packets processed counter
+each time a descriptor is processed.  Since a packet can be represented
+by more than one descriptor incrementing the counter in this way is not
+appropriate.  Also, since multiple descriptors cause the budget check
+to be short circuited, sometimes the returned value from the poll
+function would be larger than the budget value resulting in a WARN_ONCE
+being triggered.
+
+Update the polling logic to properly account for the number of packets
+processed and exit when the budget value is reached.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 55ca6bcd733b739d5667d48d7591899f376dcfb8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index 6baf601c4282,2349ea970255..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@@ -1160,9 -1595,11 +1160,17 @@@ static int xgbe_rx_poll(struct xgbe_cha
+  	struct xgbe_packet_data *packet;
+  	struct net_device *netdev = pdata->netdev;
+  	struct sk_buff *skb;
+++<<<<<<< HEAD
+ +	unsigned int incomplete, error;
+ +	unsigned int cur_len, put_len, max_len;
+ +	int received = 0;
+++=======
++ 	struct skb_shared_hwtstamps *hwtstamps;
++ 	unsigned int incomplete, error, context_next, context;
++ 	unsigned int len, put_len, max_len;
++ 	unsigned int received = 0;
++ 	int packet_count = 0;
+++>>>>>>> 55ca6bcd733b (amd-xgbe: Fix napi Rx budget accounting)
+  
+  	DBGPR("-->xgbe_rx_poll: budget=%d\n", budget);
+  
+@@@ -1170,17 -1607,30 +1178,17 @@@
+  	if (!ring)
+  		return 0;
+  
+ -	rdata = XGBE_GET_DESC_DATA(ring, ring->cur);
+  	packet = &ring->packet_data;
+- 	while (received < budget) {
++ 	while (packet_count < budget) {
+  		DBGPR("  cur = %d\n", ring->cur);
+  
+ -		/* First time in loop see if we need to restore state */
+ -		if (!received && rdata->state_saved) {
+ -			incomplete = rdata->state.incomplete;
+ -			context_next = rdata->state.context_next;
+ -			skb = rdata->state.skb;
+ -			error = rdata->state.error;
+ -			len = rdata->state.len;
+ -		} else {
+ -			memset(packet, 0, sizeof(*packet));
+ -			incomplete = 0;
+ -			context_next = 0;
+ -			skb = NULL;
+ -			error = 0;
+ -			len = 0;
+ -		}
+ +		/* Clear the packet data information */
+ +		memset(packet, 0, sizeof(*packet));
+ +		skb = NULL;
+ +		error = 0;
+ +		cur_len = 0;
+  
+  read_again:
+ -		rdata = XGBE_GET_DESC_DATA(ring, ring->cur);
+ -
+  		if (ring->dirty > (XGBE_RX_DESC_CNT >> 3))
+  			xgbe_rx_refresh(channel);
+  
+@@@ -1209,33 -1663,40 +1217,56 @@@
+  			if (packet->errors)
+  				DBGPR("Error in received packet\n");
+  			dev_kfree_skb(skb);
+- 			continue;
++ 			goto next_packet;
+  		}
+  
+++<<<<<<< HEAD
+ +		put_len = rdata->len - cur_len;
+ +		if (skb) {
+ +			if (pskb_expand_head(skb, 0, put_len, GFP_ATOMIC)) {
+ +				DBGPR("pskb_expand_head error\n");
+ +				if (incomplete) {
+ +					error = 1;
+ +					goto read_again;
+++=======
++ 		if (!context) {
++ 			put_len = rdata->len - len;
++ 			if (skb) {
++ 				if (pskb_expand_head(skb, 0, put_len,
++ 						     GFP_ATOMIC)) {
++ 					DBGPR("pskb_expand_head error\n");
++ 					if (incomplete) {
++ 						error = 1;
++ 						goto read_again;
++ 					}
++ 
++ 					dev_kfree_skb(skb);
++ 					goto next_packet;
+++>>>>>>> 55ca6bcd733b (amd-xgbe: Fix napi Rx budget accounting)
+  				}
+ -				memcpy(skb_tail_pointer(skb), rdata->skb->data,
+ -				       put_len);
+ -			} else {
+ -				skb = rdata->skb;
+ -				rdata->skb = NULL;
+ +
+ +				dev_kfree_skb(skb);
+ +				continue;
+  			}
+ -			skb_put(skb, put_len);
+ -			len += put_len;
+ +			memcpy(skb_tail_pointer(skb), rdata->skb->data,
+ +			       put_len);
+ +		} else {
+ +			skb = rdata->skb;
+ +			rdata->skb = NULL;
+  		}
+ +		skb_put(skb, put_len);
+ +		cur_len += put_len;
+  
+ -		if (incomplete || context_next)
+ +		if (incomplete)
+  			goto read_again;
+  
+++<<<<<<< HEAD
+++=======
++ 		/* Stray Context Descriptor? */
++ 		if (!skb)
++ 			goto next_packet;
++ 
+++>>>>>>> 55ca6bcd733b (amd-xgbe: Fix napi Rx budget accounting)
+  		/* Be sure we don't exceed the configured MTU */
+  		max_len = netdev->mtu + ETH_HLEN;
+  		if (!(netdev->features & NETIF_F_HW_VLAN_CTAG_RX) &&
+@@@ -1269,11 -1740,25 +1300,29 @@@
+  
+  		netdev->last_rx = jiffies;
+  		napi_gro_receive(&pdata->napi, skb);
++ 
++ next_packet:
++ 		packet_count++;
+  	}
+  
+++<<<<<<< HEAD
+ +	DBGPR("<--xgbe_rx_poll: received = %d\n", received);
+++=======
++ 	/* Check if we need to save state before leaving */
++ 	if (received && (incomplete || context_next)) {
++ 		rdata = XGBE_GET_DESC_DATA(ring, ring->cur);
++ 		rdata->state_saved = 1;
++ 		rdata->state.incomplete = incomplete;
++ 		rdata->state.context_next = context_next;
++ 		rdata->state.skb = skb;
++ 		rdata->state.len = len;
++ 		rdata->state.error = error;
++ 	}
++ 
++ 	DBGPR("<--xgbe_rx_poll: packet_count = %d\n", packet_count);
+++>>>>>>> 55ca6bcd733b (amd-xgbe: Fix napi Rx budget accounting)
+  
+- 	return received;
++ 	return packet_count;
+  }
+  
+  static int xgbe_poll(struct napi_struct *napi, int budget)
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-drv.c
