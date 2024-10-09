@@ -1,0 +1,320 @@
+netfilter: add missing error handling code for register functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Taehee Yoo <ap420073@gmail.com>
+commit 584eab291c67894cb17cc87544b9d086228ea70f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/584eab29.failed
+
+register_{netdevice/inetaddr/inet6addr}_notifier may return an error
+value, this patch adds the code to handle these error paths.
+
+	Signed-off-by: Taehee Yoo <ap420073@gmail.com>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 584eab291c67894cb17cc87544b9d086228ea70f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/netfilter/nf_nat_masquerade_ipv4.c
+#	net/ipv6/netfilter/nf_nat_masquerade_ipv6.c
+#	net/netfilter/nft_flow_offload.c
+diff --cc net/ipv4/netfilter/nf_nat_masquerade_ipv4.c
+index 9811b21304dd,c7d7fa4fc369..000000000000
+--- a/net/ipv4/netfilter/nf_nat_masquerade_ipv4.c
++++ b/net/ipv4/netfilter/nf_nat_masquerade_ipv4.c
+@@@ -133,16 -149,29 +133,33 @@@ static struct notifier_block masq_inet_
+  
+  static atomic_t masquerade_notifier_refcount = ATOMIC_INIT(0);
+  
+- void nf_nat_masquerade_ipv4_register_notifier(void)
++ int nf_nat_masquerade_ipv4_register_notifier(void)
+  {
++ 	int ret;
++ 
+  	/* check if the notifier was already set */
+  	if (atomic_inc_return(&masquerade_notifier_refcount) > 1)
+- 		return;
++ 		return 0;
+  
+  	/* Register for device down reports */
+++<<<<<<< HEAD
+ +	register_netdevice_notifier_rh(&masq_dev_notifier);
+++=======
++ 	ret = register_netdevice_notifier(&masq_dev_notifier);
++ 	if (ret)
++ 		goto err_dec;
+++>>>>>>> 584eab291c67 (netfilter: add missing error handling code for register functions)
+  	/* Register IP address change reports */
+- 	register_inetaddr_notifier(&masq_inet_notifier);
++ 	ret = register_inetaddr_notifier(&masq_inet_notifier);
++ 	if (ret)
++ 		goto err_unregister;
++ 
++ 	return ret;
++ err_unregister:
++ 	unregister_netdevice_notifier(&masq_dev_notifier);
++ err_dec:
++ 	atomic_dec(&masquerade_notifier_refcount);
++ 	return ret;
+  }
+  EXPORT_SYMBOL_GPL(nf_nat_masquerade_ipv4_register_notifier);
+  
+diff --cc net/ipv6/netfilter/nf_nat_masquerade_ipv6.c
+index 1411f281e473,7afd1e63d2db..000000000000
+--- a/net/ipv6/netfilter/nf_nat_masquerade_ipv6.c
++++ b/net/ipv6/netfilter/nf_nat_masquerade_ipv6.c
+@@@ -78,30 -84,121 +78,102 @@@ static struct notifier_block masq_dev_n
+  	.notifier_call	= masq_device_event,
+  };
+  
+++<<<<<<< HEAD
+ +static int masq_inet_event(struct notifier_block *this,
+ +			   unsigned long event, void *ptr)
+++=======
++ struct masq_dev_work {
++ 	struct work_struct work;
++ 	struct net *net;
++ 	struct in6_addr addr;
++ 	int ifindex;
++ };
++ 
++ static int inet_cmp(struct nf_conn *ct, void *work)
++ {
++ 	struct masq_dev_work *w = (struct masq_dev_work *)work;
++ 	struct nf_conntrack_tuple *tuple;
++ 
++ 	if (!device_cmp(ct, (void *)(long)w->ifindex))
++ 		return 0;
++ 
++ 	tuple = &ct->tuplehash[IP_CT_DIR_REPLY].tuple;
++ 
++ 	return ipv6_addr_equal(&w->addr, &tuple->dst.u3.in6);
++ }
++ 
++ static void iterate_cleanup_work(struct work_struct *work)
++ {
++ 	struct masq_dev_work *w;
++ 
++ 	w = container_of(work, struct masq_dev_work, work);
++ 
++ 	nf_ct_iterate_cleanup_net(w->net, inet_cmp, (void *)w, 0, 0);
++ 
++ 	put_net(w->net);
++ 	kfree(w);
++ 	atomic_dec(&v6_worker_count);
++ 	module_put(THIS_MODULE);
++ }
++ 
++ /* ipv6 inet notifier is an atomic notifier, i.e. we cannot
++  * schedule.
++  *
++  * Unfortunately, nf_ct_iterate_cleanup_net can run for a long
++  * time if there are lots of conntracks and the system
++  * handles high softirq load, so it frequently calls cond_resched
++  * while iterating the conntrack table.
++  *
++  * So we defer nf_ct_iterate_cleanup_net walk to the system workqueue.
++  *
++  * As we can have 'a lot' of inet_events (depending on amount
++  * of ipv6 addresses being deleted), we also need to add an upper
++  * limit to the number of queued work items.
++  */
++ static int masq_inet6_event(struct notifier_block *this,
++ 			    unsigned long event, void *ptr)
+++>>>>>>> 584eab291c67 (netfilter: add missing error handling code for register functions)
+  {
+  	struct inet6_ifaddr *ifa = ptr;
+ -	const struct net_device *dev;
+ -	struct masq_dev_work *w;
+ -	struct net *net;
+ -
+ -	if (event != NETDEV_DOWN ||
+ -	    atomic_read(&v6_worker_count) >= MAX_WORK_COUNT)
+ -		return NOTIFY_DONE;
+ -
+ -	dev = ifa->idev->dev;
+ -	net = maybe_get_net(dev_net(dev));
+ -	if (!net)
+ -		return NOTIFY_DONE;
+ -
+ -	if (!try_module_get(THIS_MODULE))
+ -		goto err_module;
+ +	struct netdev_notifier_info info;
+  
+ -	w = kmalloc(sizeof(*w), GFP_ATOMIC);
+ -	if (w) {
+ -		atomic_inc(&v6_worker_count);
+ -
+ -		INIT_WORK(&w->work, iterate_cleanup_work);
+ -		w->ifindex = dev->ifindex;
+ -		w->net = net;
+ -		w->addr = ifa->addr;
+ -		schedule_work(&w->work);
+ -
+ -		return NOTIFY_DONE;
+ -	}
+ -
+ -	module_put(THIS_MODULE);
+ - err_module:
+ -	put_net(net);
+ -	return NOTIFY_DONE;
+ +	netdev_notifier_info_init(&info, ifa->idev->dev);
+ +	return masq_device_event(this, event, &info);
+  }
+  
+- static struct notifier_block masq_inet_notifier = {
+- 	.notifier_call	= masq_inet_event,
++ static struct notifier_block masq_inet6_notifier = {
++ 	.notifier_call	= masq_inet6_event,
+  };
+  
+  static atomic_t masquerade_notifier_refcount = ATOMIC_INIT(0);
+  
+- void nf_nat_masquerade_ipv6_register_notifier(void)
++ int nf_nat_masquerade_ipv6_register_notifier(void)
+  {
++ 	int ret;
++ 
+  	/* check if the notifier is already set */
+  	if (atomic_inc_return(&masquerade_notifier_refcount) > 1)
+- 		return;
++ 		return 0;
+  
+++<<<<<<< HEAD
+ +	register_netdevice_notifier_rh(&masq_dev_notifier);
+ +	register_inet6addr_notifier(&masq_inet_notifier);
+++=======
++ 	ret = register_netdevice_notifier(&masq_dev_notifier);
++ 	if (ret)
++ 		goto err_dec;
++ 
++ 	ret = register_inet6addr_notifier(&masq_inet6_notifier);
++ 	if (ret)
++ 		goto err_unregister;
++ 
++ 	return ret;
++ err_unregister:
++ 	unregister_netdevice_notifier(&masq_dev_notifier);
++ err_dec:
++ 	atomic_dec(&masquerade_notifier_refcount);
++ 	return ret;
+++>>>>>>> 584eab291c67 (netfilter: add missing error handling code for register functions)
+  }
+  EXPORT_SYMBOL_GPL(nf_nat_masquerade_ipv6_register_notifier);
+  
+@@@ -111,10 -208,7 +183,15 @@@ void nf_nat_masquerade_ipv6_unregister_
+  	if (atomic_dec_return(&masquerade_notifier_refcount) > 0)
+  		return;
+  
+++<<<<<<< HEAD
+ +	unregister_inet6addr_notifier(&masq_inet_notifier);
+ +	unregister_netdevice_notifier_rh(&masq_dev_notifier);
+++=======
++ 	unregister_inet6addr_notifier(&masq_inet6_notifier);
++ 	unregister_netdevice_notifier(&masq_dev_notifier);
+++>>>>>>> 584eab291c67 (netfilter: add missing error handling code for register functions)
+  }
+  EXPORT_SYMBOL_GPL(nf_nat_masquerade_ipv6_unregister_notifier);
+ +
+ +MODULE_LICENSE("GPL");
+ +MODULE_AUTHOR("Patrick McHardy <kaber@trash.net>");
+* Unmerged path net/netfilter/nft_flow_offload.c
+diff --git a/include/net/netfilter/ipv4/nf_nat_masquerade.h b/include/net/netfilter/ipv4/nf_nat_masquerade.h
+index a9c001c646da..b9b7035b2ca4 100644
+--- a/include/net/netfilter/ipv4/nf_nat_masquerade.h
++++ b/include/net/netfilter/ipv4/nf_nat_masquerade.h
+@@ -8,7 +8,7 @@ nf_nat_masquerade_ipv4(struct sk_buff *skb, unsigned int hooknum,
+ 		       const struct nf_nat_range *range,
+ 		       const struct net_device *out);
+ 
+-void nf_nat_masquerade_ipv4_register_notifier(void);
++int nf_nat_masquerade_ipv4_register_notifier(void);
+ void nf_nat_masquerade_ipv4_unregister_notifier(void);
+ 
+ #endif /*_NF_NAT_MASQUERADE_IPV4_H_ */
+diff --git a/include/net/netfilter/ipv6/nf_nat_masquerade.h b/include/net/netfilter/ipv6/nf_nat_masquerade.h
+index 0a13396cd390..1296b8dbe09e 100644
+--- a/include/net/netfilter/ipv6/nf_nat_masquerade.h
++++ b/include/net/netfilter/ipv6/nf_nat_masquerade.h
+@@ -4,7 +4,7 @@
+ unsigned int
+ nf_nat_masquerade_ipv6(struct sk_buff *skb, const struct nf_nat_range *range,
+ 		       const struct net_device *out);
+-void nf_nat_masquerade_ipv6_register_notifier(void);
++int nf_nat_masquerade_ipv6_register_notifier(void);
+ void nf_nat_masquerade_ipv6_unregister_notifier(void);
+ 
+ #endif /* _NF_NAT_MASQUERADE_IPV6_H_ */
+diff --git a/net/ipv4/netfilter/ipt_MASQUERADE.c b/net/ipv4/netfilter/ipt_MASQUERADE.c
+index da7f02a0b868..f91afc5fa02b 100644
+--- a/net/ipv4/netfilter/ipt_MASQUERADE.c
++++ b/net/ipv4/netfilter/ipt_MASQUERADE.c
+@@ -74,9 +74,12 @@ static int __init masquerade_tg_init(void)
+ 	int ret;
+ 
+ 	ret = xt_register_target(&masquerade_tg_reg);
++	if (ret)
++		return ret;
+ 
+-	if (ret == 0)
+-		nf_nat_masquerade_ipv4_register_notifier();
++	ret = nf_nat_masquerade_ipv4_register_notifier();
++	if (ret)
++		xt_unregister_target(&masquerade_tg_reg);
+ 
+ 	return ret;
+ }
+* Unmerged path net/ipv4/netfilter/nf_nat_masquerade_ipv4.c
+diff --git a/net/ipv4/netfilter/nft_masq_ipv4.c b/net/ipv4/netfilter/nft_masq_ipv4.c
+index dc3628a396ec..ad1148fbc8b3 100644
+--- a/net/ipv4/netfilter/nft_masq_ipv4.c
++++ b/net/ipv4/netfilter/nft_masq_ipv4.c
+@@ -62,7 +62,9 @@ static int __init nft_masq_ipv4_module_init(void)
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	nf_nat_masquerade_ipv4_register_notifier();
++	ret = nf_nat_masquerade_ipv4_register_notifier();
++	if (ret)
++		nft_unregister_expr(&nft_masq_ipv4_type);
+ 
+ 	return ret;
+ }
+diff --git a/net/ipv6/netfilter/ip6t_MASQUERADE.c b/net/ipv6/netfilter/ip6t_MASQUERADE.c
+index 7f9f45d829d2..4caef836ce67 100644
+--- a/net/ipv6/netfilter/ip6t_MASQUERADE.c
++++ b/net/ipv6/netfilter/ip6t_MASQUERADE.c
+@@ -52,8 +52,12 @@ static int __init masquerade_tg6_init(void)
+ 	int err;
+ 
+ 	err = xt_register_target(&masquerade_tg6_reg);
+-	if (err == 0)
+-		nf_nat_masquerade_ipv6_register_notifier();
++	if (err)
++		return err;
++
++	err = nf_nat_masquerade_ipv6_register_notifier();
++	if (err)
++		xt_unregister_target(&masquerade_tg6_reg);
+ 
+ 	return err;
+ }
+* Unmerged path net/ipv6/netfilter/nf_nat_masquerade_ipv6.c
+diff --git a/net/ipv6/netfilter/nft_masq_ipv6.c b/net/ipv6/netfilter/nft_masq_ipv6.c
+index b74a420050c4..c7a092c88d12 100644
+--- a/net/ipv6/netfilter/nft_masq_ipv6.c
++++ b/net/ipv6/netfilter/nft_masq_ipv6.c
+@@ -62,7 +62,9 @@ static int __init nft_masq_ipv6_module_init(void)
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	nf_nat_masquerade_ipv6_register_notifier();
++	ret = nf_nat_masquerade_ipv6_register_notifier();
++	if (ret)
++		nft_unregister_expr(&nft_masq_ipv6_type);
+ 
+ 	return ret;
+ }
+* Unmerged path net/netfilter/nft_flow_offload.c
