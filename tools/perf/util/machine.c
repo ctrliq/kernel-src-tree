@@ -411,8 +411,8 @@ out_err:
  * the full rbtree:
  */
 static struct thread*
-threads__get_last_match(struct threads *threads, struct machine *machine,
-			int pid, int tid)
+__threads__get_last_match(struct threads *threads, struct machine *machine,
+			  int pid, int tid)
 {
 	struct thread *th;
 
@@ -429,10 +429,29 @@ threads__get_last_match(struct threads *threads, struct machine *machine,
 	return NULL;
 }
 
+static struct thread*
+threads__get_last_match(struct threads *threads, struct machine *machine,
+			int pid, int tid)
+{
+	struct thread *th = NULL;
+
+	if (perf_singlethreaded)
+		th = __threads__get_last_match(threads, machine, pid, tid);
+
+	return th;
+}
+
+static void
+__threads__set_last_match(struct threads *threads, struct thread *th)
+{
+	threads->last_match = th;
+}
+
 static void
 threads__set_last_match(struct threads *threads, struct thread *th)
 {
-	threads->last_match = th;
+	if (perf_singlethreaded)
+		__threads__set_last_match(threads, th);
 }
 
 /*
