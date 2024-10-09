@@ -1,0 +1,141 @@
+act_mirred: fix a race condition on mirred_list
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] sched: act_mirred: fix a race condition on mirred_list (Ivan Vecera) [1420506]
+Rebuild_FUZZ: 93.07%
+commit-author WANG Cong <xiyou.wangcong@gmail.com>
+commit 6bd00b850635abb0044e06101761533c8beba79c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/6bd00b85.failed
+
+After commit 1ce87720d456 ("net: sched: make cls_u32 lockless")
+we began to release tc actions in a RCU callback. However,
+mirred action relies on RTNL lock to protect the global
+mirred_list, therefore we could have a race condition
+between RCU callback and netdevice event, which caused
+a list corruption as reported by Vinson.
+
+Instead of relying on RTNL lock, introduce a spinlock to
+protect this list.
+
+Note, in non-bind case, it is still called with RTNL lock,
+therefore should disable BH too.
+
+	Reported-by: Vinson Lee <vlee@twopensource.com>
+	Cc: John Fastabend <john.fastabend@gmail.com>
+	Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: Cong Wang <cwang@twopensource.com>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6bd00b850635abb0044e06101761533c8beba79c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_mirred.c
+diff --cc net/sched/act_mirred.c
+index 3ff85aed0e67,3e7c51a8ca38..000000000000
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@@ -30,32 -30,20 +30,42 @@@
+  #include <linux/if_arp.h>
+  
+  #define MIRRED_TAB_MASK     7
+ +static struct tcf_common *tcf_mirred_ht[MIRRED_TAB_MASK + 1];
+ +static u32 mirred_idx_gen;
+ +static DEFINE_RWLOCK(mirred_lock);
+  static LIST_HEAD(mirred_list);
++ static DEFINE_SPINLOCK(mirred_list_lock);
+  
+ -static void tcf_mirred_release(struct tc_action *a, int bind)
+ -{
+ -	struct tcf_mirred *m = to_mirred(a);
+ -	struct net_device *dev = rcu_dereference_protected(m->tcfm_dev, 1);
+ +static struct tcf_hashinfo mirred_hash_info = {
+ +	.htab	=	tcf_mirred_ht,
+ +	.hmask	=	MIRRED_TAB_MASK,
+ +	.lock	=	&mirred_lock,
+ +};
+  
+++<<<<<<< HEAD
+ +static int tcf_mirred_release(struct tcf_mirred *m, int bind)
+ +{
+ +	if (m) {
+ +		if (bind)
+ +			m->tcf_bindcnt--;
+ +		m->tcf_refcnt--;
+ +		if (!m->tcf_bindcnt && m->tcf_refcnt <= 0) {
+ +			list_del(&m->tcfm_list);
+ +			if (m->tcfm_dev)
+ +				dev_put(m->tcfm_dev);
+ +			tcf_hash_destroy(&m->common, &mirred_hash_info);
+ +			return 1;
+ +		}
+ +	}
+ +	return 0;
+++=======
++ 	/* We could be called either in a RCU callback or with RTNL lock held. */
++ 	spin_lock_bh(&mirred_list_lock);
++ 	list_del(&m->tcfm_list);
++ 	spin_unlock_bh(&mirred_list_lock);
++ 	if (dev)
++ 		dev_put(dev);
+++>>>>>>> 6bd00b850635 (act_mirred: fix a race condition on mirred_list)
+  }
+  
+  static const struct nla_policy mirred_policy[TCA_MIRRED_MAX + 1] = {
+@@@ -132,15 -120,17 +142,21 @@@ static int tcf_mirred_init(struct net *
+  	if (dev != NULL) {
+  		m->tcfm_ifindex = parm->ifindex;
+  		if (ret != ACT_P_CREATED)
+ -			dev_put(rcu_dereference_protected(m->tcfm_dev, 1));
+ +			dev_put(m->tcfm_dev);
+  		dev_hold(dev);
+ -		rcu_assign_pointer(m->tcfm_dev, dev);
+ +		m->tcfm_dev = dev;
+  		m->tcfm_ok_push = ok_push;
+  	}
+ -
+ +	spin_unlock_bh(&m->tcf_lock);
+  	if (ret == ACT_P_CREATED) {
++ 		spin_lock_bh(&mirred_list_lock);
+  		list_add(&m->tcfm_list, &mirred_list);
+++<<<<<<< HEAD
+ +		tcf_hash_insert(pc, &mirred_hash_info);
+++=======
++ 		spin_unlock_bh(&mirred_list_lock);
++ 		tcf_hash_insert(a);
+++>>>>>>> 6bd00b850635 (act_mirred: fix a race condition on mirred_list)
+  	}
+  
+  	return ret;
+@@@ -246,13 -226,20 +262,21 @@@ static int mirred_device_event(struct n
+  	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+  	struct tcf_mirred *m;
+  
+++<<<<<<< HEAD
+ +	if (event == NETDEV_UNREGISTER)
+++=======
++ 	ASSERT_RTNL();
++ 	if (event == NETDEV_UNREGISTER) {
++ 		spin_lock_bh(&mirred_list_lock);
+++>>>>>>> 6bd00b850635 (act_mirred: fix a race condition on mirred_list)
+  		list_for_each_entry(m, &mirred_list, tcfm_list) {
+ -			if (rcu_access_pointer(m->tcfm_dev) == dev) {
+ +			if (m->tcfm_dev == dev) {
+  				dev_put(dev);
+ -				/* Note : no rcu grace period necessary, as
+ -				 * net_device are already rcu protected.
+ -				 */
+ -				RCU_INIT_POINTER(m->tcfm_dev, NULL);
+ +				m->tcfm_dev = NULL;
+  			}
+  		}
++ 		spin_unlock_bh(&mirred_list_lock);
++ 	}
+  
+  	return NOTIFY_DONE;
+  }
+* Unmerged path net/sched/act_mirred.c
