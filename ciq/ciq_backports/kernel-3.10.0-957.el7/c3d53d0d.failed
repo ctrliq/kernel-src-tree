@@ -1,0 +1,177 @@
+mmc: core: Add parameter use_blk_mq
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] core: Add parameter use_blk_mq (Gopal Tiwari) [1456570]
+Rebuild_FUZZ: 92.31%
+commit-author Adrian Hunter <adrian.hunter@intel.com>
+commit c3d53d0da69d127f488dc85638e9440220b268e8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/c3d53d0d.failed
+
+Until mmc has blk-mq support fully implemented and tested, add a parameter
+use_blk_mq, set to true if config option MMC_MQ_DEFAULT is selected, which
+it is by default.
+
+	Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+	Acked-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+	Tested-by: Linus Walleij <linus.walleij@linaro.org>
+(cherry picked from commit c3d53d0da69d127f488dc85638e9440220b268e8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/host.h
+diff --cc drivers/mmc/core/host.h
+index 5e9a1293091b,6eaf558e62d6..000000000000
+--- a/drivers/mmc/core/host.h
++++ b/drivers/mmc/core/host.h
+@@@ -18,9 -19,65 +18,69 @@@ void mmc_unregister_host_class(void)
+  void mmc_retune_enable(struct mmc_host *host);
+  void mmc_retune_disable(struct mmc_host *host);
+  void mmc_retune_hold(struct mmc_host *host);
+ +void mmc_retune_hold_now(struct mmc_host *host);
+  void mmc_retune_release(struct mmc_host *host);
+  int mmc_retune(struct mmc_host *host);
+++<<<<<<< HEAD
+++=======
++ void mmc_retune_pause(struct mmc_host *host);
++ void mmc_retune_unpause(struct mmc_host *host);
++ 
++ static inline void mmc_retune_hold_now(struct mmc_host *host)
++ {
++ 	host->retune_now = 0;
++ 	host->hold_retune += 1;
++ }
++ 
++ static inline void mmc_retune_recheck(struct mmc_host *host)
++ {
++ 	if (host->hold_retune <= 1)
++ 		host->retune_now = 1;
++ }
++ 
++ static inline int mmc_host_cmd23(struct mmc_host *host)
++ {
++ 	return host->caps & MMC_CAP_CMD23;
++ }
++ 
++ static inline int mmc_boot_partition_access(struct mmc_host *host)
++ {
++ 	return !(host->caps2 & MMC_CAP2_BOOTPART_NOACC);
++ }
++ 
++ static inline int mmc_host_uhs(struct mmc_host *host)
++ {
++ 	return host->caps &
++ 		(MMC_CAP_UHS_SDR12 | MMC_CAP_UHS_SDR25 |
++ 		 MMC_CAP_UHS_SDR50 | MMC_CAP_UHS_SDR104 |
++ 		 MMC_CAP_UHS_DDR50);
++ }
++ 
++ static inline bool mmc_card_hs200(struct mmc_card *card)
++ {
++ 	return card->host->ios.timing == MMC_TIMING_MMC_HS200;
++ }
++ 
++ static inline bool mmc_card_ddr52(struct mmc_card *card)
++ {
++ 	return card->host->ios.timing == MMC_TIMING_MMC_DDR52;
++ }
++ 
++ static inline bool mmc_card_hs400(struct mmc_card *card)
++ {
++ 	return card->host->ios.timing == MMC_TIMING_MMC_HS400;
++ }
++ 
++ static inline bool mmc_card_hs400es(struct mmc_card *card)
++ {
++ 	return card->host->ios.enhanced_strobe;
++ }
++ 
++ static inline bool mmc_host_use_blk_mq(struct mmc_host *host)
++ {
++ 	return host->use_blk_mq;
++ }
+++>>>>>>> c3d53d0da69d (mmc: core: Add parameter use_blk_mq)
+  
+  #endif
+  
+diff --git a/drivers/mmc/Kconfig b/drivers/mmc/Kconfig
+index ec21388311db..42565562577c 100644
+--- a/drivers/mmc/Kconfig
++++ b/drivers/mmc/Kconfig
+@@ -12,6 +12,16 @@ menuconfig MMC
+ 	  If you want MMC/SD/SDIO support, you should say Y here and
+ 	  also to your specific host controller driver.
+ 
++config MMC_MQ_DEFAULT
++	bool "MMC: use blk-mq I/O path by default"
++	depends on MMC && BLOCK
++	default y
++	---help---
++	  This option enables the new blk-mq based I/O path for MMC block
++	  devices by default.  With the option the mmc_core.use_blk_mq
++	  module/boot option defaults to Y, without it to N, but it can
++	  still be overridden either way.
++
+ if MMC
+ 
+ source "drivers/mmc/core/Kconfig"
+diff --git a/drivers/mmc/core/core.c b/drivers/mmc/core/core.c
+index b7de90751837..e5e83c6f2b42 100644
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -70,6 +70,13 @@ static const unsigned freqs[] = { 400000, 300000, 200000, 100000 };
+ bool use_spi_crc = 1;
+ module_param(use_spi_crc, bool, 0);
+ 
++#ifdef CONFIG_MMC_MQ_DEFAULT
++bool mmc_use_blk_mq = true;
++#else
++bool mmc_use_blk_mq = false;
++#endif
++module_param_named(use_blk_mq, mmc_use_blk_mq, bool, S_IWUSR | S_IRUGO);
++
+ static int mmc_schedule_delayed_work(struct delayed_work *work,
+ 				     unsigned long delay)
+ {
+diff --git a/drivers/mmc/core/core.h b/drivers/mmc/core/core.h
+index 5ee561264292..570e38788bbe 100644
+--- a/drivers/mmc/core/core.h
++++ b/drivers/mmc/core/core.h
+@@ -30,6 +30,8 @@ struct mmc_bus_ops {
+ 	int (*reset)(struct mmc_host *);
+ };
+ 
++extern bool mmc_use_blk_mq;
++
+ void mmc_attach_bus(struct mmc_host *host, const struct mmc_bus_ops *ops);
+ void mmc_detach_bus(struct mmc_host *host);
+ 
+diff --git a/drivers/mmc/core/host.c b/drivers/mmc/core/host.c
+index d793f9c6e54a..e1d0f9999b4a 100644
+--- a/drivers/mmc/core/host.c
++++ b/drivers/mmc/core/host.c
+@@ -397,6 +397,8 @@ struct mmc_host *mmc_alloc_host(int extra, struct device *dev)
+ 	host->max_blk_size = 512;
+ 	host->max_blk_count = PAGE_CACHE_SIZE / 512;
+ 
++	host->use_blk_mq = mmc_use_blk_mq;
++
+ 	return host;
+ }
+ 
+* Unmerged path drivers/mmc/core/host.h
+diff --git a/include/linux/mmc/host.h b/include/linux/mmc/host.h
+index 3d6f7a820ea1..2a6f2bb77a96 100644
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@ -332,6 +332,7 @@ struct mmc_host {
+ 	unsigned int		doing_retune:1;	/* re-tuning in progress */
+ 	unsigned int		retune_now:1;	/* do re-tuning at next req */
+ 	unsigned int		retune_paused:1; /* re-tuning is temporarily disabled */
++	unsigned int		use_blk_mq:1;	/* use blk-mq */
+ 
+ 	int			rescan_disable;	/* disable card detection */
+ 	int			rescan_entered;	/* used with nonremovable devices */
