@@ -1330,6 +1330,8 @@ static int wacom_probe(struct usb_interface *intf, const struct usb_device_id *i
 		goto fail2;
 	}
 
+	wacom_wac->hid_data.inputmode = -1;
+
 	wacom->usbdev = dev;
 	wacom->intf = intf;
 	mutex_init(&wacom->lock);
