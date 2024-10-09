@@ -323,8 +323,8 @@ struct srpt_port {
 	bool			enabled;
 	u8			port_guid[64];
 	u8			port;
-	u16			sm_lid;
-	u16			lid;
+	u32			sm_lid;
+	u32			lid;
 	union ib_gid		gid;
 	spinlock_t		port_acl_lock;
 	struct work_struct	work;
