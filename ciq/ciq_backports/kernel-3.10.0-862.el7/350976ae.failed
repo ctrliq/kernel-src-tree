@@ -1,0 +1,93 @@
+xfs: truncate pagecache before writeback in xfs_setattr_size()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Eryu Guan <eguan@redhat.com>
+commit 350976ae21873b0d36584ea005076356431b8f79
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/350976ae.failed
+
+On truncate down, if new size is not block size aligned, we zero the
+rest of block to avoid exposing stale data to user, and
+iomap_truncate_page() skips zeroing if the range is already in
+unwritten state or a hole. Then we writeback from on-disk i_size to
+the new size if this range hasn't been written to disk yet, and
+truncate page cache beyond new EOF and set in-core i_size.
+
+The problem is that we could write data between di_size and newsize
+before removing the page cache beyond newsize, as the extents may
+still be in unwritten state right after a buffer write. As such, the
+page of data that newsize lies in has not been zeroed by page cache
+invalidation before it is written, and xfs_do_writepage() hasn't
+triggered it's "zero data beyond EOF" case because we haven't
+updated in-core i_size yet. Then a subsequent mmap read could see
+non-zeros past EOF.
+
+I occasionally see this in fsx runs in fstests generic/112, a
+simplified fsx operation sequence is like (assuming 4k block size
+xfs):
+
+  fallocate 0x0 0x1000 0x0 keep_size
+  write 0x0 0x1000 0x0
+  truncate 0x0 0x800 0x1000
+  punch_hole 0x0 0x800 0x800
+  mapread 0x0 0x800 0x800
+
+where fallocate allocates unwritten extent but doesn't update
+i_size, buffer write populates the page cache and extent is still
+unwritten, truncate skips zeroing page past new EOF and writes the
+page to disk, punch_hole invalidates the page cache, at last mapread
+reads the block back and sees non-zero beyond EOF.
+
+Fix it by moving truncate_setsize() to before writeback so the page
+cache invalidation zeros the partial page at the new EOF. This also
+triggers "zero data beyond EOF" in xfs_do_writepage() at writeback
+time, because newsize has been set and page straddles the newsize.
+
+Also fixed the wrong 'end' param of filemap_write_and_wait_range()
+call while we're at it, the 'end' is inclusive and should be
+'newsize - 1'.
+
+	Suggested-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Eryu Guan <eguan@redhat.com>
+	Acked-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 350976ae21873b0d36584ea005076356431b8f79)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_iops.c
+diff --cc fs/xfs/xfs_iops.c
+index 4c6e1d5b88f5,56475fcd76f2..000000000000
+--- a/fs/xfs/xfs_iops.c
++++ b/fs/xfs/xfs_iops.c
+@@@ -815,22 -884,6 +815,25 @@@ xfs_setattr_size
+  		return error;
+  
+  	/*
+++<<<<<<< HEAD
+ +	 * We are going to log the inode size change in this transaction so
+ +	 * any previous writes that are beyond the on disk EOF and the new
+ +	 * EOF that have not been written out need to be written here.  If we
+ +	 * do not write the data out, we expose ourselves to the null files
+ +	 * problem. Note that this includes any block zeroing we did above;
+ +	 * otherwise those blocks may not be zeroed after a crash.
+ +	 */
+ +	if (newsize > ip->i_d.di_size &&
+ +	    (oldsize != ip->i_d.di_size || did_zeroing)) {
+ +		error = filemap_write_and_wait_range(VFS_I(ip)->i_mapping,
+ +						      ip->i_d.di_size, newsize);
+ +		if (error)
+ +			return error;
+ +	}
+ +
+ +	/*
+++=======
+++>>>>>>> 350976ae2187 (xfs: truncate pagecache before writeback in xfs_setattr_size())
+  	 * We've already locked out new page faults, so now we can safely remove
+  	 * pages from the page cache knowing they won't get refaulted until we
+  	 * drop the XFS_MMAP_EXCL lock after the extent manipulations are
+* Unmerged path fs/xfs/xfs_iops.c
