@@ -1,0 +1,134 @@
+net: mpls: Fixups for GSO
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] mpls: Fixups for GSO (Jiri Benc) [1497774]
+Rebuild_FUZZ: 88.89%
+commit-author David Ahern <dsa@cumulusnetworks.com>
+commit 48d2ab609b6bbecb7698487c8579bc40de9d6dfa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/48d2ab60.failed
+
+As reported by Lennert the MPLS GSO code is failing to properly segment
+large packets. There are a couple of problems:
+
+1. the inner protocol is not set so the gso segment functions for inner
+   protocol layers are not getting run, and
+
+2  MPLS labels for packets that use the "native" (non-OVS) MPLS code
+   are not properly accounted for in mpls_gso_segment.
+
+The MPLS GSO code was added for OVS. It is re-using skb_mac_gso_segment
+to call the gso segment functions for the higher layer protocols. That
+means skb_mac_gso_segment is called twice -- once with the network
+protocol set to MPLS and again with the network protocol set to the
+inner protocol.
+
+This patch sets the inner skb protocol addressing item 1 above and sets
+the network_header and inner_network_header to mark where the MPLS labels
+start and end. The MPLS code in OVS is also updated to set the two
+network markers.
+
+>From there the MPLS GSO code uses the difference between the network
+header and the inner network header to know the size of the MPLS header
+that was pushed. It then pulls the MPLS header, resets the mac_len and
+protocol for the inner protocol and then calls skb_mac_gso_segment
+to segment the skb.
+
+Afterward the inner protocol segmentation is done the skb protocol
+is set to mpls for each segment and the network and mac headers
+restored.
+
+	Reported-by: Lennert Buytenhek <buytenh@wantstofly.org>
+	Signed-off-by: David Ahern <dsa@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 48d2ab609b6bbecb7698487c8579bc40de9d6dfa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mpls/mpls_gso.c
+#	net/mpls/mpls_iptunnel.c
+diff --cc net/mpls/mpls_gso.c
+index 6d49384bab3c,b4da6d8e8632..000000000000
+--- a/net/mpls/mpls_gso.c
++++ b/net/mpls/mpls_gso.c
+@@@ -38,17 -46,27 +46,35 @@@ static struct sk_buff *mpls_gso_segment
+  	/* Segment inner packet. */
+  	mpls_features = skb->dev->mpls_features & features;
+  	segs = skb_mac_gso_segment(skb, mpls_features);
++ 	if (IS_ERR_OR_NULL(segs)) {
++ 		skb_gso_error_unwind(skb, mpls_protocol, mpls_hlen, mac_offset,
++ 				     mac_len);
++ 		goto out;
++ 	}
++ 	skb = segs;
+  
++ 	mpls_hlen += mac_len;
++ 	do {
++ 		skb->mac_len = mac_len;
++ 		skb->protocol = mpls_protocol;
+  
+- 	/* Restore outer protocol. */
+- 	skb->protocol = mpls_protocol;
++ 		skb_reset_inner_network_header(skb);
+  
+++<<<<<<< HEAD
+ +	/* Re-pull the mac header that the call to skb_mac_gso_segment()
+ +	 * above pulled.  It will be re-pushed after returning
+ +	 * skb_mac_gso_segment(), an indirect caller of this function.
+ +	 */
+ +	__skb_push(skb, skb->data - skb_mac_header(skb));
+++=======
++ 		__skb_push(skb, mpls_hlen);
+++>>>>>>> 48d2ab609b6b (net: mpls: Fixups for GSO)
++ 
++ 		skb_reset_mac_header(skb);
++ 		skb_set_network_header(skb, mac_len);
++ 	} while ((skb = skb->next));
+  
++ out:
+  	return segs;
+  }
+  
+* Unmerged path net/mpls/mpls_iptunnel.c
+* Unmerged path net/mpls/mpls_gso.c
+* Unmerged path net/mpls/mpls_iptunnel.c
+diff --git a/net/openvswitch/actions.c b/net/openvswitch/actions.c
+index 4d44615c6c14..41e2e6714daf 100644
+--- a/net/openvswitch/actions.c
++++ b/net/openvswitch/actions.c
+@@ -170,10 +170,16 @@ static int push_mpls(struct sk_buff *skb, struct sw_flow_key *key,
+ 	if (skb_cow_head(skb, MPLS_HLEN) < 0)
+ 		return -ENOMEM;
+ 
++	if (!skb->inner_protocol) {
++		skb_set_inner_network_header(skb, skb->mac_len);
++		skb_set_inner_protocol(skb, skb->protocol);
++	}
++
+ 	skb_push(skb, MPLS_HLEN);
+ 	memmove(skb_mac_header(skb) - MPLS_HLEN, skb_mac_header(skb),
+ 		skb->mac_len);
+ 	skb_reset_mac_header(skb);
++	skb_set_network_header(skb, skb->mac_len);
+ 
+ 	new_mpls_lse = (__be32 *)skb_mpls_header(skb);
+ 	*new_mpls_lse = mpls->mpls_lse;
+@@ -181,8 +187,6 @@ static int push_mpls(struct sk_buff *skb, struct sw_flow_key *key,
+ 	skb_postpush_rcsum(skb, new_mpls_lse, MPLS_HLEN);
+ 
+ 	update_ethertype(skb, eth_hdr(skb), mpls->mpls_ethertype);
+-	if (!skb->inner_protocol)
+-		skb_set_inner_protocol(skb, skb->protocol);
+ 	skb->protocol = mpls->mpls_ethertype;
+ 
+ 	invalidate_flow_key(key);
+@@ -206,6 +210,7 @@ static int pop_mpls(struct sk_buff *skb, struct sw_flow_key *key,
+ 
+ 	__skb_pull(skb, MPLS_HLEN);
+ 	skb_reset_mac_header(skb);
++	skb_set_network_header(skb, skb->mac_len);
+ 
+ 	/* skb_mpls_header() is used to locate the ethertype
+ 	 * field correctly in the presence of VLAN tags.
