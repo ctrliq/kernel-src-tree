@@ -1,0 +1,196 @@
+perf: Fix a race between ring_buffer_detach() and ring_buffer_attach()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit b69cf53640da2b86439596118cfa95233154ee76
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/b69cf536.failed
+
+Alexander noticed that we use RCU iteration on rb->event_list but do
+not use list_{add,del}_rcu() to add,remove entries to that list, nor
+do we observe proper grace periods when re-using the entries.
+
+Merge ring_buffer_detach() into ring_buffer_attach() such that
+attaching to the NULL buffer is detaching.
+
+Furthermore, ensure that between any 'detach' and 'attach' of the same
+event we observe the required grace period, but only when strictly
+required. In effect this means that only ioctl(.request =
+PERF_EVENT_IOC_SET_OUTPUT) will wait for a grace period, while the
+normal initial attach and final detach will not be delayed.
+
+This patch should, I think, do the right thing under all
+circumstances, the 'normal' cases all should never see the extra grace
+period, but the two cases:
+
+ 1) PERF_EVENT_IOC_SET_OUTPUT on an event which already has a
+    ring_buffer set, will now observe the required grace period between
+    removing itself from the old and attaching itself to the new buffer.
+
+    This case is 'simple' in that both buffers are present in
+    perf_event_set_output() one could think an unconditional
+    synchronize_rcu() would be sufficient; however...
+
+ 2) an event that has a buffer attached, the buffer is destroyed
+    (munmap) and then the event is attached to a new/different buffer
+    using PERF_EVENT_IOC_SET_OUTPUT.
+
+    This case is more complex because the buffer destruction does:
+      ring_buffer_attach(.rb = NULL)
+    followed by the ioctl() doing:
+      ring_buffer_attach(.rb = foo);
+
+    and we still need to observe the grace period between these two
+    calls due to us reusing the event->rb_entry list_head.
+
+In order to make 2 happen we use Paul's latest cond_synchronize_rcu()
+call.
+
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Mike Galbraith <efault@gmx.de>
+	Reported-by: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/20140507123526.GD13658@twins.programming.kicks-ass.net
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit b69cf53640da2b86439596118cfa95233154ee76)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index ac079b205685,440eefc67397..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -4114,40 -3191,9 +4114,46 @@@ static void free_event_rcu(struct rcu_h
+  	kfree(event);
+  }
+  
+++<<<<<<< HEAD
+ +static void ring_buffer_detach(struct perf_event *event, struct ring_buffer *rb);
+++=======
++ static void ring_buffer_put(struct ring_buffer *rb);
++ static void ring_buffer_attach(struct perf_event *event,
++ 			       struct ring_buffer *rb);
+++>>>>>>> b69cf53640da (perf: Fix a race between ring_buffer_detach() and ring_buffer_attach())
+ +
+ +static void detach_sb_event(struct perf_event *event)
+ +{
+ +	struct pmu_event_list *pel = per_cpu_ptr(&pmu_sb_events, event->cpu);
+ +
+ +	raw_spin_lock(&pel->lock);
+ +	list_del_rcu(&event->sb_list);
+ +	raw_spin_unlock(&pel->lock);
+ +}
+ +
+ +static bool is_sb_event(struct perf_event *event)
+ +{
+ +	struct perf_event_attr *attr = &event->attr;
+ +
+ +	if (event->parent)
+ +		return false;
+ +
+ +	if (event->attach_state & PERF_ATTACH_TASK)
+ +		return false;
+ +
+ +	if (attr->mmap || attr->mmap_data || attr->mmap2 ||
+ +	    attr->comm || attr->comm_exec ||
+ +	    attr->task ||
+ +	    attr->context_switch)
+ +		return true;
+ +	return false;
+ +}
+ +
+ +static void unaccount_pmu_sb_event(struct perf_event *event)
+ +{
+ +	if (is_sb_event(event))
+ +		detach_sb_event(event);
+ +}
+  
+  static void unaccount_event_cpu(struct perf_event *event, int cpu)
+  {
+@@@ -5521,42 -4126,30 +5534,57 @@@ accounting
+  	if (vma->vm_flags & VM_WRITE)
+  		flags |= RING_BUFFER_WRITABLE;
+  
+ -	rb = rb_alloc(nr_pages, 
+ -		event->attr.watermark ? event->attr.wakeup_watermark : 0,
+ -		event->cpu, flags);
+ -
+  	if (!rb) {
+ -		ret = -ENOMEM;
+ -		goto unlock;
+ +		rb = rb_alloc(nr_pages,
+ +			      event->attr.watermark ? event->attr.wakeup_watermark : 0,
+ +			      event->cpu, flags);
+ +
+ +		if (!rb) {
+ +			ret = -ENOMEM;
+ +			goto unlock;
+ +		}
+ +
+ +		atomic_set(&rb->mmap_count, 1);
+ +		rb->mmap_user = get_current_user();
+ +		rb->mmap_locked = extra;
+ +
+ +		ring_buffer_attach(event, rb);
+ +		rcu_assign_pointer(event->rb, rb);
+ +
+ +		perf_event_init_userpage(event);
+ +		perf_event_update_userpage(event);
+ +	} else {
+ +		ret = rb_alloc_aux(rb, event, vma->vm_pgoff, nr_pages,
+ +				   event->attr.aux_watermark, flags);
+ +		if (!ret)
+ +			rb->aux_mmap_locked = extra;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	atomic_set(&rb->mmap_count, 1);
++ 	rb->mmap_locked = extra;
++ 	rb->mmap_user = get_current_user();
++ 
++ 	atomic_long_add(user_extra, &user->locked_vm);
++ 	vma->vm_mm->pinned_vm += extra;
++ 
++ 	ring_buffer_attach(event, rb);
++ 
++ 	perf_event_init_userpage(event);
++ 	perf_event_update_userpage(event);
++ 
+++>>>>>>> b69cf53640da (perf: Fix a race between ring_buffer_detach() and ring_buffer_attach())
+  unlock:
+ -	if (!ret)
+ +	if (!ret) {
+ +		atomic_long_add(user_extra, &user->locked_vm);
+ +		vma->vm_mm->pinned_vm += extra;
+ +
+  		atomic_inc(&event->mmap_count);
+ +	} else if (rb) {
+ +		atomic_dec(&rb->mmap_count);
+ +	}
+ +aux_unlock:
+  	mutex_unlock(&event->mmap_mutex);
+  
+  	/*
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index c9f378ea760d..e70701c21f5f 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -543,6 +543,8 @@ struct perf_event {
+ 
+ 	struct ring_buffer		*rb;
+ 	struct list_head		rb_entry;
++	unsigned long			rcu_batches;
++	int				rcu_pending;
+ 
+ 	/* poll related */
+ 	wait_queue_head_t		waitq;
+* Unmerged path kernel/events/core.c
