@@ -1,0 +1,154 @@
+xfs: simplify inode reclaim tagging interfaces
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 545c0889d26d47e1139c527002eb131343d13b63
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/545c0889.failed
+
+Inode radix tree tagging for reclaim passes a lot of unnecessary
+variables around. Over time the xfs-perag has grown a xfs_mount
+backpointer, and an internal agno so we don't need to pass other
+variables into the tagging functions to supply this information.
+
+Rework the functions to pass the minimal variable set required
+and simplify the internal logic and flow.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+(cherry picked from commit 545c0889d26d47e1139c527002eb131343d13b63)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_icache.c
+diff --cc fs/xfs/xfs_icache.c
+index 68b891ef61bd,789f8c32e65f..000000000000
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@@ -756,31 -767,46 +755,56 @@@ xfs_reclaim_worker
+  }
+  
+  static void
+- __xfs_inode_set_reclaim_tag(
+- 	struct xfs_perag	*pag,
+- 	struct xfs_inode	*ip)
++ xfs_perag_set_reclaim_tag(
++ 	struct xfs_perag	*pag)
+  {
+- 	radix_tree_tag_set(&pag->pag_ici_root,
+- 			   XFS_INO_TO_AGINO(ip->i_mount, ip->i_ino),
++ 	struct xfs_mount	*mp = pag->pag_mount;
++ 
++ 	ASSERT(spin_is_locked(&pag->pag_ici_lock));
++ 	if (pag->pag_ici_reclaimable++)
++ 		return;
++ 
++ 	/* propagate the reclaim tag up into the perag radix tree */
++ 	spin_lock(&mp->m_perag_lock);
++ 	radix_tree_tag_set(&mp->m_perag_tree, pag->pag_agno,
+  			   XFS_ICI_RECLAIM_TAG);
++ 	spin_unlock(&mp->m_perag_lock);
+  
+++<<<<<<< HEAD
+ +	if (!pag->pag_ici_reclaimable) {
+ +		/* propagate the reclaim tag up into the perag radix tree */
+ +		spin_lock(&ip->i_mount->m_perag_lock);
+ +		radix_tree_tag_set(&ip->i_mount->m_perag_tree,
+ +				XFS_INO_TO_AGNO(ip->i_mount, ip->i_ino),
+ +				XFS_ICI_RECLAIM_TAG);
+ +		spin_unlock(&ip->i_mount->m_perag_lock);
+++=======
++ 	/* schedule periodic background inode reclaim */
++ 	xfs_reclaim_work_queue(mp);
+++>>>>>>> 545c0889d26d (xfs: simplify inode reclaim tagging interfaces)
+  
+- 		/* schedule periodic background inode reclaim */
+- 		xfs_reclaim_work_queue(ip->i_mount);
++ 	trace_xfs_perag_set_reclaim(mp, pag->pag_agno, -1, _RET_IP_);
++ }
+  
+- 		trace_xfs_perag_set_reclaim(ip->i_mount, pag->pag_agno,
+- 							-1, _RET_IP_);
+- 	}
+- 	pag->pag_ici_reclaimable++;
++ static void
++ xfs_perag_clear_reclaim_tag(
++ 	struct xfs_perag	*pag)
++ {
++ 	struct xfs_mount	*mp = pag->pag_mount;
++ 
++ 	ASSERT(spin_is_locked(&pag->pag_ici_lock));
++ 	if (--pag->pag_ici_reclaimable)
++ 		return;
++ 
++ 	/* clear the reclaim tag from the perag radix tree */
++ 	spin_lock(&mp->m_perag_lock);
++ 	radix_tree_tag_clear(&mp->m_perag_tree, pag->pag_agno,
++ 			     XFS_ICI_RECLAIM_TAG);
++ 	spin_unlock(&mp->m_perag_lock);
++ 	trace_xfs_perag_clear_reclaim(mp, pag->pag_agno, -1, _RET_IP_);
+  }
+  
++ 
+  /*
+   * We set the inode flag atomically with the radix tree tag.
+   * Once we get tag lookups on the radix tree, this inode flag
+@@@ -804,32 -834,14 +832,39 @@@ xfs_inode_set_reclaim_tag
+  }
+  
+  STATIC void
+++<<<<<<< HEAD
+ +__xfs_inode_clear_reclaim(
+ +	xfs_perag_t	*pag,
+ +	xfs_inode_t	*ip)
+ +{
+ +	pag->pag_ici_reclaimable--;
+ +	if (!pag->pag_ici_reclaimable) {
+ +		/* clear the reclaim tag from the perag radix tree */
+ +		spin_lock(&ip->i_mount->m_perag_lock);
+ +		radix_tree_tag_clear(&ip->i_mount->m_perag_tree,
+ +				XFS_INO_TO_AGNO(ip->i_mount, ip->i_ino),
+ +				XFS_ICI_RECLAIM_TAG);
+ +		spin_unlock(&ip->i_mount->m_perag_lock);
+ +		trace_xfs_perag_clear_reclaim(ip->i_mount, pag->pag_agno,
+ +							-1, _RET_IP_);
+ +	}
+ +}
+ +
+ +STATIC void
+ +__xfs_inode_clear_reclaim_tag(
+ +	xfs_mount_t	*mp,
+ +	xfs_perag_t	*pag,
+ +	xfs_inode_t	*ip)
+++=======
++ xfs_inode_clear_reclaim_tag(
++ 	struct xfs_perag	*pag,
++ 	xfs_ino_t		ino)
+++>>>>>>> 545c0889d26d (xfs: simplify inode reclaim tagging interfaces)
+  {
+  	radix_tree_tag_clear(&pag->pag_ici_root,
+- 			XFS_INO_TO_AGINO(mp, ip->i_ino), XFS_ICI_RECLAIM_TAG);
+- 	__xfs_inode_clear_reclaim(pag, ip);
++ 			     XFS_INO_TO_AGINO(pag->pag_mount, ino),
++ 			     XFS_ICI_RECLAIM_TAG);
++ 	xfs_perag_clear_reclaim_tag(pag);
+  }
+  
+  /*
+@@@ -1001,9 -1030,9 +1036,9 @@@ reclaim
+  	 */
+  	spin_lock(&pag->pag_ici_lock);
+  	if (!radix_tree_delete(&pag->pag_ici_root,
+ -				XFS_INO_TO_AGINO(ip->i_mount, ino)))
+ +				XFS_INO_TO_AGINO(ip->i_mount, ip->i_ino)))
+  		ASSERT(0);
+- 	__xfs_inode_clear_reclaim(pag, ip);
++ 	xfs_perag_clear_reclaim_tag(pag);
+  	spin_unlock(&pag->pag_ici_lock);
+  
+  	/*
+* Unmerged path fs/xfs/xfs_icache.c
