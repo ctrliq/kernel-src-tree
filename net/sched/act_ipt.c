@@ -301,7 +301,6 @@ static struct tc_action_ops act_ipt_ops = {
 	.dump		=	tcf_ipt_dump,
 	.cleanup	=	tcf_ipt_cleanup,
 	.init		=	tcf_ipt_init,
-	.walk		=	tcf_generic_walker
 };
 
 static struct tc_action_ops act_xt_ops = {
@@ -314,7 +313,6 @@ static struct tc_action_ops act_xt_ops = {
 	.dump		=	tcf_ipt_dump,
 	.cleanup	=	tcf_ipt_cleanup,
 	.init		=	tcf_ipt_init,
-	.walk		=	tcf_generic_walker
 };
 
 MODULE_AUTHOR("Jamal Hadi Salim(2002-13)");
