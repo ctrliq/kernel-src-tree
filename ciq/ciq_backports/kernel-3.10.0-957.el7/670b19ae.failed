@@ -1,0 +1,255 @@
+iio: Add generic DMA buffer infrastructure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [iio] Add generic DMA buffer infrastructure (Tony Camuso) [1559170]
+Rebuild_FUZZ: 93.67%
+commit-author Lars-Peter Clausen <lars@metafoo.de>
+commit 670b19ae9bfdbcb4ce2c2ffb2ec1659a7f4a2074
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/670b19ae.failed
+
+The traditional approach used in IIO to implement buffered capture requires
+the generation of at least one interrupt per sample. In the interrupt
+handler the driver reads the sample from the device and copies it to a
+software buffer. This approach has a rather large per sample overhead
+associated with it. And while it works fine for samplerates in the range of
+up to 1000 samples per second it starts to consume a rather large share of
+the available CPU processing time once we go beyond that, this is
+especially true on an embedded system with limited processing power. The
+regular interrupt also causes increased power consumption by not allowing
+the hardware into deeper sleep states, which is something that becomes more
+and more important on mobile battery powered devices.
+
+And while the recently added watermark support mitigates some of the issues
+by allowing the device to generate interrupts at a rate lower than the data
+output rate, this still requires a storage buffer inside the device and
+even if it exists it is only a few 100 samples deep at most.
+
+DMA support on the other hand allows to capture multiple millions or even
+more samples without any CPU interaction. This allows the CPU to either go
+to sleep for longer periods or focus on other tasks which increases overall
+system performance and power consumption. In addition to that some devices
+might not even offer a way to read the data other than using DMA, which
+makes DMA mandatory to use for them.
+
+The tasks involved in implementing a DMA buffer can be divided into two
+categories. The first category is memory buffer management (allocation,
+mapping, etc.) and hooking this up the IIO buffer callbacks like read(),
+enable(), disable(), etc. The second category of tasks is to setup the
+DMA hardware and manage the DMA transfers. Tasks from the first category
+will be very similar for all IIO drivers supporting DMA buffers, while the
+tasks from the second category will be hardware specific.
+
+This patch implements a generic infrastructure that take care of the former
+tasks. It provides a set of functions that implement the standard IIO
+buffer iio_buffer_access_funcs callbacks. These can either be used as is or
+be overloaded and augmented with driver specific code where necessary.
+
+For the DMA buffer support infrastructure that is introduced in this series
+sample data is grouped by so called blocks. A block is the basic unit at
+which data is exchanged between the application and the hardware. The
+application is responsible for allocating the memory associated with the
+block and then passes the block to the hardware. When the hardware has
+captured the amount of samples equal to size of a block it will notify the
+application, which can then read the data from the block and process it.
+The block size can freely chosen (within the constraints of the hardware).
+This allows to make a trade-off between latency and management overhead.
+The larger the block size the lower the per sample overhead but the latency
+between when the data was captured and when the application will be able to
+access it increases, in a similar way smaller block sizes have a larger per
+sample management overhead but a lower latency. The ideal block size thus
+depends on system and application requirements.
+
+For the time being the infrastructure only implements a simple double
+buffered scheme which allocates two blocks each with half the size of the
+configured buffer size. This provides basic support for capturing
+continuous uninterrupted data over the existing file-IO ABI. Future
+extensions to the DMA buffer infrastructure will give applications a more
+fine grained control over how many blocks are allocated and the size of
+each block. But this requires userspace ABI additions which are
+intentionally not part of this patch and will be added separately.
+
+Tasks of the second category need to be implemented by a device specific
+driver. They can be hooked up into the generic infrastructure using two
+simple callbacks, submit() and abort().
+
+The submit() callback is used to schedule DMA transfers for blocks. Once a
+DMA transfer has been completed it is expected that the buffer driver calls
+iio_dma_buffer_block_done() to notify. The abort() callback is used for
+stopping all pending and active DMA transfers when the buffer is disabled.
+
+	Signed-off-by: Lars-Peter Clausen <lars@metafoo.de>
+	Signed-off-by: Jonathan Cameron <jic23@kernel.org>
+(cherry picked from commit 670b19ae9bfdbcb4ce2c2ffb2ec1659a7f4a2074)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iio/buffer/Kconfig
+#	drivers/iio/buffer/Makefile
+#	drivers/iio/industrialio-buffer-dma.c
+* Unmerged path drivers/iio/buffer/Kconfig
+* Unmerged path drivers/iio/buffer/Makefile
+* Unmerged path drivers/iio/industrialio-buffer-dma.c
+* Unmerged path drivers/iio/buffer/Kconfig
+* Unmerged path drivers/iio/buffer/Makefile
+* Unmerged path drivers/iio/industrialio-buffer-dma.c
+diff --git a/include/linux/iio/buffer-dma.h b/include/linux/iio/buffer-dma.h
+new file mode 100644
+index 000000000000..767467d886de
+--- /dev/null
++++ b/include/linux/iio/buffer-dma.h
+@@ -0,0 +1,152 @@
++/*
++ * Copyright 2013-2015 Analog Devices Inc.
++ *  Author: Lars-Peter Clausen <lars@metafoo.de>
++ *
++ * Licensed under the GPL-2.
++ */
++
++#ifndef __INDUSTRIALIO_DMA_BUFFER_H__
++#define __INDUSTRIALIO_DMA_BUFFER_H__
++
++#include <linux/list.h>
++#include <linux/kref.h>
++#include <linux/spinlock.h>
++#include <linux/mutex.h>
++#include <linux/iio/buffer.h>
++
++struct iio_dma_buffer_queue;
++struct iio_dma_buffer_ops;
++struct device;
++
++struct iio_buffer_block {
++	u32 size;
++	u32 bytes_used;
++};
++
++/**
++ * enum iio_block_state - State of a struct iio_dma_buffer_block
++ * @IIO_BLOCK_STATE_DEQUEUED: Block is not queued
++ * @IIO_BLOCK_STATE_QUEUED: Block is on the incoming queue
++ * @IIO_BLOCK_STATE_ACTIVE: Block is currently being processed by the DMA
++ * @IIO_BLOCK_STATE_DONE: Block is on the outgoing queue
++ * @IIO_BLOCK_STATE_DEAD: Block has been marked as to be freed
++ */
++enum iio_block_state {
++	IIO_BLOCK_STATE_DEQUEUED,
++	IIO_BLOCK_STATE_QUEUED,
++	IIO_BLOCK_STATE_ACTIVE,
++	IIO_BLOCK_STATE_DONE,
++	IIO_BLOCK_STATE_DEAD,
++};
++
++/**
++ * struct iio_dma_buffer_block - IIO buffer block
++ * @head: List head
++ * @size: Total size of the block in bytes
++ * @bytes_used: Number of bytes that contain valid data
++ * @vaddr: Virutal address of the blocks memory
++ * @phys_addr: Physical address of the blocks memory
++ * @queue: Parent DMA buffer queue
++ * @kref: kref used to manage the lifetime of block
++ * @state: Current state of the block
++ */
++struct iio_dma_buffer_block {
++	/* May only be accessed by the owner of the block */
++	struct list_head head;
++	size_t bytes_used;
++
++	/*
++	 * Set during allocation, constant thereafter. May be accessed read-only
++	 * by anybody holding a reference to the block.
++	 */
++	void *vaddr;
++	dma_addr_t phys_addr;
++	size_t size;
++	struct iio_dma_buffer_queue *queue;
++
++	/* Must not be accessed outside the core. */
++	struct kref kref;
++	/*
++	 * Must not be accessed outside the core. Access needs to hold
++	 * queue->list_lock if the block is not owned by the core.
++	 */
++	enum iio_block_state state;
++};
++
++/**
++ * struct iio_dma_buffer_queue_fileio - FileIO state for the DMA buffer
++ * @blocks: Buffer blocks used for fileio
++ * @active_block: Block being used in read()
++ * @pos: Read offset in the active block
++ * @block_size: Size of each block
++ */
++struct iio_dma_buffer_queue_fileio {
++	struct iio_dma_buffer_block *blocks[2];
++	struct iio_dma_buffer_block *active_block;
++	size_t pos;
++	size_t block_size;
++};
++
++/**
++ * struct iio_dma_buffer_queue - DMA buffer base structure
++ * @buffer: IIO buffer base structure
++ * @dev: Parent device
++ * @ops: DMA buffer callbacks
++ * @lock: Protects the incoming list, active and the fields in the fileio
++ *   substruct
++ * @list_lock: Protects lists that contain blocks which can be modified in
++ *   atomic context as well as blocks on those lists. This is the outgoing queue
++ *   list and typically also a list of active blocks in the part that handles
++ *   the DMA controller
++ * @incoming: List of buffers on the incoming queue
++ * @outgoing: List of buffers on the outgoing queue
++ * @active: Whether the buffer is currently active
++ * @fileio: FileIO state
++ */
++struct iio_dma_buffer_queue {
++	struct iio_buffer buffer;
++	struct device *dev;
++	const struct iio_dma_buffer_ops *ops;
++
++	struct mutex lock;
++	spinlock_t list_lock;
++	struct list_head incoming;
++	struct list_head outgoing;
++
++	bool active;
++
++	struct iio_dma_buffer_queue_fileio fileio;
++};
++
++/**
++ * struct iio_dma_buffer_ops - DMA buffer callback operations
++ * @submit: Called when a block is submitted to the DMA controller
++ * @abort: Should abort all pending transfers
++ */
++struct iio_dma_buffer_ops {
++	int (*submit)(struct iio_dma_buffer_queue *queue,
++		struct iio_dma_buffer_block *block);
++	void (*abort)(struct iio_dma_buffer_queue *queue);
++};
++
++void iio_dma_buffer_block_done(struct iio_dma_buffer_block *block);
++void iio_dma_buffer_block_list_abort(struct iio_dma_buffer_queue *queue,
++	struct list_head *list);
++
++int iio_dma_buffer_enable(struct iio_buffer *buffer,
++	struct iio_dev *indio_dev);
++int iio_dma_buffer_disable(struct iio_buffer *buffer,
++	struct iio_dev *indio_dev);
++int iio_dma_buffer_read(struct iio_buffer *buffer, size_t n,
++	char __user *user_buffer);
++size_t iio_dma_buffer_data_available(struct iio_buffer *buffer);
++int iio_dma_buffer_set_bytes_per_datum(struct iio_buffer *buffer, size_t bpd);
++int iio_dma_buffer_set_length(struct iio_buffer *buffer, int length);
++int iio_dma_buffer_request_update(struct iio_buffer *buffer);
++
++int iio_dma_buffer_init(struct iio_dma_buffer_queue *queue,
++	struct device *dma_dev, const struct iio_dma_buffer_ops *ops);
++void iio_dma_buffer_exit(struct iio_dma_buffer_queue *queue);
++void iio_dma_buffer_release(struct iio_dma_buffer_queue *queue);
++
++#endif
