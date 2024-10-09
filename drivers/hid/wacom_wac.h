@@ -140,6 +140,10 @@
 #define WACOM_HID_G11_PEN               (WACOM_HID_UP_G11 | 0x02)
 #define WACOM_HID_G11_TOUCHSCREEN       (WACOM_HID_UP_G11 | 0x11)
 
+#define WACOM_BATTERY_USAGE(f)	(((f)->hid == HID_DG_BATTERYSTRENGTH) || \
+				 ((f)->hid == WACOM_HID_WD_BATTERY_CHARGING) || \
+				 ((f)->hid == WACOM_HID_WD_BATTERY_LEVEL))
+
 #define WACOM_PAD_FIELD(f)	(((f)->physical == HID_DG_TABLETFUNCTIONKEY) || \
 				 ((f)->physical == WACOM_HID_WD_DIGITIZERFNKEYS) || \
 				 ((f)->physical == WACOM_HID_WD_DIGITIZERINFO))
