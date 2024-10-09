@@ -1,0 +1,500 @@
+tracing/kprobes: Factor out struct trace_probe
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Namhyung Kim <namhyung.kim@lge.com>
+commit c31ffb3ff633109e8b7b438a9e1815b919f5e32d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/c31ffb3f.failed
+
+There are functions that can be shared to both of kprobes and uprobes.
+Separate common data structure to struct trace_probe and use it from
+the shared functions.
+
+	Acked-by: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Acked-by: Oleg Nesterov <oleg@redhat.com>
+	Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Cc: zhangwei(Jovi) <jovi.zhangwei@huawei.com>
+	Cc: Arnaldo Carvalho de Melo <acme@ghostprotocols.net>
+	Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+(cherry picked from commit c31ffb3ff633109e8b7b438a9e1815b919f5e32d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/trace_kprobe.c
+diff --cc kernel/trace/trace_kprobe.c
+index 5f9a7b541351,727190698727..000000000000
+--- a/kernel/trace/trace_kprobe.c
++++ b/kernel/trace/trace_kprobe.c
+@@@ -31,56 -31,45 +31,58 @@@ struct trace_kprobe 
+  	struct list_head	list;
+  	struct kretprobe	rp;	/* Use rp.kp for kprobe use */
+  	unsigned long 		nhit;
+- 	unsigned int		flags;	/* For TP_FLAG_* */
+  	const char		*symbol;	/* symbol name */
+++<<<<<<< HEAD
+ +	struct ftrace_event_class	class;
+ +	struct ftrace_event_call	call;
+ +	struct ftrace_event_file * __rcu *files;
+ +	ssize_t			size;		/* trace entry size */
+ +	unsigned int		nr_args;
+ +	struct probe_arg	args[];
+ +};
+ +
+ +#define SIZEOF_TRACE_PROBE(n)			\
+ +	(offsetof(struct trace_probe, args) +	\
+- 	(sizeof(struct probe_arg) * (n)))
+++=======
++ 	struct trace_probe	tp;
++ };
+  
++ struct event_file_link {
++ 	struct ftrace_event_file	*file;
++ 	struct list_head		list;
++ };
+  
+- static __kprobes bool trace_probe_is_return(struct trace_probe *tp)
+- {
+- 	return tp->rp.handler != NULL;
+- }
++ #define SIZEOF_TRACE_KPROBE(n)				\
++ 	(offsetof(struct trace_kprobe, tp.args) +	\
+++>>>>>>> c31ffb3ff633 (tracing/kprobes: Factor out struct trace_probe)
++ 	(sizeof(struct probe_arg) * (n)))
+  
+- static __kprobes const char *trace_probe_symbol(struct trace_probe *tp)
+- {
+- 	return tp->symbol ? tp->symbol : "unknown";
+- }
+  
+- static __kprobes unsigned long trace_probe_offset(struct trace_probe *tp)
++ static __kprobes bool trace_kprobe_is_return(struct trace_kprobe *tk)
+  {
+- 	return tp->rp.kp.offset;
++ 	return tk->rp.handler != NULL;
+  }
+  
+- static __kprobes bool trace_probe_is_enabled(struct trace_probe *tp)
++ static __kprobes const char *trace_kprobe_symbol(struct trace_kprobe *tk)
+  {
+- 	return !!(tp->flags & (TP_FLAG_TRACE | TP_FLAG_PROFILE));
++ 	return tk->symbol ? tk->symbol : "unknown";
+  }
+  
+- static __kprobes bool trace_probe_is_registered(struct trace_probe *tp)
++ static __kprobes unsigned long trace_kprobe_offset(struct trace_kprobe *tk)
+  {
+- 	return !!(tp->flags & TP_FLAG_REGISTERED);
++ 	return tk->rp.kp.offset;
+  }
+  
+- static __kprobes bool trace_probe_has_gone(struct trace_probe *tp)
++ static __kprobes bool trace_kprobe_has_gone(struct trace_kprobe *tk)
+  {
+- 	return !!(kprobe_gone(&tp->rp.kp));
++ 	return !!(kprobe_gone(&tk->rp.kp));
+  }
+  
+- static __kprobes bool trace_probe_within_module(struct trace_probe *tp,
+- 						struct module *mod)
++ static __kprobes bool trace_kprobe_within_module(struct trace_kprobe *tk,
++ 						 struct module *mod)
+  {
+  	int len = strlen(mod->name);
+- 	const char *name = trace_probe_symbol(tp);
++ 	const char *name = trace_kprobe_symbol(tk);
+  	return strncmp(mod->name, name, len) == 0 && name[len] == ':';
+  }
+  
+@@@ -312,16 -134,17 +314,22 @@@ static struct trace_kprobe *alloc_trace
+  		goto error;
+  	}
+  
+- 	tp->class.system = kstrdup(group, GFP_KERNEL);
+- 	if (!tp->class.system)
++ 	tk->tp.class.system = kstrdup(group, GFP_KERNEL);
++ 	if (!tk->tp.class.system)
+  		goto error;
+  
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&tp->list);
+ +	return tp;
+++=======
++ 	INIT_LIST_HEAD(&tk->list);
++ 	INIT_LIST_HEAD(&tk->tp.files);
++ 	return tk;
+++>>>>>>> c31ffb3ff633 (tracing/kprobes: Factor out struct trace_probe)
+  error:
+- 	kfree(tp->call.name);
+- 	kfree(tp->symbol);
+- 	kfree(tp);
++ 	kfree(tk->tp.call.name);
++ 	kfree(tk->symbol);
++ 	kfree(tk);
+  	return ERR_PTR(ret);
+  }
+  
+@@@ -378,45 -182,29 +386,52 @@@ enable_trace_kprobe(struct trace_kprob
+  {
+  	int ret = 0;
+  
+ -	if (file) {
+ -		struct event_file_link *link;
+ +	mutex_lock(&probe_enable_lock);
+  
+ -		link = kmalloc(sizeof(*link), GFP_KERNEL);
+ -		if (!link) {
+ +	if (file) {
+ +		struct ftrace_event_file **new, **old;
+ +		int n = trace_probe_nr_files(tp);
+ +
+ +		old = rcu_dereference_raw(tp->files);
+ +		/* 1 is for new one and 1 is for stopper */
+ +		new = kzalloc((n + 2) * sizeof(struct ftrace_event_file *),
+ +			      GFP_KERNEL);
+ +		if (!new) {
+  			ret = -ENOMEM;
+ -			goto out;
+ +			goto out_unlock;
+  		}
+ -
+ +		memcpy(new, old, n * sizeof(struct ftrace_event_file *));
+ +		new[n] = file;
+ +		/* The last one keeps a NULL */
+ +
+++<<<<<<< HEAD
+ +		rcu_assign_pointer(tp->files, new);
+ +		tp->flags |= TP_FLAG_TRACE;
+ +
+ +		if (old) {
+ +			/* Make sure the probe is done with old files */
+ +			synchronize_sched();
+ +			kfree(old);
+ +		}
+++=======
++ 		link->file = file;
++ 		list_add_tail_rcu(&link->list, &tk->tp.files);
++ 
++ 		tk->tp.flags |= TP_FLAG_TRACE;
+++>>>>>>> c31ffb3ff633 (tracing/kprobes: Factor out struct trace_probe)
+  	} else
+- 		tp->flags |= TP_FLAG_PROFILE;
++ 		tk->tp.flags |= TP_FLAG_PROFILE;
+  
+- 	if (trace_probe_is_registered(tp) && !trace_probe_has_gone(tp)) {
+- 		if (trace_probe_is_return(tp))
+- 			ret = enable_kretprobe(&tp->rp);
++ 	if (trace_probe_is_registered(&tk->tp) && !trace_kprobe_has_gone(tk)) {
++ 		if (trace_kprobe_is_return(tk))
++ 			ret = enable_kretprobe(&tk->rp);
+  		else
+- 			ret = enable_kprobe(&tp->rp.kp);
++ 			ret = enable_kprobe(&tk->rp.kp);
+  	}
+ - out:
+ +
+ + out_unlock:
+ +	mutex_unlock(&probe_enable_lock);
+ +
+  	return ret;
+  }
+  
+@@@ -445,58 -225,36 +460,72 @@@ trace_probe_file_index(struct trace_pro
+   * if the file is NULL, disable "perf" handler, or disable "trace" handler.
+   */
+  static int
+- disable_trace_probe(struct trace_probe *tp, struct ftrace_event_file *file)
++ disable_trace_kprobe(struct trace_kprobe *tk, struct ftrace_event_file *file)
+  {
+ -	struct event_file_link *link = NULL;
+ +	struct ftrace_event_file **old = NULL;
+  	int wait = 0;
+  	int ret = 0;
+  
+ +	mutex_lock(&probe_enable_lock);
+ +
+  	if (file) {
+++<<<<<<< HEAD
+ +		struct ftrace_event_file **new, **old;
+ +		int n = trace_probe_nr_files(tp);
+ +		int i, j;
+ +
+ +		old = rcu_dereference_raw(tp->files);
+ +		if (n == 0 || trace_probe_file_index(tp, file) < 0) {
+++=======
++ 		link = find_event_file_link(&tk->tp, file);
++ 		if (!link) {
+++>>>>>>> c31ffb3ff633 (tracing/kprobes: Factor out struct trace_probe)
+  			ret = -EINVAL;
+ -			goto out;
+ +			goto out_unlock;
+ +		}
+ +
+++<<<<<<< HEAD
+ +		if (n == 1) {	/* Remove the last file */
+ +			tp->flags &= ~TP_FLAG_TRACE;
+ +			new = NULL;
+ +		} else {
+ +			new = kzalloc(n * sizeof(struct ftrace_event_file *),
+ +				      GFP_KERNEL);
+ +			if (!new) {
+ +				ret = -ENOMEM;
+ +				goto out_unlock;
+ +			}
+ +
+ +			/* This copy & check loop copies the NULL stopper too */
+ +			for (i = 0, j = 0; j < n && i < n + 1; i++)
+ +				if (old[i] != file)
+ +					new[j++] = old[i];
+  		}
+  
+ +		rcu_assign_pointer(tp->files, new);
+ +		wait = 1;
+++=======
++ 		list_del_rcu(&link->list);
++ 		wait = 1;
++ 		if (!list_empty(&tk->tp.files))
++ 			goto out;
++ 
++ 		tk->tp.flags &= ~TP_FLAG_TRACE;
+++>>>>>>> c31ffb3ff633 (tracing/kprobes: Factor out struct trace_probe)
+  	} else
+- 		tp->flags &= ~TP_FLAG_PROFILE;
++ 		tk->tp.flags &= ~TP_FLAG_PROFILE;
+  
+- 	if (!trace_probe_is_enabled(tp) && trace_probe_is_registered(tp)) {
+- 		if (trace_probe_is_return(tp))
+- 			disable_kretprobe(&tp->rp);
++ 	if (!trace_probe_is_enabled(&tk->tp) && trace_probe_is_registered(&tk->tp)) {
++ 		if (trace_kprobe_is_return(tk))
++ 			disable_kretprobe(&tk->rp);
+  		else
+- 			disable_kprobe(&tp->rp.kp);
++ 			disable_kprobe(&tk->rp.kp);
+  		wait = 1;
+  	}
+ - out:
+ +
+ + out_unlock:
+ +	mutex_unlock(&probe_enable_lock);
+ +
+  	if (wait) {
+  		/*
+  		 * Synchronize with kprobe_trace_func/kretprobe_trace_func
+@@@ -1046,31 -818,21 +1077,36 @@@ __kprobe_trace_func(struct trace_kprob
+  		return;
+  
+  	entry = ring_buffer_event_data(event);
+- 	entry->ip = (unsigned long)tp->rp.kp.addr;
+- 	store_trace_args(sizeof(*entry), tp, regs, (u8 *)&entry[1], dsize);
++ 	entry->ip = (unsigned long)tk->rp.kp.addr;
++ 	store_trace_args(sizeof(*entry), &tk->tp, regs, (u8 *)&entry[1], dsize);
+  
+ -	if (!filter_check_discard(ftrace_file, entry, buffer, event))
+ +	if (!filter_current_check_discard(buffer, call, entry, event))
+  		trace_buffer_unlock_commit_regs(buffer, event,
+  						irq_flags, pc, regs);
+  }
+  
+  static __kprobes void
+- kprobe_trace_func(struct trace_probe *tp, struct pt_regs *regs)
++ kprobe_trace_func(struct trace_kprobe *tk, struct pt_regs *regs)
+  {
+ -	struct event_file_link *link;
+ +	/*
+ +	 * Note: preempt is already disabled around the kprobe handler.
+ +	 * However, we still need an smp_read_barrier_depends() corresponding
+ +	 * to smp_wmb() in rcu_assign_pointer() to access the pointer.
+ +	 */
+ +	struct ftrace_event_file **file = rcu_dereference_raw(tp->files);
+  
+++<<<<<<< HEAD
+ +	if (unlikely(!file))
+ +		return;
+ +
+ +	while (*file) {
+ +		__kprobe_trace_func(tp, regs, *file);
+ +		file++;
+ +	}
+++=======
++ 	list_for_each_entry_rcu(link, &tk->tp.files, list)
++ 		__kprobe_trace_func(tk, regs, link->file);
+++>>>>>>> c31ffb3ff633 (tracing/kprobes: Factor out struct trace_probe)
+  }
+  
+  /* Kretprobe handler */
+@@@ -1104,33 -866,23 +1140,38 @@@ __kretprobe_trace_func(struct trace_kpr
+  		return;
+  
+  	entry = ring_buffer_event_data(event);
+- 	entry->func = (unsigned long)tp->rp.kp.addr;
++ 	entry->func = (unsigned long)tk->rp.kp.addr;
+  	entry->ret_ip = (unsigned long)ri->ret_addr;
+- 	store_trace_args(sizeof(*entry), tp, regs, (u8 *)&entry[1], dsize);
++ 	store_trace_args(sizeof(*entry), &tk->tp, regs, (u8 *)&entry[1], dsize);
+  
+ -	if (!filter_check_discard(ftrace_file, entry, buffer, event))
+ +	if (!filter_current_check_discard(buffer, call, entry, event))
+  		trace_buffer_unlock_commit_regs(buffer, event,
+  						irq_flags, pc, regs);
+  }
+  
+  static __kprobes void
+- kretprobe_trace_func(struct trace_probe *tp, struct kretprobe_instance *ri,
++ kretprobe_trace_func(struct trace_kprobe *tk, struct kretprobe_instance *ri,
+  		     struct pt_regs *regs)
+  {
+ -	struct event_file_link *link;
+ +	/*
+ +	 * Note: preempt is already disabled around the kprobe handler.
+ +	 * However, we still need an smp_read_barrier_depends() corresponding
+ +	 * to smp_wmb() in rcu_assign_pointer() to access the pointer.
+ +	 */
+ +	struct ftrace_event_file **file = rcu_dereference_raw(tp->files);
+ +
+++<<<<<<< HEAD
+ +	if (unlikely(!file))
+ +		return;
+  
+ +	while (*file) {
+ +		__kretprobe_trace_func(tp, ri, regs, *file);
+ +		file++;
+ +	}
+++=======
++ 	list_for_each_entry_rcu(link, &tk->tp.files, list)
++ 		__kretprobe_trace_func(tk, ri, regs, link->file);
+++>>>>>>> c31ffb3ff633 (tracing/kprobes: Factor out struct trace_probe)
+  }
+  
+  /* Event entry printers */
+@@@ -1329,25 -1085,23 +1374,39 @@@ kprobe_perf_func(struct trace_kprobe *t
+  	int size, __size, dsize;
+  	int rctx;
+  
+++<<<<<<< HEAD
+ +	dsize = __get_data_size(tp, regs);
+ +	__size = sizeof(*entry) + tp->size + dsize;
+++=======
++ 	head = this_cpu_ptr(call->perf_events);
++ 	if (hlist_empty(head))
++ 		return;
++ 
++ 	dsize = __get_data_size(&tk->tp, regs);
++ 	__size = sizeof(*entry) + tk->tp.size + dsize;
+++>>>>>>> c31ffb3ff633 (tracing/kprobes: Factor out struct trace_probe)
+  	size = ALIGN(__size + sizeof(u32), sizeof(u64));
+  	size -= sizeof(u32);
+ +	if (WARN_ONCE(size > PERF_MAX_TRACE_SIZE,
+ +		     "profile buffer not large enough"))
+ +		return;
+  
+ -	entry = perf_trace_buf_prepare(size, call->event.type, regs, &rctx);
+ +	entry = perf_trace_buf_prepare(size, call->event.type, NULL, &rctx);
+  	if (!entry)
+  		return;
+  
+- 	entry->ip = (unsigned long)tp->rp.kp.addr;
++ 	entry->ip = (unsigned long)tk->rp.kp.addr;
+  	memset(&entry[1], 0, dsize);
+++<<<<<<< HEAD
+ +	store_trace_args(sizeof(*entry), tp, regs, (u8 *)&entry[1], dsize);
+ +
+ +	head = this_cpu_ptr(call->perf_events);
+ +	perf_trace_buf_submit(entry, size, rctx,
+ +					entry->ip, 1, regs, head, NULL);
+++=======
++ 	store_trace_args(sizeof(*entry), &tk->tp, regs, (u8 *)&entry[1], dsize);
++ 	perf_trace_buf_submit(entry, size, rctx, 0, 1, regs, head, NULL);
+++>>>>>>> c31ffb3ff633 (tracing/kprobes: Factor out struct trace_probe)
+  }
+  
+  /* Kretprobe profile handler */
+@@@ -1361,25 -1115,23 +1420,39 @@@ kretprobe_perf_func(struct trace_kprob
+  	int size, __size, dsize;
+  	int rctx;
+  
+++<<<<<<< HEAD
+ +	dsize = __get_data_size(tp, regs);
+ +	__size = sizeof(*entry) + tp->size + dsize;
+++=======
++ 	head = this_cpu_ptr(call->perf_events);
++ 	if (hlist_empty(head))
++ 		return;
++ 
++ 	dsize = __get_data_size(&tk->tp, regs);
++ 	__size = sizeof(*entry) + tk->tp.size + dsize;
+++>>>>>>> c31ffb3ff633 (tracing/kprobes: Factor out struct trace_probe)
+  	size = ALIGN(__size + sizeof(u32), sizeof(u64));
+  	size -= sizeof(u32);
+ +	if (WARN_ONCE(size > PERF_MAX_TRACE_SIZE,
+ +		     "profile buffer not large enough"))
+ +		return;
+  
+ -	entry = perf_trace_buf_prepare(size, call->event.type, regs, &rctx);
+ +	entry = perf_trace_buf_prepare(size, call->event.type, NULL, &rctx);
+  	if (!entry)
+  		return;
+  
+- 	entry->func = (unsigned long)tp->rp.kp.addr;
++ 	entry->func = (unsigned long)tk->rp.kp.addr;
+  	entry->ret_ip = (unsigned long)ri->ret_addr;
+++<<<<<<< HEAD
+ +	store_trace_args(sizeof(*entry), tp, regs, (u8 *)&entry[1], dsize);
+ +
+ +	head = this_cpu_ptr(call->perf_events);
+ +	perf_trace_buf_submit(entry, size, rctx,
+ +					entry->ret_ip, 1, regs, head, NULL);
+++=======
++ 	store_trace_args(sizeof(*entry), &tk->tp, regs, (u8 *)&entry[1], dsize);
++ 	perf_trace_buf_submit(entry, size, rctx, 0, 1, regs, head, NULL);
+++>>>>>>> c31ffb3ff633 (tracing/kprobes: Factor out struct trace_probe)
+  }
+  #endif	/* CONFIG_PERF_EVENTS */
+  
+@@@ -1552,6 -1310,10 +1625,13 @@@ find_trace_probe_file(struct trace_kpro
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Nobody but us can call enable_trace_kprobe/disable_trace_kprobe at this
++  * stage, we can do this lockless.
++  */
+++>>>>>>> c31ffb3ff633 (tracing/kprobes: Factor out struct trace_probe)
+  static __init int kprobe_trace_self_tests_init(void)
+  {
+  	int ret, warn = 0;
+* Unmerged path kernel/trace/trace_kprobe.c
+diff --git a/kernel/trace/trace_probe.h b/kernel/trace/trace_probe.h
+index 163c98b94238..70b215995018 100644
+--- a/kernel/trace/trace_probe.h
++++ b/kernel/trace/trace_probe.h
+@@ -270,6 +270,26 @@ struct probe_arg {
+ 	const struct fetch_type	*type;	/* Type of this argument */
+ };
+ 
++struct trace_probe {
++	unsigned int			flags;	/* For TP_FLAG_* */
++	struct ftrace_event_class	class;
++	struct ftrace_event_call	call;
++	struct list_head 		files;
++	ssize_t				size;	/* trace entry size */
++	unsigned int			nr_args;
++	struct probe_arg		args[];
++};
++
++static inline bool trace_probe_is_enabled(struct trace_probe *tp)
++{
++	return !!(tp->flags & (TP_FLAG_TRACE | TP_FLAG_PROFILE));
++}
++
++static inline bool trace_probe_is_registered(struct trace_probe *tp)
++{
++	return !!(tp->flags & TP_FLAG_REGISTERED);
++}
++
+ static inline __kprobes void call_fetch(struct fetch_param *fprm,
+ 				 struct pt_regs *regs, void *dest)
+ {
