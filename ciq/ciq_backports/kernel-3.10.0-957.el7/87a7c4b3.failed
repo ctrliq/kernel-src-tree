@@ -1,0 +1,328 @@
+liquidio: fix ndo_change_mtu to always return correct status to the caller
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Veerasenareddy Burru <veerasenareddy.burru@cavium.com>
+commit 87a7c4b3c3570feed2edb9478c3bdd474f43a239
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/87a7c4b3.failed
+
+In a scenario where the command queued to firmware get dropped or times
+out, MTU change from host will not propagate to firmware. So, it is
+required for host driver to wait for response from firmware or timeout
+and then return correct status to caller of ndo_change_mtu.
+
+Also moved the common code for MTU change from PF and VF driver files to
+common file lio_core.c
+
+	Signed-off-by: Veerasenareddy Burru <veerasenareddy.burru@cavium.com>
+	Signed-off-by: Felix Manlunas <felix.manlunas@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 87a7c4b3c3570feed2edb9478c3bdd474f43a239)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
+diff --cc drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
+index 734247f7a4cf,3342d64b7081..000000000000
+--- a/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
+@@@ -629,10 -620,11 +620,18 @@@ static void update_link_status(struct n
+  			txqs_stop(netdev);
+  		}
+  
+++<<<<<<< HEAD
+ +		if (lio->linfo.link.s.mtu != netdev->extended->max_mtu) {
+ +			dev_info(&oct->pci_dev->dev, "Max MTU Changed from %d to %d\n",
+ +				 netdev->extended->max_mtu, lio->linfo.link.s.mtu);
+ +			netdev->extended->max_mtu = lio->linfo.link.s.mtu;
+++=======
++ 		if (lio->linfo.link.s.mtu != current_max_mtu) {
++ 			dev_info(&oct->pci_dev->dev,
++ 				 "Max MTU Changed from %d to %d\n",
++ 				 current_max_mtu, lio->linfo.link.s.mtu);
++ 			netdev->max_mtu = lio->linfo.link.s.mtu;
+++>>>>>>> 87a7c4b3c357 (liquidio: fix ndo_change_mtu to always return correct status to the caller)
+  		}
+  
+  		if (lio->linfo.link.s.mtu < netdev->mtu) {
+diff --git a/drivers/net/ethernet/cavium/liquidio/lio_core.c b/drivers/net/ethernet/cavium/liquidio/lio_core.c
+index 012e6e3f3f5b..31eb2a1c665d 100644
+--- a/drivers/net/ethernet/cavium/liquidio/lio_core.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_core.c
+@@ -164,15 +164,6 @@ void liquidio_link_ctrl_cmd_completion(void *nctrl_ptr)
+ 		}
+ 		break;
+ 
+-	case OCTNET_CMD_CHANGE_MTU:
+-		/* If command is successful, change the MTU. */
+-		netif_info(lio, probe, lio->netdev, "MTU Changed from %d to %d\n",
+-			   netdev->mtu, nctrl->ncmd.s.param1);
+-		netdev->mtu = nctrl->ncmd.s.param1;
+-		queue_delayed_work(lio->link_status_wq.wq,
+-				   &lio->link_status_wq.wk.work, 0);
+-		break;
+-
+ 	case OCTNET_CMD_GPIO_ACCESS:
+ 		netif_info(lio, probe, lio->netdev, "LED Flashing visual identification\n");
+ 
+@@ -1081,3 +1072,88 @@ int octeon_setup_interrupt(struct octeon_device *oct, u32 num_ioqs)
+ 	}
+ 	return 0;
+ }
++
++static void liquidio_change_mtu_completion(struct octeon_device *oct,
++					   u32 status, void *buf)
++{
++	struct octeon_soft_command *sc = (struct octeon_soft_command *)buf;
++	struct liquidio_if_cfg_context *ctx;
++
++	ctx  = (struct liquidio_if_cfg_context *)sc->ctxptr;
++
++	if (status) {
++		dev_err(&oct->pci_dev->dev, "MTU change failed. Status: %llx\n",
++			CVM_CAST64(status));
++		WRITE_ONCE(ctx->cond, LIO_CHANGE_MTU_FAIL);
++	} else {
++		WRITE_ONCE(ctx->cond, LIO_CHANGE_MTU_SUCCESS);
++	}
++
++	/* This barrier is required to be sure that the response has been
++	 * written fully before waking up the handler
++	 */
++	wmb();
++
++	wake_up_interruptible(&ctx->wc);
++}
++
++/**
++ * \brief Net device change_mtu
++ * @param netdev network device
++ */
++int liquidio_change_mtu(struct net_device *netdev, int new_mtu)
++{
++	struct lio *lio = GET_LIO(netdev);
++	struct octeon_device *oct = lio->oct_dev;
++	struct liquidio_if_cfg_context *ctx;
++	struct octeon_soft_command *sc;
++	union octnet_cmd *ncmd;
++	int ctx_size;
++	int ret = 0;
++
++	ctx_size = sizeof(struct liquidio_if_cfg_context);
++	sc = (struct octeon_soft_command *)
++		octeon_alloc_soft_command(oct, OCTNET_CMD_SIZE, 16, ctx_size);
++
++	ncmd = (union octnet_cmd *)sc->virtdptr;
++	ctx  = (struct liquidio_if_cfg_context *)sc->ctxptr;
++
++	WRITE_ONCE(ctx->cond, 0);
++	ctx->octeon_id = lio_get_device_id(oct);
++	init_waitqueue_head(&ctx->wc);
++
++	ncmd->u64 = 0;
++	ncmd->s.cmd = OCTNET_CMD_CHANGE_MTU;
++	ncmd->s.param1 = new_mtu;
++
++	octeon_swap_8B_data((u64 *)ncmd, (OCTNET_CMD_SIZE >> 3));
++
++	sc->iq_no = lio->linfo.txpciq[0].s.q_no;
++
++	octeon_prepare_soft_command(oct, sc, OPCODE_NIC,
++				    OPCODE_NIC_CMD, 0, 0, 0);
++
++	sc->callback = liquidio_change_mtu_completion;
++	sc->callback_arg = sc;
++	sc->wait_time = 100;
++
++	ret = octeon_send_soft_command(oct, sc);
++	if (ret == IQ_SEND_FAILED) {
++		netif_info(lio, rx_err, lio->netdev, "Failed to change MTU\n");
++		return -EINVAL;
++	}
++	/* Sleep on a wait queue till the cond flag indicates that the
++	 * response arrived or timed-out.
++	 */
++	if (sleep_cond(&ctx->wc, &ctx->cond) == -EINTR ||
++	    ctx->cond == LIO_CHANGE_MTU_FAIL) {
++		octeon_free_soft_command(oct, sc);
++		return -EINVAL;
++	}
++
++	netdev->mtu = new_mtu;
++	lio->mtu = new_mtu;
++
++	octeon_free_soft_command(oct, sc);
++	return 0;
++}
+diff --git a/drivers/net/ethernet/cavium/liquidio/lio_main.c b/drivers/net/ethernet/cavium/liquidio/lio_main.c
+index 1c1ed38138cb..e8600d2492d8 100644
+--- a/drivers/net/ethernet/cavium/liquidio/lio_main.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_main.c
+@@ -91,20 +91,6 @@ static int octeon_console_debug_enabled(u32 console)
+  */
+ #define LIO_SYNC_OCTEON_TIME_INTERVAL_MS 60000
+ 
+-struct liquidio_if_cfg_context {
+-	int octeon_id;
+-
+-	wait_queue_head_t wc;
+-
+-	int cond;
+-};
+-
+-struct liquidio_if_cfg_resp {
+-	u64 rh;
+-	struct liquidio_if_cfg_info cfg_info;
+-	u64 status;
+-};
+-
+ struct liquidio_rx_ctl_context {
+ 	int octeon_id;
+ 
+@@ -841,8 +827,12 @@ static void octnet_link_status_change(struct work_struct *work)
+ 	struct cavium_wk *wk = (struct cavium_wk *)work;
+ 	struct lio *lio = (struct lio *)wk->ctxptr;
+ 
++	/* lio->linfo.link.s.mtu always contains max MTU of the lio interface.
++	 * this API is invoked only when new max-MTU of the interface is
++	 * less than current MTU.
++	 */
+ 	rtnl_lock();
+-	call_netdevice_notifiers(NETDEV_CHANGEMTU, lio->netdev);
++	dev_set_mtu(lio->netdev, lio->linfo.link.s.mtu);
+ 	rtnl_unlock();
+ }
+ 
+@@ -891,7 +881,11 @@ static inline void update_link_status(struct net_device *netdev,
+ {
+ 	struct lio *lio = GET_LIO(netdev);
+ 	int changed = (lio->linfo.link.u64 != ls->u64);
++	int current_max_mtu = lio->linfo.link.s.mtu;
++	struct octeon_device *oct = lio->oct_dev;
+ 
++	dev_dbg(&oct->pci_dev->dev, "%s: lio->linfo.link.u64=%llx, ls->u64=%llx\n",
++		__func__, lio->linfo.link.u64, ls->u64);
+ 	lio->linfo.link.u64 = ls->u64;
+ 
+ 	if ((lio->intf_open) && (changed)) {
+@@ -899,12 +893,26 @@ static inline void update_link_status(struct net_device *netdev,
+ 		lio->link_changes++;
+ 
+ 		if (lio->linfo.link.s.link_up) {
++			dev_dbg(&oct->pci_dev->dev, "%s: link_up", __func__);
+ 			netif_carrier_on(netdev);
+ 			txqs_wake(netdev);
+ 		} else {
++			dev_dbg(&oct->pci_dev->dev, "%s: link_off", __func__);
+ 			netif_carrier_off(netdev);
+ 			stop_txq(netdev);
+ 		}
++		if (lio->linfo.link.s.mtu != current_max_mtu) {
++			netif_info(lio, probe, lio->netdev, "Max MTU changed from %d to %d\n",
++				   current_max_mtu, lio->linfo.link.s.mtu);
++			netdev->max_mtu = lio->linfo.link.s.mtu;
++		}
++		if (lio->linfo.link.s.mtu < netdev->mtu) {
++			dev_warn(&oct->pci_dev->dev,
++				 "Current MTU is higher than new max MTU; Reducing the current mtu from %d to %d\n",
++				     netdev->mtu, lio->linfo.link.s.mtu);
++			queue_delayed_work(lio->link_status_wq.wq,
++					   &lio->link_status_wq.wk.work, 0);
++		}
+ 	}
+ }
+ 
+@@ -2448,38 +2456,6 @@ static struct net_device_stats *liquidio_get_stats(struct net_device *netdev)
+ 	return stats;
+ }
+ 
+-/**
+- * \brief Net device change_mtu
+- * @param netdev network device
+- */
+-static int liquidio_change_mtu(struct net_device *netdev, int new_mtu)
+-{
+-	struct lio *lio = GET_LIO(netdev);
+-	struct octeon_device *oct = lio->oct_dev;
+-	struct octnic_ctrl_pkt nctrl;
+-	int ret = 0;
+-
+-	memset(&nctrl, 0, sizeof(struct octnic_ctrl_pkt));
+-
+-	nctrl.ncmd.u64 = 0;
+-	nctrl.ncmd.s.cmd = OCTNET_CMD_CHANGE_MTU;
+-	nctrl.ncmd.s.param1 = new_mtu;
+-	nctrl.iq_no = lio->linfo.txpciq[0].s.q_no;
+-	nctrl.wait_time = 100;
+-	nctrl.netpndev = (u64)netdev;
+-	nctrl.cb_fn = liquidio_link_ctrl_cmd_completion;
+-
+-	ret = octnet_send_nic_ctrl_pkt(lio->oct_dev, &nctrl);
+-	if (ret < 0) {
+-		dev_err(&oct->pci_dev->dev, "Failed to set MTU\n");
+-		return -1;
+-	}
+-
+-	lio->mtu = new_mtu;
+-
+-	return 0;
+-}
+-
+ /**
+  * \brief Handler for SIOCSHWTSTAMP ioctl
+  * @param netdev network device
+* Unmerged path drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
+diff --git a/drivers/net/ethernet/cavium/liquidio/liquidio_common.h b/drivers/net/ethernet/cavium/liquidio/liquidio_common.h
+index 522dcc4dcff7..4f72ed1ad15a 100644
+--- a/drivers/net/ethernet/cavium/liquidio/liquidio_common.h
++++ b/drivers/net/ethernet/cavium/liquidio/liquidio_common.h
+@@ -192,7 +192,8 @@ static inline void add_sg_size(struct octeon_sg_entry *sg_entry,
+ 
+ #define   OCTNET_MAX_FRM_SIZE        (16000 + OCTNET_FRM_HEADER_SIZE)
+ 
+-#define   OCTNET_DEFAULT_FRM_SIZE    (1500 + OCTNET_FRM_HEADER_SIZE)
++#define   OCTNET_DEFAULT_MTU         (1500)
++#define   OCTNET_DEFAULT_FRM_SIZE  (OCTNET_DEFAULT_MTU + OCTNET_FRM_HEADER_SIZE)
+ 
+ /** NIC Commands are sent using this Octeon Input Queue */
+ #define   OCTNET_CMD_Q                0
+diff --git a/drivers/net/ethernet/cavium/liquidio/octeon_network.h b/drivers/net/ethernet/cavium/liquidio/octeon_network.h
+index 53d7fb89811c..bdd0d2da8702 100644
+--- a/drivers/net/ethernet/cavium/liquidio/octeon_network.h
++++ b/drivers/net/ethernet/cavium/liquidio/octeon_network.h
+@@ -35,6 +35,18 @@
+ #define   LIO_IFSTATE_RX_TIMESTAMP_ENABLED 0x08
+ #define   LIO_IFSTATE_RESETTING		   0x10
+ 
++struct liquidio_if_cfg_context {
++	u32 octeon_id;
++	wait_queue_head_t wc;
++	int cond;
++};
++
++struct liquidio_if_cfg_resp {
++	u64 rh;
++	struct liquidio_if_cfg_info cfg_info;
++	u64 status;
++};
++
+ struct oct_nic_stats_resp {
+ 	u64     rh;
+ 	struct oct_link_stats stats;
+@@ -184,6 +196,14 @@ int octeon_setup_interrupt(struct octeon_device *oct, u32 num_ioqs);
+  */
+ void liquidio_set_ethtool_ops(struct net_device *netdev);
+ 
++/**
++ * \brief Net device change_mtu
++ * @param netdev network device
++ */
++int liquidio_change_mtu(struct net_device *netdev, int new_mtu);
++#define LIO_CHANGE_MTU_SUCCESS 1
++#define LIO_CHANGE_MTU_FAIL    2
++
+ #define SKB_ADJ_MASK  0x3F
+ #define SKB_ADJ       (SKB_ADJ_MASK + 1)
+ 
