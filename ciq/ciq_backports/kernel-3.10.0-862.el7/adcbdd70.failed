@@ -1,0 +1,148 @@
+x86/intel_rdt: Fix padding when resource is enabled via mount
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] intel_rdt: Fix padding when resource is enabled via mount (Jiri Olsa) [1379551]
+Rebuild_FUZZ: 96.61%
+commit-author Vikas Shivappa <vikas.shivappa@linux.intel.com>
+commit adcbdd70309dba5a12a9d8158deb6a62a6d5fc98
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/adcbdd70.failed
+
+Currently max width of 'resource name' and 'resource data' is being
+initialized based on 'enabled resources' during boot. But the mount can
+enable different capable resources at a later time which upsets the
+tabular format of schemata. Fix this to be based on 'all capable'
+resources.
+
+	Signed-off-by: Vikas Shivappa <vikas.shivappa@linux.intel.com>
+	Tested-by: Prakhya, Sai Praneeth <sai.praneeth.prakhya@intel.com>
+	Cc: fenghua.yu@intel.com
+	Cc: tony.luck@intel.com
+	Cc: ravi.v.shankar@intel.com
+	Cc: vikas.shivappa@intel.com
+Link: http://lkml.kernel.org/r/1492645804-17465-2-git-send-email-vikas.shivappa@linux.intel.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+(cherry picked from commit adcbdd70309dba5a12a9d8158deb6a62a6d5fc98)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/intel_rdt.c
+diff --cc arch/x86/kernel/cpu/intel_rdt.c
+index ad087dd4421e,5b366462f579..000000000000
+--- a/arch/x86/kernel/cpu/intel_rdt.c
++++ b/arch/x86/kernel/cpu/intel_rdt.c
+@@@ -398,68 -483,55 +398,75 @@@ static int intel_rdt_offline_cpu(unsign
+  	return 0;
+  }
+  
+ -/*
+ - * Choose a width for the resource name and resource data based on the
+ - * resource that has widest name and cbm.
+ - */
+ -static __init void rdt_init_padding(void)
+ +static int
+ +rdt_cpu_notify(struct notifier_block *self, unsigned long action, void *hcpu)
+  {
+ -	struct rdt_resource *r;
+ -	int cl;
+ +       unsigned int cpu = (long)hcpu;
+  
+ -	for_each_capable_rdt_resource(r) {
+ -		cl = strlen(r->name);
+ -		if (cl > max_name_width)
+ -			max_name_width = cl;
+ +       switch (action & ~CPU_TASKS_FROZEN) {
+  
+ -		if (r->data_width > max_data_width)
+ -			max_data_width = r->data_width;
+ -	}
+ +       case CPU_ONLINE:
+ +       case CPU_DOWN_FAILED:
+ +               intel_rdt_online_cpu(cpu, true);
+ +               break;
+ +
+ +       case CPU_UP_CANCELED:
+ +       case CPU_DOWN_PREPARE:
+ +               intel_rdt_offline_cpu(cpu);
+ +               break;
+ +       default:
+ +               break;
+ +       }
+ +
+ +       return NOTIFY_OK;
+  }
+  
+ -static __init bool get_rdt_resources(void)
+ +static void __init rdt_cpu_setup(void *dummy)
+  {
+ -	bool ret = false;
+ +	struct rdt_resource *r;
+ +	int i;
+  
+ -	if (cache_alloc_hsw_probe())
+ -		return true;
+++<<<<<<< HEAD
+ +	clear_closid(smp_processor_id());
+++=======
+++	for_each_capable_rdt_resource(r) {
+++		cl = strlen(r->name);
+++		if (cl > max_name_width)
+++			max_name_width = cl;
+++>>>>>>> adcbdd70309d (x86/intel_rdt: Fix padding when resource is enabled via mount)
+  
+ -	if (!boot_cpu_has(X86_FEATURE_RDT_A))
+ -		return false;
+ +	for_each_capable_rdt_resource(r) {
+ +		for (i = 0; i < r->num_closid; i++) {
+ +			int idx = cbm_idx(r, i);
+  
+ -	if (boot_cpu_has(X86_FEATURE_CAT_L3)) {
+ -		rdt_get_cache_config(1, &rdt_resources_all[RDT_RESOURCE_L3]);
+ -		if (boot_cpu_has(X86_FEATURE_CDP_L3)) {
+ -			rdt_get_cdp_l3_config(RDT_RESOURCE_L3DATA);
+ -			rdt_get_cdp_l3_config(RDT_RESOURCE_L3CODE);
+ +			wrmsrl(r->msr_base + idx, r->max_cbm);
+  		}
+ -		ret = true;
+ -	}
+ -	if (boot_cpu_has(X86_FEATURE_CAT_L2)) {
+ -		/* CPUID 0x10.2 fields are same format at 0x10.1 */
+ -		rdt_get_cache_config(2, &rdt_resources_all[RDT_RESOURCE_L2]);
+ -		ret = true;
+  	}
+ +}
+ +
+ +static struct notifier_block rdt_cpu_nb = {
+ +	.notifier_call  = rdt_cpu_notify,
+ +	.priority	= -INT_MAX,
+ +};
+  
+ -	if (boot_cpu_has(X86_FEATURE_MBA)) {
+ -		if (rdt_get_mem_config(&rdt_resources_all[RDT_RESOURCE_MBA]))
+ -			ret = true;
+ +static int __init rdt_notifier_init(void)
+ +{
+ +	unsigned int cpu;
+ +
+ +	for_each_online_cpu(cpu) {
+ +		intel_rdt_online_cpu(cpu, false);
+ +		/*
+ +		 * RHEL7 - The upstream hotplug notification invokes the
+ +		 *         callbacks on related cpus, but that's not the
+ +		 *         case of the RHEL7 notification support.
+ +		 *         Following call ensures we run all the msr
+ +		 *         initialization setup on related cpus.
+ +		 */
+ +		smp_call_function_single(cpu, rdt_cpu_setup, NULL, 1);
+  	}
+  
+ -	return ret;
+ +	__register_cpu_notifier(&rdt_cpu_nb);
+ +	return 0;
+  }
+  
+  static int __init intel_rdt_late_init(void)
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.c
