@@ -398,4 +398,6 @@ extern const char	*disassembler_style;
 
 void annotation_config__init(void);
 
+int annotate_parse_percent_type(const struct option *opt, const char *_str,
+				int unset);
 #endif	/* __PERF_ANNOTATE_H */
