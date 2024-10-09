@@ -1,0 +1,372 @@
+sched/core: Kill sched_class::task_waking to clean up the migration logic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 59efa0bac9cf8b2ef8d08f7632826c6d90f6a9bb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/59efa0ba.failed
+
+With sched_class::task_waking being called only when we do
+set_task_cpu(), we can make sched_class::migrate_task_rq() do the work
+and eliminate sched_class::task_waking entirely.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Andrew Hunter <ahh@google.com>
+	Cc: Ben Segall <bsegall@google.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Matt Fleming <matt@codeblueprint.co.uk>
+	Cc: Mike Galbraith <efault@gmx.de>
+	Cc: Mike Galbraith <umgwanakikbuti@gmail.com>
+	Cc: Morten Rasmussen <morten.rasmussen@arm.com>
+	Cc: Paul Turner <pjt@google.com>
+	Cc: Pavan Kondeti <pkondeti@codeaurora.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: byungchul.park@lge.com
+	Cc: linux-kernel@vger.kernel.org
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 59efa0bac9cf8b2ef8d08f7632826c6d90f6a9bb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+#	kernel/sched/fair.c
+#	kernel/sched/sched.h
+diff --cc kernel/sched/core.c
+index 1a5e18b224eb,636c4b9cac38..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -1570,10 -1712,17 +1570,16 @@@ ttwu_do_activate(struct rq *rq, struct 
+  #ifdef CONFIG_SMP
+  	if (p->sched_contributes_to_load)
+  		rq->nr_uninterruptible--;
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (wake_flags & WF_MIGRATED)
++ 		en_flags |= ENQUEUE_MIGRATED;
+++>>>>>>> 59efa0bac9cf (sched/core: Kill sched_class::task_waking to clean up the migration logic)
+  #endif
+  
+ -	ttwu_activate(rq, p, en_flags);
+ -	ttwu_do_wakeup(rq, p, wake_flags, cookie);
+ +	ttwu_activate(rq, p, ENQUEUE_WAKEUP | ENQUEUE_WAKING);
+ +	ttwu_do_wakeup(rq, p, wake_flags);
+  }
+  
+  /*
+diff --cc kernel/sched/fair.c
+index a455c3157828,24ce01b73906..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -2804,14 -3254,45 +2804,48 @@@ static inline void check_schedstat_requ
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * MIGRATION
++  *
++  *	dequeue
++  *	  update_curr()
++  *	    update_min_vruntime()
++  *	  vruntime -= min_vruntime
++  *
++  *	enqueue
++  *	  update_curr()
++  *	    update_min_vruntime()
++  *	  vruntime += min_vruntime
++  *
++  * this way the vruntime transition between RQs is done when both
++  * min_vruntime are up-to-date.
++  *
++  * WAKEUP (remote)
++  *
++  *	->migrate_task_rq_fair() (p->state == TASK_WAKING)
++  *	  vruntime -= min_vruntime
++  *
++  *	enqueue
++  *	  update_curr()
++  *	    update_min_vruntime()
++  *	  vruntime += min_vruntime
++  *
++  * this way we don't have the most up-to-date min_vruntime on the originating
++  * CPU and an up-to-date min_vruntime on the destination CPU.
++  */
++ 
+++>>>>>>> 59efa0bac9cf (sched/core: Kill sched_class::task_waking to clean up the migration logic)
+  static void
+  enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+  {
+  	/*
+  	 * Update the normalized vruntime before updating min_vruntime
+ -	 * through calling update_curr().
+ +	 * through callig update_curr().
+  	 */
+- 	if (!(flags & ENQUEUE_WAKEUP) || (flags & ENQUEUE_WAKING))
++ 	if (!(flags & ENQUEUE_WAKEUP) || (flags & ENQUEUE_MIGRATED))
+  		se->vruntime += cfs_rq->min_vruntime;
+  
+  	/*
+@@@ -4098,46 -4841,6 +4132,49 @@@ static unsigned long cpu_avg_load_per_t
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static void record_wakee(struct task_struct *p)
+ +{
+ +	/*
+ +	 * Rough decay (wiping) for cost saving, don't worry
+ +	 * about the boundary, really active task won't care
+ +	 * about the loss.
+ +	 */
+ +	if (jiffies > current->wakee_flip_decay_ts + HZ) {
+ +		current->wakee_flips = 0;
+ +		current->wakee_flip_decay_ts = jiffies;
+ +	}
+ +
+ +	if (current->last_wakee != p) {
+ +		current->last_wakee = p;
+ +		current->wakee_flips++;
+ +	}
+ +}
+ +
+ +static void task_waking_fair(struct task_struct *p)
+ +{
+ +	struct sched_entity *se = &p->se;
+ +	struct cfs_rq *cfs_rq = cfs_rq_of(se);
+ +	u64 min_vruntime;
+ +
+ +#ifndef CONFIG_64BIT
+ +	u64 min_vruntime_copy;
+ +
+ +	do {
+ +		min_vruntime_copy = cfs_rq->min_vruntime_copy;
+ +		smp_rmb();
+ +		min_vruntime = cfs_rq->min_vruntime;
+ +	} while (min_vruntime != min_vruntime_copy);
+ +#else
+ +	min_vruntime = cfs_rq->min_vruntime;
+ +#endif
+ +
+ +	se->vruntime -= min_vruntime;
+ +	record_wakee(p);
+ +}
+ +
+++=======
+++>>>>>>> 59efa0bac9cf (sched/core: Kill sched_class::task_waking to clean up the migration logic)
+  #ifdef CONFIG_FAIR_GROUP_SCHED
+  /*
+   * effective_load() calculates the load change as seen from the root_task_group
+@@@ -4593,27 -5371,56 +4630,61 @@@ unlock
+  /*
+   * Called immediately before a task is migrated to a new cpu; task_cpu(p) and
+   * cfs_rq_of(p) references at time of call are still valid and identify the
+ - * previous cpu. The caller guarantees p->pi_lock or task_rq(p)->lock is held.
+ + * previous cpu.  However, the caller only guarantees p->pi_lock is held; no
+ + * other assumptions, including the state of rq->lock, should be made.
+   */
+ -static void migrate_task_rq_fair(struct task_struct *p)
+ +static void
+ +migrate_task_rq_fair(struct task_struct *p, int next_cpu)
+  {
+ +	struct sched_entity *se = &p->se;
+ +	struct cfs_rq *cfs_rq = cfs_rq_of(se);
+ +
+  	/*
+++<<<<<<< HEAD
+ +	 * Load tracking: accumulate removed load so that it can be processed
+ +	 * when we next update owning cfs_rq under rq->lock.  Tasks contribute
+ +	 * to blocked load iff they have a positive decay-count.  It can never
+ +	 * be negative here since on-rq tasks have decay-count == 0.
+++=======
++ 	 * As blocked tasks retain absolute vruntime the migration needs to
++ 	 * deal with this by subtracting the old and adding the new
++ 	 * min_vruntime -- the latter is done by enqueue_entity() when placing
++ 	 * the task on the new runqueue.
++ 	 */
++ 	if (p->state == TASK_WAKING) {
++ 		struct sched_entity *se = &p->se;
++ 		struct cfs_rq *cfs_rq = cfs_rq_of(se);
++ 		u64 min_vruntime;
++ 
++ #ifndef CONFIG_64BIT
++ 		u64 min_vruntime_copy;
++ 
++ 		do {
++ 			min_vruntime_copy = cfs_rq->min_vruntime_copy;
++ 			smp_rmb();
++ 			min_vruntime = cfs_rq->min_vruntime;
++ 		} while (min_vruntime != min_vruntime_copy);
++ #else
++ 		min_vruntime = cfs_rq->min_vruntime;
++ #endif
++ 
++ 		se->vruntime -= min_vruntime;
++ 	}
++ 
++ 	/*
++ 	 * We are supposed to update the task to "current" time, then its up to date
++ 	 * and ready to go to new CPU/cfs_rq. But we have difficulty in getting
++ 	 * what current time is, so simply throw away the out-of-date time. This
++ 	 * will result in the wakee task is less decayed, but giving the wakee more
++ 	 * load sounds not bad.
+++>>>>>>> 59efa0bac9cf (sched/core: Kill sched_class::task_waking to clean up the migration logic)
+  	 */
+ -	remove_entity_load_avg(&p->se);
+ -
+ -	/* Tell new CPU we are migrated */
+ -	p->se.avg.last_update_time = 0;
+ -
+ -	/* We have migrated, no longer consider this task hot */
+ -	p->se.exec_start = 0;
+ -}
+ -
+ -static void task_dead_fair(struct task_struct *p)
+ -{
+ -	remove_entity_load_avg(&p->se);
+ +	if (se->avg.decay_count) {
+ +		se->avg.decay_count = -__synchronize_entity_decay(se);
+ +		atomic64_add(se->avg.load_avg_contrib, &cfs_rq->removed_load);
+ +	}
+  }
+ +#endif
+  #endif /* CONFIG_SMP */
+  
+  static unsigned long
+@@@ -7791,7 -8671,8 +7862,12 @@@ const struct sched_class fair_sched_cla
+  	.rq_online		= rq_online_fair,
+  	.rq_offline		= rq_offline_fair,
+  
+++<<<<<<< HEAD
+ +	.task_waking		= task_waking_fair,
+++=======
++ 	.task_dead		= task_dead_fair,
++ 	.set_cpus_allowed	= set_cpus_allowed_common,
+++>>>>>>> 59efa0bac9cf (sched/core: Kill sched_class::task_waking to clean up the migration logic)
+  #endif
+  
+  	.set_curr_task          = set_curr_task_fair,
+diff --cc kernel/sched/sched.h
+index 98cec6922405,e51145e76807..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -1131,57 -1150,45 +1131,81 @@@ static inline void update_load_set(stru
+  #define WEIGHT_IDLEPRIO                3
+  #define WMULT_IDLEPRIO         1431655765
+  
+ -extern const int sched_prio_to_weight[40];
+ -extern const u32 sched_prio_to_wmult[40];
+ +/*
+ + * Nice levels are multiplicative, with a gentle 10% change for every
+ + * nice level changed. I.e. when a CPU-bound task goes from nice 0 to
+ + * nice 1, it will get ~10% less CPU time than another CPU-bound task
+ + * that remained on nice 0.
+ + *
+ + * The "10% effect" is relative and cumulative: from _any_ nice level,
+ + * if you go up 1 level, it's -10% CPU usage, if you go down 1 level
+ + * it's +10% CPU usage. (to achieve that we use a multiplier of 1.25.
+ + * If a task goes up by ~10% and another task goes down by ~10% then
+ + * the relative distance between them is ~25%.)
+ + */
+ +static const int prio_to_weight[40] = {
+ + /* -20 */     88761,     71755,     56483,     46273,     36291,
+ + /* -15 */     29154,     23254,     18705,     14949,     11916,
+ + /* -10 */      9548,      7620,      6100,      4904,      3906,
+ + /*  -5 */      3121,      2501,      1991,      1586,      1277,
+ + /*   0 */      1024,       820,       655,       526,       423,
+ + /*   5 */       335,       272,       215,       172,       137,
+ + /*  10 */       110,        87,        70,        56,        45,
+ + /*  15 */        36,        29,        23,        18,        15,
+ +};
+  
+  /*
+++<<<<<<< HEAD
+ + * Inverse (2^32/x) values of the prio_to_weight[] array, precalculated.
+++=======
++  * {de,en}queue flags:
++  *
++  * DEQUEUE_SLEEP  - task is no longer runnable
++  * ENQUEUE_WAKEUP - task just became runnable
++  *
++  * SAVE/RESTORE - an otherwise spurious dequeue/enqueue, done to ensure tasks
++  *                are in a known state which allows modification. Such pairs
++  *                should preserve as much state as possible.
++  *
++  * MOVE - paired with SAVE/RESTORE, explicitly does not preserve the location
++  *        in the runqueue.
++  *
++  * ENQUEUE_HEAD      - place at front of runqueue (tail if not specified)
++  * ENQUEUE_REPLENISH - CBS (replenish runtime and postpone deadline)
++  * ENQUEUE_MIGRATED  - the task was migrated during wakeup
+++>>>>>>> 59efa0bac9cf (sched/core: Kill sched_class::task_waking to clean up the migration logic)
+   *
+ + * In cases where the weight does not change often, we can use the
+ + * precalculated inverse to speed up arithmetics by turning divisions
+ + * into multiplications:
+   */
+ +static const u32 prio_to_wmult[40] = {
+ + /* -20 */     48388,     59856,     76040,     92818,    118348,
+ + /* -15 */    147320,    184698,    229616,    287308,    360437,
+ + /* -10 */    449829,    563644,    704093,    875809,   1099582,
+ + /*  -5 */   1376151,   1717300,   2157191,   2708050,   3363326,
+ + /*   0 */   4194304,   5237765,   6557202,   8165337,  10153587,
+ + /*   5 */  12820798,  15790321,  19976592,  24970740,  31350126,
+ + /*  10 */  39045157,  49367440,  61356676,  76695844,  95443717,
+ + /*  15 */ 119304647, 148102320, 186737708, 238609294, 286331153,
+ +};
+  
+ -#define DEQUEUE_SLEEP		0x01
+ -#define DEQUEUE_SAVE		0x02 /* matches ENQUEUE_RESTORE */
+ -#define DEQUEUE_MOVE		0x04 /* matches ENQUEUE_MOVE */
+ -
+ -#define ENQUEUE_WAKEUP		0x01
+ -#define ENQUEUE_RESTORE		0x02
+ -#define ENQUEUE_MOVE		0x04
+ -
+ -#define ENQUEUE_HEAD		0x08
+ -#define ENQUEUE_REPLENISH	0x10
+ +#define ENQUEUE_WAKEUP		1
+ +#define ENQUEUE_HEAD		2
+  #ifdef CONFIG_SMP
+++<<<<<<< HEAD
+ +#define ENQUEUE_WAKING		4	/* sched_class::task_waking was called */
+ +#else
+ +#define ENQUEUE_WAKING		0
+++=======
++ #define ENQUEUE_MIGRATED	0x20
++ #else
++ #define ENQUEUE_MIGRATED	0x00
+++>>>>>>> 59efa0bac9cf (sched/core: Kill sched_class::task_waking to clean up the migration logic)
+  #endif
+ +#define ENQUEUE_REPLENISH	8
+  
+ -#define RETRY_TASK		((void *)-1UL)
+ +#define DEQUEUE_SLEEP		1
+  
+  struct sched_class {
+  	const struct sched_class *next;
+@@@ -1198,11 -1215,8 +1222,14 @@@
+  
+  #ifdef CONFIG_SMP
+  	int  (*select_task_rq)(struct task_struct *p, int task_cpu, int sd_flag, int flags);
+ -	void (*migrate_task_rq)(struct task_struct *p);
+ -
+ +	void (*migrate_task_rq)(struct task_struct *p, int next_cpu);
+ +
+++<<<<<<< HEAD
+ +	void (*pre_schedule) (struct rq *this_rq, struct task_struct *task);
+ +	void (*post_schedule) (struct rq *this_rq);
+ +	void (*task_waking) (struct task_struct *task);
+++=======
+++>>>>>>> 59efa0bac9cf (sched/core: Kill sched_class::task_waking to clean up the migration logic)
+  	void (*task_woken) (struct rq *this_rq, struct task_struct *task);
+  
+  	void (*set_cpus_allowed)(struct task_struct *p,
+* Unmerged path kernel/sched/core.c
+* Unmerged path kernel/sched/fair.c
+* Unmerged path kernel/sched/sched.h
