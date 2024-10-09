@@ -149,6 +149,7 @@ static inline u32 no_reboot_bit(void)
 	u32 enable_bit;
 
 	switch (iTCO_wdt_private.iTCO_version) {
+	case 5:
 	case 3:
 		enable_bit = 0x00000010;
 		break;
@@ -511,6 +512,7 @@ static int iTCO_wdt_probe(struct platform_device *dev)
 
 	/* Clear out the (probably old) status */
 	switch (iTCO_wdt_private.iTCO_version) {
+	case 5:
 	case 4:
 		outw(0x0008, TCO1_STS);	/* Clear the Time Out Status bit */
 		outw(0x0002, TCO2_STS);	/* Clear SECOND_TO_STS bit */
