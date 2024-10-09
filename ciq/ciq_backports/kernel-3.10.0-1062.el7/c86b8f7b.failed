@@ -1,0 +1,166 @@
+nvmet: add AEN configuration support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit c86b8f7b4144affc4daa8b4047cd4da936b087ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/c86b8f7b.failed
+
+AEN configuration via the 'Get Features' and 'Set Features' admin
+command is mandatory, so we should be implemeting handling for it.
+
+	Signed-off-by: Hannes Reinecke <hare@suse.com>
+[hch: use WRITE_ONCE, check for invalid values]
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: Daniel Verkamp <daniel.verkamp@intel.com>
+(cherry picked from commit c86b8f7b4144affc4daa8b4047cd4da936b087ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/target/core.c
+diff --cc drivers/nvme/target/core.c
+index 81b808ef54e8,5a086b670f42..000000000000
+--- a/drivers/nvme/target/core.c
++++ b/drivers/nvme/target/core.c
+@@@ -142,6 -144,44 +142,47 @@@ static void nvmet_add_async_event(struc
+  	schedule_work(&ctrl->async_event_work);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nvmet_add_to_changed_ns_log(struct nvmet_ctrl *ctrl, __le32 nsid)
++ {
++ 	u32 i;
++ 
++ 	mutex_lock(&ctrl->lock);
++ 	if (ctrl->nr_changed_ns > NVME_MAX_CHANGED_NAMESPACES)
++ 		goto out_unlock;
++ 
++ 	for (i = 0; i < ctrl->nr_changed_ns; i++) {
++ 		if (ctrl->changed_ns_list[i] == nsid)
++ 			goto out_unlock;
++ 	}
++ 
++ 	if (ctrl->nr_changed_ns == NVME_MAX_CHANGED_NAMESPACES) {
++ 		ctrl->changed_ns_list[0] = cpu_to_le32(0xffffffff);
++ 		ctrl->nr_changed_ns = U32_MAX;
++ 		goto out_unlock;
++ 	}
++ 
++ 	ctrl->changed_ns_list[ctrl->nr_changed_ns++] = nsid;
++ out_unlock:
++ 	mutex_unlock(&ctrl->lock);
++ }
++ 
++ static void nvmet_ns_changed(struct nvmet_subsys *subsys, u32 nsid)
++ {
++ 	struct nvmet_ctrl *ctrl;
++ 
++ 	list_for_each_entry(ctrl, &subsys->ctrls, subsys_entry) {
++ 		nvmet_add_to_changed_ns_log(ctrl, cpu_to_le32(nsid));
++ 		if (!(READ_ONCE(ctrl->aen_enabled) & NVME_AEN_CFG_NS_ATTR))
++ 			continue;
++ 		nvmet_add_async_event(ctrl, NVME_AER_TYPE_NOTICE,
++ 				NVME_AER_NOTICE_NS_CHANGED,
++ 				NVME_LOG_CHANGED_NS);
++ 	}
++ }
++ 
+++>>>>>>> c86b8f7b4144 (nvmet: add AEN configuration support)
+  int nvmet_register_transport(const struct nvmet_fabrics_ops *ops)
+  {
+  	int ret = 0;
+@@@ -810,7 -863,13 +851,8 @@@ u16 nvmet_alloc_ctrl(const char *subsys
+  
+  	kref_init(&ctrl->ref);
+  	ctrl->subsys = subsys;
++ 	WRITE_ONCE(ctrl->aen_enabled, NVMET_AEN_CFG_OPTIONAL);
+  
+ -	ctrl->changed_ns_list = kmalloc_array(NVME_MAX_CHANGED_NAMESPACES,
+ -			sizeof(__le32), GFP_KERNEL);
+ -	if (!ctrl->changed_ns_list)
+ -		goto out_free_ctrl;
+ -
+  	ctrl->cqs = kcalloc(subsys->max_qid + 1,
+  			sizeof(struct nvmet_cq *),
+  			GFP_KERNEL);
+diff --git a/drivers/nvme/target/admin-cmd.c b/drivers/nvme/target/admin-cmd.c
+index 4adff15ff6c3..60497adb9ae8 100644
+--- a/drivers/nvme/target/admin-cmd.c
++++ b/drivers/nvme/target/admin-cmd.c
+@@ -164,7 +164,7 @@ static void nvmet_execute_identify_ctrl(struct nvmet_req *req)
+ 	id->ver = cpu_to_le32(ctrl->subsys->ver);
+ 
+ 	/* XXX: figure out what to do about RTD3R/RTD3 */
+-	id->oaes = cpu_to_le32(1 << 8);
++	id->oaes = cpu_to_le32(NVMET_AEN_CFG_OPTIONAL);
+ 	id->ctratt = cpu_to_le32(1 << 0);
+ 
+ 	id->oacs = 0;
+@@ -412,6 +412,16 @@ static void nvmet_execute_set_features(struct nvmet_req *req)
+ 		req->sq->ctrl->kato = DIV_ROUND_UP(val32, 1000);
+ 		nvmet_set_result(req, req->sq->ctrl->kato);
+ 		break;
++	case NVME_FEAT_ASYNC_EVENT:
++		val32 = le32_to_cpu(req->cmd->common.cdw10[1]);
++		if (val32 & ~NVMET_AEN_CFG_ALL) {
++			status = NVME_SC_INVALID_FIELD | NVME_SC_DNR;
++			break;
++		}
++
++		WRITE_ONCE(req->sq->ctrl->aen_enabled, val32);
++		nvmet_set_result(req, val32);
++		break;
+ 	case NVME_FEAT_HOST_ID:
+ 		status = NVME_SC_CMD_SEQ_ERROR | NVME_SC_DNR;
+ 		break;
+@@ -450,9 +460,10 @@ static void nvmet_execute_get_features(struct nvmet_req *req)
+ 		break;
+ 	case NVME_FEAT_WRITE_ATOMIC:
+ 		break;
++#endif
+ 	case NVME_FEAT_ASYNC_EVENT:
++		nvmet_set_result(req, READ_ONCE(req->sq->ctrl->aen_enabled));
+ 		break;
+-#endif
+ 	case NVME_FEAT_VOLATILE_WC:
+ 		nvmet_set_result(req, 1);
+ 		break;
+* Unmerged path drivers/nvme/target/core.c
+diff --git a/drivers/nvme/target/nvmet.h b/drivers/nvme/target/nvmet.h
+index 292d4d16ab7f..9e2be59ceaba 100644
+--- a/drivers/nvme/target/nvmet.h
++++ b/drivers/nvme/target/nvmet.h
+@@ -30,6 +30,21 @@
+ #define NVMET_ASYNC_EVENTS		4
+ #define NVMET_ERROR_LOG_SLOTS		128
+ 
++
++/*
++ * Supported optional AENs:
++ */
++#define NVMET_AEN_CFG_OPTIONAL \
++	NVME_AEN_CFG_NS_ATTR
++
++/*
++ * Plus mandatory SMART AENs (we'll never send them, but allow enabling them):
++ */
++#define NVMET_AEN_CFG_ALL \
++	(NVME_SMART_CRIT_SPARE | NVME_SMART_CRIT_TEMPERATURE | \
++	 NVME_SMART_CRIT_RELIABILITY | NVME_SMART_CRIT_MEDIA | \
++	 NVME_SMART_CRIT_VOLATILE_MEMORY | NVMET_AEN_CFG_OPTIONAL)
++
+ /* Helper Macros when NVMe error is NVME_SC_CONNECT_INVALID_PARAM
+  * The 16 bit shift is to set IATTR bit to 1, which means offending
+  * offset starts in the data section of connect()
+@@ -120,6 +135,7 @@ struct nvmet_ctrl {
+ 	u16			cntlid;
+ 	u32			kato;
+ 
++	u32			aen_enabled;
+ 	struct nvmet_req	*async_event_cmds[NVMET_ASYNC_EVENTS];
+ 	unsigned int		nr_async_event_cmds;
+ 	struct list_head	async_events;
