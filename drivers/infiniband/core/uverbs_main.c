@@ -924,10 +924,7 @@ static int ib_uverbs_close(struct inode *inode, struct file *filp)
 	idr_destroy(&file->idr);
 
 	mutex_lock(&file->device->lists_mutex);
-	if (!file->is_closed) {
-		list_del(&file->list);
-		file->is_closed = 1;
-	}
+	list_del_init(&file->list);
 	mutex_unlock(&file->device->lists_mutex);
 
 	if (file->async_file)
@@ -1158,8 +1155,7 @@ static void ib_uverbs_free_hw_resources(struct ib_uverbs_device *uverbs_dev,
 		struct ib_ucontext *ucontext;
 		file = list_first_entry(&uverbs_dev->uverbs_file_list,
 					struct ib_uverbs_file, list);
-		file->is_closed = 1;
-		list_del(&file->list);
+		list_del_init(&file->list);
 		kref_get(&file->ref);
 		mutex_unlock(&uverbs_dev->lists_mutex);
 
