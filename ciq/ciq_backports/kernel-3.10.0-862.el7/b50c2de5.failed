@@ -1,0 +1,179 @@
+ceph: choose readdir frag based on previous readdir reply
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Yan, Zheng <zyan@redhat.com>
+commit b50c2de51e611da90cf3cf04c058f7e9bbe79e93
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b50c2de5.failed
+
+The dirfragtree is lazily updated, it's not always accurate. Infinite
+loops happens in following circumstance.
+
+- client send request to read frag A
+- frag A has been fragmented into frag B and C. So mds fills the reply
+  with contents of frag B
+- client wants to read next frag C. ceph_choose_frag(frag value of C)
+  return frag A.
+
+The fix is using previous readdir reply to calculate next readdir frag
+when possible.
+
+	Signed-off-by: "Yan, Zheng" <zyan@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit b50c2de51e611da90cf3cf04c058f7e9bbe79e93)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/dir.c
+diff --cc fs/ceph/dir.c
+index ae8662bc47cc,e071d23f6148..000000000000
+--- a/fs/ceph/dir.c
++++ b/fs/ceph/dir.c
+@@@ -243,13 -292,12 +243,13 @@@ static int ceph_readdir(struct file *fi
+  	struct ceph_inode_info *ci = ceph_inode(inode);
+  	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
+  	struct ceph_mds_client *mdsc = fsc->mdsc;
+ -	int i;
+ +	unsigned frag = fpos_frag(filp->f_pos);
+ +	int off = fpos_off(filp->f_pos);
+  	int err;
+- 	u32 ftype;
++ 	unsigned frag = -1;
+  	struct ceph_mds_reply_info_parsed *rinfo;
+  
+ -	dout("readdir %p file %p pos %llx\n", inode, file, ctx->pos);
+ +	dout("readdir %p filp %p frag %u off %u\n", inode, filp, frag, off);
+  	if (fi->flags & CEPH_F_ATEND)
+  		return 0;
+  
+@@@ -306,6 -350,16 +306,19 @@@ more
+  			fi->last_readdir = NULL;
+  		}
+  
+++<<<<<<< HEAD
+++=======
++ 		if (is_hash_order(ctx->pos)) {
++ 			/* fragtree isn't always accurate. choose frag
++ 			 * based on previous reply when possible. */
++ 			if (frag == (unsigned)-1)
++ 				frag = ceph_choose_frag(ci, fpos_hash(ctx->pos),
++ 							NULL, NULL);
++ 		} else {
++ 			frag = fpos_frag(ctx->pos);
++ 		}
++ 
+++>>>>>>> b50c2de51e61 (ceph: choose readdir frag based on previous readdir reply)
+  		dout("readdir fetching %llx.%llx frag %x offset '%s'\n",
+  		     ceph_vinop(inode), frag, fi->last_name);
+  		req = ceph_mdsc_create_request(mdsc, op, USE_AUTH_MDS);
+@@@ -396,47 -460,73 +409,72 @@@
+  	}
+  
+  	rinfo = &fi->last_readdir->r_reply_info;
+ -	dout("readdir frag %x num %d pos %llx chunk first %llx\n",
+ -	     fi->frag, rinfo->dir_nr, ctx->pos,
+ -	     rinfo->dir_nr ? rinfo->dir_entries[0].offset : 0LL);
+ -
+ -	i = 0;
+ -	/* search start position */
+ -	if (rinfo->dir_nr > 0) {
+ -		int step, nr = rinfo->dir_nr;
+ -		while (nr > 0) {
+ -			step = nr >> 1;
+ -			if (rinfo->dir_entries[i + step].offset < ctx->pos) {
+ -				i +=  step + 1;
+ -				nr -= step + 1;
+ -			} else {
+ -				nr = step;
+ -			}
+ -		}
+ -	}
+ -	for (; i < rinfo->dir_nr; i++) {
+ -		struct ceph_mds_reply_dir_entry *rde = rinfo->dir_entries + i;
+ +	dout("readdir frag %x num %d off %d chunkoff %d\n", frag,
+ +	     rinfo->dir_nr, off, fi->offset);
+ +	while (off >= fi->offset && off - fi->offset < rinfo->dir_nr) {
+ +		u64 pos = ceph_make_fpos(frag, off);
+ +		struct ceph_mds_reply_inode *in =
+ +			rinfo->dir_in[off - fi->offset].in;
+  		struct ceph_vino vino;
+  		ino_t ino;
++ 		u32 ftype;
+  
+ -		BUG_ON(rde->offset < ctx->pos);
+ -
+ -		ctx->pos = rde->offset;
+ -		dout("readdir (%d/%d) -> %llx '%.*s' %p\n",
+ -		     i, rinfo->dir_nr, ctx->pos,
+ -		     rde->name_len, rde->name, &rde->inode.in);
+ -
+ -		BUG_ON(!rde->inode.in);
+ -		ftype = le32_to_cpu(rde->inode.in->mode) >> 12;
+ -		vino.ino = le64_to_cpu(rde->inode.in->ino);
+ -		vino.snap = le64_to_cpu(rde->inode.in->snapid);
+ +		dout("readdir off %d (%d/%d) -> %lld '%.*s' %p\n",
+ +		     off, off - fi->offset, rinfo->dir_nr, pos,
+ +		     rinfo->dir_dname_len[off - fi->offset],
+ +		     rinfo->dir_dname[off - fi->offset], in);
+ +		BUG_ON(!in);
+ +		ftype = le32_to_cpu(in->mode) >> 12;
+ +		vino.ino = le64_to_cpu(in->ino);
+ +		vino.snap = le64_to_cpu(in->snapid);
+  		ino = ceph_vino_to_ino(vino);
+ -
+ -		if (!dir_emit(ctx, rde->name, rde->name_len,
+ -			      ceph_translate_ino(inode->i_sb, ino), ftype)) {
+ +		if (filldir(dirent,
+ +			    rinfo->dir_dname[off - fi->offset],
+ +			    rinfo->dir_dname_len[off - fi->offset],
+ +			    pos,
+ +			    ceph_translate_ino(inode->i_sb, ino), ftype) < 0) {
+  			dout("filldir stopping us...\n");
+  			return 0;
+  		}
+ -		ctx->pos++;
+ +		off++;
+ +		filp->f_pos = pos + 1;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (fi->last_name) {
+ +		ceph_mdsc_put_request(fi->last_readdir);
+ +		fi->last_readdir = NULL;
+++=======
++ 	ceph_mdsc_put_request(fi->last_readdir);
++ 	fi->last_readdir = NULL;
++ 
++ 	if (fi->next_offset > 2) {
++ 		frag = fi->frag;
+++>>>>>>> b50c2de51e61 (ceph: choose readdir frag based on previous readdir reply)
+  		goto more;
+  	}
+  
+  	/* more frags? */
+++<<<<<<< HEAD
+ +	if (!ceph_frag_is_rightmost(frag)) {
+ +		frag = ceph_frag_next(frag);
+ +		off = 0;
+ +		filp->f_pos = ceph_make_fpos(frag, off);
+++=======
++ 	if (!ceph_frag_is_rightmost(fi->frag)) {
++ 		frag = ceph_frag_next(fi->frag);
++ 		if (is_hash_order(ctx->pos)) {
++ 			loff_t new_pos = ceph_make_fpos(ceph_frag_value(frag),
++ 							fi->next_offset, true);
++ 			if (new_pos > ctx->pos)
++ 				ctx->pos = new_pos;
++ 			/* keep last_name */
++ 		} else {
++ 			ctx->pos = ceph_make_fpos(frag, fi->next_offset, false);
++ 			kfree(fi->last_name);
++ 			fi->last_name = NULL;
++ 		}
+++>>>>>>> b50c2de51e61 (ceph: choose readdir frag based on previous readdir reply)
+  		dout("readdir next frag is %x\n", frag);
+  		goto more;
+  	}
+* Unmerged path fs/ceph/dir.c
