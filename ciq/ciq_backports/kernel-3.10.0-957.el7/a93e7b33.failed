@@ -1,0 +1,184 @@
+uio: Prevent device destruction while fds are open
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [uio] Prevent device destruction while fds are open (Xiubo Li) [1560418]
+Rebuild_FUZZ: 94.74%
+commit-author Hamish Martin <hamish.martin@alliedtelesis.co.nz>
+commit a93e7b331568227500186a465fee3c2cb5dffd1f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/a93e7b33.failed
+
+Prevent destruction of a uio_device while user space apps hold open
+file descriptors to that device. Further, access to the 'info' member
+of the struct uio_device is protected by spinlock. This is to ensure
+stale pointers to data not under control of the UIO subsystem are not
+dereferenced.
+
+	Signed-off-by: Hamish Martin <hamish.martin@alliedtelesis.co.nz>
+	Reviewed-by: Chris Packham <chris.packham@alliedtelesis.co.nz>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit a93e7b331568227500186a465fee3c2cb5dffd1f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/uio/uio.c
+#	include/linux/uio_driver.h
+diff --cc drivers/uio/uio.c
+index 6a5a7703969f,e8f4ac9400ea..000000000000
+--- a/drivers/uio/uio.c
++++ b/drivers/uio/uio.c
+@@@ -266,13 -270,17 +266,19 @@@ static int uio_dev_add_attributes(struc
+  		if (!map_found) {
+  			map_found = 1;
+  			idev->map_dir = kobject_create_and_add("maps",
+++<<<<<<< HEAD
+ +							&idev->dev->kobj);
+ +			if (!idev->map_dir)
+++=======
++ 							&idev->dev.kobj);
++ 			if (!idev->map_dir) {
++ 				ret = -ENOMEM;
+++>>>>>>> a93e7b331568 (uio: Prevent device destruction while fds are open)
+  				goto err_map;
+ -			}
+  		}
+  		map = kzalloc(sizeof(*map), GFP_KERNEL);
+ -		if (!map) {
+ -			ret = -ENOMEM;
+ +		if (!map)
+  			goto err_map;
+ -		}
+  		kobject_init(&map->kobj, &map_attr_type);
+  		map->mem = mem;
+  		mem->map = map;
+@@@ -291,13 -299,17 +297,19 @@@
+  		if (!portio_found) {
+  			portio_found = 1;
+  			idev->portio_dir = kobject_create_and_add("portio",
+++<<<<<<< HEAD
+ +							&idev->dev->kobj);
+ +			if (!idev->portio_dir)
+++=======
++ 							&idev->dev.kobj);
++ 			if (!idev->portio_dir) {
++ 				ret = -ENOMEM;
+++>>>>>>> a93e7b331568 (uio: Prevent device destruction while fds are open)
+  				goto err_portio;
+ -			}
+  		}
+  		portio = kzalloc(sizeof(*portio), GFP_KERNEL);
+ -		if (!portio) {
+ -			ret = -ENOMEM;
+ +		if (!portio)
+  			goto err_portio;
+ -		}
+  		kobject_init(&portio->kobj, &portio_attr_type);
+  		portio->port = port;
+  		port->portio = portio;
+@@@ -835,16 -871,21 +883,21 @@@ int __uio_register_device(struct modul
+  
+  	ret = uio_get_minor(idev);
+  	if (ret)
+ -		return ret;
+ +		goto err_get_minor;
+  
+- 	idev->dev = device_create(&uio_class, parent,
+- 				  MKDEV(uio_major, idev->minor), idev,
+- 				  "uio%d", idev->minor);
+- 	if (IS_ERR(idev->dev)) {
+- 		printk(KERN_ERR "UIO: device register failed\n");
+- 		ret = PTR_ERR(idev->dev);
++ 	idev->dev.devt = MKDEV(uio_major, idev->minor);
++ 	idev->dev.class = &uio_class;
++ 	idev->dev.parent = parent;
++ 	idev->dev.release = uio_device_release;
++ 	dev_set_drvdata(&idev->dev, idev);
++ 
++ 	ret = dev_set_name(&idev->dev, "uio%d", idev->minor);
++ 	if (ret)
++ 		goto err_device_create;
++ 
++ 	ret = device_register(&idev->dev);
++ 	if (ret)
+  		goto err_device_create;
+- 	}
+  
+  	ret = uio_dev_add_attributes(idev);
+  	if (ret)
+@@@ -864,12 -913,9 +917,12 @@@
+  err_request_irq:
+  	uio_dev_del_attributes(idev);
+  err_uio_dev_add_attributes:
+- 	device_destroy(&uio_class, MKDEV(uio_major, idev->minor));
++ 	device_unregister(&idev->dev);
+  err_device_create:
+  	uio_free_minor(idev);
+ +err_get_minor:
+ +	kfree(idev);
+ +err_kzalloc:
+  	return ret;
+  }
+  EXPORT_SYMBOL_GPL(__uio_register_device);
+@@@ -890,13 -937,16 +944,21 @@@ void uio_unregister_device(struct uio_i
+  
+  	uio_free_minor(idev);
+  
+ -	uio_dev_del_attributes(idev);
+ -
+ -	if (info->irq && info->irq != UIO_IRQ_CUSTOM)
+ +	if (info->irq && (info->irq != UIO_IRQ_CUSTOM))
+  		free_irq(info->irq, idev);
+  
+++<<<<<<< HEAD
+ +	uio_dev_del_attributes(idev);
+ +
+ +	device_destroy(&uio_class, MKDEV(uio_major, idev->minor));
+ +	kfree(idev);
+++=======
++ 	spin_lock_irqsave(&idev->info_lock, flags);
++ 	idev->info = NULL;
++ 	spin_unlock_irqrestore(&idev->info_lock, flags);
++ 
++ 	device_unregister(&idev->dev);
+++>>>>>>> a93e7b331568 (uio: Prevent device destruction while fds are open)
+  
+  	return;
+  }
+diff --cc include/linux/uio_driver.h
+index 9122e4758846,6c5f2074e14f..000000000000
+--- a/include/linux/uio_driver.h
++++ b/include/linux/uio_driver.h
+@@@ -64,16 -68,16 +65,29 @@@ struct uio_port 
+  #define MAX_UIO_PORT_REGIONS	5
+  
+  struct uio_device {
+++<<<<<<< HEAD
+ +	struct module           *owner;
+ +	struct device           *dev;
+ +	int                     minor;
+ +	atomic_t                event;
+ +	struct fasync_struct    *async_queue;
+ +	wait_queue_head_t       wait;
+ +	int                     vma_count;
+ +	struct uio_info         *info;
+ +	struct kobject          *map_dir;
+ +	struct kobject          *portio_dir;
+++=======
++         struct module           *owner;
++ 	struct device		dev;
++         int                     minor;
++         atomic_t                event;
++         struct fasync_struct    *async_queue;
++         wait_queue_head_t       wait;
++         struct uio_info         *info;
++ 	spinlock_t		info_lock;
++         struct kobject          *map_dir;
++         struct kobject          *portio_dir;
+++>>>>>>> a93e7b331568 (uio: Prevent device destruction while fds are open)
+  };
+  
+  /**
+* Unmerged path drivers/uio/uio.c
+* Unmerged path include/linux/uio_driver.h
