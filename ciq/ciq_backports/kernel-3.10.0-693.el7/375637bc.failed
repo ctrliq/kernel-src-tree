@@ -1,0 +1,265 @@
+perf/core: Introduce address range filtering
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Alexander Shishkin <alexander.shishkin@linux.intel.com>
+commit 375637bc524952f1122ea22caf5a8f1fecad8228
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/375637bc.failed
+
+Many instruction tracing PMUs out there support address range-based
+filtering, which would, for example, generate trace data only for a
+given range of instruction addresses, which is useful for tracing
+individual functions, modules or libraries. Other PMUs may also
+utilize this functionality to allow filtering to or filtering out
+code at certain address ranges.
+
+This patch introduces the interface for userspace to specify these
+filters and for the PMU drivers to apply these filters to hardware
+configuration.
+
+The user interface is an ASCII string that is passed via an ioctl()
+and specifies (in the form of an ASCII string) address ranges within
+certain object files or within kernel. There is no special treatment
+for kernel modules yet, but it might be a worthy pursuit.
+
+The PMU driver interface basically adds two extra callbacks to the
+PMU driver structure, one of which validates the filter configuration
+proposed by the user against what the hardware is actually capable of
+doing and the other one translates hardware-independent filter
+configuration into something that can be programmed into the
+hardware.
+
+	Signed-off-by: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Mathieu Poirier <mathieu.poirier@linaro.org>
+	Cc: Arnaldo Carvalho de Melo <acme@infradead.org>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Stephane Eranian <eranian@google.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Vince Weaver <vincent.weaver@maine.edu>
+	Cc: vince@deater.net
+Link: http://lkml.kernel.org/r/1461771888-10409-6-git-send-email-alexander.shishkin@linux.intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 375637bc524952f1122ea22caf5a8f1fecad8228)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/perf_event.h
+#	kernel/events/core.c
+diff --cc include/linux/perf_event.h
+index 00260788372f,c77e4a159fa2..000000000000
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@@ -151,24 -145,23 +151,33 @@@ struct hw_perf_event 
+  		};
+  #endif
+  	};
+ -	/*
+ -	 * If the event is a per task event, this will point to the task in
+ -	 * question. See the comment in perf_event_alloc().
+ -	 */
+ -	struct task_struct		*target;
+ +	int				state;
+ +	local64_t			prev_count;
+ +	u64				sample_period;
+ +	u64				last_period;
+ +	local64_t			period_left;
+ +	u64                             interrupts_seq;
+ +	u64				interrupts;
+ +
+ +	u64				freq_time_stamp;
+ +	u64				freq_count_stamp;
+ +
+ +	RH_KABI_EXTEND(struct event_constraint *constraint)
+ +	RH_KABI_EXTEND(struct task_struct	*target)
+ +#endif
+ +};
+  
++ 	/*
++ 	 * PMU would store hardware filter configuration
++ 	 * here.
++ 	 */
++ 	void				*addr_filters;
++ 
++ 	/* Last sync'ed generation of filters */
++ 	unsigned long			addr_filters_gen;
++ 
+  /*
+ - * hw_perf_event::state flags; used to track the PERF_EF_* state.
+ + * hw_perf_event::state flags
+   */
+  #define PERF_HES_STOPPED	0x01 /* the counter is stopped */
+  #define PERF_HES_UPTODATE	0x02 /* event->count up-to-date */
+@@@ -322,8 -402,71 +334,76 @@@ struct pmu 
+  	/*
+  	 * Free pmu-private AUX data structures
+  	 */
+++<<<<<<< HEAD
+ +	RH_KABI_EXTEND(void (*free_aux)		(void *aux)) /* optional */
+ +	RH_KABI_EXTEND(atomic_t			exclusive_cnt) /* < 0: cpu; > 0: tsk */
+++=======
++ 	void (*free_aux)		(void *aux); /* optional */
++ 
++ 	/*
++ 	 * Validate address range filters: make sure the HW supports the
++ 	 * requested configuration and number of filters; return 0 if the
++ 	 * supplied filters are valid, -errno otherwise.
++ 	 *
++ 	 * Runs in the context of the ioctl()ing process and is not serialized
++ 	 * with the rest of the PMU callbacks.
++ 	 */
++ 	int (*addr_filters_validate)	(struct list_head *filters);
++ 					/* optional */
++ 
++ 	/*
++ 	 * Synchronize address range filter configuration:
++ 	 * translate hw-agnostic filters into hardware configuration in
++ 	 * event::hw::addr_filters.
++ 	 *
++ 	 * Runs as a part of filter sync sequence that is done in ->start()
++ 	 * callback by calling perf_event_addr_filters_sync().
++ 	 *
++ 	 * May (and should) traverse event::addr_filters::list, for which its
++ 	 * caller provides necessary serialization.
++ 	 */
++ 	void (*addr_filters_sync)	(struct perf_event *event);
++ 					/* optional */
++ 
++ 	/*
++ 	 * Filter events for PMU-specific reasons.
++ 	 */
++ 	int (*filter_match)		(struct perf_event *event); /* optional */
+++>>>>>>> 375637bc5249 (perf/core: Introduce address range filtering)
++ };
++ 
++ /**
++  * struct perf_addr_filter - address range filter definition
++  * @entry:	event's filter list linkage
++  * @inode:	object file's inode for file-based filters
++  * @offset:	filter range offset
++  * @size:	filter range size
++  * @range:	1: range, 0: address
++  * @filter:	1: filter/start, 0: stop
++  *
++  * This is a hardware-agnostic filter configuration as specified by the user.
++  */
++ struct perf_addr_filter {
++ 	struct list_head	entry;
++ 	struct inode		*inode;
++ 	unsigned long		offset;
++ 	unsigned long		size;
++ 	unsigned int		range	: 1,
++ 				filter	: 1;
++ };
++ 
++ /**
++  * struct perf_addr_filters_head - container for address range filters
++  * @list:	list of filters for this event
++  * @lock:	spinlock that serializes accesses to the @list and event's
++  *		(and its children's) filter generations.
++  *
++  * A child event will use parent's @list (and therefore @lock), so they are
++  * bundled together; see perf_event_addr_filters().
++  */
++ struct perf_addr_filters_head {
++ 	struct list_head	list;
++ 	raw_spinlock_t		lock;
+  };
+  
+  /**
+@@@ -958,8 -1142,41 +1044,37 @@@ static inline bool has_aux(struct perf_
+  	return event->pmu->setup_aux;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool is_write_backward(struct perf_event *event)
++ {
++ 	return !!event->attr.write_backward;
++ }
++ 
++ static inline bool has_addr_filter(struct perf_event *event)
++ {
++ 	return event->pmu->nr_addr_filters;
++ }
++ 
++ /*
++  * An inherited event uses parent's filters
++  */
++ static inline struct perf_addr_filters_head *
++ perf_event_addr_filters(struct perf_event *event)
++ {
++ 	struct perf_addr_filters_head *ifh = &event->addr_filters;
++ 
++ 	if (event->parent)
++ 		ifh = &event->parent->addr_filters;
++ 
++ 	return ifh;
++ }
++ 
++ extern void perf_event_addr_filters_sync(struct perf_event *event);
++ 
+++>>>>>>> 375637bc5249 (perf/core: Introduce address range filtering)
+  extern int perf_output_begin(struct perf_output_handle *handle,
+  			     struct perf_event *event, unsigned int size);
+ -extern int perf_output_begin_forward(struct perf_output_handle *handle,
+ -				    struct perf_event *event,
+ -				    unsigned int size);
+ -extern int perf_output_begin_backward(struct perf_output_handle *handle,
+ -				      struct perf_event *event,
+ -				      unsigned int size);
+ -
+  extern void perf_output_end(struct perf_output_handle *handle);
+  extern unsigned int perf_output_copy(struct perf_output_handle *handle,
+  			     const void *buf, unsigned int len);
+diff --cc kernel/events/core.c
+index e603c21f5d0b,ffdc096a4f4e..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -42,6 -42,10 +42,13 @@@
+  #include <linux/module.h>
+  #include <linux/mman.h>
+  #include <linux/compat.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/bpf.h>
++ #include <linux/filter.h>
++ #include <linux/namei.h>
++ #include <linux/parser.h>
+++>>>>>>> 375637bc5249 (perf/core: Introduce address range filtering)
+  
+  #include "internal.h"
+  
+@@@ -3752,6 -3852,10 +3835,13 @@@ static void _free_event(struct perf_eve
+  			put_callchain_buffers();
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	perf_event_free_bpf_prog(event);
++ 	perf_addr_filters_splice(event, NULL);
++ 	kfree(event->addr_filters_offs);
++ 
+++>>>>>>> 375637bc5249 (perf/core: Introduce address range filtering)
+  	if (event->destroy)
+  		event->destroy(event);
+  
+@@@ -7932,8 -8705,10 +8517,9 @@@ perf_event_alloc(struct perf_event_att
+  	INIT_LIST_HEAD(&event->sibling_list);
+  	INIT_LIST_HEAD(&event->rb_entry);
+  	INIT_LIST_HEAD(&event->active_entry);
++ 	INIT_LIST_HEAD(&event->addr_filters.list);
+  	INIT_HLIST_NODE(&event->hlist_entry);
+  
+ -
+  	init_waitqueue_head(&event->waitq);
+  	init_irq_work(&event->pending, perf_pending_event);
+  
+* Unmerged path include/linux/perf_event.h
+* Unmerged path kernel/events/core.c
