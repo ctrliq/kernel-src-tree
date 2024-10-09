@@ -1,0 +1,300 @@
+nfp: flower: get flows by host context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author John Hurley <john.hurley@netronome.com>
+commit cf4172d5751fcf8531c3df43cbd490bac7a8c84a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/cf4172d5.failed
+
+Each flow is given a context ID that the fw uses (along with its cookie)
+to identity the flow. The flows stats are updated by the fw via this ID
+which is a reference to a pre-allocated array entry.
+
+In preparation for flow merge code, enable the nfp_fl_payload structure to
+be accessed via this stats context ID. Rather than increasing the memory
+requirements of the pre-allocated array, add a new rhashtable to associate
+each active stats context ID with its rule payload.
+
+While adding new code to the compile metadata functions, slightly
+restructure the existing function to allow for cleaner, easier to read
+error handling.
+
+	Signed-off-by: John Hurley <john.hurley@netronome.com>
+	Signed-off-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cf4172d5751fcf8531c3df43cbd490bac7a8c84a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/main.h
+#	drivers/net/ethernet/netronome/nfp/flower/metadata.c
+diff --cc drivers/net/ethernet/netronome/nfp/flower/main.h
+index 90cc96d4eae4,9b34264197c2..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.h
+@@@ -140,7 -136,11 +140,13 @@@ struct nfp_fl_lag 
+   * @stats_ids:		List of free stats ids
+   * @mask_ids:		List of free mask ids
+   * @mask_table:		Hash table used to store masks
+ - * @stats_ring_size:	Maximum number of allowed stats ids
+   * @flow_table:		Hash table used to store flower rules
+++<<<<<<< HEAD
+++=======
++  * @stats:		Stored stats updates for flower rules
++  * @stats_lock:		Lock for flower rule stats updates
++  * @stats_ctx_table:	Hash table to map stats contexts to its flow rule
+++>>>>>>> cf4172d5751f (nfp: flower: get flows by host context)
+   * @cmsg_work:		Workqueue for control messages processing
+   * @cmsg_skbs_high:	List of higher priority skbs for control message
+   *			processing
+@@@ -173,7 -167,11 +179,15 @@@ struct nfp_flower_priv 
+  	struct nfp_fl_stats_id stats_ids;
+  	struct nfp_fl_mask_id mask_ids;
+  	DECLARE_HASHTABLE(mask_table, NFP_FLOWER_MASK_HASH_BITS);
+++<<<<<<< HEAD
+ +	DECLARE_HASHTABLE(flow_table, NFP_FLOWER_HASH_BITS);
+++=======
++ 	u32 stats_ring_size;
++ 	struct rhashtable flow_table;
++ 	struct nfp_fl_stats *stats;
++ 	spinlock_t stats_lock; /* lock stats */
++ 	struct rhashtable stats_ctx_table;
+++>>>>>>> cf4172d5751f (nfp: flower: get flows by host context)
+  	struct work_struct cmsg_work;
+  	struct sk_buff_head cmsg_skbs_high;
+  	struct sk_buff_head cmsg_skbs_low;
+@@@ -275,8 -303,11 +289,10 @@@ int nfp_modify_flow_metadata(struct nfp
+  			     struct nfp_fl_payload *nfp_flow);
+  
+  struct nfp_fl_payload *
+ -nfp_flower_search_fl_table(struct nfp_app *app, unsigned long tc_flower_cookie,
+ -			   struct net_device *netdev);
+ +nfp_flower_search_fl_table(struct nfp_app *app, unsigned long tc_flower_cookie);
+  struct nfp_fl_payload *
++ nfp_flower_get_fl_payload_from_ctx(struct nfp_app *app, u32 ctx_id);
++ struct nfp_fl_payload *
+  nfp_flower_remove_fl_table(struct nfp_app *app, unsigned long tc_flower_cookie);
+  
+  void nfp_flower_rx_flow_stats(struct nfp_app *app, struct sk_buff *skb);
+diff --cc drivers/net/ethernet/netronome/nfp/flower/metadata.c
+index c748aceb17bb,d68307e5bf16..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/metadata.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/metadata.c
+@@@ -48,6 -19,23 +48,26 @@@ struct nfp_mask_id_table 
+  	u8 mask_id;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct nfp_fl_flow_table_cmp_arg {
++ 	struct net_device *netdev;
++ 	unsigned long cookie;
++ };
++ 
++ struct nfp_fl_stats_ctx_to_flow {
++ 	struct rhash_head ht_node;
++ 	u32 stats_cxt;
++ 	struct nfp_fl_payload *flow;
++ };
++ 
++ static const struct rhashtable_params stats_ctx_table_params = {
++ 	.key_offset	= offsetof(struct nfp_fl_stats_ctx_to_flow, stats_cxt),
++ 	.head_offset	= offsetof(struct nfp_fl_stats_ctx_to_flow, ht_node),
++ 	.key_len	= sizeof(u32),
++ };
++ 
+++>>>>>>> cf4172d5751f (nfp: flower: get flows by host context)
+  static int nfp_release_stats_entry(struct nfp_app *app, u32 stats_context_id)
+  {
+  	struct nfp_flower_priv *priv = app->priv;
+@@@ -316,8 -294,10 +336,9 @@@ nfp_check_mask_remove(struct nfp_app *a
+  
+  int nfp_compile_flow_metadata(struct nfp_app *app,
+  			      struct tc_cls_flower_offload *flow,
+ -			      struct nfp_fl_payload *nfp_flow,
+ -			      struct net_device *netdev)
+ +			      struct nfp_fl_payload *nfp_flow)
+  {
++ 	struct nfp_fl_stats_ctx_to_flow *ctx_entry;
+  	struct nfp_flower_priv *priv = app->priv;
+  	struct nfp_fl_payload *check_entry;
+  	u8 new_mask_id;
+@@@ -328,7 -310,23 +351,22 @@@
+  
+  	nfp_flow->meta.host_ctx_id = cpu_to_be32(stats_cxt);
+  	nfp_flow->meta.host_cookie = cpu_to_be64(flow->cookie);
+ -	nfp_flow->ingress_dev = netdev;
+  
++ 	ctx_entry = kzalloc(sizeof(*ctx_entry), GFP_KERNEL);
++ 	if (!ctx_entry) {
++ 		err = -ENOMEM;
++ 		goto err_release_stats;
++ 	}
++ 
++ 	ctx_entry->stats_cxt = stats_cxt;
++ 	ctx_entry->flow = nfp_flow;
++ 
++ 	if (rhashtable_insert_fast(&priv->stats_ctx_table, &ctx_entry->ht_node,
++ 				   stats_ctx_table_params)) {
++ 		err = -ENOMEM;
++ 		goto err_free_ctx_entry;
++ 	}
++ 
+  	new_mask_id = 0;
+  	if (!nfp_check_mask_add(app, nfp_flow->mask_data,
+  				nfp_flow->meta.mask_len,
+@@@ -343,21 -340,14 +380,14 @@@
+  
+  	/* Update flow payload with mask ids. */
+  	nfp_flow->unmasked_data[NFP_FL_MASK_ID_LOCATION] = new_mask_id;
+ -	priv->stats[stats_cxt].pkts = 0;
+ -	priv->stats[stats_cxt].bytes = 0;
+ -	priv->stats[stats_cxt].used = jiffies;
+ +	nfp_flow->stats.pkts = 0;
+ +	nfp_flow->stats.bytes = 0;
+ +	nfp_flow->stats.used = jiffies;
+  
+ -	check_entry = nfp_flower_search_fl_table(app, flow->cookie, netdev);
+ +	check_entry = nfp_flower_search_fl_table(app, flow->cookie);
+  	if (check_entry) {
+- 		if (nfp_release_stats_entry(app, stats_cxt))
+- 			return -EINVAL;
+- 
+- 		if (!nfp_check_mask_remove(app, nfp_flow->mask_data,
+- 					   nfp_flow->meta.mask_len,
+- 					   NULL, &new_mask_id))
+- 			return -EINVAL;
+- 
+- 		return -EEXIST;
++ 		err = -EEXIST;
++ 		goto err_remove_mask;
+  	}
+  
+  	return 0;
+@@@ -386,12 -401,73 +441,80 @@@ int nfp_modify_flow_metadata(struct nfp
+  	return nfp_release_stats_entry(app, temp_ctx_id);
+  }
+  
+++<<<<<<< HEAD
+ +int nfp_flower_metadata_init(struct nfp_app *app)
+++=======
++ struct nfp_fl_payload *
++ nfp_flower_get_fl_payload_from_ctx(struct nfp_app *app, u32 ctx_id)
++ {
++ 	struct nfp_fl_stats_ctx_to_flow *ctx_entry;
++ 	struct nfp_flower_priv *priv = app->priv;
++ 
++ 	ctx_entry = rhashtable_lookup_fast(&priv->stats_ctx_table, &ctx_id,
++ 					   stats_ctx_table_params);
++ 	if (!ctx_entry)
++ 		return NULL;
++ 
++ 	return ctx_entry->flow;
++ }
++ 
++ static int nfp_fl_obj_cmpfn(struct rhashtable_compare_arg *arg,
++ 			    const void *obj)
++ {
++ 	const struct nfp_fl_flow_table_cmp_arg *cmp_arg = arg->key;
++ 	const struct nfp_fl_payload *flow_entry = obj;
++ 
++ 	if (flow_entry->ingress_dev == cmp_arg->netdev)
++ 		return flow_entry->tc_flower_cookie != cmp_arg->cookie;
++ 
++ 	return 1;
++ }
++ 
++ static u32 nfp_fl_obj_hashfn(const void *data, u32 len, u32 seed)
++ {
++ 	const struct nfp_fl_payload *flower_entry = data;
++ 
++ 	return jhash2((u32 *)&flower_entry->tc_flower_cookie,
++ 		      sizeof(flower_entry->tc_flower_cookie) / sizeof(u32),
++ 		      seed);
++ }
++ 
++ static u32 nfp_fl_key_hashfn(const void *data, u32 len, u32 seed)
++ {
++ 	const struct nfp_fl_flow_table_cmp_arg *cmp_arg = data;
++ 
++ 	return jhash2((u32 *)&cmp_arg->cookie,
++ 		      sizeof(cmp_arg->cookie) / sizeof(u32), seed);
++ }
++ 
++ const struct rhashtable_params nfp_flower_table_params = {
++ 	.head_offset		= offsetof(struct nfp_fl_payload, fl_node),
++ 	.hashfn			= nfp_fl_key_hashfn,
++ 	.obj_cmpfn		= nfp_fl_obj_cmpfn,
++ 	.obj_hashfn		= nfp_fl_obj_hashfn,
++ 	.automatic_shrinking	= true,
++ };
++ 
++ int nfp_flower_metadata_init(struct nfp_app *app, u64 host_ctx_count,
++ 			     unsigned int host_num_mems)
+++>>>>>>> cf4172d5751f (nfp: flower: get flows by host context)
+  {
+  	struct nfp_flower_priv *priv = app->priv;
+ -	int err, stats_size;
+  
+  	hash_init(priv->mask_table);
+++<<<<<<< HEAD
+ +	hash_init(priv->flow_table);
+++=======
++ 
++ 	err = rhashtable_init(&priv->flow_table, &nfp_flower_table_params);
++ 	if (err)
++ 		return err;
++ 
++ 	err = rhashtable_init(&priv->stats_ctx_table, &stats_ctx_table_params);
++ 	if (err)
++ 		goto err_free_flow_table;
++ 
+++>>>>>>> cf4172d5751f (nfp: flower: get flows by host context)
+  	get_random_bytes(&priv->mask_id_seed, sizeof(priv->mask_id_seed));
+  
+  	/* Init ring buffer and unallocated mask_ids. */
+@@@ -399,7 -475,7 +522,11 @@@
+  		kmalloc_array(NFP_FLOWER_MASK_ENTRY_RS,
+  			      NFP_FLOWER_MASK_ELEMENT_RS, GFP_KERNEL);
+  	if (!priv->mask_ids.mask_id_free_list.buf)
+++<<<<<<< HEAD
+ +		return -ENOMEM;
+++=======
++ 		goto err_free_stats_ctx_table;
+++>>>>>>> cf4172d5751f (nfp: flower: get flows by host context)
+  
+  	priv->mask_ids.init_unallocated = NFP_FLOWER_MASK_ENTRY_RS - 1;
+  
+@@@ -424,6 -512,10 +551,13 @@@ err_free_last_used
+  	kfree(priv->mask_ids.last_used);
+  err_free_mask_id:
+  	kfree(priv->mask_ids.mask_id_free_list.buf);
+++<<<<<<< HEAD
+++=======
++ err_free_stats_ctx_table:
++ 	rhashtable_destroy(&priv->stats_ctx_table);
++ err_free_flow_table:
++ 	rhashtable_destroy(&priv->flow_table);
+++>>>>>>> cf4172d5751f (nfp: flower: get flows by host context)
+  	return -ENOMEM;
+  }
+  
+@@@ -434,6 -526,11 +568,14 @@@ void nfp_flower_metadata_cleanup(struc
+  	if (!priv)
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ 	rhashtable_free_and_destroy(&priv->flow_table,
++ 				    nfp_check_rhashtable_empty, NULL);
++ 	rhashtable_free_and_destroy(&priv->stats_ctx_table,
++ 				    nfp_check_rhashtable_empty, NULL);
++ 	kvfree(priv->stats);
+++>>>>>>> cf4172d5751f (nfp: flower: get flows by host context)
+  	kfree(priv->mask_ids.mask_id_free_list.buf);
+  	kfree(priv->mask_ids.last_used);
+  	vfree(priv->stats_ids.free_list.buf);
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/main.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/metadata.c
