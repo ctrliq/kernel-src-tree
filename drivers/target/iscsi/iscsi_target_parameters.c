@@ -431,6 +431,7 @@ int iscsi_create_default_params(struct iscsi_param_list **param_list_ptr)
 			TYPERANGE_MARKINT, USE_INITIAL_ONLY);
 	if (!param)
 		goto out;
+
 	/*
 	 * Extra parameters for ISER from RFC-5046
 	 */
@@ -520,9 +521,9 @@ int iscsi_set_keys_to_negotiate(
 		} else if (!strcmp(param->name, SESSIONTYPE)) {
 			SET_PSTATE_NEGOTIATE(param);
 		} else if (!strcmp(param->name, IFMARKER)) {
-			SET_PSTATE_NEGOTIATE(param);
+			SET_PSTATE_REJECT(param);
 		} else if (!strcmp(param->name, OFMARKER)) {
-			SET_PSTATE_NEGOTIATE(param);
+			SET_PSTATE_REJECT(param);
 		} else if (!strcmp(param->name, IFMARKINT)) {
 			SET_PSTATE_NEGOTIATE(param);
 		} else if (!strcmp(param->name, OFMARKINT)) {
