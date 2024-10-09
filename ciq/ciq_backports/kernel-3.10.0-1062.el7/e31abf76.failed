@@ -1,0 +1,157 @@
+IB/mlx5: Fix return value check in flow_counters_set_data()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author weiyongjun (A) <weiyongjun1@huawei.com>
+commit e31abf76f4d4d3202ca16b9668b11178df23d473
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/e31abf76.failed
+
+In case of error, the function mlx5_fc_create() returns ERR_PTR() and
+never returns NULL. The NULL test in the return value check should be
+replaced with IS_ERR().
+
+Fixes: 3b3233fbf02e ("IB/mlx5: Add flow counters binding support")
+	Signed-off-by: Wei Yongjun <weiyongjun1@huawei.com>
+	Acked-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit e31abf76f4d4d3202ca16b9668b11178df23d473)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/main.c
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index 1726b9447b75,645fc69997bc..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -2970,6 -3120,125 +2970,128 @@@ static void set_underlay_qp(struct mlx5
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int read_flow_counters(struct ib_device *ibdev,
++ 			      struct mlx5_read_counters_attr *read_attr)
++ {
++ 	struct mlx5_fc *fc = read_attr->hw_cntrs_hndl;
++ 	struct mlx5_ib_dev *dev = to_mdev(ibdev);
++ 
++ 	return mlx5_fc_query(dev->mdev, fc,
++ 			     &read_attr->out[IB_COUNTER_PACKETS],
++ 			     &read_attr->out[IB_COUNTER_BYTES]);
++ }
++ 
++ /* flow counters currently expose two counters packets and bytes */
++ #define FLOW_COUNTERS_NUM 2
++ static int counters_set_description(struct ib_counters *counters,
++ 				    enum mlx5_ib_counters_type counters_type,
++ 				    struct mlx5_ib_flow_counters_desc *desc_data,
++ 				    u32 ncounters)
++ {
++ 	struct mlx5_ib_mcounters *mcounters = to_mcounters(counters);
++ 	u32 cntrs_max_index = 0;
++ 	int i;
++ 
++ 	if (counters_type != MLX5_IB_COUNTERS_FLOW)
++ 		return -EINVAL;
++ 
++ 	/* init the fields for the object */
++ 	mcounters->type = counters_type;
++ 	mcounters->read_counters = read_flow_counters;
++ 	mcounters->counters_num = FLOW_COUNTERS_NUM;
++ 	mcounters->ncounters = ncounters;
++ 	/* each counter entry have both description and index pair */
++ 	for (i = 0; i < ncounters; i++) {
++ 		if (desc_data[i].description > IB_COUNTER_BYTES)
++ 			return -EINVAL;
++ 
++ 		if (cntrs_max_index <= desc_data[i].index)
++ 			cntrs_max_index = desc_data[i].index + 1;
++ 	}
++ 
++ 	mutex_lock(&mcounters->mcntrs_mutex);
++ 	mcounters->counters_data = desc_data;
++ 	mcounters->cntrs_max_index = cntrs_max_index;
++ 	mutex_unlock(&mcounters->mcntrs_mutex);
++ 
++ 	return 0;
++ }
++ 
++ #define MAX_COUNTERS_NUM (USHRT_MAX / (sizeof(u32) * 2))
++ static int flow_counters_set_data(struct ib_counters *ibcounters,
++ 				  struct mlx5_ib_create_flow *ucmd)
++ {
++ 	struct mlx5_ib_mcounters *mcounters = to_mcounters(ibcounters);
++ 	struct mlx5_ib_flow_counters_data *cntrs_data = NULL;
++ 	struct mlx5_ib_flow_counters_desc *desc_data = NULL;
++ 	bool hw_hndl = false;
++ 	int ret = 0;
++ 
++ 	if (ucmd && ucmd->ncounters_data != 0) {
++ 		cntrs_data = ucmd->data;
++ 		if (cntrs_data->ncounters > MAX_COUNTERS_NUM)
++ 			return -EINVAL;
++ 
++ 		desc_data = kcalloc(cntrs_data->ncounters,
++ 				    sizeof(*desc_data),
++ 				    GFP_KERNEL);
++ 		if (!desc_data)
++ 			return  -ENOMEM;
++ 
++ 		if (copy_from_user(desc_data,
++ 				   u64_to_user_ptr(cntrs_data->counters_data),
++ 				   sizeof(*desc_data) * cntrs_data->ncounters)) {
++ 			ret = -EFAULT;
++ 			goto free;
++ 		}
++ 	}
++ 
++ 	if (!mcounters->hw_cntrs_hndl) {
++ 		mcounters->hw_cntrs_hndl = mlx5_fc_create(
++ 			to_mdev(ibcounters->device)->mdev, false);
++ 		if (IS_ERR(mcounters->hw_cntrs_hndl)) {
++ 			ret = PTR_ERR(mcounters->hw_cntrs_hndl);
++ 			goto free;
++ 		}
++ 		hw_hndl = true;
++ 	}
++ 
++ 	if (desc_data) {
++ 		/* counters already bound to at least one flow */
++ 		if (mcounters->cntrs_max_index) {
++ 			ret = -EINVAL;
++ 			goto free_hndl;
++ 		}
++ 
++ 		ret = counters_set_description(ibcounters,
++ 					       MLX5_IB_COUNTERS_FLOW,
++ 					       desc_data,
++ 					       cntrs_data->ncounters);
++ 		if (ret)
++ 			goto free_hndl;
++ 
++ 	} else if (!mcounters->cntrs_max_index) {
++ 		/* counters not bound yet, must have udata passed */
++ 		ret = -EINVAL;
++ 		goto free_hndl;
++ 	}
++ 
++ 	return 0;
++ 
++ free_hndl:
++ 	if (hw_hndl) {
++ 		mlx5_fc_destroy(to_mdev(ibcounters->device)->mdev,
++ 				mcounters->hw_cntrs_hndl);
++ 		mcounters->hw_cntrs_hndl = NULL;
++ 	}
++ free:
++ 	kfree(desc_data);
++ 	return ret;
++ }
++ 
+++>>>>>>> e31abf76f4d4 (IB/mlx5: Fix return value check in flow_counters_set_data())
+  static struct mlx5_ib_flow_handler *_create_flow_rule(struct mlx5_ib_dev *dev,
+  						      struct mlx5_ib_flow_prio *ft_prio,
+  						      const struct ib_flow_attr *flow_attr,
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
