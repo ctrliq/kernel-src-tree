@@ -1,0 +1,479 @@
+mm, swap: VMA based swap readahead
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [mm] swap: VMA based swap readahead (Rafael Aquini) [1485248]
+Rebuild_FUZZ: 93.75%
+commit-author Huang Ying <ying.huang@intel.com>
+commit ec560175c0b6fce86994bdf036754d48122c5c87
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/ec560175.failed
+
+The swap readahead is an important mechanism to reduce the swap in
+latency.  Although pure sequential memory access pattern isn't very
+popular for anonymous memory, the space locality is still considered
+valid.
+
+In the original swap readahead implementation, the consecutive blocks in
+swap device are readahead based on the global space locality estimation.
+But the consecutive blocks in swap device just reflect the order of page
+reclaiming, don't necessarily reflect the access pattern in virtual
+memory.  And the different tasks in the system may have different access
+patterns, which makes the global space locality estimation incorrect.
+
+In this patch, when page fault occurs, the virtual pages near the fault
+address will be readahead instead of the swap slots near the fault swap
+slot in swap device.  This avoid to readahead the unrelated swap slots.
+At the same time, the swap readahead is changed to work on per-VMA from
+globally.  So that the different access patterns of the different VMAs
+could be distinguished, and the different readahead policy could be
+applied accordingly.  The original core readahead detection and scaling
+algorithm is reused, because it is an effect algorithm to detect the
+space locality.
+
+The test and result is as follow,
+
+Common test condition
+=====================
+
+Test Machine: Xeon E5 v3 (2 sockets, 72 threads, 32G RAM) Swap device:
+NVMe disk
+
+Micro-benchmark with combined access pattern
+============================================
+
+vm-scalability, sequential swap test case, 4 processes to eat 50G
+virtual memory space, repeat the sequential memory writing until 300
+seconds.  The first round writing will trigger swap out, the following
+rounds will trigger sequential swap in and out.
+
+At the same time, run vm-scalability random swap test case in
+background, 8 processes to eat 30G virtual memory space, repeat the
+random memory write until 300 seconds.  This will trigger random swap-in
+in the background.
+
+This is a combined workload with sequential and random memory accessing
+at the same time.  The result (for sequential workload) is as follow,
+
+			Base		Optimized
+			----		---------
+throughput		345413 KB/s	414029 KB/s (+19.9%)
+latency.average		97.14 us	61.06 us (-37.1%)
+latency.50th		2 us		1 us
+latency.60th		2 us		1 us
+latency.70th		98 us		2 us
+latency.80th		160 us		2 us
+latency.90th		260 us		217 us
+latency.95th		346 us		369 us
+latency.99th		1.34 ms		1.09 ms
+ra_hit%			52.69%		99.98%
+
+The original swap readahead algorithm is confused by the background
+random access workload, so readahead hit rate is lower.  The VMA-base
+readahead algorithm works much better.
+
+Linpack
+=======
+
+The test memory size is bigger than RAM to trigger swapping.
+
+			Base		Optimized
+			----		---------
+elapsed_time		393.49 s	329.88 s (-16.2%)
+ra_hit%			86.21%		98.82%
+
+The score of base and optimized kernel hasn't visible changes.  But the
+elapsed time reduced and readahead hit rate improved, so the optimized
+kernel runs better for startup and tear down stages.  And the absolute
+value of readahead hit rate is high, shows that the space locality is
+still valid in some practical workloads.
+
+Link: http://lkml.kernel.org/r/20170807054038.1843-4-ying.huang@intel.com
+	Signed-off-by: "Huang, Ying" <ying.huang@intel.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Shaohua Li <shli@kernel.org>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Fengguang Wu <fengguang.wu@intel.com>
+	Cc: Tim Chen <tim.c.chen@intel.com>
+	Cc: Dave Hansen <dave.hansen@intel.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit ec560175c0b6fce86994bdf036754d48122c5c87)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memory.c
+#	mm/swap_state.c
+diff --cc mm/memory.c
+index 992044080678,e87953775e3c..000000000000
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@@ -2702,36 -2744,37 +2702,53 @@@ EXPORT_SYMBOL(unmap_mapping_range)
+  /*
+   * We enter with non-exclusive mmap_sem (to exclude vma changes,
+   * but allow concurrent faults), and pte mapped but not yet locked.
+ - * We return with pte unmapped and unlocked.
+ - *
+ - * We return with the mmap_sem locked or unlocked in the same cases
+ - * as does filemap_fault().
+ + * We return with mmap_sem still held, but pte unmapped and unlocked.
+   */
+ -int do_swap_page(struct vm_fault *vmf)
+ +static int do_swap_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ +		unsigned long address, pte_t *page_table, pmd_t *pmd,
+ +		unsigned int flags, pte_t orig_pte)
+  {
+++<<<<<<< HEAD
+ +	spinlock_t *ptl;
+ +	struct page *page, *swapcache;
+++=======
++ 	struct vm_area_struct *vma = vmf->vma;
++ 	struct page *page = NULL, *swapcache;
++ 	struct mem_cgroup *memcg;
++ 	struct vma_swap_readahead swap_ra;
+++>>>>>>> ec560175c0b6 (mm, swap: VMA based swap readahead)
+  	swp_entry_t entry;
+  	pte_t pte;
+  	int locked;
+ +	struct mem_cgroup *ptr;
+  	int exclusive = 0;
+  	int ret = 0;
++ 	bool vma_readahead = swap_use_vma_readahead();
+  
+++<<<<<<< HEAD
+ +	if (!pte_unmap_same(mm, pmd, page_table, orig_pte))
+++=======
++ 	if (vma_readahead)
++ 		page = swap_readahead_detect(vmf, &swap_ra);
++ 	if (!pte_unmap_same(vma->vm_mm, vmf->pmd, vmf->pte, vmf->orig_pte)) {
++ 		if (page)
++ 			put_page(page);
+++>>>>>>> ec560175c0b6 (mm, swap: VMA based swap readahead)
+  		goto out;
++ 	}
+  
+ -	entry = pte_to_swp_entry(vmf->orig_pte);
+ +	entry = pte_to_swp_entry(orig_pte);
+  	if (unlikely(non_swap_entry(entry))) {
+  		if (is_migration_entry(entry)) {
+ -			migration_entry_wait(vma->vm_mm, vmf->pmd,
+ -					     vmf->address);
+ +			migration_entry_wait(mm, pmd, address);
+ +		} else if (is_hmm_entry(entry)) {
+ +			/*
+ +			 * For un-addressable device memory we call the pgmap
+ +			 * fault handler callback. The callback must migrate
+ +			 * the page back to some CPU accessible page.
+ +			 */
+ +			ret = hmm_entry_fault(vma, address, entry,
+ +						 flags, pmd);
+  		} else if (is_hwpoison_entry(entry)) {
+  			ret = VM_FAULT_HWPOISON;
+  		} else {
+@@@ -2741,10 -2784,16 +2758,21 @@@
+  		goto out;
+  	}
+  	delayacct_set_flag(DELAYACCT_PF_SWAPIN);
+- 	page = lookup_swap_cache(entry);
++ 	if (!page)
++ 		page = lookup_swap_cache(entry, vma_readahead ? vma : NULL,
++ 					 vmf->address);
+  	if (!page) {
+++<<<<<<< HEAD
+ +		page = swapin_readahead(entry,
+ +					GFP_HIGHUSER_MOVABLE, vma, address);
+++=======
++ 		if (vma_readahead)
++ 			page = do_swap_page_readahead(entry,
++ 				GFP_HIGHUSER_MOVABLE, vmf, &swap_ra);
++ 		else
++ 			page = swapin_readahead(entry,
++ 				GFP_HIGHUSER_MOVABLE, vma, vmf->address);
+++>>>>>>> ec560175c0b6 (mm, swap: VMA based swap readahead)
+  		if (!page) {
+  			/*
+  			 * Back out if somebody else faulted in this pte
+diff --cc mm/swap_state.c
+index bbce650716cb,3885fef7bdf5..000000000000
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@@ -40,8 -37,32 +40,31 @@@ struct backing_dev_info swap_backing_de
+  
+  struct address_space *swapper_spaces[MAX_SWAPFILES];
+  static unsigned int nr_swapper_spaces[MAX_SWAPFILES];
++ bool swap_vma_readahead = true;
++ 
++ #define SWAP_RA_MAX_ORDER_DEFAULT	3
++ 
++ static int swap_ra_max_order = SWAP_RA_MAX_ORDER_DEFAULT;
++ 
++ #define SWAP_RA_WIN_SHIFT	(PAGE_SHIFT / 2)
++ #define SWAP_RA_HITS_MASK	((1UL << SWAP_RA_WIN_SHIFT) - 1)
++ #define SWAP_RA_HITS_MAX	SWAP_RA_HITS_MASK
++ #define SWAP_RA_WIN_MASK	(~PAGE_MASK & ~SWAP_RA_HITS_MASK)
++ 
++ #define SWAP_RA_HITS(v)		((v) & SWAP_RA_HITS_MASK)
++ #define SWAP_RA_WIN(v)		(((v) & SWAP_RA_WIN_MASK) >> SWAP_RA_WIN_SHIFT)
++ #define SWAP_RA_ADDR(v)		((v) & PAGE_MASK)
++ 
++ #define SWAP_RA_VAL(addr, win, hits)				\
++ 	(((addr) & PAGE_MASK) |					\
++ 	 (((win) << SWAP_RA_WIN_SHIFT) & SWAP_RA_WIN_MASK) |	\
++ 	 ((hits) & SWAP_RA_HITS_MASK))
++ 
++ /* Initial readahead hits is 4 to start up with a small window */
++ #define GET_SWAP_RA_VAL(vma)					\
++ 	(atomic_long_read(&(vma)->swap_readahead_info) ? : 4)
+  
+  #define INC_CACHE_INFO(x)	do { swap_cache_info.x++; } while (0)
+ -#define ADD_CACHE_INFO(x, nr)	do { swap_cache_info.x += (nr); } while (0)
+  
+  static struct {
+  	unsigned long add_total;
+@@@ -303,16 -320,36 +326,43 @@@ void free_pages_and_swap_cache(struct p
+   * lock getting page table operations atomic even if we drop the page
+   * lock before returning.
+   */
+- struct page * lookup_swap_cache(swp_entry_t entry)
++ struct page *lookup_swap_cache(swp_entry_t entry, struct vm_area_struct *vma,
++ 			       unsigned long addr)
+  {
+  	struct page *page;
++ 	unsigned long ra_info;
++ 	int win, hits, readahead;
+  
+ -	page = find_get_page(swap_address_space(entry), swp_offset(entry));
+ +	page = find_get_page(swap_address_space(entry), entry.val);
+  
+++<<<<<<< HEAD
+ +	if (page)
+ +		INC_CACHE_INFO(find_success);
+ +
+ +	INC_CACHE_INFO(find_total);
+++=======
++ 	INC_CACHE_INFO(find_total);
++ 	if (page) {
++ 		INC_CACHE_INFO(find_success);
++ 		if (unlikely(PageTransCompound(page)))
++ 			return page;
++ 		readahead = TestClearPageReadahead(page);
++ 		if (vma) {
++ 			ra_info = GET_SWAP_RA_VAL(vma);
++ 			win = SWAP_RA_WIN(ra_info);
++ 			hits = SWAP_RA_HITS(ra_info);
++ 			if (readahead)
++ 				hits = min_t(int, hits + 1, SWAP_RA_HITS_MAX);
++ 			atomic_long_set(&vma->swap_readahead_info,
++ 					SWAP_RA_VAL(addr, win, hits));
++ 		}
++ 		if (readahead) {
++ 			count_vm_event(SWAP_RA_HIT);
++ 			if (!vma)
++ 				atomic_inc(&swapin_readahead_hits);
++ 		}
++ 	}
+++>>>>>>> ec560175c0b6 (mm, swap: VMA based swap readahead)
+  	return page;
+  }
+  
+@@@ -438,6 -464,66 +488,69 @@@ struct page *read_swap_cache_async(swp_
+  	return retpage;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static unsigned int __swapin_nr_pages(unsigned long prev_offset,
++ 				      unsigned long offset,
++ 				      int hits,
++ 				      int max_pages,
++ 				      int prev_win)
++ {
++ 	unsigned int pages, last_ra;
++ 
++ 	/*
++ 	 * This heuristic has been found to work well on both sequential and
++ 	 * random loads, swapping to hard disk or to SSD: please don't ask
++ 	 * what the "+ 2" means, it just happens to work well, that's all.
++ 	 */
++ 	pages = hits + 2;
++ 	if (pages == 2) {
++ 		/*
++ 		 * We can have no readahead hits to judge by: but must not get
++ 		 * stuck here forever, so check for an adjacent offset instead
++ 		 * (and don't even bother to check whether swap type is same).
++ 		 */
++ 		if (offset != prev_offset + 1 && offset != prev_offset - 1)
++ 			pages = 1;
++ 	} else {
++ 		unsigned int roundup = 4;
++ 		while (roundup < pages)
++ 			roundup <<= 1;
++ 		pages = roundup;
++ 	}
++ 
++ 	if (pages > max_pages)
++ 		pages = max_pages;
++ 
++ 	/* Don't shrink readahead too fast */
++ 	last_ra = prev_win / 2;
++ 	if (pages < last_ra)
++ 		pages = last_ra;
++ 
++ 	return pages;
++ }
++ 
++ static unsigned long swapin_nr_pages(unsigned long offset)
++ {
++ 	static unsigned long prev_offset;
++ 	unsigned int hits, pages, max_pages;
++ 	static atomic_t last_readahead_pages;
++ 
++ 	max_pages = 1 << READ_ONCE(page_cluster);
++ 	if (max_pages <= 1)
++ 		return 1;
++ 
++ 	hits = atomic_xchg(&swapin_readahead_hits, 0);
++ 	pages = __swapin_nr_pages(prev_offset, offset, hits, max_pages,
++ 				  atomic_read(&last_readahead_pages));
++ 	if (!hits)
++ 		prev_offset = offset;
++ 	atomic_set(&last_readahead_pages, pages);
++ 
++ 	return pages;
++ }
++ 
+++>>>>>>> ec560175c0b6 (mm, swap: VMA based swap readahead)
+  /**
+   * swapin_readahead - swap in pages in hope we need them soon
+   * @entry: swap entry of this memory
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index ff35333d8d6c..9f94eb112741 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -332,6 +332,7 @@ struct vm_area_struct {
+ 	struct file * vm_file;		/* File we map to (can be NULL). */
+ 	void * vm_private_data;		/* was vm_pte (shared mem) */
+ 
++	atomic_long_t swap_readahead_info;
+ #ifndef CONFIG_MMU
+ 	struct vm_region *vm_region;	/* NOMMU mapping region */
+ #endif
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index a8d3662b5bce..b668c2916659 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -283,6 +283,25 @@ struct swap_info_struct {
+ 	RH_KABI_EXTEND(struct percpu_cluster __percpu *percpu_cluster) /* per cpu's swap location */
+ };
+ 
++#ifdef CONFIG_64BIT
++#define SWAP_RA_ORDER_CEILING	5
++#else
++/* Avoid stack overflow, because we need to save part of page table */
++#define SWAP_RA_ORDER_CEILING	3
++#define SWAP_RA_PTE_CACHE_SIZE	(1 << SWAP_RA_ORDER_CEILING)
++#endif
++
++struct vma_swap_readahead {
++	unsigned short win;
++	unsigned short offset;
++	unsigned short nr_pte;
++#ifdef CONFIG_64BIT
++	pte_t *ptes;
++#else
++	pte_t ptes[SWAP_RA_PTE_CACHE_SIZE];
++#endif
++};
++
+ /* linux/mm/workingset.c */
+ void *workingset_eviction(struct address_space *mapping, struct page *page);
+ bool workingset_refault(void *shadow);
+@@ -436,6 +455,7 @@ extern struct backing_dev_info swap_backing_dev_info;
+ #define SWAP_ADDRESS_SPACE_SHIFT	14
+ #define SWAP_ADDRESS_SPACE_PAGES	(1 << SWAP_ADDRESS_SPACE_SHIFT)
+ extern struct address_space *swapper_spaces[];
++extern bool swap_vma_readahead;
+ #define swap_address_space(entry)			    \
+ 	(&swapper_spaces[swp_type(entry)][swp_offset(entry) \
+ 		>> SWAP_ADDRESS_SPACE_SHIFT])
+@@ -448,7 +468,9 @@ extern void __delete_from_swap_cache(struct page *);
+ extern void delete_from_swap_cache(struct page *);
+ extern void free_page_and_swap_cache(struct page *);
+ extern void free_pages_and_swap_cache(struct page **, int);
+-extern struct page *lookup_swap_cache(swp_entry_t);
++extern struct page *lookup_swap_cache(swp_entry_t entry,
++				      struct vm_area_struct *vma,
++				      unsigned long addr);
+ extern struct page *read_swap_cache_async(swp_entry_t, gfp_t,
+ 			struct vm_area_struct *vma, unsigned long addr);
+ extern struct page *__read_swap_cache_async(swp_entry_t, gfp_t,
+@@ -457,6 +479,17 @@ extern struct page *__read_swap_cache_async(swp_entry_t, gfp_t,
+ extern struct page *swapin_readahead(swp_entry_t, gfp_t,
+ 			struct vm_area_struct *vma, unsigned long addr);
+ 
++extern struct page *swap_readahead_detect(struct vm_fault *vmf,
++					  struct vma_swap_readahead *swap_ra);
++extern struct page *do_swap_page_readahead(swp_entry_t fentry, gfp_t gfp_mask,
++					   struct vm_fault *vmf,
++					   struct vma_swap_readahead *swap_ra);
++
++static inline bool swap_use_vma_readahead(void)
++{
++	return READ_ONCE(swap_vma_readahead);
++}
++
+ /* linux/mm/swapfile.c */
+ extern atomic_long_t nr_swap_pages;
+ extern long total_swap_pages;
+@@ -563,12 +596,32 @@ static inline struct page *swapin_readahead(swp_entry_t swp, gfp_t gfp_mask,
+ 	return NULL;
+ }
+ 
++static inline bool swap_use_vma_readahead(void)
++{
++	return false;
++}
++
++static inline struct page *swap_readahead_detect(
++	struct vm_fault *vmf, struct vma_swap_readahead *swap_ra)
++{
++	return NULL;
++}
++
++static inline struct page *do_swap_page_readahead(
++	swp_entry_t fentry, gfp_t gfp_mask,
++	struct vm_fault *vmf, struct vma_swap_readahead *swap_ra)
++{
++	return NULL;
++}
++
+ static inline int swap_writepage(struct page *p, struct writeback_control *wbc)
+ {
+ 	return 0;
+ }
+ 
+-static inline struct page *lookup_swap_cache(swp_entry_t swp)
++static inline struct page *lookup_swap_cache(swp_entry_t swp,
++					     struct vm_area_struct *vma,
++					     unsigned long addr)
+ {
+ 	return NULL;
+ }
+* Unmerged path mm/memory.c
+diff --git a/mm/shmem.c b/mm/shmem.c
+index fce4fdb37b9d..48e8366a04ed 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -1186,7 +1186,7 @@ repeat:
+ 
+ 	if (swap.val) {
+ 		/* Look it up and read it in.. */
+-		page = lookup_swap_cache(swap);
++		page = lookup_swap_cache(swap, NULL, 0);
+ 		if (!page) {
+ 			/* here we actually do the io */
+ 			if (fault_type)
+* Unmerged path mm/swap_state.c
