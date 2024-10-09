@@ -1,0 +1,324 @@
+watchdog/core: Remove the park_in_progress obfuscation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.11.1.el7
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 01f0a02701cbcf32d22cfc9d1ab9a3f0ff2ba68c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.11.1.el7/01f0a027.failed
+
+Commit:
+
+  b94f51183b06 ("kernel/watchdog: prevent false hardlockup on overloaded system")
+
+tries to fix the following issue:
+
+proc_write()
+   set_sample_period()    <--- New sample period becoms visible
+			  <----- Broken starts
+   proc_watchdog_update()
+     watchdog_enable_all_cpus()		watchdog_hrtimer_fn()
+     update_watchdog_all_cpus()		   restart_timer(sample_period)
+        watchdog_park_threads()
+
+					thread->park()
+					  disable_nmi()
+			  <----- Broken ends
+
+The reason why this is broken is that the update of the watchdog threshold
+becomes immediately effective and visible for the hrtimer function which
+uses that value to rearm the timer. But the NMI/perf side still uses the
+old value up to the point where it is disabled. If the rate has been
+lowered then the NMI can run fast enough to 'detect' a hard lockup because
+the timer has not fired due to the longer period.
+
+The patch 'fixed' this by adding a variable:
+
+proc_write()
+   set_sample_period()
+					<----- Broken starts
+   proc_watchdog_update()
+     watchdog_enable_all_cpus()		watchdog_hrtimer_fn()
+     update_watchdog_all_cpus()		   restart_timer(sample_period)
+         watchdog_park_threads()
+	  park_in_progress = 1
+					<----- Broken ends
+				        nmi_watchdog()
+					  if (park_in_progress)
+					     return;
+
+The only effect of this variable was to make the window where the breakage
+can hit small enough that it was not longer observable in testing. From a
+correctness point of view it is a pointless bandaid which merily papers
+over the root cause: the unsychronized update of the variable.
+
+Looking deeper into the related code pathes unearthed similar problems in
+the watchdog_start()/stop() functions.
+
+ watchdog_start()
+	perf_nmi_event_start()
+	hrtimer_start()
+
+ watchdog_stop()
+	hrtimer_cancel()
+	perf_nmi_event_stop()
+
+In both cases the call order is wrong because if the tasks gets preempted
+or the VM gets scheduled out long enough after the first call, then there is
+a chance that the next NMI will see a stale hrtimer interrupt count and
+trigger a false positive hard lockup splat.
+
+Get rid of park_in_progress so the code can be gradually deobfuscated and
+pruned from several layers of duct tape papering over the root cause,
+which has been either ignored or not understood at all.
+
+Once this is removed the underlying problem will be fixed by rewriting the
+proc interface to do a proper synchronized update.
+
+Address the start/stop() ordering problem as well by reverting the call
+order, so this part is at least correct now.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Don Zickus <dzickus@redhat.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Chris Metcalf <cmetcalf@mellanox.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Nicholas Piggin <npiggin@gmail.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Sebastian Siewior <bigeasy@linutronix.de>
+	Cc: Ulrich Obergfell <uobergfe@redhat.com>
+Link: http://lkml.kernel.org/r/alpine.DEB.2.20.1709052038270.2393@nanos
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 01f0a02701cbcf32d22cfc9d1ab9a3f0ff2ba68c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/nmi.h
+#	kernel/watchdog.c
+#	kernel/watchdog_hld.c
+diff --cc include/linux/nmi.h
+index b6f2c51155c0,91a3a4a4c8ae..000000000000
+--- a/include/linux/nmi.h
++++ b/include/linux/nmi.h
+@@@ -6,6 -6,89 +6,92 @@@
+  
+  #include <linux/sched.h>
+  #include <asm/irq.h>
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_HAVE_NMI_WATCHDOG)
++ #include <asm/nmi.h>
++ #endif
++ 
++ #ifdef CONFIG_LOCKUP_DETECTOR
++ void lockup_detector_init(void);
++ void lockup_detector_soft_poweroff(void);
++ void lockup_detector_cleanup(void);
++ #else
++ static inline void lockup_detector_init(void) { }
++ static inline void lockup_detector_soft_poweroff(void) { }
++ static inline void lockup_detector_cleanup(void) { }
++ #endif
++ 
++ #ifdef CONFIG_SOFTLOCKUP_DETECTOR
++ extern void touch_softlockup_watchdog_sched(void);
++ extern void touch_softlockup_watchdog(void);
++ extern void touch_softlockup_watchdog_sync(void);
++ extern void touch_all_softlockup_watchdogs(void);
++ extern unsigned int  softlockup_panic;
++ extern int soft_watchdog_enabled;
++ #else
++ static inline void touch_softlockup_watchdog_sched(void)
++ {
++ }
++ static inline void touch_softlockup_watchdog(void)
++ {
++ }
++ static inline void touch_softlockup_watchdog_sync(void)
++ {
++ }
++ static inline void touch_all_softlockup_watchdogs(void)
++ {
++ }
++ #endif
++ 
++ #ifdef CONFIG_DETECT_HUNG_TASK
++ void reset_hung_task_detector(void);
++ #else
++ static inline void reset_hung_task_detector(void)
++ {
++ }
++ #endif
++ 
++ /*
++  * The run state of the lockup detectors is controlled by the content of the
++  * 'watchdog_enabled' variable. Each lockup detector has its dedicated bit -
++  * bit 0 for the hard lockup detector and bit 1 for the soft lockup detector.
++  *
++  * 'watchdog_user_enabled', 'nmi_watchdog_enabled' and 'soft_watchdog_enabled'
++  * are variables that are only used as an 'interface' between the parameters
++  * in /proc/sys/kernel and the internal state bits in 'watchdog_enabled'. The
++  * 'watchdog_thresh' variable is handled differently because its value is not
++  * boolean, and the lockup detectors are 'suspended' while 'watchdog_thresh'
++  * is equal zero.
++  */
++ #define NMI_WATCHDOG_ENABLED_BIT   0
++ #define SOFT_WATCHDOG_ENABLED_BIT  1
++ #define NMI_WATCHDOG_ENABLED      (1 << NMI_WATCHDOG_ENABLED_BIT)
++ #define SOFT_WATCHDOG_ENABLED     (1 << SOFT_WATCHDOG_ENABLED_BIT)
++ 
++ #if defined(CONFIG_HARDLOCKUP_DETECTOR)
++ extern void hardlockup_detector_disable(void);
++ extern unsigned int hardlockup_panic;
++ #else
++ static inline void hardlockup_detector_disable(void) {}
++ #endif
++ 
++ #if defined(CONFIG_HARDLOCKUP_DETECTOR_PERF)
++ extern void arch_touch_nmi_watchdog(void);
++ extern void hardlockup_detector_perf_stop(void);
++ extern void hardlockup_detector_perf_restart(void);
++ extern void hardlockup_detector_perf_disable(void);
++ extern void hardlockup_detector_perf_cleanup(void);
++ #else
++ static inline void hardlockup_detector_perf_stop(void) { }
++ static inline void hardlockup_detector_perf_restart(void) { }
++ static inline void hardlockup_detector_perf_disable(void) { }
++ static inline void hardlockup_detector_perf_cleanup(void) { }
++ #if !defined(CONFIG_HAVE_NMI_WATCHDOG)
++ static inline void arch_touch_nmi_watchdog(void) {}
++ #endif
++ #endif
+++>>>>>>> 01f0a02701cb (watchdog/core: Remove the park_in_progress obfuscation)
+  
+  /**
+   * touch_nmi_watchdog - restart NMI watchdog timeout.
+diff --cc kernel/watchdog.c
+index 1e871d8657be,c290135fb415..000000000000
+--- a/kernel/watchdog.c
++++ b/kernel/watchdog.c
+@@@ -85,19 -96,45 +85,52 @@@ atomic_t watchdog_park_in_progress = AT
+   * unregistered/stopped, so it is an indicator whether the threads exist.
+   */
+  static int __read_mostly watchdog_running;
+ -
+  /*
+ - * These functions can be overridden if an architecture implements its
+ - * own hardlockup detector.
+ + * If a subsystem has a need to deactivate the watchdog temporarily, it
+ + * can use the suspend/resume interface to achieve this. The content of
+ + * the 'watchdog_suspended' variable reflects this state. Existing threads
+ + * are parked/unparked by the lockup_detector_{suspend|resume} functions
+ + * (see comment blocks pertaining to those functions for further details).
+   *
+ - * watchdog_nmi_enable/disable can be implemented to start and stop when
+ - * softlockup watchdog threads start and stop. The arch must select the
+ - * SOFTLOCKUP_DETECTOR Kconfig.
+ + * 'watchdog_suspended' also prevents threads from being registered/started
+ + * or unregistered/stopped via parameters in /proc/sys/kernel, so the state
+ + * of 'watchdog_running' cannot change while the watchdog is deactivated
+ + * temporarily (see related code in 'proc' handlers).
+   */
+++<<<<<<< HEAD
+ +static int __read_mostly watchdog_suspended;
+++=======
++ int __weak watchdog_nmi_enable(unsigned int cpu)
++ {
++ 	return 0;
++ }
++ 
++ void __weak watchdog_nmi_disable(unsigned int cpu)
++ {
++ 	hardlockup_detector_perf_disable();
++ }
++ 
++ /*
++  * watchdog_nmi_reconfigure can be implemented to be notified after any
++  * watchdog configuration change. The arch hardlockup watchdog should
++  * respond to the following variables:
++  * - nmi_watchdog_enabled
++  * - watchdog_thresh
++  * - watchdog_cpumask
++  * - sysctl_hardlockup_all_cpu_backtrace
++  * - hardlockup_panic
++  */
++ void __weak watchdog_nmi_reconfigure(void)
++ {
++ }
++ 
++ 
++ #ifdef CONFIG_SOFTLOCKUP_DETECTOR
++ 
++ /* Helper for online, unparked cpus. */
++ #define for_each_watchdog_cpu(cpu) \
++ 	for_each_cpu_and((cpu), cpu_online_mask, &watchdog_cpumask)
+++>>>>>>> 01f0a02701cb (watchdog/core: Remove the park_in_progress obfuscation)
+  
+  static u64 __read_mostly sample_period;
+  
+@@@ -472,7 -320,7 +505,11 @@@ static enum hrtimer_restart watchdog_ti
+  	int duration;
+  	int softlockup_all_cpu_backtrace = sysctl_softlockup_all_cpu_backtrace;
+  
+++<<<<<<< HEAD
+ +	if (atomic_read(&watchdog_park_in_progress) != 0)
+++=======
++ 	if (!watchdog_enabled)
+++>>>>>>> 01f0a02701cb (watchdog/core: Remove the park_in_progress obfuscation)
+  		return HRTIMER_NORESTART;
+  
+  	/* kick the hardlockup detector */
+@@@ -586,12 -434,19 +623,23 @@@ static void watchdog_set_prio(unsigned 
+  
+  static void watchdog_enable(unsigned int cpu)
+  {
+++<<<<<<< HEAD
+ +	struct hrtimer *hrtimer = &__raw_get_cpu_var(watchdog_hrtimer);
+++=======
++ 	struct hrtimer *hrtimer = this_cpu_ptr(&watchdog_hrtimer);
+++>>>>>>> 01f0a02701cb (watchdog/core: Remove the park_in_progress obfuscation)
+  
+- 	/* kick off the timer for the hardlockup detector */
++ 	/*
++ 	 * Start the timer first to prevent the NMI watchdog triggering
++ 	 * before the timer has a chance to fire.
++ 	 */
+  	hrtimer_init(hrtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+  	hrtimer->function = watchdog_timer_fn;
++ 	hrtimer_start(hrtimer, ns_to_ktime(sample_period),
++ 		      HRTIMER_MODE_REL_PINNED);
+  
++ 	/* Initialize timestamp */
++ 	__touch_watchdog();
+  	/* Enable the perf event */
+  	watchdog_nmi_enable(cpu);
+  
+@@@ -606,12 -455,16 +648,20 @@@
+  
+  static void watchdog_disable(unsigned int cpu)
+  {
+++<<<<<<< HEAD
+ +	struct hrtimer *hrtimer = &__raw_get_cpu_var(watchdog_hrtimer);
+++=======
++ 	struct hrtimer *hrtimer = this_cpu_ptr(&watchdog_hrtimer);
+++>>>>>>> 01f0a02701cb (watchdog/core: Remove the park_in_progress obfuscation)
+  
+  	watchdog_set_prio(SCHED_NORMAL, 0);
+- 	hrtimer_cancel(hrtimer);
+- 	/* disable the perf event */
++ 	/*
++ 	 * Disable the perf event first. That prevents that a large delay
++ 	 * between disabling the timer and disabling the perf event causes
++ 	 * the perf NMI to detect a false positive.
++ 	 */
+  	watchdog_nmi_disable(cpu);
++ 	hrtimer_cancel(hrtimer);
+  }
+  
+  static void watchdog_cleanup(unsigned int cpu, bool online)
+* Unmerged path kernel/watchdog_hld.c
+* Unmerged path include/linux/nmi.h
+* Unmerged path kernel/watchdog.c
+* Unmerged path kernel/watchdog_hld.c
