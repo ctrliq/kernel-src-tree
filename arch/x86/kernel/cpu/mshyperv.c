@@ -182,6 +182,15 @@ static int hv_nmi_unknown(unsigned int val, struct pt_regs *regs)
 }
 #endif
 
+static unsigned long hv_get_tsc_khz(void)
+{
+	unsigned long freq;
+
+	rdmsrl(HV_X64_MSR_TSC_FREQUENCY, freq);
+
+	return freq / 1000;
+}
+
 static void __init ms_hyperv_init_platform(void)
 {
 	/*
@@ -193,6 +202,12 @@ static void __init ms_hyperv_init_platform(void)
 
 	printk(KERN_INFO "HyperV: features 0x%x, hints 0x%x\n",
 	       ms_hyperv.features, ms_hyperv.hints);
+
+	if (ms_hyperv.features & HV_X64_ACCESS_FREQUENCY_MSRS &&
+	    ms_hyperv.misc_features & HV_FEATURE_FREQUENCY_MSRS_AVAILABLE) {
+		x86_platform.calibrate_tsc = hv_get_tsc_khz;
+		x86_platform.calibrate_cpu = hv_get_tsc_khz;
+	}
 
 #ifdef CONFIG_X86_LOCAL_APIC
 	if (ms_hyperv.features & HV_X64_MSR_APIC_FREQUENCY_AVAILABLE) {
