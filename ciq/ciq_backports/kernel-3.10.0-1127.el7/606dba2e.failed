@@ -1,0 +1,246 @@
+sched: Push put_prev_task() into pick_next_task()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 606dba2e289446600a0b68422ed2019af5355c12
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/606dba2e.failed
+
+In order to avoid having to do put/set on a whole cgroup hierarchy
+when we context switch, push the put into pick_next_task() so that
+both operations are in the same function. Further changes then allow
+us to possibly optimize away redundant work.
+
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1328936700.2476.17.camel@laptop
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 606dba2e289446600a0b68422ed2019af5355c12)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/stop_task.c
+diff --cc kernel/sched/stop_task.c
+index 5d1b09cc6f74,a4147c9d2017..000000000000
+--- a/kernel/sched/stop_task.c
++++ b/kernel/sched/stop_task.c
+@@@ -27,12 -28,15 +28,22 @@@ pick_next_task_stop(struct rq *rq, stru
+  {
+  	struct task_struct *stop = rq->stop;
+  
+++<<<<<<< HEAD
+ +	if (stop && task_on_rq_queued(stop)) {
+ +		stop->se.exec_start = rq_clock_task(rq);
+ +		return stop;
+ +	}
+++=======
++ 	if (!stop || !stop->on_rq)
++ 		return NULL;
+++>>>>>>> 606dba2e2894 (sched: Push put_prev_task() into pick_next_task())
+  
+- 	return NULL;
++ 	if (prev)
++ 		prev->sched_class->put_prev_task(rq, prev);
++ 
++ 	stop->se.exec_start = rq_clock_task(rq);
++ 
++ 	return stop;
+  }
+  
+  static void
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 9474c46ea21e..5978d2a29dff 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3452,18 +3452,11 @@ static inline void schedule_debug(struct task_struct *prev)
+ 	schedstat_inc(this_rq(), sched_count);
+ }
+ 
+-static void put_prev_task(struct rq *rq, struct task_struct *prev)
+-{
+-	if (prev->on_rq || rq->skip_clock_update < 0)
+-		update_rq_clock(rq);
+-	prev->sched_class->put_prev_task(rq, prev);
+-}
+-
+ /*
+  * Pick up the highest-prio task:
+  */
+ static inline struct task_struct *
+-pick_next_task(struct rq *rq)
++pick_next_task(struct rq *rq, struct task_struct *prev)
+ {
+ 	const struct sched_class *class;
+ 	struct task_struct *p;
+@@ -3473,7 +3466,7 @@ pick_next_task(struct rq *rq)
+ 	 * the fair class we can call that function directly:
+ 	 */
+ 	if (likely(rq->nr_running == rq->cfs.h_nr_running)) {
+-		p = fair_sched_class.pick_next_task(rq);
++		p = fair_sched_class.pick_next_task(rq, prev);
+ 		if (likely(p))
+ 			return p;
+ 
+@@ -3485,7 +3478,7 @@ pick_next_task(struct rq *rq)
+ 	}
+ 
+ 	for_each_class(class) {
+-		p = class->pick_next_task(rq);
++		p = class->pick_next_task(rq, prev);
+ 		if (p)
+ 			return p;
+ 	}
+@@ -3589,8 +3582,10 @@ need_resched:
+ 	if (unlikely(!rq->nr_running))
+ 		idle_balance(cpu, rq);
+ 
+-	put_prev_task(rq, prev);
+-	next = pick_next_task(rq);
++	if (prev->on_rq || rq->skip_clock_update < 0)
++		update_rq_clock(rq);
++
++	next = pick_next_task(rq, prev);
+ 	clear_tsk_need_resched(prev);
+ 	rq->skip_clock_update = 0;
+ 
+@@ -6206,7 +6201,7 @@ static void migrate_tasks(unsigned int dead_cpu)
+ 		if (rq->nr_running == 1)
+ 			break;
+ 
+-		next = pick_next_task(rq);
++		next = pick_next_task(rq, NULL);
+ 		BUG_ON(!next);
+ 		next->sched_class->put_prev_task(rq, next);
+ 
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index 75f9634980d1..21ad2e04b3b5 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -1581,7 +1581,7 @@ static struct sched_dl_entity *pick_next_dl_entity(struct rq *rq,
+ 	return rb_entry(left, struct sched_dl_entity, rb_node);
+ }
+ 
+-struct task_struct *pick_next_task_dl(struct rq *rq)
++struct task_struct *pick_next_task_dl(struct rq *rq, struct task_struct *prev)
+ {
+ 	struct sched_dl_entity *dl_se;
+ 	struct task_struct *p;
+@@ -1592,6 +1592,9 @@ struct task_struct *pick_next_task_dl(struct rq *rq)
+ 	if (unlikely(!dl_rq->dl_nr_running))
+ 		return NULL;
+ 
++	if (prev)
++		prev->sched_class->put_prev_task(rq, prev);
++
+ 	dl_se = pick_next_dl_entity(rq, dl_rq);
+ 	BUG_ON(!dl_se);
+ 
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index f3df0d8beb03..61a3829958d5 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -4880,7 +4880,8 @@ preempt:
+ 		set_last_buddy(se);
+ }
+ 
+-static struct task_struct *pick_next_task_fair(struct rq *rq)
++static struct task_struct *
++pick_next_task_fair(struct rq *rq, struct task_struct *prev)
+ {
+ 	struct task_struct *p;
+ 	struct cfs_rq *cfs_rq = &rq->cfs;
+@@ -4889,6 +4890,9 @@ static struct task_struct *pick_next_task_fair(struct rq *rq)
+ 	if (!cfs_rq->nr_running)
+ 		return NULL;
+ 
++	if (prev)
++		prev->sched_class->put_prev_task(rq, prev);
++
+ 	do {
+ 		se = pick_next_entity(cfs_rq);
+ 		set_next_entity(cfs_rq, se);
+diff --git a/kernel/sched/idle_task.c b/kernel/sched/idle_task.c
+index 59cc67dc571a..e04c1c043be4 100644
+--- a/kernel/sched/idle_task.c
++++ b/kernel/sched/idle_task.c
+@@ -33,8 +33,12 @@ static void check_preempt_curr_idle(struct rq *rq, struct task_struct *p, int fl
+ 	resched_curr(rq);
+ }
+ 
+-static struct task_struct *pick_next_task_idle(struct rq *rq)
++static struct task_struct *
++pick_next_task_idle(struct rq *rq, struct task_struct *prev)
+ {
++	if (prev)
++		prev->sched_class->put_prev_task(rq, prev);
++
+ 	schedstat_inc(rq, sched_goidle);
+ #ifdef CONFIG_SMP
+ 	/* Trigger the post schedule to do an idle_enter for CFS */
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index 6b68ceb9a68d..bdc511576d7a 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -1348,15 +1348,7 @@ static struct task_struct *_pick_next_task_rt(struct rq *rq)
+ {
+ 	struct sched_rt_entity *rt_se;
+ 	struct task_struct *p;
+-	struct rt_rq *rt_rq;
+-
+-	rt_rq = &rq->rt;
+-
+-	if (!rt_rq->rt_nr_running)
+-		return NULL;
+-
+-	if (rt_rq_throttled(rt_rq))
+-		return NULL;
++	struct rt_rq *rt_rq  = &rq->rt;
+ 
+ 	do {
+ 		rt_se = pick_next_rt_entity(rq, rt_rq);
+@@ -1370,9 +1362,22 @@ static struct task_struct *_pick_next_task_rt(struct rq *rq)
+ 	return p;
+ }
+ 
+-static struct task_struct *pick_next_task_rt(struct rq *rq)
++static struct task_struct *
++pick_next_task_rt(struct rq *rq, struct task_struct *prev)
+ {
+-	struct task_struct *p = _pick_next_task_rt(rq);
++	struct task_struct *p;
++	struct rt_rq *rt_rq = &rq->rt;
++
++	if (!rt_rq->rt_nr_running)
++		return NULL;
++
++	if (rt_rq_throttled(rt_rq))
++		return NULL;
++
++	if (prev)
++		prev->sched_class->put_prev_task(rq, prev);
++
++	p = _pick_next_task_rt(rq);
+ 
+ 	/* The running task is never eligible for pushing */
+ 	if (p)
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 38c9ae998b34..3f6064fc34fd 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1255,7 +1255,13 @@ struct sched_class {
+ 
+ 	void (*check_preempt_curr) (struct rq *rq, struct task_struct *p, int flags);
+ 
+-	struct task_struct * (*pick_next_task) (struct rq *rq);
++	/*
++	 * It is the responsibility of the pick_next_task() method that will
++	 * return the next task to call put_prev_task() on the @prev task or
++	 * something equivalent.
++	 */
++	struct task_struct * (*pick_next_task) (struct rq *rq,
++						struct task_struct *prev);
+ 	void (*put_prev_task) (struct rq *rq, struct task_struct *p);
+ 
+ #ifdef CONFIG_SMP
+* Unmerged path kernel/sched/stop_task.c
