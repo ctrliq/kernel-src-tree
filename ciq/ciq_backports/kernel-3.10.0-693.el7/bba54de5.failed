@@ -1,0 +1,352 @@
+ipvs: provide iph to schedulers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Julian Anastasov <ja@ssi.bg>
+commit bba54de5bdd107d3841b560f1a9cb0ed06e79533
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/bba54de5.failed
+
+Before now the schedulers needed access only to IP
+addresses and it was easy to get them from skb by
+using ip_vs_fill_iph_addr_only.
+
+New changes for the SH scheduler will need the protocol
+and ports which is difficult to get from skb for the
+IPv6 case. As we have all the data in the iph structure,
+to avoid the same slow lookups provide the iph to schedulers.
+
+	Signed-off-by: Julian Anastasov <ja@ssi.bg>
+	Acked-by: Hans Schillstrom <hans@schillstrom.com>
+	Signed-off-by: Simon Horman <horms@verge.net.au>
+(cherry picked from commit bba54de5bdd107d3841b560f1a9cb0ed06e79533)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/ipvs/ip_vs_core.c
+diff --cc net/netfilter/ipvs/ip_vs_core.c
+index 5bab748d4c0f,e9b0330f220d..000000000000
+--- a/net/netfilter/ipvs/ip_vs_core.c
++++ b/net/netfilter/ipvs/ip_vs_core.c
+@@@ -305,13 -305,7 +305,17 @@@ ip_vs_sched_persist(struct ip_vs_servic
+  		 * return *ignored=0 i.e. ICMP and NF_DROP
+  		 */
+  		sched = rcu_dereference(svc->scheduler);
+++<<<<<<< HEAD
+ +		if (sched) {
+ +			/* read svc->sched_data after svc->scheduler */
+ +			smp_rmb();
+ +			dest = sched->schedule(svc, skb);
+ +		} else {
+ +			dest = NULL;
+ +		}
+++=======
++ 		dest = sched->schedule(svc, skb, iph);
+++>>>>>>> bba54de5bdd1 (ipvs: provide iph to schedulers)
+  		if (!dest) {
+  			IP_VS_DBG(1, "p-schedule: no dest found.\n");
+  			kfree(param.pe_data);
+@@@ -458,13 -452,7 +462,17 @@@ ip_vs_schedule(struct ip_vs_service *sv
+  	}
+  
+  	sched = rcu_dereference(svc->scheduler);
+++<<<<<<< HEAD
+ +	if (sched) {
+ +		/* read svc->sched_data after svc->scheduler */
+ +		smp_rmb();
+ +		dest = sched->schedule(svc, skb);
+ +	} else {
+ +		dest = NULL;
+ +	}
+++=======
++ 	dest = sched->schedule(svc, skb, iph);
+++>>>>>>> bba54de5bdd1 (ipvs: provide iph to schedulers)
+  	if (dest == NULL) {
+  		IP_VS_DBG(1, "Schedule: no dest found.\n");
+  		return NULL;
+diff --git a/include/net/ip_vs.h b/include/net/ip_vs.h
+index c8d7e8e2f8b3..e1599adc052f 100644
+--- a/include/net/ip_vs.h
++++ b/include/net/ip_vs.h
+@@ -176,31 +176,6 @@ ip_vs_fill_iph_skb(int af, const struct sk_buff *skb, struct ip_vs_iphdr *iphdr)
+ 	return ip_vs_fill_iph_skb_off(af, skb, skb_network_offset(skb), iphdr);
+ }
+ 
+-/* This function is a faster version of ip_vs_fill_iph_skb().
+- * Where we only populate {s,d}addr (and avoid calling ipv6_find_hdr()).
+- * This is used by the some of the ip_vs_*_schedule() functions.
+- * (Mostly done to avoid ABI breakage of external schedulers)
+- */
+-static inline void
+-ip_vs_fill_iph_addr_only(int af, const struct sk_buff *skb,
+-			 struct ip_vs_iphdr *iphdr)
+-{
+-#ifdef CONFIG_IP_VS_IPV6
+-	if (af == AF_INET6) {
+-		const struct ipv6hdr *iph =
+-			(struct ipv6hdr *)skb_network_header(skb);
+-		iphdr->saddr.in6 = iph->saddr;
+-		iphdr->daddr.in6 = iph->daddr;
+-	} else
+-#endif
+-	{
+-		const struct iphdr *iph =
+-			(struct iphdr *)skb_network_header(skb);
+-		iphdr->saddr.ip = iph->saddr;
+-		iphdr->daddr.ip = iph->daddr;
+-	}
+-}
+-
+ static inline void ip_vs_addr_copy(int af, union nf_inet_addr *dst,
+ 				   const union nf_inet_addr *src)
+ {
+@@ -793,7 +768,8 @@ struct ip_vs_scheduler {
+ 
+ 	/* selecting a server from the given service */
+ 	struct ip_vs_dest* (*schedule)(struct ip_vs_service *svc,
+-				       const struct sk_buff *skb);
++				       const struct sk_buff *skb,
++				       struct ip_vs_iphdr *iph);
+ };
+ 
+ /* The persistence engine object */
+* Unmerged path net/netfilter/ipvs/ip_vs_core.c
+diff --git a/net/netfilter/ipvs/ip_vs_dh.c b/net/netfilter/ipvs/ip_vs_dh.c
+index ccab120df45e..c3b84546ea9e 100644
+--- a/net/netfilter/ipvs/ip_vs_dh.c
++++ b/net/netfilter/ipvs/ip_vs_dh.c
+@@ -214,18 +214,16 @@ static inline int is_overloaded(struct ip_vs_dest *dest)
+  *      Destination hashing scheduling
+  */
+ static struct ip_vs_dest *
+-ip_vs_dh_schedule(struct ip_vs_service *svc, const struct sk_buff *skb)
++ip_vs_dh_schedule(struct ip_vs_service *svc, const struct sk_buff *skb,
++		  struct ip_vs_iphdr *iph)
+ {
+ 	struct ip_vs_dest *dest;
+ 	struct ip_vs_dh_state *s;
+-	struct ip_vs_iphdr iph;
+-
+-	ip_vs_fill_iph_addr_only(svc->af, skb, &iph);
+ 
+ 	IP_VS_DBG(6, "%s(): Scheduling...\n", __func__);
+ 
+ 	s = (struct ip_vs_dh_state *) svc->sched_data;
+-	dest = ip_vs_dh_get(svc->af, s, &iph.daddr);
++	dest = ip_vs_dh_get(svc->af, s, &iph->daddr);
+ 	if (!dest
+ 	    || !(dest->flags & IP_VS_DEST_F_AVAILABLE)
+ 	    || atomic_read(&dest->weight) <= 0
+@@ -235,7 +233,7 @@ ip_vs_dh_schedule(struct ip_vs_service *svc, const struct sk_buff *skb)
+ 	}
+ 
+ 	IP_VS_DBG_BUF(6, "DH: destination IP address %s --> server %s:%d\n",
+-		      IP_VS_DBG_ADDR(svc->af, &iph.daddr),
++		      IP_VS_DBG_ADDR(svc->af, &iph->daddr),
+ 		      IP_VS_DBG_ADDR(svc->af, &dest->addr),
+ 		      ntohs(dest->port));
+ 
+diff --git a/net/netfilter/ipvs/ip_vs_lblc.c b/net/netfilter/ipvs/ip_vs_lblc.c
+index 44595b8ae37f..1383b0eadc0e 100644
+--- a/net/netfilter/ipvs/ip_vs_lblc.c
++++ b/net/netfilter/ipvs/ip_vs_lblc.c
+@@ -487,19 +487,17 @@ is_overloaded(struct ip_vs_dest *dest, struct ip_vs_service *svc)
+  *    Locality-Based (weighted) Least-Connection scheduling
+  */
+ static struct ip_vs_dest *
+-ip_vs_lblc_schedule(struct ip_vs_service *svc, const struct sk_buff *skb)
++ip_vs_lblc_schedule(struct ip_vs_service *svc, const struct sk_buff *skb,
++		    struct ip_vs_iphdr *iph)
+ {
+ 	struct ip_vs_lblc_table *tbl = svc->sched_data;
+-	struct ip_vs_iphdr iph;
+ 	struct ip_vs_dest *dest = NULL;
+ 	struct ip_vs_lblc_entry *en;
+ 
+-	ip_vs_fill_iph_addr_only(svc->af, skb, &iph);
+-
+ 	IP_VS_DBG(6, "%s(): Scheduling...\n", __func__);
+ 
+ 	/* First look in our cache */
+-	en = ip_vs_lblc_get(svc->af, tbl, &iph.daddr);
++	en = ip_vs_lblc_get(svc->af, tbl, &iph->daddr);
+ 	if (en) {
+ 		/* We only hold a read lock, but this is atomic */
+ 		en->lastuse = jiffies;
+@@ -529,12 +527,12 @@ ip_vs_lblc_schedule(struct ip_vs_service *svc, const struct sk_buff *skb)
+ 	/* If we fail to create a cache entry, we'll just use the valid dest */
+ 	spin_lock_bh(&svc->sched_lock);
+ 	if (!tbl->dead)
+-		ip_vs_lblc_new(tbl, &iph.daddr, dest);
++		ip_vs_lblc_new(tbl, &iph->daddr, dest);
+ 	spin_unlock_bh(&svc->sched_lock);
+ 
+ out:
+ 	IP_VS_DBG_BUF(6, "LBLC: destination IP address %s --> server %s:%d\n",
+-		      IP_VS_DBG_ADDR(svc->af, &iph.daddr),
++		      IP_VS_DBG_ADDR(svc->af, &iph->daddr),
+ 		      IP_VS_DBG_ADDR(svc->af, &dest->addr), ntohs(dest->port));
+ 
+ 	return dest;
+diff --git a/net/netfilter/ipvs/ip_vs_lblcr.c b/net/netfilter/ipvs/ip_vs_lblcr.c
+index 876937db0bf4..3cd85b2fc67c 100644
+--- a/net/netfilter/ipvs/ip_vs_lblcr.c
++++ b/net/netfilter/ipvs/ip_vs_lblcr.c
+@@ -655,19 +655,17 @@ is_overloaded(struct ip_vs_dest *dest, struct ip_vs_service *svc)
+  *    Locality-Based (weighted) Least-Connection scheduling
+  */
+ static struct ip_vs_dest *
+-ip_vs_lblcr_schedule(struct ip_vs_service *svc, const struct sk_buff *skb)
++ip_vs_lblcr_schedule(struct ip_vs_service *svc, const struct sk_buff *skb,
++		     struct ip_vs_iphdr *iph)
+ {
+ 	struct ip_vs_lblcr_table *tbl = svc->sched_data;
+-	struct ip_vs_iphdr iph;
+ 	struct ip_vs_dest *dest;
+ 	struct ip_vs_lblcr_entry *en;
+ 
+-	ip_vs_fill_iph_addr_only(svc->af, skb, &iph);
+-
+ 	IP_VS_DBG(6, "%s(): Scheduling...\n", __func__);
+ 
+ 	/* First look in our cache */
+-	en = ip_vs_lblcr_get(svc->af, tbl, &iph.daddr);
++	en = ip_vs_lblcr_get(svc->af, tbl, &iph->daddr);
+ 	if (en) {
+ 		en->lastuse = jiffies;
+ 
+@@ -718,12 +716,12 @@ ip_vs_lblcr_schedule(struct ip_vs_service *svc, const struct sk_buff *skb)
+ 	/* If we fail to create a cache entry, we'll just use the valid dest */
+ 	spin_lock_bh(&svc->sched_lock);
+ 	if (!tbl->dead)
+-		ip_vs_lblcr_new(tbl, &iph.daddr, dest);
++		ip_vs_lblcr_new(tbl, &iph->daddr, dest);
+ 	spin_unlock_bh(&svc->sched_lock);
+ 
+ out:
+ 	IP_VS_DBG_BUF(6, "LBLCR: destination IP address %s --> server %s:%d\n",
+-		      IP_VS_DBG_ADDR(svc->af, &iph.daddr),
++		      IP_VS_DBG_ADDR(svc->af, &iph->daddr),
+ 		      IP_VS_DBG_ADDR(svc->af, &dest->addr), ntohs(dest->port));
+ 
+ 	return dest;
+diff --git a/net/netfilter/ipvs/ip_vs_lc.c b/net/netfilter/ipvs/ip_vs_lc.c
+index 5128e338a749..2bdcb1cf2127 100644
+--- a/net/netfilter/ipvs/ip_vs_lc.c
++++ b/net/netfilter/ipvs/ip_vs_lc.c
+@@ -26,7 +26,8 @@
+  *	Least Connection scheduling
+  */
+ static struct ip_vs_dest *
+-ip_vs_lc_schedule(struct ip_vs_service *svc, const struct sk_buff *skb)
++ip_vs_lc_schedule(struct ip_vs_service *svc, const struct sk_buff *skb,
++		  struct ip_vs_iphdr *iph)
+ {
+ 	struct ip_vs_dest *dest, *least = NULL;
+ 	unsigned int loh = 0, doh;
+diff --git a/net/netfilter/ipvs/ip_vs_nq.c b/net/netfilter/ipvs/ip_vs_nq.c
+index 646cfd4baa73..d8d9860934fe 100644
+--- a/net/netfilter/ipvs/ip_vs_nq.c
++++ b/net/netfilter/ipvs/ip_vs_nq.c
+@@ -55,7 +55,8 @@ ip_vs_nq_dest_overhead(struct ip_vs_dest *dest)
+  *	Weighted Least Connection scheduling
+  */
+ static struct ip_vs_dest *
+-ip_vs_nq_schedule(struct ip_vs_service *svc, const struct sk_buff *skb)
++ip_vs_nq_schedule(struct ip_vs_service *svc, const struct sk_buff *skb,
++		  struct ip_vs_iphdr *iph)
+ {
+ 	struct ip_vs_dest *dest, *least = NULL;
+ 	unsigned int loh = 0, doh;
+diff --git a/net/netfilter/ipvs/ip_vs_rr.c b/net/netfilter/ipvs/ip_vs_rr.c
+index c35986c793d9..176b87c35e34 100644
+--- a/net/netfilter/ipvs/ip_vs_rr.c
++++ b/net/netfilter/ipvs/ip_vs_rr.c
+@@ -55,7 +55,8 @@ static int ip_vs_rr_del_dest(struct ip_vs_service *svc, struct ip_vs_dest *dest)
+  * Round-Robin Scheduling
+  */
+ static struct ip_vs_dest *
+-ip_vs_rr_schedule(struct ip_vs_service *svc, const struct sk_buff *skb)
++ip_vs_rr_schedule(struct ip_vs_service *svc, const struct sk_buff *skb,
++		  struct ip_vs_iphdr *iph)
+ {
+ 	struct list_head *p;
+ 	struct ip_vs_dest *dest, *last;
+diff --git a/net/netfilter/ipvs/ip_vs_sed.c b/net/netfilter/ipvs/ip_vs_sed.c
+index f3205925359a..a5284cc3d882 100644
+--- a/net/netfilter/ipvs/ip_vs_sed.c
++++ b/net/netfilter/ipvs/ip_vs_sed.c
+@@ -59,7 +59,8 @@ ip_vs_sed_dest_overhead(struct ip_vs_dest *dest)
+  *	Weighted Least Connection scheduling
+  */
+ static struct ip_vs_dest *
+-ip_vs_sed_schedule(struct ip_vs_service *svc, const struct sk_buff *skb)
++ip_vs_sed_schedule(struct ip_vs_service *svc, const struct sk_buff *skb,
++		   struct ip_vs_iphdr *iph)
+ {
+ 	struct ip_vs_dest *dest, *least;
+ 	unsigned int loh, doh;
+diff --git a/net/netfilter/ipvs/ip_vs_sh.c b/net/netfilter/ipvs/ip_vs_sh.c
+index a65edfe4b16c..e0d5d1653566 100644
+--- a/net/netfilter/ipvs/ip_vs_sh.c
++++ b/net/netfilter/ipvs/ip_vs_sh.c
+@@ -227,18 +227,16 @@ static inline int is_overloaded(struct ip_vs_dest *dest)
+  *      Source Hashing scheduling
+  */
+ static struct ip_vs_dest *
+-ip_vs_sh_schedule(struct ip_vs_service *svc, const struct sk_buff *skb)
++ip_vs_sh_schedule(struct ip_vs_service *svc, const struct sk_buff *skb,
++		  struct ip_vs_iphdr *iph)
+ {
+ 	struct ip_vs_dest *dest;
+ 	struct ip_vs_sh_state *s;
+-	struct ip_vs_iphdr iph;
+-
+-	ip_vs_fill_iph_addr_only(svc->af, skb, &iph);
+ 
+ 	IP_VS_DBG(6, "ip_vs_sh_schedule(): Scheduling...\n");
+ 
+ 	s = (struct ip_vs_sh_state *) svc->sched_data;
+-	dest = ip_vs_sh_get(svc->af, s, &iph.saddr);
++	dest = ip_vs_sh_get(svc->af, s, &iph->saddr);
+ 	if (!dest
+ 	    || !(dest->flags & IP_VS_DEST_F_AVAILABLE)
+ 	    || atomic_read(&dest->weight) <= 0
+@@ -248,7 +246,7 @@ ip_vs_sh_schedule(struct ip_vs_service *svc, const struct sk_buff *skb)
+ 	}
+ 
+ 	IP_VS_DBG_BUF(6, "SH: source IP address %s --> server %s:%d\n",
+-		      IP_VS_DBG_ADDR(svc->af, &iph.saddr),
++		      IP_VS_DBG_ADDR(svc->af, &iph->saddr),
+ 		      IP_VS_DBG_ADDR(svc->af, &dest->addr),
+ 		      ntohs(dest->port));
+ 
+diff --git a/net/netfilter/ipvs/ip_vs_wlc.c b/net/netfilter/ipvs/ip_vs_wlc.c
+index c60a81c4ce9a..6dc1fa128840 100644
+--- a/net/netfilter/ipvs/ip_vs_wlc.c
++++ b/net/netfilter/ipvs/ip_vs_wlc.c
+@@ -31,7 +31,8 @@
+  *	Weighted Least Connection scheduling
+  */
+ static struct ip_vs_dest *
+-ip_vs_wlc_schedule(struct ip_vs_service *svc, const struct sk_buff *skb)
++ip_vs_wlc_schedule(struct ip_vs_service *svc, const struct sk_buff *skb,
++		   struct ip_vs_iphdr *iph)
+ {
+ 	struct ip_vs_dest *dest, *least;
+ 	unsigned int loh, doh;
+diff --git a/net/netfilter/ipvs/ip_vs_wrr.c b/net/netfilter/ipvs/ip_vs_wrr.c
+index 0e68555bceb9..0546cd572d6b 100644
+--- a/net/netfilter/ipvs/ip_vs_wrr.c
++++ b/net/netfilter/ipvs/ip_vs_wrr.c
+@@ -162,7 +162,8 @@ static int ip_vs_wrr_dest_changed(struct ip_vs_service *svc,
+  *    Weighted Round-Robin Scheduling
+  */
+ static struct ip_vs_dest *
+-ip_vs_wrr_schedule(struct ip_vs_service *svc, const struct sk_buff *skb)
++ip_vs_wrr_schedule(struct ip_vs_service *svc, const struct sk_buff *skb,
++		   struct ip_vs_iphdr *iph)
+ {
+ 	struct ip_vs_dest *dest, *last, *stop = NULL;
+ 	struct ip_vs_wrr_mark *mark = svc->sched_data;
