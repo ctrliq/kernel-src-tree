@@ -1,0 +1,114 @@
+perf/x86: Fix NMI measurements
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit e8a923cc1fff6e627f906655ad52ee694ef2f6d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/e8a923cc.failed
+
+OK, so what I'm actually seeing on my WSM is that sched/clock.c is
+'broken' for the purpose we're using it for.
+
+What triggered it is that my WSM-EP is broken :-(
+
+  [    0.001000] tsc: Fast TSC calibration using PIT
+  [    0.002000] tsc: Detected 2533.715 MHz processor
+  [    0.500180] TSC synchronization [CPU#0 -> CPU#6]:
+  [    0.505197] Measured 3 cycles TSC warp between CPUs, turning off TSC clock.
+  [    0.004000] tsc: Marking TSC unstable due to check_tsc_sync_source failed
+
+For some reason it consistently detects TSC skew, even though NHM+
+should have a single clock domain for 'reasonable' systems.
+
+This marks sched_clock_stable=0, which means that we do fancy stuff to
+try and get a 'sane' clock. Part of this fancy stuff relies on the tick,
+clearly that's gone when NOHZ=y. So for idle cpus time gets stuck, until
+it either wakes up or gets kicked by another cpu.
+
+While this is perfectly fine for the scheduler -- it only cares about
+actually running stuff, and when we're running stuff we're obviously not
+idle. This does somewhat break down for perf which can trigger events
+just fine on an otherwise idle cpu.
+
+So I've got NMIs get get 'measured' as taking ~1ms, which actually
+don't last nearly that long:
+
+          <idle>-0     [013] d.h.   886.311970: rcu_nmi_enter <-do_nmi
+  ...
+          <idle>-0     [013] d.h.   886.311997: perf_sample_event_took: HERE!!! : 1040990
+
+So ftrace (which uses sched_clock(), not the fancy bits) only sees
+~27us, but we measure ~1ms !!
+
+Now since all this measurement stuff lives in x86 code, we can actually
+fix it.
+
+	Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: mingo@kernel.org
+	Cc: dave.hansen@linux.intel.com
+	Cc: eranian@google.com
+	Cc: Don Zickus <dzickus@redhat.com>
+	Cc: jmario@redhat.com
+	Cc: acme@infradead.org
+Link: http://lkml.kernel.org/r/20131017133350.GG3364@laptop.programming.kicks-ass.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit e8a923cc1fff6e627f906655ad52ee694ef2f6d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/nmi.c
+diff --cc arch/x86/kernel/nmi.c
+index f5c2364defa2,6fcb49ce50a1..000000000000
+--- a/arch/x86/kernel/nmi.c
++++ b/arch/x86/kernel/nmi.c
+@@@ -109,11 -111,13 +109,19 @@@ static int __kprobes nmi_handle(unsigne
+  	 */
+  	list_for_each_entry_rcu(a, &desc->head, list) {
+  		u64 before, delta, whole_msecs;
+ -		int remainder_ns, decimal_msecs, thishandled;
+ +		int decimal_msecs;
+  
+++<<<<<<< HEAD
+ +		before = local_clock();
+ +		handled += a->handler(type, regs);
+ +		delta = local_clock() - before;
+++=======
++ 		before = sched_clock();
++ 		thishandled = a->handler(type, regs);
++ 		handled += thishandled;
++ 		delta = sched_clock() - before;
++ 		trace_nmi_handler(a->handler, (int)delta, thishandled);
+++>>>>>>> e8a923cc1fff (perf/x86: Fix NMI measurements)
+  
+  		if (delta < nmi_longest_ns)
+  			continue;
+diff --git a/arch/x86/events/core.c b/arch/x86/events/core.c
+index 35a83706e49e..9a554ebc2e31 100644
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@ -1462,9 +1462,9 @@ void perf_events_lapic_init(void)
+ static int __kprobes
+ perf_event_nmi_handler(unsigned int cmd, struct pt_regs *regs)
+ {
+-	int ret;
+ 	u64 start_clock;
+ 	u64 finish_clock;
++	int ret;
+ 
+ 	/*
+ 	 * All PMUs/events that share this PMI handler should make sure to
+@@ -1473,9 +1473,9 @@ perf_event_nmi_handler(unsigned int cmd, struct pt_regs *regs)
+ 	if (!atomic_read(&active_events))
+ 		return NMI_DONE;
+ 
+-	start_clock = local_clock();
++	start_clock = sched_clock();
+ 	ret = x86_pmu.handle_irq(regs);
+-	finish_clock = local_clock();
++	finish_clock = sched_clock();
+ 
+ 	perf_sample_event_took(finish_clock - start_clock);
+ 
+* Unmerged path arch/x86/kernel/nmi.c
