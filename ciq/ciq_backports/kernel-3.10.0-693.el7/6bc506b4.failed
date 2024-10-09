@@ -1,0 +1,626 @@
+bridge: switchdev: Add forward mark support for stacked devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit 6bc506b4fb065eac3d89ca1ce37082e174493d9e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/6bc506b4.failed
+
+switchdev_port_fwd_mark_set() is used to set the 'offload_fwd_mark' of
+port netdevs so that packets being flooded by the device won't be
+flooded twice.
+
+It works by assigning a unique identifier (the ifindex of the first
+bridge port) to bridge ports sharing the same parent ID. This prevents
+packets from being flooded twice by the same switch, but will flood
+packets through bridge ports belonging to a different switch.
+
+This method is problematic when stacked devices are taken into account,
+such as VLANs. In such cases, a physical port netdev can have upper
+devices being members in two different bridges, thus requiring two
+different 'offload_fwd_mark's to be configured on the port netdev, which
+is impossible.
+
+The main problem is that packet and netdev marking is performed at the
+physical netdev level, whereas flooding occurs between bridge ports,
+which are not necessarily port netdevs.
+
+Instead, packet and netdev marking should really be done in the bridge
+driver with the switch driver only telling it which packets it already
+forwarded. The bridge driver will mark such packets using the mark
+assigned to the ingress bridge port and will prevent the packet from
+being forwarded through any bridge port sharing the same mark (i.e.
+having the same parent ID).
+
+Remove the current switchdev 'offload_fwd_mark' implementation and
+instead implement the proposed method. In addition, make rocker - the
+sole user of the mark - use the proposed method.
+
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6bc506b4fb065eac3d89ca1ce37082e174493d9e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/networking/switchdev.txt
+#	drivers/net/ethernet/rocker/rocker_main.c
+#	drivers/net/ethernet/rocker/rocker_ofdpa.c
+#	include/linux/netdevice.h
+#	include/linux/skbuff.h
+#	include/net/switchdev.h
+#	net/bridge/br_forward.c
+#	net/bridge/br_if.c
+#	net/bridge/br_private.h
+#	net/switchdev/switchdev.c
+diff --cc include/linux/netdevice.h
+index f1dbb3a4ae20,d122be9345c7..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -1447,11 -1409,214 +1447,220 @@@ enum netdev_priv_flags 
+  #define IFF_RXFH_CONFIGURED		IFF_RXFH_CONFIGURED
+  #define IFF_MACSEC			IFF_MACSEC
+  
+++<<<<<<< HEAD
+ +/*
+ + *	The DEVICE structure.
+ + *	Actually, this whole structure is a big mistake.  It mixes I/O
+ + *	data with strictly "high-level" data, and it has to know about
+ + *	almost every data structure used in the INET module.
+++=======
++ /**
++  *	struct net_device - The DEVICE structure.
++  *		Actually, this whole structure is a big mistake.  It mixes I/O
++  *		data with strictly "high-level" data, and it has to know about
++  *		almost every data structure used in the INET module.
++  *
++  *	@name:	This is the first field of the "visible" part of this structure
++  *		(i.e. as seen by users in the "Space.c" file).  It is the name
++  *	 	of the interface.
++  *
++  *	@name_hlist: 	Device name hash chain, please keep it close to name[]
++  *	@ifalias:	SNMP alias
++  *	@mem_end:	Shared memory end
++  *	@mem_start:	Shared memory start
++  *	@base_addr:	Device I/O address
++  *	@irq:		Device IRQ number
++  *
++  *	@carrier_changes:	Stats to monitor carrier on<->off transitions
++  *
++  *	@state:		Generic network queuing layer state, see netdev_state_t
++  *	@dev_list:	The global list of network devices
++  *	@napi_list:	List entry used for polling NAPI devices
++  *	@unreg_list:	List entry  when we are unregistering the
++  *			device; see the function unregister_netdev
++  *	@close_list:	List entry used when we are closing the device
++  *	@ptype_all:     Device-specific packet handlers for all protocols
++  *	@ptype_specific: Device-specific, protocol-specific packet handlers
++  *
++  *	@adj_list:	Directly linked devices, like slaves for bonding
++  *	@all_adj_list:	All linked devices, *including* neighbours
++  *	@features:	Currently active device features
++  *	@hw_features:	User-changeable features
++  *
++  *	@wanted_features:	User-requested features
++  *	@vlan_features:		Mask of features inheritable by VLAN devices
++  *
++  *	@hw_enc_features:	Mask of features inherited by encapsulating devices
++  *				This field indicates what encapsulation
++  *				offloads the hardware is capable of doing,
++  *				and drivers will need to set them appropriately.
++  *
++  *	@mpls_features:	Mask of features inheritable by MPLS
++  *
++  *	@ifindex:	interface index
++  *	@group:		The group the device belongs to
++  *
++  *	@stats:		Statistics struct, which was left as a legacy, use
++  *			rtnl_link_stats64 instead
++  *
++  *	@rx_dropped:	Dropped packets by core network,
++  *			do not use this in drivers
++  *	@tx_dropped:	Dropped packets by core network,
++  *			do not use this in drivers
++  *	@rx_nohandler:	nohandler dropped packets by core network on
++  *			inactive devices, do not use this in drivers
++  *
++  *	@wireless_handlers:	List of functions to handle Wireless Extensions,
++  *				instead of ioctl,
++  *				see <net/iw_handler.h> for details.
++  *	@wireless_data:	Instance data managed by the core of wireless extensions
++  *
++  *	@netdev_ops:	Includes several pointers to callbacks,
++  *			if one wants to override the ndo_*() functions
++  *	@ethtool_ops:	Management operations
++  *	@ndisc_ops:	Includes callbacks for different IPv6 neighbour
++  *			discovery handling. Necessary for e.g. 6LoWPAN.
++  *	@header_ops:	Includes callbacks for creating,parsing,caching,etc
++  *			of Layer 2 headers.
++  *
++  *	@flags:		Interface flags (a la BSD)
++  *	@priv_flags:	Like 'flags' but invisible to userspace,
++  *			see if.h for the definitions
++  *	@gflags:	Global flags ( kept as legacy )
++  *	@padded:	How much padding added by alloc_netdev()
++  *	@operstate:	RFC2863 operstate
++  *	@link_mode:	Mapping policy to operstate
++  *	@if_port:	Selectable AUI, TP, ...
++  *	@dma:		DMA channel
++  *	@mtu:		Interface MTU value
++  *	@type:		Interface hardware type
++  *	@hard_header_len: Maximum hardware header length.
++  *
++  *	@needed_headroom: Extra headroom the hardware may need, but not in all
++  *			  cases can this be guaranteed
++  *	@needed_tailroom: Extra tailroom the hardware may need, but not in all
++  *			  cases can this be guaranteed. Some cases also use
++  *			  LL_MAX_HEADER instead to allocate the skb
++  *
++  *	interface address info:
++  *
++  * 	@perm_addr:		Permanent hw address
++  * 	@addr_assign_type:	Hw address assignment type
++  * 	@addr_len:		Hardware address length
++  *	@neigh_priv_len:	Used in neigh_alloc()
++  * 	@dev_id:		Used to differentiate devices that share
++  * 				the same link layer address
++  * 	@dev_port:		Used to differentiate devices that share
++  * 				the same function
++  *	@addr_list_lock:	XXX: need comments on this one
++  *	@uc_promisc:		Counter that indicates promiscuous mode
++  *				has been enabled due to the need to listen to
++  *				additional unicast addresses in a device that
++  *				does not implement ndo_set_rx_mode()
++  *	@uc:			unicast mac addresses
++  *	@mc:			multicast mac addresses
++  *	@dev_addrs:		list of device hw addresses
++  *	@queues_kset:		Group of all Kobjects in the Tx and RX queues
++  *	@promiscuity:		Number of times the NIC is told to work in
++  *				promiscuous mode; if it becomes 0 the NIC will
++  *				exit promiscuous mode
++  *	@allmulti:		Counter, enables or disables allmulticast mode
++  *
++  *	@vlan_info:	VLAN info
++  *	@dsa_ptr:	dsa specific data
++  *	@tipc_ptr:	TIPC specific data
++  *	@atalk_ptr:	AppleTalk link
++  *	@ip_ptr:	IPv4 specific data
++  *	@dn_ptr:	DECnet specific data
++  *	@ip6_ptr:	IPv6 specific data
++  *	@ax25_ptr:	AX.25 specific data
++  *	@ieee80211_ptr:	IEEE 802.11 specific data, assign before registering
++  *
++  *	@last_rx:	Time of last Rx
++  *	@dev_addr:	Hw address (before bcast,
++  *			because most packets are unicast)
++  *
++  *	@_rx:			Array of RX queues
++  *	@num_rx_queues:		Number of RX queues
++  *				allocated at register_netdev() time
++  *	@real_num_rx_queues: 	Number of RX queues currently active in device
++  *
++  *	@rx_handler:		handler for received packets
++  *	@rx_handler_data: 	XXX: need comments on this one
++  *	@ingress_queue:		XXX: need comments on this one
++  *	@broadcast:		hw bcast address
++  *
++  *	@rx_cpu_rmap:	CPU reverse-mapping for RX completion interrupts,
++  *			indexed by RX queue number. Assigned by driver.
++  *			This must only be set if the ndo_rx_flow_steer
++  *			operation is defined
++  *	@index_hlist:		Device index hash chain
++  *
++  *	@_tx:			Array of TX queues
++  *	@num_tx_queues:		Number of TX queues allocated at alloc_netdev_mq() time
++  *	@real_num_tx_queues: 	Number of TX queues currently active in device
++  *	@qdisc:			Root qdisc from userspace point of view
++  *	@tx_queue_len:		Max frames per queue allowed
++  *	@tx_global_lock: 	XXX: need comments on this one
++  *
++  *	@xps_maps:	XXX: need comments on this one
++  *
++  *	@watchdog_timeo:	Represents the timeout that is used by
++  *				the watchdog (see dev_watchdog())
++  *	@watchdog_timer:	List of timers
++  *
++  *	@pcpu_refcnt:		Number of references to this device
++  *	@todo_list:		Delayed register/unregister
++  *	@link_watch_list:	XXX: need comments on this one
++  *
++  *	@reg_state:		Register/unregister state machine
++  *	@dismantle:		Device is going to be freed
++  *	@rtnl_link_state:	This enum represents the phases of creating
++  *				a new link
++  *
++  *	@destructor:		Called from unregister,
++  *				can be used to call free_netdev
++  *	@npinfo:		XXX: need comments on this one
++  * 	@nd_net:		Network namespace this network device is inside
++  *
++  * 	@ml_priv:	Mid-layer private
++  * 	@lstats:	Loopback statistics
++  * 	@tstats:	Tunnel statistics
++  * 	@dstats:	Dummy statistics
++  * 	@vstats:	Virtual ethernet statistics
++  *
++  *	@garp_port:	GARP
++  *	@mrp_port:	MRP
++  *
++  *	@dev:		Class/net/name entry
++  *	@sysfs_groups:	Space for optional device, statistics and wireless
++  *			sysfs groups
++  *
++  *	@sysfs_rx_queue_group:	Space for optional per-rx queue attributes
++  *	@rtnl_link_ops:	Rtnl_link_ops
++  *
++  *	@gso_max_size:	Maximum size of generic segmentation offload
++  *	@gso_max_segs:	Maximum number of segments that can be passed to the
++  *			NIC for GSO
++  *
++  *	@dcbnl_ops:	Data Center Bridging netlink ops
++  *	@num_tc:	Number of traffic classes in the net device
++  *	@tc_to_txq:	XXX: need comments on this one
++  *	@prio_tc_map	XXX: need comments on this one
++  *
++  *	@fcoe_ddp_xid:	Max exchange id for FCoE LRO by ddp
++  *
++  *	@priomap:	XXX: need comments on this one
++  *	@phydev:	Physical device may attach itself
++  *			for hardware timestamping
++  *
++  *	@qdisc_tx_busylock: lockdep class annotating Qdisc->busylock spinlock
++  *	@qdisc_running_key: lockdep class annotating Qdisc->running seqcount
++  *
++  *	@proto_down:	protocol port state information can be sent to the
++  *			switch driver and used to set the phys state of the
++  *			switch port.
+++>>>>>>> 6bc506b4fb06 (bridge: switchdev: Add forward mark support for stacked devices)
+   *
+   *	FIXME: cleanup struct net_device such that network protocol info
+   *	moves out.
+@@@ -1650,11 -1809,8 +1859,16 @@@ struct net_device 
+  #ifdef CONFIG_XPS
+  	struct xps_dev_maps __rcu *xps_maps;
+  #endif
+++<<<<<<< HEAD
+ +#ifdef CONFIG_RFS_ACCEL
+ +	/* CPU reverse-mapping for RX completion interrupts, indexed
+ +	 * by RX queue number.  Assigned by driver.  This must only be
+ +	 * set if the ndo_rx_flow_steer operation is defined. */
+ +	struct cpu_rmap		*rx_cpu_rmap;
+++=======
++ #ifdef CONFIG_NET_CLS_ACT
++ 	struct tcf_proto __rcu  *egress_cl_list;
+++>>>>>>> 6bc506b4fb06 (bridge: switchdev: Add forward mark support for stacked devices)
+  #endif
+  
+  	/* These may be needed for future network-power-down code. */
+diff --cc include/linux/skbuff.h
+index 9a8e284147e4,cfb7219be665..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -600,6 -670,77 +600,80 @@@ struct sk_buff 
+  				data_len;
+  	__u16			mac_len,
+  				hdr_len;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* Following fields are _not_ copied in __copy_skb_header()
++ 	 * Note that queue_mapping is here mostly to fill a hole.
++ 	 */
++ 	kmemcheck_bitfield_begin(flags1);
++ 	__u16			queue_mapping;
++ 	__u8			cloned:1,
++ 				nohdr:1,
++ 				fclone:2,
++ 				peeked:1,
++ 				head_frag:1,
++ 				xmit_more:1;
++ 	/* one bit hole */
++ 	kmemcheck_bitfield_end(flags1);
++ 
++ 	/* fields enclosed in headers_start/headers_end are copied
++ 	 * using a single memcpy() in __copy_skb_header()
++ 	 */
++ 	/* private: */
++ 	__u32			headers_start[0];
++ 	/* public: */
++ 
++ /* if you move pkt_type around you also must adapt those constants */
++ #ifdef __BIG_ENDIAN_BITFIELD
++ #define PKT_TYPE_MAX	(7 << 5)
++ #else
++ #define PKT_TYPE_MAX	7
++ #endif
++ #define PKT_TYPE_OFFSET()	offsetof(struct sk_buff, __pkt_type_offset)
++ 
++ 	__u8			__pkt_type_offset[0];
++ 	__u8			pkt_type:3;
++ 	__u8			pfmemalloc:1;
++ 	__u8			ignore_df:1;
++ 	__u8			nfctinfo:3;
++ 
++ 	__u8			nf_trace:1;
++ 	__u8			ip_summed:2;
++ 	__u8			ooo_okay:1;
++ 	__u8			l4_hash:1;
++ 	__u8			sw_hash:1;
++ 	__u8			wifi_acked_valid:1;
++ 	__u8			wifi_acked:1;
++ 
++ 	__u8			no_fcs:1;
++ 	/* Indicates the inner headers are valid in the skbuff. */
++ 	__u8			encapsulation:1;
++ 	__u8			encap_hdr_csum:1;
++ 	__u8			csum_valid:1;
++ 	__u8			csum_complete_sw:1;
++ 	__u8			csum_level:2;
++ 	__u8			csum_bad:1;
++ 
++ #ifdef CONFIG_IPV6_NDISC_NODETYPE
++ 	__u8			ndisc_nodetype:2;
++ #endif
++ 	__u8			ipvs_property:1;
++ 	__u8			inner_protocol_type:1;
++ 	__u8			remcsum_offload:1;
++ #ifdef CONFIG_NET_SWITCHDEV
++ 	__u8			offload_fwd_mark:1;
++ #endif
++ 	/* 2, 4 or 5 bit hole */
++ 
++ #ifdef CONFIG_NET_SCHED
++ 	__u16			tc_index;	/* traffic control index */
++ #ifdef CONFIG_NET_CLS_ACT
++ 	__u16			tc_verd;	/* traffic control verdict */
++ #endif
++ #endif
++ 
+++>>>>>>> 6bc506b4fb06 (bridge: switchdev: Add forward mark support for stacked devices)
+  	union {
+  		__wsum		csum;
+  		struct {
+@@@ -683,11 -760,11 +757,17 @@@
+  	};
+  #endif
+  #ifdef CONFIG_NETWORK_SECMARK
+++<<<<<<< HEAD
+ +	__u32			secmark;
+ +#endif
+++=======
++ 	__u32		secmark;
++ #endif
++ 
+++>>>>>>> 6bc506b4fb06 (bridge: switchdev: Add forward mark support for stacked devices)
+  	union {
+  		__u32		mark;
+ +		__u32		dropcount;
+  		__u32		reserved_tailroom;
+  	};
+  
+diff --cc net/bridge/br_forward.c
+index 20c11b41fe6a,32a02de39cd2..000000000000
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@@ -30,17 -25,15 +30,22 @@@ static int deliver_clone(const struct n
+  static inline int should_deliver(const struct net_bridge_port *p,
+  				 const struct sk_buff *skb)
+  {
+ -	struct net_bridge_vlan_group *vg;
+ -
+ -	vg = nbp_vlan_group_rcu(p);
+  	return ((p->flags & BR_HAIRPIN_MODE) || skb->dev != p->dev) &&
+++<<<<<<< HEAD
+ +		br_allowed_egress(p->br, nbp_get_vlan_info(p), skb) &&
+ +		p->state == BR_STATE_FORWARDING;
+++=======
++ 		br_allowed_egress(vg, skb) && p->state == BR_STATE_FORWARDING &&
++ 		nbp_switchdev_allowed_egress(p, skb);
+++>>>>>>> 6bc506b4fb06 (bridge: switchdev: Add forward mark support for stacked devices)
+ +}
+ +
+ +static inline unsigned int packet_length(const struct sk_buff *skb)
+ +{
+ +	return skb->len - (skb->protocol == htons(ETH_P_8021Q) ? VLAN_HLEN : 0);
+  }
+  
+ -int br_dev_queue_push_xmit(struct net *net, struct sock *sk, struct sk_buff *skb)
+ +int br_dev_queue_push_xmit(struct sock *sk, struct sk_buff *skb)
+  {
+  	if (!is_skb_forwardable(skb->dev, skb))
+  		goto drop;
+diff --cc net/bridge/br_if.c
+index 9445aee8bbee,1da3221845f1..000000000000
+--- a/net/bridge/br_if.c
++++ b/net/bridge/br_if.c
+@@@ -555,6 -567,12 +559,15 @@@ int br_add_if(struct net_bridge *br, st
+  	if (br_fdb_insert(br, p, dev->dev_addr, 0))
+  		netdev_err(dev, "failed insert local address bridge forwarding table\n");
+  
+++<<<<<<< HEAD
+++=======
++ 	err = nbp_vlan_init(p);
++ 	if (err) {
++ 		netdev_err(dev, "failed to initialize vlan filtering on this port\n");
++ 		goto err7;
++ 	}
++ 
+++>>>>>>> 6bc506b4fb06 (bridge: switchdev: Add forward mark support for stacked devices)
+  	spin_lock_bh(&br->lock);
+  	changed_addr = br_stp_recalculate_bridge_id(br);
+  
+@@@ -578,6 -593,12 +591,15 @@@
+  
+  	return 0;
+  
+++<<<<<<< HEAD
+++=======
++ err7:
++ 	list_del_rcu(&p->list);
++ 	br_fdb_delete_by_port(br, p, 0, 1);
++ 	nbp_update_port_count(br);
++ err6:
++ 	netdev_upper_dev_unlink(dev, br->dev);
+++>>>>>>> 6bc506b4fb06 (bridge: switchdev: Add forward mark support for stacked devices)
+  err5:
+  	dev->priv_flags &= ~IFF_BRIDGE_PORT;
+  	netdev_rx_handler_unregister(dev);
+diff --cc net/bridge/br_private.h
+index 1e1daa30e106,2379b2b865c9..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -178,8 -249,11 +178,11 @@@ struct net_bridge_por
+  	struct netpoll			*np;
+  #endif
+  #ifdef CONFIG_BRIDGE_VLAN_FILTERING
+ -	struct net_bridge_vlan_group	__rcu *vlgrp;
+ +	struct net_port_vlans __rcu	*vlan_info;
+  #endif
++ #ifdef CONFIG_NET_SWITCHDEV
++ 	int				offload_fwd_mark;
++ #endif
+  };
+  
+  #define br_auto_port(p) ((p)->flags & BR_AUTO_MASK)
+@@@ -283,11 -362,17 +286,16 @@@ struct net_bridg
+  	struct timer_list		gc_timer;
+  	struct kobject			*ifobj;
+  	u32				auto_cnt;
++ 
++ #ifdef CONFIG_NET_SWITCHDEV
++ 	int offload_fwd_mark;
++ #endif
++ 
+  #ifdef CONFIG_BRIDGE_VLAN_FILTERING
+ -	struct net_bridge_vlan_group	__rcu *vlgrp;
+  	u8				vlan_enabled;
+ -	u8				vlan_stats_enabled;
+  	__be16				vlan_proto;
+  	u16				default_pvid;
+ +	struct net_port_vlans __rcu	*vlan_info;
+  #endif
+  };
+  
+@@@ -299,6 -384,15 +307,18 @@@ struct br_input_skb_cb 
+  	int mrouters_only;
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ 	bool proxyarp_replied;
++ 
++ #ifdef CONFIG_BRIDGE_VLAN_FILTERING
++ 	bool vlan_filtered;
++ #endif
++ 
++ #ifdef CONFIG_NET_SWITCHDEV
++ 	int offload_fwd_mark;
++ #endif
+++>>>>>>> 6bc506b4fb06 (bridge: switchdev: Add forward mark support for stacked devices)
+  };
+  
+  #define BR_INPUT_SKB_CB(__skb)	((struct br_input_skb_cb *)(__skb)->cb)
+* Unmerged path Documentation/networking/switchdev.txt
+* Unmerged path drivers/net/ethernet/rocker/rocker_main.c
+* Unmerged path drivers/net/ethernet/rocker/rocker_ofdpa.c
+* Unmerged path include/net/switchdev.h
+* Unmerged path net/switchdev/switchdev.c
+* Unmerged path Documentation/networking/switchdev.txt
+* Unmerged path drivers/net/ethernet/rocker/rocker_main.c
+* Unmerged path drivers/net/ethernet/rocker/rocker_ofdpa.c
+* Unmerged path include/linux/netdevice.h
+* Unmerged path include/linux/skbuff.h
+* Unmerged path include/net/switchdev.h
+diff --git a/net/bridge/Makefile b/net/bridge/Makefile
+index 2228f91be4e6..1b2c5258b014 100644
+--- a/net/bridge/Makefile
++++ b/net/bridge/Makefile
+@@ -20,4 +20,6 @@ bridge-$(CONFIG_BRIDGE_IGMP_SNOOPING) += br_multicast.o br_mdb.o
+ 
+ bridge-$(CONFIG_BRIDGE_VLAN_FILTERING) += br_vlan.o
+ 
++bridge-$(CONFIG_NET_SWITCHDEV) += br_switchdev.o
++
+ obj-$(CONFIG_NETFILTER) += netfilter/
+* Unmerged path net/bridge/br_forward.c
+* Unmerged path net/bridge/br_if.c
+diff --git a/net/bridge/br_input.c b/net/bridge/br_input.c
+index ca978d06eb18..aebacfce219c 100644
+--- a/net/bridge/br_input.c
++++ b/net/bridge/br_input.c
+@@ -76,6 +76,8 @@ int br_handle_frame_finish(struct sock *sk, struct sk_buff *skb)
+ 	if (!br_allowed_ingress(p->br, nbp_get_vlan_info(p), skb, &vid))
+ 		goto out;
+ 
++	nbp_switchdev_frame_mark(p, skb);
++
+ 	/* insert into forwarding database after filtering to avoid spoofing */
+ 	br = p->br;
+ 	if (p->flags & BR_LEARNING)
+* Unmerged path net/bridge/br_private.h
+diff --git a/net/bridge/br_switchdev.c b/net/bridge/br_switchdev.c
+new file mode 100644
+index 000000000000..f4097b900de1
+--- /dev/null
++++ b/net/bridge/br_switchdev.c
+@@ -0,0 +1,57 @@
++#include <linux/kernel.h>
++#include <linux/list.h>
++#include <linux/netdevice.h>
++#include <linux/rtnetlink.h>
++#include <linux/skbuff.h>
++#include <net/switchdev.h>
++
++#include "br_private.h"
++
++static int br_switchdev_mark_get(struct net_bridge *br, struct net_device *dev)
++{
++	struct net_bridge_port *p;
++
++	/* dev is yet to be added to the port list. */
++	list_for_each_entry(p, &br->port_list, list) {
++		if (switchdev_port_same_parent_id(dev, p->dev))
++			return p->offload_fwd_mark;
++	}
++
++	return ++br->offload_fwd_mark;
++}
++
++int nbp_switchdev_mark_set(struct net_bridge_port *p)
++{
++	struct switchdev_attr attr = {
++		.orig_dev = p->dev,
++		.id = SWITCHDEV_ATTR_ID_PORT_PARENT_ID,
++	};
++	int err;
++
++	ASSERT_RTNL();
++
++	err = switchdev_port_attr_get(p->dev, &attr);
++	if (err) {
++		if (err == -EOPNOTSUPP)
++			return 0;
++		return err;
++	}
++
++	p->offload_fwd_mark = br_switchdev_mark_get(p->br, p->dev);
++
++	return 0;
++}
++
++void nbp_switchdev_frame_mark(const struct net_bridge_port *p,
++			      struct sk_buff *skb)
++{
++	if (skb->offload_fwd_mark && !WARN_ON_ONCE(!p->offload_fwd_mark))
++		BR_INPUT_SKB_CB(skb)->offload_fwd_mark = p->offload_fwd_mark;
++}
++
++bool nbp_switchdev_allowed_egress(const struct net_bridge_port *p,
++				  const struct sk_buff *skb)
++{
++	return !skb->offload_fwd_mark ||
++	       BR_INPUT_SKB_CB(skb)->offload_fwd_mark != p->offload_fwd_mark;
++}
+* Unmerged path net/switchdev/switchdev.c
