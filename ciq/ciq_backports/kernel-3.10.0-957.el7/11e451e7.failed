@@ -1,0 +1,105 @@
+drm/nouveau: remove fence wait code from deferred client work handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Ben Skeggs <bskeggs@redhat.com>
+commit 11e451e74050d9e9030581ce40337838acfcea5b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/11e451e7.failed
+
+Fences attached to deferred client work items now originate from channels
+belonging to the client, meaning we can be certain they've been signalled
+before we destroy a client.
+
+This closes a race that could happen if the dma_fence_wait_timeout() call
+didn't succeed.  When the fence was later signalled, a use-after-free was
+possible.
+
+	Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+(cherry picked from commit 11e451e74050d9e9030581ce40337838acfcea5b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/nouveau/nouveau_drm.c
+diff --cc drivers/gpu/drm/nouveau/nouveau_drm.c
+index 2dbaad042913,64b8fd0c4d68..000000000000
+--- a/drivers/gpu/drm/nouveau/nouveau_drm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_drm.c
+@@@ -111,13 -112,68 +111,71 @@@ nouveau_name(struct drm_device *dev
+  		return nouveau_platform_name(to_platform_device(dev->dev));
+  }
+  
+++<<<<<<< HEAD
+ +static void
+ +nouveau_cli_fini(struct nouveau_cli *cli)
+ +{
+ +	nvkm_vm_ref(NULL, &nvxx_client(&cli->base)->vm, NULL);
+++=======
++ static inline bool
++ nouveau_cli_work_ready(struct dma_fence *fence)
++ {
++ 	if (!dma_fence_is_signaled(fence))
++ 		return false;
++ 	dma_fence_put(fence);
++ 	return true;
++ }
++ 
++ static void
++ nouveau_cli_work(struct work_struct *w)
++ {
++ 	struct nouveau_cli *cli = container_of(w, typeof(*cli), work);
++ 	struct nouveau_cli_work *work, *wtmp;
++ 	mutex_lock(&cli->lock);
++ 	list_for_each_entry_safe(work, wtmp, &cli->worker, head) {
++ 		if (!work->fence || nouveau_cli_work_ready(work->fence)) {
++ 			list_del(&work->head);
++ 			work->func(work);
++ 		}
++ 	}
++ 	mutex_unlock(&cli->lock);
++ }
++ 
++ static void
++ nouveau_cli_work_fence(struct dma_fence *fence, struct dma_fence_cb *cb)
++ {
++ 	struct nouveau_cli_work *work = container_of(cb, typeof(*work), cb);
++ 	schedule_work(&work->cli->work);
++ }
++ 
++ void
++ nouveau_cli_work_queue(struct nouveau_cli *cli, struct dma_fence *fence,
++ 		       struct nouveau_cli_work *work)
++ {
++ 	work->fence = dma_fence_get(fence);
++ 	work->cli = cli;
++ 	mutex_lock(&cli->lock);
++ 	list_add_tail(&work->head, &cli->worker);
++ 	if (dma_fence_add_callback(fence, &work->cb, nouveau_cli_work_fence))
++ 		nouveau_cli_work_fence(fence, &work->cb);
++ 	mutex_unlock(&cli->lock);
++ }
++ 
++ static void
++ nouveau_cli_fini(struct nouveau_cli *cli)
++ {
++ 	/* All our channels are dead now, which means all the fences they
++ 	 * own are signalled, and all callback functions have been called.
++ 	 *
++ 	 * So, after flushing the workqueue, there should be nothing left.
++ 	 */
++ 	flush_work(&cli->work);
++ 	WARN_ON(!list_empty(&cli->worker));
++ 
+++>>>>>>> 11e451e74050 (drm/nouveau: remove fence wait code from deferred client work handler)
+  	usif_client_fini(cli);
+ -	nouveau_vmm_fini(&cli->vmm);
+ -	nvif_mmu_fini(&cli->mmu);
+  	nvif_device_fini(&cli->device);
+ -	mutex_lock(&cli->drm->master.lock);
+  	nvif_client_fini(&cli->base);
+ -	mutex_unlock(&cli->drm->master.lock);
+  }
+  
+  static int
+* Unmerged path drivers/gpu/drm/nouveau/nouveau_drm.c
