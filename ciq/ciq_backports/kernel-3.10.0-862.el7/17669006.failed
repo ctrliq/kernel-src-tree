@@ -1,0 +1,241 @@
+cpufreq/intel_pstate: Use CPPC to get max performance
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [cpufreq] intel_pstate: Use CPPC to get max performance (Prarit Bhargava) [1465349]
+Rebuild_FUZZ: 91.84%
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 17669006adf64d35a74cb21e3c8dfb6fb8be689f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/17669006.failed
+
+Use the acpi cppc_lib interface to get CPPC performance limits and update
+the per cpu priority for the ITMT scheduler. If the highest performance of
+CPUs differs the ITMT feature is enabled.
+
+Co-developed-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Signed-off-by: Tim Chen <tim.c.chen@linux.intel.com>
+	Cc: linux-pm@vger.kernel.org
+	Cc: peterz@infradead.org
+	Cc: jolsa@redhat.com
+	Cc: rjw@rjwysocki.net
+	Cc: linux-acpi@vger.kernel.org
+	Cc: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+	Cc: bp@suse.de
+Link: http://lkml.kernel.org/r/0998b98943bcdec7d1ddd4ff27358da555ea8e92.1479844244.git.tim.c.chen@linux.intel.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+(cherry picked from commit 17669006adf64d35a74cb21e3c8dfb6fb8be689f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/Kconfig.x86
+#	drivers/cpufreq/intel_pstate.c
+diff --cc drivers/cpufreq/Kconfig.x86
+index 89ae88f91895,c6d273b43ff9..000000000000
+--- a/drivers/cpufreq/Kconfig.x86
++++ b/drivers/cpufreq/Kconfig.x86
+@@@ -5,6 -5,8 +5,11 @@@
+  config X86_INTEL_PSTATE
+         bool "Intel P state control"
+         depends on X86
+++<<<<<<< HEAD
+++=======
++        select ACPI_PROCESSOR if ACPI
++        select ACPI_CPPC_LIB if X86_64 && ACPI && SCHED_ITMT
+++>>>>>>> 17669006adf6 (cpufreq/intel_pstate: Use CPPC to get max performance)
+         help
+            This driver provides a P state for Intel core processors.
+  	  The driver implements an internal governor and will become
+diff --cc drivers/cpufreq/intel_pstate.c
+index dcf60ef8f905,e8dc42fc0915..000000000000
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@@ -38,6 -42,11 +38,14 @@@
+  #define ATOM_TURBO_RATIOS	0x66c
+  #define ATOM_TURBO_VIDS		0x66d
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_ACPI
++ #include <acpi/processor.h>
++ #include <acpi/cppc_acpi.h>
++ #endif
++ 
+++>>>>>>> 17669006adf6 (cpufreq/intel_pstate: Use CPPC to get max performance)
+  #define FRAC_BITS 8
+  #define int_tofp(X) ((int64_t)(X) << FRAC_BITS)
+  #define fp_toint(X) ((X) >> FRAC_BITS)
+@@@ -193,10 -369,163 +201,166 @@@ static struct perf_limits *limits = &pe
+  static struct perf_limits *limits = &powersave_limits;
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_ACPI
++ 
++ static bool intel_pstate_get_ppc_enable_status(void)
++ {
++ 	if (acpi_gbl_FADT.preferred_profile == PM_ENTERPRISE_SERVER ||
++ 	    acpi_gbl_FADT.preferred_profile == PM_PERFORMANCE_SERVER)
++ 		return true;
++ 
++ 	return acpi_ppc;
++ }
++ 
++ #ifdef CONFIG_ACPI_CPPC_LIB
++ 
++ /* The work item is needed to avoid CPU hotplug locking issues */
++ static void intel_pstste_sched_itmt_work_fn(struct work_struct *work)
++ {
++ 	sched_set_itmt_support();
++ }
++ 
++ static DECLARE_WORK(sched_itmt_work, intel_pstste_sched_itmt_work_fn);
++ 
++ static void intel_pstate_set_itmt_prio(int cpu)
++ {
++ 	struct cppc_perf_caps cppc_perf;
++ 	static u32 max_highest_perf = 0, min_highest_perf = U32_MAX;
++ 	int ret;
++ 
++ 	ret = cppc_get_perf_caps(cpu, &cppc_perf);
++ 	if (ret)
++ 		return;
++ 
++ 	/*
++ 	 * The priorities can be set regardless of whether or not
++ 	 * sched_set_itmt_support(true) has been called and it is valid to
++ 	 * update them at any time after it has been called.
++ 	 */
++ 	sched_set_itmt_core_prio(cppc_perf.highest_perf, cpu);
++ 
++ 	if (max_highest_perf <= min_highest_perf) {
++ 		if (cppc_perf.highest_perf > max_highest_perf)
++ 			max_highest_perf = cppc_perf.highest_perf;
++ 
++ 		if (cppc_perf.highest_perf < min_highest_perf)
++ 			min_highest_perf = cppc_perf.highest_perf;
++ 
++ 		if (max_highest_perf > min_highest_perf) {
++ 			/*
++ 			 * This code can be run during CPU online under the
++ 			 * CPU hotplug locks, so sched_set_itmt_support()
++ 			 * cannot be called from here.  Queue up a work item
++ 			 * to invoke it.
++ 			 */
++ 			schedule_work(&sched_itmt_work);
++ 		}
++ 	}
++ }
++ #else
++ static void intel_pstate_set_itmt_prio(int cpu)
++ {
++ }
++ #endif
++ 
++ static void intel_pstate_init_acpi_perf_limits(struct cpufreq_policy *policy)
++ {
++ 	struct cpudata *cpu;
++ 	int ret;
++ 	int i;
++ 
++ 	if (hwp_active) {
++ 		intel_pstate_set_itmt_prio(policy->cpu);
++ 		return;
++ 	}
++ 
++ 	if (!intel_pstate_get_ppc_enable_status())
++ 		return;
++ 
++ 	cpu = all_cpu_data[policy->cpu];
++ 
++ 	ret = acpi_processor_register_performance(&cpu->acpi_perf_data,
++ 						  policy->cpu);
++ 	if (ret)
++ 		return;
++ 
++ 	/*
++ 	 * Check if the control value in _PSS is for PERF_CTL MSR, which should
++ 	 * guarantee that the states returned by it map to the states in our
++ 	 * list directly.
++ 	 */
++ 	if (cpu->acpi_perf_data.control_register.space_id !=
++ 						ACPI_ADR_SPACE_FIXED_HARDWARE)
++ 		goto err;
++ 
++ 	/*
++ 	 * If there is only one entry _PSS, simply ignore _PSS and continue as
++ 	 * usual without taking _PSS into account
++ 	 */
++ 	if (cpu->acpi_perf_data.state_count < 2)
++ 		goto err;
++ 
++ 	pr_debug("CPU%u - ACPI _PSS perf data\n", policy->cpu);
++ 	for (i = 0; i < cpu->acpi_perf_data.state_count; i++) {
++ 		pr_debug("     %cP%d: %u MHz, %u mW, 0x%x\n",
++ 			 (i == cpu->acpi_perf_data.state ? '*' : ' '), i,
++ 			 (u32) cpu->acpi_perf_data.states[i].core_frequency,
++ 			 (u32) cpu->acpi_perf_data.states[i].power,
++ 			 (u32) cpu->acpi_perf_data.states[i].control);
++ 	}
++ 
++ 	/*
++ 	 * The _PSS table doesn't contain whole turbo frequency range.
++ 	 * This just contains +1 MHZ above the max non turbo frequency,
++ 	 * with control value corresponding to max turbo ratio. But
++ 	 * when cpufreq set policy is called, it will call with this
++ 	 * max frequency, which will cause a reduced performance as
++ 	 * this driver uses real max turbo frequency as the max
++ 	 * frequency. So correct this frequency in _PSS table to
++ 	 * correct max turbo frequency based on the turbo state.
++ 	 * Also need to convert to MHz as _PSS freq is in MHz.
++ 	 */
++ 	if (!limits->turbo_disabled)
++ 		cpu->acpi_perf_data.states[0].core_frequency =
++ 					policy->cpuinfo.max_freq / 1000;
++ 	cpu->valid_pss_table = true;
++ 	pr_debug("_PPC limits will be enforced\n");
++ 
++ 	return;
++ 
++  err:
++ 	cpu->valid_pss_table = false;
++ 	acpi_processor_unregister_performance(policy->cpu);
++ }
++ 
++ static void intel_pstate_exit_perf_limits(struct cpufreq_policy *policy)
++ {
++ 	struct cpudata *cpu;
++ 
++ 	cpu = all_cpu_data[policy->cpu];
++ 	if (!cpu->valid_pss_table)
++ 		return;
++ 
++ 	acpi_processor_unregister_performance(policy->cpu);
++ }
++ 
++ #else
++ static void intel_pstate_init_acpi_perf_limits(struct cpufreq_policy *policy)
++ {
++ }
++ 
++ static void intel_pstate_exit_perf_limits(struct cpufreq_policy *policy)
++ {
++ }
++ #endif
++ 
+++>>>>>>> 17669006adf6 (cpufreq/intel_pstate: Use CPPC to get max performance)
+  static inline void pid_reset(struct _pid *pid, int setpoint, int busy,
+  			     int deadband, int integral) {
+ -	pid->setpoint = int_tofp(setpoint);
+ -	pid->deadband  = int_tofp(deadband);
+ +	pid->setpoint = setpoint;
+ +	pid->deadband  = deadband;
+  	pid->integral  = int_tofp(integral);
+  	pid->last_err  = int_tofp(setpoint) - int_tofp(busy);
+  }
+* Unmerged path drivers/cpufreq/Kconfig.x86
+* Unmerged path drivers/cpufreq/intel_pstate.c
