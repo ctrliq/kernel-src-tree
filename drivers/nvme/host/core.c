@@ -177,9 +177,10 @@ bool nvme_change_ctrl_state(struct nvme_ctrl *ctrl,
 		enum nvme_ctrl_state new_state)
 {
 	enum nvme_ctrl_state old_state;
+	unsigned long flags;
 	bool changed = false;
 
-	spin_lock_irq(&ctrl->lock);
+	spin_lock_irqsave(&ctrl->lock, flags);
 
 	old_state = ctrl->state;
 	switch (new_state) {
@@ -241,7 +242,7 @@ bool nvme_change_ctrl_state(struct nvme_ctrl *ctrl,
 	if (changed)
 		ctrl->state = new_state;
 
-	spin_unlock_irq(&ctrl->lock);
+	spin_unlock_irqrestore(&ctrl->lock, flags);
 
 	return changed;
 }
