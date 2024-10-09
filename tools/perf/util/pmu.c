@@ -625,8 +625,11 @@ static void pmu_add_cpu_aliases(struct list_head *head, const char *name)
 	while (1) {
 
 		pe = &map->table[i++];
-		if (!pe->name)
+		if (!pe->name) {
+			if (pe->metric_group || pe->metric_name)
+				continue;
 			break;
+		}
 
 		if (!is_pmu_core(name)) {
 			/* check for uncore devices */
