@@ -1,0 +1,87 @@
+nfp: avoid reading TX queue indexes from the device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit d38df0d364c3a154065109eb855f8d15ecd0fae2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d38df0d3.failed
+
+Reading TX queue indexes from the device memory on each interrupt
+is expensive.  It's doubly expensive with XDP running since we have
+two TX rings to check there.  If the software indexes indicate that
+the TX queue is completely empty, however, we don't need to look at
+the device completion index at all.
+
+The queuing CPU is doing a wmb() before kicking the device TX so
+we should be safe to assume on the CPU handling the completions will
+never see old value of the software copy of the index.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d38df0d364c3a154065109eb855f8d15ecd0fae2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 4bac97838402,c763a5b3bd6b..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@@ -971,9 -997,50 +974,53 @@@ static void nfp_net_tx_complete(struct 
+  		  tx_ring->rd_p, tx_ring->wr_p, tx_ring->cnt);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nfp_net_xdp_complete(struct nfp_net_tx_ring *tx_ring)
++ {
++ 	struct nfp_net_r_vector *r_vec = tx_ring->r_vec;
++ 	u32 done_pkts = 0, done_bytes = 0;
++ 	int idx, todo;
++ 	u32 qcp_rd_p;
++ 
++ 	if (tx_ring->wr_p == tx_ring->rd_p)
++ 		return;
++ 
++ 	/* Work out how many descriptors have been transmitted */
++ 	qcp_rd_p = nfp_qcp_rd_ptr_read(tx_ring->qcp_q);
++ 
++ 	if (qcp_rd_p == tx_ring->qcp_rd_p)
++ 		return;
++ 
++ 	if (qcp_rd_p > tx_ring->qcp_rd_p)
++ 		todo = qcp_rd_p - tx_ring->qcp_rd_p;
++ 	else
++ 		todo = qcp_rd_p + tx_ring->cnt - tx_ring->qcp_rd_p;
++ 
++ 	done_pkts = todo;
++ 	while (todo--) {
++ 		idx = tx_ring->rd_p & (tx_ring->cnt - 1);
++ 		tx_ring->rd_p++;
++ 
++ 		done_bytes += tx_ring->txbufs[idx].real_len;
++ 	}
++ 
++ 	tx_ring->qcp_rd_p = qcp_rd_p;
++ 
++ 	u64_stats_update_begin(&r_vec->tx_sync);
++ 	r_vec->tx_bytes += done_bytes;
++ 	r_vec->tx_pkts += done_pkts;
++ 	u64_stats_update_end(&r_vec->tx_sync);
++ 
++ 	WARN_ONCE(tx_ring->wr_p - tx_ring->rd_p > tx_ring->cnt,
++ 		  "TX ring corruption rd_p=%u wr_p=%u cnt=%u\n",
++ 		  tx_ring->rd_p, tx_ring->wr_p, tx_ring->cnt);
++ }
++ 
+++>>>>>>> d38df0d364c3 (nfp: avoid reading TX queue indexes from the device)
+  /**
+   * nfp_net_tx_ring_reset() - Free any untransmitted buffers and reset pointers
+ - * @dp:		NFP Net data path struct
+ + * @nn:		NFP Net device
+   * @tx_ring:	TX ring structure
+   *
+   * Assumes that the device is stopped
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_common.c
