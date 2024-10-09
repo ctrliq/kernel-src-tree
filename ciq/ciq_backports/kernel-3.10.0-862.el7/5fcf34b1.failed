@@ -1,0 +1,262 @@
+drm/i915/cnl: Fix DP max voltage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Rodrigo Vivi <rodrigo.vivi@intel.com>
+commit 5fcf34b1c58ea3e341a24c18759b000c38529ed5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5fcf34b1.failed
+
+On clock recovery this function is called to find out
+the max voltage swing level that we could go.
+
+However gen 9 functions use the old buffer translation tables
+to figure that out. That table is not valid for CNL
+causing an invalid number of entries and an invalid selection
+on the max voltage swing level.
+
+v2: Let's use same approach that previous platforms.
+v3: Actually use n_entries and avoid duplicated -1.
+v4: Avoid cnl_max_level and use current style.
+
+	Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+	Cc: Clint Taylor <clinton.a.taylor@intel.com>
+	Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+	Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20170831145356.15932-1-rodrigo.vivi@intel.com
+(cherry picked from commit 5fcf34b1c58ea3e341a24c18759b000c38529ed5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_ddi.c
+diff --cc drivers/gpu/drm/i915/intel_ddi.c
+index d42007e133bd,1da3bb2cc4b4..000000000000
+--- a/drivers/gpu/drm/i915/intel_ddi.c
++++ b/drivers/gpu/drm/i915/intel_ddi.c
+@@@ -1582,50 -1874,182 +1582,216 @@@ static void bxt_ddi_vswing_sequence(str
+  				     ddi_translations[level].deemphasis);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ u8 intel_ddi_dp_voltage_max(struct intel_encoder *encoder)
++ {
++ 	struct drm_i915_private *dev_priv = to_i915(encoder->base.dev);
++ 	int n_entries;
++ 
++ 	if (IS_CANNONLAKE(dev_priv)) {
++ 		if (encoder->type == INTEL_OUTPUT_EDP)
++ 			cnl_get_buf_trans_edp(dev_priv, &n_entries);
++ 		else
++ 			cnl_get_buf_trans_dp(dev_priv, &n_entries);
++ 	} else {
++ 		if (encoder->type == INTEL_OUTPUT_EDP)
++ 			intel_ddi_get_buf_trans_edp(dev_priv, &n_entries);
++ 		else
++ 			intel_ddi_get_buf_trans_dp(dev_priv, &n_entries);
++ 	}
++ 
++ 	if (WARN_ON(n_entries < 1))
++ 		n_entries = 1;
++ 	if (WARN_ON(n_entries > ARRAY_SIZE(index_to_dp_signal_levels)))
++ 		n_entries = ARRAY_SIZE(index_to_dp_signal_levels);
++ 
++ 	return index_to_dp_signal_levels[n_entries - 1] &
++ 		DP_TRAIN_VOLTAGE_SWING_MASK;
++ }
++ 
++ static void cnl_ddi_vswing_program(struct drm_i915_private *dev_priv,
++ 				    u32 level, enum port port, int type)
++ {
++ 	const struct cnl_ddi_buf_trans *ddi_translations = NULL;
++ 	u32 n_entries, val;
++ 	int ln;
++ 
++ 	if (type == INTEL_OUTPUT_HDMI) {
++ 		ddi_translations = cnl_get_buf_trans_hdmi(dev_priv, &n_entries);
++ 	} else if (type == INTEL_OUTPUT_DP) {
++ 		ddi_translations = cnl_get_buf_trans_dp(dev_priv, &n_entries);
++ 	} else if (type == INTEL_OUTPUT_EDP) {
++ 		ddi_translations = cnl_get_buf_trans_edp(dev_priv, &n_entries);
++ 	}
++ 
++ 	if (WARN_ON(ddi_translations == NULL))
++ 		return;
++ 
++ 	if (level >= n_entries) {
++ 		DRM_DEBUG_KMS("DDI translation not found for level %d. Using %d instead.", level, n_entries - 1);
++ 		level = n_entries - 1;
++ 	}
++ 
++ 	/* Set PORT_TX_DW5 Scaling Mode Sel to 010b. */
++ 	val = I915_READ(CNL_PORT_TX_DW5_LN0(port));
++ 	val &= ~SCALING_MODE_SEL_MASK;
++ 	val |= SCALING_MODE_SEL(2);
++ 	I915_WRITE(CNL_PORT_TX_DW5_GRP(port), val);
++ 
++ 	/* Program PORT_TX_DW2 */
++ 	val = I915_READ(CNL_PORT_TX_DW2_LN0(port));
++ 	val &= ~(SWING_SEL_LOWER_MASK | SWING_SEL_UPPER_MASK |
++ 		 RCOMP_SCALAR_MASK);
++ 	val |= SWING_SEL_UPPER(ddi_translations[level].dw2_swing_sel);
++ 	val |= SWING_SEL_LOWER(ddi_translations[level].dw2_swing_sel);
++ 	/* Rcomp scalar is fixed as 0x98 for every table entry */
++ 	val |= RCOMP_SCALAR(0x98);
++ 	I915_WRITE(CNL_PORT_TX_DW2_GRP(port), val);
++ 
++         /* Program PORT_TX_DW4 */
++ 	/* We cannot write to GRP. It would overrite individual loadgen */
++ 	for (ln = 0; ln < 4; ln++) {
++ 		val = I915_READ(CNL_PORT_TX_DW4_LN(port, ln));
++ 		val &= ~(POST_CURSOR_1_MASK | POST_CURSOR_2_MASK |
++ 			 CURSOR_COEFF_MASK);
++ 		val |= POST_CURSOR_1(ddi_translations[level].dw4_post_cursor_1);
++ 		val |= POST_CURSOR_2(ddi_translations[level].dw4_post_cursor_2);
++ 		val |= CURSOR_COEFF(ddi_translations[level].dw4_cursor_coeff);
++ 		I915_WRITE(CNL_PORT_TX_DW4_LN(port, ln), val);
++ 	}
++ 
++         /* Program PORT_TX_DW5 */
++ 	/* All DW5 values are fixed for every table entry */
++ 	val = I915_READ(CNL_PORT_TX_DW5_LN0(port));
++ 	val &= ~RTERM_SELECT_MASK;
++ 	val |= RTERM_SELECT(6);
++ 	val |= TAP3_DISABLE;
++ 	I915_WRITE(CNL_PORT_TX_DW5_GRP(port), val);
++ 
++         /* Program PORT_TX_DW7 */
++ 	val = I915_READ(CNL_PORT_TX_DW7_LN0(port));
++ 	val &= ~N_SCALAR_MASK;
++ 	val |= N_SCALAR(ddi_translations[level].dw7_n_scalar);
++ 	I915_WRITE(CNL_PORT_TX_DW7_GRP(port), val);
++ }
++ 
++ static void cnl_ddi_vswing_sequence(struct intel_encoder *encoder, u32 level)
++ {
++ 	struct drm_i915_private *dev_priv = to_i915(encoder->base.dev);
++ 	struct intel_dp *intel_dp = enc_to_intel_dp(&encoder->base);
++ 	enum port port = intel_ddi_get_encoder_port(encoder);
++ 	int type = encoder->type;
++ 	int width = 0;
++ 	int rate = 0;
++ 	u32 val;
++ 	int ln = 0;
++ 
++ 	if ((intel_dp) && (type == INTEL_OUTPUT_EDP || type == INTEL_OUTPUT_DP)) {
++ 		width = intel_dp->lane_count;
++ 		rate = intel_dp->link_rate;
++ 	} else if (type == INTEL_OUTPUT_HDMI) {
++ 		width = 4;
++ 		/* Rate is always < than 6GHz for HDMI */
++ 	} else {
++ 		MISSING_CASE(type);
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * 1. If port type is eDP or DP,
++ 	 * set PORT_PCS_DW1 cmnkeeper_enable to 1b,
++ 	 * else clear to 0b.
++ 	 */
++ 	val = I915_READ(CNL_PORT_PCS_DW1_LN0(port));
++ 	if (type == INTEL_OUTPUT_EDP || type == INTEL_OUTPUT_DP)
++ 		val |= COMMON_KEEPER_EN;
++ 	else
++ 		val &= ~COMMON_KEEPER_EN;
++ 	I915_WRITE(CNL_PORT_PCS_DW1_GRP(port), val);
++ 
++ 	/* 2. Program loadgen select */
++ 	/*
++ 	 * Program PORT_TX_DW4_LN depending on Bit rate and used lanes
++ 	 * <= 6 GHz and 4 lanes (LN0=0, LN1=1, LN2=1, LN3=1)
++ 	 * <= 6 GHz and 1,2 lanes (LN0=0, LN1=1, LN2=1, LN3=0)
++ 	 * > 6 GHz (LN0=0, LN1=0, LN2=0, LN3=0)
++ 	 */
++ 	for (ln = 0; ln <= 3; ln++) {
++ 		val = I915_READ(CNL_PORT_TX_DW4_LN(port, ln));
++ 		val &= ~LOADGEN_SELECT;
++ 
++ 		if ((rate <= 600000 && width == 4 && ln >= 1)  ||
++ 		    (rate <= 600000 && width < 4 && (ln == 1 || ln == 2))) {
++ 			val |= LOADGEN_SELECT;
++ 		}
++ 		I915_WRITE(CNL_PORT_TX_DW4_LN(port, ln), val);
++ 	}
++ 
++ 	/* 3. Set PORT_CL_DW5 SUS Clock Config to 11b */
++ 	val = I915_READ(CNL_PORT_CL1CM_DW5);
++ 	val |= SUS_CLOCK_CONFIG;
++ 	I915_WRITE(CNL_PORT_CL1CM_DW5, val);
++ 
++ 	/* 4. Clear training enable to change swing values */
++ 	val = I915_READ(CNL_PORT_TX_DW5_LN0(port));
++ 	val &= ~TX_TRAINING_EN;
++ 	I915_WRITE(CNL_PORT_TX_DW5_GRP(port), val);
++ 
++ 	/* 5. Program swing and de-emphasis */
++ 	cnl_ddi_vswing_program(dev_priv, level, port, type);
++ 
++ 	/* 6. Set training enable to trigger update */
++ 	val = I915_READ(CNL_PORT_TX_DW5_LN0(port));
++ 	val |= TX_TRAINING_EN;
++ 	I915_WRITE(CNL_PORT_TX_DW5_GRP(port), val);
++ }
++ 
+++>>>>>>> 5fcf34b1c58e (drm/i915/cnl: Fix DP max voltage)
+  static uint32_t translate_signal_level(int signal_levels)
+  {
+ -	int i;
+ +	uint32_t level;
+  
+ -	for (i = 0; i < ARRAY_SIZE(index_to_dp_signal_levels); i++) {
+ -		if (index_to_dp_signal_levels[i] == signal_levels)
+ -			return i;
+ -	}
+ +	switch (signal_levels) {
+ +	default:
+ +		DRM_DEBUG_KMS("Unsupported voltage swing/pre-emphasis level: 0x%x\n",
+ +			      signal_levels);
+ +	case DP_TRAIN_VOLTAGE_SWING_LEVEL_0 | DP_TRAIN_PRE_EMPH_LEVEL_0:
+ +		level = 0;
+ +		break;
+ +	case DP_TRAIN_VOLTAGE_SWING_LEVEL_0 | DP_TRAIN_PRE_EMPH_LEVEL_1:
+ +		level = 1;
+ +		break;
+ +	case DP_TRAIN_VOLTAGE_SWING_LEVEL_0 | DP_TRAIN_PRE_EMPH_LEVEL_2:
+ +		level = 2;
+ +		break;
+ +	case DP_TRAIN_VOLTAGE_SWING_LEVEL_0 | DP_TRAIN_PRE_EMPH_LEVEL_3:
+ +		level = 3;
+ +		break;
+  
+ -	WARN(1, "Unsupported voltage swing/pre-emphasis level: 0x%x\n",
+ -	     signal_levels);
+ +	case DP_TRAIN_VOLTAGE_SWING_LEVEL_1 | DP_TRAIN_PRE_EMPH_LEVEL_0:
+ +		level = 4;
+ +		break;
+ +	case DP_TRAIN_VOLTAGE_SWING_LEVEL_1 | DP_TRAIN_PRE_EMPH_LEVEL_1:
+ +		level = 5;
+ +		break;
+ +	case DP_TRAIN_VOLTAGE_SWING_LEVEL_1 | DP_TRAIN_PRE_EMPH_LEVEL_2:
+ +		level = 6;
+ +		break;
+  
+ -	return 0;
+ +	case DP_TRAIN_VOLTAGE_SWING_LEVEL_2 | DP_TRAIN_PRE_EMPH_LEVEL_0:
+ +		level = 7;
+ +		break;
+ +	case DP_TRAIN_VOLTAGE_SWING_LEVEL_2 | DP_TRAIN_PRE_EMPH_LEVEL_1:
+ +		level = 8;
+ +		break;
+ +
+ +	case DP_TRAIN_VOLTAGE_SWING_LEVEL_3 | DP_TRAIN_PRE_EMPH_LEVEL_0:
+ +		level = 9;
+ +		break;
+ +	}
+ +
+ +	return level;
+  }
+  
+  static uint32_t intel_ddi_dp_level(struct intel_dp *intel_dp)
+* Unmerged path drivers/gpu/drm/i915/intel_ddi.c
