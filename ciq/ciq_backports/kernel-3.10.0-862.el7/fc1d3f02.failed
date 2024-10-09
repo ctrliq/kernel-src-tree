@@ -1,0 +1,690 @@
+s390/zcrypt: Move the ap bus into kernel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [s390] zcrypt: Move the ap bus into kernel (Hendrik Brueckner) [1380349]
+Rebuild_FUZZ: 93.33%
+commit-author Ingo Tuchscherer <ingo.tuchscherer@linux.vnet.ibm.com>
+commit fc1d3f02544a6fd5f417921b57c663388586a17a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fc1d3f02.failed
+
+Move the ap bus into the kernel and make it general available.
+Additionally include the message types and the API layer as a
+preparation for the workload management facility.
+
+	Signed-off-by: Ingo Tuchscherer <ingo.tuchscherer@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit fc1d3f02544a6fd5f417921b57c663388586a17a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/Makefile
+#	drivers/s390/crypto/ap_bus.c
+diff --cc drivers/s390/crypto/Makefile
+index 771faf7094d6,d0549fc87247..000000000000
+--- a/drivers/s390/crypto/Makefile
++++ b/drivers/s390/crypto/Makefile
+@@@ -3,6 -3,9 +3,15 @@@
+  #
+  
+  ap-objs := ap_bus.o
+++<<<<<<< HEAD
+ +obj-$(CONFIG_ZCRYPT) += ap.o zcrypt_api.o zcrypt_pcicc.o zcrypt_pcixcc.o
+ +obj-$(CONFIG_ZCRYPT) += zcrypt_pcica.o zcrypt_cex2a.o zcrypt_cex4.o
+ +obj-$(CONFIG_ZCRYPT) += zcrypt_msgtype6.o zcrypt_msgtype50.o
+++=======
++ obj-$(subst m,y,$(CONFIG_ZCRYPT)) += ap.o
++ # zcrypt_api.o and zcrypt_msgtype*.o depend on ap.o
++ zcrypt-objs := zcrypt_api.o zcrypt_msgtype6.o zcrypt_msgtype50.o
++ obj-$(CONFIG_ZCRYPT) += zcrypt.o
++ # adapter drivers depend on ap.o and zcrypt.o
++ obj-$(CONFIG_ZCRYPT) += zcrypt_pcixcc.o zcrypt_cex2a.o zcrypt_cex4.o
+++>>>>>>> fc1d3f02544a (s390/zcrypt: Move the ap bus into kernel)
+diff --cc drivers/s390/crypto/ap_bus.c
+index 5386d81f8cd3,c695219d70c4..000000000000
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@@ -1291,9 -1638,12 +1306,16 @@@ static int ap_select_domain(void
+  	 * the "domain=" parameter or the domain with the maximum number
+  	 * of devices.
+  	 */
+++<<<<<<< HEAD
+ +	if (ap_domain_index >= 0 && ap_domain_index < AP_DOMAINS)
+++=======
++ 	spin_lock_bh(&ap_domain_lock);
++ 	if (ap_domain_index >= 0) {
+++>>>>>>> fc1d3f02544a (s390/zcrypt: Move the ap bus into kernel)
+  		/* Domain has already been selected. */
++ 		spin_unlock_bh(&ap_domain_lock);
+  		return 0;
++ 	}
+  	best_domain = -1;
+  	max_count = 0;
+  	for (i = 0; i < AP_DOMAINS; i++) {
+@@@ -1449,13 -1690,15 +1473,21 @@@ static void ap_scan_bus(struct work_str
+  	struct device *dev;
+  	ap_qid_t qid;
+  	int queue_depth = 0, device_type = 0;
+ -	unsigned int device_functions = 0;
+ -	int rc, i, borked;
+ +	unsigned int device_functions;
+ +	int rc, i;
+  
+  	ap_query_configuration();
+++<<<<<<< HEAD
+ +	if (ap_select_domain() != 0) {
+ +		return;
+ +	}
+++=======
++ 	if (ap_select_domain() != 0)
++ 		goto out;
++ 
++ 
++ 	spin_lock_bh(&ap_domain_lock);
+++>>>>>>> fc1d3f02544a (s390/zcrypt: Move the ap bus into kernel)
+  	for (i = 0; i < AP_DEVICES; i++) {
+  		qid = AP_MKQID(i, ap_domain_index);
+  		dev = bus_find_device(&ap_bus_type, NULL,
+@@@ -1538,476 -1770,21 +1570,482 @@@
+  		/* Add device attributes. */
+  		rc = sysfs_create_group(&ap_dev->device.kobj,
+  					&ap_dev_attr_group);
+ -		if (rc) {
+ -			device_unregister(&ap_dev->device);
+ -			continue;
+ +		if (!rc) {
+ +			spin_lock_bh(&ap_dev->lock);
+ +			ap_dev->unregistered = AP_DEV_REGISTERED;
+ +			spin_unlock_bh(&ap_dev->lock);
+  		}
+ +		else
+ +			device_unregister(&ap_dev->device);
+  	}
+++<<<<<<< HEAD
+++=======
++ 	spin_unlock_bh(&ap_domain_lock);
++ out:
++ 	mod_timer(&ap_config_timer, jiffies + ap_config_time * HZ);
+++>>>>>>> fc1d3f02544a (s390/zcrypt: Move the ap bus into kernel)
+  }
+  
+ -static void ap_config_timeout(unsigned long ptr)
+ +static void
+ +ap_config_timeout(unsigned long ptr)
+  {
+ -	if (ap_suspend_flag)
+ -		return;
+ -	queue_work(system_long_wq, &ap_scan_work);
+ +	queue_work(ap_work_queue, &ap_config_work);
+ +	ap_config_timer.expires = jiffies + ap_config_time * HZ;
+ +	add_timer(&ap_config_timer);
+ +}
+ +
+ +/**
+ + * ap_poll_read(): Receive pending reply messages from an AP device.
+ + * @ap_dev: pointer to the AP device
+ + * @flags: pointer to control flags, bit 2^0 is set if another poll is
+ + *	   required, bit 2^1 is set if the poll timer needs to get armed
+ + *
+ + * Returns 0 if the device is still present, -ENODEV if not.
+ + */
+ +static int ap_poll_read(struct ap_device *ap_dev, unsigned long *flags)
+ +{
+ +	struct ap_queue_status status;
+ +	struct ap_message *ap_msg;
+ +
+ +	if (ap_dev->queue_count <= 0)
+ +		return 0;
+ +	status = __ap_recv(ap_dev->qid, &ap_dev->reply->psmid,
+ +			   ap_dev->reply->message, ap_dev->reply->length);
+ +	switch (status.response_code) {
+ +	case AP_RESPONSE_NORMAL:
+ +		ap_dev->interrupt = status.int_enabled;
+ +		atomic_dec(&ap_poll_requests);
+ +		ap_decrease_queue_count(ap_dev);
+ +		list_for_each_entry(ap_msg, &ap_dev->pendingq, list) {
+ +			if (ap_msg->psmid != ap_dev->reply->psmid)
+ +				continue;
+ +			list_del_init(&ap_msg->list);
+ +			ap_dev->pendingq_count--;
+ +			ap_msg->receive(ap_dev, ap_msg, ap_dev->reply);
+ +			break;
+ +		}
+ +		if (ap_dev->queue_count > 0)
+ +			*flags |= 1;
+ +		break;
+ +	case AP_RESPONSE_NO_PENDING_REPLY:
+ +		ap_dev->interrupt = status.int_enabled;
+ +		if (status.queue_empty) {
+ +			/* The card shouldn't forget requests but who knows. */
+ +			atomic_sub(ap_dev->queue_count, &ap_poll_requests);
+ +			ap_dev->queue_count = 0;
+ +			list_splice_init(&ap_dev->pendingq, &ap_dev->requestq);
+ +			ap_dev->requestq_count += ap_dev->pendingq_count;
+ +			ap_dev->pendingq_count = 0;
+ +		} else
+ +			*flags |= 2;
+ +		break;
+ +	default:
+ +		return -ENODEV;
+ +	}
+ +	return 0;
+ +}
+ +
+ +/**
+ + * ap_poll_write(): Send messages from the request queue to an AP device.
+ + * @ap_dev: pointer to the AP device
+ + * @flags: pointer to control flags, bit 2^0 is set if another poll is
+ + *	   required, bit 2^1 is set if the poll timer needs to get armed
+ + *
+ + * Returns 0 if the device is still present, -ENODEV if not.
+ + */
+ +static int ap_poll_write(struct ap_device *ap_dev, unsigned long *flags)
+ +{
+ +	struct ap_queue_status status;
+ +	struct ap_message *ap_msg;
+ +
+ +	if (ap_dev->requestq_count <= 0 ||
+ +	    (ap_dev->queue_count >= ap_dev->queue_depth) ||
+ +	    (ap_dev->reset == AP_RESET_IN_PROGRESS))
+ +		return 0;
+ +	/* Start the next request on the queue. */
+ +	ap_msg = list_entry(ap_dev->requestq.next, struct ap_message, list);
+ +	status = __ap_send(ap_dev->qid, ap_msg->psmid,
+ +			   ap_msg->message, ap_msg->length, ap_msg->special);
+ +	switch (status.response_code) {
+ +	case AP_RESPONSE_NORMAL:
+ +		atomic_inc(&ap_poll_requests);
+ +		ap_increase_queue_count(ap_dev);
+ +		list_move_tail(&ap_msg->list, &ap_dev->pendingq);
+ +		ap_dev->requestq_count--;
+ +		ap_dev->pendingq_count++;
+ +		if (ap_dev->queue_count < ap_dev->queue_depth &&
+ +		    ap_dev->requestq_count > 0)
+ +			*flags |= 1;
+ +		*flags |= 2;
+ +		break;
+ +	case AP_RESPONSE_RESET_IN_PROGRESS:
+ +		__ap_schedule_poll_timer();
+ +	case AP_RESPONSE_Q_FULL:
+ +		*flags |= 2;
+ +		break;
+ +	case AP_RESPONSE_MESSAGE_TOO_BIG:
+ +	case AP_RESPONSE_REQ_FAC_NOT_INST:
+ +		return -EINVAL;
+ +	default:
+ +		return -ENODEV;
+ +	}
+ +	return 0;
+ +}
+ +
+ +/**
+ + * ap_poll_queue(): Poll AP device for pending replies and send new messages.
+ + * Check if the queue has a pending reset. In case it's done re-enable
+ + * interrupts, otherwise reschedule the poll_timer for another attempt.
+ + * @ap_dev: pointer to the bus device
+ + * @flags: pointer to control flags, bit 2^0 is set if another poll is
+ + *	   required, bit 2^1 is set if the poll timer needs to get armed
+ + *
+ + * Poll AP device for pending replies and send new messages. If either
+ + * ap_poll_read or ap_poll_write returns -ENODEV unregister the device.
+ + * Returns 0.
+ + */
+ +static inline int ap_poll_queue(struct ap_device *ap_dev, unsigned long *flags)
+ +{
+ +	int rc, depth, type;
+ +	struct ap_queue_status status;
+ +
+ +
+ +	if (ap_dev->reset == AP_RESET_IN_PROGRESS) {
+ +		status = ap_test_queue(ap_dev->qid, &depth, &type);
+ +		switch (status.response_code) {
+ +		case AP_RESPONSE_NORMAL:
+ +			ap_dev->reset = AP_RESET_IGNORE;
+ +			if (ap_using_interrupts()) {
+ +				rc = ap_queue_enable_interruption(
+ +					ap_dev, ap_airq.lsi_ptr);
+ +				if (!rc)
+ +					ap_dev->interrupt = AP_INTR_IN_PROGRESS;
+ +				else if (rc == -ENODEV) {
+ +					pr_err("Registering adapter interrupts for "
+ +					"AP %d failed\n", AP_QID_DEVICE(ap_dev->qid));
+ +					return rc;
+ +				}
+ +			}
+ +			/* fall through */
+ +		case AP_RESPONSE_BUSY:
+ +		case AP_RESPONSE_RESET_IN_PROGRESS:
+ +			*flags |= AP_POLL_AFTER_TIMEOUT;
+ +			break;
+ +		case AP_RESPONSE_Q_NOT_AVAIL:
+ +		case AP_RESPONSE_DECONFIGURED:
+ +		case AP_RESPONSE_CHECKSTOPPED:
+ +			return -ENODEV;
+ +		default:
+ +			break;
+ +		}
+ +	}
+ +
+ +	if ((ap_dev->reset != AP_RESET_IN_PROGRESS) &&
+ +		(ap_dev->interrupt == AP_INTR_IN_PROGRESS)) {
+ +		status = ap_test_queue(ap_dev->qid, &depth, &type);
+ +		if (ap_using_interrupts()) {
+ +			if (status.int_enabled == 1)
+ +				ap_dev->interrupt = AP_INTR_ENABLED;
+ +			else
+ +				*flags |= AP_POLL_AFTER_TIMEOUT;
+ +		} else
+ +			ap_dev->interrupt = AP_INTR_DISABLED;
+ +	}
+ +
+ +	rc = ap_poll_read(ap_dev, flags);
+ +	if (rc)
+ +		return rc;
+ +	return ap_poll_write(ap_dev, flags);
+ +}
+ +
+ +/**
+ + * __ap_queue_message(): Queue a message to a device.
+ + * @ap_dev: pointer to the AP device
+ + * @ap_msg: the message to be queued
+ + *
+ + * Queue a message to a device. Returns 0 if successful.
+ + */
+ +static int __ap_queue_message(struct ap_device *ap_dev, struct ap_message *ap_msg)
+ +{
+ +	struct ap_queue_status status;
+ +
+ +	if (list_empty(&ap_dev->requestq) &&
+ +	    (ap_dev->queue_count < ap_dev->queue_depth) &&
+ +	    (ap_dev->reset != AP_RESET_IN_PROGRESS)) {
+ +		status = __ap_send(ap_dev->qid, ap_msg->psmid,
+ +				   ap_msg->message, ap_msg->length,
+ +				   ap_msg->special);
+ +		switch (status.response_code) {
+ +		case AP_RESPONSE_NORMAL:
+ +			list_add_tail(&ap_msg->list, &ap_dev->pendingq);
+ +			atomic_inc(&ap_poll_requests);
+ +			ap_dev->pendingq_count++;
+ +			ap_increase_queue_count(ap_dev);
+ +			ap_dev->total_request_count++;
+ +			break;
+ +		case AP_RESPONSE_Q_FULL:
+ +		case AP_RESPONSE_RESET_IN_PROGRESS:
+ +			list_add_tail(&ap_msg->list, &ap_dev->requestq);
+ +			ap_dev->requestq_count++;
+ +			ap_dev->total_request_count++;
+ +			return -EBUSY;
+ +		case AP_RESPONSE_REQ_FAC_NOT_INST:
+ +		case AP_RESPONSE_MESSAGE_TOO_BIG:
+ +			ap_msg->receive(ap_dev, ap_msg, ERR_PTR(-EINVAL));
+ +			return -EINVAL;
+ +		default:	/* Device is gone. */
+ +			ap_msg->receive(ap_dev, ap_msg, ERR_PTR(-ENODEV));
+ +			return -ENODEV;
+ +		}
+ +	} else {
+ +		list_add_tail(&ap_msg->list, &ap_dev->requestq);
+ +		ap_dev->requestq_count++;
+ +		ap_dev->total_request_count++;
+ +		return -EBUSY;
+ +	}
+ +	ap_schedule_poll_timer();
+ +	return 0;
+ +}
+ +
+ +void ap_queue_message(struct ap_device *ap_dev, struct ap_message *ap_msg)
+ +{
+ +	unsigned long flags;
+ +	int rc;
+ +
+ +	/* For asynchronous message handling a valid receive-callback
+ +	 * is required. */
+ +	BUG_ON(!ap_msg->receive);
+ +
+ +	spin_lock_bh(&ap_dev->lock);
+ +	if (!ap_dev->unregistered) {
+ +		/* Make room on the queue by polling for finished requests. */
+ +		rc = ap_poll_queue(ap_dev, &flags);
+ +		if (!rc)
+ +			rc = __ap_queue_message(ap_dev, ap_msg);
+ +		if (!rc)
+ +			wake_up(&ap_poll_wait);
+ +		if (rc == -ENODEV) {
+ +			ap_dev->unregistered = AP_DEV_UNREGISTERED;
+ +			ap_msg->receive(ap_dev, ap_msg, ERR_PTR(-ENODEV));
+ +		}
+ +	} else if (ap_dev->unregistered == AP_DEV_UNREGISTERED) {
+ +		ap_msg->receive(ap_dev, ap_msg, ERR_PTR(-ENODEV));
+ +		rc = -ENODEV;
+ +	} else { /* device registration in progress */
+ +		ap_msg->receive(ap_dev, ap_msg, ERR_PTR(-EBUSY));
+ +		rc = -EBUSY;
+ +	}
+ +	spin_unlock_bh(&ap_dev->lock);
+ +
+ +	/* no device_unregister(), let ap_scan_bus() do the job */
+ +}
+ +EXPORT_SYMBOL(ap_queue_message);
+ +
+ +/**
+ + * ap_cancel_message(): Cancel a crypto request.
+ + * @ap_dev: The AP device that has the message queued
+ + * @ap_msg: The message that is to be removed
+ + *
+ + * Cancel a crypto request. This is done by removing the request
+ + * from the device pending or request queue. Note that the
+ + * request stays on the AP queue. When it finishes the message
+ + * reply will be discarded because the psmid can't be found.
+ + */
+ +void ap_cancel_message(struct ap_device *ap_dev, struct ap_message *ap_msg)
+ +{
+ +	struct ap_message *tmp;
+ +
+ +	spin_lock_bh(&ap_dev->lock);
+ +	if (!list_empty(&ap_msg->list)) {
+ +		list_for_each_entry(tmp, &ap_dev->pendingq, list)
+ +			if (tmp->psmid == ap_msg->psmid) {
+ +				ap_dev->pendingq_count--;
+ +				goto found;
+ +			}
+ +		ap_dev->requestq_count--;
+ +	found:
+ +		list_del_init(&ap_msg->list);
+ +	}
+ +	spin_unlock_bh(&ap_dev->lock);
+ +}
+ +EXPORT_SYMBOL(ap_cancel_message);
+ +
+ +/**
+ + * ap_poll_timeout(): AP receive polling for finished AP requests.
+ + * @unused: Unused pointer.
+ + *
+ + * Schedules the AP tasklet using a high resolution timer.
+ + */
+ +static enum hrtimer_restart ap_poll_timeout(struct hrtimer *unused)
+ +{
+ +	tasklet_schedule(&ap_tasklet);
+ +	return HRTIMER_NORESTART;
+ +}
+ +
+ +/**
+ + * ap_reset(): Reset a not responding AP device.
+ + * @ap_dev: Pointer to the AP device
+ + *
+ + * Reset a not responding AP device and move all requests from the
+ + * pending queue to the request queue.
+ + */
+ +static void ap_reset(struct ap_device *ap_dev, unsigned long *flags)
+ +{
+ +	int rc;
+ +
+ +	atomic_sub(ap_dev->queue_count, &ap_poll_requests);
+ +	ap_dev->queue_count = 0;
+ +	list_splice_init(&ap_dev->pendingq, &ap_dev->requestq);
+ +	ap_dev->requestq_count += ap_dev->pendingq_count;
+ +	ap_dev->pendingq_count = 0;
+ +	rc = ap_init_queue(ap_dev);
+ +	if (rc == -ENODEV)
+ +		ap_dev->unregistered = AP_DEV_UNREGISTERED;
+ +	else
+ +		*flags |= AP_POLL_AFTER_TIMEOUT;
+ +}
+ +
+ +static int __ap_poll_device(struct ap_device *ap_dev, unsigned long *flags)
+ +{
+ +	int rc;
+ +
+ +	if (!ap_dev->unregistered) {
+ +		rc = ap_poll_queue(ap_dev, flags);
+ +		if (rc == -ENODEV)
+ +			ap_dev->unregistered = AP_DEV_UNREGISTERED;
+ +		if (ap_dev->reset == AP_RESET_DO)
+ +			ap_reset(ap_dev, flags);
+ +	}
+ +	return 0;
+ +}
+ +
+ +/**
+ + * ap_poll_all(): Poll all AP devices.
+ + * @dummy: Unused variable
+ + *
+ + * Poll all AP devices on the bus in a round robin fashion. Continue
+ + * polling until bit 2^0 of the control flags is not set. If bit 2^1
+ + * of the control flags has been set arm the poll timer.
+ + */
+ +static void ap_poll_all(unsigned long dummy)
+ +{
+ +	unsigned long flags;
+ +	struct ap_device *ap_dev;
+ +
+ +	/* Reset the indicator if interrupts are used. Thus new interrupts can
+ +	 * be received. Doing it in the beginning of the tasklet is therefor
+ +	 * important that no requests on any AP get lost.
+ +	 */
+ +	if (ap_using_interrupts())
+ +		xchg(ap_airq.lsi_ptr, 0);
+ +	do {
+ +		flags = 0;
+ +		spin_lock(&ap_device_list_lock);
+ +		list_for_each_entry(ap_dev, &ap_device_list, list) {
+ +			spin_lock(&ap_dev->lock);
+ +			__ap_poll_device(ap_dev, &flags);
+ +			spin_unlock(&ap_dev->lock);
+ +		}
+ +		spin_unlock(&ap_device_list_lock);
+ +	} while (flags & AP_POLL_IMMEDIATELY);
+ +	if (flags & AP_POLL_AFTER_TIMEOUT)
+ +		__ap_schedule_poll_timer();
+ +}
+ +
+ +/**
+ + * ap_poll_thread(): Thread that polls for finished requests.
+ + * @data: Unused pointer
+ + *
+ + * AP bus poll thread. The purpose of this thread is to poll for
+ + * finished requests in a loop if there is a "free" cpu - that is
+ + * a cpu that doesn't have anything better to do. The polling stops
+ + * as soon as there is another task or if all messages have been
+ + * delivered.
+ + */
+ +static int ap_poll_thread(void *data)
+ +{
+ +	DECLARE_WAITQUEUE(wait, current);
+ +	unsigned long flags;
+ +	int requests;
+ +	struct ap_device *ap_dev;
+ +
+ +	set_user_nice(current, 19);
+ +	while (1) {
+ +		if (ap_suspend_flag)
+ +			return 0;
+ +		if (need_resched()) {
+ +			schedule();
+ +			continue;
+ +		}
+ +		add_wait_queue(&ap_poll_wait, &wait);
+ +		set_current_state(TASK_INTERRUPTIBLE);
+ +		if (kthread_should_stop())
+ +			break;
+ +		requests = atomic_read(&ap_poll_requests);
+ +		if (requests <= 0)
+ +			schedule();
+ +		set_current_state(TASK_RUNNING);
+ +		remove_wait_queue(&ap_poll_wait, &wait);
+ +
+ +		flags = 0;
+ +		spin_lock_bh(&ap_device_list_lock);
+ +		list_for_each_entry(ap_dev, &ap_device_list, list) {
+ +			spin_lock(&ap_dev->lock);
+ +			__ap_poll_device(ap_dev, &flags);
+ +			spin_unlock(&ap_dev->lock);
+ +		}
+ +		spin_unlock_bh(&ap_device_list_lock);
+ +	}
+ +	set_current_state(TASK_RUNNING);
+ +	remove_wait_queue(&ap_poll_wait, &wait);
+ +	return 0;
+ +}
+ +
+ +static int ap_poll_thread_start(void)
+ +{
+ +	int rc;
+ +
+ +	if (ap_using_interrupts() || ap_suspend_flag)
+ +		return 0;
+ +	mutex_lock(&ap_poll_thread_mutex);
+ +	if (!ap_poll_kthread) {
+ +		ap_poll_kthread = kthread_run(ap_poll_thread, NULL, "appoll");
+ +		rc = IS_ERR(ap_poll_kthread) ? PTR_ERR(ap_poll_kthread) : 0;
+ +		if (rc)
+ +			ap_poll_kthread = NULL;
+ +	}
+ +	else
+ +		rc = 0;
+ +	mutex_unlock(&ap_poll_thread_mutex);
+ +	return rc;
+ +}
+ +
+ +static void ap_poll_thread_stop(void)
+ +{
+ +	mutex_lock(&ap_poll_thread_mutex);
+ +	if (ap_poll_kthread) {
+ +		kthread_stop(ap_poll_kthread);
+ +		ap_poll_kthread = NULL;
+ +	}
+ +	mutex_unlock(&ap_poll_thread_mutex);
+ +}
+ +
+ +/**
+ + * ap_request_timeout(): Handling of request timeouts
+ + * @data: Holds the AP device.
+ + *
+ + * Handles request timeouts.
+ + */
+ +static void ap_request_timeout(unsigned long data)
+ +{
+ +	struct ap_device *ap_dev = (struct ap_device *) data;
+ +
+ +	if (ap_dev->reset == AP_RESET_ARMED) {
+ +		ap_dev->reset = AP_RESET_DO;
+ +
+ +		if (ap_using_interrupts())
+ +			tasklet_schedule(&ap_tasklet);
+ +	}
+  }
+  
+  static void ap_reset_domain(void)
+* Unmerged path drivers/s390/crypto/Makefile
+* Unmerged path drivers/s390/crypto/ap_bus.c
+diff --git a/drivers/s390/crypto/zcrypt_api.c b/drivers/s390/crypto/zcrypt_api.c
+index aac1d13c55dd..00b6f386211e 100644
+--- a/drivers/s390/crypto/zcrypt_api.c
++++ b/drivers/s390/crypto/zcrypt_api.c
+@@ -45,6 +45,7 @@
+ #include "zcrypt_api.h"
+ 
+ #include "zcrypt_msgtype6.h"
++#include "zcrypt_msgtype50.h"
+ 
+ /*
+  * Module description.
+@@ -1467,6 +1468,8 @@ int __init zcrypt_api_init(void)
+ 		goto out_misc;
+ 	}
+ 
++	zcrypt_msgtype6_init();
++	zcrypt_msgtype50_init();
+ 	return 0;
+ 
+ out_misc:
+@@ -1480,11 +1483,13 @@ out:
+  *
+  * The module termination code.
+  */
+-void zcrypt_api_exit(void)
++void __exit zcrypt_api_exit(void)
+ {
+ 	remove_proc_entry("driver/z90crypt", NULL);
+ 	misc_deregister(&zcrypt_misc_device);
+ 	zcrypt_debug_exit();
++	zcrypt_msgtype6_exit();
++	zcrypt_msgtype50_exit();
+ }
+ 
+ module_init(zcrypt_api_init);
+diff --git a/drivers/s390/crypto/zcrypt_msgtype50.c b/drivers/s390/crypto/zcrypt_msgtype50.c
+index 64cd342bbc8d..c45077e1dc6b 100644
+--- a/drivers/s390/crypto/zcrypt_msgtype50.c
++++ b/drivers/s390/crypto/zcrypt_msgtype50.c
+@@ -515,16 +515,12 @@ static struct zcrypt_ops zcrypt_msgtype50_ops = {
+ 	.variant = MSGTYPE50_VARIANT_DEFAULT,
+ };
+ 
+-int __init zcrypt_msgtype50_init(void)
++void __init zcrypt_msgtype50_init(void)
+ {
+ 	zcrypt_msgtype_register(&zcrypt_msgtype50_ops);
+-	return 0;
+ }
+ 
+ void __exit zcrypt_msgtype50_exit(void)
+ {
+ 	zcrypt_msgtype_unregister(&zcrypt_msgtype50_ops);
+ }
+-
+-module_init(zcrypt_msgtype50_init);
+-module_exit(zcrypt_msgtype50_exit);
+diff --git a/drivers/s390/crypto/zcrypt_msgtype50.h b/drivers/s390/crypto/zcrypt_msgtype50.h
+index 0a66e4aeeb50..eeb41c0f34ae 100644
+--- a/drivers/s390/crypto/zcrypt_msgtype50.h
++++ b/drivers/s390/crypto/zcrypt_msgtype50.h
+@@ -35,7 +35,7 @@
+ 
+ #define MSGTYPE_ADJUSTMENT		0x08  /*type04 extension (not needed in type50)*/
+ 
+-int zcrypt_msgtype50_init(void);
++void zcrypt_msgtype50_init(void);
+ void zcrypt_msgtype50_exit(void);
+ 
+ #endif /* _ZCRYPT_MSGTYPE50_H_ */
+diff --git a/drivers/s390/crypto/zcrypt_msgtype6.c b/drivers/s390/crypto/zcrypt_msgtype6.c
+index 9adcfa43d01d..9f8b4fd19fd3 100644
+--- a/drivers/s390/crypto/zcrypt_msgtype6.c
++++ b/drivers/s390/crypto/zcrypt_msgtype6.c
+@@ -1133,12 +1133,11 @@ static struct zcrypt_ops zcrypt_msgtype6_ep11_ops = {
+ 	.send_ep11_cprb = zcrypt_msgtype6_send_ep11_cprb,
+ };
+ 
+-int __init zcrypt_msgtype6_init(void)
++void __init zcrypt_msgtype6_init(void)
+ {
+ 	zcrypt_msgtype_register(&zcrypt_msgtype6_norng_ops);
+ 	zcrypt_msgtype_register(&zcrypt_msgtype6_ops);
+ 	zcrypt_msgtype_register(&zcrypt_msgtype6_ep11_ops);
+-	return 0;
+ }
+ 
+ void __exit zcrypt_msgtype6_exit(void)
+@@ -1147,6 +1146,3 @@ void __exit zcrypt_msgtype6_exit(void)
+ 	zcrypt_msgtype_unregister(&zcrypt_msgtype6_ops);
+ 	zcrypt_msgtype_unregister(&zcrypt_msgtype6_ep11_ops);
+ }
+-
+-module_init(zcrypt_msgtype6_init);
+-module_exit(zcrypt_msgtype6_exit);
+diff --git a/drivers/s390/crypto/zcrypt_msgtype6.h b/drivers/s390/crypto/zcrypt_msgtype6.h
+index 207247570623..5750c4377bfa 100644
+--- a/drivers/s390/crypto/zcrypt_msgtype6.h
++++ b/drivers/s390/crypto/zcrypt_msgtype6.h
+@@ -165,7 +165,7 @@ static inline void rng_type6CPRB_msgX(struct ap_device *ap_dev,
+ 	ap_msg->length = sizeof(*msg);
+ }
+ 
+-int zcrypt_msgtype6_init(void);
++void zcrypt_msgtype6_init(void);
+ void zcrypt_msgtype6_exit(void);
+ 
+ #endif /* _ZCRYPT_MSGTYPE6_H_ */
