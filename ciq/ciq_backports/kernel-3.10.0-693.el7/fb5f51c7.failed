@@ -1,0 +1,147 @@
+vfs: change d_manage() to take a struct path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Ian Kent <ikent@redhat.com>
+commit fb5f51c7425ebc808d91329257cbc963e2421368
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/fb5f51c7.failed
+
+For the autofs module to be able to reliably check if a dentry is a
+mountpoint in a multiple namespace environment the ->d_manage() dentry
+operation will need to take a path argument instead of a dentry.
+
+Link: http://lkml.kernel.org/r/20161011053352.27645.83962.stgit@pluto.themaw.net
+	Signed-off-by: Ian Kent <raven@themaw.net>
+	Cc: Al Viro <viro@ZenIV.linux.org.uk>
+	Cc: Eric W. Biederman <ebiederm@xmission.com>
+	Cc: Omar Sandoval <osandov@osandov.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit fb5f51c7425ebc808d91329257cbc963e2421368)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/dcache.h
+diff --cc include/linux/dcache.h
+index cb191dcd4eb7,bc529ce88ed0..000000000000
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@@ -157,15 -139,7 +157,19 @@@ struct dentry_operations 
+  	void (*d_iput)(struct dentry *, struct inode *);
+  	char *(*d_dname)(struct dentry *, char *, int);
+  	struct vfsmount *(*d_automount)(struct path *);
+++<<<<<<< HEAD
+ +	int (*d_manage)(struct dentry *, bool);
+ +} ____cacheline_aligned;
+ +
+ +typedef struct dentry* (*dop_real_t) (struct dentry *, const struct inode *, unsigned int);
+ +
+ +struct dentry_operations_wrapper {
+ +	struct dentry_operations ops;
+ +	size_t size;
+ +
+++=======
++ 	int (*d_manage)(const struct path *, bool);
+++>>>>>>> fb5f51c7425e (vfs: change d_manage() to take a struct path)
+  	struct dentry *(*d_real)(struct dentry *, const struct inode *,
+  				 unsigned int);
+  } ____cacheline_aligned;
+diff --git a/Documentation/filesystems/Locking b/Documentation/filesystems/Locking
+index ebee3fe161ae..ab6b59a61bcb 100644
+--- a/Documentation/filesystems/Locking
++++ b/Documentation/filesystems/Locking
+@@ -19,7 +19,7 @@ prototypes:
+ 	void (*d_iput)(struct dentry *, struct inode *);
+ 	char *(*d_dname)((struct dentry *dentry, char *buffer, int buflen);
+ 	struct vfsmount *(*d_automount)(struct path *path);
+-	int (*d_manage)(struct dentry *, bool);
++	int (*d_manage)(const struct path *, bool);
+ 	struct dentry *(*d_real)(struct dentry *, const struct inode *,
+ 				 unsigned int);
+ 
+diff --git a/Documentation/filesystems/vfs.txt b/Documentation/filesystems/vfs.txt
+index 261527a6e79a..8d5db43697a0 100644
+--- a/Documentation/filesystems/vfs.txt
++++ b/Documentation/filesystems/vfs.txt
+@@ -926,7 +926,7 @@ struct dentry_operations {
+ 	void (*d_iput)(struct dentry *, struct inode *);
+ 	char *(*d_dname)(struct dentry *, char *, int);
+ 	struct vfsmount *(*d_automount)(struct path *);
+-	int (*d_manage)(struct dentry *, bool);
++	int (*d_manage)(const struct path *, bool);
+ 	struct dentry *(*d_real)(struct dentry *, const struct inode *,
+ 				 unsigned int);
+ };
+diff --git a/fs/autofs4/root.c b/fs/autofs4/root.c
+index 964ece519dda..2edc330fbd29 100644
+--- a/fs/autofs4/root.c
++++ b/fs/autofs4/root.c
+@@ -34,7 +34,7 @@ static long autofs4_root_compat_ioctl(struct file *,unsigned int,unsigned long);
+ static int autofs4_dir_open(struct inode *inode, struct file *file);
+ static struct dentry *autofs4_lookup(struct inode *,struct dentry *, unsigned int);
+ static struct vfsmount *autofs4_d_automount(struct path *);
+-static int autofs4_d_manage(struct dentry *, bool);
++static int autofs4_d_manage(const struct path *, bool);
+ static void autofs4_dentry_release(struct dentry *);
+ 
+ const struct file_operations autofs4_root_operations = {
+@@ -422,8 +422,9 @@ done:
+ 	return NULL;
+ }
+ 
+-static int autofs4_d_manage(struct dentry *dentry, bool rcu_walk)
++static int autofs4_d_manage(const struct path *path, bool rcu_walk)
+ {
++	struct dentry *dentry = path->dentry;
+ 	struct autofs_sb_info *sbi = autofs4_sbi(dentry->d_sb);
+ 	struct autofs_info *ino = autofs4_dentry_ino(dentry);
+ 	int status;
+diff --git a/fs/namei.c b/fs/namei.c
+index 803918366933..4708e1ced014 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -1076,7 +1076,7 @@ static int follow_managed(struct path *path, unsigned flags)
+ 		if (managed & DCACHE_MANAGE_TRANSIT) {
+ 			BUG_ON(!path->dentry->d_op);
+ 			BUG_ON(!path->dentry->d_op->d_manage);
+-			ret = path->dentry->d_op->d_manage(path->dentry, false);
++			ret = path->dentry->d_op->d_manage(path, false);
+ 			if (ret < 0)
+ 				break;
+ 		}
+@@ -1134,10 +1134,10 @@ int follow_down_one(struct path *path)
+ 	return 0;
+ }
+ 
+-static inline int managed_dentry_rcu(struct dentry *dentry)
++static inline int managed_dentry_rcu(const struct path *path)
+ {
+-	return (dentry->d_flags & DCACHE_MANAGE_TRANSIT) ?
+-		dentry->d_op->d_manage(dentry, true) : 0;
++	return (path->dentry->d_flags & DCACHE_MANAGE_TRANSIT) ?
++		path->dentry->d_op->d_manage(path, true) : 0;
+ }
+ 
+ /*
+@@ -1153,7 +1153,7 @@ static bool __follow_mount_rcu(struct nameidata *nd, struct path *path,
+ 		 * Don't forget we might have a non-mountpoint managed dentry
+ 		 * that wants to block transit.
+ 		 */
+-		switch (managed_dentry_rcu(path->dentry)) {
++		switch (managed_dentry_rcu(path)) {
+ 		case -ECHILD:
+ 		default:
+ 			return false;
+@@ -1258,8 +1258,7 @@ int follow_down(struct path *path)
+ 		if (managed & DCACHE_MANAGE_TRANSIT) {
+ 			BUG_ON(!path->dentry->d_op);
+ 			BUG_ON(!path->dentry->d_op->d_manage);
+-			ret = path->dentry->d_op->d_manage(
+-				path->dentry, false);
++			ret = path->dentry->d_op->d_manage(path, false);
+ 			if (ret < 0)
+ 				return ret == -EISDIR ? 0 : ret;
+ 		}
+* Unmerged path include/linux/dcache.h
