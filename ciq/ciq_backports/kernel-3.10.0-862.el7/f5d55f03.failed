@@ -1,0 +1,240 @@
+ceph: vet the target and parent inodes before updating dentry lease
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jeff Layton <jlayton@redhat.com>
+commit f5d55f03973f79a008bf8635452849f8ef589c23
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f5d55f03.failed
+
+In a later patch, we're going to need to allow ceph_fill_trace to
+update the dentry's lease when the parent is not locked. This is
+potentially racy though -- by the time we get around to processing the
+trace, the parent may have already changed.
+
+Change update_dentry_lease to take a ceph_vino pointer and use that to
+ensure that the dentry's parent still matches it before updating the
+lease.
+
+	Signed-off-by: Jeff Layton <jlayton@redhat.com>
+	Reviewed-by: Yan, Zheng <zyan@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit f5d55f03973f79a008bf8635452849f8ef589c23)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/inode.c
+diff --cc fs/ceph/inode.c
+index e1cfa472e692,f5111df561e4..000000000000
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@@ -1001,16 -1026,31 +1003,41 @@@ static void update_dentry_lease(struct 
+  	long unsigned half_ttl = from_time + (duration * HZ / 2) / 1000;
+  	struct inode *dir;
+  
+++<<<<<<< HEAD
+ +	/* only track leases on regular dentries */
+ +	if (dentry->d_op != &ceph_dentry_ops)
+++=======
++ 	/*
++ 	 * Make sure dentry's inode matches tgt_vino. NULL tgt_vino means that
++ 	 * we expect a negative dentry.
++ 	 */
++ 	if (!tgt_vino && d_really_is_positive(dentry))
++ 		return;
++ 
++ 	if (tgt_vino && (d_really_is_negative(dentry) ||
++ 			!ceph_ino_compare(d_inode(dentry), tgt_vino)))
+++>>>>>>> f5d55f03973f (ceph: vet the target and parent inodes before updating dentry lease)
+  		return;
+  
+  	spin_lock(&dentry->d_lock);
+  	dout("update_dentry_lease %p duration %lu ms ttl %lu\n",
+  	     dentry, duration, ttl);
+  
+++<<<<<<< HEAD
+ +	/* make lease_rdcache_gen match directory */
+ +	dir = dentry->d_parent->d_inode;
+++=======
++ 	dir = d_inode(dentry->d_parent);
++ 
++ 	/* make sure parent matches dir_vino */
++ 	if (!ceph_ino_compare(dir, dir_vino))
++ 		goto out_unlock;
++ 
++ 	/* only track leases on regular dentries */
++ 	if (ceph_snap(dir) != CEPH_NOSNAP)
++ 		goto out_unlock;
++ 
+++>>>>>>> f5d55f03973f (ceph: vet the target and parent inodes before updating dentry lease)
+  	di->lease_shared_gen = ceph_inode(dir)->i_shared_gen;
+  
+  	if (duration == 0)
+@@@ -1138,9 -1169,9 +1165,15 @@@ int ceph_fill_trace(struct super_block 
+  
+  			dname.name = rinfo->dname;
+  			dname.len = rinfo->dname_len;
+++<<<<<<< HEAD
+ +			dname.hash = full_name_hash(dname.name, dname.len);
+ +			vino.ino = le64_to_cpu(rinfo->targeti.in->ino);
+ +			vino.snap = le64_to_cpu(rinfo->targeti.in->snapid);
+++=======
++ 			dname.hash = full_name_hash(parent, dname.name, dname.len);
++ 			tvino.ino = le64_to_cpu(rinfo->targeti.in->ino);
++ 			tvino.snap = le64_to_cpu(rinfo->targeti.in->snapid);
+++>>>>>>> f5d55f03973f (ceph: vet the target and parent inodes before updating dentry lease)
+  retry_lookup:
+  			dn = d_lookup(parent, &dname);
+  			dout("d_lookup on parent=%p name=%.*s got %p\n",
+@@@ -1155,17 -1186,12 +1188,24 @@@
+  					err = -ENOMEM;
+  					goto done;
+  				}
+++<<<<<<< HEAD
+ +				err = ceph_init_dentry(dn);
+ +				if (err < 0) {
+ +					dput(dn);
+ +					dput(parent);
+ +					goto done;
+ +				}
+ +			} else if (dn->d_inode &&
+ +				   (ceph_ino(dn->d_inode) != vino.ino ||
+ +				    ceph_snap(dn->d_inode) != vino.snap)) {
+++=======
++ 				err = 0;
++ 			} else if (d_really_is_positive(dn) &&
++ 				   (ceph_ino(d_inode(dn)) != tvino.ino ||
++ 				    ceph_snap(d_inode(dn)) != tvino.snap)) {
+++>>>>>>> f5d55f03973f (ceph: vet the target and parent inodes before updating dentry lease)
+  				dout(" dn %p points to wrong inode %p\n",
+ -				     dn, d_inode(dn));
+ +				     dn, dn->d_inode);
+  				d_delete(dn);
+  				dput(dn);
+  				goto retry_lookup;
+@@@ -1219,11 -1246,13 +1259,21 @@@
+  
+  		BUG_ON(!dn);
+  		BUG_ON(!dir);
+++<<<<<<< HEAD
+ +		BUG_ON(dn->d_parent->d_inode != dir);
+ +		BUG_ON(ceph_ino(dir) !=
+ +		       le64_to_cpu(rinfo->diri.in->ino));
+ +		BUG_ON(ceph_snap(dir) !=
+ +		       le64_to_cpu(rinfo->diri.in->snapid));
+++=======
++ 		BUG_ON(d_inode(dn->d_parent) != dir);
++ 
++ 		dvino.ino = le64_to_cpu(rinfo->diri.in->ino);
++ 		dvino.snap = le64_to_cpu(rinfo->diri.in->snapid);
++ 
++ 		BUG_ON(ceph_ino(dir) != dvino.ino);
++ 		BUG_ON(ceph_snap(dir) != dvino.snap);
+++>>>>>>> f5d55f03973f (ceph: vet the target and parent inodes before updating dentry lease)
+  
+  		/* do we have a lease on the whole dir? */
+  		have_dir_cap =
+@@@ -1473,14 -1511,28 +1528,36 @@@ int ceph_readdir_prepopulate(struct cep
+  
+  	/* FIXME: release caps/leases if error occurs */
+  	for (i = 0; i < rinfo->dir_nr; i++) {
+++<<<<<<< HEAD
+ +		struct ceph_vino vino;
+++=======
++ 		struct ceph_mds_reply_dir_entry *rde = rinfo->dir_entries + i;
++ 		struct ceph_vino tvino, dvino;
+++>>>>>>> f5d55f03973f (ceph: vet the target and parent inodes before updating dentry lease)
+  
+ -		dname.name = rde->name;
+ -		dname.len = rde->name_len;
+ -		dname.hash = full_name_hash(parent, dname.name, dname.len);
+ +		dname.name = rinfo->dir_dname[i];
+ +		dname.len = rinfo->dir_dname_len[i];
+ +		dname.hash = full_name_hash(dname.name, dname.len);
+  
+++<<<<<<< HEAD
+ +		vino.ino = le64_to_cpu(rinfo->dir_in[i].in->ino);
+ +		vino.snap = le64_to_cpu(rinfo->dir_in[i].in->snapid);
+++=======
++ 		tvino.ino = le64_to_cpu(rde->inode.in->ino);
++ 		tvino.snap = le64_to_cpu(rde->inode.in->snapid);
++ 
++ 		if (rinfo->hash_order) {
++ 			u32 hash = ceph_str_hash(ci->i_dir_layout.dl_dir_hash,
++ 						 rde->name, rde->name_len);
++ 			hash = ceph_frag_value(hash);
++ 			if (hash != last_hash)
++ 				fpos_offset = 2;
++ 			last_hash = hash;
++ 			rde->offset = ceph_make_fpos(hash, fpos_offset++, true);
++ 		} else {
++ 			rde->offset = ceph_make_fpos(frag, fpos_offset++, false);
++ 		}
+++>>>>>>> f5d55f03973f (ceph: vet the target and parent inodes before updating dentry lease)
+  
+  retry_lookup:
+  		dn = d_lookup(parent, &dname);
+@@@ -1496,27 -1548,21 +1573,33 @@@
+  				err = -ENOMEM;
+  				goto out;
+  			}
+++<<<<<<< HEAD
+ +			ret = ceph_init_dentry(dn);
+ +			if (ret < 0) {
+ +				dput(dn);
+ +				err = ret;
+ +				goto out;
+ +			}
+ +		} else if (dn->d_inode &&
+ +			   (ceph_ino(dn->d_inode) != vino.ino ||
+ +			    ceph_snap(dn->d_inode) != vino.snap)) {
+++=======
++ 		} else if (d_really_is_positive(dn) &&
++ 			   (ceph_ino(d_inode(dn)) != tvino.ino ||
++ 			    ceph_snap(d_inode(dn)) != tvino.snap)) {
+++>>>>>>> f5d55f03973f (ceph: vet the target and parent inodes before updating dentry lease)
+  			dout(" dn %p points to wrong inode %p\n",
+ -			     dn, d_inode(dn));
+ +			     dn, dn->d_inode);
+  			d_delete(dn);
+  			dput(dn);
+  			goto retry_lookup;
+  		}
+  
+  		/* inode */
+ -		if (d_really_is_positive(dn)) {
+ -			in = d_inode(dn);
+ +		if (dn->d_inode) {
+ +			in = dn->d_inode;
+  		} else {
+- 			in = ceph_get_inode(parent->d_sb, vino);
++ 			in = ceph_get_inode(parent->d_sb, tvino);
+  			if (IS_ERR(in)) {
+  				dout("new_inode badness\n");
+  				d_drop(dn);
+@@@ -1559,15 -1605,14 +1642,21 @@@
+  			dn = realdn;
+  		}
+  
+ -		ceph_dentry(dn)->offset = rde->offset;
+ +		di = dn->d_fsdata;
+ +		di->offset = ceph_make_fpos(frag, i + req->r_readdir_offset);
+  
+++<<<<<<< HEAD
+ +		update_dentry_lease(dn, rinfo->dir_dlease[i],
+ +				    req->r_session,
+ +				    req->r_request_started);
+++=======
++ 		dvino = ceph_vino(d_inode(parent));
++ 		update_dentry_lease(dn, rde->lease, req->r_session,
++ 				    req->r_request_started, &tvino, &dvino);
+++>>>>>>> f5d55f03973f (ceph: vet the target and parent inodes before updating dentry lease)
+  
+  		if (err == 0 && skipped == 0 && cache_ctl.index >= 0) {
+ -			ret = fill_readdir_cache(d_inode(parent), dn,
+ +			ret = fill_readdir_cache(parent->d_inode, dn,
+  						 &cache_ctl, req);
+  			if (ret < 0)
+  				err = ret;
+* Unmerged path fs/ceph/inode.c
