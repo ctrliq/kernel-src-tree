@@ -1,0 +1,205 @@
+mmc: queue: Fix queue thread wake-up
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [mmc] queue: Fix queue thread wake-up (Don Zickus) [1430497]
+Rebuild_FUZZ: 92.54%
+commit-author Adrian Hunter <adrian.hunter@intel.com>
+commit e0097cf5f2f1b7b8a594beaa32a604776d3ca6ce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/e0097cf5.failed
+
+The only time the driver sleeps expecting to be woken upon the arrival of
+a new request, is when the dispatch queue is empty. The only time that it
+is known whether the dispatch queue is empty is after NULL is returned
+from blk_fetch_request() while under the queue lock.
+
+Recognizing those facts, simplify the synchronization between the queue
+thread and the request function. A couple of flags tell the request
+function what to do, and the queue lock and barriers associated with
+wake-ups ensure synchronization.
+
+The result is simpler and allows the removal of the context_info lock.
+
+	Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+	Reviewed-by: Linus Walleij <linus.walleij@linaro.org>
+	Reviewed-by: Harjani Ritesh <riteshh@codeaurora.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit e0097cf5f2f1b7b8a594beaa32a604776d3ca6ce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/card/block.c
+#	drivers/mmc/card/queue.h
+diff --cc drivers/mmc/card/block.c
+index 0eb0adfde680,646d1a1fa6ca..000000000000
+--- a/drivers/mmc/card/block.c
++++ b/drivers/mmc/card/block.c
+@@@ -2190,14 -1753,12 +2190,18 @@@ static int mmc_blk_issue_rw_rq(struct m
+  	return 0;
+  }
+  
+ -int mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
+ +static int mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
+  {
+  	int ret;
+ -	struct mmc_blk_data *md = mq->blkdata;
+ +	struct mmc_blk_data *md = mq->data;
+  	struct mmc_card *card = md->queue.card;
+++<<<<<<< HEAD
+ +	struct mmc_host *host = card->host;
+ +	unsigned long flags;
+ +	unsigned int cmd_flags = req ? req->cmd_flags : 0;
+++=======
++ 	bool req_is_special = mmc_req_is_special(req);
+++>>>>>>> e0097cf5f2f1 (mmc: queue: Fix queue thread wake-up)
+  
+  	if (req && !mq->mqrq_prev->req)
+  		/* claim host only for the first request */
+diff --cc drivers/mmc/card/queue.h
+index d5aa7ed735f9,d09fce655800..000000000000
+--- a/drivers/mmc/card/queue.h
++++ b/drivers/mmc/card/queue.h
+@@@ -51,9 -39,8 +51,14 @@@ struct mmc_queue 
+  	unsigned int		flags;
+  #define MMC_QUEUE_SUSPENDED	(1 << 0)
+  #define MMC_QUEUE_NEW_REQUEST	(1 << 1)
+++<<<<<<< HEAD
+ +
+ +	int			(*issue_fn)(struct mmc_queue *, struct request *);
+ +	void			*data;
+++=======
++ 	bool			asleep;
++ 	struct mmc_blk_data	*blkdata;
+++>>>>>>> e0097cf5f2f1 (mmc: queue: Fix queue thread wake-up)
+  	struct request_queue	*queue;
+  	struct mmc_queue_req	mqrq[2];
+  	struct mmc_queue_req	*mqrq_cur;
+* Unmerged path drivers/mmc/card/block.c
+diff --git a/drivers/mmc/card/queue.c b/drivers/mmc/card/queue.c
+index b1e59ed0afd7..b09679ad0526 100644
+--- a/drivers/mmc/card/queue.c
++++ b/drivers/mmc/card/queue.c
+@@ -49,6 +49,7 @@ static int mmc_queue_thread(void *d)
+ {
+ 	struct mmc_queue *mq = d;
+ 	struct request_queue *q = mq->queue;
++	struct mmc_context_info *cntx = &mq->card->host->context_info;
+ 
+ 	current->flags |= PF_MEMALLOC;
+ 
+@@ -60,6 +61,19 @@ static int mmc_queue_thread(void *d)
+ 		spin_lock_irq(q->queue_lock);
+ 		set_current_state(TASK_INTERRUPTIBLE);
+ 		req = blk_fetch_request(q);
++		mq->asleep = false;
++		cntx->is_waiting_last_req = false;
++		cntx->is_new_req = false;
++		if (!req) {
++			/*
++			 * Dispatch queue is empty so set flags for
++			 * mmc_request_fn() to wake us up.
++			 */
++			if (mq->mqrq_prev->req)
++				cntx->is_waiting_last_req = true;
++			else
++				mq->asleep = true;
++		}
+ 		mq->mqrq_cur->req = req;
+ 		spin_unlock_irq(q->queue_lock);
+ 
+@@ -111,7 +125,6 @@ static void mmc_request_fn(struct request_queue *q)
+ {
+ 	struct mmc_queue *mq = q->queuedata;
+ 	struct request *req;
+-	unsigned long flags;
+ 	struct mmc_context_info *cntx;
+ 
+ 	if (!mq) {
+@@ -123,19 +136,13 @@ static void mmc_request_fn(struct request_queue *q)
+ 	}
+ 
+ 	cntx = &mq->card->host->context_info;
+-	if (!mq->mqrq_cur->req && mq->mqrq_prev->req) {
+-		/*
+-		 * New MMC request arrived when MMC thread may be
+-		 * blocked on the previous request to be complete
+-		 * with no current request fetched
+-		 */
+-		spin_lock_irqsave(&cntx->lock, flags);
+-		if (cntx->is_waiting_last_req) {
+-			cntx->is_new_req = true;
+-			wake_up_interruptible(&cntx->wait);
+-		}
+-		spin_unlock_irqrestore(&cntx->lock, flags);
+-	} else if (!mq->mqrq_cur->req && !mq->mqrq_prev->req)
++
++	if (cntx->is_waiting_last_req) {
++		cntx->is_new_req = true;
++		wake_up_interruptible(&cntx->wait);
++	}
++
++	if (mq->asleep)
+ 		wake_up_process(mq->thread);
+ }
+ 
+* Unmerged path drivers/mmc/card/queue.h
+diff --git a/drivers/mmc/core/core.c b/drivers/mmc/core/core.c
+index 8a58585e3417..4e47cf4955c7 100644
+--- a/drivers/mmc/core/core.c
++++ b/drivers/mmc/core/core.c
+@@ -503,18 +503,14 @@ static enum mmc_blk_status mmc_wait_for_data_req_done(struct mmc_host *host,
+ 	struct mmc_command *cmd;
+ 	struct mmc_context_info *context_info = &host->context_info;
+ 	enum mmc_blk_status status;
+-	unsigned long flags;
+ 
+ 	while (1) {
+ 		wait_event_interruptible(context_info->wait,
+ 				(context_info->is_done_rcv ||
+ 				 context_info->is_new_req));
+-		spin_lock_irqsave(&context_info->lock, flags);
+ 		context_info->is_waiting_last_req = false;
+-		spin_unlock_irqrestore(&context_info->lock, flags);
+ 		if (context_info->is_done_rcv) {
+ 			context_info->is_done_rcv = false;
+-			context_info->is_new_req = false;
+ 			cmd = mrq->cmd;
+ 
+ 			if (!cmd->error || !cmd->retries ||
+@@ -533,7 +529,6 @@ static enum mmc_blk_status mmc_wait_for_data_req_done(struct mmc_host *host,
+ 				continue; /* wait for done/new event again */
+ 			}
+ 		} else if (context_info->is_new_req) {
+-			context_info->is_new_req = false;
+ 			if (!next_req)
+ 				return MMC_BLK_NEW_REQUEST;
+ 		}
+@@ -3012,7 +3007,6 @@ void mmc_unregister_pm_notifier(struct mmc_host *host)
+  */
+ void mmc_init_context_info(struct mmc_host *host)
+ {
+-	spin_lock_init(&host->context_info.lock);
+ 	host->context_info.is_new_req = false;
+ 	host->context_info.is_done_rcv = false;
+ 	host->context_info.is_waiting_last_req = false;
+diff --git a/include/linux/mmc/host.h b/include/linux/mmc/host.h
+index 79227b5a0efb..72cf9d4247bd 100644
+--- a/include/linux/mmc/host.h
++++ b/include/linux/mmc/host.h
+@@ -198,14 +198,12 @@ struct mmc_slot {
+  * @is_new_req		wake up reason was new request
+  * @is_waiting_last_req	mmc context waiting for single running request
+  * @wait		wait queue
+- * @lock		lock to protect data fields
+  */
+ struct mmc_context_info {
+ 	bool			is_done_rcv;
+ 	bool			is_new_req;
+ 	bool			is_waiting_last_req;
+ 	wait_queue_head_t	wait;
+-	spinlock_t		lock;
+ };
+ 
+ struct regulator;
