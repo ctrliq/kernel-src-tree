@@ -1,0 +1,195 @@
+dax: introduce dax_operations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 6568b08b77816cda2a95919c7494108d983d5941
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6568b08b.failed
+
+Track a set of dax_operations per dax_device that can be set at
+alloc_dax() time. These operations will be used to stop the abuse of
+block_device_operations for communicating dax capabilities to
+filesystems. It will also be used to replace the "pmem api" and move
+pmem-specific cache maintenance, and other dax-driver-specific
+filesystem-dax operations, to dax device methods. In particular this
+allows us to stop abusing __copy_user_nocache(), via memcpy_to_pmem(),
+with a driver specific replacement.
+
+This is a standalone introduction of the operations. Follow on patches
+convert each dax-driver and teach fs/dax.c to use ->direct_access() from
+dax_operations instead of block_device_operations.
+
+	Suggested-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 6568b08b77816cda2a95919c7494108d983d5941)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dax/dax.c
+#	drivers/dax/dax.h
+#	drivers/dax/super.c
+#	include/linux/dax.h
+diff --cc drivers/dax/dax.c
+index 5e37741e7a4f,a0db055054a4..000000000000
+--- a/drivers/dax/dax.c
++++ b/drivers/dax/dax.c
+@@@ -714,24 -645,20 +714,34 @@@ struct dax_dev *devm_create_dax_dev(str
+  		goto err_id;
+  	}
+  
+++<<<<<<< HEAD:drivers/dax/dax.c
+ +	minor = ida_simple_get(&dax_minor_ida, 0, 0, GFP_KERNEL);
+ +	if (minor < 0) {
+ +		rc = minor;
+ +		goto err_minor;
+ +	}
+ +
+ +	dev_t = MKDEV(MAJOR(dax_devt), minor);
+ +	dev = &dax_dev->dev;
+ +	dax_dev->inode = dax_inode_get(&dax_dev->cdev, dev_t);
+ +	if (!dax_dev->inode) {
+ +		rc = -ENOMEM;
+ +		goto err_inode;
+ +	}
+++=======
++ 	/*
++ 	 * No 'host' or dax_operations since there is no access to this
++ 	 * device outside of mmap of the resulting character device.
++ 	 */
++ 	dax_dev = alloc_dax(dev_dax, NULL, NULL);
++ 	if (!dax_dev)
++ 		goto err_dax;
+++>>>>>>> 6568b08b7781 (dax: introduce dax_operations):drivers/dax/device.c
+  
+  	/* from here on we're committed to teardown via dax_dev_release() */
+ -	dev = &dev_dax->dev;
+  	device_initialize(dev);
+  
+ -	inode = dax_inode(dax_dev);
+ -	cdev = inode->i_cdev;
+ +	cdev = &dax_dev->cdev;
+  	cdev_init(cdev, &dax_fops);
+  	cdev->owner = parent->driver->owner;
+  
+diff --cc drivers/dax/dax.h
+index ddd829ab58c0,617bbc24be2b..000000000000
+--- a/drivers/dax/dax.h
++++ b/drivers/dax/dax.h
+@@@ -12,14 -12,14 +12,27 @@@
+   */
+  #ifndef __DAX_H__
+  #define __DAX_H__
+++<<<<<<< HEAD
+ +struct device;
+ +struct dax_dev;
+ +struct resource;
+ +struct dax_region;
+ +void dax_region_put(struct dax_region *dax_region);
+ +struct dax_region *alloc_dax_region(struct device *parent,
+ +		int region_id, struct resource *res, unsigned int align,
+ +		void *addr, unsigned long flags);
+ +struct dax_dev *devm_create_dax_dev(struct dax_region *dax_region,
+ +		struct resource *res, int count);
+++=======
++ struct dax_device;
++ struct dax_operations;
++ struct dax_device *alloc_dax(void *private, const char *host,
++ 		const struct dax_operations *ops);
++ void put_dax(struct dax_device *dax_dev);
++ bool dax_alive(struct dax_device *dax_dev);
++ void kill_dax(struct dax_device *dax_dev);
++ struct dax_device *inode_dax(struct inode *inode);
++ struct inode *dax_inode(struct dax_device *dax_dev);
++ void *dax_get_private(struct dax_device *dax_dev);
+++>>>>>>> 6568b08b7781 (dax: introduce dax_operations)
+  #endif /* __DAX_H__ */
+diff --cc include/linux/dax.h
+index 8937c7aed5cb,74ebb92b625a..000000000000
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@@ -6,29 -6,58 +6,48 @@@
+  #include <linux/radix-tree.h>
+  #include <asm/pgtable.h>
+  
+++<<<<<<< HEAD
+++=======
++ struct iomap_ops;
++ struct dax_device;
++ struct dax_operations {
++ 	/*
++ 	 * direct_access: translate a device-relative
++ 	 * logical-page-offset into an absolute physical pfn. Return the
++ 	 * number of pages available for DAX at that pfn.
++ 	 */
++ 	long (*direct_access)(struct dax_device *, pgoff_t, long,
++ 			void **, pfn_t *);
++ };
++ 
++ int dax_read_lock(void);
++ void dax_read_unlock(int id);
++ struct dax_device *dax_get_by_host(const char *host);
++ 
+++>>>>>>> 6568b08b7781 (dax: introduce dax_operations)
+  /*
+ - * We use lowest available bit in exceptional entry for locking, one bit for
+ - * the entry size (PMD) and two more to tell us if the entry is a huge zero
+ - * page (HZP) or an empty entry that is just used for locking.  In total four
+ - * special bits.
+ - *
+ - * If the PMD bit isn't set the entry has size PAGE_SIZE, and if the HZP and
+ - * EMPTY bits aren't set the entry is a normal DAX entry with a filesystem
+ - * block allocation.
+ + * We use lowest available bit in exceptional entry for locking, other two
+ + * bits to determine entry type. In total 3 special bits.
+   */
+ -#define RADIX_DAX_SHIFT	(RADIX_TREE_EXCEPTIONAL_SHIFT + 4)
+ +#define RADIX_DAX_SHIFT	(RADIX_TREE_EXCEPTIONAL_SHIFT + 3)
+  #define RADIX_DAX_ENTRY_LOCK (1 << RADIX_TREE_EXCEPTIONAL_SHIFT)
+ -#define RADIX_DAX_PMD (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 1))
+ -#define RADIX_DAX_HZP (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 2))
+ -#define RADIX_DAX_EMPTY (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 3))
+ +#define RADIX_DAX_PTE (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 1))
+ +#define RADIX_DAX_PMD (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 2))
+ +#define RADIX_DAX_TYPE_MASK (RADIX_DAX_PTE | RADIX_DAX_PMD)
+ +#define RADIX_DAX_TYPE(entry) ((unsigned long)entry & RADIX_DAX_TYPE_MASK)
+ +#define RADIX_DAX_SECTOR(entry) (((unsigned long)entry >> RADIX_DAX_SHIFT))
+ +#define RADIX_DAX_ENTRY(sector, pmd) ((void *)((unsigned long)sector << \
+ +		RADIX_DAX_SHIFT | (pmd ? RADIX_DAX_PMD : RADIX_DAX_PTE) | \
+ +		RADIX_TREE_EXCEPTIONAL_ENTRY))
+  
+ -static inline unsigned long dax_radix_sector(void *entry)
+ -{
+ -	return (unsigned long)entry >> RADIX_DAX_SHIFT;
+ -}
+ -
+ -static inline void *dax_radix_locked_entry(sector_t sector, unsigned long flags)
+ -{
+ -	return (void *)(RADIX_TREE_EXCEPTIONAL_ENTRY | flags |
+ -			((unsigned long)sector << RADIX_DAX_SHIFT) |
+ -			RADIX_DAX_ENTRY_LOCK);
+ -}
+  
+ -ssize_t dax_iomap_rw(struct kiocb *iocb, struct iov_iter *iter,
+ -		const struct iomap_ops *ops);
+ -int dax_iomap_fault(struct vm_fault *vmf, enum page_entry_size pe_size,
+ -		    const struct iomap_ops *ops);
+ +ssize_t dax_do_io(int rw, struct kiocb *iocb, struct inode *inode,
+ +                  const struct iovec *iov, loff_t pos, unsigned long nr_segs,
+ +                  get_block_t get_block, dio_iodone_t end_io, int flags);
+ +int dax_zero_page_range(struct inode *, loff_t from, unsigned len, get_block_t);
+ +int dax_truncate_page(struct inode *, loff_t from, get_block_t);
+ +int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t);
+  int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index);
+ -int dax_invalidate_mapping_entry(struct address_space *mapping, pgoff_t index);
+ -int dax_invalidate_mapping_entry_sync(struct address_space *mapping,
+ -				      pgoff_t index);
+  void dax_wake_mapping_entry_waiter(struct address_space *mapping,
+  		pgoff_t index, void *entry, bool wake_all);
+  
+* Unmerged path drivers/dax/super.c
+* Unmerged path drivers/dax/dax.c
+* Unmerged path drivers/dax/dax.h
+* Unmerged path drivers/dax/super.c
+* Unmerged path include/linux/dax.h
