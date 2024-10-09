@@ -2968,7 +2968,7 @@ static int insert_balance_item(struct btrfs_root *root,
 	}
 
 	key.objectid = BTRFS_BALANCE_OBJECTID;
-	key.type = BTRFS_BALANCE_ITEM_KEY;
+	key.type = BTRFS_TEMPORARY_ITEM_KEY;
 	key.offset = 0;
 
 	ret = btrfs_insert_empty_item(trans, root, path, &key,
@@ -3017,7 +3017,7 @@ static int del_balance_item(struct btrfs_root *root)
 	}
 
 	key.objectid = BTRFS_BALANCE_OBJECTID;
-	key.type = BTRFS_BALANCE_ITEM_KEY;
+	key.type = BTRFS_TEMPORARY_ITEM_KEY;
 	key.offset = 0;
 
 	ret = btrfs_search_slot(trans, root, &key, path, -1, 1);
@@ -3869,7 +3869,7 @@ int btrfs_recover_balance(struct btrfs_fs_info *fs_info)
 		return -ENOMEM;
 
 	key.objectid = BTRFS_BALANCE_OBJECTID;
-	key.type = BTRFS_BALANCE_ITEM_KEY;
+	key.type = BTRFS_TEMPORARY_ITEM_KEY;
 	key.offset = 0;
 
 	ret = btrfs_search_slot(NULL, fs_info->tree_root, &key, path, 0, 0);
