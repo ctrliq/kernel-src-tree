@@ -1,0 +1,154 @@
+net/sched: Change cls_flower to use IDR
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] sched: Change cls_flower to use IDR (Ivan Vecera) [1445420]
+Rebuild_FUZZ: 94.59%
+commit-author Chris Mi <chrism@mellanox.com>
+commit c15ab236d69dd6dad24541400f460c47853803f8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c15ab236.failed
+
+Currently, all filters with the same priority are linked in a doubly
+linked list. Every filter should have a unique handle. To make the
+handle unique, we need to iterate the list every time to see if the
+handle exists or not when inserting a new filter. It is time-consuming.
+For example, it takes about 5m3.169s to insert 64K rules.
+
+This patch changes cls_flower to use IDR. With this patch, it
+takes about 0m1.127s to insert 64K rules. The improvement is huge.
+
+But please note that in this testing, all filters share the same action.
+If every filter has a unique action, that is another bottleneck.
+Follow-up patch in this patchset addresses that.
+
+	Signed-off-by: Chris Mi <chrism@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c15ab236d69dd6dad24541400f460c47853803f8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_flower.c
+diff --cc net/sched/cls_flower.c
+index 2d81cc7499da,3d041d279b92..000000000000
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@@ -337,26 -329,19 +341,30 @@@ static bool fl_destroy(struct tcf_prot
+  	struct cls_fl_head *head = rtnl_dereference(tp->root);
+  	struct cls_fl_filter *f, *next;
+  
+ +	if (!force && !list_empty(&head->filters))
+ +		return false;
+ +
+  	list_for_each_entry_safe(f, next, &head->filters, list)
+  		__fl_delete(tp, f);
++ 	idr_destroy(&head->handle_idr);
+  
+  	__module_get(THIS_MODULE);
+  	call_rcu(&head->rcu, fl_destroy_rcu);
+ +	return true;
+  }
+  
+ -static void *fl_get(struct tcf_proto *tp, u32 handle)
+ +static unsigned long fl_get(struct tcf_proto *tp, u32 handle)
+  {
+  	struct cls_fl_head *head = rtnl_dereference(tp->root);
+- 	struct cls_fl_filter *f;
+  
+++<<<<<<< HEAD
+ +	list_for_each_entry(f, &head->filters, list)
+ +		if (f->handle == handle)
+ +			return (unsigned long) f;
+ +	return 0;
+++=======
++ 	return idr_find_ext(&head->handle_idr, handle);
+++>>>>>>> c15ab236d69d (net/sched: Change cls_flower to use IDR)
+  }
+  
+  static const struct nla_policy fl_policy[TCA_FLOWER_MAX + 1] = {
+@@@ -874,35 -857,9 +882,14 @@@ static int fl_set_parms(struct net *net
+  	fl_mask_update_range(mask);
+  	fl_set_masked_key(&f->mkey, &f->key, mask);
+  
+ +	tcf_exts_change(tp, &f->exts, &e);
+ +
+  	return 0;
+ +errout:
+ +	tcf_exts_destroy(&e);
+ +	return err;
+  }
+  
+- static u32 fl_grab_new_handle(struct tcf_proto *tp,
+- 			      struct cls_fl_head *head)
+- {
+- 	unsigned int i = 0x80000000;
+- 	u32 handle;
+- 
+- 	do {
+- 		if (++head->hgen == 0x7FFFFFFF)
+- 			head->hgen = 1;
+- 	} while (--i > 0 && fl_get(tp, head->hgen));
+- 
+- 	if (unlikely(i == 0)) {
+- 		pr_err("Insufficient number of handles\n");
+- 		handle = 0;
+- 	} else {
+- 		handle = head->hgen;
+- 	}
+- 
+- 	return handle;
+- }
+- 
+  static int fl_change(struct net *net, struct sk_buff *in_skb,
+  		     struct tcf_proto *tp, unsigned long base,
+  		     u32 handle, struct nlattr **tca,
+@@@ -937,16 -896,26 +925,24 @@@
+  		goto errout_tb;
+  	}
+  
+ -	err = tcf_exts_init(&fnew->exts, TCA_FLOWER_ACT, 0);
+ -	if (err < 0)
+ -		goto errout;
+ +	tcf_exts_init(&fnew->exts, TCA_FLOWER_ACT, 0);
+  
+  	if (!handle) {
+- 		handle = fl_grab_new_handle(tp, head);
+- 		if (!handle) {
+- 			err = -EINVAL;
++ 		err = idr_alloc_ext(&head->handle_idr, fnew, &idr_index,
++ 				    1, 0x80000000, GFP_KERNEL);
++ 		if (err)
+  			goto errout;
+- 		}
++ 		fnew->handle = idr_index;
++ 	}
++ 
++ 	/* user specifies a handle and it doesn't exist */
++ 	if (handle && !fold) {
++ 		err = idr_alloc_ext(&head->handle_idr, fnew, &idr_index,
++ 				    handle, handle + 1, GFP_KERNEL);
++ 		if (err)
++ 			goto errout;
++ 		fnew->handle = idr_index;
+  	}
+- 	fnew->handle = handle;
+  
+  	if (tb[TCA_FLOWER_FLAGS]) {
+  		fnew->flags = nla_get_u32(tb[TCA_FLOWER_FLAGS]);
+@@@ -997,9 -966,11 +993,11 @@@
+  			fl_hw_destroy_filter(tp, fold);
+  	}
+  
+ -	*arg = fnew;
+ +	*arg = (unsigned long) fnew;
+  
+  	if (fold) {
++ 		fnew->handle = handle;
++ 		idr_replace_ext(&head->handle_idr, fnew, fnew->handle);
+  		list_replace_rcu(&fold->list, &fnew->list);
+  		tcf_unbind_filter(tp, &fold->res);
+  		call_rcu(&fold->rcu, fl_destroy_filter);
+* Unmerged path net/sched/cls_flower.c
