@@ -1,0 +1,137 @@
+locking/pvqspinlock: Implement hybrid PV queued/unfair locks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Waiman Long <longman@redhat.com>
+commit 11752adb68a388724b1935d57bf543897c34d80b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/11752adb.failed
+
+Currently, all the lock waiters entering the slowpath will do one
+lock stealing attempt to acquire the lock. That helps performance,
+especially in VMs with over-committed vCPUs. However, the current
+pvqspinlocks still don't perform as good as unfair locks in many cases.
+On the other hands, unfair locks do have the problem of lock starvation
+that pvqspinlocks don't have.
+
+This patch combines the best attributes of an unfair lock and a
+pvqspinlock into a hybrid lock with 2 modes - queued mode & unfair
+mode. A lock waiter goes into the unfair mode when there are waiters
+in the wait queue but the pending bit isn't set. Otherwise, it will
+go into the queued mode waiting in the queue for its turn.
+
+On a 2-socket 36-core E5-2699 v3 system (HT off), a kernel build
+(make -j<n>) was done in a VM with unpinned vCPUs 3 times with the
+best time selected and <n> is the number of vCPUs available. The build
+times of the original pvqspinlock, hybrid pvqspinlock and unfair lock
+with various number of vCPUs are as follows:
+
+  vCPUs    pvqlock     hybrid pvqlock    unfair lock
+  -----    -------     --------------    -----------
+    30      342.1s         329.1s          329.1s
+    36      314.1s         305.3s          307.3s
+    45      345.0s         302.1s          306.6s
+    54      365.4s         308.6s          307.8s
+    72      358.9s         293.6s          303.9s
+   108      343.0s         285.9s          304.2s
+
+The hybrid pvqspinlock performs better or comparable to the unfair
+lock.
+
+By turning on QUEUED_LOCK_STAT, the table below showed the number
+of lock acquisitions in unfair mode and queue mode after a kernel
+build with various number of vCPUs.
+
+  vCPUs    queued mode  unfair mode
+  -----    -----------  -----------
+    30      9,130,518      294,954
+    36     10,856,614      386,809
+    45      8,467,264   11,475,373
+    54      6,409,987   19,670,855
+    72      4,782,063   25,712,180
+
+It can be seen that as the VM became more and more over-committed,
+the ratio of locks acquired in unfair mode increases. This is all
+done automatically to get the best overall performance as possible.
+
+Using a kernel locking microbenchmark with number of locking
+threads equals to the number of vCPUs available on the same machine,
+the minimum, average and maximum (min/avg/max) numbers of locking
+operations done per thread in a 5-second testing interval are shown
+below:
+
+  vCPUs         hybrid pvqlock             unfair lock
+  -----         --------------             -----------
+    36     822,135/881,063/950,363    75,570/313,496/  690,465
+    54     542,435/581,664/625,937    35,460/204,280/  457,172
+    72     397,500/428,177/499,299    17,933/150,679/  708,001
+   108     257,898/288,150/340,871     3,085/181,176/1,257,109
+
+It can be seen that the hybrid pvqspinlocks are more fair and
+performant than the unfair locks in this test.
+
+The table below shows the kernel build times on a smaller 2-socket
+16-core 32-thread E5-2620 v4 system.
+
+  vCPUs    pvqlock     hybrid pvqlock    unfair lock
+  -----    -------     --------------    -----------
+    16      436.8s         433.4s          435.6s
+    36      366.2s         364.8s          364.5s
+    48      423.6s         376.3s          370.2s
+    64      433.1s         376.6s          376.8s
+
+Again, the performance of the hybrid pvqspinlock was comparable to
+that of the unfair lock.
+
+	Signed-off-by: Waiman Long <longman@redhat.com>
+	Reviewed-by: Juergen Gross <jgross@suse.com>
+	Reviewed-by: Eduardo Valentin <eduval@amazon.com>
+	Acked-by: Peter Zijlstra <peterz@infradead.org>
+	Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Radim Krčmář <rkrcmar@redhat.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/1510089486-3466-1-git-send-email-longman@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 11752adb68a388724b1935d57bf543897c34d80b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/qspinlock_paravirt.h
+diff --cc kernel/qspinlock_paravirt.h
+index fd9f39adb51a,6ee477765e6c..000000000000
+--- a/kernel/qspinlock_paravirt.h
++++ b/kernel/qspinlock_paravirt.h
+@@@ -73,10 -89,22 +90,29 @@@ static inline bool pv_hybrid_queued_unf
+  {
+  	struct __qspinlock *l = (void *)lock;
+  
+++<<<<<<< HEAD:kernel/qspinlock_paravirt.h
+ +	if (!(atomic_read(&lock->val) & _Q_LOCKED_PENDING_MASK) &&
+ +	    (cmpxchg(&l->locked, 0, _Q_LOCKED_VAL) == 0)) {
+ +		qstat_inc(qstat_pv_lock_stealing, true);
+ +		return true;
+++=======
++ 	/*
++ 	 * Stay in unfair lock mode as long as queued mode waiters are
++ 	 * present in the MCS wait queue but the pending bit isn't set.
++ 	 */
++ 	for (;;) {
++ 		int val = atomic_read(&lock->val);
++ 
++ 		if (!(val & _Q_LOCKED_PENDING_MASK) &&
++ 		   (cmpxchg_acquire(&l->locked, 0, _Q_LOCKED_VAL) == 0)) {
++ 			qstat_inc(qstat_pv_lock_stealing, true);
++ 			return true;
++ 		}
++ 		if (!(val & _Q_TAIL_MASK) || (val & _Q_PENDING_MASK))
++ 			break;
++ 
++ 		cpu_relax();
+++>>>>>>> 11752adb68a3 (locking/pvqspinlock: Implement hybrid PV queued/unfair locks):kernel/locking/qspinlock_paravirt.h
+  	}
+  
+  	return false;
+* Unmerged path kernel/qspinlock_paravirt.h
