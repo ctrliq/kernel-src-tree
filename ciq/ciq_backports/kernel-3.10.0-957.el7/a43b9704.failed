@@ -1,0 +1,166 @@
+tracing/uprobes: Rename uprobe_{trace,perf}_print() functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [kernel] tracing/uprobes: Rename uprobe_(trace, perf)_print() functions (Jiri Olsa) [1434115]
+Rebuild_FUZZ: 95.93%
+commit-author Namhyung Kim <namhyung@kernel.org>
+commit a43b97043048eac1686f409af7ad3bb8071b9d83
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/a43b9704.failed
+
+The uprobe_{trace,perf}_print functions are misnomers since what they
+do is not printing.  There's also a real print function named
+print_uprobe_event() so they'll only increase confusion IMHO.
+
+Rename them with double underscores to follow convention of kprobe.
+
+Link: http://lkml.kernel.org/r/1389946120-19610-2-git-send-email-namhyung@kernel.org
+
+	Reviewed-by: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Cc: Frederic Weisbecker <fweisbec@gmail.com>
+	Cc: Ingo Molnar <mingo@kernel.org>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+	Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+	Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+(cherry picked from commit a43b97043048eac1686f409af7ad3bb8071b9d83)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/trace_uprobe.c
+diff --cc kernel/trace/trace_uprobe.c
+index 84f228258d8e,c5d2612bf233..000000000000
+--- a/kernel/trace/trace_uprobe.c
++++ b/kernel/trace/trace_uprobe.c
+@@@ -681,7 -672,93 +681,97 @@@ static const struct file_operations upr
+  	.release	= seq_release,
+  };
+  
+++<<<<<<< HEAD
+ +static void uprobe_trace_print(struct trace_uprobe *tu,
+++=======
++ struct uprobe_cpu_buffer {
++ 	struct mutex mutex;
++ 	void *buf;
++ };
++ static struct uprobe_cpu_buffer __percpu *uprobe_cpu_buffer;
++ static int uprobe_buffer_refcnt;
++ 
++ static int uprobe_buffer_init(void)
++ {
++ 	int cpu, err_cpu;
++ 
++ 	uprobe_cpu_buffer = alloc_percpu(struct uprobe_cpu_buffer);
++ 	if (uprobe_cpu_buffer == NULL)
++ 		return -ENOMEM;
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		struct page *p = alloc_pages_node(cpu_to_node(cpu),
++ 						  GFP_KERNEL, 0);
++ 		if (p == NULL) {
++ 			err_cpu = cpu;
++ 			goto err;
++ 		}
++ 		per_cpu_ptr(uprobe_cpu_buffer, cpu)->buf = page_address(p);
++ 		mutex_init(&per_cpu_ptr(uprobe_cpu_buffer, cpu)->mutex);
++ 	}
++ 
++ 	return 0;
++ 
++ err:
++ 	for_each_possible_cpu(cpu) {
++ 		if (cpu == err_cpu)
++ 			break;
++ 		free_page((unsigned long)per_cpu_ptr(uprobe_cpu_buffer, cpu)->buf);
++ 	}
++ 
++ 	free_percpu(uprobe_cpu_buffer);
++ 	return -ENOMEM;
++ }
++ 
++ static int uprobe_buffer_enable(void)
++ {
++ 	int ret = 0;
++ 
++ 	BUG_ON(!mutex_is_locked(&event_mutex));
++ 
++ 	if (uprobe_buffer_refcnt++ == 0) {
++ 		ret = uprobe_buffer_init();
++ 		if (ret < 0)
++ 			uprobe_buffer_refcnt--;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static void uprobe_buffer_disable(void)
++ {
++ 	BUG_ON(!mutex_is_locked(&event_mutex));
++ 
++ 	if (--uprobe_buffer_refcnt == 0) {
++ 		free_percpu(uprobe_cpu_buffer);
++ 		uprobe_cpu_buffer = NULL;
++ 	}
++ }
++ 
++ static struct uprobe_cpu_buffer *uprobe_buffer_get(void)
++ {
++ 	struct uprobe_cpu_buffer *ucb;
++ 	int cpu;
++ 
++ 	cpu = raw_smp_processor_id();
++ 	ucb = per_cpu_ptr(uprobe_cpu_buffer, cpu);
++ 
++ 	/*
++ 	 * Use per-cpu buffers for fastest access, but we might migrate
++ 	 * so the mutex makes sure we have sole access to it.
++ 	 */
++ 	mutex_lock(&ucb->mutex);
++ 
++ 	return ucb;
++ }
++ 
++ static void uprobe_buffer_put(struct uprobe_cpu_buffer *ucb)
++ {
++ 	mutex_unlock(&ucb->mutex);
++ }
++ 
++ static void __uprobe_trace_func(struct trace_uprobe *tu,
+++>>>>>>> a43b97043048 (tracing/uprobes: Rename uprobe_{trace,perf}_print() functions)
+  				unsigned long func, struct pt_regs *regs)
+  {
+  	struct uprobe_trace_entry_head *entry;
+@@@ -976,17 -1014,25 +1066,17 @@@ static bool uprobe_perf_filter(struct u
+  	return ret;
+  }
+  
+- static void uprobe_perf_print(struct trace_uprobe *tu,
++ static void __uprobe_perf_func(struct trace_uprobe *tu,
+  				unsigned long func, struct pt_regs *regs)
+  {
+ -	struct ftrace_event_call *call = &tu->tp.call;
+ +	struct ftrace_event_call *call = &tu->call;
+  	struct uprobe_trace_entry_head *entry;
+  	struct hlist_head *head;
+ -	struct uprobe_cpu_buffer *ucb;
+  	void *data;
+ -	int size, dsize, esize;
+ -	int rctx;
+ -
+ -	dsize = __get_data_size(&tu->tp, regs);
+ -	esize = SIZEOF_TRACE_ENTRY(is_ret_probe(tu));
+ +	int size, rctx, i;
+  
+ -	if (WARN_ON_ONCE(!uprobe_cpu_buffer))
+ -		return;
+ -
+ -	size = esize + tu->tp.size + dsize;
+ -	size = ALIGN(size + sizeof(u32), sizeof(u64)) - sizeof(u32);
+ +	size = SIZEOF_TRACE_ENTRY(is_ret_probe(tu));
+ +	size = ALIGN(size + tu->size + sizeof(u32), sizeof(u64)) - sizeof(u32);
+  	if (WARN_ONCE(size > PERF_MAX_TRACE_SIZE, "profile buffer not large enough"))
+  		return;
+  
+* Unmerged path kernel/trace/trace_uprobe.c
