@@ -1,0 +1,178 @@
+bnxt: Move generic devlink code to new file
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Steve Lin <steven.lin1@broadcom.com>
+commit 3c467bf399106030d5a97d844ee119caec04e817
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3c467bf3.failed
+
+Moving generic devlink code (registration) out of VF-R code
+into new bnxt_devlink file, in preparation for future work
+to add additional devlink functionality to bnxt.
+
+	Signed-off-by: Steve Lin <steven.lin1@broadcom.com>
+	Acked-by: Andy Gospodarek <gospo@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3c467bf399106030d5a97d844ee119caec04e817)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/Makefile
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.h
+diff --cc drivers/net/ethernet/broadcom/bnxt/Makefile
+index 6082ed1b5ea0,59c8ec9c1cad..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/Makefile
++++ b/drivers/net/ethernet/broadcom/bnxt/Makefile
+@@@ -1,3 -1,4 +1,8 @@@
+  obj-$(CONFIG_BNXT) += bnxt_en.o
+  
+++<<<<<<< HEAD
+ +bnxt_en-y := bnxt.o bnxt_sriov.o bnxt_ethtool.o bnxt_dcb.o bnxt_ulp.o
+++=======
++ bnxt_en-y := bnxt.o bnxt_sriov.o bnxt_ethtool.o bnxt_dcb.o bnxt_ulp.o bnxt_xdp.o bnxt_vfr.o bnxt_devlink.o
++ bnxt_en-$(CONFIG_BNXT_FLOWER_OFFLOAD) += bnxt_tc.o
+++>>>>>>> 3c467bf39910 (bnxt: Move generic devlink code to new file)
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 619fb6934a3c,b31bdec26fce..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -56,6 -58,10 +56,13 @@@
+  #include "bnxt_sriov.h"
+  #include "bnxt_ethtool.h"
+  #include "bnxt_dcb.h"
+++<<<<<<< HEAD
+++=======
++ #include "bnxt_xdp.h"
++ #include "bnxt_vfr.h"
++ #include "bnxt_tc.h"
++ #include "bnxt_devlink.h"
+++>>>>>>> 3c467bf39910 (bnxt: Move generic devlink code to new file)
+  
+  #define BNXT_TX_TIMEOUT		(5 * HZ)
+  
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.h
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/Makefile
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+new file mode 100644
+index 000000000000..f3f6aa868d6c
+--- /dev/null
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+@@ -0,0 +1,65 @@
++/* Broadcom NetXtreme-C/E network driver.
++ *
++ * Copyright (c) 2017 Broadcom Limited
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation.
++ */
++
++#include <linux/pci.h>
++#include <linux/netdevice.h>
++#include "bnxt_hsi.h"
++#include "bnxt.h"
++#include "bnxt_vfr.h"
++#include "bnxt_devlink.h"
++
++static const struct devlink_ops bnxt_dl_ops = {
++#ifdef CONFIG_BNXT_SRIOV
++	.eswitch_mode_set = bnxt_dl_eswitch_mode_set,
++	.eswitch_mode_get = bnxt_dl_eswitch_mode_get,
++#endif /* CONFIG_BNXT_SRIOV */
++};
++
++int bnxt_dl_register(struct bnxt *bp)
++{
++	struct devlink *dl;
++	int rc;
++
++	if (!pci_find_ext_capability(bp->pdev, PCI_EXT_CAP_ID_SRIOV))
++		return 0;
++
++	if (bp->hwrm_spec_code < 0x10800) {
++		netdev_warn(bp->dev, "Firmware does not support SR-IOV E-Switch SWITCHDEV mode.\n");
++		return -ENOTSUPP;
++	}
++
++	dl = devlink_alloc(&bnxt_dl_ops, sizeof(struct bnxt_dl));
++	if (!dl) {
++		netdev_warn(bp->dev, "devlink_alloc failed");
++		return -ENOMEM;
++	}
++
++	bnxt_link_bp_to_dl(bp, dl);
++	bp->eswitch_mode = DEVLINK_ESWITCH_MODE_LEGACY;
++	rc = devlink_register(dl, &bp->pdev->dev);
++	if (rc) {
++		bnxt_link_bp_to_dl(bp, NULL);
++		devlink_free(dl);
++		netdev_warn(bp->dev, "devlink_register failed. rc=%d", rc);
++		return rc;
++	}
++
++	return 0;
++}
++
++void bnxt_dl_unregister(struct bnxt *bp)
++{
++	struct devlink *dl = bp->dl;
++
++	if (!dl)
++		return;
++
++	devlink_unregister(dl);
++	devlink_free(dl);
++}
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.h b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.h
+new file mode 100644
+index 000000000000..e92a35d8b642
+--- /dev/null
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.h
+@@ -0,0 +1,39 @@
++/* Broadcom NetXtreme-C/E network driver.
++ *
++ * Copyright (c) 2017 Broadcom Limited
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation.
++ */
++
++#ifndef BNXT_DEVLINK_H
++#define BNXT_DEVLINK_H
++
++/* Struct to hold housekeeping info needed by devlink interface */
++struct bnxt_dl {
++	struct bnxt *bp;	/* back ptr to the controlling dev */
++};
++
++static inline struct bnxt *bnxt_get_bp_from_dl(struct devlink *dl)
++{
++	return ((struct bnxt_dl *)devlink_priv(dl))->bp;
++}
++
++/* To clear devlink pointer from bp, pass NULL dl */
++static inline void bnxt_link_bp_to_dl(struct bnxt *bp, struct devlink *dl)
++{
++	bp->dl = dl;
++
++	/* add a back pointer in dl to bp */
++	if (dl) {
++		struct bnxt_dl *bp_dl = devlink_priv(dl);
++
++		bp_dl->bp = bp;
++	}
++}
++
++int bnxt_dl_register(struct bnxt *bp);
++void bnxt_dl_unregister(struct bnxt *bp);
++
++#endif /* BNXT_DEVLINK_H */
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.h
