@@ -623,7 +623,7 @@ static struct sk_buff *netem_dequeue(struct Qdisc *sch)
 	struct rb_node *p;
 
 tfifo_dequeue:
-	skb = __skb_dequeue(&sch->q);
+	skb = __qdisc_dequeue_head(&sch->q);
 	if (skb) {
 		qdisc_qstats_backlog_dec(sch, skb);
 deliver:
