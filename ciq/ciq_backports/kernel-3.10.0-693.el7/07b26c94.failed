@@ -1,0 +1,300 @@
+gso: Support partial splitting at the frag_list pointer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Steffen Klassert <steffen.klassert@secunet.com>
+commit 07b26c9454a2a19fff86d6fcf2aba6bc801eb8d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/07b26c94.failed
+
+Since commit 8a29111c7 ("net: gro: allow to build full sized skb")
+gro may build buffers with a frag_list. This can hurt forwarding
+because most NICs can't offload such packets, they need to be
+segmented in software. This patch splits buffers with a frag_list
+at the frag_list pointer into buffers that can be TSO offloaded.
+
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+	Acked-by: Alexander Duyck <alexander.h.duyck@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 07b26c9454a2a19fff86d6fcf2aba6bc801eb8d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/skbuff.c
+#	net/ipv4/af_inet.c
+#	net/ipv4/gre_offload.c
+#	net/ipv4/udp_offload.c
+#	net/ipv6/ip6_offload.c
+diff --cc net/core/skbuff.c
+index c7043c783fdb,7bf82a28e10a..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -3112,8 -3094,42 +3112,44 @@@ struct sk_buff *skb_segment(struct sk_b
+  	if (unlikely(!proto))
+  		return ERR_PTR(-EINVAL);
+  
+ -	sg = !!(features & NETIF_F_SG);
+  	csum = !!can_checksum_protocol(features, proto);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (sg && csum && (mss != GSO_BY_FRAGS))  {
++ 		if (!(features & NETIF_F_GSO_PARTIAL)) {
++ 			struct sk_buff *iter;
++ 
++ 			if (!list_skb ||
++ 			    !net_gso_ok(features, skb_shinfo(head_skb)->gso_type))
++ 				goto normal;
++ 
++ 			/* Split the buffer at the frag_list pointer.
++ 			 * This is based on the assumption that all
++ 			 * buffers in the chain excluding the last
++ 			 * containing the same amount of data.
++ 			 */
++ 			skb_walk_frags(head_skb, iter) {
++ 				if (skb_headlen(iter))
++ 					goto normal;
++ 
++ 				len -= iter->len;
++ 			}
++ 		}
++ 
++ 		/* GSO partial only requires that we trim off any excess that
++ 		 * doesn't fit into an MSS sized block, so take care of that
++ 		 * now.
++ 		 */
++ 		partial_segs = len / mss;
++ 		if (partial_segs > 1)
++ 			mss *= partial_segs;
++ 		else
++ 			partial_segs = 0;
++ 	}
++ 
++ normal:
+++>>>>>>> 07b26c9454a2 (gso: Support partial splitting at the frag_list pointer)
+  	headroom = skb_headroom(head_skb);
+  	pos = skb_headlen(head_skb);
+  
+@@@ -3299,6 -3315,46 +3335,49 @@@ perform_csum_check
+  		}
+  	} while ((offset += len) < head_skb->len);
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Some callers want to get the end of the list.
++ 	 * Put it in segs->prev to avoid walking the list.
++ 	 * (see validate_xmit_skb_list() for example)
++ 	 */
++ 	segs->prev = tail;
++ 
++ 	if (partial_segs) {
++ 		struct sk_buff *iter;
++ 		int type = skb_shinfo(head_skb)->gso_type;
++ 		unsigned short gso_size = skb_shinfo(head_skb)->gso_size;
++ 
++ 		/* Update type to add partial and then remove dodgy if set */
++ 		type |= (features & NETIF_F_GSO_PARTIAL) / NETIF_F_GSO_PARTIAL * SKB_GSO_PARTIAL;
++ 		type &= ~SKB_GSO_DODGY;
++ 
++ 		/* Update GSO info and prepare to start updating headers on
++ 		 * our way back down the stack of protocols.
++ 		 */
++ 		for (iter = segs; iter; iter = iter->next) {
++ 			skb_shinfo(iter)->gso_size = gso_size;
++ 			skb_shinfo(iter)->gso_segs = partial_segs;
++ 			skb_shinfo(iter)->gso_type = type;
++ 			SKB_GSO_CB(iter)->data_offset = skb_headroom(iter) + doffset;
++ 		}
++ 
++ 		if (tail->len - doffset <= gso_size)
++ 			skb_shinfo(tail)->gso_size = 0;
++ 		else if (tail != segs)
++ 			skb_shinfo(tail)->gso_segs = DIV_ROUND_UP(tail->len - doffset, gso_size);
++ 	}
++ 
++ 	/* Following permits correct backpressure, for protocols
++ 	 * using skb_set_owner_w().
++ 	 * Idea is to tranfert ownership from head_skb to last segment.
++ 	 */
++ 	if (head_skb->destructor == sock_wfree) {
++ 		swap(tail->truesize, head_skb->truesize);
++ 		swap(tail->destructor, head_skb->destructor);
++ 		swap(tail->sk, head_skb->sk);
++ 	}
+++>>>>>>> 07b26c9454a2 (gso: Support partial splitting at the frag_list pointer)
+  	return segs;
+  
+  err:
+diff --cc net/ipv4/af_inet.c
+index 3068a0e54f0b,1effc986739e..000000000000
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@@ -1203,9 -1189,10 +1203,13 @@@ int inet_sk_rebuild_header(struct sock 
+  }
+  EXPORT_SYMBOL(inet_sk_rebuild_header);
+  
+ -struct sk_buff *inet_gso_segment(struct sk_buff *skb,
+ -				 netdev_features_t features)
+ +static struct sk_buff *inet_gso_segment(struct sk_buff *skb,
+ +					netdev_features_t features)
+  {
+++<<<<<<< HEAD
+++=======
++ 	bool udpfrag = false, fixedid = false, gso_partial, encap;
+++>>>>>>> 07b26c9454a2 (gso: Support partial splitting at the frag_list pointer)
+  	struct sk_buff *segs = ERR_PTR(-EINVAL);
+  	const struct net_offload *ops;
+  	unsigned int offset = 0;
+@@@ -1260,15 -1251,29 +1266,31 @@@
+  	do {
+  		iph = (struct iphdr *)(skb_mac_header(skb) + nhoff);
+  		if (udpfrag) {
+ +			iph->id = htons(id);
+  			iph->frag_off = htons(offset >> 3);
+ -			if (skb->next)
+ +			if (skb->next != NULL)
+  				iph->frag_off |= htons(IP_MF);
+  			offset += skb->len - nhoff - ihl;
+++<<<<<<< HEAD
+++=======
++ 			tot_len = skb->len - nhoff;
++ 		} else if (skb_is_gso(skb)) {
++ 			if (!fixedid) {
++ 				iph->id = htons(id);
++ 				id += skb_shinfo(skb)->gso_segs;
++ 			}
++ 
++ 			if (gso_partial)
++ 				tot_len = skb_shinfo(skb)->gso_size +
++ 					  SKB_GSO_CB(skb)->data_offset +
++ 					  skb->head - (unsigned char *)iph;
++ 			else
++ 				tot_len = skb->len - nhoff;
+++>>>>>>> 07b26c9454a2 (gso: Support partial splitting at the frag_list pointer)
+  		} else {
+ -			if (!fixedid)
+ -				iph->id = htons(id++);
+ -			tot_len = skb->len - nhoff;
+ +			iph->id = htons(id++);
+  		}
+ -		iph->tot_len = htons(tot_len);
+ +		iph->tot_len = htons(skb->len - nhoff);
+  		ip_send_check(iph);
+  		if (encap)
+  			skb_reset_inner_headers(skb);
+diff --cc net/ipv4/gre_offload.c
+index b0328bedf364,96e0efecefa6..000000000000
+--- a/net/ipv4/gre_offload.c
++++ b/net/ipv4/gre_offload.c
+@@@ -94,10 -96,25 +96,30 @@@ static struct sk_buff *gre_gso_segment(
+  			continue;
+  
+  		greh = (struct gre_base_hdr *)skb_transport_header(skb);
+ -		pcsum = (__sum16 *)(greh + 1);
+ +		pcsum = (__be32 *)(greh + 1);
+  
+++<<<<<<< HEAD
+ +		*pcsum = 0;
+ +		*(__sum16 *)pcsum = gso_make_checksum(skb, 0);
+++=======
++ 		if (gso_partial) {
++ 			unsigned int partial_adj;
++ 
++ 			/* Adjust checksum to account for the fact that
++ 			 * the partial checksum is based on actual size
++ 			 * whereas headers should be based on MSS size.
++ 			 */
++ 			partial_adj = skb->len + skb_headroom(skb) -
++ 				      SKB_GSO_CB(skb)->data_offset -
++ 				      skb_shinfo(skb)->gso_size;
++ 			*pcsum = ~csum_fold((__force __wsum)htonl(partial_adj));
++ 		} else {
++ 			*pcsum = 0;
++ 		}
++ 
++ 		*(pcsum + 1) = 0;
++ 		*pcsum = gso_make_checksum(skb, 0);
+++>>>>>>> 07b26c9454a2 (gso: Support partial splitting at the frag_list pointer)
+  	} while ((skb = skb->next));
+  out:
+  	return segs;
+diff --cc net/ipv4/udp_offload.c
+index 8dac20280d1e,f9333c963607..000000000000
+--- a/net/ipv4/udp_offload.c
++++ b/net/ipv4/udp_offload.c
+@@@ -107,9 -112,20 +109,24 @@@ static struct sk_buff *__skb_udp_tunnel
+  		skb_reset_mac_header(skb);
+  		skb_set_network_header(skb, mac_len);
+  		skb_set_transport_header(skb, udp_offset);
+ -		len = skb->len - udp_offset;
+ +		len = htons(skb->len - udp_offset);
+  		uh = udp_hdr(skb);
+++<<<<<<< HEAD
+ +		uh->len = len;
+++=======
++ 
++ 		/* If we are only performing partial GSO the inner header
++ 		 * will be using a length value equal to only one MSS sized
++ 		 * segment instead of the entire frame.
++ 		 */
++ 		if (gso_partial) {
++ 			uh->len = htons(skb_shinfo(skb)->gso_size +
++ 					SKB_GSO_CB(skb)->data_offset +
++ 					skb->head - (unsigned char *)uh);
++ 		} else {
++ 			uh->len = htons(len);
++ 		}
+++>>>>>>> 07b26c9454a2 (gso: Support partial splitting at the frag_list pointer)
+  
+  		if (!need_csum)
+  			continue;
+diff --cc net/ipv6/ip6_offload.c
+index 3facfa14ba14,e7bfd55899a3..000000000000
+--- a/net/ipv6/ip6_offload.c
++++ b/net/ipv6/ip6_offload.c
+@@@ -98,9 -102,17 +99,21 @@@ static struct sk_buff *ipv6_gso_segment
+  	if (IS_ERR(segs))
+  		goto out;
+  
++ 	gso_partial = !!(skb_shinfo(segs)->gso_type & SKB_GSO_PARTIAL);
++ 
+  	for (skb = segs; skb; skb = skb->next) {
+  		ipv6h = (struct ipv6hdr *)(skb_mac_header(skb) + nhoff);
+++<<<<<<< HEAD
+ +		ipv6h->payload_len = htons(skb->len - nhoff - sizeof(*ipv6h));
+++=======
++ 		if (gso_partial)
++ 			payload_len = skb_shinfo(skb)->gso_size +
++ 				      SKB_GSO_CB(skb)->data_offset +
++ 				      skb->head - (unsigned char *)(ipv6h + 1);
++ 		else
++ 			payload_len = skb->len - nhoff - sizeof(*ipv6h);
++ 		ipv6h->payload_len = htons(payload_len);
+++>>>>>>> 07b26c9454a2 (gso: Support partial splitting at the frag_list pointer)
+  		skb->network_header = (u8 *)ipv6h - skb->head;
+  
+  		if (udpfrag) {
+* Unmerged path net/core/skbuff.c
+* Unmerged path net/ipv4/af_inet.c
+* Unmerged path net/ipv4/gre_offload.c
+diff --git a/net/ipv4/tcp_offload.c b/net/ipv4/tcp_offload.c
+index 64b23b193f30..27625f2c0ac3 100644
+--- a/net/ipv4/tcp_offload.c
++++ b/net/ipv4/tcp_offload.c
+@@ -87,6 +87,13 @@ struct sk_buff *tcp_gso_segment(struct sk_buff *skb,
+ 	/* Only first segment might have ooo_okay set */
+ 	segs->ooo_okay = ooo_okay;
+ 
++	/* GSO partial and frag_list segmentation only requires splitting
++	 * the frame into an MSS multiple and possibly a remainder, both
++	 * cases return a GSO skb. So update the mss now.
++	 */
++	if (skb_is_gso(segs))
++		mss *= skb_shinfo(segs)->gso_segs;
++
+ 	delta = htonl(oldlen + (thlen + mss));
+ 
+ 	skb = segs;
+* Unmerged path net/ipv4/udp_offload.c
+* Unmerged path net/ipv6/ip6_offload.c
