@@ -1,0 +1,157 @@
+l2tp: make datapath sequence number support RFC-compliant
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author James Chapman <jchapman@katalix.com>
+commit 8a1631d588a39e826f4248e60310498d5266c6fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/8a1631d5.failed
+
+The L2TP datapath is not currently RFC-compliant when sequence numbers
+are used in L2TP data packets. According to the L2TP RFC, any received
+sequence number NR greater than or equal to the next expected NR is
+acceptable, where the "greater than or equal to" test is determined by
+the NR wrap point. This differs for L2TPv2 and L2TPv3, so add state in
+the session context to hold the max NR value and the NR window size in
+order to do the acceptable sequence number value check. These might be
+configurable later, but for now we derive it from the tunnel L2TP
+version, which determines the sequence number field size.
+
+	Signed-off-by: James Chapman <jchapman@katalix.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8a1631d588a39e826f4248e60310498d5266c6fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/l2tp/l2tp_core.c
+diff --cc net/l2tp/l2tp_core.c
+index c352516afaa2,735cc06971ef..000000000000
+--- a/net/l2tp/l2tp_core.c
++++ b/net/l2tp/l2tp_core.c
+@@@ -609,6 -493,108 +606,111 @@@ out
+  	spin_unlock_bh(&session->reorder_q.lock);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline int l2tp_verify_udp_checksum(struct sock *sk,
++ 					   struct sk_buff *skb)
++ {
++ 	struct udphdr *uh = udp_hdr(skb);
++ 	u16 ulen = ntohs(uh->len);
++ 	__wsum psum;
++ 
++ 	if (sk->sk_no_check || skb_csum_unnecessary(skb))
++ 		return 0;
++ 
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	if (sk->sk_family == PF_INET6) {
++ 		if (!uh->check) {
++ 			LIMIT_NETDEBUG(KERN_INFO "L2TP: IPv6: checksum is 0\n");
++ 			return 1;
++ 		}
++ 		if ((skb->ip_summed == CHECKSUM_COMPLETE) &&
++ 		    !csum_ipv6_magic(&ipv6_hdr(skb)->saddr,
++ 				     &ipv6_hdr(skb)->daddr, ulen,
++ 				     IPPROTO_UDP, skb->csum)) {
++ 			skb->ip_summed = CHECKSUM_UNNECESSARY;
++ 			return 0;
++ 		}
++ 		skb->csum = ~csum_unfold(csum_ipv6_magic(&ipv6_hdr(skb)->saddr,
++ 							 &ipv6_hdr(skb)->daddr,
++ 							 skb->len, IPPROTO_UDP,
++ 							 0));
++ 	} else
++ #endif
++ 	{
++ 		struct inet_sock *inet;
++ 		if (!uh->check)
++ 			return 0;
++ 		inet = inet_sk(sk);
++ 		psum = csum_tcpudp_nofold(inet->inet_saddr, inet->inet_daddr,
++ 					  ulen, IPPROTO_UDP, 0);
++ 
++ 		if ((skb->ip_summed == CHECKSUM_COMPLETE) &&
++ 		    !csum_fold(csum_add(psum, skb->csum)))
++ 			return 0;
++ 		skb->csum = psum;
++ 	}
++ 
++ 	return __skb_checksum_complete(skb);
++ }
++ 
++ static int l2tp_seq_check_rx_window(struct l2tp_session *session, u32 nr)
++ {
++ 	u32 nws;
++ 
++ 	if (nr >= session->nr)
++ 		nws = nr - session->nr;
++ 	else
++ 		nws = (session->nr_max + 1) - (session->nr - nr);
++ 
++ 	return nws < session->nr_window_size;
++ }
++ 
++ /* If packet has sequence numbers, queue it if acceptable. Returns 0 if
++  * acceptable, else non-zero.
++  */
++ static int l2tp_recv_data_seq(struct l2tp_session *session, struct sk_buff *skb)
++ {
++ 	if (!l2tp_seq_check_rx_window(session, L2TP_SKB_CB(skb)->ns)) {
++ 		/* Packet sequence number is outside allowed window.
++ 		 * Discard it.
++ 		 */
++ 		l2tp_dbg(session, L2TP_MSG_SEQ,
++ 			 "%s: pkt %u len %d discarded, outside window, nr=%u\n",
++ 			 session->name, L2TP_SKB_CB(skb)->ns,
++ 			 L2TP_SKB_CB(skb)->length, session->nr);
++ 		goto discard;
++ 	}
++ 
++ 	if (session->reorder_timeout != 0) {
++ 		/* Packet reordering enabled. Add skb to session's
++ 		 * reorder queue, in order of ns.
++ 		 */
++ 		l2tp_recv_queue_skb(session, skb);
++ 	} else {
++ 		/* Packet reordering disabled. Discard out-of-sequence
++ 		 * packets
++ 		 */
++ 		if ((L2TP_SKB_CB(skb)->ns != session->nr) &&
++ 		    (!session->reorder_skip)) {
++ 			atomic_long_inc(&session->stats.rx_seq_discards);
++ 			l2tp_dbg(session, L2TP_MSG_SEQ,
++ 				 "%s: oos pkt %u len %d discarded, waiting for %u, reorder_q_len=%d\n",
++ 				 session->name, L2TP_SKB_CB(skb)->ns,
++ 				 L2TP_SKB_CB(skb)->length, session->nr,
++ 				 skb_queue_len(&session->reorder_q));
++ 			goto discard;
++ 		}
++ 		skb_queue_tail(&session->reorder_q, skb);
++ 	}
++ 
++ 	return 0;
++ 
++ discard:
++ 	return 1;
++ }
++ 
+++>>>>>>> 8a1631d588a3 (l2tp: make datapath sequence number support RFC-compliant)
+  /* Do receive processing of L2TP data frames. We handle both L2TPv2
+   * and L2TPv3 data frames here.
+   *
+* Unmerged path net/l2tp/l2tp_core.c
+diff --git a/net/l2tp/l2tp_core.h b/net/l2tp/l2tp_core.h
+index 14fe7fe7a0f5..24f4b8dffa66 100644
+--- a/net/l2tp/l2tp_core.h
++++ b/net/l2tp/l2tp_core.h
+@@ -102,6 +102,8 @@ struct l2tp_session {
+ 	u32			nr;		/* session NR state (receive) */
+ 	u32			ns;		/* session NR state (send) */
+ 	struct sk_buff_head	reorder_q;	/* receive reorder queue */
++	u32			nr_max;		/* max NR. Depends on tunnel */
++	u32			nr_window_size;	/* NR window size */
+ 	struct hlist_node	hlist;		/* Hash list node */
+ 	atomic_t		ref_count;
+ 
