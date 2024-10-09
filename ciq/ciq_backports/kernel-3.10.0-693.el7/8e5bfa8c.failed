@@ -1,0 +1,133 @@
+sched/autogroup: Do not use autogroup->tg in zombie threads
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Oleg Nesterov <oleg@redhat.com>
+commit 8e5bfa8c1f8471aa4a2d30be631ef2b50e10abaf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8e5bfa8c.failed
+
+Exactly because for_each_thread() in autogroup_move_group() can't see it
+and update its ->sched_task_group before _put() and possibly free().
+
+So the exiting task needs another sched_move_task() before exit_notify()
+and we need to re-introduce the PF_EXITING (or similar) check removed by
+the previous change for another reason.
+
+	Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Mike Galbraith <efault@gmx.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: hartsjc@redhat.com
+	Cc: vbendel@redhat.com
+	Cc: vlovejoy@redhat.com
+Link: http://lkml.kernel.org/r/20161114184612.GA15968@redhat.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 8e5bfa8c1f8471aa4a2d30be631ef2b50e10abaf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/exit.c
+#	kernel/sched/auto_group.c
+diff --cc kernel/exit.c
+index a077150a21be,3076f3089919..000000000000
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@@ -819,11 -836,9 +819,16 @@@ void do_exit(long code
+  	 */
+  	perf_event_exit_task(tsk);
+  
+++<<<<<<< HEAD
+ +	cgroup_exit(tsk, 1);
+++=======
++ 	sched_autogroup_exit_task(tsk);
++ 	cgroup_exit(tsk);
+++>>>>>>> 8e5bfa8c1f84 (sched/autogroup: Do not use autogroup->tg in zombie threads)
+  
+ +	module_put(task_thread_info(tsk)->exec_domain->module);
+ +
+ +	proc_exit_connector(tsk);
+  	/*
+  	 * FIXME: do that only when needed, using sched_exit tracepoint
+  	 */
+diff --cc kernel/sched/auto_group.c
+index 031cc02f02aa,f1c8fd566246..000000000000
+--- a/kernel/sched/auto_group.c
++++ b/kernel/sched/auto_group.c
+@@@ -114,13 -111,13 +114,22 @@@ bool task_wants_autogroup(struct task_s
+  {
+  	if (tg != &root_task_group)
+  		return false;
+ +
+ +	if (p->sched_class != &fair_sched_class)
+ +		return false;
+ +
+  	/*
+++<<<<<<< HEAD
+ +	 * We can only assume the task group can't go away on us if
+ +	 * autogroup_move_group() can see us on ->thread_group list.
+++=======
++ 	 * If we race with autogroup_move_group() the caller can use the old
++ 	 * value of signal->autogroup but in this case sched_move_task() will
++ 	 * be called again before autogroup_kref_put().
++ 	 *
++ 	 * However, there is no way sched_autogroup_exit_task() could tell us
++ 	 * to avoid autogroup->tg, so we abuse PF_EXITING flag for this case.
+++>>>>>>> 8e5bfa8c1f84 (sched/autogroup: Do not use autogroup->tg in zombie threads)
+  	 */
+  	if (p->flags & PF_EXITING)
+  		return false;
+@@@ -144,13 -151,20 +163,27 @@@ autogroup_move_group(struct task_struc
+  	}
+  
+  	p->signal->autogroup = autogroup_kref_get(ag);
+++<<<<<<< HEAD
+ +
+ +	if (!ACCESS_ONCE(sysctl_sched_autogroup_enabled))
+ +		goto out;
+ +
+++=======
++ 	/*
++ 	 * We can't avoid sched_move_task() after we changed signal->autogroup,
++ 	 * this process can already run with task_group() == prev->tg or we can
++ 	 * race with cgroup code which can read autogroup = prev under rq->lock.
++ 	 * In the latter case for_each_thread() can not miss a migrating thread,
++ 	 * cpu_cgroup_attach() must not be possible after cgroup_exit() and it
++ 	 * can't be removed from thread list, we hold ->siglock.
++ 	 *
++ 	 * If an exiting thread was already removed from thread list we rely on
++ 	 * sched_autogroup_exit_task().
++ 	 */
+++>>>>>>> 8e5bfa8c1f84 (sched/autogroup: Do not use autogroup->tg in zombie threads)
+  	for_each_thread(p, t)
+  		sched_move_task(t);
+ -
+ +out:
+  	unlock_task_sighand(p, &flags);
+  	autogroup_kref_put(prev);
+  }
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index e8d907febb50..296af0ee7a7e 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -2315,6 +2315,7 @@ extern void sched_autogroup_create_attach(struct task_struct *p);
+ extern void sched_autogroup_detach(struct task_struct *p);
+ extern void sched_autogroup_fork(struct signal_struct *sig);
+ extern void sched_autogroup_exit(struct signal_struct *sig);
++extern void sched_autogroup_exit_task(struct task_struct *p);
+ #ifdef CONFIG_PROC_FS
+ extern void proc_sched_autogroup_show_task(struct task_struct *p, struct seq_file *m);
+ extern int proc_sched_autogroup_set_nice(struct task_struct *p, int nice);
+@@ -2324,6 +2325,7 @@ static inline void sched_autogroup_create_attach(struct task_struct *p) { }
+ static inline void sched_autogroup_detach(struct task_struct *p) { }
+ static inline void sched_autogroup_fork(struct signal_struct *sig) { }
+ static inline void sched_autogroup_exit(struct signal_struct *sig) { }
++static inline void sched_autogroup_exit_task(struct task_struct *p) { }
+ #endif
+ 
+ extern int yield_to(struct task_struct *p, bool preempt);
+* Unmerged path kernel/exit.c
+* Unmerged path kernel/sched/auto_group.c
