@@ -1,0 +1,316 @@
+s390/pgtable: introduce and use generic csp inline asm
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [s390] pgtable: introduce and use generic csp inline asm (Hendrik Brueckner) [1489742]
+Rebuild_FUZZ: 95.15%
+commit-author Heiko Carstens <heiko.carstens@de.ibm.com>
+commit 4ccccc522bd22ba8e272f95daca5ab92eb0387a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4ccccc52.failed
+
+We have already two inline assemblies which make use of the csp
+instruction. Since I need a third instance let's introduce a generic
+inline assmebly which can be used by everyone.
+
+	Signed-off-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Acked-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 4ccccc522bd22ba8e272f95daca5ab92eb0387a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/pgtable.h
+#	arch/s390/include/asm/tlbflush.h
+diff --cc arch/s390/include/asm/pgtable.h
+index cff6ed1e6f32,58e9950fd57f..000000000000
+--- a/arch/s390/include/asm/pgtable.h
++++ b/arch/s390/include/asm/pgtable.h
+@@@ -474,6 -400,43 +474,46 @@@ static inline int mm_has_pgste(struct m
+  #endif
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static inline int mm_alloc_pgste(struct mm_struct *mm)
++ {
++ #ifdef CONFIG_PGSTE
++ 	if (unlikely(mm->context.alloc_pgste))
++ 		return 1;
++ #endif
++ 	return 0;
++ }
++ 
++ /*
++  * In the case that a guest uses storage keys
++  * faults should no longer be backed by zero pages
++  */
++ #define mm_forbids_zeropage mm_use_skey
++ static inline int mm_use_skey(struct mm_struct *mm)
++ {
++ #ifdef CONFIG_PGSTE
++ 	if (mm->context.use_skey)
++ 		return 1;
++ #endif
++ 	return 0;
++ }
++ 
++ static inline void csp(unsigned int *ptr, unsigned int old, unsigned int new)
++ {
++ 	register unsigned long reg2 asm("2") = old;
++ 	register unsigned long reg3 asm("3") = new;
++ 	unsigned long address = (unsigned long)ptr | 1;
++ 
++ 	asm volatile(
++ 		"	csp	%0,%3"
++ 		: "+d" (reg2), "+m" (*ptr)
++ 		: "d" (reg3), "d" (address)
++ 		: "cc");
++ }
++ 
+++>>>>>>> 4ccccc522bd2 (s390/pgtable: introduce and use generic csp inline asm)
+  /*
+   * pgd/pmd/pte query functions
+   */
+@@@ -1457,29 -1074,44 +1497,34 @@@ static inline pmd_t mk_pmd_phys(unsigne
+  {
+  	pmd_t __pmd;
+  	pmd_val(__pmd) = physpage + massage_pgprot_pmd(pgprot);
+ -	return __pmd;
+ +	return pmd_mkyoung(__pmd);
+  }
+  
+ -#endif /* CONFIG_TRANSPARENT_HUGEPAGE || CONFIG_HUGETLB_PAGE */
+ -
+ -static inline void __pmdp_csp(pmd_t *pmdp)
+ -{
+ -	csp((unsigned int *)pmdp + 1, pmd_val(*pmdp),
+ -	    pmd_val(*pmdp) | _SEGMENT_ENTRY_INVALID);
+ -}
+ -
+ -static inline void __pmdp_idte(unsigned long address, pmd_t *pmdp)
+ +static inline pmd_t pmd_mkwrite(pmd_t pmd)
+  {
+ -	unsigned long sto;
+ -
+ -	sto = (unsigned long) pmdp - pmd_index(address) * sizeof(pmd_t);
+ -	asm volatile(
+ -		"	.insn	rrf,0xb98e0000,%2,%3,0,0"
+ -		: "=m" (*pmdp)
+ -		: "m" (*pmdp), "a" (sto), "a" ((address & HPAGE_MASK))
+ -		: "cc" );
+ +	/* Do not clobber PROT_NONE segments! */
+ +	if (!pmd_prot_none(pmd))
+ +		pmd_val(pmd) &= ~_SEGMENT_ENTRY_PROTECT;
+ +	return pmd;
+  }
+ +#endif /* CONFIG_TRANSPARENT_HUGEPAGE || CONFIG_HUGETLB_PAGE */
+  
+ -static inline void __pmdp_idte_local(unsigned long address, pmd_t *pmdp)
+ +static inline void pmdp_flush_lazy(struct mm_struct *mm,
+ +				   unsigned long address, pmd_t *pmdp)
+  {
+ -	unsigned long sto;
+++<<<<<<< HEAD
+ +	int active = (mm == current->active_mm) ? 1 : 0;
+  
+ -	sto = (unsigned long) pmdp - pmd_index(address) * sizeof(pmd_t);
+ -	asm volatile(
+ -		"	.insn	rrf,0xb98e0000,%2,%3,0,1"
+ -		: "=m" (*pmdp)
+ -		: "m" (*pmdp), "a" (sto), "a" ((address & HPAGE_MASK))
+ -		: "cc" );
+ +	if ((atomic_read(&mm->context.attach_count) & 0xffff) > active)
+ +		__pmd_idte(address, pmdp);
+ +	else
+ +		mm->context.flush_mm = 1;
+++=======
+++	csp((unsigned int *)pmdp + 1, pmd_val(*pmdp),
+++	    pmd_val(*pmdp) | _SEGMENT_ENTRY_INVALID);
+++>>>>>>> 4ccccc522bd2 (s390/pgtable: introduce and use generic csp inline asm)
+  }
+  
+ -pmd_t pmdp_xchg_direct(struct mm_struct *, unsigned long, pmd_t *, pmd_t);
+ -pmd_t pmdp_xchg_lazy(struct mm_struct *, unsigned long, pmd_t *, pmd_t);
+ -
+  #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+  
+  #define __HAVE_ARCH_PGTABLE_DEPOSIT
+diff --cc arch/s390/include/asm/tlbflush.h
+index 9572b1ab1d9d,ac02a6c37a3e..000000000000
+--- a/arch/s390/include/asm/tlbflush.h
++++ b/arch/s390/include/asm/tlbflush.h
+@@@ -5,72 -5,131 +5,74 @@@
+  #include <linux/sched.h>
+  #include <asm/processor.h>
+  #include <asm/pgalloc.h>
++ #include <asm/pgtable.h>
+  
+  /*
+ - * Flush all TLB entries on the local CPU.
+ + * Flush all tlb entries on the local cpu.
+   */
+  static inline void __tlb_flush_local(void)
+  {
+  	asm volatile("ptlb" : : : "memory");
+  }
+  
+ +#ifdef CONFIG_SMP
+  /*
+ - * Flush TLB entries for a specific ASCE on all CPUs
+ - */
+ -static inline void __tlb_flush_idte(unsigned long asce)
+ -{
+ -	/* Global TLB flush for the mm */
+ -	asm volatile(
+ -		"	.insn	rrf,0xb98e0000,0,%0,%1,0"
+ -		: : "a" (2048), "a" (asce) : "cc");
+ -}
+ -
+ -/*
+ - * Flush TLB entries for a specific ASCE on the local CPU
+ + * Flush all tlb entries on all cpus.
+   */
+ -static inline void __tlb_flush_idte_local(unsigned long asce)
+ -{
+ -	/* Local TLB flush for the mm */
+ -	asm volatile(
+ -		"	.insn	rrf,0xb98e0000,0,%0,%1,1"
+ -		: : "a" (2048), "a" (asce) : "cc");
+ -}
+ -
+ -#ifdef CONFIG_SMP
+  void smp_ptlb_all(void);
+  
+ -/*
+ - * Flush all TLB entries on all CPUs.
+ - */
+  static inline void __tlb_flush_global(void)
+  {
+- 	register unsigned long reg2 asm("2");
+- 	register unsigned long reg3 asm("3");
+- 	register unsigned long reg4 asm("4");
+- 	long dummy;
++ 	unsigned int dummy = 0;
+  
+++<<<<<<< HEAD
+ +#ifndef CONFIG_64BIT
+ +	if (!MACHINE_HAS_CSP) {
+ +		smp_ptlb_all();
+ +		return;
+ +	}
+ +#endif /* CONFIG_64BIT */
+ +
+ +	dummy = 0;
+ +	reg2 = reg3 = 0;
+ +	reg4 = ((unsigned long) &dummy) + 1;
+ +	asm volatile(
+ +		"	csp	%0,%2"
+ +		: : "d" (reg2), "d" (reg3), "d" (reg4), "m" (dummy) : "cc" );
+++=======
++ 	csp(&dummy, 0, 0);
+++>>>>>>> 4ccccc522bd2 (s390/pgtable: introduce and use generic csp inline asm)
+  }
+  
+ -/*
+ - * Flush TLB entries for a specific mm on all CPUs (in case gmap is used
+ - * this implicates multiple ASCEs!).
+ - */
+  static inline void __tlb_flush_full(struct mm_struct *mm)
+  {
+ -	preempt_disable();
+ -	atomic_add(0x10000, &mm->context.attach_count);
+ -	if (cpumask_equal(mm_cpumask(mm), cpumask_of(smp_processor_id()))) {
+ -		/* Local TLB flush */
+ -		__tlb_flush_local();
+ -	} else {
+ -		/* Global TLB flush */
+ -		__tlb_flush_global();
+ -		/* Reset TLB flush mask */
+ -		if (MACHINE_HAS_TLB_LC)
+ -			cpumask_copy(mm_cpumask(mm),
+ -				     &mm->context.cpu_attach_mask);
+ -	}
+ -	atomic_sub(0x10000, &mm->context.attach_count);
+ -	preempt_enable();
+ -}
+ -
+ -/*
+ - * Flush TLB entries for a specific ASCE on all CPUs.
+ - */
+ -static inline void __tlb_flush_asce(struct mm_struct *mm, unsigned long asce)
+ -{
+ -	int active, count;
+ +	cpumask_t local_cpumask;
+  
+  	preempt_disable();
+ -	active = (mm == current->active_mm) ? 1 : 0;
+ -	count = atomic_add_return(0x10000, &mm->context.attach_count);
+ -	if (MACHINE_HAS_TLB_LC && (count & 0xffff) <= active &&
+ -	    cpumask_equal(mm_cpumask(mm), cpumask_of(smp_processor_id()))) {
+ -		__tlb_flush_idte_local(asce);
+ -	} else {
+ -		if (MACHINE_HAS_IDTE)
+ -			__tlb_flush_idte(asce);
+ -		else
+ -			__tlb_flush_global();
+ -		/* Reset TLB flush mask */
+ -		if (MACHINE_HAS_TLB_LC)
+ -			cpumask_copy(mm_cpumask(mm),
+ -				     &mm->context.cpu_attach_mask);
+ -	}
+ -	atomic_sub(0x10000, &mm->context.attach_count);
+ -	preempt_enable();
+ -}
+ -
+ -static inline void __tlb_flush_kernel(void)
+ -{
+ -	if (MACHINE_HAS_IDTE)
+ -		__tlb_flush_idte(init_mm.context.asce);
+ +	/*
+ +	 * If the process only ran on the local cpu, do a local flush.
+ +	 */
+ +	cpumask_copy(&local_cpumask, cpumask_of(smp_processor_id()));
+ +	if (cpumask_equal(mm_cpumask(mm), &local_cpumask))
+ +		__tlb_flush_local();
+  	else
+  		__tlb_flush_global();
+ +	preempt_enable();
+  }
+  #else
+ -#define __tlb_flush_global()	__tlb_flush_local()
+  #define __tlb_flush_full(mm)	__tlb_flush_local()
+ +#define __tlb_flush_global()	__tlb_flush_local()
+ +#endif
+  
+  /*
+ - * Flush TLB entries for a specific ASCE on all CPUs.
+ + * Flush all tlb entries of a page table on all cpus.
+   */
+ -static inline void __tlb_flush_asce(struct mm_struct *mm, unsigned long asce)
+ -{
+ -	if (MACHINE_HAS_TLB_LC)
+ -		__tlb_flush_idte_local(asce);
+ -	else
+ -		__tlb_flush_local();
+ -}
+ -
+ -static inline void __tlb_flush_kernel(void)
+ +static inline void __tlb_flush_idte(unsigned long asce)
+  {
+ -	if (MACHINE_HAS_TLB_LC)
+ -		__tlb_flush_idte_local(init_mm.context.asce);
+ -	else
+ -		__tlb_flush_local();
+ +	asm volatile(
+ +		"	.insn	rrf,0xb98e0000,0,%0,%1,0"
+ +		: : "a" (2048), "a" (asce) : "cc" );
+  }
+ -#endif
+  
+  static inline void __tlb_flush_mm(struct mm_struct * mm)
+  {
+* Unmerged path arch/s390/include/asm/pgtable.h
+* Unmerged path arch/s390/include/asm/tlbflush.h
