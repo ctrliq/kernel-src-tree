@@ -100,7 +100,6 @@ struct alc_spec {
 	hda_nid_t mute_led_nid;
 	hda_nid_t cap_mute_led_nid;
 
-	unsigned int gpio_led; /* used for alc269_fixup_hp_gpio_led() */
 	unsigned int gpio_mute_led_mask;
 	unsigned int gpio_mic_led_mask;
 
@@ -3498,9 +3497,8 @@ static int alc269_resume(struct hda_codec *codec)
 	 * suspend, and won't restore the data after resume, so we restore it
 	 * in the driver.
 	 */
-	if (spec->gpio_led)
-		snd_hda_codec_write(codec, codec->core.afg, 0, AC_VERB_SET_GPIO_DATA,
-			    spec->gpio_led);
+	if (spec->gpio_data)
+		alc_write_gpio_data(codec);
 
 	if (spec->has_alc5505_dsp)
 		alc5505_dsp_resume(codec);
@@ -3740,18 +3738,10 @@ static void alc_update_gpio_led(struct hda_codec *codec, unsigned int mask,
 				bool enabled)
 {
 	struct alc_spec *spec = codec->spec;
-	unsigned int oldval = spec->gpio_led;
 
 	if (spec->mute_led_polarity)
 		enabled = !enabled;
-
-	if (enabled)
-		spec->gpio_led &= ~mask;
-	else
-		spec->gpio_led |= mask;
-	if (spec->gpio_led != oldval)
-		snd_hda_codec_write(codec, 0x01, 0, AC_VERB_SET_GPIO_DATA,
-				    spec->gpio_led);
+	alc_update_gpio_data(codec, mask, !enabled); /* muted -> LED on */
 }
 
 /* turn on/off mute LED via GPIO per vmaster hook */
@@ -3784,7 +3774,6 @@ static void alc269_fixup_hp_gpio_led(struct hda_codec *codec,
 
 	if (action == HDA_FIXUP_ACT_PRE_PROBE) {
 		spec->gen.vmaster_mute.hook = alc_fixup_gpio_mute_hook;
-		spec->gpio_led = 0;
 		spec->mute_led_polarity = 0;
 		spec->gpio_mute_led_mask = 0x08;
 		spec->gpio_mic_led_mask = 0x10;
@@ -3805,7 +3794,6 @@ static void alc286_fixup_hp_gpio_led(struct hda_codec *codec,
 
 	if (action == HDA_FIXUP_ACT_PRE_PROBE) {
 		spec->gen.vmaster_mute.hook = alc_fixup_gpio_mute_hook;
-		spec->gpio_led = 0;
 		spec->mute_led_polarity = 0;
 		spec->gpio_mute_led_mask = 0x02;
 		spec->gpio_mic_led_mask = 0x20;
@@ -3843,7 +3831,6 @@ static void alc269_fixup_hp_gpio_mic1_led(struct hda_codec *codec,
 
 	if (action == HDA_FIXUP_ACT_PRE_PROBE) {
 		spec->gen.vmaster_mute.hook = alc_fixup_gpio_mute_hook;
-		spec->gpio_led = 0;
 		spec->mute_led_polarity = 0;
 		spec->gpio_mute_led_mask = 0x08;
 		spec->cap_mute_led_nid = 0x18;
@@ -3866,7 +3853,6 @@ static void alc280_fixup_hp_gpio4(struct hda_codec *codec,
 
 	if (action == HDA_FIXUP_ACT_PRE_PROBE) {
 		spec->gen.vmaster_mute.hook = alc_fixup_gpio_mute_hook;
-		spec->gpio_led = 0;
 		spec->mute_led_polarity = 0;
 		spec->gpio_mute_led_mask = 0x08;
 		spec->cap_mute_led_nid = 0x18;
@@ -3949,7 +3935,6 @@ static void alc280_fixup_hp_gpio2_mic_hotkey(struct hda_codec *codec,
 						    gpio2_mic_hotkey_event);
 
 		spec->gen.vmaster_mute.hook = alc_fixup_gpio_mute_hook;
-		spec->gpio_led = 0;
 		spec->mute_led_polarity = 0;
 		spec->gpio_mute_led_mask = 0x08;
 		spec->gpio_mic_led_mask = 0x10;
@@ -3989,7 +3974,6 @@ static void alc233_fixup_lenovo_line2_mic_hotkey(struct hda_codec *codec,
 		snd_hda_jack_detect_enable_callback(codec, 0x1b,
 						    gpio2_mic_hotkey_event);
 
-		spec->gpio_led = 0;
 		spec->mute_led_polarity = 0;
 		spec->gpio_mic_led_mask = 0x04;
 		snd_hda_gen_add_micmute_led(codec, alc_gpio_micmute_update);
@@ -5365,9 +5349,6 @@ static void alc280_fixup_hp_9480m(struct hda_codec *codec,
 		 */
 		spec->gen.vmaster_mute.hook = alc_fixup_gpio_mute_hook;
 		spec->gen.hp_automute_hook = alc280_hp_gpio4_automute_hook;
-
-		/* The GPIOs are currently off */
-		spec->gpio_led = 0;
 
 		/* GPIO3 is connected to the output mute LED,
 		 * high is on, low is off
@@ -7620,7 +7601,7 @@ static unsigned int gpio_led_power_filter(struct hda_codec *codec,
 					  unsigned int power_state)
 {
 	struct alc_spec *spec = codec->spec;
-	if (nid == codec->core.afg && power_state == AC_PWRST_D3 && spec->gpio_led)
+	if (nid == codec->core.afg && power_state == AC_PWRST_D3 && spec->gpio_data)
 		return AC_PWRST_D0;
 	return power_state;
 }
@@ -7637,7 +7618,6 @@ static void alc662_fixup_led_gpio1(struct hda_codec *codec,
 
 	if (action == HDA_FIXUP_ACT_PRE_PROBE) {
 		spec->gen.vmaster_mute.hook = alc_fixup_gpio_mute_hook;
-		spec->gpio_led = 0;
 		spec->mute_led_polarity = 1;
 		spec->gpio_mute_led_mask = 0x01;
 		snd_hda_add_verbs(codec, gpio_init);
