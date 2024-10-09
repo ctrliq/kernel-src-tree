@@ -1,0 +1,383 @@
+gfs2: Turn trunc_dealloc into punch_hole
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 10d2cf94c23d48ef1b141084216e7580011e4790
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/10d2cf94.failed
+
+Add an upper bound to the range of blocks to deallocate blocks to
+function trunc_dealloc so that this function can be used for truncating
+a file as well as for punching a hole into a file.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+(cherry picked from commit 10d2cf94c23d48ef1b141084216e7580011e4790)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/bmap.c
+diff --cc fs/gfs2/bmap.c
+index fe514d9cb90e,f6dbd2f400cc..000000000000
+--- a/fs/gfs2/bmap.c
++++ b/fs/gfs2/bmap.c
+@@@ -1271,29 -1287,64 +1274,77 @@@ enum dealloc_states 
+  	DEALLOC_DONE = 3,       /* process complete */
+  };
+  
+++<<<<<<< HEAD
+ +static bool mp_eq_to_hgt(struct metapath *mp, __u16 *list, unsigned int h)
+ +{
+ +	if (memcmp(mp->mp_list, list, h * sizeof(mp->mp_list[0])))
+ +		return false;
+ +	return true;
+++=======
++ static inline void
++ metapointer_range(struct metapath *mp, int height,
++ 		  __u16 *start_list, unsigned int start_aligned,
++ 		  __u16 *end_list, unsigned int end_aligned,
++ 		  __be64 **start, __be64 **end)
++ {
++ 	struct buffer_head *bh = mp->mp_bh[height];
++ 	__be64 *first;
++ 
++ 	first = metaptr1(height, mp);
++ 	*start = first;
++ 	if (mp_eq_to_hgt(mp, start_list, height)) {
++ 		bool keep_start = height < start_aligned;
++ 		*start = first + start_list[height] + keep_start;
++ 	}
++ 	*end = (__be64 *)(bh->b_data + bh->b_size);
++ 	if (end_list && mp_eq_to_hgt(mp, end_list, height)) {
++ 		bool keep_end = height < end_aligned;
++ 		*end = first + end_list[height] + keep_end;
++ 	}
++ }
++ 
++ static inline bool walk_done(struct gfs2_sbd *sdp,
++ 			     struct metapath *mp, int height,
++ 			     __u16 *end_list, unsigned int end_aligned)
++ {
++ 	__u16 end;
++ 
++ 	if (end_list) {
++ 		bool keep_end = height < end_aligned;
++ 		if (!mp_eq_to_hgt(mp, end_list, height))
++ 			return false;
++ 		end = end_list[height] + keep_end;
++ 	} else
++ 		end = (height > 0) ? sdp->sd_inptrs : sdp->sd_diptrs;
++ 	return mp->mp_list[height] >= end;
+++>>>>>>> 10d2cf94c23d (gfs2: Turn trunc_dealloc into punch_hole)
+  }
+  
+  /**
+-  * trunc_dealloc - truncate a file down to a desired size
++  * punch_hole - deallocate blocks in a file
+   * @ip: inode to truncate
+-  * @newsize: The desired size of the file
++  * @offset: the start of the hole
++  * @length: the size of the hole (or 0 for truncate)
+   *
+-  * This function truncates a file to newsize. It works from the
+-  * bottom up, and from the right to the left. In other words, it strips off
+-  * the highest layer (data) before stripping any of the metadata. Doing it
+-  * this way is best in case the operation is interrupted by power failure, etc.
+-  * The dinode is rewritten in every transaction to guarantee integrity.
++  * Punch a hole into a file or truncate a file at a given position.  This
++  * function operates in whole blocks (@offset and @length are rounded
++  * accordingly); partially filled blocks must be cleared otherwise.
++  *
++  * This function works from the bottom up, and from the right to the left. In
++  * other words, it strips off the highest layer (data) before stripping any of
++  * the metadata. Doing it this way is best in case the operation is interrupted
++  * by power failure, etc.  The dinode is rewritten in every transaction to
++  * guarantee integrity.
+   */
+- static int trunc_dealloc(struct gfs2_inode *ip, u64 newsize)
++ static int punch_hole(struct gfs2_inode *ip, u64 offset, u64 length)
+  {
+  	struct gfs2_sbd *sdp = GFS2_SB(&ip->i_inode);
+++<<<<<<< HEAD
+ +	const u64 *arr = sdp->sd_heightsize;
+ +	struct metapath mp;
+++=======
++ 	struct metapath mp = {};
+++>>>>>>> 10d2cf94c23d (gfs2: Turn trunc_dealloc into punch_hole)
+  	struct buffer_head *dibh, *bh;
+  	struct gfs2_holder rd_gh;
+  	unsigned int bsize_shift = sdp->sd_sb.sb_bsize_shift;
+@@@ -1305,28 -1357,51 +1357,63 @@@
+  	int ret, state;
+  	int mp_h; /* metapath buffers are read in to this height */
+  	u64 prev_bnr = 0;
+ -	__be64 *start, *end;
+ +	bool keep_start; /* need to preserve the first meta pointer? */
+  
+++<<<<<<< HEAD
+ +	if ((lblock + 1) * sdp->sd_sb.sb_bsize > arr[ip->i_height]) {
+ +		/*
+ +		 * The truncate point lies beyond the allocated meta-data;
+ +		 * there is nothing to truncate.
+ +		 */
+ +		return 0;
+ +	}
+ +	memset(&mp, 0, sizeof(mp));
+ +	find_metapath(sdp, lblock, &mp, ip->i_height);
+++=======
++ 	/*
++ 	 * The start position of the hole is defined by lblock, start_list, and
++ 	 * start_aligned.  The end position of the hole is defined by lend,
++ 	 * end_list, and end_aligned.
++ 	 *
++ 	 * start_aligned and end_aligned define down to which height the start
++ 	 * and end positions are aligned to the metadata tree (i.e., the
++ 	 * position is a multiple of the metadata granularity at the height
++ 	 * above).  This determines at which heights additional meta pointers
++ 	 * needs to be preserved for the remaining data.
++ 	 */
+++>>>>>>> 10d2cf94c23d (gfs2: Turn trunc_dealloc into punch_hole)
++ 
++ 	if (length) {
++ 		u64 maxsize = sdp->sd_heightsize[ip->i_height];
++ 		u64 end_offset = offset + length;
++ 		u64 lend;
++ 
++ 		/*
++ 		 * Clip the end at the maximum file size for the given height:
++ 		 * that's how far the metadata goes; files bigger than that
++ 		 * will have additional layers of indirection.
++ 		 */
++ 		if (end_offset > maxsize)
++ 			end_offset = maxsize;
++ 		lend = end_offset >> bsize_shift;
++ 
++ 		if (lblock >= lend)
++ 			return 0;
++ 
++ 		find_metapath(sdp, lend, &mp, ip->i_height);
++ 		end_list = __end_list;
++ 		memcpy(end_list, mp.mp_list, sizeof(mp.mp_list));
++ 
++ 		for (mp_h = ip->i_height - 1; mp_h > 0; mp_h--) {
++ 			if (end_list[mp_h])
++ 				break;
++ 		}
++ 		end_aligned = mp_h;
++ 	}
+  
++ 	find_metapath(sdp, lblock, &mp, ip->i_height);
+  	memcpy(start_list, mp.mp_list, sizeof(start_list));
+  
+- 	/*
+- 	 * Set start_aligned to the metadata height up to which the truncate
+- 	 * point is aligned to the metadata tree (i.e., the truncate point is a
+- 	 * multiple of the granularity at the height above).  This determines
+- 	 * at which heights an additional meta pointer needs to be preserved:
+- 	 * an additional meta pointer is needed at a given height if
+- 	 * height < start_aligned.
+- 	 */
+  	for (mp_h = ip->i_height - 1; mp_h > 0; mp_h--) {
+  		if (start_list[mp_h])
+  			break;
+@@@ -1343,8 -1418,11 +1430,16 @@@
+  		goto out_metapath;
+  
+  	/* issue read-ahead on metadata */
+++<<<<<<< HEAD
+ +	for (mp_h = 0; mp_h < mp.mp_aheight - 1; mp_h++)
+ +		gfs2_metapath_ra(ip->i_gl, &mp, mp_h);
+++=======
++ 	for (mp_h = 0; mp_h < mp.mp_aheight - 1; mp_h++) {
++ 		metapointer_range(&mp, mp_h, start_list, start_aligned,
++ 				  end_list, end_aligned, &start, &end);
++ 		gfs2_metapath_ra(ip->i_gl, start, end);
++ 	}
+++>>>>>>> 10d2cf94c23d (gfs2: Turn trunc_dealloc into punch_hole)
+  
+  	if (mp.mp_aheight == ip->i_height)
+  		state = DEALLOC_MP_FULL; /* We have a complete metapath */
+@@@ -1379,11 -1457,27 +1474,34 @@@
+  			}
+  			prev_bnr = bh->b_blocknr;
+  
+++<<<<<<< HEAD
+ +			keep_start = mp_h < start_aligned &&
+ +				     mp_eq_to_hgt(&mp, start_list, mp_h);
+++=======
++ 			if (gfs2_metatype_check(sdp, bh,
++ 						(mp_h ? GFS2_METATYPE_IN :
++ 							GFS2_METATYPE_DI))) {
++ 				ret = -EIO;
++ 				goto out;
++ 			}
++ 
++ 			/*
++ 			 * Below, passing end_aligned as 0 gives us the
++ 			 * metapointer range excluding the end point: the end
++ 			 * point is the first metapath we must not deallocate!
++ 			 */
++ 
++ 			metapointer_range(&mp, mp_h, start_list, start_aligned,
++ 					  end_list, 0 /* end_aligned */,
++ 					  &start, &end);
++ 			ret = sweep_bh_for_rgrps(ip, &rd_gh, mp.mp_bh[mp_h],
++ 						 start, end,
++ 						 mp_h != ip->i_height - 1,
++ 						 &btotal);
+++>>>>>>> 10d2cf94c23d (gfs2: Turn trunc_dealloc into punch_hole)
+  
+ +			ret = sweep_bh_for_rgrps(ip, &rd_gh, &mp, &btotal,
+ +						 mp_h, keep_start);
+  			/* If we hit an error or just swept dinode buffer,
+  			   just exit. */
+  			if (ret || !mp_h) {
+@@@ -1437,9 -1531,13 +1555,19 @@@
+  
+  			/* issue read-ahead on metadata */
+  			if (mp.mp_aheight > 1) {
+++<<<<<<< HEAD
+ +				for (; ret > 1; ret--)
+ +					gfs2_metapath_ra(ip->i_gl, &mp,
+ +						mp.mp_aheight - ret);
+++=======
++ 				for (; ret > 1; ret--) {
++ 					metapointer_range(&mp, mp.mp_aheight - ret,
++ 							  start_list, start_aligned,
++ 							  end_list, end_aligned,
++ 							  &start, &end);
++ 					gfs2_metapath_ra(ip->i_gl, start, end);
++ 				}
+++>>>>>>> 10d2cf94c23d (gfs2: Turn trunc_dealloc into punch_hole)
+  			}
+  
+  			/* If buffers found for the entire strip height */
+@@@ -1690,9 -1788,124 +1818,9 @@@ int gfs2_truncatei_resume(struct gfs2_i
+  
+  int gfs2_file_dealloc(struct gfs2_inode *ip)
+  {
+- 	return trunc_dealloc(ip, 0);
++ 	return punch_hole(ip, 0, 0);
+  }
+  
+ -/**
+ - * gfs2_free_journal_extents - Free cached journal bmap info
+ - * @jd: The journal
+ - *
+ - */
+ -
+ -void gfs2_free_journal_extents(struct gfs2_jdesc *jd)
+ -{
+ -	struct gfs2_journal_extent *jext;
+ -
+ -	while(!list_empty(&jd->extent_list)) {
+ -		jext = list_entry(jd->extent_list.next, struct gfs2_journal_extent, list);
+ -		list_del(&jext->list);
+ -		kfree(jext);
+ -	}
+ -}
+ -
+ -/**
+ - * gfs2_add_jextent - Add or merge a new extent to extent cache
+ - * @jd: The journal descriptor
+ - * @lblock: The logical block at start of new extent
+ - * @dblock: The physical block at start of new extent
+ - * @blocks: Size of extent in fs blocks
+ - *
+ - * Returns: 0 on success or -ENOMEM
+ - */
+ -
+ -static int gfs2_add_jextent(struct gfs2_jdesc *jd, u64 lblock, u64 dblock, u64 blocks)
+ -{
+ -	struct gfs2_journal_extent *jext;
+ -
+ -	if (!list_empty(&jd->extent_list)) {
+ -		jext = list_entry(jd->extent_list.prev, struct gfs2_journal_extent, list);
+ -		if ((jext->dblock + jext->blocks) == dblock) {
+ -			jext->blocks += blocks;
+ -			return 0;
+ -		}
+ -	}
+ -
+ -	jext = kzalloc(sizeof(struct gfs2_journal_extent), GFP_NOFS);
+ -	if (jext == NULL)
+ -		return -ENOMEM;
+ -	jext->dblock = dblock;
+ -	jext->lblock = lblock;
+ -	jext->blocks = blocks;
+ -	list_add_tail(&jext->list, &jd->extent_list);
+ -	jd->nr_extents++;
+ -	return 0;
+ -}
+ -
+ -/**
+ - * gfs2_map_journal_extents - Cache journal bmap info
+ - * @sdp: The super block
+ - * @jd: The journal to map
+ - *
+ - * Create a reusable "extent" mapping from all logical
+ - * blocks to all physical blocks for the given journal.  This will save
+ - * us time when writing journal blocks.  Most journals will have only one
+ - * extent that maps all their logical blocks.  That's because gfs2.mkfs
+ - * arranges the journal blocks sequentially to maximize performance.
+ - * So the extent would map the first block for the entire file length.
+ - * However, gfs2_jadd can happen while file activity is happening, so
+ - * those journals may not be sequential.  Less likely is the case where
+ - * the users created their own journals by mounting the metafs and
+ - * laying it out.  But it's still possible.  These journals might have
+ - * several extents.
+ - *
+ - * Returns: 0 on success, or error on failure
+ - */
+ -
+ -int gfs2_map_journal_extents(struct gfs2_sbd *sdp, struct gfs2_jdesc *jd)
+ -{
+ -	u64 lblock = 0;
+ -	u64 lblock_stop;
+ -	struct gfs2_inode *ip = GFS2_I(jd->jd_inode);
+ -	struct buffer_head bh;
+ -	unsigned int shift = sdp->sd_sb.sb_bsize_shift;
+ -	u64 size;
+ -	int rc;
+ -
+ -	lblock_stop = i_size_read(jd->jd_inode) >> shift;
+ -	size = (lblock_stop - lblock) << shift;
+ -	jd->nr_extents = 0;
+ -	WARN_ON(!list_empty(&jd->extent_list));
+ -
+ -	do {
+ -		bh.b_state = 0;
+ -		bh.b_blocknr = 0;
+ -		bh.b_size = size;
+ -		rc = gfs2_block_map(jd->jd_inode, lblock, &bh, 0);
+ -		if (rc || !buffer_mapped(&bh))
+ -			goto fail;
+ -		rc = gfs2_add_jextent(jd, lblock, bh.b_blocknr, bh.b_size >> shift);
+ -		if (rc)
+ -			goto fail;
+ -		size -= bh.b_size;
+ -		lblock += (bh.b_size >> ip->i_inode.i_blkbits);
+ -	} while(size > 0);
+ -
+ -	fs_info(sdp, "journal %d mapped with %u extents\n", jd->jd_jid,
+ -		jd->nr_extents);
+ -	return 0;
+ -
+ -fail:
+ -	fs_warn(sdp, "error %d mapping journal %u at offset %llu (extent %u)\n",
+ -		rc, jd->jd_jid,
+ -		(unsigned long long)(i_size_read(jd->jd_inode) - size),
+ -		jd->nr_extents);
+ -	fs_warn(sdp, "bmap=%d lblock=%llu block=%llu, state=0x%08lx, size=%llu\n",
+ -		rc, (unsigned long long)lblock, (unsigned long long)bh.b_blocknr,
+ -		bh.b_state, (unsigned long long)bh.b_size);
+ -	gfs2_free_journal_extents(jd);
+ -	return rc;
+ -}
+ -
+  /**
+   * gfs2_write_alloc_required - figure out if a write will require an allocation
+   * @ip: the file being written to
+* Unmerged path fs/gfs2/bmap.c
