@@ -1,0 +1,163 @@
+mm/filemap.c: fix NULL pointer in page_cache_tree_insert()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Matthew Wilcox <mawilcox@microsoft.com>
+commit abc1be13fd113ddef5e2d807a466286b864caed3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/abc1be13.failed
+
+f2fs specifies the __GFP_ZERO flag for allocating some of its pages.
+Unfortunately, the page cache also uses the mapping's GFP flags for
+allocating radix tree nodes.  It always masked off the __GFP_HIGHMEM
+flag, and masks off __GFP_ZERO in some paths, but not all.  That causes
+radix tree nodes to be allocated with a NULL list_head, which causes
+backtraces like:
+
+  __list_del_entry+0x30/0xd0
+  list_lru_del+0xac/0x1ac
+  page_cache_tree_insert+0xd8/0x110
+
+The __GFP_DMA and __GFP_DMA32 flags would also be able to sneak through
+if they are ever used.  Fix them all by using GFP_RECLAIM_MASK at the
+innermost location, and remove it from earlier in the callchain.
+
+Link: http://lkml.kernel.org/r/20180411060320.14458-2-willy@infradead.org
+Fixes: 449dd6984d0e ("mm: keep page cache radix tree nodes in check")
+	Signed-off-by: Matthew Wilcox <mawilcox@microsoft.com>
+	Reported-by: Chris Fries <cfries@google.com>
+	Debugged-by: Minchan Kim <minchan@kernel.org>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit abc1be13fd113ddef5e2d807a466286b864caed3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/filemap.c
+diff --cc mm/filemap.c
+index 0ee76df32da8,0604cb02e6f3..000000000000
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@@ -586,41 -828,52 +586,50 @@@ static int __add_to_page_cache_locked(s
+  				      pgoff_t offset, gfp_t gfp_mask,
+  				      void **shadowp)
+  {
+ -	int huge = PageHuge(page);
+ -	struct mem_cgroup *memcg;
+  	int error;
+  
+ -	VM_BUG_ON_PAGE(!PageLocked(page), page);
+ -	VM_BUG_ON_PAGE(PageSwapBacked(page), page);
+ +	VM_BUG_ON(!PageLocked(page));
+ +	VM_BUG_ON(PageSwapBacked(page));
+  
+ -	if (!huge) {
+ -		error = mem_cgroup_try_charge(page, current->mm,
+ -					      gfp_mask, &memcg, false);
+ -		if (error)
+ -			return error;
+ -	}
+ +	gfp_mask = mapping_gfp_constraint(mapping, gfp_mask);
+  
+ +	error = mem_cgroup_cache_charge(page, current->mm,
+ +					gfp_mask & GFP_RECLAIM_MASK);
+ +	if (error)
+ +		goto out;
+ +
+++<<<<<<< HEAD
+ +	error = radix_tree_maybe_preload(gfp_mask & ~__GFP_HIGHMEM);
+ +	if (error == 0) {
+ +		page_cache_get(page);
+ +		page->mapping = mapping;
+ +		page->index = offset;
+++=======
++ 	error = radix_tree_maybe_preload(gfp_mask & GFP_RECLAIM_MASK);
++ 	if (error) {
++ 		if (!huge)
++ 			mem_cgroup_cancel_charge(page, memcg, false);
++ 		return error;
++ 	}
+ -
+ -	get_page(page);
+ -	page->mapping = mapping;
+ -	page->index = offset;
+ -
+ -	xa_lock_irq(&mapping->i_pages);
+ -	error = page_cache_tree_insert(mapping, page, shadowp);
+ -	radix_tree_preload_end();
+ -	if (unlikely(error))
+ -		goto err_insert;
+ -
+ -	/* hugetlb pages do not participate in page cache accounting. */
+ -	if (!huge)
+ -		__inc_node_page_state(page, NR_FILE_PAGES);
+ -	xa_unlock_irq(&mapping->i_pages);
+ -	if (!huge)
+ -		mem_cgroup_commit_charge(page, memcg, false, false);
+ -	trace_mm_filemap_add_to_page_cache(page);
+ -	return 0;
+ -err_insert:
+ -	page->mapping = NULL;
+ -	/* Leave page->index set: truncation relies upon it */
+ -	xa_unlock_irq(&mapping->i_pages);
+ -	if (!huge)
+ -		mem_cgroup_cancel_charge(page, memcg, false);
+ -	put_page(page);
+++>>>>>>> abc1be13fd11 (mm/filemap.c: fix NULL pointer in page_cache_tree_insert())
+ +
+ +		spin_lock_irq(&mapping->tree_lock);
+ +		error = page_cache_tree_insert(mapping, page, shadowp);
+ +		if (likely(!error)) {
+ +			__inc_zone_page_state(page, NR_FILE_PAGES);
+ +			spin_unlock_irq(&mapping->tree_lock);
+ +			trace_mm_filemap_add_to_page_cache(page);
+ +		} else {
+ +			page->mapping = NULL;
+ +			/* Leave page->index set: truncation relies upon it */
+ +			spin_unlock_irq(&mapping->tree_lock);
+ +			mem_cgroup_uncharge_cache_page(page);
+ +			page_cache_release(page);
+ +		}
+ +		radix_tree_preload_end();
+ +	} else
+ +		mem_cgroup_uncharge_cache_page(page);
+ +out:
+  	return error;
+  }
+  
+@@@ -1127,16 -1577,17 +1136,28 @@@ repeat
+  		page = __page_cache_alloc(gfp_mask);
+  		if (!page)
+  			return NULL;
+++<<<<<<< HEAD
+ +		/*
+ +		 * We want a regular kernel memory (not highmem or DMA etc)
+ +		 * allocation for the radix tree nodes, but we need to honour
+ +		 * the context-specific requirements the caller has asked for.
+ +		 * GFP_RECLAIM_MASK collects those requirements.
+ +		 */
+ +		err = add_to_page_cache_lru(page, mapping, index,
+ +			(gfp_mask & GFP_RECLAIM_MASK));
+++=======
++ 
++ 		if (WARN_ON_ONCE(!(fgp_flags & FGP_LOCK)))
++ 			fgp_flags |= FGP_LOCK;
++ 
++ 		/* Init accessed so avoid atomic mark_page_accessed later */
++ 		if (fgp_flags & FGP_ACCESSED)
++ 			__SetPageReferenced(page);
++ 
++ 		err = add_to_page_cache_lru(page, mapping, offset, gfp_mask);
+++>>>>>>> abc1be13fd11 (mm/filemap.c: fix NULL pointer in page_cache_tree_insert())
+  		if (unlikely(err)) {
+ -			put_page(page);
+ +			page_cache_release(page);
+  			page = NULL;
+  			if (err == -EEXIST)
+  				goto repeat;
+* Unmerged path mm/filemap.c
