@@ -994,6 +994,7 @@ static const struct {
 						 IB_QP_QKEY),
 				 [IB_QPT_GSI] = (IB_QP_CUR_STATE		|
 						 IB_QP_QKEY),
+				 [IB_QPT_RAW_PACKET] = IB_QP_RATE_LIMIT,
 			 }
 		}
 	},
@@ -1027,6 +1028,7 @@ static const struct {
 						IB_QP_QKEY),
 				[IB_QPT_GSI] = (IB_QP_CUR_STATE			|
 						IB_QP_QKEY),
+				[IB_QPT_RAW_PACKET] = IB_QP_RATE_LIMIT,
 			}
 		},
 		[IB_QPS_SQD]   = {
