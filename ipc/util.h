@@ -13,6 +13,7 @@
 #include <linux/unistd.h>
 #include <linux/err.h>
 
+#define IPCMNI 32768  /* <= MAX_INT limit for ipc arrays (including sysctl changes) */
 #define SEQ_MULTIPLIER	(IPCMNI)
 
 void sem_init (void);
