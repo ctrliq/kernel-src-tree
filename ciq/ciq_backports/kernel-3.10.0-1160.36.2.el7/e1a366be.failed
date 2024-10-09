@@ -1,0 +1,76 @@
+mm: memcontrol: switch to rcu protection in drain_all_stock()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.36.2.el7
+commit-author Roman Gushchin <guro@fb.com>
+commit e1a366be5cb4f849ec4de170d50eebc08bb0af20
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.36.2.el7/e1a366be.failed
+
+Commit 72f0184c8a00 ("mm, memcg: remove hotplug locking from try_charge")
+introduced css_tryget()/css_put() calls in drain_all_stock(), which are
+supposed to protect the target memory cgroup from being released during
+the mem_cgroup_is_descendant() call.
+
+However, it's not completely safe.  In theory, memcg can go away between
+reading stock->cached pointer and calling css_tryget().
+
+This can happen if drain_all_stock() races with drain_local_stock()
+performed on the remote cpu as a result of a work, scheduled by the
+previous invocation of drain_all_stock().
+
+The race is a bit theoretical and there are few chances to trigger it, but
+the current code looks a bit confusing, so it makes sense to fix it
+anyway.  The code looks like as if css_tryget() and css_put() are used to
+protect stocks drainage.  It's not necessary because stocked pages are
+holding references to the cached cgroup.  And it obviously won't work for
+works, scheduled on other cpus.
+
+So, let's read the stock->cached pointer and evaluate the memory cgroup
+inside a rcu read section, and get rid of css_tryget()/css_put() calls.
+
+Link: http://lkml.kernel.org/r/20190802192241.3253165-1-guro@fb.com
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: Hillf Danton <hdanton@sina.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit e1a366be5cb4f849ec4de170d50eebc08bb0af20)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+diff --cc mm/memcontrol.c
+index e564aaa0070a,80131025f2da..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -2572,13 -2271,17 +2572,25 @@@ static void drain_all_stock(struct mem_
+  	for_each_online_cpu(cpu) {
+  		struct memcg_stock_pcp *stock = &per_cpu(memcg_stock, cpu);
+  		struct mem_cgroup *memcg;
++ 		bool flush = false;
+  
++ 		rcu_read_lock();
+  		memcg = stock->cached;
+++<<<<<<< HEAD
+ +		if (!memcg || !stock->nr_pages)
+ +			continue;
+ +		if (!mem_cgroup_same_or_subtree(root_memcg, memcg))
+ +			continue;
+ +		if (!test_and_set_bit(FLUSHING_CACHED_CHARGE, &stock->flags)) {
+++=======
++ 		if (memcg && stock->nr_pages &&
++ 		    mem_cgroup_is_descendant(memcg, root_memcg))
++ 			flush = true;
++ 		rcu_read_unlock();
++ 
++ 		if (flush &&
++ 		    !test_and_set_bit(FLUSHING_CACHED_CHARGE, &stock->flags)) {
+++>>>>>>> e1a366be5cb4 (mm: memcontrol: switch to rcu protection in drain_all_stock())
+  			if (cpu == curcpu)
+  				drain_local_stock(&stock->work);
+  			else
+* Unmerged path mm/memcontrol.c
