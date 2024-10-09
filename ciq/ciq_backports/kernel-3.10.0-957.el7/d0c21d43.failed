@@ -1,0 +1,205 @@
+bonding: Send ALB learning packets using the right source
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Vlad Yasevich <vyasevic@redhat.com>
+commit d0c21d43a5a12aaebb1e42e10cf78e6491fc9e5a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/d0c21d43.failed
+
+ALB learning packets are currentlyalways sent using the slave mac
+address for all vlans configured on top of bond.   This is not always
+correct, as vlans may change their mac address.
+This patch introduced a concept of strict matching where the
+source of learning packets can either strictly match the address
+passed in, or it can determine a more correct address to use.
+
+There are 3 casese to consider:
+  1) Switchover.  In this case, we have a new active slave and we need
+     tell the switch about all addresses available on the slave.
+  2) Monitor.  We'll periodically refresh learning info for all slaves.
+     In this case, we refresh all addresses for current active, and just
+     the slave address for other slaves.
+  3) Teaching of disabled adddress.  This happens as part of the
+     failover and in this case, we alwyas to use just the address
+     provided.
+
+CC: Jay Vosburgh <j.vosburgh@gmail.com>
+CC: Veaceslav Falico <vfalico@gmail.com>
+CC: Andy Gospodarek <andy@greyhouse.net>
+	Signed-off-by: Vlad Yasevich <vyasevic@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d0c21d43a5a12aaebb1e42e10cf78e6491fc9e5a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_alb.c
+diff --cc drivers/net/bonding/bond_alb.c
+index 7d50d66d81b0,93580a47cc54..000000000000
+--- a/drivers/net/bonding/bond_alb.c
++++ b/drivers/net/bonding/bond_alb.c
+@@@ -394,7 -460,7 +395,11 @@@ static void rlb_teach_disabled_mac_on_p
+  
+  	bond->alb_info.rlb_promisc_timeout_counter = 0;
+  
+++<<<<<<< HEAD
+ +	alb_send_learning_packets(curr_active, addr);
+++=======
++ 	alb_send_learning_packets(bond->curr_active_slave, addr, true);
+++>>>>>>> d0c21d43a5a1 (bonding: Send ALB learning packets using the right source)
+  }
+  
+  /* slave being removed should not be active at this point
+@@@ -963,10 -1046,19 +968,26 @@@ static void alb_send_learning_packets(s
+  	/* loop through vlans and send one packet for each */
+  	rcu_read_lock();
+  	netdev_for_each_all_upper_dev_rcu(bond->dev, upper, iter) {
+++<<<<<<< HEAD
+ +		if (upper->priv_flags & IFF_802_1Q_VLAN)
+ +			alb_send_lp_vid(slave, mac_addr,
+ +					vlan_dev_vlan_proto(upper),
+ +					vlan_dev_vlan_id(upper));
+++=======
++ 		if (is_vlan_dev(upper) && vlan_get_encap_level(upper) == 0) {
++ 			if (strict_match &&
++ 			    ether_addr_equal_64bits(mac_addr,
++ 						    upper->dev_addr)) {
++ 				alb_send_lp_vid(slave, mac_addr,
++ 						vlan_dev_vlan_proto(upper),
++ 						vlan_dev_vlan_id(upper));
++ 			} else if (!strict_match) {
++ 				alb_send_lp_vid(slave, upper->dev_addr,
++ 						vlan_dev_vlan_proto(upper),
++ 						vlan_dev_vlan_id(upper));
++ 			}
++ 		}
+++>>>>>>> d0c21d43a5a1 (bonding: Send ALB learning packets using the right source)
+  	}
+  	rcu_read_unlock();
+  }
+@@@ -1025,8 -1117,8 +1046,13 @@@ static void alb_fasten_mac_swap(struct 
+  	ASSERT_RTNL();
+  
+  	/* fasten the change in the switch */
+++<<<<<<< HEAD
+ +	if (bond_slave_can_tx(slave1)) {
+ +		alb_send_learning_packets(slave1, slave1->dev->dev_addr);
+++=======
++ 	if (SLAVE_IS_OK(slave1)) {
++ 		alb_send_learning_packets(slave1, slave1->dev->dev_addr, false);
+++>>>>>>> d0c21d43a5a1 (bonding: Send ALB learning packets using the right source)
+  		if (bond->alb_info.rlb_enabled) {
+  			/* inform the clients that the mac address
+  			 * has changed
+@@@ -1037,8 -1129,8 +1063,13 @@@
+  		disabled_slave = slave1;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (bond_slave_can_tx(slave2)) {
+ +		alb_send_learning_packets(slave2, slave2->dev->dev_addr);
+++=======
++ 	if (SLAVE_IS_OK(slave2)) {
++ 		alb_send_learning_packets(slave2, slave2->dev->dev_addr, false);
+++>>>>>>> d0c21d43a5a1 (bonding: Send ALB learning packets using the right source)
+  		if (bond->alb_info.rlb_enabled) {
+  			/* inform the clients that the mac address
+  			 * has changed
+@@@ -1462,8 -1501,27 +1493,32 @@@ void bond_alb_monitor(struct work_struc
+  
+  	/* send learning packets */
+  	if (bond_info->lp_counter >= BOND_ALB_LP_TICKS(bond)) {
+++<<<<<<< HEAD
+ +		bond_for_each_slave_rcu(bond, slave, iter)
+ +			alb_send_learning_packets(slave, slave->dev->dev_addr);
+++=======
++ 		bool strict_match;
++ 
++ 		/* change of curr_active_slave involves swapping of mac addresses.
++ 		 * in order to avoid this swapping from happening while
++ 		 * sending the learning packets, the curr_slave_lock must be held for
++ 		 * read.
++ 		 */
++ 		read_lock(&bond->curr_slave_lock);
++ 
++ 		bond_for_each_slave_rcu(bond, slave, iter) {
++ 			/* If updating current_active, use all currently
++ 			 * user mac addreses (!strict_match).  Otherwise, only
++ 			 * use mac of the slave device.
++ 			 */
++ 			strict_match = (slave != bond->curr_active_slave);
++ 			alb_send_learning_packets(slave, slave->dev->dev_addr,
++ 						  strict_match);
++ 		}
++ 
++ 		read_unlock(&bond->curr_slave_lock);
++ 
+++>>>>>>> d0c21d43a5a1 (bonding: Send ALB learning packets using the right source)
+  		bond_info->lp_counter = 0;
+  	}
+  
+@@@ -1674,18 -1740,23 +1729,24 @@@ void bond_alb_handle_active_change(stru
+  		alb_fasten_mac_swap(bond, swap_slave, new_slave);
+  	} else {
+  		/* set the new_slave to the bond mac address */
+++<<<<<<< HEAD
+ +		alb_set_slave_mac_addr(new_slave, bond->dev->dev_addr,
+ +				       bond->dev->addr_len);
+ +		alb_send_learning_packets(new_slave, bond->dev->dev_addr);
+++=======
++ 		alb_set_slave_mac_addr(new_slave, bond->dev->dev_addr);
++ 		alb_send_learning_packets(new_slave, bond->dev->dev_addr,
++ 					  false);
+++>>>>>>> d0c21d43a5a1 (bonding: Send ALB learning packets using the right source)
+  	}
+ -
+ -	write_lock_bh(&bond->curr_slave_lock);
+  }
+  
+ -/*
+ - * Called with RTNL
+ - */
+ +/* Called with RTNL */
+  int bond_alb_set_mac_address(struct net_device *bond_dev, void *addr)
+ -	__acquires(&bond->lock)
+ -	__releases(&bond->lock)
+  {
+  	struct bonding *bond = netdev_priv(bond_dev);
+ -	struct sockaddr *sa = addr;
+ +	struct sockaddr_storage *ss = addr;
+ +	struct slave *curr_active;
+  	struct slave *swap_slave;
+  	int res;
+  
+@@@ -1709,18 -1779,19 +1770,24 @@@
+  	swap_slave = bond_slave_has_mac(bond, bond_dev->dev_addr);
+  
+  	if (swap_slave) {
+ -		alb_swap_mac_addr(swap_slave, bond->curr_active_slave);
+ -		alb_fasten_mac_swap(bond, swap_slave, bond->curr_active_slave);
+ +		alb_swap_mac_addr(swap_slave, curr_active);
+ +		alb_fasten_mac_swap(bond, swap_slave, curr_active);
+  	} else {
+ -		alb_set_slave_mac_addr(bond->curr_active_slave, bond_dev->dev_addr);
+ +		alb_set_slave_mac_addr(curr_active, bond_dev->dev_addr,
+ +				       bond_dev->addr_len);
+  
+++<<<<<<< HEAD
+ +		alb_send_learning_packets(curr_active,
+ +					  bond_dev->dev_addr);
+++=======
++ 		read_lock(&bond->lock);
++ 		alb_send_learning_packets(bond->curr_active_slave,
++ 					  bond_dev->dev_addr, false);
+++>>>>>>> d0c21d43a5a1 (bonding: Send ALB learning packets using the right source)
+  		if (bond->alb_info.rlb_enabled) {
+  			/* inform clients mac address has changed */
+ -			rlb_req_update_slave_clients(bond, bond->curr_active_slave);
+ +			rlb_req_update_slave_clients(bond, curr_active);
+  		}
+ -		read_unlock(&bond->lock);
+  	}
+  
+  	return 0;
+* Unmerged path drivers/net/bonding/bond_alb.c
