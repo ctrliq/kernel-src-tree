@@ -1,0 +1,178 @@
+audit: log module name on init_module
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Richard Guy Briggs <rgb@redhat.com>
+commit ca86cad7380e373fa17bc0ee8aff121380323e69
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/ca86cad7.failed
+
+This adds a new auxiliary record MODULE_INIT to the SYSCALL event.
+
+We get finit_module for free since it made most sense to hook this in to
+load_module().
+
+https://github.com/linux-audit/audit-kernel/issues/7
+https://github.com/linux-audit/audit-kernel/wiki/RFE-Module-Load-Record-Format
+
+	Signed-off-by: Richard Guy Briggs <rgb@redhat.com>
+	Acked-by: Jessica Yu <jeyu@redhat.com>
+[PM: corrected links in the commit description]
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit ca86cad7380e373fa17bc0ee8aff121380323e69)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/module.c
+diff --cc kernel/module.c
+index 82f01d69a669,5432dbedf8cf..000000000000
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@@ -60,6 -60,8 +60,11 @@@
+  #include <linux/jump_label.h>
+  #include <linux/pfn.h>
+  #include <linux/bsearch.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/dynamic_debug.h>
++ #include <linux/audit.h>
+++>>>>>>> ca86cad7380e (audit: log module name on init_module)
+  #include <uapi/linux/module.h>
+  #include "module-internal.h"
+  
+@@@ -3461,16 -3668,32 +3468,16 @@@ static int load_module(struct load_inf
+  	if (err)
+  		goto ddebug_cleanup;
+  
+ -	err = prepare_coming_module(mod);
+ -	if (err)
+ -		goto bug_cleanup;
+ -
+  	/* Module is ready to execute: parsing args may do that. */
+ -	after_dashes = parse_args(mod->name, mod->args, mod->kp, mod->num_kp,
+ -				  -32768, 32767, mod,
+ -				  unknown_module_param_cb);
+ -	if (IS_ERR(after_dashes)) {
+ -		err = PTR_ERR(after_dashes);
+ -		goto coming_cleanup;
+ -	} else if (after_dashes) {
+ -		pr_warn("%s: parameters '%s' after `--' ignored\n",
+ -		       mod->name, after_dashes);
+ -	}
+ +	err = parse_args(mod->name, mod->args, mod->kp, mod->num_kp,
+ +			 -32768, 32767, &ddebug_dyndbg_module_param_cb);
+ +	if (err < 0)
+ +		goto bug_cleanup;
+  
+- 	/* Link in to syfs. */
++ 	/* Link in to sysfs. */
+  	err = mod_sysfs_setup(mod, info, mod->kp, mod->num_kp);
+  	if (err < 0)
+ -		goto coming_cleanup;
+ -
+ -	if (is_livepatch_module(mod)) {
+ -		err = copy_module_elf(mod, info);
+ -		if (err < 0)
+ -			goto sysfs_cleanup;
+ -	}
+ +		goto bug_cleanup;
+  
+  	/* Get rid of temporary copy. */
+  	free_copy(info);
+diff --git a/include/linux/audit.h b/include/linux/audit.h
+index f85fdaa5472e..1d2329125f3e 100644
+--- a/include/linux/audit.h
++++ b/include/linux/audit.h
+@@ -230,6 +230,7 @@ extern int __audit_log_bprm_fcaps(struct linux_binprm *bprm,
+ 				  const struct cred *old);
+ extern void __audit_log_capset(pid_t pid, const struct cred *new, const struct cred *old);
+ extern void __audit_mmap_fd(int fd, int flags);
++extern void __audit_log_kern_module(char *name);
+ 
+ static inline void audit_ipc_obj(struct kern_ipc_perm *ipcp)
+ {
+@@ -320,6 +321,12 @@ static inline void audit_mmap_fd(int fd, int flags)
+ 		__audit_mmap_fd(fd, flags);
+ }
+ 
++static inline void audit_log_kern_module(char *name)
++{
++	if (!audit_dummy_context())
++		__audit_log_kern_module(name);
++}
++
+ extern int audit_n_rules;
+ extern int audit_signals;
+ #else /* CONFIG_AUDITSYSCALL */
+@@ -428,6 +435,11 @@ static inline void audit_log_capset(pid_t pid, const struct cred *new,
+ { }
+ static inline void audit_mmap_fd(int fd, int flags)
+ { }
++
++static inline void audit_log_kern_module(char *name)
++{
++}
++
+ static inline void audit_ptrace(struct task_struct *t)
+ { }
+ #define audit_n_rules 0
+diff --git a/include/uapi/linux/audit.h b/include/uapi/linux/audit.h
+index 28459be2d594..52716f6820d0 100644
+--- a/include/uapi/linux/audit.h
++++ b/include/uapi/linux/audit.h
+@@ -110,6 +110,7 @@
+ #define AUDIT_SECCOMP		1326	/* Secure Computing event */
+ #define AUDIT_FEATURE_CHANGE	1328	/* audit log listing feature changes */
+ #define AUDIT_REPLACE		1329	/* Replace auditd if this packet unanswerd */
++#define AUDIT_KERN_MODULE	1330	/* Kernel Module events */
+ 
+ #define AUDIT_AVC		1400	/* SE Linux avc denial or grant */
+ #define AUDIT_SELINUX_ERR	1401	/* Internal SE Linux Errors */
+diff --git a/kernel/audit.h b/kernel/audit.h
+index 18a56271aa9d..43d943942249 100644
+--- a/kernel/audit.h
++++ b/kernel/audit.h
+@@ -207,6 +207,9 @@ struct audit_context {
+ 		struct {
+ 			int			argc;
+ 		} execve;
++		struct {
++			char			*name;
++		} module;
+ 	};
+ 	int fds[2];
+ };
+diff --git a/kernel/auditsc.c b/kernel/auditsc.c
+index ac83ba981708..66b675747e89 100644
+--- a/kernel/auditsc.c
++++ b/kernel/auditsc.c
+@@ -1256,6 +1256,11 @@ static void show_special(struct audit_context *context, int *call_panic)
+ 	case AUDIT_EXECVE: {
+ 		audit_log_execve_info(context, &ab);
+ 		break; }
++	case AUDIT_KERN_MODULE:
++		audit_log_format(ab, "name=");
++		audit_log_untrustedstring(ab, context->module.name);
++		kfree(context->module.name);
++		break;
+ 	}
+ 	audit_log_end(ab);
+ }
+@@ -2297,6 +2302,15 @@ void __audit_mmap_fd(int fd, int flags)
+ 	context->type = AUDIT_MMAP;
+ }
+ 
++void __audit_log_kern_module(char *name)
++{
++	struct audit_context *context = current->audit_context;
++
++	context->module.name = kmalloc(strlen(name) + 1, GFP_KERNEL);
++	strcpy(context->module.name, name);
++	context->type = AUDIT_KERN_MODULE;
++}
++
+ static void audit_log_task(struct audit_buffer *ab)
+ {
+ 	kuid_t auid, uid;
+* Unmerged path kernel/module.c
