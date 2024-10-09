@@ -1209,6 +1209,8 @@ static int tcmu_configure_device(struct se_device *dev)
 	if (udev->dev_config[0])
 		snprintf(str + used, size - used, "/%s", udev->dev_config);
 
+	/* If the old string exists, free it */
+	kfree(info->name);
 	info->name = str;
 
 	udev->data_bitmap = kzalloc(BITS_TO_LONGS(udev->max_blocks) *
