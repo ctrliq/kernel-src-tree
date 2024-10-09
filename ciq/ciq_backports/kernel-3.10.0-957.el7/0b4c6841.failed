@@ -1,0 +1,167 @@
+bpf: use the same condition in perf event set/free bpf handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Yonghong Song <yhs@fb.com>
+commit 0b4c6841fee03e096b735074a0c4aab3a8e92986
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/0b4c6841.failed
+
+This is a cleanup such that doing the same check in
+perf_event_free_bpf_prog as we already do in
+perf_event_set_bpf_prog step.
+
+	Signed-off-by: Yonghong Song <yhs@fb.com>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0b4c6841fee03e096b735074a0c4aab3a8e92986)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index 3da42ad5a6b0,9f78a6825bbe..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -7742,6 -8074,135 +7742,138 @@@ static void perf_event_free_filter(stru
+  	ftrace_profile_free_filter(event);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_BPF_SYSCALL
++ static void bpf_overflow_handler(struct perf_event *event,
++ 				 struct perf_sample_data *data,
++ 				 struct pt_regs *regs)
++ {
++ 	struct bpf_perf_event_data_kern ctx = {
++ 		.data = data,
++ 		.regs = regs,
++ 		.event = event,
++ 	};
++ 	int ret = 0;
++ 
++ 	preempt_disable();
++ 	if (unlikely(__this_cpu_inc_return(bpf_prog_active) != 1))
++ 		goto out;
++ 	rcu_read_lock();
++ 	ret = BPF_PROG_RUN(event->prog, &ctx);
++ 	rcu_read_unlock();
++ out:
++ 	__this_cpu_dec(bpf_prog_active);
++ 	preempt_enable();
++ 	if (!ret)
++ 		return;
++ 
++ 	event->orig_overflow_handler(event, data, regs);
++ }
++ 
++ static int perf_event_set_bpf_handler(struct perf_event *event, u32 prog_fd)
++ {
++ 	struct bpf_prog *prog;
++ 
++ 	if (event->overflow_handler_context)
++ 		/* hw breakpoint or kernel counter */
++ 		return -EINVAL;
++ 
++ 	if (event->prog)
++ 		return -EEXIST;
++ 
++ 	prog = bpf_prog_get_type(prog_fd, BPF_PROG_TYPE_PERF_EVENT);
++ 	if (IS_ERR(prog))
++ 		return PTR_ERR(prog);
++ 
++ 	event->prog = prog;
++ 	event->orig_overflow_handler = READ_ONCE(event->overflow_handler);
++ 	WRITE_ONCE(event->overflow_handler, bpf_overflow_handler);
++ 	return 0;
++ }
++ 
++ static void perf_event_free_bpf_handler(struct perf_event *event)
++ {
++ 	struct bpf_prog *prog = event->prog;
++ 
++ 	if (!prog)
++ 		return;
++ 
++ 	WRITE_ONCE(event->overflow_handler, event->orig_overflow_handler);
++ 	event->prog = NULL;
++ 	bpf_prog_put(prog);
++ }
++ #else
++ static int perf_event_set_bpf_handler(struct perf_event *event, u32 prog_fd)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ static void perf_event_free_bpf_handler(struct perf_event *event)
++ {
++ }
++ #endif
++ 
++ static int perf_event_set_bpf_prog(struct perf_event *event, u32 prog_fd)
++ {
++ 	bool is_kprobe, is_tracepoint, is_syscall_tp;
++ 	struct bpf_prog *prog;
++ 
++ 	if (event->attr.type != PERF_TYPE_TRACEPOINT)
++ 		return perf_event_set_bpf_handler(event, prog_fd);
++ 
++ 	if (event->tp_event->prog)
++ 		return -EEXIST;
++ 
++ 	is_kprobe = event->tp_event->flags & TRACE_EVENT_FL_UKPROBE;
++ 	is_tracepoint = event->tp_event->flags & TRACE_EVENT_FL_TRACEPOINT;
++ 	is_syscall_tp = is_syscall_trace_event(event->tp_event);
++ 	if (!is_kprobe && !is_tracepoint && !is_syscall_tp)
++ 		/* bpf programs can only be attached to u/kprobe or tracepoint */
++ 		return -EINVAL;
++ 
++ 	prog = bpf_prog_get(prog_fd);
++ 	if (IS_ERR(prog))
++ 		return PTR_ERR(prog);
++ 
++ 	if ((is_kprobe && prog->type != BPF_PROG_TYPE_KPROBE) ||
++ 	    (is_tracepoint && prog->type != BPF_PROG_TYPE_TRACEPOINT) ||
++ 	    (is_syscall_tp && prog->type != BPF_PROG_TYPE_TRACEPOINT)) {
++ 		/* valid fd, but invalid bpf program type */
++ 		bpf_prog_put(prog);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (is_tracepoint || is_syscall_tp) {
++ 		int off = trace_event_get_offsets(event->tp_event);
++ 
++ 		if (prog->aux->max_ctx_offset > off) {
++ 			bpf_prog_put(prog);
++ 			return -EACCES;
++ 		}
++ 	}
++ 	event->tp_event->prog = prog;
++ 	event->tp_event->bpf_prog_owner = event;
++ 
++ 	return 0;
++ }
++ 
++ static void perf_event_free_bpf_prog(struct perf_event *event)
++ {
++ 	struct bpf_prog *prog;
++ 
++ 	if (event->attr.type != PERF_TYPE_TRACEPOINT) {
++ 		perf_event_free_bpf_handler(event);
++ 		return;
++ 	}
++ 
++ 	prog = event->tp_event->prog;
++ 	if (prog && event->tp_event->bpf_prog_owner == event) {
++ 		event->tp_event->prog = NULL;
++ 		bpf_prog_put(prog);
++ 	}
++ }
++ 
+++>>>>>>> 0b4c6841fee0 (bpf: use the same condition in perf event set/free bpf handler)
+  #else
+  
+  static inline void perf_tp_register(void)
+* Unmerged path kernel/events/core.c
