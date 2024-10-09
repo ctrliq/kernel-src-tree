@@ -1,0 +1,384 @@
+xfs: rename xfs_defer_join to xfs_defer_ijoin
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit 882d8785fb87f691000a0b33c215364d74bd2ceb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/882d8785.failed
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 882d8785fb87f691000a0b33c215364d74bd2ceb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_bmap.c
+diff --cc fs/xfs/libxfs/xfs_bmap.c
+index a821827ec13e,dcefadd4fc3a..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@@ -5688,3 -6231,321 +5688,324 @@@ del_cursor
+  
+  	return error;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Splits an extent into two extents at split_fsb block such that it is
++  * the first block of the current_ext. @current_ext is a target extent
++  * to be split. @split_fsb is a block where the extents is split.
++  * If split_fsb lies in a hole or the first block of extents, just return 0.
++  */
++ STATIC int
++ xfs_bmap_split_extent_at(
++ 	struct xfs_trans	*tp,
++ 	struct xfs_inode	*ip,
++ 	xfs_fileoff_t		split_fsb,
++ 	xfs_fsblock_t		*firstfsb,
++ 	struct xfs_defer_ops	*dfops)
++ {
++ 	int				whichfork = XFS_DATA_FORK;
++ 	struct xfs_btree_cur		*cur = NULL;
++ 	struct xfs_bmbt_rec_host	*gotp;
++ 	struct xfs_bmbt_irec		got;
++ 	struct xfs_bmbt_irec		new; /* split extent */
++ 	struct xfs_mount		*mp = ip->i_mount;
++ 	struct xfs_ifork		*ifp;
++ 	xfs_fsblock_t			gotblkcnt; /* new block count for got */
++ 	xfs_extnum_t			current_ext;
++ 	int				error = 0;
++ 	int				logflags = 0;
++ 	int				i = 0;
++ 
++ 	if (unlikely(XFS_TEST_ERROR(
++ 	    (XFS_IFORK_FORMAT(ip, whichfork) != XFS_DINODE_FMT_EXTENTS &&
++ 	     XFS_IFORK_FORMAT(ip, whichfork) != XFS_DINODE_FMT_BTREE),
++ 	     mp, XFS_ERRTAG_BMAPIFORMAT))) {
++ 		XFS_ERROR_REPORT("xfs_bmap_split_extent_at",
++ 				 XFS_ERRLEVEL_LOW, mp);
++ 		return -EFSCORRUPTED;
++ 	}
++ 
++ 	if (XFS_FORCED_SHUTDOWN(mp))
++ 		return -EIO;
++ 
++ 	ifp = XFS_IFORK_PTR(ip, whichfork);
++ 	if (!(ifp->if_flags & XFS_IFEXTENTS)) {
++ 		/* Read in all the extents */
++ 		error = xfs_iread_extents(tp, ip, whichfork);
++ 		if (error)
++ 			return error;
++ 	}
++ 
++ 	/*
++ 	 * gotp can be null in 2 cases: 1) if there are no extents
++ 	 * or 2) split_fsb lies in a hole beyond which there are
++ 	 * no extents. Either way, we are done.
++ 	 */
++ 	gotp = xfs_iext_bno_to_ext(ifp, split_fsb, &current_ext);
++ 	if (!gotp)
++ 		return 0;
++ 
++ 	xfs_bmbt_get_all(gotp, &got);
++ 
++ 	/*
++ 	 * Check split_fsb lies in a hole or the start boundary offset
++ 	 * of the extent.
++ 	 */
++ 	if (got.br_startoff >= split_fsb)
++ 		return 0;
++ 
++ 	gotblkcnt = split_fsb - got.br_startoff;
++ 	new.br_startoff = split_fsb;
++ 	new.br_startblock = got.br_startblock + gotblkcnt;
++ 	new.br_blockcount = got.br_blockcount - gotblkcnt;
++ 	new.br_state = got.br_state;
++ 
++ 	if (ifp->if_flags & XFS_IFBROOT) {
++ 		cur = xfs_bmbt_init_cursor(mp, tp, ip, whichfork);
++ 		cur->bc_private.b.firstblock = *firstfsb;
++ 		cur->bc_private.b.dfops = dfops;
++ 		cur->bc_private.b.flags = 0;
++ 		error = xfs_bmbt_lookup_eq(cur, got.br_startoff,
++ 				got.br_startblock,
++ 				got.br_blockcount,
++ 				&i);
++ 		if (error)
++ 			goto del_cursor;
++ 		XFS_WANT_CORRUPTED_GOTO(mp, i == 1, del_cursor);
++ 	}
++ 
++ 	xfs_bmbt_set_blockcount(gotp, gotblkcnt);
++ 	got.br_blockcount = gotblkcnt;
++ 
++ 	logflags = XFS_ILOG_CORE;
++ 	if (cur) {
++ 		error = xfs_bmbt_update(cur, got.br_startoff,
++ 				got.br_startblock,
++ 				got.br_blockcount,
++ 				got.br_state);
++ 		if (error)
++ 			goto del_cursor;
++ 	} else
++ 		logflags |= XFS_ILOG_DEXT;
++ 
++ 	/* Add new extent */
++ 	current_ext++;
++ 	xfs_iext_insert(ip, current_ext, 1, &new, 0);
++ 	XFS_IFORK_NEXT_SET(ip, whichfork,
++ 			   XFS_IFORK_NEXTENTS(ip, whichfork) + 1);
++ 
++ 	if (cur) {
++ 		error = xfs_bmbt_lookup_eq(cur, new.br_startoff,
++ 				new.br_startblock, new.br_blockcount,
++ 				&i);
++ 		if (error)
++ 			goto del_cursor;
++ 		XFS_WANT_CORRUPTED_GOTO(mp, i == 0, del_cursor);
++ 		cur->bc_rec.b.br_state = new.br_state;
++ 
++ 		error = xfs_btree_insert(cur, &i);
++ 		if (error)
++ 			goto del_cursor;
++ 		XFS_WANT_CORRUPTED_GOTO(mp, i == 1, del_cursor);
++ 	}
++ 
++ 	/*
++ 	 * Convert to a btree if necessary.
++ 	 */
++ 	if (xfs_bmap_needs_btree(ip, whichfork)) {
++ 		int tmp_logflags; /* partial log flag return val */
++ 
++ 		ASSERT(cur == NULL);
++ 		error = xfs_bmap_extents_to_btree(tp, ip, firstfsb, dfops,
++ 				&cur, 0, &tmp_logflags, whichfork);
++ 		logflags |= tmp_logflags;
++ 	}
++ 
++ del_cursor:
++ 	if (cur) {
++ 		cur->bc_private.b.allocated = 0;
++ 		xfs_btree_del_cursor(cur,
++ 				error ? XFS_BTREE_ERROR : XFS_BTREE_NOERROR);
++ 	}
++ 
++ 	if (logflags)
++ 		xfs_trans_log_inode(tp, ip, logflags);
++ 	return error;
++ }
++ 
++ int
++ xfs_bmap_split_extent(
++ 	struct xfs_inode        *ip,
++ 	xfs_fileoff_t           split_fsb)
++ {
++ 	struct xfs_mount        *mp = ip->i_mount;
++ 	struct xfs_trans        *tp;
++ 	struct xfs_defer_ops    dfops;
++ 	xfs_fsblock_t           firstfsb;
++ 	int                     error;
++ 
++ 	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_write,
++ 			XFS_DIOSTRAT_SPACE_RES(mp, 0), 0, 0, &tp);
++ 	if (error)
++ 		return error;
++ 
++ 	xfs_ilock(ip, XFS_ILOCK_EXCL);
++ 	xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
++ 
++ 	xfs_defer_init(&dfops, &firstfsb);
++ 
++ 	error = xfs_bmap_split_extent_at(tp, ip, split_fsb,
++ 			&firstfsb, &dfops);
++ 	if (error)
++ 		goto out;
++ 
++ 	error = xfs_defer_finish(&tp, &dfops, NULL);
++ 	if (error)
++ 		goto out;
++ 
++ 	return xfs_trans_commit(tp);
++ 
++ out:
++ 	xfs_defer_cancel(&dfops);
++ 	xfs_trans_cancel(tp);
++ 	return error;
++ }
++ 
++ /* Deferred mapping is only for real extents in the data fork. */
++ static bool
++ xfs_bmap_is_update_needed(
++ 	struct xfs_bmbt_irec	*bmap)
++ {
++ 	return  bmap->br_startblock != HOLESTARTBLOCK &&
++ 		bmap->br_startblock != DELAYSTARTBLOCK;
++ }
++ 
++ /* Record a bmap intent. */
++ static int
++ __xfs_bmap_add(
++ 	struct xfs_mount		*mp,
++ 	struct xfs_defer_ops		*dfops,
++ 	enum xfs_bmap_intent_type	type,
++ 	struct xfs_inode		*ip,
++ 	int				whichfork,
++ 	struct xfs_bmbt_irec		*bmap)
++ {
++ 	int				error;
++ 	struct xfs_bmap_intent		*bi;
++ 
++ 	trace_xfs_bmap_defer(mp,
++ 			XFS_FSB_TO_AGNO(mp, bmap->br_startblock),
++ 			type,
++ 			XFS_FSB_TO_AGBNO(mp, bmap->br_startblock),
++ 			ip->i_ino, whichfork,
++ 			bmap->br_startoff,
++ 			bmap->br_blockcount,
++ 			bmap->br_state);
++ 
++ 	bi = kmem_alloc(sizeof(struct xfs_bmap_intent), KM_SLEEP | KM_NOFS);
++ 	INIT_LIST_HEAD(&bi->bi_list);
++ 	bi->bi_type = type;
++ 	bi->bi_owner = ip;
++ 	bi->bi_whichfork = whichfork;
++ 	bi->bi_bmap = *bmap;
++ 
++ 	error = xfs_defer_ijoin(dfops, bi->bi_owner);
++ 	if (error) {
++ 		kmem_free(bi);
++ 		return error;
++ 	}
++ 
++ 	xfs_defer_add(dfops, XFS_DEFER_OPS_TYPE_BMAP, &bi->bi_list);
++ 	return 0;
++ }
++ 
++ /* Map an extent into a file. */
++ int
++ xfs_bmap_map_extent(
++ 	struct xfs_mount	*mp,
++ 	struct xfs_defer_ops	*dfops,
++ 	struct xfs_inode	*ip,
++ 	struct xfs_bmbt_irec	*PREV)
++ {
++ 	if (!xfs_bmap_is_update_needed(PREV))
++ 		return 0;
++ 
++ 	return __xfs_bmap_add(mp, dfops, XFS_BMAP_MAP, ip,
++ 			XFS_DATA_FORK, PREV);
++ }
++ 
++ /* Unmap an extent out of a file. */
++ int
++ xfs_bmap_unmap_extent(
++ 	struct xfs_mount	*mp,
++ 	struct xfs_defer_ops	*dfops,
++ 	struct xfs_inode	*ip,
++ 	struct xfs_bmbt_irec	*PREV)
++ {
++ 	if (!xfs_bmap_is_update_needed(PREV))
++ 		return 0;
++ 
++ 	return __xfs_bmap_add(mp, dfops, XFS_BMAP_UNMAP, ip,
++ 			XFS_DATA_FORK, PREV);
++ }
++ 
++ /*
++  * Process one of the deferred bmap operations.  We pass back the
++  * btree cursor to maintain our lock on the bmapbt between calls.
++  */
++ int
++ xfs_bmap_finish_one(
++ 	struct xfs_trans		*tp,
++ 	struct xfs_defer_ops		*dfops,
++ 	struct xfs_inode		*ip,
++ 	enum xfs_bmap_intent_type	type,
++ 	int				whichfork,
++ 	xfs_fileoff_t			startoff,
++ 	xfs_fsblock_t			startblock,
++ 	xfs_filblks_t			*blockcount,
++ 	xfs_exntst_t			state)
++ {
++ 	xfs_fsblock_t			firstfsb;
++ 	int				error = 0;
++ 
++ 	/*
++ 	 * firstfsb is tied to the transaction lifetime and is used to
++ 	 * ensure correct AG locking order and schedule work item
++ 	 * continuations.  XFS_BUI_MAX_FAST_EXTENTS (== 1) restricts us
++ 	 * to only making one bmap call per transaction, so it should
++ 	 * be safe to have it as a local variable here.
++ 	 */
++ 	firstfsb = NULLFSBLOCK;
++ 
++ 	trace_xfs_bmap_deferred(tp->t_mountp,
++ 			XFS_FSB_TO_AGNO(tp->t_mountp, startblock), type,
++ 			XFS_FSB_TO_AGBNO(tp->t_mountp, startblock),
++ 			ip->i_ino, whichfork, startoff, *blockcount, state);
++ 
++ 	if (WARN_ON_ONCE(whichfork != XFS_DATA_FORK))
++ 		return -EFSCORRUPTED;
++ 
++ 	if (XFS_TEST_ERROR(false, tp->t_mountp,
++ 			XFS_ERRTAG_BMAP_FINISH_ONE))
++ 		return -EIO;
++ 
++ 	switch (type) {
++ 	case XFS_BMAP_MAP:
++ 		error = xfs_bmapi_remap(tp, ip, startoff, *blockcount,
++ 				startblock, dfops);
++ 		*blockcount = 0;
++ 		break;
++ 	case XFS_BMAP_UNMAP:
++ 		error = __xfs_bunmapi(tp, ip, startoff, blockcount,
++ 				XFS_BMAPI_REMAP, 1, &firstfsb, dfops);
++ 		break;
++ 	default:
++ 		ASSERT(0);
++ 		error = -EFSCORRUPTED;
++ 	}
++ 
++ 	return error;
++ }
+++>>>>>>> 882d8785fb87 (xfs: rename xfs_defer_join to xfs_defer_ijoin)
+* Unmerged path fs/xfs/libxfs/xfs_bmap.c
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 4ea2f068d95c..6c0da24c68c9 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -281,7 +281,7 @@ xfs_defer_has_unfinished_work(
+  * to xfs_defer_finish().
+  */
+ int
+-xfs_defer_join(
++xfs_defer_ijoin(
+ 	struct xfs_defer_ops		*dop,
+ 	struct xfs_inode		*ip)
+ {
+@@ -324,7 +324,7 @@ xfs_defer_finish(
+ 
+ 	trace_xfs_defer_finish((*tp)->t_mountp, dop);
+ 
+-	xfs_defer_join(dop, ip);
++	xfs_defer_ijoin(dop, ip);
+ 
+ 	/* Until we run out of pending work to finish... */
+ 	while (xfs_defer_has_unfinished_work(dop)) {
+diff --git a/fs/xfs/libxfs/xfs_defer.h b/fs/xfs/libxfs/xfs_defer.h
+index 9319f67487ea..eac917053570 100644
+--- a/fs/xfs/libxfs/xfs_defer.h
++++ b/fs/xfs/libxfs/xfs_defer.h
+@@ -74,7 +74,7 @@ int xfs_defer_finish(struct xfs_trans **tp, struct xfs_defer_ops *dop,
+ void xfs_defer_cancel(struct xfs_defer_ops *dop);
+ void xfs_defer_init(struct xfs_defer_ops *dop, xfs_fsblock_t *fbp);
+ bool xfs_defer_has_unfinished_work(struct xfs_defer_ops *dop);
+-int xfs_defer_join(struct xfs_defer_ops *dop, struct xfs_inode *ip);
++int xfs_defer_ijoin(struct xfs_defer_ops *dop, struct xfs_inode *ip);
+ 
+ /* Description of a deferred type. */
+ struct xfs_defer_op_type {
