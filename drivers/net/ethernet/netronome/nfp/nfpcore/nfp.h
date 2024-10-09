@@ -92,6 +92,8 @@ int nfp_nsp_read_identify(struct nfp_nsp *state, void *buf, unsigned int size);
 /* MAC Statistics Accumulator */
 #define NFP_RESOURCE_MAC_STATISTICS	"mac.stat"
 
+int nfp_resource_table_init(struct nfp_cpp *cpp);
+
 struct nfp_resource *
 nfp_resource_acquire(struct nfp_cpp *cpp, const char *name);
 
