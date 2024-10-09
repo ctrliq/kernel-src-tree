@@ -420,7 +420,7 @@ static ssize_t ucma_get_event(struct ucma_file *file, const char __user *inbuf,
 		uevent->resp.id = ctx->id;
 	}
 
-	if (copy_to_user((void __user *)(unsigned long)cmd.response,
+	if (copy_to_user(u64_to_user_ptr(cmd.response),
 			 &uevent->resp,
 			 min_t(size_t, out_len, sizeof(uevent->resp)))) {
 		ret = -EFAULT;
@@ -490,7 +490,7 @@ static ssize_t ucma_create_id(struct ucma_file *file, const char __user *inbuf,
 	}
 
 	resp.id = ctx->id;
-	if (copy_to_user((void __user *)(unsigned long)cmd.response,
+	if (copy_to_user(u64_to_user_ptr(cmd.response),
 			 &resp, sizeof(resp))) {
 		ret = -EFAULT;
 		goto err2;
@@ -620,7 +620,7 @@ static ssize_t ucma_destroy_id(struct ucma_file *file, const char __user *inbuf,
 	}
 
 	resp.events_reported = ucma_free_ctx(ctx);
-	if (copy_to_user((void __user *)(unsigned long)cmd.response,
+	if (copy_to_user(u64_to_user_ptr(cmd.response),
 			 &resp, sizeof(resp)))
 		ret = -EFAULT;
 
@@ -850,7 +850,7 @@ static ssize_t ucma_query_route(struct ucma_file *file,
 		ucma_copy_iw_route(&resp, &ctx->cm_id->route);
 
 out:
-	if (copy_to_user((void __user *)(unsigned long)cmd.response,
+	if (copy_to_user(u64_to_user_ptr(cmd.response),
 			 &resp, sizeof(resp)))
 		ret = -EFAULT;
 
@@ -996,7 +996,7 @@ static ssize_t ucma_query(struct ucma_file *file,
 	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
 		return -EFAULT;
 
-	response = (void __user *)(unsigned long) cmd.response;
+	response = u64_to_user_ptr(cmd.response);
 	ctx = ucma_get_ctx(file, cmd.id);
 	if (IS_ERR(ctx))
 		return PTR_ERR(ctx);
@@ -1184,7 +1184,7 @@ static ssize_t ucma_init_qp_attr(struct ucma_file *file,
 		goto out;
 
 	ib_copy_qp_attr_to_user(ctx->cm_id->device, &resp, &qp_attr);
-	if (copy_to_user((void __user *)(unsigned long)cmd.response,
+	if (copy_to_user(u64_to_user_ptr(cmd.response),
 			 &resp, sizeof(resp)))
 		ret = -EFAULT;
 
@@ -1323,7 +1323,7 @@ static ssize_t ucma_set_option(struct ucma_file *file, const char __user *inbuf,
 	if (unlikely(cmd.optlen > KMALLOC_MAX_SIZE))
 		return -EINVAL;
 
-	optval = memdup_user((void __user *) (unsigned long) cmd.optval,
+	optval = memdup_user(u64_to_user_ptr(cmd.optval),
 			     cmd.optlen);
 	if (IS_ERR(optval)) {
 		ret = PTR_ERR(optval);
@@ -1403,7 +1403,7 @@ static ssize_t ucma_process_join(struct ucma_file *file,
 		goto err2;
 
 	resp.id = mc->id;
-	if (copy_to_user((void __user *)(unsigned long) cmd->response,
+	if (copy_to_user(u64_to_user_ptr(cmd->response),
 			 &resp, sizeof(resp))) {
 		ret = -EFAULT;
 		goto err3;
@@ -1508,7 +1508,7 @@ static ssize_t ucma_leave_multicast(struct ucma_file *file,
 	resp.events_reported = mc->events_reported;
 	kfree(mc);
 
-	if (copy_to_user((void __user *)(unsigned long)cmd.response,
+	if (copy_to_user(u64_to_user_ptr(cmd.response),
 			 &resp, sizeof(resp)))
 		ret = -EFAULT;
 out:
@@ -1595,7 +1595,7 @@ static ssize_t ucma_migrate_id(struct ucma_file *new_file,
 	ucma_unlock_files(cur_file, new_file);
 
 response:
-	if (copy_to_user((void __user *)(unsigned long)cmd.response,
+	if (copy_to_user(u64_to_user_ptr(cmd.response),
 			 &resp, sizeof(resp)))
 		ret = -EFAULT;
 
