@@ -1,0 +1,156 @@
+NFSv4: add flock_owner to open context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author NeilBrown <neilb@suse.com>
+commit 532d4def2f95623a9b8b2cef7723e14521377911
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/532d4def.failed
+
+An open file description (struct file) in a given process can be
+associated with two different lock owners.
+
+It can have a Posix lock owner which will be different in each process
+that has a fd on the file.
+It can have a Flock owner which will be the same in all processes.
+
+When searching for a lock stateid to use, we need to consider both of these
+owners
+
+So add a new "flock_owner" to the "nfs_open_context" (of which there
+is one for each open file description).
+
+This flock_owner does not need to be reference-counted as there is a
+1-1 relation between 'struct file' and nfs open contexts,
+and it will never be part of a list of contexts.  So there is no need
+for a 'flock_context' - just the owner is enough.
+
+The io_count included in the (Posix) lock_context provides no
+guarantee that all read-aheads that could use the state have
+completed, so not supporting it for flock locks in not a serious
+problem.  Synchronization between flock and read-ahead can be added
+later if needed.
+
+When creating an open_context for a non-openning create call, we don't have
+a 'struct file' to pass in, so the lock context gets initialized with
+a NULL owner, but this will never be used.
+
+The flock_owner is not used at all in this patch, that will come later.
+
+	Acked-by: Jeff Layton <jlayton@redhat.com>
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Reviewed-by: Jeff Layton <jlayton@redhat.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+(cherry picked from commit 532d4def2f95623a9b8b2cef7723e14521377911)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/dir.c
+diff --cc fs/nfs/dir.c
+index 63040d0daf01,f1ecfcc632eb..000000000000
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@@ -1530,7 -1543,18 +1530,22 @@@ int nfs_atomic_open(struct inode *dir, 
+  		attr.ia_size = 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	ctx = create_nfs_open_context(dentry, open_flags);
+++=======
++ 	if (!(open_flags & O_CREAT) && !d_in_lookup(dentry)) {
++ 		d_drop(dentry);
++ 		switched = true;
++ 		dentry = d_alloc_parallel(dentry->d_parent,
++ 					  &dentry->d_name, &wq);
++ 		if (IS_ERR(dentry))
++ 			return PTR_ERR(dentry);
++ 		if (unlikely(!d_in_lookup(dentry)))
++ 			return finish_no_open(file, dentry);
++ 	}
++ 
++ 	ctx = create_nfs_open_context(dentry, open_flags, file);
+++>>>>>>> 532d4def2f95 (NFSv4: add flock_owner to open context)
+  	err = PTR_ERR(ctx);
+  	if (IS_ERR(ctx))
+  		goto out;
+* Unmerged path fs/nfs/dir.c
+diff --git a/fs/nfs/inode.c b/fs/nfs/inode.c
+index b119f0855a0c..c99d3ed0e389 100644
+--- a/fs/nfs/inode.c
++++ b/fs/nfs/inode.c
+@@ -814,7 +814,9 @@ void nfs_close_context(struct nfs_open_context *ctx, int is_sync)
+ }
+ EXPORT_SYMBOL_GPL(nfs_close_context);
+ 
+-struct nfs_open_context *alloc_nfs_open_context(struct dentry *dentry, fmode_t f_mode)
++struct nfs_open_context *alloc_nfs_open_context(struct dentry *dentry,
++						fmode_t f_mode,
++						struct file *filp)
+ {
+ 	struct nfs_open_context *ctx;
+ 	struct rpc_cred *cred = rpc_lookup_cred();
+@@ -833,6 +835,7 @@ struct nfs_open_context *alloc_nfs_open_context(struct dentry *dentry, fmode_t f
+ 	ctx->mode = f_mode;
+ 	ctx->flags = 0;
+ 	ctx->error = 0;
++	ctx->flock_owner = (fl_owner_t)filp;
+ 	nfs_init_lock_context(&ctx->lock_context);
+ 	ctx->lock_context.open_context = ctx;
+ 	INIT_LIST_HEAD(&ctx->list);
+@@ -957,7 +960,7 @@ int nfs_open(struct inode *inode, struct file *filp)
+ {
+ 	struct nfs_open_context *ctx;
+ 
+-	ctx = alloc_nfs_open_context(file_dentry(filp), filp->f_mode);
++	ctx = alloc_nfs_open_context(file_dentry(filp), filp->f_mode, filp);
+ 	if (IS_ERR(ctx))
+ 		return PTR_ERR(ctx);
+ 	nfs_file_set_open_context(filp, ctx);
+diff --git a/fs/nfs/nfs4file.c b/fs/nfs/nfs4file.c
+index e696f3725b86..0b9f20bc0c2a 100644
+--- a/fs/nfs/nfs4file.c
++++ b/fs/nfs/nfs4file.c
+@@ -57,7 +57,7 @@ nfs4_file_open(struct inode *inode, struct file *filp)
+ 	parent = dget_parent(dentry);
+ 	dir = parent->d_inode;
+ 
+-	ctx = alloc_nfs_open_context(file_dentry(filp), filp->f_mode);
++	ctx = alloc_nfs_open_context(file_dentry(filp), filp->f_mode, filp);
+ 	err = PTR_ERR(ctx);
+ 	if (IS_ERR(ctx))
+ 		goto out;
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index b211a49fc834..7e6a54c3610e 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -3946,7 +3946,7 @@ nfs4_proc_create(struct inode *dir, struct dentry *dentry, struct iattr *sattr,
+ 	struct nfs4_state *state;
+ 	int status = 0;
+ 
+-	ctx = alloc_nfs_open_context(dentry, FMODE_READ);
++	ctx = alloc_nfs_open_context(dentry, FMODE_READ, NULL);
+ 	if (IS_ERR(ctx))
+ 		return PTR_ERR(ctx);
+ 
+diff --git a/include/linux/nfs_fs.h b/include/linux/nfs_fs.h
+index e7af49321e86..ba1e0eb9e2dd 100644
+--- a/include/linux/nfs_fs.h
++++ b/include/linux/nfs_fs.h
+@@ -71,6 +71,7 @@ struct nfs_lock_context {
+ struct nfs4_state;
+ struct nfs_open_context {
+ 	struct nfs_lock_context lock_context;
++	fl_owner_t flock_owner;
+ 	struct dentry *dentry;
+ 	struct rpc_cred *cred;
+ 	struct nfs4_state *state;
+@@ -365,7 +366,7 @@ extern void nfs_setsecurity(struct inode *inode, struct nfs_fattr *fattr,
+ extern struct nfs_open_context *get_nfs_open_context(struct nfs_open_context *ctx);
+ extern void put_nfs_open_context(struct nfs_open_context *ctx);
+ extern struct nfs_open_context *nfs_find_open_context(struct inode *inode, struct rpc_cred *cred, fmode_t mode);
+-extern struct nfs_open_context *alloc_nfs_open_context(struct dentry *dentry, fmode_t f_mode);
++extern struct nfs_open_context *alloc_nfs_open_context(struct dentry *dentry, fmode_t f_mode, struct file *filp);
+ extern void nfs_inode_attach_open_context(struct nfs_open_context *ctx);
+ extern void nfs_file_set_open_context(struct file *filp, struct nfs_open_context *ctx);
+ extern void nfs_file_clear_open_context(struct file *flip);
