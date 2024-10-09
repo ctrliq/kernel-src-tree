@@ -1,0 +1,301 @@
+bpf: Remove struct bpf_verifier_env argument from print_bpf_insn
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jiri Olsa <jolsa@kernel.org>
+commit abe0884011f1a569bc1254b70c41525b755e8037
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/abe08840.failed
+
+We use print_bpf_insn in user space (bpftool and soon perf),
+so it'd be nice to keep it generic and strip it off the kernel
+struct bpf_verifier_env argument.
+
+This argument can be safely removed, because its users can
+use the struct bpf_insn_cbs::private_data to pass it.
+
+By changing the argument type  we can no longer have clean
+'verbose' alias to 'bpf_verifier_log_write' in verifier.c.
+Instead  we're adding the  'verbose' cb_print callback and
+removing the alias.
+
+This way we have new cb_print callback in place, and all
+the 'verbose(env, ...) calls in verifier.c will cleanly
+cast to 'verbose(void *, ...)' so no other change is
+needed.
+
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit abe0884011f1a569bc1254b70c41525b755e8037)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/disasm.h
+diff --cc kernel/bpf/disasm.h
+index e0857d016f89,e1324a834a24..000000000000
+--- a/kernel/bpf/disasm.h
++++ b/kernel/bpf/disasm.h
+@@@ -29,8 -27,8 +27,13 @@@ extern const char *const bpf_class_stri
+  
+  const char *func_id_name(int id);
+  
+++<<<<<<< HEAD
+ +typedef void (*bpf_insn_print_t)(struct bpf_verifier_env *env,
+ +				 const char *, ...);
+++=======
++ typedef __printf(2, 3) void (*bpf_insn_print_t)(void *private_data,
++ 						const char *, ...);
+++>>>>>>> abe0884011f1 (bpf: Remove struct bpf_verifier_env argument from print_bpf_insn)
+  typedef const char *(*bpf_insn_revmap_call_t)(void *private_data,
+  					      const struct bpf_insn *insn);
+  typedef const char *(*bpf_insn_print_imm_t)(void *private_data,
+diff --git a/kernel/bpf/disasm.c b/kernel/bpf/disasm.c
+index 8740406df2cd..d6b76377cb6e 100644
+--- a/kernel/bpf/disasm.c
++++ b/kernel/bpf/disasm.c
+@@ -113,16 +113,16 @@ static const char *const bpf_jmp_string[16] = {
+ };
+ 
+ static void print_bpf_end_insn(bpf_insn_print_t verbose,
+-			       struct bpf_verifier_env *env,
++			       void *private_data,
+ 			       const struct bpf_insn *insn)
+ {
+-	verbose(env, "(%02x) r%d = %s%d r%d\n", insn->code, insn->dst_reg,
++	verbose(private_data, "(%02x) r%d = %s%d r%d\n",
++		insn->code, insn->dst_reg,
+ 		BPF_SRC(insn->code) == BPF_TO_BE ? "be" : "le",
+ 		insn->imm, insn->dst_reg);
+ }
+ 
+ void print_bpf_insn(const struct bpf_insn_cbs *cbs,
+-		    struct bpf_verifier_env *env,
+ 		    const struct bpf_insn *insn,
+ 		    bool allow_ptr_leaks)
+ {
+@@ -132,23 +132,23 @@ void print_bpf_insn(const struct bpf_insn_cbs *cbs,
+ 	if (class == BPF_ALU || class == BPF_ALU64) {
+ 		if (BPF_OP(insn->code) == BPF_END) {
+ 			if (class == BPF_ALU64)
+-				verbose(env, "BUG_alu64_%02x\n", insn->code);
++				verbose(cbs->private_data, "BUG_alu64_%02x\n", insn->code);
+ 			else
+-				print_bpf_end_insn(verbose, env, insn);
++				print_bpf_end_insn(verbose, cbs->private_data, insn);
+ 		} else if (BPF_OP(insn->code) == BPF_NEG) {
+-			verbose(env, "(%02x) r%d = %s-r%d\n",
++			verbose(cbs->private_data, "(%02x) r%d = %s-r%d\n",
+ 				insn->code, insn->dst_reg,
+ 				class == BPF_ALU ? "(u32) " : "",
+ 				insn->dst_reg);
+ 		} else if (BPF_SRC(insn->code) == BPF_X) {
+-			verbose(env, "(%02x) %sr%d %s %sr%d\n",
++			verbose(cbs->private_data, "(%02x) %sr%d %s %sr%d\n",
+ 				insn->code, class == BPF_ALU ? "(u32) " : "",
+ 				insn->dst_reg,
+ 				bpf_alu_string[BPF_OP(insn->code) >> 4],
+ 				class == BPF_ALU ? "(u32) " : "",
+ 				insn->src_reg);
+ 		} else {
+-			verbose(env, "(%02x) %sr%d %s %s%d\n",
++			verbose(cbs->private_data, "(%02x) %sr%d %s %s%d\n",
+ 				insn->code, class == BPF_ALU ? "(u32) " : "",
+ 				insn->dst_reg,
+ 				bpf_alu_string[BPF_OP(insn->code) >> 4],
+@@ -157,46 +157,46 @@ void print_bpf_insn(const struct bpf_insn_cbs *cbs,
+ 		}
+ 	} else if (class == BPF_STX) {
+ 		if (BPF_MODE(insn->code) == BPF_MEM)
+-			verbose(env, "(%02x) *(%s *)(r%d %+d) = r%d\n",
++			verbose(cbs->private_data, "(%02x) *(%s *)(r%d %+d) = r%d\n",
+ 				insn->code,
+ 				bpf_ldst_string[BPF_SIZE(insn->code) >> 3],
+ 				insn->dst_reg,
+ 				insn->off, insn->src_reg);
+ 		else if (BPF_MODE(insn->code) == BPF_XADD)
+-			verbose(env, "(%02x) lock *(%s *)(r%d %+d) += r%d\n",
++			verbose(cbs->private_data, "(%02x) lock *(%s *)(r%d %+d) += r%d\n",
+ 				insn->code,
+ 				bpf_ldst_string[BPF_SIZE(insn->code) >> 3],
+ 				insn->dst_reg, insn->off,
+ 				insn->src_reg);
+ 		else
+-			verbose(env, "BUG_%02x\n", insn->code);
++			verbose(cbs->private_data, "BUG_%02x\n", insn->code);
+ 	} else if (class == BPF_ST) {
+ 		if (BPF_MODE(insn->code) != BPF_MEM) {
+-			verbose(env, "BUG_st_%02x\n", insn->code);
++			verbose(cbs->private_data, "BUG_st_%02x\n", insn->code);
+ 			return;
+ 		}
+-		verbose(env, "(%02x) *(%s *)(r%d %+d) = %d\n",
++		verbose(cbs->private_data, "(%02x) *(%s *)(r%d %+d) = %d\n",
+ 			insn->code,
+ 			bpf_ldst_string[BPF_SIZE(insn->code) >> 3],
+ 			insn->dst_reg,
+ 			insn->off, insn->imm);
+ 	} else if (class == BPF_LDX) {
+ 		if (BPF_MODE(insn->code) != BPF_MEM) {
+-			verbose(env, "BUG_ldx_%02x\n", insn->code);
++			verbose(cbs->private_data, "BUG_ldx_%02x\n", insn->code);
+ 			return;
+ 		}
+-		verbose(env, "(%02x) r%d = *(%s *)(r%d %+d)\n",
++		verbose(cbs->private_data, "(%02x) r%d = *(%s *)(r%d %+d)\n",
+ 			insn->code, insn->dst_reg,
+ 			bpf_ldst_string[BPF_SIZE(insn->code) >> 3],
+ 			insn->src_reg, insn->off);
+ 	} else if (class == BPF_LD) {
+ 		if (BPF_MODE(insn->code) == BPF_ABS) {
+-			verbose(env, "(%02x) r0 = *(%s *)skb[%d]\n",
++			verbose(cbs->private_data, "(%02x) r0 = *(%s *)skb[%d]\n",
+ 				insn->code,
+ 				bpf_ldst_string[BPF_SIZE(insn->code) >> 3],
+ 				insn->imm);
+ 		} else if (BPF_MODE(insn->code) == BPF_IND) {
+-			verbose(env, "(%02x) r0 = *(%s *)skb[r%d + %d]\n",
++			verbose(cbs->private_data, "(%02x) r0 = *(%s *)skb[r%d + %d]\n",
+ 				insn->code,
+ 				bpf_ldst_string[BPF_SIZE(insn->code) >> 3],
+ 				insn->src_reg, insn->imm);
+@@ -212,12 +212,12 @@ void print_bpf_insn(const struct bpf_insn_cbs *cbs,
+ 			if (map_ptr && !allow_ptr_leaks)
+ 				imm = 0;
+ 
+-			verbose(env, "(%02x) r%d = %s\n",
++			verbose(cbs->private_data, "(%02x) r%d = %s\n",
+ 				insn->code, insn->dst_reg,
+ 				__func_imm_name(cbs, insn, imm,
+ 						tmp, sizeof(tmp)));
+ 		} else {
+-			verbose(env, "BUG_ld_%02x\n", insn->code);
++			verbose(cbs->private_data, "BUG_ld_%02x\n", insn->code);
+ 			return;
+ 		}
+ 	} else if (class == BPF_JMP) {
+@@ -227,35 +227,35 @@ void print_bpf_insn(const struct bpf_insn_cbs *cbs,
+ 			char tmp[64];
+ 
+ 			if (insn->src_reg == BPF_PSEUDO_CALL) {
+-				verbose(env, "(%02x) call pc%s\n",
++				verbose(cbs->private_data, "(%02x) call pc%s\n",
+ 					insn->code,
+ 					__func_get_name(cbs, insn,
+ 							tmp, sizeof(tmp)));
+ 			} else {
+ 				strcpy(tmp, "unknown");
+-				verbose(env, "(%02x) call %s#%d\n", insn->code,
++				verbose(cbs->private_data, "(%02x) call %s#%d\n", insn->code,
+ 					__func_get_name(cbs, insn,
+ 							tmp, sizeof(tmp)),
+ 					insn->imm);
+ 			}
+ 		} else if (insn->code == (BPF_JMP | BPF_JA)) {
+-			verbose(env, "(%02x) goto pc%+d\n",
++			verbose(cbs->private_data, "(%02x) goto pc%+d\n",
+ 				insn->code, insn->off);
+ 		} else if (insn->code == (BPF_JMP | BPF_EXIT)) {
+-			verbose(env, "(%02x) exit\n", insn->code);
++			verbose(cbs->private_data, "(%02x) exit\n", insn->code);
+ 		} else if (BPF_SRC(insn->code) == BPF_X) {
+-			verbose(env, "(%02x) if r%d %s r%d goto pc%+d\n",
++			verbose(cbs->private_data, "(%02x) if r%d %s r%d goto pc%+d\n",
+ 				insn->code, insn->dst_reg,
+ 				bpf_jmp_string[BPF_OP(insn->code) >> 4],
+ 				insn->src_reg, insn->off);
+ 		} else {
+-			verbose(env, "(%02x) if r%d %s 0x%x goto pc%+d\n",
++			verbose(cbs->private_data, "(%02x) if r%d %s 0x%x goto pc%+d\n",
+ 				insn->code, insn->dst_reg,
+ 				bpf_jmp_string[BPF_OP(insn->code) >> 4],
+ 				insn->imm, insn->off);
+ 		}
+ 	} else {
+-		verbose(env, "(%02x) %s\n",
++		verbose(cbs->private_data, "(%02x) %s\n",
+ 			insn->code, bpf_class_string[class]);
+ 	}
+ }
+* Unmerged path kernel/bpf/disasm.h
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 5cb5e92d5f64..f386eebe5549 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -190,23 +190,16 @@ struct bpf_call_arg_meta {
+ 
+ static DEFINE_MUTEX(bpf_verifier_lock);
+ 
+-/* log_level controls verbosity level of eBPF verifier.
+- * bpf_verifier_log_write() is used to dump the verification trace to the log,
+- * so the user can figure out what's wrong with the program
+- */
+-__printf(2, 3) void bpf_verifier_log_write(struct bpf_verifier_env *env,
+-					   const char *fmt, ...)
++static void log_write(struct bpf_verifier_env *env, const char *fmt,
++		      va_list args)
+ {
+ 	struct bpf_verifier_log *log = &env->log;
+ 	unsigned int n;
+-	va_list args;
+ 
+ 	if (!log->level || !log->ubuf || bpf_verifier_log_full(log))
+ 		return;
+ 
+-	va_start(args, fmt);
+ 	n = vscnprintf(log->kbuf, BPF_VERIFIER_TMP_LOG_SIZE, fmt, args);
+-	va_end(args);
+ 
+ 	WARN_ONCE(n >= BPF_VERIFIER_TMP_LOG_SIZE - 1,
+ 		  "verifier log line truncated - local buffer too short\n");
+@@ -219,14 +212,30 @@ __printf(2, 3) void bpf_verifier_log_write(struct bpf_verifier_env *env,
+ 	else
+ 		log->ubuf = NULL;
+ }
+-EXPORT_SYMBOL_GPL(bpf_verifier_log_write);
+-/* Historically bpf_verifier_log_write was called verbose, but the name was too
+- * generic for symbol export. The function was renamed, but not the calls in
+- * the verifier to avoid complicating backports. Hence the alias below.
++
++/* log_level controls verbosity level of eBPF verifier.
++ * bpf_verifier_log_write() is used to dump the verification trace to the log,
++ * so the user can figure out what's wrong with the program
+  */
+-static __printf(2, 3) void verbose(struct bpf_verifier_env *env,
+-				   const char *fmt, ...)
+-	__attribute__((alias("bpf_verifier_log_write")));
++__printf(2, 3) void bpf_verifier_log_write(struct bpf_verifier_env *env,
++					   const char *fmt, ...)
++{
++	va_list args;
++
++	va_start(args, fmt);
++	log_write(env, fmt, args);
++	va_end(args);
++}
++EXPORT_SYMBOL_GPL(bpf_verifier_log_write);
++
++__printf(2, 3) static void verbose(void *private_data, const char *fmt, ...)
++{
++	va_list args;
++
++	va_start(args, fmt);
++	log_write(private_data, fmt, args);
++	va_end(args);
++}
+ 
+ static bool type_is_pkt_pointer(enum bpf_reg_type type)
+ {
+@@ -4618,10 +4627,11 @@ static int do_check(struct bpf_verifier_env *env)
+ 		if (env->log.level) {
+ 			const struct bpf_insn_cbs cbs = {
+ 				.cb_print	= verbose,
++				.private_data	= env,
+ 			};
+ 
+ 			verbose(env, "%d: ", insn_idx);
+-			print_bpf_insn(&cbs, env, insn, env->allow_ptr_leaks);
++			print_bpf_insn(&cbs, insn, env->allow_ptr_leaks);
+ 		}
+ 
+ 		err = ext_analyzer_insn_hook(env, insn_idx, prev_insn_idx);
