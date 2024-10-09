@@ -1,0 +1,181 @@
+tcp/dccp: fix race at listener dismantle phase
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Eric Dumazet <edumazet@google.com>
+commit ebb516af60e18258aac8e80bbe068740ef1579ed
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/ebb516af.failed
+
+Under stress, a close() on a listener can trigger the
+WARN_ON(sk->sk_ack_backlog) in inet_csk_listen_stop()
+
+We need to test if listener is still active before queueing
+a child in inet_csk_reqsk_queue_add()
+
+Create a common inet_child_forget() helper, and use it
+from inet_csk_reqsk_queue_add() and inet_csk_listen_stop()
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ebb516af60e18258aac8e80bbe068740ef1579ed)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/request_sock.h
+#	net/ipv4/inet_connection_sock.c
+diff --cc include/net/request_sock.h
+index 610fa9ea408d,a0dde04eb178..000000000000
+--- a/include/net/request_sock.h
++++ b/include/net/request_sock.h
+@@@ -185,42 -186,20 +185,47 @@@ static inline int reqsk_queue_empty(str
+  	return queue->rskq_accept_head == NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static inline void reqsk_queue_unlink(struct request_sock_queue *queue,
+ +				      struct request_sock *req,
+ +				      struct request_sock **prev_req)
+ +{
+ +	write_lock(&queue->syn_wait_lock);
+ +	*prev_req = req->dl_next;
+ +	write_unlock(&queue->syn_wait_lock);
+ +}
+ +
+ +static inline void reqsk_queue_add(struct request_sock_queue *queue,
+ +				   struct request_sock *req,
+ +				   struct sock *parent,
+ +				   struct sock *child)
+ +{
+ +	req->sk = child;
+ +	sk_acceptq_added(parent);
+ +
+ +	if (queue->rskq_accept_head == NULL)
+ +		queue->rskq_accept_head = req;
+ +	else
+ +		queue->rskq_accept_tail->dl_next = req;
+ +
+ +	queue->rskq_accept_tail = req;
+ +	req->dl_next = NULL;
+ +}
+ +
+ +static inline struct request_sock *reqsk_queue_remove(struct request_sock_queue *queue)
+++=======
++ static inline struct request_sock *reqsk_queue_remove(struct request_sock_queue *queue,
++ 						      struct sock *parent)
+++>>>>>>> ebb516af60e1 (tcp/dccp: fix race at listener dismantle phase)
+  {
+ -	struct request_sock *req;
+ -
+ -	spin_lock_bh(&queue->rskq_lock);
+ -	req = queue->rskq_accept_head;
+ -	if (req) {
+ -		sk_acceptq_removed(parent);
+ -		queue->rskq_accept_head = req->dl_next;
+ -		if (queue->rskq_accept_head == NULL)
+ -			queue->rskq_accept_tail = NULL;
+ -	}
+ -	spin_unlock_bh(&queue->rskq_lock);
+ +	struct request_sock *req = queue->rskq_accept_head;
+ +
+ +	WARN_ON(req == NULL);
+ +
+ +	queue->rskq_accept_head = req->dl_next;
+ +	if (queue->rskq_accept_head == NULL)
+ +		queue->rskq_accept_tail = NULL;
+ +
+  	return req;
+  }
+  
+diff --cc net/ipv4/inet_connection_sock.c
+index 3f406790278d,8430bc8ccd58..000000000000
+--- a/net/ipv4/inet_connection_sock.c
++++ b/net/ipv4/inet_connection_sock.c
+@@@ -825,46 -837,26 +872,54 @@@ void inet_csk_listen_stop(struct sock *
+  		WARN_ON(sock_owned_by_user(child));
+  		sock_hold(child);
+  
+++<<<<<<< HEAD
+ +		sk->sk_prot->disconnect(child, O_NONBLOCK);
+ +
+ +		sock_orphan(child);
+ +
+ +		percpu_counter_inc(sk->sk_prot->orphan_count);
+ +
+ +		if (sk->sk_protocol == IPPROTO_TCP && tcp_rsk(req)->listener) {
+ +			BUG_ON(tcp_sk(child)->fastopen_rsk != req);
+ +			BUG_ON(sk != tcp_rsk(req)->listener);
+ +
+ +			/* Paranoid, to prevent race condition if
+ +			 * an inbound pkt destined for child is
+ +			 * blocked by sock lock in tcp_v4_rcv().
+ +			 * Also to satisfy an assertion in
+ +			 * tcp_v4_destroy_sock().
+ +			 */
+ +			tcp_sk(child)->fastopen_rsk = NULL;
+ +			sock_put(sk);
+ +		}
+ +		inet_csk_destroy_sock(child);
+ +
+++=======
++ 		inet_child_forget(sk, req, child);
+++>>>>>>> ebb516af60e1 (tcp/dccp: fix race at listener dismantle phase)
+  		bh_unlock_sock(child);
+  		local_bh_enable();
+  		sock_put(child);
+  
+++<<<<<<< HEAD
+ +		sk_acceptq_removed(sk);
+ +		__reqsk_free(req);
+++=======
++ 		cond_resched();
+++>>>>>>> ebb516af60e1 (tcp/dccp: fix race at listener dismantle phase)
+  	}
+ -	if (queue->fastopenq.rskq_rst_head) {
+ +	if (queue->fastopenq != NULL) {
+  		/* Free all the reqs queued in rskq_rst_head. */
+ -		spin_lock_bh(&queue->fastopenq.lock);
+ -		req = queue->fastopenq.rskq_rst_head;
+ -		queue->fastopenq.rskq_rst_head = NULL;
+ -		spin_unlock_bh(&queue->fastopenq.lock);
+ -		while (req != NULL) {
+ -			next = req->dl_next;
+ -			reqsk_put(req);
+ -			req = next;
+ +		spin_lock_bh(&queue->fastopenq->lock);
+ +		acc_req = queue->fastopenq->rskq_rst_head;
+ +		queue->fastopenq->rskq_rst_head = NULL;
+ +		spin_unlock_bh(&queue->fastopenq->lock);
+ +		while ((req = acc_req) != NULL) {
+ +			acc_req = req->dl_next;
+ +			__reqsk_free(req);
+  		}
+  	}
+- 	WARN_ON(sk->sk_ack_backlog);
++ 	WARN_ON_ONCE(sk->sk_ack_backlog);
+  }
+  EXPORT_SYMBOL_GPL(inet_csk_listen_stop);
+  
+diff --git a/include/net/inet_connection_sock.h b/include/net/inet_connection_sock.h
+index 06d0d0fec202..73efa0359795 100644
+--- a/include/net/inet_connection_sock.h
++++ b/include/net/inet_connection_sock.h
+@@ -269,13 +269,8 @@ struct dst_entry *inet_csk_route_req(struct sock *sk, struct flowi4 *fl4,
+ struct dst_entry *inet_csk_route_child_sock(struct sock *sk, struct sock *newsk,
+ 					    const struct request_sock *req);
+ 
+-static inline void inet_csk_reqsk_queue_add(struct sock *sk,
+-					    struct request_sock *req,
+-					    struct sock *child)
+-{
+-	reqsk_queue_add(&inet_csk(sk)->icsk_accept_queue, req, sk, child);
+-}
+-
++void inet_csk_reqsk_queue_add(struct sock *sk, struct request_sock *req,
++			      struct sock *child);
+ void inet_csk_reqsk_queue_hash_add(struct sock *sk, struct request_sock *req,
+ 				   unsigned long timeout);
+ 
+* Unmerged path include/net/request_sock.h
+* Unmerged path net/ipv4/inet_connection_sock.c
