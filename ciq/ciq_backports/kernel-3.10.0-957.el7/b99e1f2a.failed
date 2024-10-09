@@ -1,0 +1,212 @@
+Input: libps2 - support retransmission of command data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [input] libps2 - support retransmission of command data (Benjamin Tissoires) [1554926]
+Rebuild_FUZZ: 93.07%
+commit-author Dmitry Torokhov <dmitry.torokhov@gmail.com>
+commit b99e1f2a1a3f4158bed9b9e9e97ac46678d8c2ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b99e1f2a.failed
+
+The devices are allowed to respond to either command byte or command
+parameter with a NAK (0xfe), and the host is supposed to resend the
+"correct" byte. The device then will either respond with ACK or ERR (0xfc).
+Let's teach libps2 to handle the NAK responses properly, so that individual
+drivers do not need to handle them.
+
+	Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+(cherry picked from commit b99e1f2a1a3f4158bed9b9e9e97ac46678d8c2ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/input/serio/libps2.c
+diff --cc drivers/input/serio/libps2.c
+index c43291c1cca4,f05c407b31f3..000000000000
+--- a/drivers/input/serio/libps2.c
++++ b/drivers/input/serio/libps2.c
+@@@ -27,31 -26,79 +27,98 @@@ MODULE_AUTHOR("Dmitry Torokhov <dtor@ma
+  MODULE_DESCRIPTION("PS/2 driver library");
+  MODULE_LICENSE("GPL");
+  
+++<<<<<<< HEAD
+++=======
++ static int ps2_do_sendbyte(struct ps2dev *ps2dev, u8 byte,
++ 			   unsigned int timeout, unsigned int max_attempts)
++ 	__releases(&ps2dev->serio->lock) __acquires(&ps2dev->serio->lock)
++ {
++ 	int attempt = 0;
++ 	int error;
++ 
++ 	lockdep_assert_held(&ps2dev->serio->lock);
++ 
++ 	do {
++ 		ps2dev->nak = 1;
++ 		ps2dev->flags |= PS2_FLAG_ACK;
++ 
++ 		serio_continue_rx(ps2dev->serio);
++ 
++ 		error = serio_write(ps2dev->serio, byte);
++ 		if (error)
++ 			dev_dbg(&ps2dev->serio->dev,
++ 				"failed to write %#02x: %d\n", byte, error);
++ 		else
++ 			wait_event_timeout(ps2dev->wait,
++ 					   !(ps2dev->flags & PS2_FLAG_ACK),
++ 					   msecs_to_jiffies(timeout));
++ 
++ 		serio_pause_rx(ps2dev->serio);
++ 	} while (ps2dev->nak == PS2_RET_NAK && ++attempt < max_attempts);
++ 
++ 	ps2dev->flags &= ~PS2_FLAG_ACK;
++ 
++ 	if (!error) {
++ 		switch (ps2dev->nak) {
++ 		case 0:
++ 			break;
++ 		case PS2_RET_NAK:
++ 			error = -EAGAIN;
++ 			break;
++ 		case PS2_RET_ERR:
++ 			error = -EPROTO;
++ 			break;
++ 		default:
++ 			error = -EIO;
++ 			break;
++ 		}
++ 	}
++ 
++ 	if (error || attempt > 1)
++ 		dev_dbg(&ps2dev->serio->dev,
++ 			"%02x - %d (%x), attempt %d\n",
++ 			byte, error, ps2dev->nak, attempt);
++ 
++ 	return error;
++ }
++ 
+++>>>>>>> b99e1f2a1a3f (Input: libps2 - support retransmission of command data)
+  /*
+   * ps2_sendbyte() sends a byte to the device and waits for acknowledge.
+-  * It doesn't handle retransmission, though it could - because if there
+-  * is a need for retransmissions device has to be replaced anyway.
++  * It doesn't handle retransmission, the caller is expected to handle
++  * it when needed.
+   *
+   * ps2_sendbyte() can only be called from a process context.
+   */
+  
+  int ps2_sendbyte(struct ps2dev *ps2dev, u8 byte, unsigned int timeout)
+  {
+ -	int retval;
+ +	serio_pause_rx(ps2dev->serio);
+ +	ps2dev->nak = 1;
+ +	ps2dev->flags |= PS2_FLAG_ACK;
+ +	serio_continue_rx(ps2dev->serio);
+ +
+++<<<<<<< HEAD
+ +	if (serio_write(ps2dev->serio, byte) == 0)
+ +		wait_event_timeout(ps2dev->wait,
+ +				   !(ps2dev->flags & PS2_FLAG_ACK),
+ +				   msecs_to_jiffies(timeout));
+ +
+ +	serio_pause_rx(ps2dev->serio);
+ +	ps2dev->flags &= ~PS2_FLAG_ACK;
+ +	serio_continue_rx(ps2dev->serio);
+  
+ +	return -ps2dev->nak;
+++=======
++ 	serio_pause_rx(ps2dev->serio);
++ 
++ 	retval = ps2_do_sendbyte(ps2dev, byte, timeout, 1);
++ 	dev_dbg(&ps2dev->serio->dev, "%02x - %x\n", byte, ps2dev->nak);
++ 
++ 	serio_continue_rx(ps2dev->serio);
++ 
++ 	return retval;
+++>>>>>>> b99e1f2a1a3f (Input: libps2 - support retransmission of command data)
+  }
+  EXPORT_SYMBOL(ps2_sendbyte);
+  
+@@@ -187,8 -232,9 +254,8 @@@ int __ps2_command(struct ps2dev *ps2dev
+  	unsigned int timeout;
+  	unsigned int send = (command >> 12) & 0xf;
+  	unsigned int receive = (command >> 8) & 0xf;
+- 	int rc = -1;
++ 	int rc;
+  	int i;
+ -	u8 send_param[16];
+  
+  	if (receive > sizeof(ps2dev->cmdbuf)) {
+  		WARN_ON(1);
+@@@ -197,10 -243,13 +264,11 @@@
+  
+  	if (send && !param) {
+  		WARN_ON(1);
+- 		return -1;
++ 		return -EINVAL;
+  	}
+  
+ -	memcpy(send_param, param, send);
+ -
+  	serio_pause_rx(ps2dev->serio);
++ 
+  	ps2dev->flags = command == PS2_CMD_GETID ? PS2_FLAG_WAITID : 0;
+  	ps2dev->cmdcnt = receive;
+  	if (receive && param)
+@@@ -213,19 -261,19 +280,30 @@@
+  	 * ACKing the reset command, and so it can take a long
+  	 * time before the ACK arrives.
+  	 */
+++<<<<<<< HEAD
+ +	if (ps2_sendbyte(ps2dev, command & 0xff,
+ +			 command == PS2_CMD_RESET_BAT ? 1000 : 200)) {
+ +		serio_pause_rx(ps2dev->serio);
+++=======
++ 	rc = ps2_do_sendbyte(ps2dev, command & 0xff,
++ 			     command == PS2_CMD_RESET_BAT ? 1000 : 200, 2);
++ 	if (rc)
+++>>>>>>> b99e1f2a1a3f (Input: libps2 - support retransmission of command data)
+  		goto out_reset_flags;
+- 	}
+  
+  	for (i = 0; i < send; i++) {
+++<<<<<<< HEAD
+ +		if (ps2_sendbyte(ps2dev, param[i], 200)) {
+ +			serio_pause_rx(ps2dev->serio);
+++=======
++ 		rc = ps2_do_sendbyte(ps2dev, param[i], 200, 2);
++ 		if (rc)
+++>>>>>>> b99e1f2a1a3f (Input: libps2 - support retransmission of command data)
+  			goto out_reset_flags;
+- 		}
+  	}
+  
++ 	serio_continue_rx(ps2dev->serio);
++ 
+  	/*
+  	 * The reset command takes a long time to execute.
+  	 */
+@@@ -256,7 -307,17 +337,21 @@@
+  	ps2dev->flags = 0;
+  	serio_continue_rx(ps2dev->serio);
+  
+++<<<<<<< HEAD
+ +	return rc;
+++=======
++ 	dev_dbg(&ps2dev->serio->dev,
++ 		"%02x [%*ph] - %x/%08lx [%*ph]\n",
++ 		command & 0xff, send, send_param,
++ 		ps2dev->nak, ps2dev->flags,
++ 		receive, param ?: send_param);
++ 
++ 	/*
++ 	 * ps_command() handles resends itself, so do not leak -EAGAIN
++ 	 * to the callers.
++ 	 */
++ 	return rc != -EAGAIN ? rc : -EPROTO;
+++>>>>>>> b99e1f2a1a3f (Input: libps2 - support retransmission of command data)
+  }
+  EXPORT_SYMBOL(__ps2_command);
+  
+* Unmerged path drivers/input/serio/libps2.c
