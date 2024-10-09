@@ -1,0 +1,499 @@
+IB/uverbs: Remove the ib_uverbs_attr pointer from each attr
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Gunthorpe <jgg@mellanox.com>
+commit 6a1f444fefeba392d1232b408aaf5902e33e0982
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/6a1f444f.failed
+
+Memory in the bundle is valuable, do not waste it holding an 8 byte
+pointer for the rare case of writing to a PTR_OUT. We can compute the
+pointer by storing a small 1 byte array offset and the base address of the
+uattr memory in the bundle private memory.
+
+This also means we can access the kernel's copy of the ib_uverbs_attr, so
+drop the copy of flags as well.
+
+Since the uattr base should be private bundle information this also
+de-inlines the already too big uverbs_copy_to inline and moves
+create_udata into uverbs_ioctl.c so they can see the private struct
+definition.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+(cherry picked from commit 6a1f444fefeba392d1232b408aaf5902e33e0982)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/uverbs_ioctl.c
+#	drivers/infiniband/core/uverbs_std_types.c
+#	include/rdma/uverbs_ioctl.h
+diff --cc drivers/infiniband/core/uverbs_ioctl.c
+index ec7b453e622b,f355e938a0b1..000000000000
+--- a/drivers/infiniband/core/uverbs_ioctl.c
++++ b/drivers/infiniband/core/uverbs_ioctl.c
+@@@ -114,9 -123,26 +113,32 @@@ static int uverbs_process_attr(struct i
+  		    uattr->attr_data.reserved)
+  			return -EINVAL;
+  
+++<<<<<<< HEAD
+ +		e->ptr_attr.data = uattr->data;
+ +		e->ptr_attr.len = uattr->len;
+ +		e->ptr_attr.flags = uattr->flags;
+++=======
++ 		e->ptr_attr.uattr_idx = uattr - pbundle->uattrs;
++ 		e->ptr_attr.len = uattr->len;
++ 
++ 		if (val_spec->alloc_and_copy && !uverbs_attr_ptr_is_inline(e)) {
++ 			void *p;
++ 
++ 			p = kvmalloc(uattr->len, GFP_KERNEL);
++ 			if (!p)
++ 				return -ENOMEM;
++ 
++ 			e->ptr_attr.ptr = p;
++ 
++ 			if (copy_from_user(p, u64_to_user_ptr(uattr->data),
++ 					   uattr->len)) {
++ 				kvfree(p);
++ 				return -EFAULT;
++ 			}
++ 		} else {
++ 			e->ptr_attr.data = uattr->data;
++ 		}
+++>>>>>>> 6a1f444fefeb (IB/uverbs: Remove the ib_uverbs_attr pointer from each attr)
+  		break;
+  
+  	case UVERBS_ATTR_TYPE_IDR:
+@@@ -144,11 -176,11 +166,11 @@@
+  		if (IS_ERR(o_attr->uobject))
+  			return PTR_ERR(o_attr->uobject);
+  
+ -		if (spec->u.obj.access == UVERBS_ACCESS_NEW) {
+ -			s64 id = o_attr->uobject->id;
+ +		if (spec->obj.access == UVERBS_ACCESS_NEW) {
+ +			u64 id = o_attr->uobject->id;
+  
+  			/* Copy the allocated id to the user-space */
+- 			if (put_user(id, &e->uattr->data)) {
++ 			if (put_user(id, &uattr_ptr->data)) {
+  				uverbs_finalize_object(o_attr->uobject,
+  						       UVERBS_ACCESS_NEW,
+  						       false);
+@@@ -465,3 -510,116 +487,119 @@@ out
+  
+  	return err;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int uverbs_get_flags64(u64 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		       size_t idx, u64 allowed_bits)
++ {
++ 	const struct uverbs_attr *attr;
++ 	u64 flags;
++ 
++ 	attr = uverbs_attr_get(attrs_bundle, idx);
++ 	/* Missing attribute means 0 flags */
++ 	if (IS_ERR(attr)) {
++ 		*to = 0;
++ 		return 0;
++ 	}
++ 
++ 	/*
++ 	 * New userspace code should use 8 bytes to pass flags, but we
++ 	 * transparently support old userspaces that were using 4 bytes as
++ 	 * well.
++ 	 */
++ 	if (attr->ptr_attr.len == 8)
++ 		flags = attr->ptr_attr.data;
++ 	else if (attr->ptr_attr.len == 4)
++ 		flags = *(u32 *)&attr->ptr_attr.data;
++ 	else
++ 		return -EINVAL;
++ 
++ 	if (flags & ~allowed_bits)
++ 		return -EINVAL;
++ 
++ 	*to = flags;
++ 	return 0;
++ }
++ EXPORT_SYMBOL(uverbs_get_flags64);
++ 
++ int uverbs_get_flags32(u32 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		       size_t idx, u64 allowed_bits)
++ {
++ 	u64 flags;
++ 	int ret;
++ 
++ 	ret = uverbs_get_flags64(&flags, attrs_bundle, idx, allowed_bits);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (flags > U32_MAX)
++ 		return -EINVAL;
++ 	*to = flags;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(uverbs_get_flags32);
++ 
++ /*
++  * This is for ease of conversion. The purpose is to convert all drivers to
++  * use uverbs_attr_bundle instead of ib_udata.  Assume attr == 0 is input and
++  * attr == 1 is output.
++  */
++ void create_udata(struct uverbs_attr_bundle *bundle, struct ib_udata *udata)
++ {
++ 	struct bundle_priv *pbundle =
++ 		container_of(bundle, struct bundle_priv, bundle);
++ 	const struct uverbs_attr *uhw_in =
++ 		uverbs_attr_get(bundle, UVERBS_ATTR_UHW_IN);
++ 	const struct uverbs_attr *uhw_out =
++ 		uverbs_attr_get(bundle, UVERBS_ATTR_UHW_OUT);
++ 
++ 	if (!IS_ERR(uhw_in)) {
++ 		udata->inlen = uhw_in->ptr_attr.len;
++ 		if (uverbs_attr_ptr_is_inline(uhw_in))
++ 			udata->inbuf =
++ 				&pbundle->user_attrs[uhw_in->ptr_attr.uattr_idx]
++ 					 .data;
++ 		else
++ 			udata->inbuf = u64_to_user_ptr(uhw_in->ptr_attr.data);
++ 	} else {
++ 		udata->inbuf = NULL;
++ 		udata->inlen = 0;
++ 	}
++ 
++ 	if (!IS_ERR(uhw_out)) {
++ 		udata->outbuf = u64_to_user_ptr(uhw_out->ptr_attr.data);
++ 		udata->outlen = uhw_out->ptr_attr.len;
++ 	} else {
++ 		udata->outbuf = NULL;
++ 		udata->outlen = 0;
++ 	}
++ }
++ 
++ int uverbs_copy_to(const struct uverbs_attr_bundle *bundle, size_t idx,
++ 		   const void *from, size_t size)
++ {
++ 	struct bundle_priv *pbundle =
++ 		container_of(bundle, struct bundle_priv, bundle);
++ 	const struct uverbs_attr *attr = uverbs_attr_get(bundle, idx);
++ 	u16 flags;
++ 	size_t min_size;
++ 
++ 	if (IS_ERR(attr))
++ 		return PTR_ERR(attr);
++ 
++ 	min_size = min_t(size_t, attr->ptr_attr.len, size);
++ 	if (copy_to_user(u64_to_user_ptr(attr->ptr_attr.data), from, min_size))
++ 		return -EFAULT;
++ 
++ 	flags = pbundle->uattrs[attr->ptr_attr.uattr_idx].flags |
++ 		UVERBS_ATTR_F_VALID_OUTPUT;
++ 	if (put_user(flags,
++ 		     &pbundle->user_attrs[attr->ptr_attr.uattr_idx].flags))
++ 		return -EFAULT;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(uverbs_copy_to);
+++>>>>>>> 6a1f444fefeb (IB/uverbs: Remove the ib_uverbs_attr pointer from each attr)
+diff --cc drivers/infiniband/core/uverbs_std_types.c
+index bd9387aa9ae7,203cc96ac6f5..000000000000
+--- a/drivers/infiniband/core/uverbs_std_types.c
++++ b/drivers/infiniband/core/uverbs_std_types.c
+@@@ -204,110 -210,75 +204,120 @@@ static int uverbs_hot_unplug_completion
+  	return 0;
+  };
+  
+ -int uverbs_destroy_def_handler(struct ib_uverbs_file *file,
+ -			       struct uverbs_attr_bundle *attrs)
+ +/*
+ + * This spec is used in order to pass information to the hardware driver in a
+ + * legacy way. Every verb that could get driver specific data should get this
+ + * spec.
+ + */
+ +const struct uverbs_attr_def uverbs_uhw_compat_in =
+ +	UVERBS_ATTR_PTR_IN_SZ(UVERBS_ATTR_UHW_IN, UVERBS_ATTR_MIN_SIZE(0),
+ +			      UA_FLAGS(UVERBS_ATTR_SPEC_F_MIN_SZ_OR_ZERO));
+ +const struct uverbs_attr_def uverbs_uhw_compat_out =
+ +	UVERBS_ATTR_PTR_OUT_SZ(UVERBS_ATTR_UHW_OUT, UVERBS_ATTR_MIN_SIZE(0),
+ +			       UA_FLAGS(UVERBS_ATTR_SPEC_F_MIN_SZ_OR_ZERO));
+ +
+++<<<<<<< HEAD
+ +void create_udata(struct uverbs_attr_bundle *ctx, struct ib_udata *udata)
+  {
+ -	return 0;
+ +	/*
+ +	 * This is for ease of conversion. The purpose is to convert all drivers
+ +	 * to use uverbs_attr_bundle instead of ib_udata.
+ +	 * Assume attr == 0 is input and attr == 1 is output.
+ +	 */
+ +	const struct uverbs_attr *uhw_in =
+ +		uverbs_attr_get(ctx, UVERBS_ATTR_UHW_IN);
+ +	const struct uverbs_attr *uhw_out =
+ +		uverbs_attr_get(ctx, UVERBS_ATTR_UHW_OUT);
+ +
+ +	if (!IS_ERR(uhw_in)) {
+ +		udata->inlen = uhw_in->ptr_attr.len;
+ +		if (uverbs_attr_ptr_is_inline(uhw_in))
+ +			udata->inbuf = &uhw_in->uattr->data;
+ +		else
+ +			udata->inbuf = u64_to_user_ptr(uhw_in->ptr_attr.data);
+ +	} else {
+ +		udata->inbuf = NULL;
+ +		udata->inlen = 0;
+ +	}
+ +
+ +	if (!IS_ERR(uhw_out)) {
+ +		udata->outbuf = u64_to_user_ptr(uhw_out->ptr_attr.data);
+ +		udata->outlen = uhw_out->ptr_attr.len;
+ +	} else {
+ +		udata->outbuf = NULL;
+ +		udata->outlen = 0;
+ +	}
+  }
+ -EXPORT_SYMBOL(uverbs_destroy_def_handler);
+  
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_COMP_CHANNEL,
+ +			    &UVERBS_TYPE_ALLOC_FD(0,
+ +						  sizeof(struct ib_uverbs_completion_event_file),
+ +						  uverbs_hot_unplug_completion_event_file,
+ +						  &uverbs_event_fops,
+ +						  "[infinibandevent]", O_RDONLY));
+++=======
++ DECLARE_UVERBS_NAMED_OBJECT(
++ 	UVERBS_OBJECT_COMP_CHANNEL,
++ 	UVERBS_TYPE_ALLOC_FD(sizeof(struct ib_uverbs_completion_event_file),
++ 			     uverbs_hot_unplug_completion_event_file,
++ 			     &uverbs_event_fops,
++ 			     "[infinibandevent]",
++ 			     O_RDONLY));
+++>>>>>>> 6a1f444fefeb (IB/uverbs: Remove the ib_uverbs_attr pointer from each attr)
+  
+ -DECLARE_UVERBS_NAMED_OBJECT(
+ -	UVERBS_OBJECT_QP,
+ -	UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uqp_object), uverbs_free_qp));
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_QP,
+ +			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uqp_object), 0,
+ +						      uverbs_free_qp));
+  
+  DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_MW,
+ -			    UVERBS_TYPE_ALLOC_IDR(uverbs_free_mw));
+ +			    &UVERBS_TYPE_ALLOC_IDR(0, uverbs_free_mw));
+  
+ -DECLARE_UVERBS_NAMED_OBJECT(
+ -	UVERBS_OBJECT_SRQ,
+ -	UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_usrq_object),
+ -				 uverbs_free_srq));
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_MR,
+ +			    /* 1 is used in order to free the MR after all the MWs */
+ +			    &UVERBS_TYPE_ALLOC_IDR(1, uverbs_free_mr));
+ +
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_SRQ,
+ +			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_usrq_object), 0,
+ +						      uverbs_free_srq));
+  
+  DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_AH,
+ -			    UVERBS_TYPE_ALLOC_IDR(uverbs_free_ah));
+ +			    &UVERBS_TYPE_ALLOC_IDR(0, uverbs_free_ah));
+  
+ -DECLARE_UVERBS_NAMED_OBJECT(
+ -	UVERBS_OBJECT_FLOW,
+ -	UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uflow_object),
+ -				 uverbs_free_flow));
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_FLOW,
+ +			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uflow_object),
+ +						      0, uverbs_free_flow));
+  
+ -DECLARE_UVERBS_NAMED_OBJECT(
+ -	UVERBS_OBJECT_WQ,
+ -	UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uwq_object), uverbs_free_wq));
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_WQ,
+ +			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uwq_object), 0,
+ +						      uverbs_free_wq));
+  
+  DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_RWQ_IND_TBL,
+ -			    UVERBS_TYPE_ALLOC_IDR(uverbs_free_rwq_ind_tbl));
+ +			    &UVERBS_TYPE_ALLOC_IDR(0, uverbs_free_rwq_ind_tbl));
+  
+ -DECLARE_UVERBS_NAMED_OBJECT(
+ -	UVERBS_OBJECT_XRCD,
+ -	UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uxrcd_object),
+ -				 uverbs_free_xrcd));
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_XRCD,
+ +			    &UVERBS_TYPE_ALLOC_IDR_SZ(sizeof(struct ib_uxrcd_object), 0,
+ +						      uverbs_free_xrcd));
+  
+  DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_PD,
+ -			    UVERBS_TYPE_ALLOC_IDR(uverbs_free_pd));
+ -
+ -DECLARE_UVERBS_GLOBAL_METHODS(UVERBS_OBJECT_DEVICE);
+ -
+ -DECLARE_UVERBS_OBJECT_TREE(uverbs_default_objects,
+ -			   &UVERBS_OBJECT(UVERBS_OBJECT_DEVICE),
+ -			   &UVERBS_OBJECT(UVERBS_OBJECT_PD),
+ -			   &UVERBS_OBJECT(UVERBS_OBJECT_MR),
+ -			   &UVERBS_OBJECT(UVERBS_OBJECT_COMP_CHANNEL),
+ -			   &UVERBS_OBJECT(UVERBS_OBJECT_CQ),
+ -			   &UVERBS_OBJECT(UVERBS_OBJECT_QP),
+ -			   &UVERBS_OBJECT(UVERBS_OBJECT_AH),
+ -			   &UVERBS_OBJECT(UVERBS_OBJECT_MW),
+ -			   &UVERBS_OBJECT(UVERBS_OBJECT_SRQ),
+ -			   &UVERBS_OBJECT(UVERBS_OBJECT_FLOW),
+ -			   &UVERBS_OBJECT(UVERBS_OBJECT_WQ),
+ -			   &UVERBS_OBJECT(UVERBS_OBJECT_RWQ_IND_TBL),
+ -			   &UVERBS_OBJECT(UVERBS_OBJECT_XRCD),
+ -			   &UVERBS_OBJECT(UVERBS_OBJECT_FLOW_ACTION),
+ -			   &UVERBS_OBJECT(UVERBS_OBJECT_DM),
+ -			   &UVERBS_OBJECT(UVERBS_OBJECT_COUNTERS));
+ +			    /* 2 is used in order to free the PD after MRs */
+ +			    &UVERBS_TYPE_ALLOC_IDR(2, uverbs_free_pd));
+ +
+ +DECLARE_UVERBS_NAMED_OBJECT(UVERBS_OBJECT_DEVICE, NULL);
+ +
+ +static DECLARE_UVERBS_OBJECT_TREE(uverbs_default_objects,
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_DEVICE),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_PD),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_MR),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_COMP_CHANNEL),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_CQ),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_QP),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_AH),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_MW),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_SRQ),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_FLOW),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_WQ),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_RWQ_IND_TBL),
+ +				  &UVERBS_OBJECT(UVERBS_OBJECT_XRCD));
+  
+  const struct uverbs_object_tree_def *uverbs_default_get_objects(void)
+  {
+diff --cc include/rdma/uverbs_ioctl.h
+index 2cc45699a237,ecf028446cdf..000000000000
+--- a/include/rdma/uverbs_ioctl.h
++++ b/include/rdma/uverbs_ioctl.h
+@@@ -325,10 -452,16 +325,9 @@@ struct uverbs_object_tree_def 
+   */
+  
+  struct uverbs_ptr_attr {
+ -	/*
+ -	 * If UVERBS_ATTR_SPEC_F_ALLOC_AND_COPY is set then the 'ptr' is
+ -	 * used.
+ -	 */
+ -	union {
+ -		void *ptr;
+ -		u64 data;
+ -	};
+ +	u64		data;
+  	u16		len;
+- 	/* Combination of bits from enum UVERBS_ATTR_F_XXXX */
+- 	u16		flags;
++ 	u16		uattr_idx;
+  	u8		enum_id;
+  };
+  
+@@@ -406,25 -535,38 +400,59 @@@ static inline int uverbs_attr_get_enum_
+  	return attr->ptr_attr.enum_id;
+  }
+  
+++<<<<<<< HEAD
+ +static inline int uverbs_copy_to(const struct uverbs_attr_bundle *attrs_bundle,
+ +				 size_t idx, const void *from, size_t size)
+ +{
+ +	const struct uverbs_attr *attr = uverbs_attr_get(attrs_bundle, idx);
+ +	u16 flags;
+ +	size_t min_size;
+++=======
++ static inline void *uverbs_attr_get_obj(const struct uverbs_attr_bundle *attrs_bundle,
++ 					u16 idx)
++ {
++ 	const struct uverbs_attr *attr;
++ 
++ 	attr = uverbs_attr_get(attrs_bundle, idx);
++ 	if (IS_ERR(attr))
++ 		return ERR_CAST(attr);
++ 
++ 	return attr->obj_attr.uobject->object;
++ }
++ 
++ static inline struct ib_uobject *uverbs_attr_get_uobject(const struct uverbs_attr_bundle *attrs_bundle,
++ 							 u16 idx)
++ {
++ 	const struct uverbs_attr *attr = uverbs_attr_get(attrs_bundle, idx);
++ 
++ 	if (IS_ERR(attr))
++ 		return ERR_CAST(attr);
++ 
++ 	return attr->obj_attr.uobject;
++ }
++ 
++ static inline int
++ uverbs_attr_get_len(const struct uverbs_attr_bundle *attrs_bundle, u16 idx)
++ {
++ 	const struct uverbs_attr *attr = uverbs_attr_get(attrs_bundle, idx);
+++>>>>>>> 6a1f444fefeb (IB/uverbs: Remove the ib_uverbs_attr pointer from each attr)
+  
+  	if (IS_ERR(attr))
+  		return PTR_ERR(attr);
+  
+++<<<<<<< HEAD
+ +	min_size = min_t(size_t, attr->ptr_attr.len, size);
+ +	if (copy_to_user(u64_to_user_ptr(attr->ptr_attr.data), from, min_size))
+ +		return -EFAULT;
+ +
+ +	flags = attr->ptr_attr.flags | UVERBS_ATTR_F_VALID_OUTPUT;
+ +	if (put_user(flags, &attr->uattr->flags))
+ +		return -EFAULT;
+ +
+ +	return 0;
+++=======
++ 	return attr->ptr_attr.len;
+++>>>>>>> 6a1f444fefeb (IB/uverbs: Remove the ib_uverbs_attr pointer from each attr)
+  }
+  
+  static inline bool uverbs_attr_ptr_is_inline(const struct uverbs_attr *attr)
+@@@ -490,6 -644,33 +518,36 @@@ static inline int _uverbs_copy_from_or_
+  #define uverbs_copy_from_or_zero(to, attrs_bundle, idx)			      \
+  	_uverbs_copy_from_or_zero(to, attrs_bundle, idx, sizeof(*to))
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_INFINIBAND_USER_ACCESS)
++ int uverbs_get_flags64(u64 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		       size_t idx, u64 allowed_bits);
++ int uverbs_get_flags32(u32 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		       size_t idx, u64 allowed_bits);
++ int uverbs_copy_to(const struct uverbs_attr_bundle *attrs_bundle, size_t idx,
++ 		   const void *from, size_t size);
++ #else
++ static inline int
++ uverbs_get_flags64(u64 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		   size_t idx, u64 allowed_bits)
++ {
++ 	return -EINVAL;
++ }
++ static inline int
++ uverbs_get_flags32(u32 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		   size_t idx, u64 allowed_bits)
++ {
++ 	return -EINVAL;
++ }
++ static inline int uverbs_copy_to(const struct uverbs_attr_bundle *attrs_bundle,
++ 				 size_t idx, const void *from, size_t size)
++ {
++ 	return -EINVAL;
++ }
++ #endif
++ 
+++>>>>>>> 6a1f444fefeb (IB/uverbs: Remove the ib_uverbs_attr pointer from each attr)
+  /* =================================================
+   *	 Definitions -> Specs infrastructure
+   * =================================================
+* Unmerged path drivers/infiniband/core/uverbs_ioctl.c
+* Unmerged path drivers/infiniband/core/uverbs_std_types.c
+* Unmerged path include/rdma/uverbs_ioctl.h
