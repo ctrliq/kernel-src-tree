@@ -1,0 +1,421 @@
+block: trace completion of all bios.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+Rebuild_CHGLOG: - [md] block: trace completion of all bios (Xiao Ni) [1741466]
+Rebuild_FUZZ: 98.59%
+commit-author NeilBrown <neilb@suse.com>
+commit fbbaf700e7b163a0f1704b2d542ee28be11fce21
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/fbbaf700.failed
+
+Currently only dm and md/raid5 bios trigger
+trace_block_bio_complete().  Now that we have bio_chain() and
+bio_inc_remaining(), it is not possible, in general, for a driver to
+know when the bio is really complete.  Only bio_endio() knows that.
+
+So move the trace_block_bio_complete() call to bio_endio().
+
+Now trace_block_bio_complete() pairs with trace_block_bio_queue().
+Any bio for which a 'queue' event is traced, will subsequently
+generate a 'complete' event.
+
+There are a few cases where completion tracing is not wanted.
+1/ If blk_update_request() has already generated a completion
+   trace event at the 'request' level, there is no point generating
+   one at the bio level too.  In this case the bi_sector and bi_size
+   will have changed, so the bio level event would be wrong
+
+2/ If the bio hasn't actually been queued yet, but is being aborted
+   early, then a trace event could be confusing.  Some filesystems
+   call bio_endio() but do not want tracing.
+
+3/ The bio_integrity code interposes itself by replacing bi_end_io,
+   then restoring it and calling bio_endio() again.  This would produce
+   two identical trace events if left like that.
+
+To handle these, we introduce a flag BIO_TRACE_COMPLETION and only
+produce the trace event when this is set.
+We address point 1 above by clearing the flag in blk_update_request().
+We address point 2 above by only setting the flag when
+generic_make_request() is called.
+We address point 3 above by clearing the flag after generating a
+completion event.
+
+When bio_split() is used on a bio, particularly in blk_queue_split(),
+there is an extra complication.  A new bio is split off the front, and
+may be handle directly without going through generic_make_request().
+The old bio, which has been advanced, is passed to
+generic_make_request(), so it will trigger a trace event a second
+time.
+Probably the best result when a split happens is to see a single
+'queue' event for the whole bio, then multiple 'complete' events - one
+for each component.  To achieve this was can:
+- copy the BIO_TRACE_COMPLETION flag to the new bio in bio_split()
+- avoid generating a 'queue' event if BIO_TRACE_COMPLETION is already set.
+This way, the split-off bio won't create a queue event, the original
+won't either even if it re-submitted to generic_make_request(),
+but both will produce completion events, each for their own range.
+
+So if generic_make_request() is called (which generates a QUEUED
+event), then bi_endio() will create a single COMPLETE event for each
+range that the bio is split into, unless the driver has explicitly
+requested it not to.
+
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit fbbaf700e7b163a0f1704b2d542ee28be11fce21)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm.c
+#	drivers/md/raid5.c
+#	fs/bio.c
+#	include/linux/blk_types.h
+diff --cc drivers/md/dm.c
+index 486ed2cd5cf5,cd93a3b9ceca..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -811,8 -810,8 +811,13 @@@ static void dec_pending(struct dm_io *i
+  			queue_io(md, bio);
+  		} else {
+  			/* done with normal IO or empty flush */
+++<<<<<<< HEAD
+ +			trace_block_bio_complete(md->queue, bio, io_error);
+ +			bio_endio(bio, io_error);
+++=======
++ 			bio->bi_error = io_error;
++ 			bio_endio(bio);
+++>>>>>>> fbbaf700e7b1 (block: trace completion of all bios.)
+  		}
+  	}
+  }
+diff --cc drivers/md/raid5.c
+index fa00e686241a,7aeb9691c2e1..000000000000
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@@ -5212,10 -5030,8 +5212,15 @@@ static void raid5_align_endio(struct bi
+  
+  	rdev_dec_pending(rdev, conf->mddev);
+  
+++<<<<<<< HEAD
+ +	if (!error && uptodate) {
+ +		trace_block_bio_complete(bdev_get_queue(raid_bi->bi_bdev),
+ +					 raid_bi, 0);
+ +		bio_endio(raid_bi, 0);
+++=======
++ 	if (!error) {
++ 		bio_endio(raid_bi);
+++>>>>>>> fbbaf700e7b1 (block: trace completion of all bios.)
+  		if (atomic_dec_and_test(&conf->active_aligned_reads))
+  			wake_up(&conf->wait_for_quiescent);
+  		return;
+diff --cc fs/bio.c
+index 95f8b9565f90,f4d207180266..000000000000
+--- a/fs/bio.c
++++ b/fs/bio.c
+@@@ -1828,143 -1821,85 +1828,174 @@@ static inline bool bio_remaining_done(s
+  /**
+   * bio_endio - end I/O on a bio
+   * @bio:	bio
+ + * @error:	error, if any
+   *
+   * Description:
+++<<<<<<< HEAD:fs/bio.c
+ + *   bio_endio() will end I/O on the whole bio. bio_endio() is the
+ + *   preferred way to end I/O on a bio, it takes care of clearing
+ + *   BIO_UPTODATE on error. @error is 0 on success, and and one of the
+ + *   established -Exxxx (-EIO, for instance) error values in case
+ + *   something went wrong. No one should call bi_end_io() directly on a
+ + *   bio unless they own it and thus know that it has an end_io
+ + *   function.
+++=======
++  *   bio_endio() will end I/O on the whole bio. bio_endio() is the preferred
++  *   way to end I/O on a bio. No one should call bi_end_io() directly on a
++  *   bio unless they own it and thus know that it has an end_io function.
++  *
++  *   bio_endio() can be called several times on a bio that has been chained
++  *   using bio_chain().  The ->bi_end_io() function will only be called the
++  *   last time.  At this point the BLK_TA_COMPLETE tracing event will be
++  *   generated if BIO_TRACE_COMPLETION is set.
+++>>>>>>> fbbaf700e7b1 (block: trace completion of all bios.):block/bio.c
+   **/
+ -void bio_endio(struct bio *bio)
+ +void bio_endio(struct bio *bio, int error)
+  {
+ -again:
+ -	if (!bio_remaining_done(bio))
+ -		return;
+ +	while (bio) {
+ +		if (error)
+ +			clear_bit(BIO_UPTODATE, &bio->bi_flags);
+ +		else if (!test_bit(BIO_UPTODATE, &bio->bi_flags))
+ +			error = -EIO;
+  
+ -	/*
+ -	 * Need to have a real endio function for chained bios, otherwise
+ -	 * various corner cases will break (like stacking block devices that
+ -	 * save/restore bi_end_io) - however, we want to avoid unbounded
+ -	 * recursion and blowing the stack. Tail call optimization would
+ -	 * handle this, but compiling with frame pointers also disables
+ -	 * gcc's sibling call optimization.
+ -	 */
+ -	if (bio->bi_end_io == bio_chain_endio) {
+ -		bio = __bio_chain_endio(bio);
+ -		goto again;
+ +		if (unlikely(!bio_remaining_done(bio)))
+ +			break;
+ +
+ +		/*
+ +		 * Need to have a real endio function for chained bios,
+ +		 * otherwise various corner cases will break (like stacking
+ +		 * block devices that save/restore bi_end_io) - however, we want
+ +		 * to avoid unbounded recursion and blowing the stack. Tail call
+ +		 * optimization would handle this, but compiling with frame
+ +		 * pointers also disables gcc's sibling call optimization.
+ +		 */
+ +		if (bio->bi_end_io == bio_chain_endio) {
+ +			struct bio *parent = bio->bi_private;
+ +			bio_put(bio);
+ +			bio = parent;
+ +		} else {
+ +			if (bio->bi_end_io)
+ +				bio->bi_end_io(bio, error);
+ +			bio = NULL;
+ +		}
+  	}
+++<<<<<<< HEAD:fs/bio.c
+++=======
++ 
++ 	if (bio->bi_bdev && bio_flagged(bio, BIO_TRACE_COMPLETION)) {
++ 		trace_block_bio_complete(bdev_get_queue(bio->bi_bdev),
++ 					 bio, bio->bi_error);
++ 		bio_clear_flag(bio, BIO_TRACE_COMPLETION);
++ 	}
++ 
++ 	blk_throtl_bio_endio(bio);
++ 	if (bio->bi_end_io)
++ 		bio->bi_end_io(bio);
+++>>>>>>> fbbaf700e7b1 (block: trace completion of all bios.):block/bio.c
+  }
+  EXPORT_SYMBOL(bio_endio);
+  
+ -/**
+ - * bio_split - split a bio
+ - * @bio:	bio to split
+ - * @sectors:	number of sectors to split from the front of @bio
+ - * @gfp:	gfp mask
+ - * @bs:		bio set to allocate from
+ - *
+ - * Allocates and returns a new bio which represents @sectors from the start of
+ - * @bio, and updates @bio to represent the remaining sectors.
+ - *
+ - * Unless this is a discard request the newly allocated bio will point
+ - * to @bio's bi_io_vec; it is the caller's responsibility to ensure that
+ - * @bio is not freed before the split.
+ +void bio_pair_release(struct bio_pair *bp)
+ +{
+ +	if (atomic_dec_and_test(&bp->cnt)) {
+ +		struct bio *master = bp->bio1.bi_private;
+ +
+ +		bio_endio(master, bp->error);
+ +		mempool_free(bp, bp->bio2.bi_private);
+ +	}
+ +}
+ +EXPORT_SYMBOL(bio_pair_release);
+ +
+ +static void bio_pair_end_1(struct bio *bi, int err)
+ +{
+ +	struct bio_pair *bp = container_of(bi, struct bio_pair, bio1);
+ +
+ +	if (err)
+ +		bp->error = err;
+ +
+ +	/*
+ +	 * If the integrity payload was created for this bio (and not
+ +	 * split from the parent), then go ahead and free it.
+ +	 */
+ +	if (bio_integrity(bi) && bi->bi_integrity != &bp->bip2)
+ +	        bio_integrity_free(bi);
+ +
+ +	bio_pair_release(bp);
+ +}
+ +
+++<<<<<<< HEAD:fs/bio.c
+ +static void bio_pair_end_2(struct bio *bi, int err)
+ +{
+ +	struct bio_pair *bp = container_of(bi, struct bio_pair, bio2);
+ +
+ +	if (err)
+ +		bp->error = err;
+ +
+ +	/*
+ +	 * If the integrity payload was created for this bio (and not
+ +	 * split from the parent), then go ahead and free it.
+ +	 */
+ +	if (bio_integrity(bi) && bi->bi_integrity != &bp->bip1)
+ +	        bio_integrity_free(bi);
+ +
+ +	bio_pair_release(bp);
+ +}
+ +
+ +/*
+ + * split a bio - only worry about a bio with a single page in its iovec
+   */
+ -struct bio *bio_split(struct bio *bio, int sectors,
+ -		      gfp_t gfp, struct bio_set *bs)
+ +struct bio_pair *bio_split(struct bio *bi, int first_sectors)
+  {
+ -	struct bio *split = NULL;
+ +	struct bio_pair *bp = mempool_alloc(bio_split_pool, GFP_NOIO);
+  
+ -	BUG_ON(sectors <= 0);
+ -	BUG_ON(sectors >= bio_sectors(bio));
+ +	if (!bp)
+ +		return bp;
+  
+ -	split = bio_clone_fast(bio, gfp, bs);
+ -	if (!split)
+ -		return NULL;
+ +	trace_block_split(bdev_get_queue(bi->bi_bdev), bi,
+ +				bi->bi_sector + first_sectors);
+ +
+ +	BUG_ON(bio_segments(bi) > 1);
+ +	atomic_set(&bp->cnt, 3);
+ +	bp->error = 0;
+ +	bp->bio1 = *bi;
+ +	bp->bio2 = *bi;
+ +	bp->bio2.bi_sector += first_sectors;
+ +	bp->bio2.bi_size -= first_sectors << 9;
+ +	bp->bio1.bi_size = first_sectors << 9;
+  
+ -	split->bi_iter.bi_size = sectors << 9;
+ +	if (bi->bi_vcnt != 0) {
+ +		bp->bv1 = *bio_iovec(bi);
+ +		bp->bv2 = *bio_iovec(bi);
+  
+ -	if (bio_integrity(split))
+ -		bio_integrity_trim(split, 0, sectors);
+ +		if (bio_is_rw(bi)) {
+ +			bp->bv2.bv_offset += first_sectors << 9;
+ +			bp->bv2.bv_len -= first_sectors << 9;
+ +			bp->bv1.bv_len = first_sectors << 9;
+ +		}
+  
+ -	bio_advance(bio, split->bi_iter.bi_size);
+ +		bp->bio1.bi_io_vec = &bp->bv1;
+ +		bp->bio2.bi_io_vec = &bp->bv2;
+  
+ +		bp->bio1.bi_max_vecs = 1;
+ +		bp->bio2.bi_max_vecs = 1;
+ +	}
+ +
+ +	bp->bio1.bi_end_io = bio_pair_end_1;
+ +	bp->bio2.bi_end_io = bio_pair_end_2;
+ +
+ +	bp->bio1.bi_private = bi;
+ +	bp->bio2.bi_private = bio_split_pool;
+ +
+ +	if (bio_integrity(bi))
+ +		bio_integrity_split(bi, bp, first_sectors);
+ +
+ +	return bp;
+++=======
++ 	if (bio_flagged(bio, BIO_TRACE_COMPLETION))
++ 		bio_set_flag(bio, BIO_TRACE_COMPLETION);
++ 
++ 	return split;
+++>>>>>>> fbbaf700e7b1 (block: trace completion of all bios.):block/bio.c
+  }
+  EXPORT_SYMBOL(bio_split);
+  
+diff --cc include/linux/blk_types.h
+index a78cedbfc79d,72aa9519167e..000000000000
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@@ -125,17 -100,38 +125,52 @@@ struct bio 
+  /*
+   * bio flags
+   */
+++<<<<<<< HEAD
+ +#define BIO_UPTODATE	0	/* ok after I/O completion */
+ +#define BIO_SEG_VALID	3	/* bi_phys_segments valid */
+ +#define BIO_CLONED	4	/* doesn't own data */
+ +#define BIO_BOUNCED	5	/* bio is a bounce bio */
+ +#define BIO_USER_MAPPED 6	/* contains user pages */
+ +#define BIO_EOPNOTSUPP	7	/* not supported */
+ +#define BIO_NULL_MAPPED 8	/* contains invalid user pages */
+ +#define BIO_FS_INTEGRITY 9	/* fs owns integrity data, not block layer */
+ +#define BIO_QUIET	10	/* Make BIO Quiet */
+ +#define BIO_MAPPED_INTEGRITY 11/* integrity metadata has been remapped */
+ +#define BIO_SNAP_STABLE	12	/* bio data must be snapshotted during write */
+++=======
++ #define BIO_SEG_VALID	1	/* bi_phys_segments valid */
++ #define BIO_CLONED	2	/* doesn't own data */
++ #define BIO_BOUNCED	3	/* bio is a bounce bio */
++ #define BIO_USER_MAPPED 4	/* contains user pages */
++ #define BIO_NULL_MAPPED 5	/* contains invalid user pages */
++ #define BIO_QUIET	6	/* Make BIO Quiet */
++ #define BIO_CHAIN	7	/* chained bio, ->bi_remaining in effect */
++ #define BIO_REFFED	8	/* bio has elevated ->bi_cnt */
++ #define BIO_THROTTLED	9	/* This bio has already been subjected to
++ 				 * throttling rules. Don't do it again. */
++ #define BIO_TRACE_COMPLETION 10	/* bio_endio() should trace the final completion
++ 				 * of this bio. */
++ /* See BVEC_POOL_OFFSET below before adding new flags */
++ 
++ /*
++  * We support 6 different bvec pools, the last one is magic in that it
++  * is backed by a mempool.
++  */
++ #define BVEC_POOL_NR		6
++ #define BVEC_POOL_MAX		(BVEC_POOL_NR - 1)
++ 
++ /*
++  * Top 3 bits of bio flags indicate the pool the bvecs came from.  We add
++  * 1 to the actual index so that 0 indicates that there are no bvecs to be
++  * freed.
++  */
++ #define BVEC_POOL_BITS		(3)
++ #define BVEC_POOL_OFFSET	(16 - BVEC_POOL_BITS)
++ #define BVEC_POOL_IDX(bio)	((bio)->bi_flags >> BVEC_POOL_OFFSET)
++ #if (1<< BVEC_POOL_BITS) < (BVEC_POOL_NR+1)
++ # error "BVEC_POOL_BITS is too small"
++ #endif
+++>>>>>>> fbbaf700e7b1 (block: trace completion of all bios.)
+  
+  /*
+   * Flags starting here get preserved by bio_reset() - this includes
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 69bedfcb8ccc..eb1c1ad10342 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -2190,7 +2190,13 @@ generic_make_request_checks(struct bio *bio)
+ 	if (blk_throtl_bio(q, bio))
+ 		return false;	/* throttled, will be resubmitted later */
+ 
+-	trace_block_bio_queue(q, bio);
++	if (!bio_flagged(bio, BIO_TRACE_COMPLETION)) {
++		trace_block_bio_queue(q, bio);
++		/* Now that enqueuing has been traced, we need to trace
++		 * completion as well.
++		 */
++		bio_set_flag(bio, BIO_TRACE_COMPLETION);
++	}
+ 	return true;
+ 
+ end_io:
+@@ -2877,6 +2883,8 @@ bool blk_update_request(struct request *req, int error, unsigned int nr_bytes)
+ 		if (bio_bytes == bio->bi_size)
+ 			req->bio = bio->bi_next;
+ 
++		/* Completion has already been traced */
++		bio_clear_flag(bio, BIO_TRACE_COMPLETION);
+ 		req_bio_endio(req, bio, bio_bytes, error);
+ 
+ 		total_bytes += bio_bytes;
+* Unmerged path drivers/md/dm.c
+* Unmerged path drivers/md/raid5.c
+* Unmerged path fs/bio.c
+* Unmerged path include/linux/blk_types.h
