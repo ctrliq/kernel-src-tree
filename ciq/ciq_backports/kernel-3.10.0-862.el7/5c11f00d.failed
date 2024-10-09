@@ -1,0 +1,151 @@
+ixgbe: do not use adapter->num_vfs when setting VFs via module parameter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Emil Tantilov <emil.s.tantilov@intel.com>
+commit 5c11f00ddac2c030827cdecf9c2d3678cbd3137b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5c11f00d.failed
+
+Avoid setting adapter->num_vfs early in the init code path when
+using the max_vfs module parameter by passing it to ixgbe_enable_sriov()
+as a function parameter.
+
+This fixes an issue where if we failed to allocate vfinfo in
+__ixgbe_enable_sriov() the driver will crash with NULL pointer in
+ixgbe_disable_sriov() when attempting to free the vfinfo struct based
+on adapter->num_vfs. Also it cleans up the assignment of adapter->num_vfs
+since now it will only be set in __ixgbe_enable_sriov() and cleared in
+ixgbe_disable_sriov().
+
+	Signed-off-by: Emil Tantilov <emil.s.tantilov@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 5c11f00ddac2c030827cdecf9c2d3678cbd3137b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+#	drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.c
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index f7b672b27dbd,dcc8a5c26276..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@@ -5981,11 -5949,18 +5981,21 @@@ static int ixgbe_sw_init(struct ixgbe_a
+  	hw->fc.disable_fc_autoneg = ixgbe_device_supports_autoneg_fc(hw);
+  
+  #ifdef CONFIG_PCI_IOV
+ -	if (max_vfs > 0)
+ -		e_dev_warn("Enabling SR-IOV VFs using the max_vfs module parameter is deprecated - please use the pci sysfs interface instead.\n");
+ -
+  	/* assign number of SR-IOV VFs */
+++<<<<<<< HEAD
+ +	if (hw->mac.type != ixgbe_mac_82598EB)
+ +		adapter->num_vfs = (max_vfs > IXGBE_MAX_VFS_DRV_LIMIT) ? 0 : max_vfs;
+++=======
++ 	if (hw->mac.type != ixgbe_mac_82598EB) {
++ 		if (max_vfs > IXGBE_MAX_VFS_DRV_LIMIT) {
++ 			max_vfs = 0;
++ 			e_dev_warn("max_vfs parameter out of range. Not assigning any SR-IOV VFs\n");
++ 		}
++ 	}
++ #endif /* CONFIG_PCI_IOV */
+++>>>>>>> 5c11f00ddac2 (ixgbe: do not use adapter->num_vfs when setting VFs via module parameter)
+  
+ +#endif
+  	/* enable itr by default in dynamic mode */
+  	adapter->rx_itr_setting = 1;
+  	adapter->tx_itr_setting = 1;
+diff --cc drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.c
+index c6bd5ca3f938,102ca937ddb4..000000000000
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.c
+@@@ -172,18 -173,15 +173,19 @@@ static void ixgbe_get_vfs(struct ixgbe_
+  /* Note this function is called when the user wants to enable SR-IOV
+   * VFs using the now deprecated module parameter
+   */
+- void ixgbe_enable_sriov(struct ixgbe_adapter *adapter)
++ void ixgbe_enable_sriov(struct ixgbe_adapter *adapter, unsigned int max_vfs)
+  {
+  	int pre_existing_vfs = 0;
++ 	unsigned int num_vfs;
+  
+  	pre_existing_vfs = pci_num_vf(adapter->pdev);
+- 	if (!pre_existing_vfs && !adapter->num_vfs)
++ 	if (!pre_existing_vfs && !max_vfs)
+  		return;
+  
+ +	if (!pre_existing_vfs)
+ +		dev_warn(&adapter->pdev->dev,
+ +			 "Enabling SR-IOV VFs using the module parameter is deprecated - please use the pci sysfs interface.\n");
+ +
+  	/* If there are pre-existing VFs then we have to force
+  	 * use of that many - over ride any module parameter value.
+  	 * This may result from the user unloading the PF driver
+@@@ -319,18 -318,38 +320,37 @@@ static int ixgbe_pci_sriov_enable(struc
+  	if (err)
+  		return err;
+  
+ -	/* While the SR-IOV capability structure reports total VFs to be 64,
+ -	 * we limit the actual number allocated as below based on two factors.
+ -	 *    Num_TCs	MAX_VFs
+ -	 *	1	  63
+ -	 *	<=4	  31
+ -	 *	>4	  15
+ -	 * First, we reserve some transmit/receive resources for the PF.
+ -	 * Second, VMDQ also uses the same pools that SR-IOV does. We need to
+ -	 * account for this, so that we don't accidentally allocate more VFs
+ -	 * than we have available pools. The PCI bus driver already checks for
+ -	 * other values out of range.
+ +	/* While the SR-IOV capability structure reports total VFs to be
+ +	 * 64 we limit the actual number that can be allocated to 63 so
+ +	 * that some transmit/receive resources can be reserved to the
+ +	 * PF.  The PCI bus driver already checks for other values out of
+ +	 * range.
+  	 */
+ -	num_tc = netdev_get_num_tc(adapter->netdev);
+ +	if (num_vfs > IXGBE_MAX_VFS_DRV_LIMIT)
+ +		return -EPERM;
+  
+++<<<<<<< HEAD
+ +	adapter->num_vfs = num_vfs;
+++=======
++ 	if (num_tc > 4) {
++ 		if ((num_vfs + adapter->num_rx_pools) > IXGBE_MAX_VFS_8TC) {
++ 			e_dev_err("Currently the device is configured with %d TCs, Creating more than %d VFs is not allowed\n", num_tc, IXGBE_MAX_VFS_8TC);
++ 			return -EPERM;
++ 		}
++ 	} else if ((num_tc > 1) && (num_tc <= 4)) {
++ 		if ((num_vfs + adapter->num_rx_pools) > IXGBE_MAX_VFS_4TC) {
++ 			e_dev_err("Currently the device is configured with %d TCs, Creating more than %d VFs is not allowed\n", num_tc, IXGBE_MAX_VFS_4TC);
++ 			return -EPERM;
++ 		}
++ 	} else {
++ 		if ((num_vfs + adapter->num_rx_pools) > IXGBE_MAX_VFS_1TC) {
++ 			e_dev_err("Currently the device is configured with %d TCs, Creating more than %d VFs is not allowed\n", num_tc, IXGBE_MAX_VFS_1TC);
++ 			return -EPERM;
++ 		}
++ 	}
+++>>>>>>> 5c11f00ddac2 (ixgbe: do not use adapter->num_vfs when setting VFs via module parameter)
+  
+- 	err = __ixgbe_enable_sriov(adapter);
++ 	err = __ixgbe_enable_sriov(adapter, num_vfs);
+  	if (err)
+  		return  err;
+  
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+* Unmerged path drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.c
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.h b/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.h
+index 0c7977d27b71..943777af88d8 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_sriov.h
+@@ -56,7 +56,7 @@ int ixgbe_ndo_get_vf_config(struct net_device *netdev,
+ void ixgbe_check_vf_rate_limit(struct ixgbe_adapter *adapter);
+ int ixgbe_disable_sriov(struct ixgbe_adapter *adapter);
+ #ifdef CONFIG_PCI_IOV
+-void ixgbe_enable_sriov(struct ixgbe_adapter *adapter);
++void ixgbe_enable_sriov(struct ixgbe_adapter *adapter, unsigned int max_vfs);
+ #endif
+ int ixgbe_pci_sriov_configure(struct pci_dev *dev, int num_vfs);
+ 
