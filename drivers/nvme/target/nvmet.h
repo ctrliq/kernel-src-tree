@@ -116,6 +116,7 @@ struct nvmet_ctrl {
 	u32			cc;
 	u32			csts;
 
+	uuid_t			hostid;
 	u16			cntlid;
 	u32			kato;
 
