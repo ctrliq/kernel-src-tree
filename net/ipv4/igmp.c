@@ -1259,7 +1259,8 @@ static void igmp_group_added(struct ip_mc_list *im)
 /*
  *	A socket has joined a multicast group on device dev.
  */
-void __ip_mc_inc_group(struct in_device *in_dev, __be32 addr, unsigned int mode)
+static void __ip_mc_inc_group(struct in_device *in_dev, __be32 addr,
+			      unsigned int mode)
 {
 	struct ip_mc_list *im;
 
