@@ -1492,7 +1492,8 @@ int ceph_readdir_prepopulate(struct ceph_mds_request *req,
 			ceph_fill_dirfrag(parent->d_inode, rinfo->dir_dir);
 	}
 
-	if (ceph_frag_is_leftmost(frag) && req->r_readdir_offset == 2) {
+	if (ceph_frag_is_leftmost(frag) && req->r_readdir_offset == 2 &&
+	    !(rinfo->hash_order && req->r_path2)) {
 		/* note dir version at start of readdir so we can tell
 		 * if any dentries get dropped */
 		struct ceph_inode_info *ci = ceph_inode(parent->d_inode);
