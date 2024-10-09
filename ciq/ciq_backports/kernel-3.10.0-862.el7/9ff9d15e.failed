@@ -1,0 +1,118 @@
+target: Invoke release_cmd() callback without holding a spinlock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Invoke release_cmd() callback without holding a spinlock (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 93.33%
+commit-author Bart Van Assche <bart.vanassche@sandisk.com>
+commit 9ff9d15eddd13ecdd41876c5e1f31ddbb127101c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9ff9d15e.failed
+
+This patch fixes the following kernel warning because it avoids that
+IRQs are disabled while ft_release_cmd() is invoked (fc_seq_set_resp()
+invokes spin_unlock_bh()):
+
+WARNING: CPU: 3 PID: 117 at kernel/softirq.c:150 __local_bh_enable_ip+0xaa/0x110()
+Call Trace:
+ [<ffffffff814f71eb>] dump_stack+0x4f/0x7b
+ [<ffffffff8105e56a>] warn_slowpath_common+0x8a/0xc0
+ [<ffffffff8105e65a>] warn_slowpath_null+0x1a/0x20
+ [<ffffffff81062b2a>] __local_bh_enable_ip+0xaa/0x110
+ [<ffffffff814ff229>] _raw_spin_unlock_bh+0x39/0x40
+ [<ffffffffa03a7f94>] fc_seq_set_resp+0xe4/0x100 [libfc]
+ [<ffffffffa02e604a>] ft_free_cmd+0x4a/0x90 [tcm_fc]
+ [<ffffffffa02e6972>] ft_release_cmd+0x12/0x20 [tcm_fc]
+ [<ffffffffa042bd66>] target_release_cmd_kref+0x56/0x90 [target_core_mod]
+ [<ffffffffa042caf0>] target_put_sess_cmd+0xc0/0x110 [target_core_mod]
+ [<ffffffffa042cb81>] transport_release_cmd+0x41/0x70 [target_core_mod]
+ [<ffffffffa042d975>] transport_generic_free_cmd+0x35/0x420 [target_core_mod]
+
+	Signed-off-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Acked-by: Joern Engel <joern@logfs.org>
+	Reviewed-by: Andy Grover <agrover@redhat.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Cc: Sagi Grimberg <sagig@mellanox.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 9ff9d15eddd13ecdd41876c5e1f31ddbb127101c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_tmr.c
+diff --cc drivers/target/target_core_tmr.c
+index b2e169fba3c6,28fb3016370f..000000000000
+--- a/drivers/target/target_core_tmr.c
++++ b/drivers/target/target_core_tmr.c
+@@@ -133,14 -130,21 +133,24 @@@ void core_tmr_abort_task
+  		if (tmr->ref_task_tag != ref_tag)
+  			continue;
+  
+++<<<<<<< HEAD
+ +		printk("ABORT_TASK: Found referenced %s task_tag: %u\n",
+++=======
++ 		if (!kref_get_unless_zero(&se_cmd->cmd_kref))
++ 			continue;
++ 
++ 		printk("ABORT_TASK: Found referenced %s task_tag: %llu\n",
+++>>>>>>> 9ff9d15eddd1 (target: Invoke release_cmd() callback without holding a spinlock)
+  			se_cmd->se_tfo->get_fabric_name(), ref_tag);
+  
+  		spin_lock(&se_cmd->t_state_lock);
+  		if (se_cmd->transport_state & CMD_T_COMPLETE) {
+ -			printk("ABORT_TASK: ref_tag: %llu already complete,"
+ -			       " skipping\n", ref_tag);
+ +			printk("ABORT_TASK: ref_tag: %u already complete, skipping\n", ref_tag);
+  			spin_unlock(&se_cmd->t_state_lock);
+  			spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
++ 
++ 			target_put_sess_cmd(se_cmd);
++ 
+  			goto out;
+  		}
+  		se_cmd->transport_state |= CMD_T_ABORTED;
+* Unmerged path drivers/target/target_core_tmr.c
+diff --git a/drivers/target/target_core_transport.c b/drivers/target/target_core_transport.c
+index c170951cb91c..d2fc8f178e42 100644
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -2542,23 +2542,24 @@ out:
+ EXPORT_SYMBOL(target_get_sess_cmd);
+ 
+ static void target_release_cmd_kref(struct kref *kref)
+-		__releases(&se_cmd->se_sess->sess_cmd_lock)
+ {
+ 	struct se_cmd *se_cmd = container_of(kref, struct se_cmd, cmd_kref);
+ 	struct se_session *se_sess = se_cmd->se_sess;
++	unsigned long flags;
+ 
++	spin_lock_irqsave(&se_sess->sess_cmd_lock, flags);
+ 	if (list_empty(&se_cmd->se_cmd_list)) {
+-		spin_unlock(&se_sess->sess_cmd_lock);
++		spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
+ 		se_cmd->se_tfo->release_cmd(se_cmd);
+ 		return;
+ 	}
+ 	if (se_sess->sess_tearing_down && se_cmd->cmd_wait_set) {
+-		spin_unlock(&se_sess->sess_cmd_lock);
++		spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
+ 		complete(&se_cmd->cmd_wait_comp);
+ 		return;
+ 	}
+ 	list_del(&se_cmd->se_cmd_list);
+-	spin_unlock(&se_sess->sess_cmd_lock);
++	spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
+ 
+ 	se_cmd->se_tfo->release_cmd(se_cmd);
+ }
+@@ -2574,8 +2575,7 @@ int target_put_sess_cmd(struct se_cmd *se_cmd)
+ 		se_cmd->se_tfo->release_cmd(se_cmd);
+ 		return 1;
+ 	}
+-	return kref_put_spinlock_irqsave(&se_cmd->cmd_kref, target_release_cmd_kref,
+-			&se_sess->sess_cmd_lock);
++	return kref_put(&se_cmd->cmd_kref, target_release_cmd_kref);
+ }
+ EXPORT_SYMBOL(target_put_sess_cmd);
+ 
