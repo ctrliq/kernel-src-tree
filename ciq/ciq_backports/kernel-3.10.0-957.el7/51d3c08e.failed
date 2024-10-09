@@ -1,0 +1,322 @@
+mlxsw: spectrum_kvdl: Add support for linear division resources
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Arkadi Sharshevsky <arkadis@mellanox.com>
+commit 51d3c08e33712e4867970fc5bafc73df3265ed04
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/51d3c08e.failed
+
+The linear part of the KVD memory is sub-divided into multiple parts. This
+patch exposes this internal partitions via the resource interface.
+
+	Signed-off-by: Arkadi Sharshevsky <arkadis@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 51d3c08e33712e4867970fc5bafc73df3265ed04)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_kvdl.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+index f0d32fc85499,675e03a892ed..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.h
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+@@@ -437,6 -433,13 +443,14 @@@ void mlxsw_sp_rif_destroy(struct mlxsw_
+  int mlxsw_sp_kvdl_alloc(struct mlxsw_sp *mlxsw_sp, unsigned int entry_count,
+  			u32 *p_entry_index);
+  void mlxsw_sp_kvdl_free(struct mlxsw_sp *mlxsw_sp, int entry_index);
+++<<<<<<< HEAD
+++=======
++ int mlxsw_sp_kvdl_alloc_size_query(struct mlxsw_sp *mlxsw_sp,
++ 				   unsigned int entry_count,
++ 				   unsigned int *p_alloc_size);
++ u64 mlxsw_sp_kvdl_occ_get(const struct mlxsw_sp *mlxsw_sp);
++ int mlxsw_sp_kvdl_resources_register(struct devlink *devlink);
+++>>>>>>> 51d3c08e3371 (mlxsw: spectrum_kvdl: Add support for linear division resources)
+  
+  struct mlxsw_sp_acl_rule_info {
+  	unsigned int priority;
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_kvdl.c
+index 26c26cd30c3d,d4335055ff85..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_kvdl.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_kvdl.c
+@@@ -81,13 -165,247 +81,259 @@@ int mlxsw_sp_kvdl_alloc(struct mlxsw_s
+  
+  void mlxsw_sp_kvdl_free(struct mlxsw_sp *mlxsw_sp, int entry_index)
+  {
+++<<<<<<< HEAD
+ +	int type_entries;
+ +	int i;
+ +
+ +	if (entry_index < MLXSW_SP_KVDL_CHUNKS_BASE)
+ +		type_entries = 1;
+ +	else
+ +		type_entries = MLXSW_SP_CHUNK_MAX;
+ +	for (i = 0; i < type_entries; i++)
+ +		clear_bit(entry_index + i, mlxsw_sp->kvdl.usage);
+++=======
++ 	struct mlxsw_sp_kvdl_part *part;
++ 
++ 	part = mlxsw_sp_kvdl_index_part(mlxsw_sp->kvdl, entry_index);
++ 	if (IS_ERR(part))
++ 		return;
++ 	mlxsw_sp_kvdl_part_free(part, entry_index);
++ }
++ 
++ int mlxsw_sp_kvdl_alloc_size_query(struct mlxsw_sp *mlxsw_sp,
++ 				   unsigned int entry_count,
++ 				   unsigned int *p_alloc_size)
++ {
++ 	struct mlxsw_sp_kvdl_part *part;
++ 
++ 	part = mlxsw_sp_kvdl_alloc_size_part(mlxsw_sp->kvdl, entry_count);
++ 	if (IS_ERR(part))
++ 		return PTR_ERR(part);
++ 
++ 	*p_alloc_size = part->info->alloc_size;
++ 
++ 	return 0;
++ }
++ 
++ enum mlxsw_sp_kvdl_part_id {
++ 	MLXSW_SP_KVDL_PART_SINGLE,
++ 	MLXSW_SP_KVDL_PART_CHUNKS,
++ 	MLXSW_SP_KVDL_PART_LARGE_CHUNKS,
++ };
++ 
++ static const struct mlxsw_sp_kvdl_part_info kvdl_parts_info[] = {
++ 	{
++ 		.part_index	= MLXSW_SP_KVDL_PART_SINGLE,
++ 		.start_index	= MLXSW_SP_KVDL_SINGLE_BASE,
++ 		.end_index	= MLXSW_SP_KVDL_SINGLE_END,
++ 		.alloc_size	= 1,
++ 	},
++ 	{
++ 		.part_index	= MLXSW_SP_KVDL_PART_CHUNKS,
++ 		.start_index	= MLXSW_SP_KVDL_CHUNKS_BASE,
++ 		.end_index	= MLXSW_SP_KVDL_CHUNKS_END,
++ 		.alloc_size	= MLXSW_SP_CHUNK_MAX,
++ 	},
++ 	{
++ 		.part_index	= MLXSW_SP_KVDL_PART_LARGE_CHUNKS,
++ 		.start_index	= MLXSW_SP_KVDL_LARGE_CHUNKS_BASE,
++ 		.end_index	= MLXSW_SP_KVDL_LARGE_CHUNKS_END,
++ 		.alloc_size	= MLXSW_SP_LARGE_CHUNK_MAX,
++ 	},
++ };
++ 
++ static struct mlxsw_sp_kvdl_part *
++ mlxsw_sp_kvdl_part_find(struct mlxsw_sp *mlxsw_sp, unsigned int part_index)
++ {
++ 	struct mlxsw_sp_kvdl_part *part;
++ 
++ 	list_for_each_entry(part, &mlxsw_sp->kvdl->parts_list, list) {
++ 		if (part->info->part_index == part_index)
++ 			return part;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ static int mlxsw_sp_kvdl_part_init(struct mlxsw_sp *mlxsw_sp,
++ 				   unsigned int part_index)
++ {
++ 	const struct mlxsw_sp_kvdl_part_info *info;
++ 	struct mlxsw_sp_kvdl_part *part;
++ 	unsigned int nr_entries;
++ 	size_t usage_size;
++ 
++ 	info = &kvdl_parts_info[part_index];
++ 
++ 	nr_entries = (info->end_index - info->start_index + 1) /
++ 		     info->alloc_size;
++ 	usage_size = BITS_TO_LONGS(nr_entries) * sizeof(unsigned long);
++ 	part = kzalloc(sizeof(*part) + usage_size, GFP_KERNEL);
++ 	if (!part)
++ 		return -ENOMEM;
++ 
++ 	part->info = info;
++ 	list_add(&part->list, &mlxsw_sp->kvdl->parts_list);
++ 
++ 	return 0;
++ }
++ 
++ static void mlxsw_sp_kvdl_part_fini(struct mlxsw_sp *mlxsw_sp,
++ 				    unsigned int part_index)
++ {
++ 	struct mlxsw_sp_kvdl_part *part;
++ 
++ 	part = mlxsw_sp_kvdl_part_find(mlxsw_sp, part_index);
++ 	if (!part)
++ 		return;
++ 
++ 	list_del(&part->list);
++ 	kfree(part);
++ }
++ 
++ static int mlxsw_sp_kvdl_parts_init(struct mlxsw_sp *mlxsw_sp)
++ {
++ 	int err, i;
++ 
++ 	INIT_LIST_HEAD(&mlxsw_sp->kvdl->parts_list);
++ 
++ 	for (i = 0; i < ARRAY_SIZE(kvdl_parts_info); i++) {
++ 		err = mlxsw_sp_kvdl_part_init(mlxsw_sp, i);
++ 		if (err)
++ 			goto err_kvdl_part_init;
++ 	}
++ 
++ 	return 0;
++ 
++ err_kvdl_part_init:
++ 	for (i--; i >= 0; i--)
++ 		mlxsw_sp_kvdl_part_fini(mlxsw_sp, i);
++ 	return err;
++ }
++ 
++ static void mlxsw_sp_kvdl_parts_fini(struct mlxsw_sp *mlxsw_sp)
++ {
++ 	int i;
++ 
++ 	for (i = ARRAY_SIZE(kvdl_parts_info) - 1; i >= 0; i--)
++ 		mlxsw_sp_kvdl_part_fini(mlxsw_sp, i);
++ }
++ 
++ static u64 mlxsw_sp_kvdl_part_occ(struct mlxsw_sp_kvdl_part *part)
++ {
++ 	unsigned int nr_entries;
++ 	int bit = -1;
++ 	u64 occ = 0;
++ 
++ 	nr_entries = (part->info->end_index -
++ 		      part->info->start_index + 1) /
++ 		      part->info->alloc_size;
++ 	while ((bit = find_next_bit(part->usage, nr_entries, bit + 1))
++ 		< nr_entries)
++ 		occ += part->info->alloc_size;
++ 	return occ;
++ }
++ 
++ u64 mlxsw_sp_kvdl_occ_get(const struct mlxsw_sp *mlxsw_sp)
++ {
++ 	struct mlxsw_sp_kvdl_part *part;
++ 	u64 occ = 0;
++ 
++ 	list_for_each_entry(part, &mlxsw_sp->kvdl->parts_list, list)
++ 		occ += mlxsw_sp_kvdl_part_occ(part);
++ 
++ 	return occ;
++ }
++ 
++ static struct devlink_resource_size_params mlxsw_sp_kvdl_single_size_params = {
++ 	.size_min = 0,
++ 	.size_granularity = 1,
++ 	.unit = DEVLINK_RESOURCE_UNIT_ENTRY,
++ };
++ 
++ static struct devlink_resource_size_params mlxsw_sp_kvdl_chunks_size_params = {
++ 	.size_min = 0,
++ 	.size_granularity = MLXSW_SP_CHUNK_MAX,
++ 	.unit = DEVLINK_RESOURCE_UNIT_ENTRY,
++ };
++ 
++ static struct devlink_resource_size_params mlxsw_sp_kvdl_large_chunks_size_params = {
++ 	.size_min = 0,
++ 	.size_granularity = MLXSW_SP_LARGE_CHUNK_MAX,
++ 	.unit = DEVLINK_RESOURCE_UNIT_ENTRY,
++ };
++ 
++ static void
++ mlxsw_sp_kvdl_resource_size_params_prepare(struct devlink *devlink)
++ {
++ 	struct mlxsw_core *mlxsw_core = devlink_priv(devlink);
++ 	u32 kvdl_max_size;
++ 
++ 	kvdl_max_size = MLXSW_CORE_RES_GET(mlxsw_core, KVD_SIZE) -
++ 			MLXSW_CORE_RES_GET(mlxsw_core, KVD_SINGLE_MIN_SIZE) -
++ 			MLXSW_CORE_RES_GET(mlxsw_core, KVD_DOUBLE_MIN_SIZE);
++ 
++ 	mlxsw_sp_kvdl_single_size_params.size_max = kvdl_max_size;
++ 	mlxsw_sp_kvdl_chunks_size_params.size_max = kvdl_max_size;
++ 	mlxsw_sp_kvdl_large_chunks_size_params.size_max = kvdl_max_size;
++ }
++ 
++ int mlxsw_sp_kvdl_resources_register(struct devlink *devlink)
++ {
++ 	int err;
++ 
++ 	mlxsw_sp_kvdl_resource_size_params_prepare(devlink);
++ 	err = devlink_resource_register(devlink, MLXSW_SP_RESOURCE_NAME_KVD_LINEAR_SINGLES,
++ 					false, MLXSW_SP_KVDL_SINGLE_SIZE,
++ 					MLXSW_SP_RESOURCE_KVD_LINEAR_SINGLE,
++ 					MLXSW_SP_RESOURCE_KVD_LINEAR,
++ 					&mlxsw_sp_kvdl_single_size_params,
++ 					NULL);
++ 	if (err)
++ 		return err;
++ 
++ 	err = devlink_resource_register(devlink, MLXSW_SP_RESOURCE_NAME_KVD_LINEAR_CHUNKS,
++ 					false, MLXSW_SP_KVDL_CHUNKS_SIZE,
++ 					MLXSW_SP_RESOURCE_KVD_LINEAR_CHUNKS,
++ 					MLXSW_SP_RESOURCE_KVD_LINEAR,
++ 					&mlxsw_sp_kvdl_chunks_size_params,
++ 					NULL);
++ 	if (err)
++ 		return err;
++ 
++ 	err = devlink_resource_register(devlink, MLXSW_SP_RESOURCE_NAME_KVD_LINEAR_LARGE_CHUNKS,
++ 					false, MLXSW_SP_KVDL_LARGE_CHUNKS_SIZE,
++ 					MLXSW_SP_RESOURCE_KVD_LINEAR_LARGE_CHUNKS,
++ 					MLXSW_SP_RESOURCE_KVD_LINEAR,
++ 					&mlxsw_sp_kvdl_large_chunks_size_params,
++ 					NULL);
++ 	return err;
++ }
++ 
++ int mlxsw_sp_kvdl_init(struct mlxsw_sp *mlxsw_sp)
++ {
++ 	struct mlxsw_sp_kvdl *kvdl;
++ 	int err;
++ 
++ 	kvdl = kzalloc(sizeof(*mlxsw_sp->kvdl), GFP_KERNEL);
++ 	if (!kvdl)
++ 		return -ENOMEM;
++ 	mlxsw_sp->kvdl = kvdl;
++ 
++ 	err = mlxsw_sp_kvdl_parts_init(mlxsw_sp);
++ 	if (err)
++ 		goto err_kvdl_parts_init;
++ 
++ 	return 0;
++ 
++ err_kvdl_parts_init:
++ 	kfree(mlxsw_sp->kvdl);
++ 	return err;
++ }
++ 
++ void mlxsw_sp_kvdl_fini(struct mlxsw_sp *mlxsw_sp)
++ {
++ 	mlxsw_sp_kvdl_parts_fini(mlxsw_sp);
++ 	kfree(mlxsw_sp->kvdl);
+++>>>>>>> 51d3c08e3371 (mlxsw: spectrum_kvdl: Add support for linear division resources)
+  }
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+index b68d3beaa490..dc6eff892d7f 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+@@ -3752,6 +3752,10 @@ static int mlxsw_sp_resources_register(struct mlxsw_core *mlxsw_core)
+ 	if (err)
+ 		return err;
+ 
++	err = mlxsw_sp_kvdl_resources_register(devlink);
++	if  (err)
++		return err;
++
+ 	double_size = kvd_size - linear_size;
+ 	double_size *= profile->kvd_hash_double_parts;
+ 	double_size /= profile->kvd_hash_double_parts +
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_kvdl.c
