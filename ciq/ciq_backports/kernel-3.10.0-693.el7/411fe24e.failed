@@ -1,0 +1,127 @@
+nohz: Fix collision between tick and other hrtimers, again
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Frederic Weisbecker <fweisbec@gmail.com>
+commit 411fe24e6b7c283c3a1911450cdba6dd3aaea56e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/411fe24e.failed
+
+This restores commit:
+
+  24b91e360ef5: ("nohz: Fix collision between tick and other hrtimers")
+
+... which got reverted by commit:
+
+  558e8e27e73f: ('Revert "nohz: Fix collision between tick and other hrtimers"')
+
+... due to a regression where CPUs spuriously stopped ticking.
+
+The bug happened when a tick fired too early past its expected expiration:
+on IRQ exit the tick was scheduled again to the same deadline but skipped
+reprogramming because ts->next_tick still kept in cache the deadline.
+This has been fixed now with resetting ts->next_tick from the tick
+itself. Extra care has also been taken to prevent from obsolete values
+throughout CPU hotplug operations.
+
+When the tick is stopped and an interrupt occurs afterward, we check on
+that interrupt exit if the next tick needs to be rescheduled. If it
+doesn't need any update, we don't want to do anything.
+
+In order to check if the tick needs an update, we compare it against the
+clockevent device deadline. Now that's a problem because the clockevent
+device is at a lower level than the tick itself if it is implemented
+on top of hrtimer.
+
+Every hrtimer share this clockevent device. So comparing the next tick
+deadline against the clockevent device deadline is wrong because the
+device may be programmed for another hrtimer whose deadline collides
+with the tick. As a result we may end up not reprogramming the tick
+accidentally.
+
+In a worst case scenario under full dynticks mode, the tick stops firing
+as it is supposed to every 1hz, leaving /proc/stat stalled:
+
+      Task in a full dynticks CPU
+      ----------------------------
+
+      * hrtimer A is queued 2 seconds ahead
+      * the tick is stopped, scheduled 1 second ahead
+      * tick fires 1 second later
+      * on tick exit, nohz schedules the tick 1 second ahead but sees
+        the clockevent device is already programmed to that deadline,
+        fooled by hrtimer A, the tick isn't rescheduled.
+      * hrtimer A is cancelled before its deadline
+      * tick never fires again until an interrupt happens...
+
+In order to fix this, store the next tick deadline to the tick_sched
+local structure and reuse that value later to check whether we need to
+reprogram the clock after an interrupt.
+
+On the other hand, ts->sleep_length still wants to know about the next
+clock event and not just the tick, so we want to improve the related
+comment to avoid confusion.
+
+Reported-and-tested-by: Tim Wright <tim@binbash.co.uk>
+Reported-and-tested-by: Pavel Machek <pavel@ucw.cz>
+	Reported-by: James Hartsock <hartsjc@redhat.com>
+	Signed-off-by: Frederic Weisbecker <fweisbec@gmail.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Rik van Riel <riel@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: stable@vger.kernel.org
+Link: http://lkml.kernel.org/r/1492783255-5051-2-git-send-email-fweisbec@gmail.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 411fe24e6b7c283c3a1911450cdba6dd3aaea56e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/time/tick-sched.c
+#	kernel/time/tick-sched.h
+diff --cc kernel/time/tick-sched.c
+index 22bf382ff9a8,764d2905e6a5..000000000000
+--- a/kernel/time/tick-sched.c
++++ b/kernel/time/tick-sched.c
+@@@ -636,11 -780,19 +648,24 @@@ static ktime_t tick_nohz_stop_sched_tic
+  		expires = KTIME_MAX;
+  
+  	expires = min_t(u64, expires, next_tick);
+ -	tick = expires;
+ +	tick.tv64 = expires;
+  
+  	/* Skip reprogram of event if its not changed */
+++<<<<<<< HEAD
+ +	if (ts->tick_stopped && (expires == dev->next_event.tv64))
+ +		goto out;
+++=======
++ 	if (ts->tick_stopped && (expires == ts->next_tick)) {
++ 		/* Sanity check: make sure clockevent is actually programmed */
++ 		if (likely(dev->next_event <= ts->next_tick))
++ 			goto out;
++ 
++ 		WARN_ON_ONCE(1);
++ 		printk_once("basemono: %llu ts->next_tick: %llu dev->next_event: %llu timer->active: %d timer->expires: %llu\n",
++ 			    basemono, ts->next_tick, dev->next_event,
++ 			    hrtimer_active(&ts->sched_timer), hrtimer_get_expires(&ts->sched_timer));
++ 	}
+++>>>>>>> 411fe24e6b7c (nohz: Fix collision between tick and other hrtimers, again)
+  
+  	/*
+  	 * nohz_stop_sched_tick can be called several times before
+@@@ -655,9 -807,12 +680,11 @@@
+  
+  		ts->last_tick = hrtimer_get_expires(&ts->sched_timer);
+  		ts->tick_stopped = 1;
+ -		trace_tick_stop(1, TICK_DEP_MASK_NONE);
+ +		trace_tick_stop(1, " ");
+  	}
+  
++ 	ts->next_tick = tick;
++ 
+  	/*
+  	 * If the expiration time == KTIME_MAX, then we simply stop
+  	 * the tick timer.
+* Unmerged path kernel/time/tick-sched.h
+* Unmerged path kernel/time/tick-sched.c
+* Unmerged path kernel/time/tick-sched.h
