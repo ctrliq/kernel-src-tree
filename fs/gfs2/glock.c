@@ -1929,7 +1929,7 @@ static int __gfs2_glocks_open(struct inode *inode, struct file *file,
 		if (seq->buf)
 			seq->size = GFS2_SEQ_GOODSIZE;
 		gi->gl = NULL;
-		ret = rhashtable_walk_init(&gl_hash_table, &gi->hti, GFP_KERNEL);
+		rhashtable_walk_enter(&gl_hash_table, &gi->hti);
 	}
 	return ret;
 }
