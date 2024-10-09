@@ -244,6 +244,15 @@ static int alloc_rx_pool(struct ibmvnic_adapter *adapter,
 	return 0;
 }
 
+static void deactivate_rx_pools(struct ibmvnic_adapter *adapter)
+{
+	int i;
+
+	for (i = 0; i < be32_to_cpu(adapter->login_rsp_buf->num_rxadd_subcrqs);
+	     i++)
+		adapter->rx_pool[i].active = 0;
+}
+
 static void replenish_rx_pool(struct ibmvnic_adapter *adapter,
 			      struct ibmvnic_rx_pool *pool)
 {
@@ -260,6 +269,9 @@ static void replenish_rx_pool(struct ibmvnic_adapter *adapter,
 	int shift = 0;
 	int index;
 	int i;
+
+	if (!pool->active)
+		return;
 
 	handle_array = (u64 *)((u8 *)(adapter->login_rsp_buf) +
 				      be32_to_cpu(adapter->login_rsp_buf->
@@ -331,6 +343,15 @@ failure:
 	dev_kfree_skb_any(skb);
 	adapter->replenish_add_buff_failure++;
 	atomic_add(buffers_added, &pool->available);
+
+	if (lpar_rc == H_CLOSED) {
+		/* Disable buffer pool replenishment and report carrier off if
+		 * queue is closed. Firmware guarantees that a signal will
+		 * be sent to the driver, triggering a reset.
+		 */
+		deactivate_rx_pools(adapter);
+		netif_carrier_off(adapter->netdev);
+	}
 }
 
 static void replenish_pools(struct ibmvnic_adapter *adapter)
