@@ -1,0 +1,239 @@
+net/mlx5e: Support offload cls_flower with skbedit mark action
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Support offload cls_flower with skbedit mark action (Jonathan Toppins) [1383217]
+Rebuild_FUZZ: 96.67%
+commit-author Amir Vadai <amir@vadai.me>
+commit 12185a9fafa9cf39b73588c92aa49300ff3bf191
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/12185a9f.failed
+
+Introduce offloading of skbedit mark action.
+
+For example, to mark with 0x1234, all TCP (ip_proto 6) packets arriving
+to interface ens9:
+
+ # tc qdisc add dev ens9 ingress
+ # tc filter add dev ens9 protocol ip parent ffff: \
+     flower ip_proto 6 \
+     indev ens9 \
+     action skbedit mark 0x1234
+
+	Signed-off-by: Amir Vadai <amir@vadai.me>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 12185a9fafa9cf39b73588c92aa49300ff3bf191)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+index 1d7bd82a1fb1,d677428dc10f..000000000000
+--- a/drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
++++ b/drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+@@@ -30,33 -30,22 +30,40 @@@
+   * SOFTWARE.
+   */
+  
+ -#ifndef __MLX5_EN_TC_H__
+ -#define __MLX5_EN_TC_H__
+ +/*
+ + * This file is conditionally built on PowerPC only.  Otherwise weak symbol
+ + * versions of the functions exported from here are used.
+ + */
+  
+++<<<<<<< HEAD:drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+ +#include "ipath_kernel.h"
+++=======
++ #define MLX5E_TC_FLOW_ID_MASK 0x0000ffff
++ 
++ int mlx5e_tc_init(struct mlx5e_priv *priv);
++ void mlx5e_tc_cleanup(struct mlx5e_priv *priv);
+++>>>>>>> 12185a9fafa9 (net/mlx5e: Support offload cls_flower with skbedit mark action):drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
+  
+ -int mlx5e_configure_flower(struct mlx5e_priv *priv, __be16 protocol,
+ -			   struct tc_cls_flower_offload *f);
+ -int mlx5e_delete_flower(struct mlx5e_priv *priv,
+ -			struct tc_cls_flower_offload *f);
+ -
+ -static inline int mlx5e_tc_num_filters(struct mlx5e_priv *priv)
+ +/**
+ + * ipath_enable_wc - enable write combining for MMIO writes to the device
+ + * @dd: infinipath device
+ + *
+ + * Nothing to do on PowerPC, so just return without error.
+ + */
+ +int ipath_enable_wc(struct ipath_devdata *dd)
+  {
+ -	return atomic_read(&priv->fts.tc.ht.nelems);
+ +	return 0;
+  }
+  
+ -#endif /* __MLX5_EN_TC_H__ */
+ +/**
+ + * ipath_unordered_wc - indicate whether write combining is unordered
+ + *
+ + * Because our performance depends on our ability to do write
+ + * combining mmio writes in the most efficient way, we need to
+ + * know if we are on a processor that may reorder stores when
+ + * write combining.
+ + */
+ +int ipath_unordered_wc(void)
+ +{
+ +	return 1;
+ +}
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index 8b7e8d5924d3,58d4e2f962c3..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -786,138 -226,7 +787,142 @@@ static inline void mlx5e_build_rx_skb(s
+  		__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q),
+  				       be16_to_cpu(cqe->vlan_info));
+  
+++<<<<<<< HEAD
+ +	mlx5e_handle_csum(netdev, cqe, rq, skb, !!lro_num_seg);
+ +	skb->protocol = eth_type_trans(skb, netdev);
+ +}
+ +
+ +static inline void mlx5e_complete_rx_cqe(struct mlx5e_rq *rq,
+ +					 struct mlx5_cqe64 *cqe,
+ +					 u32 cqe_bcnt,
+ +					 struct sk_buff *skb)
+ +{
+ +	rq->stats.packets++;
+ +	rq->stats.bytes += cqe_bcnt;
+ +	mlx5e_build_rx_skb(cqe, cqe_bcnt, rq, skb);
+ +	napi_gro_receive(rq->cq.napi, skb);
+ +}
+ +
+ +void mlx5e_handle_rx_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
+ +{
+ +	struct mlx5e_rx_wqe *wqe;
+ +	struct sk_buff *skb;
+ +	__be16 wqe_counter_be;
+ +	u16 wqe_counter;
+ +	u32 cqe_bcnt;
+ +
+ +	wqe_counter_be = cqe->wqe_counter;
+ +	wqe_counter    = be16_to_cpu(wqe_counter_be);
+ +	wqe            = mlx5_wq_ll_get_wqe(&rq->wq, wqe_counter);
+ +	skb            = rq->skb[wqe_counter];
+ +	prefetch(skb->data);
+ +	rq->skb[wqe_counter] = NULL;
+ +
+ +	dma_unmap_single(rq->pdev,
+ +			 *((dma_addr_t *)skb->cb),
+ +			 rq->wqe_sz,
+ +			 DMA_FROM_DEVICE);
+ +
+ +	if (unlikely((cqe->op_own >> 4) != MLX5_CQE_RESP_SEND)) {
+ +		rq->stats.wqe_err++;
+ +		dev_kfree_skb(skb);
+ +		goto wq_ll_pop;
+ +	}
+ +
+ +	cqe_bcnt = be32_to_cpu(cqe->byte_cnt);
+ +	skb_put(skb, cqe_bcnt);
+ +
+ +	mlx5e_complete_rx_cqe(rq, cqe, cqe_bcnt, skb);
+ +
+ +wq_ll_pop:
+ +	mlx5_wq_ll_pop(&rq->wq, wqe_counter_be,
+ +		       &wqe->next.next_wqe_index);
+ +}
+ +
+ +static inline void mlx5e_mpwqe_fill_rx_skb(struct mlx5e_rq *rq,
+ +					   struct mlx5_cqe64 *cqe,
+ +					   struct mlx5e_mpw_info *wi,
+ +					   u32 cqe_bcnt,
+ +					   struct sk_buff *skb)
+ +{
+ +	u32 consumed_bytes = ALIGN(cqe_bcnt, rq->mpwqe_stride_sz);
+ +	u16 stride_ix      = mpwrq_get_cqe_stride_index(cqe);
+ +	u32 wqe_offset     = stride_ix * rq->mpwqe_stride_sz;
+ +	u32 head_offset    = wqe_offset & (PAGE_SIZE - 1);
+ +	u32 page_idx       = wqe_offset >> PAGE_SHIFT;
+ +	u32 head_page_idx  = page_idx;
+ +	u16 headlen = min_t(u16, MLX5_MPWRQ_SMALL_PACKET_THRESHOLD, cqe_bcnt);
+ +	u32 frag_offset    = head_offset + headlen;
+ +	u16 byte_cnt       = cqe_bcnt - headlen;
+ +
+ +	if (unlikely(frag_offset >= PAGE_SIZE)) {
+ +		page_idx++;
+ +		frag_offset -= PAGE_SIZE;
+ +	}
+ +	wi->dma_pre_sync(rq->pdev, wi, wqe_offset, consumed_bytes);
+ +
+ +	while (byte_cnt) {
+ +		u32 pg_consumed_bytes =
+ +			min_t(u32, PAGE_SIZE - frag_offset, byte_cnt);
+ +
+ +		wi->add_skb_frag(rq, skb, wi, page_idx, frag_offset,
+ +				 pg_consumed_bytes);
+ +		byte_cnt -= pg_consumed_bytes;
+ +		frag_offset = 0;
+ +		page_idx++;
+ +	}
+ +	/* copy header */
+ +	wi->copy_skb_header(rq->pdev, skb, wi, head_page_idx, head_offset,
+ +			    headlen);
+ +	/* skb linear part was allocated with headlen and aligned to long */
+ +	skb->tail += headlen;
+ +	skb->len  += headlen;
+ +}
+ +
+ +void mlx5e_handle_rx_cqe_mpwrq(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
+ +{
+ +	u16 cstrides       = mpwrq_get_cqe_consumed_strides(cqe);
+ +	u16 wqe_id         = be16_to_cpu(cqe->wqe_id);
+ +	struct mlx5e_mpw_info *wi = &rq->wqe_info[wqe_id];
+ +	struct mlx5e_rx_wqe  *wqe = mlx5_wq_ll_get_wqe(&rq->wq, wqe_id);
+ +	struct sk_buff *skb;
+ +	u16 cqe_bcnt;
+ +
+ +	wi->consumed_strides += cstrides;
+ +
+ +	if (unlikely((cqe->op_own >> 4) != MLX5_CQE_RESP_SEND)) {
+ +		rq->stats.wqe_err++;
+ +		goto mpwrq_cqe_out;
+ +	}
+ +
+ +	if (unlikely(mpwrq_is_filler_cqe(cqe))) {
+ +		rq->stats.mpwqe_filler++;
+ +		goto mpwrq_cqe_out;
+ +	}
+ +
+ +	skb = napi_alloc_skb(rq->cq.napi,
+ +			     ALIGN(MLX5_MPWRQ_SMALL_PACKET_THRESHOLD,
+ +				   sizeof(long)));
+ +	if (unlikely(!skb)) {
+ +		rq->stats.buff_alloc_err++;
+ +		goto mpwrq_cqe_out;
+ +	}
+ +
+ +	prefetch(skb->data);
+ +	cqe_bcnt = mpwrq_get_cqe_byte_cnt(cqe);
+ +
+ +	mlx5e_mpwqe_fill_rx_skb(rq, cqe, wi, cqe_bcnt, skb);
+ +	mlx5e_complete_rx_cqe(rq, cqe, cqe_bcnt, skb);
+ +
+ +mpwrq_cqe_out:
+ +	if (likely(wi->consumed_strides < rq->mpwqe_num_strides))
+ +		return;
+ +
+ +	wi->free_wqe(rq, wi);
+ +	mlx5_wq_ll_pop(&rq->wq, cqe->wqe_id, &wqe->next.next_wqe_index);
+++=======
++ 	skb->mark = be32_to_cpu(cqe->sop_drop_qpn) & MLX5E_TC_FLOW_ID_MASK;
+++>>>>>>> 12185a9fafa9 (net/mlx5e: Support offload cls_flower with skbedit mark action)
+  }
+  
+  int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+* Unmerged path drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
