@@ -1,0 +1,120 @@
+blk-mq-sched: change ->dispatch_requests() to ->dispatch_request()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jens Axboe <axboe@fb.com>
+commit c13660a08c8b3bb49def4374bfd414aaaa564662
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c13660a0.failed
+
+When we invoke dispatch_requests(), the scheduler empties everything
+into the passed in list. This isn't always a good thing, since it
+means that we remove items that we could have potentially merged
+with.
+
+Change the function to dispatch single requests at the time. If
+we do that, we can backoff exactly at the point where the device
+can't consume more IO, and leave the rest with the scheduler for
+better merging and future dispatch decision making.
+
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+	Reviewed-by: Omar Sandoval <osandov@fb.com>
+	Tested-by: Hannes Reinecke <hare@suse.com>
+(cherry picked from commit c13660a08c8b3bb49def4374bfd414aaaa564662)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-sched.c
+#	include/linux/elevator.h
+diff --cc include/linux/elevator.h
+index 297200f44dc5,b5825c4f06f7..000000000000
+--- a/include/linux/elevator.h
++++ b/include/linux/elevator.h
+@@@ -72,6 -77,34 +72,37 @@@ struct elevator_op
+  	elevator_registered_fn *elevator_registered_fn;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct blk_mq_alloc_data;
++ struct blk_mq_hw_ctx;
++ 
++ struct elevator_mq_ops {
++ 	int (*init_sched)(struct request_queue *, struct elevator_type *);
++ 	void (*exit_sched)(struct elevator_queue *);
++ 
++ 	bool (*allow_merge)(struct request_queue *, struct request *, struct bio *);
++ 	bool (*bio_merge)(struct blk_mq_hw_ctx *, struct bio *);
++ 	int (*request_merge)(struct request_queue *q, struct request **, struct bio *);
++ 	void (*request_merged)(struct request_queue *, struct request *, int);
++ 	void (*requests_merged)(struct request_queue *, struct request *, struct request *);
++ 	struct request *(*get_request)(struct request_queue *, unsigned int, struct blk_mq_alloc_data *);
++ 	void (*put_request)(struct request *);
++ 	void (*insert_requests)(struct blk_mq_hw_ctx *, struct list_head *, bool);
++ 	struct request *(*dispatch_request)(struct blk_mq_hw_ctx *);
++ 	bool (*has_work)(struct blk_mq_hw_ctx *);
++ 	void (*completed_request)(struct blk_mq_hw_ctx *, struct request *);
++ 	void (*started_request)(struct request *);
++ 	void (*requeue_request)(struct request *);
++ 	struct request *(*former_request)(struct request_queue *, struct request *);
++ 	struct request *(*next_request)(struct request_queue *, struct request *);
++ 	int (*get_rq_priv)(struct request_queue *, struct request *);
++ 	void (*put_rq_priv)(struct request_queue *, struct request *);
++ 	void (*init_icq)(struct io_cq *);
++ 	void (*exit_icq)(struct io_cq *);
++ };
++ 
+++>>>>>>> c13660a08c8b (blk-mq-sched: change ->dispatch_requests() to ->dispatch_request())
+  #define ELV_NAME_MAX	(16)
+  
+  struct elv_fs_entry {
+* Unmerged path block/blk-mq-sched.c
+* Unmerged path block/blk-mq-sched.c
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 3b21482b7f01..c9df480854dc 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -888,7 +888,7 @@ bool blk_mq_dispatch_rq_list(struct blk_mq_hw_ctx *hctx, struct list_head *list)
+ 	 */
+ 	if (!list_empty(list)) {
+ 		spin_lock(&hctx->lock);
+-		list_splice(list, &hctx->dispatch);
++		list_splice_init(list, &hctx->dispatch);
+ 		spin_unlock(&hctx->lock);
+ 
+ 		/*
+diff --git a/block/mq-deadline.c b/block/mq-deadline.c
+index a01986d7b6fb..d93ec713fa62 100644
+--- a/block/mq-deadline.c
++++ b/block/mq-deadline.c
+@@ -287,14 +287,16 @@ done:
+ 	return rq;
+ }
+ 
+-static void dd_dispatch_requests(struct blk_mq_hw_ctx *hctx,
+-				 struct list_head *rq_list)
++static struct request *dd_dispatch_request(struct blk_mq_hw_ctx *hctx)
+ {
+ 	struct deadline_data *dd = hctx->queue->elevator->elevator_data;
++	struct request *rq;
+ 
+ 	spin_lock(&dd->lock);
+-	blk_mq_sched_move_to_dispatch(hctx, rq_list, __dd_dispatch_request);
++	rq = __dd_dispatch_request(hctx);
+ 	spin_unlock(&dd->lock);
++
++	return rq;
+ }
+ 
+ static void dd_exit_queue(struct elevator_queue *e)
+@@ -517,7 +519,7 @@ static struct elv_fs_entry deadline_attrs[] = {
+ static struct elevator_type mq_deadline = {
+ 	.ops.mq = {
+ 		.insert_requests	= dd_insert_requests,
+-		.dispatch_requests	= dd_dispatch_requests,
++		.dispatch_request	= dd_dispatch_request,
+ 		.next_request		= elv_rb_latter_request,
+ 		.former_request		= elv_rb_former_request,
+ 		.bio_merge		= dd_bio_merge,
+* Unmerged path include/linux/elevator.h
