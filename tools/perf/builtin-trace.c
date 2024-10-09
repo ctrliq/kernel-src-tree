@@ -2697,7 +2697,11 @@ static int trace__fprintf_one_thread(struct thread *thread, void *priv)
 		printed += fprintf(fp, ", %lu majfaults", ttrace->pfmaj);
 	if (ttrace->pfmin)
 		printed += fprintf(fp, ", %lu minfaults", ttrace->pfmin);
-	printed += fprintf(fp, ", %.3f msec\n", ttrace->runtime_ms);
+	if (trace->sched)
+		printed += fprintf(fp, ", %.3f msec\n", ttrace->runtime_ms);
+	else if (fputc('\n', fp) != EOF)
+		++printed;
+
 	printed += thread__dump_stats(ttrace, trace, fp);
 
 	data->printed += printed;
