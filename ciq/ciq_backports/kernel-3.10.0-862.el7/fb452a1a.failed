@@ -1,0 +1,254 @@
+Revert "net: use lib/percpu_counter API for fragmentation mem accounting"
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit fb452a1aa3fd4034d7999e309c5466ff2d7005aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fb452a1a.failed
+
+This reverts commit 6d7b857d541ecd1d9bd997c97242d4ef94b19de2.
+
+There is a bug in fragmentation codes use of the percpu_counter API,
+that can cause issues on systems with many CPUs.
+
+The frag_mem_limit() just reads the global counter (fbc->count),
+without considering other CPUs can have upto batch size (130K) that
+haven't been subtracted yet.  Due to the 3MBytes lower thresh limit,
+this become dangerous at >=24 CPUs (3*1024*1024/130000=24).
+
+The correct API usage would be to use __percpu_counter_compare() which
+does the right thing, and takes into account the number of (online)
+CPUs and batch size, to account for this and call __percpu_counter_sum()
+when needed.
+
+We choose to revert the use of the lib/percpu_counter API for frag
+memory accounting for several reasons:
+
+1) On systems with CPUs > 24, the heavier fully locked
+   __percpu_counter_sum() is always invoked, which will be more
+   expensive than the atomic_t that is reverted to.
+
+Given systems with more than 24 CPUs are becoming common this doesn't
+seem like a good option.  To mitigate this, the batch size could be
+decreased and thresh be increased.
+
+2) The add_frag_mem_limit+sub_frag_mem_limit pairs happen on the RX
+   CPU, before SKBs are pushed into sockets on remote CPUs.  Given
+   NICs can only hash on L2 part of the IP-header, the NIC-RXq's will
+   likely be limited.  Thus, a fair chance that atomic add+dec happen
+   on the same CPU.
+
+Revert note that commit 1d6119baf061 ("net: fix percpu memory leaks")
+removed init_frag_mem_limit() and instead use inet_frags_init_net().
+After this revert, inet_frags_uninit_net() becomes empty.
+
+Fixes: 6d7b857d541e ("net: use lib/percpu_counter API for fragmentation mem accounting")
+Fixes: 1d6119baf061 ("net: fix percpu memory leaks")
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Acked-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fb452a1aa3fd4034d7999e309c5466ff2d7005aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/inet_frag.h
+#	net/ipv4/inet_fragment.c
+diff --cc include/net/inet_frag.h
+index a1af4828c9e5,fa635aa6d0b9..000000000000
+--- a/include/net/inet_frag.h
++++ b/include/net/inet_frag.h
+@@@ -1,18 -1,9 +1,21 @@@
+  #ifndef __NET_FRAG_H__
+  #define __NET_FRAG_H__
+  
+- #include <linux/percpu_counter.h>
+- 
+  struct netns_frags {
+++<<<<<<< HEAD
+ +	int			nqueues;
+ +	struct list_head	lru_list;
+ +	spinlock_t		lru_lock;
+ +
+ +	/* The percpu_counter "mem" need to be cacheline aligned.
+ +	 *  mem.count must not share cacheline with other writers
+ +	 */
+ +	struct percpu_counter   mem ____cacheline_aligned_in_smp;
+ +
+++=======
++ 	/* Keep atomic mem on separate cachelines in structs that include it */
++ 	atomic_t		mem ____cacheline_aligned_in_smp;
+++>>>>>>> fb452a1aa3fd (Revert "net: use lib/percpu_counter API for fragmentation mem accounting")
+  	/* sysctls */
+  	int			timeout;
+  	int			high_thresh;
+@@@ -67,23 -81,37 +70,35 @@@ struct inet_frags 
+  
+  	/* The first call to hashfn is responsible to initialize
+  	 * rnd. This is best done with net_get_random_once.
+ -	 *
+ -	 * rnd_seqlock is used to let hash insertion detect
+ -	 * when it needs to re-lookup the hash chain to use.
+  	 */
+  	u32			rnd;
+ -	seqlock_t		rnd_seqlock;
+ -	unsigned int		qsize;
+ +	int			qsize;
+  
+ -	unsigned int		(*hashfn)(const struct inet_frag_queue *);
+ -	bool			(*match)(const struct inet_frag_queue *q,
+ -					 const void *arg);
+ +	unsigned int		(*hashfn)(struct inet_frag_queue *);
+ +	bool			(*match)(struct inet_frag_queue *q, void *arg);
+  	void			(*constructor)(struct inet_frag_queue *q,
+ -					       const void *arg);
+ +						void *arg);
+  	void			(*destructor)(struct inet_frag_queue *);
+ +	void			(*skb_free)(struct sk_buff *);
+  	void			(*frag_expire)(unsigned long data);
+ -	struct kmem_cache	*frags_cachep;
+ -	const char		*frags_cache_name;
+  };
+  
+ -int inet_frags_init(struct inet_frags *);
+ +void inet_frags_init(struct inet_frags *);
+  void inet_frags_fini(struct inet_frags *);
+  
+++<<<<<<< HEAD
+ +void inet_frags_init_net(struct netns_frags *nf);
+++=======
++ static inline int inet_frags_init_net(struct netns_frags *nf)
++ {
++ 	atomic_set(&nf->mem, 0);
++ 	return 0;
++ }
++ static inline void inet_frags_uninit_net(struct netns_frags *nf)
++ {
++ }
++ 
+++>>>>>>> fb452a1aa3fd (Revert "net: use lib/percpu_counter API for fragmentation mem accounting")
+  void inet_frags_exit_net(struct netns_frags *nf, struct inet_frags *f);
+  
+  void inet_frag_kill(struct inet_frag_queue *q, struct inet_frags *f);
+@@@ -104,67 -135,24 +119,73 @@@ static inline void inet_frag_put(struc
+  
+  /* Memory Tracking Functions. */
+  
+- /* The default percpu_counter batch size is not big enough to scale to
+-  * fragmentation mem acct sizes.
+-  * The mem size of a 64K fragment is approx:
+-  *  (44 fragments * 2944 truesize) + frag_queue struct(200) = 129736 bytes
+-  */
+- static unsigned int frag_percpu_counter_batch = 130000;
+- 
+  static inline int frag_mem_limit(struct netns_frags *nf)
+  {
+- 	return percpu_counter_read(&nf->mem);
++ 	return atomic_read(&nf->mem);
+  }
+  
+ -static inline void sub_frag_mem_limit(struct netns_frags *nf, int i)
+ +static inline void sub_frag_mem_limit(struct inet_frag_queue *q, int i)
+  {
+++<<<<<<< HEAD
+ +	__percpu_counter_add(&q->net->mem, -i, frag_percpu_counter_batch);
+++=======
++ 	atomic_sub(i, &nf->mem);
+++>>>>>>> fb452a1aa3fd (Revert "net: use lib/percpu_counter API for fragmentation mem accounting")
+ +}
+ +
+ +static inline void add_frag_mem_limit(struct inet_frag_queue *q, int i)
+ +{
+++<<<<<<< HEAD
+ +	__percpu_counter_add(&q->net->mem, i, frag_percpu_counter_batch);
+ +}
+ +
+ +static inline void init_frag_mem_limit(struct netns_frags *nf)
+ +{
+ +	percpu_counter_init(&nf->mem, 0, GFP_KERNEL);
+ +}
+ +
+ +static inline int sum_frag_mem_limit(struct netns_frags *nf)
+ +{
+ +	int res;
+ +
+ +	local_bh_disable();
+ +	res = percpu_counter_sum_positive(&nf->mem);
+ +	local_bh_enable();
+ +
+ +	return res;
+ +}
+ +
+ +static inline void inet_frag_lru_move(struct inet_frag_queue *q)
+ +{
+ +	spin_lock(&q->net->lru_lock);
+ +	if (!list_empty(&q->lru_list))
+ +		list_move_tail(&q->lru_list, &q->net->lru_list);
+ +	spin_unlock(&q->net->lru_lock);
+ +}
+ +
+ +static inline void inet_frag_lru_del(struct inet_frag_queue *q)
+ +{
+ +	spin_lock(&q->net->lru_lock);
+ +	list_del_init(&q->lru_list);
+ +	q->net->nqueues--;
+ +	spin_unlock(&q->net->lru_lock);
+  }
+  
+ -static inline void add_frag_mem_limit(struct netns_frags *nf, int i)
+ +static inline void inet_frag_lru_add(struct netns_frags *nf,
+ +				     struct inet_frag_queue *q)
+  {
+ +	spin_lock(&nf->lru_lock);
+ +	list_add_tail(&q->lru_list, &nf->lru_list);
+ +	q->net->nqueues++;
+ +	spin_unlock(&nf->lru_lock);
+++=======
++ 	atomic_add(i, &nf->mem);
++ }
++ 
++ static inline int sum_frag_mem_limit(struct netns_frags *nf)
++ {
++ 	return atomic_read(&nf->mem);
+++>>>>>>> fb452a1aa3fd (Revert "net: use lib/percpu_counter API for fragmentation mem accounting")
+  }
+  
+  /* RFC 3168 support :
+diff --cc net/ipv4/inet_fragment.c
+index 3b01959bf4bb,af74d0433453..000000000000
+--- a/net/ipv4/inet_fragment.c
++++ b/net/ipv4/inet_fragment.c
+@@@ -117,13 -218,24 +117,21 @@@ EXPORT_SYMBOL(inet_frags_fini)
+  
+  void inet_frags_exit_net(struct netns_frags *nf, struct inet_frags *f)
+  {
+ -	unsigned int seq;
+ -	int i;
+ -
+  	nf->low_thresh = 0;
+  
+ -evict_again:
+  	local_bh_disable();
+ -	seq = read_seqbegin(&f->rnd_seqlock);
+ -
+ -	for (i = 0; i < INETFRAGS_HASHSZ ; i++)
+ -		inet_evict_bucket(f, &f->hash[i]);
+ -
+ +	inet_frag_evictor(nf, f, true);
+  	local_bh_enable();
+++<<<<<<< HEAD
+ +
+ +	percpu_counter_destroy(&nf->mem);
+++=======
++ 	cond_resched();
++ 
++ 	if (read_seqretry(&f->rnd_seqlock, seq) ||
++ 	    sum_frag_mem_limit(nf))
++ 		goto evict_again;
+++>>>>>>> fb452a1aa3fd (Revert "net: use lib/percpu_counter API for fragmentation mem accounting")
+  }
+  EXPORT_SYMBOL(inet_frags_exit_net);
+  
+* Unmerged path include/net/inet_frag.h
+* Unmerged path net/ipv4/inet_fragment.c
