@@ -1,0 +1,436 @@
+rtnetlink: fdb dump: optimize by saving last interface markers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Roopa Prabhu <roopa@cumulusnetworks.com>
+commit d297653dd6f07afbe7e6c702a4bcd7615680002e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d297653d.failed
+
+fdb dumps spanning multiple skb's currently restart from the first
+interface again for every skb. This results in unnecessary
+iterations on the already visited interfaces and their fdb
+entries. In large scale setups, we have seen this to slow
+down fdb dumps considerably. On a system with 30k macs we
+see fdb dumps spanning across more than 300 skbs.
+
+To fix the problem, this patch replaces the existing single fdb
+marker with three markers: netdev hash entries, netdevs and fdb
+index to continue where we left off instead of restarting from the
+first netdev. This is consistent with link dumps.
+
+In the process of fixing the performance issue, this patch also
+re-implements fix done by
+commit 472681d57a5d ("net: ndo_fdb_dump should report -EMSGSIZE to rtnl_fdb_dump")
+(with an internal fix from Wilson Kok) in the following ways:
+- change ndo_fdb_dump handlers to return error code instead
+of the last fdb index
+- use cb->args strictly for dump frag markers and not error codes.
+This is consistent with other dump functions.
+
+Below results were taken on a system with 1000 netdevs
+and 35085 fdb entries:
+before patch:
+$time bridge fdb show | wc -l
+15065
+
+real    1m11.791s
+user    0m0.070s
+sys 1m8.395s
+
+(existing code does not return all macs)
+
+after patch:
+$time bridge fdb show | wc -l
+35085
+
+real    0m2.017s
+user    0m0.113s
+sys 0m1.942s
+
+	Signed-off-by: Roopa Prabhu <roopa@cumulusnetworks.com>
+	Signed-off-by: Wilson Kok <wkok@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d297653dd6f07afbe7e6c702a4bcd7615680002e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	include/net/switchdev.h
+#	net/bridge/br_fdb.c
+#	net/core/rtnetlink.c
+#	net/switchdev/switchdev.c
+diff --cc include/linux/netdevice.h
+index 381d98dab175,67bb978470dc..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -1058,6 -1029,12 +1058,15 @@@ struct net_device_ops_extended 
+   *		      struct net_device *dev,
+   *		      const unsigned char *addr, u16 vid)
+   *	Deletes the FDB entry from dev coresponding to addr.
+++<<<<<<< HEAD
+++=======
++  * int (*ndo_fdb_dump)(struct sk_buff *skb, struct netlink_callback *cb,
++  *		       struct net_device *dev, struct net_device *filter_dev,
++  *		       int *idx)
++  *	Used to add FDB entries to dump requests. Implementers should add
++  *	entries to skb and update idx with the number of entries.
++  *
+++>>>>>>> d297653dd6f0 (rtnetlink: fdb dump: optimize by saving last interface markers)
+   * int (*ndo_bridge_setlink)(struct net_device *dev, struct nlmsghdr *nlh,
+   *			     u16 flags)
+   * int (*ndo_bridge_getlink)(struct sk_buff *skb, u32 pid, u32 seq,
+@@@ -1246,23 -1258,17 +1255,28 @@@ struct net_device_ops 
+  					       struct nlattr *tb[],
+  					       struct net_device *dev,
+  					       const unsigned char *addr,
+ -					       u16 vid);
+ -	int			(*ndo_fdb_dump)(struct sk_buff *skb,
+ +					       u16 vid))
+ +	RH_KABI_RENAME(int	(*ndo_fdb_dump),
+ +		       int	(*ndo_fdb_dump_rh72))(struct sk_buff *skb,
+  						struct netlink_callback *cb,
+  						struct net_device *dev,
+++<<<<<<< HEAD
+ +						int idx);
+++=======
++ 						struct net_device *filter_dev,
++ 						int *idx);
+++>>>>>>> d297653dd6f0 (rtnetlink: fdb dump: optimize by saving last interface markers)
+  
+ -	int			(*ndo_bridge_setlink)(struct net_device *dev,
+ +	RH_KABI_REPLACE(int	(*ndo_bridge_setlink)(struct net_device *dev,
+ +						      struct nlmsghdr *nlh),
+ +			int	(*ndo_bridge_setlink)(struct net_device *dev,
+  						      struct nlmsghdr *nlh,
+ -						      u16 flags);
+ -	int			(*ndo_bridge_getlink)(struct sk_buff *skb,
+ +						      u16 flags))
+ +	RH_KABI_REPLACE(int	(*ndo_bridge_getlink)(struct sk_buff *skb,
+ +						      u32 pid, u32 seq,
+ +						      struct net_device *dev,
+ +						      u32 filter_mask),
+ +			int	(*ndo_bridge_getlink)(struct sk_buff *skb,
+  						      u32 pid, u32 seq,
+  						      struct net_device *dev,
+  						      u32 filter_mask,
+diff --cc net/bridge/br_fdb.c
+index a38d58b2fcf2,6b43c8c88f19..000000000000
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@@ -689,17 -719,33 +690,25 @@@ int br_fdb_dump(struct sk_buff *skb
+  	if (!(dev->priv_flags & IFF_EBRIDGE))
+  		goto out;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!filter_dev) {
++ 		err = ndo_dflt_fdb_dump(skb, cb, dev, NULL, idx);
++ 		if (err < 0)
++ 			goto out;
++ 	}
++ 
+++>>>>>>> d297653dd6f0 (rtnetlink: fdb dump: optimize by saving last interface markers)
+  	for (i = 0; i < BR_HASH_SIZE; i++) {
+  		struct net_bridge_fdb_entry *f;
+  
+  		hlist_for_each_entry_rcu(f, &br->hash[i], hlist) {
+- 			int err;
+  
+- 			if (idx < cb->args[0])
++ 			if (*idx < cb->args[2])
+  				goto skip;
+  
+ -			if (filter_dev &&
+ -			    (!f->dst || f->dst->dev != filter_dev)) {
+ -				if (filter_dev != dev)
+ -					goto skip;
+ -				/* !f->dst is a special case for bridge
+ -				 * It means the MAC belongs to the bridge
+ -				 * Therefore need a little more filtering
+ -				 * we only want to dump the !f->dst case
+ -				 */
+ -				if (f->dst)
+ -					goto skip;
+ -			}
+ -			if (!filter_dev && f->dst)
+ +			if (filter_dev && (!f->dst || !f->dst->dev ||
+ +					   f->dst->dev != filter_dev))
+  				goto skip;
+  
+  			err = fdb_fill_info(skb, br, f,
+diff --cc net/core/rtnetlink.c
+index 131bb4450ad1,1dfca1c3f8f5..000000000000
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@@ -2800,13 -3068,13 +2800,13 @@@ static int nlmsg_populate_fdb(struct sk
+  	seq = cb->nlh->nlmsg_seq;
+  
+  	list_for_each_entry(ha, &list->list, list) {
+- 		if (*idx < cb->args[0])
++ 		if (*idx < cb->args[2])
+  			goto skip;
+  
+ -		err = nlmsg_populate_fdb_fill(skb, dev, ha->addr, 0,
+ +		err = nlmsg_populate_fdb_fill(skb, dev, ha->addr,
+  					      portid, seq,
+  					      RTM_NEWNEIGH, NTF_SELF,
+ -					      NLM_F_MULTI, NUD_PERMANENT);
+ +					      NLM_F_MULTI);
+  		if (err < 0)
+  			return err;
+  skip:
+@@@ -2845,46 -3112,102 +2844,142 @@@ EXPORT_SYMBOL(ndo_dflt_fdb_dump)
+  
+  static int rtnl_fdb_dump(struct sk_buff *skb, struct netlink_callback *cb)
+  {
+++<<<<<<< HEAD
+ +	int idx = 0;
+ +	struct net *net = sock_net(skb->sk);
+ +	struct net_device *dev;
+ +
+ +	rcu_read_lock();
+ +	cb->args[1] = 0;
+ +	for_each_netdev_rcu(net, dev) {
+ +		if (dev->priv_flags & IFF_BRIDGE_PORT) {
+ +			struct net_device *br_dev;
+ +			const struct net_device_ops *ops;
+ +
+ +			br_dev = netdev_master_upper_dev_get(dev);
+ +			ops = br_dev->netdev_ops;
+ +			if (get_ndo_ext(ops, ndo_fdb_dump))
+ +				idx = get_ndo_ext(ops, ndo_fdb_dump)(skb, cb,
+ +								     dev, NULL,
+ +								     idx);
+ +			else if (ops->ndo_fdb_dump_rh72)
+ +				idx = ops->ndo_fdb_dump_rh72(skb, cb, dev, idx);
+ +		}
+ +		if (cb->args[1] == -EMSGSIZE)
+ +			break;
+ +
+ +		if (get_ndo_ext(dev->netdev_ops, ndo_fdb_dump))
+ +			idx = get_ndo_ext(dev->netdev_ops, ndo_fdb_dump)(skb,
+ +									 cb,
+ +									 dev,
+ +									 NULL,
+ +									 idx);
+ +		else if (dev->netdev_ops->ndo_fdb_dump_rh72)
+ +			idx = dev->netdev_ops->ndo_fdb_dump_rh72(skb, cb, dev,
+ +								 idx);
+ +		else
+ +			idx = ndo_dflt_fdb_dump(skb, cb, dev, NULL, idx);
+ +		if (cb->args[1] == -EMSGSIZE)
+ +			break;
+++=======
++ 	struct net_device *dev;
++ 	struct nlattr *tb[IFLA_MAX+1];
++ 	struct net_device *br_dev = NULL;
++ 	const struct net_device_ops *ops = NULL;
++ 	const struct net_device_ops *cops = NULL;
++ 	struct ifinfomsg *ifm = nlmsg_data(cb->nlh);
++ 	struct net *net = sock_net(skb->sk);
++ 	struct hlist_head *head;
++ 	int brport_idx = 0;
++ 	int br_idx = 0;
++ 	int h, s_h;
++ 	int idx = 0, s_idx;
++ 	int err = 0;
++ 	int fidx = 0;
++ 
++ 	if (nlmsg_parse(cb->nlh, sizeof(struct ifinfomsg), tb, IFLA_MAX,
++ 			ifla_policy) == 0) {
++ 		if (tb[IFLA_MASTER])
++ 			br_idx = nla_get_u32(tb[IFLA_MASTER]);
++ 	}
++ 
++ 	brport_idx = ifm->ifi_index;
++ 
++ 	if (br_idx) {
++ 		br_dev = __dev_get_by_index(net, br_idx);
++ 		if (!br_dev)
++ 			return -ENODEV;
++ 
++ 		ops = br_dev->netdev_ops;
++ 	}
++ 
++ 	s_h = cb->args[0];
++ 	s_idx = cb->args[1];
++ 
++ 	for (h = s_h; h < NETDEV_HASHENTRIES; h++, s_idx = 0) {
++ 		idx = 0;
++ 		head = &net->dev_index_head[h];
++ 		hlist_for_each_entry(dev, head, index_hlist) {
++ 
++ 			if (brport_idx && (dev->ifindex != brport_idx))
++ 				continue;
++ 
++ 			if (!br_idx) { /* user did not specify a specific bridge */
++ 				if (dev->priv_flags & IFF_BRIDGE_PORT) {
++ 					br_dev = netdev_master_upper_dev_get(dev);
++ 					cops = br_dev->netdev_ops;
++ 				}
++ 			} else {
++ 				if (dev != br_dev &&
++ 				    !(dev->priv_flags & IFF_BRIDGE_PORT))
++ 					continue;
++ 
++ 				if (br_dev != netdev_master_upper_dev_get(dev) &&
++ 				    !(dev->priv_flags & IFF_EBRIDGE))
++ 					continue;
++ 				cops = ops;
++ 			}
++ 
++ 			if (idx < s_idx)
++ 				goto cont;
++ 
++ 			if (dev->priv_flags & IFF_BRIDGE_PORT) {
++ 				if (cops && cops->ndo_fdb_dump) {
++ 					err = cops->ndo_fdb_dump(skb, cb,
++ 								br_dev, dev,
++ 								&fidx);
++ 					if (err == -EMSGSIZE)
++ 						goto out;
++ 				}
++ 			}
++ 
++ 			if (dev->netdev_ops->ndo_fdb_dump)
++ 				err = dev->netdev_ops->ndo_fdb_dump(skb, cb,
++ 								    dev, NULL,
++ 								    &fidx);
++ 			else
++ 				err = ndo_dflt_fdb_dump(skb, cb, dev, NULL,
++ 							&fidx);
++ 			if (err == -EMSGSIZE)
++ 				goto out;
++ 
++ 			cops = NULL;
++ 
++ 			/* reset fdb offset to 0 for rest of the interfaces */
++ 			cb->args[2] = 0;
++ 			fidx = 0;
++ cont:
++ 			idx++;
++ 		}
+++>>>>>>> d297653dd6f0 (rtnetlink: fdb dump: optimize by saving last interface markers)
+  	}
+ +	rcu_read_unlock();
+  
+- 	cb->args[0] = idx;
++ out:
++ 	cb->args[0] = h;
++ 	cb->args[1] = idx;
++ 	cb->args[2] = fidx;
++ 
+  	return skb->len;
+  }
+  
+* Unmerged path include/net/switchdev.h
+* Unmerged path net/switchdev/switchdev.c
+diff --git a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+index bd6ea0956388..aae4d208d41d 100644
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+@@ -435,18 +435,19 @@ static int qlcnic_fdb_add(struct ndmsg *ndm, struct nlattr *tb[],
+ 
+ static int qlcnic_fdb_dump(struct sk_buff *skb, struct netlink_callback *ncb,
+ 			struct net_device *netdev,
+-			struct net_device *filter_dev, int idx)
++			struct net_device *filter_dev, int *idx)
+ {
+ 	struct qlcnic_adapter *adapter = netdev_priv(netdev);
++	int err = 0;
+ 
+ 	if (!adapter->fdb_mac_learn)
+ 		return ndo_dflt_fdb_dump(skb, ncb, netdev, filter_dev, idx);
+ 
+ 	if ((adapter->flags & QLCNIC_ESWITCH_ENABLED) ||
+ 	    qlcnic_sriov_check(adapter))
+-		idx = ndo_dflt_fdb_dump(skb, ncb, netdev, filter_dev, idx);
++		err = ndo_dflt_fdb_dump(skb, ncb, netdev, filter_dev, idx);
+ 
+-	return idx;
++	return err;
+ }
+ 
+ static void qlcnic_82xx_cancel_idc_work(struct qlcnic_adapter *adapter)
+diff --git a/drivers/net/vxlan.c b/drivers/net/vxlan.c
+index 3b2c9ff3617e..0b49e098b04b 100644
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@ -878,20 +878,20 @@ out:
+ /* Dump forwarding table */
+ static int vxlan_fdb_dump(struct sk_buff *skb, struct netlink_callback *cb,
+ 			  struct net_device *dev,
+-			  struct net_device *filter_dev, int idx)
++			  struct net_device *filter_dev, int *idx)
+ {
+ 	struct vxlan_dev *vxlan = netdev_priv(dev);
+ 	unsigned int h;
++	int err = 0;
+ 
+ 	for (h = 0; h < FDB_HASH_SIZE; ++h) {
+ 		struct vxlan_fdb *f;
+-		int err;
+ 
+ 		hlist_for_each_entry_rcu(f, &vxlan->fdb_head[h], hlist) {
+ 			struct vxlan_rdst *rd;
+ 
+ 			list_for_each_entry_rcu(rd, &f->remotes, list) {
+-				if (idx < cb->args[0])
++				if (*idx < cb->args[2])
+ 					goto skip;
+ 
+ 				err = vxlan_fdb_info(skb, vxlan, f,
+@@ -899,17 +899,15 @@ static int vxlan_fdb_dump(struct sk_buff *skb, struct netlink_callback *cb,
+ 						     cb->nlh->nlmsg_seq,
+ 						     RTM_NEWNEIGH,
+ 						     NLM_F_MULTI, rd);
+-				if (err < 0) {
+-					cb->args[1] = err;
++				if (err < 0)
+ 					goto out;
+-				}
+ skip:
+-				++idx;
++				*idx += 1;
+ 			}
+ 		}
+ 	}
+ out:
+-	return idx;
++	return err;
+ }
+ 
+ /* Watch incoming packets to learn mapping between Ethernet address
+* Unmerged path include/linux/netdevice.h
+diff --git a/include/linux/rtnetlink.h b/include/linux/rtnetlink.h
+index b89d99ba6bc1..80209d343f8e 100644
+--- a/include/linux/rtnetlink.h
++++ b/include/linux/rtnetlink.h
+@@ -94,7 +94,7 @@ extern int ndo_dflt_fdb_dump(struct sk_buff *skb,
+ 			     struct netlink_callback *cb,
+ 			     struct net_device *dev,
+ 			     struct net_device *filter_dev,
+-			     int idx);
++			     int *idx);
+ extern int ndo_dflt_fdb_add(struct ndmsg *ndm,
+ 			    struct nlattr *tb[],
+ 			    struct net_device *dev,
+* Unmerged path include/net/switchdev.h
+* Unmerged path net/bridge/br_fdb.c
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index 1e1daa30e106..14a4f2cc8e2d 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -392,7 +392,7 @@ int br_fdb_delete(struct ndmsg *ndm, struct nlattr *tb[],
+ int br_fdb_add(struct ndmsg *nlh, struct nlattr *tb[], struct net_device *dev,
+ 	       const unsigned char *addr, u16 vid, u16 nlh_flags);
+ int br_fdb_dump(struct sk_buff *skb, struct netlink_callback *cb,
+-		struct net_device *dev, struct net_device *fdev, int idx);
++		struct net_device *dev, struct net_device *fdev, int *idx);
+ int br_fdb_sync_static(struct net_bridge *br, struct net_bridge_port *p);
+ void br_fdb_unsync_static(struct net_bridge *br, struct net_bridge_port *p);
+ 
+* Unmerged path net/core/rtnetlink.c
+* Unmerged path net/switchdev/switchdev.c
