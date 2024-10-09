@@ -1,0 +1,148 @@
+iommu/vt-d: only unmap mapped entries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [iommu] vt-d: only unmap mapped entries (Jerry Snitselaar) [1499325]
+Rebuild_FUZZ: 91.18%
+commit-author Omer Peleg <omer@cs.technion.ac.il>
+commit 769530e4ba4898748a293592f0920275b40cbb93
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/769530e4.failed
+
+Current unmap implementation unmaps the entire area covered by the IOVA
+range, which is a power-of-2 aligned region. The corresponding map,
+however, only maps those pages originally mapped by the user. This
+discrepancy can lead to unmapping of already unmapped entries, which is
+unneeded work.
+
+With this patch, only mapped pages are unmapped. This is also a baseline
+for a map/unmap implementation based on IOVAs and not iova structures,
+which will allow caching.
+
+	Signed-off-by: Omer Peleg <omer@cs.technion.ac.il>
+[mad@cs.technion.ac.il: rebased and reworded the commit message]
+	Signed-off-by: Adam Morrison <mad@cs.technion.ac.il>
+	Reviewed-by: Shaohua Li <shli@fb.com>
+	Reviewed-by: Ben Serebrin <serebrin@google.com>
+	Signed-off-by: David Woodhouse <David.Woodhouse@intel.com>
+(cherry picked from commit 769530e4ba4898748a293592f0920275b40cbb93)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-iommu.c
+diff --cc drivers/iommu/intel-iommu.c
+index ae278e3a91b2,63b8c026ef9c..000000000000
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@@ -452,10 -457,9 +452,11 @@@ static LIST_HEAD(dmar_rmrr_units)
+  
+  static void flush_unmaps_timeout(unsigned long data);
+  
+ +static DEFINE_TIMER(unmap_timer,  flush_unmaps_timeout, 0, 0);
+ +
+  struct deferred_flush_entry {
+  	struct iova *iova;
++ 	unsigned long nrpages;
+  	struct dmar_domain *domain;
+  	struct page *freelist;
+  };
+@@@ -3465,11 -3538,12 +3466,12 @@@ static void flush_unmaps(void
+  		if (!cap_caching_mode(iommu->cap))
+  			iommu->flush.flush_iotlb(iommu, 0, 0, 0,
+  					 DMA_TLB_GLOBAL_FLUSH);
+ -		for (j = 0; j < flush_table->next; j++) {
+ +		for (j = 0; j < deferred_flush[i].next; j++) {
+  			unsigned long mask;
+  			struct deferred_flush_entry *entry =
+ -						&flush_table->entries[j];
+ +						&deferred_flush->entries[j];
+  			struct iova *iova = entry->iova;
++ 			unsigned long nrpages = entry->nrpages;
+  			struct dmar_domain *domain = entry->domain;
+  			struct page *freelist = entry->freelist;
+  
+@@@ -3488,22 -3561,24 +3489,23 @@@
+  			if (freelist)
+  				dma_free_pagelist(freelist);
+  		}
+ -		flush_table->next = 0;
+ +		deferred_flush[i].next = 0;
+  	}
+  
+ -	flush_data->size = 0;
+ +	list_size = 0;
+  }
+  
+ -static void flush_unmaps_timeout(unsigned long cpuid)
+ +static void flush_unmaps_timeout(unsigned long data)
+  {
+ -	struct deferred_flush_data *flush_data = per_cpu_ptr(&deferred_flush, cpuid);
+  	unsigned long flags;
+  
+ -	spin_lock_irqsave(&flush_data->lock, flags);
+ -	flush_unmaps(flush_data);
+ -	spin_unlock_irqrestore(&flush_data->lock, flags);
+ +	spin_lock_irqsave(&async_umap_flush_lock, flags);
+ +	flush_unmaps();
+ +	spin_unlock_irqrestore(&async_umap_flush_lock, flags);
+  }
+  
+- static void add_unmap(struct dmar_domain *dom, struct iova *iova, struct page *freelist)
++ static void add_unmap(struct dmar_domain *dom, struct iova *iova,
++ 		      unsigned long nrpages, struct page *freelist)
+  {
+  	unsigned long flags;
+  	int entry_id, iommu_id;
+@@@ -3517,23 -3606,26 +3519,24 @@@
+  	iommu = domain_get_iommu(dom);
+  	iommu_id = iommu->seq_id;
+  
+ -	entry_id = flush_data->tables[iommu_id].next;
+ -	++(flush_data->tables[iommu_id].next);
+ +	entry_id = deferred_flush[iommu_id].next;
+ +	++(deferred_flush[iommu_id].next);
+  
+ -	entry = &flush_data->tables[iommu_id].entries[entry_id];
+ +	entry = &deferred_flush[iommu_id].entries[entry_id];
+  	entry->domain = dom;
+  	entry->iova = iova;
++ 	entry->nrpages = nrpages;
+  	entry->freelist = freelist;
+  
+ -	if (!flush_data->timer_on) {
+ -		mod_timer(&flush_data->timer, jiffies + msecs_to_jiffies(10));
+ -		flush_data->timer_on = 1;
+ +	if (!timer_on) {
+ +		mod_timer(&unmap_timer, jiffies + msecs_to_jiffies(10));
+ +		timer_on = 1;
+  	}
+ -	flush_data->size++;
+ -	spin_unlock_irqrestore(&flush_data->lock, flags);
+ -
+ -	put_cpu();
+ +	list_size++;
+ +	spin_unlock_irqrestore(&async_umap_flush_lock, flags);
+  }
+  
+- static void intel_unmap(struct device *dev, dma_addr_t dev_addr)
++ static void intel_unmap(struct device *dev, dma_addr_t dev_addr, size_t size)
+  {
+  	struct dmar_domain *domain;
+  	unsigned long start_pfn, last_pfn;
+@@@ -3625,8 -3734,9 +3630,14 @@@ static void intel_free_coherent(struct 
+  	size = PAGE_ALIGN(size);
+  	order = get_order(size);
+  
+++<<<<<<< HEAD
+ +	intel_unmap(dev, dma_handle);
+ +	free_pages((unsigned long)vaddr, order);
+++=======
++ 	intel_unmap(dev, dma_handle, size);
++ 	if (!dma_release_from_contiguous(dev, page, size >> PAGE_SHIFT))
++ 		__free_pages(page, order);
+++>>>>>>> 769530e4ba48 (iommu/vt-d: only unmap mapped entries)
+  }
+  
+  static void intel_unmap_sg(struct device *dev, struct scatterlist *sglist,
+* Unmerged path drivers/iommu/intel-iommu.c
