@@ -1,0 +1,82 @@
+kvm: x86: reduce collisions in mmu_page_hash
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author David Matlack <dmatlack@google.com>
+commit 114df303a7eeae8b50ebf68229b7e647714a9bea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/114df303.failed
+
+When using two-dimensional paging, the mmu_page_hash (which provides
+lookups for existing kvm_mmu_page structs), becomes imbalanced; with
+too many collisions in buckets 0 and 512. This has been seen to cause
+mmu_lock to be held for multiple milliseconds in kvm_mmu_get_page on
+VMs with a large amount of RAM mapped with 4K pages.
+
+The current hash function uses the lower 10 bits of gfn to index into
+mmu_page_hash. When doing shadow paging, gfn is the address of the
+guest page table being shadow. These tables are 4K-aligned, which
+makes the low bits of gfn a good hash. However, with two-dimensional
+paging, no guest page tables are being shadowed, so gfn is the base
+address that is mapped by the table. Thus page tables (level=1) have
+a 2MB aligned gfn, page directories (level=2) have a 1GB aligned gfn,
+etc. This means hashes will only differ in their 10th bit.
+
+hash_64() provides a better hash. For example, on a VM with ~200G
+(99458 direct=1 kvm_mmu_page structs):
+
+hash            max_mmu_page_hash_collisions
+--------------------------------------------
+low 10 bits     49847
+hash_64         105
+perfect         97
+
+While we're changing the hash, increase the table size by 4x to better
+support large VMs (further reduces number of collisions in 200G VM to
+29).
+
+Note that hash_64() does not provide a good distribution prior to commit
+ef703f49a6c5 ("Eliminate bad hash multipliers from hash_32() and
+hash_64()").
+
+	Signed-off-by: David Matlack <dmatlack@google.com>
+Change-Id: I5aa6b13c834722813c6cca46b8b1ed6f53368ade
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 114df303a7eeae8b50ebf68229b7e647714a9bea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.c
+diff --cc arch/x86/kvm/mmu.c
+index d16e6f650c80,3f9fa39f1469..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -37,10 -38,8 +37,13 @@@
+  #include <linux/slab.h>
+  #include <linux/uaccess.h>
+  #include <linux/hash.h>
+++<<<<<<< HEAD
+ +#include <linux/kern_levels.h>
+++=======
+++>>>>>>> 114df303a7ee (kvm: x86: reduce collisions in mmu_page_hash)
+  
+  #include <asm/page.h>
+ +#include <asm/pat.h>
+  #include <asm/cmpxchg.h>
+  #include <asm/io.h>
+  #include <asm/vmx.h>
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 86bec63d5f8a..91d864af14fc 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -91,7 +91,7 @@ static inline gfn_t gfn_to_index(gfn_t gfn, gfn_t base_gfn, int level)
+ 
+ #define KVM_PERMILLE_MMU_PAGES 20
+ #define KVM_MIN_ALLOC_MMU_PAGES 64
+-#define KVM_MMU_HASH_SHIFT 10
++#define KVM_MMU_HASH_SHIFT 12
+ #define KVM_NUM_MMU_PAGES (1 << KVM_MMU_HASH_SHIFT)
+ #define KVM_MIN_FREE_MMU_PAGES 5
+ #define KVM_REFILL_PAGES 25
+* Unmerged path arch/x86/kvm/mmu.c
