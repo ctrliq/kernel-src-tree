@@ -1,0 +1,177 @@
+mlx5: convert to generic pci_alloc_irq_vectors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Sagi Grimberg <sagi@grimberg.me>
+commit 78249c4215840edb95447ec6867b69a7ac1d7a0d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/78249c42.failed
+
+Now that we have a generic code to allocate an array
+of irq vectors and even correctly spread their affinity,
+correctly handle cpu hotplug events and more, were much
+better off using it.
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Acked-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 78249c4215840edb95447ec6867b69a7ac1d7a0d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/main.c
+index 593e3ff970b9,d2fd55e5c68b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@@ -331,12 -348,11 +325,11 @@@ static void mlx5_free_irq_vectors(struc
+  {
+  	struct mlx5_priv *priv = &dev->priv;
+  
+- 	pci_disable_msix(dev->pdev);
++ 	pci_free_irq_vectors(dev->pdev);
+  	kfree(priv->irq_info);
+- 	kfree(priv->msix_arr);
+  }
+  
+ -struct mlx5_reg_host_endianness {
+ +struct mlx5_reg_host_endianess {
+  	u8	he;
+  	u8      rsvd[15];
+  };
+@@@ -1168,11 -1207,11 +1159,11 @@@ err_affinity_hints
+  err_stop_eqs:
+  	mlx5_stop_eqs(dev);
+  
+ -err_put_uars:
+ -	mlx5_put_uars_page(dev, priv->uar);
+ +err_free_uar:
+ +	mlx5_free_uuars(dev, &priv->uuari);
+  
+  err_disable_msix:
+- 	mlx5_disable_msix(dev);
++ 	mlx5_free_irq_vectors(dev);
+  
+  err_cleanup_once:
+  	if (boot)
+@@@ -1232,8 -1277,8 +1223,13 @@@ static int mlx5_unload_one(struct mlx5_
+  	mlx5_irq_clear_affinity_hints(dev);
+  	free_comp_eqs(dev);
+  	mlx5_stop_eqs(dev);
+++<<<<<<< HEAD
+ +	mlx5_free_uuars(dev, &priv->uuari);
+ +	mlx5_disable_msix(dev);
+++=======
++ 	mlx5_put_uars_page(dev, priv->uar);
++ 	mlx5_free_irq_vectors(dev);
+++>>>>>>> 78249c421584 (mlx5: convert to generic pci_alloc_irq_vectors)
+  	if (cleanup)
+  		mlx5_cleanup_once(dev);
+  	mlx5_stop_health_poll(dev);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+index 572d723827e5,ba1d494b016d..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+@@@ -106,8 -109,7 +106,12 @@@ int mlx5_modify_scheduling_element_cmd(
+  int mlx5_destroy_scheduling_element_cmd(struct mlx5_core_dev *dev, u8 hierarchy,
+  					u32 element_id);
+  int mlx5_wait_for_vf_pages(struct mlx5_core_dev *dev);
+++<<<<<<< HEAD
+ +cycle_t mlx5_read_internal_timer(struct mlx5_core_dev *dev);
+ +u32 mlx5_get_msix_vec(struct mlx5_core_dev *dev, int vecidx);
+++=======
++ u64 mlx5_read_internal_timer(struct mlx5_core_dev *dev);
+++>>>>>>> 78249c421584 (mlx5: convert to generic pci_alloc_irq_vectors)
+  struct mlx5_eq *mlx5_eqn2eq(struct mlx5_core_dev *dev, int eqn);
+  void mlx5_cq_tasklet_cb(unsigned long data);
+  
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index e2c448703ea8..c19d4991469b 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -378,7 +378,7 @@ static void mlx5e_enable_async_events(struct mlx5e_priv *priv)
+ static void mlx5e_disable_async_events(struct mlx5e_priv *priv)
+ {
+ 	clear_bit(MLX5E_STATE_ASYNC_EVENTS_ENABLED, &priv->state);
+-	synchronize_irq(mlx5_get_msix_vec(priv->mdev, MLX5_EQ_VEC_ASYNC));
++	synchronize_irq(pci_irq_vector(priv->mdev->pdev, MLX5_EQ_VEC_ASYNC));
+ }
+ 
+ #define MLX5E_HW2SW_MTU(hwmtu) (hwmtu - (ETH_HLEN + VLAN_HLEN + ETH_FCS_LEN))
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eq.c b/drivers/net/ethernet/mellanox/mlx5/core/eq.c
+index 634e6e3dfa90..4b356831a157 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eq.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eq.c
+@@ -399,7 +399,7 @@ int mlx5_create_map_eq(struct mlx5_core_dev *dev, struct mlx5_eq *eq, u8 vecidx,
+ 		 name, pci_name(dev->pdev));
+ 
+ 	eq->eqn = MLX5_GET(create_eq_out, out, eq_number);
+-	eq->irqn = priv->msix_arr[vecidx].vector;
++	eq->irqn = pci_irq_vector(dev->pdev, vecidx);
+ 	eq->dev = dev;
+ 	eq->doorbell = uar->map + MLX5_EQ_DOORBEL_OFFSET;
+ 	err = request_irq(eq->irqn, mlx5_msix_handler, 0,
+@@ -425,7 +425,7 @@ int mlx5_create_map_eq(struct mlx5_core_dev *dev, struct mlx5_eq *eq, u8 vecidx,
+ 	return 0;
+ 
+ err_irq:
+-	free_irq(priv->msix_arr[vecidx].vector, eq);
++	free_irq(eq->irqn, eq);
+ 
+ err_eq:
+ 	mlx5_cmd_destroy_eq(dev, eq->eqn);
+@@ -457,11 +457,6 @@ int mlx5_destroy_unmap_eq(struct mlx5_core_dev *dev, struct mlx5_eq *eq)
+ }
+ EXPORT_SYMBOL_GPL(mlx5_destroy_unmap_eq);
+ 
+-u32 mlx5_get_msix_vec(struct mlx5_core_dev *dev, int vecidx)
+-{
+-	return dev->priv.msix_arr[MLX5_EQ_VEC_ASYNC].vector;
+-}
+-
+ int mlx5_eq_init(struct mlx5_core_dev *dev)
+ {
+ 	int err;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index a8f2c4a96a9b..32df8b5f8241 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@ -1592,7 +1592,7 @@ static void esw_disable_vport(struct mlx5_eswitch *esw, int vport_num)
+ 	/* Mark this vport as disabled to discard new events */
+ 	vport->enabled = false;
+ 
+-	synchronize_irq(mlx5_get_msix_vec(esw->dev, MLX5_EQ_VEC_ASYNC));
++	synchronize_irq(pci_irq_vector(esw->dev->pdev, MLX5_EQ_VEC_ASYNC));
+ 	/* Wait for current already scheduled events to complete */
+ 	flush_workqueue(esw->work_queue);
+ 	/* Disable events from this vport */
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/health.c b/drivers/net/ethernet/mellanox/mlx5/core/health.c
+index c6679b21884e..a7997f419498 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/health.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/health.c
+@@ -80,7 +80,7 @@ static void trigger_cmd_completions(struct mlx5_core_dev *dev)
+ 	u64 vector;
+ 
+ 	/* wait for pending handlers to complete */
+-	synchronize_irq(dev->priv.msix_arr[MLX5_EQ_VEC_CMD].vector);
++	synchronize_irq(pci_irq_vector(dev->pdev, MLX5_EQ_VEC_CMD));
+ 	spin_lock_irqsave(&dev->cmd.alloc_lock, flags);
+ 	vector = ~dev->cmd.bitmask & ((1ul << (1 << dev->cmd.log_sz)) - 1);
+ 	if (!vector)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+diff --git a/include/linux/mlx5/driver.h b/include/linux/mlx5/driver.h
+index 522c3e2f587a..e8f1034a758b 100644
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -563,7 +563,6 @@ struct mlx5_port_module_event_stats {
+ struct mlx5_priv {
+ 	char			name[MLX5_MAX_NAME_LEN];
+ 	struct mlx5_eq_table	eq_table;
+-	struct msix_entry	*msix_arr;
+ 	struct mlx5_irq_info	*irq_info;
+ 	struct mlx5_uuar_info	uuari;
+ 	MLX5_DECLARE_DOORBELL_LOCK(cq_uar_lock);
