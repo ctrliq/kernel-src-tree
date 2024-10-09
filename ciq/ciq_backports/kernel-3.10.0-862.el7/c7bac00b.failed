@@ -1,0 +1,229 @@
+ibmvnic: Delete napi's when releasing driver resources
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Nathan Fontenot <nfont@linux.vnet.ibm.com>
+commit c7bac00b4056ab951c377aff99bb91b81890c727
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/c7bac00b.failed
+
+The napi structs allocated at drivier initializatio need to be
+free'ed when releasing the drivers resources.
+
+	Signed-off-by: Nathan Fontenot <nfont@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c7bac00b4056ab951c377aff99bb91b81890c727)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index 8b65bfc1f714,d52d98cf9317..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -442,22 -497,187 +442,183 @@@ static int ibmvnic_open(struct net_devi
+  		tx_pool->consumer_index = 0;
+  		tx_pool->producer_index = 0;
+  	}
+ -
+ -	return 0;
+ -}
+ -
+ -static void release_error_buffers(struct ibmvnic_adapter *adapter)
+ -{
+ -	struct device *dev = &adapter->vdev->dev;
+ -	struct ibmvnic_error_buff *error_buff, *tmp;
+ -	unsigned long flags;
+ -
+ -	spin_lock_irqsave(&adapter->error_list_lock, flags);
+ -	list_for_each_entry_safe(error_buff, tmp, &adapter->errors, list) {
+ -		list_del(&error_buff->list);
+ -		dma_unmap_single(dev, error_buff->dma, error_buff->len,
+ -				 DMA_FROM_DEVICE);
+ -		kfree(error_buff->buff);
+ -		kfree(error_buff);
+ +	adapter->bounce_buffer_size =
+ +	    (netdev->mtu + ETH_HLEN - 1) / PAGE_SIZE + 1;
+ +	adapter->bounce_buffer = kmalloc(adapter->bounce_buffer_size,
+ +					 GFP_KERNEL);
+ +	if (!adapter->bounce_buffer)
+ +		goto bounce_alloc_failed;
+ +
+ +	adapter->bounce_buffer_dma = dma_map_single(dev, adapter->bounce_buffer,
+ +						    adapter->bounce_buffer_size,
+ +						    DMA_TO_DEVICE);
+ +	if (dma_mapping_error(dev, adapter->bounce_buffer_dma)) {
+ +		dev_err(dev, "Couldn't map tx bounce buffer\n");
+ +		goto bounce_map_failed;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	spin_unlock_irqrestore(&adapter->error_list_lock, flags);
++ }
++ 
++ static int ibmvnic_login(struct net_device *netdev)
++ {
++ 	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
++ 	unsigned long timeout = msecs_to_jiffies(30000);
++ 	struct device *dev = &adapter->vdev->dev;
++ 
++ 	do {
++ 		if (adapter->renegotiate) {
++ 			adapter->renegotiate = false;
++ 			release_sub_crqs(adapter);
++ 
++ 			reinit_completion(&adapter->init_done);
++ 			send_cap_queries(adapter);
++ 			if (!wait_for_completion_timeout(&adapter->init_done,
++ 							 timeout)) {
++ 				dev_err(dev, "Capabilities query timeout\n");
++ 				return -1;
++ 			}
++ 		}
++ 
++ 		reinit_completion(&adapter->init_done);
++ 		send_login(adapter);
++ 		if (!wait_for_completion_timeout(&adapter->init_done,
++ 						 timeout)) {
++ 			dev_err(dev, "Login timeout\n");
++ 			return -1;
++ 		}
++ 	} while (adapter->renegotiate);
++ 
++ 	return 0;
++ }
++ 
++ static void release_resources(struct ibmvnic_adapter *adapter)
++ {
++ 	int i;
++ 
++ 	release_tx_pools(adapter);
++ 	release_rx_pools(adapter);
++ 
++ 	release_stats_token(adapter);
++ 	release_error_buffers(adapter);
++ 
++ 	if (adapter->napi) {
++ 		for (i = 0; i < adapter->req_rx_queues; i++) {
++ 			if (&adapter->napi[i])
++ 				netif_napi_del(&adapter->napi[i]);
++ 		}
++ 	}
++ }
++ 
++ static int set_link_state(struct ibmvnic_adapter *adapter, u8 link_state)
++ {
++ 	struct net_device *netdev = adapter->netdev;
++ 	unsigned long timeout = msecs_to_jiffies(30000);
++ 	union ibmvnic_crq crq;
++ 	bool resend;
++ 	int rc;
++ 
++ 	netdev_err(netdev, "setting link state %d\n", link_state);
++ 	memset(&crq, 0, sizeof(crq));
++ 	crq.logical_link_state.first = IBMVNIC_CRQ_CMD;
++ 	crq.logical_link_state.cmd = LOGICAL_LINK_STATE;
++ 	crq.logical_link_state.link_state = link_state;
++ 
++ 	do {
++ 		resend = false;
++ 
++ 		reinit_completion(&adapter->init_done);
++ 		rc = ibmvnic_send_crq(adapter, &crq);
++ 		if (rc) {
++ 			netdev_err(netdev, "Failed to set link state\n");
++ 			return rc;
++ 		}
++ 
++ 		if (!wait_for_completion_timeout(&adapter->init_done,
++ 						 timeout)) {
++ 			netdev_err(netdev, "timeout setting link state\n");
++ 			return -1;
++ 		}
++ 
++ 		if (adapter->init_done_rc == 1) {
++ 			/* Partuial success, delay and re-send */
++ 			mdelay(1000);
++ 			resend = true;
++ 		}
++ 	} while (resend);
++ 
++ 	return 0;
++ }
++ 
++ static int set_real_num_queues(struct net_device *netdev)
++ {
++ 	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
++ 	int rc;
++ 
++ 	rc = netif_set_real_num_tx_queues(netdev, adapter->req_tx_queues);
++ 	if (rc) {
++ 		netdev_err(netdev, "failed to set the number of tx queues\n");
++ 		return rc;
++ 	}
++ 
++ 	rc = netif_set_real_num_rx_queues(netdev, adapter->req_rx_queues);
++ 	if (rc)
++ 		netdev_err(netdev, "failed to set the number of rx queues\n");
++ 
++ 	return rc;
++ }
++ 
++ static int init_resources(struct ibmvnic_adapter *adapter)
++ {
++ 	struct net_device *netdev = adapter->netdev;
++ 	int i, rc;
++ 
++ 	rc = set_real_num_queues(netdev);
++ 	if (rc)
++ 		return rc;
++ 
++ 	rc = init_sub_crq_irqs(adapter);
++ 	if (rc) {
++ 		netdev_err(netdev, "failed to initialize sub crq irqs\n");
++ 		return -1;
++ 	}
++ 
++ 	rc = init_stats_token(adapter);
++ 	if (rc)
++ 		return rc;
++ 
++ 	adapter->map_id = 1;
++ 	adapter->napi = kcalloc(adapter->req_rx_queues,
++ 				sizeof(struct napi_struct), GFP_KERNEL);
++ 	if (!adapter->napi)
++ 		return -ENOMEM;
++ 
++ 	for (i = 0; i < adapter->req_rx_queues; i++) {
++ 		netif_napi_add(netdev, &adapter->napi[i], ibmvnic_poll,
++ 			       NAPI_POLL_WEIGHT);
++ 	}
++ 
++ 	send_map_query(adapter);
++ 
++ 	rc = init_rx_pools(netdev);
++ 	if (rc)
++ 		return rc;
++ 
++ 	rc = init_tx_pools(netdev);
++ 	return rc;
++ }
++ 
++ static int __ibmvnic_open(struct net_device *netdev)
++ {
++ 	struct ibmvnic_adapter *adapter = netdev_priv(netdev);
++ 	enum vnic_state prev_state = adapter->state;
++ 	int i, rc;
++ 
++ 	adapter->state = VNIC_OPENING;
+++>>>>>>> c7bac00b4056 (ibmvnic: Delete napi's when releasing driver resources)
+  	replenish_pools(adapter);
+  
+ -	for (i = 0; i < adapter->req_rx_queues; i++)
+ -		napi_enable(&adapter->napi[i]);
+ -
+  	/* We're ready to receive frames, enable the sub-crq interrupts and
+  	 * set the logical link state to up
+  	 */
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
