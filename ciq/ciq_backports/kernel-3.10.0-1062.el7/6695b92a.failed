@@ -1,0 +1,175 @@
+seqlock: Better document raw_write_seqcount_latch()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 6695b92a60bc7160c92d6dc5b17cc79673017c2f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/6695b92a.failed
+
+Improve the documentation of the latch technique as used in the
+current timekeeping code, such that it can be readily employed
+elsewhere.
+
+Borrow from the comments in timekeeping and replace those with a
+reference to this more generic comment.
+
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: David Woodhouse <David.Woodhouse@intel.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Reviewed-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+	Acked-by: Michel Lespinasse <walken@google.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+(cherry picked from commit 6695b92a60bc7160c92d6dc5b17cc79673017c2f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/seqlock.h
+diff --cc include/linux/seqlock.h
+index 48f2f69e3867,1c0cf3102fdc..000000000000
+--- a/include/linux/seqlock.h
++++ b/include/linux/seqlock.h
+@@@ -171,9 -220,96 +171,100 @@@ static inline int read_seqcount_retry(c
+  }
+  
+  
+++<<<<<<< HEAD
+ +/*
+++=======
++ 
++ static inline void raw_write_seqcount_begin(seqcount_t *s)
++ {
++ 	s->sequence++;
++ 	smp_wmb();
++ }
++ 
++ static inline void raw_write_seqcount_end(seqcount_t *s)
++ {
++ 	smp_wmb();
++ 	s->sequence++;
++ }
++ 
++ /**
+++>>>>>>> 6695b92a60bc (seqlock: Better document raw_write_seqcount_latch())
+   * raw_write_seqcount_latch - redirect readers to even/odd copy
+   * @s: pointer to seqcount_t
++  *
++  * The latch technique is a multiversion concurrency control method that allows
++  * queries during non-atomic modifications. If you can guarantee queries never
++  * interrupt the modification -- e.g. the concurrency is strictly between CPUs
++  * -- you most likely do not need this.
++  *
++  * Where the traditional RCU/lockless data structures rely on atomic
++  * modifications to ensure queries observe either the old or the new state the
++  * latch allows the same for non-atomic updates. The trade-off is doubling the
++  * cost of storage; we have to maintain two copies of the entire data
++  * structure.
++  *
++  * Very simply put: we first modify one copy and then the other. This ensures
++  * there is always one copy in a stable state, ready to give us an answer.
++  *
++  * The basic form is a data structure like:
++  *
++  * struct latch_struct {
++  *	seqcount_t		seq;
++  *	struct data_struct	data[2];
++  * };
++  *
++  * Where a modification, which is assumed to be externally serialized, does the
++  * following:
++  *
++  * void latch_modify(struct latch_struct *latch, ...)
++  * {
++  *	smp_wmb();	<- Ensure that the last data[1] update is visible
++  *	latch->seq++;
++  *	smp_wmb();	<- Ensure that the seqcount update is visible
++  *
++  *	modify(latch->data[0], ...);
++  *
++  *	smp_wmb();	<- Ensure that the data[0] update is visible
++  *	latch->seq++;
++  *	smp_wmb();	<- Ensure that the seqcount update is visible
++  *
++  *	modify(latch->data[1], ...);
++  * }
++  *
++  * The query will have a form like:
++  *
++  * struct entry *latch_query(struct latch_struct *latch, ...)
++  * {
++  *	struct entry *entry;
++  *	unsigned seq, idx;
++  *
++  *	do {
++  *		seq = latch->seq;
++  *		smp_rmb();
++  *
++  *		idx = seq & 0x01;
++  *		entry = data_query(latch->data[idx], ...);
++  *
++  *		smp_rmb();
++  *	} while (seq != latch->seq);
++  *
++  *	return entry;
++  * }
++  *
++  * So during the modification, queries are first redirected to data[1]. Then we
++  * modify data[0]. When that is complete, we redirect queries back to data[0]
++  * and we can modify data[1].
++  *
++  * NOTE: The non-requirement for atomic modifications does _NOT_ include
++  *       the publishing of new entries in the case where data is a dynamic
++  *       data structure.
++  *
++  *       An iteration might start in data[0] and get suspended long enough
++  *       to miss an entire modification sequence, once it resumes it might
++  *       observe the new entry.
++  *
++  * NOTE: When data is a dynamic data structure; one should use regular RCU
++  *       patterns to manage the lifetimes of the objects within.
+   */
+  static inline void raw_write_seqcount_latch(seqcount_t *s)
+  {
+* Unmerged path include/linux/seqlock.h
+diff --git a/kernel/time/timekeeping.c b/kernel/time/timekeeping.c
+index d7063566cc22..31054114ca34 100644
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@ -229,32 +229,7 @@ static inline s64 timekeeping_get_ns(struct tk_read_base *tkr)
+  * We want to use this from any context including NMI and tracing /
+  * instrumenting the timekeeping code itself.
+  *
+- * So we handle this differently than the other timekeeping accessor
+- * functions which retry when the sequence count has changed. The
+- * update side does:
+- *
+- * smp_wmb();	<- Ensure that the last base[1] update is visible
+- * tkf->seq++;
+- * smp_wmb();	<- Ensure that the seqcount update is visible
+- * update(tkf->base[0], tkr);
+- * smp_wmb();	<- Ensure that the base[0] update is visible
+- * tkf->seq++;
+- * smp_wmb();	<- Ensure that the seqcount update is visible
+- * update(tkf->base[1], tkr);
+- *
+- * The reader side does:
+- *
+- * do {
+- *	seq = tkf->seq;
+- *	smp_rmb();
+- *	idx = seq & 0x01;
+- *	now = now(tkf->base[idx]);
+- *	smp_rmb();
+- * } while (seq != tkf->seq)
+- *
+- * As long as we update base[0] readers are forced off to
+- * base[1]. Once base[0] is updated readers are redirected to base[0]
+- * and the base[1] update takes place.
++ * Employ the latch technique; see @raw_write_seqcount_latch.
+  *
+  * So if a NMI hits the update of base[0] then it will use base[1]
+  * which is still consistent. In the worst case this can result is a
