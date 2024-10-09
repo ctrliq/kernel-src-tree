@@ -1,0 +1,581 @@
+net/mlx5e: IPSec, Add Innova IPSec offload TX data path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: IPSec, Add Innova IPSec offload TX data path (Kamal Heib) [1456677 1456694]
+Rebuild_FUZZ: 96.23%
+commit-author Ilan Tayari <ilant@mellanox.com>
+commit 2ac9cfe78223bb88be8cff3b59e0e13551b4e29c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2ac9cfe7.failed
+
+In the TX data path, prepend a special metadata ethertype which
+instructs the hardware to perform cryptography.
+
+In addition, fill Software-Parser segment in TX descriptor so
+that the hardware may parse the ESP protocol, and perform TX
+checksum offload on the inner payload.
+
+Support GSO, by providing the inverse of gso_size in the metadata.
+This allows the FPGA to update the ESP header (seqno and seqiv) on the
+resulting packets, by calculating the packet number within the GSO
+back from the TCP sequence number.
+
+Note that for GSO SKBs, the stack does not include an ESP trailer,
+unlike the non-GSO case.
+
+	Signed-off-by: Ilan Tayari <ilant@mellanox.com>
+	Signed-off-by: Yossi Kuperman <yossiku@mellanox.com>
+	Signed-off-by: Yevgeny Kliteynik <kliteyn@mellanox.com>
+	Signed-off-by: Boris Pismenny <borisp@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 2ac9cfe78223bb88be8cff3b59e0e13551b4e29c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_rxtx.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+#	drivers/net/ethernet/mellanox/mlx5/core/ipoib.h
+diff --cc drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+index 1d7bd82a1fb1,ffc90b3c6ac7..000000000000
+--- a/drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
++++ b/drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+@@@ -28,22 -28,58 +28,69 @@@
+   * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+   * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   * SOFTWARE.
+ - *
+   */
+  
+ -#ifndef __MLX5E_IPSEC_H__
+ -#define __MLX5E_IPSEC_H__
+ +/*
+ + * This file is conditionally built on PowerPC only.  Otherwise weak symbol
+ + * versions of the functions exported from here are used.
+ + */
+  
+ -#ifdef CONFIG_MLX5_EN_IPSEC
+ +#include "ipath_kernel.h"
+  
+++<<<<<<< HEAD:drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+ +/**
+ + * ipath_enable_wc - enable write combining for MMIO writes to the device
+ + * @dd: infinipath device
+ + *
+ + * Nothing to do on PowerPC, so just return without error.
+ + */
+ +int ipath_enable_wc(struct ipath_devdata *dd)
+++=======
++ #include <linux/mlx5/device.h>
++ #include <net/xfrm.h>
++ #include <linux/idr.h>
++ 
++ #define MLX5E_IPSEC_SADB_RX_BITS 10
++ #define MLX5E_METADATA_ETHER_TYPE (0x8CE4)
++ #define MLX5E_METADATA_ETHER_LEN 8
++ 
++ struct mlx5e_priv;
++ 
++ struct mlx5e_ipsec_sw_stats {
++ 	atomic64_t ipsec_rx_drop_sp_alloc;
++ 	atomic64_t ipsec_rx_drop_sadb_miss;
++ 	atomic64_t ipsec_rx_drop_syndrome;
++ 	atomic64_t ipsec_tx_drop_bundle;
++ 	atomic64_t ipsec_tx_drop_no_state;
++ 	atomic64_t ipsec_tx_drop_not_ip;
++ 	atomic64_t ipsec_tx_drop_trailer;
++ 	atomic64_t ipsec_tx_drop_metadata;
++ };
++ 
++ struct mlx5e_ipsec {
++ 	struct mlx5e_priv *en_priv;
++ 	DECLARE_HASHTABLE(sadb_rx, MLX5E_IPSEC_SADB_RX_BITS);
++ 	spinlock_t sadb_rx_lock; /* Protects sadb_rx and halloc */
++ 	struct ida halloc;
++ 	struct mlx5e_ipsec_sw_stats sw_stats;
++ };
++ 
++ void mlx5e_ipsec_build_inverse_table(void);
++ int mlx5e_ipsec_init(struct mlx5e_priv *priv);
++ void mlx5e_ipsec_cleanup(struct mlx5e_priv *priv);
++ void mlx5e_ipsec_build_netdev(struct mlx5e_priv *priv);
++ 
++ struct xfrm_state *mlx5e_ipsec_sadb_rx_lookup(struct mlx5e_ipsec *dev,
++ 					      unsigned int handle);
++ 
++ #else
++ 
++ static inline void mlx5e_ipsec_build_inverse_table(void)
++ {
++ }
++ 
++ static inline int mlx5e_ipsec_init(struct mlx5e_priv *priv)
+++>>>>>>> 2ac9cfe78223 (net/mlx5e: IPSec, Add Innova IPSec offload TX data path):drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.h
+  {
+  	return 0;
+  }
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 08e121a5e7e2,e1b7ddfecd01..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -295,13 -307,142 +295,144 @@@ struct mlx5e_cq 
+  	struct mlx5_frag_wq_ctrl   wq_ctrl;
+  } ____cacheline_aligned_in_smp;
+  
+ -struct mlx5e_tx_wqe_info {
+ -	struct sk_buff *skb;
+ -	u32 num_bytes;
+ -	u8  num_wqebbs;
+ -	u8  num_dma;
+ -};
+ -
+ +struct mlx5e_rq;
+ +typedef void (*mlx5e_fp_handle_rx_cqe)(struct mlx5e_rq *rq,
+ +				       struct mlx5_cqe64 *cqe);
+ +typedef int (*mlx5e_fp_alloc_wqe)(struct mlx5e_rq *rq, struct mlx5e_rx_wqe *wqe,
+ +				  u16 ix);
+ +
+++<<<<<<< HEAD
+ +typedef void (*mlx5e_fp_dealloc_wqe)(struct mlx5e_rq *rq, u16 ix);
+++=======
++ enum mlx5e_dma_map_type {
++ 	MLX5E_DMA_MAP_SINGLE,
++ 	MLX5E_DMA_MAP_PAGE
++ };
++ 
++ struct mlx5e_sq_dma {
++ 	dma_addr_t              addr;
++ 	u32                     size;
++ 	enum mlx5e_dma_map_type type;
++ };
++ 
++ enum {
++ 	MLX5E_SQ_STATE_ENABLED,
++ 	MLX5E_SQ_STATE_IPSEC,
++ };
++ 
++ struct mlx5e_sq_wqe_info {
++ 	u8  opcode;
++ 	u8  num_wqebbs;
++ };
++ 
++ struct mlx5e_txqsq {
++ 	/* data path */
++ 
++ 	/* dirtied @completion */
++ 	u16                        cc;
++ 	u32                        dma_fifo_cc;
++ 
++ 	/* dirtied @xmit */
++ 	u16                        pc ____cacheline_aligned_in_smp;
++ 	u32                        dma_fifo_pc;
++ 	struct mlx5e_sq_stats      stats;
++ 
++ 	struct mlx5e_cq            cq;
++ 
++ 	/* write@xmit, read@completion */
++ 	struct {
++ 		struct mlx5e_sq_dma       *dma_fifo;
++ 		struct mlx5e_tx_wqe_info  *wqe_info;
++ 	} db;
++ 
++ 	/* read only */
++ 	struct mlx5_wq_cyc         wq;
++ 	u32                        dma_fifo_mask;
++ 	void __iomem              *uar_map;
++ 	struct netdev_queue       *txq;
++ 	u32                        sqn;
++ 	u16                        max_inline;
++ 	u8                         min_inline_mode;
++ 	u16                        edge;
++ 	struct device             *pdev;
++ 	struct mlx5e_tstamp       *tstamp;
++ 	__be32                     mkey_be;
++ 	unsigned long              state;
++ 
++ 	/* control path */
++ 	struct mlx5_wq_ctrl        wq_ctrl;
++ 	struct mlx5e_channel      *channel;
++ 	int                        txq_ix;
++ 	u32                        rate_limit;
++ } ____cacheline_aligned_in_smp;
++ 
++ struct mlx5e_xdpsq {
++ 	/* data path */
++ 
++ 	/* dirtied @rx completion */
++ 	u16                        cc;
++ 	u16                        pc;
++ 
++ 	struct mlx5e_cq            cq;
++ 
++ 	/* write@xmit, read@completion */
++ 	struct {
++ 		struct mlx5e_dma_info     *di;
++ 		bool                       doorbell;
++ 	} db;
++ 
++ 	/* read only */
++ 	struct mlx5_wq_cyc         wq;
++ 	void __iomem              *uar_map;
++ 	u32                        sqn;
++ 	struct device             *pdev;
++ 	__be32                     mkey_be;
++ 	u8                         min_inline_mode;
++ 	unsigned long              state;
++ 
++ 	/* control path */
++ 	struct mlx5_wq_ctrl        wq_ctrl;
++ 	struct mlx5e_channel      *channel;
++ } ____cacheline_aligned_in_smp;
++ 
++ struct mlx5e_icosq {
++ 	/* data path */
++ 
++ 	/* dirtied @completion */
++ 	u16                        cc;
++ 
++ 	/* dirtied @xmit */
++ 	u16                        pc ____cacheline_aligned_in_smp;
++ 	u32                        dma_fifo_pc;
++ 	u16                        prev_cc;
++ 
++ 	struct mlx5e_cq            cq;
++ 
++ 	/* write@xmit, read@completion */
++ 	struct {
++ 		struct mlx5e_sq_wqe_info *ico_wqe;
++ 	} db;
++ 
++ 	/* read only */
++ 	struct mlx5_wq_cyc         wq;
++ 	void __iomem              *uar_map;
++ 	u32                        sqn;
++ 	u16                        edge;
++ 	struct device             *pdev;
++ 	__be32                     mkey_be;
++ 	unsigned long              state;
++ 
++ 	/* control path */
++ 	struct mlx5_wq_ctrl        wq_ctrl;
++ 	struct mlx5e_channel      *channel;
++ } ____cacheline_aligned_in_smp;
++ 
++ static inline bool
++ mlx5e_wqc_has_room_for(struct mlx5_wq_cyc *wq, u16 cc, u16 pc, u16 n)
++ {
++ 	return (((wq->sz_m1 & (cc - pc)) >= n) || (cc == pc));
++ }
+++>>>>>>> 2ac9cfe78223 (net/mlx5e: IPSec, Add Innova IPSec offload TX data path)
+  
+  struct mlx5e_dma_info {
+  	struct page	*page;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 5a367b6ed375,a037bd7edb46..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -908,76 -1096,34 +908,85 @@@ static int mlx5e_alloc_sq_txq_db(struc
+  	return 0;
+  }
+  
+ -static int mlx5e_alloc_txqsq(struct mlx5e_channel *c,
+ -			     int txq_ix,
+ -			     struct mlx5e_params *params,
+ -			     struct mlx5e_sq_param *param,
+ -			     struct mlx5e_txqsq *sq)
+ +static void mlx5e_free_sq_db(struct mlx5e_sq *sq)
+  {
+ -	void *sqc_wq               = MLX5_ADDR_OF(sqc, param->sqc, wq);
+ -	struct mlx5_core_dev *mdev = c->mdev;
+ +	switch (sq->type) {
+ +	case MLX5E_SQ_TXQ:
+ +		mlx5e_free_sq_txq_db(sq);
+ +		break;
+ +	case MLX5E_SQ_ICO:
+ +		mlx5e_free_sq_ico_db(sq);
+ +		break;
+ +	}
+ +}
+ +
+ +static int mlx5e_alloc_sq_db(struct mlx5e_sq *sq, int numa)
+ +{
+ +	switch (sq->type) {
+ +	case MLX5E_SQ_TXQ:
+ +		return mlx5e_alloc_sq_txq_db(sq, numa);
+ +	case MLX5E_SQ_ICO:
+ +		return mlx5e_alloc_sq_ico_db(sq, numa);
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +static int mlx5e_create_sq(struct mlx5e_channel *c,
+ +			   int tc,
+ +			   struct mlx5e_sq_param *param,
+ +			   struct mlx5e_sq *sq)
+ +{
+ +	struct mlx5e_priv *priv = c->priv;
+ +	struct mlx5_core_dev *mdev = priv->mdev;
+ +
+ +	void *sqc = param->sqc;
+ +	void *sqc_wq = MLX5_ADDR_OF(sqc, sqc, wq);
+ +	u16 sq_max_wqebbs;
+  	int err;
+  
+ +	sq->type      = param->type;
+  	sq->pdev      = c->pdev;
+ -	sq->tstamp    = c->tstamp;
+ +	sq->tstamp    = &priv->tstamp;
+  	sq->mkey_be   = c->mkey_be;
+  	sq->channel   = c;
+++<<<<<<< HEAD
+ +	sq->tc        = tc;
+++=======
++ 	sq->txq_ix    = txq_ix;
++ 	sq->uar_map   = mdev->mlx5e_res.bfreg.map;
++ 	sq->max_inline      = params->tx_max_inline;
++ 	sq->min_inline_mode = params->tx_min_inline_mode;
++ 	if (MLX5_IPSEC_DEV(c->priv->mdev))
++ 		set_bit(MLX5E_SQ_STATE_IPSEC, &sq->state);
+++>>>>>>> 2ac9cfe78223 (net/mlx5e: IPSec, Add Innova IPSec offload TX data path)
+  
+ -	param->wq.db_numa_node = cpu_to_node(c->cpu);
+ -	err = mlx5_wq_cyc_create(mdev, &param->wq, sqc_wq, &sq->wq, &sq->wq_ctrl);
+ +	err = mlx5_alloc_map_uar(mdev, &sq->uar, !!MLX5_CAP_GEN(mdev, bf));
+  	if (err)
+  		return err;
+ -	sq->wq.db    = &sq->wq.db[MLX5_SND_DBR];
+  
+ -	err = mlx5e_alloc_txqsq_db(sq, cpu_to_node(c->cpu));
+ +	sq->uar_map = sq->bfreg.map;
+ +	param->wq.db_numa_node = cpu_to_node(c->cpu);
+ +
+ +	err = mlx5_wq_cyc_create(mdev, &param->wq, sqc_wq, &sq->wq,
+ +				 &sq->wq_ctrl);
+ +	if (err)
+ +		goto err_unmap_free_uar;
+ +
+ +	sq->wq.db       = &sq->wq.db[MLX5_SND_DBR];
+ +	if (sq->uar.bf_map) {
+ +		set_bit(MLX5E_SQ_STATE_BF_ENABLE, &sq->state);
+ +		sq->uar_map = sq->uar.bf_map;
+ +	} else {
+ +		sq->uar_map = sq->uar.map;
+ +	}
+ +	sq->bf_buf_size = (1 << MLX5_CAP_GEN(mdev, log_bf_reg_size)) / 2;
+ +	sq->max_inline  = param->max_inline;
+ +	sq->min_inline_mode =
+ +		MLX5_CAP_ETH(mdev, wqe_inline_mode) == MLX5_CAP_INLINE_MODE_VPORT_CONTEXT ?
+ +		param->min_inline_mode : 0;
+ +
+ +	err = mlx5e_alloc_sq_db(sq, cpu_to_node(c->cpu));
+  	if (err)
+  		goto err_sq_wq_destroy;
+  
+@@@ -1633,11 -1934,8 +1642,16 @@@ static void mlx5e_build_sq_param(struc
+  	void *wq = MLX5_ADDR_OF(sqc, sqc, wq);
+  
+  	mlx5e_build_sq_param_common(priv, param);
+++<<<<<<< HEAD
+ +	MLX5_SET(wq, wq, log_wq_sz,     priv->params.log_sq_size);
+ +
+ +	param->max_inline = priv->params.tx_max_inline;
+ +	param->min_inline_mode = priv->params.tx_min_inline_mode;
+ +	param->type = MLX5E_SQ_TXQ;
+++=======
++ 	MLX5_SET(wq, wq, log_wq_sz, params->log_sq_size);
++ 	MLX5_SET(sqc, sqc, allow_swp, !!MLX5_IPSEC_DEV(priv->mdev));
+++>>>>>>> 2ac9cfe78223 (net/mlx5e: IPSec, Add Innova IPSec offload TX data path)
+  }
+  
+  static void mlx5e_build_common_cq_param(struct mlx5e_priv *priv,
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+index 1faf0998da5b,aaa0f4ebba9a..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@@ -33,7 -33,8 +33,12 @@@
+  #include <linux/tcp.h>
+  #include <linux/if_vlan.h>
+  #include "en.h"
+++<<<<<<< HEAD
+ +#include "ipoib.h"
+++=======
++ #include "ipoib/ipoib.h"
++ #include "en_accel/ipsec_rxtx.h"
+++>>>>>>> 2ac9cfe78223 (net/mlx5e: IPSec, Add Innova IPSec offload TX data path)
+  
+  #define MLX5E_SQ_NOPS_ROOM  MLX5_SEND_WQE_MAX_WQEBBS
+  #define MLX5E_SQ_STOP_ROOM (MLX5_SEND_WQE_MAX_WQEBBS +\
+@@@ -374,12 -294,67 +379,66 @@@ static netdev_tx_t mlx5e_sq_xmit(struc
+  
+  	/* fill sq edge with nops to avoid wqe wrap around */
+  	while ((pi = (sq->pc & wq->sz_m1)) > sq->edge) {
+++<<<<<<< HEAD
+ +		sq->db.txq.skb[pi] = NULL;
+ +		mlx5e_send_nop(sq, false);
+++=======
++ 		sq->db.wqe_info[pi].skb = NULL;
++ 		mlx5e_post_nop(wq, sq->sqn, &sq->pc);
++ 		sq->stats.nop++;
++ 	}
++ }
++ 
++ static netdev_tx_t mlx5e_sq_xmit(struct mlx5e_txqsq *sq, struct sk_buff *skb,
++ 				 struct mlx5e_tx_wqe *wqe, u16 pi)
++ {
++ 	struct mlx5e_tx_wqe_info *wi   = &sq->db.wqe_info[pi];
++ 
++ 	struct mlx5_wqe_ctrl_seg *cseg = &wqe->ctrl;
++ 	struct mlx5_wqe_eth_seg  *eseg = &wqe->eth;
++ 
++ 	unsigned char *skb_data = skb->data;
++ 	unsigned int skb_len = skb->len;
++ 	u8  opcode = MLX5_OPCODE_SEND;
++ 	unsigned int num_bytes;
++ 	int num_dma;
++ 	u16 headlen;
++ 	u16 ds_cnt;
++ 	u16 ihs;
++ 
++ 	mlx5e_txwqe_build_eseg_csum(sq, skb, eseg);
++ 
++ 	if (skb_is_gso(skb)) {
++ 		opcode = MLX5_OPCODE_LSO;
++ 		ihs = mlx5e_txwqe_build_eseg_gso(sq, skb, eseg, &num_bytes);
++ 		sq->stats.packets += skb_shinfo(skb)->gso_segs;
++ 	} else {
++ 		ihs = mlx5e_calc_min_inline(sq->min_inline_mode, skb);
++ 		num_bytes = max_t(unsigned int, skb->len, ETH_ZLEN);
++ 		sq->stats.packets++;
++ 	}
++ 	sq->stats.bytes += num_bytes;
++ 	sq->stats.xmit_more += skb->xmit_more;
++ 
++ 	ds_cnt = sizeof(*wqe) / MLX5_SEND_WQE_DS;
++ 	if (ihs) {
++ 		if (skb_vlan_tag_present(skb)) {
++ 			mlx5e_insert_vlan(eseg->inline_hdr.start, skb, ihs, &skb_data, &skb_len);
++ 			ihs += VLAN_HLEN;
++ 		} else {
++ 			memcpy(eseg->inline_hdr.start, skb_data, ihs);
++ 			mlx5e_tx_skb_pull_inline(&skb_data, &skb_len, ihs);
++ 		}
++ 		eseg->inline_hdr.sz = cpu_to_be16(ihs);
++ 		ds_cnt += DIV_ROUND_UP(ihs - sizeof(eseg->inline_hdr.start), MLX5_SEND_WQE_DS);
++ 	} else if (skb_vlan_tag_present(skb)) {
++ 		eseg->insert.type = cpu_to_be16(MLX5_ETH_WQE_INSERT_VLAN);
++ 		eseg->insert.vlan_tci = cpu_to_be16(skb_vlan_tag_get(skb));
+++>>>>>>> 2ac9cfe78223 (net/mlx5e: IPSec, Add Innova IPSec offload TX data path)
+  	}
+  
+ -	headlen = skb_len - skb->data_len;
+ -	num_dma = mlx5e_txwqe_build_dsegs(sq, skb, skb_data, headlen,
+ -					  (struct mlx5_wqe_data_seg *)cseg + ds_cnt);
+ -	if (unlikely(num_dma < 0))
+ -		goto dma_unmap_wqe_err;
+ -
+ -	mlx5e_txwqe_complete(sq, skb, opcode, ds_cnt + num_dma,
+ -			     num_bytes, num_dma, wi, cseg);
+ +	if (bf)
+ +		sq->bf_budget--;
+  
+  	return NETDEV_TX_OK;
+  
+@@@ -395,9 -370,22 +454,26 @@@ dma_unmap_wqe_err
+  netdev_tx_t mlx5e_xmit(struct sk_buff *skb, struct net_device *dev)
+  {
+  	struct mlx5e_priv *priv = netdev_priv(dev);
+++<<<<<<< HEAD
+ +	struct mlx5e_sq *sq = priv->txq_to_sq_map[skb_get_queue_mapping(skb)];
+++=======
++ 	struct mlx5e_txqsq *sq = priv->txq2sq[skb_get_queue_mapping(skb)];
++ 	struct mlx5_wq_cyc *wq = &sq->wq;
++ 	u16 pi = sq->pc & wq->sz_m1;
++ 	struct mlx5e_tx_wqe *wqe = mlx5_wq_cyc_get_wqe(wq, pi);
+++>>>>>>> 2ac9cfe78223 (net/mlx5e: IPSec, Add Innova IPSec offload TX data path)
++ 
++ 	memset(wqe, 0, sizeof(*wqe));
++ 
++ #ifdef CONFIG_MLX5_EN_IPSEC
++ 	if (sq->state & BIT(MLX5E_SQ_STATE_IPSEC)) {
++ 		skb = mlx5e_ipsec_handle_tx_skb(dev, wqe, skb);
++ 		if (unlikely(!skb))
++ 			return NETDEV_TX_OK;
++ 	}
++ #endif
+  
+- 	return mlx5e_sq_xmit(sq, skb);
++ 	return mlx5e_sq_xmit(sq, skb, wqe, pi);
+  }
+  
+  bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/ipoib.h
+index 89bca182464c,e37ae2598dbb..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib.h
+@@@ -28,26 -28,28 +28,45 @@@
+   * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+   * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   * SOFTWARE.
+ - *
+   */
+  
+ -#ifndef __MLX5E_IPSEC_RXTX_H__
+ -#define __MLX5E_IPSEC_RXTX_H__
+ +#ifndef __MLX5E_IPOB_H__
+ +#define __MLX5E_IPOB_H__
+  
+++<<<<<<< HEAD:drivers/net/ethernet/mellanox/mlx5/core/ipoib.h
+ +#include <linux/mlx5/fs.h>
+++=======
++ #ifdef CONFIG_MLX5_EN_IPSEC
++ 
++ #include <linux/skbuff.h>
+++>>>>>>> 2ac9cfe78223 (net/mlx5e: IPSec, Add Innova IPSec offload TX data path):drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_rxtx.h
+  #include "en.h"
+  
+ -struct sk_buff *mlx5e_ipsec_handle_rx_skb(struct net_device *netdev,
+ -					  struct sk_buff *skb);
+ -void mlx5e_ipsec_handle_rx_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe);
+ +#define MLX5I_MAX_NUM_TC 1
+ +
+++<<<<<<< HEAD:drivers/net/ethernet/mellanox/mlx5/core/ipoib.h
+ +/* ipoib rdma netdev's private data structure */
+ +struct mlx5i_priv {
+ +	struct mlx5_core_qp qp;
+ +	char  *mlx5e_priv[0];
+ +};
+ +
+ +/* Extract mlx5e_priv from IPoIB netdev */
+ +#define mlx5i_epriv(netdev) ((void *)(((struct mlx5i_priv *)netdev_priv(netdev))->mlx5e_priv))
+ +
+ +netdev_tx_t mlx5i_sq_xmit(struct mlx5e_txqsq *sq, struct sk_buff *skb,
+ +			  struct mlx5_av *av, u32 dqpn, u32 dqkey);
+  
+ +#endif /* __MLX5E_IPOB_H__ */
+++=======
++ void mlx5e_ipsec_inverse_table_init(void);
++ bool mlx5e_ipsec_feature_check(struct sk_buff *skb, struct net_device *netdev,
++ 			       netdev_features_t features);
++ struct sk_buff *mlx5e_ipsec_handle_tx_skb(struct net_device *netdev,
++ 					  struct mlx5e_tx_wqe *wqe,
++ 					  struct sk_buff *skb);
++ 
++ #endif /* CONFIG_MLX5_EN_IPSEC */
++ 
++ #endif /* __MLX5E_IPSEC_RXTX_H__ */
+++>>>>>>> 2ac9cfe78223 (net/mlx5e: IPSec, Add Innova IPSec offload TX data path):drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_rxtx.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_rxtx.c
+* Unmerged path drivers/infiniband/hw/ipath/ipath_wc_ppc64.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_rxtx.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/ipoib.h
