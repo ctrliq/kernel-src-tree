@@ -1,0 +1,128 @@
+fsnotify: Fix possible use-after-free in inode iteration on umount
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 5716863e0f8251d3360d4cbfc0e44e08007075df
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/5716863e.failed
+
+fsnotify_unmount_inodes() plays complex tricks to pin next inode in the
+sb->s_inodes list when iterating over all inodes. Furthermore the code has a
+bug that if the current inode is the last on i_sb_list that does not have e.g.
+I_FREEING set, then we leave next_i pointing to inode which may get removed
+from the i_sb_list once we drop s_inode_list_lock thus resulting in
+use-after-free issues (usually manifesting as infinite looping in
+fsnotify_unmount_inodes()).
+
+Fix the problem by keeping current inode pinned somewhat longer. Then we can
+make the code much simpler and standard.
+
+CC: stable@vger.kernel.org
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit 5716863e0f8251d3360d4cbfc0e44e08007075df)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/inode_mark.c
+diff --cc fs/notify/inode_mark.c
+index 77720bac65c5,a3645249f7ec..000000000000
+--- a/fs/notify/inode_mark.c
++++ b/fs/notify/inode_mark.c
+@@@ -240,19 -143,17 +240,24 @@@ out
+  
+  /**
+   * fsnotify_unmount_inodes - an sb is unmounting.  handle any watched inodes.
+ - * @sb: superblock being unmounted.
+ + * @list: list of inodes being unmounted (sb->s_inodes)
+   *
+   * Called during unmount with no locks held, so needs to be safe against
+ - * concurrent modifiers. We temporarily drop sb->s_inode_list_lock and CAN block.
+ + * concurrent modifiers. We temporarily drop inode_sb_list_lock and CAN block.
+   */
+ -void fsnotify_unmount_inodes(struct super_block *sb)
+ +void fsnotify_unmount_inodes(struct list_head *list)
+  {
+- 	struct inode *inode, *next_i, *need_iput = NULL;
++ 	struct inode *inode, *iput_inode = NULL;
+  
+++<<<<<<< HEAD
+ +	spin_lock(&inode_sb_list_lock);
+ +	list_for_each_entry_safe(inode, next_i, list, i_sb_list) {
+ +		struct inode *need_iput_tmp;
+ +
+++=======
++ 	spin_lock(&sb->s_inode_list_lock);
++ 	list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+++>>>>>>> 5716863e0f82 (fsnotify: Fix possible use-after-free in inode iteration on umount)
+  		/*
+  		 * We cannot __iget() an inode in state I_FREEING,
+  		 * I_WILL_FREE, or I_NEW which is fine because by that point
+@@@ -275,49 -176,24 +280,53 @@@
+  			continue;
+  		}
+  
+- 		need_iput_tmp = need_iput;
+- 		need_iput = NULL;
+- 
+- 		/* In case fsnotify_inode_delete() drops a reference. */
+- 		if (inode != need_iput_tmp)
+- 			__iget(inode);
+- 		else
+- 			need_iput_tmp = NULL;
++ 		__iget(inode);
+  		spin_unlock(&inode->i_lock);
+++<<<<<<< HEAD
+ +
+ +		/* In case the dropping of a reference would nuke next_i. */
+ +		while (&next_i->i_sb_list != list) {
+ +			spin_lock(&next_i->i_lock);
+ +			if (!(next_i->i_state & (I_FREEING | I_WILL_FREE)) &&
+ +						atomic_read(&next_i->i_count)) {
+ +				__iget(next_i);
+ +				need_iput = next_i;
+ +				spin_unlock(&next_i->i_lock);
+ +				break;
+ +			}
+ +			spin_unlock(&next_i->i_lock);
+ +			next_i = list_next_entry(next_i, i_sb_list);
+ +		}
+ +
+ +		/*
+ +		 * We can safely drop inode_sb_list_lock here because either
+ +		 * we actually hold references on both inode and next_i or
+ +		 * end of list.  Also no new inodes will be added since the
+ +		 * umount has begun.
+ +		 */
+ +		spin_unlock(&inode_sb_list_lock);
+++=======
++ 		spin_unlock(&sb->s_inode_list_lock);
+++>>>>>>> 5716863e0f82 (fsnotify: Fix possible use-after-free in inode iteration on umount)
+  
+- 		if (need_iput_tmp)
+- 			iput(need_iput_tmp);
++ 		if (iput_inode)
++ 			iput(iput_inode);
+  
+  		/* for each watch, send FS_UNMOUNT and then remove it */
+  		fsnotify(inode, FS_UNMOUNT, inode, FSNOTIFY_EVENT_INODE, NULL, 0);
+  
+  		fsnotify_inode_delete(inode);
+  
+- 		iput(inode);
++ 		iput_inode = inode;
+  
+ -		spin_lock(&sb->s_inode_list_lock);
+ +		spin_lock(&inode_sb_list_lock);
+  	}
+++<<<<<<< HEAD
+ +	spin_unlock(&inode_sb_list_lock);
+++=======
++ 	spin_unlock(&sb->s_inode_list_lock);
++ 
++ 	if (iput_inode)
++ 		iput(iput_inode);
+++>>>>>>> 5716863e0f82 (fsnotify: Fix possible use-after-free in inode iteration on umount)
+  }
+* Unmerged path fs/notify/inode_mark.c
