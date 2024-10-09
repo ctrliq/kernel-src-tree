@@ -1,0 +1,323 @@
+crypto: chelsio - Fix an error code in chcr_hash_dma_map()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [crypto] chelsio - Fix an error code in chcr_hash_dma_map() (Arjun Vynipadath) [1523191]
+Rebuild_FUZZ: 92.59%
+commit-author Dan Carpenter <dan.carpenter@oracle.com>
+commit 7814f552ff826fefa5e1b24083c7a06a9378e9ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/7814f552.failed
+
+The dma_map_sg() function returns zero on error and positive values on
+success.  We want to return -ENOMEM on failure here and zero on success.
+
+Fixes: 2f47d5804311 ("crypto: chelsio - Move DMA un/mapping to chcr from lld cxgb4 driver")
+	Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit 7814f552ff826fefa5e1b24083c7a06a9378e9ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/chelsio/chcr_algo.c
+diff --cc drivers/crypto/chelsio/chcr_algo.c
+index 32747a50ffb7,af08dd264ca7..000000000000
+--- a/drivers/crypto/chelsio/chcr_algo.c
++++ b/drivers/crypto/chelsio/chcr_algo.c
+@@@ -2076,6 -2198,291 +2076,294 @@@ err
+  	return ERR_PTR(error);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int chcr_aead_dma_map(struct device *dev,
++ 			     struct aead_request *req,
++ 			     unsigned short op_type)
++ {
++ 	int error;
++ 	struct chcr_aead_reqctx  *reqctx = aead_request_ctx(req);
++ 	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
++ 	unsigned int authsize = crypto_aead_authsize(tfm);
++ 	int dst_size;
++ 
++ 	dst_size = req->assoclen + req->cryptlen + (op_type ?
++ 				-authsize : authsize);
++ 	if (!req->cryptlen || !dst_size)
++ 		return 0;
++ 	reqctx->iv_dma = dma_map_single(dev, reqctx->iv, IV,
++ 					DMA_BIDIRECTIONAL);
++ 	if (dma_mapping_error(dev, reqctx->iv_dma))
++ 		return -ENOMEM;
++ 
++ 	if (req->src == req->dst) {
++ 		error = dma_map_sg(dev, req->src, sg_nents(req->src),
++ 				   DMA_BIDIRECTIONAL);
++ 		if (!error)
++ 			goto err;
++ 	} else {
++ 		error = dma_map_sg(dev, req->src, sg_nents(req->src),
++ 				   DMA_TO_DEVICE);
++ 		if (!error)
++ 			goto err;
++ 		error = dma_map_sg(dev, req->dst, sg_nents(req->dst),
++ 				   DMA_FROM_DEVICE);
++ 		if (!error) {
++ 			dma_unmap_sg(dev, req->src, sg_nents(req->src),
++ 				   DMA_TO_DEVICE);
++ 			goto err;
++ 		}
++ 	}
++ 
++ 	return 0;
++ err:
++ 	dma_unmap_single(dev, reqctx->iv_dma, IV, DMA_BIDIRECTIONAL);
++ 	return -ENOMEM;
++ }
++ 
++ static void chcr_aead_dma_unmap(struct device *dev,
++ 			     struct aead_request *req,
++ 			     unsigned short op_type)
++ {
++ 	struct chcr_aead_reqctx  *reqctx = aead_request_ctx(req);
++ 	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
++ 	unsigned int authsize = crypto_aead_authsize(tfm);
++ 	int dst_size;
++ 
++ 	dst_size = req->assoclen + req->cryptlen + (op_type ?
++ 					-authsize : authsize);
++ 	if (!req->cryptlen || !dst_size)
++ 		return;
++ 
++ 	dma_unmap_single(dev, reqctx->iv_dma, IV,
++ 					DMA_BIDIRECTIONAL);
++ 	if (req->src == req->dst) {
++ 		dma_unmap_sg(dev, req->src, sg_nents(req->src),
++ 				   DMA_BIDIRECTIONAL);
++ 	} else {
++ 		dma_unmap_sg(dev, req->src, sg_nents(req->src),
++ 				   DMA_TO_DEVICE);
++ 		dma_unmap_sg(dev, req->dst, sg_nents(req->dst),
++ 				   DMA_FROM_DEVICE);
++ 	}
++ }
++ 
++ static inline void chcr_add_aead_src_ent(struct aead_request *req,
++ 			       struct ulptx_sgl *ulptx,
++ 			       unsigned int assoclen,
++ 			       unsigned short op_type)
++ {
++ 	struct ulptx_walk ulp_walk;
++ 	struct chcr_aead_reqctx  *reqctx = aead_request_ctx(req);
++ 
++ 	if (reqctx->imm) {
++ 		u8 *buf = (u8 *)ulptx;
++ 
++ 		if (reqctx->b0_dma) {
++ 			memcpy(buf, reqctx->scratch_pad, reqctx->b0_len);
++ 			buf += reqctx->b0_len;
++ 		}
++ 		sg_pcopy_to_buffer(req->src, sg_nents(req->src),
++ 				   buf, assoclen, 0);
++ 		buf += assoclen;
++ 		memcpy(buf, reqctx->iv, IV);
++ 		buf += IV;
++ 		sg_pcopy_to_buffer(req->src, sg_nents(req->src),
++ 				   buf, req->cryptlen, req->assoclen);
++ 	} else {
++ 		ulptx_walk_init(&ulp_walk, ulptx);
++ 		if (reqctx->b0_dma)
++ 			ulptx_walk_add_page(&ulp_walk, reqctx->b0_len,
++ 					    &reqctx->b0_dma);
++ 		ulptx_walk_add_sg(&ulp_walk, req->src, assoclen, 0);
++ 		ulptx_walk_add_page(&ulp_walk, IV, &reqctx->iv_dma);
++ 		ulptx_walk_add_sg(&ulp_walk, req->src, req->cryptlen,
++ 				  req->assoclen);
++ 		ulptx_walk_end(&ulp_walk);
++ 	}
++ }
++ 
++ static inline void chcr_add_aead_dst_ent(struct aead_request *req,
++ 			       struct cpl_rx_phys_dsgl *phys_cpl,
++ 			       unsigned int assoclen,
++ 			       unsigned short op_type,
++ 			       unsigned short qid)
++ {
++ 	struct chcr_aead_reqctx  *reqctx = aead_request_ctx(req);
++ 	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
++ 	struct dsgl_walk dsgl_walk;
++ 	unsigned int authsize = crypto_aead_authsize(tfm);
++ 	u32 temp;
++ 
++ 	dsgl_walk_init(&dsgl_walk, phys_cpl);
++ 	if (reqctx->b0_dma)
++ 		dsgl_walk_add_page(&dsgl_walk, reqctx->b0_len, &reqctx->b0_dma);
++ 	dsgl_walk_add_sg(&dsgl_walk, req->dst, assoclen, 0);
++ 	dsgl_walk_add_page(&dsgl_walk, IV, &reqctx->iv_dma);
++ 	temp = req->cryptlen + (op_type ? -authsize : authsize);
++ 	dsgl_walk_add_sg(&dsgl_walk, req->dst, temp, req->assoclen);
++ 	dsgl_walk_end(&dsgl_walk, qid);
++ }
++ 
++ static inline void chcr_add_cipher_src_ent(struct ablkcipher_request *req,
++ 					   struct ulptx_sgl *ulptx,
++ 					   struct  cipher_wr_param *wrparam)
++ {
++ 	struct ulptx_walk ulp_walk;
++ 	struct chcr_blkcipher_req_ctx *reqctx = ablkcipher_request_ctx(req);
++ 
++ 	if (reqctx->imm) {
++ 		u8 *buf = (u8 *)ulptx;
++ 
++ 		memcpy(buf, reqctx->iv, IV);
++ 		buf += IV;
++ 		sg_pcopy_to_buffer(req->src, sg_nents(req->src),
++ 				   buf, wrparam->bytes, reqctx->processed);
++ 	} else {
++ 		ulptx_walk_init(&ulp_walk, ulptx);
++ 		ulptx_walk_add_page(&ulp_walk, IV, &reqctx->iv_dma);
++ 		ulptx_walk_add_sg(&ulp_walk, reqctx->srcsg, wrparam->bytes,
++ 				  reqctx->src_ofst);
++ 		reqctx->srcsg = ulp_walk.last_sg;
++ 		reqctx->src_ofst = ulp_walk.last_sg_len;
++ 		ulptx_walk_end(&ulp_walk);
++ 	}
++ }
++ 
++ static inline void chcr_add_cipher_dst_ent(struct ablkcipher_request *req,
++ 					   struct cpl_rx_phys_dsgl *phys_cpl,
++ 					   struct  cipher_wr_param *wrparam,
++ 					   unsigned short qid)
++ {
++ 	struct chcr_blkcipher_req_ctx *reqctx = ablkcipher_request_ctx(req);
++ 	struct dsgl_walk dsgl_walk;
++ 
++ 	dsgl_walk_init(&dsgl_walk, phys_cpl);
++ 	dsgl_walk_add_page(&dsgl_walk, IV, &reqctx->iv_dma);
++ 	dsgl_walk_add_sg(&dsgl_walk, reqctx->dstsg, wrparam->bytes,
++ 			 reqctx->dst_ofst);
++ 	reqctx->dstsg = dsgl_walk.last_sg;
++ 	reqctx->dst_ofst = dsgl_walk.last_sg_len;
++ 
++ 	dsgl_walk_end(&dsgl_walk, qid);
++ }
++ 
++ static inline void chcr_add_hash_src_ent(struct ahash_request *req,
++ 					   struct ulptx_sgl *ulptx,
++ 					   struct hash_wr_param *param)
++ {
++ 	struct ulptx_walk ulp_walk;
++ 	struct chcr_ahash_req_ctx *reqctx = ahash_request_ctx(req);
++ 
++ 	if (reqctx->imm) {
++ 		u8 *buf = (u8 *)ulptx;
++ 
++ 		if (param->bfr_len) {
++ 			memcpy(buf, reqctx->reqbfr, param->bfr_len);
++ 			buf += param->bfr_len;
++ 		}
++ 		sg_pcopy_to_buffer(req->src, sg_nents(req->src),
++ 				   buf, param->sg_len, 0);
++ 	} else {
++ 		ulptx_walk_init(&ulp_walk, ulptx);
++ 		if (param->bfr_len)
++ 			ulptx_walk_add_page(&ulp_walk, param->bfr_len,
++ 					    &reqctx->dma_addr);
++ 		ulptx_walk_add_sg(&ulp_walk, req->src, param->sg_len,
++ 					  0);
++ //	       reqctx->srcsg = ulp_walk.last_sg;
++ //	       reqctx->src_ofst = ulp_walk.last_sg_len;
++ 			ulptx_walk_end(&ulp_walk);
++ 	}
++ }
++ 
++ 
++ static inline int chcr_hash_dma_map(struct device *dev,
++ 			     struct ahash_request *req)
++ {
++ 	struct chcr_ahash_req_ctx *req_ctx = ahash_request_ctx(req);
++ 	int error = 0;
++ 
++ 	if (!req->nbytes)
++ 		return 0;
++ 	error = dma_map_sg(dev, req->src, sg_nents(req->src),
++ 			   DMA_TO_DEVICE);
++ 	if (!error)
++ 		return -ENOMEM;
++ 	req_ctx->is_sg_map = 1;
++ 	return 0;
++ }
++ 
++ static inline void chcr_hash_dma_unmap(struct device *dev,
++ 			     struct ahash_request *req)
++ {
++ 	struct chcr_ahash_req_ctx *req_ctx = ahash_request_ctx(req);
++ 
++ 	if (!req->nbytes)
++ 		return;
++ 
++ 	dma_unmap_sg(dev, req->src, sg_nents(req->src),
++ 			   DMA_TO_DEVICE);
++ 	req_ctx->is_sg_map = 0;
++ 
++ }
++ 
++ 
++ static int chcr_cipher_dma_map(struct device *dev,
++ 			     struct ablkcipher_request *req)
++ {
++ 	int error;
++ 	struct chcr_blkcipher_req_ctx *reqctx = ablkcipher_request_ctx(req);
++ 
++ 	reqctx->iv_dma = dma_map_single(dev, reqctx->iv, IV,
++ 					DMA_BIDIRECTIONAL);
++ 	if (dma_mapping_error(dev, reqctx->iv_dma))
++ 		return -ENOMEM;
++ 
++ 	if (req->src == req->dst) {
++ 		error = dma_map_sg(dev, req->src, sg_nents(req->src),
++ 				   DMA_BIDIRECTIONAL);
++ 		if (!error)
++ 			goto err;
++ 	} else {
++ 		error = dma_map_sg(dev, req->src, sg_nents(req->src),
++ 				   DMA_TO_DEVICE);
++ 		if (!error)
++ 			goto err;
++ 		error = dma_map_sg(dev, req->dst, sg_nents(req->dst),
++ 				   DMA_FROM_DEVICE);
++ 		if (!error) {
++ 			dma_unmap_sg(dev, req->src, sg_nents(req->src),
++ 				   DMA_TO_DEVICE);
++ 			goto err;
++ 		}
++ 	}
++ 
++ 	return 0;
++ err:
++ 	dma_unmap_single(dev, reqctx->iv_dma, IV, DMA_BIDIRECTIONAL);
++ 	return -ENOMEM;
++ }
++ static void chcr_cipher_dma_unmap(struct device *dev,
++ 				  struct ablkcipher_request *req)
++ {
++ 	struct chcr_blkcipher_req_ctx *reqctx = ablkcipher_request_ctx(req);
++ 
++ 	dma_unmap_single(dev, reqctx->iv_dma, IV,
++ 					DMA_BIDIRECTIONAL);
++ 	if (req->src == req->dst) {
++ 		dma_unmap_sg(dev, req->src, sg_nents(req->src),
++ 				   DMA_BIDIRECTIONAL);
++ 	} else {
++ 		dma_unmap_sg(dev, req->src, sg_nents(req->src),
++ 				   DMA_TO_DEVICE);
++ 		dma_unmap_sg(dev, req->dst, sg_nents(req->dst),
++ 				   DMA_FROM_DEVICE);
++ 	}
++ }
++ 
+++>>>>>>> 7814f552ff82 (crypto: chelsio - Fix an error code in chcr_hash_dma_map())
+  static int set_msg_len(u8 *block, unsigned int msglen, int csize)
+  {
+  	__be32 data;
+* Unmerged path drivers/crypto/chelsio/chcr_algo.c
