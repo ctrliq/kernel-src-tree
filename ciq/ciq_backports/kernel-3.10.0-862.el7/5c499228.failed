@@ -1,0 +1,88 @@
+i40e: prevent service task from running while we're suspended
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 5c499228803a77bd4e878c7119fbd40a1dc6d773
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5c499228.failed
+
+Although the service task does check the suspended status before
+running, it might already be part way through running when we go to
+suspend. Lets ensure that the service task is stopped and will not be
+restarted again until we finish resuming. This ensures that service task
+code does not cause strange interactions with the suspend/resume
+handlers.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 5c499228803a77bd4e878c7119fbd40a1dc6d773)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e_main.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e_main.c
+index 25ede5194921,368373459ad5..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@@ -11984,15 -12059,20 +11984,25 @@@ static int i40e_suspend(struct device *
+  	struct i40e_pf *pf = pci_get_drvdata(pdev);
+  	struct i40e_hw *hw = &pf->hw;
+  
+ -	/* If we're already suspended, then there is nothing to do */
+ -	if (test_and_set_bit(__I40E_SUSPENDED, pf->state))
+ -		return 0;
+ +	set_bit(__I40E_SUSPENDED, &pf->state);
+ +	set_bit(__I40E_DOWN, &pf->state);
+  
+++<<<<<<< HEAD
+ +	if (pf->wol_en && (pf->flags & I40E_FLAG_WOL_MC_MAGIC_PKT_WAKE))
+++=======
++ 	set_bit(__I40E_DOWN, pf->state);
++ 
++ 	/* Ensure service task will not be running */
++ 	del_timer_sync(&pf->service_timer);
++ 	cancel_work_sync(&pf->service_task);
++ 
++ 	if (pf->wol_en && (pf->hw_features & I40E_HW_WOL_MC_MAGIC_PKT_WAKE))
+++>>>>>>> 5c499228803a (i40e: prevent service task from running while we're suspended)
+  		i40e_enable_mc_magic_wake(pf);
+  
+ -	i40e_prep_for_reset(pf, false);
+ +	rtnl_lock();
+ +	i40e_prep_for_reset(pf);
+ +	rtnl_unlock();
+  
+  	wr32(hw, I40E_PFPM_APM, (pf->wol_en ? I40E_PFPM_APM_APME_MASK : 0));
+  	wr32(hw, I40E_PFPM_WUFC, (pf->wol_en ? I40E_PFPM_WUFC_MAG_MASK : 0));
+@@@ -12011,14 -12091,20 +12021,18 @@@ static int i40e_resume(struct device *d
+  	struct pci_dev *pdev = to_pci_dev(dev);
+  	struct i40e_pf *pf = pci_get_drvdata(pdev);
+  
+ -	/* If we're not suspended, then there is nothing to do */
+ -	if (!test_bit(__I40E_SUSPENDED, pf->state))
+ -		return 0;
+ -
+ -	clear_bit(__I40E_DOWN, pf->state);
+ -	i40e_reset_and_rebuild(pf, false, false);
+ -
+ -	/* Clear suspended state last after everything is recovered */
+ -	clear_bit(__I40E_SUSPENDED, pf->state);
+ +	/* handling the reset will rebuild the device state */
+ +	if (test_and_clear_bit(__I40E_SUSPENDED, &pf->state)) {
+ +		clear_bit(__I40E_DOWN, &pf->state);
+ +		rtnl_lock();
+ +		i40e_reset_and_rebuild(pf, false);
+ +		rtnl_unlock();
+ +	}
+  
++ 	/* Restart the service task */
++ 	mod_timer(&pf->service_timer,
++ 		  round_jiffies(jiffies + pf->service_timer_period));
++ 
+  	return 0;
+  }
+  
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_main.c
