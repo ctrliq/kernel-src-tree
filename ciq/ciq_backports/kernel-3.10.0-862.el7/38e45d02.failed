@@ -1,0 +1,163 @@
+iommu/amd: Fix boot warning when device 00:00.0 is not iommu covered
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [iommu] amd: Fix boot warning when device 00:00.0 is not iommu covered (Jerry Snitselaar) [1411581]
+Rebuild_FUZZ: 95.38%
+commit-author Suravee Suthikulpanit <Suravee.Suthikulpanit@amd.com>
+commit 38e45d02ea9f194b89d6bf41e52ccafc8e2c2b47
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/38e45d02.failed
+
+The setup code for the performance counters in the AMD IOMMU driver
+tests whether the counters can be written. It tests to setup a counter
+for device 00:00.0, which fails on systems where this particular device
+is not covered by the IOMMU.
+
+Fix this by not relying on device 00:00.0 but only on the IOMMU being
+present.
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Suravee Suthikulpanit <Suravee.Suthikulpanit@amd.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 38e45d02ea9f194b89d6bf41e52ccafc8e2c2b47)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/amd_iommu_init.c
+diff --cc drivers/iommu/amd_iommu_init.c
+index d1b313b945cf,d06a6d9edbca..000000000000
+--- a/drivers/iommu/amd_iommu_init.c
++++ b/drivers/iommu/amd_iommu_init.c
+@@@ -1333,6 -1135,32 +1337,35 @@@ static int __init init_iommu_all(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ 
++ static void init_iommu_perf_ctr(struct amd_iommu *iommu)
++ {
++ 	u64 val = 0xabcd, val2 = 0;
++ 
++ 	if (!iommu_feature(iommu, FEATURE_PC))
++ 		return;
++ 
++ 	amd_iommu_pc_present = true;
++ 
++ 	/* Check if the performance counters can be written to */
++ 	if ((0 != iommu_pc_get_set_reg_val(iommu, 0, 0, 0, &val, true)) ||
++ 	    (0 != iommu_pc_get_set_reg_val(iommu, 0, 0, 0, &val2, false)) ||
++ 	    (val != val2)) {
++ 		pr_err("AMD-Vi: Unable to write to IOMMU perf counter.\n");
++ 		amd_iommu_pc_present = false;
++ 		return;
++ 	}
++ 
++ 	pr_info("AMD-Vi: IOMMU performance counters supported\n");
++ 
++ 	val = readl(iommu->mmio_base + MMIO_CNTR_CONF_OFFSET);
++ 	iommu->max_banks = (u8) ((val >> 12) & 0x3f);
++ 	iommu->max_counters = (u8) ((val >> 7) & 0xf);
++ }
++ 
+++>>>>>>> 38e45d02ea9f (iommu/amd: Fix boot warning when device 00:00.0 is not iommu covered)
+  static ssize_t amd_iommu_show_cap(struct device *dev,
+  				  struct device_attribute *attr,
+  				  char *buf)
+@@@ -2475,3 -2245,90 +2508,93 @@@ bool amd_iommu_v2_supported(void
+  	return amd_iommu_v2_present;
+  }
+  EXPORT_SYMBOL(amd_iommu_v2_supported);
+++<<<<<<< HEAD
+++=======
++ 
++ /****************************************************************************
++  *
++  * IOMMU EFR Performance Counter support functionality. This code allows
++  * access to the IOMMU PC functionality.
++  *
++  ****************************************************************************/
++ 
++ u8 amd_iommu_pc_get_max_banks(u16 devid)
++ {
++ 	struct amd_iommu *iommu;
++ 	u8 ret = 0;
++ 
++ 	/* locate the iommu governing the devid */
++ 	iommu = amd_iommu_rlookup_table[devid];
++ 	if (iommu)
++ 		ret = iommu->max_banks;
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL(amd_iommu_pc_get_max_banks);
++ 
++ bool amd_iommu_pc_supported(void)
++ {
++ 	return amd_iommu_pc_present;
++ }
++ EXPORT_SYMBOL(amd_iommu_pc_supported);
++ 
++ u8 amd_iommu_pc_get_max_counters(u16 devid)
++ {
++ 	struct amd_iommu *iommu;
++ 	u8 ret = 0;
++ 
++ 	/* locate the iommu governing the devid */
++ 	iommu = amd_iommu_rlookup_table[devid];
++ 	if (iommu)
++ 		ret = iommu->max_counters;
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL(amd_iommu_pc_get_max_counters);
++ 
++ static int iommu_pc_get_set_reg_val(struct amd_iommu *iommu,
++ 				    u8 bank, u8 cntr, u8 fxn,
++ 				    u64 *value, bool is_write)
++ {
++ 	u32 offset;
++ 	u32 max_offset_lim;
++ 
++ 	/* Check for valid iommu and pc register indexing */
++ 	if (WARN_ON((fxn > 0x28) || (fxn & 7)))
++ 		return -ENODEV;
++ 
++ 	offset = (u32)(((0x40|bank) << 12) | (cntr << 8) | fxn);
++ 
++ 	/* Limit the offset to the hw defined mmio region aperture */
++ 	max_offset_lim = (u32)(((0x40|iommu->max_banks) << 12) |
++ 				(iommu->max_counters << 8) | 0x28);
++ 	if ((offset < MMIO_CNTR_REG_OFFSET) ||
++ 	    (offset > max_offset_lim))
++ 		return -EINVAL;
++ 
++ 	if (is_write) {
++ 		writel((u32)*value, iommu->mmio_base + offset);
++ 		writel((*value >> 32), iommu->mmio_base + offset + 4);
++ 	} else {
++ 		*value = readl(iommu->mmio_base + offset + 4);
++ 		*value <<= 32;
++ 		*value = readl(iommu->mmio_base + offset);
++ 	}
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(amd_iommu_pc_get_set_reg_val);
++ 
++ int amd_iommu_pc_get_set_reg_val(u16 devid, u8 bank, u8 cntr, u8 fxn,
++ 				    u64 *value, bool is_write)
++ {
++ 	struct amd_iommu *iommu = amd_iommu_rlookup_table[devid];
++ 
++ 	/* Make sure the IOMMU PC resource is available */
++ 	if (!amd_iommu_pc_present || iommu == NULL)
++ 		return -ENODEV;
++ 
++ 	return iommu_pc_get_set_reg_val(iommu, bank, cntr, fxn,
++ 					value, is_write);
++ }
+++>>>>>>> 38e45d02ea9f (iommu/amd: Fix boot warning when device 00:00.0 is not iommu covered)
+* Unmerged path drivers/iommu/amd_iommu_init.c
