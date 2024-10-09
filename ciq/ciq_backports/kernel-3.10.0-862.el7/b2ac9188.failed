@@ -1,0 +1,265 @@
+IB/mlx5: Add contiguous ODP support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Artemy Kovalyov <artemyko@mellanox.com>
+commit b2ac91885b9f137fd7ed35593a72bcee9e049ba8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b2ac9188.failed
+
+Currenlty ODP supports only regular MMU pages.
+Add ODP support for regions consisting of physically contiguous chunks
+of arbitrary order (huge pages for instance) to improve performance.
+
+	Signed-off-by: Artemy Kovalyov <artemyko@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit b2ac91885b9f137fd7ed35593a72bcee9e049ba8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/odp.c
+diff --cc drivers/infiniband/hw/mlx5/odp.c
+index 25e3fb5efdf9,eddabd6e6596..000000000000
+--- a/drivers/infiniband/hw/mlx5/odp.c
++++ b/drivers/infiniband/hw/mlx5/odp.c
+@@@ -73,8 -199,8 +73,13 @@@ void mlx5_ib_invalidate_range(struct ib
+  	 * but they will write 0s as well, so no difference in the end result.
+  	 */
+  
+++<<<<<<< HEAD
+ +	for (addr = start; addr < end; addr += (u64)umem->page_size) {
+ +		idx = (addr - ib_umem_start(umem)) / PAGE_SIZE;
+++=======
++ 	for (addr = start; addr < end; addr += BIT(umem->page_shift)) {
++ 		idx = (addr - ib_umem_start(umem)) >> umem->page_shift;
+++>>>>>>> b2ac91885b9f (IB/mlx5: Add contiguous ODP support)
+  		/*
+  		 * Strive to write the MTTs in chunks, but avoid overwriting
+  		 * non-existing MTTs. The huristic here can be improved to
+@@@ -91,16 -217,19 +96,30 @@@
+  			u64 umr_offset = idx & umr_block_mask;
+  
+  			if (in_block && umr_offset == 0) {
+++<<<<<<< HEAD
+ +				mlx5_ib_update_mtt(mr, blk_start_idx,
+ +						   idx - blk_start_idx, 1);
+++=======
++ 				mlx5_ib_update_xlt(mr, blk_start_idx,
++ 						   idx - blk_start_idx, 0,
++ 						   MLX5_IB_UPD_XLT_ZAP |
++ 						   MLX5_IB_UPD_XLT_ATOMIC);
+++>>>>>>> b2ac91885b9f (IB/mlx5: Add contiguous ODP support)
+  				in_block = 0;
+  			}
+  		}
+  	}
+  	if (in_block)
+++<<<<<<< HEAD
+ +		mlx5_ib_update_mtt(mr, blk_start_idx, idx - blk_start_idx + 1,
+ +				   1);
+ +
+++=======
++ 		mlx5_ib_update_xlt(mr, blk_start_idx,
++ 				   idx - blk_start_idx + 1, 0,
++ 				   MLX5_IB_UPD_XLT_ZAP |
++ 				   MLX5_IB_UPD_XLT_ATOMIC);
+++>>>>>>> b2ac91885b9f (IB/mlx5: Add contiguous ODP support)
+  	/*
+  	 * We are now sure that the device will not access the
+  	 * memory. We can safely unmap it, and mark it as dirty if
+@@@ -177,32 -512,34 +196,48 @@@ static void mlx5_ib_page_fault_resume(s
+  }
+  
+  /*
+ - * Handle a single data segment in a page-fault WQE or RDMA region.
+ + * Handle a single data segment in a page-fault WQE.
+   *
+++<<<<<<< HEAD
+ + * Returns number of pages retrieved on success. The caller will continue to
+++=======
++  * Returns number of OS pages retrieved on success. The caller may continue to
+++>>>>>>> b2ac91885b9f (IB/mlx5: Add contiguous ODP support)
+   * the next data segment.
+   * Can return the following error codes:
+   * -EAGAIN to designate a temporary error. The caller will abort handling the
+   *  page fault and resolve it.
+   * -EFAULT when there's an error mapping the requested pages. The caller will
+ - *  abort the page fault handling.
+ + *  abort the page fault handling and possibly move the QP to an error state.
+ + * On other errors the QP should also be closed with an error.
+   */
+ -static int pagefault_single_data_segment(struct mlx5_ib_dev *dev,
+ +static int pagefault_single_data_segment(struct mlx5_ib_qp *qp,
+ +					 struct mlx5_ib_pfault *pfault,
+  					 u32 key, u64 io_virt, size_t bcnt,
+ -					 u32 *bytes_committed,
+  					 u32 *bytes_mapped)
+  {
+ +	struct mlx5_ib_dev *mib_dev = to_mdev(qp->ibqp.pd->device);
+  	int srcu_key;
+++<<<<<<< HEAD
+ +	unsigned int current_seq;
+ +	u64 start_idx;
+ +	int npages = 0, ret = 0;
+ +	struct mlx5_ib_mr *mr;
+ +	u64 access_mask = ODP_READ_ALLOWED_BIT;
+++=======
++ 	unsigned int current_seq = 0;
++ 	u64 start_idx, page_mask;
++ 	int npages = 0, ret = 0;
++ 	struct mlx5_ib_mr *mr;
++ 	u64 access_mask = ODP_READ_ALLOWED_BIT;
++ 	struct ib_umem_odp *odp;
++ 	int implicit = 0;
++ 	size_t size;
++ 	int page_shift;
+++>>>>>>> b2ac91885b9f (IB/mlx5: Add contiguous ODP support)
+  
+ -	srcu_key = srcu_read_lock(&dev->mr_srcu);
+ -	mr = mlx5_ib_odp_find_mr_lkey(dev, key);
+ +	srcu_key = srcu_read_lock(&mib_dev->mr_srcu);
+ +	mr = mlx5_ib_odp_find_mr_lkey(mib_dev, key);
+  	/*
+  	 * If we didn't find the MR, it means the MR was closed while we were
+  	 * handling the ODP event. In this case we return -EFAULT so that the
+@@@ -228,22 -560,41 +263,57 @@@
+  		goto srcu_unlock;
+  	}
+  
+++<<<<<<< HEAD
+ +	current_seq = ACCESS_ONCE(mr->umem->odp_data->notifiers_seq);
+++=======
++ 	/*
++ 	 * Avoid branches - this code will perform correctly
++ 	 * in all iterations (in iteration 2 and above,
++ 	 * bytes_committed == 0).
++ 	 */
++ 	io_virt += *bytes_committed;
++ 	bcnt -= *bytes_committed;
++ 
++ 	if (!mr->umem->odp_data->page_list) {
++ 		odp = implicit_mr_get_data(mr, io_virt, bcnt);
++ 
++ 		if (IS_ERR(odp)) {
++ 			ret = PTR_ERR(odp);
++ 			goto srcu_unlock;
++ 		}
++ 		mr = odp->private;
++ 		implicit = 1;
++ 
++ 	} else {
++ 		odp = mr->umem->odp_data;
++ 	}
++ 
++ 	page_shift = mr->umem->page_shift;
++ 	page_mask = ~(BIT(page_shift) - 1);
++ 
++ next_mr:
++ 	current_seq = READ_ONCE(odp->notifiers_seq);
+++>>>>>>> b2ac91885b9f (IB/mlx5: Add contiguous ODP support)
+  	/*
+  	 * Ensure the sequence number is valid for some time before we call
+  	 * gup.
+  	 */
+  	smp_rmb();
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Avoid branches - this code will perform correctly
+ +	 * in all iterations (in iteration 2 and above,
+ +	 * bytes_committed == 0).
+ +	 */
+ +	io_virt += pfault->mpfault.bytes_committed;
+ +	bcnt -= pfault->mpfault.bytes_committed;
+ +
+ +	start_idx = (io_virt - (mr->mmkey.iova & PAGE_MASK)) >> PAGE_SHIFT;
+++=======
++ 	size = min_t(size_t, bcnt, ib_umem_end(odp->umem) - io_virt);
++ 	start_idx = (io_virt - (mr->mmkey.iova & page_mask)) >> page_shift;
+++>>>>>>> b2ac91885b9f (IB/mlx5: Add contiguous ODP support)
+  
+  	if (mr->umem->writable)
+  		access_mask |= ODP_WRITE_ALLOWED_BIT;
+@@@ -262,22 -615,43 +332,54 @@@
+  			 * this MR, since ib_umem_odp_map_dma_pages already
+  			 * checks this.
+  			 */
+++<<<<<<< HEAD
+ +			ret = mlx5_ib_update_mtt(mr, start_idx, npages, 0);
+++=======
++ 			ret = mlx5_ib_update_xlt(mr, start_idx, np,
++ 						 page_shift,
++ 						 MLX5_IB_UPD_XLT_ATOMIC);
+++>>>>>>> b2ac91885b9f (IB/mlx5: Add contiguous ODP support)
+  		} else {
+  			ret = -EAGAIN;
+  		}
+ -		mutex_unlock(&odp->umem_mutex);
+ +		mutex_unlock(&mr->umem->odp_data->umem_mutex);
+  		if (ret < 0) {
+  			if (ret != -EAGAIN)
+ -				mlx5_ib_err(dev, "Failed to update mkey page tables\n");
+ +				pr_err("Failed to update mkey page tables\n");
+  			goto srcu_unlock;
+  		}
+- 
+  		if (bytes_mapped) {
+++<<<<<<< HEAD
+ +			u32 new_mappings = npages * PAGE_SIZE -
+ +				(io_virt - round_down(io_virt, PAGE_SIZE));
+ +			*bytes_mapped += min_t(u32, new_mappings, bcnt);
+ +		}
+++=======
++ 			u32 new_mappings = (np << page_shift) -
++ 				(io_virt - round_down(io_virt,
++ 						      1 << page_shift));
++ 			*bytes_mapped += min_t(u32, new_mappings, size);
++ 		}
++ 
++ 		npages += np << (page_shift - PAGE_SHIFT);
++ 	}
++ 
++ 	bcnt -= size;
++ 	if (unlikely(bcnt)) {
++ 		struct ib_umem_odp *next;
++ 
++ 		io_virt += size;
++ 		next = odp_next(odp);
++ 		if (unlikely(!next || next->umem->address != io_virt)) {
++ 			mlx5_ib_dbg(dev, "next implicit leaf removed at 0x%llx. got %p\n",
++ 				    io_virt, next);
++ 			ret = -EAGAIN;
++ 			goto srcu_unlock_no_wait;
++ 		}
++ 		odp = next;
++ 		mr = odp->private;
++ 		goto next_mr;
+++>>>>>>> b2ac91885b9f (IB/mlx5: Add contiguous ODP support)
+  	}
+  
+  srcu_unlock:
+diff --git a/drivers/infiniband/hw/mlx5/mem.c b/drivers/infiniband/hw/mlx5/mem.c
+index 6851357c16f4..6dcf59106a24 100644
+--- a/drivers/infiniband/hw/mlx5/mem.c
++++ b/drivers/infiniband/hw/mlx5/mem.c
+@@ -61,13 +61,12 @@ void mlx5_ib_cont_pages(struct ib_umem *umem, u64 addr,
+ 	int entry;
+ 	unsigned long page_shift = ilog2(umem->page_size);
+ 
+-	/* With ODP we must always match OS page size. */
+ 	if (umem->odp_data) {
+-		*count = ib_umem_page_count(umem);
+-		*shift = PAGE_SHIFT;
+-		*ncont = *count;
++		*ncont = ib_umem_page_count(umem);
++		*count = *ncont << (page_shift - PAGE_SHIFT);
++		*shift = page_shift;
+ 		if (order)
+-			*order = ilog2(roundup_pow_of_two(*count));
++			*order = ilog2(roundup_pow_of_two(*ncont));
+ 
+ 		return;
+ 	}
+* Unmerged path drivers/infiniband/hw/mlx5/odp.c
