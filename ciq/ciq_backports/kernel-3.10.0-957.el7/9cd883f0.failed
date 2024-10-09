@@ -1,0 +1,488 @@
+scsi: qla2xxx: Fix session cleanup for N2N
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Fix session cleanup for N2N (Himanshu Madhani) [1547714]
+Rebuild_FUZZ: 92.31%
+commit-author Quinn Tran <quinn.tran@cavium.com>
+commit 9cd883f07a54e5301d51e259acd250bb035996be
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/9cd883f0.failed
+
+When connection type is N_Port to N_Port (point-to-point), there
+is a possibilty where initiator will not send PLOGI request and
+will directly send PRLI. In N2N connection the port has higher
+port name sends the PLOGI but not allow to send PRLI if is a
+target mode. Only initiator is allowed to send PRLI.
+
+Current driver code deletes old session when it receives PLOGI
+request. If we will not receive PLOGI request then we will not
+delete old session and create new session. Add check for N2N
+with PRLI receive only and trigger cleanup. For this case, the
+cleanup requires individual cmd abort instead of using implicit
+logout as a broad stroke flush.
+
+	Signed-off-by: Krishna Kant <krishna.kant@purestorage.com>
+	Signed-off-by: Alexei Potashnik <alexei@purestorage.com>
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 9cd883f07a54e5301d51e259acd250bb035996be)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_def.h
+#	drivers/scsi/qla2xxx/qla_init.c
+#	drivers/scsi/qla2xxx/qla_os.c
+#	drivers/scsi/qla2xxx/qla_target.c
+diff --cc drivers/scsi/qla2xxx/qla_def.h
+index 65a064ba1a4b,a7b810213aac..000000000000
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@@ -3432,9 -3508,11 +3432,10 @@@ struct qla_hw_data 
+  
+  		uint32_t	detected_lr_sfp:1;
+  		uint32_t	using_lr_setting:1;
++ 		uint32_t	rida_fmt2:1;
+  	} flags;
+  
+ -	uint16_t max_exchg;
+ -	uint16_t long_range_distance;	/* 32G & above */
+ +	u8 long_range_distance;	/* 32G & above */
+  #define LR_DISTANCE_5K  1
+  #define LR_DISTANCE_10K 0
+  
+@@@ -4422,6 -4527,19 +4423,22 @@@ struct sff_8247_a0 
+  	(IS_QLA25XX(_vha->hw) || IS_QLA81XX(_vha->hw) ||\
+  	IS_QLA83XX(_vha->hw) || IS_QLA27XX(_vha->hw)))
+  
+++<<<<<<< HEAD
+++=======
++ #define USER_CTRL_IRQ(_ha) (ql2xuctrlirq && QLA_TGT_MODE_ENABLED() && \
++ 	(IS_QLA27XX(_ha) || IS_QLA83XX(_ha)))
++ 
++ #define SAVE_TOPO(_ha) { \
++ 	if (_ha->current_topology)				\
++ 		_ha->prev_topology = _ha->current_topology;     \
++ }
++ 
++ #define N2N_TOPO(ha) \
++ 	((ha->prev_topology == ISP_CFG_N && !ha->current_topology) || \
++ 	 ha->current_topology == ISP_CFG_N || \
++ 	 !ha->current_topology)
++ 
+++>>>>>>> 9cd883f07a54 (scsi: qla2xxx: Fix session cleanup for N2N)
+  #include "qla_target.h"
+  #include "qla_gbl.h"
+  #include "qla_dbg.h"
+diff --cc drivers/scsi/qla2xxx/qla_init.c
+index 320a3c9ed887,c671852131ef..000000000000
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@@ -829,8 -1008,46 +824,45 @@@ void qla24xx_handle_gpdb_event(scsi_qla
+  	spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
+  } /* gpdb event */
+  
++ 
++ static void qla_chk_n2n_b4_login(struct scsi_qla_host *vha, fc_port_t *fcport)
++ {
++ 	u8 login = 0;
++ 
++ 	if (qla_tgt_mode_enabled(vha))
++ 		return;
++ 
++ 	if (qla_dual_mode_enabled(vha)) {
++ 		if (N2N_TOPO(vha->hw)) {
++ 			u64 mywwn, wwn;
++ 
++ 			mywwn = wwn_to_u64(vha->port_name);
++ 			wwn = wwn_to_u64(fcport->port_name);
++ 			if (mywwn > wwn)
++ 				login = 1;
++ 			else if ((fcport->fw_login_state == DSC_LS_PLOGI_COMP)
++ 			    && time_after_eq(jiffies,
++ 				    fcport->plogi_nack_done_deadline))
++ 				login = 1;
++ 		} else {
++ 			login = 1;
++ 		}
++ 	} else {
++ 		/* initiator mode */
++ 		login = 1;
++ 	}
++ 
++ 	if (login) {
++ 		ql_dbg(ql_dbg_disc, vha, 0x20bf,
++ 		    "%s %d %8phC post login\n",
++ 		    __func__, __LINE__, fcport->port_name);
++ 		fcport->disc_state = DSC_LOGIN_PEND;
++ 		qla2x00_post_async_login_work(vha, fcport, NULL);
++ 	}
++ }
++ 
+  int qla24xx_fcport_handle_login(struct scsi_qla_host *vha, fc_port_t *fcport)
+  {
+ -	u16 data[2];
+  	if (fcport->login_retry == 0)
+  		return 0;
+  
+@@@ -889,23 -1104,7 +919,27 @@@
+  			break;
+  		}
+  
+++<<<<<<< HEAD
+ +		if (fcport->flags & FCF_FCP2_DEVICE) {
+ +			u8 opt = PDO_FORCE_ADISC;
+ +
+ +			ql_dbg(ql_dbg_disc, vha, 0x20c9,
+ +			    "%s %d %8phC post gpdb\n",
+ +			    __func__, __LINE__, fcport->port_name);
+ +
+ +			fcport->disc_state = DSC_GPDB;
+ +			qla24xx_post_gpdb_work(vha, fcport, opt);
+ +		} else {
+ +			ql_dbg(ql_dbg_disc, vha, 0x20cf,
+ +			    "%s %d %8phC post login\n",
+ +			    __func__, __LINE__, fcport->port_name);
+ +			fcport->disc_state = DSC_LOGIN_PEND;
+ +			qla2x00_post_async_login_work(vha, fcport, NULL);
+ +		}
+ +
+++=======
++ 		qla_chk_n2n_b4_login(vha, fcport);
+++>>>>>>> 9cd883f07a54 (scsi: qla2xxx: Fix session cleanup for N2N)
+  		break;
+  
+  	case DSC_LOGIN_FAILED:
+@@@ -4312,20 -4721,12 +4369,29 @@@ qla2x00_configure_local_loop(scsi_qla_h
+  	}
+  	new_fcport->flags &= ~FCF_FABRIC_DEVICE;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Mark local devices that were present with FCF_DEVICE_LOST for now.
+ +	 */
+ +	list_for_each_entry(fcport, &vha->vp_fcports, list) {
+ +		if (atomic_read(&fcport->state) == FCS_ONLINE &&
+ +		    fcport->port_type != FCT_BROADCAST &&
+ +		    (fcport->flags & FCF_FABRIC_DEVICE) == 0) {
+ +
+ +			ql_dbg(ql_dbg_disc, vha, 0x2096,
+ +			    "Marking port lost loop_id=0x%04x.\n",
+ +			    fcport->loop_id);
+ +
+ +			qla2x00_mark_device_lost(vha, fcport, 0, 0);
+ +		}
+++=======
++ 	/* Inititae N2N login. */
++ 	if (test_and_clear_bit(N2N_LOGIN_NEEDED, &vha->dpc_flags)) {
++ 		rval = qla24xx_n2n_handle_login(vha, new_fcport);
++ 		if (rval != QLA_SUCCESS)
++ 			goto cleanup_allocation;
++ 		return QLA_SUCCESS;
+++>>>>>>> 9cd883f07a54 (scsi: qla2xxx: Fix session cleanup for N2N)
+  	}
+  
+  	/* Add devices to port list. */
+diff --cc drivers/scsi/qla2xxx/qla_os.c
+index 75f3e94a56ff,38d6d12571f7..000000000000
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@@ -4800,10 -4826,63 +4804,38 @@@ void qla24xx_create_new_sess(struct scs
+  	spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
+  
+  	if (fcport) {
+++<<<<<<< HEAD
+ +		if (pla)
+++=======
++ 		if (N2N_TOPO(vha->hw))
++ 			fcport->flags &= ~FCF_FABRIC_DEVICE;
++ 
++ 		if (pla) {
++ 			if (pla->iocb.u.isp24.status_subcode == ELS_PRLI) {
++ 				u16 wd3_lo;
++ 
++ 				fcport->fw_login_state = DSC_LS_PRLI_PEND;
++ 				fcport->local = 0;
++ 				fcport->loop_id =
++ 					le16_to_cpu(
++ 					    pla->iocb.u.isp24.nport_handle);
++ 				fcport->fw_login_state = DSC_LS_PRLI_PEND;
++ 				wd3_lo =
++ 				    le16_to_cpu(
++ 					pla->iocb.u.isp24.u.prli.wd3_lo);
++ 
++ 				if (wd3_lo & BIT_7)
++ 					fcport->conf_compl_supported = 1;
++ 
++ 				if ((wd3_lo & BIT_4) == 0)
++ 					fcport->port_type = FCT_INITIATOR;
++ 				else
++ 					fcport->port_type = FCT_TARGET;
++ 			}
+++>>>>>>> 9cd883f07a54 (scsi: qla2xxx: Fix session cleanup for N2N)
+  			qlt_plogi_ack_unref(vha, pla);
+ -		} else {
+ -			spin_lock_irqsave(&vha->hw->tgt.sess_lock, flags);
+ -			tfcp = qla2x00_find_fcport_by_nportid(vha,
+ -			    &e->u.new_sess.id, 1);
+ -			if (tfcp && (tfcp != fcport)) {
+ -				/*
+ -				 * We have a conflict fcport with same NportID.
+ -				 */
+ -				ql_dbg(ql_dbg_disc, vha, 0xffff,
+ -				    "%s %8phC found conflict b4 add. DS %d LS %d\n",
+ -				    __func__, tfcp->port_name, tfcp->disc_state,
+ -				    tfcp->fw_login_state);
+ -
+ -				switch (tfcp->disc_state) {
+ -				case DSC_DELETED:
+ -					break;
+ -				case DSC_DELETE_PEND:
+ -					fcport->login_pause = 1;
+ -					tfcp->conflict = fcport;
+ -					break;
+ -				default:
+ -					fcport->login_pause = 1;
+ -					tfcp->conflict = fcport;
+ -					qlt_schedule_sess_for_deletion_lock
+ -						(tfcp);
+ -					break;
+ -				}
+ -			}
+ -			spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
+ +		else
+  			qla24xx_async_gnl(vha, fcport);
+ -		}
+  	}
+  
+  	if (free_fcport) {
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 1c8ec70c5535,3c25be73005d..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -4666,7 -4825,6 +4810,10 @@@ static int qlt_24xx_handle_els(struct s
+  	uint16_t loop_id;
+  	uint16_t wd3_lo;
+  	int res = 0;
+++<<<<<<< HEAD
+ +	struct qlt_plogi_ack_t *pla;
+++=======
+++>>>>>>> 9cd883f07a54 (scsi: qla2xxx: Fix session cleanup for N2N)
+  	unsigned long flags;
+  
+  	wwn = wwn_to_u64(iocb->u.isp24.port_name);
+@@@ -4690,85 -4848,7 +4837,89 @@@
+  	 */
+  	switch (iocb->u.isp24.status_subcode) {
+  	case ELS_PLOGI:
+++<<<<<<< HEAD
+ +
+ +		/* Mark all stale commands in qla_tgt_wq for deletion */
+ +		abort_cmds_for_s_id(vha, &port_id);
+ +
+ +		if (wwn) {
+ +			spin_lock_irqsave(&tgt->ha->tgt.sess_lock, flags);
+ +			sess = qlt_find_sess_invalidate_other(vha, wwn,
+ +				port_id, loop_id, &conflict_sess);
+ +			spin_unlock_irqrestore(&tgt->ha->tgt.sess_lock, flags);
+ +		}
+ +
+ +		if (IS_SW_RESV_ADDR(port_id)) {
+ +			res = 1;
+ +			break;
+ +		}
+ +
+ +		pla = qlt_plogi_ack_find_add(vha, &port_id, iocb);
+ +		if (!pla) {
+ +			qlt_send_term_imm_notif(vha, iocb, 1);
+ +			break;
+ +		}
+ +
+ +		res = 0;
+ +
+ +		if (conflict_sess) {
+ +			conflict_sess->login_gen++;
+ +			qlt_plogi_ack_link(vha, pla, conflict_sess,
+ +				QLT_PLOGI_LINK_CONFLICT);
+ +		}
+ +
+ +		if (!sess) {
+ +			pla->ref_count++;
+ +			qla24xx_post_newsess_work(vha, &port_id,
+ +				iocb->u.isp24.port_name, pla);
+ +			res = 0;
+ +			break;
+ +		}
+ +
+ +		qlt_plogi_ack_link(vha, pla, sess, QLT_PLOGI_LINK_SAME_WWN);
+ +		sess->fw_login_state = DSC_LS_PLOGI_PEND;
+ +		sess->d_id = port_id;
+ +		sess->login_gen++;
+ +
+ +		switch (sess->disc_state) {
+ +		case DSC_DELETED:
+ +			qlt_plogi_ack_unref(vha, pla);
+ +			break;
+ +
+ +		default:
+ +			/*
+ +			 * Under normal circumstances we want to release nport handle
+ +			 * during LOGO process to avoid nport handle leaks inside FW.
+ +			 * The exception is when LOGO is done while another PLOGI with
+ +			 * the same nport handle is waiting as might be the case here.
+ +			 * Note: there is always a possibily of a race where session
+ +			 * deletion has already started for other reasons (e.g. ACL
+ +			 * removal) and now PLOGI arrives:
+ +			 * 1. if PLOGI arrived in FW after nport handle has been freed,
+ +			 *    FW must have assigned this PLOGI a new/same handle and we
+ +			 *    can proceed ACK'ing it as usual when session deletion
+ +			 *    completes.
+ +			 * 2. if PLOGI arrived in FW before LOGO with LCF_FREE_NPORT
+ +			 *    bit reached it, the handle has now been released. We'll
+ +			 *    get an error when we ACK this PLOGI. Nothing will be sent
+ +			 *    back to initiator. Initiator should eventually retry
+ +			 *    PLOGI and situation will correct itself.
+ +			 */
+ +			sess->keep_nport_handle = ((sess->loop_id == loop_id) &&
+ +			   (sess->d_id.b24 == port_id.b24));
+ +
+ +			ql_dbg(ql_dbg_disc, vha, 0x20f9,
+ +			    "%s %d %8phC post del sess\n",
+ +			    __func__, __LINE__, sess->port_name);
+ +
+ +
+ +			qlt_schedule_sess_for_deletion_lock(sess);
+ +			break;
+ +		}
+ +
+++=======
++ 		res = qlt_handle_login(vha, iocb);
+++>>>>>>> 9cd883f07a54 (scsi: qla2xxx: Fix session cleanup for N2N)
+  		break;
+  
+  	case ELS_PRLI:
+* Unmerged path drivers/scsi/qla2xxx/qla_def.h
+diff --git a/drivers/scsi/qla2xxx/qla_fw.h b/drivers/scsi/qla2xxx/qla_fw.h
+index 1f808928763b..5adb0b3ff195 100644
+--- a/drivers/scsi/qla2xxx/qla_fw.h
++++ b/drivers/scsi/qla2xxx/qla_fw.h
+@@ -1367,7 +1367,7 @@ struct vp_rpt_id_entry_24xx {
+ 
+ 		    uint8_t port_name[8];
+ 		    uint8_t node_name[8];
+-		    uint32_t remote_nport_id;
++		    uint8_t remote_nport_id[4];
+ 		    uint32_t reserved_5;
+ 		} f2;
+ 	} u;
+* Unmerged path drivers/scsi/qla2xxx/qla_init.c
+diff --git a/drivers/scsi/qla2xxx/qla_isr.c b/drivers/scsi/qla2xxx/qla_isr.c
+index 07f970a66c67..8f9cec3f1e65 100644
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@ -811,6 +811,7 @@ skip_rio:
+ 		break;
+ 
+ 	case MBA_LOOP_DOWN:		/* Loop Down Event */
++		SAVE_TOPO(ha);
+ 		ha->flags.n2n_ae = 0;
+ 		ha->flags.lip_ae = 0;
+ 		ha->current_topology = 0;
+@@ -924,7 +925,6 @@ skip_rio:
+ 		set_bit(REGISTER_FC4_NEEDED, &vha->dpc_flags);
+ 		set_bit(REGISTER_FDMI_NEEDED, &vha->dpc_flags);
+ 
+-		ha->flags.gpsc_supported = 1;
+ 		vha->flags.management_server_logged_in = 0;
+ 		break;
+ 
+@@ -1061,8 +1061,6 @@ global_port_update:
+ 		 */
+ 		atomic_set(&vha->loop_state, LOOP_UP);
+ 
+-		qla2x00_mark_all_devices_lost(vha, 1);
+-
+ 		set_bit(LOOP_RESYNC_NEEDED, &vha->dpc_flags);
+ 		set_bit(LOCAL_LOOP_UPDATE, &vha->dpc_flags);
+ 		set_bit(VP_CONFIG_OK, &vha->vp_flags);
+diff --git a/drivers/scsi/qla2xxx/qla_mbx.c b/drivers/scsi/qla2xxx/qla_mbx.c
+index 4649e83dd88d..b3d4c406ad9b 100644
+--- a/drivers/scsi/qla2xxx/qla_mbx.c
++++ b/drivers/scsi/qla2xxx/qla_mbx.c
+@@ -3643,6 +3643,7 @@ qla24xx_report_id_acquisition(scsi_qla_host_t *vha,
+ 	unsigned long   flags;
+ 	int found;
+ 	port_id_t id;
++	struct fc_port *fcport;
+ 
+ 	ql_dbg(ql_dbg_mbx + ql_dbg_verbose, vha, 0x10b6,
+ 	    "Entered %s.\n", __func__);
+@@ -3665,7 +3666,7 @@ qla24xx_report_id_acquisition(scsi_qla_host_t *vha,
+ 		    "Primary port id %02x%02x%02x.\n",
+ 		    rptid_entry->port_id[2], rptid_entry->port_id[1],
+ 		    rptid_entry->port_id[0]);
+-
++		ha->current_topology = ISP_CFG_NL;
+ 		qlt_update_host_map(vha, id);
+ 
+ 	} else if (rptid_entry->format == 1) {
+@@ -3677,6 +3678,8 @@ qla24xx_report_id_acquisition(scsi_qla_host_t *vha,
+ 		    rptid_entry->port_id[2], rptid_entry->port_id[1],
+ 		    rptid_entry->port_id[0]);
+ 
++		ha->flags.gpsc_supported = 1;
++		ha->current_topology = ISP_CFG_F;
+ 		/* buffer to buffer credit flag */
+ 		vha->flags.bbcr_enable = (rptid_entry->u.f1.bbcr & 0xf) != 0;
+ 
+@@ -3742,6 +3745,8 @@ qla24xx_report_id_acquisition(scsi_qla_host_t *vha,
+ 		    rptid_entry->u.f2.port_name);
+ 
+ 		/* N2N.  direct connect */
++		ha->current_topology = ISP_CFG_N;
++		ha->flags.rida_fmt2 = 1;
+ 		vha->d_id.b.domain = rptid_entry->port_id[2];
+ 		vha->d_id.b.area = rptid_entry->port_id[1];
+ 		vha->d_id.b.al_pa = rptid_entry->port_id[0];
+@@ -3749,6 +3754,37 @@ qla24xx_report_id_acquisition(scsi_qla_host_t *vha,
+ 		spin_lock_irqsave(&ha->vport_slock, flags);
+ 		qlt_update_vp_map(vha, SET_AL_PA);
+ 		spin_unlock_irqrestore(&ha->vport_slock, flags);
++
++		list_for_each_entry(fcport, &vha->vp_fcports, list) {
++			fcport->scan_state = QLA_FCPORT_SCAN;
++		}
++
++		fcport = qla2x00_find_fcport_by_wwpn(vha,
++		    rptid_entry->u.f2.port_name, 1);
++
++		if (fcport) {
++			fcport->plogi_nack_done_deadline = jiffies + HZ;
++			fcport->scan_state = QLA_FCPORT_FOUND;
++			switch (fcport->disc_state) {
++			case DSC_DELETED:
++				ql_dbg(ql_dbg_disc, vha, 0x210d,
++				    "%s %d %8phC login\n",
++				    __func__, __LINE__, fcport->port_name);
++				qla24xx_fcport_handle_login(vha, fcport);
++				break;
++			case DSC_DELETE_PEND:
++				break;
++			default:
++				qlt_schedule_sess_for_deletion_lock(fcport);
++				break;
++			}
++		} else {
++			id.b.al_pa  = rptid_entry->u.f2.remote_nport_id[0];
++			id.b.area   = rptid_entry->u.f2.remote_nport_id[1];
++			id.b.domain = rptid_entry->u.f2.remote_nport_id[2];
++			qla24xx_post_newsess_work(vha, &id,
++			    rptid_entry->u.f2.port_name, NULL);
++		}
+ 	}
+ }
+ 
+* Unmerged path drivers/scsi/qla2xxx/qla_os.c
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
