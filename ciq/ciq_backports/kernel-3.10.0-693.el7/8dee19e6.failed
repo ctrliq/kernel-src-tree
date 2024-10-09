@@ -1,0 +1,212 @@
+amd-xgbe: Allow rx-frames coalescing to be changed anytime
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit 8dee19e619bb6d4aefdf0ce5260099fec08601a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8dee19e6.failed
+
+Currently the device must be down in order to update the rx-frames
+coalescing setting because the interrupt indicator is set in the
+descriptor data during initialization. Allow this setting to be changed
+while the device is up by moving the interrupt decision into the
+descriptor reset function and base the decision off of the supplied
+descriptor index value.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8dee19e619bb6d4aefdf0ce5260099fec08601a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+#	drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+index ec5481f846ee,96c5e4babbdf..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+@@@ -827,24 -1101,38 +827,43 @@@ static void xgbe_tx_desc_init(struct xg
+  	DBGPR("<--tx_desc_init\n");
+  }
+  
+- static void xgbe_rx_desc_reset(struct xgbe_ring_data *rdata)
++ static void xgbe_rx_desc_reset(struct xgbe_prv_data *pdata,
++ 			       struct xgbe_ring_data *rdata, unsigned int index)
+  {
+  	struct xgbe_ring_desc *rdesc = rdata->rdesc;
++ 	unsigned int rx_usecs = pdata->rx_usecs;
++ 	unsigned int rx_frames = pdata->rx_frames;
++ 	unsigned int inte;
++ 
++ 	if (!rx_usecs && !rx_frames) {
++ 		/* No coalescing, interrupt for every descriptor */
++ 		inte = 1;
++ 	} else {
++ 		/* Set interrupt based on Rx frame coalescing setting */
++ 		if (rx_frames && !((index + 1) % rx_frames))
++ 			inte = 1;
++ 		else
++ 			inte = 0;
++ 	}
+  
+  	/* Reset the Rx descriptor
+ -	 *   Set buffer 1 (lo) address to header dma address (lo)
+ -	 *   Set buffer 1 (hi) address to header dma address (hi)
+ -	 *   Set buffer 2 (lo) address to buffer dma address (lo)
+ -	 *   Set buffer 2 (hi) address to buffer dma address (hi) and
+ -	 *     set control bits OWN and INTE
+ +	 *   Set buffer 1 (lo) address to dma address (lo)
+ +	 *   Set buffer 1 (hi) address to dma address (hi)
+ +	 *   Set buffer 2 (lo) address to zero
+ +	 *   Set buffer 2 (hi) address to zero and set control bits
+ +	 *     OWN and INTE
+  	 */
+ -	rdesc->desc0 = cpu_to_le32(lower_32_bits(rdata->rx.hdr.dma));
+ -	rdesc->desc1 = cpu_to_le32(upper_32_bits(rdata->rx.hdr.dma));
+ -	rdesc->desc2 = cpu_to_le32(lower_32_bits(rdata->rx.buf.dma));
+ -	rdesc->desc3 = cpu_to_le32(upper_32_bits(rdata->rx.buf.dma));
+ +	rdesc->desc0 = cpu_to_le32(lower_32_bits(rdata->skb_dma));
+ +	rdesc->desc1 = cpu_to_le32(upper_32_bits(rdata->skb_dma));
+ +	rdesc->desc2 = 0;
+  
+++<<<<<<< HEAD
+ +	rdesc->desc3 = 0;
+ +	if (rdata->interrupt)
+ +		XGMAC_SET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, INTE, 1);
+++=======
++ 	XGMAC_SET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, INTE, inte);
+++>>>>>>> 8dee19e619bb (amd-xgbe: Allow rx-frames coalescing to be changed anytime)
+  
+  	/* Since the Rx DMA engine is likely running, make sure everything
+  	 * is written to the descriptor(s) before setting the OWN bit
+@@@ -863,9 -1151,7 +882,8 @@@ static void xgbe_rx_desc_init(struct xg
+  	struct xgbe_prv_data *pdata = channel->pdata;
+  	struct xgbe_ring *ring = channel->rx_ring;
+  	struct xgbe_ring_data *rdata;
+ +	struct xgbe_ring_desc *rdesc;
+  	unsigned int start_index = ring->cur;
+- 	unsigned int rx_coalesce, rx_frames;
+  	unsigned int i;
+  
+  	DBGPR("-->rx_desc_init\n");
+@@@ -873,38 -1159,11 +891,40 @@@
+  	/* Initialize all descriptors */
+  	for (i = 0; i < ring->rdesc_count; i++) {
+  		rdata = XGBE_GET_DESC_DATA(ring, i);
+ +		rdesc = rdata->rdesc;
+  
+++<<<<<<< HEAD
+ +		/* Initialize Rx descriptor
+ +		 *   Set buffer 1 (lo) address to dma address (lo)
+ +		 *   Set buffer 1 (hi) address to dma address (hi)
+ +		 *   Set buffer 2 (lo) address to zero
+ +		 *   Set buffer 2 (hi) address to zero and set control
+ +		 *     bits OWN and INTE appropriateley
+ +		 */
+ +		rdesc->desc0 = cpu_to_le32(lower_32_bits(rdata->skb_dma));
+ +		rdesc->desc1 = cpu_to_le32(upper_32_bits(rdata->skb_dma));
+ +		rdesc->desc2 = 0;
+ +		rdesc->desc3 = 0;
+ +		XGMAC_SET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, OWN, 1);
+ +		XGMAC_SET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, INTE, 1);
+ +		rdata->interrupt = 1;
+ +		if (rx_coalesce && (!rx_frames || ((i + 1) % rx_frames))) {
+ +			/* Clear interrupt on completion bit */
+ +			XGMAC_SET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, INTE,
+ +					  0);
+ +			rdata->interrupt = 0;
+ +		}
+++=======
++ 		/* Initialize Rx descriptor */
++ 		xgbe_rx_desc_reset(pdata, rdata, i);
+++>>>>>>> 8dee19e619bb (amd-xgbe: Allow rx-frames coalescing to be changed anytime)
+  	}
+  
+ +	/* Make sure everything is written to the descriptors before
+ +	 * telling the device about them
+ +	 */
+ +	wmb();
+ +
+  	/* Update the total number of Rx descriptors */
+  	XGMAC_DMA_IOWRITE(channel, DMA_CH_RDRLR, ring->rdesc_count - 1);
+  
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index d58e85811bc9,74b4698ea958..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@@ -1089,7 -1797,22 +1089,26 @@@ static void xgbe_rx_refresh(struct xgbe
+  	struct xgbe_ring *ring = channel->rx_ring;
+  	struct xgbe_ring_data *rdata;
+  
+++<<<<<<< HEAD
+ +	desc_if->realloc_skb(channel);
+++=======
++ 	while (ring->dirty != ring->cur) {
++ 		rdata = XGBE_GET_DESC_DATA(ring, ring->dirty);
++ 
++ 		/* Reset rdata values */
++ 		desc_if->unmap_rdata(pdata, rdata);
++ 
++ 		if (desc_if->map_rx_buffer(pdata, ring, rdata))
++ 			break;
++ 
++ 		hw_if->rx_desc_reset(pdata, rdata, ring->dirty);
++ 
++ 		ring->dirty++;
++ 	}
++ 
++ 	/* Make sure everything is written before the register write */
++ 	wmb();
+++>>>>>>> 8dee19e619bb (amd-xgbe: Allow rx-frames coalescing to be changed anytime)
+  
+  	/* Update the Rx Tail Pointer Register with address of
+  	 * the last cleaned entry */
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c b/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c
+index 6e5a90e8e36c..903ffa4dc913 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c
+@@ -422,16 +422,6 @@ static int xgbe_set_coalesce(struct net_device *netdev,
+ 	    (ec->rate_sample_interval))
+ 		return -EOPNOTSUPP;
+ 
+-	/* Can only change rx-frames when interface is down (see
+-	 * rx_descriptor_init in xgbe-dev.c)
+-	 */
+-	rx_frames = pdata->rx_frames;
+-	if (rx_frames != ec->rx_max_coalesced_frames && netif_running(netdev)) {
+-		netdev_alert(netdev,
+-			     "interface must be down to change rx-frames\n");
+-		return -EINVAL;
+-	}
+-
+ 	rx_riwt = hw_if->usec_to_riwt(pdata, ec->rx_coalesce_usecs);
+ 	rx_usecs = ec->rx_coalesce_usecs;
+ 	rx_frames = ec->rx_max_coalesced_frames;
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe.h b/drivers/net/ethernet/amd/xgbe/xgbe.h
+index 1903f878545a..fc26079f3174 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe.h
+@@ -236,8 +236,6 @@ struct xgbe_ring_data {
+ 
+ 	unsigned short len;		/* Length of received Rx packet */
+ 
+-	unsigned int interrupt;		/* Interrupt indicator */
+-
+ 	unsigned int mapped_as_page;
+ };
+ 
+@@ -424,8 +422,9 @@ struct xgbe_hw_if {
+ 	int (*dev_read)(struct xgbe_channel *);
+ 	void (*tx_desc_init)(struct xgbe_channel *);
+ 	void (*rx_desc_init)(struct xgbe_channel *);
+-	void (*rx_desc_reset)(struct xgbe_ring_data *);
+ 	void (*tx_desc_reset)(struct xgbe_ring_data *);
++	void (*rx_desc_reset)(struct xgbe_prv_data *, struct xgbe_ring_data *,
++			      unsigned int);
+ 	int (*is_last_desc)(struct xgbe_ring_desc *);
+ 	int (*is_context_desc)(struct xgbe_ring_desc *);
+ 
