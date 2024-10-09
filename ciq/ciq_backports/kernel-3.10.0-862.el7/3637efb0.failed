@@ -1,0 +1,149 @@
+x86/mce: Add PCI quirks to identify Xeons with machine check recovery
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] mce: Add PCI quirks to identify Xeons with machine check recovery (Jeff Moyer) [1437205]
+Rebuild_FUZZ: 97.01%
+commit-author Tony Luck <tony.luck@intel.com>
+commit 3637efb00864f465baebd49464e58319fd295b65
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3637efb0.failed
+
+Each Xeon includes a number of capability registers in PCI space that
+describe some features not enumerated by CPUID.
+
+Use these to determine that we are running on a model that can recover from
+machine checks. Hooks for Ivybridge ... Skylake provided.
+
+	Signed-off-by: Tony Luck <tony.luck@intel.com>
+	Acked-by: Borislav Petkov <bp@suse.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Boris Petkov <bp@suse.de>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Link: http://lkml.kernel.org/r/abf331dc4a3e2a2d17444129bc51127437bcf4ba.1472754711.git.tony.luck@intel.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+(cherry picked from commit 3637efb00864f465baebd49464e58319fd295b65)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/string_64.h
+diff --cc arch/x86/include/asm/string_64.h
+index 19e2c468fc2c,877a1dfbf770..000000000000
+--- a/arch/x86/include/asm/string_64.h
++++ b/arch/x86/include/asm/string_64.h
+@@@ -63,6 -66,34 +64,37 @@@ char *strcpy(char *dest, const char *sr
+  char *strcat(char *dest, const char *src);
+  int strcmp(const char *cs, const char *ct);
+  
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_KASAN) && !defined(__SANITIZE_ADDRESS__)
++ 
++ /*
++  * For files that not instrumented (e.g. mm/slub.c) we
++  * should use not instrumented version of mem* functions.
++  */
++ 
++ #undef memcpy
++ #define memcpy(dst, src, len) __memcpy(dst, src, len)
++ #define memmove(dst, src, len) __memmove(dst, src, len)
++ #define memset(s, c, n) __memset(s, c, n)
++ #endif
++ 
++ DECLARE_STATIC_KEY_FALSE(mcsafe_key);
++ 
++ /**
++  * memcpy_mcsafe - copy memory with indication if a machine check happened
++  *
++  * @dst:	destination address
++  * @src:	source address
++  * @cnt:	number of bytes to copy
++  *
++  * Low level memory copy function that catches machine checks
++  *
++  * Return 0 for success, -EFAULT for fail
++  */
++ int memcpy_mcsafe(void *dst, const void *src, size_t cnt);
++ 
+++>>>>>>> 3637efb00864 (x86/mce: Add PCI quirks to identify Xeons with machine check recovery)
+  #endif /* __KERNEL__ */
+  
+  #endif /* _ASM_X86_STRING_64_H */
+* Unmerged path arch/x86/include/asm/string_64.h
+diff --git a/arch/x86/kernel/cpu/mcheck/mce.c b/arch/x86/kernel/cpu/mcheck/mce.c
+index 62de9881e444..dc9b6149f926 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce.c
++++ b/arch/x86/kernel/cpu/mcheck/mce.c
+@@ -41,6 +41,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/irq_work.h>
+ #include <linux/export.h>
++#include <linux/jump_label.h>
+ 
+ #include <asm/processor.h>
+ #include <asm/mce.h>
+@@ -2073,6 +2074,7 @@ void mce_disable_bank(int bank)
+  * mce=bootlog Log MCEs from before booting. Disabled by default on AMD.
+  * mce=nobootlog Don't log MCEs from before booting.
+  * mce=bios_cmci_threshold Don't program the CMCI threshold
++ * mce=recovery force enable memcpy_mcsafe()
+  */
+ static int __init mcheck_enable(char *str)
+ {
+@@ -2668,8 +2670,14 @@ static int __init mcheck_debugfs_init(void)
+ static int __init mcheck_debugfs_init(void) { return -EINVAL; }
+ #endif
+ 
++DEFINE_STATIC_KEY_FALSE(mcsafe_key);
++EXPORT_SYMBOL_GPL(mcsafe_key);
++
+ static int __init mcheck_late_init(void)
+ {
++	if (mca_cfg.recovery)
++		static_branch_inc(&mcsafe_key);
++
+ 	mcheck_debugfs_init();
+ 
+ 	/*
+diff --git a/arch/x86/kernel/quirks.c b/arch/x86/kernel/quirks.c
+index 7f4631f469e2..5c448b35c13f 100644
+--- a/arch/x86/kernel/quirks.c
++++ b/arch/x86/kernel/quirks.c
+@@ -588,3 +588,34 @@ static void quirk_amd_xgbe_nic(struct pci_dev *dev)
+ DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AMD, 0x1458, quirk_amd_xgbe_nic);
+ DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AMD, 0x1459, quirk_amd_xgbe_nic);
+ #endif
++
++#if defined(CONFIG_X86_64) && defined(CONFIG_X86_MCE)
++#include <linux/jump_label.h>
++#include <asm/string_64.h>
++
++/* Ivy Bridge, Haswell, Broadwell */
++static void quirk_intel_brickland_xeon_ras_cap(struct pci_dev *pdev)
++{
++	u32 capid0;
++
++	pci_read_config_dword(pdev, 0x84, &capid0);
++
++	if (capid0 & 0x10)
++		static_branch_inc(&mcsafe_key);
++}
++
++/* Skylake */
++static void quirk_intel_purley_xeon_ras_cap(struct pci_dev *pdev)
++{
++	u32 capid0;
++
++	pci_read_config_dword(pdev, 0x84, &capid0);
++
++	if ((capid0 & 0xc0) == 0xc0)
++		static_branch_inc(&mcsafe_key);
++}
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x0ec3, quirk_intel_brickland_xeon_ras_cap);
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x2fc0, quirk_intel_brickland_xeon_ras_cap);
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x6fc0, quirk_intel_brickland_xeon_ras_cap);
++DECLARE_PCI_FIXUP_EARLY(PCI_VENDOR_ID_INTEL, 0x2083, quirk_intel_purley_xeon_ras_cap);
++#endif
