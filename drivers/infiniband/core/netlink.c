@@ -38,6 +38,7 @@
 #include <net/net_namespace.h>
 #include <net/sock.h>
 #include <rdma/rdma_netlink.h>
+#include <linux/module.h>
 #include "core_priv.h"
 
 struct ibnl_client {
@@ -265,3 +266,5 @@ void ibnl_cleanup(void)
 
 	netlink_kernel_release(nls);
 }
+
+MODULE_ALIAS_NET_PF_PROTO(PF_NETLINK, NETLINK_RDMA);
