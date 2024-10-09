@@ -1,0 +1,234 @@
+mlxsw: spectrum: Remove support for bridge FDB learning sync
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Arkadi Sharshevsky <arkadis@mellanox.com>
+commit a989cdb473c2fd9cd0187fa9f7da8e4a7c989332
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a989cdb4.failed
+
+Currently the mlxsw driver supports an option for disabling syncing
+the hardware learned FDBs with the software bridge. This behavior
+breaks the bridge offload model and thus it is removed.
+
+	Signed-off-by: Arkadi Sharshevsky <arkadis@mellanox.com>
+	Reviewed-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a989cdb473c2fd9cd0187fa9f7da8e4a7c989332)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+index 44693bdf62ad,eb88b721d2f7..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+@@@ -1294,7 -1691,173 +1294,177 @@@ static const struct switchdev_ops mlxsw
+  	.switchdev_port_obj_dump	= mlxsw_sp_port_obj_dump,
+  };
+  
+++<<<<<<< HEAD
+ +static void mlxsw_sp_fdb_call_notifiers(bool learning_sync, bool adding,
+++=======
++ static int
++ mlxsw_sp_bridge_8021q_port_join(struct mlxsw_sp_bridge_device *bridge_device,
++ 				struct mlxsw_sp_bridge_port *bridge_port,
++ 				struct mlxsw_sp_port *mlxsw_sp_port)
++ {
++ 	struct mlxsw_sp_port_vlan *mlxsw_sp_port_vlan;
++ 
++ 	if (is_vlan_dev(bridge_port->dev))
++ 		return -EINVAL;
++ 
++ 	mlxsw_sp_port_vlan = mlxsw_sp_port_vlan_find_by_vid(mlxsw_sp_port, 1);
++ 	if (WARN_ON(!mlxsw_sp_port_vlan))
++ 		return -EINVAL;
++ 
++ 	/* Let VLAN-aware bridge take care of its own VLANs */
++ 	mlxsw_sp_port_vlan_put(mlxsw_sp_port_vlan);
++ 
++ 	return 0;
++ }
++ 
++ static void
++ mlxsw_sp_bridge_8021q_port_leave(struct mlxsw_sp_bridge_device *bridge_device,
++ 				 struct mlxsw_sp_bridge_port *bridge_port,
++ 				 struct mlxsw_sp_port *mlxsw_sp_port)
++ {
++ 	mlxsw_sp_port_vlan_get(mlxsw_sp_port, 1);
++ 	/* Make sure untagged frames are allowed to ingress */
++ 	mlxsw_sp_port_pvid_set(mlxsw_sp_port, 1);
++ }
++ 
++ static struct mlxsw_sp_fid *
++ mlxsw_sp_bridge_8021q_fid_get(struct mlxsw_sp_bridge_device *bridge_device,
++ 			      u16 vid)
++ {
++ 	struct mlxsw_sp *mlxsw_sp = mlxsw_sp_lower_get(bridge_device->dev);
++ 
++ 	return mlxsw_sp_fid_8021q_get(mlxsw_sp, vid);
++ }
++ 
++ static const struct mlxsw_sp_bridge_ops mlxsw_sp_bridge_8021q_ops = {
++ 	.port_join	= mlxsw_sp_bridge_8021q_port_join,
++ 	.port_leave	= mlxsw_sp_bridge_8021q_port_leave,
++ 	.fid_get	= mlxsw_sp_bridge_8021q_fid_get,
++ };
++ 
++ static bool
++ mlxsw_sp_port_is_br_member(const struct mlxsw_sp_port *mlxsw_sp_port,
++ 			   const struct net_device *br_dev)
++ {
++ 	struct mlxsw_sp_port_vlan *mlxsw_sp_port_vlan;
++ 
++ 	list_for_each_entry(mlxsw_sp_port_vlan, &mlxsw_sp_port->vlans_list,
++ 			    list) {
++ 		if (mlxsw_sp_port_vlan->bridge_port &&
++ 		    mlxsw_sp_port_vlan->bridge_port->bridge_device->dev ==
++ 		    br_dev)
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static int
++ mlxsw_sp_bridge_8021d_port_join(struct mlxsw_sp_bridge_device *bridge_device,
++ 				struct mlxsw_sp_bridge_port *bridge_port,
++ 				struct mlxsw_sp_port *mlxsw_sp_port)
++ {
++ 	struct mlxsw_sp_port_vlan *mlxsw_sp_port_vlan;
++ 	u16 vid;
++ 
++ 	if (!is_vlan_dev(bridge_port->dev))
++ 		return -EINVAL;
++ 	vid = vlan_dev_vlan_id(bridge_port->dev);
++ 
++ 	mlxsw_sp_port_vlan = mlxsw_sp_port_vlan_find_by_vid(mlxsw_sp_port, vid);
++ 	if (WARN_ON(!mlxsw_sp_port_vlan))
++ 		return -EINVAL;
++ 
++ 	if (mlxsw_sp_port_is_br_member(mlxsw_sp_port, bridge_device->dev)) {
++ 		netdev_err(mlxsw_sp_port->dev, "Can't bridge VLAN uppers of the same port\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* Port is no longer usable as a router interface */
++ 	if (mlxsw_sp_port_vlan->fid)
++ 		mlxsw_sp_port_vlan_router_leave(mlxsw_sp_port_vlan);
++ 
++ 	return mlxsw_sp_port_vlan_bridge_join(mlxsw_sp_port_vlan, bridge_port);
++ }
++ 
++ static void
++ mlxsw_sp_bridge_8021d_port_leave(struct mlxsw_sp_bridge_device *bridge_device,
++ 				 struct mlxsw_sp_bridge_port *bridge_port,
++ 				 struct mlxsw_sp_port *mlxsw_sp_port)
++ {
++ 	struct mlxsw_sp_port_vlan *mlxsw_sp_port_vlan;
++ 	u16 vid = vlan_dev_vlan_id(bridge_port->dev);
++ 
++ 	mlxsw_sp_port_vlan = mlxsw_sp_port_vlan_find_by_vid(mlxsw_sp_port, vid);
++ 	if (WARN_ON(!mlxsw_sp_port_vlan))
++ 		return;
++ 
++ 	mlxsw_sp_port_vlan_bridge_leave(mlxsw_sp_port_vlan);
++ }
++ 
++ static struct mlxsw_sp_fid *
++ mlxsw_sp_bridge_8021d_fid_get(struct mlxsw_sp_bridge_device *bridge_device,
++ 			      u16 vid)
++ {
++ 	struct mlxsw_sp *mlxsw_sp = mlxsw_sp_lower_get(bridge_device->dev);
++ 
++ 	return mlxsw_sp_fid_8021d_get(mlxsw_sp, bridge_device->dev->ifindex);
++ }
++ 
++ static const struct mlxsw_sp_bridge_ops mlxsw_sp_bridge_8021d_ops = {
++ 	.port_join	= mlxsw_sp_bridge_8021d_port_join,
++ 	.port_leave	= mlxsw_sp_bridge_8021d_port_leave,
++ 	.fid_get	= mlxsw_sp_bridge_8021d_fid_get,
++ };
++ 
++ int mlxsw_sp_port_bridge_join(struct mlxsw_sp_port *mlxsw_sp_port,
++ 			      struct net_device *brport_dev,
++ 			      struct net_device *br_dev)
++ {
++ 	struct mlxsw_sp *mlxsw_sp = mlxsw_sp_port->mlxsw_sp;
++ 	struct mlxsw_sp_bridge_device *bridge_device;
++ 	struct mlxsw_sp_bridge_port *bridge_port;
++ 	int err;
++ 
++ 	bridge_port = mlxsw_sp_bridge_port_get(mlxsw_sp->bridge, brport_dev);
++ 	if (IS_ERR(bridge_port))
++ 		return PTR_ERR(bridge_port);
++ 	bridge_device = bridge_port->bridge_device;
++ 
++ 	err = bridge_device->ops->port_join(bridge_device, bridge_port,
++ 					    mlxsw_sp_port);
++ 	if (err)
++ 		goto err_port_join;
++ 
++ 	return 0;
++ 
++ err_port_join:
++ 	mlxsw_sp_bridge_port_put(mlxsw_sp->bridge, bridge_port);
++ 	return err;
++ }
++ 
++ void mlxsw_sp_port_bridge_leave(struct mlxsw_sp_port *mlxsw_sp_port,
++ 				struct net_device *brport_dev,
++ 				struct net_device *br_dev)
++ {
++ 	struct mlxsw_sp *mlxsw_sp = mlxsw_sp_port->mlxsw_sp;
++ 	struct mlxsw_sp_bridge_device *bridge_device;
++ 	struct mlxsw_sp_bridge_port *bridge_port;
++ 
++ 	bridge_device = mlxsw_sp_bridge_device_find(mlxsw_sp->bridge, br_dev);
++ 	if (!bridge_device)
++ 		return;
++ 	bridge_port = __mlxsw_sp_bridge_port_find(bridge_device, brport_dev);
++ 	if (!bridge_port)
++ 		return;
++ 
++ 	bridge_device->ops->port_leave(bridge_device, bridge_port,
++ 				       mlxsw_sp_port);
++ 	mlxsw_sp_bridge_port_put(mlxsw_sp->bridge, bridge_port);
++ }
++ 
++ static void mlxsw_sp_fdb_call_notifiers(bool adding,
+++>>>>>>> a989cdb473c2 (mlxsw: spectrum: Remove support for bridge FDB learning sync)
+  					char *mac, u16 vid,
+  					struct net_device *dev)
+  {
+@@@ -1353,8 -1916,8 +1521,13 @@@ do_fdb_op
+  
+  	if (!do_notification)
+  		return;
+++<<<<<<< HEAD
+ +	mlxsw_sp_fdb_call_notifiers(mlxsw_sp_port->learning_sync,
+ +				    adding, mac, vid, mlxsw_sp_port->dev);
+++=======
++ 	mlxsw_sp_fdb_call_notifiers(adding, mac, vid, bridge_port->dev);
++ 
+++>>>>>>> a989cdb473c2 (mlxsw: spectrum: Remove support for bridge FDB learning sync)
+  	return;
+  
+  just_remove:
+@@@ -1413,8 -1974,8 +1586,13 @@@ do_fdb_op
+  
+  	if (!do_notification)
+  		return;
+++<<<<<<< HEAD
+ +	mlxsw_sp_fdb_call_notifiers(mlxsw_sp_port->learning_sync, adding, mac,
+ +				    vid, dev);
+++=======
++ 	mlxsw_sp_fdb_call_notifiers(adding, mac, vid, bridge_port->dev);
++ 
+++>>>>>>> a989cdb473c2 (mlxsw: spectrum: Remove support for bridge FDB learning sync)
+  	return;
+  
+  just_remove:
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
