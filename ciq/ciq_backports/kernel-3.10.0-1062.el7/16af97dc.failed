@@ -1,0 +1,202 @@
+mm: migrate: prevent racy access to tlb_flush_pending
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Nadav Amit <nadav.amit@gmail.com>
+commit 16af97dc5a8975371a83d9e30a64038b48f40a2d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/16af97dc.failed
+
+Patch series "fixes of TLB batching races", v6.
+
+It turns out that Linux TLB batching mechanism suffers from various
+races.  Races that are caused due to batching during reclamation were
+recently handled by Mel and this patch-set deals with others.  The more
+fundamental issue is that concurrent updates of the page-tables allow
+for TLB flushes to be batched on one core, while another core changes
+the page-tables.  This other core may assume a PTE change does not
+require a flush based on the updated PTE value, while it is unaware that
+TLB flushes are still pending.
+
+This behavior affects KSM (which may result in memory corruption) and
+MADV_FREE and MADV_DONTNEED (which may result in incorrect behavior).  A
+proof-of-concept can easily produce the wrong behavior of MADV_DONTNEED.
+Memory corruption in KSM is harder to produce in practice, but was
+observed by hacking the kernel and adding a delay before flushing and
+replacing the KSM page.
+
+Finally, there is also one memory barrier missing, which may affect
+architectures with weak memory model.
+
+This patch (of 7):
+
+Setting and clearing mm->tlb_flush_pending can be performed by multiple
+threads, since mmap_sem may only be acquired for read in
+task_numa_work().  If this happens, tlb_flush_pending might be cleared
+while one of the threads still changes PTEs and batches TLB flushes.
+
+This can lead to the same race between migration and
+change_protection_range() that led to the introduction of
+tlb_flush_pending.  The result of this race was data corruption, which
+means that this patch also addresses a theoretically possible data
+corruption.
+
+An actual data corruption was not observed, yet the race was was
+confirmed by adding assertion to check tlb_flush_pending is not set by
+two threads, adding artificial latency in change_protection_range() and
+using sysctl to reduce kernel.numa_balancing_scan_delay_ms.
+
+Link: http://lkml.kernel.org/r/20170802000818.4760-2-namit@vmware.com
+Fixes: 20841405940e ("mm: fix TLB flush race between migration, and
+change_protection_range")
+	Signed-off-by: Nadav Amit <namit@vmware.com>
+	Acked-by: Mel Gorman <mgorman@suse.de>
+	Acked-by: Rik van Riel <riel@redhat.com>
+	Acked-by: Minchan Kim <minchan@kernel.org>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: "David S. Miller" <davem@davemloft.net>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jeff Dike <jdike@addtoit.com>
+	Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+	Cc: Russell King <linux@armlinux.org.uk>
+	Cc: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: Yoshinori Sato <ysato@users.sourceforge.jp>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 16af97dc5a8975371a83d9e30a64038b48f40a2d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/fork.c
+#	mm/debug.c
+diff --cc kernel/fork.c
+index 9bff3b28c357,e075b7780421..000000000000
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@@ -608,14 -797,20 +608,22 @@@ static struct mm_struct *mm_init(struc
+  	INIT_LIST_HEAD(&mm->mmlist);
+  	mm->core_state = NULL;
+  	atomic_long_set(&mm->nr_ptes, 0);
+ -	mm_nr_pmds_init(mm);
+ -	mm->map_count = 0;
+ -	mm->locked_vm = 0;
+ -	mm->pinned_vm = 0;
+  	memset(&mm->rss_stat, 0, sizeof(mm->rss_stat));
+ +	atomic_long_set(&mm->mm_shmempages, 0);
+  	spin_lock_init(&mm->page_table_lock);
+ -	mm_init_cpumask(mm);
+ +	mm->free_area_cache = TASK_UNMAPPED_BASE;
+ +	mm->cached_hole_size = ~0UL;
+  	mm_init_aio(mm);
+  	mm_init_owner(mm, p);
+++<<<<<<< HEAD
+ +	clear_tlb_flush_pending(mm);
+++=======
++ 	mmu_notifier_mm_init(mm);
++ 	init_tlb_flush_pending(mm);
++ #if defined(CONFIG_TRANSPARENT_HUGEPAGE) && !USE_SPLIT_PMD_PTLOCKS
++ 	mm->pmd_huge_pte = NULL;
++ #endif
+++>>>>>>> 16af97dc5a89 (mm: migrate: prevent racy access to tlb_flush_pending)
+  
+  	if (current->mm) {
+  		mm->flags = current->mm->flags & MMF_INIT_MASK;
+* Unmerged path mm/debug.c
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index ff35333d8d6c..84a3f024c52d 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -503,7 +503,7 @@ struct mm_struct {
+ 	 * can move process memory needs to flush the TLB when moving a
+ 	 * PROT_NONE or PROT_NUMA mapped page.
+ 	 */
+-	bool tlb_flush_pending;
++	atomic_t tlb_flush_pending;
+ #endif
+ #ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
+ 	/* See flush_tlb_batched_pending() */
+@@ -578,33 +578,46 @@ static inline cpumask_t *mm_cpumask(struct mm_struct *mm)
+ static inline bool tlb_flush_pending(struct mm_struct *mm)
+ {
+ 	barrier();
+-	return mm->tlb_flush_pending;
++	return atomic_read(&mm->tlb_flush_pending) > 0;
+ }
+-static inline void set_tlb_flush_pending(struct mm_struct *mm)
++
++static inline void init_tlb_flush_pending(struct mm_struct *mm)
+ {
+-	mm->tlb_flush_pending = true;
++	atomic_set(&mm->tlb_flush_pending, 0);
++}
++
++static inline void inc_tlb_flush_pending(struct mm_struct *mm)
++{
++	atomic_inc(&mm->tlb_flush_pending);
+ 
+ 	/*
+-	 * Guarantee that the tlb_flush_pending store does not leak into the
++	 * Guarantee that the tlb_flush_pending increase does not leak into the
+ 	 * critical section updating the page tables
+ 	 */
+ 	smp_mb__before_spinlock();
+ }
++
+ /* Clearing is done after a TLB flush, which also provides a barrier. */
+-static inline void clear_tlb_flush_pending(struct mm_struct *mm)
++static inline void dec_tlb_flush_pending(struct mm_struct *mm)
+ {
+ 	barrier();
+-	mm->tlb_flush_pending = false;
++	atomic_dec(&mm->tlb_flush_pending);
+ }
+ #else
+ static inline bool tlb_flush_pending(struct mm_struct *mm)
+ {
+ 	return false;
+ }
+-static inline void set_tlb_flush_pending(struct mm_struct *mm)
++
++static inline void init_tlb_flush_pending(struct mm_struct *mm)
+ {
+ }
+-static inline void clear_tlb_flush_pending(struct mm_struct *mm)
++
++static inline void inc_tlb_flush_pending(struct mm_struct *mm)
++{
++}
++
++static inline void dec_tlb_flush_pending(struct mm_struct *mm)
+ {
+ }
+ #endif
+* Unmerged path kernel/fork.c
+* Unmerged path mm/debug.c
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 434e86a00922..b94340148f41 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -223,7 +223,7 @@ static unsigned long change_protection_range(struct vm_area_struct *vma,
+ 	BUG_ON(addr >= end);
+ 	pgd = pgd_offset(mm, addr);
+ 	flush_cache_range(vma, addr, end);
+-	set_tlb_flush_pending(mm);
++	inc_tlb_flush_pending(mm);
+ 	do {
+ 		next = pgd_addr_end(addr, end);
+ 		if (pgd_none_or_clear_bad(pgd))
+@@ -235,7 +235,7 @@ static unsigned long change_protection_range(struct vm_area_struct *vma,
+ 	/* Only flush the TLB if we actually modified any entries: */
+ 	if (pages)
+ 		flush_tlb_range(vma, start, end);
+-	clear_tlb_flush_pending(mm);
++	dec_tlb_flush_pending(mm);
+ 
+ 	return pages;
+ }
