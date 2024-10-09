@@ -897,7 +897,9 @@ static int fm10k_mc_vlan_unsync(struct net_device *netdev,
 static int fm10k_update_vid(struct net_device *netdev, u16 vid, bool set)
 {
 	struct fm10k_intfc *interface = netdev_priv(netdev);
+	struct fm10k_l2_accel *l2_accel = interface->l2_accel;
 	struct fm10k_hw *hw = &interface->hw;
+	u16 glort;
 	s32 err;
 	int i;
 
@@ -964,6 +966,22 @@ static int fm10k_update_vid(struct net_device *netdev, u16 vid, bool set)
 				      hw->mac.addr, vid, set);
 	if (err)
 		goto err_out;
+
+	/* Update L2 accelerated macvlan addresses */
+	if (l2_accel) {
+		for (i = 0; i < l2_accel->size; i++) {
+			struct net_device *sdev = l2_accel->macvlan[i];
+
+			if (!sdev)
+				continue;
+
+			glort = l2_accel->dglort + 1 + i;
+
+			fm10k_queue_mac_request(interface, glort,
+						sdev->dev_addr,
+						vid, set);
+		}
+	}
 
 	/* set VLAN ID prior to syncing/unsyncing the VLAN */
 	interface->vid = vid + (set ? VLAN_N_VID : 0);
@@ -1204,6 +1222,22 @@ void fm10k_restore_rx_state(struct fm10k_intfc *interface)
 
 		fm10k_queue_mac_request(interface, glort,
 					hw->mac.addr, vid, true);
+
+		/* synchronize macvlan addresses */
+		if (l2_accel) {
+			for (i = 0; i < l2_accel->size; i++) {
+				struct net_device *sdev = l2_accel->macvlan[i];
+
+				if (!sdev)
+					continue;
+
+				glort = l2_accel->dglort + 1 + i;
+
+				fm10k_queue_mac_request(interface, glort,
+							sdev->dev_addr,
+							vid, true);
+			}
+		}
 	}
 
 	/* update xcast mode before synchronizing addresses if host's mailbox
@@ -1421,7 +1455,7 @@ static void *fm10k_dfwd_add_station(struct net_device *dev,
 	struct fm10k_dglort_cfg dglort = { 0 };
 	struct fm10k_hw *hw = &interface->hw;
 	int size = 0, i;
-	u16 glort;
+	u16 vid, glort;
 
 	/* The hardware supported by fm10k only filters on the destination MAC
 	 * address. In order to avoid issues we only support offloading modes
@@ -1501,6 +1535,12 @@ static void *fm10k_dfwd_add_station(struct net_device *dev,
 					hw->mac.default_vid, true);
 	}
 
+	for (vid = fm10k_find_next_vlan(interface, 0);
+	     vid < VLAN_N_VID;
+	     vid = fm10k_find_next_vlan(interface, vid))
+		fm10k_queue_mac_request(interface, glort, sdev->dev_addr,
+					vid, true);
+
 	fm10k_mbx_unlock(interface);
 
 	return sdev;
@@ -1513,8 +1553,8 @@ static void fm10k_dfwd_del_station(struct net_device *dev, void *priv)
 	struct fm10k_dglort_cfg dglort = { 0 };
 	struct fm10k_hw *hw = &interface->hw;
 	struct net_device *sdev = priv;
+	u16 vid, glort;
 	int i;
-	u16 glort;
 
 	if (!l2_accel)
 		return;
@@ -1540,6 +1580,12 @@ static void fm10k_dfwd_del_station(struct net_device *dev, void *priv)
 		fm10k_queue_mac_request(interface, glort, sdev->dev_addr,
 					hw->mac.default_vid, false);
 	}
+
+	for (vid = fm10k_find_next_vlan(interface, 0);
+	     vid < VLAN_N_VID;
+	     vid = fm10k_find_next_vlan(interface, vid))
+		fm10k_queue_mac_request(interface, glort, sdev->dev_addr,
+					vid, false);
 
 	fm10k_mbx_unlock(interface);
 
