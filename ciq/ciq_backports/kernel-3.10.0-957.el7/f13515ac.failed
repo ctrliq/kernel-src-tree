@@ -1,0 +1,284 @@
+scsi: qla2xxx: Replace GPDB with async ADISC command
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Replace GPDB with async ADISC command (Himanshu Madhani) [1547714]
+Rebuild_FUZZ: 93.88%
+commit-author Quinn Tran <quinn.tran@cavium.com>
+commit f13515acdcb5a40c6e324cb00b4a1ce269a94e1f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/f13515ac.failed
+
+Replace call to Get Port DataBase MB with PDO_FORCE_ADISC
+flag with async ADISC command so driver can see ADISC command
+has error or not.
+
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit f13515acdcb5a40c6e324cb00b4a1ce269a94e1f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_gs.c
+#	drivers/scsi/qla2xxx/qla_init.c
+diff --cc drivers/scsi/qla2xxx/qla_gs.c
+index 0dfd63fae4b1,bb96219ce525..000000000000
+--- a/drivers/scsi/qla2xxx/qla_gs.c
++++ b/drivers/scsi/qla2xxx/qla_gs.c
+@@@ -2797,13 -2819,23 +2797,33 @@@ void qla24xx_handle_gidpn_event(scsi_ql
+  				case MODE_INITIATOR:
+  				case MODE_DUAL:
+  				default:
+++<<<<<<< HEAD
+ +					if (atomic_read(&fcport->state) ==
+ +					    FCS_ONLINE)
+ +						break;
+ +					ql_dbg(ql_dbg_disc, vha, 0x201f,
+ +					    "%s %d %8phC post gnl\n",
+ +					    __func__, __LINE__, fcport->port_name);
+ +					qla24xx_post_gnl_work(vha, fcport);
+++=======
++ 					ql_dbg(ql_dbg_disc, vha, 0x201f,
++ 					    "%s %d %8phC post %s\n", __func__,
++ 					    __LINE__, fcport->port_name,
++ 					    (atomic_read(&fcport->state) ==
++ 					    FCS_ONLINE) ? "adisc" : "gnl");
++ 
++ 					if (atomic_read(&fcport->state) ==
++ 					    FCS_ONLINE) {
++ 						u16 data[2];
++ 
++ 						data[0] = data[1] = 0;
++ 						qla2x00_post_async_adisc_work(
++ 						    vha, fcport, data);
++ 					} else {
++ 						qla24xx_post_gnl_work(vha,
++ 						    fcport);
++ 					}
+++>>>>>>> f13515acdcb5 (scsi: qla2xxx: Replace GPDB with async ADISC command)
+  					break;
+  				}
+  			} else { /* fcport->d_id.b24 != ea->id.b24 */
+@@@ -3143,43 -3175,138 +3163,138 @@@ void qla24xx_async_gpnid_done(scsi_qla_
+  
+  void qla24xx_handle_gpnid_event(scsi_qla_host_t *vha, struct event_arg *ea)
+  {
+++<<<<<<< HEAD
+ +	fc_port_t *fcport;
+ +	unsigned long flags;
+++=======
++ 	fc_port_t *fcport, *conflict, *t;
++ 	u16 data[2];
+++>>>>>>> f13515acdcb5 (scsi: qla2xxx: Replace GPDB with async ADISC command)
+  
+ -	ql_dbg(ql_dbg_disc, vha, 0xffff,
+ -	    "%s %d port_id: %06x\n",
+ -	    __func__, __LINE__, ea->id.b24);
+ +	spin_lock_irqsave(&vha->hw->tgt.sess_lock, flags);
+ +	fcport = qla2x00_find_fcport_by_wwpn(vha, ea->port_name, 1);
+ +	spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
+  
+ -	if (ea->rc) {
+ -		/* cable is disconnected */
+ -		list_for_each_entry_safe(fcport, t, &vha->vp_fcports, list) {
+ -			if (fcport->d_id.b24 == ea->id.b24) {
+ -				ql_dbg(ql_dbg_disc, vha, 0xffff,
+ -				    "%s %d %8phC DS %d\n",
+ -				    __func__, __LINE__,
+ -				    fcport->port_name,
+ -				    fcport->disc_state);
+ -				fcport->scan_state = QLA_FCPORT_SCAN;
+ -				switch (fcport->disc_state) {
+ -				case DSC_DELETED:
+ -				case DSC_DELETE_PEND:
+ -					break;
+ -				default:
+ -					ql_dbg(ql_dbg_disc, vha, 0xffff,
+ -					    "%s %d %8phC post del sess\n",
+ -					    __func__, __LINE__,
+ -					    fcport->port_name);
+ -					qlt_schedule_sess_for_deletion_lock
+ -						(fcport);
+ -					break;
+ -				}
+ -			}
+ +	if (fcport) {
+ +		/* cable moved. just plugged in */
+ +		fcport->rscn_gen++;
+ +		fcport->d_id = ea->id;
+ +		fcport->scan_state = QLA_FCPORT_FOUND;
+ +		fcport->flags |= FCF_FABRIC_DEVICE;
+ +
+ +		switch (fcport->disc_state) {
+ +		case DSC_DELETED:
+ +			ql_dbg(ql_dbg_disc, vha, 0x210d,
+ +			    "%s %d %8phC login\n", __func__, __LINE__,
+ +			    fcport->port_name);
+ +			qla24xx_fcport_handle_login(vha, fcport);
+ +			break;
+ +		case DSC_DELETE_PEND:
+ +			break;
+ +		default:
+ +			ql_dbg(ql_dbg_disc, vha, 0x2064,
+ +			    "%s %d %8phC post del sess\n",
+ +			    __func__, __LINE__, fcport->port_name);
+ +			qlt_schedule_sess_for_deletion_lock(fcport);
+ +			break;
+  		}
+  	} else {
+ -		/* cable is connected */
+ -		fcport = qla2x00_find_fcport_by_wwpn(vha, ea->port_name, 1);
+ -		if (fcport) {
+ -			list_for_each_entry_safe(conflict, t, &vha->vp_fcports,
+ -			    list) {
+ -				if ((conflict->d_id.b24 == ea->id.b24) &&
+ -				    (fcport != conflict)) {
+ -					/* 2 fcports with conflict Nport ID or
+ -					 * an existing fcport is having nport ID
+ -					 * conflict with new fcport.
+ -					 */
+ -
+ +		/* create new fcport */
+ +		ql_dbg(ql_dbg_disc, vha, 0x2065,
+ +		    "%s %d %8phC post new sess\n",
+ +		    __func__, __LINE__, ea->port_name);
+ +
+++<<<<<<< HEAD
+ +		qla24xx_post_newsess_work(vha, &ea->id, ea->port_name, NULL);
+++=======
++ 					ql_dbg(ql_dbg_disc, vha, 0xffff,
++ 					    "%s %d %8phC DS %d\n",
++ 					    __func__, __LINE__,
++ 					    conflict->port_name,
++ 					    conflict->disc_state);
++ 					conflict->scan_state = QLA_FCPORT_SCAN;
++ 					switch (conflict->disc_state) {
++ 					case DSC_DELETED:
++ 					case DSC_DELETE_PEND:
++ 						break;
++ 					default:
++ 						ql_dbg(ql_dbg_disc, vha, 0xffff,
++ 						    "%s %d %8phC post del sess\n",
++ 						    __func__, __LINE__,
++ 						    conflict->port_name);
++ 						qlt_schedule_sess_for_deletion_lock
++ 							(conflict);
++ 						break;
++ 					}
++ 				}
++ 			}
++ 
++ 			fcport->rscn_gen++;
++ 			fcport->scan_state = QLA_FCPORT_FOUND;
++ 			fcport->flags |= FCF_FABRIC_DEVICE;
++ 			switch (fcport->disc_state) {
++ 			case DSC_LOGIN_COMPLETE:
++ 				/* recheck session is still intact. */
++ 				ql_dbg(ql_dbg_disc, vha, 0x210d,
++ 				    "%s %d %8phC revalidate session with ADISC\n",
++ 				    __func__, __LINE__, fcport->port_name);
++ 				data[0] = data[1] = 0;
++ 				qla2x00_post_async_adisc_work(vha, fcport,
++ 				    data);
++ 				break;
++ 			case DSC_DELETED:
++ 				ql_dbg(ql_dbg_disc, vha, 0x210d,
++ 				    "%s %d %8phC login\n", __func__, __LINE__,
++ 				    fcport->port_name);
++ 				fcport->d_id = ea->id;
++ 				qla24xx_fcport_handle_login(vha, fcport);
++ 				break;
++ 			case DSC_DELETE_PEND:
++ 				fcport->d_id = ea->id;
++ 				break;
++ 			default:
++ 				fcport->d_id = ea->id;
++ 				break;
++ 			}
++ 		} else {
++ 			list_for_each_entry_safe(conflict, t, &vha->vp_fcports,
++ 			    list) {
++ 				if (conflict->d_id.b24 == ea->id.b24) {
++ 					/* 2 fcports with conflict Nport ID or
++ 					 * an existing fcport is having nport ID
++ 					 * conflict with new fcport.
++ 					 */
++ 					ql_dbg(ql_dbg_disc, vha, 0xffff,
++ 					    "%s %d %8phC DS %d\n",
++ 					    __func__, __LINE__,
++ 					    conflict->port_name,
++ 					    conflict->disc_state);
++ 
++ 					conflict->scan_state = QLA_FCPORT_SCAN;
++ 					switch (conflict->disc_state) {
++ 					case DSC_DELETED:
++ 					case DSC_DELETE_PEND:
++ 						break;
++ 					default:
++ 						ql_dbg(ql_dbg_disc, vha, 0xffff,
++ 						    "%s %d %8phC post del sess\n",
++ 						    __func__, __LINE__,
++ 						    conflict->port_name);
++ 						qlt_schedule_sess_for_deletion_lock
++ 							(conflict);
++ 						break;
++ 					}
++ 				}
++ 			}
++ 
++ 			/* create new fcport */
++ 			ql_dbg(ql_dbg_disc, vha, 0x2065,
++ 			    "%s %d %8phC post new sess\n",
++ 			    __func__, __LINE__, ea->port_name);
++ 			qla24xx_post_newsess_work(vha, &ea->id,
++ 			    ea->port_name, NULL);
++ 		}
+++>>>>>>> f13515acdcb5 (scsi: qla2xxx: Replace GPDB with async ADISC command)
+  	}
+  }
+  
+diff --cc drivers/scsi/qla2xxx/qla_init.c
+index 83ad7d90d14e,93d0077ba388..000000000000
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@@ -36,9 -36,12 +36,15 @@@ static int qla2x00_restart_isp(scsi_qla
+  static struct qla_chip_state_84xx *qla84xx_get_chip(struct scsi_qla_host *);
+  static int qla84xx_init_chip(scsi_qla_host_t *);
+  static int qla25xx_init_queues(struct qla_hw_data *);
+ -static int qla24xx_post_prli_work(struct scsi_qla_host*, fc_port_t *);
+ +static int qla24xx_post_gpdb_work(struct scsi_qla_host *, fc_port_t *, u8);
+  static void qla24xx_handle_plogi_done_event(struct scsi_qla_host *,
+      struct event_arg *);
+++<<<<<<< HEAD
+++=======
++ static void qla24xx_handle_prli_done_event(struct scsi_qla_host *,
++     struct event_arg *);
++ static void qla24xx_handle_gpdb_event(scsi_qla_host_t *, struct event_arg *);
+++>>>>>>> f13515acdcb5 (scsi: qla2xxx: Replace GPDB with async ADISC command)
+  
+  /* SRB Extensions ---------------------------------------------------------- */
+  
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 65a064ba1a4b..d11574536b6a 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -2228,6 +2228,7 @@ enum discovery_state {
+ 	DSC_GPSC,
+ 	DSC_UPD_FCPORT,
+ 	DSC_LOGIN_COMPLETE,
++	DSC_ADISC,
+ 	DSC_DELETE_PEND,
+ };
+ 
+@@ -2252,6 +2253,7 @@ enum fcport_mgt_event {
+ 	FCME_GPDB_DONE,
+ 	FCME_GPNID_DONE,
+ 	FCME_DELETE_DONE,
++	FCME_ADISC_DONE,
+ };
+ 
+ enum rscn_addr_format {
+* Unmerged path drivers/scsi/qla2xxx/qla_gs.c
+* Unmerged path drivers/scsi/qla2xxx/qla_init.c
