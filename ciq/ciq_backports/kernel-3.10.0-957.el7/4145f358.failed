@@ -1,0 +1,187 @@
+powernv/kdump: Fix cases where the kdump kernel can get HMI's
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Balbir Singh <bsingharora@gmail.com>
+commit 4145f358644b970fcff293c09fdcc7939e8527d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/4145f358.failed
+
+Certain HMI's such as malfunction error propagate through
+all threads/core on the system. If a thread was offline
+prior to us crashing the system and jumping to the kdump
+kernel, bad things happen when it wakes up due to an HMI
+in the kdump kernel.
+
+There are several possible ways to solve this problem
+
+1. Put the offline cores in a state such that they are
+not woken up for machine check and HMI errors. This
+does not work, since we might need to wake up offline
+threads to handle TB errors
+2. Ignore HMI errors, setup HMEER to mask HMI errors,
+but this still leads the window open for any MCEs
+and masking them for the duration of the dump might
+be a concern
+3. Wake up offline CPUs, as in send them to
+crash_ipi_callback (not wake them up as in mark them
+online as seen by the hotplug). kexec does a
+wake_online_cpus() call, this patch does something
+similar, but instead sends an IPI and forces them to
+crash_ipi_callback()
+
+This patch takes approach #3.
+
+Care is taken to enable this only for powenv platforms
+via crash_wake_offline (a global value set at setup
+time). The crash code sends out IPI's to all CPU's
+which then move to crash_ipi_callback and kexec_smp_wait().
+
+	Signed-off-by: Balbir Singh <bsingharora@gmail.com>
+	Reviewed-by: Nicholas Piggin <npiggin@gmail.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 4145f358644b970fcff293c09fdcc7939e8527d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/smp.c
+#	arch/powerpc/platforms/powernv/smp.c
+diff --cc arch/powerpc/kernel/smp.c
+index bad72bc7b031,bbe7634b3a43..000000000000
+--- a/arch/powerpc/kernel/smp.c
++++ b/arch/powerpc/kernel/smp.c
+@@@ -337,13 -540,27 +337,34 @@@ void smp_send_debugger_break(void
+  }
+  #endif
+  
+ -#ifdef CONFIG_KEXEC_CORE
+ +#ifdef CONFIG_KEXEC
+  void crash_send_ipi(void (*crash_ipi_callback)(struct pt_regs *))
+  {
+++<<<<<<< HEAD
+ +	crash_ipi_function_ptr = crash_ipi_callback;
+ +	if (crash_ipi_callback) {
+ +		mb();
+ +		smp_send_debugger_break();
+++=======
++ 	int cpu;
++ 
++ 	smp_send_nmi_ipi(NMI_IPI_ALL_OTHERS, crash_ipi_callback, 1000000);
++ 	if (kdump_in_progress() && crash_wake_offline) {
++ 		for_each_present_cpu(cpu) {
++ 			if (cpu_online(cpu))
++ 				continue;
++ 			/*
++ 			 * crash_ipi_callback will wait for
++ 			 * all cpus, including offline CPUs.
++ 			 * We don't care about nmi_ipi_function.
++ 			 * Offline cpus will jump straight into
++ 			 * crash_ipi_callback, we can skip the
++ 			 * entire NMI dance and waiting for
++ 			 * cpus to clear pending mask, etc.
++ 			 */
++ 			do_smp_send_nmi_ipi(cpu);
++ 		}
+++>>>>>>> 4145f358644b (powernv/kdump: Fix cases where the kdump kernel can get HMI's)
+  	}
+  }
+  #endif
+diff --cc arch/powerpc/platforms/powernv/smp.c
+index 98ec67ec03e5,9664c8461f03..000000000000
+--- a/arch/powerpc/platforms/powernv/smp.c
++++ b/arch/powerpc/platforms/powernv/smp.c
+@@@ -34,6 -36,9 +34,12 @@@
+  #include <asm/dbell.h>
+  #include <asm/kvm_ppc.h>
+  #include <asm/ppc-opcode.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/cpuidle.h>
++ #include <asm/kexec.h>
++ #include <asm/reg.h>
+++>>>>>>> 4145f358644b (powernv/kdump: Fix cases where the kdump kernel can get HMI's)
+  
+  #include "powernv.h"
+  
+@@@ -221,10 -211,32 +227,36 @@@ static void pnv_smp_cpu_kill_self(void
+  		} else if ((srr1 & wmask) == SRR1_WAKEHDBELL) {
+  			unsigned long msg = PPC_DBELL_TYPE(PPC_DBELL_SERVER);
+  			asm volatile(PPC_MSGCLR(%0) : : "r" (msg));
++ 		} else if ((srr1 & wmask) == SRR1_WAKERESET) {
++ 			irq_set_pending_from_srr1(srr1);
++ 			/* Does not return */
+  		}
+++<<<<<<< HEAD
+ +		local_paca->irq_happened &= ~(PACA_IRQ_EE | PACA_IRQ_DBELL);
+++=======
++ 
+++>>>>>>> 4145f358644b (powernv/kdump: Fix cases where the kdump kernel can get HMI's)
+  		smp_mb();
+  
++ 		/*
++ 		 * For kdump kernels, we process the ipi and jump to
++ 		 * crash_ipi_callback
++ 		 */
++ 		if (kdump_in_progress()) {
++ 			/*
++ 			 * If we got to this point, we've not used
++ 			 * NMI's, otherwise we would have gone
++ 			 * via the SRR1_WAKERESET path. We are
++ 			 * using regular IPI's for waking up offline
++ 			 * threads.
++ 			 */
++ 			struct pt_regs regs;
++ 
++ 			ppc_save_regs(&regs);
++ 			crash_ipi_callback(&regs);
++ 			/* Does not return */
++ 		}
++ 
+  		if (cpu_core_split_required())
+  			continue;
+  
+diff --git a/arch/powerpc/include/asm/kexec.h b/arch/powerpc/include/asm/kexec.h
+index bb6f5e7105f3..d63512292e86 100644
+--- a/arch/powerpc/include/asm/kexec.h
++++ b/arch/powerpc/include/asm/kexec.h
+@@ -88,6 +88,8 @@ extern void kexec_smp_wait(void);	/* get and clear naca physid, wait for
+ 					  master to copy new code to 0 */
+ extern int crashing_cpu;
+ extern void crash_send_ipi(void (*crash_ipi_callback)(struct pt_regs *));
++extern void crash_ipi_callback(struct pt_regs *);
++extern int crash_wake_offline;
+ 
+ struct kimage;
+ struct pt_regs;
+diff --git a/arch/powerpc/kernel/crash.c b/arch/powerpc/kernel/crash.c
+index ef3970f6fd12..8efb825e023d 100644
+--- a/arch/powerpc/kernel/crash.c
++++ b/arch/powerpc/kernel/crash.c
+@@ -44,6 +44,14 @@
+ #define REAL_MODE_TIMEOUT	10000
+ 
+ static int time_to_dump;
++/*
++ * crash_wake_offline should be set to 1 by platforms that intend to wake
++ * up offline cpus prior to jumping to a kdump kernel. Currently powernv
++ * sets it to 1, since we want to avoid things from happening when an
++ * offline CPU wakes up due to something like an HMI (malfunction error),
++ * which propagates to all threads.
++ */
++int crash_wake_offline;
+ 
+ #define CRASH_HANDLER_MAX 3
+ /* NULL terminated list of shutdown handles */
+@@ -106,6 +114,9 @@ static void crash_kexec_prepare_cpus(int cpu)
+ 
+ 	printk(KERN_EMERG "Sending IPI to other CPUs\n");
+ 
++	if (crash_wake_offline)
++		ncpus = num_present_cpus() - 1;
++
+ 	crash_send_ipi(crash_ipi_callback);
+ 	smp_wmb();
+ 
+* Unmerged path arch/powerpc/kernel/smp.c
+* Unmerged path arch/powerpc/platforms/powernv/smp.c
