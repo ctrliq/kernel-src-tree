@@ -1,0 +1,173 @@
+x86/bugs: Add AMD retbleed= boot parameter
+
+jira LE-1907
+cve CVE-2022-29901
+cve CVE-2022-29900
+cve CVE-2022-23825
+cve CVE-2022-23816
+Rebuild_History Non-Buildable kernel-3.10.0-1160.80.1.el7
+commit-author Alexandre Chartre <alexandre.chartre@oracle.com>
+commit 7fbf47c7ce50b38a64576b150e7011ae73d54669
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.80.1.el7/7fbf47c7.failed
+
+Add the "retbleed=<value>" boot parameter to select a mitigation for
+RETBleed. Possible values are "off", "auto" and "unret"
+(JMP2RET mitigation). The default value is "auto".
+
+Currently, "retbleed=auto" will select the unret mitigation on
+AMD and Hygon and no mitigation on Intel (JMP2RET is not effective on
+Intel).
+
+  [peterz: rebase; add hygon]
+  [jpoimboe: cleanups]
+
+	Signed-off-by: Alexandre Chartre <alexandre.chartre@oracle.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Josh Poimboeuf <jpoimboe@kernel.org>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+(cherry picked from commit 7fbf47c7ce50b38a64576b150e7011ae73d54669)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/admin-guide/kernel-parameters.txt
+#	arch/x86/Kconfig
+#	arch/x86/kernel/cpu/bugs.c
+diff --cc arch/x86/Kconfig
+index f3698f265557,e35eecfb74f2..000000000000
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@@ -413,20 -472,40 +413,30 @@@ config RETPOLIN
+  	  branches. Requires a compiler with -mindirect-branch=thunk-extern
+  	  support for full protection. The kernel may run slower.
+  
+ -config CC_HAS_SLS
+ -	def_bool $(cc-option,-mharden-sls=all)
+ +	  Without compiler support, at least indirect branches in assembler
+ +	  code are eliminated. Since this includes the syscall entry path,
+ +	  it is not entirely pointless.
+  
+++<<<<<<< HEAD
+ +config INTEL_RDT
+ +	bool "Intel Resource Director Technology support"
+++=======
++ config CC_HAS_RETURN_THUNK
++ 	def_bool $(cc-option,-mfunction-return=thunk-extern)
++ 
++ config SLS
++ 	bool "Mitigate Straight-Line-Speculation"
++ 	depends on CC_HAS_SLS && X86_64
++ 	select OBJTOOL if HAVE_OBJTOOL
+++>>>>>>> 7fbf47c7ce50 (x86/bugs: Add AMD retbleed= boot parameter)
+  	default n
+ -	help
+ -	  Compile the kernel with straight-line-speculation options to guard
+ -	  against straight line speculation. The kernel image might be slightly
+ -	  larger.
+ -
+ -config X86_CPU_RESCTRL
+ -	bool "x86 CPU resource control support"
+ -	depends on X86 && (CPU_SUP_INTEL || CPU_SUP_AMD)
+ +	depends on X86 && CPU_SUP_INTEL
+  	select KERNFS
+ -	select PROC_CPU_RESCTRL		if PROC_FS
+  	help
+ -	  Enable x86 CPU resource control support.
+ -
+ -	  Provide support for the allocation and monitoring of system resources
+ -	  usage by the CPU.
+ -
+ -	  Intel calls this Intel Resource Director Technology
+ -	  (Intel(R) RDT). More information about RDT can be found in the
+ -	  Intel x86 Architecture Software Developer Manual.
+ -
+ -	  AMD calls this AMD Platform Quality of Service (AMD QoS).
+ -	  More information about AMD QoS can be found in the AMD64 Technology
+ -	  Platform Quality of Service Extensions manual.
+ +	  Select to enable resource allocation and monitoring which are
+ +	  sub-features of Intel Resource Director Technology(RDT). More
+ +	  information about RDT can be found in the Intel x86
+ +	  Architecture Software Developer Manual.
+  
+  	  Say N if unsure.
+  
+diff --cc arch/x86/kernel/cpu/bugs.c
+index a7e93ef81745,bdeb732ff2d9..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -32,9 -37,9 +32,10 @@@
+  #include "cpu.h"
+  
+  static void __init spectre_v1_select_mitigation(void);
++ static void __init retbleed_select_mitigation(void);
+  static void __init spectre_v2_select_mitigation(void);
+ -static void __init ssb_select_mitigation(void);
+ +static void __init ssb_parse_cmdline(void);
+ +void ssb_select_mitigation(void);
+  static void __init l1tf_select_mitigation(void);
+  static void __init mds_select_mitigation(void);
+  static void __init md_clear_update_mitigation(void);
+@@@ -75,19 -108,26 +76,25 @@@ void __init check_bugs(void
+  	}
+  
+  	/*
+ -	 * Read the SPEC_CTRL MSR to account for reserved bits which may
+ -	 * have unknown values. AMD64_LS_CFG MSR is cached in the early AMD
+ -	 * init code as it is not enumerated and depends on the family.
+ +	 * Select proper mitigation for any exposure to the Speculative Store
+ +	 * Bypass vulnerability (exposed as a bug in "Memory Disambiguation")
+ +	 * This has to be done before spec_ctrl_init() to make sure that its
+ +	 * SPEC_CTRL MSR value is properly set up.
+  	 */
+ -	if (boot_cpu_has(X86_FEATURE_MSR_SPEC_CTRL))
+ -		rdmsrl(MSR_IA32_SPEC_CTRL, x86_spec_ctrl_base);
+ +	ssb_parse_cmdline();
+  
+ -	/* Allow STIBP in MSR_SPEC_CTRL if supported */
+ -	if (boot_cpu_has(X86_FEATURE_STIBP))
+ -		x86_spec_ctrl_mask |= SPEC_CTRL_STIBP;
+ +	spec_ctrl_init();
+  
+ -	/* Select the proper CPU mitigations before patching alternatives: */
+ +	/* Select the proper CPU mitigations before patching alternatives */
+  	spectre_v1_select_mitigation();
++ 	retbleed_select_mitigation();
++ 	/*
++ 	 * spectre_v2_select_mitigation() relies on the state set by
++ 	 * retbleed_select_mitigation(); specifically the STIBP selection is
++ 	 * forced for UNRET.
++ 	 */
+  	spectre_v2_select_mitigation();
+ +	spec_ctrl_cpu_init();
+  	ssb_select_mitigation();
+  	l1tf_select_mitigation();
+  	md_clear_select_mitigation();
+@@@ -1393,8 -2095,18 +1494,21 @@@ static ssize_t srbds_show_state(char *b
+  	return sprintf(buf, "%s\n", srbds_strings[srbds_mitigation]);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static ssize_t retbleed_show_state(char *buf)
++ {
++ 	if (retbleed_mitigation == RETBLEED_MITIGATION_UNRET &&
++ 	    (boot_cpu_data.x86_vendor != X86_VENDOR_AMD &&
++ 	     boot_cpu_data.x86_vendor != X86_VENDOR_HYGON))
++ 		return sprintf(buf, "Vulnerable: untrained return thunk on non-Zen uarch\n");
++ 
++ 	return sprintf(buf, "%s\n", retbleed_strings[retbleed_mitigation]);
++ }
++ 
+++>>>>>>> 7fbf47c7ce50 (x86/bugs: Add AMD retbleed= boot parameter)
+  static ssize_t cpu_show_common(struct device *dev, struct device_attribute *attr,
+ -			       char *buf, unsigned int bug)
+ +			char *buf, unsigned int bug)
+  {
+  	if (!boot_cpu_has_bug(bug))
+  		return sprintf(buf, "Not affected\n");
+* Unmerged path Documentation/admin-guide/kernel-parameters.txt
+* Unmerged path Documentation/admin-guide/kernel-parameters.txt
+* Unmerged path arch/x86/Kconfig
+* Unmerged path arch/x86/kernel/cpu/bugs.c
