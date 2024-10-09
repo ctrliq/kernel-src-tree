@@ -1,0 +1,160 @@
+s390/pci: fix dma address calculation in map_sg
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [s390] pci: fix dma address calculation in map_sg (Hendrik Brueckner) [1539025]
+Rebuild_FUZZ: 94.38%
+commit-author Sebastian Ott <sebott@linux.vnet.ibm.com>
+commit 6b7df3ce92ac82ec3f4a2953b6fed77da7b38aaa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/6b7df3ce.failed
+
+__s390_dma_map_sg maps a dma-contiguous area. Although we only map
+whole pages we have to take into account that the area doesn't start
+or stop at a page boundary because we use the dma address to loop
+over the individual sg entries. Failing to do that might lead to an
+access of the wrong sg entry.
+
+Fixes: ee877b81c6b9 ("s390/pci_dma: improve map_sg")
+Reported-and-tested-by: Christoph Raisch <raisch@de.ibm.com>
+	Signed-off-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+	Reviewed-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 6b7df3ce92ac82ec3f4a2953b6fed77da7b38aaa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci_dma.c
+diff --cc arch/s390/pci/pci_dma.c
+index 0a25a0fb6217,47f4afbff0a5..000000000000
+--- a/arch/s390/pci/pci_dma.c
++++ b/arch/s390/pci/pci_dma.c
+@@@ -402,37 -414,99 +402,88 @@@ static void s390_dma_free(struct devic
+  	free_pages((unsigned long) pa, get_order(size));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Map a segment into a contiguous dma address area */
++ static int __s390_dma_map_sg(struct device *dev, struct scatterlist *sg,
++ 			     size_t size, dma_addr_t *handle,
++ 			     enum dma_data_direction dir)
++ {
++ 	unsigned long nr_pages = PAGE_ALIGN(size) >> PAGE_SHIFT;
++ 	struct zpci_dev *zdev = to_zpci(to_pci_dev(dev));
++ 	dma_addr_t dma_addr_base, dma_addr;
++ 	int flags = ZPCI_PTE_VALID;
++ 	struct scatterlist *s;
++ 	unsigned long pa;
++ 	int ret;
++ 
++ 	dma_addr_base = dma_alloc_address(dev, nr_pages);
++ 	if (dma_addr_base == DMA_ERROR_CODE)
++ 		return -ENOMEM;
++ 
++ 	dma_addr = dma_addr_base;
++ 	if (dir == DMA_NONE || dir == DMA_TO_DEVICE)
++ 		flags |= ZPCI_TABLE_PROTECTED;
++ 
++ 	for (s = sg; dma_addr < dma_addr_base + size; s = sg_next(s)) {
++ 		pa = page_to_phys(sg_page(s));
++ 		ret = __dma_update_trans(zdev, pa, dma_addr,
++ 					 s->offset + s->length, flags);
++ 		if (ret)
++ 			goto unmap;
++ 
++ 		dma_addr += s->offset + s->length;
++ 	}
++ 	ret = __dma_purge_tlb(zdev, dma_addr_base, size, flags);
++ 	if (ret)
++ 		goto unmap;
++ 
++ 	*handle = dma_addr_base;
++ 	atomic64_add(nr_pages, &zdev->mapped_pages);
++ 
++ 	return ret;
++ 
++ unmap:
++ 	dma_update_trans(zdev, 0, dma_addr_base, dma_addr - dma_addr_base,
++ 			 ZPCI_PTE_INVALID);
++ 	dma_free_address(dev, dma_addr_base, nr_pages);
++ 	zpci_err("map error:\n");
++ 	zpci_err_dma(ret, pa);
++ 	return ret;
++ }
++ 
+++>>>>>>> 6b7df3ce92ac (s390/pci: fix dma address calculation in map_sg)
+  static int s390_dma_map_sg(struct device *dev, struct scatterlist *sg,
+  			   int nr_elements, enum dma_data_direction dir,
+ -			   unsigned long attrs)
+ +			   struct dma_attrs *attrs)
+  {
+ -	struct scatterlist *s = sg, *start = sg, *dma = sg;
+ -	unsigned int max = dma_get_max_seg_size(dev);
+ -	unsigned int size = s->offset + s->length;
+ -	unsigned int offset = s->offset;
+ -	int count = 0, i;
+ -
+ -	for (i = 1; i < nr_elements; i++) {
+ -		s = sg_next(s);
+ -
+ -		s->dma_address = DMA_ERROR_CODE;
+ -		s->dma_length = 0;
+ -
+ -		if (s->offset || (size & ~PAGE_MASK) ||
+ -		    size + s->length > max) {
+ -			if (__s390_dma_map_sg(dev, start, size,
+ -					      &dma->dma_address, dir))
+ -				goto unmap;
+ -
+ -			dma->dma_address += offset;
+ -			dma->dma_length = size - offset;
+ +	int mapped_elements = 0;
+ +	struct scatterlist *s;
+ +	int i;
+  
+ -			size = offset = s->offset;
+ -			start = s;
+ -			dma = sg_next(dma);
+ -			count++;
+ -		}
+ -		size += s->length;
+ +	for_each_sg(sg, s, nr_elements, i) {
+ +		struct page *page = sg_page(s);
+ +		s->dma_address = s390_dma_map_pages(dev, page, s->offset,
+ +						    s->length, dir, NULL);
+ +		if (!dma_mapping_error(dev, s->dma_address)) {
+ +			s->dma_length = s->length;
+ +			mapped_elements++;
+ +		} else
+ +			goto unmap;
+  	}
+ -	if (__s390_dma_map_sg(dev, start, size, &dma->dma_address, dir))
+ -		goto unmap;
+ -
+ -	dma->dma_address += offset;
+ -	dma->dma_length = size - offset;
+ +out:
+ +	return mapped_elements;
+  
+ -	return count + 1;
+  unmap:
+ -	for_each_sg(sg, s, count, i)
+ -		s390_dma_unmap_pages(dev, sg_dma_address(s), sg_dma_len(s),
+ -				     dir, attrs);
+ -
+ -	return 0;
+ +	for_each_sg(sg, s, mapped_elements, i) {
+ +		if (s->dma_address)
+ +			s390_dma_unmap_pages(dev, s->dma_address, s->dma_length,
+ +					     dir, NULL);
+ +		s->dma_address = 0;
+ +		s->dma_length = 0;
+ +	}
+ +	mapped_elements = 0;
+ +	goto out;
+  }
+  
+  static void s390_dma_unmap_sg(struct device *dev, struct scatterlist *sg,
+* Unmerged path arch/s390/pci/pci_dma.c
