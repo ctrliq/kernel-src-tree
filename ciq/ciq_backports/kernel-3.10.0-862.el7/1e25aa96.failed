@@ -1,0 +1,153 @@
+hid-sensor: Fix suspend/resume delay
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+commit 1e25aa9641e8f3fa39cd5e46b4afcafd7f12a44b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1e25aa96.failed
+
+By default all the sensors are runtime suspended state (lowest power
+state). During Linux suspend process, all the run time suspended
+devices are resumed and then suspended. This caused all sensors to
+power up and introduced delay in suspend time, when we introduced
+runtime PM for HID sensors. The opposite process happens during resume
+process.
+
+To fix this, we do powerup process of the sensors only when the request
+is issued from user (raw or tiggerred). In this way when runtime,
+resume calls for powerup it will simply return as this will not match
+user requested state.
+
+Note this is a regression fix as the increase in suspend / resume
+times can be substantial (report of 8 seconds on Len's laptop!)
+
+	Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+	Tested-by: Len Brown <len.brown@intel.com>
+	Cc: <Stable@vger.kernel.org>
+	Signed-off-by: Jonathan Cameron <jic23@kernel.org>
+(cherry picked from commit 1e25aa9641e8f3fa39cd5e46b4afcafd7f12a44b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iio/common/hid-sensors/hid-sensor-trigger.c
+#	include/linux/hid-sensor-hub.h
+diff --cc drivers/iio/common/hid-sensors/hid-sensor-trigger.c
+index 5cc9e5190684,595511022795..000000000000
+--- a/drivers/iio/common/hid-sensors/hid-sensor-trigger.c
++++ b/drivers/iio/common/hid-sensors/hid-sensor-trigger.c
+@@@ -28,16 -29,20 +28,18 @@@
+  #include <linux/iio/sysfs.h>
+  #include "hid-sensor-trigger.h"
+  
+ -static int _hid_sensor_power_state(struct hid_sensor_common *st, bool state)
+ +static int hid_sensor_data_rdy_trigger_set_state(struct iio_trigger *trig,
+ +						bool state)
+  {
+ +	struct hid_sensor_common *st = iio_trigger_get_drvdata(trig);
+  	int state_val;
+  	int report_val;
+ -	s32 poll_value = 0;
+  
+  	if (state) {
++ 		if (!atomic_read(&st->user_requested_state))
++ 			return 0;
+  		if (sensor_hub_device_open(st->hsdev))
+  			return -EIO;
+ -
+ -		atomic_inc(&st->data_ready);
+ -
+  		state_val = hid_sensor_get_usage_index(st->hsdev,
+  			st->power_state.report_id,
+  			st->power_state.index,
+@@@ -46,7 -51,15 +48,16 @@@
+  			st->report_state.report_id,
+  			st->report_state.index,
+  			HID_USAGE_SENSOR_PROP_REPORTING_STATE_ALL_EVENTS_ENUM);
+ -
+ -		poll_value = hid_sensor_read_poll_value(st);
+  	} else {
+++<<<<<<< HEAD
+++=======
++ 		int val;
++ 
++ 		val = atomic_dec_if_positive(&st->data_ready);
++ 		if (val < 0)
++ 			return 0;
++ 
+++>>>>>>> 1e25aa9641e8 (hid-sensor: Fix suspend/resume delay)
+  		sensor_hub_device_close(st->hsdev);
+  		state_val = hid_sensor_get_usage_index(st->hsdev,
+  			st->power_state.report_id,
+@@@ -74,10 -87,46 +85,46 @@@
+  	}
+  
+  	sensor_hub_get_feature(st->hsdev, st->power_state.report_id,
+ -			       st->power_state.index,
+ -			       sizeof(state_val), &state_val);
+ -	if (state && poll_value)
+ -		msleep_interruptible(poll_value * 2);
+ -
+ +					st->power_state.index,
+ +					&state_val);
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ EXPORT_SYMBOL(hid_sensor_power_state);
++ 
++ int hid_sensor_power_state(struct hid_sensor_common *st, bool state)
++ {
++ 
++ #ifdef CONFIG_PM
++ 	int ret;
++ 
++ 	atomic_set(&st->user_requested_state, state);
++ 	if (state)
++ 		ret = pm_runtime_get_sync(&st->pdev->dev);
++ 	else {
++ 		pm_runtime_mark_last_busy(&st->pdev->dev);
++ 		ret = pm_runtime_put_autosuspend(&st->pdev->dev);
++ 	}
++ 	if (ret < 0) {
++ 		if (state)
++ 			pm_runtime_put_noidle(&st->pdev->dev);
++ 		return ret;
++ 	}
++ 
++  	return 0;
++ #else
++ 	atomic_set(&st->user_requested_state, state);
++ 	return _hid_sensor_power_state(st, state);
++ #endif
++ }
++ 
++ static int hid_sensor_data_rdy_trigger_set_state(struct iio_trigger *trig,
++ 						bool state)
++ {
++ 	return hid_sensor_power_state(iio_trigger_get_drvdata(trig), state);
++ }
+++>>>>>>> 1e25aa9641e8 (hid-sensor: Fix suspend/resume delay)
+  
+  void hid_sensor_remove_trigger(struct hid_sensor_common *attrb)
+  {
+diff --cc include/linux/hid-sensor-hub.h
+index 05fe6c21f3e2,cd224dfd94d8..000000000000
+--- a/include/linux/hid-sensor-hub.h
++++ b/include/linux/hid-sensor-hub.h
+@@@ -167,7 -229,8 +167,12 @@@ struct hid_sensor_common 
+  	struct hid_sensor_hub_device *hsdev;
+  	struct platform_device *pdev;
+  	unsigned usage_id;
+++<<<<<<< HEAD
+ +	bool data_ready;
+++=======
++ 	atomic_t data_ready;
++ 	atomic_t user_requested_state;
+++>>>>>>> 1e25aa9641e8 (hid-sensor: Fix suspend/resume delay)
+  	struct iio_trigger *trigger;
+  	struct hid_sensor_hub_attribute_info poll;
+  	struct hid_sensor_hub_attribute_info report_state;
+* Unmerged path drivers/iio/common/hid-sensors/hid-sensor-trigger.c
+* Unmerged path include/linux/hid-sensor-hub.h
