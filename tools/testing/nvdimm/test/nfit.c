@@ -1333,7 +1333,7 @@ static void nfit_test0_setup(struct nfit_test *t)
 	struct acpi_nfit_data_region *bdw;
 	struct acpi_nfit_flush_address *flush;
 	struct acpi_nfit_capabilities *pcap;
-	unsigned int offset, i;
+	unsigned int offset = 0, i;
 
 	/*
 	 * spa0 (interleave first half of dimm0 and dimm1, note storage
@@ -1347,93 +1347,102 @@ static void nfit_test0_setup(struct nfit_test *t)
 	spa->range_index = 0+1;
 	spa->address = t->spa_set_dma[0];
 	spa->length = SPA0_SIZE;
+	offset += spa->header.length;
 
 	/*
 	 * spa1 (interleave last half of the 4 DIMMS, note storage
 	 * does not actually alias the related block-data-window
 	 * regions)
 	 */
-	spa = nfit_buf + sizeof(*spa);
+	spa = nfit_buf + offset;
 	spa->header.type = ACPI_NFIT_TYPE_SYSTEM_ADDRESS;
 	spa->header.length = sizeof(*spa);
 	memcpy(spa->range_guid, to_nfit_uuid(NFIT_SPA_PM), 16);
 	spa->range_index = 1+1;
 	spa->address = t->spa_set_dma[1];
 	spa->length = SPA1_SIZE;
+	offset += spa->header.length;
 
 	/* spa2 (dcr0) dimm0 */
-	spa = nfit_buf + sizeof(*spa) * 2;
+	spa = nfit_buf + offset;
 	spa->header.type = ACPI_NFIT_TYPE_SYSTEM_ADDRESS;
 	spa->header.length = sizeof(*spa);
 	memcpy(spa->range_guid, to_nfit_uuid(NFIT_SPA_DCR), 16);
 	spa->range_index = 2+1;
 	spa->address = t->dcr_dma[0];
 	spa->length = DCR_SIZE;
+	offset += spa->header.length;
 
 	/* spa3 (dcr1) dimm1 */
-	spa = nfit_buf + sizeof(*spa) * 3;
+	spa = nfit_buf + offset;
 	spa->header.type = ACPI_NFIT_TYPE_SYSTEM_ADDRESS;
 	spa->header.length = sizeof(*spa);
 	memcpy(spa->range_guid, to_nfit_uuid(NFIT_SPA_DCR), 16);
 	spa->range_index = 3+1;
 	spa->address = t->dcr_dma[1];
 	spa->length = DCR_SIZE;
+	offset += spa->header.length;
 
 	/* spa4 (dcr2) dimm2 */
-	spa = nfit_buf + sizeof(*spa) * 4;
+	spa = nfit_buf + offset;
 	spa->header.type = ACPI_NFIT_TYPE_SYSTEM_ADDRESS;
 	spa->header.length = sizeof(*spa);
 	memcpy(spa->range_guid, to_nfit_uuid(NFIT_SPA_DCR), 16);
 	spa->range_index = 4+1;
 	spa->address = t->dcr_dma[2];
 	spa->length = DCR_SIZE;
+	offset += spa->header.length;
 
 	/* spa5 (dcr3) dimm3 */
-	spa = nfit_buf + sizeof(*spa) * 5;
+	spa = nfit_buf + offset;
 	spa->header.type = ACPI_NFIT_TYPE_SYSTEM_ADDRESS;
 	spa->header.length = sizeof(*spa);
 	memcpy(spa->range_guid, to_nfit_uuid(NFIT_SPA_DCR), 16);
 	spa->range_index = 5+1;
 	spa->address = t->dcr_dma[3];
 	spa->length = DCR_SIZE;
+	offset += spa->header.length;
 
 	/* spa6 (bdw for dcr0) dimm0 */
-	spa = nfit_buf + sizeof(*spa) * 6;
+	spa = nfit_buf + offset;
 	spa->header.type = ACPI_NFIT_TYPE_SYSTEM_ADDRESS;
 	spa->header.length = sizeof(*spa);
 	memcpy(spa->range_guid, to_nfit_uuid(NFIT_SPA_BDW), 16);
 	spa->range_index = 6+1;
 	spa->address = t->dimm_dma[0];
 	spa->length = DIMM_SIZE;
+	offset += spa->header.length;
 
 	/* spa7 (bdw for dcr1) dimm1 */
-	spa = nfit_buf + sizeof(*spa) * 7;
+	spa = nfit_buf + offset;
 	spa->header.type = ACPI_NFIT_TYPE_SYSTEM_ADDRESS;
 	spa->header.length = sizeof(*spa);
 	memcpy(spa->range_guid, to_nfit_uuid(NFIT_SPA_BDW), 16);
 	spa->range_index = 7+1;
 	spa->address = t->dimm_dma[1];
 	spa->length = DIMM_SIZE;
+	offset += spa->header.length;
 
 	/* spa8 (bdw for dcr2) dimm2 */
-	spa = nfit_buf + sizeof(*spa) * 8;
+	spa = nfit_buf + offset;
 	spa->header.type = ACPI_NFIT_TYPE_SYSTEM_ADDRESS;
 	spa->header.length = sizeof(*spa);
 	memcpy(spa->range_guid, to_nfit_uuid(NFIT_SPA_BDW), 16);
 	spa->range_index = 8+1;
 	spa->address = t->dimm_dma[2];
 	spa->length = DIMM_SIZE;
+	offset += spa->header.length;
 
 	/* spa9 (bdw for dcr3) dimm3 */
-	spa = nfit_buf + sizeof(*spa) * 9;
+	spa = nfit_buf + offset;
 	spa->header.type = ACPI_NFIT_TYPE_SYSTEM_ADDRESS;
 	spa->header.length = sizeof(*spa);
 	memcpy(spa->range_guid, to_nfit_uuid(NFIT_SPA_BDW), 16);
 	spa->range_index = 9+1;
 	spa->address = t->dimm_dma[3];
 	spa->length = DIMM_SIZE;
+	offset += spa->header.length;
 
-	offset = sizeof(*spa) * 10;
 	/* mem-region0 (spa0, dimm0) */
 	memdev = nfit_buf + offset;
 	memdev->header.type = ACPI_NFIT_TYPE_MEMORY_MAP;
@@ -1448,9 +1457,10 @@ static void nfit_test0_setup(struct nfit_test *t)
 	memdev->address = 0;
 	memdev->interleave_index = 0;
 	memdev->interleave_ways = 2;
+	offset += memdev->header.length;
 
 	/* mem-region1 (spa0, dimm1) */
-	memdev = nfit_buf + offset + sizeof(struct acpi_nfit_memory_map);
+	memdev = nfit_buf + offset;
 	memdev->header.type = ACPI_NFIT_TYPE_MEMORY_MAP;
 	memdev->header.length = sizeof(*memdev);
 	memdev->device_handle = handle[1];
@@ -1464,9 +1474,10 @@ static void nfit_test0_setup(struct nfit_test *t)
 	memdev->interleave_index = 0;
 	memdev->interleave_ways = 2;
 	memdev->flags = ACPI_NFIT_MEM_HEALTH_ENABLED;
+	offset += memdev->header.length;
 
 	/* mem-region2 (spa1, dimm0) */
-	memdev = nfit_buf + offset + sizeof(struct acpi_nfit_memory_map) * 2;
+	memdev = nfit_buf + offset;
 	memdev->header.type = ACPI_NFIT_TYPE_MEMORY_MAP;
 	memdev->header.length = sizeof(*memdev);
 	memdev->device_handle = handle[0];
@@ -1480,9 +1491,10 @@ static void nfit_test0_setup(struct nfit_test *t)
 	memdev->interleave_index = 0;
 	memdev->interleave_ways = 4;
 	memdev->flags = ACPI_NFIT_MEM_HEALTH_ENABLED;
+	offset += memdev->header.length;
 
 	/* mem-region3 (spa1, dimm1) */
-	memdev = nfit_buf + offset + sizeof(struct acpi_nfit_memory_map) * 3;
+	memdev = nfit_buf + offset;
 	memdev->header.type = ACPI_NFIT_TYPE_MEMORY_MAP;
 	memdev->header.length = sizeof(*memdev);
 	memdev->device_handle = handle[1];
@@ -1495,9 +1507,10 @@ static void nfit_test0_setup(struct nfit_test *t)
 	memdev->address = SPA0_SIZE/2;
 	memdev->interleave_index = 0;
 	memdev->interleave_ways = 4;
+	offset += memdev->header.length;
 
 	/* mem-region4 (spa1, dimm2) */
-	memdev = nfit_buf + offset + sizeof(struct acpi_nfit_memory_map) * 4;
+	memdev = nfit_buf + offset;
 	memdev->header.type = ACPI_NFIT_TYPE_MEMORY_MAP;
 	memdev->header.length = sizeof(*memdev);
 	memdev->device_handle = handle[2];
@@ -1511,9 +1524,10 @@ static void nfit_test0_setup(struct nfit_test *t)
 	memdev->interleave_index = 0;
 	memdev->interleave_ways = 4;
 	memdev->flags = ACPI_NFIT_MEM_HEALTH_ENABLED;
+	offset += memdev->header.length;
 
 	/* mem-region5 (spa1, dimm3) */
-	memdev = nfit_buf + offset + sizeof(struct acpi_nfit_memory_map) * 5;
+	memdev = nfit_buf + offset;
 	memdev->header.type = ACPI_NFIT_TYPE_MEMORY_MAP;
 	memdev->header.length = sizeof(*memdev);
 	memdev->device_handle = handle[3];
@@ -1526,9 +1540,10 @@ static void nfit_test0_setup(struct nfit_test *t)
 	memdev->address = SPA0_SIZE/2;
 	memdev->interleave_index = 0;
 	memdev->interleave_ways = 4;
+	offset += memdev->header.length;
 
 	/* mem-region6 (spa/dcr0, dimm0) */
-	memdev = nfit_buf + offset + sizeof(struct acpi_nfit_memory_map) * 6;
+	memdev = nfit_buf + offset;
 	memdev->header.type = ACPI_NFIT_TYPE_MEMORY_MAP;
 	memdev->header.length = sizeof(*memdev);
 	memdev->device_handle = handle[0];
@@ -1541,9 +1556,10 @@ static void nfit_test0_setup(struct nfit_test *t)
 	memdev->address = 0;
 	memdev->interleave_index = 0;
 	memdev->interleave_ways = 1;
+	offset += memdev->header.length;
 
 	/* mem-region7 (spa/dcr1, dimm1) */
-	memdev = nfit_buf + offset + sizeof(struct acpi_nfit_memory_map) * 7;
+	memdev = nfit_buf + offset;
 	memdev->header.type = ACPI_NFIT_TYPE_MEMORY_MAP;
 	memdev->header.length = sizeof(*memdev);
 	memdev->device_handle = handle[1];
@@ -1556,9 +1572,10 @@ static void nfit_test0_setup(struct nfit_test *t)
 	memdev->address = 0;
 	memdev->interleave_index = 0;
 	memdev->interleave_ways = 1;
+	offset += memdev->header.length;
 
 	/* mem-region8 (spa/dcr2, dimm2) */
-	memdev = nfit_buf + offset + sizeof(struct acpi_nfit_memory_map) * 8;
+	memdev = nfit_buf + offset;
 	memdev->header.type = ACPI_NFIT_TYPE_MEMORY_MAP;
 	memdev->header.length = sizeof(*memdev);
 	memdev->device_handle = handle[2];
@@ -1571,9 +1588,10 @@ static void nfit_test0_setup(struct nfit_test *t)
 	memdev->address = 0;
 	memdev->interleave_index = 0;
 	memdev->interleave_ways = 1;
+	offset += memdev->header.length;
 
 	/* mem-region9 (spa/dcr3, dimm3) */
-	memdev = nfit_buf + offset + sizeof(struct acpi_nfit_memory_map) * 9;
+	memdev = nfit_buf + offset;
 	memdev->header.type = ACPI_NFIT_TYPE_MEMORY_MAP;
 	memdev->header.length = sizeof(*memdev);
 	memdev->device_handle = handle[3];
@@ -1586,9 +1604,10 @@ static void nfit_test0_setup(struct nfit_test *t)
 	memdev->address = 0;
 	memdev->interleave_index = 0;
 	memdev->interleave_ways = 1;
+	offset += memdev->header.length;
 
 	/* mem-region10 (spa/bdw0, dimm0) */
-	memdev = nfit_buf + offset + sizeof(struct acpi_nfit_memory_map) * 10;
+	memdev = nfit_buf + offset;
 	memdev->header.type = ACPI_NFIT_TYPE_MEMORY_MAP;
 	memdev->header.length = sizeof(*memdev);
 	memdev->device_handle = handle[0];
@@ -1601,9 +1620,10 @@ static void nfit_test0_setup(struct nfit_test *t)
 	memdev->address = 0;
 	memdev->interleave_index = 0;
 	memdev->interleave_ways = 1;
+	offset += memdev->header.length;
 
 	/* mem-region11 (spa/bdw1, dimm1) */
-	memdev = nfit_buf + offset + sizeof(struct acpi_nfit_memory_map) * 11;
+	memdev = nfit_buf + offset;
 	memdev->header.type = ACPI_NFIT_TYPE_MEMORY_MAP;
 	memdev->header.length = sizeof(*memdev);
 	memdev->device_handle = handle[1];
@@ -1616,9 +1636,10 @@ static void nfit_test0_setup(struct nfit_test *t)
 	memdev->address = 0;
 	memdev->interleave_index = 0;
 	memdev->interleave_ways = 1;
+	offset += memdev->header.length;
 
 	/* mem-region12 (spa/bdw2, dimm2) */
-	memdev = nfit_buf + offset + sizeof(struct acpi_nfit_memory_map) * 12;
+	memdev = nfit_buf + offset;
 	memdev->header.type = ACPI_NFIT_TYPE_MEMORY_MAP;
 	memdev->header.length = sizeof(*memdev);
 	memdev->device_handle = handle[2];
@@ -1631,9 +1652,10 @@ static void nfit_test0_setup(struct nfit_test *t)
 	memdev->address = 0;
 	memdev->interleave_index = 0;
 	memdev->interleave_ways = 1;
+	offset += memdev->header.length;
 
 	/* mem-region13 (spa/dcr3, dimm3) */
-	memdev = nfit_buf + offset + sizeof(struct acpi_nfit_memory_map) * 13;
+	memdev = nfit_buf + offset;
 	memdev->header.type = ACPI_NFIT_TYPE_MEMORY_MAP;
 	memdev->header.length = sizeof(*memdev);
 	memdev->device_handle = handle[3];
@@ -1647,12 +1669,12 @@ static void nfit_test0_setup(struct nfit_test *t)
 	memdev->interleave_index = 0;
 	memdev->interleave_ways = 1;
 	memdev->flags = ACPI_NFIT_MEM_HEALTH_ENABLED;
+	offset += memdev->header.length;
 
-	offset = offset + sizeof(struct acpi_nfit_memory_map) * 14;
 	/* dcr-descriptor0: blk */
 	dcr = nfit_buf + offset;
 	dcr->header.type = ACPI_NFIT_TYPE_CONTROL_REGION;
-	dcr->header.length = sizeof(struct acpi_nfit_control_region);
+	dcr->header.length = sizeof(*dcr);
 	dcr->region_index = 0+1;
 	dcr_common_init(dcr);
 	dcr->serial_number = ~handle[0];
@@ -1663,11 +1685,12 @@ static void nfit_test0_setup(struct nfit_test *t)
 	dcr->command_size = 8;
 	dcr->status_offset = 8;
 	dcr->status_size = 4;
+	offset += dcr->header.length;
 
 	/* dcr-descriptor1: blk */
-	dcr = nfit_buf + offset + sizeof(struct acpi_nfit_control_region);
+	dcr = nfit_buf + offset;
 	dcr->header.type = ACPI_NFIT_TYPE_CONTROL_REGION;
-	dcr->header.length = sizeof(struct acpi_nfit_control_region);
+	dcr->header.length = sizeof(*dcr);
 	dcr->region_index = 1+1;
 	dcr_common_init(dcr);
 	dcr->serial_number = ~handle[1];
@@ -1678,11 +1701,12 @@ static void nfit_test0_setup(struct nfit_test *t)
 	dcr->command_size = 8;
 	dcr->status_offset = 8;
 	dcr->status_size = 4;
+	offset += dcr->header.length;
 
 	/* dcr-descriptor2: blk */
-	dcr = nfit_buf + offset + sizeof(struct acpi_nfit_control_region) * 2;
+	dcr = nfit_buf + offset;
 	dcr->header.type = ACPI_NFIT_TYPE_CONTROL_REGION;
-	dcr->header.length = sizeof(struct acpi_nfit_control_region);
+	dcr->header.length = sizeof(*dcr);
 	dcr->region_index = 2+1;
 	dcr_common_init(dcr);
 	dcr->serial_number = ~handle[2];
@@ -1693,11 +1717,12 @@ static void nfit_test0_setup(struct nfit_test *t)
 	dcr->command_size = 8;
 	dcr->status_offset = 8;
 	dcr->status_size = 4;
+	offset += dcr->header.length;
 
 	/* dcr-descriptor3: blk */
-	dcr = nfit_buf + offset + sizeof(struct acpi_nfit_control_region) * 3;
+	dcr = nfit_buf + offset;
 	dcr->header.type = ACPI_NFIT_TYPE_CONTROL_REGION;
-	dcr->header.length = sizeof(struct acpi_nfit_control_region);
+	dcr->header.length = sizeof(*dcr);
 	dcr->region_index = 3+1;
 	dcr_common_init(dcr);
 	dcr->serial_number = ~handle[3];
@@ -1708,8 +1733,8 @@ static void nfit_test0_setup(struct nfit_test *t)
 	dcr->command_size = 8;
 	dcr->status_offset = 8;
 	dcr->status_size = 4;
+	offset += dcr->header.length;
 
-	offset = offset + sizeof(struct acpi_nfit_control_region) * 4;
 	/* dcr-descriptor0: pmem */
 	dcr = nfit_buf + offset;
 	dcr->header.type = ACPI_NFIT_TYPE_CONTROL_REGION;
@@ -1720,10 +1745,10 @@ static void nfit_test0_setup(struct nfit_test *t)
 	dcr->serial_number = ~handle[0];
 	dcr->code = NFIT_FIC_BYTEN;
 	dcr->windows = 0;
+	offset += dcr->header.length;
 
 	/* dcr-descriptor1: pmem */
-	dcr = nfit_buf + offset + offsetof(struct acpi_nfit_control_region,
-			window_size);
+	dcr = nfit_buf + offset;
 	dcr->header.type = ACPI_NFIT_TYPE_CONTROL_REGION;
 	dcr->header.length = offsetof(struct acpi_nfit_control_region,
 			window_size);
@@ -1732,10 +1757,10 @@ static void nfit_test0_setup(struct nfit_test *t)
 	dcr->serial_number = ~handle[1];
 	dcr->code = NFIT_FIC_BYTEN;
 	dcr->windows = 0;
+	offset += dcr->header.length;
 
 	/* dcr-descriptor2: pmem */
-	dcr = nfit_buf + offset + offsetof(struct acpi_nfit_control_region,
-			window_size) * 2;
+	dcr = nfit_buf + offset;
 	dcr->header.type = ACPI_NFIT_TYPE_CONTROL_REGION;
 	dcr->header.length = offsetof(struct acpi_nfit_control_region,
 			window_size);
@@ -1744,10 +1769,10 @@ static void nfit_test0_setup(struct nfit_test *t)
 	dcr->serial_number = ~handle[2];
 	dcr->code = NFIT_FIC_BYTEN;
 	dcr->windows = 0;
+	offset += dcr->header.length;
 
 	/* dcr-descriptor3: pmem */
-	dcr = nfit_buf + offset + offsetof(struct acpi_nfit_control_region,
-			window_size) * 3;
+	dcr = nfit_buf + offset;
 	dcr->header.type = ACPI_NFIT_TYPE_CONTROL_REGION;
 	dcr->header.length = offsetof(struct acpi_nfit_control_region,
 			window_size);
@@ -1756,54 +1781,56 @@ static void nfit_test0_setup(struct nfit_test *t)
 	dcr->serial_number = ~handle[3];
 	dcr->code = NFIT_FIC_BYTEN;
 	dcr->windows = 0;
+	offset += dcr->header.length;
 
-	offset = offset + offsetof(struct acpi_nfit_control_region,
-			window_size) * 4;
 	/* bdw0 (spa/dcr0, dimm0) */
 	bdw = nfit_buf + offset;
 	bdw->header.type = ACPI_NFIT_TYPE_DATA_REGION;
-	bdw->header.length = sizeof(struct acpi_nfit_data_region);
+	bdw->header.length = sizeof(*bdw);
 	bdw->region_index = 0+1;
 	bdw->windows = 1;
 	bdw->offset = 0;
 	bdw->size = BDW_SIZE;
 	bdw->capacity = DIMM_SIZE;
 	bdw->start_address = 0;
+	offset += bdw->header.length;
 
 	/* bdw1 (spa/dcr1, dimm1) */
-	bdw = nfit_buf + offset + sizeof(struct acpi_nfit_data_region);
+	bdw = nfit_buf + offset;
 	bdw->header.type = ACPI_NFIT_TYPE_DATA_REGION;
-	bdw->header.length = sizeof(struct acpi_nfit_data_region);
+	bdw->header.length = sizeof(*bdw);
 	bdw->region_index = 1+1;
 	bdw->windows = 1;
 	bdw->offset = 0;
 	bdw->size = BDW_SIZE;
 	bdw->capacity = DIMM_SIZE;
 	bdw->start_address = 0;
+	offset += bdw->header.length;
 
 	/* bdw2 (spa/dcr2, dimm2) */
-	bdw = nfit_buf + offset + sizeof(struct acpi_nfit_data_region) * 2;
+	bdw = nfit_buf + offset;
 	bdw->header.type = ACPI_NFIT_TYPE_DATA_REGION;
-	bdw->header.length = sizeof(struct acpi_nfit_data_region);
+	bdw->header.length = sizeof(*bdw);
 	bdw->region_index = 2+1;
 	bdw->windows = 1;
 	bdw->offset = 0;
 	bdw->size = BDW_SIZE;
 	bdw->capacity = DIMM_SIZE;
 	bdw->start_address = 0;
+	offset += bdw->header.length;
 
 	/* bdw3 (spa/dcr3, dimm3) */
-	bdw = nfit_buf + offset + sizeof(struct acpi_nfit_data_region) * 3;
+	bdw = nfit_buf + offset;
 	bdw->header.type = ACPI_NFIT_TYPE_DATA_REGION;
-	bdw->header.length = sizeof(struct acpi_nfit_data_region);
+	bdw->header.length = sizeof(*bdw);
 	bdw->region_index = 3+1;
 	bdw->windows = 1;
 	bdw->offset = 0;
 	bdw->size = BDW_SIZE;
 	bdw->capacity = DIMM_SIZE;
 	bdw->start_address = 0;
+	offset += bdw->header.length;
 
-	offset = offset + sizeof(struct acpi_nfit_data_region) * 4;
 	/* flush0 (dimm0) */
 	flush = nfit_buf + offset;
 	flush->header.type = ACPI_NFIT_TYPE_FLUSH_ADDRESS;
@@ -1812,48 +1839,52 @@ static void nfit_test0_setup(struct nfit_test *t)
 	flush->hint_count = NUM_HINTS;
 	for (i = 0; i < NUM_HINTS; i++)
 		flush->hint_address[i] = t->flush_dma[0] + i * sizeof(u64);
+	offset += flush->header.length;
 
 	/* flush1 (dimm1) */
-	flush = nfit_buf + offset + flush_hint_size * 1;
+	flush = nfit_buf + offset;
 	flush->header.type = ACPI_NFIT_TYPE_FLUSH_ADDRESS;
 	flush->header.length = flush_hint_size;
 	flush->device_handle = handle[1];
 	flush->hint_count = NUM_HINTS;
 	for (i = 0; i < NUM_HINTS; i++)
 		flush->hint_address[i] = t->flush_dma[1] + i * sizeof(u64);
+	offset += flush->header.length;
 
 	/* flush2 (dimm2) */
-	flush = nfit_buf + offset + flush_hint_size  * 2;
+	flush = nfit_buf + offset;
 	flush->header.type = ACPI_NFIT_TYPE_FLUSH_ADDRESS;
 	flush->header.length = flush_hint_size;
 	flush->device_handle = handle[2];
 	flush->hint_count = NUM_HINTS;
 	for (i = 0; i < NUM_HINTS; i++)
 		flush->hint_address[i] = t->flush_dma[2] + i * sizeof(u64);
+	offset += flush->header.length;
 
 	/* flush3 (dimm3) */
-	flush = nfit_buf + offset + flush_hint_size * 3;
+	flush = nfit_buf + offset;
 	flush->header.type = ACPI_NFIT_TYPE_FLUSH_ADDRESS;
 	flush->header.length = flush_hint_size;
 	flush->device_handle = handle[3];
 	flush->hint_count = NUM_HINTS;
 	for (i = 0; i < NUM_HINTS; i++)
 		flush->hint_address[i] = t->flush_dma[3] + i * sizeof(u64);
+	offset += flush->header.length;
 
 	/* platform capabilities */
-	pcap = nfit_buf + offset + flush_hint_size * 4;
+	pcap = nfit_buf + offset;
 	pcap->header.type = ACPI_NFIT_TYPE_CAPABILITIES;
 	pcap->header.length = sizeof(*pcap);
 	pcap->highest_capability = 1;
 	pcap->capabilities = ACPI_NFIT_CAPABILITY_CACHE_FLUSH |
 		ACPI_NFIT_CAPABILITY_MEM_FLUSH;
+	offset += pcap->header.length;
 
 	if (t->setup_hotplug) {
-		offset = offset + flush_hint_size * 4 + sizeof(*pcap);
 		/* dcr-descriptor4: blk */
 		dcr = nfit_buf + offset;
 		dcr->header.type = ACPI_NFIT_TYPE_CONTROL_REGION;
-		dcr->header.length = sizeof(struct acpi_nfit_control_region);
+		dcr->header.length = sizeof(*dcr);
 		dcr->region_index = 8+1;
 		dcr_common_init(dcr);
 		dcr->serial_number = ~handle[4];
@@ -1864,8 +1895,8 @@ static void nfit_test0_setup(struct nfit_test *t)
 		dcr->command_size = 8;
 		dcr->status_offset = 8;
 		dcr->status_size = 4;
+		offset += dcr->header.length;
 
-		offset = offset + sizeof(struct acpi_nfit_control_region);
 		/* dcr-descriptor4: pmem */
 		dcr = nfit_buf + offset;
 		dcr->header.type = ACPI_NFIT_TYPE_CONTROL_REGION;
@@ -1876,21 +1907,20 @@ static void nfit_test0_setup(struct nfit_test *t)
 		dcr->serial_number = ~handle[4];
 		dcr->code = NFIT_FIC_BYTEN;
 		dcr->windows = 0;
+		offset += dcr->header.length;
 
-		offset = offset + offsetof(struct acpi_nfit_control_region,
-				window_size);
 		/* bdw4 (spa/dcr4, dimm4) */
 		bdw = nfit_buf + offset;
 		bdw->header.type = ACPI_NFIT_TYPE_DATA_REGION;
-		bdw->header.length = sizeof(struct acpi_nfit_data_region);
+		bdw->header.length = sizeof(*bdw);
 		bdw->region_index = 8+1;
 		bdw->windows = 1;
 		bdw->offset = 0;
 		bdw->size = BDW_SIZE;
 		bdw->capacity = DIMM_SIZE;
 		bdw->start_address = 0;
+		offset += bdw->header.length;
 
-		offset = offset + sizeof(struct acpi_nfit_data_region);
 		/* spa10 (dcr4) dimm4 */
 		spa = nfit_buf + offset;
 		spa->header.type = ACPI_NFIT_TYPE_SYSTEM_ADDRESS;
@@ -1899,30 +1929,32 @@ static void nfit_test0_setup(struct nfit_test *t)
 		spa->range_index = 10+1;
 		spa->address = t->dcr_dma[4];
 		spa->length = DCR_SIZE;
+		offset += spa->header.length;
 
 		/*
 		 * spa11 (single-dimm interleave for hotplug, note storage
 		 * does not actually alias the related block-data-window
 		 * regions)
 		 */
-		spa = nfit_buf + offset + sizeof(*spa);
+		spa = nfit_buf + offset;
 		spa->header.type = ACPI_NFIT_TYPE_SYSTEM_ADDRESS;
 		spa->header.length = sizeof(*spa);
 		memcpy(spa->range_guid, to_nfit_uuid(NFIT_SPA_PM), 16);
 		spa->range_index = 11+1;
 		spa->address = t->spa_set_dma[2];
 		spa->length = SPA0_SIZE;
+		offset += spa->header.length;
 
 		/* spa12 (bdw for dcr4) dimm4 */
-		spa = nfit_buf + offset + sizeof(*spa) * 2;
+		spa = nfit_buf + offset;
 		spa->header.type = ACPI_NFIT_TYPE_SYSTEM_ADDRESS;
 		spa->header.length = sizeof(*spa);
 		memcpy(spa->range_guid, to_nfit_uuid(NFIT_SPA_BDW), 16);
 		spa->range_index = 12+1;
 		spa->address = t->dimm_dma[4];
 		spa->length = DIMM_SIZE;
+		offset += spa->header.length;
 
-		offset = offset + sizeof(*spa) * 3;
 		/* mem-region14 (spa/dcr4, dimm4) */
 		memdev = nfit_buf + offset;
 		memdev->header.type = ACPI_NFIT_TYPE_MEMORY_MAP;
@@ -1937,10 +1969,10 @@ static void nfit_test0_setup(struct nfit_test *t)
 		memdev->address = 0;
 		memdev->interleave_index = 0;
 		memdev->interleave_ways = 1;
+		offset += memdev->header.length;
 
-		/* mem-region15 (spa0, dimm4) */
-		memdev = nfit_buf + offset +
-				sizeof(struct acpi_nfit_memory_map);
+		/* mem-region15 (spa11, dimm4) */
+		memdev = nfit_buf + offset;
 		memdev->header.type = ACPI_NFIT_TYPE_MEMORY_MAP;
 		memdev->header.length = sizeof(*memdev);
 		memdev->device_handle = handle[4];
@@ -1954,10 +1986,10 @@ static void nfit_test0_setup(struct nfit_test *t)
 		memdev->interleave_index = 0;
 		memdev->interleave_ways = 1;
 		memdev->flags = ACPI_NFIT_MEM_HEALTH_ENABLED;
+		offset += memdev->header.length;
 
 		/* mem-region16 (spa/bdw4, dimm4) */
-		memdev = nfit_buf + offset +
-				sizeof(struct acpi_nfit_memory_map) * 2;
+		memdev = nfit_buf + offset;
 		memdev->header.type = ACPI_NFIT_TYPE_MEMORY_MAP;
 		memdev->header.length = sizeof(*memdev);
 		memdev->device_handle = handle[4];
@@ -1970,8 +2002,8 @@ static void nfit_test0_setup(struct nfit_test *t)
 		memdev->address = 0;
 		memdev->interleave_index = 0;
 		memdev->interleave_ways = 1;
+		offset += memdev->header.length;
 
-		offset = offset + sizeof(struct acpi_nfit_memory_map) * 3;
 		/* flush3 (dimm4) */
 		flush = nfit_buf + offset;
 		flush->header.type = ACPI_NFIT_TYPE_FLUSH_ADDRESS;
@@ -1981,6 +2013,7 @@ static void nfit_test0_setup(struct nfit_test *t)
 		for (i = 0; i < NUM_HINTS; i++)
 			flush->hint_address[i] = t->flush_dma[4]
 				+ i * sizeof(u64);
+		offset += flush->header.length;
 	}
 
 	post_ars_status(&t->ars_state, &t->badrange, t->spa_set_dma[0],
@@ -2027,17 +2060,18 @@ static void nfit_test1_setup(struct nfit_test *t)
 	spa->range_index = 0+1;
 	spa->address = t->spa_set_dma[0];
 	spa->length = SPA2_SIZE;
+	offset += spa->header.length;
 
 	/* virtual cd region */
-	spa = nfit_buf + sizeof(*spa);
+	spa = nfit_buf + offset;
 	spa->header.type = ACPI_NFIT_TYPE_SYSTEM_ADDRESS;
 	spa->header.length = sizeof(*spa);
 	memcpy(spa->range_guid, to_nfit_uuid(NFIT_SPA_VCD), 16);
 	spa->range_index = 0;
 	spa->address = t->spa_set_dma[1];
 	spa->length = SPA_VCD_SIZE;
+	offset += spa->header.length;
 
-	offset += sizeof(*spa) * 2;
 	/* mem-region0 (spa0, dimm0) */
 	memdev = nfit_buf + offset;
 	memdev->header.type = ACPI_NFIT_TYPE_MEMORY_MAP;
@@ -2055,8 +2089,8 @@ static void nfit_test1_setup(struct nfit_test *t)
 	memdev->flags = ACPI_NFIT_MEM_SAVE_FAILED | ACPI_NFIT_MEM_RESTORE_FAILED
 		| ACPI_NFIT_MEM_FLUSH_FAILED | ACPI_NFIT_MEM_HEALTH_OBSERVED
 		| ACPI_NFIT_MEM_NOT_ARMED;
+	offset += memdev->header.length;
 
-	offset += sizeof(*memdev);
 	/* dcr-descriptor0 */
 	dcr = nfit_buf + offset;
 	dcr->header.type = ACPI_NFIT_TYPE_CONTROL_REGION;
@@ -2067,8 +2101,8 @@ static void nfit_test1_setup(struct nfit_test *t)
 	dcr->serial_number = ~handle[5];
 	dcr->code = NFIT_FIC_BYTE;
 	dcr->windows = 0;
-
 	offset += dcr->header.length;
+
 	memdev = nfit_buf + offset;
 	memdev->header.type = ACPI_NFIT_TYPE_MEMORY_MAP;
 	memdev->header.length = sizeof(*memdev);
@@ -2083,9 +2117,9 @@ static void nfit_test1_setup(struct nfit_test *t)
 	memdev->interleave_index = 0;
 	memdev->interleave_ways = 1;
 	memdev->flags = ACPI_NFIT_MEM_MAP_FAILED;
+	offset += memdev->header.length;
 
 	/* dcr-descriptor1 */
-	offset += sizeof(*memdev);
 	dcr = nfit_buf + offset;
 	dcr->header.type = ACPI_NFIT_TYPE_CONTROL_REGION;
 	dcr->header.length = offsetof(struct acpi_nfit_control_region,
@@ -2095,6 +2129,7 @@ static void nfit_test1_setup(struct nfit_test *t)
 	dcr->serial_number = ~handle[6];
 	dcr->code = NFIT_FIC_BYTE;
 	dcr->windows = 0;
+	offset += dcr->header.length;
 
 	post_ars_status(&t->ars_state, &t->badrange, t->spa_set_dma[0],
 			SPA2_SIZE);
