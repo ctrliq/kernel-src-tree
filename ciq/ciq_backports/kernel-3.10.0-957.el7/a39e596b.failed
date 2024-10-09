@@ -1,0 +1,134 @@
+xfs: support for synchronous DAX faults
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Christoph Hellwig <hch@lst.de>
+commit a39e596baa07cb1dc19c2ead14c9fd2a30f22352
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/a39e596b.failed
+
+Return IOMAP_F_DIRTY from xfs_file_iomap_begin() when asked to prepare
+blocks for writing and the inode is pinned, and has dirty fields other
+than the timestamps.  In __xfs_filemap_fault() we then detect this case
+and call dax_finish_sync_fault() to make sure all metadata is committed,
+and to insert the page table entry.
+
+Note that this will also dirty corresponding radix tree entry which is
+what we want - fsync(2) will still provide data integrity guarantees for
+applications not using userspace flushing. And applications using
+userspace flushing can avoid calling fsync(2) and thus avoid the
+performance overhead.
+
+[JK: Added VM_SYNC flag handling]
+
+	Reviewed-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit a39e596baa07cb1dc19c2ead14c9fd2a30f22352)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_file.c
+diff --cc fs/xfs/xfs_file.c
+index cea567087acc,4827e82d5d2c..000000000000
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@@ -43,7 -43,8 +43,12 @@@
+  #include <linux/dcache.h>
+  #include <linux/falloc.h>
+  #include <linux/pagevec.h>
+++<<<<<<< HEAD
+ +#include <linux/splice.h>
+++=======
++ #include <linux/backing-dev.h>
++ #include <linux/mman.h>
+++>>>>>>> a39e596baa07 (xfs: support for synchronous DAX faults)
+  
+  static const struct vm_operations_struct xfs_file_vm_ops;
+  
+@@@ -1198,13 -1040,53 +1203,28 @@@ xfs_filemap_huge_fault
+  	}
+  
+  	xfs_ilock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
+++<<<<<<< HEAD
+ +	ret = dax_iomap_fault(vmf, pe_size, &xfs_iomap_ops);
+++=======
++ 	if (IS_DAX(inode)) {
++ 		pfn_t pfn;
++ 
++ 		ret = dax_iomap_fault(vmf, pe_size, &pfn, &xfs_iomap_ops);
++ 		if (ret & VM_FAULT_NEEDDSYNC)
++ 			ret = dax_finish_sync_fault(vmf, pe_size, pfn);
++ 	} else {
++ 		if (write_fault)
++ 			ret = iomap_page_mkwrite(vmf, &xfs_iomap_ops);
++ 		else
++ 			ret = filemap_fault(vmf);
++ 	}
+++>>>>>>> a39e596baa07 (xfs: support for synchronous DAX faults)
+  	xfs_iunlock(XFS_I(inode), XFS_MMAPLOCK_SHARED);
+  
+ -	if (write_fault)
+ +	if (vmf->flags & FAULT_FLAG_WRITE)
+  		sb_end_pagefault(inode->i_sb);
+ -	return ret;
+ -}
+  
+ -static int
+ -xfs_filemap_fault(
+ -	struct vm_fault		*vmf)
+ -{
+ -	/* DAX can shortcut the normal fault path on write faults! */
+ -	return __xfs_filemap_fault(vmf, PE_SIZE_PTE,
+ -			IS_DAX(file_inode(vmf->vma->vm_file)) &&
+ -			(vmf->flags & FAULT_FLAG_WRITE));
+ -}
+ -
+ -static int
+ -xfs_filemap_huge_fault(
+ -	struct vm_fault		*vmf,
+ -	enum page_entry_size	pe_size)
+ -{
+ -	if (!IS_DAX(file_inode(vmf->vma->vm_file)))
+ -		return VM_FAULT_FALLBACK;
+ -
+ -	/* DAX can shortcut the normal fault path on write faults! */
+ -	return __xfs_filemap_fault(vmf, pe_size,
+ -			(vmf->flags & FAULT_FLAG_WRITE));
+ -}
+ -
+ -static int
+ -xfs_filemap_page_mkwrite(
+ -	struct vm_fault		*vmf)
+ -{
+ -	return __xfs_filemap_fault(vmf, PE_SIZE_PTE, true);
+ +	return ret;
+  }
+  
+  /*
+* Unmerged path fs/xfs/xfs_file.c
+diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
+index dee0317e2022..c520c33d28bb 100644
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@ -33,6 +33,7 @@
+ #include "xfs_error.h"
+ #include "xfs_trans.h"
+ #include "xfs_trans_space.h"
++#include "xfs_inode_item.h"
+ #include "xfs_iomap.h"
+ #include "xfs_trace.h"
+ #include "xfs_icache.h"
+@@ -1031,6 +1032,10 @@ xfs_file_iomap_begin(
+ 		trace_xfs_iomap_found(ip, offset, length, 0, &imap);
+ 	}
+ 
++	if ((flags & IOMAP_WRITE) && xfs_ipincount(ip) &&
++	    (ip->i_itemp->ili_fsync_fields & ~XFS_ILOG_TIMESTAMP))
++		iomap->flags |= IOMAP_F_DIRTY;
++
+ 	xfs_bmbt_to_iomap(ip, iomap, &imap);
+ 
+ 	/* optionally associate a dax device with the iomap bdev */
