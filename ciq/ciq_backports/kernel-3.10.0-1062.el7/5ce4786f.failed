@@ -1,0 +1,94 @@
+kvm: x86: Make sync_page() flush remote TLBs once only
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Junaid Shahid <junaids@google.com>
+commit 5ce4786f75d16504223c7a65a42b200c2550fa29
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/5ce4786f.failed
+
+sync_page() calls set_spte() from a loop across a page table. It would
+work better if set_spte() left the TLB flushing to its callers, so that
+sync_page() can aggregate into a single call.
+
+	Signed-off-by: Junaid Shahid <junaids@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 5ce4786f75d16504223c7a65a42b200c2550fa29)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.c
+diff --cc arch/x86/kvm/mmu.c
+index db86a346eaea,75bc73e23df0..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -2802,6 -2831,8 +2806,11 @@@ static void mmu_set_spte(struct kvm_vcp
+  {
+  	int was_rmapped = 0;
+  	int rmap_count;
+++<<<<<<< HEAD
+++=======
++ 	int set_spte_ret;
++ 	int ret = RET_PF_RETRY;
+++>>>>>>> 5ce4786f75d1 (kvm: x86: Make sync_page() flush remote TLBs once only)
+  
+  	pgprintk("%s: spte %llx write_fault %d gfn %llx\n", __func__,
+  		 *sptep, write_fault, gfn);
+@@@ -2828,15 -2859,18 +2837,18 @@@
+  			was_rmapped = 1;
+  	}
+  
+- 	if (set_spte(vcpu, sptep, pte_access, level, gfn, pfn, speculative,
+- 	      true, host_writable)) {
++ 	set_spte_ret = set_spte(vcpu, sptep, pte_access, level, gfn, pfn,
++ 				speculative, true, host_writable);
++ 	if (set_spte_ret & SET_SPTE_WRITE_PROTECTED_PT) {
+  		if (write_fault)
+ -			ret = RET_PF_EMULATE;
+ +			*emulate = 1;
+  		kvm_make_request(KVM_REQ_TLB_FLUSH, vcpu);
+  	}
++ 	if (set_spte_ret & SET_SPTE_NEED_REMOTE_TLB_FLUSH)
++ 		kvm_flush_remote_tlbs(vcpu->kvm);
+  
+ -	if (unlikely(is_mmio_spte(*sptep)))
+ -		ret = RET_PF_EMULATE;
+ +	if (unlikely(is_mmio_spte(*sptep) && emulate))
+ +		*emulate = 1;
+  
+  	pgprintk("%s: setting spte %llx\n", __func__, *sptep);
+  	pgprintk("instantiating %s PTE (%s) at %llx (%llx) addr %p\n",
+* Unmerged path arch/x86/kvm/mmu.c
+diff --git a/arch/x86/kvm/paging_tmpl.h b/arch/x86/kvm/paging_tmpl.h
+index b281446d6b8c..0efaed72070d 100644
+--- a/arch/x86/kvm/paging_tmpl.h
++++ b/arch/x86/kvm/paging_tmpl.h
+@@ -969,6 +969,7 @@ static int FNAME(sync_page)(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp)
+ 	int i, nr_present = 0;
+ 	bool host_writable;
+ 	gpa_t first_pte_gpa;
++	int set_spte_ret = 0;
+ 
+ 	/* direct kvm_mmu_page can not be unsync. */
+ 	BUG_ON(sp->role.direct);
+@@ -1025,12 +1026,15 @@ static int FNAME(sync_page)(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp)
+ 
+ 		host_writable = sp->spt[i] & SPTE_HOST_WRITEABLE;
+ 
+-		set_spte(vcpu, &sp->spt[i], pte_access,
+-			 PT_PAGE_TABLE_LEVEL, gfn,
+-			 spte_to_pfn(sp->spt[i]), true, false,
+-			 host_writable);
++		set_spte_ret |= set_spte(vcpu, &sp->spt[i],
++					 pte_access, PT_PAGE_TABLE_LEVEL,
++					 gfn, spte_to_pfn(sp->spt[i]),
++					 true, false, host_writable);
+ 	}
+ 
++	if (set_spte_ret & SET_SPTE_NEED_REMOTE_TLB_FLUSH)
++		kvm_flush_remote_tlbs(vcpu->kvm);
++
+ 	return nr_present;
+ }
+ 
