@@ -130,9 +130,7 @@ int snd_emux_register(struct snd_emux *emu, struct snd_card *card, int index, ch
 #endif
 	snd_emux_init_virmidi(emu, card);
 
-#ifdef CONFIG_PROC_FS
 	snd_emux_proc_init(emu, card, index);
-#endif
 	return 0;
 }
 
@@ -152,9 +150,7 @@ int snd_emux_free(struct snd_emux *emu)
 		del_timer(&emu->tlist);
 	spin_unlock_irqrestore(&emu->voice_lock, flags);
 
-#ifdef CONFIG_PROC_FS
 	snd_emux_proc_free(emu);
-#endif
 	snd_emux_delete_virmidi(emu);
 #if IS_ENABLED(CONFIG_SND_SEQUENCER_OSS)
 	snd_emux_detach_seq_oss(emu);
