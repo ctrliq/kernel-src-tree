@@ -1,0 +1,132 @@
+x86/CPU/AMD: Bring back Compute Unit ID
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] cpu/amd: Bring back Compute Unit ID (Suravee Suthikulpanit) [1477397]
+Rebuild_FUZZ: 94.59%
+commit-author Borislav Petkov <bp@suse.de>
+commit 79a8b9aa388b0620cc1d525d7c0f0d9a8a85e08e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/79a8b9aa.failed
+
+Commit:
+
+  a33d331761bc ("x86/CPU/AMD: Fix Bulldozer topology")
+
+restored the initial approach we had with the Fam15h topology of
+enumerating CU (Compute Unit) threads as cores. And this is still
+correct - they're beefier than HT threads but still have some
+shared functionality.
+
+Our current approach has a problem with the Mad Max Steam game, for
+example. Yves Dionne reported a certain "choppiness" while playing on
+v4.9.5.
+
+That problem stems most likely from the fact that the CU threads share
+resources within one CU and when we schedule to a thread of a different
+compute unit, this incurs latency due to migrating the working set to a
+different CU through the caches.
+
+When the thread siblings mask mirrors that aspect of the CUs and
+threads, the scheduler pays attention to it and tries to schedule within
+one CU first. Which takes care of the latency, of course.
+
+	Reported-by: Yves Dionne <yves.dionne@gmail.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: <stable@vger.kernel.org> # 4.9
+	Cc: Brice Goglin <Brice.Goglin@inria.fr>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Yazen Ghannam <yazen.ghannam@amd.com>
+Link: http://lkml.kernel.org/r/20170205105022.8705-1-bp@alien8.de
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 79a8b9aa388b0620cc1d525d7c0f0d9a8a85e08e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/amd.c
+diff --cc arch/x86/kernel/cpu/amd.c
+index d5b90c4a6937,20dc44d1e6be..000000000000
+--- a/arch/x86/kernel/cpu/amd.c
++++ b/arch/x86/kernel/cpu/amd.c
+@@@ -305,17 -308,16 +305,30 @@@ static void amd_get_topology(struct cpu
+  	int cpu = smp_processor_id();
+  
+  	/* get information required for multi-node processors */
+++<<<<<<< HEAD
+ +	if (cpu_has_topoext) {
+ +		u32 eax, ebx, ecx, edx;
+ +
+ +		cpuid(0x8000001e, &eax, &ebx, &ecx, &edx);
+ +		nodes_per_socket = ((ecx >> 8) & 7) + 1;
+ +		node_id = ecx & 7;
+ +
+ +		/* get compute unit information */
+ +		smp_num_siblings = ((ebx >> 8) & 3) + 1;
+ +		c->x86_max_cores /= smp_num_siblings;
+ +		c->cpu_core_id = ebx & 0xff;
+++=======
++ 	if (boot_cpu_has(X86_FEATURE_TOPOEXT)) {
++ 		u32 eax, ebx, ecx, edx;
++ 
++ 		cpuid(0x8000001e, &eax, &ebx, &ecx, &edx);
++ 
++ 		node_id  = ecx & 0xff;
++ 		smp_num_siblings = ((ebx >> 8) & 0xff) + 1;
++ 
++ 		if (c->x86 == 0x15)
++ 			c->cu_id = ebx & 0xff;
+++>>>>>>> 79a8b9aa388b (x86/CPU/AMD: Bring back Compute Unit ID)
+  
+  		/*
+  		 * We may have multiple LLCs if L3 caches exist, so check if we
+diff --git a/arch/x86/include/asm/processor.h b/arch/x86/include/asm/processor.h
+index 5023ca6231a6..3c619d9ca8ce 100644
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@ -110,6 +110,7 @@ struct cpuinfo_x86 {
+ 	__u8			x86_phys_bits;
+ 	/* CPUID returned core id bits: */
+ 	__u8			x86_coreid_bits;
++	__u8			cu_id;
+ 	/* Max extended CPUID function supported: */
+ 	__u32			extended_cpuid_level;
+ 	/* Maximum supported CPUID level, -1=no CPUID: */
+* Unmerged path arch/x86/kernel/cpu/amd.c
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index 59edb62b6a2b..1133e6dfe070 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -953,6 +953,7 @@ static void identify_cpu(struct cpuinfo_x86 *c)
+ 	c->x86_model_id[0] = '\0';  /* Unset */
+ 	c->x86_max_cores = 1;
+ 	c->x86_coreid_bits = 0;
++	c->cu_id = 0xff;
+ #ifdef CONFIG_X86_64
+ 	c->x86_clflush_size = 64;
+ 	c->x86_phys_bits = 36;
+diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
+index 92e0aea4e8c8..db531f3a981c 100644
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@ -420,9 +420,15 @@ static bool match_smt(struct cpuinfo_x86 *c, struct cpuinfo_x86 *o)
+ 		int cpu1 = c->cpu_index, cpu2 = o->cpu_index;
+ 
+ 		if (c->phys_proc_id == o->phys_proc_id &&
+-		    per_cpu(cpu_llc_id, cpu1) == per_cpu(cpu_llc_id, cpu2) &&
+-		    c->cpu_core_id == o->cpu_core_id)
+-			return topology_sane(c, o, "smt");
++		    per_cpu(cpu_llc_id, cpu1) == per_cpu(cpu_llc_id, cpu2)) {
++			if (c->cpu_core_id == o->cpu_core_id)
++				return topology_sane(c, o, "smt");
++
++			if ((c->cu_id != 0xff) &&
++			    (o->cu_id != 0xff) &&
++			    (c->cu_id == o->cu_id))
++				return topology_sane(c, o, "smt");
++		}
+ 
+ 	} else if (c->phys_proc_id == o->phys_proc_id &&
+ 		   c->cpu_core_id == o->cpu_core_id) {
