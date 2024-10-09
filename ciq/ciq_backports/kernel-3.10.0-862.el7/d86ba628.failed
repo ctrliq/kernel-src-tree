@@ -1,0 +1,125 @@
+drm/i915/cnl: Extend WM workaround with IPC for CNL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Kumar, Mahesh <mahesh1.kumar@intel.com>
+commit d86ba628ce4bfd83c987e4dab9d917cbb3622854
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/d86ba628.failed
+
+CNL:A & CNL:B have same workaround as KBL to increase wm level latency
+by 4us if IPC is enabled.
+
+	Signed-off-by: Mahesh Kumar <mahesh1.kumar@intel.com>
+	Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+	Signed-off-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20170817134529.2839-6-mahesh1.kumar@intel.com
+(cherry picked from commit d86ba628ce4bfd83c987e4dab9d917cbb3622854)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_pm.c
+diff --cc drivers/gpu/drm/i915/intel_pm.c
+index 52c3abe82e2f,f2911de69ea9..000000000000
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@@ -3572,74 -4491,33 +3572,84 @@@ static int skl_compute_plane_wm(const s
+  		return 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (apply_memory_bw_wa && fb->modifier == I915_FORMAT_MOD_X_TILED)
+++=======
++ 	/* Display WA #1141: kbl,cfl */
++ 	if ((IS_KABYLAKE(dev_priv) || IS_COFFEELAKE(dev_priv) ||
++ 	    IS_CNL_REVID(dev_priv, CNL_REVID_A0, CNL_REVID_B0)) &&
++ 	    dev_priv->ipc_enabled)
++ 		latency += 4;
++ 
++ 	if (apply_memory_bw_wa && wp->x_tiled)
+++>>>>>>> d86ba628ce4b (drm/i915/cnl: Extend WM workaround with IPC for CNL)
+  		latency += 15;
+  
+ -	method1 = skl_wm_method1(dev_priv, wp->plane_pixel_rate,
+ -				 wp->cpp, latency);
+ -	method2 = skl_wm_method2(wp->plane_pixel_rate,
+ +	width = drm_rect_width(&intel_pstate->base.src) >> 16;
+ +	height = drm_rect_height(&intel_pstate->base.src) >> 16;
+ +
+ +	if (drm_rotation_90_or_270(pstate->rotation))
+ +		swap(width, height);
+ +
+ +	cpp = drm_format_plane_cpp(fb->pixel_format, 0);
+ +	plane_pixel_rate = skl_adjusted_plane_pixel_rate(cstate, intel_pstate);
+ +
+ +	if (drm_rotation_90_or_270(pstate->rotation)) {
+ +		int cpp = (fb->pixel_format == DRM_FORMAT_NV12) ?
+ +			drm_format_plane_cpp(fb->pixel_format, 1) :
+ +			drm_format_plane_cpp(fb->pixel_format, 0);
+ +
+ +		switch (cpp) {
+ +		case 1:
+ +			y_min_scanlines = 16;
+ +			break;
+ +		case 2:
+ +			y_min_scanlines = 8;
+ +			break;
+ +		case 4:
+ +			y_min_scanlines = 4;
+ +			break;
+ +		default:
+ +			MISSING_CASE(cpp);
+ +			return -EINVAL;
+ +		}
+ +	} else {
+ +		y_min_scanlines = 4;
+ +	}
+ +
+ +	if (apply_memory_bw_wa)
+ +		y_min_scanlines *= 2;
+ +
+ +	plane_bytes_per_line = width * cpp;
+ +	if (fb->modifier == I915_FORMAT_MOD_Y_TILED ||
+ +	    fb->modifier == I915_FORMAT_MOD_Yf_TILED) {
+ +		plane_blocks_per_line =
+ +		      DIV_ROUND_UP(plane_bytes_per_line * y_min_scanlines, 512);
+ +		plane_blocks_per_line /= y_min_scanlines;
+ +	} else if (fb->modifier == DRM_FORMAT_MOD_NONE) {
+ +		plane_blocks_per_line = DIV_ROUND_UP(plane_bytes_per_line, 512)
+ +					+ 1;
+ +	} else {
+ +		plane_blocks_per_line = DIV_ROUND_UP(plane_bytes_per_line, 512);
+ +	}
+ +
+ +	method1 = skl_wm_method1(plane_pixel_rate, cpp, latency);
+ +	method2 = skl_wm_method2(plane_pixel_rate,
+  				 cstate->base.adjusted_mode.crtc_htotal,
+  				 latency,
+ -				 wp->plane_blocks_per_line);
+ +				 plane_blocks_per_line);
+ +
+ +	y_tile_minimum = plane_blocks_per_line * y_min_scanlines;
+  
+ -	if (wp->y_tiled) {
+ -		selected_result = max_fixed16(method2, wp->y_tile_minimum);
+ +	if (fb->modifier == I915_FORMAT_MOD_Y_TILED ||
+ +	    fb->modifier == I915_FORMAT_MOD_Yf_TILED) {
+ +		selected_result = max(method2, y_tile_minimum);
+  	} else {
+ -		if ((wp->cpp * cstate->base.adjusted_mode.crtc_htotal /
+ -		     512 < 1) && (wp->plane_bytes_per_line / 512 < 1))
+ +		if ((cpp * cstate->base.adjusted_mode.crtc_htotal / 512 < 1) &&
+ +		    (plane_bytes_per_line / 512 < 1))
+  			selected_result = method2;
+ -		else if (ddb_allocation >=
+ -			 fixed16_to_u32_round_up(wp->plane_blocks_per_line))
+ -			selected_result = min_fixed16(method1, method2);
+ -		else if (latency >= wp->linetime_us)
+ -			selected_result = min_fixed16(method1, method2);
+ +		else if ((ddb_allocation / plane_blocks_per_line) >= 1)
+ +			selected_result = min(method1, method2);
+  		else
+  			selected_result = method1;
+  	}
+* Unmerged path drivers/gpu/drm/i915/intel_pm.c
