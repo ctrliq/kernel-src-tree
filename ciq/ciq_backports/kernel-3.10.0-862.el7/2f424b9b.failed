@@ -1,0 +1,338 @@
+qla2xxx: Move atioq to a different lock to reduce lock contention
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Quinn Tran <quinn.tran@qlogic.com>
+commit 2f424b9b36ad7062e9ade41a9fb034d21a9e4e4b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2f424b9b.failed
+
+99% of the time the ATIOQ has SCSI command.  The other 1% of time
+is something else.  Most of the time this interrupt does not need
+to hold the hardware_lock.  We're moving the ATIO interrupt thread
+to a different lock to reduce lock contention.
+
+	Signed-off-by: Quinn Tran <quinn.tran@qlogic.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@qlogic.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 2f424b9b36ad7062e9ade41a9fb034d21a9e4e4b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_gbl.h
+#	drivers/scsi/qla2xxx/qla_os.c
+#	drivers/scsi/qla2xxx/qla_target.c
+#	drivers/scsi/qla2xxx/qla_target.h
+diff --cc drivers/scsi/qla2xxx/qla_gbl.h
+index c4f068539cd6,0103e468e357..000000000000
+--- a/drivers/scsi/qla2xxx/qla_gbl.h
++++ b/drivers/scsi/qla2xxx/qla_gbl.h
+@@@ -782,4 -772,12 +782,15 @@@ extern void qla82xx_mbx_completion(scsi
+  extern int qla8044_abort_isp(scsi_qla_host_t *);
+  extern int qla8044_check_fw_alive(struct scsi_qla_host *);
+  
+++<<<<<<< HEAD
+++=======
++ extern void qlt_host_reset_handler(struct qla_hw_data *ha);
++ extern int qla_get_exlogin_status(scsi_qla_host_t *, uint16_t *,
++ 	uint16_t *);
++ extern int qla_set_exlogin_mem_cfg(scsi_qla_host_t *vha, dma_addr_t phys_addr);
++ extern int qla_get_exchoffld_status(scsi_qla_host_t *, uint16_t *, uint16_t *);
++ extern int qla_set_exchoffld_mem_cfg(scsi_qla_host_t *, dma_addr_t);
++ extern void qlt_handle_abts_recv(struct scsi_qla_host *, response_t *);
++ 
+++>>>>>>> 2f424b9b36ad (qla2xxx: Move atioq to a different lock to reduce lock contention)
+  #endif /* _QLA_GBL_H */
+diff --cc drivers/scsi/qla2xxx/qla_os.c
+index c679c5766696,eff8bea0dab3..000000000000
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@@ -2653,6 -2334,11 +2653,14 @@@ qla2x00_probe_one(struct pci_dev *pdev
+  	    "Memory allocated for ha=%p.\n", ha);
+  	ha->pdev = pdev;
+  	ha->tgt.enable_class_2 = ql2xenableclass2;
+++<<<<<<< HEAD
+++=======
++ 	INIT_LIST_HEAD(&ha->tgt.q_full_list);
++ 	spin_lock_init(&ha->tgt.q_full_lock);
++ 	spin_lock_init(&ha->tgt.sess_lock);
++ 	spin_lock_init(&ha->tgt.atio_lock);
++ 
+++>>>>>>> 2f424b9b36ad (qla2xxx: Move atioq to a different lock to reduce lock contention)
+  
+  	/* Clear our data area */
+  	ha->bars = bars;
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 4e0d4c3c5146,ac7a7549c669..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -179,9 -208,35 +179,35 @@@ struct scsi_qla_host *qlt_find_host_by_
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +void qlt_24xx_atio_pkt_all_vps(struct scsi_qla_host *vha,
+ +	struct atio_from_isp *atio)
+++=======
++ static inline void qlt_incr_num_pend_cmds(struct scsi_qla_host *vha)
++ {
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&vha->hw->tgt.q_full_lock, flags);
++ 
++ 	vha->hw->tgt.num_pend_cmds++;
++ 	if (vha->hw->tgt.num_pend_cmds > vha->hw->qla_stats.stat_max_pend_cmds)
++ 		vha->hw->qla_stats.stat_max_pend_cmds =
++ 			vha->hw->tgt.num_pend_cmds;
++ 	spin_unlock_irqrestore(&vha->hw->tgt.q_full_lock, flags);
++ }
++ static inline void qlt_decr_num_pend_cmds(struct scsi_qla_host *vha)
++ {
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&vha->hw->tgt.q_full_lock, flags);
++ 	vha->hw->tgt.num_pend_cmds--;
++ 	spin_unlock_irqrestore(&vha->hw->tgt.q_full_lock, flags);
++ }
++ 
++ static void qlt_24xx_atio_pkt_all_vps(struct scsi_qla_host *vha,
++ 	struct atio_from_isp *atio, uint8_t ha_locked)
+++>>>>>>> 2f424b9b36ad (qla2xxx: Move atioq to a different lock to reduce lock contention)
+  {
+ -	ql_dbg(ql_dbg_tgt, vha, 0xe072,
+ -		"%s: qla_target(%d): type %x ox_id %04x\n",
+ -		__func__, vha->vp_idx, atio->u.raw.entry_type,
+ -		be16_to_cpu(atio->u.isp24.fcp_hdr.ox_id));
+ -
+  	switch (atio->u.raw.entry_type) {
+  	case ATIO_TYPE7:
+  	{
+@@@ -984,9 -1209,9 +1010,9 @@@ void qlt_stop_phase2(struct qla_tgt *tg
+  	    "Waiting for %d IRQ commands to complete (tgt %p)",
+  	    tgt->irq_cmd_count, tgt);
+  
+ -	mutex_lock(&vha->vha_tgt.tgt_mutex);
+ +	mutex_lock(&ha->tgt.tgt_mutex);
+  	spin_lock_irqsave(&ha->hardware_lock, flags);
+- 	while (tgt->irq_cmd_count != 0) {
++ 	while ((tgt->irq_cmd_count != 0) || (tgt->atio_irq_cmd_count != 0)) {
+  		spin_unlock_irqrestore(&ha->hardware_lock, flags);
+  		udelay(2);
+  		spin_lock_irqsave(&ha->hardware_lock, flags);
+@@@ -3640,14 -5350,15 +3666,15 @@@ static void qlt_send_busy(struct scsi_q
+  /* ha->hardware_lock supposed to be held on entry */
+  /* called via callback from qla2xxx */
+  static void qlt_24xx_atio_pkt(struct scsi_qla_host *vha,
+- 	struct atio_from_isp *atio)
++ 	struct atio_from_isp *atio, uint8_t ha_locked)
+  {
+  	struct qla_hw_data *ha = vha->hw;
+ -	struct qla_tgt *tgt = vha->vha_tgt.qla_tgt;
+ +	struct qla_tgt *tgt = ha->tgt.qla_tgt;
+  	int rc;
++ 	unsigned long flags;
+  
+  	if (unlikely(tgt == NULL)) {
+ -		ql_dbg(ql_dbg_io, vha, 0x3064,
+ +		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf039,
+  		    "ATIO pkt, but no tgt (ha %p)", ha);
+  		return;
+  	}
+@@@ -3684,15 -5377,32 +3711,35 @@@
+  			    "qla_target(%d): ATIO_TYPE7 "
+  			    "received with UNKNOWN exchange address, "
+  			    "sending QUEUE_FULL\n", vha->vp_idx);
++ 			if (!ha_locked)
++ 				spin_lock_irqsave(&ha->hardware_lock, flags);
+  			qlt_send_busy(vha, atio, SAM_STAT_TASK_SET_FULL);
++ 			if (!ha_locked)
++ 				spin_unlock_irqrestore(&ha->hardware_lock, flags);
+  			break;
+  		}
+++<<<<<<< HEAD
+ +		if (likely(atio->u.isp24.fcp_cmnd.task_mgmt_flags == 0))
+++=======
++ 
++ 
++ 
++ 		if (likely(atio->u.isp24.fcp_cmnd.task_mgmt_flags == 0)) {
++ 			rc = qlt_chk_qfull_thresh_hold(vha, atio);
++ 			if (rc != 0) {
++ 				tgt->atio_irq_cmd_count--;
++ 				return;
++ 			}
+++>>>>>>> 2f424b9b36ad (qla2xxx: Move atioq to a different lock to reduce lock contention)
+  			rc = qlt_handle_cmd_for_atio(vha, atio);
+ -		} else {
+ +		else
+  			rc = qlt_handle_task_mgmt(vha, atio);
+ -		}
+  		if (unlikely(rc != 0)) {
+  			if (rc == -ESRCH) {
++ 				if (!ha_locked)
++ 					spin_lock_irqsave
++ 						(&ha->hardware_lock, flags);
++ 
+  #if 1 /* With TERM EXCHANGE some FC cards refuse to boot */
+  				qlt_send_busy(vha, atio, SAM_STAT_BUSY);
+  #else
+diff --cc drivers/scsi/qla2xxx/qla_target.h
+index b33e411f28a0,71b2865ba3c8..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.h
++++ b/drivers/scsi/qla2xxx/qla_target.h
+@@@ -805,6 -882,35 +806,38 @@@ struct qla_tgt 
+  	struct list_head tgt_list_entry;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct qla_tgt_sess_op {
++ 	struct scsi_qla_host *vha;
++ 	uint32_t chip_reset;
++ 	struct atio_from_isp atio;
++ 	struct work_struct work;
++ 	struct list_head cmd_list;
++ 	bool aborted;
++ };
++ 
++ enum qla_sess_deletion {
++ 	QLA_SESS_DELETION_NONE		= 0,
++ 	QLA_SESS_DELETION_PENDING	= 1, /* hopefully we can get rid of
++ 					      * this one */
++ 	QLA_SESS_DELETION_IN_PROGRESS	= 2,
++ };
++ 
++ typedef enum {
++ 	QLT_PLOGI_LINK_SAME_WWN,
++ 	QLT_PLOGI_LINK_CONFLICT,
++ 	QLT_PLOGI_LINK_MAX
++ } qlt_plogi_link_t;
++ 
++ typedef struct {
++ 	struct list_head		list;
++ 	struct imm_ntfy_from_isp	iocb;
++ 	port_id_t			id;
++ 	int				ref_count;
++ } qlt_plogi_ack_t;
++ 
+++>>>>>>> 2f424b9b36ad (qla2xxx: Move atioq to a different lock to reduce lock contention)
+  /*
+   * Equivilant to IT Nexus (Initiator-Target)
+   */
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 9cf0dee11112..565b35dd0cc2 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -2968,6 +2968,7 @@ struct qlt_hw_data {
+ 
+ 	uint8_t tgt_node_name[WWN_SIZE];
+ 	int rspq_vector_cpuid;
++	spinlock_t atio_lock ____cacheline_aligned;
+ };
+ 
+ /*
+* Unmerged path drivers/scsi/qla2xxx/qla_gbl.h
+diff --git a/drivers/scsi/qla2xxx/qla_init.c b/drivers/scsi/qla2xxx/qla_init.c
+index ea8080a1a353..3d043d486087 100644
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@ -4829,7 +4829,7 @@ qla2x00_restart_isp(scsi_qla_host_t *vha)
+ 	struct qla_hw_data *ha = vha->hw;
+ 	struct req_que *req = ha->req_q_map[0];
+ 	struct rsp_que *rsp = ha->rsp_q_map[0];
+-	unsigned long flags;
++	unsigned long flags, flags2;
+ 
+ 	/* If firmware needs to be loaded */
+ 	if (qla2x00_isp_firmware(vha)) {
+@@ -4858,8 +4858,10 @@ qla2x00_restart_isp(scsi_qla_host_t *vha)
+ 			 * while we weren't online.
+ 			 */
+ 			spin_lock_irqsave(&ha->hardware_lock, flags);
++			spin_lock_irqsave(&ha->tgt.atio_lock, flags2);
+ 			if (qla_tgt_mode_enabled(vha))
+-				qlt_24xx_process_atio_queue(vha);
++				qlt_24xx_process_atio_queue(vha, 1);
++			spin_unlock_irqrestore(&ha->tgt.atio_lock, flags2);
+ 			spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ 
+ 			set_bit(LOOP_RESYNC_NEEDED, &vha->dpc_flags);
+diff --git a/drivers/scsi/qla2xxx/qla_isr.c b/drivers/scsi/qla2xxx/qla_isr.c
+index 61661da1dd7e..9e18f777a8b0 100644
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@ -2612,8 +2612,14 @@ void qla24xx_process_response_queue(struct scsi_qla_host *vha,
+ 			qla24xx_els_ct_entry(vha, rsp->req, pkt, ELS_IOCB_TYPE);
+ 			break;
+ 		case ABTS_RECV_24XX:
+-			/* ensure that the ATIO queue is empty */
+-			qlt_24xx_process_atio_queue(vha);
++			if (IS_QLA83XX(ha) || IS_QLA27XX(ha)) {
++				/* ensure that the ATIO queue is empty */
++				qlt_handle_abts_recv(vha, (response_t *)pkt);
++				break;
++			} else {
++				/* drop through */
++				qlt_24xx_process_atio_queue(vha, 1);
++			}
+ 		case ABTS_RESP_24XX:
+ 		case CTIO_TYPE7:
+ 		case NOTIFY_ACK_TYPE:
+@@ -2779,13 +2785,22 @@ qla24xx_intr_handler(int irq, void *dev_id)
+ 		case INTR_RSP_QUE_UPDATE_83XX:
+ 			qla24xx_process_response_queue(vha, rsp);
+ 			break;
+-		case INTR_ATIO_QUE_UPDATE:
+-			qlt_24xx_process_atio_queue(vha);
++		case INTR_ATIO_QUE_UPDATE:{
++			unsigned long flags2;
++			spin_lock_irqsave(&ha->tgt.atio_lock, flags2);
++			qlt_24xx_process_atio_queue(vha, 1);
++			spin_unlock_irqrestore(&ha->tgt.atio_lock, flags2);
+ 			break;
+-		case INTR_ATIO_RSP_QUE_UPDATE:
+-			qlt_24xx_process_atio_queue(vha);
++		}
++		case INTR_ATIO_RSP_QUE_UPDATE: {
++			unsigned long flags2;
++			spin_lock_irqsave(&ha->tgt.atio_lock, flags2);
++			qlt_24xx_process_atio_queue(vha, 1);
++			spin_unlock_irqrestore(&ha->tgt.atio_lock, flags2);
++
+ 			qla24xx_process_response_queue(vha, rsp);
+ 			break;
++		}
+ 		default:
+ 			ql_dbg(ql_dbg_async, vha, 0x504f,
+ 			    "Unrecognized interrupt type (%d).\n", stat * 0xff);
+@@ -2909,13 +2924,22 @@ qla24xx_msix_default(int irq, void *dev_id)
+ 		case INTR_RSP_QUE_UPDATE_83XX:
+ 			qla24xx_process_response_queue(vha, rsp);
+ 			break;
+-		case INTR_ATIO_QUE_UPDATE:
+-			qlt_24xx_process_atio_queue(vha);
++		case INTR_ATIO_QUE_UPDATE:{
++			unsigned long flags2;
++			spin_lock_irqsave(&ha->tgt.atio_lock, flags2);
++			qlt_24xx_process_atio_queue(vha, 1);
++			spin_unlock_irqrestore(&ha->tgt.atio_lock, flags2);
+ 			break;
+-		case INTR_ATIO_RSP_QUE_UPDATE:
+-			qlt_24xx_process_atio_queue(vha);
++		}
++		case INTR_ATIO_RSP_QUE_UPDATE: {
++			unsigned long flags2;
++			spin_lock_irqsave(&ha->tgt.atio_lock, flags2);
++			qlt_24xx_process_atio_queue(vha, 1);
++			spin_unlock_irqrestore(&ha->tgt.atio_lock, flags2);
++
+ 			qla24xx_process_response_queue(vha, rsp);
+ 			break;
++		}
+ 		default:
+ 			ql_dbg(ql_dbg_async, vha, 0x5051,
+ 			    "Unrecognized interrupt type (%d).\n", stat & 0xff);
+* Unmerged path drivers/scsi/qla2xxx/qla_os.c
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
+* Unmerged path drivers/scsi/qla2xxx/qla_target.h
