@@ -1,0 +1,129 @@
+i40e: avoid O(n^2) loop when deleting all filters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit 148141bb26cf942e6bc7249c55d9958dd62dd4f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/148141bb.failed
+
+Use __i40e_del_filter instead of using i40e_del_filter() which will
+avoid doing an additional search to delete a filter we already have the
+pointer for.
+
+Change-ID: Iea5a7e3cafbf8c682ed9d3b6c69cf5ff53f44daf
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit 148141bb26cf942e6bc7249c55d9958dd62dd4f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e.h
+#	drivers/net/ethernet/intel/i40e/i40e_main.c
+#	drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e.h
+index 2ef7a3690712,8bb0f4b79575..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e.h
++++ b/drivers/net/ethernet/intel/i40e/i40e.h
+@@@ -746,10 -761,9 +746,16 @@@ u32 i40e_get_global_fd_count(struct i40
+  bool i40e_set_ntuple(struct i40e_pf *pf, netdev_features_t features);
+  void i40e_set_ethtool_ops(struct net_device *netdev);
+  struct i40e_mac_filter *i40e_add_filter(struct i40e_vsi *vsi,
+++<<<<<<< HEAD
+ +					u8 *macaddr, s16 vlan,
+ +					bool is_vf, bool is_netdev);
+ +void i40e_del_filter(struct i40e_vsi *vsi, u8 *macaddr, s16 vlan,
+ +		     bool is_vf, bool is_netdev);
+++=======
++ 					const u8 *macaddr, s16 vlan);
++ void __i40e_del_filter(struct i40e_vsi *vsi, struct i40e_mac_filter *f);
++ void i40e_del_filter(struct i40e_vsi *vsi, const u8 *macaddr, s16 vlan);
+++>>>>>>> 148141bb26cf (i40e: avoid O(n^2) loop when deleting all filters)
+  int i40e_sync_vsi_filters(struct i40e_vsi *vsi);
+  struct i40e_vsi *i40e_vsi_setup(struct i40e_pf *pf, u8 type,
+  				u16 uplink, u32 param1);
+diff --cc drivers/net/ethernet/intel/i40e/i40e_main.c
+index 2f00e31ef630,cabd72854274..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@@ -1360,14 -1420,46 +1360,52 @@@ add_filter_out
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * i40e_del_filter - Remove a mac/vlan filter from the VSI
+++=======
++  * __i40e_del_filter - Remove a specific filter from the VSI
++  * @vsi: VSI to remove from
++  * @f: the filter to remove from the list
++  *
++  * This function should be called instead of i40e_del_filter only if you know
++  * the exact filter you will remove already, such as via i40e_find_filter or
++  * i40e_find_mac.
++  *
++  * NOTE: This function is expected to be called with mac_filter_hash_lock
++  * being held.
++  * ANOTHER NOTE: This function MUST be called from within the context of
++  * the "safe" variants of any list iterators, e.g. list_for_each_entry_safe()
++  * instead of list_for_each_entry().
++  **/
++ void __i40e_del_filter(struct i40e_vsi *vsi, struct i40e_mac_filter *f)
++ {
++ 	if (!f)
++ 		return;
++ 
++ 	if ((f->state == I40E_FILTER_FAILED) ||
++ 	    (f->state == I40E_FILTER_NEW)) {
++ 		/* this one never got added by the FW. Just remove it,
++ 		 * no need to sync anything.
++ 		 */
++ 		hash_del(&f->hlist);
++ 		kfree(f);
++ 	} else {
++ 		f->state = I40E_FILTER_REMOVE;
++ 		vsi->flags |= I40E_VSI_FLAG_FILTER_CHANGED;
++ 		vsi->back->flags |= I40E_FLAG_FILTER_SYNC;
++ 	}
++ }
++ 
++ /**
++  * i40e_del_filter - Remove a MAC/VLAN filter from the VSI
+++>>>>>>> 148141bb26cf (i40e: avoid O(n^2) loop when deleting all filters)
+   * @vsi: the VSI to be searched
+   * @macaddr: the MAC address
+ - * @vlan: the VLAN
+ + * @vlan: the vlan
+ + * @is_vf: make sure it's a VF filter, else doesn't matter
+ + * @is_netdev: make sure it's a netdev filter, else doesn't matter
+   *
+ - * NOTE: This function is expected to be called with mac_filter_hash_lock
+ + * NOTE: This function is expected to be called with mac_filter_list_lock
+   * being held.
+   * ANOTHER NOTE: This function MUST be called from within the context of
+   * the "safe" variants of any list iterators, e.g. list_for_each_entry_safe()
+diff --cc drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+index 4fb0bfac177f,49941dd691d9..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
+@@@ -2733,10 -2724,10 +2733,15 @@@ int i40e_ndo_set_vf_mac(struct net_devi
+  	/* Delete all the filters for this VSI - we're going to kill it
+  	 * anyway.
+  	 */
+++<<<<<<< HEAD
+ +	list_for_each_entry(f, &vsi->mac_filter_list, list)
+ +		i40e_del_filter(vsi, f->macaddr, f->vlan, true, false);
+++=======
++ 	hash_for_each(vsi->mac_filter_hash, bkt, f, hlist)
++ 		__i40e_del_filter(vsi, f);
+++>>>>>>> 148141bb26cf (i40e: avoid O(n^2) loop when deleting all filters)
+  
+ -	spin_unlock_bh(&vsi->mac_filter_hash_lock);
+ +	spin_unlock_bh(&vsi->mac_filter_list_lock);
+  
+  	dev_info(&pf->pdev->dev, "Setting MAC %pM on VF %d\n", mac, vf_id);
+  	/* program mac filter */
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e.h
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_main.c
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_virtchnl_pf.c
