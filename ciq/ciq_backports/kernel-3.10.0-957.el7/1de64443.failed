@@ -1,0 +1,666 @@
+sched/core: Fix task and run queue sched_info::run_delay inconsistencies
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 1de64443d755f83af8ba8b558fded0c61afaef47
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/1de64443.failed
+
+Mike Meyer reported the following bug:
+
+> During evaluation of some performance data, it was discovered thread
+> and run queue run_delay accounting data was inconsistent with the other
+> accounting data that was collected.  Further investigation found under
+> certain circumstances execution time was leaking into the task and
+> run queue accounting of run_delay.
+>
+> Consider the following sequence:
+>
+>     a. thread is running.
+>     b. thread moves beween cgroups, changes scheduling class or priority.
+>     c. thread sleeps OR
+>     d. thread involuntarily gives up cpu.
+>
+> a. implies:
+>
+>     thread->sched_info.last_queued = 0
+>
+> a. and b. results in the following:
+>
+>     1. dequeue_task(rq, thread)
+>
+>            sched_info_dequeued(rq, thread)
+>                delta = 0
+>
+>                sched_info_reset_dequeued(thread)
+>                    thread->sched_info.last_queued = 0
+>
+>                thread->sched_info.run_delay += delta
+>
+>     2. enqueue_task(rq, thread)
+>
+>            sched_info_queued(rq, thread)
+>
+>                /* thread is still on cpu at this point. */
+>                thread->sched_info.last_queued = task_rq(thread)->clock;
+>
+> c. results in:
+>
+>     dequeue_task(rq, thread)
+>
+>         sched_info_dequeued(rq, thread)
+>
+>             /* delta is execution time not run_delay. */
+>             delta = task_rq(thread)->clock - thread->sched_info.last_queued
+>
+>         sched_info_reset_dequeued(thread)
+>             thread->sched_info.last_queued = 0
+>
+>         thread->sched_info.run_delay += delta
+>
+>     Since thread was running between enqueue_task(rq, thread) and
+>     dequeue_task(rq, thread), the delta above is really execution
+>     time and not run_delay.
+>
+> d. results in:
+>
+>     __sched_info_switch(thread, next_thread)
+>
+>         sched_info_depart(rq, thread)
+>
+>             sched_info_queued(rq, thread)
+>
+>                 /* last_queued not updated due to being non-zero */
+>                 return
+>
+>     Since thread was running between enqueue_task(rq, thread) and
+>     __sched_info_switch(thread, next_thread), the execution time
+>     between enqueue_task(rq, thread) and
+>     __sched_info_switch(thread, next_thread) now will become
+>     associated with run_delay due to when last_queued was last updated.
+>
+
+This alternative patch solves the problem by not calling
+sched_info_{de,}queued() in {de,en}queue_task(). Therefore the
+sched_info state is preserved and things work as expected.
+
+By inlining the {de,en}queue_task() functions the new condition
+becomes (mostly) a compile-time constant and we'll not emit any new
+branch instructions.
+
+It even shrinks the code (due to inlining {en,de}queue_task()):
+
+$ size defconfig-build/kernel/sched/core.o defconfig-build/kernel/sched/core.o.orig
+   text    data     bss     dec     hex filename
+  64019   23378    2344   89741   15e8d defconfig-build/kernel/sched/core.o
+  64149   23378    2344   89871   15f0f defconfig-build/kernel/sched/core.o.orig
+
+	Reported-by: Mike Meyer <Mike.Meyer@Teradata.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Mike Galbraith <efault@gmx.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: linux-kernel@vger.kernel.org
+Link: http://lkml.kernel.org/r/20150930154413.GO3604@twins.programming.kicks-ass.net
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 1de64443d755f83af8ba8b558fded0c61afaef47)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+diff --cc kernel/sched/core.c
+index 1a5e18b224eb,fb14a010426f..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -873,17 -827,19 +873,27 @@@ static void set_load_weight(struct task
+  	load->inv_weight = prio_to_wmult[prio];
+  }
+  
+- static void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
++ static inline void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
+  {
+  	update_rq_clock(rq);
+++<<<<<<< HEAD
+ +	sched_info_queued(p);
+++=======
++ 	if (!(flags & ENQUEUE_RESTORE))
++ 		sched_info_queued(rq, p);
+++>>>>>>> 1de64443d755 (sched/core: Fix task and run queue sched_info::run_delay inconsistencies)
+  	p->sched_class->enqueue_task(rq, p, flags);
+  }
+  
+- static void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
++ static inline void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
+  {
+  	update_rq_clock(rq);
+++<<<<<<< HEAD
+ +	sched_info_dequeued(p);
+++=======
++ 	if (!(flags & DEQUEUE_SAVE))
++ 		sched_info_dequeued(rq, p);
+++>>>>>>> 1de64443d755 (sched/core: Fix task and run queue sched_info::run_delay inconsistencies)
+  	p->sched_class->dequeue_task(rq, p, flags);
+  }
+  
+@@@ -1094,6 -1048,222 +1104,225 @@@ void check_preempt_curr(struct rq *rq, 
+  }
+  
+  #ifdef CONFIG_SMP
+++<<<<<<< HEAD
+++=======
++ /*
++  * This is how migration works:
++  *
++  * 1) we invoke migration_cpu_stop() on the target CPU using
++  *    stop_one_cpu().
++  * 2) stopper starts to run (implicitly forcing the migrated thread
++  *    off the CPU)
++  * 3) it checks whether the migrated task is still in the wrong runqueue.
++  * 4) if it's in the wrong runqueue then the migration thread removes
++  *    it and puts it into the right queue.
++  * 5) stopper completes and stop_one_cpu() returns and the migration
++  *    is done.
++  */
++ 
++ /*
++  * move_queued_task - move a queued task to new rq.
++  *
++  * Returns (locked) new rq. Old rq's lock is released.
++  */
++ static struct rq *move_queued_task(struct rq *rq, struct task_struct *p, int new_cpu)
++ {
++ 	lockdep_assert_held(&rq->lock);
++ 
++ 	dequeue_task(rq, p, 0);
++ 	p->on_rq = TASK_ON_RQ_MIGRATING;
++ 	set_task_cpu(p, new_cpu);
++ 	raw_spin_unlock(&rq->lock);
++ 
++ 	rq = cpu_rq(new_cpu);
++ 
++ 	raw_spin_lock(&rq->lock);
++ 	BUG_ON(task_cpu(p) != new_cpu);
++ 	p->on_rq = TASK_ON_RQ_QUEUED;
++ 	enqueue_task(rq, p, 0);
++ 	check_preempt_curr(rq, p, 0);
++ 
++ 	return rq;
++ }
++ 
++ struct migration_arg {
++ 	struct task_struct *task;
++ 	int dest_cpu;
++ };
++ 
++ /*
++  * Move (not current) task off this cpu, onto dest cpu. We're doing
++  * this because either it can't run here any more (set_cpus_allowed()
++  * away from this CPU, or CPU going down), or because we're
++  * attempting to rebalance this task on exec (sched_exec).
++  *
++  * So we race with normal scheduler movements, but that's OK, as long
++  * as the task is no longer on this CPU.
++  */
++ static struct rq *__migrate_task(struct rq *rq, struct task_struct *p, int dest_cpu)
++ {
++ 	if (unlikely(!cpu_active(dest_cpu)))
++ 		return rq;
++ 
++ 	/* Affinity changed (again). */
++ 	if (!cpumask_test_cpu(dest_cpu, tsk_cpus_allowed(p)))
++ 		return rq;
++ 
++ 	rq = move_queued_task(rq, p, dest_cpu);
++ 
++ 	return rq;
++ }
++ 
++ /*
++  * migration_cpu_stop - this will be executed by a highprio stopper thread
++  * and performs thread migration by bumping thread off CPU then
++  * 'pushing' onto another runqueue.
++  */
++ static int migration_cpu_stop(void *data)
++ {
++ 	struct migration_arg *arg = data;
++ 	struct task_struct *p = arg->task;
++ 	struct rq *rq = this_rq();
++ 
++ 	/*
++ 	 * The original target cpu might have gone down and we might
++ 	 * be on another cpu but it doesn't matter.
++ 	 */
++ 	local_irq_disable();
++ 	/*
++ 	 * We need to explicitly wake pending tasks before running
++ 	 * __migrate_task() such that we will not miss enforcing cpus_allowed
++ 	 * during wakeups, see set_cpus_allowed_ptr()'s TASK_WAKING test.
++ 	 */
++ 	sched_ttwu_pending();
++ 
++ 	raw_spin_lock(&p->pi_lock);
++ 	raw_spin_lock(&rq->lock);
++ 	/*
++ 	 * If task_rq(p) != rq, it cannot be migrated here, because we're
++ 	 * holding rq->lock, if p->on_rq == 0 it cannot get enqueued because
++ 	 * we're holding p->pi_lock.
++ 	 */
++ 	if (task_rq(p) == rq && task_on_rq_queued(p))
++ 		rq = __migrate_task(rq, p, arg->dest_cpu);
++ 	raw_spin_unlock(&rq->lock);
++ 	raw_spin_unlock(&p->pi_lock);
++ 
++ 	local_irq_enable();
++ 	return 0;
++ }
++ 
++ /*
++  * sched_class::set_cpus_allowed must do the below, but is not required to
++  * actually call this function.
++  */
++ void set_cpus_allowed_common(struct task_struct *p, const struct cpumask *new_mask)
++ {
++ 	cpumask_copy(&p->cpus_allowed, new_mask);
++ 	p->nr_cpus_allowed = cpumask_weight(new_mask);
++ }
++ 
++ void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
++ {
++ 	struct rq *rq = task_rq(p);
++ 	bool queued, running;
++ 
++ 	lockdep_assert_held(&p->pi_lock);
++ 
++ 	queued = task_on_rq_queued(p);
++ 	running = task_current(rq, p);
++ 
++ 	if (queued) {
++ 		/*
++ 		 * Because __kthread_bind() calls this on blocked tasks without
++ 		 * holding rq->lock.
++ 		 */
++ 		lockdep_assert_held(&rq->lock);
++ 		dequeue_task(rq, p, DEQUEUE_SAVE);
++ 	}
++ 	if (running)
++ 		put_prev_task(rq, p);
++ 
++ 	p->sched_class->set_cpus_allowed(p, new_mask);
++ 
++ 	if (running)
++ 		p->sched_class->set_curr_task(rq);
++ 	if (queued)
++ 		enqueue_task(rq, p, ENQUEUE_RESTORE);
++ }
++ 
++ /*
++  * Change a given task's CPU affinity. Migrate the thread to a
++  * proper CPU and schedule it away if the CPU it's executing on
++  * is removed from the allowed bitmask.
++  *
++  * NOTE: the caller must have a valid reference to the task, the
++  * task must not exit() & deallocate itself prematurely. The
++  * call is not atomic; no spinlocks may be held.
++  */
++ static int __set_cpus_allowed_ptr(struct task_struct *p,
++ 				  const struct cpumask *new_mask, bool check)
++ {
++ 	unsigned long flags;
++ 	struct rq *rq;
++ 	unsigned int dest_cpu;
++ 	int ret = 0;
++ 
++ 	rq = task_rq_lock(p, &flags);
++ 
++ 	/*
++ 	 * Must re-check here, to close a race against __kthread_bind(),
++ 	 * sched_setaffinity() is not guaranteed to observe the flag.
++ 	 */
++ 	if (check && (p->flags & PF_NO_SETAFFINITY)) {
++ 		ret = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	if (cpumask_equal(&p->cpus_allowed, new_mask))
++ 		goto out;
++ 
++ 	if (!cpumask_intersects(new_mask, cpu_active_mask)) {
++ 		ret = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	do_set_cpus_allowed(p, new_mask);
++ 
++ 	/* Can the task run on the task's current CPU? If so, we're done */
++ 	if (cpumask_test_cpu(task_cpu(p), new_mask))
++ 		goto out;
++ 
++ 	dest_cpu = cpumask_any_and(cpu_active_mask, new_mask);
++ 	if (task_running(rq, p) || p->state == TASK_WAKING) {
++ 		struct migration_arg arg = { p, dest_cpu };
++ 		/* Need help from migration thread: drop lock and wait. */
++ 		task_rq_unlock(rq, p, &flags);
++ 		stop_one_cpu(cpu_of(rq), migration_cpu_stop, &arg);
++ 		tlb_migrate_finish(p->mm);
++ 		return 0;
++ 	} else if (task_on_rq_queued(p)) {
++ 		/*
++ 		 * OK, since we're going to drop the lock immediately
++ 		 * afterwards anyway.
++ 		 */
++ 		lockdep_unpin_lock(&rq->lock);
++ 		rq = move_queued_task(rq, p, dest_cpu);
++ 		lockdep_pin_lock(&rq->lock);
++ 	}
++ out:
++ 	task_rq_unlock(rq, p, &flags);
++ 
++ 	return ret;
++ }
++ 
++ int set_cpus_allowed_ptr(struct task_struct *p, const struct cpumask *new_mask)
++ {
++ 	return __set_cpus_allowed_ptr(p, new_mask, false);
++ }
++ EXPORT_SYMBOL_GPL(set_cpus_allowed_ptr);
++ 
+++>>>>>>> 1de64443d755 (sched/core: Fix task and run queue sched_info::run_delay inconsistencies)
+  void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
+  {
+  #ifdef CONFIG_SCHED_DEBUG
+@@@ -1526,10 -1694,10 +1755,10 @@@ ttwu_stat(struct task_struct *p, int cp
+  #endif /* CONFIG_SCHEDSTATS */
+  }
+  
+- static void ttwu_activate(struct rq *rq, struct task_struct *p, int en_flags)
++ static inline void ttwu_activate(struct rq *rq, struct task_struct *p, int en_flags)
+  {
+  	activate_task(rq, p, en_flags);
+ -	p->on_rq = TASK_ON_RQ_QUEUED;
+ +	p->on_rq = 1;
+  
+  	/* if a worker is waking up, notify workqueue */
+  	if (p->flags & PF_WQ_WORKER)
+@@@ -4127,7 -3327,7 +4356,11 @@@ EXPORT_SYMBOL(sleep_on_timeout)
+   */
+  void rt_mutex_setprio(struct task_struct *p, int prio)
+  {
+++<<<<<<< HEAD
+ +	int oldprio, on_rq, running, enqueue_flag = 0;
+++=======
++ 	int oldprio, queued, running, enqueue_flag = ENQUEUE_RESTORE;
+++>>>>>>> 1de64443d755 (sched/core: Fix task and run queue sched_info::run_delay inconsistencies)
+  	struct rq *rq;
+  	const struct sched_class *prev_class;
+  
+@@@ -4156,12 -3356,12 +4389,17 @@@
+  	trace_sched_pi_setprio(p, prio);
+  	oldprio = p->prio;
+  	prev_class = p->sched_class;
+ -	queued = task_on_rq_queued(p);
+ +	on_rq = p->on_rq;
+  	running = task_current(rq, p);
+++<<<<<<< HEAD
+ +	if (on_rq)
+ +		dequeue_task(rq, p, 0);
+++=======
++ 	if (queued)
++ 		dequeue_task(rq, p, DEQUEUE_SAVE);
+++>>>>>>> 1de64443d755 (sched/core: Fix task and run queue sched_info::run_delay inconsistencies)
+  	if (running)
+ -		put_prev_task(rq, p);
+ +		p->sched_class->put_prev_task(rq, p);
+  
+  	/*
+  	 * Boosting condition are:
+@@@ -4175,9 -3375,9 +4413,9 @@@
+  	if (dl_prio(prio)) {
+  		struct task_struct *pi_task = rt_mutex_get_top_task(p);
+  		if (!dl_prio(p->normal_prio) ||
+ -		    (pi_task && dl_entity_preempt(&pi_task->dl, &p->dl))) {
+ +			(pi_task && dl_entity_preempt(&pi_task->dl, &p->dl))) {
+  			p->dl.dl_boosted = 1;
+- 			enqueue_flag = ENQUEUE_REPLENISH;
++ 			enqueue_flag |= ENQUEUE_REPLENISH;
+  		} else
+  			p->dl.dl_boosted = 0;
+  		p->sched_class = &dl_sched_class;
+@@@ -4229,9 -3435,9 +4467,15 @@@ void set_user_nice(struct task_struct *
+  		p->static_prio = NICE_TO_PRIO(nice);
+  		goto out_unlock;
+  	}
+++<<<<<<< HEAD
+ +	on_rq = p->on_rq;
+ +	if (on_rq)
+ +		dequeue_task(rq, p, 0);
+++=======
++ 	queued = task_on_rq_queued(p);
++ 	if (queued)
++ 		dequeue_task(rq, p, DEQUEUE_SAVE);
+++>>>>>>> 1de64443d755 (sched/core: Fix task and run queue sched_info::run_delay inconsistencies)
+  
+  	p->static_prio = NICE_TO_PRIO(nice);
+  	set_load_weight(p);
+@@@ -4239,8 -3445,8 +4483,13 @@@
+  	p->prio = effective_prio(p);
+  	delta = p->prio - old_prio;
+  
+++<<<<<<< HEAD
+ +	if (on_rq) {
+ +		enqueue_task(rq, p, 0);
+++=======
++ 	if (queued) {
++ 		enqueue_task(rq, p, ENQUEUE_RESTORE);
+++>>>>>>> 1de64443d755 (sched/core: Fix task and run queue sched_info::run_delay inconsistencies)
+  		/*
+  		 * If the task increased its priority or is running and
+  		 * lowered its priority, then reschedule its CPU:
+@@@ -4707,28 -3926,61 +4956,47 @@@ change
+  		return -EBUSY;
+  	}
+  
+ -	p->sched_reset_on_fork = reset_on_fork;
+ -	oldprio = p->prio;
+ -
+ -	if (pi) {
+ -		/*
+ -		 * Take priority boosted tasks into account. If the new
+ -		 * effective priority is unchanged, we just store the new
+ -		 * normal parameters and do not touch the scheduler class and
+ -		 * the runqueue. This will be done when the task deboost
+ -		 * itself.
+ -		 */
+ -		new_effective_prio = rt_mutex_get_effective_prio(p, newprio);
+ -		if (new_effective_prio == oldprio) {
+ -			__setscheduler_params(p, attr);
+ -			task_rq_unlock(rq, p, &flags);
+ -			return 0;
+ -		}
+ -	}
+ -
+ -	queued = task_on_rq_queued(p);
+ +	on_rq = p->on_rq;
+  	running = task_current(rq, p);
+++<<<<<<< HEAD
+ +	if (on_rq)
+ +		dequeue_task(rq, p, 0);
+++=======
++ 	if (queued)
++ 		dequeue_task(rq, p, DEQUEUE_SAVE);
+++>>>>>>> 1de64443d755 (sched/core: Fix task and run queue sched_info::run_delay inconsistencies)
+  	if (running)
+ -		put_prev_task(rq, p);
+ +		p->sched_class->put_prev_task(rq, p);
+ +
+ +	p->sched_reset_on_fork = reset_on_fork;
+  
+ +	oldprio = p->prio;
+  	prev_class = p->sched_class;
+ -	__setscheduler(rq, p, attr, pi);
+ +	__setscheduler(rq, p, attr);
+  
+  	if (running)
+  		p->sched_class->set_curr_task(rq);
+++<<<<<<< HEAD
+ +	if (on_rq)
+ +		enqueue_task(rq, p, 0);
+++=======
++ 	if (queued) {
++ 		int enqueue_flags = ENQUEUE_RESTORE;
++ 		/*
++ 		 * We enqueue to tail when the priority of a task is
++ 		 * increased (user space view).
++ 		 */
++ 		if (oldprio <= p->prio)
++ 			enqueue_flags |= ENQUEUE_HEAD;
++ 
++ 		enqueue_task(rq, p, enqueue_flags);
++ 	}
+++>>>>>>> 1de64443d755 (sched/core: Fix task and run queue sched_info::run_delay inconsistencies)
+  
+  	check_class_changed(rq, p, prev_class, oldprio);
+ -	preempt_disable(); /* avoid rq from going away on us */
+  	task_rq_unlock(rq, p, &flags);
+  
+ -	if (pi)
+ -		rt_mutex_adjust_pi(p);
+ -
+ -	/*
+ -	 * Run balance callbacks after we've adjusted the PI chain.
+ -	 */
+ -	balance_callback(rq);
+ -	preempt_enable();
+ +	rt_mutex_adjust_pi(p);
+  
+  	return 0;
+  }
+@@@ -6003,48 -5108,28 +6271,58 @@@ void sched_setnuma(struct task_struct *
+  {
+  	struct rq *rq;
+  	unsigned long flags;
+ -	bool queued, running;
+ +	bool on_rq, running;
+  
+  	rq = task_rq_lock(p, &flags);
+ -	queued = task_on_rq_queued(p);
+ +	on_rq = p->on_rq;
+  	running = task_current(rq, p);
+  
+++<<<<<<< HEAD
+ +	if (on_rq)
+ +		dequeue_task(rq, p, 0);
+++=======
++ 	if (queued)
++ 		dequeue_task(rq, p, DEQUEUE_SAVE);
+++>>>>>>> 1de64443d755 (sched/core: Fix task and run queue sched_info::run_delay inconsistencies)
+  	if (running)
+ -		put_prev_task(rq, p);
+ +		p->sched_class->put_prev_task(rq, p);
+  
+  	p->numa_preferred_nid = nid;
+  
+  	if (running)
+  		p->sched_class->set_curr_task(rq);
+++<<<<<<< HEAD
+ +	if (on_rq)
+ +		enqueue_task(rq, p, 0);
+++=======
++ 	if (queued)
++ 		enqueue_task(rq, p, ENQUEUE_RESTORE);
+++>>>>>>> 1de64443d755 (sched/core: Fix task and run queue sched_info::run_delay inconsistencies)
+  	task_rq_unlock(rq, p, &flags);
+  }
+ -#endif /* CONFIG_NUMA_BALANCING */
+ +#endif
+ +
+ +/*
+ + * migration_cpu_stop - this will be executed by a highprio stopper thread
+ + * and performs thread migration by bumping thread off CPU then
+ + * 'pushing' onto another runqueue.
+ + */
+ +static int migration_cpu_stop(void *data)
+ +{
+ +	struct migration_arg *arg = data;
+ +
+ +	/*
+ +	 * The original target cpu might have gone down and we might
+ +	 * be on another cpu but it doesn't matter.
+ +	 */
+ +	local_irq_disable();
+ +	__migrate_task(arg->task, raw_smp_processor_id(), arg->dest_cpu);
+ +	local_irq_enable();
+ +	return 0;
+ +}
+  
+  #ifdef CONFIG_HOTPLUG_CPU
+ +
+  /*
+   * Ensures that the idle task is using init_mm right before its cpu goes
+   * offline.
+@@@ -8816,12 -7740,12 +9094,17 @@@ void sched_move_task(struct task_struc
+  	rq = task_rq_lock(tsk, &flags);
+  
+  	running = task_current(rq, tsk);
+ -	queued = task_on_rq_queued(tsk);
+ +	on_rq = tsk->on_rq;
+  
+++<<<<<<< HEAD
+ +	if (on_rq)
+ +		dequeue_task(rq, tsk, 0);
+++=======
++ 	if (queued)
++ 		dequeue_task(rq, tsk, DEQUEUE_SAVE);
+++>>>>>>> 1de64443d755 (sched/core: Fix task and run queue sched_info::run_delay inconsistencies)
+  	if (unlikely(running))
+ -		put_prev_task(rq, tsk);
+ +		tsk->sched_class->put_prev_task(rq, tsk);
+  
+  	/*
+  	 * All callers are synchronized by task_rq_lock(); we do not use RCU
+@@@ -8842,8 -7766,8 +9125,13 @@@
+  
+  	if (unlikely(running))
+  		tsk->sched_class->set_curr_task(rq);
+++<<<<<<< HEAD
+ +	if (on_rq)
+ +		enqueue_task(rq, tsk, 0);
+++=======
++ 	if (queued)
++ 		enqueue_task(rq, tsk, ENQUEUE_RESTORE);
+++>>>>>>> 1de64443d755 (sched/core: Fix task and run queue sched_info::run_delay inconsistencies)
+  
+  	task_rq_unlock(rq, tsk, &flags);
+  }
+* Unmerged path kernel/sched/core.c
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 98cec6922405..8a68a8e7c84e 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1172,16 +1172,18 @@ static const u32 prio_to_wmult[40] = {
+  /*  15 */ 119304647, 148102320, 186737708, 238609294, 286331153,
+ };
+ 
+-#define ENQUEUE_WAKEUP		1
+-#define ENQUEUE_HEAD		2
++#define ENQUEUE_WAKEUP		0x01
++#define ENQUEUE_HEAD		0x02
+ #ifdef CONFIG_SMP
+-#define ENQUEUE_WAKING		4	/* sched_class::task_waking was called */
++#define ENQUEUE_WAKING		0x04	/* sched_class::task_waking was called */
+ #else
+-#define ENQUEUE_WAKING		0
++#define ENQUEUE_WAKING		0x00
+ #endif
+-#define ENQUEUE_REPLENISH	8
++#define ENQUEUE_REPLENISH	0x08
++#define ENQUEUE_RESTORE	0x10
+ 
+-#define DEQUEUE_SLEEP		1
++#define DEQUEUE_SLEEP		0x01
++#define DEQUEUE_SAVE		0x02
+ 
+ struct sched_class {
+ 	const struct sched_class *next;
