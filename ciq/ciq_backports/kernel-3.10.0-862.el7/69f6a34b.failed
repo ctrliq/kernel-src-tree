@@ -1,0 +1,315 @@
+seccomp: Replace BUG(!spin_is_locked()) with assert_spin_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Guenter Roeck <linux@roeck-us.net>
+commit 69f6a34bdeea4fec50bb90619bc9602973119572
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/69f6a34b.failed
+
+Current upstream kernel hangs with mips and powerpc targets in
+uniprocessor mode if SECCOMP is configured.
+
+Bisect points to commit dbd952127d11 ("seccomp: introduce writer locking").
+Turns out that code such as
+	BUG_ON(!spin_is_locked(&list_lock));
+can not be used in uniprocessor mode because spin_is_locked() always
+returns false in this configuration, and that assert_spin_locked()
+exists for that very purpose and must be used instead.
+
+Fixes: dbd952127d11 ("seccomp: introduce writer locking")
+	Cc: Kees Cook <keescook@chromium.org>
+	Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+(cherry picked from commit 69f6a34bdeea4fec50bb90619bc9602973119572)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/fork.c
+#	kernel/seccomp.c
+diff --cc kernel/fork.c
+index d1ed92efc038,0cf9cdb6e491..000000000000
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@@ -1183,13 -1096,37 +1183,24 @@@ static int copy_signal(unsigned long cl
+  	return 0;
+  }
+  
+ -static void copy_seccomp(struct task_struct *p)
+ +static void copy_flags(unsigned long clone_flags, struct task_struct *p)
+  {
+++<<<<<<< HEAD
+ +	unsigned long new_flags = p->flags;
+++=======
++ #ifdef CONFIG_SECCOMP
++ 	/*
++ 	 * Must be called with sighand->lock held, which is common to
++ 	 * all threads in the group. Holding cred_guard_mutex is not
++ 	 * needed because this new task is not yet running and cannot
++ 	 * be racing exec.
++ 	 */
++ 	assert_spin_locked(&current->sighand->siglock);
+++>>>>>>> 69f6a34bdeea (seccomp: Replace BUG(!spin_is_locked()) with assert_spin_lock)
+  
+ -	/* Ref-count the new filter user, and assign it. */
+ -	get_seccomp_filter(current);
+ -	p->seccomp = current->seccomp;
+ -
+ -	/*
+ -	 * Explicitly enable no_new_privs here in case it got set
+ -	 * between the task_struct being duplicated and holding the
+ -	 * sighand lock. The seccomp state and nnp must be in sync.
+ -	 */
+ -	if (task_no_new_privs(current))
+ -		task_set_no_new_privs(p);
+ -
+ -	/*
+ -	 * If the parent gained a seccomp mode after copying thread
+ -	 * flags and between before we held the sighand lock, we have
+ -	 * to manually enable the seccomp thread flag here.
+ -	 */
+ -	if (p->seccomp.mode != SECCOMP_MODE_DISABLED)
+ -		set_tsk_thread_flag(p, TIF_SECCOMP);
+ -#endif
+ +	new_flags &= ~(PF_SUPERPRIV | PF_WQ_WORKER);
+ +	new_flags |= PF_FORKNOEXEC;
+ +	p->flags = new_flags;
+  }
+  
+  SYSCALL_DEFINE1(set_tid_address, int __user *, tidptr)
+diff --cc kernel/seccomp.c
+index dab81904040f,44eb005c6695..000000000000
+--- a/kernel/seccomp.c
++++ b/kernel/seccomp.c
+@@@ -223,30 -203,149 +223,146 @@@ static u32 seccomp_run_filters(int sysc
+  
+  static inline bool seccomp_may_assign_mode(unsigned long seccomp_mode)
+  {
+++<<<<<<< HEAD
+++=======
++ 	assert_spin_locked(&current->sighand->siglock);
++ 
+++>>>>>>> 69f6a34bdeea (seccomp: Replace BUG(!spin_is_locked()) with assert_spin_lock)
+  	if (current->seccomp.mode && current->seccomp.mode != seccomp_mode)
+  		return false;
+  
+  	return true;
+  }
+  
+ -static inline void seccomp_assign_mode(struct task_struct *task,
+ -				       unsigned long seccomp_mode)
+ +static inline void seccomp_assign_mode(unsigned long seccomp_mode)
+  {
+++<<<<<<< HEAD
+ +	current->seccomp.mode = seccomp_mode;
+ +	set_tsk_thread_flag(current, TIF_SECCOMP);
+++=======
++ 	assert_spin_locked(&task->sighand->siglock);
++ 
++ 	task->seccomp.mode = seccomp_mode;
++ 	/*
++ 	 * Make sure TIF_SECCOMP cannot be set before the mode (and
++ 	 * filter) is set.
++ 	 */
++ 	smp_mb__before_atomic();
++ 	set_tsk_thread_flag(task, TIF_SECCOMP);
+++>>>>>>> 69f6a34bdeea (seccomp: Replace BUG(!spin_is_locked()) with assert_spin_lock)
+  }
+  
+  #ifdef CONFIG_SECCOMP_FILTER
+ -/* Returns 1 if the parent is an ancestor of the child. */
+ -static int is_ancestor(struct seccomp_filter *parent,
+ -		       struct seccomp_filter *child)
+ -{
+ -	/* NULL is the root ancestor. */
+ -	if (parent == NULL)
+ -		return 1;
+ -	for (; child; child = child->prev)
+ -		if (child == parent)
+ -			return 1;
+ -	return 0;
+ -}
+ -
+  /**
+++<<<<<<< HEAD
+ + * seccomp_attach_filter: Attaches a seccomp filter to current.
+++=======
++  * seccomp_can_sync_threads: checks if all threads can be synchronized
++  *
++  * Expects sighand and cred_guard_mutex locks to be held.
++  *
++  * Returns 0 on success, -ve on error, or the pid of a thread which was
++  * either not in the correct seccomp mode or it did not have an ancestral
++  * seccomp filter.
++  */
++ static inline pid_t seccomp_can_sync_threads(void)
++ {
++ 	struct task_struct *thread, *caller;
++ 
++ 	BUG_ON(!mutex_is_locked(&current->signal->cred_guard_mutex));
++ 	assert_spin_locked(&current->sighand->siglock);
++ 
++ 	/* Validate all threads being eligible for synchronization. */
++ 	caller = current;
++ 	for_each_thread(caller, thread) {
++ 		pid_t failed;
++ 
++ 		/* Skip current, since it is initiating the sync. */
++ 		if (thread == caller)
++ 			continue;
++ 
++ 		if (thread->seccomp.mode == SECCOMP_MODE_DISABLED ||
++ 		    (thread->seccomp.mode == SECCOMP_MODE_FILTER &&
++ 		     is_ancestor(thread->seccomp.filter,
++ 				 caller->seccomp.filter)))
++ 			continue;
++ 
++ 		/* Return the first thread that cannot be synchronized. */
++ 		failed = task_pid_vnr(thread);
++ 		/* If the pid cannot be resolved, then return -ESRCH */
++ 		if (unlikely(WARN_ON(failed == 0)))
++ 			failed = -ESRCH;
++ 		return failed;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * seccomp_sync_threads: sets all threads to use current's filter
++  *
++  * Expects sighand and cred_guard_mutex locks to be held, and for
++  * seccomp_can_sync_threads() to have returned success already
++  * without dropping the locks.
++  *
++  */
++ static inline void seccomp_sync_threads(void)
++ {
++ 	struct task_struct *thread, *caller;
++ 
++ 	BUG_ON(!mutex_is_locked(&current->signal->cred_guard_mutex));
++ 	assert_spin_locked(&current->sighand->siglock);
++ 
++ 	/* Synchronize all threads. */
++ 	caller = current;
++ 	for_each_thread(caller, thread) {
++ 		/* Skip current, since it needs no changes. */
++ 		if (thread == caller)
++ 			continue;
++ 
++ 		/* Get a task reference for the new leaf node. */
++ 		get_seccomp_filter(caller);
++ 		/*
++ 		 * Drop the task reference to the shared ancestor since
++ 		 * current's path will hold a reference.  (This also
++ 		 * allows a put before the assignment.)
++ 		 */
++ 		put_seccomp_filter(thread);
++ 		smp_store_release(&thread->seccomp.filter,
++ 				  caller->seccomp.filter);
++ 		/*
++ 		 * Opt the other thread into seccomp if needed.
++ 		 * As threads are considered to be trust-realm
++ 		 * equivalent (see ptrace_may_access), it is safe to
++ 		 * allow one thread to transition the other.
++ 		 */
++ 		if (thread->seccomp.mode == SECCOMP_MODE_DISABLED) {
++ 			/*
++ 			 * Don't let an unprivileged task work around
++ 			 * the no_new_privs restriction by creating
++ 			 * a thread that sets it up, enters seccomp,
++ 			 * then dies.
++ 			 */
++ 			if (task_no_new_privs(caller))
++ 				task_set_no_new_privs(thread);
++ 
++ 			seccomp_assign_mode(thread, SECCOMP_MODE_FILTER);
++ 		}
++ 	}
++ }
++ 
++ /**
++  * seccomp_prepare_filter: Prepares a seccomp filter for use.
+++>>>>>>> 69f6a34bdeea (seccomp: Replace BUG(!spin_is_locked()) with assert_spin_lock)
+   * @fprog: BPF program to install
+   *
+ - * Returns filter on success or an ERR_PTR on failure.
+ + * Returns 0 on success or an errno on failure.
+   */
+ -static struct seccomp_filter *seccomp_prepare_filter(struct sock_fprog *fprog)
+ +static long seccomp_attach_filter(struct sock_fprog *fprog)
+  {
+  	struct seccomp_filter *filter;
+ -	unsigned long fp_size;
+ -	struct sock_filter *fp;
+ -	int new_len;
+ +	unsigned long fp_size = fprog->len * sizeof(struct sock_filter);
+ +	unsigned long total_insns = fprog->len;
+  	long ret;
+  
+  	if (fprog->len == 0 || fprog->len > BPF_MAXINSNS)
+@@@ -325,9 -444,56 +441,60 @@@ long seccomp_attach_user_filter(char __
+  #endif
+  	if (copy_from_user(&fprog, user_filter, sizeof(fprog)))
+  		goto out;
+ -	filter = seccomp_prepare_filter(&fprog);
+ +	ret = seccomp_attach_filter(&fprog);
+  out:
+++<<<<<<< HEAD
+ +	return ret;
+++=======
++ 	return filter;
++ }
++ 
++ /**
++  * seccomp_attach_filter: validate and attach filter
++  * @flags:  flags to change filter behavior
++  * @filter: seccomp filter to add to the current process
++  *
++  * Caller must be holding current->sighand->siglock lock.
++  *
++  * Returns 0 on success, -ve on error.
++  */
++ static long seccomp_attach_filter(unsigned int flags,
++ 				  struct seccomp_filter *filter)
++ {
++ 	unsigned long total_insns;
++ 	struct seccomp_filter *walker;
++ 
++ 	assert_spin_locked(&current->sighand->siglock);
++ 
++ 	/* Validate resulting filter length. */
++ 	total_insns = filter->prog->len;
++ 	for (walker = current->seccomp.filter; walker; walker = walker->prev)
++ 		total_insns += walker->prog->len + 4;  /* 4 instr penalty */
++ 	if (total_insns > MAX_INSNS_PER_PATH)
++ 		return -ENOMEM;
++ 
++ 	/* If thread sync has been requested, check that it is possible. */
++ 	if (flags & SECCOMP_FILTER_FLAG_TSYNC) {
++ 		int ret;
++ 
++ 		ret = seccomp_can_sync_threads();
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	/*
++ 	 * If there is an existing filter, make it the prev and don't drop its
++ 	 * task reference.
++ 	 */
++ 	filter->prev = current->seccomp.filter;
++ 	current->seccomp.filter = filter;
++ 
++ 	/* Now that the new filter is in place, synchronize to all threads. */
++ 	if (flags & SECCOMP_FILTER_FLAG_TSYNC)
++ 		seccomp_sync_threads();
++ 
++ 	return 0;
+++>>>>>>> 69f6a34bdeea (seccomp: Replace BUG(!spin_is_locked()) with assert_spin_lock)
+  }
+  
+  /* get_seccomp_filter - increments the reference count of the filter on @tsk */
+* Unmerged path kernel/fork.c
+* Unmerged path kernel/seccomp.c
