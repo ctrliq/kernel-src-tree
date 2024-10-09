@@ -1,0 +1,274 @@
+platform/x86: wmi: release mutex on module acquistion failure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [platform] x86: wmi: release mutex on module acquistion failure (Jarod Wilson) [1562200]
+Rebuild_FUZZ: 92.04%
+commit-author Mario Limonciello <mario.limonciello@dell.com>
+commit 5e3e22971fb0b0d7d03286f1a619d0348748a243
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/5e3e2297.failed
+
+This failure mode should have also released the mutex.
+
+	Signed-off-by: Mario Limonciello <mario.limonciello@dell.com>
+	Signed-off-by: Darren Hart (VMware) <dvhart@infradead.org>
+(cherry picked from commit 5e3e22971fb0b0d7d03286f1a619d0348748a243)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/platform/x86/wmi.c
+diff --cc drivers/platform/x86/wmi.c
+index ce57af6635c6,791449a2370f..000000000000
+--- a/drivers/platform/x86/wmi.c
++++ b/drivers/platform/x86/wmi.c
+@@@ -671,22 -789,236 +671,206 @@@ static int wmi_dev_uevent(struct devic
+  
+  	return 0;
+  }
+ -static int wmi_char_open(struct inode *inode, struct file *filp)
+ -{
+ -	const char *driver_name = filp->f_path.dentry->d_iname;
+ -	struct wmi_block *wblock = NULL;
+ -	struct wmi_block *next = NULL;
+ -
+ -	list_for_each_entry_safe(wblock, next, &wmi_block_list, list) {
+ -		if (!wblock->dev.dev.driver)
+ -			continue;
+ -		if (strcmp(driver_name, wblock->dev.dev.driver->name) == 0) {
+ -			filp->private_data = wblock;
+ -			break;
+ -		}
+ -	}
+  
+ -	if (!filp->private_data)
+ -		return -ENODEV;
+ +static void wmi_dev_free(struct device *dev)
+ +{
+ +	struct wmi_block *wmi_block = container_of(dev, struct wmi_block, dev);
+  
+ -	return nonseekable_open(inode, filp);
+ +	kfree(wmi_block);
+  }
+  
+++<<<<<<< HEAD
+ +static struct class wmi_class = {
+++=======
++ static ssize_t wmi_char_read(struct file *filp, char __user *buffer,
++ 	size_t length, loff_t *offset)
++ {
++ 	struct wmi_block *wblock = filp->private_data;
++ 
++ 	return simple_read_from_buffer(buffer, length, offset,
++ 				       &wblock->req_buf_size,
++ 				       sizeof(wblock->req_buf_size));
++ }
++ 
++ static long wmi_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++ {
++ 	struct wmi_ioctl_buffer __user *input =
++ 		(struct wmi_ioctl_buffer __user *) arg;
++ 	struct wmi_block *wblock = filp->private_data;
++ 	struct wmi_ioctl_buffer *buf = NULL;
++ 	struct wmi_driver *wdriver = NULL;
++ 	int ret;
++ 
++ 	if (_IOC_TYPE(cmd) != WMI_IOC)
++ 		return -ENOTTY;
++ 
++ 	/* make sure we're not calling a higher instance than exists*/
++ 	if (_IOC_NR(cmd) >= wblock->gblock.instance_count)
++ 		return -EINVAL;
++ 
++ 	mutex_lock(&wblock->char_mutex);
++ 	buf = wblock->handler_data;
++ 	if (get_user(buf->length, &input->length)) {
++ 		dev_dbg(&wblock->dev.dev, "Read length from user failed\n");
++ 		ret = -EFAULT;
++ 		goto out_ioctl;
++ 	}
++ 	/* if it's too small, abort */
++ 	if (buf->length < wblock->req_buf_size) {
++ 		dev_err(&wblock->dev.dev,
++ 			"Buffer %lld too small, need at least %lld\n",
++ 			buf->length, wblock->req_buf_size);
++ 		ret = -EINVAL;
++ 		goto out_ioctl;
++ 	}
++ 	/* if it's too big, warn, driver will only use what is needed */
++ 	if (buf->length > wblock->req_buf_size)
++ 		dev_warn(&wblock->dev.dev,
++ 			"Buffer %lld is bigger than required %lld\n",
++ 			buf->length, wblock->req_buf_size);
++ 
++ 	/* copy the structure from userspace */
++ 	if (copy_from_user(buf, input, wblock->req_buf_size)) {
++ 		dev_dbg(&wblock->dev.dev, "Copy %llu from user failed\n",
++ 			wblock->req_buf_size);
++ 		ret = -EFAULT;
++ 		goto out_ioctl;
++ 	}
++ 
++ 	/* let the driver do any filtering and do the call */
++ 	wdriver = container_of(wblock->dev.dev.driver,
++ 			       struct wmi_driver, driver);
++ 	if (!try_module_get(wdriver->driver.owner)) {
++ 		ret = -EBUSY;
++ 		goto out_ioctl;
++ 	}
++ 	ret = wdriver->filter_callback(&wblock->dev, cmd, buf);
++ 	module_put(wdriver->driver.owner);
++ 	if (ret)
++ 		goto out_ioctl;
++ 
++ 	/* return the result (only up to our internal buffer size) */
++ 	if (copy_to_user(input, buf, wblock->req_buf_size)) {
++ 		dev_dbg(&wblock->dev.dev, "Copy %llu to user failed\n",
++ 			wblock->req_buf_size);
++ 		ret = -EFAULT;
++ 	}
++ 
++ out_ioctl:
++ 	mutex_unlock(&wblock->char_mutex);
++ 	return ret;
++ }
++ 
++ static const struct file_operations wmi_fops = {
++ 	.owner		= THIS_MODULE,
++ 	.read		= wmi_char_read,
++ 	.open		= wmi_char_open,
++ 	.unlocked_ioctl	= wmi_ioctl,
++ 	.compat_ioctl	= wmi_ioctl,
++ };
++ 
++ static int wmi_dev_probe(struct device *dev)
++ {
++ 	struct wmi_block *wblock = dev_to_wblock(dev);
++ 	struct wmi_driver *wdriver =
++ 		container_of(dev->driver, struct wmi_driver, driver);
++ 	int ret = 0;
++ 	int count;
++ 	char *buf;
++ 
++ 	if (ACPI_FAILURE(wmi_method_enable(wblock, 1)))
++ 		dev_warn(dev, "failed to enable device -- probing anyway\n");
++ 
++ 	if (wdriver->probe) {
++ 		ret = wdriver->probe(dev_to_wdev(dev));
++ 		if (ret != 0)
++ 			goto probe_failure;
++ 	}
++ 
++ 	/* driver wants a character device made */
++ 	if (wdriver->filter_callback) {
++ 		/* check that required buffer size declared by driver or MOF */
++ 		if (!wblock->req_buf_size) {
++ 			dev_err(&wblock->dev.dev,
++ 				"Required buffer size not set\n");
++ 			ret = -EINVAL;
++ 			goto probe_failure;
++ 		}
++ 
++ 		count = get_order(wblock->req_buf_size);
++ 		wblock->handler_data = (void *)__get_free_pages(GFP_KERNEL,
++ 								count);
++ 		if (!wblock->handler_data) {
++ 			ret = -ENOMEM;
++ 			goto probe_failure;
++ 		}
++ 
++ 		buf = kmalloc(strlen(wdriver->driver.name) + 4, GFP_KERNEL);
++ 		if (!buf) {
++ 			ret = -ENOMEM;
++ 			goto probe_string_failure;
++ 		}
++ 		sprintf(buf, "wmi/%s", wdriver->driver.name);
++ 		wblock->char_dev.minor = MISC_DYNAMIC_MINOR;
++ 		wblock->char_dev.name = buf;
++ 		wblock->char_dev.fops = &wmi_fops;
++ 		wblock->char_dev.mode = 0444;
++ 		ret = misc_register(&wblock->char_dev);
++ 		if (ret) {
++ 			dev_warn(dev, "failed to register char dev: %d", ret);
++ 			ret = -ENOMEM;
++ 			goto probe_misc_failure;
++ 		}
++ 	}
++ 
++ 	return 0;
++ 
++ probe_misc_failure:
++ 	kfree(buf);
++ probe_string_failure:
++ 	kfree(wblock->handler_data);
++ probe_failure:
++ 	if (ACPI_FAILURE(wmi_method_enable(wblock, 0)))
++ 		dev_warn(dev, "failed to disable device\n");
++ 	return ret;
++ }
++ 
++ static int wmi_dev_remove(struct device *dev)
++ {
++ 	struct wmi_block *wblock = dev_to_wblock(dev);
++ 	struct wmi_driver *wdriver =
++ 		container_of(dev->driver, struct wmi_driver, driver);
++ 	int ret = 0;
++ 
++ 	if (wdriver->filter_callback) {
++ 		misc_deregister(&wblock->char_dev);
++ 		kfree(wblock->char_dev.name);
++ 		free_pages((unsigned long)wblock->handler_data,
++ 			   get_order(wblock->req_buf_size));
++ 	}
++ 
++ 	if (wdriver->remove)
++ 		ret = wdriver->remove(dev_to_wdev(dev));
++ 
++ 	if (ACPI_FAILURE(wmi_method_enable(wblock, 0)))
++ 		dev_warn(dev, "failed to disable device\n");
++ 
++ 	return ret;
++ }
++ 
++ static struct class wmi_bus_class = {
++ 	.name = "wmi_bus",
++ };
++ 
++ static struct bus_type wmi_bus_type = {
+++>>>>>>> 5e3e22971fb0 (platform/x86: wmi: release mutex on module acquistion failure)
+  	.name = "wmi",
+ +	.dev_release = wmi_dev_free,
+ +	.dev_uevent = wmi_dev_uevent,
+  	.dev_groups = wmi_groups,
+ -	.match = wmi_dev_match,
+ -	.uevent = wmi_dev_uevent,
+ -	.probe = wmi_dev_probe,
+ -	.remove = wmi_dev_remove,
+ -};
+ -
+ -static struct device_type wmi_type_event = {
+ -	.name = "event",
+ -	.groups = wmi_event_groups,
+ -	.release = wmi_dev_release,
+ -};
+ -
+ -static struct device_type wmi_type_method = {
+ -	.name = "method",
+ -	.groups = wmi_method_groups,
+ -	.release = wmi_dev_release,
+ -};
+ -
+ -static struct device_type wmi_type_data = {
+ -	.name = "data",
+ -	.groups = wmi_data_groups,
+ -	.release = wmi_dev_release,
+  };
+  
+ -static int wmi_create_device(struct device *wmi_bus_dev,
+ -			     const struct guid_block *gblock,
+ +static int wmi_create_device(const struct guid_block *gblock,
+  			     struct wmi_block *wblock,
+  			     struct acpi_device *device)
+  {
+* Unmerged path drivers/platform/x86/wmi.c
