@@ -1,0 +1,191 @@
+net/mlx5e: IPoIB, Basic netdev ndos open/close
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: IPoIB, Basic netdev ndos open/close (Don Dutile) [1385325 1499362]
+Rebuild_FUZZ: 95.45%
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit 603f4a45214d602f27749ad8b3bb6bd767dac2d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/603f4a45.failed
+
+Implement open/close of IPoIB netdevice ndos using mlx5e's
+channels API to manage data path resources (RQs/SQs/CQs).
+
+Set IPoIB netdev address on dev_init ndo.
+
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Reviewed-by: Erez Shitrit <erezsh@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 603f4a45214d602f27749ad8b3bb6bd767dac2d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/ipoib.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index f6e3d4bf0928,23b92ec54e12..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -794,6 -871,21 +794,24 @@@ void mlx5e_build_indir_tir_ctx_hash(str
+  
+  int mlx5e_open_locked(struct net_device *netdev);
+  int mlx5e_close_locked(struct net_device *netdev);
+++<<<<<<< HEAD
+++=======
++ 
++ int mlx5e_open_channels(struct mlx5e_priv *priv,
++ 			struct mlx5e_channels *chs);
++ void mlx5e_close_channels(struct mlx5e_channels *chs);
++ 
++ /* Function pointer to be used to modify WH settings while
++  * switching channels
++  */
++ typedef int (*mlx5e_fp_hw_modify)(struct mlx5e_priv *priv);
++ void mlx5e_switch_priv_channels(struct mlx5e_priv *priv,
++ 				struct mlx5e_channels *new_chs,
++ 				mlx5e_fp_hw_modify hw_modify);
++ void mlx5e_activate_priv_channels(struct mlx5e_priv *priv);
++ void mlx5e_deactivate_priv_channels(struct mlx5e_priv *priv);
++ 
+++>>>>>>> 603f4a45214d (net/mlx5e: IPoIB, Basic netdev ndos open/close)
+  void mlx5e_build_default_indir_rqt(struct mlx5_core_dev *mdev,
+  				   u32 *indirection_rqt, int len,
+  				   int num_channels);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index fc92406a15c4,eb657987e9b5..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -2195,6 -2528,89 +2195,92 @@@ static void mlx5e_netdev_set_tcs(struc
+  		netdev_set_tc_queue(netdev, tc, nch, 0);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void mlx5e_build_channels_tx_maps(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5e_channel *c;
++ 	struct mlx5e_txqsq *sq;
++ 	int i, tc;
++ 
++ 	for (i = 0; i < priv->channels.num; i++)
++ 		for (tc = 0; tc < priv->profile->max_tc; tc++)
++ 			priv->channel_tc2txq[i][tc] = i + tc * priv->channels.num;
++ 
++ 	for (i = 0; i < priv->channels.num; i++) {
++ 		c = priv->channels.c[i];
++ 		for (tc = 0; tc < c->num_tc; tc++) {
++ 			sq = &c->sq[tc];
++ 			priv->txq2sq[sq->txq_ix] = sq;
++ 		}
++ 	}
++ }
++ 
++ void mlx5e_activate_priv_channels(struct mlx5e_priv *priv)
++ {
++ 	int num_txqs = priv->channels.num * priv->channels.params.num_tc;
++ 	struct net_device *netdev = priv->netdev;
++ 
++ 	mlx5e_netdev_set_tcs(netdev);
++ 	netif_set_real_num_tx_queues(netdev, num_txqs);
++ 	netif_set_real_num_rx_queues(netdev, priv->channels.num);
++ 
++ 	mlx5e_build_channels_tx_maps(priv);
++ 	mlx5e_activate_channels(&priv->channels);
++ 	netif_tx_start_all_queues(priv->netdev);
++ 
++ 	if (MLX5_CAP_GEN(priv->mdev, vport_group_manager))
++ 		mlx5e_add_sqs_fwd_rules(priv);
++ 
++ 	mlx5e_wait_channels_min_rx_wqes(&priv->channels);
++ 	mlx5e_redirect_rqts_to_channels(priv, &priv->channels);
++ }
++ 
++ void mlx5e_deactivate_priv_channels(struct mlx5e_priv *priv)
++ {
++ 	mlx5e_redirect_rqts_to_drop(priv);
++ 
++ 	if (MLX5_CAP_GEN(priv->mdev, vport_group_manager))
++ 		mlx5e_remove_sqs_fwd_rules(priv);
++ 
++ 	/* FIXME: This is a W/A only for tx timeout watch dog false alarm when
++ 	 * polling for inactive tx queues.
++ 	 */
++ 	netif_tx_stop_all_queues(priv->netdev);
++ 	netif_tx_disable(priv->netdev);
++ 	mlx5e_deactivate_channels(&priv->channels);
++ }
++ 
++ void mlx5e_switch_priv_channels(struct mlx5e_priv *priv,
++ 				struct mlx5e_channels *new_chs,
++ 				mlx5e_fp_hw_modify hw_modify)
++ {
++ 	struct net_device *netdev = priv->netdev;
++ 	int new_num_txqs;
++ 
++ 	new_num_txqs = new_chs->num * new_chs->params.num_tc;
++ 
++ 	netif_carrier_off(netdev);
++ 
++ 	if (new_num_txqs < netdev->real_num_tx_queues)
++ 		netif_set_real_num_tx_queues(netdev, new_num_txqs);
++ 
++ 	mlx5e_deactivate_priv_channels(priv);
++ 	mlx5e_close_channels(&priv->channels);
++ 
++ 	priv->channels = *new_chs;
++ 
++ 	/* New channels are ready to roll, modify HW settings if needed */
++ 	if (hw_modify)
++ 		hw_modify(priv);
++ 
++ 	mlx5e_refresh_tirs(priv, false);
++ 	mlx5e_activate_priv_channels(priv);
++ 
++ 	mlx5e_update_carrier(priv);
++ }
++ 
+++>>>>>>> 603f4a45214d (net/mlx5e: IPoIB, Basic netdev ndos open/close)
+  int mlx5e_open_locked(struct net_device *netdev)
+  {
+  	struct mlx5e_priv *priv = netdev_priv(netdev);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/ipoib.c
+index 2f65927a8d03,e188d067bc97..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib.c
+@@@ -44,8 -56,25 +56,30 @@@ static void mlx5i_init(struct mlx5_core
+  {
+  	struct mlx5e_priv *priv  = mlx5i_epriv(netdev);
+  
+++<<<<<<< HEAD
+ +	priv->ppriv = ppriv;
+ +	/*  TODO: init netdev and mlx5e_params here */
+++=======
++ 	priv->mdev        = mdev;
++ 	priv->netdev      = netdev;
++ 	priv->profile     = profile;
++ 	priv->ppriv       = ppriv;
++ 
++ 	mlx5e_build_nic_params(mdev, &priv->channels.params, profile->max_nch(mdev));
++ 
++ 	mutex_init(&priv->state_lock);
++ 
++ 	netdev->hw_features    |= NETIF_F_SG;
++ 	netdev->hw_features    |= NETIF_F_IP_CSUM;
++ 	netdev->hw_features    |= NETIF_F_IPV6_CSUM;
++ 	netdev->hw_features    |= NETIF_F_GRO;
++ 	netdev->hw_features    |= NETIF_F_TSO;
++ 	netdev->hw_features    |= NETIF_F_TSO6;
++ 	netdev->hw_features    |= NETIF_F_RXCSUM;
++ 	netdev->hw_features    |= NETIF_F_RXHASH;
++ 
++ 	netdev->netdev_ops = &mlx5i_netdev_ops;
+++>>>>>>> 603f4a45214d (net/mlx5e: IPoIB, Basic netdev ndos open/close)
+  }
+  
+  /* Called directly before IPoIB netdevice is destroyed to cleanup SW structs */
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/ipoib.c
