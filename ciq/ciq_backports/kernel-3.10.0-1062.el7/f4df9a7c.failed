@@ -1,0 +1,501 @@
+RDMA: Use GID from the ib_gid_attr during the add_gid() callback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Parav Pandit <parav@mellanox.com>
+commit f4df9a7c34d8f9e84af73ce187bcdf6fea65c4cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/f4df9a7c.failed
+
+Now that ib_gid_attr contains the GID, make use of that in the add_gid()
+callback functions for the provider drivers to simplify the add_gid()
+implementations.
+
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit f4df9a7c34d8f9e84af73ce187bcdf6fea65c4cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/cache.c
+#	drivers/infiniband/hw/bnxt_re/ib_verbs.c
+#	drivers/infiniband/hw/bnxt_re/ib_verbs.h
+#	drivers/infiniband/hw/hns/hns_roce_device.h
+#	drivers/infiniband/hw/hns/hns_roce_hw_v1.c
+#	drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+#	drivers/infiniband/hw/hns/hns_roce_main.c
+#	drivers/infiniband/hw/mlx4/main.c
+#	drivers/infiniband/hw/mlx5/main.c
+#	drivers/infiniband/hw/vmw_pvrdma/pvrdma_main.c
+#	include/rdma/ib_verbs.h
+diff --cc drivers/infiniband/core/cache.c
+index 235416ffd0cc,e569956c4e7a..000000000000
+--- a/drivers/infiniband/core/cache.c
++++ b/drivers/infiniband/core/cache.c
+@@@ -163,65 -183,183 +163,147 @@@ int ib_cache_gid_parse_type_str(const c
+  }
+  EXPORT_SYMBOL(ib_cache_gid_parse_type_str);
+  
+ -static struct ib_gid_table *rdma_gid_table(struct ib_device *device, u8 port)
+ -{
+ -	return device->cache.ports[port - rdma_start_port(device)].gid;
+ -}
+ -
+ -static bool is_gid_entry_free(const struct ib_gid_table_entry *entry)
+ -{
+ -	return !entry;
+ -}
+ -
+ -static bool is_gid_entry_valid(const struct ib_gid_table_entry *entry)
+ -{
+ -	return entry && entry->state == GID_TABLE_ENTRY_VALID;
+ -}
+ -
+ -static void schedule_free_gid(struct kref *kref)
+ -{
+ -	struct ib_gid_table_entry *entry =
+ -			container_of(kref, struct ib_gid_table_entry, kref);
+ -
+ -	queue_work(ib_wq, &entry->del_work);
+ -}
+ -
+ -static void free_gid_entry(struct ib_gid_table_entry *entry)
+ -{
+ -	struct ib_device *device = entry->attr.device;
+ -	u8 port_num = entry->attr.port_num;
+ -	struct ib_gid_table *table = rdma_gid_table(device, port_num);
+ -
+ -	pr_debug("%s device=%s port=%d index=%d gid %pI6\n", __func__,
+ -		 device->name, port_num, entry->attr.index,
+ -		 entry->attr.gid.raw);
+ -
+ -	mutex_lock(&table->lock);
+ -	if (rdma_cap_roce_gid_table(device, port_num) &&
+ -	    entry->state != GID_TABLE_ENTRY_INVALID)
+ -		device->del_gid(&entry->attr, &entry->context);
+ -	write_lock_irq(&table->rwlock);
+ -
+ -	/*
+ -	 * The only way to avoid overwriting NULL in table is
+ -	 * by comparing if it is same entry in table or not!
+ -	 * If new entry in table is added by the time we free here,
+ -	 * don't overwrite the table entry.
+ -	 */
+ -	if (entry == table->data_vec[entry->attr.index])
+ -		table->data_vec[entry->attr.index] = NULL;
+ -	/* Now this index is ready to be allocated */
+ -	write_unlock_irq(&table->rwlock);
+ -	mutex_unlock(&table->lock);
+ -
+ -	if (entry->attr.ndev)
+ -		dev_put(entry->attr.ndev);
+ -	kfree(entry);
+ -}
+ -
+ -/**
+ - * free_gid_work - Release reference to the GID entry
+ - * @work: Work structure to refer to GID entry which needs to be
+ - * deleted.
+ - *
+ - * free_gid_work() frees the entry from the HCA's hardware table
+ - * if provider supports it. It releases reference to netdevice.
+ +/* This function expects that rwlock will be write locked in all
+ + * scenarios and that lock will be locked in sleep-able (RoCE)
+ + * scenarios.
+   */
+ -static void free_gid_work(struct work_struct *work)
+ +static int write_gid(struct ib_device *ib_dev, u8 port,
+ +		     struct ib_gid_table *table, int ix,
+ +		     const union ib_gid *gid,
+ +		     const struct ib_gid_attr *attr,
+ +		     enum gid_table_write_action action,
+ +		     bool  default_gid)
+ +	__releases(&table->rwlock) __acquires(&table->rwlock)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct ib_gid_table_entry *entry =
++ 		container_of(work, struct ib_gid_table_entry, del_work);
++ 	free_gid_entry(entry);
++ }
++ 
++ static struct ib_gid_table_entry *
++ alloc_gid_entry(const struct ib_gid_attr *attr)
++ {
++ 	struct ib_gid_table_entry *entry;
++ 
++ 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
++ 	if (!entry)
++ 		return NULL;
++ 	kref_init(&entry->kref);
++ 	memcpy(&entry->attr, attr, sizeof(*attr));
++ 	if (entry->attr.ndev)
++ 		dev_hold(entry->attr.ndev);
++ 	INIT_WORK(&entry->del_work, free_gid_work);
++ 	entry->state = GID_TABLE_ENTRY_INVALID;
++ 	return entry;
++ }
++ 
++ static void store_gid_entry(struct ib_gid_table *table,
++ 			    struct ib_gid_table_entry *entry)
++ {
++ 	entry->state = GID_TABLE_ENTRY_VALID;
++ 
++ 	pr_debug("%s device=%s port=%d index=%d gid %pI6\n", __func__,
++ 		 entry->attr.device->name, entry->attr.port_num,
++ 		 entry->attr.index, entry->attr.gid.raw);
++ 
++ 	lockdep_assert_held(&table->lock);
++ 	write_lock_irq(&table->rwlock);
++ 	table->data_vec[entry->attr.index] = entry;
++ 	write_unlock_irq(&table->rwlock);
++ }
++ 
++ static void put_gid_entry(struct ib_gid_table_entry *entry)
++ {
++ 	kref_put(&entry->kref, schedule_free_gid);
++ }
++ 
++ static int add_roce_gid(struct ib_gid_table_entry *entry)
++ {
++ 	const struct ib_gid_attr *attr = &entry->attr;
++ 	int ret;
++ 
++ 	if (!attr->ndev) {
++ 		pr_err("%s NULL netdev device=%s port=%d index=%d\n",
++ 		       __func__, attr->device->name, attr->port_num,
++ 		       attr->index);
++ 		return -EINVAL;
++ 	}
++ 	if (rdma_cap_roce_gid_table(attr->device, attr->port_num)) {
++ 		ret = attr->device->add_gid(attr, &entry->context);
++ 		if (ret) {
++ 			pr_err("%s GID add failed device=%s port=%d index=%d\n",
++ 			       __func__, attr->device->name, attr->port_num,
++ 			       attr->index);
++ 			return ret;
++ 		}
++ 	}
++ 	return 0;
++ }
++ 
++ /**
++  * add_modify_gid - Add or modify GID table entry
++  *
++  * @table:	GID table in which GID to be added or modified
++  * @attr:	Attributes of the GID
++  *
++  * Returns 0 on success or appropriate error code. It accepts zero
++  * GID addition for non RoCE ports for HCA's who report them as valid
++  * GID. However such zero GIDs are not added to the cache.
++  */
++ static int add_modify_gid(struct ib_gid_table *table,
++ 			  const struct ib_gid_attr *attr)
++ {
++ 	struct ib_gid_table_entry *entry;
+++>>>>>>> f4df9a7c34d8 (RDMA: Use GID from the ib_gid_attr during the add_gid() callback)
+  	int ret = 0;
+ +	struct net_device *old_net_dev;
+ +	enum ib_gid_type old_gid_type;
+  
+ -	/*
+ -	 * Invalidate any old entry in the table to make it safe to write to
+ -	 * this index.
+ +	/* in rdma_cap_roce_gid_table, this funciton should be protected by a
+ +	 * sleep-able lock.
+  	 */
+ -	if (is_gid_entry_valid(table->data_vec[attr->index]))
+ -		put_gid_entry(table->data_vec[attr->index]);
+  
+ -	/*
+ -	 * Some HCA's report multiple GID entries with only one valid GID, and
+ -	 * leave other unused entries as the zero GID. Convert zero GIDs to
+ -	 * empty table entries instead of storing them.
+ -	 */
+ -	if (rdma_is_zero_gid(&attr->gid))
+ -		return 0;
+ +	if (rdma_cap_roce_gid_table(ib_dev, port)) {
+ +		table->data_vec[ix].props |= GID_TABLE_ENTRY_INVALID;
+ +		write_unlock_irq(&table->rwlock);
+ +		/* GID_TABLE_WRITE_ACTION_MODIFY currently isn't supported by
+ +		 * RoCE providers and thus only updates the cache.
+ +		 */
+ +		if (action == GID_TABLE_WRITE_ACTION_ADD)
+ +			ret = ib_dev->add_gid(ib_dev, port, ix, gid, attr,
+ +					      &table->data_vec[ix].context);
+ +		else if (action == GID_TABLE_WRITE_ACTION_DEL)
+ +			ret = ib_dev->del_gid(ib_dev, port, ix,
+ +					      &table->data_vec[ix].context);
+ +		write_lock_irq(&table->rwlock);
+ +	}
+  
+ -	entry = alloc_gid_entry(attr);
+ -	if (!entry)
+ -		return -ENOMEM;
+ +	old_net_dev = table->data_vec[ix].attr.ndev;
+ +	old_gid_type = table->data_vec[ix].attr.gid_type;
+ +	if (old_net_dev && old_net_dev != attr->ndev)
+ +		dev_put(old_net_dev);
+ +	/* if modify_gid failed, just delete the old gid */
+ +	if (ret || action == GID_TABLE_WRITE_ACTION_DEL) {
+ +		gid = &zgid;
+ +		attr = &zattr;
+ +		table->data_vec[ix].context = NULL;
+ +	}
+  
+ -	if (rdma_protocol_roce(attr->device, attr->port_num)) {
+ -		ret = add_roce_gid(entry);
+ -		if (ret)
+ -			goto done;
+ +	memcpy(&table->data_vec[ix].gid, gid, sizeof(*gid));
+ +	memcpy(&table->data_vec[ix].attr, attr, sizeof(*attr));
+ +	if (default_gid) {
+ +		table->data_vec[ix].props |= GID_TABLE_ENTRY_DEFAULT;
+ +		if (action == GID_TABLE_WRITE_ACTION_DEL)
+ +			table->data_vec[ix].attr.gid_type = old_gid_type;
+  	}
+ +	if (table->data_vec[ix].attr.ndev &&
+ +	    table->data_vec[ix].attr.ndev != old_net_dev)
+ +		dev_hold(table->data_vec[ix].attr.ndev);
+  
+ -	store_gid_entry(table, entry);
+ -	return 0;
+ +	table->data_vec[ix].props &= ~GID_TABLE_ENTRY_INVALID;
+  
+ -done:
+ -	put_gid_entry(entry);
+  	return ret;
+  }
+  
+diff --cc drivers/infiniband/hw/bnxt_re/ib_verbs.c
+index 8301d7e5fa8c,62eb9e3346d5..000000000000
+--- a/drivers/infiniband/hw/bnxt_re/ib_verbs.c
++++ b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+@@@ -365,9 -364,7 +365,13 @@@ int bnxt_re_del_gid(struct ib_device *i
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +int bnxt_re_add_gid(struct ib_device *ibdev, u8 port_num,
+ +		    unsigned int index, const union ib_gid *gid,
+ +		    const struct ib_gid_attr *attr, void **context)
+++=======
++ int bnxt_re_add_gid(const struct ib_gid_attr *attr, void **context)
+++>>>>>>> f4df9a7c34d8 (RDMA: Use GID from the ib_gid_attr during the add_gid() callback)
+  {
+  	int rc;
+  	u32 tbl_idx = 0;
+diff --cc drivers/infiniband/hw/bnxt_re/ib_verbs.h
+index e62b7c2c7da6,bd04d40d897a..000000000000
+--- a/drivers/infiniband/hw/bnxt_re/ib_verbs.h
++++ b/drivers/infiniband/hw/bnxt_re/ib_verbs.h
+@@@ -157,11 -157,8 +157,16 @@@ int bnxt_re_get_port_immutable(struct i
+  void bnxt_re_query_fw_str(struct ib_device *ibdev, char *str);
+  int bnxt_re_query_pkey(struct ib_device *ibdev, u8 port_num,
+  		       u16 index, u16 *pkey);
+++<<<<<<< HEAD
+ +int bnxt_re_del_gid(struct ib_device *ibdev, u8 port_num,
+ +		    unsigned int index, void **context);
+ +int bnxt_re_add_gid(struct ib_device *ibdev, u8 port_num,
+ +		    unsigned int index, const union ib_gid *gid,
+ +		    const struct ib_gid_attr *attr, void **context);
+++=======
++ int bnxt_re_del_gid(const struct ib_gid_attr *attr, void **context);
++ int bnxt_re_add_gid(const struct ib_gid_attr *attr, void **context);
+++>>>>>>> f4df9a7c34d8 (RDMA: Use GID from the ib_gid_attr during the add_gid() callback)
+  int bnxt_re_query_gid(struct ib_device *ibdev, u8 port_num,
+  		      int index, union ib_gid *gid);
+  enum rdma_link_layer bnxt_re_get_link_layer(struct ib_device *ibdev,
+diff --cc drivers/infiniband/hw/mlx4/main.c
+index dfb86d79ccd8,859089df9f17..000000000000
+--- a/drivers/infiniband/hw/mlx4/main.c
++++ b/drivers/infiniband/hw/mlx4/main.c
+@@@ -243,14 -246,9 +243,18 @@@ static int mlx4_ib_update_gids(struct g
+  	return mlx4_ib_update_gids_v1(gids, ibdev, port_num);
+  }
+  
+++<<<<<<< HEAD
+ +static int mlx4_ib_add_gid(struct ib_device *device,
+ +			   u8 port_num,
+ +			   unsigned int index,
+ +			   const union ib_gid *gid,
+ +			   const struct ib_gid_attr *attr,
+ +			   void **context)
+++=======
++ static int mlx4_ib_add_gid(const struct ib_gid_attr *attr, void **context)
+++>>>>>>> f4df9a7c34d8 (RDMA: Use GID from the ib_gid_attr during the add_gid() callback)
+  {
+ -	struct mlx4_ib_dev *ibdev = to_mdev(attr->device);
+ +	struct mlx4_ib_dev *ibdev = to_mdev(device);
+  	struct mlx4_ib_iboe *iboe = &ibdev->iboe;
+  	struct mlx4_port_gid_table   *port_gid_table;
+  	int free = -1, found = -1;
+@@@ -268,11 -266,12 +272,12 @@@
+  	if (!context)
+  		return -EINVAL;
+  
+ -	port_gid_table = &iboe->gids[attr->port_num - 1];
+ +	port_gid_table = &iboe->gids[port_num - 1];
+  	spin_lock_bh(&iboe->lock);
+  	for (i = 0; i < MLX4_MAX_PORT_GIDS; ++i) {
+- 		if (!memcmp(&port_gid_table->gids[i].gid, gid, sizeof(*gid)) &&
+- 		    (port_gid_table->gids[i].gid_type == attr->gid_type))  {
++ 		if (!memcmp(&port_gid_table->gids[i].gid,
++ 			    &attr->gid, sizeof(attr->gid)) &&
++ 		    port_gid_table->gids[i].gid_type == attr->gid_type)  {
+  			found = i;
+  			break;
+  		}
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index caab7cc36fbe,94669df81342..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -483,18 -510,18 +483,26 @@@ static int set_roce_addr(struct mlx5_ib
+  				      vlan_id, port_num);
+  }
+  
+++<<<<<<< HEAD
+ +static int mlx5_ib_add_gid(struct ib_device *device, u8 port_num,
+ +			   unsigned int index, const union ib_gid *gid,
+ +			   const struct ib_gid_attr *attr,
+ +			   __always_unused void **context)
+ +{
+ +	return set_roce_addr(to_mdev(device), port_num, index, gid, attr);
+++=======
++ static int mlx5_ib_add_gid(const struct ib_gid_attr *attr,
++ 			   __always_unused void **context)
++ {
++ 	return set_roce_addr(to_mdev(attr->device), attr->port_num,
++ 			     attr->index, &attr->gid, attr);
+++>>>>>>> f4df9a7c34d8 (RDMA: Use GID from the ib_gid_attr during the add_gid() callback)
+  }
+  
+ -static int mlx5_ib_del_gid(const struct ib_gid_attr *attr,
+ -			   __always_unused void **context)
+ +static int mlx5_ib_del_gid(struct ib_device *device, u8 port_num,
+ +			   unsigned int index, __always_unused void **context)
+  {
+ -	return set_roce_addr(to_mdev(attr->device), attr->port_num,
+ -			     attr->index, NULL, NULL);
+ +	return set_roce_addr(to_mdev(device), port_num, index, NULL, NULL);
+  }
+  
+  __be16 mlx5_get_roce_udp_sport(struct mlx5_ib_dev *dev, u8 port_num,
+diff --cc drivers/infiniband/hw/vmw_pvrdma/pvrdma_main.c
+index f493046158a6,faa1be2d7727..000000000000
+--- a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_main.c
++++ b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_main.c
+@@@ -62,17 -62,8 +62,22 @@@ static DEFINE_MUTEX(pvrdma_device_list_
+  static LIST_HEAD(pvrdma_device_list);
+  static struct workqueue_struct *event_wq;
+  
+++<<<<<<< HEAD
+ +static int pvrdma_add_gid(struct ib_device *ibdev,
+ +			  u8 port_num,
+ +			  unsigned int index,
+ +			  const union ib_gid *gid,
+ +			  const struct ib_gid_attr *attr,
+ +			  void **context);
+ +static int pvrdma_del_gid(struct ib_device *ibdev,
+ +			  u8 port_num,
+ +			  unsigned int index,
+ +			  void **context);
+ +
+++=======
++ static int pvrdma_add_gid(const struct ib_gid_attr *attr, void **context);
++ static int pvrdma_del_gid(const struct ib_gid_attr *attr, void **context);
+++>>>>>>> f4df9a7c34d8 (RDMA: Use GID from the ib_gid_attr during the add_gid() callback)
+  
+  static ssize_t show_hca(struct device *device, struct device_attribute *attr,
+  			char *buf)
+@@@ -656,18 -648,13 +661,22 @@@ static int pvrdma_add_gid_at_index(stru
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int pvrdma_add_gid(struct ib_device *ibdev,
+ +			  u8 port_num,
+ +			  unsigned int index,
+ +			  const union ib_gid *gid,
+ +			  const struct ib_gid_attr *attr,
+ +			  void **context)
+++=======
++ static int pvrdma_add_gid(const struct ib_gid_attr *attr, void **context)
+++>>>>>>> f4df9a7c34d8 (RDMA: Use GID from the ib_gid_attr during the add_gid() callback)
+  {
+ -	struct pvrdma_dev *dev = to_vdev(attr->device);
+ +	struct pvrdma_dev *dev = to_vdev(ibdev);
+  
+- 	return pvrdma_add_gid_at_index(dev, gid,
++ 	return pvrdma_add_gid_at_index(dev, &attr->gid,
+  				       ib_gid_type_to_pvrdma(attr->gid_type),
+ -				       attr->index);
+ +				       index);
+  }
+  
+  static int pvrdma_del_gid_at_index(struct pvrdma_dev *dev, int index)
+diff --cc include/rdma/ib_verbs.h
+index 696c31d40d6e,1c153cc046ee..000000000000
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@@ -2243,27 -2330,23 +2243,31 @@@ struct ib_device 
+  	int		           (*query_gid)(struct ib_device *device,
+  						u8 port_num, int index,
+  						union ib_gid *gid);
+ -	/* When calling add_gid, the HW vendor's driver should add the gid
+ -	 * of device of port at gid index available at @attr. Meta-info of
+ -	 * that gid (for example, the network device related to this gid) is
+ -	 * available at @attr. @context allows the HW vendor driver to store
+ -	 * extra information together with a GID entry. The HW vendor driver may
+ -	 * allocate memory to contain this information and store it in @context
+ -	 * when a new GID entry is written to. Params are consistent until the
+ -	 * next call of add_gid or delete_gid. The function should return 0 on
+ +	/* When calling add_gid, the HW vendor's driver should
+ +	 * add the gid of device @device at gid index @index of
+ +	 * port @port_num to be @gid. Meta-info of that gid (for example,
+ +	 * the network device related to this gid is available
+ +	 * at @attr. @context allows the HW vendor driver to store extra
+ +	 * information together with a GID entry. The HW vendor may allocate
+ +	 * memory to contain this information and store it in @context when a
+ +	 * new GID entry is written to. Params are consistent until the next
+ +	 * call of add_gid or delete_gid. The function should return 0 on
+  	 * success or error otherwise. The function could be called
+ -	 * concurrently for different ports. This function is only called when
+ -	 * roce_gid_table is used.
+ +	 * concurrently for different ports. This function is only called
+ +	 * when roce_gid_table is used.
+  	 */
+++<<<<<<< HEAD
+ +	int		           (*add_gid)(struct ib_device *device,
+ +					      u8 port_num,
+ +					      unsigned int index,
+ +					      const union ib_gid *gid,
+ +					      const struct ib_gid_attr *attr,
+++=======
++ 	int		           (*add_gid)(const struct ib_gid_attr *attr,
+++>>>>>>> f4df9a7c34d8 (RDMA: Use GID from the ib_gid_attr during the add_gid() callback)
+  					      void **context);
+  	/* When calling del_gid, the HW vendor's driver should delete the
+ -	 * gid of device @device at gid index gid_index of port port_num
+ -	 * available in @attr.
+ +	 * gid of device @device at gid index @index of port @port_num.
+  	 * Upon the deletion of a GID entry, the HW vendor must free any
+  	 * allocated memory. The caller will clear @context afterwards.
+  	 * This function is only called when roce_gid_table is used.
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_device.h
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_hw_v1.c
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_main.c
+* Unmerged path drivers/infiniband/core/cache.c
+* Unmerged path drivers/infiniband/hw/bnxt_re/ib_verbs.c
+* Unmerged path drivers/infiniband/hw/bnxt_re/ib_verbs.h
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_device.h
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_hw_v1.c
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_main.c
+* Unmerged path drivers/infiniband/hw/mlx4/main.c
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+* Unmerged path drivers/infiniband/hw/vmw_pvrdma/pvrdma_main.c
+* Unmerged path include/rdma/ib_verbs.h
