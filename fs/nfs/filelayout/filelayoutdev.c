@@ -283,6 +283,7 @@ nfs4_fl_prepare_ds(struct pnfs_layout_segment *lseg, u32 ds_idx)
 			     s->nfs_client->cl_minorversion,
 			     s->nfs_client->cl_rpcclient->cl_auth->au_flavor);
 	if (status) {
+		nfs4_mark_deviceid_unavailable(devid);
 		ret = NULL;
 		goto out;
 	}
