@@ -1,0 +1,466 @@
+KVM: nVMX: Eliminate vmcs02 pool
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jim Mattson <jmattson@google.com>
+commit 00647b44944a2f7212ac2c3825a465153d6e438f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/00647b44.failed
+
+The potential performance advantages of a vmcs02 pool have never been
+realized. To simplify the code, eliminate the pool. Instead, a single
+vmcs02 is allocated per VCPU when the VCPU enters VMX operation.
+
+	Signed-off-by: Jim Mattson <jmattson@google.com>
+	Signed-off-by: Mark Kanda <mark.kanda@oracle.com>
+	Reviewed-by: Ameya More <ameya.more@oracle.com>
+	Reviewed-by: David Hildenbrand <david@redhat.com>
+	Reviewed-by: Paolo Bonzini <pbonzini@redhat.com>
+	Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+(cherry picked from commit 00647b44944a2f7212ac2c3825a465153d6e438f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 06b6ba430b58,d1870f3c8c69..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -6412,94 -6981,6 +6404,97 @@@ static int handle_monitor(struct kvm_vc
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * To run an L2 guest, we need a vmcs02 based on the L1-specified vmcs12.
+ + * We could reuse a single VMCS for all the L2 guests, but we also want the
+ + * option to allocate a separate vmcs02 for each separate loaded vmcs12 - this
+ + * allows keeping them loaded on the processor, and in the future will allow
+ + * optimizations where prepare_vmcs02 doesn't need to set all the fields on
+ + * every entry if they never change.
+ + * So we keep, in vmx->nested.vmcs02_pool, a cache of size VMCS02_POOL_SIZE
+ + * (>=0) with a vmcs02 for each recently loaded vmcs12s, most recent first.
+ + *
+ + * The following functions allocate and free a vmcs02 in this pool.
+ + */
+ +
+ +/* Get a VMCS from the pool to use as vmcs02 for the current vmcs12. */
+ +static struct loaded_vmcs *nested_get_current_vmcs02(struct vcpu_vmx *vmx)
+ +{
+ +	struct vmcs02_list *item;
+ +	list_for_each_entry(item, &vmx->nested.vmcs02_pool, list)
+ +		if (item->vmptr == vmx->nested.current_vmptr) {
+ +			list_move(&item->list, &vmx->nested.vmcs02_pool);
+ +			return &item->vmcs02;
+ +		}
+ +
+ +	if (vmx->nested.vmcs02_num >= max(VMCS02_POOL_SIZE, 1)) {
+ +		/* Recycle the least recently used VMCS. */
+ +		item = list_last_entry(&vmx->nested.vmcs02_pool,
+ +				       struct vmcs02_list, list);
+ +		item->vmptr = vmx->nested.current_vmptr;
+ +		list_move(&item->list, &vmx->nested.vmcs02_pool);
+ +		return &item->vmcs02;
+ +	}
+ +
+ +	/* Create a new VMCS */
+ +	item = kmalloc(sizeof(struct vmcs02_list), GFP_KERNEL);
+ +	if (!item)
+ +		return NULL;
+ +	item->vmcs02.vmcs = alloc_vmcs();
+ +	item->vmcs02.shadow_vmcs = NULL;
+ +	if (!item->vmcs02.vmcs) {
+ +		kfree(item);
+ +		return NULL;
+ +	}
+ +	loaded_vmcs_init(&item->vmcs02);
+ +	item->vmptr = vmx->nested.current_vmptr;
+ +	list_add(&(item->list), &(vmx->nested.vmcs02_pool));
+ +	vmx->nested.vmcs02_num++;
+ +	return &item->vmcs02;
+ +}
+ +
+ +/* Free and remove from pool a vmcs02 saved for a vmcs12 (if there is one) */
+ +static void nested_free_vmcs02(struct vcpu_vmx *vmx, gpa_t vmptr)
+ +{
+ +	struct vmcs02_list *item;
+ +	list_for_each_entry(item, &vmx->nested.vmcs02_pool, list)
+ +		if (item->vmptr == vmptr) {
+ +			free_loaded_vmcs(&item->vmcs02);
+ +			list_del(&item->list);
+ +			kfree(item);
+ +			vmx->nested.vmcs02_num--;
+ +			return;
+ +		}
+ +}
+ +
+ +/*
+ + * Free all VMCSs saved for this vcpu, except the one pointed by
+ + * vmx->loaded_vmcs. We must be running L1, so vmx->loaded_vmcs
+ + * must be &vmx->vmcs01.
+ + */
+ +static void nested_free_all_saved_vmcss(struct vcpu_vmx *vmx)
+ +{
+ +	struct vmcs02_list *item, *n;
+ +
+ +	WARN_ON(vmx->loaded_vmcs != &vmx->vmcs01);
+ +	list_for_each_entry_safe(item, n, &vmx->nested.vmcs02_pool, list) {
+ +		/*
+ +		 * Something will leak if the above WARN triggers.  Better than
+ +		 * a use-after-free.
+ +		 */
+ +		if (vmx->loaded_vmcs == &item->vmcs02)
+ +			continue;
+ +
+ +		free_loaded_vmcs(&item->vmcs02);
+ +		list_del(&item->list);
+ +		kfree(item);
+ +		vmx->nested.vmcs02_num--;
+ +	}
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> 00647b44944a (KVM: nVMX: Eliminate vmcs02 pool)
+   * The following 3 functions, nested_vmx_succeed()/failValid()/failInvalid(),
+   * set the success or error code of an emulated VMX instruction, as specified
+   * by Vol 2B, VMX Instruction Reference, "Conventions".
+@@@ -6758,60 -7156,17 +6753,66 @@@ static int nested_vmx_check_vmptr(struc
+  	return 0;
+  }
+  
+ -static int enter_vmx_operation(struct kvm_vcpu *vcpu)
+ +/*
+ + * Emulate the VMXON instruction.
+ + * Currently, we just remember that VMX is active, and do not save or even
+ + * inspect the argument to VMXON (the so-called "VMXON pointer") because we
+ + * do not currently need to store anything in that guest-allocated memory
+ + * region. Consequently, VMCLEAR and VMPTRLD also do not verify that the their
+ + * argument is different from the VMXON pointer (which the spec says they do).
+ + */
+ +static int handle_vmon(struct kvm_vcpu *vcpu)
+  {
+ +	struct kvm_segment cs;
+  	struct vcpu_vmx *vmx = to_vmx(vcpu);
+  	struct vmcs *shadow_vmcs;
+ +	const u64 VMXON_NEEDED_FEATURES = FEATURE_CONTROL_LOCKED
+ +		| FEATURE_CONTROL_VMXON_ENABLED_OUTSIDE_SMX;
+ +
+ +	/* The Intel VMX Instruction Reference lists a bunch of bits that
+ +	 * are prerequisite to running VMXON, most notably cr4.VMXE must be
+ +	 * set to 1 (see vmx_set_cr4() for when we allow the guest to set this).
+ +	 * Otherwise, we should fail with #UD. We test these now:
+ +	 */
+ +	if (!kvm_read_cr4_bits(vcpu, X86_CR4_VMXE) ||
+ +	    !kvm_read_cr0_bits(vcpu, X86_CR0_PE) ||
+ +	    (vmx_get_rflags(vcpu) & X86_EFLAGS_VM)) {
+ +		kvm_queue_exception(vcpu, UD_VECTOR);
+ +		return 1;
+ +	}
+ +
+ +	vmx_get_segment(vcpu, &cs, VCPU_SREG_CS);
+ +	if (is_long_mode(vcpu) && !cs.l) {
+ +		kvm_queue_exception(vcpu, UD_VECTOR);
+ +		return 1;
+ +	}
+ +
+ +	if (vmx_get_cpl(vcpu)) {
+ +		kvm_inject_gp(vcpu, 0);
+ +		return 1;
+ +	}
+ +
+ +	if (nested_vmx_check_vmptr(vcpu, EXIT_REASON_VMON, NULL))
+ +		return 1;
+ +
+ +	if (vmx->nested.vmxon) {
+ +		nested_vmx_failValid(vcpu, VMXERR_VMXON_IN_VMX_ROOT_OPERATION);
+ +		skip_emulated_instruction(vcpu);
+ +		return 1;
+ +	}
+ +
+ +	if ((vmx->msr_ia32_feature_control & VMXON_NEEDED_FEATURES)
+ +			!= VMXON_NEEDED_FEATURES) {
+ +		kvm_inject_gp(vcpu, 0);
+ +		return 1;
+ +	}
+  
++ 	vmx->nested.vmcs02.vmcs = alloc_vmcs();
++ 	vmx->nested.vmcs02.shadow_vmcs = NULL;
++ 	if (!vmx->nested.vmcs02.vmcs)
++ 		goto out_vmcs02;
++ 	loaded_vmcs_init(&vmx->nested.vmcs02);
++ 
+  	if (cpu_has_vmx_msr_bitmap()) {
+  		vmx->nested.msr_bitmap =
+  				(unsigned long *)__get_free_page(GFP_KERNEL);
+@@@ -6834,11 -7189,8 +6835,8 @@@
+  		vmx->vmcs01.shadow_vmcs = shadow_vmcs;
+  	}
+  
+- 	INIT_LIST_HEAD(&(vmx->nested.vmcs02_pool));
+- 	vmx->nested.vmcs02_num = 0;
+- 
+  	hrtimer_init(&vmx->nested.preemption_timer, CLOCK_MONOTONIC,
+ -		     HRTIMER_MODE_REL_PINNED);
+ +		     HRTIMER_MODE_REL);
+  	vmx->nested.preemption_timer.function = vmx_preemption_timer_fn;
+  
+  	vmx->nested.vmxon = true;
+@@@ -6940,9 -7359,9 +6941,9 @@@ static void free_nested(struct vcpu_vm
+  		vmx->vmcs01.shadow_vmcs = NULL;
+  	}
+  	kfree(vmx->nested.cached_vmcs12);
+- 	/* Unpin physical memory we referred to in current vmcs02 */
++ 	/* Unpin physical memory we referred to in the vmcs02 */
+  	if (vmx->nested.apic_access_page) {
+ -		kvm_release_page_dirty(vmx->nested.apic_access_page);
+ +		nested_release_page(vmx->nested.apic_access_page);
+  		vmx->nested.apic_access_page = NULL;
+  	}
+  	if (vmx->nested.virtual_apic_page) {
+@@@ -6987,28 -7404,22 +6988,31 @@@ static int handle_vmclear(struct kvm_vc
+  	if (vmptr == vmx->nested.current_vmptr)
+  		nested_release_vmcs12(vmx);
+  
+ -	kvm_vcpu_write_guest(vcpu,
+ -			vmptr + offsetof(struct vmcs12, launch_state),
+ -			&zero, sizeof(zero));
+ +	page = nested_get_page(vcpu, vmptr);
+ +	if (page == NULL) {
+ +		/*
+ +		 * For accurate processor emulation, VMCLEAR beyond available
+ +		 * physical memory should do nothing at all. However, it is
+ +		 * possible that a nested vmx bug, not a guest hypervisor bug,
+ +		 * resulted in this case, so let's shut down before doing any
+ +		 * more damage:
+ +		 */
+ +		kvm_make_request(KVM_REQ_TRIPLE_FAULT, vcpu);
+ +		return 1;
+ +	}
+ +	vmcs12 = kmap(page);
+ +	vmcs12->launch_state = 0;
+ +	kunmap(page);
+ +	nested_release_page(page);
+ +
+++<<<<<<< HEAD
+ +	nested_free_vmcs02(vmx, vmptr);
+  
+ +	skip_emulated_instruction(vcpu);
+++=======
+++>>>>>>> 00647b44944a (KVM: nVMX: Eliminate vmcs02 pool)
+  	nested_vmx_succeed(vcpu);
+ -	return kvm_skip_emulated_instruction(vcpu);
+ +	return 1;
+  }
+  
+  static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch);
+@@@ -9962,6 -10691,177 +9967,180 @@@ static int prepare_vmcs02(struct kvm_vc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int check_vmentry_prereqs(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 
++ 	if (vmcs12->guest_activity_state != GUEST_ACTIVITY_ACTIVE &&
++ 	    vmcs12->guest_activity_state != GUEST_ACTIVITY_HLT)
++ 		return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
++ 	if (nested_vmx_check_io_bitmap_controls(vcpu, vmcs12))
++ 		return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
++ 	if (nested_vmx_check_msr_bitmap_controls(vcpu, vmcs12))
++ 		return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
++ 	if (nested_vmx_check_tpr_shadow_controls(vcpu, vmcs12))
++ 		return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
++ 	if (nested_vmx_check_apicv_controls(vcpu, vmcs12))
++ 		return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
++ 	if (nested_vmx_check_msr_switch_controls(vcpu, vmcs12))
++ 		return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
++ 	if (nested_vmx_check_pml_controls(vcpu, vmcs12))
++ 		return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
++ 	if (!vmx_control_verify(vmcs12->cpu_based_vm_exec_control,
++ 				vmx->nested.nested_vmx_procbased_ctls_low,
++ 				vmx->nested.nested_vmx_procbased_ctls_high) ||
++ 	    (nested_cpu_has(vmcs12, CPU_BASED_ACTIVATE_SECONDARY_CONTROLS) &&
++ 	     !vmx_control_verify(vmcs12->secondary_vm_exec_control,
++ 				 vmx->nested.nested_vmx_secondary_ctls_low,
++ 				 vmx->nested.nested_vmx_secondary_ctls_high)) ||
++ 	    !vmx_control_verify(vmcs12->pin_based_vm_exec_control,
++ 				vmx->nested.nested_vmx_pinbased_ctls_low,
++ 				vmx->nested.nested_vmx_pinbased_ctls_high) ||
++ 	    !vmx_control_verify(vmcs12->vm_exit_controls,
++ 				vmx->nested.nested_vmx_exit_ctls_low,
++ 				vmx->nested.nested_vmx_exit_ctls_high) ||
++ 	    !vmx_control_verify(vmcs12->vm_entry_controls,
++ 				vmx->nested.nested_vmx_entry_ctls_low,
++ 				vmx->nested.nested_vmx_entry_ctls_high))
++ 		return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
++ 	if (nested_cpu_has_vmfunc(vmcs12)) {
++ 		if (vmcs12->vm_function_control &
++ 		    ~vmx->nested.nested_vmx_vmfunc_controls)
++ 			return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
++ 		if (nested_cpu_has_eptp_switching(vmcs12)) {
++ 			if (!nested_cpu_has_ept(vmcs12) ||
++ 			    !page_address_valid(vcpu, vmcs12->eptp_list_address))
++ 				return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 		}
++ 	}
++ 
++ 	if (vmcs12->cr3_target_count > nested_cpu_vmx_misc_cr3_count(vcpu))
++ 		return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
++ 
++ 	if (!nested_host_cr0_valid(vcpu, vmcs12->host_cr0) ||
++ 	    !nested_host_cr4_valid(vcpu, vmcs12->host_cr4) ||
++ 	    !nested_cr3_valid(vcpu, vmcs12->host_cr3))
++ 		return VMXERR_ENTRY_INVALID_HOST_STATE_FIELD;
++ 
++ 	return 0;
++ }
++ 
++ static int check_vmentry_postreqs(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12,
++ 				  u32 *exit_qual)
++ {
++ 	bool ia32e;
++ 
++ 	*exit_qual = ENTRY_FAIL_DEFAULT;
++ 
++ 	if (!nested_guest_cr0_valid(vcpu, vmcs12->guest_cr0) ||
++ 	    !nested_guest_cr4_valid(vcpu, vmcs12->guest_cr4))
++ 		return 1;
++ 
++ 	if (!nested_cpu_has2(vmcs12, SECONDARY_EXEC_SHADOW_VMCS) &&
++ 	    vmcs12->vmcs_link_pointer != -1ull) {
++ 		*exit_qual = ENTRY_FAIL_VMCS_LINK_PTR;
++ 		return 1;
++ 	}
++ 
++ 	/*
++ 	 * If the load IA32_EFER VM-entry control is 1, the following checks
++ 	 * are performed on the field for the IA32_EFER MSR:
++ 	 * - Bits reserved in the IA32_EFER MSR must be 0.
++ 	 * - Bit 10 (corresponding to IA32_EFER.LMA) must equal the value of
++ 	 *   the IA-32e mode guest VM-exit control. It must also be identical
++ 	 *   to bit 8 (LME) if bit 31 in the CR0 field (corresponding to
++ 	 *   CR0.PG) is 1.
++ 	 */
++ 	if (to_vmx(vcpu)->nested.nested_run_pending &&
++ 	    (vmcs12->vm_entry_controls & VM_ENTRY_LOAD_IA32_EFER)) {
++ 		ia32e = (vmcs12->vm_entry_controls & VM_ENTRY_IA32E_MODE) != 0;
++ 		if (!kvm_valid_efer(vcpu, vmcs12->guest_ia32_efer) ||
++ 		    ia32e != !!(vmcs12->guest_ia32_efer & EFER_LMA) ||
++ 		    ((vmcs12->guest_cr0 & X86_CR0_PG) &&
++ 		     ia32e != !!(vmcs12->guest_ia32_efer & EFER_LME)))
++ 			return 1;
++ 	}
++ 
++ 	/*
++ 	 * If the load IA32_EFER VM-exit control is 1, bits reserved in the
++ 	 * IA32_EFER MSR must be 0 in the field for that register. In addition,
++ 	 * the values of the LMA and LME bits in the field must each be that of
++ 	 * the host address-space size VM-exit control.
++ 	 */
++ 	if (vmcs12->vm_exit_controls & VM_EXIT_LOAD_IA32_EFER) {
++ 		ia32e = (vmcs12->vm_exit_controls &
++ 			 VM_EXIT_HOST_ADDR_SPACE_SIZE) != 0;
++ 		if (!kvm_valid_efer(vcpu, vmcs12->host_ia32_efer) ||
++ 		    ia32e != !!(vmcs12->host_ia32_efer & EFER_LMA) ||
++ 		    ia32e != !!(vmcs12->host_ia32_efer & EFER_LME))
++ 			return 1;
++ 	}
++ 
++ 	if ((vmcs12->vm_entry_controls & VM_ENTRY_LOAD_BNDCFGS) &&
++ 		(is_noncanonical_address(vmcs12->guest_bndcfgs & PAGE_MASK, vcpu) ||
++ 		(vmcs12->guest_bndcfgs & MSR_IA32_BNDCFGS_RSVD)))
++ 			return 1;
++ 
++ 	return 0;
++ }
++ 
++ static int enter_vmx_non_root_mode(struct kvm_vcpu *vcpu, bool from_vmentry)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
++ 	u32 msr_entry_idx;
++ 	u32 exit_qual;
++ 
++ 	enter_guest_mode(vcpu);
++ 
++ 	if (!(vmcs12->vm_entry_controls & VM_ENTRY_LOAD_DEBUG_CONTROLS))
++ 		vmx->nested.vmcs01_debugctl = vmcs_read64(GUEST_IA32_DEBUGCTL);
++ 
++ 	vmx_switch_vmcs(vcpu, &vmx->nested.vmcs02);
++ 	vmx_segment_cache_clear(vmx);
++ 
++ 	if (prepare_vmcs02(vcpu, vmcs12, from_vmentry, &exit_qual)) {
++ 		leave_guest_mode(vcpu);
++ 		vmx_switch_vmcs(vcpu, &vmx->vmcs01);
++ 		nested_vmx_entry_failure(vcpu, vmcs12,
++ 					 EXIT_REASON_INVALID_STATE, exit_qual);
++ 		return 1;
++ 	}
++ 
++ 	nested_get_vmcs12_pages(vcpu, vmcs12);
++ 
++ 	msr_entry_idx = nested_vmx_load_msr(vcpu,
++ 					    vmcs12->vm_entry_msr_load_addr,
++ 					    vmcs12->vm_entry_msr_load_count);
++ 	if (msr_entry_idx) {
++ 		leave_guest_mode(vcpu);
++ 		vmx_switch_vmcs(vcpu, &vmx->vmcs01);
++ 		nested_vmx_entry_failure(vcpu, vmcs12,
++ 				EXIT_REASON_MSR_LOAD_FAIL, msr_entry_idx);
++ 		return 1;
++ 	}
++ 
++ 	/*
++ 	 * Note no nested_vmx_succeed or nested_vmx_fail here. At this point
++ 	 * we are no longer running L1, and VMLAUNCH/VMRESUME has not yet
++ 	 * returned as far as L1 is concerned. It will only return (and set
++ 	 * the success flag) when L2 exits (see nested_vmx_vmexit()).
++ 	 */
++ 	return 0;
++ }
++ 
+++>>>>>>> 00647b44944a (KVM: nVMX: Eliminate vmcs02 pool)
+  /*
+   * nested_vmx_run() handles a nested entry, i.e., a VMLAUNCH or VMRESUME on L1
+   * for running an L2 nested guest.
+@@@ -10658,15 -11447,16 +10837,21 @@@ static void nested_vmx_vmexit(struct kv
+  	vm_exit_controls_reset_shadow(vmx);
+  	vmx_segment_cache_clear(vmx);
+  
+++<<<<<<< HEAD
+ +	/* if no vmcs02 cache requested, remove the one we used */
+ +	if (VMCS02_POOL_SIZE == 0)
+ +		nested_free_vmcs02(vmx, vmx->nested.current_vmptr);
+ +
+ +	load_vmcs12_host_state(vcpu, vmcs12);
+ +
+ +	/* Update TSC_OFFSET if TSC was changed while L2 ran */
+++=======
++ 	/* Update any VMCS fields that might have changed while L2 ran */
++ 	vmcs_write32(VM_EXIT_MSR_LOAD_COUNT, vmx->msr_autoload.nr);
++ 	vmcs_write32(VM_ENTRY_MSR_LOAD_COUNT, vmx->msr_autoload.nr);
+++>>>>>>> 00647b44944a (KVM: nVMX: Eliminate vmcs02 pool)
+  	vmcs_write64(TSC_OFFSET, vcpu->arch.tsc_offset);
+ -	if (vmx->hv_deadline_tsc == -1)
+ -		vmcs_clear_bits(PIN_BASED_VM_EXEC_CONTROL,
+ -				PIN_BASED_VMX_PREEMPTION_TIMER);
+ -	else
+ -		vmcs_set_bits(PIN_BASED_VM_EXEC_CONTROL,
+ -			      PIN_BASED_VMX_PREEMPTION_TIMER);
+ +
+  	if (kvm_has_tsc_control)
+  		decache_tsc_multiplier(vmx);
+  
+* Unmerged path arch/x86/kvm/vmx.c
