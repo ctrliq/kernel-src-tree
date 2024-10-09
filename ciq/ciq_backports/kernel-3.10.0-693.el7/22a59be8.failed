@@ -1,0 +1,212 @@
+net: ipv4: Add ability to have GRE ignore DF bit in IPv4 payloads
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [net] ipv4: Add ability to have GRE ignore DF bit in IPv4 payloads (Jakub Sitnicki) [1369158]
+Rebuild_FUZZ: 96.00%
+commit-author Philip Prindeville <philipp@redfish-solutions.com>
+commit 22a59be8b7693eb2d0897a9638f5991f2f8e4ddd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/22a59be8.failed
+
+    In the presence of firewalls which improperly block ICMP Unreachable
+    (including Fragmentation Required) messages, Path MTU Discovery is
+    prevented from working.
+
+    A workaround is to handle IPv4 payloads opaquely, ignoring the DF bit--as
+    is done for other payloads like AppleTalk--and doing transparent
+    fragmentation and reassembly.
+
+    Redux includes the enforcement of mutual exclusion between this feature
+    and Path MTU Discovery as suggested by Alexander Duyck.
+
+    Cc: Alexander Duyck <alexander.duyck@gmail.com>
+    Reviewed-by: Stephen Hemminger <stephen@networkplumber.org>
+    Signed-off-by: Philip Prindeville <philipp@redfish-solutions.com>
+
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 22a59be8b7693eb2d0897a9638f5991f2f8e4ddd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip_tunnels.h
+diff --cc include/net/ip_tunnels.h
+index c62b45515469,9222678426a1..000000000000
+--- a/include/net/ip_tunnels.h
++++ b/include/net/ip_tunnels.h
+@@@ -127,16 -131,8 +127,21 @@@ struct ip_tunnel 
+  	unsigned int		prl_count;	/* # of entries in PRL */
+  	int			ip_tnl_net_id;
+  	struct gro_cells	gro_cells;
+++<<<<<<< HEAD
+ +
+ +	/* Reserved slots. For Red Hat usage only. */
+ +	RH_KABI_USE(1, bool	collect_md)
+ +	RH_KABI_RESERVE(2)
+ +	RH_KABI_RESERVE(3)
+ +	RH_KABI_RESERVE(4)
+ +	RH_KABI_RESERVE(5)
+ +	RH_KABI_RESERVE(6)
+ +	RH_KABI_RESERVE(7)
+ +	RH_KABI_RESERVE(8)
+++=======
++ 	bool			collect_md;
++ 	bool			ignore_df;
+++>>>>>>> 22a59be8b769 (net: ipv4: Add ability to have GRE ignore DF bit in IPv4 payloads)
+  };
+  
+  #define TUNNEL_CSUM		__cpu_to_be16(0x01)
+* Unmerged path include/net/ip_tunnels.h
+diff --git a/include/uapi/linux/if_tunnel.h b/include/uapi/linux/if_tunnel.h
+index 6b6a1c41980d..832e7a65248d 100644
+--- a/include/uapi/linux/if_tunnel.h
++++ b/include/uapi/linux/if_tunnel.h
+@@ -113,6 +113,7 @@ enum {
+ 	IFLA_GRE_ENCAP_SPORT,
+ 	IFLA_GRE_ENCAP_DPORT,
+ 	IFLA_GRE_COLLECT_METADATA,
++	IFLA_GRE_IGNORE_DF,
+ 	__IFLA_GRE_MAX,
+ };
+ 
+diff --git a/net/ipv4/ip_gre.c b/net/ipv4/ip_gre.c
+index 9c178e45801f..cb025dcec980 100644
+--- a/net/ipv4/ip_gre.c
++++ b/net/ipv4/ip_gre.c
+@@ -978,17 +978,19 @@ out:
+ 	return ipgre_tunnel_validate(tb, data);
+ }
+ 
+-static void ipgre_netlink_parms(struct net_device *dev,
++static int ipgre_netlink_parms(struct net_device *dev,
+ 				struct nlattr *data[],
+ 				struct nlattr *tb[],
+ 				struct ip_tunnel_parm *parms)
+ {
++	struct ip_tunnel *t = netdev_priv(dev);
++
+ 	memset(parms, 0, sizeof(*parms));
+ 
+ 	parms->iph.protocol = IPPROTO_GRE;
+ 
+ 	if (!data)
+-		return;
++		return 0;
+ 
+ 	if (data[IFLA_GRE_LINK])
+ 		parms->link = nla_get_u32(data[IFLA_GRE_LINK]);
+@@ -1017,16 +1019,26 @@ static void ipgre_netlink_parms(struct net_device *dev,
+ 	if (data[IFLA_GRE_TOS])
+ 		parms->iph.tos = nla_get_u8(data[IFLA_GRE_TOS]);
+ 
+-	if (!data[IFLA_GRE_PMTUDISC] || nla_get_u8(data[IFLA_GRE_PMTUDISC]))
++	if (!data[IFLA_GRE_PMTUDISC] || nla_get_u8(data[IFLA_GRE_PMTUDISC])) {
++		if (t->ignore_df)
++			return -EINVAL;
+ 		parms->iph.frag_off = htons(IP_DF);
++	}
+ 
+ 	if (data[IFLA_GRE_COLLECT_METADATA]) {
+-		struct ip_tunnel *t = netdev_priv(dev);
+-
+ 		t->collect_md = true;
+ 		if (dev->type == ARPHRD_IPGRE)
+ 			dev->type = ARPHRD_NONE;
+ 	}
++
++	if (data[IFLA_GRE_IGNORE_DF]) {
++		if (nla_get_u8(data[IFLA_GRE_IGNORE_DF])
++		  && (parms->iph.frag_off & htons(IP_DF)))
++			return -EINVAL;
++		t->ignore_df = !!nla_get_u8(data[IFLA_GRE_IGNORE_DF]);
++	}
++
++	return 0;
+ }
+ 
+ /* This function returns true when ENCAP attributes are present in the nl msg */
+@@ -1097,16 +1109,19 @@ static int ipgre_newlink(struct net *src_net, struct net_device *dev,
+ {
+ 	struct ip_tunnel_parm p;
+ 	struct ip_tunnel_encap ipencap;
++	int err;
+ 
+ 	if (ipgre_netlink_encap_parms(data, &ipencap)) {
+ 		struct ip_tunnel *t = netdev_priv(dev);
+-		int err = ip_tunnel_encap_setup(t, &ipencap);
++		err = ip_tunnel_encap_setup(t, &ipencap);
+ 
+ 		if (err < 0)
+ 			return err;
+ 	}
+ 
+-	ipgre_netlink_parms(dev, data, tb, &p);
++	err = ipgre_netlink_parms(dev, data, tb, &p);
++	if (err < 0)
++		return err;
+ 	return ip_tunnel_newlink(dev, tb, &p);
+ }
+ 
+@@ -1115,16 +1130,19 @@ static int ipgre_changelink(struct net_device *dev, struct nlattr *tb[],
+ {
+ 	struct ip_tunnel_parm p;
+ 	struct ip_tunnel_encap ipencap;
++	int err;
+ 
+ 	if (ipgre_netlink_encap_parms(data, &ipencap)) {
+ 		struct ip_tunnel *t = netdev_priv(dev);
+-		int err = ip_tunnel_encap_setup(t, &ipencap);
++		err = ip_tunnel_encap_setup(t, &ipencap);
+ 
+ 		if (err < 0)
+ 			return err;
+ 	}
+ 
+-	ipgre_netlink_parms(dev, data, tb, &p);
++	err = ipgre_netlink_parms(dev, data, tb, &p);
++	if (err < 0)
++		return err;
+ 	return ip_tunnel_changelink(dev, tb, &p);
+ }
+ 
+@@ -1161,6 +1179,8 @@ static size_t ipgre_get_size(const struct net_device *dev)
+ 		nla_total_size(2) +
+ 		/* IFLA_GRE_COLLECT_METADATA */
+ 		nla_total_size(0) +
++		/* IFLA_GRE_IGNORE_DF */
++		nla_total_size(1) +
+ 		0;
+ }
+ 
+@@ -1192,6 +1212,9 @@ static int ipgre_fill_info(struct sk_buff *skb, const struct net_device *dev)
+ 			t->encap.dport))
+ 		goto nla_put_failure;
+ 
++	if (nla_put_u8(skb, IFLA_GRE_IGNORE_DF, t->ignore_df))
++		goto nla_put_failure;
++
+ 	if (t->collect_md) {
+ 		if (nla_put_flag(skb, IFLA_GRE_COLLECT_METADATA))
+ 			goto nla_put_failure;
+@@ -1219,6 +1242,7 @@ static const struct nla_policy ipgre_policy[IFLA_GRE_MAX + 1] = {
+ 	[IFLA_GRE_ENCAP_SPORT]	= { .type = NLA_U16 },
+ 	[IFLA_GRE_ENCAP_DPORT]	= { .type = NLA_U16 },
+ 	[IFLA_GRE_COLLECT_METADATA]	= { .type = NLA_FLAG },
++	[IFLA_GRE_IGNORE_DF]	= { .type = NLA_U8 },
+ };
+ 
+ static struct rtnl_link_ops ipgre_link_ops __read_mostly = {
+diff --git a/net/ipv4/ip_tunnel.c b/net/ipv4/ip_tunnel.c
+index d14d601392c2..83f865d1a5d0 100644
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@ -724,7 +724,7 @@ void ip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev,
+ 	}
+ 
+ 	df = tnl_params->frag_off;
+-	if (skb->protocol == htons(ETH_P_IP))
++	if (skb->protocol == htons(ETH_P_IP) && !tunnel->ignore_df)
+ 		df |= (inner_iph->frag_off&htons(IP_DF));
+ 
+ 	max_headroom = LL_RESERVED_SPACE(rt->dst.dev) + sizeof(struct iphdr)
