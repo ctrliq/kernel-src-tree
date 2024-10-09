@@ -1,0 +1,213 @@
+i40e: avoid looping to check whether we're in VLAN mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit cbebb85f306f6023ebaa26ca66380571b4b680bf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/cbebb85f.failed
+
+We determine that a VSI is in vlan_mode whenever it has any filters
+with a VLAN other than -1 (I40E_VLAN_ALL). The previous method of doing
+so was to perform a loop whenever we needed the check. However, we can
+notice that only place where filters are added (i40e_add_filter) can
+change the condition from false to true, and the only place we can
+return to false is in i40e_vsi_sync_filters_subtask. Thus, we can remove
+the loop and use a boolean directly.
+
+Doing this avoids looping over filters repeatedly especially while we're
+already inside a loop over all the filters. This should reduce the
+latency of filter operations throughout the driver.
+
+Change-ID: Iafde08df588da2a2ea666997d05e11fad8edc338
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit cbebb85f306f6023ebaa26ca66380571b4b680bf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/i40e/i40e.h
+#	drivers/net/ethernet/intel/i40e/i40e_main.c
+diff --cc drivers/net/ethernet/intel/i40e/i40e.h
+index 68870b273109,60dbb5b90e1a..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e.h
++++ b/drivers/net/ethernet/intel/i40e/i40e.h
+@@@ -504,9 -513,11 +504,17 @@@ struct i40e_vsi 
+  #define I40E_VSI_FLAG_VEB_OWNER		BIT(1)
+  	unsigned long flags;
+  
+++<<<<<<< HEAD
+ +	/* Per VSI lock to protect elements/list (MAC filter) */
+ +	spinlock_t mac_filter_list_lock;
+ +	struct list_head mac_filter_list;
+++=======
++ 	/* Per VSI lock to protect elements/hash (MAC filter) */
++ 	spinlock_t mac_filter_hash_lock;
++ 	/* Fixed size hash table with 2^8 buckets for MAC filters */
++ 	DECLARE_HASHTABLE(mac_filter_hash, 8);
++ 	bool has_vlan_filter;
+++>>>>>>> cbebb85f306f (i40e: avoid looping to check whether we're in VLAN mode)
+  
+  	/* VSI stats */
+  	struct rtnl_link_stats64 net_stats;
+diff --cc drivers/net/ethernet/intel/i40e/i40e_main.c
+index 6f5b9c2cdeec,b4529b5a6af6..000000000000
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@@ -1210,86 -1198,31 +1210,113 @@@ struct i40e_mac_filter *i40e_find_mac(s
+   **/
+  bool i40e_is_vsi_in_vlan(struct i40e_vsi *vsi)
+  {
+++<<<<<<< HEAD
+ +	struct i40e_mac_filter *f;
+- 
+- 	/* Only -1 for all the filters denotes not in vlan mode
+- 	 * so we have to go through all the list in order to make sure
+++=======
++ 	/* If we have a PVID, always operate in VLAN mode */
++ 	if (vsi->info.pvid)
++ 		return true;
+++>>>>>>> cbebb85f306f (i40e: avoid looping to check whether we're in VLAN mode)
++ 
++ 	/* We need to operate in VLAN mode whenever we have any filters with
++ 	 * a VLAN other than I40E_VLAN_ALL. We could check the table each
++ 	 * time, incurring search cost repeatedly. However, we can notice two
++ 	 * things:
++ 	 *
++ 	 * 1) the only place where we can gain a VLAN filter is in
++ 	 *    i40e_add_filter.
++ 	 *
++ 	 * 2) the only place where filters are actually removed is in
++ 	 *    i40e_vsi_sync_filters_subtask.
++ 	 *
++ 	 * Thus, we can simply use a boolean value, has_vlan_filters which we
++ 	 * will set to true when we add a VLAN filter in i40e_add_filter. Then
++ 	 * we have to perform the full search after deleting filters in
++ 	 * i40e_vsi_sync_filters_subtask, but we already have to search
++ 	 * filters here and can perform the check at the same time. This
++ 	 * results in avoiding embedding a loop for VLAN mode inside another
++ 	 * loop over all the filters, and should maintain correctness as noted
++ 	 * above.
+  	 */
+++<<<<<<< HEAD
+ +	list_for_each_entry(f, &vsi->mac_filter_list, list) {
+ +		if (f->vlan >= 0 || vsi->info.pvid)
+ +			return true;
+ +	}
+ +
+ +	return false;
+++=======
++ 	return vsi->has_vlan_filter;
+++>>>>>>> cbebb85f306f (i40e: avoid looping to check whether we're in VLAN mode)
+ +}
+ +
+ +/**
+ + * i40e_put_mac_in_vlan - Make macvlan filters from macaddrs and vlans
+ + * @vsi: the VSI to be searched
+ + * @macaddr: the mac address to be filtered
+ + * @is_vf: true if it is a VF
+ + * @is_netdev: true if it is a netdev
+ + *
+ + * Goes through all the macvlan filters and adds a
+ + * macvlan filter for each unique vlan that already exists
+ + *
+ + * Returns first filter found on success, else NULL
+ + **/
+ +struct i40e_mac_filter *i40e_put_mac_in_vlan(struct i40e_vsi *vsi, u8 *macaddr,
+ +					     bool is_vf, bool is_netdev)
+ +{
+ +	struct i40e_mac_filter *f;
+ +
+ +	list_for_each_entry(f, &vsi->mac_filter_list, list) {
+ +		if (vsi->info.pvid)
+ +			f->vlan = le16_to_cpu(vsi->info.pvid);
+ +		if (!i40e_find_filter(vsi, macaddr, f->vlan,
+ +				      is_vf, is_netdev)) {
+ +			if (!i40e_add_filter(vsi, macaddr, f->vlan,
+ +					     is_vf, is_netdev))
+ +				return NULL;
+ +		}
+ +	}
+ +
+ +	return list_first_entry_or_null(&vsi->mac_filter_list,
+ +					struct i40e_mac_filter, list);
+ +}
+ +
+ +/**
+ + * i40e_del_mac_all_vlan - Remove a MAC filter from all VLANS
+ + * @vsi: the VSI to be searched
+ + * @macaddr: the mac address to be removed
+ + * @is_vf: true if it is a VF
+ + * @is_netdev: true if it is a netdev
+ + *
+ + * Removes a given MAC address from a VSI, regardless of VLAN
+ + *
+ + * Returns 0 for success, or error
+ + **/
+ +int i40e_del_mac_all_vlan(struct i40e_vsi *vsi, u8 *macaddr,
+ +			  bool is_vf, bool is_netdev)
+ +{
+ +	struct i40e_mac_filter *f = NULL;
+ +	int changed = 0;
+ +
+ +	WARN(!spin_is_locked(&vsi->mac_filter_list_lock),
+ +	     "Missing mac_filter_list_lock\n");
+ +	list_for_each_entry(f, &vsi->mac_filter_list, list) {
+ +		if ((ether_addr_equal(macaddr, f->macaddr)) &&
+ +		    (is_vf == f->is_vf) &&
+ +		    (is_netdev == f->is_netdev)) {
+ +			f->counter--;
+ +			changed = 1;
+ +			if (f->counter == 0)
+ +				f->state = I40E_FILTER_REMOVE;
+ +		}
+ +	}
+ +	if (changed) {
+ +		vsi->flags |= I40E_VSI_FLAG_FILTER_CHANGED;
+ +		vsi->back->flags |= I40E_FLAG_FILTER_SYNC;
+ +		return 0;
+ +	}
+ +	return -ENOENT;
+  }
+  
+  /**
+@@@ -1319,8 -1256,14 +1346,14 @@@ struct i40e_mac_filter *i40e_add_filter
+  	if (!f) {
+  		f = kzalloc(sizeof(*f), GFP_ATOMIC);
+  		if (!f)
+ -			return NULL;
+ +			goto add_filter_out;
+  
++ 		/* Update the boolean indicating if we need to function in
++ 		 * VLAN mode.
++ 		 */
++ 		if (vlan >= 0)
++ 			vsi->has_vlan_filter = true;
++ 
+  		ether_addr_copy(f->macaddr, macaddr);
+  		f->vlan = vlan;
+  		/* If we're in overflow promisc mode, set the state directly
+@@@ -1935,7 -1997,15 +1968,19 @@@ int i40e_sync_vsi_filters(struct i40e_v
+  		del_list = NULL;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!list_empty(&tmp_add_list)) {
+++=======
++ 	/* After finishing notifying firmware of the deleted filters, update
++ 	 * the cached value of vsi->has_vlan_filter. Note that we are safe to
++ 	 * use just !!vlan_filters here because if we only have VLAN=0 (that
++ 	 * is, non_vlan_filters) these will all be converted to VLAN=-1 in the
++ 	 * logic above already so this value would still be correct.
++ 	 */
++ 	vsi->has_vlan_filter = !!vlan_filters;
++ 
++ 	if (!hlist_empty(&tmp_add_list)) {
+++>>>>>>> cbebb85f306f (i40e: avoid looping to check whether we're in VLAN mode)
+  		/* Do all the adds now. */
+  		filter_list_len = hw->aq.asq_buf_size /
+  			       sizeof(struct i40e_aqc_add_macvlan_element_data);
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e.h
+* Unmerged path drivers/net/ethernet/intel/i40e/i40e_main.c
