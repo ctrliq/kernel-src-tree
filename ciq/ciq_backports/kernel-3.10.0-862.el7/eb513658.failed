@@ -1,0 +1,264 @@
+bnxt_en: Add basic ethtool -t selftest support.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] bnxt_en: Add basic ethtool -t selftest support (Jonathan Toppins) [1459659]
+Rebuild_FUZZ: 98.92%
+commit-author Michael Chan <michael.chan@broadcom.com>
+commit eb51365846bc418687af4c4f41b68b6e84cdd449
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/eb513658.failed
+
+Add the basic infrastructure and only firmware tests initially.
+
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit eb51365846bc418687af4c4f41b68b6e84cdd449)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 5289d9d23b48,7b72ba9fd0aa..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -7467,9 -7604,9 +7468,13 @@@ static int bnxt_init_one(struct pci_de
+  
+  	bnxt_hwrm_func_qcfg(bp);
+  	bnxt_hwrm_port_led_qcaps(bp);
+++<<<<<<< HEAD
+ +	bnxt_dcb_init(bp);
+++=======
++ 	bnxt_ethtool_init(bp);
+++>>>>>>> eb51365846bc (bnxt_en: Add basic ethtool -t selftest support.)
+  
+ -	bnxt_set_rx_skb_mode(bp, false);
+ +	bnxt_set_rx_skb_mode(bp);
+  	bnxt_set_tpa_flags(bp);
+  	bnxt_set_ring_params(bp);
+  	bnxt_set_max_func_irqs(bp, max_irqs);
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.h b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index 1ff86ce1c504..7b2939814da4 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@ -419,8 +419,6 @@ struct rx_tpa_end_cmp_ext {
+ 
+ #define BNXT_MIN_PKT_SIZE	52
+ 
+-#define BNXT_NUM_TESTS(bp)	0
+-
+ #define BNXT_DEFAULT_RX_RING_SIZE	511
+ #define BNXT_DEFAULT_TX_RING_SIZE	511
+ 
+@@ -893,6 +891,14 @@ struct bnxt_led_info {
+ 	__le16	led_color_caps;
+ };
+ 
++#define BNXT_MAX_TEST	8
++
++struct bnxt_test_info {
++	u8 offline_mask;
++	u16 timeout;
++	char string[BNXT_MAX_TEST][ETH_GSTRING_LEN];
++};
++
+ #define BNXT_GRCPF_REG_WINDOW_BASE_OUT	0x400
+ #define BNXT_CAG_REG_LEGACY_INT_STATUS	0x4014
+ #define BNXT_CAG_REG_BASE		0x300000
+@@ -1160,6 +1166,9 @@ struct bnxt {
+ 	u32			lpi_tmr_lo;
+ 	u32			lpi_tmr_hi;
+ 
++	u8			num_tests;
++	struct bnxt_test_info	*test_info;
++
+ 	u8			wol_filter_id;
+ 	u8			wol;
+ 
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+index 235aedf756e1..ad13ded52fbb 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+@@ -210,6 +210,10 @@ static int bnxt_get_sset_count(struct net_device *dev, int sset)
+ 
+ 		return num_stats;
+ 	}
++	case ETH_SS_TEST:
++		if (!bp->num_tests)
++			return -EOPNOTSUPP;
++		return bp->num_tests;
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+@@ -307,6 +311,11 @@ static void bnxt_get_strings(struct net_device *dev, u32 stringset, u8 *buf)
+ 			}
+ 		}
+ 		break;
++	case ETH_SS_TEST:
++		if (bp->num_tests)
++			memcpy(buf, bp->test_info->string,
++			       bp->num_tests * ETH_GSTRING_LEN);
++		break;
+ 	default:
+ 		netdev_err(bp->dev, "bnxt_get_strings invalid request %x\n",
+ 			   stringset);
+@@ -838,7 +847,7 @@ static void bnxt_get_drvinfo(struct net_device *dev,
+ 			sizeof(info->fw_version));
+ 	strlcpy(info->bus_info, pci_name(bp->pdev), sizeof(info->bus_info));
+ 	info->n_stats = BNXT_NUM_STATS * bp->cp_nr_rings;
+-	info->testinfo_len = BNXT_NUM_TESTS(bp);
++	info->testinfo_len = bp->num_tests;
+ 	/* TODO CHIMP_FW: eeprom dump details */
+ 	info->eedump_len = 0;
+ 	/* TODO CHIMP FW: reg dump details */
+@@ -2181,6 +2190,130 @@ static int bnxt_set_phys_id(struct net_device *dev,
+ 	return rc;
+ }
+ 
++static int bnxt_run_fw_tests(struct bnxt *bp, u8 test_mask, u8 *test_results)
++{
++	struct hwrm_selftest_exec_output *resp = bp->hwrm_cmd_resp_addr;
++	struct hwrm_selftest_exec_input req = {0};
++	int rc;
++
++	bnxt_hwrm_cmd_hdr_init(bp, &req, HWRM_SELFTEST_EXEC, -1, -1);
++	mutex_lock(&bp->hwrm_cmd_lock);
++	resp->test_success = 0;
++	req.flags = test_mask;
++	rc = _hwrm_send_message(bp, &req, sizeof(req), bp->test_info->timeout);
++	*test_results = resp->test_success;
++	mutex_unlock(&bp->hwrm_cmd_lock);
++	return rc;
++}
++
++#define BNXT_DRV_TESTS			0
++
++static void bnxt_self_test(struct net_device *dev, struct ethtool_test *etest,
++			   u64 *buf)
++{
++	struct bnxt *bp = netdev_priv(dev);
++	bool offline = false;
++	u8 test_results = 0;
++	u8 test_mask = 0;
++	int rc, i;
++
++	if (!bp->num_tests || !BNXT_SINGLE_PF(bp))
++		return;
++	memset(buf, 0, sizeof(u64) * bp->num_tests);
++	if (!netif_running(dev)) {
++		etest->flags |= ETH_TEST_FL_FAILED;
++		return;
++	}
++
++	if (etest->flags & ETH_TEST_FL_OFFLINE) {
++		if (bp->pf.active_vfs) {
++			etest->flags |= ETH_TEST_FL_FAILED;
++			netdev_warn(dev, "Offline tests cannot be run with active VFs\n");
++			return;
++		}
++		offline = true;
++	}
++
++	for (i = 0; i < bp->num_tests - BNXT_DRV_TESTS; i++) {
++		u8 bit_val = 1 << i;
++
++		if (!(bp->test_info->offline_mask & bit_val))
++			test_mask |= bit_val;
++		else if (offline)
++			test_mask |= bit_val;
++	}
++	if (!offline) {
++		bnxt_run_fw_tests(bp, test_mask, &test_results);
++	} else {
++		rc = bnxt_close_nic(bp, false, false);
++		if (rc)
++			return;
++		bnxt_run_fw_tests(bp, test_mask, &test_results);
++		bnxt_open_nic(bp, false, true);
++	}
++	for (i = 0; i < bp->num_tests - BNXT_DRV_TESTS; i++) {
++		u8 bit_val = 1 << i;
++
++		if ((test_mask & bit_val) && !(test_results & bit_val)) {
++			buf[i] = 1;
++			etest->flags |= ETH_TEST_FL_FAILED;
++		}
++	}
++}
++
++void bnxt_ethtool_init(struct bnxt *bp)
++{
++	struct hwrm_selftest_qlist_output *resp = bp->hwrm_cmd_resp_addr;
++	struct hwrm_selftest_qlist_input req = {0};
++	struct bnxt_test_info *test_info;
++	int i, rc;
++
++	if (bp->hwrm_spec_code < 0x10704 || !BNXT_SINGLE_PF(bp))
++		return;
++
++	bnxt_hwrm_cmd_hdr_init(bp, &req, HWRM_SELFTEST_QLIST, -1, -1);
++	mutex_lock(&bp->hwrm_cmd_lock);
++	rc = _hwrm_send_message(bp, &req, sizeof(req), HWRM_CMD_TIMEOUT);
++	if (rc)
++		goto ethtool_init_exit;
++
++	test_info = kzalloc(sizeof(*bp->test_info), GFP_KERNEL);
++	if (!test_info)
++		goto ethtool_init_exit;
++
++	bp->test_info = test_info;
++	bp->num_tests = resp->num_tests + BNXT_DRV_TESTS;
++	if (bp->num_tests > BNXT_MAX_TEST)
++		bp->num_tests = BNXT_MAX_TEST;
++
++	test_info->offline_mask = resp->offline_tests;
++	test_info->timeout = le16_to_cpu(resp->test_timeout);
++	if (!test_info->timeout)
++		test_info->timeout = HWRM_CMD_TIMEOUT;
++	for (i = 0; i < bp->num_tests; i++) {
++		char *str = test_info->string[i];
++		char *fw_str = resp->test0_name + i * 32;
++
++		strlcpy(str, fw_str, ETH_GSTRING_LEN);
++		strncat(str, " test", ETH_GSTRING_LEN - strlen(str));
++		if (test_info->offline_mask & (1 << i))
++			strncat(str, " (offline)",
++				ETH_GSTRING_LEN - strlen(str));
++		else
++			strncat(str, " (online)",
++				ETH_GSTRING_LEN - strlen(str));
++	}
++
++ethtool_init_exit:
++	mutex_unlock(&bp->hwrm_cmd_lock);
++}
++
++void bnxt_ethtool_free(struct bnxt *bp)
++{
++	kfree(bp->test_info);
++	bp->test_info = NULL;
++}
++
+ const struct ethtool_ops bnxt_ethtool_ops = {
+ 	.get_link_ksettings	= bnxt_get_link_ksettings,
+ 	.set_link_ksettings	= bnxt_set_link_ksettings,
+@@ -2216,4 +2349,5 @@ const struct ethtool_ops bnxt_ethtool_ops = {
+ 	.get_module_eeprom	= bnxt_get_module_eeprom,
+ 	.nway_reset		= bnxt_nway_reset,
+ 	.set_phys_id		= bnxt_set_phys_id,
++	.self_test		= bnxt_self_test,
+ };
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.h b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.h
+index 27621710e07b..f1bc90b6fb5b 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.h
+@@ -39,5 +39,7 @@ extern const struct ethtool_ops bnxt_ethtool_ops;
+ u32 _bnxt_fw_to_ethtool_adv_spds(u16, u8);
+ u32 bnxt_fw_to_ethtool_speed(u16);
+ u16 bnxt_get_fw_auto_link_speeds(u32);
++void bnxt_ethtool_init(struct bnxt *bp);
++void bnxt_ethtool_free(struct bnxt *bp);
+ 
+ #endif
