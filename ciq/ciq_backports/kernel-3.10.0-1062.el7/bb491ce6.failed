@@ -1,0 +1,153 @@
+gfs2: Check for the end of metadata in punch_hole
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit bb491ce67aa7c1635e5ae4f2f304a7d13d3dbe71
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/bb491ce6.failed
+
+When punching a hole or truncating an inode down to a given size, also
+check if the truncate point / start of the hole is within the range we
+have metadata for.  Otherwise, we can end up freeing blocks that
+shouldn't be freed, corrupting the inode, or crashing the machine when
+trying to punch a hole into the void.
+
+When growing an inode via truncate, we set the new size but we don't
+allocate additional levels of indirect blocks and grow the inode height.
+When shrinking that inode again, the new size may still point beyond the
+end of the inode's metadata.
+
+Fixes xfstest generic/476.
+
+	Debugged-by: Bob Peterson <rpeterso@redhat.com>
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+(cherry picked from commit bb491ce67aa7c1635e5ae4f2f304a7d13d3dbe71)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/bmap.c
+diff --cc fs/gfs2/bmap.c
+index 3dae2b1463b5,ce4a978e0c18..000000000000
+--- a/fs/gfs2/bmap.c
++++ b/fs/gfs2/bmap.c
+@@@ -1279,21 -1333,26 +1279,26 @@@ static bool mp_eq_to_hgt(struct metapat
+  }
+  
+  /**
+ - * punch_hole - deallocate blocks in a file
+ + * trunc_dealloc - truncate a file down to a desired size
+   * @ip: inode to truncate
+ - * @offset: the start of the hole
+ - * @length: the size of the hole (or 0 for truncate)
+ + * @newsize: The desired size of the file
+   *
+ - * Punch a hole into a file or truncate a file at a given position.  This
+ - * function operates in whole blocks (@offset and @length are rounded
+ - * accordingly); partially filled blocks must be cleared otherwise.
+ - *
+ - * This function works from the bottom up, and from the right to the left. In
+ - * other words, it strips off the highest layer (data) before stripping any of
+ - * the metadata. Doing it this way is best in case the operation is interrupted
+ - * by power failure, etc.  The dinode is rewritten in every transaction to
+ - * guarantee integrity.
+ + * This function truncates a file to newsize. It works from the
+ + * bottom up, and from the right to the left. In other words, it strips off
+ + * the highest layer (data) before stripping any of the metadata. Doing it
+ + * this way is best in case the operation is interrupted by power failure, etc.
+ + * The dinode is rewritten in every transaction to guarantee integrity.
+   */
+ -static int punch_hole(struct gfs2_inode *ip, u64 offset, u64 length)
+ +static int trunc_dealloc(struct gfs2_inode *ip, u64 newsize)
+  {
+  	struct gfs2_sbd *sdp = GFS2_SB(&ip->i_inode);
+++<<<<<<< HEAD
+ +	const u64 *arr = sdp->sd_heightsize;
+ +	struct metapath mp;
+++=======
++ 	u64 maxsize = sdp->sd_heightsize[ip->i_height];
++ 	struct metapath mp = {};
+++>>>>>>> bb491ce67aa7 (gfs2: Check for the end of metadata in punch_hole)
+  	struct buffer_head *dibh, *bh;
+  	struct gfs2_holder rd_gh;
+  	unsigned int bsize_shift = sdp->sd_sb.sb_bsize_shift;
+@@@ -1305,28 -1365,58 +1310,56 @@@
+  	int ret, state;
+  	int mp_h; /* metapath buffers are read in to this height */
+  	u64 prev_bnr = 0;
+++<<<<<<< HEAD
+ +	bool keep_start; /* need to preserve the first meta pointer? */
+++=======
++ 	__be64 *start, *end;
++ 
++ 	if (offset >= maxsize) {
++ 		/*
++ 		 * The starting point lies beyond the allocated meta-data;
++ 		 * there are no blocks do deallocate.
++ 		 */
++ 		return 0;
++ 	}
++ 
++ 	/*
++ 	 * The start position of the hole is defined by lblock, start_list, and
++ 	 * start_aligned.  The end position of the hole is defined by lend,
++ 	 * end_list, and end_aligned.
++ 	 *
++ 	 * start_aligned and end_aligned define down to which height the start
++ 	 * and end positions are aligned to the metadata tree (i.e., the
++ 	 * position is a multiple of the metadata granularity at the height
++ 	 * above).  This determines at which heights additional meta pointers
++ 	 * needs to be preserved for the remaining data.
++ 	 */
++ 
++ 	if (length) {
++ 		u64 end_offset = offset + length;
++ 		u64 lend;
+++>>>>>>> bb491ce67aa7 (gfs2: Check for the end of metadata in punch_hole)
+  
+ +	if ((lblock + 1) * sdp->sd_sb.sb_bsize > arr[ip->i_height]) {
+  		/*
+ -		 * Clip the end at the maximum file size for the given height:
+ -		 * that's how far the metadata goes; files bigger than that
+ -		 * will have additional layers of indirection.
+ +		 * The truncate point lies beyond the allocated meta-data;
+ +		 * there is nothing to truncate.
+  		 */
+ -		if (end_offset > maxsize)
+ -			end_offset = maxsize;
+ -		lend = end_offset >> bsize_shift;
+ -
+ -		if (lblock >= lend)
+ -			return 0;
+ -
+ -		find_metapath(sdp, lend, &mp, ip->i_height);
+ -		end_list = __end_list;
+ -		memcpy(end_list, mp.mp_list, sizeof(mp.mp_list));
+ -
+ -		for (mp_h = ip->i_height - 1; mp_h > 0; mp_h--) {
+ -			if (end_list[mp_h])
+ -				break;
+ -		}
+ -		end_aligned = mp_h;
+ +		return 0;
+  	}
+ -
+ +	memset(&mp, 0, sizeof(mp));
+  	find_metapath(sdp, lblock, &mp, ip->i_height);
+ +
+  	memcpy(start_list, mp.mp_list, sizeof(start_list));
+  
+ +	/*
+ +	 * Set start_aligned to the metadata height up to which the truncate
+ +	 * point is aligned to the metadata tree (i.e., the truncate point is a
+ +	 * multiple of the granularity at the height above).  This determines
+ +	 * at which heights an additional meta pointer needs to be preserved:
+ +	 * an additional meta pointer is needed at a given height if
+ +	 * height < start_aligned.
+ +	 */
+  	for (mp_h = ip->i_height - 1; mp_h > 0; mp_h--) {
+  		if (start_list[mp_h])
+  			break;
+* Unmerged path fs/gfs2/bmap.c
