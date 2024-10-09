@@ -1,0 +1,379 @@
+amd-xgbe: Fix DMA API debug warning
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit cfbfd86bfde15020bccde377e11586ee5c8b701d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/cfbfd86b.failed
+
+When running a kernel configured with CONFIG_DMA_API_DEBUG=y a warning
+is issued:
+  DMA-API: device driver tries to sync DMA memory it has not allocated
+
+This warning is the result of mapping the full range of the Rx buffer
+pages allocated and then performing a dma_sync_single_for_cpu against
+a calculated DMA address. The proper thing to do is to use the
+dma_sync_single_range_for_cpu with a base DMA address and an offset.
+
+	Reported-by: Kim Phillips <kim.phillips@arm.com>
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Tested-by: Kim Phillips <kim.phillips@arm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cfbfd86bfde15020bccde377e11586ee5c8b701d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+#	drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+#	drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+#	drivers/net/ethernet/amd/xgbe/xgbe.h
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+index 28954354521f,b3bc87fe3764..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-desc.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+@@@ -234,6 -260,97 +234,100 @@@ err_ring
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int xgbe_alloc_pages(struct xgbe_prv_data *pdata,
++ 			    struct xgbe_page_alloc *pa, gfp_t gfp, int order)
++ {
++ 	struct page *pages = NULL;
++ 	dma_addr_t pages_dma;
++ 	int ret;
++ 
++ 	/* Try to obtain pages, decreasing order if necessary */
++ 	gfp |= __GFP_COLD | __GFP_COMP | __GFP_NOWARN;
++ 	while (order >= 0) {
++ 		pages = alloc_pages(gfp, order);
++ 		if (pages)
++ 			break;
++ 
++ 		order--;
++ 	}
++ 	if (!pages)
++ 		return -ENOMEM;
++ 
++ 	/* Map the pages */
++ 	pages_dma = dma_map_page(pdata->dev, pages, 0,
++ 				 PAGE_SIZE << order, DMA_FROM_DEVICE);
++ 	ret = dma_mapping_error(pdata->dev, pages_dma);
++ 	if (ret) {
++ 		put_page(pages);
++ 		return ret;
++ 	}
++ 
++ 	pa->pages = pages;
++ 	pa->pages_len = PAGE_SIZE << order;
++ 	pa->pages_offset = 0;
++ 	pa->pages_dma = pages_dma;
++ 
++ 	return 0;
++ }
++ 
++ static void xgbe_set_buffer_data(struct xgbe_buffer_data *bd,
++ 				 struct xgbe_page_alloc *pa,
++ 				 unsigned int len)
++ {
++ 	get_page(pa->pages);
++ 	bd->pa = *pa;
++ 
++ 	bd->dma_base = pa->pages_dma;
++ 	bd->dma_off = pa->pages_offset;
++ 	bd->dma_len = len;
++ 
++ 	pa->pages_offset += len;
++ 	if ((pa->pages_offset + len) > pa->pages_len) {
++ 		/* This data descriptor is responsible for unmapping page(s) */
++ 		bd->pa_unmap = *pa;
++ 
++ 		/* Get a new allocation next time */
++ 		pa->pages = NULL;
++ 		pa->pages_len = 0;
++ 		pa->pages_offset = 0;
++ 		pa->pages_dma = 0;
++ 	}
++ }
++ 
++ static int xgbe_map_rx_buffer(struct xgbe_prv_data *pdata,
++ 			      struct xgbe_ring *ring,
++ 			      struct xgbe_ring_data *rdata)
++ {
++ 	int order, ret;
++ 
++ 	if (!ring->rx_hdr_pa.pages) {
++ 		ret = xgbe_alloc_pages(pdata, &ring->rx_hdr_pa, GFP_ATOMIC, 0);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	if (!ring->rx_buf_pa.pages) {
++ 		order = max_t(int, PAGE_ALLOC_COSTLY_ORDER - 1, 0);
++ 		ret = xgbe_alloc_pages(pdata, &ring->rx_buf_pa, GFP_ATOMIC,
++ 				       order);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	/* Set up the header page info */
++ 	xgbe_set_buffer_data(&rdata->rx.hdr, &ring->rx_hdr_pa,
++ 			     XGBE_SKB_ALLOC_SIZE);
++ 
++ 	/* Set up the buffer page info */
++ 	xgbe_set_buffer_data(&rdata->rx.buf, &ring->rx_buf_pa,
++ 			     pdata->rx_buf_size);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> cfbfd86bfde1 (amd-xgbe: Fix DMA API debug warning)
+  static void xgbe_wrapper_tx_descriptor_init(struct xgbe_prv_data *pdata)
+  {
+  	struct xgbe_hw_if *hw_if = &pdata->hw_if;
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+index ec5481f846ee,a4473d8ff4fa..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+@@@ -827,24 -1103,41 +827,51 @@@ static void xgbe_tx_desc_init(struct xg
+  	DBGPR("<--tx_desc_init\n");
+  }
+  
+ -static void xgbe_rx_desc_reset(struct xgbe_prv_data *pdata,
+ -			       struct xgbe_ring_data *rdata, unsigned int index)
+ +static void xgbe_rx_desc_reset(struct xgbe_ring_data *rdata)
+  {
+  	struct xgbe_ring_desc *rdesc = rdata->rdesc;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int rx_usecs = pdata->rx_usecs;
++ 	unsigned int rx_frames = pdata->rx_frames;
++ 	unsigned int inte;
++ 	dma_addr_t hdr_dma, buf_dma;
++ 
++ 	if (!rx_usecs && !rx_frames) {
++ 		/* No coalescing, interrupt for every descriptor */
++ 		inte = 1;
++ 	} else {
++ 		/* Set interrupt based on Rx frame coalescing setting */
++ 		if (rx_frames && !((index + 1) % rx_frames))
++ 			inte = 1;
++ 		else
++ 			inte = 0;
++ 	}
+++>>>>>>> cfbfd86bfde1 (amd-xgbe: Fix DMA API debug warning)
+  
+  	/* Reset the Rx descriptor
+ -	 *   Set buffer 1 (lo) address to header dma address (lo)
+ -	 *   Set buffer 1 (hi) address to header dma address (hi)
+ -	 *   Set buffer 2 (lo) address to buffer dma address (lo)
+ -	 *   Set buffer 2 (hi) address to buffer dma address (hi) and
+ -	 *     set control bits OWN and INTE
+ +	 *   Set buffer 1 (lo) address to dma address (lo)
+ +	 *   Set buffer 1 (hi) address to dma address (hi)
+ +	 *   Set buffer 2 (lo) address to zero
+ +	 *   Set buffer 2 (hi) address to zero and set control bits
+ +	 *     OWN and INTE
+  	 */
+++<<<<<<< HEAD
+ +	rdesc->desc0 = cpu_to_le32(lower_32_bits(rdata->skb_dma));
+ +	rdesc->desc1 = cpu_to_le32(upper_32_bits(rdata->skb_dma));
+ +	rdesc->desc2 = 0;
+++=======
++ 	hdr_dma = rdata->rx.hdr.dma_base + rdata->rx.hdr.dma_off;
++ 	buf_dma = rdata->rx.buf.dma_base + rdata->rx.buf.dma_off;
++ 	rdesc->desc0 = cpu_to_le32(lower_32_bits(hdr_dma));
++ 	rdesc->desc1 = cpu_to_le32(upper_32_bits(hdr_dma));
++ 	rdesc->desc2 = cpu_to_le32(lower_32_bits(buf_dma));
++ 	rdesc->desc3 = cpu_to_le32(upper_32_bits(buf_dma));
+++>>>>>>> cfbfd86bfde1 (amd-xgbe: Fix DMA API debug warning)
+  
+ -	XGMAC_SET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, INTE, inte);
+ +	rdesc->desc3 = 0;
+ +	if (rdata->interrupt)
+ +		XGMAC_SET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, INTE, 1);
+  
+  	/* Since the Rx DMA engine is likely running, make sure everything
+  	 * is written to the descriptor(s) before setting the OWN bit
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index d58e85811bc9,aae9d5ecd182..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@@ -1098,6 -1749,52 +1098,55 @@@ static void xgbe_rx_refresh(struct xgbe
+  			  lower_32_bits(rdata->rdesc_dma));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct sk_buff *xgbe_create_skb(struct xgbe_prv_data *pdata,
++ 				       struct napi_struct *napi,
++ 				       struct xgbe_ring_data *rdata,
++ 				       unsigned int len)
++ {
++ 	struct sk_buff *skb;
++ 	u8 *packet;
++ 	unsigned int copy_len;
++ 
++ 	skb = napi_alloc_skb(napi, rdata->rx.hdr.dma_len);
++ 	if (!skb)
++ 		return NULL;
++ 
++ 	/* Start with the header buffer which may contain just the header
++ 	 * or the header plus data
++ 	 */
++ 	dma_sync_single_range_for_cpu(pdata->dev, rdata->rx.hdr.dma_base,
++ 				      rdata->rx.hdr.dma_off,
++ 				      rdata->rx.hdr.dma_len, DMA_FROM_DEVICE);
++ 
++ 	packet = page_address(rdata->rx.hdr.pa.pages) +
++ 		 rdata->rx.hdr.pa.pages_offset;
++ 	copy_len = (rdata->rx.hdr_len) ? rdata->rx.hdr_len : len;
++ 	copy_len = min(rdata->rx.hdr.dma_len, copy_len);
++ 	skb_copy_to_linear_data(skb, packet, copy_len);
++ 	skb_put(skb, copy_len);
++ 
++ 	len -= copy_len;
++ 	if (len) {
++ 		/* Add the remaining data as a frag */
++ 		dma_sync_single_range_for_cpu(pdata->dev,
++ 					      rdata->rx.buf.dma_base,
++ 					      rdata->rx.buf.dma_off,
++ 					      rdata->rx.buf.dma_len,
++ 					      DMA_FROM_DEVICE);
++ 
++ 		skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
++ 				rdata->rx.buf.pa.pages,
++ 				rdata->rx.buf.pa.pages_offset,
++ 				len, rdata->rx.buf.dma_len);
++ 		rdata->rx.buf.pa.pages = NULL;
++ 	}
++ 
++ 	return skb;
++ }
++ 
+++>>>>>>> cfbfd86bfde1 (amd-xgbe: Fix DMA API debug warning)
+  static int xgbe_tx_poll(struct xgbe_channel *channel)
+  {
+  	struct xgbe_prv_data *pdata = channel->pdata;
+@@@ -1211,35 -1932,44 +1260,44 @@@ read_again
+  
+  		if (error || packet->errors) {
+  			if (packet->errors)
+ -				netif_err(pdata, rx_err, netdev,
+ -					  "error in received packet\n");
+ +				DBGPR("Error in received packet\n");
+  			dev_kfree_skb(skb);
+ -			goto next_packet;
+ +			continue;
+  		}
+  
+ -		if (!context) {
+ -			/* Length is cumulative, get this descriptor's length */
+ -			rdesc_len = rdata->rx.len - len;
+ -			len += rdesc_len;
+ -
+ -			if (rdesc_len && !skb) {
+ -				skb = xgbe_create_skb(pdata, napi, rdata,
+ -						      rdesc_len);
+ -				if (!skb)
+ +		put_len = rdata->len - cur_len;
+ +		if (skb) {
+ +			if (pskb_expand_head(skb, 0, put_len, GFP_ATOMIC)) {
+ +				DBGPR("pskb_expand_head error\n");
+ +				if (incomplete) {
+  					error = 1;
+++<<<<<<< HEAD
+ +					goto read_again;
+ +				}
+++=======
++ 			} else if (rdesc_len) {
++ 				dma_sync_single_range_for_cpu(pdata->dev,
++ 							rdata->rx.buf.dma_base,
++ 							rdata->rx.buf.dma_off,
++ 							rdata->rx.buf.dma_len,
++ 							DMA_FROM_DEVICE);
+++>>>>>>> cfbfd86bfde1 (amd-xgbe: Fix DMA API debug warning)
+  
+ -				skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
+ -						rdata->rx.buf.pa.pages,
+ -						rdata->rx.buf.pa.pages_offset,
+ -						rdesc_len,
+ -						rdata->rx.buf.dma_len);
+ -				rdata->rx.buf.pa.pages = NULL;
+ +				dev_kfree_skb(skb);
+ +				continue;
+  			}
+ +			memcpy(skb_tail_pointer(skb), rdata->skb->data,
+ +			       put_len);
+ +		} else {
+ +			skb = rdata->skb;
+ +			rdata->skb = NULL;
+  		}
+ +		skb_put(skb, put_len);
+ +		cur_len += put_len;
+  
+ -		if (incomplete || context_next)
+ +		if (incomplete)
+  			goto read_again;
+  
+ -		if (!skb)
+ -			goto next_packet;
+ -
+  		/* Be sure we don't exceed the configured MTU */
+  		max_len = netdev->mtu + ETH_HLEN;
+  		if (!(netdev->features & NETIF_F_HW_VLAN_CTAG_RX) &&
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe.h
+index 1903f878545a,717ce21b6077..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe.h
+@@@ -221,6 -323,40 +221,43 @@@ struct xgbe_ring_desc 
+  	__le32 desc3;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Page allocation related values */
++ struct xgbe_page_alloc {
++ 	struct page *pages;
++ 	unsigned int pages_len;
++ 	unsigned int pages_offset;
++ 
++ 	dma_addr_t pages_dma;
++ };
++ 
++ /* Ring entry buffer data */
++ struct xgbe_buffer_data {
++ 	struct xgbe_page_alloc pa;
++ 	struct xgbe_page_alloc pa_unmap;
++ 
++ 	dma_addr_t dma_base;
++ 	unsigned long dma_off;
++ 	unsigned int dma_len;
++ };
++ 
++ /* Tx-related ring data */
++ struct xgbe_tx_ring_data {
++ 	unsigned int packets;		/* BQL packet count */
++ 	unsigned int bytes;		/* BQL byte count */
++ };
++ 
++ /* Rx-related ring data */
++ struct xgbe_rx_ring_data {
++ 	struct xgbe_buffer_data hdr;	/* Header locations */
++ 	struct xgbe_buffer_data buf;	/* Payload locations */
++ 
++ 	unsigned short hdr_len;		/* Length of received header */
++ 	unsigned short len;		/* Length of received packet */
++ };
++ 
+++>>>>>>> cfbfd86bfde1 (amd-xgbe: Fix DMA API debug warning)
+  /* Structure used to hold information related to the descriptor
+   * and the packet associated with the descriptor (always use
+   * use the XGBE_GET_DESC_DATA macro to access this data from the ring)
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-desc.c
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe.h
