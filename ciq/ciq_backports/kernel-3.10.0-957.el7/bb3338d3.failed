@@ -1,0 +1,108 @@
+md/raid5-cache: in r5l_do_submit_io(), submit io->split_bio first
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [md] raid5-cache: in r5l_do_submit_io(), submit io->split_bio first (Nigel Croxon) [1494474]
+Rebuild_FUZZ: 97.64%
+commit-author Song Liu <songliubraving@fb.com>
+commit bb3338d3474e0329918fda9dae2c52751731eb58
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/bb3338d3.failed
+
+In r5l_do_submit_io(), it is necessary to check io->split_bio before
+submit io->current_bio. This is because, endio of current_bio may
+free the whole IO unit, and thus change io->split_bio.
+
+	Signed-off-by: Song Liu <songliubraving@fb.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit bb3338d3474e0329918fda9dae2c52751731eb58)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid5-cache.c
+diff --cc drivers/md/raid5-cache.c
+index a6628b7c2270,a6a62e212cd3..000000000000
+--- a/drivers/md/raid5-cache.c
++++ b/drivers/md/raid5-cache.c
+@@@ -539,6 -598,76 +539,79 @@@ static void r5l_log_endio(struct bio *b
+  
+  	if (log->need_cache_flush)
+  		md_wakeup_thread(log->rdev->mddev->thread);
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (io->has_null_flush) {
++ 		struct bio *bi;
++ 
++ 		WARN_ON(bio_list_empty(&io->flush_barriers));
++ 		while ((bi = bio_list_pop(&io->flush_barriers)) != NULL) {
++ 			bio_endio(bi);
++ 			atomic_dec(&io->pending_stripe);
++ 		}
++ 	}
++ 
++ 	/* finish flush only io_unit and PAYLOAD_FLUSH only io_unit */
++ 	if (atomic_read(&io->pending_stripe) == 0)
++ 		__r5l_stripe_write_finished(io);
++ }
++ 
++ static void r5l_do_submit_io(struct r5l_log *log, struct r5l_io_unit *io)
++ {
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&log->io_list_lock, flags);
++ 	__r5l_set_io_unit_state(io, IO_UNIT_IO_START);
++ 	spin_unlock_irqrestore(&log->io_list_lock, flags);
++ 
++ 	/*
++ 	 * In case of journal device failures, submit_bio will get error
++ 	 * and calls endio, then active stripes will continue write
++ 	 * process. Therefore, it is not necessary to check Faulty bit
++ 	 * of journal device here.
++ 	 *
++ 	 * We can't check split_bio after current_bio is submitted. If
++ 	 * io->split_bio is null, after current_bio is submitted, current_bio
++ 	 * might already be completed and the io_unit is freed. We submit
++ 	 * split_bio first to avoid the issue.
++ 	 */
++ 	if (io->split_bio) {
++ 		if (io->has_flush)
++ 			io->split_bio->bi_opf |= REQ_PREFLUSH;
++ 		if (io->has_fua)
++ 			io->split_bio->bi_opf |= REQ_FUA;
++ 		submit_bio(io->split_bio);
++ 	}
++ 
++ 	if (io->has_flush)
++ 		io->current_bio->bi_opf |= REQ_PREFLUSH;
++ 	if (io->has_fua)
++ 		io->current_bio->bi_opf |= REQ_FUA;
++ 	submit_bio(io->current_bio);
++ }
++ 
++ /* deferred io_unit will be dispatched here */
++ static void r5l_submit_io_async(struct work_struct *work)
++ {
++ 	struct r5l_log *log = container_of(work, struct r5l_log,
++ 					   deferred_io_work);
++ 	struct r5l_io_unit *io = NULL;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&log->io_list_lock, flags);
++ 	if (!list_empty(&log->running_ios)) {
++ 		io = list_first_entry(&log->running_ios, struct r5l_io_unit,
++ 				      log_sibling);
++ 		if (!io->io_deferred)
++ 			io = NULL;
++ 		else
++ 			io->io_deferred = 0;
++ 	}
++ 	spin_unlock_irqrestore(&log->io_list_lock, flags);
++ 	if (io)
++ 		r5l_do_submit_io(log, io);
+++>>>>>>> bb3338d3474e (md/raid5-cache: in r5l_do_submit_io(), submit io->split_bio first)
+  }
+  
+  static void r5c_disable_writeback_async(struct work_struct *work)
+* Unmerged path drivers/md/raid5-cache.c
