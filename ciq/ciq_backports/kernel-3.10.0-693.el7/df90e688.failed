@@ -1,0 +1,84 @@
+l2tp: fix lookup for sockets not bound to a device in l2tp_ip
+
+jira LE-1907
+cve CVE-2016-10200
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Guillaume Nault <g.nault@alphalink.fr>
+commit df90e6886146dd744eb3929782e6df9749cd4a69
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/df90e688.failed
+
+When looking up an l2tp socket, we must consider a null netdevice id as
+wild card. There are currently two problems caused by
+__l2tp_ip_bind_lookup() not considering 'dif' as wild card when set to 0:
+
+  * A socket bound to a device (i.e. with sk->sk_bound_dev_if != 0)
+    never receives any packet. Since __l2tp_ip_bind_lookup() is called
+    with dif == 0 in l2tp_ip_recv(), sk->sk_bound_dev_if is always
+    different from 'dif' so the socket doesn't match.
+
+  * Two sockets, one bound to a device but not the other, can be bound
+    to the same address. If the first socket binding to the address is
+    the one that is also bound to a device, the second socket can bind
+    to the same address without __l2tp_ip_bind_lookup() noticing the
+    overlap.
+
+To fix this issue, we need to consider that any null device index, be
+it 'sk->sk_bound_dev_if' or 'dif', matches with any other value.
+We also need to pass the input device index to __l2tp_ip_bind_lookup()
+on reception so that sockets bound to a device never receive packets
+from other devices.
+
+This patch fixes l2tp_ip6 in the same way.
+
+	Signed-off-by: Guillaume Nault <g.nault@alphalink.fr>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit df90e6886146dd744eb3929782e6df9749cd4a69)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/l2tp/l2tp_ip6.c
+diff --cc net/l2tp/l2tp_ip6.c
+index b296fd192ac0,4a8644001d09..000000000000
+--- a/net/l2tp/l2tp_ip6.c
++++ b/net/l2tp/l2tp_ip6.c
+@@@ -192,8 -197,8 +193,13 @@@ pass_up
+  		struct ipv6hdr *iph = ipv6_hdr(skb);
+  
+  		read_lock_bh(&l2tp_ip6_lock);
+++<<<<<<< HEAD
+ +		sk = __l2tp_ip6_bind_lookup(&init_net, &iph->daddr,
+ +					    0, tunnel_id);
+++=======
++ 		sk = __l2tp_ip6_bind_lookup(net, &iph->daddr, inet6_iif(skb),
++ 					    tunnel_id);
+++>>>>>>> df90e6886146 (l2tp: fix lookup for sockets not bound to a device in l2tp_ip)
+  		if (!sk) {
+  			read_unlock_bh(&l2tp_ip6_lock);
+  			goto discard;
+diff --git a/net/l2tp/l2tp_ip.c b/net/l2tp/l2tp_ip.c
+index 3d97ef7ec584..4a1c4585e06e 100644
+--- a/net/l2tp/l2tp_ip.c
++++ b/net/l2tp/l2tp_ip.c
+@@ -61,7 +61,8 @@ static struct sock *__l2tp_ip_bind_lookup(struct net *net, __be32 laddr, int dif
+ 		if ((l2tp->conn_id == tunnel_id) &&
+ 		    net_eq(sock_net(sk), net) &&
+ 		    !(inet->inet_rcv_saddr && inet->inet_rcv_saddr != laddr) &&
+-		    !(sk->sk_bound_dev_if && sk->sk_bound_dev_if != dif))
++		    (!sk->sk_bound_dev_if || !dif ||
++		     sk->sk_bound_dev_if == dif))
+ 			goto found;
+ 	}
+ 
+@@ -180,7 +181,8 @@ pass_up:
+ 		struct iphdr *iph = (struct iphdr *) skb_network_header(skb);
+ 
+ 		read_lock_bh(&l2tp_ip_lock);
+-		sk = __l2tp_ip_bind_lookup(net, iph->daddr, 0, tunnel_id);
++		sk = __l2tp_ip_bind_lookup(net, iph->daddr, inet_iif(skb),
++					   tunnel_id);
+ 		if (!sk) {
+ 			read_unlock_bh(&l2tp_ip_lock);
+ 			goto discard;
+* Unmerged path net/l2tp/l2tp_ip6.c
