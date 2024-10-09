@@ -429,6 +429,9 @@ static void del_flow_group(struct fs_node *node)
 	fs_get_obj(ft, fg->node.parent);
 	dev = get_dev(&ft->node);
 
+	if (ft->autogroup.active)
+		ft->autogroup.num_groups--;
+
 	if (mlx5_cmd_destroy_flow_group(dev, ft, fg->id))
 		pr_warn("flow steering can't destroy fg %d of ft %d\n",
 			fg->id, ft->id);
