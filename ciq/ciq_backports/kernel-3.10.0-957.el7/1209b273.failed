@@ -1,0 +1,229 @@
+perf test: Add infrastructure to run shell based tests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit 1209b273a25ee60a267b606bea77e068b8556a8d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/1209b273.failed
+
+To allow testing by directly using perf tools in scripts, checking that
+the effects on the system are the ones expected and that the output
+produced is as well the desired one.
+
+For instance, adding a probe at a well known location with 'perf probe',
+then checking that the results from using that probe to record are the
+desired ones, etc.
+
+The next csets will introduce tests using this new testing
+infrastructure.
+
+The scripts should return 0 for Ok, 1 for FAIL and 2 for SKIP.
+
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Michael Petlan <mpetlan@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Thomas Richter <tmricht@linux.vnet.ibm.com>
+	Cc: Wang Nan <wangnan0@huawei.com>
+Link: http://lkml.kernel.org/n/tip-swbpn7amrjqffh83lsr39s9p@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 1209b273a25ee60a267b606bea77e068b8556a8d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/tests/builtin-test.c
+diff --cc tools/perf/tests/builtin-test.c
+index 0164e0678b6e,2bd158e3c02f..000000000000
+--- a/tools/perf/tests/builtin-test.c
++++ b/tools/perf/tests/builtin-test.c
+@@@ -326,6 -354,171 +331,174 @@@ static int run_test(struct test *test, 
+  	for (j = 0; j < ARRAY_SIZE(tests); j++)	\
+  		for (t = &tests[j][0]; t->func; t++)
+  
+++<<<<<<< HEAD
+++=======
++ static int test_and_print(struct test *t, bool force_skip, int subtest)
++ {
++ 	int err;
++ 
++ 	if (!force_skip) {
++ 		pr_debug("\n--- start ---\n");
++ 		err = run_test(t, subtest);
++ 		pr_debug("---- end ----\n");
++ 	} else {
++ 		pr_debug("\n--- force skipped ---\n");
++ 		err = TEST_SKIP;
++ 	}
++ 
++ 	if (!t->subtest.get_nr)
++ 		pr_debug("%s:", t->desc);
++ 	else
++ 		pr_debug("%s subtest %d:", t->desc, subtest);
++ 
++ 	switch (err) {
++ 	case TEST_OK:
++ 		pr_info(" Ok\n");
++ 		break;
++ 	case TEST_SKIP:
++ 		color_fprintf(stderr, PERF_COLOR_YELLOW, " Skip\n");
++ 		break;
++ 	case TEST_FAIL:
++ 	default:
++ 		color_fprintf(stderr, PERF_COLOR_RED, " FAILED!\n");
++ 		break;
++ 	}
++ 
++ 	return err;
++ }
++ 
++ static const char *shell_test__description(char *description, size_t size,
++ 					   const char *path, const char *name)
++ {
++ 	FILE *fp;
++ 	char filename[PATH_MAX];
++ 
++ 	path__join(filename, sizeof(filename), path, name);
++ 	fp = fopen(filename, "r");
++ 	if (!fp)
++ 		return NULL;
++ 
++ 	description = fgets(description, size, fp);
++ 	fclose(fp);
++ 
++ 	return description ? trim(description + 1) : NULL;
++ }
++ 
++ #define for_each_shell_test(dir, ent)		\
++ 	while ((ent = readdir(dir)) != NULL)	\
++ 		if (ent->d_type == DT_REG && ent->d_name[0] != '.')
++ 
++ static const char *shell_tests__dir(char *path, size_t size)
++ {
++ 	const char *devel_dirs[] = { "./tools/perf/tests", "./tests", };
++         char *exec_path;
++ 	unsigned int i;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(devel_dirs); ++i) {
++ 		struct stat st;
++ 		if (!lstat(devel_dirs[i], &st)) {
++ 			scnprintf(path, size, "%s/shell", devel_dirs[i]);
++ 			if (!lstat(devel_dirs[i], &st))
++ 				return path;
++ 		}
++ 	}
++ 
++         /* Then installed path. */
++         exec_path = get_argv_exec_path();
++         scnprintf(path, size, "%s/tests/shell", exec_path);
++ 	free(exec_path);
++ 	return path;
++ }
++ 
++ static int shell_tests__max_desc_width(void)
++ {
++ 	DIR *dir;
++ 	struct dirent *ent;
++ 	char path_dir[PATH_MAX];
++ 	const char *path = shell_tests__dir(path_dir, sizeof(path_dir));
++ 	int width = 0;
++ 
++ 	if (path == NULL)
++ 		return -1;
++ 
++ 	dir = opendir(path);
++ 	if (!dir)
++ 		return -1;
++ 
++ 	for_each_shell_test(dir, ent) {
++ 		char bf[256];
++ 		const char *desc = shell_test__description(bf, sizeof(bf), path, ent->d_name);
++ 
++ 		if (desc) {
++ 			int len = strlen(desc);
++ 
++ 			if (width < len)
++ 				width = len;
++ 		}
++ 	}
++ 
++ 	closedir(dir);
++ 	return width;
++ }
++ 
++ struct shell_test {
++ 	const char *dir;
++ 	const char *file;
++ };
++ 
++ static int shell_test__run(struct test *test, int subdir __maybe_unused)
++ {
++ 	int err;
++ 	char script[PATH_MAX];
++ 	struct shell_test *st = test->priv;
++ 
++ 	path__join(script, sizeof(script), st->dir, st->file);
++ 
++ 	err = system(script);
++ 	if (!err)
++ 		return TEST_OK;
++ 
++ 	return WEXITSTATUS(err) == 2 ? TEST_SKIP : TEST_FAIL;
++ }
++ 
++ static int run_shell_tests(int argc, const char *argv[], int i, int width)
++ {
++ 	DIR *dir;
++ 	struct dirent *ent;
++ 	char path_dir[PATH_MAX];
++ 	struct shell_test st = {
++ 		.dir = shell_tests__dir(path_dir, sizeof(path_dir)),
++ 	};
++ 
++ 	if (st.dir == NULL)
++ 		return -1;
++ 
++ 	dir = opendir(st.dir);
++ 	if (!dir)
++ 		return -1;
++ 
++ 	for_each_shell_test(dir, ent) {
++ 		int curr = i++;
++ 		char desc[256];
++ 		struct test test = {
++ 			.desc = shell_test__description(desc, sizeof(desc), st.dir, ent->d_name),
++ 			.func = shell_test__run,
++ 			.priv = &st,
++ 		};
++ 
++ 		if (!perf_test__matches(&test, curr, argc, argv))
++ 			continue;
++ 
++ 		st.file = ent->d_name;
++ 		pr_info("%2d: %-*s:", i, width, test.desc);
++ 		test_and_print(&test, false, -1);
++ 	}
++ 
++ 	closedir(dir);
++ 	return 0;
++ }
++ 
+++>>>>>>> 1209b273a25e (perf test: Add infrastructure to run shell based tests)
+  static int __cmd_test(int argc, const char *argv[], struct intlist *skiplist)
+  {
+  	struct test *t;
+* Unmerged path tools/perf/tests/builtin-test.c
+diff --git a/tools/perf/tests/tests.h b/tools/perf/tests/tests.h
+index 1b76acfa89d8..87650c2c2c19 100644
+--- a/tools/perf/tests/tests.h
++++ b/tools/perf/tests/tests.h
+@@ -30,6 +30,7 @@ struct test {
+ 	const char *desc;
+ 	int (*func)(int subtest);
+ 	bool (*is_supported)(void);
++	void *priv;
+ };
+ 
+ /* Tests */
