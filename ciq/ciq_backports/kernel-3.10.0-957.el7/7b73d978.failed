@@ -1,0 +1,522 @@
+mm: pass the vmem_altmap to vmemmap_populate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mm] pass the vmem_altmap to vmemmap_populate (Jeff Moyer) [1505291]
+Rebuild_FUZZ: 95.24%
+commit-author Christoph Hellwig <hch@lst.de>
+commit 7b73d978a5d0d2a3637bdd57191cb6ffbad3feca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/7b73d978.failed
+
+We can just pass this on instead of having to do a radix tree lookup
+without proper locking a few levels into the callchain.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 7b73d978a5d0d2a3637bdd57191cb6ffbad3feca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/mm/mmu.c
+#	arch/powerpc/mm/init_64.c
+#	include/linux/memory_hotplug.h
+#	mm/memory_hotplug.c
+#	mm/sparse.c
+diff --cc arch/arm64/mm/mmu.c
+index eeecc9c8ed68,ec8952ff13be..000000000000
+--- a/arch/arm64/mm/mmu.c
++++ b/arch/arm64/mm/mmu.c
+@@@ -390,13 -653,15 +390,25 @@@ int kern_addr_valid(unsigned long addr
+  	return pfn_valid(pte_pfn(*pte));
+  }
+  #ifdef CONFIG_SPARSEMEM_VMEMMAP
+++<<<<<<< HEAD
+ +#ifdef CONFIG_ARM64_64K_PAGES
+ +int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node)
+ +{
+ +	return vmemmap_populate_basepages(start, end, node);
+ +}
+ +#else	/* !CONFIG_ARM64_64K_PAGES */
+ +int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node)
+++=======
++ #if !ARM64_SWAPPER_USES_SECTION_MAPS
++ int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node,
++ 		struct vmem_altmap *altmap)
++ {
++ 	return vmemmap_populate_basepages(start, end, node);
++ }
++ #else	/* !ARM64_SWAPPER_USES_SECTION_MAPS */
++ int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node,
++ 		struct vmem_altmap *altmap)
+++>>>>>>> 7b73d978a5d0 (mm: pass the vmem_altmap to vmemmap_populate)
+  {
+  	unsigned long addr = start;
+  	unsigned long next;
+diff --cc arch/powerpc/mm/init_64.c
+index bc11f9ce7444,779b74a96b8f..000000000000
+--- a/arch/powerpc/mm/init_64.c
++++ b/arch/powerpc/mm/init_64.c
+@@@ -315,7 -200,7 +316,11 @@@ int __meminit vmemmap_populate(unsigne
+  		if (vmemmap_populated(start, page_size))
+  			continue;
+  
+++<<<<<<< HEAD
+ +		p = vmemmap_alloc_block(page_size, node);
+++=======
++ 		p =  __vmemmap_alloc_block_buf(page_size, node, altmap);
+++>>>>>>> 7b73d978a5d0 (mm: pass the vmem_altmap to vmemmap_populate)
+  		if (!p)
+  			return -ENOMEM;
+  
+diff --cc include/linux/memory_hotplug.h
+index d0cd6c1954bf,cbdd6d52e877..000000000000
+--- a/include/linux/memory_hotplug.h
++++ b/include/linux/memory_hotplug.h
+@@@ -270,7 -327,8 +270,12 @@@ extern int arch_add_memory(int nid, u6
+  extern int offline_pages(unsigned long start_pfn, unsigned long nr_pages);
+  extern bool is_memblock_offlined(struct memory_block *mem);
+  extern void remove_memory(int nid, u64 start, u64 size);
+++<<<<<<< HEAD
+ +extern int sparse_add_one_section(struct zone *zone, unsigned long start_pfn);
+++=======
++ extern int sparse_add_one_section(struct pglist_data *pgdat,
++ 		unsigned long start_pfn, struct vmem_altmap *altmap);
+++>>>>>>> 7b73d978a5d0 (mm: pass the vmem_altmap to vmemmap_populate)
+  extern void sparse_remove_one_section(struct zone *zone, struct mem_section *ms,
+  		unsigned long map_offset);
+  extern struct page *sparse_decode_mem_map(unsigned long coded_mem_map,
+diff --cc mm/memory_hotplug.c
+index 4ad6525f2bd5,b36f1822c432..000000000000
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@@ -294,210 -249,16 +294,219 @@@ void register_page_bootmem_info_node(st
+  }
+  #endif /* CONFIG_HAVE_BOOTMEM_INFO_NODE */
+  
+++<<<<<<< HEAD
+ +static void grow_zone_span(struct zone *zone, unsigned long start_pfn,
+ +			   unsigned long end_pfn)
+ +{
+ +	unsigned long old_zone_end_pfn;
+ +
+ +	zone_span_writelock(zone);
+ +
+ +	old_zone_end_pfn = zone->zone_start_pfn + zone->spanned_pages;
+ +	if (!zone->spanned_pages || start_pfn < zone->zone_start_pfn)
+ +		zone->zone_start_pfn = start_pfn;
+ +
+ +	zone->spanned_pages = max(old_zone_end_pfn, end_pfn) -
+ +				zone->zone_start_pfn;
+ +
+ +	zone_span_writeunlock(zone);
+ +}
+ +
+ +static void resize_zone(struct zone *zone, unsigned long start_pfn,
+ +		unsigned long end_pfn)
+ +{
+ +	zone_span_writelock(zone);
+ +
+ +	if (end_pfn - start_pfn) {
+ +		zone->zone_start_pfn = start_pfn;
+ +		zone->spanned_pages = end_pfn - start_pfn;
+ +	} else {
+ +		/*
+ +		 * make it consist as free_area_init_core(),
+ +		 * if spanned_pages = 0, then keep start_pfn = 0
+ +		 */
+ +		zone->zone_start_pfn = 0;
+ +		zone->spanned_pages = 0;
+ +	}
+ +
+ +	zone_span_writeunlock(zone);
+ +}
+ +
+ +static void fix_zone_id(struct zone *zone, unsigned long start_pfn,
+ +		unsigned long end_pfn)
+ +{
+ +	enum zone_type zid = zone_idx(zone);
+ +	int nid = zone->zone_pgdat->node_id;
+ +	unsigned long pfn;
+ +
+ +	for (pfn = start_pfn; pfn < end_pfn; pfn++)
+ +		set_page_links(pfn_to_page(pfn), zid, nid, pfn);
+ +}
+ +
+ +/* Can fail with -ENOMEM from allocating a wait table with vmalloc() or
+ + * alloc_bootmem_node_nopanic() */
+ +static int __ref ensure_zone_is_initialized(struct zone *zone,
+ +			unsigned long start_pfn, unsigned long num_pages)
+ +{
+ +	if (!zone_is_initialized(zone))
+ +		return init_currently_empty_zone(zone, start_pfn, num_pages,
+ +						 MEMMAP_HOTPLUG);
+ +	return 0;
+ +}
+ +
+ +static int __meminit move_pfn_range_left(struct zone *z1, struct zone *z2,
+ +		unsigned long start_pfn, unsigned long end_pfn)
+ +{
+ +	int ret;
+ +	unsigned long flags;
+ +	unsigned long z1_start_pfn;
+ +
+ +	ret = ensure_zone_is_initialized(z1, start_pfn, end_pfn - start_pfn);
+ +	if (ret)
+ +		return ret;
+ +
+ +	pgdat_resize_lock(z1->zone_pgdat, &flags);
+ +
+ +	/* can't move pfns which are higher than @z2 */
+ +	if (end_pfn > zone_end_pfn(z2))
+ +		goto out_fail;
+ +	/* the move out part mast at the left most of @z2 */
+ +	if (start_pfn > z2->zone_start_pfn)
+ +		goto out_fail;
+ +	/* must included/overlap */
+ +	if (end_pfn <= z2->zone_start_pfn)
+ +		goto out_fail;
+ +
+ +	/* use start_pfn for z1's start_pfn if z1 is empty */
+ +	if (z1->spanned_pages)
+ +		z1_start_pfn = z1->zone_start_pfn;
+ +	else
+ +		z1_start_pfn = start_pfn;
+ +
+ +	resize_zone(z1, z1_start_pfn, end_pfn);
+ +	resize_zone(z2, end_pfn, zone_end_pfn(z2));
+ +
+ +	pgdat_resize_unlock(z1->zone_pgdat, &flags);
+ +
+ +	fix_zone_id(z1, start_pfn, end_pfn);
+ +
+ +	return 0;
+ +out_fail:
+ +	pgdat_resize_unlock(z1->zone_pgdat, &flags);
+ +	return -1;
+ +}
+ +
+ +static int __meminit move_pfn_range_right(struct zone *z1, struct zone *z2,
+ +		unsigned long start_pfn, unsigned long end_pfn)
+ +{
+ +	int ret;
+ +	unsigned long flags;
+ +	unsigned long z2_end_pfn;
+ +
+ +	ret = ensure_zone_is_initialized(z2, start_pfn, end_pfn - start_pfn);
+ +	if (ret)
+ +		return ret;
+ +
+ +	pgdat_resize_lock(z1->zone_pgdat, &flags);
+ +
+ +	/* can't move pfns which are lower than @z1 */
+ +	if (z1->zone_start_pfn > start_pfn)
+ +		goto out_fail;
+ +	/* the move out part mast at the right most of @z1 */
+ +	if (zone_end_pfn(z1) >  end_pfn)
+ +		goto out_fail;
+ +	/* must included/overlap */
+ +	if (start_pfn >= zone_end_pfn(z1))
+ +		goto out_fail;
+ +
+ +	/* use end_pfn for z2's end_pfn if z2 is empty */
+ +	if (z2->spanned_pages)
+ +		z2_end_pfn = zone_end_pfn(z2);
+ +	else
+ +		z2_end_pfn = end_pfn;
+ +
+ +	resize_zone(z1, z1->zone_start_pfn, start_pfn);
+ +	resize_zone(z2, start_pfn, z2_end_pfn);
+ +
+ +	pgdat_resize_unlock(z1->zone_pgdat, &flags);
+ +
+ +	fix_zone_id(z2, start_pfn, end_pfn);
+ +
+ +	return 0;
+ +out_fail:
+ +	pgdat_resize_unlock(z1->zone_pgdat, &flags);
+ +	return -1;
+ +}
+ +
+ +static void grow_pgdat_span(struct pglist_data *pgdat, unsigned long start_pfn,
+ +			    unsigned long end_pfn)
+ +{
+ +	unsigned long old_pgdat_end_pfn =
+ +		pgdat->node_start_pfn + pgdat->node_spanned_pages;
+ +
+ +	if (!pgdat->node_spanned_pages || start_pfn < pgdat->node_start_pfn)
+ +		pgdat->node_start_pfn = start_pfn;
+ +
+ +	pgdat->node_spanned_pages = max(old_pgdat_end_pfn, end_pfn) -
+ +					pgdat->node_start_pfn;
+ +}
+ +
+ +static int __meminit __add_zone(struct zone *zone, unsigned long phys_start_pfn)
+ +{
+ +	struct pglist_data *pgdat = zone->zone_pgdat;
+ +	int nr_pages = PAGES_PER_SECTION;
+ +	int nid = pgdat->node_id;
+ +	int zone_type;
+ +	unsigned long flags, pfn;
+ +	int ret;
+ +
+ +#ifdef CONFIG_ZONE_DEVICE
+ +	if (zone == pgdat->zone_device)
+ +		zone_type = ZONE_DEVICE;
+ +	else
+ +#endif
+ +		zone_type = zone - pgdat->node_zones;
+ +
+ +	ret = ensure_zone_is_initialized(zone, phys_start_pfn, nr_pages);
+ +	if (ret)
+ +		return ret;
+ +
+ +	pgdat_resize_lock(zone->zone_pgdat, &flags);
+ +	grow_zone_span(zone, phys_start_pfn, phys_start_pfn + nr_pages);
+ +	grow_pgdat_span(zone->zone_pgdat, phys_start_pfn,
+ +			phys_start_pfn + nr_pages);
+ +	pgdat_resize_unlock(zone->zone_pgdat, &flags);
+ +	memmap_init_zone(nr_pages, nid, zone_type,
+ +			 phys_start_pfn, MEMMAP_HOTPLUG);
+ +
+ +	/* online_page_range is called later and expects pages reserved */
+ +	for (pfn = phys_start_pfn; pfn < phys_start_pfn + nr_pages; pfn++) {
+ +		if (!pfn_valid(pfn))
+ +			continue;
+ +
+ +		SetPageReserved(pfn_to_page(pfn));
+ +	}
+ +	return 0;
+ +}
+ +
+ +static int __meminit __add_section(int nid, struct zone *zone,
+ +					unsigned long phys_start_pfn)
+++=======
++ static int __meminit __add_section(int nid, unsigned long phys_start_pfn,
++ 		struct vmem_altmap *altmap, bool want_memblock)
+++>>>>>>> 7b73d978a5d0 (mm: pass the vmem_altmap to vmemmap_populate)
+  {
+  	int ret;
+ -	int i;
+  
+  	if (pfn_valid(phys_start_pfn))
+  		return -EEXIST;
+  
+++<<<<<<< HEAD
+ +	ret = sparse_add_one_section(zone, phys_start_pfn);
+ +
+++=======
++ 	ret = sparse_add_one_section(NODE_DATA(nid), phys_start_pfn, altmap);
+++>>>>>>> 7b73d978a5d0 (mm: pass the vmem_altmap to vmemmap_populate)
+  	if (ret < 0)
+  		return ret;
+  
+@@@ -541,7 -317,8 +550,12 @@@ int __ref __add_pages(int nid, struct z
+  	}
+  
+  	for (i = start_sec; i <= end_sec; i++) {
+++<<<<<<< HEAD
+ +		err = __add_section(nid, zone, i << PFN_SECTION_SHIFT);
+++=======
++ 		err = __add_section(nid, section_nr_to_pfn(i), altmap,
++ 				want_memblock);
+++>>>>>>> 7b73d978a5d0 (mm: pass the vmem_altmap to vmemmap_populate)
+  
+  		/*
+  		 * EEXIST is finally dealt with by ioresource collision
+diff --cc mm/sparse.c
+index 443cfc7e80e7,5f4a0dac7836..000000000000
+--- a/mm/sparse.c
++++ b/mm/sparse.c
+@@@ -609,11 -636,54 +610,12 @@@ void __init sparse_init(void
+  }
+  
+  #ifdef CONFIG_MEMORY_HOTPLUG
+ -
+ -/* Mark all memory sections within the pfn range as online */
+ -void online_mem_sections(unsigned long start_pfn, unsigned long end_pfn)
+ -{
+ -	unsigned long pfn;
+ -
+ -	for (pfn = start_pfn; pfn < end_pfn; pfn += PAGES_PER_SECTION) {
+ -		unsigned long section_nr = pfn_to_section_nr(pfn);
+ -		struct mem_section *ms;
+ -
+ -		/* onlining code should never touch invalid ranges */
+ -		if (WARN_ON(!valid_section_nr(section_nr)))
+ -			continue;
+ -
+ -		ms = __nr_to_section(section_nr);
+ -		ms->section_mem_map |= SECTION_IS_ONLINE;
+ -	}
+ -}
+ -
+ -#ifdef CONFIG_MEMORY_HOTREMOVE
+ -/* Mark all memory sections within the pfn range as online */
+ -void offline_mem_sections(unsigned long start_pfn, unsigned long end_pfn)
+ -{
+ -	unsigned long pfn;
+ -
+ -	for (pfn = start_pfn; pfn < end_pfn; pfn += PAGES_PER_SECTION) {
+ -		unsigned long section_nr = pfn_to_section_nr(start_pfn);
+ -		struct mem_section *ms;
+ -
+ -		/*
+ -		 * TODO this needs some double checking. Offlining code makes
+ -		 * sure to check pfn_valid but those checks might be just bogus
+ -		 */
+ -		if (WARN_ON(!valid_section_nr(section_nr)))
+ -			continue;
+ -
+ -		ms = __nr_to_section(section_nr);
+ -		ms->section_mem_map &= ~SECTION_IS_ONLINE;
+ -	}
+ -}
+ -#endif
+ -
+  #ifdef CONFIG_SPARSEMEM_VMEMMAP
+- static inline struct page *kmalloc_section_memmap(unsigned long pnum, int nid)
++ static inline struct page *kmalloc_section_memmap(unsigned long pnum, int nid,
++ 		struct vmem_altmap *altmap)
+  {
+  	/* This will make the necessary allocations eventually. */
+- 	return sparse_mem_map_populate(pnum, nid);
++ 	return sparse_mem_map_populate(pnum, nid, altmap);
+  }
+  static void __kfree_section_memmap(struct page *memmap)
+  {
+@@@ -705,10 -776,10 +708,15 @@@ static void free_map_bootmem(struct pag
+   * set.  If this is <=0, then that means that the passed-in
+   * map was not consumed and must be freed.
+   */
+++<<<<<<< HEAD
+ +int __meminit sparse_add_one_section(struct zone *zone, unsigned long start_pfn)
+++=======
++ int __meminit sparse_add_one_section(struct pglist_data *pgdat,
++ 		unsigned long start_pfn, struct vmem_altmap *altmap)
+++>>>>>>> 7b73d978a5d0 (mm: pass the vmem_altmap to vmemmap_populate)
+  {
+  	unsigned long section_nr = pfn_to_section_nr(start_pfn);
+ +	struct pglist_data *pgdat = zone->zone_pgdat;
+  	struct mem_section *ms;
+  	struct page *memmap;
+  	unsigned long *usemap;
+* Unmerged path arch/arm64/mm/mmu.c
+diff --git a/arch/ia64/mm/discontig.c b/arch/ia64/mm/discontig.c
+index ae4db4bd6d97..d53ef8ab7aff 100644
+--- a/arch/ia64/mm/discontig.c
++++ b/arch/ia64/mm/discontig.c
+@@ -819,7 +819,8 @@ void arch_refresh_nodedata(int update_node, pg_data_t *update_pgdat)
+ #endif
+ 
+ #ifdef CONFIG_SPARSEMEM_VMEMMAP
+-int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node)
++int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node,
++		struct vmem_altmap *altmap)
+ {
+ 	return vmemmap_populate_basepages(start, end, node);
+ }
+* Unmerged path arch/powerpc/mm/init_64.c
+diff --git a/arch/s390/mm/vmem.c b/arch/s390/mm/vmem.c
+index c0b7a029c72a..a80cca09d9fd 100644
+--- a/arch/s390/mm/vmem.c
++++ b/arch/s390/mm/vmem.c
+@@ -201,7 +201,8 @@ static void vmem_remove_range(unsigned long start, unsigned long size)
+ /*
+  * Add a backed mem_map array to the virtual mem_map array.
+  */
+-int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node)
++int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node,
++		struct vmem_altmap *altmap)
+ {
+ 	unsigned long pgt_prot, sgt_prot;
+ 	unsigned long address = start;
+diff --git a/arch/sparc/mm/init_64.c b/arch/sparc/mm/init_64.c
+index 1e1aed064009..b13fe1a4f06e 100644
+--- a/arch/sparc/mm/init_64.c
++++ b/arch/sparc/mm/init_64.c
+@@ -2171,7 +2171,7 @@ static long __meminitdata addr_start, addr_end;
+ static int __meminitdata node_start;
+ 
+ int __meminit vmemmap_populate(unsigned long vstart, unsigned long vend,
+-			       int node)
++			       int node, struct vmem_altmap *altmap)
+ {
+ 	unsigned long phys_start = (vstart - VMEMMAP_BASE);
+ 	unsigned long phys_end = (vend - VMEMMAP_BASE);
+diff --git a/arch/x86/mm/init_64.c b/arch/x86/mm/init_64.c
+index 25c65b6af83e..6c014eb5dc2b 100644
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@ -1299,9 +1299,9 @@ static int __meminit vmemmap_populate_hugepages(unsigned long start,
+ 	return 0;
+ }
+ 
+-int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node)
++int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node,
++		struct vmem_altmap *altmap)
+ {
+-	struct vmem_altmap *altmap = to_vmem_altmap(start);
+ 	int err;
+ 
+ 	if (cpu_has_pse)
+* Unmerged path include/linux/memory_hotplug.h
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index a228f1a787bf..af693f734616 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -2361,7 +2361,8 @@ void sparse_mem_maps_populate_node(struct page **map_map,
+ 				   unsigned long map_count,
+ 				   int nodeid);
+ 
+-struct page *sparse_mem_map_populate(unsigned long pnum, int nid);
++struct page *sparse_mem_map_populate(unsigned long pnum, int nid,
++		struct vmem_altmap *altmap);
+ pgd_t *vmemmap_pgd_populate(unsigned long addr, int node);
+ pud_t *vmemmap_pud_populate(pgd_t *pgd, unsigned long addr, int node);
+ pmd_t *vmemmap_pmd_populate(pud_t *pud, unsigned long addr, int node);
+@@ -2378,7 +2379,8 @@ static inline void *vmemmap_alloc_block_buf(unsigned long size, int node)
+ void vmemmap_verify(pte_t *, int, unsigned long, unsigned long);
+ int vmemmap_populate_basepages(unsigned long start, unsigned long end,
+ 			       int node);
+-int vmemmap_populate(unsigned long start, unsigned long end, int node);
++int vmemmap_populate(unsigned long start, unsigned long end, int node,
++		struct vmem_altmap *altmap);
+ void vmemmap_populate_print_last(void);
+ #ifdef CONFIG_MEMORY_HOTPLUG
+ void vmemmap_free(unsigned long start, unsigned long end);
+* Unmerged path mm/memory_hotplug.c
+diff --git a/mm/sparse-vmemmap.c b/mm/sparse-vmemmap.c
+index b60802b3e5ea..c4615f60de6f 100644
+--- a/mm/sparse-vmemmap.c
++++ b/mm/sparse-vmemmap.c
+@@ -248,7 +248,8 @@ int __meminit vmemmap_populate_basepages(unsigned long start,
+ 	return 0;
+ }
+ 
+-struct page * __meminit sparse_mem_map_populate(unsigned long pnum, int nid)
++struct page * __meminit sparse_mem_map_populate(unsigned long pnum, int nid,
++		struct vmem_altmap *altmap)
+ {
+ 	unsigned long start;
+ 	unsigned long end;
+@@ -258,7 +259,7 @@ struct page * __meminit sparse_mem_map_populate(unsigned long pnum, int nid)
+ 	start = (unsigned long)map;
+ 	end = (unsigned long)(map + PAGES_PER_SECTION);
+ 
+-	if (vmemmap_populate(start, end, nid))
++	if (vmemmap_populate(start, end, nid, altmap))
+ 		return NULL;
+ 
+ 	return map;
+@@ -288,7 +289,7 @@ void __init sparse_mem_maps_populate_node(struct page **map_map,
+ 		if (!present_section_nr(pnum))
+ 			continue;
+ 
+-		map_map[pnum] = sparse_mem_map_populate(pnum, nodeid);
++		map_map[pnum] = sparse_mem_map_populate(pnum, nodeid, NULL);
+ 		if (map_map[pnum])
+ 			continue;
+ 		ms = __nr_to_section(pnum);
+* Unmerged path mm/sparse.c
