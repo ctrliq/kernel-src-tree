@@ -355,12 +355,11 @@ static unsigned int annotate_browser__refresh(struct ui_browser *browser)
 	return ret;
 }
 
-static int disasm__cmp(struct annotation_line *a,
-		       struct annotation_line *b, int nr_pcnt)
+static int disasm__cmp(struct annotation_line *a, struct annotation_line *b)
 {
 	int i;
 
-	for (i = 0; i < nr_pcnt; i++) {
+	for (i = 0; i < a->samples_nr; i++) {
 		if (a->samples[i].percent == b->samples[i].percent)
 			continue;
 		return a->samples[i].percent < b->samples[i].percent;
@@ -368,8 +367,7 @@ static int disasm__cmp(struct annotation_line *a,
 	return 0;
 }
 
-static void disasm_rb_tree__insert(struct rb_root *root, struct annotation_line *al,
-				   int nr_events)
+static void disasm_rb_tree__insert(struct rb_root *root, struct annotation_line *al)
 {
 	struct rb_node **p = &root->rb_node;
 	struct rb_node *parent = NULL;
@@ -379,7 +377,7 @@ static void disasm_rb_tree__insert(struct rb_root *root, struct annotation_line 
 		parent = *p;
 		l = rb_entry(parent, struct annotation_line, rb_node);
 
-		if (disasm__cmp(al, l, nr_events))
+		if (disasm__cmp(al, l))
 			p = &(*p)->rb_left;
 		else
 			p = &(*p)->rb_right;
@@ -451,7 +449,7 @@ static void annotate_browser__calc_percent(struct annotate_browser *browser,
 			continue;
 		}
 
-		for (i = 0; i < browser->nr_events; i++) {
+		for (i = 0; i < pos->al.samples_nr; i++) {
 			struct annotation_data *sample = &pos->al.samples[i];
 
 			if (max_percent < sample->percent)
@@ -462,8 +460,7 @@ static void annotate_browser__calc_percent(struct annotate_browser *browser,
 			RB_CLEAR_NODE(&pos->al.rb_node);
 			continue;
 		}
-		disasm_rb_tree__insert(&browser->entries, &pos->al,
-				       browser->nr_events);
+		disasm_rb_tree__insert(&browser->entries, &pos->al);
 	}
 	pthread_mutex_unlock(&notes->lock);
 
