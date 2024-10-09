@@ -1,0 +1,132 @@
+net: aquantia: Improve link state and statistics check interval callback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] aquantia: Improve link state and statistics check interval callback (David Arcari) [1500365]
+Rebuild_FUZZ: 96.40%
+commit-author Igor Russkikh <igor.russkikh@aquantia.com>
+commit fdb4a0830e74acfbe84d4d4e6772ea09c96786ad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fdb4a083.failed
+
+Reduce timeout from 2 secs to 1 sec. If link is down,
+reduce it to 500msec. This speeds up link detection.
+
+	Signed-off-by: Igor Russkikh <igor.russkikh@aquantia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fdb4a0830e74acfbe84d4d4e6772ea09c96786ad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+index 7c2a87f5d89a,75a894a9251c..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_nic.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+@@@ -117,15 -134,42 +117,51 @@@ int aq_nic_cfg_start(struct aq_nic_s *s
+  	return 0;
+  }
+  
+ -static int aq_nic_update_link_status(struct aq_nic_s *self)
+ +static void aq_nic_service_timer_cb(unsigned long param)
+  {
+++<<<<<<< HEAD
+ +	struct aq_nic_s *self = (struct aq_nic_s *)param;
+ +	struct net_device *ndev = aq_nic_get_ndev(self);
+++=======
++ 	int err = self->aq_hw_ops.hw_get_link_status(self->aq_hw);
++ 
++ 	if (err)
++ 		return err;
++ 
++ 	if (self->link_status.mbps != self->aq_hw->aq_link_status.mbps) {
++ 		pr_info("%s: link change old %d new %d\n",
++ 			AQ_CFG_DRV_NAME, self->link_status.mbps,
++ 			self->aq_hw->aq_link_status.mbps);
++ 		aq_nic_update_interrupt_moderation_settings(self);
++ 	}
++ 
++ 	self->link_status = self->aq_hw->aq_link_status;
++ 	if (!netif_carrier_ok(self->ndev) && self->link_status.mbps) {
++ 		aq_utils_obj_set(&self->header.flags,
++ 				 AQ_NIC_FLAG_STARTED);
++ 		aq_utils_obj_clear(&self->header.flags,
++ 				   AQ_NIC_LINK_DOWN);
++ 		netif_carrier_on(self->ndev);
++ 		netif_tx_wake_all_queues(self->ndev);
++ 	}
++ 	if (netif_carrier_ok(self->ndev) && !self->link_status.mbps) {
++ 		netif_carrier_off(self->ndev);
++ 		netif_tx_disable(self->ndev);
++ 		aq_utils_obj_set(&self->header.flags, AQ_NIC_LINK_DOWN);
++ 	}
++ 	return 0;
++ }
++ 
++ static void aq_nic_service_timer_cb(struct timer_list *t)
++ {
++ 	struct aq_nic_s *self = from_timer(self, t, service_timer);
++ 	int ctimer = AQ_CFG_SERVICE_TIMER_INTERVAL;
+++>>>>>>> fdb4a0830e74 (net: aquantia: Improve link state and statistics check interval callback)
+  	int err = 0;
+ +	unsigned int i = 0U;
+ +	struct aq_hw_link_status_s link_status;
+ +	struct aq_ring_stats_rx_s stats_rx;
+ +	struct aq_ring_stats_tx_s stats_tx;
+  
+  	if (aq_utils_obj_test(&self->header.flags, AQ_NIC_FLAGS_IS_NOT_READY))
+  		goto err_exit;
+@@@ -155,28 -181,19 +191,33 @@@
+  	if (self->aq_hw_ops.hw_update_stats)
+  		self->aq_hw_ops.hw_update_stats(self->aq_hw);
+  
+ -	aq_nic_update_ndev_stats(self);
+ +	memset(&stats_rx, 0U, sizeof(struct aq_ring_stats_rx_s));
+ +	memset(&stats_tx, 0U, sizeof(struct aq_ring_stats_tx_s));
+ +	for (i = AQ_DIMOF(self->aq_vec); i--;) {
+ +		if (self->aq_vec[i])
+ +			aq_vec_add_stats(self->aq_vec[i], &stats_rx, &stats_tx);
+ +	}
+  
+++<<<<<<< HEAD
+ +	ndev->stats.rx_packets = stats_rx.packets;
+ +	ndev->stats.rx_bytes = stats_rx.bytes;
+ +	ndev->stats.rx_errors = stats_rx.errors;
+ +	ndev->stats.tx_packets = stats_tx.packets;
+ +	ndev->stats.tx_bytes = stats_tx.bytes;
+ +	ndev->stats.tx_errors = stats_tx.errors;
+++=======
++ 	/* If no link - use faster timer rate to detect link up asap */
++ 	if (!netif_carrier_ok(self->ndev))
++ 		ctimer = max(ctimer / 2, 1);
+++>>>>>>> fdb4a0830e74 (net: aquantia: Improve link state and statistics check interval callback)
+  
+  err_exit:
+- 	mod_timer(&self->service_timer,
+- 		  jiffies + AQ_CFG_SERVICE_TIMER_INTERVAL);
++ 	mod_timer(&self->service_timer, jiffies + ctimer);
+  }
+  
+ -static void aq_nic_polling_timer_cb(struct timer_list *t)
+ +static void aq_nic_polling_timer_cb(unsigned long param)
+  {
+ -	struct aq_nic_s *self = from_timer(self, t, polling_timer);
+ +	struct aq_nic_s *self = (struct aq_nic_s *)param;
+  	struct aq_vec_s *aq_vec = NULL;
+  	unsigned int i = 0U;
+  
+diff --git a/drivers/net/ethernet/aquantia/atlantic/aq_cfg.h b/drivers/net/ethernet/aquantia/atlantic/aq_cfg.h
+index 214986436ece..65a2376282fc 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_cfg.h
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_cfg.h
+@@ -46,7 +46,7 @@
+ #define AQ_CFG_PCI_FUNC_MSIX_IRQS   9U
+ #define AQ_CFG_PCI_FUNC_PORTS       2U
+ 
+-#define AQ_CFG_SERVICE_TIMER_INTERVAL    (2 * HZ)
++#define AQ_CFG_SERVICE_TIMER_INTERVAL    (1 * HZ)
+ #define AQ_CFG_POLLING_TIMER_INTERVAL   ((unsigned int)(2 * HZ))
+ 
+ #define AQ_CFG_SKB_FRAGS_MAX   32U
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_nic.c
