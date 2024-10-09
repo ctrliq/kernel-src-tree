@@ -1,0 +1,119 @@
+mlxsw: spectrum: Add support for TC flower offload statistics
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Arkadi Sharshevsky <arkadis@mellanox.com>
+commit 7c1b8eb175b69add8eac105409d2a59723574675
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7c1b8eb1.failed
+
+Add support for TC flower offload statistics including number of packets,
+bytes and last use timestamp. Currently the statistics are gathered on a
+per-rule basis.
+
+	Signed-off-by: Arkadi Sharshvesky <arkadis@mellanox.com>
+	Reviewed-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7c1b8eb175b69add8eac105409d2a59723574675)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c
+index 6f6ff409c265,28bc989371c6..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c
+@@@ -55,7 -56,13 +55,17 @@@ static int mlxsw_sp_flower_parse_action
+  	if (tc_no_actions(exts))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	tc_for_each_action(a, exts) {
+++=======
++ 	/* Count action is inserted first */
++ 	err = mlxsw_sp_acl_rulei_act_count(mlxsw_sp, rulei);
++ 	if (err)
++ 		return err;
++ 
++ 	tcf_exts_to_list(exts, &actions);
++ 	list_for_each_entry(a, &actions, list) {
+++>>>>>>> 7c1b8eb175b6 (mlxsw: spectrum: Add support for TC flower offload statistics)
+  		if (is_tcf_gact_shot(a)) {
+  			err = mlxsw_sp_acl_rulei_act_drop(rulei);
+  			if (err)
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+index eb00d2638070..159a139d4404 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+@@ -1371,6 +1371,9 @@ static int mlxsw_sp_setup_tc(struct net_device *dev, u32 handle,
+ 			mlxsw_sp_flower_destroy(mlxsw_sp_port, ingress,
+ 						tc->cls_flower);
+ 			return 0;
++		case TC_CLSFLOWER_STATS:
++			return mlxsw_sp_flower_stats(mlxsw_sp_port, ingress,
++						     tc->cls_flower);
+ 		default:
+ 			return -EOPNOTSUPP;
+ 		}
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum.h b/drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+index d52e95137afe..b44ddd7d5da1 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.h
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+@@ -678,6 +678,8 @@ int mlxsw_sp_flower_replace(struct mlxsw_sp_port *mlxsw_sp_port, bool ingress,
+ 			    __be16 protocol, struct tc_cls_flower_offload *f);
+ void mlxsw_sp_flower_destroy(struct mlxsw_sp_port *mlxsw_sp_port, bool ingress,
+ 			     struct tc_cls_flower_offload *f);
++int mlxsw_sp_flower_stats(struct mlxsw_sp_port *mlxsw_sp_port, bool ingress,
++			  struct tc_cls_flower_offload *f);
+ int mlxsw_sp_flow_counter_get(struct mlxsw_sp *mlxsw_sp,
+ 			      unsigned int counter_index, u64 *packets,
+ 			      u64 *bytes);
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl.c
+index 87d011171da9..4d6920d45026 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl.c
+@@ -92,6 +92,8 @@ struct mlxsw_sp_acl_rule {
+ 	struct mlxsw_sp_acl_ruleset *ruleset;
+ 	struct mlxsw_sp_acl_rule_info *rulei;
+ 	u64 last_used;
++	u64 last_packets;
++	u64 last_bytes;
+ 	unsigned long priv[0];
+ 	/* priv has to be always the last item */
+ };
+@@ -559,6 +561,32 @@ static void mlxsw_sp_acl_rul_activity_update_work(struct work_struct *work)
+ 	mlxsw_sp_acl_rule_activity_work_schedule(acl);
+ }
+ 
++int mlxsw_sp_acl_rule_get_stats(struct mlxsw_sp *mlxsw_sp,
++				struct mlxsw_sp_acl_rule *rule,
++				u64 *packets, u64 *bytes, u64 *last_use)
++
++{
++	struct mlxsw_sp_acl_rule_info *rulei;
++	u64 current_packets;
++	u64 current_bytes;
++	int err;
++
++	rulei = mlxsw_sp_acl_rule_rulei(rule);
++	err = mlxsw_sp_flow_counter_get(mlxsw_sp, rulei->counter_index,
++					&current_packets, &current_bytes);
++	if (err)
++		return err;
++
++	*packets = current_packets - rule->last_packets;
++	*bytes = current_bytes - rule->last_bytes;
++	*last_use = rule->last_used;
++
++	rule->last_bytes = current_bytes;
++	rule->last_packets = current_packets;
++
++	return 0;
++}
++
+ #define MLXSW_SP_KDVL_ACT_EXT_SIZE 1
+ 
+ static int mlxsw_sp_act_kvdl_set_add(void *priv, u32 *p_kvdl_index,
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c
