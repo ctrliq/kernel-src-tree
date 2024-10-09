@@ -2905,10 +2905,10 @@ int ipmi_register_smi(struct ipmi_smi_handlers *handlers,
 		intf->curr_channel = IPMI_MAX_CHANNELS;
 	}
 
+	rv = ipmi_bmc_register(intf, i);
+
 	if (rv == 0)
 		rv = add_proc_entries(intf, i);
-
-	rv = ipmi_bmc_register(intf, i);
 
  out:
 	if (rv) {
@@ -2996,8 +2996,6 @@ int ipmi_unregister_smi(ipmi_smi_t intf)
 	int intf_num = intf->intf_num;
 	ipmi_user_t user;
 
-	ipmi_bmc_unregister(intf);
-
 	mutex_lock(&smi_watchers_mutex);
 	mutex_lock(&ipmi_interfaces_mutex);
 	intf->intf_num = -1;
@@ -3021,6 +3019,7 @@ int ipmi_unregister_smi(ipmi_smi_t intf)
 	mutex_unlock(&ipmi_interfaces_mutex);
 
 	remove_proc_entries(intf);
+	ipmi_bmc_unregister(intf);
 
 	/*
 	 * Call all the watcher interfaces to tell them that
