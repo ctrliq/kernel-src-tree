@@ -1,0 +1,156 @@
+perf/core: Fix perf_uprobe_init()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Song Liu <songliubraving@fb.com>
+commit 0eadcc7a7bc03e991d2da1cf88143fb7cc0342c1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/0eadcc7a.failed
+
+Similarly to the uprobe PMU fix in perf_kprobe_init(), fix error
+handling in perf_uprobe_init() as well.
+
+	Reported-by: 范龙飞 <long7573@126.com>
+	Signed-off-by: Song Liu <songliubraving@fb.com>
+	Acked-by: Masami Hiramatsu <mhiramat@kernel.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Fixes: e12f03d7031a ("perf/core: Implement the 'perf_kprobe' PMU")
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 0eadcc7a7bc03e991d2da1cf88143fb7cc0342c1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/trace_event_perf.c
+diff --cc kernel/trace/trace_event_perf.c
+index ae2877cbe443,c79193e598f5..000000000000
+--- a/kernel/trace/trace_event_perf.c
++++ b/kernel/trace/trace_event_perf.c
+@@@ -213,15 -238,114 +213,123 @@@ void perf_trace_destroy(struct perf_eve
+  	mutex_unlock(&event_mutex);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_KPROBE_EVENTS
++ int perf_kprobe_init(struct perf_event *p_event, bool is_retprobe)
++ {
++ 	int ret;
++ 	char *func = NULL;
++ 	struct trace_event_call *tp_event;
++ 
++ 	if (p_event->attr.kprobe_func) {
++ 		func = kzalloc(KSYM_NAME_LEN, GFP_KERNEL);
++ 		if (!func)
++ 			return -ENOMEM;
++ 		ret = strncpy_from_user(
++ 			func, u64_to_user_ptr(p_event->attr.kprobe_func),
++ 			KSYM_NAME_LEN);
++ 		if (ret == KSYM_NAME_LEN)
++ 			ret = -E2BIG;
++ 		if (ret < 0)
++ 			goto out;
++ 
++ 		if (func[0] == '\0') {
++ 			kfree(func);
++ 			func = NULL;
++ 		}
++ 	}
++ 
++ 	tp_event = create_local_trace_kprobe(
++ 		func, (void *)(unsigned long)(p_event->attr.kprobe_addr),
++ 		p_event->attr.probe_offset, is_retprobe);
++ 	if (IS_ERR(tp_event)) {
++ 		ret = PTR_ERR(tp_event);
++ 		goto out;
++ 	}
++ 
++ 	ret = perf_trace_event_init(tp_event, p_event);
++ 	if (ret)
++ 		destroy_local_trace_kprobe(tp_event);
++ out:
++ 	kfree(func);
++ 	return ret;
++ }
++ 
++ void perf_kprobe_destroy(struct perf_event *p_event)
++ {
++ 	perf_trace_event_close(p_event);
++ 	perf_trace_event_unreg(p_event);
++ 
++ 	destroy_local_trace_kprobe(p_event->tp_event);
++ }
++ #endif /* CONFIG_KPROBE_EVENTS */
++ 
++ #ifdef CONFIG_UPROBE_EVENTS
++ int perf_uprobe_init(struct perf_event *p_event, bool is_retprobe)
++ {
++ 	int ret;
++ 	char *path = NULL;
++ 	struct trace_event_call *tp_event;
++ 
++ 	if (!p_event->attr.uprobe_path)
++ 		return -EINVAL;
++ 	path = kzalloc(PATH_MAX, GFP_KERNEL);
++ 	if (!path)
++ 		return -ENOMEM;
++ 	ret = strncpy_from_user(
++ 		path, u64_to_user_ptr(p_event->attr.uprobe_path), PATH_MAX);
++ 	if (ret == PATH_MAX)
++ 		return -E2BIG;
++ 	if (ret < 0)
++ 		goto out;
++ 	if (path[0] == '\0') {
++ 		ret = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	tp_event = create_local_trace_uprobe(
++ 		path, p_event->attr.probe_offset, is_retprobe);
++ 	if (IS_ERR(tp_event)) {
++ 		ret = PTR_ERR(tp_event);
++ 		goto out;
++ 	}
++ 
++ 	/*
++ 	 * local trace_uprobe need to hold event_mutex to call
++ 	 * uprobe_buffer_enable() and uprobe_buffer_disable().
++ 	 * event_mutex is not required for local trace_kprobes.
++ 	 */
++ 	mutex_lock(&event_mutex);
++ 	ret = perf_trace_event_init(tp_event, p_event);
++ 	if (ret)
++ 		destroy_local_trace_uprobe(tp_event);
++ 	mutex_unlock(&event_mutex);
++ out:
++ 	kfree(path);
++ 	return ret;
++ }
++ 
++ void perf_uprobe_destroy(struct perf_event *p_event)
++ {
++ 	mutex_lock(&event_mutex);
++ 	perf_trace_event_close(p_event);
++ 	perf_trace_event_unreg(p_event);
++ 	mutex_unlock(&event_mutex);
++ 	destroy_local_trace_uprobe(p_event->tp_event);
++ }
++ #endif /* CONFIG_UPROBE_EVENTS */
++ 
+++>>>>>>> 0eadcc7a7bc0 (perf/core: Fix perf_uprobe_init())
+  int perf_trace_add(struct perf_event *p_event, int flags)
+  {
+ -	struct trace_event_call *tp_event = p_event->tp_event;
+ +	struct ftrace_event_call *tp_event = p_event->tp_event;
+ +	struct hlist_head __percpu *pcpu_list;
+ +	struct hlist_head *list;
+ +
+ +	pcpu_list = tp_event->perf_events;
+ +	if (WARN_ON_ONCE(!pcpu_list))
+ +		return -EINVAL;
+  
+  	if (!(flags & PERF_EF_START))
+  		p_event->hw.state = PERF_HES_STOPPED;
+* Unmerged path kernel/trace/trace_event_perf.c
