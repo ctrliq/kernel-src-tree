@@ -1,0 +1,198 @@
+x86/intel_rdt/mbm: Fix MBM overflow handler during CPU hotplug
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] intel_rdt/mbm: Fix MBM overflow handler during CPU hotplug (Jiri Olsa) [1457533]
+Rebuild_FUZZ: 96.67%
+commit-author Vikas Shivappa <vikas.shivappa@linux.intel.com>
+commit bbc4615e0b7df5e21d0991adb4b2798508354924
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/bbc4615e.failed
+
+When a CPU is dying, the overflow worker is canceled and rescheduled on a
+different CPU in the same domain. But if the timer is already about to
+expire this essentially doubles the interval which might result in a non
+detected overflow.
+
+Cancel the overflow worker and reschedule it immediately on a different CPU
+in same domain. The work could be flushed as well, but that would
+reschedule it on the same CPU.
+
+[ tglx: Rewrote changelog once again ]
+
+	Reported-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Vikas Shivappa <vikas.shivappa@linux.intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: ravi.v.shankar@intel.com
+	Cc: tony.luck@intel.com
+	Cc: fenghua.yu@intel.com
+	Cc: peterz@infradead.org
+	Cc: eranian@google.com
+	Cc: vikas.shivappa@intel.com
+	Cc: ak@linux.intel.com
+	Cc: davidcc@google.com
+Link: http://lkml.kernel.org/r/1502845243-20454-2-git-send-email-vikas.shivappa@linux.intel.com
+
+(cherry picked from commit bbc4615e0b7df5e21d0991adb4b2798508354924)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/intel_rdt.c
+#	arch/x86/kernel/cpu/intel_rdt.h
+#	arch/x86/kernel/cpu/intel_rdt_monitor.c
+#	arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
+diff --cc arch/x86/kernel/cpu/intel_rdt.c
+index ad087dd4421e,b8dc141896b6..000000000000
+--- a/arch/x86/kernel/cpu/intel_rdt.c
++++ b/arch/x86/kernel/cpu/intel_rdt.c
+@@@ -280,6 -390,69 +280,72 @@@ static struct rdt_domain *rdt_find_doma
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int domain_setup_ctrlval(struct rdt_resource *r, struct rdt_domain *d)
++ {
++ 	struct msr_param m;
++ 	u32 *dc;
++ 	int i;
++ 
++ 	dc = kmalloc_array(r->num_closid, sizeof(*d->ctrl_val), GFP_KERNEL);
++ 	if (!dc)
++ 		return -ENOMEM;
++ 
++ 	d->ctrl_val = dc;
++ 
++ 	/*
++ 	 * Initialize the Control MSRs to having no control.
++ 	 * For Cache Allocation: Set all bits in cbm
++ 	 * For Memory Allocation: Set b/w requested to 100
++ 	 */
++ 	for (i = 0; i < r->num_closid; i++, dc++)
++ 		*dc = r->default_ctrl;
++ 
++ 	m.low = 0;
++ 	m.high = r->num_closid;
++ 	r->msr_update(d, &m, r);
++ 	return 0;
++ }
++ 
++ static int domain_setup_mon_state(struct rdt_resource *r, struct rdt_domain *d)
++ {
++ 	size_t tsize;
++ 
++ 	if (is_llc_occupancy_enabled()) {
++ 		d->rmid_busy_llc = kcalloc(BITS_TO_LONGS(r->num_rmid),
++ 					   sizeof(unsigned long),
++ 					   GFP_KERNEL);
++ 		if (!d->rmid_busy_llc)
++ 			return -ENOMEM;
++ 	}
++ 	if (is_mbm_total_enabled()) {
++ 		tsize = sizeof(*d->mbm_total);
++ 		d->mbm_total = kcalloc(r->num_rmid, tsize, GFP_KERNEL);
++ 		if (!d->mbm_total) {
++ 			kfree(d->rmid_busy_llc);
++ 			return -ENOMEM;
++ 		}
++ 	}
++ 	if (is_mbm_local_enabled()) {
++ 		tsize = sizeof(*d->mbm_local);
++ 		d->mbm_local = kcalloc(r->num_rmid, tsize, GFP_KERNEL);
++ 		if (!d->mbm_local) {
++ 			kfree(d->rmid_busy_llc);
++ 			kfree(d->mbm_total);
++ 			return -ENOMEM;
++ 		}
++ 	}
++ 
++ 	if (is_mbm_enabled()) {
++ 		INIT_DELAYED_WORK(&d->mbm_over, mbm_handle_overflow);
++ 		mbm_setup_overflow_handler(d, MBM_OVERFLOW_INTERVAL);
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> bbc4615e0b7d (x86/intel_rdt/mbm: Fix MBM overflow handler during CPU hotplug)
+  /*
+   * domain_add_cpu - Add a cpu to a resource's domain list.
+   *
+@@@ -347,9 -523,24 +413,16 @@@ static void domain_remove_cpu(int cpu, 
+  
+  	cpumask_clear_cpu(cpu, &d->cpu_mask);
+  	if (cpumask_empty(&d->cpu_mask)) {
+ -		/*
+ -		 * If resctrl is mounted, remove all the
+ -		 * per domain monitor data directories.
+ -		 */
+ -		if (static_branch_unlikely(&rdt_mon_enable_key))
+ -			rmdir_mondata_subdir_allrdtgrp(r, d->id);
+ -		kfree(d->ctrl_val);
+ -		kfree(d->rmid_busy_llc);
+ -		kfree(d->mbm_total);
+ -		kfree(d->mbm_local);
+ +		kfree(d->cbm);
+  		list_del(&d->list);
+ -		if (is_mbm_enabled())
+ -			cancel_delayed_work(&d->mbm_over);
+  		kfree(d);
+++<<<<<<< HEAD
+++=======
++ 	} else if (r == &rdt_resources_all[RDT_RESOURCE_L3] &&
++ 		   cpu == d->mbm_work_cpu && is_mbm_enabled()) {
++ 		cancel_delayed_work(&d->mbm_over);
++ 		mbm_setup_overflow_handler(d, 0);
+++>>>>>>> bbc4615e0b7d (x86/intel_rdt/mbm: Fix MBM overflow handler during CPU hotplug)
+  	}
+  }
+  
+diff --cc arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
+index 1c3603d97e9d,b529f93e8ed0..000000000000
+--- a/arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
++++ b/arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
+@@@ -787,12 -1107,51 +787,30 @@@ static struct dentry *rdt_mount(struct 
+  	dentry = kernfs_mount(fs_type, flags, rdt_root,
+  			      RDTGROUP_SUPER_MAGIC, NULL);
+  	if (IS_ERR(dentry))
+++<<<<<<< HEAD
+ +		goto out_destroy;
+++=======
++ 		goto out_mondata;
++ 
++ 	if (rdt_alloc_capable)
++ 		static_branch_enable(&rdt_alloc_enable_key);
++ 	if (rdt_mon_capable)
++ 		static_branch_enable(&rdt_mon_enable_key);
++ 
++ 	if (rdt_alloc_capable || rdt_mon_capable)
++ 		static_branch_enable(&rdt_enable_key);
++ 
++ 	if (is_mbm_enabled()) {
++ 		r = &rdt_resources_all[RDT_RESOURCE_L3];
++ 		list_for_each_entry(dom, &r->domains, list)
++ 			mbm_setup_overflow_handler(dom, MBM_OVERFLOW_INTERVAL);
++ 	}
+++>>>>>>> bbc4615e0b7d (x86/intel_rdt/mbm: Fix MBM overflow handler during CPU hotplug)
+  
+ +	static_key_slow_inc(&rdt_enable_key);
+  	goto out;
+  
+ -out_mondata:
+ -	if (rdt_mon_capable)
+ -		kernfs_remove(kn_mondata);
+ -out_mongrp:
+ -	if (rdt_mon_capable)
+ -		kernfs_remove(kn_mongrp);
+ -out_info:
+ +out_destroy:
+  	kernfs_remove(kn_info);
+  out_cdp:
+  	cdp_disable();
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.h
+* Unmerged path arch/x86/kernel/cpu/intel_rdt_monitor.c
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.c
+* Unmerged path arch/x86/kernel/cpu/intel_rdt.h
+* Unmerged path arch/x86/kernel/cpu/intel_rdt_monitor.c
+* Unmerged path arch/x86/kernel/cpu/intel_rdt_rdtgroup.c
