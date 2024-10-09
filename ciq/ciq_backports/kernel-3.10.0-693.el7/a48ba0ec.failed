@@ -1,0 +1,223 @@
+scsi: megaraid_sas: raid 1 write performance for large io
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] megaraid_sas: raid 1 write performance for large io (Tomas Henzl) [1417038]
+Rebuild_FUZZ: 94.44%
+commit-author Shivasharan S <shivasharan.srikanteshwara@broadcom.com>
+commit a48ba0eca0456d45e920169930569caa3fc57124
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/a48ba0ec.failed
+
+Avoid Host side PCI bandwidth bottleneck and hint FW to do Write
+buffering using RaidFlag MR_RAID_FLAGS_IO_SUB_TYPE_LDIO_BW_LIMIT.  Once
+IO is landed in FW with MR_RAID_FLAGS_IO_SUB_TYPE_LDIO_BW_LIMIT, it will
+do single DMA from host and buffer the Write operation. On back end, FW
+will DMA same buffer to the Mirror and Data Arm.  This will improve
+large block IO performance which bottleneck due to Host side PCI
+bandwidth limitation.
+
+Consistent ~4000MB T.P for 256K Block size is expected performance
+numbers.  IOPS for small Block size should be on par with Disk
+performance.  (E.g 42 SAS Disk in JBOD mode gives 3700MB T.P.  Same
+Drive used in R1 WT mode, should give ~1800MB T.P)
+
+Using this patch 24 R1 VDs (HDD) gives below performance for Sequential
+Write.  Without this patch, we cannot reach above 3200MB (Throughput is
+in MB.)
+
+Block Size   	50% 256K and 50% 4K          100% 256K
+4K                 3100                        2030
+8K                 3140                        2740
+16K                3140                        3140
+32K                3400                        3240
+64K                3500                        3700
+128K               3870                        3870
+256K               3920                        3920
+
+	Signed-off-by: Shivasharan S <shivasharan.srikanteshwara@broadcom.com>
+	Signed-off-by: Kashyap Desai <kashyap.desai@broadcom.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Reviewed-by: Tomas Henzl <thenzl@redhat.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit a48ba0eca0456d45e920169930569caa3fc57124)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/megaraid/megaraid_sas.h
+#	drivers/scsi/megaraid/megaraid_sas_fusion.c
+diff --cc drivers/scsi/megaraid/megaraid_sas.h
+index 724240214af5,bed8a3784120..000000000000
+--- a/drivers/scsi/megaraid/megaraid_sas.h
++++ b/drivers/scsi/megaraid/megaraid_sas.h
+@@@ -1808,6 -1877,8 +1810,11 @@@ union megasas_frame 
+  struct MR_PRIV_DEVICE {
+  	bool is_tm_capable;
+  	bool tm_busy;
+++<<<<<<< HEAD
+++=======
++ 	atomic_t r1_ldio_hint;
++ 	u8   interface_type;
+++>>>>>>> a48ba0eca045 (scsi: megaraid_sas: raid 1 write performance for large io)
+  };
+  struct megasas_cmd;
+  
+@@@ -2151,6 -2236,11 +2158,14 @@@ struct megasas_instance 
+  	bool dev_handle;
+  	bool fw_sync_cache_support;
+  	bool is_ventura;
+++<<<<<<< HEAD
+++=======
++ 	bool msix_combined;
++ 	u16 max_raid_mapsize;
++ 	/* preffered count to send as LDIO irrspective of FP capable.*/
++ 	u8  r1_ldio_hint_default;
++ 	u32 nvme_page_size;
+++>>>>>>> a48ba0eca045 (scsi: megaraid_sas: raid 1 write performance for large io)
+  };
+  struct MR_LD_VF_MAP {
+  	u32 size;
+diff --cc drivers/scsi/megaraid/megaraid_sas_fusion.c
+index 8eadcc3b9862,edbecc531f33..000000000000
+--- a/drivers/scsi/megaraid/megaraid_sas_fusion.c
++++ b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+@@@ -1821,6 -2098,84 +1822,87 @@@ static void megasas_stream_detect(struc
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * megasas_set_raidflag_cpu_affinity - This function sets the cpu
++  * affinity (cpu of the controller) and raid_flags in the raid context
++  * based on IO type.
++  *
++  * @praid_context:	IO RAID context
++  * @raid:		LD raid map
++  * @fp_possible:	Is fast path possible?
++  * @is_read:		Is read IO?
++  *
++  */
++ static void
++ megasas_set_raidflag_cpu_affinity(union RAID_CONTEXT_UNION *praid_context,
++ 				  struct MR_LD_RAID *raid, bool fp_possible,
++ 				  u8 is_read, u32 scsi_buff_len)
++ {
++ 	u8 cpu_sel = MR_RAID_CTX_CPUSEL_0;
++ 	struct RAID_CONTEXT_G35 *rctx_g35;
++ 
++ 	rctx_g35 = &praid_context->raid_context_g35;
++ 	if (fp_possible) {
++ 		if (is_read) {
++ 			if ((raid->cpuAffinity.pdRead.cpu0) &&
++ 			    (raid->cpuAffinity.pdRead.cpu1))
++ 				cpu_sel = MR_RAID_CTX_CPUSEL_FCFS;
++ 			else if (raid->cpuAffinity.pdRead.cpu1)
++ 				cpu_sel = MR_RAID_CTX_CPUSEL_1;
++ 		} else {
++ 			if ((raid->cpuAffinity.pdWrite.cpu0) &&
++ 			    (raid->cpuAffinity.pdWrite.cpu1))
++ 				cpu_sel = MR_RAID_CTX_CPUSEL_FCFS;
++ 			else if (raid->cpuAffinity.pdWrite.cpu1)
++ 				cpu_sel = MR_RAID_CTX_CPUSEL_1;
++ 			/* Fast path cache by pass capable R0/R1 VD */
++ 			if ((raid->level <= 1) &&
++ 			    (raid->capability.fp_cache_bypass_capable)) {
++ 				rctx_g35->routing_flags.bits.sld = 1;
++ 				rctx_g35->raid_flags =
++ 					(MR_RAID_FLAGS_IO_SUB_TYPE_CACHE_BYPASS
++ 					<< MR_RAID_CTX_RAID_FLAGS_IO_SUB_TYPE_SHIFT);
++ 			}
++ 		}
++ 	} else {
++ 		if (is_read) {
++ 			if ((raid->cpuAffinity.ldRead.cpu0) &&
++ 			    (raid->cpuAffinity.ldRead.cpu1))
++ 				cpu_sel = MR_RAID_CTX_CPUSEL_FCFS;
++ 			else if (raid->cpuAffinity.ldRead.cpu1)
++ 				cpu_sel = MR_RAID_CTX_CPUSEL_1;
++ 		} else {
++ 			if ((raid->cpuAffinity.ldWrite.cpu0) &&
++ 			    (raid->cpuAffinity.ldWrite.cpu1))
++ 				cpu_sel = MR_RAID_CTX_CPUSEL_FCFS;
++ 			else if (raid->cpuAffinity.ldWrite.cpu1)
++ 				cpu_sel = MR_RAID_CTX_CPUSEL_1;
++ 
++ 			if (rctx_g35->stream_detected &&
++ 			    (raid->level == 5) &&
++ 			    (raid->writeMode == MR_RL_WRITE_THROUGH_MODE) &&
++ 			    (cpu_sel == MR_RAID_CTX_CPUSEL_FCFS))
++ 				cpu_sel = MR_RAID_CTX_CPUSEL_0;
++ 		}
++ 	}
++ 
++ 	rctx_g35->routing_flags.bits.cpu_sel = cpu_sel;
++ 
++ 	/* Always give priority to MR_RAID_FLAGS_IO_SUB_TYPE_LDIO_BW_LIMIT
++ 	 * vs MR_RAID_FLAGS_IO_SUB_TYPE_CACHE_BYPASS.
++ 	 * IO Subtype is not bitmap.
++ 	 */
++ 	if ((raid->level == 1) && (!is_read)) {
++ 		if (scsi_buff_len > MR_LARGE_IO_MIN_SIZE)
++ 			praid_context->raid_context_g35.raid_flags =
++ 				(MR_RAID_FLAGS_IO_SUB_TYPE_LDIO_BW_LIMIT
++ 				<< MR_RAID_CTX_RAID_FLAGS_IO_SUB_TYPE_SHIFT);
++ 	}
++ }
++ 
++ /**
+++>>>>>>> a48ba0eca045 (scsi: megaraid_sas: raid 1 write performance for large io)
+   * megasas_build_ldio_fusion -	Prepares IOs to devices
+   * @instance:		Adapter soft state
+   * @scp:		SCSI command
+@@@ -1946,9 -2311,43 +2028,46 @@@ megasas_build_ldio_fusion(struct megasa
+  		/* In ventura if stream detected for a read and it is read ahead
+  		 *  capable make this IO as LDIO
+  		 */
+ -		if (praid_context->raid_context_g35.stream_detected &&
+ -		    io_info.isRead && io_info.ra_capable)
+ +		if (io_request->RaidContext.raid_context_g35.stream_detected &&
+ +				io_info.isRead && io_info.ra_capable)
+  			fp_possible = false;
+++<<<<<<< HEAD
+++=======
++ 
++ 		/* FP for Optimal raid level 1.
++ 		 * All large RAID-1 writes (> 32 KiB, both WT and WB modes)
++ 		 * are built by the driver as LD I/Os.
++ 		 * All small RAID-1 WT writes (<= 32 KiB) are built as FP I/Os
++ 		 * (there is never a reason to process these as buffered writes)
++ 		 * All small RAID-1 WB writes (<= 32 KiB) are built as FP I/Os
++ 		 * with the SLD bit asserted.
++ 		 */
++ 		if (io_info.r1_alt_dev_handle != MR_DEVHANDLE_INVALID) {
++ 			mrdev_priv = scp->device->hostdata;
++ 
++ 			if (atomic_inc_return(&instance->fw_outstanding) >
++ 				(instance->host->can_queue)) {
++ 				fp_possible = false;
++ 				atomic_dec(&instance->fw_outstanding);
++ 			} else if ((scsi_buff_len > MR_LARGE_IO_MIN_SIZE) ||
++ 				   atomic_dec_if_positive(&mrdev_priv->r1_ldio_hint)) {
++ 				fp_possible = false;
++ 				atomic_dec(&instance->fw_outstanding);
++ 				if (scsi_buff_len > MR_LARGE_IO_MIN_SIZE)
++ 					atomic_set(&mrdev_priv->r1_ldio_hint,
++ 						   instance->r1_ldio_hint_default);
++ 			}
++ 		}
++ 
++ 		/* If raid is NULL, set CPU affinity to default CPU0 */
++ 		if (raid)
++ 			megasas_set_raidflag_cpu_affinity(praid_context,
++ 				raid, fp_possible, io_info.isRead,
++ 				scsi_buff_len);
++ 		else
++ 			praid_context->raid_context_g35.routing_flags.bits.cpu_sel =
++ 				MR_RAID_CTX_CPUSEL_0;
+++>>>>>>> a48ba0eca045 (scsi: megaraid_sas: raid 1 write performance for large io)
+  	}
+  
+  	if (fp_possible) {
+* Unmerged path drivers/scsi/megaraid/megaraid_sas.h
+* Unmerged path drivers/scsi/megaraid/megaraid_sas_fusion.c
