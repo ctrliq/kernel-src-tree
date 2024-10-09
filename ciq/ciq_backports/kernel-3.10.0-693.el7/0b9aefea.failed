@@ -1,0 +1,93 @@
+tcp: minimize false-positives on TCP/GRO check
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+commit 0b9aefea860063bb39e36bd7fe6c7087fed0ba87
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/0b9aefea.failed
+
+Markus Trippelsdorf reported that after commit dcb17d22e1c2 ("tcp: warn
+on bogus MSS and try to amend it") the kernel started logging the
+warning for a NIC driver that doesn't even support GRO.
+
+It was diagnosed that it was possibly caused on connections that were
+using TCP Timestamps but some packets lacked the Timestamps option. As
+we reduce rcv_mss when timestamps are used, the lack of them would cause
+the packets to be bigger than expected, although this is a valid case.
+
+As this warning is more as a hint, getting a clean-cut on the
+threshold is probably not worth the execution time spent on it. This
+patch thus alleviates the false-positives with 2 quick checks: by
+accounting for the entire TCP option space and also checking against the
+interface MTU if it's available.
+
+These changes, specially the MTU one, might mask some real positives,
+though if they are really happening, it's possible that sooner or later
+it will be triggered anyway.
+
+	Reported-by: Markus Trippelsdorf <markus@trippelsdorf.de>
+	Cc: Eric Dumazet <eric.dumazet@gmail.com>
+	Signed-off-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0b9aefea860063bb39e36bd7fe6c7087fed0ba87)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_input.c
+diff --cc net/ipv4/tcp_input.c
+index 82210b952832,97ac6776e47d..000000000000
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@@ -121,6 -122,29 +121,32 @@@ int sysctl_tcp_invalid_ratelimit __read
+  #define TCP_REMNANT (TCP_FLAG_FIN|TCP_FLAG_URG|TCP_FLAG_SYN|TCP_FLAG_PSH)
+  #define TCP_HP_BITS (~(TCP_RESERVED_BITS|TCP_FLAG_PSH))
+  
+++<<<<<<< HEAD
+++=======
++ #define REXMIT_NONE	0 /* no loss recovery to do */
++ #define REXMIT_LOST	1 /* retransmit packets marked lost */
++ #define REXMIT_NEW	2 /* FRTO-style transmit of unsent/new packets */
++ 
++ static void tcp_gro_dev_warn(struct sock *sk, const struct sk_buff *skb,
++ 			     unsigned int len)
++ {
++ 	static bool __once __read_mostly;
++ 
++ 	if (!__once) {
++ 		struct net_device *dev;
++ 
++ 		__once = true;
++ 
++ 		rcu_read_lock();
++ 		dev = dev_get_by_index_rcu(sock_net(sk), skb->skb_iif);
++ 		if (!dev || len >= dev->mtu)
++ 			pr_warn("%s: Driver has suspect GRO implementation, TCP performance may be compromised.\n",
++ 				dev ? dev->name : "Unknown driver");
++ 		rcu_read_unlock();
++ 	}
++ }
++ 
+++>>>>>>> 0b9aefea8600 (tcp: minimize false-positives on TCP/GRO check)
+  /* Adapt the MSS value used to make delayed ack decision to the
+   * real world.
+   */
+@@@ -137,7 -161,12 +163,16 @@@ static void tcp_measure_rcv_mss(struct 
+  	 */
+  	len = skb_shinfo(skb)->gso_size ? : skb->len;
+  	if (len >= icsk->icsk_ack.rcv_mss) {
+++<<<<<<< HEAD
+ +		icsk->icsk_ack.rcv_mss = len;
+++=======
++ 		icsk->icsk_ack.rcv_mss = min_t(unsigned int, len,
++ 					       tcp_sk(sk)->advmss);
++ 		/* Account for possibly-removed options */
++ 		if (unlikely(len > icsk->icsk_ack.rcv_mss +
++ 				   MAX_TCP_OPTION_SPACE))
++ 			tcp_gro_dev_warn(sk, skb, len);
+++>>>>>>> 0b9aefea8600 (tcp: minimize false-positives on TCP/GRO check)
+  	} else {
+  		/* Otherwise, we make more careful check taking into account,
+  		 * that SACKs block is variable.
+* Unmerged path net/ipv4/tcp_input.c
