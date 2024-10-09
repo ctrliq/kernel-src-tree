@@ -3759,6 +3759,8 @@ static void nfp_net_netdev_init(struct nfp_net *nn)
 	netdev->extended->min_mtu = ETH_MIN_MTU;
 	netdev->extended->max_mtu = nn->max_mtu;
 
+	netdev->gso_max_segs = NFP_NET_LSO_MAX_SEGS;
+
 	netif_carrier_off(netdev);
 
 	nfp_net_set_ethtool_ops(netdev);
