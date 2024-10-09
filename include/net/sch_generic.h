@@ -77,6 +77,9 @@ struct Qdisc {
 	struct netdev_queue	*dev_queue;
 
 	struct gnet_stats_rate_est64	rate_est;
+	struct gnet_stats_basic_cpu __percpu *cpu_bstats;
+	struct gnet_stats_queue	__percpu *cpu_qstats;
+
 	struct Qdisc		*next_sched;
 	struct sk_buff		*gso_skb;
 	/*
