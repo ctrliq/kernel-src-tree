@@ -1,0 +1,149 @@
+iommu/iova: Optimise the padding calculation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [iommu] iova: Optimise the padding calculation (Jerry Snitselaar) [1615865]
+Rebuild_FUZZ: 92.68%
+commit-author Zhen Lei <thunder.leizhen@huawei.com>
+commit 086c83acb70fc6da044c9ca45c1c9780c64545b0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/086c83ac.failed
+
+The mask for calculating the padding size doesn't change, so there's no
+need to recalculate it every loop iteration. Furthermore, Once we've
+done that, it becomes clear that we don't actually need to calculate a
+padding size at all - by flipping the arithmetic around, we can just
+combine the upper limit, size, and mask directly to check against the
+lower limit.
+
+For an arm64 build, this alone knocks 20% off the object code size of
+the entire alloc_iova() function!
+
+	Signed-off-by: Zhen Lei <thunder.leizhen@huawei.com>
+	Tested-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+	Tested-by: Zhen Lei <thunder.leizhen@huawei.com>
+	Tested-by: Nate Watterson <nwatters@codeaurora.org>
+[rm: simplified more of the arithmetic, rewrote commit message]
+	Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 086c83acb70fc6da044c9ca45c1c9780c64545b0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/iova.c
+diff --cc drivers/iommu/iova.c
+index 1a0166896ba6,20be9a8b3188..000000000000
+--- a/drivers/iommu/iova.c
++++ b/drivers/iommu/iova.c
+@@@ -153,14 -154,32 +153,43 @@@ __cached_rbnode_delete_update(struct io
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Computes the padding size required, to make the start address
+ + * naturally aligned on the power-of-two order of its size
+ + */
+ +static unsigned int
+ +iova_get_pad_size(unsigned int size, unsigned int limit_pfn)
+ +{
+ +	return (limit_pfn - size) & (__roundup_pow_of_two(size) - 1);
+++=======
++ /* Insert the iova into domain rbtree by holding writer lock */
++ static void
++ iova_insert_rbtree(struct rb_root *root, struct iova *iova,
++ 		   struct rb_node *start)
++ {
++ 	struct rb_node **new, *parent = NULL;
++ 
++ 	new = (start) ? &start : &(root->rb_node);
++ 	/* Figure out where to put new node */
++ 	while (*new) {
++ 		struct iova *this = rb_entry(*new, struct iova, node);
++ 
++ 		parent = *new;
++ 
++ 		if (iova->pfn_lo < this->pfn_lo)
++ 			new = &((*new)->rb_left);
++ 		else if (iova->pfn_lo > this->pfn_lo)
++ 			new = &((*new)->rb_right);
++ 		else {
++ 			WARN_ON(1); /* this should not happen */
++ 			return;
++ 		}
++ 	}
++ 	/* Add new node and rebalance tree. */
++ 	rb_link_node(&iova->node, parent, new);
++ 	rb_insert_color(&iova->node, root);
+++>>>>>>> 086c83acb70f (iommu/iova: Optimise the padding calculation)
+  }
+  
+  static int __alloc_and_insert_iova_range(struct iova_domain *iovad,
+@@@ -178,16 -200,14 +210,14 @@@
+  	curr = __get_cached_rbnode(iovad, &limit_pfn);
+  	prev = curr;
+  	while (curr) {
+ -		struct iova *curr_iova = rb_entry(curr, struct iova, node);
+ +		struct iova *curr_iova = container_of(curr, struct iova, node);
+  
+- 		if (limit_pfn <= curr_iova->pfn_lo) {
++ 		if (limit_pfn <= curr_iova->pfn_lo)
+  			goto move_left;
+- 		} else if (limit_pfn > curr_iova->pfn_hi) {
+- 			if (size_aligned)
+- 				pad_size = iova_get_pad_size(size, limit_pfn);
+- 			if ((curr_iova->pfn_hi + size + pad_size) < limit_pfn)
+- 				break;	/* found a free slot */
+- 		}
++ 
++ 		if (((limit_pfn - size) & align_mask) > curr_iova->pfn_hi)
++ 			break;	/* found a free slot */
++ 
+  		limit_pfn = curr_iova->pfn_lo;
+  move_left:
+  		prev = curr;
+@@@ -204,39 -221,11 +231,39 @@@
+  	}
+  
+  	/* pfn_lo will point to size aligned address if size_aligned is set */
+- 	new->pfn_lo = limit_pfn - (size + pad_size);
++ 	new->pfn_lo = new_pfn;
+  	new->pfn_hi = new->pfn_lo + size - 1;
+  
+ -	/* If we have 'prev', it's a valid place to start the insertion. */
+ -	iova_insert_rbtree(&iovad->rbroot, new, prev);
+ +	/* Insert the new_iova into domain rbtree by holding writer lock */
+ +	/* Add new node and rebalance tree. */
+ +	{
+ +		struct rb_node **entry, *parent = NULL;
+ +
+ +		/* If we have 'prev', it's a valid place to start the
+ +		   insertion. Otherwise, start from the root. */
+ +		if (prev)
+ +			entry = &prev;
+ +		else
+ +			entry = &iovad->rbroot.rb_node;
+ +
+ +		/* Figure out where to put new node */
+ +		while (*entry) {
+ +			struct iova *this = container_of(*entry,
+ +							struct iova, node);
+ +			parent = *entry;
+ +
+ +			if (new->pfn_lo < this->pfn_lo)
+ +				entry = &((*entry)->rb_left);
+ +			else if (new->pfn_lo > this->pfn_lo)
+ +				entry = &((*entry)->rb_right);
+ +			else
+ +				BUG(); /* this should not happen */
+ +		}
+ +
+ +		/* Add new node and rebalance tree. */
+ +		rb_link_node(&new->node, parent, entry);
+ +		rb_insert_color(&new->node, &iovad->rbroot);
+ +	}
+  	__cached_rbnode_insert_update(iovad, saved_pfn, new);
+  
+  	spin_unlock_irqrestore(&iovad->iova_rbtree_lock, flags);
+* Unmerged path drivers/iommu/iova.c
