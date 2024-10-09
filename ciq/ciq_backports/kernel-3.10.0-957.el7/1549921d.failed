@@ -1,0 +1,327 @@
+nfp: bpf: move jump resolution to jit.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 1549921da3e8efb6c95e39444c67ed1729a0ccaf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/1549921d.failed
+
+Jump target resolution should be in jit.c not offload.c.
+No functional changes.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Jiong Wang <jiong.wang@netronome.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 1549921da3e8efb6c95e39444c67ed1729a0ccaf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/bpf/main.h
+#	drivers/net/ethernet/netronome/nfp/bpf/offload.c
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 5212b54abaf7,0b1347f2afd1..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@@ -183,37 -228,33 +183,42 @@@ struct nfp_prog 
+  	struct list_head insns;
+  };
+  
+ -/**
+ - * struct nfp_bpf_vnic - per-vNIC BPF priv structure
+ - * @tc_prog:	currently loaded cls_bpf program
+ - */
+ -struct nfp_bpf_vnic {
+ -	struct bpf_prog *tc_prog;
+ +struct nfp_bpf_result {
+ +	unsigned int n_instr;
+ +	bool dense_mode;
+  };
+  
+++<<<<<<< HEAD
+ +int
+ +nfp_bpf_jit(struct bpf_prog *filter, void *prog, enum nfp_bpf_action_type act,
+ +	    unsigned int prog_start, unsigned int prog_done,
+ +	    unsigned int prog_sz, struct nfp_bpf_result *res);
+++=======
++ void nfp_bpf_jit_prepare(struct nfp_prog *nfp_prog, unsigned int cnt);
++ int nfp_bpf_jit(struct nfp_prog *prog);
+++>>>>>>> 1549921da3e8 (nfp: bpf: move jump resolution to jit.c)
+  
+ -extern const struct bpf_prog_offload_ops nfp_bpf_analyzer_ops;
+ +int nfp_prog_verify(struct nfp_prog *nfp_prog, struct bpf_prog *prog);
+  
+ -struct netdev_bpf;
+ -struct nfp_app;
+  struct nfp_net;
+ +struct tc_cls_bpf_offload;
+ +
+ +/**
+ + * struct nfp_net_bpf_priv - per-vNIC BPF private data
+ + * @rx_filter:		Filter offload statistics - dropped packets/bytes
+ + * @rx_filter_prev:	Filter offload statistics - values from previous update
+ + * @rx_filter_change:	Jiffies when statistics last changed
+ + * @rx_filter_stats_timer:  Timer for polling filter offload statistics
+ + * @rx_filter_lock:	Lock protecting timer state changes (teardown)
+ + */
+ +struct nfp_net_bpf_priv {
+ +	struct nfp_stat_pair rx_filter, rx_filter_prev;
+ +	unsigned long rx_filter_change;
+ +	struct timer_list rx_filter_stats_timer;
+ +	spinlock_t rx_filter_lock;
+ +};
+ +
+ +int nfp_net_bpf_offload(struct nfp_net *nn, struct tc_cls_bpf_offload *cls_bpf);
+ +void nfp_net_filter_stats_timer(unsigned long data);
+  
+ -int nfp_net_bpf_offload(struct nfp_net *nn, struct bpf_prog *prog,
+ -			bool old_prog);
+ -
+ -int nfp_bpf_verifier_prep(struct nfp_app *app, struct nfp_net *nn,
+ -			  struct netdev_bpf *bpf);
+ -int nfp_bpf_translate(struct nfp_app *app, struct nfp_net *nn,
+ -		      struct bpf_prog *prog);
+ -int nfp_bpf_destroy(struct nfp_app *app, struct nfp_net *nn,
+ -		    struct bpf_prog *prog);
+ -struct nfp_insn_meta *
+ -nfp_bpf_goto_meta(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
+ -		  unsigned int insn_idx, unsigned int n_insns);
+  #endif
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/offload.c
+index de79faf0874b,0ca6faaacc58..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/offload.c
+@@@ -51,118 -51,117 +51,122 @@@
+  #include "../nfp_net_ctrl.h"
+  #include "../nfp_net.h"
+  
+ -static int
+ -nfp_prog_prepare(struct nfp_prog *nfp_prog, const struct bpf_insn *prog,
+ -		 unsigned int cnt)
+ +void nfp_net_filter_stats_timer(unsigned long data)
+  {
+ -	struct nfp_insn_meta *meta;
+ -	unsigned int i;
+ +	struct nfp_net *nn = (void *)data;
+ +	struct nfp_net_bpf_priv *priv;
+ +	struct nfp_stat_pair latest;
+  
+ -	for (i = 0; i < cnt; i++) {
+ -		meta = kzalloc(sizeof(*meta), GFP_KERNEL);
+ -		if (!meta)
+ -			return -ENOMEM;
+ +	priv = nn->app_priv;
+  
+ -		meta->insn = prog[i];
+ -		meta->n = i;
+ +	spin_lock_bh(&priv->rx_filter_lock);
+  
+ -		list_add_tail(&meta->l, &nfp_prog->insns);
+ -	}
+ +	if (nn->dp.ctrl & NFP_NET_CFG_CTRL_BPF)
+ +		mod_timer(&priv->rx_filter_stats_timer,
+ +			  jiffies + NFP_NET_STAT_POLL_IVL);
+  
+ -	nfp_bpf_jit_prepare(nfp_prog, cnt);
+ +	spin_unlock_bh(&priv->rx_filter_lock);
+  
+ -	return 0;
+ +	latest.pkts = nn_readq(nn, NFP_NET_CFG_STATS_APP1_FRAMES);
+ +	latest.bytes = nn_readq(nn, NFP_NET_CFG_STATS_APP1_BYTES);
+ +
+ +	if (latest.pkts != priv->rx_filter.pkts)
+ +		priv->rx_filter_change = jiffies;
+ +
+ +	priv->rx_filter = latest;
+  }
+  
+ -static void nfp_prog_free(struct nfp_prog *nfp_prog)
+ +#if 0 /* Not in RHEL7 */
+ +static void nfp_net_bpf_stats_reset(struct nfp_net *nn)
+  {
+ -	struct nfp_insn_meta *meta, *tmp;
+ +	struct nfp_net_bpf_priv *priv = nn->app_priv;
+  
+ -	list_for_each_entry_safe(meta, tmp, &nfp_prog->insns, l) {
+ -		list_del(&meta->l);
+ -		kfree(meta);
+ -	}
+ -	kfree(nfp_prog);
+ +	priv->rx_filter.pkts = nn_readq(nn, NFP_NET_CFG_STATS_APP1_FRAMES);
+ +	priv->rx_filter.bytes = nn_readq(nn, NFP_NET_CFG_STATS_APP1_BYTES);
+ +	priv->rx_filter_prev = priv->rx_filter;
+ +	priv->rx_filter_change = jiffies;
+  }
+  
+ -int nfp_bpf_verifier_prep(struct nfp_app *app, struct nfp_net *nn,
+ -			  struct netdev_bpf *bpf)
+ +static int
+ +nfp_net_bpf_stats_update(struct nfp_net *nn, struct tc_cls_bpf_offload *cls_bpf)
+  {
+ -	struct bpf_prog *prog = bpf->verifier.prog;
+ -	struct nfp_prog *nfp_prog;
+ -	int ret;
+ +	struct tc_action *a;
+ +	LIST_HEAD(actions);
+ +	struct nfp_net_bpf_priv *priv = nn->app_priv;
+ +	u64 bytes, pkts;
+  
+ -	nfp_prog = kzalloc(sizeof(*nfp_prog), GFP_KERNEL);
+ -	if (!nfp_prog)
+ -		return -ENOMEM;
+ -	prog->aux->offload->dev_priv = nfp_prog;
+ +	pkts = priv->rx_filter.pkts - priv->rx_filter_prev.pkts;
+ +	bytes = priv->rx_filter.bytes - priv->rx_filter_prev.bytes;
+ +	bytes -= pkts * ETH_HLEN;
+  
+ -	INIT_LIST_HEAD(&nfp_prog->insns);
+ -	nfp_prog->type = prog->type;
+ -	nfp_prog->bpf = app->priv;
+ +	priv->rx_filter_prev = priv->rx_filter;
+  
+ -	ret = nfp_prog_prepare(nfp_prog, prog->insnsi, prog->len);
+ -	if (ret)
+ -		goto err_free;
+ +	preempt_disable();
+  
+ -	nfp_prog->verifier_meta = nfp_prog_first_meta(nfp_prog);
+ -	bpf->verifier.ops = &nfp_bpf_analyzer_ops;
+++<<<<<<< HEAD
+ +	tcf_exts_to_list(cls_bpf->exts, &actions);
+ +	list_for_each_entry(a, &actions, list)
+ +		tcf_action_stats_update(a, bytes, pkts, nn->rx_filter_change);
+  
+ -	return 0;
+ -
+ -err_free:
+ -	nfp_prog_free(nfp_prog);
+ +	preempt_enable();
+++=======
+++	nfp_bpf_jit_prepare(nfp_prog, cnt);
+++>>>>>>> 1549921da3e8 (nfp: bpf: move jump resolution to jit.c)
+  
+ -	return ret;
+ +	return 0;
+  }
+  
+ -int nfp_bpf_translate(struct nfp_app *app, struct nfp_net *nn,
+ -		      struct bpf_prog *prog)
+ +static int
+ +nfp_net_bpf_get_act(struct nfp_net *nn, struct tc_cls_bpf_offload *cls_bpf)
+  {
+ -	struct nfp_prog *nfp_prog = prog->aux->offload->dev_priv;
+ -	unsigned int stack_size;
+ -	unsigned int max_instr;
+ +	const struct tc_action *a;
+ +	LIST_HEAD(actions);
+  
+ -	stack_size = nn_readb(nn, NFP_NET_CFG_BPF_STACK_SZ) * 64;
+ -	if (prog->aux->stack_depth > stack_size) {
+ -		nn_info(nn, "stack too large: program %dB > FW stack %dB\n",
+ -			prog->aux->stack_depth, stack_size);
+ -		return -EOPNOTSUPP;
+ -	}
+ -
+ -	nfp_prog->stack_depth = round_up(prog->aux->stack_depth, 4);
+ -	nfp_prog->start_off = nn_readw(nn, NFP_NET_CFG_BPF_START);
+ -	nfp_prog->tgt_done = nn_readw(nn, NFP_NET_CFG_BPF_DONE);
+ +	if (!cls_bpf->exts)
+ +		return NN_ACT_XDP;
+  
+ -	max_instr = nn_readw(nn, NFP_NET_CFG_BPF_MAX_LEN);
+ -	nfp_prog->__prog_alloc_len = max_instr * sizeof(u64);
+ +	/* TC direct action */
+ +	if (cls_bpf->exts_integrated) {
+ +		if (tc_no_actions(cls_bpf->exts))
+ +			return NN_ACT_DIRECT;
+  
+ -	nfp_prog->prog = kmalloc(nfp_prog->__prog_alloc_len, GFP_KERNEL);
+ -	if (!nfp_prog->prog)
+ -		return -ENOMEM;
+ +		return -EOPNOTSUPP;
+ +	}
+  
+ -	return nfp_bpf_jit(nfp_prog);
+ -}
+ +	/* TC legacy mode */
+ +	if (!tc_single_action(cls_bpf->exts))
+ +		return -EOPNOTSUPP;
+  
+ -int nfp_bpf_destroy(struct nfp_app *app, struct nfp_net *nn,
+ -		    struct bpf_prog *prog)
+ -{
+ -	struct nfp_prog *nfp_prog = prog->aux->offload->dev_priv;
+ +	tcf_exts_to_list(cls_bpf->exts, &actions);
+ +	list_for_each_entry(a, &actions, list) {
+ +		if (is_tcf_gact_shot(a))
+ +			return NN_ACT_TC_DROP;
+  
+ -	kfree(nfp_prog->prog);
+ -	nfp_prog_free(nfp_prog);
+ +		if (is_tcf_mirred_egress_redirect(a) &&
+ +		    tcf_mirred_ifindex(a) == nn->dp.netdev->ifindex)
+ +			return NN_ACT_TC_REDIR;
+ +	}
+  
+ -	return 0;
+ +	return -EOPNOTSUPP;
+  }
+  
+ -static int nfp_net_bpf_load(struct nfp_net *nn, struct bpf_prog *prog)
+ +static int
+ +nfp_net_bpf_offload_prepare(struct nfp_net *nn,
+ +			    struct tc_cls_bpf_offload *cls_bpf,
+ +			    struct nfp_bpf_result *res,
+ +			    void **code, dma_addr_t *dma_addr, u16 max_instr)
+  {
+ -	struct nfp_prog *nfp_prog = prog->aux->offload->dev_priv;
+ +	unsigned int code_sz = max_instr * sizeof(u64);
+ +	enum nfp_bpf_action_type act;
+ +	unsigned int stack_size;
+ +	u16 start_off, done_off;
+  	unsigned int max_mtu;
+ -	dma_addr_t dma_addr;
+ -	int err;
+ +	int ret;
+ +
+ +	ret = nfp_net_bpf_get_act(nn, cls_bpf);
+ +	if (ret < 0)
+ +		return ret;
+ +	act = ret;
+  
+  	max_mtu = nn_readb(nn, NFP_NET_CFG_BPF_INL_MTU) * 64 - 32;
+  	if (max_mtu < nn->dp.netdev->mtu) {
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/jit.c b/drivers/net/ethernet/netronome/nfp/bpf/jit.c
+index 0a5af8620ac1..0d3d3ae29834 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/jit.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/jit.c
+@@ -2527,3 +2527,26 @@ out:
+ 
+ 	return ret;
+ }
++
++void nfp_bpf_jit_prepare(struct nfp_prog *nfp_prog, unsigned int cnt)
++{
++	struct nfp_insn_meta *meta;
++
++	/* Another pass to record jump information. */
++	list_for_each_entry(meta, &nfp_prog->insns, l) {
++		u64 code = meta->insn.code;
++
++		if (BPF_CLASS(code) == BPF_JMP && BPF_OP(code) != BPF_EXIT &&
++		    BPF_OP(code) != BPF_CALL) {
++			struct nfp_insn_meta *dst_meta;
++			unsigned short dst_indx;
++
++			dst_indx = meta->n + 1 + meta->insn.off;
++			dst_meta = nfp_bpf_goto_meta(nfp_prog, meta, dst_indx,
++						     cnt);
++
++			meta->jmp_dst = dst_meta;
++			dst_meta->flags |= FLAG_INSN_IS_JUMP_DST;
++		}
++	}
++}
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/main.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/offload.c
