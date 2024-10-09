@@ -1,0 +1,327 @@
+iommu/amd: Allow the AMD IOMMU to work with memory encryption
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Tom Lendacky <thomas.lendacky@amd.com>
+commit 2543a786aa25258451f3418b87a038c7ddaa2e85
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2543a786.failed
+
+The IOMMU is programmed with physical addresses for the various tables
+and buffers that are used to communicate between the device and the
+driver. When the driver allocates this memory it is encrypted. In order
+for the IOMMU to access the memory as encrypted the encryption mask needs
+to be included in these physical addresses during configuration.
+
+The PTE entries created by the IOMMU should also include the encryption
+mask so that when the device behind the IOMMU performs a DMA, the DMA
+will be performed to encrypted memory.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+	Acked-by: Joerg Roedel <jroedel@suse.de>
+	Cc: <iommu@lists.linux-foundation.org>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brijesh Singh <brijesh.singh@amd.com>
+	Cc: Dave Young <dyoung@redhat.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Larry Woodman <lwoodman@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Matt Fleming <matt@codeblueprint.co.uk>
+	Cc: Michael S. Tsirkin <mst@redhat.com>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Radim Krčmář <rkrcmar@redhat.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Toshimitsu Kani <toshi.kani@hpe.com>
+	Cc: kasan-dev@googlegroups.com
+	Cc: kvm@vger.kernel.org
+	Cc: linux-arch@vger.kernel.org
+	Cc: linux-doc@vger.kernel.org
+	Cc: linux-efi@vger.kernel.org
+	Cc: linux-mm@kvack.org
+Link: http://lkml.kernel.org/r/3053631ea25ba8b1601c351cb7c541c496f6d9bc.1500319216.git.thomas.lendacky@amd.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 2543a786aa25258451f3418b87a038c7ddaa2e85)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/amd_iommu_init.c
+diff --cc drivers/iommu/amd_iommu_init.c
+index 64aaefb97454,42ff9a86c102..000000000000
+--- a/drivers/iommu/amd_iommu_init.c
++++ b/drivers/iommu/amd_iommu_init.c
+@@@ -29,6 -29,8 +29,11 @@@
+  #include <linux/export.h>
+  #include <linux/iommu.h>
+  #include <linux/kmemleak.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/crash_dump.h>
++ #include <linux/mem_encrypt.h>
+++>>>>>>> 2543a786aa25 (iommu/amd: Allow the AMD IOMMU to work with memory encryption)
+  #include <asm/pci-direct.h>
+  #include <asm/iommu.h>
+  #include <asm/gart.h>
+@@@ -670,6 -690,99 +675,102 @@@ static void __init free_ppr_log(struct 
+  	free_pages((unsigned long)iommu->ppr_log, get_order(PPR_LOG_SIZE));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void free_ga_log(struct amd_iommu *iommu)
++ {
++ #ifdef CONFIG_IRQ_REMAP
++ 	if (iommu->ga_log)
++ 		free_pages((unsigned long)iommu->ga_log,
++ 			    get_order(GA_LOG_SIZE));
++ 	if (iommu->ga_log_tail)
++ 		free_pages((unsigned long)iommu->ga_log_tail,
++ 			    get_order(8));
++ #endif
++ }
++ 
++ static int iommu_ga_log_enable(struct amd_iommu *iommu)
++ {
++ #ifdef CONFIG_IRQ_REMAP
++ 	u32 status, i;
++ 
++ 	if (!iommu->ga_log)
++ 		return -EINVAL;
++ 
++ 	status = readl(iommu->mmio_base + MMIO_STATUS_OFFSET);
++ 
++ 	/* Check if already running */
++ 	if (status & (MMIO_STATUS_GALOG_RUN_MASK))
++ 		return 0;
++ 
++ 	iommu_feature_enable(iommu, CONTROL_GAINT_EN);
++ 	iommu_feature_enable(iommu, CONTROL_GALOG_EN);
++ 
++ 	for (i = 0; i < LOOP_TIMEOUT; ++i) {
++ 		status = readl(iommu->mmio_base + MMIO_STATUS_OFFSET);
++ 		if (status & (MMIO_STATUS_GALOG_RUN_MASK))
++ 			break;
++ 	}
++ 
++ 	if (i >= LOOP_TIMEOUT)
++ 		return -EINVAL;
++ #endif /* CONFIG_IRQ_REMAP */
++ 	return 0;
++ }
++ 
++ #ifdef CONFIG_IRQ_REMAP
++ static int iommu_init_ga_log(struct amd_iommu *iommu)
++ {
++ 	u64 entry;
++ 
++ 	if (!AMD_IOMMU_GUEST_IR_VAPIC(amd_iommu_guest_ir))
++ 		return 0;
++ 
++ 	iommu->ga_log = (u8 *)__get_free_pages(GFP_KERNEL | __GFP_ZERO,
++ 					get_order(GA_LOG_SIZE));
++ 	if (!iommu->ga_log)
++ 		goto err_out;
++ 
++ 	iommu->ga_log_tail = (u8 *)__get_free_pages(GFP_KERNEL | __GFP_ZERO,
++ 					get_order(8));
++ 	if (!iommu->ga_log_tail)
++ 		goto err_out;
++ 
++ 	entry = iommu_virt_to_phys(iommu->ga_log) | GA_LOG_SIZE_512;
++ 	memcpy_toio(iommu->mmio_base + MMIO_GA_LOG_BASE_OFFSET,
++ 		    &entry, sizeof(entry));
++ 	entry = (iommu_virt_to_phys(iommu->ga_log) & 0xFFFFFFFFFFFFFULL) & ~7ULL;
++ 	memcpy_toio(iommu->mmio_base + MMIO_GA_LOG_TAIL_OFFSET,
++ 		    &entry, sizeof(entry));
++ 	writel(0x00, iommu->mmio_base + MMIO_GA_HEAD_OFFSET);
++ 	writel(0x00, iommu->mmio_base + MMIO_GA_TAIL_OFFSET);
++ 
++ 	return 0;
++ err_out:
++ 	free_ga_log(iommu);
++ 	return -EINVAL;
++ }
++ #endif /* CONFIG_IRQ_REMAP */
++ 
++ static int iommu_init_ga(struct amd_iommu *iommu)
++ {
++ 	int ret = 0;
++ 
++ #ifdef CONFIG_IRQ_REMAP
++ 	/* Note: We have already checked GASup from IVRS table.
++ 	 *       Now, we need to make sure that GAMSup is set.
++ 	 */
++ 	if (AMD_IOMMU_GUEST_IR_VAPIC(amd_iommu_guest_ir) &&
++ 	    !iommu_feature(iommu, FEATURE_GAM_VAPIC))
++ 		amd_iommu_guest_ir = AMD_IOMMU_GUEST_IR_LEGACY_GA;
++ 
++ 	ret = iommu_init_ga_log(iommu);
++ #endif /* CONFIG_IRQ_REMAP */
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> 2543a786aa25 (iommu/amd: Allow the AMD IOMMU to work with memory encryption)
+  static void iommu_enable_gt(struct amd_iommu *iommu)
+  {
+  	if (!iommu_feature(iommu, FEATURE_GT))
+diff --git a/drivers/iommu/amd_iommu.c b/drivers/iommu/amd_iommu.c
+index e80343c1de99..174784c52f78 100644
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@ -543,7 +543,7 @@ static void dump_dte_entry(u16 devid)
+ 
+ static void dump_command(unsigned long phys_addr)
+ {
+-	struct iommu_cmd *cmd = phys_to_virt(phys_addr);
++	struct iommu_cmd *cmd = iommu_phys_to_virt(phys_addr);
+ 	int i;
+ 
+ 	for (i = 0; i < 4; ++i)
+@@ -864,11 +864,13 @@ static void copy_cmd_to_buffer(struct amd_iommu *iommu,
+ 
+ static void build_completion_wait(struct iommu_cmd *cmd, u64 address)
+ {
++	u64 paddr = iommu_virt_to_phys((void *)address);
++
+ 	WARN_ON(address & 0x7ULL);
+ 
+ 	memset(cmd, 0, sizeof(*cmd));
+-	cmd->data[0] = lower_32_bits(__pa(address)) | CMD_COMPL_WAIT_STORE_MASK;
+-	cmd->data[1] = upper_32_bits(__pa(address));
++	cmd->data[0] = lower_32_bits(paddr) | CMD_COMPL_WAIT_STORE_MASK;
++	cmd->data[1] = upper_32_bits(paddr);
+ 	cmd->data[2] = 1;
+ 	CMD_SET_TYPE(cmd, CMD_COMPL_WAIT);
+ }
+@@ -1308,7 +1310,7 @@ static bool increase_address_space(struct protection_domain *domain,
+ 		return false;
+ 
+ 	*pte             = PM_LEVEL_PDE(domain->mode,
+-					virt_to_phys(domain->pt_root));
++					iommu_virt_to_phys(domain->pt_root));
+ 	domain->pt_root  = pte;
+ 	domain->mode    += 1;
+ 	domain->updated  = true;
+@@ -1345,7 +1347,7 @@ static u64 *alloc_pte(struct protection_domain *domain,
+ 			if (!page)
+ 				return NULL;
+ 
+-			__npte = PM_LEVEL_PDE(level, virt_to_phys(page));
++			__npte = PM_LEVEL_PDE(level, iommu_virt_to_phys(page));
+ 
+ 			/* pte could have been changed somewhere. */
+ 			if (cmpxchg64(pte, __pte, __npte) != __pte) {
+@@ -1461,10 +1463,10 @@ static int iommu_map_page(struct protection_domain *dom,
+ 			return -EBUSY;
+ 
+ 	if (count > 1) {
+-		__pte = PAGE_SIZE_PTE(phys_addr, page_size);
++		__pte = PAGE_SIZE_PTE(__sme_set(phys_addr), page_size);
+ 		__pte |= PM_LEVEL_ENC(7) | IOMMU_PTE_P | IOMMU_PTE_FC;
+ 	} else
+-		__pte = phys_addr | IOMMU_PTE_P | IOMMU_PTE_FC;
++		__pte = __sme_set(phys_addr) | IOMMU_PTE_P | IOMMU_PTE_FC;
+ 
+ 	if (prot & IOMMU_PROT_IR)
+ 		__pte |= IOMMU_PTE_IR;
+@@ -1939,7 +1941,7 @@ static void free_gcr3_tbl_level1(u64 *tbl)
+ 		if (!(tbl[i] & GCR3_VALID))
+ 			continue;
+ 
+-		ptr = __va(tbl[i] & PAGE_MASK);
++		ptr = iommu_phys_to_virt(tbl[i] & PAGE_MASK);
+ 
+ 		free_page((unsigned long)ptr);
+ 	}
+@@ -1954,7 +1956,7 @@ static void free_gcr3_tbl_level2(u64 *tbl)
+ 		if (!(tbl[i] & GCR3_VALID))
+ 			continue;
+ 
+-		ptr = __va(tbl[i] & PAGE_MASK);
++		ptr = iommu_phys_to_virt(tbl[i] & PAGE_MASK);
+ 
+ 		free_gcr3_tbl_level1(ptr);
+ 	}
+@@ -2073,7 +2075,7 @@ static void set_dte_entry(u16 devid, struct protection_domain *domain, bool ats)
+ 	u64 flags = 0;
+ 
+ 	if (domain->mode != PAGE_MODE_NONE)
+-		pte_root = virt_to_phys(domain->pt_root);
++		pte_root = iommu_virt_to_phys(domain->pt_root);
+ 
+ 	pte_root |= (domain->mode & DEV_ENTRY_MODE_MASK)
+ 		    << DEV_ENTRY_MODE_SHIFT;
+@@ -2085,7 +2087,7 @@ static void set_dte_entry(u16 devid, struct protection_domain *domain, bool ats)
+ 		flags |= DTE_FLAG_IOTLB;
+ 
+ 	if (domain->flags & PD_IOMMUV2_MASK) {
+-		u64 gcr3 = __pa(domain->gcr3_tbl);
++		u64 gcr3 = iommu_virt_to_phys(domain->gcr3_tbl);
+ 		u64 glx  = domain->glx;
+ 		u64 tmp;
+ 
+@@ -3438,10 +3440,10 @@ static u64 *__get_gcr3_pte(u64 *root, int level, int pasid, bool alloc)
+ 			if (root == NULL)
+ 				return NULL;
+ 
+-			*pte = __pa(root) | GCR3_VALID;
++			*pte = iommu_virt_to_phys(root) | GCR3_VALID;
+ 		}
+ 
+-		root = __va(*pte & PAGE_MASK);
++		root = iommu_phys_to_virt(*pte & PAGE_MASK);
+ 
+ 		level -= 1;
+ 	}
+@@ -3633,7 +3635,7 @@ static void set_dte_irq_entry(u16 devid, struct irq_remap_table *table)
+ 
+ 	dte	= amd_iommu_dev_table[devid].data[2];
+ 	dte	&= ~DTE_IRQ_PHYS_ADDR_MASK;
+-	dte	|= virt_to_phys(table->table);
++	dte	|= iommu_virt_to_phys(table->table);
+ 	dte	|= DTE_IRQ_REMAP_INTCTL;
+ 	dte	|= DTE_IRQ_TABLE_LEN;
+ 	dte	|= DTE_IRQ_REMAP_ENABLE;
+* Unmerged path drivers/iommu/amd_iommu_init.c
+diff --git a/drivers/iommu/amd_iommu_proto.h b/drivers/iommu/amd_iommu_proto.h
+index a3b5a778d824..11297437e34d 100644
+--- a/drivers/iommu/amd_iommu_proto.h
++++ b/drivers/iommu/amd_iommu_proto.h
+@@ -76,4 +76,14 @@ static inline bool iommu_feature(struct amd_iommu *iommu, u64 f)
+ 	return !!(iommu->features & f);
+ }
+ 
++static inline u64 iommu_virt_to_phys(void *vaddr)
++{
++	return (u64)__sme_set(virt_to_phys(vaddr));
++}
++
++static inline void *iommu_phys_to_virt(unsigned long paddr)
++{
++	return phys_to_virt(__sme_clr(paddr));
++}
++
+ #endif /* _ASM_X86_AMD_IOMMU_PROTO_H  */
+diff --git a/drivers/iommu/amd_iommu_types.h b/drivers/iommu/amd_iommu_types.h
+index e448daa671af..eb9e47e80371 100644
+--- a/drivers/iommu/amd_iommu_types.h
++++ b/drivers/iommu/amd_iommu_types.h
+@@ -317,7 +317,7 @@
+ 
+ #define IOMMU_PAGE_MASK (((1ULL << 52) - 1) & ~0xfffULL)
+ #define IOMMU_PTE_PRESENT(pte) ((pte) & IOMMU_PTE_P)
+-#define IOMMU_PTE_PAGE(pte) (phys_to_virt((pte) & IOMMU_PAGE_MASK))
++#define IOMMU_PTE_PAGE(pte) (iommu_phys_to_virt((pte) & IOMMU_PAGE_MASK))
+ #define IOMMU_PTE_MODE(pte) (((pte) >> 9) & 0x07)
+ 
+ #define IOMMU_PROT_MASK 0x03
