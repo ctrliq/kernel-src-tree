@@ -1,0 +1,150 @@
+RDS: Update rds_conn_shutdown to work with rds_conn_path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Sowmini Varadhan <sowmini.varadhan@oracle.com>
+commit d769ef81d5b5932520fbefb02614a4380c132495
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/d769ef81.failed
+
+This commit changes rds_conn_shutdown to take a rds_conn_path *
+argument, allowing it to shutdown paths other than c_path[0] for
+MP-capable transports.
+
+	Signed-off-by: Sowmini Varadhan <sowmini.varadhan@oracle.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d769ef81d5b5932520fbefb02614a4380c132495)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/rds/connection.c
+#	net/rds/rds.h
+#	net/rds/threads.c
+diff --cc net/rds/connection.c
+index dde4562b9b4d,a88d26fd8223..000000000000
+--- a/net/rds/connection.c
++++ b/net/rds/connection.c
+@@@ -324,8 -357,8 +334,13 @@@ void rds_conn_shutdown(struct rds_conn_
+  	if (!hlist_unhashed(&conn->c_hash_node)) {
+  		rcu_read_unlock();
+  		if (conn->c_trans->t_type != RDS_TRANS_TCP ||
+++<<<<<<< HEAD
+ +		    conn->c_outgoing == 1)
+ +			rds_queue_reconnect(conn);
+++=======
++ 		    cp->cp_outgoing == 1)
++ 			rds_queue_reconnect(cp);
+++>>>>>>> d769ef81d5b5 (RDS: Update rds_conn_shutdown to work with rds_conn_path)
+  	} else {
+  		rcu_read_unlock();
+  	}
+diff --cc net/rds/rds.h
+index 8889455d9d7c,2e35b738176f..000000000000
+--- a/net/rds/rds.h
++++ b/net/rds/rds.h
+@@@ -442,8 -456,11 +442,9 @@@ struct rds_transport 
+  	void (*conn_free)(void *data);
+  	int (*conn_connect)(struct rds_connection *conn);
+  	void (*conn_shutdown)(struct rds_connection *conn);
++ 	void (*conn_path_shutdown)(struct rds_conn_path *conn);
+  	void (*xmit_prepare)(struct rds_connection *conn);
+ -	void (*xmit_path_prepare)(struct rds_conn_path *cp);
+  	void (*xmit_complete)(struct rds_connection *conn);
+ -	void (*xmit_path_complete)(struct rds_conn_path *cp);
+  	int (*xmit)(struct rds_connection *conn, struct rds_message *rm,
+  		    unsigned int hdr_off, unsigned int sg, unsigned int off);
+  	int (*xmit_rdma)(struct rds_connection *conn, struct rm_rdma_op *op);
+@@@ -638,9 -654,10 +639,9 @@@ struct rds_connection *rds_conn_create(
+  struct rds_connection *rds_conn_create_outgoing(struct net *net,
+  						__be32 laddr, __be32 faddr,
+  			       struct rds_transport *trans, gfp_t gfp);
+- void rds_conn_shutdown(struct rds_connection *conn);
++ void rds_conn_shutdown(struct rds_conn_path *cpath);
+  void rds_conn_destroy(struct rds_connection *conn);
+  void rds_conn_drop(struct rds_connection *conn);
+ -void rds_conn_path_drop(struct rds_conn_path *cpath);
+  void rds_conn_connect_if_down(struct rds_connection *conn);
+  void rds_conn_path_connect_if_down(struct rds_conn_path *cp);
+  void rds_for_each_conn_info(struct socket *sock, unsigned int len,
+@@@ -743,10 -786,9 +744,16 @@@ void rds_inc_info_copy(struct rds_incom
+  		       __be32 saddr, __be32 daddr, int flip);
+  
+  /* send.c */
+++<<<<<<< HEAD
+ +int rds_sendmsg(struct kiocb *iocb, struct socket *sock, struct msghdr *msg,
+ +		size_t payload_len);
+ +void rds_send_reset(struct rds_connection *conn);
+ +int rds_send_xmit(struct rds_connection *conn);
+++=======
++ int rds_sendmsg(struct socket *sock, struct msghdr *msg, size_t payload_len);
++ void rds_send_path_reset(struct rds_conn_path *conn);
++ int rds_send_xmit(struct rds_conn_path *cp);
+++>>>>>>> d769ef81d5b5 (RDS: Update rds_conn_shutdown to work with rds_conn_path)
+  struct sockaddr_in;
+  void rds_send_drop_to(struct rds_sock *rs, struct sockaddr_in *dest);
+  typedef int (*is_acked_func)(struct rds_message *rm, uint64_t ack);
+diff --cc net/rds/threads.c
+index 55bb19ff40f2,9fbe95bb14a9..000000000000
+--- a/net/rds/threads.c
++++ b/net/rds/threads.c
+@@@ -211,9 -221,11 +211,13 @@@ void rds_recv_worker(struct work_struc
+  
+  void rds_shutdown_worker(struct work_struct *work)
+  {
+ -	struct rds_conn_path *cp = container_of(work,
+ -						struct rds_conn_path,
+ -						cp_down_w);
+ +	struct rds_connection *conn = container_of(work, struct rds_connection, c_down_w);
+  
+++<<<<<<< HEAD
+ +	rds_conn_shutdown(conn);
+++=======
++ 	rds_conn_shutdown(cp);
+++>>>>>>> d769ef81d5b5 (RDS: Update rds_conn_shutdown to work with rds_conn_path)
+  }
+  
+  void rds_threads_exit(void)
+* Unmerged path net/rds/connection.c
+* Unmerged path net/rds/rds.h
+diff --git a/net/rds/send.c b/net/rds/send.c
+index 283757171fc5..232d79f84d1e 100644
+--- a/net/rds/send.c
++++ b/net/rds/send.c
+@@ -62,7 +62,7 @@ static void rds_send_remove_from_sock(struct list_head *messages, int status);
+  * Reset the send state.  Callers must ensure that this doesn't race with
+  * rds_send_xmit().
+  */
+-static void rds_send_path_reset(struct rds_conn_path *cp)
++void rds_send_path_reset(struct rds_conn_path *cp)
+ {
+ 	struct rds_message *rm, *tmp;
+ 	unsigned long flags;
+@@ -99,12 +99,7 @@ static void rds_send_path_reset(struct rds_conn_path *cp)
+ 	list_splice_init(&cp->cp_retrans, &cp->cp_send_queue);
+ 	spin_unlock_irqrestore(&cp->cp_lock, flags);
+ }
+-
+-void rds_send_reset(struct rds_connection *conn)
+-{
+-	rds_send_path_reset(&conn->c_path[0]);
+-}
+-EXPORT_SYMBOL_GPL(rds_send_reset);
++EXPORT_SYMBOL_GPL(rds_send_path_reset);
+ 
+ static int acquire_in_xmit(struct rds_connection *conn)
+ {
+diff --git a/net/rds/tcp.c b/net/rds/tcp.c
+index c8a7b4c90190..fbf6e744e5a2 100644
+--- a/net/rds/tcp.c
++++ b/net/rds/tcp.c
+@@ -185,7 +185,7 @@ void rds_tcp_reset_callbacks(struct socket *sock,
+ 	release_sock(osock->sk);
+ 	sock_release(osock);
+ newsock:
+-	rds_send_reset(conn);
++	rds_send_path_reset(&conn->c_path[0]);
+ 	lock_sock(sock->sk);
+ 	write_lock_bh(&sock->sk->sk_callback_lock);
+ 	tc->t_sock = sock;
+* Unmerged path net/rds/threads.c
