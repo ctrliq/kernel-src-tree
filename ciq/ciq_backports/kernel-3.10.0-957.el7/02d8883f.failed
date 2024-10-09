@@ -1,0 +1,474 @@
+RDMA/restrack: Add general infrastructure to track RDMA resources
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [rdma] restrack: Add general infrastructure to track RDMA resources (Don Dutile) [1549856]
+Rebuild_FUZZ: 96.00%
+commit-author Leon Romanovsky <leonro@mellanox.com>
+commit 02d8883f520ee91c4c40c0a31892eb25ea2df2c9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/02d8883f.failed
+
+The RDMA subsystem has very strict set of objects to work with, but it
+completely lacks tracking facilities and has no visibility of resource
+utilization.
+
+The following patch adds such infrastructure to keep track of RDMA
+resources to help with debugging of user space applications. The primary
+user of this infrastructure is RDMA nldev netlink (following patches), to
+be exposed to userspace via rdmatool, but it is not limited too that.
+
+At this stage, the main three objects (PD, CQ and QP) are added, and more
+will be added later.
+
+	Reviewed-by: Mark Bloch <markb@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 02d8883f520ee91c4c40c0a31892eb25ea2df2c9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/device.c
+diff --cc drivers/infiniband/core/device.c
+index c4d879547bf6,e8010e73a1cf..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -590,6 -598,9 +592,12 @@@ void ib_unregister_device(struct ib_dev
+  	}
+  	up_read(&lists_rwsem);
+  
+++<<<<<<< HEAD
+++=======
++ 	rdma_restrack_clean(&device->res);
++ 
++ 	ib_device_unregister_rdmacg(device);
+++>>>>>>> 02d8883f520e (RDMA/restrack: Add general infrastructure to track RDMA resources)
+  	ib_device_unregister_sysfs(device);
+  
+  	mutex_unlock(&device_mutex);
+diff --git a/drivers/infiniband/core/Makefile b/drivers/infiniband/core/Makefile
+index 462096e20c22..56fd16c129de 100644
+--- a/drivers/infiniband/core/Makefile
++++ b/drivers/infiniband/core/Makefile
+@@ -11,7 +11,7 @@ ib_core-y :=			packer.o ud_header.o verbs.o cq.o rw.o sysfs.o \
+ 				device.o fmr_pool.o cache.o netlink.o \
+ 				roce_gid_mgmt.o mr_pool.o addr.o sa_query.o \
+ 				multicast.o mad.o smi.o agent.o mad_rmpp.o \
+-				security.o nldev.o
++				security.o nldev.o restrack.o
+ 
+ ib_core-$(CONFIG_INFINIBAND_USER_MEM) += umem.o
+ ib_core-$(CONFIG_INFINIBAND_ON_DEMAND_PAGING) += umem_odp.o umem_rbtree.o
+diff --git a/drivers/infiniband/core/core_priv.h b/drivers/infiniband/core/core_priv.h
+index 8b50b63ceda7..4e1c61d0b6a3 100644
+--- a/drivers/infiniband/core/core_priv.h
++++ b/drivers/infiniband/core/core_priv.h
+@@ -39,6 +39,7 @@
+ #include <rdma/ib_verbs.h>
+ #include <rdma/opa_addr.h>
+ #include <rdma/ib_mad.h>
++#include <rdma/restrack.h>
+ #include "mad_priv.h"
+ 
+ /* Total number of ports combined across all struct ib_devices's */
+* Unmerged path drivers/infiniband/core/device.c
+diff --git a/drivers/infiniband/core/restrack.c b/drivers/infiniband/core/restrack.c
+new file mode 100644
+index 000000000000..857637bf46da
+--- /dev/null
++++ b/drivers/infiniband/core/restrack.c
+@@ -0,0 +1,164 @@
++/* SPDX-License-Identifier: (GPL-2.0+ OR BSD-3-Clause) */
++/*
++ * Copyright (c) 2017-2018 Mellanox Technologies. All rights reserved.
++ */
++
++#include <rdma/ib_verbs.h>
++#include <rdma/restrack.h>
++#include <linux/mutex.h>
++#include <linux/sched/task.h>
++#include <linux/uaccess.h>
++#include <linux/pid_namespace.h>
++
++void rdma_restrack_init(struct rdma_restrack_root *res)
++{
++	init_rwsem(&res->rwsem);
++}
++
++void rdma_restrack_clean(struct rdma_restrack_root *res)
++{
++	WARN_ON_ONCE(!hash_empty(res->hash));
++}
++
++int rdma_restrack_count(struct rdma_restrack_root *res,
++			enum rdma_restrack_type type,
++			struct pid_namespace *ns)
++{
++	struct rdma_restrack_entry *e;
++	u32 cnt = 0;
++
++	down_read(&res->rwsem);
++	hash_for_each_possible(res->hash, e, node, type) {
++		if (ns == &init_pid_ns ||
++		    (!rdma_is_kernel_res(e) &&
++		     ns == task_active_pid_ns(e->task)))
++			cnt++;
++	}
++	up_read(&res->rwsem);
++	return cnt;
++}
++EXPORT_SYMBOL(rdma_restrack_count);
++
++static void set_kern_name(struct rdma_restrack_entry *res)
++{
++	enum rdma_restrack_type type = res->type;
++	struct ib_qp *qp;
++
++	if (type != RDMA_RESTRACK_QP)
++		/* PD and CQ types already have this name embedded in */
++		return;
++
++	qp = container_of(res, struct ib_qp, res);
++	if (!qp->pd) {
++		WARN_ONCE(true, "XRC QPs are not supported\n");
++		/* Survive, despite the programmer's error */
++		res->kern_name = " ";
++		return;
++	}
++
++	res->kern_name = qp->pd->res.kern_name;
++}
++
++static struct ib_device *res_to_dev(struct rdma_restrack_entry *res)
++{
++	enum rdma_restrack_type type = res->type;
++	struct ib_device *dev;
++	struct ib_xrcd *xrcd;
++	struct ib_pd *pd;
++	struct ib_cq *cq;
++	struct ib_qp *qp;
++
++	switch (type) {
++	case RDMA_RESTRACK_PD:
++		pd = container_of(res, struct ib_pd, res);
++		dev = pd->device;
++		break;
++	case RDMA_RESTRACK_CQ:
++		cq = container_of(res, struct ib_cq, res);
++		dev = cq->device;
++		break;
++	case RDMA_RESTRACK_QP:
++		qp = container_of(res, struct ib_qp, res);
++		dev = qp->device;
++		break;
++	case RDMA_RESTRACK_XRCD:
++		xrcd = container_of(res, struct ib_xrcd, res);
++		dev = xrcd->device;
++		break;
++	default:
++		WARN_ONCE(true, "Wrong resource tracking type %u\n", type);
++		return NULL;
++	}
++
++	return dev;
++}
++
++void rdma_restrack_add(struct rdma_restrack_entry *res)
++{
++	struct ib_device *dev = res_to_dev(res);
++
++	if (!dev)
++		return;
++
++	if (!uaccess_kernel()) {
++		get_task_struct(current);
++		res->task = current;
++		res->kern_name = NULL;
++	} else {
++		set_kern_name(res);
++		res->task = NULL;
++	}
++
++	kref_init(&res->kref);
++	init_completion(&res->comp);
++	res->valid = true;
++
++	down_write(&dev->res.rwsem);
++	hash_add(dev->res.hash, &res->node, res->type);
++	up_write(&dev->res.rwsem);
++}
++EXPORT_SYMBOL(rdma_restrack_add);
++
++int __must_check rdma_restrack_get(struct rdma_restrack_entry *res)
++{
++	return kref_get_unless_zero(&res->kref);
++}
++EXPORT_SYMBOL(rdma_restrack_get);
++
++static void restrack_release(struct kref *kref)
++{
++	struct rdma_restrack_entry *res;
++
++	res = container_of(kref, struct rdma_restrack_entry, kref);
++	complete(&res->comp);
++}
++
++int rdma_restrack_put(struct rdma_restrack_entry *res)
++{
++	return kref_put(&res->kref, restrack_release);
++}
++EXPORT_SYMBOL(rdma_restrack_put);
++
++void rdma_restrack_del(struct rdma_restrack_entry *res)
++{
++	struct ib_device *dev;
++
++	if (!res->valid)
++		return;
++
++	dev = res_to_dev(res);
++	if (!dev)
++		return;
++
++	rdma_restrack_put(res);
++
++	wait_for_completion(&res->comp);
++
++	down_write(&dev->res.rwsem);
++	hash_del(&res->node);
++	res->valid = false;
++	if (res->task)
++		put_task_struct(res->task);
++	up_write(&dev->res.rwsem);
++}
++EXPORT_SYMBOL(rdma_restrack_del);
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index f97fc9c3c37a..51cf7d337756 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -62,6 +62,7 @@
+ #include <linux/mmu_notifier.h>
+ #include <asm/uaccess.h>
+ #include <uapi/rdma/ib_user_verbs.h>
++#include <rdma/restrack.h>
+ 
+ #define IB_FW_VERSION_NAME_MAX	ETHTOOL_FWVERS_LEN
+ 
+@@ -1515,6 +1516,7 @@ struct ib_pd {
+ 	 * Implementation details of the RDMA core, don't use in drivers:
+ 	 */
+ 	struct ib_mr	       *__internal_mr;
++	struct rdma_restrack_entry res;
+ };
+ 
+ struct ib_xrcd {
+@@ -1524,6 +1526,10 @@ struct ib_xrcd {
+ 
+ 	struct mutex		tgt_qp_mutex;
+ 	struct list_head	tgt_qp_list;
++	/*
++	 * Implementation details of the RDMA core, don't use in drivers:
++	 */
++	struct rdma_restrack_entry res;
+ };
+ 
+ struct ib_ah {
+@@ -1555,6 +1561,10 @@ struct ib_cq {
+ 		struct irq_poll		iop;
+ 		struct work_struct	work;
+ 	};
++	/*
++	 * Implementation details of the RDMA core, don't use in drivers:
++	 */
++	struct rdma_restrack_entry res;
+ };
+ 
+ struct ib_srq {
+@@ -1731,6 +1741,11 @@ struct ib_qp {
+ 	struct ib_rwq_ind_table *rwq_ind_tbl;
+ 	struct ib_qp_security  *qp_sec;
+ 	u8			port;
++
++	/*
++	 * Implementation details of the RDMA core, don't use in drivers:
++	 */
++	struct rdma_restrack_entry     res;
+ };
+ 
+ struct ib_mr {
+@@ -2382,6 +2397,10 @@ struct ib_device {
+ 	struct rdma_hw_stats         *hw_stats;
+ 
+ 	u32                          index;
++	/*
++	 * Implementation details of the RDMA core, don't use in drivers
++	 */
++	struct rdma_restrack_root     res;
+ 
+ 	/**
+ 	 * The following mandatory functions are used only at device
+diff --git a/include/rdma/restrack.h b/include/rdma/restrack.h
+new file mode 100644
+index 000000000000..c2d81167c858
+--- /dev/null
++++ b/include/rdma/restrack.h
+@@ -0,0 +1,157 @@
++/* SPDX-License-Identifier: (GPL-2.0+ OR BSD-3-Clause) */
++/*
++ * Copyright (c) 2017-2018 Mellanox Technologies. All rights reserved.
++ */
++
++#ifndef _RDMA_RESTRACK_H_
++#define _RDMA_RESTRACK_H_
++
++#include <linux/typecheck.h>
++#include <linux/rwsem.h>
++#include <linux/sched.h>
++#include <linux/kref.h>
++#include <linux/completion.h>
++
++/**
++ * enum rdma_restrack_type - HW objects to track
++ */
++enum rdma_restrack_type {
++	/**
++	 * @RDMA_RESTRACK_PD: Protection domain (PD)
++	 */
++	RDMA_RESTRACK_PD,
++	/**
++	 * @RDMA_RESTRACK_CQ: Completion queue (CQ)
++	 */
++	RDMA_RESTRACK_CQ,
++	/**
++	 * @RDMA_RESTRACK_QP: Queue pair (QP)
++	 */
++	RDMA_RESTRACK_QP,
++	/**
++	 * @RDMA_RESTRACK_XRCD: XRC domain (XRCD)
++	 */
++	RDMA_RESTRACK_XRCD,
++	/**
++	 * @RDMA_RESTRACK_MAX: Last entry, used for array dclarations
++	 */
++	RDMA_RESTRACK_MAX
++};
++
++#define RDMA_RESTRACK_HASH_BITS	8
++/**
++ * struct rdma_restrack_root - main resource tracking management
++ * entity, per-device
++ */
++struct rdma_restrack_root {
++	/*
++	 * @rwsem: Read/write lock to protect lists
++	 */
++	struct rw_semaphore	rwsem;
++	/**
++	 * @hash: global database for all resources per-device
++	 */
++	DECLARE_HASHTABLE(hash, RDMA_RESTRACK_HASH_BITS);
++};
++
++/**
++ * struct rdma_restrack_entry - metadata per-entry
++ */
++struct rdma_restrack_entry {
++	/**
++	 * @valid: validity indicator
++	 *
++	 * The entries are filled during rdma_restrack_add,
++	 * can be attempted to be free during rdma_restrack_del.
++	 *
++	 * As an example for that, see mlx5 QPs with type MLX5_IB_QPT_HW_GSI
++	 */
++	bool			valid;
++	/*
++	 * @kref: Protect destroy of the resource
++	 */
++	struct kref		kref;
++	/*
++	 * @comp: Signal that all consumers of resource are completed their work
++	 */
++	struct completion	comp;
++	/**
++	 * @task: owner of resource tracking entity
++	 *
++	 * There are two types of entities: created by user and created
++	 * by kernel.
++	 *
++	 * This is relevant for the entities created by users.
++	 * For the entities created by kernel, this pointer will be NULL.
++	 */
++	struct task_struct	*task;
++	/**
++	 * @kern_name: name of owner for the kernel created entities.
++	 */
++	const char		*kern_name;
++	/**
++	 * @node: hash table entry
++	 */
++	struct hlist_node	node;
++	/**
++	 * @type: various objects in restrack database
++	 */
++	enum rdma_restrack_type	type;
++};
++
++/**
++ * rdma_restrack_init() - initialize resource tracking
++ * @res:  resource tracking root
++ */
++void rdma_restrack_init(struct rdma_restrack_root *res);
++
++/**
++ * rdma_restrack_clean() - clean resource tracking
++ * @res:  resource tracking root
++ */
++void rdma_restrack_clean(struct rdma_restrack_root *res);
++
++/**
++ * rdma_restrack_count() - the current usage of specific object
++ * @res:  resource entry
++ * @type: actual type of object to operate
++ * @ns:   PID namespace
++ */
++int rdma_restrack_count(struct rdma_restrack_root *res,
++			enum rdma_restrack_type type,
++			struct pid_namespace *ns);
++
++/**
++ * rdma_restrack_add() - add object to the reource tracking database
++ * @res:  resource entry
++ */
++void rdma_restrack_add(struct rdma_restrack_entry *res);
++
++/**
++ * rdma_restrack_del() - delete object from the reource tracking database
++ * @res:  resource entry
++ * @type: actual type of object to operate
++ */
++void rdma_restrack_del(struct rdma_restrack_entry *res);
++
++/**
++ * rdma_is_kernel_res() - check the owner of resource
++ * @res:  resource entry
++ */
++static inline bool rdma_is_kernel_res(struct rdma_restrack_entry *res)
++{
++	return !res->task;
++}
++
++/**
++ * rdma_restrack_get() - grab to protect resource from release
++ * @res:  resource entry
++ */
++int __must_check rdma_restrack_get(struct rdma_restrack_entry *res);
++
++/**
++ * rdma_restrack_put() - relase resource
++ * @res:  resource entry
++ */
++int rdma_restrack_put(struct rdma_restrack_entry *res);
++#endif /* _RDMA_RESTRACK_H_ */
