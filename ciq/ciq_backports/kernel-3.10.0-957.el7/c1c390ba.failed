@@ -1,0 +1,96 @@
+tcmu: prevent corruption when invalid data page requested
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mike Christie <mchristi@redhat.com>
+commit c1c390ba53195aef36e94b2354bc0e603057c293
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/c1c390ba.failed
+
+We will always have a page mapped for cmd data if it is
+valid command. If the mapping does not exist then something
+bad happened in userspace and it should not proceed. This
+has us return VM_FAULT_SIGBUS when this happens instead of
+returning a freshly allocated paged. The latter can cause
+corruption because userspace might write the pages data
+overwriting valid data or return it to the initiator.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit c1c390ba53195aef36e94b2354bc0e603057c293)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 2ac4515b6a67,a746fedbb486..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -997,9 -1339,32 +997,36 @@@ static int tcmu_find_mem_index(struct v
+  	return -1;
+  }
+  
+ -static struct page *tcmu_try_get_block_page(struct tcmu_dev *udev, uint32_t dbi)
+ +static int tcmu_vma_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+  {
+++<<<<<<< HEAD
+ +	struct tcmu_dev *udev = vma->vm_private_data;
+++=======
++ 	struct page *page;
++ 
++ 	mutex_lock(&udev->cmdr_lock);
++ 	page = tcmu_get_block_page(udev, dbi);
++ 	if (likely(page)) {
++ 		mutex_unlock(&udev->cmdr_lock);
++ 		return page;
++ 	}
++ 
++ 	/*
++ 	 * Userspace messed up and passed in a address not in the
++ 	 * data iov passed to it.
++ 	 */
++ 	pr_err("Invalid addr to data block mapping  (dbi %u) on device %s\n",
++ 	       dbi, udev->name);
++ 	page = NULL;
++ 	mutex_unlock(&udev->cmdr_lock);
++ 
++ 	return page;
++ }
++ 
++ static int tcmu_vma_fault(struct vm_fault *vmf)
++ {
++ 	struct tcmu_dev *udev = vmf->vma->vm_private_data;
+++>>>>>>> c1c390ba5319 (tcmu: prevent corruption when invalid data page requested)
+  	struct uio_info *info = &udev->uio_info;
+  	struct page *page;
+  	unsigned long offset;
+@@@ -1015,11 -1380,20 +1042,24 @@@
+  	 */
+  	offset = (vmf->pgoff - mi) << PAGE_SHIFT;
+  
+ -	if (offset < udev->data_off) {
+ -		/* For the vmalloc()ed cmd area pages */
+ -		addr = (void *)(unsigned long)info->mem[mi].addr + offset;
+ +	addr = (void *)(unsigned long)info->mem[mi].addr + offset;
+ +	if (info->mem[mi].memtype == UIO_MEM_LOGICAL)
+ +		page = virt_to_page(addr);
+ +	else
+  		page = vmalloc_to_page(addr);
+++<<<<<<< HEAD
+++=======
++ 	} else {
++ 		uint32_t dbi;
++ 
++ 		/* For the dynamically growing data area pages */
++ 		dbi = (offset - udev->data_off) / DATA_BLOCK_SIZE;
++ 		page = tcmu_try_get_block_page(udev, dbi);
++ 		if (!page)
++ 			return VM_FAULT_SIGBUS;
++ 	}
++ 
+++>>>>>>> c1c390ba5319 (tcmu: prevent corruption when invalid data page requested)
+  	get_page(page);
+  	vmf->page = page;
+  	return 0;
+* Unmerged path drivers/target/target_core_user.c
