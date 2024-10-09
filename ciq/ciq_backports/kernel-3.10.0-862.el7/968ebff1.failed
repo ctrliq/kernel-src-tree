@@ -1,0 +1,115 @@
+cgroup, perf_event: make perf_event controller work on cgroup2 hierarchy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Tejun Heo <tj@kernel.org>
+commit 968ebff1efde6948564308836ecf1ef57de4e106
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/968ebff1.failed
+
+perf_event is a utility controller whose primary role is identifying
+cgroup membership to filter perf events; however, because it also
+tracks some per-css state, it can't be replaced by pure cgroup
+membership test.  Mark the controller as implicitly enabled on the
+default hierarchy so that perf events can always be filtered based on
+cgroup v2 path as long as the controller is not mounted on a legacy
+hierarchy.
+
+"perf record" is updated accordingly so that it searches for both v1
+and v2 hierarchies.  A v1 hierarchy is used if perf_event is mounted
+on it; otherwise, it uses the v2 hierarchy.
+
+v2: Doc updated to reflect more flexible rebinding behavior.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Acked-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+(cherry picked from commit 968ebff1efde6948564308836ecf1ef57de4e106)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/cgroup-v2.txt
+* Unmerged path Documentation/cgroup-v2.txt
+* Unmerged path Documentation/cgroup-v2.txt
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index c7982922c47d..bf732a98418d 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -10683,5 +10683,11 @@ struct cgroup_subsys perf_subsys = {
+ 	.css_free	= perf_cgroup_css_free,
+ 	.exit		= perf_cgroup_exit,
+ 	.attach		= perf_cgroup_attach,
++	/*
++	 * Implicitly enable on dfl hierarchy so that perf events can
++	 * always be filtered by cgroup2 path as long as perf_event
++	 * controller is not mounted on a legacy hierarchy.
++	 */
++	.implicit_on_dfl = true,
+ };
+ #endif /* CONFIG_CGROUP_PERF */
+diff --git a/tools/perf/util/cgroup.c b/tools/perf/util/cgroup.c
+index 8fdee24725a7..eafbf11442b2 100644
+--- a/tools/perf/util/cgroup.c
++++ b/tools/perf/util/cgroup.c
+@@ -12,8 +12,8 @@ cgroupfs_find_mountpoint(char *buf, size_t maxlen)
+ {
+ 	FILE *fp;
+ 	char mountpoint[PATH_MAX + 1], tokens[PATH_MAX + 1], type[PATH_MAX + 1];
++	char path_v1[PATH_MAX + 1], path_v2[PATH_MAX + 2], *path;
+ 	char *token, *saved_ptr = NULL;
+-	int found = 0;
+ 
+ 	fp = fopen("/proc/mounts", "r");
+ 	if (!fp)
+@@ -24,31 +24,43 @@ cgroupfs_find_mountpoint(char *buf, size_t maxlen)
+ 	 * and inspect every cgroupfs mount point to find one that has
+ 	 * perf_event subsystem
+ 	 */
++	path_v1[0] = '\0';
++	path_v2[0] = '\0';
++
+ 	while (fscanf(fp, "%*s %"STR(PATH_MAX)"s %"STR(PATH_MAX)"s %"
+ 				STR(PATH_MAX)"s %*d %*d\n",
+ 				mountpoint, type, tokens) == 3) {
+ 
+-		if (!strcmp(type, "cgroup")) {
++		if (!path_v1[0] && !strcmp(type, "cgroup")) {
+ 
+ 			token = strtok_r(tokens, ",", &saved_ptr);
+ 
+ 			while (token != NULL) {
+ 				if (!strcmp(token, "perf_event")) {
+-					found = 1;
++					strcpy(path_v1, mountpoint);
+ 					break;
+ 				}
+ 				token = strtok_r(NULL, ",", &saved_ptr);
+ 			}
+ 		}
+-		if (found)
++
++		if (!path_v2[0] && !strcmp(type, "cgroup2"))
++			strcpy(path_v2, mountpoint);
++
++		if (path_v1[0] && path_v2[0])
+ 			break;
+ 	}
+ 	fclose(fp);
+-	if (!found)
++
++	if (path_v1[0])
++		path = path_v1;
++	else if (path_v2[0])
++		path = path_v2;
++	else
+ 		return -1;
+ 
+-	if (strlen(mountpoint) < maxlen) {
+-		strcpy(buf, mountpoint);
++	if (strlen(path) < maxlen) {
++		strcpy(buf, path);
+ 		return 0;
+ 	}
+ 	return -1;
