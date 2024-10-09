@@ -1,0 +1,123 @@
+ext4: perform dax_device lookup at mount
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 5e405595e5bf4c09fab9ca1e7dbe5b62872757b5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/5e405595.failed
+
+The ->iomap_begin() operation is a hot path, so cache the
+fs_dax_get_by_host() result at mount time to avoid the incurring the
+hash lookup overhead on a per-i/o basis.
+
+	Cc: "Theodore Ts'o" <tytso@mit.edu>
+	Cc: Andreas Dilger <adilger.kernel@dilger.ca>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Reported-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 5e405595e5bf4c09fab9ca1e7dbe5b62872757b5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/ext4.h
+#	fs/ext4/inode.c
+diff --cc fs/ext4/ext4.h
+index 76a16c835c1e,194e622dc3dd..000000000000
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@@ -1404,6 -1525,10 +1404,13 @@@ struct ext4_sb_info 
+  	struct ratelimit_state s_err_ratelimit_state;
+  	struct ratelimit_state s_warning_ratelimit_state;
+  	struct ratelimit_state s_msg_ratelimit_state;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* Barrier between changing inodes' journal flags and writepages ops. */
++ 	struct percpu_rw_semaphore s_journal_flag_rwsem;
++ 	struct dax_device *s_daxdev;
+++>>>>>>> 5e405595e5bf (ext4: perform dax_device lookup at mount)
+  };
+  
+  static inline struct ext4_sb_info *EXT4_SB(struct super_block *sb)
+diff --cc fs/ext4/inode.c
+index 83725648daac,16424b5c4e88..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -3159,18 -3473,14 +3159,23 @@@ retry
+  	}
+  
+  	iomap->flags = 0;
+++<<<<<<< HEAD
+ +	bdev = inode->i_sb->s_bdev;
+ +	iomap->bdev = bdev;
+ +	if (blk_queue_dax(bdev->bd_queue))
+ +		iomap->dax_dev = dax_get_by_host(bdev->bd_disk->disk_name);
+ +	else
+ +		iomap->dax_dev = NULL;
+++=======
++ 	iomap->bdev = inode->i_sb->s_bdev;
++ 	iomap->dax_dev = sbi->s_daxdev;
+++>>>>>>> 5e405595e5bf (ext4: perform dax_device lookup at mount)
+  	iomap->offset = first_block << blkbits;
+ +	iomap->length = (u64)map.m_len << blkbits;
+  
+  	if (ret == 0) {
+ -		iomap->type = IOMAP_HOLE;
+ -		iomap->blkno = IOMAP_NULL_BLOCK;
+ -		iomap->length = (u64)map.m_len << blkbits;
+ +		iomap->type = delalloc ? IOMAP_DELALLOC : IOMAP_HOLE;
+ +		iomap->addr = IOMAP_NULL_ADDR;
+  	} else {
+  		if (map.m_flags & EXT4_MAP_MAPPED) {
+  			iomap->type = IOMAP_MAPPED;
+@@@ -3197,7 -3507,6 +3202,10 @@@ static int ext4_iomap_end(struct inode 
+  	int blkbits = inode->i_blkbits;
+  	bool truncate = false;
+  
+++<<<<<<< HEAD
+ +	put_dax(iomap->dax_dev);
+++=======
+++>>>>>>> 5e405595e5bf (ext4: perform dax_device lookup at mount)
+  	if (!(flags & IOMAP_WRITE) || (flags & IOMAP_FAULT))
+  		return 0;
+  
+* Unmerged path fs/ext4/ext4.h
+* Unmerged path fs/ext4/inode.c
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 8b638ee58dbb..8433b7ff4735 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -867,6 +867,7 @@ static void ext4_put_super(struct super_block *sb)
+ 	if (sbi->s_chksum_driver)
+ 		crypto_free_shash(sbi->s_chksum_driver);
+ 	kfree(sbi->s_blockgroup_lock);
++	fs_put_dax(sbi->s_daxdev);
+ 	kfree(sbi);
+ }
+ 
+@@ -3478,6 +3479,7 @@ static int ext4_reserve_clusters(struct ext4_sb_info *sbi, ext4_fsblk_t count)
+ 
+ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
+ {
++	struct dax_device *dax_dev = fs_dax_get_by_bdev(sb->s_bdev);
+ 	char *orig_data = kstrdup(data, GFP_KERNEL);
+ 	struct buffer_head *bh;
+ 	struct ext4_super_block *es = NULL;
+@@ -3501,6 +3503,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
+ 	unsigned int journal_ioprio = DEFAULT_JOURNAL_IOPRIO;
+ 	ext4_group_t first_not_zeroed;
+ 
++	sbi->s_daxdev = dax_dev;
+ 	if ((data && !orig_data) || !sbi)
+ 		goto out_free_base;
+ 
+@@ -4419,6 +4422,7 @@ out_fail:
+ out_free_base:
+ 	kfree(sbi);
+ 	kfree(orig_data);
++	fs_put_dax(dax_dev);
+ 	return err ? err : ret;
+ }
+ 
