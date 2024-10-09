@@ -1,0 +1,325 @@
+net/mlx5e: Retrieve the switchdev id from the firmware only once
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Retrieve the switchdev id from the firmware only once (Don Dutile) [1417284]
+Rebuild_FUZZ: 96.77%
+commit-author Hadar Hen Zion <hadarh@mellanox.com>
+commit dbe413e3bb93e0634f6d8d00b01cda6f141e0acd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/dbe413e3.failed
+
+Avoid firmware command execution each time the switchdev HW ID attr get
+call is made. We do that by reading the ID (PF NIC MAC) only once at
+load time and store it on the representor structure.
+
+	Signed-off-by: Hadar Hen Zion <hadarh@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit dbe413e3bb93e0634f6d8d00b01cda6f141e0acd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 03cb4d7e741a,03d944c0077e..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -3001,7 -3262,162 +3001,166 @@@ static int mlx5e_create_umr_mkey(struc
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +static void *mlx5e_create_netdev(struct mlx5_core_dev *mdev)
+++=======
++ static void mlx5e_nic_init(struct mlx5_core_dev *mdev,
++ 			   struct net_device *netdev,
++ 			   const struct mlx5e_profile *profile,
++ 			   void *ppriv)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(netdev);
++ 
++ 	mlx5e_build_nic_netdev_priv(mdev, netdev, profile, ppriv);
++ 	mlx5e_build_nic_netdev(netdev);
++ 	mlx5e_vxlan_init(priv);
++ }
++ 
++ static void mlx5e_nic_cleanup(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5_core_dev *mdev = priv->mdev;
++ 	struct mlx5_eswitch *esw = mdev->priv.eswitch;
++ 
++ 	mlx5e_vxlan_cleanup(priv);
++ 
++ 	if (MLX5_CAP_GEN(mdev, vport_group_manager))
++ 		mlx5_eswitch_unregister_vport_rep(esw, 0);
++ }
++ 
++ static int mlx5e_init_nic_rx(struct mlx5e_priv *priv)
++ {
++ 	struct mlx5_core_dev *mdev = priv->mdev;
++ 	int err;
++ 	int i;
++ 
++ 	err = mlx5e_create_indirect_rqts(priv);
++ 	if (err) {
++ 		mlx5_core_warn(mdev, "create indirect rqts failed, %d\n", err);
++ 		return err;
++ 	}
++ 
++ 	err = mlx5e_create_direct_rqts(priv);
++ 	if (err) {
++ 		mlx5_core_warn(mdev, "create direct rqts failed, %d\n", err);
++ 		goto err_destroy_indirect_rqts;
++ 	}
++ 
++ 	err = mlx5e_create_indirect_tirs(priv);
++ 	if (err) {
++ 		mlx5_core_warn(mdev, "create indirect tirs failed, %d\n", err);
++ 		goto err_destroy_direct_rqts;
++ 	}
++ 
++ 	err = mlx5e_create_direct_tirs(priv);
++ 	if (err) {
++ 		mlx5_core_warn(mdev, "create direct tirs failed, %d\n", err);
++ 		goto err_destroy_indirect_tirs;
++ 	}
++ 
++ 	err = mlx5e_create_flow_steering(priv);
++ 	if (err) {
++ 		mlx5_core_warn(mdev, "create flow steering failed, %d\n", err);
++ 		goto err_destroy_direct_tirs;
++ 	}
++ 
++ 	err = mlx5e_tc_init(priv);
++ 	if (err)
++ 		goto err_destroy_flow_steering;
++ 
++ 	return 0;
++ 
++ err_destroy_flow_steering:
++ 	mlx5e_destroy_flow_steering(priv);
++ err_destroy_direct_tirs:
++ 	mlx5e_destroy_direct_tirs(priv);
++ err_destroy_indirect_tirs:
++ 	mlx5e_destroy_indirect_tirs(priv);
++ err_destroy_direct_rqts:
++ 	for (i = 0; i < priv->profile->max_nch(mdev); i++)
++ 		mlx5e_destroy_rqt(priv, &priv->direct_tir[i].rqt);
++ err_destroy_indirect_rqts:
++ 	mlx5e_destroy_rqt(priv, &priv->indir_rqt);
++ 	return err;
++ }
++ 
++ static void mlx5e_cleanup_nic_rx(struct mlx5e_priv *priv)
++ {
++ 	int i;
++ 
++ 	mlx5e_tc_cleanup(priv);
++ 	mlx5e_destroy_flow_steering(priv);
++ 	mlx5e_destroy_direct_tirs(priv);
++ 	mlx5e_destroy_indirect_tirs(priv);
++ 	for (i = 0; i < priv->profile->max_nch(priv->mdev); i++)
++ 		mlx5e_destroy_rqt(priv, &priv->direct_tir[i].rqt);
++ 	mlx5e_destroy_rqt(priv, &priv->indir_rqt);
++ }
++ 
++ static int mlx5e_init_nic_tx(struct mlx5e_priv *priv)
++ {
++ 	int err;
++ 
++ 	err = mlx5e_create_tises(priv);
++ 	if (err) {
++ 		mlx5_core_warn(priv->mdev, "create tises failed, %d\n", err);
++ 		return err;
++ 	}
++ 
++ #ifdef CONFIG_MLX5_CORE_EN_DCB
++ 	mlx5e_dcbnl_ieee_setets_core(priv, &priv->params.ets);
++ #endif
++ 	return 0;
++ }
++ 
++ static void mlx5e_nic_enable(struct mlx5e_priv *priv)
++ {
++ 	struct net_device *netdev = priv->netdev;
++ 	struct mlx5_core_dev *mdev = priv->mdev;
++ 	struct mlx5_eswitch *esw = mdev->priv.eswitch;
++ 	struct mlx5_eswitch_rep rep;
++ 
++ 	if (mlx5e_vxlan_allowed(mdev)) {
++ 		rtnl_lock();
++ 		udp_tunnel_get_rx_info(netdev);
++ 		rtnl_unlock();
++ 	}
++ 
++ 	mlx5e_enable_async_events(priv);
++ 	queue_work(priv->wq, &priv->set_rx_mode_work);
++ 
++ 	if (MLX5_CAP_GEN(mdev, vport_group_manager)) {
++ 		mlx5_query_nic_vport_mac_address(mdev, 0, rep.hw_id);
++ 		rep.load = mlx5e_nic_rep_load;
++ 		rep.unload = mlx5e_nic_rep_unload;
++ 		rep.vport = 0;
++ 		rep.priv_data = priv;
++ 		mlx5_eswitch_register_vport_rep(esw, &rep);
++ 	}
++ }
++ 
++ static void mlx5e_nic_disable(struct mlx5e_priv *priv)
++ {
++ 	queue_work(priv->wq, &priv->set_rx_mode_work);
++ 	mlx5e_disable_async_events(priv);
++ }
++ 
++ static const struct mlx5e_profile mlx5e_nic_profile = {
++ 	.init		   = mlx5e_nic_init,
++ 	.cleanup	   = mlx5e_nic_cleanup,
++ 	.init_rx	   = mlx5e_init_nic_rx,
++ 	.cleanup_rx	   = mlx5e_cleanup_nic_rx,
++ 	.init_tx	   = mlx5e_init_nic_tx,
++ 	.cleanup_tx	   = mlx5e_cleanup_nic_tx,
++ 	.enable		   = mlx5e_nic_enable,
++ 	.disable	   = mlx5e_nic_disable,
++ 	.update_stats	   = mlx5e_update_stats,
++ 	.max_nch	   = mlx5e_get_max_num_channels,
++ 	.max_tc		   = MLX5E_MAX_NUM_TC,
++ };
++ 
++ void *mlx5e_create_netdev(struct mlx5_core_dev *mdev,
++ 			  const struct mlx5e_profile *profile, void *ppriv)
+++>>>>>>> dbe413e3bb93 (net/mlx5e: Retrieve the switchdev id from the firmware only once)
+  {
+  	struct net_device *netdev;
+  	struct mlx5e_priv *priv;
+@@@ -3160,9 -3501,57 +3319,61 @@@ err_free_netdev
+  	return NULL;
+  }
+  
+ -static void mlx5e_register_vport_rep(struct mlx5_core_dev *mdev)
+ +static void mlx5e_destroy_netdev(struct mlx5_core_dev *mdev, void *vpriv)
+  {
+++<<<<<<< HEAD
+ +	struct mlx5e_priv *priv = vpriv;
+++=======
++ 	struct mlx5_eswitch *esw = mdev->priv.eswitch;
++ 	int total_vfs = MLX5_TOTAL_VPORTS(mdev);
++ 	int vport;
++ 	u8 mac[ETH_ALEN];
++ 
++ 	if (!MLX5_CAP_GEN(mdev, vport_group_manager))
++ 		return;
++ 
++ 	mlx5_query_nic_vport_mac_address(mdev, 0, mac);
++ 
++ 	for (vport = 1; vport < total_vfs; vport++) {
++ 		struct mlx5_eswitch_rep rep;
++ 
++ 		rep.load = mlx5e_vport_rep_load;
++ 		rep.unload = mlx5e_vport_rep_unload;
++ 		rep.vport = vport;
++ 		ether_addr_copy(rep.hw_id, mac);
++ 		mlx5_eswitch_register_vport_rep(esw, &rep);
++ 	}
++ }
++ 
++ static void *mlx5e_add(struct mlx5_core_dev *mdev)
++ {
++ 	struct mlx5_eswitch *esw = mdev->priv.eswitch;
++ 	void *ppriv = NULL;
++ 	void *ret;
++ 
++ 	if (mlx5e_check_required_hca_cap(mdev))
++ 		return NULL;
++ 
++ 	if (mlx5e_create_mdev_resources(mdev))
++ 		return NULL;
++ 
++ 	mlx5e_register_vport_rep(mdev);
++ 
++ 	if (MLX5_CAP_GEN(mdev, vport_group_manager))
++ 		ppriv = &esw->offloads.vport_reps[0];
++ 
++ 	ret = mlx5e_create_netdev(mdev, &mlx5e_nic_profile, ppriv);
++ 	if (!ret) {
++ 		mlx5e_destroy_mdev_resources(mdev);
++ 		return NULL;
++ 	}
++ 	return ret;
++ }
++ 
++ void mlx5e_destroy_netdev(struct mlx5_core_dev *mdev, struct mlx5e_priv *priv)
++ {
++ 	const struct mlx5e_profile *profile = priv->profile;
+++>>>>>>> dbe413e3bb93 (net/mlx5e: Retrieve the switchdev id from the firmware only once)
+  	struct net_device *netdev = priv->netdev;
+  
+  	set_bit(MLX5E_STATE_DESTROYING, &priv->state);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index 6f9da7b7d506,a96140971d77..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@@ -130,9 -137,50 +130,56 @@@ struct mlx5_l2_table 
+  
+  struct mlx5_eswitch_fdb {
+  	void *fdb;
+++<<<<<<< HEAD
+ +	struct mlx5_flow_group *addr_grp;
+ +	struct mlx5_flow_group *allmulti_grp;
+ +	struct mlx5_flow_group *promisc_grp;
+++=======
++ 	union {
++ 		struct legacy_fdb {
++ 			struct mlx5_flow_group *addr_grp;
++ 			struct mlx5_flow_group *allmulti_grp;
++ 			struct mlx5_flow_group *promisc_grp;
++ 		} legacy;
++ 
++ 		struct offloads_fdb {
++ 			struct mlx5_flow_table *fdb;
++ 			struct mlx5_flow_group *send_to_vport_grp;
++ 			struct mlx5_flow_group *miss_grp;
++ 			struct mlx5_flow_rule  *miss_rule;
++ 		} offloads;
++ 	};
++ };
++ 
++ enum {
++ 	SRIOV_NONE,
++ 	SRIOV_LEGACY,
++ 	SRIOV_OFFLOADS
++ };
++ 
++ struct mlx5_esw_sq {
++ 	struct mlx5_flow_rule	*send_to_vport_rule;
++ 	struct list_head	 list;
++ };
++ 
++ struct mlx5_eswitch_rep {
++ 	int		       (*load)(struct mlx5_eswitch *esw,
++ 				       struct mlx5_eswitch_rep *rep);
++ 	void		       (*unload)(struct mlx5_eswitch *esw,
++ 					 struct mlx5_eswitch_rep *rep);
++ 	u16		       vport;
++ 	struct mlx5_flow_rule *vport_rx_rule;
++ 	void		      *priv_data;
++ 	struct list_head       vport_sqs_list;
++ 	bool		       valid;
++ 	u8		       hw_id[ETH_ALEN];
++ };
++ 
++ struct mlx5_esw_offload {
++ 	struct mlx5_flow_table *ft_offloads;
++ 	struct mlx5_flow_group *vport_rx_group;
++ 	struct mlx5_eswitch_rep *vport_reps;
+++>>>>>>> dbe413e3bb93 (net/mlx5e: Retrieve the switchdev id from the firmware only once)
+  };
+  
+  struct mlx5_eswitch {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
