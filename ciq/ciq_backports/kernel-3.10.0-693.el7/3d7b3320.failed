@@ -1,0 +1,333 @@
+gre: set inner_protocol on xmit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Simon Horman <simon.horman@netronome.com>
+commit 3d7b33209201cbfa090d614db993571ca3c6b090
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/3d7b3320.failed
+
+Ensure that the inner_protocol is set on transmit so that GSO segmentation,
+which relies on that field, works correctly.
+
+This is achieved by setting the inner_protocol in gre_build_header rather
+than each caller of that function. It ensures that the inner_protocol is
+set when gre_fb_xmit() is used to transmit GRE which was not previously the
+case.
+
+I have observed this is not the case when OvS transmits GRE using
+lwtunnel metadata (which it always does).
+
+Fixes: 38720352412a ("gre: Use inner_proto to obtain inner header protocol")
+	Cc: Pravin Shelar <pshelar@ovn.org>
+	Acked-by: Alexander Duyck <alexander.h.duyck@intel.com>
+	Signed-off-by: Simon Horman <simon.horman@netronome.com>
+	Acked-by: Pravin B Shelar <pshelar@ovn.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3d7b33209201cbfa090d614db993571ca3c6b090)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/gre.h
+#	net/ipv6/ip6_gre.c
+diff --cc include/net/gre.h
+index 898513e436c5,73ea256eb7d7..000000000000
+--- a/include/net/gre.h
++++ b/include/net/gre.h
+@@@ -23,5 -23,111 +23,115 @@@ struct gre_protocol 
+  int gre_add_protocol(const struct gre_protocol *proto, u8 version);
+  int gre_del_protocol(const struct gre_protocol *proto, u8 version);
+  
+++<<<<<<< HEAD
+ +struct net_device *gretap_fb_dev_create(struct net *net, const char *name);
+++=======
++ struct net_device *gretap_fb_dev_create(struct net *net, const char *name,
++ 				       u8 name_assign_type);
++ int gre_parse_header(struct sk_buff *skb, struct tnl_ptk_info *tpi,
++ 		     bool *csum_err, __be16 proto, int nhs);
++ 
++ static inline int gre_calc_hlen(__be16 o_flags)
++ {
++ 	int addend = 4;
++ 
++ 	if (o_flags & TUNNEL_CSUM)
++ 		addend += 4;
++ 	if (o_flags & TUNNEL_KEY)
++ 		addend += 4;
++ 	if (o_flags & TUNNEL_SEQ)
++ 		addend += 4;
++ 	return addend;
++ }
++ 
++ static inline __be16 gre_flags_to_tnl_flags(__be16 flags)
++ {
++ 	__be16 tflags = 0;
++ 
++ 	if (flags & GRE_CSUM)
++ 		tflags |= TUNNEL_CSUM;
++ 	if (flags & GRE_ROUTING)
++ 		tflags |= TUNNEL_ROUTING;
++ 	if (flags & GRE_KEY)
++ 		tflags |= TUNNEL_KEY;
++ 	if (flags & GRE_SEQ)
++ 		tflags |= TUNNEL_SEQ;
++ 	if (flags & GRE_STRICT)
++ 		tflags |= TUNNEL_STRICT;
++ 	if (flags & GRE_REC)
++ 		tflags |= TUNNEL_REC;
++ 	if (flags & GRE_VERSION)
++ 		tflags |= TUNNEL_VERSION;
++ 
++ 	return tflags;
++ }
++ 
++ static inline __be16 gre_tnl_flags_to_gre_flags(__be16 tflags)
++ {
++ 	__be16 flags = 0;
++ 
++ 	if (tflags & TUNNEL_CSUM)
++ 		flags |= GRE_CSUM;
++ 	if (tflags & TUNNEL_ROUTING)
++ 		flags |= GRE_ROUTING;
++ 	if (tflags & TUNNEL_KEY)
++ 		flags |= GRE_KEY;
++ 	if (tflags & TUNNEL_SEQ)
++ 		flags |= GRE_SEQ;
++ 	if (tflags & TUNNEL_STRICT)
++ 		flags |= GRE_STRICT;
++ 	if (tflags & TUNNEL_REC)
++ 		flags |= GRE_REC;
++ 	if (tflags & TUNNEL_VERSION)
++ 		flags |= GRE_VERSION;
++ 
++ 	return flags;
++ }
++ 
++ static inline __sum16 gre_checksum(struct sk_buff *skb)
++ {
++ 	__wsum csum;
++ 
++ 	if (skb->ip_summed == CHECKSUM_PARTIAL)
++ 		csum = lco_csum(skb);
++ 	else
++ 		csum = skb_checksum(skb, 0, skb->len, 0);
++ 	return csum_fold(csum);
++ }
++ 
++ static inline void gre_build_header(struct sk_buff *skb, int hdr_len,
++ 				    __be16 flags, __be16 proto,
++ 				    __be32 key, __be32 seq)
++ {
++ 	struct gre_base_hdr *greh;
++ 
++ 	skb_push(skb, hdr_len);
++ 
++ 	skb_set_inner_protocol(skb, proto);
++ 	skb_reset_transport_header(skb);
++ 	greh = (struct gre_base_hdr *)skb->data;
++ 	greh->flags = gre_tnl_flags_to_gre_flags(flags);
++ 	greh->protocol = proto;
++ 
++ 	if (flags & (TUNNEL_KEY | TUNNEL_CSUM | TUNNEL_SEQ)) {
++ 		__be32 *ptr = (__be32 *)(((u8 *)greh) + hdr_len - 4);
++ 
++ 		if (flags & TUNNEL_SEQ) {
++ 			*ptr = seq;
++ 			ptr--;
++ 		}
++ 		if (flags & TUNNEL_KEY) {
++ 			*ptr = key;
++ 			ptr--;
++ 		}
++ 		if (flags & TUNNEL_CSUM &&
++ 		    !(skb_shinfo(skb)->gso_type &
++ 		      (SKB_GSO_GRE | SKB_GSO_GRE_CSUM))) {
++ 			*ptr = 0;
++ 			*(__sum16 *)ptr = gre_checksum(skb);
++ 		}
++ 	}
++ }
++ 
+++>>>>>>> 3d7b33209201 (gre: set inner_protocol on xmit)
+  #endif
+diff --cc net/ipv6/ip6_gre.c
+index 7af2a5d5ad35,704274cbd495..000000000000
+--- a/net/ipv6/ip6_gre.c
++++ b/net/ipv6/ip6_gre.c
+@@@ -538,148 -507,20 +538,153 @@@ static netdev_tx_t ip6gre_xmit2(struct 
+  	if (dev->type == ARPHRD_ETHER)
+  		IPCB(skb)->flags = 0;
+  
+ -	if (dev->header_ops && dev->type == ARPHRD_IP6GRE)
+ -		fl6->daddr = ((struct ipv6hdr *)skb->data)->daddr;
+ -	else
+ +	if (dev->header_ops && dev->type == ARPHRD_IP6GRE) {
+ +		gre_hlen = 0;
+ +		ipv6h = (struct ipv6hdr *)skb->data;
+ +		fl6->daddr = ipv6h->daddr;
+ +	} else {
+ +		gre_hlen = tunnel->hlen;
+  		fl6->daddr = tunnel->parms.raddr;
+ +	}
+ +
+ +	if (!fl6->flowi6_mark)
+ +		dst = dst_cache_get(&tunnel->dst_cache);
+ +
+ +	if (!dst) {
+ +		dst = ip6_route_output(net, NULL, fl6);
+ +
+ +		if (dst->error)
+ +			goto tx_err_link_failure;
+ +		dst = xfrm_lookup(net, dst, flowi6_to_flowi(fl6), NULL, 0);
+ +		if (IS_ERR(dst)) {
+ +			err = PTR_ERR(dst);
+ +			dst = NULL;
+ +			goto tx_err_link_failure;
+ +		}
+ +		ndst = dst;
+ +	}
+ +
+ +	tdev = dst->dev;
+ +
+ +	if (tdev == dev) {
+ +		stats->collisions++;
+ +		net_warn_ratelimited("%s: Local routing loop detected!\n",
+ +				     tunnel->parms.name);
+ +		goto tx_err_dst_release;
+ +	}
+ +
+ +	mtu = dst_mtu(dst) - sizeof(*ipv6h);
+ +	if (encap_limit >= 0) {
+ +		min_headroom += 8;
+ +		mtu -= 8;
+ +	}
+ +	if (mtu < IPV6_MIN_MTU)
+ +		mtu = IPV6_MIN_MTU;
+ +	if (skb_dst(skb))
+ +		skb_dst(skb)->ops->update_pmtu(skb_dst(skb), NULL, skb, mtu);
+ +	if (skb->len > mtu && !skb_is_gso(skb)) {
+ +		*pmtu = mtu;
+ +		err = -EMSGSIZE;
+ +		goto tx_err_dst_release;
+ +	}
+ +
+ +	if (tunnel->err_count > 0) {
+ +		if (time_before(jiffies,
+ +				tunnel->err_time + IP6TUNNEL_ERR_TIMEO)) {
+ +			tunnel->err_count--;
+ +
+ +			dst_link_failure(skb);
+ +		} else
+ +			tunnel->err_count = 0;
+ +	}
+ +
+ +	skb_scrub_packet(skb, !net_eq(tunnel->net, dev_net(dev)));
+  
+ -	if (tunnel->parms.o_flags & TUNNEL_SEQ)
+ -		tunnel->o_seqno++;
+ +	min_headroom += LL_RESERVED_SPACE(tdev) + gre_hlen + dst->header_len;
+  
+ -	/* Push GRE header. */
+ -	gre_build_header(skb, tunnel->tun_hlen, tunnel->parms.o_flags,
+ -			 protocol, tunnel->parms.o_key, htonl(tunnel->o_seqno));
+ +	if (skb_headroom(skb) < min_headroom || skb_header_cloned(skb)) {
+ +		int head_delta = SKB_DATA_ALIGN(min_headroom -
+ +						skb_headroom(skb) +
+ +						16);
+  
+ +		err = pskb_expand_head(skb, max_t(int, head_delta, 0),
+ +				       0, GFP_ATOMIC);
+ +		if (min_headroom > dev->needed_headroom)
+ +			dev->needed_headroom = min_headroom;
+ +		if (unlikely(err))
+ +			goto tx_err_dst_release;
+ +	}
+ +
+ +	if (!fl6->flowi6_mark && ndst)
+ +		dst_cache_set_ip6(&tunnel->dst_cache, ndst, &fl6->saddr);
+ +	skb_dst_set(skb, dst);
+ +
+ +	proto = NEXTHDR_GRE;
+ +	if (encap_limit >= 0) {
+ +		init_tel_txopt(&opt, encap_limit);
+ +		ipv6_push_nfrag_opts(skb, &opt.ops, &proto, NULL);
+ +	}
+ +
+ +	err = iptunnel_handle_offloads(skb,
+ +				       (tunnel->parms.o_flags & GRE_CSUM) ?
+ +				       SKB_GSO_GRE_CSUM : SKB_GSO_GRE);
+ +	if (err)
+ +		goto tx_err_dst_release;
+ +
+ +	skb_push(skb, gre_hlen);
+ +	skb_reset_network_header(skb);
+ +	skb_set_transport_header(skb, sizeof(*ipv6h));
+ +
+ +	/*
+ +	 *	Push down and install the IP header.
+ +	 */
+ +	ipv6h = ipv6_hdr(skb);
+ +	ip6_flow_hdr(ipv6h, INET_ECN_encapsulate(0, dsfield), fl6->flowlabel);
+ +	ipv6h->hop_limit = tunnel->parms.hop_limit;
+ +	ipv6h->nexthdr = proto;
+ +	ipv6h->saddr = fl6->saddr;
+ +	ipv6h->daddr = fl6->daddr;
+ +
+ +	((__be16 *)(ipv6h + 1))[0] = tunnel->parms.o_flags;
+ +	protocol = (dev->type == ARPHRD_ETHER) ?
+ +		    htons(ETH_P_TEB) : skb->protocol;
+ +	((__be16 *)(ipv6h + 1))[1] = protocol;
+ +
+ +	if (tunnel->parms.o_flags&(GRE_KEY|GRE_CSUM|GRE_SEQ)) {
+ +		__be32 *ptr = (__be32 *)(((u8 *)ipv6h) + tunnel->hlen - 4);
+ +
+ +		if (tunnel->parms.o_flags&GRE_SEQ) {
+ +			++tunnel->o_seqno;
+ +			*ptr = htonl(tunnel->o_seqno);
+ +			ptr--;
+ +		}
+ +		if (tunnel->parms.o_flags&GRE_KEY) {
+ +			*ptr = tunnel->parms.o_key;
+ +			ptr--;
+ +		}
+ +		if ((tunnel->parms.o_flags & GRE_CSUM) &&
+ +		    !(skb_shinfo(skb)->gso_type &
+ +		      (SKB_GSO_GRE | SKB_GSO_GRE_CSUM))) {
+ +			*ptr = 0;
+ +			*(__sum16 *)ptr = gre6_checksum(skb);
+ +		}
+ +	}
+ +
+++<<<<<<< HEAD
+ +	skb_set_inner_protocol(skb, protocol);
+ +
+ +	ip6tunnel_xmit(NULL, skb, dev);
+ +	return 0;
+ +tx_err_link_failure:
+ +	stats->tx_carrier_errors++;
+ +	dst_link_failure(skb);
+ +tx_err_dst_release:
+ +	dst_release(dst);
+ +	return err;
+++=======
++ 	return ip6_tnl_xmit(skb, dev, dsfield, fl6, encap_limit, pmtu,
++ 			    NEXTHDR_GRE);
+++>>>>>>> 3d7b33209201 (gre: set inner_protocol on xmit)
+  }
+  
+  static inline int ip6gre_xmit_ipv4(struct sk_buff *skb, struct net_device *dev)
+* Unmerged path include/net/gre.h
+diff --git a/net/ipv4/ip_gre.c b/net/ipv4/ip_gre.c
+index 9c178e45801f..26fec7a9d7b6 100644
+--- a/net/ipv4/ip_gre.c
++++ b/net/ipv4/ip_gre.c
+@@ -500,7 +500,6 @@ static void __gre_xmit(struct sk_buff *skb, struct net_device *dev,
+ 	build_header(skb, tunnel->tun_hlen, tunnel->parms.o_flags,
+ 		     proto, tunnel->parms.o_key, htonl(tunnel->o_seqno));
+ 
+-	skb_set_inner_protocol(skb, proto);
+ 	ip_tunnel_xmit(skb, dev, tnl_params, tnl_params->protocol);
+ }
+ 
+* Unmerged path net/ipv6/ip6_gre.c
