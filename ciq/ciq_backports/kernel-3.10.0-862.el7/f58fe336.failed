@@ -1,0 +1,348 @@
+s390/zcrypt: use explicit return code for flushed requests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [s390] zcrypt: use explicit return code for flushed requests (Hendrik Brueckner) [1380349]
+Rebuild_FUZZ: 95.50%
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit f58fe336009f451748c1c337f35130a320ef923d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f58fe336.failed
+
+If a AP device is removed while messages are still pending, the requests
+are cancelled by calling the message receive function with an error pointer
+for the reply. The message type receive handler recognize this and create
+a fake hardware error TYPE82_RSP_CODE / REP82_ERROR_MACHINE_FAILURE.
+The message with the hardware error then causes a printk and a return
+code of -EAGAIN.
+
+Replace the intricate scheme with an explicit return code for this sitation
+and avoid the error message.
+
+Reviewd-by: Ingo Tuchscherer <ingo.tuchscherer@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit f58fe336009f451748c1c337f35130a320ef923d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/ap_bus.c
+diff --cc drivers/s390/crypto/ap_bus.c
+index 5386d81f8cd3,7224bf7fa9bf..000000000000
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@@ -1786,20 -1727,14 +1790,28 @@@ void ap_queue_message(struct ap_device 
+  			rc = __ap_queue_message(ap_dev, ap_msg);
+  		if (!rc)
+  			wake_up(&ap_poll_wait);
+++<<<<<<< HEAD
+ +		if (rc == -ENODEV) {
+ +			ap_dev->unregistered = AP_DEV_UNREGISTERED;
+ +			ap_msg->receive(ap_dev, ap_msg, ERR_PTR(-ENODEV));
+ +		}
+ +	} else if (ap_dev->unregistered == AP_DEV_UNREGISTERED) {
+ +		ap_msg->receive(ap_dev, ap_msg, ERR_PTR(-ENODEV));
+++=======
++ 		if (rc == -ENODEV)
++ 			ap_dev->unregistered = 1;
++ 	} else {
++ 		ap_msg->rc = -ENODEV;
++ 		ap_msg->receive(ap_dev, ap_msg, NULL);
+++>>>>>>> f58fe336009f (s390/zcrypt: use explicit return code for flushed requests)
+  		rc = -ENODEV;
+ +	} else { /* device registration in progress */
+ +		ap_msg->receive(ap_dev, ap_msg, ERR_PTR(-EBUSY));
+ +		rc = -EBUSY;
+  	}
+  	spin_unlock_bh(&ap_dev->lock);
+ +
+ +	/* no device_unregister(), let ap_scan_bus() do the job */
+  }
+  EXPORT_SYMBOL(ap_queue_message);
+  
+* Unmerged path drivers/s390/crypto/ap_bus.c
+diff --git a/drivers/s390/crypto/ap_bus.h b/drivers/s390/crypto/ap_bus.h
+index 2da8ecdc7a5f..a6d983cc9a24 100644
+--- a/drivers/s390/crypto/ap_bus.h
++++ b/drivers/s390/crypto/ap_bus.h
+@@ -208,6 +208,7 @@ struct ap_message {
+ 	unsigned long long psmid;	/* Message id. */
+ 	void *message;			/* Pointer to message buffer. */
+ 	size_t length;			/* Message length. */
++	int rc;				/* Return code for this message */
+ 
+ 	void *private;			/* ap driver private pointer. */
+ 	unsigned int special:1;		/* Used for special commands. */
+@@ -240,6 +241,7 @@ static inline void ap_init_message(struct ap_message *ap_msg)
+ {
+ 	ap_msg->psmid = 0;
+ 	ap_msg->length = 0;
++	ap_msg->rc = 0;
+ 	ap_msg->special = 0;
+ 	ap_msg->receive = NULL;
+ }
+diff --git a/drivers/s390/crypto/zcrypt_msgtype50.c b/drivers/s390/crypto/zcrypt_msgtype50.c
+index 6c9af1332967..71ceee9137a8 100644
+--- a/drivers/s390/crypto/zcrypt_msgtype50.c
++++ b/drivers/s390/crypto/zcrypt_msgtype50.c
+@@ -395,10 +395,8 @@ static void zcrypt_cex2a_receive(struct ap_device *ap_dev,
+ 	int length;
+ 
+ 	/* Copy the reply message to the request message buffer. */
+-	if (IS_ERR(reply)) {
+-		memcpy(msg->message, &error_reply, sizeof(error_reply));
+-		goto out;
+-	}
++	if (!reply)
++		goto out;	/* ap_msg->rc indicates the error */
+ 	t80h = reply->message;
+ 	if (t80h->type == TYPE80_RSP_CODE) {
+ 		if (ap_dev->device_type == AP_DEVICE_TYPE_CEX2A)
+@@ -449,10 +447,12 @@ static long zcrypt_cex2a_modexpo(struct zcrypt_device *zdev,
+ 	init_completion(&work);
+ 	ap_queue_message(zdev->ap_dev, &ap_msg);
+ 	rc = wait_for_completion_interruptible(&work);
+-	if (rc == 0)
+-		rc = convert_response(zdev, &ap_msg, mex->outputdata,
+-				      mex->outputdatalength);
+-	else
++	if (rc == 0) {
++		rc = ap_msg.rc;
++		if (rc == 0)
++			rc = convert_response(zdev, &ap_msg, mex->outputdata,
++					      mex->outputdatalength);
++	} else
+ 		/* Signal pending. */
+ 		ap_cancel_message(zdev->ap_dev, &ap_msg);
+ out_free:
+@@ -493,10 +493,12 @@ static long zcrypt_cex2a_modexpo_crt(struct zcrypt_device *zdev,
+ 	init_completion(&work);
+ 	ap_queue_message(zdev->ap_dev, &ap_msg);
+ 	rc = wait_for_completion_interruptible(&work);
+-	if (rc == 0)
+-		rc = convert_response(zdev, &ap_msg, crt->outputdata,
+-				      crt->outputdatalength);
+-	else
++	if (rc == 0) {
++		rc = ap_msg.rc;
++		if (rc == 0)
++			rc = convert_response(zdev, &ap_msg, crt->outputdata,
++					      crt->outputdatalength);
++	} else
+ 		/* Signal pending. */
+ 		ap_cancel_message(zdev->ap_dev, &ap_msg);
+ out_free:
+diff --git a/drivers/s390/crypto/zcrypt_msgtype6.c b/drivers/s390/crypto/zcrypt_msgtype6.c
+index cdba2fb45fdc..628d65edea61 100644
+--- a/drivers/s390/crypto/zcrypt_msgtype6.c
++++ b/drivers/s390/crypto/zcrypt_msgtype6.c
+@@ -829,10 +829,8 @@ static void zcrypt_msgtype6_receive(struct ap_device *ap_dev,
+ 	int length;
+ 
+ 	/* Copy the reply message to the request message buffer. */
+-	if (IS_ERR(reply)) {
+-		memcpy(msg->message, &error_reply, sizeof(error_reply));
+-		goto out;
+-	}
++	if (!reply)
++		goto out;	/* ap_msg->rc indicates the error */
+ 	t86r = reply->message;
+ 	if (t86r->hdr.type == TYPE86_RSP_CODE &&
+ 		 t86r->cprbx.cprb_ver_id == 0x02) {
+@@ -880,10 +878,8 @@ static void zcrypt_msgtype6_receive_ep11(struct ap_device *ap_dev,
+ 	int length;
+ 
+ 	/* Copy the reply message to the request message buffer. */
+-	if (IS_ERR(reply)) {
+-		memcpy(msg->message, &error_reply, sizeof(error_reply));
+-		goto out;
+-	}
++	if (!reply)
++		goto out;	/* ap_msg->rc indicates the error */
+ 	t86r = reply->message;
+ 	if (t86r->hdr.type == TYPE86_RSP_CODE &&
+ 	    t86r->cprbx.cprb_ver_id == 0x04) {
+@@ -935,10 +931,13 @@ static long zcrypt_msgtype6_modexpo(struct zcrypt_device *zdev,
+ 	init_completion(&resp_type.work);
+ 	ap_queue_message(zdev->ap_dev, &ap_msg);
+ 	rc = wait_for_completion_interruptible(&resp_type.work);
+-	if (rc == 0)
+-		rc = convert_response_ica(zdev, &ap_msg, mex->outputdata,
+-					  mex->outputdatalength);
+-	else
++	if (rc == 0) {
++		rc = ap_msg.rc;
++		if (rc == 0)
++			rc = convert_response_ica(zdev, &ap_msg,
++						  mex->outputdata,
++						  mex->outputdatalength);
++	} else
+ 		/* Signal pending. */
+ 		ap_cancel_message(zdev->ap_dev, &ap_msg);
+ out_free:
+@@ -976,10 +975,13 @@ static long zcrypt_msgtype6_modexpo_crt(struct zcrypt_device *zdev,
+ 	init_completion(&resp_type.work);
+ 	ap_queue_message(zdev->ap_dev, &ap_msg);
+ 	rc = wait_for_completion_interruptible(&resp_type.work);
+-	if (rc == 0)
+-		rc = convert_response_ica(zdev, &ap_msg, crt->outputdata,
+-					  crt->outputdatalength);
+-	else
++	if (rc == 0) {
++		rc = ap_msg.rc;
++		if (rc == 0)
++			rc = convert_response_ica(zdev, &ap_msg,
++						  crt->outputdata,
++						  crt->outputdatalength);
++	} else
+ 		/* Signal pending. */
+ 		ap_cancel_message(zdev->ap_dev, &ap_msg);
+ out_free:
+@@ -1017,9 +1019,11 @@ static long zcrypt_msgtype6_send_cprb(struct zcrypt_device *zdev,
+ 	init_completion(&resp_type.work);
+ 	ap_queue_message(zdev->ap_dev, &ap_msg);
+ 	rc = wait_for_completion_interruptible(&resp_type.work);
+-	if (rc == 0)
+-		rc = convert_response_xcrb(zdev, &ap_msg, xcRB);
+-	else
++	if (rc == 0) {
++		rc = ap_msg.rc;
++		if (rc == 0)
++			rc = convert_response_xcrb(zdev, &ap_msg, xcRB);
++	} else
+ 		/* Signal pending. */
+ 		ap_cancel_message(zdev->ap_dev, &ap_msg);
+ out_free:
+@@ -1057,9 +1061,12 @@ static long zcrypt_msgtype6_send_ep11_cprb(struct zcrypt_device *zdev,
+ 	init_completion(&resp_type.work);
+ 	ap_queue_message(zdev->ap_dev, &ap_msg);
+ 	rc = wait_for_completion_interruptible(&resp_type.work);
+-	if (rc == 0)
+-		rc = convert_response_ep11_xcrb(zdev, &ap_msg, xcrb);
+-	else /* Signal pending. */
++	if (rc == 0) {
++		rc = ap_msg.rc;
++		if (rc == 0)
++			rc = convert_response_ep11_xcrb(zdev, &ap_msg, xcrb);
++	} else
++		/* Signal pending. */
+ 		ap_cancel_message(zdev->ap_dev, &ap_msg);
+ 
+ out_free:
+@@ -1096,9 +1103,11 @@ static long zcrypt_msgtype6_rng(struct zcrypt_device *zdev,
+ 	init_completion(&resp_type.work);
+ 	ap_queue_message(zdev->ap_dev, &ap_msg);
+ 	rc = wait_for_completion_interruptible(&resp_type.work);
+-	if (rc == 0)
+-		rc = convert_response_rng(zdev, &ap_msg, buffer);
+-	else
++	if (rc == 0) {
++		rc = ap_msg.rc;
++		if (rc == 0)
++			rc = convert_response_rng(zdev, &ap_msg, buffer);
++	} else
+ 		/* Signal pending. */
+ 		ap_cancel_message(zdev->ap_dev, &ap_msg);
+ 	kfree(ap_msg.message);
+diff --git a/drivers/s390/crypto/zcrypt_pcica.c b/drivers/s390/crypto/zcrypt_pcica.c
+index 2f220208da63..6af9c9fd39b1 100644
+--- a/drivers/s390/crypto/zcrypt_pcica.c
++++ b/drivers/s390/crypto/zcrypt_pcica.c
+@@ -258,10 +258,8 @@ static void zcrypt_pcica_receive(struct ap_device *ap_dev,
+ 	int length;
+ 
+ 	/* Copy the reply message to the request message buffer. */
+-	if (IS_ERR(reply)) {
+-		memcpy(msg->message, &error_reply, sizeof(error_reply));
+-		goto out;
+-	}
++	if (!reply)
++		goto out;	/* ap_msg->rc indicates the error */
+ 	t84h = reply->message;
+ 	if (t84h->code == TYPE84_RSP_CODE) {
+ 		length = min(PCICA_MAX_RESPONSE_SIZE, (int) t84h->len);
+@@ -302,10 +300,12 @@ static long zcrypt_pcica_modexpo(struct zcrypt_device *zdev,
+ 	init_completion(&work);
+ 	ap_queue_message(zdev->ap_dev, &ap_msg);
+ 	rc = wait_for_completion_interruptible(&work);
+-	if (rc == 0)
+-		rc = convert_response(zdev, &ap_msg, mex->outputdata,
+-				      mex->outputdatalength);
+-	else
++	if (rc == 0) {
++		rc = ap_msg.rc;
++		if (rc == 0)
++			rc = convert_response(zdev, &ap_msg, mex->outputdata,
++					      mex->outputdatalength);
++	} else
+ 		/* Signal pending. */
+ 		ap_cancel_message(zdev->ap_dev, &ap_msg);
+ out_free:
+@@ -341,10 +341,12 @@ static long zcrypt_pcica_modexpo_crt(struct zcrypt_device *zdev,
+ 	init_completion(&work);
+ 	ap_queue_message(zdev->ap_dev, &ap_msg);
+ 	rc = wait_for_completion_interruptible(&work);
+-	if (rc == 0)
+-		rc = convert_response(zdev, &ap_msg, crt->outputdata,
+-				      crt->outputdatalength);
+-	else
++	if (rc == 0) {
++		rc = ap_msg.rc;
++		if (rc == 0)
++			rc = convert_response(zdev, &ap_msg, crt->outputdata,
++					      crt->outputdatalength);
++	} else
+ 		/* Signal pending. */
+ 		ap_cancel_message(zdev->ap_dev, &ap_msg);
+ out_free:
+diff --git a/drivers/s390/crypto/zcrypt_pcicc.c b/drivers/s390/crypto/zcrypt_pcicc.c
+index 4d14c04b746e..039e3ba3515b 100644
+--- a/drivers/s390/crypto/zcrypt_pcicc.c
++++ b/drivers/s390/crypto/zcrypt_pcicc.c
+@@ -461,10 +461,8 @@ static void zcrypt_pcicc_receive(struct ap_device *ap_dev,
+ 	int length;
+ 
+ 	/* Copy the reply message to the request message buffer. */
+-	if (IS_ERR(reply)) {
+-		memcpy(msg->message, &error_reply, sizeof(error_reply));
+-		goto out;
+-	}
++	if (!reply)
++		goto out;	/* ap_msg->rc indicates the error */
+ 	t86r = reply->message;
+ 	if (t86r->hdr.type == TYPE86_RSP_CODE &&
+ 		 t86r->cprb.cprb_ver_id == 0x01) {
+@@ -508,10 +506,12 @@ static long zcrypt_pcicc_modexpo(struct zcrypt_device *zdev,
+ 	init_completion(&work);
+ 	ap_queue_message(zdev->ap_dev, &ap_msg);
+ 	rc = wait_for_completion_interruptible(&work);
+-	if (rc == 0)
+-		rc = convert_response(zdev, &ap_msg, mex->outputdata,
+-				      mex->outputdatalength);
+-	else
++	if (rc == 0) {
++		rc = ap_msg.rc;
++		if (rc == 0)
++			rc = convert_response(zdev, &ap_msg, mex->outputdata,
++					      mex->outputdatalength);
++	} else
+ 		/* Signal pending. */
+ 		ap_cancel_message(zdev->ap_dev, &ap_msg);
+ out_free:
+@@ -548,10 +548,12 @@ static long zcrypt_pcicc_modexpo_crt(struct zcrypt_device *zdev,
+ 	init_completion(&work);
+ 	ap_queue_message(zdev->ap_dev, &ap_msg);
+ 	rc = wait_for_completion_interruptible(&work);
+-	if (rc == 0)
+-		rc = convert_response(zdev, &ap_msg, crt->outputdata,
+-				      crt->outputdatalength);
+-	else
++	if (rc == 0) {
++		rc = ap_msg.rc;
++		if (rc == 0)
++			rc = convert_response(zdev, &ap_msg, crt->outputdata,
++					      crt->outputdatalength);
++	} else
+ 		/* Signal pending. */
+ 		ap_cancel_message(zdev->ap_dev, &ap_msg);
+ out_free:
