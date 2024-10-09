@@ -1,0 +1,233 @@
+powerpc/64s: Add support for software count cache flush
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [powerpc] 64s: Add support for software count cache flush (Gustavo Duarte) [1694459]
+Rebuild_FUZZ: 92.16%
+commit-author Michael Ellerman <mpe@ellerman.id.au>
+commit ee13cb249fabdff8b90aaff61add347749280087
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/ee13cb24.failed
+
+Some CPU revisions support a mode where the count cache needs to be
+flushed by software on context switch. Additionally some revisions may
+have a hardware accelerated flush, in which case the software flush
+sequence can be shortened.
+
+If we detect the appropriate flag from firmware we patch a branch
+into _switch() which takes us to a count cache flush sequence.
+
+That sequence in turn may be patched to return early if we detect that
+the CPU supports accelerating the flush sequence in hardware.
+
+Add debugfs support for reporting the state of the flush, as well as
+runtime disabling it.
+
+And modify the spectre_v2 sysfs file to report the state of the
+software flush.
+
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit ee13cb249fabdff8b90aaff61add347749280087)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/asm-prototypes.h
+#	arch/powerpc/kernel/entry_64.S
+#	arch/powerpc/kernel/security.c
+diff --cc arch/powerpc/kernel/entry_64.S
+index 7c06ada267e8,2206912ea4f0..000000000000
+--- a/arch/powerpc/kernel/entry_64.S
++++ b/arch/powerpc/kernel/entry_64.S
+@@@ -492,37 -589,32 +544,59 @@@ END_FTR_SECTION_IFSET(CPU_FTR_ALTIVEC
+  	std	r23,_CCR(r1)
+  	std	r1,KSP(r3)	/* Set old stack pointer */
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_PPC_BOOK3S_64
+ +BEGIN_FTR_SECTION
+ +	/* Event based branch registers */
+ +	mfspr	r0, SPRN_BESCR
+ +	std	r0, THREAD_BESCR(r3)
+ +	mfspr	r0, SPRN_EBBHR
+ +	std	r0, THREAD_EBBHR(r3)
+ +	mfspr	r0, SPRN_EBBRR
+ +	std	r0, THREAD_EBBRR(r3)
+ +END_FTR_SECTION_IFSET(CPU_FTR_ARCH_207S)
+ +#endif
+ +
+ +#ifdef CONFIG_SMP
+ +	/* We need a sync somewhere here to make sure that if the
+ +	 * previous task gets rescheduled on another CPU, it sees all
+ +	 * stores it has performed on this one.
+++=======
++ 	FLUSH_COUNT_CACHE
++ 
++ 	/*
++ 	 * On SMP kernels, care must be taken because a task may be
++ 	 * scheduled off CPUx and on to CPUy. Memory ordering must be
++ 	 * considered.
++ 	 *
++ 	 * Cacheable stores on CPUx will be visible when the task is
++ 	 * scheduled on CPUy by virtue of the core scheduler barriers
++ 	 * (see "Notes on Program-Order guarantees on SMP systems." in
++ 	 * kernel/sched/core.c).
++ 	 *
++ 	 * Uncacheable stores in the case of involuntary preemption must
++ 	 * be taken care of. The smp_mb__before_spin_lock() in __schedule()
++ 	 * is implemented as hwsync on powerpc, which orders MMIO too. So
++ 	 * long as there is an hwsync in the context switch path, it will
++ 	 * be executed on the source CPU after the task has performed
++ 	 * all MMIO ops on that CPU, and on the destination CPU before the
++ 	 * task performs any MMIO ops there.
+++>>>>>>> ee13cb249fab (powerpc/64s: Add support for software count cache flush)
+  	 */
+ +	sync
+ +#endif /* CONFIG_SMP */
+  
+  	/*
+ -	 * The kernel context switch path must contain a spin_lock,
+ -	 * which contains larx/stcx, which will clear any reservation
+ -	 * of the task being switched.
+ +	 * If we optimise away the clear of the reservation in system
+ +	 * calls because we know the CPU tracks the address of the
+ +	 * reservation, then we need to clear it here to cover the
+ +	 * case that the kernel context switch path has no larx
+ +	 * instructions.
+  	 */
+ +BEGIN_FTR_SECTION
+ +	ldarx	r6,0,r1
+ +END_FTR_SECTION_IFSET(CPU_FTR_STCX_CHECKS_ADDRESS)
+ +
+  #ifdef CONFIG_PPC_BOOK3S
+  /* Cancel all explict user streams as they will have no use after context
+   * switch and will stop the HW from creating streams itself
+diff --cc arch/powerpc/kernel/security.c
+index c48c320c0dde,f6f469fc4073..000000000000
+--- a/arch/powerpc/kernel/security.c
++++ b/arch/powerpc/kernel/security.c
+@@@ -7,13 -7,101 +7,107 @@@
+  #include <linux/kernel.h>
+  #include <linux/device.h>
+  #include <linux/seq_buf.h>
+ +#include <linux/debugfs.h>
+  
+++<<<<<<< HEAD
+++=======
++ #include <asm/asm-prototypes.h>
++ #include <asm/code-patching.h>
++ #include <asm/debugfs.h>
+++>>>>>>> ee13cb249fab (powerpc/64s: Add support for software count cache flush)
+  #include <asm/security_features.h>
+ -#include <asm/setup.h>
+  
+  
+  unsigned long powerpc_security_features __read_mostly = SEC_FTR_DEFAULT;
+  
+++<<<<<<< HEAD
+++=======
++ enum count_cache_flush_type {
++ 	COUNT_CACHE_FLUSH_NONE	= 0x1,
++ 	COUNT_CACHE_FLUSH_SW	= 0x2,
++ 	COUNT_CACHE_FLUSH_HW	= 0x4,
++ };
++ static enum count_cache_flush_type count_cache_flush_type;
++ 
++ bool barrier_nospec_enabled;
++ static bool no_nospec;
++ 
++ static void enable_barrier_nospec(bool enable)
++ {
++ 	barrier_nospec_enabled = enable;
++ 	do_barrier_nospec_fixups(enable);
++ }
++ 
++ void setup_barrier_nospec(void)
++ {
++ 	bool enable;
++ 
++ 	/*
++ 	 * It would make sense to check SEC_FTR_SPEC_BAR_ORI31 below as well.
++ 	 * But there's a good reason not to. The two flags we check below are
++ 	 * both are enabled by default in the kernel, so if the hcall is not
++ 	 * functional they will be enabled.
++ 	 * On a system where the host firmware has been updated (so the ori
++ 	 * functions as a barrier), but on which the hypervisor (KVM/Qemu) has
++ 	 * not been updated, we would like to enable the barrier. Dropping the
++ 	 * check for SEC_FTR_SPEC_BAR_ORI31 achieves that. The only downside is
++ 	 * we potentially enable the barrier on systems where the host firmware
++ 	 * is not updated, but that's harmless as it's a no-op.
++ 	 */
++ 	enable = security_ftr_enabled(SEC_FTR_FAVOUR_SECURITY) &&
++ 		 security_ftr_enabled(SEC_FTR_BNDS_CHK_SPEC_BAR);
++ 
++ 	if (!no_nospec)
++ 		enable_barrier_nospec(enable);
++ }
++ 
++ static int __init handle_nospectre_v1(char *p)
++ {
++ 	no_nospec = true;
++ 
++ 	return 0;
++ }
++ early_param("nospectre_v1", handle_nospectre_v1);
++ 
++ #ifdef CONFIG_DEBUG_FS
++ static int barrier_nospec_set(void *data, u64 val)
++ {
++ 	switch (val) {
++ 	case 0:
++ 	case 1:
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!!val == !!barrier_nospec_enabled)
++ 		return 0;
++ 
++ 	enable_barrier_nospec(!!val);
++ 
++ 	return 0;
++ }
++ 
++ static int barrier_nospec_get(void *data, u64 *val)
++ {
++ 	*val = barrier_nospec_enabled ? 1 : 0;
++ 	return 0;
++ }
++ 
++ DEFINE_SIMPLE_ATTRIBUTE(fops_barrier_nospec,
++ 			barrier_nospec_get, barrier_nospec_set, "%llu\n");
++ 
++ static __init int barrier_nospec_debugfs_init(void)
++ {
++ 	debugfs_create_file("barrier_nospec", 0600, powerpc_debugfs_root, NULL,
++ 			    &fops_barrier_nospec);
++ 	return 0;
++ }
++ device_initcall(barrier_nospec_debugfs_init);
++ #endif /* CONFIG_DEBUG_FS */
++ 
++ #ifdef CONFIG_PPC_BOOK3S_64
+++>>>>>>> ee13cb249fab (powerpc/64s: Add support for software count cache flush)
+  ssize_t cpu_show_meltdown(struct device *dev, struct device_attribute *attr, char *buf)
+  {
+  	bool thread_priv;
+* Unmerged path arch/powerpc/include/asm/asm-prototypes.h
+* Unmerged path arch/powerpc/include/asm/asm-prototypes.h
+diff --git a/arch/powerpc/include/asm/security_features.h b/arch/powerpc/include/asm/security_features.h
+index a0d47bc18a5c..759597bf0fd8 100644
+--- a/arch/powerpc/include/asm/security_features.h
++++ b/arch/powerpc/include/asm/security_features.h
+@@ -22,6 +22,7 @@ enum stf_barrier_type {
+ 
+ void setup_stf_barrier(void);
+ void do_stf_barrier_fixups(enum stf_barrier_type types);
++void setup_count_cache_flush(void);
+ 
+ static inline void security_ftr_set(unsigned long feature)
+ {
+* Unmerged path arch/powerpc/kernel/entry_64.S
+* Unmerged path arch/powerpc/kernel/security.c
