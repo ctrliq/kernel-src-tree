@@ -1,0 +1,131 @@
+geneve: lock RCU on TX path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit a717e3f740803cc88bd5c9a70c93504f6a368663
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a717e3f7.failed
+
+There is no guarantees that callers of the TX path will hold
+the RCU lock.  Grab it explicitly.
+
+Fixes: fceb9c3e3825 ("geneve: avoid using stale geneve socket.")
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a717e3f740803cc88bd5c9a70c93504f6a368663)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/geneve.c
+diff --cc drivers/net/geneve.c
+index c4c93ccffa85,7074b40ebd7f..000000000000
+--- a/drivers/net/geneve.c
++++ b/drivers/net/geneve.c
+@@@ -865,79 -798,31 +865,90 @@@ static netdev_tx_t geneve_xmit_skb(stru
+  	__u8 tos, ttl;
+  	__be16 sport;
+  	__be16 df;
+ -	int err;
+ +	bool xnet = !net_eq(geneve->net, dev_net(geneve->dev));
+ +	u32 flags = geneve->flags;
+  
+ +	if (geneve->collect_md) {
+ +		if (unlikely(!info || !(info->mode & IP_TUNNEL_INFO_TX))) {
+ +			netdev_dbg(dev, "no tunnel metadata\n");
+ +			goto tx_error;
+ +		}
+ +		if (info && ip_tunnel_info_af(info) != AF_INET)
+ +			goto tx_error;
+ +	}
+ +
+++<<<<<<< HEAD
+  	rt = geneve_get_v4_rt(skb, dev, &fl4, info);
+ -	if (IS_ERR(rt))
+ -		return PTR_ERR(rt);
+ +	if (IS_ERR(rt)) {
+ +		err = PTR_ERR(rt);
+ +		goto tx_error;
+ +	}
+  
+  	sport = udp_flow_src_port(geneve->net, skb, 1, USHRT_MAX, true);
+ -	if (geneve->collect_md) {
+ +	skb_reset_mac_header(skb);
+ +
+ +	if (info) {
+ +		const struct ip_tunnel_key *key = &info->key;
+ +		u8 *opts = NULL;
+ +		u8 vni[3];
+ +
+ +		tunnel_id_to_vni(key->tun_id, vni);
+ +		if (info->options_len)
+ +			opts = ip_tunnel_info_opts(info);
+ +
+ +		if (key->tun_flags & TUNNEL_CSUM)
+ +			flags &= ~GENEVE_F_UDP_ZERO_CSUM_TX;
+ +		else
+ +			flags |= GENEVE_F_UDP_ZERO_CSUM_TX;
+ +
+ +		err = geneve_build_skb(rt, skb, key->tun_flags, vni,
+ +				       info->options_len, opts, flags, xnet);
+ +		if (unlikely(err))
+ +			goto tx_error;
+ +
+  		tos = ip_tunnel_ecn_encap(key->tos, ip_hdr(skb), skb);
+  		ttl = key->ttl;
+ +		df = key->tun_flags & TUNNEL_DONT_FRAGMENT ? htons(IP_DF) : 0;
+  	} else {
+ +		err = geneve_build_skb(rt, skb, 0, geneve->vni,
+ +				       0, NULL, flags, xnet);
+ +		if (unlikely(err))
+ +			goto tx_error;
+ +
+  		tos = ip_tunnel_ecn_encap(fl4.flowi4_tos, ip_hdr(skb), skb);
+ -		ttl = key->ttl ? : ip4_dst_hoplimit(&rt->dst);
+ +		ttl = geneve->ttl;
+ +		if (!ttl && IN_MULTICAST(ntohl(fl4.daddr)))
+ +			ttl = 1;
+ +		ttl = ttl ? : ip4_dst_hoplimit(&rt->dst);
+ +		df = 0;
+  	}
+ -	df = key->tun_flags & TUNNEL_DONT_FRAGMENT ? htons(IP_DF) : 0;
+ -
+ -	err = geneve_build_skb(&rt->dst, skb, info, xnet, sizeof(struct iphdr));
+ -	if (unlikely(err))
+ -		return err;
+ -
+  	udp_tunnel_xmit_skb(rt, gs4->sock->sk, skb, fl4.saddr, fl4.daddr,
+ -			    tos, ttl, df, sport, geneve->info.key.tp_dst,
+ +			    tos, ttl, df, sport, geneve->dst_port,
+  			    !net_eq(geneve->net, dev_net(geneve->dev)),
+ -			    !(info->key.tun_flags & TUNNEL_CSUM));
+ -	return 0;
+ +			    !!(flags & GENEVE_F_UDP_ZERO_CSUM_TX));
+ +
+ +	return NETDEV_TX_OK;
+++=======
+++	rcu_read_lock();
+++#if IS_ENABLED(CONFIG_IPV6)
+++	if (info->mode & IP_TUNNEL_INFO_IPV6)
+++		err = geneve6_xmit_skb(skb, dev, geneve, info);
+++	else
+++#endif
+++		err = geneve_xmit_skb(skb, dev, geneve, info);
+++	rcu_read_unlock();
+++>>>>>>> a717e3f74080 (geneve: lock RCU on TX path)
+ +
+ +tx_error:
+ +	dev_kfree_skb(skb);
+ +
+ +	if (err == -ELOOP)
+ +		dev->stats.collisions++;
+ +	else if (err == -ENETUNREACH)
+ +		dev->stats.tx_carrier_errors++;
+ +
+ +	dev->stats.tx_errors++;
+ +	return NETDEV_TX_OK;
+  }
+  
+  #if IS_ENABLED(CONFIG_IPV6)
+* Unmerged path drivers/net/geneve.c
