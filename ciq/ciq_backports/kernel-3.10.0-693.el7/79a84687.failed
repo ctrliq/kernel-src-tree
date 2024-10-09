@@ -1,0 +1,151 @@
+random: check for increase of entropy_count because of signed conversion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Hannes Frederic Sowa <hannes@stressinduktion.org>
+commit 79a8468747c5f95ed3d5ce8376a3e82e0c5857fc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/79a84687.failed
+
+The expression entropy_count -= ibytes << (ENTROPY_SHIFT + 3) could
+actually increase entropy_count if during assignment of the unsigned
+expression on the RHS (mind the -=) we reduce the value modulo
+2^width(int) and assign it to entropy_count. Trinity found this.
+
+[ Commit modified by tytso to add an additional safety check for a
+  negative entropy_count -- which should never happen, and to also add
+  an additional paranoia check to prevent overly large count values to
+  be passed into urandom_read().  ]
+
+	Reported-by: Dave Jones <davej@redhat.com>
+	Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+	Cc: stable@vger.kernel.org
+(cherry picked from commit 79a8468747c5f95ed3d5ce8376a3e82e0c5857fc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/char/random.c
+diff --cc drivers/char/random.c
+index 0d7813b08ad2,71529e196b84..000000000000
+--- a/drivers/char/random.c
++++ b/drivers/char/random.c
+@@@ -653,8 -641,10 +653,15 @@@ retry
+  		} while (unlikely(entropy_count < pool_size-2 && pnfrac));
+  	}
+  
+++<<<<<<< HEAD
+ +	if (entropy_count < 0) {
+ +		DEBUG_ENT("negative entropy/overflow\n");
+++=======
++ 	if (unlikely(entropy_count < 0)) {
++ 		pr_warn("random: negative entropy/overflow: pool %s count %d\n",
++ 			r->name, entropy_count);
++ 		WARN_ON(1);
+++>>>>>>> 79a8468747c5 (random: check for increase of entropy_count because of signed conversion)
+  		entropy_count = 0;
+  	} else if (entropy_count > pool_size)
+  		entropy_count = pool_size;
+@@@ -977,46 -980,44 +984,61 @@@ static void xfer_secondary_pool(struct 
+  static size_t account(struct entropy_store *r, size_t nbytes, int min,
+  		      int reserved)
+  {
+ +	unsigned long flags;
+ +	int wakeup_write = 0;
+ +	int have_bytes;
+  	int entropy_count, orig;
+- 	size_t ibytes;
++ 	size_t ibytes, nfrac;
+  
+ +	/* Hold lock while accounting */
+ +	spin_lock_irqsave(&r->lock, flags);
+ +
+  	BUG_ON(r->entropy_count > r->poolinfo->poolfracbits);
+ +	DEBUG_ENT("trying to extract %zu bits from %s\n",
+ +		  nbytes * 8, r->name);
+  
+  	/* Can we pull enough? */
+  retry:
+  	entropy_count = orig = ACCESS_ONCE(r->entropy_count);
+ +	have_bytes = entropy_count >> (ENTROPY_SHIFT + 3);
+  	ibytes = nbytes;
+ -	/* If limited, never pull more than available */
+ -	if (r->limit) {
+ -		int have_bytes = entropy_count >> (ENTROPY_SHIFT + 3);
+ -
+ -		if ((have_bytes -= reserved) < 0)
+ -			have_bytes = 0;
+ -		ibytes = min_t(size_t, ibytes, have_bytes);
+ -	}
+ -	if (ibytes < min)
+ +	if (have_bytes < min + reserved) {
+  		ibytes = 0;
+++<<<<<<< HEAD
+ +	} else {
+ +		/* If limited, never pull more than available */
+ +		if (r->limit)
+ +			ibytes = min_t(size_t, ibytes, have_bytes - reserved);
+ +		entropy_count = max_t(int, 0,
+ +			    entropy_count - (ibytes << (ENTROPY_SHIFT + 3)));
+ +		if (cmpxchg(&r->entropy_count, orig, entropy_count) != orig)
+ +			goto retry;
+++=======
++ 
++ 	if (unlikely(entropy_count < 0)) {
++ 		pr_warn("random: negative entropy count: pool %s count %d\n",
++ 			r->name, entropy_count);
++ 		WARN_ON(1);
++ 		entropy_count = 0;
++ 	}
++ 	nfrac = ibytes << (ENTROPY_SHIFT + 3);
++ 	if ((size_t) entropy_count > nfrac)
++ 		entropy_count -= nfrac;
++ 	else
++ 		entropy_count = 0;
+++>>>>>>> 79a8468747c5 (random: check for increase of entropy_count because of signed conversion)
+  
+ -	if (cmpxchg(&r->entropy_count, orig, entropy_count) != orig)
+ -		goto retry;
+ +		if ((r->entropy_count >> ENTROPY_SHIFT)
+ +		    < random_write_wakeup_thresh)
+ +			wakeup_write = 1;
+ +	}
+  
+ -	trace_debit_entropy(r->name, 8 * ibytes);
+ -	if (ibytes &&
+ -	    (r->entropy_count >> ENTROPY_SHIFT) < random_write_wakeup_bits) {
+ +	DEBUG_ENT("debiting %zu entropy credits from %s%s\n",
+ +		  ibytes * 8, r->name, r->limit ? "" : " (unlimited)");
+ +
+ +	spin_unlock_irqrestore(&r->lock, flags);
+ +
+ +	if (wakeup_write) {
+  		wake_up_interruptible(&random_write_wait);
+  		kill_fasync(&fasync, SIGIO, POLL_OUT);
+  	}
+@@@ -1368,7 -1379,19 +1390,23 @@@ random_read(struct file *file, char __u
+  static ssize_t
+  urandom_read(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos)
+  {
+++<<<<<<< HEAD
+ +	return extract_entropy_user(&nonblocking_pool, buf, nbytes);
+++=======
++ 	int ret;
++ 
++ 	if (unlikely(nonblocking_pool.initialized == 0))
++ 		printk_once(KERN_NOTICE "random: %s urandom read "
++ 			    "with %d bits of entropy available\n",
++ 			    current->comm, nonblocking_pool.entropy_total);
++ 
++ 	nbytes = min_t(size_t, nbytes, INT_MAX >> (ENTROPY_SHIFT + 3));
++ 	ret = extract_entropy_user(&nonblocking_pool, buf, nbytes);
++ 
++ 	trace_urandom_read(8 * nbytes, ENTROPY_BITS(&nonblocking_pool),
++ 			   ENTROPY_BITS(&input_pool));
++ 	return ret;
+++>>>>>>> 79a8468747c5 (random: check for increase of entropy_count because of signed conversion)
+  }
+  
+  static unsigned int
+* Unmerged path drivers/char/random.c
