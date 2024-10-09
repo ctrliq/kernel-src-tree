@@ -1,0 +1,179 @@
+powerpc/fsl: Add nospectre_v2 command line argument
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [powerpc] fsl: Add nospectre_v2 command line argument (Gustavo Duarte) [1694459]
+Rebuild_FUZZ: 91.49%
+commit-author Diana Craciun <diana.craciun@nxp.com>
+commit f633a8ad636efb5d4bba1a047d4a0f1ef719aa06
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/f633a8ad.failed
+
+When the command line argument is present, the Spectre variant 2
+mitigations are disabled.
+
+	Signed-off-by: Diana Craciun <diana.craciun@nxp.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit f633a8ad636efb5d4bba1a047d4a0f1ef719aa06)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/setup.h
+#	arch/powerpc/kernel/security.c
+diff --cc arch/powerpc/include/asm/setup.h
+index cb1e56079d12,65676e2325b8..000000000000
+--- a/arch/powerpc/include/asm/setup.h
++++ b/arch/powerpc/include/asm/setup.h
+@@@ -40,6 -53,26 +40,29 @@@ enum l1d_flush_type 
+  
+  void setup_rfi_flush(enum l1d_flush_type, bool enable);
+  void do_rfi_flush_fixups(enum l1d_flush_type types);
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_PPC_BARRIER_NOSPEC
++ void setup_barrier_nospec(void);
++ #else
++ static inline void setup_barrier_nospec(void) { };
++ #endif
++ void do_barrier_nospec_fixups(bool enable);
++ extern bool barrier_nospec_enabled;
++ 
++ #ifdef CONFIG_PPC_BARRIER_NOSPEC
++ void do_barrier_nospec_fixups_range(bool enable, void *start, void *end);
++ #else
++ static inline void do_barrier_nospec_fixups_range(bool enable, void *start, void *end) { };
++ #endif
++ 
++ #ifdef CONFIG_PPC_FSL_BOOK3E
++ void setup_spectre_v2(void);
++ #else
++ static inline void setup_spectre_v2(void) {};
++ #endif
++ void do_btb_flush_fixups(void);
+++>>>>>>> f633a8ad636e (powerpc/fsl: Add nospectre_v2 command line argument)
+  
+  #endif /* !__ASSEMBLY__ */
+  
+diff --cc arch/powerpc/kernel/security.c
+index c48c320c0dde,9ab771b1aebb..000000000000
+--- a/arch/powerpc/kernel/security.c
++++ b/arch/powerpc/kernel/security.c
+@@@ -14,6 -18,112 +14,115 @@@
+  
+  unsigned long powerpc_security_features __read_mostly = SEC_FTR_DEFAULT;
+  
+++<<<<<<< HEAD
+++=======
++ enum count_cache_flush_type {
++ 	COUNT_CACHE_FLUSH_NONE	= 0x1,
++ 	COUNT_CACHE_FLUSH_SW	= 0x2,
++ 	COUNT_CACHE_FLUSH_HW	= 0x4,
++ };
++ static enum count_cache_flush_type count_cache_flush_type = COUNT_CACHE_FLUSH_NONE;
++ 
++ bool barrier_nospec_enabled;
++ static bool no_nospec;
++ static bool btb_flush_enabled;
++ #ifdef CONFIG_PPC_FSL_BOOK3E
++ static bool no_spectrev2;
++ #endif
++ 
++ static void enable_barrier_nospec(bool enable)
++ {
++ 	barrier_nospec_enabled = enable;
++ 	do_barrier_nospec_fixups(enable);
++ }
++ 
++ void setup_barrier_nospec(void)
++ {
++ 	bool enable;
++ 
++ 	/*
++ 	 * It would make sense to check SEC_FTR_SPEC_BAR_ORI31 below as well.
++ 	 * But there's a good reason not to. The two flags we check below are
++ 	 * both are enabled by default in the kernel, so if the hcall is not
++ 	 * functional they will be enabled.
++ 	 * On a system where the host firmware has been updated (so the ori
++ 	 * functions as a barrier), but on which the hypervisor (KVM/Qemu) has
++ 	 * not been updated, we would like to enable the barrier. Dropping the
++ 	 * check for SEC_FTR_SPEC_BAR_ORI31 achieves that. The only downside is
++ 	 * we potentially enable the barrier on systems where the host firmware
++ 	 * is not updated, but that's harmless as it's a no-op.
++ 	 */
++ 	enable = security_ftr_enabled(SEC_FTR_FAVOUR_SECURITY) &&
++ 		 security_ftr_enabled(SEC_FTR_BNDS_CHK_SPEC_BAR);
++ 
++ 	if (!no_nospec)
++ 		enable_barrier_nospec(enable);
++ }
++ 
++ static int __init handle_nospectre_v1(char *p)
++ {
++ 	no_nospec = true;
++ 
++ 	return 0;
++ }
++ early_param("nospectre_v1", handle_nospectre_v1);
++ 
++ #ifdef CONFIG_DEBUG_FS
++ static int barrier_nospec_set(void *data, u64 val)
++ {
++ 	switch (val) {
++ 	case 0:
++ 	case 1:
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!!val == !!barrier_nospec_enabled)
++ 		return 0;
++ 
++ 	enable_barrier_nospec(!!val);
++ 
++ 	return 0;
++ }
++ 
++ static int barrier_nospec_get(void *data, u64 *val)
++ {
++ 	*val = barrier_nospec_enabled ? 1 : 0;
++ 	return 0;
++ }
++ 
++ DEFINE_SIMPLE_ATTRIBUTE(fops_barrier_nospec,
++ 			barrier_nospec_get, barrier_nospec_set, "%llu\n");
++ 
++ static __init int barrier_nospec_debugfs_init(void)
++ {
++ 	debugfs_create_file("barrier_nospec", 0600, powerpc_debugfs_root, NULL,
++ 			    &fops_barrier_nospec);
++ 	return 0;
++ }
++ device_initcall(barrier_nospec_debugfs_init);
++ #endif /* CONFIG_DEBUG_FS */
++ 
++ #ifdef CONFIG_PPC_FSL_BOOK3E
++ static int __init handle_nospectre_v2(char *p)
++ {
++ 	no_spectrev2 = true;
++ 
++ 	return 0;
++ }
++ early_param("nospectre_v2", handle_nospectre_v2);
++ void setup_spectre_v2(void)
++ {
++ 	if (no_spectrev2)
++ 		do_btb_flush_fixups();
++ 	else
++ 		btb_flush_enabled = true;
++ }
++ #endif /* CONFIG_PPC_FSL_BOOK3E */
++ 
++ #ifdef CONFIG_PPC_BOOK3S_64
+++>>>>>>> f633a8ad636e (powerpc/fsl: Add nospectre_v2 command line argument)
+  ssize_t cpu_show_meltdown(struct device *dev, struct device_attribute *attr, char *buf)
+  {
+  	bool thread_priv;
+* Unmerged path arch/powerpc/include/asm/setup.h
+* Unmerged path arch/powerpc/kernel/security.c
