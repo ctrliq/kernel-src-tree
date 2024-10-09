@@ -1,0 +1,181 @@
+scsi: core: Simplify control flow in scmd_eh_abort_handler()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.83.1.el7
+commit-author Ewan D. Milne <emilne@redhat.com>
+commit 54d816d3d36293728ffc8488fae14b002d4b4a64
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.83.1.el7/54d816d3.failed
+
+Simplify the nested conditionals in the function by using a label for the
+error path.  Introduce local "shost" to avoid repeated "sdev->shost" usage.
+Also remove scsi_eh_complete_abort() since there is now only one place it
+would be called.
+
+Link: https://lore.kernel.org/r/20211029194311.17504-3-emilne@redhat.com
+	Signed-off-by: Ewan D. Milne <emilne@redhat.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 54d816d3d36293728ffc8488fae14b002d4b4a64)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_error.c
+diff --cc drivers/scsi/scsi_error.c
+index 3183377f9515,2db518f118bd..000000000000
+--- a/drivers/scsi/scsi_error.c
++++ b/drivers/scsi/scsi_error.c
+@@@ -108,6 -114,25 +108,28 @@@ static int scsi_host_eh_past_deadline(s
+  	return 1;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool scsi_cmd_retry_allowed(struct scsi_cmnd *cmd)
++ {
++ 	if (cmd->allowed == SCSI_CMD_RETRIES_NO_LIMIT)
++ 		return true;
++ 
++ 	return ++cmd->retries <= cmd->allowed;
++ }
++ 
++ static bool scsi_eh_should_retry_cmd(struct scsi_cmnd *cmd)
++ {
++ 	struct scsi_device *sdev = cmd->device;
++ 	struct Scsi_Host *host = sdev->host;
++ 
++ 	if (host->hostt->eh_should_retry_cmd)
++ 		return  host->hostt->eh_should_retry_cmd(cmd);
++ 
++ 	return true;
++ }
++ 
+++>>>>>>> 54d816d3d362 (scsi: core: Simplify control flow in scmd_eh_abort_handler())
+  /**
+   * scmd_eh_abort_handler - Handle command aborts
+   * @work:	command to be aborted.
+@@@ -118,54 -149,73 +140,122 @@@ scmd_eh_abort_handler(struct work_struc
+  	struct scsi_cmnd *scmd =
+  		container_of(work, struct scsi_cmnd, abort_work.work);
+  	struct scsi_device *sdev = scmd->device;
+++<<<<<<< HEAD
+ +	int rtn;
+++=======
++ 	struct Scsi_Host *shost = sdev->host;
++ 	enum scsi_disposition rtn;
++ 	unsigned long flags;
+++>>>>>>> 54d816d3d362 (scsi: core: Simplify control flow in scmd_eh_abort_handler())
+  
+- 	if (scsi_host_eh_past_deadline(sdev->host)) {
++ 	if (scsi_host_eh_past_deadline(shost)) {
+  		SCSI_LOG_ERROR_RECOVERY(3,
+  			scmd_printk(KERN_INFO, scmd,
+  				    "eh timeout, not aborting\n"));
+++<<<<<<< HEAD
+ +	} else {
+ +		SCSI_LOG_ERROR_RECOVERY(3,
+ +			scmd_printk(KERN_INFO, scmd,
+ +				    "aborting command\n"));
+ +		rtn = scsi_try_to_abort_cmd(sdev->host->hostt, scmd);
+ +		if (rtn == SUCCESS) {
+ +			set_host_byte(scmd, DID_TIME_OUT);
+ +			if (scsi_host_eh_past_deadline(sdev->host)) {
+ +				SCSI_LOG_ERROR_RECOVERY(3,
+ +					scmd_printk(KERN_INFO, scmd,
+ +						    "eh timeout, not retrying "
+ +						    "aborted command\n"));
+ +			} else if (!scsi_noretry_cmd(scmd) &&
+ +			    (++scmd->retries <= scmd->allowed)) {
+ +				SCSI_LOG_ERROR_RECOVERY(3,
+ +					scmd_printk(KERN_WARNING, scmd,
+ +						    "retry aborted command\n"));
+ +				scsi_queue_insert(scmd, SCSI_MLQUEUE_EH_RETRY);
+ +				return;
+ +			} else {
+ +				SCSI_LOG_ERROR_RECOVERY(3,
+ +					scmd_printk(KERN_WARNING, scmd,
+ +						    "finish aborted command\n"));
+ +				scsi_finish_command(scmd);
+ +				return;
+ +			}
+ +		} else {
+ +			SCSI_LOG_ERROR_RECOVERY(3,
+ +				scmd_printk(KERN_INFO, scmd,
+ +					    "cmd abort %s\n",
+ +					    (rtn == FAST_IO_FAIL) ?
+ +					    "not send" : "failed"));
+ +		}
+ +	}
+ +
+ +	if (!scsi_eh_scmd_add(scmd, 0)) {
+ +		SCSI_LOG_ERROR_RECOVERY(3,
+ +			scmd_printk(KERN_WARNING, scmd,
+ +				    "terminate aborted command\n"));
+ +		set_host_byte(scmd, DID_TIME_OUT);
+ +		scsi_finish_command(scmd);
+ +	}
+++=======
++ 		goto out;
++ 	}
++ 
++ 	SCSI_LOG_ERROR_RECOVERY(3,
++ 			scmd_printk(KERN_INFO, scmd,
++ 				    "aborting command\n"));
++ 	rtn = scsi_try_to_abort_cmd(shost->hostt, scmd);
++ 	if (rtn != SUCCESS) {
++ 		SCSI_LOG_ERROR_RECOVERY(3,
++ 			scmd_printk(KERN_INFO, scmd,
++ 				    "cmd abort %s\n",
++ 				    (rtn == FAST_IO_FAIL) ?
++ 				    "not send" : "failed"));
++ 		goto out;
++ 	}
++ 	set_host_byte(scmd, DID_TIME_OUT);
++ 	if (scsi_host_eh_past_deadline(shost)) {
++ 		SCSI_LOG_ERROR_RECOVERY(3,
++ 			scmd_printk(KERN_INFO, scmd,
++ 				    "eh timeout, not retrying "
++ 				    "aborted command\n"));
++ 		goto out;
++ 	}
++ 
++ 	spin_lock_irqsave(shost->host_lock, flags);
++ 	list_del_init(&scmd->eh_entry);
++ 
++ 	/*
++ 	 * If the abort succeeds, and there is no further
++ 	 * EH action, clear the ->last_reset time.
++ 	 */
++ 	if (list_empty(&shost->eh_abort_list) &&
++ 	    list_empty(&shost->eh_cmd_q))
++ 		if (shost->eh_deadline != -1)
++ 			shost->last_reset = 0;
++ 
++ 	spin_unlock_irqrestore(shost->host_lock, flags);
++ 
++ 	if (!scsi_noretry_cmd(scmd) &&
++ 	    scsi_cmd_retry_allowed(scmd) &&
++ 	    scsi_eh_should_retry_cmd(scmd)) {
++ 		SCSI_LOG_ERROR_RECOVERY(3,
++ 			scmd_printk(KERN_WARNING, scmd,
++ 				    "retry aborted command\n"));
++ 		scsi_queue_insert(scmd, SCSI_MLQUEUE_EH_RETRY);
++ 	} else {
++ 		SCSI_LOG_ERROR_RECOVERY(3,
++ 			scmd_printk(KERN_WARNING, scmd,
++ 				    "finish aborted command\n"));
++ 		scsi_finish_command(scmd);
++ 	}
++ 	return;
++ 
++ out:
++ 	spin_lock_irqsave(shost->host_lock, flags);
++ 	list_del_init(&scmd->eh_entry);
++ 	spin_unlock_irqrestore(shost->host_lock, flags);
++ 
++ 	scsi_eh_scmd_add(scmd);
+++>>>>>>> 54d816d3d362 (scsi: core: Simplify control flow in scmd_eh_abort_handler())
+  }
+  
+  /**
+* Unmerged path drivers/scsi/scsi_error.c
