@@ -1,0 +1,315 @@
+ipv4: Restore fib_trie_flush_external function and fix call ordering
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Alexander Duyck <alexander.h.duyck@intel.com>
+commit 3b7093346b326e5d3590c7d49f6aefe6fa5b2c9a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3b709334.failed
+
+The patch that removed the FIB offload infrastructure was a bit too
+aggressive and also removed code needed to clean up us splitting the table
+if additional rules were added.  Specifically the function
+fib_trie_flush_external was called at the end of a new rule being added to
+flush the foreign trie entries from the main trie.
+
+I updated the code so that we only call fib_trie_flush_external on the main
+table so that we flush the entries for local from main.  This way we don't
+call it for every rule change which is what was happening previously.
+
+Fixes: 347e3b28c1ba2 ("switchdev: remove FIB offload infrastructure")
+	Reported-by: Eric Dumazet <edumazet@google.com>
+	Cc: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: Alexander Duyck <alexander.h.duyck@intel.com>
+	Acked-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3b7093346b326e5d3590c7d49f6aefe6fa5b2c9a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip_fib.h
+#	net/ipv4/fib_frontend.c
+#	net/ipv4/fib_trie.c
+diff --cc include/net/ip_fib.h
+index c451a6db3f60,f390c3bb05c5..000000000000
+--- a/include/net/ip_fib.h
++++ b/include/net/ip_fib.h
+@@@ -249,10 -242,10 +249,15 @@@ int fib_table_delete(struct net *, stru
+  int fib_table_dump(struct fib_table *table, struct sk_buff *skb,
+  		   struct netlink_callback *cb);
+  int fib_table_flush(struct net *net, struct fib_table *table);
+++<<<<<<< HEAD
+++=======
++ struct fib_table *fib_trie_unmerge(struct fib_table *main_tb);
++ void fib_table_flush_external(struct fib_table *table);
+++>>>>>>> 3b7093346b32 (ipv4: Restore fib_trie_flush_external function and fix call ordering)
+  void fib_free_table(struct fib_table *tb);
+  
+ +
+ +
+  #ifndef CONFIG_IP_MULTIPLE_TABLES
+  
+  #define TABLE_LOCAL_INDEX	(RT_TABLE_LOCAL & (FIB_TABLE_HASHSZ - 1))
+diff --cc net/ipv4/fib_frontend.c
+index 30f0d2b5e192,161fc0f0d752..000000000000
+--- a/net/ipv4/fib_frontend.c
++++ b/net/ipv4/fib_frontend.c
+@@@ -126,6 -129,58 +126,61 @@@ struct fib_table *fib_get_table(struct 
+  }
+  #endif /* CONFIG_IP_MULTIPLE_TABLES */
+  
+++<<<<<<< HEAD
+++=======
++ static void fib_replace_table(struct net *net, struct fib_table *old,
++ 			      struct fib_table *new)
++ {
++ #ifdef CONFIG_IP_MULTIPLE_TABLES
++ 	switch (new->tb_id) {
++ 	case RT_TABLE_MAIN:
++ 		rcu_assign_pointer(net->ipv4.fib_main, new);
++ 		break;
++ 	case RT_TABLE_DEFAULT:
++ 		rcu_assign_pointer(net->ipv4.fib_default, new);
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 
++ #endif
++ 	/* replace the old table in the hlist */
++ 	hlist_replace_rcu(&old->tb_hlist, &new->tb_hlist);
++ }
++ 
++ int fib_unmerge(struct net *net)
++ {
++ 	struct fib_table *old, *new, *main_table;
++ 
++ 	/* attempt to fetch local table if it has been allocated */
++ 	old = fib_get_table(net, RT_TABLE_LOCAL);
++ 	if (!old)
++ 		return 0;
++ 
++ 	new = fib_trie_unmerge(old);
++ 	if (!new)
++ 		return -ENOMEM;
++ 
++ 	/* table is already unmerged */
++ 	if (new == old)
++ 		return 0;
++ 
++ 	/* replace merged table with clean table */
++ 	fib_replace_table(net, old, new);
++ 	fib_free_table(old);
++ 
++ 	/* attempt to fetch main table if it has been allocated */
++ 	main_table = fib_get_table(net, RT_TABLE_MAIN);
++ 	if (!main_table)
++ 		return 0;
++ 
++ 	/* flush local entries from main table */
++ 	fib_table_flush_external(main_table);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 3b7093346b32 (ipv4: Restore fib_trie_flush_external function and fix call ordering)
+  static void fib_flush(struct net *net)
+  {
+  	int flushed = 0;
+diff --cc net/ipv4/fib_trie.c
+index 5512775a2305,735edc9d41a2..000000000000
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@@ -1716,6 -1646,185 +1716,188 @@@ found
+  	return n;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void fib_trie_free(struct fib_table *tb)
++ {
++ 	struct trie *t = (struct trie *)tb->tb_data;
++ 	struct key_vector *pn = t->kv;
++ 	unsigned long cindex = 1;
++ 	struct hlist_node *tmp;
++ 	struct fib_alias *fa;
++ 
++ 	/* walk trie in reverse order and free everything */
++ 	for (;;) {
++ 		struct key_vector *n;
++ 
++ 		if (!(cindex--)) {
++ 			t_key pkey = pn->key;
++ 
++ 			if (IS_TRIE(pn))
++ 				break;
++ 
++ 			n = pn;
++ 			pn = node_parent(pn);
++ 
++ 			/* drop emptied tnode */
++ 			put_child_root(pn, n->key, NULL);
++ 			node_free(n);
++ 
++ 			cindex = get_index(pkey, pn);
++ 
++ 			continue;
++ 		}
++ 
++ 		/* grab the next available node */
++ 		n = get_child(pn, cindex);
++ 		if (!n)
++ 			continue;
++ 
++ 		if (IS_TNODE(n)) {
++ 			/* record pn and cindex for leaf walking */
++ 			pn = n;
++ 			cindex = 1ul << n->bits;
++ 
++ 			continue;
++ 		}
++ 
++ 		hlist_for_each_entry_safe(fa, tmp, &n->leaf, fa_list) {
++ 			hlist_del_rcu(&fa->fa_list);
++ 			alias_free_mem_rcu(fa);
++ 		}
++ 
++ 		put_child_root(pn, n->key, NULL);
++ 		node_free(n);
++ 	}
++ 
++ #ifdef CONFIG_IP_FIB_TRIE_STATS
++ 	free_percpu(t->stats);
++ #endif
++ 	kfree(tb);
++ }
++ 
++ struct fib_table *fib_trie_unmerge(struct fib_table *oldtb)
++ {
++ 	struct trie *ot = (struct trie *)oldtb->tb_data;
++ 	struct key_vector *l, *tp = ot->kv;
++ 	struct fib_table *local_tb;
++ 	struct fib_alias *fa;
++ 	struct trie *lt;
++ 	t_key key = 0;
++ 
++ 	if (oldtb->tb_data == oldtb->__data)
++ 		return oldtb;
++ 
++ 	local_tb = fib_trie_table(RT_TABLE_LOCAL, NULL);
++ 	if (!local_tb)
++ 		return NULL;
++ 
++ 	lt = (struct trie *)local_tb->tb_data;
++ 
++ 	while ((l = leaf_walk_rcu(&tp, key)) != NULL) {
++ 		struct key_vector *local_l = NULL, *local_tp;
++ 
++ 		hlist_for_each_entry_rcu(fa, &l->leaf, fa_list) {
++ 			struct fib_alias *new_fa;
++ 
++ 			if (local_tb->tb_id != fa->tb_id)
++ 				continue;
++ 
++ 			/* clone fa for new local table */
++ 			new_fa = kmem_cache_alloc(fn_alias_kmem, GFP_KERNEL);
++ 			if (!new_fa)
++ 				goto out;
++ 
++ 			memcpy(new_fa, fa, sizeof(*fa));
++ 
++ 			/* insert clone into table */
++ 			if (!local_l)
++ 				local_l = fib_find_node(lt, &local_tp, l->key);
++ 
++ 			if (fib_insert_alias(lt, local_tp, local_l, new_fa,
++ 					     NULL, l->key))
++ 				goto out;
++ 		}
++ 
++ 		/* stop loop if key wrapped back to 0 */
++ 		key = l->key + 1;
++ 		if (key < l->key)
++ 			break;
++ 	}
++ 
++ 	return local_tb;
++ out:
++ 	fib_trie_free(local_tb);
++ 
++ 	return NULL;
++ }
++ 
++ /* Caller must hold RTNL */
++ void fib_table_flush_external(struct fib_table *tb)
++ {
++ 	struct trie *t = (struct trie *)tb->tb_data;
++ 	struct key_vector *pn = t->kv;
++ 	unsigned long cindex = 1;
++ 	struct hlist_node *tmp;
++ 	struct fib_alias *fa;
++ 
++ 	/* walk trie in reverse order */
++ 	for (;;) {
++ 		unsigned char slen = 0;
++ 		struct key_vector *n;
++ 
++ 		if (!(cindex--)) {
++ 			t_key pkey = pn->key;
++ 
++ 			/* cannot resize the trie vector */
++ 			if (IS_TRIE(pn))
++ 				break;
++ 
++ 			/* resize completed node */
++ 			pn = resize(t, pn);
++ 			cindex = get_index(pkey, pn);
++ 
++ 			continue;
++ 		}
++ 
++ 		/* grab the next available node */
++ 		n = get_child(pn, cindex);
++ 		if (!n)
++ 			continue;
++ 
++ 		if (IS_TNODE(n)) {
++ 			/* record pn and cindex for leaf walking */
++ 			pn = n;
++ 			cindex = 1ul << n->bits;
++ 
++ 			continue;
++ 		}
++ 
++ 		hlist_for_each_entry_safe(fa, tmp, &n->leaf, fa_list) {
++ 			/* if alias was cloned to local then we just
++ 			 * need to remove the local copy from main
++ 			 */
++ 			if (tb->tb_id != fa->tb_id) {
++ 				hlist_del_rcu(&fa->fa_list);
++ 				alias_free_mem_rcu(fa);
++ 				continue;
++ 			}
++ 
++ 			/* record local slen */
++ 			slen = fa->fa_slen;
++ 		}
++ 
++ 		/* update leaf slen */
++ 		n->slen = slen;
++ 
++ 		if (hlist_empty(&n->leaf)) {
++ 			put_child_root(pn, n->key, NULL);
++ 			node_free(n);
++ 		}
++ 	}
++ }
++ 
+++>>>>>>> 3b7093346b32 (ipv4: Restore fib_trie_flush_external function and fix call ordering)
+  /* Caller must hold RTNL. */
+  int fib_table_flush(struct net *net, struct fib_table *tb)
+  {
+* Unmerged path include/net/ip_fib.h
+* Unmerged path net/ipv4/fib_frontend.c
+* Unmerged path net/ipv4/fib_trie.c
