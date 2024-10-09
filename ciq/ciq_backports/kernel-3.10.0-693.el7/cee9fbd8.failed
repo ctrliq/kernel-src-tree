@@ -1,0 +1,633 @@
+qede: Add qedr framework
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Ram Amrani <Ram.Amrani@caviumnetworks.com>
+commit cee9fbd8e2e9e713cd8bf227c6492fd8854de74b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/cee9fbd8.failed
+
+Adds a skeletal implementation of the qede RoCE driver -
+The qedr has some dependencies of the state of the underlying base
+interface. This adds some logic required with mutual registrations
+and the ability to pass updates on 'intresting' events.
+
+	Signed-off-by: Ram Amrani <Ram.Amrani@caviumnetworks.com>
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@caviumnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cee9fbd8e2e9e713cd8bf227c6492fd8854de74b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/Kconfig
+diff --cc drivers/net/ethernet/qlogic/Kconfig
+index 0b68350a2e0d,0df1391f9663..000000000000
+--- a/drivers/net/ethernet/qlogic/Kconfig
++++ b/drivers/net/ethernet/qlogic/Kconfig
+@@@ -124,24 -107,15 +119,37 @@@ config QED
+  	---help---
+  	  This enables the support for ...
+  
+++<<<<<<< HEAD
+ +config QEDE_VXLAN
+ +	bool "Virtual eXtensible Local Area Network support"
+ +	default n
+ +	depends on QEDE && VXLAN && !(QEDE=y && VXLAN=m)
+ +	---help---
+ +	  This enables hardware offload support for VXLAN protocol over
+ +	  qede module. Say Y here if you want to enable hardware offload
+ +	  support for Virtual eXtensible Local Area Network (VXLAN)
+ +	  in the driver.
+ +
+ +config QEDE_GENEVE
+ +	bool "Generic Network Virtualization Encapsulation (GENEVE) support"
+ +	depends on QEDE && GENEVE && !(QEDE=y && GENEVE=m)
+ +	---help---
+ +	  This allows one to create GENEVE virtual interfaces that provide
+ +	  Layer 2 Networks over Layer 3 Networks. GENEVE is often used
+ +	  to tunnel virtual network infrastructure in virtualized environments.
+ +	  Say Y here if you want to enable hardware offload support for
+ +	  Generic Network Virtualization Encapsulation (GENEVE) in the driver.
+++=======
++ config INFINIBAND_QEDR
++ 	tristate "QLogic qede RoCE sources [debug]"
++ 	depends on QEDE && 64BIT
++ 	select QED_LL2
++ 	default n
++ 	---help---
++ 	  This provides a temporary node that allows the compilation
++ 	  and logical testing of the InfiniBand over Ethernet support
++ 	  for QLogic QED. This would be replaced by the 'real' option
++ 	  once the QEDR driver is added [+relocated].
+++>>>>>>> cee9fbd8e2e9 (qede: Add qedr framework)
+  
+  endif # NET_VENDOR_QLOGIC
+* Unmerged path drivers/net/ethernet/qlogic/Kconfig
+diff --git a/drivers/net/ethernet/qlogic/qede/Makefile b/drivers/net/ethernet/qlogic/qede/Makefile
+index 74a49850d74d..28dc58919c85 100644
+--- a/drivers/net/ethernet/qlogic/qede/Makefile
++++ b/drivers/net/ethernet/qlogic/qede/Makefile
+@@ -2,3 +2,4 @@ obj-$(CONFIG_QEDE) := qede.o
+ 
+ qede-y := qede_main.o qede_ethtool.o
+ qede-$(CONFIG_DCB) += qede_dcbnl.o
++qede-$(CONFIG_INFINIBAND_QEDR) += qede_roce.o
+diff --git a/drivers/net/ethernet/qlogic/qede/qede.h b/drivers/net/ethernet/qlogic/qede/qede.h
+index e01adce4a966..28c0e9f42c9e 100644
+--- a/drivers/net/ethernet/qlogic/qede/qede.h
++++ b/drivers/net/ethernet/qlogic/qede/qede.h
+@@ -106,6 +106,13 @@ struct qede_vlan {
+ 	bool configured;
+ };
+ 
++struct qede_rdma_dev {
++	struct qedr_dev *qedr_dev;
++	struct list_head entry;
++	struct list_head roce_event_list;
++	struct workqueue_struct *roce_wq;
++};
++
+ struct qede_dev {
+ 	struct qed_dev			*cdev;
+ 	struct net_device		*ndev;
+@@ -185,6 +192,8 @@ struct qede_dev {
+ 	unsigned long			sp_flags;
+ 	u16				vxlan_dst_port;
+ 	u16				geneve_dst_port;
++
++	struct qede_rdma_dev		rdma_info;
+ };
+ 
+ enum QEDE_STATE {
+diff --git a/drivers/net/ethernet/qlogic/qede/qede_main.c b/drivers/net/ethernet/qlogic/qede/qede_main.c
+index 1f6adb311837..683fb313194e 100644
+--- a/drivers/net/ethernet/qlogic/qede/qede_main.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_main.c
+@@ -41,7 +41,7 @@
+ #include <linux/random.h>
+ #include <net/ip6_checksum.h>
+ #include <linux/bitops.h>
+-
++#include <linux/qed/qede_roce.h>
+ #include "qede.h"
+ 
+ static char version[] =
+@@ -194,8 +194,7 @@ static int qede_netdev_event(struct notifier_block *this, unsigned long event,
+ 	struct ethtool_drvinfo drvinfo;
+ 	struct qede_dev *edev;
+ 
+-	/* Currently only support name change */
+-	if (event != NETDEV_CHANGENAME)
++	if (event != NETDEV_CHANGENAME && event != NETDEV_CHANGEADDR)
+ 		goto done;
+ 
+ 	/* Check whether this is a qede device */
+@@ -208,11 +207,18 @@ static int qede_netdev_event(struct notifier_block *this, unsigned long event,
+ 		goto done;
+ 	edev = netdev_priv(ndev);
+ 
+-	/* Notify qed of the name change */
+-	if (!edev->ops || !edev->ops->common)
+-		goto done;
+-	edev->ops->common->set_id(edev->cdev, edev->ndev->name,
+-				  "qede");
++	switch (event) {
++	case NETDEV_CHANGENAME:
++		/* Notify qed of the name change */
++		if (!edev->ops || !edev->ops->common)
++			goto done;
++		edev->ops->common->set_id(edev->cdev, edev->ndev->name, "qede");
++		break;
++	case NETDEV_CHANGEADDR:
++		edev = netdev_priv(ndev);
++		qede_roce_event_changeaddr(edev);
++		break;
++	}
+ 
+ done:
+ 	return NOTIFY_DONE;
+@@ -2548,10 +2554,14 @@ static int __qede_probe(struct pci_dev *pdev, u32 dp_module, u8 dp_level,
+ 
+ 	qede_init_ndev(edev);
+ 
++	rc = qede_roce_dev_add(edev);
++	if (rc)
++		goto err3;
++
+ 	rc = register_netdev(edev->ndev);
+ 	if (rc) {
+ 		DP_NOTICE(edev, "Cannot register net-device\n");
+-		goto err3;
++		goto err4;
+ 	}
+ 
+ 	edev->ops->common->set_id(cdev, edev->ndev->name, DRV_MODULE_VERSION);
+@@ -2571,6 +2581,8 @@ static int __qede_probe(struct pci_dev *pdev, u32 dp_module, u8 dp_level,
+ 
+ 	return 0;
+ 
++err4:
++	qede_roce_dev_remove(edev);
+ err3:
+ 	free_netdev(edev->ndev);
+ err2:
+@@ -2617,8 +2629,11 @@ static void __qede_remove(struct pci_dev *pdev, enum qede_remove_mode mode)
+ 	DP_INFO(edev, "Starting qede_remove\n");
+ 
+ 	cancel_delayed_work_sync(&edev->sp_task);
++
+ 	unregister_netdev(ndev);
+ 
++	qede_roce_dev_remove(edev);
++
+ 	edev->ops->common->set_power_state(cdev, PCI_D0);
+ 
+ 	pci_set_drvdata(pdev, NULL);
+@@ -3515,6 +3530,7 @@ static void qede_unload(struct qede_dev *edev, enum qede_unload_mode mode)
+ 
+ 	DP_INFO(edev, "Starting qede unload\n");
+ 
++	qede_roce_dev_event_close(edev);
+ 	mutex_lock(&edev->qede_lock);
+ 	edev->state = QEDE_STATE_CLOSED;
+ 
+@@ -3615,6 +3631,7 @@ static int qede_load(struct qede_dev *edev, enum qede_load_mode mode)
+ 	/* Query whether link is already-up */
+ 	memset(&link_output, 0, sizeof(link_output));
+ 	edev->ops->common->get_link(edev->cdev, &link_output);
++	qede_roce_dev_event_open(edev);
+ 	qede_link_update(edev, &link_output);
+ 
+ 	DP_INFO(edev, "Ending successfully qede load\n");
+diff --git a/drivers/net/ethernet/qlogic/qede/qede_roce.c b/drivers/net/ethernet/qlogic/qede/qede_roce.c
+new file mode 100644
+index 000000000000..9867f960b063
+--- /dev/null
++++ b/drivers/net/ethernet/qlogic/qede/qede_roce.c
+@@ -0,0 +1,314 @@
++/* QLogic qedr NIC Driver
++ * Copyright (c) 2015-2016  QLogic Corporation
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and /or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++#include <linux/pci.h>
++#include <linux/netdevice.h>
++#include <linux/list.h>
++#include <linux/mutex.h>
++#include <linux/qed/qede_roce.h>
++#include "qede.h"
++
++static struct qedr_driver *qedr_drv;
++static LIST_HEAD(qedr_dev_list);
++static DEFINE_MUTEX(qedr_dev_list_lock);
++
++bool qede_roce_supported(struct qede_dev *dev)
++{
++	return dev->dev_info.common.rdma_supported;
++}
++
++static void _qede_roce_dev_add(struct qede_dev *edev)
++{
++	if (!qedr_drv)
++		return;
++
++	edev->rdma_info.qedr_dev = qedr_drv->add(edev->cdev, edev->pdev,
++						 edev->ndev);
++}
++
++static int qede_roce_create_wq(struct qede_dev *edev)
++{
++	INIT_LIST_HEAD(&edev->rdma_info.roce_event_list);
++	edev->rdma_info.roce_wq = create_singlethread_workqueue("roce_wq");
++	if (!edev->rdma_info.roce_wq) {
++		DP_NOTICE(edev, "qedr: Could not create workqueue\n");
++		return -ENOMEM;
++	}
++
++	return 0;
++}
++
++static void qede_roce_cleanup_event(struct qede_dev *edev)
++{
++	struct list_head *head = &edev->rdma_info.roce_event_list;
++	struct qede_roce_event_work *event_node;
++
++	flush_workqueue(edev->rdma_info.roce_wq);
++	while (!list_empty(head)) {
++		event_node = list_entry(head->next, struct qede_roce_event_work,
++					list);
++		cancel_work_sync(&event_node->work);
++		list_del(&event_node->list);
++		kfree(event_node);
++	}
++}
++
++static void qede_roce_destroy_wq(struct qede_dev *edev)
++{
++	qede_roce_cleanup_event(edev);
++	destroy_workqueue(edev->rdma_info.roce_wq);
++}
++
++int qede_roce_dev_add(struct qede_dev *edev)
++{
++	int rc = 0;
++
++	if (qede_roce_supported(edev)) {
++		rc = qede_roce_create_wq(edev);
++		if (rc)
++			return rc;
++
++		INIT_LIST_HEAD(&edev->rdma_info.entry);
++		mutex_lock(&qedr_dev_list_lock);
++		list_add_tail(&edev->rdma_info.entry, &qedr_dev_list);
++		_qede_roce_dev_add(edev);
++		mutex_unlock(&qedr_dev_list_lock);
++	}
++
++	return rc;
++}
++
++static void _qede_roce_dev_remove(struct qede_dev *edev)
++{
++	if (qedr_drv && qedr_drv->remove && edev->rdma_info.qedr_dev)
++		qedr_drv->remove(edev->rdma_info.qedr_dev);
++	edev->rdma_info.qedr_dev = NULL;
++}
++
++void qede_roce_dev_remove(struct qede_dev *edev)
++{
++	if (!qede_roce_supported(edev))
++		return;
++
++	qede_roce_destroy_wq(edev);
++	mutex_lock(&qedr_dev_list_lock);
++	_qede_roce_dev_remove(edev);
++	list_del(&edev->rdma_info.entry);
++	mutex_unlock(&qedr_dev_list_lock);
++}
++
++static void _qede_roce_dev_open(struct qede_dev *edev)
++{
++	if (qedr_drv && edev->rdma_info.qedr_dev && qedr_drv->notify)
++		qedr_drv->notify(edev->rdma_info.qedr_dev, QEDE_UP);
++}
++
++static void qede_roce_dev_open(struct qede_dev *edev)
++{
++	if (!qede_roce_supported(edev))
++		return;
++
++	mutex_lock(&qedr_dev_list_lock);
++	_qede_roce_dev_open(edev);
++	mutex_unlock(&qedr_dev_list_lock);
++}
++
++static void _qede_roce_dev_close(struct qede_dev *edev)
++{
++	if (qedr_drv && edev->rdma_info.qedr_dev && qedr_drv->notify)
++		qedr_drv->notify(edev->rdma_info.qedr_dev, QEDE_DOWN);
++}
++
++static void qede_roce_dev_close(struct qede_dev *edev)
++{
++	if (!qede_roce_supported(edev))
++		return;
++
++	mutex_lock(&qedr_dev_list_lock);
++	_qede_roce_dev_close(edev);
++	mutex_unlock(&qedr_dev_list_lock);
++}
++
++static void qede_roce_dev_shutdown(struct qede_dev *edev)
++{
++	if (!qede_roce_supported(edev))
++		return;
++
++	mutex_lock(&qedr_dev_list_lock);
++	if (qedr_drv && edev->rdma_info.qedr_dev && qedr_drv->notify)
++		qedr_drv->notify(edev->rdma_info.qedr_dev, QEDE_CLOSE);
++	mutex_unlock(&qedr_dev_list_lock);
++}
++
++int qede_roce_register_driver(struct qedr_driver *drv)
++{
++	struct qede_dev *edev;
++	u8 qedr_counter = 0;
++
++	mutex_lock(&qedr_dev_list_lock);
++	if (qedr_drv) {
++		mutex_unlock(&qedr_dev_list_lock);
++		return -EINVAL;
++	}
++	qedr_drv = drv;
++
++	list_for_each_entry(edev, &qedr_dev_list, rdma_info.entry) {
++		struct net_device *ndev;
++
++		qedr_counter++;
++		_qede_roce_dev_add(edev);
++		ndev = edev->ndev;
++		if (netif_running(ndev) && netif_oper_up(ndev))
++			_qede_roce_dev_open(edev);
++	}
++	mutex_unlock(&qedr_dev_list_lock);
++
++	DP_INFO(edev, "qedr: discovered and registered %d RoCE funcs\n",
++		qedr_counter);
++
++	return 0;
++}
++EXPORT_SYMBOL(qede_roce_register_driver);
++
++void qede_roce_unregister_driver(struct qedr_driver *drv)
++{
++	struct qede_dev *edev;
++
++	mutex_lock(&qedr_dev_list_lock);
++	list_for_each_entry(edev, &qedr_dev_list, rdma_info.entry) {
++		if (edev->rdma_info.qedr_dev)
++			_qede_roce_dev_remove(edev);
++	}
++	qedr_drv = NULL;
++	mutex_unlock(&qedr_dev_list_lock);
++}
++EXPORT_SYMBOL(qede_roce_unregister_driver);
++
++static void qede_roce_changeaddr(struct qede_dev *edev)
++{
++	if (!qede_roce_supported(edev))
++		return;
++
++	if (qedr_drv && edev->rdma_info.qedr_dev && qedr_drv->notify)
++		qedr_drv->notify(edev->rdma_info.qedr_dev, QEDE_CHANGE_ADDR);
++}
++
++struct qede_roce_event_work *qede_roce_get_free_event_node(struct qede_dev
++							   *edev)
++{
++	struct qede_roce_event_work *event_node = NULL;
++	struct list_head *list_node = NULL;
++	bool found = false;
++
++	list_for_each(list_node, &edev->rdma_info.roce_event_list) {
++		event_node = list_entry(list_node, struct qede_roce_event_work,
++					list);
++		if (!work_pending(&event_node->work)) {
++			found = true;
++			break;
++		}
++	}
++
++	if (!found) {
++		event_node = kzalloc(sizeof(*event_node), GFP_KERNEL);
++		if (!event_node) {
++			DP_NOTICE(edev,
++				  "qedr: Could not allocate memory for roce work\n");
++			return NULL;
++		}
++		list_add_tail(&event_node->list,
++			      &edev->rdma_info.roce_event_list);
++	}
++
++	return event_node;
++}
++
++static void qede_roce_handle_event(struct work_struct *work)
++{
++	struct qede_roce_event_work *event_node;
++	enum qede_roce_event event;
++	struct qede_dev *edev;
++
++	event_node = container_of(work, struct qede_roce_event_work, work);
++	event = event_node->event;
++	edev = event_node->ptr;
++
++	switch (event) {
++	case QEDE_UP:
++		qede_roce_dev_open(edev);
++		break;
++	case QEDE_DOWN:
++		qede_roce_dev_close(edev);
++		break;
++	case QEDE_CLOSE:
++		qede_roce_dev_shutdown(edev);
++		break;
++	case QEDE_CHANGE_ADDR:
++		qede_roce_changeaddr(edev);
++		break;
++	default:
++		DP_NOTICE(edev, "Invalid roce event %d", event);
++	}
++}
++
++static void qede_roce_add_event(struct qede_dev *edev,
++				enum qede_roce_event event)
++{
++	struct qede_roce_event_work *event_node;
++
++	if (!edev->rdma_info.qedr_dev)
++		return;
++
++	event_node = qede_roce_get_free_event_node(edev);
++	if (!event_node)
++		return;
++
++	event_node->event = event;
++	event_node->ptr = edev;
++
++	INIT_WORK(&event_node->work, qede_roce_handle_event);
++	queue_work(edev->rdma_info.roce_wq, &event_node->work);
++}
++
++void qede_roce_dev_event_open(struct qede_dev *edev)
++{
++	qede_roce_add_event(edev, QEDE_UP);
++}
++
++void qede_roce_dev_event_close(struct qede_dev *edev)
++{
++	qede_roce_add_event(edev, QEDE_DOWN);
++}
++
++void qede_roce_event_changeaddr(struct qede_dev *edev)
++{
++	qede_roce_add_event(edev, QEDE_CHANGE_ADDR);
++}
+diff --git a/include/linux/qed/qed_if.h b/include/linux/qed/qed_if.h
+index c2d74e8785cf..e313742b571d 100644
+--- a/include/linux/qed/qed_if.h
++++ b/include/linux/qed/qed_if.h
+@@ -260,11 +260,10 @@ struct qed_dev_info {
+ 	/* MFW version */
+ 	u32		mfw_rev;
+ 
+-	bool rdma_supported;
+-
+ 	u32		flash_size;
+ 	u8		mf_mode;
+ 	bool		tx_switching;
++	bool		rdma_supported;
+ };
+ 
+ enum qed_sb_type {
+diff --git a/include/linux/qed/qede_roce.h b/include/linux/qed/qede_roce.h
+new file mode 100644
+index 000000000000..99fbe6d55acb
+--- /dev/null
++++ b/include/linux/qed/qede_roce.h
+@@ -0,0 +1,88 @@
++/* QLogic qedr NIC Driver
++ * Copyright (c) 2015-2016  QLogic Corporation
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and /or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++#ifndef QEDE_ROCE_H
++#define QEDE_ROCE_H
++
++struct qedr_dev;
++struct qed_dev;
++struct qede_dev;
++
++enum qede_roce_event {
++	QEDE_UP,
++	QEDE_DOWN,
++	QEDE_CHANGE_ADDR,
++	QEDE_CLOSE
++};
++
++struct qede_roce_event_work {
++	struct list_head list;
++	struct work_struct work;
++	void *ptr;
++	enum qede_roce_event event;
++};
++
++struct qedr_driver {
++	unsigned char name[32];
++
++	struct qedr_dev* (*add)(struct qed_dev *, struct pci_dev *,
++				struct net_device *);
++
++	void (*remove)(struct qedr_dev *);
++	void (*notify)(struct qedr_dev *, enum qede_roce_event);
++};
++
++/* APIs for RoCE driver to register callback handlers,
++ * which will be invoked when device is added, removed, ifup, ifdown
++ */
++int qede_roce_register_driver(struct qedr_driver *drv);
++void qede_roce_unregister_driver(struct qedr_driver *drv);
++
++bool qede_roce_supported(struct qede_dev *dev);
++
++#if IS_ENABLED(CONFIG_INFINIBAND_QEDR)
++int qede_roce_dev_add(struct qede_dev *dev);
++void qede_roce_dev_event_open(struct qede_dev *dev);
++void qede_roce_dev_event_close(struct qede_dev *dev);
++void qede_roce_dev_remove(struct qede_dev *dev);
++void qede_roce_event_changeaddr(struct qede_dev *qedr);
++#else
++static inline int qede_roce_dev_add(struct qede_dev *dev)
++{
++	return 0;
++}
++
++static inline void qede_roce_dev_event_open(struct qede_dev *dev) {}
++static inline void qede_roce_dev_event_close(struct qede_dev *dev) {}
++static inline void qede_roce_dev_remove(struct qede_dev *dev) {}
++static inline void qede_roce_event_changeaddr(struct qede_dev *qedr) {}
++#endif
++#endif
