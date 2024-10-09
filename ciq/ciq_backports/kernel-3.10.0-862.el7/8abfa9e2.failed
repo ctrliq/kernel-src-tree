@@ -1,0 +1,1149 @@
+scsi: qla2xxx: Add function call to qpair for door bell
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Add function call to qpair for door bell (Himanshu Madhani) [1460030]
+Rebuild_FUZZ: 94.23%
+commit-author Quinn Tran <quinn.tran@cavium.com>
+commit 8abfa9e2268337cdcd458e24008345973328e2e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/8abfa9e2.failed
+
+Add call back to door bell for qpair. This help reduce access to
+qla_hw_data structure, in order to reduce cach thrash.
+
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 8abfa9e2268337cdcd458e24008345973328e2e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_inline.h
+#	drivers/scsi/qla2xxx/qla_os.c
+#	drivers/scsi/qla2xxx/qla_target.c
+#	drivers/scsi/qla2xxx/qla_target.h
+diff --cc drivers/scsi/qla2xxx/qla_inline.h
+index 0ac13772fc47,9a2c86eacf44..000000000000
+--- a/drivers/scsi/qla2xxx/qla_inline.h
++++ b/drivers/scsi/qla2xxx/qla_inline.h
+@@@ -308,3 -308,62 +308,65 @@@ qla2x00_set_retry_delay_timestamp(fc_po
+  		fcport->retry_delay_timestamp = jiffies +
+  		    (retry_delay * HZ / 10);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static inline bool
++ qla_is_exch_offld_enabled(struct scsi_qla_host *vha)
++ {
++ 	if (qla_ini_mode_enabled(vha) &&
++ 	    (ql2xiniexchg > FW_DEF_EXCHANGES_CNT))
++ 		return true;
++ 	else if (qla_tgt_mode_enabled(vha) &&
++ 	    (ql2xexchoffld > FW_DEF_EXCHANGES_CNT))
++ 		return true;
++ 	else if (qla_dual_mode_enabled(vha) &&
++ 	    ((ql2xiniexchg + ql2xexchoffld) > FW_DEF_EXCHANGES_CNT))
++ 		return true;
++ 	else
++ 		return false;
++ }
++ 
++ static inline void
++ qla_cpu_update(struct qla_qpair *qpair, uint16_t cpuid)
++ {
++ 	qpair->cpuid = cpuid;
++ 
++ 	if (!list_empty(&qpair->hints_list)) {
++ 		struct qla_qpair_hint *h;
++ 
++ 		list_for_each_entry(h, &qpair->hints_list, hint_elem)
++ 			h->cpuid = qpair->cpuid;
++ 	}
++ }
++ 
++ static inline struct qla_qpair_hint *
++ qla_qpair_to_hint(struct qla_tgt *tgt, struct qla_qpair *qpair)
++ {
++ 	struct qla_qpair_hint *h;
++ 	u16 i;
++ 
++ 	for (i = 0; i < tgt->ha->max_qpairs + 1; i++) {
++ 		h = &tgt->qphints[i];
++ 		if (h->qpair == qpair)
++ 			return h;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ static inline void
++ qla_83xx_start_iocbs(struct qla_qpair *qpair)
++ {
++ 	struct req_que *req = qpair->req;
++ 
++ 	req->ring_index++;
++ 	if (req->ring_index == req->length) {
++ 		req->ring_index = 0;
++ 		req->ring_ptr = req->ring;
++ 	} else
++ 		req->ring_ptr++;
++ 
++ 	WRT_REG_DWORD(req->req_q_in, req->ring_index);
++ }
+++>>>>>>> 8abfa9e22683 (scsi: qla2xxx: Add function call to qpair for door bell)
+diff --cc drivers/scsi/qla2xxx/qla_os.c
+index 4e0d0a2f9461,88e115fcea60..000000000000
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@@ -347,9 -393,18 +369,21 @@@ static int qla2x00_alloc_queues(struct 
+  		goto fail_rsp_map;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	ha->base_qpair = kzalloc(sizeof(struct qla_qpair), GFP_KERNEL);
++ 	if (ha->base_qpair == NULL) {
++ 		ql_log(ql_log_warn, vha, 0x00e0,
++ 		    "Failed to allocate base queue pair memory.\n");
++ 		goto fail_base_qpair;
++ 	}
++ 
++ 	qla_init_base_qpair(vha, req, rsp);
++ 
+++>>>>>>> 8abfa9e22683 (scsi: qla2xxx: Add function call to qpair for door bell)
+  	if (ql2xmqsupport && ha->max_qpairs) {
+ -		ha->queue_pair_map = kcalloc(ha->max_qpairs, sizeof(struct qla_qpair *),
+ -			GFP_KERNEL);
+ +		ha->queue_pair_map = kcalloc(ha->max_qpairs,
+ +			sizeof(struct qla_qpair *), GFP_KERNEL);
+  		if (!ha->queue_pair_map) {
+  			ql_log(ql_log_fatal, vha, 0x0180,
+  			    "Unable to allocate memory for queue pair ptrs.\n");
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 7a27b61e2d53,db5a81265d1b..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -1186,7 -1728,10 +1186,14 @@@ static void qlt_24xx_send_abts_resp(str
+  
+  	/* Memory Barrier */
+  	wmb();
+++<<<<<<< HEAD
+ +	qla2x00_start_iocbs(vha, vha->req);
+++=======
++ 	if (qpair->reqq_start_iocbs)
++ 		qpair->reqq_start_iocbs(qpair);
++ 	else
++ 		qla2x00_start_iocbs(vha, qpair->req);
+++>>>>>>> 8abfa9e22683 (scsi: qla2xxx: Add function call to qpair for door bell)
+  }
+  
+  /*
+@@@ -1402,7 -2061,10 +1409,14 @@@ static void qlt_24xx_send_task_mgmt_cti
+  
+  	/* Memory Barrier */
+  	wmb();
+++<<<<<<< HEAD
+ +	qla2x00_start_iocbs(ha, ha->req);
+++=======
++ 	if (qpair->reqq_start_iocbs)
++ 		qpair->reqq_start_iocbs(qpair);
++ 	else
++ 		qla2x00_start_iocbs(ha, qpair->req);
+++>>>>>>> 8abfa9e22683 (scsi: qla2xxx: Add function call to qpair for door bell)
+  }
+  
+  void qlt_free_mcmd(struct qla_tgt_mgmt_cmd *mcmd)
+@@@ -1411,6 -2073,76 +1425,79 @@@
+  }
+  EXPORT_SYMBOL(qlt_free_mcmd);
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * ha->hardware_lock supposed to be held on entry. Might drop it, then
++  * reacquire
++  */
++ void qlt_send_resp_ctio(struct qla_qpair *qpair, struct qla_tgt_cmd *cmd,
++     uint8_t scsi_status, uint8_t sense_key, uint8_t asc, uint8_t ascq)
++ {
++ 	struct atio_from_isp *atio = &cmd->atio;
++ 	struct ctio7_to_24xx *ctio;
++ 	uint16_t temp;
++ 	struct scsi_qla_host *vha = cmd->vha;
++ 
++ 	ql_dbg(ql_dbg_tgt_dif, vha, 0x3066,
++ 	    "Sending response CTIO7 (vha=%p, atio=%p, scsi_status=%02x, "
++ 	    "sense_key=%02x, asc=%02x, ascq=%02x",
++ 	    vha, atio, scsi_status, sense_key, asc, ascq);
++ 
++ 	ctio = (struct ctio7_to_24xx *)qla2x00_alloc_iocbs(vha, NULL);
++ 	if (!ctio) {
++ 		ql_dbg(ql_dbg_async, vha, 0x3067,
++ 		    "qla2x00t(%ld): %s failed: unable to allocate request packet",
++ 		    vha->host_no, __func__);
++ 		goto out;
++ 	}
++ 
++ 	ctio->entry_type = CTIO_TYPE7;
++ 	ctio->entry_count = 1;
++ 	ctio->handle = QLA_TGT_SKIP_HANDLE;
++ 	ctio->nport_handle = cmd->sess->loop_id;
++ 	ctio->timeout = cpu_to_le16(QLA_TGT_TIMEOUT);
++ 	ctio->vp_index = vha->vp_idx;
++ 	ctio->initiator_id[0] = atio->u.isp24.fcp_hdr.s_id[2];
++ 	ctio->initiator_id[1] = atio->u.isp24.fcp_hdr.s_id[1];
++ 	ctio->initiator_id[2] = atio->u.isp24.fcp_hdr.s_id[0];
++ 	ctio->exchange_addr = atio->u.isp24.exchange_addr;
++ 	temp = (atio->u.isp24.attr << 9) |
++ 	    CTIO7_FLAGS_STATUS_MODE_1 | CTIO7_FLAGS_SEND_STATUS;
++ 	ctio->u.status1.flags = cpu_to_le16(temp);
++ 	temp = be16_to_cpu(atio->u.isp24.fcp_hdr.ox_id);
++ 	ctio->u.status1.ox_id = cpu_to_le16(temp);
++ 	ctio->u.status1.scsi_status =
++ 	    cpu_to_le16(SS_RESPONSE_INFO_LEN_VALID | scsi_status);
++ 	ctio->u.status1.response_len = cpu_to_le16(18);
++ 	ctio->u.status1.residual = cpu_to_le32(get_datalen_for_atio(atio));
++ 
++ 	if (ctio->u.status1.residual != 0)
++ 		ctio->u.status1.scsi_status |=
++ 		    cpu_to_le16(SS_RESIDUAL_UNDER);
++ 
++ 	/* Response code and sense key */
++ 	put_unaligned_le32(((0x70 << 24) | (sense_key << 8)),
++ 	    (&ctio->u.status1.sense_data)[0]);
++ 	/* Additional sense length */
++ 	put_unaligned_le32(0x0a, (&ctio->u.status1.sense_data)[1]);
++ 	/* ASC and ASCQ */
++ 	put_unaligned_le32(((asc << 24) | (ascq << 16)),
++ 	    (&ctio->u.status1.sense_data)[3]);
++ 
++ 	/* Memory Barrier */
++ 	wmb();
++ 
++ 	if (qpair->reqq_start_iocbs)
++ 		qpair->reqq_start_iocbs(qpair);
++ 	else
++ 		qla2x00_start_iocbs(vha, qpair->req);
++ 
++ out:
++ 	return;
++ }
++ 
+++>>>>>>> 8abfa9e22683 (scsi: qla2xxx: Add function call to qpair for door bell)
+  /* callback from target fabric module code */
+  void qlt_xmit_tm_rsp(struct qla_tgt_mgmt_cmd *mcmd)
+  {
+@@@ -1462,16 -2223,43 +1549,55 @@@ static int qlt_pci_map_calc_cnt(struct 
+  
+  	prm->cmd->sg_mapped = 1;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * If greater than four sg entries then we need to allocate
+ +	 * the continuation entries
+ +	 */
+ +	if (prm->seg_cnt > prm->tgt->datasegs_per_cmd)
+ +		prm->req_cnt += DIV_ROUND_UP(prm->seg_cnt -
+ +		    prm->tgt->datasegs_per_cmd, prm->tgt->datasegs_per_cont);
+++=======
++ 	if (cmd->se_cmd.prot_op == TARGET_PROT_NORMAL) {
++ 		/*
++ 		 * If greater than four sg entries then we need to allocate
++ 		 * the continuation entries
++ 		 */
++ 		if (prm->seg_cnt > prm->tgt->datasegs_per_cmd)
++ 			prm->req_cnt += DIV_ROUND_UP(prm->seg_cnt -
++ 			prm->tgt->datasegs_per_cmd,
++ 			prm->tgt->datasegs_per_cont);
++ 	} else {
++ 		/* DIF */
++ 		if ((cmd->se_cmd.prot_op == TARGET_PROT_DIN_INSERT) ||
++ 		    (cmd->se_cmd.prot_op == TARGET_PROT_DOUT_STRIP)) {
++ 			prm->seg_cnt = DIV_ROUND_UP(cmd->bufflen, cmd->blk_sz);
++ 			prm->tot_dsds = prm->seg_cnt;
++ 		} else
++ 			prm->tot_dsds = prm->seg_cnt;
++ 
++ 		if (cmd->prot_sg_cnt) {
++ 			prm->prot_sg      = cmd->prot_sg;
++ 			prm->prot_seg_cnt = pci_map_sg(cmd->qpair->pdev,
++ 				cmd->prot_sg, cmd->prot_sg_cnt,
++ 				cmd->dma_data_direction);
++ 			if (unlikely(prm->prot_seg_cnt == 0))
++ 				goto out_err;
++ 
++ 			if ((cmd->se_cmd.prot_op == TARGET_PROT_DIN_INSERT) ||
++ 			    (cmd->se_cmd.prot_op == TARGET_PROT_DOUT_STRIP)) {
++ 				/* Dif Bundling not support here */
++ 				prm->prot_seg_cnt = DIV_ROUND_UP(cmd->bufflen,
++ 								cmd->blk_sz);
++ 				prm->tot_dsds += prm->prot_seg_cnt;
++ 			} else
++ 				prm->tot_dsds += prm->prot_seg_cnt;
++ 		}
++ 	}
+++>>>>>>> 8abfa9e22683 (scsi: qla2xxx: Add function call to qpair for door bell)
+  
+ +	ql_dbg(ql_dbg_tgt, prm->cmd->vha, 0xe009, "seg_cnt=%d, req_cnt=%d\n",
+ +	    prm->seg_cnt, prm->req_cnt);
+  	return 0;
+  
+  out_err:
+@@@ -1481,17 -2269,33 +1607,42 @@@
+  	return -1;
+  }
+  
+ -static void qlt_unmap_sg(struct scsi_qla_host *vha, struct qla_tgt_cmd *cmd)
+ +static inline void qlt_unmap_sg(struct scsi_qla_host *vha,
+ +	struct qla_tgt_cmd *cmd)
+  {
+++<<<<<<< HEAD
+ +	struct qla_hw_data *ha = vha->hw;
+ +
+ +	BUG_ON(!cmd->sg_mapped);
+ +	pci_unmap_sg(ha->pdev, cmd->sg, cmd->sg_cnt, cmd->dma_data_direction);
+ +	cmd->sg_mapped = 0;
+++=======
++ 	struct qla_hw_data *ha;
++ 	struct qla_qpair *qpair;
++ 	if (!cmd->sg_mapped)
++ 		return;
++ 
++ 	qpair = cmd->qpair;
++ 
++ 	pci_unmap_sg(qpair->pdev, cmd->sg, cmd->sg_cnt,
++ 	    cmd->dma_data_direction);
++ 	cmd->sg_mapped = 0;
++ 
++ 	if (cmd->prot_sg_cnt)
++ 		pci_unmap_sg(qpair->pdev, cmd->prot_sg, cmd->prot_sg_cnt,
++ 			cmd->dma_data_direction);
++ 
++ 	if (!cmd->ctx)
++ 		return;
++ 	ha = vha->hw;
++ 	if (cmd->ctx_dsd_alloced)
++ 		qla2x00_clean_dsd_pool(ha, cmd->ctx);
++ 
++ 	dma_pool_free(ha->dl_dma_pool, cmd->ctx, cmd->ctx->crc_ctx_dma);
+++>>>>>>> 8abfa9e22683 (scsi: qla2xxx: Add function call to qpair for door bell)
+  }
+  
+ -static int qlt_check_reserve_free_req(struct qla_qpair *qpair,
+ +static int qlt_check_reserve_free_req(struct scsi_qla_host *vha,
+  	uint32_t req_cnt)
+  {
+  	uint32_t cnt;
+@@@ -1540,30 -2336,37 +1691,44 @@@ static inline void *qlt_get_req_pkt(str
+  }
+  
+  /* ha->hardware_lock supposed to be held on entry */
+ -static inline uint32_t qlt_make_handle(struct qla_qpair *qpair)
+ +static inline uint32_t qlt_make_handle(struct scsi_qla_host *vha)
+  {
+++<<<<<<< HEAD
+ +	struct qla_hw_data *ha = vha->hw;
+++=======
+++>>>>>>> 8abfa9e22683 (scsi: qla2xxx: Add function call to qpair for door bell)
+  	uint32_t h;
+ -	int index;
+ -	uint8_t found = 0;
+ -	struct req_que *req = qpair->req;
+ -
+ -	h = req->current_outstanding_cmd;
+ -
+ -	for (index = 1; index < req->num_outstanding_cmds; index++) {
+ -		h++;
+ -		if (h == req->num_outstanding_cmds)
+ -			h = 1;
+ -
+ -		if (h == QLA_TGT_SKIP_HANDLE)
+ -			continue;
+  
+ -		if (!req->outstanding_cmds[h]) {
+ -			found = 1;
+ +	h = ha->tgt.current_handle;
+ +	/* always increment cmd handle */
+ +	do {
+ +		++h;
+ +		if (h > DEFAULT_OUTSTANDING_COMMANDS)
+ +			h = 1; /* 0 is QLA_TGT_NULL_HANDLE */
+ +		if (h == ha->tgt.current_handle) {
+ +			ql_dbg(ql_dbg_tgt, vha, 0xe04e,
+ +			    "qla_target(%d): Ran out of "
+ +			    "empty cmd slots in ha %p\n", vha->vp_idx, ha);
+ +			h = QLA_TGT_NULL_HANDLE;
+  			break;
+  		}
+ -	}
+ -
+ +	} while ((h == QLA_TGT_NULL_HANDLE) ||
+ +	    (h == QLA_TGT_SKIP_HANDLE) ||
+ +	    (ha->tgt.cmds[h-1] != NULL));
+ +
+++<<<<<<< HEAD
+ +	if (h != QLA_TGT_NULL_HANDLE)
+ +		ha->tgt.current_handle = h;
+++=======
++ 	if (found) {
++ 		req->current_outstanding_cmd = h;
++ 	} else {
++ 		ql_dbg(ql_dbg_io, qpair->vha, 0x305b,
++ 		    "qla_target(%d): Ran out of empty cmd slots\n",
++ 		    qpair->vha->vp_idx);
++ 		h = QLA_TGT_NULL_HANDLE;
++ 	}
+++>>>>>>> 8abfa9e22683 (scsi: qla2xxx: Add function call to qpair for door bell)
+  
+  	return h;
+  }
+@@@ -2119,8 -3202,11 +2284,16 @@@ int qlt_xmit_response(struct qla_tgt_cm
+  
+  	/* Memory Barrier */
+  	wmb();
+++<<<<<<< HEAD
+ +	qla2x00_start_iocbs(vha, vha->req);
+ +	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+++=======
++ 	if (qpair->reqq_start_iocbs)
++ 		qpair->reqq_start_iocbs(qpair);
++ 	else
++ 		qla2x00_start_iocbs(vha, qpair->req);
++ 	spin_unlock_irqrestore(qpair->qp_lock_ptr, flags);
+++>>>>>>> 8abfa9e22683 (scsi: qla2xxx: Add function call to qpair for door bell)
+  
+  	return 0;
+  
+@@@ -2179,8 -3279,12 +2352,16 @@@ int qlt_rdy_to_xfer(struct qla_tgt_cmd 
+  
+  	/* Memory Barrier */
+  	wmb();
+++<<<<<<< HEAD
+ +	qla2x00_start_iocbs(vha, vha->req);
+ +	spin_unlock_irqrestore(&ha->hardware_lock, flags);
+++=======
++ 	if (qpair->reqq_start_iocbs)
++ 		qpair->reqq_start_iocbs(qpair);
++ 	else
++ 		qla2x00_start_iocbs(vha, qpair->req);
++ 	spin_unlock_irqrestore(qpair->qp_lock_ptr, flags);
+++>>>>>>> 8abfa9e22683 (scsi: qla2xxx: Add function call to qpair for door bell)
+  
+  	return res;
+  
+@@@ -2194,9 -3297,197 +2375,115 @@@ out_unlock_free_unmap
+  EXPORT_SYMBOL(qlt_rdy_to_xfer);
+  
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * it is assumed either hardware_lock or qpair lock is held.
++  */
++ static void
++ qlt_handle_dif_error(struct qla_qpair *qpair, struct qla_tgt_cmd *cmd,
++ 	struct ctio_crc_from_fw *sts)
++ {
++ 	uint8_t		*ap = &sts->actual_dif[0];
++ 	uint8_t		*ep = &sts->expected_dif[0];
++ 	uint64_t	lba = cmd->se_cmd.t_task_lba;
++ 	uint8_t scsi_status, sense_key, asc, ascq;
++ 	unsigned long flags;
++ 	struct scsi_qla_host *vha = cmd->vha;
++ 
++ 	cmd->trc_flags |= TRC_DIF_ERR;
++ 
++ 	cmd->a_guard   = be16_to_cpu(*(uint16_t *)(ap + 0));
++ 	cmd->a_app_tag = be16_to_cpu(*(uint16_t *)(ap + 2));
++ 	cmd->a_ref_tag = be32_to_cpu(*(uint32_t *)(ap + 4));
++ 
++ 	cmd->e_guard   = be16_to_cpu(*(uint16_t *)(ep + 0));
++ 	cmd->e_app_tag = be16_to_cpu(*(uint16_t *)(ep + 2));
++ 	cmd->e_ref_tag = be32_to_cpu(*(uint32_t *)(ep + 4));
++ 
++ 	ql_dbg(ql_dbg_tgt_dif, vha, 0xf075,
++ 	    "%s: aborted %d state %d\n", __func__, cmd->aborted, cmd->state);
++ 
++ 	scsi_status = sense_key = asc = ascq = 0;
++ 
++ 	/* check appl tag */
++ 	if (cmd->e_app_tag != cmd->a_app_tag) {
++ 		ql_dbg(ql_dbg_tgt_dif, vha, 0xe00d,
++ 		    "App Tag ERR: cdb[%x] lba[%llx %llx] blks[%x] [Actual|Expected] Ref[%x|%x], App[%x|%x], Guard [%x|%x] cmd=%p ox_id[%04x]",
++ 		    cmd->cdb[0], lba, (lba+cmd->num_blks), cmd->num_blks,
++ 		    cmd->a_ref_tag, cmd->e_ref_tag, cmd->a_app_tag,
++ 		    cmd->e_app_tag, cmd->a_guard, cmd->e_guard, cmd,
++ 		    cmd->atio.u.isp24.fcp_hdr.ox_id);
++ 
++ 		cmd->dif_err_code = DIF_ERR_APP;
++ 		scsi_status = SAM_STAT_CHECK_CONDITION;
++ 		sense_key = ABORTED_COMMAND;
++ 		asc = 0x10;
++ 		ascq = 0x2;
++ 	}
++ 
++ 	/* check ref tag */
++ 	if (cmd->e_ref_tag != cmd->a_ref_tag) {
++ 		ql_dbg(ql_dbg_tgt_dif, vha, 0xe00e,
++ 		    "Ref Tag ERR: cdb[%x] lba[%llx %llx] blks[%x] [Actual|Expected] Ref[%x|%x], App[%x|%x], Guard[%x|%x] cmd=%p ox_id[%04x] ",
++ 		    cmd->cdb[0], lba, (lba+cmd->num_blks), cmd->num_blks,
++ 		    cmd->a_ref_tag, cmd->e_ref_tag, cmd->a_app_tag,
++ 		    cmd->e_app_tag, cmd->a_guard, cmd->e_guard, cmd,
++ 		    cmd->atio.u.isp24.fcp_hdr.ox_id);
++ 
++ 		cmd->dif_err_code = DIF_ERR_REF;
++ 		scsi_status = SAM_STAT_CHECK_CONDITION;
++ 		sense_key = ABORTED_COMMAND;
++ 		asc = 0x10;
++ 		ascq = 0x3;
++ 		goto out;
++ 	}
++ 
++ 	/* check guard */
++ 	if (cmd->e_guard != cmd->a_guard) {
++ 		ql_dbg(ql_dbg_tgt_dif, vha, 0xe012,
++ 		    "Guard ERR: cdb[%x] lba[%llx %llx] blks[%x] [Actual|Expected] Ref[%x|%x], App[%x|%x], Guard [%x|%x] cmd=%p ox_id[%04x]",
++ 		    cmd->cdb[0], lba, (lba+cmd->num_blks), cmd->num_blks,
++ 		    cmd->a_ref_tag, cmd->e_ref_tag, cmd->a_app_tag,
++ 		    cmd->e_app_tag, cmd->a_guard, cmd->e_guard, cmd,
++ 		    cmd->atio.u.isp24.fcp_hdr.ox_id);
++ 
++ 		cmd->dif_err_code = DIF_ERR_GRD;
++ 		scsi_status = SAM_STAT_CHECK_CONDITION;
++ 		sense_key = ABORTED_COMMAND;
++ 		asc = 0x10;
++ 		ascq = 0x1;
++ 	}
++ out:
++ 	switch (cmd->state) {
++ 	case QLA_TGT_STATE_NEED_DATA:
++ 		/* handle_data will load DIF error code  */
++ 		cmd->state = QLA_TGT_STATE_DATA_IN;
++ 		vha->hw->tgt.tgt_ops->handle_data(cmd);
++ 		break;
++ 	default:
++ 		spin_lock_irqsave(&cmd->cmd_lock, flags);
++ 		if (cmd->aborted) {
++ 			spin_unlock_irqrestore(&cmd->cmd_lock, flags);
++ 			vha->hw->tgt.tgt_ops->free_cmd(cmd);
++ 			break;
++ 		}
++ 		spin_unlock_irqrestore(&cmd->cmd_lock, flags);
++ 
++ 		qlt_send_resp_ctio(qpair, cmd, scsi_status, sense_key, asc,
++ 		    ascq);
++ 		/* assume scsi status gets out on the wire.
++ 		 * Will not wait for completion.
++ 		 */
++ 		vha->hw->tgt.tgt_ops->free_cmd(cmd);
++ 		break;
++ 	}
++ }
++ 
+++>>>>>>> 8abfa9e22683 (scsi: qla2xxx: Add function call to qpair for door bell)
+  /* If hardware_lock held on entry, might drop it, then reaquire */
+  /* This function sends the appropriate CTIO to ISP 2xxx or 24xx */
+ -static int __qlt_send_term_imm_notif(struct scsi_qla_host *vha,
+ -	struct imm_ntfy_from_isp *ntfy)
+ -{
+ -	struct nack_to_isp *nack;
+ -	struct qla_hw_data *ha = vha->hw;
+ -	request_t *pkt;
+ -	int ret = 0;
+ -
+ -	ql_dbg(ql_dbg_tgt_tmr, vha, 0xe01c,
+ -	    "Sending TERM ELS CTIO (ha=%p)\n", ha);
+ -
+ -	pkt = (request_t *)qla2x00_alloc_iocbs(vha, NULL);
+ -	if (pkt == NULL) {
+ -		ql_dbg(ql_dbg_tgt, vha, 0xe080,
+ -		    "qla_target(%d): %s failed: unable to allocate "
+ -		    "request packet\n", vha->vp_idx, __func__);
+ -		return -ENOMEM;
+ -	}
+ -
+ -	pkt->entry_type = NOTIFY_ACK_TYPE;
+ -	pkt->entry_count = 1;
+ -	pkt->handle = QLA_TGT_SKIP_HANDLE;
+ -
+ -	nack = (struct nack_to_isp *)pkt;
+ -	nack->ox_id = ntfy->ox_id;
+ -
+ -	nack->u.isp24.nport_handle = ntfy->u.isp24.nport_handle;
+ -	if (le16_to_cpu(ntfy->u.isp24.status) == IMM_NTFY_ELS) {
+ -		nack->u.isp24.flags = ntfy->u.isp24.flags &
+ -			__constant_cpu_to_le32(NOTIFY24XX_FLAGS_PUREX_IOCB);
+ -	}
+ -
+ -	/* terminate */
+ -	nack->u.isp24.flags |=
+ -		__constant_cpu_to_le16(NOTIFY_ACK_FLAGS_TERMINATE);
+ -
+ -	nack->u.isp24.srr_rx_id = ntfy->u.isp24.srr_rx_id;
+ -	nack->u.isp24.status = ntfy->u.isp24.status;
+ -	nack->u.isp24.status_subcode = ntfy->u.isp24.status_subcode;
+ -	nack->u.isp24.fw_handle = ntfy->u.isp24.fw_handle;
+ -	nack->u.isp24.exchange_address = ntfy->u.isp24.exchange_address;
+ -	nack->u.isp24.srr_rel_offs = ntfy->u.isp24.srr_rel_offs;
+ -	nack->u.isp24.srr_ui = ntfy->u.isp24.srr_ui;
+ -	nack->u.isp24.vp_index = ntfy->u.isp24.vp_index;
+ -
+ -	qla2x00_start_iocbs(vha, vha->req);
+ -	return ret;
+ -}
+ -
+ -static void qlt_send_term_imm_notif(struct scsi_qla_host *vha,
+ -	struct imm_ntfy_from_isp *imm, int ha_locked)
+ -{
+ -	unsigned long flags = 0;
+ -	int rc;
+ -
+ -	if (ha_locked) {
+ -		rc = __qlt_send_term_imm_notif(vha, imm);
+ -
+ -#if 0	/* Todo  */
+ -		if (rc == -ENOMEM)
+ -			qlt_alloc_qfull_cmd(vha, imm, 0, 0);
+ -#else
+ -		if (rc) {
+ -		}
+ -#endif
+ -		goto done;
+ -	}
+ -
+ -	spin_lock_irqsave(&vha->hw->hardware_lock, flags);
+ -	rc = __qlt_send_term_imm_notif(vha, imm);
+ -
+ -#if 0	/* Todo */
+ -	if (rc == -ENOMEM)
+ -		qlt_alloc_qfull_cmd(vha, imm, 0, 0);
+ -#endif
+ -
+ -done:
+ -	if (!ha_locked)
+ -		spin_unlock_irqrestore(&vha->hw->hardware_lock, flags);
+ -}
+ -
+ -/*
+ - * If hardware_lock held on entry, might drop it, then reaquire
+ - * This function sends the appropriate CTIO to ISP 2xxx or 24xx
+ - */
+ -static int __qlt_send_term_exchange(struct qla_qpair *qpair,
+ +static int __qlt_send_term_exchange(struct scsi_qla_host *vha,
+  	struct qla_tgt_cmd *cmd,
+  	struct atio_from_isp *atio)
+  {
+@@@ -2251,46 -3546,132 +2538,53 @@@
+  
+  	/* Memory Barrier */
+  	wmb();
+ -	if (qpair->reqq_start_iocbs)
+ -		qpair->reqq_start_iocbs(qpair);
+ -	else
+ -		qla2x00_start_iocbs(vha, qpair->req);
+ -	return ret;
+ -}
+ -
+ -static void qlt_send_term_exchange(struct qla_qpair *qpair,
+ -	struct qla_tgt_cmd *cmd, struct atio_from_isp *atio, int ha_locked,
+ -	int ul_abort)
+ -{
+ -	struct scsi_qla_host *vha;
+ -	unsigned long flags = 0;
+ -	int rc;
+ -
+ -	/* why use different vha? NPIV */
+ -	if (cmd)
+ -		vha = cmd->vha;
+ -	else
+ -		vha = qpair->vha;
+ -
+ -	if (ha_locked) {
+ -		rc = __qlt_send_term_exchange(qpair, cmd, atio);
+ -		if (rc == -ENOMEM)
+ -			qlt_alloc_qfull_cmd(vha, atio, 0, 0);
+ -		goto done;
+ -	}
+ -	spin_lock_irqsave(qpair->qp_lock_ptr, flags);
+ -	rc = __qlt_send_term_exchange(qpair, cmd, atio);
+ -	if (rc == -ENOMEM)
+ -		qlt_alloc_qfull_cmd(vha, atio, 0, 0);
+ -
+ -done:
+ -	if (cmd && !ul_abort && !cmd->aborted) {
+ -		if (cmd->sg_mapped)
+ -			qlt_unmap_sg(vha, cmd);
+ -		vha->hw->tgt.tgt_ops->free_cmd(cmd);
+ -	}
+ -
+ -	if (!ha_locked)
+ -		spin_unlock_irqrestore(qpair->qp_lock_ptr, flags);
+ -
+ -	return;
+ -}
+ -
+ -static void qlt_init_term_exchange(struct scsi_qla_host *vha)
+ -{
+ -	struct list_head free_list;
+ -	struct qla_tgt_cmd *cmd, *tcmd;
+ -
+ -	vha->hw->tgt.leak_exchg_thresh_hold =
+ -	    (vha->hw->cur_fw_xcb_count/100) * LEAK_EXCHG_THRESH_HOLD_PERCENT;
+ -
+ -	cmd = tcmd = NULL;
+ -	if (!list_empty(&vha->hw->tgt.q_full_list)) {
+ -		INIT_LIST_HEAD(&free_list);
+ -		list_splice_init(&vha->hw->tgt.q_full_list, &free_list);
+ -
+ -		list_for_each_entry_safe(cmd, tcmd, &free_list, cmd_list) {
+ -			list_del(&cmd->cmd_list);
+ -			/* This cmd was never sent to TCM.  There is no need
+ -			 * to schedule free or call free_cmd
+ -			 */
+ -			qlt_free_cmd(cmd);
+ -			vha->hw->tgt.num_qfull_cmds_alloc--;
+ -		}
+ -	}
+ -	vha->hw->tgt.num_qfull_cmds_dropped = 0;
+ -}
+ -
+ -static void qlt_chk_exch_leak_thresh_hold(struct scsi_qla_host *vha)
+ -{
+ -	uint32_t total_leaked;
+ -
+ -	total_leaked = vha->hw->tgt.num_qfull_cmds_dropped;
+ -
+ -	if (vha->hw->tgt.leak_exchg_thresh_hold &&
+ -	    (total_leaked > vha->hw->tgt.leak_exchg_thresh_hold)) {
+ -
+ -		ql_dbg(ql_dbg_tgt, vha, 0xe079,
+ -		    "Chip reset due to exchange starvation: %d/%d.\n",
+ -		    total_leaked, vha->hw->cur_fw_xcb_count);
+ -
+ -		if (IS_P3P_TYPE(vha->hw))
+ -			set_bit(FCOE_CTX_RESET_NEEDED, &vha->dpc_flags);
+ -		else
+ -			set_bit(ISP_ABORT_NEEDED, &vha->dpc_flags);
+ -		qla2xxx_wake_dpc(vha);
+ -	}
+ -
+++<<<<<<< HEAD
+ +	qla2x00_start_iocbs(vha, vha->req);
+++=======
+++	if (qpair->reqq_start_iocbs)
+++		qpair->reqq_start_iocbs(qpair);
+++	else
+++		qla2x00_start_iocbs(vha, qpair->req);
+++>>>>>>> 8abfa9e22683 (scsi: qla2xxx: Add function call to qpair for door bell)
+ +	return ret;
+  }
+  
+ -int qlt_abort_cmd(struct qla_tgt_cmd *cmd)
+ +static void qlt_send_term_exchange(struct scsi_qla_host *vha,
+ +	struct qla_tgt_cmd *cmd, struct atio_from_isp *atio, int ha_locked)
+  {
+ -	struct qla_tgt *tgt = cmd->tgt;
+ -	struct scsi_qla_host *vha = tgt->vha;
+ -	struct se_cmd *se_cmd = &cmd->se_cmd;
+  	unsigned long flags;
+ +	int rc;
+  
+ -	ql_dbg(ql_dbg_tgt_mgt, vha, 0xf014,
+ -	    "qla_target(%d): terminating exchange for aborted cmd=%p "
+ -	    "(se_cmd=%p, tag=%llu)", vha->vp_idx, cmd, &cmd->se_cmd,
+ -	    se_cmd->tag);
+ +	if (qlt_issue_marker(vha, ha_locked) < 0)
+ +		return;
+  
+ -	spin_lock_irqsave(&cmd->cmd_lock, flags);
+ -	if (cmd->aborted) {
+ -		spin_unlock_irqrestore(&cmd->cmd_lock, flags);
+ -		/*
+ -		 * It's normal to see 2 calls in this path:
+ -		 *  1) XFER Rdy completion + CMD_T_ABORT
+ -		 *  2) TCM TMR - drain_state_list
+ -		 */
+ -		ql_dbg(ql_dbg_tgt_mgt, vha, 0xf016,
+ -		    "multiple abort. %p transport_state %x, t_state %x, "
+ -		    "se_cmd_flags %x\n", cmd, cmd->se_cmd.transport_state,
+ -		    cmd->se_cmd.t_state, cmd->se_cmd.se_cmd_flags);
+ -		return EIO;
+ +	if (ha_locked) {
+ +		rc = __qlt_send_term_exchange(vha, cmd, atio);
+ +		goto done;
+  	}
+ -	cmd->aborted = 1;
+ -	cmd->trc_flags |= TRC_ABORT;
+ -	spin_unlock_irqrestore(&cmd->cmd_lock, flags);
+ +	spin_lock_irqsave(&vha->hw->hardware_lock, flags);
+ +	rc = __qlt_send_term_exchange(vha, cmd, atio);
+ +	spin_unlock_irqrestore(&vha->hw->hardware_lock, flags);
+ +done:
+ +	/*
+ +	 * Terminate exchange will tell fw to release any active CTIO
+ +	 * that's in FW posession and cleanup the exchange.
+ +	 *
+ +	 * "cmd->state == QLA_TGT_STATE_ABORTED" means CTIO is still
+ +	 * down at FW.  Free the cmd later when CTIO comes back later
+ +	 * w/aborted(0x2) status.
+ +	 *
+ +	 * "cmd->state != QLA_TGT_STATE_ABORTED" means CTIO is already
+ +	 * back w/some err.  Free the cmd now.
+ +	 */
+ +	if ((rc == 1) && (cmd->state != QLA_TGT_STATE_ABORTED)) {
+ +		if (!ha_locked && !in_interrupt())
+ +			msleep(250); /* just in case */
+  
+ -	qlt_send_term_exchange(cmd->qpair, cmd, &cmd->atio, 0, 1);
+ -	return 0;
+ +		vha->hw->tgt.tgt_ops->free_cmd(cmd);
+ +	}
+ +	return;
+  }
+ -EXPORT_SYMBOL(qlt_abort_cmd);
+  
+  void qlt_free_cmd(struct qla_tgt_cmd *cmd)
+  {
+@@@ -2518,27 -3871,48 +2812,33 @@@ static void qlt_do_ctio_completion(stru
+  
+  		case CTIO_PORT_LOGGED_OUT:
+  		case CTIO_PORT_UNAVAILABLE:
+ -		{
+ -			int logged_out =
+ -				(status & 0xFFFF) == CTIO_PORT_LOGGED_OUT;
+ -
+  			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf059,
+ -			    "qla_target(%d): CTIO with %s status %x "
+ +			    "qla_target(%d): CTIO with PORT LOGGED "
+ +			    "OUT (29) or PORT UNAVAILABLE (28) status %x "
+  			    "received (state %x, se_cmd %p)\n", vha->vp_idx,
+ -			    logged_out ? "PORT LOGGED OUT" : "PORT UNAVAILABLE",
+  			    status, cmd->state, se_cmd);
+ -
+ -			if (logged_out && cmd->sess) {
+ -				/*
+ -				 * Session is already logged out, but we need
+ -				 * to notify initiator, who's not aware of this
+ -				 */
+ -				cmd->sess->logout_on_delete = 0;
+ -				cmd->sess->send_els_logo = 1;
+ -				ql_dbg(ql_dbg_disc, vha, 0x20f8,
+ -				    "%s %d %8phC post del sess\n",
+ -				    __func__, __LINE__, cmd->sess->port_name);
+ -
+ -				qlt_schedule_sess_for_deletion_lock(cmd->sess);
+ -			}
+  			break;
+ -		}
+ -		case CTIO_DIF_ERROR: {
+ -			struct ctio_crc_from_fw *crc =
+ -				(struct ctio_crc_from_fw *)ctio;
+ -			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf073,
+ -			    "qla_target(%d): CTIO with DIF_ERROR status %x "
+ -			    "received (state %x, ulp_cmd %p) actual_dif[0x%llx] "
+ -			    "expect_dif[0x%llx]\n",
+ -			    vha->vp_idx, status, cmd->state, se_cmd,
+ -			    *((u64 *)&crc->actual_dif[0]),
+ -			    *((u64 *)&crc->expected_dif[0]));
+  
+++<<<<<<< HEAD
+ +		case CTIO_SRR_RECEIVED:
+ +			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf05a,
+ +			    "qla_target(%d): CTIO with SRR_RECEIVED"
+ +			    " status %x received (state %x, se_cmd %p)\n",
+ +			    vha->vp_idx, status, cmd->state, se_cmd);
+ +			if (qlt_prepare_srr_ctio(vha, cmd, ctio) != 0)
+ +				break;
+ +			else
+ +				return;
+ +
+++=======
++ 			qlt_handle_dif_error(qpair, cmd, ctio);
++ 			return;
++ 		}
+++>>>>>>> 8abfa9e22683 (scsi: qla2xxx: Add function call to qpair for door bell)
+  		default:
+  			ql_dbg(ql_dbg_tgt_mgt, vha, 0xf05b,
+ -			    "qla_target(%d): CTIO with error status 0x%x received (state %x, se_cmd %p\n",
+ +			    "qla_target(%d): CTIO with error status "
+ +			    "0x%x received (state %x, se_cmd %p\n",
+  			    vha->vp_idx, status, cmd->state, se_cmd);
+  			break;
+  		}
+@@@ -3634,7 -5145,216 +3934,220 @@@ static void qlt_send_busy(struct scsi_q
+  	ctio24->u.status1.scsi_status = cpu_to_le16(status);
+  	/* Memory Barrier */
+  	wmb();
+++<<<<<<< HEAD
+ +	qla2x00_start_iocbs(vha, vha->req);
+++=======
++ 	if (qpair->reqq_start_iocbs)
++ 		qpair->reqq_start_iocbs(qpair);
++ 	else
++ 		qla2x00_start_iocbs(vha, qpair->req);
++ 	return 0;
++ }
++ 
++ /*
++  * This routine is used to allocate a command for either a QFull condition
++  * (ie reply SAM_STAT_BUSY) or to terminate an exchange that did not go
++  * out previously.
++  */
++ static void
++ qlt_alloc_qfull_cmd(struct scsi_qla_host *vha,
++ 	struct atio_from_isp *atio, uint16_t status, int qfull)
++ {
++ 	struct qla_tgt *tgt = vha->vha_tgt.qla_tgt;
++ 	struct qla_hw_data *ha = vha->hw;
++ 	struct fc_port *sess;
++ 	struct se_session *se_sess;
++ 	struct qla_tgt_cmd *cmd;
++ 	int tag;
++ 	unsigned long flags;
++ 
++ 	if (unlikely(tgt->tgt_stop)) {
++ 		ql_dbg(ql_dbg_io, vha, 0x300a,
++ 			"New command while device %p is shutting down\n", tgt);
++ 		return;
++ 	}
++ 
++ 	if ((vha->hw->tgt.num_qfull_cmds_alloc + 1) > MAX_QFULL_CMDS_ALLOC) {
++ 		vha->hw->tgt.num_qfull_cmds_dropped++;
++ 		if (vha->hw->tgt.num_qfull_cmds_dropped >
++ 			vha->qla_stats.stat_max_qfull_cmds_dropped)
++ 			vha->qla_stats.stat_max_qfull_cmds_dropped =
++ 				vha->hw->tgt.num_qfull_cmds_dropped;
++ 
++ 		ql_dbg(ql_dbg_io, vha, 0x3068,
++ 			"qla_target(%d): %s: QFull CMD dropped[%d]\n",
++ 			vha->vp_idx, __func__,
++ 			vha->hw->tgt.num_qfull_cmds_dropped);
++ 
++ 		qlt_chk_exch_leak_thresh_hold(vha);
++ 		return;
++ 	}
++ 
++ 	sess = ha->tgt.tgt_ops->find_sess_by_s_id
++ 		(vha, atio->u.isp24.fcp_hdr.s_id);
++ 	if (!sess)
++ 		return;
++ 
++ 	se_sess = sess->se_sess;
++ 
++ 	tag = percpu_ida_alloc(&se_sess->sess_tag_pool, TASK_RUNNING);
++ 	if (tag < 0)
++ 		return;
++ 
++ 	cmd = &((struct qla_tgt_cmd *)se_sess->sess_cmd_map)[tag];
++ 	if (!cmd) {
++ 		ql_dbg(ql_dbg_io, vha, 0x3009,
++ 			"qla_target(%d): %s: Allocation of cmd failed\n",
++ 			vha->vp_idx, __func__);
++ 
++ 		vha->hw->tgt.num_qfull_cmds_dropped++;
++ 		if (vha->hw->tgt.num_qfull_cmds_dropped >
++ 			vha->qla_stats.stat_max_qfull_cmds_dropped)
++ 			vha->qla_stats.stat_max_qfull_cmds_dropped =
++ 				vha->hw->tgt.num_qfull_cmds_dropped;
++ 
++ 		qlt_chk_exch_leak_thresh_hold(vha);
++ 		return;
++ 	}
++ 
++ 	memset(cmd, 0, sizeof(struct qla_tgt_cmd));
++ 
++ 	qlt_incr_num_pend_cmds(vha);
++ 	INIT_LIST_HEAD(&cmd->cmd_list);
++ 	memcpy(&cmd->atio, atio, sizeof(*atio));
++ 
++ 	cmd->tgt = vha->vha_tgt.qla_tgt;
++ 	cmd->vha = vha;
++ 	cmd->reset_count = ha->base_qpair->chip_reset;
++ 	cmd->q_full = 1;
++ 	cmd->qpair = ha->base_qpair;
++ 
++ 	if (qfull) {
++ 		cmd->q_full = 1;
++ 		/* NOTE: borrowing the state field to carry the status */
++ 		cmd->state = status;
++ 	} else
++ 		cmd->term_exchg = 1;
++ 
++ 	spin_lock_irqsave(&vha->hw->tgt.q_full_lock, flags);
++ 	list_add_tail(&cmd->cmd_list, &vha->hw->tgt.q_full_list);
++ 
++ 	vha->hw->tgt.num_qfull_cmds_alloc++;
++ 	if (vha->hw->tgt.num_qfull_cmds_alloc >
++ 		vha->qla_stats.stat_max_qfull_cmds_alloc)
++ 		vha->qla_stats.stat_max_qfull_cmds_alloc =
++ 			vha->hw->tgt.num_qfull_cmds_alloc;
++ 	spin_unlock_irqrestore(&vha->hw->tgt.q_full_lock, flags);
++ }
++ 
++ int
++ qlt_free_qfull_cmds(struct qla_qpair *qpair)
++ {
++ 	struct scsi_qla_host *vha = qpair->vha;
++ 	struct qla_hw_data *ha = vha->hw;
++ 	unsigned long flags;
++ 	struct qla_tgt_cmd *cmd, *tcmd;
++ 	struct list_head free_list, q_full_list;
++ 	int rc = 0;
++ 
++ 	if (list_empty(&ha->tgt.q_full_list))
++ 		return 0;
++ 
++ 	INIT_LIST_HEAD(&free_list);
++ 	INIT_LIST_HEAD(&q_full_list);
++ 
++ 	spin_lock_irqsave(&vha->hw->tgt.q_full_lock, flags);
++ 	if (list_empty(&ha->tgt.q_full_list)) {
++ 		spin_unlock_irqrestore(&vha->hw->tgt.q_full_lock, flags);
++ 		return 0;
++ 	}
++ 
++ 	list_splice_init(&vha->hw->tgt.q_full_list, &q_full_list);
++ 	spin_unlock_irqrestore(&vha->hw->tgt.q_full_lock, flags);
++ 
++ 	spin_lock_irqsave(qpair->qp_lock_ptr, flags);
++ 	list_for_each_entry_safe(cmd, tcmd, &q_full_list, cmd_list) {
++ 		if (cmd->q_full)
++ 			/* cmd->state is a borrowed field to hold status */
++ 			rc = __qlt_send_busy(qpair, &cmd->atio, cmd->state);
++ 		else if (cmd->term_exchg)
++ 			rc = __qlt_send_term_exchange(qpair, NULL, &cmd->atio);
++ 
++ 		if (rc == -ENOMEM)
++ 			break;
++ 
++ 		if (cmd->q_full)
++ 			ql_dbg(ql_dbg_io, vha, 0x3006,
++ 			    "%s: busy sent for ox_id[%04x]\n", __func__,
++ 			    be16_to_cpu(cmd->atio.u.isp24.fcp_hdr.ox_id));
++ 		else if (cmd->term_exchg)
++ 			ql_dbg(ql_dbg_io, vha, 0x3007,
++ 			    "%s: Term exchg sent for ox_id[%04x]\n", __func__,
++ 			    be16_to_cpu(cmd->atio.u.isp24.fcp_hdr.ox_id));
++ 		else
++ 			ql_dbg(ql_dbg_io, vha, 0x3008,
++ 			    "%s: Unexpected cmd in QFull list %p\n", __func__,
++ 			    cmd);
++ 
++ 		list_del(&cmd->cmd_list);
++ 		list_add_tail(&cmd->cmd_list, &free_list);
++ 
++ 		/* piggy back on hardware_lock for protection */
++ 		vha->hw->tgt.num_qfull_cmds_alloc--;
++ 	}
++ 	spin_unlock_irqrestore(qpair->qp_lock_ptr, flags);
++ 
++ 	cmd = NULL;
++ 
++ 	list_for_each_entry_safe(cmd, tcmd, &free_list, cmd_list) {
++ 		list_del(&cmd->cmd_list);
++ 		/* This cmd was never sent to TCM.  There is no need
++ 		 * to schedule free or call free_cmd
++ 		 */
++ 		qlt_free_cmd(cmd);
++ 	}
++ 
++ 	if (!list_empty(&q_full_list)) {
++ 		spin_lock_irqsave(&vha->hw->tgt.q_full_lock, flags);
++ 		list_splice(&q_full_list, &vha->hw->tgt.q_full_list);
++ 		spin_unlock_irqrestore(&vha->hw->tgt.q_full_lock, flags);
++ 	}
++ 
++ 	return rc;
++ }
++ 
++ static void
++ qlt_send_busy(struct qla_qpair *qpair, struct atio_from_isp *atio,
++     uint16_t status)
++ {
++ 	int rc = 0;
++ 	struct scsi_qla_host *vha = qpair->vha;
++ 
++ 	rc = __qlt_send_busy(qpair, atio, status);
++ 	if (rc == -ENOMEM)
++ 		qlt_alloc_qfull_cmd(vha, atio, status, 1);
++ }
++ 
++ static int
++ qlt_chk_qfull_thresh_hold(struct scsi_qla_host *vha, struct qla_qpair *qpair,
++ 	struct atio_from_isp *atio, uint8_t ha_locked)
++ {
++ 	struct qla_hw_data *ha = vha->hw;
++ 	uint16_t status;
++ 	unsigned long flags;
++ 
++ 	if (ha->tgt.num_pend_cmds < Q_FULL_THRESH_HOLD(ha))
++ 		return 0;
++ 
++ 	if (!ha_locked)
++ 		spin_lock_irqsave(&ha->hardware_lock, flags);
++ 	status = temp_sam_status;
++ 	qlt_send_busy(qpair, atio, status);
++ 	if (!ha_locked)
++ 		spin_unlock_irqrestore(&ha->hardware_lock, flags);
++ 
++ 	return 1;
+++>>>>>>> 8abfa9e22683 (scsi: qla2xxx: Add function call to qpair for door bell)
+  }
+  
+  /* ha->hardware_lock supposed to be held on entry */
+diff --cc drivers/scsi/qla2xxx/qla_target.h
+index b33e411f28a0,30a389445de4..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.h
++++ b/drivers/scsi/qla2xxx/qla_target.h
+@@@ -1006,5 -1093,13 +1006,16 @@@ extern void qlt_stop_phase1(struct qla_
+  extern void qlt_stop_phase2(struct qla_tgt *);
+  extern irqreturn_t qla83xx_msix_atio_q(int, void *);
+  extern void qlt_83xx_iospace_config(struct qla_hw_data *);
+++<<<<<<< HEAD
+++=======
++ extern int qlt_free_qfull_cmds(struct qla_qpair *);
++ extern void qlt_logo_completion_handler(fc_port_t *, int);
++ extern void qlt_do_generation_tick(struct scsi_qla_host *, int *);
++ 
++ void qlt_send_resp_ctio(struct qla_qpair *, struct qla_tgt_cmd *, uint8_t,
++     uint8_t, uint8_t, uint8_t);
++ extern void qlt_abort_cmd_on_host_reset(struct scsi_qla_host *,
++     struct qla_tgt_cmd *);
+++>>>>>>> 8abfa9e22683 (scsi: qla2xxx: Add function call to qpair for door bell)
+  
+  #endif /* __QLA_TARGET_H */
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 3f28536dc812..f8524be8abfb 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -2911,6 +2911,9 @@ struct qla_qpair {
+ 
+ 	mempool_t *srb_mempool;
+ 
++	struct pci_dev  *pdev;
++	void (*reqq_start_iocbs)(struct qla_qpair *);
++
+ 	/* to do: New driver: move queues to here instead of pointers */
+ 	struct req_que *req;
+ 	struct rsp_que *rsp;
+diff --git a/drivers/scsi/qla2xxx/qla_init.c b/drivers/scsi/qla2xxx/qla_init.c
+index b9189cae77e5..76fcb3f93bf5 100644
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@ -6685,6 +6685,9 @@ struct qla_qpair *qla2xxx_create_qpair(struct scsi_qla_host *vha,
+ 
+ 		qpair->msix->in_use = 1;
+ 		list_add_tail(&qpair->qp_list_elem, &vha->qp_list);
++		qpair->pdev = ha->pdev;
++		if (IS_QLA27XX(ha) || IS_QLA83XX(ha))
++			qpair->reqq_start_iocbs = qla_83xx_start_iocbs;
+ 
+ 		mutex_unlock(&ha->mq_lock);
+ 
+* Unmerged path drivers/scsi/qla2xxx/qla_inline.h
+* Unmerged path drivers/scsi/qla2xxx/qla_os.c
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
+* Unmerged path drivers/scsi/qla2xxx/qla_target.h
