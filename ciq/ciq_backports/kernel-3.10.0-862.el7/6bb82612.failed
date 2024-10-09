@@ -1,0 +1,860 @@
+target: Convert se_portal_group->tpg_lun_list[] to RCU hlist
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [target] Convert se_portal_group->tpg_lun_list to RCU hlist (Maurizio Lombardi) [1366062]
+Rebuild_FUZZ: 90.91%
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit 6bb826121be244a5a3c8bd8b7d45c47df18810b7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6bb82612.failed
+
+This patch converts the fixed size se_portal_group->tpg_lun_list[]
+to use modern RCU with hlist_head in order to support an arbitary
+number of se_lun ports per target endpoint.
+
+It includes dropping core_tpg_alloc_lun() from core_dev_add_lun(),
+and calling it directly from target_fabric_make_lun() to allocate
+a new se_lun.  And add a new target_fabric_port_release() configfs
+item callback to invoke kfree_rcu() to release memory during
+se_lun->lun_group shutdown.
+
+Also now that se_node_acl->lun_entry_hlist is using RCU, convert
+existing tpg_lun_lock to struct mutex so core_tpg_add_node_to_devs()
+can perform RCU updater logic without releasing ->tpg_lun_mutex.
+
+Also, drop core_tpg_clear_object_luns() and it's single consumer
+in iscsi-target, which is duplicating TPG LUN shutdown logic and
+is current code results in a NOP.
+
+Finally, sbp-target and xen-scsiback fabric driver conversions are
+included, which are required due to the non-standard way they use
+->tpg_lun_hlist.
+
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Sagi Grimberg <sagig@mellanox.com>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Chris Boot <bootc@bootc.net>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 6bb826121be244a5a3c8bd8b7d45c47df18810b7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_tpg.c
+#	drivers/xen/xen-scsiback.c
+#	include/target/target_core_base.h
+#	include/target/target_core_fabric.h
+diff --cc drivers/target/target_core_tpg.c
+index 0696de9553d3,13d34e22a3c4..000000000000
+--- a/drivers/target/target_core_tpg.c
++++ b/drivers/target/target_core_tpg.c
+@@@ -197,67 -156,63 +192,72 @@@ static int core_set_queue_depth_for_nod
+  	return 0;
+  }
+  
+ -static struct se_node_acl *target_alloc_node_acl(struct se_portal_group *tpg,
+ -		const unsigned char *initiatorname)
+++<<<<<<< HEAD
+ +void array_free(void *array, int n)
+  {
+ -	struct se_node_acl *acl;
+ -
+ -	acl = kzalloc(max(sizeof(*acl), tpg->se_tpg_tfo->node_acl_size),
+ -			GFP_KERNEL);
+ -	if (!acl)
+ -		return NULL;
+ -
+ -	INIT_LIST_HEAD(&acl->acl_list);
+ -	INIT_LIST_HEAD(&acl->acl_sess_list);
+ -	INIT_HLIST_HEAD(&acl->lun_entry_hlist);
+ -	kref_init(&acl->acl_kref);
+ -	init_completion(&acl->acl_free_comp);
+ -	spin_lock_init(&acl->nacl_sess_lock);
+ -	mutex_init(&acl->lun_entry_mutex);
+ -	atomic_set(&acl->acl_pr_ref_count, 0);
+ -	if (tpg->se_tpg_tfo->tpg_get_default_depth)
+ -		acl->queue_depth = tpg->se_tpg_tfo->tpg_get_default_depth(tpg);
+ -	else
+ -		acl->queue_depth = 1;
+ -	snprintf(acl->initiatorname, TRANSPORT_IQN_LEN, "%s", initiatorname);
+ -	acl->se_tpg = tpg;
+ -	acl->acl_index = scsi_get_new_index(SCSI_AUTH_INTR_INDEX);
+ -
+ -	tpg->se_tpg_tfo->set_default_node_attributes(acl);
+ +	void **a = array;
+ +	int i;
+  
+ -	if (core_set_queue_depth_for_node(tpg, acl) < 0)
+ -		goto out_free_acl;
+ +	for (i = 0; i < n; i++)
+ +		kfree(a[i]);
+ +	kfree(a);
+ +}
+  
+ -	return acl;
+ +static void *array_zalloc(int n, size_t size, gfp_t flags)
+ +{
+ +	void **a;
+ +	int i;
+  
+ -out_free_acl:
+ -	kfree(acl);
+ -	return NULL;
+ +	a = kzalloc(n * sizeof(void*), flags);
+ +	if (!a)
+ +		return NULL;
+ +	for (i = 0; i < n; i++) {
+ +		a[i] = kzalloc(size, flags);
+ +		if (!a[i]) {
+ +			array_free(a, n);
+ +			return NULL;
+ +		}
+ +	}
+ +	return a;
+  }
+  
+ -static void target_add_node_acl(struct se_node_acl *acl)
+ +/*      core_create_device_list_for_node():
+ + *
+ + *
+ + */
+ +static int core_create_device_list_for_node(struct se_node_acl *nacl)
+++=======
+++static struct se_node_acl *target_alloc_node_acl(struct se_portal_group *tpg,
+++		const unsigned char *initiatorname)
+++>>>>>>> 6bb826121be2 (target: Convert se_portal_group->tpg_lun_list[] to RCU hlist)
+  {
+ -	struct se_portal_group *tpg = acl->se_tpg;
+ -
+ -	spin_lock_irq(&tpg->acl_node_lock);
+ -	list_add_tail(&acl->acl_list, &tpg->acl_node_list);
+ -	tpg->num_node_acls++;
+ -	spin_unlock_irq(&tpg->acl_node_lock);
+ +	struct se_dev_entry *deve;
+ +	int i;
+ +
+ +	nacl->device_list = array_zalloc(TRANSPORT_MAX_LUNS_PER_TPG,
+ +			sizeof(struct se_dev_entry), GFP_KERNEL);
+ +	if (!nacl->device_list) {
+ +		pr_err("Unable to allocate memory for"
+ +			" struct se_node_acl->device_list\n");
+ +		return -ENOMEM;
+ +	}
+ +	for (i = 0; i < TRANSPORT_MAX_LUNS_PER_TPG; i++) {
+ +		deve = nacl->device_list[i];
+ +
+ +		atomic_set(&deve->ua_count, 0);
+ +		atomic_set(&deve->pr_ref_count, 0);
+ +		spin_lock_init(&deve->ua_lock);
+ +		INIT_LIST_HEAD(&deve->alua_port_list);
+ +		INIT_LIST_HEAD(&deve->ua_list);
+ +	}
+  
+ -	pr_debug("%s_TPG[%hu] - Added %s ACL with TCQ Depth: %d for %s"
+ -		" Initiator Node: %s\n",
+ -		tpg->se_tpg_tfo->get_fabric_name(),
+ -		tpg->se_tpg_tfo->tpg_get_tag(tpg),
+ -		acl->dynamic_node_acl ? "DYNAMIC" : "",
+ -		acl->queue_depth,
+ -		tpg->se_tpg_tfo->get_fabric_name(),
+ -		acl->initiatorname);
+ +	return 0;
+  }
+  
+ +/*	core_tpg_check_initiator_node_acl()
+ + *
+ + *
+ + */
+  struct se_node_acl *core_tpg_check_initiator_node_acl(
+  	struct se_portal_group *tpg,
+  	unsigned char *initiatorname)
+@@@ -329,38 -251,11 +329,41 @@@ void core_tpg_wait_for_nacl_pr_ref(stru
+  		cpu_relax();
+  }
+  
+++<<<<<<< HEAD
+ +void core_tpg_clear_object_luns(struct se_portal_group *tpg)
+ +{
+ +	int i;
+ +	struct se_lun *lun;
+ +
+ +	spin_lock(&tpg->tpg_lun_lock);
+ +	for (i = 0; i < TRANSPORT_MAX_LUNS_PER_TPG; i++) {
+ +		lun = tpg->tpg_lun_list[i];
+ +
+ +		if ((lun->lun_status != TRANSPORT_LUN_STATUS_ACTIVE) ||
+ +		    (lun->lun_se_dev == NULL))
+ +			continue;
+ +
+ +		spin_unlock(&tpg->tpg_lun_lock);
+ +		core_dev_del_lun(tpg, lun);
+ +		spin_lock(&tpg->tpg_lun_lock);
+ +	}
+ +	spin_unlock(&tpg->tpg_lun_lock);
+ +}
+ +EXPORT_SYMBOL(core_tpg_clear_object_luns);
+ +
+ +/*	core_tpg_add_initiator_node_acl():
+ + *
+ + *
+ + */
+++=======
+++>>>>>>> 6bb826121be2 (target: Convert se_portal_group->tpg_lun_list[] to RCU hlist)
+  struct se_node_acl *core_tpg_add_initiator_node_acl(
+  	struct se_portal_group *tpg,
+ -	const char *initiatorname)
+ +	struct se_node_acl *se_nacl,
+ +	const char *initiatorname,
+ +	u32 queue_depth)
+  {
+ -	struct se_node_acl *acl;
+ +	struct se_node_acl *acl = NULL;
+  
+  	spin_lock_irq(&tpg->acl_node_lock);
+  	acl = __core_tpg_get_initiator_node_acl(tpg, initiatorname);
+@@@ -672,38 -508,13 +675,43 @@@ static int core_tpg_setup_virtual_lun0(
+  }
+  
+  int core_tpg_register(
+ -	const struct target_core_fabric_ops *tfo,
+ +	struct target_core_fabric_ops *tfo,
+  	struct se_wwn *se_wwn,
+  	struct se_portal_group *se_tpg,
+ -	int proto_id)
+ +	void *tpg_fabric_ptr,
+ +	int se_tpg_type)
+  {
+++<<<<<<< HEAD
+ +	struct se_lun *lun;
+ +	u32 i;
+ +
+ +	se_tpg->tpg_lun_list = array_zalloc(TRANSPORT_MAX_LUNS_PER_TPG,
+ +			sizeof(struct se_lun), GFP_KERNEL);
+ +	if (!se_tpg->tpg_lun_list) {
+ +		pr_err("Unable to allocate struct se_portal_group->"
+ +				"tpg_lun_list\n");
+ +		return -ENOMEM;
+ +	}
+ +
+ +	for (i = 0; i < TRANSPORT_MAX_LUNS_PER_TPG; i++) {
+ +		lun = se_tpg->tpg_lun_list[i];
+ +		lun->unpacked_lun = i;
+ +		lun->lun_link_magic = SE_LUN_LINK_MAGIC;
+ +		lun->lun_status = TRANSPORT_LUN_STATUS_FREE;
+ +		atomic_set(&lun->lun_acl_count, 0);
+ +		init_completion(&lun->lun_shutdown_comp);
+ +		INIT_LIST_HEAD(&lun->lun_acl_list);
+ +		spin_lock_init(&lun->lun_acl_lock);
+ +		spin_lock_init(&lun->lun_sep_lock);
+ +		init_completion(&lun->lun_ref_comp);
+ +	}
+ +
+ +	se_tpg->se_tpg_type = se_tpg_type;
+ +	se_tpg->se_tpg_fabric_ptr = tpg_fabric_ptr;
+++=======
++ 	INIT_HLIST_HEAD(&se_tpg->tpg_lun_hlist);
++ 	se_tpg->proto_id = proto_id;
+++>>>>>>> 6bb826121be2 (target: Convert se_portal_group->tpg_lun_list[] to RCU hlist)
+  	se_tpg->se_tpg_tfo = tfo;
+  	se_tpg->se_tpg_wwn = se_wwn;
+  	atomic_set(&se_tpg->tpg_pr_ref_count, 0);
+@@@ -712,14 -523,11 +720,18 @@@
+  	INIT_LIST_HEAD(&se_tpg->tpg_sess_list);
+  	spin_lock_init(&se_tpg->acl_node_lock);
+  	spin_lock_init(&se_tpg->session_lock);
+- 	spin_lock_init(&se_tpg->tpg_lun_lock);
++ 	mutex_init(&se_tpg->tpg_lun_mutex);
+  
+++<<<<<<< HEAD
+ +	if (se_tpg->se_tpg_type == TRANSPORT_TPG_TYPE_NORMAL) {
+ +		if (core_tpg_setup_virtual_lun0(se_tpg) < 0) {
+ +			array_free(se_tpg->tpg_lun_list,
+ +				   TRANSPORT_MAX_LUNS_PER_TPG);
+++=======
++ 	if (se_tpg->proto_id >= 0) {
++ 		if (core_tpg_setup_virtual_lun0(se_tpg) < 0)
+++>>>>>>> 6bb826121be2 (target: Convert se_portal_group->tpg_lun_list[] to RCU hlist)
+  			return -ENOMEM;
+- 		}
+  	}
+  
+  	spin_lock_bh(&tpg_lock);
+@@@ -773,11 -579,9 +785,14 @@@ int core_tpg_deregister(struct se_porta
+  	}
+  	spin_unlock_irq(&se_tpg->acl_node_lock);
+  
+ -	if (se_tpg->proto_id >= 0)
+ +	if (se_tpg->se_tpg_type == TRANSPORT_TPG_TYPE_NORMAL)
+  		core_tpg_remove_lun(se_tpg, &se_tpg->tpg_virt_lun0);
+  
+++<<<<<<< HEAD
+ +	se_tpg->se_tpg_fabric_ptr = NULL;
+ +	array_free(se_tpg->tpg_lun_list, TRANSPORT_MAX_LUNS_PER_TPG);
+++=======
+++>>>>>>> 6bb826121be2 (target: Convert se_portal_group->tpg_lun_list[] to RCU hlist)
+  	return 0;
+  }
+  EXPORT_SYMBOL(core_tpg_deregister);
+diff --cc include/target/target_core_base.h
+index 7bcf92529421,c15fa1a3b945..000000000000
+--- a/include/target/target_core_base.h
++++ b/include/target/target_core_base.h
+@@@ -878,9 -879,7 +880,13 @@@ struct se_portal_group 
+  	spinlock_t		acl_node_lock;
+  	/* Spinlock for adding/removing sessions */
+  	spinlock_t		session_lock;
+++<<<<<<< HEAD
+ +	spinlock_t		tpg_lun_lock;
+ +	/* Pointer to $FABRIC_MOD portal group */
+ +	void			*se_tpg_fabric_ptr;
+++=======
++ 	struct mutex		tpg_lun_mutex;
+++>>>>>>> 6bb826121be2 (target: Convert se_portal_group->tpg_lun_list[] to RCU hlist)
+  	struct list_head	se_tpg_node;
+  	/* linked list for initiator ACL list */
+  	struct list_head	acl_node_list;
+diff --cc include/target/target_core_fabric.h
+index c9a57a197803,b1e00a7d66de..000000000000
+--- a/include/target/target_core_fabric.h
++++ b/include/target/target_core_fabric.h
+@@@ -153,11 -157,6 +153,14 @@@ struct se_node_acl *core_tpg_get_initia
+  		unsigned char *);
+  struct se_node_acl *core_tpg_check_initiator_node_acl(struct se_portal_group *,
+  		unsigned char *);
+++<<<<<<< HEAD
+ +void	core_tpg_clear_object_luns(struct se_portal_group *);
+ +struct se_node_acl *core_tpg_add_initiator_node_acl(struct se_portal_group *,
+ +		struct se_node_acl *, const char *, u32);
+ +int	core_tpg_del_initiator_node_acl(struct se_portal_group *,
+ +		struct se_node_acl *, int);
+++=======
+++>>>>>>> 6bb826121be2 (target: Convert se_portal_group->tpg_lun_list[] to RCU hlist)
+  int	core_tpg_set_initiator_node_queue_depth(struct se_portal_group *,
+  		unsigned char *, u32, int);
+  int	core_tpg_set_initiator_node_tag(struct se_portal_group *,
+* Unmerged path drivers/xen/xen-scsiback.c
+diff --git a/drivers/target/iscsi/iscsi_target_tpg.c b/drivers/target/iscsi/iscsi_target_tpg.c
+index 7005d3d54fdd..8d3cd2dd3c76 100644
+--- a/drivers/target/iscsi/iscsi_target_tpg.c
++++ b/drivers/target/iscsi/iscsi_target_tpg.c
+@@ -282,8 +282,6 @@ int iscsit_tpg_del_portal_group(
+ 		return -EPERM;
+ 	}
+ 
+-	core_tpg_clear_object_luns(&tpg->tpg_se_tpg);
+-
+ 	if (tpg->param_list) {
+ 		iscsi_release_param_list(tpg->param_list);
+ 		tpg->param_list = NULL;
+diff --git a/drivers/target/sbp/sbp_target.c b/drivers/target/sbp/sbp_target.c
+index b33c121ab56c..5b96c14b52d3 100644
+--- a/drivers/target/sbp/sbp_target.c
++++ b/drivers/target/sbp/sbp_target.c
+@@ -110,13 +110,13 @@ static struct sbp_session *sbp_session_find_by_guid(
+ }
+ 
+ static struct sbp_login_descriptor *sbp_login_find_by_lun(
+-		struct sbp_session *session, struct se_lun *lun)
++		struct sbp_session *session, u32 unpacked_lun)
+ {
+ 	struct sbp_login_descriptor *login, *found = NULL;
+ 
+ 	spin_lock_bh(&session->lock);
+ 	list_for_each_entry(login, &session->login_list, link) {
+-		if (login->lun == lun)
++		if (login->login_lun == unpacked_lun)
+ 			found = login;
+ 	}
+ 	spin_unlock_bh(&session->lock);
+@@ -126,7 +126,7 @@ static struct sbp_login_descriptor *sbp_login_find_by_lun(
+ 
+ static int sbp_login_count_all_by_lun(
+ 		struct sbp_tpg *tpg,
+-		struct se_lun *lun,
++		u32 unpacked_lun,
+ 		int exclusive)
+ {
+ 	struct se_session *se_sess;
+@@ -140,7 +140,7 @@ static int sbp_login_count_all_by_lun(
+ 
+ 		spin_lock_bh(&sess->lock);
+ 		list_for_each_entry(login, &sess->login_list, link) {
+-			if (login->lun != lun)
++			if (login->login_lun != unpacked_lun)
+ 				continue;
+ 
+ 			if (!exclusive || login->exclusive)
+@@ -176,23 +176,23 @@ static struct sbp_login_descriptor *sbp_login_find_by_id(
+ 	return found;
+ }
+ 
+-static struct se_lun *sbp_get_lun_from_tpg(struct sbp_tpg *tpg, int lun)
++static u32 sbp_get_lun_from_tpg(struct sbp_tpg *tpg, u32 login_lun, int *err)
+ {
+ 	struct se_portal_group *se_tpg = &tpg->se_tpg;
+ 	struct se_lun *se_lun;
+ 
+-	if (lun >= TRANSPORT_MAX_LUNS_PER_TPG)
+-		return ERR_PTR(-EINVAL);
+-
+-	spin_lock(&se_tpg->tpg_lun_lock);
+-	se_lun = se_tpg->tpg_lun_list[lun];
+-
+-	if (se_lun->lun_status != TRANSPORT_LUN_STATUS_ACTIVE)
+-		se_lun = ERR_PTR(-ENODEV);
+-
+-	spin_unlock(&se_tpg->tpg_lun_lock);
++	rcu_read_lock();
++	hlist_for_each_entry_rcu(se_lun, &se_tpg->tpg_lun_hlist, link) {
++		if (se_lun->unpacked_lun == login_lun) {
++			rcu_read_unlock();
++			*err = 0;
++			return login_lun;
++		}
++	}
++	rcu_read_unlock();
+ 
+-	return se_lun;
++	*err = -ENODEV;
++	return login_lun;
+ }
+ 
+ static struct sbp_session *sbp_session_create(
+@@ -296,17 +296,16 @@ static void sbp_management_request_login(
+ {
+ 	struct sbp_tport *tport = agent->tport;
+ 	struct sbp_tpg *tpg = tport->tpg;
+-	struct se_lun *se_lun;
+-	int ret;
+-	u64 guid;
+ 	struct sbp_session *sess;
+ 	struct sbp_login_descriptor *login;
+ 	struct sbp_login_response_block *response;
+-	int login_response_len;
++	u64 guid;
++	u32 unpacked_lun;
++	int login_response_len, ret;
+ 
+-	se_lun = sbp_get_lun_from_tpg(tpg,
+-			LOGIN_ORB_LUN(be32_to_cpu(req->orb.misc)));
+-	if (IS_ERR(se_lun)) {
++	unpacked_lun = sbp_get_lun_from_tpg(tpg,
++			LOGIN_ORB_LUN(be32_to_cpu(req->orb.misc)), &ret);
++	if (ret) {
+ 		pr_notice("login to unknown LUN: %d\n",
+ 			LOGIN_ORB_LUN(be32_to_cpu(req->orb.misc)));
+ 
+@@ -327,11 +326,11 @@ static void sbp_management_request_login(
+ 	}
+ 
+ 	pr_notice("mgt_agent LOGIN to LUN %d from %016llx\n",
+-		se_lun->unpacked_lun, guid);
++		unpacked_lun, guid);
+ 
+ 	sess = sbp_session_find_by_guid(tpg, guid);
+ 	if (sess) {
+-		login = sbp_login_find_by_lun(sess, se_lun);
++		login = sbp_login_find_by_lun(sess, unpacked_lun);
+ 		if (login) {
+ 			pr_notice("initiator already logged-in\n");
+ 
+@@ -359,7 +358,7 @@ static void sbp_management_request_login(
+ 	 * reject with access_denied if any logins present
+ 	 */
+ 	if (LOGIN_ORB_EXCLUSIVE(be32_to_cpu(req->orb.misc)) &&
+-			sbp_login_count_all_by_lun(tpg, se_lun, 0)) {
++			sbp_login_count_all_by_lun(tpg, unpacked_lun, 0)) {
+ 		pr_warn("refusing exclusive login with other active logins\n");
+ 
+ 		req->status.status = cpu_to_be32(
+@@ -372,7 +371,7 @@ static void sbp_management_request_login(
+ 	 * check exclusive bit in any existing login descriptor
+ 	 * reject with access_denied if any exclusive logins present
+ 	 */
+-	if (sbp_login_count_all_by_lun(tpg, se_lun, 1)) {
++	if (sbp_login_count_all_by_lun(tpg, unpacked_lun, 1)) {
+ 		pr_warn("refusing login while another exclusive login present\n");
+ 
+ 		req->status.status = cpu_to_be32(
+@@ -385,7 +384,7 @@ static void sbp_management_request_login(
+ 	 * check we haven't exceeded the number of allowed logins
+ 	 * reject with resources_unavailable if we have
+ 	 */
+-	if (sbp_login_count_all_by_lun(tpg, se_lun, 0) >=
++	if (sbp_login_count_all_by_lun(tpg, unpacked_lun, 0) >=
+ 			tport->max_logins_per_lun) {
+ 		pr_warn("max number of logins reached\n");
+ 
+@@ -441,7 +440,7 @@ static void sbp_management_request_login(
+ 	}
+ 
+ 	login->sess = sess;
+-	login->lun = se_lun;
++	login->login_lun = unpacked_lun;
+ 	login->status_fifo_addr = sbp2_pointer_to_addr(&req->orb.status_fifo);
+ 	login->exclusive = LOGIN_ORB_EXCLUSIVE(be32_to_cpu(req->orb.misc));
+ 	login->login_id = atomic_inc_return(&login_id);
+@@ -603,7 +602,7 @@ static void sbp_management_request_logout(
+ 	}
+ 
+ 	pr_info("mgt_agent LOGOUT from LUN %d session %d\n",
+-		login->lun->unpacked_lun, login->login_id);
++		login->login_lun, login->login_id);
+ 
+ 	if (req->node_addr != login->sess->node_id) {
+ 		pr_warn("logout from different node ID\n");
+@@ -1229,7 +1228,7 @@ static void sbp_handle_command(struct sbp_target_request *req)
+ 		goto err;
+ 	}
+ 
+-	unpacked_lun = req->login->lun->unpacked_lun;
++	unpacked_lun = req->login->login_lun;
+ 	sbp_calc_data_length_direction(req, &data_length, &data_dir);
+ 
+ 	pr_debug("sbp_handle_command ORB:0x%llx unpacked_lun:%d data_len:%d data_dir:%d\n",
+@@ -1931,25 +1930,21 @@ static char *sbp_parse_pr_out_transport_id(
+ 
+ static int sbp_count_se_tpg_luns(struct se_portal_group *tpg)
+ {
+-	int i, count = 0;
+-
+-	spin_lock(&tpg->tpg_lun_lock);
+-	for (i = 0; i < TRANSPORT_MAX_LUNS_PER_TPG; i++) {
+-		struct se_lun *se_lun = tpg->tpg_lun_list[i];
+-
+-		if (se_lun->lun_status == TRANSPORT_LUN_STATUS_FREE)
+-			continue;
++	struct se_lun *lun;
++	int count = 0;
+ 
++	rcu_read_lock();
++	hlist_for_each_entry_rcu(lun, &tpg->tpg_lun_hlist, link)
+ 		count++;
+-	}
+-	spin_unlock(&tpg->tpg_lun_lock);
++	rcu_read_unlock();
+ 
+ 	return count;
+ }
+ 
+ static int sbp_update_unit_directory(struct sbp_tport *tport)
+ {
+-	int num_luns, num_entries, idx = 0, mgt_agt_addr, ret, i;
++	struct se_lun *lun;
++	int num_luns, num_entries, idx = 0, mgt_agt_addr, ret;
+ 	u32 *data;
+ 
+ 	if (tport->unit_directory.data) {
+@@ -2011,28 +2006,20 @@ static int sbp_update_unit_directory(struct sbp_tport *tport)
+ 	/* unit unique ID (leaf is just after LUNs) */
+ 	data[idx++] = 0x8d000000 | (num_luns + 1);
+ 
+-	spin_lock(&tport->tpg->se_tpg.tpg_lun_lock);
+-	for (i = 0; i < TRANSPORT_MAX_LUNS_PER_TPG; i++) {
+-		struct se_lun *se_lun = tport->tpg->se_tpg.tpg_lun_list[i];
++	rcu_read_lock();
++	hlist_for_each_entry_rcu(lun, &tport->tpg->se_tpg.tpg_lun_hlist, link) {
+ 		struct se_device *dev;
+ 		int type;
+ 
+-		if (se_lun->lun_status == TRANSPORT_LUN_STATUS_FREE)
+-			continue;
+-
+-		spin_unlock(&tport->tpg->se_tpg.tpg_lun_lock);
+-
+-		dev = se_lun->lun_se_dev;
++		dev = lun->lun_se_dev;
+ 		type = dev->transport->get_device_type(dev);
+ 
+ 		/* logical_unit_number */
+ 		data[idx++] = 0x14000000 |
+ 			((type << 16) & 0x1f0000) |
+-			(se_lun->unpacked_lun & 0xffff);
+-
+-		spin_lock(&tport->tpg->se_tpg.tpg_lun_lock);
++			(lun->unpacked_lun & 0xffff);
+ 	}
+-	spin_unlock(&tport->tpg->se_tpg.tpg_lun_lock);
++	rcu_read_unlock();
+ 
+ 	/* unit unique ID leaf */
+ 	data[idx++] = 2 << 16;
+diff --git a/drivers/target/sbp/sbp_target.h b/drivers/target/sbp/sbp_target.h
+index e1b0b84f7379..73bcb1208832 100644
+--- a/drivers/target/sbp/sbp_target.h
++++ b/drivers/target/sbp/sbp_target.h
+@@ -125,7 +125,7 @@ struct sbp_login_descriptor {
+ 	struct sbp_session *sess;
+ 	struct list_head link;
+ 
+-	struct se_lun *lun;
++	u32 login_lun;
+ 
+ 	u64 status_fifo_addr;
+ 	int exclusive;
+diff --git a/drivers/target/target_core_device.c b/drivers/target/target_core_device.c
+index 53dcefb982bc..85e3babf6fc7 100644
+--- a/drivers/target/target_core_device.c
++++ b/drivers/target/target_core_device.c
+@@ -1183,22 +1183,17 @@ int se_dev_set_block_size(struct se_device *dev, u32 block_size)
+ }
+ EXPORT_SYMBOL(se_dev_set_block_size);
+ 
+-struct se_lun *core_dev_add_lun(
++int core_dev_add_lun(
+ 	struct se_portal_group *tpg,
+ 	struct se_device *dev,
+-	u32 unpacked_lun)
++	struct se_lun *lun)
+ {
+-	struct se_lun *lun;
+ 	int rc;
+ 
+-	lun = core_tpg_alloc_lun(tpg, unpacked_lun);
+-	if (IS_ERR(lun))
+-		return lun;
+-
+ 	rc = core_tpg_add_lun(tpg, lun,
+ 				TRANSPORT_LUNFLAGS_READ_WRITE, dev);
+ 	if (rc < 0)
+-		return ERR_PTR(rc);
++		return rc;
+ 
+ 	pr_debug("%s_TPG[%u]_LUN[%u] - Activated %s Logical Unit from"
+ 		" CORE HBA: %u\n", tpg->se_tpg_tfo->get_fabric_name(),
+@@ -1223,7 +1218,7 @@ struct se_lun *core_dev_add_lun(
+ 		spin_unlock_irq(&tpg->acl_node_lock);
+ 	}
+ 
+-	return lun;
++	return 0;
+ }
+ 
+ /*      core_dev_del_lun():
+@@ -1242,68 +1237,6 @@ void core_dev_del_lun(
+ 	core_tpg_remove_lun(tpg, lun);
+ }
+ 
+-struct se_lun *core_get_lun_from_tpg(struct se_portal_group *tpg, u32 unpacked_lun)
+-{
+-	struct se_lun *lun;
+-
+-	spin_lock(&tpg->tpg_lun_lock);
+-	if (unpacked_lun > (TRANSPORT_MAX_LUNS_PER_TPG-1)) {
+-		pr_err("%s LUN: %u exceeds TRANSPORT_MAX_LUNS"
+-			"_PER_TPG-1: %u for Target Portal Group: %hu\n",
+-			tpg->se_tpg_tfo->get_fabric_name(), unpacked_lun,
+-			TRANSPORT_MAX_LUNS_PER_TPG-1,
+-			tpg->se_tpg_tfo->tpg_get_tag(tpg));
+-		spin_unlock(&tpg->tpg_lun_lock);
+-		return NULL;
+-	}
+-	lun = tpg->tpg_lun_list[unpacked_lun];
+-
+-	if (lun->lun_status != TRANSPORT_LUN_STATUS_FREE) {
+-		pr_err("%s Logical Unit Number: %u is not free on"
+-			" Target Portal Group: %hu, ignoring request.\n",
+-			tpg->se_tpg_tfo->get_fabric_name(), unpacked_lun,
+-			tpg->se_tpg_tfo->tpg_get_tag(tpg));
+-		spin_unlock(&tpg->tpg_lun_lock);
+-		return NULL;
+-	}
+-	spin_unlock(&tpg->tpg_lun_lock);
+-
+-	return lun;
+-}
+-
+-/*      core_dev_get_lun():
+- *
+- *
+- */
+-static struct se_lun *core_dev_get_lun(struct se_portal_group *tpg, u32 unpacked_lun)
+-{
+-	struct se_lun *lun;
+-
+-	spin_lock(&tpg->tpg_lun_lock);
+-	if (unpacked_lun > (TRANSPORT_MAX_LUNS_PER_TPG-1)) {
+-		pr_err("%s LUN: %u exceeds TRANSPORT_MAX_LUNS_PER"
+-			"_TPG-1: %u for Target Portal Group: %hu\n",
+-			tpg->se_tpg_tfo->get_fabric_name(), unpacked_lun,
+-			TRANSPORT_MAX_LUNS_PER_TPG-1,
+-			tpg->se_tpg_tfo->tpg_get_tag(tpg));
+-		spin_unlock(&tpg->tpg_lun_lock);
+-		return NULL;
+-	}
+-	lun = tpg->tpg_lun_list[unpacked_lun];
+-
+-	if (lun->lun_status != TRANSPORT_LUN_STATUS_ACTIVE) {
+-		pr_err("%s Logical Unit Number: %u is not active on"
+-			" Target Portal Group: %hu, ignoring request.\n",
+-			tpg->se_tpg_tfo->get_fabric_name(), unpacked_lun,
+-			tpg->se_tpg_tfo->tpg_get_tag(tpg));
+-		spin_unlock(&tpg->tpg_lun_lock);
+-		return NULL;
+-	}
+-	spin_unlock(&tpg->tpg_lun_lock);
+-
+-	return lun;
+-}
+-
+ struct se_lun_acl *core_dev_init_initiator_node_lun_acl(
+ 	struct se_portal_group *tpg,
+ 	struct se_node_acl *nacl,
+@@ -1337,22 +1270,11 @@ struct se_lun_acl *core_dev_init_initiator_node_lun_acl(
+ int core_dev_add_initiator_node_lun_acl(
+ 	struct se_portal_group *tpg,
+ 	struct se_lun_acl *lacl,
+-	u32 unpacked_lun,
++	struct se_lun *lun,
+ 	u32 lun_access)
+ {
+-	struct se_lun *lun;
+-	struct se_node_acl *nacl;
++	struct se_node_acl *nacl = lacl->se_lun_nacl;
+ 
+-	lun = core_dev_get_lun(tpg, unpacked_lun);
+-	if (!lun) {
+-		pr_err("%s Logical Unit Number: %u is not active on"
+-			" Target Portal Group: %hu, ignoring request.\n",
+-			tpg->se_tpg_tfo->get_fabric_name(), unpacked_lun,
+-			tpg->se_tpg_tfo->tpg_get_tag(tpg));
+-		return -EINVAL;
+-	}
+-
+-	nacl = lacl->se_lun_nacl;
+ 	if (!nacl)
+ 		return -EINVAL;
+ 
+@@ -1373,7 +1295,7 @@ int core_dev_add_initiator_node_lun_acl(
+ 
+ 	pr_debug("%s_TPG[%hu]_LUN[%u->%u] - Added %s ACL for "
+ 		" InitiatorNode: %s\n", tpg->se_tpg_tfo->get_fabric_name(),
+-		tpg->se_tpg_tfo->tpg_get_tag(tpg), unpacked_lun, lacl->mapped_lun,
++		tpg->se_tpg_tfo->tpg_get_tag(tpg), lun->unpacked_lun, lacl->mapped_lun,
+ 		(lun_access & TRANSPORT_LUNFLAGS_READ_WRITE) ? "RW" : "RO",
+ 		lacl->initiatorname);
+ 	/*
+diff --git a/drivers/target/target_core_fabric_configfs.c b/drivers/target/target_core_fabric_configfs.c
+index 0c3f90130b7d..6893160e5f4a 100644
+--- a/drivers/target/target_core_fabric_configfs.c
++++ b/drivers/target/target_core_fabric_configfs.c
+@@ -69,7 +69,7 @@ static int target_fabric_mappedlun_link(
+ 			struct se_lun_acl, se_lun_group);
+ 	struct se_portal_group *se_tpg;
+ 	struct config_item *nacl_ci, *tpg_ci, *tpg_ci_s, *wwn_ci, *wwn_ci_s;
+-	int ret = 0, lun_access;
++	int lun_access;
+ 
+ 	if (lun->lun_link_magic != SE_LUN_LINK_MAGIC) {
+ 		pr_err("Bad lun->lun_link_magic, not a valid lun_ci pointer:"
+@@ -125,12 +125,9 @@ static int target_fabric_mappedlun_link(
+ 	 * Determine the actual mapped LUN value user wants..
+ 	 *
+ 	 * This value is what the SCSI Initiator actually sees the
+-	 * iscsi/$IQN/$TPGT/lun/lun_* as on their SCSI Initiator Ports.
++	 * $FABRIC/$WWPN/$TPGT/lun/lun_* as on their SCSI Initiator Ports.
+ 	 */
+-	ret = core_dev_add_initiator_node_lun_acl(se_tpg, lacl,
+-			lun->unpacked_lun, lun_access);
+-
+-	return (ret < 0) ? -EINVAL : 0;
++	return core_dev_add_initiator_node_lun_acl(se_tpg, lacl, lun, lun_access);
+ }
+ 
+ static int target_fabric_mappedlun_unlink(
+@@ -755,7 +752,6 @@ static int target_fabric_port_link(
+ 	struct config_item *tpg_ci;
+ 	struct se_lun *lun = container_of(to_config_group(lun_ci),
+ 				struct se_lun, lun_group);
+-	struct se_lun *lun_p;
+ 	struct se_portal_group *se_tpg;
+ 	struct se_device *dev =
+ 		container_of(to_config_group(se_dev_ci), struct se_device, dev_group);
+@@ -783,10 +779,9 @@ static int target_fabric_port_link(
+ 		return -EEXIST;
+ 	}
+ 
+-	lun_p = core_dev_add_lun(se_tpg, dev, lun->unpacked_lun);
+-	if (IS_ERR(lun_p)) {
+-		pr_err("core_dev_add_lun() failed\n");
+-		ret = PTR_ERR(lun_p);
++	ret = core_dev_add_lun(se_tpg, dev, lun);
++	if (ret) {
++		pr_err("core_dev_add_lun() failed: %d\n", ret);
+ 		goto out;
+ 	}
+ 
+@@ -826,9 +821,18 @@ static int target_fabric_port_unlink(
+ 	return 0;
+ }
+ 
++static void target_fabric_port_release(struct config_item *item)
++{
++	struct se_lun *lun = container_of(to_config_group(item),
++					  struct se_lun, lun_group);
++
++	kfree_rcu(lun, rcu_head);
++}
++
+ static struct configfs_item_operations target_fabric_port_item_ops = {
+ 	.show_attribute		= target_fabric_port_attr_show,
+ 	.store_attribute	= target_fabric_port_attr_store,
++	.release		= target_fabric_port_release,
+ 	.allow_link		= target_fabric_port_link,
+ 	.drop_link		= target_fabric_port_unlink,
+ };
+@@ -887,15 +891,16 @@ static struct config_group *target_fabric_make_lun(
+ 	if (unpacked_lun > UINT_MAX)
+ 		return ERR_PTR(-EINVAL);
+ 
+-	lun = core_get_lun_from_tpg(se_tpg, unpacked_lun);
+-	if (!lun)
+-		return ERR_PTR(-EINVAL);
++	lun = core_tpg_alloc_lun(se_tpg, unpacked_lun);
++	if (IS_ERR(lun))
++		return ERR_CAST(lun);
+ 
+ 	lun_cg = &lun->lun_group;
+ 	lun_cg->default_groups = kmalloc(sizeof(struct config_group *) * 2,
+ 				GFP_KERNEL);
+ 	if (!lun_cg->default_groups) {
+ 		pr_err("Unable to allocate lun_cg->default_groups\n");
++		kfree(lun);
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+ 
+@@ -912,6 +917,7 @@ static struct config_group *target_fabric_make_lun(
+ 	if (!port_stat_grp->default_groups) {
+ 		pr_err("Unable to allocate port_stat_grp->default_groups\n");
+ 		kfree(lun_cg->default_groups);
++		kfree(lun);
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+ 	target_stat_setup_port_default_groups(lun);
+diff --git a/drivers/target/target_core_internal.h b/drivers/target/target_core_internal.h
+index 874a9bc988d8..352da61820cf 100644
+--- a/drivers/target/target_core_internal.h
++++ b/drivers/target/target_core_internal.h
+@@ -24,13 +24,13 @@ int	core_dev_export(struct se_device *, struct se_portal_group *,
+ 		struct se_lun *);
+ void	core_dev_unexport(struct se_device *, struct se_portal_group *,
+ 		struct se_lun *);
+-struct se_lun *core_dev_add_lun(struct se_portal_group *, struct se_device *, u32);
++int	core_dev_add_lun(struct se_portal_group *, struct se_device *,
++		struct se_lun *lun);
+ void	core_dev_del_lun(struct se_portal_group *, struct se_lun *);
+-struct se_lun *core_get_lun_from_tpg(struct se_portal_group *, u32);
+ struct se_lun_acl *core_dev_init_initiator_node_lun_acl(struct se_portal_group *,
+ 		struct se_node_acl *, u32, int *);
+ int	core_dev_add_initiator_node_lun_acl(struct se_portal_group *,
+-		struct se_lun_acl *, u32, u32);
++		struct se_lun_acl *, struct se_lun *lun, u32);
+ int	core_dev_del_initiator_node_lun_acl(struct se_portal_group *,
+ 		struct se_lun *, struct se_lun_acl *);
+ void	core_dev_free_initiator_node_lun_acl(struct se_portal_group *,
+* Unmerged path drivers/target/target_core_tpg.c
+* Unmerged path drivers/xen/xen-scsiback.c
+* Unmerged path include/target/target_core_base.h
+* Unmerged path include/target/target_core_fabric.h
