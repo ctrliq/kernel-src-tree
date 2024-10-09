@@ -1,0 +1,153 @@
+nvme: Complete all stuck requests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Keith Busch <keith.busch@intel.com>
+commit 302ad8cc09339ea261eef58a8d5f4a116a8ffda5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/302ad8cc.failed
+
+If the nvme driver is shutting down its controller, the drievr will not
+start the queues up again, preventing blk-mq's hot CPU notifier from
+making forward progress.
+
+To fix that, this patch starts a request_queue freeze when the driver
+resets a controller so no new requests may enter. The driver will wait
+for frozen after IO queues are restarted to ensure the queue reference
+can be reinitialized when nvme requests to unfreeze the queues.
+
+If the driver is doing a safe shutdown, the driver will wait for the
+controller to successfully complete all inflight requests so that we
+don't unnecessarily fail them. Once the controller has been disabled,
+the queues will be restarted to force remaining entered requests to end
+in failure so that blk-mq's hot cpu notifier may progress.
+
+	Signed-off-by: Keith Busch <keith.busch@intel.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Jens Axboe <axboe@fb.com>
+(cherry picked from commit 302ad8cc09339ea261eef58a8d5f4a116a8ffda5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/pci.c
+index f32ea6cfb9f0,26a5fd05fe88..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -1740,8 -1715,16 +1753,21 @@@ static void nvme_dev_disable(struct nvm
+  	}
+  	nvme_pci_disable(dev);
+  
+++<<<<<<< HEAD
+ +	for (i = dev->queue_count - 1; i >= 0; i--)
+ +		nvme_clear_queue(dev->queues[i]);
+++=======
++ 	blk_mq_tagset_busy_iter(&dev->tagset, nvme_cancel_request, &dev->ctrl);
++ 	blk_mq_tagset_busy_iter(&dev->admin_tagset, nvme_cancel_request, &dev->ctrl);
++ 
++ 	/*
++ 	 * The driver will not be starting up queues again if shutting down so
++ 	 * must flush all entered requests to their failed completion to avoid
++ 	 * deadlocking blk-mq hot-cpu notifier.
++ 	 */
++ 	if (shutdown)
++ 		nvme_start_queues(&dev->ctrl);
+++>>>>>>> 302ad8cc0933 (nvme: Complete all stuck requests)
+  	mutex_unlock(&dev->shutdown_lock);
+  }
+  
+@@@ -1855,10 -1847,18 +1881,12 @@@ static void nvme_reset_work(struct work
+  		nvme_remove_namespaces(&dev->ctrl);
+  	} else {
+  		nvme_start_queues(&dev->ctrl);
++ 		nvme_wait_freeze(&dev->ctrl);
+  		nvme_dev_add(dev);
++ 		nvme_unfreeze(&dev->ctrl);
+  	}
+  
+ -	if (!nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_LIVE)) {
+ -		dev_warn(dev->ctrl.device, "failed to mark controller live\n");
+ -		goto out;
+ -	}
+ -
+ -	if (dev->online_queues > 1)
+ -		nvme_queue_scan(&dev->ctrl);
+ +	clear_bit(NVME_CTRL_RESETTING, &dev->flags);
+  	return;
+  
+   out:
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index 0588703d149f..73d52a5a6f44 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -1529,6 +1529,53 @@ void nvme_kill_queues(struct nvme_ctrl *ctrl)
+ 	rcu_read_unlock();
+ }
+ 
++void nvme_unfreeze(struct nvme_ctrl *ctrl)
++{
++	struct nvme_ns *ns;
++
++	mutex_lock(&ctrl->namespaces_mutex);
++	list_for_each_entry(ns, &ctrl->namespaces, list)
++		blk_mq_unfreeze_queue(ns->queue);
++	mutex_unlock(&ctrl->namespaces_mutex);
++}
++EXPORT_SYMBOL_GPL(nvme_unfreeze);
++
++void nvme_wait_freeze_timeout(struct nvme_ctrl *ctrl, long timeout)
++{
++	struct nvme_ns *ns;
++
++	mutex_lock(&ctrl->namespaces_mutex);
++	list_for_each_entry(ns, &ctrl->namespaces, list) {
++		timeout = blk_mq_freeze_queue_wait_timeout(ns->queue, timeout);
++		if (timeout <= 0)
++			break;
++	}
++	mutex_unlock(&ctrl->namespaces_mutex);
++}
++EXPORT_SYMBOL_GPL(nvme_wait_freeze_timeout);
++
++void nvme_wait_freeze(struct nvme_ctrl *ctrl)
++{
++	struct nvme_ns *ns;
++
++	mutex_lock(&ctrl->namespaces_mutex);
++	list_for_each_entry(ns, &ctrl->namespaces, list)
++		blk_mq_freeze_queue_wait(ns->queue);
++	mutex_unlock(&ctrl->namespaces_mutex);
++}
++EXPORT_SYMBOL_GPL(nvme_wait_freeze);
++
++void nvme_start_freeze(struct nvme_ctrl *ctrl)
++{
++	struct nvme_ns *ns;
++
++	mutex_lock(&ctrl->namespaces_mutex);
++	list_for_each_entry(ns, &ctrl->namespaces, list)
++		blk_mq_freeze_queue_start(ns->queue);
++	mutex_unlock(&ctrl->namespaces_mutex);
++}
++EXPORT_SYMBOL_GPL(nvme_start_freeze);
++
+ void nvme_stop_queues(struct nvme_ctrl *ctrl)
+ {
+ 	struct nvme_ns *ns;
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index ddd7fc3f3881..940ccba3ba9c 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -244,6 +244,10 @@ void nvme_remove_namespaces(struct nvme_ctrl *ctrl);
+ void nvme_stop_queues(struct nvme_ctrl *ctrl);
+ void nvme_start_queues(struct nvme_ctrl *ctrl);
+ void nvme_kill_queues(struct nvme_ctrl *ctrl);
++void nvme_unfreeze(struct nvme_ctrl *ctrl);
++void nvme_wait_freeze(struct nvme_ctrl *ctrl);
++void nvme_wait_freeze_timeout(struct nvme_ctrl *ctrl, long timeout);
++void nvme_start_freeze(struct nvme_ctrl *ctrl);
+ 
+ struct request *nvme_alloc_request(struct request_queue *q,
+ 		struct nvme_command *cmd, unsigned int flags);
+* Unmerged path drivers/nvme/host/pci.c
