@@ -1049,4 +1049,6 @@ void ixgbe_sriov_reinit(struct ixgbe_adapter *adapter);
 
 u32 ixgbe_rss_indir_tbl_entries(struct ixgbe_adapter *adapter);
 void ixgbe_store_reta(struct ixgbe_adapter *adapter);
+s32 ixgbe_negotiate_fc(struct ixgbe_hw *hw, u32 adv_reg, u32 lp_reg,
+		       u32 adv_sym, u32 adv_asm, u32 lp_sym, u32 lp_asm);
 #endif /* _IXGBE_H_ */
