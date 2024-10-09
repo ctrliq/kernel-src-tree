@@ -1,0 +1,101 @@
+vhost: fix skb leak in handle_rx()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [vhost] fix skb leak in handle_rx() (Wei Xu) [1465912]
+Rebuild_FUZZ: 88.52%
+commit-author Wei Xu <wexu@redhat.com>
+commit 6e474083f3daf3a3546737f5d7d502ad12eb257c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/6e474083.failed
+
+Matthew found a roughly 40% tcp throughput regression with commit
+c67df11f(vhost_net: try batch dequing from skb array) as discussed
+in the following thread:
+https://www.mail-archive.com/netdev@vger.kernel.org/msg187936.html
+
+Eventually we figured out that it was a skb leak in handle_rx()
+when sending packets to the VM. This usually happens when a guest
+can not drain out vq as fast as vhost fills in, afterwards it sets
+off the traffic jam and leaks skb(s) which occurs as no headcount
+to send on the vq from vhost side.
+
+This can be avoided by making sure we have got enough headcount
+before actually consuming a skb from the batched rx array while
+transmitting, which is simply done by moving checking the zero
+headcount a bit ahead.
+
+	Signed-off-by: Wei Xu <wexu@redhat.com>
+	Reported-by: Matthew Rosato <mjrosato@linux.vnet.ibm.com>
+	Acked-by: Michael S. Tsirkin <mst@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6e474083f3daf3a3546737f5d7d502ad12eb257c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vhost/net.c
+diff --cc drivers/vhost/net.c
+index baf5b225a11a,c7bdeb655646..000000000000
+--- a/drivers/vhost/net.c
++++ b/drivers/vhost/net.c
+@@@ -720,15 -777,7 +720,19 @@@ static void handle_rx(struct vhost_net 
+  					likely(mergeable) ? UIO_MAXIOV : 1);
+  		/* On error, stop handling until the next kick. */
+  		if (unlikely(headcount < 0))
+++<<<<<<< HEAD
+ +			break;
+ +		/* On overrun, truncate and discard */
+ +		if (unlikely(headcount > UIO_MAXIOV)) {
+ +			msg.msg_iovlen = 1;
+ +			err = sock->ops->recvmsg(NULL, sock, &msg,
+ +						 1, MSG_DONTWAIT | MSG_TRUNC);
+ +			pr_debug("Discarded rx packet: len %zd\n", sock_len);
+ +			continue;
+ +		}
+++=======
++ 			goto out;
+++>>>>>>> 6e474083f3da (vhost: fix skb leak in handle_rx())
+  		/* OK, now we need to know about added descriptors. */
+  		if (!headcount) {
+  			if (unlikely(vhost_enable_notify(&net->dev, vq))) {
+@@@ -739,18 -788,28 +743,28 @@@
+  			}
+  			/* Nothing new?  Wait for eventfd to tell us
+  			 * they refilled. */
+ -			goto out;
+ +			break;
+  		}
++ 		if (nvq->rx_array)
++ 			msg.msg_control = vhost_net_buf_consume(&nvq->rxq);
++ 		/* On overrun, truncate and discard */
++ 		if (unlikely(headcount > UIO_MAXIOV)) {
++ 			iov_iter_init(&msg.msg_iter, READ, vq->iov, 1, 1);
++ 			err = sock->ops->recvmsg(sock, &msg,
++ 						 1, MSG_DONTWAIT | MSG_TRUNC);
++ 			pr_debug("Discarded rx packet: len %zd\n", sock_len);
++ 			continue;
++ 		}
+  		/* We don't need to be notified again. */
+ -		iov_iter_init(&msg.msg_iter, READ, vq->iov, in, vhost_len);
+ -		fixup = msg.msg_iter;
+ -		if (unlikely((vhost_hlen))) {
+ -			/* We will supply the header ourselves
+ -			 * TODO: support TSO.
+ -			 */
+ -			iov_iter_advance(&msg.msg_iter, vhost_hlen);
+ -		}
+ -		err = sock->ops->recvmsg(sock, &msg,
+ +		if (unlikely((vhost_hlen)))
+ +			/* Skip header. TODO: support TSO. */
+ +			move_iovec_hdr(vq->iov, nvq->hdr, vhost_hlen, in);
+ +		else
+ +			/* Copy the header for use in VIRTIO_NET_F_MRG_RXBUF:
+ +			 * needed because recvmsg can modify msg_iov. */
+ +			copy_iovec_hdr(vq->iov, nvq->hdr, sock_hlen, in);
+ +		msg.msg_iovlen = in;
+ +		err = sock->ops->recvmsg(NULL, sock, &msg,
+  					 sock_len, MSG_DONTWAIT | MSG_TRUNC);
+  		/* Userspace might have consumed the packet meanwhile:
+  		 * it's not supposed to do this usually, but might be hard
+* Unmerged path drivers/vhost/net.c
