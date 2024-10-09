@@ -6449,7 +6449,7 @@ int bnxt_setup_mq_tc(struct net_device *dev, u8 tc)
 	bool sh = false;
 
 	if (tc > bp->max_tc) {
-		netdev_err(dev, "too many traffic classes requested: %d Max supported is %d\n",
+		netdev_err(dev, "Too many traffic classes requested: %d. Max supported is %d.\n",
 			   tc, bp->max_tc);
 		return -EINVAL;
 	}
