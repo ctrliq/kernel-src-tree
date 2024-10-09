@@ -1,0 +1,266 @@
+KVM: x86: add tracepoints around __direct_map and FNAME(fetch)
+
+jira LE-1907
+cve CVE-2018-12207
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 335e192a3fa415e1202c8b9ecdaaecd643f823cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/335e192a.failed
+
+These are useful in debugging shadow paging.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 335e192a3fa415e1202c8b9ecdaaecd643f823cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.c
+#	arch/x86/kvm/paging_tmpl.h
+diff --cc arch/x86/kvm/mmu.c
+index 9724e772f5d0,6248c39a33ef..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -236,10 -238,70 +233,46 @@@ static const u64 shadow_acc_track_saved
+  						    PT64_EPT_EXECUTABLE_MASK;
+  static const u64 shadow_acc_track_saved_bits_shift = PT64_SECOND_AVAIL_BITS_SHIFT;
+  
+ -/*
+ - * This mask must be set on all non-zero Non-Present or Reserved SPTEs in order
+ - * to guard against L1TF attacks.
+ - */
+ -static u64 __read_mostly shadow_nonpresent_or_rsvd_mask;
+ -
+ -/*
+ - * The number of high-order 1 bits to use in the mask above.
+ - */
+ -static const u64 shadow_nonpresent_or_rsvd_mask_len = 5;
+ -
+ -/*
+ - * In some cases, we need to preserve the GFN of a non-present or reserved
+ - * SPTE when we usurp the upper five bits of the physical address space to
+ - * defend against L1TF, e.g. for MMIO SPTEs.  To preserve the GFN, we'll
+ - * shift bits of the GFN that overlap with shadow_nonpresent_or_rsvd_mask
+ - * left into the reserved bits, i.e. the GFN in the SPTE will be split into
+ - * high and low parts.  This mask covers the lower bits of the GFN.
+ - */
+ -static u64 __read_mostly shadow_nonpresent_or_rsvd_lower_gfn_mask;
+ -
+ -/*
+ - * The number of non-reserved physical address bits irrespective of features
+ - * that repurpose legal bits, e.g. MKTME.
+ - */
+ -static u8 __read_mostly shadow_phys_bits;
+ -
+  static void mmu_spte_set(u64 *sptep, u64 spte);
++ static bool is_executable_pte(u64 spte);
+  static union kvm_mmu_page_role
+  kvm_mmu_calc_root_page_role(struct kvm_vcpu *vcpu);
+  
+++<<<<<<< HEAD
+++=======
++ #define CREATE_TRACE_POINTS
++ #include "mmutrace.h"
++ 
++ 
++ static inline bool kvm_available_flush_tlb_with_range(void)
++ {
++ 	return kvm_x86_ops->tlb_remote_flush_with_range;
++ }
++ 
++ static void kvm_flush_remote_tlbs_with_range(struct kvm *kvm,
++ 		struct kvm_tlb_range *range)
++ {
++ 	int ret = -ENOTSUPP;
++ 
++ 	if (range && kvm_x86_ops->tlb_remote_flush_with_range)
++ 		ret = kvm_x86_ops->tlb_remote_flush_with_range(kvm, range);
++ 
++ 	if (ret)
++ 		kvm_flush_remote_tlbs(kvm);
++ }
++ 
++ static void kvm_flush_remote_tlbs_with_address(struct kvm *kvm,
++ 		u64 start_gfn, u64 pages)
++ {
++ 	struct kvm_tlb_range range;
++ 
++ 	range.start_gfn = start_gfn;
++ 	range.pages = pages;
++ 
++ 	kvm_flush_remote_tlbs_with_range(kvm, &range);
++ }
++ 
+++>>>>>>> 335e192a3fa4 (KVM: x86: add tracepoints around __direct_map and FNAME(fetch))
+  void kvm_mmu_set_mmio_spte_mask(u64 mmio_mask, u64 mmio_value)
+  {
+  	BUG_ON((mmio_mask & mmio_value) != mmio_value);
+@@@ -3055,41 -3185,40 +3085,48 @@@ static void direct_pte_prefetch(struct 
+  	__direct_pte_prefetch(vcpu, sp, sptep);
+  }
+  
+ -static int __direct_map(struct kvm_vcpu *vcpu, gpa_t gpa, int write,
+ -			int map_writable, int level, kvm_pfn_t pfn,
+ +static int __direct_map(struct kvm_vcpu *vcpu, gpa_t v, int write,
+ +			int map_writable, int level, gfn_t gfn, kvm_pfn_t pfn,
+  			bool prefault)
+  {
+ -	struct kvm_shadow_walk_iterator it;
+ +	struct kvm_shadow_walk_iterator iterator;
+  	struct kvm_mmu_page *sp;
+ -	int ret;
+ -	gfn_t gfn = gpa >> PAGE_SHIFT;
+ -	gfn_t base_gfn = gfn;
+ +	int emulate = 0;
+ +	gfn_t pseudo_gfn;
+  
+  	if (!VALID_PAGE(vcpu->arch.mmu->root_hpa))
+ -		return RET_PF_RETRY;
+ +		return 0;
+  
+++<<<<<<< HEAD
+ +	for_each_shadow_entry(vcpu, (u64)gfn << PAGE_SHIFT, iterator) {
+ +		if (iterator.level == level) {
+ +			emulate = mmu_set_spte(vcpu, iterator.sptep, ACC_ALL,
+ +					       write, level, gfn, pfn, prefault,
+ +					       map_writable);
+ +			direct_pte_prefetch(vcpu, iterator.sptep);
+ +			++vcpu->stat.pf_fixed;
+++=======
++ 	trace_kvm_mmu_spte_requested(gpa, level, pfn);
++ 	for_each_shadow_entry(vcpu, gpa, it) {
++ 		base_gfn = gfn & ~(KVM_PAGES_PER_HPAGE(it.level) - 1);
++ 		if (it.level == level)
+++>>>>>>> 335e192a3fa4 (KVM: x86: add tracepoints around __direct_map and FNAME(fetch))
+  			break;
+ +		}
+ +
+ +		drop_large_spte(vcpu, iterator.sptep);
+ +		if (!is_shadow_present_pte(*iterator.sptep)) {
+ +			u64 base_addr = iterator.addr;
+  
+ -		drop_large_spte(vcpu, it.sptep);
+ -		if (!is_shadow_present_pte(*it.sptep)) {
+ -			sp = kvm_mmu_get_page(vcpu, base_gfn, it.addr,
+ -					      it.level - 1, true, ACC_ALL);
+ +			base_addr &= PT64_LVL_ADDR_MASK(iterator.level);
+ +			pseudo_gfn = base_addr >> PAGE_SHIFT;
+ +			sp = kvm_mmu_get_page(vcpu, pseudo_gfn, iterator.addr,
+ +					      iterator.level - 1, 1, ACC_ALL);
+  
+ -			link_shadow_page(vcpu, it.sptep, sp);
+ +			link_shadow_page(vcpu, iterator.sptep, sp);
+  		}
+  	}
+ -
+ -	ret = mmu_set_spte(vcpu, it.sptep, ACC_ALL,
+ -			   write, level, base_gfn, pfn, prefault,
+ -			   map_writable);
+ -	direct_pte_prefetch(vcpu, it.sptep);
+ -	++vcpu->stat.pf_fixed;
+ -	return ret;
+ +	return emulate;
+  }
+  
+  static void kvm_send_hwpoison_signal(unsigned long address, struct task_struct *tsk)
+diff --cc arch/x86/kvm/paging_tmpl.h
+index 0da31d8cbf16,e9d110fdcb8e..000000000000
+--- a/arch/x86/kvm/paging_tmpl.h
++++ b/arch/x86/kvm/paging_tmpl.h
+@@@ -646,12 -668,16 +646,18 @@@ static int FNAME(fetch)(struct kvm_vcp
+  			link_shadow_page(vcpu, it.sptep, sp);
+  	}
+  
+ -	base_gfn = gw->gfn;
+ +	for (;
+ +	     shadow_walk_okay(&it) && it.level > hlevel;
+ +	     shadow_walk_next(&it)) {
+ +		gfn_t direct_gfn;
+  
+++<<<<<<< HEAD
+++=======
++ 	trace_kvm_mmu_spte_requested(addr, gw->level, pfn);
++ 
++ 	for (; shadow_walk_okay(&it); shadow_walk_next(&it)) {
+++>>>>>>> 335e192a3fa4 (KVM: x86: add tracepoints around __direct_map and FNAME(fetch))
+  		clear_sp_write_flooding_count(it.sptep);
+ -		base_gfn = gw->gfn & ~(KVM_PAGES_PER_HPAGE(it.level) - 1);
+ -		if (it.level == hlevel)
+ -			break;
+ -
+  		validate_direct_spte(vcpu, it.sptep, direct_access);
+  
+  		drop_large_spte(vcpu, it.sptep);
+* Unmerged path arch/x86/kvm/mmu.c
+diff --git a/arch/x86/kvm/mmutrace.h b/arch/x86/kvm/mmutrace.h
+index b2875d4a110a..997da9097be2 100644
+--- a/arch/x86/kvm/mmutrace.h
++++ b/arch/x86/kvm/mmutrace.h
+@@ -324,6 +324,65 @@ TRACE_EVENT(
+ 		  __entry->kvm_gen == __entry->spte_gen
+ 	)
+ );
++
++TRACE_EVENT(
++	kvm_mmu_set_spte,
++	TP_PROTO(int level, gfn_t gfn, u64 *sptep),
++	TP_ARGS(level, gfn, sptep),
++
++	TP_STRUCT__entry(
++		__field(u64, gfn)
++		__field(u64, spte)
++		__field(u64, sptep)
++		__field(u8, level)
++		/* These depend on page entry type, so compute them now.  */
++		__field(bool, r)
++		__field(bool, x)
++		__field(u8, u)
++	),
++
++	TP_fast_assign(
++		__entry->gfn = gfn;
++		__entry->spte = *sptep;
++		__entry->sptep = virt_to_phys(sptep);
++		__entry->level = level;
++		__entry->r = shadow_present_mask || (__entry->spte & PT_PRESENT_MASK);
++		__entry->x = is_executable_pte(__entry->spte);
++		__entry->u = shadow_user_mask ? !!(__entry->spte & shadow_user_mask) : -1;
++	),
++
++	TP_printk("gfn %llx spte %llx (%s%s%s%s) level %d at %llx",
++		  __entry->gfn, __entry->spte,
++		  __entry->r ? "r" : "-",
++		  __entry->spte & PT_WRITABLE_MASK ? "w" : "-",
++		  __entry->x ? "x" : "-",
++		  __entry->u == -1 ? "" : (__entry->u ? "u" : "-"),
++		  __entry->level, __entry->sptep
++	)
++);
++
++TRACE_EVENT(
++	kvm_mmu_spte_requested,
++	TP_PROTO(gpa_t addr, int level, kvm_pfn_t pfn),
++	TP_ARGS(addr, level, pfn),
++
++	TP_STRUCT__entry(
++		__field(u64, gfn)
++		__field(u64, pfn)
++		__field(u8, level)
++	),
++
++	TP_fast_assign(
++		__entry->gfn = addr >> PAGE_SHIFT;
++		__entry->pfn = pfn | (__entry->gfn & (KVM_PAGES_PER_HPAGE(level) - 1));
++		__entry->level = level;
++	),
++
++	TP_printk("gfn %llx pfn %llx level %d",
++		  __entry->gfn, __entry->pfn, __entry->level
++	)
++);
++
+ #endif /* _TRACE_KVMMMU_H */
+ 
+ #undef TRACE_INCLUDE_PATH
+* Unmerged path arch/x86/kvm/paging_tmpl.h
