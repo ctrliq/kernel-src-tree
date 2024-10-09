@@ -1,0 +1,369 @@
+x86/mm: Add support to enable SME in early boot processing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] mm: Add support to enable SME in early boot processing (Suravee Suthikulpanit) [1361287]
+Rebuild_FUZZ: 96.43%
+commit-author Tom Lendacky <thomas.lendacky@amd.com>
+commit 5868f3651fa0dff96a57f94d49247d3ef320ebe2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5868f365.failed
+
+Add support to the early boot code to use Secure Memory Encryption (SME).
+Since the kernel has been loaded into memory in a decrypted state, encrypt
+the kernel in place and update the early pagetables with the memory
+encryption mask so that new pagetable entries will use memory encryption.
+
+The routines to set the encryption mask and perform the encryption are
+stub routines for now with functionality to be added in a later patch.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brijesh Singh <brijesh.singh@amd.com>
+	Cc: Dave Young <dyoung@redhat.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: Larry Woodman <lwoodman@redhat.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Matt Fleming <matt@codeblueprint.co.uk>
+	Cc: Michael S. Tsirkin <mst@redhat.com>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Radim Krčmář <rkrcmar@redhat.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: Toshimitsu Kani <toshi.kani@hpe.com>
+	Cc: kasan-dev@googlegroups.com
+	Cc: kvm@vger.kernel.org
+	Cc: linux-arch@vger.kernel.org
+	Cc: linux-doc@vger.kernel.org
+	Cc: linux-efi@vger.kernel.org
+	Cc: linux-mm@kvack.org
+Link: http://lkml.kernel.org/r/e52ad781f085224bf835b3caff9aa3aee6febccb.1500319216.git.thomas.lendacky@amd.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 5868f3651fa0dff96a57f94d49247d3ef320ebe2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/mem_encrypt.h
+#	arch/x86/kernel/head64.c
+#	arch/x86/kernel/head_64.S
+#	arch/x86/mm/mem_encrypt.c
+#	include/linux/mem_encrypt.h
+diff --cc arch/x86/kernel/head64.c
+index 39ad3cdc4c78,1f0ddcc9675c..000000000000
+--- a/arch/x86/kernel/head64.c
++++ b/arch/x86/kernel/head64.c
+@@@ -31,11 -34,144 +32,147 @@@
+  /*
+   * Manage page tables very early on.
+   */
+ -extern pgd_t early_top_pgt[PTRS_PER_PGD];
+ +extern pgd_t early_level4_pgt[PTRS_PER_PGD];
+  extern pmd_t early_dynamic_pgts[EARLY_DYNAMIC_PAGE_TABLES][PTRS_PER_PMD];
+ -static unsigned int __initdata next_early_pgt;
+ +static unsigned int __initdata next_early_pgt = 2;
+  pmdval_t early_pmd_flags = __PAGE_KERNEL_LARGE & ~(_PAGE_GLOBAL | _PAGE_NX);
+  
+++<<<<<<< HEAD
+++=======
++ #define __head	__section(.head.text)
++ 
++ static void __head *fixup_pointer(void *ptr, unsigned long physaddr)
++ {
++ 	return ptr - (void *)_text + (void *)physaddr;
++ }
++ 
++ unsigned long __head __startup_64(unsigned long physaddr)
++ {
++ 	unsigned long load_delta, *p;
++ 	unsigned long pgtable_flags;
++ 	pgdval_t *pgd;
++ 	p4dval_t *p4d;
++ 	pudval_t *pud;
++ 	pmdval_t *pmd, pmd_entry;
++ 	int i;
++ 
++ 	/* Is the address too large? */
++ 	if (physaddr >> MAX_PHYSMEM_BITS)
++ 		for (;;);
++ 
++ 	/*
++ 	 * Compute the delta between the address I am compiled to run at
++ 	 * and the address I am actually running at.
++ 	 */
++ 	load_delta = physaddr - (unsigned long)(_text - __START_KERNEL_map);
++ 
++ 	/* Is the address not 2M aligned? */
++ 	if (load_delta & ~PMD_PAGE_MASK)
++ 		for (;;);
++ 
++ 	/* Activate Secure Memory Encryption (SME) if supported and enabled */
++ 	sme_enable();
++ 
++ 	/* Include the SME encryption mask in the fixup value */
++ 	load_delta += sme_get_me_mask();
++ 
++ 	/* Fixup the physical addresses in the page table */
++ 
++ 	pgd = fixup_pointer(&early_top_pgt, physaddr);
++ 	pgd[pgd_index(__START_KERNEL_map)] += load_delta;
++ 
++ 	if (IS_ENABLED(CONFIG_X86_5LEVEL)) {
++ 		p4d = fixup_pointer(&level4_kernel_pgt, physaddr);
++ 		p4d[511] += load_delta;
++ 	}
++ 
++ 	pud = fixup_pointer(&level3_kernel_pgt, physaddr);
++ 	pud[510] += load_delta;
++ 	pud[511] += load_delta;
++ 
++ 	pmd = fixup_pointer(level2_fixmap_pgt, physaddr);
++ 	pmd[506] += load_delta;
++ 
++ 	/*
++ 	 * Set up the identity mapping for the switchover.  These
++ 	 * entries should *NOT* have the global bit set!  This also
++ 	 * creates a bunch of nonsense entries but that is fine --
++ 	 * it avoids problems around wraparound.
++ 	 */
++ 
++ 	pud = fixup_pointer(early_dynamic_pgts[next_early_pgt++], physaddr);
++ 	pmd = fixup_pointer(early_dynamic_pgts[next_early_pgt++], physaddr);
++ 	pgtable_flags = _KERNPG_TABLE + sme_get_me_mask();
++ 
++ 	if (IS_ENABLED(CONFIG_X86_5LEVEL)) {
++ 		p4d = fixup_pointer(early_dynamic_pgts[next_early_pgt++], physaddr);
++ 
++ 		i = (physaddr >> PGDIR_SHIFT) % PTRS_PER_PGD;
++ 		pgd[i + 0] = (pgdval_t)p4d + pgtable_flags;
++ 		pgd[i + 1] = (pgdval_t)p4d + pgtable_flags;
++ 
++ 		i = (physaddr >> P4D_SHIFT) % PTRS_PER_P4D;
++ 		p4d[i + 0] = (pgdval_t)pud + pgtable_flags;
++ 		p4d[i + 1] = (pgdval_t)pud + pgtable_flags;
++ 	} else {
++ 		i = (physaddr >> PGDIR_SHIFT) % PTRS_PER_PGD;
++ 		pgd[i + 0] = (pgdval_t)pud + pgtable_flags;
++ 		pgd[i + 1] = (pgdval_t)pud + pgtable_flags;
++ 	}
++ 
++ 	i = (physaddr >> PUD_SHIFT) % PTRS_PER_PUD;
++ 	pud[i + 0] = (pudval_t)pmd + pgtable_flags;
++ 	pud[i + 1] = (pudval_t)pmd + pgtable_flags;
++ 
++ 	pmd_entry = __PAGE_KERNEL_LARGE_EXEC & ~_PAGE_GLOBAL;
++ 	pmd_entry += sme_get_me_mask();
++ 	pmd_entry +=  physaddr;
++ 
++ 	for (i = 0; i < DIV_ROUND_UP(_end - _text, PMD_SIZE); i++) {
++ 		int idx = i + (physaddr >> PMD_SHIFT) % PTRS_PER_PMD;
++ 		pmd[idx] = pmd_entry + i * PMD_SIZE;
++ 	}
++ 
++ 	/*
++ 	 * Fixup the kernel text+data virtual addresses. Note that
++ 	 * we might write invalid pmds, when the kernel is relocated
++ 	 * cleanup_highmap() fixes this up along with the mappings
++ 	 * beyond _end.
++ 	 */
++ 
++ 	pmd = fixup_pointer(level2_kernel_pgt, physaddr);
++ 	for (i = 0; i < PTRS_PER_PMD; i++) {
++ 		if (pmd[i] & _PAGE_PRESENT)
++ 			pmd[i] += load_delta;
++ 	}
++ 
++ 	/*
++ 	 * Fixup phys_base - remove the memory encryption mask to obtain
++ 	 * the true physical address.
++ 	 */
++ 	p = fixup_pointer(&phys_base, physaddr);
++ 	*p += load_delta - sme_get_me_mask();
++ 
++ 	/* Encrypt the kernel (if SME is active) */
++ 	sme_encrypt_kernel();
++ 
++ 	/*
++ 	 * Return the SME encryption mask (if SME is active) to be used as a
++ 	 * modifier for the initial pgdir entry programmed into CR3.
++ 	 */
++ 	return sme_get_me_mask();
++ }
++ 
++ unsigned long __startup_secondary_64(void)
++ {
++ 	/*
++ 	 * Return the SME encryption mask (if SME is active) to be used as a
++ 	 * modifier for the initial pgdir entry programmed into CR3.
++ 	 */
++ 	return sme_get_me_mask();
++ }
++ 
+++>>>>>>> 5868f3651fa0 (x86/mm: Add support to enable SME in early boot processing)
+  /* Wipe all early page tables except for the kernel symbol map */
+  static void __init reset_early_page_tables(void)
+  {
+diff --cc arch/x86/kernel/head_64.S
+index d567183c0ffb,ec5d5e90c8f1..000000000000
+--- a/arch/x86/kernel/head_64.S
++++ b/arch/x86/kernel/head_64.S
+@@@ -76,96 -74,18 +76,111 @@@ startup_64
+  	call verify_cpu
+  
+  	/*
+++<<<<<<< HEAD
+ +	 * Compute the delta between the address I am compiled to run at and the
+ +	 * address I am actually running at.
+ +	 */
+ +	leaq	_text(%rip), %rbp
+ +	subq	$_text - __START_KERNEL_map, %rbp
+ +
+ +	/* Is the address not 2M aligned? */
+ +	testl	$~PMD_PAGE_MASK, %ebp
+ +	jnz	bad_address
+ +
+ +	/*
+ +	 * Is the address too large?
+ +	 */
+ +	leaq	_text(%rip), %rax
+ +	shrq	$MAX_PHYSMEM_BITS, %rax
+ +	jnz	bad_address
+ +
+ +	/*
+ +	 * Fixup the physical addresses in the page table
+ +	 */
+ +	addq	%rbp, early_level4_pgt + (L4_START_KERNEL*8)(%rip)
+ +
+ +	addq	%rbp, level3_kernel_pgt + (510*8)(%rip)
+ +	addq	%rbp, level3_kernel_pgt + (511*8)(%rip)
+ +
+ +	addq	%rbp, level2_fixmap_pgt + (506*8)(%rip)
+ +
+ +	/*
+ +	 * Set up the identity mapping for the switchover.  These
+ +	 * entries should *NOT* have the global bit set!  This also
+ +	 * creates a bunch of nonsense entries but that is fine --
+ +	 * it avoids problems around wraparound.
+ +	 */
+ +	leaq	_text(%rip), %rdi
+ +	leaq	early_level4_pgt(%rip), %rbx
+ +
+ +	movq	%rdi, %rax
+ +	shrq	$PGDIR_SHIFT, %rax
+ +
+ +	leaq	(PAGE_SIZE + _KERNPG_TABLE)(%rbx), %rdx
+ +	movq	%rdx, 0(%rbx,%rax,8)
+ +	movq	%rdx, 8(%rbx,%rax,8)
+ +
+ +	addq	$PAGE_SIZE, %rdx
+ +	movq	%rdi, %rax
+ +	shrq	$PUD_SHIFT, %rax
+ +	andl	$(PTRS_PER_PUD-1), %eax
+ +	movq	%rdx, PAGE_SIZE(%rbx,%rax,8)
+ +	incl	%eax
+ +	andl	$(PTRS_PER_PUD-1), %eax
+ +	movq	%rdx, PAGE_SIZE(%rbx,%rax,8)
+ +
+ +	addq	$PAGE_SIZE * 2, %rbx
+ +	movq	%rdi, %rax
+ +	shrq	$PMD_SHIFT, %rdi
+ +	addq	$(__PAGE_KERNEL_LARGE_EXEC & ~_PAGE_GLOBAL), %rax
+ +	leaq	(_end - 1)(%rip), %rcx
+ +	shrq	$PMD_SHIFT, %rcx
+ +	subq	%rdi, %rcx
+ +	incl	%ecx
+ +
+ +1:
+ +	andq	$(PTRS_PER_PMD - 1), %rdi
+ +	movq	%rax, (%rbx,%rdi,8)
+ +	incq	%rdi
+ +	addq	$PMD_SIZE, %rax
+ +	decl	%ecx
+ +	jnz	1b
+ +
+ +	/*
+ +	 * Fixup the kernel text+data virtual addresses. Note that
+ +	 * we might write invalid pmds, when the kernel is relocated
+ +	 * cleanup_highmap() fixes this up along with the mappings
+ +	 * beyond _end.
+ +	 */
+ +	leaq	level2_kernel_pgt(%rip), %rdi
+ +	leaq	4096(%rdi), %r8
+ +	/* See if it is a valid page table entry */
+ +1:	testq	$1, 0(%rdi)
+ +	jz	2f
+ +	addq	%rbp, 0(%rdi)
+ +	/* Go to the next page */
+ +2:	addq	$8, %rdi
+ +	cmp	%r8, %rdi
+ +	jne	1b
+ +
+ +	/* Fixup phys_base */
+ +	addq	%rbp, phys_base(%rip)
+ +
+ +	movq	$(early_level4_pgt - __START_KERNEL_map), %rax
+++=======
++ 	 * Perform pagetable fixups. Additionally, if SME is active, encrypt
++ 	 * the kernel and retrieve the modifier (SME encryption mask if SME
++ 	 * is active) to be added to the initial pgdir entry that will be
++ 	 * programmed into CR3.
++ 	 */
++ 	leaq	_text(%rip), %rdi
++ 	pushq	%rsi
++ 	call	__startup_64
++ 	popq	%rsi
++ 
++ 	/* Form the CR3 value being sure to include the CR3 modifier */
++ 	addq	$(early_top_pgt - __START_KERNEL_map), %rax
+++>>>>>>> 5868f3651fa0 (x86/mm: Add support to enable SME in early boot processing)
+  	jmp 1f
+  ENTRY(secondary_startup_64)
+  	/*
+@@@ -185,14 -105,26 +200,27 @@@
+  	/* Sanitize CPU configuration */
+  	call verify_cpu
+  
+++<<<<<<< HEAD
+ +	movq	$(init_level4_pgt - __START_KERNEL_map), %rax
+++=======
++ 	/*
++ 	 * Retrieve the modifier (SME encryption mask if SME is active) to be
++ 	 * added to the initial pgdir entry that will be programmed into CR3.
++ 	 */
++ 	pushq	%rsi
++ 	call	__startup_secondary_64
++ 	popq	%rsi
++ 
++ 	/* Form the CR3 value being sure to include the CR3 modifier */
++ 	addq	$(init_top_pgt - __START_KERNEL_map), %rax
+++>>>>>>> 5868f3651fa0 (x86/mm: Add support to enable SME in early boot processing)
+  1:
+  
+ -	/* Enable PAE mode, PGE and LA57 */
+ +	/* Enable PAE mode and PGE */
+  	movl	$(X86_CR4_PAE | X86_CR4_PGE), %ecx
+ -#ifdef CONFIG_X86_5LEVEL
+ -	orl	$X86_CR4_LA57, %ecx
+ -#endif
+  	movq	%rcx, %cr4
+  
+ -	/* Setup early boot stage 4-/5-level pagetables. */
+ +	/* Setup early boot stage 4 level pagetables. */
+  	addq	phys_base(%rip), %rax
+  	movq	%rax, %cr3
+  
+* Unmerged path arch/x86/include/asm/mem_encrypt.h
+* Unmerged path arch/x86/mm/mem_encrypt.c
+* Unmerged path include/linux/mem_encrypt.h
+* Unmerged path arch/x86/include/asm/mem_encrypt.h
+* Unmerged path arch/x86/kernel/head64.c
+* Unmerged path arch/x86/kernel/head_64.S
+* Unmerged path arch/x86/mm/mem_encrypt.c
+* Unmerged path include/linux/mem_encrypt.h
