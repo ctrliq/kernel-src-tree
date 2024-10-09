@@ -1,0 +1,202 @@
+net: sched: rename tcf_destroy_chain helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] sched: rename tcf_destroy_chain helper (Ivan Vecera) [1445420]
+Rebuild_FUZZ: 93.83%
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit fbe9c5b01f97b44b1e4c7d86c092beaf707d4b9d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/fbe9c5b0.failed
+
+Make the name consistent with the rest of the helpers around.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fbe9c5b01f97b44b1e4c7d86c092beaf707d4b9d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_api.c
+diff --cc net/sched/cls_api.c
+index 1dc6d123ed94,c02b03e0b39e..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -127,9 -128,149 +127,151 @@@ static inline u32 tcf_auto_prio(struct 
+  	return first;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct tcf_proto *tcf_proto_create(const char *kind, u32 protocol,
++ 					  u32 prio, u32 parent, struct Qdisc *q,
++ 					  struct tcf_block *block)
++ {
++ 	struct tcf_proto *tp;
++ 	int err;
++ 
++ 	tp = kzalloc(sizeof(*tp), GFP_KERNEL);
++ 	if (!tp)
++ 		return ERR_PTR(-ENOBUFS);
++ 
++ 	err = -ENOENT;
++ 	tp->ops = tcf_proto_lookup_ops(kind);
++ 	if (!tp->ops) {
++ #ifdef CONFIG_MODULES
++ 		rtnl_unlock();
++ 		request_module("cls_%s", kind);
++ 		rtnl_lock();
++ 		tp->ops = tcf_proto_lookup_ops(kind);
++ 		/* We dropped the RTNL semaphore in order to perform
++ 		 * the module load. So, even if we succeeded in loading
++ 		 * the module we have to replay the request. We indicate
++ 		 * this using -EAGAIN.
++ 		 */
++ 		if (tp->ops) {
++ 			module_put(tp->ops->owner);
++ 			err = -EAGAIN;
++ 		} else {
++ 			err = -ENOENT;
++ 		}
++ 		goto errout;
++ #endif
++ 	}
++ 	tp->classify = tp->ops->classify;
++ 	tp->protocol = protocol;
++ 	tp->prio = prio;
++ 	tp->classid = parent;
++ 	tp->q = q;
++ 	tp->block = block;
++ 
++ 	err = tp->ops->init(tp);
++ 	if (err) {
++ 		module_put(tp->ops->owner);
++ 		goto errout;
++ 	}
++ 	return tp;
++ 
++ errout:
++ 	kfree(tp);
++ 	return ERR_PTR(err);
++ }
++ 
++ static void tcf_proto_destroy(struct tcf_proto *tp)
++ {
++ 	tp->ops->destroy(tp);
++ 	module_put(tp->ops->owner);
++ 	kfree_rcu(tp, rcu);
++ }
++ 
++ static void tcf_chain_destroy(struct tcf_proto __rcu **fl)
++ {
++ 	struct tcf_proto *tp;
++ 
++ 	while ((tp = rtnl_dereference(*fl)) != NULL) {
++ 		RCU_INIT_POINTER(*fl, tp->next);
++ 		tcf_proto_destroy(tp);
++ 	}
++ }
++ 
++ int tcf_block_get(struct tcf_block **p_block,
++ 		  struct tcf_proto __rcu **p_filter_chain)
++ {
++ 	struct tcf_block *block = kzalloc(sizeof(*block), GFP_KERNEL);
++ 
++ 	if (!block)
++ 		return -ENOMEM;
++ 	block->p_filter_chain = p_filter_chain;
++ 	*p_block = block;
++ 	return 0;
++ }
++ EXPORT_SYMBOL(tcf_block_get);
++ 
++ void tcf_block_put(struct tcf_block *block)
++ {
++ 	if (!block)
++ 		return;
++ 	tcf_chain_destroy(block->p_filter_chain);
++ 	kfree(block);
++ }
++ EXPORT_SYMBOL(tcf_block_put);
++ 
++ /* Main classifier routine: scans classifier chain attached
++  * to this qdisc, (optionally) tests for protocol and asks
++  * specific classifiers.
++  */
++ int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
++ 		 struct tcf_result *res, bool compat_mode)
++ {
++ 	__be16 protocol = tc_skb_protocol(skb);
++ #ifdef CONFIG_NET_CLS_ACT
++ 	const int max_reclassify_loop = 4;
++ 	const struct tcf_proto *old_tp = tp;
++ 	int limit = 0;
++ 
++ reclassify:
++ #endif
++ 	for (; tp; tp = rcu_dereference_bh(tp->next)) {
++ 		int err;
++ 
++ 		if (tp->protocol != protocol &&
++ 		    tp->protocol != htons(ETH_P_ALL))
++ 			continue;
++ 
++ 		err = tp->classify(skb, tp, res);
++ #ifdef CONFIG_NET_CLS_ACT
++ 		if (unlikely(err == TC_ACT_RECLASSIFY && !compat_mode))
++ 			goto reset;
++ #endif
++ 		if (err >= 0)
++ 			return err;
++ 	}
++ 
++ 	return TC_ACT_UNSPEC; /* signal: continue lookup */
++ #ifdef CONFIG_NET_CLS_ACT
++ reset:
++ 	if (unlikely(limit++ >= max_reclassify_loop)) {
++ 		net_notice_ratelimited("%s: reclassify loop, rule prio %u, protocol %02x\n",
++ 				       tp->q->ops->id, tp->prio & 0xffff,
++ 				       ntohs(tp->protocol));
++ 		return TC_ACT_SHOT;
++ 	}
++ 
++ 	tp = old_tp;
++ 	protocol = tc_skb_protocol(skb);
++ 	goto reclassify;
++ #endif
++ }
++ EXPORT_SYMBOL(tcf_classify);
++ 
+++>>>>>>> fbe9c5b01f97 (net: sched: rename tcf_destroy_chain helper)
+  /* Add/change/delete/get a filter node */
+  
+ -static int tc_ctl_tfilter(struct sk_buff *skb, struct nlmsghdr *n,
+ -			  struct netlink_ext_ack *extack)
+ +static int tc_ctl_tfilter(struct sk_buff *skb, struct nlmsghdr *n)
+  {
+  	struct net *net = sock_net(skb->sk);
+  	struct nlattr *tca[TCA_MAX + 1];
+@@@ -221,13 -363,16 +363,13 @@@ replay
+  	}
+  
+  	/* And the last stroke */
+ -	block = cops->tcf_block(q, cl);
+ -	if (!block) {
+ -		err = -EINVAL;
+ +	chain = cops->tcf_chain(q, cl);
+ +	err = -EINVAL;
+ +	if (chain == NULL)
+  		goto errout;
+ -	}
+ -	chain = block->p_filter_chain;
+ -
+  	if (n->nlmsg_type == RTM_DELTFILTER && prio == 0) {
+  		tfilter_notify_chain(net, skb, n, chain, RTM_DELTFILTER);
+- 		tcf_destroy_chain(chain);
++ 		tcf_chain_destroy(chain);
+  		err = 0;
+  		goto errout;
+  	}
+* Unmerged path net/sched/cls_api.c
