@@ -1,0 +1,371 @@
+xfs: automatic dfops buffer relogging
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit 82ff27bc52a88cb5cc400bfa64e210d3ec8dfebd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/82ff27bc.failed
+
+Buffers that are held across deferred operations are explicitly
+joined to the dfops structure to ensure appropriate relogging.
+While buffers are currently joined explicitly, we can detect the
+conditions that require relogging at dfops finish time by inspecting
+the transaction item list for held buffers.
+
+Replace the xfs_defer_bjoin() infrastructure with such detection and
+automatic relogging of held buffers. This eliminates the need for
+the per-dfops buffer list, replaced by an on-stack variant in
+xfs_defer_trans_roll().
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 82ff27bc52a88cb5cc400bfa64e210d3ec8dfebd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_attr.c
+#	fs/xfs/libxfs/xfs_defer.c
+#	fs/xfs/libxfs/xfs_defer.h
+#	fs/xfs/xfs_dquot.c
+#	fs/xfs/xfs_trans.h
+diff --cc fs/xfs/libxfs/xfs_attr.c
+index 3e8597157ebe,227887bee00d..000000000000
+--- a/fs/xfs/libxfs/xfs_attr.c
++++ b/fs/xfs/libxfs/xfs_attr.c
+@@@ -326,15 -311,19 +326,30 @@@ xfs_attr_set
+  		 * It won't fit in the shortform, transform to a leaf block.
+  		 * GROT: another possible req'mt for a double-split btree op.
+  		 */
+++<<<<<<< HEAD
+ +		xfs_defer_init(args.dfops, args.firstblock);
+ +		error = xfs_attr_shortform_to_leaf(&args);
+ +		if (!error)
+ +			error = xfs_defer_finish(&args.trans, args.dfops, dp);
+ +		if (error) {
+ +			args.trans = NULL;
+ +			xfs_defer_cancel(&dfops);
+++=======
++ 		error = xfs_attr_shortform_to_leaf(&args, &leaf_bp);
++ 		if (error)
++ 			goto out;
++ 		/*
++ 		 * Prevent the leaf buffer from being unlocked so that a
++ 		 * concurrent AIL push cannot grab the half-baked leaf
++ 		 * buffer and run into problems with the write verifier.
++ 		 */
++ 		xfs_trans_bhold(args.trans, leaf_bp);
++ 		xfs_defer_ijoin(args.trans->t_dfops, dp);
++ 		error = xfs_defer_finish(&args.trans);
++ 		if (error)
+++>>>>>>> 82ff27bc52a8 (xfs: automatic dfops buffer relogging)
+  			goto out;
+ +		}
+  
+  		/*
+  		 * Commit the leaf transformation.  We'll need another (linked)
+diff --cc fs/xfs/libxfs/xfs_defer.c
+index 606e68286320,e9b7671d289a..000000000000
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@@ -239,9 -226,13 +240,17 @@@ xfs_defer_trans_abort
+  /* Roll a transaction so we can do some deferred op processing. */
+  STATIC int
+  xfs_defer_trans_roll(
+ -	struct xfs_trans		**tp)
+ +	struct xfs_trans		**tp,
+ +	struct xfs_defer_ops		*dop)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct xfs_defer_ops		*dop = (*tp)->t_dfops;
++ 	struct xfs_buf_log_item		*bli;
++ 	struct xfs_log_item		*lip;
++ 	struct xfs_buf			*bplist[XFS_DEFER_OPS_NR_BUFS];
++ 	int				bpcount = 0;
+++>>>>>>> 82ff27bc52a8 (xfs: automatic dfops buffer relogging)
+  	int				i;
+  	int				error;
+  
+@@@ -249,7 -240,26 +258,30 @@@
+  	for (i = 0; i < XFS_DEFER_OPS_NR_INODES && dop->dop_inodes[i]; i++)
+  		xfs_trans_log_inode(*tp, dop->dop_inodes[i], XFS_ILOG_CORE);
+  
+++<<<<<<< HEAD
+ +	trace_xfs_defer_trans_roll((*tp)->t_mountp, dop);
+++=======
++ 	list_for_each_entry(lip, &(*tp)->t_items, li_trans) {
++ 		switch (lip->li_type) {
++ 		case XFS_LI_BUF:
++ 			bli = container_of(lip, struct xfs_buf_log_item,
++ 					   bli_item);
++ 			if (bli->bli_flags & XFS_BLI_HOLD) {
++ 				if (bpcount >= XFS_DEFER_OPS_NR_BUFS) {
++ 					ASSERT(0);
++ 					return -EFSCORRUPTED;
++ 				}
++ 				xfs_trans_dirty_buf(*tp, bli->bli_buf);
++ 				bplist[bpcount++] = bli->bli_buf;
++ 			}
++ 			break;
++ 		default:
++ 			break;
++ 		}
++ 	}
++ 
++ 	trace_xfs_defer_trans_roll((*tp)->t_mountp, dop, _RET_IP_);
+++>>>>>>> 82ff27bc52a8 (xfs: automatic dfops buffer relogging)
+  
+  	/* Roll the transaction. */
+  	error = xfs_trans_roll(tp);
+@@@ -264,6 -274,12 +296,15 @@@
+  	for (i = 0; i < XFS_DEFER_OPS_NR_INODES && dop->dop_inodes[i]; i++)
+  		xfs_trans_ijoin(*tp, dop->dop_inodes[i], 0);
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Rejoin the buffers and dirty them so the log moves forward. */
++ 	for (i = 0; i < bpcount; i++) {
++ 		xfs_trans_bjoin(*tp, bplist[i]);
++ 		xfs_trans_bhold(*tp, bplist[i]);
++ 	}
++ 
+++>>>>>>> 82ff27bc52a8 (xfs: automatic dfops buffer relogging)
+  	return error;
+  }
+  
+@@@ -300,6 -316,26 +341,29 @@@ xfs_defer_join
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Reset an already used dfops after finish.
++  */
++ static void
++ xfs_defer_reset(
++ 	struct xfs_trans	*tp)
++ {
++ 	struct xfs_defer_ops	*dop = tp->t_dfops;
++ 
++ 	ASSERT(!xfs_defer_has_unfinished_work(dop));
++ 
++ 	memset(dop->dop_inodes, 0, sizeof(dop->dop_inodes));
++ 
++ 	/*
++ 	 * Low mode state transfers across transaction rolls to mirror dfops
++ 	 * lifetime. Clear it now that dfops is reset.
++ 	 */
++ 	tp->t_flags &= ~XFS_TRANS_LOWMODE;
++ }
++ 
++ /*
+++>>>>>>> 82ff27bc52a8 (xfs: automatic dfops buffer relogging)
+   * Finish all the pending work.  This involves logging intent items for
+   * any work items that wandered in since the last transaction roll (if
+   * one has even happened), rolling the transaction, and finishing the
+@@@ -500,14 -555,48 +564,53 @@@ xfs_defer_init_op_type
+  /* Initialize a deferred operation. */
+  void
+  xfs_defer_init(
+ -	struct xfs_trans		*tp,
+ -	struct xfs_defer_ops		*dop)
+ +	struct xfs_defer_ops		*dop,
+ +	xfs_fsblock_t			*fbp)
+  {
+ -	struct xfs_mount		*mp = NULL;
+ -
+ -	memset(dop, 0, sizeof(struct xfs_defer_ops));
+ +	dop->dop_committed = false;
+ +	dop->dop_low = false;
+ +	memset(&dop->dop_inodes, 0, sizeof(dop->dop_inodes));
+ +	*fbp = NULLFSBLOCK;
+  	INIT_LIST_HEAD(&dop->dop_intake);
+  	INIT_LIST_HEAD(&dop->dop_pending);
+++<<<<<<< HEAD
+ +	trace_xfs_defer_init(NULL, dop);
+++=======
++ 	if (tp) {
++ 		ASSERT(tp->t_firstblock == NULLFSBLOCK);
++ 		tp->t_dfops = dop;
++ 		mp = tp->t_mountp;
++ 	}
++ 	trace_xfs_defer_init(mp, dop, _RET_IP_);
++ }
++ 
++ /*
++  * Move state from one xfs_defer_ops to another and reset the source to initial
++  * state. This is primarily used to carry state forward across transaction rolls
++  * with internal dfops.
++  */
++ void
++ xfs_defer_move(
++ 	struct xfs_trans	*dtp,
++ 	struct xfs_trans	*stp)
++ {
++ 	struct xfs_defer_ops	*dst = dtp->t_dfops;
++ 	struct xfs_defer_ops	*src = stp->t_dfops;
++ 	ASSERT(dst != src);
++ 
++ 	list_splice_init(&src->dop_intake, &dst->dop_intake);
++ 	list_splice_init(&src->dop_pending, &dst->dop_pending);
++ 
++ 	memcpy(dst->dop_inodes, src->dop_inodes, sizeof(dst->dop_inodes));
++ 
++ 	/*
++ 	 * Low free space mode was historically controlled by a dfops field.
++ 	 * This meant that low mode state potentially carried across multiple
++ 	 * transaction rolls. Transfer low mode on a dfops move to preserve
++ 	 * that behavior.
++ 	 */
++ 	dtp->t_flags |= (stp->t_flags & XFS_TRANS_LOWMODE);
++ 
++ 	xfs_defer_reset(stp);
+++>>>>>>> 82ff27bc52a8 (xfs: automatic dfops buffer relogging)
+  }
+diff --cc fs/xfs/libxfs/xfs_defer.h
+index 9319f67487ea,4a8bb838adf2..000000000000
+--- a/fs/xfs/libxfs/xfs_defer.h
++++ b/fs/xfs/libxfs/xfs_defer.h
+@@@ -55,26 -34,16 +55,31 @@@ enum xfs_defer_ops_type 
+  	XFS_DEFER_OPS_TYPE_MAX,
+  };
+  
+ +#define XFS_DEFER_OPS_NR_INODES	2	/* join up to two inodes */
+ +
+ +struct xfs_defer_ops {
+ +	bool			dop_committed;	/* did any trans commit? */
+ +	bool			dop_low;	/* alloc in low mode */
+ +	struct list_head	dop_intake;	/* unlogged pending work */
+ +	struct list_head	dop_pending;	/* logged pending work */
+ +
+ +	/* relog these inodes with each roll */
+ +	struct xfs_inode	*dop_inodes[XFS_DEFER_OPS_NR_INODES];
+ +};
+ +
+  void xfs_defer_add(struct xfs_defer_ops *dop, enum xfs_defer_ops_type type,
+  		struct list_head *h);
+ -int xfs_defer_finish_noroll(struct xfs_trans **tp);
+ -int xfs_defer_finish(struct xfs_trans **tp);
+ -void xfs_defer_cancel(struct xfs_trans *);
+ -void xfs_defer_init(struct xfs_trans *tp, struct xfs_defer_ops *dop);
+ +int xfs_defer_finish(struct xfs_trans **tp, struct xfs_defer_ops *dop,
+ +		struct xfs_inode *ip);
+ +void xfs_defer_cancel(struct xfs_defer_ops *dop);
+ +void xfs_defer_init(struct xfs_defer_ops *dop, xfs_fsblock_t *fbp);
+  bool xfs_defer_has_unfinished_work(struct xfs_defer_ops *dop);
+++<<<<<<< HEAD
+ +int xfs_defer_join(struct xfs_defer_ops *dop, struct xfs_inode *ip);
+++=======
++ int xfs_defer_ijoin(struct xfs_defer_ops *dop, struct xfs_inode *ip);
++ void xfs_defer_move(struct xfs_trans *dtp, struct xfs_trans *stp);
+++>>>>>>> 82ff27bc52a8 (xfs: automatic dfops buffer relogging)
+  
+  /* Description of a deferred type. */
+  struct xfs_defer_op_type {
+diff --cc fs/xfs/xfs_dquot.c
+index 191ab4fa4c54,e1196854dbcd..000000000000
+--- a/fs/xfs/xfs_dquot.c
++++ b/fs/xfs/xfs_dquot.c
+@@@ -360,35 -337,43 +360,39 @@@ xfs_qm_dqalloc
+  	 */
+  	xfs_qm_init_dquot_blk(tp, mp, be32_to_cpu(dqp->q_core.d_id),
+  			      dqp->dq_flags & XFS_DQ_ALLTYPES, bp);
+ -	xfs_buf_set_ref(bp, XFS_DQUOT_REF);
+  
+  	/*
+ -	 * Hold the buffer and join it to the dfops so that we'll still own
+ -	 * the buffer when we return to the caller.  The buffer disposal on
+ -	 * error must be paid attention to very carefully, as it has been
+ -	 * broken since commit efa092f3d4c6 "[XFS] Fixes a bug in the quota
+ -	 * code when allocating a new dquot record" in 2005, and the later
+ -	 * conversion to xfs_defer_ops in commit 310a75a3c6c747 failed to keep
+ -	 * the buffer locked across the _defer_finish call.  We can now do
+ -	 * this correctly with xfs_defer_bjoin.
+ +	 * xfs_defer_finish() may commit the current transaction and
+ +	 * start a second transaction if the freelist is not empty.
+  	 *
+ -	 * Above, we allocated a disk block for the dquot information and
+ -	 * used get_buf to initialize the dquot.  If the _defer_bjoin fails,
+ -	 * the buffer is still locked to *tpp, so we must _bhold_release and
+ -	 * then _trans_brelse the buffer.  If the _defer_finish fails, the old
+ -	 * transaction is gone but the new buffer is not joined or held to any
+ -	 * transaction, so we must _buf_relse it.
+ +	 * Since we still want to modify this buffer, we need to
+ +	 * ensure that the buffer is not released on commit of
+ +	 * the first transaction and ensure the buffer is added to the
+ +	 * second transaction.
+  	 *
+ -	 * If everything succeeds, the caller of this function is returned a
+ -	 * buffer that is locked and held to the transaction.  The caller
+ -	 * is responsible for unlocking any buffer passed back, either
+ -	 * manually or by committing the transaction.
+ +	 * If there is only one transaction then don't stop the buffer
+ +	 * from being released when it commits later on.
+  	 */
+ +
+  	xfs_trans_bhold(tp, bp);
+ -	if (error) {
+ -		xfs_trans_bhold_release(tp, bp);
+ -		xfs_trans_brelse(tp, bp);
+++<<<<<<< HEAD
+ +
+ +	error = xfs_defer_finish(tpp, &dfops, NULL);
+ +	if (error)
+  		goto error1;
+ -	}
+ -	error = xfs_defer_finish(tpp);
+ -	tp = *tpp;
+ +
+ +	/* Transaction was committed? */
+ +	if (*tpp != tp) {
+ +		tp = *tpp;
+ +		xfs_trans_bjoin(tp, bp);
+ +	} else {
+++=======
++ 	if (error) {
+ -		xfs_buf_relse(bp);
+ -		goto error1;
+++>>>>>>> 82ff27bc52a8 (xfs: automatic dfops buffer relogging)
+ +		xfs_trans_bhold_release(tp, bp);
+  	}
+ -	*bpp = bp;
+ +
+ +	*O_bpp = bp;
+  	return 0;
+  
+  error1:
+diff --cc fs/xfs/xfs_trans.h
+index ea0c951470ba,581456c79197..000000000000
+--- a/fs/xfs/xfs_trans.h
++++ b/fs/xfs/xfs_trans.h
+@@@ -88,6 -89,18 +88,21 @@@ void	xfs_log_item_init(struct xfs_moun
+  #define XFS_ITEM_LOCKED		2
+  #define XFS_ITEM_FLUSHING	3
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Deferred operations tracking structure.
++  */
++ #define XFS_DEFER_OPS_NR_INODES	2	/* join up to two inodes */
++ #define XFS_DEFER_OPS_NR_BUFS	2	/* join up to two buffers */
++ struct xfs_defer_ops {
++ 	struct list_head	dop_intake;	/* unlogged pending work */
++ 	struct list_head	dop_pending;	/* logged pending work */
++ 
++ 	/* relog these with each roll */
++ 	struct xfs_inode	*dop_inodes[XFS_DEFER_OPS_NR_INODES];
++ };
+++>>>>>>> 82ff27bc52a8 (xfs: automatic dfops buffer relogging)
+  
+  /*
+   * This is the structure maintained for every active transaction.
+* Unmerged path fs/xfs/libxfs/xfs_attr.c
+* Unmerged path fs/xfs/libxfs/xfs_defer.c
+* Unmerged path fs/xfs/libxfs/xfs_defer.h
+* Unmerged path fs/xfs/xfs_dquot.c
+* Unmerged path fs/xfs/xfs_trans.h
