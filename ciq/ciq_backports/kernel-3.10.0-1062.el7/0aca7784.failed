@@ -1,0 +1,169 @@
+scsi: qla2xxx: Reduce holding sess_lock to prevent CPU lock-up
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Reduce holding sess_lock to prevent CPU lock-up (Himanshu Madhani) [1628301]
+Rebuild_FUZZ: 94.92%
+commit-author Quinn Tran <quinn.tran@cavium.com>
+commit 0aca77843e2803bf4fab1598b7891c56c16be979
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/0aca7784.failed
+
+- Reduce sess_lock holding to prevent CPU Lock up. sess_lock was held across
+  fc_port registration and deletion.  These calls can be blocked by upper
+  layer. Sess_lock is also being accessed by interrupt thread.
+
+- Reduce number of loops in processing work_list to prevent kernel complaint
+  of CPU lockup or holding sess_lock.
+
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 0aca77843e2803bf4fab1598b7891c56c16be979)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_init.c
+#	drivers/scsi/qla2xxx/qla_target.c
+diff --cc drivers/scsi/qla2xxx/qla_init.c
+index b11673f92fa1,c675066b080e..000000000000
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@@ -1056,11 -1184,9 +1055,17 @@@ void __qla24xx_handle_gpdb_event(scsi_q
+  		vha->fcport_count++;
+  		ea->fcport->login_succ = 1;
+  
+++<<<<<<< HEAD
+ +		ql_dbg(ql_dbg_disc, vha, 0x20d6,
+ +		    "%s %d %8phC post upd_fcport fcp_cnt %d\n",
+ +		    __func__, __LINE__,  ea->fcport->port_name,
+ +		    vha->fcport_count);
+ +		qla24xx_post_upd_fcport_work(vha, ea->fcport);
+++=======
++ 		spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
++ 		qla24xx_sched_upd_fcport(ea->fcport);
++ 		spin_lock_irqsave(&vha->hw->tgt.sess_lock, flags);
+++>>>>>>> 0aca77843e28 (scsi: qla2xxx: Reduce holding sess_lock to prevent CPU lock-up)
+  	} else if (ea->fcport->login_succ) {
+  		/*
+  		 * We have an existing session. A late RSCN delivery
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 1de1bf228cff,d5f6ce8c86df..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -593,14 -601,9 +593,20 @@@ void qla2x00_async_nack_sp_done(void *s
+  			sp->fcport->login_succ = 1;
+  
+  			vha->fcport_count++;
+++<<<<<<< HEAD
+ +
+ +			ql_dbg(ql_dbg_disc, vha, 0x20f3,
+ +			    "%s %d %8phC post upd_fcport fcp_cnt %d\n",
+ +			    __func__, __LINE__,
+ +			    sp->fcport->port_name,
+ +			    vha->fcport_count);
+ +			sp->fcport->disc_state = DSC_UPD_FCPORT;
+ +			qla24xx_post_upd_fcport_work(vha, sp->fcport);
+++=======
++ 			spin_unlock_irqrestore(&vha->hw->tgt.sess_lock, flags);
++ 			qla24xx_sched_upd_fcport(sp->fcport);
++ 			spin_lock_irqsave(&vha->hw->tgt.sess_lock, flags);
+++>>>>>>> 0aca77843e28 (scsi: qla2xxx: Reduce holding sess_lock to prevent CPU lock-up)
+  		} else {
+  			sp->fcport->login_retry = 0;
+  			sp->fcport->disc_state = DSC_LOGIN_COMPLETE;
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 3d4cdf4444af..43e4ea8d7cf4 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -262,8 +262,8 @@ struct name_list_extended {
+ 	struct get_name_list_extended *l;
+ 	dma_addr_t		ldma;
+ 	struct list_head	fcports;
+-	spinlock_t		fcports_lock;
+ 	u32			size;
++	u8			sent;
+ };
+ /*
+  * Timeout timer counts in seconds
+diff --git a/drivers/scsi/qla2xxx/qla_gs.c b/drivers/scsi/qla2xxx/qla_gs.c
+index b2ae89a0a86d..a6f0796593c7 100644
+--- a/drivers/scsi/qla2xxx/qla_gs.c
++++ b/drivers/scsi/qla2xxx/qla_gs.c
+@@ -3917,11 +3917,10 @@ void qla24xx_async_gnnft_done(scsi_qla_host_t *vha, srb_t *sp)
+ 			if ((qla_dual_mode_enabled(vha) ||
+ 				qla_ini_mode_enabled(vha)) &&
+ 			    atomic_read(&fcport->state) == FCS_ONLINE) {
+-				qla2x00_mark_device_lost(vha, fcport,
+-				    ql2xplogiabsentdevice, 0);
++				if (fcport->loop_id != FC_NO_LOOP_ID) {
++					if (fcport->flags & FCF_FCP2_DEVICE)
++						fcport->logout_on_delete = 0;
+ 
+-				if (fcport->loop_id != FC_NO_LOOP_ID &&
+-				    (fcport->flags & FCF_FCP2_DEVICE) == 0) {
+ 					ql_dbg(ql_dbg_disc, vha, 0x20f0,
+ 					    "%s %d %8phC post del sess\n",
+ 					    __func__, __LINE__,
+@@ -4151,12 +4150,13 @@ static void qla2x00_async_gpnft_gnnft_sp_done(void *s, int res)
+ 
+ 		sp->rc = res;
+ 		rc = qla2x00_post_nvme_gpnft_done_work(vha, sp, QLA_EVT_GPNFT);
+-		if (!rc) {
++		if (rc) {
+ 			qla24xx_sp_unmap(vha, sp);
+ 			set_bit(LOCAL_LOOP_UPDATE, &vha->dpc_flags);
+ 			set_bit(LOOP_RESYNC_NEEDED, &vha->dpc_flags);
+ 			return;
+ 		}
++		return;
+ 	}
+ 
+ 	if (cmd == GPN_FT_CMD) {
+@@ -4206,6 +4206,8 @@ static int qla24xx_async_gnnft(scsi_qla_host_t *vha, struct srb *sp,
+ 		vha->scan.scan_flags &= ~SF_SCANNING;
+ 		spin_unlock_irqrestore(&vha->work_lock, flags);
+ 		WARN_ON(1);
++		set_bit(LOCAL_LOOP_UPDATE, &vha->dpc_flags);
++		set_bit(LOOP_RESYNC_NEEDED, &vha->dpc_flags);
+ 		goto done_free_sp;
+ 	}
+ 
+@@ -4239,8 +4241,12 @@ static int qla24xx_async_gnnft(scsi_qla_host_t *vha, struct srb *sp,
+ 	sp->done = qla2x00_async_gpnft_gnnft_sp_done;
+ 
+ 	rval = qla2x00_start_sp(sp);
+-	if (rval != QLA_SUCCESS)
++	if (rval != QLA_SUCCESS) {
++		spin_lock_irqsave(&vha->work_lock, flags);
++		vha->scan.scan_flags &= ~SF_SCANNING;
++		spin_unlock_irqrestore(&vha->work_lock, flags);
+ 		goto done_free_sp;
++	}
+ 
+ 	ql_dbg(ql_dbg_disc, vha, 0xffff,
+ 	    "Async-%s hdl=%x FC4Type %x.\n", sp->name,
+* Unmerged path drivers/scsi/qla2xxx/qla_init.c
+diff --git a/drivers/scsi/qla2xxx/qla_os.c b/drivers/scsi/qla2xxx/qla_os.c
+index 8a8a4d42e79b..58e74482fbb3 100644
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@ -2779,7 +2779,7 @@ static void qla2x00_iocb_work_fn(struct work_struct *work)
+ 		struct scsi_qla_host, iocb_work);
+ 	struct qla_hw_data *ha = vha->hw;
+ 	struct scsi_qla_host *base_vha = pci_get_drvdata(ha->pdev);
+-	int i = 20;
++	int i = 2;
+ 	unsigned long flags;
+ 
+ 	if (test_bit(UNLOADING, &base_vha->dpc_flags))
+@@ -4662,7 +4662,6 @@ struct scsi_qla_host *qla2x00_create_host(struct scsi_host_template *sht,
+ 
+ 	spin_lock_init(&vha->work_lock);
+ 	spin_lock_init(&vha->cmd_list_lock);
+-	spin_lock_init(&vha->gnl.fcports_lock);
+ 	init_waitqueue_head(&vha->fcport_waitQ);
+ 	init_waitqueue_head(&vha->vref_waitq);
+ 
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
