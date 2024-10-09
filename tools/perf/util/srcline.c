@@ -8,6 +8,7 @@
 #include "util/util.h"
 #include "util/debug.h"
 #include "util/callchain.h"
+#include "srcline.h"
 
 #include "symbol.h"
 
