@@ -1,0 +1,487 @@
+net: phy: fix resume handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] phy: fix resume handling (Ivan Vecera) [1685646]
+Rebuild_FUZZ: 90.57%
+commit-author Russell King <rmk+kernel@armlinux.org.uk>
+commit f5e64032a799d4f54decc7eb6aafcdffb67f9ad9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/f5e64032.failed
+
+When a PHY has the BMCR_PDOWN bit set, it may decide to ignore writes
+to other registers, or reset the registers to power-on defaults.
+Micrel PHYs do this for their interrupt registers.
+
+The current structure of phylib tries to enable interrupts before
+resuming (and releasing) the BMCR_PDOWN bit.  This fails, causing
+Micrel PHYs to stop working after a suspend/resume sequence if they
+are using interrupts.
+
+Fix this by ensuring that the PHY driver resume methods do not take
+the phydev->lock mutex themselves, but the callers of phy_resume()
+take that lock.  This then allows us to move the call to phy_resume()
+before we enable interrupts in phy_start().
+
+	Signed-off-by: Russell King <rmk+kernel@armlinux.org.uk>
+	Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f5e64032a799d4f54decc7eb6aafcdffb67f9ad9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/phy/at803x.c
+#	drivers/net/phy/phy_device.c
+diff --cc drivers/net/phy/at803x.c
+index 45cbc10de01c,e911e4990b20..000000000000
+--- a/drivers/net/phy/at803x.c
++++ b/drivers/net/phy/at803x.c
+@@@ -43,23 -161,114 +43,101 @@@ static void at803x_set_wol_mac_addr(str
+  	};
+  
+  	if (!ndev)
+ -		return -ENODEV;
+ +		return;
+  
+ -	if (wol->wolopts & WAKE_MAGIC) {
+ -		mac = (const u8 *) ndev->dev_addr;
+ +	mac = (const u8 *) ndev->dev_addr;
+  
+ -		if (!is_valid_ether_addr(mac))
+ -			return -EINVAL;
+ +	if (!is_valid_ether_addr(mac))
+ +		return;
+  
+ -		for (i = 0; i < 3; i++) {
+ -			phy_write(phydev, AT803X_MMD_ACCESS_CONTROL,
+ +	for (i = 0; i < 3; i++) {
+ +		phy_write(phydev, AT803X_MMD_ACCESS_CONTROL,
+  				  AT803X_DEVICE_ADDR);
+ -			phy_write(phydev, AT803X_MMD_ACCESS_CONTROL_DATA,
+ +		phy_write(phydev, AT803X_MMD_ACCESS_CONTROL_DATA,
+  				  offsets[i]);
+ -			phy_write(phydev, AT803X_MMD_ACCESS_CONTROL,
+ +		phy_write(phydev, AT803X_MMD_ACCESS_CONTROL,
+  				  AT803X_FUNC_DATA);
+ -			phy_write(phydev, AT803X_MMD_ACCESS_CONTROL_DATA,
+ +		phy_write(phydev, AT803X_MMD_ACCESS_CONTROL_DATA,
+  				  mac[(i * 2) + 1] | (mac[(i * 2)] << 8));
+ -		}
+ -
+ -		value = phy_read(phydev, AT803X_INTR_ENABLE);
+ -		value |= AT803X_INTR_ENABLE_WOL;
+ -		ret = phy_write(phydev, AT803X_INTR_ENABLE, value);
+ -		if (ret)
+ -			return ret;
+ -		value = phy_read(phydev, AT803X_INTR_STATUS);
+ -	} else {
+ -		value = phy_read(phydev, AT803X_INTR_ENABLE);
+ -		value &= (~AT803X_INTR_ENABLE_WOL);
+ -		ret = phy_write(phydev, AT803X_INTR_ENABLE, value);
+ -		if (ret)
+ -			return ret;
+ -		value = phy_read(phydev, AT803X_INTR_STATUS);
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	return ret;
++ }
++ 
++ static void at803x_get_wol(struct phy_device *phydev,
++ 			   struct ethtool_wolinfo *wol)
++ {
++ 	u32 value;
++ 
++ 	wol->supported = WAKE_MAGIC;
++ 	wol->wolopts = 0;
++ 
++ 	value = phy_read(phydev, AT803X_INTR_ENABLE);
++ 	if (value & AT803X_INTR_ENABLE_WOL)
++ 		wol->wolopts |= WAKE_MAGIC;
++ }
++ 
++ static int at803x_suspend(struct phy_device *phydev)
++ {
++ 	int value;
++ 	int wol_enabled;
++ 
++ 	mutex_lock(&phydev->lock);
++ 
++ 	value = phy_read(phydev, AT803X_INTR_ENABLE);
++ 	wol_enabled = value & AT803X_INTR_ENABLE_WOL;
++ 
++ 	value = phy_read(phydev, MII_BMCR);
++ 
++ 	if (wol_enabled)
++ 		value |= BMCR_ISOLATE;
++ 	else
++ 		value |= BMCR_PDOWN;
++ 
++ 	phy_write(phydev, MII_BMCR, value);
++ 
++ 	mutex_unlock(&phydev->lock);
++ 
++ 	return 0;
++ }
++ 
++ static int at803x_resume(struct phy_device *phydev)
++ {
++ 	int value;
++ 
++ 	value = phy_read(phydev, MII_BMCR);
++ 	value &= ~(BMCR_PDOWN | BMCR_ISOLATE);
++ 	phy_write(phydev, MII_BMCR, value);
++ 
++ 	return 0;
++ }
++ 
++ static int at803x_probe(struct phy_device *phydev)
++ {
++ 	struct device *dev = &phydev->mdio.dev;
++ 	struct at803x_priv *priv;
++ 	struct gpio_desc *gpiod_reset;
++ 
++ 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++ 	if (!priv)
++ 		return -ENOMEM;
++ 
++ 	if (phydev->drv->phy_id != ATH8030_PHY_ID)
++ 		goto does_not_require_reset_workaround;
++ 
++ 	gpiod_reset = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
++ 	if (IS_ERR(gpiod_reset))
++ 		return PTR_ERR(gpiod_reset);
++ 
++ 	priv->gpiod_reset = gpiod_reset;
++ 
++ does_not_require_reset_workaround:
++ 	phydev->priv = priv;
++ 
++ 	return 0;
+++>>>>>>> f5e64032a799 (net: phy: fix resume handling)
+  }
+  
+  static int at803x_config_init(struct phy_device *phydev)
+diff --cc drivers/net/phy/phy_device.c
+index f7f4abfd4a6f,b15b31ca2618..000000000000
+--- a/drivers/net/phy/phy_device.c
++++ b/drivers/net/phy/phy_device.c
+@@@ -62,9 -75,120 +62,123 @@@ static struct phy_driver genphy_driver[
+  static LIST_HEAD(phy_fixup_list);
+  static DEFINE_MUTEX(phy_fixup_lock);
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_PM
++ static bool mdio_bus_phy_may_suspend(struct phy_device *phydev)
++ {
++ 	struct device_driver *drv = phydev->mdio.dev.driver;
++ 	struct phy_driver *phydrv = to_phy_driver(drv);
++ 	struct net_device *netdev = phydev->attached_dev;
++ 
++ 	if (!drv || !phydrv->suspend)
++ 		return false;
++ 
++ 	/* PHY not attached? May suspend if the PHY has not already been
++ 	 * suspended as part of a prior call to phy_disconnect() ->
++ 	 * phy_detach() -> phy_suspend() because the parent netdev might be the
++ 	 * MDIO bus driver and clock gated at this point.
++ 	 */
++ 	if (!netdev)
++ 		return !phydev->suspended;
++ 
++ 	/* Don't suspend PHY if the attached netdev parent may wakeup.
++ 	 * The parent may point to a PCI device, as in tg3 driver.
++ 	 */
++ 	if (netdev->dev.parent && device_may_wakeup(netdev->dev.parent))
++ 		return false;
++ 
++ 	/* Also don't suspend PHY if the netdev itself may wakeup. This
++ 	 * is the case for devices w/o underlaying pwr. mgmt. aware bus,
++ 	 * e.g. SoC devices.
++ 	 */
++ 	if (device_may_wakeup(&netdev->dev))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ static int mdio_bus_phy_suspend(struct device *dev)
++ {
++ 	struct phy_device *phydev = to_phy_device(dev);
++ 
++ 	/* We must stop the state machine manually, otherwise it stops out of
++ 	 * control, possibly with the phydev->lock held. Upon resume, netdev
++ 	 * may call phy routines that try to grab the same lock, and that may
++ 	 * lead to a deadlock.
++ 	 */
++ 	if (phydev->attached_dev && phydev->adjust_link)
++ 		phy_stop_machine(phydev);
++ 
++ 	if (!mdio_bus_phy_may_suspend(phydev))
++ 		return 0;
++ 
++ 	return phy_suspend(phydev);
++ }
++ 
++ static int mdio_bus_phy_resume(struct device *dev)
++ {
++ 	struct phy_device *phydev = to_phy_device(dev);
++ 	int ret;
++ 
++ 	if (!mdio_bus_phy_may_suspend(phydev))
++ 		goto no_resume;
++ 
++ 	mutex_lock(&phydev->lock);
++ 	ret = phy_resume(phydev);
++ 	mutex_unlock(&phydev->lock);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ no_resume:
++ 	if (phydev->attached_dev && phydev->adjust_link)
++ 		phy_start_machine(phydev);
++ 
++ 	return 0;
++ }
++ 
++ static int mdio_bus_phy_restore(struct device *dev)
++ {
++ 	struct phy_device *phydev = to_phy_device(dev);
++ 	struct net_device *netdev = phydev->attached_dev;
++ 	int ret;
++ 
++ 	if (!netdev)
++ 		return 0;
++ 
++ 	ret = phy_init_hw(phydev);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	/* The PHY needs to renegotiate. */
++ 	phydev->link = 0;
++ 	phydev->state = PHY_UP;
++ 
++ 	phy_start_machine(phydev);
++ 
++ 	return 0;
++ }
++ 
++ static const struct dev_pm_ops mdio_bus_phy_pm_ops = {
++ 	.suspend = mdio_bus_phy_suspend,
++ 	.resume = mdio_bus_phy_resume,
++ 	.freeze = mdio_bus_phy_suspend,
++ 	.thaw = mdio_bus_phy_resume,
++ 	.restore = mdio_bus_phy_restore,
++ };
++ 
++ #define MDIO_BUS_PHY_PM_OPS (&mdio_bus_phy_pm_ops)
++ 
++ #else
++ 
++ #define MDIO_BUS_PHY_PM_OPS NULL
++ 
++ #endif /* CONFIG_PM */
++ 
+++>>>>>>> f5e64032a799 (net: phy: fix resume handling)
+  /**
+   * phy_register_fixup - creates a new phy_fixup and adds it to the list
+ - * @bus_id: A string which matches phydev->mdio.dev.bus_id (or PHY_ANY_ID)
+ + * @bus_id: A string which matches phydev->dev.bus_id (or PHY_ANY_ID)
+   * @phy_uid: Used to match against phydev->phy_id (the UID of the PHY)
+   *	It can also be PHY_ANY_UID
+   * @phy_uid_mask: Applied to phydev->phy_id and fixup->phy_uid before
+@@@ -651,9 -1026,12 +765,15 @@@ int phy_attach_direct(struct net_devic
+  	 */
+  	err = phy_init_hw(phydev);
+  	if (err)
+ -		goto error;
+ +		phy_detach(phydev);
+  
++ 	mutex_lock(&phydev->lock);
+  	phy_resume(phydev);
+++<<<<<<< HEAD
+++=======
++ 	mutex_unlock(&phydev->lock);
++ 	phy_led_triggers_register(phydev);
+++>>>>>>> f5e64032a799 (net: phy: fix resume handling)
+  
+  	return err;
+  
+@@@ -760,11 -1158,20 +880,25 @@@ EXPORT_SYMBOL(phy_suspend)
+  
+  int phy_resume(struct phy_device *phydev)
+  {
+ -	struct phy_driver *phydrv = to_phy_driver(phydev->mdio.dev.driver);
+ -	int ret = 0;
+ +	struct phy_driver *phydrv = to_phy_driver(phydev->dev.driver);
+  
+++<<<<<<< HEAD
+ +	if (phydrv->resume)
+ +		return phydrv->resume(phydev);
+ +	return 0;
+++=======
++ 	WARN_ON(!mutex_is_locked(&phydev->lock));
++ 
++ 	if (phydev->drv && phydrv->resume)
++ 		ret = phydrv->resume(phydev);
++ 
++ 	if (ret)
++ 		return ret;
++ 
++ 	phydev->suspended = false;
++ 
++ 	return ret;
+++>>>>>>> f5e64032a799 (net: phy: fix resume handling)
+  }
+  EXPORT_SYMBOL(phy_resume);
+  
+@@@ -1198,21 -1656,98 +1332,17 @@@ int genphy_resume(struct phy_device *ph
+  {
+  	int value;
+  
+- 	mutex_lock(&phydev->lock);
+- 
+  	value = phy_read(phydev, MII_BMCR);
+ -	if (value < 0)
+ -		return value;
+ -
+ -	if (enable)
+ -		value |= BMCR_LOOPBACK;
+ -	else
+ -		value &= ~BMCR_LOOPBACK;
+ -
+ -	return phy_write(phydev, MII_BMCR, value);
+ -}
+ -EXPORT_SYMBOL(genphy_loopback);
+ -
+ -static int __set_phy_supported(struct phy_device *phydev, u32 max_speed)
+ -{
+ -	/* The default values for phydev->supported are provided by the PHY
+ -	 * driver "features" member, we want to reset to sane defaults first
+ -	 * before supporting higher speeds.
+ -	 */
+ -	phydev->supported &= PHY_DEFAULT_FEATURES;
+ -
+ -	switch (max_speed) {
+ -	default:
+ -		return -ENOTSUPP;
+ -	case SPEED_1000:
+ -		phydev->supported |= PHY_1000BT_FEATURES;
+ -		/* fall through */
+ -	case SPEED_100:
+ -		phydev->supported |= PHY_100BT_FEATURES;
+ -		/* fall through */
+ -	case SPEED_10:
+ -		phydev->supported |= PHY_10BT_FEATURES;
+ -	}
+ +	phy_write(phydev, MII_BMCR, value & ~BMCR_PDOWN);
+  
+- 	mutex_unlock(&phydev->lock);
+- 
+  	return 0;
+  }
+ +EXPORT_SYMBOL(genphy_resume);
+  
+ -int phy_set_max_speed(struct phy_device *phydev, u32 max_speed)
+ +static int gen10g_resume(struct phy_device *phydev)
+  {
+ -	int err;
+ -
+ -	err = __set_phy_supported(phydev, max_speed);
+ -	if (err)
+ -		return err;
+ -
+ -	phydev->advertising = phydev->supported;
+ -
+  	return 0;
+  }
+ -EXPORT_SYMBOL(phy_set_max_speed);
+ -
+ -static void of_set_phy_supported(struct phy_device *phydev)
+ -{
+ -	struct device_node *node = phydev->mdio.dev.of_node;
+ -	u32 max_speed;
+ -
+ -	if (!IS_ENABLED(CONFIG_OF_MDIO))
+ -		return;
+ -
+ -	if (!node)
+ -		return;
+ -
+ -	if (!of_property_read_u32(node, "max-speed", &max_speed))
+ -		__set_phy_supported(phydev, max_speed);
+ -}
+ -
+ -static void of_set_phy_eee_broken(struct phy_device *phydev)
+ -{
+ -	struct device_node *node = phydev->mdio.dev.of_node;
+ -	u32 broken = 0;
+ -
+ -	if (!IS_ENABLED(CONFIG_OF_MDIO))
+ -		return;
+ -
+ -	if (!node)
+ -		return;
+ -
+ -	if (of_property_read_bool(node, "eee-broken-100tx"))
+ -		broken |= MDIO_EEE_100TX;
+ -	if (of_property_read_bool(node, "eee-broken-1000t"))
+ -		broken |= MDIO_EEE_1000T;
+ -	if (of_property_read_bool(node, "eee-broken-10gt"))
+ -		broken |= MDIO_EEE_10GT;
+ -	if (of_property_read_bool(node, "eee-broken-1000kx"))
+ -		broken |= MDIO_EEE_1000KX;
+ -	if (of_property_read_bool(node, "eee-broken-10gkx4"))
+ -		broken |= MDIO_EEE_10GKX4;
+ -	if (of_property_read_bool(node, "eee-broken-10gkr"))
+ -		broken |= MDIO_EEE_10GKR;
+ -
+ -	phydev->eee_broken_modes = broken;
+ -}
+  
+  /**
+   * phy_probe - probe and init a PHY device
+* Unmerged path drivers/net/phy/at803x.c
+diff --git a/drivers/net/phy/phy.c b/drivers/net/phy/phy.c
+index c89d087511ee..ff0506feac7d 100644
+--- a/drivers/net/phy/phy.c
++++ b/drivers/net/phy/phy.c
+@@ -867,7 +867,6 @@ EXPORT_SYMBOL(phy_stop);
+  */
+ void phy_start(struct phy_device *phydev)
+ {
+-	bool do_resume = false;
+ 	int err = 0;
+ 
+ 	mutex_lock(&phydev->lock);
+@@ -880,23 +879,21 @@ void phy_start(struct phy_device *phydev)
+ 		phydev->state = PHY_UP;
+ 		break;
+ 	case PHY_HALTED:
++		/* if phy was suspended, bring the physical link up again */
++		phy_resume(phydev);
++
+ 		/* make sure interrupts are re-enabled for the PHY */
+ 		err = phy_enable_interrupts(phydev);
+ 		if (err < 0)
+ 			break;
+ 
+ 		phydev->state = PHY_RESUMING;
+-		do_resume = true;
+ 		break;
+ 	default:
+ 		break;
+ 	}
+ 	mutex_unlock(&phydev->lock);
+ 
+-	/* if phy was suspended, bring the physical link up again */
+-	if (do_resume)
+-		phy_resume(phydev);
+-
+ 	phy_trigger_machine(phydev, true);
+ }
+ EXPORT_SYMBOL(phy_start);
+* Unmerged path drivers/net/phy/phy_device.c
