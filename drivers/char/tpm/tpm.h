@@ -345,11 +345,6 @@ struct tpm_pcrread_in {
 	__be32	pcr_idx;
 } __packed;
 
-struct tpm_pcrextend_in {
-	__be32	pcr_idx;
-	u8	hash[TPM_DIGEST_SIZE];
-} __packed;
-
 /* 128 bytes is an arbitrary cap. This could be as large as TPM_BUFSIZE - 18
  * bytes, but 128 is still a relatively large number of random bytes and
  * anything much bigger causes users of struct tpm_cmd_t to start getting
@@ -376,7 +371,6 @@ typedef union {
 	struct	tpm_getcap_params_in getcap_in;
 	struct	tpm_pcrread_in	pcrread_in;
 	struct	tpm_pcrread_out	pcrread_out;
-	struct	tpm_pcrextend_in pcrextend_in;
 	struct	tpm_getrandom_in getrandom_in;
 	struct	tpm_getrandom_out getrandom_out;
 	struct tpm_startup_in startup_in;
