@@ -478,7 +478,7 @@ static bool tcindex_destroy(struct tcf_proto *tp, bool force)
 	pr_debug("tcindex_destroy(tp %p),p %p\n", tp, p);
 	walker.count = 0;
 	walker.skip = 0;
-	walker.fn = &tcindex_destroy_element;
+	walker.fn = tcindex_destroy_element;
 	tcindex_walk(tp, &walker);
 
 	call_rcu(&p->rcu, __tcindex_destroy);
