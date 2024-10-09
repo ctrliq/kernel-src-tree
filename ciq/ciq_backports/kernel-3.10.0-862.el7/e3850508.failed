@@ -1,0 +1,394 @@
+s390/zcrypt: Fix blocking queue device after unbind/bind.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [s390] zcrypt: Fix blocking queue device after unbind/bind (Hendrik Brueckner) [1380349]
+Rebuild_FUZZ: 94.44%
+commit-author Harald Freudenberger <freude@linux.vnet.ibm.com>
+commit e385050873d1e19e40481d8cd868c9f60ebe46ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e3850508.failed
+
+When the association between a queue device and the
+driver is released via unbind and later re-associated
+the queue device was not operational any more. Reason
+was a wrong administration of the card/queue lists
+within the ap device driver.
+
+This patch introduces revised card/queue list handling
+within the ap device driver: when an ap device is
+detected it is initial not added to the card/queue list
+any more. With driver probe the card device is added to
+the card list/the queue device is added to the queue list
+within a card. With driver remove the device is removed
+from the card/queue list. Additionally there are some
+situations within the ap device live where the lists
+need update upon card/queue device release (for example
+device hot unplug or suspend/resume).
+
+	Signed-off-by: Harald Freudenberger <freude@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit e385050873d1e19e40481d8cd868c9f60ebe46ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/ap_bus.c
+#	drivers/s390/crypto/ap_card.c
+#	drivers/s390/crypto/ap_queue.c
+diff --cc drivers/s390/crypto/ap_bus.c
+index 5386d81f8cd3,ea099910b4e9..000000000000
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@@ -945,22 -668,28 +945,45 @@@ static int ap_device_probe(struct devic
+  	struct ap_driver *ap_drv = to_ap_drv(dev->driver);
+  	int rc;
+  
++ 	/* Add queue/card to list of active queues/cards */
++ 	spin_lock_bh(&ap_list_lock);
++ 	if (is_card_dev(dev))
++ 		list_add(&to_ap_card(dev)->list, &ap_card_list);
++ 	else
++ 		list_add(&to_ap_queue(dev)->list,
++ 			 &to_ap_queue(dev)->card->queues);
++ 	spin_unlock_bh(&ap_list_lock);
++ 
+  	ap_dev->drv = ap_drv;
+ +
+ +	spin_lock_bh(&ap_device_list_lock);
+ +	list_add(&ap_dev->list, &ap_device_list);
+ +	spin_unlock_bh(&ap_device_list_lock);
+ +
+  	rc = ap_drv->probe ? ap_drv->probe(ap_dev) : -ENODEV;
+++<<<<<<< HEAD
+ +	if (rc) {
+ +		spin_lock_bh(&ap_device_list_lock);
+ +		list_del_init(&ap_dev->list);
+ +		spin_unlock_bh(&ap_device_list_lock);
+ +	} else {
+ +		if (ap_dev->reset == AP_RESET_IN_PROGRESS ||
+ +			ap_dev->interrupt == AP_INTR_IN_PROGRESS)
+ +			__ap_schedule_poll_timer();
+ +	}
+++=======
++ 
++ 	if (rc) {
++ 		spin_lock_bh(&ap_list_lock);
++ 		if (is_card_dev(dev))
++ 			list_del_init(&to_ap_card(dev)->list);
++ 		else
++ 			list_del_init(&to_ap_queue(dev)->list);
++ 		spin_unlock_bh(&ap_list_lock);
++ 		ap_dev->drv = NULL;
++ 	}
++ 
+++>>>>>>> e385050873d1 (s390/zcrypt: Fix blocking queue device after unbind/bind.)
+  	return rc;
+  }
+  
+@@@ -999,16 -698,17 +1022,30 @@@ static int ap_device_remove(struct devi
+  	struct ap_device *ap_dev = to_ap_dev(dev);
+  	struct ap_driver *ap_drv = ap_dev->drv;
+  
+++<<<<<<< HEAD
+ +	ap_flush_queue(ap_dev);
+ +	del_timer_sync(&ap_dev->timeout);
+ +	spin_lock_bh(&ap_device_list_lock);
+ +	list_del_init(&ap_dev->list);
+ +	spin_unlock_bh(&ap_device_list_lock);
+ +	if (ap_drv->remove)
+ +		ap_drv->remove(ap_dev);
+ +	spin_lock_bh(&ap_dev->lock);
+ +	atomic_sub(ap_dev->queue_count, &ap_poll_requests);
+ +	spin_unlock_bh(&ap_dev->lock);
+++=======
++ 	if (ap_drv->remove)
++ 		ap_drv->remove(ap_dev);
++ 
++ 	/* Remove queue/card from list of active queues/cards */
++ 	spin_lock_bh(&ap_list_lock);
++ 	if (is_card_dev(dev))
++ 		list_del_init(&to_ap_card(dev)->list);
++ 	else
++ 		list_del_init(&to_ap_queue(dev)->list);
++ 	spin_unlock_bh(&ap_list_lock);
++ 
+++>>>>>>> e385050873d1 (s390/zcrypt: Fix blocking queue device after unbind/bind.)
+  	return 0;
+  }
+  
+@@@ -1425,126 -977,158 +1462,255 @@@ static void ap_interrupt_handler(struc
+  }
+  
+  /**
+ - * ap_scan_bus(): Scan the AP bus for new devices
+ - * Runs periodically, workqueue timer (ap_config_time)
+ + * __ap_scan_bus(): Scan the AP bus.
+ + * @dev: Pointer to device
+ + * @data: Pointer to data
+ + *
+ + * Scan the AP bus for new devices.
+   */
+ -static void ap_scan_bus(struct work_struct *unused)
+ +static int __ap_scan_bus(struct device *dev, void *data)
+  {
+++<<<<<<< HEAD
+ +	return to_ap_dev(dev)->qid == (ap_qid_t)(unsigned long) data;
+++=======
++ 	struct ap_queue *aq;
++ 	struct ap_card *ac;
++ 	struct device *dev;
++ 	ap_qid_t qid;
++ 	int depth = 0, type = 0;
++ 	unsigned int functions = 0;
++ 	int rc, id, dom, borked, domains;
++ 
++ 	AP_DBF(DBF_DEBUG, "ap_scan_bus running\n");
++ 
++ 	ap_query_configuration();
++ 	if (ap_select_domain() != 0)
++ 		goto out;
++ 
++ 	for (id = 0; id < AP_DEVICES; id++) {
++ 		/* check if device is registered */
++ 		dev = bus_find_device(&ap_bus_type, NULL,
++ 				      (void *)(long) id,
++ 				      __match_card_device_with_id);
++ 		ac = dev ? to_ap_card(dev) : NULL;
++ 		if (!ap_test_config_card_id(id)) {
++ 			if (dev) {
++ 				/* Card device has been removed from
++ 				 * configuration, remove the belonging
++ 				 * queue devices.
++ 				 */
++ 				bus_for_each_dev(&ap_bus_type, NULL,
++ 					(void *)(long) id,
++ 					__ap_queue_devices_with_id_unregister);
++ 				/* now remove the card device */
++ 				device_unregister(dev);
++ 				put_device(dev);
++ 			}
++ 			continue;
++ 		}
++ 		/* According to the configuration there should be a card
++ 		 * device, so check if there is at least one valid queue
++ 		 * and maybe create queue devices and the card device.
++ 		 */
++ 		domains = 0;
++ 		for (dom = 0; dom < AP_DOMAINS; dom++) {
++ 			qid = AP_MKQID(id, dom);
++ 			dev = bus_find_device(&ap_bus_type, NULL,
++ 					      (void *)(long) qid,
++ 					      __match_queue_device_with_qid);
++ 			aq = dev ? to_ap_queue(dev) : NULL;
++ 			if (!ap_test_config_domain(dom)) {
++ 				if (dev) {
++ 					/* Queue device exists but has been
++ 					 * removed from configuration.
++ 					 */
++ 					device_unregister(dev);
++ 					put_device(dev);
++ 				}
++ 				continue;
++ 			}
++ 			rc = ap_query_queue(qid, &depth, &type, &functions);
++ 			if (dev) {
++ 				spin_lock_bh(&aq->lock);
++ 				if (rc == -ENODEV ||
++ 				    /* adapter reconfiguration */
++ 				    (ac && ac->functions != functions))
++ 					aq->state = AP_STATE_BORKED;
++ 				borked = aq->state == AP_STATE_BORKED;
++ 				spin_unlock_bh(&aq->lock);
++ 				if (borked)	/* Remove broken device */
++ 					device_unregister(dev);
++ 				put_device(dev);
++ 				if (!borked) {
++ 					domains++;
++ 					continue;
++ 				}
++ 			}
++ 			if (rc)
++ 				continue;
++ 			/* new queue device needed */
++ 			if (!ac) {
++ 				/* but first create the card device */
++ 				ac = ap_card_create(id, depth,
++ 						    type, functions);
++ 				if (!ac)
++ 					continue;
++ 				ac->ap_dev.device.bus = &ap_bus_type;
++ 				ac->ap_dev.device.parent = ap_root_device;
++ 				dev_set_name(&ac->ap_dev.device,
++ 					     "card%02x", id);
++ 				/* Register card with AP bus */
++ 				rc = device_register(&ac->ap_dev.device);
++ 				if (rc) {
++ 					put_device(&ac->ap_dev.device);
++ 					ac = NULL;
++ 					break;
++ 				}
++ 				/* get it and thus adjust reference counter */
++ 				get_device(&ac->ap_dev.device);
++ 			}
++ 			/* now create the new queue device */
++ 			aq = ap_queue_create(qid, type);
++ 			if (!aq)
++ 				continue;
++ 			aq->card = ac;
++ 			aq->ap_dev.device.bus = &ap_bus_type;
++ 			aq->ap_dev.device.parent = &ac->ap_dev.device;
++ 			dev_set_name(&aq->ap_dev.device,
++ 				     "%02x.%04x", id, dom);
++ 			/* Start with a device reset */
++ 			spin_lock_bh(&aq->lock);
++ 			ap_wait(ap_sm_event(aq, AP_EVENT_POLL));
++ 			spin_unlock_bh(&aq->lock);
++ 			/* Register device */
++ 			rc = device_register(&aq->ap_dev.device);
++ 			if (rc) {
++ 				put_device(&aq->ap_dev.device);
++ 				continue;
++ 			}
++ 			domains++;
++ 		} /* end domain loop */
++ 		if (ac) {
++ 			/* remove card dev if there are no queue devices */
++ 			if (!domains)
++ 				device_unregister(&ac->ap_dev.device);
++ 			put_device(&ac->ap_dev.device);
++ 		}
++ 	} /* end device loop */
++ out:
++ 	mod_timer(&ap_config_timer, jiffies + ap_config_time * HZ);
+++>>>>>>> e385050873d1 (s390/zcrypt: Fix blocking queue device after unbind/bind.)
+  }
+  
+ -static void ap_config_timeout(unsigned long ptr)
+ +static void ap_device_release(struct device *dev)
+  {
+ -	if (ap_suspend_flag)
+ -		return;
+ -	queue_work(system_long_wq, &ap_scan_work);
+ +	struct ap_device *ap_dev = to_ap_dev(dev);
+ +
+ +	kfree(ap_dev);
+  }
+  
+ -static void ap_reset_all(void)
+ +static void ap_scan_bus(struct work_struct *unused)
+  {
+ -	int i, j;
+ +	struct ap_device *ap_dev;
+ +	struct device *dev;
+ +	ap_qid_t qid;
+ +	int queue_depth = 0, device_type = 0;
+ +	unsigned int device_functions;
+ +	int rc, i;
+  
+ -	for (i = 0; i < AP_DOMAINS; i++) {
+ -		if (!ap_test_config_domain(i))
+ +	ap_query_configuration();
+ +	if (ap_select_domain() != 0) {
+ +		return;
+ +	}
+ +	for (i = 0; i < AP_DEVICES; i++) {
+ +		qid = AP_MKQID(i, ap_domain_index);
+ +		dev = bus_find_device(&ap_bus_type, NULL,
+ +				      (void *)(unsigned long)qid,
+ +				      __ap_scan_bus);
+ +		if (ap_test_config_card_id(i))
+ +			rc = ap_query_queue(qid, &queue_depth, &device_type);
+ +		else
+ +			rc = -ENODEV;
+ +		if (dev) {
+ +			ap_dev = to_ap_dev(dev);
+ +			spin_lock_bh(&ap_dev->lock);
+ +			if (rc == -ENODEV ||
+ +			    ap_dev->unregistered == AP_DEV_UNREGISTERED) {
+ +				spin_unlock_bh(&ap_dev->lock);
+ +				if (ap_dev->unregistered == AP_DEV_UNREGISTERED)
+ +					i--;
+ +				device_unregister(dev);
+ +				put_device(dev);
+ +				continue;
+ +			}
+ +			spin_unlock_bh(&ap_dev->lock);
+ +			put_device(dev);
+  			continue;
+ -		for (j = 0; j < AP_DEVICES; j++) {
+ -			if (!ap_test_config_card_id(j))
+ +		}
+ +		if (rc)
+ +			continue;
+ +		ap_dev = kzalloc(sizeof(*ap_dev), GFP_KERNEL);
+ +		if (!ap_dev)
+ +			break;
+ +		ap_dev->qid = qid;
+ +		rc = ap_init_queue(ap_dev);
+ +		if ((rc != 0) && (rc != -EBUSY)) {
+ +			kfree(ap_dev);
+ +			continue;
+ +		}
+ +		ap_dev->queue_depth = queue_depth;
+ +		ap_dev->unregistered = AP_DEV_REGIST_IN_PROGRESS;
+ +		spin_lock_init(&ap_dev->lock);
+ +		INIT_LIST_HEAD(&ap_dev->pendingq);
+ +		INIT_LIST_HEAD(&ap_dev->requestq);
+ +		INIT_LIST_HEAD(&ap_dev->list);
+ +		setup_timer(&ap_dev->timeout, ap_request_timeout,
+ +			    (unsigned long) ap_dev);
+ +		switch (device_type) {
+ +		case 0:
+ +			/* device type probing for old cards */
+ +			if (ap_probe_device_type(ap_dev)) {
+ +				kfree(ap_dev);
+  				continue;
+ -			ap_rapq(AP_MKQID(j, i));
+ +			}
+ +			break;
+ +		default:
+ +			ap_dev->device_type = device_type;
+ +		}
+ +		ap_dev->raw_hwtype = device_type;
+ +		/* CEX6 toleration: map to CEX5 */
+ +		if (device_type == AP_DEVICE_TYPE_CEX6)
+ +			ap_dev->device_type = AP_DEVICE_TYPE_CEX5;
+ +
+ +		rc = ap_query_functions(qid, &device_functions);
+ +		if (!rc)
+ +			ap_dev->functions = device_functions;
+ +		else
+ +			ap_dev->functions = 0u;
+ +
+ +		ap_dev->device.bus = &ap_bus_type;
+ +		ap_dev->device.parent = ap_root_device;
+ +		if (dev_set_name(&ap_dev->device, "card%02x",
+ +				 AP_QID_DEVICE(ap_dev->qid))) {
+ +			kfree(ap_dev);
+ +			continue;
+ +		}
+ +		ap_dev->device.release = ap_device_release;
+ +		rc = device_register(&ap_dev->device);
+ +		if (rc) {
+ +			put_device(&ap_dev->device);
+ +			continue;
+ +		}
+ +		/* Add device attributes. */
+ +		rc = sysfs_create_group(&ap_dev->device.kobj,
+ +					&ap_dev_attr_group);
+ +		if (!rc) {
+ +			spin_lock_bh(&ap_dev->lock);
+ +			ap_dev->unregistered = AP_DEV_REGISTERED;
+ +			spin_unlock_bh(&ap_dev->lock);
+  		}
+ +		else
+ +			device_unregister(&ap_dev->device);
+  	}
+  }
+  
+* Unmerged path drivers/s390/crypto/ap_card.c
+* Unmerged path drivers/s390/crypto/ap_queue.c
+* Unmerged path drivers/s390/crypto/ap_bus.c
+* Unmerged path drivers/s390/crypto/ap_card.c
+* Unmerged path drivers/s390/crypto/ap_queue.c
