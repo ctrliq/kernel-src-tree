@@ -1,0 +1,273 @@
+vfs: factor out helpers d_instantiate_anon() and d_alloc_anon()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Miklos Szeredi <miklos@szeredi.hu>
+commit f9c34674bc60e5fc0af6ec6513517ed9182862b9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/f9c34674.failed
+
+Those helpers are going to be used by overlayfs to implement
+NFS export decode.
+
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit f9c34674bc60e5fc0af6ec6513517ed9182862b9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dcache.c
+#	include/linux/dcache.h
+diff --cc fs/dcache.c
+index f8f0822c6dd1,99bce0ed0213..000000000000
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@@ -1559,6 -1699,22 +1559,25 @@@ struct dentry *d_alloc(struct dentry * 
+  }
+  EXPORT_SYMBOL(d_alloc);
+  
+++<<<<<<< HEAD
+++=======
++ struct dentry *d_alloc_anon(struct super_block *sb)
++ {
++ 	return __d_alloc(sb, NULL);
++ }
++ EXPORT_SYMBOL(d_alloc_anon);
++ 
++ struct dentry *d_alloc_cursor(struct dentry * parent)
++ {
++ 	struct dentry *dentry = d_alloc_anon(parent->d_sb);
++ 	if (dentry) {
++ 		dentry->d_flags |= DCACHE_RCUACCESS | DCACHE_DENTRY_CURSOR;
++ 		dentry->d_parent = dget(parent);
++ 	}
++ 	return dentry;
++ }
++ 
+++>>>>>>> f9c34674bc60 (vfs: factor out helpers d_instantiate_anon() and d_alloc_anon())
+  /**
+   * d_alloc_pseudo - allocate a dentry (for lookup-less filesystems)
+   * @sb: the superblock
+@@@ -1763,9 -1893,7 +1782,13 @@@ struct dentry *d_make_root(struct inod
+  	struct dentry *res = NULL;
+  
+  	if (root_inode) {
+++<<<<<<< HEAD
+ +		static const struct qstr name = QSTR_INIT("/", 1);
+ +
+ +		res = __d_alloc(root_inode->i_sb, &name);
+++=======
++ 		res = d_alloc_anon(root_inode->i_sb);
+++>>>>>>> f9c34674bc60 (vfs: factor out helpers d_instantiate_anon() and d_alloc_anon())
+  		if (res)
+  			d_instantiate(res, root_inode);
+  		else
+@@@ -1804,8 -1932,79 +1827,82 @@@ struct dentry *d_find_any_alias(struct 
+  }
+  EXPORT_SYMBOL(d_find_any_alias);
+  
+++<<<<<<< HEAD
+++=======
++ static struct dentry *__d_instantiate_anon(struct dentry *dentry,
++ 					   struct inode *inode,
++ 					   bool disconnected)
++ {
++ 	struct dentry *res;
++ 	unsigned add_flags;
++ 
++ 	security_d_instantiate(dentry, inode);
++ 	spin_lock(&inode->i_lock);
++ 	res = __d_find_any_alias(inode);
++ 	if (res) {
++ 		spin_unlock(&inode->i_lock);
++ 		dput(dentry);
++ 		goto out_iput;
++ 	}
++ 
++ 	/* attach a disconnected dentry */
++ 	add_flags = d_flags_for_inode(inode);
++ 
++ 	if (disconnected)
++ 		add_flags |= DCACHE_DISCONNECTED;
++ 
++ 	spin_lock(&dentry->d_lock);
++ 	__d_set_inode_and_type(dentry, inode, add_flags);
++ 	hlist_add_head(&dentry->d_u.d_alias, &inode->i_dentry);
++ 	hlist_bl_lock(&dentry->d_sb->s_anon);
++ 	hlist_bl_add_head(&dentry->d_hash, &dentry->d_sb->s_anon);
++ 	hlist_bl_unlock(&dentry->d_sb->s_anon);
++ 	spin_unlock(&dentry->d_lock);
++ 	spin_unlock(&inode->i_lock);
++ 
++ 	return dentry;
++ 
++  out_iput:
++ 	iput(inode);
++ 	return res;
++ }
++ 
++ struct dentry *d_instantiate_anon(struct dentry *dentry, struct inode *inode)
++ {
++ 	return __d_instantiate_anon(dentry, inode, true);
++ }
++ EXPORT_SYMBOL(d_instantiate_anon);
++ 
++ static struct dentry *__d_obtain_alias(struct inode *inode, bool disconnected)
++ {
++ 	struct dentry *tmp;
++ 	struct dentry *res;
++ 
++ 	if (!inode)
++ 		return ERR_PTR(-ESTALE);
++ 	if (IS_ERR(inode))
++ 		return ERR_CAST(inode);
++ 
++ 	res = d_find_any_alias(inode);
++ 	if (res)
++ 		goto out_iput;
++ 
++ 	tmp = d_alloc_anon(inode->i_sb);
++ 	if (!tmp) {
++ 		res = ERR_PTR(-ENOMEM);
++ 		goto out_iput;
++ 	}
++ 
++ 	return __d_instantiate_anon(tmp, inode, disconnected);
++ 
++ out_iput:
++ 	iput(inode);
++ 	return res;
++ }
++ 
+++>>>>>>> f9c34674bc60 (vfs: factor out helpers d_instantiate_anon() and d_alloc_anon())
+  /**
+ - * d_obtain_alias - find or allocate a DISCONNECTED dentry for a given inode
+ + * d_obtain_alias - find or allocate a dentry for a given inode
+   * @inode: inode to allocate the dentry for
+   *
+   * Obtain a dentry for an inode resulting from NFS filehandle conversion or
+@@@ -1824,59 -2023,32 +1921,87 @@@
+   */
+  struct dentry *d_obtain_alias(struct inode *inode)
+  {
+++<<<<<<< HEAD
+ +	static const struct qstr anonstring = QSTR_INIT("/", 1);
+ +	struct dentry *tmp;
+ +	struct dentry *res;
+ +	unsigned add_flags;
+ +
+ +	if (!inode)
+ +		return ERR_PTR(-ESTALE);
+ +	if (IS_ERR(inode))
+ +		return ERR_CAST(inode);
+ +
+ +	res = d_find_any_alias(inode);
+ +	if (res)
+ +		goto out_iput;
+ +
+ +	tmp = __d_alloc(inode->i_sb, &anonstring);
+ +	if (!tmp) {
+ +		res = ERR_PTR(-ENOMEM);
+ +		goto out_iput;
+ +	}
+ +
+ +	spin_lock(&inode->i_lock);
+ +	res = __d_find_any_alias(inode);
+ +	if (res) {
+ +		spin_unlock(&inode->i_lock);
+ +		dput(tmp);
+ +		goto out_iput;
+ +	}
+ +
+ +	/* attach a disconnected dentry */
+ +	add_flags = d_flags_for_inode(inode) | DCACHE_DISCONNECTED;
+ +
+ +	spin_lock(&tmp->d_lock);
+ +	tmp->d_inode = inode;
+ +	tmp->d_flags |= add_flags;
+ +	hlist_add_head(&tmp->d_alias, &inode->i_dentry);
+ +	hlist_bl_lock(&tmp->d_sb->s_anon);
+ +	hlist_bl_add_head(&tmp->d_hash, &tmp->d_sb->s_anon);
+ +	hlist_bl_unlock(&tmp->d_sb->s_anon);
+ +	spin_unlock(&tmp->d_lock);
+ +	spin_unlock(&inode->i_lock);
+ +	security_d_instantiate(tmp, inode);
+ +
+ +	return tmp;
+ +
+ + out_iput:
+ +	if (res && !IS_ERR(res))
+ +		security_d_instantiate(res, inode);
+ +	iput(inode);
+ +	return res;
+++=======
++ 	return __d_obtain_alias(inode, true);
+++>>>>>>> f9c34674bc60 (vfs: factor out helpers d_instantiate_anon() and d_alloc_anon())
+  }
+  EXPORT_SYMBOL(d_obtain_alias);
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * d_obtain_root - find or allocate a dentry for a given inode
++  * @inode: inode to allocate the dentry for
++  *
++  * Obtain an IS_ROOT dentry for the root of a filesystem.
++  *
++  * We must ensure that directory inodes only ever have one dentry.  If a
++  * dentry is found, that is returned instead of allocating a new one.
++  *
++  * On successful return, the reference to the inode has been transferred
++  * to the dentry.  In case of an error the reference on the inode is
++  * released.  A %NULL or IS_ERR inode may be passed in and will be the
++  * error will be propagate to the return value, with a %NULL @inode
++  * replaced by ERR_PTR(-ESTALE).
++  */
++ struct dentry *d_obtain_root(struct inode *inode)
++ {
++ 	return __d_obtain_alias(inode, false);
++ }
++ EXPORT_SYMBOL(d_obtain_root);
++ 
++ /**
+++>>>>>>> f9c34674bc60 (vfs: factor out helpers d_instantiate_anon() and d_alloc_anon())
+   * d_add_ci - lookup or allocate new dentry with case-exact name
+   * @inode:  the inode case-insensitive lookup has found
+   * @dentry: the negative dentry that was passed to the parent's lookup func
+diff --cc include/linux/dcache.h
+index d021d2f76e5c,82a99d366aec..000000000000
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@@ -242,7 -227,8 +242,12 @@@ static inline int dname_external(struc
+   */
+  extern void d_instantiate(struct dentry *, struct inode *);
+  extern struct dentry * d_instantiate_unique(struct dentry *, struct inode *);
+++<<<<<<< HEAD
+ +extern struct dentry * d_materialise_unique(struct dentry *, struct inode *);
+++=======
++ extern struct dentry * d_instantiate_anon(struct dentry *, struct inode *);
++ extern int d_instantiate_no_diralias(struct dentry *, struct inode *);
+++>>>>>>> f9c34674bc60 (vfs: factor out helpers d_instantiate_anon() and d_alloc_anon())
+  extern void __d_drop(struct dentry *dentry);
+  extern void d_drop(struct dentry *dentry);
+  extern void d_delete(struct dentry *);
+@@@ -250,11 -236,16 +255,12 @@@ extern void d_set_d_op(struct dentry *d
+  
+  /* allocate/de-allocate */
+  extern struct dentry * d_alloc(struct dentry *, const struct qstr *);
++ extern struct dentry * d_alloc_anon(struct super_block *);
+  extern struct dentry * d_alloc_pseudo(struct super_block *, const struct qstr *);
+ -extern struct dentry * d_alloc_parallel(struct dentry *, const struct qstr *,
+ -					wait_queue_head_t *);
+  extern struct dentry * d_splice_alias(struct inode *, struct dentry *);
+  extern struct dentry * d_add_ci(struct dentry *, struct inode *, struct qstr *);
+ -extern struct dentry * d_exact_alias(struct dentry *, struct inode *);
+  extern struct dentry *d_find_any_alias(struct inode *inode);
+  extern struct dentry * d_obtain_alias(struct inode *);
+ -extern struct dentry * d_obtain_root(struct inode *);
+  extern void shrink_dcache_sb(struct super_block *);
+  extern void shrink_dcache_parent(struct dentry *);
+  extern void shrink_dcache_for_umount(struct super_block *);
+* Unmerged path fs/dcache.c
+* Unmerged path include/linux/dcache.h
