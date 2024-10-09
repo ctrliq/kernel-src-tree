@@ -1,0 +1,165 @@
+brd: remove dax support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 7a862fbbdec665190c5ef298c0c6ec9f3915cf45
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/7a862fbb.failed
+
+DAX support in brd is awkward because its backing page frames are
+distinct from the ones provided by pmem, dcssblk, or axonram. We need
+pfn_t_devmap() entries to fully support DAX, and the limited DAX support
+for pfn_t_special() page frames is not interesting for brd when pmem is
+already a superset of brd.  Lastly, brd is the only dax capable driver
+that may sleep in its ->direct_access() implementation. So it causes a
+global burden with no net gain of kernel functionality.
+
+For all these reasons, remove DAX support.
+
+	Cc: Jens Axboe <axboe@kernel.dk>
+	Cc: Matthew Wilcox <mawilcox@microsoft.com>
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 7a862fbbdec665190c5ef298c0c6ec9f3915cf45)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/brd.c
+diff --cc drivers/block/brd.c
+index bfe79fba5ad9,b2391bbd7e5a..000000000000
+--- a/drivers/block/brd.c
++++ b/drivers/block/brd.c
+@@@ -19,13 -20,8 +19,16 @@@
+  #include <linux/radix-tree.h>
+  #include <linux/fs.h>
+  #include <linux/slab.h>
+++<<<<<<< HEAD
+ +#ifdef CONFIG_BLK_DEV_RAM_DAX
+ +#include <linux/pfn_t.h>
+ +#include <linux/dax.h>
+ +#include <linux/socket.h> /* memcpy_fromiovecend_partial */
+ +#endif
+++=======
+++>>>>>>> 7a862fbbdec6 (brd: remove dax support)
+  
+ -#include <linux/uaccess.h>
+ +#include <asm/uaccess.h>
+  
+  #define SECTOR_SHIFT		9
+  #define PAGE_SECTORS_SHIFT	(PAGE_SHIFT - SECTOR_SHIFT)
+@@@ -377,78 -323,6 +374,81 @@@ static int brd_rw_page(struct block_dev
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_BLK_DEV_RAM_DAX
+ +static long __brd_direct_access(struct brd_device *brd, pgoff_t pgoff,
+ +		long nr_pages, void **kaddr, pfn_t *pfn)
+ +{
+ +	struct page *page;
+ +
+ +	if (!brd)
+ +		return -ENODEV;
+ +	page = brd_insert_page(brd, PFN_PHYS(pgoff) / 512);
+ +	if (!page)
+ +		return -ENOSPC;
+ +	*kaddr = page_address(page);
+ +	*pfn = page_to_pfn_t(page);
+ +
+ +	return 1;
+ +}
+ +
+ +static long brd_dax_direct_access(struct dax_device *dax_dev,
+ +		pgoff_t pgoff, long nr_pages, void **kaddr, pfn_t *pfn)
+ +{
+ +	struct brd_device *brd = dax_get_private(dax_dev);
+ +
+ +	return __brd_direct_access(brd, pgoff, nr_pages, kaddr, pfn);
+ +}
+ +
+ +static int brd_dax_memcpy_fromiovecend(struct dax_device *dax_dev,
+ +		pgoff_t pgoff, void *addr, const struct iovec *iov,
+ +		int offset, int len)
+ +{
+ +	return memcpy_fromiovecend_partial_flushcache(addr, iov, offset, len);
+ +}
+ +
+ +static const struct dax_operations brd_dax_ops = {
+ +	.direct_access = brd_dax_direct_access,
+ +	.memcpy_fromiovecend = brd_dax_memcpy_fromiovecend,
+ +};
+ +#endif
+ +
+ +static int brd_ioctl(struct block_device *bdev, fmode_t mode,
+ +			unsigned int cmd, unsigned long arg)
+ +{
+ +	int error;
+ +	struct brd_device *brd = bdev->bd_disk->private_data;
+ +
+ +	if (cmd != BLKFLSBUF)
+ +		return -ENOTTY;
+ +
+ +	/*
+ +	 * ram device BLKFLSBUF has special semantics, we want to actually
+ +	 * release and destroy the ramdisk data.
+ +	 */
+ +	mutex_lock(&brd_mutex);
+ +	mutex_lock(&bdev->bd_mutex);
+ +	error = -EBUSY;
+ +	if (bdev->bd_openers <= 1) {
+ +		/*
+ +		 * Kill the cache first, so it isn't written back to the
+ +		 * device.
+ +		 *
+ +		 * Another thread might instantiate more buffercache here,
+ +		 * but there is not much we can do to close that race.
+ +		 */
+ +		kill_bdev(bdev);
+ +		brd_free_pages(brd);
+ +		error = 0;
+ +	}
+ +	mutex_unlock(&bdev->bd_mutex);
+ +	mutex_unlock(&brd_mutex);
+ +
+ +	return error;
+ +}
+ +
+++=======
+++>>>>>>> 7a862fbbdec6 (brd: remove dax support)
+  static const struct block_device_operations brd_fops = {
+  	.owner =		THIS_MODULE,
+  	.rw_page =		brd_rw_page,
+diff --git a/drivers/block/Kconfig b/drivers/block/Kconfig
+index 3780fa75760f..1c562edaec26 100644
+--- a/drivers/block/Kconfig
++++ b/drivers/block/Kconfig
+@@ -337,7 +337,6 @@ config BLK_DEV_SX8
+ 
+ config BLK_DEV_RAM
+ 	tristate "RAM block device support"
+-	select DAX if BLK_DEV_RAM_DAX
+ 	---help---
+ 	  Saying Y here will allow you to use a portion of your RAM memory as
+ 	  a block device, so that you can make file systems on it, read and
+@@ -372,17 +371,6 @@ config BLK_DEV_RAM_SIZE
+ 	  The default value is 4096 kilobytes. Only change this if you know
+ 	  what you are doing.
+ 
+-config BLK_DEV_RAM_DAX
+-	bool "Support Direct Access (DAX) to RAM block devices"
+-	depends on BLK_DEV_RAM && FS_DAX
+-	default n
+-	help
+-	  Support filesystems using DAX to access RAM block devices.  This
+-	  avoids double-buffering data in the page cache before copying it
+-	  to the block device.  Answering Y will slightly enlarge the kernel,
+-	  and will prevent RAM block device backing store memory from being
+-	  allocated from highmem (only a problem for highmem systems).
+-
+ config CDROM_PKTCDVD
+ 	tristate "Packet writing on CD/DVD media"
+ 	depends on !UML
+* Unmerged path drivers/block/brd.c
