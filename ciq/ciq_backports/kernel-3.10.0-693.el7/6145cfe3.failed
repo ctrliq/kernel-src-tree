@@ -1,0 +1,142 @@
+x86, kaslr: Raise the maximum virtual address to -1 GiB on x86_64
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [x86] kaslr: Raise the maximum virtual address to -1 GiB on x86_64 (Baoquan He) [1290840]
+Rebuild_FUZZ: 96.00%
+commit-author Kees Cook <keescook@chromium.org>
+commit 6145cfe394a7f138f6b64491c5663f97dba12450
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/6145cfe3.failed
+
+On 64-bit, this raises the maximum location to -1 GiB (from -1.5 GiB),
+the upper limit currently, since the kernel fixmap page mappings need
+to be moved to use the other 1 GiB (which would be the theoretical
+limit when building with -mcmodel=kernel).
+
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+Link: http://lkml.kernel.org/r/1381450698-28710-7-git-send-email-keescook@chromium.org
+	Signed-off-by: H. Peter Anvin <hpa@linux.intel.com>
+(cherry picked from commit 6145cfe394a7f138f6b64491c5663f97dba12450)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/Kconfig
+diff --cc arch/x86/Kconfig
+index 5162fc083bed,51f439953d23..000000000000
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@@ -1789,12 -1722,52 +1789,56 @@@ config RELOCATABL
+  
+  	  Note: If CONFIG_RELOCATABLE=y, then the kernel runs from the address
+  	  it has been loaded at and the compile time physical address
+ -	  (CONFIG_PHYSICAL_START) is used as the minimum location.
+ +	  (CONFIG_PHYSICAL_START) is ignored.
+  
+++<<<<<<< HEAD
+ +# Relocation on x86-32 needs some additional build support
+++=======
++ config RANDOMIZE_BASE
++ 	bool "Randomize the address of the kernel image"
++ 	depends on RELOCATABLE
++ 	depends on !HIBERNATION
++ 	default n
++ 	---help---
++ 	   Randomizes the physical and virtual address at which the
++ 	   kernel image is decompressed, as a security feature that
++ 	   deters exploit attempts relying on knowledge of the location
++ 	   of kernel internals.
++ 
++ 	   Entropy is generated using the RDRAND instruction if it
++ 	   is supported.  If not, then RDTSC is used, if supported. If
++ 	   neither RDRAND nor RDTSC are supported, then no randomness
++ 	   is introduced.
++ 
++ 	   The kernel will be offset by up to RANDOMIZE_BASE_MAX_OFFSET,
++ 	   and aligned according to PHYSICAL_ALIGN.
++ 
++ config RANDOMIZE_BASE_MAX_OFFSET
++ 	hex "Maximum ASLR offset allowed"
++ 	depends on RANDOMIZE_BASE
++ 	range 0x0 0x20000000 if X86_32
++ 	default "0x20000000" if X86_32
++ 	range 0x0 0x40000000 if X86_64
++ 	default "0x40000000" if X86_64
++ 	---help---
++ 	 Determines the maximal offset in bytes that will be applied to the
++ 	 kernel when Address Space Layout Randomization (ASLR) is active.
++ 	 Must be less than or equal to the actual physical memory on the
++ 	 system. This must be a multiple of CONFIG_PHYSICAL_ALIGN.
++ 
++ 	 On 32-bit this is limited to 512MiB.
++ 
++ 	 On 64-bit this is limited by how the kernel fixmap page table is
++ 	 positioned, so this cannot be larger that 1GiB currently. Normally
++ 	 there is a 512MiB to 1.5GiB split between kernel and modules. When
++ 	 this is raised above the 512MiB default, the modules area will
++ 	 shrink to compensate, up to the current maximum 1GiB to 1GiB split.
++ 
++ # Relocation on x86 needs some additional build support
+++>>>>>>> 6145cfe394a7 (x86, kaslr: Raise the maximum virtual address to -1 GiB on x86_64)
+  config X86_NEED_RELOCS
+  	def_bool y
+ -	depends on RANDOMIZE_BASE || (X86_32 && RELOCATABLE)
+ +	depends on X86_32 && RELOCATABLE
+  
+  config PHYSICAL_ALIGN
+  	hex "Alignment value to which kernel should be aligned"
+* Unmerged path arch/x86/Kconfig
+diff --git a/arch/x86/include/asm/page_64_types.h b/arch/x86/include/asm/page_64_types.h
+index 94f1cf6df981..75450b2c7be4 100644
+--- a/arch/x86/include/asm/page_64_types.h
++++ b/arch/x86/include/asm/page_64_types.h
+@@ -38,9 +38,18 @@
+ #define __VIRTUAL_MASK_SHIFT	47
+ 
+ /*
+- * Kernel image size is limited to 512 MB (see level2_kernel_pgt in
+- * arch/x86/kernel/head_64.S), and it is mapped here:
++ * Kernel image size is limited to 1GiB due to the fixmap living in the
++ * next 1GiB (see level2_kernel_pgt in arch/x86/kernel/head_64.S). Use
++ * 512MiB by default, leaving 1.5GiB for modules once the page tables
++ * are fully set up. If kernel ASLR is configured, it can extend the
++ * kernel page table mapping, reducing the size of the modules area.
+  */
+-#define KERNEL_IMAGE_SIZE	(512 * 1024 * 1024)
++#define KERNEL_IMAGE_SIZE_DEFAULT      (512 * 1024 * 1024)
++#if defined(CONFIG_RANDOMIZE_BASE) && \
++	CONFIG_RANDOMIZE_BASE_MAX_OFFSET > KERNEL_IMAGE_SIZE_DEFAULT
++#define KERNEL_IMAGE_SIZE   CONFIG_RANDOMIZE_BASE_MAX_OFFSET
++#else
++#define KERNEL_IMAGE_SIZE      KERNEL_IMAGE_SIZE_DEFAULT
++#endif
+ 
+ #endif /* _ASM_X86_PAGE_64_DEFS_H */
+diff --git a/arch/x86/include/asm/pgtable_64_types.h b/arch/x86/include/asm/pgtable_64_types.h
+index 2d883440cb9a..c883bf726398 100644
+--- a/arch/x86/include/asm/pgtable_64_types.h
++++ b/arch/x86/include/asm/pgtable_64_types.h
+@@ -58,7 +58,7 @@ typedef struct { pteval_t pte; } pte_t;
+ #define VMALLOC_START    _AC(0xffffc90000000000, UL)
+ #define VMALLOC_END      _AC(0xffffe8ffffffffff, UL)
+ #define VMEMMAP_START	 _AC(0xffffea0000000000, UL)
+-#define MODULES_VADDR    _AC(0xffffffffa0000000, UL)
++#define MODULES_VADDR    (__START_KERNEL_map + KERNEL_IMAGE_SIZE)
+ #define MODULES_END      _AC(0xffffffffff000000, UL)
+ #define MODULES_LEN   (MODULES_END - MODULES_VADDR)
+ 
+diff --git a/arch/x86/mm/init_32.c b/arch/x86/mm/init_32.c
+index 9fddbeed8c43..40a8029e4ab8 100644
+--- a/arch/x86/mm/init_32.c
++++ b/arch/x86/mm/init_32.c
+@@ -832,6 +832,9 @@ void __init mem_init(void)
+ 	BUILD_BUG_ON(VMALLOC_START			>= VMALLOC_END);
+ #undef high_memory
+ #undef __FIXADDR_TOP
++#ifdef CONFIG_RANDOMIZE_BASE
++	BUILD_BUG_ON(CONFIG_RANDOMIZE_BASE_MAX_OFFSET > KERNEL_IMAGE_SIZE);
++#endif
+ 
+ #ifdef CONFIG_HIGHMEM
+ 	BUG_ON(PKMAP_BASE + LAST_PKMAP*PAGE_SIZE	> FIXADDR_START);
