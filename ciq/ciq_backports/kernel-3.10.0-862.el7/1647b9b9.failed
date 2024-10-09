@@ -1,0 +1,160 @@
+brd: add dax_operations support
+    
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 1647b9b959c7b1b3c20e8efa2c40529e7dce756a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/1647b9b9.failed
+
+Setup a dax_inode to have the same lifetime as the brd block device and
+add a ->direct_access() method that is equivalent to
+brd_direct_access(). Once fs/dax.c has been converted to use
+dax_operations the old brd_direct_access() will be removed.
+
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 1647b9b959c7b1b3c20e8efa2c40529e7dce756a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/brd.c
+diff --cc drivers/block/brd.c
+index 779aabf7a791,60f3193c9ce2..000000000000
+--- a/drivers/block/brd.c
++++ b/drivers/block/brd.c
+@@@ -21,9 -21,10 +21,10 @@@
+  #include <linux/slab.h>
+  #ifdef CONFIG_BLK_DEV_RAM_DAX
+  #include <linux/pfn_t.h>
++ #include <linux/dax.h>
+  #endif
+  
+ -#include <linux/uaccess.h>
+ +#include <asm/uaccess.h>
+  
+  #define SECTOR_SHIFT		9
+  #define PAGE_SECTORS_SHIFT	(PAGE_SHIFT - SECTOR_SHIFT)
+@@@ -387,51 -392,40 +390,79 @@@ static long __brd_direct_access(struct 
+  	*kaddr = page_address(page);
+  	*pfn = page_to_pfn_t(page);
+  
+- 	return PAGE_SIZE;
++ 	return 1;
++ }
++ 
++ static long brd_blk_direct_access(struct block_device *bdev, sector_t sector,
++ 			void **kaddr, pfn_t *pfn, long size)
++ {
++ 	struct brd_device *brd = bdev->bd_disk->private_data;
++ 	long nr_pages = __brd_direct_access(brd, PHYS_PFN(sector * 512),
++ 			PHYS_PFN(size), kaddr, pfn);
++ 
++ 	if (nr_pages < 0)
++ 		return nr_pages;
++ 	return nr_pages * PAGE_SIZE;
++ }
++ 
++ static long brd_dax_direct_access(struct dax_device *dax_dev,
++ 		pgoff_t pgoff, long nr_pages, void **kaddr, pfn_t *pfn)
++ {
++ 	struct brd_device *brd = dax_get_private(dax_dev);
++ 
++ 	return __brd_direct_access(brd, pgoff, nr_pages, kaddr, pfn);
+  }
++ 
++ static const struct dax_operations brd_dax_ops = {
++ 	.direct_access = brd_dax_direct_access,
++ };
+  #else
+- #define brd_direct_access NULL
++ #define brd_blk_direct_access NULL
+  #endif
+  
+ +static int brd_ioctl(struct block_device *bdev, fmode_t mode,
+ +			unsigned int cmd, unsigned long arg)
+ +{
+ +	int error;
+ +	struct brd_device *brd = bdev->bd_disk->private_data;
+ +
+ +	if (cmd != BLKFLSBUF)
+ +		return -ENOTTY;
+ +
+ +	/*
+ +	 * ram device BLKFLSBUF has special semantics, we want to actually
+ +	 * release and destroy the ramdisk data.
+ +	 */
+ +	mutex_lock(&brd_mutex);
+ +	mutex_lock(&bdev->bd_mutex);
+ +	error = -EBUSY;
+ +	if (bdev->bd_openers <= 1) {
+ +		/*
+ +		 * Kill the cache first, so it isn't written back to the
+ +		 * device.
+ +		 *
+ +		 * Another thread might instantiate more buffercache here,
+ +		 * but there is not much we can do to close that race.
+ +		 */
+ +		kill_bdev(bdev);
+ +		brd_free_pages(brd);
+ +		error = 0;
+ +	}
+ +	mutex_unlock(&bdev->bd_mutex);
+ +	mutex_unlock(&brd_mutex);
+ +
+ +	return error;
+ +}
+ +
+  static const struct block_device_operations brd_fops = {
+  	.owner =		THIS_MODULE,
+  	.rw_page =		brd_rw_page,
+++<<<<<<< HEAD
+ +	.ioctl =		brd_ioctl,
+ +	.direct_access =	brd_direct_access,
+++=======
++ 	.direct_access =	brd_blk_direct_access,
+++>>>>>>> 1647b9b959c7 (brd: add dax_operations support)
+  };
+  
+  /*
+@@@ -487,14 -486,19 +520,18 @@@ static struct brd_device *brd_alloc(in
+  	blk_queue_max_hw_sectors(brd->brd_queue, 1024);
+  	blk_queue_bounce_limit(brd->brd_queue, BLK_BOUNCE_ANY);
+  
+ -	/* This is so fdisk will align partitions on 4k, because of
+ -	 * direct_access API needing 4k alignment, returning a PFN
+ -	 * (This is only a problem on very small devices <= 4M,
+ -	 *  otherwise fdisk will align on 1M. Regardless this call
+ -	 *  is harmless)
+ -	 */
+ -	blk_queue_physical_block_size(brd->brd_queue, PAGE_SIZE);
+ -
+  	brd->brd_queue->limits.discard_granularity = PAGE_SIZE;
+ -	blk_queue_max_discard_sectors(brd->brd_queue, UINT_MAX);
+ +	brd->brd_queue->limits.max_discard_sectors = UINT_MAX;
+  	brd->brd_queue->limits.discard_zeroes_data = 1;
+  	queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, brd->brd_queue);
+++<<<<<<< HEAD
+ +#ifdef CONFIG_BLK_DEV_RAM_DAX
+ +	queue_flag_set_unlocked(QUEUE_FLAG_DAX, brd->brd_queue);
+ +#endif
+ +	disk = brd->brd_disk = alloc_disk(1 << part_shift);
+++=======
++ 	disk = brd->brd_disk = alloc_disk(max_part);
+++>>>>>>> 1647b9b959c7 (brd: add dax_operations support)
+  	if (!disk)
+  		goto out_free_queue;
+  	disk->major		= RAMDISK_MAJOR;
+diff --git a/drivers/block/Kconfig b/drivers/block/Kconfig
+index 83c9bbc23698..3780fa75760f 100644
+--- a/drivers/block/Kconfig
++++ b/drivers/block/Kconfig
+@@ -337,6 +337,7 @@ config BLK_DEV_SX8
+ 
+ config BLK_DEV_RAM
+ 	tristate "RAM block device support"
++	select DAX if BLK_DEV_RAM_DAX
+ 	---help---
+ 	  Saying Y here will allow you to use a portion of your RAM memory as
+ 	  a block device, so that you can make file systems on it, read and
+* Unmerged path drivers/block/brd.c
