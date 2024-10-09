@@ -1232,7 +1232,7 @@ struct snd_soc_pcm_runtime {
 	struct snd_pcm *pcm;
 	struct snd_compr *compr;
 	struct snd_soc_codec *codec;
-	struct snd_soc_platform *platform;
+	struct snd_soc_platform *platform; /* will be removed */
 	struct snd_soc_dai *codec_dai;
 	struct snd_soc_dai *cpu_dai;
 	struct snd_soc_component *component; /* Only valid for AUX dev rtds */
