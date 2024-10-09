@@ -1,0 +1,280 @@
+x86/microcode/AMD: Change load_microcode_amd()'s param to bool to fix preemptibility bug
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [x86] microcode/amd: Change load_microcode_amd()'s param to bool to fix preemptibility bug (Prarit Bhargava) [1568249]
+Rebuild_FUZZ: 97.67%
+commit-author Borislav Petkov <bp@suse.de>
+commit dac6ca243c4c49a9ca7507d3d66140ebfac8b04b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/dac6ca24.failed
+
+With CONFIG_DEBUG_PREEMPT enabled, I get:
+
+  BUG: using smp_processor_id() in preemptible [00000000] code: swapper/0/1
+  caller is debug_smp_processor_id
+  CPU: 0 PID: 1 Comm: swapper/0 Not tainted 4.12.0-rc2+ #2
+  Call Trace:
+   dump_stack
+   check_preemption_disabled
+   debug_smp_processor_id
+   save_microcode_in_initrd_amd
+   ? microcode_init
+   save_microcode_in_initrd
+   ...
+
+because, well, it says it above, we're using smp_processor_id() in
+preemptible code.
+
+But passing the CPU number is not really needed. It is only used to
+determine whether we're on the BSP, and, if so, to save the microcode
+patch for early loading.
+
+ [ We don't absolutely need to do it on the BSP but we do that
+   customarily there. ]
+
+Instead, convert that function parameter to a boolean which denotes
+whether the patch should be saved or not, thereby avoiding the use of
+smp_processor_id() in preemptible code.
+
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20170528200414.31305-1-bp@alien8.de
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit dac6ca243c4c49a9ca7507d3d66140ebfac8b04b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/microcode/amd.c
+diff --cc arch/x86/kernel/cpu/microcode/amd.c
+index 0d1af0efc84a,e9f4d762aa5b..000000000000
+--- a/arch/x86/kernel/cpu/microcode/amd.c
++++ b/arch/x86/kernel/cpu/microcode/amd.c
+@@@ -304,166 -284,65 +304,177 @@@ void __init load_ucode_amd_bsp(unsigne
+  	if (!(cp.data && cp.size))
+  		return;
+  
+ -	apply_microcode_early_amd(cpuid_1_eax, cp.data, cp.size, true);
+ +	*data = cp.data;
+ +	*size = cp.size;
+ +
+ +	apply_ucode_in_initrd(cp.data, cp.size, true);
+  }
+  
+ -void load_ucode_amd_ap(unsigned int cpuid_1_eax)
+ +#ifdef CONFIG_X86_32
+ +/*
+ + * On 32-bit, since AP's early load occurs before paging is turned on, we
+ + * cannot traverse cpu_equiv_table and pcache in kernel heap memory. So during
+ + * cold boot, AP will apply_ucode_in_initrd() just like the BSP. During
+ + * save_microcode_in_initrd_amd() BSP's patch is copied to amd_ucode_patch,
+ + * which is used upon resume from suspend.
+ + */
+ +void load_ucode_amd_ap(void)
+  {
+  	struct microcode_amd *mc;
+ -	struct cpio_data cp;
+ -	u32 *new_rev, rev, dummy;
+ +	size_t *usize;
+ +	void **ucode;
+  
+ -	if (IS_ENABLED(CONFIG_X86_32)) {
+ -		mc	= (struct microcode_amd *)__pa_nodebug(amd_ucode_patch);
+ -		new_rev = (u32 *)__pa_nodebug(&ucode_new_rev);
+ -	} else {
+ -		mc	= (struct microcode_amd *)amd_ucode_patch;
+ -		new_rev = &ucode_new_rev;
+ +	mc = (struct microcode_amd *)__pa_nodebug(amd_ucode_patch);
+ +	if (mc->hdr.patch_id && mc->hdr.processor_rev_id) {
+ +		__apply_microcode_amd(mc);
+ +		return;
+  	}
+  
+ -	native_rdmsr(MSR_AMD64_PATCH_LEVEL, rev, dummy);
+ +	ucode = (void *)__pa_nodebug(&container);
+ +	usize = (size_t *)__pa_nodebug(&container_size);
+  
+ -	/* Check whether we have saved a new patch already: */
+ -	if (*new_rev && rev < mc->hdr.patch_id) {
+ -		if (!__apply_microcode_amd(mc)) {
+ -			*new_rev = mc->hdr.patch_id;
+ -			return;
+ -		}
+ -	}
+ -
+ -	__load_ucode_amd(cpuid_1_eax, &cp);
+ -	if (!(cp.data && cp.size))
+ +	if (!*ucode || !*usize)
+  		return;
+  
+ -	apply_microcode_early_amd(cpuid_1_eax, cp.data, cp.size, false);
+ +	apply_ucode_in_initrd(*ucode, *usize, false);
+  }
+  
+++<<<<<<< HEAD
+ +static void __init collect_cpu_sig_on_bsp(void *arg)
+++=======
++ static enum ucode_state
++ load_microcode_amd(bool save, u8 family, const u8 *data, size_t size);
++ 
++ int __init save_microcode_in_initrd_amd(unsigned int cpuid_1_eax)
+++>>>>>>> dac6ca243c4c (x86/microcode/AMD: Change load_microcode_amd()'s param to bool to fix preemptibility bug)
+  {
+ -	struct cont_desc desc = { 0 };
+ -	enum ucode_state ret;
+ -	struct cpio_data cp;
+ +	unsigned int cpu = smp_processor_id();
+ +	struct ucode_cpu_info *uci = ucode_cpu_info + cpu;
+  
+ -	cp = find_microcode_in_initrd(ucode_path, false);
+ -	if (!(cp.data && cp.size))
+ -		return -EINVAL;
+ +	uci->cpu_sig.sig = cpuid_eax(0x00000001);
+ +}
+ +
+ +static void __init get_bsp_sig(void)
+ +{
+ +	unsigned int bsp = boot_cpu_data.cpu_index;
+ +	struct ucode_cpu_info *uci = ucode_cpu_info + bsp;
+ +
+ +	if (!uci->cpu_sig.sig)
+ +		smp_call_function_single(bsp, collect_cpu_sig_on_bsp, NULL, 1);
+ +}
+ +#else
+ +void load_ucode_amd_ap(void)
+ +{
+ +	unsigned int cpu = smp_processor_id();
+ +	struct equiv_cpu_entry *eq;
+ +	struct microcode_amd *mc;
+ +	u8 *cont = container;
+ +	u32 rev, eax;
+ +	u16 eq_id;
+ +
+ +	/* Exit if called on the BSP. */
+ +	if (!cpu)
+ +		return;
+ +
+ +	if (!container)
+ +		return;
+ +
+ +	/*
+ +	 * 64-bit runs with paging enabled, thus early==false.
+ +	 */
+ +	if (check_current_patch_level(&rev, false))
+ +		return;
+ +
+ +	/* Add CONFIG_RANDOMIZE_MEMORY offset. */
+ +	if (!ucode_builtin)
+ +		cont += PAGE_OFFSET - __PAGE_OFFSET_BASE;
+ +
+ +	eax = cpuid_eax(0x00000001);
+ +	eq  = (struct equiv_cpu_entry *)(cont + CONTAINER_HDR_SZ);
+ +
+ +	eq_id = find_equiv_id(eq, eax);
+ +	if (!eq_id)
+ +		return;
+ +
+ +	if (eq_id == this_equiv_id) {
+ +		mc = (struct microcode_amd *)amd_ucode_patch;
+ +
+ +		if (mc && rev < mc->hdr.patch_id) {
+ +			if (!__apply_microcode_amd(mc))
+ +				ucode_new_rev = mc->hdr.patch_id;
+ +		}
+ +
+ +	} else {
+ +		if (!ucode_cpio.data)
+ +			return;
+  
+ -	desc.cpuid_1_eax = cpuid_1_eax;
+ +		/*
+ +		 * AP has a different equivalence ID than BSP, looks like
+ +		 * mixed-steppings silicon so go through the ucode blob anew.
+ +		 */
+ +		apply_ucode_in_initrd(ucode_cpio.data, ucode_cpio.size, false);
+ +	}
+ +}
+ +#endif
+  
+ -	scan_containers(cp.data, cp.size, &desc);
+ -	if (!desc.mc)
+ +int __init save_microcode_in_initrd_amd(void)
+ +{
+ +	unsigned long cont;
+ +	int retval = 0;
+ +	enum ucode_state ret;
+ +	u8 *cont_va;
+ +	u32 eax;
+ +
+ +	if (!container)
+  		return -EINVAL;
+  
+ +#ifdef CONFIG_X86_32
+ +	get_bsp_sig();
+ +	cont	= (unsigned long)container;
+ +	cont_va = __va(container);
+ +#else
+ +	/*
+ +	 * We need the physical address of the container for both bitness since
+ +	 * boot_params.hdr.ramdisk_image is a physical address.
+ +	 */
+ +	cont    = __pa(container);
+ +	cont_va = container;
+ +#endif
+ +
+ +	/*
+ +	 * Take into account the fact that the ramdisk might get relocated and
+ +	 * therefore we need to recompute the container's position in virtual
+ +	 * memory space.
+ +	 */
+ +	if (relocated_ramdisk)
+ +		container = (u8 *)(__va(relocated_ramdisk) +
+ +			     (cont - boot_params.hdr.ramdisk_image));
+ +	else
+ +		container = cont_va;
+ +
+++<<<<<<< HEAD
+ +	/* Add CONFIG_RANDOMIZE_MEMORY offset. */
+ +	if (!ucode_builtin)
+ +		container += PAGE_OFFSET - __PAGE_OFFSET_BASE;
+ +
+ +	eax   = cpuid_eax(0x00000001);
+ +	eax   = ((eax >> 8) & 0xf) + ((eax >> 20) & 0xff);
+ +
+ +	ret = load_microcode_amd(smp_processor_id(), eax, container, container_size);
+++=======
++ 	ret = load_microcode_amd(true, x86_family(cpuid_1_eax), desc.data, desc.size);
+++>>>>>>> dac6ca243c4c (x86/microcode/AMD: Change load_microcode_amd()'s param to bool to fix preemptibility bug)
+  	if (ret != UCODE_OK)
+ -		return -EINVAL;
+ +		retval = -EINVAL;
+  
+ -	return 0;
+ +	/*
+ +	 * This will be freed any msec now, stash patches for the current
+ +	 * family and switch to patch cache for cpu hotplug, etc later.
+ +	 */
+ +	container = NULL;
+ +	container_size = 0;
+ +
+ +	return retval;
+  }
+  
+  void reload_ucode_amd(void)
+@@@ -865,7 -673,8 +876,12 @@@ static enum ucode_state __load_microcod
+  	return UCODE_OK;
+  }
+  
+++<<<<<<< HEAD
+ +enum ucode_state load_microcode_amd(int cpu, u8 family, const u8 *data, size_t size)
+++=======
++ static enum ucode_state
++ load_microcode_amd(bool save, u8 family, const u8 *data, size_t size)
+++>>>>>>> dac6ca243c4c (x86/microcode/AMD: Change load_microcode_amd()'s param to bool to fix preemptibility bug)
+  {
+  	enum ucode_state ret;
+  
+* Unmerged path arch/x86/kernel/cpu/microcode/amd.c
