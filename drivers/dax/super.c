@@ -201,8 +201,7 @@ static ssize_t write_cache_show(struct device *dev,
 	if (!dax_dev)
 		return -ENXIO;
 
-	rc = sprintf(buf, "%d\n", !!test_bit(DAXDEV_WRITE_CACHE,
-				&dax_dev->flags));
+	rc = sprintf(buf, "%d\n", !!dax_write_cache_enabled(dax_dev));
 	put_dax(dax_dev);
 	return rc;
 }
@@ -220,10 +219,8 @@ static ssize_t write_cache_store(struct device *dev,
 
 	if (rc)
 		len = rc;
-	else if (write_cache)
-		set_bit(DAXDEV_WRITE_CACHE, &dax_dev->flags);
 	else
-		clear_bit(DAXDEV_WRITE_CACHE, &dax_dev->flags);
+		dax_write_cache(dax_dev, write_cache);
 
 	put_dax(dax_dev);
 	return len;
@@ -317,7 +314,7 @@ EXPORT_SYMBOL_GPL(dax_memcpy_toiovecend);
 void arch_wb_cache_pmem(void *addr, size_t size);
 void dax_flush(struct dax_device *dax_dev, void *addr, size_t size)
 {
-	if (unlikely(!test_bit(DAXDEV_WRITE_CACHE, &dax_dev->flags)))
+	if (unlikely(!dax_write_cache_enabled(dax_dev)))
 		return;
 
 	arch_wb_cache_pmem(addr, size);
