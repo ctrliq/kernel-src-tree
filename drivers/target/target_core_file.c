@@ -691,7 +691,7 @@ fd_execute_rw(struct se_cmd *cmd, struct scatterlist *sgl, u32 sgl_nents,
 	if (data_direction == DMA_FROM_DEVICE) {
 		memset(&fd_prot, 0, sizeof(struct fd_prot));
 
-		if (cmd->prot_type) {
+		if (cmd->prot_type && dev->dev_attrib.pi_prot_type) {
 			ret = fd_do_prot_rw(cmd, &fd_prot, false);
 			if (ret < 0)
 				return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
@@ -699,7 +699,7 @@ fd_execute_rw(struct se_cmd *cmd, struct scatterlist *sgl, u32 sgl_nents,
 
 		ret = fd_do_rw(cmd, sgl, sgl_nents, 0);
 
-		if (ret > 0 && cmd->prot_type) {
+		if (ret > 0 && cmd->prot_type && dev->dev_attrib.pi_prot_type) {
 			u32 sectors = cmd->data_length / dev->dev_attrib.block_size;
 
 			rc = sbc_dif_verify_read(cmd, cmd->t_task_lba, sectors,
@@ -715,7 +715,7 @@ fd_execute_rw(struct se_cmd *cmd, struct scatterlist *sgl, u32 sgl_nents,
 	} else {
 		memset(&fd_prot, 0, sizeof(struct fd_prot));
 
-		if (cmd->prot_type) {
+		if (cmd->prot_type && dev->dev_attrib.pi_prot_type) {
 			u32 sectors = cmd->data_length / dev->dev_attrib.block_size;
 
 			ret = fd_do_prot_rw(cmd, &fd_prot, false);
@@ -753,7 +753,7 @@ fd_execute_rw(struct se_cmd *cmd, struct scatterlist *sgl, u32 sgl_nents,
 			vfs_fsync_range(fd_dev->fd_file, start, end, 1);
 		}
 
-		if (ret > 0 && cmd->prot_type) {
+		if (ret > 0 && cmd->prot_type && dev->dev_attrib.pi_prot_type) {
 			ret = fd_do_prot_rw(cmd, &fd_prot, true);
 			if (ret < 0)
 				return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
