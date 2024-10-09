@@ -1,0 +1,226 @@
+dax: introduce dax_direct_access()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit b0686260fecaa924d8eff2ace94bee70506bc308
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b0686260.failed
+
+Replace bdev_direct_access() with dax_direct_access() that uses
+dax_device and dax_operations instead of a block_device and
+block_device_operations for dax. Once all consumers of the old api have
+been converted bdev_direct_access() will be deleted.
+
+Given that block device partitioning decisions can cause dax page
+alignment constraints to be violated this also introduces the
+bdev_dax_pgoff() helper. It handles calculating a logical pgoff relative
+to the dax_device and also checks for page alignment.
+
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit b0686260fecaa924d8eff2ace94bee70506bc308)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/Kconfig
+#	drivers/dax/super.c
+#	fs/block_dev.c
+#	include/linux/dax.h
+diff --cc block/Kconfig
+index a7e40a7c8214,93da7fc3f254..000000000000
+--- a/block/Kconfig
++++ b/block/Kconfig
+@@@ -4,6 -4,9 +4,12 @@@
+  menuconfig BLOCK
+         bool "Enable the block layer" if EXPERT
+         default y
+++<<<<<<< HEAD
+++=======
++        select SBITMAP
++        select SRCU
++        select DAX
+++>>>>>>> b0686260feca (dax: introduce dax_direct_access())
+         help
+  	 Provide block layer support for the kernel.
+  
+diff --cc fs/block_dev.c
+index ed7207dfa086,2f7885712575..000000000000
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@@ -530,6 -719,64 +531,67 @@@ int bdev_write_page(struct block_devic
+  EXPORT_SYMBOL_GPL(bdev_write_page);
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * bdev_direct_access() - Get the address for directly-accessibly memory
++  * @bdev: The device containing the memory
++  * @dax: control and output parameters for ->direct_access
++  *
++  * If a block device is made up of directly addressable memory, this function
++  * will tell the caller the PFN and the address of the memory.  The address
++  * may be directly dereferenced within the kernel without the need to call
++  * ioremap(), kmap() or similar.  The PFN is suitable for inserting into
++  * page tables.
++  *
++  * Return: negative errno if an error occurs, otherwise the number of bytes
++  * accessible at this address.
++  */
++ long bdev_direct_access(struct block_device *bdev, struct blk_dax_ctl *dax)
++ {
++ 	sector_t sector = dax->sector;
++ 	long avail, size = dax->size;
++ 	const struct block_device_operations *ops = bdev->bd_disk->fops;
++ 
++ 	/*
++ 	 * The device driver is allowed to sleep, in order to make the
++ 	 * memory directly accessible.
++ 	 */
++ 	might_sleep();
++ 
++ 	if (size < 0)
++ 		return size;
++ 	if (!blk_queue_dax(bdev_get_queue(bdev)) || !ops->direct_access)
++ 		return -EOPNOTSUPP;
++ 	if ((sector + DIV_ROUND_UP(size, 512)) >
++ 					part_nr_sects_read(bdev->bd_part))
++ 		return -ERANGE;
++ 	sector += get_start_sect(bdev);
++ 	if (sector % (PAGE_SIZE / 512))
++ 		return -EINVAL;
++ 	avail = ops->direct_access(bdev, sector, &dax->addr, &dax->pfn, size);
++ 	if (!avail)
++ 		return -ERANGE;
++ 	if (avail > 0 && avail & ~PAGE_MASK)
++ 		return -ENXIO;
++ 	return min(avail, size);
++ }
++ EXPORT_SYMBOL_GPL(bdev_direct_access);
++ 
++ int bdev_dax_pgoff(struct block_device *bdev, sector_t sector, size_t size,
++ 		pgoff_t *pgoff)
++ {
++ 	phys_addr_t phys_off = (get_start_sect(bdev) + sector) * 512;
++ 
++ 	if (pgoff)
++ 		*pgoff = PHYS_PFN(phys_off);
++ 	if (phys_off % PAGE_SIZE || size % PAGE_SIZE)
++ 		return -EINVAL;
++ 	return 0;
++ }
++ EXPORT_SYMBOL(bdev_dax_pgoff);
++ 
++ /**
+++>>>>>>> b0686260feca (dax: introduce dax_direct_access())
+   * bdev_dax_supported() - Check if the device supports dax for filesystem
+   * @sb: The superblock of the device
+   * @blocksize: The block size of the device
+diff --cc include/linux/dax.h
+index 8937c7aed5cb,7e62e280c11f..000000000000
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@@ -6,29 -6,66 +6,56 @@@
+  #include <linux/radix-tree.h>
+  #include <asm/pgtable.h>
+  
+++<<<<<<< HEAD
+++=======
++ struct iomap_ops;
++ struct dax_device;
++ struct dax_operations {
++ 	/*
++ 	 * direct_access: translate a device-relative
++ 	 * logical-page-offset into an absolute physical pfn. Return the
++ 	 * number of pages available for DAX at that pfn.
++ 	 */
++ 	long (*direct_access)(struct dax_device *, pgoff_t, long,
++ 			void **, pfn_t *);
++ };
++ 
++ int dax_read_lock(void);
++ void dax_read_unlock(int id);
++ struct dax_device *dax_get_by_host(const char *host);
++ struct dax_device *alloc_dax(void *private, const char *host,
++ 		const struct dax_operations *ops);
++ void put_dax(struct dax_device *dax_dev);
++ bool dax_alive(struct dax_device *dax_dev);
++ void kill_dax(struct dax_device *dax_dev);
++ void *dax_get_private(struct dax_device *dax_dev);
++ long dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff, long nr_pages,
++ 		void **kaddr, pfn_t *pfn);
++ 
+++>>>>>>> b0686260feca (dax: introduce dax_direct_access())
+  /*
+ - * We use lowest available bit in exceptional entry for locking, one bit for
+ - * the entry size (PMD) and two more to tell us if the entry is a huge zero
+ - * page (HZP) or an empty entry that is just used for locking.  In total four
+ - * special bits.
+ - *
+ - * If the PMD bit isn't set the entry has size PAGE_SIZE, and if the HZP and
+ - * EMPTY bits aren't set the entry is a normal DAX entry with a filesystem
+ - * block allocation.
+ + * We use lowest available bit in exceptional entry for locking, other two
+ + * bits to determine entry type. In total 3 special bits.
+   */
+ -#define RADIX_DAX_SHIFT	(RADIX_TREE_EXCEPTIONAL_SHIFT + 4)
+ +#define RADIX_DAX_SHIFT	(RADIX_TREE_EXCEPTIONAL_SHIFT + 3)
+  #define RADIX_DAX_ENTRY_LOCK (1 << RADIX_TREE_EXCEPTIONAL_SHIFT)
+ -#define RADIX_DAX_PMD (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 1))
+ -#define RADIX_DAX_HZP (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 2))
+ -#define RADIX_DAX_EMPTY (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 3))
+ +#define RADIX_DAX_PTE (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 1))
+ +#define RADIX_DAX_PMD (1 << (RADIX_TREE_EXCEPTIONAL_SHIFT + 2))
+ +#define RADIX_DAX_TYPE_MASK (RADIX_DAX_PTE | RADIX_DAX_PMD)
+ +#define RADIX_DAX_TYPE(entry) ((unsigned long)entry & RADIX_DAX_TYPE_MASK)
+ +#define RADIX_DAX_SECTOR(entry) (((unsigned long)entry >> RADIX_DAX_SHIFT))
+ +#define RADIX_DAX_ENTRY(sector, pmd) ((void *)((unsigned long)sector << \
+ +		RADIX_DAX_SHIFT | (pmd ? RADIX_DAX_PMD : RADIX_DAX_PTE) | \
+ +		RADIX_TREE_EXCEPTIONAL_ENTRY))
+  
+ -static inline unsigned long dax_radix_sector(void *entry)
+ -{
+ -	return (unsigned long)entry >> RADIX_DAX_SHIFT;
+ -}
+ -
+ -static inline void *dax_radix_locked_entry(sector_t sector, unsigned long flags)
+ -{
+ -	return (void *)(RADIX_TREE_EXCEPTIONAL_ENTRY | flags |
+ -			((unsigned long)sector << RADIX_DAX_SHIFT) |
+ -			RADIX_DAX_ENTRY_LOCK);
+ -}
+  
+ -ssize_t dax_iomap_rw(struct kiocb *iocb, struct iov_iter *iter,
+ -		const struct iomap_ops *ops);
+ -int dax_iomap_fault(struct vm_fault *vmf, enum page_entry_size pe_size,
+ -		    const struct iomap_ops *ops);
+ +ssize_t dax_do_io(int rw, struct kiocb *iocb, struct inode *inode,
+ +                  const struct iovec *iov, loff_t pos, unsigned long nr_segs,
+ +                  get_block_t get_block, dio_iodone_t end_io, int flags);
+ +int dax_zero_page_range(struct inode *, loff_t from, unsigned len, get_block_t);
+ +int dax_truncate_page(struct inode *, loff_t from, get_block_t);
+ +int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t);
+  int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index);
+ -int dax_invalidate_mapping_entry(struct address_space *mapping, pgoff_t index);
+ -int dax_invalidate_mapping_entry_sync(struct address_space *mapping,
+ -				      pgoff_t index);
+  void dax_wake_mapping_entry_waiter(struct address_space *mapping,
+  		pgoff_t index, void *entry, bool wake_all);
+  
+* Unmerged path drivers/dax/super.c
+* Unmerged path block/Kconfig
+* Unmerged path drivers/dax/super.c
+* Unmerged path fs/block_dev.c
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 2d7fe01dd7d2..c5793cc8370e 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -1834,6 +1834,7 @@ extern int bdev_write_page(struct block_device *, sector_t, struct page *,
+ 						struct writeback_control *);
+ extern long bdev_direct_access(struct block_device *, struct blk_dax_ctl *);
+ extern int bdev_dax_supported(struct super_block *, int);
++int bdev_dax_pgoff(struct block_device *, sector_t, size_t, pgoff_t *pgoff);
+ #else /* CONFIG_BLOCK */
+ /*
+  * stubs for when the block layer is configured out
+* Unmerged path include/linux/dax.h
