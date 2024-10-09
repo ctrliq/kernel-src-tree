@@ -1,0 +1,275 @@
+KVM: PPC: Implement existing and add new halt polling vcpu stats
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Suraj Jitindar Singh <sjitindarsingh@gmail.com>
+commit 2a27f514a47d39c50aaa5c07831ab35178955d47
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/2a27f514.failed
+
+vcpu stats are used to collect information about a vcpu which can be viewed
+in the debugfs. For example halt_attempted_poll and halt_successful_poll
+are used to keep track of the number of times the vcpu attempts to and
+successfully polls. These stats are currently not used on powerpc.
+
+Implement incrementation of the halt_attempted_poll and
+halt_successful_poll vcpu stats for powerpc. Since these stats are summed
+over all the vcpus for all running guests it doesn't matter which vcpu
+they are attributed to, thus we choose the current runner vcpu of the
+vcore.
+
+Also add new vcpu stats: halt_poll_success_ns, halt_poll_fail_ns and
+halt_wait_ns to be used to accumulate the total time spend polling
+successfully, polling unsuccessfully and waiting respectively, and
+halt_successful_wait to accumulate the number of times the vcpu waits.
+Given that halt_poll_success_ns, halt_poll_fail_ns and halt_wait_ns are
+expressed in nanoseconds it is necessary to represent these as 64-bit
+quantities, otherwise they would overflow after only about 4 seconds.
+
+Given that the total time spend either polling or waiting will be known and
+the number of times that each was done, it will be possible to determine
+the average poll and wait times. This will give the ability to tune the kvm
+module parameters based on the calculated average wait and poll times.
+
+	Signed-off-by: Suraj Jitindar Singh <sjitindarsingh@gmail.com>
+	Reviewed-by: David Matlack <dmatlack@google.com>
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+(cherry picked from commit 2a27f514a47d39c50aaa5c07831ab35178955d47)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/kvm_host.h
+#	arch/powerpc/kvm/book3s.c
+#	arch/powerpc/kvm/book3s_hv.c
+diff --cc arch/powerpc/include/asm/kvm_host.h
+index 8841a038084f,373003f4551d..000000000000
+--- a/arch/powerpc/include/asm/kvm_host.h
++++ b/arch/powerpc/include/asm/kvm_host.h
+@@@ -96,37 -101,41 +96,62 @@@ struct kvm_vm_stat 
+  };
+  
+  struct kvm_vcpu_stat {
+ -	u64 sum_exits;
+ -	u64 mmio_exits;
+ -	u64 signal_exits;
+ -	u64 light_exits;
+ +	u32 sum_exits;
+ +	u32 mmio_exits;
+ +	u32 dcr_exits;
+ +	u32 signal_exits;
+ +	u32 light_exits;
+  	/* Account for special types of light exits: */
+++<<<<<<< HEAD
+ +	u32 itlb_real_miss_exits;
+ +	u32 itlb_virt_miss_exits;
+ +	u32 dtlb_real_miss_exits;
+ +	u32 dtlb_virt_miss_exits;
+ +	u32 syscall_exits;
+ +	u32 isi_exits;
+ +	u32 dsi_exits;
+ +	u32 emulated_inst_exits;
+ +	u32 dec_exits;
+ +	u32 ext_intr_exits;
+ +	u32 halt_successful_poll;
+ +	u32 halt_attempted_poll;
+ +	u32 halt_wakeup;
+ +	u32 dbell_exits;
+ +	u32 gdbell_exits;
+ +	u32 ld;
+ +	u32 st;
+++=======
++ 	u64 itlb_real_miss_exits;
++ 	u64 itlb_virt_miss_exits;
++ 	u64 dtlb_real_miss_exits;
++ 	u64 dtlb_virt_miss_exits;
++ 	u64 syscall_exits;
++ 	u64 isi_exits;
++ 	u64 dsi_exits;
++ 	u64 emulated_inst_exits;
++ 	u64 dec_exits;
++ 	u64 ext_intr_exits;
++ 	u64 halt_poll_success_ns;
++ 	u64 halt_poll_fail_ns;
++ 	u64 halt_wait_ns;
++ 	u64 halt_successful_poll;
++ 	u64 halt_attempted_poll;
++ 	u64 halt_successful_wait;
++ 	u64 halt_poll_invalid;
++ 	u64 halt_wakeup;
++ 	u64 dbell_exits;
++ 	u64 gdbell_exits;
++ 	u64 ld;
++ 	u64 st;
+++>>>>>>> 2a27f514a47d (KVM: PPC: Implement existing and add new halt polling vcpu stats)
+  #ifdef CONFIG_PPC_BOOK3S
+ -	u64 pf_storage;
+ -	u64 pf_instruc;
+ -	u64 sp_storage;
+ -	u64 sp_instruc;
+ -	u64 queue_intr;
+ -	u64 ld_slow;
+ -	u64 st_slow;
+ +	u32 pf_storage;
+ +	u32 pf_instruc;
+ +	u32 sp_storage;
+ +	u32 sp_instruc;
+ +	u32 queue_intr;
+ +	u32 ld_slow;
+ +	u32 st_slow;
+  #endif
+  };
+  
+diff --cc arch/powerpc/kvm/book3s.c
+index a2a3b2997330,71eb8f3d3b54..000000000000
+--- a/arch/powerpc/kvm/book3s.c
++++ b/arch/powerpc/kvm/book3s.c
+@@@ -52,8 -52,13 +52,16 @@@ struct kvm_stats_debugfs_item debugfs_e
+  	{ "dec",         VCPU_STAT(dec_exits) },
+  	{ "ext_intr",    VCPU_STAT(ext_intr_exits) },
+  	{ "queue_intr",  VCPU_STAT(queue_intr) },
++ 	{ "halt_poll_success_ns",	VCPU_STAT(halt_poll_success_ns) },
++ 	{ "halt_poll_fail_ns",		VCPU_STAT(halt_poll_fail_ns) },
++ 	{ "halt_wait_ns",		VCPU_STAT(halt_wait_ns) },
+  	{ "halt_successful_poll", VCPU_STAT(halt_successful_poll), },
+  	{ "halt_attempted_poll", VCPU_STAT(halt_attempted_poll), },
+++<<<<<<< HEAD
+++=======
++ 	{ "halt_successful_wait",	VCPU_STAT(halt_successful_wait) },
++ 	{ "halt_poll_invalid", VCPU_STAT(halt_poll_invalid) },
+++>>>>>>> 2a27f514a47d (KVM: PPC: Implement existing and add new halt polling vcpu stats)
+  	{ "halt_wakeup", VCPU_STAT(halt_wakeup) },
+  	{ "pf_storage",  VCPU_STAT(pf_storage) },
+  	{ "sp_storage",  VCPU_STAT(sp_storage) },
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index 32dd0caea96b,30ff8ab5aba1..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -2585,29 -2680,50 +2585,73 @@@ static void kvmppc_wait_for_exec(struc
+   */
+  static void kvmppc_vcore_blocked(struct kvmppc_vcore *vc)
+  {
+++<<<<<<< HEAD
+ +	struct kvm_vcpu *vcpu;
+ +	int do_sleep = 1;
+ +
+ +	DEFINE_WAIT(wait);
+++=======
++ 	ktime_t cur, start_poll, start_wait;
++ 	int do_sleep = 1;
++ 	u64 block_ns;
++ 	DECLARE_SWAITQUEUE(wait);
++ 
++ 	/* Poll for pending exceptions and ceded state */
++ 	cur = start_poll = ktime_get();
++ 	if (vc->halt_poll_ns) {
++ 		ktime_t stop = ktime_add_ns(start_poll, vc->halt_poll_ns);
++ 		++vc->runner->stat.halt_attempted_poll;
+++>>>>>>> 2a27f514a47d (KVM: PPC: Implement existing and add new halt polling vcpu stats)
+  
+ -		vc->vcore_state = VCORE_POLLING;
+ -		spin_unlock(&vc->lock);
+ +	prepare_to_wait(&vc->wq, &wait, TASK_INTERRUPTIBLE);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Check one last time for pending exceptions and ceded state after
+ +	 * we put ourselves on the wait queue
+ +	 */
+ +	list_for_each_entry(vcpu, &vc->runnable_threads, arch.run_list) {
+ +		if (vcpu->arch.pending_exceptions || !vcpu->arch.ceded) {
+ +			do_sleep = 0;
+ +			break;
+ +		}
+ +	}
+ +
+ +	if (!do_sleep) {
+ +		finish_wait(&vc->wq, &wait);
+ +		return;
+++=======
++ 		do {
++ 			if (kvmppc_vcore_check_block(vc)) {
++ 				do_sleep = 0;
++ 				break;
++ 			}
++ 			cur = ktime_get();
++ 		} while (single_task_running() && ktime_before(cur, stop));
++ 
++ 		spin_lock(&vc->lock);
++ 		vc->vcore_state = VCORE_INACTIVE;
++ 
++ 		if (!do_sleep) {
++ 			++vc->runner->stat.halt_successful_poll;
++ 			goto out;
++ 		}
+  	}
+  
++ 	prepare_to_swait(&vc->wq, &wait, TASK_INTERRUPTIBLE);
++ 
++ 	if (kvmppc_vcore_check_block(vc)) {
++ 		finish_swait(&vc->wq, &wait);
++ 		do_sleep = 0;
++ 		/* If we polled, count this as a successful poll */
++ 		if (vc->halt_poll_ns)
++ 			++vc->runner->stat.halt_successful_poll;
++ 		goto out;
+++>>>>>>> 2a27f514a47d (KVM: PPC: Implement existing and add new halt polling vcpu stats)
++ 	}
++ 
++ 	start_wait = ktime_get();
++ 
+  	vc->vcore_state = VCORE_SLEEPING;
+  	trace_kvmppc_vcore_blocked(vc, 0);
+  	spin_unlock(&vc->lock);
+@@@ -2616,6 -2732,45 +2660,48 @@@
+  	spin_lock(&vc->lock);
+  	vc->vcore_state = VCORE_INACTIVE;
+  	trace_kvmppc_vcore_blocked(vc, 1);
+++<<<<<<< HEAD
+++=======
++ 	++vc->runner->stat.halt_successful_wait;
++ 
++ 	cur = ktime_get();
++ 
++ out:
++ 	block_ns = ktime_to_ns(cur) - ktime_to_ns(start_poll);
++ 
++ 	/* Attribute wait time */
++ 	if (do_sleep) {
++ 		vc->runner->stat.halt_wait_ns +=
++ 			ktime_to_ns(cur) - ktime_to_ns(start_wait);
++ 		/* Attribute failed poll time */
++ 		if (vc->halt_poll_ns)
++ 			vc->runner->stat.halt_poll_fail_ns +=
++ 				ktime_to_ns(start_wait) -
++ 				ktime_to_ns(start_poll);
++ 	} else {
++ 		/* Attribute successful poll time */
++ 		if (vc->halt_poll_ns)
++ 			vc->runner->stat.halt_poll_success_ns +=
++ 				ktime_to_ns(cur) -
++ 				ktime_to_ns(start_poll);
++ 	}
++ 
++ 	/* Adjust poll time */
++ 	if (halt_poll_max_ns) {
++ 		if (block_ns <= vc->halt_poll_ns)
++ 			;
++ 		/* We slept and blocked for longer than the max halt time */
++ 		else if (vc->halt_poll_ns && block_ns > halt_poll_max_ns)
++ 			shrink_halt_poll_ns(vc);
++ 		/* We slept and our poll time is too small */
++ 		else if (vc->halt_poll_ns < halt_poll_max_ns &&
++ 				block_ns < halt_poll_max_ns)
++ 			grow_halt_poll_ns(vc);
++ 	} else
++ 		vc->halt_poll_ns = 0;
++ 
++ 	trace_kvmppc_vcore_wakeup(do_sleep, block_ns);
+++>>>>>>> 2a27f514a47d (KVM: PPC: Implement existing and add new halt polling vcpu stats)
+  }
+  
+  static int kvmppc_run_vcpu(struct kvm_run *kvm_run, struct kvm_vcpu *vcpu)
+* Unmerged path arch/powerpc/include/asm/kvm_host.h
+* Unmerged path arch/powerpc/kvm/book3s.c
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
