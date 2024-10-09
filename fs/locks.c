@@ -268,7 +268,7 @@ static void locks_copy_private(struct file_lock *new, struct file_lock *fl)
 /*
  * Initialize a new lock from an existing file_lock structure.
  */
-void __locks_copy_lock(struct file_lock *new, const struct file_lock *fl)
+void locks_copy_conflock(struct file_lock *new, struct file_lock *fl)
 {
 	new->fl_owner = fl->fl_owner;
 	new->fl_pid = fl->fl_pid;
@@ -280,13 +280,13 @@ void __locks_copy_lock(struct file_lock *new, const struct file_lock *fl)
 	new->fl_ops = NULL;
 	new->fl_lmops = NULL;
 }
-EXPORT_SYMBOL(__locks_copy_lock);
+EXPORT_SYMBOL(locks_copy_conflock);
 
 void locks_copy_lock(struct file_lock *new, struct file_lock *fl)
 {
 	locks_release_private(new);
 
-	__locks_copy_lock(new, fl);
+	locks_copy_conflock(new, fl);
 	new->fl_file = fl->fl_file;
 	new->fl_ops = fl->fl_ops;
 	new->fl_lmops = fl->fl_lmops;
@@ -756,7 +756,7 @@ posix_test_lock(struct file *filp, struct file_lock *fl)
 			break;
 	}
 	if (cfl) {
-		__locks_copy_lock(fl, cfl);
+		locks_copy_conflock(fl, cfl);
 		if (cfl->fl_nspid)
 			fl->fl_pid = pid_vnr(cfl->fl_nspid);
 	} else
@@ -943,7 +943,7 @@ static int __posix_lock_file(struct inode *inode, struct file_lock *request, str
 			if (!posix_locks_conflict(request, fl))
 				continue;
 			if (conflock)
-				__locks_copy_lock(conflock, fl);
+				locks_copy_conflock(conflock, fl);
 			error = -EAGAIN;
 			if (!(request->fl_flags & FL_SLEEP))
 				goto out;
