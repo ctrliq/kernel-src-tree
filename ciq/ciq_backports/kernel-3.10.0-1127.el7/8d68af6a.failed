@@ -1,0 +1,129 @@
+s390/qeth: consolidate skb allocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Julian Wiedmann <jwi@linux.vnet.ibm.com>
+commit 8d68af6af6b4f76eac4f9abf584b4ea356f638c0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/8d68af6a.failed
+
+Move the allocation of SG skbs into the main path. This allows for
+a little code sharing, and handling ENOMEM from within one place.
+
+As side effect, L2 SG skbs now get the proper amount of additional
+headroom (read: zero) instead of the hard-coded ETH_HLEN.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.vnet.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8d68af6af6b4f76eac4f9abf584b4ea356f638c0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core_main.c
+diff --cc drivers/s390/net/qeth_core_main.c
+index b1a62a620d2b,23b439fb5f2c..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -5104,49 -5170,32 +5104,74 @@@ out
+  }
+  EXPORT_SYMBOL_GPL(qeth_core_hardsetup_card);
+  
+++<<<<<<< HEAD
+ +static inline int qeth_create_skb_frag(struct qeth_qdio_buffer *qethbuffer,
+ +		struct qdio_buffer_element *element,
+ +		struct sk_buff **pskb, int offset, int *pfrag, int data_len)
+ +{
+ +	struct page *page = virt_to_page(element->addr);
+ +	if (*pskb == NULL) {
+ +		if (qethbuffer->rx_skb) {
+ +			/* only if qeth_card.options.cq == QETH_CQ_ENABLED */
+ +			*pskb = qethbuffer->rx_skb;
+ +			qethbuffer->rx_skb = NULL;
+ +		} else {
+ +			*pskb = dev_alloc_skb(QETH_RX_PULL_LEN + ETH_HLEN);
+ +			if (!(*pskb))
+ +				return -ENOMEM;
+ +		}
+ +
+ +		skb_reserve(*pskb, ETH_HLEN);
+ +		if (data_len <= QETH_RX_PULL_LEN) {
+ +			memcpy(skb_put(*pskb, data_len), element->addr + offset,
+ +				data_len);
+ +		} else {
+ +			get_page(page);
+ +			memcpy(skb_put(*pskb, QETH_RX_PULL_LEN),
+ +			       element->addr + offset, QETH_RX_PULL_LEN);
+ +			skb_fill_page_desc(*pskb, *pfrag, page,
+ +				offset + QETH_RX_PULL_LEN,
+ +				data_len - QETH_RX_PULL_LEN);
+ +			(*pskb)->data_len += data_len - QETH_RX_PULL_LEN;
+ +			(*pskb)->len      += data_len - QETH_RX_PULL_LEN;
+ +			(*pskb)->truesize += data_len - QETH_RX_PULL_LEN;
+ +			(*pfrag)++;
+ +		}
+ +	} else {
+ +		get_page(page);
+ +		skb_fill_page_desc(*pskb, *pfrag, page, offset, data_len);
+ +		(*pskb)->data_len += data_len;
+ +		(*pskb)->len      += data_len;
+ +		(*pskb)->truesize += data_len;
+ +		(*pfrag)++;
+ +	}
+ +
+++=======
++ static void qeth_create_skb_frag(struct qdio_buffer_element *element,
++ 				 struct sk_buff *skb, int offset, int data_len)
++ {
++ 	struct page *page = virt_to_page(element->addr);
++ 	unsigned int next_frag;
++ 
++ 	/* first fill the linear space */
++ 	if (!skb->len) {
++ 		unsigned int linear = min(data_len, skb_tailroom(skb));
++ 
++ 		skb_put_data(skb, element->addr + offset, linear);
++ 		data_len -= linear;
++ 		if (!data_len)
++ 			return;
++ 		offset += linear;
++ 		/* fall through to add page frag for remaining data */
++ 	}
++ 
++ 	next_frag = skb_shinfo(skb)->nr_frags;
++ 	get_page(page);
++ 	skb_add_rx_frag(skb, next_frag, page, offset, data_len, data_len);
++ }
+++>>>>>>> 8d68af6af6b4 (s390/qeth: consolidate skb allocation)
+  
+ -static inline int qeth_is_last_sbale(struct qdio_buffer_element *sbale)
+ -{
+ -	return (sbale->eflags & SBAL_EFLAGS_LAST_ENTRY);
+ +	return 0;
+  }
+  
+  struct sk_buff *qeth_core_get_next_skb(struct qeth_card *card,
+@@@ -5213,14 -5268,11 +5245,22 @@@
+  	while (skb_len) {
+  		data_len = min(skb_len, (int)(element->length - offset));
+  		if (data_len) {
+++<<<<<<< HEAD
+ +			if (use_rx_sg) {
+ +				if (qeth_create_skb_frag(qethbuffer, element,
+ +				    &skb, offset, &frag, data_len))
+ +					goto no_mem;
+ +			} else {
+ +				memcpy(skb_put(skb, data_len), data_ptr,
+ +					data_len);
+ +			}
+++=======
++ 			if (use_rx_sg)
++ 				qeth_create_skb_frag(element, skb, offset,
++ 						     data_len);
++ 			else
++ 				skb_put_data(skb, data_ptr, data_len);
+++>>>>>>> 8d68af6af6b4 (s390/qeth: consolidate skb allocation)
+  		}
+  		skb_len -= data_len;
+  		if (skb_len) {
+* Unmerged path drivers/s390/net/qeth_core_main.c
