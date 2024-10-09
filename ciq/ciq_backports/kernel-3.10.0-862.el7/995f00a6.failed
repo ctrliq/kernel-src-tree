@@ -1,0 +1,120 @@
+x86: kvm: mmu: use ept a/d in vmcs02 iff used in vmcs12
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [x86] kvm: mmu: use ept a/d in vmcs02 iff used in vmcs12 (Paolo Bonzini) [1469685]
+Rebuild_FUZZ: 95.24%
+commit-author Peter Feiner <pfeiner@google.com>
+commit 995f00a619584e65e53eff372d9b73b121a7bad5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/995f00a6.failed
+
+EPT A/D was enabled in the vmcs02 EPTP regardless of the vmcs12's EPTP
+value. The problem is that enabling A/D changes the behavior of L2's
+x86 page table walks as seen by L1. With A/D enabled, x86 page table
+walks are always treated as EPT writes.
+
+Commit ae1e2d1082ae ("kvm: nVMX: support EPT accessed/dirty bits",
+2017-03-30) tried to work around this problem by clearing the write
+bit in the exit qualification for EPT violations triggered by page
+walks.  However, that fixup introduced the opposite bug: page-table walks
+that actually set x86 A/D bits were *missing* the write bit in the exit
+qualification.
+
+This patch fixes the problem by disabling EPT A/D in the shadow MMU
+when EPT A/D is disabled in vmcs12's EPTP.
+
+	Signed-off-by: Peter Feiner <pfeiner@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 995f00a619584e65e53eff372d9b73b121a7bad5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 9e322d5ffbcf,fb0471268a14..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -878,10 -910,10 +878,16 @@@ static void nested_release_page_clean(s
+  	kvm_release_page_clean(page);
+  }
+  
++ static bool nested_ept_ad_enabled(struct kvm_vcpu *vcpu);
+  static unsigned long nested_ept_get_cr3(struct kvm_vcpu *vcpu);
+++<<<<<<< HEAD
+ +static u64 construct_eptp(unsigned long root_hpa);
+ +static void kvm_cpu_vmxon(u64 addr);
+ +static void kvm_cpu_vmxoff(void);
+++=======
++ static u64 construct_eptp(struct kvm_vcpu *vcpu, unsigned long root_hpa);
++ static bool vmx_xsaves_supported(void);
+++>>>>>>> 995f00a61958 (x86: kvm: mmu: use ept a/d in vmcs02 iff used in vmcs12)
+  static int vmx_set_tss_addr(struct kvm *kvm, unsigned int addr);
+  static void vmx_set_segment(struct kvm_vcpu *vcpu,
+  			    struct kvm_segment *var, int seg);
+@@@ -6160,6 -6431,19 +6167,22 @@@ static void wakeup_handler(void
+  	spin_unlock(&per_cpu(blocked_vcpu_on_cpu_lock, cpu));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void vmx_enable_tdp(void)
++ {
++ 	kvm_mmu_set_mask_ptes(VMX_EPT_READABLE_MASK,
++ 		enable_ept_ad_bits ? VMX_EPT_ACCESS_BIT : 0ull,
++ 		enable_ept_ad_bits ? VMX_EPT_DIRTY_BIT : 0ull,
++ 		0ull, VMX_EPT_EXECUTABLE_MASK,
++ 		cpu_has_vmx_ept_execute_only() ? 0ull : VMX_EPT_READABLE_MASK,
++ 		VMX_EPT_RWX_MASK);
++ 
++ 	ept_set_mmio_spte_mask();
++ 	kvm_enable_tdp();
++ }
++ 
+++>>>>>>> 995f00a61958 (x86: kvm: mmu: use ept a/d in vmcs02 iff used in vmcs12)
+  static __init int hardware_setup(void)
+  {
+  	int r = -ENOMEM, i, msr;
+@@@ -9139,12 -9397,20 +9167,27 @@@ static unsigned long nested_ept_get_cr3
+  	return get_vmcs12(vcpu)->ept_pointer;
+  }
+  
+ -static int nested_ept_init_mmu_context(struct kvm_vcpu *vcpu)
+ +static void nested_ept_init_mmu_context(struct kvm_vcpu *vcpu)
+  {
+++<<<<<<< HEAD
+ +	WARN_ON(mmu_is_nested(vcpu));
+ +	kvm_init_shadow_ept_mmu(vcpu,
+ +			to_vmx(vcpu)->nested.nested_vmx_ept_caps &
+ +			VMX_EPT_EXECUTE_ONLY_BIT);
+++=======
++ 	bool wants_ad;
++ 
++ 	WARN_ON(mmu_is_nested(vcpu));
++ 	wants_ad = nested_ept_ad_enabled(vcpu);
++ 	if (wants_ad && !enable_ept_ad_bits)
++ 		return 1;
++ 
++ 	kvm_mmu_unload(vcpu);
++ 	kvm_init_shadow_ept_mmu(vcpu,
++ 			to_vmx(vcpu)->nested.nested_vmx_ept_caps &
++ 			VMX_EPT_EXECUTE_ONLY_BIT,
++ 			wants_ad);
+++>>>>>>> 995f00a61958 (x86: kvm: mmu: use ept a/d in vmcs02 iff used in vmcs12)
+  	vcpu->arch.mmu.set_cr3           = vmx_set_cr3;
+  	vcpu->arch.mmu.get_cr3           = nested_ept_get_cr3;
+  	vcpu->arch.mmu.inject_page_fault = nested_ept_inject_page_fault;
+diff --git a/arch/x86/kvm/mmu.c b/arch/x86/kvm/mmu.c
+index 588adec09b8c..4265576cab6f 100644
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -4211,6 +4211,7 @@ void kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, bool execonly)
+ 	context->root_level = context->shadow_root_level;
+ 	context->root_hpa = INVALID_PAGE;
+ 	context->direct_map = false;
++	context->base_role.ad_disabled = !accessed_dirty;
+ 
+ 	update_permission_bitmask(vcpu, context, true);
+ 	update_pkru_bitmask(vcpu, context, true);
+* Unmerged path arch/x86/kvm/vmx.c
