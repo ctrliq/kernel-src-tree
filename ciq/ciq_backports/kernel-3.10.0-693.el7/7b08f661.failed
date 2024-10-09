@@ -1,0 +1,106 @@
+bnxt_en: Improve completion ring allocation for VFs.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] bnxt_en: Improve completion ring allocation for VFs (Jonathan Toppins) [1382378]
+Rebuild_FUZZ: 99.03%
+commit-author Michael Chan <michael.chan@broadcom.com>
+commit 7b08f661ab80e87dcdba7ab9a460fe2c9d08bf5b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7b08f661.failed
+
+All available remaining completion rings not used by the PF should be
+made available for the VFs so that there are enough rings in the VF to
+support RDMA.  The earlier workaround code of capping the rings by the
+statistics context is removed.
+
+When SRIOV is disabled, call a new function bnxt_restore_pf_fw_resources()
+to restore FW resources.  Later on we need to add some logic to account
+for RDMA resources.
+
+	Signed-off-by: Somnath Kotur <somnath.kotur@broadcom.com>
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7b08f661ab80e87dcdba7ab9a460fe2c9d08bf5b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.h
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index d19388f26026,43a4b170a6f1..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@@ -1218,7 -1234,9 +1218,13 @@@ int _hwrm_send_message(struct bnxt *, v
+  int hwrm_send_message(struct bnxt *, void *, u32, int);
+  int hwrm_send_message_silent(struct bnxt *, void *, u32, int);
+  int bnxt_hwrm_set_coal(struct bnxt *);
+++<<<<<<< HEAD
+ +int bnxt_hwrm_func_qcaps(struct bnxt *);
+++=======
++ void bnxt_set_max_func_irqs(struct bnxt *bp, unsigned int max);
++ void bnxt_tx_disable(struct bnxt *bp);
++ void bnxt_tx_enable(struct bnxt *bp);
+++>>>>>>> 7b08f661ab80 (bnxt_en: Improve completion ring allocation for VFs.)
+  int bnxt_hwrm_set_pause(struct bnxt *);
+  int bnxt_hwrm_set_link_setting(struct bnxt *, bool, bool);
+  int bnxt_hwrm_fw_set_time(struct bnxt *);
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index c6f371a45f71..7b95d75b79da 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -4139,7 +4139,7 @@ func_qcfg_exit:
+ 	return rc;
+ }
+ 
+-int bnxt_hwrm_func_qcaps(struct bnxt *bp)
++static int bnxt_hwrm_func_qcaps(struct bnxt *bp)
+ {
+ 	int rc = 0;
+ 	struct hwrm_func_qcaps_input req = {0};
+@@ -6781,6 +6781,12 @@ static int bnxt_set_dflt_rings(struct bnxt *bp)
+ 	return rc;
+ }
+ 
++void bnxt_restore_pf_fw_resources(struct bnxt *bp)
++{
++	ASSERT_RTNL();
++	bnxt_hwrm_func_qcaps(bp);
++}
++
+ static void bnxt_parse_log_pcie_link(struct bnxt *bp)
+ {
+ 	enum pcie_link_width width = PCIE_LNK_WIDTH_UNKNOWN;
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.h
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_sriov.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_sriov.c
+index d488199b4697..0e20af1a7e1c 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_sriov.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_sriov.c
+@@ -413,15 +413,7 @@ static int bnxt_hwrm_func_cfg(struct bnxt *bp, int num_vfs)
+ 	bnxt_hwrm_cmd_hdr_init(bp, &req, HWRM_FUNC_CFG, -1, -1);
+ 
+ 	/* Remaining rings are distributed equally amongs VF's for now */
+-	/* TODO: the following workaroud is needed to restrict total number
+-	 * of vf_cp_rings not exceed number of HW ring groups. This WA should
+-	 * be removed once new HWRM provides HW ring groups capability in
+-	 * hwrm_func_qcap.
+-	 */
+-	vf_cp_rings = min_t(u16, pf->max_cp_rings, pf->max_stat_ctxs);
+-	vf_cp_rings = (vf_cp_rings - bp->cp_nr_rings) / num_vfs;
+-	/* TODO: restore this logic below once the WA above is removed */
+-	/* vf_cp_rings = (pf->max_cp_rings - bp->cp_nr_rings) / num_vfs; */
++	vf_cp_rings = (pf->max_cp_rings - bp->cp_nr_rings) / num_vfs;
+ 	vf_stat_ctx = (pf->max_stat_ctxs - bp->num_stat_ctxs) / num_vfs;
+ 	if (bp->flags & BNXT_FLAG_AGG_RINGS)
+ 		vf_rx_rings = (pf->max_rx_rings - bp->rx_nr_rings * 2) /
+@@ -583,7 +575,9 @@ void bnxt_sriov_disable(struct bnxt *bp)
+ 
+ 	bp->pf.active_vfs = 0;
+ 	/* Reclaim all resources for the PF. */
+-	bnxt_hwrm_func_qcaps(bp);
++	rtnl_lock();
++	bnxt_restore_pf_fw_resources(bp);
++	rtnl_unlock();
+ }
+ 
+ int bnxt_sriov_configure(struct pci_dev *pdev, int num_vfs)
