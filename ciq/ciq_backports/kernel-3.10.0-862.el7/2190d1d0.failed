@@ -1,0 +1,451 @@
+net: sched: introduce helpers to work with filter chains
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [net] sched: introduce helpers to work with filter chains (Ivan Vecera) [1445420]
+Rebuild_FUZZ: 95.33%
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 2190d1d0944f84c55cdfdb89c7920f8f9311bdde
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2190d1d0.failed
+
+Introduce struct tcf_chain object and set of helpers around it. Wraps up
+insertion, deletion and search in the filter chain.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Jamal Hadi Salim <jhs@mojatatu.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2190d1d0944f84c55cdfdb89c7920f8f9311bdde)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sch_generic.h
+#	net/sched/cls_api.c
+diff --cc include/net/sch_generic.h
+index 7b71681b10fc,52bceede534b..000000000000
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@@ -249,6 -248,15 +249,18 @@@ struct qdisc_skb_cb 
+  	unsigned char		data[QDISC_CB_PRIV_LEN];
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct tcf_chain {
++ 	struct tcf_proto __rcu *filter_chain;
++ 	struct tcf_proto __rcu **p_filter_chain;
++ };
++ 
++ struct tcf_block {
++ 	struct tcf_chain *chain;
++ };
++ 
+++>>>>>>> 2190d1d0944f (net: sched: introduce helpers to work with filter chains)
+  static inline void qdisc_cb_private_validate(const struct sk_buff *skb, int sz)
+  {
+  	struct qdisc_skb_cb *qcb;
+diff --cc net/sched/cls_api.c
+index 1dc6d123ed94,fee3d7faeb79..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -124,12 -124,234 +123,236 @@@ static inline u32 tcf_auto_prio(struct 
+  	if (tp)
+  		first = tp->prio - 1;
+  
+ -	return TC_H_MAJ(first);
+ +	return first;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct tcf_proto *tcf_proto_create(const char *kind, u32 protocol,
++ 					  u32 prio, u32 parent, struct Qdisc *q,
++ 					  struct tcf_block *block)
++ {
++ 	struct tcf_proto *tp;
++ 	int err;
++ 
++ 	tp = kzalloc(sizeof(*tp), GFP_KERNEL);
++ 	if (!tp)
++ 		return ERR_PTR(-ENOBUFS);
++ 
++ 	err = -ENOENT;
++ 	tp->ops = tcf_proto_lookup_ops(kind);
++ 	if (!tp->ops) {
++ #ifdef CONFIG_MODULES
++ 		rtnl_unlock();
++ 		request_module("cls_%s", kind);
++ 		rtnl_lock();
++ 		tp->ops = tcf_proto_lookup_ops(kind);
++ 		/* We dropped the RTNL semaphore in order to perform
++ 		 * the module load. So, even if we succeeded in loading
++ 		 * the module we have to replay the request. We indicate
++ 		 * this using -EAGAIN.
++ 		 */
++ 		if (tp->ops) {
++ 			module_put(tp->ops->owner);
++ 			err = -EAGAIN;
++ 		} else {
++ 			err = -ENOENT;
++ 		}
++ 		goto errout;
++ #endif
++ 	}
++ 	tp->classify = tp->ops->classify;
++ 	tp->protocol = protocol;
++ 	tp->prio = prio;
++ 	tp->classid = parent;
++ 	tp->q = q;
++ 	tp->block = block;
++ 
++ 	err = tp->ops->init(tp);
++ 	if (err) {
++ 		module_put(tp->ops->owner);
++ 		goto errout;
++ 	}
++ 	return tp;
++ 
++ errout:
++ 	kfree(tp);
++ 	return ERR_PTR(err);
++ }
++ 
++ static void tcf_proto_destroy(struct tcf_proto *tp)
++ {
++ 	tp->ops->destroy(tp);
++ 	module_put(tp->ops->owner);
++ 	kfree_rcu(tp, rcu);
++ }
++ 
++ static struct tcf_chain *tcf_chain_create(void)
++ {
++ 	return kzalloc(sizeof(struct tcf_chain), GFP_KERNEL);
++ }
++ 
++ static void tcf_chain_destroy(struct tcf_chain *chain)
++ {
++ 	struct tcf_proto *tp;
++ 
++ 	while ((tp = rtnl_dereference(chain->filter_chain)) != NULL) {
++ 		RCU_INIT_POINTER(chain->filter_chain, tp->next);
++ 		tcf_proto_destroy(tp);
++ 	}
++ 	kfree(chain);
++ }
++ 
++ static void
++ tcf_chain_filter_chain_ptr_set(struct tcf_chain *chain,
++ 			       struct tcf_proto __rcu **p_filter_chain)
++ {
++ 	chain->p_filter_chain = p_filter_chain;
++ }
++ 
++ int tcf_block_get(struct tcf_block **p_block,
++ 		  struct tcf_proto __rcu **p_filter_chain)
++ {
++ 	struct tcf_block *block = kzalloc(sizeof(*block), GFP_KERNEL);
++ 	int err;
++ 
++ 	if (!block)
++ 		return -ENOMEM;
++ 	block->chain = tcf_chain_create();
++ 	if (!block->chain) {
++ 		err = -ENOMEM;
++ 		goto err_chain_create;
++ 	}
++ 	tcf_chain_filter_chain_ptr_set(block->chain, p_filter_chain);
++ 	*p_block = block;
++ 	return 0;
++ 
++ err_chain_create:
++ 	kfree(block);
++ 	return err;
++ }
++ EXPORT_SYMBOL(tcf_block_get);
++ 
++ void tcf_block_put(struct tcf_block *block)
++ {
++ 	if (!block)
++ 		return;
++ 	tcf_chain_destroy(block->chain);
++ 	kfree(block);
++ }
++ EXPORT_SYMBOL(tcf_block_put);
++ 
++ /* Main classifier routine: scans classifier chain attached
++  * to this qdisc, (optionally) tests for protocol and asks
++  * specific classifiers.
++  */
++ int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
++ 		 struct tcf_result *res, bool compat_mode)
++ {
++ 	__be16 protocol = tc_skb_protocol(skb);
++ #ifdef CONFIG_NET_CLS_ACT
++ 	const int max_reclassify_loop = 4;
++ 	const struct tcf_proto *old_tp = tp;
++ 	int limit = 0;
++ 
++ reclassify:
++ #endif
++ 	for (; tp; tp = rcu_dereference_bh(tp->next)) {
++ 		int err;
++ 
++ 		if (tp->protocol != protocol &&
++ 		    tp->protocol != htons(ETH_P_ALL))
++ 			continue;
++ 
++ 		err = tp->classify(skb, tp, res);
++ #ifdef CONFIG_NET_CLS_ACT
++ 		if (unlikely(err == TC_ACT_RECLASSIFY && !compat_mode))
++ 			goto reset;
++ #endif
++ 		if (err >= 0)
++ 			return err;
++ 	}
++ 
++ 	return TC_ACT_UNSPEC; /* signal: continue lookup */
++ #ifdef CONFIG_NET_CLS_ACT
++ reset:
++ 	if (unlikely(limit++ >= max_reclassify_loop)) {
++ 		net_notice_ratelimited("%s: reclassify loop, rule prio %u, protocol %02x\n",
++ 				       tp->q->ops->id, tp->prio & 0xffff,
++ 				       ntohs(tp->protocol));
++ 		return TC_ACT_SHOT;
++ 	}
++ 
++ 	tp = old_tp;
++ 	protocol = tc_skb_protocol(skb);
++ 	goto reclassify;
++ #endif
++ }
++ EXPORT_SYMBOL(tcf_classify);
++ 
++ struct tcf_chain_info {
++ 	struct tcf_proto __rcu **pprev;
++ 	struct tcf_proto __rcu *next;
++ };
++ 
++ static struct tcf_proto *tcf_chain_tp_prev(struct tcf_chain_info *chain_info)
++ {
++ 	return rtnl_dereference(*chain_info->pprev);
++ }
++ 
++ static void tcf_chain_tp_insert(struct tcf_chain *chain,
++ 				struct tcf_chain_info *chain_info,
++ 				struct tcf_proto *tp)
++ {
++ 	if (chain->p_filter_chain &&
++ 	    *chain_info->pprev == chain->filter_chain)
++ 		*chain->p_filter_chain = tp;
++ 	RCU_INIT_POINTER(tp->next, tcf_chain_tp_prev(chain_info));
++ 	rcu_assign_pointer(*chain_info->pprev, tp);
++ }
++ 
++ static void tcf_chain_tp_remove(struct tcf_chain *chain,
++ 				struct tcf_chain_info *chain_info,
++ 				struct tcf_proto *tp)
++ {
++ 	struct tcf_proto *next = rtnl_dereference(chain_info->next);
++ 
++ 	if (chain->p_filter_chain && tp == chain->filter_chain)
++ 		*chain->p_filter_chain = next;
++ 	RCU_INIT_POINTER(*chain_info->pprev, next);
++ }
++ 
++ static struct tcf_proto *tcf_chain_tp_find(struct tcf_chain *chain,
++ 					   struct tcf_chain_info *chain_info,
++ 					   u32 protocol, u32 prio,
++ 					   bool prio_allocate)
++ {
++ 	struct tcf_proto **pprev;
++ 	struct tcf_proto *tp;
++ 
++ 	/* Check the chain for existence of proto-tcf with this priority */
++ 	for (pprev = &chain->filter_chain;
++ 	     (tp = rtnl_dereference(*pprev)); pprev = &tp->next) {
++ 		if (tp->prio >= prio) {
++ 			if (tp->prio == prio) {
++ 				if (prio_allocate ||
++ 				    (tp->protocol != protocol && protocol))
++ 					return ERR_PTR(-EINVAL);
++ 			} else {
++ 				tp = NULL;
++ 			}
++ 			break;
++ 		}
++ 	}
++ 	chain_info->pprev = pprev;
++ 	chain_info->next = tp ? tp->next : NULL;
++ 	return tp;
++ }
++ 
+++>>>>>>> 2190d1d0944f (net: sched: introduce helpers to work with filter chains)
+  /* Add/change/delete/get a filter node */
+  
+ -static int tc_ctl_tfilter(struct sk_buff *skb, struct nlmsghdr *n,
+ -			  struct netlink_ext_ack *extack)
+ +static int tc_ctl_tfilter(struct sk_buff *skb, struct nlmsghdr *n)
+  {
+  	struct net *net = sock_net(skb->sk);
+  	struct nlattr *tca[TCA_MAX + 1];
+@@@ -140,11 -362,10 +363,17 @@@
+  	u32 parent;
+  	struct net_device *dev;
+  	struct Qdisc  *q;
+++<<<<<<< HEAD
+ +	struct tcf_proto __rcu **back;
+ +	struct tcf_proto __rcu **chain;
+ +	struct tcf_proto *next;
+++=======
++ 	struct tcf_chain_info chain_info;
++ 	struct tcf_chain *chain;
++ 	struct tcf_block *block;
+++>>>>>>> 2190d1d0944f (net: sched: introduce helpers to work with filter chains)
+  	struct tcf_proto *tp;
+ +	const struct tcf_proto_ops *tp_ops;
+  	const struct Qdisc_class_ops *cops;
+  	unsigned long cl;
+  	unsigned long fh;
+@@@ -221,30 -444,25 +450,44 @@@ replay
+  	}
+  
+  	/* And the last stroke */
+ -	block = cops->tcf_block(q, cl);
+ -	if (!block) {
+ -		err = -EINVAL;
+ +	chain = cops->tcf_chain(q, cl);
+ +	err = -EINVAL;
+ +	if (chain == NULL)
+  		goto errout;
+++<<<<<<< HEAD
+++=======
++ 	}
++ 	chain = block->chain;
++ 
+++>>>>>>> 2190d1d0944f (net: sched: introduce helpers to work with filter chains)
+  	if (n->nlmsg_type == RTM_DELTFILTER && prio == 0) {
+  		tfilter_notify_chain(net, skb, n, chain, RTM_DELTFILTER);
+ -		tcf_chain_destroy(chain);
+ +		tcf_destroy_chain(chain);
+  		err = 0;
+  		goto errout;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Check the chain for existence of proto-tcf with this priority */
+ +	for (back = chain;
+ +	     (tp = rtnl_dereference(*back)) != NULL;
+ +	     back = &tp->next) {
+ +		if (tp->prio >= prio) {
+ +			if (tp->prio == prio) {
+ +				if (!nprio ||
+ +				    (tp->protocol != protocol && protocol))
+ +					goto errout;
+ +			} else
+ +				tp = NULL;
+ +			break;
+ +		}
+++=======
++ 	tp = tcf_chain_tp_find(chain, &chain_info, protocol,
++ 			       prio, prio_allocate);
++ 	if (IS_ERR(tp)) {
++ 		err = PTR_ERR(tp);
++ 		goto errout;
+++>>>>>>> 2190d1d0944f (net: sched: introduce helpers to work with filter chains)
+  	}
+  
+  	if (tp == NULL) {
+@@@ -308,20 -479,29 +551,31 @@@
+  			goto errout;
+  		}
+  
+++<<<<<<< HEAD
+++=======
++ 		if (prio_allocate)
++ 			prio = tcf_auto_prio(tcf_chain_tp_prev(&chain_info));
++ 
++ 		tp = tcf_proto_create(nla_data(tca[TCA_KIND]),
++ 				      protocol, prio, parent, q, block);
++ 		if (IS_ERR(tp)) {
++ 			err = PTR_ERR(tp);
++ 			goto errout;
++ 		}
+++>>>>>>> 2190d1d0944f (net: sched: introduce helpers to work with filter chains)
+  		tp_created = 1;
+ -	} else if (tca[TCA_KIND] && nla_strcmp(tca[TCA_KIND], tp->ops->kind)) {
+ -		err = -EINVAL;
+ +
+ +	} else if (tca[TCA_KIND] && nla_strcmp(tca[TCA_KIND], tp->ops->kind))
+  		goto errout;
+ -	}
+  
+  	fh = tp->ops->get(tp, t->tcm_handle);
+  
+  	if (fh == 0) {
+  		if (n->nlmsg_type == RTM_DELTFILTER && t->tcm_handle == 0) {
+- 			next = rtnl_dereference(tp->next);
+- 			RCU_INIT_POINTER(*back, next);
++ 			tcf_chain_tp_remove(chain, &chain_info, tp);
+  			tfilter_notify(net, skb, n, tp, fh,
+  				       RTM_DELTFILTER, false);
+ -			tcf_proto_destroy(tp);
+ +			tcf_proto_destroy(tp, true);
+  			err = 0;
+  			goto errout;
+  		}
+@@@ -341,14 -524,15 +595,20 @@@
+  			}
+  			break;
+  		case RTM_DELTFILTER:
+ -			err = tp->ops->delete(tp, fh, &last);
+ +			err = tp->ops->delete(tp, fh);
+  			if (err)
+  				goto errout;
+- 			next = rtnl_dereference(tp->next);
+  			tfilter_notify(net, skb, n, tp, t->tcm_handle,
+  				       RTM_DELTFILTER, false);
+++<<<<<<< HEAD
+ +			if (tcf_proto_destroy(tp, false))
+ +				RCU_INIT_POINTER(*back, next);
+++=======
++ 			if (last) {
++ 				tcf_chain_tp_remove(chain, &chain_info, tp);
++ 				tcf_proto_destroy(tp);
++ 			}
+++>>>>>>> 2190d1d0944f (net: sched: introduce helpers to work with filter chains)
+  			goto errout;
+  		case RTM_GETTFILTER:
+  			err = tfilter_notify(net, skb, n, tp, fh,
+@@@ -466,7 -648,9 +724,13 @@@ static int tc_dump_tfilter(struct sk_bu
+  	int s_t;
+  	struct net_device *dev;
+  	struct Qdisc *q;
+++<<<<<<< HEAD
+ +	struct tcf_proto *tp, __rcu **chain;
+++=======
++ 	struct tcf_block *block;
++ 	struct tcf_proto *tp;
++ 	struct tcf_chain *chain;
+++>>>>>>> 2190d1d0944f (net: sched: introduce helpers to work with filter chains)
+  	struct tcmsg *tcm = nlmsg_data(cb->nlh);
+  	unsigned long cl = 0;
+  	const struct Qdisc_class_ops *cops;
+@@@ -494,9 -678,10 +758,13 @@@
+  		if (cl == 0)
+  			goto errout;
+  	}
+ -	block = cops->tcf_block(q, cl);
+ -	if (!block)
+ +	chain = cops->tcf_chain(q, cl);
+ +	if (chain == NULL)
+  		goto errout;
+++<<<<<<< HEAD
+++=======
++ 	chain = block->chain;
+++>>>>>>> 2190d1d0944f (net: sched: introduce helpers to work with filter chains)
+  
+  	s_t = cb->args[0];
+  
+* Unmerged path include/net/sch_generic.h
+* Unmerged path net/sched/cls_api.c
