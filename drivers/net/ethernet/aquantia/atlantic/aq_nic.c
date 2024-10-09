@@ -152,6 +152,9 @@ static void aq_nic_service_timer_cb(unsigned long param)
 		self->link_status = link_status;
 	}
 
+	if (self->aq_hw_ops.hw_update_stats)
+		self->aq_hw_ops.hw_update_stats(self->aq_hw);
+
 	memset(&stats_rx, 0U, sizeof(struct aq_ring_stats_rx_s));
 	memset(&stats_tx, 0U, sizeof(struct aq_ring_stats_tx_s));
 	for (i = AQ_DIMOF(self->aq_vec); i--;) {
