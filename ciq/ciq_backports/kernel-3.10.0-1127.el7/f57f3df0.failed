@@ -1,0 +1,98 @@
+ALSA: pcm: More fine-grained PCM link locking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Takashi Iwai <tiwai@suse.de>
+commit f57f3df03a8e6010e321fa0258d3e054713c3cb7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/f57f3df0.failed
+
+We have currently two global locks, a rwlock and a rwsem, that are
+used for managing linking the PCM streams.  Due to these global locks,
+once when a linked stream is used, the lock granularity suffers a
+lot.
+
+This patch attempts to eliminate the former global lock for atomic
+ops.  The latter rwsem needs remaining because of the loosy way of the
+loop calls in snd_pcm_action_nonatomic(), as well as for avoiding the
+deadlock at linking.  However, these are used far rarely, actually
+only by two actions (prepare and  reset), where both are no timing
+critical ones.  So this can be still seen as a good improvement.
+
+The basic strategy to eliminate the rwlock is to assure group->lock at
+adding or removing a stream to / from the group.  Since we already
+takes the group lock whenever taking the all substream locks under the
+group, this shouldn't be a big problem.  The reference to group
+pointer in snd_pcm_substream object is protected by the stream lock
+itself.
+
+However, there are still pitfalls: a race window at re-locking and the
+lifecycle of group object.  The former is a small race window for
+dereferencing the substream group object opened while snd_pcm_action()
+performs re-locking to avoid ABBA deadlocks.  This includes the unlink
+of group during that window, too.  And the latter is the kfree
+performed after all streams are removed from the group while it's
+still dereferenced.
+
+For addressing these corner cases, two new tricks are introduced:
+- After re-locking, the group assigned to the stream is checked again;
+  if the group is changed, we retry the whole procedure.
+- Introduce a refcount to snd_pcm_group object, so that it's freed
+  only when it's empty and really no one refers to it.
+
+(Some readers might wonder why not RCU for the latter.  RCU in this
+case would cost more than refcounting, unfortunately.  We take the
+group lock sooner or later, hence the performance improvement by RCU
+would be negligible.  Meanwhile, because we need to deal with
+schedulable context depending on the pcm->nonatomic flag, it'll become
+dynamic RCU/SRCU switch, and the grace period may become too long.)
+
+Along with these changes, there are a significant amount of code
+refactoring.  The complex group re-lock & ref code is factored out to
+snd_pcm_stream_group_ref() function, for example.
+
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit f57f3df03a8e6010e321fa0258d3e054713c3cb7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/core/pcm_native.c
+diff --cc sound/core/pcm_native.c
+index 72d271be617b,cbde23fc67a9..000000000000
+--- a/sound/core/pcm_native.c
++++ b/sound/core/pcm_native.c
+@@@ -1820,7 -1874,8 +1873,12 @@@ static int snd_pcm_drain(struct snd_pcm
+  	struct snd_card *card;
+  	struct snd_pcm_runtime *runtime;
+  	struct snd_pcm_substream *s;
+++<<<<<<< HEAD
+ +	wait_queue_t wait;
+++=======
++ 	struct snd_pcm_group *group;
++ 	wait_queue_entry_t wait;
+++>>>>>>> f57f3df03a8e (ALSA: pcm: More fine-grained PCM link locking)
+  	int result = 0;
+  	int nonblock = 0;
+  
+diff --git a/include/sound/pcm.h b/include/sound/pcm.h
+index 1f3fab998786..ddc806131104 100644
+--- a/include/sound/pcm.h
++++ b/include/sound/pcm.h
+@@ -30,6 +30,7 @@
+ #include <linux/mm.h>
+ #include <linux/bitops.h>
+ #include <linux/pm_qos.h>
++#include <linux/refcount.h>
+ 
+ #define snd_pcm_substream_chip(substream) ((substream)->private_data)
+ #define snd_pcm_chip(pcm) ((pcm)->private_data)
+@@ -439,6 +440,7 @@ struct snd_pcm_group {		/* keep linked substreams */
+ 	spinlock_t lock;
+ 	struct mutex mutex;
+ 	struct list_head substreams;
++	refcount_t refs;
+ };
+ 
+ struct pid;
+* Unmerged path sound/core/pcm_native.c
