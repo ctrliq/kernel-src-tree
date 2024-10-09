@@ -1,0 +1,372 @@
+HID: remove initial reading of reports at connect
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [hid] remove initial reading of reports at connect (Benjamin Tissoires) [1411429]
+Rebuild_FUZZ: 94.62%
+commit-author Benjamin Tissoires <benjamin.tissoires@redhat.com>
+commit 9143059fafd4eebed2d43ffb5455178d4010e60a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9143059f.failed
+
+It looks like a bunch of devices do not like to be polled
+for their reports at init time. When you look into the details,
+it seems that for those that are requiring the quirk
+HID_QUIRK_NO_INIT_REPORTS, the driver fails to retrieve part
+of the features/inputs while others (more generic) work.
+
+IMO, it should be acceptable to remove the need for the quirk
+in the general case. On the small amount of cases where
+we actually need to read the current values, the driver
+in charge (hid-mt or wacom) already retrieves the features
+manually.
+
+There are 2 cases where we might need to retrieve the reports at
+init:
+1. hiddev devices with specific use-space tool
+2. a device that would require the driver to fetch a specific
+   feature/input at plug
+
+For case 2, I have seen this a few time on hid-multitouch. It
+is solved in hid-multitouch directly by fetching the feature.
+I hope it won't be too common and this can be solved on a per-case
+basis (crossing fingers).
+
+For case 1, we moved the implementation of HID_QUIRK_NO_INIT_REPORTS
+in hiddev. When somebody starts calling ioctls that needs an initial
+update, the hiddev device will fetch the initial state of the reports
+to mimic the current behavior. This adds a small amount of time during
+the first HIDIOCGUSAGE(S), but it should be acceptable in
+most cases. To keep the currently known broken devices, we have to
+keep around HID_QUIRK_NO_INIT_REPORTS, but the scope will only be
+for hiddev.
+
+Note that I don't think hidraw would be affected and I checked that
+the FF drivers that need to interact with the report fields are all
+using output reports, which are not initialized by
+usbhid_init_reports().
+
+NO_INIT_INPUT_REPORTS is then replaced by HID_QUIRK_NO_INIT_REPORTS:
+there is no point keeping it for just one device.
+
+	Signed-off-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+(cherry picked from commit 9143059fafd4eebed2d43ffb5455178d4010e60a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hid/i2c-hid/i2c-hid.c
+#	drivers/hid/usbhid/hid-quirks.c
+diff --cc drivers/hid/i2c-hid/i2c-hid.c
+index 08fef6a73ebf,042b90d451ee..000000000000
+--- a/drivers/hid/i2c-hid/i2c-hid.c
++++ b/drivers/hid/i2c-hid/i2c-hid.c
+@@@ -506,70 -508,6 +506,73 @@@ static int i2c_hid_get_report_length(st
+  		report->device->report_enum[report->type].numbered + 2;
+  }
+  
+++<<<<<<< HEAD
+ +static void i2c_hid_init_report(struct hid_report *report, u8 *buffer,
+ +	size_t bufsize)
+ +{
+ +	struct hid_device *hid = report->device;
+ +	struct i2c_client *client = hid->driver_data;
+ +	struct i2c_hid *ihid = i2c_get_clientdata(client);
+ +	unsigned int size, ret_size;
+ +
+ +	size = i2c_hid_get_report_length(report);
+ +	if (i2c_hid_get_report(client,
+ +			report->type == HID_FEATURE_REPORT ? 0x03 : 0x01,
+ +			report->id, buffer, size))
+ +		return;
+ +
+ +	i2c_hid_dbg(ihid, "report (len=%d): %*ph\n", size, size, buffer);
+ +
+ +	ret_size = buffer[0] | (buffer[1] << 8);
+ +
+ +	if (ret_size != size) {
+ +		dev_err(&client->dev, "error in %s size:%d / ret_size:%d\n",
+ +			__func__, size, ret_size);
+ +		return;
+ +	}
+ +
+ +	/* hid->driver_lock is held as we are in probe function,
+ +	 * we just need to setup the input fields, so using
+ +	 * hid_report_raw_event is safe. */
+ +	hid_report_raw_event(hid, report->type, buffer + 2, size - 2, 1);
+ +}
+ +
+ +/*
+ + * Initialize all reports
+ + */
+ +static void i2c_hid_init_reports(struct hid_device *hid)
+ +{
+ +	struct hid_report *report;
+ +	struct i2c_client *client = hid->driver_data;
+ +	struct i2c_hid *ihid = i2c_get_clientdata(client);
+ +	u8 *inbuf = kzalloc(ihid->bufsize, GFP_KERNEL);
+ +
+ +	if (!inbuf) {
+ +		dev_err(&client->dev, "can not retrieve initial reports\n");
+ +		return;
+ +	}
+ +
+ +	list_for_each_entry(report,
+ +		&hid->report_enum[HID_INPUT_REPORT].report_list, list)
+ +		i2c_hid_init_report(report, inbuf, ihid->bufsize);
+ +
+ +	/*
+ +	 * The device must be powered on while we fetch initial reports
+ +	 * from it.
+ +	 */
+ +	pm_runtime_get_sync(&client->dev);
+ +
+ +	list_for_each_entry(report,
+ +		&hid->report_enum[HID_FEATURE_REPORT].report_list, list)
+ +		i2c_hid_init_report(report, inbuf, ihid->bufsize);
+ +
+ +	pm_runtime_put(&client->dev);
+ +
+ +	kfree(inbuf);
+ +}
+ +
+++=======
+++>>>>>>> 9143059fafd4 (HID: remove initial reading of reports at connect)
+  /*
+   * Traverse the supplied list of reports and find the longest
+   */
+diff --cc drivers/hid/usbhid/hid-quirks.c
+index 32043bc41163,ec4fdba39722..000000000000
+--- a/drivers/hid/usbhid/hid-quirks.c
++++ b/drivers/hid/usbhid/hid-quirks.c
+@@@ -130,126 -147,21 +130,136 @@@ static const struct hid_blacklist 
+  	{ USB_VENDOR_ID_CHICONY, USB_DEVICE_ID_CHICONY_WIRELESS, HID_QUIRK_MULTI_INPUT },
+  	{ USB_VENDOR_ID_SIGMA_MICRO, USB_DEVICE_ID_SIGMA_MICRO_KEYBOARD, HID_QUIRK_NO_INIT_REPORTS },
+  	{ USB_VENDOR_ID_KYE, USB_DEVICE_ID_KYE_MOUSEPEN_I608X, HID_QUIRK_MULTI_INPUT },
+ -	{ USB_VENDOR_ID_KYE, USB_DEVICE_ID_KYE_MOUSEPEN_I608X_V2, HID_QUIRK_MULTI_INPUT },
+  	{ USB_VENDOR_ID_KYE, USB_DEVICE_ID_KYE_EASYPEN_M610X, HID_QUIRK_MULTI_INPUT },
+ -	{ USB_VENDOR_ID_KYE, USB_DEVICE_ID_KYE_PENSKETCH_M912, HID_QUIRK_MULTI_INPUT },
+  	{ USB_VENDOR_ID_NTRIG, USB_DEVICE_ID_NTRIG_DUOSENSE, HID_QUIRK_NO_INIT_REPORTS },
+ -	{ USB_VENDOR_ID_SEMICO, USB_DEVICE_ID_SEMICO_USB_KEYKOARD, HID_QUIRK_NO_INIT_REPORTS },
+ -	{ USB_VENDOR_ID_SEMICO, USB_DEVICE_ID_SEMICO_USB_KEYKOARD2, HID_QUIRK_NO_INIT_REPORTS },
+  	{ USB_VENDOR_ID_SYNAPTICS, USB_DEVICE_ID_SYNAPTICS_LTS1, HID_QUIRK_NO_INIT_REPORTS },
+  	{ USB_VENDOR_ID_SYNAPTICS, USB_DEVICE_ID_SYNAPTICS_LTS2, HID_QUIRK_NO_INIT_REPORTS },
+++<<<<<<< HEAD
+ +
+ +	/* For now, only handle new devices in hid-wacom */
+ +	{ USB_VENDOR_ID_WACOM, 0x00, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x10, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x11, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x12, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x13, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x14, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x15, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x16, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x17, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x18, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x19, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x60, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x61, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x62, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x63, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x64, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x65, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x69, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x6A, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x6B, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x20, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x21, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x22, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x23, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x24, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x30, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x31, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x32, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x33, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x34, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x35, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x37, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x38, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x39, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xC4, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xC0, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xC2, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x03, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x41, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x42, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x43, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x44, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x45, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x57, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x59, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x5D, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x5B, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x5E, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xB0, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xB1, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xB2, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xB3, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xB4, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xB5, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xB7, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xB8, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xB9, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xBA, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xBB, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xBC, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x26, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x27, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x28, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x29, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x2A, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x3F, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xC5, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xC6, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xC7, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xCE, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x84, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xD0, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xD1, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xD2, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xD3, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xD4, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xD5, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xD6, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xD7, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xD8, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xDA, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xDB, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xDD, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xDE, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xDF, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xF0, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xCC, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x90, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x93, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x97, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x9A, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x9F, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xE2, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xE3, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xE5, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xE6, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xEC, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xED, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xEF, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x100, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x101, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x10D, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x304, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x314, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x315, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x317, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x32A, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x4001, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0x47, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xF4, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xF8, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xF6, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_WACOM, 0xFA, HID_QUIRK_IGNORE },
+ +	{ USB_VENDOR_ID_LENOVO, 0x6004, HID_QUIRK_IGNORE },
+++=======
++ 	{ USB_VENDOR_ID_SYNAPTICS, USB_DEVICE_ID_SYNAPTICS_HD, HID_QUIRK_NO_INIT_REPORTS },
++ 	{ USB_VENDOR_ID_SYNAPTICS, USB_DEVICE_ID_SYNAPTICS_QUAD_HD, HID_QUIRK_NO_INIT_REPORTS },
++ 	{ USB_VENDOR_ID_SYNAPTICS, USB_DEVICE_ID_SYNAPTICS_TP_V103, HID_QUIRK_NO_INIT_REPORTS },
++ 	{ USB_VENDOR_ID_HOLTEK_ALT, USB_DEVICE_ID_HOLTEK_ALT_KEYBOARD_A096, HID_QUIRK_NO_INIT_REPORTS },
++ 	{ USB_VENDOR_ID_MULTIPLE_1781, USB_DEVICE_ID_RAPHNET_4NES4SNES_OLD, HID_QUIRK_MULTI_INPUT },
++ 	{ USB_VENDOR_ID_DRACAL_RAPHNET, USB_DEVICE_ID_RAPHNET_2NES2SNES, HID_QUIRK_MULTI_INPUT },
++ 	{ USB_VENDOR_ID_DRACAL_RAPHNET, USB_DEVICE_ID_RAPHNET_4NES4SNES, HID_QUIRK_MULTI_INPUT },
+++>>>>>>> 9143059fafd4 (HID: remove initial reading of reports at connect)
+  
+  	{ 0, 0 }
+  };
+* Unmerged path drivers/hid/i2c-hid/i2c-hid.c
+diff --git a/drivers/hid/usbhid/hid-core.c b/drivers/hid/usbhid/hid-core.c
+index bddcb78314e6..e2c94fde08aa 100644
+--- a/drivers/hid/usbhid/hid-core.c
++++ b/drivers/hid/usbhid/hid-core.c
+@@ -752,11 +752,9 @@ void usbhid_init_reports(struct hid_device *hid)
+ 	struct hid_report_enum *report_enum;
+ 	int err, ret;
+ 
+-	if (!(hid->quirks & HID_QUIRK_NO_INIT_INPUT_REPORTS)) {
+-		report_enum = &hid->report_enum[HID_INPUT_REPORT];
+-		list_for_each_entry(report, &report_enum->report_list, list)
+-			usbhid_submit_report(hid, report, USB_DIR_IN);
+-	}
++	report_enum = &hid->report_enum[HID_INPUT_REPORT];
++	list_for_each_entry(report, &report_enum->report_list, list)
++		usbhid_submit_report(hid, report, USB_DIR_IN);
+ 
+ 	report_enum = &hid->report_enum[HID_FEATURE_REPORT];
+ 	list_for_each_entry(report, &report_enum->report_list, list)
+@@ -1127,9 +1125,6 @@ static int usbhid_start(struct hid_device *hid)
+ 	usbhid->urbctrl->transfer_dma = usbhid->ctrlbuf_dma;
+ 	usbhid->urbctrl->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+ 
+-	if (!(hid->quirks & HID_QUIRK_NO_INIT_REPORTS))
+-		usbhid_init_reports(hid);
+-
+ 	set_bit(HID_STARTED, &usbhid->iofl);
+ 
+ 	if (hid->quirks & HID_QUIRK_ALWAYS_POLL) {
+* Unmerged path drivers/hid/usbhid/hid-quirks.c
+diff --git a/drivers/hid/usbhid/hiddev.c b/drivers/hid/usbhid/hiddev.c
+index 700145b15088..667171829f65 100644
+--- a/drivers/hid/usbhid/hiddev.c
++++ b/drivers/hid/usbhid/hiddev.c
+@@ -54,6 +54,7 @@ struct hiddev {
+ 	struct hid_device *hid;
+ 	struct list_head list;
+ 	spinlock_t list_lock;
++	bool initialized;
+ };
+ 
+ struct hiddev_list {
+@@ -689,6 +690,7 @@ static long hiddev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 
+ 	case HIDIOCINITREPORT:
+ 		usbhid_init_reports(hid);
++		hiddev->initialized = true;
+ 		r = 0;
+ 		break;
+ 
+@@ -790,6 +792,10 @@ static long hiddev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 	case HIDIOCGUSAGES:
+ 	case HIDIOCSUSAGES:
+ 	case HIDIOCGCOLLECTIONINDEX:
++		if (!hiddev->initialized) {
++			usbhid_init_reports(hid);
++			hiddev->initialized = true;
++		}
+ 		r = hiddev_ioctl_usage(hiddev, cmd, user_arg);
+ 		break;
+ 
+@@ -910,6 +916,13 @@ int hiddev_connect(struct hid_device *hid, unsigned int force)
+ 		kfree(hiddev);
+ 		return -1;
+ 	}
++
++	/*
++	 * If HID_QUIRK_NO_INIT_REPORTS is set, make sure we don't initialize
++	 * the reports.
++	 */
++	hiddev->initialized = hid->quirks & HID_QUIRK_NO_INIT_REPORTS;
++
+ 	return 0;
+ }
+ 
+diff --git a/include/linux/hid.h b/include/linux/hid.h
+index 2f007bf563d8..47bdbc2491ec 100644
+--- a/include/linux/hid.h
++++ b/include/linux/hid.h
+@@ -288,7 +288,7 @@ struct hid_item {
+ #define HID_QUIRK_MULTI_INPUT			0x00000040
+ #define HID_QUIRK_HIDINPUT_FORCE		0x00000080
+ #define HID_QUIRK_NO_EMPTY_INPUT		0x00000100
+-#define HID_QUIRK_NO_INIT_INPUT_REPORTS		0x00000200
++/* 0x00000200 reserved for backward compatibility, was NO_INIT_INPUT_REPORTS */
+ #define HID_QUIRK_ALWAYS_POLL			0x00000400
+ #define HID_QUIRK_SKIP_OUTPUT_REPORTS		0x00010000
+ #define HID_QUIRK_SKIP_OUTPUT_REPORT_ID		0x00020000
