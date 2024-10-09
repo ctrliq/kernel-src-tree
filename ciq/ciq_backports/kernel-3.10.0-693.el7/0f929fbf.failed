@@ -1,0 +1,130 @@
+ACPICA: Tables: Add new mechanism to skip NULL entries in RSDT and XSDT.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [acpi] acpica: tables: Add new mechanism to skip NULL entries in RSDT and XSDT (Prarit Bhargava) [1425180]
+Rebuild_FUZZ: 99.30%
+commit-author Lv Zheng <lv.zheng@intel.com>
+commit 0f929fbf0dc6ed21829a9fcd495838858df82291
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/0f929fbf.failed
+
+It is reported that there are buggy BIOSes in the world: AMI uses an XSDT
+compiler for early BIOSes, this compiler will generate XSDT with a NULL
+entry.  The affected BIOS versions are "AMI BIOS F2-F4".
+
+Original solution on Linux is to use an alternative heathy root table
+instead of the ill one.  This commit is:
+  Commit: 671cc68dc61f029d44b43a681356078e02d8dab8
+  Subject: ACPICA: Back port and refine validation of the XSDT root table.
+
+This is an example of such XSDT dumped from B85-HD3 (AMI F3 BIOS):
+[000h 0000   4]                    Signature : "XSDT"    [Extended System Description Table]
+[004h 0004   4]                 Table Length : 00000074
+[008h 0008   1]                     Revision : 01
+[009h 0009   1]                     Checksum : 18
+[00Ah 0010   6]                       Oem ID : "ALASKA"
+[010h 0016   8]                 Oem Table ID : "A M I"
+[018h 0024   4]                 Oem Revision : 01072009
+[01Ch 0028   4]              Asl Compiler ID : "AMI "
+[020h 0032   4]        Asl Compiler Revision : 00010013
+
+[024h 0036   8]       ACPI Table Address   0 : 00000000BA5F8180
+[02Ch 0044   8]       ACPI Table Address   1 : 00000000BA5F8290
+[034h 0052   8]       ACPI Table Address   2 : 00000000BA5F8308
+[03Ch 0060   8]       ACPI Table Address   3 : 00000000BA5F8848
+[044h 0068   8]       ACPI Table Address   4 : 00000000BA5F9320
+[04Ch 0076   8]       ACPI Table Address   5 : 00000000BA5F9360
+[054h 0084   8]       ACPI Table Address   6 : 00000000BA5F9398
+[05Ch 0092   8]       ACPI Table Address   7 : 00000000BA5F9708
+[064h d100   8]       ACPI Table Address   8 : 00000000BA5FC9A8
+[06Ch 0108   8]       ACPI Table Address   9 : 0000000000000000
+
+But according to the bug report, the XSDT in fact is not broken. In the
+above XSDT, ACPI Table Address 1-8 contains the same value as RSDT.  The
+differences can only be seen on the following 2 entries:
+1. The first entry points to a FADT whose Revision is 5 while the first
+   entry in RSDT points to a FADT whose Revision is 2.
+   The FADT dumped from the address indicated by the first entry of XSDT:
+    FACP @ 0x00000000BA5F8180
+      0000: 46 41 43 50 0C 01 00 00<05>4B 41 4C 41 53 4B 41  FACP.....KALASKA
+      ...
+   The FADT dumped from the address indicated by the first entry of RSDT:
+    FACP @ 0x00000000BA5ED0F0
+      0000: 46 41 43 50 84 00 00 00<02>A7 41 4C 41 53 4B 41  FACP......ALASKA
+      ...
+2. The last entry is a NULL terminator.
+According to the test result, the Revision 5 FADT is accessible.  Thus the
+original solution turns out to be a work around that is preventing the
+higher revision tables to be used for such platforms (they are all x86-64
+platforms, and should use XSDT and higher revision FADT).
+
+This patch offers a new solution, where a sanity check is performed before
+installing a table address from XSDT. If the entry is NULL, it is simply
+discarded.
+
+Note that, this patch doesn't remove the original solution, so for Linux
+kernel, this commit is actually a no-op, but it allows acpidump to be
+working on such platforms. By doing so, we allow another easy revertable
+commit to enable this feature so that when that commit is reverted, the
+useful sanity check will not be affected. Lv Zheng.
+
+References: https://bugzilla.kernel.org/show_bug.cgi?id=73911
+References: https://bugs.archlinux.org/task/39811
+	Signed-off-by: Lv Zheng <lv.zheng@intel.com>
+Reported-and-tested-by: Bruce Chiarelli <mano155@gmail.com>
+Reported-and-tested-by: Spyros Stathopoulos <spystath@gmail.com>
+	Signed-off-by: Bob Moore <robert.moore@intel.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 0f929fbf0dc6ed21829a9fcd495838858df82291)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/acpica/tbutils.c
+#	tools/power/acpi/os_specific/service_layers/oslinuxtbl.c
+diff --cc drivers/acpi/acpica/tbutils.c
+index 61ffb069ecd5,801d1963d7d8..000000000000
+--- a/drivers/acpi/acpica/tbutils.c
++++ b/drivers/acpi/acpica/tbutils.c
+@@@ -564,12 -474,30 +564,37 @@@ acpi_tb_parse_root_table(acpi_physical_
+  
+  		/* Get the table physical address (32-bit for RSDT, 64-bit for XSDT) */
+  
+++<<<<<<< HEAD
+ +		acpi_gbl_root_table_list.tables[acpi_gbl_root_table_list.
+ +						current_table_count].address =
+ +		    acpi_tb_get_root_table_entry(table_entry, table_entry_size);
+++=======
++ 		address =
++ 		    acpi_tb_get_root_table_entry(table_entry, table_entry_size);
++ 
++ 		/* Skip NULL entries in RSDT/XSDT */
++ 
++ 		if (!address) {
++ 			goto next_table;
++ 		}
++ 
++ 		status = acpi_tb_install_standard_table(address,
++ 							ACPI_TABLE_ORIGIN_INTERNAL_PHYSICAL,
++ 							FALSE, TRUE,
++ 							&table_index);
++ 
++ 		if (ACPI_SUCCESS(status) &&
++ 		    ACPI_COMPARE_NAME(&acpi_gbl_root_table_list.
++ 				      tables[table_index].signature,
++ 				      ACPI_SIG_FADT)) {
++ 			acpi_tb_parse_fadt(table_index);
++ 		}
+++>>>>>>> 0f929fbf0dc6 (ACPICA: Tables: Add new mechanism to skip NULL entries in RSDT and XSDT.)
++ 
++ next_table:
+  
+  		table_entry += table_entry_size;
+ +		acpi_gbl_root_table_list.current_table_count++;
+  	}
+  
+  	/*
+* Unmerged path tools/power/acpi/os_specific/service_layers/oslinuxtbl.c
+* Unmerged path drivers/acpi/acpica/tbutils.c
+* Unmerged path tools/power/acpi/os_specific/service_layers/oslinuxtbl.c
