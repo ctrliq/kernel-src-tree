@@ -1,0 +1,148 @@
+scsi: cxlflash: Improve asynchronous interrupt processing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] cxlflash: Improve asynchronous interrupt processing (Gustavo Duarte) [1456494]
+Rebuild_FUZZ: 94.44%
+commit-author Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+commit e2ef33fa5958c51ebf0c6f18db19fe927e2185fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e2ef33fa.failed
+
+The method used to decode asynchronous interrupts involves unnecessary loops
+to match up bits that are set with corresponding entries in the asynchronous
+interrupt information table. This algorithm is wasteful and does not scale
+well as new status bits are supported.
+
+As an improvement, use the for_each_set_bit() service to iterate over the
+asynchronous status bits and refactor the information table such that it can
+be indexed by bit position.
+
+	Signed-off-by: Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
+	Signed-off-by: Uma Krishnan <ukrishn@linux.vnet.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit e2ef33fa5958c51ebf0c6f18db19fe927e2185fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/cxlflash/main.c
+diff --cc drivers/scsi/cxlflash/main.c
+index c68badcfa77f,c60936fb70bb..000000000000
+--- a/drivers/scsi/cxlflash/main.c
++++ b/drivers/scsi/cxlflash/main.c
+@@@ -1077,49 -1014,9 +1077,52 @@@ static void afu_link_reset(struct afu *
+  	writeq_be(port_sel, &afu->afu_map->global.regs.afu_port_sel);
+  	cxlflash_afu_sync(afu, 0, 0, AFU_GSYNC);
+  
+ -	dev_dbg(dev, "%s: returning port_sel=%016llx\n", __func__, port_sel);
+ +	pr_debug("%s: returning port_sel=%lld\n", __func__, port_sel);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Asynchronous interrupt information table
+ + */
+ +static const struct asyc_intr_info ainfo[] = {
+ +	{SISL_ASTATUS_FC0_OTHER, "other error", 0, CLR_FC_ERROR | LINK_RESET},
+ +	{SISL_ASTATUS_FC0_LOGO, "target initiated LOGO", 0, 0},
+ +	{SISL_ASTATUS_FC0_CRC_T, "CRC threshold exceeded", 0, LINK_RESET},
+ +	{SISL_ASTATUS_FC0_LOGI_R, "login timed out, retrying", 0, LINK_RESET},
+ +	{SISL_ASTATUS_FC0_LOGI_F, "login failed", 0, CLR_FC_ERROR},
+ +	{SISL_ASTATUS_FC0_LOGI_S, "login succeeded", 0, SCAN_HOST},
+ +	{SISL_ASTATUS_FC0_LINK_DN, "link down", 0, 0},
+ +	{SISL_ASTATUS_FC0_LINK_UP, "link up", 0, 0},
+ +	{SISL_ASTATUS_FC1_OTHER, "other error", 1, CLR_FC_ERROR | LINK_RESET},
+ +	{SISL_ASTATUS_FC1_LOGO, "target initiated LOGO", 1, 0},
+ +	{SISL_ASTATUS_FC1_CRC_T, "CRC threshold exceeded", 1, LINK_RESET},
+ +	{SISL_ASTATUS_FC1_LOGI_R, "login timed out, retrying", 1, LINK_RESET},
+ +	{SISL_ASTATUS_FC1_LOGI_F, "login failed", 1, CLR_FC_ERROR},
+ +	{SISL_ASTATUS_FC1_LOGI_S, "login succeeded", 1, SCAN_HOST},
+ +	{SISL_ASTATUS_FC1_LINK_DN, "link down", 1, 0},
+ +	{SISL_ASTATUS_FC1_LINK_UP, "link up", 1, 0},
+ +	{0x0, "", 0, 0}		/* terminator */
+ +};
+ +
+ +/**
+ + * find_ainfo() - locates and returns asynchronous interrupt information
+ + * @status:	Status code set by AFU on error.
+ + *
+ + * Return: The located information or NULL when the status code is invalid.
+ + */
+ +static const struct asyc_intr_info *find_ainfo(u64 status)
+ +{
+ +	const struct asyc_intr_info *info;
+ +
+ +	for (info = &ainfo[0]; info->status; info++)
+ +		if (info->status == status)
+ +			return info;
+ +
+ +	return NULL;
+ +}
+ +
+++=======
+++>>>>>>> e2ef33fa5958 (scsi: cxlflash: Improve asynchronous interrupt processing)
+  /**
+   * afu_err_intr_init() - clears and initializes the AFU for error interrupts
+   * @afu:	AFU associated with the host.
+@@@ -1263,18 -1288,19 +1295,27 @@@ static irqreturn_t cxlflash_async_err_i
+  	struct afu *afu = (struct afu *)data;
+  	struct cxlflash_cfg *cfg = afu->parent;
+  	struct device *dev = &cfg->dev->dev;
+- 	u64 reg_unmasked;
+  	const struct asyc_intr_info *info;
+  	struct sisl_global_map __iomem *global = &afu->afu_map->global;
+++<<<<<<< HEAD
+++=======
++ 	__be64 __iomem *fc_port_regs;
++ 	u64 reg_unmasked;
+++>>>>>>> e2ef33fa5958 (scsi: cxlflash: Improve asynchronous interrupt processing)
+  	u64 reg;
++ 	u64 bit;
+  	u8 port;
+- 	int i;
+  
+  	reg = readq_be(&global->regs.aintr_status);
+  	reg_unmasked = (reg & SISL_ASTATUS_UNMASK);
+  
+++<<<<<<< HEAD
+ +	if (reg_unmasked == 0) {
+ +		dev_err(dev, "%s: spurious interrupt, aintr_status 0x%016llX\n",
+++=======
++ 	if (unlikely(reg_unmasked == 0)) {
++ 		dev_err(dev, "%s: spurious interrupt, aintr_status=%016llx\n",
+++>>>>>>> e2ef33fa5958 (scsi: cxlflash: Improve asynchronous interrupt processing)
+  			__func__, reg);
+  		goto out;
+  	}
+@@@ -1283,16 -1309,24 +1324,23 @@@
+  	writeq_be(reg_unmasked, &global->regs.aintr_clear);
+  
+  	/* Check each bit that is on */
+- 	for (i = 0; reg_unmasked; i++, reg_unmasked = (reg_unmasked >> 1)) {
+- 		info = find_ainfo(1ULL << i);
+- 		if (((reg_unmasked & 0x1) == 0) || !info)
++ 	for_each_set_bit(bit, (ulong *)&reg_unmasked, BITS_PER_LONG) {
++ 		if (unlikely(bit >= ARRAY_SIZE(ainfo))) {
++ 			WARN_ON_ONCE(1);
+  			continue;
++ 		}
++ 
++ 		info = &ainfo[bit];
++ 		if (unlikely(info->status != 1ULL << bit)) {
++ 			WARN_ON_ONCE(1);
++ 			continue;
++ 		}
+  
+  		port = info->port;
+ -		fc_port_regs = get_fc_port_regs(cfg, port);
+  
+ -		dev_err(dev, "%s: FC Port %d -> %s, fc_status=%016llx\n",
+ +		dev_err(dev, "%s: FC Port %d -> %s, fc_status 0x%08llX\n",
+  			__func__, port, info->desc,
+ -		       readq_be(&fc_port_regs[FC_STATUS / 8]));
+ +		       readq_be(&global->fc_regs[port][FC_STATUS / 8]));
+  
+  		/*
+  		 * Do link reset first, some OTHER errors will set FC_ERROR
+* Unmerged path drivers/scsi/cxlflash/main.c
