@@ -51,7 +51,6 @@
 #include "tcm_qla2xxx.h"
 
 static struct workqueue_struct *tcm_qla2xxx_free_wq;
-static struct workqueue_struct *tcm_qla2xxx_cmd_wq;
 
 /*
  * Parse WWN.
@@ -1964,16 +1963,8 @@ static int tcm_qla2xxx_register_configfs(void)
 		goto out_fabric_npiv;
 	}
 
-	tcm_qla2xxx_cmd_wq = alloc_workqueue("tcm_qla2xxx_cmd", 0, 0);
-	if (!tcm_qla2xxx_cmd_wq) {
-		ret = -ENOMEM;
-		goto out_free_wq;
-	}
-
 	return 0;
 
-out_free_wq:
-	destroy_workqueue(tcm_qla2xxx_free_wq);
 out_fabric_npiv:
 	target_unregister_template(&tcm_qla2xxx_npiv_ops);
 out_fabric:
@@ -1983,7 +1974,6 @@ out_fabric:
 
 static void tcm_qla2xxx_deregister_configfs(void)
 {
-	destroy_workqueue(tcm_qla2xxx_cmd_wq);
 	destroy_workqueue(tcm_qla2xxx_free_wq);
 
 	target_unregister_template(&tcm_qla2xxx_ops);
