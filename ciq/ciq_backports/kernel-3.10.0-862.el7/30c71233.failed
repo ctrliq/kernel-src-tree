@@ -1,0 +1,128 @@
+ceph: clean up unsafe d_parent access in __choose_mds
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jeff Layton <jlayton@redhat.com>
+commit 30c71233a1d4b5c23ad6652847285bf6b57086e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/30c71233.failed
+
+__choose_mds exists to pick an MDS to use when issuing a call. Doing
+that typically involves picking an inode and using the authoritative
+MDS for it. In most cases, that's pretty straightforward, as we are
+using an inode to which we hold a reference (usually represented by
+r_dentry or r_inode in the request).
+
+In the case of a snapshotted directory however, we need to fetch
+the non-snapped parent, which involves walking back up the parents
+in the tree. The dentries in the snapshot dir are effectively frozen
+but the overall parent is _not_, and could vanish if a concurrent
+rename were to occur.
+
+Clean this code up and take special care to ensure the validity of
+the entries we're working with. First, try to use the inode in
+r_locked_dir if one exists. If not and all we have is r_dentry,
+then we have to walk back up the tree. Use the rcu_read_lock for
+this so we can ensure that any d_parent we find won't go away, and
+take extra care to deal with the possibility that the dentries could
+go negative.
+
+Change get_nonsnap_parent to return an inode, and take a reference to
+that inode before returning (if any). Change all of the other places
+where we set "inode" in __choose_mds to also take a reference, and then
+call iput on that inode before exiting the function.
+
+Link: http://tracker.ceph.com/issues/18148
+	Signed-off-by: Jeff Layton <jlayton@redhat.com>
+	Reviewed-by: Yan, Zheng <zyan@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 30c71233a1d4b5c23ad6652847285bf6b57086e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/mds_client.c
+diff --cc fs/ceph/mds_client.c
+index 33c790140222,377ac34ddbb3..000000000000
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@@ -669,19 -696,6 +690,22 @@@ static struct inode *get_nonsnap_parent
+   *
+   * Called under mdsc->mutex.
+   */
+++<<<<<<< HEAD
+ +static struct dentry *get_nonsnap_parent(struct dentry *dentry)
+ +{
+ +	/*
+ +	 * we don't need to worry about protecting the d_parent access
+ +	 * here because we never renaming inside the snapped namespace
+ +	 * except to resplice to another snapdir, and either the old or new
+ +	 * result is a valid result.
+ +	 */
+ +	while (!IS_ROOT(dentry) && ceph_snap(dentry->d_inode) != CEPH_NOSNAP)
+ +		dentry = dentry->d_parent;
+ +	return dentry;
+ +}
+ +
+++=======
+++>>>>>>> 30c71233a1d4 (ceph: clean up unsafe d_parent access in __choose_mds)
+  static int __choose_mds(struct ceph_mds_client *mdsc,
+  			struct ceph_mds_request *req)
+  {
+@@@ -711,30 -725,39 +735,53 @@@
+  	inode = NULL;
+  	if (req->r_inode) {
+  		inode = req->r_inode;
++ 		ihold(inode);
+  	} else if (req->r_dentry) {
+  		/* ignore race with rename; old or new d_parent is okay */
+++<<<<<<< HEAD
+ +		struct dentry *parent = req->r_dentry->d_parent;
+ +		struct inode *dir = parent->d_inode;
+ +
+ +		if (dir->i_sb != mdsc->fsc->sb) {
+ +			/* not this fs! */
+ +			inode = req->r_dentry->d_inode;
+ +		} else if (ceph_snap(dir) != CEPH_NOSNAP) {
+ +			/* direct snapped/virtual snapdir requests
+ +			 * based on parent dir inode */
+ +			struct dentry *dn = get_nonsnap_parent(parent);
+ +			inode = dn->d_inode;
+++=======
++ 		struct dentry *parent;
++ 		struct inode *dir;
++ 
++ 		rcu_read_lock();
++ 		parent = req->r_dentry->d_parent;
++ 		dir = req->r_locked_dir ? : d_inode_rcu(parent);
++ 
++ 		if (!dir || dir->i_sb != mdsc->fsc->sb) {
++ 			/*  not this fs or parent went negative */
++ 			inode = d_inode(req->r_dentry);
++ 			if (inode)
++ 				ihold(inode);
++ 		} else if (ceph_snap(dir) != CEPH_NOSNAP) {
++ 			/* direct snapped/virtual snapdir requests
++ 			 * based on parent dir inode */
++ 			inode = get_nonsnap_parent(parent);
+++>>>>>>> 30c71233a1d4 (ceph: clean up unsafe d_parent access in __choose_mds)
+  			dout("__choose_mds using nonsnap parent %p\n", inode);
+  		} else {
+  			/* dentry target */
+ -			inode = d_inode(req->r_dentry);
+ +			inode = req->r_dentry->d_inode;
+  			if (!inode || mode == USE_AUTH_MDS) {
+  				/* dir + name */
+- 				inode = dir;
++ 				inode = igrab(dir);
+  				hash = ceph_dentry_hash(dir, req->r_dentry);
+  				is_hash = true;
++ 			} else {
++ 				ihold(inode);
+  			}
+  		}
++ 		rcu_read_unlock();
+  	}
+  
+  	dout("__choose_mds %p is_hash=%d (%d) mode %d\n", inode, (int)is_hash,
+* Unmerged path fs/ceph/mds_client.c
