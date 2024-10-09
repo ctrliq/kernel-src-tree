@@ -523,15 +523,6 @@ static void liquidio_deinit_pci(void)
 }
 
 /**
- * \brief Stop Tx queue
- * @param netdev network device
- */
-static void stop_txq(struct net_device *netdev)
-{
-	txqs_stop(netdev);
-}
-
-/**
  * \brief Start Tx queue
  * @param netdev network device
  */
@@ -843,7 +834,7 @@ static inline void update_link_status(struct net_device *netdev,
 			txqs_wake(netdev);
 		} else {
 			netif_carrier_off(netdev);
-			stop_txq(netdev);
+			txqs_stop(netdev);
 		}
 	}
 }
