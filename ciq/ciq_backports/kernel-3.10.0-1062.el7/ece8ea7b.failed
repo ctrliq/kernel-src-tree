@@ -1,0 +1,187 @@
+RDMA/usnic: Do not use ucontext->tgid
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Gunthorpe <jgg@mellanox.com>
+commit ece8ea7bfac053cf27c24e1a767b796a4db2fbd7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/ece8ea7b.failed
+
+Update this driver to match the code it copies from umem.c which no longer
+uses tgid.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit ece8ea7bfac053cf27c24e1a767b796a4db2fbd7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/usnic/usnic_uiom.c
+diff --cc drivers/infiniband/hw/usnic/usnic_uiom.c
+index b500d8d322ba,49275a548751..000000000000
+--- a/drivers/infiniband/hw/usnic/usnic_uiom.c
++++ b/drivers/infiniband/hw/usnic/usnic_uiom.c
+@@@ -111,6 -102,18 +100,21 @@@ static int usnic_uiom_get_pages(unsigne
+  	int i;
+  	int flags;
+  	dma_addr_t pa;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int gup_flags;
++ 	struct mm_struct *mm;
++ 
++ 	/*
++ 	 * If the combination of the addr and size requested for this memory
++ 	 * region causes an integer overflow, return error.
++ 	 */
++ 	if (((addr + size) < addr) || PAGE_ALIGN(addr + size) < (addr + size))
++ 		return -EINVAL;
++ 
++ 	if (!size)
++ 		return -EINVAL;
+++>>>>>>> ece8ea7bfac0 (RDMA/usnic: Do not use ucontext->tgid)
+  
+  	if (!can_do_mlock())
+  		return -EPERM;
+@@@ -123,9 -126,10 +127,10 @@@
+  
+  	npages = PAGE_ALIGN(size + (addr & ~PAGE_MASK)) >> PAGE_SHIFT;
+  
+- 	down_write(&current->mm->mmap_sem);
++ 	uiomr->owning_mm = mm = current->mm;
++ 	down_write(&mm->mmap_sem);
+  
+ -	locked = npages + current->mm->pinned_vm;
+ +	locked = npages + current->mm->locked_vm;
+  	lock_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+  
+  	if ((locked > lock_limit) && !capable(CAP_IPC_LOCK)) {
+@@@ -181,10 -187,12 +186,17 @@@
+  out:
+  	if (ret < 0)
+  		usnic_uiom_put_pages(chunk_list, 0);
+++<<<<<<< HEAD
+ +	else
+ +		current->mm->locked_vm = locked;
+++=======
++ 	else {
++ 		mm->pinned_vm = locked;
++ 		mmgrab(uiomr->owning_mm);
++ 	}
+++>>>>>>> ece8ea7bfac0 (RDMA/usnic: Do not use ucontext->tgid)
+  
+- 	up_write(&current->mm->mmap_sem);
++ 	up_write(&mm->mmap_sem);
+  	free_page((unsigned long) page_list);
+  	return ret;
+  }
+@@@ -416,45 -425,55 +429,89 @@@ out_free_uiomr
+  	return ERR_PTR(err);
+  }
+  
+++<<<<<<< HEAD
+ +void usnic_uiom_reg_release(struct usnic_uiom_reg *uiomr, int closing)
+ +{
+ +	struct mm_struct *mm;
+ +	unsigned long diff;
+++=======
++ static void __usnic_uiom_release_tail(struct usnic_uiom_reg *uiomr)
++ {
++ 	mmdrop(uiomr->owning_mm);
++ 	kfree(uiomr);
++ }
+++>>>>>>> ece8ea7bfac0 (RDMA/usnic: Do not use ucontext->tgid)
++ 
++ static inline size_t usnic_uiom_num_pages(struct usnic_uiom_reg *uiomr)
++ {
++ 	return PAGE_ALIGN(uiomr->length + uiomr->offset) >> PAGE_SHIFT;
++ }
++ 
++ static void usnic_uiom_release_defer(struct work_struct *work)
++ {
++ 	struct usnic_uiom_reg *uiomr =
++ 		container_of(work, struct usnic_uiom_reg, work);
+  
++ 	down_write(&uiomr->owning_mm->mmap_sem);
++ 	uiomr->owning_mm->pinned_vm -= usnic_uiom_num_pages(uiomr);
++ 	up_write(&uiomr->owning_mm->mmap_sem);
++ 
++ 	__usnic_uiom_release_tail(uiomr);
++ }
++ 
++ void usnic_uiom_reg_release(struct usnic_uiom_reg *uiomr,
++ 			    struct ib_ucontext *context)
++ {
+  	__usnic_uiom_reg_release(uiomr->pd, uiomr, 1);
+  
+++<<<<<<< HEAD
+ +	mm = get_task_mm(current);
+ +	if (!mm) {
+ +		kfree(uiomr);
+ +		return;
+ +	}
+ +
+ +	diff = PAGE_ALIGN(uiomr->length + uiomr->offset) >> PAGE_SHIFT;
+ +
+++=======
+++>>>>>>> ece8ea7bfac0 (RDMA/usnic: Do not use ucontext->tgid)
+  	/*
+  	 * We may be called with the mm's mmap_sem already held.  This
+  	 * can happen when a userspace munmap() is the call that drops
+  	 * the last reference to our file and calls our release
+  	 * method.  If there are memory regions to destroy, we'll end
+  	 * up here and not be able to take the mmap_sem.  In that case
+- 	 * we defer the vm_locked accounting to the system workqueue.
++ 	 * we defer the vm_locked accounting to a workqueue.
+  	 */
+++<<<<<<< HEAD
+ +	if (closing) {
+ +		if (!down_write_trylock(&mm->mmap_sem)) {
+ +			INIT_WORK(&uiomr->work, usnic_uiom_reg_account);
+ +			uiomr->mm = mm;
+ +			uiomr->diff = diff;
+ +
+++=======
++ 	if (context->closing) {
++ 		if (!down_write_trylock(&uiomr->owning_mm->mmap_sem)) {
++ 			INIT_WORK(&uiomr->work, usnic_uiom_release_defer);
+++>>>>>>> ece8ea7bfac0 (RDMA/usnic: Do not use ucontext->tgid)
+  			queue_work(usnic_uiom_wq, &uiomr->work);
+  			return;
+  		}
+- 	} else
+- 		down_write(&mm->mmap_sem);
++ 	} else {
++ 		down_write(&uiomr->owning_mm->mmap_sem);
++ 	}
++ 	uiomr->owning_mm->pinned_vm -= usnic_uiom_num_pages(uiomr);
++ 	up_write(&uiomr->owning_mm->mmap_sem);
+  
+++<<<<<<< HEAD
+ +	current->mm->locked_vm -= diff;
+ +	up_write(&mm->mmap_sem);
+ +	mmput(mm);
+ +	kfree(uiomr);
+++=======
++ 	__usnic_uiom_release_tail(uiomr);
+++>>>>>>> ece8ea7bfac0 (RDMA/usnic: Do not use ucontext->tgid)
+  }
+  
+  struct usnic_uiom_pd *usnic_uiom_alloc_pd(void)
+* Unmerged path drivers/infiniband/hw/usnic/usnic_uiom.c
+diff --git a/drivers/infiniband/hw/usnic/usnic_uiom.h b/drivers/infiniband/hw/usnic/usnic_uiom.h
+index 45ca7c1613a7..d8dd11bdf7cd 100644
+--- a/drivers/infiniband/hw/usnic/usnic_uiom.h
++++ b/drivers/infiniband/hw/usnic/usnic_uiom.h
+@@ -69,8 +69,7 @@ struct usnic_uiom_reg {
+ 	int				writable;
+ 	struct list_head		chunk_list;
+ 	struct work_struct		work;
+-	struct mm_struct		*mm;
+-	unsigned long			diff;
++	struct mm_struct		*owning_mm;
+ };
+ 
+ struct usnic_uiom_chunk {
