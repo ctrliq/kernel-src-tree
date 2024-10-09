@@ -1,0 +1,128 @@
+mm/memory_hotplug: introduce add_pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [mm] memory_hotplug: introduce add_pages (Jerome Glisse) [1444991]
+Rebuild_FUZZ: 95.89%
+commit-author Michal Hocko <mhocko@suse.com>
+commit 3072e413e305e353cd4654f8a57d953b66e85bf3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/3072e413.failed
+
+There are new users of memory hotplug emerging.  Some of them require
+different subset of arch_add_memory.  There are some which only require
+allocation of struct pages without mapping those pages to the kernel
+address space.  We currently have __add_pages for that purpose.  But this
+is rather lowlevel and not very suitable for the code outside of the
+memory hotplug.  E.g.  x86_64 wants to update max_pfn which should be done
+by the caller.  Introduce add_pages() which should care about those
+details if they are needed.  Each architecture should define its
+implementation and select CONFIG_ARCH_HAS_ADD_PAGES.  All others use the
+currently existing __add_pages.
+
+Link: http://lkml.kernel.org/r/20170817000548.32038-7-jglisse@redhat.com
+	Signed-off-by: Michal Hocko <mhocko@suse.com>
+	Signed-off-by: Jérôme Glisse <jglisse@redhat.com>
+	Acked-by: Balbir Singh <bsingharora@gmail.com>
+	Cc: Aneesh Kumar <aneesh.kumar@linux.vnet.ibm.com>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: David Nellans <dnellans@nvidia.com>
+	Cc: Evgeny Baskakov <ebaskakov@nvidia.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: John Hubbard <jhubbard@nvidia.com>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Mark Hairgrove <mhairgrove@nvidia.com>
+	Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Cc: Sherry Cheung <SCheung@nvidia.com>
+	Cc: Subhash Gutti <sgutti@nvidia.com>
+	Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+	Cc: Bob Liu <liubo95@huawei.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 3072e413e305e353cd4654f8a57d953b66e85bf3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/mm/init_64.c
+diff --cc arch/x86/mm/init_64.c
+index 166c4a50ca6f,048fbe8fc274..000000000000
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@@ -659,27 -772,12 +659,36 @@@ static void update_end_of_memory_vars(u
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Memory is added always to NORMAL zone. This means you will never get
+ + * additional DMA/DMA32 memory.
+ + */
+ +int arch_add_memory(int nid, u64 start, u64 size, bool for_device)
+ +{
+ +	struct pglist_data *pgdat = NODE_DATA(nid);
+ +	int zoneid = zone_for_memory(nid, start, size, ZONE_NORMAL, for_device);
+ +	struct zone *zone = pgdat->node_zones + zoneid;
+ +	unsigned long start_pfn = start >> PAGE_SHIFT;
+ +	unsigned long nr_pages = size >> PAGE_SHIFT;
+ +	int ret;
+ +
+ +#ifdef CONFIG_ZONE_DEVICE
+ +	if (zoneid == ZONE_DEVICE)
+ +		zone = pgdat->zone_device;
+ +#endif
+ +
+ +	init_memory_mapping(start, start + size);
+ +
+ +	ret = __add_pages(nid, zone, start_pfn, nr_pages);
+++=======
++ int add_pages(int nid, unsigned long start_pfn,
++ 	      unsigned long nr_pages, bool want_memblock)
++ {
++ 	int ret;
++ 
++ 	ret = __add_pages(nid, start_pfn, nr_pages, want_memblock);
+++>>>>>>> 3072e413e305 (mm/memory_hotplug: introduce add_pages)
+  	WARN_ON_ONCE(ret);
+  
+  	/* update max_pfn, max_low_pfn and high_memory */
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 9bc9c85a18d7..dd855e45b1a1 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -1947,6 +1947,10 @@ config CMDLINE_OVERRIDE
+ 
+ endmenu
+ 
++config ARCH_HAS_ADD_PAGES
++	def_bool y
++	depends on X86_64 && ARCH_ENABLE_MEMORY_HOTPLUG
++
+ config ARCH_ENABLE_MEMORY_HOTPLUG
+ 	def_bool y
+ 	depends on X86_64 || (X86_32 && HIGHMEM)
+* Unmerged path arch/x86/mm/init_64.c
+diff --git a/include/linux/memory_hotplug.h b/include/linux/memory_hotplug.h
+index b74828398ae5..1818ddfe25f7 100644
+--- a/include/linux/memory_hotplug.h
++++ b/include/linux/memory_hotplug.h
+@@ -107,6 +107,17 @@ extern int __remove_pages(struct zone *zone, unsigned long start_pfn,
+ extern int __add_pages(int nid, struct zone *zone, unsigned long start_pfn,
+ 	unsigned long nr_pages);
+ 
++#ifndef CONFIG_ARCH_HAS_ADD_PAGES
++static inline int add_pages(int nid, unsigned long start_pfn,
++			    unsigned long nr_pages, bool want_memblock)
++{
++	return __add_pages(nid, start_pfn, nr_pages, want_memblock);
++}
++#else /* ARCH_HAS_ADD_PAGES */
++int add_pages(int nid, unsigned long start_pfn,
++	      unsigned long nr_pages, bool want_memblock);
++#endif /* ARCH_HAS_ADD_PAGES */
++
+ #ifdef CONFIG_NUMA
+ extern int memory_add_physaddr_to_nid(u64 start);
+ #else
