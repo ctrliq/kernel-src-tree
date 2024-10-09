@@ -1,0 +1,269 @@
+IB/uverbs: Move the FD uobj type struct file allocation to alloc_commit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Jason Gunthorpe <jgg@mellanox.com>
+commit aba94548c9e49939fafc92bb406a7f8e7ed87643
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/aba94548.failed
+
+Allocating the struct file during alloc_begin creates this strange
+asymmetry with IDR, where the FD has two krefs pointing at it during the
+pre-commit phase. In particular this makes the abort process for FD very
+strange and confusing.
+
+For instance abort currently calls the type's destroy_object twice, and
+the fops release once if abort is done. This is very counter intuitive. No
+fops should be called until alloc_commit succeeds, and destroy_object
+should only ever be called once.
+
+Moving the struct file allocation to the alloc_commit is now simple, as we
+already support failure of rdma_alloc_commit_uobject, with all the
+required rollback pieces.
+
+This creates an understandable symmetry with IDR and simplifies/fixes the
+abort handling for FD types.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit aba94548c9e49939fafc92bb406a7f8e7ed87643)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/rdma_core.c
+#	include/rdma/uverbs_types.h
+diff --cc drivers/infiniband/core/rdma_core.c
+index 586f179a9de6,8a6ce66d4726..000000000000
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@@ -321,14 -326,10 +321,15 @@@ uobj_put
+  }
+  
+  static struct ib_uobject *alloc_begin_fd_uobject(const struct uverbs_obj_type *type,
+ -						 struct ib_uverbs_file *ufile)
+ +						 struct ib_ucontext *ucontext)
+  {
+- 	const struct uverbs_obj_fd_type *fd_type =
+- 		container_of(type, struct uverbs_obj_fd_type, type);
+  	int new_fd;
+  	struct ib_uobject *uobj;
+++<<<<<<< HEAD
+ +	struct ib_uobject_file *uobj_file;
+ +	struct file *filp;
+++=======
+++>>>>>>> aba94548c9e4 (IB/uverbs: Move the FD uobj type struct file allocation to alloc_commit)
+  
+  	new_fd = get_unused_fd_flags(O_CLOEXEC);
+  	if (new_fd < 0)
+@@@ -340,22 -341,8 +341,27 @@@
+  		return uobj;
+  	}
+  
+++<<<<<<< HEAD
+ +	uobj_file = container_of(uobj, struct ib_uobject_file, uobj);
+ +	filp = anon_inode_getfile(fd_type->name,
+ +				  fd_type->fops,
+ +				  uobj_file,
+ +				  fd_type->flags);
+ +	if (IS_ERR(filp)) {
+ +		put_unused_fd(new_fd);
+ +		uverbs_uobject_put(uobj);
+ +		return (void *)filp;
+ +	}
+ +
+ +	uobj_file->uobj.id = new_fd;
+ +	uobj_file->uobj.object = filp;
+ +	uobj_file->ufile = ucontext->ufile;
+ +	INIT_LIST_HEAD(&uobj->list);
+ +	kref_get(&uobj_file->ufile->ref);
+++=======
++ 	uobj->id = new_fd;
++ 	uobj->ufile = ufile;
+++>>>>>>> aba94548c9e4 (IB/uverbs: Move the FD uobj type struct file allocation to alloc_commit)
+  
+  	return uobj;
+  }
+@@@ -388,14 -384,10 +394,17 @@@ static int __must_check remove_commit_i
+  
+  static void alloc_abort_fd_uobject(struct ib_uobject *uobj)
+  {
+++<<<<<<< HEAD
+ +	struct ib_uobject_file *uobj_file =
+ +		container_of(uobj, struct ib_uobject_file, uobj);
+ +	struct file *filp = uobj->object;
+ +	int id = uobj_file->uobj.id;
+++=======
++ 	put_unused_fd(uobj->id);
+++>>>>>>> aba94548c9e4 (IB/uverbs: Move the FD uobj type struct file allocation to alloc_commit)
+  
+- 	/* Unsuccessful NEW */
+- 	fput(filp);
+- 	put_unused_fd(id);
++ 	/* Pairs with the kref from alloc_begin_idr_uobject */
++ 	uverbs_uobject_put(uobj);
+  }
+  
+  static int __must_check remove_commit_fd_uobject(struct ib_uobject *uobj,
+@@@ -507,36 -475,73 +516,88 @@@ out
+  	return ret;
+  }
+  
+- static void alloc_commit_idr_uobject(struct ib_uobject *uobj)
++ static int alloc_commit_idr_uobject(struct ib_uobject *uobj)
+  {
+ -	struct ib_uverbs_file *ufile = uobj->ufile;
+ -
+ -	spin_lock(&ufile->idr_lock);
+ +	spin_lock(&uobj->context->ufile->idr_lock);
+  	/*
+  	 * We already allocated this IDR with a NULL object, so
+  	 * this shouldn't fail.
+ -	 *
+ -	 * NOTE: Once we set the IDR we loose ownership of our kref on uobj.
+ -	 * It will be put by remove_commit_idr_uobject()
+  	 */
+++<<<<<<< HEAD
+ +	WARN_ON(idr_replace(&uobj->context->ufile->idr,
+ +			    uobj, uobj->id));
+ +	spin_unlock(&uobj->context->ufile->idr_lock);
+++=======
++ 	WARN_ON(idr_replace(&ufile->idr, uobj, uobj->id));
++ 	spin_unlock(&ufile->idr_lock);
++ 
++ 	return 0;
+++>>>>>>> aba94548c9e4 (IB/uverbs: Move the FD uobj type struct file allocation to alloc_commit)
+  }
+  
+- static void alloc_commit_fd_uobject(struct ib_uobject *uobj)
++ static int alloc_commit_fd_uobject(struct ib_uobject *uobj)
+  {
+++<<<<<<< HEAD
+ +	struct ib_uobject_file *uobj_file =
+ +		container_of(uobj, struct ib_uobject_file, uobj);
+++=======
++ 	const struct uverbs_obj_fd_type *fd_type =
++ 		container_of(uobj->type, struct uverbs_obj_fd_type, type);
++ 	int fd = uobj->id;
++ 	struct file *filp;
++ 
++ 	/*
++ 	 * The kref for uobj is moved into filp->private data and put in
++ 	 * uverbs_close_fd(). Once alloc_commit() succeeds uverbs_close_fd()
++ 	 * must be guaranteed to be called from the provided fops release
++ 	 * callback.
++ 	 */
++ 	filp = anon_inode_getfile(fd_type->name,
++ 				  fd_type->fops,
++ 				  uobj,
++ 				  fd_type->flags);
++ 	if (IS_ERR(filp))
++ 		return PTR_ERR(filp);
++ 
++ 	uobj->object = filp;
++ 
++ 	/* Matching put will be done in uverbs_close_fd() */
++ 	kref_get(&uobj->ufile->ref);
+++>>>>>>> aba94548c9e4 (IB/uverbs: Move the FD uobj type struct file allocation to alloc_commit)
+  
+ +	fd_install(uobj_file->uobj.id, uobj->object);
+  	/* This shouldn't be used anymore. Use the file object instead */
+++<<<<<<< HEAD
+ +	uobj_file->uobj.id = 0;
+ +	/* Get another reference as we export this to the fops */
+ +	uverbs_uobject_get(&uobj_file->uobj);
+++=======
++ 	uobj->id = 0;
++ 
++ 	/*
++ 	 * NOTE: Once we install the file we loose ownership of our kref on
++ 	 * uobj. It will be put by uverbs_close_fd()
++ 	 */
++ 	fd_install(fd, filp);
++ 
++ 	return 0;
+++>>>>>>> aba94548c9e4 (IB/uverbs: Move the FD uobj type struct file allocation to alloc_commit)
+  }
+  
+ -/*
+ - * In all cases rdma_alloc_commit_uobject() consumes the kref to uobj and the
+ - * caller can no longer assume uobj is valid. If this function fails it
+ - * destroys the uboject, including the attached HW object.
+ - */
+ -int __must_check rdma_alloc_commit_uobject(struct ib_uobject *uobj)
+ +int rdma_alloc_commit_uobject(struct ib_uobject *uobj)
+  {
+++<<<<<<< HEAD
+ +	/* Cleanup is running. Calling this should have been impossible */
+ +	if (!down_read_trylock(&uobj->context->cleanup_rwsem)) {
+ +		int ret;
+ +
+++=======
++ 	struct ib_uverbs_file *ufile = uobj->ufile;
++ 	int ret;
++ 
++ 	/* Cleanup is running. Calling this should have been impossible */
++ 	if (!down_read_trylock(&ufile->hw_destroy_rwsem)) {
+++>>>>>>> aba94548c9e4 (IB/uverbs: Move the FD uobj type struct file allocation to alloc_commit)
+  		WARN(true, "ib_uverbs: Cleanup is running while allocating an uobject\n");
+  		ret = uobj->type->type_class->remove_commit(uobj,
+  							    RDMA_REMOVE_DURING_CLEANUP);
+@@@ -546,16 -551,29 +607,32 @@@
+  		return ret;
+  	}
+  
+- 	/* matches atomic_set(-1) in alloc_uobj */
+  	assert_uverbs_usecnt(uobj, true);
+- 	atomic_set(&uobj->usecnt, 0);
++ 
++ 	/* alloc_commit consumes the uobj kref */
++ 	ret = uobj->type->type_class->alloc_commit(uobj);
++ 	if (ret) {
++ 		if (uobj->type->type_class->remove_commit(
++ 			    uobj, RDMA_REMOVE_DURING_CLEANUP))
++ 			pr_warn("ib_uverbs: cleanup of idr object %d failed\n",
++ 				uobj->id);
++ 		up_read(&ufile->hw_destroy_rwsem);
++ 		return ret;
++ 	}
+  
+ -	/* kref is held so long as the uobj is on the uobj list. */
+ -	uverbs_uobject_get(uobj);
+ -	spin_lock_irq(&ufile->uobjects_lock);
+ -	list_add(&uobj->list, &ufile->uobjects);
+ -	spin_unlock_irq(&ufile->uobjects_lock);
+ +	mutex_lock(&uobj->context->uobjects_lock);
+ +	list_add(&uobj->list, &uobj->context->uobjects);
+ +	mutex_unlock(&uobj->context->uobjects_lock);
+  
+++<<<<<<< HEAD
+ +	uobj->type->type_class->alloc_commit(uobj);
+ +	up_read(&uobj->context->cleanup_rwsem);
+++=======
++ 	/* matches atomic_set(-1) in alloc_uobj */
++ 	atomic_set(&uobj->usecnt, 0);
++ 
++ 	up_read(&ufile->hw_destroy_rwsem);
+++>>>>>>> aba94548c9e4 (IB/uverbs: Move the FD uobj type struct file allocation to alloc_commit)
+  
+  	return 0;
+  }
+diff --cc include/rdma/uverbs_types.h
+index cc04ec65588d,cfc50fcdbff6..000000000000
+--- a/include/rdma/uverbs_types.h
++++ b/include/rdma/uverbs_types.h
+@@@ -72,8 -72,8 +72,13 @@@ struct uverbs_obj_type_class 
+  	 *		 reset flow).
+  	 */
+  	struct ib_uobject *(*alloc_begin)(const struct uverbs_obj_type *type,
+++<<<<<<< HEAD
+ +					  struct ib_ucontext *ucontext);
+ +	void (*alloc_commit)(struct ib_uobject *uobj);
+++=======
++ 					  struct ib_uverbs_file *ufile);
++ 	int (*alloc_commit)(struct ib_uobject *uobj);
+++>>>>>>> aba94548c9e4 (IB/uverbs: Move the FD uobj type struct file allocation to alloc_commit)
+  	void (*alloc_abort)(struct ib_uobject *uobj);
+  
+  	struct ib_uobject *(*lookup_get)(const struct uverbs_obj_type *type,
+* Unmerged path drivers/infiniband/core/rdma_core.c
+* Unmerged path include/rdma/uverbs_types.h
