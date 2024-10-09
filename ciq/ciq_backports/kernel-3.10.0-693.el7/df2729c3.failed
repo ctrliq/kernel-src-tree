@@ -1,0 +1,207 @@
+sctp: check for dst and pathmtu update in sctp_packet_config
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Xin Long <lucien.xin@gmail.com>
+commit df2729c3238ed89fb8ccf850d38c732858a5bade
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/df2729c3.failed
+
+This patch is to move sctp_transport_dst_check into sctp_packet_config
+from sctp_packet_transmit and add pathmtu check in sctp_packet_config.
+
+With this fix, sctp can update dst or pathmtu before appending chunks,
+which can void dropping packets in sctp_packet_transmit when dst is
+obsolete or dst's mtu is changed.
+
+This patch is also to improve some other codes in sctp_packet_config.
+It updates packet max_size with gso_max_size, checks for dst and
+pathmtu, and appends ecne chunk only when packet is empty and asoc
+is not NULL.
+
+It makes sctp flush work better, as we only need to set up them once
+for one flush schedule. It's also safe, since asoc is NULL only when
+the packet is created by sctp_ootb_pkt_new in which it just gets the
+new dst, no need to do more things for it other than set packet with
+transport's pathmtu.
+
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Acked-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Acked-by: Neil Horman <nhorman@tuxdriver.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit df2729c3238ed89fb8ccf850d38c732858a5bade)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sctp/sctp.h
+#	net/sctp/output.c
+diff --cc include/net/sctp/sctp.h
+index 5e1b0dc26470,d75caa7a629b..000000000000
+--- a/include/net/sctp/sctp.h
++++ b/include/net/sctp/sctp.h
+@@@ -593,10 -596,8 +593,15 @@@ static inline void sctp_v4_map_v6(unio
+   */
+  static inline struct dst_entry *sctp_transport_dst_check(struct sctp_transport *t)
+  {
+++<<<<<<< HEAD
+ +	if (t->dst && !dst_check(t->dst, t->dst_cookie)) {
+ +		dst_release(t->dst);
+ +		t->dst = NULL;
+ +	}
+++=======
++ 	if (t->dst && !dst_check(t->dst, t->dst_cookie))
++ 		sctp_transport_dst_release(t);
+++>>>>>>> df2729c3238e (sctp: check for dst and pathmtu update in sctp_packet_config)
+  
+  	return t->dst;
+  }
+diff --cc net/sctp/output.c
+index 02b6a1b39273,ec4d50a38713..000000000000
+--- a/net/sctp/output.c
++++ b/net/sctp/output.c
+@@@ -728,27 -523,122 +738,134 @@@ int sctp_packet_transmit(struct sctp_pa
+  			sk_setup_caps(sk, tp->dst);
+  		}
+  		rcu_read_unlock();
+++<<<<<<< HEAD
+++=======
++ 		goto chksum;
++ 	}
++ 
++ 	if (sctp_checksum_disable)
++ 		return 1;
++ 
++ 	if (!(skb_dst(head)->dev->features & NETIF_F_SCTP_CRC) ||
++ 	    dst_xfrm(skb_dst(head)) || packet->ipfragok) {
++ 		struct sctphdr *sh =
++ 			(struct sctphdr *)skb_transport_header(head);
++ 
++ 		sh->checksum = sctp_compute_cksum(head, 0);
++ 	} else {
++ chksum:
++ 		head->ip_summed = CHECKSUM_PARTIAL;
++ 		head->csum_start = skb_transport_header(head) - head->head;
++ 		head->csum_offset = offsetof(struct sctphdr, checksum);
++ 	}
++ 
++ 	return pkt_count;
++ }
++ 
++ /* All packets are sent to the network through this function from
++  * sctp_outq_tail().
++  *
++  * The return value is always 0 for now.
++  */
++ int sctp_packet_transmit(struct sctp_packet *packet, gfp_t gfp)
++ {
++ 	struct sctp_transport *tp = packet->transport;
++ 	struct sctp_association *asoc = tp->asoc;
++ 	struct sctp_chunk *chunk, *tmp;
++ 	int pkt_count, gso = 0;
++ 	struct dst_entry *dst;
++ 	struct sk_buff *head;
++ 	struct sctphdr *sh;
++ 	struct sock *sk;
++ 
++ 	pr_debug("%s: packet:%p\n", __func__, packet);
++ 	if (list_empty(&packet->chunk_list))
++ 		return 0;
++ 	chunk = list_entry(packet->chunk_list.next, struct sctp_chunk, list);
++ 	sk = chunk->skb->sk;
++ 
++ 	/* check gso */
++ 	if (packet->size > tp->pathmtu && !packet->ipfragok) {
++ 		if (!sk_can_gso(sk)) {
++ 			pr_err_once("Trying to GSO but underlying device doesn't support it.");
++ 			goto out;
++ 		}
++ 		gso = 1;
++ 	}
++ 
++ 	/* alloc head skb */
++ 	head = alloc_skb((gso ? packet->overhead : packet->size) +
++ 			 MAX_HEADER, gfp);
++ 	if (!head)
++ 		goto out;
++ 	skb_reserve(head, packet->overhead + MAX_HEADER);
++ 	sctp_packet_set_owner_w(head, sk);
++ 
++ 	/* set sctp header */
++ 	sh = (struct sctphdr *)skb_push(head, sizeof(struct sctphdr));
++ 	skb_reset_transport_header(head);
++ 	sh->source = htons(packet->source_port);
++ 	sh->dest = htons(packet->destination_port);
++ 	sh->vtag = htonl(packet->vtag);
++ 	sh->checksum = 0;
++ 
++ 	/* drop packet if no dst */
++ 	dst = dst_clone(tp->dst);
++ 	if (!dst) {
++ 		IP_INC_STATS(sock_net(sk), IPSTATS_MIB_OUTNOROUTES);
++ 		kfree_skb(head);
++ 		goto out;
++ 	}
++ 	skb_dst_set(head, dst);
++ 
++ 	/* pack up chunks */
++ 	pkt_count = sctp_packet_pack(packet, head, gso, gfp);
++ 	if (!pkt_count) {
++ 		kfree_skb(head);
++ 		goto out;
++ 	}
++ 	pr_debug("***sctp_transmit_packet*** skb->len:%d\n", head->len);
++ 
++ 	/* start autoclose timer */
++ 	if (packet->has_data && sctp_state(asoc, ESTABLISHED) &&
++ 	    asoc->timeouts[SCTP_EVENT_TIMEOUT_AUTOCLOSE]) {
++ 		struct timer_list *timer =
++ 			&asoc->timers[SCTP_EVENT_TIMEOUT_AUTOCLOSE];
++ 		unsigned long timeout =
++ 			asoc->timeouts[SCTP_EVENT_TIMEOUT_AUTOCLOSE];
++ 
++ 		if (!mod_timer(timer, jiffies + timeout))
++ 			sctp_association_hold(asoc);
++ 	}
++ 
++ 	/* sctp xmit */
++ 	tp->af_specific->ecn_capable(sk);
++ 	if (asoc) {
++ 		asoc->stats.opackets += pkt_count;
++ 		if (asoc->peer.last_sent_to != tp)
++ 			asoc->peer.last_sent_to = tp;
+++>>>>>>> df2729c3238e (sctp: check for dst and pathmtu update in sctp_packet_config)
+  	}
+  	head->ignore_df = packet->ipfragok;
+ -	if (tp->dst_pending_confirm)
+ -		skb_set_dst_pending_confirm(head, 1);
+ -	/* neighbour should be confirmed on successful transmission or
+ -	 * positive error
+ +	tp->af_specific->sctp_xmit(head, tp);
+ +	goto out;
+ +
+ +nomem:
+ +	if (packet->auth && list_empty(&packet->auth->list))
+ +		sctp_chunk_free(packet->auth);
+ +
+ +nodst:
+ +	/* FIXME: Returning the 'err' will effect all the associations
+ +	 * associated with a socket, although only one of the paths of the
+ +	 * association is unreachable.
+ +	 * The real failure of a transport or association can be passed on
+ +	 * to the user via notifications. So setting this error may not be
+ +	 * required.
+  	 */
+ -	if (tp->af_specific->sctp_xmit(head, tp) >= 0 &&
+ -	    tp->dst_pending_confirm)
+ -		tp->dst_pending_confirm = 0;
+ +	 /* err = -EHOSTUNREACH; */
+ +	kfree_skb(head);
+  
+ -out:
+ +err:
+  	list_for_each_entry_safe(chunk, tmp, &packet->chunk_list, list) {
+  		list_del_init(&chunk->list);
+  		if (!sctp_chunk_is_data(chunk))
+* Unmerged path include/net/sctp/sctp.h
+* Unmerged path net/sctp/output.c
