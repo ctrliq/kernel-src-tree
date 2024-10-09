@@ -1,0 +1,132 @@
+scsi: tcmu: unmap if dev is configured
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mike Christie <mchristi@redhat.com>
+commit dc335a995527fb1ee9ec5649162b22cd1ce728ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/dc335a99.failed
+
+The tcmu dev is added to the list of tcmu devices during configuration.  At
+this time the tcmu setup has completed, but lio core has not completed its
+setup. The device is not yet usable so do not try to unmap blocks from it
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Reviewed-by: Xiubo Li <xiubli@redhat.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit dc335a995527fb1ee9ec5649162b22cd1ce728ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 5534ef1b341c,31cfe8345ef3..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -1653,9 -2565,100 +1653,103 @@@ static struct target_backend_ops tcmu_o
+  	.show_configfs_dev_params = tcmu_show_configfs_dev_params,
+  	.get_device_type	= sbc_get_device_type,
+  	.get_blocks		= tcmu_get_blocks,
+ -	.tb_dev_action_attrs	= tcmu_action_attrs,
+ +	.tb_dev_attrib_attrs	= NULL,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static void find_free_blocks(void)
++ {
++ 	struct tcmu_dev *udev;
++ 	loff_t off;
++ 	u32 start, end, block, total_freed = 0;
++ 
++ 	if (atomic_read(&global_db_count) <= tcmu_global_max_blocks)
++ 		return;
++ 
++ 	mutex_lock(&root_udev_mutex);
++ 	list_for_each_entry(udev, &root_udev, node) {
++ 		mutex_lock(&udev->cmdr_lock);
++ 
++ 		if (!target_dev_configured(&udev->se_dev)) {
++ 			mutex_unlock(&udev->cmdr_lock);
++ 			continue;
++ 		}
++ 
++ 		/* Try to complete the finished commands first */
++ 		tcmu_handle_completions(udev);
++ 
++ 		/* Skip the udevs in idle */
++ 		if (!udev->dbi_thresh) {
++ 			mutex_unlock(&udev->cmdr_lock);
++ 			continue;
++ 		}
++ 
++ 		end = udev->dbi_max + 1;
++ 		block = find_last_bit(udev->data_bitmap, end);
++ 		if (block == udev->dbi_max) {
++ 			/*
++ 			 * The last bit is dbi_max, so it is not possible
++ 			 * reclaim any blocks.
++ 			 */
++ 			mutex_unlock(&udev->cmdr_lock);
++ 			continue;
++ 		} else if (block == end) {
++ 			/* The current udev will goto idle state */
++ 			udev->dbi_thresh = start = 0;
++ 			udev->dbi_max = 0;
++ 		} else {
++ 			udev->dbi_thresh = start = block + 1;
++ 			udev->dbi_max = block;
++ 		}
++ 
++ 		/* Here will truncate the data area from off */
++ 		off = udev->data_off + start * DATA_BLOCK_SIZE;
++ 		unmap_mapping_range(udev->inode->i_mapping, off, 0, 1);
++ 
++ 		/* Release the block pages */
++ 		tcmu_blocks_release(&udev->data_blocks, start, end);
++ 		mutex_unlock(&udev->cmdr_lock);
++ 
++ 		total_freed += end - start;
++ 		pr_debug("Freed %u blocks (total %u) from %s.\n", end - start,
++ 			 total_freed, udev->name);
++ 	}
++ 	mutex_unlock(&root_udev_mutex);
++ 
++ 	if (atomic_read(&global_db_count) > tcmu_global_max_blocks)
++ 		schedule_delayed_work(&tcmu_unmap_work, msecs_to_jiffies(5000));
++ }
++ 
++ static void check_timedout_devices(void)
++ {
++ 	struct tcmu_dev *udev, *tmp_dev;
++ 	LIST_HEAD(devs);
++ 
++ 	spin_lock_bh(&timed_out_udevs_lock);
++ 	list_splice_init(&timed_out_udevs, &devs);
++ 
++ 	list_for_each_entry_safe(udev, tmp_dev, &devs, timedout_entry) {
++ 		list_del_init(&udev->timedout_entry);
++ 		spin_unlock_bh(&timed_out_udevs_lock);
++ 
++ 		mutex_lock(&udev->cmdr_lock);
++ 		idr_for_each(&udev->commands, tcmu_check_expired_cmd, NULL);
++ 		mutex_unlock(&udev->cmdr_lock);
++ 
++ 		spin_lock_bh(&timed_out_udevs_lock);
++ 	}
++ 
++ 	spin_unlock_bh(&timed_out_udevs_lock);
++ }
++ 
++ static void tcmu_unmap_work_fn(struct work_struct *work)
++ {
++ 	check_timedout_devices();
++ 	find_free_blocks();
++ }
++ 
+++>>>>>>> dc335a995527 (scsi: tcmu: unmap if dev is configured)
+  static int __init tcmu_module_init(void)
+  {
+  	int ret, i, k, len = 0;
+* Unmerged path drivers/target/target_core_user.c
