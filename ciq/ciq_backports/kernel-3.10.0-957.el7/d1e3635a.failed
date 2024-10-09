@@ -1,0 +1,125 @@
+scsi: qla2xxx: Add boundary checks for exchanges to be offloaded
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Add boundary checks for exchanges to be offloaded (Himanshu Madhani) [1547714]
+Rebuild_FUZZ: 95.08%
+commit-author Quinn Tran <quinn.tran@cavium.com>
+commit d1e3635a5ef2523e517068d0acb25533e739bf10
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/d1e3635a.failed
+
+Max boundary for exchange off load is 32k exchanges. If a system
+is unable to allocate large memory buffer to support this feature,
+then driver will reduce the number of exchanges down to a value
+system can support.
+
+	Signed-off-by: Quinn Tran <quinn.tran@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit d1e3635a5ef2523e517068d0acb25533e739bf10)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_def.h
+diff --cc drivers/scsi/qla2xxx/qla_def.h
+index 65a064ba1a4b,043dd51a2760..000000000000
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@@ -3434,7 -3508,8 +3436,12 @@@ struct qla_hw_data 
+  		uint32_t	using_lr_setting:1;
+  	} flags;
+  
+++<<<<<<< HEAD
+ +	u8 long_range_distance;	/* 32G & above */
+++=======
++ 	uint16_t max_exchg;
++ 	uint16_t long_range_distance;	/* 32G & above */
+++>>>>>>> d1e3635a5ef2 (scsi: qla2xxx: Add boundary checks for exchanges to be offloaded)
+  #define LR_DISTANCE_5K  1
+  #define LR_DISTANCE_10K 0
+  
+* Unmerged path drivers/scsi/qla2xxx/qla_def.h
+diff --git a/drivers/scsi/qla2xxx/qla_os.c b/drivers/scsi/qla2xxx/qla_os.c
+index 75f3e94a56ff..d249edc7ee8f 100644
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@ -2832,6 +2832,7 @@ qla2x00_probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	ha->init_cb_size = sizeof(init_cb_t);
+ 	ha->link_data_rate = PORT_SPEED_UNKNOWN;
+ 	ha->optrom_size = OPTROM_SIZE_2300;
++	ha->max_exchg = FW_MAX_EXCHANGES_CNT;
+ 
+ 	/* Assign ISP specific operations. */
+ 	if (IS_QLA2100(ha)) {
+@@ -4263,6 +4264,9 @@ qla2x00_number_of_exch(scsi_qla_host_t *vha, u32 *ret_cnt, u16 max_cnt)
+ 	u32 temp;
+ 	*ret_cnt = FW_DEF_EXCHANGES_CNT;
+ 
++	if (max_cnt > vha->hw->max_exchg)
++		max_cnt = vha->hw->max_exchg;
++
+ 	if (qla_ini_mode_enabled(vha)) {
+ 		if (ql2xiniexchg > max_cnt)
+ 			ql2xiniexchg = max_cnt;
+@@ -4292,8 +4296,8 @@ int
+ qla2x00_set_exchoffld_buffer(scsi_qla_host_t *vha)
+ {
+ 	int rval;
+-	u16 size, max_cnt;
+-	u32 temp;
++	u16	size, max_cnt;
++	u32 actual_cnt, totsz;
+ 	struct qla_hw_data *ha = vha->hw;
+ 
+ 	if (!ha->flags.exchoffld_enabled)
+@@ -4310,16 +4314,19 @@ qla2x00_set_exchoffld_buffer(scsi_qla_host_t *vha)
+ 		return rval;
+ 	}
+ 
+-	qla2x00_number_of_exch(vha, &temp, max_cnt);
+-	temp *= size;
++	qla2x00_number_of_exch(vha, &actual_cnt, max_cnt);
++	ql_log(ql_log_info, vha, 0xd014,
++	    "Actual exchange offload count: %d.\n", actual_cnt);
++
++	totsz = actual_cnt * size;
+ 
+-	if (temp != ha->exchoffld_size) {
++	if (totsz != ha->exchoffld_size) {
+ 		qla2x00_free_exchoffld_buffer(ha);
+-		ha->exchoffld_size = temp;
++		ha->exchoffld_size = totsz;
+ 
+ 		ql_log(ql_log_info, vha, 0xd016,
+-		    "Exchange offload: max_count=%d, buffers=0x%x, total=%d.\n",
+-		    max_cnt, size, temp);
++		    "Exchange offload: max_count=%d, actual count=%d entry sz=0x%x, total sz=0x%x\n",
++		    max_cnt, actual_cnt, size, totsz);
+ 
+ 		ql_log(ql_log_info, vha, 0xd017,
+ 		    "Exchange Buffers requested size = 0x%x\n",
+@@ -4330,7 +4337,21 @@ qla2x00_set_exchoffld_buffer(scsi_qla_host_t *vha)
+ 			ha->exchoffld_size, &ha->exchoffld_buf_dma, GFP_KERNEL);
+ 		if (!ha->exchoffld_buf) {
+ 			ql_log_pci(ql_log_fatal, ha->pdev, 0xd013,
+-			"Failed to allocate memory for exchoffld_buf_dma.\n");
++			"Failed to allocate memory for Exchange Offload.\n");
++
++			if (ha->max_exchg >
++			    (FW_DEF_EXCHANGES_CNT + REDUCE_EXCHANGES_CNT)) {
++				ha->max_exchg -= REDUCE_EXCHANGES_CNT;
++			} else if (ha->max_exchg >
++			    (FW_DEF_EXCHANGES_CNT + 512)) {
++				ha->max_exchg -= 512;
++			} else {
++				ha->flags.exchoffld_enabled = 0;
++				ql_log_pci(ql_log_fatal, ha->pdev, 0xd013,
++				    "Disabling Exchange offload due to lack of memory\n");
++			}
++			ha->exchoffld_size = 0;
++
+ 			return -ENOMEM;
+ 		}
+ 	}
