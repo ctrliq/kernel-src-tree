@@ -1,0 +1,464 @@
+ext4: prevent data corruption with journaling + DAX
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ross Zwisler <ross.zwisler@linux.intel.com>
+commit e9072d859df3e0f2c3ba450f0d1739595c2d5d13
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/e9072d85.failed
+
+The current code has the potential for data corruption when changing an
+inode's journaling mode, as that can result in a subsequent unsafe change
+in S_DAX.
+
+I've captured an instance of this data corruption in the following fstest:
+
+https://patchwork.kernel.org/patch/9948377/
+
+Prevent this data corruption from happening by disallowing changes to the
+journaling mode if the '-o dax' mount option was used.  This means that for
+a given filesystem we could have a mix of inodes using either DAX or
+data journaling, but whatever state the inodes are in will be held for the
+duration of the mount.
+
+	Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Cc: stable@vger.kernel.org
+(cherry picked from commit e9072d859df3e0f2c3ba450f0d1739595c2d5d13)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/ioctl.c
+diff --cc fs/ext4/ioctl.c
+index cb6fb2f0796f,b0b754b37c36..000000000000
+--- a/fs/ext4/ioctl.c
++++ b/fs/ext4/ioctl.c
+@@@ -199,6 -193,406 +199,409 @@@ journal_err_out
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_EXT4_FS_ENCRYPTION
++ static int uuid_is_zero(__u8 u[16])
++ {
++ 	int	i;
++ 
++ 	for (i = 0; i < 16; i++)
++ 		if (u[i])
++ 			return 0;
++ 	return 1;
++ }
++ #endif
++ 
++ static int ext4_ioctl_setflags(struct inode *inode,
++ 			       unsigned int flags)
++ {
++ 	struct ext4_inode_info *ei = EXT4_I(inode);
++ 	handle_t *handle = NULL;
++ 	int err = -EPERM, migrate = 0;
++ 	struct ext4_iloc iloc;
++ 	unsigned int oldflags, mask, i;
++ 	unsigned int jflag;
++ 
++ 	/* Is it quota file? Do not allow user to mess with it */
++ 	if (ext4_is_quota_file(inode))
++ 		goto flags_out;
++ 
++ 	oldflags = ei->i_flags;
++ 
++ 	/* The JOURNAL_DATA flag is modifiable only by root */
++ 	jflag = flags & EXT4_JOURNAL_DATA_FL;
++ 
++ 	/*
++ 	 * The IMMUTABLE and APPEND_ONLY flags can only be changed by
++ 	 * the relevant capability.
++ 	 *
++ 	 * This test looks nicer. Thanks to Pauline Middelink
++ 	 */
++ 	if ((flags ^ oldflags) & (EXT4_APPEND_FL | EXT4_IMMUTABLE_FL)) {
++ 		if (!capable(CAP_LINUX_IMMUTABLE))
++ 			goto flags_out;
++ 	}
++ 
++ 	/*
++ 	 * The JOURNAL_DATA flag can only be changed by
++ 	 * the relevant capability.
++ 	 */
++ 	if ((jflag ^ oldflags) & (EXT4_JOURNAL_DATA_FL)) {
++ 		if (!capable(CAP_SYS_RESOURCE))
++ 			goto flags_out;
++ 	}
++ 	if ((flags ^ oldflags) & EXT4_EXTENTS_FL)
++ 		migrate = 1;
++ 
++ 	if (flags & EXT4_EOFBLOCKS_FL) {
++ 		/* we don't support adding EOFBLOCKS flag */
++ 		if (!(oldflags & EXT4_EOFBLOCKS_FL)) {
++ 			err = -EOPNOTSUPP;
++ 			goto flags_out;
++ 		}
++ 	} else if (oldflags & EXT4_EOFBLOCKS_FL) {
++ 		err = ext4_truncate(inode);
++ 		if (err)
++ 			goto flags_out;
++ 	}
++ 
++ 	handle = ext4_journal_start(inode, EXT4_HT_INODE, 1);
++ 	if (IS_ERR(handle)) {
++ 		err = PTR_ERR(handle);
++ 		goto flags_out;
++ 	}
++ 	if (IS_SYNC(inode))
++ 		ext4_handle_sync(handle);
++ 	err = ext4_reserve_inode_write(handle, inode, &iloc);
++ 	if (err)
++ 		goto flags_err;
++ 
++ 	for (i = 0, mask = 1; i < 32; i++, mask <<= 1) {
++ 		if (!(mask & EXT4_FL_USER_MODIFIABLE))
++ 			continue;
++ 		/* These flags get special treatment later */
++ 		if (mask == EXT4_JOURNAL_DATA_FL || mask == EXT4_EXTENTS_FL)
++ 			continue;
++ 		if (mask & flags)
++ 			ext4_set_inode_flag(inode, i);
++ 		else
++ 			ext4_clear_inode_flag(inode, i);
++ 	}
++ 
++ 	ext4_set_inode_flags(inode);
++ 	inode->i_ctime = current_time(inode);
++ 
++ 	err = ext4_mark_iloc_dirty(handle, inode, &iloc);
++ flags_err:
++ 	ext4_journal_stop(handle);
++ 	if (err)
++ 		goto flags_out;
++ 
++ 	if ((jflag ^ oldflags) & (EXT4_JOURNAL_DATA_FL)) {
++ 		/*
++ 		 * Changes to the journaling mode can cause unsafe changes to
++ 		 * S_DAX if we are using the DAX mount option.
++ 		 */
++ 		if (test_opt(inode->i_sb, DAX)) {
++ 			err = -EBUSY;
++ 			goto flags_out;
++ 		}
++ 
++ 		err = ext4_change_inode_journal_flag(inode, jflag);
++ 		if (err)
++ 			goto flags_out;
++ 	}
++ 	if (migrate) {
++ 		if (flags & EXT4_EXTENTS_FL)
++ 			err = ext4_ext_migrate(inode);
++ 		else
++ 			err = ext4_ind_migrate(inode);
++ 	}
++ 
++ flags_out:
++ 	return err;
++ }
++ 
++ #ifdef CONFIG_QUOTA
++ static int ext4_ioctl_setproject(struct file *filp, __u32 projid)
++ {
++ 	struct inode *inode = file_inode(filp);
++ 	struct super_block *sb = inode->i_sb;
++ 	struct ext4_inode_info *ei = EXT4_I(inode);
++ 	int err, rc;
++ 	handle_t *handle;
++ 	kprojid_t kprojid;
++ 	struct ext4_iloc iloc;
++ 	struct ext4_inode *raw_inode;
++ 	struct dquot *transfer_to[MAXQUOTAS] = { };
++ 
++ 	if (!ext4_has_feature_project(sb)) {
++ 		if (projid != EXT4_DEF_PROJID)
++ 			return -EOPNOTSUPP;
++ 		else
++ 			return 0;
++ 	}
++ 
++ 	if (EXT4_INODE_SIZE(sb) <= EXT4_GOOD_OLD_INODE_SIZE)
++ 		return -EOPNOTSUPP;
++ 
++ 	kprojid = make_kprojid(&init_user_ns, (projid_t)projid);
++ 
++ 	if (projid_eq(kprojid, EXT4_I(inode)->i_projid))
++ 		return 0;
++ 
++ 	err = mnt_want_write_file(filp);
++ 	if (err)
++ 		return err;
++ 
++ 	err = -EPERM;
++ 	inode_lock(inode);
++ 	/* Is it quota file? Do not allow user to mess with it */
++ 	if (ext4_is_quota_file(inode))
++ 		goto out_unlock;
++ 
++ 	err = ext4_get_inode_loc(inode, &iloc);
++ 	if (err)
++ 		goto out_unlock;
++ 
++ 	raw_inode = ext4_raw_inode(&iloc);
++ 	if (!EXT4_FITS_IN_INODE(raw_inode, ei, i_projid)) {
++ 		err = ext4_expand_extra_isize(inode,
++ 					      EXT4_SB(sb)->s_want_extra_isize,
++ 					      &iloc);
++ 		if (err)
++ 			goto out_unlock;
++ 	} else {
++ 		brelse(iloc.bh);
++ 	}
++ 
++ 	dquot_initialize(inode);
++ 
++ 	handle = ext4_journal_start(inode, EXT4_HT_QUOTA,
++ 		EXT4_QUOTA_INIT_BLOCKS(sb) +
++ 		EXT4_QUOTA_DEL_BLOCKS(sb) + 3);
++ 	if (IS_ERR(handle)) {
++ 		err = PTR_ERR(handle);
++ 		goto out_unlock;
++ 	}
++ 
++ 	err = ext4_reserve_inode_write(handle, inode, &iloc);
++ 	if (err)
++ 		goto out_stop;
++ 
++ 	transfer_to[PRJQUOTA] = dqget(sb, make_kqid_projid(kprojid));
++ 	if (!IS_ERR(transfer_to[PRJQUOTA])) {
++ 
++ 		/* __dquot_transfer() calls back ext4_get_inode_usage() which
++ 		 * counts xattr inode references.
++ 		 */
++ 		down_read(&EXT4_I(inode)->xattr_sem);
++ 		err = __dquot_transfer(inode, transfer_to);
++ 		up_read(&EXT4_I(inode)->xattr_sem);
++ 		dqput(transfer_to[PRJQUOTA]);
++ 		if (err)
++ 			goto out_dirty;
++ 	}
++ 
++ 	EXT4_I(inode)->i_projid = kprojid;
++ 	inode->i_ctime = current_time(inode);
++ out_dirty:
++ 	rc = ext4_mark_iloc_dirty(handle, inode, &iloc);
++ 	if (!err)
++ 		err = rc;
++ out_stop:
++ 	ext4_journal_stop(handle);
++ out_unlock:
++ 	inode_unlock(inode);
++ 	mnt_drop_write_file(filp);
++ 	return err;
++ }
++ #else
++ static int ext4_ioctl_setproject(struct file *filp, __u32 projid)
++ {
++ 	if (projid != EXT4_DEF_PROJID)
++ 		return -EOPNOTSUPP;
++ 	return 0;
++ }
++ #endif
++ 
++ /* Transfer internal flags to xflags */
++ static inline __u32 ext4_iflags_to_xflags(unsigned long iflags)
++ {
++ 	__u32 xflags = 0;
++ 
++ 	if (iflags & EXT4_SYNC_FL)
++ 		xflags |= FS_XFLAG_SYNC;
++ 	if (iflags & EXT4_IMMUTABLE_FL)
++ 		xflags |= FS_XFLAG_IMMUTABLE;
++ 	if (iflags & EXT4_APPEND_FL)
++ 		xflags |= FS_XFLAG_APPEND;
++ 	if (iflags & EXT4_NODUMP_FL)
++ 		xflags |= FS_XFLAG_NODUMP;
++ 	if (iflags & EXT4_NOATIME_FL)
++ 		xflags |= FS_XFLAG_NOATIME;
++ 	if (iflags & EXT4_PROJINHERIT_FL)
++ 		xflags |= FS_XFLAG_PROJINHERIT;
++ 	return xflags;
++ }
++ 
++ #define EXT4_SUPPORTED_FS_XFLAGS (FS_XFLAG_SYNC | FS_XFLAG_IMMUTABLE | \
++ 				  FS_XFLAG_APPEND | FS_XFLAG_NODUMP | \
++ 				  FS_XFLAG_NOATIME | FS_XFLAG_PROJINHERIT)
++ 
++ /* Transfer xflags flags to internal */
++ static inline unsigned long ext4_xflags_to_iflags(__u32 xflags)
++ {
++ 	unsigned long iflags = 0;
++ 
++ 	if (xflags & FS_XFLAG_SYNC)
++ 		iflags |= EXT4_SYNC_FL;
++ 	if (xflags & FS_XFLAG_IMMUTABLE)
++ 		iflags |= EXT4_IMMUTABLE_FL;
++ 	if (xflags & FS_XFLAG_APPEND)
++ 		iflags |= EXT4_APPEND_FL;
++ 	if (xflags & FS_XFLAG_NODUMP)
++ 		iflags |= EXT4_NODUMP_FL;
++ 	if (xflags & FS_XFLAG_NOATIME)
++ 		iflags |= EXT4_NOATIME_FL;
++ 	if (xflags & FS_XFLAG_PROJINHERIT)
++ 		iflags |= EXT4_PROJINHERIT_FL;
++ 
++ 	return iflags;
++ }
++ 
++ static int ext4_shutdown(struct super_block *sb, unsigned long arg)
++ {
++ 	struct ext4_sb_info *sbi = EXT4_SB(sb);
++ 	__u32 flags;
++ 
++ 	if (!capable(CAP_SYS_ADMIN))
++ 		return -EPERM;
++ 
++ 	if (get_user(flags, (__u32 __user *)arg))
++ 		return -EFAULT;
++ 
++ 	if (flags > EXT4_GOING_FLAGS_NOLOGFLUSH)
++ 		return -EINVAL;
++ 
++ 	if (ext4_forced_shutdown(sbi))
++ 		return 0;
++ 
++ 	ext4_msg(sb, KERN_ALERT, "shut down requested (%d)", flags);
++ 
++ 	switch (flags) {
++ 	case EXT4_GOING_FLAGS_DEFAULT:
++ 		freeze_bdev(sb->s_bdev);
++ 		set_bit(EXT4_FLAGS_SHUTDOWN, &sbi->s_ext4_flags);
++ 		thaw_bdev(sb->s_bdev, sb);
++ 		break;
++ 	case EXT4_GOING_FLAGS_LOGFLUSH:
++ 		set_bit(EXT4_FLAGS_SHUTDOWN, &sbi->s_ext4_flags);
++ 		if (sbi->s_journal && !is_journal_aborted(sbi->s_journal)) {
++ 			(void) ext4_force_commit(sb);
++ 			jbd2_journal_abort(sbi->s_journal, 0);
++ 		}
++ 		break;
++ 	case EXT4_GOING_FLAGS_NOLOGFLUSH:
++ 		set_bit(EXT4_FLAGS_SHUTDOWN, &sbi->s_ext4_flags);
++ 		if (sbi->s_journal && !is_journal_aborted(sbi->s_journal)) {
++ 			msleep(100);
++ 			jbd2_journal_abort(sbi->s_journal, 0);
++ 		}
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 	clear_opt(sb, DISCARD);
++ 	return 0;
++ }
++ 
++ struct getfsmap_info {
++ 	struct super_block	*gi_sb;
++ 	struct fsmap_head __user *gi_data;
++ 	unsigned int		gi_idx;
++ 	__u32			gi_last_flags;
++ };
++ 
++ static int ext4_getfsmap_format(struct ext4_fsmap *xfm, void *priv)
++ {
++ 	struct getfsmap_info *info = priv;
++ 	struct fsmap fm;
++ 
++ 	trace_ext4_getfsmap_mapping(info->gi_sb, xfm);
++ 
++ 	info->gi_last_flags = xfm->fmr_flags;
++ 	ext4_fsmap_from_internal(info->gi_sb, &fm, xfm);
++ 	if (copy_to_user(&info->gi_data->fmh_recs[info->gi_idx++], &fm,
++ 			sizeof(struct fsmap)))
++ 		return -EFAULT;
++ 
++ 	return 0;
++ }
++ 
++ static int ext4_ioc_getfsmap(struct super_block *sb,
++ 			     struct fsmap_head __user *arg)
++ {
++ 	struct getfsmap_info info = {0};
++ 	struct ext4_fsmap_head xhead = {0};
++ 	struct fsmap_head head;
++ 	bool aborted = false;
++ 	int error;
++ 
++ 	if (copy_from_user(&head, arg, sizeof(struct fsmap_head)))
++ 		return -EFAULT;
++ 	if (memchr_inv(head.fmh_reserved, 0, sizeof(head.fmh_reserved)) ||
++ 	    memchr_inv(head.fmh_keys[0].fmr_reserved, 0,
++ 		       sizeof(head.fmh_keys[0].fmr_reserved)) ||
++ 	    memchr_inv(head.fmh_keys[1].fmr_reserved, 0,
++ 		       sizeof(head.fmh_keys[1].fmr_reserved)))
++ 		return -EINVAL;
++ 	/*
++ 	 * ext4 doesn't report file extents at all, so the only valid
++ 	 * file offsets are the magic ones (all zeroes or all ones).
++ 	 */
++ 	if (head.fmh_keys[0].fmr_offset ||
++ 	    (head.fmh_keys[1].fmr_offset != 0 &&
++ 	     head.fmh_keys[1].fmr_offset != -1ULL))
++ 		return -EINVAL;
++ 
++ 	xhead.fmh_iflags = head.fmh_iflags;
++ 	xhead.fmh_count = head.fmh_count;
++ 	ext4_fsmap_to_internal(sb, &xhead.fmh_keys[0], &head.fmh_keys[0]);
++ 	ext4_fsmap_to_internal(sb, &xhead.fmh_keys[1], &head.fmh_keys[1]);
++ 
++ 	trace_ext4_getfsmap_low_key(sb, &xhead.fmh_keys[0]);
++ 	trace_ext4_getfsmap_high_key(sb, &xhead.fmh_keys[1]);
++ 
++ 	info.gi_sb = sb;
++ 	info.gi_data = arg;
++ 	error = ext4_getfsmap(sb, &xhead, ext4_getfsmap_format, &info);
++ 	if (error == EXT4_QUERY_RANGE_ABORT) {
++ 		error = 0;
++ 		aborted = true;
++ 	} else if (error)
++ 		return error;
++ 
++ 	/* If we didn't abort, set the "last" flag in the last fmx */
++ 	if (!aborted && info.gi_idx) {
++ 		info.gi_last_flags |= FMR_OF_LAST;
++ 		if (copy_to_user(&info.gi_data->fmh_recs[info.gi_idx - 1].fmr_flags,
++ 				 &info.gi_last_flags,
++ 				 sizeof(info.gi_last_flags)))
++ 			return -EFAULT;
++ 	}
++ 
++ 	/* copy back header */
++ 	head.fmh_entries = xhead.fmh_entries;
++ 	head.fmh_oflags = xhead.fmh_oflags;
++ 	if (copy_to_user(arg, &head, sizeof(struct fsmap_head)))
++ 		return -EFAULT;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> e9072d859df3 (ext4: prevent data corruption with journaling + DAX)
+  long ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+  {
+  	struct inode *inode = file_inode(filp);
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index f49ba18669c7..85ff3ecd1eba 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -5257,11 +5257,6 @@ int ext4_change_inode_journal_flag(struct inode *inode, int val)
+ 		ext4_clear_inode_flag(inode, EXT4_INODE_JOURNAL_DATA);
+ 	}
+ 	ext4_set_aops(inode);
+-	/*
+-	 * Update inode->i_flags after EXT4_INODE_JOURNAL_DATA was updated.
+-	 * E.g. S_DAX may get cleared / set.
+-	 */
+-	ext4_set_inode_flags(inode);
+ 
+ 	jbd2_journal_unlock_updates(journal);
+ 	ext4_inode_resume_unlocked_dio(inode);
+* Unmerged path fs/ext4/ioctl.c
