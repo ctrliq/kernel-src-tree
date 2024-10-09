@@ -1,0 +1,157 @@
+amd-xgbe: Add additional stats to be reported via ethtool
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit 5452b2dfe685ba6774ceca19ec1df1fa499702fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/5452b2df.failed
+
+Add additional/extended statistics beyond what is provided by the
+hardware to be reported via ethtool. The new stats focus on the
+calls into ndo_start_xmit and the napi_poll routine.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5452b2dfe685ba6774ceca19ec1df1fa499702fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+index ec5481f846ee,6f593a552f9f..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+@@@ -1140,8 -1625,8 +1143,13 @@@ static int xgbe_dev_read(struct xgbe_ch
+  	struct xgbe_ring_data *rdata;
+  	struct xgbe_ring_desc *rdesc;
+  	struct xgbe_packet_data *packet = &ring->packet_data;
+++<<<<<<< HEAD
+ +	struct net_device *netdev = channel->pdata->netdev;
+ +	unsigned int err, etlt;
+++=======
++ 	struct net_device *netdev = pdata->netdev;
++ 	unsigned int err, etlt, l34t;
+++>>>>>>> 5452b2dfe685 (amd-xgbe: Add additional stats to be reported via ethtool)
+  
+  	DBGPR("-->xgbe_dev_read: cur = %d\n", ring->cur);
+  
+@@@ -1159,8 -1644,55 +1167,58 @@@
+  	xgbe_dump_rx_desc(ring, rdesc, ring->cur);
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ 	if (XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, CTXT)) {
++ 		/* Timestamp Context Descriptor */
++ 		xgbe_get_rx_tstamp(packet, rdesc);
++ 
++ 		XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES,
++ 			       CONTEXT, 1);
++ 		XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES,
++ 			       CONTEXT_NEXT, 0);
++ 		return 0;
++ 	}
++ 
++ 	/* Normal Descriptor, be sure Context Descriptor bit is off */
++ 	XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES, CONTEXT, 0);
++ 
++ 	/* Indicate if a Context Descriptor is next */
++ 	if (XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, CDA))
++ 		XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES,
++ 			       CONTEXT_NEXT, 1);
++ 
++ 	/* Get the header length */
++ 	if (XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, FD)) {
++ 		rdata->rx.hdr_len = XGMAC_GET_BITS_LE(rdesc->desc2,
++ 						      RX_NORMAL_DESC2, HL);
++ 		if (rdata->rx.hdr_len)
++ 			pdata->ext_stats.rx_split_header_packets++;
++ 	}
++ 
++ 	/* Get the RSS hash */
++ 	if (XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, RSV)) {
++ 		XGMAC_SET_BITS(packet->attributes, RX_PACKET_ATTRIBUTES,
++ 			       RSS_HASH, 1);
++ 
++ 		packet->rss_hash = le32_to_cpu(rdesc->desc1);
++ 
++ 		l34t = XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, L34T);
++ 		switch (l34t) {
++ 		case RX_DESC3_L34T_IPV4_TCP:
++ 		case RX_DESC3_L34T_IPV4_UDP:
++ 		case RX_DESC3_L34T_IPV6_TCP:
++ 		case RX_DESC3_L34T_IPV6_UDP:
++ 			packet->rss_hash_type = PKT_HASH_TYPE_L4;
++ 			break;
++ 		default:
++ 			packet->rss_hash_type = PKT_HASH_TYPE_L3;
++ 		}
++ 	}
++ 
+++>>>>>>> 5452b2dfe685 (amd-xgbe: Add additional stats to be reported via ethtool)
+  	/* Get the packet length */
+ -	rdata->rx.len = XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, PL);
+ +	rdata->len = XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, PL);
+  
+  	if (!XGMAC_GET_BITS_LE(rdesc->desc3, RX_NORMAL_DESC3, LD)) {
+  		/* Not all the data has been transferred for this packet */
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-dev.c
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c b/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c
+index 6e5a90e8e36c..cad4a68b9eeb 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-ethtool.c
+@@ -133,6 +133,12 @@ struct xgbe_stats {
+ 	  offsetof(struct xgbe_prv_data, mmc_stats._var),	\
+ 	}
+ 
++#define XGMAC_EXT_STAT(_string, _var)				\
++	{ _string,						\
++	  FIELD_SIZEOF(struct xgbe_ext_stats, _var),		\
++	  offsetof(struct xgbe_prv_data, ext_stats._var),	\
++	}
++
+ static const struct xgbe_stats xgbe_gstring_stats[] = {
+ 	XGMAC_MMC_STAT("tx_bytes", txoctetcount_gb),
+ 	XGMAC_MMC_STAT("tx_packets", txframecount_gb),
+@@ -140,6 +146,7 @@ static const struct xgbe_stats xgbe_gstring_stats[] = {
+ 	XGMAC_MMC_STAT("tx_broadcast_packets", txbroadcastframes_gb),
+ 	XGMAC_MMC_STAT("tx_multicast_packets", txmulticastframes_gb),
+ 	XGMAC_MMC_STAT("tx_vlan_packets", txvlanframes_g),
++	XGMAC_EXT_STAT("tx_tso_packets", tx_tso_packets),
+ 	XGMAC_MMC_STAT("tx_64_byte_packets", tx64octets_gb),
+ 	XGMAC_MMC_STAT("tx_65_to_127_byte_packets", tx65to127octets_gb),
+ 	XGMAC_MMC_STAT("tx_128_to_255_byte_packets", tx128to255octets_gb),
+@@ -171,6 +178,7 @@ static const struct xgbe_stats xgbe_gstring_stats[] = {
+ 	XGMAC_MMC_STAT("rx_fifo_overflow_errors", rxfifooverflow),
+ 	XGMAC_MMC_STAT("rx_watchdog_errors", rxwatchdogerror),
+ 	XGMAC_MMC_STAT("rx_pause_frames", rxpauseframes),
++	XGMAC_EXT_STAT("rx_split_header_packets", rx_split_header_packets),
+ };
+ #define XGBE_STATS_COUNT	ARRAY_SIZE(xgbe_gstring_stats)
+ 
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe.h b/drivers/net/ethernet/amd/xgbe/xgbe.h
+index 1903f878545a..89739474c113 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe.h
++++ b/drivers/net/ethernet/amd/xgbe/xgbe.h
+@@ -385,6 +385,11 @@ struct xgbe_mmc_stats {
+ 	u64 rxwatchdogerror;
+ };
+ 
++struct xgbe_ext_stats {
++	u64 tx_tso_packets;
++	u64 rx_split_header_packets;
++};
++
+ struct xgbe_hw_if {
+ 	int (*tx_complete)(struct xgbe_ring_desc *);
+ 
+@@ -598,6 +603,7 @@ struct xgbe_prv_data {
+ 	netdev_features_t netdev_features;
+ 	struct napi_struct napi;
+ 	struct xgbe_mmc_stats mmc_stats;
++	struct xgbe_ext_stats ext_stats;
+ 
+ 	/* System clock value used for Rx watchdog */
+ 	struct clk *sysclock;
