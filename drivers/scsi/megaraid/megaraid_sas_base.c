@@ -5200,10 +5200,12 @@ megasas_setup_irqs_msix(struct megasas_instance *instance, u8 is_probe)
 					 &instance->irq_context[j]);
 			/* Retry irq register for IO_APIC*/
 			instance->msix_vectors = 0;
-			if (is_probe)
+			if (is_probe) {
+				pci_free_irq_vectors(instance->pdev);
 				return megasas_setup_irqs_ioapic(instance);
-			else
+			} else {
 				return -1;
+			}
 		}
 	}
 	return 0;
@@ -5488,9 +5490,11 @@ static int megasas_init_fw(struct megasas_instance *instance)
 			MPI2_REPLY_POST_HOST_INDEX_OFFSET);
 	}
 
-	i = pci_alloc_irq_vectors(instance->pdev, 1, 1, PCI_IRQ_LEGACY);
-	if (i < 0)
-		goto fail_setup_irqs;
+	if (!instance->msix_vectors) {
+		i = pci_alloc_irq_vectors(instance->pdev, 1, 1, PCI_IRQ_LEGACY);
+		if (i < 0)
+			goto fail_setup_irqs;
+	}
 
 	megasas_setup_reply_map(instance);
 
