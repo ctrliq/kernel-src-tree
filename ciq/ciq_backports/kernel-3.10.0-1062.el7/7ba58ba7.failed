@@ -1,0 +1,124 @@
+net/mlx5e: Offload TC e-switch rules with egress LAG device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Offload TC e-switch rules with egress LAG device (Alaa Hleihel) [1642355 1642498]
+Rebuild_FUZZ: 96.49%
+commit-author Rabie Loulou <rabiel@mellanox.com>
+commit 7ba58ba7ba5e19324b3879000ef341966b19727b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/7ba58ba7.failed
+
+When parsing TC FDB actions, if the egress device is a bond/team
+net-device which enslaved the uplink representor of the e-switch,
+use the uplink representor as the destination in the HW rule.
+
+	Signed-off-by: Rabie Loulou <rabiel@mellanox.com>
+	Signed-off-by: Aviv Heller <avivh@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 7ba58ba7ba5e19324b3879000ef341966b19727b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index fbb4f1b36627,cede77fd208f..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -2622,29 -2539,77 +2622,43 @@@ static int parse_tc_fdb_actions(struct 
+  			continue;
+  		}
+  
+ -		if (is_tcf_csum(a)) {
+ -			if (csum_offload_supported(priv, action,
+ -						   tcf_csum_update_flags(a),
+ -						   extack))
+ -				continue;
+ -
+ -			return -EOPNOTSUPP;
+ -		}
+ -
+ -		if (is_tcf_mirred_egress_redirect(a) || is_tcf_mirred_egress_mirror(a)) {
+ -			struct mlx5e_priv *out_priv;
+ +		if (is_tcf_mirred_egress_redirect(a)) {
+  			struct net_device *out_dev;
+ +			struct mlx5e_priv *out_priv;
+  
+  			out_dev = tcf_mirred_dev(a);
+ -			if (!out_dev) {
+ -				/* out_dev is NULL when filters with
+ -				 * non-existing mirred device are replayed to
+ -				 * the driver.
+ -				 */
+ -				return -EINVAL;
+ -			}
+  
+ -			if (attr->out_count >= MLX5_MAX_FLOW_FWD_VPORTS) {
+ -				NL_SET_ERR_MSG_MOD(extack,
+ -						   "can't support more output ports, can't offload forwarding");
+ -				pr_err("can't support more than %d output ports, can't offload forwarding\n",
+ -				       attr->out_count);
+ -				return -EOPNOTSUPP;
+ -			}
+ -
+ -			action |= MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
+ -				  MLX5_FLOW_CONTEXT_ACTION_COUNT;
+  			if (switchdev_port_same_parent_id(priv->netdev,
+++<<<<<<< HEAD
+ +							  out_dev)) {
+ +				attr->action |= MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
+ +					MLX5_FLOW_CONTEXT_ACTION_COUNT;
+++=======
++ 							  out_dev) ||
++ 			    is_merged_eswitch_dev(priv, out_dev)) {
++ 				struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
++ 				struct net_device *uplink_dev = mlx5_eswitch_uplink_get_proto_dev(esw, REP_ETH);
++ 				struct net_device *uplink_upper = netdev_master_upper_dev_get(uplink_dev);
++ 
++ 				if (uplink_upper &&
++ 				    netif_is_lag_master(uplink_upper) &&
++ 				    uplink_upper == out_dev)
++ 					out_dev = uplink_dev;
++ 
+++>>>>>>> 7ba58ba7ba5e (net/mlx5e: Offload TC e-switch rules with egress LAG device)
+  				out_priv = netdev_priv(out_dev);
+  				rpriv = out_priv->ppriv;
+ -				attr->dests[attr->out_count].rep = rpriv->rep;
+ -				attr->dests[attr->out_count].mdev = out_priv->mdev;
+ -				attr->out_count++;
+ +				attr->out_rep = rpriv->rep;
+ +				attr->out_mdev = out_priv->mdev;
+  			} else if (encap) {
+ -				parse_attr->mirred_ifindex[attr->out_count] =
+ -					out_dev->ifindex;
+ -				parse_attr->tun_info[attr->out_count] = *info;
+ -				encap = false;
+ +				parse_attr->mirred_ifindex = out_dev->ifindex;
+ +				parse_attr->tun_info = *info;
+  				attr->parse_attr = parse_attr;
+ -				attr->dests[attr->out_count].flags |=
+ -					MLX5_ESW_DEST_ENCAP;
+ -				attr->out_count++;
+ -				/* attr->dests[].rep is resolved when we
+ -				 * handle encap
+ -				 */
+ -			} else if (parse_attr->filter_dev != priv->netdev) {
+ -				/* All mlx5 devices are called to configure
+ -				 * high level device filters. Therefore, the
+ -				 * *attempt* to  install a filter on invalid
+ -				 * eswitch should not trigger an explicit error
+ -				 */
+ -				return -EINVAL;
+ +				attr->action |= MLX5_FLOW_CONTEXT_ACTION_ENCAP |
+ +					MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
+ +					MLX5_FLOW_CONTEXT_ACTION_COUNT;
+ +				/* attr->out_rep is resolved when we handle encap */
+  			} else {
+ -				NL_SET_ERR_MSG_MOD(extack,
+ -						   "devices are not on same switch HW, can't offload forwarding");
+  				pr_err("devices %s %s not on same switch HW, can't offload forwarding\n",
+  				       priv->netdev->name, out_dev->name);
+  				return -EINVAL;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
