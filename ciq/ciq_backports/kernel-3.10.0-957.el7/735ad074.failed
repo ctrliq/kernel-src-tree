@@ -1,0 +1,224 @@
+iio: Support triggered events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [iio] Support triggered events (Tony Camuso) [1559170]
+Rebuild_FUZZ: 90.57%
+commit-author Vladimir Barinov <vladimir.barinov@cogentembedded.com>
+commit 735ad074ffa72ccc4fdba8e54eb024df95545e7d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/735ad074.failed
+
+Support triggered events.
+
+This is useful for chips that don't have their own interrupt sources.
+It allows to use generic/standalone iio triggers for those drivers.
+
+	Signed-off-by: Vladimir Barinov <vladimir.barinov@cogentembedded.com>
+	Signed-off-by: Jonathan Cameron <jic23@kernel.org>
+(cherry picked from commit 735ad074ffa72ccc4fdba8e54eb024df95545e7d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iio/industrialio-trigger.c
+diff --cc drivers/iio/industrialio-trigger.c
+index ca534641be47,ae2806aafb72..000000000000
+--- a/drivers/iio/industrialio-trigger.c
++++ b/drivers/iio/industrialio-trigger.c
+@@@ -369,10 -366,18 +369,22 @@@ static ssize_t iio_trigger_write_curren
+  
+  	indio_dev->trig = trig;
+  
+++<<<<<<< HEAD
+ +	if (oldtrig && indio_dev->trig != oldtrig)
+++=======
++ 	if (oldtrig) {
++ 		if (indio_dev->modes & INDIO_EVENT_TRIGGERED)
++ 			iio_trigger_detach_poll_func(oldtrig,
++ 						     indio_dev->pollfunc_event);
+++>>>>>>> 735ad074ffa7 (iio: Support triggered events)
+  		iio_trigger_put(oldtrig);
+- 	if (indio_dev->trig)
++ 	}
++ 	if (indio_dev->trig) {
+  		iio_trigger_get(indio_dev->trig);
++ 		if (indio_dev->modes & INDIO_EVENT_TRIGGERED)
++ 			iio_trigger_attach_poll_func(indio_dev->trig,
++ 						     indio_dev->pollfunc_event);
++ 	}
+  
+  	return len;
+  }
+diff --git a/drivers/iio/Kconfig b/drivers/iio/Kconfig
+index 4445a10262c8..103779150a50 100644
+--- a/drivers/iio/Kconfig
++++ b/drivers/iio/Kconfig
+@@ -59,6 +59,12 @@ config IIO_CONSUMERS_PER_TRIGGER
+ 	This value controls the maximum number of consumers that a
+ 	given trigger may handle. Default is 2.
+ 
++config IIO_TRIGGERED_EVENT
++	tristate
++	select IIO_TRIGGER
++	help
++	  Provides helper functions for setting up triggered events.
++
+ source "drivers/iio/accel/Kconfig"
+ source "drivers/iio/adc/Kconfig"
+ source "drivers/iio/amplifiers/Kconfig"
+diff --git a/drivers/iio/Makefile b/drivers/iio/Makefile
+index 7a3866c2d2a1..9dff359c7b87 100644
+--- a/drivers/iio/Makefile
++++ b/drivers/iio/Makefile
+@@ -11,6 +11,8 @@ industrialio-$(CONFIG_IIO_BUFFER_CB) += buffer_cb.o
+ obj-$(CONFIG_IIO_TRIGGERED_BUFFER) += industrialio-triggered-buffer.o
+ obj-$(CONFIG_IIO_KFIFO_BUF) += kfifo_buf.o
+ 
++obj-$(CONFIG_IIO_TRIGGERED_EVENT) += industrialio-triggered-event.o
++
+ obj-y += accel/
+ obj-y += adc/
+ obj-y += amplifiers/
+diff --git a/drivers/iio/industrialio-core.c b/drivers/iio/industrialio-core.c
+index 4add760f6942..f36cbba979c3 100644
+--- a/drivers/iio/industrialio-core.c
++++ b/drivers/iio/industrialio-core.c
+@@ -886,7 +886,7 @@ static void iio_device_unregister_sysfs(struct iio_dev *indio_dev)
+ static void iio_dev_release(struct device *device)
+ {
+ 	struct iio_dev *indio_dev = dev_to_iio_dev(device);
+-	if (indio_dev->modes & INDIO_BUFFER_TRIGGERED)
++	if (indio_dev->modes & (INDIO_BUFFER_TRIGGERED | INDIO_EVENT_TRIGGERED))
+ 		iio_device_unregister_trigger_consumer(indio_dev);
+ 	iio_device_unregister_eventset(indio_dev);
+ 	iio_device_unregister_sysfs(indio_dev);
+@@ -1111,7 +1111,7 @@ int iio_device_register(struct iio_dev *indio_dev)
+ 			"Failed to register event set\n");
+ 		goto error_free_sysfs;
+ 	}
+-	if (indio_dev->modes & INDIO_BUFFER_TRIGGERED)
++	if (indio_dev->modes & (INDIO_BUFFER_TRIGGERED | INDIO_EVENT_TRIGGERED))
+ 		iio_device_register_trigger_consumer(indio_dev);
+ 
+ 	if ((indio_dev->modes & INDIO_ALL_BUFFER_MODES) &&
+* Unmerged path drivers/iio/industrialio-trigger.c
+diff --git a/drivers/iio/industrialio-triggered-event.c b/drivers/iio/industrialio-triggered-event.c
+new file mode 100644
+index 000000000000..8cc254fac16a
+--- /dev/null
++++ b/drivers/iio/industrialio-triggered-event.c
+@@ -0,0 +1,68 @@
++/*
++ * Copyright (C) 2015 Cogent Embedded, Inc.
++ *
++ * This program is free software; you can redistribute  it and/or modify it
++ * under  the terms of  the GNU General  Public License as published by the
++ * Free Software Foundation;  either version 2 of the  License, or (at your
++ * option) any later version.
++ */
++
++#include <linux/kernel.h>
++#include <linux/export.h>
++#include <linux/module.h>
++#include <linux/iio/iio.h>
++#include <linux/iio/triggered_event.h>
++#include <linux/iio/trigger_consumer.h>
++
++/**
++ * iio_triggered_event_setup() - Setup pollfunc_event for triggered event
++ * @indio_dev:	IIO device structure
++ * @h:		Function which will be used as pollfunc_event top half
++ * @thread:	Function which will be used as pollfunc_event bottom half
++ *
++ * This function combines some common tasks which will normally be performed
++ * when setting up a triggered event. It will allocate the pollfunc_event and
++ * set mode to use it for triggered event.
++ *
++ * Before calling this function the indio_dev structure should already be
++ * completely initialized, but not yet registered. In practice this means that
++ * this function should be called right before iio_device_register().
++ *
++ * To free the resources allocated by this function call
++ * iio_triggered_event_cleanup().
++ */
++int iio_triggered_event_setup(struct iio_dev *indio_dev,
++			      irqreturn_t (*h)(int irq, void *p),
++			      irqreturn_t (*thread)(int irq, void *p))
++{
++	indio_dev->pollfunc_event = iio_alloc_pollfunc(h,
++						       thread,
++						       IRQF_ONESHOT,
++						       indio_dev,
++						       "%s_consumer%d",
++						       indio_dev->name,
++						       indio_dev->id);
++	if (indio_dev->pollfunc_event == NULL)
++		return -ENOMEM;
++
++	/* Flag that events polling is possible */
++	indio_dev->modes |= INDIO_EVENT_TRIGGERED;
++
++	return 0;
++}
++EXPORT_SYMBOL(iio_triggered_event_setup);
++
++/**
++ * iio_triggered_event_cleanup() - Free resources allocated by iio_triggered_event_setup()
++ * @indio_dev: IIO device structure
++ */
++void iio_triggered_event_cleanup(struct iio_dev *indio_dev)
++{
++	indio_dev->modes &= ~INDIO_EVENT_TRIGGERED;
++	iio_dealloc_pollfunc(indio_dev->pollfunc_event);
++}
++EXPORT_SYMBOL(iio_triggered_event_cleanup);
++
++MODULE_AUTHOR("Vladimir Barinov");
++MODULE_DESCRIPTION("IIO helper functions for setting up triggered events");
++MODULE_LICENSE("GPL");
+diff --git a/include/linux/iio/iio.h b/include/linux/iio/iio.h
+index 2de8b5018c4d..db56fe7a8de2 100644
+--- a/include/linux/iio/iio.h
++++ b/include/linux/iio/iio.h
+@@ -269,6 +269,7 @@ static inline s64 iio_get_time_ns(void)
+ #define INDIO_BUFFER_TRIGGERED		0x02
+ #define INDIO_BUFFER_SOFTWARE		0x04
+ #define INDIO_BUFFER_HARDWARE		0x08
++#define INDIO_EVENT_TRIGGERED		0x10
+ 
+ #define INDIO_ALL_BUFFER_MODES					\
+ 	(INDIO_BUFFER_TRIGGERED | INDIO_BUFFER_HARDWARE | INDIO_BUFFER_SOFTWARE)
+@@ -424,6 +425,7 @@ struct iio_buffer_setup_ops {
+  * @scan_index_timestamp:[INTERN] cache of the index to the timestamp
+  * @trig:		[INTERN] current device trigger (buffer modes)
+  * @pollfunc:		[DRIVER] function run on trigger being received
++ * @pollfunc_event:	[DRIVER] function run on events trigger being received
+  * @channels:		[DRIVER] channel specification structure table
+  * @num_channels:	[DRIVER] number of channels specified in @channels.
+  * @channel_attr_list:	[INTERN] keep track of automatically created channel
+@@ -462,6 +464,7 @@ struct iio_dev {
+ 	unsigned			scan_index_timestamp;
+ 	struct iio_trigger		*trig;
+ 	struct iio_poll_func		*pollfunc;
++	struct iio_poll_func		*pollfunc_event;
+ 
+ 	struct iio_chan_spec const	*channels;
+ 	int				num_channels;
+diff --git a/include/linux/iio/triggered_event.h b/include/linux/iio/triggered_event.h
+new file mode 100644
+index 000000000000..8fe8537085bb
+--- /dev/null
++++ b/include/linux/iio/triggered_event.h
+@@ -0,0 +1,11 @@
++#ifndef _LINUX_IIO_TRIGGERED_EVENT_H_
++#define _LINUX_IIO_TRIGGERED_EVENT_H_
++
++#include <linux/interrupt.h>
++
++int iio_triggered_event_setup(struct iio_dev *indio_dev,
++	irqreturn_t (*h)(int irq, void *p),
++	irqreturn_t (*thread)(int irq, void *p));
++void iio_triggered_event_cleanup(struct iio_dev *indio_dev);
++
++#endif
