@@ -1,0 +1,302 @@
+xfs: create block pointer check functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit 21ec54168b368f1a98097dee00625ec8ec2d47f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/21ec5416.failed
+
+Create some helper functions to check that a block pointer points
+within the filesystem (or AG) and doesn't point at static metadata.
+We will use this for scrub.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+(cherry picked from commit 21ec54168b368f1a98097dee00625ec8ec2d47f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_alloc.c
+#	fs/xfs/libxfs/xfs_alloc.h
+#	fs/xfs/libxfs/xfs_rtbitmap.c
+#	fs/xfs/xfs_rtalloc.h
+diff --cc fs/xfs/libxfs/xfs_alloc.c
+index 2bb1769eaa5c,11c01e2668bf..000000000000
+--- a/fs/xfs/libxfs/xfs_alloc.c
++++ b/fs/xfs/libxfs/xfs_alloc.c
+@@@ -2860,3 -2874,109 +2860,112 @@@ err
+  	xfs_trans_brelse(tp, agbp);
+  	return error;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ struct xfs_alloc_query_range_info {
++ 	xfs_alloc_query_range_fn	fn;
++ 	void				*priv;
++ };
++ 
++ /* Format btree record and pass to our callback. */
++ STATIC int
++ xfs_alloc_query_range_helper(
++ 	struct xfs_btree_cur		*cur,
++ 	union xfs_btree_rec		*rec,
++ 	void				*priv)
++ {
++ 	struct xfs_alloc_query_range_info	*query = priv;
++ 	struct xfs_alloc_rec_incore		irec;
++ 
++ 	irec.ar_startblock = be32_to_cpu(rec->alloc.ar_startblock);
++ 	irec.ar_blockcount = be32_to_cpu(rec->alloc.ar_blockcount);
++ 	return query->fn(cur, &irec, query->priv);
++ }
++ 
++ /* Find all free space within a given range of blocks. */
++ int
++ xfs_alloc_query_range(
++ 	struct xfs_btree_cur			*cur,
++ 	struct xfs_alloc_rec_incore		*low_rec,
++ 	struct xfs_alloc_rec_incore		*high_rec,
++ 	xfs_alloc_query_range_fn		fn,
++ 	void					*priv)
++ {
++ 	union xfs_btree_irec			low_brec;
++ 	union xfs_btree_irec			high_brec;
++ 	struct xfs_alloc_query_range_info	query;
++ 
++ 	ASSERT(cur->bc_btnum == XFS_BTNUM_BNO);
++ 	low_brec.a = *low_rec;
++ 	high_brec.a = *high_rec;
++ 	query.priv = priv;
++ 	query.fn = fn;
++ 	return xfs_btree_query_range(cur, &low_brec, &high_brec,
++ 			xfs_alloc_query_range_helper, &query);
++ }
++ 
++ /* Find all free space records. */
++ int
++ xfs_alloc_query_all(
++ 	struct xfs_btree_cur			*cur,
++ 	xfs_alloc_query_range_fn		fn,
++ 	void					*priv)
++ {
++ 	struct xfs_alloc_query_range_info	query;
++ 
++ 	ASSERT(cur->bc_btnum == XFS_BTNUM_BNO);
++ 	query.priv = priv;
++ 	query.fn = fn;
++ 	return xfs_btree_query_all(cur, xfs_alloc_query_range_helper, &query);
++ }
++ 
++ /* Find the size of the AG, in blocks. */
++ xfs_agblock_t
++ xfs_ag_block_count(
++ 	struct xfs_mount	*mp,
++ 	xfs_agnumber_t		agno)
++ {
++ 	ASSERT(agno < mp->m_sb.sb_agcount);
++ 
++ 	if (agno < mp->m_sb.sb_agcount - 1)
++ 		return mp->m_sb.sb_agblocks;
++ 	return mp->m_sb.sb_dblocks - (agno * mp->m_sb.sb_agblocks);
++ }
++ 
++ /*
++  * Verify that an AG block number pointer neither points outside the AG
++  * nor points at static metadata.
++  */
++ bool
++ xfs_verify_agbno(
++ 	struct xfs_mount	*mp,
++ 	xfs_agnumber_t		agno,
++ 	xfs_agblock_t		agbno)
++ {
++ 	xfs_agblock_t		eoag;
++ 
++ 	eoag = xfs_ag_block_count(mp, agno);
++ 	if (agbno >= eoag)
++ 		return false;
++ 	if (agbno <= XFS_AGFL_BLOCK(mp))
++ 		return false;
++ 	return true;
++ }
++ 
++ /*
++  * Verify that an FS block number pointer neither points outside the
++  * filesystem nor points at static AG metadata.
++  */
++ bool
++ xfs_verify_fsbno(
++ 	struct xfs_mount	*mp,
++ 	xfs_fsblock_t		fsbno)
++ {
++ 	xfs_agnumber_t		agno = XFS_FSB_TO_AGNO(mp, fsbno);
++ 
++ 	if (agno >= mp->m_sb.sb_agcount)
++ 		return false;
++ 	return xfs_verify_agbno(mp, agno, XFS_FSB_TO_AGBNO(mp, fsbno));
++ }
+++>>>>>>> 21ec54168b36 (xfs: create block pointer check functions)
+diff --cc fs/xfs/libxfs/xfs_alloc.h
+index 7764318509c1,7ba2d129d504..000000000000
+--- a/fs/xfs/libxfs/xfs_alloc.h
++++ b/fs/xfs/libxfs/xfs_alloc.h
+@@@ -213,4 -219,22 +213,25 @@@ int xfs_alloc_fix_freelist(struct xfs_a
+  int xfs_free_extent_fix_freelist(struct xfs_trans *tp, xfs_agnumber_t agno,
+  		struct xfs_buf **agbp);
+  
+++<<<<<<< HEAD
+++=======
++ xfs_extlen_t xfs_prealloc_blocks(struct xfs_mount *mp);
++ 
++ typedef int (*xfs_alloc_query_range_fn)(
++ 	struct xfs_btree_cur		*cur,
++ 	struct xfs_alloc_rec_incore	*rec,
++ 	void				*priv);
++ 
++ int xfs_alloc_query_range(struct xfs_btree_cur *cur,
++ 		struct xfs_alloc_rec_incore *low_rec,
++ 		struct xfs_alloc_rec_incore *high_rec,
++ 		xfs_alloc_query_range_fn fn, void *priv);
++ int xfs_alloc_query_all(struct xfs_btree_cur *cur, xfs_alloc_query_range_fn fn,
++ 		void *priv);
++ xfs_agblock_t xfs_ag_block_count(struct xfs_mount *mp, xfs_agnumber_t agno);
++ bool xfs_verify_agbno(struct xfs_mount *mp, xfs_agnumber_t agno,
++ 		xfs_agblock_t agbno);
++ bool xfs_verify_fsbno(struct xfs_mount *mp, xfs_fsblock_t fsbno);
++ 
+++>>>>>>> 21ec54168b36 (xfs: create block pointer check functions)
+  #endif	/* __XFS_ALLOC_H__ */
+diff --cc fs/xfs/libxfs/xfs_rtbitmap.c
+index 3ceff244c51c,4523a92d5507..000000000000
+--- a/fs/xfs/libxfs/xfs_rtbitmap.c
++++ b/fs/xfs/libxfs/xfs_rtbitmap.c
+@@@ -1016,3 -1016,85 +1016,88 @@@ xfs_rtfree_extent
+  	}
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /* Find all the free records within a given range. */
++ int
++ xfs_rtalloc_query_range(
++ 	struct xfs_trans		*tp,
++ 	struct xfs_rtalloc_rec		*low_rec,
++ 	struct xfs_rtalloc_rec		*high_rec,
++ 	xfs_rtalloc_query_range_fn	fn,
++ 	void				*priv)
++ {
++ 	struct xfs_rtalloc_rec		rec;
++ 	struct xfs_mount		*mp = tp->t_mountp;
++ 	xfs_rtblock_t			rtstart;
++ 	xfs_rtblock_t			rtend;
++ 	xfs_rtblock_t			rem;
++ 	int				is_free;
++ 	int				error = 0;
++ 
++ 	if (low_rec->ar_startblock > high_rec->ar_startblock)
++ 		return -EINVAL;
++ 	else if (low_rec->ar_startblock == high_rec->ar_startblock)
++ 		return 0;
++ 
++ 	/* Iterate the bitmap, looking for discrepancies. */
++ 	rtstart = low_rec->ar_startblock;
++ 	rem = high_rec->ar_startblock - rtstart;
++ 	while (rem) {
++ 		/* Is the first block free? */
++ 		error = xfs_rtcheck_range(mp, tp, rtstart, 1, 1, &rtend,
++ 				&is_free);
++ 		if (error)
++ 			break;
++ 
++ 		/* How long does the extent go for? */
++ 		error = xfs_rtfind_forw(mp, tp, rtstart,
++ 				high_rec->ar_startblock - 1, &rtend);
++ 		if (error)
++ 			break;
++ 
++ 		if (is_free) {
++ 			rec.ar_startblock = rtstart;
++ 			rec.ar_blockcount = rtend - rtstart + 1;
++ 
++ 			error = fn(tp, &rec, priv);
++ 			if (error)
++ 				break;
++ 		}
++ 
++ 		rem -= rtend - rtstart + 1;
++ 		rtstart = rtend + 1;
++ 	}
++ 
++ 	return error;
++ }
++ 
++ /* Find all the free records. */
++ int
++ xfs_rtalloc_query_all(
++ 	struct xfs_trans		*tp,
++ 	xfs_rtalloc_query_range_fn	fn,
++ 	void				*priv)
++ {
++ 	struct xfs_rtalloc_rec		keys[2];
++ 
++ 	keys[0].ar_startblock = 0;
++ 	keys[1].ar_startblock = tp->t_mountp->m_sb.sb_rblocks;
++ 	keys[0].ar_blockcount = keys[1].ar_blockcount = 0;
++ 
++ 	return xfs_rtalloc_query_range(tp, &keys[0], &keys[1], fn, priv);
++ }
++ 
++ /*
++  * Verify that an realtime block number pointer doesn't point off the
++  * end of the realtime device.
++  */
++ bool
++ xfs_verify_rtbno(
++ 	struct xfs_mount	*mp,
++ 	xfs_rtblock_t		rtbno)
++ {
++ 	return rtbno < mp->m_sb.sb_rblocks;
++ }
+++>>>>>>> 21ec54168b36 (xfs: create block pointer check functions)
+diff --cc fs/xfs/xfs_rtalloc.h
+index acf265c5cfac,3f30f846d7f2..000000000000
+--- a/fs/xfs/xfs_rtalloc.h
++++ b/fs/xfs/xfs_rtalloc.h
+@@@ -120,14 -130,24 +120,27 @@@ int xfs_rtmodify_summary(struct xfs_mou
+  int xfs_rtfree_range(struct xfs_mount *mp, struct xfs_trans *tp,
+  		     xfs_rtblock_t start, xfs_extlen_t len,
+  		     struct xfs_buf **rbpp, xfs_fsblock_t *rsb);
+++<<<<<<< HEAD
+ +
+ +
+++=======
++ int xfs_rtalloc_query_range(struct xfs_trans *tp,
++ 			    struct xfs_rtalloc_rec *low_rec,
++ 			    struct xfs_rtalloc_rec *high_rec,
++ 			    xfs_rtalloc_query_range_fn fn,
++ 			    void *priv);
++ int xfs_rtalloc_query_all(struct xfs_trans *tp,
++ 			  xfs_rtalloc_query_range_fn fn,
++ 			  void *priv);
++ bool xfs_verify_rtbno(struct xfs_mount *mp, xfs_rtblock_t rtbno);
+++>>>>>>> 21ec54168b36 (xfs: create block pointer check functions)
+  #else
+  # define xfs_rtallocate_extent(t,b,min,max,l,f,p,rb)    (ENOSYS)
+  # define xfs_rtfree_extent(t,b,l)                       (ENOSYS)
+  # define xfs_rtpick_extent(m,t,l,rb)                    (ENOSYS)
+  # define xfs_growfs_rt(mp,in)                           (ENOSYS)
+ -# define xfs_rtalloc_query_range(t,l,h,f,p)             (ENOSYS)
+ -# define xfs_rtalloc_query_all(t,f,p)                   (ENOSYS)
+  # define xfs_rtbuf_get(m,t,b,i,p)                       (ENOSYS)
++ # define xfs_verify_rtbno(m, r)			(false)
+  static inline int		/* error */
+  xfs_rtmount_init(
+  	xfs_mount_t	*mp)	/* file system mount structure */
+* Unmerged path fs/xfs/libxfs/xfs_alloc.c
+* Unmerged path fs/xfs/libxfs/xfs_alloc.h
+* Unmerged path fs/xfs/libxfs/xfs_rtbitmap.c
+* Unmerged path fs/xfs/xfs_rtalloc.h
