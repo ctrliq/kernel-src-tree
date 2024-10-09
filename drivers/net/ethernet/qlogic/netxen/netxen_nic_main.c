@@ -2074,7 +2074,7 @@ netxen_nic_xmit_frame(struct sk_buff *skb, struct net_device *netdev)
 	struct skb_frag_struct *frag;
 
 	u32 producer;
-	int frag_count, no_of_desc;
+	int frag_count;
 	u32 num_txd = tx_ring->num_desc;
 
 	frag_count = skb_shinfo(skb)->nr_frags + 1;
@@ -2094,8 +2094,6 @@ netxen_nic_xmit_frame(struct sk_buff *skb, struct net_device *netdev)
 
 		frag_count = 1 + skb_shinfo(skb)->nr_frags;
 	}
-	/* 4 fragments per cmd des */
-	no_of_desc = (frag_count + 3) >> 2;
 
 	if (unlikely(netxen_tx_avail(tx_ring) <= TX_STOP_THRESH)) {
 		netif_stop_queue(netdev);
