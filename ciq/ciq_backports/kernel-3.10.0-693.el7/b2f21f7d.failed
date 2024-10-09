@@ -1,0 +1,86 @@
+SUNRPC: accept() may return sockets that are still in SYN_RECV
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Trond Myklebust <trond.myklebust@primarydata.com>
+commit b2f21f7d85758309f94eafd502fe555e8e5a7f06
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/b2f21f7d.failed
+
+We're seeing traces of the following form:
+
+ [10952.396347] svc: transport ffff88042ba4a 000 dequeued, inuse=2
+ [10952.396351] svc: tcp_accept ffff88042ba4 a000 sock ffff88042a6e4c80
+ [10952.396362] nfsd: connect from 10.2.6.1, port=187
+ [10952.396364] svc: svc_setup_socket ffff8800b99bcf00
+ [10952.396368] setting up TCP socket for reading
+ [10952.396370] svc: svc_setup_socket created ffff8803eb10a000 (inet ffff88042b75b800)
+ [10952.396373] svc: transport ffff8803eb10a000 put into queue
+ [10952.396375] svc: transport ffff88042ba4a000 put into queue
+ [10952.396377] svc: server ffff8800bb0ec000 waiting for data (to = 3600000)
+ [10952.396380] svc: transport ffff8803eb10a000 dequeued, inuse=2
+ [10952.396381] svc_recv: found XPT_CLOSE
+ [10952.396397] svc: svc_delete_xprt(ffff8803eb10a000)
+ [10952.396398] svc: svc_tcp_sock_detach(ffff8803eb10a000)
+ [10952.396399] svc: svc_sock_detach(ffff8803eb10a000)
+ [10952.396412] svc: svc_sock_free(ffff8803eb10a000)
+
+i.e. an immediate close of the socket after initialisation.
+
+The culprit appears to be the test at the end of svc_tcp_init, which
+checks if the newly created socket is in the TCP_ESTABLISHED state,
+and immediately closes it if not. The evidence appears to suggest that
+the socket might still be in the SYN_RECV state at this time.
+
+The fix is to check for both states, and then to add a check in
+svc_tcp_state_change() to ensure we don't close the socket when
+it transitions into TCP_ESTABLISHED.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit b2f21f7d85758309f94eafd502fe555e8e5a7f06)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/svcsock.c
+diff --cc net/sunrpc/svcsock.c
+index a3ebe6c6b21b,a11ddc8975c3..000000000000
+--- a/net/sunrpc/svcsock.c
++++ b/net/sunrpc/svcsock.c
+@@@ -830,26 -762,12 +830,34 @@@ static void svc_tcp_state_change(struc
+  	if (!svsk)
+  		printk("svc: socket %p: no user data\n", sk);
+  	else {
+++<<<<<<< HEAD
+ +		set_bit(XPT_CLOSE, &svsk->sk_xprt.xpt_flags);
+ +		svc_xprt_enqueue(&svsk->sk_xprt);
+++=======
++ 		svsk->sk_ostate(sk);
++ 		if (sk->sk_state != TCP_ESTABLISHED) {
++ 			set_bit(XPT_CLOSE, &svsk->sk_xprt.xpt_flags);
++ 			svc_xprt_enqueue(&svsk->sk_xprt);
++ 		}
+++>>>>>>> b2f21f7d8575 (SUNRPC: accept() may return sockets that are still in SYN_RECV)
+  	}
+ +	if (sunrpc_waitqueue_active(wq))
+ +		wake_up_interruptible_all(wq);
+ +}
+ +
+ +static void svc_tcp_data_ready(struct sock *sk, int count)
+ +{
+ +	struct svc_sock *svsk = (struct svc_sock *)sk->sk_user_data;
+ +	wait_queue_head_t *wq = sk_sleep(sk);
+ +
+ +	dprintk("svc: socket %p TCP data ready (svsk %p)\n",
+ +		sk, sk->sk_user_data);
+ +	if (svsk) {
+ +		set_bit(XPT_DATA, &svsk->sk_xprt.xpt_flags);
+ +		svc_xprt_enqueue(&svsk->sk_xprt);
+ +	}
+ +	if (sunrpc_waitqueue_active(wq))
+ +		wake_up_interruptible(wq);
+  }
+  
+  /*
+* Unmerged path net/sunrpc/svcsock.c
