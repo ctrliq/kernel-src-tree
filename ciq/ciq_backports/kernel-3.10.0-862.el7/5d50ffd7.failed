@@ -1,0 +1,260 @@
+locks: add new fcntl cmd values for handling file private locks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jeff Layton <jlayton@redhat.com>
+commit 5d50ffd7c31dab47c6b828841ca1ec70a1b40169
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5d50ffd7.failed
+
+Due to some unfortunate history, POSIX locks have very strange and
+unhelpful semantics. The thing that usually catches people by surprise
+is that they are dropped whenever the process closes any file descriptor
+associated with the inode.
+
+This is extremely problematic for people developing file servers that
+need to implement byte-range locks. Developers often need a "lock
+management" facility to ensure that file descriptors are not closed
+until all of the locks associated with the inode are finished.
+
+Additionally, "classic" POSIX locks are owned by the process. Locks
+taken between threads within the same process won't conflict with one
+another, which renders them useless for synchronization between threads.
+
+This patchset adds a new type of lock that attempts to address these
+issues. These locks conflict with classic POSIX read/write locks, but
+have semantics that are more like BSD locks with respect to inheritance
+and behavior on close.
+
+This is implemented primarily by changing how fl_owner field is set for
+these locks. Instead of having them owned by the files_struct of the
+process, they are instead owned by the filp on which they were acquired.
+Thus, they are inherited across fork() and are only released when the
+last reference to a filp is put.
+
+These new semantics prevent them from being merged with classic POSIX
+locks, even if they are acquired by the same process. These locks will
+also conflict with classic POSIX locks even if they are acquired by
+the same process or on the same file descriptor.
+
+The new locks are managed using a new set of cmd values to the fcntl()
+syscall. The initial implementation of this converts these values to
+"classic" cmd values at a fairly high level, and the details are not
+exposed to the underlying filesystem. We may eventually want to push
+this handing out to the lower filesystem code but for now I don't
+see any need for it.
+
+Also, note that with this implementation the new cmd values are only
+available via fcntl64() on 32-bit arches. There's little need to
+add support for legacy apps on a new interface like this.
+
+	Signed-off-by: Jeff Layton <jlayton@redhat.com>
+(cherry picked from commit 5d50ffd7c31dab47c6b828841ca1ec70a1b40169)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/locks.c
+diff --cc fs/locks.c
+index 20dcff562a1d,3b54b98236ee..000000000000
+--- a/fs/locks.c
++++ b/fs/locks.c
+@@@ -2304,7 -2265,9 +2348,13 @@@ void locks_remove_file(struct file *fil
+  	if (!inode->i_flock)
+  		return;
+  
+++<<<<<<< HEAD
+ +	if (filp->f_op && filp->f_op->flock && is_remote_lock(filp)) {
+++=======
++ 	locks_remove_posix(filp, (fl_owner_t)filp);
++ 
++ 	if (filp->f_op->flock) {
+++>>>>>>> 5d50ffd7c31d (locks: add new fcntl cmd values for handling file private locks)
+  		struct file_lock fl = {
+  			.fl_pid = current->tgid,
+  			.fl_file = filp,
+diff --git a/arch/arm/kernel/sys_oabi-compat.c b/arch/arm/kernel/sys_oabi-compat.c
+index 3e94811690ce..702bd329d9d0 100644
+--- a/arch/arm/kernel/sys_oabi-compat.c
++++ b/arch/arm/kernel/sys_oabi-compat.c
+@@ -203,6 +203,9 @@ asmlinkage long sys_oabi_fcntl64(unsigned int fd, unsigned int cmd,
+ 	int ret;
+ 
+ 	switch (cmd) {
++	case F_GETLKP:
++	case F_SETLKP:
++	case F_SETLKPW:
+ 	case F_GETLK64:
+ 	case F_SETLK64:
+ 	case F_SETLKW64:
+diff --git a/fs/compat.c b/fs/compat.c
+index ce28ea16eb65..f30fa02a5be1 100644
+--- a/fs/compat.c
++++ b/fs/compat.c
+@@ -399,12 +399,28 @@ static int put_compat_flock64(struct flock *kfl, struct compat_flock64 __user *u
+ }
+ #endif
+ 
++static unsigned int
++convert_fcntl_cmd(unsigned int cmd)
++{
++	switch (cmd) {
++	case F_GETLK64:
++		return F_GETLK;
++	case F_SETLK64:
++		return F_SETLK;
++	case F_SETLKW64:
++		return F_SETLKW;
++	}
++
++	return cmd;
++}
++
+ asmlinkage long compat_sys_fcntl64(unsigned int fd, unsigned int cmd,
+ 		unsigned long arg)
+ {
+ 	mm_segment_t old_fs;
+ 	struct flock f;
+ 	long ret;
++	unsigned int conv_cmd;
+ 
+ 	switch (cmd) {
+ 	case F_GETLK:
+@@ -441,16 +457,18 @@ asmlinkage long compat_sys_fcntl64(unsigned int fd, unsigned int cmd,
+ 	case F_GETLK64:
+ 	case F_SETLK64:
+ 	case F_SETLKW64:
++	case F_GETLKP:
++	case F_SETLKP:
++	case F_SETLKPW:
+ 		ret = get_compat_flock64(&f, compat_ptr(arg));
+ 		if (ret != 0)
+ 			break;
+ 		old_fs = get_fs();
+ 		set_fs(KERNEL_DS);
+-		ret = sys_fcntl(fd, (cmd == F_GETLK64) ? F_GETLK :
+-				((cmd == F_SETLK64) ? F_SETLK : F_SETLKW),
+-				(unsigned long)&f);
++		conv_cmd = convert_fcntl_cmd(cmd);
++		ret = sys_fcntl(fd, conv_cmd, (unsigned long)&f);
+ 		set_fs(old_fs);
+-		if (cmd == F_GETLK64 && ret == 0) {
++		if ((conv_cmd == F_GETLK || conv_cmd == F_GETLKP) && ret == 0) {
+ 			/* need to return lock information - see above for commentary */
+ 			if (f.l_start > COMPAT_LOFF_T_MAX)
+ 				ret = -EOVERFLOW;
+@@ -471,8 +489,15 @@ asmlinkage long compat_sys_fcntl64(unsigned int fd, unsigned int cmd,
+ asmlinkage long compat_sys_fcntl(unsigned int fd, unsigned int cmd,
+ 		unsigned long arg)
+ {
+-	if ((cmd == F_GETLK64) || (cmd == F_SETLK64) || (cmd == F_SETLKW64))
++	switch (cmd) {
++	case F_GETLK64:
++	case F_SETLK64:
++	case F_SETLKW64:
++	case F_GETLKP:
++	case F_SETLKP:
++	case F_SETLKPW:
+ 		return -EINVAL;
++	}
+ 	return compat_sys_fcntl64(fd, cmd, arg);
+ }
+ 
+diff --git a/fs/fcntl.c b/fs/fcntl.c
+index 7ce6511af2e5..88f20139a671 100644
+--- a/fs/fcntl.c
++++ b/fs/fcntl.c
+@@ -274,9 +274,19 @@ static long do_fcntl(int fd, unsigned int cmd, unsigned long arg,
+ 	case F_SETFL:
+ 		err = setfl(fd, filp, arg);
+ 		break;
++#if BITS_PER_LONG != 32
++	/* 32-bit arches must use fcntl64() */
++	case F_GETLKP:
++#endif
+ 	case F_GETLK:
+ 		err = fcntl_getlk(filp, cmd, (struct flock __user *) arg);
+ 		break;
++#if BITS_PER_LONG != 32
++	/* 32-bit arches must use fcntl64() */
++	case F_SETLKP:
++	case F_SETLKPW:
++#endif
++		/* Fallthrough */
+ 	case F_SETLK:
+ 	case F_SETLKW:
+ 		err = fcntl_setlk(fd, filp, cmd, (struct flock __user *) arg);
+@@ -394,17 +404,20 @@ SYSCALL_DEFINE3(fcntl64, unsigned int, fd, unsigned int, cmd,
+ 		goto out1;
+ 	
+ 	switch (cmd) {
+-		case F_GETLK64:
+-			err = fcntl_getlk64(f.file, cmd, (struct flock64 __user *) arg);
+-			break;
+-		case F_SETLK64:
+-		case F_SETLKW64:
+-			err = fcntl_setlk64(fd, f.file, cmd,
+-					(struct flock64 __user *) arg);
+-			break;
+-		default:
+-			err = do_fcntl(fd, cmd, arg, f.file);
+-			break;
++	case F_GETLK64:
++	case F_GETLKP:
++		err = fcntl_getlk64(f.file, cmd, (struct flock64 __user *) arg);
++		break;
++	case F_SETLK64:
++	case F_SETLKW64:
++	case F_SETLKP:
++	case F_SETLKPW:
++		err = fcntl_setlk64(fd, f.file, cmd,
++				(struct flock64 __user *) arg);
++		break;
++	default:
++		err = do_fcntl(fd, cmd, arg, f.file);
++		break;
+ 	}
+ out1:
+ 	fdput(f);
+* Unmerged path fs/locks.c
+diff --git a/include/uapi/asm-generic/fcntl.h b/include/uapi/asm-generic/fcntl.h
+index 729af84a016e..75104ba0f12a 100644
+--- a/include/uapi/asm-generic/fcntl.h
++++ b/include/uapi/asm-generic/fcntl.h
+@@ -124,6 +124,22 @@
+ #define F_GETOWNER_UIDS	17
+ #endif
+ 
++/*
++ * fd "private" POSIX locks.
++ *
++ * Usually POSIX locks held by a process are released on *any* close and are
++ * not inherited across a fork().
++ *
++ * These cmd values will set locks that conflict with normal POSIX locks, but
++ * are "owned" by the opened file, not the process. This means that they are
++ * inherited across fork() like BSD (flock) locks, and they are only released
++ * automatically when the last reference to the the open file against which
++ * they were acquired is put.
++ */
++#define F_GETLKP	36
++#define F_SETLKP	37
++#define F_SETLKPW	38
++
+ #define F_OWNER_TID	0
+ #define F_OWNER_PID	1
+ #define F_OWNER_PGRP	2
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index 7c150cbbfbc6..5c4aa1a57563 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -3501,6 +3501,9 @@ static int selinux_file_fcntl(struct file *file, unsigned int cmd,
+ 	case F_GETLK:
+ 	case F_SETLK:
+ 	case F_SETLKW:
++	case F_GETLKP:
++	case F_SETLKP:
++	case F_SETLKPW:
+ #if BITS_PER_LONG == 32
+ 	case F_GETLK64:
+ 	case F_SETLK64:
