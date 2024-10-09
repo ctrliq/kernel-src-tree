@@ -1,0 +1,121 @@
+xfs: fix error handling in xfs_bmap_extents_to_btree
+
+jira LE-1907
+cve CVE-2018-13095
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Dave Chinner <dchinner@redhat.com>
+commit e55ec4ddbef9897199c307dfb23167e3801fdaf5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/e55ec4dd.failed
+
+Commit 01239d77b9dd ("xfs: fix a null pointer dereference in
+xfs_bmap_extents_to_btree") attempted to fix a null pointer
+dreference when a fuzzing corruption of some kind was found.
+This fix was flawed, resulting in assert failures like:
+
+XFS: Assertion failed: ifp->if_broot == NULL, file: fs/xfs/libxfs/xfs_bmap.c, line: 715
+.....
+Call Trace:
+  xfs_bmap_extents_to_btree+0x6b9/0x7b0
+  __xfs_bunmapi+0xae7/0xf00
+  ? xfs_log_reserve+0x1c8/0x290
+  xfs_reflink_remap_extent+0x20b/0x620
+  xfs_reflink_remap_blocks+0x7e/0x290
+  xfs_reflink_remap_range+0x311/0x530
+  vfs_dedupe_file_range_one+0xd7/0xe0
+  vfs_dedupe_file_range+0x15b/0x1a0
+  do_vfs_ioctl+0x267/0x6c0
+
+The problem is that the error handling code now asserts that the
+inode fork is not in btree format before the error handling code
+undoes the modifications that put the fork back in extent format.
+Fix this by moving the assert back to after the xfs_iroot_realloc()
+call that returns the fork to extent format, and clean up the jump
+labels to be meaningful.
+
+Also, returning ENOSPC when xfs_btree_get_bufl() fails to
+instantiate the buffer that was allocated (the actual fix in the
+commit mentioned above) is incorrect. This is a fatal error - only
+an invalid block address or a filesystem shutdown can result in
+failing to get a buffer here.
+
+Hence change this to EFSCORRUPTED so that the higher layer knows
+this was a corruption related failure and should not treat it as an
+ENOSPC error.  This should result in a shutdown (via cancelling a
+dirty transaction) which is necessary as we do not attempt to clean
+up the (invalid) block that we have already allocated.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit e55ec4ddbef9897199c307dfb23167e3801fdaf5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_bmap.c
+diff --cc fs/xfs/libxfs/xfs_bmap.c
+index a821827ec13e,a47670332326..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@@ -741,11 -712,15 +742,22 @@@ xfs_bmap_extents_to_btree
+  	args.minlen = args.maxlen = args.prod = 1;
+  	args.wasdel = wasdel;
+  	*logflagsp = 0;
+++<<<<<<< HEAD
+ +	if ((error = xfs_alloc_vextent(&args))) {
+ +		xfs_iroot_realloc(ip, -1, whichfork);
+ +		xfs_btree_del_cursor(cur, XFS_BTREE_ERROR);
+ +		return error;
+++=======
++ 	error = xfs_alloc_vextent(&args);
++ 	if (error)
++ 		goto out_root_realloc;
++ 
++ 	if (WARN_ON_ONCE(args.fsbno == NULLFSBLOCK)) {
++ 		error = -ENOSPC;
++ 		goto out_root_realloc;
+++>>>>>>> e55ec4ddbef9 (xfs: fix error handling in xfs_bmap_extents_to_btree)
+  	}
++ 
+  	/*
+  	 * Allocation can't fail, the space was reserved.
+  	 */
+@@@ -757,6 -731,11 +769,14 @@@
+  	ip->i_d.di_nblocks++;
+  	xfs_trans_mod_dquot_byino(tp, ip, XFS_TRANS_DQ_BCOUNT, 1L);
+  	abp = xfs_btree_get_bufl(mp, tp, args.fsbno, 0);
+++<<<<<<< HEAD
+++=======
++ 	if (!abp) {
++ 		error = -EFSCORRUPTED;
++ 		goto out_unreserve_dquot;
++ 	}
++ 
+++>>>>>>> e55ec4ddbef9 (xfs: fix error handling in xfs_bmap_extents_to_btree)
+  	/*
+  	 * Fill in the child block.
+  	 */
+@@@ -799,6 -775,16 +819,19 @@@
+  	*curp = cur;
+  	*logflagsp = XFS_ILOG_CORE | xfs_ilog_fbroot(whichfork);
+  	return 0;
+++<<<<<<< HEAD
+++=======
++ 
++ out_unreserve_dquot:
++ 	xfs_trans_mod_dquot_byino(tp, ip, XFS_TRANS_DQ_BCOUNT, -1L);
++ out_root_realloc:
++ 	xfs_iroot_realloc(ip, -1, whichfork);
++ 	XFS_IFORK_FMT_SET(ip, whichfork, XFS_DINODE_FMT_EXTENTS);
++ 	ASSERT(ifp->if_broot == NULL);
++ 	xfs_btree_del_cursor(cur, XFS_BTREE_ERROR);
++ 
++ 	return error;
+++>>>>>>> e55ec4ddbef9 (xfs: fix error handling in xfs_bmap_extents_to_btree)
+  }
+  
+  /*
+* Unmerged path fs/xfs/libxfs/xfs_bmap.c
