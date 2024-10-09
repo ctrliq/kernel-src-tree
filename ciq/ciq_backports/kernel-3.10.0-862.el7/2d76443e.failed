@@ -1,0 +1,381 @@
+tcmu: reconfigure netlink attr changes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Mike Christie <mchristi@redhat.com>
+commit 2d76443e02f260d7a5bd0ede1851ae5534f0c68d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/2d76443e.failed
+
+1. TCMU_ATTR_TYPE is too generic when it describes only the
+reconfiguration type, so rename to TCMU_ATTR_RECONFIG_TYPE.
+
+2. Only return the reconfig type when it is a
+TCMU_CMD_RECONFIG_DEVICE command.
+
+3. CONFIG_* type is not needed. We can pass the value along with an
+ATTR to userspace, so it does not need to read sysfs/configfs.
+
+4. Fix leak in tcmu_dev_path_store and rename to dev_config to
+reflect it is more than just a path that can be changed.
+
+6. Don't update kernel struct value if netlink sending fails.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Reviewed-by: "Bryant G. Ly" <bryantly@linux.vnet.ibm.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 2d76443e02f260d7a5bd0ede1851ae5534f0c68d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+#	include/uapi/linux/target_core_user.h
+diff --cc drivers/target/target_core_user.c
+index 5b22226ed5d2,ca5b081295db..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -984,64 -1146,39 +984,70 @@@ static int tcmu_open(struct uio_info *i
+  	return 0;
+  }
+  
+ -static void tcmu_dev_call_rcu(struct rcu_head *p)
+ +static int tcmu_release(struct uio_info *info, struct inode *inode)
+  {
+ -	struct se_device *dev = container_of(p, struct se_device, rcu_head);
+ -	struct tcmu_dev *udev = TCMU_DEV(dev);
+ +	struct tcmu_dev *udev = container_of(info, struct tcmu_dev, uio_info);
+  
+ -	kfree(udev->uio_info.name);
+ -	kfree(udev->name);
+ -	kfree(udev);
+ +	clear_bit(TCMU_DEV_BIT_OPEN, &udev->flags);
+ +
+ +	pr_debug("close\n");
+ +
+ +	return 0;
+  }
+  
+ -static void tcmu_dev_kref_release(struct kref *kref)
+++<<<<<<< HEAD
+ +static void tcmu_init_genl_cmd_reply(struct tcmu_dev *udev, int cmd)
+  {
+ -	struct tcmu_dev *udev = container_of(kref, struct tcmu_dev, kref);
+ -	struct se_device *dev = &udev->se_dev;
+ +	struct tcmu_nl_cmd *nl_cmd = &udev->curr_nl_cmd;
+ +
+ +	if (!tcmu_kern_cmd_reply_supported)
+ +		return;
+ +relock:
+ +	spin_lock(&udev->nl_cmd_lock);
+ +
+ +	if (nl_cmd->cmd != TCMU_CMD_UNSPEC) {
+ +		spin_unlock(&udev->nl_cmd_lock);
+ +		pr_debug("sleeping for open nl cmd\n");
+ +		wait_event(udev->nl_cmd_wq, (nl_cmd->cmd == TCMU_CMD_UNSPEC));
+ +		goto relock;
+ +	}
+  
+ -	call_rcu(&dev->rcu_head, tcmu_dev_call_rcu);
+ +	memset(nl_cmd, 0, sizeof(*nl_cmd));
+ +	nl_cmd->cmd = cmd;
+ +	init_completion(&nl_cmd->complete);
+ +
+ +	spin_unlock(&udev->nl_cmd_lock);
+  }
+  
+ -static int tcmu_release(struct uio_info *info, struct inode *inode)
+ +static int tcmu_wait_genl_cmd_reply(struct tcmu_dev *udev)
+  {
+ -	struct tcmu_dev *udev = container_of(info, struct tcmu_dev, uio_info);
+ +	struct tcmu_nl_cmd *nl_cmd = &udev->curr_nl_cmd;
+ +	int ret;
+ +	DEFINE_WAIT(__wait);
+  
+ -	clear_bit(TCMU_DEV_BIT_OPEN, &udev->flags);
+ +	if (!tcmu_kern_cmd_reply_supported)
+ +		return 0;
+  
+ -	pr_debug("close\n");
+ -	/* release ref from configure */
+ -	kref_put(&udev->kref, tcmu_dev_kref_release);
+ -	return 0;
+ +	pr_debug("sleeping for nl reply\n");
+ +	wait_for_completion(&nl_cmd->complete);
+ +
+ +	spin_lock(&udev->nl_cmd_lock);
+ +	nl_cmd->cmd = TCMU_CMD_UNSPEC;
+ +	ret = nl_cmd->status;
+ +	nl_cmd->status = 0;
+ +	spin_unlock(&udev->nl_cmd_lock);
+ +
+ +	wake_up_all(&udev->nl_cmd_wq);
+ +
+ +       return ret;;
+  }
+  
+ +static int tcmu_netlink_event(struct tcmu_dev *udev, enum tcmu_genl_cmd cmd)
+++=======
++ static int tcmu_netlink_event(enum tcmu_genl_cmd cmd, const char *name,
++ 			      int minor, int reconfig_attr,
++ 			      const void *reconfig_data)
+++>>>>>>> 2d76443e02f2 (tcmu: reconfigure netlink attr changes)
+  {
+  	struct sk_buff *skb;
+  	void *msg_header;
+@@@ -1063,9 -1200,27 +1069,33 @@@
+  	if (ret < 0)
+  		goto free_skb;
+  
+++<<<<<<< HEAD
+ +	ret = nla_put_u32(skb, TCMU_ATTR_DEVICE_ID, udev->dev_index);
+ +	if (ret < 0)
+ +		goto free_skb;
+++=======
++ 	if (cmd == TCMU_CMD_RECONFIG_DEVICE) {
++ 		switch (reconfig_attr) {
++ 		case TCMU_ATTR_DEV_CFG:
++ 			ret = nla_put_string(skb, reconfig_attr, reconfig_data);
++ 			break;
++ 		case TCMU_ATTR_DEV_SIZE:
++ 			ret = nla_put_u64_64bit(skb, reconfig_attr,
++ 						*((u64 *)reconfig_data),
++ 						TCMU_ATTR_PAD);
++ 			break;
++ 		case TCMU_ATTR_WRITECACHE:
++ 			ret = nla_put_u8(skb, reconfig_attr,
++ 					  *((u8 *)reconfig_data));
++ 			break;
++ 		default:
++ 			BUG();
++ 		}
++ 
++ 		if (ret < 0)
++ 			goto free_skb;
++ 	}
+++>>>>>>> 2d76443e02f2 (tcmu: reconfigure netlink attr changes)
+  
+  	genlmsg_end(skb, msg_header);
+  
+@@@ -1166,9 -1314,18 +1196,20 @@@ static int tcmu_configure_device(struc
+  	/* Other attributes can be configured in userspace */
+  	if (!dev->dev_attrib.hw_max_sectors)
+  		dev->dev_attrib.hw_max_sectors = 128;
+ -	if (!dev->dev_attrib.emulate_write_cache)
+ -		dev->dev_attrib.emulate_write_cache = 0;
+  	dev->dev_attrib.hw_queue_depth = 128;
+  
+++<<<<<<< HEAD
+ +	ret = tcmu_netlink_event(udev, TCMU_CMD_ADDED_DEVICE);
+++=======
++ 	/*
++ 	 * Get a ref incase userspace does a close on the uio device before
++ 	 * LIO has initiated tcmu_free_device.
++ 	 */
++ 	kref_get(&udev->kref);
++ 
++ 	ret = tcmu_netlink_event(TCMU_CMD_ADDED_DEVICE, udev->uio_info.name,
++ 				 udev->uio_info.uio_dev->minor, 0, NULL);
+++>>>>>>> 2d76443e02f2 (tcmu: reconfigure netlink attr changes)
+  	if (ret)
+  		goto err_netlink;
+  
+@@@ -1230,17 -1403,17 +1271,22 @@@ static void tcmu_destroy_device(struct 
+  	spin_unlock_irq(&udev->commands_lock);
+  	WARN_ON(!all_expired);
+  
+ -	tcmu_blocks_release(udev);
+ -
+  	if (tcmu_dev_configured(udev)) {
+++<<<<<<< HEAD
+ +		tcmu_netlink_event(udev, TCMU_CMD_REMOVED_DEVICE);
+++=======
++ 		tcmu_netlink_event(TCMU_CMD_REMOVED_DEVICE, udev->uio_info.name,
++ 				   udev->uio_info.uio_dev->minor, 0, NULL);
+++>>>>>>> 2d76443e02f2 (tcmu: reconfigure netlink attr changes)
+  
+  		uio_unregister_device(&udev->uio_info);
+ -	}
+ +		kfree(udev->uio_info.name);
+ +		kfree(udev->name);
+  
+ -	/* release ref from init */
+ -	kref_put(&udev->kref, tcmu_dev_kref_release);
+ +		mutex_lock(&device_mutex);
+ +		idr_remove(&devices_idr, udev->dev_index);
+ +		mutex_unlock(&device_mutex);
+ +	}
+  }
+  
+  enum {
+@@@ -1456,26 -1570,128 +1502,148 @@@ static ssize_t tcmu_dev_store_attr_cmd_
+  	udev->cmd_time_out = val * MSEC_PER_SEC;
+  	return count;
+  }
+ -CONFIGFS_ATTR(tcmu_, cmd_time_out);
+ +TB_DEV_ATTR(tcmu, cmd_time_out, S_IRUGO | S_IWUSR);
+  
+++<<<<<<< HEAD
+ +DEF_TB_DEV_ATTRIB_RO(tcmu, hw_pi_prot_type);
+ +TB_DEV_ATTR_RO(tcmu, hw_pi_prot_type);
+++=======
++ static ssize_t tcmu_dev_config_show(struct config_item *item, char *page)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 						struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
+++>>>>>>> 2d76443e02f2 (tcmu: reconfigure netlink attr changes)
+  
+ -	return snprintf(page, PAGE_SIZE, "%s\n", udev->dev_config);
+ -}
+ +DEF_TB_DEV_ATTRIB_RO(tcmu, hw_block_size);
+ +TB_DEV_ATTR_RO(tcmu, hw_block_size);
+ +
+++<<<<<<< HEAD
+ +DEF_TB_DEV_ATTRIB_RO(tcmu, hw_max_sectors);
+ +TB_DEV_ATTR_RO(tcmu, hw_max_sectors);
+ +
+ +DEF_TB_DEV_ATTRIB_RO(tcmu, hw_queue_depth);
+ +TB_DEV_ATTR_RO(tcmu, hw_queue_depth);
+  
+ +static struct configfs_attribute *tcmu_backend_dev_attrs[] = {
+ +	&tcmu_dev_attrib_hw_pi_prot_type.attr,
+ +	&tcmu_dev_attrib_hw_block_size.attr,
+ +	&tcmu_dev_attrib_hw_max_sectors.attr,
+ +	&tcmu_dev_attrib_hw_queue_depth.attr,
+ +	&tcmu_dev_attrib_cmd_time_out.attr,
+++=======
++ static ssize_t tcmu_dev_config_store(struct config_item *item, const char *page,
++ 				     size_t count)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 						struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 	int ret, len;
++ 
++ 	len = strlen(page);
++ 	if (!len || len > TCMU_CONFIG_LEN - 1)
++ 		return -EINVAL;
++ 
++ 	/* Check if device has been configured before */
++ 	if (tcmu_dev_configured(udev)) {
++ 		ret = tcmu_netlink_event(TCMU_CMD_RECONFIG_DEVICE,
++ 					 udev->uio_info.name,
++ 					 udev->uio_info.uio_dev->minor,
++ 					 TCMU_ATTR_DEV_CFG, page);
++ 		if (ret) {
++ 			pr_err("Unable to reconfigure device\n");
++ 			return ret;
++ 		}
++ 	}
++ 	strlcpy(udev->dev_config, page, TCMU_CONFIG_LEN);
++ 
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, dev_config);
++ 
++ static ssize_t tcmu_dev_size_show(struct config_item *item, char *page)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 						struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 
++ 	return snprintf(page, PAGE_SIZE, "%zu\n", udev->dev_size);
++ }
++ 
++ static ssize_t tcmu_dev_size_store(struct config_item *item, const char *page,
++ 				   size_t count)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 						struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 	u64 val;
++ 	int ret;
++ 
++ 	ret = kstrtou64(page, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	/* Check if device has been configured before */
++ 	if (tcmu_dev_configured(udev)) {
++ 		ret = tcmu_netlink_event(TCMU_CMD_RECONFIG_DEVICE,
++ 					 udev->uio_info.name,
++ 					 udev->uio_info.uio_dev->minor,
++ 					 TCMU_ATTR_DEV_SIZE, &val);
++ 		if (ret) {
++ 			pr_err("Unable to reconfigure device\n");
++ 			return ret;
++ 		}
++ 	}
++ 	udev->dev_size = val;
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, dev_size);
++ 
++ static ssize_t tcmu_emulate_write_cache_show(struct config_item *item,
++ 					     char *page)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 					struct se_dev_attrib, da_group);
++ 
++ 	return snprintf(page, PAGE_SIZE, "%i\n", da->emulate_write_cache);
++ }
++ 
++ static ssize_t tcmu_emulate_write_cache_store(struct config_item *item,
++ 					      const char *page, size_t count)
++ {
++ 	struct se_dev_attrib *da = container_of(to_config_group(item),
++ 					struct se_dev_attrib, da_group);
++ 	struct tcmu_dev *udev = TCMU_DEV(da->da_dev);
++ 	u8 val;
++ 	int ret;
++ 
++ 	ret = kstrtou8(page, 0, &val);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	/* Check if device has been configured before */
++ 	if (tcmu_dev_configured(udev)) {
++ 		ret = tcmu_netlink_event(TCMU_CMD_RECONFIG_DEVICE,
++ 					 udev->uio_info.name,
++ 					 udev->uio_info.uio_dev->minor,
++ 					 TCMU_ATTR_WRITECACHE, &val);
++ 		if (ret) {
++ 			pr_err("Unable to reconfigure device\n");
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	da->emulate_write_cache = val;
++ 	return count;
++ }
++ CONFIGFS_ATTR(tcmu_, emulate_write_cache);
++ 
++ static struct configfs_attribute *tcmu_attrib_attrs[] = {
++ 	&tcmu_attr_cmd_time_out,
++ 	&tcmu_attr_dev_config,
++ 	&tcmu_attr_dev_size,
++ 	&tcmu_attr_emulate_write_cache,
+++>>>>>>> 2d76443e02f2 (tcmu: reconfigure netlink attr changes)
+  	NULL,
+  };
+  
+diff --cc include/uapi/linux/target_core_user.h
+index aff57a0b29a6,4bfc9a1b635c..000000000000
+--- a/include/uapi/linux/target_core_user.h
++++ b/include/uapi/linux/target_core_user.h
+@@@ -147,9 -143,6 +147,12 @@@ enum tcmu_genl_attr 
+  	TCMU_ATTR_DEV_CFG,
+  	TCMU_ATTR_DEV_SIZE,
+  	TCMU_ATTR_WRITECACHE,
+++<<<<<<< HEAD
+ +	TCMU_ATTR_CMD_STATUS,
+ +	TCMU_ATTR_DEVICE_ID,
+ +	TCMU_ATTR_SUPP_KERN_CMD_REPLY,
+++=======
+++>>>>>>> 2d76443e02f2 (tcmu: reconfigure netlink attr changes)
+  	__TCMU_ATTR_MAX,
+  };
+  #define TCMU_ATTR_MAX (__TCMU_ATTR_MAX - 1)
+* Unmerged path drivers/target/target_core_user.c
+* Unmerged path include/uapi/linux/target_core_user.h
