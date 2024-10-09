@@ -1,0 +1,624 @@
+RDMA/uverbs: Add UVERBS_ATTR_CONST_IN to the specs language
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [rdma] uverbs: Add UVERBS_ATTR_CONST_IN to the specs language (Kamal Heib) [1655923]
+Rebuild_FUZZ: 95.58%
+commit-author Mark Bloch <markb@mellanox.com>
+commit 0953fffec9ba022f63bfe01e86427530d8320d5c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/0953fffe.failed
+
+This makes it clear and safe to access constants passed in from user
+space. We define a consistent ABI of u64 for all constants, and verify
+that the data passed in can be represented by the type the user supplies.
+
+The expectation is this will always be used with an enum declaring the
+constant values, and the user will use the enum type as input to the
+accessor.
+
+To retrieve the attribute value we introduce two helper calls - one
+standard which may fail if attribute is not valid and one where caller can
+provide a default value which will be used in case the attribute is not
+valid (useful when attribute is optional).
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Ariel Levkovich <lariel@mellanox.com>
+	Signed-off-by: Mark Bloch <markb@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+(cherry picked from commit 0953fffec9ba022f63bfe01e86427530d8320d5c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/uverbs_ioctl.c
+#	include/rdma/uverbs_ioctl.h
+diff --cc drivers/infiniband/core/uverbs_ioctl.c
+index ec7b453e622b,4bafd4671de2..000000000000
+--- a/drivers/infiniband/core/uverbs_ioctl.c
++++ b/drivers/infiniband/core/uverbs_ioctl.c
+@@@ -429,39 -476,161 +429,178 @@@ long ib_uverbs_ioctl(struct file *filp
+  	struct ib_uverbs_ioctl_hdr __user *user_hdr =
+  		(struct ib_uverbs_ioctl_hdr __user *)arg;
+  	struct ib_uverbs_ioctl_hdr hdr;
+ +	struct ib_device *ib_dev;
+  	int srcu_key;
+ -	int err;
+ +	long err;
+  
+ -	if (unlikely(cmd != RDMA_VERBS_IOCTL))
+ -		return -ENOIOCTLCMD;
+ +	srcu_key = srcu_read_lock(&file->device->disassociate_srcu);
+ +	ib_dev = srcu_dereference(file->device->ib_dev,
+ +				  &file->device->disassociate_srcu);
+ +	if (!ib_dev) {
+ +		err = -EIO;
+ +		goto out;
+ +	}
+  
+ -	err = copy_from_user(&hdr, user_hdr, sizeof(hdr));
+ -	if (err)
+ -		return -EFAULT;
+ +	if (cmd == RDMA_VERBS_IOCTL) {
+ +		err = copy_from_user(&hdr, user_hdr, sizeof(hdr));
+  
+ -	if (hdr.length > PAGE_SIZE ||
+ -	    hdr.length != struct_size(&hdr, attrs, hdr.num_attrs))
+ -		return -EINVAL;
+ +		if (err || hdr.length > IB_UVERBS_MAX_CMD_SZ ||
+ +		    hdr.length != sizeof(hdr) + hdr.num_attrs * sizeof(struct ib_uverbs_attr)) {
+ +			err = -EINVAL;
+ +			goto out;
+ +		}
+  
+ -	if (hdr.reserved1 || hdr.reserved2)
+ -		return -EPROTONOSUPPORT;
+ +		if (hdr.reserved) {
+ +			err = -EPROTONOSUPPORT;
+ +			goto out;
+ +		}
+  
+ -	srcu_key = srcu_read_lock(&file->device->disassociate_srcu);
+ -	err = ib_uverbs_cmd_verbs(file, &hdr, user_hdr->attrs);
+ +		err = ib_uverbs_cmd_verbs(ib_dev, file, &hdr,
+ +					  (__user void *)arg + sizeof(hdr));
+ +	} else {
+ +		err = -ENOIOCTLCMD;
+ +	}
+ +out:
+  	srcu_read_unlock(&file->device->disassociate_srcu, srcu_key);
+ +
+  	return err;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int uverbs_get_flags64(u64 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		       size_t idx, u64 allowed_bits)
++ {
++ 	const struct uverbs_attr *attr;
++ 	u64 flags;
++ 
++ 	attr = uverbs_attr_get(attrs_bundle, idx);
++ 	/* Missing attribute means 0 flags */
++ 	if (IS_ERR(attr)) {
++ 		*to = 0;
++ 		return 0;
++ 	}
++ 
++ 	/*
++ 	 * New userspace code should use 8 bytes to pass flags, but we
++ 	 * transparently support old userspaces that were using 4 bytes as
++ 	 * well.
++ 	 */
++ 	if (attr->ptr_attr.len == 8)
++ 		flags = attr->ptr_attr.data;
++ 	else if (attr->ptr_attr.len == 4)
++ 		flags = *(u32 *)&attr->ptr_attr.data;
++ 	else
++ 		return -EINVAL;
++ 
++ 	if (flags & ~allowed_bits)
++ 		return -EINVAL;
++ 
++ 	*to = flags;
++ 	return 0;
++ }
++ EXPORT_SYMBOL(uverbs_get_flags64);
++ 
++ int uverbs_get_flags32(u32 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		       size_t idx, u64 allowed_bits)
++ {
++ 	u64 flags;
++ 	int ret;
++ 
++ 	ret = uverbs_get_flags64(&flags, attrs_bundle, idx, allowed_bits);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (flags > U32_MAX)
++ 		return -EINVAL;
++ 	*to = flags;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(uverbs_get_flags32);
++ 
++ /*
++  * This is for ease of conversion. The purpose is to convert all drivers to
++  * use uverbs_attr_bundle instead of ib_udata.  Assume attr == 0 is input and
++  * attr == 1 is output.
++  */
++ void create_udata(struct uverbs_attr_bundle *bundle, struct ib_udata *udata)
++ {
++ 	struct bundle_priv *pbundle =
++ 		container_of(bundle, struct bundle_priv, bundle);
++ 	const struct uverbs_attr *uhw_in =
++ 		uverbs_attr_get(bundle, UVERBS_ATTR_UHW_IN);
++ 	const struct uverbs_attr *uhw_out =
++ 		uverbs_attr_get(bundle, UVERBS_ATTR_UHW_OUT);
++ 
++ 	if (!IS_ERR(uhw_in)) {
++ 		udata->inlen = uhw_in->ptr_attr.len;
++ 		if (uverbs_attr_ptr_is_inline(uhw_in))
++ 			udata->inbuf =
++ 				&pbundle->user_attrs[uhw_in->ptr_attr.uattr_idx]
++ 					 .data;
++ 		else
++ 			udata->inbuf = u64_to_user_ptr(uhw_in->ptr_attr.data);
++ 	} else {
++ 		udata->inbuf = NULL;
++ 		udata->inlen = 0;
++ 	}
++ 
++ 	if (!IS_ERR(uhw_out)) {
++ 		udata->outbuf = u64_to_user_ptr(uhw_out->ptr_attr.data);
++ 		udata->outlen = uhw_out->ptr_attr.len;
++ 	} else {
++ 		udata->outbuf = NULL;
++ 		udata->outlen = 0;
++ 	}
++ }
++ 
++ int uverbs_copy_to(const struct uverbs_attr_bundle *bundle, size_t idx,
++ 		   const void *from, size_t size)
++ {
++ 	struct bundle_priv *pbundle =
++ 		container_of(bundle, struct bundle_priv, bundle);
++ 	const struct uverbs_attr *attr = uverbs_attr_get(bundle, idx);
++ 	u16 flags;
++ 	size_t min_size;
++ 
++ 	if (IS_ERR(attr))
++ 		return PTR_ERR(attr);
++ 
++ 	min_size = min_t(size_t, attr->ptr_attr.len, size);
++ 	if (copy_to_user(u64_to_user_ptr(attr->ptr_attr.data), from, min_size))
++ 		return -EFAULT;
++ 
++ 	flags = pbundle->uattrs[attr->ptr_attr.uattr_idx].flags |
++ 		UVERBS_ATTR_F_VALID_OUTPUT;
++ 	if (put_user(flags,
++ 		     &pbundle->user_attrs[attr->ptr_attr.uattr_idx].flags))
++ 		return -EFAULT;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(uverbs_copy_to);
++ 
++ int _uverbs_get_const(s64 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		      size_t idx, s64 lower_bound, u64 upper_bound,
++ 		      s64  *def_val)
++ {
++ 	const struct uverbs_attr *attr;
++ 
++ 	attr = uverbs_attr_get(attrs_bundle, idx);
++ 	if (IS_ERR(attr)) {
++ 		if ((PTR_ERR(attr) != -ENOENT) || !def_val)
++ 			return PTR_ERR(attr);
++ 
++ 		*to = *def_val;
++ 	} else {
++ 		*to = attr->ptr_attr.data;
++ 	}
++ 
++ 	if (*to < lower_bound || (*to > 0 && (u64)*to > upper_bound))
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(_uverbs_get_const);
+++>>>>>>> 0953fffec9ba (RDMA/uverbs: Add UVERBS_ATTR_CONST_IN to the specs language)
+diff --cc include/rdma/uverbs_ioctl.h
+index 2cc45699a237,fc2e52234a2a..000000000000
+--- a/include/rdma/uverbs_ioctl.h
++++ b/include/rdma/uverbs_ioctl.h
+@@@ -192,132 -284,136 +192,141 @@@ struct uverbs_object_tree_def 
+  	const struct uverbs_object_def * const (*objects)[];
+  };
+  
+ -/*
+ - * =======================================
+ - *	Attribute Specifications
+ - * =======================================
+ - */
+ -
+ -#define UVERBS_ATTR_SIZE(_min_len, _len)			\
+ -	.u.ptr.min_len = _min_len, .u.ptr.len = _len
+ +#define UA_FLAGS(_flags)  .flags = _flags
+ +#define __UVERBS_ATTR0(_id, _type, _fld, _attr, ...)              \
+ +	((const struct uverbs_attr_def)				  \
+ +	 {.id = _id, .attr = {{._fld = {.type = _type, _attr, .flags = 0, } }, } })
+ +#define __UVERBS_ATTR1(_id, _type, _fld, _attr, _extra1, ...)      \
+ +	((const struct uverbs_attr_def)				  \
+ +	 {.id = _id, .attr = {{._fld = {.type = _type, _attr, _extra1 } },} })
+ +#define __UVERBS_ATTR2(_id, _type, _fld, _attr, _extra1, _extra2)    \
+ +	((const struct uverbs_attr_def)				  \
+ +	 {.id = _id, .attr = {{._fld = {.type = _type, _attr, _extra1, _extra2 } },} })
+ +#define __UVERBS_ATTR(_id, _type, _fld, _attr, _extra1, _extra2, _n, ...)	\
+ +	__UVERBS_ATTR##_n(_id, _type, _fld, _attr, _extra1, _extra2)
+  
+ -#define UVERBS_ATTR_NO_DATA() UVERBS_ATTR_SIZE(0, 0)
+ -
+ -/*
+ - * Specifies a uapi structure that cannot be extended. The user must always
+ - * supply the whole structure and nothing more. The structure must be declared
+ - * in a header under include/uapi/rdma.
+ - */
+  #define UVERBS_ATTR_TYPE(_type)					\
+ -	.u.ptr.min_len = sizeof(_type), .u.ptr.len = sizeof(_type)
+ -/*
+ - * Specifies a uapi structure where the user must provide at least up to
+ - * member 'last'.  Anything after last and up until the end of the structure
+ - * can be non-zero, anything longer than the end of the structure must be
+ - * zero. The structure must be declared in a header under include/uapi/rdma.
+ - */
+ -#define UVERBS_ATTR_STRUCT(_type, _last)                                       \
+ -	.zero_trailing = 1,                                                    \
+ -	UVERBS_ATTR_SIZE(((uintptr_t)(&((_type *)0)->_last + 1)),              \
+ -			 sizeof(_type))
+ -/*
+ - * Specifies at least min_len bytes must be passed in, but the amount can be
+ - * larger, up to the protocol maximum size. No check for zeroing is done.
+ - */
+ -#define UVERBS_ATTR_MIN_SIZE(_min_len) UVERBS_ATTR_SIZE(_min_len, USHRT_MAX)
+ -
+ -/* Must be used in the '...' of any UVERBS_ATTR */
+ -#define UA_ALLOC_AND_COPY .alloc_and_copy = 1
+ -#define UA_MANDATORY .mandatory = 1
+ -#define UA_OPTIONAL .mandatory = 0
+ -
+ -#define UVERBS_ATTR_IDR(_attr_id, _idr_type, _access, ...)                     \
+ -	(&(const struct uverbs_attr_def){                                      \
+ -		.id = _attr_id,                                                \
+ -		.attr = { .type = UVERBS_ATTR_TYPE_IDR,                        \
+ -			  .u.obj.obj_type = _idr_type,                         \
+ -			  .u.obj.access = _access,                             \
+ -			  __VA_ARGS__ } })
+ -
+ -#define UVERBS_ATTR_FD(_attr_id, _fd_type, _access, ...)                       \
+ -	(&(const struct uverbs_attr_def){                                      \
+ -		.id = (_attr_id) +                                             \
+ -		      BUILD_BUG_ON_ZERO((_access) != UVERBS_ACCESS_NEW &&      \
+ -					(_access) != UVERBS_ACCESS_READ),      \
+ -		.attr = { .type = UVERBS_ATTR_TYPE_FD,                         \
+ -			  .u.obj.obj_type = _fd_type,                          \
+ -			  .u.obj.access = _access,                             \
+ -			  __VA_ARGS__ } })
+ -
+ -#define UVERBS_ATTR_PTR_IN(_attr_id, _type, ...)                               \
+ -	(&(const struct uverbs_attr_def){                                      \
+ -		.id = _attr_id,                                                \
+ -		.attr = { .type = UVERBS_ATTR_TYPE_PTR_IN,                     \
+ -			  _type,                                               \
+ -			  __VA_ARGS__ } })
+ -
+ -#define UVERBS_ATTR_PTR_OUT(_attr_id, _type, ...)                              \
+ -	(&(const struct uverbs_attr_def){                                      \
+ -		.id = _attr_id,                                                \
+ -		.attr = { .type = UVERBS_ATTR_TYPE_PTR_OUT,                    \
+ -			  _type,                                               \
+ -			  __VA_ARGS__ } })
+ -
+ -/* _enum_arry should be a 'static const union uverbs_attr_spec[]' */
+ -#define UVERBS_ATTR_ENUM_IN(_attr_id, _enum_arr, ...)                          \
+ -	(&(const struct uverbs_attr_def){                                      \
+ -		.id = _attr_id,                                                \
+ -		.attr = { .type = UVERBS_ATTR_TYPE_ENUM_IN,                    \
+ -			  .u2.enum_def.ids = _enum_arr,                        \
+ -			  .u.enum_def.num_elems = ARRAY_SIZE(_enum_arr),       \
+ -			  __VA_ARGS__ },                                       \
+ -	})
+ +	.min_len = sizeof(_type), .len = sizeof(_type)
+ +#define UVERBS_ATTR_STRUCT(_type, _last)			\
+ +	.min_len = ((uintptr_t)(&((_type *)0)->_last + 1)), .len = sizeof(_type)
+ +#define UVERBS_ATTR_SIZE(_min_len, _len)			\
+ +	.min_len = _min_len, .len = _len
+ +#define UVERBS_ATTR_MIN_SIZE(_min_len)				\
+ +	UVERBS_ATTR_SIZE(_min_len, USHRT_MAX)
+  
++ /* An input value that is a member in the enum _enum_type. */
++ #define UVERBS_ATTR_CONST_IN(_attr_id, _enum_type, ...)                        \
++ 	UVERBS_ATTR_PTR_IN(                                                    \
++ 		_attr_id,                                                      \
++ 		UVERBS_ATTR_SIZE(                                              \
++ 			sizeof(u64) + BUILD_BUG_ON_ZERO(!sizeof(_enum_type)),  \
++ 			sizeof(u64)),                                          \
++ 		__VA_ARGS__)
++ 
+  /*
+ - * An input value that is a bitwise combination of values of _enum_type.
+ - * This permits the flag value to be passed as either a u32 or u64, it must
+ - * be retrieved via uverbs_get_flag().
+ - */
+ -#define UVERBS_ATTR_FLAGS_IN(_attr_id, _enum_type, ...)                        \
+ -	UVERBS_ATTR_PTR_IN(                                                    \
+ -		_attr_id,                                                      \
+ -		UVERBS_ATTR_SIZE(sizeof(u32) + BUILD_BUG_ON_ZERO(              \
+ -						       !sizeof(_enum_type *)), \
+ -				 sizeof(u64)),                                 \
+ -		__VA_ARGS__)
+ -
+ -/*
+ - * This spec is used in order to pass information to the hardware driver in a
+ - * legacy way. Every verb that could get driver specific data should get this
+ - * spec.
+ + * In new compiler, UVERBS_ATTR could be simplified by declaring it as
+ + * [_id] = {.type = _type, .len = _len, ##__VA_ARGS__}
+ + * But since we support older compilers too, we need the more complex code.
+   */
+ -#define UVERBS_ATTR_UHW()                                                      \
+ -	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_UHW_IN,                                 \
+ -			   UVERBS_ATTR_MIN_SIZE(0),			       \
+ -			   UA_OPTIONAL),				       \
+ -	UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_UHW_OUT,                               \
+ -			    UVERBS_ATTR_MIN_SIZE(0),			       \
+ -			    UA_OPTIONAL)
+ +#define UVERBS_ATTR(_id, _type, _fld, _attr, ...)			\
+ +	__UVERBS_ATTR(_id, _type, _fld, _attr, ##__VA_ARGS__, 2, 1, 0)
+ +#define UVERBS_ATTR_PTR_IN_SZ(_id, _len, ...)				\
+ +	UVERBS_ATTR(_id, UVERBS_ATTR_TYPE_PTR_IN, ptr, _len, ##__VA_ARGS__)
+ +/* If sizeof(_type) <= sizeof(u64), this will be inlined rather than a pointer */
+ +#define UVERBS_ATTR_PTR_IN(_id, _type, ...)				\
+ +	UVERBS_ATTR_PTR_IN_SZ(_id, _type, ##__VA_ARGS__)
+ +#define UVERBS_ATTR_PTR_OUT_SZ(_id, _len, ...)				\
+ +	UVERBS_ATTR(_id, UVERBS_ATTR_TYPE_PTR_OUT, ptr, _len, ##__VA_ARGS__)
+ +#define UVERBS_ATTR_PTR_OUT(_id, _type, ...)				\
+ +	UVERBS_ATTR_PTR_OUT_SZ(_id, _type, ##__VA_ARGS__)
+ +#define UVERBS_ATTR_ENUM_IN(_id, _enum_arr, ...)			\
+ +	UVERBS_ATTR(_id, UVERBS_ATTR_TYPE_ENUM_IN, enum_def,		\
+ +		    .ids = (_enum_arr),					\
+ +		    .num_elems = ARRAY_SIZE(_enum_arr), ##__VA_ARGS__)
+  
+  /*
+ - * =======================================
+ - *	Declaration helpers
+ - * =======================================
+ + * In new compiler, UVERBS_ATTR_IDR (and FD) could be simplified by declaring
+ + * it as
+ + * {.id = _id,								\
+ + *  .attr {.type = __obj_class,						\
+ + *         .obj = {.obj_type = _idr_type,				\
+ + *                       .access = _access                              \
+ + *                }, ##__VA_ARGS__ } }
+ + * But since we support older compilers too, we need the more complex code.
+   */
+ -
+ -#define DECLARE_UVERBS_OBJECT_TREE(_name, ...)                                 \
+ -	static const struct uverbs_object_def *const _name##_ptr[] = {         \
+ -		__VA_ARGS__,                                                   \
+ -	};                                                                     \
+ -	static const struct uverbs_object_tree_def _name = {                   \
+ -		.num_objects = ARRAY_SIZE(_name##_ptr),                        \
+ -		.objects = &_name##_ptr,                                       \
+ +#define ___UVERBS_ATTR_OBJ0(_id, _obj_class, _obj_type, _access, ...)\
+ +	((const struct uverbs_attr_def)					\
+ +	{.id = _id,							\
+ +	 .attr = { {.obj = {.type = _obj_class, .obj_type = _obj_type,	\
+ +			    .access = _access, .flags = 0 } }, } })
+ +#define ___UVERBS_ATTR_OBJ1(_id, _obj_class, _obj_type, _access, _flags)\
+ +	((const struct uverbs_attr_def)					\
+ +	{.id = _id,							\
+ +	.attr = { {.obj = {.type = _obj_class, .obj_type = _obj_type,	\
+ +			   .access = _access, _flags} }, } })
+ +#define ___UVERBS_ATTR_OBJ(_id, _obj_class, _obj_type, _access, _flags, \
+ +			   _n, ...)					\
+ +	___UVERBS_ATTR_OBJ##_n(_id, _obj_class, _obj_type, _access, _flags)
+ +#define __UVERBS_ATTR_OBJ(_id, _obj_class, _obj_type, _access, ...)	\
+ +	___UVERBS_ATTR_OBJ(_id, _obj_class, _obj_type, _access,		\
+ +			   ##__VA_ARGS__, 1, 0)
+ +#define UVERBS_ATTR_IDR(_id, _idr_type, _access, ...)			 \
+ +	__UVERBS_ATTR_OBJ(_id, UVERBS_ATTR_TYPE_IDR, _idr_type, _access,\
+ +			  ##__VA_ARGS__)
+ +#define UVERBS_ATTR_FD(_id, _fd_type, _access, ...)			\
+ +	__UVERBS_ATTR_OBJ(_id, UVERBS_ATTR_TYPE_FD, _fd_type,		\
+ +			  (_access) + BUILD_BUG_ON_ZERO(		\
+ +				(_access) != UVERBS_ACCESS_NEW &&	\
+ +				(_access) != UVERBS_ACCESS_READ),	\
+ +			  ##__VA_ARGS__)
+ +#define DECLARE_UVERBS_ATTR_SPEC(_name, ...)				\
+ +	const struct uverbs_attr_def _name = __VA_ARGS__
+ +
+ +#define DECLARE_UVERBS_ENUM(_name, ...)					\
+ +	const struct uverbs_enum_spec _name = {				\
+ +		.len = ARRAY_SIZE(((struct uverbs_attr_spec[]){__VA_ARGS__})),\
+ +		.ids = {__VA_ARGS__},					\
+  	}
+ +#define _UVERBS_METHOD_ATTRS_SZ(...)					\
+ +	(sizeof((const struct uverbs_attr_def * const []){__VA_ARGS__}) /\
+ +	 sizeof(const struct uverbs_attr_def *))
+ +#define _UVERBS_METHOD(_id, _handler, _flags, ...)			\
+ +	((const struct uverbs_method_def) {				\
+ +	 .id = _id,							\
+ +	 .flags = _flags,						\
+ +	 .handler = _handler,						\
+ +	 .num_attrs = _UVERBS_METHOD_ATTRS_SZ(__VA_ARGS__),		\
+ +	 .attrs = &(const struct uverbs_attr_def * const []){__VA_ARGS__} })
+ +#define DECLARE_UVERBS_METHOD(_name, _id, _handler, ...)		\
+ +	const struct uverbs_method_def _name =				\
+ +		_UVERBS_METHOD(_id, _handler, 0, ##__VA_ARGS__)
+ +#define DECLARE_UVERBS_CTX_METHOD(_name, _id, _handler, _flags, ...)	\
+ +	const struct uverbs_method_def _name =				\
+ +		_UVERBS_METHOD(_id, _handler,				\
+ +			       UVERBS_ACTION_FLAG_CREATE_ROOT,		\
+ +			       ##__VA_ARGS__)
+ +#define _UVERBS_OBJECT_METHODS_SZ(...)					\
+ +	(sizeof((const struct uverbs_method_def * const []){__VA_ARGS__}) / \
+ +	 sizeof(const struct uverbs_method_def *))
+ +#define _UVERBS_OBJECT(_id, _type_attrs, ...)				\
+ +	((const struct uverbs_object_def) {				\
+ +	 .id = _id,							\
+ +	 .type_attrs = _type_attrs,					\
+ +	 .num_methods = _UVERBS_OBJECT_METHODS_SZ(__VA_ARGS__),		\
+ +	 .methods = &(const struct uverbs_method_def * const []){__VA_ARGS__} })
+ +#define DECLARE_UVERBS_OBJECT(_name, _id, _type_attrs, ...)		\
+ +	const struct uverbs_object_def _name =				\
+ +		_UVERBS_OBJECT(_id, _type_attrs, ##__VA_ARGS__)
+ +#define _UVERBS_TREE_OBJECTS_SZ(...)					\
+ +	(sizeof((const struct uverbs_object_def * const []){__VA_ARGS__}) / \
+ +	 sizeof(const struct uverbs_object_def *))
+ +#define _UVERBS_OBJECT_TREE(...)					\
+ +	((const struct uverbs_object_tree_def) {			\
+ +	 .num_objects = _UVERBS_TREE_OBJECTS_SZ(__VA_ARGS__),		\
+ +	 .objects = &(const struct uverbs_object_def * const []){__VA_ARGS__} })
+ +#define DECLARE_UVERBS_OBJECT_TREE(_name, ...)				\
+ +	const struct uverbs_object_tree_def _name =			\
+ +		_UVERBS_OBJECT_TREE(__VA_ARGS__)
+  
+  /* =================================================
+   *              Parsing infrastructure
+@@@ -490,55 -591,86 +499,109 @@@ static inline int _uverbs_copy_from_or_
+  #define uverbs_copy_from_or_zero(to, attrs_bundle, idx)			      \
+  	_uverbs_copy_from_or_zero(to, attrs_bundle, idx, sizeof(*to))
+  
+ +/* =================================================
+ + *	 Definitions -> Specs infrastructure
+ + * =================================================
+ + */
+ +
+ +/*
+ + * uverbs_alloc_spec_tree - Merges different common and driver specific feature
+ + *	into one parsing tree that every uverbs command will be parsed upon.
+ + *
+ + * @num_trees: Number of trees in the array @trees.
+ + * @trees: Array of pointers to tree root definitions to merge. Each such tree
+ + *	   possibly contains objects, methods and attributes definitions.
+ + *
+ + * Returns:
+ + *	uverbs_root_spec *: The root of the merged parsing tree.
+ + *	On error, we return an error code. Error is checked via IS_ERR.
+ + *
+ + * The following merges could take place:
+ + * a. Two trees representing the same method with different handler
+ + *	-> We take the handler of the tree that its handler != NULL
+ + *	   and its index in the trees array is greater. The incentive for that
+ + *	   is that developers are expected to first merge common trees and then
+ + *	   merge trees that gives specialized the behaviour.
+ + * b. Two trees representing the same object with different
+ + *    type_attrs (struct uverbs_obj_type):
+ + *	-> We take the type_attrs of the tree that its type_attr != NULL
+ + *	   and its index in the trees array is greater. This could be used
+ + *	   in order to override the free function, allocation size, etc.
+ + * c. Two trees representing the same method attribute (same id but possibly
+ + *    different attributes):
+ + *	-> ERROR (-ENOENT), we believe that's not the programmer's intent.
+ + *
+ + * An object without any methods is considered invalid and will abort the
+ + * function with -ENOENT error.
+ + */
+  #if IS_ENABLED(CONFIG_INFINIBAND_USER_ACCESS)
+++<<<<<<< HEAD
+ +struct uverbs_root_spec *uverbs_alloc_spec_tree(unsigned int num_trees,
+ +						const struct uverbs_object_tree_def **trees);
+ +void uverbs_free_spec_tree(struct uverbs_root_spec *root);
+++=======
++ int uverbs_get_flags64(u64 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		       size_t idx, u64 allowed_bits);
++ int uverbs_get_flags32(u32 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		       size_t idx, u64 allowed_bits);
++ int uverbs_copy_to(const struct uverbs_attr_bundle *attrs_bundle, size_t idx,
++ 		   const void *from, size_t size);
++ __malloc void *_uverbs_alloc(struct uverbs_attr_bundle *bundle, size_t size,
++ 			     gfp_t flags);
++ 
++ static inline __malloc void *uverbs_alloc(struct uverbs_attr_bundle *bundle,
++ 					  size_t size)
++ {
++ 	return _uverbs_alloc(bundle, size, GFP_KERNEL);
++ }
++ 
++ static inline __malloc void *uverbs_zalloc(struct uverbs_attr_bundle *bundle,
++ 					   size_t size)
++ {
++ 	return _uverbs_alloc(bundle, size, GFP_KERNEL | __GFP_ZERO);
++ }
++ int _uverbs_get_const(s64 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		      size_t idx, s64 lower_bound, u64 upper_bound,
++ 		      s64 *def_val);
+++>>>>>>> 0953fffec9ba (RDMA/uverbs: Add UVERBS_ATTR_CONST_IN to the specs language)
+  #else
+ -static inline int
+ -uverbs_get_flags64(u64 *to, const struct uverbs_attr_bundle *attrs_bundle,
+ -		   size_t idx, u64 allowed_bits)
+ -{
+ -	return -EINVAL;
+ -}
+ -static inline int
+ -uverbs_get_flags32(u32 *to, const struct uverbs_attr_bundle *attrs_bundle,
+ -		   size_t idx, u64 allowed_bits)
+ +static inline struct uverbs_root_spec *uverbs_alloc_spec_tree(unsigned int num_trees,
+ +							      const struct uverbs_object_tree_def **trees)
+  {
+ -	return -EINVAL;
+ +	return NULL;
+  }
+ -static inline int uverbs_copy_to(const struct uverbs_attr_bundle *attrs_bundle,
+ -				 size_t idx, const void *from, size_t size)
+ -{
+ -	return -EINVAL;
+ -}
+ -static inline __malloc void *uverbs_alloc(struct uverbs_attr_bundle *bundle,
+ -					  size_t size)
+ -{
+ -	return ERR_PTR(-EINVAL);
+ -}
+ -static inline __malloc void *uverbs_zalloc(struct uverbs_attr_bundle *bundle,
+ -					   size_t size)
+ +
+ +static inline void uverbs_free_spec_tree(struct uverbs_root_spec *root)
+  {
+ -	return ERR_PTR(-EINVAL);
+  }
++ static inline int
++ _uverbs_get_const(s64 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		  size_t idx, s64 lower_bound, u64 upper_bound,
++ 		  s64 *def_val)
++ {
++ 	return -EINVAL;
++ }
+  #endif
+  
++ #define uverbs_get_const(_to, _attrs_bundle, _idx)                             \
++ 	({                                                                     \
++ 		s64 _val;                                                      \
++ 		int _ret = _uverbs_get_const(&_val, _attrs_bundle, _idx,       \
++ 					     type_min(typeof(*_to)),           \
++ 					     type_max(typeof(*_to)), NULL);    \
++ 		(*_to) = _val;                                                 \
++ 		_ret;                                                          \
++ 	})
++ 
++ #define uverbs_get_const_default(_to, _attrs_bundle, _idx, _default)           \
++ 	({                                                                     \
++ 		s64 _val;                                                      \
++ 		s64 _def_val = _default;                                       \
++ 		int _ret =                                                     \
++ 			_uverbs_get_const(&_val, _attrs_bundle, _idx,          \
++ 					  type_min(typeof(*_to)),              \
++ 					  type_max(typeof(*_to)), &_def_val);  \
++ 		(*_to) = _val;                                                 \
++ 		_ret;                                                          \
++ 	})
+  #endif
+* Unmerged path drivers/infiniband/core/uverbs_ioctl.c
+* Unmerged path include/rdma/uverbs_ioctl.h
