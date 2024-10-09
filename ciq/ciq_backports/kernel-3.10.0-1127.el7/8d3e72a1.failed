@@ -1,0 +1,111 @@
+iomap: don't mark the inode dirty in iomap_write_end
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 8d3e72a180b42c01ec00045e1bb8eb91175adafe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/8d3e72a1.failed
+
+Marking the inode dirty for each page copied into the page cache can be
+very inefficient for file systems that use the VFS dirty inode tracking,
+and is completely pointless for those that don't use the VFS dirty inode
+tracking.  So instead, only set an iomap flag when changing the in-core
+inode size, and open code the rest of __generic_write_end.
+
+Partially based on code from Christoph Hellwig.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 8d3e72a180b42c01ec00045e1bb8eb91175adafe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/iomap.c
+#	include/linux/iomap.h
+diff --cc fs/iomap.c
+index b368e069ba43,c4acf69b7196..000000000000
+--- a/fs/iomap.c
++++ b/fs/iomap.c
+@@@ -183,18 -772,35 +183,42 @@@ static in
+  iomap_write_end(struct inode *inode, loff_t pos, unsigned len,
+  		unsigned copied, struct page *page, struct iomap *iomap)
+  {
+++<<<<<<< HEAD
+++=======
++ 	const struct iomap_page_ops *page_ops = iomap->page_ops;
++ 	loff_t old_size = inode->i_size;
+++>>>>>>> 8d3e72a180b4 (iomap: don't mark the inode dirty in iomap_write_end)
+  	int ret;
+  
+  	if (iomap->type == IOMAP_INLINE) {
+ -		ret = iomap_write_end_inline(inode, page, iomap, pos, copied);
+ -	} else if (iomap->flags & IOMAP_F_BUFFER_HEAD) {
+ -		ret = block_write_end(NULL, inode->i_mapping, pos, len, copied,
+ -				page, NULL);
+ +		ret = iomap_write_end_inline(inode, page, iomap, pos, len,
+ +				copied);
+  	} else {
+ -		ret = __iomap_write_end(inode, pos, len, copied, page, iomap);
+ +		ret = generic_write_end(NULL, inode->i_mapping, pos, len,
+ +				copied, page, NULL);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (iomap->page_done)
+ +		iomap->page_done(inode, pos, copied, page, iomap);
+++=======
++ 	/*
++ 	 * Update the in-memory inode size after copying the data into the page
++ 	 * cache.  It's up to the file system to write the updated size to disk,
++ 	 * preferably after I/O completion so that no stale data is exposed.
++ 	 */
++ 	if (pos + ret > old_size) {
++ 		i_size_write(inode, pos + ret);
++ 		iomap->flags |= IOMAP_F_SIZE_CHANGED;
++ 	}
++ 	unlock_page(page);
++ 
++ 	if (old_size < pos)
++ 		pagecache_isize_extended(inode, old_size, pos);
++ 	if (page_ops && page_ops->page_done)
++ 		page_ops->page_done(inode, pos, copied, page, iomap);
++ 	put_page(page);
+++>>>>>>> 8d3e72a180b4 (iomap: don't mark the inode dirty in iomap_write_end)
+  
+  	if (ret < len)
+  		iomap_write_failed(inode, pos, len);
+diff --cc include/linux/iomap.h
+index 10bfcd107955,1df9ea187a9a..000000000000
+--- a/include/linux/iomap.h
++++ b/include/linux/iomap.h
+@@@ -30,6 -34,8 +30,11 @@@ struct vm_fault
+   */
+  #define IOMAP_F_NEW		0x01	/* blocks have been newly allocated */
+  #define IOMAP_F_DIRTY		0x02	/* uncommitted metadata */
+++<<<<<<< HEAD
+++=======
++ #define IOMAP_F_BUFFER_HEAD	0x04	/* file system requires buffer heads */
++ #define IOMAP_F_SIZE_CHANGED	0x08	/* file size has changed */
+++>>>>>>> 8d3e72a180b4 (iomap: don't mark the inode dirty in iomap_write_end)
+  
+  /*
+   * Flags that only need to be reported for IOMAP_REPORT requests:
+diff --git a/fs/gfs2/bmap.c b/fs/gfs2/bmap.c
+index cbb60a8063dc..6ac325fd79a4 100644
+--- a/fs/gfs2/bmap.c
++++ b/fs/gfs2/bmap.c
+@@ -1122,6 +1122,8 @@ static int gfs2_iomap_end(struct inode *inode, loff_t pos, loff_t length,
+ 
+ 	if (ip->i_qadata && ip->i_qadata->qa_qd_num)
+ 		gfs2_quota_unlock(ip);
++	if (iomap->flags & IOMAP_F_SIZE_CHANGED)
++		mark_inode_dirty(inode);
+ 	gfs2_write_unlock(inode);
+ 
+ out:
+* Unmerged path fs/iomap.c
+* Unmerged path include/linux/iomap.h
