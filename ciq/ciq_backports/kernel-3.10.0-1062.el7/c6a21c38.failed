@@ -1,0 +1,148 @@
+IB/mlx5: Change TX affinity assignment in RoCE LAG mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Majd Dibbiny <majd@mellanox.com>
+commit c6a21c3864fc7f5febae7d096cd136f397c791f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/c6a21c38.failed
+
+In the current code, the TX affinity is per RoCE device, which can cause
+unfairness between different contexts. e.g. if we open two contexts, and
+each open 10 QPs concurrently, all of the QPs of the first context might
+end up on the first port instead of distributed on the two ports as
+expected
+
+To overcome this unfairness between processes, we maintain per device TX
+affinity, and per process TX affinity.
+
+The allocation algorithm is as follow:
+
+1. Hold two tx_port_affinity atomic variables, one per RoCE device and one
+   per ucontext. Both initialized to 0.
+
+2. In mlx5_ib_alloc_ucontext do:
+ 2.1. ucontext.tx_port_affinity = device.tx_port_affinity
+ 2.2. device.tx_port_affinity += 1
+
+3. In modify QP INIT2RST:
+ 3.1. qp.tx_port_affinity = ucontext.tx_port_affinity % MLX5_PORT_NUM
+ 3.2. ucontext.tx_port_affinity += 1
+
+	Signed-off-by: Majd Dibbiny <majd@mellanox.com>
+	Reviewed-by: Moni Shoua <monis@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit c6a21c3864fc7f5febae7d096cd136f397c791f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 71b1991d86b3,387a6ec1ce3b..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -125,6 -137,10 +125,13 @@@ struct mlx5_ib_ucontext 
+  	struct mutex		vma_private_list_mutex;
+  
+  	u64			lib_caps;
+++<<<<<<< HEAD
+++=======
++ 	DECLARE_BITMAP(dm_pages, MLX5_MAX_MEMIC_PAGES);
++ 	u16			devx_uid;
++ 	/* For RoCE LAG TX affinity */
++ 	atomic_t		tx_port_affinity;
+++>>>>>>> c6a21c3864fc (IB/mlx5: Change TX affinity assignment in RoCE LAG mode)
+  };
+  
+  static inline struct mlx5_ib_ucontext *to_mucontext(struct ib_ucontext *ibucontext)
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index 1d3555c545d0..0a1004398c0d 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -1831,6 +1831,14 @@ static struct ib_ucontext *mlx5_ib_alloc_ucontext(struct ib_device *ibdev,
+ 	context->lib_caps = req.lib_caps;
+ 	print_lib_caps(dev, context->lib_caps);
+ 
++	if (mlx5_lag_is_active(dev->mdev)) {
++		u8 port = mlx5_core_native_port_num(dev->mdev);
++
++		atomic_set(&context->tx_port_affinity,
++			   atomic_add_return(
++				   1, &dev->roce[port].tx_port_affinity));
++	}
++
+ 	return &context->ibucontext;
+ 
+ out_td:
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
+diff --git a/drivers/infiniband/hw/mlx5/qp.c b/drivers/infiniband/hw/mlx5/qp.c
+index f4d4c645a971..dbd797f60da2 100644
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@ -2908,6 +2908,37 @@ static int modify_raw_packet_qp(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp,
+ 	return 0;
+ }
+ 
++static unsigned int get_tx_affinity(struct mlx5_ib_dev *dev,
++				    struct mlx5_ib_pd *pd,
++				    struct mlx5_ib_qp_base *qp_base,
++				    u8 port_num)
++{
++	struct mlx5_ib_ucontext *ucontext = NULL;
++	unsigned int tx_port_affinity;
++
++	if (pd && pd->ibpd.uobject && pd->ibpd.uobject->context)
++		ucontext = to_mucontext(pd->ibpd.uobject->context);
++
++	if (ucontext) {
++		tx_port_affinity = (unsigned int)atomic_add_return(
++					   1, &ucontext->tx_port_affinity) %
++					   MLX5_MAX_PORTS +
++				   1;
++		mlx5_ib_dbg(dev, "Set tx affinity 0x%x to qpn 0x%x ucontext %p\n",
++				tx_port_affinity, qp_base->mqp.qpn, ucontext);
++	} else {
++		tx_port_affinity =
++			(unsigned int)atomic_add_return(
++				1, &dev->roce[port_num].tx_port_affinity) %
++				MLX5_MAX_PORTS +
++			1;
++		mlx5_ib_dbg(dev, "Set tx affinity 0x%x to qpn 0x%x\n",
++				tx_port_affinity, qp_base->mqp.qpn);
++	}
++
++	return tx_port_affinity;
++}
++
+ static int __mlx5_ib_modify_qp(struct ib_qp *ibqp,
+ 			       const struct ib_qp_attr *attr, int attr_mask,
+ 			       enum ib_qp_state cur_state, enum ib_qp_state new_state,
+@@ -2973,6 +3004,7 @@ static int __mlx5_ib_modify_qp(struct ib_qp *ibqp,
+ 	if (!context)
+ 		return -ENOMEM;
+ 
++	pd = get_pd(qp);
+ 	context->flags = cpu_to_be32(mlx5_st << 16);
+ 
+ 	if (!(attr_mask & IB_QP_PATH_MIG_STATE)) {
+@@ -3001,9 +3033,7 @@ static int __mlx5_ib_modify_qp(struct ib_qp *ibqp,
+ 		    (ibqp->qp_type == IB_QPT_XRC_TGT)) {
+ 			if (mlx5_lag_is_active(dev->mdev)) {
+ 				u8 p = mlx5_core_native_port_num(dev->mdev);
+-				tx_affinity = (unsigned int)atomic_add_return(1,
+-						&dev->roce[p].next_port) %
+-						MLX5_MAX_PORTS + 1;
++				tx_affinity = get_tx_affinity(dev, pd, base, p);
+ 				context->flags |= cpu_to_be32(tx_affinity << 24);
+ 			}
+ 		}
+@@ -3061,7 +3091,6 @@ static int __mlx5_ib_modify_qp(struct ib_qp *ibqp,
+ 			goto out;
+ 	}
+ 
+-	pd = get_pd(qp);
+ 	get_cqs(qp->ibqp.qp_type, qp->ibqp.send_cq, qp->ibqp.recv_cq,
+ 		&send_cq, &recv_cq);
+ 
