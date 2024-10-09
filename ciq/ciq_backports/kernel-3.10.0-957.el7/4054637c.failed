@@ -1,0 +1,92 @@
+nvme: flush reset_work before safely continuing with delete operation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [nvme] flush reset_work before safely continuing with delete operation (David Milburn) [1519689]
+Rebuild_FUZZ: 95.45%
+commit-author Sagi Grimberg <sagi@grimberg.me>
+commit 4054637c9b4fbe9feef0cf6f2516ef00d8053560
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/4054637c.failed
+
+Prevent racing controller reset and delete flows. reset_work must not
+ever self-requeue so flushing it suffices.
+
+	Reported-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 4054637c9b4fbe9feef0cf6f2516ef00d8053560)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index 7c0569923504,003314eb6341..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -100,7 -97,47 +100,51 @@@ static int nvme_reset_ctrl_sync(struct 
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int nvme_error_status(struct request *req)
+++=======
++ static void nvme_delete_ctrl_work(struct work_struct *work)
++ {
++ 	struct nvme_ctrl *ctrl =
++ 		container_of(work, struct nvme_ctrl, delete_work);
++ 
++ 	flush_work(&ctrl->reset_work);
++ 	nvme_stop_ctrl(ctrl);
++ 	nvme_remove_namespaces(ctrl);
++ 	ctrl->ops->delete_ctrl(ctrl);
++ 	nvme_uninit_ctrl(ctrl);
++ 	nvme_put_ctrl(ctrl);
++ }
++ 
++ int nvme_delete_ctrl(struct nvme_ctrl *ctrl)
++ {
++ 	if (!nvme_change_ctrl_state(ctrl, NVME_CTRL_DELETING))
++ 		return -EBUSY;
++ 	if (!queue_work(nvme_wq, &ctrl->delete_work))
++ 		return -EBUSY;
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(nvme_delete_ctrl);
++ 
++ int nvme_delete_ctrl_sync(struct nvme_ctrl *ctrl)
++ {
++ 	int ret = 0;
++ 
++ 	/*
++ 	 * Keep a reference until the work is flushed since ->delete_ctrl
++ 	 * can free the controller.
++ 	 */
++ 	nvme_get_ctrl(ctrl);
++ 	ret = nvme_delete_ctrl(ctrl);
++ 	if (!ret)
++ 		flush_work(&ctrl->delete_work);
++ 	nvme_put_ctrl(ctrl);
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(nvme_delete_ctrl_sync);
++ 
++ static blk_status_t nvme_error_status(struct request *req)
+++>>>>>>> 4054637c9b4f (nvme: flush reset_work before safely continuing with delete operation)
+  {
+  	switch (nvme_req(req)->status & 0x7ff) {
+  	case NVME_SC_SUCCESS:
+* Unmerged path drivers/nvme/host/core.c
+diff --git a/drivers/nvme/host/fc.c b/drivers/nvme/host/fc.c
+index 6e7bb75ba7ba..bcdfc53b7ee6 100644
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@ -2916,7 +2916,6 @@ nvme_fc_delete_ctrl_work(struct work_struct *work)
+ 	struct nvme_fc_ctrl *ctrl =
+ 		container_of(work, struct nvme_fc_ctrl, delete_work);
+ 
+-	cancel_work_sync(&ctrl->ctrl.reset_work);
+ 	cancel_delayed_work_sync(&ctrl->connect_work);
+ 	nvme_stop_ctrl(&ctrl->ctrl);
+ 	nvme_remove_namespaces(&ctrl->ctrl);
