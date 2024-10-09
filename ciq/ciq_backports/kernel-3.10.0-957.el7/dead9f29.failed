@@ -1,0 +1,94 @@
+perf: Fix race in BPF program unregister
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Alexei Starovoitov <ast@plumgrid.com>
+commit dead9f29ddcc69551f35529a252d2704047870d3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/dead9f29.failed
+
+there is a race between perf_event_free_bpf_prog() and free_trace_kprobe():
+
+	__free_event()
+	  event->destroy(event)
+	    tp_perf_event_destroy()
+	      perf_trace_destroy()
+		perf_trace_event_unreg()
+
+which is dropping event->tp_event->perf_refcount and allows to proceed in:
+
+	unregister_trace_kprobe()
+	  unregister_kprobe_event()
+	      trace_remove_event_call()
+		    probe_remove_event_call()
+	free_trace_kprobe()
+
+while __free_event does:
+
+	call_rcu(&event->rcu_head, free_event_rcu);
+	  free_event_rcu()
+	    perf_event_free_bpf_prog()
+
+To fix the race simply move perf_event_free_bpf_prog() before
+event->destroy(), since event->tp_event is still valid at that point.
+
+Note, perf_trace_destroy() is not racing with trace_remove_event_call()
+since they both grab event_mutex.
+
+	Reported-by: Wang Nan <wangnan0@huawei.com>
+	Signed-off-by: Alexei Starovoitov <ast@plumgrid.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Arnaldo Carvalho de Melo <acme@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: lizefan@huawei.com
+	Cc: pi3orama@163.com
+Fixes: 2541517c32be ("tracing, perf: Implement BPF programs attached to kprobes")
+Link: http://lkml.kernel.org/r/1431717321-28772-1-git-send-email-ast@plumgrid.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit dead9f29ddcc69551f35529a252d2704047870d3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/core.c
+diff --cc kernel/events/core.c
+index e490cd411934,eddf1ed4155e..000000000000
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@@ -4078,8 -3565,28 +4078,33 @@@ static bool exclusive_event_installable
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static void perf_addr_filters_splice(struct perf_event *event,
+ +				       struct list_head *head);
+++=======
++ static void __free_event(struct perf_event *event)
++ {
++ 	if (!event->parent) {
++ 		if (event->attr.sample_type & PERF_SAMPLE_CALLCHAIN)
++ 			put_callchain_buffers();
++ 	}
++ 
++ 	perf_event_free_bpf_prog(event);
++ 
++ 	if (event->destroy)
++ 		event->destroy(event);
++ 
++ 	if (event->ctx)
++ 		put_ctx(event->ctx);
++ 
++ 	if (event->pmu) {
++ 		exclusive_event_destroy(event);
++ 		module_put(event->pmu->module);
++ 	}
++ 
++ 	call_rcu(&event->rcu_head, free_event_rcu);
++ }
+++>>>>>>> dead9f29ddcc (perf: Fix race in BPF program unregister)
+  
+  static void _free_event(struct perf_event *event)
+  {
+* Unmerged path kernel/events/core.c
