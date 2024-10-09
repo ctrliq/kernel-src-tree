@@ -1,0 +1,130 @@
+md: be extra careful not to take a reference to a Faulty device.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [md] be extra careful not to take a reference to a Faulty device (Jes Sorensen) [1380016]
+Rebuild_FUZZ: 95.93%
+commit-author NeilBrown <neilb@suse.com>
+commit f5b67ae86ee317db20c0e10d54f16a0bbbd3207d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f5b67ae8.failed
+
+It is important that we never increment rdev->nr_pending on a Faulty
+device as ->hot_remove_disk() assumes that once the Faulty flag is visible
+no code will take a new reference.
+
+Some places take a new reference after only check In_sync.  This should
+be safe as the two are changed together.  However to make the code more
+obviously safe, add checks for 'Faulty' as well.
+
+Note: the actual rule is:
+  Never increment nr_pending if  Faulty is set and Blocked is clear,
+  never clear Faulty, and never set Blocked without holding a reference
+  through nr_pending.
+
+fix build error (Shaohua)
+	Signed-off-by: NeilBrown <neilb@suse.com>
+	Signed-off-by: Shaohua Li <shli@fb.com>
+(cherry picked from commit f5b67ae86ee317db20c0e10d54f16a0bbbd3207d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid10.c
+diff --cc drivers/md/raid10.c
+index 62cb2179657b,34facda18e72..000000000000
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@@ -2423,8 -2286,8 +2423,9 @@@ static void fix_read_error(struct r10co
+  			d = r10_bio->devs[sl].devnum;
+  			rdev = rcu_dereference(conf->mirrors[d].rdev);
+  			if (rdev &&
+ +			    !test_bit(Unmerged, &rdev->flags) &&
+  			    test_bit(In_sync, &rdev->flags) &&
++ 			    !test_bit(Faulty, &rdev->flags) &&
+  			    is_badblock(rdev, r10_bio->devs[sl].addr + sect, s,
+  					&first_bad, &bad_sectors) == 0) {
+  				atomic_inc(&rdev->nr_pending);
+@@@ -2477,7 -2340,7 +2478,11 @@@
+  			d = r10_bio->devs[sl].devnum;
+  			rdev = rcu_dereference(conf->mirrors[d].rdev);
+  			if (!rdev ||
+++<<<<<<< HEAD
+ +			    test_bit(Unmerged, &rdev->flags) ||
+++=======
++ 			    test_bit(Faulty, &rdev->flags) ||
+++>>>>>>> f5b67ae86ee3 (md: be extra careful not to take a reference to a Faulty device.)
+  			    !test_bit(In_sync, &rdev->flags))
+  				continue;
+  
+@@@ -3084,14 -2949,20 +3090,27 @@@ static sector_t raid10_sync_request(str
+  			int must_sync;
+  			int any_working;
+  			struct raid10_info *mirror = &conf->mirrors[i];
+ -			struct md_rdev *mrdev, *mreplace;
+  
+++<<<<<<< HEAD
+ +			if ((mirror->rdev == NULL ||
+ +			     test_bit(In_sync, &mirror->rdev->flags))
+ +			    &&
+ +			    (mirror->replacement == NULL ||
+ +			     test_bit(Faulty,
+ +				      &mirror->replacement->flags)))
+++=======
++ 			rcu_read_lock();
++ 			mrdev = rcu_dereference(mirror->rdev);
++ 			mreplace = rcu_dereference(mirror->replacement);
++ 
++ 			if ((mrdev == NULL ||
++ 			     test_bit(Faulty, &mrdev->flags) ||
++ 			     test_bit(In_sync, &mrdev->flags)) &&
++ 			    (mreplace == NULL ||
++ 			     test_bit(Faulty, &mreplace->flags))) {
++ 				rcu_read_unlock();
+++>>>>>>> f5b67ae86ee3 (md: be extra careful not to take a reference to a Faulty device.)
+  				continue;
+ -			}
+  
+  			still_degraded = 0;
+  			/* want to reconstruct this device */
+@@@ -3101,8 -2972,11 +3120,10 @@@
+  				/* last stripe is not complete - don't
+  				 * try to recover this sector.
+  				 */
+ -				rcu_read_unlock();
+  				continue;
+  			}
++ 			if (mreplace && test_bit(Faulty, &mreplace->flags))
++ 				mreplace = NULL;
+  			/* Unless we are doing a full sync, or a replacement
+  			 * we only need to recover the block if it is set in
+  			 * the bitmap
+diff --git a/drivers/md/multipath.c b/drivers/md/multipath.c
+index 2469a87c423b..e1d8920ba868 100644
+--- a/drivers/md/multipath.c
++++ b/drivers/md/multipath.c
+@@ -43,7 +43,8 @@ static int multipath_map (struct mpconf *conf)
+ 	rcu_read_lock();
+ 	for (i = 0; i < disks; i++) {
+ 		struct md_rdev *rdev = rcu_dereference(conf->multipaths[i].rdev);
+-		if (rdev && test_bit(In_sync, &rdev->flags)) {
++		if (rdev && test_bit(In_sync, &rdev->flags) &&
++		    !test_bit(Faulty, &rdev->flags)) {
+ 			atomic_inc(&rdev->nr_pending);
+ 			rcu_read_unlock();
+ 			return i;
+* Unmerged path drivers/md/raid10.c
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index a03d70b85c08..e3479d1bfe5c 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -3082,7 +3082,8 @@ handle_failed_stripe(struct r5conf *conf, struct stripe_head *sh,
+ 			struct md_rdev *rdev;
+ 			rcu_read_lock();
+ 			rdev = rcu_dereference(conf->disks[i].rdev);
+-			if (rdev && test_bit(In_sync, &rdev->flags))
++			if (rdev && test_bit(In_sync, &rdev->flags) &&
++			    !test_bit(Faulty, &rdev->flags))
+ 				atomic_inc(&rdev->nr_pending);
+ 			else
+ 				rdev = NULL;
