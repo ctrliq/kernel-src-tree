@@ -1,0 +1,181 @@
+net/mlx5e: Use bool as return type for mlx5e_xdp_handle
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Use bool as return type for mlx5e_xdp_handle (Alaa Hleihel) [1618609]
+Rebuild_FUZZ: 96.23%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit efb6d7a20c856e8714d17f5a4ce509df893c4f01
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/efb6d7a2.failed
+
+Function returns boolean values, use bool instead of int.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit efb6d7a20c856e8714d17f5a4ce509df893c4f01)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index f75f2c655534,abc6ca8168d2..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -733,6 -727,151 +733,154 @@@ static inline void mlx5e_complete_rx_cq
+  	mlx5e_build_rx_skb(cqe, cqe_bcnt, rq, skb);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void mlx5e_xmit_xdp_doorbell(struct mlx5e_xdpsq *sq)
++ {
++ 	struct mlx5_wq_cyc *wq = &sq->wq;
++ 	struct mlx5e_tx_wqe *wqe;
++ 	u16 pi = (sq->pc - 1) & wq->sz_m1; /* last pi */
++ 
++ 	wqe  = mlx5_wq_cyc_get_wqe(wq, pi);
++ 
++ 	mlx5e_notify_hw(wq, sq->pc, sq->uar_map, &wqe->ctrl);
++ }
++ 
++ static inline bool mlx5e_xmit_xdp_frame(struct mlx5e_rq *rq,
++ 					struct mlx5e_dma_info *di,
++ 					const struct xdp_buff *xdp)
++ {
++ 	struct mlx5e_xdpsq       *sq   = &rq->xdpsq;
++ 	struct mlx5_wq_cyc       *wq   = &sq->wq;
++ 	u16                       pi   = sq->pc & wq->sz_m1;
++ 	struct mlx5e_tx_wqe      *wqe  = mlx5_wq_cyc_get_wqe(wq, pi);
++ 
++ 	struct mlx5_wqe_ctrl_seg *cseg = &wqe->ctrl;
++ 	struct mlx5_wqe_eth_seg  *eseg = &wqe->eth;
++ 	struct mlx5_wqe_data_seg *dseg;
++ 
++ 	ptrdiff_t data_offset = xdp->data - xdp->data_hard_start;
++ 	dma_addr_t dma_addr  = di->addr + data_offset;
++ 	unsigned int dma_len = xdp->data_end - xdp->data;
++ 
++ 	prefetchw(wqe);
++ 
++ 	if (unlikely(dma_len < MLX5E_XDP_MIN_INLINE || rq->hw_mtu < dma_len)) {
++ 		rq->stats.xdp_drop++;
++ 		return false;
++ 	}
++ 
++ 	if (unlikely(!mlx5e_wqc_has_room_for(wq, sq->cc, sq->pc, 1))) {
++ 		if (sq->db.doorbell) {
++ 			/* SQ is full, ring doorbell */
++ 			mlx5e_xmit_xdp_doorbell(sq);
++ 			sq->db.doorbell = false;
++ 		}
++ 		rq->stats.xdp_tx_full++;
++ 		return false;
++ 	}
++ 
++ 	dma_sync_single_for_device(sq->pdev, dma_addr, dma_len, PCI_DMA_TODEVICE);
++ 
++ 	cseg->fm_ce_se = 0;
++ 
++ 	dseg = (struct mlx5_wqe_data_seg *)eseg + 1;
++ 
++ 	/* copy the inline part if required */
++ 	if (sq->min_inline_mode != MLX5_INLINE_MODE_NONE) {
++ 		memcpy(eseg->inline_hdr.start, xdp->data, MLX5E_XDP_MIN_INLINE);
++ 		eseg->inline_hdr.sz = cpu_to_be16(MLX5E_XDP_MIN_INLINE);
++ 		dma_len  -= MLX5E_XDP_MIN_INLINE;
++ 		dma_addr += MLX5E_XDP_MIN_INLINE;
++ 		dseg++;
++ 	}
++ 
++ 	/* write the dma part */
++ 	dseg->addr       = cpu_to_be64(dma_addr);
++ 	dseg->byte_count = cpu_to_be32(dma_len);
++ 
++ 	cseg->opmod_idx_opcode = cpu_to_be32((sq->pc << 8) | MLX5_OPCODE_SEND);
++ 
++ 	/* move page to reference to sq responsibility,
++ 	 * and mark so it's not put back in page-cache.
++ 	 */
++ 	__set_bit(MLX5E_RQ_FLAG_XDP_XMIT, rq->flags); /* non-atomic */
++ 	sq->db.di[pi] = *di;
++ 	sq->pc++;
++ 
++ 	sq->db.doorbell = true;
++ 
++ 	rq->stats.xdp_tx++;
++ 	return true;
++ }
++ 
++ /* returns true if packet was consumed by xdp */
++ static inline bool mlx5e_xdp_handle(struct mlx5e_rq *rq,
++ 				    struct mlx5e_dma_info *di,
++ 				    void *va, u16 *rx_headroom, u32 *len)
++ {
++ 	struct bpf_prog *prog = READ_ONCE(rq->xdp_prog);
++ 	struct xdp_buff xdp;
++ 	u32 act;
++ 	int err;
++ 
++ 	if (!prog)
++ 		return false;
++ 
++ 	xdp.data = va + *rx_headroom;
++ 	xdp_set_data_meta_invalid(&xdp);
++ 	xdp.data_end = xdp.data + *len;
++ 	xdp.data_hard_start = va;
++ 	xdp.rxq = &rq->xdp_rxq;
++ 
++ 	act = bpf_prog_run_xdp(prog, &xdp);
++ 	switch (act) {
++ 	case XDP_PASS:
++ 		*rx_headroom = xdp.data - xdp.data_hard_start;
++ 		*len = xdp.data_end - xdp.data;
++ 		return false;
++ 	case XDP_TX:
++ 		if (unlikely(!mlx5e_xmit_xdp_frame(rq, di, &xdp)))
++ 			trace_xdp_exception(rq->netdev, prog, act);
++ 		return true;
++ 	case XDP_REDIRECT:
++ 		/* When XDP enabled then page-refcnt==1 here */
++ 		err = xdp_do_redirect(rq->netdev, &xdp, prog);
++ 		if (!err) {
++ 			__set_bit(MLX5E_RQ_FLAG_XDP_XMIT, rq->flags);
++ 			rq->xdpsq.db.redirect_flush = true;
++ 			mlx5e_page_dma_unmap(rq, di);
++ 		}
++ 		return true;
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 	case XDP_ABORTED:
++ 		trace_xdp_exception(rq->netdev, prog, act);
++ 	case XDP_DROP:
++ 		rq->stats.xdp_drop++;
++ 		return true;
++ 	}
++ }
++ 
++ static inline
++ struct sk_buff *mlx5e_build_linear_skb(struct mlx5e_rq *rq, void *va,
++ 				       u32 frag_size, u16 headroom,
++ 				       u32 cqe_bcnt)
++ {
++ 	struct sk_buff *skb = build_skb(va, frag_size);
++ 
++ 	if (unlikely(!skb)) {
++ 		rq->stats.buff_alloc_err++;
++ 		return NULL;
++ 	}
++ 
++ 	skb_reserve(skb, headroom);
++ 	skb_put(skb, cqe_bcnt);
++ 
++ 	return skb;
++ }
++ 
+++>>>>>>> efb6d7a20c85 (net/mlx5e: Use bool as return type for mlx5e_xdp_handle)
+  static inline
+  struct sk_buff *skb_from_cqe(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe,
+  			     struct mlx5e_wqe_frag_info *wi, u32 cqe_bcnt)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
