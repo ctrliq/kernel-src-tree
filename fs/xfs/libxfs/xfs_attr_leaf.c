@@ -2611,7 +2611,7 @@ xfs_attr3_leaf_clearflag(
 	/*
 	 * Commit the flag value change and start the next trans in series.
 	 */
-	return xfs_trans_roll(&args->trans, args->dp);
+	return xfs_trans_roll_inode(&args->trans, args->dp);
 }
 
 /*
@@ -2662,7 +2662,7 @@ xfs_attr3_leaf_setflag(
 	/*
 	 * Commit the flag value change and start the next trans in series.
 	 */
-	return xfs_trans_roll(&args->trans, args->dp);
+	return xfs_trans_roll_inode(&args->trans, args->dp);
 }
 
 /*
@@ -2780,7 +2780,7 @@ xfs_attr3_leaf_flipflags(
 	/*
 	 * Commit the flag value change and start the next trans in series.
 	 */
-	error = xfs_trans_roll(&args->trans, args->dp);
+	error = xfs_trans_roll_inode(&args->trans, args->dp);
 
 	return error;
 }

@@ -1014,7 +1014,7 @@ xfs_dir_ialloc(
 			tp->t_flags &= ~(XFS_TRANS_DQ_DIRTY);
 		}
 
-		code = xfs_trans_roll(&tp, NULL);
+		code = xfs_trans_roll(&tp);
 		if (committed != NULL)
 			*committed = 1;
 
@@ -1573,7 +1573,7 @@ xfs_itruncate_extents(
 		if (error)
 			goto out_bmap_cancel;
 
-		error = xfs_trans_roll(&tp, ip);
+		error = xfs_trans_roll_inode(&tp, ip);
 		if (error)
 			goto out;
 	}
