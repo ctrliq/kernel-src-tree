@@ -1,0 +1,139 @@
+mlxsw: spectrum: handle NETIF_F_HW_TC changes correctly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 9454d9307e05989bc5dd50c023acd51d632fe6f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/9454d930.failed
+
+Currently, whenever the NETIF_F_HW_TC feature changes, we silently
+always allow it, but we actually do not disable the flows in HW
+on disable. That breaks user's expectations. So just forbid
+the feature disable in case there are any filters offloaded.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Reviewed-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9454d9307e05989bc5dd50c023acd51d632fe6f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+index 5f7ceba69091,3b9c8a0437bf..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+@@@ -1839,21 -1835,69 +1839,74 @@@ static int mlxsw_sp_setup_tc(struct net
+  	}
+  }
+  
++ 
++ static int mlxsw_sp_feature_hw_tc(struct net_device *dev, bool enable)
++ {
++ 	struct mlxsw_sp_port *mlxsw_sp_port = netdev_priv(dev);
++ 
++ 	if (!enable && (mlxsw_sp_port->acl_rule_count ||
++ 			!list_empty(&mlxsw_sp_port->mall_tc_list))) {
++ 		netdev_err(dev, "Active offloaded tc filters, can't turn hw_tc_offload off\n");
++ 		return -EINVAL;
++ 	}
++ 	return 0;
++ }
++ 
++ typedef int (*mlxsw_sp_feature_handler)(struct net_device *dev, bool enable);
++ 
++ static int mlxsw_sp_handle_feature(struct net_device *dev,
++ 				   netdev_features_t wanted_features,
++ 				   netdev_features_t feature,
++ 				   mlxsw_sp_feature_handler feature_handler)
++ {
++ 	netdev_features_t changes = wanted_features ^ dev->features;
++ 	bool enable = !!(wanted_features & feature);
++ 	int err;
++ 
++ 	if (!(changes & feature))
++ 		return 0;
++ 
++ 	err = feature_handler(dev, enable);
++ 	if (err) {
++ 		netdev_err(dev, "%s feature %pNF failed, err %d\n",
++ 			   enable ? "Enable" : "Disable", &feature, err);
++ 		return err;
++ 	}
++ 
++ 	if (enable)
++ 		dev->features |= feature;
++ 	else
++ 		dev->features &= ~feature;
++ 
++ 	return 0;
++ }
++ static int mlxsw_sp_set_features(struct net_device *dev,
++ 				 netdev_features_t features)
++ {
++ 	return mlxsw_sp_handle_feature(dev, features, NETIF_F_HW_TC,
++ 				       mlxsw_sp_feature_hw_tc);
++ }
++ 
+  static const struct net_device_ops mlxsw_sp_port_netdev_ops = {
+ +	.ndo_size		= sizeof(struct net_device_ops),
+  	.ndo_open		= mlxsw_sp_port_open,
+  	.ndo_stop		= mlxsw_sp_port_stop,
+  	.ndo_start_xmit		= mlxsw_sp_port_xmit,
+ -	.ndo_setup_tc           = mlxsw_sp_setup_tc,
+ +	.extended.ndo_setup_tc_rh = mlxsw_sp_setup_tc,
+  	.ndo_set_rx_mode	= mlxsw_sp_set_rx_mode,
+  	.ndo_set_mac_address	= mlxsw_sp_port_set_mac_address,
+ -	.ndo_change_mtu		= mlxsw_sp_port_change_mtu,
+ +	.extended.ndo_change_mtu = mlxsw_sp_port_change_mtu,
+  	.ndo_get_stats64	= mlxsw_sp_port_get_stats64,
+ -	.ndo_has_offload_stats	= mlxsw_sp_port_has_offload_stats,
+ -	.ndo_get_offload_stats	= mlxsw_sp_port_get_offload_stats,
+ +	.extended.ndo_has_offload_stats	= mlxsw_sp_port_has_offload_stats,
+ +	.extended.ndo_get_offload_stats	= mlxsw_sp_port_get_offload_stats,
+  	.ndo_vlan_rx_add_vid	= mlxsw_sp_port_add_vid,
+  	.ndo_vlan_rx_kill_vid	= mlxsw_sp_port_kill_vid,
+++<<<<<<< HEAD
+ +	.extended.ndo_get_phys_port_name	= mlxsw_sp_port_get_phys_port_name,
+++=======
++ 	.ndo_get_phys_port_name	= mlxsw_sp_port_get_phys_port_name,
++ 	.ndo_set_features	= mlxsw_sp_set_features,
+++>>>>>>> 9454d9307e05 (mlxsw: spectrum: handle NETIF_F_HW_TC changes correctly)
+  };
+  
+  static void mlxsw_sp_port_get_drvinfo(struct net_device *dev,
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum.h b/drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+index 8b66c0775fd5..de05dee312e4 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.h
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.h
+@@ -270,6 +270,7 @@ struct mlxsw_sp_port {
+ 	struct mlxsw_sp_port_sample *sample;
+ 	struct list_head vlans_list;
+ 	struct mlxsw_sp_qdisc root_qdisc;
++	unsigned acl_rule_count;
+ };
+ 
+ static inline bool
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c
+index 2f0e57857ea4..cf84629fcb11 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c
+@@ -424,6 +424,7 @@ int mlxsw_sp_flower_replace(struct mlxsw_sp_port *mlxsw_sp_port, bool ingress,
+ 		goto err_rule_add;
+ 
+ 	mlxsw_sp_acl_ruleset_put(mlxsw_sp, ruleset);
++	mlxsw_sp_port->acl_rule_count++;
+ 	return 0;
+ 
+ err_rule_add:
+@@ -455,6 +456,7 @@ void mlxsw_sp_flower_destroy(struct mlxsw_sp_port *mlxsw_sp_port, bool ingress,
+ 	}
+ 
+ 	mlxsw_sp_acl_ruleset_put(mlxsw_sp, ruleset);
++	mlxsw_sp_port->acl_rule_count--;
+ }
+ 
+ int mlxsw_sp_flower_stats(struct mlxsw_sp_port *mlxsw_sp_port, bool ingress,
