@@ -1,0 +1,1532 @@
+mm: introduce kv[mz]alloc helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Michal Hocko <mhocko@suse.com>
+commit a7c3e901a46ff54c016d040847eda598a9e3e653
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/a7c3e901.failed
+
+Patch series "kvmalloc", v5.
+
+There are many open coded kmalloc with vmalloc fallback instances in the
+tree.  Most of them are not careful enough or simply do not care about
+the underlying semantic of the kmalloc/page allocator which means that
+a) some vmalloc fallbacks are basically unreachable because the kmalloc
+part will keep retrying until it succeeds b) the page allocator can
+invoke a really disruptive steps like the OOM killer to move forward
+which doesn't sound appropriate when we consider that the vmalloc
+fallback is available.
+
+As it can be seen implementing kvmalloc requires quite an intimate
+knowledge if the page allocator and the memory reclaim internals which
+strongly suggests that a helper should be implemented in the memory
+subsystem proper.
+
+Most callers, I could find, have been converted to use the helper
+instead.  This is patch 6.  There are some more relying on __GFP_REPEAT
+in the networking stack which I have converted as well and Eric Dumazet
+was not opposed [2] to convert them as well.
+
+[1] http://lkml.kernel.org/r/20170130094940.13546-1-mhocko@kernel.org
+[2] http://lkml.kernel.org/r/1485273626.16328.301.camel@edumazet-glaptop3.roam.corp.google.com
+
+This patch (of 9):
+
+Using kmalloc with the vmalloc fallback for larger allocations is a
+common pattern in the kernel code.  Yet we do not have any common helper
+for that and so users have invented their own helpers.  Some of them are
+really creative when doing so.  Let's just add kv[mz]alloc and make sure
+it is implemented properly.  This implementation makes sure to not make
+a large memory pressure for > PAGE_SZE requests (__GFP_NORETRY) and also
+to not warn about allocation failures.  This also rules out the OOM
+killer as the vmalloc is a more approapriate fallback than a disruptive
+user visible action.
+
+This patch also changes some existing users and removes helpers which
+are specific for them.  In some cases this is not possible (e.g.
+ext4_kvmalloc, libcfs_kvzalloc) because those seems to be broken and
+require GFP_NO{FS,IO} context which is not vmalloc compatible in general
+(note that the page table allocation is GFP_KERNEL).  Those need to be
+fixed separately.
+
+While we are at it, document that __vmalloc{_node} about unsupported gfp
+mask because there seems to be a lot of confusion out there.
+kvmalloc_node will warn about GFP_KERNEL incompatible (which are not
+superset) flags to catch new abusers.  Existing ones would have to die
+slowly.
+
+[sfr@canb.auug.org.au: f2fs fixup]
+  Link: http://lkml.kernel.org/r/20170320163735.332e64b7@canb.auug.org.au
+Link: http://lkml.kernel.org/r/20170306103032.2540-2-mhocko@kernel.org
+	Signed-off-by: Michal Hocko <mhocko@suse.com>
+	Signed-off-by: Stephen Rothwell <sfr@canb.auug.org.au>
+	Reviewed-by: Andreas Dilger <adilger@dilger.ca>	[ext4 part]
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: John Hubbard <jhubbard@nvidia.com>
+	Cc: David Miller <davem@davemloft.net>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit a7c3e901a46ff54c016d040847eda598a9e3e653)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/f2fs/f2fs.h
+#	fs/f2fs/file.c
+#	fs/f2fs/node.c
+#	fs/f2fs/segment.c
+#	fs/seq_file.c
+#	include/linux/vmalloc.h
+#	ipc/util.c
+#	security/apparmor/apparmorfs.c
+#	security/apparmor/include/lib.h
+#	security/apparmor/lib.c
+#	security/apparmor/match.c
+#	security/apparmor/policy_unpack.c
+diff --cc fs/f2fs/f2fs.h
+index 20aab02f2a42,1fc17a1fc5d0..000000000000
+--- a/fs/f2fs/f2fs.h
++++ b/fs/f2fs/f2fs.h
+@@@ -846,38 -1686,335 +846,332 @@@ enum 
+  	FI_INC_LINK,		/* need to increment i_nlink */
+  	FI_ACL_MODE,		/* indicate acl mode */
+  	FI_NO_ALLOC,		/* should not allocate any blocks */
+ -	FI_FREE_NID,		/* free allocated nide */
+ -	FI_NO_EXTENT,		/* not to use the extent cache */
+ -	FI_INLINE_XATTR,	/* used for inline xattr */
+ -	FI_INLINE_DATA,		/* used for inline data*/
+ -	FI_INLINE_DENTRY,	/* used for inline dentry */
+ -	FI_APPEND_WRITE,	/* inode has appended data */
+ -	FI_UPDATE_WRITE,	/* inode has in-place-update data */
+ -	FI_NEED_IPU,		/* used for ipu per file */
+ -	FI_ATOMIC_FILE,		/* indicate atomic file */
+ -	FI_ATOMIC_COMMIT,	/* indicate the state of atomical committing */
+ -	FI_VOLATILE_FILE,	/* indicate volatile file */
+ -	FI_FIRST_BLOCK_WRITTEN,	/* indicate #0 data block was written */
+ -	FI_DROP_CACHE,		/* drop dirty page cache */
+ -	FI_DATA_EXIST,		/* indicate data exists */
+ -	FI_INLINE_DOTS,		/* indicate inline dot dentries */
+ -	FI_DO_DEFRAG,		/* indicate defragment is running */
+ -	FI_DIRTY_FILE,		/* indicate regular/symlink has dirty pages */
+ -	FI_NO_PREALLOC,		/* indicate skipped preallocated blocks */
+  };
+  
+ -static inline void __mark_inode_dirty_flag(struct inode *inode,
+ -						int flag, bool set)
+ -{
+ -	switch (flag) {
+ -	case FI_INLINE_XATTR:
+ -	case FI_INLINE_DATA:
+ -	case FI_INLINE_DENTRY:
+ -		if (set)
+ -			return;
+ -	case FI_DATA_EXIST:
+ -	case FI_INLINE_DOTS:
+ -		f2fs_mark_inode_dirty_sync(inode, true);
+ +static inline void set_inode_flag(struct f2fs_inode_info *fi, int flag)
+ +{
+ +	set_bit(flag, &fi->flags);
+ +}
+ +
+ +static inline int is_inode_flag_set(struct f2fs_inode_info *fi, int flag)
+ +{
+ +	return test_bit(flag, &fi->flags);
+ +}
+ +
+ +static inline void clear_inode_flag(struct f2fs_inode_info *fi, int flag)
+ +{
+ +	clear_bit(flag, &fi->flags);
+ +}
+ +
+ +static inline void set_acl_inode(struct f2fs_inode_info *fi, umode_t mode)
+ +{
+ +	fi->i_acl_mode = mode;
+ +	set_inode_flag(fi, FI_ACL_MODE);
+ +}
+ +
+ +static inline int cond_clear_inode_flag(struct f2fs_inode_info *fi, int flag)
+ +{
+ +	if (is_inode_flag_set(fi, FI_ACL_MODE)) {
+ +		clear_inode_flag(fi, FI_ACL_MODE);
+ +		return 1;
+  	}
+ +	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void set_inode_flag(struct inode *inode, int flag)
++ {
++ 	if (!test_bit(flag, &F2FS_I(inode)->flags))
++ 		set_bit(flag, &F2FS_I(inode)->flags);
++ 	__mark_inode_dirty_flag(inode, flag, true);
++ }
++ 
++ static inline int is_inode_flag_set(struct inode *inode, int flag)
++ {
++ 	return test_bit(flag, &F2FS_I(inode)->flags);
++ }
++ 
++ static inline void clear_inode_flag(struct inode *inode, int flag)
++ {
++ 	if (test_bit(flag, &F2FS_I(inode)->flags))
++ 		clear_bit(flag, &F2FS_I(inode)->flags);
++ 	__mark_inode_dirty_flag(inode, flag, false);
++ }
++ 
++ static inline void set_acl_inode(struct inode *inode, umode_t mode)
++ {
++ 	F2FS_I(inode)->i_acl_mode = mode;
++ 	set_inode_flag(inode, FI_ACL_MODE);
++ 	f2fs_mark_inode_dirty_sync(inode, false);
++ }
++ 
++ static inline void f2fs_i_links_write(struct inode *inode, bool inc)
++ {
++ 	if (inc)
++ 		inc_nlink(inode);
++ 	else
++ 		drop_nlink(inode);
++ 	f2fs_mark_inode_dirty_sync(inode, true);
++ }
++ 
++ static inline void f2fs_i_blocks_write(struct inode *inode,
++ 					blkcnt_t diff, bool add)
++ {
++ 	bool clean = !is_inode_flag_set(inode, FI_DIRTY_INODE);
++ 	bool recover = is_inode_flag_set(inode, FI_AUTO_RECOVER);
++ 
++ 	inode->i_blocks = add ? inode->i_blocks + diff :
++ 				inode->i_blocks - diff;
++ 	f2fs_mark_inode_dirty_sync(inode, true);
++ 	if (clean || recover)
++ 		set_inode_flag(inode, FI_AUTO_RECOVER);
++ }
++ 
++ static inline void f2fs_i_size_write(struct inode *inode, loff_t i_size)
++ {
++ 	bool clean = !is_inode_flag_set(inode, FI_DIRTY_INODE);
++ 	bool recover = is_inode_flag_set(inode, FI_AUTO_RECOVER);
++ 
++ 	if (i_size_read(inode) == i_size)
++ 		return;
++ 
++ 	i_size_write(inode, i_size);
++ 	f2fs_mark_inode_dirty_sync(inode, true);
++ 	if (clean || recover)
++ 		set_inode_flag(inode, FI_AUTO_RECOVER);
++ }
++ 
++ static inline void f2fs_i_depth_write(struct inode *inode, unsigned int depth)
++ {
++ 	F2FS_I(inode)->i_current_depth = depth;
++ 	f2fs_mark_inode_dirty_sync(inode, true);
++ }
++ 
++ static inline void f2fs_i_xnid_write(struct inode *inode, nid_t xnid)
++ {
++ 	F2FS_I(inode)->i_xattr_nid = xnid;
++ 	f2fs_mark_inode_dirty_sync(inode, true);
++ }
++ 
++ static inline void f2fs_i_pino_write(struct inode *inode, nid_t pino)
++ {
++ 	F2FS_I(inode)->i_pino = pino;
++ 	f2fs_mark_inode_dirty_sync(inode, true);
++ }
++ 
++ static inline void get_inline_info(struct inode *inode, struct f2fs_inode *ri)
++ {
++ 	struct f2fs_inode_info *fi = F2FS_I(inode);
++ 
++ 	if (ri->i_inline & F2FS_INLINE_XATTR)
++ 		set_bit(FI_INLINE_XATTR, &fi->flags);
++ 	if (ri->i_inline & F2FS_INLINE_DATA)
++ 		set_bit(FI_INLINE_DATA, &fi->flags);
++ 	if (ri->i_inline & F2FS_INLINE_DENTRY)
++ 		set_bit(FI_INLINE_DENTRY, &fi->flags);
++ 	if (ri->i_inline & F2FS_DATA_EXIST)
++ 		set_bit(FI_DATA_EXIST, &fi->flags);
++ 	if (ri->i_inline & F2FS_INLINE_DOTS)
++ 		set_bit(FI_INLINE_DOTS, &fi->flags);
++ }
++ 
++ static inline void set_raw_inline(struct inode *inode, struct f2fs_inode *ri)
++ {
++ 	ri->i_inline = 0;
++ 
++ 	if (is_inode_flag_set(inode, FI_INLINE_XATTR))
++ 		ri->i_inline |= F2FS_INLINE_XATTR;
++ 	if (is_inode_flag_set(inode, FI_INLINE_DATA))
++ 		ri->i_inline |= F2FS_INLINE_DATA;
++ 	if (is_inode_flag_set(inode, FI_INLINE_DENTRY))
++ 		ri->i_inline |= F2FS_INLINE_DENTRY;
++ 	if (is_inode_flag_set(inode, FI_DATA_EXIST))
++ 		ri->i_inline |= F2FS_DATA_EXIST;
++ 	if (is_inode_flag_set(inode, FI_INLINE_DOTS))
++ 		ri->i_inline |= F2FS_INLINE_DOTS;
++ }
++ 
++ static inline int f2fs_has_inline_xattr(struct inode *inode)
++ {
++ 	return is_inode_flag_set(inode, FI_INLINE_XATTR);
++ }
++ 
++ static inline unsigned int addrs_per_inode(struct inode *inode)
++ {
++ 	if (f2fs_has_inline_xattr(inode))
++ 		return DEF_ADDRS_PER_INODE - F2FS_INLINE_XATTR_ADDRS;
++ 	return DEF_ADDRS_PER_INODE;
++ }
++ 
++ static inline void *inline_xattr_addr(struct page *page)
++ {
++ 	struct f2fs_inode *ri = F2FS_INODE(page);
++ 
++ 	return (void *)&(ri->i_addr[DEF_ADDRS_PER_INODE -
++ 					F2FS_INLINE_XATTR_ADDRS]);
++ }
++ 
++ static inline int inline_xattr_size(struct inode *inode)
++ {
++ 	if (f2fs_has_inline_xattr(inode))
++ 		return F2FS_INLINE_XATTR_ADDRS << 2;
++ 	else
++ 		return 0;
++ }
++ 
++ static inline int f2fs_has_inline_data(struct inode *inode)
++ {
++ 	return is_inode_flag_set(inode, FI_INLINE_DATA);
++ }
++ 
++ static inline void f2fs_clear_inline_inode(struct inode *inode)
++ {
++ 	clear_inode_flag(inode, FI_INLINE_DATA);
++ 	clear_inode_flag(inode, FI_DATA_EXIST);
++ }
++ 
++ static inline int f2fs_exist_data(struct inode *inode)
++ {
++ 	return is_inode_flag_set(inode, FI_DATA_EXIST);
++ }
++ 
++ static inline int f2fs_has_inline_dots(struct inode *inode)
++ {
++ 	return is_inode_flag_set(inode, FI_INLINE_DOTS);
++ }
++ 
++ static inline bool f2fs_is_atomic_file(struct inode *inode)
++ {
++ 	return is_inode_flag_set(inode, FI_ATOMIC_FILE);
++ }
++ 
++ static inline bool f2fs_is_commit_atomic_write(struct inode *inode)
++ {
++ 	return is_inode_flag_set(inode, FI_ATOMIC_COMMIT);
++ }
++ 
++ static inline bool f2fs_is_volatile_file(struct inode *inode)
++ {
++ 	return is_inode_flag_set(inode, FI_VOLATILE_FILE);
++ }
++ 
++ static inline bool f2fs_is_first_block_written(struct inode *inode)
++ {
++ 	return is_inode_flag_set(inode, FI_FIRST_BLOCK_WRITTEN);
++ }
++ 
++ static inline bool f2fs_is_drop_cache(struct inode *inode)
++ {
++ 	return is_inode_flag_set(inode, FI_DROP_CACHE);
++ }
++ 
++ static inline void *inline_data_addr(struct page *page)
++ {
++ 	struct f2fs_inode *ri = F2FS_INODE(page);
++ 
++ 	return (void *)&(ri->i_addr[1]);
++ }
++ 
++ static inline int f2fs_has_inline_dentry(struct inode *inode)
++ {
++ 	return is_inode_flag_set(inode, FI_INLINE_DENTRY);
++ }
++ 
++ static inline void f2fs_dentry_kunmap(struct inode *dir, struct page *page)
++ {
++ 	if (!f2fs_has_inline_dentry(dir))
++ 		kunmap(page);
++ }
++ 
++ static inline int is_file(struct inode *inode, int type)
++ {
++ 	return F2FS_I(inode)->i_advise & type;
++ }
++ 
++ static inline void set_file(struct inode *inode, int type)
++ {
++ 	F2FS_I(inode)->i_advise |= type;
++ 	f2fs_mark_inode_dirty_sync(inode, true);
++ }
++ 
++ static inline void clear_file(struct inode *inode, int type)
++ {
++ 	F2FS_I(inode)->i_advise &= ~type;
++ 	f2fs_mark_inode_dirty_sync(inode, true);
++ }
++ 
++ static inline bool f2fs_skip_inode_update(struct inode *inode, int dsync)
++ {
++ 	if (dsync) {
++ 		struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
++ 		bool ret;
++ 
++ 		spin_lock(&sbi->inode_lock[DIRTY_META]);
++ 		ret = list_empty(&F2FS_I(inode)->gdirty_list);
++ 		spin_unlock(&sbi->inode_lock[DIRTY_META]);
++ 		return ret;
++ 	}
++ 	if (!is_inode_flag_set(inode, FI_AUTO_RECOVER) ||
++ 			file_keep_isize(inode) ||
++ 			i_size_read(inode) & PAGE_MASK)
++ 		return false;
++ 	return F2FS_I(inode)->last_disk_size == i_size_read(inode);
++ }
++ 
++ static inline int f2fs_readonly(struct super_block *sb)
++ {
++ 	return sb->s_flags & MS_RDONLY;
++ }
++ 
++ static inline bool f2fs_cp_error(struct f2fs_sb_info *sbi)
++ {
++ 	return is_set_ckpt_flags(sbi, CP_ERROR_FLAG);
++ }
++ 
++ static inline bool is_dot_dotdot(const struct qstr *str)
++ {
++ 	if (str->len == 1 && str->name[0] == '.')
++ 		return true;
++ 
++ 	if (str->len == 2 && str->name[0] == '.' && str->name[1] == '.')
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static inline bool f2fs_may_extent_tree(struct inode *inode)
++ {
++ 	if (!test_opt(F2FS_I_SB(inode), EXTENT_CACHE) ||
++ 			is_inode_flag_set(inode, FI_NO_EXTENT))
++ 		return false;
++ 
++ 	return S_ISREG(inode->i_mode);
++ }
++ 
++ static inline void *f2fs_kmalloc(struct f2fs_sb_info *sbi,
++ 					size_t size, gfp_t flags)
++ {
++ #ifdef CONFIG_F2FS_FAULT_INJECTION
++ 	if (time_to_inject(sbi, FAULT_KMALLOC)) {
++ 		f2fs_show_injection_info(FAULT_KMALLOC);
++ 		return NULL;
++ 	}
++ #endif
++ 	return kmalloc(size, flags);
++ }
++ 
++ #define get_inode_mode(i) \
++ 	((is_inode_flag_set(i, FI_ACL_MODE)) ? \
++ 	 (F2FS_I(i)->i_acl_mode) : ((i)->i_mode))
++ 
++ /* get offset of first page in next direct node */
++ #define PGOFS_OF_NEXT_DNODE(pgofs, inode)				\
++ 	((pgofs < ADDRS_PER_INODE(inode)) ? ADDRS_PER_INODE(inode) :	\
++ 	(pgofs - ADDRS_PER_INODE(inode) + ADDRS_PER_BLOCK) /	\
++ 	ADDRS_PER_BLOCK * ADDRS_PER_BLOCK + ADDRS_PER_INODE(inode))
++ 
+++>>>>>>> a7c3e901a46f (mm: introduce kv[mz]alloc helpers)
+  /*
+   * file.c
+   */
+diff --cc fs/f2fs/file.c
+index 69adfb9525e3,0849af78381f..000000000000
+--- a/fs/f2fs/file.c
++++ b/fs/f2fs/file.c
+@@@ -472,10 -852,311 +472,315 @@@ static int punch_hole(struct inode *ino
+  	return ret;
+  }
+  
+ -static int __read_out_blkaddrs(struct inode *inode, block_t *blkaddr,
+ -				int *do_replace, pgoff_t off, pgoff_t len)
+ +static int expand_inode_data(struct inode *inode, loff_t offset,
+ +					loff_t len, int mode)
+  {
+++<<<<<<< HEAD
+ +	struct f2fs_sb_info *sbi = F2FS_SB(inode->i_sb);
+++=======
++ 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
++ 	struct dnode_of_data dn;
++ 	int ret, done, i;
++ 
++ next_dnode:
++ 	set_new_dnode(&dn, inode, NULL, NULL, 0);
++ 	ret = get_dnode_of_data(&dn, off, LOOKUP_NODE_RA);
++ 	if (ret && ret != -ENOENT) {
++ 		return ret;
++ 	} else if (ret == -ENOENT) {
++ 		if (dn.max_level == 0)
++ 			return -ENOENT;
++ 		done = min((pgoff_t)ADDRS_PER_BLOCK - dn.ofs_in_node, len);
++ 		blkaddr += done;
++ 		do_replace += done;
++ 		goto next;
++ 	}
++ 
++ 	done = min((pgoff_t)ADDRS_PER_PAGE(dn.node_page, inode) -
++ 							dn.ofs_in_node, len);
++ 	for (i = 0; i < done; i++, blkaddr++, do_replace++, dn.ofs_in_node++) {
++ 		*blkaddr = datablock_addr(dn.node_page, dn.ofs_in_node);
++ 		if (!is_checkpointed_data(sbi, *blkaddr)) {
++ 
++ 			if (test_opt(sbi, LFS)) {
++ 				f2fs_put_dnode(&dn);
++ 				return -ENOTSUPP;
++ 			}
++ 
++ 			/* do not invalidate this block address */
++ 			f2fs_update_data_blkaddr(&dn, NULL_ADDR);
++ 			*do_replace = 1;
++ 		}
++ 	}
++ 	f2fs_put_dnode(&dn);
++ next:
++ 	len -= done;
++ 	off += done;
++ 	if (len)
++ 		goto next_dnode;
++ 	return 0;
++ }
++ 
++ static int __roll_back_blkaddrs(struct inode *inode, block_t *blkaddr,
++ 				int *do_replace, pgoff_t off, int len)
++ {
++ 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
++ 	struct dnode_of_data dn;
++ 	int ret, i;
++ 
++ 	for (i = 0; i < len; i++, do_replace++, blkaddr++) {
++ 		if (*do_replace == 0)
++ 			continue;
++ 
++ 		set_new_dnode(&dn, inode, NULL, NULL, 0);
++ 		ret = get_dnode_of_data(&dn, off + i, LOOKUP_NODE_RA);
++ 		if (ret) {
++ 			dec_valid_block_count(sbi, inode, 1);
++ 			invalidate_blocks(sbi, *blkaddr);
++ 		} else {
++ 			f2fs_update_data_blkaddr(&dn, *blkaddr);
++ 		}
++ 		f2fs_put_dnode(&dn);
++ 	}
++ 	return 0;
++ }
++ 
++ static int __clone_blkaddrs(struct inode *src_inode, struct inode *dst_inode,
++ 			block_t *blkaddr, int *do_replace,
++ 			pgoff_t src, pgoff_t dst, pgoff_t len, bool full)
++ {
++ 	struct f2fs_sb_info *sbi = F2FS_I_SB(src_inode);
++ 	pgoff_t i = 0;
++ 	int ret;
++ 
++ 	while (i < len) {
++ 		if (blkaddr[i] == NULL_ADDR && !full) {
++ 			i++;
++ 			continue;
++ 		}
++ 
++ 		if (do_replace[i] || blkaddr[i] == NULL_ADDR) {
++ 			struct dnode_of_data dn;
++ 			struct node_info ni;
++ 			size_t new_size;
++ 			pgoff_t ilen;
++ 
++ 			set_new_dnode(&dn, dst_inode, NULL, NULL, 0);
++ 			ret = get_dnode_of_data(&dn, dst + i, ALLOC_NODE);
++ 			if (ret)
++ 				return ret;
++ 
++ 			get_node_info(sbi, dn.nid, &ni);
++ 			ilen = min((pgoff_t)
++ 				ADDRS_PER_PAGE(dn.node_page, dst_inode) -
++ 						dn.ofs_in_node, len - i);
++ 			do {
++ 				dn.data_blkaddr = datablock_addr(dn.node_page,
++ 								dn.ofs_in_node);
++ 				truncate_data_blocks_range(&dn, 1);
++ 
++ 				if (do_replace[i]) {
++ 					f2fs_i_blocks_write(src_inode,
++ 								1, false);
++ 					f2fs_i_blocks_write(dst_inode,
++ 								1, true);
++ 					f2fs_replace_block(sbi, &dn, dn.data_blkaddr,
++ 					blkaddr[i], ni.version, true, false);
++ 
++ 					do_replace[i] = 0;
++ 				}
++ 				dn.ofs_in_node++;
++ 				i++;
++ 				new_size = (dst + i) << PAGE_SHIFT;
++ 				if (dst_inode->i_size < new_size)
++ 					f2fs_i_size_write(dst_inode, new_size);
++ 			} while (--ilen && (do_replace[i] || blkaddr[i] == NULL_ADDR));
++ 
++ 			f2fs_put_dnode(&dn);
++ 		} else {
++ 			struct page *psrc, *pdst;
++ 
++ 			psrc = get_lock_data_page(src_inode, src + i, true);
++ 			if (IS_ERR(psrc))
++ 				return PTR_ERR(psrc);
++ 			pdst = get_new_data_page(dst_inode, NULL, dst + i,
++ 								true);
++ 			if (IS_ERR(pdst)) {
++ 				f2fs_put_page(psrc, 1);
++ 				return PTR_ERR(pdst);
++ 			}
++ 			f2fs_copy_page(psrc, pdst);
++ 			set_page_dirty(pdst);
++ 			f2fs_put_page(pdst, 1);
++ 			f2fs_put_page(psrc, 1);
++ 
++ 			ret = truncate_hole(src_inode, src + i, src + i + 1);
++ 			if (ret)
++ 				return ret;
++ 			i++;
++ 		}
++ 	}
++ 	return 0;
++ }
++ 
++ static int __exchange_data_block(struct inode *src_inode,
++ 			struct inode *dst_inode, pgoff_t src, pgoff_t dst,
++ 			pgoff_t len, bool full)
++ {
++ 	block_t *src_blkaddr;
++ 	int *do_replace;
++ 	pgoff_t olen;
++ 	int ret;
++ 
++ 	while (len) {
++ 		olen = min((pgoff_t)4 * ADDRS_PER_BLOCK, len);
++ 
++ 		src_blkaddr = kvzalloc(sizeof(block_t) * olen, GFP_KERNEL);
++ 		if (!src_blkaddr)
++ 			return -ENOMEM;
++ 
++ 		do_replace = kvzalloc(sizeof(int) * olen, GFP_KERNEL);
++ 		if (!do_replace) {
++ 			kvfree(src_blkaddr);
++ 			return -ENOMEM;
++ 		}
++ 
++ 		ret = __read_out_blkaddrs(src_inode, src_blkaddr,
++ 					do_replace, src, olen);
++ 		if (ret)
++ 			goto roll_back;
++ 
++ 		ret = __clone_blkaddrs(src_inode, dst_inode, src_blkaddr,
++ 					do_replace, src, dst, olen, full);
++ 		if (ret)
++ 			goto roll_back;
++ 
++ 		src += olen;
++ 		dst += olen;
++ 		len -= olen;
++ 
++ 		kvfree(src_blkaddr);
++ 		kvfree(do_replace);
++ 	}
++ 	return 0;
++ 
++ roll_back:
++ 	__roll_back_blkaddrs(src_inode, src_blkaddr, do_replace, src, len);
++ 	kvfree(src_blkaddr);
++ 	kvfree(do_replace);
++ 	return ret;
++ }
++ 
++ static int f2fs_do_collapse(struct inode *inode, pgoff_t start, pgoff_t end)
++ {
++ 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
++ 	pgoff_t nrpages = (i_size_read(inode) + PAGE_SIZE - 1) / PAGE_SIZE;
++ 	int ret;
++ 
++ 	f2fs_balance_fs(sbi, true);
++ 	f2fs_lock_op(sbi);
++ 
++ 	f2fs_drop_extent_tree(inode);
++ 
++ 	ret = __exchange_data_block(inode, inode, end, start, nrpages - end, true);
++ 	f2fs_unlock_op(sbi);
++ 	return ret;
++ }
++ 
++ static int f2fs_collapse_range(struct inode *inode, loff_t offset, loff_t len)
++ {
++ 	pgoff_t pg_start, pg_end;
++ 	loff_t new_size;
++ 	int ret;
++ 
++ 	if (offset + len >= i_size_read(inode))
++ 		return -EINVAL;
++ 
++ 	/* collapse range should be aligned to block size of f2fs. */
++ 	if (offset & (F2FS_BLKSIZE - 1) || len & (F2FS_BLKSIZE - 1))
++ 		return -EINVAL;
++ 
++ 	ret = f2fs_convert_inline_inode(inode);
++ 	if (ret)
++ 		return ret;
++ 
++ 	pg_start = offset >> PAGE_SHIFT;
++ 	pg_end = (offset + len) >> PAGE_SHIFT;
++ 
++ 	/* write out all dirty pages from offset */
++ 	ret = filemap_write_and_wait_range(inode->i_mapping, offset, LLONG_MAX);
++ 	if (ret)
++ 		return ret;
++ 
++ 	truncate_pagecache(inode, offset);
++ 
++ 	ret = f2fs_do_collapse(inode, pg_start, pg_end);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* write out all moved pages, if possible */
++ 	filemap_write_and_wait_range(inode->i_mapping, offset, LLONG_MAX);
++ 	truncate_pagecache(inode, offset);
++ 
++ 	new_size = i_size_read(inode) - len;
++ 	truncate_pagecache(inode, new_size);
++ 
++ 	ret = truncate_blocks(inode, new_size, true);
++ 	if (!ret)
++ 		f2fs_i_size_write(inode, new_size);
++ 
++ 	return ret;
++ }
++ 
++ static int f2fs_do_zero_range(struct dnode_of_data *dn, pgoff_t start,
++ 								pgoff_t end)
++ {
++ 	struct f2fs_sb_info *sbi = F2FS_I_SB(dn->inode);
++ 	pgoff_t index = start;
++ 	unsigned int ofs_in_node = dn->ofs_in_node;
++ 	blkcnt_t count = 0;
++ 	int ret;
++ 
++ 	for (; index < end; index++, dn->ofs_in_node++) {
++ 		if (datablock_addr(dn->node_page, dn->ofs_in_node) == NULL_ADDR)
++ 			count++;
++ 	}
++ 
++ 	dn->ofs_in_node = ofs_in_node;
++ 	ret = reserve_new_blocks(dn, count);
++ 	if (ret)
++ 		return ret;
++ 
++ 	dn->ofs_in_node = ofs_in_node;
++ 	for (index = start; index < end; index++, dn->ofs_in_node++) {
++ 		dn->data_blkaddr =
++ 				datablock_addr(dn->node_page, dn->ofs_in_node);
++ 		/*
++ 		 * reserve_new_blocks will not guarantee entire block
++ 		 * allocation.
++ 		 */
++ 		if (dn->data_blkaddr == NULL_ADDR) {
++ 			ret = -ENOSPC;
++ 			break;
++ 		}
++ 		if (dn->data_blkaddr != NEW_ADDR) {
++ 			invalidate_blocks(sbi, dn->data_blkaddr);
++ 			dn->data_blkaddr = NEW_ADDR;
++ 			set_data_blkaddr(dn);
++ 		}
++ 	}
++ 
++ 	f2fs_update_extent_cache_range(dn, start, 0, index - start);
++ 
++ 	return ret;
++ }
++ 
++ static int f2fs_zero_range(struct inode *inode, loff_t offset, loff_t len,
++ 								int mode)
++ {
++ 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
++ 	struct address_space *mapping = inode->i_mapping;
+++>>>>>>> a7c3e901a46f (mm: introduce kv[mz]alloc helpers)
+  	pgoff_t index, pg_start, pg_end;
+  	loff_t new_size = i_size_read(inode);
+  	loff_t off_start, off_end;
+diff --cc fs/f2fs/node.c
+index 3df43b4efd89,0ea1dca8a0e2..000000000000
+--- a/fs/f2fs/node.c
++++ b/fs/f2fs/node.c
+@@@ -1715,6 -2602,42 +1715,45 @@@ static int init_node_manager(struct f2f
+  					GFP_KERNEL);
+  	if (!nm_i->nat_bitmap)
+  		return -ENOMEM;
+++<<<<<<< HEAD
+++=======
++ 
++ 	err = __get_nat_bitmaps(sbi);
++ 	if (err)
++ 		return err;
++ 
++ #ifdef CONFIG_F2FS_CHECK_FS
++ 	nm_i->nat_bitmap_mir = kmemdup(version_bitmap, nm_i->bitmap_size,
++ 					GFP_KERNEL);
++ 	if (!nm_i->nat_bitmap_mir)
++ 		return -ENOMEM;
++ #endif
++ 
++ 	return 0;
++ }
++ 
++ static int init_free_nid_cache(struct f2fs_sb_info *sbi)
++ {
++ 	struct f2fs_nm_info *nm_i = NM_I(sbi);
++ 
++ 	nm_i->free_nid_bitmap = kvzalloc(nm_i->nat_blocks *
++ 					NAT_ENTRY_BITMAP_SIZE, GFP_KERNEL);
++ 	if (!nm_i->free_nid_bitmap)
++ 		return -ENOMEM;
++ 
++ 	nm_i->nat_block_bitmap = kvzalloc(nm_i->nat_blocks / 8,
++ 								GFP_KERNEL);
++ 	if (!nm_i->nat_block_bitmap)
++ 		return -ENOMEM;
++ 
++ 	nm_i->free_nid_count = kvzalloc(nm_i->nat_blocks *
++ 					sizeof(unsigned short), GFP_KERNEL);
++ 	if (!nm_i->free_nid_count)
++ 		return -ENOMEM;
++ 
++ 	spin_lock_init(&nm_i->free_nid_lock);
++ 
+++>>>>>>> a7c3e901a46f (mm: introduce kv[mz]alloc helpers)
+  	return 0;
+  }
+  
+diff --cc fs/f2fs/segment.c
+index 3f08cfa78afe,13806f642ab5..000000000000
+--- a/fs/f2fs/segment.c
++++ b/fs/f2fs/segment.c
+@@@ -1407,12 -2501,13 +1407,22 @@@ static int build_sit_info(struct f2fs_s
+  
+  	SM_I(sbi)->sit_info = sit_i;
+  
+++<<<<<<< HEAD
+ +	sit_i->sentries = vzalloc(TOTAL_SEGS(sbi) * sizeof(struct seg_entry));
+ +	if (!sit_i->sentries)
+ +		return -ENOMEM;
+ +
+ +	bitmap_size = f2fs_bitmap_size(TOTAL_SEGS(sbi));
+ +	sit_i->dirty_sentries_bitmap = kzalloc(bitmap_size, GFP_KERNEL);
+++=======
++ 	sit_i->sentries = kvzalloc(MAIN_SEGS(sbi) *
++ 					sizeof(struct seg_entry), GFP_KERNEL);
++ 	if (!sit_i->sentries)
++ 		return -ENOMEM;
++ 
++ 	bitmap_size = f2fs_bitmap_size(MAIN_SEGS(sbi));
++ 	sit_i->dirty_sentries_bitmap = kvzalloc(bitmap_size, GFP_KERNEL);
+++>>>>>>> a7c3e901a46f (mm: introduce kv[mz]alloc helpers)
+  	if (!sit_i->dirty_sentries_bitmap)
+  		return -ENOMEM;
+  
+@@@ -1421,14 -2516,32 +1431,19 @@@
+  			= kzalloc(SIT_VBLOCK_MAP_SIZE, GFP_KERNEL);
+  		sit_i->sentries[start].ckpt_valid_map
+  			= kzalloc(SIT_VBLOCK_MAP_SIZE, GFP_KERNEL);
+ -		if (!sit_i->sentries[start].cur_valid_map ||
+ -				!sit_i->sentries[start].ckpt_valid_map)
+ -			return -ENOMEM;
+ -
+ -#ifdef CONFIG_F2FS_CHECK_FS
+ -		sit_i->sentries[start].cur_valid_map_mir
+ -			= kzalloc(SIT_VBLOCK_MAP_SIZE, GFP_KERNEL);
+ -		if (!sit_i->sentries[start].cur_valid_map_mir)
+ +		if (!sit_i->sentries[start].cur_valid_map
+ +				|| !sit_i->sentries[start].ckpt_valid_map)
+  			return -ENOMEM;
+ -#endif
+ -
+ -		if (f2fs_discard_en(sbi)) {
+ -			sit_i->sentries[start].discard_map
+ -				= kzalloc(SIT_VBLOCK_MAP_SIZE, GFP_KERNEL);
+ -			if (!sit_i->sentries[start].discard_map)
+ -				return -ENOMEM;
+ -		}
+  	}
+  
+ -	sit_i->tmp_map = kzalloc(SIT_VBLOCK_MAP_SIZE, GFP_KERNEL);
+ -	if (!sit_i->tmp_map)
+ -		return -ENOMEM;
+ -
+  	if (sbi->segs_per_sec > 1) {
+++<<<<<<< HEAD
+ +		sit_i->sec_entries = vzalloc(TOTAL_SECS(sbi) *
+ +					sizeof(struct sec_entry));
+++=======
++ 		sit_i->sec_entries = kvzalloc(MAIN_SECS(sbi) *
++ 					sizeof(struct sec_entry), GFP_KERNEL);
+++>>>>>>> a7c3e901a46f (mm: introduce kv[mz]alloc helpers)
+  		if (!sit_i->sec_entries)
+  			return -ENOMEM;
+  	}
+@@@ -1473,13 -2590,13 +1488,23 @@@ static int build_free_segmap(struct f2f
+  
+  	SM_I(sbi)->free_info = free_i;
+  
+++<<<<<<< HEAD
+ +	bitmap_size = f2fs_bitmap_size(TOTAL_SEGS(sbi));
+ +	free_i->free_segmap = kmalloc(bitmap_size, GFP_KERNEL);
+ +	if (!free_i->free_segmap)
+ +		return -ENOMEM;
+ +
+ +	sec_bitmap_size = f2fs_bitmap_size(TOTAL_SECS(sbi));
+ +	free_i->free_secmap = kmalloc(sec_bitmap_size, GFP_KERNEL);
+++=======
++ 	bitmap_size = f2fs_bitmap_size(MAIN_SEGS(sbi));
++ 	free_i->free_segmap = kvmalloc(bitmap_size, GFP_KERNEL);
++ 	if (!free_i->free_segmap)
++ 		return -ENOMEM;
++ 
++ 	sec_bitmap_size = f2fs_bitmap_size(MAIN_SECS(sbi));
++ 	free_i->free_secmap = kvmalloc(sec_bitmap_size, GFP_KERNEL);
+++>>>>>>> a7c3e901a46f (mm: introduce kv[mz]alloc helpers)
+  	if (!free_i->free_secmap)
+  		return -ENOMEM;
+  
+@@@ -1598,9 -2762,9 +1623,13 @@@ static void init_dirty_segmap(struct f2
+  static int init_victim_secmap(struct f2fs_sb_info *sbi)
+  {
+  	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
+ -	unsigned int bitmap_size = f2fs_bitmap_size(MAIN_SECS(sbi));
+ +	unsigned int bitmap_size = f2fs_bitmap_size(TOTAL_SECS(sbi));
+  
+++<<<<<<< HEAD
+ +	dirty_i->victim_secmap = kzalloc(bitmap_size, GFP_KERNEL);
+++=======
++ 	dirty_i->victim_secmap = kvzalloc(bitmap_size, GFP_KERNEL);
+++>>>>>>> a7c3e901a46f (mm: introduce kv[mz]alloc helpers)
+  	if (!dirty_i->victim_secmap)
+  		return -ENOMEM;
+  	return 0;
+@@@ -1619,10 -2783,10 +1648,14 @@@ static int build_dirty_segmap(struct f2
+  	SM_I(sbi)->dirty_info = dirty_i;
+  	mutex_init(&dirty_i->seglist_lock);
+  
+ -	bitmap_size = f2fs_bitmap_size(MAIN_SEGS(sbi));
+ +	bitmap_size = f2fs_bitmap_size(TOTAL_SEGS(sbi));
+  
+  	for (i = 0; i < NR_DIRTY_TYPE; i++) {
+++<<<<<<< HEAD
+ +		dirty_i->dirty_segmap[i] = kzalloc(bitmap_size, GFP_KERNEL);
+++=======
++ 		dirty_i->dirty_segmap[i] = kvzalloc(bitmap_size, GFP_KERNEL);
+++>>>>>>> a7c3e901a46f (mm: introduce kv[mz]alloc helpers)
+  		if (!dirty_i->dirty_segmap[i])
+  			return -ENOMEM;
+  	}
+diff --cc fs/seq_file.c
+index 260b225bd5e9,dc7c2be963ed..000000000000
+--- a/fs/seq_file.c
++++ b/fs/seq_file.c
+@@@ -26,20 -25,7 +26,24 @@@ static void seq_set_overflow(struct seq
+  
+  static void *seq_buf_alloc(unsigned long size)
+  {
+++<<<<<<< HEAD
+ +	void *buf;
+ +
+ +	buf = kmalloc(size, GFP_KERNEL | __GFP_NOWARN);
+ +	if (!buf && size > PAGE_SIZE)
+ +		buf = vmalloc(size);
+ +	return buf;
+++=======
++ 	return kvmalloc(size, GFP_KERNEL);
+++>>>>>>> a7c3e901a46f (mm: introduce kv[mz]alloc helpers)
+ +}
+ +
+ +static void seq_buf_free(const void *buf)
+ +{
+ +	if (unlikely(is_vmalloc_addr(buf)))
+ +		vfree(buf);
+ +	else
+ +		kfree(buf);
+  }
+  
+  /**
+diff --cc include/linux/vmalloc.h
+index dd0a2c810529,46991ad3ddd5..000000000000
+--- a/include/linux/vmalloc.h
++++ b/include/linux/vmalloc.h
+@@@ -75,8 -78,12 +75,15 @@@ extern void *vmalloc_32_user(unsigned l
+  extern void *__vmalloc(unsigned long size, gfp_t gfp_mask, pgprot_t prot);
+  extern void *__vmalloc_node_range(unsigned long size, unsigned long align,
+  			unsigned long start, unsigned long end, gfp_t gfp_mask,
+++<<<<<<< HEAD
+ +			pgprot_t prot, int node, const void *caller);
+++=======
++ 			pgprot_t prot, unsigned long vm_flags, int node,
++ 			const void *caller);
++ extern void *__vmalloc_node_flags(unsigned long size, int node, gfp_t flags);
++ 
+++>>>>>>> a7c3e901a46f (mm: introduce kv[mz]alloc helpers)
+  extern void vfree(const void *addr);
+ -extern void vfree_atomic(const void *addr);
+  
+  extern void *vmap(struct page **pages, unsigned int count,
+  			unsigned long flags, pgprot_t prot);
+diff --cc ipc/util.c
+index 0e32955be759,caec7b1bfaa3..000000000000
+--- a/ipc/util.c
++++ b/ipc/util.c
+@@@ -455,21 -395,15 +455,25 @@@ void ipc_rmid(struct ipc_ids *ids, stru
+  }
+  
+  /**
+ - * ipc_alloc -	allocate ipc space
+ - * @size: size desired
+ + *	ipc_alloc	-	allocate ipc space
+ + *	@size: size desired
+   *
+ - * Allocate memory from the appropriate pools and return a pointer to it.
+ - * NULL is returned if the allocation fails
+ + *	Allocate memory from the appropriate pools and return a pointer to it.
+ + *	NULL is returned if the allocation fails
+   */
+ + 
+  void *ipc_alloc(int size)
+  {
+++<<<<<<< HEAD
+ +	void *out;
+ +	if(size > PAGE_SIZE)
+ +		out = vmalloc(size);
+ +	else
+ +		out = kmalloc(size, GFP_KERNEL);
+ +	return out;
+++=======
++ 	return kvmalloc(size, GFP_KERNEL);
+++>>>>>>> a7c3e901a46f (mm: introduce kv[mz]alloc helpers)
+  }
+  
+  /**
+diff --cc security/apparmor/apparmorfs.c
+index 16c15ec6f670,be0b49897a67..000000000000
+--- a/security/apparmor/apparmorfs.c
++++ b/security/apparmor/apparmorfs.c
+@@@ -50,19 -97,16 +50,23 @@@ static char *aa_simple_write_to_buffer(
+  		/* only writes from pos 0, that is complete writes */
+  		return ERR_PTR(-ESPIPE);
+  
+ +	/*
+ +	 * Don't allow profile load/replace/remove from profiles that don't
+ +	 * have CAP_MAC_ADMIN
+ +	 */
+ +	if (!aa_may_manage_policy(op))
+ +		return ERR_PTR(-EACCES);
+ +
+  	/* freed by caller to simple_write_to_buffer */
+++<<<<<<< HEAD
+ +	data = kvmalloc(alloc_size);
+++=======
++ 	data = kvmalloc(sizeof(*data) + alloc_size, GFP_KERNEL);
+++>>>>>>> a7c3e901a46f (mm: introduce kv[mz]alloc helpers)
+  	if (data == NULL)
+  		return ERR_PTR(-ENOMEM);
+ -	kref_init(&data->count);
+ -	data->size = copy_size;
+ -	data->hash = NULL;
+ -	data->abi = 0;
+  
+ -	if (copy_from_user(data->data, userbuf, copy_size)) {
+ +	if (copy_from_user(data, userbuf, copy_size)) {
+  		kvfree(data);
+  		return ERR_PTR(-EFAULT);
+  	}
+diff --cc security/apparmor/lib.c
+index 7430298116d6,7cd788a9445b..000000000000
+--- a/security/apparmor/lib.c
++++ b/security/apparmor/lib.c
+@@@ -75,46 -114,49 +75,53 @@@ void aa_info_message(const char *str
+  }
+  
+  /**
+ - * aa_info_message - log a none profile related status message
+ - * @str: message to log
+++<<<<<<< HEAD
+ + * kvmalloc - do allocation preferring kmalloc but falling back to vmalloc
+ + * @size: size of allocation
+ + *
+ + * Return: allocated buffer or NULL if failed
+ + *
+ + * It is possible that policy being loaded from the user is larger than
+ + * what can be allocated by kmalloc, in those cases fall back to vmalloc.
+   */
+ -void aa_info_message(const char *str)
+ +void *kvmalloc(size_t size)
+  {
+ -	if (audit_enabled) {
+ -		DEFINE_AUDIT_DATA(sa, LSM_AUDIT_DATA_NONE, NULL);
+ +	void *buffer = NULL;
+  
+ -		aad(&sa)->info = str;
+ -		aa_audit_msg(AUDIT_APPARMOR_STATUS, &sa, NULL);
+ +	if (size == 0)
+ +		return NULL;
+ +
+ +	/* do not attempt kmalloc if we need more than 16 pages at once */
+ +	if (size <= (16*PAGE_SIZE))
+ +		buffer = kmalloc(size, GFP_NOIO | __GFP_NOWARN);
+ +	if (!buffer) {
+ +		/* see kvfree for why size must be at least work_struct size
+ +		 * when allocated via vmalloc
+ +		 */
+ +		if (size < sizeof(struct work_struct))
+ +			size = sizeof(struct work_struct);
+ +		buffer = vmalloc(size);
+  	}
+ -	printk(KERN_INFO "AppArmor: %s\n", str);
+ +	return buffer;
+  }
+  
+  /**
+ + * do_vfree - workqueue routine for freeing vmalloced memory
+ + * @work: data to be freed
+++=======
++  * aa_policy_init - initialize a policy structure
++  * @policy: policy to initialize  (NOT NULL)
++  * @prefix: prefix name if any is required.  (MAYBE NULL)
++  * @name: name of the policy, init will make a copy of it  (NOT NULL)
+++>>>>>>> a7c3e901a46f (mm: introduce kv[mz]alloc helpers)
+   *
+ - * Note: this fn creates a copy of strings passed in
+ - *
+ - * Returns: true if policy init successful
+ + * The work_struct is overlaid to the data being freed, as at the point
+ + * the work is scheduled the data is no longer valid, be its freeing
+ + * needs to be delayed until safe.
+   */
+ -bool aa_policy_init(struct aa_policy *policy, const char *prefix,
+ -		    const char *name, gfp_t gfp)
+ +static void do_vfree(struct work_struct *work)
+  {
+ -	/* freed by policy_free */
+ -	if (prefix) {
+ -		policy->hname = kmalloc(strlen(prefix) + strlen(name) + 3,
+ -					gfp);
+ -		if (policy->hname)
+ -			sprintf((char *)policy->hname, "%s//%s", prefix, name);
+ -	} else
+ -		policy->hname = kstrdup(name, gfp);
+ -	if (!policy->hname)
+ -		return false;
+ -	/* base.name is a substring of fqname */
+ -	policy->name = basename(policy->hname);
+ -	INIT_LIST_HEAD(&policy->list);
+ -	INIT_LIST_HEAD(&policy->profiles);
+ -
+ -	return true;
+ +	vfree(work);
+  }
+  
+  /**
+diff --cc security/apparmor/match.c
+index 90971a8c3789,960c913381e2..000000000000
+--- a/security/apparmor/match.c
++++ b/security/apparmor/match.c
+@@@ -57,20 -88,27 +57,24 @@@ static struct table_header *unpack_tabl
+  	if (bsize < tsize)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	table = kvmalloc(tsize);
+++=======
++ 	table = kvzalloc(tsize, GFP_KERNEL);
+++>>>>>>> a7c3e901a46f (mm: introduce kv[mz]alloc helpers)
+  	if (table) {
+ -		table->td_id = th.td_id;
+ -		table->td_flags = th.td_flags;
+ -		table->td_lolen = th.td_lolen;
+ +		*table = th;
+  		if (th.td_flags == YYTD_DATA8)
+  			UNPACK_ARRAY(table->td_data, blob, th.td_lolen,
+ -				     u8, u8, byte_to_byte);
+ +				     u8, byte_to_byte);
+  		else if (th.td_flags == YYTD_DATA16)
+  			UNPACK_ARRAY(table->td_data, blob, th.td_lolen,
+ -				     u16, __be16, be16_to_cpu);
+ +				     u16, be16_to_cpu);
+  		else if (th.td_flags == YYTD_DATA32)
+  			UNPACK_ARRAY(table->td_data, blob, th.td_lolen,
+ -				     u32, __be32, be32_to_cpu);
+ +				     u32, be32_to_cpu);
+  		else
+  			goto fail;
+ -		/* if table was vmalloced make sure the page tables are synced
+ -		 * before it is used, as it goes live to all cpus.
+ -		 */
+ -		if (is_vmalloc_addr(table))
+ -			vm_unmap_aliases();
+  	}
+  
+  out:
+diff --cc security/apparmor/policy_unpack.c
+index 329b1fd30749,f3422a91353c..000000000000
+--- a/security/apparmor/policy_unpack.c
++++ b/security/apparmor/policy_unpack.c
+@@@ -461,6 -485,30 +461,33 @@@ fail
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void *kvmemdup(const void *src, size_t len)
++ {
++ 	void *p = kvmalloc(len, GFP_KERNEL);
++ 
++ 	if (p)
++ 		memcpy(p, src, len);
++ 	return p;
++ }
++ 
++ static u32 strhash(const void *data, u32 len, u32 seed)
++ {
++ 	const char * const *key = data;
++ 
++ 	return jhash(*key, strlen(*key), seed);
++ }
++ 
++ static int datacmp(struct rhashtable_compare_arg *arg, const void *obj)
++ {
++ 	const struct aa_data *data = obj;
++ 	const char * const *key = arg->key;
++ 
++ 	return strcmp(data->key, *key);
++ }
++ 
+++>>>>>>> a7c3e901a46f (mm: introduce kv[mz]alloc helpers)
+  /**
+   * unpack_profile - unpack a serialized profile
+   * @e: serialized data extent information (NOT NULL)
+* Unmerged path security/apparmor/include/lib.h
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 1e74c743d62f..a019fce80576 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -176,8 +176,8 @@ static void recalculate_apic_map(struct kvm *kvm)
+ 		if (kvm_apic_present(vcpu))
+ 			max_id = max(max_id, kvm_x2apic_id(vcpu->arch.apic));
+ 
+-	new = kvm_kvzalloc(sizeof(struct kvm_apic_map) +
+-	                   sizeof(struct kvm_lapic *) * ((u64)max_id + 1));
++	new = kvzalloc(sizeof(struct kvm_apic_map) +
++	                   sizeof(struct kvm_lapic *) * ((u64)max_id + 1), GFP_KERNEL);
+ 
+ 	if (!new)
+ 		goto out;
+diff --git a/arch/x86/kvm/page_track.c b/arch/x86/kvm/page_track.c
+index c9473acd65d6..088bfbd69ce6 100644
+--- a/arch/x86/kvm/page_track.c
++++ b/arch/x86/kvm/page_track.c
+@@ -38,8 +38,8 @@ int kvm_page_track_create_memslot(struct kvm_memory_slot *slot,
+ 	int  i;
+ 
+ 	for (i = 0; i < KVM_PAGE_TRACK_MAX; i++) {
+-		slot->arch.gfn_track[i] = kvm_kvzalloc(npages *
+-					    sizeof(*slot->arch.gfn_track[i]));
++		slot->arch.gfn_track[i] = kvzalloc(npages *
++					    sizeof(*slot->arch.gfn_track[i]), GFP_KERNEL);
+ 		if (!slot->arch.gfn_track[i])
+ 			goto track_free;
+ 	}
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 99e230533b87..9ec02042e2ee 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -8039,13 +8039,13 @@ int kvm_arch_create_memslot(struct kvm *kvm, struct kvm_memory_slot *slot,
+ 				      slot->base_gfn, level) + 1;
+ 
+ 		slot->arch.rmap[i] =
+-			kvm_kvzalloc(lpages * sizeof(*slot->arch.rmap[i]));
++			kvzalloc(lpages * sizeof(*slot->arch.rmap[i]), GFP_KERNEL);
+ 		if (!slot->arch.rmap[i])
+ 			goto out_free;
+ 		if (i == 0)
+ 			continue;
+ 
+-		linfo = kvm_kvzalloc(lpages * sizeof(*linfo));
++		linfo = kvzalloc(lpages * sizeof(*linfo), GFP_KERNEL);
+ 		if (!linfo)
+ 			goto out_free;
+ 
+diff --git a/drivers/md/dm-stats.c b/drivers/md/dm-stats.c
+index 2c4f513ab662..8e767cc587b9 100644
+--- a/drivers/md/dm-stats.c
++++ b/drivers/md/dm-stats.c
+@@ -146,12 +146,7 @@ static void *dm_kvzalloc(size_t alloc_size, int node)
+ 	if (!claim_shared_memory(alloc_size))
+ 		return NULL;
+ 
+-	if (alloc_size <= KMALLOC_MAX_SIZE) {
+-		p = kzalloc_node(alloc_size, GFP_KERNEL | __GFP_NORETRY | __GFP_NOMEMALLOC | __GFP_NOWARN, node);
+-		if (p)
+-			return p;
+-	}
+-	p = vzalloc_node(alloc_size, node);
++	p = kvzalloc_node(alloc_size, GFP_KERNEL | __GFP_NOMEMALLOC, node);
+ 	if (p)
+ 		return p;
+ 
+diff --git a/fs/ext4/mballoc.c b/fs/ext4/mballoc.c
+index 343f1ad2e4b3..e0e29f38f15f 100644
+--- a/fs/ext4/mballoc.c
++++ b/fs/ext4/mballoc.c
+@@ -2350,7 +2350,7 @@ int ext4_mb_alloc_groupinfo(struct super_block *sb, ext4_group_t ngroups)
+ 		return 0;
+ 
+ 	size = roundup_pow_of_two(sizeof(*sbi->s_group_info) * size);
+-	new_groupinfo = ext4_kvzalloc(size, GFP_KERNEL);
++	new_groupinfo = kvzalloc(size, GFP_KERNEL);
+ 	if (!new_groupinfo) {
+ 		ext4_msg(sb, KERN_ERR, "can't allocate buddy meta group");
+ 		return -ENOMEM;
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index d1a1c921911f..7d17d39024d2 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -1981,7 +1981,7 @@ int ext4_alloc_flex_bg_array(struct super_block *sb, ext4_group_t ngroup)
+ 		return 0;
+ 
+ 	size = roundup_pow_of_two(size * sizeof(struct flex_groups));
+-	new_groups = ext4_kvzalloc(size, GFP_KERNEL);
++	new_groups = kvzalloc(size, GFP_KERNEL);
+ 	if (!new_groups) {
+ 		ext4_msg(sb, KERN_ERR, "not enough memory for %d flex groups",
+ 			 size / (int) sizeof(struct flex_groups));
+@@ -4006,7 +4006,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
+ 			goto failed_mount;
+ 		}
+ 	}
+-	sbi->s_group_desc = ext4_kvmalloc(db_count *
++	sbi->s_group_desc = kvmalloc(db_count *
+ 					  sizeof(struct buffer_head *),
+ 					  GFP_KERNEL);
+ 	if (sbi->s_group_desc == NULL) {
+* Unmerged path fs/f2fs/f2fs.h
+* Unmerged path fs/f2fs/file.c
+* Unmerged path fs/f2fs/node.c
+* Unmerged path fs/f2fs/segment.c
+* Unmerged path fs/seq_file.c
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 2ca52a5f4bfe..1d77f398039e 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -756,8 +756,6 @@ void kvm_arch_check_processor_compat(void *rtn);
+ int kvm_arch_vcpu_runnable(struct kvm_vcpu *vcpu);
+ int kvm_arch_vcpu_should_kick(struct kvm_vcpu *vcpu);
+ 
+-void *kvm_kvzalloc(unsigned long size);
+-
+ #ifndef __KVM_HAVE_ARCH_VM_ALLOC
+ static inline struct kvm *kvm_arch_alloc_vm(void)
+ {
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 3416fff96060..c2cc5426c768 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -406,6 +406,20 @@ static inline int is_vmalloc_or_module_addr(const void *x)
+ }
+ #endif
+ 
++extern void *kvmalloc_node(size_t size, gfp_t flags, int node);
++static inline void *kvmalloc(size_t size, gfp_t flags)
++{
++	return kvmalloc_node(size, flags, NUMA_NO_NODE);
++}
++static inline void *kvzalloc_node(size_t size, gfp_t flags, int node)
++{
++	return kvmalloc_node(size, flags | __GFP_ZERO, node);
++}
++static inline void *kvzalloc(size_t size, gfp_t flags)
++{
++	return kvmalloc(size, flags | __GFP_ZERO);
++}
++
+ extern void kvfree(const void *addr);
+ 
+ static inline void compound_lock(struct page *page)
+* Unmerged path include/linux/vmalloc.h
+* Unmerged path ipc/util.c
+diff --git a/mm/nommu.c b/mm/nommu.c
+index 9b6c2b5a762b..79d3c46a7a72 100644
+--- a/mm/nommu.c
++++ b/mm/nommu.c
+@@ -282,6 +282,11 @@ void *__vmalloc(unsigned long size, gfp_t gfp_mask, pgprot_t prot)
+ }
+ EXPORT_SYMBOL(__vmalloc);
+ 
++void *__vmalloc_node_flags(unsigned long size, int node, gfp_t flags)
++{
++	return __vmalloc(size, flags, PAGE_KERNEL);
++}
++
+ void *vmalloc_user(unsigned long size)
+ {
+ 	void *ret;
+diff --git a/mm/util.c b/mm/util.c
+index 7bb27027324a..a0e9e75e3ac8 100644
+--- a/mm/util.c
++++ b/mm/util.c
+@@ -444,6 +444,51 @@ unsigned long vm_mmap(struct file *file, unsigned long addr,
+ }
+ EXPORT_SYMBOL(vm_mmap);
+ 
++/**
++ * kvmalloc_node - attempt to allocate physically contiguous memory, but upon
++ * failure, fall back to non-contiguous (vmalloc) allocation.
++ * @size: size of the request.
++ * @flags: gfp mask for the allocation - must be compatible (superset) with GFP_KERNEL.
++ * @node: numa node to allocate from
++ *
++ * Uses kmalloc to get the memory but if the allocation fails then falls back
++ * to the vmalloc allocator. Use kvfree for freeing the memory.
++ *
++ * Reclaim modifiers - __GFP_NORETRY, __GFP_REPEAT and __GFP_NOFAIL are not supported
++ *
++ * Any use of gfp flags outside of GFP_KERNEL should be consulted with mm people.
++ */
++void *kvmalloc_node(size_t size, gfp_t flags, int node)
++{
++	gfp_t kmalloc_flags = flags;
++	void *ret;
++
++	/*
++	 * vmalloc uses GFP_KERNEL for some internal allocations (e.g page tables)
++	 * so the given set of flags has to be compatible.
++	 */
++	WARN_ON_ONCE((flags & GFP_KERNEL) != GFP_KERNEL);
++
++	/*
++	 * Make sure that larger requests are not too disruptive - no OOM
++	 * killer and no allocation failure warnings as we have a fallback
++	 */
++	if (size > PAGE_SIZE)
++		kmalloc_flags |= __GFP_NORETRY | __GFP_NOWARN;
++
++	ret = kmalloc_node(size, kmalloc_flags, node);
++
++	/*
++	 * It doesn't really make sense to fallback to vmalloc for sub page
++	 * requests
++	 */
++	if (ret || size <= PAGE_SIZE)
++		return ret;
++
++	return __vmalloc_node_flags(size, node, flags | __GFP_HIGHMEM);
++}
++EXPORT_SYMBOL(kvmalloc_node);
++
+ void kvfree(const void *addr)
+ {
+ 	if (is_vmalloc_addr(addr))
+diff --git a/mm/vmalloc.c b/mm/vmalloc.c
+index ce089619f50a..e0f52a8fbefb 100644
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@ -1729,6 +1729,13 @@ fail:
+  *	Allocate enough pages to cover @size from the page level
+  *	allocator with @gfp_mask flags.  Map them into contiguous
+  *	kernel virtual space, using a pagetable protection of @prot.
++ *
++ *	Reclaim modifiers in @gfp_mask - __GFP_NORETRY, __GFP_REPEAT
++ *	and __GFP_NOFAIL are not supported
++ *
++ *	Any use of gfp flags outside of GFP_KERNEL should be consulted
++ *	with mm people.
++ *
+  */
+ static void *__vmalloc_node(unsigned long size, unsigned long align,
+ 			    gfp_t gfp_mask, pgprot_t prot,
+@@ -1745,7 +1752,7 @@ void *__vmalloc(unsigned long size, gfp_t gfp_mask, pgprot_t prot)
+ }
+ EXPORT_SYMBOL(__vmalloc);
+ 
+-static inline void *__vmalloc_node_flags(unsigned long size,
++void *__vmalloc_node_flags(unsigned long size,
+ 					int node, gfp_t flags)
+ {
+ 	return __vmalloc_node(size, 1, flags, PAGE_KERNEL,
+* Unmerged path security/apparmor/apparmorfs.c
+* Unmerged path security/apparmor/include/lib.h
+* Unmerged path security/apparmor/lib.c
+* Unmerged path security/apparmor/match.c
+* Unmerged path security/apparmor/policy_unpack.c
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 982b271b69f6..8905a360336a 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -473,7 +473,7 @@ static struct kvm_memslots *kvm_alloc_memslots(void)
+ 	int i;
+ 	struct kvm_memslots *slots;
+ 
+-	slots = kvm_kvzalloc(sizeof(struct kvm_memslots));
++	slots = kvzalloc(sizeof(struct kvm_memslots), GFP_KERNEL);
+ 	if (!slots)
+ 		return NULL;
+ 
+@@ -654,18 +654,6 @@ out_err_no_disable:
+ 	return ERR_PTR(r);
+ }
+ 
+-/*
+- * Avoid using vmalloc for a small buffer.
+- * Should not be used when the size is statically known.
+- */
+-void *kvm_kvzalloc(unsigned long size)
+-{
+-	if (size > PAGE_SIZE)
+-		return vzalloc(size);
+-	else
+-		return kzalloc(size, GFP_KERNEL);
+-}
+-
+ static void kvm_destroy_devices(struct kvm *kvm)
+ {
+ 	struct list_head *node, *tmp;
+@@ -743,7 +731,7 @@ static int kvm_create_dirty_bitmap(struct kvm_memory_slot *memslot)
+ #ifndef CONFIG_S390
+ 	unsigned long dirty_bytes = 2 * kvm_dirty_bitmap_bytes(memslot);
+ 
+-	memslot->dirty_bitmap = kvm_kvzalloc(dirty_bytes);
++	memslot->dirty_bitmap = kvzalloc(dirty_bytes, GFP_KERNEL);
+ 	if (!memslot->dirty_bitmap)
+ 		return -ENOMEM;
+ 
+@@ -964,7 +952,7 @@ int __kvm_set_memory_region(struct kvm *kvm,
+ 			goto out_free;
+ 	}
+ 
+-	slots = kvm_kvzalloc(sizeof(struct kvm_memslots));
++	slots = kvzalloc(sizeof(struct kvm_memslots), GFP_KERNEL);
+ 	if (!slots)
+ 		goto out_free;
+ 	memcpy(slots, __kvm_memslots(kvm, as_id), sizeof(struct kvm_memslots));
