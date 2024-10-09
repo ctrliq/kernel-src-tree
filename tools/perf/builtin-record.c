@@ -38,7 +38,7 @@
 #include <sched.h>
 #include <sys/mman.h>
 #include <asm/bug.h>
-
+#include <linux/time64.h>
 
 struct record {
 	struct perf_tool	tool;
@@ -919,7 +919,7 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 	}
 
 	if (opts->initial_delay) {
-		usleep(opts->initial_delay * 1000);
+		usleep(opts->initial_delay * USEC_PER_MSEC);
 		perf_evlist__enable(rec->evlist);
 	}
 
