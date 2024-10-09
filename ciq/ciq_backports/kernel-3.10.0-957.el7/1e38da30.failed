@@ -1,0 +1,97 @@
+timerfd: Protect the might cancel mechanism proper
+
+jira LE-1907
+cve CVE-2017-10661
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 1e38da300e1e395a15048b0af1e5305bd91402f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/1e38da30.failed
+
+The handling of the might_cancel queueing is not properly protected, so
+parallel operations on the file descriptor can race with each other and
+lead to list corruptions or use after free.
+
+Protect the context for these operations with a seperate lock.
+
+The wait queue lock cannot be reused for this because that would create a
+lock inversion scenario vs. the cancel lock. Replacing might_cancel with an
+atomic (atomic_t or atomic bit) does not help either because it still can
+race vs. the actual list operation.
+
+	Reported-by: Dmitry Vyukov <dvyukov@google.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: "linux-fsdevel@vger.kernel.org"
+	Cc: syzkaller <syzkaller@googlegroups.com>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: linux-fsdevel@vger.kernel.org
+Link: http://lkml.kernel.org/r/alpine.DEB.2.20.1701311521430.3457@nanos
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+(cherry picked from commit 1e38da300e1e395a15048b0af1e5305bd91402f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/timerfd.c
+diff --cc fs/timerfd.c
+index ad102677e873,384fa759a563..000000000000
+--- a/fs/timerfd.c
++++ b/fs/timerfd.c
+@@@ -98,18 -123,27 +99,32 @@@ static void __timerfd_remove_cancel(str
+  	}
+  }
+  
++ static void timerfd_remove_cancel(struct timerfd_ctx *ctx)
++ {
++ 	spin_lock(&ctx->cancel_lock);
++ 	__timerfd_remove_cancel(ctx);
++ 	spin_unlock(&ctx->cancel_lock);
++ }
++ 
+  static bool timerfd_canceled(struct timerfd_ctx *ctx)
+  {
+ -	if (!ctx->might_cancel || ctx->moffs != KTIME_MAX)
+ +	if (!ctx->might_cancel || ctx->moffs.tv64 != KTIME_MAX)
+  		return false;
+ -	ctx->moffs = ktime_mono_to_real(0);
+ +	ctx->moffs = ktime_get_monotonic_offset();
+  	return true;
+  }
+  
+  static void timerfd_setup_cancel(struct timerfd_ctx *ctx, int flags)
+  {
+++<<<<<<< HEAD
+ +	if (ctx->clockid == CLOCK_REALTIME && (flags & TFD_TIMER_ABSTIME) &&
+ +	    (flags & TFD_TIMER_CANCEL_ON_SET)) {
+++=======
++ 	spin_lock(&ctx->cancel_lock);
++ 	if ((ctx->clockid == CLOCK_REALTIME ||
++ 	     ctx->clockid == CLOCK_REALTIME_ALARM) &&
++ 	    (flags & TFD_TIMER_ABSTIME) && (flags & TFD_TIMER_CANCEL_ON_SET)) {
+++>>>>>>> 1e38da300e1e (timerfd: Protect the might cancel mechanism proper)
+  		if (!ctx->might_cancel) {
+  			ctx->might_cancel = true;
+  			spin_lock(&cancel_lock);
+@@@ -336,9 -410,18 +352,10 @@@ SYSCALL_DEFINE2(timerfd_create, int, cl
+  		return -ENOMEM;
+  
+  	init_waitqueue_head(&ctx->wqh);
++ 	spin_lock_init(&ctx->cancel_lock);
+  	ctx->clockid = clockid;
+ -
+ -	if (isalarm(ctx))
+ -		alarm_init(&ctx->t.alarm,
+ -			   ctx->clockid == CLOCK_REALTIME_ALARM ?
+ -			   ALARM_REALTIME : ALARM_BOOTTIME,
+ -			   timerfd_alarmproc);
+ -	else
+ -		hrtimer_init(&ctx->t.tmr, clockid, HRTIMER_MODE_ABS);
+ -
+ -	ctx->moffs = ktime_mono_to_real(0);
+ +	hrtimer_init(&ctx->tmr, clockid, HRTIMER_MODE_ABS);
+ +	ctx->moffs = ktime_get_monotonic_offset();
+  
+  	ufd = anon_inode_getfd("[timerfd]", &timerfd_fops, ctx,
+  			       O_RDWR | (flags & TFD_SHARED_FCNTL_FLAGS));
+* Unmerged path fs/timerfd.c
