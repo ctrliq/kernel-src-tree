@@ -1,0 +1,240 @@
+x86/mm/KASLR: Propagate KASLR status to kernel proper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [x86] mm/kaslr: Propagate KASLR status to kernel proper (Baoquan He) [1290840]
+Rebuild_FUZZ: 96.08%
+commit-author Borislav Petkov <bp@suse.de>
+commit 78cac48c0434c82e860fade3cd0420a7a4adbb08
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/78cac48c.failed
+
+Commit:
+
+  e2b32e678513 ("x86, kaslr: randomize module base load address")
+
+made module base address randomization unconditional and didn't regard
+disabled KKASLR due to CONFIG_HIBERNATION and command line option
+"nokaslr". For more info see (now reverted) commit:
+
+  f47233c2d34f ("x86/mm/ASLR: Propagate base load address calculation")
+
+In order to propagate KASLR status to kernel proper, we need a single bit
+in boot_params.hdr.loadflags and we've chosen bit 1 thus leaving the
+top-down allocated bits for bits supposed to be used by the bootloader.
+
+Originally-From: Jiri Kosina <jkosina@suse.cz>
+	Suggested-by: H. Peter Anvin <hpa@zytor.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: Kees Cook <keescook@chromium.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 78cac48c0434c82e860fade3cd0420a7a4adbb08)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/aslr.c
+#	arch/x86/boot/compressed/misc.c
+#	arch/x86/boot/compressed/misc.h
+#	arch/x86/kernel/module.c
+diff --cc arch/x86/boot/compressed/misc.c
+index 136cb407d4ef,a107b935e22f..000000000000
+--- a/arch/x86/boot/compressed/misc.c
++++ b/arch/x86/boot/compressed/misc.c
+@@@ -397,6 -399,16 +400,19 @@@ asmlinkage void decompress_kernel(void 
+  	free_mem_ptr     = heap;	/* Heap */
+  	free_mem_end_ptr = heap + BOOT_HEAP_SIZE;
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * The memory hole needed for the kernel is the larger of either
++ 	 * the entire decompressed kernel plus relocation table, or the
++ 	 * entire decompressed kernel plus .bss and .brk sections.
++ 	 */
++ 	output = choose_kernel_location(real_mode, input_data, input_len, output,
++ 					output_len > run_size ? output_len
++ 							      : run_size);
++ 
++ 	/* Validate memory location choices. */
+++>>>>>>> 78cac48c0434 (x86/mm/KASLR: Propagate KASLR status to kernel proper)
+  	if ((unsigned long)output & (MIN_KERNEL_ALIGN - 1))
+  		error("Destination address inappropriately aligned");
+  #ifdef CONFIG_X86_64
+diff --cc arch/x86/boot/compressed/misc.h
+index 674019d8e235,89dd0d78013a..000000000000
+--- a/arch/x86/boot/compressed/misc.h
++++ b/arch/x86/boot/compressed/misc.h
+@@@ -44,7 -52,31 +44,33 @@@ static inline void debug_putstr(const c
+  /* cmdline.c */
+  int cmdline_find_option(const char *option, char *buffer, int bufsize);
+  int cmdline_find_option_bool(const char *option);
+ -#endif
+  
+++<<<<<<< HEAD
+++=======
++ 
++ #if CONFIG_RANDOMIZE_BASE
++ /* aslr.c */
++ unsigned char *choose_kernel_location(struct boot_params *boot_params,
++ 				      unsigned char *input,
++ 				      unsigned long input_size,
++ 				      unsigned char *output,
++ 				      unsigned long output_size);
++ /* cpuflags.c */
++ bool has_cpuflag(int flag);
++ #else
++ static inline
++ unsigned char *choose_kernel_location(struct boot_params *boot_params,
++ 				      unsigned char *input,
++ 				      unsigned long input_size,
++ 				      unsigned char *output,
++ 				      unsigned long output_size)
++ {
++ 	return output;
++ }
++ #endif
++ 
++ #ifdef CONFIG_EARLY_PRINTK
+++>>>>>>> 78cac48c0434 (x86/mm/KASLR: Propagate KASLR status to kernel proper)
+  /* early_serial_console.c */
+  extern int early_serial_base;
+  void console_init(void);
+diff --cc arch/x86/kernel/module.c
+index 7c1efc437dc0,005c03e93fc5..000000000000
+--- a/arch/x86/kernel/module.c
++++ b/arch/x86/kernel/module.c
+@@@ -43,13 -46,53 +44,45 @@@ do {							
+  } while (0)
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_RANDOMIZE_BASE
++ static unsigned long module_load_offset;
++ 
++ /* Mutex protects the module_load_offset. */
++ static DEFINE_MUTEX(module_kaslr_mutex);
++ 
++ static unsigned long int get_module_load_offset(void)
++ {
++ 	if (kaslr_enabled()) {
++ 		mutex_lock(&module_kaslr_mutex);
++ 		/*
++ 		 * Calculate the module_load_offset the first time this
++ 		 * code is called. Once calculated it stays the same until
++ 		 * reboot.
++ 		 */
++ 		if (module_load_offset == 0)
++ 			module_load_offset =
++ 				(get_random_int() % 1024 + 1) * PAGE_SIZE;
++ 		mutex_unlock(&module_kaslr_mutex);
++ 	}
++ 	return module_load_offset;
++ }
++ #else
++ static unsigned long int get_module_load_offset(void)
++ {
++ 	return 0;
++ }
++ #endif
++ 
+++>>>>>>> 78cac48c0434 (x86/mm/KASLR: Propagate KASLR status to kernel proper)
+  void *module_alloc(unsigned long size)
+  {
+ -	void *p;
+ -
+  	if (PAGE_ALIGN(size) > MODULES_LEN)
+  		return NULL;
+ -
+ -	p = __vmalloc_node_range(size, MODULE_ALIGN,
+ -				    MODULES_VADDR + get_module_load_offset(),
+ -				    MODULES_END, GFP_KERNEL | __GFP_HIGHMEM,
+ -				    PAGE_KERNEL_EXEC, 0, NUMA_NO_NODE,
+ -				    __builtin_return_address(0));
+ -	if (p && (kasan_module_alloc(p, size) < 0)) {
+ -		vfree(p);
+ -		return NULL;
+ -	}
+ -
+ -	return p;
+ +	return __vmalloc_node_range(size, 1, MODULES_VADDR, MODULES_END,
+ +				GFP_KERNEL | __GFP_HIGHMEM, PAGE_KERNEL_EXEC,
+ +				-1, __builtin_return_address(0));
+  }
+  
+  #ifdef CONFIG_X86_32
+* Unmerged path arch/x86/boot/compressed/aslr.c
+diff --git a/Documentation/x86/boot.txt b/Documentation/x86/boot.txt
+index ba3a9a79ef0b..2e4674a245d7 100644
+--- a/Documentation/x86/boot.txt
++++ b/Documentation/x86/boot.txt
+@@ -406,6 +406,12 @@ Protocol:	2.00+
+ 	- If 0, the protected-mode code is loaded at 0x10000.
+ 	- If 1, the protected-mode code is loaded at 0x100000.
+ 
++  Bit 1 (kernel internal): ALSR_FLAG
++	- Used internally by the compressed kernel to communicate
++	  KASLR status to kernel proper.
++	  If 1, KASLR enabled.
++	  If 0, KASLR disabled.
++
+   Bit 5 (write): QUIET_FLAG
+ 	- If 0, print early messages.
+ 	- If 1, suppress early messages.
+* Unmerged path arch/x86/boot/compressed/aslr.c
+* Unmerged path arch/x86/boot/compressed/misc.c
+* Unmerged path arch/x86/boot/compressed/misc.h
+diff --git a/arch/x86/include/asm/setup.h b/arch/x86/include/asm/setup.h
+index b704295f0650..ccf92b67c88c 100644
+--- a/arch/x86/include/asm/setup.h
++++ b/arch/x86/include/asm/setup.h
+@@ -68,6 +68,11 @@ static inline void x86_ce4100_early_setup(void) { }
+  */
+ extern struct boot_params boot_params;
+ 
++static inline bool kaslr_enabled(void)
++{
++	return !!(boot_params.hdr.loadflags & KASLR_FLAG);
++}
++
+ /*
+  * Do NOT EVER look at the BIOS memory size location.
+  * It does not work on many machines.
+diff --git a/arch/x86/include/uapi/asm/bootparam.h b/arch/x86/include/uapi/asm/bootparam.h
+index b49c0cfdd694..57c717099c26 100644
+--- a/arch/x86/include/uapi/asm/bootparam.h
++++ b/arch/x86/include/uapi/asm/bootparam.h
+@@ -15,6 +15,7 @@
+ 
+ /* loadflags */
+ #define LOADED_HIGH	(1<<0)
++#define KASLR_FLAG	(1<<1)
+ #define QUIET_FLAG	(1<<5)
+ #define KEEP_SEGMENTS	(1<<6)
+ #define CAN_USE_HEAP	(1<<7)
+* Unmerged path arch/x86/kernel/module.c
+diff --git a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
+index 7c228560d4bb..187445b86ca8 100644
+--- a/arch/x86/kernel/setup.c
++++ b/arch/x86/kernel/setup.c
+@@ -934,10 +934,15 @@ static void rh_check_supported(void)
+ static int
+ dump_kernel_offset(struct notifier_block *self, unsigned long v, void *p)
+ {
+-	pr_emerg("Kernel Offset: 0x%lx from 0x%lx "
+-		 "(relocation range: 0x%lx-0x%lx)\n",
+-		 (unsigned long)&_text - __START_KERNEL, __START_KERNEL,
+-		 __START_KERNEL_map, MODULES_VADDR-1);
++	if (kaslr_enabled()) {
++		pr_emerg("Kernel Offset: 0x%lx from 0x%lx (relocation range: 0x%lx-0x%lx)\n",
++			 (unsigned long)&_text - __START_KERNEL,
++			 __START_KERNEL,
++			 __START_KERNEL_map,
++			 MODULES_VADDR-1);
++	} else {
++		pr_emerg("Kernel Offset: disabled\n");
++	}
+ 
+ 	return 0;
+ }
