@@ -1,0 +1,228 @@
+phy: fixed: Fix removal of phys.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [netdrv] phy: fixed: Fix removal of phys (Ivan Vecera) [1382040]
+Rebuild_FUZZ: 98.41%
+commit-author Andrew Lunn <andrew@lunn.ch>
+commit 5bcbe0f35fb13e31fdd0b2dc9695f19ab0208207
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/5bcbe0f3.failed
+
+The fixed phys delete function simply removed the fixed phy from the
+internal linked list and freed the memory. It however did not
+unregister the associated phy device. This meant it was still possible
+to find the phy device on the mdio bus.
+
+Make fixed_phy_del() an internal function and add a
+fixed_phy_unregister() to unregisters the phy device and then uses
+fixed_phy_del() to free resources.
+
+Modify DSA to use this new API function, so we don't leak phys.
+
+	Signed-off-by: Andrew Lunn <andrew@lunn.ch>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5bcbe0f35fb13e31fdd0b2dc9695f19ab0208207)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/phy_fixed.h
+#	net/dsa/dsa.c
+diff --cc include/linux/phy_fixed.h
+index 1ae156fd15c7,1d41ec44e39d..000000000000
+--- a/include/linux/phy_fixed.h
++++ b/include/linux/phy_fixed.h
+@@@ -13,11 -13,13 +13,21 @@@ struct device_node
+  
+  #if IS_ENABLED(CONFIG_FIXED_PHY)
+  extern int fixed_phy_add(unsigned int irq, int phy_id,
+++<<<<<<< HEAD
+ +			 struct fixed_phy_status *status);
+ +extern int fixed_phy_register(unsigned int irq,
+ +			      struct fixed_phy_status *status,
+ +			      struct device_node *np);
+ +extern void fixed_phy_del(int phy_addr);
+++=======
++ 			 struct fixed_phy_status *status,
++ 			 int link_gpio);
++ extern struct phy_device *fixed_phy_register(unsigned int irq,
++ 					     struct fixed_phy_status *status,
++ 					     int link_gpio,
++ 					     struct device_node *np);
++ extern void fixed_phy_unregister(struct phy_device *phydev);
+++>>>>>>> 5bcbe0f35fb1 (phy: fixed: Fix removal of phys.)
+  extern int fixed_phy_set_link_update(struct phy_device *phydev,
+  			int (*link_update)(struct net_device *,
+  					   struct fixed_phy_status *));
+@@@ -30,15 -33,15 +40,14 @@@ static inline int fixed_phy_add(unsigne
+  {
+  	return -ENODEV;
+  }
+ -static inline struct phy_device *fixed_phy_register(unsigned int irq,
+ -						struct fixed_phy_status *status,
+ -						int gpio_link,
+ -						struct device_node *np)
+ +static inline int fixed_phy_register(unsigned int irq,
+ +				     struct fixed_phy_status *status,
+ +				     struct device_node *np)
+  {
+ -	return ERR_PTR(-ENODEV);
+ +	return -ENODEV;
+  }
+- static inline int fixed_phy_del(int phy_addr)
++ static inline void fixed_phy_unregister(struct phy_device *phydev)
+  {
+- 	return -ENODEV;
+  }
+  static inline int fixed_phy_set_link_update(struct phy_device *phydev,
+  			int (*link_update)(struct net_device *,
+diff --cc net/dsa/dsa.c
+index 0eb5d5e76dfb,c28c47463b7e..000000000000
+--- a/net/dsa/dsa.c
++++ b/net/dsa/dsa.c
+@@@ -208,34 -420,87 +208,72 @@@ out
+  
+  static void dsa_switch_destroy(struct dsa_switch *ds)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct device_node *port_dn;
++ 	struct phy_device *phydev;
++ 	struct dsa_chip_data *cd = ds->pd;
++ 	int port;
++ 
++ #ifdef CONFIG_NET_DSA_HWMON
++ 	if (ds->hwmon_dev)
++ 		hwmon_device_unregister(ds->hwmon_dev);
++ #endif
++ 
++ 	/* Destroy network devices for physical switch ports. */
++ 	for (port = 0; port < DSA_MAX_PORTS; port++) {
++ 		if (!(ds->phys_port_mask & (1 << port)))
++ 			continue;
++ 
++ 		if (!ds->ports[port])
++ 			continue;
++ 
++ 		dsa_slave_destroy(ds->ports[port]);
++ 	}
++ 
++ 	/* Remove any fixed link PHYs */
++ 	for (port = 0; port < DSA_MAX_PORTS; port++) {
++ 		port_dn = cd->port_dn[port];
++ 		if (of_phy_is_fixed_link(port_dn)) {
++ 			phydev = of_phy_find_device(port_dn);
++ 			if (phydev) {
++ 				phy_device_free(phydev);
++ 				of_node_put(port_dn);
++ 				fixed_phy_unregister(phydev);
++ 			}
++ 		}
++ 	}
++ 
++ 	mdiobus_unregister(ds->slave_mii_bus);
+++>>>>>>> 5bcbe0f35fb1 (phy: fixed: Fix removal of phys.)
+  }
+  
+ -#ifdef CONFIG_PM_SLEEP
+ -static int dsa_switch_suspend(struct dsa_switch *ds)
+ +
+ +/* link polling *************************************************************/
+ +static void dsa_link_poll_work(struct work_struct *ugly)
+  {
+ -	int i, ret = 0;
+ +	struct dsa_switch_tree *dst;
+ +	int i;
+  
+ -	/* Suspend slave network devices */
+ -	for (i = 0; i < DSA_MAX_PORTS; i++) {
+ -		if (!dsa_is_port_initialized(ds, i))
+ -			continue;
+ +	dst = container_of(ugly, struct dsa_switch_tree, link_poll_work);
+  
+ -		ret = dsa_slave_suspend(ds->ports[i]);
+ -		if (ret)
+ -			return ret;
+ -	}
+ +	for (i = 0; i < dst->pd->nr_chips; i++) {
+ +		struct dsa_switch *ds = dst->ds[i];
+  
+ -	if (ds->drv->suspend)
+ -		ret = ds->drv->suspend(ds);
+ +		if (ds != NULL && ds->drv->poll_link != NULL)
+ +			ds->drv->poll_link(ds);
+ +	}
+  
+ -	return ret;
+ +	mod_timer(&dst->link_poll_timer, round_jiffies(jiffies + HZ));
+  }
+  
+ -static int dsa_switch_resume(struct dsa_switch *ds)
+ +static void dsa_link_poll_timer(unsigned long _dst)
+  {
+ -	int i, ret = 0;
+ -
+ -	if (ds->drv->resume)
+ -		ret = ds->drv->resume(ds);
+ -
+ -	if (ret)
+ -		return ret;
+ -
+ -	/* Resume slave network devices */
+ -	for (i = 0; i < DSA_MAX_PORTS; i++) {
+ -		if (!dsa_is_port_initialized(ds, i))
+ -			continue;
+ -
+ -		ret = dsa_slave_resume(ds->ports[i]);
+ -		if (ret)
+ -			return ret;
+ -	}
+ +	struct dsa_switch_tree *dst = (void *)_dst;
+  
+ -	return 0;
+ +	schedule_work(&dst->link_poll_work);
+  }
+ -#endif
+ +
+  
+  /* platform driver init and cleanup *****************************************/
+  static int dev_is_class(struct device *dev, void *class)
+diff --git a/drivers/net/phy/fixed_phy.c b/drivers/net/phy/fixed_phy.c
+index 0b6b5e8ee74c..b62c0b75735f 100644
+--- a/drivers/net/phy/fixed_phy.c
++++ b/drivers/net/phy/fixed_phy.c
+@@ -246,7 +246,7 @@ err_regs:
+ }
+ EXPORT_SYMBOL_GPL(fixed_phy_add);
+ 
+-void fixed_phy_del(int phy_addr)
++static void fixed_phy_del(int phy_addr)
+ {
+ 	struct fixed_mdio_bus *fmb = &platform_fmb;
+ 	struct fixed_phy *fp, *tmp;
+@@ -259,7 +259,6 @@ void fixed_phy_del(int phy_addr)
+ 		}
+ 	}
+ }
+-EXPORT_SYMBOL_GPL(fixed_phy_del);
+ 
+ static int phy_fixed_addr;
+ static DEFINE_SPINLOCK(phy_fixed_addr_lock);
+@@ -307,6 +306,14 @@ int fixed_phy_register(unsigned int irq,
+ }
+ EXPORT_SYMBOL_GPL(fixed_phy_register);
+ 
++void fixed_phy_unregister(struct phy_device *phy)
++{
++	phy_device_remove(phy);
++
++	fixed_phy_del(phy->mdio.addr);
++}
++EXPORT_SYMBOL_GPL(fixed_phy_unregister);
++
+ static int __init fixed_mdio_bus_init(void)
+ {
+ 	struct fixed_mdio_bus *fmb = &platform_fmb;
+* Unmerged path include/linux/phy_fixed.h
+* Unmerged path net/dsa/dsa.c
