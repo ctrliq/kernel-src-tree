@@ -1,0 +1,148 @@
+IB/srpt: Detect session shutdown reliably
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Bart Van Assche <bart.vanassche@sandisk.com>
+commit aaf45bd83eba804adfa5c4ff5b17ca0c88884c6f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/aaf45bd8.failed
+
+The Last WQE Reached event is only generated after one or more work
+requests have been queued on the QP associated with a session. Since
+session shutdown can start before any work requests have been queued,
+use a zero-length RDMA write to wait until a QP has been drained.
+
+Additionally, rework the code for closing and disconnecting a session.
+
+	Signed-off-by: Bart Van Assche <bart.vanassche@sandisk.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Cc: Sagi Grimberg <sagig@mellanox.com>
+	Cc: Alex Estrin <alex.estrin@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit aaf45bd83eba804adfa5c4ff5b17ca0c88884c6f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/srpt/ib_srpt.c
+diff --cc drivers/infiniband/ulp/srpt/ib_srpt.c
+index 2fcda8eb58d3,0881ae902ba0..000000000000
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.c
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.c
+@@@ -93,8 -91,8 +93,13 @@@ MODULE_PARM_DESC(srpt_service_guid
+  		 " instead of using the node_guid of the first HCA.");
+  
+  static struct ib_client srpt_client;
+++<<<<<<< HEAD
+ +static struct target_fabric_configfs *srpt_target;
+ +static void srpt_release_channel(struct srpt_rdma_ch *ch);
+++=======
++ static void srpt_release_cmd(struct se_cmd *se_cmd);
++ static void srpt_free_ch(struct kref *kref);
+++>>>>>>> aaf45bd83eba (IB/srpt: Detect session shutdown reliably)
+  static int srpt_queue_status(struct se_cmd *cmd);
+  static void srpt_recv_done(struct ib_cq *cq, struct ib_wc *wc);
+  static void srpt_send_done(struct ib_cq *cq, struct ib_wc *wc);
+@@@ -1964,34 -2000,9 +2008,34 @@@ static void srpt_release_channel_work(s
+  
+  	wake_up(&sdev->ch_releaseQ);
+  
+- 	kfree(ch);
++ 	kref_put(&ch->kref, srpt_free_ch);
+  }
+  
+ +static struct srpt_node_acl *__srpt_lookup_acl(struct srpt_port *sport,
+ +					       u8 i_port_id[16])
+ +{
+ +	struct srpt_node_acl *nacl;
+ +
+ +	list_for_each_entry(nacl, &sport->port_acl_list, list)
+ +		if (memcmp(nacl->i_port_id, i_port_id,
+ +			   sizeof(nacl->i_port_id)) == 0)
+ +			return nacl;
+ +
+ +	return NULL;
+ +}
+ +
+ +static struct srpt_node_acl *srpt_lookup_acl(struct srpt_port *sport,
+ +					     u8 i_port_id[16])
+ +{
+ +	struct srpt_node_acl *nacl;
+ +
+ +	spin_lock_irq(&sport->port_acl_lock);
+ +	nacl = __srpt_lookup_acl(sport, i_port_id);
+ +	spin_unlock_irq(&sport->port_acl_lock);
+ +
+ +	return nacl;
+ +}
+ +
+  /**
+   * srpt_cm_req_recv() - Process the event IB_CM_REQ_RECEIVED.
+   *
+@@@ -2228,10 -2248,8 +2267,10 @@@ static int srpt_cm_req_recv(struct ib_c
+  	goto out;
+  
+  release_channel:
+- 	srpt_set_ch_state(ch, CH_RELEASING);
++ 	srpt_disconnect_ch(ch);
+  	transport_deregister_session_configfs(ch->sess);
+ +
+ +deregister_session:
+  	transport_deregister_session(ch->sess);
+  	ch->sess = NULL;
+  
+@@@ -2527,9 -2509,9 +2530,9 @@@ static int srpt_write_pending(struct se
+  		break;
+  	case CH_DISCONNECTING:
+  	case CH_DRAINING:
+- 	case CH_RELEASING:
++ 	case CH_DISCONNECTED:
+  		pr_debug("cmd with tag %lld: channel disconnecting\n",
+ -			 ioctx->cmd.tag);
+ +			 ioctx->tag);
+  		srpt_set_cmd_state(ioctx, SRPT_STATE_DATA_IN);
+  		ret = -EINVAL;
+  		goto out;
+* Unmerged path drivers/infiniband/ulp/srpt/ib_srpt.c
+diff --git a/drivers/infiniband/ulp/srpt/ib_srpt.h b/drivers/infiniband/ulp/srpt/ib_srpt.h
+index 886950568e7c..5b9b80dd93de 100644
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.h
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.h
+@@ -219,20 +219,20 @@ struct srpt_send_ioctx {
+ 
+ /**
+  * enum rdma_ch_state - SRP channel state.
+- * @CH_CONNECTING:	 QP is in RTR state; waiting for RTU.
+- * @CH_LIVE:		 QP is in RTS state.
+- * @CH_DISCONNECTING:    DREQ has been received; waiting for DREP
+- *                       or DREQ has been send and waiting for DREP
+- *                       or .
+- * @CH_DRAINING:	 QP is in ERR state; waiting for last WQE event.
+- * @CH_RELEASING:	 Last WQE event has been received; releasing resources.
++ * @CH_CONNECTING:    QP is in RTR state; waiting for RTU.
++ * @CH_LIVE:	      QP is in RTS state.
++ * @CH_DISCONNECTING: DREQ has been sent and waiting for DREP or DREQ has
++ *                    been received.
++ * @CH_DRAINING:      DREP has been received or waiting for DREP timed out
++ *                    and last work request has been queued.
++ * @CH_DISCONNECTED:  Last completion has been received.
+  */
+ enum rdma_ch_state {
+ 	CH_CONNECTING,
+ 	CH_LIVE,
+ 	CH_DISCONNECTING,
+ 	CH_DRAINING,
+-	CH_RELEASING
++	CH_DISCONNECTED,
+ };
+ 
+ /**
+@@ -268,6 +268,8 @@ struct srpt_rdma_ch {
+ 	struct ib_cm_id		*cm_id;
+ 	struct ib_qp		*qp;
+ 	struct ib_cq		*cq;
++	struct ib_cqe		zw_cqe;
++	struct kref		kref;
+ 	int			rq_size;
+ 	u32			rsp_size;
+ 	atomic_t		sq_wr_avail;
