@@ -1,0 +1,356 @@
+drm/i915: make context status notifier head be per engine
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [drm] i915: make context status notifier head be per engine (Rob Clark) [1380115]
+Rebuild_FUZZ: 96.36%
+commit-author Changbin Du <changbin.du@intel.com>
+commit 3fc03069bc6e6c316f19bb526e3c8ce784677477
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/3fc03069.failed
+
+GVTg has introduced the context status notifier to schedule the GVTg
+workload. At that time, the notifier is bound to GVTg context only,
+so GVTg is not aware of host workloads.
+
+Now we are going to improve GVTg's guest workload scheduler policy,
+and add Guc emulation support for new Gen graphics. Both these two
+features require acknowledgment for all contexts running on hardware.
+(But will not alter host workload.) So here try to make some change.
+
+The change is simple:
+  1. Move the context status notifier head from i915_gem_context to
+     intel_engine_cs. Which means there is a notifier head per engine
+     instead of per context. Execlist driver still call notifier for
+     each context sched-in/out events of current engine.
+  2. At GVTg side, it binds a notifier_block for each physical engine
+     at GVTg initialization period. Then GVTg can hear all context
+     status events.
+
+In this patch, GVTg do nothing for host context event, but later
+will add a function there. But in any case, the notifier callback is
+a noop if this is no active vGPU.
+
+Since intel_gvt_init() is called at early initialization stage and
+require the status notifier head has been initiated, I initiate it in
+intel_engine_setup().
+
+v2: remove a redundant newline. (chris)
+
+Fixes: 3c7ba6359d70 ("drm/i915: Introduce execlist context status change notification")
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=100232
+	Signed-off-by: Changbin Du <changbin.du@intel.com>
+	Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+	Cc: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+	Cc: Zhi Wang <zhi.a.wang@intel.com>
+	Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170313024711.28591-1-changbin.du@intel.com
+	Acked-by: Zhenyu Wang <zhenyuw@linux.intel.com>
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+(cherry picked from commit 3fc03069bc6e6c316f19bb526e3c8ce784677477)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/gvt/gvt.h
+#	drivers/gpu/drm/i915/gvt/scheduler.c
+#	drivers/gpu/drm/i915/i915_gem_context.c
+#	drivers/gpu/drm/i915/i915_gem_context.h
+#	drivers/gpu/drm/i915/intel_engine_cs.c
+#	drivers/gpu/drm/i915/intel_lrc.c
+#	drivers/gpu/drm/i915/intel_ringbuffer.h
+diff --cc drivers/gpu/drm/i915/i915_gem_context.c
+index 5dd84e148bba,000508502cf9..000000000000
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@@ -249,9 -312,21 +249,25 @@@ __create_hw_context(struct drm_device *
+  	/* NB: Mark all slices as needing a remap so that when the context first
+  	 * loads it will restore whatever remap state already exists. If there
+  	 * is no remap info, it will be a NOP. */
+ -	ctx->remap_slice = ALL_L3_SLICES(dev_priv);
+ +	ctx->remap_slice = (1 << NUM_L3_SLICES(dev)) - 1;
+  
+++<<<<<<< HEAD
+ +	ctx->hang_stats.ban_period_seconds = DRM_I915_CTX_BAN_PERIOD;
+++=======
++ 	i915_gem_context_set_bannable(ctx);
++ 	ctx->ring_size = 4 * PAGE_SIZE;
++ 	ctx->desc_template =
++ 		default_desc_template(dev_priv, dev_priv->mm.aliasing_ppgtt);
++ 
++ 	/* GuC requires the ring to be placed above GUC_WOPCM_TOP. If GuC is not
++ 	 * present or not in use we still need a small bias as ring wraparound
++ 	 * at offset 0 sometimes hangs. No idea why.
++ 	 */
++ 	if (HAS_GUC(dev_priv) && i915.enable_guc_loading)
++ 		ctx->ggtt_offset_bias = GUC_WOPCM_TOP;
++ 	else
++ 		ctx->ggtt_offset_bias = I915_GTT_PAGE_SIZE;
+++>>>>>>> 3fc03069bc6e (drm/i915: make context status notifier head be per engine)
+  
+  	return ctx;
+  
+diff --cc drivers/gpu/drm/i915/intel_lrc.c
+index b7bec1c75519,e1195b975ef6..000000000000
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@@ -303,68 -264,105 +303,80 @@@ logical_ring_init_platform_invariants(s
+   * expensive to calculate, we'll just do it once and cache the result,
+   * which remains valid until the context is unpinned.
+   *
+ - * This is what a descriptor looks like, from LSB to MSB::
+ - *
+ - *      bits  0-11:    flags, GEN8_CTX_* (cached in ctx->desc_template)
+ - *      bits 12-31:    LRCA, GTT address of (the HWSP of) this context
+ - *      bits 32-52:    ctx ID, a globally unique tag
+ - *      bits 53-54:    mbz, reserved for use by hardware
+ - *      bits 55-63:    group ID, currently unused and set to 0
+ + * This is what a descriptor looks like, from LSB to MSB:
+ + *    bits 0-11:    flags, GEN8_CTX_* (cached in ctx_desc_template)
+ + *    bits 12-31:    LRCA, GTT address of (the HWSP of) this context
+ + *    bits 32-51:    ctx ID, a globally unique tag (the LRCA again!)
+ + *    bits 52-63:    reserved, may encode the engine ID (for GuC)
+   */
+  static void
+ -intel_lr_context_descriptor_update(struct i915_gem_context *ctx,
+ -				   struct intel_engine_cs *engine)
+ +intel_lr_context_descriptor_update(struct intel_context *ctx,
+ +				   struct intel_engine_cs *ring)
+  {
+ -	struct intel_context *ce = &ctx->engine[engine->id];
+ -	u64 desc;
+ +	uint64_t lrca, desc;
+  
+ -	BUILD_BUG_ON(MAX_CONTEXT_HW_ID > (1<<GEN8_CTX_ID_WIDTH));
+ +	lrca = ctx->engine[ring->id].lrc_vma->node.start +
+ +	       LRC_PPHWSP_PN * PAGE_SIZE;
+  
+ -	desc = ctx->desc_template;				/* bits  0-11 */
+ -	desc |= i915_ggtt_offset(ce->state) + LRC_PPHWSP_PN * PAGE_SIZE;
+ -								/* bits 12-31 */
+ -	desc |= (u64)ctx->hw_id << GEN8_CTX_ID_SHIFT;		/* bits 32-52 */
+ +	desc = ring->ctx_desc_template;			   /* bits  0-11 */
+ +	desc |= lrca;					   /* bits 12-31 */
+ +	desc |= (lrca >> PAGE_SHIFT) << GEN8_CTX_ID_SHIFT; /* bits 32-51 */
+  
+ -	ce->lrc_desc = desc;
+ +	ctx->engine[ring->id].lrc_desc = desc;
+  }
+  
+ -uint64_t intel_lr_context_descriptor(struct i915_gem_context *ctx,
+ -				     struct intel_engine_cs *engine)
+ +uint64_t intel_lr_context_descriptor(struct intel_context *ctx,
+ +				     struct intel_engine_cs *ring)
+  {
+ -	return ctx->engine[engine->id].lrc_desc;
+ +	return ctx->engine[ring->id].lrc_desc;
+  }
+  
+ -static inline void
+ -execlists_context_status_change(struct drm_i915_gem_request *rq,
+ -				unsigned long status)
+ +/**
+ + * intel_execlists_ctx_id() - get the Execlists Context ID
+ + * @ctx: Context to get the ID for
+ + * @ring: Engine to get the ID for
+ + *
+ + * Do not confuse with ctx->id! Unfortunately we have a name overload
+ + * here: the old context ID we pass to userspace as a handler so that
+ + * they can refer to a context, and the new context ID we pass to the
+ + * ELSP so that the GPU can inform us of the context status via
+ + * interrupts.
+ + *
+ + * The context ID is a portion of the context descriptor, so we can
+ + * just extract the required part from the cached descriptor.
+ + *
+ + * Return: 20-bits globally unique context ID.
+ + */
+ +u32 intel_execlists_ctx_id(struct intel_context *ctx,
+ +			   struct intel_engine_cs *ring)
+  {
+++<<<<<<< HEAD
+ +	return intel_lr_context_descriptor(ctx, ring) >> GEN8_CTX_ID_SHIFT;
+++=======
++ 	/*
++ 	 * Only used when GVT-g is enabled now. When GVT-g is disabled,
++ 	 * The compiler should eliminate this function as dead-code.
++ 	 */
++ 	if (!IS_ENABLED(CONFIG_DRM_I915_GVT))
++ 		return;
++ 
++ 	atomic_notifier_call_chain(&rq->engine->context_status_notifier,
++ 				   status, rq);
+++>>>>>>> 3fc03069bc6e (drm/i915: make context status notifier head be per engine)
+  }
+  
+ -static void
+ -execlists_update_context_pdps(struct i915_hw_ppgtt *ppgtt, u32 *reg_state)
+ -{
+ -	ASSIGN_CTX_PDP(ppgtt, reg_state, 3);
+ -	ASSIGN_CTX_PDP(ppgtt, reg_state, 2);
+ -	ASSIGN_CTX_PDP(ppgtt, reg_state, 1);
+ -	ASSIGN_CTX_PDP(ppgtt, reg_state, 0);
+ -}
+ -
+ -static u64 execlists_update_context(struct drm_i915_gem_request *rq)
+ +static void execlists_elsp_write(struct drm_i915_gem_request *rq0,
+ +				 struct drm_i915_gem_request *rq1)
+  {
+ -	struct intel_context *ce = &rq->ctx->engine[rq->engine->id];
+ -	struct i915_hw_ppgtt *ppgtt =
+ -		rq->ctx->ppgtt ?: rq->i915->mm.aliasing_ppgtt;
+ -	u32 *reg_state = ce->lrc_reg_state;
+  
+ -	GEM_BUG_ON(!IS_ALIGNED(rq->tail, 8));
+ -	reg_state[CTX_RING_TAIL+1] = rq->tail;
+ +	struct intel_engine_cs *ring = rq0->ring;
+ +	struct drm_device *dev = ring->dev;
+ +	struct drm_i915_private *dev_priv = dev->dev_private;
+ +	uint64_t desc[2];
+  
+ -	/* True 32b PPGTT with dynamic page allocation: update PDP
+ -	 * registers and point the unallocated PDPs to scratch page.
+ -	 * PML4 is allocated during ppgtt init, so this is not needed
+ -	 * in 48-bit mode.
+ -	 */
+ -	if (ppgtt && !i915_vm_is_48bit(&ppgtt->base))
+ -		execlists_update_context_pdps(ppgtt, reg_state);
+ -
+ -	return ce->lrc_desc;
+ -}
+ -
+ -static void execlists_submit_ports(struct intel_engine_cs *engine)
+ -{
+ -	struct drm_i915_private *dev_priv = engine->i915;
+ -	struct execlist_port *port = engine->execlist_port;
+ -	u32 __iomem *elsp =
+ -		dev_priv->regs + i915_mmio_reg_offset(RING_ELSP(engine));
+ -	u64 desc[2];
+ -
+ -	GEM_BUG_ON(port[0].count > 1);
+ -	if (!port[0].count)
+ -		execlists_context_status_change(port[0].request,
+ -						INTEL_CONTEXT_SCHEDULE_IN);
+ -	desc[0] = execlists_update_context(port[0].request);
+ -	GEM_DEBUG_EXEC(port[0].context_id = upper_32_bits(desc[0]));
+ -	port[0].count++;
+ -
+ -	if (port[1].request) {
+ -		GEM_BUG_ON(port[1].count);
+ -		execlists_context_status_change(port[1].request,
+ -						INTEL_CONTEXT_SCHEDULE_IN);
+ -		desc[1] = execlists_update_context(port[1].request);
+ -		GEM_DEBUG_EXEC(port[1].context_id = upper_32_bits(desc[1]));
+ -		port[1].count = 1;
+ +	if (rq1) {
+ +		desc[1] = intel_lr_context_descriptor(rq1->ctx, rq1->ring);
+ +		rq1->elsp_submitted++;
+  	} else {
+  		desc[1] = 0;
+  	}
+diff --cc drivers/gpu/drm/i915/intel_ringbuffer.h
+index 566b0ae10ce0,8bdba18420fa..000000000000
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@@ -268,58 -379,39 +268,65 @@@ struct  intel_engine_cs 
+  	} semaphore;
+  
+  	/* Execlists */
+ -	struct tasklet_struct irq_tasklet;
+ -	struct execlist_port {
+ -		struct drm_i915_gem_request *request;
+ -		unsigned int count;
+ -		GEM_DEBUG_DECL(u32 context_id);
+ -	} execlist_port[2];
+ -	struct rb_root execlist_queue;
+ -	struct rb_node *execlist_first;
+ -	unsigned int fw_domains;
+ -
+ -	/* Contexts are pinned whilst they are active on the GPU. The last
+ -	 * context executed remains active whilst the GPU is idle - the
+ -	 * switch away and write to the context object only occurs on the
+ -	 * next execution.  Contexts are only unpinned on retirement of the
+ -	 * following request ensuring that we can always write to the object
+ -	 * on the context switch even after idling. Across suspend, we switch
+ -	 * to the kernel context and trash it as the save may not happen
+ -	 * before the hardware is powered down.
+ +	spinlock_t execlist_lock;
+ +	struct list_head execlist_queue;
+ +	struct list_head execlist_retired_req_list;
+ +	u8 next_context_status_buffer;
+ +	bool disable_lite_restore_wa;
+ +	u32 ctx_desc_template;
+ +	u32             irq_keep_mask; /* bitmask for interrupts that should not be masked */
+ +	int		(*emit_request)(struct drm_i915_gem_request *request);
+ +	int		(*emit_flush)(struct drm_i915_gem_request *request,
+ +				      u32 invalidate_domains,
+ +				      u32 flush_domains);
+ +	int		(*emit_bb_start)(struct drm_i915_gem_request *req,
+ +					 u64 offset, unsigned dispatch_flags);
+ +
+ +	/**
+ +	 * List of objects currently involved in rendering from the
+ +	 * ringbuffer.
+ +	 *
+ +	 * Includes buffers having the contents of their GPU caches
+ +	 * flushed, not necessarily primitives.  last_read_req
+ +	 * represents when the rendering involved will be completed.
+ +	 *
+ +	 * A reference is held on the buffer while on this list.
+  	 */
+ -	struct i915_gem_context *last_retired_context;
+ +	struct list_head active_list;
+  
+ -	/* We track the current MI_SET_CONTEXT in order to eliminate
+ -	 * redudant context switches. This presumes that requests are not
+ -	 * reordered! Or when they are the tracking is updated along with
+ -	 * the emission of individual requests into the legacy command
+ -	 * stream (ring).
+ +	/**
+ +	 * List of breadcrumbs associated with GPU requests currently
+ +	 * outstanding.
+  	 */
+ -	struct i915_gem_context *legacy_active_context;
+ +	struct list_head request_list;
+  
+++<<<<<<< HEAD
+ +	/**
+ +	 * Seqno of request most recently submitted to request_list.
+ +	 * Used exclusively by hang checker to avoid grabbing lock while
+ +	 * inspecting request list.
+ +	 */
+ +	u32 last_submitted_seqno;
+ +
+ +	bool gpu_caches_dirty;
+ +
+ +	wait_queue_head_t irq_queue;
+ +
+ +	struct intel_context *last_context;
+ +
+ +	struct intel_ring_hangcheck hangcheck;
+ +
+ +	struct {
+ +		struct drm_i915_gem_object *obj;
+ +		u32 gtt_offset;
+ +		volatile u32 *cpu_page;
+ +	} scratch;
+++=======
++ 	/* status_notifier: list of callbacks for context-switch changes */
++ 	struct atomic_notifier_head context_status_notifier;
++ 
++ 	struct intel_engine_hangcheck hangcheck;
+++>>>>>>> 3fc03069bc6e (drm/i915: make context status notifier head be per engine)
+  
+  	bool needs_cmd_parser;
+  
+* Unmerged path drivers/gpu/drm/i915/gvt/gvt.h
+* Unmerged path drivers/gpu/drm/i915/gvt/scheduler.c
+* Unmerged path drivers/gpu/drm/i915/i915_gem_context.h
+* Unmerged path drivers/gpu/drm/i915/intel_engine_cs.c
+* Unmerged path drivers/gpu/drm/i915/gvt/gvt.h
+* Unmerged path drivers/gpu/drm/i915/gvt/scheduler.c
+* Unmerged path drivers/gpu/drm/i915/i915_gem_context.c
+* Unmerged path drivers/gpu/drm/i915/i915_gem_context.h
+* Unmerged path drivers/gpu/drm/i915/intel_engine_cs.c
+* Unmerged path drivers/gpu/drm/i915/intel_lrc.c
+* Unmerged path drivers/gpu/drm/i915/intel_ringbuffer.h
