@@ -1,0 +1,157 @@
+vxlan: Set ports in flow key when doing route lookups
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Martynas Pumputis <martynas@weave.works>
+commit 4ecb1d83f6abe8d49163427f4d431ebe98f8bd5f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/4ecb1d83.failed
+
+Otherwise, a xfrm policy with sport/dport being set cannot be matched.
+
+	Signed-off-by: Martynas Pumputis <martynas@weave.works>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4ecb1d83f6abe8d49163427f4d431ebe98f8bd5f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+diff --cc drivers/net/vxlan.c
+index 7f3ca81e43cb,ca7196c40060..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -1772,15 -1793,12 +1772,15 @@@ static int vxlan_build_skb(struct sk_bu
+  
+  	skb_set_inner_protocol(skb, inner_protocol);
+  	return 0;
+ +
+ +out_free:
+ +	kfree_skb(skb);
+ +	return err;
+  }
+  
+ -static struct rtable *vxlan_get_route(struct vxlan_dev *vxlan, struct net_device *dev,
+ -				      struct vxlan_sock *sock4,
+ +static struct rtable *vxlan_get_route(struct vxlan_dev *vxlan,
+  				      struct sk_buff *skb, int oif, u8 tos,
+- 				      __be32 daddr, __be32 *saddr,
++ 				      __be32 daddr, __be32 *saddr, __be16 dport, __be16 sport,
+  				      struct dst_cache *dst_cache,
+  				      const struct ip_tunnel_info *info)
+  {
+@@@ -1803,9 -1824,17 +1803,11 @@@
+  	fl4.flowi4_proto = IPPROTO_UDP;
+  	fl4.daddr = daddr;
+  	fl4.saddr = *saddr;
++ 	fl4.fl4_dport = dport;
++ 	fl4.fl4_sport = sport;
+  
+  	rt = ip_route_output_key(vxlan->net, &fl4);
+ -	if (likely(!IS_ERR(rt))) {
+ -		if (rt->dst.dev == dev) {
+ -			netdev_dbg(dev, "circular route to %pI4\n", &daddr);
+ -			ip_rt_put(rt);
+ -			return ERR_PTR(-ELOOP);
+ -		}
+ -
+ +	if (!IS_ERR(rt)) {
+  		*saddr = fl4.saddr;
+  		if (use_cache)
+  			dst_cache_set_ip4(dst_cache, &rt->dst, fl4.saddr);
+@@@ -1842,12 -1880,22 +1845,14 @@@ static struct dst_entry *vxlan6_get_rou
+  	fl6.flowlabel = ip6_make_flowinfo(RT_TOS(tos), label);
+  	fl6.flowi6_mark = skb->mark;
+  	fl6.flowi6_proto = IPPROTO_UDP;
++ 	fl6.fl6_dport = dport;
++ 	fl6.fl6_sport = sport;
+  
+  	err = ipv6_stub->ipv6_dst_lookup(vxlan->net,
+ -					 sock6->sock->sk,
+ +					 vxlan->vn6_sock->sock->sk,
+  					 &ndst, &fl6);
+ -	if (unlikely(err < 0)) {
+ -		netdev_dbg(dev, "no route to %pI6\n", daddr);
+ -		return ERR_PTR(-ENETUNREACH);
+ -	}
+ -
+ -	if (unlikely(ndst->dev == dev)) {
+ -		netdev_dbg(dev, "circular route to %pI6\n", daddr);
+ -		dst_release(ndst);
+ -		return ERR_PTR(-ELOOP);
+ -	}
+ +	if (err < 0)
+ +		return ERR_PTR(err);
+  
+  	*saddr = fl6.saddr;
+  	if (use_cache)
+@@@ -1997,11 -2073,10 +2002,12 @@@ static void vxlan_xmit_one(struct sk_bu
+  				     rdst ? rdst->remote_ifindex : 0, tos,
+  				     dst->sin.sin_addr.s_addr,
+  				     &src->sin.sin_addr.s_addr,
++ 				     dst_port, src_port,
+  				     dst_cache, info);
+  		if (IS_ERR(rt)) {
+ -			err = PTR_ERR(rt);
+ +			netdev_dbg(dev, "no route to %pI4\n",
+ +				   &dst->sin.sin_addr.s_addr);
+ +			dev->stats.tx_carrier_errors++;
+  			goto tx_error;
+  		}
+  
+@@@ -2055,11 -2110,11 +2061,12 @@@
+  					rdst ? rdst->remote_ifindex : 0, tos,
+  					label, &dst->sin6.sin6_addr,
+  					&src->sin6.sin6_addr,
++ 					dst_port, src_port,
+  					dst_cache, info);
+  		if (IS_ERR(ndst)) {
+ -			err = PTR_ERR(ndst);
+ -			ndst = NULL;
+ +			netdev_dbg(dev, "no route to %pI6\n",
+ +				   &dst->sin6.sin6_addr);
+ +			dev->stats.tx_carrier_errors++;
+  			goto tx_error;
+  		}
+  
+@@@ -2423,27 -2432,23 +2430,35 @@@ static int vxlan_fill_metadata_dst(stru
+  	dport = info->key.tp_dst ? : vxlan->cfg.dst_port;
+  
+  	if (ip_tunnel_info_af(info) == AF_INET) {
+ -		struct vxlan_sock *sock4 = rcu_dereference(vxlan->vn4_sock);
+  		struct rtable *rt;
+  
+ -		rt = vxlan_get_route(vxlan, dev, sock4, skb, 0, info->key.tos,
+ +		if (!vxlan->vn4_sock)
+ +			return -EINVAL;
+ +		rt = vxlan_get_route(vxlan, skb, 0, info->key.tos,
+  				     info->key.u.ipv4.dst,
+++<<<<<<< HEAD
+ +				     &info->key.u.ipv4.src,
+ +				     &info->dst_cache, info);
+++=======
++ 				     &info->key.u.ipv4.src, dport, sport, NULL, info);
+++>>>>>>> 4ecb1d83f6ab (vxlan: Set ports in flow key when doing route lookups)
+  		if (IS_ERR(rt))
+  			return PTR_ERR(rt);
+  		ip_rt_put(rt);
+  	} else {
+  #if IS_ENABLED(CONFIG_IPV6)
+ -		struct vxlan_sock *sock6 = rcu_dereference(vxlan->vn6_sock);
+  		struct dst_entry *ndst;
+  
+ -		ndst = vxlan6_get_route(vxlan, dev, sock6, skb, 0, info->key.tos,
+ +		if (!vxlan->vn6_sock)
+ +			return -EINVAL;
+ +		ndst = vxlan6_get_route(vxlan, skb, 0, info->key.tos,
+  					info->key.label, &info->key.u.ipv6.dst,
+++<<<<<<< HEAD
+ +					&info->key.u.ipv6.src,
+ +					&info->dst_cache, info);
+++=======
++ 					&info->key.u.ipv6.src, dport, sport, NULL, info);
+++>>>>>>> 4ecb1d83f6ab (vxlan: Set ports in flow key when doing route lookups)
+  		if (IS_ERR(ndst))
+  			return PTR_ERR(ndst);
+  		dst_release(ndst);
+* Unmerged path drivers/net/vxlan.c
