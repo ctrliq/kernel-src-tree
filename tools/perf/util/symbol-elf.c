@@ -1412,7 +1412,7 @@ static int kcore_copy__process_kallsyms(void *arg, const char *name, char type,
 {
 	struct kcore_copy_info *kci = arg;
 
-	if (!symbol_type__is_a(type, MAP__FUNCTION))
+	if (!kallsyms__is_function(type))
 		return 0;
 
 	if (strchr(name, '[')) {
