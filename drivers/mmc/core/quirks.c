@@ -35,7 +35,7 @@
 #define SDIO_DEVICE_ID_MARVELL_8797_F0	0x9128
 #endif
 
-static const struct mmc_fixup mmc_fixup_methods[] = {
+static const struct mmc_fixup sdio_fixup_methods[] = {
 	SDIO_FIXUP(SDIO_VENDOR_ID_TI, SDIO_DEVICE_ID_TI_WL1271,
 		   add_quirk, MMC_QUIRK_NONSTD_FUNC_IF),
 
@@ -55,10 +55,6 @@ void mmc_fixup_device(struct mmc_card *card, const struct mmc_fixup *table)
 {
 	const struct mmc_fixup *f;
 	u64 rev = cid_rev_card(card);
-
-	/* Non-core specific workarounds. */
-	if (!table)
-		table = mmc_fixup_methods;
 
 	for (f = table; f->vendor_fixup; f++) {
 		if ((f->manfid == CID_MANFID_ANY ||
