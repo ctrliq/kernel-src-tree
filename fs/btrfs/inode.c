@@ -5808,7 +5808,7 @@ static int btrfs_real_readdir(struct file *filp, void *dirent,
 			if (name_len <= sizeof(tmp_name)) {
 				name_ptr = tmp_name;
 			} else {
-				name_ptr = kmalloc(name_len, GFP_NOFS);
+				name_ptr = kmalloc(name_len, GFP_KERNEL);
 				if (!name_ptr) {
 					ret = -ENOMEM;
 					goto err;
