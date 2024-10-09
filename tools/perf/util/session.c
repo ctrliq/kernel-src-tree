@@ -1497,10 +1497,27 @@ int perf_session__register_idle_thread(struct perf_session *session)
 	return err;
 }
 
+static void
+perf_session__warn_order(const struct perf_session *session)
+{
+	const struct ordered_events *oe = &session->ordered_events;
+	struct perf_evsel *evsel;
+	bool should_warn = true;
+
+	evlist__for_each_entry(session->evlist, evsel) {
+		if (evsel->attr.write_backward)
+			should_warn = false;
+	}
+
+	if (!should_warn)
+		return;
+	if (oe->nr_unordered_events != 0)
+		ui__warning("%u out of order events recorded.\n", oe->nr_unordered_events);
+}
+
 static void perf_session__warn_about_errors(const struct perf_session *session)
 {
 	const struct events_stats *stats = &session->evlist->stats;
-	const struct ordered_events *oe = &session->ordered_events;
 
 	if (session->tool->lost == perf_event__process_lost &&
 	    stats->nr_events[PERF_RECORD_LOST] != 0) {
@@ -1557,8 +1574,7 @@ static void perf_session__warn_about_errors(const struct perf_session *session)
 			    stats->nr_unprocessable_samples);
 	}
 
-	if (oe->nr_unordered_events != 0)
-		ui__warning("%u out of order events recorded.\n", oe->nr_unordered_events);
+	perf_session__warn_order(session);
 
 	events_stats__auxtrace_error_warn(stats);
 
