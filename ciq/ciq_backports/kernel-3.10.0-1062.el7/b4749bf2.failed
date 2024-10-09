@@ -1,0 +1,561 @@
+RDMA/mlx5: Add a new flow action verb - modify header
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Mark Bloch <markb@mellanox.com>
+commit b4749bf25652689d8e33827460266b78bb2ec42c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/b4749bf2.failed
+
+Expose the ability to create a flow action which changes packet
+headers. The data passed from userspace should be modify header actions as
+defined by HW specification.
+
+	Signed-off-by: Mark Bloch <markb@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit b4749bf25652689d8e33827460266b78bb2ec42c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/flow.c
+#	drivers/infiniband/hw/mlx5/main.c
+#	drivers/infiniband/hw/mlx5/mlx5_ib.h
+#	drivers/net/ethernet/mellanox/mlx5/core/vxlan.h
+#	include/uapi/rdma/mlx5_user_ioctl_cmds.h
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index 1d3555c545d0,d41419fb6b3e..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -3325,6 -3658,355 +3325,358 @@@ unlock
+  	return ERR_PTR(err);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct mlx5_ib_flow_prio *_get_flow_table(struct mlx5_ib_dev *dev,
++ 						 int priority, bool mcast)
++ {
++ 	int max_table_size;
++ 	struct mlx5_flow_namespace *ns = NULL;
++ 	struct mlx5_ib_flow_prio *prio;
++ 
++ 	max_table_size = BIT(MLX5_CAP_FLOWTABLE_NIC_RX(dev->mdev,
++ 			     log_max_ft_size));
++ 	if (max_table_size < MLX5_FS_MAX_ENTRIES)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	if (mcast)
++ 		priority = MLX5_IB_FLOW_MCAST_PRIO;
++ 	else
++ 		priority = ib_prio_to_core_prio(priority, false);
++ 
++ 	ns = mlx5_get_flow_namespace(dev->mdev, MLX5_FLOW_NAMESPACE_BYPASS);
++ 	if (!ns)
++ 		return ERR_PTR(-ENOTSUPP);
++ 
++ 	prio = &dev->flow_db->prios[priority];
++ 
++ 	if (prio->flow_table)
++ 		return prio;
++ 
++ 	return _get_prio(ns, prio, priority, MLX5_FS_MAX_ENTRIES,
++ 			 MLX5_FS_MAX_TYPES);
++ }
++ 
++ static struct mlx5_ib_flow_handler *
++ _create_raw_flow_rule(struct mlx5_ib_dev *dev,
++ 		      struct mlx5_ib_flow_prio *ft_prio,
++ 		      struct mlx5_flow_destination *dst,
++ 		      struct mlx5_ib_flow_matcher  *fs_matcher,
++ 		      void *cmd_in, int inlen)
++ {
++ 	struct mlx5_ib_flow_handler *handler;
++ 	struct mlx5_flow_act flow_act = {.flow_tag = MLX5_FS_DEFAULT_FLOW_TAG};
++ 	struct mlx5_flow_spec *spec;
++ 	struct mlx5_flow_table *ft = ft_prio->flow_table;
++ 	int err = 0;
++ 
++ 	spec = kvzalloc(sizeof(*spec), GFP_KERNEL);
++ 	handler = kzalloc(sizeof(*handler), GFP_KERNEL);
++ 	if (!handler || !spec) {
++ 		err = -ENOMEM;
++ 		goto free;
++ 	}
++ 
++ 	INIT_LIST_HEAD(&handler->list);
++ 
++ 	memcpy(spec->match_value, cmd_in, inlen);
++ 	memcpy(spec->match_criteria, fs_matcher->matcher_mask.match_params,
++ 	       fs_matcher->mask_len);
++ 	spec->match_criteria_enable = fs_matcher->match_criteria_enable;
++ 
++ 	flow_act.action |= MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
++ 	handler->rule = mlx5_add_flow_rules(ft, spec,
++ 					    &flow_act, dst, 1);
++ 
++ 	if (IS_ERR(handler->rule)) {
++ 		err = PTR_ERR(handler->rule);
++ 		goto free;
++ 	}
++ 
++ 	ft_prio->refcount++;
++ 	handler->prio = ft_prio;
++ 	handler->dev = dev;
++ 	ft_prio->flow_table = ft;
++ 
++ free:
++ 	if (err)
++ 		kfree(handler);
++ 	kvfree(spec);
++ 	return err ? ERR_PTR(err) : handler;
++ }
++ 
++ static bool raw_fs_is_multicast(struct mlx5_ib_flow_matcher *fs_matcher,
++ 				void *match_v)
++ {
++ 	void *match_c;
++ 	void *match_v_set_lyr_2_4, *match_c_set_lyr_2_4;
++ 	void *dmac, *dmac_mask;
++ 	void *ipv4, *ipv4_mask;
++ 
++ 	if (!(fs_matcher->match_criteria_enable &
++ 	      (1 << MATCH_CRITERIA_ENABLE_OUTER_BIT)))
++ 		return false;
++ 
++ 	match_c = fs_matcher->matcher_mask.match_params;
++ 	match_v_set_lyr_2_4 = MLX5_ADDR_OF(fte_match_param, match_v,
++ 					   outer_headers);
++ 	match_c_set_lyr_2_4 = MLX5_ADDR_OF(fte_match_param, match_c,
++ 					   outer_headers);
++ 
++ 	dmac = MLX5_ADDR_OF(fte_match_set_lyr_2_4, match_v_set_lyr_2_4,
++ 			    dmac_47_16);
++ 	dmac_mask = MLX5_ADDR_OF(fte_match_set_lyr_2_4, match_c_set_lyr_2_4,
++ 				 dmac_47_16);
++ 
++ 	if (is_multicast_ether_addr(dmac) &&
++ 	    is_multicast_ether_addr(dmac_mask))
++ 		return true;
++ 
++ 	ipv4 = MLX5_ADDR_OF(fte_match_set_lyr_2_4, match_v_set_lyr_2_4,
++ 			    dst_ipv4_dst_ipv6.ipv4_layout.ipv4);
++ 
++ 	ipv4_mask = MLX5_ADDR_OF(fte_match_set_lyr_2_4, match_c_set_lyr_2_4,
++ 				 dst_ipv4_dst_ipv6.ipv4_layout.ipv4);
++ 
++ 	if (ipv4_is_multicast(*(__be32 *)(ipv4)) &&
++ 	    ipv4_is_multicast(*(__be32 *)(ipv4_mask)))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ struct mlx5_ib_flow_handler *
++ mlx5_ib_raw_fs_rule_add(struct mlx5_ib_dev *dev,
++ 			struct mlx5_ib_flow_matcher *fs_matcher,
++ 			void *cmd_in, int inlen, int dest_id,
++ 			int dest_type)
++ {
++ 	struct mlx5_flow_destination *dst;
++ 	struct mlx5_ib_flow_prio *ft_prio;
++ 	int priority = fs_matcher->priority;
++ 	struct mlx5_ib_flow_handler *handler;
++ 	bool mcast;
++ 	int err;
++ 
++ 	if (fs_matcher->flow_type != MLX5_IB_FLOW_TYPE_NORMAL)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	if (fs_matcher->priority > MLX5_IB_FLOW_LAST_PRIO)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	dst = kzalloc(sizeof(*dst), GFP_KERNEL);
++ 	if (!dst)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	mcast = raw_fs_is_multicast(fs_matcher, cmd_in);
++ 	mutex_lock(&dev->flow_db->lock);
++ 
++ 	ft_prio = _get_flow_table(dev, priority, mcast);
++ 	if (IS_ERR(ft_prio)) {
++ 		err = PTR_ERR(ft_prio);
++ 		goto unlock;
++ 	}
++ 
++ 	if (dest_type == MLX5_FLOW_DESTINATION_TYPE_TIR) {
++ 		dst->type = dest_type;
++ 		dst->tir_num = dest_id;
++ 	} else {
++ 		dst->type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE_NUM;
++ 		dst->ft_num = dest_id;
++ 	}
++ 
++ 	handler = _create_raw_flow_rule(dev, ft_prio, dst, fs_matcher, cmd_in,
++ 					inlen);
++ 
++ 	if (IS_ERR(handler)) {
++ 		err = PTR_ERR(handler);
++ 		goto destroy_ft;
++ 	}
++ 
++ 	mutex_unlock(&dev->flow_db->lock);
++ 	atomic_inc(&fs_matcher->usecnt);
++ 	handler->flow_matcher = fs_matcher;
++ 
++ 	kfree(dst);
++ 
++ 	return handler;
++ 
++ destroy_ft:
++ 	put_flow_table(dev, ft_prio, false);
++ unlock:
++ 	mutex_unlock(&dev->flow_db->lock);
++ 	kfree(dst);
++ 
++ 	return ERR_PTR(err);
++ }
++ 
++ static u32 mlx5_ib_flow_action_flags_to_accel_xfrm_flags(u32 mlx5_flags)
++ {
++ 	u32 flags = 0;
++ 
++ 	if (mlx5_flags & MLX5_IB_UAPI_FLOW_ACTION_FLAGS_REQUIRE_METADATA)
++ 		flags |= MLX5_ACCEL_XFRM_FLAG_REQUIRE_METADATA;
++ 
++ 	return flags;
++ }
++ 
++ #define MLX5_FLOW_ACTION_ESP_CREATE_LAST_SUPPORTED	MLX5_IB_UAPI_FLOW_ACTION_FLAGS_REQUIRE_METADATA
++ static struct ib_flow_action *
++ mlx5_ib_create_flow_action_esp(struct ib_device *device,
++ 			       const struct ib_flow_action_attrs_esp *attr,
++ 			       struct uverbs_attr_bundle *attrs)
++ {
++ 	struct mlx5_ib_dev *mdev = to_mdev(device);
++ 	struct ib_uverbs_flow_action_esp_keymat_aes_gcm *aes_gcm;
++ 	struct mlx5_accel_esp_xfrm_attrs accel_attrs = {};
++ 	struct mlx5_ib_flow_action *action;
++ 	u64 action_flags;
++ 	u64 flags;
++ 	int err = 0;
++ 
++ 	err = uverbs_get_flags64(
++ 		&action_flags, attrs, MLX5_IB_ATTR_CREATE_FLOW_ACTION_FLAGS,
++ 		((MLX5_FLOW_ACTION_ESP_CREATE_LAST_SUPPORTED << 1) - 1));
++ 	if (err)
++ 		return ERR_PTR(err);
++ 
++ 	flags = mlx5_ib_flow_action_flags_to_accel_xfrm_flags(action_flags);
++ 
++ 	/* We current only support a subset of the standard features. Only a
++ 	 * keymat of type AES_GCM, with icv_len == 16, iv_algo == SEQ and esn
++ 	 * (with overlap). Full offload mode isn't supported.
++ 	 */
++ 	if (!attr->keymat || attr->replay || attr->encap ||
++ 	    attr->spi || attr->seq || attr->tfc_pad ||
++ 	    attr->hard_limit_pkts ||
++ 	    (attr->flags & ~(IB_FLOW_ACTION_ESP_FLAGS_ESN_TRIGGERED |
++ 			     IB_UVERBS_FLOW_ACTION_ESP_FLAGS_ENCRYPT)))
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	if (attr->keymat->protocol !=
++ 	    IB_UVERBS_FLOW_ACTION_ESP_KEYMAT_AES_GCM)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	aes_gcm = &attr->keymat->keymat.aes_gcm;
++ 
++ 	if (aes_gcm->icv_len != 16 ||
++ 	    aes_gcm->iv_algo != IB_UVERBS_FLOW_ACTION_IV_ALGO_SEQ)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	action = kmalloc(sizeof(*action), GFP_KERNEL);
++ 	if (!action)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	action->esp_aes_gcm.ib_flags = attr->flags;
++ 	memcpy(&accel_attrs.keymat.aes_gcm.aes_key, &aes_gcm->aes_key,
++ 	       sizeof(accel_attrs.keymat.aes_gcm.aes_key));
++ 	accel_attrs.keymat.aes_gcm.key_len = aes_gcm->key_len * 8;
++ 	memcpy(&accel_attrs.keymat.aes_gcm.salt, &aes_gcm->salt,
++ 	       sizeof(accel_attrs.keymat.aes_gcm.salt));
++ 	memcpy(&accel_attrs.keymat.aes_gcm.seq_iv, &aes_gcm->iv,
++ 	       sizeof(accel_attrs.keymat.aes_gcm.seq_iv));
++ 	accel_attrs.keymat.aes_gcm.icv_len = aes_gcm->icv_len * 8;
++ 	accel_attrs.keymat.aes_gcm.iv_algo = MLX5_ACCEL_ESP_AES_GCM_IV_ALGO_SEQ;
++ 	accel_attrs.keymat_type = MLX5_ACCEL_ESP_KEYMAT_AES_GCM;
++ 
++ 	accel_attrs.esn = attr->esn;
++ 	if (attr->flags & IB_FLOW_ACTION_ESP_FLAGS_ESN_TRIGGERED)
++ 		accel_attrs.flags |= MLX5_ACCEL_ESP_FLAGS_ESN_TRIGGERED;
++ 	if (attr->flags & IB_UVERBS_FLOW_ACTION_ESP_FLAGS_ESN_NEW_WINDOW)
++ 		accel_attrs.flags |= MLX5_ACCEL_ESP_FLAGS_ESN_STATE_OVERLAP;
++ 
++ 	if (attr->flags & IB_UVERBS_FLOW_ACTION_ESP_FLAGS_ENCRYPT)
++ 		accel_attrs.action |= MLX5_ACCEL_ESP_ACTION_ENCRYPT;
++ 
++ 	action->esp_aes_gcm.ctx =
++ 		mlx5_accel_esp_create_xfrm(mdev->mdev, &accel_attrs, flags);
++ 	if (IS_ERR(action->esp_aes_gcm.ctx)) {
++ 		err = PTR_ERR(action->esp_aes_gcm.ctx);
++ 		goto err_parse;
++ 	}
++ 
++ 	action->esp_aes_gcm.ib_flags = attr->flags;
++ 
++ 	return &action->ib_action;
++ 
++ err_parse:
++ 	kfree(action);
++ 	return ERR_PTR(err);
++ }
++ 
++ static int
++ mlx5_ib_modify_flow_action_esp(struct ib_flow_action *action,
++ 			       const struct ib_flow_action_attrs_esp *attr,
++ 			       struct uverbs_attr_bundle *attrs)
++ {
++ 	struct mlx5_ib_flow_action *maction = to_mflow_act(action);
++ 	struct mlx5_accel_esp_xfrm_attrs accel_attrs;
++ 	int err = 0;
++ 
++ 	if (attr->keymat || attr->replay || attr->encap ||
++ 	    attr->spi || attr->seq || attr->tfc_pad ||
++ 	    attr->hard_limit_pkts ||
++ 	    (attr->flags & ~(IB_FLOW_ACTION_ESP_FLAGS_ESN_TRIGGERED |
++ 			     IB_FLOW_ACTION_ESP_FLAGS_MOD_ESP_ATTRS |
++ 			     IB_UVERBS_FLOW_ACTION_ESP_FLAGS_ESN_NEW_WINDOW)))
++ 		return -EOPNOTSUPP;
++ 
++ 	/* Only the ESN value or the MLX5_ACCEL_ESP_FLAGS_ESN_STATE_OVERLAP can
++ 	 * be modified.
++ 	 */
++ 	if (!(maction->esp_aes_gcm.ib_flags &
++ 	      IB_FLOW_ACTION_ESP_FLAGS_ESN_TRIGGERED) &&
++ 	    attr->flags & (IB_FLOW_ACTION_ESP_FLAGS_ESN_TRIGGERED |
++ 			   IB_UVERBS_FLOW_ACTION_ESP_FLAGS_ESN_NEW_WINDOW))
++ 		return -EINVAL;
++ 
++ 	memcpy(&accel_attrs, &maction->esp_aes_gcm.ctx->attrs,
++ 	       sizeof(accel_attrs));
++ 
++ 	accel_attrs.esn = attr->esn;
++ 	if (attr->flags & IB_UVERBS_FLOW_ACTION_ESP_FLAGS_ESN_NEW_WINDOW)
++ 		accel_attrs.flags |= MLX5_ACCEL_ESP_FLAGS_ESN_STATE_OVERLAP;
++ 	else
++ 		accel_attrs.flags &= ~MLX5_ACCEL_ESP_FLAGS_ESN_STATE_OVERLAP;
++ 
++ 	err = mlx5_accel_esp_modify_xfrm(maction->esp_aes_gcm.ctx,
++ 					 &accel_attrs);
++ 	if (err)
++ 		return err;
++ 
++ 	maction->esp_aes_gcm.ib_flags &=
++ 		~IB_UVERBS_FLOW_ACTION_ESP_FLAGS_ESN_NEW_WINDOW;
++ 	maction->esp_aes_gcm.ib_flags |=
++ 		attr->flags & IB_UVERBS_FLOW_ACTION_ESP_FLAGS_ESN_NEW_WINDOW;
++ 
++ 	return 0;
++ }
++ 
++ static int mlx5_ib_destroy_flow_action(struct ib_flow_action *action)
++ {
++ 	struct mlx5_ib_flow_action *maction = to_mflow_act(action);
++ 
++ 	switch (action->type) {
++ 	case IB_FLOW_ACTION_ESP:
++ 		/*
++ 		 * We only support aes_gcm by now, so we implicitly know this is
++ 		 * the underline crypto.
++ 		 */
++ 		mlx5_accel_esp_destroy_xfrm(maction->esp_aes_gcm.ctx);
++ 		break;
++ 	case IB_FLOW_ACTION_UNSPECIFIED:
++ 		mlx5_ib_destroy_flow_action_raw(maction);
++ 		break;
++ 	default:
++ 		WARN_ON(true);
++ 		break;
++ 	}
++ 
++ 	kfree(maction);
++ 	return 0;
++ }
++ 
+++>>>>>>> b4749bf25652 (RDMA/mlx5: Add a new flow action verb - modify header)
+  static int mlx5_ib_mcg_attach(struct ib_qp *ibqp, union ib_gid *gid, u16 lid)
+  {
+  	struct mlx5_ib_dev *dev = to_mdev(ibqp->device);
+diff --cc drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 71b1991d86b3,c26ea868b4f1..000000000000
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@@ -766,8 -811,65 +770,70 @@@ struct mlx5_ib_multiport_info 
+  	bool unaffiliate;
+  };
+  
+++<<<<<<< HEAD
+++struct mlx5_ib_dev {
+++	struct ib_device		ib_dev;
+++=======
++ struct mlx5_ib_flow_action {
++ 	struct ib_flow_action		ib_action;
++ 	union {
++ 		struct {
++ 			u64			    ib_flags;
++ 			struct mlx5_accel_esp_xfrm *ctx;
++ 		} esp_aes_gcm;
++ 		struct {
++ 			struct mlx5_ib_dev *dev;
++ 			u32 sub_type;
++ 			u32 action_id;
++ 		} flow_action_raw;
++ 	};
++ };
++ 
++ struct mlx5_memic {
++ 	struct mlx5_core_dev *dev;
++ 	spinlock_t		memic_lock;
++ 	DECLARE_BITMAP(memic_alloc_pages, MLX5_MAX_MEMIC_PAGES);
++ };
++ 
++ struct mlx5_read_counters_attr {
++ 	struct mlx5_fc *hw_cntrs_hndl;
++ 	u64 *out;
++ 	u32 flags;
++ };
++ 
++ enum mlx5_ib_counters_type {
++ 	MLX5_IB_COUNTERS_FLOW,
++ };
++ 
++ struct mlx5_ib_mcounters {
++ 	struct ib_counters ibcntrs;
++ 	enum mlx5_ib_counters_type type;
++ 	/* number of counters supported for this counters type */
++ 	u32 counters_num;
++ 	struct mlx5_fc *hw_cntrs_hndl;
++ 	/* read function for this counters type */
++ 	int (*read_counters)(struct ib_device *ibdev,
++ 			     struct mlx5_read_counters_attr *read_attr);
++ 	/* max index set as part of create_flow */
++ 	u32 cntrs_max_index;
++ 	/* number of counters data entries (<description,index> pair) */
++ 	u32 ncounters;
++ 	/* counters data array for descriptions and indexes */
++ 	struct mlx5_ib_flow_counters_desc *counters_data;
++ 	/* protects access to mcounters internal data */
++ 	struct mutex mcntrs_mutex;
++ };
++ 
++ static inline struct mlx5_ib_mcounters *
++ to_mcounters(struct ib_counters *ibcntrs)
++ {
++ 	return container_of(ibcntrs, struct mlx5_ib_mcounters, ibcntrs);
++ }
++ 
+  struct mlx5_ib_dev {
+  	struct ib_device		ib_dev;
++ 	const struct uverbs_object_tree_def *driver_trees[7];
+++>>>>>>> b4749bf25652 (RDMA/mlx5: Add a new flow action verb - modify header)
+  	struct mlx5_core_dev		*mdev;
+  	struct mlx5_roce		roce[MLX5_MAX_PORTS];
+  	int				num_ports;
+@@@ -1092,6 -1236,42 +1158,45 @@@ struct mlx5_core_dev *mlx5_ib_get_nativ
+  void mlx5_ib_put_native_port_mdev(struct mlx5_ib_dev *dev,
+  				  u8 port_num);
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_INFINIBAND_USER_ACCESS)
++ int mlx5_ib_devx_create(struct mlx5_ib_dev *dev,
++ 			struct mlx5_ib_ucontext *context);
++ void mlx5_ib_devx_destroy(struct mlx5_ib_dev *dev,
++ 			  struct mlx5_ib_ucontext *context);
++ const struct uverbs_object_tree_def *mlx5_ib_get_devx_tree(void);
++ struct mlx5_ib_flow_handler *mlx5_ib_raw_fs_rule_add(
++ 	struct mlx5_ib_dev *dev, struct mlx5_ib_flow_matcher *fs_matcher,
++ 	void *cmd_in, int inlen, int dest_id, int dest_type);
++ bool mlx5_ib_devx_is_flow_dest(void *obj, int *dest_id, int *dest_type);
++ int mlx5_ib_get_flow_trees(const struct uverbs_object_tree_def **root);
++ void mlx5_ib_destroy_flow_action_raw(struct mlx5_ib_flow_action *maction);
++ #else
++ static inline int
++ mlx5_ib_devx_create(struct mlx5_ib_dev *dev,
++ 		    struct mlx5_ib_ucontext *context) { return -EOPNOTSUPP; };
++ static inline void mlx5_ib_devx_destroy(struct mlx5_ib_dev *dev,
++ 					struct mlx5_ib_ucontext *context) {}
++ static inline const struct uverbs_object_tree_def *
++ mlx5_ib_get_devx_tree(void) { return NULL; }
++ static inline bool mlx5_ib_devx_is_flow_dest(void *obj, int *dest_id,
++ 					     int *dest_type)
++ {
++ 	return false;
++ }
++ static inline int
++ mlx5_ib_get_flow_trees(const struct uverbs_object_tree_def **root)
++ {
++ 	return 0;
++ }
++ static inline void
++ mlx5_ib_destroy_flow_action_raw(struct mlx5_ib_flow_action *maction)
++ {
++ 	return;
++ };
++ #endif
+++>>>>>>> b4749bf25652 (RDMA/mlx5: Add a new flow action verb - modify header)
+  static inline void init_query_mad(struct ib_smp *mad)
+  {
+  	mad->base_version  = 1;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/vxlan.h
+index 6b38b6fbd030,ceb6d0d8529a..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/vxlan.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/vxlan.h
+@@@ -29,24 -29,20 +29,33 @@@
+   * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   * SOFTWARE.
+   */
+ +#ifndef __MLX5_VXLAN_H__
+ +#define __MLX5_VXLAN_H__
+  
+ -#ifndef MLX5_USER_IOCTL_VERBS_H
+ -#define MLX5_USER_IOCTL_VERBS_H
+ +#include <linux/mlx5/driver.h>
+ +#include "en.h"
+  
+ -#include <linux/types.h>
+ +struct mlx5_vxlan_port;
+  
+ -enum mlx5_ib_uapi_flow_action_flags {
+ -	MLX5_IB_UAPI_FLOW_ACTION_FLAGS_REQUIRE_METADATA	= 1 << 0,
+ -};
+ +static inline bool mlx5e_vxlan_allowed(struct mlx5_core_dev *mdev)
+ +{
+ +	return (MLX5_CAP_ETH(mdev, tunnel_stateless_vxlan) &&
+ +		mlx5_core_is_pf(mdev));
+ +}
+  
+++<<<<<<< HEAD:drivers/net/ethernet/mellanox/mlx5/core/vxlan.h
+ +void mlx5e_vxlan_init(struct mlx5e_priv *priv);
+ +void mlx5e_vxlan_cleanup(struct mlx5e_priv *priv);
+ +void mlx5e_vxlan_add_port(struct mlx5e_priv *priv, u16 port);
+ +void mlx5e_vxlan_del_port(struct mlx5e_priv *priv, u16 port);
+ +struct mlx5_vxlan_port *mlx5e_vxlan_lookup_port(struct mlx5e_priv *priv, u16 port);
+++=======
++ enum mlx5_ib_uapi_flow_table_type {
++ 	MLX5_IB_UAPI_FLOW_TABLE_TYPE_NIC_RX     = 0x0,
++ 	MLX5_IB_UAPI_FLOW_TABLE_TYPE_NIC_TX	= 0x1,
++ };
++ 
++ #endif
+++>>>>>>> b4749bf25652 (RDMA/mlx5: Add a new flow action verb - modify header):include/uapi/rdma/mlx5_user_ioctl_verbs.h
+  
+ +#endif /* __MLX5_VXLAN_H__ */
+* Unmerged path drivers/infiniband/hw/mlx5/flow.c
+* Unmerged path include/uapi/rdma/mlx5_user_ioctl_cmds.h
+* Unmerged path drivers/infiniband/hw/mlx5/flow.c
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+* Unmerged path drivers/infiniband/hw/mlx5/mlx5_ib.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/vxlan.h
+* Unmerged path include/uapi/rdma/mlx5_user_ioctl_cmds.h
