@@ -1,0 +1,233 @@
+qla2xxx: Check for online flag instead of active reset when transmitting responses
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Dilip Kumar Uppugandla <dilip@purestorage.com>
+commit 3bb67df5b5f880a1c9c1086308cf2b981d824da5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3bb67df5.failed
+
+Driver has following initialization sequence for Target mode
+
+1. Driver initialization starts
+
+2. ISP Abort is scheduled when the target is enabled.
+
+qla2xxx [0000:04:00.0]-4807:25: ISP abort scheduled
+qla2xxx [0000:04:00.0]-00af:25: Performing ISP error recovery - ha=ffff880caa9e0000.
+
+3. DPC thread starts the ISP Abort
+
+4. While DPC is resetting the chip and initializing the firmware, we get
+   async events from the firmware about P2P mode, LOOP UP and PORT UPDATE.
+
+5. PRLI from a initiator is delivered to us followed by a PLOGI and then a
+   SCSI command which creates a session.
+
+6. If the SCSI command is a WRITE in this case, we issue XFR RDY and it
+   gets dropped as can be seen with messages RESET-XFR because ISP Abort
+   is still active
+
+qla2xxx [0000:04:00.0]-e902:25: RESET-XFR active/old-count/new-count = 1/1/1.
+
+7. If the SCSI command is a READ, we issue RESPONSE and they get dropped
+   as well because Abort is still active.
+
+qla2xxx [0000:04:00.0]-e901:25: RESET-RSP active/old-count/new-count = 1/1/1
+
+8. Now eventually, ISP Abort finishes clearing the DPC flags.
+
+qla2xxx [0000:04:00.0]-8822:25: qla2x00_abort_isp succeeded.
+qla2xxx [0000:04:00.0]-4808:25: ISP abort end.
+
+9. Since we dropped SCSI commands silently (without any responses sent
+   to the initiator) initiator waits for a SCSI timeout (which is 60
+   seconds in our case), Sends an ABTS which fails since there
+   no se_cmd found for the tag that ABTS is referencing as the
+   commands were cleaned up in Step 6 and 7.
+
+10. Initiator send an IO after the ABTS which succeed fine.
+
+To fix the above case, the following changes have been made:
+  - To prevent target from dropping commands silently, use the online flag
+    instead to check for an active chip reset. Once the port is online during
+    a chip reset phase, we are good to process the commands.
+  - Clean up qla2x00_restart_isp to not set the online flag and process ATIO
+    as it is unnecessary. During a chip reset, interrupts are enabled only
+    after setting the online flag to 1, so ATIO's won't be missed and hence
+    no need to process ATIO's after setting the online flag.
+
+	Signed-off-by: Dilip Kumar Uppugandla <dilip@purestorage.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@qlogic.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 3bb67df5b5f880a1c9c1086308cf2b981d824da5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_init.c
+#	drivers/scsi/qla2xxx/qla_target.c
+diff --cc drivers/scsi/qla2xxx/qla_init.c
+index ea8080a1a353,52a87657c7dd..000000000000
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@@ -4829,7 -4939,6 +4849,10 @@@ qla2x00_restart_isp(scsi_qla_host_t *vh
+  	struct qla_hw_data *ha = vha->hw;
+  	struct req_que *req = ha->req_q_map[0];
+  	struct rsp_que *rsp = ha->rsp_q_map[0];
+++<<<<<<< HEAD
+ +	unsigned long flags;
+++=======
+++>>>>>>> 3bb67df5b5f8 (qla2xxx: Check for online flag instead of active reset when transmitting responses)
+  
+  	/* If firmware needs to be loaded */
+  	if (qla2x00_isp_firmware(vha)) {
+@@@ -4851,17 -4960,6 +4874,20 @@@
+  			/* Issue a marker after FW becomes ready. */
+  			qla2x00_marker(vha, req, rsp, 0, 0, MK_SYNC_ALL);
+  
+++<<<<<<< HEAD
+ +			vha->flags.online = 1;
+ +
+ +			/*
+ +			 * Process any ATIO queue entries that came in
+ +			 * while we weren't online.
+ +			 */
+ +			spin_lock_irqsave(&ha->hardware_lock, flags);
+ +			if (qla_tgt_mode_enabled(vha))
+ +				qlt_24xx_process_atio_queue(vha);
+ +			spin_unlock_irqrestore(&ha->hardware_lock, flags);
+ +
+++=======
+++>>>>>>> 3bb67df5b5f8 (qla2xxx: Check for online flag instead of active reset when transmitting responses)
+  			set_bit(LOOP_RESYNC_NEEDED, &vha->dpc_flags);
+  		}
+  
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 45ccae5ec6af,c7ab9e69c881..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -179,9 -208,35 +179,39 @@@ struct scsi_qla_host *qlt_find_host_by_
+  	return NULL;
+  }
+  
+ -static inline void qlt_incr_num_pend_cmds(struct scsi_qla_host *vha)
+ +void qlt_24xx_atio_pkt_all_vps(struct scsi_qla_host *vha,
+ +	struct atio_from_isp *atio)
+  {
+++<<<<<<< HEAD
+++=======
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&vha->hw->tgt.q_full_lock, flags);
++ 
++ 	vha->hw->tgt.num_pend_cmds++;
++ 	if (vha->hw->tgt.num_pend_cmds > vha->hw->qla_stats.stat_max_pend_cmds)
++ 		vha->hw->qla_stats.stat_max_pend_cmds =
++ 			vha->hw->tgt.num_pend_cmds;
++ 	spin_unlock_irqrestore(&vha->hw->tgt.q_full_lock, flags);
++ }
++ static inline void qlt_decr_num_pend_cmds(struct scsi_qla_host *vha)
++ {
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&vha->hw->tgt.q_full_lock, flags);
++ 	vha->hw->tgt.num_pend_cmds--;
++ 	spin_unlock_irqrestore(&vha->hw->tgt.q_full_lock, flags);
++ }
++ 
++ static bool qlt_24xx_atio_pkt_all_vps(struct scsi_qla_host *vha,
++ 	struct atio_from_isp *atio, uint8_t ha_locked)
++ {
++ 	ql_dbg(ql_dbg_tgt, vha, 0xe072,
++ 		"%s: qla_target(%d): type %x ox_id %04x\n",
++ 		__func__, vha->vp_idx, atio->u.raw.entry_type,
++ 		be16_to_cpu(atio->u.isp24.fcp_hdr.ox_id));
++ 
+++>>>>>>> 3bb67df5b5f8 (qla2xxx: Check for online flag instead of active reset when transmitting responses)
+  	switch (atio->u.raw.entry_type) {
+  	case ATIO_TYPE7:
+  	{
+@@@ -1423,6 -1737,21 +1453,24 @@@ void qlt_xmit_tm_rsp(struct qla_tgt_mgm
+  	    mcmd, mcmd->fc_tm_rsp, mcmd->flags);
+  
+  	spin_lock_irqsave(&ha->hardware_lock, flags);
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (!vha->flags.online || mcmd->reset_count != ha->chip_reset) {
++ 		/*
++ 		 * Either the port is not online or this request was from
++ 		 * previous life, just abort the processing.
++ 		 */
++ 		ql_dbg(ql_dbg_async, vha, 0xe100,
++ 			"RESET-TMR online/active/old-count/new-count = %d/%d/%d/%d.\n",
++ 			vha->flags.online, qla2x00_reset_active(vha),
++ 			mcmd->reset_count, ha->chip_reset);
++ 		ha->tgt.tgt_ops->free_mcmd(mcmd);
++ 		spin_unlock_irqrestore(&ha->hardware_lock, flags);
++ 		return;
++ 	}
++ 
+++>>>>>>> 3bb67df5b5f8 (qla2xxx: Check for online flag instead of active reset when transmitting responses)
+  	if (mcmd->flags == QLA24XX_MGMT_SEND_NACK)
+  		qlt_send_notify_ack(vha, &mcmd->orig_iocb.imm_ntfy,
+  		    0, 0, 0, 0, 0, 0);
+@@@ -2046,6 -2688,26 +2094,29 @@@ int qlt_xmit_response(struct qla_tgt_cm
+  
+  	spin_lock_irqsave(&ha->hardware_lock, flags);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (xmit_type == QLA_TGT_XMIT_STATUS)
++ 		vha->tgt_counters.core_qla_snd_status++;
++ 	else
++ 		vha->tgt_counters.core_qla_que_buf++;
++ 
++ 	if (!vha->flags.online || cmd->reset_count != ha->chip_reset) {
++ 		/*
++ 		 * Either the port is not online or this request was from
++ 		 * previous life, just abort the processing.
++ 		 */
++ 		cmd->state = QLA_TGT_STATE_PROCESSED;
++ 		qlt_abort_cmd_on_host_reset(cmd->vha, cmd);
++ 		ql_dbg(ql_dbg_async, vha, 0xe101,
++ 			"RESET-RSP online/active/old-count/new-count = %d/%d/%d/%d.\n",
++ 			vha->flags.online, qla2x00_reset_active(vha),
++ 			cmd->reset_count, ha->chip_reset);
++ 		spin_unlock_irqrestore(&ha->hardware_lock, flags);
++ 		return 0;
++ 	}
++ 
+++>>>>>>> 3bb67df5b5f8 (qla2xxx: Check for online flag instead of active reset when transmitting responses)
+  	/* Does F/W have an IOCBs for this request */
+  	res = qlt_check_reserve_free_req(vha, full_req_cnt);
+  	if (unlikely(res))
+@@@ -2162,6 -2834,22 +2233,25 @@@ int qlt_rdy_to_xfer(struct qla_tgt_cmd 
+  
+  	spin_lock_irqsave(&ha->hardware_lock, flags);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!vha->flags.online || (cmd->reset_count != ha->chip_reset) ||
++ 	    (cmd->sess && cmd->sess->deleted == QLA_SESS_DELETION_IN_PROGRESS)) {
++ 		/*
++ 		 * Either the port is not online or this request was from
++ 		 * previous life, just abort the processing.
++ 		 */
++ 		cmd->state = QLA_TGT_STATE_NEED_DATA;
++ 		qlt_abort_cmd_on_host_reset(cmd->vha, cmd);
++ 		ql_dbg(ql_dbg_async, vha, 0xe102,
++ 			"RESET-XFR online/active/old-count/new-count = %d/%d/%d/%d.\n",
++ 			vha->flags.online, qla2x00_reset_active(vha),
++ 			cmd->reset_count, ha->chip_reset);
++ 		spin_unlock_irqrestore(&ha->hardware_lock, flags);
++ 		return 0;
++ 	}
++ 
+++>>>>>>> 3bb67df5b5f8 (qla2xxx: Check for online flag instead of active reset when transmitting responses)
+  	/* Does F/W have an IOCBs for this request */
+  	res = qlt_check_reserve_free_req(vha, prm.req_cnt);
+  	if (res != 0)
+* Unmerged path drivers/scsi/qla2xxx/qla_init.c
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
