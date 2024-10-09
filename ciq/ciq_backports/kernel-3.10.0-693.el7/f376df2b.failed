@@ -1,0 +1,365 @@
+Btrfs: add tracepoints for flush events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Josef Bacik <jbacik@fb.com>
+commit f376df2b7da3a40f62f861a65efdd8c29fa1b877
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/f376df2b.failed
+
+We want to track when we're triggering flushing from our reservation code and
+what flushing is being done when we start flushing.  Thanks,
+
+	Signed-off-by: Josef Bacik <jbacik@fb.com>
+	Signed-off-by: David Sterba <dsterba@suse.com>
+(cherry picked from commit f376df2b7da3a40f62f861a65efdd8c29fa1b877)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/extent-tree.c
+diff --cc fs/btrfs/extent-tree.c
+index ff52912597b1,31ded6aae1f0..000000000000
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@@ -4735,13 -4835,11 +4735,21 @@@ commit
+  	return btrfs_commit_transaction(trans, root);
+  }
+  
+++<<<<<<< HEAD
+ +enum flush_state {
+ +	FLUSH_DELAYED_ITEMS_NR	=	1,
+ +	FLUSH_DELAYED_ITEMS	=	2,
+ +	FLUSH_DELALLOC		=	3,
+ +	FLUSH_DELALLOC_WAIT	=	4,
+ +	ALLOC_CHUNK		=	5,
+ +	COMMIT_TRANS		=	6,
+++=======
++ struct reserve_ticket {
++ 	u64 bytes;
++ 	int error;
++ 	struct list_head list;
++ 	wait_queue_head_t wait;
+++>>>>>>> f376df2b7da3 (Btrfs: add tracepoints for flush events)
+  };
+  
+  static int flush_space(struct btrfs_root *root,
+@@@ -4907,6 -5033,201 +4917,204 @@@ void btrfs_init_async_reclaim_work(stru
+  	INIT_WORK(work, btrfs_async_reclaim_metadata_space);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void priority_reclaim_metadata_space(struct btrfs_fs_info *fs_info,
++ 					    struct btrfs_space_info *space_info,
++ 					    struct reserve_ticket *ticket)
++ {
++ 	u64 to_reclaim;
++ 	int flush_state = FLUSH_DELAYED_ITEMS_NR;
++ 
++ 	spin_lock(&space_info->lock);
++ 	to_reclaim = btrfs_calc_reclaim_metadata_size(fs_info->fs_root,
++ 						      space_info);
++ 	if (!to_reclaim) {
++ 		spin_unlock(&space_info->lock);
++ 		return;
++ 	}
++ 	spin_unlock(&space_info->lock);
++ 
++ 	do {
++ 		flush_space(fs_info->fs_root, space_info, to_reclaim,
++ 			    to_reclaim, flush_state);
++ 		flush_state++;
++ 		spin_lock(&space_info->lock);
++ 		if (ticket->bytes == 0) {
++ 			spin_unlock(&space_info->lock);
++ 			return;
++ 		}
++ 		spin_unlock(&space_info->lock);
++ 
++ 		/*
++ 		 * Priority flushers can't wait on delalloc without
++ 		 * deadlocking.
++ 		 */
++ 		if (flush_state == FLUSH_DELALLOC ||
++ 		    flush_state == FLUSH_DELALLOC_WAIT)
++ 			flush_state = ALLOC_CHUNK;
++ 	} while (flush_state < COMMIT_TRANS);
++ }
++ 
++ static int wait_reserve_ticket(struct btrfs_fs_info *fs_info,
++ 			       struct btrfs_space_info *space_info,
++ 			       struct reserve_ticket *ticket, u64 orig_bytes)
++ 
++ {
++ 	DEFINE_WAIT(wait);
++ 	int ret = 0;
++ 
++ 	spin_lock(&space_info->lock);
++ 	while (ticket->bytes > 0 && ticket->error == 0) {
++ 		ret = prepare_to_wait_event(&ticket->wait, &wait, TASK_KILLABLE);
++ 		if (ret) {
++ 			ret = -EINTR;
++ 			break;
++ 		}
++ 		spin_unlock(&space_info->lock);
++ 
++ 		schedule();
++ 
++ 		finish_wait(&ticket->wait, &wait);
++ 		spin_lock(&space_info->lock);
++ 	}
++ 	if (!ret)
++ 		ret = ticket->error;
++ 	if (!list_empty(&ticket->list))
++ 		list_del_init(&ticket->list);
++ 	if (ticket->bytes && ticket->bytes < orig_bytes) {
++ 		u64 num_bytes = orig_bytes - ticket->bytes;
++ 		space_info->bytes_may_use -= num_bytes;
++ 		trace_btrfs_space_reservation(fs_info, "space_info",
++ 					      space_info->flags, num_bytes, 0);
++ 	}
++ 	spin_unlock(&space_info->lock);
++ 
++ 	return ret;
++ }
++ 
++ /**
++  * reserve_metadata_bytes - try to reserve bytes from the block_rsv's space
++  * @root - the root we're allocating for
++  * @space_info - the space info we want to allocate from
++  * @orig_bytes - the number of bytes we want
++  * @flush - whether or not we can flush to make our reservation
++  *
++  * This will reserve orig_bytes number of bytes from the space info associated
++  * with the block_rsv.  If there is not enough space it will make an attempt to
++  * flush out space to make room.  It will do this by flushing delalloc if
++  * possible or committing the transaction.  If flush is 0 then no attempts to
++  * regain reservations will be made and this will fail if there is not enough
++  * space already.
++  */
++ static int __reserve_metadata_bytes(struct btrfs_root *root,
++ 				    struct btrfs_space_info *space_info,
++ 				    u64 orig_bytes,
++ 				    enum btrfs_reserve_flush_enum flush)
++ {
++ 	struct reserve_ticket ticket;
++ 	u64 used;
++ 	int ret = 0;
++ 
++ 	ASSERT(orig_bytes);
++ 	spin_lock(&space_info->lock);
++ 	ret = -ENOSPC;
++ 	used = space_info->bytes_used + space_info->bytes_reserved +
++ 		space_info->bytes_pinned + space_info->bytes_readonly +
++ 		space_info->bytes_may_use;
++ 
++ 	/*
++ 	 * If we have enough space then hooray, make our reservation and carry
++ 	 * on.  If not see if we can overcommit, and if we can, hooray carry on.
++ 	 * If not things get more complicated.
++ 	 */
++ 	if (used + orig_bytes <= space_info->total_bytes) {
++ 		space_info->bytes_may_use += orig_bytes;
++ 		trace_btrfs_space_reservation(root->fs_info, "space_info",
++ 					      space_info->flags, orig_bytes,
++ 					      1);
++ 		ret = 0;
++ 	} else if (can_overcommit(root, space_info, orig_bytes, flush)) {
++ 		space_info->bytes_may_use += orig_bytes;
++ 		trace_btrfs_space_reservation(root->fs_info, "space_info",
++ 					      space_info->flags, orig_bytes,
++ 					      1);
++ 		ret = 0;
++ 	}
++ 
++ 	/*
++ 	 * If we couldn't make a reservation then setup our reservation ticket
++ 	 * and kick the async worker if it's not already running.
++ 	 *
++ 	 * If we are a priority flusher then we just need to add our ticket to
++ 	 * the list and we will do our own flushing further down.
++ 	 */
++ 	if (ret && flush != BTRFS_RESERVE_NO_FLUSH) {
++ 		ticket.bytes = orig_bytes;
++ 		ticket.error = 0;
++ 		init_waitqueue_head(&ticket.wait);
++ 		if (flush == BTRFS_RESERVE_FLUSH_ALL) {
++ 			list_add_tail(&ticket.list, &space_info->tickets);
++ 			if (!space_info->flush) {
++ 				space_info->flush = 1;
++ 				trace_btrfs_trigger_flush(root->fs_info,
++ 							  space_info->flags,
++ 							  orig_bytes, flush,
++ 							  "enospc");
++ 				queue_work(system_unbound_wq,
++ 					   &root->fs_info->async_reclaim_work);
++ 			}
++ 		} else {
++ 			list_add_tail(&ticket.list,
++ 				      &space_info->priority_tickets);
++ 		}
++ 	} else if (!ret && space_info->flags & BTRFS_BLOCK_GROUP_METADATA) {
++ 		used += orig_bytes;
++ 		/*
++ 		 * We will do the space reservation dance during log replay,
++ 		 * which means we won't have fs_info->fs_root set, so don't do
++ 		 * the async reclaim as we will panic.
++ 		 */
++ 		if (!root->fs_info->log_root_recovering &&
++ 		    need_do_async_reclaim(space_info, root->fs_info, used) &&
++ 		    !work_busy(&root->fs_info->async_reclaim_work)) {
++ 			trace_btrfs_trigger_flush(root->fs_info,
++ 						  space_info->flags,
++ 						  orig_bytes, flush,
++ 						  "preempt");
++ 			queue_work(system_unbound_wq,
++ 				   &root->fs_info->async_reclaim_work);
++ 		}
++ 	}
++ 	spin_unlock(&space_info->lock);
++ 	if (!ret || flush == BTRFS_RESERVE_NO_FLUSH)
++ 		return ret;
++ 
++ 	if (flush == BTRFS_RESERVE_FLUSH_ALL)
++ 		return wait_reserve_ticket(root->fs_info, space_info, &ticket,
++ 					   orig_bytes);
++ 
++ 	ret = 0;
++ 	priority_reclaim_metadata_space(root->fs_info, space_info, &ticket);
++ 	spin_lock(&space_info->lock);
++ 	if (ticket.bytes) {
++ 		if (ticket.bytes < orig_bytes) {
++ 			u64 num_bytes = orig_bytes - ticket.bytes;
++ 			space_info->bytes_may_use -= num_bytes;
++ 			trace_btrfs_space_reservation(root->fs_info,
++ 					"space_info", space_info->flags,
++ 					num_bytes, 0);
++ 
++ 		}
++ 		list_del_init(&ticket.list);
++ 		ret = -ENOSPC;
++ 	}
++ 	spin_unlock(&space_info->lock);
++ 	ASSERT(list_empty(&ticket.list));
++ 	return ret;
++ }
++ 
+++>>>>>>> f376df2b7da3 (Btrfs: add tracepoints for flush events)
+  /**
+   * reserve_metadata_bytes - try to reserve bytes from the block_rsv's space
+   * @root - the root we're allocating for
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index eaff9105e433..dc621f9c43e3 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -2584,6 +2584,15 @@ enum btrfs_reserve_flush_enum {
+ 	BTRFS_RESERVE_FLUSH_ALL,
+ };
+ 
++enum btrfs_flush_state {
++	FLUSH_DELAYED_ITEMS_NR	=	1,
++	FLUSH_DELAYED_ITEMS	=	2,
++	FLUSH_DELALLOC		=	3,
++	FLUSH_DELALLOC_WAIT	=	4,
++	ALLOC_CHUNK		=	5,
++	COMMIT_TRANS		=	6,
++};
++
+ int btrfs_check_data_free_space(struct inode *inode, u64 start, u64 len);
+ int btrfs_alloc_data_chunk_ondemand(struct inode *inode, u64 bytes);
+ void btrfs_free_reserved_data_space(struct inode *inode, u64 start, u64 len);
+* Unmerged path fs/btrfs/extent-tree.c
+diff --git a/include/trace/events/btrfs.h b/include/trace/events/btrfs.h
+index e3da63d990d4..bb0b2b28d24c 100644
+--- a/include/trace/events/btrfs.h
++++ b/include/trace/events/btrfs.h
+@@ -782,6 +782,88 @@ TRACE_EVENT(btrfs_space_reservation,
+ 		  __entry->bytes)
+ );
+ 
++#define show_flush_action(action)						\
++	__print_symbolic(action,						\
++		{ BTRFS_RESERVE_NO_FLUSH,	"BTRFS_RESERVE_NO_FLUSH"},	\
++		{ BTRFS_RESERVE_FLUSH_LIMIT,	"BTRFS_RESERVE_FLUSH_LIMIT"},	\
++		{ BTRFS_RESERVE_FLUSH_ALL,	"BTRFS_RESERVE_FLUSH_ALL"})
++
++TRACE_EVENT(btrfs_trigger_flush,
++
++	TP_PROTO(struct btrfs_fs_info *fs_info, u64 flags, u64 bytes,
++		 int flush, char *reason),
++
++	TP_ARGS(fs_info, flags, bytes, flush, reason),
++
++	TP_STRUCT__entry(
++		__array(	u8,	fsid,	BTRFS_UUID_SIZE	)
++		__field(	u64,	flags			)
++		__field(	u64,	bytes			)
++		__field(	int,	flush			)
++		__string(	reason,	reason			)
++	),
++
++	TP_fast_assign(
++		memcpy(__entry->fsid, fs_info->fsid, BTRFS_UUID_SIZE);
++		__entry->flags	= flags;
++		__entry->bytes	= bytes;
++		__entry->flush	= flush;
++		__assign_str(reason, reason)
++	),
++
++	TP_printk("%pU: %s: flush = %d(%s), flags = %llu(%s), bytes = %llu",
++		  __entry->fsid, __get_str(reason), __entry->flush,
++		  show_flush_action(__entry->flush),
++		  (unsigned long long)__entry->flags,
++		  __print_flags((unsigned long)__entry->flags, "|",
++				BTRFS_GROUP_FLAGS),
++		  (unsigned long long)__entry->bytes)
++);
++
++#define show_flush_state(state)							\
++	__print_symbolic(state,							\
++		{ FLUSH_DELAYED_ITEMS_NR,	"FLUSH_DELAYED_ITEMS_NR"},	\
++		{ FLUSH_DELAYED_ITEMS,		"FLUSH_DELAYED_ITEMS"},		\
++		{ FLUSH_DELALLOC,		"FLUSH_DELALLOC"},		\
++		{ FLUSH_DELALLOC_WAIT,		"FLUSH_DELALLOC_WAIT"},		\
++		{ ALLOC_CHUNK,			"ALLOC_CHUNK"},			\
++		{ COMMIT_TRANS,			"COMMIT_TRANS"})
++
++TRACE_EVENT(btrfs_flush_space,
++
++	TP_PROTO(struct btrfs_fs_info *fs_info, u64 flags, u64 num_bytes,
++		 u64 orig_bytes, int state, int ret),
++
++	TP_ARGS(fs_info, flags, num_bytes, orig_bytes, state, ret),
++
++	TP_STRUCT__entry(
++		__array(	u8,	fsid,	BTRFS_UUID_SIZE	)
++		__field(	u64,	flags			)
++		__field(	u64,	num_bytes		)
++		__field(	u64,	orig_bytes		)
++		__field(	int,	state			)
++		__field(	int,	ret			)
++	),
++
++	TP_fast_assign(
++		memcpy(__entry->fsid, fs_info->fsid, BTRFS_UUID_SIZE);
++		__entry->flags		=	flags;
++		__entry->num_bytes	=	num_bytes;
++		__entry->orig_bytes	=	orig_bytes;
++		__entry->state		=	state;
++		__entry->ret		=	ret;
++	),
++
++	TP_printk("%pU: state = %d(%s), flags = %llu(%s), num_bytes = %llu, "
++		  "orig_bytes = %llu, ret = %d", __entry->fsid, __entry->state,
++		  show_flush_state(__entry->state),
++		  (unsigned long long)__entry->flags,
++		  __print_flags((unsigned long)__entry->flags, "|",
++				BTRFS_GROUP_FLAGS),
++		  (unsigned long long)__entry->num_bytes,
++		  (unsigned long long)__entry->orig_bytes, __entry->ret)
++);
++
+ DECLARE_EVENT_CLASS(btrfs__reserved_extent,
+ 
+ 	TP_PROTO(struct btrfs_root *root, u64 start, u64 len),
