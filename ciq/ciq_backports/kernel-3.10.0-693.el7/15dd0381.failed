@@ -1,0 +1,260 @@
+scsi: megaraid_sas: NVME Interface detection and prop settings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [scsi] megaraid_sas: NVME Interface detection and prop settings (Tomas Henzl) [1417038]
+Rebuild_FUZZ: 94.92%
+commit-author Shivasharan S <shivasharan.srikanteshwara@broadcom.com>
+commit 15dd03811d99dcf828f4eeb2c2b6a02ddc1201c7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/15dd0381.failed
+
+Adding detection logic for NVME device attached behind Ventura
+controller.  Driver set HostPageSize in IOC_INIT frame to inform about
+page size for NVME devices.  Firmware reports NVME page size to the
+driver.  PD INFO DCMD provide new interface type NVME_PD. Driver set
+property of NVME device.
+
+	Signed-off-by: Shivasharan S <shivasharan.srikanteshwara@broadcom.com>
+	Signed-off-by: Kashyap Desai <kashyap.desai@broadcom.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Reviewed-by: Tomas Henzl <thenzl@redhat.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 15dd03811d99dcf828f4eeb2c2b6a02ddc1201c7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/megaraid/megaraid_sas.h
+#	drivers/scsi/megaraid/megaraid_sas_base.c
+diff --cc drivers/scsi/megaraid/megaraid_sas.h
+index 724240214af5,f9efddf32641..000000000000
+--- a/drivers/scsi/megaraid/megaraid_sas.h
++++ b/drivers/scsi/megaraid/megaraid_sas.h
+@@@ -2151,6 -2214,9 +2158,12 @@@ struct megasas_instance 
+  	bool dev_handle;
+  	bool fw_sync_cache_support;
+  	bool is_ventura;
+++<<<<<<< HEAD
+++=======
++ 	bool msix_combined;
++ 	u16 max_raid_mapsize;
++ 	u32 nvme_page_size;
+++>>>>>>> 15dd03811d99 (scsi: megaraid_sas: NVME Interface detection and prop settings)
+  };
+  struct MR_LD_VF_MAP {
+  	u32 size;
+diff --cc drivers/scsi/megaraid/megaraid_sas_base.c
+index 1d06c777c981,f383bf2cc0a8..000000000000
+--- a/drivers/scsi/megaraid/megaraid_sas_base.c
++++ b/drivers/scsi/megaraid/megaraid_sas_base.c
+@@@ -1787,45 -1791,88 +1791,112 @@@ void megasas_set_dynamic_target_propert
+  	}
+  }
+  
+- static void megasas_set_device_queue_depth(struct scsi_device *sdev)
++ /*
++  * megasas_set_nvme_device_properties -
++  * set nomerges=2
++  * set virtual page boundary = 4K (current mr_nvme_pg_size is 4K).
++  * set maximum io transfer = MDTS of NVME device provided by MR firmware.
++  *
++  * MR firmware provides value in KB. Caller of this function converts
++  * kb into bytes.
++  *
++  * e.a MDTS=5 means 2^5 * nvme page size. (In case of 4K page size,
++  * MR firmware provides value 128 as (32 * 4K) = 128K.
++  *
++  * @sdev:				scsi device
++  * @max_io_size:				maximum io transfer size
++  *
++  */
++ static inline void
++ megasas_set_nvme_device_properties(struct scsi_device *sdev, u32 max_io_size)
+  {
+- 	u16				pd_index = 0;
+- 	int		ret = DCMD_FAILED;
+  	struct megasas_instance *instance;
++ 	u32 mr_nvme_pg_size;
++ 
++ 	instance = (struct megasas_instance *)sdev->host->hostdata;
++ 	mr_nvme_pg_size = max_t(u32, instance->nvme_page_size,
++ 				MR_DEFAULT_NVME_PAGE_SIZE);
++ 
++ 	blk_queue_max_hw_sectors(sdev->request_queue, (max_io_size / 512));
++ 
++ 	queue_flag_set_unlocked(QUEUE_FLAG_NOMERGES, sdev->request_queue);
++ 	blk_queue_virt_boundary(sdev->request_queue, mr_nvme_pg_size - 1);
++ }
++ 
++ 
++ /*
++  * megasas_set_static_target_properties -
++  * Device property set by driver are static and it is not required to be
++  * updated after OCR.
++  *
++  * set io timeout
++  * set device queue depth
++  * set nvme device properties. see - megasas_set_nvme_device_properties
++  *
++  * @sdev:				scsi device
++  *
++  */
++ static void megasas_set_static_target_properties(struct scsi_device *sdev)
++ {
++ 	u16	target_index = 0;
++ 	u8 interface_type;
++ 	u32 device_qd = MEGASAS_DEFAULT_CMD_PER_LUN;
++ 	u32 max_io_size_kb = MR_DEFAULT_NVME_MDTS_KB;
++ 	struct megasas_instance *instance;
++ 	struct MR_PRIV_DEVICE *mr_device_priv_data;
+  
+  	instance = megasas_lookup_instance(sdev->host->host_no);
++ 	mr_device_priv_data = sdev->hostdata;
++ 	interface_type  = mr_device_priv_data->interface_type;
+  
+- 	if (sdev->channel < MEGASAS_MAX_PD_CHANNELS) {
+- 		pd_index = (sdev->channel * MEGASAS_MAX_DEV_PER_CHANNEL) + sdev->id;
++ 	/*
++ 	 * The RAID firmware may require extended timeouts.
++ 	 */
++ 	blk_queue_rq_timeout(sdev->request_queue, scmd_timeout * HZ);
+  
+- 		if (instance->pd_info) {
+- 			mutex_lock(&instance->hba_mutex);
+- 			ret = megasas_get_pd_info(instance, pd_index);
+- 			mutex_unlock(&instance->hba_mutex);
+- 		}
++ 	target_index = (sdev->channel * MEGASAS_MAX_DEV_PER_CHANNEL) + sdev->id;
+  
+++<<<<<<< HEAD
+ +		if (ret != DCMD_SUCCESS)
+ +			return;
+ +
+ +		if (instance->pd_list[pd_index].driveState == MR_PD_STATE_SYSTEM) {
+ +
+ +			switch (instance->pd_list[pd_index].interface) {
+ +			case SAS_PD:
+ +				scsi_adjust_queue_depth(sdev, scsi_get_tag_type(sdev),
+ +					MEGASAS_SAS_QD);
+ +				break;
+ +
+ +			case SATA_PD:
+ +				scsi_adjust_queue_depth(sdev, scsi_get_tag_type(sdev),
+ +					MEGASAS_SATA_QD);
+ +				break;
+ +
+ +			default:
+ +				scsi_adjust_queue_depth(sdev, scsi_get_tag_type(sdev),
+ +					MEGASAS_DEFAULT_PD_QD);
+ +			}
+ +		}
+++=======
++ 	switch (interface_type) {
++ 	case SAS_PD:
++ 		device_qd = MEGASAS_SAS_QD;
++ 		break;
++ 	case SATA_PD:
++ 		device_qd = MEGASAS_SATA_QD;
++ 		break;
++ 	case NVME_PD:
++ 		device_qd = MEGASAS_NVME_QD;
++ 		break;
+++>>>>>>> 15dd03811d99 (scsi: megaraid_sas: NVME Interface detection and prop settings)
+  	}
++ 
++ 	if (instance->nvme_page_size && max_io_size_kb)
++ 		megasas_set_nvme_device_properties(sdev, (max_io_size_kb << 10));
++ 
++ 	scsi_change_queue_depth(sdev, device_qd);
++ 
+  }
+  
+  
+@@@ -5035,8 -5080,8 +5116,13 @@@ skip_alloc
+  static int megasas_init_fw(struct megasas_instance *instance)
+  {
+  	u32 max_sectors_1;
+++<<<<<<< HEAD
+ +	u32 max_sectors_2;
+ +	u32 tmp_sectors, msix_enable, scratch_pad_2;
+++=======
++ 	u32 max_sectors_2, tmp_sectors, msix_enable;
++ 	u32 scratch_pad_2, scratch_pad_3, scratch_pad_4;
+++>>>>>>> 15dd03811d99 (scsi: megaraid_sas: NVME Interface detection and prop settings)
+  	resource_size_t base_addr;
+  	struct megasas_register_set __iomem *reg_set;
+  	struct megasas_ctrl_info *ctrl_info = NULL;
+@@@ -5196,6 -5262,23 +5282,26 @@@
+  	if (instance->instancet->init_adapter(instance))
+  		goto fail_init_adapter;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (instance->is_ventura) {
++ 		scratch_pad_4 =
++ 			readl(&instance->reg_set->outbound_scratch_pad_4);
++ 		if ((scratch_pad_4 & MR_NVME_PAGE_SIZE_MASK) >=
++ 			MR_DEFAULT_NVME_PAGE_SHIFT)
++ 			instance->nvme_page_size =
++ 				(1 << (scratch_pad_4 & MR_NVME_PAGE_SIZE_MASK));
++ 
++ 		dev_info(&instance->pdev->dev,
++ 			 "NVME page size\t: (%d)\n", instance->nvme_page_size);
++ 	}
++ 
++ 	if (instance->msix_vectors ?
++ 		megasas_setup_irqs_msix(instance, 1) :
++ 		megasas_setup_irqs_ioapic(instance))
++ 		goto fail_init_adapter;
++ 
+++>>>>>>> 15dd03811d99 (scsi: megaraid_sas: NVME Interface detection and prop settings)
+  	instance->instancet->enable_intr(instance);
+  
+  	dev_info(&instance->pdev->dev, "INIT adapter done\n");
+* Unmerged path drivers/scsi/megaraid/megaraid_sas.h
+* Unmerged path drivers/scsi/megaraid/megaraid_sas_base.c
+diff --git a/drivers/scsi/megaraid/megaraid_sas_fusion.c b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+index 8eadcc3b9862..16f6e98ee8ac 100644
+--- a/drivers/scsi/megaraid/megaraid_sas_fusion.c
++++ b/drivers/scsi/megaraid/megaraid_sas_fusion.c
+@@ -374,7 +374,8 @@ static int megasas_create_sg_sense_fusion(struct megasas_instance *instance)
+ 
+ 	fusion->sg_dma_pool =
+ 			pci_pool_create("mr_sg", instance->pdev,
+-				instance->max_chain_frame_sz, 4, 0);
++				instance->max_chain_frame_sz,
++				MR_DEFAULT_NVME_PAGE_SIZE, 0);
+ 	/* SCSI_SENSE_BUFFERSIZE  = 96 bytes */
+ 	fusion->sense_dma_pool =
+ 			pci_pool_create("mr_sense", instance->pdev,
+@@ -821,6 +822,7 @@ megasas_ioc_init_fusion(struct megasas_instance *instance)
+ 			MPI2_IOCINIT_MSGFLAG_RDPQ_ARRAY_MODE : 0;
+ 	IOCInitMessage->SystemRequestFrameBaseAddress = cpu_to_le64(fusion->io_request_frames_phys);
+ 	IOCInitMessage->HostMSIxVectors = instance->msix_vectors;
++	IOCInitMessage->HostPageSize = MR_DEFAULT_NVME_PAGE_SHIFT;
+ 	init_frame = (struct megasas_init_frame *)cmd->frame;
+ 	memset(init_frame, 0, MEGAMFI_FRAME_SIZE);
+ 
+@@ -3887,7 +3889,7 @@ transition_to_ready:
+ 			megasas_setup_jbod_map(instance);
+ 
+ 			shost_for_each_device(sdev, shost)
+-				megasas_update_sdev_properties(sdev);
++				megasas_set_dynamic_target_properties(sdev);
+ 
+ 			/* reset stream detection array */
+ 			if (instance->is_ventura) {
+diff --git a/drivers/scsi/megaraid/megaraid_sas_fusion.h b/drivers/scsi/megaraid/megaraid_sas_fusion.h
+index ef6bfe55344c..5c39601f857d 100644
+--- a/drivers/scsi/megaraid/megaraid_sas_fusion.h
++++ b/drivers/scsi/megaraid/megaraid_sas_fusion.h
+@@ -650,7 +650,7 @@ struct MPI2_IOC_INIT_REQUEST {
+ 	__le16			HeaderVersion;                  /* 0x0E */
+ 	u32                     Reserved5;                      /* 0x10 */
+ 	__le16			Reserved6;                      /* 0x14 */
+-	u8                      Reserved7;                      /* 0x16 */
++	u8                      HostPageSize;                   /* 0x16 */
+ 	u8                      HostMSIxVectors;                /* 0x17 */
+ 	__le16			Reserved8;                      /* 0x18 */
+ 	__le16			SystemRequestFrameSize;         /* 0x1A */
