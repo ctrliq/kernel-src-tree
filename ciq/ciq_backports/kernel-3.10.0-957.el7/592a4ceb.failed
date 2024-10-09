@@ -1,0 +1,197 @@
+liquidio: Moved common function if_cfg_callback to lio_core.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Intiyaz Basha <intiyaz.basha@cavium.com>
+commit 592a4cebc2bccb23880087a21c0626ab7481626d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/592a4ceb.failed
+
+Moved common function if_cfg_callback to lio_core.c
+and renamed it to lio_if_cfg_callback.
+
+	Signed-off-by: Intiyaz Basha <intiyaz.basha@cavium.com>
+	Acked-by: Derek Chickles <derek.chickles@cavium.com>
+	Signed-off-by: Felix Manlunas <felix.manlunas@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 592a4cebc2bccb23880087a21c0626ab7481626d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/cavium/liquidio/octeon_network.h
+diff --cc drivers/net/ethernet/cavium/liquidio/octeon_network.h
+index 7f5286059b2c,11907e928472..000000000000
+--- a/drivers/net/ethernet/cavium/liquidio/octeon_network.h
++++ b/drivers/net/ethernet/cavium/liquidio/octeon_network.h
+@@@ -184,6 -199,18 +184,21 @@@ int octeon_setup_interrupt(struct octeo
+   */
+  void liquidio_set_ethtool_ops(struct net_device *netdev);
+  
+++<<<<<<< HEAD
+++=======
++ void lio_if_cfg_callback(struct octeon_device *oct,
++ 			 u32 status __attribute__((unused)),
++ 			 void *buf);
++ 
++ /**
++  * \brief Net device change_mtu
++  * @param netdev network device
++  */
++ int liquidio_change_mtu(struct net_device *netdev, int new_mtu);
++ #define LIO_CHANGE_MTU_SUCCESS 1
++ #define LIO_CHANGE_MTU_FAIL    2
++ 
+++>>>>>>> 592a4cebc2bc (liquidio: Moved common function if_cfg_callback to lio_core.c)
+  #define SKB_ADJ_MASK  0x3F
+  #define SKB_ADJ       (SKB_ADJ_MASK + 1)
+  
+diff --git a/drivers/net/ethernet/cavium/liquidio/lio_core.c b/drivers/net/ethernet/cavium/liquidio/lio_core.c
+index 5c6599c797a0..fb65a6602966 100644
+--- a/drivers/net/ethernet/cavium/liquidio/lio_core.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_core.c
+@@ -29,6 +29,38 @@
+ /* OOM task polling interval */
+ #define LIO_OOM_POLL_INTERVAL_MS 250
+ 
++/**
++ * \brief Callback for getting interface configuration
++ * @param status status of request
++ * @param buf pointer to resp structure
++ */
++void lio_if_cfg_callback(struct octeon_device *oct,
++			 u32 status __attribute__((unused)), void *buf)
++{
++	struct octeon_soft_command *sc = (struct octeon_soft_command *)buf;
++	struct liquidio_if_cfg_context *ctx;
++	struct liquidio_if_cfg_resp *resp;
++
++	resp = (struct liquidio_if_cfg_resp *)sc->virtrptr;
++	ctx = (struct liquidio_if_cfg_context *)sc->ctxptr;
++
++	oct = lio_get_device(ctx->octeon_id);
++	if (resp->status)
++		dev_err(&oct->pci_dev->dev, "nic if cfg instruction failed. Status: %llx\n",
++			CVM_CAST64(resp->status));
++	WRITE_ONCE(ctx->cond, 1);
++
++	snprintf(oct->fw_info.liquidio_firmware_version, 32, "%s",
++		 resp->cfg_info.liquidio_firmware_version);
++
++	/* This barrier is required to be sure that the response has been
++	 * written fully before waking up the handler
++	 */
++	wmb();
++
++	wake_up_interruptible(&ctx->wc);
++}
++
+ int liquidio_set_feature(struct net_device *netdev, int cmd, u16 param1)
+ {
+ 	struct lio *lio = GET_LIO(netdev);
+diff --git a/drivers/net/ethernet/cavium/liquidio/lio_main.c b/drivers/net/ethernet/cavium/liquidio/lio_main.c
+index e1450948d50e..3fbea43457b9 100644
+--- a/drivers/net/ethernet/cavium/liquidio/lio_main.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_main.c
+@@ -1928,39 +1928,6 @@ static int load_firmware(struct octeon_device *oct)
+ 	return ret;
+ }
+ 
+-/**
+- * \brief Callback for getting interface configuration
+- * @param status status of request
+- * @param buf pointer to resp structure
+- */
+-static void if_cfg_callback(struct octeon_device *oct,
+-			    u32 status __attribute__((unused)),
+-			    void *buf)
+-{
+-	struct octeon_soft_command *sc = (struct octeon_soft_command *)buf;
+-	struct liquidio_if_cfg_resp *resp;
+-	struct liquidio_if_cfg_context *ctx;
+-
+-	resp = (struct liquidio_if_cfg_resp *)sc->virtrptr;
+-	ctx = (struct liquidio_if_cfg_context *)sc->ctxptr;
+-
+-	oct = lio_get_device(ctx->octeon_id);
+-	if (resp->status)
+-		dev_err(&oct->pci_dev->dev, "nic if cfg instruction failed. Status: 0x%llx (0x%08x)\n",
+-			CVM_CAST64(resp->status), status);
+-	WRITE_ONCE(ctx->cond, 1);
+-
+-	snprintf(oct->fw_info.liquidio_firmware_version, 32, "%s",
+-		 resp->cfg_info.liquidio_firmware_version);
+-
+-	/* This barrier is required to be sure that the response has been
+-	 * written fully before waking up the handler
+-	 */
+-	wmb();
+-
+-	wake_up_interruptible(&ctx->wc);
+-}
+-
+ /**
+  * \brief Poll routine for checking transmit queue status
+  * @param work work_struct data structure
+@@ -3460,7 +3427,7 @@ static int setup_nic_devices(struct octeon_device *octeon_dev)
+ 					    OPCODE_NIC_IF_CFG, 0,
+ 					    if_cfg.u64, 0);
+ 
+-		sc->callback = if_cfg_callback;
++		sc->callback = lio_if_cfg_callback;
+ 		sc->callback_arg = sc;
+ 		sc->wait_time = 3000;
+ 
+diff --git a/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c b/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
+index 75996d8e9970..bd098976bb78 100644
+--- a/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
+@@ -1083,38 +1083,6 @@ static void free_netsgbuf_with_resp(void *buf)
+ 	/* Don't free the skb yet */
+ }
+ 
+-/**
+- * \brief Callback for getting interface configuration
+- * @param status status of request
+- * @param buf pointer to resp structure
+- */
+-static void if_cfg_callback(struct octeon_device *oct,
+-			    u32 status __attribute__((unused)), void *buf)
+-{
+-	struct octeon_soft_command *sc = (struct octeon_soft_command *)buf;
+-	struct liquidio_if_cfg_context *ctx;
+-	struct liquidio_if_cfg_resp *resp;
+-
+-	resp = (struct liquidio_if_cfg_resp *)sc->virtrptr;
+-	ctx = (struct liquidio_if_cfg_context *)sc->ctxptr;
+-
+-	oct = lio_get_device(ctx->octeon_id);
+-	if (resp->status)
+-		dev_err(&oct->pci_dev->dev, "nic if cfg instruction failed. Status: %llx\n",
+-			CVM_CAST64(resp->status));
+-	WRITE_ONCE(ctx->cond, 1);
+-
+-	snprintf(oct->fw_info.liquidio_firmware_version, 32, "%s",
+-		 resp->cfg_info.liquidio_firmware_version);
+-
+-	/* This barrier is required to be sure that the response has been
+-	 * written fully before waking up the handler
+-	 */
+-	wmb();
+-
+-	wake_up_interruptible(&ctx->wc);
+-}
+-
+ /**
+  * \brief Net device open for LiquidIO
+  * @param netdev network device
+@@ -2212,7 +2180,7 @@ static int setup_nic_devices(struct octeon_device *octeon_dev)
+ 					    OPCODE_NIC_IF_CFG, 0, if_cfg.u64,
+ 					    0);
+ 
+-		sc->callback = if_cfg_callback;
++		sc->callback = lio_if_cfg_callback;
+ 		sc->callback_arg = sc;
+ 		sc->wait_time = 5000;
+ 
+* Unmerged path drivers/net/ethernet/cavium/liquidio/octeon_network.h
