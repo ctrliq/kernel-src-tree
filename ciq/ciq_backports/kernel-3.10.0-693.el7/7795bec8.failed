@@ -1,0 +1,154 @@
+dax: Remove redundant inode size checks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Jan Kara <jack@suse.cz>
+commit 7795bec89ebf927ea3ad9ed5f396c227e5c73271
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7795bec8.failed
+
+Callers of dax fault handlers must make sure these calls cannot race
+with truncate. Thus it is enough to check inode size when entering the
+function and we don't have to recheck it again later in the handler.
+Note that inode size itself can be decreased while the fault handler
+runs but filesystem locking prevents against any radix tree or block
+mapping information changes resulting from the truncate and that is what
+we really care about.
+
+	Reviewed-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Vishal Verma <vishal.l.verma@intel.com>
+(cherry picked from commit 7795bec89ebf927ea3ad9ed5f396c227e5c73271)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+diff --cc fs/dax.c
+index ac0232cd059c,9bc6624251b4..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -340,13 -310,6 +338,16 @@@ static int dax_load_hole(struct address
+  						GFP_KERNEL | __GFP_ZERO);
+  	if (!page)
+  		return VM_FAULT_OOM;
+++<<<<<<< HEAD
+ +	/* Recheck i_size under page lock to avoid truncate race */
+ +	size = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
+ +	if (vmf->pgoff >= size) {
+ +		unlock_page(page);
+ +		page_cache_release(page);
+ +		return VM_FAULT_SIGBUS;
+ +	}
+++=======
+++>>>>>>> 7795bec89ebf (dax: Remove redundant inode size checks)
+  
+  	vmf->page = page;
+  	return VM_FAULT_LOCKED;
+@@@ -576,24 -540,10 +577,10 @@@ static int dax_insert_mapping(struct in
+  		.sector = to_sector(bh, inode),
+  		.size = bh->b_size,
+  	};
+- 	pgoff_t size;
+  	int error;
+  
+ -	i_mmap_lock_read(mapping);
+ +	mutex_lock(&mapping->i_mmap_mutex);
+  
+- 	/*
+- 	 * Check truncate didn't happen while we were allocating a block.
+- 	 * If it did, this block may or may not be still allocated to the
+- 	 * file.  We can't tell the filesystem to free it because we can't
+- 	 * take i_mutex here.  In the worst case, the file still has blocks
+- 	 * allocated past the end of the file.
+- 	 */
+- 	size = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
+- 	if (unlikely(vmf->pgoff >= size)) {
+- 		error = -EIO;
+- 		goto out;
+- 	}
+- 
+  	if (dax_map_atomic(bdev, &dax) < 0) {
+  		error = PTR_ERR(dax.addr);
+  		goto out;
+@@@ -666,18 -606,9 +653,9 @@@ int __dax_fault(struct vm_area_struct *
+  		}
+  		if (unlikely(page->mapping != mapping)) {
+  			unlock_page(page);
+ -			put_page(page);
+ +			page_cache_release(page);
+  			goto repeat;
+  		}
+- 		size = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
+- 		if (unlikely(vmf->pgoff >= size)) {
+- 			/*
+- 			 * We have a struct page covering a hole in the file
+- 			 * from a read fault and we've raced with a truncate
+- 			 */
+- 			error = -EIO;
+- 			goto unlock_page;
+- 		}
+  	}
+  
+  	error = get_block(inode, block, &bh, 0);
+@@@ -710,17 -641,8 +688,22 @@@
+  		if (error)
+  			goto unlock_page;
+  		vmf->page = page;
+++<<<<<<< HEAD
+ +		if (!page) {
+ +			mutex_lock(&mapping->i_mmap_mutex);
+ +			/* Check we didn't race with truncate */
+ +			size = (i_size_read(inode) + PAGE_SIZE - 1) >>
+ +								PAGE_SHIFT;
+ +			if (vmf->pgoff >= size) {
+ +				mutex_unlock(&mapping->i_mmap_mutex);
+ +				error = -EIO;
+ +				goto out;
+ +			}
+ +		}
+++=======
++ 		if (!page)
++ 			i_mmap_lock_read(mapping);
+++>>>>>>> 7795bec89ebf (dax: Remove redundant inode size checks)
+  		return VM_FAULT_LOCKED;
+  	}
+  
+@@@ -879,32 -818,8 +862,35 @@@ int __dax_pmd_fault(struct vm_area_stru
+  		truncate_pagecache_range(inode, lstart, lend);
+  	}
+  
+ -	i_mmap_lock_read(mapping);
+ +	mutex_lock(&mapping->i_mmap_mutex);
+ +
+ +	/*
+ +	 * If we allocated new storage, make sure no process has any
+ +	 * zero pages covering this hole
+ +	 */
+ +	if (buffer_new(&bh)) {
+ +		mutex_unlock(&mapping->i_mmap_mutex);
+ +		unmap_mapping_range(mapping, pgoff << PAGE_SHIFT, PMD_SIZE, 0);
+ +		mutex_lock(&mapping->i_mmap_mutex);
+ +	}
+ +
+++<<<<<<< HEAD
+ +	/*
+ +	 * If a truncate happened while we were allocating blocks, we may
+ +	 * leave blocks allocated to the file that are beyond EOF.  We can't
+ +	 * take i_mutex here, so just leave them hanging; they'll be freed
+ +	 * when the file is deleted.
+ +	 */
+ +	size = (i_size_read(inode) + PAGE_SIZE - 1) >> PAGE_SHIFT;
+ +	if (pgoff >= size) {
+ +		result = VM_FAULT_SIGBUS;
+ +		goto out;
+ +	}
+ +	if ((pgoff | PG_PMD_COLOUR) >= size)
+ +		goto fallback;
+  
+++=======
+++>>>>>>> 7795bec89ebf (dax: Remove redundant inode size checks)
+  	if (!write && !buffer_mapped(&bh) && buffer_uptodate(&bh)) {
+  		spinlock_t *ptl;
+  		pmd_t entry;
+* Unmerged path fs/dax.c
