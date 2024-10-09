@@ -1,0 +1,184 @@
+x86/microcode: Make the late update update_lock a raw lock for RT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [x86] microcode: Make the late update update_lock a raw lock for RT (Scott Wood) [1581193]
+Rebuild_FUZZ: 96.83%
+commit-author Scott Wood <swood@redhat.com>
+commit ff987fcf011d20c53b3a613edf6e2055ea48e26e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/ff987fcf.failed
+
+__reload_late() is called from stop_machine context and thus cannot
+acquire a non-raw spinlock on PREEMPT_RT.
+
+	Signed-off-by: Scott Wood <swood@redhat.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Ashok Raj <ashok.raj@intel.com>
+	Cc: Clark Williams <williams@redhat.com>
+	Cc: Pei Zhang <pezhang@redhat.com>
+	Cc: x86-ml <x86@kernel.org>
+Link: http://lkml.kernel.org/r/20180524154420.24455-1-swood@redhat.com
+(cherry picked from commit ff987fcf011d20c53b3a613edf6e2055ea48e26e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/microcode/core.c
+diff --cc arch/x86/kernel/cpu/microcode/core.c
+index 1b81185d9250,08286269fd24..000000000000
+--- a/arch/x86/kernel/cpu/microcode/core.c
++++ b/arch/x86/kernel/cpu/microcode/core.c
+@@@ -60,12 -67,12 +60,20 @@@ static bool dis_ucode_ldr
+   */
+  static DEFINE_MUTEX(microcode_mutex);
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Serialize late loading so that CPUs get updated one-by-one.
++  */
++ static DEFINE_RAW_SPINLOCK(update_lock);
++ 
+++>>>>>>> ff987fcf011d (x86/microcode: Make the late update update_lock a raw lock for RT)
+  struct ucode_cpu_info		ucode_cpu_info[NR_CPUS];
+ +EXPORT_SYMBOL_GPL(ucode_cpu_info);
+ +
+ +/*
+ + * Operations that are run on a target cpu:
+ + */
+  
+  struct cpu_info_ctx {
+  	struct cpu_signature	*cpu_sig;
+@@@ -369,22 -494,112 +377,111 @@@ static void __exit microcode_dev_exit(v
+  /* fake device for request_firmware */
+  static struct platform_device	*microcode_pdev;
+  
+ -/*
+ - * Late loading dance. Why the heavy-handed stomp_machine effort?
+ - *
+ - * - HT siblings must be idle and not execute other code while the other sibling
+ - *   is loading microcode in order to avoid any negative interactions caused by
+ - *   the loading.
+ - *
+ - * - In addition, microcode update on the cores must be serialized until this
+ - *   requirement can be relaxed in the future. Right now, this is conservative
+ - *   and good.
+ - */
+ -#define SPINUNIT 100 /* 100 nsec */
+ -
+ -static int check_online_cpus(void)
+ +static int reload_for_cpu(int cpu)
+  {
+ -	if (num_online_cpus() == num_present_cpus())
+ -		return 0;
+ +	struct ucode_cpu_info *uci = ucode_cpu_info + cpu;
+ +	enum ucode_state ustate;
+ +	int err = 0;
+  
+ -	pr_err("Not all CPUs online, aborting microcode update.\n");
+ +	if (!uci->valid)
+ +		return err;
+  
+++<<<<<<< HEAD
+ +	ustate = microcode_ops->request_microcode_fw(cpu, &microcode_pdev->dev, true);
+ +	if (ustate == UCODE_OK)
+ +		apply_microcode_on_target(cpu);
+ +	else
+ +		if (ustate == UCODE_ERROR)
+ +			err = -EINVAL;
+ +	return err;
+++=======
++ 	return -EINVAL;
++ }
++ 
++ static atomic_t late_cpus_in;
++ static atomic_t late_cpus_out;
++ 
++ static int __wait_for_cpus(atomic_t *t, long long timeout)
++ {
++ 	int all_cpus = num_online_cpus();
++ 
++ 	atomic_inc(t);
++ 
++ 	while (atomic_read(t) < all_cpus) {
++ 		if (timeout < SPINUNIT) {
++ 			pr_err("Timeout while waiting for CPUs rendezvous, remaining: %d\n",
++ 				all_cpus - atomic_read(t));
++ 			return 1;
++ 		}
++ 
++ 		ndelay(SPINUNIT);
++ 		timeout -= SPINUNIT;
++ 
++ 		touch_nmi_watchdog();
++ 	}
++ 	return 0;
++ }
++ 
++ /*
++  * Returns:
++  * < 0 - on error
++  *   0 - no update done
++  *   1 - microcode was updated
++  */
++ static int __reload_late(void *info)
++ {
++ 	int cpu = smp_processor_id();
++ 	enum ucode_state err;
++ 	int ret = 0;
++ 
++ 	/*
++ 	 * Wait for all CPUs to arrive. A load will not be attempted unless all
++ 	 * CPUs show up.
++ 	 * */
++ 	if (__wait_for_cpus(&late_cpus_in, NSEC_PER_SEC))
++ 		return -1;
++ 
++ 	raw_spin_lock(&update_lock);
++ 	apply_microcode_local(&err);
++ 	raw_spin_unlock(&update_lock);
++ 
++ 	/* siblings return UCODE_OK because their engine got updated already */
++ 	if (err > UCODE_NFOUND) {
++ 		pr_warn("Error reloading microcode on CPU %d\n", cpu);
++ 		ret = -1;
++ 	} else if (err == UCODE_UPDATED || err == UCODE_OK) {
++ 		ret = 1;
++ 	}
++ 
++ 	/*
++ 	 * Increase the wait timeout to a safe value here since we're
++ 	 * serializing the microcode update and that could take a while on a
++ 	 * large number of CPUs. And that is fine as the *actual* timeout will
++ 	 * be determined by the last CPU finished updating and thus cut short.
++ 	 */
++ 	if (__wait_for_cpus(&late_cpus_out, NSEC_PER_SEC * num_online_cpus()))
++ 		panic("Timeout during microcode update!\n");
++ 
++ 	return ret;
++ }
++ 
++ /*
++  * Reload microcode late on all CPUs. Wait for a sec until they
++  * all gather together.
++  */
++ static int microcode_reload_late(void)
++ {
++ 	int ret;
++ 
++ 	atomic_set(&late_cpus_in,  0);
++ 	atomic_set(&late_cpus_out, 0);
++ 
++ 	ret = stop_machine_cpuslocked(__reload_late, NULL, cpu_online_mask);
++ 	if (ret > 0)
++ 		microcode_check();
++ 
++ 	return ret;
+++>>>>>>> ff987fcf011d (x86/microcode: Make the late update update_lock a raw lock for RT)
+  }
+  
+  static ssize_t reload_store(struct device *dev,
+* Unmerged path arch/x86/kernel/cpu/microcode/core.c
