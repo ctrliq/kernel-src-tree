@@ -1007,6 +1007,8 @@ struct netdev_xdp {
 		struct {
 			bool prog_attached;
 			u32 prog_id;
+			/* flags with which program was installed */
+			u32 prog_flags;
 		};
 	};
 };
