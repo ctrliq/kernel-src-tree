@@ -1,0 +1,146 @@
+libceph: make sure need_resend targets reflect latest map
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Ilya Dryomov <idryomov@gmail.com>
+commit 04c7d789e269c2b82bbd08106049a5a979cdb3fd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/04c7d789.failed
+
+Otherwise we may miss events like PG splits, pool deletions, etc when
+we get multiple incremental maps at once.  Because check_pool_dne() can
+now be fed an unlinked request, finish_request() needed to be taught to
+handle unlinked requests.
+
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 04c7d789e269c2b82bbd08106049a5a979cdb3fd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ceph/debugfs.c
+diff --cc net/ceph/debugfs.c
+index 41670a0c1c91,c0089f8ccaeb..000000000000
+--- a/net/ceph/debugfs.c
++++ b/net/ceph/debugfs.c
+@@@ -166,8 -166,16 +166,21 @@@ static void dump_target(struct seq_fil
+  	seq_printf(s, "]/%d\t[", t->up.primary);
+  	for (i = 0; i < t->acting.size; i++)
+  		seq_printf(s, "%s%d", (!i ? "" : ","), t->acting.osds[i]);
+++<<<<<<< HEAD
+ +	seq_printf(s, "]/%d\t%s\t0x%x", t->acting.primary, t->target_oid.name,
+ +		   t->flags);
+++=======
++ 	seq_printf(s, "]/%d\te%u\t", t->acting.primary, t->epoch);
++ 	if (t->target_oloc.pool_ns) {
++ 		seq_printf(s, "%*pE/%*pE\t0x%x",
++ 			(int)t->target_oloc.pool_ns->len,
++ 			t->target_oloc.pool_ns->str,
++ 			t->target_oid.name_len, t->target_oid.name, t->flags);
++ 	} else {
++ 		seq_printf(s, "%*pE\t0x%x", t->target_oid.name_len,
++ 			t->target_oid.name, t->flags);
++ 	}
+++>>>>>>> 04c7d789e269 (libceph: make sure need_resend targets reflect latest map)
+  	if (t->paused)
+  		seq_puts(s, "\tP");
+  }
+diff --git a/include/linux/ceph/osd_client.h b/include/linux/ceph/osd_client.h
+index f2edb240e885..cb732f952705 100644
+--- a/include/linux/ceph/osd_client.h
++++ b/include/linux/ceph/osd_client.h
+@@ -148,6 +148,7 @@ struct ceph_osd_request_target {
+ 	unsigned int flags;                /* CEPH_OSD_FLAG_* */
+ 	bool paused;
+ 
++	u32 epoch;
+ 	u32 last_force_resend;
+ 
+ 	int osd;
+* Unmerged path net/ceph/debugfs.c
+diff --git a/net/ceph/osd_client.c b/net/ceph/osd_client.c
+index c2a2e1bde4a4..82e63e85f81a 100644
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -385,6 +385,7 @@ static void target_copy(struct ceph_osd_request_target *dest,
+ 	dest->flags = src->flags;
+ 	dest->paused = src->paused;
+ 
++	dest->epoch = src->epoch;
+ 	dest->last_force_resend = src->last_force_resend;
+ 
+ 	dest->osd = src->osd;
+@@ -1319,6 +1320,7 @@ static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
+ 	enum calc_target_result ct_res;
+ 	int ret;
+ 
++	t->epoch = osdc->osdmap->epoch;
+ 	pi = ceph_pg_pool_by_id(osdc->osdmap, t->base_oloc.pool);
+ 	if (!pi) {
+ 		t->osd = CEPH_HOMELESS_OSD;
+@@ -1593,10 +1595,11 @@ static void send_request(struct ceph_osd_request *req)
+ 
+ 	encode_request(req, req->r_request);
+ 
+-	dout("%s req %p tid %llu to pgid %llu.%x spgid %llu.%xs%d osd%d flags 0x%x attempt %d\n",
++	dout("%s req %p tid %llu to pgid %llu.%x spgid %llu.%xs%d osd%d e%u flags 0x%x attempt %d\n",
+ 	     __func__, req, req->r_tid, req->r_t.pgid.pool, req->r_t.pgid.seed,
+ 	     req->r_t.spgid.pgid.pool, req->r_t.spgid.pgid.seed,
+-	     req->r_t.spgid.shard, osd->o_osd, req->r_flags, req->r_attempts);
++	     req->r_t.spgid.shard, osd->o_osd, req->r_t.epoch, req->r_flags,
++	     req->r_attempts);
+ 
+ 	req->r_t.paused = false;
+ 	req->r_stamp = jiffies;
+@@ -1736,13 +1739,12 @@ static void submit_request(struct ceph_osd_request *req, bool wrlocked)
+ static void finish_request(struct ceph_osd_request *req)
+ {
+ 	struct ceph_osd_client *osdc = req->r_osdc;
+-	struct ceph_osd *osd = req->r_osd;
+ 
+-	verify_osd_locked(osd);
++	WARN_ON(lookup_request_mc(&osdc->map_checks, req->r_tid));
+ 	dout("%s req %p tid %llu\n", __func__, req, req->r_tid);
+ 
+-	WARN_ON(lookup_request_mc(&osdc->map_checks, req->r_tid));
+-	unlink_request(osd, req);
++	if (req->r_osd)
++		unlink_request(req->r_osd, req);
+ 	atomic_dec(&osdc->num_requests);
+ 
+ 	/*
+@@ -3210,8 +3212,25 @@ static void kick_requests(struct ceph_osd_client *osdc,
+ 			  struct list_head *need_resend_linger)
+ {
+ 	struct ceph_osd_linger_request *lreq, *nlreq;
++	enum calc_target_result ct_res;
+ 	struct rb_node *n;
+ 
++	/* make sure need_resend targets reflect latest map */
++	for (n = rb_first(need_resend); n; ) {
++		struct ceph_osd_request *req =
++		    rb_entry(n, struct ceph_osd_request, r_node);
++
++		n = rb_next(n);
++
++		if (req->r_t.epoch < osdc->osdmap->epoch) {
++			ct_res = calc_target(osdc, &req->r_t, NULL, false);
++			if (ct_res == CALC_TARGET_POOL_DNE) {
++				erase_request(need_resend, req);
++				check_pool_dne(req);
++			}
++		}
++	}
++
+ 	for (n = rb_first(need_resend); n; ) {
+ 		struct ceph_osd_request *req =
+ 		    rb_entry(n, struct ceph_osd_request, r_node);
+@@ -3220,8 +3239,6 @@ static void kick_requests(struct ceph_osd_client *osdc,
+ 		n = rb_next(n);
+ 		erase_request(need_resend, req); /* before link_request() */
+ 
+-		WARN_ON(req->r_osd);
+-		calc_target(osdc, &req->r_t, NULL, false);
+ 		osd = lookup_create_osd(osdc, req->r_t.osd, true);
+ 		link_request(osd, req);
+ 		if (!req->r_linger) {
