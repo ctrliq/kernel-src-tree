@@ -1,0 +1,137 @@
+sched/core: Fix remote wakeups
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit b7e7ade34e6188bee2e3b0d42b51d25137d9e2a5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b7e7ade3.failed
+
+Commit:
+
+  b5179ac70de8 ("sched/fair: Prepare to fix fairness problems on migration")
+
+... introduced a bug: Mike Galbraith found that it introduced a
+performance regression, while Paul E. McKenney reported lost
+wakeups and bisected it to this commit.
+
+The reason is that I mis-read ttwu_queue() such that I assumed any
+wakeup that got a remote queue must have had the task migrated.
+
+Since this is not so; we need to transfer this information between
+queueing the wakeup and actually doing the wakeup. Use a new
+task_struct::sched_flag for this, we already write to
+sched_contributes_to_load in the wakeup path so this is a hot and
+modified cacheline.
+
+	Reported-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+	Reported-by: Mike Galbraith <umgwanakikbuti@gmail.com>
+	Tested-by: Mike Galbraith <umgwanakikbuti@gmail.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Andrew Hunter <ahh@google.com>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Ben Segall <bsegall@google.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Brian Gerst <brgerst@gmail.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: Denys Vlasenko <dvlasenk@redhat.com>
+	Cc: Fenghua Yu <fenghua.yu@intel.com>
+	Cc: H. Peter Anvin <hpa@zytor.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Matt Fleming <matt@codeblueprint.co.uk>
+	Cc: Morten Rasmussen <morten.rasmussen@arm.com>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Paul Turner <pjt@google.com>
+	Cc: Pavan Kondeti <pkondeti@codeaurora.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Quentin Casasnovas <quentin.casasnovas@oracle.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: byungchul.park@lge.com
+Fixes: b5179ac70de8 ("sched/fair: Prepare to fix fairness problems on migration")
+Link: http://lkml.kernel.org/r/20160523091907.GD15728@worktop.ger.corp.intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit b7e7ade34e6188bee2e3b0d42b51d25137d9e2a5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched.h
+#	kernel/sched/core.c
+diff --cc include/linux/sched.h
+index 0646138be0ad,e053517a88b6..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -1407,17 -1529,29 +1407,40 @@@ struct task_struct 
+  	/* Used for emulating ABI behavior of previous Linux versions */
+  	unsigned int personality;
+  
+ -	/* scheduler bits, serialized by scheduler locks */
+ +	unsigned did_exec:1;
+ +	unsigned in_execve:1;	/* Tell the LSMs that the process is doing an
+ +				 * execve */
+ +	unsigned in_iowait:1;
+ +
+ +	/* task may not gain privileges */
+ +	unsigned no_new_privs:1;
+ +
+ +	/* Revert to default priority/policy when forking */
+  	unsigned sched_reset_on_fork:1;
+  	unsigned sched_contributes_to_load:1;
+++<<<<<<< HEAD
+++=======
++ 	unsigned sched_migrated:1;
++ 	unsigned sched_remote_wakeup:1;
++ 	unsigned :0; /* force alignment to the next boundary */
++ 
++ 	/* unserialized, strictly 'current' */
++ 	unsigned in_execve:1; /* bit to tell LSMs we're in execve */
++ 	unsigned in_iowait:1;
++ #ifdef CONFIG_MEMCG
++ 	unsigned memcg_may_oom:1;
++ #ifndef CONFIG_SLOB
++ 	unsigned memcg_kmem_skip_account:1;
++ #endif
++ #endif
++ #ifdef CONFIG_COMPAT_BRK
++ 	unsigned brk_randomized:1;
++ #endif
++ 
++ 	unsigned long atomic_flags; /* Flags needing atomic access. */
++ 
++ 	struct restart_block restart_block;
+++>>>>>>> b7e7ade34e61 (sched/core: Fix remote wakeups)
+  
+  	pid_t pid;
+  	pid_t tgid;
+diff --cc kernel/sched/core.c
+index 1a5e18b224eb,7f2cae4620c7..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -1609,13 -1765,21 +1609,23 @@@ void sched_ttwu_pending(void
+  		return;
+  
+  	raw_spin_lock_irqsave(&rq->lock, flags);
+ -	cookie = lockdep_pin_lock(&rq->lock);
+  
+  	while (llist) {
++ 		int wake_flags = 0;
++ 
+  		p = llist_entry(llist, struct task_struct, wake_entry);
+  		llist = llist_next(llist);
+++<<<<<<< HEAD
+ +		ttwu_do_activate(rq, p, 0);
+++=======
++ 
++ 		if (p->sched_remote_wakeup)
++ 			wake_flags = WF_MIGRATED;
++ 
++ 		ttwu_do_activate(rq, p, wake_flags, cookie);
+++>>>>>>> b7e7ade34e61 (sched/core: Fix remote wakeups)
+  	}
+  
+ -	lockdep_unpin_lock(&rq->lock, cookie);
+  	raw_spin_unlock_irqrestore(&rq->lock, flags);
+  }
+  
+* Unmerged path include/linux/sched.h
+* Unmerged path kernel/sched/core.c
