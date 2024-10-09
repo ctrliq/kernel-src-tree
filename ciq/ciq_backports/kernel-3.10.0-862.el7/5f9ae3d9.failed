@@ -1,0 +1,148 @@
+ipv4: do metrics match when looking up and deleting a route
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 5f9ae3d9e7e4ad6db0491abc7c4ae5452dbeadd8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5f9ae3d9.failed
+
+Now when ipv4 route inserts a fib_info, it memcmp fib_metrics.
+It means ipv4 route identifies one route also with metrics.
+
+But when removing a route, it tries to find the route without
+caring about the metrics. It will cause that the route with
+right metrics can't be removed.
+
+Thomas noticed this issue when doing the testing:
+
+1. add:
+   # ip route append 192.168.7.0/24 dev v window 1000
+   # ip route append 192.168.7.0/24 dev v window 1001
+   # ip route append 192.168.7.0/24 dev v window 1002
+   # ip route append 192.168.7.0/24 dev v window 1003
+2. delete:
+   # ip route delete 192.168.7.0/24 dev v window 1002
+3. show:
+     192.168.7.0/24 proto boot scope link window 1001
+     192.168.7.0/24 proto boot scope link window 1002
+     192.168.7.0/24 proto boot scope link window 1003
+
+The one with window 1002 wasn't deleted but the first one was.
+
+This patch is to do metrics match when looking up and deleting
+one route.
+
+	Reported-by: Thomas Haller <thaller@redhat.com>
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5f9ae3d9e7e4ad6db0491abc7c4ae5452dbeadd8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/fib_lookup.h
+#	net/ipv4/fib_trie.c
+diff --cc net/ipv4/fib_lookup.h
+index c6118779d817,5b2af19cfb5b..000000000000
+--- a/net/ipv4/fib_lookup.h
++++ b/net/ipv4/fib_lookup.h
+@@@ -25,19 -27,17 +25,33 @@@ static inline void fib_alias_accessed(s
+  }
+  
+  /* Exported by fib_semantics.c */
+++<<<<<<< HEAD
+ +extern void fib_release_info(struct fib_info *);
+ +extern struct fib_info *fib_create_info(struct fib_config *cfg);
+ +extern int fib_nh_match(struct fib_config *cfg, struct fib_info *fi);
+ +extern int fib_dump_info(struct sk_buff *skb, u32 pid, u32 seq, int event,
+ +			 u32 tb_id, u8 type, __be32 dst,
+ +			 int dst_len, u8 tos, struct fib_info *fi,
+ +			 unsigned int);
+ +extern void rtmsg_fib(int event, __be32 key, struct fib_alias *fa,
+ +		      int dst_len, u32 tb_id, struct nl_info *info,
+ +		      unsigned int nlm_flags);
+ +extern int fib_detect_death(struct fib_info *fi, int order,
+ +			    struct fib_info **last_resort,
+ +			    int *last_idx, int dflt);
+++=======
++ void fib_release_info(struct fib_info *);
++ struct fib_info *fib_create_info(struct fib_config *cfg,
++ 				 struct netlink_ext_ack *extack);
++ int fib_nh_match(struct fib_config *cfg, struct fib_info *fi,
++ 		 struct netlink_ext_ack *extack);
++ bool fib_metrics_match(struct fib_config *cfg, struct fib_info *fi);
++ int fib_dump_info(struct sk_buff *skb, u32 pid, u32 seq, int event, u32 tb_id,
++ 		  u8 type, __be32 dst, int dst_len, u8 tos, struct fib_info *fi,
++ 		  unsigned int);
++ void rtmsg_fib(int event, __be32 key, struct fib_alias *fa, int dst_len,
++ 	       u32 tb_id, const struct nl_info *info, unsigned int nlm_flags);
+++>>>>>>> 5f9ae3d9e7e4 (ipv4: do metrics match when looking up and deleting a route)
+  
+  static inline void fib_result_assign(struct fib_result *res,
+  				     struct fib_info *fi)
+diff --cc net/ipv4/fib_trie.c
+index 5512775a2305,c636650a6a70..000000000000
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@@ -1630,7 -1563,8 +1630,12 @@@ int fib_table_delete(struct net *net, s
+  		     fi->fib_prefsrc == cfg->fc_prefsrc) &&
+  		    (!cfg->fc_protocol ||
+  		     fi->fib_protocol == cfg->fc_protocol) &&
+++<<<<<<< HEAD
+ +		    fib_nh_match(cfg, fi) == 0) {
+++=======
++ 		    fib_nh_match(cfg, fi, extack) == 0 &&
++ 		    fib_metrics_match(cfg, fi)) {
+++>>>>>>> 5f9ae3d9e7e4 (ipv4: do metrics match when looking up and deleting a route)
+  			fa_to_delete = fa;
+  			break;
+  		}
+* Unmerged path net/ipv4/fib_lookup.h
+diff --git a/net/ipv4/fib_semantics.c b/net/ipv4/fib_semantics.c
+index 22ec44cc4020..7d3ac6948355 100644
+--- a/net/ipv4/fib_semantics.c
++++ b/net/ipv4/fib_semantics.c
+@@ -661,6 +661,40 @@ int fib_nh_match(struct fib_config *cfg, struct fib_info *fi)
+ 	return 0;
+ }
+ 
++bool fib_metrics_match(struct fib_config *cfg, struct fib_info *fi)
++{
++	struct nlattr *nla;
++	int remaining;
++
++	if (!cfg->fc_mx)
++		return true;
++
++	nla_for_each_attr(nla, cfg->fc_mx, cfg->fc_mx_len, remaining) {
++		int type = nla_type(nla);
++		u32 val;
++
++		if (!type)
++			continue;
++		if (type > RTAX_MAX)
++			return false;
++
++		if (type == RTAX_CC_ALGO) {
++			char tmp[TCP_CA_NAME_MAX];
++			bool ecn_ca = false;
++
++			nla_strlcpy(tmp, nla, sizeof(tmp));
++			val = tcp_ca_get_key_by_name(tmp, &ecn_ca);
++		} else {
++			val = nla_get_u32(nla);
++		}
++
++		if (fi->fib_metrics->metrics[type - 1] != val)
++			return false;
++	}
++
++	return true;
++}
++
+ 
+ /*
+  * Picture
+* Unmerged path net/ipv4/fib_trie.c
