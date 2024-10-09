@@ -1,0 +1,208 @@
+cpuset: enable onlined cpu/node in effective masks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Li Zefan <lizefan@huawei.com>
+commit be4c9dd7aee5ecf3e748da68c27b38bdca70d444
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/be4c9dd7.failed
+
+Firstly offline cpu1:
+
+  # echo 0-1 > cpuset.cpus
+  # echo 0 > /sys/devices/system/cpu/cpu1/online
+  # cat cpuset.cpus
+  0-1
+  # cat cpuset.effective_cpus
+  0
+
+Then online it:
+
+  # echo 1 > /sys/devices/system/cpu/cpu1/online
+  # cat cpuset.cpus
+  0-1
+  # cat cpuset.effective_cpus
+  0-1
+
+And cpuset will bring it back to the effective mask.
+
+The implementation is quite straightforward. Instead of calculating the
+offlined cpus/mems and do updates, we just set the new effective_mask
+to online_mask & congifured_mask.
+
+This is a behavior change for default hierarchy, so legacy hierarchy
+won't be affected.
+
+v2:
+- make refactoring of cpuset_hotplug_update_tasks() as seperate patch,
+  suggested by Tejun.
+- make hotplug_update_tasks_insane() use @new_cpus and @new_mems as
+  hotplug_update_tasks_sane() does.
+
+	Signed-off-by: Li Zefan <lizefan@huawei.com>
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+(cherry picked from commit be4c9dd7aee5ecf3e748da68c27b38bdca70d444)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/cpuset.c
+diff --cc kernel/cpuset.c
+index 650413f2caa8,c47cb940712e..000000000000
+--- a/kernel/cpuset.c
++++ b/kernel/cpuset.c
+@@@ -2087,6 -2080,66 +2087,69 @@@ static void remove_tasks_in_empty_cpuse
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ hotplug_update_tasks_legacy(struct cpuset *cs,
++ 			    struct cpumask *new_cpus, nodemask_t *new_mems,
++ 			    bool cpus_updated, bool mems_updated)
++ {
++ 	bool is_empty;
++ 
++ 	mutex_lock(&callback_mutex);
++ 	cpumask_copy(cs->cpus_allowed, new_cpus);
++ 	cpumask_copy(cs->effective_cpus, new_cpus);
++ 	cs->mems_allowed = *new_mems;
++ 	cs->effective_mems = *new_mems;
++ 	mutex_unlock(&callback_mutex);
++ 
++ 	/*
++ 	 * Don't call update_tasks_cpumask() if the cpuset becomes empty,
++ 	 * as the tasks will be migratecd to an ancestor.
++ 	 */
++ 	if (cpus_updated && !cpumask_empty(cs->cpus_allowed))
++ 		update_tasks_cpumask(cs);
++ 	if (mems_updated && !nodes_empty(cs->mems_allowed))
++ 		update_tasks_nodemask(cs);
++ 
++ 	is_empty = cpumask_empty(cs->cpus_allowed) ||
++ 		   nodes_empty(cs->mems_allowed);
++ 
++ 	mutex_unlock(&cpuset_mutex);
++ 
++ 	/*
++ 	 * Move tasks to the nearest ancestor with execution resources,
++ 	 * This is full cgroup operation which will also call back into
++ 	 * cpuset. Should be done outside any lock.
++ 	 */
++ 	if (is_empty)
++ 		remove_tasks_in_empty_cpuset(cs);
++ 
++ 	mutex_lock(&cpuset_mutex);
++ }
++ 
++ static void
++ hotplug_update_tasks(struct cpuset *cs,
++ 		     struct cpumask *new_cpus, nodemask_t *new_mems,
++ 		     bool cpus_updated, bool mems_updated)
++ {
++ 	if (cpumask_empty(new_cpus))
++ 		cpumask_copy(new_cpus, parent_cs(cs)->effective_cpus);
++ 	if (nodes_empty(*new_mems))
++ 		*new_mems = parent_cs(cs)->effective_mems;
++ 
++ 	mutex_lock(&callback_mutex);
++ 	cpumask_copy(cs->effective_cpus, new_cpus);
++ 	cs->effective_mems = *new_mems;
++ 	mutex_unlock(&callback_mutex);
++ 
++ 	if (cpus_updated)
++ 		update_tasks_cpumask(cs);
++ 	if (mems_updated)
++ 		update_tasks_nodemask(cs);
++ }
++ 
+++>>>>>>> be4c9dd7aee5 (cpuset: enable onlined cpu/node in effective masks)
+  /**
+   * cpuset_hotplug_update_tasks - update tasks in a cpuset for hotunplug
+   * @cs: cpuset in interest
+@@@ -2097,11 -2150,10 +2160,18 @@@
+   */
+  static void cpuset_hotplug_update_tasks(struct cpuset *cs)
+  {
+++<<<<<<< HEAD
+ +	static cpumask_t off_cpus;
+ +	static nodemask_t off_mems;
+ +	bool is_empty;
+ +	bool sane = cgroup_sane_behavior(cs->css.cgroup);
+ +
+++=======
++ 	static cpumask_t new_cpus;
++ 	static nodemask_t new_mems;
++ 	bool cpus_updated;
++ 	bool mems_updated;
+++>>>>>>> be4c9dd7aee5 (cpuset: enable onlined cpu/node in effective masks)
+  retry:
+  	wait_event(cpuset_attach_wq, cs->attach_in_progress == 0);
+  
+@@@ -2116,49 -2168,20 +2186,64 @@@
+  		goto retry;
+  	}
+  
+++<<<<<<< HEAD
+ +	cpumask_andnot(&off_cpus, cs->cpus_allowed, top_cpuset.cpus_allowed);
+ +	nodes_andnot(off_mems, cs->mems_allowed, top_cpuset.mems_allowed);
+ +
+ +	mutex_lock(&callback_mutex);
+ +	cpumask_andnot(cs->cpus_allowed, cs->cpus_allowed, &off_cpus);
+ +	cpumask_andnot(cs->effective_cpus, cs->effective_cpus, &off_cpus);
+ +	mutex_unlock(&callback_mutex);
+ +
+ +	/*
+ +	 * If sane_behavior flag is set, we need to update tasks' cpumask
+ +	 * for empty cpuset to take on ancestor's cpumask.
+ +	 */
+ +	if ((sane && cpumask_empty(cs->cpus_allowed)) ||
+ +	    !cpumask_empty(&off_cpus))
+ +		update_tasks_cpumask(cs, NULL);
+ +
+ +	mutex_lock(&callback_mutex);
+ +	nodes_andnot(cs->mems_allowed, cs->mems_allowed, off_mems);
+ +	nodes_andnot(cs->effective_mems, cs->effective_mems, off_mems);
+ +	mutex_unlock(&callback_mutex);
+ +
+ +	/*
+ +	 * If sane_behavior flag is set, we need to update tasks' nodemask
+ +	 * for empty cpuset to take on ancestor's nodemask.
+ +	 */
+ +	if ((sane && nodes_empty(cs->mems_allowed)) ||
+ +	    !nodes_empty(off_mems))
+ +		update_tasks_nodemask(cs, NULL);
+ +
+ +	is_empty = cpumask_empty(cs->cpus_allowed) ||
+ +		nodes_empty(cs->mems_allowed);
+++=======
++ 	cpumask_and(&new_cpus, cs->cpus_allowed, parent_cs(cs)->effective_cpus);
++ 	nodes_and(new_mems, cs->mems_allowed, parent_cs(cs)->effective_mems);
++ 
++ 	cpus_updated = !cpumask_equal(&new_cpus, cs->effective_cpus);
++ 	mems_updated = !nodes_equal(new_mems, cs->effective_mems);
++ 
++ 	if (cgroup_on_dfl(cs->css.cgroup))
++ 		hotplug_update_tasks(cs, &new_cpus, &new_mems,
++ 				     cpus_updated, mems_updated);
++ 	else
++ 		hotplug_update_tasks_legacy(cs, &new_cpus, &new_mems,
++ 					    cpus_updated, mems_updated);
+++>>>>>>> be4c9dd7aee5 (cpuset: enable onlined cpu/node in effective masks)
+  
+  	mutex_unlock(&cpuset_mutex);
+ +
+ +	/*
+ +	 * If sane_behavior flag is set, we'll keep tasks in empty cpusets.
+ +	 *
+ +	 * Otherwise move tasks to the nearest ancestor with execution
+ +	 * resources.  This is full cgroup operation which will
+ +	 * also call back into cpuset.  Should be done outside any lock.
+ +	 */
+ +	if (!sane && is_empty)
+ +		remove_tasks_in_empty_cpuset(cs);
+  }
+  
+  /**
+* Unmerged path kernel/cpuset.c
