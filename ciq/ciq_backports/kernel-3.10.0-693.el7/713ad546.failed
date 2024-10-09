@@ -1,0 +1,213 @@
+EDAC, amd64: Define and register UMC error decode function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [edac] amd64: Define and register UMC error decode function (Suravee Suthikulpanit) [1303712]
+Rebuild_FUZZ: 94.55%
+commit-author Yazen Ghannam <Yazen.Ghannam@amd.com>
+commit 713ad54675fdfd7358dbcae21ab4788a014c6e23
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/713ad546.failed
+
+How we need to decode UMC errors is different from how we decode bus
+errors, so let's define a new function for this. We also need a way to
+determine the UMC channel since we're not guaranteed that there is a
+fixed relation between channel and MCA bank.
+
+	Signed-off-by: Yazen Ghannam <Yazen.Ghannam@amd.com>
+	Cc: Aravind Gopalakrishnan <aravindksg.lkml@gmail.com>
+	Cc: linux-edac <linux-edac@vger.kernel.org>
+	Cc: x86-ml <x86@kernel.org>
+Link: http://lkml.kernel.org/r/1480359593-80369-1-git-send-email-Yazen.Ghannam@amd.com
+[ Fold in decode_synd_reg(), simplify. ]
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+(cherry picked from commit 713ad54675fdfd7358dbcae21ab4788a014c6e23)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/edac/amd64_edac.c
+diff --cc drivers/edac/amd64_edac.c
+index 6abeba1c9e8a,48a38ab363dd..000000000000
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@@ -2261,23 -2447,114 +2267,103 @@@ static inline void __amd64_decode_bus_e
+  	__log_ecc_error(mci, &err, ecc_type);
+  }
+  
+++<<<<<<< HEAD
+ +void amd64_decode_bus_error(int node_id, struct mce *m)
+++=======
++ /*
++  * To find the UMC channel represented by this bank we need to match on its
++  * instance_id. The instance_id of a bank is held in the lower 32 bits of its
++  * IPID.
++  */
++ static int find_umc_channel(struct amd64_pvt *pvt, struct mce *m)
++ {
++ 	u32 umc_instance_id[] = {0x50f00, 0x150f00};
++ 	u32 instance_id = m->ipid & GENMASK(31, 0);
++ 	int i, channel = -1;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(umc_instance_id); i++)
++ 		if (umc_instance_id[i] == instance_id)
++ 			channel = i;
++ 
++ 	return channel;
++ }
++ 
++ static void decode_umc_error(int node_id, struct mce *m)
++ {
++ 	u8 ecc_type = (m->status >> 45) & 0x3;
++ 	struct mem_ctl_info *mci;
++ 	struct amd64_pvt *pvt;
++ 	struct err_info err;
++ 	u64 sys_addr;
++ 
++ 	mci = edac_mc_find(node_id);
++ 	if (!mci)
++ 		return;
++ 
++ 	pvt = mci->pvt_info;
++ 
++ 	memset(&err, 0, sizeof(err));
++ 
++ 	if (m->status & MCI_STATUS_DEFERRED)
++ 		ecc_type = 3;
++ 
++ 	err.channel = find_umc_channel(pvt, m);
++ 	if (err.channel < 0) {
++ 		err.err_code = ERR_CHANNEL;
++ 		goto log_error;
++ 	}
++ 
++ 	if (umc_normaddr_to_sysaddr(m->addr, pvt->mc_node_id, err.channel, &sys_addr)) {
++ 		err.err_code = ERR_NORM_ADDR;
++ 		goto log_error;
++ 	}
++ 
++ 	error_address_to_page_and_offset(sys_addr, &err);
++ 
++ 	if (!(m->status & MCI_STATUS_SYNDV)) {
++ 		err.err_code = ERR_SYND;
++ 		goto log_error;
++ 	}
++ 
++ 	if (ecc_type == 2) {
++ 		u8 length = (m->synd >> 18) & 0x3f;
++ 
++ 		if (length)
++ 			err.syndrome = (m->synd >> 32) & GENMASK(length - 1, 0);
++ 		else
++ 			err.err_code = ERR_CHANNEL;
++ 	}
++ 
++ 	err.csrow = m->synd & 0x7;
++ 
++ log_error:
++ 	__log_ecc_error(mci, &err, ecc_type);
++ }
++ 
++ /*
++  * Use pvt->F3 which contains the F3 CPU PCI device to get the related
++  * F1 (AddrMap) and F2 (Dct) devices. Return negative value on error.
++  * Reserve F0 and F6 on systems with a UMC.
++  */
++ static int
++ reserve_mc_sibling_devs(struct amd64_pvt *pvt, u16 pci_id1, u16 pci_id2)
+++>>>>>>> 713ad54675fd (EDAC, amd64: Define and register UMC error decode function)
+  {
+ -	if (pvt->umc) {
+ -		pvt->F0 = pci_get_related_function(pvt->F3->vendor, pci_id1, pvt->F3);
+ -		if (!pvt->F0) {
+ -		amd64_err("error F0 device not found: vendor %x device 0x%x (broken BIOS?)\n",
+ -			  PCI_VENDOR_ID_AMD, pci_id1);
+ -			return -ENODEV;
+ -		}
+ -
+ -		pvt->F6 = pci_get_related_function(pvt->F3->vendor, pci_id2, pvt->F3);
+ -		if (!pvt->F6) {
+ -			pci_dev_put(pvt->F0);
+ -			pvt->F0 = NULL;
+ -
+ -		amd64_err("error F6 device not found: vendor %x device 0x%x (broken BIOS?)\n",
+ -			  PCI_VENDOR_ID_AMD, pci_id2);
+ -
+ -			return -ENODEV;
+ -		}
+ -		edac_dbg(1, "F0: %s\n", pci_name(pvt->F0));
+ -		edac_dbg(1, "F3: %s\n", pci_name(pvt->F3));
+ -		edac_dbg(1, "F6: %s\n", pci_name(pvt->F6));
+ -
+ -		return 0;
+ -	}
+ +	__amd64_decode_bus_error(mcis[node_id], m);
+ +}
+  
+ +/*
+ + * Use pvt->F2 which contains the F2 CPU PCI device to get the related
+ + * F1 (AddrMap) and F3 (Misc) devices. Return negative value on error.
+ + */
+ +static int reserve_mc_sibling_devs(struct amd64_pvt *pvt, u16 f1_id, u16 f3_id)
+ +{
+  	/* Reserve the ADDRESS MAP Device */
+ -	pvt->F1 = pci_get_related_function(pvt->F3->vendor, pci_id1, pvt->F3);
+ +	pvt->F1 = pci_get_related_function(pvt->F2->vendor, f1_id, pvt->F2);
+  	if (!pvt->F1) {
+ -	amd64_err("error address map device not found: vendor %x device 0x%x (broken BIOS?)\n",
+ -		  PCI_VENDOR_ID_AMD, pci_id1);
+ +		amd64_err("error address map device not found: "
+ +			  "vendor %x device 0x%x (broken BIOS?)\n",
+ +			  PCI_VENDOR_ID_AMD, f1_id);
+  		return -ENODEV;
+  	}
+  
+@@@ -2939,11 -3308,10 +3025,18 @@@ static int init_one_instance(struct pci
+  	if (report_gart_errors)
+  		amd_report_gart_errors(true);
+  
+++<<<<<<< HEAD
+ +	amd_register_ecc_decoder(amd64_decode_bus_error);
+ +
+ +	mcis[nid] = mci;
+ +
+ +	atomic_inc(&drv_instances);
+++=======
++ 	if (pvt->umc)
++ 		amd_register_ecc_decoder(decode_umc_error);
++ 	else
++ 		amd_register_ecc_decoder(decode_bus_error);
+++>>>>>>> 713ad54675fd (EDAC, amd64: Define and register UMC error decode function)
+  
+  	return 0;
+  
+@@@ -3042,7 -3402,11 +3135,15 @@@ static void remove_one_instance(struct 
+  
+  	/* unregister from EDAC MCE */
+  	amd_report_gart_errors(false);
+++<<<<<<< HEAD
+ +	amd_unregister_ecc_decoder(amd64_decode_bus_error);
+++=======
++ 
++ 	if (pvt->umc)
++ 		amd_unregister_ecc_decoder(decode_umc_error);
++ 	else
++ 		amd_unregister_ecc_decoder(decode_bus_error);
+++>>>>>>> 713ad54675fd (EDAC, amd64: Define and register UMC error decode function)
+  
+  	kfree(ecc_stngs[nid]);
+  	ecc_stngs[nid] = NULL;
+* Unmerged path drivers/edac/amd64_edac.c
+diff --git a/drivers/edac/amd64_edac.h b/drivers/edac/amd64_edac.h
+index 839d59711c41..8c3fac6939a8 100644
+--- a/drivers/edac/amd64_edac.h
++++ b/drivers/edac/amd64_edac.h
+@@ -405,6 +405,8 @@ enum err_codes {
+ 	ERR_NODE	= -1,
+ 	ERR_CSROW	= -2,
+ 	ERR_CHANNEL	= -3,
++	ERR_SYND	= -4,
++	ERR_NORM_ADDR	= -5,
+ };
+ 
+ struct err_info {
