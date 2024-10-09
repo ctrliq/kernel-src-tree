@@ -1,0 +1,158 @@
+amd-xgbe: Use device workqueue instead of system workqueue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit afb43e8a0af18fa959e9ef09abfa969c3c83f4ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/afb43e8a.failed
+
+The driver creates, flushes and destroys a device workqueue but queues
+work to the system workqueue. Switch from using the system workqueue to
+the device workqueue.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit afb43e8a0af18fa959e9ef09abfa969c3c83f4ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index d58e85811bc9,14bad8c44c87..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@@ -238,9 -360,12 +238,9 @@@ static irqreturn_t xgbe_isr(int irq, vo
+  			}
+  		}
+  
+ -		if (XGMAC_GET_BITS(dma_ch_isr, DMA_CH_SR, RBU))
+ -			pdata->ext_stats.rx_buffer_unavailable++;
+ -
+  		/* Restart the device on a Fatal Bus Error */
+  		if (XGMAC_GET_BITS(dma_ch_isr, DMA_CH_SR, FBE))
+- 			schedule_work(&pdata->restart_work);
++ 			queue_work(pdata->dev_workqueue, &pdata->restart_work);
+  
+  		/* Clear all interrupt signals */
+  		XGMAC_DMA_IOWRITE(channel, DMA_CH_SR, dma_ch_isr);
+@@@ -254,13 -379,39 +254,28 @@@
+  
+  		if (XGMAC_GET_BITS(mac_isr, MAC_ISR, MMCRXIS))
+  			hw_if->rx_mmc_int(pdata);
+++<<<<<<< HEAD
+++=======
++ 
++ 		if (XGMAC_GET_BITS(mac_isr, MAC_ISR, TSIS)) {
++ 			mac_tssr = XGMAC_IOREAD(pdata, MAC_TSSR);
++ 
++ 			if (XGMAC_GET_BITS(mac_tssr, MAC_TSSR, TXTSC)) {
++ 				/* Read Tx Timestamp to clear interrupt */
++ 				pdata->tx_tstamp =
++ 					hw_if->get_tx_tstamp(pdata);
++ 				queue_work(pdata->dev_workqueue,
++ 					   &pdata->tx_tstamp_work);
++ 			}
++ 		}
+++>>>>>>> afb43e8a0af1 (amd-xgbe: Use device workqueue instead of system workqueue)
+  	}
+  
+ -isr_done:
+ -	return IRQ_HANDLED;
+ -}
+ -
+ -static irqreturn_t xgbe_dma_isr(int irq, void *data)
+ -{
+ -	struct xgbe_channel *channel = data;
+ -
+ -	/* Per channel DMA interrupts are enabled, so we use the per
+ -	 * channel napi structure and not the private data napi structure
+ -	 */
+ -	if (napi_schedule_prep(&channel->napi)) {
+ -		/* Disable Tx and Rx interrupts */
+ -		disable_irq_nosync(channel->dma_irq);
+ +	DBGPR("  DMA_ISR = %08x\n", XGMAC_IOREAD(pdata, DMA_ISR));
+  
+ -		/* Turn on polling */
+ -		__napi_schedule(&channel->napi);
+ -	}
+ +	DBGPR("<--xgbe_isr\n");
+  
+ +isr_done:
+  	return IRQ_HANDLED;
+  }
+  
+@@@ -287,14 -438,28 +302,36 @@@ static enum hrtimer_restart xgbe_tx_tim
+  
+  	channel->tx_timer_active = 0;
+  
+ +	spin_unlock_irqrestore(&ring->lock, flags);
+ +
+  	DBGPR("<--xgbe_tx_timer\n");
+ +
+ +	return HRTIMER_NORESTART;
+  }
+  
+++<<<<<<< HEAD
+ +static void xgbe_init_tx_timers(struct xgbe_prv_data *pdata)
+++=======
++ static void xgbe_service(struct work_struct *work)
++ {
++ 	struct xgbe_prv_data *pdata = container_of(work,
++ 						   struct xgbe_prv_data,
++ 						   service_work);
++ 
++ 	pdata->phy_if.phy_status(pdata);
++ }
++ 
++ static void xgbe_service_timer(unsigned long data)
++ {
++ 	struct xgbe_prv_data *pdata = (struct xgbe_prv_data *)data;
++ 
++ 	queue_work(pdata->dev_workqueue, &pdata->service_work);
++ 
++ 	mod_timer(&pdata->service_timer, jiffies + HZ);
++ }
++ 
++ static void xgbe_init_timers(struct xgbe_prv_data *pdata)
+++>>>>>>> afb43e8a0af1 (amd-xgbe: Use device workqueue instead of system workqueue)
+  {
+  	struct xgbe_channel *channel;
+  	unsigned int i;
+@@@ -585,10 -892,10 +622,15 @@@ static int xgbe_start(struct xgbe_prv_d
+  	hw_if->enable_tx(pdata);
+  	hw_if->enable_rx(pdata);
+  
+ -	netif_tx_start_all_queues(netdev);
+ +	xgbe_init_tx_timers(pdata);
+  
+++<<<<<<< HEAD
+ +	xgbe_napi_enable(pdata, 1);
+ +	netif_tx_start_all_queues(netdev);
+++=======
++ 	xgbe_start_timers(pdata);
++ 	queue_work(pdata->dev_workqueue, &pdata->service_work);
+++>>>>>>> afb43e8a0af1 (amd-xgbe: Use device workqueue instead of system workqueue)
+  
+  	DBGPR("<--xgbe_start\n");
+  
+@@@ -981,6 -1532,14 +1023,17 @@@ static int xgbe_change_mtu(struct net_d
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void xgbe_tx_timeout(struct net_device *netdev)
++ {
++ 	struct xgbe_prv_data *pdata = netdev_priv(netdev);
++ 
++ 	netdev_warn(netdev, "tx timeout, device restarting\n");
++ 	queue_work(pdata->dev_workqueue, &pdata->restart_work);
++ }
++ 
+++>>>>>>> afb43e8a0af1 (amd-xgbe: Use device workqueue instead of system workqueue)
+  static struct rtnl_link_stats64 *xgbe_get_stats64(struct net_device *netdev,
+  						  struct rtnl_link_stats64 *s)
+  {
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-drv.c
