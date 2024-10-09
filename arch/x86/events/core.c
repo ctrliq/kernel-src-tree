@@ -2212,7 +2212,8 @@ perf_callchain_kernel(struct perf_callchain_entry *entry, struct pt_regs *regs)
 		return;
 	}
 
-	perf_callchain_store(entry, regs->ip);
+	if (perf_callchain_store(entry, regs->ip))
+		return;
 
 	dump_trace(NULL, regs, NULL, 0, &backtrace_ops, entry);
 }
