@@ -1,0 +1,188 @@
+selinux: refactor sidtab conversion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Ondrej Mosnacek <omosnace@redhat.com>
+commit 5386e6caa6711407182573e2b0344fe908b0fbcc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/5386e6ca.failed
+
+This is a purely cosmetic change that encapsulates the three-step sidtab
+conversion logic (shutdown -> clone -> map) into a single function
+defined in sidtab.c (as opposed to services.c).
+
+	Signed-off-by: Ondrej Mosnacek <omosnace@redhat.com>
+	Acked-by: Stephen Smalley <sds@tycho.nsa.gov>
+[PM: whitespaces fixes to make checkpatch happy]
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit 5386e6caa6711407182573e2b0344fe908b0fbcc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/selinux/ss/services.c
+diff --cc security/selinux/ss/services.c
+index f2e85744961c,7337db24a6a8..000000000000
+--- a/security/selinux/ss/services.c
++++ b/security/selinux/ss/services.c
+@@@ -1805,21 -1880,11 +1805,27 @@@ int security_change_sid(u32 ssid
+  				    out_sid, false);
+  }
+  
+++<<<<<<< HEAD
+ +/* Clone the SID into the new SID table. */
+ +static int clone_sid(u32 sid,
+ +		     struct context *context,
+ +		     void *arg)
+ +{
+ +	struct sidtab *s = arg;
+ +
+ +	if (sid > SECINITSID_NUM)
+ +		return sidtab_insert(s, sid, context);
+ +	else
+ +		return 0;
+ +}
+ +
+ +static inline int convert_context_handle_invalid_context(struct context *context)
+++=======
++ static inline int convert_context_handle_invalid_context(
++ 	struct selinux_state *state,
++ 	struct context *context)
+++>>>>>>> 5386e6caa671 (selinux: refactor sidtab conversion)
+  {
+ -	struct policydb *policydb = &state->ss->policydb;
+  	char *s;
+  	u32 len;
+  
+@@@ -2098,22 -2173,16 +2104,25 @@@ int security_load_policy(void *data, si
+  		goto err;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Clone the SID table. */
+ +	sidtab_shutdown(&sidtab);
+ +
+ +	rc = sidtab_map(&sidtab, clone_sid, &newsidtab);
+ +	if (rc)
+ +		goto err;
+ +
+++=======
+++>>>>>>> 5386e6caa671 (selinux: refactor sidtab conversion)
+  	/*
+  	 * Convert the internal representations of contexts
+  	 * in the new SID table.
+  	 */
+ -	args.state = state;
+ -	args.oldp = policydb;
+ +	args.oldp = &policydb;
+  	args.newp = newpolicydb;
+- 	rc = sidtab_map(&newsidtab, convert_context, &args);
++ 	rc = sidtab_convert(sidtab, &newsidtab, convert_context, &args);
+  	if (rc) {
+ -		pr_err("SELinux:  unable to convert the internal"
+ +		printk(KERN_ERR "SELinux:  unable to convert the internal"
+  			" representation of contexts in the new SID"
+  			" table\n");
+  		goto err;
+* Unmerged path security/selinux/ss/services.c
+diff --git a/security/selinux/ss/sidtab.c b/security/selinux/ss/sidtab.c
+index 5840a35155fc..b0f58878f44f 100644
+--- a/security/selinux/ss/sidtab.c
++++ b/security/selinux/ss/sidtab.c
+@@ -122,11 +122,11 @@ struct context *sidtab_search_force(struct sidtab *s, u32 sid)
+ 	return sidtab_search_core(s, sid, 1);
+ }
+ 
+-int sidtab_map(struct sidtab *s,
+-	       int (*apply) (u32 sid,
+-			     struct context *context,
+-			     void *args),
+-	       void *args)
++static int sidtab_map(struct sidtab *s,
++		      int (*apply)(u32 sid,
++				   struct context *context,
++				   void *args),
++		      void *args)
+ {
+ 	int i, rc = 0;
+ 	struct sidtab_node *cur;
+@@ -147,6 +147,37 @@ out:
+ 	return rc;
+ }
+ 
++/* Clone the SID into the new SID table. */
++static int clone_sid(u32 sid, struct context *context, void *arg)
++{
++	struct sidtab *s = arg;
++
++	if (sid > SECINITSID_NUM)
++		return sidtab_insert(s, sid, context);
++	else
++		return 0;
++}
++
++int sidtab_convert(struct sidtab *s, struct sidtab *news,
++		   int (*convert)(u32 sid,
++				  struct context *context,
++				  void *args),
++		   void *args)
++{
++	unsigned long flags;
++	int rc;
++
++	spin_lock_irqsave(&s->lock, flags);
++	s->shutdown = 1;
++	spin_unlock_irqrestore(&s->lock, flags);
++
++	rc = sidtab_map(s, clone_sid, news);
++	if (rc)
++		return rc;
++
++	return sidtab_map(news, convert, args);
++}
++
+ static void sidtab_update_cache(struct sidtab *s, struct sidtab_node *n, int loc)
+ {
+ 	BUG_ON(loc >= SIDTAB_CACHE_LEN);
+@@ -302,12 +333,3 @@ void sidtab_set(struct sidtab *dst, struct sidtab *src)
+ 		dst->cache[i] = NULL;
+ 	spin_unlock_irqrestore(&src->lock, flags);
+ }
+-
+-void sidtab_shutdown(struct sidtab *s)
+-{
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&s->lock, flags);
+-	s->shutdown = 1;
+-	spin_unlock_irqrestore(&s->lock, flags);
+-}
+diff --git a/security/selinux/ss/sidtab.h b/security/selinux/ss/sidtab.h
+index 84dc154d9389..6b1c749b8b1d 100644
+--- a/security/selinux/ss/sidtab.h
++++ b/security/selinux/ss/sidtab.h
+@@ -36,11 +36,11 @@ int sidtab_insert(struct sidtab *s, u32 sid, struct context *context);
+ struct context *sidtab_search(struct sidtab *s, u32 sid);
+ struct context *sidtab_search_force(struct sidtab *s, u32 sid);
+ 
+-int sidtab_map(struct sidtab *s,
+-	       int (*apply) (u32 sid,
+-			     struct context *context,
+-			     void *args),
+-	       void *args);
++int sidtab_convert(struct sidtab *s, struct sidtab *news,
++		   int (*apply)(u32 sid,
++				struct context *context,
++				void *args),
++		   void *args);
+ 
+ int sidtab_context_to_sid(struct sidtab *s,
+ 			  struct context *context,
+@@ -49,7 +49,6 @@ int sidtab_context_to_sid(struct sidtab *s,
+ void sidtab_hash_eval(struct sidtab *h, char *tag);
+ void sidtab_destroy(struct sidtab *s);
+ void sidtab_set(struct sidtab *dst, struct sidtab *src);
+-void sidtab_shutdown(struct sidtab *s);
+ 
+ #endif	/* _SS_SIDTAB_H_ */
+ 
