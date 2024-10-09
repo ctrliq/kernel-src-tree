@@ -1,0 +1,169 @@
+pipe: make account_pipe_buffers() return a value, and use it
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Michael Kerrisk (man-pages) <mtk.manpages@gmail.com>
+commit 9c87bcf0a31b338dc8a69a5d251a037565a94e13
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9c87bcf0.failed
+
+This is an optional patch, to provide a small performance
+improvement.  Alter account_pipe_buffers() so that it returns the
+new value in user->pipe_bufs. This means that we can refactor
+too_many_pipe_buffers_soft() and too_many_pipe_buffers_hard() to
+avoid the costs of repeated use of atomic_long_read() to get the
+value user->pipe_bufs.
+
+Link: http://lkml.kernel.org/r/93e5f193-1e5e-3e1f-3a20-eae79b7e1310@gmail.com
+	Signed-off-by: Michael Kerrisk <mtk.manpages@gmail.com>
+	Reviewed-by: Vegard Nossum <vegard.nossum@oracle.com>
+	Cc: Willy Tarreau <w@1wt.eu>
+	Cc: <socketpair@gmail.com>
+	Cc: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+	Cc: Jens Axboe <axboe@fb.com>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 9c87bcf0a31b338dc8a69a5d251a037565a94e13)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/pipe.c
+diff --cc fs/pipe.c
+index 771f837999b4,5ff02c4afe9f..000000000000
+--- a/fs/pipe.c
++++ b/fs/pipe.c
+@@@ -823,31 -620,41 +821,67 @@@ static bool too_many_pipe_buffers_hard(
+  struct pipe_inode_info *alloc_pipe_info(void)
+  {
+  	struct pipe_inode_info *pipe;
+++<<<<<<< HEAD
+++=======
++ 	unsigned long pipe_bufs = PIPE_DEF_BUFFERS;
++ 	struct user_struct *user = get_current_user();
++ 	unsigned long user_bufs;
+++>>>>>>> 9c87bcf0a31b (pipe: make account_pipe_buffers() return a value, and use it)
+ +
+ +	pipe = kzalloc(sizeof(struct pipe_inode_info), GFP_KERNEL);
+ +	if (pipe) {
+ +		unsigned long pipe_bufs = PIPE_DEF_BUFFERS;
+ +		struct user_struct *user = get_current_user();
+ +
+++<<<<<<< HEAD
+ +		if (!too_many_pipe_buffers_hard(user)) {
+ +			if (too_many_pipe_buffers_soft(user))
+ +				pipe_bufs = 1;
+ +			pipe->bufs = kzalloc(sizeof(struct pipe_buffer) * pipe_bufs, GFP_KERNEL);
+ +		}
+  
+ -	pipe = kzalloc(sizeof(struct pipe_inode_info), GFP_KERNEL_ACCOUNT);
+ -	if (pipe == NULL)
+ -		goto out_free_uid;
+ +		if (pipe->bufs) {
+ +			init_waitqueue_head(&pipe->wait);
+ +			pipe->r_counter = pipe->w_counter = 1;
+ +			pipe->buffers = pipe_bufs;
+ +			pipe->user = user;
+ +			account_pipe_buffers(user, 0, pipe_bufs);
+ +			mutex_init(&pipe->mutex);
+ +			return pipe;
+ +		}
+ +		free_uid(user);
+ +		kfree(pipe);
+ +	}
+  
+++=======
++ 	user_bufs = account_pipe_buffers(user, 0, pipe_bufs);
++ 
++ 	if (too_many_pipe_buffers_soft(user_bufs)) {
++ 		user_bufs = account_pipe_buffers(user, pipe_bufs, 1);
++ 		pipe_bufs = 1;
++ 	}
++ 
++ 	if (too_many_pipe_buffers_hard(user_bufs))
++ 		goto out_revert_acct;
++ 
++ 	pipe->bufs = kcalloc(pipe_bufs, sizeof(struct pipe_buffer),
++ 			     GFP_KERNEL_ACCOUNT);
++ 
++ 	if (pipe->bufs) {
++ 		init_waitqueue_head(&pipe->wait);
++ 		pipe->r_counter = pipe->w_counter = 1;
++ 		pipe->buffers = pipe_bufs;
++ 		pipe->user = user;
++ 		mutex_init(&pipe->mutex);
++ 		return pipe;
++ 	}
++ 
++ out_revert_acct:
++ 	(void) account_pipe_buffers(user, pipe_bufs, 0);
++ 	kfree(pipe);
++ out_free_uid:
++ 	free_uid(user);
+++>>>>>>> 9c87bcf0a31b (pipe: make account_pipe_buffers() return a value, and use it)
+  	return NULL;
+  }
+  
+@@@ -1225,6 -1033,8 +1259,11 @@@ static long pipe_set_size(struct pipe_i
+  {
+  	struct pipe_buffer *bufs;
+  	unsigned int size, nr_pages;
+++<<<<<<< HEAD
+++=======
++ 	unsigned long user_bufs;
++ 	long ret = 0;
+++>>>>>>> 9c87bcf0a31b (pipe: make account_pipe_buffers() return a value, and use it)
+  
+  	size = round_pipe_size(arg);
+  	nr_pages = size >> PAGE_SHIFT;
+@@@ -1232,13 -1042,26 +1271,25 @@@
+  	if (!nr_pages)
+  		return -EINVAL;
+  
+ -	/*
+ -	 * If trying to increase the pipe capacity, check that an
+ -	 * unprivileged user is not trying to exceed various limits
+ -	 * (soft limit check here, hard limit check just below).
+ -	 * Decreasing the pipe capacity is always permitted, even
+ -	 * if the user is currently over a limit.
+ -	 */
+ -	if (nr_pages > pipe->buffers &&
+ -			size > pipe_max_size && !capable(CAP_SYS_RESOURCE))
+ +	if (!capable(CAP_SYS_RESOURCE) && size > pipe_max_size)
+  		return -EPERM;
+  
+++<<<<<<< HEAD
+ +	if ((too_many_pipe_buffers_hard(pipe->user) ||
+ +			too_many_pipe_buffers_soft(pipe->user)) &&
+ +			!capable(CAP_SYS_RESOURCE) && !capable(CAP_SYS_ADMIN))
+ +		return -EPERM;
+++=======
++ 	user_bufs = account_pipe_buffers(pipe->user, pipe->buffers, nr_pages);
++ 
++ 	if (nr_pages > pipe->buffers &&
++ 			(too_many_pipe_buffers_hard(user_bufs) ||
++ 			 too_many_pipe_buffers_soft(user_bufs)) &&
++ 			!capable(CAP_SYS_RESOURCE) && !capable(CAP_SYS_ADMIN)) {
++ 		ret = -EPERM;
++ 		goto out_revert_acct;
++ 	}
+++>>>>>>> 9c87bcf0a31b (pipe: make account_pipe_buffers() return a value, and use it)
+  
+  	/*
+  	 * We can shrink the pipe, if arg >= pipe->nrbufs. Since we don't
+@@@ -1280,6 -1107,10 +1331,13 @@@
+  	pipe->bufs = bufs;
+  	pipe->buffers = nr_pages;
+  	return nr_pages * PAGE_SIZE;
+++<<<<<<< HEAD
+++=======
++ 
++ out_revert_acct:
++ 	(void) account_pipe_buffers(pipe->user, nr_pages, pipe->buffers);
++ 	return ret;
+++>>>>>>> 9c87bcf0a31b (pipe: make account_pipe_buffers() return a value, and use it)
+  }
+  
+  /*
+* Unmerged path fs/pipe.c
