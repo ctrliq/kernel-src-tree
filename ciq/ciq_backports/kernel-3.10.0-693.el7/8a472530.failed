@@ -1,0 +1,278 @@
+qede: Don't check netdevice for rx-hash
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Mintz, Yuval <Yuval.Mintz@cavium.com>
+commit 8a4725306522c875fca4bff4bd14a46e97690f48
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8a472530.failed
+
+Receive-hashing is a fixed feature, so there's no need to check
+during the ingress datapath whether it's set or not.
+
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8a4725306522c875fca4bff4bd14a46e97690f48)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qede/qede_main.c
+diff --cc drivers/net/ethernet/qlogic/qede/qede_main.c
+index a8dbc81cacdb,c9cae3e28ff4..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede_main.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_main.c
+@@@ -1375,14 -1391,244 +1369,249 @@@ static bool qede_pkt_is_ip_fragmented(s
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct sk_buff *qede_rx_allocate_skb(struct qede_dev *edev,
++ 					    struct qede_rx_queue *rxq,
++ 					    struct sw_rx_data *bd, u16 len,
++ 					    u16 pad)
++ {
++ 	unsigned int offset = bd->page_offset;
++ 	struct skb_frag_struct *frag;
++ 	struct page *page = bd->data;
++ 	unsigned int pull_len;
++ 	struct sk_buff *skb;
++ 	unsigned char *va;
++ 
++ 	/* Allocate a new SKB with a sufficient large header len */
++ 	skb = netdev_alloc_skb(edev->ndev, QEDE_RX_HDR_SIZE);
++ 	if (unlikely(!skb))
++ 		return NULL;
++ 
++ 	/* Copy data into SKB - if it's small, we can simply copy it and
++ 	 * re-use the already allcoated & mapped memory.
++ 	 */
++ 	if (len + pad <= edev->rx_copybreak) {
++ 		memcpy(skb_put(skb, len),
++ 		       page_address(page) + pad + offset, len);
++ 		qede_reuse_page(edev, rxq, bd);
++ 		goto out;
++ 	}
++ 
++ 	frag = &skb_shinfo(skb)->frags[0];
++ 
++ 	skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
++ 			page, pad + offset, len, rxq->rx_buf_seg_size);
++ 
++ 	va = skb_frag_address(frag);
++ 	pull_len = eth_get_headlen(va, QEDE_RX_HDR_SIZE);
++ 
++ 	/* Align the pull_len to optimize memcpy */
++ 	memcpy(skb->data, va, ALIGN(pull_len, sizeof(long)));
++ 
++ 	/* Correct the skb & frag sizes offset after the pull */
++ 	skb_frag_size_sub(frag, pull_len);
++ 	frag->page_offset += pull_len;
++ 	skb->data_len -= pull_len;
++ 	skb->tail += pull_len;
++ 
++ 	if (unlikely(qede_realloc_rx_buffer(edev, rxq, bd))) {
++ 		/* Incr page ref count to reuse on allocation failure so
++ 		 * that it doesn't get freed while freeing SKB [as its
++ 		 * already mapped there].
++ 		 */
++ 		page_ref_inc(page);
++ 		dev_kfree_skb_any(skb);
++ 		return NULL;
++ 	}
++ 
++ out:
++ 	/* We've consumed the first BD and prepared an SKB */
++ 	qede_rx_bd_ring_consume(rxq);
++ 	return skb;
++ }
++ 
++ static int qede_rx_build_jumbo(struct qede_dev *edev,
++ 			       struct qede_rx_queue *rxq,
++ 			       struct sk_buff *skb,
++ 			       struct eth_fast_path_rx_reg_cqe *cqe,
++ 			       u16 first_bd_len)
++ {
++ 	u16 pkt_len = le16_to_cpu(cqe->pkt_len);
++ 	struct sw_rx_data *bd;
++ 	u16 bd_cons_idx;
++ 	u8 num_frags;
++ 
++ 	pkt_len -= first_bd_len;
++ 
++ 	/* We've already used one BD for the SKB. Now take care of the rest */
++ 	for (num_frags = cqe->bd_num - 1; num_frags > 0; num_frags--) {
++ 		u16 cur_size = pkt_len > rxq->rx_buf_size ? rxq->rx_buf_size :
++ 		    pkt_len;
++ 
++ 		if (unlikely(!cur_size)) {
++ 			DP_ERR(edev,
++ 			       "Still got %d BDs for mapping jumbo, but length became 0\n",
++ 			       num_frags);
++ 			goto out;
++ 		}
++ 
++ 		/* We need a replacement buffer for each BD */
++ 		if (unlikely(qede_alloc_rx_buffer(edev, rxq)))
++ 			goto out;
++ 
++ 		/* Now that we've allocated the replacement buffer,
++ 		 * we can safely consume the next BD and map it to the SKB.
++ 		 */
++ 		bd_cons_idx = rxq->sw_rx_cons & NUM_RX_BDS_MAX;
++ 		bd = &rxq->sw_rx_ring[bd_cons_idx];
++ 		qede_rx_bd_ring_consume(rxq);
++ 
++ 		dma_unmap_page(&edev->pdev->dev, bd->mapping,
++ 			       PAGE_SIZE, DMA_FROM_DEVICE);
++ 
++ 		skb_fill_page_desc(skb, skb_shinfo(skb)->nr_frags++,
++ 				   bd->data, 0, cur_size);
++ 
++ 		skb->truesize += PAGE_SIZE;
++ 		skb->data_len += cur_size;
++ 		skb->len += cur_size;
++ 		pkt_len -= cur_size;
++ 	}
++ 
++ 	if (unlikely(pkt_len))
++ 		DP_ERR(edev,
++ 		       "Mapped all BDs of jumbo, but still have %d bytes\n",
++ 		       pkt_len);
++ 
++ out:
++ 	return num_frags;
++ }
++ 
++ static int qede_rx_process_tpa_cqe(struct qede_dev *edev,
++ 				   struct qede_fastpath *fp,
++ 				   struct qede_rx_queue *rxq,
++ 				   union eth_rx_cqe *cqe,
++ 				   enum eth_rx_cqe_type type)
++ {
++ 	switch (type) {
++ 	case ETH_RX_CQE_TYPE_TPA_START:
++ 		qede_tpa_start(edev, rxq, &cqe->fast_path_tpa_start);
++ 		return 0;
++ 	case ETH_RX_CQE_TYPE_TPA_CONT:
++ 		qede_tpa_cont(edev, rxq, &cqe->fast_path_tpa_cont);
++ 		return 0;
++ 	case ETH_RX_CQE_TYPE_TPA_END:
++ 		qede_tpa_end(edev, fp, &cqe->fast_path_tpa_end);
++ 		return 1;
++ 	default:
++ 		return 0;
++ 	}
++ }
++ 
++ static int qede_rx_process_cqe(struct qede_dev *edev,
++ 			       struct qede_fastpath *fp,
++ 			       struct qede_rx_queue *rxq)
++ {
++ 	struct eth_fast_path_rx_reg_cqe *fp_cqe;
++ 	u16 len, pad, bd_cons_idx, parse_flag;
++ 	enum eth_rx_cqe_type cqe_type;
++ 	union eth_rx_cqe *cqe;
++ 	struct sw_rx_data *bd;
++ 	struct sk_buff *skb;
++ 	__le16 flags;
++ 	u8 csum_flag;
++ 
++ 	/* Get the CQE from the completion ring */
++ 	cqe = (union eth_rx_cqe *)qed_chain_consume(&rxq->rx_comp_ring);
++ 	cqe_type = cqe->fast_path_regular.type;
++ 
++ 	/* Process an unlikely slowpath event */
++ 	if (unlikely(cqe_type == ETH_RX_CQE_TYPE_SLOW_PATH)) {
++ 		struct eth_slow_path_rx_cqe *sp_cqe;
++ 
++ 		sp_cqe = (struct eth_slow_path_rx_cqe *)cqe;
++ 		edev->ops->eth_cqe_completion(edev->cdev, fp->id, sp_cqe);
++ 		return 0;
++ 	}
++ 
++ 	/* Handle TPA cqes */
++ 	if (cqe_type != ETH_RX_CQE_TYPE_REGULAR)
++ 		return qede_rx_process_tpa_cqe(edev, fp, rxq, cqe, cqe_type);
++ 
++ 	/* Get the data from the SW ring; Consume it only after it's evident
++ 	 * we wouldn't recycle it.
++ 	 */
++ 	bd_cons_idx = rxq->sw_rx_cons & NUM_RX_BDS_MAX;
++ 	bd = &rxq->sw_rx_ring[bd_cons_idx];
++ 
++ 	fp_cqe = &cqe->fast_path_regular;
++ 	len = le16_to_cpu(fp_cqe->len_on_first_bd);
++ 	pad = fp_cqe->placement_offset;
++ 
++ 	/* If this is an error packet then drop it */
++ 	flags = cqe->fast_path_regular.pars_flags.flags;
++ 	parse_flag = le16_to_cpu(flags);
++ 
++ 	csum_flag = qede_check_csum(parse_flag);
++ 	if (unlikely(csum_flag == QEDE_CSUM_ERROR)) {
++ 		if (qede_pkt_is_ip_fragmented(fp_cqe, parse_flag)) {
++ 			rxq->rx_ip_frags++;
++ 		} else {
++ 			DP_NOTICE(edev,
++ 				  "CQE has error, flags = %x, dropping incoming packet\n",
++ 				  parse_flag);
++ 			rxq->rx_hw_errors++;
++ 			qede_recycle_rx_bd_ring(rxq, edev, fp_cqe->bd_num);
++ 			return 0;
++ 		}
++ 	}
++ 
++ 	/* Basic validation passed; Need to prepare an SKB. This would also
++ 	 * guarantee to finally consume the first BD upon success.
++ 	 */
++ 	skb = qede_rx_allocate_skb(edev, rxq, bd, len, pad);
++ 	if (!skb) {
++ 		rxq->rx_alloc_errors++;
++ 		qede_recycle_rx_bd_ring(rxq, edev, fp_cqe->bd_num);
++ 		return 0;
++ 	}
++ 
++ 	/* In case of Jumbo packet, several PAGE_SIZEd buffers will be pointed
++ 	 * by a single cqe.
++ 	 */
++ 	if (fp_cqe->bd_num > 1) {
++ 		u16 unmapped_frags = qede_rx_build_jumbo(edev, rxq, skb,
++ 							 fp_cqe, len);
++ 
++ 		if (unlikely(unmapped_frags > 0)) {
++ 			qede_recycle_rx_bd_ring(rxq, edev, unmapped_frags);
++ 			dev_kfree_skb_any(skb);
++ 			return 0;
++ 		}
++ 	}
++ 
++ 	/* The SKB contains all the data. Now prepare meta-magic */
++ 	skb->protocol = eth_type_trans(skb, edev->ndev);
++ 	qede_get_rxhash(skb, fp_cqe->bitfields, fp_cqe->rss_hash);
++ 	qede_set_skb_csum(skb, csum_flag);
++ 	skb_record_rx_queue(skb, rxq->rxq_id);
++ 
++ 	/* SKB is prepared - pass it to stack */
++ 	qede_skb_receive(edev, fp, skb, le16_to_cpu(fp_cqe->vlan_tag));
++ 
++ 	return 1;
++ }
++ 
+++>>>>>>> 8a4725306522 (qede: Don't check netdevice for rx-hash)
+  static int qede_rx_int(struct qede_fastpath *fp, int budget)
+  {
+ -	struct qede_rx_queue *rxq = fp->rxq;
+  	struct qede_dev *edev = fp->edev;
+ -	u16 hw_comp_cons, sw_comp_cons;
+ -	int work_done = 0;
+ +	struct qede_rx_queue *rxq = fp->rxq;
+ +
+ +	u16 hw_comp_cons, sw_comp_cons, sw_rx_index, parse_flag;
+ +	int rx_pkt = 0;
+ +	u8 csum_flag;
+  
+  	hw_comp_cons = le16_to_cpu(*rxq->hw_cons_ptr);
+  	sw_comp_cons = qed_chain_get_cons_idx(&rxq->rx_comp_ring);
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_main.c
