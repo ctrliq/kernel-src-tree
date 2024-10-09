@@ -1,0 +1,107 @@
+gfs2: gfs2_evict_inode: Put glocks asynchronously
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 71c1b2136835c88c231f7a5e3dc618f7568f84f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/71c1b213.failed
+
+gfs2_evict_inode is called to free inodes under memory pressure.  The
+function calls into DLM when an inode's last cluster-wide reference goes
+away (remote unlink) and to release the glock and associated DLM lock
+before finally destroying the inode.  However, if DLM is blocked on
+memory to become available, calling into DLM again will deadlock.
+
+Avoid that by decoupling releasing glocks from destroying inodes in that
+case: with gfs2_glock_queue_put, glocks will be dequeued asynchronously
+in work queue context, when the associated inodes have likely already
+been destroyed.
+
+With this change, inodes can end up being unlinked, remote-unlink can be
+triggered, and then the inode can be reallocated before all
+remote-unlink callbacks are processed.  To detect that, revalidate the
+link count in gfs2_evict_inode to make sure we're not deleting an
+allocated, referenced inode.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+(cherry picked from commit 71c1b2136835c88c231f7a5e3dc618f7568f84f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/super.c
+diff --cc fs/gfs2/super.c
+index 6d6639fd57f5,4089dbe617a6..000000000000
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@@ -1590,15 -1672,19 +1612,23 @@@ out
+  	gfs2_ordered_del_inode(ip);
+  	clear_inode(inode);
+  	gfs2_dir_hash_inval(ip);
+ -	glock_clear_object(ip->i_gl, ip);
+ +	glock_set_object(ip->i_gl, NULL);
+  	wait_on_bit_io(&ip->i_flags, GIF_GLOP_PENDING, TASK_UNINTERRUPTIBLE);
+  	gfs2_glock_add_to_lru(ip->i_gl);
+- 	gfs2_glock_put(ip->i_gl);
++ 	gfs2_glock_put_eventually(ip->i_gl);
+  	ip->i_gl = NULL;
+  	if (gfs2_holder_initialized(&ip->i_iopen_gh)) {
+++<<<<<<< HEAD
+ +		ip->i_iopen_gh.gh_gl->gl_object = NULL;
+++=======
++ 		struct gfs2_glock *gl = ip->i_iopen_gh.gh_gl;
++ 
++ 		glock_clear_object(gl, ip);
+++>>>>>>> 71c1b2136835 (gfs2: gfs2_evict_inode: Put glocks asynchronously)
+  		ip->i_iopen_gh.gh_flags |= GL_NOCACHE;
++ 		gfs2_glock_hold(gl);
+  		gfs2_glock_dq_uninit(&ip->i_iopen_gh);
++ 		gfs2_glock_put_eventually(gl);
+  	}
+  }
+  
+diff --git a/fs/gfs2/glock.c b/fs/gfs2/glock.c
+index 11b05fe84e1a..6f40976cc7ab 100644
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@ -98,7 +98,7 @@ void gfs2_glock_free(struct gfs2_glock *gl)
+  *
+  */
+ 
+-static void gfs2_glock_hold(struct gfs2_glock *gl)
++void gfs2_glock_hold(struct gfs2_glock *gl)
+ {
+ 	GLOCK_BUG_ON(gl, __lockref_is_dead(&gl->gl_lockref));
+ 	lockref_get(&gl->gl_lockref);
+@@ -155,6 +155,14 @@ static void gfs2_glock_remove_from_lru(struct gfs2_glock *gl)
+ 	spin_unlock(&lru_lock);
+ }
+ 
++/*
++ * Cause the glock to be put in work queue context.
++ */
++void gfs2_glock_queue_put(struct gfs2_glock *gl)
++{
++	gfs2_glock_queue_work(gl, 0);
++}
++
+ /**
+  * gfs2_glock_put() - Decrement reference count on glock
+  * @gl: The glock to put
+diff --git a/fs/gfs2/glock.h b/fs/gfs2/glock.h
+index 8f56e85c5e7d..5c43048b7812 100644
+--- a/fs/gfs2/glock.h
++++ b/fs/gfs2/glock.h
+@@ -181,7 +181,9 @@ static inline struct address_space *gfs2_glock2aspace(struct gfs2_glock *gl)
+ extern int gfs2_glock_get(struct gfs2_sbd *sdp, u64 number,
+ 			  const struct gfs2_glock_operations *glops,
+ 			  int create, struct gfs2_glock **glp);
++extern void gfs2_glock_hold(struct gfs2_glock *gl);
+ extern void gfs2_glock_put(struct gfs2_glock *gl);
++extern void gfs2_glock_queue_put(struct gfs2_glock *gl);
+ extern void gfs2_holder_init(struct gfs2_glock *gl, unsigned int state,
+ 			     u16 flags, struct gfs2_holder *gh);
+ extern void gfs2_holder_reinit(unsigned int state, u16 flags,
+* Unmerged path fs/gfs2/super.c
