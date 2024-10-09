@@ -398,8 +398,6 @@ xfs_qm_dqalloc(
 error1:
 	xfs_defer_cancel(&dfops);
 error0:
-	xfs_iunlock(quotip, XFS_ILOCK_EXCL);
-
 	return error;
 }
 
