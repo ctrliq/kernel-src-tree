@@ -1,0 +1,781 @@
+net/mlx5e: Add support to neighbour update flow
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Add support to neighbour update flow (Don Dutile) [1499362 1456687]
+Rebuild_FUZZ: 95.56%
+commit-author Hadar Hen Zion <hadarh@mellanox.com>
+commit 232c001398ae8406dc0daf07b14e6ec9a5562719
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/232c0013.failed
+
+In order to offload TC encap rules, the driver does a lookup for the IP
+tunnel neighbour according to the output device and the destination IP
+given by the user.
+
+To keep tracking after the validity state of such neighbours, we keep
+the neighbours information (pair of device pointer and destination IP)
+in a hash table maintained at the relevant egress representor and
+register to get NETEVENT_NEIGH_UPDATE events. When getting neighbour update
+netevent, we search for a match among the cached neighbours entries used for
+encapsulation.
+
+In case the neighbour isn't valid, we can't offload the flow into the
+HW. We cache the flow (requested matching and actions) in the driver and
+offload the rule later, when the neighbour is resolved and becomes
+valid.
+
+When a flow is only cached in the driver and not offloaded into HW
+yet, we use EAGAIN return value to mark it internally, the TC ndo still
+returns success.
+
+Listen to kernel neighbour update netevents to trace relevant neighbours
+validity state:
+
+1. If a neighbour becomes valid, offload the related rules to HW.
+
+2. If the neighbour becomes invalid, remove the related rules from HW.
+
+3. If the neighbour mac address was changed, update the encap header.
+   Remove all the offloaded rules using the old encap header from the HW
+   and insert new rules to HW with updated encap header.
+
+Access to the neighbors hash table is protected by RTNL lock of its
+caller or by the table's spinlock.
+
+Details of the locking/synchronization among the different actions
+applied on the neighbour table:
+
+Add/remove operations - protected by RTNL lock of its caller (all TC
+commands are protected by RTNL lock). Add and remove operations are
+initiated only when the user inserts/removes a TC rule into/from the driver.
+
+Lookup/remove operations - since the lookup operation is done from
+netevent notifier block, RTNL lock can't be used (atomic context).
+Use the table's spin lock to protect lookups from TC user removal operation.
+bh is used since netevent can be called from a softirq context.
+
+Lookup/add operations - The hash table access functions are taking
+care of the protection between lookup and add operations.
+
+When adding/removing encap headers and rules to/from the HW, RTNL lock
+is used. It can happen when:
+
+1. The user inserts/removes a TC rule into/from the driver (TC commands
+are protected by RTNL lock of it's caller).
+
+2. The driver gets neighbour notification event, which reports about
+neighbour validity status change. Before adding/removing encap headers
+and rules to/from the HW, RTNL lock is taken.
+
+A neighbour hash table entry should be freed when its encap list is empty.
+Since The neighbour update netevent notification schedules a neighbour
+update work that uses the neighbour hash entry, it can't be freed
+unconditionally when the encap list becomes empty during TC delete rule flow.
+Use reference count to protect from freeing neighbour hash table entry
+while it's still in use.
+
+When the user asks to unregister a netdvice used by one of the neigbours,
+neighbour removal notification is received. Then we take a reference on the
+neighbour and don't free it until the relevant encap entries (and flows) are
+marked as invalid (not offloaded) and removed from HW.
+As long as the encap entry is still valid (checked under RTNL lock) we
+can safely access the neighbour device saved on mlx5e_neigh struct.
+
+	Signed-off-by: Hadar Hen Zion <hadarh@mellanox.com>
+	Reviewed-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 232c001398ae8406dc0daf07b14e6ec9a5562719)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index abcb1976163d,730de6b7e46e..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@@ -224,18 -226,292 +226,307 @@@ void mlx5e_remove_sqs_fwd_rules(struct 
+  	mlx5_eswitch_sqs2vport_stop(esw, rep);
+  }
+  
+++<<<<<<< HEAD
+ +void mlx5e_nic_rep_unload(struct mlx5_eswitch *esw,
+ +			  struct mlx5_eswitch_rep *rep)
+ +{
+ +	struct net_device *netdev = rep->netdev;
+ +	struct mlx5e_priv *priv = netdev_priv(netdev);
+ +
+ +	if (test_bit(MLX5E_STATE_OPENED, &priv->state))
+ +		mlx5e_remove_sqs_fwd_rules(priv);
+ +
+ +	/* clean (and re-init) existing uplink offloaded TC rules */
+ +	mlx5e_tc_cleanup(priv);
+ +	mlx5e_tc_init(priv);
+++=======
++ static void mlx5e_rep_neigh_entry_hold(struct mlx5e_neigh_hash_entry *nhe)
++ {
++ 	refcount_inc(&nhe->refcnt);
++ }
++ 
++ static void mlx5e_rep_neigh_entry_release(struct mlx5e_neigh_hash_entry *nhe)
++ {
++ 	if (refcount_dec_and_test(&nhe->refcnt))
++ 		kfree(nhe);
++ }
++ 
++ static void mlx5e_rep_update_flows(struct mlx5e_priv *priv,
++ 				   struct mlx5e_encap_entry *e,
++ 				   bool neigh_connected,
++ 				   unsigned char ha[ETH_ALEN])
++ {
++ 	struct ethhdr *eth = (struct ethhdr *)e->encap_header;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	if ((!neigh_connected && (e->flags & MLX5_ENCAP_ENTRY_VALID)) ||
++ 	    !ether_addr_equal(e->h_dest, ha))
++ 		mlx5e_tc_encap_flows_del(priv, e);
++ 
++ 	if (neigh_connected && !(e->flags & MLX5_ENCAP_ENTRY_VALID)) {
++ 		ether_addr_copy(e->h_dest, ha);
++ 		ether_addr_copy(eth->h_dest, ha);
++ 
++ 		mlx5e_tc_encap_flows_add(priv, e);
++ 	}
++ }
++ 
++ static void mlx5e_rep_neigh_update(struct work_struct *work)
++ {
++ 	struct mlx5e_neigh_hash_entry *nhe =
++ 		container_of(work, struct mlx5e_neigh_hash_entry, neigh_update_work);
++ 	struct neighbour *n = nhe->n;
++ 	struct mlx5e_encap_entry *e;
++ 	unsigned char ha[ETH_ALEN];
++ 	struct mlx5e_priv *priv;
++ 	bool neigh_connected;
++ 	bool encap_connected;
++ 	u8 nud_state, dead;
++ 
++ 	rtnl_lock();
++ 
++ 	/* If these parameters are changed after we release the lock,
++ 	 * we'll receive another event letting us know about it.
++ 	 * We use this lock to avoid inconsistency between the neigh validity
++ 	 * and it's hw address.
++ 	 */
++ 	read_lock_bh(&n->lock);
++ 	memcpy(ha, n->ha, ETH_ALEN);
++ 	nud_state = n->nud_state;
++ 	dead = n->dead;
++ 	read_unlock_bh(&n->lock);
++ 
++ 	neigh_connected = (nud_state & NUD_VALID) && !dead;
++ 
++ 	list_for_each_entry(e, &nhe->encap_list, encap_list) {
++ 		encap_connected = !!(e->flags & MLX5_ENCAP_ENTRY_VALID);
++ 		priv = netdev_priv(e->out_dev);
++ 
++ 		if (encap_connected != neigh_connected ||
++ 		    !ether_addr_equal(e->h_dest, ha))
++ 			mlx5e_rep_update_flows(priv, e, neigh_connected, ha);
++ 	}
++ 	mlx5e_rep_neigh_entry_release(nhe);
++ 	rtnl_unlock();
++ 	neigh_release(n);
++ }
++ 
++ static struct mlx5e_neigh_hash_entry *
++ mlx5e_rep_neigh_entry_lookup(struct mlx5e_priv *priv,
++ 			     struct mlx5e_neigh *m_neigh);
++ 
++ static int mlx5e_rep_netevent_event(struct notifier_block *nb,
++ 				    unsigned long event, void *ptr)
++ {
++ 	struct mlx5e_rep_priv *rpriv = container_of(nb, struct mlx5e_rep_priv,
++ 						    neigh_update.netevent_nb);
++ 	struct mlx5e_neigh_update_table *neigh_update = &rpriv->neigh_update;
++ 	struct net_device *netdev = rpriv->rep->netdev;
++ 	struct mlx5e_priv *priv = netdev_priv(netdev);
++ 	struct mlx5e_neigh_hash_entry *nhe = NULL;
++ 	struct mlx5e_neigh m_neigh = {};
++ 	struct neighbour *n;
++ 
++ 	switch (event) {
++ 	case NETEVENT_NEIGH_UPDATE:
++ 		n = ptr;
++ #if IS_ENABLED(CONFIG_IPV6)
++ 		if (n->tbl != ipv6_stub->nd_tbl && n->tbl != &arp_tbl)
++ #else
++ 		if (n->tbl != &arp_tbl)
++ #endif
++ 			return NOTIFY_DONE;
++ 
++ 		m_neigh.dev = n->dev;
++ 		memcpy(&m_neigh.dst_ip, n->primary_key, n->tbl->key_len);
++ 
++ 		/* We are in atomic context and can't take RTNL mutex, so use
++ 		 * spin_lock_bh to lookup the neigh table. bh is used since
++ 		 * netevent can be called from a softirq context.
++ 		 */
++ 		spin_lock_bh(&neigh_update->encap_lock);
++ 		nhe = mlx5e_rep_neigh_entry_lookup(priv, &m_neigh);
++ 		if (!nhe) {
++ 			spin_unlock_bh(&neigh_update->encap_lock);
++ 			return NOTIFY_DONE;
++ 		}
++ 
++ 		/* This assignment is valid as long as the the neigh reference
++ 		 * is taken
++ 		 */
++ 		nhe->n = n;
++ 
++ 		/* Take a reference to ensure the neighbour and mlx5 encap
++ 		 * entry won't be destructed until we drop the reference in
++ 		 * delayed work.
++ 		 */
++ 		neigh_hold(n);
++ 		mlx5e_rep_neigh_entry_hold(nhe);
++ 
++ 		if (!queue_work(priv->wq, &nhe->neigh_update_work)) {
++ 			mlx5e_rep_neigh_entry_release(nhe);
++ 			neigh_release(n);
++ 		}
++ 		spin_unlock_bh(&neigh_update->encap_lock);
++ 		break;
++ 	}
++ 	return NOTIFY_DONE;
++ }
++ 
++ static const struct rhashtable_params mlx5e_neigh_ht_params = {
++ 	.head_offset = offsetof(struct mlx5e_neigh_hash_entry, rhash_node),
++ 	.key_offset = offsetof(struct mlx5e_neigh_hash_entry, m_neigh),
++ 	.key_len = sizeof(struct mlx5e_neigh),
++ 	.automatic_shrinking = true,
++ };
++ 
++ static int mlx5e_rep_neigh_init(struct mlx5e_rep_priv *rpriv)
++ {
++ 	struct mlx5e_neigh_update_table *neigh_update = &rpriv->neigh_update;
++ 	int err;
++ 
++ 	err = rhashtable_init(&neigh_update->neigh_ht, &mlx5e_neigh_ht_params);
++ 	if (err)
++ 		return err;
++ 
++ 	INIT_LIST_HEAD(&neigh_update->neigh_list);
++ 	spin_lock_init(&neigh_update->encap_lock);
++ 
++ 	rpriv->neigh_update.netevent_nb.notifier_call = mlx5e_rep_netevent_event;
++ 	err = register_netevent_notifier(&rpriv->neigh_update.netevent_nb);
++ 	if (err)
++ 		goto out_err;
++ 	return 0;
++ 
++ out_err:
++ 	rhashtable_destroy(&neigh_update->neigh_ht);
++ 	return err;
++ }
++ 
++ static void mlx5e_rep_neigh_cleanup(struct mlx5e_rep_priv *rpriv)
++ {
++ 	struct mlx5e_neigh_update_table *neigh_update = &rpriv->neigh_update;
++ 	struct mlx5e_priv *priv = netdev_priv(rpriv->rep->netdev);
++ 
++ 	unregister_netevent_notifier(&neigh_update->netevent_nb);
++ 
++ 	flush_workqueue(priv->wq); /* flush neigh update works */
++ 
++ 	rhashtable_destroy(&neigh_update->neigh_ht);
++ }
++ 
++ static int mlx5e_rep_neigh_entry_insert(struct mlx5e_priv *priv,
++ 					struct mlx5e_neigh_hash_entry *nhe)
++ {
++ 	struct mlx5e_rep_priv *rpriv = priv->ppriv;
++ 	int err;
++ 
++ 	err = rhashtable_insert_fast(&rpriv->neigh_update.neigh_ht,
++ 				     &nhe->rhash_node,
++ 				     mlx5e_neigh_ht_params);
++ 	if (err)
++ 		return err;
++ 
++ 	list_add(&nhe->neigh_list, &rpriv->neigh_update.neigh_list);
++ 
++ 	return err;
++ }
++ 
++ static void mlx5e_rep_neigh_entry_remove(struct mlx5e_priv *priv,
++ 					 struct mlx5e_neigh_hash_entry *nhe)
++ {
++ 	struct mlx5e_rep_priv *rpriv = priv->ppriv;
++ 
++ 	spin_lock_bh(&rpriv->neigh_update.encap_lock);
++ 
++ 	list_del(&nhe->neigh_list);
++ 
++ 	rhashtable_remove_fast(&rpriv->neigh_update.neigh_ht,
++ 			       &nhe->rhash_node,
++ 			       mlx5e_neigh_ht_params);
++ 	spin_unlock_bh(&rpriv->neigh_update.encap_lock);
++ }
++ 
++ /* This function must only be called under RTNL lock or under the
++  * representor's encap_lock in case RTNL mutex can't be held.
++  */
++ static struct mlx5e_neigh_hash_entry *
++ mlx5e_rep_neigh_entry_lookup(struct mlx5e_priv *priv,
++ 			     struct mlx5e_neigh *m_neigh)
++ {
++ 	struct mlx5e_rep_priv *rpriv = priv->ppriv;
++ 	struct mlx5e_neigh_update_table *neigh_update = &rpriv->neigh_update;
++ 
++ 	return rhashtable_lookup_fast(&neigh_update->neigh_ht, m_neigh,
++ 				      mlx5e_neigh_ht_params);
+++>>>>>>> 232c001398ae (net/mlx5e: Add support to neighbour update flow)
++ }
++ 
++ static int mlx5e_rep_neigh_entry_create(struct mlx5e_priv *priv,
++ 					struct mlx5e_encap_entry *e,
++ 					struct mlx5e_neigh_hash_entry **nhe)
++ {
++ 	int err;
++ 
++ 	*nhe = kzalloc(sizeof(**nhe), GFP_KERNEL);
++ 	if (!*nhe)
++ 		return -ENOMEM;
++ 
++ 	memcpy(&(*nhe)->m_neigh, &e->m_neigh, sizeof(e->m_neigh));
++ 	INIT_WORK(&(*nhe)->neigh_update_work, mlx5e_rep_neigh_update);
++ 	INIT_LIST_HEAD(&(*nhe)->encap_list);
++ 	refcount_set(&(*nhe)->refcnt, 1);
++ 
++ 	err = mlx5e_rep_neigh_entry_insert(priv, *nhe);
++ 	if (err)
++ 		goto out_free;
++ 	return 0;
++ 
++ out_free:
++ 	kfree(*nhe);
++ 	return err;
++ }
++ 
++ static void mlx5e_rep_neigh_entry_destroy(struct mlx5e_priv *priv,
++ 					  struct mlx5e_neigh_hash_entry *nhe)
++ {
++ 	/* The neigh hash entry must be removed from the hash table regardless
++ 	 * of the reference count value, so it won't be found by the next
++ 	 * neigh notification call. The neigh hash entry reference count is
++ 	 * incremented only during creation and neigh notification calls and
++ 	 * protects from freeing the nhe struct.
++ 	 */
++ 	mlx5e_rep_neigh_entry_remove(priv, nhe);
++ 	mlx5e_rep_neigh_entry_release(nhe);
++ }
++ 
++ int mlx5e_rep_encap_entry_attach(struct mlx5e_priv *priv,
++ 				 struct mlx5e_encap_entry *e)
++ {
++ 	struct mlx5e_neigh_hash_entry *nhe;
++ 	int err;
++ 
++ 	nhe = mlx5e_rep_neigh_entry_lookup(priv, &e->m_neigh);
++ 	if (!nhe) {
++ 		err = mlx5e_rep_neigh_entry_create(priv, e, &nhe);
++ 		if (err)
++ 			return err;
++ 	}
++ 	list_add(&e->encap_list, &nhe->encap_list);
++ 	return 0;
++ }
++ 
++ void mlx5e_rep_encap_entry_detach(struct mlx5e_priv *priv,
++ 				  struct mlx5e_encap_entry *e)
++ {
++ 	struct mlx5e_neigh_hash_entry *nhe;
++ 
++ 	list_del(&e->encap_list);
++ 	nhe = mlx5e_rep_neigh_entry_lookup(priv, &e->m_neigh);
++ 
++ 	if (list_empty(&nhe->encap_list))
++ 		mlx5e_rep_neigh_entry_destroy(priv, nhe);
+  }
+  
+  static int mlx5e_rep_open(struct net_device *dev)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index d3c637b0294b,624dbfe31a0e..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -42,8 -42,10 +42,12 @@@
+  #include <net/tc_act/tc_mirred.h>
+  #include <net/tc_act/tc_vlan.h>
+  #include <net/tc_act/tc_tunnel_key.h>
+ -#include <net/tc_act/tc_pedit.h>
+  #include <net/vxlan.h>
+  #include "en.h"
+++<<<<<<< HEAD
+++=======
++ #include "en_rep.h"
+++>>>>>>> 232c001398ae (net/mlx5e: Add support to neighbour update flow)
+  #include "en_tc.h"
+  #include "eswitch.h"
+  #include "vxlan.h"
+@@@ -202,14 -244,75 +206,77 @@@ static void mlx5e_tc_del_fdb_flow(struc
+  				  struct mlx5e_tc_flow *flow)
+  {
+  	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+ -	struct mlx5_esw_flow_attr *attr = flow->esw_attr;
+  
+- 	if (flow->flags & MLX5E_TC_FLOW_OFFLOADED)
++ 	if (flow->flags & MLX5E_TC_FLOW_OFFLOADED) {
++ 		flow->flags &= ~MLX5E_TC_FLOW_OFFLOADED;
+  		mlx5_eswitch_del_offloaded_rule(esw, flow->rule, flow->esw_attr);
++ 	}
+  
+  	mlx5_eswitch_del_vlan_action(esw, flow->esw_attr);
+  
+- 	if (flow->esw_attr->action & MLX5_FLOW_CONTEXT_ACTION_ENCAP)
++ 	if (flow->esw_attr->action & MLX5_FLOW_CONTEXT_ACTION_ENCAP) {
+  		mlx5e_detach_encap(priv, flow);
+++<<<<<<< HEAD
+++=======
++ 		kvfree(flow->esw_attr->parse_attr);
++ 	}
++ 
++ 	if (flow->esw_attr->action & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR)
++ 		mlx5_modify_header_dealloc(priv->mdev,
++ 					   attr->mod_hdr_id);
+++>>>>>>> 232c001398ae (net/mlx5e: Add support to neighbour update flow)
++ }
++ 
++ void mlx5e_tc_encap_flows_add(struct mlx5e_priv *priv,
++ 			      struct mlx5e_encap_entry *e)
++ {
++ 	struct mlx5e_tc_flow *flow;
++ 	int err;
++ 
++ 	err = mlx5_encap_alloc(priv->mdev, e->tunnel_type,
++ 			       e->encap_size, e->encap_header,
++ 			       &e->encap_id);
++ 	if (err) {
++ 		mlx5_core_warn(priv->mdev, "Failed to offload cached encapsulation header, %d\n",
++ 			       err);
++ 		return;
++ 	}
++ 	e->flags |= MLX5_ENCAP_ENTRY_VALID;
++ 
++ 	list_for_each_entry(flow, &e->flows, encap) {
++ 		flow->esw_attr->encap_id = e->encap_id;
++ 		flow->rule = mlx5e_tc_add_fdb_flow(priv,
++ 						   flow->esw_attr->parse_attr,
++ 						   flow);
++ 		if (IS_ERR(flow->rule)) {
++ 			err = PTR_ERR(flow->rule);
++ 			mlx5_core_warn(priv->mdev, "Failed to update cached encapsulation flow, %d\n",
++ 				       err);
++ 			continue;
++ 		}
++ 		flow->flags |= MLX5E_TC_FLOW_OFFLOADED;
++ 	}
++ }
++ 
++ void mlx5e_tc_encap_flows_del(struct mlx5e_priv *priv,
++ 			      struct mlx5e_encap_entry *e)
++ {
++ 	struct mlx5e_tc_flow *flow;
++ 	struct mlx5_fc *counter;
++ 
++ 	list_for_each_entry(flow, &e->flows, encap) {
++ 		if (flow->flags & MLX5E_TC_FLOW_OFFLOADED) {
++ 			flow->flags &= ~MLX5E_TC_FLOW_OFFLOADED;
++ 			counter = mlx5_flow_rule_counter(flow->rule);
++ 			mlx5_del_flow_rules(flow->rule);
++ 			mlx5_fc_destroy(priv->mdev, counter);
++ 		}
++ 	}
++ 
++ 	if (e->flags & MLX5_ENCAP_ENTRY_VALID) {
++ 		e->flags &= ~MLX5_ENCAP_ENTRY_VALID;
++ 		mlx5_encap_dealloc(priv->mdev, e->encap_id);
++ 	}
+  }
+  
+  static void mlx5e_detach_encap(struct mlx5e_priv *priv,
+@@@ -219,14 -322,16 +286,21 @@@
+  
+  	list_del(&flow->encap);
+  	if (list_empty(next)) {
+ -		struct mlx5e_encap_entry *e;
+ +		struct mlx5_encap_entry *e;
+  
+++<<<<<<< HEAD
+ +		e = list_entry(next, struct mlx5_encap_entry, flows);
+ +		if (e->n) {
+++=======
++ 		e = list_entry(next, struct mlx5e_encap_entry, flows);
++ 		mlx5e_rep_encap_entry_detach(netdev_priv(e->out_dev), e);
++ 
++ 		if (e->flags & MLX5_ENCAP_ENTRY_VALID)
+++>>>>>>> 232c001398ae (net/mlx5e: Add support to neighbour update flow)
+  			mlx5_encap_dealloc(priv->mdev, e->encap_id);
+- 			neigh_release(e->n);
+- 		}
++ 
+  		hlist_del_rcu(&e->encap_hlist);
++ 		kfree(e->encap_header);
+  		kfree(e);
+  	}
+  }
+@@@ -918,24 -1311,34 +992,48 @@@ static int mlx5e_create_encap_header_ip
+  	if (err)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	e->n = n;
+ +	e->out_dev = *out_dev;
+ +
+ +	if (!(n->nud_state & NUD_VALID)) {
+ +		pr_warn("%s: can't offload, neighbour to %pI4 invalid\n", __func__, &fl4.daddr);
+ +		err = -EOPNOTSUPP;
+ +		goto out;
+ +	}
+ +
+ +	neigh_ha_snapshot(e->h_dest, n, *out_dev);
+ +
+++=======
++ 	/* used by mlx5e_detach_encap to lookup a neigh hash table
++ 	 * entry in the neigh hash table when a user deletes a rule
++ 	 */
++ 	e->m_neigh.dev = n->dev;
++ 	memcpy(&e->m_neigh.dst_ip, n->primary_key, n->tbl->key_len);
++ 	e->out_dev = out_dev;
++ 
++ 	/* It's importent to add the neigh to the hash table before checking
++ 	 * the neigh validity state. So if we'll get a notification, in case the
++ 	 * neigh changes it's validity state, we would find the relevant neigh
++ 	 * in the hash.
++ 	 */
++ 	err = mlx5e_rep_encap_entry_attach(netdev_priv(out_dev), e);
++ 	if (err)
++ 		goto out;
++ 
++ 	read_lock_bh(&n->lock);
++ 	nud_state = n->nud_state;
++ 	ether_addr_copy(e->h_dest, n->ha);
++ 	read_unlock_bh(&n->lock);
++ 
+++>>>>>>> 232c001398ae (net/mlx5e: Add support to neighbour update flow)
+  	switch (e->tunnel_type) {
+  	case MLX5_HEADER_TYPE_VXLAN:
+ -		gen_vxlan_header_ipv4(out_dev, encap_header,
+ -				      ipv4_encap_size, e->h_dest, ttl,
+ -				      fl4.daddr,
+ -				      fl4.saddr, tun_key->tp_dst,
+ -				      tunnel_id_to_key32(tun_key->tun_id));
+ +		encap_size = gen_vxlan_header_ipv4(*out_dev, encap_header,
+ +						   e->h_dest, ttl,
+ +						   tun_key->u.ipv4.dst,
+ +						   saddr, tun_key->tp_dst,
+ +						   tunnel_id_to_key32(tun_key->tun_id));
+  		break;
+  	default:
+  		err = -EOPNOTSUPP;
+@@@ -943,11 -1354,20 +1049,24 @@@
+  	}
+  
+  	err = mlx5_encap_alloc(priv->mdev, e->tunnel_type,
+++<<<<<<< HEAD
+ +			       encap_size, encap_header, &e->encap_id);
+++=======
++ 			       ipv4_encap_size, encap_header, &e->encap_id);
++ 	if (err)
++ 		goto destroy_neigh_entry;
++ 
++ 	e->flags |= MLX5_ENCAP_ENTRY_VALID;
++ 	neigh_release(n);
++ 	return err;
++ 
++ destroy_neigh_entry:
++ 	mlx5e_rep_encap_entry_detach(netdev_priv(e->out_dev), e);
+++>>>>>>> 232c001398ae (net/mlx5e: Add support to neighbour update flow)
+  out:
+- 	if (err && n)
+- 		neigh_release(n);
+  	kfree(encap_header);
++ 	if (n)
++ 		neigh_release(n);
+  	return err;
+  }
+  
+@@@ -994,16 -1414,26 +1113,39 @@@ static int mlx5e_create_encap_header_ip
+  	if (err)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	if (!(n->nud_state & NUD_VALID)) {
+ +		pr_warn("%s: can't offload, neighbour to %pI6 invalid\n", __func__, &fl6.daddr);
+ +		err = -EOPNOTSUPP;
+ +		goto out;
+ +	}
+ +
+ +	e->n = n;
+ +	e->out_dev = *out_dev;
+ +
+ +	neigh_ha_snapshot(e->h_dest, n, *out_dev);
+++=======
++ 	/* used by mlx5e_detach_encap to lookup a neigh hash table
++ 	 * entry in the neigh hash table when a user deletes a rule
++ 	 */
++ 	e->m_neigh.dev = n->dev;
++ 	memcpy(&e->m_neigh.dst_ip, n->primary_key, n->tbl->key_len);
++ 	e->out_dev = out_dev;
++ 
++ 	/* It's importent to add the neigh to the hash table before checking
++ 	 * the neigh validity state. So if we'll get a notification, in case the
++ 	 * neigh changes it's validity state, we would find the relevant neigh
++ 	 * in the hash.
++ 	 */
++ 	err = mlx5e_rep_encap_entry_attach(netdev_priv(out_dev), e);
++ 	if (err)
++ 		goto out;
++ 
++ 	read_lock_bh(&n->lock);
++ 	nud_state = n->nud_state;
++ 	ether_addr_copy(e->h_dest, n->ha);
++ 	read_unlock_bh(&n->lock);
+++>>>>>>> 232c001398ae (net/mlx5e: Add support to neighbour update flow)
+  
+  	switch (e->tunnel_type) {
+  	case MLX5_HEADER_TYPE_VXLAN:
+@@@ -1086,16 -1535,21 +1246,25 @@@ vxlan_encap_offload_err
+  	INIT_LIST_HEAD(&e->flows);
+  
+  	if (family == AF_INET)
+ -		err = mlx5e_create_encap_header_ipv4(priv, mirred_dev, e);
+ +		err = mlx5e_create_encap_header_ipv4(priv, mirred_dev, e, &out_dev);
+  	else if (family == AF_INET6)
+ -		err = mlx5e_create_encap_header_ipv6(priv, mirred_dev, e);
+ +		err = mlx5e_create_encap_header_ipv6(priv, mirred_dev, e, &out_dev);
+  
+- 	if (err)
++ 	if (err && err != -EAGAIN)
+  		goto out_err;
+  
+ +	attr->encap = e;
+  	hash_add_rcu(esw->offloads.encap_tbl, &e->encap_hlist, hash_key);
+  
+++<<<<<<< HEAD
+++=======
++ attach_flow:
++ 	list_add(&flow->encap, &e->flows);
++ 	*encap_dev = e->out_dev;
++ 	if (e->flags & MLX5_ENCAP_ENTRY_VALID)
++ 		attr->encap_id = e->encap_id;
++ 
+++>>>>>>> 232c001398ae (net/mlx5e: Add support to neighbour update flow)
+  	return err;
+  
+  out_err:
+@@@ -1107,10 -1561,13 +1276,10 @@@ static int parse_tc_fdb_actions(struct 
+  				struct mlx5e_tc_flow *flow)
+  {
+  	struct mlx5_esw_flow_attr *attr = flow->esw_attr;
+ -	struct mlx5e_rep_priv *rpriv = priv->ppriv;
+  	struct ip_tunnel_info *info = NULL;
+  	const struct tc_action *a;
+ -	LIST_HEAD(actions);
+  	bool encap = false;
+- 	int err;
++ 	int err = 0;
+  
+  	if (tc_no_actions(exts))
+  		return -EINVAL;
+@@@ -1137,18 -1605,20 +1306,30 @@@
+  				attr->action |= MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
+  					MLX5_FLOW_CONTEXT_ACTION_COUNT;
+  				out_priv = netdev_priv(out_dev);
+ -				rpriv = out_priv->ppriv;
+ -				attr->out_rep = rpriv->rep;
+ +				attr->out_rep = out_priv->ppriv;
+  			} else if (encap) {
+  				err = mlx5e_attach_encap(priv, info,
+++<<<<<<< HEAD
+ +							 out_dev, attr);
+ +				if (err)
+++=======
++ 							 out_dev, &encap_dev, flow);
++ 				if (err && err != -EAGAIN)
+++>>>>>>> 232c001398ae (net/mlx5e: Add support to neighbour update flow)
+  					return err;
+ +				list_add(&flow->encap, &attr->encap->flows);
+  				attr->action |= MLX5_FLOW_CONTEXT_ACTION_ENCAP |
+  					MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
+  					MLX5_FLOW_CONTEXT_ACTION_COUNT;
+++<<<<<<< HEAD
+ +				out_priv = netdev_priv(attr->encap->out_dev);
+ +				attr->out_rep = out_priv->ppriv;
+++=======
++ 				out_priv = netdev_priv(encap_dev);
++ 				rpriv = out_priv->ppriv;
++ 				attr->out_rep = rpriv->rep;
++ 				attr->parse_attr = parse_attr;
+++>>>>>>> 232c001398ae (net/mlx5e: Add support to neighbour update flow)
+  			} else {
+  				pr_err("devices %s %s not on same switch HW, can't offload forwarding\n",
+  				       priv->netdev->name, out_dev->name);
+@@@ -1224,9 -1694,9 +1405,9 @@@ int mlx5e_configure_flower(struct mlx5e
+  		goto err_free;
+  
+  	if (flow->flags & MLX5E_TC_FLOW_ESWITCH) {
+ -		err = parse_tc_fdb_actions(priv, f->exts, parse_attr, flow);
+ +		err = parse_tc_fdb_actions(priv, f->exts, flow);
+  		if (err < 0)
+- 			goto err_free;
++ 			goto err_handle_encap_flow;
+  		flow->rule = mlx5e_tc_add_fdb_flow(priv, parse_attr, flow);
+  	} else {
+  		err = parse_tc_nic_actions(priv, f->exts, parse_attr, flow);
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index c62f318c62ef,55beda6bf134..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@@ -309,7 -295,9 +309,13 @@@ struct mlx5_esw_flow_attr 
+  	int	action;
+  	u16	vlan;
+  	bool	vlan_handled;
+++<<<<<<< HEAD
+ +	struct mlx5_encap_entry *encap;
+++=======
++ 	u32	encap_id;
++ 	u32	mod_hdr_id;
++ 	struct mlx5e_tc_flow_parse_attr *parse_attr;
+++>>>>>>> 232c001398ae (net/mlx5e: Add support to neighbour update flow)
+  };
+  
+  int mlx5_eswitch_sqs2vport_start(struct mlx5_eswitch *esw,
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
+index 34bf903fc886..278c7a646a55 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
+@@ -46,6 +46,12 @@ int mlx5e_delete_flower(struct mlx5e_priv *priv,
+ int mlx5e_stats_flower(struct mlx5e_priv *priv,
+ 		       struct tc_cls_flower_offload *f);
+ 
++struct mlx5e_encap_entry;
++void mlx5e_tc_encap_flows_add(struct mlx5e_priv *priv,
++			      struct mlx5e_encap_entry *e);
++void mlx5e_tc_encap_flows_del(struct mlx5e_priv *priv,
++			      struct mlx5e_encap_entry *e);
++
+ static inline int mlx5e_tc_num_filters(struct mlx5e_priv *priv)
+ {
+ 	return atomic_read(&priv->fs.tc.ht.nelems);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
