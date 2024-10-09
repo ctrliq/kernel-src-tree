@@ -275,7 +275,7 @@ static int ip_finish_output(struct sock *sk, struct sk_buff *skb)
 		return dst_output_sk(sk, skb);
 	}
 #endif
-	mtu = ip_skb_dst_mtu(skb);
+	mtu = ip_skb_dst_mtu(sk, skb);
 	if (skb_is_gso(skb))
 		return ip_finish_output_gso(sk, skb, mtu);
 
@@ -548,7 +548,7 @@ int ip_do_fragment(struct sock *sk, struct sk_buff *skb,
 
 	iph = ip_hdr(skb);
 
-	mtu = ip_skb_dst_mtu(skb);
+	mtu = ip_skb_dst_mtu(sk, skb);
 	if (IPCB(skb)->frag_max_size && IPCB(skb)->frag_max_size < mtu)
 		mtu = IPCB(skb)->frag_max_size;
 
