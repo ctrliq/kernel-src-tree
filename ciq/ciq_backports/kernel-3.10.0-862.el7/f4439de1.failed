@@ -1,0 +1,284 @@
+ovl: mark parent impure and restore timestamp on ovl_link_up()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit f4439de118283159ff165e52036134a278ebf990
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f4439de1.failed
+
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+(cherry picked from commit f4439de118283159ff165e52036134a278ebf990)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/copy_up.c
+diff --cc fs/overlayfs/copy_up.c
+index 6e96b99a973d,acb6f97deb97..000000000000
+--- a/fs/overlayfs/copy_up.c
++++ b/fs/overlayfs/copy_up.c
+@@@ -264,33 -233,179 +264,151 @@@ int ovl_set_attr(struct dentry *upperde
+  	return err;
+  }
+  
+ -struct ovl_fh *ovl_encode_fh(struct dentry *lower, bool is_upper)
+ +static int ovl_copy_up_locked(struct dentry *workdir, struct dentry *upperdir,
+ +			      struct dentry *dentry, struct path *lowerpath,
+ +			      struct kstat *stat, const char *link)
+  {
+ -	struct ovl_fh *fh;
+ -	int fh_type, fh_len, dwords;
+ -	void *buf;
+ -	int buflen = MAX_HANDLE_SZ;
+ -	uuid_t *uuid = &lower->d_sb->s_uuid;
+ -
+ -	buf = kmalloc(buflen, GFP_TEMPORARY);
+ -	if (!buf)
+ -		return ERR_PTR(-ENOMEM);
+ +	struct inode *wdir = workdir->d_inode;
+ +	struct inode *udir = upperdir->d_inode;
+ +	struct dentry *newdentry = NULL;
+ +	struct dentry *upper = NULL;
+ +	umode_t mode = stat->mode;
+ +	int err;
+ +	const struct cred *old_creds = NULL;
+ +	struct cred *new_creds = NULL;
+  
+ -	/*
+ -	 * We encode a non-connectable file handle for non-dir, because we
+ -	 * only need to find the lower inode number and we don't want to pay
+ -	 * the price or reconnecting the dentry.
+ -	 */
+ -	dwords = buflen >> 2;
+ -	fh_type = exportfs_encode_fh(lower, buf, &dwords, 0);
+ -	buflen = (dwords << 2);
+ -
+ -	fh = ERR_PTR(-EIO);
+ -	if (WARN_ON(fh_type < 0) ||
+ -	    WARN_ON(buflen > MAX_HANDLE_SZ) ||
+ -	    WARN_ON(fh_type == FILEID_INVALID))
+ +	newdentry = ovl_lookup_temp(workdir, dentry);
+ +	err = PTR_ERR(newdentry);
+ +	if (IS_ERR(newdentry))
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	upper = lookup_one_len(dentry->d_name.name, upperdir,
+ +			       dentry->d_name.len);
+ +	err = PTR_ERR(upper);
+++=======
++ 	BUILD_BUG_ON(MAX_HANDLE_SZ + offsetof(struct ovl_fh, fid) > 255);
++ 	fh_len = offsetof(struct ovl_fh, fid) + buflen;
++ 	fh = kmalloc(fh_len, GFP_KERNEL);
++ 	if (!fh) {
++ 		fh = ERR_PTR(-ENOMEM);
++ 		goto out;
++ 	}
++ 
++ 	fh->version = OVL_FH_VERSION;
++ 	fh->magic = OVL_FH_MAGIC;
++ 	fh->type = fh_type;
++ 	fh->flags = OVL_FH_FLAG_CPU_ENDIAN;
++ 	/*
++ 	 * When we will want to decode an overlay dentry from this handle
++ 	 * and all layers are on the same fs, if we get a disconncted real
++ 	 * dentry when we decode fid, the only way to tell if we should assign
++ 	 * it to upperdentry or to lowerstack is by checking this flag.
++ 	 */
++ 	if (is_upper)
++ 		fh->flags |= OVL_FH_FLAG_PATH_UPPER;
++ 	fh->len = fh_len;
++ 	fh->uuid = *uuid;
++ 	memcpy(fh->fid, buf, buflen);
++ 
++ out:
++ 	kfree(buf);
++ 	return fh;
++ }
++ 
++ static int ovl_set_origin(struct dentry *dentry, struct dentry *lower,
++ 			  struct dentry *upper)
++ {
++ 	const struct ovl_fh *fh = NULL;
++ 	int err;
++ 
++ 	/*
++ 	 * When lower layer doesn't support export operations store a 'null' fh,
++ 	 * so we can use the overlay.origin xattr to distignuish between a copy
++ 	 * up and a pure upper inode.
++ 	 */
++ 	if (ovl_can_decode_fh(lower->d_sb)) {
++ 		fh = ovl_encode_fh(lower, false);
++ 		if (IS_ERR(fh))
++ 			return PTR_ERR(fh);
++ 	}
++ 
++ 	/*
++ 	 * Do not fail when upper doesn't support xattrs.
++ 	 */
++ 	err = ovl_check_setxattr(dentry, upper, OVL_XATTR_ORIGIN, fh,
++ 				 fh ? fh->len : 0, 0);
++ 	kfree(fh);
++ 
++ 	return err;
++ }
++ 
++ struct ovl_copy_up_ctx {
++ 	struct dentry *parent;
++ 	struct dentry *dentry;
++ 	struct path lowerpath;
++ 	struct kstat stat;
++ 	struct kstat pstat;
++ 	const char *link;
++ 	struct dentry *destdir;
++ 	struct qstr destname;
++ 	struct dentry *workdir;
++ 	bool tmpfile;
++ 	bool origin;
++ };
++ 
++ static int ovl_link_up(struct ovl_copy_up_ctx *c)
++ {
++ 	int err;
++ 	struct dentry *upper;
++ 	struct dentry *upperdir = ovl_dentry_upper(c->parent);
++ 	struct inode *udir = d_inode(upperdir);
++ 
++ 	/* Mark parent "impure" because it may now contain non-pure upper */
++ 	err = ovl_set_impure(c->parent, upperdir);
++ 	if (err)
++ 		return err;
++ 
++ 	err = ovl_set_nlink_lower(c->dentry);
++ 	if (err)
++ 		return err;
++ 
++ 	inode_lock_nested(udir, I_MUTEX_PARENT);
++ 	upper = lookup_one_len(c->dentry->d_name.name, upperdir,
++ 			       c->dentry->d_name.len);
++ 	err = PTR_ERR(upper);
++ 	if (!IS_ERR(upper)) {
++ 		err = ovl_do_link(ovl_dentry_upper(c->dentry), udir, upper,
++ 				  true);
++ 		dput(upper);
++ 
++ 		if (!err) {
++ 			/* Restore timestamps on parent (best effort) */
++ 			ovl_set_timestamps(upperdir, &c->pstat);
++ 			ovl_dentry_set_upper_alias(c->dentry);
++ 		}
++ 	}
++ 	inode_unlock(udir);
++ 	ovl_set_nlink_upper(c->dentry);
++ 
++ 	return err;
++ }
++ 
++ static int ovl_install_temp(struct ovl_copy_up_ctx *c, struct dentry *temp,
++ 			    struct dentry **newdentry)
++ {
++ 	int err;
++ 	struct dentry *upper;
++ 	struct inode *udir = d_inode(c->destdir);
++ 
++ 	upper = lookup_one_len(c->destname.name, c->destdir, c->destname.len);
+++>>>>>>> f4439de11828 (ovl: mark parent impure and restore timestamp on ovl_link_up())
+  	if (IS_ERR(upper))
+ -		return PTR_ERR(upper);
+ +		goto out1;
+  
+ -	if (c->tmpfile)
+ -		err = ovl_do_link(temp, udir, upper, true);
+ -	else
+ -		err = ovl_do_rename(d_inode(c->workdir), temp, udir, upper, 0);
+ -
+ -	if (!err)
+ -		*newdentry = dget(c->tmpfile ? upper : temp);
+ -	dput(upper);
+ -
+ -	return err;
+ -}
+ -
+ -static int ovl_get_tmpfile(struct ovl_copy_up_ctx *c, struct dentry **tempp)
+ -{
+ -	int err;
+ -	struct dentry *temp;
+ -	const struct cred *old_creds = NULL;
+ -	struct cred *new_creds = NULL;
+ -	struct cattr cattr = {
+ -		/* Can't properly set mode on creation because of the umask */
+ -		.mode = c->stat.mode & S_IFMT,
+ -		.rdev = c->stat.rdev,
+ -		.link = c->link
+ -	};
+ -
+ -	err = security_inode_copy_up(c->dentry, &new_creds);
+ +	err = security_inode_copy_up(dentry, &new_creds);
+  	if (err < 0)
+ -		goto out;
+ +		goto out2;
+  
+  	if (new_creds)
+  		old_creds = override_creds(new_creds);
+@@@ -393,35 -618,30 +511,49 @@@ static int ovl_copy_up_one(struct dentr
+  	if (err)
+  		return err;
+  
+ -	/* maybe truncate regular file. this has no effect on dirs */
+ -	if (flags & O_TRUNC)
+ -		ctx.stat.size = 0;
+ -
+ -	if (S_ISLNK(ctx.stat.mode)) {
+ -		ctx.link = vfs_get_link(ctx.lowerpath.dentry, &done);
+ -		if (IS_ERR(ctx.link))
+ -			return PTR_ERR(ctx.link);
+ +	if (S_ISLNK(stat->mode)) {
+ +		link = ovl_read_symlink(lowerpath->dentry);
+ +		if (IS_ERR(link))
+ +			return PTR_ERR(link);
+  	}
+ -	ovl_do_check_copy_up(ctx.lowerpath.dentry);
+  
+++<<<<<<< HEAD
+ +	err = -EIO;
+ +	if (lock_rename(workdir, upperdir) != NULL) {
+ +		pr_err("overlayfs: failed to lock workdir+upperdir\n");
+ +		goto out_unlock;
+++=======
++ 	err = ovl_copy_up_start(dentry);
++ 	/* err < 0: interrupted, err > 0: raced with another copy-up */
++ 	if (unlikely(err)) {
++ 		if (err > 0)
++ 			err = 0;
++ 	} else {
++ 		if (!ovl_dentry_upper(dentry))
++ 			err = ovl_do_copy_up(&ctx);
++ 		if (!err && !ovl_dentry_has_upper_alias(dentry))
++ 			err = ovl_link_up(&ctx);
++ 		ovl_copy_up_end(dentry);
+++>>>>>>> f4439de11828 (ovl: mark parent impure and restore timestamp on ovl_link_up())
+ +	}
+ +	upperdentry = ovl_dentry_upper(dentry);
+ +	if (upperdentry) {
+ +		/* Raced with another copy-up?  Nothing to do, then... */
+ +		err = 0;
+ +		goto out_unlock;
+  	}
+ -	do_delayed_call(&done);
+ +
+ +	err = ovl_copy_up_locked(workdir, upperdir, dentry, lowerpath,
+ +				 stat, link);
+ +	if (!err) {
+ +		/* Restore timestamps on parent (best effort) */
+ +		ovl_set_timestamps(upperdir, &pstat);
+ +	}
+ +out_unlock:
+ +	unlock_rename(workdir, upperdir);
+ +
+ +	if (link)
+ +		free_page((unsigned long) link);
+  
+  	return err;
+  }
+* Unmerged path fs/overlayfs/copy_up.c
