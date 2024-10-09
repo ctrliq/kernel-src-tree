@@ -1,0 +1,300 @@
+RDMA/netlink: Rename netlink callback struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [infiniband] netlink: Rename netlink callback struct (Don Dutile) [1499364]
+Rebuild_FUZZ: 93.98%
+commit-author Leon Romanovsky <leonro@mellanox.com>
+commit 3250b4dbd87aa08c21891cabfc6f6b48b36fd7e5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3250b4db.failed
+
+The RDMA netlink client infrastructure was removed and made obsolete.
+The old infrastructure defined struct ibnl_client_cbs. Now that all
+uses of this have been updated to the new infrastructure, rename the
+struct to be compliant with the current stack naming standards:
+struct rdma_nl_cbs.
+
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+(cherry picked from commit 3250b4dbd87aa08c21891cabfc6f6b48b36fd7e5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/cma.c
+#	drivers/infiniband/core/device.c
+#	drivers/infiniband/core/netlink.c
+#	include/rdma/rdma_netlink.h
+diff --cc drivers/infiniband/core/cma.c
+index ae818a6311c2,d8edd8b11561..000000000000
+--- a/drivers/infiniband/core/cma.c
++++ b/drivers/infiniband/core/cma.c
+@@@ -4534,9 -4458,8 +4534,14 @@@ out
+  	return skb->len;
+  }
+  
+++<<<<<<< HEAD
+ +static const struct ibnl_client_cbs cma_cb_table[] = {
+ +	[RDMA_NL_RDMA_CM_ID_STATS] = { .dump = cma_get_id_stats,
+ +				       .module = THIS_MODULE },
+++=======
++ static const struct rdma_nl_cbs cma_cb_table[] = {
++ 	[RDMA_NL_RDMA_CM_ID_STATS] = { .dump = cma_get_id_stats},
+++>>>>>>> 3250b4dbd87a (RDMA/netlink: Rename netlink callback struct)
+  };
+  
+  static int cma_init_net(struct net *net)
+diff --cc drivers/infiniband/core/device.c
+index 32656f7b9a64,33a39518848c..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -972,29 -1086,21 +972,33 @@@ struct net_device *ib_get_net_dev_by_pa
+  }
+  EXPORT_SYMBOL(ib_get_net_dev_by_params);
+  
+++<<<<<<< HEAD
+ +static struct ibnl_client_cbs ibnl_ls_cb_table[] = {
+++=======
++ static const struct rdma_nl_cbs ibnl_ls_cb_table[] = {
+++>>>>>>> 3250b4dbd87a (RDMA/netlink: Rename netlink callback struct)
+  	[RDMA_NL_LS_OP_RESOLVE] = {
+  		.dump = ib_nl_handle_resolve_resp,
+ -		.flags = RDMA_NL_ADMIN_PERM,
+ -	},
+ +		.module = THIS_MODULE },
+  	[RDMA_NL_LS_OP_SET_TIMEOUT] = {
+  		.dump = ib_nl_handle_set_timeout,
+ -		.flags = RDMA_NL_ADMIN_PERM,
+ -	},
+ +		.module = THIS_MODULE },
+  	[RDMA_NL_LS_OP_IP_RESOLVE] = {
+  		.dump = ib_nl_handle_ip_res_resp,
+ -		.flags = RDMA_NL_ADMIN_PERM,
+ -	},
+ +		.module = THIS_MODULE },
+  };
+  
+ +static int ib_add_ibnl_clients(void)
+ +{
+ +	return ibnl_add_client(RDMA_NL_LS, ARRAY_SIZE(ibnl_ls_cb_table),
+ +			       ibnl_ls_cb_table);
+ +}
+ +
+ +static void ib_remove_ibnl_clients(void)
+ +{
+ +	ibnl_remove_client(RDMA_NL_LS);
+ +}
+ +
+  static int __init ib_core_init(void)
+  {
+  	int ret;
+diff --cc drivers/infiniband/core/netlink.c
+index 66c3e82b1b77,a7082adae16b..000000000000
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@@ -39,76 -39,88 +39,105 @@@
+  #include <rdma/rdma_netlink.h>
+  #include "core_priv.h"
+  
+++<<<<<<< HEAD
+ +struct ibnl_client {
+ +	struct list_head		list;
+ +	int				index;
+ +	int				nops;
+ +	const struct ibnl_client_cbs   *cb_table;
+ +};
+++=======
++ #include "core_priv.h"
++ 
++ static DEFINE_MUTEX(rdma_nl_mutex);
++ static struct sock *nls;
++ static struct {
++ 	const struct rdma_nl_cbs   *cb_table;
++ } rdma_nl_types[RDMA_NL_NUM_CLIENTS];
+++>>>>>>> 3250b4dbd87a (RDMA/netlink: Rename netlink callback struct)
+  
+ -int rdma_nl_chk_listeners(unsigned int group)
+ +static DEFINE_MUTEX(ibnl_mutex);
+ +static struct sock *nls;
+ +static LIST_HEAD(client_list);
+ +
+ +int ibnl_chk_listeners(unsigned int group)
+  {
+ -	return (netlink_has_listeners(nls, group)) ? 0 : -1;
+ +	if (netlink_has_listeners(nls, group) == 0)
+ +		return -1;
+ +	return 0;
+  }
+ -EXPORT_SYMBOL(rdma_nl_chk_listeners);
+  
+ -static bool is_nl_msg_valid(unsigned int type, unsigned int op)
+ +int ibnl_add_client(int index, int nops,
+ +		    const struct ibnl_client_cbs cb_table[])
+  {
+ -	static const unsigned int max_num_ops[RDMA_NL_NUM_CLIENTS - 1] = {
+ -				  RDMA_NL_RDMA_CM_NUM_OPS,
+ -				  RDMA_NL_IWPM_NUM_OPS,
+ -				  0,
+ -				  RDMA_NL_LS_NUM_OPS,
+ -				  0 };
+ -
+ -	/*
+ -	 * This BUILD_BUG_ON is intended to catch addition of new
+ -	 * RDMA netlink protocol without updating the array above.
+ -	 */
+ -	BUILD_BUG_ON(RDMA_NL_NUM_CLIENTS != 6);
+ +	struct ibnl_client *cur;
+ +	struct ibnl_client *nl_client;
+  
+ -	if (type > RDMA_NL_NUM_CLIENTS - 1)
+ -		return false;
+++<<<<<<< HEAD
+ +	nl_client = kmalloc(sizeof *nl_client, GFP_KERNEL);
+ +	if (!nl_client)
+ +		return -ENOMEM;
+  
+ -	return (op < max_num_ops[type - 1]) ? true : false;
+ -}
+ +	nl_client->index	= index;
+ +	nl_client->nops		= nops;
+ +	nl_client->cb_table	= cb_table;
+  
+ -static bool is_nl_valid(unsigned int type, unsigned int op)
+ -{
+ -	if (!is_nl_msg_valid(type, op) ||
+ -	    !rdma_nl_types[type].cb_table ||
+ -	    !rdma_nl_types[type].cb_table[op].dump)
+ -		return false;
+ -	return true;
+ -}
+ +	mutex_lock(&ibnl_mutex);
+  
+ +	list_for_each_entry(cur, &client_list, list) {
+ +		if (cur->index == index) {
+ +			pr_warn("Client for %d already exists\n", index);
+ +			mutex_unlock(&ibnl_mutex);
+ +			kfree(nl_client);
+ +			return -EINVAL;
+ +		}
+++=======
++ void rdma_nl_register(unsigned int index,
++ 		      const struct rdma_nl_cbs cb_table[])
++ {
++ 	mutex_lock(&rdma_nl_mutex);
++ 	if (!is_nl_msg_valid(index, 0)) {
++ 		/*
++ 		 * All clients are not interesting in success/failure of
++ 		 * this call. They want to see the print to error log and
++ 		 * continue their initialization. Print warning for them,
++ 		 * because it is programmer's error to be here.
++ 		 */
++ 		mutex_unlock(&rdma_nl_mutex);
++ 		WARN(true,
++ 		     "The not-valid %u index was supplied to RDMA netlink\n",
++ 		     index);
++ 		return;
+++>>>>>>> 3250b4dbd87a (RDMA/netlink: Rename netlink callback struct)
+  	}
+  
+ -	if (rdma_nl_types[index].cb_table) {
+ -		mutex_unlock(&rdma_nl_mutex);
+ -		WARN(true,
+ -		     "The %u index is already registered in RDMA netlink\n",
+ -		     index);
+ -		return;
+ -	}
+ +	list_add_tail(&nl_client->list, &client_list);
+ +
+ +	mutex_unlock(&ibnl_mutex);
+  
+ -	rdma_nl_types[index].cb_table = cb_table;
+ -	mutex_unlock(&rdma_nl_mutex);
+ +	return 0;
+  }
+ -EXPORT_SYMBOL(rdma_nl_register);
+ +EXPORT_SYMBOL(ibnl_add_client);
+  
+ -void rdma_nl_unregister(unsigned int index)
+ +int ibnl_remove_client(int index)
+  {
+ -	mutex_lock(&rdma_nl_mutex);
+ -	rdma_nl_types[index].cb_table = NULL;
+ -	mutex_unlock(&rdma_nl_mutex);
+ +	struct ibnl_client *cur, *next;
+ +
+ +	mutex_lock(&ibnl_mutex);
+ +	list_for_each_entry_safe(cur, next, &client_list, list) {
+ +		if (cur->index == index) {
+ +			list_del(&(cur->list));
+ +			mutex_unlock(&ibnl_mutex);
+ +			kfree(cur);
+ +			return 0;
+ +		}
+ +	}
+ +	pr_warn("Can't remove callback for client idx %d. Not found\n", index);
+ +	mutex_unlock(&ibnl_mutex);
+ +
+ +	return -EINVAL;
+  }
+ -EXPORT_SYMBOL(rdma_nl_unregister);
+ +EXPORT_SYMBOL(ibnl_remove_client);
+  
+  void *ibnl_put_msg(struct sk_buff *skb, struct nlmsghdr **nlh, int seq,
+  		   int len, int client, int op, int flags)
+diff --cc include/rdma/rdma_netlink.h
+index 3d228061a9e1,92f8832297ab..000000000000
+--- a/include/rdma/rdma_netlink.h
++++ b/include/rdma/rdma_netlink.h
+@@@ -5,21 -5,23 +5,26 @@@
+  #include <linux/netlink.h>
+  #include <uapi/rdma/rdma_netlink.h>
+  
+- struct ibnl_client_cbs {
++ struct rdma_nl_cbs {
+  	int (*dump)(struct sk_buff *skb, struct netlink_callback *nlcb);
+ -	u8 flags;
+ -};
+ -
+ -enum rdma_nl_flags {
+ -	/* Require CAP_NET_ADMIN */
+ -	RDMA_NL_ADMIN_PERM	= 1 << 0,
+ +	struct module *module;
+  };
+  
+  /**
+ - * Register client in RDMA netlink.
+ + * Add a a client to the list of IB netlink exporters.
+   * @index: Index of the added client
+ + * @nops: Number of supported ops by the added client.
+   * @cb_table: A table for op->callback
+ + *
+ + * Returns 0 on success or a negative error code.
+   */
+++<<<<<<< HEAD
+ +int ibnl_add_client(int index, int nops,
+ +		    const struct ibnl_client_cbs cb_table[]);
+++=======
++ void rdma_nl_register(unsigned int index,
++ 		      const struct rdma_nl_cbs cb_table[]);
+++>>>>>>> 3250b4dbd87a (RDMA/netlink: Rename netlink callback struct)
+  
+  /**
+   * Remove a client from IB netlink.
+* Unmerged path drivers/infiniband/core/cma.c
+* Unmerged path drivers/infiniband/core/device.c
+diff --git a/drivers/infiniband/core/iwcm.c b/drivers/infiniband/core/iwcm.c
+index 31661b5c1743..f4d94bde1693 100644
+--- a/drivers/infiniband/core/iwcm.c
++++ b/drivers/infiniband/core/iwcm.c
+@@ -80,7 +80,7 @@ const char *__attribute_const__ iwcm_reject_msg(int reason)
+ }
+ EXPORT_SYMBOL(iwcm_reject_msg);
+ 
+-static struct ibnl_client_cbs iwcm_nl_cb_table[] = {
++static struct rdma_nl_cbs iwcm_nl_cb_table[] = {
+ 	[RDMA_NL_IWPM_REG_PID] = {.dump = iwpm_register_pid_cb},
+ 	[RDMA_NL_IWPM_ADD_MAPPING] = {.dump = iwpm_add_mapping_cb},
+ 	[RDMA_NL_IWPM_QUERY_MAPPING] = {.dump = iwpm_add_and_query_mapping_cb},
+* Unmerged path drivers/infiniband/core/netlink.c
+* Unmerged path include/rdma/rdma_netlink.h
