@@ -1,0 +1,796 @@
+tcmu: don't block submitting context for block waits
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Mike Christie <mchristi@redhat.com>
+commit af1dd7ff46824a94da1d90443bd07db2796bd545
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/af1dd7ff.failed
+
+This patch has tcmu internally queue cmds if its ring buffer
+is full. It also makes the TCMU_GLOBAL_MAX_BLOCKS limit a
+hint instead of a hard limit, so we do not have to add any
+new locks/atomics in the main IO path except when IO is not
+running.
+
+This fixes the following bugs:
+
+1. We cannot sleep from the submitting context because it might be
+called from a target recv context. This results in transport level
+commands timing out. For example if the ring is full, we would
+sleep, and a iscsi initiator would send a iscsi ping/nop which
+times out because the target's recv thread is sleeping here.
+
+2. Devices were not fairly scheduled to run when they hit the global
+limit so they could time out waiting for ring space while others
+got run.
+
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit af1dd7ff46824a94da1d90443bd07db2796bd545)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 8fa83807dcdc,52fc1d440d23..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -61,17 -67,27 +61,28 @@@
+   * this may have a 'UAM' comment.
+   */
+  
+ -#define TCMU_TIME_OUT (30 * MSEC_PER_SEC)
+  
+ -/* For cmd area, the size is fixed 8MB */
+ -#define CMDR_SIZE (8 * 1024 * 1024)
+ +#define TCMU_TIME_OUT (30 * MSEC_PER_SEC)
+  
+ -/*
+ - * For data area, the block size is PAGE_SIZE and
+ - * the total size is 256K * PAGE_SIZE.
+ - */
+ +#define DATA_BLOCK_BITS_DEF 2048
+ +#define DATA_BLOCKS_BITS_MAX 65536
+  #define DATA_BLOCK_SIZE PAGE_SIZE
+ -#define DATA_BLOCK_BITS (256 * 1024)
+ -#define DATA_SIZE (DATA_BLOCK_BITS * DATA_BLOCK_SIZE)
+ +#define DATA_BLOCK_SHIFT PAGE_SHIFT
+ +#define TCMU_MBS_TO_BLOCKS(_mbs) (_mbs << (20 - DATA_BLOCK_SHIFT))
+ +#define TCMU_BLOCKS_TO_MBS(_blocks) (_blocks >> (20 - DATA_BLOCK_SHIFT))
+  
+++<<<<<<< HEAD
+ +#define CMDR_SIZE (16 * 4096)
+++=======
++ /* The total size of the ring is 8M + 256K * PAGE_SIZE */
++ #define TCMU_RING_SIZE (CMDR_SIZE + DATA_SIZE)
++ 
++ /*
++  * Default number of global data blocks(512K * PAGE_SIZE)
++  * when the unmap thread will be started.
++  */
++ #define TCMU_GLOBAL_MAX_BLOCKS (512 * 1024)
+++>>>>>>> af1dd7ff4682 (tcmu: don't block submitting context for block waits)
+  
+  static u8 tcmu_kern_cmd_reply_supported;
+  
+@@@ -91,8 -107,10 +102,14 @@@ struct tcmu_nl_cmd 
+  };
+  
+  struct tcmu_dev {
+++<<<<<<< HEAD
+++=======
++ 	struct list_head node;
++ 	struct kref kref;
++ 
+++>>>>>>> af1dd7ff4682 (tcmu: don't block submitting context for block waits)
+  	struct se_device se_dev;
+ +	int dev_index;
+  
+  	char *name;
+  	struct se_hba *hba;
+@@@ -111,17 -131,16 +128,27 @@@
+  	/* Must add data_off and mb_addr to get the address */
+  	size_t data_off;
+  	size_t data_size;
+ +	uint32_t max_blocks;
+ +	size_t ring_size;
+ +
+ +	unsigned long *data_bitmap;
+  
+++<<<<<<< HEAD
+ +	wait_queue_head_t wait_cmdr;
+ +	/* TODO should this be a mutex? */
+ +	spinlock_t cmdr_lock;
+++=======
++ 	struct mutex cmdr_lock;
++ 	struct list_head cmdr_queue;
++ 
++ 	uint32_t dbi_max;
++ 	uint32_t dbi_thresh;
++ 	DECLARE_BITMAP(data_bitmap, DATA_BLOCK_BITS);
++ 	struct radix_tree_root data_blocks;
+++>>>>>>> af1dd7ff4682 (tcmu: don't block submitting context for block waits)
+  
+  	struct idr commands;
+ +	spinlock_t commands_lock;
+  
+  	struct timer_list timeout;
+  	unsigned int cmd_time_out;
+@@@ -154,6 -178,24 +182,27 @@@ struct tcmu_cmd 
+  #define TCMU_CMD_BIT_EXPIRED 0
+  	unsigned long flags;
+  };
+++<<<<<<< HEAD
+++=======
++ /*
++  * To avoid dead lock the mutex lock order should always be:
++  *
++  * mutex_lock(&root_udev_mutex);
++  * ...
++  * mutex_lock(&tcmu_dev->cmdr_lock);
++  * mutex_unlock(&tcmu_dev->cmdr_lock);
++  * ...
++  * mutex_unlock(&root_udev_mutex);
++  */
++ static DEFINE_MUTEX(root_udev_mutex);
++ static LIST_HEAD(root_udev);
++ 
++ static DEFINE_SPINLOCK(timed_out_udevs_lock);
++ static LIST_HEAD(timed_out_udevs);
++ 
++ static atomic_t global_db_count = ATOMIC_INIT(0);
++ static struct delayed_work tcmu_unmap_work;
+++>>>>>>> af1dd7ff4682 (tcmu: don't block submitting context for block waits)
+  
+  static struct kmem_cache *tcmu_cmd_cache;
+  
+@@@ -292,6 -332,84 +341,87 @@@ static struct genl_family tcmu_genl_fam
+  	.n_ops = ARRAY_SIZE(tcmu_genl_ops),
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define tcmu_cmd_set_dbi_cur(cmd, index) ((cmd)->dbi_cur = (index))
++ #define tcmu_cmd_reset_dbi_cur(cmd) tcmu_cmd_set_dbi_cur(cmd, 0)
++ #define tcmu_cmd_set_dbi(cmd, index) ((cmd)->dbi[(cmd)->dbi_cur++] = (index))
++ #define tcmu_cmd_get_dbi(cmd) ((cmd)->dbi[(cmd)->dbi_cur++])
++ 
++ static void tcmu_cmd_free_data(struct tcmu_cmd *tcmu_cmd, uint32_t len)
++ {
++ 	struct tcmu_dev *udev = tcmu_cmd->tcmu_dev;
++ 	uint32_t i;
++ 
++ 	for (i = 0; i < len; i++)
++ 		clear_bit(tcmu_cmd->dbi[i], udev->data_bitmap);
++ }
++ 
++ static inline bool tcmu_get_empty_block(struct tcmu_dev *udev,
++ 					struct tcmu_cmd *tcmu_cmd)
++ {
++ 	struct page *page;
++ 	int ret, dbi;
++ 
++ 	dbi = find_first_zero_bit(udev->data_bitmap, udev->dbi_thresh);
++ 	if (dbi == udev->dbi_thresh)
++ 		return false;
++ 
++ 	page = radix_tree_lookup(&udev->data_blocks, dbi);
++ 	if (!page) {
++ 		if (atomic_add_return(1, &global_db_count) >
++ 					TCMU_GLOBAL_MAX_BLOCKS)
++ 			schedule_delayed_work(&tcmu_unmap_work, 0);
++ 
++ 		/* try to get new page from the mm */
++ 		page = alloc_page(GFP_KERNEL);
++ 		if (!page)
++ 			goto err_alloc;
++ 
++ 		ret = radix_tree_insert(&udev->data_blocks, dbi, page);
++ 		if (ret)
++ 			goto err_insert;
++ 	}
++ 
++ 	if (dbi > udev->dbi_max)
++ 		udev->dbi_max = dbi;
++ 
++ 	set_bit(dbi, udev->data_bitmap);
++ 	tcmu_cmd_set_dbi(tcmu_cmd, dbi);
++ 
++ 	return true;
++ err_insert:
++ 	__free_page(page);
++ err_alloc:
++ 	atomic_dec(&global_db_count);
++ 	return false;
++ }
++ 
++ static bool tcmu_get_empty_blocks(struct tcmu_dev *udev,
++ 				  struct tcmu_cmd *tcmu_cmd)
++ {
++ 	int i;
++ 
++ 	for (i = tcmu_cmd->dbi_cur; i < tcmu_cmd->dbi_cnt; i++) {
++ 		if (!tcmu_get_empty_block(udev, tcmu_cmd))
++ 			return false;
++ 	}
++ 	return true;
++ }
++ 
++ static inline struct page *
++ tcmu_get_block_page(struct tcmu_dev *udev, uint32_t dbi)
++ {
++ 	return radix_tree_lookup(&udev->data_blocks, dbi);
++ }
++ 
++ static inline void tcmu_free_cmd(struct tcmu_cmd *tcmu_cmd)
++ {
++ 	kfree(tcmu_cmd->dbi);
++ 	kmem_cache_free(tcmu_cmd_cache, tcmu_cmd);
++ }
++ 
+++>>>>>>> af1dd7ff4682 (tcmu: don't block submitting context for block waits)
+  static inline size_t tcmu_cmd_get_data_length(struct tcmu_cmd *tcmu_cmd)
+  {
+  	struct se_cmd *se_cmd = tcmu_cmd->se_cmd;
+@@@ -330,36 -441,20 +460,40 @@@ static struct tcmu_cmd *tcmu_alloc_cmd(
+  	if (!tcmu_cmd)
+  		return NULL;
+  
+++<<<<<<< HEAD
+ +	tcmu_cmd->data_bitmap = kzalloc(BITS_TO_LONGS(udev->max_blocks) *
+ +					sizeof(unsigned long), GFP_KERNEL);
+ +	if (!tcmu_cmd->data_bitmap)
+ +		goto free_cmd;
+ +
+++=======
++ 	INIT_LIST_HEAD(&tcmu_cmd->cmdr_queue_entry);
+++>>>>>>> af1dd7ff4682 (tcmu: don't block submitting context for block waits)
+  	tcmu_cmd->se_cmd = se_cmd;
+  	tcmu_cmd->tcmu_dev = udev;
+ +	if (udev->cmd_time_out)
+ +		tcmu_cmd->deadline = jiffies +
+ +					msecs_to_jiffies(udev->cmd_time_out);
+  
+ -	tcmu_cmd_reset_dbi_cur(tcmu_cmd);
+ -	tcmu_cmd->dbi_cnt = tcmu_cmd_get_block_cnt(tcmu_cmd);
+ -	tcmu_cmd->dbi = kcalloc(tcmu_cmd->dbi_cnt, sizeof(uint32_t),
+ -				GFP_KERNEL);
+ -	if (!tcmu_cmd->dbi) {
+ -		kmem_cache_free(tcmu_cmd_cache, tcmu_cmd);
+ -		return NULL;
+ -	}
+ +	idr_preload(GFP_KERNEL);
+ +	spin_lock_irq(&udev->commands_lock);
+ +	cmd_id = idr_alloc(&udev->commands, tcmu_cmd, 0,
+ +		USHRT_MAX, GFP_NOWAIT);
+ +	spin_unlock_irq(&udev->commands_lock);
+ +	idr_preload_end();
+ +
+ +	if (cmd_id < 0)
+ +		goto free_bitmap;
+ +
+ +	tcmu_cmd->cmd_id = cmd_id;
+  
+  	return tcmu_cmd;
+ +
+ +free_bitmap:
+ +	kfree(tcmu_cmd->data_bitmap);
+ +free_cmd:
+ +	kmem_cache_free(tcmu_cmd_cache, tcmu_cmd);
+ +	return NULL;
+  }
+  
+  static inline void tcmu_flush_dcache_range(void *vaddr, size_t size)
+@@@ -588,8 -741,63 +722,68 @@@ static inline size_t tcmu_cmd_get_cmd_s
+  	return command_size;
+  }
+  
+++<<<<<<< HEAD
+ +static sense_reason_t
+ +tcmu_queue_cmd_ring(struct tcmu_cmd *tcmu_cmd)
+++=======
++ static int tcmu_setup_cmd_timer(struct tcmu_cmd *tcmu_cmd)
++ {
++ 	struct tcmu_dev *udev = tcmu_cmd->tcmu_dev;
++ 	unsigned long tmo = udev->cmd_time_out;
++ 	int cmd_id;
++ 
++ 	/*
++ 	 * If it was on the cmdr queue waiting we do not reset the timer
++ 	 * for requeues and when it is finally sent to userspace.
++ 	 */
++ 	if (tcmu_cmd->cmd_id)
++ 		return 0;
++ 
++ 	cmd_id = idr_alloc(&udev->commands, tcmu_cmd, 1, USHRT_MAX, GFP_NOWAIT);
++ 	if (cmd_id < 0) {
++ 		pr_err("tcmu: Could not allocate cmd id.\n");
++ 		return cmd_id;
++ 	}
++ 	tcmu_cmd->cmd_id = cmd_id;
++ 
++ 	if (!tmo)
++ 		tmo = TCMU_TIME_OUT;
++ 
++ 	pr_debug("allocated cmd %u for dev %s tmo %lu\n", tcmu_cmd->cmd_id,
++ 		 udev->name, tmo / MSEC_PER_SEC);
++ 
++ 	tcmu_cmd->deadline = round_jiffies_up(jiffies + msecs_to_jiffies(tmo));
++ 	mod_timer(&udev->timeout, tcmu_cmd->deadline);
++ 	return 0;
++ }
++ 
++ static int add_to_cmdr_queue(struct tcmu_cmd *tcmu_cmd)
++ {
++ 	struct tcmu_dev *udev = tcmu_cmd->tcmu_dev;
++ 	int ret;
++ 
++ 	ret = tcmu_setup_cmd_timer(tcmu_cmd);
++ 	if (ret)
++ 		return ret;
++ 
++ 	list_add_tail(&tcmu_cmd->cmdr_queue_entry, &udev->cmdr_queue);
++ 	pr_debug("adding cmd %u on dev %s to ring space wait queue\n",
++ 		 tcmu_cmd->cmd_id, udev->name);
++ 	return 0;
++ }
++ 
++ /**
++  * queue_cmd_ring - queue cmd to ring or internally
++  * @tcmu_cmd: cmd to queue
++  * @scsi_err: TCM error code if failure (-1) returned.
++  *
++  * Returns:
++  * -1 we cannot queue internally or to the ring.
++  *  0 success
++  *  1 internally queued to wait for ring memory to free.
++  */
++ static sense_reason_t queue_cmd_ring(struct tcmu_cmd *tcmu_cmd, int *scsi_err)
+++>>>>>>> af1dd7ff4682 (tcmu: don't block submitting context for block waits)
+  {
+  	struct tcmu_dev *udev = tcmu_cmd->tcmu_dev;
+  	struct se_cmd *se_cmd = tcmu_cmd->se_cmd;
+@@@ -617,11 -830,11 +811,16 @@@
+  	 * The size will be recalculated later as actually needed to save
+  	 * cmd area memories.
+  	 */
+ -	base_command_size = tcmu_cmd_get_base_cmd_size(tcmu_cmd->dbi_cnt);
+ +	base_command_size = tcmu_cmd_get_base_cmd_size(
+ +					tcmu_cmd_get_block_cnt(tcmu_cmd));
+  	command_size = tcmu_cmd_get_cmd_size(tcmu_cmd, base_command_size);
+  
+++<<<<<<< HEAD
+ +	spin_lock_irq(&udev->cmdr_lock);
+++=======
++ 	if (!list_empty(&udev->cmdr_queue))
++ 		goto queue;
+++>>>>>>> af1dd7ff4682 (tcmu: don't block submitting context for block waits)
+  
+  	mb = udev->mb_addr;
+  	cmd_head = mb->cmd_head % udev->cmdr_size; /* UAM */
+@@@ -635,46 -843,18 +834,61 @@@
+  		pr_warn("TCMU: Request of size %zu/%zu is too big for %u/%zu "
+  			"cmd ring/data area\n", command_size, data_length,
+  			udev->cmdr_size, udev->data_size);
+++<<<<<<< HEAD
+ +		spin_unlock_irq(&udev->cmdr_lock);
+ +		return TCM_INVALID_CDB_FIELD;
+ +	}
+ +
+ +	while (!is_ring_space_avail(udev, command_size, data_length)) {
+ +		int ret;
+ +		DEFINE_WAIT(__wait);
+ +
+ +		if (!udev->qfull_time_out) {
+ +			spin_unlock_irq(&udev->cmdr_lock);
+ +			return TCM_OUT_OF_RESOURCES;
+ +		}
+ +
+ +		prepare_to_wait(&udev->wait_cmdr, &__wait, TASK_INTERRUPTIBLE);
+ +
+ +		pr_debug("sleeping for ring space\n");
+ +		/*
+ +		 * For backwards compat if qfull_time_out is not set
+ +		 * use cmd_time_out and if that's not set use the default
+ +		 * time out.
+ +		 */
+ +		spin_unlock_irq(&udev->cmdr_lock);
+ +		if (udev->qfull_time_out > 0)
+ +			ret = schedule_timeout(
+ +					msecs_to_jiffies(udev->qfull_time_out));
+ +		else if (udev->cmd_time_out)
+ +			ret = schedule_timeout(
+ +					msecs_to_jiffies(udev->cmd_time_out));
+ +		else
+ +			ret = schedule_timeout(msecs_to_jiffies(TCMU_TIME_OUT));
+ +		finish_wait(&udev->wait_cmdr, &__wait);
+ +		if (!ret) {
+ +			pr_debug("tcmu: command timed out waiting for ring space.\n");
+ +			return TCM_OUT_OF_RESOURCES;
+ +		}
+ +
+ +		spin_lock_irq(&udev->cmdr_lock);
+ +
+ +		/* We dropped cmdr_lock, cmd_head is stale */
+ +		cmd_head = mb->cmd_head % udev->cmdr_size; /* UAM */
+++=======
++ 		*scsi_err = TCM_INVALID_CDB_FIELD;
++ 		return -1;
++ 	}
++ 
++ 	if (!is_ring_space_avail(udev, tcmu_cmd, command_size, data_length)) {
++ 		/*
++ 		 * Don't leave commands partially setup because the unmap
++ 		 * thread might need the blocks to make forward progress.
++ 		 */
++ 		tcmu_cmd_free_data(tcmu_cmd, tcmu_cmd->dbi_cur);
++ 		tcmu_cmd_reset_dbi_cur(tcmu_cmd);
++ 		goto queue;
+++>>>>>>> af1dd7ff4682 (tcmu: don't block submitting context for block waits)
+  	}
+  
+  	/* Insert a PAD if end-of-ring space is too small */
+@@@ -737,17 -929,19 +951,32 @@@
+  
+  	UPDATE_HEAD(mb->cmd_head, command_size, udev->cmdr_size);
+  	tcmu_flush_dcache_range(mb, sizeof(*mb));
+++<<<<<<< HEAD
+ +
+ +	spin_unlock_irq(&udev->cmdr_lock);
+++=======
+++>>>>>>> af1dd7ff4682 (tcmu: don't block submitting context for block waits)
+  
+  	/* TODO: only if FLUSH and FUA? */
+  	uio_event_notify(&udev->uio_info);
+  
+++<<<<<<< HEAD
+ +	if (udev->cmd_time_out)
+ +		mod_timer(&udev->timeout, round_jiffies_up(jiffies +
+ +			  msecs_to_jiffies(udev->cmd_time_out)));
+ +
+ +	return TCM_NO_SENSE;
+++=======
++ 	return 0;
++ 
++ queue:
++ 	if (add_to_cmdr_queue(tcmu_cmd)) {
++ 		*scsi_err = TCM_OUT_OF_RESOURCES;
++ 		return -1;
++ 	}
++ 
++ 	return 1;
+++>>>>>>> af1dd7ff4682 (tcmu: don't block submitting context for block waits)
+  }
+  
+  static sense_reason_t
+@@@ -756,22 -950,19 +985,36 @@@ tcmu_queue_cmd(struct se_cmd *se_cmd
+  	struct se_device *se_dev = se_cmd->se_dev;
+  	struct tcmu_dev *udev = TCMU_DEV(se_dev);
+  	struct tcmu_cmd *tcmu_cmd;
+++<<<<<<< HEAD
+ +	sense_reason_t ret;
+++=======
++ 	sense_reason_t scsi_ret;
++ 	int ret;
+++>>>>>>> af1dd7ff4682 (tcmu: don't block submitting context for block waits)
+  
+  	tcmu_cmd = tcmu_alloc_cmd(se_cmd);
+  	if (!tcmu_cmd)
+  		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+  
+++<<<<<<< HEAD
+ +	ret = tcmu_queue_cmd_ring(tcmu_cmd);
+ +	if (ret != TCM_NO_SENSE) {
+ +		spin_lock_irq(&udev->commands_lock);
+ +		idr_remove(&udev->commands, tcmu_cmd->cmd_id);
+ +		spin_unlock_irq(&udev->commands_lock);
+ +
+ +		tcmu_free_cmd(tcmu_cmd);
+ +	}
+ +
+ +	return ret;
+++=======
++ 	mutex_lock(&udev->cmdr_lock);
++ 	ret = queue_cmd_ring(tcmu_cmd, &scsi_ret);
++ 	mutex_unlock(&udev->cmdr_lock);
++ 	if (ret < 0)
++ 		tcmu_free_cmd(tcmu_cmd);
++ 	return scsi_ret;
+++>>>>>>> af1dd7ff4682 (tcmu: don't block submitting context for block waits)
+  }
+  
+  static void tcmu_handle_completion(struct tcmu_cmd *cmd, struct tcmu_cmd_entry *entry)
+@@@ -870,12 -1049,15 +1113,24 @@@ static unsigned int tcmu_handle_complet
+  		handled++;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (mb->cmd_tail == mb->cmd_head)
+ +		del_timer(&udev->timeout); /* no more pending cmds */
+ +
+ +	spin_unlock_irqrestore(&udev->cmdr_lock, flags);
+ +
+ +	wake_up(&udev->wait_cmdr);
+++=======
++ 	if (mb->cmd_tail == mb->cmd_head && list_empty(&udev->cmdr_queue)) {
++ 		del_timer(&udev->timeout);
++ 		/*
++ 		 * not more pending or waiting commands so try to reclaim
++ 		 * blocks if needed.
++ 		 */
++ 		if (atomic_read(&global_db_count) > TCMU_GLOBAL_MAX_BLOCKS)
++ 			schedule_delayed_work(&tcmu_unmap_work, 0);
++ 	}
+++>>>>>>> af1dd7ff4682 (tcmu: don't block submitting context for block waits)
+  
+  	return handled;
+  }
+@@@ -897,24 -1100,18 +1173,28 @@@ static int tcmu_check_expired_cmd(int i
+  	return 0;
+  }
+  
+ -static void tcmu_device_timedout(struct timer_list *t)
+ +static void tcmu_device_timedout(unsigned long data)
+  {
+ -	struct tcmu_dev *udev = from_timer(udev, t, timeout);
+ +	struct tcmu_dev *udev = (struct tcmu_dev *)data;
+ +	unsigned long flags;
+ +	int handled;
+ +
+ +	handled = tcmu_handle_completions(udev);
+  
+ -	pr_debug("%s cmd timeout has expired\n", udev->name);
+ +	pr_warn("%d completions handled from timeout\n", handled);
+  
+ -	spin_lock(&timed_out_udevs_lock);
+ -	if (list_empty(&udev->timedout_entry))
+ -		list_add_tail(&udev->timedout_entry, &timed_out_udevs);
+ -	spin_unlock(&timed_out_udevs_lock);
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&udev->commands_lock, flags);
+ +	idr_for_each(&udev->commands, tcmu_check_expired_cmd, NULL);
+ +	spin_unlock_irqrestore(&udev->commands_lock, flags);
+  
+ +	/*
+ +	 * We don't need to wakeup threads on wait_cmdr since they have their
+ +	 * own timeout.
+ +	 */
+++=======
++ 	schedule_delayed_work(&tcmu_unmap_work, 0);
+++>>>>>>> af1dd7ff4682 (tcmu: don't block submitting context for block waits)
+  }
+  
+  static int tcmu_attach_hba(struct se_hba *hba, u32 host_id)
+@@@ -953,18 -1151,14 +1233,25 @@@ static struct se_device *tcmu_alloc_dev
+  
+  	udev->hba = hba;
+  	udev->cmd_time_out = TCMU_TIME_OUT;
+ +	udev->qfull_time_out = -1;
+ +
+ +	udev->max_blocks = DATA_BLOCK_BITS_DEF;
+  
+++<<<<<<< HEAD
+ +	init_waitqueue_head(&udev->wait_cmdr);
+ +	spin_lock_init(&udev->cmdr_lock);
+ +
+++=======
++ 	mutex_init(&udev->cmdr_lock);
++ 
++ 	INIT_LIST_HEAD(&udev->timedout_entry);
++ 	INIT_LIST_HEAD(&udev->cmdr_queue);
+++>>>>>>> af1dd7ff4682 (tcmu: don't block submitting context for block waits)
+  	idr_init(&udev->commands);
+ +	spin_lock_init(&udev->commands_lock);
+  
+ -	timer_setup(&udev->timeout, tcmu_device_timedout, 0);
+ +	setup_timer(&udev->timeout, tcmu_device_timedout,
+ +		(unsigned long)udev);
+  
+  	init_waitqueue_head(&udev->nl_cmd_wq);
+  	spin_lock_init(&udev->nl_cmd_lock);
+@@@ -972,11 -1166,65 +1259,67 @@@
+  	return &udev->se_dev;
+  }
+  
++ static bool run_cmdr_queue(struct tcmu_dev *udev)
++ {
++ 	struct tcmu_cmd *tcmu_cmd, *tmp_cmd;
++ 	LIST_HEAD(cmds);
++ 	bool drained = true;
++ 	sense_reason_t scsi_ret;
++ 	int ret;
++ 
++ 	if (list_empty(&udev->cmdr_queue))
++ 		return true;
++ 
++ 	pr_debug("running %s's cmdr queue\n", udev->name);
++ 
++ 	list_splice_init(&udev->cmdr_queue, &cmds);
++ 
++ 	list_for_each_entry_safe(tcmu_cmd, tmp_cmd, &cmds, cmdr_queue_entry) {
++ 		list_del_init(&tcmu_cmd->cmdr_queue_entry);
++ 
++ 	        pr_debug("removing cmd %u on dev %s from queue\n",
++ 		         tcmu_cmd->cmd_id, udev->name);
++ 
++ 		ret = queue_cmd_ring(tcmu_cmd, &scsi_ret);
++ 		if (ret < 0) {
++ 		        pr_debug("cmd %u on dev %s failed with %u\n",
++ 			         tcmu_cmd->cmd_id, udev->name, scsi_ret);
++ 
++ 			idr_remove(&udev->commands, tcmu_cmd->cmd_id);
++ 			/*
++ 			 * Ignore scsi_ret for now. target_complete_cmd
++ 			 * drops it.
++ 			 */
++ 			target_complete_cmd(tcmu_cmd->se_cmd,
++ 					    SAM_STAT_CHECK_CONDITION);
++ 			tcmu_free_cmd(tcmu_cmd);
++ 		} else if (ret > 0) {
++ 			pr_debug("ran out of space during cmdr queue run\n");
++ 			/*
++ 			 * cmd was requeued, so just put all cmds back in
++ 			 * the queue
++ 			 */
++ 			list_splice_tail(&cmds, &udev->cmdr_queue);
++ 			drained = false;
++ 			goto done;
++ 		}
++ 	}
++ done:
++ 	return drained;
++ }
++ 
+  static int tcmu_irqcontrol(struct uio_info *info, s32 irq_on)
+  {
+- 	struct tcmu_dev *tcmu_dev = container_of(info, struct tcmu_dev, uio_info);
++ 	struct tcmu_dev *udev = container_of(info, struct tcmu_dev, uio_info);
+  
+++<<<<<<< HEAD
+ +	tcmu_handle_completions(tcmu_dev);
+++=======
++ 	mutex_lock(&udev->cmdr_lock);
++ 	tcmu_handle_completions(udev);
++ 	run_cmdr_queue(udev);
++ 	mutex_unlock(&udev->cmdr_lock);
+++>>>>>>> af1dd7ff4682 (tcmu: don't block submitting context for block waits)
+  
+  	return 0;
+  }
+@@@ -1229,8 -1618,10 +1572,13 @@@ static int tcmu_configure_device(struc
+  	/* mailbox fits in first part of CMDR space */
+  	udev->cmdr_size = CMDR_SIZE - CMDR_OFF;
+  	udev->data_off = CMDR_SIZE;
+++<<<<<<< HEAD
+ +	udev->data_size = udev->ring_size - CMDR_SIZE;
+++=======
++ 	udev->data_size = DATA_SIZE;
++ 	udev->dbi_thresh = 0; /* Default in Idle state */
+++>>>>>>> af1dd7ff4682 (tcmu: don't block submitting context for block waits)
+  
+ -	/* Initialise the mailbox of the ring buffer */
+  	mb = udev->mb_addr;
+  	mb->version = TCMU_MAILBOX_VERSION;
+  	mb->flags = TCMU_MAILBOX_FLAG_CAP_OOOC;
+@@@ -1654,12 -2065,100 +2002,106 @@@ static struct target_backend_ops tcmu_o
+  	.tb_dev_attrib_attrs	= NULL,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static void find_free_blocks(void)
++ {
++ 	struct tcmu_dev *udev;
++ 	loff_t off;
++ 	u32 start, end, block, total_freed = 0;
++ 
++ 	if (atomic_read(&global_db_count) <= TCMU_GLOBAL_MAX_BLOCKS)
++ 		return;
++ 
++ 	mutex_lock(&root_udev_mutex);
++ 	list_for_each_entry(udev, &root_udev, node) {
++ 		mutex_lock(&udev->cmdr_lock);
++ 
++ 		/* Try to complete the finished commands first */
++ 		tcmu_handle_completions(udev);
++ 
++ 		/* Skip the udevs in idle */
++ 		if (!udev->dbi_thresh) {
++ 			mutex_unlock(&udev->cmdr_lock);
++ 			continue;
++ 		}
++ 
++ 		end = udev->dbi_max + 1;
++ 		block = find_last_bit(udev->data_bitmap, end);
++ 		if (block == udev->dbi_max) {
++ 			/*
++ 			 * The last bit is dbi_max, so it is not possible
++ 			 * reclaim any blocks.
++ 			 */
++ 			mutex_unlock(&udev->cmdr_lock);
++ 			continue;
++ 		} else if (block == end) {
++ 			/* The current udev will goto idle state */
++ 			udev->dbi_thresh = start = 0;
++ 			udev->dbi_max = 0;
++ 		} else {
++ 			udev->dbi_thresh = start = block + 1;
++ 			udev->dbi_max = block;
++ 		}
++ 
++ 		/* Here will truncate the data area from off */
++ 		off = udev->data_off + start * DATA_BLOCK_SIZE;
++ 		unmap_mapping_range(udev->inode->i_mapping, off, 0, 1);
++ 
++ 		/* Release the block pages */
++ 		tcmu_blocks_release(&udev->data_blocks, start, end);
++ 		mutex_unlock(&udev->cmdr_lock);
++ 
++ 		total_freed += end - start;
++ 		pr_debug("Freed %u blocks (total %u) from %s.\n", end - start,
++ 			 total_freed, udev->name);
++ 	}
++ 	mutex_unlock(&root_udev_mutex);
++ 
++ 	if (atomic_read(&global_db_count) > TCMU_GLOBAL_MAX_BLOCKS)
++ 		schedule_delayed_work(&tcmu_unmap_work, msecs_to_jiffies(5000));
++ }
++ 
++ static void check_timedout_devices(void)
++ {
++ 	struct tcmu_dev *udev, *tmp_dev;
++ 	LIST_HEAD(devs);
++ 
++ 	spin_lock_bh(&timed_out_udevs_lock);
++ 	list_splice_init(&timed_out_udevs, &devs);
++ 
++ 	list_for_each_entry_safe(udev, tmp_dev, &devs, timedout_entry) {
++ 		list_del_init(&udev->timedout_entry);
++ 		spin_unlock_bh(&timed_out_udevs_lock);
++ 
++ 		mutex_lock(&udev->cmdr_lock);
++ 		idr_for_each(&udev->commands, tcmu_check_expired_cmd, NULL);
++ 		mutex_unlock(&udev->cmdr_lock);
++ 
++ 		spin_lock_bh(&timed_out_udevs_lock);
++ 	}
++ 
++ 	spin_unlock_bh(&timed_out_udevs_lock);
++ }
++ 
++ static void tcmu_unmap_work_fn(struct work_struct *work)
++ {
++ 	check_timedout_devices();
++ 	find_free_blocks();
++ }
++ 
+++>>>>>>> af1dd7ff4682 (tcmu: don't block submitting context for block waits)
+  static int __init tcmu_module_init(void)
+  {
+  	int ret, i, k, len = 0;
+  
+  	BUILD_BUG_ON((sizeof(struct tcmu_cmd_entry) % TCMU_OP_ALIGN_SIZE) != 0);
+  
+++<<<<<<< HEAD
+++=======
++ 	INIT_DELAYED_WORK(&tcmu_unmap_work, tcmu_unmap_work_fn);
++ 
+++>>>>>>> af1dd7ff4682 (tcmu: don't block submitting context for block waits)
+  	tcmu_cmd_cache = kmem_cache_create("tcmu_cmd_cache",
+  				sizeof(struct tcmu_cmd),
+  				__alignof__(struct tcmu_cmd),
+@@@ -1723,7 -2220,7 +2165,11 @@@ out_free_cache
+  
+  static void __exit tcmu_module_exit(void)
+  {
+++<<<<<<< HEAD
+ +	idr_destroy(&devices_idr);
+++=======
++ 	cancel_delayed_work_sync(&tcmu_unmap_work);
+++>>>>>>> af1dd7ff4682 (tcmu: don't block submitting context for block waits)
+  	target_backend_unregister(&tcmu_ops);
+  	kfree(tcmu_attrs);
+  	genl_unregister_family(&tcmu_genl_family);
+* Unmerged path drivers/target/target_core_user.c
