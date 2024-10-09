@@ -1680,8 +1680,8 @@ static int ipoib_dev_init_default(struct net_device *dev)
 
 	priv->tx_ring = vzalloc(ipoib_sendq_size * sizeof *priv->tx_ring);
 	if (!priv->tx_ring) {
-		printk(KERN_WARNING "%s: failed to allocate TX ring (%d entries)\n",
-		       priv->ca->name, ipoib_sendq_size);
+		pr_warn("%s: failed to allocate TX ring (%d entries)\n",
+			priv->ca->name, ipoib_sendq_size);
 		goto out_rx_ring_cleanup;
 	}
 
@@ -2223,8 +2223,7 @@ static struct net_device *ipoib_add_port(const char *format,
 
 	result = ib_query_port(hca, port, &attr);
 	if (result) {
-		printk(KERN_WARNING "%s: ib_query_port %d failed\n",
-		       hca->name, port);
+		pr_warn("%s: ib_query_port %d failed\n", hca->name, port);
 		goto device_init_failed;
 	}
 
@@ -2238,8 +2237,8 @@ static struct net_device *ipoib_add_port(const char *format,
 
 	result = ib_query_pkey(hca, port, 0, &priv->pkey);
 	if (result) {
-		printk(KERN_WARNING "%s: ib_query_pkey port %d failed (ret = %d)\n",
-		       hca->name, port, result);
+		pr_warn("%s: ib_query_pkey port %d failed (ret = %d)\n",
+			hca->name, port, result);
 		goto device_init_failed;
 	}
 
@@ -2256,8 +2255,8 @@ static struct net_device *ipoib_add_port(const char *format,
 
 	result = ib_query_gid(hca, port, 0, &priv->local_gid, NULL);
 	if (result) {
-		printk(KERN_WARNING "%s: ib_query_gid port %d failed (ret = %d)\n",
-		       hca->name, port, result);
+		pr_warn("%s: ib_query_gid port %d failed (ret = %d)\n",
+			hca->name, port, result);
 		goto device_init_failed;
 	}
 
@@ -2267,8 +2266,8 @@ static struct net_device *ipoib_add_port(const char *format,
 
 	result = ipoib_dev_init(priv->dev, hca, port);
 	if (result) {
-		printk(KERN_WARNING "%s: failed to initialize port %d (ret = %d)\n",
-		       hca->name, port, result);
+		pr_warn("%s: failed to initialize port %d (ret = %d)\n",
+			hca->name, port, result);
 		goto device_init_failed;
 	}
 
@@ -2278,8 +2277,8 @@ static struct net_device *ipoib_add_port(const char *format,
 
 	result = register_netdev(priv->dev);
 	if (result) {
-		printk(KERN_WARNING "%s: couldn't register ipoib port %d; error %d\n",
-		       hca->name, port, result);
+		pr_warn("%s: couldn't register ipoib port %d; error %d\n",
+			hca->name, port, result);
 		goto register_failed;
 	}
 
