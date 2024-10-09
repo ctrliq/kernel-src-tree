@@ -1,0 +1,238 @@
+nfp: don't spawn netdevs for reconfigured ports
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit b9de00770db50ce11f64cd7676dbcaf295a1926f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/b9de0077.failed
+
+After port reconfiguration (port split, media type change)
+firmware will continue to report old configuration until
+reboot.  NSP will inform us that reconfiguration is pending.
+To avoid user confusion refuse to spawn netdevs until the
+new configuration is applied (reboot).
+
+We need to split the netdev to eth_table port matching from
+MAC search and move it earlier in the probe() flow.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b9de00770db50ce11f64cd7676dbcaf295a1926f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+#	drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
+#	drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.h
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+index 3afcdc11480c,1644954f52cd..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+@@@ -129,10 -129,19 +129,24 @@@ err_area
+  	return (u8 __iomem *)ERR_PTR(err);
+  }
+  
++ /**
++  * nfp_net_get_mac_addr() - Get the MAC address.
++  * @nn:       NFP Network structure
++  * @cpp:      NFP CPP handle
++  * @id:	      NFP port id
++  *
++  * First try to get the MAC address from NSP ETH table. If that
++  * fails try HWInfo.  As a last resort generate a random address.
++  */
+  static void
+++<<<<<<< HEAD
+ +nfp_net_get_mac_addr_hwinfo(struct nfp_net *nn, struct nfp_cpp *cpp,
+ +			    unsigned int id)
+++=======
++ nfp_net_get_mac_addr(struct nfp_net *nn, struct nfp_cpp *cpp, unsigned int id)
+++>>>>>>> b9de00770db5 (nfp: don't spawn netdevs for reconfigured ports)
+  {
++ 	struct nfp_net_dp *dp = &nn->dp;
+  	u8 mac_addr[ETH_ALEN];
+  	const char *mac_str;
+  	char name[32];
+@@@ -156,34 -170,20 +176,29 @@@
+  		return;
+  	}
+  
+ -	ether_addr_copy(dp->netdev->dev_addr, mac_addr);
+ -	ether_addr_copy(dp->netdev->perm_addr, mac_addr);
+ +	ether_addr_copy(nn->netdev->dev_addr, mac_addr);
+ +	ether_addr_copy(nn->netdev->perm_addr, mac_addr);
+  }
+  
+- /**
+-  * nfp_net_get_mac_addr() - Get the MAC address.
+-  * @nn:       NFP Network structure
+-  * @pf:	      NFP PF device structure
+-  * @id:	      NFP port id
+-  *
+-  * First try to get the MAC address from NSP ETH table. If that
+-  * fails try HWInfo.  As a last resort generate a random address.
+-  */
+- static void
+- nfp_net_get_mac_addr(struct nfp_net *nn, struct nfp_pf *pf, unsigned int id)
++ static struct nfp_eth_table_port *
++ nfp_net_find_port(struct nfp_pf *pf, unsigned int id)
+  {
+  	int i;
+  
+  	for (i = 0; pf->eth_tbl && i < pf->eth_tbl->count; i++)
+- 		if (pf->eth_tbl->ports[i].eth_index == id) {
+- 			const u8 *mac_addr = pf->eth_tbl->ports[i].mac_addr;
++ 		if (pf->eth_tbl->ports[i].eth_index == id)
++ 			return &pf->eth_tbl->ports[i];
+  
+++<<<<<<< HEAD
+ +			ether_addr_copy(nn->netdev->dev_addr, mac_addr);
+ +			ether_addr_copy(nn->netdev->perm_addr, mac_addr);
+ +			return;
+ +		}
+ +
+ +	nfp_net_get_mac_addr_hwinfo(nn, pf->cpp, id);
+++=======
++ 	return NULL;
+++>>>>>>> b9de00770db5 (nfp: don't spawn netdevs for reconfigured ports)
+  }
+  
+  static unsigned int nfp_net_pf_get_num_ports(struct nfp_pf *pf)
+@@@ -305,12 -307,13 +322,13 @@@ nfp_net_pf_alloc_port_netdev(struct nfp
+  
+  	nn->cpp = pf->cpp;
+  	nn->fw_ver = *fw_ver;
+ -	nn->dp.ctrl_bar = ctrl_bar;
+ +	nn->ctrl_bar = ctrl_bar;
+  	nn->tx_bar = tx_bar;
+  	nn->rx_bar = rx_bar;
+ -	nn->dp.is_vf = 0;
+ +	nn->is_vf = 0;
+  	nn->stride_rx = stride;
+  	nn->stride_tx = stride;
++ 	nn->eth_port = eth_port;
+  
+  	return nn;
+  }
+diff --cc drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
+index f94361014b87,932772fbd27e..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
+@@@ -134,9 -135,37 +135,43 @@@ nfp_eth_port_translate(struct nfp_nsp *
+  
+  	nfp_eth_copy_mac_reverse(dst->mac_addr, src->mac_addr);
+  
+++<<<<<<< HEAD
+ +	snprintf(dst->label, sizeof(dst->label) - 1, "%llu.%llu",
+ +		 FIELD_GET(NSP_ETH_PORT_PHYLABEL, port),
+ +		 FIELD_GET(NSP_ETH_PORT_LABEL, port));
+++=======
++ 	dst->label_port = FIELD_GET(NSP_ETH_PORT_PHYLABEL, port);
++ 	dst->label_subport = FIELD_GET(NSP_ETH_PORT_LABEL, port);
++ 
++ 	if (nfp_nsp_get_abi_ver_minor(nsp) < 17)
++ 		return;
++ 
++ 	dst->override_changed = FIELD_GET(NSP_ETH_STATE_OVRD_CHNG, state);
++ }
++ 
++ static void
++ nfp_eth_mark_split_ports(struct nfp_cpp *cpp, struct nfp_eth_table *table)
++ {
++ 	unsigned int i, j;
++ 
++ 	for (i = 0; i < table->count; i++)
++ 		for (j = 0; j < table->count; j++) {
++ 			if (i == j)
++ 				continue;
++ 			if (table->ports[i].label_port !=
++ 			    table->ports[j].label_port)
++ 				continue;
++ 			if (table->ports[i].label_subport ==
++ 			    table->ports[j].label_subport)
++ 				nfp_warn(cpp,
++ 					 "Port %d subport %d is a duplicate\n",
++ 					 table->ports[i].label_port,
++ 					 table->ports[i].label_subport);
++ 
++ 			table->ports[i].is_split = true;
++ 			break;
++ 		}
+++>>>>>>> b9de00770db5 (nfp: don't spawn netdevs for reconfigured ports)
+  }
+  
+  /**
+@@@ -202,9 -231,11 +237,9 @@@ __nfp_eth_read_ports(struct nfp_cpp *cp
+  	table->count = cnt;
+  	for (i = 0, j = 0; i < NSP_ETH_MAX_COUNT; i++)
+  		if (entries[i].port & NSP_ETH_PORT_LANES_MASK)
+- 			nfp_eth_port_translate(&entries[i], i,
++ 			nfp_eth_port_translate(nsp, &entries[i], i,
+  					       &table->ports[j++]);
+  
+ -	nfp_eth_mark_split_ports(cpp, table);
+ -
+  	kfree(entries);
+  
+  	return table;
+diff --cc drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.h
+index edf703d319c8,6838741fadd7..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.h
++++ b/drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.h
+@@@ -53,6 -54,9 +53,12 @@@
+   * @enabled:	is enabled?
+   * @tx_enabled:	is TX enabled?
+   * @rx_enabled:	is RX enabled?
+++<<<<<<< HEAD
+++=======
++  * @override_changed: is media reconfig pending?
++  *
++  * @is_split:	is interface part of a split port
+++>>>>>>> b9de00770db5 (nfp: don't spawn netdevs for reconfigured ports)
+   */
+  struct nfp_eth_table {
+  	unsigned int count;
+@@@ -70,6 -76,11 +76,14 @@@
+  		bool enabled;
+  		bool tx_enabled;
+  		bool rx_enabled;
+++<<<<<<< HEAD
+++=======
++ 
++ 		bool override_changed;
++ 
++ 		/* Computed fields */
++ 		bool is_split;
+++>>>>>>> b9de00770db5 (nfp: don't spawn netdevs for reconfigured ports)
+  	} ports[0];
+  };
+  
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_main.h b/drivers/net/ethernet/netronome/nfp/nfp_main.h
+index 39105d0435e9..bb15a5724bf7 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_main.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_main.h
+@@ -64,7 +64,8 @@ struct nfp_eth_table;
+  * @fw_loaded:		Is the firmware loaded?
+  * @eth_tbl:		NSP ETH table
+  * @ddir:		Per-device debugfs directory
+- * @num_ports:		Number of adapter ports
++ * @num_ports:		Number of adapter ports app firmware supports
++ * @num_netdevs:	Number of netdevs spawned
+  * @ports:		Linked list of port structures (struct nfp_net)
+  */
+ struct nfp_pf {
+@@ -88,6 +89,8 @@ struct nfp_pf {
+ 	struct dentry *ddir;
+ 
+ 	unsigned int num_ports;
++	unsigned int num_netdevs;
++
+ 	struct list_head ports;
+ };
+ 
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfpcore/nfp_nsp_eth.h
