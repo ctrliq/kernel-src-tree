@@ -1,0 +1,287 @@
+sfc: give ef10 its own rwsem in the filter table instead of filter_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Edward Cree <ecree@solarflare.com>
+commit c2bebe37c6b686817f795b6b63599ed4472775fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/c2bebe37.failed
+
+efx->filter_lock remains in place for use on farch, but EF10 now ignores it.
+EFX_EF10_FILTER_FLAG_BUSY is no longer needed, hence it is removed.
+
+	Signed-off-by: Edward Cree <ecree@solarflare.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c2bebe37c6b686817f795b6b63599ed4472775fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/sfc/ef10.c
+diff --cc drivers/net/ethernet/sfc/ef10.c
+index 85c02e9c3fe4,9db1b9144e70..000000000000
+--- a/drivers/net/ethernet/sfc/ef10.c
++++ b/drivers/net/ethernet/sfc/ef10.c
+@@@ -4692,196 -4733,35 +4667,208 @@@ static s32 efx_ef10_filter_get_rx_ids(s
+  
+  #ifdef CONFIG_RFS_ACCEL
+  
+++<<<<<<< HEAD
+ +static efx_mcdi_async_completer efx_ef10_filter_rfs_insert_complete;
+ +
+ +static s32 efx_ef10_filter_rfs_insert(struct efx_nic *efx,
+ +				      struct efx_filter_spec *spec)
+ +{
+ +	struct efx_ef10_filter_table *table = efx->filter_state;
+ +	MCDI_DECLARE_BUF(inbuf, MC_CMD_FILTER_OP_EXT_IN_LEN);
+ +	struct efx_filter_spec *saved_spec;
+ +	unsigned int hash, i, depth = 1;
+ +	bool replacing = false;
+ +	int ins_index = -1;
+ +	u64 cookie;
+ +	s32 rc;
+ +
+ +	/* Must be an RX filter without RSS and not for a multicast
+ +	 * destination address (RFS only works for connected sockets).
+ +	 * These restrictions allow us to pass only a tiny amount of
+ +	 * data through to the completion function.
+ +	 */
+ +	EFX_WARN_ON_PARANOID(spec->flags !=
+ +			     (EFX_FILTER_FLAG_RX | EFX_FILTER_FLAG_RX_SCATTER));
+ +	EFX_WARN_ON_PARANOID(spec->priority != EFX_FILTER_PRI_HINT);
+ +	EFX_WARN_ON_PARANOID(efx_filter_is_mc_recipient(spec));
+ +
+ +	hash = efx_ef10_filter_hash(spec);
+ +
+ +	spin_lock_bh(&efx->filter_lock);
+ +
+ +	/* Find any existing filter with the same match tuple or else
+ +	 * a free slot to insert at.  If an existing filter is busy,
+ +	 * we have to give up.
+ +	 */
+ +	for (;;) {
+ +		i = (hash + depth) & (HUNT_FILTER_TBL_ROWS - 1);
+ +		saved_spec = efx_ef10_filter_entry_spec(table, i);
+ +
+ +		if (!saved_spec) {
+ +			if (ins_index < 0)
+ +				ins_index = i;
+ +		} else if (efx_ef10_filter_equal(spec, saved_spec)) {
+ +			if (table->entry[i].spec & EFX_EF10_FILTER_FLAG_BUSY) {
+ +				rc = -EBUSY;
+ +				goto fail_unlock;
+ +			}
+ +			if (spec->priority < saved_spec->priority) {
+ +				rc = -EPERM;
+ +				goto fail_unlock;
+ +			}
+ +			ins_index = i;
+ +			break;
+ +		}
+ +
+ +		/* Once we reach the maximum search depth, use the
+ +		 * first suitable slot or return -EBUSY if there was
+ +		 * none
+ +		 */
+ +		if (depth == EFX_EF10_FILTER_SEARCH_LIMIT) {
+ +			if (ins_index < 0) {
+ +				rc = -EBUSY;
+ +				goto fail_unlock;
+ +			}
+ +			break;
+ +		}
+ +
+ +		++depth;
+ +	}
+ +
+ +	/* Create a software table entry if necessary, and mark it
+ +	 * busy.  We might yet fail to insert, but any attempt to
+ +	 * insert a conflicting filter while we're waiting for the
+ +	 * firmware must find the busy entry.
+ +	 */
+ +	saved_spec = efx_ef10_filter_entry_spec(table, ins_index);
+ +	if (saved_spec) {
+ +		replacing = true;
+ +	} else {
+ +		saved_spec = kmalloc(sizeof(*spec), GFP_ATOMIC);
+ +		if (!saved_spec) {
+ +			rc = -ENOMEM;
+ +			goto fail_unlock;
+ +		}
+ +		*saved_spec = *spec;
+ +	}
+ +	efx_ef10_filter_set_entry(table, ins_index, saved_spec,
+ +				  EFX_EF10_FILTER_FLAG_BUSY);
+ +
+ +	spin_unlock_bh(&efx->filter_lock);
+ +
+ +	/* Pack up the variables needed on completion */
+ +	cookie = replacing << 31 | ins_index << 16 | spec->dmaq_id;
+ +
+ +	efx_ef10_filter_push_prep(efx, spec, inbuf,
+ +				  table->entry[ins_index].handle, NULL,
+ +				  replacing);
+ +	efx_mcdi_rpc_async(efx, MC_CMD_FILTER_OP, inbuf, sizeof(inbuf),
+ +			   MC_CMD_FILTER_OP_OUT_LEN,
+ +			   efx_ef10_filter_rfs_insert_complete, cookie);
+ +
+ +	return ins_index;
+ +
+ +fail_unlock:
+ +	spin_unlock_bh(&efx->filter_lock);
+ +	return rc;
+ +}
+ +
+ +static void
+ +efx_ef10_filter_rfs_insert_complete(struct efx_nic *efx, unsigned long cookie,
+ +				    int rc, efx_dword_t *outbuf,
+ +				    size_t outlen_actual)
+ +{
+ +	struct efx_ef10_filter_table *table = efx->filter_state;
+ +	unsigned int ins_index, dmaq_id;
+ +	struct efx_filter_spec *spec;
+ +	bool replacing;
+ +
+ +	/* Unpack the cookie */
+ +	replacing = cookie >> 31;
+ +	ins_index = (cookie >> 16) & (HUNT_FILTER_TBL_ROWS - 1);
+ +	dmaq_id = cookie & 0xffff;
+ +
+ +	spin_lock_bh(&efx->filter_lock);
+ +	spec = efx_ef10_filter_entry_spec(table, ins_index);
+ +	if (rc == 0) {
+ +		table->entry[ins_index].handle =
+ +			MCDI_QWORD(outbuf, FILTER_OP_OUT_HANDLE);
+ +		if (replacing)
+ +			spec->dmaq_id = dmaq_id;
+ +	} else if (!replacing) {
+ +		kfree(spec);
+ +		spec = NULL;
+ +	}
+ +	efx_ef10_filter_set_entry(table, ins_index, spec, 0);
+ +	spin_unlock_bh(&efx->filter_lock);
+ +
+ +	wake_up_all(&table->waitq);
+ +}
+ +
+ +static void
+ +efx_ef10_filter_rfs_expire_complete(struct efx_nic *efx,
+ +				    unsigned long filter_idx,
+ +				    int rc, efx_dword_t *outbuf,
+ +				    size_t outlen_actual);
+ +
+ +static bool efx_ef10_filter_rfs_expire_one(struct efx_nic *efx, u32 flow_id,
+ +					   unsigned int filter_idx)
+ +{
+ +	struct efx_ef10_filter_table *table = efx->filter_state;
+ +	struct efx_filter_spec *spec =
+ +		efx_ef10_filter_entry_spec(table, filter_idx);
+ +	MCDI_DECLARE_BUF(inbuf,
+ +			 MC_CMD_FILTER_OP_IN_HANDLE_OFST +
+ +			 MC_CMD_FILTER_OP_IN_HANDLE_LEN);
+ +
+ +	if (!spec ||
+ +	    (table->entry[filter_idx].spec & EFX_EF10_FILTER_FLAG_BUSY) ||
+ +	    spec->priority != EFX_FILTER_PRI_HINT ||
+ +	    !rps_may_expire_flow(efx->net_dev, spec->dmaq_id,
+ +				 flow_id, filter_idx))
+ +		return false;
+ +
+ +	MCDI_SET_DWORD(inbuf, FILTER_OP_IN_OP,
+ +		       MC_CMD_FILTER_OP_IN_OP_REMOVE);
+ +	MCDI_SET_QWORD(inbuf, FILTER_OP_IN_HANDLE,
+ +		       table->entry[filter_idx].handle);
+ +	if (efx_mcdi_rpc_async(efx, MC_CMD_FILTER_OP, inbuf, sizeof(inbuf), 0,
+ +			       efx_ef10_filter_rfs_expire_complete, filter_idx))
+ +		return false;
+ +
+ +	table->entry[filter_idx].spec |= EFX_EF10_FILTER_FLAG_BUSY;
+ +	return true;
+- }
+- 
+- static void
+- efx_ef10_filter_rfs_expire_complete(struct efx_nic *efx,
+- 				    unsigned long filter_idx,
+- 				    int rc, efx_dword_t *outbuf,
+- 				    size_t outlen_actual)
+++=======
++ static bool efx_ef10_filter_rfs_expire_one(struct efx_nic *efx, u32 flow_id,
++ 					   unsigned int filter_idx)
+  {
+- 	struct efx_ef10_filter_table *table = efx->filter_state;
+- 	struct efx_filter_spec *spec =
+- 		efx_ef10_filter_entry_spec(table, filter_idx);
++ 	struct efx_ef10_filter_table *table;
++ 	struct efx_filter_spec *spec;
++ 	bool ret;
+  
+- 	spin_lock_bh(&efx->filter_lock);
+- 	if (rc == 0) {
+- 		kfree(spec);
+- 		efx_ef10_filter_set_entry(table, filter_idx, NULL, 0);
++ 	down_read(&efx->filter_sem);
++ 	table = efx->filter_state;
++ 	down_write(&table->lock);
++ 	spec = efx_ef10_filter_entry_spec(table, filter_idx);
++ 
++ 	if (!spec || spec->priority != EFX_FILTER_PRI_HINT) {
++ 		ret = true;
++ 		goto out_unlock;
+  	}
+- 	table->entry[filter_idx].spec &= ~EFX_EF10_FILTER_FLAG_BUSY;
+- 	wake_up_all(&table->waitq);
+- 	spin_unlock_bh(&efx->filter_lock);
++ 
++ 	if (!rps_may_expire_flow(efx->net_dev, spec->dmaq_id,
++ 				 flow_id, filter_idx)) {
++ 		ret = false;
++ 		goto out_unlock;
++ 	}
++ 
++ 	ret = efx_ef10_filter_remove_internal(efx, 1U << spec->priority,
++ 					      filter_idx, true) == 0;
++ out_unlock:
++ 	up_write(&table->lock);
++ 	up_read(&efx->filter_sem);
++ 	return ret;
+++>>>>>>> c2bebe37c6b6 (sfc: give ef10 its own rwsem in the filter table instead of filter_lock)
+  }
+  
+  #endif /* CONFIG_RFS_ACCEL */
+@@@ -5579,8 -5451,9 +5558,9 @@@ static void efx_ef10_filter_remove_old(
+  	int rc;
+  	int i;
+  
++ 	down_write(&table->lock);
+  	for (i = 0; i < HUNT_FILTER_TBL_ROWS; i++) {
+ -		if (READ_ONCE(table->entry[i].spec) &
+ +		if (ACCESS_ONCE(table->entry[i].spec) &
+  		    EFX_EF10_FILTER_FLAG_AUTO_OLD) {
+  			rc = efx_ef10_filter_remove_internal(efx,
+  					1U << EFX_FILTER_PRI_AUTO, i, true);
+* Unmerged path drivers/net/ethernet/sfc/ef10.c
+diff --git a/drivers/net/ethernet/sfc/efx.c b/drivers/net/ethernet/sfc/efx.c
+index 546cc9e439a8..7d2da20e5fe7 100644
+--- a/drivers/net/ethernet/sfc/efx.c
++++ b/drivers/net/ethernet/sfc/efx.c
+@@ -1764,7 +1764,6 @@ static int efx_probe_filters(struct efx_nic *efx)
+ {
+ 	int rc;
+ 
+-	spin_lock_init(&efx->filter_lock);
+ 	init_rwsem(&efx->filter_sem);
+ 	mutex_lock(&efx->mac_lock);
+ 	down_write(&efx->filter_sem);
+diff --git a/drivers/net/ethernet/sfc/net_driver.h b/drivers/net/ethernet/sfc/net_driver.h
+index d3b503c79fbe..d4c0af85ef63 100644
+--- a/drivers/net/ethernet/sfc/net_driver.h
++++ b/drivers/net/ethernet/sfc/net_driver.h
+@@ -821,7 +821,7 @@ struct efx_rss_context {
+  * @loopback_mode: Loopback status
+  * @loopback_modes: Supported loopback mode bitmask
+  * @loopback_selftest: Offline self-test private state
+- * @filter_sem: Filter table rw_semaphore, for freeing the table
++ * @filter_sem: Filter table rw_semaphore, protects existence of @filter_state
+  * @filter_lock: Filter table lock, for mere content changes
+  * @filter_state: Architecture-dependent filter table state
+  * @rps_flow_id: Flow IDs of filters allocated for accelerated RFS,
