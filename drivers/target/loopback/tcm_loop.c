@@ -108,7 +108,7 @@ static struct device_driver tcm_loop_driverfs = {
 /*
  * Used with root_device_register() in tcm_loop_alloc_core_bus() below
  */
-struct device *tcm_loop_primary;
+static struct device *tcm_loop_primary;
 
 /*
  * Copied from drivers/scsi/libfc/fc_fcp.c:fc_change_queue_depth() and
