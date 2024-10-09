@@ -1,0 +1,179 @@
+mmc: block: Anonymize the drv op data pointer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] block: Anonymize the drv op data pointer (Gopal Tiwari) [1456570]
+Rebuild_FUZZ: 94.12%
+commit-author Linus Walleij <linus.walleij@linaro.org>
+commit 69f7599e6c55b80aa34fee18217a67d16703b906
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/69f7599e.failed
+
+We have a data pointer for the ioctl() data, but we need to
+pass other data along with the DRV_OP:s, so make this a
+void * so it can be reused.
+
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit 69f7599e6c55b80aa34fee18217a67d16703b906)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/block.c
+#	drivers/mmc/core/queue.h
+diff --cc drivers/mmc/core/block.c
+index 781c489f21d5,727699c75ca4..000000000000
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@@ -582,17 -587,21 +582,33 @@@ static int mmc_blk_ioctl_cmd(struct blo
+  		goto cmd_done;
+  	}
+  
+++<<<<<<< HEAD
+ +	mmc_get_card(card);
+ +
+ +	ioc_err = __mmc_blk_ioctl_cmd(card, md, idata);
+ +
+ +	/* Always switch back to main area after RPMB access */
+ +	if (md->area_type & MMC_BLK_DATA_AREA_RPMB)
+ +		mmc_blk_part_switch(card, dev_get_drvdata(&card->dev));
+ +
+ +	mmc_put_card(card);
+ +
+++=======
++ 	/*
++ 	 * Dispatch the ioctl() into the block request queue.
++ 	 */
++ 	mq = &md->queue;
++ 	req = blk_get_request(mq->queue,
++ 		idata->ic.write_flag ? REQ_OP_DRV_OUT : REQ_OP_DRV_IN,
++ 		__GFP_RECLAIM);
++ 	idatas[0] = idata;
++ 	req_to_mmc_queue_req(req)->drv_op = MMC_DRV_OP_IOCTL;
++ 	req_to_mmc_queue_req(req)->drv_op_data = idatas;
++ 	req_to_mmc_queue_req(req)->ioc_count = 1;
++ 	blk_execute_rq(mq->queue, NULL, req, 0);
++ 	ioc_err = req_to_mmc_queue_req(req)->drv_op_result;
+++>>>>>>> 69f7599e6c55 (mmc: block: Anonymize the drv op data pointer)
+  	err = mmc_blk_ioctl_copy_to_user(ic_ptr, idata);
+ -	blk_put_request(req);
+  
+  cmd_done:
+  	mmc_blk_put(md);
+@@@ -655,16 -666,19 +671,31 @@@ static int mmc_blk_ioctl_multi_cmd(stru
+  		goto cmd_done;
+  	}
+  
+ +	mmc_get_card(card);
+ +
+++<<<<<<< HEAD
+ +	for (i = 0; i < num_of_cmds && !ioc_err; i++)
+ +		ioc_err = __mmc_blk_ioctl_cmd(card, md, idata[i]);
+  
+ +	/* Always switch back to main area after RPMB access */
+ +	if (md->area_type & MMC_BLK_DATA_AREA_RPMB)
+ +		mmc_blk_part_switch(card, dev_get_drvdata(&card->dev));
+ +
+ +	mmc_put_card(card);
+++=======
++ 	/*
++ 	 * Dispatch the ioctl()s into the block request queue.
++ 	 */
++ 	mq = &md->queue;
++ 	req = blk_get_request(mq->queue,
++ 		idata[0]->ic.write_flag ? REQ_OP_DRV_OUT : REQ_OP_DRV_IN,
++ 		__GFP_RECLAIM);
++ 	req_to_mmc_queue_req(req)->drv_op = MMC_DRV_OP_IOCTL;
++ 	req_to_mmc_queue_req(req)->drv_op_data = idata;
++ 	req_to_mmc_queue_req(req)->ioc_count = num_of_cmds;
++ 	blk_execute_rq(mq->queue, NULL, req, 0);
++ 	ioc_err = req_to_mmc_queue_req(req)->drv_op_result;
+++>>>>>>> 69f7599e6c55 (mmc: block: Anonymize the drv op data pointer)
+  
+  	/* copy to user if data and response */
+  	for (i = 0; i < num_of_cmds && !err; i++)
+@@@ -1150,7 -1166,57 +1181,61 @@@ int mmc_access_rpmb(struct mmc_queue *m
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+ +static int mmc_blk_issue_discard_rq(struct mmc_queue *mq, struct request *req)
+++=======
++ /*
++  * The non-block commands come back from the block layer after it queued it and
++  * processed it with all other requests and then they get issued in this
++  * function.
++  */
++ static void mmc_blk_issue_drv_op(struct mmc_queue *mq, struct request *req)
++ {
++ 	struct mmc_queue_req *mq_rq;
++ 	struct mmc_card *card = mq->card;
++ 	struct mmc_blk_data *md = mq->blkdata;
++ 	struct mmc_blk_ioc_data **idata;
++ 	int ret;
++ 	int i;
++ 
++ 	mq_rq = req_to_mmc_queue_req(req);
++ 
++ 	switch (mq_rq->drv_op) {
++ 	case MMC_DRV_OP_IOCTL:
++ 		idata = mq_rq->drv_op_data;
++ 		for (i = 0, ret = 0; i < mq_rq->ioc_count; i++) {
++ 			ret = __mmc_blk_ioctl_cmd(card, md, idata[i]);
++ 			if (ret)
++ 				break;
++ 		}
++ 		/* Always switch back to main area after RPMB access */
++ 		if (md->area_type & MMC_BLK_DATA_AREA_RPMB)
++ 			mmc_blk_part_switch(card, dev_get_drvdata(&card->dev));
++ 		break;
++ 	case MMC_DRV_OP_BOOT_WP:
++ 		ret = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL, EXT_CSD_BOOT_WP,
++ 				 card->ext_csd.boot_ro_lock |
++ 				 EXT_CSD_BOOT_WP_B_PWR_WP_EN,
++ 				 card->ext_csd.part_time);
++ 		if (ret)
++ 			pr_err("%s: Locking boot partition ro until next power on failed: %d\n",
++ 			       md->disk->disk_name, ret);
++ 		else
++ 			card->ext_csd.boot_ro_lock |=
++ 				EXT_CSD_BOOT_WP_B_PWR_WP_EN;
++ 		break;
++ 	default:
++ 		pr_err("%s: unknown driver specific operation\n",
++ 		       md->disk->disk_name);
++ 		ret = -EINVAL;
++ 		break;
++ 	}
++ 	mq_rq->drv_op_result = ret;
++ 	blk_end_request_all(req, ret);
++ }
++ 
++ static void mmc_blk_issue_discard_rq(struct mmc_queue *mq, struct request *req)
+++>>>>>>> 69f7599e6c55 (mmc: block: Anonymize the drv op data pointer)
+  {
+  	struct mmc_blk_data *md = mq->blkdata;
+  	struct mmc_card *card = md->queue.card;
+diff --cc drivers/mmc/core/queue.h
+index a61f88199573,cf26a15a64bf..000000000000
+--- a/drivers/mmc/core/queue.h
++++ b/drivers/mmc/core/queue.h
+@@@ -23,7 -48,11 +23,15 @@@ struct mmc_queue_req 
+  	char			*bounce_buf;
+  	struct scatterlist	*bounce_sg;
+  	unsigned int		bounce_sg_len;
+++<<<<<<< HEAD
+ +	struct mmc_async_req	mmc_active;
+++=======
++ 	struct mmc_async_req	areq;
++ 	enum mmc_drv_op		drv_op;
++ 	int			drv_op_result;
++ 	void			*drv_op_data;
++ 	unsigned int		ioc_count;
+++>>>>>>> 69f7599e6c55 (mmc: block: Anonymize the drv op data pointer)
+  };
+  
+  struct mmc_queue {
+* Unmerged path drivers/mmc/core/block.c
+* Unmerged path drivers/mmc/core/queue.h
