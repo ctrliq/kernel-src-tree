@@ -1,0 +1,107 @@
+usb: host: xhci support option to disable the xHCI USB2 HW LPM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [usb] host: xhci support option to disable the xHCI USB2 HW LPM (Torez Smith) [1540721]
+Rebuild_FUZZ: 95.80%
+commit-author Thang Q. Nguyen <tqnguyen@apm.com>
+commit 4750bc78efdb126ddc40f1b34dbae7ce319344cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/4750bc78.failed
+
+XHCI specification 1.1 does not require xHCI-compliant controllers
+to always enable hardware USB2 LPM. However, the current xHCI
+driver always enable it when seeing HLC=1.
+This patch supports an option for users to control disabling
+USB2 Hardware LPM via DT/ACPI attribute.
+This option is needed in case user would like to disable this
+feature. For example, their xHCI controller has its USB2 HW LPM
+broken.
+
+	Signed-off-by: Tung Nguyen <tunguyen@apm.com>
+	Signed-off-by: Thang Q. Nguyen <tqnguyen@apm.com>
+	Acked-by: Rob Herring <robh@kernel.org>
+	Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 4750bc78efdb126ddc40f1b34dbae7ce319344cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/host/xhci-plat.c
+diff --cc drivers/usb/host/xhci-plat.c
+index 6a4cb93efaf5,d0625faee8f7..000000000000
+--- a/drivers/usb/host/xhci-plat.c
++++ b/drivers/usb/host/xhci-plat.c
+@@@ -114,22 -256,19 +114,29 @@@ static int xhci_plat_probe(struct platf
+  			dev_name(&pdev->dev), hcd);
+  	if (!xhci->shared_hcd) {
+  		ret = -ENOMEM;
+ -		goto disable_clk;
+ +		goto dealloc_usb2_hcd;
+  	}
+  
+++<<<<<<< HEAD
+ +	if ((node && of_property_read_bool(node, "usb3-lpm-capable")) ||
+ +			(pdata && pdata->usb3_lpm_capable))
+++=======
++ 	if (device_property_read_bool(sysdev, "usb2-lpm-disable"))
++ 		xhci->quirks |= XHCI_HW_LPM_DISABLE;
++ 
++ 	if (device_property_read_bool(sysdev, "usb3-lpm-capable"))
+++>>>>>>> 4750bc78efdb (usb: host: xhci support option to disable the xHCI USB2 HW LPM)
+  		xhci->quirks |= XHCI_LPM_SUPPORT;
+ +	/*
+ +	 * Set the xHCI pointer before xhci_plat_setup() (aka hcd_driver.reset)
+ +	 * is called by usb_add_hcd().
+ +	 */
+ +	*((struct xhci_hcd **) xhci->shared_hcd->hcd_priv) = xhci;
+  
+ -	if (device_property_read_bool(&pdev->dev, "quirk-broken-port-ped"))
+ -		xhci->quirks |= XHCI_BROKEN_PORT_PED;
+ +	if (HCC_MAX_PSA(xhci->hcc_params) >= 4)
+ +		xhci->shared_hcd->can_do_streams = 1;
+  
+ -	hcd->usb_phy = devm_usb_get_phy_by_phandle(sysdev, "usb-phy", 0);
+ +	hcd->usb_phy = devm_usb_get_phy_by_phandle(&pdev->dev, "usb-phy", 0);
+  	if (IS_ERR(hcd->usb_phy)) {
+  		ret = PTR_ERR(hcd->usb_phy);
+  		if (ret == -EPROBE_DEFER)
+diff --git a/Documentation/devicetree/bindings/usb/usb-xhci.txt b/Documentation/devicetree/bindings/usb/usb-xhci.txt
+index a603bca6d729..e81159db4ee0 100644
+--- a/Documentation/devicetree/bindings/usb/usb-xhci.txt
++++ b/Documentation/devicetree/bindings/usb/usb-xhci.txt
+@@ -10,6 +10,7 @@ Required properties:
+ 
+ Optional properties:
+   - clocks: reference to a clock
++  - usb2-lpm-disable: indicate if we don't want to enable USB2 HW LPM
+   - usb3-lpm-capable: determines if platform is USB3 LPM capable
+ 
+ Example:
+* Unmerged path drivers/usb/host/xhci-plat.c
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index 87b1af7f0534..f3f5b970fec4 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -4129,7 +4129,7 @@ static int xhci_set_usb2_hardware_lpm(struct usb_hcd *hcd,
+ 	xhci_dbg(xhci, "%s port %d USB2 hardware LPM\n",
+ 			enable ? "enable" : "disable", port_num + 1);
+ 
+-	if (enable) {
++	if (enable && !(xhci->quirks & XHCI_HW_LPM_DISABLE)) {
+ 		/* Host supports BESL timeout instead of HIRD */
+ 		if (udev->usb2_hw_lpm_besl_capable) {
+ 			/* if device doesn't have a preferred BESL value use a
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index 6afdefe12905..da46c5161511 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1830,6 +1830,7 @@ struct xhci_hcd {
+ /* For controller with a broken Port Disable implementation */
+ #define XHCI_BROKEN_PORT_PED	(1 << 25)
+ #define XHCI_ASMEDIA_MODIFY_FLOWCONTROL	(1 << 28)
++#define XHCI_HW_LPM_DISABLE	(1 << 29)
+ 
+ 	unsigned int		num_active_eps;
+ 	unsigned int		limit_active_eps;
