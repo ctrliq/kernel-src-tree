@@ -1,0 +1,260 @@
+dm mpath: remove bio-based bloat from struct dm_mpath_io
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit bf661be1fcf9b1da8abc81a56ff41ce5964ce896
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/bf661be1.failed
+
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit bf661be1fcf9b1da8abc81a56ff41ce5964ce896)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-mpath.c
+diff --cc drivers/md/dm-mpath.c
+index d712f8cf8006,2d10ff780d84..000000000000
+--- a/drivers/md/dm-mpath.c
++++ b/drivers/md/dm-mpath.c
+@@@ -275,6 -289,41 +275,44 @@@ static void clear_request_fn_mpio(struc
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static size_t multipath_per_bio_data_size(void)
++ {
++ 	return sizeof(struct dm_mpath_io) + sizeof(struct dm_bio_details);
++ }
++ 
++ static struct dm_mpath_io *get_mpio_from_bio(struct bio *bio)
++ {
++ 	return dm_per_bio_data(bio, multipath_per_bio_data_size());
++ }
++ 
++ static struct dm_bio_details *get_bio_details_from_bio(struct bio *bio)
++ {
++ 	/* dm_bio_details is immediately after the dm_mpath_io in bio's per-bio-data */
++ 	struct dm_mpath_io *mpio = get_mpio_from_bio(bio);
++ 	void *bio_details = mpio + 1;
++ 
++ 	return bio_details;
++ }
++ 
++ static void multipath_init_per_bio_data(struct bio *bio, struct dm_mpath_io **mpio_p,
++ 					struct dm_bio_details **bio_details_p)
++ {
++ 	struct dm_mpath_io *mpio = get_mpio_from_bio(bio);
++ 	struct dm_bio_details *bio_details = get_bio_details_from_bio(bio);
++ 
++ 	memset(mpio, 0, sizeof(*mpio));
++ 	memset(bio_details, 0, sizeof(*bio_details));
++ 	dm_bio_record(bio_details, bio);
++ 
++ 	if (mpio_p)
++ 		*mpio_p = mpio;
++ 	if (bio_details_p)
++ 		*bio_details_p = bio_details;
++ }
++ 
+++>>>>>>> bf661be1fcf9 (dm mpath: remove bio-based bloat from struct dm_mpath_io)
+  /*-----------------------------------------------
+   * Path selection
+   *-----------------------------------------------*/
+@@@ -540,6 -592,108 +578,111 @@@ static void multipath_release_clone(str
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Map cloned bios (bio-based multipath)
++  */
++ static int __multipath_map_bio(struct multipath *m, struct bio *bio, struct dm_mpath_io *mpio)
++ {
++ 	size_t nr_bytes = bio->bi_iter.bi_size;
++ 	struct pgpath *pgpath;
++ 	unsigned long flags;
++ 	bool queue_io;
++ 
++ 	/* Do we need to select a new pgpath? */
++ 	pgpath = lockless_dereference(m->current_pgpath);
++ 	queue_io = test_bit(MPATHF_QUEUE_IO, &m->flags);
++ 	if (!pgpath || !queue_io)
++ 		pgpath = choose_pgpath(m, nr_bytes);
++ 
++ 	if ((pgpath && queue_io) ||
++ 	    (!pgpath && test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags))) {
++ 		/* Queue for the daemon to resubmit */
++ 		spin_lock_irqsave(&m->lock, flags);
++ 		bio_list_add(&m->queued_bios, bio);
++ 		spin_unlock_irqrestore(&m->lock, flags);
++ 		/* PG_INIT_REQUIRED cannot be set without QUEUE_IO */
++ 		if (queue_io || test_bit(MPATHF_PG_INIT_REQUIRED, &m->flags))
++ 			pg_init_all_paths(m);
++ 		else if (!queue_io)
++ 			queue_work(kmultipathd, &m->process_queued_bios);
++ 		return DM_MAPIO_SUBMITTED;
++ 	}
++ 
++ 	if (!pgpath) {
++ 		if (!must_push_back_bio(m))
++ 			return -EIO;
++ 		return DM_MAPIO_REQUEUE;
++ 	}
++ 
++ 	mpio->pgpath = pgpath;
++ 	mpio->nr_bytes = nr_bytes;
++ 
++ 	bio->bi_error = 0;
++ 	bio->bi_bdev = pgpath->path.dev->bdev;
++ 	bio->bi_rw |= REQ_FAILFAST_TRANSPORT;
++ 
++ 	if (pgpath->pg->ps.type->start_io)
++ 		pgpath->pg->ps.type->start_io(&pgpath->pg->ps,
++ 					      &pgpath->path,
++ 					      nr_bytes);
++ 	return DM_MAPIO_REMAPPED;
++ }
++ 
++ static int multipath_map_bio(struct dm_target *ti, struct bio *bio)
++ {
++ 	struct multipath *m = ti->private;
++ 	struct dm_mpath_io *mpio = NULL;
++ 
++ 	multipath_init_per_bio_data(bio, &mpio, NULL);
++ 
++ 	return __multipath_map_bio(m, bio, mpio);
++ }
++ 
++ static void process_queued_bios_list(struct multipath *m)
++ {
++ 	if (test_bit(MPATHF_BIO_BASED, &m->flags))
++ 		queue_work(kmultipathd, &m->process_queued_bios);
++ }
++ 
++ static void process_queued_bios(struct work_struct *work)
++ {
++ 	int r;
++ 	unsigned long flags;
++ 	struct bio *bio;
++ 	struct bio_list bios;
++ 	struct blk_plug plug;
++ 	struct multipath *m =
++ 		container_of(work, struct multipath, process_queued_bios);
++ 
++ 	bio_list_init(&bios);
++ 
++ 	spin_lock_irqsave(&m->lock, flags);
++ 
++ 	if (bio_list_empty(&m->queued_bios)) {
++ 		spin_unlock_irqrestore(&m->lock, flags);
++ 		return;
++ 	}
++ 
++ 	bio_list_merge(&bios, &m->queued_bios);
++ 	bio_list_init(&m->queued_bios);
++ 
++ 	spin_unlock_irqrestore(&m->lock, flags);
++ 
++ 	blk_start_plug(&plug);
++ 	while ((bio = bio_list_pop(&bios))) {
++ 		r = __multipath_map_bio(m, bio, get_mpio_from_bio(bio));
++ 		if (r < 0 || r == DM_MAPIO_REQUEUE) {
++ 			bio->bi_error = r;
++ 			bio_endio(bio);
++ 		} else if (r == DM_MAPIO_REMAPPED)
++ 			generic_make_request(bio);
++ 	}
++ 	blk_finish_plug(&plug);
++ }
++ 
++ /*
+++>>>>>>> bf661be1fcf9 (dm mpath: remove bio-based bloat from struct dm_mpath_io)
+   * If we run out of usable paths, should we queue I/O or error it?
+   */
+  static int queue_if_no_path(struct multipath *m, bool queue_if_no_path,
+@@@ -980,7 -1130,9 +1123,13 @@@ static int multipath_ctr(struct dm_targ
+  	ti->num_flush_bios = 1;
+  	ti->num_discard_bios = 1;
+  	ti->num_write_same_bios = 1;
+++<<<<<<< HEAD
+ +	if (use_blk_mq)
+++=======
++ 	if (bio_based)
++ 		ti->per_io_data_size = multipath_per_bio_data_size();
++ 	else if (use_blk_mq)
+++>>>>>>> bf661be1fcf9 (dm mpath: remove bio-based bloat from struct dm_mpath_io)
+  		ti->per_io_data_size = sizeof(struct dm_mpath_io);
+  
+  	return 0;
+@@@ -1403,6 -1569,64 +1552,67 @@@ static int multipath_end_io(struct dm_t
+  	return r;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int do_end_io_bio(struct multipath *m, struct bio *clone,
++ 			 int error, struct dm_mpath_io *mpio)
++ {
++ 	unsigned long flags;
++ 
++ 	if (!error)
++ 		return 0;	/* I/O complete */
++ 
++ 	if (noretry_error(error))
++ 		return error;
++ 
++ 	if (mpio->pgpath)
++ 		fail_path(mpio->pgpath);
++ 
++ 	if (!atomic_read(&m->nr_valid_paths)) {
++ 		if (!test_bit(MPATHF_QUEUE_IF_NO_PATH, &m->flags)) {
++ 			if (!must_push_back_bio(m))
++ 				return -EIO;
++ 			return DM_ENDIO_REQUEUE;
++ 		} else {
++ 			if (error == -EBADE)
++ 				return error;
++ 		}
++ 	}
++ 
++ 	/* Queue for the daemon to resubmit */
++ 	dm_bio_restore(get_bio_details_from_bio(clone), clone);
++ 
++ 	spin_lock_irqsave(&m->lock, flags);
++ 	bio_list_add(&m->queued_bios, clone);
++ 	spin_unlock_irqrestore(&m->lock, flags);
++ 	if (!test_bit(MPATHF_QUEUE_IO, &m->flags))
++ 		queue_work(kmultipathd, &m->process_queued_bios);
++ 
++ 	return DM_ENDIO_INCOMPLETE;
++ }
++ 
++ static int multipath_end_io_bio(struct dm_target *ti, struct bio *clone, int error)
++ {
++ 	struct multipath *m = ti->private;
++ 	struct dm_mpath_io *mpio = get_mpio_from_bio(clone);
++ 	struct pgpath *pgpath;
++ 	struct path_selector *ps;
++ 	int r;
++ 
++ 	BUG_ON(!mpio);
++ 
++ 	r = do_end_io_bio(m, clone, error, mpio);
++ 	pgpath = mpio->pgpath;
++ 	if (pgpath) {
++ 		ps = &pgpath->pg->ps;
++ 		if (ps->type->end_io)
++ 			ps->type->end_io(ps, &pgpath->path, mpio->nr_bytes);
++ 	}
++ 
++ 	return r;
++ }
++ 
+++>>>>>>> bf661be1fcf9 (dm mpath: remove bio-based bloat from struct dm_mpath_io)
+  /*
+   * Suspend can't complete until all the I/O is processed so if
+   * the last path fails we must error any remaining I/O.
+* Unmerged path drivers/md/dm-mpath.c
