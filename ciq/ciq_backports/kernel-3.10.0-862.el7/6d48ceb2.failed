@@ -1,0 +1,295 @@
+nfp: allocate a private workqueue for driver work
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 6d48ceb27af1420882f092495fc796cfcbf92a14
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/6d48ceb2.failed
+
+Since we grab pf->lock around pci_enable_sriov() we can no longer
+safely queue work which may also grab that lock onto system workqueue.
+pci_enable_sriov() will flush system workqueue as part to wait for VF
+probing.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6d48ceb27af1420882f092495fc796cfcbf92a14)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/nfp_main.h
+#	drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_main.h
+index 1ac430fbaa18,a08cfba7e68e..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_main.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_main.h
+@@@ -64,12 -77,21 +64,20 @@@ struct nfp_eth_table
+   * @limit_vfs:		Number of VFs supported by firmware (~0 for PCI limit)
+   * @num_vfs:		Number of SR-IOV VFs enabled
+   * @fw_loaded:		Is the firmware loaded?
+ - * @ctrl_vnic:		Pointer to the control vNIC if available
+ - * @mip:		MIP handle
+ - * @rtbl:		RTsym table
+ - * @hwinfo:		HWInfo table
+   * @eth_tbl:		NSP ETH table
+ - * @nspi:		NSP identification info
+ - * @hwmon_dev:		pointer to hwmon device
+   * @ddir:		Per-device debugfs directory
+++<<<<<<< HEAD
+ + * @num_ports:		Number of adapter ports
+ + * @ports:		Linked list of port structures (struct nfp_net)
+ + * @port_lock:		Protects @ports, @num_ports, @num_netdevs
+++=======
++  * @max_data_vnics:	Number of data vNICs app firmware supports
++  * @num_vnics:		Number of vNICs spawned
++  * @vnics:		Linked list of vNIC structures (struct nfp_net)
++  * @ports:		Linked list of port structures (struct nfp_port)
++  * @wq:			Workqueue for running works which need to grab @lock
+++>>>>>>> 6d48ceb27af1 (nfp: allocate a private workqueue for driver work)
+   * @port_refresh_work:	Work entry for taking netdevs out
+ - * @lock:		Protects all fields which may change after probe
+   */
+  struct nfp_pf {
+  	struct pci_dev *pdev;
+@@@ -91,10 -124,19 +99,17 @@@
+  
+  	struct dentry *ddir;
+  
+ -	unsigned int max_data_vnics;
+ -	unsigned int num_vnics;
+ -
+ -	struct list_head vnics;
+ +	unsigned int num_ports;
+  	struct list_head ports;
++ 
++ 	struct workqueue_struct *wq;
+  	struct work_struct port_refresh_work;
+++<<<<<<< HEAD
+ +	struct mutex port_lock;
+++=======
++ 
++ 	struct mutex lock;
+++>>>>>>> 6d48ceb27af1 (nfp: allocate a private workqueue for driver work)
+  };
+  
+  extern struct pci_driver nfp_netvf_pci_driver;
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+index 092c7d18f2ec,c85a2f18c4df..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+@@@ -449,77 -583,128 +449,82 @@@ err_nn_free
+  
+  static void nfp_net_pci_remove_finish(struct nfp_pf *pf)
+  {
+ -	nfp_net_pf_app_stop(pf);
+ -	/* stop app first, to avoid double free of ctrl vNIC's ddir */
+  	nfp_net_debugfs_dir_clean(&pf->ddir);
+  
+ -	nfp_net_pf_free_irqs(pf);
+ -	nfp_net_pf_app_clean(pf);
+ -	nfp_net_pci_unmap_mem(pf);
+ -}
+ -
+ -static int
+ -nfp_net_eth_port_update(struct nfp_cpp *cpp, struct nfp_port *port,
+ -			struct nfp_eth_table *eth_table)
+ -{
+ -	struct nfp_eth_table_port *eth_port;
+ -
+ -	ASSERT_RTNL();
+ -
+ -	eth_port = nfp_net_find_port(eth_table, port->eth_id);
+ -	if (!eth_port) {
+ -		set_bit(NFP_PORT_CHANGED, &port->flags);
+ -		nfp_warn(cpp, "Warning: port #%d not present after reconfig\n",
+ -			 port->eth_id);
+ -		return -EIO;
+ -	}
+ -	if (eth_port->override_changed) {
+ -		nfp_warn(cpp, "Port #%d config changed, unregistering. Reboot required before port will be operational again.\n", port->eth_id);
+ -		port->type = NFP_PORT_INVALID;
+ -	}
+ -
+ -	memcpy(port->eth_port, eth_port, sizeof(*eth_port));
+ +	nfp_net_irqs_disable(pf->pdev);
+ +	kfree(pf->irq_entries);
+  
+ -	return 0;
+ +	nfp_cpp_area_release_free(pf->rx_area);
+ +	nfp_cpp_area_release_free(pf->tx_area);
+ +	nfp_cpp_area_release_free(pf->ctrl_area);
+  }
+  
+ -int nfp_net_refresh_port_table_sync(struct nfp_pf *pf)
+ +static void nfp_net_refresh_netdevs(struct work_struct *work)
+  {
+ -	struct nfp_eth_table *eth_table;
+ +	struct nfp_pf *pf = container_of(work, struct nfp_pf,
+ +					 port_refresh_work);
+  	struct nfp_net *nn, *next;
+ -	struct nfp_port *port;
+  
+ -	lockdep_assert_held(&pf->lock);
+ +	mutex_lock(&pf->port_lock);
+  
+  	/* Check for nfp_net_pci_remove() racing against us */
+ -	if (list_empty(&pf->vnics))
+ -		return 0;
+ -
+ -	/* Update state of all ports */
+ -	rtnl_lock();
+ -	list_for_each_entry(port, &pf->ports, port_list)
+ -		clear_bit(NFP_PORT_CHANGED, &port->flags);
+ -
+ -	eth_table = nfp_eth_read_ports(pf->cpp);
+ -	if (!eth_table) {
+ -		list_for_each_entry(port, &pf->ports, port_list)
+ -			if (__nfp_port_get_eth_port(port))
+ -				set_bit(NFP_PORT_CHANGED, &port->flags);
+ -		rtnl_unlock();
+ -		nfp_err(pf->cpp, "Error refreshing port config!\n");
+ -		return -EIO;
+ -	}
+ +	if (list_empty(&pf->ports))
+ +		goto out;
+  
+ -	list_for_each_entry(port, &pf->ports, port_list)
+ -		if (__nfp_port_get_eth_port(port))
+ -			nfp_net_eth_port_update(pf->cpp, port, eth_table);
+ -	rtnl_unlock();
+ +	list_for_each_entry_safe(nn, next, &pf->ports, port_list) {
+ +		if (!nn->eth_port) {
+ +			nfp_warn(pf->cpp, "Warning: port not present after reconfig\n");
+ +			continue;
+ +		}
+ +		if (!nn->eth_port->override_changed)
+ +			continue;
+  
+ -	kfree(eth_table);
+++<<<<<<< HEAD
+ +		nn_warn(nn, "Port config changed, unregistering. Reboot required before port will be operational again.\n");
+++=======
+++	queue_work(pf->wq, &pf->port_refresh_work);
+++}
+++>>>>>>> 6d48ceb27af1 (nfp: allocate a private workqueue for driver work)
+  
+ -	/* Shoot off the ports which became invalid */
+ -	list_for_each_entry_safe(nn, next, &pf->vnics, vnic_list) {
+ -		if (!nn->port || nn->port->type != NFP_PORT_INVALID)
+ -			continue;
+ +		nfp_net_debugfs_dir_clean(&nn->debugfs_dir);
+ +		nfp_net_netdev_clean(nn->dp.netdev);
+  
+ -		nfp_net_pf_clean_vnic(pf, nn);
+ -		nfp_net_pf_free_vnic(pf, nn);
+ +		list_del(&nn->port_list);
+ +		pf->num_netdevs--;
+ +		nfp_net_netdev_free(nn);
+  	}
+  
+ -	if (list_empty(&pf->vnics))
+ +	if (list_empty(&pf->ports))
+  		nfp_net_pci_remove_finish(pf);
+ -
+ -	return 0;
+ -}
+ -
+ -static void nfp_net_refresh_vnics(struct work_struct *work)
+ -{
+ -	struct nfp_pf *pf = container_of(work, struct nfp_pf,
+ -					 port_refresh_work);
+ -
+ -	mutex_lock(&pf->lock);
+ -	nfp_net_refresh_port_table_sync(pf);
+ -	mutex_unlock(&pf->lock);
+ +out:
+ +	mutex_unlock(&pf->port_lock);
+  }
+  
+ -void nfp_net_refresh_port_table(struct nfp_port *port)
+ +void nfp_net_refresh_port_config(struct nfp_net *nn)
+  {
+ -	struct nfp_pf *pf = port->app->pf;
+ +	struct nfp_pf *pf = pci_get_drvdata(nn->pdev);
+ +	struct nfp_eth_table *old_table;
+  
+ -	set_bit(NFP_PORT_CHANGED, &port->flags);
+ -
+ -	queue_work(pf->wq, &pf->port_refresh_work);
+ -}
+ +	ASSERT_RTNL();
+  
+ -int nfp_net_refresh_eth_port(struct nfp_port *port)
+ -{
+ -	struct nfp_cpp *cpp = port->app->cpp;
+ -	struct nfp_eth_table *eth_table;
+ -	int ret;
+ +	old_table = pf->eth_tbl;
+  
+ -	clear_bit(NFP_PORT_CHANGED, &port->flags);
+ +	list_for_each_entry(nn, &pf->ports, port_list)
+ +		nfp_net_link_changed_read_clear(nn);
+  
+ -	eth_table = nfp_eth_read_ports(cpp);
+ -	if (!eth_table) {
+ -		set_bit(NFP_PORT_CHANGED, &port->flags);
+ -		nfp_err(cpp, "Error refreshing port state table!\n");
+ -		return -EIO;
+ +	pf->eth_tbl = nfp_eth_read_ports(pf->cpp);
+ +	if (!pf->eth_tbl) {
+ +		pf->eth_tbl = old_table;
+ +		nfp_err(pf->cpp, "Error refreshing port config!\n");
+ +		return;
+  	}
+  
+ -	ret = nfp_net_eth_port_update(cpp, port, eth_table);
+ +	list_for_each_entry(nn, &pf->ports, port_list)
+ +		nn->eth_port = nfp_net_find_port(pf, nn->eth_port->eth_index);
+  
+ -	kfree(eth_table);
+ +	kfree(old_table);
+  
+ -	return ret;
+ +	schedule_work(&pf->port_refresh_work);
+  }
+  
+  /*
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_main.c b/drivers/net/ethernet/netronome/nfp/nfp_main.c
+index 11612af996f5..83ee6a41b494 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_main.c
+@@ -345,6 +345,12 @@ static int nfp_pci_probe(struct pci_dev *pdev,
+ 	pci_set_drvdata(pdev, pf);
+ 	pf->pdev = pdev;
+ 
++	pf->wq = alloc_workqueue("nfp-%s", 0, 2, pci_name(pdev));
++	if (!pf->wq) {
++		err = -ENOMEM;
++		goto err_pci_priv_unset;
++	}
++
+ 	pf->cpp = nfp_cpp_from_nfp6000_pcie(pdev);
+ 	if (IS_ERR_OR_NULL(pf->cpp)) {
+ 		err = PTR_ERR(pf->cpp);
+@@ -391,6 +397,8 @@ err_fw_unload:
+ err_cpp_free:
+ 	nfp_cpp_free(pf->cpp);
+ err_disable_msix:
++	destroy_workqueue(pf->wq);
++err_pci_priv_unset:
+ 	pci_set_drvdata(pdev, NULL);
+ 	kfree(pf);
+ err_rel_regions:
+@@ -413,6 +421,7 @@ static void nfp_pci_remove(struct pci_dev *pdev)
+ 	if (pf->fw_loaded)
+ 		nfp_fw_unload(pf);
+ 
++	destroy_workqueue(pf->wq);
+ 	pci_set_drvdata(pdev, NULL);
+ 	nfp_cpp_free(pf->cpp);
+ 
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_main.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_net_main.c
