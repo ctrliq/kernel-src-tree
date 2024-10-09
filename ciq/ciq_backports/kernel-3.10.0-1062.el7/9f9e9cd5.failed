@@ -1,0 +1,332 @@
+net/mlx5e: Remove page_ref bulking in Striding RQ
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+Rebuild_CHGLOG: - [netdrv] mlx5e: Remove page_ref bulking in Striding RQ (Alaa Hleihel) [1642498]
+Rebuild_FUZZ: 95.74%
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit 9f9e9cd50eac6ad09cb053509f2e764bddc05f18
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/9f9e9cd5.failed
+
+When many packets reside on the same page, the bulking of
+page_ref modifications reduces the total number of atomic
+operations executed.
+
+Besides the necessary 2 operations on page alloc/free, we
+have the following extra ops per page:
+- one on WQE allocation (bump refcnt to maximum possible),
+- zero ops for SKBs,
+- one on WQE free,
+a constant of two operations in total, no matter how many
+packets/SKBs actually populate the page.
+
+Without this bulking, we have:
+- no ops on WQE allocation or free,
+- one op per SKB,
+
+Comparing the two methods when PAGE_SIZE is 4K:
+- As mentioned above, bulking method always executes 2 operations,
+  not more, but not less.
+- In the default MTU configuration (1500, stride size is 2K),
+  the non-bulking method execute 2 ops as well.
+- For larger MTUs with stride size of 4K, non-bulking method
+  executes only a single op.
+- For XDP (stride size of 4K, no SKBs), non-bulking method
+  executes no ops at all!
+
+Hence, to optimize the flows with linear SKB and XDP over Striding RQ,
+we here remove the page_ref bulking method.
+
+Performance testing:
+ConnectX-5, Intel(R) Xeon(R) CPU E5-2680 v3 @ 2.50GHz.
+
+Single core packet rate (64 bytes).
+
+Early drop in TC: no degradation.
+
+XDP_DROP:
+before: 14,270,188 pps
+after:  20,503,603 pps, 43% improvement.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 9f9e9cd50eac6ad09cb053509f2e764bddc05f18)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en.h
+index efbd1f3dfd48,5853de4e4fc7..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@@ -463,7 -456,7 +463,11 @@@ struct mlx5e_umr_dma_info 
+  struct mlx5e_mpw_info {
+  	struct mlx5e_umr_dma_info umr;
+  	u16 consumed_strides;
+++<<<<<<< HEAD
+ +	u16 skbs_frags[MLX5_MPWRQ_PAGES_PER_WQE];
+++=======
++ 	DECLARE_BITMAP(xdp_xmit_bitmap, MLX5_MPWRQ_PAGES_PER_WQE);
+++>>>>>>> 9f9e9cd50eac (net/mlx5e: Remove page_ref bulking in Striding RQ)
+  };
+  
+  /* a single cache unit is capable to serve one napi call (for non-striding rq)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index 95481ee556bb,9bb47a6d40f1..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -349,74 -338,16 +340,85 @@@ mlx5e_copy_skb_header_mpwqe(struct devi
+  	}
+  }
+  
+ +static inline void mlx5e_post_umr_wqe(struct mlx5e_rq *rq, u16 ix)
+ +{
+++<<<<<<< HEAD
+ +	struct mlx5e_mpw_info *wi = &rq->mpwqe.info[ix];
+ +	struct mlx5e_icosq *sq = &rq->channel->icosq;
+ +	struct mlx5_wq_cyc *wq = &sq->wq;
+ +	struct mlx5e_umr_wqe *wqe;
+ +	u8 num_wqebbs = DIV_ROUND_UP(sizeof(*wqe), MLX5_SEND_WQE_BB);
+ +	u16 pi;
+ +
+ +	/* fill sq edge with nops to avoid wqe wrap around */
+ +	while ((pi = (sq->pc & wq->sz_m1)) > sq->edge) {
+ +		sq->db.ico_wqe[pi].opcode = MLX5_OPCODE_NOP;
+ +		mlx5e_post_nop(wq, sq->sqn, &sq->pc);
+ +	}
+ +
+ +	wqe = mlx5_wq_cyc_get_wqe(wq, pi);
+ +	memcpy(wqe, &wi->umr.wqe, sizeof(*wqe));
+ +	wqe->ctrl.opmod_idx_opcode =
+ +		cpu_to_be32((sq->pc << MLX5_WQE_CTRL_WQE_INDEX_SHIFT) |
+ +			    MLX5_OPCODE_UMR);
+ +
+ +	sq->db.ico_wqe[pi].opcode = MLX5_OPCODE_UMR;
+ +	sq->pc += num_wqebbs;
+ +	mlx5e_notify_hw(&sq->wq, sq->pc, sq->uar_map, &wqe->ctrl);
+ +}
+ +
+ +static int mlx5e_alloc_rx_umr_mpwqe(struct mlx5e_rq *rq,
+ +				    u16 ix)
+ +{
+ +	struct mlx5e_mpw_info *wi = &rq->mpwqe.info[ix];
+ +	int pg_strides = mlx5e_mpwqe_strides_per_page(rq);
+ +	struct mlx5e_dma_info *dma_info = &wi->umr.dma_info[0];
+ +	int err;
+ +	int i;
+ +
+ +	for (i = 0; i < MLX5_MPWRQ_PAGES_PER_WQE; i++, dma_info++) {
+ +		err = mlx5e_page_alloc_mapped(rq, dma_info);
+ +		if (unlikely(err))
+ +			goto err_unmap;
+ +		wi->umr.mtt[i] = cpu_to_be64(dma_info->addr | MLX5_EN_WR);
+ +		page_ref_add(dma_info->page, pg_strides);
+ +	}
+ +
+ +	memset(wi->skbs_frags, 0, sizeof(*wi->skbs_frags) * MLX5_MPWRQ_PAGES_PER_WQE);
+ +	wi->consumed_strides = 0;
+ +
+ +	return 0;
+ +
+ +err_unmap:
+ +	while (--i >= 0) {
+ +		dma_info--;
+ +		page_ref_sub(dma_info->page, pg_strides);
+ +		mlx5e_page_release(rq, dma_info, true);
+ +	}
+ +
+ +	return err;
+ +}
+ +
+  void mlx5e_free_rx_mpwqe(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi)
+  {
+ +	int pg_strides = mlx5e_mpwqe_strides_per_page(rq);
+ +	struct mlx5e_dma_info *dma_info = &wi->umr.dma_info[0];
+ +	int i;
+ +
+ +	for (i = 0; i < MLX5_MPWRQ_PAGES_PER_WQE; i++, dma_info++) {
+ +		page_ref_sub(dma_info->page, pg_strides - wi->skbs_frags[i]);
+ +		mlx5e_page_release(rq, dma_info, true);
+ +	}
+++=======
++ 	const bool no_xdp_xmit =
++ 		bitmap_empty(wi->xdp_xmit_bitmap, MLX5_MPWRQ_PAGES_PER_WQE);
++ 	struct mlx5e_dma_info *dma_info = wi->umr.dma_info;
++ 	int i;
++ 
++ 	for (i = 0; i < MLX5_MPWRQ_PAGES_PER_WQE; i++)
++ 		if (no_xdp_xmit || !test_bit(i, wi->xdp_xmit_bitmap))
++ 			mlx5e_page_release(rq, &dma_info[i], true);
+++>>>>>>> 9f9e9cd50eac (net/mlx5e: Remove page_ref bulking in Striding RQ)
+  }
+  
+  static void mlx5e_post_rx_mpwqe(struct mlx5e_rq *rq)
+@@@ -436,16 -367,54 +438,53 @@@
+  
+  static int mlx5e_alloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct mlx5e_mpw_info *wi = &rq->mpwqe.info[ix];
++ 	struct mlx5e_dma_info *dma_info = &wi->umr.dma_info[0];
++ 	struct mlx5e_icosq *sq = &rq->channel->icosq;
++ 	struct mlx5_wq_cyc *wq = &sq->wq;
++ 	struct mlx5e_umr_wqe *umr_wqe;
++ 	int cpy = offsetof(struct mlx5e_umr_wqe, inline_mtts);
+++>>>>>>> 9f9e9cd50eac (net/mlx5e: Remove page_ref bulking in Striding RQ)
+  	int err;
+ -	u16 pi;
+ -	int i;
+  
+ -	/* fill sq edge with nops to avoid wqe wrap around */
+ -	while ((pi = (sq->pc & wq->sz_m1)) > sq->edge) {
+ -		sq->db.ico_wqe[pi].opcode = MLX5_OPCODE_NOP;
+ -		mlx5e_post_nop(wq, sq->sqn, &sq->pc);
+ +	err = mlx5e_alloc_rx_umr_mpwqe(rq, ix);
+ +	if (unlikely(err)) {
+ +		rq->stats->buff_alloc_err++;
+ +		return err;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	umr_wqe = mlx5_wq_cyc_get_wqe(wq, pi);
++ 	memcpy(umr_wqe, &wi->umr.wqe, cpy);
++ 	for (i = 0; i < MLX5_MPWRQ_PAGES_PER_WQE; i++, dma_info++) {
++ 		err = mlx5e_page_alloc_mapped(rq, dma_info);
++ 		if (unlikely(err))
++ 			goto err_unmap;
++ 		umr_wqe->inline_mtts[i].ptag = cpu_to_be64(dma_info->addr | MLX5_EN_WR);
++ 	}
++ 
++ 	bitmap_zero(wi->xdp_xmit_bitmap, MLX5_MPWRQ_PAGES_PER_WQE);
++ 	wi->consumed_strides = 0;
++ 
+++>>>>>>> 9f9e9cd50eac (net/mlx5e: Remove page_ref bulking in Striding RQ)
+  	rq->mpwqe.umr_in_progress = true;
+ -
+ -	umr_wqe->ctrl.opmod_idx_opcode =
+ -		cpu_to_be32((sq->pc << MLX5_WQE_CTRL_WQE_INDEX_SHIFT) |
+ -			    MLX5_OPCODE_UMR);
+ -
+ -	sq->db.ico_wqe[pi].opcode = MLX5_OPCODE_UMR;
+ -	sq->pc += MLX5E_UMR_WQEBBS;
+ -	mlx5e_notify_hw(&sq->wq, sq->pc, sq->uar_map, &umr_wqe->ctrl);
+ -
+ +	mlx5e_post_umr_wqe(rq, ix);
+  	return 0;
+++<<<<<<< HEAD
+++=======
++ 
++ err_unmap:
++ 	while (--i >= 0) {
++ 		dma_info--;
++ 		mlx5e_page_release(rq, dma_info, true);
++ 	}
++ 	rq->stats.buff_alloc_err++;
++ 
++ 	return err;
+++>>>>>>> 9f9e9cd50eac (net/mlx5e: Remove page_ref bulking in Striding RQ)
+  }
+  
+  void mlx5e_dealloc_rx_mpwqe(struct mlx5e_rq *rq, u16 ix)
+@@@ -991,23 -966,28 +1030,39 @@@ wq_ll_pop
+  }
+  #endif
+  
+ -struct sk_buff *
+ -mlx5e_skb_from_cqe_mpwrq_nonlinear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
+ -				   u16 cqe_bcnt, u32 head_offset, u32 page_idx)
+ +static inline void mlx5e_mpwqe_fill_rx_skb(struct mlx5e_rq *rq,
+ +					   struct mlx5_cqe64 *cqe,
+ +					   struct mlx5e_mpw_info *wi,
+ +					   u32 cqe_bcnt,
+ +					   struct sk_buff *skb)
+  {
+ +	u16 stride_ix      = mpwrq_get_cqe_stride_index(cqe);
+ +	u32 wqe_offset     = stride_ix << rq->mpwqe.log_stride_sz;
+ +	u32 head_offset    = wqe_offset & (PAGE_SIZE - 1);
+ +	u32 page_idx       = wqe_offset >> PAGE_SHIFT;
+ +	u32 head_page_idx  = page_idx;
+  	u16 headlen = min_t(u16, MLX5_MPWRQ_SMALL_PACKET_THRESHOLD, cqe_bcnt);
++ 	struct mlx5e_dma_info *di = &wi->umr.dma_info[page_idx];
+  	u32 frag_offset    = head_offset + headlen;
+++<<<<<<< HEAD
+ +	u16 byte_cnt       = cqe_bcnt - headlen;
+++=======
++ 	u32 byte_cnt       = cqe_bcnt - headlen;
++ 	struct mlx5e_dma_info *head_di = di;
++ 	struct sk_buff *skb;
++ 
++ 	skb = napi_alloc_skb(rq->cq.napi,
++ 			     ALIGN(MLX5_MPWRQ_SMALL_PACKET_THRESHOLD, sizeof(long)));
++ 	if (unlikely(!skb)) {
++ 		rq->stats.buff_alloc_err++;
++ 		return NULL;
++ 	}
++ 
++ 	prefetchw(skb->data);
+++>>>>>>> 9f9e9cd50eac (net/mlx5e: Remove page_ref bulking in Striding RQ)
+  
+  	if (unlikely(frag_offset >= PAGE_SIZE)) {
+- 		page_idx++;
++ 		di++;
+  		frag_offset -= PAGE_SIZE;
+  	}
+  
+@@@ -1027,6 -1007,47 +1082,50 @@@
+  	/* skb linear part was allocated with headlen and aligned to long */
+  	skb->tail += headlen;
+  	skb->len  += headlen;
+++<<<<<<< HEAD
+++=======
++ 
++ 	return skb;
++ }
++ 
++ struct sk_buff *
++ mlx5e_skb_from_cqe_mpwrq_linear(struct mlx5e_rq *rq, struct mlx5e_mpw_info *wi,
++ 				u16 cqe_bcnt, u32 head_offset, u32 page_idx)
++ {
++ 	struct mlx5e_dma_info *di = &wi->umr.dma_info[page_idx];
++ 	u16 rx_headroom = rq->buff.headroom;
++ 	u32 cqe_bcnt32 = cqe_bcnt;
++ 	struct sk_buff *skb;
++ 	void *va, *data;
++ 	u32 frag_size;
++ 	bool consumed;
++ 
++ 	va             = page_address(di->page) + head_offset;
++ 	data           = va + rx_headroom;
++ 	frag_size      = MLX5_SKB_FRAG_SZ(rx_headroom + cqe_bcnt32);
++ 
++ 	dma_sync_single_range_for_cpu(rq->pdev, di->addr, head_offset,
++ 				      frag_size, DMA_FROM_DEVICE);
++ 	prefetch(data);
++ 
++ 	rcu_read_lock();
++ 	consumed = mlx5e_xdp_handle(rq, di, va, &rx_headroom, &cqe_bcnt32);
++ 	rcu_read_unlock();
++ 	if (consumed) {
++ 		if (__test_and_clear_bit(MLX5E_RQ_FLAG_XDP_XMIT, rq->flags))
++ 			__set_bit(page_idx, wi->xdp_xmit_bitmap); /* non-atomic */
++ 		return NULL; /* page/packet was consumed by XDP */
++ 	}
++ 
++ 	skb = mlx5e_build_linear_skb(rq, va, frag_size, rx_headroom, cqe_bcnt32);
++ 	if (unlikely(!skb))
++ 		return NULL;
++ 
++ 	/* queue up for recycling/reuse */
++ 	page_ref_inc(di->page);
++ 
++ 	return skb;
+++>>>>>>> 9f9e9cd50eac (net/mlx5e: Remove page_ref bulking in Striding RQ)
+  }
+  
+  void mlx5e_handle_rx_cqe_mpwrq(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
