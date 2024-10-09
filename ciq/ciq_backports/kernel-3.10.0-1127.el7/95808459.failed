@@ -1,0 +1,266 @@
+xfs: refactor xfs_buf_log_item reference count handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Brian Foster <bfoster@redhat.com>
+commit 95808459b110f16b50f03a70ecfa72bb14bd8a96
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/95808459.failed
+
+The xfs_buf_log_item structure has a reference counter with slightly
+tricky semantics. In the common case, a buffer is logged and
+committed in a transaction, committed to the on-disk log (added to
+the AIL) and then finally written back and removed from the AIL. The
+bli refcount covers two potentially overlapping timeframes:
+
+ 1. the bli is held in an active transaction
+ 2. the bli is pinned by the log
+
+The caveat to this approach is that the reference counter does not
+purely dictate the lifetime of the bli. IOW, when a dirty buffer is
+physically logged and unpinned, the bli refcount may go to zero as
+the log item is inserted into the AIL. Only once the buffer is
+written back can the bli finally be freed.
+
+The above semantics means that it is not enough for the various
+refcount decrementing contexts to release the bli on decrement to
+zero. xfs_trans_brelse(), transaction commit (->iop_unlock()) and
+unpin (->iop_unpin()) must all drop the associated reference and
+make additional checks to determine if the current context is
+responsible for freeing the item.
+
+For example, if a transaction holds but does not dirty a particular
+bli, the commit may drop the refcount to zero. If the bli itself is
+clean, it is also not AIL resident and must be freed at this time.
+The same is true for xfs_trans_brelse(). If the transaction dirties
+a bli and then aborts or an unpin results in an abort due to a log
+I/O error, the last reference count holder is expected to explicitly
+remove the item from the AIL and release it (since an abort means
+filesystem shutdown and metadata writeback will never occur).
+
+This leads to fairly complex checks being replicated in a few
+different places. Since ->iop_unlock() and xfs_trans_brelse() are
+nearly identical, refactor the logic into a common helper that
+implements and documents the semantics in one place. This patch does
+not change behavior.
+
+	Signed-off-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+
+(cherry picked from commit 95808459b110f16b50f03a70ecfa72bb14bd8a96)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_buf_item.c
+#	fs/xfs/xfs_trans_buf.c
+diff --cc fs/xfs/xfs_buf_item.c
+index 8afcfa3ed976,12d8455bfbb2..000000000000
+--- a/fs/xfs/xfs_buf_item.c
++++ b/fs/xfs/xfs_buf_item.c
+@@@ -567,36 -599,14 +610,45 @@@ xfs_buf_item_unlock
+  {
+  	struct xfs_buf_log_item	*bip = BUF_ITEM(lip);
+  	struct xfs_buf		*bp = bip->bli_buf;
+++<<<<<<< HEAD
+ +	bool			aborted = !!(lip->li_flags & XFS_LI_ABORTED);
+ +	bool			hold = !!(bip->bli_flags & XFS_BLI_HOLD);
+ +	bool			dirty = !!(bip->bli_flags & XFS_BLI_DIRTY);
+ +#if defined(DEBUG) || defined(XFS_WARN)
+ +	bool			ordered = !!(bip->bli_flags & XFS_BLI_ORDERED);
+++=======
++ 	bool			released;
++ 	bool			hold = bip->bli_flags & XFS_BLI_HOLD;
++ 	bool			stale = bip->bli_flags & XFS_BLI_STALE;
++ #if defined(DEBUG) || defined(XFS_WARN)
++ 	bool			ordered = bip->bli_flags & XFS_BLI_ORDERED;
++ 	bool			dirty = bip->bli_flags & XFS_BLI_DIRTY;
+++>>>>>>> 95808459b110 (xfs: refactor xfs_buf_log_item reference count handling)
+  #endif
+  
+ +	/* Clear the buffer's association with this transaction. */
+ +	bp->b_transp = NULL;
+ +
+ +	/*
+ +	 * The per-transaction state has been copied above so clear it from the
+ +	 * bli.
+ +	 */
+ +	bip->bli_flags &= ~(XFS_BLI_LOGGED | XFS_BLI_HOLD | XFS_BLI_ORDERED);
+ +
+ +	/*
+ +	 * If the buf item is marked stale, then don't do anything.  We'll
+ +	 * unlock the buffer and free the buf item when the buffer is unpinned
+ +	 * for the last time.
+ +	 */
+ +	if (bip->bli_flags & XFS_BLI_STALE) {
+ +		trace_xfs_buf_item_unlock_stale(bip);
+ +		ASSERT(bip->__bli_format.blf_flags & XFS_BLF_CANCEL);
+ +		if (!aborted) {
+ +			atomic_dec(&bip->bli_refcount);
+ +			return;
+ +		}
+ +	}
+ +
+  	trace_xfs_buf_item_unlock(bip);
+  
+  	/*
+@@@ -611,30 -615,26 +663,51 @@@
+  	 */
+  	ASSERT((!ordered && dirty == xfs_buf_item_dirty_format(bip)) ||
+  	       (ordered && dirty && !xfs_buf_item_dirty_format(bip)));
+++<<<<<<< HEAD
+++=======
++ 	ASSERT(!stale || (bip->__bli_format.blf_flags & XFS_BLF_CANCEL));
+++>>>>>>> 95808459b110 (xfs: refactor xfs_buf_log_item reference count handling)
+  
+  	/*
+ -	 * Clear the buffer's association with this transaction and
+ -	 * per-transaction state from the bli, which has been copied above.
+ +	 * Clean buffers, by definition, cannot be in the AIL. However, aborted
+ +	 * buffers may be in the AIL regardless of dirty state. An aborted
+ +	 * transaction that invalidates a buffer already in the AIL may have
+ +	 * marked it stale and cleared the dirty state, for example.
+ +	 *
+ +	 * Therefore if we are aborting a buffer and we've just taken the last
+ +	 * reference away, we have to check if it is in the AIL before freeing
+ +	 * it. We need to free it in this case, because an aborted transaction
+ +	 * has already shut the filesystem down and this is the last chance we
+ +	 * will have to do so.
+  	 */
+++<<<<<<< HEAD
+ +	if (atomic_dec_and_test(&bip->bli_refcount)) {
+ +		if (aborted) {
+ +			ASSERT(XFS_FORCED_SHUTDOWN(lip->li_mountp));
+ +			xfs_trans_ail_remove(lip, SHUTDOWN_LOG_IO_ERROR);
+ +			xfs_buf_item_relse(bp);
+ +		} else if (!dirty)
+ +			xfs_buf_item_relse(bp);
+ +	}
+ +
+ +	if (!hold)
+ +		xfs_buf_relse(bp);
+++=======
++ 	bp->b_transp = NULL;
++ 	bip->bli_flags &= ~(XFS_BLI_LOGGED | XFS_BLI_HOLD | XFS_BLI_ORDERED);
++ 
++ 	/*
++ 	 * Unref the item and unlock the buffer unless held or stale. Stale
++ 	 * buffers remain locked until final unpin unless the bli is freed by
++ 	 * the unref call. The latter implies shutdown because buffer
++ 	 * invalidation dirties the bli and transaction.
++ 	 */
++ 	released = xfs_buf_item_put(bip);
++ 	if (hold || (stale && !released))
++ 		return;
++ 	ASSERT(!stale || test_bit(XFS_LI_ABORTED, &lip->li_flags));
++ 	xfs_buf_relse(bp);
+++>>>>>>> 95808459b110 (xfs: refactor xfs_buf_log_item reference count handling)
+  }
+  
+  /*
+diff --cc fs/xfs/xfs_trans_buf.c
+index 0621767a06d9,286a287ac57a..000000000000
+--- a/fs/xfs/xfs_trans_buf.c
++++ b/fs/xfs/xfs_trans_buf.c
+@@@ -422,17 -335,14 +422,21 @@@ shutdown_abort
+   */
+  void
+  xfs_trans_brelse(
+ -	struct xfs_trans	*tp,
+ -	struct xfs_buf		*bp)
+ +	xfs_trans_t		*tp,
+ +	xfs_buf_t		*bp)
+  {
+++<<<<<<< HEAD
+ +	struct xfs_buf_log_item	*bip;
+ +	int			freed;
+++=======
++ 	struct xfs_buf_log_item	*bip = bp->b_log_item;
+++>>>>>>> 95808459b110 (xfs: refactor xfs_buf_log_item reference count handling)
+  
+ -	ASSERT(bp->b_transp == tp);
+ -
+ -	if (!tp) {
+ +	/*
+ +	 * Default to a normal brelse() call if the tp is NULL.
+ +	 */
+ +	if (tp == NULL) {
+ +		ASSERT(bp->b_transp == NULL);
+  		xfs_buf_relse(bp);
+  		return;
+  	}
+@@@ -471,49 -369,16 +475,54 @@@
+  	if (bip->bli_flags & XFS_BLI_STALE)
+  		return;
+  
+ +	ASSERT(!(bip->bli_flags & XFS_BLI_LOGGED));
+ +
+++<<<<<<< HEAD
+  	/*
+ -	 * Unlink the log item from the transaction and clear the hold flag, if
+ -	 * set. We wouldn't want the next user of the buffer to get confused.
+ +	 * Free up the log item descriptor tracking the released item.
+  	 */
+ -	ASSERT(!(bip->bli_flags & XFS_BLI_LOGGED));
+  	xfs_trans_del_item(&bip->bli_item);
+ -	bip->bli_flags &= ~XFS_BLI_HOLD;
+  
+ +	/*
+ +	 * Clear the hold flag in the buf log item if it is set.
+ +	 * We wouldn't want the next user of the buffer to
+ +	 * get confused.
+ +	 */
+ +	if (bip->bli_flags & XFS_BLI_HOLD) {
+ +		bip->bli_flags &= ~XFS_BLI_HOLD;
+ +	}
+ +
+ +	/*
+ +	 * Drop our reference to the buf log item.
+ +	 */
+ +	freed = atomic_dec_and_test(&bip->bli_refcount);
+ +
+ +	/*
+ +	 * If the buf item is not tracking data in the log, then we must free it
+ +	 * before releasing the buffer back to the free pool.
+ +	 *
+ +	 * If the fs has shutdown and we dropped the last reference, it may fall
+ +	 * on us to release a (possibly dirty) bli if it never made it to the
+ +	 * AIL (e.g., the aborted unpin already happened and didn't release it
+ +	 * due to our reference). Since we're already shutdown and need xa_lock,
+ +	 * just force remove from the AIL and release the bli here.
+ +	 */
+ +	if (XFS_FORCED_SHUTDOWN(tp->t_mountp) && freed) {
+ +		xfs_trans_ail_remove(&bip->bli_item, SHUTDOWN_LOG_IO_ERROR);
+ +		xfs_buf_item_relse(bp);
+ +	} else if (!(bip->bli_flags & XFS_BLI_DIRTY)) {
+ +/***
+ +		ASSERT(bp->b_pincount == 0);
+ +***/
+ +		ASSERT(atomic_read(&bip->bli_refcount) == 0);
+ +		ASSERT(!(bip->bli_item.li_flags & XFS_LI_IN_AIL));
+ +		ASSERT(!(bip->bli_flags & XFS_BLI_INODE_ALLOC_BUF));
+ +		xfs_buf_item_relse(bp);
+ +	}
+++=======
++ 	/* drop the reference to the bli */
++ 	xfs_buf_item_put(bip);
+++>>>>>>> 95808459b110 (xfs: refactor xfs_buf_log_item reference count handling)
+  
+  	bp->b_transp = NULL;
+  	xfs_buf_relse(bp);
+* Unmerged path fs/xfs/xfs_buf_item.c
+diff --git a/fs/xfs/xfs_buf_item.h b/fs/xfs/xfs_buf_item.h
+index 0febfbbf6ba9..e56728060b34 100644
+--- a/fs/xfs/xfs_buf_item.h
++++ b/fs/xfs/xfs_buf_item.h
+@@ -63,6 +63,7 @@ struct xfs_buf_log_item {
+ 
+ int	xfs_buf_item_init(struct xfs_buf *, struct xfs_mount *);
+ void	xfs_buf_item_relse(struct xfs_buf *);
++bool	xfs_buf_item_put(struct xfs_buf_log_item *);
+ void	xfs_buf_item_log(struct xfs_buf_log_item *, uint, uint);
+ bool	xfs_buf_item_dirty_format(struct xfs_buf_log_item *);
+ void	xfs_buf_attach_iodone(struct xfs_buf *,
+* Unmerged path fs/xfs/xfs_trans_buf.c
