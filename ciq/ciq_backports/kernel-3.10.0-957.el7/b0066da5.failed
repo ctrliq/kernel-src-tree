@@ -1,0 +1,204 @@
+ip_tunnel: Rename & publish init_tunnel_flow
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Petr Machata <petrm@mellanox.com>
+commit b0066da52ea53bae2b4ceed3f47d488df27dab66
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/b0066da5.failed
+
+Initializing struct flowi4 is useful for drivers that need to emulate
+routing decisions made by a tunnel interface. Publish the
+function (appropriately renamed) so that the drivers in question don't
+need to cut'n'paste it around.
+
+	Signed-off-by: Petr Machata <petrm@mellanox.com>
+	Reviewed-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b0066da52ea53bae2b4ceed3f47d488df27dab66)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/ip_tunnel.c
+diff --cc net/ipv4/ip_tunnel.c
+index 0aa050b45075,b2117d89bc83..000000000000
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@@ -288,20 -290,6 +288,23 @@@ failed
+  	return ERR_PTR(err);
+  }
+  
+++<<<<<<< HEAD
+ +static inline void init_tunnel_flow(struct flowi4 *fl4,
+ +				    int proto,
+ +				    __be32 daddr, __be32 saddr,
+ +				    __be32 key, __u8 tos, int oif)
+ +{
+ +	memset(fl4, 0, sizeof(*fl4));
+ +	fl4->flowi4_oif = oif;
+ +	fl4->daddr = daddr;
+ +	fl4->saddr = saddr;
+ +	fl4->flowi4_tos = tos;
+ +	fl4->flowi4_proto = proto;
+ +	fl4->fl4_gre_key = key;
+ +}
+ +
+++=======
+++>>>>>>> b0066da52ea5 (ip_tunnel: Rename & publish init_tunnel_flow)
+  static int ip_tunnel_bind_dev(struct net_device *dev)
+  {
+  	struct net_device *tdev = NULL;
+@@@ -318,9 -306,10 +321,16 @@@
+  		struct flowi4 fl4;
+  		struct rtable *rt;
+  
+++<<<<<<< HEAD
+ +		init_tunnel_flow(&fl4, iph->protocol, iph->daddr,
+ +				 iph->saddr, tunnel->parms.o_key,
+ +				 RT_TOS(iph->tos), tunnel->parms.link);
+++=======
++ 		ip_tunnel_init_flow(&fl4, iph->protocol, iph->daddr,
++ 				    iph->saddr, tunnel->parms.o_key,
++ 				    RT_TOS(iph->tos), tunnel->parms.link,
++ 				    tunnel->fwmark);
+++>>>>>>> b0066da52ea5 (ip_tunnel: Rename & publish init_tunnel_flow)
+  		rt = ip_route_output_key(tunnel->net, &fl4);
+  
+  		if (!IS_ERR(rt)) {
+@@@ -591,6 -539,81 +601,84 @@@ static int tnl_update_pmtu(struct net_d
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void ip_md_tunnel_xmit(struct sk_buff *skb, struct net_device *dev, u8 proto)
++ {
++ 	struct ip_tunnel *tunnel = netdev_priv(dev);
++ 	u32 headroom = sizeof(struct iphdr);
++ 	struct ip_tunnel_info *tun_info;
++ 	const struct ip_tunnel_key *key;
++ 	const struct iphdr *inner_iph;
++ 	struct rtable *rt;
++ 	struct flowi4 fl4;
++ 	__be16 df = 0;
++ 	u8 tos, ttl;
++ 
++ 	tun_info = skb_tunnel_info(skb);
++ 	if (unlikely(!tun_info || !(tun_info->mode & IP_TUNNEL_INFO_TX) ||
++ 		     ip_tunnel_info_af(tun_info) != AF_INET))
++ 		goto tx_error;
++ 	key = &tun_info->key;
++ 	memset(&(IPCB(skb)->opt), 0, sizeof(IPCB(skb)->opt));
++ 	inner_iph = (const struct iphdr *)skb_inner_network_header(skb);
++ 	tos = key->tos;
++ 	if (tos == 1) {
++ 		if (skb->protocol == htons(ETH_P_IP))
++ 			tos = inner_iph->tos;
++ 		else if (skb->protocol == htons(ETH_P_IPV6))
++ 			tos = ipv6_get_dsfield((const struct ipv6hdr *)inner_iph);
++ 	}
++ 	ip_tunnel_init_flow(&fl4, proto, key->u.ipv4.dst, key->u.ipv4.src, 0,
++ 			    RT_TOS(tos), tunnel->parms.link, tunnel->fwmark);
++ 	if (tunnel->encap.type != TUNNEL_ENCAP_NONE)
++ 		goto tx_error;
++ 	rt = ip_route_output_key(tunnel->net, &fl4);
++ 	if (IS_ERR(rt)) {
++ 		dev->stats.tx_carrier_errors++;
++ 		goto tx_error;
++ 	}
++ 	if (rt->dst.dev == dev) {
++ 		ip_rt_put(rt);
++ 		dev->stats.collisions++;
++ 		goto tx_error;
++ 	}
++ 	tos = ip_tunnel_ecn_encap(tos, inner_iph, skb);
++ 	ttl = key->ttl;
++ 	if (ttl == 0) {
++ 		if (skb->protocol == htons(ETH_P_IP))
++ 			ttl = inner_iph->ttl;
++ 		else if (skb->protocol == htons(ETH_P_IPV6))
++ 			ttl = ((const struct ipv6hdr *)inner_iph)->hop_limit;
++ 		else
++ 			ttl = ip4_dst_hoplimit(&rt->dst);
++ 	}
++ 	if (key->tun_flags & TUNNEL_DONT_FRAGMENT)
++ 		df = htons(IP_DF);
++ 	else if (skb->protocol == htons(ETH_P_IP))
++ 		df = inner_iph->frag_off & htons(IP_DF);
++ 	headroom += LL_RESERVED_SPACE(rt->dst.dev) + rt->dst.header_len;
++ 	if (headroom > dev->needed_headroom)
++ 		dev->needed_headroom = headroom;
++ 
++ 	if (skb_cow_head(skb, dev->needed_headroom)) {
++ 		ip_rt_put(rt);
++ 		goto tx_dropped;
++ 	}
++ 	iptunnel_xmit(NULL, rt, skb, fl4.saddr, fl4.daddr, proto, tos, ttl,
++ 		      df, !net_eq(tunnel->net, dev_net(dev)));
++ 	return;
++ tx_error:
++ 	dev->stats.tx_errors++;
++ 	goto kfree;
++ tx_dropped:
++ 	dev->stats.tx_dropped++;
++ kfree:
++ 	kfree_skb(skb);
++ }
++ EXPORT_SYMBOL_GPL(ip_md_tunnel_xmit);
++ 
+++>>>>>>> b0066da52ea5 (ip_tunnel: Rename & publish init_tunnel_flow)
+  void ip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev,
+  		    const struct iphdr *tnl_params, u8 protocol)
+  {
+@@@ -671,8 -694,16 +759,21 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	init_tunnel_flow(&fl4, protocol, dst, tnl_params->saddr,
+ +			 tunnel->parms.o_key, RT_TOS(tos), tunnel->parms.link);
+++=======
++ 	if (tunnel->fwmark) {
++ 		ip_tunnel_init_flow(&fl4, protocol, dst, tnl_params->saddr,
++ 				    tunnel->parms.o_key, RT_TOS(tos),
++ 				    tunnel->parms.link, tunnel->fwmark);
++ 	}
++ 	else {
++ 		ip_tunnel_init_flow(&fl4, protocol, dst, tnl_params->saddr,
++ 				    tunnel->parms.o_key, RT_TOS(tos),
++ 				    tunnel->parms.link, skb->mark);
++ 	}
+++>>>>>>> b0066da52ea5 (ip_tunnel: Rename & publish init_tunnel_flow)
+  
+  	if (ip_tunnel_encap(skb, tunnel, &protocol, &fl4) < 0)
+  		goto tx_error;
+diff --git a/include/net/ip_tunnels.h b/include/net/ip_tunnels.h
+index 56ec31bea5c4..fc001c070f63 100644
+--- a/include/net/ip_tunnels.h
++++ b/include/net/ip_tunnels.h
+@@ -271,6 +271,22 @@ static inline __be32 tunnel_id_to_key32(__be64 tun_id)
+ 
+ #ifdef CONFIG_INET
+ 
++static inline void ip_tunnel_init_flow(struct flowi4 *fl4,
++				       int proto,
++				       __be32 daddr, __be32 saddr,
++				       __be32 key, __u8 tos, int oif,
++				       __u32 mark)
++{
++	memset(fl4, 0, sizeof(*fl4));
++	fl4->flowi4_oif = oif;
++	fl4->daddr = daddr;
++	fl4->saddr = saddr;
++	fl4->flowi4_tos = tos;
++	fl4->flowi4_proto = proto;
++	fl4->fl4_gre_key = key;
++	fl4->flowi4_mark = mark;
++}
++
+ int ip_tunnel_init(struct net_device *dev);
+ void ip_tunnel_uninit(struct net_device *dev);
+ void  ip_tunnel_dellink(struct net_device *dev, struct list_head *head);
+* Unmerged path net/ipv4/ip_tunnel.c
