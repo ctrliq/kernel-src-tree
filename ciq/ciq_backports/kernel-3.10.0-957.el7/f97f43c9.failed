@@ -1,0 +1,128 @@
+RDMA/srpt: Fix RCU debug build error
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Leon Romanovsky <leonro@mellanox.com>
+commit f97f43c9ed1dd9d1f7afc758fc31a619752d08f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/f97f43c9.failed
+
+Combination of CONFIG_DEBUG_OBJECTS_RCU_HEAD=y and
+CONFIG_INFINIBAND_SRPT=m produces the following build error.
+
+ERROR: "init_rcu_head" [drivers/infiniband/ulp/srpt/ib_srpt.ko] undefined!
+make[1]: *** [scripts/Makefile.modpost:92: __modpost] Error 1
+make: *** [Makefile:1216: modules] Error 2
+
+The reason to it that init_rcu_head() is not exported and not supposed
+to be used in modules. It is needed for dynamic initialization of
+statically allocated rcu_head structures.
+
+Fixes: 795bc112cd5a ("IB/srpt: Make it safe to use RCU for srpt_device.rch_list")
+Fixes: a11253142e6d ("IB/srpt: Rework multi-channel support")
+	Signed-off-by: Bart Van Assche <bart.vanassche@wdc.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit f97f43c9ed1dd9d1f7afc758fc31a619752d08f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/srpt/ib_srpt.c
+diff --cc drivers/infiniband/ulp/srpt/ib_srpt.c
+index 70e5ec349271,0373b7c40902..000000000000
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.c
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.c
+@@@ -1880,8 -1897,67 +1880,72 @@@ static bool srpt_disconnect_ch_sync(str
+  		pr_info("%s(%s-%d state %d): still waiting ...\n", __func__,
+  			ch->sess_name, ch->qp->qp_num, ch->state);
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&sport->mutex);
+ +	return ret == 0;
+++=======
++ }
++ 
++ static void __srpt_close_all_ch(struct srpt_port *sport)
++ {
++ 	struct srpt_nexus *nexus;
++ 	struct srpt_rdma_ch *ch;
++ 
++ 	lockdep_assert_held(&sport->mutex);
++ 
++ 	list_for_each_entry(nexus, &sport->nexus_list, entry) {
++ 		list_for_each_entry(ch, &nexus->ch_list, list) {
++ 			if (srpt_disconnect_ch(ch) >= 0)
++ 				pr_info("Closing channel %s-%d because target %s_%d has been disabled\n",
++ 					ch->sess_name, ch->qp->qp_num,
++ 					sport->sdev->device->name, sport->port);
++ 			srpt_close_ch(ch);
++ 		}
++ 	}
++ }
++ 
++ /*
++  * Look up (i_port_id, t_port_id) in sport->nexus_list. Create an entry if
++  * it does not yet exist.
++  */
++ static struct srpt_nexus *srpt_get_nexus(struct srpt_port *sport,
++ 					 const u8 i_port_id[16],
++ 					 const u8 t_port_id[16])
++ {
++ 	struct srpt_nexus *nexus = NULL, *tmp_nexus = NULL, *n;
++ 
++ 	for (;;) {
++ 		mutex_lock(&sport->mutex);
++ 		list_for_each_entry(n, &sport->nexus_list, entry) {
++ 			if (memcmp(n->i_port_id, i_port_id, 16) == 0 &&
++ 			    memcmp(n->t_port_id, t_port_id, 16) == 0) {
++ 				nexus = n;
++ 				break;
++ 			}
++ 		}
++ 		if (!nexus && tmp_nexus) {
++ 			list_add_tail_rcu(&tmp_nexus->entry,
++ 					  &sport->nexus_list);
++ 			swap(nexus, tmp_nexus);
++ 		}
++ 		mutex_unlock(&sport->mutex);
++ 
++ 		if (nexus)
++ 			break;
++ 		tmp_nexus = kzalloc(sizeof(*nexus), GFP_KERNEL);
++ 		if (!tmp_nexus) {
++ 			nexus = ERR_PTR(-ENOMEM);
++ 			break;
++ 		}
++ 		INIT_LIST_HEAD(&tmp_nexus->ch_list);
++ 		memcpy(tmp_nexus->i_port_id, i_port_id, 16);
++ 		memcpy(tmp_nexus->t_port_id, t_port_id, 16);
++ 	}
++ 
++ 	kfree(tmp_nexus);
++ 
++ 	return nexus;
+++>>>>>>> f97f43c9ed1d (RDMA/srpt: Fix RCU debug build error)
+  }
+  
+  static void srpt_set_enabled(struct srpt_port *sport, bool enabled)
+@@@ -2080,14 -2109,13 +2144,13 @@@ static int srpt_cm_req_recv(struct ib_c
+  		goto reject;
+  	}
+  
+- 	init_rcu_head(&ch->rcu);
+  	kref_init(&ch->kref);
+ -	ch->pkey = be16_to_cpu(pkey);
+ -	ch->nexus = nexus;
+  	ch->zw_cqe.done = srpt_zerolength_write_done;
+  	INIT_WORK(&ch->release_work, srpt_release_channel_work);
+ -	ch->sport = sport;
+ -	ch->ib_cm.cm_id = cm_id;
+ +	memcpy(ch->i_port_id, req->initiator_port_id, 16);
+ +	memcpy(ch->t_port_id, req->target_port_id, 16);
+ +	ch->sport = &sdev->port[param->port - 1];
+ +	ch->cm_id = cm_id;
+  	cm_id->context = ch;
+  	/*
+  	 * ch->rq_size should be at least as large as the initiator queue
+* Unmerged path drivers/infiniband/ulp/srpt/ib_srpt.c
