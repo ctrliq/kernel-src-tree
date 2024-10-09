@@ -1,0 +1,278 @@
+net: xdp: make the stack take care of the tear down
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [netdrv] xdp: make the stack take care of the tear down (John Linville) [1557410]
+Rebuild_FUZZ: 94.85%
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit bd0b2e7fe611953470ec7c533b455fb2abd382cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/bd0b2e7f.failed
+
+Since day one of XDP drivers had to remember to free the program
+on the remove path.  This leads to code duplication and is error
+prone.  Make the stack query the installed programs on unregister
+and if something is installed, remove the program.  Freeing of
+program attached to XDP generic is moved from free_netdev() as well.
+
+Because the remove will now be called before notifiers are
+invoked, BPF offload state of the program will not get destroyed
+before uninstall.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit bd0b2e7fe611953470ec7c533b455fb2abd382cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/netronome/nfp/bpf/main.c
+#	net/core/dev.c
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index d1e80d4c22df,8c1dd60eab6f..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -7784,8 -7801,6 +7784,11 @@@ static void bnxt_remove_one(struct pci_
+  	kfree(bp->edev);
+  	bp->edev = NULL;
+  	bnxt_cleanup_pci(bp);
+++<<<<<<< HEAD
+ +	if (bp->xdp_prog)
+ +		bpf_prog_put(bp->xdp_prog);
+++=======
+++>>>>>>> bd0b2e7fe611 (net: xdp: make the stack take care of the tear down)
+  	free_netdev(dev);
+  }
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index f9f9996c2b9e,0f5c012de52e..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -4021,7 -4308,6 +4021,10 @@@ static void mlx5e_nic_cleanup(struct ml
+  {
+  	mlx5e_ipsec_cleanup(priv);
+  	mlx5e_vxlan_cleanup(priv);
+++<<<<<<< HEAD
+ +
+++=======
+++>>>>>>> bd0b2e7fe611 (net: xdp: make the stack take care of the tear down)
+  }
+  
+  static int mlx5e_init_nic_rx(struct mlx5e_priv *priv)
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/main.c
+index 4ca14182b178,54bfd7846f6d..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.c
+@@@ -85,33 -82,61 +85,91 @@@ static const char *nfp_bpf_extra_cap(st
+  	return nfp_net_ebpf_capable(nn) ? "BPF" : "";
+  }
+  
+++<<<<<<< HEAD
+ +static int
+ +nfp_bpf_vnic_alloc(struct nfp_app *app, struct nfp_net *nn, unsigned int id)
+ +{
+ +	struct nfp_net_bpf_priv *priv;
+ +	int ret;
+ +
+ +	priv = kmalloc(sizeof(*priv), GFP_KERNEL);
+ +	if (!priv)
+ +		return -ENOMEM;
+ +
+ +	nn->app_priv = priv;
+ +	spin_lock_init(&priv->rx_filter_lock);
+ +	setup_timer(&priv->rx_filter_stats_timer,
+ +		    nfp_net_filter_stats_timer, (unsigned long)nn);
+ +
+ +	ret = nfp_app_nic_vnic_alloc(app, nn, id);
+ +	if (ret)
+ +		kfree(priv);
+ +
+ +	return ret;
+ +}
+ +
+ +static void nfp_bpf_vnic_free(struct nfp_app *app, struct nfp_net *nn)
+ +{
+ +	if (nn->dp.bpf_offload_xdp)
+ +		nfp_bpf_xdp_offload(app, nn, NULL);
+ +	kfree(nn->app_priv);
+++=======
++ static int nfp_bpf_setup_tc_block_cb(enum tc_setup_type type,
++ 				     void *type_data, void *cb_priv)
++ {
++ 	struct tc_cls_bpf_offload *cls_bpf = type_data;
++ 	struct nfp_net *nn = cb_priv;
++ 
++ 	if (type != TC_SETUP_CLSBPF ||
++ 	    !tc_can_offload(nn->dp.netdev) ||
++ 	    !nfp_net_ebpf_capable(nn) ||
++ 	    cls_bpf->common.protocol != htons(ETH_P_ALL) ||
++ 	    cls_bpf->common.chain_index)
++ 		return -EOPNOTSUPP;
++ 	if (nn->dp.bpf_offload_xdp)
++ 		return -EBUSY;
++ 
++ 	/* Only support TC direct action */
++ 	if (!cls_bpf->exts_integrated ||
++ 	    tcf_exts_has_actions(cls_bpf->exts)) {
++ 		nn_err(nn, "only direct action with no legacy actions supported\n");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	switch (cls_bpf->command) {
++ 	case TC_CLSBPF_REPLACE:
++ 		return nfp_net_bpf_offload(nn, cls_bpf->prog, true);
++ 	case TC_CLSBPF_ADD:
++ 		return nfp_net_bpf_offload(nn, cls_bpf->prog, false);
++ 	case TC_CLSBPF_DESTROY:
++ 		return nfp_net_bpf_offload(nn, NULL, true);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int nfp_bpf_setup_tc_block(struct net_device *netdev,
++ 				  struct tc_block_offload *f)
++ {
++ 	struct nfp_net *nn = netdev_priv(netdev);
++ 
++ 	if (f->binder_type != TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++ 		return -EOPNOTSUPP;
++ 
++ 	switch (f->command) {
++ 	case TC_BLOCK_BIND:
++ 		return tcf_block_cb_register(f->block,
++ 					     nfp_bpf_setup_tc_block_cb,
++ 					     nn, nn);
++ 	case TC_BLOCK_UNBIND:
++ 		tcf_block_cb_unregister(f->block,
++ 					nfp_bpf_setup_tc_block_cb,
++ 					nn);
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
+++>>>>>>> bd0b2e7fe611 (net: xdp: make the stack take care of the tear down)
+  }
+  
+  static int nfp_bpf_setup_tc(struct nfp_app *app, struct net_device *netdev,
+@@@ -147,8 -161,7 +205,12 @@@ const struct nfp_app_type app_bpf = 
+  
+  	.extra_cap	= nfp_bpf_extra_cap,
+  
+++<<<<<<< HEAD
+ +	.vnic_alloc	= nfp_bpf_vnic_alloc,
+ +	.vnic_free	= nfp_bpf_vnic_free,
+++=======
++ 	.vnic_alloc	= nfp_app_nic_vnic_alloc,
+++>>>>>>> bd0b2e7fe611 (net: xdp: make the stack take care of the tear down)
+  
+  	.setup_tc	= nfp_bpf_setup_tc,
+  	.tc_busy	= nfp_bpf_tc_busy,
+diff --cc net/core/dev.c
+index 2401cdc6aa09,6bea8931bb62..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -7007,6 -7073,64 +7007,67 @@@ int dev_change_proto_down(struct net_de
+  }
+  EXPORT_SYMBOL(dev_change_proto_down);
+  
+++<<<<<<< HEAD
+++=======
++ void __dev_xdp_query(struct net_device *dev, bpf_op_t bpf_op,
++ 		     struct netdev_bpf *xdp)
++ {
++ 	memset(xdp, 0, sizeof(*xdp));
++ 	xdp->command = XDP_QUERY_PROG;
++ 
++ 	/* Query must always succeed. */
++ 	WARN_ON(bpf_op(dev, xdp) < 0);
++ }
++ 
++ static u8 __dev_xdp_attached(struct net_device *dev, bpf_op_t bpf_op)
++ {
++ 	struct netdev_bpf xdp;
++ 
++ 	__dev_xdp_query(dev, bpf_op, &xdp);
++ 
++ 	return xdp.prog_attached;
++ }
++ 
++ static int dev_xdp_install(struct net_device *dev, bpf_op_t bpf_op,
++ 			   struct netlink_ext_ack *extack, u32 flags,
++ 			   struct bpf_prog *prog)
++ {
++ 	struct netdev_bpf xdp;
++ 
++ 	memset(&xdp, 0, sizeof(xdp));
++ 	if (flags & XDP_FLAGS_HW_MODE)
++ 		xdp.command = XDP_SETUP_PROG_HW;
++ 	else
++ 		xdp.command = XDP_SETUP_PROG;
++ 	xdp.extack = extack;
++ 	xdp.flags = flags;
++ 	xdp.prog = prog;
++ 
++ 	return bpf_op(dev, &xdp);
++ }
++ 
++ static void dev_xdp_uninstall(struct net_device *dev)
++ {
++ 	struct netdev_bpf xdp;
++ 	bpf_op_t ndo_bpf;
++ 
++ 	/* Remove generic XDP */
++ 	WARN_ON(dev_xdp_install(dev, generic_xdp_install, NULL, 0, NULL));
++ 
++ 	/* Remove from the driver */
++ 	ndo_bpf = dev->netdev_ops->ndo_bpf;
++ 	if (!ndo_bpf)
++ 		return;
++ 
++ 	__dev_xdp_query(dev, ndo_bpf, &xdp);
++ 	if (xdp.prog_attached == XDP_ATTACHED_NONE)
++ 		return;
++ 
++ 	/* Program removal should always succeed */
++ 	WARN_ON(dev_xdp_install(dev, ndo_bpf, NULL, xdp.prog_flags, NULL));
++ }
++ 
+++>>>>>>> bd0b2e7fe611 (net: xdp: make the stack take care of the tear down)
+  /**
+   *	dev_change_xdp_fd - set or clear a bpf program for a device rx path
+   *	@dev: device
+@@@ -7098,10 -7261,11 +7159,11 @@@ static void rollback_registered_many(st
+  		/* Shutdown queueing discipline. */
+  		dev_shutdown(dev);
+  
++ 		dev_xdp_uninstall(dev);
+  
+  		/* Notify protocols, that we are about to destroy
+ -		 * this device. They should clean all the things.
+ -		 */
+ +		   this device. They should clean all the things.
+ +		*/
+  		call_netdevice_notifiers(NETDEV_UNREGISTER, dev);
+  
+  		if (!dev->rtnl_link_ops ||
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/main.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+index 2ea7963a05ef..a6bcd7174b7c 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_common.c
+@@ -3583,9 +3583,6 @@ struct nfp_net *nfp_net_alloc(struct pci_dev *pdev, bool needs_netdev,
+  */
+ void nfp_net_free(struct nfp_net *nn)
+ {
+-	if (nn->xdp_prog)
+-		bpf_prog_put(nn->xdp_prog);
+-
+ 	if (nn->dp.netdev)
+ 		free_netdev(nn->dp.netdev);
+ 	else
+* Unmerged path net/core/dev.c
