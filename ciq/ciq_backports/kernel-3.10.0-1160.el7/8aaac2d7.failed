@@ -1,0 +1,131 @@
+scsi: qla2xxx: Fix stuck login session using prli_pend_timer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Quinn Tran <qutran@marvell.com>
+commit 8aaac2d7da873aebeba92c666f82c00bbd74aaf9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/8aaac2d7.failed
+
+Session is stuck if driver sees FW has received a PRLI. Driver allows FW to
+finish with processing of PRLI by checking back with FW at a later time to
+see if the PRLI has finished. Instead, driver failed to push forward after
+re-checking PRLI completion.
+
+Fixes: ce0ba496dccf ("scsi: qla2xxx: Fix stuck login session")
+	Cc: stable@vger.kernel.org # 5.3
+Link: https://lore.kernel.org/r/20191217220617.28084-9-hmadhani@marvell.com
+	Signed-off-by: Quinn Tran <qutran@marvell.com>
+	Signed-off-by: Himanshu Madhani <hmadhani@marvell.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 8aaac2d7da873aebeba92c666f82c00bbd74aaf9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_def.h
+#	drivers/scsi/qla2xxx/qla_target.c
+diff --cc drivers/scsi/qla2xxx/qla_def.h
+index f0eeda17e1d9,90dae8f2d080..000000000000
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@@ -2369,6 -2401,8 +2369,11 @@@ typedef struct fc_port 
+  	unsigned int id_changed:1;
+  	unsigned int scan_needed:1;
+  	unsigned int n2n_flag:1;
+++<<<<<<< HEAD
+++=======
++ 	unsigned int explicit_logout:1;
++ 	unsigned int prli_pend_timer:1;
+++>>>>>>> 8aaac2d7da87 (scsi: qla2xxx: Fix stuck login session using prli_pend_timer)
+  
+  	struct completion nvme_del_done;
+  	uint32_t nvme_prli_service_param;
+diff --cc drivers/scsi/qla2xxx/qla_target.c
+index 2f7baa14d83f,0ef76743a26d..000000000000
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@@ -1279,7 -1258,8 +1279,12 @@@ void qlt_schedule_sess_for_deletion(str
+  	sess->deleted = QLA_SESS_DELETION_IN_PROGRESS;
+  	spin_unlock_irqrestore(&sess->vha->work_lock, flags);
+  
+++<<<<<<< HEAD
+ +	sess->disc_state = DSC_DELETE_PEND;
+++=======
++ 	sess->prli_pend_timer = 0;
++ 	qla2x00_set_fcport_disc_state(sess, DSC_DELETE_PEND);
+++>>>>>>> 8aaac2d7da87 (scsi: qla2xxx: Fix stuck login session using prli_pend_timer)
+  
+  	qla24xx_chk_fcp_state(sess);
+  
+* Unmerged path drivers/scsi/qla2xxx/qla_def.h
+diff --git a/drivers/scsi/qla2xxx/qla_init.c b/drivers/scsi/qla2xxx/qla_init.c
+index f980b85d84d4..bc925d0e3679 100644
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@ -699,7 +699,7 @@ static void qla24xx_handle_gnl_done_event(scsi_qla_host_t *vha,
+ 	port_id_t id;
+ 	u64 wwn;
+ 	u16 data[2];
+-	u8 current_login_state;
++	u8 current_login_state, nvme_cls;
+ 
+ 	fcport = ea->fcport;
+ 	ql_dbg(ql_dbg_disc, vha, 0xffff,
+@@ -758,10 +758,17 @@ static void qla24xx_handle_gnl_done_event(scsi_qla_host_t *vha,
+ 
+ 		loop_id = le16_to_cpu(e->nport_handle);
+ 		loop_id = (loop_id & 0x7fff);
+-		if (NVME_TARGET(vha->hw, fcport))
+-			current_login_state = e->current_login_state >> 4;
+-		else
+-			current_login_state = e->current_login_state & 0xf;
++		nvme_cls = e->current_login_state >> 4;
++		current_login_state = e->current_login_state & 0xf;
++
++		if (PRLI_PHASE(nvme_cls)) {
++			current_login_state = nvme_cls;
++			fcport->fc4_type &= ~FS_FC4TYPE_FCP;
++			fcport->fc4_type |= FS_FC4TYPE_NVME;
++		} else if (PRLI_PHASE(current_login_state)) {
++			fcport->fc4_type |= FS_FC4TYPE_FCP;
++			fcport->fc4_type &= ~FS_FC4TYPE_NVME;
++		}
+ 
+ 		ql_dbg(ql_dbg_disc, vha, 0x20e2,
+ 		    "%s found %8phC CLS [%x|%x] fc4_type %d ID[%06x|%06x] lid[%d|%d]\n",
+@@ -1246,12 +1253,19 @@ qla24xx_async_prli(struct scsi_qla_host *vha, fc_port_t *fcport)
+ 	struct srb_iocb *lio;
+ 	int rval = QLA_FUNCTION_FAILED;
+ 
+-	if (!vha->flags.online)
++	if (!vha->flags.online) {
++		ql_dbg(ql_dbg_disc, vha, 0xffff, "%s %d %8phC exit\n",
++		    __func__, __LINE__, fcport->port_name);
+ 		return rval;
++	}
+ 
+-	if (fcport->fw_login_state == DSC_LS_PLOGI_PEND ||
+-	    fcport->fw_login_state == DSC_LS_PRLI_PEND)
++	if ((fcport->fw_login_state == DSC_LS_PLOGI_PEND ||
++	    fcport->fw_login_state == DSC_LS_PRLI_PEND) &&
++	    qla_dual_mode_enabled(vha)) {
++		ql_dbg(ql_dbg_disc, vha, 0xffff, "%s %d %8phC exit\n",
++		    __func__, __LINE__, fcport->port_name);
+ 		return rval;
++	}
+ 
+ 	sp = qla2x00_get_sp(vha, fcport, GFP_KERNEL);
+ 	if (!sp)
+@@ -1630,6 +1644,10 @@ int qla24xx_fcport_handle_login(struct scsi_qla_host *vha, fc_port_t *fcport)
+ 			break;
+ 		default:
+ 			if (fcport->login_pause) {
++				ql_dbg(ql_dbg_disc, vha, 0x20d8,
++				    "%s %d %8phC exit\n",
++				    __func__, __LINE__,
++				    fcport->port_name);
+ 				fcport->last_rscn_gen = fcport->rscn_gen;
+ 				fcport->last_login_gen = fcport->login_gen;
+ 				set_bit(RELOGIN_NEEDED, &vha->dpc_flags);
+* Unmerged path drivers/scsi/qla2xxx/qla_target.c
