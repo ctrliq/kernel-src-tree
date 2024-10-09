@@ -1002,14 +1002,6 @@ static void wait_barrier(struct r1conf *conf, sector_t sector_nr)
 	_wait_barrier(conf, idx);
 }
 
-static void wait_all_barriers(struct r1conf *conf)
-{
-	int idx;
-
-	for (idx = 0; idx < BARRIER_BUCKETS_NR; idx++)
-		_wait_barrier(conf, idx);
-}
-
 static void _allow_barrier(struct r1conf *conf, int idx)
 {
 	atomic_dec(&conf->nr_pending[idx]);
@@ -1021,14 +1013,6 @@ static void allow_barrier(struct r1conf *conf, sector_t sector_nr)
 	int idx = sector_to_idx(sector_nr);
 
 	_allow_barrier(conf, idx);
-}
-
-static void allow_all_barriers(struct r1conf *conf)
-{
-	int idx;
-
-	for (idx = 0; idx < BARRIER_BUCKETS_NR; idx++)
-		_allow_barrier(conf, idx);
 }
 
 /* conf->resync_lock should be held */
@@ -1643,8 +1627,12 @@ static void print_conf(struct r1conf *conf)
 
 static void close_sync(struct r1conf *conf)
 {
-	wait_all_barriers(conf);
-	allow_all_barriers(conf);
+	int idx;
+
+	for (idx = 0; idx < BARRIER_BUCKETS_NR; idx++) {
+		_wait_barrier(conf, idx);
+		_allow_barrier(conf, idx);
+	}
 
 	mempool_destroy(conf->r1buf_pool);
 	conf->r1buf_pool = NULL;
