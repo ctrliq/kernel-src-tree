@@ -1,0 +1,137 @@
+thunderbolt: Mask ring interrupt properly when polling starts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [thunderbolt] Mask ring interrupt properly when polling starts (Jarod Wilson) [1495229]
+Rebuild_FUZZ: 88.07%
+commit-author Mika Westerberg <mika.westerberg@linux.intel.com>
+commit 74657181e7c449351d1ad28cf43941bc333e1bd6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/74657181.failed
+
+When ring enters polling mode we are expected to mask the ring interrupt
+before the callback is called. However, the current code actually
+unmasks it probably because of a copy-paste mistake.
+
+Mask the interrupt properly from now on.
+
+Fixes: 4ffe722eefcb ("thunderbolt: Add polling mode for rings")
+	Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+	Acked-by: Yehezkel Bernat <yehezkel.bernat@intel.com>
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 74657181e7c449351d1ad28cf43941bc333e1bd6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/thunderbolt/nhi.c
+diff --cc drivers/thunderbolt/nhi.c
+index 8a7a3d0133f9,f45bcbc63738..000000000000
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@@ -274,9 -271,100 +274,103 @@@ int __ring_enqueue(struct tb_ring *ring
+  	} else {
+  		ret = -ESHUTDOWN;
+  	}
+ -	spin_unlock_irqrestore(&ring->lock, flags);
+ +	mutex_unlock(&ring->lock);
+  	return ret;
+  }
+++<<<<<<< HEAD
+++=======
++ EXPORT_SYMBOL_GPL(__tb_ring_enqueue);
++ 
++ /**
++  * tb_ring_poll() - Poll one completed frame from the ring
++  * @ring: Ring to poll
++  *
++  * This function can be called when @start_poll callback of the @ring
++  * has been called. It will read one completed frame from the ring and
++  * return it to the caller. Returns %NULL if there is no more completed
++  * frames.
++  */
++ struct ring_frame *tb_ring_poll(struct tb_ring *ring)
++ {
++ 	struct ring_frame *frame = NULL;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&ring->lock, flags);
++ 	if (!ring->running)
++ 		goto unlock;
++ 	if (ring_empty(ring))
++ 		goto unlock;
++ 
++ 	if (ring->descriptors[ring->tail].flags & RING_DESC_COMPLETED) {
++ 		frame = list_first_entry(&ring->in_flight, typeof(*frame),
++ 					 list);
++ 		list_del_init(&frame->list);
++ 
++ 		if (!ring->is_tx) {
++ 			frame->size = ring->descriptors[ring->tail].length;
++ 			frame->eof = ring->descriptors[ring->tail].eof;
++ 			frame->sof = ring->descriptors[ring->tail].sof;
++ 			frame->flags = ring->descriptors[ring->tail].flags;
++ 		}
++ 
++ 		ring->tail = (ring->tail + 1) % ring->size;
++ 	}
++ 
++ unlock:
++ 	spin_unlock_irqrestore(&ring->lock, flags);
++ 	return frame;
++ }
++ EXPORT_SYMBOL_GPL(tb_ring_poll);
++ 
++ static void __ring_interrupt_mask(struct tb_ring *ring, bool mask)
++ {
++ 	int idx = ring_interrupt_index(ring);
++ 	int reg = REG_RING_INTERRUPT_BASE + idx / 32 * 4;
++ 	int bit = idx % 32;
++ 	u32 val;
++ 
++ 	val = ioread32(ring->nhi->iobase + reg);
++ 	if (mask)
++ 		val &= ~BIT(bit);
++ 	else
++ 		val |= BIT(bit);
++ 	iowrite32(val, ring->nhi->iobase + reg);
++ }
++ 
++ /* Both @nhi->lock and @ring->lock should be held */
++ static void __ring_interrupt(struct tb_ring *ring)
++ {
++ 	if (!ring->running)
++ 		return;
++ 
++ 	if (ring->start_poll) {
++ 		__ring_interrupt_mask(ring, true);
++ 		ring->start_poll(ring->poll_data);
++ 	} else {
++ 		schedule_work(&ring->work);
++ 	}
++ }
++ 
++ /**
++  * tb_ring_poll_complete() - Re-start interrupt for the ring
++  * @ring: Ring to re-start the interrupt
++  *
++  * This will re-start (unmask) the ring interrupt once the user is done
++  * with polling.
++  */
++ void tb_ring_poll_complete(struct tb_ring *ring)
++ {
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&ring->nhi->lock, flags);
++ 	spin_lock(&ring->lock);
++ 	if (ring->start_poll)
++ 		__ring_interrupt_mask(ring, false);
++ 	spin_unlock(&ring->lock);
++ 	spin_unlock_irqrestore(&ring->nhi->lock, flags);
++ }
++ EXPORT_SYMBOL_GPL(tb_ring_poll_complete);
+++>>>>>>> 74657181e7c4 (thunderbolt: Mask ring interrupt properly when polling starts)
+  
+  static irqreturn_t ring_msix(int irq, void *data)
+  {
+* Unmerged path drivers/thunderbolt/nhi.c
