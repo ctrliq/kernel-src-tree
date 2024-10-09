@@ -1,0 +1,128 @@
+IB/ipoib: Fix sysfs Pkey create<->remove possible deadlock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Shalom Lagziel <shaloml@mellanox.com>
+commit 9c6f42e9254150d2772242d9f8bd8d0b7b7431ff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/9c6f42e9.failed
+
+A possible ABBA lock can happen with RTNL and vlan_rwsem.
+For example:
+
+Flow A: Device Flush
+	__ipoib_ib_dev_flush
+	down_read(vlan_rwsem) 			// Lock A
+	ipoib_flush_ah
+	flush_workqueue(priv->wq) 		// Wait for completion
+	A work on shared WQ (Mcast carrier)
+		ipoib_mcast_carrier_on_task
+		while (!rtnl_trylock())         // Wait for lock B
+
+Flow B: Sysfs PKEY delete
+	ipoib_vlan_delete
+	lock(RTNL) 				// Lock B
+	down_write(vlan_rwsem) 			// Wait for lock A
+
+This can happen with PKEY creates as well. The solution is to release
+the RTNL lock in sysfs functions in case it is not possible to lock
+VLAN RW semaphore and reset the SYS call.
+
+Fixes: 69956d83267e ("IB/ipoib: Sync between remove_one to sysfs calls that use rtnl_lock")
+	Signed-off-by: Shalom Lagziel <shaloml@mellanox.com>
+	Signed-off-by: Alex Vesker <valex@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leon@kernel.org>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 9c6f42e9254150d2772242d9f8bd8d0b7b7431ff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+diff --cc drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+index a69df126283b,e01c58edca15..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+@@@ -131,14 -132,26 +131,35 @@@ int ipoib_vlan_add(struct net_device *p
+  
+  	snprintf(intf_name, sizeof intf_name, "%s.%04x",
+  		 ppriv->dev->name, pkey);
+++<<<<<<< HEAD
+ +	priv = ipoib_intf_alloc(intf_name);
+ +	if (!priv)
+ +		return -ENOMEM;
+ +
+ +	if (!rtnl_trylock())
+ +		return restart_syscall();
+++=======
+  
+- 	down_write(&ppriv->vlan_rwsem);
++ 	if (!mutex_trylock(&ppriv->sysfs_mutex))
++ 		return restart_syscall();
++ 
++ 	if (!rtnl_trylock()) {
++ 		mutex_unlock(&ppriv->sysfs_mutex);
++ 		return restart_syscall();
++ 	}
++ 
++ 	if (!down_write_trylock(&ppriv->vlan_rwsem)) {
++ 		rtnl_unlock();
++ 		mutex_unlock(&ppriv->sysfs_mutex);
++ 		return restart_syscall();
++ 	}
+++>>>>>>> 9c6f42e92541 (IB/ipoib: Fix sysfs Pkey create<->remove possible deadlock)
++ 
++ 	priv = ipoib_intf_alloc(ppriv->ca, ppriv->port, intf_name);
++ 	if (!priv) {
++ 		result = -ENOMEM;
++ 		goto out;
++ 	}
+  
+  	/*
+  	 * First ensure this isn't a duplicate. We check the parent device and
+@@@ -162,11 -175,13 +183,15 @@@
+  
+  out:
+  	up_write(&ppriv->vlan_rwsem);
+ +
+++<<<<<<< HEAD
+  	rtnl_unlock();
+ -	mutex_unlock(&ppriv->sysfs_mutex);
+  
+ +	if (result)
+++=======
++ 	if (result && priv) {
+++>>>>>>> 9c6f42e92541 (IB/ipoib: Fix sysfs Pkey create<->remove possible deadlock)
+  		free_netdev(priv->dev);
+ -		kfree(priv);
+ -	}
+  
+  	return result;
+  }
+@@@ -184,10 -199,20 +209,24 @@@ int ipoib_vlan_delete(struct net_devic
+  	if (test_bit(IPOIB_FLAG_GOING_DOWN, &ppriv->flags))
+  		return -EPERM;
+  
+ -	if (!mutex_trylock(&ppriv->sysfs_mutex))
+ +	if (!rtnl_trylock())
+  		return restart_syscall();
+  
+++<<<<<<< HEAD
+ +	down_write(&ppriv->vlan_rwsem);
+++=======
++ 	if (!rtnl_trylock()) {
++ 		mutex_unlock(&ppriv->sysfs_mutex);
++ 		return restart_syscall();
++ 	}
++ 
++ 	if (!down_write_trylock(&ppriv->vlan_rwsem)) {
++ 		rtnl_unlock();
++ 		mutex_unlock(&ppriv->sysfs_mutex);
++ 		return restart_syscall();
++ 	}
++ 
+++>>>>>>> 9c6f42e92541 (IB/ipoib: Fix sysfs Pkey create<->remove possible deadlock)
+  	list_for_each_entry_safe(priv, tpriv, &ppriv->child_intfs, list) {
+  		if (priv->pkey == pkey &&
+  		    priv->child_type == IPOIB_LEGACY_CHILD) {
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib_vlan.c
