@@ -1,0 +1,253 @@
+sctp: get sock from transport in sctp_transport_update_pmtu
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 3ebfdf082184d04f6e73b30cd9446613dc7f8c02
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/3ebfdf08.failed
+
+This patch is almost to revert commit 02f3d4ce9e81 ("sctp: Adjust PMTU
+updates to accomodate route invalidation."). As t->asoc can't be NULL
+in sctp_transport_update_pmtu, it could get sk from asoc, and no need
+to pass sk into that function.
+
+It is also to remove some duplicated codes from that function.
+
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Acked-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3ebfdf082184d04f6e73b30cd9446613dc7f8c02)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sctp/output.c
+diff --cc net/sctp/output.c
+index 02b6a1b39273,1409a875ad8e..000000000000
+--- a/net/sctp/output.c
++++ b/net/sctp/output.c
+@@@ -93,40 -86,37 +93,52 @@@ void sctp_packet_config(struct sctp_pac
+  {
+  	struct sctp_transport *tp = packet->transport;
+  	struct sctp_association *asoc = tp->asoc;
+ -	struct sock *sk;
+  
+  	pr_debug("%s: packet:%p vtag:0x%x\n", __func__, packet, vtag);
+ +
+  	packet->vtag = vtag;
+  
+ -	/* do the following jobs only once for a flush schedule */
+ -	if (!sctp_packet_empty(packet))
+ -		return;
+ +	if (asoc && tp->dst) {
+ +		struct sock *sk = asoc->base.sk;
+  
+ -	/* set packet max_size with pathmtu */
+ -	packet->max_size = tp->pathmtu;
+ -	if (!asoc)
+ -		return;
+ +		rcu_read_lock();
+ +		if (__sk_dst_get(sk) != tp->dst) {
+ +			dst_hold(tp->dst);
+ +			sk_setup_caps(sk, tp->dst);
+ +		}
+ +
+++<<<<<<< HEAD
+ +		if (sk_can_gso(sk)) {
+ +			struct net_device *dev = tp->dst->dev;
+  
+ +			packet->max_size = dev->gso_max_size;
+ +		} else {
+ +			packet->max_size = asoc->pathmtu;
+ +		}
+ +		rcu_read_unlock();
+ +
+ +	} else {
+ +		packet->max_size = tp->pathmtu;
+++=======
++ 	/* update dst or transport pathmtu if in need */
++ 	sk = asoc->base.sk;
++ 	if (!sctp_transport_dst_check(tp)) {
++ 		sctp_transport_route(tp, NULL, sctp_sk(sk));
++ 		if (asoc->param_flags & SPP_PMTUD_ENABLE)
++ 			sctp_assoc_sync_pmtu(asoc);
++ 	} else if (!sctp_transport_pmtu_check(tp)) {
++ 		if (asoc->param_flags & SPP_PMTUD_ENABLE)
++ 			sctp_assoc_sync_pmtu(asoc);
+++>>>>>>> 3ebfdf082184 (sctp: get sock from transport in sctp_transport_update_pmtu)
+  	}
+  
+ -	/* If there a is a prepend chunk stick it on the list before
+ -	 * any other chunks get appended.
+ -	 */
+ -	if (ecn_capable) {
+ -		struct sctp_chunk *chunk = sctp_get_ecne_prepend(asoc);
+ +	if (ecn_capable && sctp_packet_empty(packet)) {
+ +		struct sctp_chunk *chunk;
+  
+ +		/* If there a is a prepend chunk stick it on the list before
+ +		 * any other chunks get appended.
+ +		 */
+ +		chunk = sctp_get_ecne_prepend(asoc);
+  		if (chunk)
+  			sctp_packet_append_chunk(packet, chunk);
+  	}
+diff --git a/include/net/sctp/sctp.h b/include/net/sctp/sctp.h
+index 5e1b0dc26470..9fde6fd7b25b 100644
+--- a/include/net/sctp/sctp.h
++++ b/include/net/sctp/sctp.h
+@@ -444,10 +444,9 @@ static inline int sctp_frag_point(const struct sctp_association *asoc, int pmtu)
+ 	return frag;
+ }
+ 
+-static inline void sctp_assoc_pending_pmtu(struct sock *sk, struct sctp_association *asoc)
++static inline void sctp_assoc_pending_pmtu(struct sctp_association *asoc)
+ {
+-
+-	sctp_assoc_sync_pmtu(sk, asoc);
++	sctp_assoc_sync_pmtu(asoc);
+ 	asoc->pmtu_pending = 0;
+ }
+ 
+diff --git a/include/net/sctp/structs.h b/include/net/sctp/structs.h
+index b400f13631ff..761cfc69a7d0 100644
+--- a/include/net/sctp/structs.h
++++ b/include/net/sctp/structs.h
+@@ -982,8 +982,8 @@ void sctp_transport_lower_cwnd(struct sctp_transport *, sctp_lower_cwnd_t);
+ void sctp_transport_burst_limited(struct sctp_transport *);
+ void sctp_transport_burst_reset(struct sctp_transport *);
+ unsigned long sctp_transport_timeout(struct sctp_transport *);
+-void sctp_transport_reset(struct sctp_transport *);
+-void sctp_transport_update_pmtu(struct sock *, struct sctp_transport *, u32);
++void sctp_transport_reset(struct sctp_transport *t);
++void sctp_transport_update_pmtu(struct sctp_transport *t, u32 pmtu);
+ void sctp_transport_immediate_rtx(struct sctp_transport *);
+ 
+ 
+@@ -1950,7 +1950,7 @@ void sctp_assoc_update(struct sctp_association *old,
+ 
+ __u32 sctp_association_get_next_tsn(struct sctp_association *);
+ 
+-void sctp_assoc_sync_pmtu(struct sock *, struct sctp_association *);
++void sctp_assoc_sync_pmtu(struct sctp_association *asoc);
+ void sctp_assoc_rwnd_increase(struct sctp_association *, unsigned int);
+ void sctp_assoc_rwnd_decrease(struct sctp_association *, unsigned int);
+ void sctp_assoc_set_primary(struct sctp_association *,
+diff --git a/net/sctp/associola.c b/net/sctp/associola.c
+index db1964d5b61c..c59e334b86a0 100644
+--- a/net/sctp/associola.c
++++ b/net/sctp/associola.c
+@@ -1407,7 +1407,7 @@ sctp_assoc_choose_alter_transport(struct sctp_association *asoc,
+ /* Update the association's pmtu and frag_point by going through all the
+  * transports. This routine is called when a transport's PMTU has changed.
+  */
+-void sctp_assoc_sync_pmtu(struct sock *sk, struct sctp_association *asoc)
++void sctp_assoc_sync_pmtu(struct sctp_association *asoc)
+ {
+ 	struct sctp_transport *t;
+ 	__u32 pmtu = 0;
+@@ -1419,8 +1419,8 @@ void sctp_assoc_sync_pmtu(struct sock *sk, struct sctp_association *asoc)
+ 	list_for_each_entry(t, &asoc->peer.transport_addr_list,
+ 				transports) {
+ 		if (t->pmtu_pending && t->dst) {
+-			sctp_transport_update_pmtu(sk, t,
+-						   SCTP_TRUNC4(dst_mtu(t->dst)));
++			sctp_transport_update_pmtu(
++					t, SCTP_TRUNC4(dst_mtu(t->dst)));
+ 			t->pmtu_pending = 0;
+ 		}
+ 		if (!pmtu || (t->pathmtu < pmtu))
+diff --git a/net/sctp/input.c b/net/sctp/input.c
+index 9cdbec2d525c..5a635325f5d6 100644
+--- a/net/sctp/input.c
++++ b/net/sctp/input.c
+@@ -405,10 +405,10 @@ void sctp_icmp_frag_needed(struct sock *sk, struct sctp_association *asoc,
+ 
+ 	if (t->param_flags & SPP_PMTUD_ENABLE) {
+ 		/* Update transports view of the MTU */
+-		sctp_transport_update_pmtu(sk, t, pmtu);
++		sctp_transport_update_pmtu(t, pmtu);
+ 
+ 		/* Update association pmtu. */
+-		sctp_assoc_sync_pmtu(sk, asoc);
++		sctp_assoc_sync_pmtu(asoc);
+ 	}
+ 
+ 	/* Retransmit with the new pmtu setting.
+* Unmerged path net/sctp/output.c
+diff --git a/net/sctp/socket.c b/net/sctp/socket.c
+index 8996677c592f..f44723071942 100644
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@ -1899,7 +1899,7 @@ static int sctp_sendmsg(struct kiocb *iocb, struct sock *sk,
+ 	}
+ 
+ 	if (asoc->pmtu_pending)
+-		sctp_assoc_pending_pmtu(sk, asoc);
++		sctp_assoc_pending_pmtu(asoc);
+ 
+ 	/* If fragmentation is disabled and the message length exceeds the
+ 	 * association fragmentation point, return EMSGSIZE.  The I-D
+@@ -2424,7 +2424,7 @@ static int sctp_apply_peer_addr_params(struct sctp_paddrparams *params,
+ 	if ((params->spp_flags & SPP_PMTUD_DISABLE) && params->spp_pathmtu) {
+ 		if (trans) {
+ 			trans->pathmtu = params->spp_pathmtu;
+-			sctp_assoc_sync_pmtu(sctp_opt2sk(sp), asoc);
++			sctp_assoc_sync_pmtu(asoc);
+ 		} else if (asoc) {
+ 			asoc->pathmtu = params->spp_pathmtu;
+ 			sctp_frag_point(asoc, params->spp_pathmtu);
+@@ -2441,7 +2441,7 @@ static int sctp_apply_peer_addr_params(struct sctp_paddrparams *params,
+ 				(trans->param_flags & ~SPP_PMTUD) | pmtud_change;
+ 			if (update) {
+ 				sctp_transport_pmtu(trans, sctp_opt2sk(sp));
+-				sctp_assoc_sync_pmtu(sctp_opt2sk(sp), asoc);
++				sctp_assoc_sync_pmtu(asoc);
+ 			}
+ 		} else if (asoc) {
+ 			asoc->param_flags =
+diff --git a/net/sctp/transport.c b/net/sctp/transport.c
+index 545086ee3a1d..995539e87f4c 100644
+--- a/net/sctp/transport.c
++++ b/net/sctp/transport.c
+@@ -245,14 +245,13 @@ void sctp_transport_pmtu(struct sctp_transport *transport, struct sock *sk)
+ 		transport->pathmtu = SCTP_DEFAULT_MAXSEGMENT;
+ }
+ 
+-void sctp_transport_update_pmtu(struct sock *sk, struct sctp_transport *t, u32 pmtu)
++void sctp_transport_update_pmtu(struct sctp_transport *t, u32 pmtu)
+ {
+-	struct dst_entry *dst;
++	struct dst_entry *dst = sctp_transport_dst_check(t);
+ 
+ 	if (unlikely(pmtu < SCTP_DEFAULT_MINSEGMENT)) {
+ 		pr_warn("%s: Reported pmtu %d too low, using default minimum of %d\n",
+-			__func__, pmtu,
+-			SCTP_DEFAULT_MINSEGMENT);
++			__func__, pmtu, SCTP_DEFAULT_MINSEGMENT);
+ 		/* Use default minimum segment size and disable
+ 		 * pmtu discovery on this transport.
+ 		 */
+@@ -261,17 +260,13 @@ void sctp_transport_update_pmtu(struct sock *sk, struct sctp_transport *t, u32 p
+ 		t->pathmtu = pmtu;
+ 	}
+ 
+-	dst = sctp_transport_dst_check(t);
+-	if (!dst)
+-		t->af_specific->get_dst(t, &t->saddr, &t->fl, sk);
+-
+ 	if (dst) {
+-		dst->ops->update_pmtu(dst, sk, NULL, pmtu);
+-
++		dst->ops->update_pmtu(dst, t->asoc->base.sk, NULL, pmtu);
+ 		dst = sctp_transport_dst_check(t);
+-		if (!dst)
+-			t->af_specific->get_dst(t, &t->saddr, &t->fl, sk);
+ 	}
++
++	if (!dst)
++		t->af_specific->get_dst(t, &t->saddr, &t->fl, t->asoc->base.sk);
+ }
+ 
+ /* Caches the dst entry and source address for a transport's destination
