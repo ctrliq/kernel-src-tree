@@ -37,8 +37,8 @@
  * of which use ARM any more).  See the "Databook" from Synopsys for
  * information beyond what licensees probably provide.
  *
- * The driver has currently been tested only with the Atmel AT32AP7000,
- * which does not support descriptor writeback.
+ * The driver has been tested with the Atmel AT32AP7000, which does not
+ * support descriptor writeback.
  */
 
 static inline unsigned int dwc_get_dms(struct dw_dma_slave *slave)
