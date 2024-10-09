@@ -554,7 +554,6 @@ add_delayed_ref_head(struct btrfs_fs_info *fs_info,
 	struct btrfs_delayed_ref_head *existing;
 	struct btrfs_delayed_ref_head *head_ref = NULL;
 	struct btrfs_delayed_ref_root *delayed_refs;
-	struct btrfs_qgroup_extent_record *qexisting;
 	int count_mod = 1;
 	int must_insert_reserved = 0;
 
@@ -620,9 +619,8 @@ add_delayed_ref_head(struct btrfs_fs_info *fs_info,
 		qrecord->num_bytes = num_bytes;
 		qrecord->old_roots = NULL;
 
-		qexisting = btrfs_qgroup_insert_dirty_extent(delayed_refs,
-							     qrecord);
-		if (qexisting)
+		if(btrfs_qgroup_insert_dirty_extent_nolock(fs_info,
+					delayed_refs, qrecord))
 			kfree(qrecord);
 	}
 
@@ -790,7 +788,8 @@ int btrfs_add_delayed_tree_ref(struct btrfs_fs_info *fs_info,
 	if (!head_ref)
 		goto free_ref;
 
-	if (fs_info->quota_enabled && is_fstree(ref_root)) {
+	if (test_bit(BTRFS_FS_QUOTA_ENABLED, &fs_info->flags) &&
+	    is_fstree(ref_root)) {
 		record = kmalloc(sizeof(*record), GFP_NOFS);
 		if (!record)
 			goto free_head_ref;
@@ -848,7 +847,8 @@ int btrfs_add_delayed_data_ref(struct btrfs_fs_info *fs_info,
 		return -ENOMEM;
 	}
 
-	if (fs_info->quota_enabled && is_fstree(ref_root)) {
+	if (test_bit(BTRFS_FS_QUOTA_ENABLED, &fs_info->flags) &&
+	    is_fstree(ref_root)) {
 		record = kmalloc(sizeof(*record), GFP_NOFS);
 		if (!record) {
 			kmem_cache_free(btrfs_delayed_data_ref_cachep, ref);

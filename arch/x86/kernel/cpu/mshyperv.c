@@ -145,13 +145,16 @@ static cycle_t read_hv_clock(struct clocksource *arg)
 	return current_tick;
 }
 
-static struct clocksource hyperv_cs = {
+static struct clocksource hyperv_cs_msr = {
 	.name		= "hyperv_clocksource",
 	.rating		= 400, /* use this when running on Hyperv*/
 	.read		= read_hv_clock,
 	.mask		= CLOCKSOURCE_MASK(64),
 	.flags		= CLOCK_SOURCE_IS_CONTINUOUS,
 };
+
+struct clocksource *hyperv_cs;
+EXPORT_SYMBOL_GPL(hyperv_cs);
 
 static unsigned char hv_get_nmi_reason(void)
 {
@@ -185,8 +188,10 @@ static void __init ms_hyperv_init_platform(void)
 	}
 #endif
 
-	if (ms_hyperv.features & HV_X64_MSR_TIME_REF_COUNT_AVAILABLE)
-		clocksource_register_hz(&hyperv_cs, NSEC_PER_SEC/100);
+	if (ms_hyperv.features & HV_X64_MSR_TIME_REF_COUNT_AVAILABLE) {
+		clocksource_register_hz(&hyperv_cs_msr, NSEC_PER_SEC/100);
+		hyperv_cs = &hyperv_cs_msr;
+	}
 
 #ifdef CONFIG_X86_IO_APIC
 	no_timer_check = 1;

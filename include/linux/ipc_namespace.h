@@ -70,6 +70,7 @@ struct ipc_namespace {
 	struct user_namespace *user_ns;
 
 	unsigned int	proc_inum;
+	RH_KABI_EXTEND(struct ucounts *ucounts)
 };
 
 extern struct ipc_namespace init_ipc_ns;

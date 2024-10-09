@@ -26,7 +26,6 @@
 
 #include <linux/fsnotify_backend.h>
 #include "fsnotify.h"
-#include "../mount.h"
 
 /*
  * Clear all of the marks on an inode when it is being evicted from core
@@ -252,13 +251,13 @@ int fsnotify(struct inode *to_tell, __u32 mask, const void *data, int data_is,
 
 		if (inode_node) {
 			inode_mark = hlist_entry(srcu_dereference(inode_node, &fsnotify_mark_srcu),
-						 struct fsnotify_mark, i.i_list);
+						 struct fsnotify_mark, obj_list);
 			inode_group = inode_mark->group;
 		}
 
 		if (vfsmount_node) {
 			vfsmount_mark = hlist_entry(srcu_dereference(vfsmount_node, &fsnotify_mark_srcu),
-							struct fsnotify_mark, m.m_list);
+						    struct fsnotify_mark, obj_list);
 			vfsmount_group = vfsmount_mark->group;
 		}
 

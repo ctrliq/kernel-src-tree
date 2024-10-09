@@ -892,8 +892,16 @@ static int c4iw_rdev_open(struct c4iw_rdev *rdev)
 			atomic_set(&rdev->wr_log_idx, 0);
 		}
 	}
+	rdev->free_workq = create_singlethread_workqueue("iw_cxgb4_free");
+	if (!rdev->free_workq) {
+		err = -ENOMEM;
+		goto err_free_status_page;
+	}
+
 	rdev->status_page->db_off = 0;
 	return 0;
+err_free_status_page:
+	free_page((unsigned long)rdev->status_page);
 destroy_ocqp_pool:
 	c4iw_ocqp_pool_destroy(rdev);
 destroy_rqtpool:
@@ -907,6 +915,7 @@ destroy_resource:
 
 static void c4iw_rdev_close(struct c4iw_rdev *rdev)
 {
+	destroy_workqueue(rdev->free_workq);
 	kfree(rdev->wr_log);
 	free_page((unsigned long)rdev->status_page);
 	c4iw_pblpool_destroy(rdev);
@@ -1523,6 +1532,11 @@ static int c4iw_uld_control(void *handle, enum cxgb4_control control, ...)
 
 static struct cxgb4_uld_info c4iw_uld_info = {
 	.name = DRV_NAME,
+	.nrxq = MAX_ULD_QSETS,
+	.ntxq = MAX_ULD_QSETS,
+	.rxq_size = 511,
+	.ciq = true,
+	.lro = false,
 	.add = c4iw_uld_add,
 	.rx_handler = c4iw_uld_rx_handler,
 	.state_change = c4iw_uld_state_change,

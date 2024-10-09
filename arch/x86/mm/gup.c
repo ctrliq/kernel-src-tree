@@ -156,17 +156,18 @@ static inline void get_head_page_multiple(struct page *page, int nr)
 static noinline int gup_huge_pmd(pmd_t pmd, unsigned long addr,
 		unsigned long end, int write, struct page **pages, int *nr)
 {
+	pte_t pte = *(pte_t *)&pmd;
 	struct page *head, *page;
 	int refs;
 
-	if (!pte_allows_gup(pmd_val(pmd), write))
+	if (!pte_allows_gup(pte_val(pte), write))
 		return 0;
 	/* hugepages are never "special" */
-	VM_BUG_ON(pmd_flags(pmd) & _PAGE_SPECIAL);
-	VM_BUG_ON(!pfn_valid(pmd_pfn(pmd)));
+	VM_BUG_ON(pte_flags(pte) & _PAGE_SPECIAL);
+	VM_BUG_ON(!pfn_valid(pte_pfn(pte)));
 
 	refs = 0;
-	head = pmd_page(pmd);
+	head = pte_page(pte);
 	page = head + ((addr & ~PMD_MASK) >> PAGE_SHIFT);
 	do {
 		VM_BUG_ON_PAGE(compound_head(page) != head, page);
@@ -228,17 +229,18 @@ static int gup_pmd_range(pud_t pud, unsigned long addr, unsigned long end,
 static noinline int gup_huge_pud(pud_t pud, unsigned long addr,
 		unsigned long end, int write, struct page **pages, int *nr)
 {
+	pte_t pte = *(pte_t *)&pud;
 	struct page *head, *page;
 	int refs;
 
-	if (!pte_allows_gup(pud_val(pud), write))
+	if (!pte_allows_gup(pte_val(pte), write))
 		return 0;
 	/* hugepages are never "special" */
-	VM_BUG_ON(pud_flags(pud) & _PAGE_SPECIAL);
-	VM_BUG_ON(!pfn_valid(pud_pfn(pud)));
+	VM_BUG_ON(pte_flags(pte) & _PAGE_SPECIAL);
+	VM_BUG_ON(!pfn_valid(pte_pfn(pte)));
 
 	refs = 0;
-	head = pud_page(pud);
+	head = pte_page(pte);
 	page = head + ((addr & ~PUD_MASK) >> PAGE_SHIFT);
 	do {
 		VM_BUG_ON_PAGE(compound_head(page) != head, page);

@@ -177,7 +177,6 @@ static struct ctl_table sunrpc_table[] = {
  * increase over time if the server is down or not responding.
  */
 #define XS_TCP_INIT_REEST_TO	(3U * HZ)
-#define XS_TCP_MAX_REEST_TO	(5U * 60 * HZ)
 
 /*
  * TCP idle timeout; client drops the transport socket if it is idle
@@ -766,11 +765,19 @@ static void xs_restore_old_callbacks(struct sock_xprt *transport, struct sock *s
 	sk->sk_error_report = transport->old_error_report;
 }
 
+static void xs_sock_reset_state_flags(struct rpc_xprt *xprt)
+{
+	struct sock_xprt *transport = container_of(xprt, struct sock_xprt, xprt);
+
+	clear_bit(XPRT_SOCK_DATA_READY, &transport->sock_state);
+}
+
 static void xs_sock_reset_connection_flags(struct rpc_xprt *xprt)
 {
 	smp_mb__before_atomic();
 	clear_bit(XPRT_CLOSE_WAIT, &xprt->state);
 	clear_bit(XPRT_CLOSING, &xprt->state);
+	xs_sock_reset_state_flags(xprt);
 	smp_mb__after_atomic();
 }
 
@@ -973,10 +980,13 @@ static void xs_local_data_receive(struct sock_xprt *transport)
 		goto out;
 	for (;;) {
 		skb = skb_recv_datagram(sk, 0, 1, &err);
-		if (skb == NULL)
+		if (skb != NULL) {
+			xs_local_data_read_skb(&transport->xprt, sk, skb);
+			skb_free_datagram(sk, skb);
+			continue;
+		}
+		if (!test_and_clear_bit(XPRT_SOCK_DATA_READY, &transport->sock_state))
 			break;
-		xs_local_data_read_skb(&transport->xprt, sk, skb);
-		skb_free_datagram(sk, skb);
 	}
 out:
 	mutex_unlock(&transport->recv_mutex);
@@ -1054,11 +1064,14 @@ static void xs_udp_data_receive(struct sock_xprt *transport)
 	if (sk == NULL)
 		goto out;
 	for (;;) {
-		skb = skb_recv_datagram(sk, 0, 1, &err);
-		if (skb == NULL)
+		skb = skb_recv_udp(sk, 0, 1, &err);
+		if (skb != NULL) {
+			xs_udp_data_read_skb(&transport->xprt, sk, skb);
+			consume_skb(skb);
+			continue;
+		}
+		if (!test_and_clear_bit(XPRT_SOCK_DATA_READY, &transport->sock_state))
 			break;
-		xs_udp_data_read_skb(&transport->xprt, sk, skb);
-		skb_free_datagram_locked(sk, skb);
 	}
 out:
 	mutex_unlock(&transport->recv_mutex);
@@ -1086,7 +1099,14 @@ static void xs_data_ready(struct sock *sk, int len)
 	if (xprt != NULL) {
 		struct sock_xprt *transport = container_of(xprt,
 				struct sock_xprt, xprt);
-		queue_work(rpciod_workqueue, &transport->recv_worker);
+		transport->old_data_ready(sk, len);
+		/* Any data means we had a useful conversation, so
+		 * then we don't need to delay the next reconnect
+		 */
+		if (xprt->reestablish_timeout)
+			xprt->reestablish_timeout = 0;
+		if (!test_and_set_bit(XPRT_SOCK_DATA_READY, &transport->sock_state))
+			queue_work(xprtiod_workqueue, &transport->recv_worker);
 	}
 	read_unlock_bh(&sk->sk_callback_lock);
 }
@@ -1486,10 +1506,15 @@ static void xs_tcp_data_receive(struct sock_xprt *transport)
 	for (;;) {
 		lock_sock(sk);
 		read = tcp_read_sock(sk, &rd_desc, xs_tcp_data_recv);
-		release_sock(sk);
-		if (read <= 0)
-			break;
-		total += read;
+		if (read <= 0) {
+			clear_bit(XPRT_SOCK_DATA_READY, &transport->sock_state);
+			release_sock(sk);
+			if (!test_bit(XPRT_SOCK_DATA_READY, &transport->sock_state))
+				break;
+		} else {
+			release_sock(sk);
+			total += read;
+		}
 		rd_desc.count = 65536;
 	}
 out:
@@ -1502,34 +1527,6 @@ static void xs_tcp_data_receive_workfn(struct work_struct *work)
 	struct sock_xprt *transport =
 		container_of(work, struct sock_xprt, recv_worker);
 	xs_tcp_data_receive(transport);
-}
-
-/**
- * xs_tcp_data_ready - "data ready" callback for TCP sockets
- * @sk: socket with data to read
- *
- */
-static void xs_tcp_data_ready(struct sock *sk, int bytes)
-{
-	struct sock_xprt *transport;
-	struct rpc_xprt *xprt;
-
-	dprintk("RPC:       xs_tcp_data_ready...\n");
-
-	read_lock_bh(&sk->sk_callback_lock);
-	if (!(xprt = xprt_from_sock(sk)))
-		goto out;
-	transport = container_of(xprt, struct sock_xprt, xprt);
-
-	/* Any data means we had a useful conversation, so
-	 * the we don't need to delay the next reconnect
-	 */
-	if (xprt->reestablish_timeout)
-		xprt->reestablish_timeout = 0;
-	queue_work(rpciod_workqueue, &transport->recv_worker);
-
-out:
-	read_unlock_bh(&sk->sk_callback_lock);
 }
 
 /**
@@ -1723,7 +1720,7 @@ static void xs_udp_timer(struct rpc_xprt *xprt, struct rpc_task *task)
 static unsigned short xs_get_random_port(void)
 {
 	unsigned short range = xprt_max_resvport - xprt_min_resvport;
-	unsigned short rand = (unsigned short) net_random() % range;
+	unsigned short rand = (unsigned short) prandom_u32() % range;
 	return rand + xprt_min_resvport;
 }
 
@@ -2165,6 +2162,8 @@ static void xs_udp_finish_connecting(struct rpc_xprt *xprt, struct socket *sock)
 		write_unlock_bh(&sk->sk_callback_lock);
 	}
 	xs_udp_do_set_buffer_size(xprt);
+
+	xprt->stat.connect_start = jiffies;
 }
 
 static void xs_udp_setup_socket(struct work_struct *work)
@@ -2250,7 +2249,7 @@ static int xs_tcp_finish_connecting(struct rpc_xprt *xprt, struct socket *sock)
 		xs_save_old_callbacks(transport, sk);
 
 		sk->sk_user_data = xprt;
-		sk->sk_data_ready = xs_tcp_data_ready;
+		sk->sk_data_ready = xs_data_ready;
 		sk->sk_state_change = xs_tcp_state_change;
 		sk->sk_write_space = xs_tcp_write_space;
 		sock_set_flag(sk, SOCK_FASYNC);
@@ -2361,6 +2360,25 @@ out:
 	xprt_wake_pending_tasks(xprt, status);
 }
 
+static unsigned long xs_reconnect_delay(const struct rpc_xprt *xprt)
+{
+	unsigned long start, now = jiffies;
+
+	start = xprt->stat.connect_start + xprt->reestablish_timeout;
+	if (time_after(start, now))
+		return start - now;
+	return 0;
+}
+
+static void xs_reconnect_backoff(struct rpc_xprt *xprt)
+{
+	xprt->reestablish_timeout <<= 1;
+	if (xprt->reestablish_timeout > xprt->max_reconnect_timeout)
+		xprt->reestablish_timeout = xprt->max_reconnect_timeout;
+	if (xprt->reestablish_timeout < XS_TCP_INIT_REEST_TO)
+		xprt->reestablish_timeout = XS_TCP_INIT_REEST_TO;
+}
+
 /**
  * xs_connect - connect a socket to a remote endpoint
  * @xprt: pointer to transport structure
@@ -2378,6 +2396,7 @@ out:
 static void xs_connect(struct rpc_xprt *xprt, struct rpc_task *task)
 {
 	struct sock_xprt *transport = container_of(xprt, struct sock_xprt, xprt);
+	unsigned long delay = 0;
 
 	WARN_ON_ONCE(!xprt_lock_connect(xprt, task, transport));
 
@@ -2389,19 +2408,15 @@ static void xs_connect(struct rpc_xprt *xprt, struct rpc_task *task)
 		/* Start by resetting any existing state */
 		xs_reset_transport(transport);
 
-		queue_delayed_work(rpciod_workqueue,
-				   &transport->connect_worker,
-				   xprt->reestablish_timeout);
-		xprt->reestablish_timeout <<= 1;
-		if (xprt->reestablish_timeout < XS_TCP_INIT_REEST_TO)
-			xprt->reestablish_timeout = XS_TCP_INIT_REEST_TO;
-		if (xprt->reestablish_timeout > XS_TCP_MAX_REEST_TO)
-			xprt->reestablish_timeout = XS_TCP_MAX_REEST_TO;
-	} else {
+		delay = xs_reconnect_delay(xprt);
+		xs_reconnect_backoff(xprt);
+
+	} else
 		dprintk("RPC:       xs_connect scheduled xprt %p\n", xprt);
-		queue_delayed_work(rpciod_workqueue,
-				   &transport->connect_worker, 0);
-	}
+
+	queue_delayed_work(xprtiod_workqueue,
+			&transport->connect_worker,
+			delay);
 }
 
 /**
@@ -2493,34 +2508,38 @@ static void xs_tcp_print_stats(struct rpc_xprt *xprt, struct seq_file *seq)
  * we allocate pages instead doing a kmalloc like rpc_malloc is because we want
  * to use the server side send routines.
  */
-static void *bc_malloc(struct rpc_task *task, size_t size)
+static int bc_malloc(struct rpc_task *task)
 {
+	struct rpc_rqst *rqst = task->tk_rqstp;
+	size_t size = rqst->rq_callsize;
 	struct page *page;
 	struct rpc_buffer *buf;
 
-	WARN_ON_ONCE(size > PAGE_SIZE - sizeof(struct rpc_buffer));
-	if (size > PAGE_SIZE - sizeof(struct rpc_buffer))
-		return NULL;
+	if (size > PAGE_SIZE - sizeof(struct rpc_buffer)) {
+		WARN_ONCE(1, "xprtsock: large bc buffer request (size %zu)\n",
+			  size);
+		return -EINVAL;
+	}
 
 	page = alloc_page(GFP_KERNEL);
 	if (!page)
-		return NULL;
+		return -ENOMEM;
 
 	buf = page_address(page);
 	buf->len = PAGE_SIZE;
 
-	return buf->data;
+	rqst->rq_buffer = buf->data;
+	rqst->rq_rbuffer = (char *)rqst->rq_buffer + rqst->rq_callsize;
+	return 0;
 }
 
 /*
  * Free the space allocated in the bc_alloc routine
  */
-static void bc_free(void *buffer)
+static void bc_free(struct rpc_task *task)
 {
+	void *buffer = task->tk_rqstp->rq_buffer;
 	struct rpc_buffer *buf;
-
-	if (!buffer)
-		return;
 
 	buf = container_of(buffer, struct rpc_buffer, data);
 	free_page((unsigned long)buf);
@@ -2952,6 +2971,8 @@ static struct rpc_xprt *xs_setup_tcp(struct xprt_create *args)
 
 	xprt->ops = &xs_tcp_ops;
 	xprt->timeout = &xs_tcp_default_timeout;
+
+	xprt->max_reconnect_timeout = xprt->timeout->to_maxval;
 
 	INIT_WORK(&transport->recv_worker, xs_tcp_data_receive_workfn);
 	INIT_DELAYED_WORK(&transport->connect_worker, xs_tcp_setup_socket);

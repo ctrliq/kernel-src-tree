@@ -18,7 +18,7 @@
 #define _MEI_DEV_H_
 
 #include <linux/types.h>
-#include <linux/watchdog.h>
+#include <linux/cdev.h>
 #include <linux/poll.h>
 #include <linux/mei.h>
 #include <linux/mei_cl_bus.h>
@@ -26,33 +26,13 @@
 #include "hw.h"
 #include "hbm.h"
 
-/*
- * watch dog definition
- */
-#define MEI_WD_HDR_SIZE       4
-#define MEI_WD_STOP_MSG_SIZE  MEI_WD_HDR_SIZE
-#define MEI_WD_START_MSG_SIZE (MEI_WD_HDR_SIZE + 16)
-
-#define MEI_WD_DEFAULT_TIMEOUT   120  /* seconds */
-#define MEI_WD_MIN_TIMEOUT       120  /* seconds */
-#define MEI_WD_MAX_TIMEOUT     65535  /* seconds */
-
-#define MEI_WD_STOP_TIMEOUT      10 /* msecs */
-
-#define MEI_WD_STATE_INDEPENDENCE_MSG_SENT       (1 << 0)
-
-#define MEI_RD_MSG_BUF_SIZE           (128 * sizeof(u32))
-
 
 /*
  * AMTHI Client UUID
  */
 extern const uuid_le mei_amthif_guid;
 
-/*
- * Watchdog Client UUID
- */
-extern const uuid_le mei_wd_guid;
+#define MEI_RD_MSG_BUF_SIZE           (128 * sizeof(u32))
 
 /*
  * Number of Maximum MEI Clients
@@ -72,15 +52,6 @@ extern const uuid_le mei_wd_guid;
  * minus internal client for MEI Bus Messages
  */
 #define  MEI_MAX_OPEN_HANDLE_COUNT (MEI_CLIENTS_MAX - 1)
-
-/*
- * Internal Clients Number
- */
-#define MEI_HOST_CLIENT_ID_ANY        (-1)
-#define MEI_HBM_HOST_CLIENT_ID         0 /* not used, just for documentation */
-#define MEI_WD_HOST_CLIENT_ID          1
-#define MEI_IAMTHIF_HOST_CLIENT_ID     2
-
 
 /* File state */
 enum file_state {
@@ -116,12 +87,6 @@ enum mei_file_transaction_states {
 	MEI_IDLE,
 	MEI_WRITING,
 	MEI_WRITE_COMPLETE,
-};
-
-enum mei_wd_states {
-	MEI_WD_IDLE,
-	MEI_WD_RUNNING,
-	MEI_WD_STOPPING,
 };
 
 /**
@@ -187,7 +152,7 @@ struct mei_fw_status {
  * @refcnt: struct reference count
  * @props: client properties
  * @client_id: me client id
- * @mei_flow_ctrl_creds: flow control credits
+ * @tx_flow_ctrl_creds: flow control credits
  * @connect_count: number connections to this client
  * @bus_added: added to bus
  */
@@ -196,7 +161,7 @@ struct mei_me_client {
 	struct kref refcnt;
 	struct mei_client_properties props;
 	u8 client_id;
-	u8 mei_flow_ctrl_creds;
+	u8 tx_flow_ctrl_creds;
 	u8 connect_count;
 	u8 bus_added;
 };
@@ -247,7 +212,7 @@ struct mei_cl_cb {
  * @me_cl: fw client connected
  * @fp: file associated with client
  * @host_client_id: host id
- * @mei_flow_ctrl_creds: transmit flow credentials
+ * @tx_flow_ctrl_creds: transmit flow credentials
  * @rx_flow_ctrl_creds: receive flow credentials
  * @timer_count:  watchdog timer for operation completion
  * @notify_en: notification - enabled/disabled
@@ -271,7 +236,7 @@ struct mei_cl {
 	struct mei_me_client *me_cl;
 	const struct file *fp;
 	u8 host_client_id;
-	u8 mei_flow_ctrl_creds;
+	u8 tx_flow_ctrl_creds;
 	u8 rx_flow_ctrl_creds;
 	u8 timer_count;
 	u8 notify_en;
@@ -413,7 +378,6 @@ const char *mei_pg_state_str(enum mei_pg_state state);
  * @wait_hw_ready : wait queue for receive HW ready message form FW
  * @wait_pg     : wait queue for receive PG message from FW
  * @wait_hbm_start : wait queue for receive HBM start message from FW
- * @wait_stop_wd : wait queue for receive WD stop message from FW
  *
  * @reset_count : number of consecutive resets
  * @dev_state   : device state
@@ -428,13 +392,15 @@ const char *mei_pg_state_str(enum mei_pg_state state);
  *
  * @hbuf_depth  : depth of hardware host/write buffer is slots
  * @hbuf_is_ready : query if the host host/write buffer is ready
- * @wr_msg      : the buffer for hbm control messages
  *
  * @version     : HBM protocol version in use
  * @hbm_f_pg_supported  : hbm feature pgi protocol
  * @hbm_f_dc_supported  : hbm feature dynamic clients
  * @hbm_f_dot_supported : hbm feature disconnect on timeout
  * @hbm_f_ev_supported  : hbm feature event notification
+ * @hbm_f_fa_supported  : hbm feature fixed address client
+ * @hbm_f_ie_supported  : hbm feature immediate reply to enum request
+ * @hbm_f_os_supported  : hbm feature support OS ver message
  *
  * @me_clients_rwsem: rw lock over me_clients list
  * @me_clients  : list of FW clients
@@ -442,12 +408,7 @@ const char *mei_pg_state_str(enum mei_pg_state state);
  * @host_clients_map : host clients id pool
  *
  * @allow_fixed_address: allow user space to connect a fixed client
- *
- * @wd_cl       : watchdog client
- * @wd_state    : watchdog client state
- * @wd_pending  : watchdog command is pending
- * @wd_timeout  : watchdog expiration timeout
- * @wd_data     : watchdog message buffer
+ * @override_fixed_address: force allow fixed address behavior
  *
  * @amthif_cmd_list : amthif list for cmd waiting
  * @iamthif_cl  : amthif host client
@@ -456,7 +417,6 @@ const char *mei_pg_state_str(enum mei_pg_state state);
  * @iamthif_state : amthif processor state
  * @iamthif_canceled : current amthif command is canceled
  *
- * @init_work   : work item for the device init
  * @reset_work  : work item for the device reset
  * @bus_rescan_work : work item for the bus rescan
  *
@@ -491,7 +451,6 @@ struct mei_device {
 	wait_queue_head_t wait_hw_ready;
 	wait_queue_head_t wait_pg;
 	wait_queue_head_t wait_hbm_start;
-	wait_queue_head_t wait_stop_wd;
 
 	/*
 	 * mei device  states
@@ -516,17 +475,14 @@ struct mei_device {
 	u8 hbuf_depth;
 	bool hbuf_is_ready;
 
-	/* used for control messages */
-	struct {
-		struct mei_msg_hdr hdr;
-		unsigned char data[128];
-	} wr_msg;
-
 	struct hbm_version version;
 	unsigned int hbm_f_pg_supported:1;
 	unsigned int hbm_f_dc_supported:1;
 	unsigned int hbm_f_dot_supported:1;
 	unsigned int hbm_f_ev_supported:1;
+	unsigned int hbm_f_fa_supported:1;
+	unsigned int hbm_f_ie_supported:1;
+	unsigned int hbm_f_os_supported:1;
 
 	struct rw_semaphore me_clients_rwsem;
 	struct list_head me_clients;
@@ -534,13 +490,7 @@ struct mei_device {
 	DECLARE_BITMAP(host_clients_map, MEI_CLIENTS_MAX);
 
 	u32 allow_fixed_address;
-
-	struct mei_cl wd_cl;
-	enum mei_wd_states wd_state;
-	bool wd_pending;
-	u16 wd_timeout;
-	unsigned char wd_data[MEI_WD_START_MSG_SIZE];
-
+	bool override_fixed_address;
 
 	/* amthif list for cmd waiting */
 	struct mei_cl_cb amthif_cmd_list;
@@ -550,7 +500,6 @@ struct mei_device {
 	enum iamthif_states iamthif_state;
 	bool iamthif_canceled;
 
-	struct work_struct init_work;
 	struct work_struct reset_work;
 	struct work_struct bus_rescan_work;
 
@@ -643,21 +592,6 @@ int mei_amthif_irq_read_msg(struct mei_cl *cl,
 			    struct mei_cl_cb *complete_list);
 int mei_amthif_irq_read(struct mei_device *dev, s32 *slots);
 
-int mei_wd_send(struct mei_device *dev);
-int mei_wd_stop(struct mei_device *dev);
-int mei_wd_host_init(struct mei_device *dev, struct mei_me_client *me_cl);
-/*
- * mei_watchdog_register  - Registering watchdog interface
- *   once we got connection to the WD Client
- * @dev: mei device
- */
-int mei_watchdog_register(struct mei_device *dev);
-/*
- * mei_watchdog_unregister  - Unregistering watchdog interface
- * @dev: mei device
- */
-void mei_watchdog_unregister(struct mei_device *dev);
-
 /*
  * Register Access Function
  */
@@ -733,8 +667,7 @@ static inline size_t mei_hbuf_max_len(const struct mei_device *dev)
 }
 
 static inline int mei_write_message(struct mei_device *dev,
-			struct mei_msg_hdr *hdr,
-			unsigned char *buf)
+			struct mei_msg_hdr *hdr, void *buf)
 {
 	return dev->ops->write(dev, hdr, buf);
 }

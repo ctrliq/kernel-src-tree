@@ -25,6 +25,8 @@
 #define KVM_MAX_VCPUS 64
 #define KVM_USER_MEM_SLOTS 32
 
+#define KVM_HALT_POLL_NS_DEFAULT 0
+
 struct sca_entry {
 	atomic_t scn;
 	__u32	reserved;
@@ -120,51 +122,51 @@ struct kvm_s390_sie_block {
 } __attribute__((packed));
 
 struct kvm_vcpu_stat {
-	u32 exit_userspace;
-	u32 exit_null;
-	u32 exit_external_request;
-	u32 exit_external_interrupt;
-	u32 exit_stop_request;
-	u32 exit_validity;
-	u32 exit_instruction;
-	u32 halt_successful_poll;
-	u32 halt_attempted_poll;
-	u32 instruction_lctl;
-	u32 instruction_lctlg;
-	u32 exit_program_interruption;
-	u32 exit_instr_and_program;
-	u32 deliver_external_call;
-	u32 deliver_emergency_signal;
-	u32 deliver_service_signal;
-	u32 deliver_virtio_interrupt;
-	u32 deliver_stop_signal;
-	u32 deliver_prefix_signal;
-	u32 deliver_restart_signal;
-	u32 deliver_program_int;
-	u32 deliver_io_int;
-	u32 exit_wait_state;
-	u32 instruction_pfmf;
-	u32 instruction_stidp;
-	u32 instruction_spx;
-	u32 instruction_stpx;
-	u32 instruction_stap;
-	u32 instruction_storage_key;
-	u32 instruction_stsch;
-	u32 instruction_chsc;
-	u32 instruction_stsi;
-	u32 instruction_stfl;
-	u32 instruction_tprot;
-	u32 instruction_sigp_sense;
-	u32 instruction_sigp_sense_running;
-	u32 instruction_sigp_external_call;
-	u32 instruction_sigp_emergency;
-	u32 instruction_sigp_stop;
-	u32 instruction_sigp_arch;
-	u32 instruction_sigp_prefix;
-	u32 instruction_sigp_restart;
-	u32 diagnose_10;
-	u32 diagnose_44;
-	u32 diagnose_9c;
+	u64 exit_userspace;
+	u64 exit_null;
+	u64 exit_external_request;
+	u64 exit_external_interrupt;
+	u64 exit_stop_request;
+	u64 exit_validity;
+	u64 exit_instruction;
+	u64 halt_successful_poll;
+	u64 halt_attempted_poll;
+	u64 instruction_lctl;
+	u64 instruction_lctlg;
+	u64 exit_program_interruption;
+	u64 exit_instr_and_program;
+	u64 deliver_external_call;
+	u64 deliver_emergency_signal;
+	u64 deliver_service_signal;
+	u64 deliver_virtio_interrupt;
+	u64 deliver_stop_signal;
+	u64 deliver_prefix_signal;
+	u64 deliver_restart_signal;
+	u64 deliver_program_int;
+	u64 deliver_io_int;
+	u64 exit_wait_state;
+	u64 instruction_pfmf;
+	u64 instruction_stidp;
+	u64 instruction_spx;
+	u64 instruction_stpx;
+	u64 instruction_stap;
+	u64 instruction_storage_key;
+	u64 instruction_stsch;
+	u64 instruction_chsc;
+	u64 instruction_stsi;
+	u64 instruction_stfl;
+	u64 instruction_tprot;
+	u64 instruction_sigp_sense;
+	u64 instruction_sigp_sense_running;
+	u64 instruction_sigp_external_call;
+	u64 instruction_sigp_emergency;
+	u64 instruction_sigp_stop;
+	u64 instruction_sigp_arch;
+	u64 instruction_sigp_prefix;
+	u64 instruction_sigp_restart;
+	u64 diagnose_10;
+	u64 diagnose_44;
+	u64 diagnose_9c;
 };
 
 struct kvm_s390_io_info {
@@ -265,7 +267,7 @@ struct kvm_vcpu_arch {
 };
 
 struct kvm_vm_stat {
-	u32 remote_tlb_flush;
+	ulong remote_tlb_flush;
 };
 
 struct kvm_arch_memory_slot {
@@ -289,4 +291,8 @@ static inline bool kvm_is_error_hva(unsigned long addr)
 
 extern int sie64a(struct kvm_s390_sie_block *, u64 *);
 extern char sie_exit;
+
+static inline void kvm_arch_vcpu_blocking(struct kvm_vcpu *vcpu) {}
+static inline void kvm_arch_vcpu_unblocking(struct kvm_vcpu *vcpu) {}
+
 #endif

@@ -39,6 +39,7 @@
 #include "auxtrace.h"
 #include "tsc.h"
 #include "intel-pt.h"
+#include "config.h"
 
 #include "intel-pt-decoder/intel-pt-log.h"
 #include "intel-pt-decoder/intel-pt-decoder.h"
@@ -490,7 +491,7 @@ static int intel_pt_walk_next_insn(struct intel_pt_insn *intel_pt_insn,
 		start_ip = *ip;
 
 		/* Load maps to ensure dso->is_64_bit has been updated */
-		map__load(al.map, NULL);
+		map__load(al.map);
 
 		x86_64 = al.map->dso->is_64_bit;
 
@@ -641,7 +642,7 @@ static bool intel_pt_exclude_kernel(struct intel_pt *pt)
 {
 	struct perf_evsel *evsel;
 
-	evlist__for_each(pt->session->evlist, evsel) {
+	evlist__for_each_entry(pt->session->evlist, evsel) {
 		if (intel_pt_get_config(pt, &evsel->attr, NULL) &&
 		    !evsel->attr.exclude_kernel)
 			return false;
@@ -657,7 +658,7 @@ static bool intel_pt_return_compression(struct intel_pt *pt)
 	if (!pt->noretcomp_bit)
 		return true;
 
-	evlist__for_each(pt->session->evlist, evsel) {
+	evlist__for_each_entry(pt->session->evlist, evsel) {
 		if (intel_pt_get_config(pt, &evsel->attr, &config) &&
 		    (config & pt->noretcomp_bit))
 			return false;
@@ -677,7 +678,7 @@ static unsigned int intel_pt_mtc_period(struct intel_pt *pt)
 	for (shift = 0, config = pt->mtc_freq_bits; !(config & 1); shift++)
 		config >>= 1;
 
-	evlist__for_each(pt->session->evlist, evsel) {
+	evlist__for_each_entry(pt->session->evlist, evsel) {
 		if (intel_pt_get_config(pt, &evsel->attr, &config))
 			return (config & pt->mtc_freq_bits) >> shift;
 	}
@@ -693,7 +694,7 @@ static bool intel_pt_timeless_decoding(struct intel_pt *pt)
 	if (!pt->tsc_bit || !pt->cap_user_time_zero)
 		return true;
 
-	evlist__for_each(pt->session->evlist, evsel) {
+	evlist__for_each_entry(pt->session->evlist, evsel) {
 		if (!(evsel->attr.sample_type & PERF_SAMPLE_TIME))
 			return true;
 		if (intel_pt_get_config(pt, &evsel->attr, &config)) {
@@ -710,7 +711,7 @@ static bool intel_pt_tracing_kernel(struct intel_pt *pt)
 {
 	struct perf_evsel *evsel;
 
-	evlist__for_each(pt->session->evlist, evsel) {
+	evlist__for_each_entry(pt->session->evlist, evsel) {
 		if (intel_pt_get_config(pt, &evsel->attr, NULL) &&
 		    !evsel->attr.exclude_kernel)
 			return true;
@@ -727,7 +728,7 @@ static bool intel_pt_have_tsc(struct intel_pt *pt)
 	if (!pt->tsc_bit)
 		return false;
 
-	evlist__for_each(pt->session->evlist, evsel) {
+	evlist__for_each_entry(pt->session->evlist, evsel) {
 		if (intel_pt_get_config(pt, &evsel->attr, &config)) {
 			if (config & pt->tsc_bit)
 				have_tsc = true;
@@ -1385,7 +1386,7 @@ static u64 intel_pt_switch_ip(struct intel_pt *pt, u64 *ptss_ip)
 	if (!map)
 		return 0;
 
-	if (map__load(map, NULL))
+	if (map__load(map))
 		return 0;
 
 	start = dso__first_symbol(map->dso, MAP__FUNCTION);
@@ -1944,7 +1945,7 @@ static int intel_pt_synth_events(struct intel_pt *pt,
 	u64 id;
 	int err;
 
-	evlist__for_each(evlist, evsel) {
+	evlist__for_each_entry(evlist, evsel) {
 		if (evsel->attr.type == pt->pmu_type && evsel->ids) {
 			found = true;
 			break;
@@ -2024,7 +2025,7 @@ static int intel_pt_synth_events(struct intel_pt *pt,
 		pt->sample_transactions = true;
 		pt->transactions_id = id;
 		id += 1;
-		evlist__for_each(evlist, evsel) {
+		evlist__for_each_entry(evlist, evsel) {
 			if (evsel->id && evsel->id[0] == pt->transactions_id) {
 				if (evsel->name)
 					zfree(&evsel->name);
@@ -2062,7 +2063,7 @@ static struct perf_evsel *intel_pt_find_sched_switch(struct perf_evlist *evlist)
 {
 	struct perf_evsel *evsel;
 
-	evlist__for_each_reverse(evlist, evsel) {
+	evlist__for_each_entry_reverse(evlist, evsel) {
 		const char *name = perf_evsel__name(evsel);
 
 		if (!strcmp(name, "sched:sched_switch"))
@@ -2076,7 +2077,7 @@ static bool intel_pt_find_switch(struct perf_evlist *evlist)
 {
 	struct perf_evsel *evsel;
 
-	evlist__for_each(evlist, evsel) {
+	evlist__for_each_entry(evlist, evsel) {
 		if (evsel->attr.context_switch)
 			return true;
 	}
@@ -2158,7 +2159,9 @@ int intel_pt_process_auxtrace_info(union perf_event *event,
 
 	addr_filters__init(&pt->filts);
 
-	perf_config(intel_pt_perf_config, pt);
+	err = perf_config(intel_pt_perf_config, pt);
+	if (err)
+		goto err_free;
 
 	err = auxtrace_queues__init(&pt->queues);
 	if (err)

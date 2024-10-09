@@ -18,7 +18,6 @@
 #define _MEI_CLIENT_H_
 
 #include <linux/types.h>
-#include <linux/watchdog.h>
 #include <linux/poll.h>
 #include <linux/mei.h>
 
@@ -104,10 +103,10 @@ struct mei_cl *mei_cl_allocate(struct mei_device *dev);
 void mei_cl_init(struct mei_cl *cl, struct mei_device *dev);
 
 
-int mei_cl_link(struct mei_cl *cl, int id);
+int mei_cl_link(struct mei_cl *cl);
 int mei_cl_unlink(struct mei_cl *cl);
 
-struct mei_cl *mei_cl_alloc_linked(struct mei_device *dev, int id);
+struct mei_cl *mei_cl_alloc_linked(struct mei_device *dev);
 
 struct mei_cl_cb *mei_cl_read_cb(const struct mei_cl *cl,
 				 const struct file *fp);
@@ -120,9 +119,6 @@ struct mei_cl_cb *mei_cl_enqueue_ctrl_wr_cb(struct mei_cl *cl, size_t length,
 					    const struct file *fp);
 int mei_cl_flush_queues(struct mei_cl *cl, const struct file *fp);
 
-int mei_cl_flow_ctrl_creds(struct mei_cl *cl);
-
-int mei_cl_flow_ctrl_reduce(struct mei_cl *cl);
 /*
  *  MEI input output function prototype
  */
@@ -229,7 +225,7 @@ int mei_cl_irq_write(struct mei_cl *cl, struct mei_cl_cb *cb,
 
 void mei_cl_complete(struct mei_cl *cl, struct mei_cl_cb *cb);
 
-void mei_host_client_init(struct work_struct *work);
+void mei_host_client_init(struct mei_device *dev);
 
 u8 mei_cl_notify_fop2req(enum mei_cb_file_ops fop);
 enum mei_cb_file_ops mei_cl_notify_req2fop(u8 request);

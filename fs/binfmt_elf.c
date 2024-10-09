@@ -31,6 +31,7 @@
 #include <linux/security.h>
 #include <linux/random.h>
 #include <linux/elf.h>
+#include <linux/elf-randomize.h>
 #include <linux/utsname.h>
 #include <linux/coredump.h>
 #include <linux/sched.h>
@@ -85,13 +86,19 @@ static struct linux_binfmt elf_format = {
 
 #define BAD_ADDR(x) ((unsigned long)(x) >= TASK_SIZE)
 
-static int set_brk(unsigned long start, unsigned long end)
+static int set_brk(unsigned long start, unsigned long end, int prot)
 {
 	start = ELF_PAGEALIGN(start);
 	end = ELF_PAGEALIGN(end);
 	if (end > start) {
 		unsigned long addr;
-		addr = vm_brk(start, end - start);
+		/*
+		 * Map the last of the bss segment.
+		 * If the header is requesting these pages to be
+		 * executable, honour that (ppc32 needs this).
+		 */
+		addr = vm_brk_flags(start, end - start,
+				prot & PROT_EXEC ? VM_EXEC : 0);
 		if (BAD_ADDR(addr))
 			return addr;
 	}
@@ -397,6 +404,7 @@ static unsigned long load_elf_interp(struct elfhdr *interp_elf_ex,
 	unsigned long load_addr = 0;
 	int load_addr_set = 0;
 	unsigned long last_bss = 0, elf_bss = 0;
+	int bss_prot = 0;
 	unsigned long error = ~0UL;
 	unsigned long total_size;
 	int retval, i, size;
@@ -505,8 +513,10 @@ static unsigned long load_elf_interp(struct elfhdr *interp_elf_ex,
 			 * elf_bss and last_bss is the bss section.
 			 */
 			k = load_addr + eppnt->p_memsz + eppnt->p_vaddr;
-			if (k > last_bss)
+			if (k > last_bss) {
 				last_bss = k;
+				bss_prot = elf_prot;
+			}
 		}
 	}
 
@@ -526,7 +536,8 @@ static unsigned long load_elf_interp(struct elfhdr *interp_elf_ex,
 		elf_bss = ELF_PAGESTART(elf_bss + ELF_MIN_ALIGN - 1);
 
 		/* Map the last of the bss segment */
-		error = vm_brk(elf_bss, last_bss - elf_bss);
+		error = vm_brk_flags(elf_bss, last_bss - elf_bss,
+				bss_prot & PROT_EXEC ? VM_EXEC : 0);
 		if (BAD_ADDR(error))
 			goto out_close;
 	}
@@ -557,7 +568,7 @@ static unsigned long randomize_stack_top(unsigned long stack_top)
 
 	if ((current->flags & PF_RANDOMIZE) &&
 		!(current->personality & ADDR_NO_RANDOMIZE)) {
-		random_variable = (unsigned long) get_random_int();
+		random_variable = get_random_long();
 		random_variable &= STACK_RND_MASK;
 		random_variable <<= PAGE_SHIFT;
 	}
@@ -577,6 +588,7 @@ static int load_elf_binary(struct linux_binprm *bprm)
 	unsigned long error;
 	struct elf_phdr *elf_ppnt, *elf_phdata;
 	unsigned long elf_bss, elf_brk;
+	int bss_prot = 0;
 	int retval, i;
 	unsigned int size;
 	unsigned long elf_entry;
@@ -765,7 +777,8 @@ static int load_elf_binary(struct linux_binprm *bprm)
 			   before this one. Map anonymous pages, if needed,
 			   and clear the area.  */
 			retval = set_brk(elf_bss + load_bias,
-					 elf_brk + load_bias);
+					 elf_brk + load_bias,
+					 bss_prot);
 			if (retval) {
 				send_sig(SIGKILL, current, 0);
 				goto out_free_dentry;
@@ -803,21 +816,10 @@ static int load_elf_binary(struct linux_binprm *bprm)
 			 * default mmap base, as well as whatever program they
 			 * might try to exec.  This is because the brk will
 			 * follow the loader, and is not movable.  */
-#ifdef CONFIG_ARCH_BINFMT_ELF_RANDOMIZE_PIE
-			/* Memory randomization might have been switched off
-			 * in runtime via sysctl or explicit setting of
-			 * personality flags.
-			 * If that is the case, retain the original non-zero
-			 * load_bias value in order to establish proper
-			 * non-randomized mappings.
-			 */
+			load_bias = ELF_ET_DYN_BASE - vaddr;
 			if (current->flags & PF_RANDOMIZE)
-				load_bias = 0;
-			else
-				load_bias = ELF_PAGESTART(ELF_ET_DYN_BASE - vaddr);
-#else
-			load_bias = ELF_PAGESTART(ELF_ET_DYN_BASE - vaddr);
-#endif
+				load_bias += arch_mmap_rnd();
+			load_bias = ELF_PAGESTART(load_bias);
 			total_size = total_mapping_size(elf_phdata,
 							loc->elf_ex.e_phnum);
 			if (!total_size) {
@@ -874,8 +876,10 @@ static int load_elf_binary(struct linux_binprm *bprm)
 		if (end_data < k)
 			end_data = k;
 		k = elf_ppnt->p_vaddr + elf_ppnt->p_memsz;
-		if (k > elf_brk)
+		if (k > elf_brk) {
+			bss_prot = elf_prot;
 			elf_brk = k;
+		}
 	}
 
 	loc->elf_ex.e_entry += load_bias;
@@ -891,7 +895,7 @@ static int load_elf_binary(struct linux_binprm *bprm)
 	 * mapping in the interpreter, to make sure it doesn't wind
 	 * up getting placed where the bss needs to go.
 	 */
-	retval = set_brk(elf_bss, elf_brk);
+	retval = set_brk(elf_bss, elf_brk, bss_prot);
 	if (retval) {
 		send_sig(SIGKILL, current, 0);
 		goto out_free_dentry;
@@ -963,15 +967,13 @@ static int load_elf_binary(struct linux_binprm *bprm)
 	current->mm->end_data = end_data;
 	current->mm->start_stack = bprm->p;
 
-#ifdef arch_randomize_brk
 	if ((current->flags & PF_RANDOMIZE) && (randomize_va_space > 1)) {
 		current->mm->brk = current->mm->start_brk =
 			arch_randomize_brk(current->mm);
-#ifdef CONFIG_COMPAT_BRK
+#ifdef compat_brk_randomized
 		current->brk_randomized = 1;
 #endif
 	}
-#endif
 
 	if (current->personality & MMAP_PAGE_ZERO) {
 		/* Why this, you ask???  Well SVr4 maps page 0 as read-only,

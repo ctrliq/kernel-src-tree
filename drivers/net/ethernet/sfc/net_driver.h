@@ -139,8 +139,6 @@ struct efx_special_buffer {
  * struct efx_tx_buffer - buffer state for a TX descriptor
  * @skb: When @flags & %EFX_TX_BUF_SKB, the associated socket buffer to be
  *	freed when descriptor completes
- * @heap_buf: When @flags & %EFX_TX_BUF_HEAP, the associated heap buffer to be
- *	freed when descriptor completes.
  * @option: When @flags & %EFX_TX_BUF_OPTION, a NIC-specific option descriptor.
  * @dma_addr: DMA address of the fragment.
  * @flags: Flags for allocation and DMA mapping type
@@ -151,10 +149,7 @@ struct efx_special_buffer {
  * Only valid if @unmap_len != 0.
  */
 struct efx_tx_buffer {
-	union {
-		const struct sk_buff *skb;
-		void *heap_buf;
-	};
+	const struct sk_buff *skb;
 	union {
 		efx_qword_t option;
 		dma_addr_t dma_addr;
@@ -166,7 +161,6 @@ struct efx_tx_buffer {
 };
 #define EFX_TX_BUF_CONT		1	/* not last descriptor of packet */
 #define EFX_TX_BUF_SKB		2	/* buffer is last part of skb */
-#define EFX_TX_BUF_HEAP		4	/* buffer was allocated with kmalloc() */
 #define EFX_TX_BUF_MAP_SINGLE	8	/* buffer was mapped with dma_map_single() */
 #define EFX_TX_BUF_OPTION	0x10	/* empty buffer for option descriptor */
 
@@ -752,6 +746,7 @@ struct vfdi_status;
  * @rx_hash_key: Toeplitz hash key for RSS
  * @rx_indir_table: Indirection table for RSS
  * @rx_scatter: Scatter mode enabled for receives
+ * @rss_active: RSS enabled on hardware
  * @rx_hash_udp_4tuple: UDP 4-tuple hashing enabled
  * @int_error_count: Number of internal errors seen recently
  * @int_error_expire: Time at which error count will be expired
@@ -890,6 +885,7 @@ struct efx_nic {
 	u8 rx_hash_key[40];
 	u32 rx_indir_table[128];
 	bool rx_scatter;
+	bool rss_active;
 	bool rx_hash_udp_4tuple;
 
 	unsigned int_error_count;
@@ -1073,6 +1069,7 @@ struct efx_udp_tunnel {
  * @tx_remove: Free resources for TX queue
  * @tx_write: Write TX descriptors and doorbell
  * @rx_push_rss_config: Write RSS hash key and indirection table to the NIC
+ * @rx_pull_rss_config: Read RSS hash key and indirection table back from the NIC
  * @rx_probe: Allocate resources for RX queue
  * @rx_init: Initialise RX queue on the NIC
  * @rx_remove: Free resources for RX queue
@@ -1209,7 +1206,8 @@ struct efx_nic_type {
 	unsigned int (*tx_limit_len)(struct efx_tx_queue *tx_queue,
 				     dma_addr_t dma_addr, unsigned int len);
 	int (*rx_push_rss_config)(struct efx_nic *efx, bool user,
-				  const u32 *rx_indir_table);
+				  const u32 *rx_indir_table, const u8 *key);
+	int (*rx_pull_rss_config)(struct efx_nic *efx);
 	int (*rx_probe)(struct efx_rx_queue *rx_queue);
 	void (*rx_init)(struct efx_rx_queue *rx_queue);
 	void (*rx_remove)(struct efx_rx_queue *rx_queue);
@@ -1313,6 +1311,7 @@ struct efx_nic_type {
 	int mcdi_max_ver;
 	unsigned int max_rx_ip_filters;
 	u32 hwtstamp_filters;
+	unsigned int rx_hash_key_size;
 };
 
 /**************************************************************************

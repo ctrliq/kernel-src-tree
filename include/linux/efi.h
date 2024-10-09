@@ -578,6 +578,9 @@ typedef efi_status_t efi_query_variable_store_t(u32 attributes, unsigned long si
 #define EFI_FILE_INFO_ID \
     EFI_GUID(  0x9576e92, 0x6d3f, 0x11d2, 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b )
 
+#define EFI_SYSTEM_RESOURCE_TABLE_GUID \
+    EFI_GUID(  0xb122a263, 0x3661, 0x4f68, 0x99, 0x29, 0x78, 0xf8, 0xb0, 0xd6, 0x21, 0x80 )
+
 #define EFI_FILE_SYSTEM_GUID \
     EFI_GUID(  0x964e5b22, 0x6459, 0x11d2, 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b )
 
@@ -848,6 +851,8 @@ extern struct efi {
 	struct efi_memory_map *memmap;
 	/* SMBIOS table (64 bit entry point) */
 	RH_KABI_EXTEND(unsigned long smbios3)
+	/* ESRT table */
+	RH_KABI_EXTEND(unsigned long esrt)
 } efi;
 
 static inline int
@@ -885,17 +890,25 @@ static inline efi_status_t efi_query_variable_store(u32 attributes, unsigned lon
 #endif
 extern void __iomem *efi_lookup_mapped_addr(u64 phys_addr);
 extern int efi_config_init(efi_config_table_type_t *arch_tables);
+#ifdef CONFIG_EFI_ESRT
+extern void __init efi_esrt_init(void);
+#else
+static inline void efi_esrt_init(void) { }
+#endif
 extern u64 efi_get_iobase (void);
 extern u32 efi_mem_type (unsigned long phys_addr);
 extern u64 efi_mem_attributes (unsigned long phys_addr);
 extern u64 efi_mem_attribute (unsigned long phys_addr, unsigned long size);
 extern int __init efi_uart_console_only (void);
+extern u64 efi_mem_desc_end(efi_memory_desc_t *md);
+extern int efi_mem_desc_lookup(u64 phys_addr, efi_memory_desc_t *out_md);
 extern void efi_initialize_iomem_resources(struct resource *code_resource,
 		struct resource *data_resource, struct resource *bss_resource);
 extern void efi_get_time(struct timespec *now);
 extern int efi_set_rtc_mmss(const struct timespec *now);
 extern void efi_reserve_boot_services(void);
 extern struct efi_memory_map memmap;
+extern struct kobject *efi_kobj;
 
 struct key;
 extern int __init parse_efi_signature_list(const void *data, size_t size,

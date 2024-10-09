@@ -43,6 +43,7 @@
 #include <linux/semaphore.h>
 #include <rdma/ib_smi.h>
 #include <linux/delay.h>
+#include <linux/etherdevice.h>
 
 #include <asm/io.h>
 
@@ -1995,6 +1996,8 @@ static int mlx4_master_activate_admin_state(struct mlx4_priv *priv, int slave)
 	int port, err;
 	struct mlx4_vport_state *vp_admin;
 	struct mlx4_vport_oper_state *vp_oper;
+	struct mlx4_slave_state *slave_state =
+		&priv->mfunc.master.slave_state[slave];
 	struct mlx4_active_ports actv_ports = mlx4_get_active_ports(
 			&priv->dev, slave);
 	int min_port = find_first_bit(actv_ports.ports,
@@ -2009,7 +2012,19 @@ static int mlx4_master_activate_admin_state(struct mlx4_priv *priv, int slave)
 			priv->mfunc.master.vf_admin[slave].enable_smi[port];
 		vp_oper = &priv->mfunc.master.vf_oper[slave].vport[port];
 		vp_admin = &priv->mfunc.master.vf_admin[slave].vport[port];
-		vp_oper->state = *vp_admin;
+		if (vp_admin->vlan_proto != htons(ETH_P_8021AD) ||
+		    slave_state->vst_qinq_supported) {
+			vp_oper->state.vlan_proto   = vp_admin->vlan_proto;
+			vp_oper->state.default_vlan = vp_admin->default_vlan;
+			vp_oper->state.default_qos  = vp_admin->default_qos;
+		}
+		vp_oper->state.link_state = vp_admin->link_state;
+		vp_oper->state.mac        = vp_admin->mac;
+		vp_oper->state.spoofchk   = vp_admin->spoofchk;
+		vp_oper->state.tx_rate    = vp_admin->tx_rate;
+		vp_oper->state.qos_vport  = vp_admin->qos_vport;
+		vp_oper->state.guid       = vp_admin->guid;
+
 		if (MLX4_VGT != vp_admin->default_vlan) {
 			err = __mlx4_register_vlan(&priv->dev, port,
 						   vp_admin->default_vlan, &(vp_oper->vlan_idx));
@@ -2097,6 +2112,7 @@ static void mlx4_master_do_cmd(struct mlx4_dev *dev, int slave, u8 cmd,
 		mlx4_warn(dev, "Received reset from slave:%d\n", slave);
 		slave_state[slave].active = false;
 		slave_state[slave].old_vlan_api = false;
+		slave_state[slave].vst_qinq_supported = false;
 		mlx4_master_deactivate_admin_state(priv, slave);
 		for (i = 0; i < MLX4_EVENT_TYPES_NUM; ++i) {
 				slave_state[slave].event_eq[i].eqn = -1;
@@ -2375,6 +2391,7 @@ int mlx4_multi_func_init(struct mlx4_dev *dev)
 			vf_oper = &priv->mfunc.master.vf_oper[i];
 			s_state = &priv->mfunc.master.slave_state[i];
 			s_state->last_cmd = MLX4_COMM_CMD_RESET;
+			s_state->vst_qinq_supported = false;
 			mutex_init(&priv->mfunc.master.gen_eqe_mutex[i]);
 			for (j = 0; j < MLX4_EVENT_TYPES_NUM; ++j)
 				s_state->event_eq[j].eqn = -1;
@@ -2950,7 +2967,7 @@ static bool mlx4_valid_vf_state_change(struct mlx4_dev *dev, int port,
 	return false;
 }
 
-int mlx4_set_vf_mac(struct mlx4_dev *dev, int port, int vf, u64 mac)
+int mlx4_set_vf_mac(struct mlx4_dev *dev, int port, int vf, u8 *mac)
 {
 	struct mlx4_priv *priv = mlx4_priv(dev);
 	struct mlx4_vport_state *s_info;
@@ -2959,13 +2976,22 @@ int mlx4_set_vf_mac(struct mlx4_dev *dev, int port, int vf, u64 mac)
 	if (!mlx4_is_master(dev))
 		return -EPROTONOSUPPORT;
 
+	if (is_multicast_ether_addr(mac))
+		return -EINVAL;
+
 	slave = mlx4_get_slave_indx(dev, vf);
 	if (slave < 0)
 		return -EINVAL;
 
 	port = mlx4_slaves_closest_port(dev, slave, port);
 	s_info = &priv->mfunc.master.vf_admin[slave].vport[port];
-	s_info->mac = mac;
+
+	if (s_info->spoofchk && is_zero_ether_addr(mac)) {
+		mlx4_info(dev, "MAC invalidation is not allowed when spoofchk is on\n");
+		return -EPERM;
+	}
+
+	s_info->mac = mlx4_mac_to_u64(mac);
 	mlx4_info(dev, "default mac on vf %d port %d to %llX will take effect only after vf restart\n",
 		  vf, port, s_info->mac);
 	return 0;
@@ -2973,10 +2999,13 @@ int mlx4_set_vf_mac(struct mlx4_dev *dev, int port, int vf, u64 mac)
 EXPORT_SYMBOL_GPL(mlx4_set_vf_mac);
 
 
-int mlx4_set_vf_vlan(struct mlx4_dev *dev, int port, int vf, u16 vlan, u8 qos)
+int mlx4_set_vf_vlan(struct mlx4_dev *dev, int port, int vf, u16 vlan, u8 qos,
+		     __be16 proto)
 {
 	struct mlx4_priv *priv = mlx4_priv(dev);
 	struct mlx4_vport_state *vf_admin;
+	struct mlx4_slave_state *slave_state;
+	struct mlx4_vport_oper_state *vf_oper;
 	int slave;
 
 	if ((!mlx4_is_master(dev)) ||
@@ -2986,12 +3015,31 @@ int mlx4_set_vf_vlan(struct mlx4_dev *dev, int port, int vf, u16 vlan, u8 qos)
 	if ((vlan > 4095) || (qos > 7))
 		return -EINVAL;
 
+	if (proto == htons(ETH_P_8021AD) &&
+	    !(dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_SVLAN_BY_QP))
+		return -EPROTONOSUPPORT;
+
+	if (proto != htons(ETH_P_8021Q) &&
+	    proto != htons(ETH_P_8021AD))
+		return -EINVAL;
+
+	if ((proto == htons(ETH_P_8021AD)) &&
+	    ((vlan == 0) || (vlan == MLX4_VGT)))
+		return -EINVAL;
+
 	slave = mlx4_get_slave_indx(dev, vf);
 	if (slave < 0)
 		return -EINVAL;
 
+	slave_state = &priv->mfunc.master.slave_state[slave];
+	if ((proto == htons(ETH_P_8021AD)) && (slave_state->active) &&
+	    (!slave_state->vst_qinq_supported)) {
+		mlx4_err(dev, "vf %d does not support VST QinQ mode\n", vf);
+		return -EPROTONOSUPPORT;
+	}
 	port = mlx4_slaves_closest_port(dev, slave, port);
 	vf_admin = &priv->mfunc.master.vf_admin[slave].vport[port];
+	vf_oper = &priv->mfunc.master.vf_oper[slave].vport[port];
 
 	if (!mlx4_valid_vf_state_change(dev, port, vf_admin, vlan, qos))
 		return -EPERM;
@@ -3001,6 +3049,7 @@ int mlx4_set_vf_vlan(struct mlx4_dev *dev, int port, int vf, u16 vlan, u8 qos)
 	else
 		vf_admin->default_vlan = vlan;
 	vf_admin->default_qos = qos;
+	vf_admin->vlan_proto = proto;
 
 	/* If rate was configured prior to VST, we saved the configured rate
 	 * in vf_admin->rate and now, if priority supported we enforce the QoS
@@ -3009,7 +3058,12 @@ int mlx4_set_vf_vlan(struct mlx4_dev *dev, int port, int vf, u16 vlan, u8 qos)
 	    vf_admin->tx_rate)
 		vf_admin->qos_vport = slave;
 
-	if (mlx4_master_immediate_activate_vlan_qos(priv, slave, port))
+	/* Try to activate new vf state without restart,
+	 * this option is not supported while moving to VST QinQ mode.
+	 */
+	if ((proto == htons(ETH_P_8021AD) &&
+	     vf_oper->state.vlan_proto != proto) ||
+	    mlx4_master_immediate_activate_vlan_qos(priv, slave, port))
 		mlx4_info(dev,
 			  "updating vf %d port %d config will take effect on next VF restart\n",
 			  vf, port);
@@ -3110,6 +3164,7 @@ int mlx4_set_vf_spoofchk(struct mlx4_dev *dev, int port, int vf, bool setting)
 	struct mlx4_priv *priv = mlx4_priv(dev);
 	struct mlx4_vport_state *s_info;
 	int slave;
+	u8 mac[ETH_ALEN];
 
 	if ((!mlx4_is_master(dev)) ||
 	    !(dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_FSM))
@@ -3121,6 +3176,13 @@ int mlx4_set_vf_spoofchk(struct mlx4_dev *dev, int port, int vf, bool setting)
 
 	port = mlx4_slaves_closest_port(dev, slave, port);
 	s_info = &priv->mfunc.master.vf_admin[slave].vport[port];
+
+	mlx4_u64_to_mac(mac, s_info->mac);
+	if (setting && !is_valid_ether_addr(mac)) {
+		mlx4_info(dev, "Illegal MAC with spoofchk\n");
+		return -EPERM;
+	}
+
 	s_info->spoofchk = setting;
 
 	return 0;
@@ -3153,6 +3215,7 @@ int mlx4_get_vf_config(struct mlx4_dev *dev, int port, int vf, struct ifla_vf_in
 
 	ivf->vlan		= s_info->default_vlan;
 	ivf->qos		= s_info->default_qos;
+	ivf->vlan_proto		= s_info->vlan_proto;
 
 	if (mlx4_is_vf_vst_and_prio_qos(dev, port, s_info))
 		ivf->max_tx_rate = s_info->tx_rate;

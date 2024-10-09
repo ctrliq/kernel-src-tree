@@ -22,7 +22,6 @@
 #include <linux/ctype.h>
 #include <linux/projid.h>
 #include <linux/fs_struct.h>
-#include <linux/moduleparam.h>
 
 static struct kmem_cache *user_ns_cachep __read_mostly;
 static DEFINE_MUTEX(userns_state_mutex);
@@ -30,6 +29,17 @@ static DEFINE_MUTEX(userns_state_mutex);
 static bool new_idmap_permitted(const struct file *file,
 				struct user_namespace *ns, int cap_setid,
 				struct uid_gid_map *map);
+static void free_user_ns(struct work_struct *work);
+
+static struct ucounts *inc_user_namespaces(struct user_namespace *ns, kuid_t uid)
+{
+	return inc_ucount(ns, uid, UCOUNT_USER_NAMESPACES);
+}
+
+static void dec_user_namespaces(struct ucounts *ucounts)
+{
+	return dec_ucount(ucounts, UCOUNT_USER_NAMESPACES);
+}
 
 static void set_cred_user_ns(struct cred *cred, struct user_namespace *user_ns)
 {
@@ -50,11 +60,6 @@ static void set_cred_user_ns(struct cred *cred, struct user_namespace *user_ns)
 	cred->user_ns = user_ns;
 }
 
-/* While user namespaces remain in tech preview disable them */
-static bool enable_user_ns_creation;
-module_param_named(enable, enable_user_ns_creation, bool, 0444);
-MODULE_PARM_DESC(enable, "Enable creation of new user namespaces");
-
 /*
  * Create a new user namespace, deriving the creator from the user in the
  * passed credentials, and replacing that user with the new root user for the
@@ -68,17 +73,28 @@ int create_user_ns(struct cred *new)
 	struct user_namespace *ns, *parent_ns = new->user_ns;
 	kuid_t owner = new->euid;
 	kgid_t group = new->egid;
-	int ret;
-	static int __read_mostly called_mark_tech_preview = 0;
+	struct ucounts *ucounts;
+	int ret, i;
 
-	if (!enable_user_ns_creation)
-		return -EINVAL;
-
-	if (!called_mark_tech_preview && !xchg(&called_mark_tech_preview, 1))
-		mark_tech_preview("user namespace", NULL);
-
+	ret = -ENOSPC;
 	if (parent_ns->level > 32)
-		return -EUSERS;
+		goto fail;
+
+	ucounts = inc_user_namespaces(parent_ns, owner);
+	if (!ucounts) {
+		/*
+		 * Preserve bug comaptibility with previous versions of RHEL
+		 * and don't change the error code for user namespaces entirely
+		 * disabled.
+		 *
+		 * This allows old version of chrome to start.  Newer versions
+		 * can handle -ENOSPC properly.
+		 */
+		if ((parent_ns == &init_user_ns) &&
+		    (init_user_ns.ucount_max[UCOUNT_USER_NAMESPACES] == 0))
+			ret = -EINVAL;
+		goto fail;
+	}
 
 	/*
 	 * Verify that we can not violate the policy of which files
@@ -86,26 +102,27 @@ int create_user_ns(struct cred *new)
 	 * by verifing that the root directory is at the root of the
 	 * mount namespace which allows all files to be accessed.
 	 */
+	ret = -EPERM;
 	if (current_chrooted())
-		return -EPERM;
+		goto fail_dec;
 
 	/* The creator needs a mapping in the parent user namespace
 	 * or else we won't be able to reasonably tell userspace who
 	 * created a user_namespace.
 	 */
+	ret = -EPERM;
 	if (!kuid_has_mapping(parent_ns, owner) ||
 	    !kgid_has_mapping(parent_ns, group))
-		return -EPERM;
+		goto fail_dec;
 
+	ret = -ENOMEM;
 	ns = kmem_cache_zalloc(user_ns_cachep, GFP_KERNEL);
 	if (!ns)
-		return -ENOMEM;
+		goto fail_dec;
 
 	ret = proc_alloc_inum(&ns->proc_inum);
-	if (ret) {
-		kmem_cache_free(user_ns_cachep, ns);
-		return ret;
-	}
+	if (ret)
+		goto fail_free;
 
 	atomic_set(&ns->count, 1);
 	/* Leave the new->user_ns reference with the new user namespace. */
@@ -113,20 +130,39 @@ int create_user_ns(struct cred *new)
 	ns->level = parent_ns->level + 1;
 	ns->owner = owner;
 	ns->group = group;
+	INIT_WORK(&ns->work, free_user_ns);
+	for (i = 0; i < UCOUNT_COUNTS; i++) {
+		ns->ucount_max[i] = INT_MAX;
+	}
+	ns->ucounts = ucounts;
 
 	/* Inherit USERNS_SETGROUPS_ALLOWED from our parent */
 	mutex_lock(&userns_state_mutex);
 	ns->flags = parent_ns->flags;
 	mutex_unlock(&userns_state_mutex);
 
-	set_cred_user_ns(new, ns);
-
-	update_mnt_policy(ns);
-
 #ifdef CONFIG_PERSISTENT_KEYRINGS
 	init_rwsem(&ns->persistent_keyring_register_sem);
 #endif
+	ret = -ENOMEM;
+	if (!setup_userns_sysctls(ns))
+		goto fail_keyring;
+
+	set_cred_user_ns(new, ns);
+
+	update_mnt_policy(ns);
 	return 0;
+fail_keyring:
+#ifdef CONFIG_PERSISTENT_KEYRINGS
+	key_put(ns->persistent_keyring_register);
+#endif
+fail_free:
+	proc_free_inum(ns->proc_inum);
+	kmem_cache_free(user_ns_cachep, ns);
+fail_dec:
+	dec_user_namespaces(ucounts);
+fail:
+	return ret;
 }
 
 int unshare_userns(unsigned long unshare_flags, struct cred **new_cred)
@@ -149,21 +185,30 @@ int unshare_userns(unsigned long unshare_flags, struct cred **new_cred)
 	return err;
 }
 
-void free_user_ns(struct user_namespace *ns)
+static void free_user_ns(struct work_struct *work)
 {
-	struct user_namespace *parent;
+	struct user_namespace *parent, *ns =
+		container_of(work, struct user_namespace, work);
 
 	do {
+		struct ucounts *ucounts = ns->ucounts;
 		parent = ns->parent;
+		retire_userns_sysctls(ns);
 #ifdef CONFIG_PERSISTENT_KEYRINGS
 		key_put(ns->persistent_keyring_register);
 #endif
 		proc_free_inum(ns->proc_inum);
 		kmem_cache_free(user_ns_cachep, ns);
+		dec_user_namespaces(ucounts);
 		ns = parent;
 	} while (atomic_dec_and_test(&parent->count));
 }
-EXPORT_SYMBOL(free_user_ns);
+
+void __put_user_ns(struct user_namespace *ns)
+{
+	schedule_work(&ns->work);
+}
+EXPORT_SYMBOL(__put_user_ns);
 
 static u32 map_id_range_down(struct uid_gid_map *map, u32 id, u32 count)
 {
@@ -1016,6 +1061,10 @@ const struct proc_ns_operations userns_operations = {
 static __init int user_namespaces_init(void)
 {
 	user_ns_cachep = KMEM_CACHE(user_namespace, SLAB_PANIC);
+	/* To make user namespaces something to opt in to for existing
+	 * RHEL users default ucount_max to 0.
+	 */
+	init_user_ns.ucount_max[UCOUNT_USER_NAMESPACES] = 0;
 	return 0;
 }
 subsys_initcall(user_namespaces_init);

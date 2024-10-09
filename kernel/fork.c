@@ -53,6 +53,7 @@
 #include <linux/rmap.h>
 #include <linux/ksm.h>
 #include <linux/acct.h>
+#include <linux/userfaultfd_k.h>
 #include <linux/tsacct_kern.h>
 #include <linux/cn_proc.h>
 #include <linux/freezer.h>
@@ -71,6 +72,11 @@
 #include <linux/signalfd.h>
 #include <linux/uprobes.h>
 #include <linux/aio.h>
+#include <linux/hmm.h>
+#include <linux/compiler.h>
+#ifndef __GENKSYMS__
+#include <linux/user_namespace.h>
+#endif
 
 #include <asm/pgtable.h>
 #include <asm/pgalloc.h>
@@ -97,16 +103,16 @@ DEFINE_PER_CPU(unsigned long, process_counts) = 0;
 /* Place it into the same section/cacheline with tasklist_lock */
 __attribute__((__section__(".data..cacheline_aligned")))
 static atomic_t tasklist_waiters = ATOMIC_INIT(0);
-__cacheline_aligned DEFINE_RWLOCK(tasklist_lock);  /* outer */
+__cacheline_aligned DEFINE_QRWLOCK(tasklist_lock);  /* outer */
 
 void tasklist_write_lock_irq(void)
 {
 	local_irq_disable();
-	if (write_trylock(&tasklist_lock))
+	if (qwrite_trylock(&tasklist_lock))
 		return;
 
 	atomic_inc(&tasklist_waiters);
-	write_lock(&tasklist_lock);
+	qwrite_lock(&tasklist_lock);
 	atomic_dec(&tasklist_waiters);
 }
 
@@ -121,7 +127,7 @@ void tasklist_read_lock(void)
 	while (atomic_read(&tasklist_waiters))
 		cpu_relax();
 no_wait:
-	read_lock(&tasklist_lock);
+	qread_lock(&tasklist_lock);
 }
 
 #ifdef CONFIG_PROVE_RCU
@@ -279,6 +285,7 @@ void __init __weak arch_task_cache_init(void) { }
 
 void __init fork_init(unsigned long mempages)
 {
+	int i;
 #ifndef CONFIG_ARCH_TASK_STRUCT_ALLOCATOR
 #ifndef ARCH_MIN_TASKALIGN
 #define ARCH_MIN_TASKALIGN	L1_CACHE_BYTES
@@ -309,9 +316,13 @@ void __init fork_init(unsigned long mempages)
 	init_task.signal->rlim[RLIMIT_NPROC].rlim_max = max_threads/2;
 	init_task.signal->rlim[RLIMIT_SIGPENDING] =
 		init_task.signal->rlim[RLIMIT_NPROC];
+
+	for (i = 0; i < UCOUNT_COUNTS; i++) {
+		init_user_ns.ucount_max[i] = max_threads/2;
+	}
 }
 
-int __attribute__((weak)) arch_dup_task_struct(struct task_struct *dst,
+int __weak arch_dup_task_struct(struct task_struct *dst,
 					       struct task_struct *src)
 {
 	*dst = *src;
@@ -382,6 +393,7 @@ static int dup_mmap(struct mm_struct *mm, struct mm_struct *oldmm)
 	int retval;
 	unsigned long charge;
 	struct mempolicy *pol;
+	LIST_HEAD(uf);
 
 	uprobe_start_dup_mmap();
 	down_write(&oldmm->mmap_sem);
@@ -441,11 +453,13 @@ static int dup_mmap(struct mm_struct *mm, struct mm_struct *oldmm)
 			goto fail_nomem_policy;
 		vma_set_policy(tmp, pol);
 		tmp->vm_mm = mm;
+		retval = dup_userfaultfd(tmp, &uf);
+		if (retval)
+			goto fail_nomem_anon_vma_fork;
 		if (anon_vma_fork(tmp, mpnt))
 			goto fail_nomem_anon_vma_fork;
-		tmp->vm_flags &= ~(VM_LOCKED|VM_UFFD_MISSING|VM_UFFD_WP);
+		tmp->vm_flags &= ~(VM_LOCKED);
 		tmp->vm_next = tmp->vm_prev = NULL;
-		tmp->vm_userfaultfd_ctx = NULL_VM_UFFD_CTX;
 		file = tmp->vm_file;
 		if (file) {
 			struct inode *inode = file_inode(file);
@@ -505,6 +519,7 @@ out:
 	up_write(&mm->mmap_sem);
 	flush_tlb_mm(oldmm);
 	up_write(&oldmm->mmap_sem);
+	dup_userfaultfd_complete(&uf);
 	uprobe_end_dup_mmap();
 	return retval;
 fail_nomem_anon_vma_fork:
@@ -645,6 +660,7 @@ void __mmdrop(struct mm_struct *mm)
 	BUG_ON(mm == &init_mm);
 	mm_free_pgd(mm);
 	destroy_context(mm);
+	hmm_mm_destroy(mm);
 	mmu_notifier_mm_destroy(mm);
 	check_mm(mm);
 	free_mm(mm);
@@ -1076,6 +1092,7 @@ static int copy_sighand(unsigned long clone_flags, struct task_struct *tsk)
 	rcu_assign_pointer(tsk->sighand, sig);
 	if (!sig)
 		return -ENOMEM;
+
 	atomic_set(&sig->count, 1);
 	memcpy(sig->action, current->sighand->action, sizeof(sig->action));
 	return 0;
@@ -1137,6 +1154,7 @@ static int copy_signal(unsigned long clone_flags, struct task_struct *tsk)
 	init_sigpending(&sig->shared_pending);
 	INIT_LIST_HEAD(&sig->posix_timers);
 	seqlock_init(&sig->stats_lock);
+	prev_cputime_init(&sig->prev_cputime);
 
 	hrtimer_init(&sig->real_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	sig->real_timer.function = it_real_fn;
@@ -1336,9 +1354,8 @@ static struct task_struct *copy_process(unsigned long clone_flags,
 
 	p->utime = p->stime = p->gtime = 0;
 	p->utimescaled = p->stimescaled = 0;
-#ifndef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
-	p->prev_cputime.utime = p->prev_cputime.stime = 0;
-#endif
+	prev_cputime_init(&p->prev_cputime);
+
 #ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
 	seqlock_init(&p->vtime_seqlock);
 	p->vtime_snap = 0;
@@ -1555,7 +1572,7 @@ static struct task_struct *copy_process(unsigned long clone_flags,
 	recalc_sigpending();
 	if (signal_pending(current)) {
 		spin_unlock(&current->sighand->siglock);
-		write_unlock_irq(&tasklist_lock);
+		qwrite_unlock_irq(&tasklist_lock);
 		retval = -ERESTARTNOINTR;
 		goto bad_fork_cancel_cgroup;
 	}
@@ -1595,7 +1612,7 @@ static struct task_struct *copy_process(unsigned long clone_flags,
 
 	total_forks++;
 	spin_unlock(&current->sighand->siglock);
-	write_unlock_irq(&tasklist_lock);
+	qwrite_unlock_irq(&tasklist_lock);
 	proc_fork_connector(p);
 	cgroup_post_fork(p, cgrp_ss_priv);
 	if (clone_flags & CLONE_THREAD)

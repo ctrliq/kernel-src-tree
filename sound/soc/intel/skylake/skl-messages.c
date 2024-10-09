@@ -327,7 +327,7 @@ int skl_suspend_dsp(struct skl *skl)
 	int ret;
 
 	/* if ppcap is not supported return 0 */
-	if (!skl->ebus.ppcap)
+	if (!skl->ebus.bus.ppcap)
 		return 0;
 
 	ret = skl_dsp_sleep(ctx->dsp);
@@ -347,7 +347,7 @@ int skl_resume_dsp(struct skl *skl)
 	int ret;
 
 	/* if ppcap is not supported return 0 */
-	if (!skl->ebus.ppcap)
+	if (!skl->ebus.bus.ppcap)
 		return 0;
 
 	/* enable ppcap interrupt */

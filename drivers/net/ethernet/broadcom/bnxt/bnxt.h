@@ -1,6 +1,7 @@
 /* Broadcom NetXtreme-C/E network driver.
  *
  * Copyright (c) 2014-2016 Broadcom Corporation
+ * Copyright (c) 2016-2017 Broadcom Limited
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -11,10 +12,10 @@
 #define BNXT_H
 
 #define DRV_MODULE_NAME		"bnxt_en"
-#define DRV_MODULE_VERSION	"1.6.0"
+#define DRV_MODULE_VERSION	"1.7.0"
 
 #define DRV_VER_MAJ	1
-#define DRV_VER_MIN	6
+#define DRV_VER_MIN	7
 #define DRV_VER_UPD	0
 
 struct tx_bd {
@@ -387,6 +388,9 @@ struct rx_tpa_end_cmp_ext {
 #define DB_KEY_TX_PUSH						(0x4 << 28)
 #define DB_LONG_TX_PUSH						(0x2 << 24)
 
+#define BNXT_MIN_ROCE_CP_RINGS	2
+#define BNXT_MIN_ROCE_STAT_CTXS	1
+
 #define INVALID_HW_RING_ID	((u16)-1)
 
 /* The hardware supports certain page sizes.  Use the supported page sizes
@@ -651,20 +655,8 @@ struct bnxt_napi {
 	struct bnxt_rx_ring_info	*rx_ring;
 	struct bnxt_tx_ring_info	*tx_ring;
 
-#ifdef CONFIG_NET_RX_BUSY_POLL
-	atomic_t		poll_state;
-#endif
 	bool			in_reset;
 };
-
-#ifdef CONFIG_NET_RX_BUSY_POLL
-enum bnxt_poll_state_t {
-	BNXT_STATE_IDLE = 0,
-	BNXT_STATE_NAPI,
-	BNXT_STATE_POLL,
-	BNXT_STATE_DISABLE,
-};
-#endif
 
 struct bnxt_irq {
 	irq_handler_t	handler;
@@ -717,6 +709,7 @@ struct bnxt_vnic_info {
 #define BNXT_VNIC_RFS_FLAG	2
 #define BNXT_VNIC_MCAST_FLAG	4
 #define BNXT_VNIC_UCAST_FLAG	8
+#define BNXT_VNIC_RFS_NEW_RSS_FLAG	0x10
 };
 
 #if defined(CONFIG_BNXT_SRIOV)
@@ -779,10 +772,12 @@ struct bnxt_pf_info {
 
 struct bnxt_ntuple_filter {
 	struct hlist_node	hash;
+	u8			dst_mac_addr[ETH_ALEN];
 	u8			src_mac_addr[ETH_ALEN];
 	struct flow_keys	fkeys;
 	__le64			filter_id;
 	u16			sw_id;
+	u8			l2_fltr_idx;
 	u16			rxq;
 	u32			flow_id;
 	unsigned long		state;
@@ -969,6 +964,13 @@ struct bnxt {
 	#define BNXT_FLAG_PORT_STATS	0x400
 	#define BNXT_FLAG_UDP_RSS_CAP	0x800
 	#define BNXT_FLAG_EEE_CAP	0x1000
+	#define BNXT_FLAG_NEW_RSS_CAP	0x2000
+	#define BNXT_FLAG_ROCEV1_CAP	0x8000
+	#define BNXT_FLAG_ROCEV2_CAP	0x10000
+	#define BNXT_FLAG_ROCE_CAP	(BNXT_FLAG_ROCEV1_CAP |	\
+					 BNXT_FLAG_ROCEV2_CAP)
+	#define BNXT_FLAG_NO_AGG_RINGS	0x20000
+	#define BNXT_FLAG_FW_LLDP_AGENT	0x80000
 	#define BNXT_FLAG_CHIP_NITRO_A0	0x1000000
 
 	#define BNXT_FLAG_ALL_CONFIG_FEATS (BNXT_FLAG_TPA |		\
@@ -980,6 +982,9 @@ struct bnxt {
 #define BNXT_NPAR(bp)		((bp)->port_partition_type)
 #define BNXT_SINGLE_PF(bp)	(BNXT_PF(bp) && !BNXT_NPAR(bp))
 #define BNXT_CHIP_TYPE_NITRO_A0(bp) ((bp)->flags & BNXT_FLAG_CHIP_NITRO_A0)
+
+	struct bnxt_en_dev	*edev;
+	struct bnxt_en_dev *	(*ulp_probe)(struct net_device *);
 
 	struct bnxt_napi	**bnapi;
 
@@ -1037,10 +1042,17 @@ struct bnxt {
 	unsigned long		state;
 #define BNXT_STATE_OPEN		0
 #define BNXT_STATE_IN_SP_TASK	1
-#define BNXT_STATE_FN_RST_DONE	2
 
 	struct bnxt_irq	*irq_tbl;
+	int			total_irqs;
 	u8			mac_addr[ETH_ALEN];
+
+#ifdef CONFIG_BNXT_DCB
+	struct ieee_pfc		*ieee_pfc;
+	struct ieee_ets		*ieee_ets;
+	u8			dcbx_cap;
+	u8			default_pri;
+#endif /* CONFIG_BNXT_DCB */
 
 	u32			msg_enable;
 
@@ -1136,92 +1148,12 @@ struct bnxt {
 	struct bnxt_led_info	leds[BNXT_MAX_LED];
 };
 
-#ifdef CONFIG_NET_RX_BUSY_POLL
-static inline void bnxt_enable_poll(struct bnxt_napi *bnapi)
-{
-	atomic_set(&bnapi->poll_state, BNXT_STATE_IDLE);
-}
+#define BNXT_RX_STATS_OFFSET(counter)			\
+	(offsetof(struct rx_port_stats, counter) / 8)
 
-/* called from the NAPI poll routine to get ownership of a bnapi */
-static inline bool bnxt_lock_napi(struct bnxt_napi *bnapi)
-{
-	int rc = atomic_cmpxchg(&bnapi->poll_state, BNXT_STATE_IDLE,
-				BNXT_STATE_NAPI);
-
-	return rc == BNXT_STATE_IDLE;
-}
-
-static inline void bnxt_unlock_napi(struct bnxt_napi *bnapi)
-{
-	atomic_set(&bnapi->poll_state, BNXT_STATE_IDLE);
-}
-
-/* called from the busy poll routine to get ownership of a bnapi */
-static inline bool bnxt_lock_poll(struct bnxt_napi *bnapi)
-{
-	int rc = atomic_cmpxchg(&bnapi->poll_state, BNXT_STATE_IDLE,
-				BNXT_STATE_POLL);
-
-	return rc == BNXT_STATE_IDLE;
-}
-
-static inline void bnxt_unlock_poll(struct bnxt_napi *bnapi)
-{
-	atomic_set(&bnapi->poll_state, BNXT_STATE_IDLE);
-}
-
-static inline bool bnxt_busy_polling(struct bnxt_napi *bnapi)
-{
-	return atomic_read(&bnapi->poll_state) == BNXT_STATE_POLL;
-}
-
-static inline void bnxt_disable_poll(struct bnxt_napi *bnapi)
-{
-	int old;
-
-	while (1) {
-		old = atomic_cmpxchg(&bnapi->poll_state, BNXT_STATE_IDLE,
-				     BNXT_STATE_DISABLE);
-		if (old == BNXT_STATE_IDLE)
-			break;
-		usleep_range(500, 5000);
-	}
-}
-
-#else
-
-static inline void bnxt_enable_poll(struct bnxt_napi *bnapi)
-{
-}
-
-static inline bool bnxt_lock_napi(struct bnxt_napi *bnapi)
-{
-	return true;
-}
-
-static inline void bnxt_unlock_napi(struct bnxt_napi *bnapi)
-{
-}
-
-static inline bool bnxt_lock_poll(struct bnxt_napi *bnapi)
-{
-	return false;
-}
-
-static inline void bnxt_unlock_poll(struct bnxt_napi *bnapi)
-{
-}
-
-static inline bool bnxt_busy_polling(struct bnxt_napi *bnapi)
-{
-	return false;
-}
-
-static inline void bnxt_disable_poll(struct bnxt_napi *bnapi)
-{
-}
-
-#endif
+#define BNXT_TX_STATS_OFFSET(counter)			\
+	((offsetof(struct tx_port_stats, counter) +	\
+	  sizeof(struct rx_port_stats) + 512) / 8)
 
 #define I2C_DEV_ADDR_A0				0xa0
 #define I2C_DEV_ADDR_A2				0xa2
@@ -1240,8 +1172,17 @@ int hwrm_send_message(struct bnxt *, void *, u32, int);
 int hwrm_send_message_silent(struct bnxt *, void *, u32, int);
 int bnxt_hwrm_func_rgtr_async_events(struct bnxt *bp, unsigned long *bmap,
 				     int bmap_size);
+int bnxt_hwrm_vnic_cfg(struct bnxt *bp, u16 vnic_id);
+int __bnxt_hwrm_get_tx_rings(struct bnxt *bp, u16 fid, int *tx_rings);
+int bnxt_hwrm_reserve_tx_rings(struct bnxt *bp, int *tx_rings);
 int bnxt_hwrm_set_coal(struct bnxt *);
-int bnxt_hwrm_func_qcaps(struct bnxt *);
+unsigned int bnxt_get_max_func_stat_ctxs(struct bnxt *bp);
+void bnxt_set_max_func_stat_ctxs(struct bnxt *bp, unsigned int max);
+unsigned int bnxt_get_max_func_cp_rings(struct bnxt *bp);
+void bnxt_set_max_func_cp_rings(struct bnxt *bp, unsigned int max);
+void bnxt_set_max_func_irqs(struct bnxt *bp, unsigned int max);
+void bnxt_tx_disable(struct bnxt *bp);
+void bnxt_tx_enable(struct bnxt *bp);
 int bnxt_hwrm_set_pause(struct bnxt *);
 int bnxt_hwrm_set_link_setting(struct bnxt *, bool, bool);
 int bnxt_hwrm_fw_set_time(struct bnxt *);
@@ -1249,4 +1190,5 @@ int bnxt_open_nic(struct bnxt *, bool, bool);
 int bnxt_close_nic(struct bnxt *, bool, bool);
 int bnxt_setup_mq_tc(struct net_device *dev, u8 tc);
 int bnxt_get_max_rings(struct bnxt *, int *, int *, bool);
+void bnxt_restore_pf_fw_resources(struct bnxt *bp);
 #endif

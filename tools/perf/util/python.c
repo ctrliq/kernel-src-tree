@@ -295,18 +295,6 @@ static bool is_tracepoint(struct pyrf_event *pevent)
 	return pevent->evsel->attr.type == PERF_TYPE_TRACEPOINT;
 }
 
-static int is_printable_array(char *p, unsigned int len)
-{
-	unsigned int i;
-
-	for (i = 0; i < len; i++) {
-		if (!isprint(p[i]) && !isspace(p[i]))
-			return 0;
-	}
-
-	return 1;
-}
-
 static PyObject*
 tracepoint_field(struct pyrf_event *pe, struct format_field *field)
 {
@@ -1061,7 +1049,7 @@ static PyObject *pyrf_evlist__item(PyObject *obj, Py_ssize_t i)
 	if (i >= pevlist->evlist.nr_entries)
 		return NULL;
 
-	evlist__for_each(&pevlist->evlist, pos) {
+	evlist__for_each_entry(&pevlist->evlist, pos) {
 		if (i-- == 0)
 			break;
 	}

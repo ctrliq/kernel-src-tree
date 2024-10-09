@@ -274,14 +274,12 @@ EXPORT_SYMBOL_GPL(vmbus_prep_negotiate_resp);
  */
 static struct vmbus_channel *alloc_channel(void)
 {
-	static atomic_t chan_num = ATOMIC_INIT(0);
 	struct vmbus_channel *channel;
 
 	channel = kzalloc(sizeof(*channel), GFP_ATOMIC);
 	if (!channel)
 		return NULL;
 
-	channel->id = atomic_inc_return(&chan_num);
 	channel->acquire_ring_lock = true;
 	spin_lock_init(&channel->inbound_lock);
 	spin_lock_init(&channel->lock);
@@ -350,6 +348,7 @@ void hv_process_channel_removal(struct vmbus_channel *channel, u32 relid)
 	struct vmbus_channel *primary_channel;
 
 	BUG_ON(!channel->rescind);
+	BUG_ON(!mutex_is_locked(&vmbus_connection.channel_mutex));
 
 	hv_event_tasklet_disable(channel);
 	if (channel->target_cpu != get_cpu()) {
@@ -363,9 +362,7 @@ void hv_process_channel_removal(struct vmbus_channel *channel, u32 relid)
 	hv_event_tasklet_enable(channel);
 
 	if (channel->primary_channel == NULL) {
-		mutex_lock(&vmbus_connection.channel_mutex);
 		list_del(&channel->listentry);
-		mutex_unlock(&vmbus_connection.channel_mutex);
 
 		primary_channel = channel;
 	} else {
@@ -414,6 +411,7 @@ static void vmbus_process_offer(struct vmbus_channel *newchannel)
 	bool fnew = true;
 	unsigned long flags;
 	u16 dev_type;
+	int ret;
 
 	/* Make sure this is a new offer */
 	mutex_lock(&vmbus_connection.channel_mutex);
@@ -498,7 +496,11 @@ static void vmbus_process_offer(struct vmbus_channel *newchannel)
 	 * binding which eventually invokes the device driver's AddDevice()
 	 * method.
 	 */
-	if (vmbus_device_register(newchannel->device_obj) != 0) {
+	mutex_lock(&vmbus_connection.channel_mutex);
+	ret = vmbus_device_register(newchannel->device_obj);
+	mutex_unlock(&vmbus_connection.channel_mutex);
+
+	if (ret != 0) {
 		pr_err("unable to add child device object (relid %d)\n",
 			newchannel->offermsg.child_relid);
 		kfree(newchannel->device_obj);
@@ -806,6 +808,8 @@ static void vmbus_onoffer_rescind(struct vmbus_channel_message_header *hdr)
 	struct device *dev;
 
 	rescind = (struct vmbus_channel_rescind_offer *)hdr;
+
+	mutex_lock(&vmbus_connection.channel_mutex);
 	channel = relid2channel(rescind->child_relid);
 
 	if (channel == NULL) {
@@ -814,7 +818,7 @@ static void vmbus_onoffer_rescind(struct vmbus_channel_message_header *hdr)
 		 * vmbus_process_offer(), we have already invoked
 		 * vmbus_release_relid() on error.
 		 */
-		return;
+		goto out;
 	}
 
 	spin_lock_irqsave(&channel->lock, flags);
@@ -822,6 +826,10 @@ static void vmbus_onoffer_rescind(struct vmbus_channel_message_header *hdr)
 	spin_unlock_irqrestore(&channel->lock, flags);
 
 	if (channel->device_obj) {
+		if (channel->chn_rescind_callback) {
+			channel->chn_rescind_callback(channel);
+			goto out;
+		}
 		/*
 		 * We will have to unregister this device from the
 		 * driver core.
@@ -835,7 +843,24 @@ static void vmbus_onoffer_rescind(struct vmbus_channel_message_header *hdr)
 		hv_process_channel_removal(channel,
 			channel->offermsg.child_relid);
 	}
+
+out:
+	mutex_unlock(&vmbus_connection.channel_mutex);
 }
+
+void vmbus_hvsock_device_unregister(struct vmbus_channel *channel)
+{
+	mutex_lock(&vmbus_connection.channel_mutex);
+
+	BUG_ON(!is_hvsock_channel(channel));
+
+	channel->rescind = true;
+	vmbus_device_unregister(channel->device_obj);
+
+	mutex_unlock(&vmbus_connection.channel_mutex);
+}
+EXPORT_SYMBOL_GPL(vmbus_hvsock_device_unregister);
+
 
 /*
  * vmbus_onoffers_delivered -
@@ -1191,3 +1216,10 @@ bool vmbus_are_subchannels_present(struct vmbus_channel *primary)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(vmbus_are_subchannels_present);
+
+void vmbus_set_chn_rescind_callback(struct vmbus_channel *channel,
+		void (*chn_rescind_cb)(struct vmbus_channel *))
+{
+	channel->chn_rescind_callback = chn_rescind_cb;
+}
+EXPORT_SYMBOL_GPL(vmbus_set_chn_rescind_callback);

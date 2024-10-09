@@ -21,7 +21,7 @@ static struct sk_buff *__skb_udp_tunnel_segment(struct sk_buff *skb,
 	__be16 new_protocol, bool is_ipv6)
 {
 	int tnl_hlen = skb_inner_mac_header(skb) - skb_transport_header(skb);
-	bool remcsum, need_csum, offload_csum, ufo;
+	bool remcsum, need_csum, offload_csum, ufo, gso_partial;
 	struct sk_buff *segs = ERR_PTR(-EINVAL);
 	struct udphdr *uh = udp_hdr(skb);
 	u16 mac_offset = skb->mac_header;
@@ -39,8 +39,11 @@ static struct sk_buff *__skb_udp_tunnel_segment(struct sk_buff *skb,
 	 * 16 bit length field due to the header being added outside of an
 	 * IP or IPv6 frame that was already limited to 64K - 1.
 	 */
-	partial = csum_sub(csum_unfold(uh->check),
-			   (__force __wsum)htonl(skb->len));
+	if (skb_shinfo(skb)->gso_type & SKB_GSO_PARTIAL)
+		partial = (__force __wsum)uh->len;
+	else
+		partial = (__force __wsum)htonl(skb->len);
+	partial = csum_sub(csum_unfold(uh->check), partial);
 
 	/* setup inner skb. */
 	skb->encapsulation = 0;
@@ -54,8 +57,7 @@ static struct sk_buff *__skb_udp_tunnel_segment(struct sk_buff *skb,
 	need_csum = !!(skb_shinfo(skb)->gso_type & SKB_GSO_UDP_TUNNEL_CSUM);
 	skb->encap_hdr_csum = need_csum;
 
-	remcsum = !!(skb_shinfo(skb)->gso_type & SKB_GSO_TUNNEL_REMCSUM);
-	skb->remcsum_offload = remcsum;
+	remcsum = skb->remcsum_offload;
 
 	ufo = !!(skb_shinfo(skb)->gso_type & SKB_GSO_UDP);
 
@@ -85,11 +87,13 @@ static struct sk_buff *__skb_udp_tunnel_segment(struct sk_buff *skb,
 		goto out;
 	}
 
+	gso_partial = !!(skb_shinfo(segs)->gso_type & SKB_GSO_PARTIAL);
+
 	outer_hlen = skb_tnl_header_len(skb);
 	udp_offset = outer_hlen - tnl_hlen;
 	skb = segs;
 	do {
-		__be16 len;
+		unsigned int len;
 
 		if (remcsum)
 			skb->ip_summed = CHECKSUM_NONE;
@@ -107,14 +111,26 @@ static struct sk_buff *__skb_udp_tunnel_segment(struct sk_buff *skb,
 		skb_reset_mac_header(skb);
 		skb_set_network_header(skb, mac_len);
 		skb_set_transport_header(skb, udp_offset);
-		len = htons(skb->len - udp_offset);
+		len = skb->len - udp_offset;
 		uh = udp_hdr(skb);
-		uh->len = len;
+
+		/* If we are only performing partial GSO the inner header
+		 * will be using a length value equal to only one MSS sized
+		 * segment instead of the entire frame.
+		 */
+		if (gso_partial) {
+			uh->len = htons(skb_shinfo(skb)->gso_size +
+					SKB_GSO_CB(skb)->data_offset +
+					skb->head - (unsigned char *)uh);
+		} else {
+			uh->len = htons(len);
+		}
 
 		if (!need_csum)
 			continue;
 
-		uh->check = ~csum_fold(csum_add(partial, (__force __wsum)len));
+		uh->check = ~csum_fold(csum_add(partial,
+				       (__force __wsum)htonl(len)));
 
 		if (skb->encapsulation || !offload_csum) {
 			uh->check = gso_make_checksum(skb, ~uh->check);
@@ -346,9 +362,6 @@ int udp_gro_complete(struct sk_buff *skb, int nhoff,
 	rcu_read_unlock();
 	if (sk)
 		sock_put(sk);
-
-	if (skb->remcsum_offload)
-		skb_shinfo(skb)->gso_type |= SKB_GSO_TUNNEL_REMCSUM;
 
 	return err;
 }

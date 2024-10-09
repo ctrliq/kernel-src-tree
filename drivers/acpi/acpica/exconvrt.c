@@ -124,7 +124,9 @@ acpi_ex_convert_to_integer(union acpi_operand_object *obj_desc,
 		 * of ACPI 3.0) is that the to_integer() operator allows both decimal
 		 * and hexadecimal strings (hex prefixed with "0x").
 		 */
-		status = acpi_ut_strtoul64((char *)pointer, flags, &result);
+		status = acpi_ut_strtoul64(ACPI_CAST_PTR(char, pointer),
+					   (acpi_gbl_integer_byte_width |
+					    flags), &result);
 		if (ACPI_FAILURE(status)) {
 			return_ACPI_STATUS(status);
 		}
@@ -227,9 +229,8 @@ acpi_ex_convert_to_buffer(union acpi_operand_object *obj_desc,
 		/* Copy the integer to the buffer, LSB first */
 
 		new_buf = return_desc->buffer.pointer;
-		ACPI_MEMCPY(new_buf,
-			    &obj_desc->integer.value,
-			    acpi_gbl_integer_byte_width);
+		memcpy(new_buf,
+		       &obj_desc->integer.value, acpi_gbl_integer_byte_width);
 		break;
 
 	case ACPI_TYPE_STRING:
@@ -252,8 +253,8 @@ acpi_ex_convert_to_buffer(union acpi_operand_object *obj_desc,
 		/* Copy the string to the buffer */
 
 		new_buf = return_desc->buffer.pointer;
-		ACPI_STRNCPY((char *)new_buf, (char *)obj_desc->string.pointer,
-			     obj_desc->string.length);
+		strncpy((char *)new_buf, (char *)obj_desc->string.pointer,
+			obj_desc->string.length);
 		break;
 
 	default:
@@ -631,7 +632,7 @@ acpi_ex_convert_to_target_type(acpi_object_type destination_type,
 			 */
 			status =
 			    acpi_ex_convert_to_integer(source_desc, result_desc,
-						       16);
+						       ACPI_STRTOUL_BASE16);
 			break;
 
 		case ACPI_TYPE_STRING:

@@ -116,10 +116,6 @@ struct drbg_state {
 	void *priv_data;	/* Cipher handle */
 	bool seeded;		/* DRBG fully seeded? */
 	bool pr;		/* Prediction resistance enabled? */
-#ifdef CONFIG_CRYPTO_FIPS
-	bool fips_primed;	/* Continuous test primed? */
-	unsigned char *prev;	/* FIPS 140-2 continuous test value */
-#endif
 	const struct drbg_state_ops *d_ops;
 	const struct drbg_core *core;
 	struct drbg_test_data *test_data;

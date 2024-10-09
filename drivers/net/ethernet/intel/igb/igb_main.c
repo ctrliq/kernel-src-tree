@@ -169,7 +169,7 @@ static int igb_set_vf_mac(struct igb_adapter *, int, unsigned char *);
 static void igb_restore_vf_multicasts(struct igb_adapter *adapter);
 static int igb_ndo_set_vf_mac(struct net_device *netdev, int vf, u8 *mac);
 static int igb_ndo_set_vf_vlan(struct net_device *netdev,
-			       int vf, u16 vlan, u8 qos);
+			       int vf, u16 vlan, u8 qos, __be16 vlan_proto);
 static int igb_ndo_set_vf_bw(struct net_device *, int, int, int);
 static int igb_ndo_set_vf_spoofchk(struct net_device *netdev, int vf,
 				   bool setting);
@@ -385,7 +385,7 @@ static void igb_dump(struct igb_adapter *adapter)
 		dev_info(&adapter->pdev->dev, "Net device Info\n");
 		pr_info("Device Name     state            trans_start      last_rx\n");
 		pr_info("%-15s %016lX %016lX %016lX\n", netdev->name,
-			netdev->state, netdev->trans_start, netdev->last_rx);
+			netdev->state, dev_trans_start(netdev), netdev->last_rx);
 	}
 
 	/* Print Registers */
@@ -2141,6 +2141,7 @@ igb_features_check(struct sk_buff *skb, struct net_device *dev,
 }
 
 static const struct net_device_ops igb_netdev_ops = {
+	.ndo_size		= sizeof(struct net_device_ops),
 	.ndo_open		= igb_open,
 	.ndo_stop		= igb_close,
 	.ndo_start_xmit		= igb_xmit_frame,
@@ -2154,7 +2155,7 @@ static const struct net_device_ops igb_netdev_ops = {
 	.ndo_vlan_rx_add_vid	= igb_vlan_rx_add_vid,
 	.ndo_vlan_rx_kill_vid	= igb_vlan_rx_kill_vid,
 	.ndo_set_vf_mac		= igb_ndo_set_vf_mac,
-	.ndo_set_vf_vlan	= igb_ndo_set_vf_vlan,
+	.extended.ndo_set_vf_vlan	= igb_ndo_set_vf_vlan,
 	.ndo_set_vf_rate	= igb_ndo_set_vf_bw,
 	.ndo_set_vf_spoofchk	= igb_ndo_set_vf_spoofchk,
 	.ndo_get_vf_config	= igb_ndo_get_vf_config,
@@ -6228,13 +6229,16 @@ static int igb_disable_port_vlan(struct igb_adapter *adapter, int vf)
 	return 0;
 }
 
-static int igb_ndo_set_vf_vlan(struct net_device *netdev,
-			       int vf, u16 vlan, u8 qos)
+static int igb_ndo_set_vf_vlan(struct net_device *netdev, int vf,
+			       u16 vlan, u8 qos, __be16 vlan_proto)
 {
 	struct igb_adapter *adapter = netdev_priv(netdev);
 
 	if ((vf >= adapter->vfs_allocated_count) || (vlan > 4095) || (qos > 7))
 		return -EINVAL;
+
+	if (vlan_proto != htons(ETH_P_8021Q))
+		return -EPROTONOSUPPORT;
 
 	return (vlan || qos) ? igb_enable_port_vlan(adapter, vf, vlan, qos) :
 			       igb_disable_port_vlan(adapter, vf);

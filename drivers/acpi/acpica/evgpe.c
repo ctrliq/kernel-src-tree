@@ -517,8 +517,8 @@ static void ACPI_SYSTEM_XFACE acpi_ev_asynch_execute_gpe_method(void *context)
 	 * Take a snapshot of the GPE info for this level - we copy the info to
 	 * prevent a race condition with remove_handler/remove_block.
 	 */
-	ACPI_MEMCPY(local_gpe_event_info, gpe_event_info,
-		    sizeof(struct acpi_gpe_event_info));
+	memcpy(local_gpe_event_info, gpe_event_info,
+	       sizeof(struct acpi_gpe_event_info));
 
 	status = acpi_ut_release_mutex(ACPI_MTX_EVENTS);
 	if (ACPI_FAILURE(status)) {

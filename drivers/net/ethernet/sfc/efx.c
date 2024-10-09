@@ -346,7 +346,7 @@ static int efx_poll(struct napi_struct *napi, int budget)
 		 * since efx_nic_eventq_read_ack() will have no effect if
 		 * interrupts have already been disabled.
 		 */
-		napi_complete(napi);
+		napi_complete_done(napi, spent);
 		efx_nic_eventq_read_ack(channel);
 	}
 
@@ -2408,6 +2408,7 @@ static void efx_udp_tunnel_del(struct net_device *dev, struct udp_tunnel_info *t
 }
 
 static const struct net_device_ops efx_netdev_ops = {
+	.ndo_size		= sizeof(struct net_device_ops),
 	.ndo_open		= efx_net_open,
 	.ndo_stop		= efx_net_stop,
 	.ndo_get_stats64	= efx_net_stats,
@@ -2423,13 +2424,13 @@ static const struct net_device_ops efx_netdev_ops = {
 	.ndo_vlan_rx_kill_vid	= efx_vlan_rx_kill_vid,
 #ifdef CONFIG_SFC_SRIOV
 	.ndo_set_vf_mac		= efx_sriov_set_vf_mac,
-	.ndo_set_vf_vlan	= efx_sriov_set_vf_vlan,
+	.extended.ndo_set_vf_vlan	= efx_sriov_set_vf_vlan,
 	.ndo_set_vf_spoofchk	= efx_sriov_set_vf_spoofchk,
 	.ndo_get_vf_config	= efx_sriov_get_vf_config,
 	.ndo_set_vf_link_state  = efx_sriov_set_vf_link_state,
 #endif
 	.ndo_get_phys_port_id   = efx_get_phys_port_id,
-	.ndo_get_phys_port_name	= efx_get_phys_port_name,
+	.extended.ndo_get_phys_port_name	= efx_get_phys_port_name,
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller = efx_netpoll,
 #endif
@@ -2437,8 +2438,8 @@ static const struct net_device_ops efx_netdev_ops = {
 #ifdef CONFIG_RFS_ACCEL
 	.ndo_rx_flow_steer	= efx_filter_rfs,
 #endif
-	.ndo_udp_tunnel_add	= efx_udp_tunnel_add,
-	.ndo_udp_tunnel_del	= efx_udp_tunnel_del,
+	.extended.ndo_udp_tunnel_add	= efx_udp_tunnel_add,
+	.extended.ndo_udp_tunnel_del	= efx_udp_tunnel_del,
 };
 
 static void efx_update_name(struct efx_nic *efx)

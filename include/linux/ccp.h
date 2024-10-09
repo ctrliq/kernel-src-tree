@@ -1,9 +1,10 @@
 /*
  * AMD Cryptographic Coprocessor (CCP) driver
  *
- * Copyright (C) 2013 Advanced Micro Devices, Inc.
+ * Copyright (C) 2013,2016 Advanced Micro Devices, Inc.
  *
  * Author: Tom Lendacky <thomas.lendacky@amd.com>
+ * Author: Gary R Hook <gary.hook@amd.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -25,6 +26,25 @@ struct ccp_cmd;
 
 #if defined(CONFIG_CRYPTO_DEV_CCP_DD) || \
 	defined(CONFIG_CRYPTO_DEV_CCP_DD_MODULE)
+
+/**
+ * ccp_present - check if a CCP device is present
+ *
+ * Returns zero if a CCP device is present, -ENODEV otherwise.
+ */
+int ccp_present(void);
+
+#define	CCP_VSIZE 16
+#define	CCP_VMASK		((unsigned int)((1 << CCP_VSIZE) - 1))
+#define	CCP_VERSION(v, r)	((unsigned int)((v << CCP_VSIZE) \
+					       | (r & CCP_VMASK)))
+
+/**
+ * ccp_version - get the version of the CCP
+ *
+ * Returns a positive version number, or zero if no CCP
+ */
+unsigned int ccp_version(void);
 
 /**
  * ccp_enqueue_cmd - queue an operation for processing by the CCP
@@ -52,6 +72,16 @@ struct ccp_cmd;
 int ccp_enqueue_cmd(struct ccp_cmd *cmd);
 
 #else /* CONFIG_CRYPTO_DEV_CCP_DD is not enabled */
+
+static inline int ccp_present(void)
+{
+	return -ENODEV;
+}
+
+static inline unsigned int ccp_version(void)
+{
+	return 0;
+}
 
 static inline int ccp_enqueue_cmd(struct ccp_cmd *cmd)
 {
@@ -145,7 +175,7 @@ struct ccp_aes_engine {
 	u32 iv_len;		/* In bytes */
 
 	struct scatterlist *src, *dst;
-	u32 src_len;		/* In bytes */
+	u64 src_len;		/* In bytes */
 
 	u32 cmac_final;		/* Indicates final cmac cmd */
 	struct scatterlist *cmac_key;	/* K1/K2 cmac key required for
@@ -202,15 +232,12 @@ struct ccp_xts_aes_engine {
 	u32 iv_len;		/* In bytes */
 
 	struct scatterlist *src, *dst;
-	u32 src_len;		/* In bytes */
+	u64 src_len;		/* In bytes */
 
 	u32 final;
 };
 
 /***** SHA engine *****/
-#define CCP_SHA_BLOCKSIZE               SHA256_BLOCK_SIZE
-#define CCP_SHA_CTXSIZE                 SHA256_DIGEST_SIZE
-
 /**
  * ccp_sha_type - type of SHA operation
  *
@@ -232,6 +259,9 @@ enum ccp_sha_type {
  * @ctx_len: length in bytes of hash value
  * @src: data to be used for this operation
  * @src_len: length in bytes of data used for this operation
+ * @opad: data to be used for final HMAC operation
+ * @opad_len: length in bytes of data used for final HMAC operation
+ * @first: indicates first SHA operation
  * @final: indicates final SHA operation
  * @msg_bits: total length of the message in bits used in final SHA operation
  *
@@ -249,8 +279,12 @@ struct ccp_sha_engine {
 	u32 ctx_len;		/* In bytes */
 
 	struct scatterlist *src;
-	u32 src_len;		/* In bytes */
+	u64 src_len;		/* In bytes */
 
+	struct scatterlist *opad;
+	u32 opad_len;		/* In bytes */
+
+	u32 first;		/* Indicates first sha cmd */
 	u32 final;		/* Indicates final sha cmd */
 	u64 msg_bits;		/* Message length in bits required for
 				 * final sha cmd */
@@ -340,7 +374,36 @@ struct ccp_passthru_engine {
 	u32 mask_len;		/* In bytes */
 
 	struct scatterlist *src, *dst;
-	u32 src_len;		/* In bytes */
+	u64 src_len;		/* In bytes */
+
+	u32 final;
+};
+
+/**
+ * struct ccp_passthru_nomap_engine - CCP pass-through operation
+ *   without performing DMA mapping
+ * @bit_mod: bitwise operation to perform
+ * @byte_swap: byteswap operation to perform
+ * @mask: mask to be applied to data
+ * @mask_len: length in bytes of mask
+ * @src: data to be used for this operation
+ * @dst: data produced by this operation
+ * @src_len: length in bytes of data used for this operation
+ * @final: indicate final pass-through operation
+ *
+ * Variables required to be set when calling ccp_enqueue_cmd():
+ *   - bit_mod, byte_swap, src, dst, src_len
+ *   - mask, mask_len if bit_mod is not CCP_PASSTHRU_BITWISE_NOOP
+ */
+struct ccp_passthru_nomap_engine {
+	enum ccp_passthru_bitwise bit_mod;
+	enum ccp_passthru_byteswap byte_swap;
+
+	dma_addr_t mask;
+	u32 mask_len;		/* In bytes */
+
+	dma_addr_t src_dma, dst_dma;
+	u64 src_len;		/* In bytes */
 
 	u32 final;
 };
@@ -486,13 +549,14 @@ enum ccp_engine {
 };
 
 /* Flag values for flags member of ccp_cmd */
-#define CCP_CMD_MAY_BACKLOG	0x00000001
+#define CCP_CMD_MAY_BACKLOG		0x00000001
+#define CCP_CMD_PASSTHRU_NO_DMA_MAP	0x00000002
 
 /**
  * struct ccp_cmd - CPP operation request
  * @entry: list element (ccp driver use only)
  * @work: work element used for callbacks (ccp driver use only)
- * @ccp: CCP device to be run on (ccp driver use only)
+ * @ccp: CCP device to be run on
  * @ret: operation return code (ccp driver use only)
  * @flags: cmd processing flags
  * @engine: CCP operation to perform
@@ -526,6 +590,7 @@ struct ccp_cmd {
 		struct ccp_sha_engine sha;
 		struct ccp_rsa_engine rsa;
 		struct ccp_passthru_engine passthru;
+		struct ccp_passthru_nomap_engine passthru_nomap;
 		struct ccp_ecc_engine ecc;
 	} u;
 

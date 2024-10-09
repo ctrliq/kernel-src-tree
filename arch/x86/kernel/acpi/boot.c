@@ -48,7 +48,6 @@
 
 #include "sleep.h" /* To include x86_acpi_suspend_lowlevel */
 static int __initdata acpi_force = 0;
-u32 acpi_rsdt_forced;
 int acpi_disabled;
 EXPORT_SYMBOL(acpi_disabled);
 
@@ -161,24 +160,37 @@ static int __init acpi_parse_madt(struct acpi_table_header *table)
 	return 0;
 }
 
-static void acpi_register_lapic(int id, u8 enabled)
+/**
+ * acpi_register_lapic - register a local apic and generates a logic cpu number
+ * @id: local apic id to register
+ * @acpiid: ACPI id to register
+ * @enabled: this cpu is enabled or not
+ *
+ * Returns the logic cpu number which maps to the local apic
+ */
+static int acpi_register_lapic(int id, u32 acpiid, u8 enabled)
 {
 	unsigned int ver = 0;
+	int cpu;
 
 	if (id >= (MAX_LOCAL_APIC-1)) {
 		printk(KERN_INFO PREFIX "skipped apicid that is too big\n");
-		return;
+		return -EINVAL;
 	}
 
 	if (!enabled) {
 		++disabled_cpus;
-		return;
+		return -EINVAL;
 	}
 
 	if (boot_cpu_physical_apicid != -1U)
 		ver = apic_version[boot_cpu_physical_apicid];
 
-	generic_processor_info(id, ver);
+	cpu = generic_processor_info(id, ver);
+	if (cpu >= 0)
+		early_per_cpu(x86_cpu_to_acpiid, cpu) = acpiid;
+
+	return cpu;
 }
 
 static int __init
@@ -208,7 +220,7 @@ acpi_parse_x2apic(struct acpi_subtable_header *header, const unsigned long end)
 	if (!apic->apic_id_valid(apic_id) && enabled)
 		printk(KERN_WARNING PREFIX "x2apic entry ignored\n");
 	else
-		acpi_register_lapic(apic_id, enabled);
+		acpi_register_lapic(apic_id, processor->uid, enabled);
 #else
 	printk(KERN_WARNING PREFIX "x2apic entry ignored\n");
 #endif
@@ -236,6 +248,7 @@ acpi_parse_lapic(struct acpi_subtable_header * header, const unsigned long end)
 	 * when we use CPU hotplug.
 	 */
 	acpi_register_lapic(processor->id,	/* APIC ID */
+			    processor->processor_id, /* ACPI ID */
 			    processor->lapic_flags & ACPI_MADT_ENABLED);
 
 	return 0;
@@ -254,6 +267,7 @@ acpi_parse_sapic(struct acpi_subtable_header *header, const unsigned long end)
 	acpi_table_print_madt_entry(header);
 
 	acpi_register_lapic((processor->id << 8) | processor->eid,/* APIC ID */
+			    processor->processor_id, /* ACPI ID */
 			    processor->lapic_flags & ACPI_MADT_ENABLED);
 
 	return 0;
@@ -724,44 +738,19 @@ static void acpi_map_cpu2node(acpi_handle handle, int cpu, int physid)
 
 static int _acpi_map_lsapic(acpi_handle handle, int physid, int *pcpu)
 {
-	cpumask_var_t tmp_map, new_map;
 	int cpu;
-	int retval = -ENOMEM;
 
-	if (!alloc_cpumask_var(&tmp_map, GFP_KERNEL))
-		goto out;
-
-	if (!alloc_cpumask_var(&new_map, GFP_KERNEL))
-		goto free_tmp_map;
-
-	cpumask_copy(tmp_map, cpu_present_mask);
-	acpi_register_lapic(physid, ACPI_MADT_ENABLED);
-
-	/*
-	 * If acpi_register_lapic successfully generates a new logical cpu
-	 * number, then the following will get us exactly what was mapped
-	 */
-	cpumask_andnot(new_map, cpu_present_mask, tmp_map);
-	if (cpumask_empty(new_map)) {
-		printk ("Unable to map lapic to logical cpu number\n");
-		retval = -EINVAL;
-		goto free_new_map;
+	cpu = acpi_register_lapic(physid, U32_MAX, ACPI_MADT_ENABLED);
+	if (cpu < 0) {
+		pr_info(PREFIX "Unable to map lapic to logical cpu number\n");
+		return cpu;
 	}
 
 	acpi_processor_set_pdc(handle);
-
-	cpu = cpumask_first(new_map);
 	acpi_map_cpu2node(handle, cpu, physid);
 
 	*pcpu = cpu;
-	retval = 0;
-
-free_new_map:
-	free_cpumask_var(new_map);
-free_tmp_map:
-	free_cpumask_var(tmp_map);
-out:
-	return retval;
+	return 0;
 }
 
 /* wrapper to silence section mismatch warning */
@@ -1569,7 +1558,7 @@ static int __init parse_acpi(char *arg)
 	}
 	/* acpi=rsdt use RSDT instead of XSDT */
 	else if (strcmp(arg, "rsdt") == 0) {
-		acpi_rsdt_forced = 1;
+		acpi_gbl_do_not_use_xsdt = TRUE;
 	}
 	/* "acpi=noirq" disables ACPI interrupt routing */
 	else if (strcmp(arg, "noirq") == 0) {

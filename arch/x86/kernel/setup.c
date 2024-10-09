@@ -113,6 +113,7 @@
 #include <asm/alternative.h>
 #include <asm/prom.h>
 #include <asm/microcode.h>
+#include <asm/kaslr.h>
 
 /*
  * max_low_pfn_mapped: highest direct mapped pfn under 4GB
@@ -515,7 +516,7 @@ static void __init memblock_x86_reserve_range_setup_data(void)
  * --------- Crashkernel reservation ------------------------------
  */
 
-#ifdef CONFIG_KEXEC
+#ifdef CONFIG_KEXEC_CORE
 
 /* 16M alignment for crash kernel regions */
 #define CRASH_ALIGN            (16 << 20)
@@ -886,16 +887,30 @@ static void rh_check_supported(void)
 		mark_hardware_unsupported("Processor");
 	}
 
+	if ((boot_cpu_data.x86_vendor == X86_VENDOR_AMD) &&
+	    (boot_cpu_data.x86 >= 0x17)) {
+		/* RHEL7 supports model AMD EPYC 7xxx (Naples SP3) */
+		if (boot_cpu_data.x86 != 0x17 ||
+		    !strstr(boot_cpu_data.x86_model_id, "AMD EPYC 7")) {
+			pr_crit("Detected CPU family %xh model %d\n",
+				boot_cpu_data.x86,
+				boot_cpu_data.x86_model);
+			mark_hardware_unsupported("AMD Processor");
+		}
+	}
+
 	/* Intel CPU family 6, model greater than 60 */
 	if ((boot_cpu_data.x86_vendor == X86_VENDOR_INTEL) &&
 	    ((boot_cpu_data.x86 == 6))) {
 		switch (boot_cpu_data.x86_model) {
 		case 158: /* Kabylake-H/S */
 		case 142: /* Kabylake-U/Y */
+		case 133: /* Knights Mill */
 		case 95: /* Denverton */
 		case 94: /* Skylake-S */
 		case 87: /* Knights Landing */
 		case 86: /* Broadwell-DE SoC */
+		case 85: /* Purley */
 		case 79: /* Broadwell-EP and EX */
 		case 78: /* Skylake-Y */
 		case 77: /* Atom Avoton */
@@ -903,16 +918,12 @@ static void rh_check_supported(void)
 		case 70: /* Crystal Well */
 		case 69: /* Haswell ULT */
 			break;
-		case 85: /* Purley 2S */
-			if (dmi_socket_count == 2)
-				break;
 		default:
 			if (boot_cpu_data.x86_model > 63) {
-				printk(KERN_CRIT
-				       "Detected CPU family %d model %d\n",
-				       boot_cpu_data.x86,
-				       boot_cpu_data.x86_model);
-				mark_hardware_unsupported("Intel CPU model");
+				pr_crit("Detected CPU family %d model %d\n",
+					boot_cpu_data.x86,
+					boot_cpu_data.x86_model);
+				mark_hardware_unsupported("Intel Processor");
 			}
 			break;
 		}
@@ -934,10 +945,15 @@ static void rh_check_supported(void)
 static int
 dump_kernel_offset(struct notifier_block *self, unsigned long v, void *p)
 {
-	pr_emerg("Kernel Offset: 0x%lx from 0x%lx "
-		 "(relocation range: 0x%lx-0x%lx)\n",
-		 (unsigned long)&_text - __START_KERNEL, __START_KERNEL,
-		 __START_KERNEL_map, MODULES_VADDR-1);
+	if (kaslr_enabled()) {
+		pr_emerg("Kernel Offset: 0x%lx from 0x%lx (relocation range: 0x%lx-0x%lx)\n",
+			 kaslr_offset(),
+			 __START_KERNEL,
+			 __START_KERNEL_map,
+			 MODULES_VADDR-1);
+	} else {
+		pr_emerg("Kernel Offset: disabled\n");
+	}
 
 	return 0;
 }
@@ -1157,6 +1173,12 @@ void __init setup_arch(char **cmdline_p)
 
 	max_possible_pfn = max_pfn;
 
+	/*
+	 * Define random base addresses for memory sections after max_pfn is
+	 * defined and before each memory section base is used.
+	 */
+	kernel_randomize_memory();
+
 #ifdef CONFIG_X86_32
 	/* max_low_pfn get updated here */
 	find_low_pfn_range();
@@ -1321,11 +1343,16 @@ void __init setup_arch(char **cmdline_p)
 	if (smp_found_config)
 		get_smp_config();
 
+	/*
+	 * Systems w/o ACPI and mptables might not have it mapped the local
+	 * APIC yet, but prefill_possible_map() might need to access it.
+	 */
+	init_apic_mappings();
+
 	prefill_possible_map();
 
 	init_cpu_to_node();
 
-	init_apic_mappings();
 	if (x86_io_apic_ops.init)
 		x86_io_apic_ops.init();
 

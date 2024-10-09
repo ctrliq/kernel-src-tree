@@ -44,6 +44,21 @@ static inline void arch_memcpy_to_pmem(void *dst, const void *src, size_t n)
 		BUG();
 }
 
+static inline int arch_memcpy_from_pmem(void *dst, const void *src,
+		size_t n)
+{
+	/*
+	 * KABI: until we can figure out how to shoe-horn mcsafe_memcpy
+	 * into RHEL, we always perform the fallback.
+	 */
+#if 0
+	if (static_cpu_has(X86_FEATURE_MCE_RECOVERY))
+		return memcpy_mcsafe(dst, (void __force *) src, n);
+#endif
+	memcpy(dst, (void __force *) src, n);
+	return 0;
+}
+
 /**
  * arch_wb_cache_pmem - write back a cache range with CLWB
  * @vaddr:	virtual start address

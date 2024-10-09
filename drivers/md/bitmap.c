@@ -192,11 +192,13 @@ static struct md_rdev *next_active_rdev(struct md_rdev *rdev, struct mddev *mdde
 
 static int write_sb_page(struct bitmap *bitmap, struct page *page, int wait)
 {
-	struct md_rdev *rdev = NULL;
+	struct md_rdev *rdev;
 	struct block_device *bdev;
 	struct mddev *mddev = bitmap->mddev;
 	struct bitmap_storage *store = &bitmap->storage;
 
+restart:
+	rdev = NULL;
 	while ((rdev = next_active_rdev(rdev, mddev)) != NULL) {
 		int size = PAGE_SIZE;
 		loff_t offset = mddev->bitmap_info.offset;
@@ -252,8 +254,8 @@ static int write_sb_page(struct bitmap *bitmap, struct page *page, int wait)
 			       page);
 	}
 
-	if (wait)
-		md_super_wait(mddev);
+	if (wait && md_super_wait(mddev) < 0)
+		goto restart;
 	return 0;
 
  bad_alignment:
@@ -389,10 +391,10 @@ static int read_page(struct file *file, unsigned long index,
 		ret = -EIO;
 out:
 	if (ret)
-		printk(KERN_ALERT "md: bitmap read error: (%dB @ %llu): %d\n",
-			(int)PAGE_SIZE,
-			(unsigned long long)index << PAGE_SHIFT,
-			ret);
+		pr_err("md: bitmap read error: (%dB @ %llu): %d\n",
+		       (int)PAGE_SIZE,
+		       (unsigned long long)index << PAGE_SHIFT,
+		       ret);
 	return ret;
 }
 
@@ -411,6 +413,13 @@ static void bitmap_wait_writes(struct bitmap *bitmap)
 		wait_event(bitmap->write_wait,
 			   atomic_read(&bitmap->pending_writes)==0);
 	else
+		/* Note that we ignore the return value.  The writes
+		 * might have failed, but that would just mean that
+		 * some bits which should be cleared haven't been,
+		 * which is safe.  The relevant bitmap blocks will
+		 * probably get written again, but there is no great
+		 * loss if they aren't.
+		 */
 		md_super_wait(bitmap->mddev);
 }
 
@@ -453,24 +462,24 @@ void bitmap_print_sb(struct bitmap *bitmap)
 	if (!bitmap || !bitmap->storage.sb_page)
 		return;
 	sb = kmap_atomic(bitmap->storage.sb_page);
-	printk(KERN_DEBUG "%s: bitmap file superblock:\n", bmname(bitmap));
-	printk(KERN_DEBUG "         magic: %08x\n", le32_to_cpu(sb->magic));
-	printk(KERN_DEBUG "       version: %d\n", le32_to_cpu(sb->version));
-	printk(KERN_DEBUG "          uuid: %08x.%08x.%08x.%08x\n",
-					*(__u32 *)(sb->uuid+0),
-					*(__u32 *)(sb->uuid+4),
-					*(__u32 *)(sb->uuid+8),
-					*(__u32 *)(sb->uuid+12));
-	printk(KERN_DEBUG "        events: %llu\n",
-			(unsigned long long) le64_to_cpu(sb->events));
-	printk(KERN_DEBUG "events cleared: %llu\n",
-			(unsigned long long) le64_to_cpu(sb->events_cleared));
-	printk(KERN_DEBUG "         state: %08x\n", le32_to_cpu(sb->state));
-	printk(KERN_DEBUG "     chunksize: %d B\n", le32_to_cpu(sb->chunksize));
-	printk(KERN_DEBUG "  daemon sleep: %ds\n", le32_to_cpu(sb->daemon_sleep));
-	printk(KERN_DEBUG "     sync size: %llu KB\n",
-			(unsigned long long)le64_to_cpu(sb->sync_size)/2);
-	printk(KERN_DEBUG "max write behind: %d\n", le32_to_cpu(sb->write_behind));
+	pr_debug("%s: bitmap file superblock:\n", bmname(bitmap));
+	pr_debug("         magic: %08x\n", le32_to_cpu(sb->magic));
+	pr_debug("       version: %d\n", le32_to_cpu(sb->version));
+	pr_debug("          uuid: %08x.%08x.%08x.%08x\n",
+		 *(__u32 *)(sb->uuid+0),
+		 *(__u32 *)(sb->uuid+4),
+		 *(__u32 *)(sb->uuid+8),
+		 *(__u32 *)(sb->uuid+12));
+	pr_debug("        events: %llu\n",
+		 (unsigned long long) le64_to_cpu(sb->events));
+	pr_debug("events cleared: %llu\n",
+		 (unsigned long long) le64_to_cpu(sb->events_cleared));
+	pr_debug("         state: %08x\n", le32_to_cpu(sb->state));
+	pr_debug("     chunksize: %d B\n", le32_to_cpu(sb->chunksize));
+	pr_debug("  daemon sleep: %ds\n", le32_to_cpu(sb->daemon_sleep));
+	pr_debug("     sync size: %llu KB\n",
+		 (unsigned long long)le64_to_cpu(sb->sync_size)/2);
+	pr_debug("max write behind: %d\n", le32_to_cpu(sb->write_behind));
 	kunmap_atomic(sb);
 }
 
@@ -504,14 +513,14 @@ static int bitmap_new_disk_sb(struct bitmap *bitmap)
 	BUG_ON(!chunksize);
 	if (!is_power_of_2(chunksize)) {
 		kunmap_atomic(sb);
-		printk(KERN_ERR "bitmap chunksize not a power of 2\n");
+		pr_warn("bitmap chunksize not a power of 2\n");
 		return -EINVAL;
 	}
 	sb->chunksize = cpu_to_le32(chunksize);
 
 	daemon_sleep = bitmap->mddev->bitmap_info.daemon_sleep;
 	if (!daemon_sleep || (daemon_sleep > MAX_SCHEDULE_TIMEOUT)) {
-		printk(KERN_INFO "Choosing daemon_sleep default (5 sec)\n");
+		pr_debug("Choosing daemon_sleep default (5 sec)\n");
 		daemon_sleep = 5 * HZ;
 	}
 	sb->daemon_sleep = cpu_to_le32(daemon_sleep);
@@ -604,7 +613,7 @@ static int bitmap_read_sb(struct bitmap *bitmap)
 	else if (write_behind > COUNTER_MAX)
 		reason = "write-behind limit out of range (0 - 16383)";
 	if (reason) {
-		printk(KERN_INFO "%s: invalid bitmap file superblock: %s\n",
+		pr_warn("%s: invalid bitmap file superblock: %s\n",
 			bmname(bitmap), reason);
 		goto out;
 	}
@@ -618,18 +627,15 @@ static int bitmap_read_sb(struct bitmap *bitmap)
 		 * bitmap's UUID and event counter to the mddev's
 		 */
 		if (memcmp(sb->uuid, bitmap->mddev->uuid, 16)) {
-			printk(KERN_INFO
-			       "%s: bitmap superblock UUID mismatch\n",
-			       bmname(bitmap));
+			pr_warn("%s: bitmap superblock UUID mismatch\n",
+				bmname(bitmap));
 			goto out;
 		}
 		events = le64_to_cpu(sb->events);
 		if (events < bitmap->mddev->events) {
-			printk(KERN_INFO
-			       "%s: bitmap file is out of date (%llu < %llu) "
-			       "-- forcing full recovery\n",
-			       bmname(bitmap), events,
-			       (unsigned long long) bitmap->mddev->events);
+			pr_warn("%s: bitmap file is out of date (%llu < %llu) -- forcing full recovery\n",
+				bmname(bitmap), events,
+				(unsigned long long) bitmap->mddev->events);
 			set_bit(BITMAP_STALE, &bitmap->flags);
 		}
 	}
@@ -793,15 +799,13 @@ static void bitmap_file_kick(struct bitmap *bitmap)
 				ptr = d_path(&bitmap->storage.file->f_path,
 					     path, PAGE_SIZE);
 
-			printk(KERN_ALERT
-			      "%s: kicking failed bitmap file %s from array!\n",
-			      bmname(bitmap), IS_ERR(ptr) ? "" : ptr);
+			pr_warn("%s: kicking failed bitmap file %s from array!\n",
+				bmname(bitmap), IS_ERR(ptr) ? "" : ptr);
 
 			kfree(path);
 		} else
-			printk(KERN_ALERT
-			       "%s: disabling internal bitmap due to errors\n",
-			       bmname(bitmap));
+			pr_warn("%s: disabling internal bitmap due to errors\n",
+				bmname(bitmap));
 	}
 }
 
@@ -971,14 +975,13 @@ static int bitmap_init_from_disk(struct bitmap *bitmap, sector_t start)
 
 	outofdate = test_bit(BITMAP_STALE, &bitmap->flags);
 	if (outofdate)
-		printk(KERN_INFO "%s: bitmap file is out of date, doing full "
-			"recovery\n", bmname(bitmap));
+		pr_warn("%s: bitmap file is out of date, doing full recovery\n", bmname(bitmap));
 
 	if (file && i_size_read(file->f_mapping->host) < store->bytes) {
-		printk(KERN_INFO "%s: bitmap file too short %lu < %lu\n",
-		       bmname(bitmap),
-		       (unsigned long) i_size_read(file->f_mapping->host),
-		       store->bytes);
+		pr_warn("%s: bitmap file too short %lu < %lu\n",
+			bmname(bitmap),
+			(unsigned long) i_size_read(file->f_mapping->host),
+			store->bytes);
 		goto err;
 	}
 
@@ -1049,16 +1052,15 @@ static int bitmap_init_from_disk(struct bitmap *bitmap, sector_t start)
 		offset = 0;
 	}
 
-	printk(KERN_INFO "%s: bitmap initialized from disk: "
-	       "read %lu pages, set %lu of %lu bits\n",
-	       bmname(bitmap), store->file_pages,
-	       bit_cnt, chunks);
+	pr_debug("%s: bitmap initialized from disk: read %lu pages, set %lu of %lu bits\n",
+		 bmname(bitmap), store->file_pages,
+		 bit_cnt, chunks);
 
 	return 0;
 
  err:
-	printk(KERN_INFO "%s: bitmap initialisation failed: %d\n",
-	       bmname(bitmap), ret);
+	pr_warn("%s: bitmap initialisation failed: %d\n",
+		bmname(bitmap), ret);
 	return ret;
 }
 
@@ -1509,7 +1511,7 @@ void bitmap_cond_end_sync(struct bitmap *bitmap, sector_t sector)
 		   atomic_read(&bitmap->mddev->recovery_active) == 0);
 
 	bitmap->mddev->curr_resync_completed = sector;
-	set_bit(MD_CHANGE_CLEAN, &bitmap->mddev->flags);
+	set_bit(MD_SB_CHANGE_CLEAN, &bitmap->mddev->sb_flags);
 	sector &= ~((1ULL << bitmap->counts.chunkshift) - 1);
 	s = 0;
 	while (s < sector && s < bitmap->mddev->resync_max_sectors) {
@@ -1598,6 +1600,9 @@ static void bitmap_free(struct bitmap *bitmap)
 	if (!bitmap) /* there was no bitmap */
 		return;
 
+	if (bitmap->sysfs_can_clear)
+		sysfs_put(bitmap->sysfs_can_clear);
+
 	/* Shouldn't be needed - but just in case.... */
 	wait_event(bitmap->write_wait,
 		   atomic_read(&bitmap->pending_writes) == 0);
@@ -1633,15 +1638,13 @@ void bitmap_destroy(struct mddev *mddev)
 	if (mddev->thread)
 		mddev->thread->timeout = MAX_SCHEDULE_TIMEOUT;
 
-	if (bitmap->sysfs_can_clear)
-		sysfs_put(bitmap->sysfs_can_clear);
-
 	bitmap_free(bitmap);
 }
 
 /*
  * initialize the bitmap structure
  * if this returns an error, bitmap_destroy must be called to do clean up
+ * once mddev->bitmap is set
  */
 int bitmap_create(struct mddev *mddev)
 {
@@ -1710,8 +1713,8 @@ int bitmap_create(struct mddev *mddev)
 	if (err)
 		goto error;
 
-	printk(KERN_INFO "created bitmap (%lu pages) for device %s\n",
-	       bitmap->counts.pages, bmname(bitmap));
+	pr_debug("created bitmap (%lu pages) for device %s\n",
+		 bitmap->counts.pages, bmname(bitmap));
 
 	mddev->bitmap = bitmap;
 	return test_bit(BITMAP_WRITE_ERROR, &bitmap->flags) ? -EIO : 0;
@@ -1857,8 +1860,10 @@ int bitmap_resize(struct bitmap *bitmap, sector_t blocks,
 	if (bitmap->mddev->bitmap_info.offset || bitmap->mddev->bitmap_info.file)
 		ret = bitmap_storage_alloc(&store, chunks,
 					   !bitmap->mddev->bitmap_info.external);
-	if (ret)
+	if (ret) {
+		bitmap_file_unmap(&store);
 		goto err;
+	}
 
 	pages = DIV_ROUND_UP(chunks, PAGE_COUNTER_RATIO);
 
@@ -1980,19 +1985,29 @@ location_show(struct mddev *mddev, char *page)
 static ssize_t
 location_store(struct mddev *mddev, const char *buf, size_t len)
 {
+	int rv;
 
+	rv = mddev_lock(mddev);
+	if (rv)
+		return rv;
 	if (mddev->pers) {
-		if (!mddev->pers->quiesce)
-			return -EBUSY;
-		if (mddev->recovery || mddev->sync_thread)
-			return -EBUSY;
+		if (!mddev->pers->quiesce) {
+			rv = -EBUSY;
+			goto out;
+		}
+		if (mddev->recovery || mddev->sync_thread) {
+			rv = -EBUSY;
+			goto out;
+		}
 	}
 
 	if (mddev->bitmap || mddev->bitmap_info.file ||
 	    mddev->bitmap_info.offset) {
 		/* bitmap already configured.  Only option is to clear it */
-		if (strncmp(buf, "none", 4) != 0)
-			return -EBUSY;
+		if (strncmp(buf, "none", 4) != 0) {
+			rv = -EBUSY;
+			goto out;
+		}
 		if (mddev->pers) {
 			mddev->pers->quiesce(mddev, 1);
 			bitmap_destroy(mddev);
@@ -2011,34 +2026,38 @@ location_store(struct mddev *mddev, const char *buf, size_t len)
 			/* nothing to be done */;
 		else if (strncmp(buf, "file:", 5) == 0) {
 			/* Not supported yet */
-			return -EINVAL;
+			rv = -EINVAL;
+			goto out;
 		} else {
-			int rv;
 			if (buf[0] == '+')
 				rv = kstrtoll(buf+1, 10, &offset);
 			else
 				rv = kstrtoll(buf, 10, &offset);
 			if (rv)
-				return rv;
-			if (offset == 0)
-				return -EINVAL;
+				goto out;
+			if (offset == 0) {
+				rv = -EINVAL;
+				goto out;
+			}
 			if (mddev->bitmap_info.external == 0 &&
 			    mddev->major_version == 0 &&
-			    offset != mddev->bitmap_info.default_offset)
-				return -EINVAL;
+			    offset != mddev->bitmap_info.default_offset) {
+				rv = -EINVAL;
+				goto out;
+			}
 			mddev->bitmap_info.offset = offset;
 			if (mddev->pers) {
 				mddev->pers->quiesce(mddev, 1);
 				rv = bitmap_create(mddev);
 				if (!rv)
 					rv = bitmap_load(mddev);
+				if (rv)
+					mddev->bitmap_info.offset = 0;
+				mddev->pers->quiesce(mddev, 0);
 				if (rv) {
 					bitmap_destroy(mddev);
-					mddev->bitmap_info.offset = 0;
+					goto out;
 				}
-				mddev->pers->quiesce(mddev, 0);
-				if (rv)
-					return rv;
 			}
 		}
 	}
@@ -2046,9 +2065,14 @@ location_store(struct mddev *mddev, const char *buf, size_t len)
 		/* Ensure new bitmap info is stored in
 		 * metadata promptly.
 		 */
-		set_bit(MD_CHANGE_DEVS, &mddev->flags);
+		set_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags);
 		md_wakeup_thread(mddev->thread);
 	}
+	rv = 0;
+out:
+	mddev_unlock(mddev);
+	if (rv)
+		return rv;
 	return len;
 }
 

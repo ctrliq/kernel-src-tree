@@ -1731,6 +1731,64 @@ unlock:
 	return ret;
 }
 
+ssize_t
+ceph_file_splice_read(struct file *in, loff_t *ppos,
+		struct pipe_inode_info *pipe, size_t len, unsigned int flags)
+{
+	ssize_t ret;
+	struct inode *inode = file_inode(in);
+	struct ceph_inode_info *ci = ceph_inode(inode);
+	struct ceph_file_info *fi = in->private_data;
+	int got, want;
+
+	if (fi->fmode & CEPH_FILE_MODE_LAZY)
+		want = CEPH_CAP_FILE_CACHE | CEPH_CAP_FILE_LAZYIO;
+	else
+		want = CEPH_CAP_FILE_CACHE;
+
+	ret = ceph_get_caps(ci, CEPH_CAP_FILE_RD, want, -1, &got, NULL);
+	if (ret < 0)
+		return ret;
+
+	if (!(got & want)) {
+		ceph_put_cap_refs(ci, got);
+		return default_file_splice_read(in, ppos, pipe, len, flags);
+	}
+
+	ret = generic_file_splice_read(in, ppos, pipe, len, flags);
+	ceph_put_cap_refs(ci, got);
+	return ret;
+}
+
+ssize_t
+ceph_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
+			loff_t *ppos, size_t len, unsigned int flags)
+{
+	ssize_t ret;
+	struct inode *inode = file_inode(out);
+	struct ceph_inode_info *ci = ceph_inode(inode);
+	struct ceph_file_info *fi = out->private_data;
+	int got, want;
+
+	if (fi->fmode & CEPH_FILE_MODE_LAZY)
+		want = CEPH_CAP_FILE_BUFFER | CEPH_CAP_FILE_LAZYIO;
+	else
+		want = CEPH_CAP_FILE_BUFFER;
+
+	ret = ceph_get_caps(ci, CEPH_CAP_FILE_WR, want, *ppos + len, &got, NULL);
+	if (ret < 0)
+		return ret;
+
+	if (!(got & want)) {
+		ceph_put_cap_refs(ci, got);
+		return default_file_splice_write(pipe, out, ppos, len, flags);
+	}
+
+	ret = generic_file_splice_write(pipe, out, ppos, len, flags);
+	ceph_put_cap_refs(ci, got);
+	return ret;
+}
+
 const struct file_operations ceph_file_fops = {
 	.open = ceph_open,
 	.release = ceph_release,
@@ -1743,8 +1801,8 @@ const struct file_operations ceph_file_fops = {
 	.fsync = ceph_fsync,
 	.lock = ceph_lock,
 	.flock = ceph_flock,
-	.splice_read = generic_file_splice_read,
-	.splice_write = generic_file_splice_write,
+	.splice_read = ceph_file_splice_read,
+	.splice_write = ceph_file_splice_write,
 	.unlocked_ioctl = ceph_ioctl,
 	.compat_ioctl	= ceph_ioctl,
 	.fallocate	= ceph_fallocate,

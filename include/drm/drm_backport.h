@@ -12,6 +12,7 @@
 #include <linux/hrtimer.h>
 #include <linux/err.h>
 #include <linux/io.h>
+#include <linux/console.h>
 
 /**
  * ktime_mono_to_real - Convert monotonic time to clock realtime
@@ -112,30 +113,6 @@ extern struct workqueue_struct *system_power_efficient_wq;
 
 #include <linux/rculist.h>
 
-/**
- * hlist_add_behind_rcu
- * @n: the new element to add to the hash list.
- * @prev: the existing element to add the new element after.
- *
- * Description:
- * Adds the specified element to the specified hlist
- * after the specified node while permitting racing traversals.
- *
- * The caller must take whatever precautions are necessary
- * (such as holding appropriate locks) to avoid racing
- * with another list-mutation primitive, such as hlist_add_head_rcu()
- * or hlist_del_rcu(), running on this same list.
- * However, it is perfectly legal to run concurrently with
- * the _rcu list-traversal primitives, such as
- * hlist_for_each_entry_rcu(), used to prevent memory-consistency
- * problems on Alpha CPUs.
- */
-static inline void hlist_add_behind_rcu(struct hlist_node *n,
-                                       struct hlist_node *prev)
-{
-	hlist_add_after_rcu(prev, n);
-}
-
 /* stubs, we don't have mipi-dsi.. */
 struct mipi_dsi_device;
 struct mipi_dsi_packet;
@@ -198,14 +175,164 @@ enum acpi_backlight_type {
 static inline enum acpi_backlight_type acpi_video_get_backlight_type(void)
 {
 	int acpi_video_backlight_support(void);
+#if IS_ENABLED(CONFIG_ACPI_VIDEO)
 	bool acpi_video_verify_backlight_support(void);
 	if (acpi_video_backlight_support() &&
 			!acpi_video_verify_backlight_support())
 		return acpi_backlight_native;
+#else
+	if (acpi_video_backlight_support())
+		return acpi_backlight_native;
+#endif
 	return acpi_backlight_undef;
 }
 
 static inline bool apple_gmux_present(void) { return false; }
+static inline bool vga_switcheroo_client_probe_defer(struct pci_dev *pdev) { return false; }
+
+/* cmpxchg_relaxed */
+#ifndef cmpxchg_relaxed
+#define  cmpxchg_relaxed		cmpxchg
+#define  cmpxchg_acquire		cmpxchg
+#define  cmpxchg_release		cmpxchg
+#endif
+
+static inline int register_vmap_purge_notifier(struct notifier_block *nb)
+{
+	return 0;
+}
+
+static inline int unregister_vmap_purge_notifier(struct notifier_block *nb)
+{
+	return 0;
+}
+
+enum mutex_trylock_recursive_enum {
+	MUTEX_TRYLOCK_FAILED    = 0,
+	MUTEX_TRYLOCK_SUCCESS   = 1,
+	MUTEX_TRYLOCK_RECURSIVE,
+};
+
+static bool mutex_is_locked_by(struct mutex *mutex, struct task_struct *task)
+{
+	if (!mutex_is_locked(mutex))
+		return false;
+
+#if defined(CONFIG_SMP) || defined(CONFIG_DEBUG_MUTEXES)
+	return mutex->owner == task;
+#else
+	/* Since UP may be pre-empted, we cannot assume that we own the lock */
+	return false;
+#endif
+}
+
+static inline __deprecated __must_check enum mutex_trylock_recursive_enum
+mutex_trylock_recursive(struct mutex *lock)
+{
+	/* BACKPORT NOTE:
+	 * Different from upstream to avoid backporting
+	 * 3ca0ff571b092ee4d807f1168caa428d95b0173b, but functionally
+	 * equivalent for i915 to previous behavior
+	 */
+	if (unlikely(mutex_is_locked_by(lock, current)))
+		return MUTEX_TRYLOCK_RECURSIVE;
+
+	return mutex_trylock(lock);
+}
+
+
+/*
+ * On x86 PAT systems we have memory tracking that keeps track of
+ * the allowed mappings on memory ranges. This tracking works for
+ * all the in-kernel mapping APIs (ioremap*), but where the user
+ * wishes to map a range from a physical device into user memory
+ * the tracking won't be updated. This API is to be used by
+ * drivers which remap physical device pages into userspace,
+ * and wants to make sure they are mapped WC and not UC.
+ *
+ * BACKPORT NOTES:  If:
+ *
+ *   87744ab3832b mm: fix cache mode tracking in vm_insert_mixed()
+ *
+ * gets backported, then we want to backport:
+ *
+ *   8ef4227615e1 x86/io: add interface to reserve io memtype for a resource range. (v1.1)
+ *
+ * and drop these next two stubs
+ */
+static inline int arch_io_reserve_memtype_wc(resource_size_t base,
+					     resource_size_t size)
+{
+	return 0;
+}
+
+static inline void arch_io_free_memtype_wc(resource_size_t base,
+					   resource_size_t size)
+{
+}
+
+
+static inline int __must_check down_write_killable(struct rw_semaphore *sem)
+{
+	down_write(sem);
+	return 0;
+}
+
+
+static inline long __drm_get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
+		unsigned long start, unsigned long nr_pages, int write,
+		int force, struct page **pages, struct vm_area_struct **vmas)
+{
+	return get_user_pages(tsk, mm, start, nr_pages, write, force, pages, vmas);
+}
+
+#define get_user_pages_remote(c, mm, start, nr_pages, write, pages, vmas, locked) \
+		__drm_get_user_pages(c, mm, start, nr_pages, write, 0, pages, vmas)
+#define get_user_pages(start, nr_pages, write, pages, vmas) \
+	__drm_get_user_pages(current, current->mm, start, nr_pages, write, 0, pages, vmas)
+
+
+#define smp_store_mb(var, value)	set_mb(var, value)
+
+#ifndef atomic_set_release
+#define  atomic_set_release(v, i)	smp_store_release(&(v)->counter, (i))
+#endif
+
+#ifdef CONFIG_X86
+#ifndef atomic_andnot
+static inline void atomic_andnot(int i, atomic_t *v)
+{
+	atomic_and(~i, v);
+}
+#endif
+#endif
+
+static inline bool gfpflags_allow_blocking(const gfp_t gfp_flags)
+{
+	return !!(gfp_flags & __GFP_WAIT);
+}
+
+/* drm_panel stubs to make i915 happy.. I don't think we support any hw
+ * using DSI and panel stuff without some work will be unhappy on power
+ * or anything else w/ CONFIG_OF..
+ */
+struct drm_panel;
+struct drm_connector;
+static inline void drm_panel_init(struct drm_panel *panel) {}
+static inline int drm_panel_attach(struct drm_panel *panel, struct drm_connector *connector)
+{
+	return -ENXIO;
+}
+static inline int drm_panel_detach(struct drm_panel *panel)
+{
+	return 0;
+}
+static inline int drm_panel_add(struct drm_panel *panel)
+{
+	return -ENXIO;
+}
+static inline void drm_panel_remove(struct drm_panel *panel) {}
+
 
 int __init drm_backport_init(void);
 void __exit drm_backport_exit(void);

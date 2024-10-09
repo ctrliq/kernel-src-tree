@@ -147,6 +147,7 @@ enum transport_state_table {
 	TRANSPORT_ISTATE_PROCESSING = 11,
 	TRANSPORT_COMPLETE_QF_WP = 18,
 	TRANSPORT_COMPLETE_QF_OK = 19,
+	TRANSPORT_COMPLETE_QF_ERR = 20,
 };
 
 /* Used for struct se_cmd->se_cmd_flags */
@@ -169,6 +170,7 @@ enum se_cmd_flags_table {
 	SCF_COMPARE_AND_WRITE		= 0x00080000,
 	SCF_COMPARE_AND_WRITE_POST	= 0x00100000,
 	SCF_CMD_XCOPY_PASSTHROUGH	= 0x00200000,
+	SCF_PASSTHROUGH_PROT_SG_TO_MEM_NOALLOC = 0x00400000,
 };
 
 /* struct se_dev_entry->lun_flags and struct se_lun->lun_access */
@@ -246,6 +248,7 @@ enum tcm_tmrsp_table {
  */
 typedef enum {
 	SCSI_INST_INDEX,
+	SCSI_DEVICE_INDEX,
 	SCSI_AUTH_INTR_INDEX,
 	SCSI_INDEX_TYPE_MAX
 } scsi_index_t;
@@ -307,8 +310,6 @@ struct t10_alua_tg_pt_gp {
 	u16	tg_pt_gp_id;
 	int	tg_pt_gp_valid_id;
 	int	tg_pt_gp_alua_supported_states;
-	int	tg_pt_gp_alua_pending_state;
-	int	tg_pt_gp_alua_previous_state;
 	int	tg_pt_gp_alua_access_status;
 	int	tg_pt_gp_alua_access_type;
 	int	tg_pt_gp_nonop_delay_msecs;
@@ -317,18 +318,16 @@ struct t10_alua_tg_pt_gp {
 	int	tg_pt_gp_pref;
 	int	tg_pt_gp_write_metadata;
 	u32	tg_pt_gp_members;
-	atomic_t tg_pt_gp_alua_access_state;
+	int	tg_pt_gp_alua_access_state;
 	atomic_t tg_pt_gp_ref_cnt;
 	spinlock_t tg_pt_gp_lock;
-	struct mutex tg_pt_gp_md_mutex;
+	struct mutex tg_pt_gp_transition_mutex;
 	struct se_device *tg_pt_gp_dev;
 	struct config_group tg_pt_gp_group;
 	struct list_head tg_pt_gp_list;
 	struct list_head tg_pt_gp_mem_list;
 	struct se_port *tg_pt_gp_alua_port;
 	struct se_node_acl *tg_pt_gp_alua_nacl;
-	struct delayed_work tg_pt_gp_transition_work;
-	struct completion *tg_pt_gp_transition_complete;
 };
 
 struct t10_alua_tg_pt_gp_member {

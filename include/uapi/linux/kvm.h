@@ -171,6 +171,7 @@ struct kvm_pit_config {
 #define KVM_EXIT_WATCHDOG         21
 #define KVM_EXIT_S390_TSCH        22
 #define KVM_EXIT_EPR              23
+#define KVM_EXIT_SYSTEM_EVENT     24
 #define KVM_EXIT_IOAPIC_EOI       26
 
 /* For KVM_EXIT_INTERNAL_ERROR */
@@ -306,6 +307,16 @@ struct kvm_run {
 		struct {
 			__u8 vector;
 		} eoi;
+
+		/* KVM_EXIT_SYSTEM_EVENT */
+		struct {
+#define KVM_SYSTEM_EVENT_SHUTDOWN       1
+#define KVM_SYSTEM_EVENT_RESET          2
+#define KVM_SYSTEM_EVENT_CRASH          3
+			__u32 type;
+			__u64 flags;
+		} system_event;
+
 		/* Fix the size of the union. */
 		char padding[256];
 	};
@@ -691,6 +702,7 @@ struct kvm_ppc_smmu_info {
 #define KVM_CAP_GUEST_DEBUG_HW_WPS 120
 #define KVM_CAP_SPLIT_IRQCHIP 121
 #define KVM_CAP_IOEVENTFD_ANY_LENGTH 122
+#define KVM_CAP_MAX_VCPU_ID 128
 #define KVM_CAP_X2APIC_API 129
 
 #ifdef KVM_CAP_IRQ_ROUTING
@@ -774,11 +786,18 @@ struct kvm_irqfd {
 	__u8  pad[16];
 };
 
+/* For KVM_CAP_ADJUST_CLOCK */
+
+/* Do not use 1, KVM_CHECK_EXTENSION returned it before we had flags.  */
+#define KVM_CLOCK_TSC_STABLE		2
+
 struct kvm_clock_data {
 	__u64 clock;
 	__u32 flags;
 	__u32 pad[9];
 };
+
+/* For KVM_CAP_SW_TLB */
 
 #define KVM_MMU_FSL_BOOKE_NOHV		0
 #define KVM_MMU_FSL_BOOKE_HV		1

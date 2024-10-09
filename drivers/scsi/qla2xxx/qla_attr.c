@@ -147,92 +147,6 @@ static struct bin_attribute sysfs_fw_dump_attr = {
 };
 
 static ssize_t
-qla2x00_sysfs_read_fw_dump_template(struct file *filp, struct kobject *kobj,
-			   struct bin_attribute *bin_attr,
-			   char *buf, loff_t off, size_t count)
-{
-	struct scsi_qla_host *vha = shost_priv(dev_to_shost(container_of(kobj,
-	    struct device, kobj)));
-	struct qla_hw_data *ha = vha->hw;
-
-	if (!ha->fw_dump_template || !ha->fw_dump_template_len)
-		return 0;
-
-	ql_dbg(ql_dbg_user, vha, 0x70e2,
-	    "chunk <- off=%llx count=%lx\n", off, count);
-	return memory_read_from_buffer(buf, count, &off,
-	    ha->fw_dump_template, ha->fw_dump_template_len);
-}
-
-static ssize_t
-qla2x00_sysfs_write_fw_dump_template(struct file *filp, struct kobject *kobj,
-			    struct bin_attribute *bin_attr,
-			    char *buf, loff_t off, size_t count)
-{
-	struct scsi_qla_host *vha = shost_priv(dev_to_shost(container_of(kobj,
-	    struct device, kobj)));
-	struct qla_hw_data *ha = vha->hw;
-	uint32_t size;
-
-	if (off == 0) {
-		if (ha->fw_dump)
-			vfree(ha->fw_dump);
-		if (ha->fw_dump_template)
-			vfree(ha->fw_dump_template);
-
-		ha->fw_dump = NULL;
-		ha->fw_dump_len = 0;
-		ha->fw_dump_template = NULL;
-		ha->fw_dump_template_len = 0;
-
-		size = qla27xx_fwdt_template_size(buf);
-		ql_dbg(ql_dbg_user, vha, 0x70d1,
-		    "-> allocating fwdt (%x bytes)...\n", size);
-		ha->fw_dump_template = vmalloc(size);
-		if (!ha->fw_dump_template) {
-			ql_log(ql_log_warn, vha, 0x70d2,
-			    "Failed allocate fwdt (%x bytes).\n", size);
-			return -ENOMEM;
-		}
-		ha->fw_dump_template_len = size;
-	}
-
-	if (off + count > ha->fw_dump_template_len) {
-		count = ha->fw_dump_template_len - off;
-		ql_dbg(ql_dbg_user, vha, 0x70d3,
-		    "chunk -> truncating to %lx bytes.\n", count);
-	}
-
-	ql_dbg(ql_dbg_user, vha, 0x70d4,
-	    "chunk -> off=%llx count=%lx\n", off, count);
-	memcpy(ha->fw_dump_template + off, buf, count);
-
-	if (off + count == ha->fw_dump_template_len) {
-		size = qla27xx_fwdt_calculate_dump_size(vha);
-		ql_dbg(ql_dbg_user, vha, 0x70d5,
-		    "-> allocating fwdump (%x bytes)...\n", size);
-		ha->fw_dump = vmalloc(size);
-		if (!ha->fw_dump) {
-			ql_log(ql_log_warn, vha, 0x70d6,
-			    "Failed allocate fwdump (%x bytes).\n", size);
-			return -ENOMEM;
-		}
-		ha->fw_dump_len = size;
-	}
-
-	return count;
-}
-static struct bin_attribute sysfs_fw_dump_template_attr = {
-	.attr = {
-		.name = "fw_dump_template",
-		.mode = S_IRUSR | S_IWUSR,
-	},
-	.size = 0,
-	.read = qla2x00_sysfs_read_fw_dump_template,
-	.write = qla2x00_sysfs_write_fw_dump_template,
-};
-
-static ssize_t
 qla2x00_sysfs_read_nvram(struct file *filp, struct kobject *kobj,
 			 struct bin_attribute *bin_attr,
 			 char *buf, loff_t off, size_t count)
@@ -946,7 +860,6 @@ static struct sysfs_entry {
 	int is4GBp_only;
 } bin_file_entries[] = {
 	{ "fw_dump", &sysfs_fw_dump_attr, },
-	{ "fw_dump_template", &sysfs_fw_dump_template_attr, 0x27 },
 	{ "nvram", &sysfs_nvram_attr, },
 	{ "optrom", &sysfs_optrom_attr, },
 	{ "optrom_ctl", &sysfs_optrom_ctl_attr, },
@@ -971,8 +884,6 @@ qla2x00_alloc_sysfs_attr(scsi_qla_host_t *vha)
 		if (iter->is4GBp_only == 2 && !IS_QLA25XX(vha->hw))
 			continue;
 		if (iter->is4GBp_only == 3 && !(IS_CNA_CAPABLE(vha->hw)))
-			continue;
-		if (iter->is4GBp_only == 0x27 && !IS_QLA27XX(vha->hw))
 			continue;
 
 		ret = sysfs_create_bin_file(&host->shost_gendev.kobj,
@@ -1830,6 +1741,9 @@ qla2x00_terminate_rport_io(struct fc_rport *rport)
 	if (!fcport)
 		return;
 
+	if (test_bit(UNLOADING, &fcport->vha->dpc_flags))
+		return;
+
 	if (test_bit(ABORT_ISP_ACTIVE, &fcport->vha->dpc_flags))
 		return;
 
@@ -2046,9 +1960,9 @@ qla24xx_vport_create(struct fc_vport *fc_vport, bool disable)
 	scsi_qla_host_t *base_vha = shost_priv(fc_vport->shost);
 	scsi_qla_host_t *vha = NULL;
 	struct qla_hw_data *ha = base_vha->hw;
-	uint16_t options = 0;
 	int	cnt;
 	struct req_que *req = ha->req_q_map[0];
+	struct qla_qpair *qpair;
 
 	ret = qla24xx_vport_create_req_sanity_check(fc_vport);
 	if (ret) {
@@ -2133,15 +2047,9 @@ qla24xx_vport_create(struct fc_vport *fc_vport, bool disable)
 	qlt_vport_create(vha, ha);
 	qla24xx_vport_disable(fc_vport, disable);
 
-	if (ha->flags.cpu_affinity_enabled) {
-		req = ha->req_q_map[1];
-		ql_dbg(ql_dbg_multiq, vha, 0xc000,
-		    "Request queue %p attached with "
-		    "VP[%d], cpu affinity =%d\n",
-		    req, vha->vp_idx, ha->flags.cpu_affinity_enabled);
+	if (!ql2xmqsupport || !ha->npiv_info)
 		goto vport_queue;
-	} else if (ql2xmaxqueues == 1 || !ha->npiv_info)
-		goto vport_queue;
+
 	/* Create a request queue in QoS mode for the vport */
 	for (cnt = 0; cnt < ha->nvram_npiv_size; cnt++) {
 		if (memcmp(ha->npiv_info[cnt].port_name, vha->port_name, 8) == 0
@@ -2153,20 +2061,20 @@ qla24xx_vport_create(struct fc_vport *fc_vport, bool disable)
 	}
 
 	if (qos) {
-		ret = qla25xx_create_req_que(ha, options, vha->vp_idx, 0, 0,
-			qos);
-		if (!ret)
+		qpair = qla2xxx_create_qpair(vha, 0, qos, vha->vp_idx);
+		if (!qpair)
 			ql_log(ql_log_warn, vha, 0x7084,
-			    "Can't create request queue for VP[%d]\n",
+			    "Can't create qpair for VP[%d]\n",
 			    vha->vp_idx);
 		else {
 			ql_dbg(ql_dbg_multiq, vha, 0xc001,
-			    "Request Que:%d Q0s: %d) created for VP[%d]\n",
-			    ret, qos, vha->vp_idx);
+			    "Queue pair: %d Qos: %d) created for VP[%d]\n",
+			    qpair->id, qos, vha->vp_idx);
 			ql_dbg(ql_dbg_user, vha, 0x7085,
-			    "Request Que:%d Q0s: %d) created for VP[%d]\n",
-			    ret, qos, vha->vp_idx);
-			req = ha->req_q_map[ret];
+			    "Queue Pair: %d Qos: %d) created for VP[%d]\n",
+			    qpair->id, qos, vha->vp_idx);
+			req = qpair->req;
+			vha->qpair = qpair;
 		}
 	}
 
@@ -2209,8 +2117,6 @@ qla24xx_vport_delete(struct fc_vport *fc_vport)
 		    "Timer for the VP[%d] has stopped\n", vha->vp_idx);
 	}
 
-	BUG_ON(atomic_read(&vha->vref_count));
-
 	qla2x00_free_fcports(vha);
 
 	mutex_lock(&ha->vport_lock);
@@ -2218,10 +2124,10 @@ qla24xx_vport_delete(struct fc_vport *fc_vport)
 	clear_bit(vha->vp_idx, ha->vp_idx_map);
 	mutex_unlock(&ha->vport_lock);
 
-	if (vha->req->id && !ha->flags.cpu_affinity_enabled) {
-		if (qla25xx_delete_req_que(vha, vha->req) != QLA_SUCCESS)
+	if (vha->qpair && vha->qpair->vp_idx == vha->vp_idx) {
+		if (qla2xxx_delete_qpair(vha, vha->qpair) != QLA_SUCCESS)
 			ql_log(ql_log_warn, vha, 0x7087,
-			    "Queue delete failed.\n");
+			    "Queue Pair delete failed.\n");
 	}
 
 	ql_log(ql_log_info, vha, 0x7088, "VP[%d] deleted.\n", id);

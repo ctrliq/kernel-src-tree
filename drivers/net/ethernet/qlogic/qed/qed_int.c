@@ -1,9 +1,33 @@
 /* QLogic qed NIC Driver
- * Copyright (c) 2015 QLogic Corporation
+ * Copyright (c) 2015-2017  QLogic Corporation
  *
- * This software is available under the terms of the GNU General Public License
- * (GPL) Version 2, available from the file COPYING in the main directory of
- * this source tree.
+ * This software is available to you under a choice of one of two
+ * licenses.  You may choose to be licensed under the terms of the GNU
+ * General Public License (GPL) Version 2, available from the file
+ * COPYING in the main directory of this source tree, or the
+ * OpenIB.org BSD license below:
+ *
+ *     Redistribution and use in source and binary forms, with or
+ *     without modification, are permitted provided that the following
+ *     conditions are met:
+ *
+ *      - Redistributions of source code must retain the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer.
+ *
+ *      - Redistributions in binary form must reproduce the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer in the documentation and /or other materials
+ *        provided with the distribution.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  */
 
 #include <linux/types.h>
@@ -2370,10 +2394,8 @@ static int qed_int_sb_attn_alloc(struct qed_hwfn *p_hwfn,
 
 	/* SB struct */
 	p_sb = kmalloc(sizeof(*p_sb), GFP_KERNEL);
-	if (!p_sb) {
-		DP_NOTICE(cdev, "Failed to allocate `struct qed_sb_attn_info'\n");
+	if (!p_sb)
 		return -ENOMEM;
-	}
 
 	/* SB ring  */
 	p_virt = dma_alloc_coherent(&cdev->pdev->dev,
@@ -2381,7 +2403,6 @@ static int qed_int_sb_attn_alloc(struct qed_hwfn *p_hwfn,
 				    &p_phys, GFP_KERNEL);
 
 	if (!p_virt) {
-		DP_NOTICE(cdev, "Failed to allocate status block (attentions)\n");
 		kfree(p_sb);
 		return -ENOMEM;
 	}
@@ -2576,8 +2597,12 @@ static u16 qed_get_igu_sb_id(struct qed_hwfn *p_hwfn, u16 sb_id)
 	else
 		igu_sb_id = qed_vf_get_igu_sb_id(p_hwfn, sb_id);
 
-	DP_VERBOSE(p_hwfn, NETIF_MSG_INTR, "SB [%s] index is 0x%04x\n",
-		   (sb_id == QED_SP_SB_ID) ? "DSB" : "non-DSB", igu_sb_id);
+	if (sb_id == QED_SP_SB_ID)
+		DP_VERBOSE(p_hwfn, NETIF_MSG_INTR,
+			   "Slowpath SB index in IGU is 0x%04x\n", igu_sb_id);
+	else
+		DP_VERBOSE(p_hwfn, NETIF_MSG_INTR,
+			   "SB [%04x] <--> IGU SB [%04x]\n", sb_id, igu_sb_id);
 
 	return igu_sb_id;
 }
@@ -2663,17 +2688,14 @@ static int qed_int_sp_sb_alloc(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
 
 	/* SB struct */
 	p_sb = kmalloc(sizeof(*p_sb), GFP_KERNEL);
-	if (!p_sb) {
-		DP_NOTICE(p_hwfn, "Failed to allocate `struct qed_sb_info'\n");
+	if (!p_sb)
 		return -ENOMEM;
-	}
 
 	/* SB ring  */
 	p_virt = dma_alloc_coherent(&p_hwfn->cdev->pdev->dev,
 				    SB_ALIGNED_SIZE(p_hwfn),
 				    &p_phys, GFP_KERNEL);
 	if (!p_virt) {
-		DP_NOTICE(p_hwfn, "Failed to allocate status block\n");
 		kfree(p_sb);
 		return -ENOMEM;
 	}
@@ -2955,7 +2977,6 @@ int qed_int_igu_read_cam(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
 	u16 prev_sb_id = 0xFF;
 
 	p_hwfn->hw_info.p_igu_info = kzalloc(sizeof(*p_igu_info), GFP_KERNEL);
-
 	if (!p_hwfn->hw_info.p_igu_info)
 		return -ENOMEM;
 
@@ -3142,18 +3163,14 @@ int qed_int_alloc(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt)
 	int rc = 0;
 
 	rc = qed_int_sp_dpc_alloc(p_hwfn);
-	if (rc) {
-		DP_ERR(p_hwfn->cdev, "Failed to allocate sp dpc mem\n");
-		return rc;
-	}
-	rc = qed_int_sp_sb_alloc(p_hwfn, p_ptt);
-	if (rc) {
-		DP_ERR(p_hwfn->cdev, "Failed to allocate sp sb mem\n");
-		return rc;
-	}
-	rc = qed_int_sb_attn_alloc(p_hwfn, p_ptt);
 	if (rc)
-		DP_ERR(p_hwfn->cdev, "Failed to allocate sb attn mem\n");
+		return rc;
+
+	rc = qed_int_sp_sb_alloc(p_hwfn, p_ptt);
+	if (rc)
+		return rc;
+
+	rc = qed_int_sb_attn_alloc(p_hwfn, p_ptt);
 
 	return rc;
 }

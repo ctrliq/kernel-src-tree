@@ -217,48 +217,6 @@ static inline unsigned short drbg_sec_strength(drbg_flag_t flags)
 }
 
 /*
- * FIPS 140-2 continuous self test
- * The test is performed on the result of one round of the output
- * function. Thus, the function implicitly knows the size of the
- * buffer.
- *
- * @drbg DRBG handle
- * @buf output buffer of random data to be checked
- *
- * return:
- *	true on success
- *	false on error
- */
-static bool drbg_fips_continuous_test(struct drbg_state *drbg,
-				      const unsigned char *buf)
-{
-#ifdef CONFIG_CRYPTO_FIPS
-	int ret = 0;
-	/* skip test if we test the overall system */
-	if (drbg->test_data)
-		return true;
-	/* only perform test in FIPS mode */
-	if (0 == fips_enabled)
-		return true;
-	if (!drbg->fips_primed) {
-		/* Priming of FIPS test */
-		memcpy(drbg->prev, buf, drbg_blocklen(drbg));
-		drbg->fips_primed = true;
-		/* return false due to priming, i.e. another round is needed */
-		return false;
-	}
-	ret = memcmp(drbg->prev, buf, drbg_blocklen(drbg));
-	if (!ret)
-		panic("DRBG continuous self test failed\n");
-	memcpy(drbg->prev, buf, drbg_blocklen(drbg));
-	/* the test shall pass when the two compared values are not equal */
-	return ret != 0;
-#else
-	return true;
-#endif /* CONFIG_CRYPTO_FIPS */
-}
-
-/*
  * Convert an integer into a byte representation of this integer.
  * The byte representation is big-endian
  *
@@ -635,11 +593,6 @@ static int drbg_ctr_generate(struct drbg_state *drbg,
 		}
 		outlen = (drbg_blocklen(drbg) < (buflen - len)) ?
 			  drbg_blocklen(drbg) : (buflen - len);
-		if (!drbg_fips_continuous_test(drbg, drbg->scratchpad)) {
-			/* 10.2.1.5.2 step 6 */
-			drbg_add_buf(drbg->V, drbg_blocklen(drbg), &prefix, 1);
-			continue;
-		}
 		/* 10.2.1.5.2 step 4.3 */
 		memcpy(buf + len, drbg->scratchpad, outlen);
 		len += outlen;
@@ -758,8 +711,6 @@ static int drbg_hmac_generate(struct drbg_state *drbg,
 			return ret;
 		outlen = (drbg_blocklen(drbg) < (buflen - len)) ?
 			  drbg_blocklen(drbg) : (buflen - len);
-		if (!drbg_fips_continuous_test(drbg, drbg->V))
-			continue;
 
 		/* 10.1.2.5 step 4.2 */
 		memcpy(buf + len, drbg->V, outlen);
@@ -958,10 +909,6 @@ static int drbg_hash_hashgen(struct drbg_state *drbg,
 		}
 		outlen = (drbg_blocklen(drbg) < (buflen - len)) ?
 			  drbg_blocklen(drbg) : (buflen - len);
-		if (!drbg_fips_continuous_test(drbg, dst)) {
-			drbg_add_buf(src, drbg_statelen(drbg), &prefix, 1);
-			continue;
-		}
 		/* 10.1.1.4 step hashgen 4.2 */
 		memcpy(buf + len, dst, outlen);
 		len += outlen;
@@ -1131,12 +1078,6 @@ static inline void drbg_dealloc_state(struct drbg_state *drbg)
 		kzfree(drbg->scratchpad);
 	drbg->scratchpad = NULL;
 	drbg->reseed_ctr = 0;
-#ifdef CONFIG_CRYPTO_FIPS
-	if (drbg->prev)
-		kzfree(drbg->prev);
-	drbg->prev = NULL;
-	drbg->fips_primed = false;
-#endif
 }
 
 /*
@@ -1157,12 +1098,6 @@ static inline int drbg_alloc_state(struct drbg_state *drbg)
 	drbg->C = kzalloc(drbg_statelen(drbg), GFP_KERNEL);
 	if (!drbg->C)
 		goto err;
-#ifdef CONFIG_CRYPTO_FIPS
-	drbg->prev = kzalloc(drbg_blocklen(drbg), GFP_KERNEL);
-	if (!drbg->prev)
-		goto err;
-	drbg->fips_primed = false;
-#endif
 	/* scratchpad is only generated for CTR and Hash */
 	if (drbg->core->flags & DRBG_HMAC)
 		sb_size = 0;
@@ -1205,10 +1140,6 @@ static inline void drbg_copy_drbg(struct drbg_state *src,
 	dst->reseed_ctr = src->reseed_ctr;
 	dst->seeded = src->seeded;
 	dst->pr = src->pr;
-#ifdef CONFIG_CRYPTO_FIPS
-	dst->fips_primed = src->fips_primed;
-	memcpy(dst->prev, src->prev, drbg_blocklen(src));
-#endif
 	/*
 	 * Not copied:
 	 * scratchpad is initialized drbg_alloc_state;
@@ -1859,6 +1790,8 @@ static inline int __init drbg_healthcheck_sanity(void)
 	if (!drbg)
 		return -ENOMEM;
 
+	drbg->core = &drbg_cores[coreref];
+
 	/*
 	 * if the following tests fail, it is likely that there is a buffer
 	 * overflow as buf is much smaller than the requested or provided
@@ -1867,12 +1800,6 @@ static inline int __init drbg_healthcheck_sanity(void)
 	 * grave bug.
 	 */
 
-	/* get a valid instance of DRBG for following tests */
-	ret = drbg_instantiate(drbg, NULL, coreref, pr);
-	if (ret) {
-		rc = ret;
-		goto outbuf;
-	}
 	max_addtllen = drbg_max_addtl(drbg);
 	max_request_bytes = drbg_max_request_bytes(drbg);
 	drbg_string_fill(&addtl, buf, max_addtllen + 1);
@@ -1882,10 +1809,9 @@ static inline int __init drbg_healthcheck_sanity(void)
 	/* overflow max_bits */
 	len = drbg_generate(drbg, buf, (max_request_bytes + 1), NULL);
 	BUG_ON(0 < len);
-	drbg_uninstantiate(drbg);
 
 	/* overflow max addtllen with personalization string */
-	ret = drbg_instantiate(drbg, &addtl, coreref, pr);
+	ret = drbg_seed(drbg, &addtl, false);
 	BUG_ON(0 == ret);
 	/* test uninstantated DRBG */
 	len = drbg_generate(drbg, buf, (max_request_bytes + 1), NULL);
@@ -1896,9 +1822,7 @@ static inline int __init drbg_healthcheck_sanity(void)
 	pr_devel("DRBG: Sanity tests for failure code paths successfully "
 		 "completed\n");
 
-	drbg_uninstantiate(drbg);
-outbuf:
-	kzfree(drbg);
+	kfree(drbg);
 	return rc;
 #else /* CONFIG_CRYPTO_FIPS */
 	return 0;

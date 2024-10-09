@@ -229,7 +229,7 @@ static int kvm_hv_get_msr_pw(struct kvm_vcpu *vcpu, u32 msr, u64 *pdata)
 		break;
 	case HV_X64_MSR_TIME_REF_COUNT: {
 		data =
-		     div_u64(get_kernel_ns() + kvm->arch.kvmclock_offset, 100);
+		     div_u64(get_kvmclock_ns(kvm), 100);
 		break;
 	}
 	case HV_X64_MSR_REFERENCE_TSC:

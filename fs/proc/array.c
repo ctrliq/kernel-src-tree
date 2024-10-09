@@ -82,6 +82,7 @@
 #include <linux/ptrace.h>
 #include <linux/tracehook.h>
 #include <linux/user_namespace.h>
+#include <linux/fs_struct.h>
 
 #include <asm/pgtable.h>
 #include <asm/processor.h>
@@ -160,12 +161,25 @@ static inline const char *get_task_state(struct task_struct *tsk)
 	return *p;
 }
 
+static inline int get_task_umask(struct task_struct *tsk)
+{
+	struct fs_struct *fs;
+	int umask = -ENOENT;
+
+	task_lock(tsk);
+	fs = tsk->fs;
+	if (fs)
+		umask = fs->umask;
+	task_unlock(tsk);
+	return umask;
+}
+
 static inline void task_state(struct seq_file *m, struct pid_namespace *ns,
 				struct pid *pid, struct task_struct *p)
 {
 	struct user_namespace *user_ns = seq_user_ns(m);
 	struct group_info *group_info;
-	int g;
+	int g, umask;
 	struct fdtable *fdt = NULL;
 	const struct cred *cred;
 	pid_t ppid, tpid;
@@ -180,6 +194,11 @@ static inline void task_state(struct seq_file *m, struct pid_namespace *ns,
 			tpid = task_pid_nr_ns(tracer, ns);
 	}
 	cred = get_task_cred(p);
+
+	umask = get_task_umask(p);
+	if (umask >= 0)
+		seq_printf(m, "Umask:\t%#04o\n", umask);
+
 	seq_printf(m,
 		"State:\t%s\n"
 		"Tgid:\t%d\n"
@@ -647,7 +666,7 @@ get_children_pid(struct inode *inode, struct pid *pid_prev, loff_t pos)
 	}
 
 out:
-	read_unlock(&tasklist_lock);
+	qread_unlock(&tasklist_lock);
 	return pid;
 }
 

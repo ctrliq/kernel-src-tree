@@ -11,6 +11,7 @@
 #define _LINUX_RH_KABI_H
 
 #include <linux/compiler.h>
+#include <linux/stringify.h>
 
 /*
  * The RH_KABI_REPLACE* macros attempt to add the ability to use the '_new'
@@ -58,13 +59,15 @@
 
 #else
 
+#define RH_KABI_ALIGN_WARNING ".  Disable CONFIG_RH_KABI_SIZE_ALIGN_CHECKS if debugging."
+
 #if IS_BUILTIN(CONFIG_RH_KABI_SIZE_ALIGN_CHECKS)
 #define __RH_KABI_CHECK_SIZE_ALIGN(_orig, _new)				\
 	union {								\
 		_Static_assert(sizeof(struct{_new;}) <= sizeof(struct{_orig;}), \
-			       "kabi sizeof test panic");		\
+			       __FILE__ ":" __stringify(__LINE__) ": "  __stringify(_new) " is larger than " __stringify(_orig) RH_KABI_ALIGN_WARNING); \
 		_Static_assert(__alignof__(struct{_new;}) <= __alignof__(struct{_orig;}), \
-			       "kabi alignof test panic");		\
+			       __FILE__ ":" __stringify(__LINE__) ": "  __stringify(_orig) " is not aligned the same as " __stringify(_new) RH_KABI_ALIGN_WARNING); \
 	}
 #else
 #define __RH_KABI_CHECK_SIZE_ALIGN(_orig, _new)

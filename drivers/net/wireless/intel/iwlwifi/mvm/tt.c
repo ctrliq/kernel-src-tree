@@ -241,11 +241,8 @@ static int iwl_mvm_get_temp_cmd(struct iwl_mvm *mvm)
 	};
 	u32 cmdid;
 
-	if (fw_has_api(&mvm->fw->ucode_capa, IWL_UCODE_TLV_API_WIDE_CMD_HDR))
-		cmdid = iwl_cmd_id(CMD_DTS_MEASUREMENT_TRIGGER_WIDE,
-				   PHY_OPS_GROUP, 0);
-	else
-		cmdid = CMD_DTS_MEASUREMENT_TRIGGER;
+	cmdid = iwl_cmd_id(CMD_DTS_MEASUREMENT_TRIGGER_WIDE,
+			   PHY_OPS_GROUP, 0);
 
 	if (!fw_has_capa(&mvm->fw->ucode_capa,
 			 IWL_UCODE_TLV_CAPA_EXTENDED_DTS_MEASURE))
@@ -260,9 +257,6 @@ int iwl_mvm_get_temp(struct iwl_mvm *mvm, s32 *temp)
 	static u16 temp_notif[] = { WIDE_ID(PHY_OPS_GROUP,
 					    DTS_MEASUREMENT_NOTIF_WIDE) };
 	int ret;
-
-	if (!fw_has_api(&mvm->fw->ucode_capa, IWL_UCODE_TLV_API_WIDE_CMD_HDR))
-		temp_notif[0] = DTS_MEASUREMENT_NOTIFICATION;
 
 	lockdep_assert_held(&mvm->mutex);
 
@@ -630,7 +624,6 @@ static int iwl_mvm_tzone_get_temp(struct thermal_zone_device *device,
 				  int *temperature)
 #else
 				  unsigned long *temperature)
-
 #endif
 {
 	struct iwl_mvm *mvm = (struct iwl_mvm *)device->devdata;
@@ -660,7 +653,6 @@ static int iwl_mvm_tzone_get_trip_temp(struct thermal_zone_device *device,
 				       int trip, int *temp)
 #else
 				       int trip, unsigned long *temp)
-
 #endif
 {
 	struct iwl_mvm *mvm = (struct iwl_mvm *)device->devdata;
@@ -863,8 +855,10 @@ static void iwl_mvm_thermal_zone_unregister(struct iwl_mvm *mvm)
 		return;
 
 	IWL_DEBUG_TEMP(mvm, "Thermal zone device unregister\n");
-	thermal_zone_device_unregister(mvm->tz_device.tzone);
-	mvm->tz_device.tzone = NULL;
+	if (mvm->tz_device.tzone) {
+		thermal_zone_device_unregister(mvm->tz_device.tzone);
+		mvm->tz_device.tzone = NULL;
+	}
 }
 
 static void iwl_mvm_cooling_device_unregister(struct iwl_mvm *mvm)
@@ -873,8 +867,10 @@ static void iwl_mvm_cooling_device_unregister(struct iwl_mvm *mvm)
 		return;
 
 	IWL_DEBUG_TEMP(mvm, "Cooling device unregister\n");
-	thermal_cooling_device_unregister(mvm->cooling_dev.cdev);
-	mvm->cooling_dev.cdev = NULL;
+	if (mvm->cooling_dev.cdev) {
+		thermal_cooling_device_unregister(mvm->cooling_dev.cdev);
+		mvm->cooling_dev.cdev = NULL;
+	}
 }
 #endif /* CONFIG_THERMAL */
 

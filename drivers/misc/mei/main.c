@@ -67,7 +67,7 @@ static int mei_open(struct inode *inode, struct file *file)
 		goto err_unlock;
 	}
 
-	cl = mei_cl_alloc_linked(dev, MEI_HOST_CLIENT_ID_ANY);
+	cl = mei_cl_alloc_linked(dev);
 	if (IS_ERR(cl)) {
 		err = PTR_ERR(cl);
 		goto err_unlock;
@@ -141,9 +141,8 @@ static ssize_t mei_read(struct file *file, char __user *ubuf,
 	struct mei_cl *cl = file->private_data;
 	struct mei_device *dev;
 	struct mei_cl_cb *cb = NULL;
+	bool nonblock = !!(file->f_flags & O_NONBLOCK);
 	int rets;
-	int err;
-
 
 	if (WARN_ON(!cl || !cl->dev))
 		return -ENODEV;
@@ -174,25 +173,29 @@ static ssize_t mei_read(struct file *file, char __user *ubuf,
 	if (*offset > 0)
 		*offset = 0;
 
-	err = mei_cl_read_start(cl, length, file);
-	if (err && err != -EBUSY) {
-		cl_dbg(dev, cl, "mei start read failure status = %d\n", err);
-		rets = err;
+	rets = mei_cl_read_start(cl, length, file);
+	if (rets && rets != -EBUSY) {
+		cl_dbg(dev, cl, "mei start read failure status = %d\n", rets);
 		goto out;
 	}
 
-	/* synchronized under device mutex */
-	if (!waitqueue_active(&cl->rx_wait)) {
-		if (file->f_flags & O_NONBLOCK) {
-			rets = -EAGAIN;
-			goto out;
-		}
+	if (nonblock) {
+		rets = -EAGAIN;
+		goto out;
+	}
 
+	if (rets == -EBUSY &&
+	    !mei_cl_enqueue_ctrl_wr_cb(cl, length, MEI_FOP_READ, file)) {
+		rets = -ENOMEM;
+		goto out;
+	}
+
+	do {
 		mutex_unlock(&dev->device_lock);
 
 		if (wait_event_interruptible(cl->rx_wait,
-				(!list_empty(&cl->rd_completed)) ||
-				(!mei_cl_is_connected(cl)))) {
+					     (!list_empty(&cl->rd_completed)) ||
+					     (!mei_cl_is_connected(cl)))) {
 
 			if (signal_pending(current))
 				return -EINTR;
@@ -204,18 +207,9 @@ static ssize_t mei_read(struct file *file, char __user *ubuf,
 			rets = -ENODEV;
 			goto out;
 		}
-	}
 
-	cb = mei_cl_read_cb(cl, file);
-	if (!cb) {
-		if (mei_cl_is_fixed_address(cl) && dev->allow_fixed_address) {
-			cb = mei_cl_read_cb(cl, NULL);
-			if (cb)
-				goto copy_buffer;
-		}
-		rets = 0;
-		goto out;
-	}
+		cb = mei_cl_read_cb(cl, file);
+	} while (!cb);
 
 copy_buffer:
 	/* now copy the data to user space */
@@ -367,12 +361,22 @@ static int mei_ioctl_connect_client(struct file *file,
 
 	/* find ME client we're trying to connect to */
 	me_cl = mei_me_cl_by_uuid(dev, &data->in_client_uuid);
-	if (!me_cl ||
-	    (me_cl->props.fixed_address && !dev->allow_fixed_address)) {
+	if (!me_cl) {
 		dev_dbg(dev->dev, "Cannot connect to FW Client UUID = %pUl\n",
 			&data->in_client_uuid);
-		mei_me_cl_put(me_cl);
-		return  -ENOTTY;
+		rets = -ENOTTY;
+		goto end;
+	}
+
+	if (me_cl->props.fixed_address) {
+		bool forbidden = dev->override_fixed_address ?
+			 !dev->allow_fixed_address : !dev->hbm_f_fa_supported;
+		if (forbidden) {
+			dev_dbg(dev->dev, "Connection forbidden to FW Client UUID = %pUl\n",
+				&data->in_client_uuid);
+			rets = -ENOTTY;
+			goto end;
+		}
 	}
 
 	dev_dbg(dev->dev, "Connect to FW Client ID = %d\n",

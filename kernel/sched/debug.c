@@ -159,7 +159,7 @@ static void print_rq(struct seq_file *m, struct rq *rq, int rq_cpu)
 	"------------------------------------------------------"
 	"----------------------------------------------------\n");
 
-	read_lock_irqsave(&tasklist_lock, flags);
+	qread_lock_irqsave(&tasklist_lock, flags);
 
 	do_each_thread(g, p) {
 		if (task_cpu(p) != rq_cpu)
@@ -168,7 +168,7 @@ static void print_rq(struct seq_file *m, struct rq *rq, int rq_cpu)
 		print_task(m, rq, p);
 	} while_each_thread(g, p);
 
-	read_unlock_irqrestore(&tasklist_lock, flags);
+	qread_unlock_irqrestore(&tasklist_lock, flags);
 }
 
 void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)

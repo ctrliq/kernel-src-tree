@@ -64,9 +64,6 @@ struct ipoib_mcast_iter {
 	unsigned int       send_only;
 };
 
-/* join state that allows creating mcg with sendonly member request */
-#define SENDONLY_FULLMEMBER_JOIN	8
-
 /*
  * This should be called with the priv->lock held
  */
@@ -585,11 +582,13 @@ void ipoib_mcast_join_task(struct work_struct *work)
 		return;
 	}
 	priv->local_lid = port_attr.lid;
+	netif_addr_lock_bh(dev);
 
-	if (ib_query_gid(priv->ca, priv->port, 0, &priv->local_gid, NULL))
-		ipoib_warn(priv, "ib_query_gid() failed\n");
-	else
-		memcpy(priv->dev->dev_addr + 4, priv->local_gid.raw, sizeof (union ib_gid));
+	if (!test_bit(IPOIB_FLAG_DEV_ADDR_SET, &priv->flags)) {
+		netif_addr_unlock_bh(dev);
+		return;
+	}
+	netif_addr_unlock_bh(dev);
 
 	spin_lock_irq(&priv->lock);
 	if (!test_bit(IPOIB_FLAG_OPER_UP, &priv->flags))

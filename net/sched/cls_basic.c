@@ -62,9 +62,6 @@ static unsigned long basic_get(struct tcf_proto *tp, u32 handle)
 	struct basic_head *head = rtnl_dereference(tp->root);
 	struct basic_filter *f;
 
-	if (head == NULL)
-		return 0UL;
-
 	list_for_each_entry(f, &head->flist, link)
 		if (f->handle == handle)
 			l = (unsigned long) f;
@@ -87,40 +84,37 @@ static int basic_init(struct tcf_proto *tp)
 static void basic_delete_filter(struct rcu_head *head)
 {
 	struct basic_filter *f = container_of(head, struct basic_filter, rcu);
-	struct tcf_proto *tp = f->tp;
 
-	tcf_unbind_filter(tp, &f->res);
 	tcf_exts_destroy(&f->exts);
-	tcf_em_tree_destroy(tp, &f->ematches);
+	tcf_em_tree_destroy(&f->ematches);
 	kfree(f);
 }
 
-static void basic_destroy(struct tcf_proto *tp)
+static bool basic_destroy(struct tcf_proto *tp, bool force)
 {
 	struct basic_head *head = rtnl_dereference(tp->root);
 	struct basic_filter *f, *n;
 
+	if (!force && !list_empty(&head->flist))
+		return false;
+
 	list_for_each_entry_safe(f, n, &head->flist, link) {
 		list_del_rcu(&f->link);
+		tcf_unbind_filter(tp, &f->res);
 		call_rcu(&f->rcu, basic_delete_filter);
 	}
-	RCU_INIT_POINTER(tp->root, NULL);
 	kfree_rcu(head, rcu);
+	return true;
 }
 
 static int basic_delete(struct tcf_proto *tp, unsigned long arg)
 {
-	struct basic_head *head = rtnl_dereference(tp->root);
-	struct basic_filter *t, *f = (struct basic_filter *) arg;
+	struct basic_filter *f = (struct basic_filter *) arg;
 
-	list_for_each_entry(t, &head->flist, link)
-		if (t == f) {
-			list_del_rcu(&t->link);
-			call_rcu(&t->rcu, basic_delete_filter);
-			return 0;
-		}
-
-	return -ENOENT;
+	list_del_rcu(&f->link);
+	tcf_unbind_filter(tp, &f->res);
+	call_rcu(&f->rcu, basic_delete_filter);
+	return 0;
 }
 
 static const struct nla_policy basic_policy[TCA_BASIC_MAX + 1] = {
@@ -217,6 +211,7 @@ static int basic_change(struct net *net, struct sk_buff *in_skb,
 
 	if (fold) {
 		list_replace_rcu(&fold->link, &fnew->link);
+		tcf_unbind_filter(tp, &fold->res);
 		call_rcu(&fold->rcu, basic_delete_filter);
 	} else {
 		list_add_rcu(&fnew->link, &head->flist);

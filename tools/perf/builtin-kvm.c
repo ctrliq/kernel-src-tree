@@ -24,6 +24,7 @@
 #include <sys/timerfd.h>
 #endif
 
+#include <linux/time64.h>
 #include <termios.h>
 #include <semaphore.h>
 #include <pthread.h>
@@ -941,13 +942,13 @@ static int kvm_live_open_events(struct perf_kvm_stat *kvm)
 	struct perf_evlist *evlist = kvm->evlist;
 	char sbuf[STRERR_BUFSIZE];
 
-	perf_evlist__config(evlist, &kvm->opts);
+	perf_evlist__config(evlist, &kvm->opts, NULL);
 
 	/*
 	 * Note: exclude_{guest,host} do not apply here.
 	 *       This command processes KVM tracepoints from host only
 	 */
-	evlist__for_each(evlist, pos) {
+	evlist__for_each_entry(evlist, pos) {
 		struct perf_event_attr *attr = &pos->attr;
 
 		/* make sure these *are* set */
@@ -977,13 +978,13 @@ static int kvm_live_open_events(struct perf_kvm_stat *kvm)
 	err = perf_evlist__open(evlist);
 	if (err < 0) {
 		printf("Couldn't create the events: %s\n",
-		       strerror_r(errno, sbuf, sizeof(sbuf)));
+		       str_error_r(errno, sbuf, sizeof(sbuf)));
 		goto out;
 	}
 
 	if (perf_evlist__mmap(evlist, kvm->opts.mmap_pages, false) < 0) {
 		ui__error("Failed to mmap the events: %s\n",
-			  strerror_r(errno, sbuf, sizeof(sbuf)));
+			  str_error_r(errno, sbuf, sizeof(sbuf)));
 		perf_evlist__close(evlist);
 		goto out;
 	}

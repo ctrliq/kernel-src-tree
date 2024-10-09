@@ -62,7 +62,6 @@
 #endif
 #include <net/netlink.h>
 #include <linux/freezer.h>
-#include <linux/tty.h>
 #include <linux/pid_namespace.h>
 
 #include "audit.h"
@@ -118,7 +117,7 @@ u32		audit_sig_sid = 0;
    3) suppressed due to audit_rate_limit
    4) suppressed due to audit_backlog_limit
 */
-static atomic_t    audit_lost = ATOMIC_INIT(0);
+static atomic_t	audit_lost = ATOMIC_INIT(0);
 
 /* The netlink socket. */
 static struct sock *audit_sock;
@@ -861,8 +860,17 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 			if (err < 0)
 				return err;
 		}
-		if (s.mask & AUDIT_STATUS_BACKLOG_LIMIT)
+		if (s.mask & AUDIT_STATUS_BACKLOG_LIMIT) {
 			err = audit_set_backlog_limit(s.backlog_limit);
+			if (err < 0)
+				return err;
+		}
+		if (s.mask == AUDIT_STATUS_LOST) {
+			u32 lost = atomic_xchg(&audit_lost, 0);
+
+			audit_log_config_change("lost", 0, lost, 1);
+			return lost;
+		}
 		break;
 	}
 	case AUDIT_GET_FEATURE:
@@ -881,7 +889,7 @@ static int audit_receive_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 		if (!audit_enabled && msg_type != AUDIT_USER_AVC)
 			return 0;
 
-		err = audit_filter_user(msg_type);
+		err = audit_filter(msg_type, AUDIT_FILTER_USER);
 		if (err == 1) { /* match or error */
 			err = 0;
 			if (msg_type == AUDIT_USER_TTY) {
@@ -1281,7 +1289,7 @@ struct audit_buffer *audit_log_start(struct audit_context *ctx, gfp_t gfp_mask,
 	if (audit_initialized != AUDIT_INITIALIZED)
 		return NULL;
 
-	if (unlikely(audit_filter_type(type)))
+	if (unlikely(!audit_filter(type, AUDIT_FILTER_TYPE)))
 		return NULL;
 
 	if (gfp_mask & __GFP_WAIT) {
@@ -1567,7 +1575,7 @@ void audit_log_d_path(struct audit_buffer *ab, const char *prefix,
 
 void audit_log_session_info(struct audit_buffer *ab)
 {
-	u32 sessionid = audit_get_sessionid(current);
+	unsigned int sessionid = audit_get_sessionid(current);
 	uid_t auid = from_kuid(&init_user_ns, audit_get_loginuid(current));
 
 	audit_log_format(ab, " auid=%u ses=%u", auid, sessionid);
@@ -1637,7 +1645,7 @@ static inline int audit_copy_fcaps(struct audit_names *name,
 
 /* Copy inode data into an audit_names. */
 void audit_copy_inode(struct audit_names *name, const struct dentry *dentry,
-		      const struct inode *inode)
+		      struct inode *inode)
 {
 	name->ino   = inode->i_ino;
 	name->dev   = inode->i_sb->s_dev;
@@ -1769,26 +1777,36 @@ error_path:
 }
 EXPORT_SYMBOL(audit_log_task_context);
 
+struct tty_struct *audit_get_tty(struct task_struct *tsk)
+{
+	struct tty_struct *tty = NULL;
+	unsigned long flags;
+
+	spin_lock_irqsave(&tsk->sighand->siglock, flags);
+	if (tsk->signal)
+		tty = tty_kref_get(tsk->signal->tty);
+	spin_unlock_irqrestore(&tsk->sighand->siglock, flags);
+	return tty;
+}
+
+void audit_put_tty(struct tty_struct *tty)
+{
+	tty_kref_put(tty);
+}
+
 void audit_log_task_info(struct audit_buffer *ab, struct task_struct *tsk)
 {
 	const struct cred *cred;
 	char comm[sizeof(tsk->comm)];
 	struct mm_struct *mm = tsk->mm;
-	char *tty;
+	struct tty_struct *tty;
 
 	if (!ab)
 		return;
 
 	/* tsk == current */
 	cred = current_cred();
-
-	spin_lock_irq(&tsk->sighand->siglock);
-	if (tsk->signal && tsk->signal->tty && tsk->signal->tty->name)
-		tty = tsk->signal->tty->name;
-	else
-		tty = "(none)";
-	spin_unlock_irq(&tsk->sighand->siglock);
-
+	tty = audit_get_tty(tsk);
 	audit_log_format(ab,
 			 " ppid=%d pid=%d auid=%u uid=%u gid=%u"
 			 " euid=%u suid=%u fsuid=%u"
@@ -1804,8 +1822,9 @@ void audit_log_task_info(struct audit_buffer *ab, struct task_struct *tsk)
 			 from_kgid(&init_user_ns, cred->egid),
 			 from_kgid(&init_user_ns, cred->sgid),
 			 from_kgid(&init_user_ns, cred->fsgid),
-			 tty, audit_get_sessionid(tsk));
-
+			 tty ? tty->name : "(none)",
+			 audit_get_sessionid(tsk));
+	audit_put_tty(tty);
 	audit_log_format(ab, " comm=");
 	audit_log_untrustedstring(ab, get_task_comm(comm, tsk));
 

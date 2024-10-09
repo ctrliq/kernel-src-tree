@@ -232,6 +232,13 @@ struct request {
 	struct request *next_rq;
 };
 
+#define req_op(req)		(op_from_rq_bits((req)->cmd_flags))
+#define req_set_op(req, op)	((req)->cmd_flags |= op)
+#define req_set_op_attrs(req, op, flags) do {	\
+	req_set_op(req, op);			\
+	(req)->cmd_flags |= flags;		\
+} while (0)
+
 static inline unsigned short req_get_ioprio(struct request *req)
 {
 	return req->ioprio;
@@ -525,12 +532,14 @@ struct request_queue {
 
 	RH_KABI_EXTEND(struct list_head		requeue_list)
 	RH_KABI_EXTEND(spinlock_t			requeue_lock)
-	RH_KABI_EXTEND(struct work_struct		requeue_work)
+	/* requeue_work's type is changed from 'work_struct' to 'delayed_work' below */
+	RH_KABI_EXTEND(struct work_struct	rh_reserved_requeue_work)
 	RH_KABI_EXTEND(atomic_t				mq_freeze_depth)
 	RH_KABI_EXTEND(struct blk_flush_queue   *fq)
 	RH_KABI_EXTEND(struct percpu_ref	q_usage_counter)
 	RH_KABI_EXTEND(bool			mq_sysfs_init_done)
 	RH_KABI_EXTEND(struct work_struct	timeout_work)
+	RH_KABI_EXTEND(struct delayed_work	requeue_work)
 };
 
 #define QUEUE_FLAG_QUEUED	1	/* uses generic tag queueing */
@@ -557,6 +566,7 @@ struct request_queue {
 #define QUEUE_FLAG_UNPRIV_SGIO 21	/* SG_IO free for unprivileged users */
 #define QUEUE_FLAG_NO_SG_MERGE 22	/* don't attempt to merge SG segments*/
 #define QUEUE_FLAG_SG_GAPS     23	/* queue doesn't support SG gaps */
+#define QUEUE_FLAG_DAX         24	/* device supports DAX */
 
 #define QUEUE_FLAG_DEFAULT	((1 << QUEUE_FLAG_IO_STAT) |		\
 				 (1 << QUEUE_FLAG_STACKABLE)	|	\
@@ -647,6 +657,7 @@ static inline void queue_flag_clear(unsigned int flag, struct request_queue *q)
 #define blk_queue_discard(q)	test_bit(QUEUE_FLAG_DISCARD, &(q)->queue_flags)
 #define blk_queue_secdiscard(q)	(blk_queue_discard(q) && \
 	test_bit(QUEUE_FLAG_SECDISCARD, &(q)->queue_flags))
+#define blk_queue_dax(q)	test_bit(QUEUE_FLAG_DAX, &(q)->queue_flags)
 
 #define blk_noretry_request(rq) \
 	((rq)->cmd_flags & (REQ_FAILFAST_DEV|REQ_FAILFAST_TRANSPORT| \
@@ -667,7 +678,8 @@ static inline void queue_flag_clear(unsigned int flag, struct request_queue *q)
 
 #define list_entry_rq(ptr)	list_entry((ptr), struct request, queuelist)
 
-#define rq_data_dir(rq)		(((rq)->cmd_flags & 1) != 0)
+#define rq_data_dir(rq) \
+	(op_is_write(op_from_rq_bits(rq->cmd_flags)) ? WRITE : READ)
 
 /*
  * Driver can handle struct request, if it either has an old style
@@ -857,7 +869,7 @@ extern struct request *blk_make_request(struct request_queue *, struct bio *,
 extern void blk_rq_set_block_pc(struct request *);
 extern void blk_requeue_request(struct request_queue *, struct request *);
 extern void blk_add_request_payload(struct request *rq, struct page *page,
-		unsigned int len);
+		int offset, unsigned int len);
 extern int blk_lld_busy(struct request_queue *q);
 extern int blk_rq_prep_clone(struct request *rq, struct request *rq_src,
 			     struct bio_set *bs, gfp_t gfp_mask,
@@ -897,7 +909,7 @@ static inline void blk_set_queue_congested(struct request_queue *q, int sync)
 	set_bdi_congested(&q->backing_dev_info, sync);
 }
 
-extern int blk_queue_enter(struct request_queue *q, gfp_t gfp);
+extern int blk_queue_enter(struct request_queue *q, bool nowait);
 extern void blk_queue_exit(struct request_queue *q);
 extern void blk_start_queue(struct request_queue *q);
 extern void blk_stop_queue(struct request_queue *q);
@@ -906,6 +918,7 @@ extern void __blk_stop_queue(struct request_queue *q);
 extern void __blk_run_queue(struct request_queue *q);
 extern void blk_run_queue(struct request_queue *);
 extern void blk_run_queue_async(struct request_queue *q);
+extern void blk_mq_quiesce_queue(struct request_queue *q);
 extern int blk_rq_map_user(struct request_queue *, struct request *,
 			   struct rq_map_data *, void __user *, unsigned long,
 			   gfp_t);
@@ -1495,24 +1508,73 @@ static inline bool bvec_gap_to_prev(struct request_queue *q,
 	return __bvec_gap_to_prev(q, bprv, offset);
 }
 
-static inline bool bio_will_gap(struct request_queue *q, struct bio *prev,
-			 struct bio *next)
+/*
+ * Check if the two bvecs from two bios can be merged to one segment.
+ * If yes, no need to check gap between the two bios since the 1st bio
+ * and the 1st bvec in the 2nd bio can be handled in one segment.
+ */
+static inline bool bios_segs_mergeable(struct request_queue *q,
+		struct bio *prev, struct bio_vec *prev_last_bv,
+		struct bio_vec *next_first_bv)
 {
-	if (!bio_has_data(prev) || !queue_virt_boundary(q))
+	if (!BIOVEC_PHYS_MERGEABLE(prev_last_bv, next_first_bv))
 		return false;
+	if (!BIOVEC_SEG_BOUNDARY(q, prev_last_bv, next_first_bv))
+		return false;
+	if (prev->bi_seg_back_size + next_first_bv->bv_len >
+			queue_max_segment_size(q))
+		return false;
+	return true;
+}
 
-	return __bvec_gap_to_prev(q, &prev->bi_io_vec[prev->bi_vcnt - 1],
-				  next->bi_io_vec[0].bv_offset);
+static inline bool bio_will_gap(struct request_queue *q,
+				struct request *prev_rq,
+				struct bio *prev,
+				struct bio *next)
+{
+	if (bio_has_data(prev) && queue_virt_boundary(q)) {
+		struct bio_vec *pb, *nb;
+
+		/*
+		 * don't merge if the 1st bio starts with non-zero
+		 * offset, otherwise it is quite difficult to respect
+		 * sg gap limit. We work hard to merge a huge number of small
+		 * single bios in case of mkfs.
+		 */
+		if (prev_rq)
+			pb = &prev_rq->bio->bi_io_vec[0];
+		else
+			pb = &prev->bi_io_vec[0];
+		if (pb->bv_offset)
+			return true;
+
+		/*
+		 * We don't need to worry about the situation that the
+		 * merged segment ends in unaligned virt boundary:
+		 *
+		 * - if 'pb' ends aligned, the merged segment ends aligned
+		 * - if 'pb' ends unaligned, the next bio must include
+		 *   one single bvec of 'nb', otherwise the 'nb' can't
+		 *   merge with 'pb'
+		 */
+		pb = &prev->bi_io_vec[prev->bi_vcnt - 1];
+		nb = &next->bi_io_vec[0];
+
+		if (!bios_segs_mergeable(q, prev, pb, nb))
+			return __bvec_gap_to_prev(q, pb, nb->bv_offset);
+	}
+
+	return false;
 }
 
 static inline bool req_gap_back_merge(struct request *req, struct bio *bio)
 {
-	return bio_will_gap(req->q, req->biotail, bio);
+	return bio_will_gap(req->q, req, req->biotail, bio);
 }
 
 static inline bool req_gap_front_merge(struct request *req, struct bio *bio)
 {
-	return bio_will_gap(req->q, bio, req->bio);
+	return bio_will_gap(req->q, NULL, bio, req->bio);
 }
 
 struct work_struct;
@@ -1736,7 +1798,7 @@ struct block_device_operations {
 	RH_KABI_REPLACE(int (*direct_access) (struct block_device *, sector_t,
 						void **, unsigned long *),
 			long (*direct_access)(struct block_device *, sector_t,
-						void **, pfn_t *))
+						void **, pfn_t *, long))
 	unsigned int (*check_events) (struct gendisk *disk,
 				      unsigned int clearing);
 	/* ->media_changed() is DEPRECATED, use ->check_events() instead */

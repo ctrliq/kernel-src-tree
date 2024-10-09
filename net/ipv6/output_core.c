@@ -146,6 +146,7 @@ static int __ip6_local_out_sk(struct sock *sk, struct sk_buff *skb)
 	if (len > IPV6_MAXPLEN)
 		len = 0;
 	ipv6_hdr(skb)->payload_len = htons(len);
+	skb->protocol = htons(ETH_P_IPV6);
 
 	return nf_hook(NFPROTO_IPV6, NF_INET_LOCAL_OUT, sk, skb,
 		       NULL, skb_dst(skb)->dev, dst_output_sk);

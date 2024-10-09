@@ -2943,7 +2943,7 @@ static void cgroup_enable_task_cg_lists(void)
 	 * is not guaranteed to have its child immediately visible in the
 	 * tasklist if we walk through it with RCU.
 	 */
-	read_lock(&tasklist_lock);
+	qread_lock(&tasklist_lock);
 	do_each_thread(g, p) {
 		task_lock(p);
 		/*
@@ -2960,7 +2960,7 @@ static void cgroup_enable_task_cg_lists(void)
 
 		task_unlock(p);
 	} while_each_thread(g, p);
-	read_unlock(&tasklist_lock);
+	qread_unlock(&tasklist_lock);
 	write_unlock(&css_set_lock);
 }
 

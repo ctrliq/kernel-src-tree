@@ -211,5 +211,10 @@ int		rpc_clnt_setup_test_and_add_xprt(struct rpc_clnt *,
 			void *);
 
 const char *rpc_proc_name(const struct rpc_task *task);
+
+void rpc_clnt_xprt_switch_put(struct rpc_clnt *);
+void rpc_clnt_xprt_switch_add_xprt(struct rpc_clnt *, struct rpc_xprt *);
+bool rpc_clnt_xprt_switch_has_addr(struct rpc_clnt *clnt,
+			const struct sockaddr *sap);
 #endif /* __KERNEL__ */
 #endif /* _LINUX_SUNRPC_CLNT_H */

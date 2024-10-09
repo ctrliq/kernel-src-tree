@@ -64,6 +64,7 @@
 #include "debugfs.h"
 #include "verbs.h"
 #include "aspm.h"
+#include "affinity.h"
 
 #undef pr_fmt
 #define pr_fmt(fmt) DRIVER_NAME ": " fmt
@@ -1011,7 +1012,6 @@ static void __hfi1_free_devdata(struct kobject *kobj)
 	rcu_barrier(); /* wait for rcu callbacks to complete */
 	free_percpu(dd->int_counter);
 	free_percpu(dd->rcv_limit);
-	hfi1_dev_affinity_free(dd);
 	free_percpu(dd->send_schedule);
 	rvt_dealloc_device(&dd->verbs_dev.rdi);
 }
@@ -1169,7 +1169,7 @@ static int init_one(struct pci_dev *, const struct pci_device_id *);
 #define DRIVER_LOAD_MSG "Intel " DRIVER_NAME " loaded: "
 #define PFX DRIVER_NAME ": "
 
-static const struct pci_device_id hfi1_pci_tbl[] = {
+const struct pci_device_id hfi1_pci_tbl[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL0) },
 	{ PCI_DEVICE(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL1) },
 	{ 0, }
@@ -1202,6 +1202,10 @@ static int __init hfi1_mod_init(void)
 	int ret;
 
 	ret = dev_init();
+	if (ret)
+		goto bail;
+
+	ret = node_affinity_init();
 	if (ret)
 		goto bail;
 
@@ -1285,6 +1289,7 @@ module_init(hfi1_mod_init);
 static void __exit hfi1_mod_cleanup(void)
 {
 	pci_unregister_driver(&hfi1_pci_driver);
+	node_affinity_destroy();
 	hfi1_wss_exit();
 	hfi1_dbg_exit();
 	hfi1_cpulist_count = 0;

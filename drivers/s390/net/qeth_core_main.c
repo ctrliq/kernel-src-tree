@@ -618,7 +618,8 @@ static struct qeth_ipa_cmd *qeth_check_ipa_data(struct qeth_card *card,
 					card->info.hwtrap = 2;
 				qeth_schedule_recovery(card);
 				return NULL;
-			case IPA_CMD_SETBRIDGEPORT:
+			case IPA_CMD_SETBRIDGEPORT_IQD:
+			case IPA_CMD_SETBRIDGEPORT_OSA:
 			case IPA_CMD_ADDRESS_CHANGE_NOTIF:
 				if (card->discipline->control_event_handler
 								(card, cmd))
@@ -3426,7 +3427,7 @@ static void qeth_flush_buffers(struct qeth_qdio_out_q *queue, int index,
 		}
 	}
 
-	queue->card->dev->trans_start = jiffies;
+	netif_trans_update(queue->card->dev);
 	if (queue->card->options.performance_stats) {
 		queue->card->perf_stats.outbound_do_qdio_cnt++;
 		queue->card->perf_stats.outbound_do_qdio_start_time =
@@ -3703,6 +3704,14 @@ void qeth_qdio_output_handler(struct ccw_device *ccwdev,
 }
 EXPORT_SYMBOL_GPL(qeth_qdio_output_handler);
 
+/* We cannot use outbound queue 3 for unicast packets on HiperSockets */
+static inline int qeth_cut_iqd_prio(struct qeth_card *card, int queue_num)
+{
+	if ((card->info.type == QETH_CARD_TYPE_IQD) && (queue_num == 3))
+		return 2;
+	return queue_num;
+}
+
 /**
  * Note: Function assumes that we have 4 outbound queues.
  */
@@ -3730,9 +3739,9 @@ int qeth_get_priority_queue(struct qeth_card *card, struct sk_buff *skb,
 			return card->qdio.default_out_queue;
 		}
 		if (card->qdio.do_prio_queueing == QETH_PRIO_Q_ING_PREC)
-			return ~tos >> 6 & 3;
+			return qeth_cut_iqd_prio(card, ~tos >> 6 & 3);
 		if (tos & IPTOS_MINCOST)
-			return 3;
+			return qeth_cut_iqd_prio(card, 3);
 		if (tos & IPTOS_RELIABILITY)
 			return 2;
 		if (tos & IPTOS_THROUGHPUT)
@@ -3743,11 +3752,12 @@ int qeth_get_priority_queue(struct qeth_card *card, struct sk_buff *skb,
 	case QETH_PRIO_Q_ING_SKB:
 		if (skb->priority > 5)
 			return 0;
-		return ~skb->priority >> 1 & 3;
+		return qeth_cut_iqd_prio(card, ~skb->priority >> 1 & 3);
 	case QETH_PRIO_Q_ING_VLAN:
 		tci = &((struct ethhdr *)skb->data)->h_proto;
 		if (*tci == ETH_P_8021Q)
-			return ~*(tci + 1) >> (VLAN_PRIO_SHIFT + 1) & 3;
+			return qeth_cut_iqd_prio(card, ~*(tci + 1) >>
+			(VLAN_PRIO_SHIFT + 1) & 3);
 		break;
 	default:
 		break;
@@ -4906,13 +4916,11 @@ static void qeth_core_free_card(struct qeth_card *card)
 void qeth_trace_features(struct qeth_card *card)
 {
 	QETH_CARD_TEXT(card, 2, "features");
-	QETH_CARD_TEXT_(card, 2, "%x", card->options.ipa4.supported_funcs);
-	QETH_CARD_TEXT_(card, 2, "%x", card->options.ipa4.enabled_funcs);
-	QETH_CARD_TEXT_(card, 2, "%x", card->options.ipa6.supported_funcs);
-	QETH_CARD_TEXT_(card, 2, "%x", card->options.ipa6.enabled_funcs);
-	QETH_CARD_TEXT_(card, 2, "%x", card->options.adp.supported_funcs);
-	QETH_CARD_TEXT_(card, 2, "%x", card->options.adp.enabled_funcs);
-	QETH_CARD_TEXT_(card, 2, "%x", card->info.diagass_support);
+	QETH_CARD_HEX(card, 2, &card->options.ipa4, sizeof(card->options.ipa4));
+	QETH_CARD_HEX(card, 2, &card->options.ipa6, sizeof(card->options.ipa6));
+	QETH_CARD_HEX(card, 2, &card->options.adp, sizeof(card->options.adp));
+	QETH_CARD_HEX(card, 2, &card->info.diagass_support,
+		      sizeof(card->info.diagass_support));
 }
 EXPORT_SYMBOL_GPL(qeth_trace_features);
 
@@ -5011,6 +5019,7 @@ retriable:
 	}
 
 	card->options.ipa4.supported_funcs = 0;
+	card->options.ipa6.supported_funcs = 0;
 	card->options.adp.supported_funcs = 0;
 	card->options.sbp.supported_funcs = 0;
 	card->info.diagass_support = 0;
@@ -5178,6 +5187,102 @@ no_mem:
 	return NULL;
 }
 EXPORT_SYMBOL_GPL(qeth_core_get_next_skb);
+
+static int qeth_setassparms_cb(struct qeth_card *card,
+			       struct qeth_reply *reply, unsigned long data)
+{
+	struct qeth_ipa_cmd *cmd;
+
+	QETH_CARD_TEXT(card, 4, "defadpcb");
+
+	cmd = (struct qeth_ipa_cmd *) data;
+	if (cmd->hdr.return_code == 0) {
+		cmd->hdr.return_code = cmd->data.setassparms.hdr.return_code;
+		if (cmd->hdr.prot_version == QETH_PROT_IPV4)
+			card->options.ipa4.enabled_funcs = cmd->hdr.ipa_enabled;
+		if (cmd->hdr.prot_version == QETH_PROT_IPV6)
+			card->options.ipa6.enabled_funcs = cmd->hdr.ipa_enabled;
+	}
+	if (cmd->data.setassparms.hdr.assist_no == IPA_INBOUND_CHECKSUM &&
+	    cmd->data.setassparms.hdr.command_code == IPA_CMD_ASS_START) {
+		card->info.csum_mask = cmd->data.setassparms.data.flags_32bit;
+		QETH_CARD_TEXT_(card, 3, "csum:%d", card->info.csum_mask);
+	}
+	if (cmd->data.setassparms.hdr.assist_no == IPA_OUTBOUND_CHECKSUM &&
+	    cmd->data.setassparms.hdr.command_code == IPA_CMD_ASS_START) {
+		card->info.tx_csum_mask =
+			cmd->data.setassparms.data.flags_32bit;
+		QETH_CARD_TEXT_(card, 3, "tcsu:%d", card->info.tx_csum_mask);
+	}
+
+	return 0;
+}
+
+static struct qeth_cmd_buffer *qeth_get_setassparms_cmd(struct qeth_card *card,
+						  enum qeth_ipa_funcs ipa_func,
+						  __u16 cmd_code, __u16 len,
+						  enum qeth_prot_versions prot)
+{
+	struct qeth_cmd_buffer *iob;
+	struct qeth_ipa_cmd *cmd;
+
+	QETH_CARD_TEXT(card, 4, "getasscm");
+	iob = qeth_get_ipacmd_buffer(card, IPA_CMD_SETASSPARMS, prot);
+
+	if (iob) {
+		cmd = (struct qeth_ipa_cmd *)(iob->data+IPA_PDU_HEADER_SIZE);
+		cmd->data.setassparms.hdr.assist_no = ipa_func;
+		cmd->data.setassparms.hdr.length = 8 + len;
+		cmd->data.setassparms.hdr.command_code = cmd_code;
+		cmd->data.setassparms.hdr.return_code = 0;
+		cmd->data.setassparms.hdr.seq_no = 0;
+	}
+
+	return iob;
+}
+
+int qeth_send_setassparms(struct qeth_card *card,
+			  struct qeth_cmd_buffer *iob, __u16 len, long data,
+			  int (*reply_cb)(struct qeth_card *,
+					  struct qeth_reply *, unsigned long),
+			  void *reply_param)
+{
+	int rc;
+	struct qeth_ipa_cmd *cmd;
+
+	QETH_CARD_TEXT(card, 4, "sendassp");
+
+	cmd = (struct qeth_ipa_cmd *)(iob->data+IPA_PDU_HEADER_SIZE);
+	if (len <= sizeof(__u32))
+		cmd->data.setassparms.data.flags_32bit = (__u32) data;
+	else   /* (len > sizeof(__u32)) */
+		memcpy(&cmd->data.setassparms.data, (void *) data, len);
+
+	rc = qeth_send_ipa_cmd(card, iob, reply_cb, reply_param);
+	return rc;
+}
+EXPORT_SYMBOL_GPL(qeth_send_setassparms);
+
+int qeth_send_simple_setassparms(struct qeth_card *card,
+				 enum qeth_ipa_funcs ipa_func,
+				 __u16 cmd_code, long data)
+{
+	int rc;
+	int length = 0;
+	struct qeth_cmd_buffer *iob;
+
+	QETH_CARD_TEXT(card, 4, "simassp4");
+	if (data)
+		length = sizeof(__u32);
+	iob = qeth_get_setassparms_cmd(card, ipa_func, cmd_code,
+				       length, QETH_PROT_IPV4);
+	if (!iob)
+		return -ENOMEM;
+	rc = qeth_send_setassparms(card, iob, length, data,
+				   qeth_setassparms_cb, NULL);
+	return rc;
+}
+EXPORT_SYMBOL_GPL(qeth_send_simple_setassparms);
 
 static void qeth_unregister_dbf_views(void)
 {
@@ -5758,6 +5863,7 @@ int qeth_core_ethtool_get_settings(struct net_device *netdev,
 	struct qeth_card *card = netdev->ml_priv;
 	enum qeth_link_types link_type;
 	struct carrier_info carrier_info;
+	u32 speed;
 	int rc;
 
 	if ((card->info.type == QETH_CARD_TYPE_IQD) || (card->info.guestlan))
@@ -5773,28 +5879,29 @@ int qeth_core_ethtool_get_settings(struct net_device *netdev,
 	case QETH_LINK_TYPE_FAST_ETH:
 	case QETH_LINK_TYPE_LANE_ETH100:
 		qeth_set_ecmd_adv_sup(ecmd, SPEED_100, PORT_TP);
-		ecmd->speed = SPEED_100;
+		speed = SPEED_100;
 		ecmd->port = PORT_TP;
 		break;
 
 	case QETH_LINK_TYPE_GBIT_ETH:
 	case QETH_LINK_TYPE_LANE_ETH1000:
 		qeth_set_ecmd_adv_sup(ecmd, SPEED_1000, PORT_FIBRE);
-		ecmd->speed = SPEED_1000;
+		speed = SPEED_1000;
 		ecmd->port = PORT_FIBRE;
 		break;
 
 	case QETH_LINK_TYPE_10GBIT_ETH:
 		qeth_set_ecmd_adv_sup(ecmd, SPEED_10000, PORT_FIBRE);
-		ecmd->speed = SPEED_10000;
+		speed = SPEED_10000;
 		ecmd->port = PORT_FIBRE;
 		break;
 
 	default:
 		qeth_set_ecmd_adv_sup(ecmd, SPEED_10, PORT_TP);
-		ecmd->speed = SPEED_10;
+		speed = SPEED_10;
 		ecmd->port = PORT_TP;
 	}
+	ethtool_cmd_speed_set(ecmd, speed);
 
 	/* Check if we can obtain more accurate information.	 */
 	/* If QUERY_CARD_INFO command is not supported or fails, */
@@ -5846,22 +5953,92 @@ int qeth_core_ethtool_get_settings(struct net_device *netdev,
 
 	switch (carrier_info.port_speed) {
 	case CARD_INFO_PORTS_10M:
-		ecmd->speed = SPEED_10;
+		speed = SPEED_10;
 		break;
 	case CARD_INFO_PORTS_100M:
-		ecmd->speed = SPEED_100;
+		speed = SPEED_100;
 		break;
 	case CARD_INFO_PORTS_1G:
-		ecmd->speed = SPEED_1000;
+		speed = SPEED_1000;
 		break;
 	case CARD_INFO_PORTS_10G:
-		ecmd->speed = SPEED_10000;
+		speed = SPEED_10000;
 		break;
 	}
+	ethtool_cmd_speed_set(ecmd, speed);
 
 	return 0;
 }
 EXPORT_SYMBOL_GPL(qeth_core_ethtool_get_settings);
+
+static int qeth_send_checksum_command(struct qeth_card *card)
+{
+	int rc;
+
+	rc = qeth_send_simple_setassparms(card, IPA_INBOUND_CHECKSUM,
+					  IPA_CMD_ASS_START, 0);
+	if (rc) {
+		dev_warn(&card->gdev->dev, "Starting HW checksumming for %s "
+			"failed, using SW checksumming\n",
+			QETH_CARD_IFNAME(card));
+		return rc;
+	}
+	rc = qeth_send_simple_setassparms(card, IPA_INBOUND_CHECKSUM,
+					  IPA_CMD_ASS_ENABLE,
+					  card->info.csum_mask);
+	if (rc) {
+		dev_warn(&card->gdev->dev, "Enabling HW checksumming for %s "
+			"failed, using SW checksumming\n",
+			QETH_CARD_IFNAME(card));
+		return rc;
+	}
+	return 0;
+}
+
+int qeth_set_rx_csum(struct qeth_card *card, int on)
+{
+	int rc;
+
+	if (on) {
+		rc = qeth_send_checksum_command(card);
+		if (rc)
+			return -EIO;
+		dev_info(&card->gdev->dev,
+			"HW Checksumming (inbound) enabled\n");
+	} else {
+		rc = qeth_send_simple_setassparms(card,
+			IPA_INBOUND_CHECKSUM, IPA_CMD_ASS_STOP, 0);
+		if (rc)
+			return -EIO;
+	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qeth_set_rx_csum);
+
+int qeth_start_ipa_tx_checksum(struct qeth_card *card)
+{
+	int rc = 0;
+
+	if (!qeth_is_supported(card, IPA_OUTBOUND_CHECKSUM))
+		return rc;
+	rc = qeth_send_simple_setassparms(card, IPA_OUTBOUND_CHECKSUM,
+					  IPA_CMD_ASS_START, 0);
+	if (rc)
+		goto err_out;
+	rc = qeth_send_simple_setassparms(card, IPA_OUTBOUND_CHECKSUM,
+					  IPA_CMD_ASS_ENABLE,
+					  card->info.tx_csum_mask);
+	if (rc)
+		goto err_out;
+
+	dev_info(&card->gdev->dev, "HW TX Checksumming enabled\n");
+	return rc;
+err_out:
+	dev_warn(&card->gdev->dev, "Enabling HW TX checksumming for %s "
+		"failed, using SW TX checksumming\n", QETH_CARD_IFNAME(card));
+	return rc;
+}
+EXPORT_SYMBOL_GPL(qeth_start_ipa_tx_checksum);
 
 static int __init qeth_core_init(void)
 {

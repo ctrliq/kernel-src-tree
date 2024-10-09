@@ -546,32 +546,6 @@ kill_it:
 }
 EXPORT_SYMBOL(dput);
 
-/**
- * d_invalidate - invalidate a dentry
- * @dentry: dentry to invalidate
- *
- * Try to invalidate the dentry if it turns out to be
- * possible. If there are reasons not to delete it
- * return -EBUSY. On success return 0.
- *
- * no dcache lock.
- */
- 
-int d_invalidate(struct dentry * dentry)
-{
-	/*
-	 * If it's already been dropped, return OK.
-	 */
-	spin_lock(&dentry->d_lock);
-	if (d_unhashed(dentry)) {
-		spin_unlock(&dentry->d_lock);
-		return 0;
-	}
-	spin_unlock(&dentry->d_lock);
-
-	return check_submounts_and_drop(dentry);
-}
-EXPORT_SYMBOL(d_invalidate);
 
 /* This must be called with d_lock held */
 static inline void __dget_dlock(struct dentry *dentry)
@@ -1142,12 +1116,51 @@ int have_submounts(struct dentry *parent)
 }
 EXPORT_SYMBOL(have_submounts);
 
+struct check_mount {
+	struct vfsmount *mnt;
+	unsigned int mounted;
+};
+
+static enum d_walk_ret path_check_mount(void *data, struct dentry *dentry)
+{
+	struct check_mount *info = data;
+	struct path path = { .mnt = info->mnt, .dentry = dentry };
+
+	if (likely(!d_mountpoint(dentry)))
+		return D_WALK_CONTINUE;
+	if (__path_is_mountpoint(&path)) {
+		info->mounted = 1;
+		return D_WALK_QUIT;
+	}
+	return D_WALK_CONTINUE;
+}
+
+/**
+ * path_has_submounts - check for mounts over a dentry in the
+ *                      current namespace.
+ * @parent: path to check.
+ *
+ * Return true if the parent or its subdirectories contain
+ * a mount point in the current namespace.
+ */
+int path_has_submounts(const struct path *parent)
+{
+	struct check_mount data = { .mnt = parent->mnt, .mounted = 0 };
+
+	read_seqlock_excl(&mount_lock);
+	d_walk(parent->dentry, &data, path_check_mount, NULL);
+	read_sequnlock_excl(&mount_lock);
+
+	return data.mounted;
+}
+EXPORT_SYMBOL(path_has_submounts);
+
 /*
  * Called by mount code to set a mountpoint and check if the mountpoint is
  * reachable (e.g. NFS can unhash a directory dentry and then the complete
  * subtree can become unreachable).
  *
- * Only one of check_submounts_and_drop() and d_set_mounted() must succeed.  For
+ * Only one of d_invalidate() and d_set_mounted() must succeed.  For
  * this reason take rename_lock and d_lock on dentry and ancestors.
  */
 int d_set_mounted(struct dentry *dentry)
@@ -1156,7 +1169,7 @@ int d_set_mounted(struct dentry *dentry)
 	int ret = -ENOENT;
 	write_seqlock(&rename_lock);
 	for (p = dentry->d_parent; !IS_ROOT(p); p = p->d_parent) {
-		/* Need exclusion wrt. check_submounts_and_drop() */
+		/* Need exclusion wrt. d_invalidate() */
 		spin_lock(&p->d_lock);
 		if (unlikely(d_unhashed(p))) {
 			spin_unlock(&p->d_lock);
@@ -1166,8 +1179,11 @@ int d_set_mounted(struct dentry *dentry)
 	}
 	spin_lock(&dentry->d_lock);
 	if (!d_unlinked(dentry)) {
-		dentry->d_flags |= DCACHE_MOUNTED;
-		ret = 0;
+		ret = -EBUSY;
+		if (!d_mountpoint(dentry)) {
+			dentry->d_flags |= DCACHE_MOUNTED;
+			ret = 0;
+		}
 	}
  	spin_unlock(&dentry->d_lock);
 out:
@@ -1256,70 +1272,89 @@ void shrink_dcache_parent(struct dentry *parent)
 }
 EXPORT_SYMBOL(shrink_dcache_parent);
 
-static enum d_walk_ret check_and_collect(void *_data, struct dentry *dentry)
+struct detach_data {
+	struct select_data select;
+	struct dentry *mountpoint;
+};
+static enum d_walk_ret detach_and_collect(void *_data, struct dentry *dentry)
 {
-	struct select_data *data = _data;
+	struct detach_data *data = _data;
 
 	if (d_mountpoint(dentry)) {
-		data->found = -EBUSY;
+		__dget_dlock(dentry);
+		data->mountpoint = dentry;
 		return D_WALK_QUIT;
 	}
 
-	return select_collect(_data, dentry);
+	return select_collect(&data->select, dentry);
 }
 
 static void check_and_drop(void *_data)
 {
-	struct select_data *data = _data;
+	struct detach_data *data = _data;
 
-	if (d_mountpoint(data->start))
-		data->found = -EBUSY;
-	if (!data->found)
-		__d_drop(data->start);
+	if (!data->mountpoint && !data->select.found)
+		__d_drop(data->select.start);
 }
 
 /**
- * check_submounts_and_drop - prune dcache, check for submounts and drop
+ * d_invalidate - detach submounts, prune dcache, and drop
+ * @dentry: dentry to invalidate (aka detach, prune and drop)
  *
- * All done as a single atomic operation relative to has_unlinked_ancestor().
- * Returns 0 if successfully unhashed @parent.  If there were submounts then
- * return -EBUSY.
+ * no dcache lock.
  *
- * @dentry: dentry to prune and drop
+ * The final d_drop is done as an atomic operation relative to
+ * rename_lock ensuring there are no races with d_set_mounted.  This
+ * ensures there are no unhashed dentries on the path to a mountpoint.
  */
-int check_submounts_and_drop(struct dentry *dentry)
+int d_invalidate(struct dentry *dentry)
 {
-	int ret = 0;
+	/*
+	 * If it's already been dropped, return OK.
+	 */
+	spin_lock(&dentry->d_lock);
+	if (d_unhashed(dentry)) {
+		spin_unlock(&dentry->d_lock);
+		return 0;
+	}
+	spin_unlock(&dentry->d_lock);
 
 	/* Negative dentries can be dropped without further checks */
 	if (!dentry->d_inode) {
 		d_drop(dentry);
-		goto out;
+		return 0;
 	}
 
 	for (;;) {
-		struct select_data data;
+		struct detach_data data;
 
-		INIT_LIST_HEAD(&data.dispose);
-		data.start = dentry;
-		data.found = 0;
+		data.mountpoint = NULL;
+		INIT_LIST_HEAD(&data.select.dispose);
+		data.select.start = dentry;
+		data.select.found = 0;
 
-		d_walk(dentry, &data, check_and_collect, check_and_drop);
-		ret = data.found;
+		d_walk(dentry, &data, detach_and_collect, check_and_drop);
 
-		if (!list_empty(&data.dispose))
-			shrink_dentry_list(&data.dispose);
+		if (data.select.found)
+			shrink_dentry_list(&data.select.dispose);
 
-		if (ret <= 0)
-			break;
+		if (data.mountpoint) {
+			if (may_detach_mounts) {
+				detach_mounts(data.mountpoint);
+				dput(data.mountpoint);
+			} else {
+				dput(data.mountpoint);
+				return -EBUSY;
+			}
+		}
+
+		if (!data.mountpoint && !data.select.found)
+			return 0;
 
 		cond_resched();
 	}
-
-out:
-	return ret;
 }
-EXPORT_SYMBOL(check_submounts_and_drop);
+EXPORT_SYMBOL(d_invalidate);
 
 /**
  * __d_alloc	-	allocate a dcache entry
@@ -2525,10 +2560,8 @@ static struct dentry *__d_unalias(struct inode *inode,
 		goto out_err;
 	m2 = &alias->d_parent->d_inode->i_mutex;
 out_unalias:
-	if (likely(!d_mountpoint(alias))) {
-		__d_move(alias, dentry, false);
-		ret = alias;
-	}
+	__d_move(alias, dentry, false);
+	ret = alias;
 out_err:
 	spin_unlock(&inode->i_lock);
 	if (m2)
@@ -2730,11 +2763,14 @@ static int prepend_path(const struct path *path,
 	struct vfsmount *vfsmnt;
 	struct mount *mnt;
 	int error = 0;
-	unsigned seq = 0;
+	unsigned seq, m_seq = 0;
 	char *bptr;
 	int blen;
 
-	br_read_lock(&vfsmount_lock);
+	rcu_read_lock();
+restart_mnt:
+	read_seqbegin_or_lock(&mount_lock, &m_seq);
+	seq = 0;
 	rcu_read_lock();
 restart:
 	bptr = *buffer;
@@ -2748,6 +2784,7 @@ restart:
 		struct dentry * parent;
 
 		if (dentry == vfsmnt->mnt_root || IS_ROOT(dentry)) {
+			struct mount *parent = ACCESS_ONCE(mnt->mnt_parent);
 			/* Escaped? */
 			if (dentry != vfsmnt->mnt_root) {
 				bptr = *buffer;
@@ -2756,9 +2793,9 @@ restart:
 				break;
 			}
 			/* Global root? */
-			if (mnt_has_parent(mnt)) {
-				dentry = mnt->mnt_mountpoint;
-				mnt = mnt->mnt_parent;
+			if (mnt != parent) {
+				dentry = ACCESS_ONCE(mnt->mnt_mountpoint);
+				mnt = parent;
 				vfsmnt = &mnt->mnt;
 				continue;
 			}
@@ -2792,7 +2829,14 @@ restart:
 		goto restart;
 	}
 	done_seqretry(&rename_lock, seq);
-	br_read_unlock(&vfsmount_lock);
+
+	if (!(m_seq & 1))
+		rcu_read_unlock();
+	if (need_seqretry(&mount_lock, m_seq)) {
+		m_seq = 1;
+		goto restart_mnt;
+	}
+	done_seqretry(&mount_lock, m_seq);
 
 	if (error >= 0 && bptr == *buffer) {
 		if (--blen < 0)

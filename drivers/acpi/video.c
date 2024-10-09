@@ -43,6 +43,7 @@
 #include <acpi/acpi_drivers.h>
 #include <linux/suspend.h>
 #include <acpi/video.h>
+#include <linux/workqueue.h>
 
 #include "internal.h"
 
@@ -172,6 +173,8 @@ struct acpi_video_bus {
 	char phys[32];	/* for input device */
 	struct notifier_block pm_nb;
 	struct notifier_block backlight_nb;
+	struct work_struct backlight_unregister_work;
+	struct work_struct backlight_register_work;
 };
 
 struct acpi_video_device_flags {
@@ -1925,6 +1928,21 @@ static void acpi_video_bus_remove_notify_handler(struct acpi_video_bus *video)
 	video->input = NULL;
 }
 
+/* This uses a workqueue to avoid various locking ordering issues */
+static void acpi_video_backlight_unregister_work(struct work_struct *work)
+{
+	struct acpi_video_bus *video =
+			container_of(work, struct acpi_video_bus, backlight_unregister_work);
+	acpi_video_bus_unregister_backlight(video);
+}
+
+static void acpi_video_backlight_register_work(struct work_struct *work)
+{
+	struct acpi_video_bus *video =
+			container_of(work, struct acpi_video_bus, backlight_register_work);
+	acpi_video_bus_register_backlight(video);
+}
+
 static int acpi_video_backlight_notify(struct notifier_block *nb,
 					unsigned long val, void *bd)
 {
@@ -1940,10 +1958,10 @@ static int acpi_video_backlight_notify(struct notifier_block *nb,
 	switch (val) {
 	case BACKLIGHT_REGISTERED:
 		if (!acpi_video_verify_backlight_support())
-			acpi_video_bus_unregister_backlight(video);
+			schedule_work(&video->backlight_unregister_work);
 		break;
 	case BACKLIGHT_UNREGISTERED:
-		acpi_video_bus_register_backlight(video);
+		schedule_work(&video->backlight_register_work);
 		break;
 	}
 
@@ -1960,6 +1978,9 @@ static int acpi_video_bus_add_backlight_notify_handler(
 	error = backlight_register_notifier(&video->backlight_nb);
 	if (error == 0)
 		video->backlight_notifier_registered = true;
+
+	INIT_WORK(&video->backlight_unregister_work, acpi_video_backlight_unregister_work);
+	INIT_WORK(&video->backlight_register_work, acpi_video_backlight_register_work);
 
 	return error;
 }

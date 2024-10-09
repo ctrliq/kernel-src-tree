@@ -324,7 +324,7 @@ static int ef4_poll(struct napi_struct *napi, int budget)
 		 * since ef4_nic_eventq_read_ack() will have no effect if
 		 * interrupts have already been disabled.
 		 */
-		napi_complete(napi);
+		napi_complete_done(napi, spent);
 		ef4_nic_eventq_read_ack(channel);
 	}
 
@@ -2160,6 +2160,18 @@ static int ef4_change_mtu(struct net_device *net_dev, int new_mtu)
 	rc = ef4_check_disabled(efx);
 	if (rc)
 		return rc;
+        if (new_mtu > EF4_MAX_MTU) {
+                netif_err(efx, drv, efx->net_dev,
+                          "Requested MTU of %d too big (max: %d)\n",
+                          new_mtu, EF4_MAX_MTU);
+                return -EINVAL;
+        }
+        if (new_mtu < EF4_MIN_MTU) {
+                netif_err(efx, drv, efx->net_dev,
+                          "Requested MTU of %d too small (min: %d)\n",
+                          new_mtu, EF4_MIN_MTU);
+                return -EINVAL;
+        }
 
 	netif_dbg(efx, drv, efx->net_dev, "changing MTU to %d\n", new_mtu);
 
@@ -2306,8 +2318,6 @@ static int ef4_register_netdev(struct ef4_nic *efx)
 	net_dev->netdev_ops = &ef4_netdev_ops;
 	net_dev->ethtool_ops = &ef4_ethtool_ops;
 	net_dev->gso_max_segs = EF4_TSO_MAX_SEGS;
-	net_dev->min_mtu = EF4_MIN_MTU;
-	net_dev->max_mtu = EF4_MAX_MTU;
 
 	rtnl_lock();
 
@@ -3271,7 +3281,7 @@ static int __init ef4_init_module(void)
 
 	printk(KERN_INFO "Solarflare Falcon driver v" EF4_DRIVER_VERSION "\n");
 
-	rc = register_netdevice_notifier(&ef4_netdev_notifier);
+	rc = register_netdevice_notifier_rh(&ef4_netdev_notifier);
 	if (rc)
 		goto err_notifier;
 
@@ -3290,7 +3300,7 @@ static int __init ef4_init_module(void)
  err_pci:
 	destroy_workqueue(reset_workqueue);
  err_reset:
-	unregister_netdevice_notifier(&ef4_netdev_notifier);
+	unregister_netdevice_notifier_rh(&ef4_netdev_notifier);
  err_notifier:
 	return rc;
 }
@@ -3301,7 +3311,7 @@ static void __exit ef4_exit_module(void)
 
 	pci_unregister_driver(&ef4_pci_driver);
 	destroy_workqueue(reset_workqueue);
-	unregister_netdevice_notifier(&ef4_netdev_notifier);
+	unregister_netdevice_notifier_rh(&ef4_netdev_notifier);
 
 }
 

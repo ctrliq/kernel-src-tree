@@ -39,7 +39,7 @@
 #define MLX5E_READ_CTR32_CPU(ptr, dsc, i) \
 	(*(u32 *)((char *)ptr + dsc[i].offset))
 #define MLX5E_READ_CTR32_BE(ptr, dsc, i) \
-	be64_to_cpu(*(__be32 *)((char *)ptr + dsc[i].offset))
+	be32_to_cpu(*(__be32 *)((char *)ptr + dsc[i].offset))
 
 #define MLX5E_DECLARE_STAT(type, fld) #fld, offsetof(type, fld)
 #define MLX5E_DECLARE_RX_STAT(type, fld) "rx%d_"#fld, offsetof(type, fld)
@@ -73,10 +73,13 @@ struct mlx5e_sw_stats {
 	u64 tx_xmit_more;
 	u64 rx_wqe_err;
 	u64 rx_mpwqe_filler;
-	u64 rx_mpwqe_frag;
 	u64 rx_buff_alloc_err;
 	u64 rx_cqe_compress_blks;
 	u64 rx_cqe_compress_pkts;
+	u64 rx_cache_reuse;
+	u64 rx_cache_full;
+	u64 rx_cache_empty;
+	u64 rx_cache_busy;
 
 	/* Special handling counters */
 	u64 link_down_events_phy;
@@ -105,10 +108,13 @@ static const struct counter_desc sw_stats_desc[] = {
 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, tx_xmit_more) },
 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_wqe_err) },
 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_mpwqe_filler) },
-	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_mpwqe_frag) },
 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_buff_alloc_err) },
 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_cqe_compress_blks) },
 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_cqe_compress_pkts) },
+	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_cache_reuse) },
+	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_cache_full) },
+	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_cache_empty) },
+	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_cache_busy) },
 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, link_down_events_phy) },
 };
 
@@ -276,6 +282,21 @@ static const struct counter_desc pport_per_prio_pfc_stats_desc[] = {
 	{ "rx_%s_pause_transition", PPORT_PER_PRIO_OFF(rx_pause_transition) },
 };
 
+#define PCIE_PERF_OFF(c) \
+	MLX5_BYTE_OFF(mpcnt_reg, counter_set.pcie_perf_cntrs_grp_data_layout.c)
+#define PCIE_PERF_GET(pcie_stats, c) \
+	MLX5_GET(mpcnt_reg, (pcie_stats)->pcie_perf_counters, \
+		 counter_set.pcie_perf_cntrs_grp_data_layout.c)
+
+struct mlx5e_pcie_stats {
+	__be64 pcie_perf_counters[MLX5_ST_SZ_QW(mpcnt_reg)];
+};
+
+static const struct counter_desc pcie_perf_stats_desc[] = {
+	{ "rx_pci_signal_integrity", PCIE_PERF_OFF(rx_errors) },
+	{ "tx_pci_signal_integrity", PCIE_PERF_OFF(tx_errors) },
+};
+
 struct mlx5e_rq_stats {
 	u64 packets;
 	u64 bytes;
@@ -286,10 +307,13 @@ struct mlx5e_rq_stats {
 	u64 lro_bytes;
 	u64 wqe_err;
 	u64 mpwqe_filler;
-	u64 mpwqe_frag;
 	u64 buff_alloc_err;
 	u64 cqe_compress_blks;
 	u64 cqe_compress_pkts;
+	u64 cache_reuse;
+	u64 cache_full;
+	u64 cache_empty;
+	u64 cache_busy;
 };
 
 static const struct counter_desc rq_stats_desc[] = {
@@ -302,10 +326,13 @@ static const struct counter_desc rq_stats_desc[] = {
 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, lro_bytes) },
 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, wqe_err) },
 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, mpwqe_filler) },
-	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, mpwqe_frag) },
 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, buff_alloc_err) },
 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, cqe_compress_blks) },
 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, cqe_compress_pkts) },
+	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, cache_reuse) },
+	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, cache_full) },
+	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, cache_empty) },
+	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, cache_busy) },
 };
 
 struct mlx5e_sq_stats {
@@ -351,6 +378,9 @@ static const struct counter_desc sq_stats_desc[] = {
 #define NUM_PPORT_PHY_STATISTICAL_COUNTERS(priv) \
 	(ARRAY_SIZE(pport_phy_statistical_stats_desc) * \
 	 MLX5_CAP_PCAM_FEATURE((priv)->mdev, ppcnt_statistical_group))
+#define NUM_PCIE_PERF_COUNTERS(priv) \
+	(ARRAY_SIZE(pcie_perf_stats_desc) * \
+	 MLX5_CAP_MCAM_FEATURE((priv)->mdev, pcie_performance_group))
 #define NUM_PPORT_PER_PRIO_TRAFFIC_COUNTERS \
 	ARRAY_SIZE(pport_per_prio_traffic_stats_desc)
 #define NUM_PPORT_PER_PRIO_PFC_COUNTERS \
@@ -361,6 +391,7 @@ static const struct counter_desc sq_stats_desc[] = {
 					 NUM_PPORT_PHY_STATISTICAL_COUNTERS(priv) + \
 					 NUM_PPORT_PER_PRIO_TRAFFIC_COUNTERS * \
 					 NUM_PPORT_PRIO)
+#define NUM_PCIE_COUNTERS(priv)		NUM_PCIE_PERF_COUNTERS(priv)
 #define NUM_RQ_STATS			ARRAY_SIZE(rq_stats_desc)
 #define NUM_SQ_STATS			ARRAY_SIZE(sq_stats_desc)
 
@@ -369,6 +400,8 @@ struct mlx5e_stats {
 	struct mlx5e_qcounter_stats qcnt;
 	struct mlx5e_vport_stats vport;
 	struct mlx5e_pport_stats pport;
+	struct mlx5e_pcie_stats pcie;
+	struct rtnl_link_stats64 vf_vport;
 };
 
 static const struct counter_desc mlx5e_pme_status_desc[] = {

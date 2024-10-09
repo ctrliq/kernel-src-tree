@@ -48,6 +48,7 @@
 #include "lpfc_compat.h"
 #include "lpfc_crtn.h"
 #include "lpfc_vport.h"
+#include "lpfc_attr.h"
 
 #define LPFC_DEF_DEVLOSS_TMO 30
 #define LPFC_MIN_DEVLOSS_TMO 1
@@ -1944,94 +1945,6 @@ lpfc_##attr##_store(struct device *dev, struct device_attribute *attr, \
 }
 
 
-#define LPFC_ATTR(name, defval, minval, maxval, desc) \
-static uint lpfc_##name = defval;\
-module_param(lpfc_##name, uint, S_IRUGO);\
-MODULE_PARM_DESC(lpfc_##name, desc);\
-lpfc_param_init(name, defval, minval, maxval)
-
-#define LPFC_ATTR_R(name, defval, minval, maxval, desc) \
-static uint lpfc_##name = defval;\
-module_param(lpfc_##name, uint, S_IRUGO);\
-MODULE_PARM_DESC(lpfc_##name, desc);\
-lpfc_param_show(name)\
-lpfc_param_init(name, defval, minval, maxval)\
-static DEVICE_ATTR(lpfc_##name, S_IRUGO , lpfc_##name##_show, NULL)
-
-#define LPFC_ATTR_RW(name, defval, minval, maxval, desc) \
-static uint lpfc_##name = defval;\
-module_param(lpfc_##name, uint, S_IRUGO);\
-MODULE_PARM_DESC(lpfc_##name, desc);\
-lpfc_param_show(name)\
-lpfc_param_init(name, defval, minval, maxval)\
-lpfc_param_set(name, defval, minval, maxval)\
-lpfc_param_store(name)\
-static DEVICE_ATTR(lpfc_##name, S_IRUGO | S_IWUSR,\
-		   lpfc_##name##_show, lpfc_##name##_store)
-
-#define LPFC_ATTR_HEX_R(name, defval, minval, maxval, desc) \
-static uint lpfc_##name = defval;\
-module_param(lpfc_##name, uint, S_IRUGO);\
-MODULE_PARM_DESC(lpfc_##name, desc);\
-lpfc_param_hex_show(name)\
-lpfc_param_init(name, defval, minval, maxval)\
-static DEVICE_ATTR(lpfc_##name, S_IRUGO , lpfc_##name##_show, NULL)
-
-#define LPFC_ATTR_HEX_RW(name, defval, minval, maxval, desc) \
-static uint lpfc_##name = defval;\
-module_param(lpfc_##name, uint, S_IRUGO);\
-MODULE_PARM_DESC(lpfc_##name, desc);\
-lpfc_param_hex_show(name)\
-lpfc_param_init(name, defval, minval, maxval)\
-lpfc_param_set(name, defval, minval, maxval)\
-lpfc_param_store(name)\
-static DEVICE_ATTR(lpfc_##name, S_IRUGO | S_IWUSR,\
-		   lpfc_##name##_show, lpfc_##name##_store)
-
-#define LPFC_VPORT_ATTR(name, defval, minval, maxval, desc) \
-static uint lpfc_##name = defval;\
-module_param(lpfc_##name, uint, S_IRUGO);\
-MODULE_PARM_DESC(lpfc_##name, desc);\
-lpfc_vport_param_init(name, defval, minval, maxval)
-
-#define LPFC_VPORT_ATTR_R(name, defval, minval, maxval, desc) \
-static uint lpfc_##name = defval;\
-module_param(lpfc_##name, uint, S_IRUGO);\
-MODULE_PARM_DESC(lpfc_##name, desc);\
-lpfc_vport_param_show(name)\
-lpfc_vport_param_init(name, defval, minval, maxval)\
-static DEVICE_ATTR(lpfc_##name, S_IRUGO , lpfc_##name##_show, NULL)
-
-#define LPFC_VPORT_ATTR_RW(name, defval, minval, maxval, desc) \
-static uint lpfc_##name = defval;\
-module_param(lpfc_##name, uint, S_IRUGO);\
-MODULE_PARM_DESC(lpfc_##name, desc);\
-lpfc_vport_param_show(name)\
-lpfc_vport_param_init(name, defval, minval, maxval)\
-lpfc_vport_param_set(name, defval, minval, maxval)\
-lpfc_vport_param_store(name)\
-static DEVICE_ATTR(lpfc_##name, S_IRUGO | S_IWUSR,\
-		   lpfc_##name##_show, lpfc_##name##_store)
-
-#define LPFC_VPORT_ATTR_HEX_R(name, defval, minval, maxval, desc) \
-static uint lpfc_##name = defval;\
-module_param(lpfc_##name, uint, S_IRUGO);\
-MODULE_PARM_DESC(lpfc_##name, desc);\
-lpfc_vport_param_hex_show(name)\
-lpfc_vport_param_init(name, defval, minval, maxval)\
-static DEVICE_ATTR(lpfc_##name, S_IRUGO , lpfc_##name##_show, NULL)
-
-#define LPFC_VPORT_ATTR_HEX_RW(name, defval, minval, maxval, desc) \
-static uint lpfc_##name = defval;\
-module_param(lpfc_##name, uint, S_IRUGO);\
-MODULE_PARM_DESC(lpfc_##name, desc);\
-lpfc_vport_param_hex_show(name)\
-lpfc_vport_param_init(name, defval, minval, maxval)\
-lpfc_vport_param_set(name, defval, minval, maxval)\
-lpfc_vport_param_store(name)\
-static DEVICE_ATTR(lpfc_##name, S_IRUGO | S_IWUSR,\
-		   lpfc_##name##_show, lpfc_##name##_store)
-
 static DEVICE_ATTR(bg_info, S_IRUGO, lpfc_bg_info_show, NULL);
 static DEVICE_ATTR(bg_guard_err, S_IRUGO, lpfc_bg_guard_err_show, NULL);
 static DEVICE_ATTR(bg_apptag_err, S_IRUGO, lpfc_bg_apptag_err_show, NULL);
@@ -2841,6 +2754,12 @@ MODULE_PARM_DESC(lpfc_poll, "FCP ring polling mode control:"
 static DEVICE_ATTR(lpfc_poll, S_IRUGO | S_IWUSR,
 		   lpfc_poll_show, lpfc_poll_store);
 
+int lpfc_no_hba_reset_cnt;
+unsigned long lpfc_no_hba_reset[MAX_HBAS_NO_RESET] = {
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+module_param_array(lpfc_no_hba_reset, ulong, &lpfc_no_hba_reset_cnt, 0444);
+MODULE_PARM_DESC(lpfc_no_hba_reset, "WWPN of HBAs that should not be reset");
+
 LPFC_ATTR(sli_mode, 0, 0, 3,
 	"SLI mode selector:"
 	" 0 - auto (SLI-3 if supported),"
@@ -2849,6 +2768,9 @@ LPFC_ATTR(sli_mode, 0, 0, 3,
 
 LPFC_ATTR_R(enable_npiv, 1, 0, 1,
 	"Enable NPIV functionality");
+
+LPFC_ATTR_R(use_blk_mq, 0, 0, 1,
+	"Enable blk_mq functionality");
 
 LPFC_ATTR_R(fcf_failover_policy, 1, 1, 2,
 	"FCF Fast failover=1 Priority failover=2");
@@ -4761,12 +4683,12 @@ LPFC_ATTR_R(sg_seg_cnt, LPFC_DEFAULT_SG_SEG_CNT, LPFC_DEFAULT_SG_SEG_CNT,
 	    LPFC_MAX_SG_SEG_CNT, "Max Scatter Gather Segment Count");
 
 /*
- * This parameter will be depricated, the driver cannot limit the
- * protection data s/g list.
+ * lpfc_enable_mds_diags: Enable MDS Diagnostics
+ *       0  = MDS Diagnostics disabled (default)
+ *       1  = MDS Diagnostics enabled
+ * Value range is [0,1]. Default value is 0.
  */
-LPFC_ATTR_R(prot_sg_seg_cnt, LPFC_DEFAULT_SG_SEG_CNT,
-	    LPFC_DEFAULT_SG_SEG_CNT, LPFC_MAX_SG_SEG_CNT,
-	    "Max Protection Scatter Gather Segment Count");
+LPFC_ATTR_R(enable_mds_diags, 0, 0, 1, "Enable MDS Diagnostics");
 
 struct device_attribute *lpfc_hba_attrs[] = {
 	&dev_attr_bg_info,
@@ -4813,6 +4735,7 @@ struct device_attribute *lpfc_hba_attrs[] = {
 	&dev_attr_lpfc_enable_SmartSAN,
 	&dev_attr_lpfc_max_luns,
 	&dev_attr_lpfc_enable_npiv,
+	&dev_attr_lpfc_use_blk_mq,
 	&dev_attr_lpfc_fcf_failover_policy,
 	&dev_attr_lpfc_enable_rrq,
 	&dev_attr_nport_evt_cnt,
@@ -4849,7 +4772,6 @@ struct device_attribute *lpfc_hba_attrs[] = {
 	&dev_attr_lpfc_sg_seg_cnt,
 	&dev_attr_lpfc_max_scsicmpl_time,
 	&dev_attr_lpfc_stat_data_ctrl,
-	&dev_attr_lpfc_prot_sg_seg_cnt,
 	&dev_attr_lpfc_aer_support,
 	&dev_attr_lpfc_aer_state_cleanup,
 	&dev_attr_lpfc_sriov_nr_virtfn,
@@ -4865,6 +4787,7 @@ struct device_attribute *lpfc_hba_attrs[] = {
 	&dev_attr_lpfc_sriov_hw_max_virtfn,
 	&dev_attr_protocol,
 	&dev_attr_lpfc_xlane_supported,
+	&dev_attr_lpfc_enable_mds_diags,
 	NULL,
 };
 
@@ -5137,7 +5060,6 @@ lpfc_free_sysfs_attr(struct lpfc_vport *vport)
 	sysfs_remove_bin_file(&shost->shost_dev.kobj, &sysfs_mbox_attr);
 	sysfs_remove_bin_file(&shost->shost_dev.kobj, &sysfs_ctlreg_attr);
 }
-
 
 /*
  * Dynamic FC Host Attributes Support
@@ -5837,6 +5759,7 @@ lpfc_get_cfgparam(struct lpfc_hba *phba)
 	lpfc_poll_tmo_init(phba, lpfc_poll_tmo);
 	lpfc_task_mgmt_tmo_init(phba, lpfc_task_mgmt_tmo);
 	lpfc_enable_npiv_init(phba, lpfc_enable_npiv);
+	lpfc_use_blk_mq_init(phba, lpfc_use_blk_mq);
 	lpfc_fcf_failover_policy_init(phba, lpfc_fcf_failover_policy);
 	lpfc_enable_rrq_init(phba, lpfc_enable_rrq);
 	lpfc_fdmi_on_init(phba, lpfc_fdmi_on);
@@ -5866,7 +5789,6 @@ lpfc_get_cfgparam(struct lpfc_hba *phba)
 	phba->cfg_soft_wwnn = 0L;
 	phba->cfg_soft_wwpn = 0L;
 	lpfc_sg_seg_cnt_init(phba, lpfc_sg_seg_cnt);
-	lpfc_prot_sg_seg_cnt_init(phba, lpfc_prot_sg_seg_cnt);
 	lpfc_hba_queue_depth_init(phba, lpfc_hba_queue_depth);
 	lpfc_hba_log_verbose_init(phba, lpfc_log_verbose);
 	lpfc_aer_support_init(phba, lpfc_aer_support);
@@ -5877,6 +5799,7 @@ lpfc_get_cfgparam(struct lpfc_hba *phba)
 	lpfc_delay_discovery_init(phba, lpfc_delay_discovery);
 	lpfc_sli_mode_init(phba, lpfc_sli_mode);
 	phba->cfg_enable_dss = 1;
+	lpfc_enable_mds_diags_init(phba, lpfc_enable_mds_diags);
 	return;
 }
 

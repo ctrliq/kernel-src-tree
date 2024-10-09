@@ -23,6 +23,7 @@
 #include <linux/audit.h>
 #include <linux/skbuff.h>
 #include <uapi/linux/mqueue.h>
+#include <linux/tty.h>
 
 #ifdef __GENKSYMS__
 #define AUDIT_DEBUG 0
@@ -111,6 +112,11 @@ struct audit_names {
 	int			ino_count;
 #endif
 #endif
+};
+
+struct audit_proctitle {
+	int	len;	/* length of the cmdline field. */
+	char	*value;	/* the cmdline field */
 };
 
 /* The per-task audit context. */
@@ -207,7 +213,11 @@ struct audit_context {
 		struct {
 			int			argc;
 		} execve;
+		RH_KABI_EXTEND(struct {
+			char			*name;
+		} module;)
 	};
+	RH_KABI_EXTEND(struct audit_proctitle proctitle;)
 	int fds[2];
 };
 
@@ -215,7 +225,7 @@ extern int audit_ever_enabled;
 
 extern void audit_copy_inode(struct audit_names *name,
 			     const struct dentry *dentry,
-			     const struct inode *inode);
+			     struct inode *inode);
 extern void audit_log_cap(struct audit_buffer *ab, char *prefix,
 			  kernel_cap_t *cap);
 extern void audit_log_fcaps(struct audit_buffer *ab, struct audit_names *name);
@@ -262,6 +272,9 @@ extern void audit_free_rule_rcu(struct rcu_head *);
 extern struct list_head audit_filter_list[];
 
 extern struct audit_entry *audit_dupe_rule(struct audit_krule *old);
+
+extern struct tty_struct *audit_get_tty(struct task_struct *tsk);
+extern void audit_put_tty(struct tty_struct *tty);
 
 /* audit watch functions */
 #ifdef CONFIG_AUDIT_WATCH
@@ -327,6 +340,8 @@ extern char *audit_unpack_string(void **, size_t *, size_t);
 extern pid_t audit_sig_pid;
 extern kuid_t audit_sig_uid;
 extern u32 audit_sig_sid;
+
+extern int audit_filter(int msgtype, unsigned int listtype);
 
 #ifdef CONFIG_AUDITSYSCALL
 extern int __audit_signal_info(int sig, struct task_struct *t);

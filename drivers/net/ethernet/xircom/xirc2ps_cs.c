@@ -27,7 +27,8 @@
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA
  *
  *
  * ALTERNATIVELY, this driver may be distributed under the terms of
@@ -1199,7 +1200,7 @@ xirc2ps_tx_timeout_task(struct work_struct *work)
 	struct net_device *dev = local->dev;
     /* reset the card */
     do_reset(dev,1);
-    dev->trans_start = jiffies; /* prevent tx timeout */
+    netif_trans_update(dev); /* prevent tx timeout */
     netif_wake_queue(dev);
 }
 

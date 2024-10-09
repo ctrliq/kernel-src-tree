@@ -700,7 +700,7 @@ static void digi_set_termios(struct tty_struct *tty,
 			/* and throttling input */
 			modem_signals = TIOCM_DTR;
 			if (!(tty->termios.c_cflag & CRTSCTS) ||
-			    !test_bit(TTY_THROTTLED, &tty->flags))
+			    !tty_throttled(tty))
 				modem_signals |= TIOCM_RTS;
 			digi_set_modem_signals(port, modem_signals, 1);
 		}

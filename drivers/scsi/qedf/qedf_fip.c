@@ -173,7 +173,7 @@ void qedf_fip_recv(struct qedf_ctx *qedf, struct sk_buff *skb)
 		    skb->data, skb->len, false);
 
 	/* Handle FIP VLAN resp in the driver */
-	if (op == FIP_OP_VLAN && sub == FIP_SC_VL_NOTE) {
+	if (op == FIP_OP_VLAN && sub == FIP_SC_VL_REP) {
 		qedf_fcoe_process_vlan_resp(qedf, skb);
 		qedf->vlan_hw_insert = 0;
 		kfree_skb(skb);

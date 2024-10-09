@@ -2018,7 +2018,7 @@ static void bnx2x_set_rx_buf_size(struct bnx2x *bp)
 			mtu = bp->dev->mtu;
 		fp->rx_buf_size = BNX2X_FW_RX_ALIGN_START +
 				  IP_HEADER_ALIGNMENT_PADDING +
-				  ETH_OVREHEAD +
+				  ETH_OVERHEAD +
 				  mtu +
 				  BNX2X_FW_RX_ALIGN_END;
 		fp->rx_buf_size = SKB_DATA_ALIGN(fp->rx_buf_size);
@@ -3244,14 +3244,13 @@ static int bnx2x_poll(struct napi_struct *napi, int budget)
 			rmb();
 
 			if (!(bnx2x_has_rx_work(fp) || bnx2x_has_tx_work(fp))) {
-				if (napi_complete_done(napi, rx_work_done)) {
-					/* Re-enable interrupts */
-					DP(NETIF_MSG_RX_STATUS,
-					   "Update index to %d\n", fp->fp_hc_idx);
-					bnx2x_ack_sb(bp, fp->igu_sb_id, USTORM_ID,
-						     le16_to_cpu(fp->fp_hc_idx),
-						     IGU_INT_ENABLE, 1);
-				}
+				napi_complete_done(napi, rx_work_done);
+				/* Re-enable interrupts */
+				DP(NETIF_MSG_RX_STATUS,
+				   "Update index to %d\n", fp->fp_hc_idx);
+				bnx2x_ack_sb(bp, fp->igu_sb_id, USTORM_ID,
+					     le16_to_cpu(fp->fp_hc_idx),
+					     IGU_INT_ENABLE, 1);
 			} else {
 				rx_work_done = budget;
 			}
@@ -4864,7 +4863,7 @@ int bnx2x_change_mtu(struct net_device *dev, int new_mtu)
 	}
 
 	if ((new_mtu > ETH_MAX_JUMBO_PACKET_SIZE) ||
-	    ((new_mtu + ETH_HLEN) < ETH_MIN_PACKET_SIZE)) {
+	    (new_mtu < ETH_MIN_PACKET_SIZE)) {
 		BNX2X_ERR("Can't support requested MTU size\n");
 		return -EINVAL;
 	}

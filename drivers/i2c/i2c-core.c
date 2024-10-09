@@ -240,6 +240,20 @@ static int i2c_device_probe(struct device *dev)
 	if (!client)
 		return 0;
 
+	if (!client->irq) {
+		int irq = -ENOENT;
+
+		if (ACPI_COMPANION(dev))
+			irq = acpi_dev_gpio_irq_get(ACPI_COMPANION(dev), 0);
+
+		if (irq == -EPROBE_DEFER)
+			return irq;
+		if (irq < 0)
+			irq = 0;
+
+		client->irq = irq;
+	}
+
 	driver = to_i2c_driver(dev->driver);
 	if (!driver->probe || !driver->id_table)
 		return -ENODEV;
@@ -972,7 +986,7 @@ static int acpi_i2c_add_resource(struct acpi_resource *ares, void *data)
 			if (sb->access_mode == ACPI_I2C_10BIT_MODE)
 				info->flags |= I2C_CLIENT_TEN;
 		}
-	} else if (info->irq < 0) {
+	} else if (!info->irq) {
 		struct resource r;
 
 		if (acpi_dev_resource_interrupt(ares, 0, &r))
@@ -999,7 +1013,6 @@ static acpi_status acpi_i2c_add_device(acpi_handle handle, u32 level,
 
 	memset(&info, 0, sizeof(info));
 	info.fwnode = acpi_fwnode_handle(adev);
-	info.irq = -1;
 
 	INIT_LIST_HEAD(&resource_list);
 	ret = acpi_dev_get_resources(adev, &resource_list,

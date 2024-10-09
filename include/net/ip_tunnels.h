@@ -129,7 +129,8 @@ struct ip_tunnel {
 	struct gro_cells	gro_cells;
 
 	/* Reserved slots. For Red Hat usage only. */
-	RH_KABI_USE(1, bool	collect_md)
+	RH_KABI_USE2(1, bool	collect_md,
+			bool	ignore_df)
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
@@ -165,6 +166,7 @@ struct tnl_ptk_info {
 
 #define PACKET_RCVD	0
 #define PACKET_REJECT	1
+#define PACKET_NEXT	2
 
 #define IP_TNL_HASH_BITS   7
 #define IP_TNL_HASH_SIZE   (1 << IP_TNL_HASH_BITS)
@@ -238,6 +240,25 @@ static inline unsigned short ip_tunnel_info_af(const struct ip_tunnel_info
 					       *tun_info)
 {
 	return tun_info->mode & IP_TUNNEL_INFO_IPV6 ? AF_INET6 : AF_INET;
+}
+
+static inline __be64 key32_to_tunnel_id(__be32 key)
+{
+#ifdef __BIG_ENDIAN
+	return (__force __be64)key;
+#else
+	return (__force __be64)((__force u64)key << 32);
+#endif
+}
+
+/* Returns the least-significant 32 bits of a __be64. */
+static inline __be32 tunnel_id_to_key32(__be64 tun_id)
+{
+#ifdef __BIG_ENDIAN
+	return (__force __be32)tun_id;
+#else
+	return (__force __be32)((__force u64)tun_id >> 32);
+#endif
 }
 
 #ifdef CONFIG_INET
@@ -314,8 +335,7 @@ void iptunnel_xmit(struct sock *sk, struct rtable *rt, struct sk_buff *skb,
 struct metadata_dst *iptunnel_metadata_reply(struct metadata_dst *md,
 					     gfp_t flags);
 
-struct sk_buff *iptunnel_handle_offloads(struct sk_buff *skb, bool gre_csum,
-					 int gso_type_mask);
+int iptunnel_handle_offloads(struct sk_buff *skb, int gso_type_mask);
 
 static inline int iptunnel_pull_offloads(struct sk_buff *skb)
 {

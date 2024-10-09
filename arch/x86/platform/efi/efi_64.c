@@ -29,6 +29,7 @@
 #include <linux/reboot.h>
 #include <linux/slab.h>
 
+#include <asm/pgalloc.h>
 #include <asm/setup.h>
 #include <asm/page.h>
 #include <asm/e820.h>
@@ -48,8 +49,7 @@ static unsigned long efi_flags __initdata;
  * We allocate runtime services regions bottom-up, starting from -4G, i.e.
  * 0xffff_ffff_0000_0000 and limit EFI VA mapping space to 64G.
  */
-static u64 efi_va	= -4 * (1UL << 30);
-#define EFI_VA_END	(-68 * (1UL << 30))
+static u64 efi_va = EFI_VA_START;
 
 /*
  * Scratch space used for switching the pagetable in the EFI stub
@@ -81,9 +81,12 @@ static void __init early_code_mapping_set_exec(int executable)
 
 void __init efi_call_phys_prelog(void)
 {
-	unsigned long vaddress;
+	unsigned long vaddr, addr_pgd, addr_pud;
+	pgd_t *pgd_k, *pgd_efi;
+	pud_t *pud;
+
 	int pgd;
-	int n_pgds;
+	int n_pgds, j;
 
 	if (!efi_enabled(EFI_OLD_MEMMAP))
 		return;
@@ -94,10 +97,34 @@ void __init efi_call_phys_prelog(void)
 	n_pgds = DIV_ROUND_UP((max_pfn << PAGE_SHIFT), PGDIR_SIZE);
 	save_pgd = kmalloc(n_pgds * sizeof(pgd_t), GFP_KERNEL);
 
+	/*
+	 * Build 1:1 ident mapping for old_map usage. It needs to be noticed
+	 * that PAGE_OFFSET is PGDIR_SIZE aligned with KASLR disabled, while
+	 * PUD_SIZE ALIGNED with KASLR enabled. So for a given physical
+	 * address X, the pud_index(X) != pud_index(__va(X)), we can only copy
+	 * pud entry of __va(X) to fill in pud entry of X to build 1:1 mapping
+	 * . Means here we can only reuse pmd table of direct mapping.
+	 */
 	for (pgd = 0; pgd < n_pgds; pgd++) {
-		save_pgd[pgd] = *pgd_offset_k(pgd * PGDIR_SIZE);
-		vaddress = (unsigned long)__va(pgd * PGDIR_SIZE);
-		set_pgd(pgd_offset_k(pgd * PGDIR_SIZE), *pgd_offset_k(vaddress));
+		addr_pgd = (unsigned long)(pgd * PGDIR_SIZE);
+		vaddr = (unsigned long)__va(pgd * PGDIR_SIZE);
+		pgd_efi = pgd_offset_k(addr_pgd);
+		save_pgd[pgd] = *pgd_efi;
+
+		pud = pud_alloc(&init_mm, pgd_efi, addr_pgd);
+		if (!pud) {
+			pr_err("Failed to allocate pud table!\n");
+			break;
+		}
+		for (j = 0; j < PTRS_PER_PUD; j++) {
+			addr_pud = addr_pgd + j * PUD_SIZE;
+			if (addr_pud > (max_pfn << PAGE_SHIFT))
+				break;
+			vaddr = (unsigned long)__va(addr_pud);
+
+			pgd_k = pgd_offset_k(vaddr);
+			pud[j] = *pud_offset(pgd_k, vaddr);
+		}
 	}
 	__flush_tlb_all();
 }
@@ -107,14 +134,24 @@ void __init efi_call_phys_epilog(void)
 	/*
 	 * After the lock is released, the original page table is restored.
 	 */
-	int pgd;
+	int pgd_idx;
 	int n_pgds = DIV_ROUND_UP((max_pfn << PAGE_SHIFT) , PGDIR_SIZE);
+	pgd_t *pgd;
+	pud_t *pud;
 
 	if (!efi_enabled(EFI_OLD_MEMMAP))
 		return;
 
-	for (pgd = 0; pgd < n_pgds; pgd++)
-		set_pgd(pgd_offset_k(pgd * PGDIR_SIZE), save_pgd[pgd]);
+	for (pgd_idx = 0; pgd_idx < n_pgds; pgd_idx++) {
+		pgd = pgd_offset_k(pgd_idx * PGDIR_SIZE);
+		set_pgd(pgd_offset_k(pgd_idx * PGDIR_SIZE), save_pgd[pgd_idx]);
+
+		if (!(pgd_val(*pgd) & _PAGE_PRESENT))
+			continue;
+
+		pud = (pud_t *)pgd_page_vaddr(*pgd);
+		pud_free(&init_mm, pud);
+	}
 	kfree(save_pgd);
 	__flush_tlb_all();
 	local_irq_restore(efi_flags);

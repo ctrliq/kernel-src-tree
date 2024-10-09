@@ -158,13 +158,15 @@ static void page_cache_tree_delete(struct address_space *mapping,
 			return;
 
 	/*
-	 * Track node that only contains shadow entries.
+	 * Track node that only contains shadow entries. DAX mappings contain
+	 * no shadow entries and may contain other exceptional entries so skip
+	 * those.
 	 *
 	 * Avoid acquiring the list_lru lock if already tracked.  The
 	 * list_empty() test is safe as node->private_list is
 	 * protected by mapping->tree_lock.
 	 */
-	if (!workingset_node_pages(node) &&
+	if (!dax_mapping(mapping) && !workingset_node_pages(node) &&
 	    list_empty(&node->private_list)) {
 		node->private_data = mapping;
 		workingset_remember_node(node);
@@ -575,6 +577,9 @@ static int page_cache_tree_insert(struct address_space *mapping,
 			/* DAX accounts exceptional entries as normal pages */
 			if (node)
 				workingset_node_pages_dec(node);
+			/* Wakeup waiters for exceptional entry lock */
+			dax_wake_mapping_entry_waiter(mapping, page->index, p,
+						      true);
 		}
 	}
 	radix_tree_replace_slot(slot, page);
@@ -1590,7 +1595,7 @@ size_t copy_page_to_iter(struct page *page, size_t offset, size_t bytes,
 	buf = iov->iov_base + skip;
 	copy = min(bytes, iov->iov_len - skip);
 
-	if (!fault_in_pages_writeable(buf, copy)) {
+	if (IS_ENABLED(CONFIG_HIGHMEM) && !fault_in_pages_writeable(buf, copy)) {
 		kaddr = kmap_atomic(page);
 		from = kaddr + offset;
 
@@ -1668,7 +1673,7 @@ size_t copy_page_from_iter(struct page *page, size_t offset, size_t bytes,
 	buf = iov->iov_base + skip;
 	copy = min(bytes, iov->iov_len - skip);
 
-	if (!fault_in_pages_readable(buf, copy)) {
+	if (IS_ENABLED(CONFIG_HIGHMEM) && !fault_in_pages_readable(buf, copy)) {
 		kaddr = kmap_atomic(page);
 		to = kaddr + offset;
 
@@ -1969,7 +1974,7 @@ int file_read_actor(read_descriptor_t *desc, struct page *page,
 	 * Faults on the destination of a read are common, so do it before
 	 * taking the kmap.
 	 */
-	if (!fault_in_pages_writeable(desc->arg.buf, size)) {
+	if (IS_ENABLED(CONFIG_HIGHMEM) && !fault_in_pages_writeable(desc->arg.buf, size)) {
 		kaddr = kmap_atomic(page);
 		left = __copy_to_user_inatomic(desc->arg.buf,
 						kaddr + offset, size);

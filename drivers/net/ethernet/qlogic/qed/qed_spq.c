@@ -1,9 +1,33 @@
 /* QLogic qed NIC Driver
- * Copyright (c) 2015 QLogic Corporation
+ * Copyright (c) 2015-2017  QLogic Corporation
  *
- * This software is available under the terms of the GNU General Public License
- * (GPL) Version 2, available from the file COPYING in the main directory of
- * this source tree.
+ * This software is available to you under a choice of one of two
+ * licenses.  You may choose to be licensed under the terms of the GNU
+ * General Public License (GPL) Version 2, available from the file
+ * COPYING in the main directory of this source tree, or the
+ * OpenIB.org BSD license below:
+ *
+ *     Redistribution and use in source and binary forms, with or
+ *     without modification, are permitted provided that the following
+ *     conditions are met:
+ *
+ *      - Redistributions of source code must retain the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer.
+ *
+ *      - Redistributions in binary form must reproduce the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer in the documentation and /or other materials
+ *        provided with the distribution.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  */
 
 #include <linux/types.h>
@@ -24,13 +48,13 @@
 #include "qed_hsi.h"
 #include "qed_hw.h"
 #include "qed_int.h"
+#include "qed_iscsi.h"
 #include "qed_mcp.h"
+#include "qed_ooo.h"
 #include "qed_reg_addr.h"
 #include "qed_sp.h"
 #include "qed_sriov.h"
-#if IS_ENABLED(CONFIG_INFINIBAND_QEDR)
 #include "qed_roce.h"
-#endif
 
 /***************************************************************************
 * Structures & Definitions
@@ -272,15 +296,30 @@ qed_async_event_completion(struct qed_hwfn *p_hwfn,
 			   struct event_ring_entry *p_eqe)
 {
 	switch (p_eqe->protocol_id) {
-#if IS_ENABLED(CONFIG_INFINIBAND_QEDR)
+#if IS_ENABLED(CONFIG_QED_RDMA)
 	case PROTOCOLID_ROCE:
-		qed_async_roce_event(p_hwfn, p_eqe);
+		qed_roce_async_event(p_hwfn, p_eqe->opcode,
+				     &p_eqe->data.rdma_data);
 		return 0;
 #endif
 	case PROTOCOLID_COMMON:
 		return qed_sriov_eqe_event(p_hwfn,
 					   p_eqe->opcode,
 					   p_eqe->echo, &p_eqe->data);
+	case PROTOCOLID_ISCSI:
+		if (!IS_ENABLED(CONFIG_QED_ISCSI))
+			return -EINVAL;
+
+		if (p_hwfn->p_iscsi_info->event_cb) {
+			struct qed_iscsi_info *p_iscsi = p_hwfn->p_iscsi_info;
+
+			return p_iscsi->event_cb(p_iscsi->event_context,
+						 p_eqe->opcode, &p_eqe->data);
+		} else {
+			DP_NOTICE(p_hwfn,
+				  "iSCSI async completion is not set\n");
+			return -EINVAL;
+		}
 	default:
 		DP_NOTICE(p_hwfn,
 			  "Unknown Async completion for protocol: %d\n",
@@ -363,10 +402,8 @@ struct qed_eq *qed_eq_alloc(struct qed_hwfn *p_hwfn, u16 num_elem)
 
 	/* Allocate EQ struct */
 	p_eq = kzalloc(sizeof(*p_eq), GFP_KERNEL);
-	if (!p_eq) {
-		DP_NOTICE(p_hwfn, "Failed to allocate `struct qed_eq'\n");
+	if (!p_eq)
 		return NULL;
-	}
 
 	/* Allocate and initialize EQ chain*/
 	if (qed_chain_alloc(p_hwfn->cdev,
@@ -375,10 +412,8 @@ struct qed_eq *qed_eq_alloc(struct qed_hwfn *p_hwfn, u16 num_elem)
 			    QED_CHAIN_CNT_TYPE_U16,
 			    num_elem,
 			    sizeof(union event_ring_element),
-			    &p_eq->chain)) {
-		DP_NOTICE(p_hwfn, "Failed to allocate eq chain\n");
+			    &p_eq->chain))
 		goto eq_allocate_fail;
-	}
 
 	/* register EQ completion on the SP SB */
 	qed_int_register_cb(p_hwfn, qed_eq_completion,
@@ -491,10 +526,8 @@ int qed_spq_alloc(struct qed_hwfn *p_hwfn)
 
 	/* SPQ struct */
 	p_spq = kzalloc(sizeof(struct qed_spq), GFP_KERNEL);
-	if (!p_spq) {
-		DP_NOTICE(p_hwfn, "Failed to allocate `struct qed_spq'\n");
+	if (!p_spq)
 		return -ENOMEM;
-	}
 
 	/* SPQ ring  */
 	if (qed_chain_alloc(p_hwfn->cdev,
@@ -503,18 +536,14 @@ int qed_spq_alloc(struct qed_hwfn *p_hwfn)
 			    QED_CHAIN_CNT_TYPE_U16,
 			    0,   /* N/A when the mode is SINGLE */
 			    sizeof(struct slow_path_element),
-			    &p_spq->chain)) {
-		DP_NOTICE(p_hwfn, "Failed to allocate spq chain\n");
+			    &p_spq->chain))
 		goto spq_allocate_fail;
-	}
 
 	/* allocate and fill the SPQ elements (incl. ramrod data list) */
 	capacity = qed_chain_get_capacity(&p_spq->chain);
 	p_virt = dma_alloc_coherent(&p_hwfn->cdev->pdev->dev,
-				    capacity *
-				    sizeof(struct qed_spq_entry),
+				    capacity * sizeof(struct qed_spq_entry),
 				    &p_phys, GFP_KERNEL);
-
 	if (!p_virt)
 		goto spq_allocate_fail;
 
@@ -865,15 +894,22 @@ int qed_spq_completion(struct qed_hwfn *p_hwfn,
 
 	if (!found) {
 		DP_NOTICE(p_hwfn,
-			  "Failed to find an entry this EQE completes\n");
+			  "Failed to find an entry this EQE [echo %04x] completes\n",
+			  le16_to_cpu(echo));
 		return -EEXIST;
 	}
 
-	DP_VERBOSE(p_hwfn, QED_MSG_SPQ, "Complete: func %p cookie %p)\n",
+	DP_VERBOSE(p_hwfn, QED_MSG_SPQ,
+		   "Complete EQE [echo %04x]: func %p cookie %p)\n",
+		   le16_to_cpu(echo),
 		   p_ent->comp_cb.function, p_ent->comp_cb.cookie);
 	if (found->comp_cb.function)
 		found->comp_cb.function(p_hwfn, found->comp_cb.cookie, p_data,
 					fw_return_code);
+	else
+		DP_VERBOSE(p_hwfn,
+			   QED_MSG_SPQ,
+			   "Got a completion without a callback function\n");
 
 	if ((found->comp_mode != QED_SPQ_MODE_EBLOCK) ||
 	    (found->queue == &p_spq->unlimited_pending))
@@ -897,10 +933,8 @@ struct qed_consq *qed_consq_alloc(struct qed_hwfn *p_hwfn)
 
 	/* Allocate ConsQ struct */
 	p_consq = kzalloc(sizeof(*p_consq), GFP_KERNEL);
-	if (!p_consq) {
-		DP_NOTICE(p_hwfn, "Failed to allocate `struct qed_consq'\n");
+	if (!p_consq)
 		return NULL;
-	}
 
 	/* Allocate and initialize EQ chain*/
 	if (qed_chain_alloc(p_hwfn->cdev,
@@ -908,10 +942,8 @@ struct qed_consq *qed_consq_alloc(struct qed_hwfn *p_hwfn)
 			    QED_CHAIN_MODE_PBL,
 			    QED_CHAIN_CNT_TYPE_U16,
 			    QED_CHAIN_PAGE_SIZE / 0x80,
-			    0x80, &p_consq->chain)) {
-		DP_NOTICE(p_hwfn, "Failed to allocate consq chain");
+			    0x80, &p_consq->chain))
 		goto consq_allocate_fail;
-	}
 
 	return p_consq;
 

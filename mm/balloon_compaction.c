@@ -200,6 +200,14 @@ int balloon_page_migrate(struct page *newpage,
 	int rc = -EAGAIN;
 
 	/*
+	 * We can not easily support the no copy case here so ignore it as it
+	 * is unlikely to be use with ballon pages. See include/linux/hmm.h for
+	 * user of the MIGRATE_SYNC_NO_COPY mode.
+	 */
+	if (mode == MIGRATE_SYNC_NO_COPY)
+		return -EINVAL;
+
+	/*
 	 * Block others from accessing the 'newpage' when we get around to
 	 * establishing additional references. We should be the only one
 	 * holding a reference to the 'newpage' at this point.

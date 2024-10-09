@@ -107,15 +107,8 @@ static int bnxt_set_coalesce(struct net_device *dev,
 
 #define BNXT_NUM_STATS	21
 
-#define BNXT_RX_STATS_OFFSET(counter)	\
-	(offsetof(struct rx_port_stats, counter) / 8)
-
 #define BNXT_RX_STATS_ENTRY(counter)	\
 	{ BNXT_RX_STATS_OFFSET(counter), __stringify(counter) }
-
-#define BNXT_TX_STATS_OFFSET(counter)			\
-	((offsetof(struct tx_port_stats, counter) +	\
-	  sizeof(struct rx_port_stats) + 512) / 8)
 
 #define BNXT_TX_STATS_ENTRY(counter)	\
 	{ BNXT_TX_STATS_OFFSET(counter), __stringify(counter) }
@@ -150,6 +143,14 @@ static const struct {
 	BNXT_RX_STATS_ENTRY(rx_tagged_frames),
 	BNXT_RX_STATS_ENTRY(rx_double_tagged_frames),
 	BNXT_RX_STATS_ENTRY(rx_good_frames),
+	BNXT_RX_STATS_ENTRY(rx_pfc_ena_frames_pri0),
+	BNXT_RX_STATS_ENTRY(rx_pfc_ena_frames_pri1),
+	BNXT_RX_STATS_ENTRY(rx_pfc_ena_frames_pri2),
+	BNXT_RX_STATS_ENTRY(rx_pfc_ena_frames_pri3),
+	BNXT_RX_STATS_ENTRY(rx_pfc_ena_frames_pri4),
+	BNXT_RX_STATS_ENTRY(rx_pfc_ena_frames_pri5),
+	BNXT_RX_STATS_ENTRY(rx_pfc_ena_frames_pri6),
+	BNXT_RX_STATS_ENTRY(rx_pfc_ena_frames_pri7),
 	BNXT_RX_STATS_ENTRY(rx_undrsz_frames),
 	BNXT_RX_STATS_ENTRY(rx_eee_lpi_events),
 	BNXT_RX_STATS_ENTRY(rx_eee_lpi_duration),
@@ -179,6 +180,14 @@ static const struct {
 	BNXT_TX_STATS_ENTRY(tx_fcs_err_frames),
 	BNXT_TX_STATS_ENTRY(tx_err),
 	BNXT_TX_STATS_ENTRY(tx_fifo_underruns),
+	BNXT_TX_STATS_ENTRY(tx_pfc_ena_frames_pri0),
+	BNXT_TX_STATS_ENTRY(tx_pfc_ena_frames_pri1),
+	BNXT_TX_STATS_ENTRY(tx_pfc_ena_frames_pri2),
+	BNXT_TX_STATS_ENTRY(tx_pfc_ena_frames_pri3),
+	BNXT_TX_STATS_ENTRY(tx_pfc_ena_frames_pri4),
+	BNXT_TX_STATS_ENTRY(tx_pfc_ena_frames_pri5),
+	BNXT_TX_STATS_ENTRY(tx_pfc_ena_frames_pri6),
+	BNXT_TX_STATS_ENTRY(tx_pfc_ena_frames_pri7),
 	BNXT_TX_STATS_ENTRY(tx_eee_lpi_events),
 	BNXT_TX_STATS_ENTRY(tx_eee_lpi_duration),
 	BNXT_TX_STATS_ENTRY(tx_total_collisions),
@@ -379,6 +388,7 @@ static int bnxt_set_channels(struct net_device *dev,
 {
 	struct bnxt *bp = netdev_priv(dev);
 	int max_rx_rings, max_tx_rings, tcs;
+	int req_tx_rings, rsv_tx_rings;
 	u32 rc = 0;
 	bool sh = false;
 
@@ -413,6 +423,20 @@ static int bnxt_set_channels(struct net_device *dev,
 	if (!sh && (channel->rx_count > max_rx_rings ||
 		    channel->tx_count > max_tx_rings))
 		return -ENOMEM;
+
+	req_tx_rings = sh ? channel->combined_count : channel->tx_count;
+	req_tx_rings = min_t(int, req_tx_rings, max_tx_rings);
+	if (tcs > 1)
+		req_tx_rings *= tcs;
+
+	rsv_tx_rings = req_tx_rings;
+	if (bnxt_hwrm_reserve_tx_rings(bp, &rsv_tx_rings))
+		return -ENOMEM;
+
+	if (rsv_tx_rings < req_tx_rings) {
+		netdev_warn(dev, "Unable to allocate the requested tx rings\n");
+		return -ENOMEM;
+	}
 
 	if (netif_running(dev)) {
 		if (BNXT_PF(bp)) {
@@ -515,23 +539,23 @@ static int bnxt_grxclsrule(struct bnxt *bp, struct ethtool_rxnfc *cmd)
 
 fltr_found:
 	fkeys = &fltr->fkeys;
-	if (fkeys->ip_proto == IPPROTO_TCP)
+	if (fkeys->basic.ip_proto == IPPROTO_TCP)
 		fs->flow_type = TCP_V4_FLOW;
-	else if (fkeys->ip_proto == IPPROTO_UDP)
+	else if (fkeys->basic.ip_proto == IPPROTO_UDP)
 		fs->flow_type = UDP_V4_FLOW;
 	else
 		goto fltr_err;
 
-	fs->h_u.tcp_ip4_spec.ip4src = fkeys->src;
+	fs->h_u.tcp_ip4_spec.ip4src = fkeys->addrs.v4addrs.src;
 	fs->m_u.tcp_ip4_spec.ip4src = cpu_to_be32(~0);
 
-	fs->h_u.tcp_ip4_spec.ip4dst = fkeys->dst;
+	fs->h_u.tcp_ip4_spec.ip4dst = fkeys->addrs.v4addrs.dst;
 	fs->m_u.tcp_ip4_spec.ip4dst = cpu_to_be32(~0);
 
-	fs->h_u.tcp_ip4_spec.psrc = fkeys->port16[0];
+	fs->h_u.tcp_ip4_spec.psrc = fkeys->ports.src;
 	fs->m_u.tcp_ip4_spec.psrc = cpu_to_be16(~0);
 
-	fs->h_u.tcp_ip4_spec.pdst = fkeys->port16[1];
+	fs->h_u.tcp_ip4_spec.pdst = fkeys->ports.dst;
 	fs->m_u.tcp_ip4_spec.pdst = cpu_to_be16(~0);
 
 	fs->ring_cookie = fltr->rxq;

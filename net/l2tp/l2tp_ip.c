@@ -11,6 +11,7 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include <asm/ioctls.h>
 #include <linux/icmp.h>
 #include <linux/module.h>
 #include <linux/skbuff.h>
@@ -61,7 +62,8 @@ static struct sock *__l2tp_ip_bind_lookup(struct net *net, __be32 laddr, int dif
 		if ((l2tp->conn_id == tunnel_id) &&
 		    net_eq(sock_net(sk), net) &&
 		    !(inet->inet_rcv_saddr && inet->inet_rcv_saddr != laddr) &&
-		    !(sk->sk_bound_dev_if && sk->sk_bound_dev_if != dif))
+		    (!sk->sk_bound_dev_if || !dif ||
+		     sk->sk_bound_dev_if == dif))
 			goto found;
 	}
 
@@ -174,13 +176,15 @@ pass_up:
 
 	tunnel_id = ntohl(*(__be32 *) &skb->data[4]);
 	tunnel = l2tp_tunnel_find(net, tunnel_id);
-	if (tunnel != NULL)
+	if (tunnel) {
 		sk = tunnel->sock;
-	else {
+		sock_hold(sk);
+	} else {
 		struct iphdr *iph = (struct iphdr *) skb_network_header(skb);
 
 		read_lock_bh(&l2tp_ip_lock);
-		sk = __l2tp_ip_bind_lookup(net, iph->daddr, 0, tunnel_id);
+		sk = __l2tp_ip_bind_lookup(net, iph->daddr, inet_iif(skb),
+					   tunnel_id);
 		if (!sk) {
 			read_unlock_bh(&l2tp_ip_lock);
 			goto discard;
@@ -255,15 +259,9 @@ static int l2tp_ip_bind(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 	if (addr->l2tp_family != AF_INET)
 		return -EINVAL;
 
-	ret = -EADDRINUSE;
-	read_lock_bh(&l2tp_ip_lock);
-	if (__l2tp_ip_bind_lookup(net, addr->l2tp_addr.s_addr,
-				  sk->sk_bound_dev_if, addr->l2tp_conn_id))
-		goto out_in_use;
-
-	read_unlock_bh(&l2tp_ip_lock);
-
 	lock_sock(sk);
+
+	ret = -EINVAL;
 	if (!sock_flag(sk, SOCK_ZAPPED))
 		goto out;
 
@@ -280,24 +278,27 @@ static int l2tp_ip_bind(struct sock *sk, struct sockaddr *uaddr, int addr_len)
 		inet->inet_rcv_saddr = inet->inet_saddr = addr->l2tp_addr.s_addr;
 	if (chk_addr_ret == RTN_MULTICAST || chk_addr_ret == RTN_BROADCAST)
 		inet->inet_saddr = 0;  /* Use device */
-	sk_dst_reset(sk);
-
-	l2tp_ip_sk(sk)->conn_id = addr->l2tp_conn_id;
 
 	write_lock_bh(&l2tp_ip_lock);
+	if (__l2tp_ip_bind_lookup(net, addr->l2tp_addr.s_addr,
+				  sk->sk_bound_dev_if, addr->l2tp_conn_id)) {
+		write_unlock_bh(&l2tp_ip_lock);
+		ret = -EADDRINUSE;
+		goto out;
+	}
+
+	sk_dst_reset(sk);
+	l2tp_ip_sk(sk)->conn_id = addr->l2tp_conn_id;
+
 	sk_add_bind_node(sk, &l2tp_ip_bind_table);
 	sk_del_node_init(sk);
 	write_unlock_bh(&l2tp_ip_lock);
+
 	ret = 0;
 	sock_reset_flag(sk, SOCK_ZAPPED);
 
 out:
 	release_sock(sk);
-
-	return ret;
-
-out_in_use:
-	read_unlock_bh(&l2tp_ip_lock);
 
 	return ret;
 }
@@ -443,7 +444,7 @@ static int l2tp_ip_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *m
 	*((__be32 *) skb_put(skb, 4)) = 0;
 
 	/* Copy user data into skb */
-	rc = memcpy_fromiovec(skb_put(skb, len), msg->msg_iov, len);
+	rc = memcpy_from_msg(skb_put(skb, len), msg, len);
 	if (rc < 0) {
 		kfree_skb(skb);
 		goto error;
@@ -530,7 +531,7 @@ static int l2tp_ip_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *m
 		copied = len;
 	}
 
-	err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
+	err = skb_copy_datagram_msg(skb, 0, msg, copied);
 	if (err)
 		goto done;
 
@@ -554,6 +555,30 @@ out:
 	return err ? err : copied;
 }
 
+int l2tp_ioctl(struct sock *sk, int cmd, unsigned long arg)
+{
+	struct sk_buff *skb;
+	int amount;
+
+	switch (cmd) {
+	case SIOCOUTQ:
+		amount = sk_wmem_alloc_get(sk);
+		break;
+	case SIOCINQ:
+		spin_lock_bh(&sk->sk_receive_queue.lock);
+		skb = skb_peek(&sk->sk_receive_queue);
+		amount = skb ? skb->len : 0;
+		spin_unlock_bh(&sk->sk_receive_queue.lock);
+		break;
+
+	default:
+		return -ENOIOCTLCMD;
+	}
+
+	return put_user(amount, (int __user *)arg);
+}
+EXPORT_SYMBOL(l2tp_ioctl);
+
 static struct proto l2tp_ip_prot = {
 	.name		   = "L2TP/IP",
 	.owner		   = THIS_MODULE,
@@ -562,7 +587,7 @@ static struct proto l2tp_ip_prot = {
 	.bind		   = l2tp_ip_bind,
 	.connect	   = l2tp_ip_connect,
 	.disconnect	   = l2tp_ip_disconnect,
-	.ioctl		   = udp_ioctl,
+	.ioctl		   = l2tp_ioctl,
 	.destroy	   = l2tp_ip_destroy_sock,
 	.setsockopt	   = ip_setsockopt,
 	.getsockopt	   = ip_getsockopt,

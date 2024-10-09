@@ -1,5 +1,5 @@
-/* Intel Ethernet Switch Host Interface Driver
- * Copyright(c) 2013 - 2015 Intel Corporation.
+/* Intel(R) Ethernet Switch Host Interface Driver
+ * Copyright(c) 2013 - 2016 Intel Corporation.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -243,9 +243,6 @@ void fm10k_clean_all_tx_rings(struct fm10k_intfc *interface)
 
 	for (i = 0; i < interface->num_tx_queues; i++)
 		fm10k_clean_tx_ring(interface->tx_ring[i]);
-
-	/* remove any stale timestamp buffers and free them */
-	skb_queue_purge(&interface->ts_tx_skb_queue);
 }
 
 /**
@@ -659,10 +656,6 @@ static netdev_tx_t fm10k_xmit_frame(struct sk_buff *skb, struct net_device *dev)
 			return NETDEV_TX_OK;
 		__skb_put(skb, pad_len);
 	}
-
-	/* prepare packet for hardware time stamping */
-	if (unlikely(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP))
-		fm10k_ts_tx_enqueue(interface, skb);
 
 	if (r_idx >= interface->num_tx_queues)
 		r_idx %= interface->num_tx_queues;
@@ -1207,18 +1200,6 @@ static int __fm10k_setup_tc(struct net_device *dev, u32 handle, __be16 proto,
 	return fm10k_setup_tc(dev, tc->tc);
 }
 
-static int fm10k_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
-{
-	switch (cmd) {
-	case SIOCGHWTSTAMP:
-		return fm10k_get_ts_config(netdev, ifr);
-	case SIOCSHWTSTAMP:
-		return fm10k_set_ts_config(netdev, ifr);
-	default:
-		return -EOPNOTSUPP;
-	}
-}
-
 #if 0
 static void fm10k_assign_l2_accel(struct fm10k_intfc *interface,
 				  struct fm10k_l2_accel *l2_accel)
@@ -1383,14 +1364,13 @@ static const struct net_device_ops fm10k_netdev_ops = {
 	.ndo_get_stats64	= fm10k_get_stats64,
 	.ndo_setup_tc		= __fm10k_setup_tc,
 	.ndo_set_vf_mac		= fm10k_ndo_set_vf_mac,
-	.ndo_set_vf_vlan	= fm10k_ndo_set_vf_vlan,
+	.extended.ndo_set_vf_vlan	= fm10k_ndo_set_vf_vlan,
 	.ndo_set_vf_tx_rate	= fm10k_ndo_set_vf_bw,
 	.ndo_get_vf_config	= fm10k_ndo_get_vf_config,
 	.ndo_add_vxlan_port	= fm10k_add_vxlan_port,
 	.ndo_del_vxlan_port	= fm10k_del_vxlan_port,
-	.ndo_do_ioctl		= fm10k_ioctl,
-#if 0
 	.ndo_size		= sizeof(struct net_device_ops),
+#if 0
 	.extended.ndo_dfwd_add_station	= fm10k_dfwd_add_station,
 	.extended.ndo_dfwd_del_station	= fm10k_dfwd_del_station,
 #endif
@@ -1401,8 +1381,9 @@ static const struct net_device_ops fm10k_netdev_ops = {
 
 #define DEFAULT_DEBUG_LEVEL_SHIFT 3
 
-struct net_device *fm10k_alloc_netdev(void)
+struct net_device *fm10k_alloc_netdev(const struct fm10k_info *info)
 {
+	netdev_features_t hw_features;
 	struct fm10k_intfc *interface;
 	struct net_device *dev;
 
@@ -1425,29 +1406,33 @@ struct net_device *fm10k_alloc_netdev(void)
 			 NETIF_F_TSO |
 			 NETIF_F_TSO6 |
 			 NETIF_F_TSO_ECN |
-			 NETIF_F_GSO_UDP_TUNNEL |
 			 NETIF_F_RXHASH |
 			 NETIF_F_RXCSUM;
 
+	/* Only the PF can support VXLAN and NVGRE tunnel offloads */
+	if (info->mac == fm10k_mac_pf) {
+		dev->hw_enc_features = NETIF_F_IP_CSUM |
+				       NETIF_F_TSO |
+				       NETIF_F_TSO6 |
+				       NETIF_F_TSO_ECN |
+				       NETIF_F_GSO_UDP_TUNNEL |
+				       NETIF_F_IPV6_CSUM |
+				       NETIF_F_SG;
+
+		dev->features |= NETIF_F_GSO_UDP_TUNNEL;
+	}
+
 	/* all features defined to this point should be changeable */
-	dev->hw_features |= dev->features;
+	hw_features = dev->features;
 
 	/* allow user to enable L2 forwarding acceleration */
 #if 0
 	/* NOT IN RHEL7 */
-	dev->hw_features |= NETIF_F_HW_L2FW_DOFFLOAD;
+	hw_features |= NETIF_F_HW_L2FW_DOFFLOAD;
 #endif
 
 	/* configure VLAN features */
 	dev->vlan_features |= dev->features;
-
-	/* configure tunnel offloads */
-	dev->hw_enc_features |= NETIF_F_IP_CSUM |
-				NETIF_F_TSO |
-				NETIF_F_TSO6 |
-				NETIF_F_TSO_ECN |
-				NETIF_F_GSO_UDP_TUNNEL |
-				NETIF_F_IPV6_CSUM;
 
 	/* we want to leave these both on as we cannot disable VLAN tag
 	 * insertion or stripping on the hardware since it is contained
@@ -1458,6 +1443,8 @@ struct net_device *fm10k_alloc_netdev(void)
 			 NETIF_F_HW_VLAN_CTAG_FILTER;
 
 	dev->priv_flags |= IFF_UNICAST_FLT;
+
+	dev->hw_features |= hw_features;
 
 	return dev;
 }

@@ -258,7 +258,7 @@ static void aac_sa_start_adapter(struct aac_dev *dev)
 			NULL, NULL, NULL, NULL, NULL);
 }
 
-static int aac_sa_restart_adapter(struct aac_dev *dev, int bled)
+static int aac_sa_restart_adapter(struct aac_dev *dev, int bled, u8 reset_type)
 {
 	return -EINVAL;
 }

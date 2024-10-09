@@ -92,8 +92,10 @@ static int apic_extnmi = APIC_EXTNMI_BSP;
  */
 DEFINE_EARLY_PER_CPU_READ_MOSTLY(u16, x86_cpu_to_apicid, BAD_APICID);
 DEFINE_EARLY_PER_CPU_READ_MOSTLY(u16, x86_bios_cpu_apicid, BAD_APICID);
+DEFINE_EARLY_PER_CPU_READ_MOSTLY(u32, x86_cpu_to_acpiid, U32_MAX);
 EXPORT_EARLY_PER_CPU_SYMBOL(x86_cpu_to_apicid);
 EXPORT_EARLY_PER_CPU_SYMBOL(x86_bios_cpu_apicid);
+EXPORT_EARLY_PER_CPU_SYMBOL(x86_cpu_to_acpiid);
 
 #ifdef CONFIG_X86_32
 
@@ -2126,7 +2128,7 @@ void disconnect_bsp_APIC(int virt_wire_setup)
 	apic_write(APIC_LVT1, value);
 }
 
-void generic_processor_info(int apicid, int version)
+int generic_processor_info(int apicid, int version)
 {
 	int cpu, max = nr_cpu_ids;
 	bool boot_cpu_detected = physid_isset(boot_cpu_physical_apicid,
@@ -2162,7 +2164,7 @@ void generic_processor_info(int apicid, int version)
 			   thiscpu, apicid);
 
 		disabled_cpus++;
-		return;
+		return -ENODEV;
 	}
 
 	/*
@@ -2179,7 +2181,7 @@ void generic_processor_info(int apicid, int version)
 			"  Processor %d/0x%x ignored.\n", max, thiscpu, apicid);
 
 		disabled_cpus++;
-		return;
+		return -ENODEV;
 	}
 
 	if (num_processors >= nr_cpu_ids) {
@@ -2190,7 +2192,7 @@ void generic_processor_info(int apicid, int version)
 			"  Processor %d/0x%x ignored.\n", max, thiscpu, apicid);
 
 		disabled_cpus++;
-		return;
+		return -EINVAL;
 	}
 
 	num_processors++;
@@ -2207,21 +2209,7 @@ void generic_processor_info(int apicid, int version)
 		cpu = cpumask_next_zero(-1, cpu_present_mask);
 
 	/*
-	 * This can happen on physical hotplug. The sanity check at boot time
-	 * is done from native_smp_prepare_cpus() after num_possible_cpus() is
-	 * established.
-	 */
-	if (topology_update_package_map(apicid, cpu) < 0) {
-		int thiscpu = max + disabled_cpus;
-
-		pr_warning("ACPI: Package limit reached. Processor %d/0x%x ignored.\n",
-			   thiscpu, apicid);
-		disabled_cpus++;
-		return;
-	}
-
-	/*
-	 * Validate version
+ 	 * Validate version
 	 */
 	if (version == 0x0) {
 		pr_warning("BIOS bug: APIC version is 0 for CPU %d/0x%x, fixing up to 0x10\n",
@@ -2249,6 +2237,8 @@ void generic_processor_info(int apicid, int version)
 #endif
 	set_cpu_possible(cpu, true);
 	set_cpu_present(cpu, true);
+
+	return cpu;
 }
 
 int hard_smp_processor_id(void)

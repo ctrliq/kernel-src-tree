@@ -120,7 +120,7 @@ static void sdhci_set_card_detection(struct sdhci_host *host, bool enable)
 	u32 present;
 
 	if ((host->quirks & SDHCI_QUIRK_BROKEN_CARD_DETECTION) ||
-	    (host->mmc->caps & MMC_CAP_NONREMOVABLE))
+	    !mmc_card_is_removable(host->mmc))
 		return;
 
 	if (enable) {
@@ -1344,19 +1344,9 @@ clock_set:
 }
 EXPORT_SYMBOL_GPL(sdhci_calc_clk);
 
-void sdhci_set_clock(struct sdhci_host *host, unsigned int clock)
+void sdhci_enable_clk(struct sdhci_host *host, u16 clk)
 {
-	u16 clk;
 	unsigned long timeout;
-
-	host->mmc->actual_clock = 0;
-
-	sdhci_writew(host, 0, SDHCI_CLOCK_CONTROL);
-
-	if (clock == 0)
-		return;
-
-	clk = sdhci_calc_clk(host, clock, &host->mmc->actual_clock);
 
 	clk |= SDHCI_CLOCK_INT_EN;
 	sdhci_writew(host, clk, SDHCI_CLOCK_CONTROL);
@@ -1378,12 +1368,42 @@ void sdhci_set_clock(struct sdhci_host *host, unsigned int clock)
 	clk |= SDHCI_CLOCK_CARD_EN;
 	sdhci_writew(host, clk, SDHCI_CLOCK_CONTROL);
 }
+EXPORT_SYMBOL_GPL(sdhci_enable_clk);
+
+void sdhci_set_clock(struct sdhci_host *host, unsigned int clock)
+{
+	u16 clk;
+
+	host->mmc->actual_clock = 0;
+
+	sdhci_writew(host, 0, SDHCI_CLOCK_CONTROL);
+
+	if (clock == 0)
+		return;
+
+	clk = sdhci_calc_clk(host, clock, &host->mmc->actual_clock);
+	sdhci_enable_clk(host, clk);
+}
 EXPORT_SYMBOL_GPL(sdhci_set_clock);
 
-static void sdhci_set_power(struct sdhci_host *host, unsigned char mode,
-			    unsigned short vdd)
+static void sdhci_set_power_reg(struct sdhci_host *host, unsigned char mode,
+				unsigned short vdd)
 {
 	struct mmc_host *mmc = host->mmc;
+
+	spin_unlock_irq(&host->lock);
+	mmc_regulator_set_ocr(mmc, mmc->supply.vmmc, vdd);
+	spin_lock_irq(&host->lock);
+
+	if (mode != MMC_POWER_OFF)
+		sdhci_writeb(host, SDHCI_POWER_ON, SDHCI_POWER_CONTROL);
+	else
+		sdhci_writeb(host, 0, SDHCI_POWER_CONTROL);
+}
+
+void sdhci_set_power_noreg(struct sdhci_host *host, unsigned char mode,
+			   unsigned short vdd)
+{
 	u8 pwr = 0;
 
 	if (mode != MMC_POWER_OFF) {
@@ -1415,7 +1435,6 @@ static void sdhci_set_power(struct sdhci_host *host, unsigned char mode,
 		sdhci_writeb(host, 0, SDHCI_POWER_CONTROL);
 		if (host->quirks2 & SDHCI_QUIRK2_CARD_ON_NEEDS_BUS_ON)
 			sdhci_runtime_pm_bus_off(host);
-		vdd = 0;
 	} else {
 		/*
 		 * Spec says that we should clear the power reg before setting
@@ -1446,13 +1465,18 @@ static void sdhci_set_power(struct sdhci_host *host, unsigned char mode,
 		if (host->quirks & SDHCI_QUIRK_DELAY_AFTER_POWER)
 			mdelay(10);
 	}
-
-	if (!IS_ERR(mmc->supply.vmmc)) {
-		spin_unlock_irq(&host->lock);
-		mmc_regulator_set_ocr(mmc, mmc->supply.vmmc, vdd);
-		spin_lock_irq(&host->lock);
-	}
 }
+EXPORT_SYMBOL_GPL(sdhci_set_power_noreg);
+
+void sdhci_set_power(struct sdhci_host *host, unsigned char mode,
+		     unsigned short vdd)
+{
+	if (IS_ERR(host->mmc->supply.vmmc))
+		sdhci_set_power_noreg(host, mode, vdd);
+	else
+		sdhci_set_power_reg(host, mode, vdd);
+}
+EXPORT_SYMBOL_GPL(sdhci_set_power);
 
 /*****************************************************************************\
  *                                                                           *
@@ -1596,7 +1620,10 @@ static void sdhci_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 		}
 	}
 
-	sdhci_set_power(host, ios->power_mode, ios->vdd);
+	if (host->ops->set_power)
+		host->ops->set_power(host, ios->power_mode, ios->vdd);
+	else
+		sdhci_set_power(host, ios->power_mode, ios->vdd);
 
 	if (host->ops->platform_send_init_74_clocks)
 		host->ops->platform_send_init_74_clocks(host, ios->power_mode);
@@ -1713,14 +1740,14 @@ static int sdhci_get_cd(struct mmc_host *mmc)
 		return 0;
 
 	/* If nonremovable, assume that the card is always present. */
-	if (host->mmc->caps & MMC_CAP_NONREMOVABLE)
+	if (!mmc_card_is_removable(host->mmc))
 		return 1;
 
 	/*
 	 * Try slot gpio detect, if defined it take precedence
 	 * over build in controller functionality
 	 */
-	if (!IS_ERR_VALUE(gpio_cd))
+	if (gpio_cd >= 0)
 		return !!gpio_cd;
 
 	/* If polling, assume that the card is always present. */
@@ -2202,8 +2229,7 @@ static void sdhci_post_req(struct mmc_host *mmc, struct mmc_request *mrq,
 	data->host_cookie = COOKIE_UNMAPPED;
 }
 
-static void sdhci_pre_req(struct mmc_host *mmc, struct mmc_request *mrq,
-			       bool is_first_req)
+static void sdhci_pre_req(struct mmc_host *mmc, struct mmc_request *mrq)
 {
 	struct sdhci_host *host = mmc_priv(mmc);
 
@@ -3318,8 +3344,8 @@ int sdhci_setup_host(struct sdhci_host *host)
 		mmc->caps |= MMC_CAP_SD_HIGHSPEED | MMC_CAP_MMC_HIGHSPEED;
 
 	if ((host->quirks & SDHCI_QUIRK_BROKEN_CARD_DETECTION) &&
-	    !(mmc->caps & MMC_CAP_NONREMOVABLE) &&
-	    IS_ERR_VALUE(mmc_gpio_get_cd(host->mmc)))
+	    mmc_card_is_removable(mmc) &&
+	    mmc_gpio_get_cd(host->mmc) < 0)
 		mmc->caps |= MMC_CAP_NEEDS_POLL;
 
 	/* If vqmmc regulator and no 1.8V signalling, then there's no UHS */

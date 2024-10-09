@@ -835,7 +835,7 @@ fst_tx_dma_complete(struct fst_card_info *card, struct fst_port_info *port,
 		DMA_OWN | TX_STP | TX_ENP);
 	dev->stats.tx_packets++;
 	dev->stats.tx_bytes += len;
-	dev->trans_start = jiffies;
+	netif_trans_update(dev);
 }
 
 /*
@@ -1396,7 +1396,7 @@ do_bottom_half_tx(struct fst_card_info *card)
 						DMA_OWN | TX_STP | TX_ENP);
 					dev->stats.tx_packets++;
 					dev->stats.tx_bytes += skb->len;
-					dev->trans_start = jiffies;
+					netif_trans_update(dev);
 				} else {
 					/* Or do it through dma */
 					memcpy(card->tx_dma_handle_host,
@@ -2267,7 +2267,7 @@ fst_tx_timeout(struct net_device *dev)
 	    card->card_no, port->index);
 	fst_issue_cmd(port, ABORTTX);
 
-	dev->trans_start = jiffies;
+	netif_trans_update(dev);
 	netif_wake_queue(dev);
 	port->start = 0;
 }

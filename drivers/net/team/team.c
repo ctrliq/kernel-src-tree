@@ -28,6 +28,7 @@
 #include <net/genetlink.h>
 #include <net/netlink.h>
 #include <net/sch_generic.h>
+#include <net/switchdev.h>
 #include <generated/utsrelease.h>
 #include <linux/if_team.h>
 
@@ -1104,23 +1105,24 @@ static void team_port_disable_netpoll(struct team_port *port)
 }
 #endif
 
-static int team_upper_dev_link(struct net_device *dev,
-			       struct net_device *port_dev)
+static int team_upper_dev_link(struct team *team, struct team_port *port)
 {
+	struct netdev_lag_upper_info lag_upper_info;
 	int err;
 
-	err = netdev_master_upper_dev_link(port_dev, dev);
+	lag_upper_info.tx_type = team->mode->lag_tx_type;
+	err = netdev_master_upper_dev_link(port->dev, team->dev, NULL,
+					   &lag_upper_info);
 	if (err)
 		return err;
-	port_dev->priv_flags |= IFF_TEAM_PORT;
+	port->dev->priv_flags |= IFF_TEAM_PORT;
 	return 0;
 }
 
-static void team_upper_dev_unlink(struct net_device *dev,
-				  struct net_device *port_dev)
+static void team_upper_dev_unlink(struct team *team, struct team_port *port)
 {
-	netdev_upper_dev_unlink(port_dev, dev);
-	port_dev->priv_flags &= ~IFF_TEAM_PORT;
+	netdev_upper_dev_unlink(port->dev, team->dev);
+	port->dev->priv_flags &= ~IFF_TEAM_PORT;
 }
 
 static void __team_port_change_port_added(struct team_port *port, bool linkup);
@@ -1225,7 +1227,7 @@ static int team_port_add(struct team *team, struct net_device *port_dev)
 		goto err_handler_register;
 	}
 
-	err = team_upper_dev_link(dev, port_dev);
+	err = team_upper_dev_link(team, port);
 	if (err) {
 		netdev_err(dev, "Device %s failed to set upper link\n",
 			   portname);
@@ -1251,7 +1253,7 @@ static int team_port_add(struct team *team, struct net_device *port_dev)
 	return 0;
 
 err_option_port_add:
-	team_upper_dev_unlink(dev, port_dev);
+	team_upper_dev_unlink(team, port);
 
 err_set_upper_link:
 	netdev_rx_handler_unregister(port_dev);
@@ -1297,7 +1299,7 @@ static int team_port_del(struct team *team, struct net_device *port_dev)
 
 	team_port_disable(team, port);
 	list_del_rcu(&port->list);
-	team_upper_dev_unlink(dev, port_dev);
+	team_upper_dev_unlink(team, port);
 	netdev_rx_handler_unregister(port_dev);
 	team_port_disable_netpoll(port);
 	vlan_vids_del_by_dev(port_dev, dev);
@@ -1568,24 +1570,6 @@ static const struct team_option team_options[] = {
 	},
 };
 
-static struct lock_class_key team_netdev_xmit_lock_key;
-static struct lock_class_key team_netdev_addr_lock_key;
-static struct lock_class_key team_tx_busylock_key;
-
-static void team_set_lockdep_class_one(struct net_device *dev,
-				       struct netdev_queue *txq,
-				       void *unused)
-{
-	lockdep_set_class(&txq->_xmit_lock, &team_netdev_xmit_lock_key);
-}
-
-static void team_set_lockdep_class(struct net_device *dev)
-{
-	lockdep_set_class(&dev->addr_list_lock, &team_netdev_addr_lock_key);
-	netdev_for_each_tx_queue(dev, team_set_lockdep_class_one, NULL);
-	dev->qdisc_tx_busylock = &team_tx_busylock_key;
-}
-
 static int team_init(struct net_device *dev)
 {
 	struct team *team = netdev_priv(dev);
@@ -1620,7 +1604,7 @@ static int team_init(struct net_device *dev)
 		goto err_options_register;
 	netif_carrier_off(dev);
 
-	team_set_lockdep_class(dev);
+	netdev_lockdep_set_classes(dev);
 
 	return 0;
 
@@ -1912,7 +1896,7 @@ static void team_netpoll_cleanup(struct net_device *dev)
 }
 
 static int team_netpoll_setup(struct net_device *dev,
-			      struct netpoll_info *npifo)
+			      struct netpoll_info *npifo, gfp_t gfp)
 {
 	struct team *team = netdev_priv(dev);
 	struct team_port *port;
@@ -1999,6 +1983,7 @@ static int team_change_carrier(struct net_device *dev, bool new_carrier)
 }
 
 static const struct net_device_ops team_netdev_ops = {
+	.ndo_size		= sizeof(struct net_device_ops),
 	.ndo_init		= team_init,
 	.ndo_uninit		= team_uninit,
 	.ndo_open		= team_open,
@@ -2020,7 +2005,15 @@ static const struct net_device_ops team_netdev_ops = {
 	.ndo_add_slave		= team_add_slave,
 	.ndo_del_slave		= team_del_slave,
 	.ndo_fix_features	= team_fix_features,
+	.extended.ndo_neigh_construct	= netdev_default_l2upper_neigh_construct,
+	.extended.ndo_neigh_destroy	= netdev_default_l2upper_neigh_destroy,
 	.ndo_change_carrier     = team_change_carrier,
+	.ndo_bridge_setlink	= switchdev_port_bridge_setlink,
+	.ndo_bridge_getlink	= switchdev_port_bridge_getlink,
+	.ndo_bridge_dellink	= switchdev_port_bridge_dellink,
+	.ndo_fdb_add		= switchdev_port_fdb_add,
+	.ndo_fdb_del		= switchdev_port_fdb_del,
+	.extended.ndo_fdb_dump	= switchdev_port_fdb_dump,
 	.ndo_features_check	= passthru_features_check,
 };
 
@@ -2091,6 +2084,7 @@ static void team_setup(struct net_device *dev)
 	dev->destructor	= team_destructor;
 	dev->priv_flags &= ~(IFF_XMIT_DST_RELEASE | IFF_TX_SKB_SHARING);
 	dev->priv_flags |= IFF_NO_QUEUE;
+	dev->priv_flags |= IFF_TEAM;
 
 	/*
 	 * Indicate we support unicast address filtering. That way core won't

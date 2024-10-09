@@ -273,7 +273,7 @@ extern char ___assert_task_state[1 - 2*!!(
  * _adding_ to the beginning of the run-queue has
  * a separate lock).
  */
-extern rwlock_t tasklist_lock;
+extern qrwlock_t tasklist_lock;
 extern spinlock_t mmlist_lock;
 
 extern void tasklist_write_lock_irq(void);
@@ -478,16 +478,35 @@ struct cpu_itimer {
 };
 
 /**
- * struct cputime - snaphsot of system and user cputime
+ * struct prev_cputime - snaphsot of system and user cputime
  * @utime: time spent in user mode
  * @stime: time spent in system mode
+ * @lock: protects the above two fields
  *
- * Gathers a generic snapshot of user and system time.
+ * Stores previous user/system time values such that we can guarantee
+ * monotonicity.
  */
+struct prev_cputime {
+#ifndef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
+	cputime_t utime;
+	cputime_t stime;
+	raw_spinlock_t lock;
+#endif
+};
+
+/* RHEL7 note: Do not use. Only here to preserve kABI */
 struct cputime {
 	cputime_t utime;
 	cputime_t stime;
 };
+
+static inline void prev_cputime_init(struct prev_cputime *prev)
+{
+#ifndef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
+	prev->utime = prev->stime = 0;
+	raw_spin_lock_init(&prev->lock);
+#endif
+}
 
 /**
  * struct task_cputime - collected CPU time counts
@@ -495,22 +514,19 @@ struct cputime {
  * @stime:		time spent in kernel mode, in &cputime_t units
  * @sum_exec_runtime:	total time spent on the CPU, in nanoseconds
  *
- * This is an extension of struct cputime that includes the total runtime
- * spent by the task from the scheduler point of view.
- *
- * As a result, this structure groups together three kinds of CPU time
- * that are tracked for threads and thread groups.  Most things considering
- * CPU time want to group these counts together and treat all three
- * of them in parallel.
+ * This structure groups together three kinds of CPU time that are tracked for
+ * threads and thread groups.  Most things considering CPU time want to group
+ * these counts together and treat all three of them in parallel.
  */
 struct task_cputime {
 	cputime_t utime;
 	cputime_t stime;
 	unsigned long long sum_exec_runtime;
 };
+
 /* Alternate field names when used to cache expirations. */
-#define prof_exp	stime
 #define virt_exp	utime
+#define prof_exp	stime
 #define sched_exp	sum_exec_runtime
 
 #define INIT_CPUTIME	\
@@ -642,7 +658,7 @@ struct signal_struct {
 	cputime_t gtime;
 	cputime_t cgtime;
 #ifndef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
-	struct cputime prev_cputime;
+	RH_KABI_DEPRECATE(struct cputime,	prev_cputime)
 #endif
 	unsigned long nvcsw, nivcsw, cnvcsw, cnivcsw;
 	unsigned long min_flt, maj_flt, cmin_flt, cmaj_flt;
@@ -707,6 +723,9 @@ struct signal_struct {
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
+#ifndef __GENKSYMS__
+	struct prev_cputime prev_cputime;
+#endif
 };
 
 /*
@@ -1236,7 +1255,8 @@ struct sched_dl_entity {
 	u64 dl_runtime;		/* maximum runtime for each instance	*/
 	u64 dl_deadline;	/* relative deadline of each instance	*/
 	u64 dl_period;		/* separation of two instances (period) */
-	u64 dl_bw;		/* dl_runtime / dl_deadline		*/
+	u64 dl_bw;		/* dl_runtime / dl_period		*/
+	u64 dl_density;		/* dl_runtime / dl_deadline		*/
 
 	/*
 	 * Actual scheduling parameters. Initialized with the values above,
@@ -1436,7 +1456,7 @@ struct task_struct {
 	cputime_t utime, stime, utimescaled, stimescaled;
 	cputime_t gtime;
 #ifndef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
-	struct cputime prev_cputime;
+	RH_KABI_DEPRECATE(struct cputime,	prev_cputime)
 #endif
 #ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
 	seqlock_t vtime_seqlock;
@@ -1510,8 +1530,6 @@ struct task_struct {
 
 	/* Protection of the PI data structures: */
 	raw_spinlock_t pi_lock;
-
-	struct wake_q_node wake_q;
 
 #ifdef CONFIG_RT_MUTEXES
 	/* PI waiters blocked on a rt_mutex held by this task */
@@ -1590,9 +1608,6 @@ struct task_struct {
 	struct css_set __rcu *cgroups;
 	/* cg_list protected by css_set_lock and tsk->alloc_lock */
 	struct list_head cg_list;
-#endif
-#ifdef CONFIG_INTEL_RDT_A
-	int closid;
 #endif
 #ifdef CONFIG_FUTEX
 	struct robust_list_head __user *robust_list;
@@ -1748,7 +1763,11 @@ struct task_struct {
 #endif
 	/* This would be in rss_stat[MM_SHMEMPAGES] if not for kABI */
 	RH_KABI_USE(4, int mm_shmempages)
+#ifdef CONFIG_INTEL_RDT_A
+	RH_KABI_USE(5, int closid)
+#else
 	RH_KABI_RESERVE(5)
+#endif
 	RH_KABI_RESERVE(6)
 	RH_KABI_RESERVE(7)
 	RH_KABI_RESERVE(8)
@@ -1784,6 +1803,8 @@ struct task_struct {
 		struct rb_node pushable_dl_tasks;
 	#endif
 	struct sched_statistics statistics;
+	struct wake_q_node wake_q;
+	struct prev_cputime prev_cputime;
 #endif /* __GENKSYMS__ */
 };
 
@@ -2318,6 +2339,7 @@ extern void sched_autogroup_create_attach(struct task_struct *p);
 extern void sched_autogroup_detach(struct task_struct *p);
 extern void sched_autogroup_fork(struct signal_struct *sig);
 extern void sched_autogroup_exit(struct signal_struct *sig);
+extern void sched_autogroup_exit_task(struct task_struct *p);
 #ifdef CONFIG_PROC_FS
 extern void proc_sched_autogroup_show_task(struct task_struct *p, struct seq_file *m);
 extern int proc_sched_autogroup_set_nice(struct task_struct *p, int nice);
@@ -2327,6 +2349,7 @@ static inline void sched_autogroup_create_attach(struct task_struct *p) { }
 static inline void sched_autogroup_detach(struct task_struct *p) { }
 static inline void sched_autogroup_fork(struct signal_struct *sig) { }
 static inline void sched_autogroup_exit(struct signal_struct *sig) { }
+static inline void sched_autogroup_exit_task(struct task_struct *p) { }
 #endif
 
 extern int yield_to(struct task_struct *p, bool preempt);
@@ -2674,8 +2697,8 @@ static inline int thread_group_empty(struct task_struct *p)
  * pins the final release of task.io_context.  Also protects ->cpuset and
  * ->cgroup.subsys[]. And ->vfork_done.
  *
- * Nests both inside and outside of read_lock(&tasklist_lock).
- * It must not be nested with write_lock_irq(&tasklist_lock),
+ * Nests both inside and outside of qread_lock(&tasklist_lock).
+ * It must not be nested with qwrite_lock_irq(&tasklist_lock),
  * neither inside nor outside.
  */
 static inline void task_lock(struct task_struct *p)
@@ -2953,7 +2976,7 @@ static inline bool __must_check current_set_polling_and_test(void)
 
 	/*
 	 * Polling state must be visible before we test NEED_RESCHED,
-	 * paired by resched_task()
+	 * paired by resched_curr()
 	 */
 	smp_mb();
 
@@ -2971,7 +2994,7 @@ static inline bool __must_check current_clr_polling_and_test(void)
 
 	/*
 	 * Polling state must be visible before we test NEED_RESCHED,
-	 * paired by resched_task()
+	 * paired by resched_curr()
 	 */
 	smp_mb();
 
@@ -2994,7 +3017,7 @@ static inline bool __must_check current_set_polling_and_test(void)
 
 	/*
 	 * Polling state must be visible before we test NEED_RESCHED,
-	 * paired by resched_task()
+	 * paired by resched_curr()
 	 *
 	 * XXX: assumes set/clear bit are identical barrier wise.
 	 */
@@ -3014,7 +3037,7 @@ static inline bool __must_check current_clr_polling_and_test(void)
 
 	/*
 	 * Polling state must be visible before we test NEED_RESCHED,
-	 * paired by resched_task()
+	 * paired by resched_curr()
 	 */
 	smp_mb__after_clear_bit();
 

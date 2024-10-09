@@ -48,6 +48,8 @@ static int parse_callchain_mode(const char *value)
 		callchain_param.mode = CHAIN_FOLDED;
 		return 0;
 	}
+
+	pr_err("Invalid callchain mode: %s\n", value);
 	return -1;
 }
 
@@ -63,6 +65,8 @@ static int parse_callchain_order(const char *value)
 		callchain_param.order_set = true;
 		return 0;
 	}
+
+	pr_err("Invalid callchain order: %s\n", value);
 	return -1;
 }
 
@@ -80,6 +84,8 @@ static int parse_callchain_sort_key(const char *value)
 		callchain_param.branch_callstack = 1;
 		return 0;
 	}
+
+	pr_err("Invalid callchain sort key: %s\n", value);
 	return -1;
 }
 
@@ -97,6 +103,8 @@ static int parse_callchain_value(const char *value)
 		callchain_param.value = CCVAL_COUNT;
 		return 0;
 	}
+
+	pr_err("Invalid callchain config key: %s\n", value);
 	return -1;
 }
 
@@ -210,13 +218,17 @@ int perf_callchain_config(const char *var, const char *value)
 		return parse_callchain_sort_key(value);
 	if (!strcmp(var, "threshold")) {
 		callchain_param.min_percent = strtod(value, &endptr);
-		if (value == endptr)
+		if (value == endptr) {
+			pr_err("Invalid callchain threshold: %s\n", value);
 			return -1;
+		}
 	}
 	if (!strcmp(var, "print-limit")) {
 		callchain_param.print_limit = strtod(value, &endptr);
-		if (value == endptr)
+		if (value == endptr) {
+			pr_err("Invalid callchain print limit: %s\n", value);
 			return -1;
+		}
 	}
 
 	return 0;
@@ -759,7 +771,8 @@ merge_chain_branch(struct callchain_cursor *cursor,
 
 	list_for_each_entry_safe(list, next_list, &src->val, list) {
 		callchain_cursor_append(cursor, list->ip,
-					list->ms.map, list->ms.sym);
+					list->ms.map, list->ms.sym,
+					false, NULL, 0, 0);
 		list_del(&list->list);
 		map__zput(list->ms.map);
 		free(list);
@@ -797,7 +810,9 @@ int callchain_merge(struct callchain_cursor *cursor,
 }
 
 int callchain_cursor_append(struct callchain_cursor *cursor,
-			    u64 ip, struct map *map, struct symbol *sym)
+			    u64 ip, struct map *map, struct symbol *sym,
+			    bool branch, struct branch_flags *flags,
+			    int nr_loop_iter, int samples)
 {
 	struct callchain_cursor_node *node = *cursor->last;
 
@@ -813,6 +828,13 @@ int callchain_cursor_append(struct callchain_cursor *cursor,
 	map__zput(node->map);
 	node->map = map__get(map);
 	node->sym = sym;
+	node->branch = branch;
+	node->nr_loop_iter = nr_loop_iter;
+	node->samples = samples;
+
+	if (flags)
+		memcpy(&node->branch_flags, flags,
+			sizeof(struct branch_flags));
 
 	cursor->nr++;
 
@@ -821,7 +843,8 @@ int callchain_cursor_append(struct callchain_cursor *cursor,
 	return 0;
 }
 
-int sample__resolve_callchain(struct perf_sample *sample, struct symbol **parent,
+int sample__resolve_callchain(struct perf_sample *sample,
+			      struct callchain_cursor *cursor, struct symbol **parent,
 			      struct perf_evsel *evsel, struct addr_location *al,
 			      int max_stack)
 {
@@ -829,8 +852,8 @@ int sample__resolve_callchain(struct perf_sample *sample, struct symbol **parent
 		return 0;
 
 	if (symbol_conf.use_callchain || symbol_conf.cumulate_callchain ||
-	    sort__has_parent) {
-		return thread__resolve_callchain(al->thread, evsel, sample,
+	    perf_hpp_list.parent) {
+		return thread__resolve_callchain(al->thread, cursor, evsel, sample,
 						 parent, al, max_stack);
 	}
 	return 0;

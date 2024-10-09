@@ -3324,6 +3324,51 @@ out_free_mem:
 	return rc;
 }
 
+static uint64_t
+lpfc_get_wwpn(struct lpfc_hba *phba)
+{
+	uint64_t wwn;
+	int rc;
+	LPFC_MBOXQ_t *mboxq;
+	MAILBOX_t *mb;
+
+	if (phba->sli_rev < LPFC_SLI_REV4) {
+		/* Reset the port first */
+		lpfc_sli_brdrestart(phba);
+		rc = lpfc_sli_chipset_init(phba);
+		if (rc)
+			return (uint64_t)-1;
+	}
+
+	mboxq = (LPFC_MBOXQ_t *) mempool_alloc(phba->mbox_mem_pool,
+						GFP_KERNEL);
+	if (!mboxq)
+		return (uint64_t)-1;
+
+	/* First get WWN of HBA instance */
+	lpfc_read_nv(phba, mboxq);
+	rc = lpfc_sli_issue_mbox(phba, mboxq, MBX_POLL);
+	if (rc != MBX_SUCCESS) {
+		lpfc_printf_log(phba, KERN_ERR, LOG_SLI,
+				"6019 Mailbox failed , mbxCmd x%x "
+				"READ_NV, mbxStatus x%x\n",
+				bf_get(lpfc_mqe_command, &mboxq->u.mqe),
+				bf_get(lpfc_mqe_status, &mboxq->u.mqe));
+		mempool_free(mboxq, phba->mbox_mem_pool);
+		return (uint64_t) -1;
+	}
+	mb = &mboxq->u.mb;
+	memcpy(&wwn, (char *)mb->un.varRDnvp.portname, sizeof(uint64_t));
+	/* wwn is WWPN of HBA instance */
+	mempool_free(mboxq, phba->mbox_mem_pool);
+	if (phba->sli_rev == LPFC_SLI_REV4)
+		return be64_to_cpu(wwn);
+	else
+		return (((wwn & 0xffffffff00000000) >> 32) |
+			((wwn & 0x00000000ffffffff) << 32));
+
+}
+
 /**
  * lpfc_create_port - Create an FC port
  * @phba: pointer to lpfc hba data structure.
@@ -3346,16 +3391,31 @@ lpfc_create_port(struct lpfc_hba *phba, int instance, struct device *dev)
 	struct lpfc_vport *vport;
 	struct Scsi_Host  *shost;
 	int error = 0;
+	int i;
+	uint64_t wwn;
+	bool use_no_reset_hba = false;
+
+	wwn = lpfc_get_wwpn(phba);
+
+	for (i = 0; i < lpfc_no_hba_reset_cnt; i++) {
+		if (wwn == lpfc_no_hba_reset[i]) {
+			lpfc_printf_log(phba, KERN_ERR, LOG_SLI,
+					"6020 Setting use_no_reset port=%llx\n",
+					wwn);
+			use_no_reset_hba = true;
+			break;
+		}
+	}
 
 	if (dev != &phba->pcidev->dev) {
 		shost = scsi_host_alloc(&lpfc_vport_template,
 					sizeof(struct lpfc_vport));
 	} else {
-		if (phba->sli_rev == LPFC_SLI_REV4)
+		if (!use_no_reset_hba)
 			shost = scsi_host_alloc(&lpfc_template,
 					sizeof(struct lpfc_vport));
 		else
-			shost = scsi_host_alloc(&lpfc_template_s3,
+			shost = scsi_host_alloc(&lpfc_template_no_hr,
 					sizeof(struct lpfc_vport));
 	}
 	if (!shost)
@@ -3386,6 +3446,10 @@ lpfc_create_port(struct lpfc_hba *phba, int instance, struct device *dev)
 	 * max xri value determined in hba setup.
 	 */
 	shost->can_queue = phba->cfg_hba_queue_depth - 10;
+	if (phba->sli_rev == LPFC_SLI_REV4)
+		shost->use_blk_mq = phba->cfg_use_blk_mq ? true : false;
+	else
+		shost->use_blk_mq = false; /* sli3 HBAs do no support MQ */
 	if (dev != &phba->pcidev->dev) {
 		shost->transportt = lpfc_vport_transport_template;
 		vport->port_type = LPFC_NPIV_PORT;
@@ -4042,6 +4106,8 @@ lpfc_sli4_async_fc_evt(struct lpfc_hba *phba, struct lpfc_acqe_fc_la *acqe_fc)
 {
 	struct lpfc_dmabuf *mp;
 	LPFC_MBOXQ_t *pmb;
+	MAILBOX_t *mb;
+	struct lpfc_mbx_read_top *la;
 	int rc;
 
 	if (bf_get(lpfc_trailer_type, acqe_fc) !=
@@ -4111,6 +4177,24 @@ lpfc_sli4_async_fc_evt(struct lpfc_hba *phba, struct lpfc_acqe_fc_la *acqe_fc)
 	lpfc_read_topology(phba, pmb, mp);
 	pmb->mbox_cmpl = lpfc_mbx_cmpl_read_topology;
 	pmb->vport = phba->pport;
+
+	if (phba->sli4_hba.link_state.status != LPFC_FC_LA_TYPE_LINK_UP) {
+		/* Parse and translate status field */
+		mb = &pmb->u.mb;
+		mb->mbxStatus = lpfc_sli4_parse_latt_fault(phba,
+							   (void *)acqe_fc);
+
+		/* Parse and translate link attention fields */
+		la = (struct lpfc_mbx_read_top *)&pmb->u.mb.un.varReadTop;
+		la->eventTag = acqe_fc->event_tag;
+		bf_set(lpfc_mbx_read_top_att_type, la,
+		       LPFC_FC_LA_TYPE_LINK_DOWN);
+
+		/* Invoke the mailbox command callback function */
+		lpfc_mbx_cmpl_read_topology(phba, pmb);
+
+		return;
+	}
 
 	rc = lpfc_sli_issue_mbox(phba, pmb, MBX_NOWAIT);
 	if (rc == MBX_NOT_FINISHED)
@@ -5058,7 +5142,8 @@ lpfc_sli_driver_resource_setup(struct lpfc_hba *phba)
 
 	/* Initialize the host templates the configured values. */
 	lpfc_vport_template.sg_tablesize = phba->cfg_sg_seg_cnt;
-	lpfc_template_s3.sg_tablesize = phba->cfg_sg_seg_cnt;
+	lpfc_template_no_hr.sg_tablesize = phba->cfg_sg_seg_cnt;
+	lpfc_template.sg_tablesize = phba->cfg_sg_seg_cnt;
 
 	/* There are going to be 2 reserved BDEs: 1 FCP cmnd + 1 FCP rsp */
 	if (phba->cfg_enable_bg) {
@@ -5293,6 +5378,7 @@ lpfc_sli4_driver_resource_setup(struct lpfc_hba *phba)
 	/* Initialize the host templates with the updated values. */
 	lpfc_vport_template.sg_tablesize = phba->cfg_sg_seg_cnt;
 	lpfc_template.sg_tablesize = phba->cfg_sg_seg_cnt;
+	lpfc_template_no_hr.sg_tablesize = phba->cfg_sg_seg_cnt;
 
 	if (phba->cfg_sg_dma_buf_size  <= LPFC_MIN_SG_SLI4_BUF_SZ)
 		phba->cfg_sg_dma_buf_size = LPFC_MIN_SG_SLI4_BUF_SZ;
@@ -7306,6 +7392,7 @@ int
 lpfc_sli4_queue_create(struct lpfc_hba *phba)
 {
 	struct lpfc_queue *qdesc;
+	uint32_t wqesize;
 	int idx;
 
 	/*
@@ -7390,8 +7477,10 @@ lpfc_sli4_queue_create(struct lpfc_hba *phba)
 		phba->sli4_hba.fcp_cq[idx] = qdesc;
 
 		/* Create Fast Path FCP WQs */
-		qdesc = lpfc_sli4_queue_alloc(phba, phba->sli4_hba.wq_esize,
-					      phba->sli4_hba.wq_ecount);
+		wqesize = (phba->fcp_embed_io) ?
+				LPFC_WQE128_SIZE : phba->sli4_hba.wq_esize;
+		qdesc = lpfc_sli4_queue_alloc(phba, wqesize,
+						phba->sli4_hba.wq_ecount);
 		if (!qdesc) {
 			lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
 					"0503 Failed allocate fast-path FCP "
@@ -9638,6 +9727,23 @@ lpfc_get_sli4_parameters(struct lpfc_hba *phba, LPFC_MBOXQ_t *mboxq)
 	if (sli4_params->sge_supp_len > LPFC_MAX_SGE_SIZE)
 		sli4_params->sge_supp_len = LPFC_MAX_SGE_SIZE;
 
+	/*
+	 * Issue IOs with CDB embedded in WQE to minimized the number
+	 * of DMAs the firmware has to do. Setting this to 1 also forces
+	 * the driver to use 128 bytes WQEs for FCP IOs.
+	 */
+	if (bf_get(cfg_ext_embed_cb, mbx_sli4_parameters))
+		phba->fcp_embed_io = 1;
+	else
+		phba->fcp_embed_io = 0;
+
+	/*
+	 * Check if the SLI port supports MDS Diagnostics
+	 */
+	if (bf_get(cfg_mds_diags, mbx_sli4_parameters))
+		phba->mds_diags_support = 1;
+	else
+		phba->mds_diags_support = 0;
 	return 0;
 }
 

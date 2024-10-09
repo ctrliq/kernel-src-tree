@@ -235,8 +235,8 @@ void cpuidle_resume(void)
 }
 
 #ifdef CONFIG_ARCH_HAS_CPU_RELAX
-static int poll_idle(struct cpuidle_device *dev,
-		struct cpuidle_driver *drv, int index)
+static int __cpuidle poll_idle(struct cpuidle_device *dev,
+			       struct cpuidle_driver *drv, int index)
 {
 	ktime_t	t1, t2;
 	s64 diff;

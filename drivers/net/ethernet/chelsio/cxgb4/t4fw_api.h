@@ -1,7 +1,7 @@
 /*
  * This file is part of the Chelsio T4 Ethernet driver for Linux.
  *
- * Copyright (c) 2009-2014 Chelsio Communications, Inc. All rights reserved.
+ * Copyright (c) 2009-2016 Chelsio Communications, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -682,6 +682,7 @@ enum fw_cmd_opcodes {
 	FW_RSS_IND_TBL_CMD             = 0x20,
 	FW_RSS_GLB_CONFIG_CMD          = 0x22,
 	FW_RSS_VI_CONFIG_CMD           = 0x23,
+	FW_SCHED_CMD                   = 0x24,
 	FW_DEVLOG_CMD                  = 0x25,
 	FW_CLIP_CMD                    = 0x28,
 	FW_LASTC2E_CMD                 = 0x40,
@@ -1062,7 +1063,7 @@ struct fw_caps_config_cmd {
 	__be16 niccaps;
 	__be16 ofldcaps;
 	__be16 rdmacaps;
-	__be16 r4;
+	__be16 cryptocaps;
 	__be16 iscsicaps;
 	__be16 fcoecaps;
 	__be32 cfcsum;
@@ -1166,7 +1167,8 @@ enum fw_params_param_pfvf {
 	FW_PARAMS_PARAM_PFVF_ACTIVE_FILTER_START = 0x2D,
 	FW_PARAMS_PARAM_PFVF_ACTIVE_FILTER_END = 0x2E,
 	FW_PARAMS_PARAM_PFVF_ETHOFLD_END = 0x30,
-	FW_PARAMS_PARAM_PFVF_CPLFW4MSG_ENCAP = 0x31
+	FW_PARAMS_PARAM_PFVF_CPLFW4MSG_ENCAP = 0x31,
+	FW_PARAMS_PARAM_PFVF_NCRYPTO_LOOKASIDE = 0x32
 };
 
 /*
@@ -2971,6 +2973,41 @@ struct fw_rss_vi_config_cmd {
 #define FW_RSS_VI_CONFIG_CMD_UDPEN_V(x)	((x) << FW_RSS_VI_CONFIG_CMD_UDPEN_S)
 #define FW_RSS_VI_CONFIG_CMD_UDPEN_F	FW_RSS_VI_CONFIG_CMD_UDPEN_V(1U)
 
+enum fw_sched_sc {
+	FW_SCHED_SC_PARAMS		= 1,
+};
+
+struct fw_sched_cmd {
+	__be32 op_to_write;
+	__be32 retval_len16;
+	union fw_sched {
+		struct fw_sched_config {
+			__u8   sc;
+			__u8   type;
+			__u8   minmaxen;
+			__u8   r3[5];
+			__u8   nclasses[4];
+			__be32 r4;
+		} config;
+		struct fw_sched_params {
+			__u8   sc;
+			__u8   type;
+			__u8   level;
+			__u8   mode;
+			__u8   unit;
+			__u8   rate;
+			__u8   ch;
+			__u8   cl;
+			__be32 min;
+			__be32 max;
+			__be16 weight;
+			__be16 pktsize;
+			__be16 burstsize;
+			__be16 r4;
+		} params;
+	} u;
+};
+
 struct fw_clip_cmd {
 	__be32 op_to_write;
 	__be32 alloc_to_len16;
@@ -3353,6 +3390,14 @@ struct fw_crypto_lookaside_wr {
 	((x) << FW_CRYPTO_LOOKASIDE_WR_IV_S)
 #define FW_CRYPTO_LOOKASIDE_WR_IV_G(x) \
 	(((x) >> FW_CRYPTO_LOOKASIDE_WR_IV_S) & FW_CRYPTO_LOOKASIDE_WR_IV_M)
+
+#define FW_CRYPTO_LOOKASIDE_WR_FQIDX_S   15
+#define FW_CRYPTO_LOOKASIDE_WR_FQIDX_M   0xff
+#define FW_CRYPTO_LOOKASIDE_WR_FQIDX_V(x) \
+	((x) << FW_CRYPTO_LOOKASIDE_WR_FQIDX_S)
+#define FW_CRYPTO_LOOKASIDE_WR_FQIDX_G(x) \
+	(((x) >> FW_CRYPTO_LOOKASIDE_WR_FQIDX_S) & \
+	 FW_CRYPTO_LOOKASIDE_WR_FQIDX_M)
 
 #define FW_CRYPTO_LOOKASIDE_WR_TX_CH_S 10
 #define FW_CRYPTO_LOOKASIDE_WR_TX_CH_M 0x3

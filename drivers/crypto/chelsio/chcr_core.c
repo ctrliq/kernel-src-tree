@@ -39,12 +39,11 @@ static chcr_handler_func work_handlers[NUM_CPL_CMDS] = {
 	[CPL_FW6_PLD] = cpl_fw6_pld_handler,
 };
 
-static struct cxgb4_pci_uld_info chcr_uld_info = {
+static struct cxgb4_uld_info chcr_uld_info = {
 	.name = DRV_MODULE_NAME,
-	.nrxq = 4,
+	.nrxq = MAX_ULD_QSETS,
+	.ntxq = MAX_ULD_QSETS,
 	.rxq_size = 1024,
-	.nciq = 0,
-	.ciq_size = 0,
 	.add = chcr_uld_add,
 	.state_change = chcr_uld_state_change,
 	.rx_handler = chcr_uld_rx_handler,
@@ -53,6 +52,7 @@ static struct cxgb4_pci_uld_info chcr_uld_info = {
 int assign_chcr_device(struct chcr_dev **dev)
 {
 	struct uld_ctx *u_ctx;
+	int ret = -ENXIO;
 
 	/*
 	 * Which device to use if multiple devices are available TODO
@@ -60,15 +60,14 @@ int assign_chcr_device(struct chcr_dev **dev)
 	 * must go to the same device to maintain the ordering.
 	 */
 	mutex_lock(&dev_mutex); /* TODO ? */
-	u_ctx = list_first_entry(&uld_ctx_list, struct uld_ctx, entry);
-	if (!u_ctx) {
-		mutex_unlock(&dev_mutex);
-		return -ENXIO;
+	list_for_each_entry(u_ctx, &uld_ctx_list, entry)
+		if (u_ctx->dev) {
+			*dev = u_ctx->dev;
+			ret = 0;
+			break;
 	}
-
-	*dev = u_ctx->dev;
 	mutex_unlock(&dev_mutex);
-	return 0;
+	return ret;
 }
 
 static int chcr_dev_add(struct uld_ctx *u_ctx)
@@ -128,7 +127,7 @@ static int cpl_fw6_pld_handler(struct chcr_dev *dev,
 
 int chcr_send_wr(struct sk_buff *skb)
 {
-	return cxgb4_ofld_send(skb->dev, skb);
+	return cxgb4_crypto_send(skb->dev, skb);
 }
 
 static void *chcr_uld_add(const struct cxgb4_lld_info *lld)
@@ -205,10 +204,8 @@ static int chcr_uld_state_change(void *handle, enum cxgb4_state state)
 
 static int __init chcr_crypto_init(void)
 {
-	if (cxgb4_register_pci_uld(CXGB4_PCI_ULD1, &chcr_uld_info)) {
+	if (cxgb4_register_uld(CXGB4_ULD_CRYPTO, &chcr_uld_info))
 		pr_err("ULD register fail: No chcr crypto support in cxgb4");
-		return -1;
-	}
 
 	return 0;
 }
@@ -228,7 +225,7 @@ static void __exit chcr_crypto_exit(void)
 		kfree(u_ctx);
 	}
 	mutex_unlock(&dev_mutex);
-	cxgb4_unregister_pci_uld(CXGB4_PCI_ULD1);
+	cxgb4_unregister_uld(CXGB4_ULD_CRYPTO);
 }
 
 module_init(chcr_crypto_init);

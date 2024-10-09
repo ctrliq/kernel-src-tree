@@ -1573,7 +1573,7 @@ long keyctl_session_to_parent(void)
 	if (!ret)
 		newwork = NULL;
 unlock:
-	write_unlock_irq(&tasklist_lock);
+	qwrite_unlock_irq(&tasklist_lock);
 	rcu_read_unlock();
 	if (oldwork)
 		put_cred(container_of(oldwork, struct cred, rcu));

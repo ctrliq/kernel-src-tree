@@ -69,17 +69,20 @@
 MODULE_AUTHOR("Qumranet");
 MODULE_LICENSE("GPL");
 
-/* halt polling only reduces halt latency by 5-7 us, 400us is enough */
-static unsigned int halt_poll_ns = 400000;
+/* Architectures should define their poll value according to the halt latency */
+unsigned int halt_poll_ns = KVM_HALT_POLL_NS_DEFAULT;
 module_param(halt_poll_ns, uint, S_IRUGO | S_IWUSR);
+EXPORT_SYMBOL_GPL(halt_poll_ns);
 
 /* Default doubles per-vcpu halt_poll_ns. */
-static unsigned int halt_poll_ns_grow = 2;
+unsigned int halt_poll_ns_grow = 2;
 module_param(halt_poll_ns_grow, uint, S_IRUGO | S_IWUSR);
+EXPORT_SYMBOL_GPL(halt_poll_ns_grow);
 
 /* Default resets per-vcpu halt_poll_ns . */
-static unsigned int halt_poll_ns_shrink;
+unsigned int halt_poll_ns_shrink;
 module_param(halt_poll_ns_shrink, uint, S_IRUGO | S_IWUSR);
+EXPORT_SYMBOL_GPL(halt_poll_ns_shrink);
 
 /*
  * Ordering of locks:
@@ -1426,12 +1429,8 @@ static int hva_to_pfn_remapped(struct vm_area_struct *vma,
 		 * get_user_pages fails for VM_IO and VM_PFNMAP vmas and does
 		 * not call the fault handler, so do it here.
 		 */
-		bool unlocked = false;
 		r = fixup_user_fault(current, current->mm, addr,
-				     (write_fault ? FAULT_FLAG_WRITE : 0),
-				     &unlocked);
-		if (unlocked)
-			return -EAGAIN;
+				     (write_fault ? FAULT_FLAG_WRITE : 0));
 		if (r)
 			return r;
 
@@ -2107,6 +2106,8 @@ void kvm_vcpu_block(struct kvm_vcpu *vcpu)
 		} while (single_task_running() && (ktime_compare(cur, stop) < 0));
 	}
 
+	kvm_arch_vcpu_blocking(vcpu);
+
 	for (;;) {
 		prepare_to_wait(&vcpu->wq, &wait, TASK_INTERRUPTIBLE);
 
@@ -2120,6 +2121,7 @@ void kvm_vcpu_block(struct kvm_vcpu *vcpu)
 	finish_wait(&vcpu->wq, &wait);
 	cur = ktime_get();
 
+	kvm_arch_vcpu_unblocking(vcpu);
 out:
 	block_ns = ktime_to_ns(cur) - ktime_to_ns(start);
 
@@ -2141,13 +2143,8 @@ out:
 EXPORT_SYMBOL_GPL(kvm_vcpu_block);
 
 #ifndef CONFIG_S390
-/*
- * Kick a sleeping VCPU, or a guest VCPU in guest mode, into host kernel mode.
- */
-void kvm_vcpu_kick(struct kvm_vcpu *vcpu)
+void kvm_vcpu_wake_up(struct kvm_vcpu *vcpu)
 {
-	int me;
-	int cpu = vcpu->cpu;
 	wait_queue_head_t *wqp;
 
 	wqp = kvm_arch_vcpu_wq(vcpu);
@@ -2156,6 +2153,18 @@ void kvm_vcpu_kick(struct kvm_vcpu *vcpu)
 		++vcpu->stat.halt_wakeup;
 	}
 
+}
+EXPORT_SYMBOL_GPL(kvm_vcpu_wake_up);
+
+/*
+ * Kick a sleeping VCPU, or a guest VCPU in guest mode, into host kernel mode.
+ */
+void kvm_vcpu_kick(struct kvm_vcpu *vcpu)
+{
+	int me;
+	int cpu = vcpu->cpu;
+
+	kvm_vcpu_wake_up(vcpu);
 	me = get_cpu();
 	if (cpu != me && (unsigned)cpu < nr_cpu_ids && cpu_online(cpu))
 		if (kvm_arch_vcpu_should_kick(vcpu))
@@ -2369,7 +2378,7 @@ static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, u32 id)
 	int r;
 	struct kvm_vcpu *vcpu, *v;
 
-	if (id >= KVM_MAX_VCPUS)
+	if (id >= KVM_MAX_VCPU_ID)
 		return -EINVAL;
 
 	vcpu = kvm_arch_vcpu_create(kvm, id);
@@ -2850,6 +2859,8 @@ static long kvm_vm_ioctl_check_extension_generic(struct kvm *kvm, long arg)
 	case KVM_CAP_MULTI_ADDRESS_SPACE:
 		return KVM_ADDRESS_SPACE_NUM;
 #endif
+	case KVM_CAP_MAX_VCPU_ID:
+		return KVM_MAX_VCPU_ID;
 	default:
 		break;
 	}
@@ -3589,7 +3600,7 @@ static int vm_stat_get_per_vm(void *data, u64 *val)
 {
 	struct kvm_stat_data *stat_data = (struct kvm_stat_data *)data;
 
-	*val = *(u32 *)((void *)stat_data->kvm + stat_data->offset);
+	*val = *(ulong *)((void *)stat_data->kvm + stat_data->offset);
 
 	return 0;
 }
@@ -3619,7 +3630,7 @@ static int vcpu_stat_get_per_vm(void *data, u64 *val)
 	*val = 0;
 
 	kvm_for_each_vcpu(i, vcpu, stat_data->kvm)
-		*val += *(u32 *)((void *)vcpu + stat_data->offset);
+		*val += *(u64 *)((void *)vcpu + stat_data->offset);
 
 	return 0;
 }

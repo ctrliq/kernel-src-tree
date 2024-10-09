@@ -758,16 +758,13 @@ static int ixgbe_set_vf_macvlan(struct ixgbe_adapter *adapter,
 
 int ixgbe_vf_configuration(struct pci_dev *pdev, unsigned int event_mask)
 {
-	unsigned char vf_mac_addr[6];
 	struct ixgbe_adapter *adapter = pci_get_drvdata(pdev);
 	unsigned int vfn = (event_mask & 0x3f);
 
 	bool enable = ((event_mask & 0x10000000U) != 0);
 
-	if (enable) {
-		eth_zero_addr(vf_mac_addr);
-		memcpy(adapter->vfinfo[vfn].vf_mac_addresses, vf_mac_addr, 6);
-	}
+	if (enable)
+		eth_zero_addr(adapter->vfinfo[vfn].vf_mac_addresses);
 
 	return 0;
 }
@@ -1394,13 +1391,16 @@ static int ixgbe_disable_port_vlan(struct ixgbe_adapter *adapter, int vf)
 	return err;
 }
 
-int ixgbe_ndo_set_vf_vlan(struct net_device *netdev, int vf, u16 vlan, u8 qos)
+int ixgbe_ndo_set_vf_vlan(struct net_device *netdev, int vf, u16 vlan,
+			  u8 qos, __be16 vlan_proto)
 {
 	int err = 0;
 	struct ixgbe_adapter *adapter = netdev_priv(netdev);
 
 	if ((vf >= adapter->num_vfs) || (vlan > 4095) || (qos > 7))
 		return -EINVAL;
+	if (vlan_proto != htons(ETH_P_8021Q))
+		return -EPROTONOSUPPORT;
 	if (vlan || qos) {
 		/* Check if there is already a port VLAN set, if so
 		 * we have to delete the old one first before we

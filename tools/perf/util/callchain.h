@@ -131,6 +131,10 @@ struct callchain_cursor_node {
 	u64				ip;
 	struct map			*map;
 	struct symbol			*sym;
+	bool				branch;
+	struct branch_flags		branch_flags;
+	int				nr_loop_iter;
+	int				samples;
 	struct callchain_cursor_node	*next;
 };
 
@@ -190,7 +194,9 @@ static inline void callchain_cursor_reset(struct callchain_cursor *cursor)
 }
 
 int callchain_cursor_append(struct callchain_cursor *cursor, u64 ip,
-			    struct map *map, struct symbol *sym);
+			    struct map *map, struct symbol *sym,
+			    bool branch, struct branch_flags *flags,
+			    int nr_loop_iter, int samples);
 
 /* Close a cursor writing session. Initialize for the reader */
 static inline void callchain_cursor_commit(struct callchain_cursor *cursor)
@@ -224,7 +230,14 @@ struct hist_entry;
 int record_parse_callchain_opt(const struct option *opt, const char *arg, int unset);
 int record_callchain_opt(const struct option *opt, const char *arg, int unset);
 
-int sample__resolve_callchain(struct perf_sample *sample, struct symbol **parent,
+struct record_opts;
+
+int record_opts__parse_callchain(struct record_opts *record,
+				 struct callchain_param *callchain,
+				 const char *arg, bool unset);
+
+int sample__resolve_callchain(struct perf_sample *sample,
+			      struct callchain_cursor *cursor, struct symbol **parent,
 			      struct perf_evsel *evsel, struct addr_location *al,
 			      int max_stack);
 int hist_entry__append_callchain(struct hist_entry *he, struct perf_sample *sample);

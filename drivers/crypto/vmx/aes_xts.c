@@ -84,9 +84,8 @@ static int p8_aes_xts_setkey(struct crypto_tfm *tfm, const u8 *key,
 	int ret;
 	struct p8_aes_xts_ctx *ctx = crypto_tfm_ctx(tfm);
 
-	ret = xts_check_key(tfm, key, keylen);
-	if (ret)
-		return ret;
+	if (keylen % 2)
+		return -EINVAL;
 
 	preempt_disable();
 	pagefault_disable();
@@ -94,7 +93,6 @@ static int p8_aes_xts_setkey(struct crypto_tfm *tfm, const u8 *key,
 	ret = aes_p8_set_encrypt_key(key + keylen/2, (keylen/2) * 8, &ctx->tweak_key);
 	ret += aes_p8_set_encrypt_key(key, (keylen/2) * 8, &ctx->enc_key);
 	ret += aes_p8_set_decrypt_key(key, (keylen/2) * 8, &ctx->dec_key);
-	disable_kernel_vsx();
 	pagefault_enable();
 	preempt_enable();
 
@@ -146,7 +144,6 @@ static int p8_aes_xts_crypt(struct blkcipher_desc *desc,
 			ret = blkcipher_walk_done(desc, &walk, nbytes);
 		}
 
-		disable_kernel_vsx();
 		pagefault_enable();
 		preempt_enable();
 	}

@@ -4,7 +4,7 @@
 #include "util/evlist.h"
 #include "util/evsel.h"
 #include "util/util.h"
-#include "util/cache.h"
+#include "util/config.h"
 #include "util/symbol.h"
 #include "util/thread.h"
 #include "util/header.h"
@@ -340,7 +340,7 @@ static int build_alloc_func_list(void)
 	}
 
 	kernel_map = machine__kernel_map(machine);
-	if (map__load(kernel_map, NULL) < 0) {
+	if (map__load(kernel_map) < 0) {
 		pr_err("cannot load kernel map\n");
 		return -ENOENT;
 	}
@@ -385,7 +385,7 @@ static u64 find_callsite(struct perf_evsel *evsel, struct perf_sample *sample)
 	}
 
 	al.thread = machine__findnew_thread(machine, sample->pid, sample->tid);
-	sample__resolve_callchain(sample, NULL, evsel, &al, 16);
+	sample__resolve_callchain(sample, &callchain_cursor, NULL, evsel, &al, 16);
 
 	callchain_cursor_commit(&callchain_cursor);
 	while (true) {
@@ -1000,7 +1000,7 @@ static void __print_slab_result(struct rb_root *root,
 		if (is_caller) {
 			addr = data->call_site;
 			if (!raw_ip)
-				sym = machine__find_kernel_function(machine, addr, &map, NULL);
+				sym = machine__find_kernel_function(machine, addr, &map);
 		} else
 			addr = data->ptr;
 
@@ -1064,8 +1064,7 @@ static void __print_page_alloc_result(struct perf_session *session, int n_lines)
 		char *caller = buf;
 
 		data = rb_entry(next, struct page_stat, node);
-		sym = machine__find_kernel_function(machine, data->callsite,
-						    &map, NULL);
+		sym = machine__find_kernel_function(machine, data->callsite, &map);
 		if (sym && sym->name)
 			caller = sym->name;
 		else
@@ -1107,8 +1106,7 @@ static void __print_page_caller_result(struct perf_session *session, int n_lines
 		char *caller = buf;
 
 		data = rb_entry(next, struct page_stat, node);
-		sym = machine__find_kernel_function(machine, data->callsite,
-						    &map, NULL);
+		sym = machine__find_kernel_function(machine, data->callsite, &map);
 		if (sym && sym->name)
 			caller = sym->name;
 		else
@@ -1381,7 +1379,7 @@ static int __cmd_kmem(struct perf_session *session)
 		goto out;
 	}
 
-	evlist__for_each(session->evlist, evsel) {
+	evlist__for_each_entry(session->evlist, evsel) {
 		if (!strcmp(perf_evsel__name(evsel), "kmem:mm_page_alloc") &&
 		    perf_evsel__field(evsel, "pfn")) {
 			use_pfn = true;
@@ -1922,10 +1920,12 @@ int cmd_kmem(int argc, const char **argv, const char *prefix __maybe_unused)
 		NULL
 	};
 	struct perf_session *session;
-	int ret = -1;
 	const char errmsg[] = "No %s allocation events found.  Have you run 'perf kmem record --%s'?\n";
+	int ret = perf_config(kmem_config, NULL);
 
-	perf_config(kmem_config, NULL);
+	if (ret)
+		return ret;
+
 	argc = parse_options_subcommand(argc, argv, kmem_options,
 					kmem_subcommands, kmem_usage, 0);
 
@@ -1949,6 +1949,8 @@ int cmd_kmem(int argc, const char **argv, const char *prefix __maybe_unused)
 	kmem_session = session = perf_session__new(&file, false, &perf_kmem);
 	if (session == NULL)
 		return -1;
+
+	ret = -1;
 
 	if (kmem_slab) {
 		if (!perf_evlist__find_tracepoint_by_name(session->evlist,

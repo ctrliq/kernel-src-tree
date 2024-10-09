@@ -119,9 +119,9 @@ acpi_initialize_tables(struct acpi_table_desc * initial_table_array,
 	} else {
 		/* Root Table Array has been statically allocated by the host */
 
-		ACPI_MEMSET(initial_table_array, 0,
-			    (acpi_size) initial_table_count *
-			    sizeof(struct acpi_table_desc));
+		memset(initial_table_array, 0,
+		       (acpi_size) initial_table_count *
+		       sizeof(struct acpi_table_desc));
 
 		acpi_gbl_root_table_list.tables = initial_table_array;
 		acpi_gbl_root_table_list.max_table_count = initial_table_count;
@@ -229,7 +229,7 @@ acpi_get_table_header(char *signature,
 		if (!acpi_gbl_root_table_list.tables[i].pointer) {
 			if ((acpi_gbl_root_table_list.tables[i].flags &
 			     ACPI_TABLE_ORIGIN_MASK) ==
-			    ACPI_TABLE_ORIGIN_MAPPED) {
+			    ACPI_TABLE_ORIGIN_INTERNAL_PHYSICAL) {
 				header =
 				    acpi_os_map_memory(acpi_gbl_root_table_list.
 						       tables[i].address,
@@ -238,8 +238,8 @@ acpi_get_table_header(char *signature,
 				if (!header) {
 					return (AE_NO_MEMORY);
 				}
-				ACPI_MEMCPY(out_table_header, header,
-					    sizeof(struct acpi_table_header));
+				memcpy(out_table_header, header,
+				       sizeof(struct acpi_table_header));
 				acpi_os_unmap_memory(header,
 						     sizeof(struct
 							    acpi_table_header));
@@ -247,9 +247,9 @@ acpi_get_table_header(char *signature,
 				return (AE_NOT_FOUND);
 			}
 		} else {
-			ACPI_MEMCPY(out_table_header,
-				    acpi_gbl_root_table_list.tables[i].pointer,
-				    sizeof(struct acpi_table_header));
+			memcpy(out_table_header,
+			       acpi_gbl_root_table_list.tables[i].pointer,
+			       sizeof(struct acpi_table_header));
 		}
 		return (AE_OK);
 	}
@@ -342,7 +342,7 @@ acpi_get_table_with_size(char *signature,
 		}
 
 		status =
-		    acpi_tb_verify_table(&acpi_gbl_root_table_list.tables[i]);
+		    acpi_tb_validate_table(&acpi_gbl_root_table_list.tables[i]);
 		if (ACPI_SUCCESS(status)) {
 			*out_table = acpi_gbl_root_table_list.tables[i].pointer;
 			*tbl_size = acpi_gbl_root_table_list.tables[i].length;
@@ -410,8 +410,8 @@ acpi_get_table_by_index(u32 table_index, struct acpi_table_header ** table)
 		/* Table is not mapped, map it */
 
 		status =
-		    acpi_tb_verify_table(&acpi_gbl_root_table_list.
-					 tables[table_index]);
+		    acpi_tb_validate_table(&acpi_gbl_root_table_list.
+					   tables[table_index]);
 		if (ACPI_FAILURE(status)) {
 			(void)acpi_ut_release_mutex(ACPI_MTX_TABLES);
 			return_ACPI_STATUS(status);

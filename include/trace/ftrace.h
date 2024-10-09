@@ -202,6 +202,10 @@
 #define __get_dynamic_array(field)	\
 		((void *)__entry + (__entry->__data_loc_##field & 0xffff))
 
+#undef __get_dynamic_array_len
+#define __get_dynamic_array_len(field)	\
+		((__entry->__data_loc_##field >> 16) & 0xffff)
+
 #undef __get_str
 #define __get_str(field) (char *)__get_dynamic_array(field)
 
@@ -237,6 +241,14 @@
 #undef __print_hex
 #define __print_hex(buf, buf_len) ftrace_print_hex_seq(p, buf, buf_len)
 
+#undef __print_array
+#define __print_array(array, count, el_size)				\
+	({								\
+		BUILD_BUG_ON(el_size != 1 && el_size != 2 &&		\
+			     el_size != 4 && el_size != 8);		\
+		ftrace_print_array_seq(p, array, count, el_size);	\
+	})
+
 #undef DECLARE_EVENT_CLASS
 #define DECLARE_EVENT_CLASS(call, proto, args, tstruct, assign, print)	\
 static notrace enum print_line_t					\
@@ -251,14 +263,12 @@ ftrace_raw_output_##call(struct trace_iterator *iter, int flags,	\
 	field = (typeof(field))iter->ent;				\
 									\
 	ret = ftrace_raw_output_prep(iter, trace_event);		\
-	if (ret)							\
+	if (ret != TRACE_TYPE_HANDLED)					\
 		return ret;						\
 									\
-	ret = trace_seq_printf(s, print);				\
-	if (!ret)							\
-		return TRACE_TYPE_PARTIAL_LINE;				\
+	trace_seq_printf(s, print);					\
 									\
-	return TRACE_TYPE_HANDLED;					\
+	return trace_handle_return(s);					\
 }									\
 static struct trace_event_functions ftrace_event_type_funcs_##call = {	\
 	.trace			= ftrace_raw_output_##call,		\
@@ -598,7 +608,9 @@ static inline void ftrace_test_probe_##call(void)			\
 #undef __print_symbolic
 #undef __print_hex
 #undef __get_dynamic_array
+#undef __get_dynamic_array_len
 #undef __get_str
+#undef __print_array
 
 #undef TP_printk
 #define TP_printk(fmt, args...) "\"" fmt "\", "  __stringify(args)
@@ -654,6 +666,10 @@ __attribute__((section("_ftrace_events"))) *__event_##call = &event_##call
 #undef __get_dynamic_array
 #define __get_dynamic_array(field)	\
 		((void *)__entry + (__entry->__data_loc_##field & 0xffff))
+
+#undef __get_dynamic_array_len
+#define __get_dynamic_array_len(field)	\
+		((__entry->__data_loc_##field >> 16) & 0xffff)
 
 #undef __get_str
 #define __get_str(field) (char *)__get_dynamic_array(field)

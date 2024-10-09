@@ -29,6 +29,7 @@
 #include <crypto/rng.h>
 #include <crypto/drbg.h>
 #include <crypto/akcipher.h>
+#include <crypto/kpp.h>
 
 #include "internal.h"
 
@@ -120,6 +121,11 @@ struct akcipher_test_suite {
 	unsigned int count;
 };
 
+struct kpp_test_suite {
+	struct kpp_testvec *vecs;
+	unsigned int count;
+};
+
 struct alg_test_desc {
 	const char *alg;
 	int (*test)(const struct alg_test_desc *desc, const char *driver,
@@ -135,6 +141,7 @@ struct alg_test_desc {
 		struct cprng_test_suite cprng;
 		struct drbg_test_suite drbg;
 		struct akcipher_test_suite akcipher;
+		struct kpp_test_suite kpp;
 	} suite;
 };
 
@@ -188,10 +195,9 @@ static void testmgr_free_buf(char *buf[XBUFSIZE])
 static int wait_async_op(struct tcrypt_result *tr, int ret)
 {
 	if (ret == -EINPROGRESS || ret == -EBUSY) {
-		ret = wait_for_completion_interruptible(&tr->completion);
-		if (!ret)
-			ret = tr->err;
+		wait_for_completion(&tr->completion);
 		INIT_COMPLETION(tr->completion);
+		ret = tr->err;
 	}
 	return ret;
 }
@@ -331,12 +337,11 @@ static int test_hash(struct crypto_ahash *tfm, struct hash_testvec *template,
 				break;
 			case -EINPROGRESS:
 			case -EBUSY:
-				ret = wait_for_completion_interruptible(
-					&tresult.completion);
-				if (!ret && !(ret = tresult.err)) {
-					INIT_COMPLETION(tresult.completion);
+				wait_for_completion(&tresult.completion);
+				INIT_COMPLETION(tresult.completion);
+				ret = tresult.err;
+				if (!ret)
 					break;
-				}
 				/* fall through */
 			default:
 				printk(KERN_ERR "alg: hash: digest failed "
@@ -511,12 +516,11 @@ static int __test_aead(struct crypto_aead *tfm, int enc,
 				break;
 			case -EINPROGRESS:
 			case -EBUSY:
-				ret = wait_for_completion_interruptible(
-					&result.completion);
-				if (!ret && !(ret = result.err)) {
-					INIT_COMPLETION(result.completion);
+				wait_for_completion(&result.completion);
+				INIT_COMPLETION(result.completion);
+				ret = result.err;
+				if (!ret)
 					break;
-				}
 			case -EBADMSG:
 				if (template[i].novrfy)
 					/* verification failure was expected */
@@ -661,12 +665,11 @@ static int __test_aead(struct crypto_aead *tfm, int enc,
 				break;
 			case -EINPROGRESS:
 			case -EBUSY:
-				ret = wait_for_completion_interruptible(
-					&result.completion);
-				if (!ret && !(ret = result.err)) {
-					INIT_COMPLETION(result.completion);
+				wait_for_completion(&result.completion);
+				INIT_COMPLETION(result.completion);
+				ret = result.err;
+				if (!ret)
 					break;
-				}
 			case -EBADMSG:
 				if (template[i].novrfy)
 					/* verification failure was expected */
@@ -777,6 +780,9 @@ static int test_cipher(struct crypto_cipher *tfm, int enc,
 		if (template[i].np)
 			continue;
 
+		if (fips_enabled && template[i].fips_skip)
+			continue;
+
 		j++;
 
 		ret = -EINVAL;
@@ -883,6 +889,9 @@ static int __test_skcipher(struct crypto_ablkcipher *tfm, int enc,
 		else
 			memset(iv, 0, MAX_IVLEN);
 
+		if (fips_enabled && template[i].fips_skip)
+			continue;
+
 		if (!(template[i].np) || (template[i].also_non_np)) {
 			j++;
 
@@ -926,12 +935,11 @@ static int __test_skcipher(struct crypto_ablkcipher *tfm, int enc,
 				break;
 			case -EINPROGRESS:
 			case -EBUSY:
-				ret = wait_for_completion_interruptible(
-					&result.completion);
-				if (!ret && !((ret = result.err))) {
-					INIT_COMPLETION(result.completion);
+				wait_for_completion(&result.completion);
+				INIT_COMPLETION(result.completion);
+				ret = result.err;
+				if (!ret)
 					break;
-				}
 				/* fall through */
 			default:
 				pr_err("alg: skcipher%s: %s failed on test %d for %s: ret=%d\n",
@@ -957,6 +965,9 @@ static int __test_skcipher(struct crypto_ablkcipher *tfm, int enc,
 			memcpy(iv, template[i].iv, ivsize);
 		else
 			memset(iv, 0, MAX_IVLEN);
+
+		if (fips_enabled && template[i].fips_skip)
+			continue;
 
 		if (template[i].np) {
 			j++;
@@ -1026,12 +1037,11 @@ static int __test_skcipher(struct crypto_ablkcipher *tfm, int enc,
 				break;
 			case -EINPROGRESS:
 			case -EBUSY:
-				ret = wait_for_completion_interruptible(
-					&result.completion);
-				if (!ret && !((ret = result.err))) {
-					INIT_COMPLETION(result.completion);
+				wait_for_completion(&result.completion);
+				INIT_COMPLETION(result.completion);
+				ret = result.err;
+				if (!ret)
 					break;
-				}
 				/* fall through */
 			default:
 				pr_err("alg: skcipher%s: %s failed on chunk test %d for %s: ret=%d\n",
@@ -1732,6 +1742,133 @@ static int alg_test_drbg(const struct alg_test_desc *desc, const char *driver,
 
 }
 
+static int do_test_kpp(struct crypto_kpp *tfm, struct kpp_testvec *vec,
+		       const char *alg)
+{
+	struct kpp_request *req;
+	void *input_buf = NULL;
+	void *output_buf = NULL;
+	struct tcrypt_result result;
+	unsigned int out_len_max;
+	int err = -ENOMEM;
+	struct scatterlist src, dst;
+
+	req = kpp_request_alloc(tfm, GFP_KERNEL);
+	if (!req)
+		return err;
+
+	init_completion(&result.completion);
+
+	err = crypto_kpp_set_secret(tfm, vec->secret, vec->secret_size);
+	if (err < 0)
+		goto free_req;
+
+	out_len_max = crypto_kpp_maxsize(tfm);
+	output_buf = kzalloc(out_len_max, GFP_KERNEL);
+	if (!output_buf) {
+		err = -ENOMEM;
+		goto free_req;
+	}
+
+	/* Use appropriate parameter as base */
+	kpp_request_set_input(req, NULL, 0);
+	sg_init_one(&dst, output_buf, out_len_max);
+	kpp_request_set_output(req, &dst, out_len_max);
+	kpp_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+				 tcrypt_complete, &result);
+
+	/* Compute public key */
+	err = wait_async_op(&result, crypto_kpp_generate_public_key(req));
+	if (err) {
+		pr_err("alg: %s: generate public key test failed. err %d\n",
+		       alg, err);
+		goto free_output;
+	}
+	/* Verify calculated public key */
+	if (memcmp(vec->expected_a_public, sg_virt(req->dst),
+		   vec->expected_a_public_size)) {
+		pr_err("alg: %s: generate public key test failed. Invalid output\n",
+		       alg);
+		err = -EINVAL;
+		goto free_output;
+	}
+
+	/* Calculate shared secret key by using counter part (b) public key. */
+	input_buf = kzalloc(vec->b_public_size, GFP_KERNEL);
+	if (!input_buf) {
+		err = -ENOMEM;
+		goto free_output;
+	}
+
+	memcpy(input_buf, vec->b_public, vec->b_public_size);
+	sg_init_one(&src, input_buf, vec->b_public_size);
+	sg_init_one(&dst, output_buf, out_len_max);
+	kpp_request_set_input(req, &src, vec->b_public_size);
+	kpp_request_set_output(req, &dst, out_len_max);
+	kpp_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+				 tcrypt_complete, &result);
+	err = wait_async_op(&result, crypto_kpp_compute_shared_secret(req));
+	if (err) {
+		pr_err("alg: %s: compute shard secret test failed. err %d\n",
+		       alg, err);
+		goto free_all;
+	}
+	/*
+	 * verify shared secret from which the user will derive
+	 * secret key by executing whatever hash it has chosen
+	 */
+	if (memcmp(vec->expected_ss, sg_virt(req->dst),
+		   vec->expected_ss_size)) {
+		pr_err("alg: %s: compute shared secret test failed. Invalid output\n",
+		       alg);
+		err = -EINVAL;
+	}
+
+free_all:
+	kfree(input_buf);
+free_output:
+	kfree(output_buf);
+free_req:
+	kpp_request_free(req);
+	return err;
+}
+
+static int test_kpp(struct crypto_kpp *tfm, const char *alg,
+		    struct kpp_testvec *vecs, unsigned int tcount)
+{
+	int ret, i;
+
+	for (i = 0; i < tcount; i++) {
+		ret = do_test_kpp(tfm, vecs++, alg);
+		if (ret) {
+			pr_err("alg: %s: test failed on vector %d, err=%d\n",
+			       alg, i + 1, ret);
+			return ret;
+		}
+	}
+	return 0;
+}
+
+static int alg_test_kpp(const struct alg_test_desc *desc, const char *driver,
+			u32 type, u32 mask)
+{
+	struct crypto_kpp *tfm;
+	int err = 0;
+
+	tfm = crypto_alloc_kpp(driver, type | CRYPTO_ALG_INTERNAL, mask);
+	if (IS_ERR(tfm)) {
+		pr_err("alg: kpp: Failed to load tfm for %s: %ld\n",
+		       driver, PTR_ERR(tfm));
+		return PTR_ERR(tfm);
+	}
+	if (desc->suite.kpp.vecs)
+		err = test_kpp(tfm, desc->alg, desc->suite.kpp.vecs,
+			       desc->suite.kpp.count);
+
+	crypto_free_kpp(tfm);
+	return err;
+}
+
 static int do_test_rsa(struct crypto_akcipher *tfm,
 		       struct akcipher_testvec *vecs)
 {
@@ -1985,14 +2122,108 @@ static const struct alg_test_desc alg_test_descs[] = {
 			}
 		}
 	}, {
+		.alg = "authenc(hmac(md5),ecb(cipher_null))",
+		.test = alg_test_aead,
+		.suite = {
+			.aead = {
+				.enc = {
+					.vecs = hmac_md5_ecb_cipher_null_enc_tv_template,
+					.count = HMAC_MD5_ECB_CIPHER_NULL_ENC_TEST_VECTORS
+				},
+				.dec = {
+					.vecs = hmac_md5_ecb_cipher_null_dec_tv_template,
+					.count = HMAC_MD5_ECB_CIPHER_NULL_DEC_TEST_VECTORS
+				}
+			}
+		}
+	}, {
 		.alg = "authenc(hmac(sha1),cbc(aes))",
 		.test = alg_test_aead,
 		.fips_allowed = 1,
 		.suite = {
 			.aead = {
 				.enc = {
-					.vecs = hmac_sha1_aes_cbc_enc_tv_template,
-					.count = HMAC_SHA1_AES_CBC_ENC_TEST_VECTORS
+					.vecs =
+					hmac_sha1_aes_cbc_enc_tv_temp,
+					.count =
+					HMAC_SHA1_AES_CBC_ENC_TEST_VEC
+				}
+			}
+		}
+	}, {
+		.alg = "authenc(hmac(sha1),cbc(des))",
+		.test = alg_test_aead,
+		.suite = {
+			.aead = {
+				.enc = {
+					.vecs =
+					hmac_sha1_des_cbc_enc_tv_temp,
+					.count =
+					HMAC_SHA1_DES_CBC_ENC_TEST_VEC
+				}
+			}
+		}
+	}, {
+		.alg = "authenc(hmac(sha1),cbc(des3_ede))",
+		.test = alg_test_aead,
+		.fips_allowed = 1,
+		.suite = {
+			.aead = {
+				.enc = {
+					.vecs =
+					hmac_sha1_des3_ede_cbc_enc_tv_temp,
+					.count =
+					HMAC_SHA1_DES3_EDE_CBC_ENC_TEST_VEC
+				}
+			}
+		}
+	}, {
+		.alg = "authenc(hmac(sha1),ctr(aes))",
+		.test = alg_test_null,
+		.fips_allowed = 1,
+	}, {
+		.alg = "authenc(hmac(sha1),ecb(cipher_null))",
+		.test = alg_test_aead,
+		.suite = {
+			.aead = {
+				.enc = {
+					.vecs =
+					hmac_sha1_ecb_cipher_null_enc_tv_temp,
+					.count =
+					HMAC_SHA1_ECB_CIPHER_NULL_ENC_TEST_VEC
+				},
+				.dec = {
+					.vecs =
+					hmac_sha1_ecb_cipher_null_dec_tv_temp,
+					.count =
+					HMAC_SHA1_ECB_CIPHER_NULL_DEC_TEST_VEC
+				}
+			}
+		}
+	}, {
+		.alg = "authenc(hmac(sha224),cbc(des))",
+		.test = alg_test_aead,
+		.suite = {
+			.aead = {
+				.enc = {
+					.vecs =
+					hmac_sha224_des_cbc_enc_tv_temp,
+					.count =
+					HMAC_SHA224_DES_CBC_ENC_TEST_VEC
+				}
+			}
+		}
+	}, {
+		.alg = "authenc(hmac(sha224),cbc(des3_ede))",
+		.test = alg_test_aead,
+		.fips_allowed = 1,
+		.suite = {
+			.aead = {
+				.enc = {
+					.vecs =
+					hmac_sha224_des3_ede_cbc_enc_tv_temp,
+					.count =
+					HMAC_SHA224_DES3_EDE_CBC_ENC_TEST_VEC
 				}
 			}
 		}
@@ -2003,23 +2234,120 @@ static const struct alg_test_desc alg_test_descs[] = {
 		.suite = {
 			.aead = {
 				.enc = {
-					.vecs = hmac_sha256_aes_cbc_enc_tv_template,
-					.count = HMAC_SHA256_AES_CBC_ENC_TEST_VECTORS
+					.vecs =
+					hmac_sha256_aes_cbc_enc_tv_temp,
+					.count =
+					HMAC_SHA256_AES_CBC_ENC_TEST_VEC
 				}
 			}
 		}
 	}, {
-		.alg = "authenc(hmac(sha512),cbc(aes))",
+		.alg = "authenc(hmac(sha256),cbc(des))",
+		.test = alg_test_aead,
+		.suite = {
+			.aead = {
+				.enc = {
+					.vecs =
+					hmac_sha256_des_cbc_enc_tv_temp,
+					.count =
+					HMAC_SHA256_DES_CBC_ENC_TEST_VEC
+				}
+			}
+		}
+	}, {
+		.alg = "authenc(hmac(sha256),cbc(des3_ede))",
 		.test = alg_test_aead,
 		.fips_allowed = 1,
 		.suite = {
 			.aead = {
 				.enc = {
-					.vecs = hmac_sha512_aes_cbc_enc_tv_template,
-					.count = HMAC_SHA512_AES_CBC_ENC_TEST_VECTORS
+					.vecs =
+					hmac_sha256_des3_ede_cbc_enc_tv_temp,
+					.count =
+					HMAC_SHA256_DES3_EDE_CBC_ENC_TEST_VEC
 				}
 			}
 		}
+	}, {
+		.alg = "authenc(hmac(sha384),cbc(des))",
+		.test = alg_test_aead,
+		.suite = {
+			.aead = {
+				.enc = {
+					.vecs =
+					hmac_sha384_des_cbc_enc_tv_temp,
+					.count =
+					HMAC_SHA384_DES_CBC_ENC_TEST_VEC
+				}
+			}
+		}
+	}, {
+		.alg = "authenc(hmac(sha384),cbc(des3_ede))",
+		.test = alg_test_aead,
+		.fips_allowed = 1,
+		.suite = {
+			.aead = {
+				.enc = {
+					.vecs =
+					hmac_sha384_des3_ede_cbc_enc_tv_temp,
+					.count =
+					HMAC_SHA384_DES3_EDE_CBC_ENC_TEST_VEC
+				}
+			}
+		}
+	}, {
+		.alg = "authenc(hmac(sha256),ctr(aes))",
+		.test = alg_test_null,
+		.fips_allowed = 1,
+	}, {
+		.alg = "authenc(hmac(sha384),ctr(aes))",
+		.test = alg_test_null,
+		.fips_allowed = 1,
+	}, {
+		.alg = "authenc(hmac(sha512),cbc(aes))",
+		.fips_allowed = 1,
+		.test = alg_test_aead,
+		.suite = {
+			.aead = {
+				.enc = {
+					.vecs =
+					hmac_sha512_aes_cbc_enc_tv_temp,
+					.count =
+					HMAC_SHA512_AES_CBC_ENC_TEST_VEC
+				}
+			}
+		}
+	}, {
+		.alg = "authenc(hmac(sha512),cbc(des))",
+		.test = alg_test_aead,
+		.suite = {
+			.aead = {
+				.enc = {
+					.vecs =
+					hmac_sha512_des_cbc_enc_tv_temp,
+					.count =
+					HMAC_SHA512_DES_CBC_ENC_TEST_VEC
+				}
+			}
+		}
+	}, {
+		.alg = "authenc(hmac(sha512),cbc(des3_ede))",
+		.test = alg_test_aead,
+		.fips_allowed = 1,
+		.suite = {
+			.aead = {
+				.enc = {
+					.vecs =
+					hmac_sha512_des3_ede_cbc_enc_tv_temp,
+					.count =
+					HMAC_SHA512_DES3_EDE_CBC_ENC_TEST_VEC
+				}
+			}
+		}
+	}, {
+		.alg = "authenc(hmac(sha512),ctr(aes))",
+		.test = alg_test_null,
+		.fips_allowed = 1,
 	}, {
 		.alg = "cbc(aes)",
 		.test = alg_test_skcipher,
@@ -2458,6 +2786,16 @@ static const struct alg_test_desc alg_test_descs[] = {
 			}
 		}
 	}, {
+		.alg = "dh",
+		.test = alg_test_kpp,
+		.fips_allowed = 1,
+		.suite = {
+			.kpp = {
+				.vecs = dh_tv_template,
+				.count = DH_TEST_VECTORS
+			}
+		}
+	}, {
 		.alg = "digest_null",
 		.test = alg_test_null,
 	}, {
@@ -2723,7 +3061,6 @@ static const struct alg_test_desc alg_test_descs[] = {
 	}, {
 		.alg = "ecb(des)",
 		.test = alg_test_skcipher,
-		.fips_allowed = 1,
 		.suite = {
 			.cipher = {
 				.enc = {
@@ -2885,6 +3222,16 @@ static const struct alg_test_desc alg_test_descs[] = {
 					.vecs = xtea_dec_tv_template,
 					.count = XTEA_DEC_TEST_VECTORS
 				}
+			}
+		}
+	}, {
+		.alg = "ecdh",
+		.test = alg_test_kpp,
+		.fips_allowed = 1,
+		.suite = {
+			.kpp = {
+				.vecs = ecdh_tv_template,
+				.count = ECDH_TEST_VECTORS
 			}
 		}
 	}, {
@@ -3560,8 +3907,8 @@ test_done:
 		panic("%s: %s alg self test failed in fips mode!\n", driver, alg);
 
 	if (fips_enabled && !rc)
-		printk(KERN_INFO "alg: self-tests for %s (%s) passed\n",
-		       driver, alg);
+		pr_info(KERN_INFO "alg: self-tests for %s (%s) passed\n",
+			driver, alg);
 
 	return rc;
 

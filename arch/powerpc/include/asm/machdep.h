@@ -61,6 +61,7 @@ struct machdep_calls {
 					       unsigned long addr,
 					       unsigned char *hpte_slot_array,
 					       int psize, int ssize);
+	int		(*resize_hpt)(unsigned long shift);
 	/* special for kexec, to be called in real mode, linear mapping is
 	 * destroyed as well */
 	void		(*hpte_clear_all)(void);
@@ -251,10 +252,6 @@ struct machdep_calls {
 
 #ifdef CONFIG_ARCH_RANDOM
 	int (*get_random_long)(unsigned long *v);
-#endif
-
-#ifdef CONFIG_MEMORY_HOTREMOVE
-	int (*remove_memory)(u64, u64);
 #endif
 };
 

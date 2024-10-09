@@ -131,7 +131,7 @@ extern struct sctp_globals {
 	/* This is the sctp port control hash.	*/
 	struct sctp_bind_hashbucket *port_hashtable;
 	/* This is the hash of all transports. */
-	struct rhashtable transport_hashtable;
+	struct rhltable transport_hashtable;
 
 	/* Sizes of above hashtables. */
 	int ep_hashsize;
@@ -214,7 +214,9 @@ struct sctp_sock {
 	struct sctp_paddrparams paddrparam;
 	struct sctp_event_subscribe subscribe;
 	struct sctp_assocparams assocparams;
+
 	int user_frag;
+
 	__u32 autoclose;
 	__u32 adaptation_ind;
 	__u32 pd_point;
@@ -222,8 +224,8 @@ struct sctp_sock {
 		disable_fragments:1,
 		v4mapped:1,
 		frag_interleave:1,
-		_reserved1:1,
-		_reserved2:1,
+		recvrcvinfo:1,
+		recvnxtinfo:1,
 		data_ready_signalled:1;
 
 	atomic_t pd_mode;
@@ -535,13 +537,13 @@ struct sctp_datamsg {
 	/* Did the messenge fail to send? */
 	int send_error;
 	u8 send_failed:1,
-	   can_abandon:1,   /* can chunks from this message can be abandoned. */
 	   can_delay;	    /* should this message be Nagle delayed */
 };
 
 struct sctp_datamsg *sctp_datamsg_from_user(struct sctp_association *,
 					    struct sctp_sndrcvinfo *,
 					    struct msghdr *, int len);
+void sctp_datamsg_free(struct sctp_datamsg *);
 void sctp_datamsg_put(struct sctp_datamsg *);
 void sctp_chunk_fail(struct sctp_chunk *, int error);
 int sctp_chunk_abandoned(struct sctp_chunk *);
@@ -766,7 +768,7 @@ static inline int sctp_packet_empty(struct sctp_packet *packet)
 struct sctp_transport {
 	/* A list of transports. */
 	struct list_head transports;
-	struct rhash_head node;
+	struct rhlist_head node;
 
 	/* Reference counting. */
 	atomic_t refcnt;
@@ -841,6 +843,8 @@ struct sctp_transport {
 	__u32 flight_size;
 
 	__u32 burst_limited;	/* Holds old cwnd when max.burst is applied */
+
+	__u32 dst_pending_confirm;	/* need to confirm neighbour */
 
 	/* Destination */
 	struct dst_entry *dst;
@@ -982,9 +986,11 @@ void sctp_transport_lower_cwnd(struct sctp_transport *, sctp_lower_cwnd_t);
 void sctp_transport_burst_limited(struct sctp_transport *);
 void sctp_transport_burst_reset(struct sctp_transport *);
 unsigned long sctp_transport_timeout(struct sctp_transport *);
-void sctp_transport_reset(struct sctp_transport *);
-void sctp_transport_update_pmtu(struct sock *, struct sctp_transport *, u32);
+void sctp_transport_reset(struct sctp_transport *t);
+void sctp_transport_update_pmtu(struct sctp_transport *t, u32 pmtu);
 void sctp_transport_immediate_rtx(struct sctp_transport *);
+void sctp_transport_dst_release(struct sctp_transport *t);
+void sctp_transport_dst_confirm(struct sctp_transport *t);
 
 
 /* This is the structure we use to queue packets as they come into
@@ -1950,7 +1956,7 @@ void sctp_assoc_update(struct sctp_association *old,
 
 __u32 sctp_association_get_next_tsn(struct sctp_association *);
 
-void sctp_assoc_sync_pmtu(struct sock *, struct sctp_association *);
+void sctp_assoc_sync_pmtu(struct sctp_association *asoc);
 void sctp_assoc_rwnd_increase(struct sctp_association *, unsigned int);
 void sctp_assoc_rwnd_decrease(struct sctp_association *, unsigned int);
 void sctp_assoc_set_primary(struct sctp_association *,
@@ -1976,7 +1982,8 @@ struct sctp_chunk *sctp_get_ecne_prepend(struct sctp_association *asoc);
 /* A convenience structure to parse out SCTP specific CMSGs. */
 typedef struct sctp_cmsgs {
 	struct sctp_initmsg *init;
-	struct sctp_sndrcvinfo *info;
+	struct sctp_sndrcvinfo *srinfo;
+	struct sctp_sndinfo *sinfo;
 } sctp_cmsgs_t;
 
 /* Structure for tracking memory objects */

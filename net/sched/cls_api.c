@@ -133,7 +133,6 @@ static int tc_ctl_tfilter(struct sk_buff *skb, struct nlmsghdr *n)
 {
 	struct net *net = sock_net(skb->sk);
 	struct nlattr *tca[TCA_MAX + 1];
-	spinlock_t *root_lock;
 	struct tcmsg *t;
 	u32 protocol;
 	u32 prio;
@@ -141,7 +140,8 @@ static int tc_ctl_tfilter(struct sk_buff *skb, struct nlmsghdr *n)
 	u32 parent;
 	struct net_device *dev;
 	struct Qdisc  *q;
-	struct tcf_proto **back, **chain;
+	struct tcf_proto __rcu **back;
+	struct tcf_proto __rcu **chain;
 	struct tcf_proto *tp;
 	const struct tcf_proto_ops *tp_ops;
 	const struct Qdisc_class_ops *cops;
@@ -230,7 +230,9 @@ replay:
 	}
 
 	/* Check the chain for existence of proto-tcf with this priority */
-	for (back = chain; (tp = *back) != NULL; back = &tp->next) {
+	for (back = chain;
+	     (tp = rtnl_dereference(*back)) != NULL;
+	     back = &tp->next) {
 		if (tp->prio >= prio) {
 			if (tp->prio == prio) {
 				if (!nprio ||
@@ -241,8 +243,6 @@ replay:
 			break;
 		}
 	}
-
-	root_lock = qdisc_root_sleeping_lock(q);
 
 	if (tp == NULL) {
 		/* Proto-tcf does not exist, create new one */
@@ -292,7 +292,8 @@ replay:
 		}
 		tp->ops = tp_ops;
 		tp->protocol = protocol;
-		tp->prio = nprio ? : TC_H_MAJ(tcf_auto_prio(*back));
+		tp->prio = nprio ? :
+			       TC_H_MAJ(tcf_auto_prio(rtnl_dereference(*back)));
 		tp->q = q;
 		tp->classify = tp_ops->classify;
 		tp->classid = parent;
@@ -313,12 +314,12 @@ replay:
 
 	if (fh == 0) {
 		if (n->nlmsg_type == RTM_DELTFILTER && t->tcm_handle == 0) {
-			spin_lock_bh(root_lock);
-			*back = tp->next;
-			spin_unlock_bh(root_lock);
+			struct tcf_proto *next = rtnl_dereference(tp->next);
+
+			RCU_INIT_POINTER(*back, next);
 
 			tfilter_notify(net, skb, n, tp, fh, RTM_DELTFILTER);
-			tcf_destroy(tp);
+			tcf_destroy(tp, true);
 			err = 0;
 			goto errout;
 		}
@@ -333,17 +334,24 @@ replay:
 			err = -EEXIST;
 			if (n->nlmsg_flags & NLM_F_EXCL) {
 				if (tp_created)
-					tcf_destroy(tp);
+					tcf_destroy(tp, true);
 				goto errout;
 			}
 			break;
 		case RTM_DELTFILTER:
 			err = tp->ops->delete(tp, fh);
-			if (err == 0)
-				tfilter_notify(net, skb, n, tp, fh, RTM_DELTFILTER);
+			if (err == 0) {
+				struct tcf_proto *next = rtnl_dereference(tp->next);
+
+				tfilter_notify(net, skb, n, tp, fh,
+					       RTM_DELTFILTER);
+				if (tcf_destroy(tp, false))
+					RCU_INIT_POINTER(*back, next);
+			}
 			goto errout;
 		case RTM_GETTFILTER:
-			err = tfilter_notify(net, skb, n, tp, fh, RTM_NEWTFILTER);
+			err = tfilter_notify(net, skb, n, tp, fh,
+					     RTM_NEWTFILTER);
 			goto errout;
 		default:
 			err = -EINVAL;
@@ -355,15 +363,13 @@ replay:
 			      n->nlmsg_flags & NLM_F_CREATE ? TCA_ACT_NOREPLACE : TCA_ACT_REPLACE);
 	if (err == 0) {
 		if (tp_created) {
-			spin_lock_bh(root_lock);
-			tp->next = *back;
-			*back = tp;
-			spin_unlock_bh(root_lock);
+			RCU_INIT_POINTER(tp->next, rtnl_dereference(*back));
+			rcu_assign_pointer(*back, tp);
 		}
 		tfilter_notify(net, skb, n, tp, fh, RTM_NEWTFILTER);
 	} else {
 		if (tp_created)
-			tcf_destroy(tp);
+			tcf_destroy(tp, true);
 	}
 
 errout:
@@ -375,8 +381,9 @@ errout:
 	return err;
 }
 
-static int tcf_fill_node(struct net *net, struct sk_buff *skb, struct tcf_proto *tp,
-			 unsigned long fh, u32 portid, u32 seq, u16 flags, int event)
+static int tcf_fill_node(struct net *net, struct sk_buff *skb,
+			 struct tcf_proto *tp, unsigned long fh, u32 portid,
+			 u32 seq, u16 flags, int event)
 {
 	struct tcmsg *tcm;
 	struct nlmsghdr  *nlh;
@@ -442,7 +449,8 @@ static int tcf_node_dump(struct tcf_proto *tp, unsigned long n,
 	struct net *net = sock_net(a->skb->sk);
 
 	return tcf_fill_node(net, a->skb, tp, n, NETLINK_CB(a->cb->skb).portid,
-			     a->cb->nlh->nlmsg_seq, NLM_F_MULTI, RTM_NEWTFILTER);
+			     a->cb->nlh->nlmsg_seq, NLM_F_MULTI,
+			     RTM_NEWTFILTER);
 }
 
 /* called with RTNL */
@@ -453,7 +461,7 @@ static int tc_dump_tfilter(struct sk_buff *skb, struct netlink_callback *cb)
 	int s_t;
 	struct net_device *dev;
 	struct Qdisc *q;
-	struct tcf_proto *tp, **chain;
+	struct tcf_proto *tp, __rcu **chain;
 	struct tcmsg *tcm = nlmsg_data(cb->nlh);
 	unsigned long cl = 0;
 	const struct Qdisc_class_ops *cops;
@@ -487,7 +495,8 @@ static int tc_dump_tfilter(struct sk_buff *skb, struct netlink_callback *cb)
 
 	s_t = cb->args[0];
 
-	for (tp = *chain, t = 0; tp; tp = tp->next, t++) {
+	for (tp = rtnl_dereference(*chain), t = 0;
+	     tp; tp = rtnl_dereference(tp->next), t++) {
 		if (t < s_t)
 			continue;
 		if (TC_H_MAJ(tcm->tcm_info) &&
@@ -497,9 +506,11 @@ static int tc_dump_tfilter(struct sk_buff *skb, struct netlink_callback *cb)
 		    TC_H_MIN(tcm->tcm_info) != tp->protocol)
 			continue;
 		if (t > s_t)
-			memset(&cb->args[1], 0, sizeof(cb->args)-sizeof(cb->args[0]));
+			memset(&cb->args[1], 0,
+			       sizeof(cb->args)-sizeof(cb->args[0]));
 		if (cb->args[1] == 0) {
-			if (tcf_fill_node(net, skb, tp, 0, NETLINK_CB(cb->skb).portid,
+			if (tcf_fill_node(net, skb, tp, 0,
+					  NETLINK_CB(cb->skb).portid,
 					  cb->nlh->nlmsg_seq, NLM_F_MULTI,
 					  RTM_NEWTFILTER) <= 0)
 				break;
@@ -539,7 +550,7 @@ void tcf_exts_destroy(struct tcf_exts *exts)
 EXPORT_SYMBOL(tcf_exts_destroy);
 
 int tcf_exts_validate(struct net *net, struct tcf_proto *tp, struct nlattr **tb,
-		  struct nlattr *rate_tlv, struct tcf_exts *exts, bool ovr)
+		      struct nlattr *rate_tlv, struct tcf_exts *exts, bool ovr)
 {
 #ifdef CONFIG_NET_CLS_ACT
 	{
@@ -548,8 +559,7 @@ int tcf_exts_validate(struct net *net, struct tcf_proto *tp, struct nlattr **tb,
 		INIT_LIST_HEAD(&exts->actions);
 		if (exts->police && tb[exts->police]) {
 			act = tcf_action_init_1(net, tb[exts->police], rate_tlv,
-						"police", ovr,
-						TCA_ACT_BIND);
+						"police", ovr, TCA_ACT_BIND);
 			if (IS_ERR(act))
 				return PTR_ERR(act);
 
@@ -558,8 +568,8 @@ int tcf_exts_validate(struct net *net, struct tcf_proto *tp, struct nlattr **tb,
 		} else if (exts->action && tb[exts->action]) {
 			int err;
 			err = tcf_action_init(net, tb[exts->action], rate_tlv,
-					      NULL, ovr,
-					      TCA_ACT_BIND, &exts->actions);
+					      NULL, ovr, TCA_ACT_BIND,
+					      &exts->actions);
 			if (err)
 				return err;
 		}
@@ -638,6 +648,28 @@ int tcf_exts_dump_stats(struct sk_buff *skb, struct tcf_exts *exts)
 	return 0;
 }
 EXPORT_SYMBOL(tcf_exts_dump_stats);
+
+int tcf_exts_get_dev(struct net_device *dev, struct tcf_exts *exts,
+		     struct net_device **hw_dev)
+{
+#ifdef CONFIG_NET_CLS_ACT
+	const struct tc_action *a;
+
+	if (tc_no_actions(exts))
+		return -EINVAL;
+
+	list_for_each_entry(a, &exts->actions, list) {
+		if (a->ops->get_dev) {
+			a->ops->get_dev(a, dev_net(dev), hw_dev);
+			break;
+		}
+	}
+	if (*hw_dev)
+		return 0;
+#endif
+	return -EOPNOTSUPP;
+}
+EXPORT_SYMBOL(tcf_exts_get_dev);
 
 static int __init tc_filter_init(void)
 {

@@ -4164,7 +4164,7 @@ void debug_show_all_locks(void)
 	 * tasklist_lock-holding task deadlocks or crashes.
 	 */
 retry:
-	if (!read_trylock(&tasklist_lock)) {
+	if (!qread_trylock(&tasklist_lock)) {
 		if (count == 10)
 			printk("hm, tasklist_lock locked, retrying... ");
 		if (count) {
@@ -4191,7 +4191,7 @@ retry:
 		if (p->lockdep_depth)
 			lockdep_print_held_locks(p);
 		if (!unlock)
-			if (read_trylock(&tasklist_lock))
+			if (qread_trylock(&tasklist_lock))
 				unlock = 1;
 	} while_each_thread(g, p);
 
@@ -4199,7 +4199,7 @@ retry:
 	printk("=============================================\n\n");
 
 	if (unlock)
-		read_unlock(&tasklist_lock);
+		qread_unlock(&tasklist_lock);
 }
 EXPORT_SYMBOL_GPL(debug_show_all_locks);
 

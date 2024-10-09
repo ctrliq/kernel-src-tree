@@ -187,6 +187,8 @@ struct user_sdma_iovec {
 	struct sdma_mmu_node *node;
 };
 
+#define SDMA_CACHE_NODE_EVICT 0
+
 struct sdma_mmu_node {
 	struct mmu_rb_node rb;
 	struct hfi1_user_sdma_pkt_q *pq;

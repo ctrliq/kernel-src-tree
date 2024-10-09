@@ -413,18 +413,22 @@ static int xdr_decode(nfs_readdir_descriptor_t *desc,
 static
 int nfs_same_file(struct dentry *dentry, struct nfs_entry *entry)
 {
+	struct inode *inode;
 	struct nfs_inode *nfsi;
 
 	if (dentry->d_inode == NULL)
-		goto different;
+		return 0;
 
-	nfsi = NFS_I(dentry->d_inode);
-	if (entry->fattr->fileid == nfsi->fileid)
-		return 1;
-	if (nfs_compare_fh(entry->fh, &nfsi->fh) == 0)
-		return 1;
-different:
-	return 0;
+	inode = dentry->d_inode;
+	if (is_bad_inode(inode) || NFS_STALE(inode))
+		return 0;
+
+	nfsi = NFS_I(inode);
+	if (entry->fattr->fileid != nfsi->fileid)
+		return 0;
+	if (entry->fh->size && nfs_compare_fh(entry->fh, &nfsi->fh) != 0)
+		return 0;
+	return 1;
 }
 
 static
@@ -440,14 +444,17 @@ bool nfs_use_readdirplus(struct inode *dir, struct file *filp)
 }
 
 /*
- * This function is called by the lookup code to request the use of
- * readdirplus to accelerate any future lookups in the same
+ * This function is called by the lookup and getattr code to request the
+ * use of readdirplus to accelerate any future lookups in the same
  * directory.
  */
-static
 void nfs_advise_use_readdirplus(struct inode *dir)
 {
-	set_bit(NFS_INO_ADVISE_RDPLUS, &NFS_I(dir)->flags);
+	struct nfs_inode *nfsi = NFS_I(dir);
+
+	if (nfs_server_capable(dir, NFS_CAP_READDIRPLUS) &&
+	    !list_empty(&nfsi->open_files))
+		set_bit(NFS_INO_ADVISE_RDPLUS, &nfsi->flags);
 }
 
 /*
@@ -460,9 +467,12 @@ void nfs_advise_use_readdirplus(struct inode *dir)
  */
 void nfs_force_use_readdirplus(struct inode *dir)
 {
-	if (!list_empty(&NFS_I(dir)->open_files)) {
-		nfs_advise_use_readdirplus(dir);
-		nfs_zap_mapping(dir, dir->i_mapping);
+	struct nfs_inode *nfsi = NFS_I(dir);
+
+	if (nfs_server_capable(dir, NFS_CAP_READDIRPLUS) &&
+	    !list_empty(&nfsi->open_files)) {
+		set_bit(NFS_INO_ADVISE_RDPLUS, &nfsi->flags);
+		invalidate_mapping_pages(dir->i_mapping, 0, -1);
 	}
 }
 
@@ -495,6 +505,8 @@ void nfs_prime_dcache(struct dentry *parent, struct nfs_entry *entry)
 					&entry->fattr->fsid))
 			goto out;
 		if (nfs_same_file(dentry, entry)) {
+			if (!entry->fh->size)
+				goto out;
 			nfs_set_verifier(dentry, nfs_save_change_attribute(dir));
 			status = nfs_refresh_inode(dentry->d_inode, entry->fattr);
 			if (!status)
@@ -506,6 +518,8 @@ void nfs_prime_dcache(struct dentry *parent, struct nfs_entry *entry)
 			dput(dentry);
 		}
 	}
+	if (!entry->fh->size)
+		goto out;
 
 	dentry = d_alloc(parent, &filename);
 	if (dentry == NULL)
@@ -851,17 +865,6 @@ int uncached_readdir(nfs_readdir_descriptor_t *desc, void *dirent,
 	goto out;
 }
 
-static bool nfs_dir_mapping_need_revalidate(struct inode *dir)
-{
-	struct nfs_inode *nfsi = NFS_I(dir);
-
-	if (nfs_attribute_cache_expired(dir))
-		return true;
-	if (nfsi->cache_validity & NFS_INO_INVALID_DATA)
-		return true;
-	return false;
-}
-
 /* The file offset position represents the dirent entry number.  A
    last cookie cache takes care of the common case of reading the
    whole directory.
@@ -893,7 +896,7 @@ static int nfs_readdir(struct file *filp, void *dirent, filldir_t filldir)
 	desc->plus = nfs_use_readdirplus(inode, filp) ? 1 : 0;
 
 	nfs_block_sillyrename(dentry);
-	if (filp->f_pos == 0 || nfs_dir_mapping_need_revalidate(inode))
+	if (filp->f_pos == 0 || nfs_attribute_cache_expired(inode))
 		res = nfs_revalidate_mapping(inode, filp->f_mapping);
 	if (res < 0)
 		goto out;
@@ -1132,7 +1135,7 @@ static int nfs_lookup_revalidate(struct dentry *dentry, unsigned int flags)
 				return -ECHILD;
 			goto out_bad;
 		}
-		goto out_valid_noent;
+		goto out_valid;
 	}
 
 	if (is_bad_inode(inode)) {
@@ -1155,6 +1158,7 @@ static int nfs_lookup_revalidate(struct dentry *dentry, unsigned int flags)
 				return -ECHILD;
 			goto out_zap_parent;
 		}
+		nfs_advise_use_readdirplus(dir);
 		goto out_valid;
 	}
 
@@ -1190,12 +1194,12 @@ static int nfs_lookup_revalidate(struct dentry *dentry, unsigned int flags)
 	nfs_free_fhandle(fhandle);
 	nfs4_label_free(label);
 
+	/* set a readdirplus hint that we had a cache miss */
+	nfs_force_use_readdirplus(dir);
+
 out_set_verifier:
 	nfs_set_verifier(dentry, nfs_save_change_attribute(dir));
  out_valid:
-	/* Success: notify readdir to use READDIRPLUS */
-	nfs_advise_use_readdirplus(dir);
- out_valid_noent:
 	if (flags & LOOKUP_RCU) {
 		if (parent != ACCESS_ONCE(dentry->d_parent))
 			return -ECHILD;
@@ -1224,10 +1228,6 @@ out_zap_parent:
 		if (IS_ROOT(dentry))
 			goto out_valid;
 	}
-	/* If we have submounts, don't unhash ! */
-	if (check_submounts_and_drop(dentry) != 0)
-		goto out_valid;
-
 	dput(parent);
 	dfprintk(LOOKUPCACHE, "NFS: %s(%pd2) is invalid\n",
 			__func__, dentry);
@@ -1407,8 +1407,8 @@ struct dentry *nfs_lookup(struct inode *dir, struct dentry * dentry, unsigned in
 	if (IS_ERR(res))
 		goto out_unblock_sillyrename;
 
-	/* Success: notify readdir to use READDIRPLUS */
-	nfs_advise_use_readdirplus(dir);
+	/* Notify readdir to use READDIRPLUS */
+	nfs_force_use_readdirplus(dir);
 
 no_entry:
 	res = d_materialise_unique(dentry, inode);
@@ -1517,8 +1517,13 @@ int nfs_atomic_open(struct inode *dir, struct dentry *dentry,
 		return -ENAMETOOLONG;
 
 	if (open_flags & O_CREAT) {
+		struct nfs_server *server = NFS_SERVER(dir);
+
+		if (!(server->attr_bitmask[2] & FATTR4_WORD2_MODE_UMASK))
+			mode &= ~current_umask();
+
 		attr.ia_valid |= ATTR_MODE;
-		attr.ia_mode = mode & ~current_umask();
+		attr.ia_mode = mode;
 	}
 	if (open_flags & O_TRUNC) {
 		attr.ia_valid |= ATTR_SIZE;
@@ -1966,29 +1971,6 @@ nfs_link(struct dentry *old_dentry, struct inode *dir, struct dentry *dentry)
 }
 EXPORT_SYMBOL_GPL(nfs_link);
 
-static void
-nfs_complete_rename(struct rpc_task *task, struct nfs_renamedata *data)
-{
-	struct dentry *old_dentry = data->old_dentry;
-	struct dentry *new_dentry = data->new_dentry;
-	struct inode *old_inode = d_inode(old_dentry);
-	struct inode *new_inode = d_inode(new_dentry);
-
-	nfs_mark_for_revalidate(old_inode);
-
-	switch (task->tk_status) {
-	case 0:
-		if (new_inode != NULL)
-			nfs_drop_nlink(new_inode);
-		d_move(old_dentry, new_dentry);
-		nfs_set_verifier(new_dentry,
-					nfs_save_change_attribute(data->new_dir));
-		break;
-	case -ENOENT:
-		nfs_dentry_handle_enoent(old_dentry);
-	}
-}
-
 /*
  * RENAME
  * FIXME: Some nfsds, like the Linux user space nfsd, may generate a
@@ -2067,8 +2049,7 @@ int nfs_rename(struct inode *old_dir, struct dentry *old_dentry,
 	if (new_inode != NULL)
 		NFS_PROTO(new_inode)->return_delegation(new_inode);
 
-	task = nfs_async_rename(old_dir, new_dir, old_dentry, new_dentry,
-					nfs_complete_rename);
+	task = nfs_async_rename(old_dir, new_dir, old_dentry, new_dentry, NULL);
 	if (IS_ERR(task)) {
 		error = PTR_ERR(task);
 		goto out;
@@ -2082,11 +2063,27 @@ int nfs_rename(struct inode *old_dir, struct dentry *old_dentry,
 	} else
 		error = task->tk_status;
 	rpc_put_task(task);
+	nfs_mark_for_revalidate(old_inode);
 out:
 	if (rehash)
 		d_rehash(rehash);
 	trace_nfs_rename_exit(old_dir, old_dentry,
 			new_dir, new_dentry, error);
+	if (!error) {
+		if (new_inode != NULL)
+			nfs_drop_nlink(new_inode);
+		/*
+		 * The d_move() should be here instead of in an async RPC completion
+		 * handler because we need the proper locks to move the dentry.  If
+		 * we're interrupted by a signal, the async RPC completion handler
+		 * should mark the directories for revalidation.
+		 */
+		d_move(old_dentry, new_dentry);
+		nfs_set_verifier(new_dentry,
+					nfs_save_change_attribute(new_dir));
+	} else if (error == -ENOENT)
+		nfs_dentry_handle_enoent(old_dentry);
+
 	/* new dentry created? */
 	if (dentry)
 		dput(dentry);

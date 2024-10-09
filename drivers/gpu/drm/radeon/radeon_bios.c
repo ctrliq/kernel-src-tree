@@ -601,8 +601,9 @@ static bool radeon_acpi_vfct_bios(struct radeon_device *rdev)
 	UEFI_ACPI_VFCT *vfct;
 	unsigned offset;
 
-	if (!ACPI_SUCCESS(acpi_get_table_with_size("VFCT", 1, &hdr, &tbl_size)))
+	if (!ACPI_SUCCESS(acpi_get_table("VFCT", 1, &hdr)))
 		return false;
+	tbl_size = hdr->length;
 	if (tbl_size < sizeof(UEFI_ACPI_VFCT)) {
 		DRM_ERROR("ACPI VFCT table present but broken (too short #1)\n");
 		return false;

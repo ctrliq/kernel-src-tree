@@ -105,12 +105,16 @@ ENTRY(startup_32)
 	addl	%eax, %ebx
 	notl	%eax
 	andl	%eax, %ebx
-#else
-	movl	$LOAD_PHYSICAL_ADDR, %ebx
+	cmpl	$LOAD_PHYSICAL_ADDR, %ebx
+	jge	1f
 #endif
+	movl	$LOAD_PHYSICAL_ADDR, %ebx
+1:
 
 	/* Target address to relocate to for decompression */
-	addl	$z_extract_offset, %ebx
+	movl	BP_init_size(%esi), %eax
+	subl	$_end, %eax
+	addl	%eax, %ebx
 
 /*
  * Prepare for entering 64 bit mode
@@ -132,7 +136,7 @@ ENTRY(startup_32)
 	/* Initialize Page tables to 0 */
 	leal	pgtable(%ebx), %edi
 	xorl	%eax, %eax
-	movl	$((4096*6)/4), %ecx
+	movl	$(BOOT_INIT_PGT_SIZE/4), %ecx
 	rep	stosl
 
 	/* Build Level 4 */
@@ -331,12 +335,16 @@ preferred_addr:
 	addq	%rax, %rbp
 	notq	%rax
 	andq	%rax, %rbp
-#else
-	movq	$LOAD_PHYSICAL_ADDR, %rbp
+	cmpq	$LOAD_PHYSICAL_ADDR, %rbp
+	jge	1f
 #endif
+	movq	$LOAD_PHYSICAL_ADDR, %rbp
+1:
 
 	/* Target address to relocate to for decompression */
-	leaq	z_extract_offset(%rbp), %rbx
+	movl	BP_init_size(%rsi), %ebx
+	subl	$_end, %ebx
+	addq	%rbp, %rbx
 
 	/* Set up the stack */
 	leaq	boot_stack_end(%rbx), %rsp
@@ -406,7 +414,7 @@ relocated:
 2:
 	
 /*
- * Do the decompression, and jump to the new kernel..
+ * Do the extraction, and jump to the new kernel..
  */
 	pushq	%rsi			/* Save the real mode argument */
 	movq	%rsi, %rdi		/* real mode address */
@@ -414,14 +422,14 @@ relocated:
 	leaq	input_data(%rip), %rdx  /* input_data */
 	movl	$z_input_len, %ecx	/* input_len */
 	movq	%rbp, %r8		/* output target address */
-	movq	$z_output_len, %r9	/* decompressed length */
-	call	decompress_kernel
+	movq	$z_output_len, %r9	/* decompressed length, end of relocs */
+	call	extract_kernel		/* returns kernel location in %rax */
 	popq	%rsi
 
 /*
  * Jump to the decompressed kernel.
  */
-	jmp	*%rbp
+	jmp	*%rax
 
 	.code32
 no_longmode:
@@ -482,4 +490,4 @@ boot_stack_end:
 	.section ".pgtable","a",@nobits
 	.balign 4096
 pgtable:
-	.fill 6*4096, 1, 0
+	.fill BOOT_PGT_SIZE, 1, 0

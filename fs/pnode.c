@@ -200,7 +200,7 @@ static struct mount *next_group(struct mount *m, struct mount *origin)
 static struct user_namespace *user_ns;
 static struct mount *last_dest, *first_source, *last_source, *dest_master;
 static struct mountpoint *mp;
-static struct list_head *list;
+static struct hlist_head *list;
 
 static inline bool peers(struct mount *m1, struct mount *m2)
 {
@@ -254,11 +254,11 @@ static int propagate_one(struct mount *m)
 	last_dest = m;
 	last_source = child;
 	if (m->mnt_master != dest_master) {
-		br_read_lock(&vfsmount_lock);
+		read_seqlock_excl(&mount_lock);
 		SET_MNT_MARK(m->mnt_master);
-		br_read_unlock(&vfsmount_lock);
+		read_sequnlock_excl(&mount_lock);
 	}
-	list_add_tail(&child->mnt_hash, list);
+	hlist_add_head(&child->mnt_hash, list);
 	return 0;
 }
 
@@ -276,7 +276,7 @@ static int propagate_one(struct mount *m)
  * @tree_list : list of heads of trees to be attached.
  */
 int propagate_mnt(struct mount *dest_mnt, struct mountpoint *dest_mp,
-		    struct mount *source_mnt, struct list_head *tree_list)
+		    struct mount *source_mnt, struct hlist_head *tree_list)
 {
 	struct mount *m, *n;
 	int ret = 0;
@@ -314,13 +314,13 @@ int propagate_mnt(struct mount *dest_mnt, struct mountpoint *dest_mp,
 		} while (n != m);
 	}
 out:
-	br_read_lock(&vfsmount_lock);
-	list_for_each_entry(n, tree_list, mnt_hash) {
+	read_seqlock_excl(&mount_lock);
+	hlist_for_each_entry(n, tree_list, mnt_hash) {
 		m = n->mnt_parent;
 		if (m->mnt_master != dest_mnt->mnt_master)
 			CLEAR_MNT_MARK(m->mnt_master);
 	}
-	br_read_unlock(&vfsmount_lock);
+	read_sequnlock_excl(&mount_lock);
 	return ret;
 }
 
@@ -370,6 +370,46 @@ int propagate_mount_busy(struct mount *mnt, int refcnt)
 }
 
 /*
+ * Clear MNT_LOCKED when it can be shown to be safe.
+ *
+ * mount_lock lock must be held for write
+ */
+void propagate_mount_unlock(struct mount *mnt)
+{
+	struct mount *parent = mnt->mnt_parent;
+	struct mount *m, *child;
+
+	BUG_ON(parent == mnt);
+
+	for (m = propagation_next(parent, parent); m;
+			m = propagation_next(m, parent)) {
+		child = __lookup_mnt_last(&m->mnt, mnt->mnt_mountpoint);
+		if (child)
+			child->mnt.mnt_flags &= ~MNT_LOCKED;
+	}
+}
+
+/*
+ * Mark all mounts that the MNT_LOCKED logic will allow to be unmounted.
+ */
+static void mark_umount_candidates(struct mount *mnt)
+{
+	struct mount *parent = mnt->mnt_parent;
+	struct mount *m;
+
+	BUG_ON(parent == mnt);
+
+	for (m = propagation_next(parent, parent); m;
+			m = propagation_next(m, parent)) {
+		struct mount *child = __lookup_mnt_last(&m->mnt,
+						mnt->mnt_mountpoint);
+		if (child && (!IS_MNT_LOCKED(child) || IS_MNT_MARKED(m))) {
+			SET_MNT_MARK(child);
+		}
+	}
+}
+
+/*
  * NOTE: unmounting 'mnt' naturally propagates to all other mounts its
  * parent propagates to.
  */
@@ -386,11 +426,17 @@ static void __propagate_umount(struct mount *mnt)
 		struct mount *child = __lookup_mnt_last(&m->mnt,
 						mnt->mnt_mountpoint);
 		/*
-		 * umount the child only if the child has no
-		 * other children
+		 * umount the child only if the child has no children
+		 * and the child is marked safe to unmount.
 		 */
-		if (child && list_empty(&child->mnt_mounts))
-			list_move_tail(&child->mnt_hash, &mnt->mnt_hash);
+		if (!child || !IS_MNT_MARKED(child))
+			continue;
+		CLEAR_MNT_MARK(child);
+		if (list_empty(&child->mnt_mounts)) {
+			list_del_init(&child->mnt_child);
+			child->mnt.mnt_flags |= MNT_UMOUNT;
+			list_move_tail(&child->mnt_list, &mnt->mnt_list);
+		}
 	}
 }
 
@@ -405,7 +451,10 @@ int propagate_umount(struct list_head *list)
 {
 	struct mount *mnt;
 
-	list_for_each_entry(mnt, list, mnt_hash)
+	list_for_each_entry_reverse(mnt, list, mnt_list)
+		mark_umount_candidates(mnt);
+
+	list_for_each_entry(mnt, list, mnt_list)
 		__propagate_umount(mnt);
 	return 0;
 }

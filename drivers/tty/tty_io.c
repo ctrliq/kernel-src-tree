@@ -509,7 +509,7 @@ void proc_clear_tty(struct task_struct *p)
  * a controlling terminal.
  *
  * Caller must hold:  tty_lock()
- *		      a readlock on tasklist_lock
+ *		      a qreadlock on tasklist_lock
  *		      sighand lock
  */
 static void __proc_set_tty(struct tty_struct *tty)
@@ -606,7 +606,7 @@ static int tty_signal_session_leader(struct tty_struct *tty, int exit_session)
 	int refs = 0;
 	struct pid *tty_pgrp = NULL;
 
-	read_lock(&tasklist_lock);
+	qread_lock(&tasklist_lock);
 	if (tty->session) {
 		do_each_pid_task(tty->session, PIDTYPE_SID, p) {
 			spin_lock_irq(&p->sighand->siglock);
@@ -631,7 +631,7 @@ static int tty_signal_session_leader(struct tty_struct *tty, int exit_session)
 			spin_unlock_irq(&p->sighand->siglock);
 		} while_each_pid_task(tty->session, PIDTYPE_SID, p);
 	}
-	read_unlock(&tasklist_lock);
+	qread_unlock(&tasklist_lock);
 
 	if (tty_pgrp) {
 		if (exit_session)
@@ -938,9 +938,9 @@ void disassociate_ctty(int on_exit)
 	}
 
 	/* Now clear signal->tty under the lock */
-	read_lock(&tasklist_lock);
+	qread_lock(&tasklist_lock);
 	session_clear_tty(task_session(current));
-	read_unlock(&tasklist_lock);
+	qread_unlock(&tasklist_lock);
 }
 
 /**
@@ -1851,11 +1851,11 @@ int tty_release(struct inode *inode, struct file *filp)
 	 * tty.
 	 */
 	if (!tty->count) {
-		read_lock(&tasklist_lock);
+		qread_lock(&tasklist_lock);
 		session_clear_tty(tty->session);
 		if (o_tty)
 			session_clear_tty(o_tty->session);
-		read_unlock(&tasklist_lock);
+		qread_unlock(&tasklist_lock);
 	}
 
 	/* check whether both sides are closing ... */
@@ -2113,7 +2113,7 @@ retry_open:
 	clear_bit(TTY_HUPPED, &tty->flags);
 
 
-	read_lock(&tasklist_lock);
+	qread_lock(&tasklist_lock);
 	spin_lock_irq(&current->sighand->siglock);
 	if (!noctty &&
 	    current->signal->leader &&
@@ -2121,7 +2121,7 @@ retry_open:
 	    tty->session == NULL)
 		__proc_set_tty(tty);
 	spin_unlock_irq(&current->sighand->siglock);
-	read_unlock(&tasklist_lock);
+	qread_unlock(&tasklist_lock);
 	tty_unlock(tty);
 	return 0;
 err_unlock:
@@ -2417,7 +2417,7 @@ static int tiocsctty(struct tty_struct *tty, int arg)
 	int ret = 0;
 
 	tty_lock(tty);
-	read_lock(&tasklist_lock);
+	qread_lock(&tasklist_lock);
 
 	if (current->signal->leader && (task_session(current) == tty->session))
 		goto unlock;
@@ -2448,7 +2448,7 @@ static int tiocsctty(struct tty_struct *tty, int arg)
 	}
 	proc_set_tty(tty);
 unlock:
-	read_unlock(&tasklist_lock);
+	qread_unlock(&tasklist_lock);
 	tty_unlock(tty);
 	return ret;
 }
@@ -2957,7 +2957,7 @@ void __do_SAK(struct tty_struct *tty)
 
 	tty_driver_flush_buffer(tty);
 
-	read_lock(&tasklist_lock);
+	qread_lock(&tasklist_lock);
 	/* Kill the entire session */
 	do_each_pid_task(session, PIDTYPE_SID, p) {
 		printk(KERN_NOTICE "SAK: killed process %d"
@@ -2986,7 +2986,7 @@ void __do_SAK(struct tty_struct *tty)
 		}
 		task_unlock(p);
 	} while_each_thread(g, p);
-	read_unlock(&tasklist_lock);
+	qread_unlock(&tasklist_lock);
 #endif
 }
 

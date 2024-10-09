@@ -263,13 +263,21 @@ static void put_compound_page(struct page *page)
 
 void put_page(struct page *page)
 {
+	/*
+	 * ZONE_DEVICE pages should never have their refcount reach 0 (this
+	 * would be a bug), so call page_ref_dec() in put_zone_device_page()
+	 * to decrement page refcount and skip __put_page() here, as this
+	 * would worsen things if a ZONE_DEVICE had a refcount bug.
+	 */
+	if (unlikely(is_zone_device_page(page))) {
+		put_zone_device_page(page);
+		return;
+	}
+
 	if (unlikely(PageCompound(page)))
 		put_compound_page(page);
 	else if (put_page_testzero(page))
 		__put_single_page(page);
-
-	if (unlikely(is_zone_device_page(page)))
-		put_zone_device_page(page);
 }
 EXPORT_SYMBOL(put_page);
 

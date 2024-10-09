@@ -158,6 +158,7 @@ static u32 *ipv4_cow_metrics(struct dst_entry *dst, unsigned long old)
 static struct neighbour *ipv4_neigh_lookup(const struct dst_entry *dst,
 					   struct sk_buff *skb,
 					   const void *daddr);
+static void ipv4_confirm_neigh(const struct dst_entry *dst, const void *daddr);
 
 static struct dst_ops ipv4_dst_ops = {
 	.family =		AF_INET,
@@ -174,6 +175,7 @@ static struct dst_ops ipv4_dst_ops = {
 	.redirect =		ip_do_redirect,
 	.local_out =		__ip_local_out,
 	.neigh_lookup =		ipv4_neigh_lookup,
+	.confirm_neigh =	ipv4_confirm_neigh,
 };
 
 #define ECN_OR_COST(class)	TC_PRIO_##class
@@ -465,6 +467,23 @@ static struct neighbour *ipv4_neigh_lookup(const struct dst_entry *dst,
 	if (n)
 		return n;
 	return neigh_create(&arp_tbl, pkey, dev);
+}
+
+static void ipv4_confirm_neigh(const struct dst_entry *dst, const void *daddr)
+{
+	struct net_device *dev = dst->dev;
+	const __be32 *pkey = daddr;
+	const struct rtable *rt;
+
+	rt = (const struct rtable *)dst;
+	if (rt->rt_gateway)
+		pkey = (const __be32 *)&rt->rt_gateway;
+	else if (!daddr ||
+		 (rt->rt_flags &
+		  (RTCF_MULTICAST | RTCF_BROADCAST | RTCF_LOCAL)))
+		return;
+
+	__ipv4_confirm_neigh(dev, *(__force u32 *)pkey);
 }
 
 #define IP_IDENTS_SZ 2048u
@@ -2275,7 +2294,8 @@ struct rtable *__ip_route_output_key_hash(struct net *net, struct flowi4 *fl4,
 #ifdef CONFIG_IP_ROUTE_MULTIPATH
 	if (res.fi->fib_nhs > 1 && fl4->flowi4_oif == 0) {
 		if (mp_hash < 0)
-			mp_hash = fib_multipath_hash(fl4->saddr, fl4->daddr);
+			mp_hash = get_hash_from_flowi4(fl4) >> 1;
+
 		fib_select_multipath(&res, mp_hash);
 	}
 	else

@@ -598,27 +598,23 @@ struct mei_cl *mei_cl_allocate(struct mei_device *dev)
  * mei_cl_link - allocate host id in the host map
  *
  * @cl: host client
- * @id: fixed host id or MEI_HOST_CLIENT_ID_ANY (-1) for generic one
  *
  * Return: 0 on success
  *	-EINVAL on incorrect values
  *	-EMFILE if open count exceeded.
  */
-int mei_cl_link(struct mei_cl *cl, int id)
+int mei_cl_link(struct mei_cl *cl)
 {
 	struct mei_device *dev;
 	long open_handle_count;
+	int id;
 
 	if (WARN_ON(!cl || !cl->dev))
 		return -EINVAL;
 
 	dev = cl->dev;
 
-	/* If Id is not assigned get one*/
-	if (id == MEI_HOST_CLIENT_ID_ANY)
-		id = find_first_zero_bit(dev->host_clients_map,
-					MEI_CLIENTS_MAX);
-
+	id = find_first_zero_bit(dev->host_clients_map, MEI_CLIENTS_MAX);
 	if (id >= MEI_CLIENTS_MAX) {
 		dev_err(dev->dev, "id exceeded %d", MEI_CLIENTS_MAX);
 		return -EMFILE;
@@ -659,7 +655,7 @@ int mei_cl_unlink(struct mei_cl *cl)
 	if (!cl)
 		return 0;
 
-	/* wd and amthif might not be initialized */
+	/* amthif might not be initialized */
 	if (!cl->dev)
 		return 0;
 
@@ -681,31 +677,12 @@ int mei_cl_unlink(struct mei_cl *cl)
 	return 0;
 }
 
-
-void mei_host_client_init(struct work_struct *work)
+void mei_host_client_init(struct mei_device *dev)
 {
-	struct mei_device *dev =
-		container_of(work, struct mei_device, init_work);
-	struct mei_me_client *me_cl;
-
-	mutex_lock(&dev->device_lock);
-
-
-	me_cl = mei_me_cl_by_uuid(dev, &mei_amthif_guid);
-	if (me_cl)
-		mei_amthif_host_init(dev, me_cl);
-	mei_me_cl_put(me_cl);
-
-	me_cl = mei_me_cl_by_uuid(dev, &mei_wd_guid);
-	if (me_cl)
-		mei_wd_host_init(dev, me_cl);
-	mei_me_cl_put(me_cl);
-
 	dev->dev_state = MEI_DEV_ENABLED;
 	dev->reset_count = 0;
-	mutex_unlock(&dev->device_lock);
 
-	mei_cl_bus_rescan(dev);
+	schedule_work(&dev->bus_rescan_work);
 
 	pm_runtime_mark_last_busy(dev->dev);
 	dev_dbg(dev->dev, "rpm: autosuspend\n");
@@ -788,8 +765,8 @@ void mei_cl_set_disconnected(struct mei_cl *cl)
 	mei_io_list_flush(&dev->ctrl_rd_list, cl);
 	mei_io_list_flush(&dev->ctrl_wr_list, cl);
 	mei_cl_wake_all(cl);
-	cl->mei_flow_ctrl_creds = 0;
 	cl->rx_flow_ctrl_creds = 0;
+	cl->tx_flow_ctrl_creds = 0;
 	cl->timer_count = 0;
 
 	if (!cl->me_cl)
@@ -799,7 +776,7 @@ void mei_cl_set_disconnected(struct mei_cl *cl)
 		cl->me_cl->connect_count--;
 
 	if (cl->me_cl->connect_count == 0)
-		cl->me_cl->mei_flow_ctrl_creds = 0;
+		cl->me_cl->tx_flow_ctrl_creds = 0;
 
 	mei_me_cl_put(cl->me_cl);
 	cl->me_cl = NULL;
@@ -1169,11 +1146,10 @@ nortpm:
  * mei_cl_alloc_linked - allocate and link host client
  *
  * @dev: the device structure
- * @id: fixed host id or MEI_HOST_CLIENT_ID_ANY (-1) for generic one
  *
  * Return: cl on success ERR_PTR on failure
  */
-struct mei_cl *mei_cl_alloc_linked(struct mei_device *dev, int id)
+struct mei_cl *mei_cl_alloc_linked(struct mei_device *dev)
 {
 	struct mei_cl *cl;
 	int ret;
@@ -1184,7 +1160,7 @@ struct mei_cl *mei_cl_alloc_linked(struct mei_device *dev, int id)
 		goto err;
 	}
 
-	ret = mei_cl_link(cl, id);
+	ret = mei_cl_link(cl);
 	if (ret)
 		goto err;
 
@@ -1194,49 +1170,42 @@ err:
 	return ERR_PTR(ret);
 }
 
-
-
 /**
- * mei_cl_flow_ctrl_creds - checks flow_control credits for cl.
+ * mei_cl_tx_flow_ctrl_creds - checks flow_control credits for cl.
  *
- * @cl: private data of the file object
+ * @cl: host client
  *
- * Return: 1 if mei_flow_ctrl_creds >0, 0 - otherwise.
+ * Return: 1 if tx_flow_ctrl_creds >0, 0 - otherwise.
  */
-int mei_cl_flow_ctrl_creds(struct mei_cl *cl)
+static int mei_cl_tx_flow_ctrl_creds(struct mei_cl *cl)
 {
-	int rets;
-
 	if (WARN_ON(!cl || !cl->me_cl))
 		return -EINVAL;
 
-	if (cl->mei_flow_ctrl_creds > 0)
+	if (cl->tx_flow_ctrl_creds > 0)
 		return 1;
 
-	if (mei_cl_is_fixed_address(cl)) {
-		rets = mei_cl_read_start(cl, mei_cl_mtu(cl), NULL);
-		if (rets && rets != -EBUSY)
-			return rets;
+	if (mei_cl_is_fixed_address(cl))
 		return 1;
-	}
 
 	if (mei_cl_is_single_recv_buf(cl)) {
-		if (cl->me_cl->mei_flow_ctrl_creds > 0)
+		if (cl->me_cl->tx_flow_ctrl_creds > 0)
 			return 1;
 	}
 	return 0;
 }
 
 /**
- * mei_cl_flow_ctrl_reduce - reduces flow_control.
+ * mei_cl_tx_flow_ctrl_creds_reduce - reduces transmit flow control credits
+ *   for a client
  *
- * @cl: private data of the file object
+ * @cl: host client
  *
  * Return:
  *	0 on success
  *	-EINVAL when ctrl credits are <= 0
  */
-int mei_cl_flow_ctrl_reduce(struct mei_cl *cl)
+static int mei_cl_tx_flow_ctrl_creds_reduce(struct mei_cl *cl)
 {
 	if (WARN_ON(!cl || !cl->me_cl))
 		return -EINVAL;
@@ -1245,13 +1214,13 @@ int mei_cl_flow_ctrl_reduce(struct mei_cl *cl)
 		return 0;
 
 	if (mei_cl_is_single_recv_buf(cl)) {
-		if (WARN_ON(cl->me_cl->mei_flow_ctrl_creds <= 0))
+		if (WARN_ON(cl->me_cl->tx_flow_ctrl_creds <= 0))
 			return -EINVAL;
-		cl->me_cl->mei_flow_ctrl_creds--;
+		cl->me_cl->tx_flow_ctrl_creds--;
 	} else {
-		if (WARN_ON(cl->mei_flow_ctrl_creds <= 0))
+		if (WARN_ON(cl->tx_flow_ctrl_creds <= 0))
 			return -EINVAL;
-		cl->mei_flow_ctrl_creds--;
+		cl->tx_flow_ctrl_creds--;
 	}
 	return 0;
 }
@@ -1565,7 +1534,7 @@ int mei_cl_irq_write(struct mei_cl *cl, struct mei_cl_cb *cb,
 
 	first_chunk = cb->buf_idx == 0;
 
-	rets = first_chunk ? mei_cl_flow_ctrl_creds(cl) : 1;
+	rets = first_chunk ? mei_cl_tx_flow_ctrl_creds(cl) : 1;
 	if (rets < 0)
 		return rets;
 
@@ -1613,7 +1582,7 @@ int mei_cl_irq_write(struct mei_cl *cl, struct mei_cl_cb *cb,
 	cb->completed = mei_hdr.msg_complete == 1;
 
 	if (first_chunk) {
-		if (mei_cl_flow_ctrl_reduce(cl))
+		if (mei_cl_tx_flow_ctrl_creds_reduce(cl))
 			return -EIO;
 	}
 
@@ -1671,7 +1640,7 @@ int mei_cl_write(struct mei_cl *cl, struct mei_cl_cb *cb)
 	mei_hdr.msg_complete = 0;
 	mei_hdr.internal = cb->internal;
 
-	rets = mei_cl_flow_ctrl_creds(cl);
+	rets = mei_cl_tx_flow_ctrl_creds(cl);
 	if (rets < 0)
 		goto err;
 
@@ -1699,7 +1668,7 @@ int mei_cl_write(struct mei_cl *cl, struct mei_cl_cb *cb)
 	if (rets)
 		goto err;
 
-	rets = mei_cl_flow_ctrl_reduce(cl);
+	rets = mei_cl_tx_flow_ctrl_creds_reduce(cl);
 	if (rets)
 		goto err;
 

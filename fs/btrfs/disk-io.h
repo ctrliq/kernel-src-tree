@@ -19,7 +19,7 @@
 #ifndef __DISKIO__
 #define __DISKIO__
 
-#define BTRFS_SUPER_INFO_OFFSET (64 * 1024)
+#define BTRFS_SUPER_INFO_OFFSET SZ_64K
 #define BTRFS_SUPER_INFO_SIZE 4096
 
 #define BTRFS_SUPER_MIRROR_MAX	 3
@@ -35,7 +35,7 @@ enum btrfs_wq_endio_type {
 
 static inline u64 btrfs_sb_offset(int mirror)
 {
-	u64 start = 16 * 1024;
+	u64 start = SZ_16K;
 	if (mirror)
 		return start << (BTRFS_SUPER_MIRROR_SHIFT * mirror);
 	return BTRFS_SUPER_INFO_OFFSET;
@@ -92,7 +92,8 @@ void btrfs_drop_and_free_fs_root(struct btrfs_fs_info *fs_info,
 void btrfs_free_fs_root(struct btrfs_root *root);
 
 #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
-struct btrfs_root *btrfs_alloc_dummy_root(void);
+struct btrfs_root *btrfs_alloc_dummy_root(struct btrfs_fs_info *fs_info,
+					  u32 sectorsize, u32 nodesize);
 #endif
 
 /*

@@ -170,7 +170,8 @@
 #define PCI_DEVICE_ID_AMD_15H_M60H_NB_F2 0x1572
 #define PCI_DEVICE_ID_AMD_16H_NB_F1	0x1531
 #define PCI_DEVICE_ID_AMD_16H_NB_F2	0x1532
-
+#define PCI_DEVICE_ID_AMD_17H_DF_F0    0x1460
+#define PCI_DEVICE_ID_AMD_17H_DF_F6    0x1466
 /*
  * Function 1 - Address Map
  */
@@ -302,12 +303,27 @@
 /* MSRs */
 #define MSR_MCGCTL_NBE			BIT(4)
 
+/* F17h */
+
+/* F0: */
+#define DF_DHAR				0x104
+
 /* UMC CH register offsets */
+#define UMCCH_BASE_ADDR			0x0
+#define UMCCH_ADDR_MASK			0x20
+#define UMCCH_ADDR_CFG			0x30
+#define UMCCH_DIMM_CFG			0x80
+#define UMCCH_UMC_CFG			0x100
 #define UMCCH_SDP_CTRL			0x104
+#define UMCCH_ECC_CTRL			0x14C
+#define UMCCH_ECC_BAD_SYMBOL		0xD90
+#define UMCCH_UMC_CAP			0xDF0
 #define UMCCH_UMC_CAP_HI		0xDF4
 
 /* UMC CH bitfields */
+#define UMC_ECC_CHIPKILL_CAP		BIT(31)
 #define UMC_ECC_ENABLED			BIT(30)
+
 #define UMC_SDP_INIT			BIT(31)
 
 #define NUM_UMCS			2
@@ -319,6 +335,7 @@ enum amd_families {
 	F15_M30H_CPUS,
 	F15_M60H_CPUS,
 	F16_CPUS,
+	F17_CPUS,
 	NUM_FAMILIES,
 };
 
@@ -351,11 +368,19 @@ struct chip_select {
 	u8 m_cnt;
 };
 
+struct amd64_umc {
+	u32 dimm_cfg;		/* DIMM Configuration reg */
+	u32 umc_cfg;		/* Configuration reg */
+	u32 sdp_ctrl;		/* SDP Control reg */
+	u32 ecc_ctrl;		/* DRAM ECC Control reg */
+	u32 umc_cap_hi;		/* Capabilities High reg */
+};
+
 struct amd64_pvt {
 	struct low_ops *ops;
 
 	/* pci_device handles which we utilize */
-	struct pci_dev *F1, *F2, *F3;
+	struct pci_dev *F0, *F1, *F2, *F3, *F6;
 
 	u16 mc_node_id;		/* MC index of this MC node */
 	u8 fam;			/* CPU family */
@@ -398,6 +423,8 @@ struct amd64_pvt {
 
 	/* cache the dram_type */
 	enum mem_type dram_type;
+
+	struct amd64_umc *umc;	/* UMC registers */
 };
 
 enum err_codes {
@@ -405,6 +432,8 @@ enum err_codes {
 	ERR_NODE	= -1,
 	ERR_CSROW	= -2,
 	ERR_CHANNEL	= -3,
+	ERR_SYND	= -4,
+	ERR_NORM_ADDR	= -5,
 };
 
 struct err_info {
@@ -511,7 +540,7 @@ struct low_ops {
 
 struct amd64_family_type {
 	const char *ctl_name;
-	u16 f1_id, f3_id;
+	u16 f0_id, f1_id, f2_id, f6_id;
 	struct low_ops ops;
 };
 

@@ -45,14 +45,16 @@ struct mnt_namespace;
 #define MNT_PROPAGATION_MASK	(MNT_SHARED | MNT_UNBINDABLE)
 
 #define MNT_INTERNAL_FLAGS (MNT_SHARED | MNT_WRITE_HOLD | MNT_INTERNAL | \
-			    MNT_MARKED)
+			    MNT_DOOMED | MNT_SYNC_UMOUNT | MNT_MARKED)
 
 #define MNT_INTERNAL	0x4000
 
 #define MNT_LOCK_READONLY	0x400000
 #define MNT_LOCKED		0x800000
-
+#define MNT_DOOMED		0x1000000
+#define MNT_SYNC_UMOUNT		0x2000000
 #define MNT_MARKED		0x4000000
+#define MNT_UMOUNT		0x8000000
 
 struct vfsmount {
 	struct dentry *mnt_root;	/* root of the mounted tree */
@@ -61,6 +63,7 @@ struct vfsmount {
 };
 
 struct file; /* forward dec */
+struct path;
 
 extern int mnt_want_write(struct vfsmount *mnt);
 extern int mnt_want_write_file(struct file *file);
@@ -69,8 +72,7 @@ extern void mnt_drop_write(struct vfsmount *mnt);
 extern void mnt_drop_write_file(struct file *file);
 extern void mntput(struct vfsmount *mnt);
 extern struct vfsmount *mntget(struct vfsmount *mnt);
-extern void mnt_pin(struct vfsmount *mnt);
-extern void mnt_unpin(struct vfsmount *mnt);
+extern struct vfsmount *mnt_clone_internal(struct path *path);
 extern int __mnt_is_readonly(struct vfsmount *mnt);
 
 struct path;
@@ -85,5 +87,7 @@ extern void mnt_set_expiry(struct vfsmount *mnt, struct list_head *expiry_list);
 extern void mark_mounts_for_expiry(struct list_head *mounts);
 
 extern dev_t name_to_dev_t(const char *name);
+
+extern bool path_is_mountpoint(const struct path *path);
 
 #endif /* _LINUX_MOUNT_H */

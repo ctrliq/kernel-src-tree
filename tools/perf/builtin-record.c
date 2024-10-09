@@ -13,6 +13,7 @@
 #include "util/util.h"
 #include <subcmd/parse-options.h>
 #include "util/parse-events.h"
+#include "util/config.h"
 
 #include "util/callchain.h"
 #include "util/cgroup.h"
@@ -33,6 +34,8 @@
 #include "util/tsc.h"
 #include "util/parse-branch-options.h"
 #include "util/parse-regs-options.h"
+#include "util/trigger.h"
+#include "util/perf-hooks.h"
 #include "asm/bug.h"
 
 #include <unistd.h>
@@ -40,6 +43,15 @@
 #include <sys/mman.h>
 #include <asm/bug.h>
 #include <linux/time64.h>
+
+struct switch_output {
+	bool		 enabled;
+	bool		 signal;
+	unsigned long	 size;
+	unsigned long	 time;
+	const char	*str;
+	bool		 set;
+};
 
 struct record {
 	struct perf_tool	tool;
@@ -57,8 +69,32 @@ struct record {
 	bool			no_buildid_cache_set;
 	bool			buildid_all;
 	bool			timestamp_filename;
+	struct switch_output	switch_output;
 	unsigned long long	samples;
 };
+
+static volatile int auxtrace_record__snapshot_started;
+static DEFINE_TRIGGER(auxtrace_snapshot_trigger);
+static DEFINE_TRIGGER(switch_output_trigger);
+
+static bool switch_output_signal(struct record *rec)
+{
+	return rec->switch_output.signal &&
+	       trigger_is_ready(&switch_output_trigger);
+}
+
+static bool switch_output_size(struct record *rec)
+{
+	return rec->switch_output.size &&
+	       trigger_is_ready(&switch_output_trigger) &&
+	       (rec->bytes_written >= rec->switch_output.size);
+}
+
+static bool switch_output_time(struct record *rec)
+{
+	return rec->switch_output.time &&
+	       trigger_is_ready(&switch_output_trigger);
+}
 
 static int record__write(struct record *rec, void *bf, size_t size)
 {
@@ -68,6 +104,10 @@ static int record__write(struct record *rec, void *bf, size_t size)
 	}
 
 	rec->bytes_written += size;
+
+	if (switch_output_size(rec))
+		trigger_hit(&switch_output_trigger);
+
 	return 0;
 }
 
@@ -187,45 +227,6 @@ static volatile int done;
 static volatile int signr = -1;
 static volatile int child_finished;
 
-static volatile enum {
-	AUXTRACE_SNAPSHOT_OFF = -1,
-	AUXTRACE_SNAPSHOT_DISABLED = 0,
-	AUXTRACE_SNAPSHOT_ENABLED = 1,
-} auxtrace_snapshot_state = AUXTRACE_SNAPSHOT_OFF;
-
-static inline void
-auxtrace_snapshot_on(void)
-{
-	auxtrace_snapshot_state = AUXTRACE_SNAPSHOT_DISABLED;
-}
-
-static inline void
-auxtrace_snapshot_enable(void)
-{
-	if (auxtrace_snapshot_state == AUXTRACE_SNAPSHOT_OFF)
-		return;
-	auxtrace_snapshot_state = AUXTRACE_SNAPSHOT_ENABLED;
-}
-
-static inline void
-auxtrace_snapshot_disable(void)
-{
-	if (auxtrace_snapshot_state == AUXTRACE_SNAPSHOT_OFF)
-		return;
-	auxtrace_snapshot_state = AUXTRACE_SNAPSHOT_DISABLED;
-}
-
-static inline bool
-auxtrace_snapshot_is_enabled(void)
-{
-	if (auxtrace_snapshot_state == AUXTRACE_SNAPSHOT_OFF)
-		return false;
-	return auxtrace_snapshot_state == AUXTRACE_SNAPSHOT_ENABLED;
-}
-
-static volatile int auxtrace_snapshot_err;
-static volatile int auxtrace_record__snapshot_started;
-
 static void sig_handler(int sig)
 {
 	if (sig == SIGCHLD)
@@ -234,6 +235,12 @@ static void sig_handler(int sig)
 		signr = sig;
 
 	done = 1;
+}
+
+static void sigsegv_handler(int sig)
+{
+	perf_hooks__recover();
+	sighandler_dump_stack(sig);
 }
 
 static void record__sig_exit(void)
@@ -342,11 +349,12 @@ static void record__read_auxtrace_snapshot(struct record *rec)
 {
 	pr_debug("Recording AUX area tracing snapshot\n");
 	if (record__auxtrace_read_snapshot_all(rec) < 0) {
-		auxtrace_snapshot_err = -1;
+		trigger_error(&auxtrace_snapshot_trigger);
 	} else {
-		auxtrace_snapshot_err = auxtrace_record__snapshot_finish(rec->itr);
-		if (!auxtrace_snapshot_err)
-			auxtrace_snapshot_enable();
+		if (auxtrace_record__snapshot_finish(rec->itr))
+			trigger_error(&auxtrace_snapshot_trigger);
+		else
+			trigger_ready(&auxtrace_snapshot_trigger);
 	}
 }
 
@@ -391,7 +399,7 @@ static int record__mmap_evlist(struct record *rec,
 			return -errno;
 		} else {
 			pr_err("failed to mmap with %d (%s)\n", errno,
-				strerror_r(errno, msg, sizeof(msg)));
+				str_error_r(errno, msg, sizeof(msg)));
 			if (errno)
 				return -errno;
 			else
@@ -416,9 +424,9 @@ static int record__open(struct record *rec)
 	struct perf_evsel_config_term *err_term;
 	int rc = 0;
 
-	perf_evlist__config(evlist, opts);
+	perf_evlist__config(evlist, opts, &callchain_param);
 
-	evlist__for_each(evlist, pos) {
+	evlist__for_each_entry(evlist, pos) {
 try_again:
 		if (perf_evsel__open(pos, pos->cpus, pos->threads) < 0) {
 			if (perf_evsel__fallback(pos, errno, msg, sizeof(msg))) {
@@ -438,7 +446,7 @@ try_again:
 	if (perf_evlist__apply_filters(evlist, &pos)) {
 		error("failed to set filter \"%s\" on event %s with %d (%s)\n",
 			pos->filter, perf_evsel__name(pos), errno,
-			strerror_r(errno, msg, sizeof(msg)));
+			str_error_r(errno, msg, sizeof(msg)));
 		rc = -1;
 		goto out;
 	}
@@ -552,6 +560,9 @@ static int record__mmap_read_evlist(struct record *rec, struct perf_evlist *evli
 	if (!maps)
 		return 0;
 
+	if (backward && evlist->bkw_mmap_state != BKW_MMAP_DATA_PENDING)
+		return 0;
+
 	for (i = 0; i < evlist->nr_mmaps; i++) {
 		struct auxtrace_mmap *mm = &maps[i].auxtrace_mmap;
 
@@ -577,6 +588,8 @@ static int record__mmap_read_evlist(struct record *rec, struct perf_evlist *evli
 	if (bytes_written != rec->bytes_written)
 		rc = record__write(rec, &finished_round_event, sizeof(finished_round_event));
 
+	if (backward)
+		perf_evlist__toggle_bkw_mmap(evlist, BKW_MMAP_EMPTY);
 out:
 	return rc;
 }
@@ -589,7 +602,7 @@ static int record__mmap_read_all(struct record *rec)
 	if (err)
 		return err;
 
-	return err;
+	return record__mmap_read_evlist(rec, rec->evlist, true);
 }
 
 static void record__init_features(struct record *rec)
@@ -638,6 +651,28 @@ record__finish_output(struct record *rec)
 	return;
 }
 
+static int record__synthesize_workload(struct record *rec, bool tail)
+{
+	struct {
+		struct thread_map map;
+		struct thread_map_data map_data;
+	} thread_map;
+
+	if (rec->opts.tail_synthesize != tail)
+		return 0;
+
+	thread_map.map.nr = 1;
+	thread_map.map.map[0].pid = rec->evlist->workload.pid;
+	thread_map.map.map[0].comm = NULL;
+	return perf_event__synthesize_thread_map(&rec->tool, &thread_map.map,
+						 process_synthesized_event,
+						 &rec->session->machines.host,
+						 rec->opts.sample_address,
+						 rec->opts.proc_map_timeout);
+}
+
+static int record__synthesize(struct record *rec, bool tail);
+
 static int
 record__switch_output(struct record *rec, bool at_exit)
 {
@@ -646,6 +681,10 @@ record__switch_output(struct record *rec, bool at_exit)
 
 	/* Same Size:      "2015122520103046"*/
 	char timestamp[] = "InvalidTimestamp";
+
+	record__synthesize(rec, true);
+	if (target__none(&rec->opts.target))
+		record__synthesize_workload(rec, true);
 
 	rec->samples = 0;
 	record__finish_output(rec);
@@ -666,6 +705,23 @@ record__switch_output(struct record *rec, bool at_exit)
 	if (!quiet)
 		fprintf(stderr, "[ perf record: Dump %s.%s ]\n",
 			file->path, timestamp);
+
+	/* Output tracking events */
+	if (!at_exit) {
+		record__synthesize(rec, false);
+
+		/*
+		 * In 'perf record --switch-output' without -a,
+		 * record__synthesize() in record__switch_output() won't
+		 * generate tracking events because there's no thread_map
+		 * in evlist. Which causes newly created perf.data doesn't
+		 * contain map and comm information.
+		 * Create a fake thread_map and directly call
+		 * perf_event__synthesize_thread_map() for those events.
+		 */
+		if (target__none(&rec->opts.target))
+			record__synthesize_workload(rec, false);
+	}
 	return fd;
 }
 
@@ -686,6 +742,7 @@ static void workload_exec_failed_signal(int signo __maybe_unused,
 }
 
 static void snapshot_sig_handler(int sig);
+static void alarm_sig_handler(int sig);
 
 int __weak
 perf_event__synth_time_conv(const struct perf_event_mmap_page *pc __maybe_unused,
@@ -718,7 +775,7 @@ static const struct perf_event_mmap_page *record__pick_pc(struct record *rec)
 	return NULL;
 }
 
-static int record__synthesize(struct record *rec)
+static int record__synthesize(struct record *rec, bool tail)
 {
 	struct perf_session *session = rec->session;
 	struct machine *machine = &session->machines.host;
@@ -727,6 +784,9 @@ static int record__synthesize(struct record *rec)
 	struct perf_tool *tool = &rec->tool;
 	int fd = perf_data_file__fd(file);
 	int err = 0;
+
+	if (rec->opts.tail_synthesize != tail)
+		return 0;
 
 	if (file->is_pipe) {
 		err = perf_event__synthesize_attrs(tool, session,
@@ -811,10 +871,14 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 	signal(SIGCHLD, sig_handler);
 	signal(SIGINT, sig_handler);
 	signal(SIGTERM, sig_handler);
+	signal(SIGSEGV, sigsegv_handler);
 
-	if (rec->opts.auxtrace_snapshot_mode) {
+	if (rec->opts.auxtrace_snapshot_mode || rec->switch_output.enabled) {
 		signal(SIGUSR2, snapshot_sig_handler);
-		auxtrace_snapshot_on();
+		if (rec->opts.auxtrace_snapshot_mode)
+			trigger_on(&auxtrace_snapshot_trigger);
+		if (rec->switch_output.enabled)
+			trigger_on(&switch_output_trigger);
 	} else {
 		signal(SIGUSR2, SIG_IGN);
 	}
@@ -878,7 +942,7 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 
 	machine = &session->machines.host;
 
-	err = record__synthesize(rec);
+	err = record__synthesize(rec, false);
 	if (err < 0)
 		goto out_child;
 
@@ -933,25 +997,77 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 		perf_evlist__enable(rec->evlist);
 	}
 
-	auxtrace_snapshot_enable();
+	trigger_ready(&auxtrace_snapshot_trigger);
+	trigger_ready(&switch_output_trigger);
+	perf_hooks__invoke_record_start();
 	for (;;) {
 		unsigned long long hits = rec->samples;
 
+		/*
+		 * rec->evlist->bkw_mmap_state is possible to be
+		 * BKW_MMAP_EMPTY here: when done == true and
+		 * hits != rec->samples in previous round.
+		 *
+		 * perf_evlist__toggle_bkw_mmap ensure we never
+		 * convert BKW_MMAP_EMPTY to BKW_MMAP_DATA_PENDING.
+		 */
+		if (trigger_is_hit(&switch_output_trigger) || done || draining)
+			perf_evlist__toggle_bkw_mmap(rec->evlist, BKW_MMAP_DATA_PENDING);
+
 		if (record__mmap_read_all(rec) < 0) {
-			auxtrace_snapshot_disable();
+			trigger_error(&auxtrace_snapshot_trigger);
+			trigger_error(&switch_output_trigger);
 			err = -1;
 			goto out_child;
 		}
 
 		if (auxtrace_record__snapshot_started) {
 			auxtrace_record__snapshot_started = 0;
-			if (!auxtrace_snapshot_err)
+			if (!trigger_is_error(&auxtrace_snapshot_trigger))
 				record__read_auxtrace_snapshot(rec);
-			if (auxtrace_snapshot_err) {
+			if (trigger_is_error(&auxtrace_snapshot_trigger)) {
 				pr_err("AUX area tracing snapshot failed\n");
 				err = -1;
 				goto out_child;
 			}
+		}
+
+		if (trigger_is_hit(&switch_output_trigger)) {
+			/*
+			 * If switch_output_trigger is hit, the data in
+			 * overwritable ring buffer should have been collected,
+			 * so bkw_mmap_state should be set to BKW_MMAP_EMPTY.
+			 *
+			 * If SIGUSR2 raise after or during record__mmap_read_all(),
+			 * record__mmap_read_all() didn't collect data from
+			 * overwritable ring buffer. Read again.
+			 */
+			if (rec->evlist->bkw_mmap_state == BKW_MMAP_RUNNING)
+				continue;
+			trigger_ready(&switch_output_trigger);
+
+			/*
+			 * Reenable events in overwrite ring buffer after
+			 * record__mmap_read_all(): we should have collected
+			 * data from it.
+			 */
+			perf_evlist__toggle_bkw_mmap(rec->evlist, BKW_MMAP_RUNNING);
+
+			if (!quiet)
+				fprintf(stderr, "[ perf record: dump data: Woken up %ld times ]\n",
+					waking);
+			waking = 0;
+			fd = record__switch_output(rec, false);
+			if (fd < 0) {
+				pr_err("Failed to switch to new file\n");
+				trigger_error(&switch_output_trigger);
+				err = fd;
+				goto out_child;
+			}
+
+			/* re-arm the alarm */
+			if (rec->switch_output.time)
+				alarm(rec->switch_output.time);
 		}
 
 		if (hits == rec->samples) {
@@ -976,16 +1092,17 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 		 * disable events in this case.
 		 */
 		if (done && !disabled && !target__none(&opts->target)) {
-			auxtrace_snapshot_disable();
+			trigger_off(&auxtrace_snapshot_trigger);
 			perf_evlist__disable(rec->evlist);
 			disabled = true;
 		}
 	}
-	auxtrace_snapshot_disable();
+	trigger_off(&auxtrace_snapshot_trigger);
+	trigger_off(&switch_output_trigger);
 
 	if (forks && workload_exec_errno) {
 		char msg[STRERR_BUFSIZE];
-		const char *emsg = strerror_r(workload_exec_errno, msg, sizeof(msg));
+		const char *emsg = str_error_r(workload_exec_errno, msg, sizeof(msg));
 		pr_err("Workload failed: %s\n", emsg);
 		err = -1;
 		goto out_child;
@@ -993,6 +1110,9 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 
 	if (!quiet)
 		fprintf(stderr, "[ perf record: Woken up %ld times to write data ]\n", waking);
+
+	if (target__none(&rec->opts.target))
+		record__synthesize_workload(rec, true);
 
 out_child:
 	if (forks) {
@@ -1012,6 +1132,7 @@ out_child:
 	} else
 		status = err;
 
+	record__synthesize(rec, true);
 	/* this will be recalculated during process_buildids() */
 	rec->samples = 0;
 
@@ -1026,6 +1147,8 @@ out_child:
 			}
 		}
 	}
+
+	perf_hooks__invoke_record_end();
 
 	if (!err && !quiet) {
 		char samples[128];
@@ -1048,58 +1171,61 @@ out_delete_session:
 	return status;
 }
 
-static void callchain_debug(void)
+static void callchain_debug(struct callchain_param *callchain)
 {
 	static const char *str[CALLCHAIN_MAX] = { "NONE", "FP", "DWARF", "LBR" };
 
-	pr_debug("callchain: type %s\n", str[callchain_param.record_mode]);
+	pr_debug("callchain: type %s\n", str[callchain->record_mode]);
 
-	if (callchain_param.record_mode == CALLCHAIN_DWARF)
+	if (callchain->record_mode == CALLCHAIN_DWARF)
 		pr_debug("callchain: stack dump size %d\n",
-			 callchain_param.dump_size);
+			 callchain->dump_size);
+}
+
+int record_opts__parse_callchain(struct record_opts *record,
+				 struct callchain_param *callchain,
+				 const char *arg, bool unset)
+{
+	int ret;
+	callchain->enabled = !unset;
+
+	/* --no-call-graph */
+	if (unset) {
+		callchain->record_mode = CALLCHAIN_NONE;
+		pr_debug("callchain: disabled\n");
+		return 0;
+	}
+
+	ret = parse_callchain_record_opt(arg, callchain);
+	if (!ret) {
+		/* Enable data address sampling for DWARF unwind. */
+		if (callchain->record_mode == CALLCHAIN_DWARF)
+			record->sample_address = true;
+		callchain_debug(callchain);
+	}
+
+	return ret;
 }
 
 int record_parse_callchain_opt(const struct option *opt,
 			       const char *arg,
 			       int unset)
 {
-	int ret;
-	struct record_opts *record = (struct record_opts *)opt->value;
-
-	record->callgraph_set = true;
-	callchain_param.enabled = !unset;
-
-	/* --no-call-graph */
-	if (unset) {
-		callchain_param.record_mode = CALLCHAIN_NONE;
-		pr_debug("callchain: disabled\n");
-		return 0;
-	}
-
-	ret = parse_callchain_record_opt(arg, &callchain_param);
-	if (!ret) {
-		/* Enable data address sampling for DWARF unwind. */
-		if (callchain_param.record_mode == CALLCHAIN_DWARF)
-			record->sample_address = true;
-		callchain_debug();
-	}
-
-	return ret;
+	return record_opts__parse_callchain(opt->value, &callchain_param, arg, unset);
 }
 
 int record_callchain_opt(const struct option *opt,
 			 const char *arg __maybe_unused,
 			 int unset __maybe_unused)
 {
-	struct record_opts *record = (struct record_opts *)opt->value;
+	struct callchain_param *callchain = opt->value;
 
-	record->callgraph_set = true;
-	callchain_param.enabled = true;
+	callchain->enabled = true;
 
-	if (callchain_param.record_mode == CALLCHAIN_NONE)
-		callchain_param.record_mode = CALLCHAIN_FP;
+	if (callchain->record_mode == CALLCHAIN_NONE)
+		callchain->record_mode = CALLCHAIN_FP;
 
-	callchain_debug();
+	callchain_debug(callchain);
 	return 0;
 }
 
@@ -1122,6 +1248,90 @@ static int perf_record_config(const char *var, const char *value, void *cb)
 		var = "call-graph.record-mode"; /* fall-through */
 
 	return perf_default_config(var, value, cb);
+}
+
+struct clockid_map {
+	const char *name;
+	int clockid;
+};
+
+#define CLOCKID_MAP(n, c)	\
+	{ .name = n, .clockid = (c), }
+
+#define CLOCKID_END	{ .name = NULL, }
+
+
+/*
+ * Add the missing ones, we need to build on many distros...
+ */
+#ifndef CLOCK_MONOTONIC_RAW
+#define CLOCK_MONOTONIC_RAW 4
+#endif
+#ifndef CLOCK_BOOTTIME
+#define CLOCK_BOOTTIME 7
+#endif
+#ifndef CLOCK_TAI
+#define CLOCK_TAI 11
+#endif
+
+static const struct clockid_map clockids[] = {
+	/* available for all events, NMI safe */
+	CLOCKID_MAP("monotonic", CLOCK_MONOTONIC),
+	CLOCKID_MAP("monotonic_raw", CLOCK_MONOTONIC_RAW),
+
+	/* available for some events */
+	CLOCKID_MAP("realtime", CLOCK_REALTIME),
+	CLOCKID_MAP("boottime", CLOCK_BOOTTIME),
+	CLOCKID_MAP("tai", CLOCK_TAI),
+
+	/* available for the lazy */
+	CLOCKID_MAP("mono", CLOCK_MONOTONIC),
+	CLOCKID_MAP("raw", CLOCK_MONOTONIC_RAW),
+	CLOCKID_MAP("real", CLOCK_REALTIME),
+	CLOCKID_MAP("boot", CLOCK_BOOTTIME),
+
+	CLOCKID_END,
+};
+
+static int parse_clockid(const struct option *opt, const char *str, int unset)
+{
+	struct record_opts *opts = (struct record_opts *)opt->value;
+	const struct clockid_map *cm;
+	const char *ostr = str;
+
+	if (unset) {
+		opts->use_clockid = 0;
+		return 0;
+	}
+
+	/* no arg passed */
+	if (!str)
+		return 0;
+
+	/* no setting it twice */
+	if (opts->use_clockid)
+		return -1;
+
+	opts->use_clockid = true;
+
+	/* if its a number, we're done */
+	if (sscanf(str, "%d", &opts->clockid) == 1)
+		return 0;
+
+	/* allow a "CLOCK_" prefix to the name */
+	if (!strncasecmp(str, "CLOCK_", 6))
+		str += 6;
+
+	for (cm = clockids; cm->name; cm++) {
+		if (!strcasecmp(str, cm->name)) {
+			opts->clockid = cm->clockid;
+			return 0;
+		}
+	}
+
+	opts->use_clockid = false;
+	ui__warning("unknown clockid %s, check man page\n", ostr);
+	return -1;
 }
 
 static int record__parse_mmap_pages(const struct option *opt,
@@ -1165,6 +1375,78 @@ static int record__parse_mmap_pages(const struct option *opt,
 out_free:
 	free(s);
 	return ret;
+}
+
+static void switch_output_size_warn(struct record *rec)
+{
+	u64 wakeup_size = perf_evlist__mmap_size(rec->opts.mmap_pages);
+	struct switch_output *s = &rec->switch_output;
+
+	wakeup_size /= 2;
+
+	if (s->size < wakeup_size) {
+		char buf[100];
+
+		unit_number__scnprintf(buf, sizeof(buf), wakeup_size);
+		pr_warning("WARNING: switch-output data size lower than "
+			   "wakeup kernel buffer size (%s) "
+			   "expect bigger perf.data sizes\n", buf);
+	}
+}
+
+static int switch_output_setup(struct record *rec)
+{
+	struct switch_output *s = &rec->switch_output;
+	static struct parse_tag tags_size[] = {
+		{ .tag  = 'B', .mult = 1       },
+		{ .tag  = 'K', .mult = 1 << 10 },
+		{ .tag  = 'M', .mult = 1 << 20 },
+		{ .tag  = 'G', .mult = 1 << 30 },
+		{ .tag  = 0 },
+	};
+	static struct parse_tag tags_time[] = {
+		{ .tag  = 's', .mult = 1        },
+		{ .tag  = 'm', .mult = 60       },
+		{ .tag  = 'h', .mult = 60*60    },
+		{ .tag  = 'd', .mult = 60*60*24 },
+		{ .tag  = 0 },
+	};
+	unsigned long val;
+
+	if (!s->set)
+		return 0;
+
+	if (!strcmp(s->str, "signal")) {
+		s->signal = true;
+		pr_debug("switch-output with SIGUSR2 signal\n");
+		goto enabled;
+	}
+
+	val = parse_tag_value(s->str, tags_size);
+	if (val != (unsigned long) -1) {
+		s->size = val;
+		pr_debug("switch-output with %s size threshold\n", s->str);
+		goto enabled;
+	}
+
+	val = parse_tag_value(s->str, tags_time);
+	if (val != (unsigned long) -1) {
+		s->time = val;
+		pr_debug("switch-output with %s time threshold (%lu seconds)\n",
+			 s->str, s->time);
+		goto enabled;
+	}
+
+	return -1;
+
+enabled:
+	rec->timestamp_filename = true;
+	s->enabled              = true;
+
+	if (s->size && !rec->opts.no_buffering)
+		switch_output_size_warn(rec);
+
+	return 0;
 }
 
 static const char * const __record_usage[] = {
@@ -1211,6 +1493,8 @@ static struct record record = {
 const char record_callchain_help[] = CALLCHAIN_RECORD_HELP
 	"\n\t\t\t\tDefault: fp";
 
+static bool dry_run;
+
 /*
  * XXX Will stay a global variable till we fix builtin-script.c to stop messing
  * with it and switch to use the library functions in perf_evlist that came
@@ -1247,13 +1531,16 @@ static struct option __record_options[] = {
 	OPT_BOOLEAN_SET('i', "no-inherit", &record.opts.no_inherit,
 			&record.opts.no_inherit_set,
 			"child tasks do not inherit counters"),
+	OPT_BOOLEAN(0, "tail-synthesize", &record.opts.tail_synthesize,
+		    "synthesize non-sample events at the end of output"),
+	OPT_BOOLEAN(0, "overwrite", &record.opts.overwrite, "use overwrite mode"),
 	OPT_UINTEGER('F', "freq", &record.opts.user_freq, "profile at this frequency"),
 	OPT_CALLBACK('m', "mmap-pages", &record.opts, "pages[,pages]",
 		     "number of mmap data pages and AUX area tracing mmap pages",
 		     record__parse_mmap_pages),
 	OPT_BOOLEAN(0, "group", &record.opts.group,
 		    "put the counters into a counter group"),
-	OPT_CALLBACK_NOOPT('g', NULL, &record.opts,
+	OPT_CALLBACK_NOOPT('g', NULL, &callchain_param,
 			   NULL, "enables call-graph recording" ,
 			   &record_callchain_opt),
 	OPT_CALLBACK(0, "call-graph", &record.opts,
@@ -1265,6 +1552,7 @@ static struct option __record_options[] = {
 	OPT_BOOLEAN('s', "stat", &record.opts.inherit_stat,
 		    "per thread counts"),
 	OPT_BOOLEAN('d', "data", &record.opts.sample_address, "Record the sample addresses"),
+	OPT_BOOLEAN(0, "sample-cpu", &record.opts.sample_cpu, "Record the sample cpu"),
 	OPT_BOOLEAN_SET('T', "timestamp", &record.opts.sample_time,
 			&record.opts.sample_time_set,
 			"Record the sample timestamps"),
@@ -1303,6 +1591,9 @@ static struct option __record_options[] = {
 		    " use -I ? to list register names", parse_regs),
 	OPT_BOOLEAN(0, "running-time", &record.opts.running_time,
 		    "Record running/enabled time of read (:S) events"),
+	OPT_CALLBACK('k', "clockid", &record.opts,
+	"clockid", "clockid to use for events, see clock_gettime()",
+	parse_clockid),
 	OPT_STRING_OPTARG('S', "snapshot", &record.opts.auxtrace_snapshot_opts,
 			  "opts", "AUX area tracing Snapshot Mode", ""),
 	OPT_UINTEGER(0, "proc-map-timeout", &record.opts.proc_map_timeout,
@@ -1319,6 +1610,12 @@ static struct option __record_options[] = {
 		    "Record build-id of all DSOs regardless of hits"),
 	OPT_BOOLEAN(0, "timestamp-filename", &record.timestamp_filename,
 		    "append timestamp to output filename"),
+	OPT_STRING_OPTARG_SET(0, "switch-output", &record.switch_output.str,
+			  &record.switch_output.set, "signal,size,time",
+			  "Switch output when receive SIGUSR2 or cross size,time threshold",
+			  "signal"),
+	OPT_BOOLEAN(0, "dry-run", &dry_run,
+		    "Parse options then exit"),
 	OPT_END()
 };
 
@@ -1341,7 +1638,9 @@ int cmd_record(int argc, const char **argv, const char *prefix __maybe_unused)
 	if (rec->evlist == NULL)
 		return -ENOMEM;
 
-	perf_config(perf_record_config, rec);
+	err = perf_config(perf_record_config, rec);
+	if (err)
+		return err;
 
 	argc = parse_options(argc, argv, record_options, record_usage,
 			    PARSE_OPT_STOP_AT_NON_OPTION);
@@ -1360,20 +1659,43 @@ int cmd_record(int argc, const char **argv, const char *prefix __maybe_unused)
 		return -EINVAL;
 	}
 
+	if (switch_output_setup(rec)) {
+		parse_options_usage(record_usage, record_options, "switch-output", 0);
+		return -EINVAL;
+	}
+
+	if (rec->switch_output.time) {
+		signal(SIGALRM, alarm_sig_handler);
+		alarm(rec->switch_output.time);
+	}
+
 	if (!rec->itr) {
 		rec->itr = auxtrace_record__init(rec->evlist, &err);
 		if (err)
-			return err;
+			goto out;
 	}
 
 	err = auxtrace_parse_snapshot_options(rec->itr, &rec->opts,
 					      rec->opts.auxtrace_snapshot_opts);
 	if (err)
-		return err;
+		goto out;
 
-	err = -ENOMEM;
+	/*
+	 * Allow aliases to facilitate the lookup of symbols for address
+	 * filters. Refer to auxtrace_parse_filters().
+	 */
+	symbol_conf.allow_aliases = true;
 
 	symbol__init(NULL);
+
+	err = auxtrace_parse_filters(rec->evlist);
+	if (err)
+		goto out;
+
+	if (dry_run)
+		goto out;
+
+	err = -ENOMEM;
 
 	if (symbol_conf.kptr_restrict)
 		pr_warning(
@@ -1385,8 +1707,39 @@ int cmd_record(int argc, const char **argv, const char *prefix __maybe_unused)
 "If some relocation was applied (e.g. kexec) symbols may be misresolved\n"
 "even with a suitable vmlinux or kallsyms file.\n\n");
 
-	if (rec->no_buildid_cache || rec->no_buildid)
+	if (rec->no_buildid_cache || rec->no_buildid) {
 		disable_buildid_cache();
+	} else if (rec->switch_output.enabled) {
+		/*
+		 * In 'perf record --switch-output', disable buildid
+		 * generation by default to reduce data file switching
+		 * overhead. Still generate buildid if they are required
+		 * explicitly using
+		 *
+		 *  perf record --switch-output --no-no-buildid \
+		 *              --no-no-buildid-cache
+		 *
+		 * Following code equals to:
+		 *
+		 * if ((rec->no_buildid || !rec->no_buildid_set) &&
+		 *     (rec->no_buildid_cache || !rec->no_buildid_cache_set))
+		 *         disable_buildid_cache();
+		 */
+		bool disable = true;
+
+		if (rec->no_buildid_set && !rec->no_buildid)
+			disable = false;
+		if (rec->no_buildid_cache_set && !rec->no_buildid_cache)
+			disable = false;
+		if (disable) {
+			rec->no_buildid = true;
+			rec->no_buildid_cache = true;
+			disable_buildid_cache();
+		}
+	}
+
+	if (record.opts.overwrite)
+		record.opts.tail_synthesize = true;
 
 	if (rec->evlist->nr_entries == 0 &&
 	    perf_evlist__add_default(rec->evlist) < 0) {
@@ -1448,9 +1801,23 @@ out:
 
 static void snapshot_sig_handler(int sig __maybe_unused)
 {
-	if (!auxtrace_snapshot_is_enabled())
-		return;
-	auxtrace_snapshot_disable();
-	auxtrace_snapshot_err = auxtrace_record__snapshot_start(record.itr);
-	auxtrace_record__snapshot_started = 1;
+	struct record *rec = &record;
+
+	if (trigger_is_ready(&auxtrace_snapshot_trigger)) {
+		trigger_hit(&auxtrace_snapshot_trigger);
+		auxtrace_record__snapshot_started = 1;
+		if (auxtrace_record__snapshot_start(record.itr))
+			trigger_error(&auxtrace_snapshot_trigger);
+	}
+
+	if (switch_output_signal(rec))
+		trigger_hit(&switch_output_trigger);
+}
+
+static void alarm_sig_handler(int sig __maybe_unused)
+{
+	struct record *rec = &record;
+
+	if (switch_output_time(rec))
+		trigger_hit(&switch_output_trigger);
 }

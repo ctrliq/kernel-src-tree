@@ -16,6 +16,7 @@
 #include <linux/rmap.h>
 #include <linux/syscalls.h>
 #include <linux/mmu_notifier.h>
+#include <linux/userfaultfd_k.h>
 
 #include <asm/mmu_context.h>
 #include <asm/cacheflush.h>
@@ -132,6 +133,7 @@ SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
 	int err = -EINVAL;
 	int has_write_lock = 0;
 	vm_flags_t vm_flags = 0;
+	LIST_HEAD(uf);
 
 	if (prot)
 		return err;
@@ -208,7 +210,8 @@ get_write_lock:
 			/* mmap_region may free vma; grab the info now */
 			vm_flags = vma->vm_flags;
 
-			addr = mmap_region(file, start, size, vm_flags, pgoff);
+			addr = mmap_region(file, start, size, vm_flags, pgoff,
+					   &uf);
 			fput(file);
 			if (IS_ERR_VALUE(addr)) {
 				err = addr;
@@ -256,6 +259,7 @@ out_freed:
 		up_read(&mm->mmap_sem);
 	else
 		up_write(&mm->mmap_sem);
+	userfaultfd_unmap_complete(mm, &uf);
 	if (!err && ((vm_flags & VM_LOCKED) || !(flags & MAP_NONBLOCK)))
 		mm_populate(start, size);
 

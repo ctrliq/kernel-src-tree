@@ -127,7 +127,7 @@ void hci_conn_del_sysfs(struct hci_conn *conn)
 static inline char *host_typetostr(int type)
 {
 	switch (type) {
-	case HCI_BREDR:
+	case HCI_PRIMARY:
 		return "BR/EDR";
 	case HCI_AMP:
 		return "AMP";

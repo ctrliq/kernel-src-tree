@@ -67,7 +67,7 @@ void __ptrace_link(struct task_struct *child, struct task_struct *new_parent)
  * re-attaches and performs a WNOHANG wait(2), it may fail.
  *
  * CONTEXT:
- * write_lock_irq(tasklist_lock)
+ * qwrite_lock_irq(tasklist_lock)
  */
 void __ptrace_unlink(struct task_struct *child)
 {
@@ -196,7 +196,7 @@ static int ptrace_check_attach(struct task_struct *child, bool ignore_state)
 		if (ignore_state || ptrace_freeze_traced(child))
 			ret = 0;
 	}
-	read_unlock(&tasklist_lock);
+	qread_unlock(&tasklist_lock);
 
 	if (!ret && !ignore_state) {
 		if (!wait_task_inactive(child, __TASK_TRACED)) {
@@ -365,7 +365,7 @@ static int ptrace_attach(struct task_struct *task, long request,
 
 	retval = 0;
 unlock_tasklist:
-	write_unlock_irq(&tasklist_lock);
+	qwrite_unlock_irq(&tasklist_lock);
 unlock_creds:
 	mutex_unlock(&task->signal->cred_guard_mutex);
 out:
@@ -408,7 +408,7 @@ static int ptrace_traceme(void)
 			__ptrace_link(current, current->real_parent);
 		}
 	}
-	write_unlock_irq(&tasklist_lock);
+	qwrite_unlock_irq(&tasklist_lock);
 
 	return ret;
 }
@@ -486,7 +486,7 @@ static int ptrace_detach(struct task_struct *child, unsigned int data)
 		child->exit_code = data;
 		dead = __ptrace_detach(current, child);
 	}
-	write_unlock_irq(&tasklist_lock);
+	qwrite_unlock_irq(&tasklist_lock);
 
 	proc_ptrace_connector(child, PTRACE_DETACH);
 	if (unlikely(dead))
@@ -518,7 +518,7 @@ void exit_ptrace(struct task_struct *tracer)
 			list_add(&p->ptrace_entry, &ptrace_dead);
 	}
 
-	write_unlock_irq(&tasklist_lock);
+	qwrite_unlock_irq(&tasklist_lock);
 	BUG_ON(!list_empty(&tracer->ptraced));
 
 	list_for_each_entry_safe(p, n, &ptrace_dead, ptrace_entry) {

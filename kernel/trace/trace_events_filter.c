@@ -683,7 +683,7 @@ void print_event_filter(struct ftrace_event_call *call, struct trace_seq *s)
 	if (filter && filter->filter_string)
 		trace_seq_printf(s, "%s\n", filter->filter_string);
 	else
-		trace_seq_printf(s, "none\n");
+		trace_seq_puts(s, "none\n");
 }
 
 void print_subsystem_event_filter(struct event_subsystem *system,
@@ -696,7 +696,7 @@ void print_subsystem_event_filter(struct event_subsystem *system,
 	if (filter && filter->filter_string)
 		trace_seq_printf(s, "%s\n", filter->filter_string);
 	else
-		trace_seq_printf(s, DEFAULT_SYS_FILTER_MESSAGE "\n");
+		trace_seq_puts(s, DEFAULT_SYS_FILTER_MESSAGE "\n");
 	mutex_unlock(&event_mutex);
 }
 
@@ -1002,13 +1002,14 @@ static int init_pred(struct filter_parse_state *ps,
 		return -EINVAL;
 	}
 
-	if (is_string_field(field)) {
+	if (field->filter_type == FILTER_COMM) {
+		filter_build_regex(pred);
+		fn = filter_pred_comm;
+		pred->regex.field_len = TASK_COMM_LEN;
+	} else if (is_string_field(field)) {
 		filter_build_regex(pred);
 
-		if (!strcmp(field->name, "comm")) {
-			fn = filter_pred_comm;
-			pred->regex.field_len = TASK_COMM_LEN;
-		} else if (field->filter_type == FILTER_STATIC_STRING) {
+		if (field->filter_type == FILTER_STATIC_STRING) {
 			fn = filter_pred_string;
 			pred->regex.field_len = field->size;
 		} else if (field->filter_type == FILTER_DYN_STRING)
@@ -1031,7 +1032,7 @@ static int init_pred(struct filter_parse_state *ps,
 		}
 		pred->val = val;
 
-		if (!strcmp(field->name, "cpu"))
+		if (field->filter_type == FILTER_CPU)
 			fn = filter_pred_cpu;
 		else
 			fn = select_comparison_fn(pred->op, field->size,

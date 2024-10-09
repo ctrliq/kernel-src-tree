@@ -29,6 +29,7 @@
 #include <crypto/internal/hash.h>
 #include <linux/scatterlist.h>
 #include <uapi/linux/cifs/cifs_mount.h>
+#include <linux/uuid.h>
 #ifdef CONFIG_CIFS_SMB2
 #include "smb2pdu.h"
 #endif
@@ -239,7 +240,7 @@ struct smb_version_operations {
 	void (*print_stats)(struct seq_file *m, struct cifs_tcon *);
 	void (*dump_share_caps)(struct seq_file *, struct cifs_tcon *);
 	/* verify the message */
-	int (*check_message)(char *, unsigned int);
+	int (*check_message)(char *, unsigned int, struct TCP_Server_Info *);
 	bool (*is_oplock_break)(char *, struct TCP_Server_Info *);
 	void (*downgrade_oplock)(struct TCP_Server_Info *,
 					struct cifsInodeInfo *, bool);
@@ -648,6 +649,9 @@ struct TCP_Server_Info {
 #ifdef CONFIG_CIFS_SMB2
 	unsigned int	max_read;
 	unsigned int	max_write;
+	__u8		preauth_hash[512];
+	struct delayed_work reconnect; /* reconnect workqueue job */
+	struct mutex reconnect_mutex; /* prevent simultaneous reconnects */
 #endif /* CONFIG_CIFS_SMB2 */
 	unsigned long echo_interval;
 };
@@ -731,7 +735,7 @@ compare_mid(__u16 mid, const struct smb_hdr *smb)
  *
  * Note that this might make for "interesting" allocation problems during
  * writeback however as we have to allocate an array of pointers for the
- * pages. A 16M write means ~32kb page array with PAGE_CACHE_SIZE == 4096.
+ * pages. A 16M write means ~32kb page array with PAGE_SIZE == 4096.
  *
  * For reads, there is a similar problem as we need to allocate an array
  * of kvecs to handle the receive, though that should only need to be done
@@ -750,7 +754,7 @@ compare_mid(__u16 mid, const struct smb_hdr *smb)
 
 /*
  * The default wsize is 1M. find_get_pages seems to return a maximum of 256
- * pages in a single call. With PAGE_CACHE_SIZE == 4k, this means we can fill
+ * pages in a single call. With PAGE_SIZE == 4k, this means we can fill
  * a single wsize request with a single call.
  */
 #define CIFS_DEFAULT_IOSIZE (1024 * 1024)
@@ -831,7 +835,10 @@ struct cifs_ses {
 	bool need_reconnect:1; /* connection reset, uid now invalid */
 #ifdef CONFIG_CIFS_SMB2
 	__u16 session_flags;
-	char smb3signingkey[SMB3_SIGN_KEY_SIZE]; /* for signing smb3 packets */
+	__u8 smb3signingkey[SMB3_SIGN_KEY_SIZE];
+	__u8 smb3encryptionkey[SMB3_SIGN_KEY_SIZE];
+	__u8 smb3decryptionkey[SMB3_SIGN_KEY_SIZE];
+	__u8 preauth_hash[512];
 #endif /* CONFIG_CIFS_SMB2 */
 };
 
@@ -848,6 +855,7 @@ cap_unix(struct cifs_ses *ses)
 struct cifs_tcon {
 	struct list_head tcon_list;
 	int tc_count;
+	struct list_head rlist; /* reconnect list */
 	struct list_head openFileList;
 	spinlock_t open_file_lock; /* protects list above */
 	struct cifs_ses *ses;	/* pointer to session associated with */
@@ -921,6 +929,7 @@ struct cifs_tcon {
 	bool broken_posix_open; /* e.g. Samba server versions < 3.3.2, 3.2.9 */
 	bool broken_sparse_sup; /* if server or share does not support sparse */
 	bool need_reconnect:1; /* connection reset, tid now invalid */
+	bool need_reopen_files:1; /* need to reopen tcon file handles */
 	bool use_resilient:1; /* use resilient instead of durable handles */
 	bool use_persistent:1; /* use persistent instead of durable handles */
 #ifdef CONFIG_CIFS_SMB2
@@ -1612,11 +1621,11 @@ GLOBAL_EXTERN atomic_t midCount;
 
 /* Misc globals */
 GLOBAL_EXTERN bool enable_oplocks; /* enable or disable oplocks */
-GLOBAL_EXTERN unsigned int lookupCacheEnabled;
+GLOBAL_EXTERN bool lookupCacheEnabled;
 GLOBAL_EXTERN unsigned int global_secflags;	/* if on, session setup sent
 				with more secure ntlmssp2 challenge/resp */
 GLOBAL_EXTERN unsigned int sign_CIFS_PDUs;  /* enable smb packet signing */
-GLOBAL_EXTERN unsigned int linuxExtEnabled;/*enable Linux/Unix CIFS extensions*/
+GLOBAL_EXTERN bool linuxExtEnabled;/*enable Linux/Unix CIFS extensions*/
 GLOBAL_EXTERN unsigned int CIFSMaxBufSize;  /* max size not including hdr */
 GLOBAL_EXTERN unsigned int cifs_min_rcv;    /* min size of big ntwrk buf pool */
 GLOBAL_EXTERN unsigned int cifs_min_small;  /* min size of small buf pool */
@@ -1637,6 +1646,7 @@ void cifs_oplock_break(struct work_struct *work);
 
 extern const struct slow_work_ops cifs_oplock_break_ops;
 extern struct workqueue_struct *cifsiod_wq;
+extern __u32 cifs_lock_secret;
 
 extern mempool_t *cifs_mid_poolp;
 

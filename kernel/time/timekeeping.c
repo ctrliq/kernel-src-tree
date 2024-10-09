@@ -22,6 +22,7 @@
 #include <linux/tick.h>
 #include <linux/stop_machine.h>
 #include <linux/pvclock_gtod.h>
+#include <linux/compiler.h>
 
 #include "tick-internal.h"
 #include "ntp_internal.h"
@@ -35,6 +36,23 @@ static struct timekeeper timekeeper;
 static DEFINE_RAW_SPINLOCK(timekeeper_lock);
 static seqcount_t timekeeper_seq;
 static struct timekeeper shadow_timekeeper;
+
+/**
+ * struct tk_fast - NMI safe timekeeper
+ * @seq:	Sequence counter for protecting updates. The lowest bit
+ *		is the index for the tk_read_base array
+ * @base:	tk_read_base array. Access is indexed by the lowest bit of
+ *		@seq.
+ *
+ * See @update_fast_timekeeper() below.
+ */
+struct tk_fast {
+	seqcount_t		seq;
+	struct tk_read_base	base[2];
+};
+
+static struct tk_fast tk_fast_mono ____cacheline_aligned;
+static struct tk_fast tk_fast_raw  ____cacheline_aligned;
 
 /* flag for if timekeeping is suspended */
 int __read_mostly timekeeping_suspended;
@@ -204,6 +222,121 @@ static inline s64 timekeeping_get_ns(struct tk_read_base *tkr)
 	return timekeeping_delta_to_ns(tkr, delta);
 }
 
+/**
+ * update_fast_timekeeper - Update the fast and NMI safe monotonic timekeeper.
+ * @tkr: Timekeeping readout base from which we take the update
+ *
+ * We want to use this from any context including NMI and tracing /
+ * instrumenting the timekeeping code itself.
+ *
+ * So we handle this differently than the other timekeeping accessor
+ * functions which retry when the sequence count has changed. The
+ * update side does:
+ *
+ * smp_wmb();	<- Ensure that the last base[1] update is visible
+ * tkf->seq++;
+ * smp_wmb();	<- Ensure that the seqcount update is visible
+ * update(tkf->base[0], tkr);
+ * smp_wmb();	<- Ensure that the base[0] update is visible
+ * tkf->seq++;
+ * smp_wmb();	<- Ensure that the seqcount update is visible
+ * update(tkf->base[1], tkr);
+ *
+ * The reader side does:
+ *
+ * do {
+ *	seq = tkf->seq;
+ *	smp_rmb();
+ *	idx = seq & 0x01;
+ *	now = now(tkf->base[idx]);
+ *	smp_rmb();
+ * } while (seq != tkf->seq)
+ *
+ * As long as we update base[0] readers are forced off to
+ * base[1]. Once base[0] is updated readers are redirected to base[0]
+ * and the base[1] update takes place.
+ *
+ * So if a NMI hits the update of base[0] then it will use base[1]
+ * which is still consistent. In the worst case this can result is a
+ * slightly wrong timestamp (a few nanoseconds). See
+ * @ktime_get_mono_fast_ns.
+ */
+static void update_fast_timekeeper(struct tk_read_base *tkr, struct tk_fast *tkf)
+{
+	struct tk_read_base *base = tkf->base;
+
+	/* Force readers off to base[1] */
+	raw_write_seqcount_latch(&tkf->seq);
+
+	/* Update base[0] */
+	memcpy(base, tkr, sizeof(*base));
+
+	/* Force readers back to base[0] */
+	raw_write_seqcount_latch(&tkf->seq);
+
+	/* Update base[1] */
+	memcpy(base + 1, base, sizeof(*base));
+}
+
+/**
+ * ktime_get_mono_fast_ns - Fast NMI safe access to clock monotonic
+ *
+ * This timestamp is not guaranteed to be monotonic across an update.
+ * The timestamp is calculated by:
+ *
+ *	now = base_mono + clock_delta * slope
+ *
+ * So if the update lowers the slope, readers who are forced to the
+ * not yet updated second array are still using the old steeper slope.
+ *
+ * tmono
+ * ^
+ * |    o  n
+ * |   o n
+ * |  u
+ * | o
+ * |o
+ * |12345678---> reader order
+ *
+ * o = old slope
+ * u = update
+ * n = new slope
+ *
+ * So reader 6 will observe time going backwards versus reader 5.
+ *
+ * While other CPUs are likely to be able observe that, the only way
+ * for a CPU local observation is when an NMI hits in the middle of
+ * the update. Timestamps taken from that NMI context might be ahead
+ * of the following timestamps. Callers need to be aware of that and
+ * deal with it.
+ */
+static __always_inline u64 __ktime_get_fast_ns(struct tk_fast *tkf)
+{
+	struct tk_read_base *tkr;
+	unsigned int seq;
+	u64 now;
+
+	do {
+		seq = raw_read_seqcount(&tkf->seq);
+		tkr = tkf->base + (seq & 0x01);
+		now = ktime_to_ns(tkr->base) + timekeeping_get_ns(tkr);
+	} while (read_seqcount_retry(&tkf->seq, seq));
+
+	return now;
+}
+
+u64 ktime_get_mono_fast_ns(void)
+{
+	return __ktime_get_fast_ns(&tk_fast_mono);
+}
+EXPORT_SYMBOL_GPL(ktime_get_mono_fast_ns);
+
+u64 ktime_get_raw_fast_ns(void)
+{
+	return __ktime_get_fast_ns(&tk_fast_raw);
+}
+EXPORT_SYMBOL_GPL(ktime_get_raw_fast_ns);
+
 static inline s64 timekeeping_cycles_to_ns(struct tk_read_base *tkr,
 					    cycle_t cycles)
 {
@@ -310,6 +443,9 @@ static void timekeeping_update(struct timekeeper *tk, unsigned int action)
 
 	if (action & TK_MIRROR)
 		memcpy(&shadow_timekeeper, &timekeeper, sizeof(timekeeper));
+
+	update_fast_timekeeper(&tk->tkr_mono, &tk_fast_mono);
+	update_fast_timekeeper(&tk->tkr_raw,  &tk_fast_raw);
 }
 
 /**
@@ -1061,7 +1197,7 @@ u64 timekeeping_max_deferment(void)
  *
  *  XXX - Do be sure to remove it once all arches implement it.
  */
-void __attribute__((weak)) read_persistent_clock(struct timespec *ts)
+void __weak read_persistent_clock(struct timespec *ts)
 {
 	ts->tv_sec = 0;
 	ts->tv_nsec = 0;
@@ -1076,7 +1212,7 @@ void __attribute__((weak)) read_persistent_clock(struct timespec *ts)
  *
  *  XXX - Do be sure to remove it once all arches implement it.
  */
-void __attribute__((weak)) read_boot_clock(struct timespec *ts)
+void __weak read_boot_clock(struct timespec *ts)
 {
 	ts->tv_sec = 0;
 	ts->tv_nsec = 0;
@@ -1134,7 +1270,7 @@ void __init timekeeping_init(void)
 	tmp.tv_nsec = 0;
 	tk_set_sleep_time(tk, tmp);
 
-	memcpy(&shadow_timekeeper, &timekeeper, sizeof(timekeeper));
+	timekeeping_update(tk, TK_MIRROR | TK_CLOCK_WAS_SET);
 
 	write_seqcount_end(&timekeeper_seq);
 	raw_spin_unlock_irqrestore(&timekeeper_lock, flags);
@@ -1739,8 +1875,9 @@ void update_wall_time(void)
 	 * memcpy under the timekeeper_seq against one before we start
 	 * updating.
 	 */
+	timekeeping_update(tk, clock_set);
 	memcpy(real_tk, tk, sizeof(*tk));
-	timekeeping_update(real_tk, clock_set);
+	/* The memcpy must come last. Do not put anything here! */
 	write_seqcount_end(&timekeeper_seq);
 out:
 	raw_spin_unlock_irqrestore(&timekeeper_lock, flags);

@@ -268,10 +268,6 @@ void i40e_init_pf_fcoe(struct i40e_pf *pf)
 	struct i40e_hw *hw = &pf->hw;
 	u32 val;
 
-	/* RHEL7.1 has FCoE disabled */
-	dev_info(&pf->pdev->dev, "FCoE capability is disabled\n");
-	return 0;
-
 	pf->flags &= ~I40E_FLAG_FCOE_ENABLED;
 	pf->num_fcoe_qps = 0;
 	pf->fcoe_hmc_cntx_num = 0;
@@ -1526,12 +1522,12 @@ void i40e_fcoe_config_netdev(struct net_device *netdev, struct i40e_vsi *vsi)
 	 * same PCI function.
 	 */
 	netdev->dev_port = 1;
-	spin_lock_bh(&vsi->mac_filter_list_lock);
-	i40e_add_filter(vsi, hw->mac.san_addr, 0, false, false);
-	i40e_add_filter(vsi, (u8[6]) FC_FCOE_FLOGI_MAC, 0, false, false);
-	i40e_add_filter(vsi, FIP_ALL_FCOE_MACS, 0, false, false);
-	i40e_add_filter(vsi, FIP_ALL_ENODE_MACS, 0, false, false);
-	spin_unlock_bh(&vsi->mac_filter_list_lock);
+	spin_lock_bh(&vsi->mac_filter_hash_lock);
+	i40e_add_filter(vsi, hw->mac.san_addr, 0);
+	i40e_add_filter(vsi, (u8[6]) FC_FCOE_FLOGI_MAC, 0);
+	i40e_add_filter(vsi, FIP_ALL_FCOE_MACS, 0);
+	i40e_add_filter(vsi, FIP_ALL_ENODE_MACS, 0);
+	spin_unlock_bh(&vsi->mac_filter_hash_lock);
 
 	/* use san mac */
 	ether_addr_copy(netdev->dev_addr, hw->mac.san_addr);

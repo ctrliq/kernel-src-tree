@@ -178,40 +178,81 @@ static inline unsigned int calc_tx_flits_ofld(const struct sk_buff *skb)
 	return flits + sgl_len(cnt);
 }
 
-static struct shash_desc *chcr_alloc_shash(unsigned int ds)
+static inline void get_aes_decrypt_key(unsigned char *dec_key,
+				       const unsigned char *key,
+				       unsigned int keylength)
+{
+	u32 temp;
+	u32 w_ring[MAX_NK];
+	int i, j, k;
+	u8  nr, nk;
+
+	switch (keylength) {
+	case AES_KEYLENGTH_128BIT:
+		nk = KEYLENGTH_4BYTES;
+		nr = NUMBER_OF_ROUNDS_10;
+		break;
+	case AES_KEYLENGTH_192BIT:
+		nk = KEYLENGTH_6BYTES;
+		nr = NUMBER_OF_ROUNDS_12;
+		break;
+	case AES_KEYLENGTH_256BIT:
+		nk = KEYLENGTH_8BYTES;
+		nr = NUMBER_OF_ROUNDS_14;
+		break;
+	default:
+		return;
+	}
+	for (i = 0; i < nk; i++)
+		w_ring[i] = be32_to_cpu(*(u32 *)&key[4 * i]);
+
+	i = 0;
+	temp = w_ring[nk - 1];
+	while (i + nk < (nr + 1) * 4) {
+		if (!(i % nk)) {
+			/* RotWord(temp) */
+			temp = (temp << 8) | (temp >> 24);
+			temp = aes_ks_subword(temp);
+			temp ^= round_constant[i / nk];
+		} else if (nk == 8 && (i % 4 == 0)) {
+			temp = aes_ks_subword(temp);
+		}
+		w_ring[i % nk] ^= temp;
+		temp = w_ring[i % nk];
+		i++;
+	}
+	i--;
+	for (k = 0, j = i % nk; k < nk; k++) {
+		*((u32 *)dec_key + k) = htonl(w_ring[j]);
+		j--;
+		if (j < 0)
+			j += nk;
+	}
+}
+
+static struct crypto_shash *chcr_alloc_shash(unsigned int ds)
 {
 	struct crypto_shash *base_hash = NULL;
-	struct shash_desc *desc;
 
 	switch (ds) {
 	case SHA1_DIGEST_SIZE:
-		base_hash = crypto_alloc_shash("sha1-generic", 0, 0);
+		base_hash = crypto_alloc_shash("sha1", 0, 0);
 		break;
 	case SHA224_DIGEST_SIZE:
-		base_hash = crypto_alloc_shash("sha224-generic", 0, 0);
+		base_hash = crypto_alloc_shash("sha224", 0, 0);
 		break;
 	case SHA256_DIGEST_SIZE:
-		base_hash = crypto_alloc_shash("sha256-generic", 0, 0);
+		base_hash = crypto_alloc_shash("sha256", 0, 0);
 		break;
 	case SHA384_DIGEST_SIZE:
-		base_hash = crypto_alloc_shash("sha384-generic", 0, 0);
+		base_hash = crypto_alloc_shash("sha384", 0, 0);
 		break;
 	case SHA512_DIGEST_SIZE:
-		base_hash = crypto_alloc_shash("sha512-generic", 0, 0);
+		base_hash = crypto_alloc_shash("sha512", 0, 0);
 		break;
 	}
-	if (IS_ERR(base_hash)) {
-		pr_err("Can not allocate sha-generic algo.\n");
-		return (void *)base_hash;
-	}
 
-	desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(base_hash),
-		       GFP_KERNEL);
-	if (!desc)
-		return ERR_PTR(-ENOMEM);
-	desc->tfm = base_hash;
-	desc->flags = crypto_shash_get_flags(base_hash);
-	return desc;
+	return base_hash;
 }
 
 static int chcr_compute_partial_hash(struct shash_desc *desc,
@@ -410,7 +451,7 @@ static inline void create_wreq(struct chcr_context *ctx,
 {
 	struct uld_ctx *u_ctx = ULD_CTX(ctx);
 	int iv_loc = IV_DSGL;
-	int qid = u_ctx->lldi.rxq_ids[ctx->tx_channel_id];
+	int qid = u_ctx->lldi.rxq_ids[ctx->rx_qidx];
 	unsigned int immdatalen = 0, nr_frags = 0;
 
 	if (is_ofld_imm(skb)) {
@@ -430,10 +471,10 @@ static inline void create_wreq(struct chcr_context *ctx,
 				    (calc_tx_flits_ofld(skb) * 8), 16)));
 	chcr_req->wreq.cookie = cpu_to_be64((uintptr_t)req);
 	chcr_req->wreq.rx_chid_to_rx_q_id =
-		FILL_WR_RX_Q_ID(ctx->dev->tx_channel_id, qid,
-				(hash_sz) ? IV_NOP : iv_loc);
-
-	chcr_req->ulptx.cmd_dest = FILL_ULPTX_CMD_DEST(ctx->dev->tx_channel_id);
+		FILL_WR_RX_Q_ID(ctx->dev->rx_channel_id, qid,
+				(hash_sz) ? IV_NOP : iv_loc, ctx->tx_qidx);
+	chcr_req->ulptx.cmd_dest = FILL_ULPTX_CMD_DEST(ctx->dev->tx_channel_id,
+						       qid);
 	chcr_req->ulptx.len = htonl((DIV_ROUND_UP((calc_tx_flits_ofld(skb) * 8),
 					16) - ((sizeof(chcr_req->wreq)) >> 4)));
 
@@ -497,7 +538,7 @@ static struct sk_buff
 	chcr_req = (struct chcr_wr *)__skb_put(skb, transhdr_len);
 	memset(chcr_req, 0, transhdr_len);
 	chcr_req->sec_cpl.op_ivinsrtofst =
-		FILL_SEC_CPL_OP_IVINSR(ctx->dev->tx_channel_id, 2, 1);
+		FILL_SEC_CPL_OP_IVINSR(ctx->dev->rx_channel_id, 2, 1);
 
 	chcr_req->sec_cpl.pldlen = htonl(ivsize + req->nbytes);
 	chcr_req->sec_cpl.aadstart_cipherstop_hi =
@@ -586,16 +627,18 @@ badkey_err:
 
 static int cxgb4_is_crypto_q_full(struct net_device *dev, unsigned int idx)
 {
-	int ret = 0;
-	struct sge_ofld_txq *q;
 	struct adapter *adap = netdev2adap(dev);
+	struct sge_uld_txq_info *txq_info =
+		adap->sge.uld_txq_info[CXGB4_TX_CRYPTO];
+	struct sge_uld_txq *txq;
+	int ret = 0;
 
 	local_bh_disable();
-	q = &adap->sge.ofldtxq[idx];
-	spin_lock(&q->sendq.lock);
-	if (q->full)
+	txq = &txq_info->uldtxq[idx];
+	spin_lock(&txq->sendq.lock);
+	if (txq->full)
 		ret = -1;
-	spin_unlock(&q->sendq.lock);
+	spin_unlock(&txq->sendq.lock);
 	local_bh_enable();
 	return ret;
 }
@@ -608,19 +651,19 @@ static int chcr_aes_encrypt(struct ablkcipher_request *req)
 	struct sk_buff *skb;
 
 	if (unlikely(cxgb4_is_crypto_q_full(u_ctx->lldi.ports[0],
-					    ctx->tx_channel_id))) {
+					    ctx->tx_qidx))) {
 		if (!(req->base.flags & CRYPTO_TFM_REQ_MAY_BACKLOG))
 			return -EBUSY;
 	}
 
-	skb = create_cipher_wr(req, u_ctx->lldi.rxq_ids[ctx->tx_channel_id],
+	skb = create_cipher_wr(req, u_ctx->lldi.rxq_ids[ctx->rx_qidx],
 			       CHCR_ENCRYPT_OP);
 	if (IS_ERR(skb)) {
 		pr_err("chcr : %s : Failed to form WR. No memory\n", __func__);
 		return  PTR_ERR(skb);
 	}
 	skb->dev = u_ctx->lldi.ports[0];
-	set_wr_txq(skb, CPL_PRIORITY_DATA, ctx->tx_channel_id);
+	set_wr_txq(skb, CPL_PRIORITY_DATA, ctx->tx_qidx);
 	chcr_send_wr(skb);
 	return -EINPROGRESS;
 }
@@ -633,19 +676,19 @@ static int chcr_aes_decrypt(struct ablkcipher_request *req)
 	struct sk_buff *skb;
 
 	if (unlikely(cxgb4_is_crypto_q_full(u_ctx->lldi.ports[0],
-					    ctx->tx_channel_id))) {
+					    ctx->tx_qidx))) {
 		if (!(req->base.flags & CRYPTO_TFM_REQ_MAY_BACKLOG))
 			return -EBUSY;
 	}
 
-	skb = create_cipher_wr(req, u_ctx->lldi.rxq_ids[0],
+	skb = create_cipher_wr(req, u_ctx->lldi.rxq_ids[ctx->rx_qidx],
 			       CHCR_DECRYPT_OP);
 	if (IS_ERR(skb)) {
 		pr_err("chcr : %s : Failed to form WR. No memory\n", __func__);
 		return PTR_ERR(skb);
 	}
 	skb->dev = u_ctx->lldi.ports[0];
-	set_wr_txq(skb, CPL_PRIORITY_DATA, ctx->tx_channel_id);
+	set_wr_txq(skb, CPL_PRIORITY_DATA, ctx->tx_qidx);
 	chcr_send_wr(skb);
 	return -EINPROGRESS;
 }
@@ -653,7 +696,9 @@ static int chcr_aes_decrypt(struct ablkcipher_request *req)
 static int chcr_device_init(struct chcr_context *ctx)
 {
 	struct uld_ctx *u_ctx;
+	struct adapter *adap;
 	unsigned int id;
+	int txq_perchan, txq_idx, ntxq;
 	int err = 0, rxq_perchan, rxq_idx;
 
 	id = smp_processor_id();
@@ -664,12 +709,20 @@ static int chcr_device_init(struct chcr_context *ctx)
 			goto out;
 		}
 		u_ctx = ULD_CTX(ctx);
+		adap = padap(ctx->dev);
+		ntxq = min_not_zero((unsigned int)u_ctx->lldi.nrxq,
+				    adap->vres.ncrypto_fc);
 		rxq_perchan = u_ctx->lldi.nrxq / u_ctx->lldi.nchan;
-		ctx->dev->tx_channel_id = 0;
+		txq_perchan = ntxq / u_ctx->lldi.nchan;
 		rxq_idx = ctx->dev->tx_channel_id * rxq_perchan;
 		rxq_idx += id % rxq_perchan;
+		txq_idx = ctx->dev->tx_channel_id * txq_perchan;
+		txq_idx += id % txq_perchan;
 		spin_lock(&ctx->dev->lock_chcr_dev);
-		ctx->tx_channel_id = rxq_idx;
+		ctx->rx_qidx = rxq_idx;
+		ctx->tx_qidx = txq_idx;
+		ctx->dev->tx_channel_id = !ctx->dev->tx_channel_id;
+		ctx->dev->rx_channel_id = 0;
 		spin_unlock(&ctx->dev->lock_chcr_dev);
 	}
 out:
@@ -718,6 +771,11 @@ static int get_alg_config(struct algo_param *params,
 	return 0;
 }
 
+static inline void chcr_free_shash(struct crypto_shash *base_hash)
+{
+		crypto_free_shash(base_hash);
+}
+
 /**
  *	create_hash_wr - Create hash work request
  *	@req - Cipher req base
@@ -757,7 +815,7 @@ static struct sk_buff *create_hash_wr(struct ahash_request *req,
 	memset(chcr_req, 0, transhdr_len);
 
 	chcr_req->sec_cpl.op_ivinsrtofst =
-		FILL_SEC_CPL_OP_IVINSR(ctx->dev->tx_channel_id, 2, 0);
+		FILL_SEC_CPL_OP_IVINSR(ctx->dev->rx_channel_id, 2, 0);
 	chcr_req->sec_cpl.pldlen = htonl(param->bfr_len + param->sg_len);
 
 	chcr_req->sec_cpl.aadstart_cipherstop_hi =
@@ -816,7 +874,7 @@ static int chcr_ahash_update(struct ahash_request *req)
 
 	u_ctx = ULD_CTX(ctx);
 	if (unlikely(cxgb4_is_crypto_q_full(u_ctx->lldi.ports[0],
-					    ctx->tx_channel_id))) {
+					    ctx->tx_qidx))) {
 		if (!(req->base.flags & CRYPTO_TFM_REQ_MAY_BACKLOG))
 			return -EBUSY;
 	}
@@ -856,7 +914,7 @@ static int chcr_ahash_update(struct ahash_request *req)
 	}
 	req_ctx->reqlen = remainder;
 	skb->dev = u_ctx->lldi.ports[0];
-	set_wr_txq(skb, CPL_PRIORITY_DATA, ctx->tx_channel_id);
+	set_wr_txq(skb, CPL_PRIORITY_DATA, ctx->tx_qidx);
 	chcr_send_wr(skb);
 
 	return -EINPROGRESS;
@@ -909,7 +967,7 @@ static int chcr_ahash_final(struct ahash_request *req)
 		return -ENOMEM;
 
 	skb->dev = u_ctx->lldi.ports[0];
-	set_wr_txq(skb, CPL_PRIORITY_DATA, ctx->tx_channel_id);
+	set_wr_txq(skb, CPL_PRIORITY_DATA, ctx->tx_qidx);
 	chcr_send_wr(skb);
 	return -EINPROGRESS;
 }
@@ -928,7 +986,7 @@ static int chcr_ahash_finup(struct ahash_request *req)
 	u_ctx = ULD_CTX(ctx);
 
 	if (unlikely(cxgb4_is_crypto_q_full(u_ctx->lldi.ports[0],
-					    ctx->tx_channel_id))) {
+					    ctx->tx_qidx))) {
 		if (!(req->base.flags & CRYPTO_TFM_REQ_MAY_BACKLOG))
 			return -EBUSY;
 	}
@@ -960,7 +1018,7 @@ static int chcr_ahash_finup(struct ahash_request *req)
 		return -ENOMEM;
 
 	skb->dev = u_ctx->lldi.ports[0];
-	set_wr_txq(skb, CPL_PRIORITY_DATA, ctx->tx_channel_id);
+	set_wr_txq(skb, CPL_PRIORITY_DATA, ctx->tx_qidx);
 	chcr_send_wr(skb);
 
 	return -EINPROGRESS;
@@ -981,7 +1039,7 @@ static int chcr_ahash_digest(struct ahash_request *req)
 
 	u_ctx = ULD_CTX(ctx);
 	if (unlikely(cxgb4_is_crypto_q_full(u_ctx->lldi.ports[0],
-					    ctx->tx_channel_id))) {
+					    ctx->tx_qidx))) {
 		if (!(req->base.flags & CRYPTO_TFM_REQ_MAY_BACKLOG))
 			return -EBUSY;
 	}
@@ -1011,7 +1069,7 @@ static int chcr_ahash_digest(struct ahash_request *req)
 		return -ENOMEM;
 
 	skb->dev = u_ctx->lldi.ports[0];
-	set_wr_txq(skb, CPL_PRIORITY_DATA, ctx->tx_channel_id);
+	set_wr_txq(skb, CPL_PRIORITY_DATA, ctx->tx_qidx);
 	chcr_send_wr(skb);
 	return -EINPROGRESS;
 }
@@ -1053,15 +1111,16 @@ static int chcr_ahash_setkey(struct crypto_ahash *tfm, const u8 *key,
 	unsigned int bs = crypto_tfm_alg_blocksize(crypto_ahash_tfm(tfm));
 	unsigned int i, err = 0, updated_digestsize;
 
-	/*
-	 * use the key to calculate the ipad and opad. ipad will sent with the
+	SHASH_DESC_ON_STACK(shash, hmacctx->base_hash);
+
+	/* use the key to calculate the ipad and opad. ipad will sent with the
 	 * first request's data. opad will be sent with the final hash result
 	 * ipad in hmacctx->ipad and opad in hmacctx->opad location
 	 */
-	if (!hmacctx->desc)
-		return -EINVAL;
+	shash->tfm = hmacctx->base_hash;
+	shash->flags = crypto_shash_get_flags(hmacctx->base_hash);
 	if (keylen > bs) {
-		err = crypto_shash_digest(hmacctx->desc, key, keylen,
+		err = crypto_shash_digest(shash, key, keylen,
 					  hmacctx->ipad);
 		if (err)
 			goto out;
@@ -1082,13 +1141,13 @@ static int chcr_ahash_setkey(struct crypto_ahash *tfm, const u8 *key,
 		updated_digestsize = SHA256_DIGEST_SIZE;
 	else if (digestsize == SHA384_DIGEST_SIZE)
 		updated_digestsize = SHA512_DIGEST_SIZE;
-	err = chcr_compute_partial_hash(hmacctx->desc, hmacctx->ipad,
+	err = chcr_compute_partial_hash(shash, hmacctx->ipad,
 					hmacctx->ipad, digestsize);
 	if (err)
 		goto out;
 	chcr_change_order(hmacctx->ipad, updated_digestsize);
 
-	err = chcr_compute_partial_hash(hmacctx->desc, hmacctx->opad,
+	err = chcr_compute_partial_hash(shash, hmacctx->opad,
 					hmacctx->opad, digestsize);
 	if (err)
 		goto out;
@@ -1184,16 +1243,10 @@ static int chcr_hmac_cra_init(struct crypto_tfm *tfm)
 
 	crypto_ahash_set_reqsize(__crypto_ahash_cast(tfm),
 				 sizeof(struct chcr_ahash_req_ctx));
-	hmacctx->desc = chcr_alloc_shash(digestsize);
-	if (IS_ERR(hmacctx->desc))
-		return PTR_ERR(hmacctx->desc);
+	hmacctx->base_hash = chcr_alloc_shash(digestsize);
+	if (IS_ERR(hmacctx->base_hash))
+		return PTR_ERR(hmacctx->base_hash);
 	return chcr_device_init(crypto_tfm_ctx(tfm));
-}
-
-static void chcr_free_shash(struct shash_desc *desc)
-{
-	crypto_free_shash(desc->tfm);
-	kfree(desc);
 }
 
 static void chcr_hmac_cra_exit(struct crypto_tfm *tfm)
@@ -1201,9 +1254,9 @@ static void chcr_hmac_cra_exit(struct crypto_tfm *tfm)
 	struct chcr_context *ctx = crypto_tfm_ctx(tfm);
 	struct hmac_ctx *hmacctx = HMAC_CTX(ctx);
 
-	if (hmacctx->desc) {
-		chcr_free_shash(hmacctx->desc);
-		hmacctx->desc = NULL;
+	if (hmacctx->base_hash) {
+		chcr_free_shash(hmacctx->base_hash);
+		hmacctx->base_hash = NULL;
 	}
 }
 

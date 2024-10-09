@@ -76,7 +76,7 @@ static __maybe_unused unsigned long mpx_mmap(unsigned long len)
 	/* Set pgoff according to addr for anon_vma */
 	pgoff = addr >> PAGE_SHIFT;
 
-	ret = mmap_region(NULL, addr, len, vm_flags, pgoff);
+	ret = mmap_region(NULL, addr, len, vm_flags, pgoff, NULL);
 	if (IS_ERR_VALUE(ret))
 		goto out;
 
@@ -896,7 +896,7 @@ static int unmap_entire_bt(struct mm_struct *mm,
 	 * avoid recursion, do_munmap() will check whether it comes
 	 * from one bounds table through VM_MPX flag.
 	 */
-	return do_munmap(mm, bt_addr, mpx_bt_size_bytes(mm));
+	return do_munmap(mm, bt_addr, mpx_bt_size_bytes(mm), NULL);
 }
 
 static int try_unmap_single_bt(struct mm_struct *mm,

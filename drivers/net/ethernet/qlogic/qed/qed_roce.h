@@ -1,5 +1,5 @@
 /* QLogic qed NIC Driver
- * Copyright (c) 2015-2016  QLogic Corporation
+ * Copyright (c) 2015-2017  QLogic Corporation
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -82,6 +82,7 @@ struct qed_rdma_info {
 	struct qed_bmap qp_map;
 	struct qed_bmap srq_map;
 	struct qed_bmap cid_map;
+	struct qed_bmap real_cid_map;
 	struct qed_bmap dpi_map;
 	struct qed_bmap toggle_bits;
 	struct qed_rdma_events events;
@@ -92,6 +93,7 @@ struct qed_rdma_info {
 	u32 num_qps;
 	u32 num_mrs;
 	u16 queue_zone_base;
+	u16 max_queue_zones;
 	enum protocol_type proto;
 };
 
@@ -153,6 +155,7 @@ struct qed_rdma_qp {
 	dma_addr_t irq_phys_addr;
 	u8 irq_num_pages;
 	bool resp_offloaded;
+	u32 cq_prod;
 
 	u8 remote_mac_addr[6];
 	u8 local_mac_addr[6];
@@ -161,36 +164,57 @@ struct qed_rdma_qp {
 	dma_addr_t shared_queue_phys_addr;
 };
 
-int
-qed_rdma_add_user(void *rdma_cxt,
-		  struct qed_rdma_add_user_out_params *out_params);
-int qed_rdma_alloc_pd(void *rdma_cxt, u16 *pd);
-int qed_rdma_alloc_tid(void *rdma_cxt, u32 *tid);
-int qed_rdma_deregister_tid(void *rdma_cxt, u32 tid);
-void qed_rdma_free_tid(void *rdma_cxt, u32 tid);
-struct qed_rdma_device *qed_rdma_query_device(void *rdma_cxt);
-struct qed_rdma_port *qed_rdma_query_port(void *rdma_cxt);
-int
-qed_rdma_register_tid(void *rdma_cxt,
-		      struct qed_rdma_register_tid_in_params *params);
-void qed_rdma_remove_user(void *rdma_cxt, u16 dpi);
-int qed_rdma_start(void *p_hwfn, struct qed_rdma_start_in_params *params);
-int qed_rdma_stop(void *rdma_cxt);
-u32 qed_rdma_get_sb_id(void *p_hwfn, u32 rel_sb_id);
-u32 qed_rdma_query_cau_timer_res(void *p_hwfn);
-void qed_rdma_cnq_prod_update(void *rdma_cxt, u8 cnq_index, u16 prod);
-void qed_rdma_resc_free(struct qed_hwfn *p_hwfn);
-void qed_async_roce_event(struct qed_hwfn *p_hwfn,
-			  struct event_ring_entry *p_eqe);
-int qed_rdma_destroy_qp(void *rdma_cxt, struct qed_rdma_qp *qp);
-int qed_rdma_modify_qp(void *rdma_cxt, struct qed_rdma_qp *qp,
-		       struct qed_rdma_modify_qp_in_params *params);
-int qed_rdma_query_qp(void *rdma_cxt, struct qed_rdma_qp *qp,
-		      struct qed_rdma_query_qp_out_params *out_params);
-
-#if IS_ENABLED(CONFIG_INFINIBAND_QEDR)
+#if IS_ENABLED(CONFIG_QED_RDMA)
 void qed_rdma_dpm_bar(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt);
+void qed_roce_async_event(struct qed_hwfn *p_hwfn,
+			  u8 fw_event_code, union rdma_eqe_data *rdma_data);
+void qed_ll2b_complete_tx_gsi_packet(struct qed_hwfn *p_hwfn,
+				     u8 connection_handle,
+				     void *cookie,
+				     dma_addr_t first_frag_addr,
+				     bool b_last_fragment, bool b_last_packet);
+void qed_ll2b_release_tx_gsi_packet(struct qed_hwfn *p_hwfn,
+				    u8 connection_handle,
+				    void *cookie,
+				    dma_addr_t first_frag_addr,
+				    bool b_last_fragment, bool b_last_packet);
+void qed_ll2b_complete_rx_gsi_packet(struct qed_hwfn *p_hwfn,
+				     u8 connection_handle,
+				     void *cookie,
+				     dma_addr_t rx_buf_addr,
+				     u16 data_length,
+				     u8 data_length_error,
+				     u16 parse_flags,
+				     u16 vlan,
+				     u32 src_mac_addr_hi,
+				     u16 src_mac_addr_lo, bool b_last_packet);
 #else
-void qed_rdma_dpm_bar(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt) {}
+static inline void qed_rdma_dpm_bar(struct qed_hwfn *p_hwfn, struct qed_ptt *p_ptt) {}
+static inline void qed_roce_async_event(struct qed_hwfn *p_hwfn,
+					u8 fw_event_code,
+					union rdma_eqe_data *rdma_data) {}
+static inline void qed_ll2b_complete_tx_gsi_packet(struct qed_hwfn *p_hwfn,
+						   u8 connection_handle,
+						   void *cookie,
+						   dma_addr_t first_frag_addr,
+						   bool b_last_fragment,
+						   bool b_last_packet) {}
+static inline void qed_ll2b_release_tx_gsi_packet(struct qed_hwfn *p_hwfn,
+						  u8 connection_handle,
+						  void *cookie,
+						  dma_addr_t first_frag_addr,
+						  bool b_last_fragment,
+						  bool b_last_packet) {}
+static inline void qed_ll2b_complete_rx_gsi_packet(struct qed_hwfn *p_hwfn,
+						   u8 connection_handle,
+						   void *cookie,
+						   dma_addr_t rx_buf_addr,
+						   u16 data_length,
+						   u8 data_length_error,
+						   u16 parse_flags,
+						   u16 vlan,
+						   u32 src_mac_addr_hi,
+						   u16 src_mac_addr_lo,
+						   bool b_last_packet) {}
 #endif
 #endif

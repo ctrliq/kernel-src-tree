@@ -167,6 +167,11 @@ static inline void do_raw_spin_unlock(raw_spinlock_t *lock) __releases(lock)
 }
 #endif
 
+#ifdef CONFIG_QUEUED_SPINLOCKS
+#define _raw_spin_lock(lock)		_raw_qspin_lock(lock)
+#define _raw_spin_lock_irq(lock)	_raw_qspin_lock_irq(lock)
+#endif
+
 /*
  * Define the various spin_lock methods.  Note we define these
  * regardless of whether CONFIG_SMP or CONFIG_PREEMPT are set. The
@@ -409,5 +414,15 @@ static inline int spin_can_lock(spinlock_t *lock)
 extern int _atomic_dec_and_lock(atomic_t *atomic, spinlock_t *lock);
 #define atomic_dec_and_lock(atomic, lock) \
 		__cond_lock(lock, _atomic_dec_and_lock(atomic, lock))
+
+/*
+ * Add qspinlock and qrwlock includes
+ */
+#ifdef CONFIG_QUEUED_RWLOCKS
+#include <generated/qrwlock.h>
+#include <generated/qrwlock_api_smp.h>
+#else
+#include <asm-generic/qrwlock_remap.h>
+#endif
 
 #endif /* __LINUX_SPINLOCK_H */

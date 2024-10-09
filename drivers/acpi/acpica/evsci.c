@@ -120,6 +120,7 @@ u32 ACPI_SYSTEM_XFACE acpi_ev_gpe_xrupt_handler(void *context)
 
 	interrupt_handled |= acpi_ev_gpe_detect(gpe_xrupt_list);
 
+	acpi_sci_count++;
 	return_UINT32(interrupt_handled);
 }
 

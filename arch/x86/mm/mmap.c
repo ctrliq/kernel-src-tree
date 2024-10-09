@@ -65,18 +65,18 @@ static int mmap_is_legacy(void)
 	return sysctl_legacy_va_layout;
 }
 
-static unsigned long mmap_rnd(void)
+unsigned long arch_mmap_rnd(void)
 {
 	unsigned long rnd;
 
-	/*
-	 *  8 bits of randomness in 32bit mmaps, 20 address space bits
-	 * 28 bits of randomness in 64bit mmaps, 40 address space bits
-	 */
 	if (mmap_is_ia32())
-		rnd = (unsigned long)get_random_int() % (1<<8);
+#ifdef CONFIG_COMPAT
+		rnd = get_random_long() & ((1UL << mmap_rnd_compat_bits) - 1);
+#else
+		rnd = get_random_long() & ((1UL << mmap_rnd_bits) - 1);
+#endif
 	else
-		rnd = (unsigned long)get_random_int() % (1<<28);
+		rnd = get_random_long() & ((1UL << mmap_rnd_bits) - 1);
 
 	return rnd << PAGE_SHIFT;
 }
@@ -114,7 +114,7 @@ void arch_pick_mmap_layout(struct mm_struct *mm)
 	unsigned long random_factor = 0UL;
 
 	if (current->flags & PF_RANDOMIZE)
-		random_factor = mmap_rnd();
+		random_factor = arch_mmap_rnd();
 
 	mm->mmap_legacy_base = mmap_legacy_base(random_factor);
 

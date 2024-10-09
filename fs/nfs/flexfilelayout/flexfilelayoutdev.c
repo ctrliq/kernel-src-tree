@@ -220,22 +220,13 @@ outerr:
 	return false;
 }
 
-static u64
-end_offset(u64 start, u64 len)
-{
-	u64 end;
-
-	end = start + len;
-	return end >= start ? end : NFS4_MAX_UINT64;
-}
-
 static void extend_ds_error(struct nfs4_ff_layout_ds_err *err,
 			    u64 offset, u64 length)
 {
 	u64 end;
 
-	end = max_t(u64, end_offset(err->offset, err->length),
-		    end_offset(offset, length));
+	end = max_t(u64, pnfs_end_offset(err->offset, err->length),
+		    pnfs_end_offset(offset, length));
 	err->offset = min_t(u64, err->offset, offset);
 	err->length = end - err->offset;
 }
@@ -250,15 +241,16 @@ ff_ds_error_match(const struct nfs4_ff_layout_ds_err *e1,
 		return e1->opnum < e2->opnum ? -1 : 1;
 	if (e1->status != e2->status)
 		return e1->status < e2->status ? -1 : 1;
-	ret = memcmp(&e1->stateid, &e2->stateid, sizeof(e1->stateid));
+	ret = memcmp(e1->stateid.data, e2->stateid.data,
+			sizeof(e1->stateid.data));
 	if (ret != 0)
 		return ret;
 	ret = memcmp(&e1->deviceid, &e2->deviceid, sizeof(e1->deviceid));
 	if (ret != 0)
 		return ret;
-	if (end_offset(e1->offset, e1->length) < e2->offset)
+	if (pnfs_end_offset(e1->offset, e1->length) < e2->offset)
 		return -1;
-	if (e1->offset > end_offset(e2->offset, e2->length))
+	if (e1->offset > pnfs_end_offset(e2->offset, e2->length))
 		return 1;
 	/* If ranges overlap or are contiguous, they are the same */
 	return 0;
@@ -391,6 +383,7 @@ nfs4_ff_layout_prepare_ds(struct pnfs_layout_segment *lseg, u32 ds_idx,
 	struct inode *ino = lseg->pls_layout->plh_inode;
 	struct nfs_server *s = NFS_SERVER(ino);
 	unsigned int max_payload;
+	int status;
 
 	if (!ff_layout_mirror_valid(lseg, mirror, true)) {
 		pr_err_ratelimited("NFS: %s: No data server for offset index %d\n",
@@ -400,7 +393,7 @@ nfs4_ff_layout_prepare_ds(struct pnfs_layout_segment *lseg, u32 ds_idx,
 
 	devid = &mirror->mirror_ds->id_node;
 	if (ff_layout_test_devid_unavailable(devid))
-		goto out;
+		goto out_fail;
 
 	ds = mirror->mirror_ds->ds;
 	/* matching smp_wmb() in _nfs4_pnfs_v3/4_ds_connect */
@@ -411,7 +404,7 @@ nfs4_ff_layout_prepare_ds(struct pnfs_layout_segment *lseg, u32 ds_idx,
 	/* FIXME: For now we assume the server sent only one version of NFS
 	 * to use for the DS.
 	 */
-	nfs4_pnfs_ds_connect(s, ds, devid, dataserver_timeo,
+	status = nfs4_pnfs_ds_connect(s, ds, devid, dataserver_timeo,
 			     dataserver_retrans,
 			     mirror->mirror_ds->ds_versions[0].version,
 			     mirror->mirror_ds->ds_versions[0].minor_version,
@@ -426,21 +419,16 @@ nfs4_ff_layout_prepare_ds(struct pnfs_layout_segment *lseg, u32 ds_idx,
 			mirror->mirror_ds->ds_versions[0].rsize = max_payload;
 		if (mirror->mirror_ds->ds_versions[0].wsize > max_payload)
 			mirror->mirror_ds->ds_versions[0].wsize = max_payload;
-	} else {
-		ff_layout_track_ds_error(FF_LAYOUT_FROM_HDR(lseg->pls_layout),
-					 mirror, lseg->pls_range.offset,
-					 lseg->pls_range.length, NFS4ERR_NXIO,
-					 OP_ILLEGAL, GFP_NOIO);
-		if (!fail_return) {
-			if (ff_layout_has_available_ds(lseg))
-				set_bit(NFS_LAYOUT_RETURN_BEFORE_CLOSE,
-					&lseg->pls_layout->plh_flags);
-			else
-				pnfs_error_mark_layout_for_return(ino, lseg);
-		} else
-			pnfs_error_mark_layout_for_return(ino, lseg);
-		ds = NULL;
+		goto out;
 	}
+	ff_layout_track_ds_error(FF_LAYOUT_FROM_HDR(lseg->pls_layout),
+				 mirror, lseg->pls_range.offset,
+				 lseg->pls_range.length, NFS4ERR_NXIO,
+				 OP_ILLEGAL, GFP_NOIO);
+out_fail:
+	if (fail_return || !ff_layout_has_available_ds(lseg))
+		pnfs_error_mark_layout_for_return(ino, lseg);
+	ds = NULL;
 out:
 	return ds;
 }
@@ -483,16 +471,6 @@ nfs4_ff_find_or_create_ds_client(struct pnfs_layout_segment *lseg, u32 ds_idx,
 	}
 }
 
-static bool is_range_intersecting(u64 offset1, u64 length1,
-				  u64 offset2, u64 length2)
-{
-	u64 end1 = end_offset(offset1, length1);
-	u64 end2 = end_offset(offset2, length2);
-
-	return (end1 == NFS4_MAX_UINT64 || end1 > offset2) &&
-	       (end2 == NFS4_MAX_UINT64 || end2 > offset1);
-}
-
 /* called with inode i_lock held */
 int ff_layout_encode_ds_ioerr(struct nfs4_flexfile_layout *flo,
 			      struct xdr_stream *xdr, int *count,
@@ -502,8 +480,10 @@ int ff_layout_encode_ds_ioerr(struct nfs4_flexfile_layout *flo,
 	__be32 *p;
 
 	list_for_each_entry_safe(err, n, &flo->error_list, list) {
-		if (!is_range_intersecting(err->offset, err->length,
-					   range->offset, range->length))
+		if (!pnfs_is_range_intersecting(err->offset,
+				pnfs_end_offset(err->offset, err->length),
+				range->offset,
+				pnfs_end_offset(range->offset, range->length)))
 			continue;
 		/* offset(8) + length(8) + stateid(NFS4_STATEID_SIZE)
 		 * + array length + deviceid(NFS4_DEVICEID4_SIZE)

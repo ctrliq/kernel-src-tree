@@ -502,14 +502,13 @@ int __inet_hash_connect(struct inet_timewait_death_row *death_row,
 		 */
 		offset &= ~1;
 
-		local_bh_disable();
 		for (i = 0; i < remaining; i++) {
 			port = low + (i + offset) % remaining;
 			if (inet_is_reserved_local_port(port))
 				continue;
 			head = &hinfo->bhash[inet_bhashfn(net, port,
 					hinfo->bhash_size)];
-			spin_lock(&head->lock);
+			spin_lock_bh(&head->lock);
 
 			/* Does not bother with rcv_saddr checks,
 			 * because the established check is already
@@ -532,7 +531,7 @@ int __inet_hash_connect(struct inet_timewait_death_row *death_row,
 			tb = inet_bind_bucket_create(hinfo->bind_bucket_cachep,
 					net, head, port);
 			if (!tb) {
-				spin_unlock(&head->lock);
+				spin_unlock_bh(&head->lock);
 				break;
 			}
 			tb->fastreuse = -1;
@@ -540,9 +539,9 @@ int __inet_hash_connect(struct inet_timewait_death_row *death_row,
 			goto ok;
 
 		next_port:
-			spin_unlock(&head->lock);
+			spin_unlock_bh(&head->lock);
+			cond_resched();
 		}
-		local_bh_enable();
 
 		return -EADDRNOTAVAIL;
 

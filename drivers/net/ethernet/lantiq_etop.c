@@ -9,7 +9,8 @@
  *   GNU General Public License for more details.
  *
  *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, see <http://www.gnu.org/licenses/>.
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307, USA.
  *
  *   Copyright (C) 2011 John Crispin <blogic@openwrt.org>
  */
@@ -541,7 +542,7 @@ ltq_etop_tx(struct sk_buff *skb, struct net_device *dev)
 	byte_offset = CPHYSADDR(skb->data) % 16;
 	ch->skb[ch->dma.desc] = skb;
 
-	dev->trans_start = jiffies;
+	netif_trans_update(dev);
 
 	spin_lock_irqsave(&priv->lock, flags);
 	desc->addr = ((unsigned int) dma_map_single(NULL, skb->data, len,
@@ -680,7 +681,7 @@ ltq_etop_tx_timeout(struct net_device *dev)
 	err = ltq_etop_hw_init(dev);
 	if (err)
 		goto err_hw;
-	dev->trans_start = jiffies;
+	netif_trans_update(dev);
 	netif_wake_queue(dev);
 	return;
 

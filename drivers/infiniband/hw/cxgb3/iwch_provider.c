@@ -58,11 +58,12 @@
 #include "iwch.h"
 #include "iwch_provider.h"
 #include "iwch_cm.h"
-#include "iwch_user.h"
+#include <rdma/cxgb3-abi.h>
 #include "common.h"
 
 static struct ib_ah *iwch_ah_create(struct ib_pd *pd,
-				    struct ib_ah_attr *ah_attr)
+				    struct ib_ah_attr *ah_attr,
+				    struct ib_udata *udata)
 {
 	return ERR_PTR(-ENOSYS);
 }

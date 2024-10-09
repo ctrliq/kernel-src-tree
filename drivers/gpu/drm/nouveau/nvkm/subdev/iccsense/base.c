@@ -30,15 +30,14 @@
 
 static bool
 nvkm_iccsense_validate_device(struct i2c_adapter *i2c, u8 addr,
-			      enum nvbios_extdev_type type, u8 rail)
+			      enum nvbios_extdev_type type)
 {
 	switch (type) {
 	case NVBIOS_EXTDEV_INA209:
 	case NVBIOS_EXTDEV_INA219:
-		return rail == 0 && nv_rd16i2cr(i2c, addr, 0x0) >= 0;
+		return nv_rd16i2cr(i2c, addr, 0x0) >= 0;
 	case NVBIOS_EXTDEV_INA3221:
-		return rail <= 3 &&
-		       nv_rd16i2cr(i2c, addr, 0xff) == 0x3220 &&
+		return nv_rd16i2cr(i2c, addr, 0xff) == 0x3220 &&
 		       nv_rd16i2cr(i2c, addr, 0xfe) == 0x5449;
 	default:
 		return false;
@@ -67,8 +66,9 @@ nvkm_iccsense_ina2x9_read(struct nvkm_iccsense *iccsense,
                           struct nvkm_iccsense_rail *rail,
 			  u8 shunt_reg, u8 bus_reg)
 {
-	return nvkm_iccsense_poll_lane(rail->i2c, rail->addr, shunt_reg, 0,
-				       bus_reg, 3, rail->mohm, 10 * 4);
+	return nvkm_iccsense_poll_lane(rail->sensor->i2c, rail->sensor->addr,
+				       shunt_reg, 0, bus_reg, 3, rail->mohm,
+				       10 * 4);
 }
 
 static int
@@ -89,37 +89,39 @@ static int
 nvkm_iccsense_ina3221_read(struct nvkm_iccsense *iccsense,
 			   struct nvkm_iccsense_rail *rail)
 {
-	return nvkm_iccsense_poll_lane(rail->i2c, rail->addr,
-				       1 + (rail->rail * 2), 3,
-				       2 + (rail->rail * 2), 3, rail->mohm,
+	return nvkm_iccsense_poll_lane(rail->sensor->i2c, rail->sensor->addr,
+				       1 + (rail->idx * 2), 3,
+				       2 + (rail->idx * 2), 3, rail->mohm,
 				       40 * 8);
 }
 
-int
-nvkm_iccsense_read(struct nvkm_iccsense *iccsense, u8 idx)
+static void
+nvkm_iccsense_sensor_config(struct nvkm_iccsense *iccsense,
+		            struct nvkm_iccsense_sensor *sensor)
 {
-	struct nvkm_iccsense_rail *rail;
-
-	if (!iccsense || idx >= iccsense->rail_count)
-		return -EINVAL;
-
-	rail = &iccsense->rails[idx];
-	if (!rail->read)
-		return -ENODEV;
-
-	return rail->read(iccsense, rail);
+	struct nvkm_subdev *subdev = &iccsense->subdev;
+	nvkm_trace(subdev, "write config of extdev %i: 0x%04x\n", sensor->id, sensor->config);
+	nv_wr16i2cr(sensor->i2c, sensor->addr, 0x00, sensor->config);
 }
 
 int
 nvkm_iccsense_read_all(struct nvkm_iccsense *iccsense)
 {
-	int result = 0, i;
-	for (i = 0; i < iccsense->rail_count; ++i) {
-		int res = nvkm_iccsense_read(iccsense, i);
-		if (res >= 0)
-			result += res;
-		else
+	int result = 0;
+	struct nvkm_iccsense_rail *rail;
+
+	if (!iccsense)
+		return -EINVAL;
+
+	list_for_each_entry(rail, &iccsense->rails, head) {
+		int res;
+		if (!rail->read)
+			return -ENODEV;
+
+		res = rail->read(iccsense, rail);
+		if (res < 0)
 			return res;
+		result += res;
 	}
 	return result;
 }
@@ -128,11 +130,85 @@ static void *
 nvkm_iccsense_dtor(struct nvkm_subdev *subdev)
 {
 	struct nvkm_iccsense *iccsense = nvkm_iccsense(subdev);
+	struct nvkm_iccsense_sensor *sensor, *tmps;
+	struct nvkm_iccsense_rail *rail, *tmpr;
 
-	if (iccsense->rails)
-		kfree(iccsense->rails);
+	list_for_each_entry_safe(sensor, tmps, &iccsense->sensors, head) {
+		list_del(&sensor->head);
+		kfree(sensor);
+	}
+	list_for_each_entry_safe(rail, tmpr, &iccsense->rails, head) {
+		list_del(&rail->head);
+		kfree(rail);
+	}
 
 	return iccsense;
+}
+
+static struct nvkm_iccsense_sensor*
+nvkm_iccsense_create_sensor(struct nvkm_iccsense *iccsense, u8 id)
+{
+	struct nvkm_subdev *subdev = &iccsense->subdev;
+	struct nvkm_bios *bios = subdev->device->bios;
+	struct nvkm_i2c *i2c = subdev->device->i2c;
+	struct nvbios_extdev_func extdev;
+	struct nvkm_i2c_bus *i2c_bus;
+	struct nvkm_iccsense_sensor *sensor;
+	u8 addr;
+
+	if (!i2c || !bios || nvbios_extdev_parse(bios, id, &extdev))
+		return NULL;
+
+	if (extdev.type == 0xff)
+		return NULL;
+
+	if (extdev.type != NVBIOS_EXTDEV_INA209 &&
+	    extdev.type != NVBIOS_EXTDEV_INA219 &&
+	    extdev.type != NVBIOS_EXTDEV_INA3221) {
+		iccsense->data_valid = false;
+		nvkm_error(subdev, "Unknown sensor type %x, power reading "
+			   "disabled\n", extdev.type);
+		return NULL;
+	}
+
+	if (extdev.bus)
+		i2c_bus = nvkm_i2c_bus_find(i2c, NVKM_I2C_BUS_SEC);
+	else
+		i2c_bus = nvkm_i2c_bus_find(i2c, NVKM_I2C_BUS_PRI);
+	if (!i2c_bus)
+		return NULL;
+
+	addr = extdev.addr >> 1;
+	if (!nvkm_iccsense_validate_device(&i2c_bus->i2c, addr,
+					   extdev.type)) {
+		iccsense->data_valid = false;
+		nvkm_warn(subdev, "found invalid sensor id: %i, power reading"
+			  "might be invalid\n", id);
+		return NULL;
+	}
+
+	sensor = kmalloc(sizeof(*sensor), GFP_KERNEL);
+	if (!sensor)
+		return NULL;
+
+	list_add_tail(&sensor->head, &iccsense->sensors);
+	sensor->id = id;
+	sensor->type = extdev.type;
+	sensor->i2c = &i2c_bus->i2c;
+	sensor->addr = addr;
+	sensor->config = 0x0;
+	return sensor;
+}
+
+static struct nvkm_iccsense_sensor*
+nvkm_iccsense_get_sensor(struct nvkm_iccsense *iccsense, u8 id)
+{
+	struct nvkm_iccsense_sensor *sensor;
+	list_for_each_entry(sensor, &iccsense->sensors, head) {
+		if (sensor->id == id)
+			return sensor;
+	}
+	return nvkm_iccsense_create_sensor(iccsense, id);
 }
 
 static int
@@ -140,77 +216,82 @@ nvkm_iccsense_oneinit(struct nvkm_subdev *subdev)
 {
 	struct nvkm_iccsense *iccsense = nvkm_iccsense(subdev);
 	struct nvkm_bios *bios = subdev->device->bios;
-	struct nvkm_i2c *i2c = subdev->device->i2c;
 	struct nvbios_iccsense stbl;
 	int i;
 
-	if (!i2c || !bios || nvbios_iccsense_parse(bios, &stbl)
-	    || !stbl.nr_entry)
+	if (!bios || nvbios_iccsense_parse(bios, &stbl) || !stbl.nr_entry)
 		return 0;
-
-	iccsense->rails = kmalloc(sizeof(*iccsense->rails) * stbl.nr_entry,
-	                          GFP_KERNEL);
-	if (!iccsense->rails)
-		return -ENOMEM;
 
 	iccsense->data_valid = true;
 	for (i = 0; i < stbl.nr_entry; ++i) {
-		struct pwr_rail_t *r = &stbl.rail[i];
-		struct nvbios_extdev_func extdev;
-		struct nvkm_iccsense_rail *rail;
-		struct nvkm_i2c_bus *i2c_bus;
-		u8 addr;
+		struct pwr_rail_t *pwr_rail = &stbl.rail[i];
+		struct nvkm_iccsense_sensor *sensor;
+		int r;
 
-		if (!r->mode || r->resistor_mohm == 0)
+		if (pwr_rail->mode != 1 || !pwr_rail->resistor_count)
 			continue;
 
-		if (nvbios_extdev_parse(bios, r->extdev_id, &extdev))
+		sensor = nvkm_iccsense_get_sensor(iccsense, pwr_rail->extdev_id);
+		if (!sensor)
 			continue;
 
-		if (extdev.type == 0xff)
-			continue;
+		if (!sensor->config)
+			sensor->config = pwr_rail->config;
+		else if (sensor->config != pwr_rail->config)
+			nvkm_error(subdev, "config mismatch found for extdev %i\n", pwr_rail->extdev_id);
 
-		if (extdev.bus)
-			i2c_bus = nvkm_i2c_bus_find(i2c, NVKM_I2C_BUS_SEC);
-		else
-			i2c_bus = nvkm_i2c_bus_find(i2c, NVKM_I2C_BUS_PRI);
-		if (!i2c_bus)
-			continue;
+		for (r = 0; r < pwr_rail->resistor_count; ++r) {
+			struct nvkm_iccsense_rail *rail;
+			struct pwr_rail_resistor_t *res = &pwr_rail->resistors[r];
+			int (*read)(struct nvkm_iccsense *,
+				    struct nvkm_iccsense_rail *);
 
-		addr = extdev.addr >> 1;
-		if (!nvkm_iccsense_validate_device(&i2c_bus->i2c, addr,
-						   extdev.type, r->rail)) {
-			iccsense->data_valid = false;
-			nvkm_warn(subdev, "found unknown or invalid rail entry"
-				  " type 0x%x rail %i, power reading might be"
-				  " invalid\n", extdev.type, r->rail);
-			continue;
+			if (!res->mohm || !res->enabled)
+				continue;
+
+			switch (sensor->type) {
+			case NVBIOS_EXTDEV_INA209:
+				read = nvkm_iccsense_ina209_read;
+				break;
+			case NVBIOS_EXTDEV_INA219:
+				read = nvkm_iccsense_ina219_read;
+				break;
+			case NVBIOS_EXTDEV_INA3221:
+				read = nvkm_iccsense_ina3221_read;
+				break;
+			default:
+				continue;
+			}
+
+			rail = kmalloc(sizeof(*rail), GFP_KERNEL);
+			if (!rail)
+				return -ENOMEM;
+
+			rail->read = read;
+			rail->sensor = sensor;
+			rail->idx = r;
+			rail->mohm = res->mohm;
+			nvkm_debug(subdev, "create rail for extdev %i: { idx: %i, mohm: %i }\n", pwr_rail->extdev_id, r, rail->mohm);
+			list_add_tail(&rail->head, &iccsense->rails);
 		}
-
-		rail = &iccsense->rails[iccsense->rail_count];
-		switch (extdev.type) {
-		case NVBIOS_EXTDEV_INA209:
-			rail->read = nvkm_iccsense_ina209_read;
-			break;
-		case NVBIOS_EXTDEV_INA219:
-			rail->read = nvkm_iccsense_ina219_read;
-			break;
-		case NVBIOS_EXTDEV_INA3221:
-			rail->read = nvkm_iccsense_ina3221_read;
-			break;
-		}
-
-		rail->addr = addr;
-		rail->rail = r->rail;
-		rail->mohm = r->resistor_mohm;
-		rail->i2c = &i2c_bus->i2c;
-		++iccsense->rail_count;
 	}
 	return 0;
 }
 
-struct nvkm_subdev_func iccsense_func = {
+static int
+nvkm_iccsense_init(struct nvkm_subdev *subdev)
+{
+	struct nvkm_iccsense *iccsense = nvkm_iccsense(subdev);
+	struct nvkm_iccsense_sensor *sensor;
+	list_for_each_entry(sensor, &iccsense->sensors, head)
+		nvkm_iccsense_sensor_config(iccsense, sensor);
+	return 0;
+}
+
+static const struct nvkm_subdev_func
+iccsense_func = {
 	.oneinit = nvkm_iccsense_oneinit,
+	.init = nvkm_iccsense_init,
 	.dtor = nvkm_iccsense_dtor,
 };
 
@@ -218,7 +299,7 @@ void
 nvkm_iccsense_ctor(struct nvkm_device *device, int index,
 		   struct nvkm_iccsense *iccsense)
 {
-	nvkm_subdev_ctor(&iccsense_func, device, index, 0, &iccsense->subdev);
+	nvkm_subdev_ctor(&iccsense_func, device, index, &iccsense->subdev);
 }
 
 int
@@ -227,6 +308,8 @@ nvkm_iccsense_new_(struct nvkm_device *device, int index,
 {
 	if (!(*iccsense = kzalloc(sizeof(**iccsense), GFP_KERNEL)))
 		return -ENOMEM;
+	INIT_LIST_HEAD(&(*iccsense)->sensors);
+	INIT_LIST_HEAD(&(*iccsense)->rails);
 	nvkm_iccsense_ctor(device, index, *iccsense);
 	return 0;
 }

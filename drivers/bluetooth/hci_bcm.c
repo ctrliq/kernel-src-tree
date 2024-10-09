@@ -806,7 +806,7 @@ static int bcm_remove(struct platform_device *pdev)
 
 static const struct hci_uart_proto bcm_proto = {
 	.id		= HCI_UART_BCM,
-	.name		= "BCM",
+	.name		= "Broadcom",
 	.manufacturer	= 15,
 	.init_speed	= 115200,
 	.oper_speed	= 4000000,
@@ -833,6 +833,7 @@ static const struct acpi_device_id bcm_acpi_match[] = {
 	{ "BCM2E64", 0 },
 	{ "BCM2E65", 0 },
 	{ "BCM2E67", 0 },
+	{ "BCM2E71", 0 },
 	{ "BCM2E7B", 0 },
 	{ "BCM2E7C", 0 },
 	{ },

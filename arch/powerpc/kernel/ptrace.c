@@ -38,6 +38,7 @@
 #include <asm/page.h>
 #include <asm/pgtable.h>
 #include <asm/switch_to.h>
+#include <asm/tm.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/syscalls.h>
@@ -116,6 +117,24 @@ static const struct pt_regs_offset regoffset_table[] = {
 	REG_OFFSET_NAME(dsisr),
 	REG_OFFSET_END,
 };
+
+#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
+static void flush_tmregs_to_thread(struct task_struct *tsk)
+{
+	/*
+	 * If task is not current, it will have been flushed already to
+	 * it's thread_struct during __switch_to().
+	 *
+	 * A reclaim flushes ALL the state.
+	 */
+
+	if (tsk == current && MSR_TM_SUSPENDED(mfmsr()))
+		tm_reclaim_current(TM_CAUSE_SIGNAL);
+
+}
+#else
+static inline void flush_tmregs_to_thread(struct task_struct *tsk) { }
+#endif
 
 /**
  * regs_query_register_offset() - query register offset from its name
@@ -1458,7 +1477,6 @@ static int tm_spr_get(struct task_struct *target,
 	/* Build tests */
 	BUILD_BUG_ON(TSO(tm_tfhar) + sizeof(u64) != TSO(tm_texasr));
 	BUILD_BUG_ON(TSO(tm_texasr) + sizeof(u64) != TSO(tm_tfiar));
-	BUILD_BUG_ON(TSO(tm_tfiar) + sizeof(u64) != TSO(ckpt_regs));
 
 	if (!cpu_has_feature(CPU_FTR_TM))
 		return -ENODEV;
@@ -1514,7 +1532,6 @@ static int tm_spr_set(struct task_struct *target,
 	/* Build tests */
 	BUILD_BUG_ON(TSO(tm_tfhar) + sizeof(u64) != TSO(tm_texasr));
 	BUILD_BUG_ON(TSO(tm_texasr) + sizeof(u64) != TSO(tm_tfiar));
-	BUILD_BUG_ON(TSO(tm_tfiar) + sizeof(u64) != TSO(ckpt_regs));
 
 	if (!cpu_has_feature(CPU_FTR_TM))
 		return -ENODEV;

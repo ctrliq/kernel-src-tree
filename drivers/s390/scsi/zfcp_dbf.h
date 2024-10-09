@@ -115,6 +115,7 @@ struct zfcp_dbf_san {
 	u32 d_id;
 #define ZFCP_DBF_SAN_MAX_PAYLOAD (FC_CT_HDR_LEN + 32)
 	char payload[ZFCP_DBF_SAN_MAX_PAYLOAD];
+	u16 pl_len;
 } __packed;
 
 /**
@@ -310,7 +311,7 @@ static inline
 void zfcp_dbf_hba_fsf_resp(char *tag, int level, struct zfcp_fsf_req *req)
 {
 	if (level <= req->adapter->dbf->hba->level)
-		zfcp_dbf_hba_fsf_res(tag, req);
+		zfcp_dbf_hba_fsf_res(tag, level, req);
 }
 
 /**
@@ -351,7 +352,7 @@ void _zfcp_dbf_scsi(char *tag, int level, struct scsi_cmnd *scmd,
 					scmd->device->host->hostdata[0];
 
 	if (level <= adapter->dbf->scsi->level)
-		zfcp_dbf_scsi(tag, scmd, req);
+		zfcp_dbf_scsi(tag, level, scmd, req);
 }
 
 /**

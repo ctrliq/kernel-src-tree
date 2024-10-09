@@ -10,8 +10,8 @@ obj-y     = fork.o exec_domain.o panic.o printk.o \
 	    kthread.o wait.o sys_ni.o posix-cpu-timers.o mutex.o \
 	    hrtimer.o rwsem.o nsproxy.o srcu.o semaphore.o \
 	    notifier.o ksysfs.o cred.o \
-	    async.o range.o groups.o lglock.o smpboot.o \
-	    rh_taint.o rh_kabi.o rh_shadowman.o mcs_spinlock.o
+	    async.o range.o groups.o lglock.o smpboot.o ucount.o \
+	    rh_taint.o rh_kabi.o rh_shadowman.o
 
 ifdef CONFIG_FUNCTION_TRACER
 # Do not trace debug files and internal ftrace files
@@ -52,6 +52,9 @@ endif
 obj-$(CONFIG_SMP) += spinlock.o
 obj-$(CONFIG_DEBUG_SPINLOCK) += spinlock.o
 obj-$(CONFIG_PROVE_LOCKING) += spinlock.o
+obj-$(CONFIG_QUEUED_SPINLOCKS) += qspinlock.o
+obj-$(CONFIG_QUEUED_RWLOCKS) += qrwlock.o qrwlock_gen.o
+obj-$(CONFIG_LOCK_SPIN_ON_OWNER) += osq_lock.o
 obj-$(CONFIG_UID16) += uid16.o
 obj-$(CONFIG_SYSTEM_TRUSTED_KEYRING) += system_keyring.o system_certificates.o
 obj-$(CONFIG_MODULES) += module.o
@@ -59,7 +62,10 @@ obj-$(CONFIG_MODULE_SIG) += module_signing.o
 obj-$(CONFIG_MODULE_SIG_UEFI) += modsign_uefi.o
 obj-$(CONFIG_KALLSYMS) += kallsyms.o
 obj-$(CONFIG_BSD_PROCESS_ACCT) += acct.o
+obj-$(CONFIG_CRASH_CORE) += crash_core.o
+obj-$(CONFIG_KEXEC_CORE) += kexec_core.o
 obj-$(CONFIG_KEXEC) += kexec.o
+obj-$(CONFIG_KEXEC_FILE) += kexec_file.o
 obj-$(CONFIG_BACKTRACE_SELF_TEST) += backtracetest.o
 obj-$(CONFIG_COMPAT) += compat.o
 obj-$(CONFIG_CGROUPS) += cgroup.o

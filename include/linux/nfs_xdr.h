@@ -239,7 +239,6 @@ struct nfs4_layoutget_args {
 	struct inode *inode;
 	struct nfs_open_context *ctx;
 	nfs4_stateid stateid;
-	unsigned long timestamp;
 	struct nfs4_layoutdriver_data layout;
 };
 
@@ -257,7 +256,6 @@ struct nfs4_layoutget {
 	struct nfs4_layoutget_res res;
 	struct rpc_cred *cred;
 	gfp_t gfp_flags;
-	long timeout;
 };
 
 struct nfs4_getdeviceinfo_args {
@@ -420,6 +418,7 @@ struct nfs_openargs {
 	enum open_claim_type4	claim;
 	enum createmode4	createmode;
 	const struct nfs4_label *label;
+	umode_t			umask;
 };
 
 struct nfs_openres {
@@ -939,6 +938,7 @@ struct nfs4_create_arg {
 	const struct nfs_fh *		dir_fh;
 	const u32 *			bitmask;
 	const struct nfs4_label		*label;
+	umode_t				umask;
 };
 
 struct nfs4_create_res {
@@ -1349,6 +1349,33 @@ struct nfs42_falloc_res {
 	const struct nfs_server		*falloc_server;
 };
 
+struct nfs42_copy_args {
+	struct nfs4_sequence_args	seq_args;
+
+	struct nfs_fh			*src_fh;
+	nfs4_stateid			src_stateid;
+	u64				src_pos;
+
+	struct nfs_fh			*dst_fh;
+	nfs4_stateid			dst_stateid;
+	u64				dst_pos;
+
+	u64				count;
+};
+
+struct nfs42_write_res {
+	u64			count;
+	struct nfs_writeverf	verifier;
+};
+
+struct nfs42_copy_res {
+	struct nfs4_sequence_res	seq_res;
+	struct nfs42_write_res		write_res;
+	bool				consecutive;
+	bool				synchronous;
+	struct nfs_commitres		commit_res;
+};
+
 struct nfs42_seek_args {
 	struct nfs4_sequence_args	seq_args;
 
@@ -1391,6 +1418,7 @@ struct nfs_pgio_header {
 	struct list_head	pages;
 	struct nfs_page		*req;
 	struct nfs_writeverf	verf;		/* Used for writes */
+	fmode_t			rw_mode;
 	struct pnfs_layout_segment *lseg;
 	loff_t			io_start;
 	const struct rpc_call_ops *mds_ops;
@@ -1428,15 +1456,16 @@ struct nfs_mds_commit_info {
 	struct list_head	list;
 };
 
+struct nfs_commit_info;
 struct nfs_commit_data;
 struct nfs_inode;
 struct nfs_commit_completion_ops {
-	void (*error_cleanup) (struct nfs_inode *nfsi);
 	void (*completion) (struct nfs_commit_data *data);
+	void (*resched_write) (struct nfs_commit_info *, struct nfs_page *);
 };
 
 struct nfs_commit_info {
-	spinlock_t			*lock;	/* inode->i_lock */
+	struct inode 			*inode;	/* Needed for inode->i_lock */
 	struct nfs_mds_commit_info	*mds;
 	struct pnfs_ds_commit_info	*ds;
 	struct nfs_direct_req		*dreq;	/* O_DIRECT request */
@@ -1514,6 +1543,7 @@ struct nfs_rpc_ops {
 	const struct inode_operations *dir_inode_ops;
 	const struct inode_operations *file_inode_ops;
 	const struct file_operations *file_ops;
+	const struct nlmclnt_operations *nlmclnt_ops;
 
 	int	(*getroot) (struct nfs_server *, struct nfs_fh *,
 			    struct nfs_fsinfo *);

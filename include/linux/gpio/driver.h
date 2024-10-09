@@ -4,6 +4,9 @@
 #include <linux/device.h>
 #include <linux/types.h>
 #include <linux/module.h>
+#include <linux/irq.h>
+#include <linux/irqchip/chained_irq.h>
+#include <linux/irqdomain.h>
 
 struct gpio_desc;
 struct of_phandle_args;
@@ -96,6 +99,17 @@ struct gpio_chip {
 	bool			can_sleep;
 	bool			exported;
 
+#ifdef CONFIG_GPIOLIB_IRQCHIP
+	/*
+	 * With CONFIG_GPIO_IRQCHIP we get an irqchip inside the gpiolib
+	 * to handle IRQs for most practical cases.
+	 */
+	struct irq_chip		*irqchip;
+	struct irq_domain	*irqdomain;
+	irq_flow_handler_t	irq_handler;
+	unsigned int		irq_default_type;
+#endif
+
 #if defined(CONFIG_OF_GPIO)
 	/*
 	 * If CONFIG_OF is enabled, then all GPIO controllers described in the
@@ -183,5 +197,20 @@ struct gpiod_lookup_table {
 }
 
 void gpiod_add_lookup_table(struct gpiod_lookup_table *table);
+
+#ifdef CONFIG_GPIOLIB_IRQCHIP
+
+void gpiochip_set_chained_irqchip(struct gpio_chip *gpiochip,
+		struct irq_chip *irqchip,
+		int parent_irq,
+		irq_flow_handler_t parent_handler);
+
+int gpiochip_irqchip_add(struct gpio_chip *gpiochip,
+		struct irq_chip *irqchip,
+		unsigned int first_irq,
+		irq_flow_handler_t handler,
+		unsigned int type);
+
+#endif /* CONFIG_GPIO_IRQCHIP */
 
 #endif

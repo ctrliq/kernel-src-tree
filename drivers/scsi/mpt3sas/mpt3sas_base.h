@@ -81,9 +81,9 @@
 
 #define MPT2SAS_DRIVER_NAME		"mpt2sas"
 #define MPT2SAS_DESCRIPTION	"LSI MPT Fusion SAS 2.0 Device Driver"
-#define MPT2SAS_DRIVER_VERSION		"20.102.00.00"
+#define MPT2SAS_DRIVER_VERSION		"20.103.00.00"
 #define MPT2SAS_MAJOR_VERSION		20
-#define MPT2SAS_MINOR_VERSION		102
+#define MPT2SAS_MINOR_VERSION		103
 #define MPT2SAS_BUILD_VERSION		0
 #define MPT2SAS_RELEASE_VERSION	00
 
@@ -393,6 +393,7 @@ struct MPT3SAS_TARGET {
  * @eedp_enable: eedp support enable bit
  * @eedp_type: 0(type_1), 1(type_2), 2(type_3)
  * @eedp_block_length: block size
+ * @ata_command_pending: SATL passthrough outstanding for device
  */
 struct MPT3SAS_DEVICE {
 	struct MPT3SAS_TARGET *sas_target;
@@ -402,6 +403,18 @@ struct MPT3SAS_DEVICE {
 	u8	block;
 	u8	tlr_snoop_check;
 	u8	ignore_delay_remove;
+	/*
+	 * Bug workaround for SATL handling: the mpt2/3sas firmware
+	 * doesn't return BUSY or TASK_SET_FULL for subsequent
+	 * commands while a SATL pass through is in operation as the
+	 * spec requires, it simply does nothing with them until the
+	 * pass through completes, causing them possibly to timeout if
+	 * the passthrough is a long executing command (like format or
+	 * secure erase).  This variable allows us to do the right
+	 * thing while a SATL command is pending.
+	 */
+	unsigned long ata_command_pending;
+
 };
 
 #define MPT3_CMD_NOT_USED	0x8000	/* free */
@@ -736,7 +749,10 @@ typedef void (*MPT_BUILD_SG)(struct MPT3SAS_ADAPTER *ioc, void *psge,
 typedef void (*MPT_BUILD_ZERO_LEN_SGE)(struct MPT3SAS_ADAPTER *ioc,
 		void *paddr);
 
-
+/* To support atomic and non atomic descriptors*/
+typedef void (*PUT_SMID_IO_FP_HIP) (struct MPT3SAS_ADAPTER *ioc, u16 smid,
+	u16 funcdep);
+typedef void (*PUT_SMID_DEFAULT) (struct MPT3SAS_ADAPTER *ioc, u16 smid);
 
 /* IOC Facts and Port Facts converted from little endian to cpu */
 union mpi3_version_union {
@@ -1194,6 +1210,13 @@ struct MPT3SAS_ADAPTER {
 	struct SL_WH_MPI_TRIGGERS_T diag_trigger_mpi;
 	void		*device_remove_in_progress;
 	u16		device_remove_in_progress_sz;
+	u8		is_gen35_ioc;
+	u8		atomic_desc_capable;
+	PUT_SMID_IO_FP_HIP put_smid_scsi_io;
+	PUT_SMID_IO_FP_HIP put_smid_fast_path;
+	PUT_SMID_IO_FP_HIP put_smid_hi_priority;
+	PUT_SMID_DEFAULT put_smid_default;
+
 };
 
 typedef u8 (*MPT_CALLBACK)(struct MPT3SAS_ADAPTER *ioc, u16 smid, u8 msix_index,
@@ -1239,13 +1262,6 @@ u16 mpt3sas_base_get_smid_scsiio(struct MPT3SAS_ADAPTER *ioc, u8 cb_idx,
 
 u16 mpt3sas_base_get_smid(struct MPT3SAS_ADAPTER *ioc, u8 cb_idx);
 void mpt3sas_base_free_smid(struct MPT3SAS_ADAPTER *ioc, u16 smid);
-void mpt3sas_base_put_smid_scsi_io(struct MPT3SAS_ADAPTER *ioc, u16 smid,
-	u16 handle);
-void mpt3sas_base_put_smid_fast_path(struct MPT3SAS_ADAPTER *ioc, u16 smid,
-	u16 handle);
-void mpt3sas_base_put_smid_hi_priority(struct MPT3SAS_ADAPTER *ioc,
-	u16 smid, u16 msix_task);
-void mpt3sas_base_put_smid_default(struct MPT3SAS_ADAPTER *ioc, u16 smid);
 void mpt3sas_base_initialize_callback_handler(void);
 u8 mpt3sas_base_register_callback_handler(MPT_CALLBACK cb_func);
 void mpt3sas_base_release_callback_handler(u8 cb_idx);

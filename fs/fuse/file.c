@@ -1741,7 +1741,7 @@ static int fuse_setlk(struct file *file, struct file_lock *fl, int flock)
 	}
 
 	/* Unlock on close is handled by the flush method */
-	if (fl->fl_flags & FL_CLOSE)
+	if ((fl->fl_flags & FL_CLOSE_POSIX) == FL_CLOSE_POSIX)
 		return 0;
 
 	req = fuse_get_req_nopages(fc);
@@ -1788,7 +1788,7 @@ static int fuse_file_flock(struct file *file, int cmd, struct file_lock *fl)
 	int err;
 
 	if (fc->no_flock) {
-		err = flock_lock_file_wait(file, fl);
+		err = locks_lock_file_wait(file, fl);
 	} else {
 		struct fuse_file *ff = file->private_data;
 
@@ -1837,20 +1837,85 @@ static sector_t fuse_bmap(struct address_space *mapping, sector_t block)
 	return err ? 0 : outarg.block;
 }
 
+static loff_t fuse_lseek(struct file *file, loff_t offset, int whence)
+{
+	struct inode *inode = file->f_mapping->host;
+	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_file *ff = file->private_data;
+	struct fuse_req	*req;
+	struct fuse_lseek_in inarg = {
+		.fh = ff->fh,
+		.offset = offset,
+		.whence = whence
+	};
+	struct fuse_lseek_out outarg;
+	int err;
+
+	if (fc->no_lseek)
+		goto fallback;
+
+	req = fuse_get_req_nopages(fc);
+	err = PTR_ERR(req);
+	if (IS_ERR(req))
+		return err;
+
+	req->in.h.opcode = FUSE_LSEEK;
+	req->in.h.nodeid = ff->nodeid;
+	req->in.numargs = 1;
+	req->in.args[0].size = sizeof(inarg);
+	req->in.args[0].value = &inarg;
+	req->out.numargs = 1;
+	req->out.args[0].size = sizeof(outarg);
+	req->out.args[0].value = &outarg;
+	fuse_request_send(fc, req);
+	err = req->out.h.error;
+	fuse_put_request(fc, req);
+
+	if (err) {
+		if (err == -ENOSYS) {
+			fc->no_lseek = 1;
+			goto fallback;
+		}
+		return err;
+	}
+
+	return vfs_setpos(file, outarg.offset, inode->i_sb->s_maxbytes);
+
+fallback:
+	err = fuse_update_attributes(inode, NULL, file, NULL);
+	if (!err)
+		return generic_file_llseek(file, offset, whence);
+	else
+		return err;
+}
+
 static loff_t fuse_file_llseek(struct file *file, loff_t offset, int whence)
 {
 	loff_t retval;
 	struct inode *inode = file_inode(file);
 
-	/* No i_mutex protection necessary for SEEK_CUR and SEEK_SET */
-	if (whence == SEEK_CUR || whence == SEEK_SET)
-		return generic_file_llseek(file, offset, whence);
-
-	mutex_lock(&inode->i_mutex);
-	retval = fuse_update_attributes(inode, NULL, file, NULL);
-	if (!retval)
+	switch (whence) {
+	case SEEK_SET:
+	case SEEK_CUR:
+		 /* No i_mutex protection necessary for SEEK_CUR and SEEK_SET */
 		retval = generic_file_llseek(file, offset, whence);
-	mutex_unlock(&inode->i_mutex);
+		break;
+	case SEEK_END:
+		mutex_lock(&inode->i_mutex);
+		retval = fuse_update_attributes(inode, NULL, file, NULL);
+		if (!retval)
+			retval = generic_file_llseek(file, offset, whence);
+		mutex_unlock(&inode->i_mutex);
+		break;
+	case SEEK_HOLE:
+	case SEEK_DATA:
+		mutex_lock(&inode->i_mutex);
+		retval = fuse_lseek(file, offset, whence);
+		mutex_unlock(&inode->i_mutex);
+		break;
+	default:
+		retval = -EINVAL;
+	}
 
 	return retval;
 }

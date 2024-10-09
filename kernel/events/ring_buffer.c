@@ -138,8 +138,11 @@ __perf_output_begin(struct perf_output_handle *handle,
 	if (unlikely(!rb))
 		goto out;
 
-	if (unlikely(!rb->nr_pages))
+	if (unlikely(rb->paused)) {
+		if (rb->nr_pages)
+			local_inc(&rb->lost);
 		goto out;
+	}
 
 	handle->rb    = rb;
 	handle->event = event;
@@ -227,10 +230,24 @@ out:
 	return -ENOSPC;
 }
 
+int perf_output_begin_forward(struct perf_output_handle *handle,
+			     struct perf_event *event, unsigned int size)
+{
+	return __perf_output_begin(handle, event, size, false);
+}
+
+int perf_output_begin_backward(struct perf_output_handle *handle,
+			       struct perf_event *event, unsigned int size)
+{
+	return __perf_output_begin(handle, event, size, true);
+}
+
 int perf_output_begin(struct perf_output_handle *handle,
 		      struct perf_event *event, unsigned int size)
 {
-	return __perf_output_begin(handle, event, size, false);
+
+	return __perf_output_begin(handle, event, size,
+				   unlikely(is_write_backward(event)));
 }
 
 unsigned int perf_output_copy(struct perf_output_handle *handle,
@@ -271,6 +288,13 @@ ring_buffer_init(struct ring_buffer *rb, long watermark, int flags)
 
 	INIT_LIST_HEAD(&rb->event_list);
 	spin_lock_init(&rb->event_lock);
+
+	/*
+	 * perf_output_begin() only checks rb->paused, therefore
+	 * rb->paused must be true if we have no pages for output.
+	 */
+	if (!rb->nr_pages)
+		rb->paused = 1;
 }
 
 /*

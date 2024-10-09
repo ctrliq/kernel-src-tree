@@ -57,7 +57,8 @@ struct symbol {
 	u64		end;
 	u16		namelen;
 	u8		binding;
-	bool		ignore;
+	u8		idle:1;
+	u8		ignore:1;
 	u8		arch_sym;
 	char		name[0];
 };
@@ -131,20 +132,27 @@ struct symbol_conf {
 			*pid_list_str,
 			*tid_list_str,
 			*sym_list_str,
-			*col_width_list_str;
+			*col_width_list_str,
+			*bt_stop_list_str;
        struct strlist	*dso_list,
 			*comm_list,
 			*sym_list,
 			*dso_from_list,
 			*dso_to_list,
 			*sym_from_list,
-			*sym_to_list;
+			*sym_to_list,
+			*bt_stop_list;
 	struct intlist	*pid_list,
 			*tid_list;
 	const char	*symfs;
 };
 
 extern struct symbol_conf symbol_conf;
+
+struct symbol_name_rb_node {
+	struct rb_node	rb_node;
+	struct symbol	sym;
+};
 
 static inline int __symbol__join_symfs(char *bf, size_t size, const char *path)
 {
@@ -237,16 +245,13 @@ int symsrc__init(struct symsrc *ss, struct dso *dso, const char *name,
 bool symsrc__has_symtab(struct symsrc *ss);
 bool symsrc__possibly_runtime(struct symsrc *ss);
 
-int dso__load(struct dso *dso, struct map *map, symbol_filter_t filter);
+int dso__load(struct dso *dso, struct map *map);
 int dso__load_vmlinux(struct dso *dso, struct map *map,
-		      const char *vmlinux, bool vmlinux_allocated,
-		      symbol_filter_t filter);
-int dso__load_vmlinux_path(struct dso *dso, struct map *map,
-			   symbol_filter_t filter);
+		      const char *vmlinux, bool vmlinux_allocated);
+int dso__load_vmlinux_path(struct dso *dso, struct map *map);
 int __dso__load_kallsyms(struct dso *dso, const char *filename, struct map *map,
-			 bool no_kcore, symbol_filter_t filter);
-int dso__load_kallsyms(struct dso *dso, const char *filename, struct map *map,
-		       symbol_filter_t filter);
+			 bool no_kcore);
+int dso__load_kallsyms(struct dso *dso, const char *filename, struct map *map);
 
 void dso__insert_symbol(struct dso *dso, enum map_type type,
 			struct symbol *sym);
@@ -278,23 +283,29 @@ void symbol__elf_init(void);
 int symbol__annotation_init(void);
 
 struct symbol *symbol__new(u64 start, u64 len, u8 binding, const char *name);
+size_t __symbol__fprintf_symname_offs(const struct symbol *sym,
+				      const struct addr_location *al,
+				      bool unknown_as_addr,
+				      bool print_offsets, FILE *fp);
 size_t symbol__fprintf_symname_offs(const struct symbol *sym,
 				    const struct addr_location *al, FILE *fp);
+size_t __symbol__fprintf_symname(const struct symbol *sym,
+				 const struct addr_location *al,
+				 bool unknown_as_addr, FILE *fp);
 size_t symbol__fprintf_symname(const struct symbol *sym, FILE *fp);
 size_t symbol__fprintf(struct symbol *sym, FILE *fp);
 bool symbol_type__is_a(char symbol_type, enum map_type map_type);
 bool symbol__restricted_filename(const char *filename,
 				 const char *restricted_filename);
-bool symbol__is_idle(struct symbol *sym);
 int symbol__config_symfs(const struct option *opt __maybe_unused,
 			 const char *dir, int unset __maybe_unused);
 
 int dso__load_sym(struct dso *dso, struct map *map, struct symsrc *syms_ss,
-		  struct symsrc *runtime_ss, symbol_filter_t filter,
-		  int kmodule);
+		  struct symsrc *runtime_ss, int kmodule);
 int dso__synthesize_plt_symbols(struct dso *dso, struct symsrc *ss,
-				struct map *map, symbol_filter_t filter);
+				struct map *map);
 
+void __symbols__insert(struct rb_root *symbols, struct symbol *sym, bool kernel);
 void symbols__insert(struct rb_root *symbols, struct symbol *sym);
 void symbols__fixup_duplicate(struct rb_root *symbols);
 void symbols__fixup_end(struct rb_root *symbols);

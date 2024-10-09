@@ -1313,21 +1313,21 @@ static int
 lpfc_sli_ringtxcmpl_put(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 			struct lpfc_iocbq *piocb)
 {
+
+	BUG_ON(!piocb);
+
 	list_add_tail(&piocb->list, &pring->txcmplq);
 	piocb->iocb_flag |= LPFC_IO_ON_TXCMPLQ;
 
 	if ((unlikely(pring->ringno == LPFC_ELS_RING)) &&
 	   (piocb->iocb.ulpCommand != CMD_ABORT_XRI_CN) &&
-	   (piocb->iocb.ulpCommand != CMD_CLOSE_XRI_CN) &&
-	 (!(piocb->vport->load_flag & FC_UNLOADING))) {
-		if (!piocb->vport)
-			BUG();
-		else
+	   (piocb->iocb.ulpCommand != CMD_CLOSE_XRI_CN)) {
+		BUG_ON(!piocb->vport);
+		if (!(piocb->vport->load_flag & FC_UNLOADING))
 			mod_timer(&piocb->vport->els_tmofunc,
-				jiffies +
-				msecs_to_jiffies(1000 * (phba->fc_ratov << 1)));
+				  jiffies +
+				  msecs_to_jiffies(1000 * (phba->fc_ratov << 1)));
 	}
-
 
 	return 0;
 }
@@ -4013,13 +4013,16 @@ lpfc_sli_brdreset(struct lpfc_hba *phba)
 	/* Reset HBA */
 	lpfc_printf_log(phba, KERN_INFO, LOG_SLI,
 			"0325 Reset HBA Data: x%x x%x\n",
-			phba->pport->port_state, psli->sli_flag);
+			(phba->pport) ? phba->pport->port_state : 0,
+			psli->sli_flag);
 
 	/* perform board reset */
 	phba->fc_eventTag = 0;
 	phba->link_events = 0;
-	phba->pport->fc_myDID = 0;
-	phba->pport->fc_prevDID = 0;
+	if (phba->pport) {
+		phba->pport->fc_myDID = 0;
+		phba->pport->fc_prevDID = 0;
+	}
 
 	/* Turn off parity checking and serr during the physical reset */
 	pci_read_config_word(phba->pcidev, PCI_COMMAND, &cfg_value);
@@ -4145,7 +4148,8 @@ lpfc_sli_brdrestart_s3(struct lpfc_hba *phba)
 	/* Restart HBA */
 	lpfc_printf_log(phba, KERN_INFO, LOG_SLI,
 			"0337 Restart HBA Data: x%x x%x\n",
-			phba->pport->port_state, psli->sli_flag);
+			(phba->pport) ? phba->pport->port_state : 0,
+			psli->sli_flag);
 
 	word0 = 0;
 	mb = (MAILBOX_t *) &word0;
@@ -4159,7 +4163,7 @@ lpfc_sli_brdrestart_s3(struct lpfc_hba *phba)
 	readl(to_slim); /* flush */
 
 	/* Only skip post after fc_ffinit is completed */
-	if (phba->pport->port_state)
+	if (phba->pport && phba->pport->port_state)
 		word0 = 1;	/* This is really setting up word1 */
 	else
 		word0 = 0;	/* This is really setting up word1 */
@@ -4168,7 +4172,8 @@ lpfc_sli_brdrestart_s3(struct lpfc_hba *phba)
 	readl(to_slim); /* flush */
 
 	lpfc_sli_brdreset(phba);
-	phba->pport->stopped = 0;
+	if (phba->pport)
+		phba->pport->stopped = 0;
 	phba->link_state = LPFC_INIT_START;
 	phba->hba_flag = 0;
 	spin_unlock_irq(&phba->hbalock);
@@ -4255,7 +4260,7 @@ lpfc_sli_brdrestart(struct lpfc_hba *phba)
  * iteration, the function will restart the HBA again. The function returns
  * zero if HBA successfully restarted else returns negative error code.
  **/
-static int
+int
 lpfc_sli_chipset_init(struct lpfc_hba *phba)
 {
 	uint32_t status, i = 0;
@@ -4662,6 +4667,7 @@ lpfc_sli_hba_setup(struct lpfc_hba *phba)
 
 		break;
 	}
+	phba->fcp_embed_io = 0;	/* SLI4 FC support only */
 
 	rc = lpfc_sli_config_port(phba, mode);
 
@@ -5670,38 +5676,36 @@ lpfc_sli4_dealloc_extent(struct lpfc_hba *phba, uint16_t type)
 	return rc;
 }
 
-void
-lpfc_set_features(struct lpfc_hba *phba)
+static void
+lpfc_set_features(struct lpfc_hba *phba, LPFC_MBOXQ_t *mbox,
+		  uint32_t feature)
 {
-	LPFC_MBOXQ_t *mbox = NULL;
 	uint32_t len;
-	int rc;
 
-	mbox = mempool_alloc(phba->mbox_mem_pool, GFP_KERNEL);
-	if (!mbox)
-		return;
 	len = sizeof(struct lpfc_mbx_set_feature) -
 		sizeof(struct lpfc_sli4_cfg_mhdr);
 	lpfc_sli4_config(phba, mbox, LPFC_MBOX_SUBSYSTEM_COMMON,
 			 LPFC_MBOX_OPCODE_SET_FEATURES, len,
 			 LPFC_SLI4_MBX_EMBED);
-	bf_set(lpfc_mbx_set_feature_UER,
-	       &mbox->u.mqe.un.set_feature, 1);
-	mbox->u.mqe.un.set_feature.feature = LPFC_SET_UE_RECOVERY;
-	mbox->u.mqe.un.set_feature.param_len = 8;
-	rc = lpfc_sli_issue_mbox(phba, mbox, MBX_POLL);
 
-	if (rc != MBX_SUCCESS) {
-		mempool_free(mbox, phba->mbox_mem_pool);
-		return;
+	switch (feature) {
+	case LPFC_SET_UE_RECOVERY:
+		bf_set(lpfc_mbx_set_feature_UER,
+		       &mbox->u.mqe.un.set_feature, 1);
+		mbox->u.mqe.un.set_feature.feature = LPFC_SET_UE_RECOVERY;
+		mbox->u.mqe.un.set_feature.param_len = 8;
+		break;
+	case LPFC_SET_MDS_DIAGS:
+		bf_set(lpfc_mbx_set_feature_mds,
+		       &mbox->u.mqe.un.set_feature, 1);
+		bf_set(lpfc_mbx_set_feature_mds_deep_loopbk,
+		       &mbox->u.mqe.un.set_feature, 0);
+		mbox->u.mqe.un.set_feature.feature = LPFC_SET_MDS_DIAGS;
+		mbox->u.mqe.un.set_feature.param_len = 8;
+		break;
 	}
-	phba->hba_flag |= HBA_RECOVERABLE_UE;
-	phba->eratt_poll_interval = 1;  /* Set 1Sec interval to detect UE */
-	phba->sli4_hba.ue_to_sr = bf_get(lpfc_mbx_set_feature_UESR,
-					 &mbox->u.mqe.un.set_feature);
-	phba->sli4_hba.ue_to_rp = bf_get(lpfc_mbx_set_feature_UERP,
-					 &mbox->u.mqe.un.set_feature);
-	mempool_free(mbox, phba->mbox_mem_pool);
+
+	return;
 }
 
 /**
@@ -6353,10 +6357,12 @@ lpfc_sli4_hba_setup(struct lpfc_hba *phba)
 
 	mqe = &mboxq->u.mqe;
 	phba->sli_rev = bf_get(lpfc_mbx_rd_rev_sli_lvl, &mqe->un.read_rev);
-	if (bf_get(lpfc_mbx_rd_rev_fcoe, &mqe->un.read_rev))
+	if (bf_get(lpfc_mbx_rd_rev_fcoe, &mqe->un.read_rev)) {
 		phba->hba_flag |= HBA_FCOE_MODE;
-	else
+		phba->fcp_embed_io = 0;	/* SLI4 FC support only */
+	} else {
 		phba->hba_flag &= ~HBA_FCOE_MODE;
+	}
 
 	if (bf_get(lpfc_mbx_rd_rev_cee_ver, &mqe->un.read_rev) ==
 		LPFC_DCBX_CEE_MODE)
@@ -6447,8 +6453,29 @@ lpfc_sli4_hba_setup(struct lpfc_hba *phba)
 	}
 
 	if (bf_get(lpfc_sli_intf_if_type, &phba->sli4_hba.sli_intf) ==
-	    LPFC_SLI_INTF_IF_TYPE_0)
-		lpfc_set_features(phba);
+	    LPFC_SLI_INTF_IF_TYPE_0) {
+		lpfc_set_features(phba, mboxq, LPFC_SET_UE_RECOVERY);
+		rc = lpfc_sli_issue_mbox(phba, mboxq, MBX_POLL);
+		if (rc == MBX_SUCCESS) {
+			phba->hba_flag |= HBA_RECOVERABLE_UE;
+			/* Set 1Sec interval to detect UE */
+			phba->eratt_poll_interval = 1;
+			phba->sli4_hba.ue_to_sr = bf_get(
+					lpfc_mbx_set_feature_UESR,
+					&mboxq->u.mqe.un.set_feature);
+			phba->sli4_hba.ue_to_rp = bf_get(
+					lpfc_mbx_set_feature_UERP,
+					&mboxq->u.mqe.un.set_feature);
+		}
+	}
+
+	if (phba->cfg_enable_mds_diags && phba->mds_diags_support) {
+		/* Enable MDS Diagnostics only if the SLI Port supports it */
+		lpfc_set_features(phba, mboxq, LPFC_SET_MDS_DIAGS);
+		rc = lpfc_sli_issue_mbox(phba, mboxq, MBX_POLL);
+		if (rc != MBX_SUCCESS)
+			phba->mds_diags_support = 0;
+	}
 
 	/*
 	 * Discover the port's supported feature set and match it against the
@@ -8260,12 +8287,15 @@ lpfc_sli4_iocb2wqe(struct lpfc_hba *phba, struct lpfc_iocbq *iocbq,
 	else
 		command_type = ELS_COMMAND_NON_FIP;
 
+	if (phba->fcp_embed_io)
+		memset(wqe, 0, sizeof(union lpfc_wqe128));
 	/* Some of the fields are in the right position already */
 	memcpy(wqe, &iocbq->iocb, sizeof(union lpfc_wqe));
-	abort_tag = (uint32_t) iocbq->iotag;
-	xritag = iocbq->sli4_xritag;
 	wqe->generic.wqe_com.word7 = 0; /* The ct field has moved so reset */
 	wqe->generic.wqe_com.word10 = 0;
+
+	abort_tag = (uint32_t) iocbq->iotag;
+	xritag = iocbq->sli4_xritag;
 	/* words0-2 bpl convert bde */
 	if (iocbq->iocb.un.genreq64.bdl.bdeFlags == BUFF_TYPE_BLP_64) {
 		numBdes = iocbq->iocb.un.genreq64.bdl.bdeSize /
@@ -8414,11 +8444,9 @@ lpfc_sli4_iocb2wqe(struct lpfc_hba *phba, struct lpfc_iocbq *iocbq,
 		       iocbq->iocb.ulpFCP2Rcvy);
 		bf_set(wqe_lnk, &wqe->fcp_iwrite.wqe_com, iocbq->iocb.ulpXS);
 		/* Always open the exchange */
-		bf_set(wqe_xc, &wqe->fcp_iwrite.wqe_com, 0);
 		bf_set(wqe_iod, &wqe->fcp_iwrite.wqe_com, LPFC_WQE_IOD_WRITE);
 		bf_set(wqe_lenloc, &wqe->fcp_iwrite.wqe_com,
 		       LPFC_WQE_LENLOC_WORD4);
-		bf_set(wqe_ebde_cnt, &wqe->fcp_iwrite.wqe_com, 0);
 		bf_set(wqe_pu, &wqe->fcp_iwrite.wqe_com, iocbq->iocb.ulpPU);
 		bf_set(wqe_dbde, &wqe->fcp_iwrite.wqe_com, 1);
 		if (iocbq->iocb_flag & LPFC_IO_OAS) {
@@ -8431,6 +8459,35 @@ lpfc_sli4_iocb2wqe(struct lpfc_hba *phba, struct lpfc_iocbq *iocbq,
 				bf_set(wqe_ccp, &wqe->fcp_iwrite.wqe_com,
 				       (phba->cfg_XLanePriority << 1));
 			}
+		}
+		/* Note, word 10 is already initialized to 0 */
+
+		if (phba->fcp_embed_io) {
+			struct lpfc_scsi_buf *lpfc_cmd;
+			struct sli4_sge *sgl;
+			union lpfc_wqe128 *wqe128;
+			struct fcp_cmnd *fcp_cmnd;
+			uint32_t *ptr;
+
+			/* 128 byte wqe support here */
+			wqe128 = (union lpfc_wqe128 *)wqe;
+
+			lpfc_cmd = iocbq->context1;
+			sgl = (struct sli4_sge *)lpfc_cmd->fcp_bpl;
+			fcp_cmnd = lpfc_cmd->fcp_cmnd;
+
+			/* Word 0-2 - FCP_CMND */
+			wqe128->generic.bde.tus.f.bdeFlags =
+				BUFF_TYPE_BDE_IMMED;
+			wqe128->generic.bde.tus.f.bdeSize = sgl->sge_len;
+			wqe128->generic.bde.addrHigh = 0;
+			wqe128->generic.bde.addrLow =  88;  /* Word 22 */
+
+			bf_set(wqe_wqes, &wqe128->fcp_iwrite.wqe_com, 1);
+
+			/* Word 22-29  FCP CMND Payload */
+			ptr = &wqe128->words[22];
+			memcpy(ptr, fcp_cmnd, sizeof(struct fcp_cmnd));
 		}
 		break;
 	case CMD_FCP_IREAD64_CR:
@@ -8446,11 +8503,9 @@ lpfc_sli4_iocb2wqe(struct lpfc_hba *phba, struct lpfc_iocbq *iocbq,
 		       iocbq->iocb.ulpFCP2Rcvy);
 		bf_set(wqe_lnk, &wqe->fcp_iread.wqe_com, iocbq->iocb.ulpXS);
 		/* Always open the exchange */
-		bf_set(wqe_xc, &wqe->fcp_iread.wqe_com, 0);
 		bf_set(wqe_iod, &wqe->fcp_iread.wqe_com, LPFC_WQE_IOD_READ);
 		bf_set(wqe_lenloc, &wqe->fcp_iread.wqe_com,
 		       LPFC_WQE_LENLOC_WORD4);
-		bf_set(wqe_ebde_cnt, &wqe->fcp_iread.wqe_com, 0);
 		bf_set(wqe_pu, &wqe->fcp_iread.wqe_com, iocbq->iocb.ulpPU);
 		bf_set(wqe_dbde, &wqe->fcp_iread.wqe_com, 1);
 		if (iocbq->iocb_flag & LPFC_IO_OAS) {
@@ -8464,6 +8519,35 @@ lpfc_sli4_iocb2wqe(struct lpfc_hba *phba, struct lpfc_iocbq *iocbq,
 				       (phba->cfg_XLanePriority << 1));
 			}
 		}
+		/* Note, word 10 is already initialized to 0 */
+
+		if (phba->fcp_embed_io) {
+			struct lpfc_scsi_buf *lpfc_cmd;
+			struct sli4_sge *sgl;
+			union lpfc_wqe128 *wqe128;
+			struct fcp_cmnd *fcp_cmnd;
+			uint32_t *ptr;
+
+			/* 128 byte wqe support here */
+			wqe128 = (union lpfc_wqe128 *)wqe;
+
+			lpfc_cmd = iocbq->context1;
+			sgl = (struct sli4_sge *)lpfc_cmd->fcp_bpl;
+			fcp_cmnd = lpfc_cmd->fcp_cmnd;
+
+			/* Word 0-2 - FCP_CMND */
+			wqe128->generic.bde.tus.f.bdeFlags =
+				BUFF_TYPE_BDE_IMMED;
+			wqe128->generic.bde.tus.f.bdeSize = sgl->sge_len;
+			wqe128->generic.bde.addrHigh = 0;
+			wqe128->generic.bde.addrLow =  88;  /* Word 22 */
+
+			bf_set(wqe_wqes, &wqe128->fcp_iread.wqe_com, 1);
+
+			/* Word 22-29  FCP CMND Payload */
+			ptr = &wqe128->words[22];
+			memcpy(ptr, fcp_cmnd, sizeof(struct fcp_cmnd));
+		}
 		break;
 	case CMD_FCP_ICMND64_CR:
 		/* word3 iocb=iotag wqe=payload_offset_len */
@@ -8475,13 +8559,11 @@ lpfc_sli4_iocb2wqe(struct lpfc_hba *phba, struct lpfc_iocbq *iocbq,
 		/* word3 iocb=IO_TAG wqe=reserved */
 		bf_set(wqe_pu, &wqe->fcp_icmd.wqe_com, 0);
 		/* Always open the exchange */
-		bf_set(wqe_xc, &wqe->fcp_icmd.wqe_com, 0);
 		bf_set(wqe_dbde, &wqe->fcp_icmd.wqe_com, 1);
 		bf_set(wqe_iod, &wqe->fcp_icmd.wqe_com, LPFC_WQE_IOD_WRITE);
 		bf_set(wqe_qosd, &wqe->fcp_icmd.wqe_com, 1);
 		bf_set(wqe_lenloc, &wqe->fcp_icmd.wqe_com,
 		       LPFC_WQE_LENLOC_NONE);
-		bf_set(wqe_ebde_cnt, &wqe->fcp_icmd.wqe_com, 0);
 		bf_set(wqe_erp, &wqe->fcp_icmd.wqe_com,
 		       iocbq->iocb.ulpFCP2Rcvy);
 		if (iocbq->iocb_flag & LPFC_IO_OAS) {
@@ -8494,6 +8576,35 @@ lpfc_sli4_iocb2wqe(struct lpfc_hba *phba, struct lpfc_iocbq *iocbq,
 				bf_set(wqe_ccp, &wqe->fcp_icmd.wqe_com,
 				       (phba->cfg_XLanePriority << 1));
 			}
+		}
+		/* Note, word 10 is already initialized to 0 */
+
+		if (phba->fcp_embed_io) {
+			struct lpfc_scsi_buf *lpfc_cmd;
+			struct sli4_sge *sgl;
+			union lpfc_wqe128 *wqe128;
+			struct fcp_cmnd *fcp_cmnd;
+			uint32_t *ptr;
+
+			/* 128 byte wqe support here */
+			wqe128 = (union lpfc_wqe128 *)wqe;
+
+			lpfc_cmd = iocbq->context1;
+			sgl = (struct sli4_sge *)lpfc_cmd->fcp_bpl;
+			fcp_cmnd = lpfc_cmd->fcp_cmnd;
+
+			/* Word 0-2 - FCP_CMND */
+			wqe128->generic.bde.tus.f.bdeFlags =
+				BUFF_TYPE_BDE_IMMED;
+			wqe128->generic.bde.tus.f.bdeSize = sgl->sge_len;
+			wqe128->generic.bde.addrHigh = 0;
+			wqe128->generic.bde.addrLow =  88;  /* Word 22 */
+
+			bf_set(wqe_wqes, &wqe128->fcp_icmd.wqe_com, 1);
+
+			/* Word 22-29  FCP CMND Payload */
+			ptr = &wqe128->words[22];
+			memcpy(ptr, fcp_cmnd, sizeof(struct fcp_cmnd));
 		}
 		break;
 	case CMD_GEN_REQUEST64_CR:
@@ -8726,9 +8837,16 @@ __lpfc_sli_issue_iocb_s4(struct lpfc_hba *phba, uint32_t ring_number,
 			 struct lpfc_iocbq *piocb, uint32_t flag)
 {
 	struct lpfc_sglq *sglq;
-	union lpfc_wqe wqe;
+	union lpfc_wqe *wqe;
+	union lpfc_wqe128 wqe128;
 	struct lpfc_queue *wq;
 	struct lpfc_sli_ring *pring = &phba->sli.ring[ring_number];
+
+	/*
+	 * The WQE can be either 64 or 128 bytes,
+	 * so allocate space on the stack assuming the largest.
+	 */
+	wqe = (union lpfc_wqe *)&wqe128;
 
 	if (piocb->sli4_xritag == NO_XRI) {
 		if (piocb->iocb.ulpCommand == CMD_ABORT_XRI_CN ||
@@ -8776,7 +8894,7 @@ __lpfc_sli_issue_iocb_s4(struct lpfc_hba *phba, uint32_t ring_number,
 			return IOCB_ERROR;
 	}
 
-	if (lpfc_sli4_iocb2wqe(phba, piocb, &wqe))
+	if (lpfc_sli4_iocb2wqe(phba, piocb, wqe))
 		return IOCB_ERROR;
 
 	if ((piocb->iocb_flag & LPFC_IO_FCP) ||
@@ -8786,12 +8904,12 @@ __lpfc_sli_issue_iocb_s4(struct lpfc_hba *phba, uint32_t ring_number,
 		} else {
 			wq = phba->sli4_hba.oas_wq;
 		}
-		if (lpfc_sli4_wq_put(wq, &wqe))
+		if (lpfc_sli4_wq_put(wq, wqe))
 			return IOCB_ERROR;
 	} else {
 		if (unlikely(!phba->sli4_hba.els_wq))
 			return IOCB_ERROR;
-		if (lpfc_sli4_wq_put(phba->sli4_hba.els_wq, &wqe))
+		if (lpfc_sli4_wq_put(phba->sli4_hba.els_wq, wqe))
 			return IOCB_ERROR;
 	}
 	lpfc_sli_ringtxcmpl_put(phba, pring, piocb);
@@ -8806,9 +8924,9 @@ __lpfc_sli_issue_iocb_s4(struct lpfc_hba *phba, uint32_t ring_number,
  * pointer from the lpfc_hba struct.
  *
  * Return codes:
- * 	IOCB_ERROR - Error
- * 	IOCB_SUCCESS - Success
- * 	IOCB_BUSY - Busy
+ * IOCB_ERROR - Error
+ * IOCB_SUCCESS - Success
+ * IOCB_BUSY - Busy
  **/
 int
 __lpfc_sli_issue_iocb(struct lpfc_hba *phba, uint32_t ring_number,
@@ -8861,7 +8979,7 @@ lpfc_sli_api_table_setup(struct lpfc_hba *phba, uint8_t dev_grp)
  * Since ABORTS must go on the same WQ of the command they are
  * aborting, we use command's fcp_wqidx.
  */
-int
+static int
 lpfc_sli_calc_ring(struct lpfc_hba *phba, uint32_t ring_number,
 		    struct lpfc_iocbq *piocb)
 {

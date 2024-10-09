@@ -360,12 +360,10 @@ xfs_set_dmattrs(
 	if (XFS_FORCED_SHUTDOWN(mp))
 		return -EIO;
 
-	tp = xfs_trans_alloc(mp, XFS_TRANS_SET_DMATTRS);
-	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_ichange, 0, 0);
-	if (error) {
-		xfs_trans_cancel(tp);
+	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_ichange, 0, 0, 0, &tp);
+	if (error)
 		return error;
-	}
+
 	xfs_ilock(ip, XFS_ILOCK_EXCL);
 	xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL);
 
@@ -994,7 +992,7 @@ xfs_set_diflags(
 		di_flags |= XFS_DIFLAG_NODEFRAG;
 	if (xflags & XFS_XFLAG_FILESTREAM)
 		di_flags |= XFS_DIFLAG_FILESTREAM;
-	if (S_ISDIR(ip->i_d.di_mode)) {
+	if (S_ISDIR(VFS_I(ip)->i_mode)) {
 		if (xflags & XFS_XFLAG_RTINHERIT)
 			di_flags |= XFS_DIFLAG_RTINHERIT;
 		if (xflags & XFS_XFLAG_NOSYMLINKS)
@@ -1003,7 +1001,7 @@ xfs_set_diflags(
 			di_flags |= XFS_DIFLAG_EXTSZINHERIT;
 		if (xflags & XFS_XFLAG_PROJINHERIT)
 			di_flags |= XFS_DIFLAG_PROJINHERIT;
-	} else if (S_ISREG(ip->i_d.di_mode)) {
+	} else if (S_ISREG(VFS_I(ip)->i_mode)) {
 		if (xflags & XFS_XFLAG_REALTIME)
 			di_flags |= XFS_DIFLAG_REALTIME;
 		if (xflags & XFS_XFLAG_EXTSIZE)
@@ -1114,7 +1112,7 @@ xfs_ioctl_setattr_dax_invalidate(
 	 * directories on filesystems where the block size is equal to the page
 	 * size. On directories it serves as an inherit hint.
 	 */
-	if (fa->fsx_xflags & FS_XFLAG_DAX) {
+	if (fa->fsx_xflags & XFS_XFLAG_DAX) {
 		if (!(S_ISREG(inode->i_mode) || S_ISDIR(inode->i_mode)))
 			return -EINVAL;
 		if (ip->i_mount->m_sb.sb_blocksize != PAGE_SIZE)
@@ -1122,9 +1120,9 @@ xfs_ioctl_setattr_dax_invalidate(
 	}
 
 	/* If the DAX state is not changing, we have nothing to do here. */
-	if ((fa->fsx_xflags & FS_XFLAG_DAX) && IS_DAX(inode))
+	if ((fa->fsx_xflags & XFS_XFLAG_DAX) && IS_DAX(inode))
 		return 0;
-	if (!(fa->fsx_xflags & FS_XFLAG_DAX) && !IS_DAX(inode))
+	if (!(fa->fsx_xflags & XFS_XFLAG_DAX) && !IS_DAX(inode))
 		return 0;
 
 	/* lock, flush and invalidate mapping in preparation for flag change */
@@ -1172,10 +1170,9 @@ xfs_ioctl_setattr_get_trans(
 	if (XFS_FORCED_SHUTDOWN(mp))
 		goto out_unlock;
 
-	tp = xfs_trans_alloc(mp, XFS_TRANS_SETATTR_NOT_SIZE);
-	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_ichange, 0, 0);
+	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_ichange, 0, 0, 0, &tp);
 	if (error)
-		goto out_cancel;
+		return ERR_PTR(error);
 
 	xfs_ilock(ip, XFS_ILOCK_EXCL);
 	xfs_trans_ijoin(tp, ip, XFS_ILOCK_EXCL | join_flags);
@@ -1226,14 +1223,14 @@ xfs_ioctl_setattr_check_extsize(
 {
 	struct xfs_mount	*mp = ip->i_mount;
 
-	if ((fa->fsx_xflags & XFS_XFLAG_EXTSIZE) && !S_ISREG(ip->i_d.di_mode))
+	if ((fa->fsx_xflags & XFS_XFLAG_EXTSIZE) && !S_ISREG(VFS_I(ip)->i_mode))
 		return -EINVAL;
 
 	if ((fa->fsx_xflags & XFS_XFLAG_EXTSZINHERIT) &&
-	    !S_ISDIR(ip->i_d.di_mode))
+	    !S_ISDIR(VFS_I(ip)->i_mode))
 		return -EINVAL;
 
-	if (S_ISREG(ip->i_d.di_mode) && ip->i_d.di_nextents &&
+	if (S_ISREG(VFS_I(ip)->i_mode) && ip->i_d.di_nextents &&
 	    ((ip->i_d.di_extsize << mp->m_sb.sb_blocklog) != fa->fsx_extsize))
 		return -EINVAL;
 
@@ -1366,9 +1363,9 @@ xfs_ioctl_setattr(
 	 * successful return from chown()
 	 */
 
-	if ((ip->i_d.di_mode & (S_ISUID|S_ISGID)) &&
+	if ((VFS_I(ip)->i_mode & (S_ISUID|S_ISGID)) &&
 	    !capable_wrt_inode_uidgid(VFS_I(ip), CAP_FSETID))
-		ip->i_d.di_mode &= ~(S_ISUID|S_ISGID);
+		VFS_I(ip)->i_mode &= ~(S_ISUID|S_ISGID);
 
 	/* Change the ownerships and register project quota modifications */
 	if (xfs_get_projid(ip) != fa->fsx_projid) {

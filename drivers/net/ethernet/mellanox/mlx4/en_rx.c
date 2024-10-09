@@ -57,7 +57,7 @@ static int mlx4_alloc_pages(struct mlx4_en_priv *priv,
 	struct page *page;
 	dma_addr_t dma;
 
-	for (order = MLX4_EN_ALLOC_PREFER_ORDER; ;) {
+	for (order = frag_info->order; ;) {
 		gfp_t gfp = _gfp;
 
 		if (order)
@@ -70,8 +70,8 @@ static int mlx4_alloc_pages(struct mlx4_en_priv *priv,
 			return -ENOMEM;
 	}
 	dma = dma_map_page(priv->ddev, page, 0, PAGE_SIZE << order,
-			   PCI_DMA_FROMDEVICE);
-	if (dma_mapping_error(priv->ddev, dma)) {
+			   frag_info->dma_dir);
+	if (unlikely(dma_mapping_error(priv->ddev, dma))) {
 		put_page(page);
 		return -ENOMEM;
 	}
@@ -107,7 +107,8 @@ static int mlx4_en_alloc_frags(struct mlx4_en_priv *priv,
 		    ring_alloc[i].page_size)
 			continue;
 
-		if (mlx4_alloc_pages(priv, &page_alloc[i], frag_info, gfp))
+		if (unlikely(mlx4_alloc_pages(priv, &page_alloc[i],
+					      frag_info, gfp)))
 			goto out;
 	}
 
@@ -124,7 +125,8 @@ out:
 	while (i--) {
 		if (page_alloc[i].page != ring_alloc[i].page) {
 			dma_unmap_page(priv->ddev, page_alloc[i].dma,
-				page_alloc[i].page_size, PCI_DMA_FROMDEVICE);
+				page_alloc[i].page_size,
+				priv->frag_info[i].dma_dir);
 			page = page_alloc[i].page;
 			/* Revert changes done by mlx4_alloc_pages */
 			page_ref_sub(page, page_alloc[i].page_size /
@@ -144,7 +146,7 @@ static void mlx4_en_free_frag(struct mlx4_en_priv *priv,
 
 	if (next_frag_end > frags[i].page_size)
 		dma_unmap_page(priv->ddev, frags[i].dma, frags[i].page_size,
-					 PCI_DMA_FROMDEVICE);
+			       frag_info->dma_dir);
 
 	if (frags[i].page)
 		put_page(frags[i].page);
@@ -175,7 +177,8 @@ out:
 
 		page_alloc = &ring->page_alloc[i];
 		dma_unmap_page(priv->ddev, page_alloc->dma,
-			       page_alloc->page_size, PCI_DMA_FROMDEVICE);
+			       page_alloc->page_size,
+			       priv->frag_info[i].dma_dir);
 		page = page_alloc->page;
 		/* Revert changes done by mlx4_alloc_pages */
 		page_ref_sub(page, page_alloc->page_size /
@@ -200,7 +203,7 @@ static void mlx4_en_destroy_allocator(struct mlx4_en_priv *priv,
 		       i, page_count(page_alloc->page));
 
 		dma_unmap_page(priv->ddev, page_alloc->dma,
-				page_alloc->page_size, PCI_DMA_FROMDEVICE);
+				page_alloc->page_size, frag_info->dma_dir);
 		while (page_alloc->page_offset + frag_info->frag_stride <
 		       page_alloc->page_size) {
 			put_page(page_alloc->page);
@@ -242,6 +245,12 @@ static int mlx4_en_prepare_rx_desc(struct mlx4_en_priv *priv,
 	struct mlx4_en_rx_desc *rx_desc = ring->buf + (index * ring->stride);
 	struct mlx4_en_rx_alloc *frags = ring->rx_info +
 					(index << priv->log_rx_info);
+
+	if (ring->page_cache.index > 0) {
+		frags[0] = ring->page_cache.buf[--ring->page_cache.index];
+		rx_desc->data[0].addr = cpu_to_be64(frags[0].dma);
+		return 0;
+	}
 
 	return mlx4_en_alloc_frags(priv, rx_desc, frags, ring->page_alloc, gfp);
 }
@@ -510,6 +519,24 @@ void mlx4_en_recover_from_oom(struct mlx4_en_priv *priv)
 	}
 }
 
+/* When the rx ring is running in page-per-packet mode, a released frame can go
+ * directly into a small cache, to avoid unmapping or touching the page
+ * allocator. In bpf prog performance scenarios, buffers are either forwarded
+ * or dropped, never converted to skbs, so every page can come directly from
+ * this cache when it is sized to be a multiple of the napi budget.
+ */
+bool mlx4_en_rx_recycle(struct mlx4_en_rx_ring *ring,
+			struct mlx4_en_rx_alloc *frame)
+{
+	struct mlx4_en_page_cache *cache = &ring->page_cache;
+
+	if (cache->index >= MLX4_EN_CACHE_SIZE)
+		return false;
+
+	cache->buf[cache->index++] = *frame;
+	return true;
+}
+
 void mlx4_en_destroy_rx_ring(struct mlx4_en_priv *priv,
 			     struct mlx4_en_rx_ring **pring,
 			     u32 size, u16 stride)
@@ -527,6 +554,16 @@ void mlx4_en_destroy_rx_ring(struct mlx4_en_priv *priv,
 void mlx4_en_deactivate_rx_ring(struct mlx4_en_priv *priv,
 				struct mlx4_en_rx_ring *ring)
 {
+	int i;
+
+	for (i = 0; i < ring->page_cache.index; i++) {
+		struct mlx4_en_rx_alloc *frame = &ring->page_cache.buf[i];
+
+		dma_unmap_page(priv->ddev, frame->dma, frame->page_size,
+			       priv->frag_info[0].dma_dir);
+		put_page(frame->page);
+	}
+	ring->page_cache.index = 0;
 	mlx4_en_free_rx_buf(priv, ring);
 	if (ring->stride <= TXBB_SIZE)
 		ring->buf -= TXBB_SIZE;
@@ -550,7 +587,7 @@ static int mlx4_en_complete_rx_desc(struct mlx4_en_priv *priv,
 		frag_info = &priv->frag_info[nr];
 		if (length <= frag_info->frag_prefix_size)
 			break;
-		if (!frags[nr].page)
+		if (unlikely(!frags[nr].page))
 			goto fail;
 
 		dma = be64_to_cpu(rx_desc->data[nr].addr);
@@ -590,7 +627,7 @@ static struct sk_buff *mlx4_en_rx_skb(struct mlx4_en_priv *priv,
 	dma_addr_t dma;
 
 	skb = netdev_alloc_skb(priv->dev, SMALL_PACKET_SIZE + NET_IP_ALIGN);
-	if (!skb) {
+	if (unlikely(!skb)) {
 		en_dbg(RX_ERR, priv, "Failed allocating skb\n");
 		return NULL;
 	}
@@ -652,18 +689,23 @@ out_loopback:
 	dev_kfree_skb_any(skb);
 }
 
-static void mlx4_en_refill_rx_buffers(struct mlx4_en_priv *priv,
-				     struct mlx4_en_rx_ring *ring)
+static bool mlx4_en_refill_rx_buffers(struct mlx4_en_priv *priv,
+				      struct mlx4_en_rx_ring *ring)
 {
-	int index = ring->prod & ring->size_mask;
+	u32 missing = ring->actual_size - (ring->prod - ring->cons);
 
-	while ((u32) (ring->prod - ring->cons) < ring->actual_size) {
-		if (mlx4_en_prepare_rx_desc(priv, ring, index,
+	/* Try to batch allocations, but not too much. */
+	if (missing < 8)
+		return false;
+	do {
+		if (mlx4_en_prepare_rx_desc(priv, ring,
+					    ring->prod & ring->size_mask,
 					    GFP_ATOMIC | __GFP_COLD))
 			break;
 		ring->prod++;
-		index = ring->prod & ring->size_mask;
-	}
+	} while (--missing);
+
+	return true;
 }
 
 /* When hardware doesn't strip the vlan, we need to calculate the checksum
@@ -701,7 +743,8 @@ static int get_fixed_ipv6_csum(__wsum hw_checksum, struct sk_buff *skb,
 {
 	__wsum csum_pseudo_hdr = 0;
 
-	if (ipv6h->nexthdr == IPPROTO_FRAGMENT || ipv6h->nexthdr == IPPROTO_HOPOPTS)
+	if (unlikely(ipv6h->nexthdr == IPPROTO_FRAGMENT ||
+		     ipv6h->nexthdr == IPPROTO_HOPOPTS))
 		return -1;
 	hw_checksum = csum_add(hw_checksum, (__force __wsum)htons(ipv6h->nexthdr));
 
@@ -734,7 +777,7 @@ static int check_csum(struct mlx4_cqe *cqe, struct sk_buff *skb, void *va,
 		get_fixed_ipv4_csum(hw_checksum, skb, hdr);
 #if IS_ENABLED(CONFIG_IPV6)
 	else if (cqe->status & cpu_to_be16(MLX4_CQE_STATUS_IPV6))
-		if (get_fixed_ipv6_csum(hw_checksum, skb, hdr))
+		if (unlikely(get_fixed_ipv6_csum(hw_checksum, skb, hdr)))
 			return -1;
 #endif
 	return 0;
@@ -758,10 +801,10 @@ int mlx4_en_process_rx_cq(struct net_device *dev, struct mlx4_en_cq *cq, int bud
 	u64 timestamp;
 	bool l2_tunnel;
 
-	if (!priv->port_up)
+	if (unlikely(!priv->port_up))
 		return 0;
 
-	if (budget <= 0)
+	if (unlikely(budget <= 0))
 		return polled;
 
 	/* We assume a 1:1 mapping between CQEs and Rx descriptors, so Rx
@@ -938,7 +981,7 @@ int mlx4_en_process_rx_cq(struct net_device *dev, struct mlx4_en_cq *cq, int bud
 
 		/* GRO not possible, complete processing here */
 		skb = mlx4_en_rx_skb(priv, rx_desc, frags, length);
-		if (!skb) {
+		if (unlikely(!skb)) {
 			ring->dropped++;
 			goto next;
 		}
@@ -999,12 +1042,16 @@ next:
 	}
 
 out:
+	if (polled) {
+		mlx4_cq_set_ci(&cq->mcq);
+		wmb(); /* ensure HW sees CQ consumer before we post new buffers */
+		ring->cons = cq->mcq.cons_index;
+	}
 	AVG_PERF_COUNTER(priv->pstats.rx_coal_avg, polled);
-	mlx4_cq_set_ci(&cq->mcq);
-	wmb(); /* ensure HW sees CQ consumer before we post new buffers */
-	ring->cons = cq->mcq.cons_index;
-	mlx4_en_refill_rx_buffers(priv, ring);
-	mlx4_en_update_rx_prod_db(ring);
+
+	if (mlx4_en_refill_rx_buffers(priv, ring))
+		mlx4_en_update_rx_prod_db(ring);
+
 	return polled;
 }
 
@@ -1051,10 +1098,13 @@ int mlx4_en_poll_rx_cq(struct napi_struct *napi, int budget)
 			return budget;
 
 		/* Current cpu is not according to smp_irq_affinity -
-		 * probably affinity changed. need to stop this NAPI
-		 * poll, and restart it on the right CPU
+		 * probably affinity changed. Need to stop this NAPI
+		 * poll, and restart it on the right CPU.
+		 * Try to avoid returning a too small value (like 0),
+		 * to not fool net_rx_action() and its netdev_budget
 		 */
-		done = 0;
+		if (done)
+			done--;
 #else
 		if (cq->tot_rx < MLX4_EN_MIN_RX_ARM)
 			return budget;
@@ -1080,22 +1130,26 @@ static const int frag_sizes[] = {
 
 void mlx4_en_calc_rx_buf(struct net_device *dev)
 {
+	enum dma_data_direction dma_dir = PCI_DMA_FROMDEVICE;
 	struct mlx4_en_priv *priv = netdev_priv(dev);
 	/* VLAN_HLEN is added twice,to support skb vlan tagged with multiple
 	 * headers. (For example: ETH_P_8021Q and ETH_P_8021AD).
 	 */
 	int eff_mtu = dev->mtu + ETH_HLEN + (2 * VLAN_HLEN);
+	int order = MLX4_EN_ALLOC_PREFER_ORDER;
+	u32 align = SMP_CACHE_BYTES;
 	int buf_size = 0;
 	int i = 0;
 
 	while (buf_size < eff_mtu) {
+		priv->frag_info[i].order = order;
 		priv->frag_info[i].frag_size =
 			(eff_mtu > buf_size + frag_sizes[i]) ?
 				frag_sizes[i] : eff_mtu - buf_size;
 		priv->frag_info[i].frag_prefix_size = buf_size;
 		priv->frag_info[i].frag_stride =
-				ALIGN(priv->frag_info[i].frag_size,
-				      SMP_CACHE_BYTES);
+				ALIGN(priv->frag_info[i].frag_size, align);
+		priv->frag_info[i].dma_dir = dma_dir;
 		buf_size += priv->frag_info[i].frag_size;
 		i++;
 	}
@@ -1107,7 +1161,8 @@ void mlx4_en_calc_rx_buf(struct net_device *dev)
 	en_dbg(DRV, priv, "Rx buffer scatter-list (effective-mtu:%d num_frags:%d):\n",
 	       eff_mtu, priv->num_frags);
 	for (i = 0; i < priv->num_frags; i++) {
-		en_err(priv,
+		en_dbg(DRV,
+		       priv,
 		       "  frag:%d - size:%d prefix:%d stride:%d\n",
 		       i,
 		       priv->frag_info[i].frag_size,

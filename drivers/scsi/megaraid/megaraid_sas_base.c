@@ -43,6 +43,7 @@
 #include <linux/uio.h>
 #include <linux/slab.h>
 #include <asm/uaccess.h>
+#include <asm/unaligned.h>
 #include <linux/fs.h>
 #include <linux/compat.h>
 #include <linux/blkdev.h>
@@ -116,8 +117,10 @@ static int megasas_ld_list_query(struct megasas_instance *instance,
 static int megasas_issue_init_mfi(struct megasas_instance *instance);
 static int megasas_register_aen(struct megasas_instance *instance,
 				u32 seq_num, u32 class_locale_word);
-static int
-megasas_get_pd_info(struct megasas_instance *instance, u16 device_id);
+static void megasas_get_pd_info(struct megasas_instance *instance,
+				struct scsi_device *sdev);
+static int megasas_get_target_prop(struct megasas_instance *instance,
+				   struct scsi_device *sdev);
 /*
  * PCI ID table for all supported controllers
  */
@@ -1740,16 +1743,21 @@ static struct megasas_instance *megasas_lookup_instance(u16 host_no)
 }
 
 /*
-* megasas_update_sdev_properties - Update sdev structure based on controller's FW capabilities
+* megasas_set_dynamic_target_properties -
+* Device property set by driver may not be static and it is required to be
+* updated after OCR
+*
+* set tm_capable.
+* set dma alignment (only for eedp protection enable vd).
 *
 * @sdev: OS provided scsi device
 *
 * Returns void
 */
-void megasas_update_sdev_properties(struct scsi_device *sdev)
+void megasas_set_dynamic_target_properties(struct scsi_device *sdev)
 {
-	u16 pd_index = 0;
-	u32 device_id, ld;
+	u16 pd_index = 0, ld;
+	u32 device_id;
 	struct megasas_instance *instance;
 	struct fusion_context *fusion;
 	struct MR_PRIV_DEVICE *mr_device_priv_data;
@@ -1774,60 +1782,116 @@ void megasas_update_sdev_properties(struct scsi_device *sdev)
 		raid = MR_LdRaidGet(ld, local_map_ptr);
 
 		if (raid->capability.ldPiMode == MR_PROT_INFO_TYPE_CONTROLLER)
-			blk_queue_update_dma_alignment(sdev->request_queue,
-						       0x7);
+		blk_queue_update_dma_alignment(sdev->request_queue, 0x7);
 
 		mr_device_priv_data->is_tm_capable =
 			raid->capability.tmCapable;
 	} else if (instance->use_seqnum_jbod_fp) {
 		pd_index = (sdev->channel * MEGASAS_MAX_DEV_PER_CHANNEL) +
-				sdev->id;
+			sdev->id;
 		pd_sync = (void *)fusion->pd_seq_sync
 				[(instance->pd_seq_map_id - 1) & 1];
 		mr_device_priv_data->is_tm_capable =
-				pd_sync->seq[pd_index].capability.tmCapable;
+			pd_sync->seq[pd_index].capability.tmCapable;
 	}
 }
 
-static void megasas_set_device_queue_depth(struct scsi_device *sdev)
+/*
+ * megasas_set_nvme_device_properties -
+ * set nomerges=2
+ * set virtual page boundary = 4K (current mr_nvme_pg_size is 4K).
+ * set maximum io transfer = MDTS of NVME device provided by MR firmware.
+ *
+ * MR firmware provides value in KB. Caller of this function converts
+ * kb into bytes.
+ *
+ * e.a MDTS=5 means 2^5 * nvme page size. (In case of 4K page size,
+ * MR firmware provides value 128 as (32 * 4K) = 128K.
+ *
+ * @sdev:				scsi device
+ * @max_io_size:				maximum io transfer size
+ *
+ */
+static inline void
+megasas_set_nvme_device_properties(struct scsi_device *sdev, u32 max_io_size)
 {
-	u16				pd_index = 0;
-	int		ret = DCMD_FAILED;
 	struct megasas_instance *instance;
+	u32 mr_nvme_pg_size;
+
+	instance = (struct megasas_instance *)sdev->host->hostdata;
+	mr_nvme_pg_size = max_t(u32, instance->nvme_page_size,
+				MR_DEFAULT_NVME_PAGE_SIZE);
+
+	blk_queue_max_hw_sectors(sdev->request_queue, (max_io_size / 512));
+
+	queue_flag_set_unlocked(QUEUE_FLAG_NOMERGES, sdev->request_queue);
+	blk_queue_virt_boundary(sdev->request_queue, mr_nvme_pg_size - 1);
+}
+
+
+/*
+ * megasas_set_static_target_properties -
+ * Device property set by driver are static and it is not required to be
+ * updated after OCR.
+ *
+ * set io timeout
+ * set device queue depth
+ * set nvme device properties. see - megasas_set_nvme_device_properties
+ *
+ * @sdev:				scsi device
+ * @is_target_prop			true, if fw provided target properties.
+ */
+static void megasas_set_static_target_properties(struct scsi_device *sdev,
+						 bool is_target_prop)
+{
+	u16	target_index = 0;
+	u8 interface_type;
+	u32 device_qd = MEGASAS_DEFAULT_CMD_PER_LUN;
+	u32 max_io_size_kb = MR_DEFAULT_NVME_MDTS_KB;
+	u32 tgt_device_qd;
+	struct megasas_instance *instance;
+	struct MR_PRIV_DEVICE *mr_device_priv_data;
 
 	instance = megasas_lookup_instance(sdev->host->host_no);
+	mr_device_priv_data = sdev->hostdata;
+	interface_type  = mr_device_priv_data->interface_type;
 
-	if (sdev->channel < MEGASAS_MAX_PD_CHANNELS) {
-		pd_index = (sdev->channel * MEGASAS_MAX_DEV_PER_CHANNEL) + sdev->id;
+	/*
+	 * The RAID firmware may require extended timeouts.
+	 */
+	blk_queue_rq_timeout(sdev->request_queue, scmd_timeout * HZ);
 
-		if (instance->pd_info) {
-			mutex_lock(&instance->hba_mutex);
-			ret = megasas_get_pd_info(instance, pd_index);
-			mutex_unlock(&instance->hba_mutex);
-		}
+	target_index = (sdev->channel * MEGASAS_MAX_DEV_PER_CHANNEL) + sdev->id;
 
-		if (ret != DCMD_SUCCESS)
-			return;
-
-		if (instance->pd_list[pd_index].driveState == MR_PD_STATE_SYSTEM) {
-
-			switch (instance->pd_list[pd_index].interface) {
-			case SAS_PD:
-				scsi_adjust_queue_depth(sdev, scsi_get_tag_type(sdev),
-					MEGASAS_SAS_QD);
-				break;
-
-			case SATA_PD:
-				scsi_adjust_queue_depth(sdev, scsi_get_tag_type(sdev),
-					MEGASAS_SATA_QD);
-				break;
-
-			default:
-				scsi_adjust_queue_depth(sdev, scsi_get_tag_type(sdev),
-					MEGASAS_DEFAULT_PD_QD);
-			}
-		}
+	switch (interface_type) {
+	case SAS_PD:
+		device_qd = MEGASAS_SAS_QD;
+		break;
+	case SATA_PD:
+		device_qd = MEGASAS_SATA_QD;
+		break;
+	case NVME_PD:
+		device_qd = MEGASAS_NVME_QD;
+		break;
 	}
+
+	if (is_target_prop) {
+		tgt_device_qd = le32_to_cpu(instance->tgt_prop->device_qdepth);
+		if (tgt_device_qd &&
+		    (tgt_device_qd <= instance->host->can_queue))
+			device_qd = tgt_device_qd;
+
+		/* max_io_size_kb will be set to non zero for
+		 * nvme based vd and syspd.
+		 */
+		max_io_size_kb = le32_to_cpu(instance->tgt_prop->max_io_size_kb);
+	}
+
+	if (instance->nvme_page_size && max_io_size_kb)
+		megasas_set_nvme_device_properties(sdev, (max_io_size_kb << 10));
+
+	scsi_adjust_queue_depth(sdev, scsi_get_tag_type(sdev), device_qd);
+
 }
 
 
@@ -1835,6 +1899,8 @@ static int megasas_slave_configure(struct scsi_device *sdev)
 {
 	u16 pd_index = 0;
 	struct megasas_instance *instance;
+	int ret_target_prop = DCMD_FAILED;
+	bool is_target_prop = false;
 
 	instance = megasas_lookup_instance(sdev->host->host_no);
 	if (instance->pd_list_not_supported) {
@@ -1846,14 +1912,25 @@ static int megasas_slave_configure(struct scsi_device *sdev)
 				return -ENXIO;
 		}
 	}
-	megasas_set_device_queue_depth(sdev);
-	megasas_update_sdev_properties(sdev);
 
-	/*
-	 * The RAID firmware may require extended timeouts.
+	mutex_lock(&instance->hba_mutex);
+	/* Send DCMD to Firmware and cache the information */
+	if ((instance->pd_info) && !MEGASAS_IS_LOGICAL(sdev))
+		megasas_get_pd_info(instance, sdev);
+
+	/* Some ventura firmware may not have instance->nvme_page_size set.
+	 * Do not send MR_DCMD_DRV_GET_TARGET_PROP
 	 */
-	blk_queue_rq_timeout(sdev->request_queue,
-		scmd_timeout * HZ);
+	if ((instance->tgt_prop) && (instance->nvme_page_size))
+		ret_target_prop = megasas_get_target_prop(instance, sdev);
+
+	is_target_prop = (ret_target_prop == DCMD_SUCCESS) ? true : false;
+	megasas_set_static_target_properties(sdev, is_target_prop);
+
+	mutex_unlock(&instance->hba_mutex);
+
+	/* This sdev property may change post OCR */
+	megasas_set_dynamic_target_properties(sdev);
 
 	return 0;
 }
@@ -1889,6 +1966,9 @@ scan_target:
 
 	sdev->tagged_supported = 1;
 	scsi_activate_tcq(sdev, sdev->queue_depth);
+
+	atomic_set(&mr_device_priv_data->r1_ldio_hint,
+		   instance->r1_ldio_hint_default);
 	return 0;
 }
 
@@ -4040,18 +4120,22 @@ dcmd_timeout_ocr_possible(struct megasas_instance *instance) {
 		return INITIATE_OCR;
 }
 
-static int
-megasas_get_pd_info(struct megasas_instance *instance, u16 device_id)
+static void
+megasas_get_pd_info(struct megasas_instance *instance, struct scsi_device *sdev)
 {
 	int ret;
 	struct megasas_cmd *cmd;
 	struct megasas_dcmd_frame *dcmd;
 
+	struct MR_PRIV_DEVICE *mr_device_priv_data;
+	u16 device_id = 0;
+
+	device_id = (sdev->channel * MEGASAS_MAX_DEV_PER_CHANNEL) + sdev->id;
 	cmd = megasas_get_cmd(instance);
 
 	if (!cmd) {
 		dev_err(&instance->pdev->dev, "Failed to get cmd %s\n", __func__);
-		return -ENOMEM;
+		return;
 	}
 
 	dcmd = &cmd->frame->dcmd;
@@ -4078,7 +4162,9 @@ megasas_get_pd_info(struct megasas_instance *instance, u16 device_id)
 
 	switch (ret) {
 	case DCMD_SUCCESS:
-		instance->pd_list[device_id].interface =
+		mr_device_priv_data = sdev->hostdata;
+		le16_to_cpus((u16 *)&instance->pd_info->state.ddf.pdType);
+		mr_device_priv_data->interface_type =
 				instance->pd_info->state.ddf.pdType.intf;
 		break;
 
@@ -4105,7 +4191,7 @@ megasas_get_pd_info(struct megasas_instance *instance, u16 device_id)
 	if (ret != DCMD_TIMEOUT)
 		megasas_return_cmd(instance, cmd);
 
-	return ret;
+	return;
 }
 /*
  * megasas_get_pd_list_info -	Returns FW's pd_list structure
@@ -4484,8 +4570,7 @@ megasas_ld_list_query(struct megasas_instance *instance, u8 query_type)
 static void megasas_update_ext_vd_details(struct megasas_instance *instance)
 {
 	struct fusion_context *fusion;
-	u32 old_map_sz;
-	u32 new_map_sz;
+	u32 ventura_map_sz = 0;
 
 	fusion = instance->ctrl_context;
 	/* For MFI based controllers return dummy success */
@@ -4515,21 +4600,27 @@ static void megasas_update_ext_vd_details(struct megasas_instance *instance)
 		instance->supportmax256vd ? "Extended VD(240 VD)firmware" :
 		"Legacy(64 VD) firmware");
 
-	old_map_sz = sizeof(struct MR_FW_RAID_MAP) +
-				(sizeof(struct MR_LD_SPAN_MAP) *
-				(instance->fw_supported_vd_count - 1));
-	new_map_sz = sizeof(struct MR_FW_RAID_MAP_EXT);
-	fusion->drv_map_sz = sizeof(struct MR_DRV_RAID_MAP) +
-				(sizeof(struct MR_LD_SPAN_MAP) *
-				(instance->drv_supported_vd_count - 1));
+	if (instance->max_raid_mapsize) {
+		ventura_map_sz = instance->max_raid_mapsize *
+						MR_MIN_MAP_SIZE; /* 64k */
+		fusion->current_map_sz = ventura_map_sz;
+		fusion->max_map_sz = ventura_map_sz;
+	} else {
+		fusion->old_map_sz =  sizeof(struct MR_FW_RAID_MAP) +
+					(sizeof(struct MR_LD_SPAN_MAP) *
+					(instance->fw_supported_vd_count - 1));
+		fusion->new_map_sz =  sizeof(struct MR_FW_RAID_MAP_EXT);
 
-	fusion->max_map_sz = max(old_map_sz, new_map_sz);
+		fusion->max_map_sz =
+			max(fusion->old_map_sz, fusion->new_map_sz);
 
-
-	if (instance->supportmax256vd)
-		fusion->current_map_sz = new_map_sz;
-	else
-		fusion->current_map_sz = old_map_sz;
+		if (instance->supportmax256vd)
+			fusion->current_map_sz = fusion->new_map_sz;
+		else
+			fusion->current_map_sz = fusion->old_map_sz;
+	}
+	/* irrespective of FW raid maps, driver raid map is constant */
+	fusion->drv_map_sz = sizeof(struct MR_DRV_RAID_MAP_ALL);
 }
 
 /**
@@ -4599,6 +4690,7 @@ megasas_get_ctrl_info(struct megasas_instance *instance)
 		le32_to_cpus((u32 *)&ctrl_info->properties.OnOffProperties);
 		le32_to_cpus((u32 *)&ctrl_info->adapterOperations2);
 		le32_to_cpus((u32 *)&ctrl_info->adapterOperations3);
+		le16_to_cpus((u16 *)&ctrl_info->adapter_operations4);
 
 		/* Update the latest Ext VD info.
 		 * From Init path, store current firmware details.
@@ -4608,6 +4700,8 @@ megasas_get_ctrl_info(struct megasas_instance *instance)
 		megasas_update_ext_vd_details(instance);
 		instance->use_seqnum_jbod_fp =
 			ctrl_info->adapterOperations3.useSeqNumJbodFP;
+		instance->support_morethan256jbod =
+			ctrl_info->adapter_operations4.support_pd_map_target_id;
 
 		/*Check whether controller is iMR or MR */
 		instance->is_imr = (ctrl_info->memory_size ? 0 : 1);
@@ -5069,8 +5163,8 @@ skip_alloc:
 static int megasas_init_fw(struct megasas_instance *instance)
 {
 	u32 max_sectors_1;
-	u32 max_sectors_2;
-	u32 tmp_sectors, msix_enable, scratch_pad_2;
+	u32 max_sectors_2, tmp_sectors, msix_enable;
+	u32 scratch_pad_2, scratch_pad_3, scratch_pad_4;
 	resource_size_t base_addr;
 	struct megasas_register_set __iomem *reg_set;
 	struct megasas_ctrl_info *ctrl_info = NULL;
@@ -5083,7 +5177,7 @@ static int megasas_init_fw(struct megasas_instance *instance)
 
 	/* Find first memory bar */
 	bar_list = pci_select_bars(instance->pdev, IORESOURCE_MEM);
-	instance->bar = find_first_bit(&bar_list, sizeof(unsigned long));
+	instance->bar = find_first_bit(&bar_list, BITS_PER_LONG);
 	if (pci_request_selected_regions(instance->pdev, 1<<instance->bar,
 					 "megasas: LSI")) {
 		dev_printk(KERN_DEBUG, &instance->pdev->dev, "IO memory region busy!\n");
@@ -5141,13 +5235,13 @@ static int megasas_init_fw(struct megasas_instance *instance)
 			goto fail_ready_state;
 	}
 
-	/*
-	 * MSI-X host index 0 is common for all adapter.
-	 * It is used for all MPT based Adapters.
-	 */
-	instance->reply_post_host_index_addr[0] =
-		(u32 __iomem *)((u8 __iomem *)instance->reg_set +
-		MPI2_REPLY_POST_HOST_INDEX_OFFSET);
+	if (instance->is_ventura) {
+		scratch_pad_3 =
+			readl(&instance->reg_set->outbound_scratch_pad_3);
+		instance->max_raid_mapsize = ((scratch_pad_3 >>
+			MR_MAX_RAID_MAP_SIZE_OFFSET_SHIFT) &
+			MR_MAX_RAID_MAP_SIZE_MASK);
+	}
 
 	/* Check if MSI-X is supported while in ready state */
 	msix_enable = (instance->instancet->read_fw_status_reg(reg_set) &
@@ -5165,6 +5259,9 @@ static int megasas_init_fw(struct megasas_instance *instance)
 				instance->msix_vectors = ((scratch_pad_2
 					& MR_MAX_REPLY_QUEUES_EXT_OFFSET)
 					>> MR_MAX_REPLY_QUEUES_EXT_OFFSET_SHIFT) + 1;
+				if (instance->msix_vectors > 16)
+					instance->msix_combined = true;
+
 				if (rdpq_enable)
 					instance->is_rdpq = (scratch_pad_2 & MR_RDPQ_MODE_OFFSET) ?
 								1 : 0;
@@ -5198,6 +5295,19 @@ static int megasas_init_fw(struct megasas_instance *instance)
 		else
 			instance->msix_vectors = 0;
 	}
+	/*
+	 * MSI-X host index 0 is common for all adapter.
+	 * It is used for all MPT based Adapters.
+	 */
+	if (instance->msix_combined) {
+		instance->reply_post_host_index_addr[0] =
+				(u32 *)((u8 *)instance->reg_set +
+				MPI2_SUP_REPLY_POST_HOST_INDEX_OFFSET);
+	} else {
+		instance->reply_post_host_index_addr[0] =
+			(u32 *)((u8 *)instance->reg_set +
+			MPI2_REPLY_POST_HOST_INDEX_OFFSET);
+	}
 
 	dev_info(&instance->pdev->dev,
 		"firmware supports msix\t: (%d)", fw_msix_count);
@@ -5209,11 +5319,6 @@ static int megasas_init_fw(struct megasas_instance *instance)
 
 	tasklet_init(&instance->isr_tasklet, instance->instancet->tasklet,
 		(unsigned long)instance);
-
-	if (instance->msix_vectors ?
-		megasas_setup_irqs_msix(instance, 1) :
-		megasas_setup_irqs_ioapic(instance))
-		goto fail_setup_irqs;
 
 	instance->ctrl_info = kzalloc(sizeof(struct megasas_ctrl_info),
 				GFP_KERNEL);
@@ -5228,6 +5333,23 @@ static int megasas_init_fw(struct megasas_instance *instance)
 	instance->fw_supported_pd_count = MAX_PHYSICAL_DEVICES;
 	/* Get operational params, sge flags, send init cmd to controller */
 	if (instance->instancet->init_adapter(instance))
+		goto fail_init_adapter;
+
+	if (instance->is_ventura) {
+		scratch_pad_4 =
+			readl(&instance->reg_set->outbound_scratch_pad_4);
+		if ((scratch_pad_4 & MR_NVME_PAGE_SIZE_MASK) >=
+			MR_DEFAULT_NVME_PAGE_SHIFT)
+			instance->nvme_page_size =
+				(1 << (scratch_pad_4 & MR_NVME_PAGE_SIZE_MASK));
+
+		dev_info(&instance->pdev->dev,
+			 "NVME page size\t: (%d)\n", instance->nvme_page_size);
+	}
+
+	if (instance->msix_vectors ?
+		megasas_setup_irqs_msix(instance, 1) :
+		megasas_setup_irqs_ioapic(instance))
 		goto fail_init_adapter;
 
 	instance->instancet->enable_intr(instance);
@@ -5249,14 +5371,14 @@ static int megasas_init_fw(struct megasas_instance *instance)
 	memset(instance->ld_ids, 0xff, MEGASAS_MAX_LD_IDS);
 
 	/* stream detection initialization */
-	if (instance->is_ventura) {
+	if (instance->is_ventura && fusion) {
 		fusion->stream_detect_by_ld =
-		kzalloc(sizeof(struct LD_STREAM_DETECT *)
-		* MAX_LOGICAL_DRIVES_EXT,
-		GFP_KERNEL);
+			kzalloc(sizeof(struct LD_STREAM_DETECT *)
+			* MAX_LOGICAL_DRIVES_EXT,
+			GFP_KERNEL);
 		if (!fusion->stream_detect_by_ld) {
 			dev_err(&instance->pdev->dev,
-					"unable to allocate stream detection for pool of LDs\n");
+				"unable to allocate stream detection for pool of LDs\n");
 			goto fail_get_ld_pd_list;
 		}
 		for (i = 0; i < MAX_LOGICAL_DRIVES_EXT; ++i) {
@@ -5398,9 +5520,8 @@ static int megasas_init_fw(struct megasas_instance *instance)
 
 fail_get_ld_pd_list:
 	instance->instancet->disable_intr(instance);
-fail_init_adapter:
 	megasas_destroy_irqs(instance);
-fail_setup_irqs:
+fail_init_adapter:
 	if (instance->msix_vectors)
 		pci_disable_msix(instance->pdev);
 	instance->msix_vectors = 0;
@@ -5633,6 +5754,98 @@ megasas_register_aen(struct megasas_instance *instance, u32 seq_num,
 	return 0;
 }
 
+/* megasas_get_target_prop - Send DCMD with below details to firmware.
+ *
+ * This DCMD will fetch few properties of LD/system PD defined
+ * in MR_TARGET_DEV_PROPERTIES. eg. Queue Depth, MDTS value.
+ *
+ * DCMD send by drivers whenever new target is added to the OS.
+ *
+ * dcmd.opcode         - MR_DCMD_DEV_GET_TARGET_PROP
+ * dcmd.mbox.b[0]      - DCMD is to be fired for LD or system PD.
+ *                       0 = system PD, 1 = LD.
+ * dcmd.mbox.s[1]      - TargetID for LD/system PD.
+ * dcmd.sge IN         - Pointer to return MR_TARGET_DEV_PROPERTIES.
+ *
+ * @instance:		Adapter soft state
+ * @sdev:		OS provided scsi device
+ *
+ * Returns 0 on success non-zero on failure.
+ */
+static int
+megasas_get_target_prop(struct megasas_instance *instance,
+			struct scsi_device *sdev)
+{
+	int ret;
+	struct megasas_cmd *cmd;
+	struct megasas_dcmd_frame *dcmd;
+	u16 targetId = (sdev->channel % 2) + sdev->id;
+
+	cmd = megasas_get_cmd(instance);
+
+	if (!cmd) {
+		dev_err(&instance->pdev->dev,
+			"Failed to get cmd %s\n", __func__);
+		return -ENOMEM;
+	}
+
+	dcmd = &cmd->frame->dcmd;
+
+	memset(instance->tgt_prop, 0, sizeof(*instance->tgt_prop));
+	memset(dcmd->mbox.b, 0, MFI_MBOX_SIZE);
+	dcmd->mbox.b[0] = MEGASAS_IS_LOGICAL(sdev);
+
+	dcmd->mbox.s[1] = cpu_to_le16(targetId);
+	dcmd->cmd = MFI_CMD_DCMD;
+	dcmd->cmd_status = 0xFF;
+	dcmd->sge_count = 1;
+	dcmd->flags = cpu_to_le16(MFI_FRAME_DIR_READ);
+	dcmd->timeout = 0;
+	dcmd->pad_0 = 0;
+	dcmd->data_xfer_len =
+		cpu_to_le32(sizeof(struct MR_TARGET_PROPERTIES));
+	dcmd->opcode = cpu_to_le32(MR_DCMD_DRV_GET_TARGET_PROP);
+	dcmd->sgl.sge32[0].phys_addr =
+		cpu_to_le32(instance->tgt_prop_h);
+	dcmd->sgl.sge32[0].length =
+		cpu_to_le32(sizeof(struct MR_TARGET_PROPERTIES));
+
+	if (instance->ctrl_context && !instance->mask_interrupts)
+		ret = megasas_issue_blocked_cmd(instance,
+						cmd, MFI_IO_TIMEOUT_SECS);
+	else
+		ret = megasas_issue_polled(instance, cmd);
+
+	switch (ret) {
+	case DCMD_TIMEOUT:
+		switch (dcmd_timeout_ocr_possible(instance)) {
+		case INITIATE_OCR:
+			cmd->flags |= DRV_DCMD_SKIP_REFIRE;
+			megasas_reset_fusion(instance->host,
+					     MFI_IO_TIMEOUT_OCR);
+			break;
+		case KILL_ADAPTER:
+			megaraid_sas_kill_hba(instance);
+			break;
+		case IGNORE_TIMEOUT:
+			dev_info(&instance->pdev->dev,
+				 "Ignore DCMD timeout: %s %d\n",
+				 __func__, __LINE__);
+			break;
+		}
+		break;
+
+	default:
+		megasas_return_cmd(instance, cmd);
+	}
+	if (ret != DCMD_SUCCESS)
+		dev_err(&instance->pdev->dev,
+			"return from %s %d return value %d\n",
+			__func__, __LINE__, ret);
+
+	return ret;
+}
+
 /**
  * megasas_start_aen -	Subscribes to AEN during driver load time
  * @instance:		Adapter soft state
@@ -5841,18 +6054,12 @@ static int megasas_probe_one(struct pci_dev *pdev,
 	case PCI_DEVICE_ID_LSI_CUTLASS_52:
 	case PCI_DEVICE_ID_LSI_CUTLASS_53:
 	{
-		instance->ctrl_context_pages =
-			get_order(sizeof(struct fusion_context));
-		instance->ctrl_context = (void *)__get_free_pages(GFP_KERNEL,
-				instance->ctrl_context_pages);
-		if (!instance->ctrl_context) {
-			dev_printk(KERN_DEBUG, &pdev->dev, "Failed to allocate "
-			       "memory for Fusion context info\n");
+		if (megasas_alloc_fusion_context(instance)) {
+			megasas_free_fusion_context(instance);
 			goto fail_alloc_dma_buf;
 		}
 		fusion = instance->ctrl_context;
-		memset(fusion, 0,
-			((1 << PAGE_SHIFT) << instance->ctrl_context_pages));
+
 		if ((instance->pdev->device == PCI_DEVICE_ID_LSI_FUSION) ||
 			(instance->pdev->device == PCI_DEVICE_ID_LSI_PLASMA))
 			fusion->adapter_type = THUNDERBOLT_SERIES;
@@ -5919,8 +6126,16 @@ static int megasas_probe_one(struct pci_dev *pdev,
 		instance->pd_info = pci_alloc_consistent(pdev,
 			sizeof(struct MR_PD_INFO), &instance->pd_info_h);
 
+		instance->pd_info = pci_alloc_consistent(pdev,
+			sizeof(struct MR_PD_INFO), &instance->pd_info_h);
+		instance->tgt_prop = pci_alloc_consistent(pdev,
+			sizeof(struct MR_TARGET_PROPERTIES), &instance->tgt_prop_h);
+
 		if (!instance->pd_info)
 			dev_err(&instance->pdev->dev, "Failed to alloc mem for pd_info\n");
+
+		if (!instance->tgt_prop)
+			dev_err(&instance->pdev->dev, "Failed to alloc mem for tgt_prop\n");
 
 		instance->crash_dump_buf = pci_alloc_consistent(pdev,
 						CRASH_DMA_BUF_SIZE,
@@ -6066,6 +6281,10 @@ fail_alloc_dma_buf:
 		pci_free_consistent(pdev, sizeof(struct MR_PD_INFO),
 					instance->pd_info,
 					instance->pd_info_h);
+	if (instance->tgt_prop)
+		pci_free_consistent(pdev, sizeof(struct MR_TARGET_PROPERTIES),
+					instance->tgt_prop,
+					instance->tgt_prop_h);
 	if (instance->producer)
 		pci_free_consistent(pdev, sizeof(u32), instance->producer,
 				    instance->producer_h);
@@ -6331,6 +6550,10 @@ fail_init_mfi:
 		pci_free_consistent(pdev, sizeof(struct MR_PD_INFO),
 					instance->pd_info,
 					instance->pd_info_h);
+	if (instance->tgt_prop)
+		pci_free_consistent(pdev, sizeof(struct MR_TARGET_PROPERTIES),
+					instance->tgt_prop,
+					instance->tgt_prop_h);
 	if (instance->producer)
 		pci_free_consistent(pdev, sizeof(u32), instance->producer,
 				instance->producer_h);
@@ -6472,8 +6695,7 @@ skip_firing_dcmds:
 					fusion->pd_seq_sync[i],
 					fusion->pd_seq_phys[i]);
 		}
-		free_pages((ulong)instance->ctrl_context,
-			instance->ctrl_context_pages);
+		megasas_free_fusion_context(instance);
 	} else {
 		megasas_release_mfi(instance);
 		pci_free_consistent(pdev, sizeof(u32),
@@ -6489,11 +6711,14 @@ skip_firing_dcmds:
 	if (instance->evt_detail)
 		pci_free_consistent(pdev, sizeof(struct megasas_evt_detail),
 				instance->evt_detail, instance->evt_detail_h);
-
 	if (instance->pd_info)
 		pci_free_consistent(pdev, sizeof(struct MR_PD_INFO),
 					instance->pd_info,
 					instance->pd_info_h);
+	if (instance->tgt_prop)
+		pci_free_consistent(pdev, sizeof(struct MR_TARGET_PROPERTIES),
+					instance->tgt_prop,
+					instance->tgt_prop_h);
 	if (instance->vf_affiliation)
 		pci_free_consistent(pdev, (MAX_LOGICAL_DRIVES + 1) *
 				    sizeof(struct MR_LD_VF_AFFILIATION),
@@ -6807,7 +7032,8 @@ megasas_mgmt_fw_ioctl(struct megasas_instance *instance,
 		sense_ptr = (unsigned long *) ((unsigned long)ioc->frame.raw +
 				ioc->sense_off);
 
-		if (copy_to_user((void __user *)((unsigned long)(*sense_ptr)),
+		if (copy_to_user((void __user *)((unsigned long)
+				 get_unaligned((unsigned long *)sense_ptr)),
 				 sense, ioc->sense_len)) {
 			dev_err(&instance->pdev->dev, "Failed to copy out to user "
 					"sense data\n");

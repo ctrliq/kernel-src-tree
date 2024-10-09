@@ -471,11 +471,11 @@ static int aac_rx_ioremap(struct aac_dev * dev, u32 size)
 	return 0;
 }
 
-static int aac_rx_restart_adapter(struct aac_dev *dev, int bled)
+static int aac_rx_restart_adapter(struct aac_dev *dev, int bled, u8 reset_type)
 {
 	u32 var = 0;
 
-	if (!(dev->supplement_adapter_info.SupportedOptions2 &
+	if (!(dev->supplement_adapter_info.supported_options2 &
 	  AAC_OPTION_MU_RESET) || (bled >= 0) || (bled == -2)) {
 		if (bled)
 			printk(KERN_ERR "%s%d: adapter kernel panic'd %x.\n",
@@ -560,7 +560,7 @@ int _aac_rx_init(struct aac_dev *dev)
 	dev->a_ops.adapter_enable_int = aac_rx_disable_interrupt;
 	dev->OIMR = status = rx_readb (dev, MUnit.OIMR);
 	if ((((status & 0x0c) != 0x0c) || aac_reset_devices || reset_devices) &&
-	  !aac_rx_restart_adapter(dev, 0))
+	  !aac_rx_restart_adapter(dev, 0, IOP_HWSOFT_RESET))
 		/* Make sure the Hardware FIFO is empty */
 		while ((++restart < 512) &&
 		  (rx_readl(dev, MUnit.OutboundQueue) != 0xFFFFFFFFL));
@@ -569,7 +569,8 @@ int _aac_rx_init(struct aac_dev *dev)
 	 */
 	status = rx_readl(dev, MUnit.OMRx[0]);
 	if (status & KERNEL_PANIC) {
-		if (aac_rx_restart_adapter(dev, aac_rx_check_health(dev)))
+		if (aac_rx_restart_adapter(dev,
+			aac_rx_check_health(dev), IOP_HWSOFT_RESET))
 			goto error_iounmap;
 		++restart;
 	}
@@ -607,7 +608,8 @@ int _aac_rx_init(struct aac_dev *dev)
 		  ((startup_timeout > 60)
 		    ? (startup_timeout - 60)
 		    : (startup_timeout / 2))))) {
-			if (likely(!aac_rx_restart_adapter(dev, aac_rx_check_health(dev))))
+			if (likely(!aac_rx_restart_adapter(dev,
+				aac_rx_check_health(dev), IOP_HWSOFT_RESET)))
 				start = jiffies;
 			++restart;
 		}

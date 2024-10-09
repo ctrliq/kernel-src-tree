@@ -23,19 +23,22 @@
  * inode->i_mutex	(while writing or truncating, not reading or faulting)
  *   mm->mmap_sem
  *     page->flags PG_locked (lock_page)
- *       mapping->i_mmap_mutex
- *         anon_vma->rwsem
- *           mm->page_table_lock or pte_lock
- *             zone->lru_lock (in mark_page_accessed, isolate_lru_page)
- *             swap_lock (in swap_duplicate, swap_info_get)
- *               mmlist_lock (in mmput, drain_mmlist and others)
- *               mapping->private_lock (in __set_page_dirty_buffers)
- *               inode->i_lock (in set_page_dirty's __mark_inode_dirty)
- *               bdi.wb->list_lock (in set_page_dirty's __mark_inode_dirty)
- *                 sb_lock (within inode_lock in fs/fs-writeback.c)
- *                 mapping->tree_lock (widely used, in set_page_dirty,
- *                           in arch-dependent flush_dcache_mmap_lock,
- *                           within bdi.wb->list_lock in __sync_single_inode)
+ *       hugetlbfs_i_mmap_rwsem_key (in huge_pmd_share)
+ *         mapping->i_mmap_rwsem
+ *           anon_vma->rwsem
+ *             mm->page_table_lock or pte_lock
+ *               zone->lru_lock (in mark_page_accessed, isolate_lru_page)
+ *               swap_lock (in swap_duplicate, swap_info_get)
+ *                 mmlist_lock (in mmput, drain_mmlist and others)
+ *                 mapping->private_lock (in __set_page_dirty_buffers)
+ *                   mem_cgroup_{begin,end}_page_stat (memcg->move_lock)
+ *                     mapping->tree_lock (widely used)
+ *                 inode->i_lock (in set_page_dirty's __mark_inode_dirty)
+ *                 bdi.wb->list_lock (in set_page_dirty's __mark_inode_dirty)
+ *                   sb_lock (within inode_lock in fs/fs-writeback.c)
+ *                   mapping->tree_lock (widely used, in set_page_dirty,
+ *                             in arch-dependent flush_dcache_mmap_lock,
+ *                             within bdi.wb->list_lock in __sync_single_inode)
  *
  * anon_vma->rwsem,mapping->i_mutex      (memory_failure, collect_procs_anon)
  *   ->tasklist_lock
@@ -57,6 +60,7 @@
 #include <linux/migrate.h>
 #include <linux/hugetlb.h>
 #include <linux/backing-dev.h>
+#include <linux/memremap.h>
 
 #include <asm/tlbflush.h>
 
@@ -1249,8 +1253,9 @@ void page_add_new_anon_rmap(struct page *page,
 	__page_set_anon_rmap(page, vma, address, 1);
 	if (!mlocked_vma_newpage(vma, page)) {
 		SetPageActive(page);
-		lru_cache_add(page);
-	} else
+		if (!is_zone_device_page(page))
+			lru_cache_add(page);
+	} else if (!is_zone_device_page(page))
 		add_page_to_unevictable_list(page);
 }
 
@@ -1344,6 +1349,52 @@ int try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 	pte_t pteval;
 	spinlock_t *ptl;
 	int ret = SWAP_AGAIN;
+
+	if ((flags & TTU_MIGRATION) && is_zone_device_page(page)) {
+		swp_entry_t entry;
+		pte_t swp_pte;
+		pmd_t *pmdp;
+
+		if (!is_hmm_page(page))
+			goto out;
+
+		pmdp = mm_find_pmd(mm, address);
+		if (!pmdp)
+			goto out;
+
+		pte = pte_offset_map_lock(mm, pmdp, address, &ptl);
+		if (!pte)
+			goto out;
+
+		pteval = ptep_get_and_clear(mm, address, pte);
+		if (pte_present(pteval) || pte_none(pteval) || pte_file(pteval)) {
+			set_pte_at(mm, address, pte, pteval);
+			goto out_unmap;
+		}
+
+		entry = pte_to_swp_entry(pteval);
+		if (!is_hmm_entry(entry)) {
+			set_pte_at(mm, address, pte, pteval);
+			goto out_unmap;
+		}
+
+		if (hmm_entry_to_page(entry) != page) {
+			set_pte_at(mm, address, pte, pteval);
+			goto out_unmap;
+		}
+
+		/*
+		 * Store the pfn of the page in a special migration
+		 * pte. do_swap_page() will wait until the migration
+		 * pte is removed and then restart fault handling.
+		 */
+		entry = make_migration_entry(page, 0);
+		swp_pte = swp_entry_to_pte(entry);
+		if (pte_soft_dirty(*pte))
+			swp_pte = pte_swp_mksoft_dirty(swp_pte);
+		set_pte_at(mm, address, pte, swp_pte);
+		goto out_unmap;
+	}
 
 	pte = page_check_address(page, mm, address, &ptl, 0);
 	if (!pte)

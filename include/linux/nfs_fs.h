@@ -60,18 +60,12 @@ struct nfs_lockowner {
 	pid_t l_pid;
 };
 
-#define NFS_IO_INPROGRESS 0
-struct nfs_io_counter {
-	unsigned long flags;
-	atomic_t io_count;
-};
-
 struct nfs_lock_context {
 	atomic_t count;
 	struct list_head list;
 	struct nfs_open_context *open_context;
 	struct nfs_lockowner lockowner;
-	struct nfs_io_counter io_count;
+	atomic_t io_count;
 };
 
 struct nfs4_state;
@@ -86,6 +80,7 @@ struct nfs_open_context {
 #define NFS_CONTEXT_ERROR_WRITE		(0)
 #define NFS_CONTEXT_RESEND_WRITES	(1)
 #define NFS_CONTEXT_BAD			(2)
+#define NFS_CONTEXT_UNLOCK	(3)
 	int error;
 
 	struct list_head list;
@@ -220,7 +215,6 @@ struct nfs_inode {
 #define NFS_INO_FLUSHING	(4)		/* inode is flushing out data */
 #define NFS_INO_FSCACHE		(5)		/* inode can be cached by FS-Cache */
 #define NFS_INO_FSCACHE_LOCK	(6)		/* FS-Cache cookie management lock */
-#define NFS_INO_COMMIT		(7)		/* inode is committing unstable writes */
 #define NFS_INO_LAYOUTCOMMIT	(9)		/* layoutcommit required */
 #define NFS_INO_LAYOUTCOMMITTING (10)		/* layoutcommit inflight */
 #define NFS_INO_LAYOUTSTATS	(11)		/* layoutstats inflight */
@@ -431,7 +425,7 @@ extern __be32 root_nfs_parse_addr(char *name); /*__init*/
  */
 extern const struct file_operations nfs_file_operations;
 #if IS_ENABLED(CONFIG_NFS_V4)
-extern const struct file_operations nfs4_file_operations;
+extern const struct file_operations_extend nfs4_file_operations;
 #endif /* CONFIG_NFS_V4 */
 extern const struct address_space_operations nfs_file_aops;
 extern const struct address_space_operations nfs_dir_aops;

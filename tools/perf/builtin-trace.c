@@ -33,14 +33,18 @@
 #include "util/stat.h"
 #include "trace-event.h"
 #include "util/parse-events.h"
+#include "callchain.h"
+#include "syscalltbl.h"
+#include "rb_resort.h"
 
-#include <libaudit.h>
+#include <libaudit.h> /* FIXME: Still needed for audit_errno_to_name */
 #include <stdlib.h>
-#include <linux/futex.h>
+#include <string.h>
 #include <linux/err.h>
-#include <linux/filter.h>
 #include <linux/audit.h>
 #include <linux/random.h>
+#include <linux/stringify.h>
+#include <linux/time64.h>
 
 #ifndef O_CLOEXEC
 # define O_CLOEXEC		02000000
@@ -48,10 +52,7 @@
 
 struct trace {
 	struct perf_tool	tool;
-	struct {
-		int		machine;
-		int		open_id;
-	}			audit;
+	struct syscalltbl	*sctbl;
 	struct {
 		int		max;
 		struct syscall  *table;
@@ -82,6 +83,8 @@ struct trace {
 		u64		vfs_getname,
 				proc_getname;
 	} stats;
+	unsigned int		max_stack;
+	unsigned int		min_stack;
 	bool			not_ev_qualifier;
 	bool			live;
 	bool			full_time;
@@ -92,9 +95,11 @@ struct trace {
 	bool			show_comm;
 	bool			show_tool_stats;
 	bool			trace_syscalls;
+	bool			kernel_syscallchains;
 	bool			force;
 	bool			vfs_getname;
 	int			trace_pgfaults;
+	int			open_id;
 };
 
 struct tp_field {
@@ -364,80 +369,6 @@ static size_t syscall_arg__scnprintf_int(char *bf, size_t size,
 
 #define SCA_INT syscall_arg__scnprintf_int
 
-static size_t syscall_arg__scnprintf_flock(char *bf, size_t size,
-					   struct syscall_arg *arg)
-{
-	int printed = 0, op = arg->val;
-
-	if (op == 0)
-		return scnprintf(bf, size, "NONE");
-#define	P_CMD(cmd) \
-	if ((op & LOCK_##cmd) == LOCK_##cmd) { \
-		printed += scnprintf(bf + printed, size - printed, "%s%s", printed ? "|" : "", #cmd); \
-		op &= ~LOCK_##cmd; \
-	}
-
-	P_CMD(SH);
-	P_CMD(EX);
-	P_CMD(NB);
-	P_CMD(UN);
-	P_CMD(MAND);
-	P_CMD(RW);
-	P_CMD(READ);
-	P_CMD(WRITE);
-#undef P_OP
-
-	if (op)
-		printed += scnprintf(bf + printed, size - printed, "%s%#x", printed ? "|" : "", op);
-
-	return printed;
-}
-
-#define SCA_FLOCK syscall_arg__scnprintf_flock
-
-static size_t syscall_arg__scnprintf_futex_op(char *bf, size_t size, struct syscall_arg *arg)
-{
-	enum syscall_futex_args {
-		SCF_UADDR   = (1 << 0),
-		SCF_OP	    = (1 << 1),
-		SCF_VAL	    = (1 << 2),
-		SCF_TIMEOUT = (1 << 3),
-		SCF_UADDR2  = (1 << 4),
-		SCF_VAL3    = (1 << 5),
-	};
-	int op = arg->val;
-	int cmd = op & FUTEX_CMD_MASK;
-	size_t printed = 0;
-
-	switch (cmd) {
-#define	P_FUTEX_OP(n) case FUTEX_##n: printed = scnprintf(bf, size, #n);
-	P_FUTEX_OP(WAIT);	    arg->mask |= SCF_VAL3|SCF_UADDR2;		  break;
-	P_FUTEX_OP(WAKE);	    arg->mask |= SCF_VAL3|SCF_UADDR2|SCF_TIMEOUT; break;
-	P_FUTEX_OP(FD);		    arg->mask |= SCF_VAL3|SCF_UADDR2|SCF_TIMEOUT; break;
-	P_FUTEX_OP(REQUEUE);	    arg->mask |= SCF_VAL3|SCF_TIMEOUT;	          break;
-	P_FUTEX_OP(CMP_REQUEUE);    arg->mask |= SCF_TIMEOUT;			  break;
-	P_FUTEX_OP(CMP_REQUEUE_PI); arg->mask |= SCF_TIMEOUT;			  break;
-	P_FUTEX_OP(WAKE_OP);							  break;
-	P_FUTEX_OP(LOCK_PI);	    arg->mask |= SCF_VAL3|SCF_UADDR2|SCF_TIMEOUT; break;
-	P_FUTEX_OP(UNLOCK_PI);	    arg->mask |= SCF_VAL3|SCF_UADDR2|SCF_TIMEOUT; break;
-	P_FUTEX_OP(TRYLOCK_PI);	    arg->mask |= SCF_VAL3|SCF_UADDR2;		  break;
-	P_FUTEX_OP(WAIT_BITSET);    arg->mask |= SCF_UADDR2;			  break;
-	P_FUTEX_OP(WAKE_BITSET);    arg->mask |= SCF_UADDR2;			  break;
-	P_FUTEX_OP(WAIT_REQUEUE_PI);						  break;
-	default: printed = scnprintf(bf, size, "%#x", cmd);			  break;
-	}
-
-	if (op & FUTEX_PRIVATE_FLAG)
-		printed += scnprintf(bf + printed, size - printed, "|PRIV");
-
-	if (op & FUTEX_CLOCK_REALTIME)
-		printed += scnprintf(bf + printed, size - printed, "|CLKRT");
-
-	return printed;
-}
-
-#define SCA_FUTEX_OP  syscall_arg__scnprintf_futex_op
-
 static const char *epoll_ctl_ops[] = { "ADD", "DEL", "MOD", };
 static DEFINE_STRARRAY_OFFSET(epoll_ctl_ops, 1);
 
@@ -615,12 +546,14 @@ static size_t syscall_arg__scnprintf_getrandom_flags(char *bf, size_t size,
 	  .arg_parm	 = { [arg] = &strarray__##array, }
 
 #include "trace/beauty/eventfd.c"
-#include "trace/beauty/pid.c"
+#include "trace/beauty/flock.c"
+#include "trace/beauty/futex_op.c"
 #include "trace/beauty/mmap.c"
 #include "trace/beauty/mode_t.c"
 #include "trace/beauty/msg_flags.c"
 #include "trace/beauty/open_flags.c"
 #include "trace/beauty/perf_event_open.c"
+#include "trace/beauty/pid.c"
 #include "trace/beauty/sched_policy.c"
 #include "trace/beauty/seccomp.c"
 #include "trace/beauty/signum.c"
@@ -686,11 +619,11 @@ static struct syscall_fmt {
 	{ .name	    = "getdents",   .errmsg = true, },
 	{ .name	    = "getdents64", .errmsg = true, },
 	{ .name	    = "getitimer",  .errmsg = true, STRARRAY(0, which, itimers), },
+	{ .name	    = "getrandom",  .errmsg = true,
+	  .arg_scnprintf = { [2] = SCA_GETRANDOM_FLAGS, /* flags */ }, },
 	{ .name	    = "getpid",	    .errpid = true, },
 	{ .name	    = "getpgid",    .errpid = true, },
 	{ .name	    = "getppid",    .errpid = true, },
-	{ .name	    = "getrandom",  .errmsg = true,
-	  .arg_scnprintf = { [2] = SCA_GETRANDOM_FLAGS, /* flags */ }, },
 	{ .name	    = "getrlimit",  .errmsg = true, STRARRAY(0, resource, rlimit_resources), },
 	{ .name	    = "getxattr",   .errmsg = true, },
 	{ .name	    = "inotify_add_watch",	    .errmsg = true, },
@@ -821,8 +754,8 @@ static struct syscall_fmt {
 	{ .name	    = "setitimer",  .errmsg = true, STRARRAY(0, which, itimers), },
 	{ .name	    = "setpgid",    .errmsg = true, },
 	{ .name	    = "setrlimit",  .errmsg = true, STRARRAY(0, resource, rlimit_resources), },
-	{ .name	    = "setxattr",   .errmsg = true, },
-	{ .name	    = "shutdown",   .errmsg = true, },
+	{ .name     = "setxattr",   .errmsg = true, },
+	{ .name     = "shutdown",   .errmsg = true, },
 	{ .name	    = "socket",	    .errmsg = true,
 	  .arg_scnprintf = { [0] = SCA_STRARRAY, /* family */
 			     [1] = SCA_SK_TYPE, /* type */ },
@@ -1240,7 +1173,7 @@ static int trace__read_syscall_info(struct trace *trace, int id)
 {
 	char tp_name[128];
 	struct syscall *sc;
-	const char *name = audit_syscall_to_name(id, trace->audit.machine);
+	const char *name = syscalltbl__name(trace->sctbl, id);
 
 	if (name == NULL)
 		return -1;
@@ -1315,7 +1248,7 @@ static int trace__validate_ev_qualifier(struct trace *trace)
 
 	strlist__for_each_entry(pos, trace->ev_qualifier) {
 		const char *sc = pos->s;
-		int id = audit_name_to_syscall(sc, trace->audit.machine);
+		int id = syscalltbl__id(trace->sctbl, sc);
 
 		if (id < 0) {
 			if (err == 0) {
@@ -1512,7 +1445,7 @@ static int trace__printf_interrupted_entry(struct trace *trace, struct perf_samp
 
 	duration = sample->time - ttrace->entry_time;
 
-	printed  = trace__fprintf_entry_head(trace, trace->current, duration, sample->time, trace->output);
+	printed  = trace__fprintf_entry_head(trace, trace->current, duration, ttrace->entry_time, trace->output);
 	printed += fprintf(trace->output, "%-70s) ...\n", ttrace->entry_str);
 	ttrace->entry_pending = false;
 
@@ -1547,7 +1480,7 @@ static int trace__sys_enter(struct trace *trace, struct perf_evsel *evsel,
 			goto out_put;
 	}
 
-	if (!(trace->duration_filter || trace->summary_only))
+	if (!(trace->duration_filter || trace->summary_only || trace->min_stack))
 		trace__printf_interrupted_entry(trace, sample);
 
 	ttrace->entry_time = sample->time;
@@ -1558,8 +1491,8 @@ static int trace__sys_enter(struct trace *trace, struct perf_evsel *evsel,
 					   args, trace, thread);
 
 	if (sc->is_exit) {
-		if (!trace->duration_filter && !trace->summary_only) {
-			trace__fprintf_entry_head(trace, thread, 1, sample->time, trace->output);
+		if (!(trace->duration_filter || trace->summary_only || trace->min_stack)) {
+			trace__fprintf_entry_head(trace, thread, 1, ttrace->entry_time, trace->output);
 			fprintf(trace->output, "%-70s)\n", ttrace->entry_str);
 		}
 	} else {
@@ -1578,6 +1511,29 @@ out_put:
 	return err;
 }
 
+static int trace__resolve_callchain(struct trace *trace, struct perf_evsel *evsel,
+				    struct perf_sample *sample,
+				    struct callchain_cursor *cursor)
+{
+	struct addr_location al;
+
+	if (machine__resolve(trace->host, &al, sample) < 0 ||
+	    thread__resolve_callchain(al.thread, cursor, evsel, sample, NULL, NULL, trace->max_stack))
+		return -1;
+
+	return 0;
+}
+
+static int trace__fprintf_callchain(struct trace *trace, struct perf_sample *sample)
+{
+	/* TODO: user-configurable print_opts */
+	const unsigned int print_opts = EVSEL__PRINT_SYM |
+				        EVSEL__PRINT_DSO |
+				        EVSEL__PRINT_UNKNOWN_AS_ADDR;
+
+	return sample__fprintf_callchain(sample, 38, print_opts, &callchain_cursor, trace->output);
+}
+
 static int trace__sys_exit(struct trace *trace, struct perf_evsel *evsel,
 			   union perf_event *event __maybe_unused,
 			   struct perf_sample *sample)
@@ -1585,7 +1541,7 @@ static int trace__sys_exit(struct trace *trace, struct perf_evsel *evsel,
 	long ret;
 	u64 duration = 0;
 	struct thread *thread;
-	int id = perf_evsel__sc_tp_uint(evsel, id, sample), err = -1;
+	int id = perf_evsel__sc_tp_uint(evsel, id, sample), err = -1, callchain_ret = 0;
 	struct syscall *sc = trace__syscall_info(trace, evsel, id);
 	struct thread_trace *ttrace;
 
@@ -1602,7 +1558,7 @@ static int trace__sys_exit(struct trace *trace, struct perf_evsel *evsel,
 
 	ret = perf_evsel__sc_tp_uint(evsel, ret, sample);
 
-	if (id == trace->audit.open_id && ret >= 0 && ttrace->filename.pending_open) {
+	if (id == trace->open_id && ret >= 0 && ttrace->filename.pending_open) {
 		trace__set_fd_pathname(thread, ret, ttrace->filename.name);
 		ttrace->filename.pending_open = false;
 		++trace->stats.vfs_getname;
@@ -1615,10 +1571,19 @@ static int trace__sys_exit(struct trace *trace, struct perf_evsel *evsel,
 	} else if (trace->duration_filter)
 		goto out;
 
+	if (sample->callchain) {
+		callchain_ret = trace__resolve_callchain(trace, evsel, sample, &callchain_cursor);
+		if (callchain_ret == 0) {
+			if (callchain_cursor.nr < trace->min_stack)
+				goto out;
+			callchain_ret = 1;
+		}
+	}
+
 	if (trace->summary_only)
 		goto out;
 
-	trace__fprintf_entry_head(trace, thread, duration, sample->time, trace->output);
+	trace__fprintf_entry_head(trace, thread, duration, ttrace->entry_time, trace->output);
 
 	if (ttrace->entry_pending) {
 		fprintf(trace->output, "%-70s", ttrace->entry_str);
@@ -1633,7 +1598,7 @@ signed_print:
 		fprintf(trace->output, ") = %ld", ret);
 	} else if (ret < 0 && (sc->fmt->errmsg || sc->fmt->errpid)) {
 		char bf[STRERR_BUFSIZE];
-		const char *emsg = strerror_r(-ret, bf, sizeof(bf)),
+		const char *emsg = str_error_r(-ret, bf, sizeof(bf)),
 			   *e = audit_errno_to_name(-ret);
 
 		fprintf(trace->output, ") = -1 %s %s", e, emsg);
@@ -1654,6 +1619,11 @@ signed_print:
 		goto signed_print;
 
 	fputc('\n', trace->output);
+
+	if (callchain_ret > 0)
+		trace__fprintf_callchain(trace, sample);
+	else if (callchain_ret < 0)
+		pr_err("Problem processing %s callchain, skipping...\n", perf_evsel__name(evsel));
 out:
 	ttrace->entry_pending = false;
 	err = 0;
@@ -1753,6 +1723,17 @@ static int trace__event_handler(struct trace *trace, struct perf_evsel *evsel,
 				union perf_event *event __maybe_unused,
 				struct perf_sample *sample)
 {
+	int callchain_ret = 0;
+
+	if (sample->callchain) {
+		callchain_ret = trace__resolve_callchain(trace, evsel, sample, &callchain_cursor);
+		if (callchain_ret == 0) {
+			if (callchain_cursor.nr < trace->min_stack)
+				goto out;
+			callchain_ret = 1;
+		}
+	}
+
 	trace__printf_interrupted_entry(trace, sample);
 	trace__fprintf_tstamp(trace, sample->time, trace->output);
 
@@ -1768,6 +1749,12 @@ static int trace__event_handler(struct trace *trace, struct perf_evsel *evsel,
 	}
 
 	fprintf(trace->output, ")\n");
+
+	if (callchain_ret > 0)
+		trace__fprintf_callchain(trace, sample);
+	else if (callchain_ret < 0)
+		pr_err("Problem processing %s callchain, skipping...\n", perf_evsel__name(evsel));
+out:
 	return 0;
 }
 
@@ -1798,8 +1785,19 @@ static int trace__pgfault(struct trace *trace,
 	char map_type = 'd';
 	struct thread_trace *ttrace;
 	int err = -1;
+	int callchain_ret = 0;
 
 	thread = machine__findnew_thread(trace->host, sample->pid, sample->tid);
+
+	if (sample->callchain) {
+		callchain_ret = trace__resolve_callchain(trace, evsel, sample, &callchain_cursor);
+		if (callchain_ret == 0) {
+			if (callchain_cursor.nr < trace->min_stack)
+				goto out_put;
+			callchain_ret = 1;
+		}
+	}
+
 	ttrace = thread__trace(thread, trace->output);
 	if (ttrace == NULL)
 		goto out_put;
@@ -1841,6 +1839,11 @@ static int trace__pgfault(struct trace *trace,
 	print_location(trace->output, sample, &al, true, false);
 
 	fprintf(trace->output, " (%c%c)\n", map_type, al.level);
+
+	if (callchain_ret > 0)
+		trace__fprintf_callchain(trace, sample);
+	else if (callchain_ret < 0)
+		pr_err("Problem processing %s callchain, skipping...\n", perf_evsel__name(evsel));
 out:
 	err = 0;
 out_put:
@@ -2041,6 +2044,15 @@ static int trace__add_syscall_newtp(struct trace *trace)
 	perf_evlist__add(evlist, sys_enter);
 	perf_evlist__add(evlist, sys_exit);
 
+	if (callchain_param.enabled && !trace->kernel_syscallchains) {
+		/*
+		 * We're interested only in the user space callchain
+		 * leading to the syscall, allow overriding that for
+		 * debugging reasons using --kernel_syscall_callchains
+		 */
+		sys_exit->attr.exclude_callchain_kernel = 1;
+	}
+
 	trace->syscalls.events.sys_enter = sys_enter;
 	trace->syscalls.events.sys_exit  = sys_exit;
 
@@ -2128,7 +2140,45 @@ static int trace__run(struct trace *trace, int argc, const char **argv)
 		goto out_delete_evlist;
 	}
 
-	perf_evlist__config(evlist, &trace->opts);
+	perf_evlist__config(evlist, &trace->opts, NULL);
+
+	if (callchain_param.enabled) {
+		bool use_identifier = false;
+
+		if (trace->syscalls.events.sys_exit) {
+			perf_evsel__config_callchain(trace->syscalls.events.sys_exit,
+						     &trace->opts, &callchain_param);
+			use_identifier = true;
+		}
+
+		if (pgfault_maj) {
+			perf_evsel__config_callchain(pgfault_maj, &trace->opts, &callchain_param);
+			use_identifier = true;
+		}
+
+		if (pgfault_min) {
+			perf_evsel__config_callchain(pgfault_min, &trace->opts, &callchain_param);
+			use_identifier = true;
+		}
+
+		if (use_identifier) {
+		       /*
+			* Now we have evsels with different sample_ids, use
+			* PERF_SAMPLE_IDENTIFIER to map from sample to evsel
+			* from a fixed position in each ring buffer record.
+			*
+			* As of this the changeset introducing this comment, this
+			* isn't strictly needed, as the fields that can come before
+			* PERF_SAMPLE_ID are all used, but we'll probably disable
+			* some of those for things like copying the payload of
+			* pointer syscall arguments, and for vfs_getname we don't
+			* need PERF_SAMPLE_ADDR and PERF_SAMPLE_IP, so do this
+			* here as a warning we need to use PERF_SAMPLE_IDENTIFIER.
+			*/
+			perf_evlist__set_sample_bit(evlist, IDENTIFIER);
+			perf_evlist__reset_sample_bit(evlist, ID);
+		}
+	}
 
 	signal(SIGCHLD, sig_handler);
 	signal(SIGINT, sig_handler);
@@ -2284,7 +2334,7 @@ out_error_apply_filters:
 	fprintf(trace->output,
 		"Failed to set filter \"%s\" on event %s with %d (%s)\n",
 		evsel->filter, perf_evsel__name(evsel), errno,
-		strerror_r(errno, errbuf, sizeof(errbuf)));
+		str_error_r(errno, errbuf, sizeof(errbuf)));
 	goto out_delete_evlist;
 }
 out_error_mem:
@@ -2371,7 +2421,7 @@ static int trace__replay(struct trace *trace)
 		goto out;
 	}
 
-	evlist__for_each(session->evlist, evsel) {
+	evlist__for_each_entry(session->evlist, evsel) {
 		if (evsel->attr.type == PERF_TYPE_SOFTWARE &&
 		    (evsel->attr.config == PERF_COUNT_SW_PAGE_FAULTS_MAJ ||
 		     evsel->attr.config == PERF_COUNT_SW_PAGE_FAULTS_MIN ||
@@ -2434,7 +2484,7 @@ static size_t thread__dump_stats(struct thread_trace *ttrace,
 	printed += fprintf(fp, "                               (msec)    (msec)    (msec)    (msec)        (%%)\n");
 	printed += fprintf(fp, "   --------------- -------- --------- --------- --------- ---------     ------\n");
 
-	resort_rb__for_each(nd, syscall_stats) {
+	resort_rb__for_each_entry(nd, syscall_stats) {
 		struct stats *stats = syscall_stats_entry->stats;
 		if (stats) {
 			double min = (double)(stats->min) / NSEC_PER_MSEC;
@@ -2460,19 +2510,9 @@ static size_t thread__dump_stats(struct thread_trace *ttrace,
 	return printed;
 }
 
-/* struct used to pass data to per-thread function */
-struct summary_data {
-	FILE *fp;
-	struct trace *trace;
-	size_t printed;
-};
-
-static int trace__fprintf_one_thread(struct thread *thread, void *priv)
+static size_t trace__fprintf_thread(FILE *fp, struct thread *thread, struct trace *trace)
 {
-	struct summary_data *data = priv;
-	FILE *fp = data->fp;
-	size_t printed = data->printed;
-	struct trace *trace = data->trace;
+	size_t printed = 0;
 	struct thread_trace *ttrace = thread__priv(thread);
 	double ratio;
 
@@ -2495,22 +2535,38 @@ static int trace__fprintf_one_thread(struct thread *thread, void *priv)
 
 	printed += thread__dump_stats(ttrace, trace, fp);
 
-	data->printed += printed;
+	return printed;
+}
 
-	return 0;
+static unsigned long thread__nr_events(struct thread_trace *ttrace)
+{
+	return ttrace ? ttrace->nr_events : 0;
+}
+
+DEFINE_RESORT_RB(threads, (thread__nr_events(a->thread->priv) < thread__nr_events(b->thread->priv)),
+	struct thread *thread;
+)
+{
+	entry->thread = rb_entry(nd, struct thread, rb_node);
 }
 
 static size_t trace__fprintf_thread_summary(struct trace *trace, FILE *fp)
 {
-	struct summary_data data = {
-		.fp = fp,
-		.trace = trace
-	};
-	data.printed = trace__fprintf_threads_header(fp);
+	DECLARE_RESORT_RB_MACHINE_THREADS(threads, trace->host);
+	size_t printed = trace__fprintf_threads_header(fp);
+	struct rb_node *nd;
 
-	machine__for_each_thread(trace->host, trace__fprintf_one_thread, &data);
+	if (threads == NULL) {
+		fprintf(fp, "%s", "Error sorting output by nr_events!\n");
+		return 0;
+	}
 
-	return data.printed;
+	resort_rb__for_each_entry(nd, threads)
+		printed += trace__fprintf_thread(fp, threads_entry->thread, trace);
+
+	resort_rb__delete(threads);
+
+	return printed;
 }
 
 static int trace__set_duration(const struct option *opt, const char *str,
@@ -2592,8 +2648,93 @@ static void evlist__set_evsel_handler(struct perf_evlist *evlist, void *handler)
 {
 	struct perf_evsel *evsel;
 
-	evlist__for_each(evlist, evsel)
+	evlist__for_each_entry(evlist, evsel)
 		evsel->handler = handler;
+}
+
+/*
+ * XXX: Hackish, just splitting the combined -e+--event (syscalls
+ * (raw_syscalls:{sys_{enter,exit}} + events (tracepoints, HW, SW, etc) to use
+ * existing facilities unchanged (trace->ev_qualifier + parse_options()).
+ *
+ * It'd be better to introduce a parse_options() variant that would return a
+ * list with the terms it didn't match to an event...
+ */
+static int trace__parse_events_option(const struct option *opt, const char *str,
+				      int unset __maybe_unused)
+{
+	struct trace *trace = (struct trace *)opt->value;
+	const char *s = str;
+	char *sep = NULL, *lists[2] = { NULL, NULL, };
+	int len = strlen(str), err = -1, list;
+	char *strace_groups_dir = system_path(STRACE_GROUPS_DIR);
+	char group_name[PATH_MAX];
+
+	if (strace_groups_dir == NULL)
+		return -1;
+
+	if (*s == '!') {
+		++s;
+		trace->not_ev_qualifier = true;
+	}
+
+	while (1) {
+		if ((sep = strchr(s, ',')) != NULL)
+			*sep = '\0';
+
+		list = 0;
+		if (syscalltbl__id(trace->sctbl, s) >= 0) {
+			list = 1;
+		} else {
+			path__join(group_name, sizeof(group_name), strace_groups_dir, s);
+			if (access(group_name, R_OK) == 0)
+				list = 1;
+		}
+
+		if (lists[list]) {
+			sprintf(lists[list] + strlen(lists[list]), ",%s", s);
+		} else {
+			lists[list] = malloc(len);
+			if (lists[list] == NULL)
+				goto out;
+			strcpy(lists[list], s);
+		}
+
+		if (!sep)
+			break;
+
+		*sep = ',';
+		s = sep + 1;
+	}
+
+	if (lists[1] != NULL) {
+		struct strlist_config slist_config = {
+			.dirname = strace_groups_dir,
+		};
+
+		trace->ev_qualifier = strlist__new(lists[1], &slist_config);
+		if (trace->ev_qualifier == NULL) {
+			fputs("Not enough memory to parse event qualifier", trace->output);
+			goto out;
+		}
+
+		if (trace__validate_ev_qualifier(trace))
+			goto out;
+	}
+
+	err = 0;
+
+	if (lists[0]) {
+		struct option o = OPT_CALLBACK('e', "event", &trace->evlist, "event",
+					       "event selector. use 'perf list' to list available events",
+					       parse_events_option);
+		err = parse_events_option(&o, lists[0], 0);
+	}
+out:
+	if (sep)
+		*sep = ',';
+
+	return err;
 }
 
 int cmd_trace(int argc, const char **argv, const char *prefix __maybe_unused)
@@ -2606,10 +2747,6 @@ int cmd_trace(int argc, const char **argv, const char *prefix __maybe_unused)
 		NULL
 	};
 	struct trace trace = {
-		.audit = {
-			.machine = audit_detect_machine(),
-			.open_id = audit_name_to_syscall("open", trace.audit.machine),
-		},
 		.syscalls = {
 			. max = -1,
 		},
@@ -2627,17 +2764,19 @@ int cmd_trace(int argc, const char **argv, const char *prefix __maybe_unused)
 		.output = stderr,
 		.show_comm = true,
 		.trace_syscalls = true,
+		.kernel_syscallchains = false,
+		.max_stack = UINT_MAX,
 	};
 	const char *output_name = NULL;
-	const char *ev_qualifier_str = NULL;
 	const struct option trace_options[] = {
-	OPT_CALLBACK(0, "event", &trace.evlist, "event",
-		     "event selector. use 'perf list' to list available events",
-		     parse_events_option),
+	OPT_CALLBACK('e', "event", &trace, "event",
+		     "event/syscall selector. use 'perf list' to list available events",
+		     trace__parse_events_option),
 	OPT_BOOLEAN(0, "comm", &trace.show_comm,
 		    "show the thread COMM next to its id"),
 	OPT_BOOLEAN(0, "tool_stats", &trace.show_tool_stats, "show tool stats"),
-	OPT_STRING('e', "expr", &ev_qualifier_str, "expr", "list of syscalls to trace"),
+	OPT_CALLBACK(0, "expr", &trace, "expr", "list of syscalls/events to trace",
+		     trace__parse_events_option),
 	OPT_STRING('o', "output", &output_name, "file", "output file name"),
 	OPT_STRING('i', "input", &input_name, "file", "Analyze events in file"),
 	OPT_STRING('p', "pid", &trace.opts.target.pid, "pid",
@@ -2672,6 +2811,18 @@ int cmd_trace(int argc, const char **argv, const char *prefix __maybe_unused)
 		     "Trace pagefaults", parse_pagefaults, "maj"),
 	OPT_BOOLEAN(0, "syscalls", &trace.trace_syscalls, "Trace syscalls"),
 	OPT_BOOLEAN('f', "force", &trace.force, "don't complain, do it"),
+	OPT_CALLBACK(0, "call-graph", &trace.opts,
+		     "record_mode[,record_size]", record_callchain_help,
+		     &record_parse_callchain_opt),
+	OPT_BOOLEAN(0, "kernel-syscall-graph", &trace.kernel_syscallchains,
+		    "Show the kernel callchains on the syscall exit path"),
+	OPT_UINTEGER(0, "min-stack", &trace.min_stack,
+		     "Set the minimum stack depth when parsing the callchain, "
+		     "anything below the specified depth will be ignored."),
+	OPT_UINTEGER(0, "max-stack", &trace.max_stack,
+		     "Set the maximum stack depth when parsing the callchain, "
+		     "anything beyond the specified depth will be ignored. "
+		     "Default: kernel.perf_event_max_stack or " __stringify(PERF_MAX_STACK_DEPTH)),
 	OPT_UINTEGER(0, "proc-map-timeout", &trace.opts.proc_map_timeout,
 			"per thread proc mmap processing timeout in ms"),
 	OPT_UINTEGER('D', "delay", &trace.opts.initial_delay,
@@ -2679,6 +2830,8 @@ int cmd_trace(int argc, const char **argv, const char *prefix __maybe_unused)
 		     "start"),
 	OPT_END()
 	};
+	bool __maybe_unused max_stack_user_set = true;
+	bool mmap_pages_user_set = true;
 	const char * const trace_subcommands[] = { "record", NULL };
 	int err;
 	char bf[BUFSIZ];
@@ -2687,8 +2840,9 @@ int cmd_trace(int argc, const char **argv, const char *prefix __maybe_unused)
 	signal(SIGFPE, sighandler_dump_stack);
 
 	trace.evlist = perf_evlist__new();
+	trace.sctbl = syscalltbl__new();
 
-	if (trace.evlist == NULL) {
+	if (trace.evlist == NULL || trace.sctbl == NULL) {
 		pr_err("Not enough memory to run!\n");
 		err = -ENOMEM;
 		goto out;
@@ -2697,9 +2851,31 @@ int cmd_trace(int argc, const char **argv, const char *prefix __maybe_unused)
 	argc = parse_options_subcommand(argc, argv, trace_options, trace_subcommands,
 				 trace_usage, PARSE_OPT_STOP_AT_NON_OPTION);
 
+	err = -1;
+
 	if (trace.trace_pgfaults) {
 		trace.opts.sample_address = true;
 		trace.opts.sample_time = true;
+	}
+
+	if (trace.opts.mmap_pages == UINT_MAX)
+		mmap_pages_user_set = false;
+
+	if (trace.max_stack == UINT_MAX) {
+		trace.max_stack = sysctl_perf_event_max_stack;
+		max_stack_user_set = false;
+	}
+
+#ifdef HAVE_DWARF_UNWIND_SUPPORT
+	if ((trace.min_stack || max_stack_user_set) && !callchain_param.enabled && trace.trace_syscalls)
+		record_opts__parse_callchain(&trace.opts, &callchain_param, "dwarf", false);
+#endif
+
+	if (callchain_param.enabled) {
+		if (!mmap_pages_user_set && geteuid() == 0)
+			trace.opts.mmap_pages = perf_event_mlock_kb_in_pages() * 4;
+
+		symbol_conf.use_callchain = true;
 	}
 
 	if (trace.evlist->nr_entries > 0)
@@ -2718,6 +2894,11 @@ int cmd_trace(int argc, const char **argv, const char *prefix __maybe_unused)
 		return -1;
 	}
 
+	if (!trace.trace_syscalls && trace.ev_qualifier) {
+		pr_err("The -e option can't be used with --no-syscalls.\n");
+		goto out;
+	}
+
 	if (output_name != NULL) {
 		err = trace__open_output(&trace, output_name);
 		if (err < 0) {
@@ -2726,27 +2907,7 @@ int cmd_trace(int argc, const char **argv, const char *prefix __maybe_unused)
 		}
 	}
 
-	if (ev_qualifier_str != NULL) {
-		const char *s = ev_qualifier_str;
-		struct strlist_config slist_config = {
-			.dirname = system_path(STRACE_GROUPS_DIR),
-		};
-
-		trace.not_ev_qualifier = *s == '!';
-		if (trace.not_ev_qualifier)
-			++s;
-		trace.ev_qualifier = strlist__new(s, &slist_config);
-		if (trace.ev_qualifier == NULL) {
-			fputs("Not enough memory to parse event qualifier",
-			      trace.output);
-			err = -ENOMEM;
-			goto out_close;
-		}
-
-		err = trace__validate_ev_qualifier(&trace);
-		if (err)
-			goto out_close;
-	}
+	trace.open_id = syscalltbl__id(trace.sctbl, "open");
 
 	err = target__validate(&trace.opts.target);
 	if (err) {

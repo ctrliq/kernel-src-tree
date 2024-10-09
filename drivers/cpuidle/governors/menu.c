@@ -269,7 +269,6 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev)
 		data->needs_update = 0;
 	}
 
-	data->last_state_idx = CPUIDLE_DRIVER_STATE_START - 1;
 	data->exit_us = 0;
 
 	/* Special case when user has set very strict latency requirement */
@@ -299,14 +298,19 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev)
 
 	get_typical_interval(data);
 
-	/*
-	 * We want to default to C1 (hlt), not to busy polling
-	 * unless the timer is happening really really soon.
-	 */
-	if (data->expected_us > 5 &&
-	    !drv->states[CPUIDLE_DRIVER_STATE_START].disabled &&
-		dev->states_usage[CPUIDLE_DRIVER_STATE_START].disable == 0)
+	if (CPUIDLE_DRIVER_STATE_START > 0) {
+		data->last_state_idx = CPUIDLE_DRIVER_STATE_START - 1;
+		/*
+		 * We want to default to C1 (hlt), not to busy polling
+		 * unless the timer is happening really really soon.
+		 */
+		if (data->expected_us > 5 &&
+		    !drv->states[CPUIDLE_DRIVER_STATE_START].disabled &&
+			dev->states_usage[CPUIDLE_DRIVER_STATE_START].disable == 0)
+			data->last_state_idx = CPUIDLE_DRIVER_STATE_START;
+	} else {
 		data->last_state_idx = CPUIDLE_DRIVER_STATE_START;
+	}
 
 	/*
 	 * Find the idle state with the lowest power while satisfying
@@ -367,7 +371,7 @@ static void menu_update(struct cpuidle_driver *drv, struct cpuidle_device *dev)
 	 * are basically lost in the dark.  As a compromise, assume we slept
 	 * for the whole expected time.
 	 */
-	if (unlikely(!(target->flags & CPUIDLE_FLAG_TIME_VALID)))
+	if (unlikely(target->flags & CPUIDLE_FLAG_TIME_INVALID))
 		last_idle_us = data->expected_us;
 
 

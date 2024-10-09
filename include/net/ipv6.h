@@ -19,7 +19,7 @@
 #include <net/if_inet6.h>
 #include <net/ndisc.h>
 #include <net/flow.h>
-#include <net/flow_keys.h>
+#include <net/flow_dissector.h>
 #include <net/snmp.h>
 
 #define SIN6_LEN_RFC2133	24
@@ -111,7 +111,8 @@ struct frag_hdr {
 	__be32	identification;
 };
 
-#define	IP6_MF	0x0001
+#define	IP6_MF		0x0001
+#define	IP6_OFFSET	0xFFF8
 
 #include <net/sock.h>
 
@@ -698,20 +699,21 @@ void ipv6_proxy_select_ident(struct net *net, struct sk_buff *skb);
 
 int ip6_dst_hoplimit(struct dst_entry *dst);
 
-#if IS_ENABLED(CONFIG_IPV6)
-static inline void ip6_set_txhash(struct sock *sk)
+/* copy IPv6 saddr & daddr to flow_keys, possibly using 64bit load/store
+ * Equivalent to :	flow->v6addrs.src = iph->saddr;
+ *			flow->v6addrs.dst = iph->daddr;
+ */
+static inline void iph_to_flow_copy_v6addrs(struct flow_keys *flow,
+					    const struct ipv6hdr *iph)
 {
-	struct inet_sock *inet = inet_sk(sk);
-	struct ipv6_pinfo *np = inet6_sk(sk);
-	struct flow_keys keys;
-
-	keys.src = (__force __be32)ipv6_addr_hash(&np->saddr);
-	keys.dst = (__force __be32)ipv6_addr_hash(&sk->sk_v6_daddr);
-	keys.port16[0] = inet->inet_sport;
-	keys.port16[1] = inet->inet_dport;
-
-	sk->sk_txhash = flow_hash_from_keys(&keys);
+	BUILD_BUG_ON(offsetof(typeof(flow->addrs), v6addrs.dst) !=
+		     offsetof(typeof(flow->addrs), v6addrs.src) +
+		     sizeof(flow->addrs.v6addrs.src));
+	memcpy(&flow->addrs.v6addrs, &iph->saddr, sizeof(flow->addrs.v6addrs));
+	flow->control.addr_type = FLOW_DISSECTOR_KEY_IPV6_ADDRS;
 }
+
+#if IS_ENABLED(CONFIG_IPV6)
 #else
 static inline void ip6_set_txhash(struct sock *sk) { }
 #endif

@@ -37,6 +37,11 @@ static inline int __sync_blockdev(struct block_device *bdev, int wait)
 #endif
 
 /*
+ * buffer.c
+ */
+extern void guard_bio_eod(int rw, struct bio *bio);
+
+/*
  * char_dev.c
  */
 extern void __init chrdev_init(void);
@@ -60,8 +65,6 @@ extern int finish_automount(struct vfsmount *, struct path *);
 extern int sb_prepare_remount_readonly(struct super_block *);
 
 extern void __init mnt_init(void);
-
-extern struct lglock vfsmount_lock;
 
 extern int __mnt_want_write(struct vfsmount *);
 extern int __mnt_want_write_file(struct file *);
@@ -111,6 +114,15 @@ extern int open_check_o_direct(struct file *f);
 extern spinlock_t inode_sb_list_lock;
 extern void inode_add_lru(struct inode *inode);
 
+extern bool __atime_needs_update(const struct path *, struct inode *, bool);
+static inline bool atime_needs_update_rcu(const struct path *path,
+					  struct inode *inode)
+{
+	return __atime_needs_update(path, inode, true);
+}
+
+extern bool atime_needs_update_rcu(const struct path *, struct inode *);
+
 /*
  * fs-writeback.c
  */
@@ -129,9 +141,14 @@ extern int d_set_mounted(struct dentry *dentry);
 /*
  * read_write.c
  */
-extern ssize_t __kernel_write(struct file *, const char *, size_t, loff_t *);
 
 /*
  * pipe.c
  */
 extern const struct file_operations pipefifo_fops;
+
+/*
+ * fs_pin.c
+ */
+extern void group_pin_kill(struct hlist_head *p);
+extern void mnt_pin_kill(struct mount *m);

@@ -484,7 +484,8 @@ static char *efi_convert_cmdline_to_ascii(efi_system_table_t *sys_table_arg,
 
 	options_size++;  /* NUL termination */
 
-	status = efi_low_alloc(sys_table_arg, options_size, 0, &cmdline_addr);
+	/* RHEL7-ONLY: alignment must not be zero. */
+	status = efi_low_alloc(sys_table_arg, options_size, 1, &cmdline_addr);
 	if (status != EFI_SUCCESS)
 		return NULL;
 

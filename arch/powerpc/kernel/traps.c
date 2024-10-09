@@ -60,6 +60,7 @@
 #include <asm/switch_to.h>
 #include <asm/tm.h>
 #include <asm/debug.h>
+#include <asm/hmi.h>
 
 #if defined(CONFIG_DEBUGGER) || defined(CONFIG_KEXEC)
 int (*__debugger)(struct pt_regs *regs) __read_mostly;
@@ -305,8 +306,12 @@ long hmi_exception_realmode(struct pt_regs *regs)
 {
 	__get_cpu_var(irq_stat).hmi_exceptions++;
 
+	wait_for_subcore_guest_exit();
+
 	if (ppc_md.hmi_exception_early)
 		ppc_md.hmi_exception_early(regs);
+
+	wait_for_tb_resync();
 
 	return 0;
 }

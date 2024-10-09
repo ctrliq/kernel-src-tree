@@ -227,9 +227,11 @@ EXPORT_SYMBOL(rdma_port_get_link_layer);
  * Every PD has a local_dma_lkey which can be used as the lkey value for local
  * memory operations.
  */
-struct ib_pd *ib_alloc_pd(struct ib_device *device)
+struct ib_pd *__ib_alloc_pd(struct ib_device *device, unsigned int flags,
+		const char *caller)
 {
 	struct ib_pd *pd;
+	int mr_access_flags = 0;
 
 	pd = device->alloc_pd(device, NULL, NULL);
 	if (IS_ERR(pd))
@@ -239,24 +241,44 @@ struct ib_pd *ib_alloc_pd(struct ib_device *device)
 	pd->uobject = NULL;
 	pd->__internal_mr = NULL;
 	atomic_set(&pd->usecnt, 0);
+	pd->flags = flags;
 
 	if (device->attrs.device_cap_flags & IB_DEVICE_LOCAL_DMA_LKEY)
 		pd->local_dma_lkey = device->local_dma_lkey;
-	else {
+	else
+		mr_access_flags |= IB_ACCESS_LOCAL_WRITE;
+
+	if (flags & IB_PD_UNSAFE_GLOBAL_RKEY) {
+		pr_warn("%s: enabling unsafe global rkey\n", caller);
+		mr_access_flags |= IB_ACCESS_REMOTE_READ | IB_ACCESS_REMOTE_WRITE;
+	}
+
+	if (mr_access_flags) {
 		struct ib_mr *mr;
 
-		mr = ib_get_dma_mr(pd, IB_ACCESS_LOCAL_WRITE);
+		mr = pd->device->get_dma_mr(pd, mr_access_flags);
 		if (IS_ERR(mr)) {
 			ib_dealloc_pd(pd);
-			return (struct ib_pd *)mr;
+			return ERR_CAST(mr);
 		}
 
+		mr->device	= pd->device;
+		mr->pd		= pd;
+		mr->uobject	= NULL;
+		mr->need_inval	= false;
+
 		pd->__internal_mr = mr;
-		pd->local_dma_lkey = pd->__internal_mr->lkey;
+
+		if (!(device->attrs.device_cap_flags & IB_DEVICE_LOCAL_DMA_LKEY))
+			pd->local_dma_lkey = pd->__internal_mr->lkey;
+
+		if (flags & IB_PD_UNSAFE_GLOBAL_RKEY)
+			pd->unsafe_global_rkey = pd->__internal_mr->rkey;
 	}
+
 	return pd;
 }
-EXPORT_SYMBOL(ib_alloc_pd);
+EXPORT_SYMBOL(__ib_alloc_pd);
 
 /**
  * ib_dealloc_pd - Deallocates a protection domain.
@@ -271,7 +293,7 @@ void ib_dealloc_pd(struct ib_pd *pd)
 	int ret;
 
 	if (pd->__internal_mr) {
-		ret = ib_dereg_mr(pd->__internal_mr);
+		ret = pd->device->dereg_mr(pd->__internal_mr);
 		WARN_ON(ret);
 		pd->__internal_mr = NULL;
 	}
@@ -293,7 +315,7 @@ struct ib_ah *ib_create_ah(struct ib_pd *pd, struct ib_ah_attr *ah_attr)
 {
 	struct ib_ah *ah;
 
-	ah = pd->device->create_ah(pd, ah_attr);
+	ah = pd->device->create_ah(pd, ah_attr, NULL);
 
 	if (!IS_ERR(ah)) {
 		ah->device  = pd->device;
@@ -1395,29 +1417,6 @@ EXPORT_SYMBOL(ib_resize_cq);
 
 /* Memory regions */
 
-struct ib_mr *ib_get_dma_mr(struct ib_pd *pd, int mr_access_flags)
-{
-	struct ib_mr *mr;
-	int err;
-
-	err = ib_check_mr_access(mr_access_flags);
-	if (err)
-		return ERR_PTR(err);
-
-	mr = pd->device->get_dma_mr(pd, mr_access_flags);
-
-	if (!IS_ERR(mr)) {
-		mr->device  = pd->device;
-		mr->pd      = pd;
-		mr->uobject = NULL;
-		atomic_inc(&pd->usecnt);
-		mr->need_inval = false;
-	}
-
-	return mr;
-}
-EXPORT_SYMBOL(ib_get_dma_mr);
-
 int ib_dereg_mr(struct ib_mr *mr)
 {
 	struct ib_pd *pd = mr->pd;
@@ -1585,6 +1584,150 @@ int ib_dealloc_xrcd(struct ib_xrcd *xrcd)
 	return xrcd->device->dealloc_xrcd(xrcd);
 }
 EXPORT_SYMBOL(ib_dealloc_xrcd);
+
+/**
+ * ib_create_wq - Creates a WQ associated with the specified protection
+ * domain.
+ * @pd: The protection domain associated with the WQ.
+ * @wq_init_attr: A list of initial attributes required to create the
+ * WQ. If WQ creation succeeds, then the attributes are updated to
+ * the actual capabilities of the created WQ.
+ *
+ * wq_init_attr->max_wr and wq_init_attr->max_sge determine
+ * the requested size of the WQ, and set to the actual values allocated
+ * on return.
+ * If ib_create_wq() succeeds, then max_wr and max_sge will always be
+ * at least as large as the requested values.
+ */
+struct ib_wq *ib_create_wq(struct ib_pd *pd,
+			   struct ib_wq_init_attr *wq_attr)
+{
+	struct ib_wq *wq;
+
+	if (!pd->device->create_wq)
+		return ERR_PTR(-ENOSYS);
+
+	wq = pd->device->create_wq(pd, wq_attr, NULL);
+	if (!IS_ERR(wq)) {
+		wq->event_handler = wq_attr->event_handler;
+		wq->wq_context = wq_attr->wq_context;
+		wq->wq_type = wq_attr->wq_type;
+		wq->cq = wq_attr->cq;
+		wq->device = pd->device;
+		wq->pd = pd;
+		wq->uobject = NULL;
+		atomic_inc(&pd->usecnt);
+		atomic_inc(&wq_attr->cq->usecnt);
+		atomic_set(&wq->usecnt, 0);
+	}
+	return wq;
+}
+EXPORT_SYMBOL(ib_create_wq);
+
+/**
+ * ib_destroy_wq - Destroys the specified WQ.
+ * @wq: The WQ to destroy.
+ */
+int ib_destroy_wq(struct ib_wq *wq)
+{
+	int err;
+	struct ib_cq *cq = wq->cq;
+	struct ib_pd *pd = wq->pd;
+
+	if (atomic_read(&wq->usecnt))
+		return -EBUSY;
+
+	err = wq->device->destroy_wq(wq);
+	if (!err) {
+		atomic_dec(&pd->usecnt);
+		atomic_dec(&cq->usecnt);
+	}
+	return err;
+}
+EXPORT_SYMBOL(ib_destroy_wq);
+
+/**
+ * ib_modify_wq - Modifies the specified WQ.
+ * @wq: The WQ to modify.
+ * @wq_attr: On input, specifies the WQ attributes to modify.
+ * @wq_attr_mask: A bit-mask used to specify which attributes of the WQ
+ *   are being modified.
+ * On output, the current values of selected WQ attributes are returned.
+ */
+int ib_modify_wq(struct ib_wq *wq, struct ib_wq_attr *wq_attr,
+		 u32 wq_attr_mask)
+{
+	int err;
+
+	if (!wq->device->modify_wq)
+		return -ENOSYS;
+
+	err = wq->device->modify_wq(wq, wq_attr, wq_attr_mask, NULL);
+	return err;
+}
+EXPORT_SYMBOL(ib_modify_wq);
+
+/*
+ * ib_create_rwq_ind_table - Creates a RQ Indirection Table.
+ * @device: The device on which to create the rwq indirection table.
+ * @ib_rwq_ind_table_init_attr: A list of initial attributes required to
+ * create the Indirection Table.
+ *
+ * Note: The life time of ib_rwq_ind_table_init_attr->ind_tbl is not less
+ *	than the created ib_rwq_ind_table object and the caller is responsible
+ *	for its memory allocation/free.
+ */
+struct ib_rwq_ind_table *ib_create_rwq_ind_table(struct ib_device *device,
+						 struct ib_rwq_ind_table_init_attr *init_attr)
+{
+	struct ib_rwq_ind_table *rwq_ind_table;
+	int i;
+	u32 table_size;
+
+	if (!device->create_rwq_ind_table)
+		return ERR_PTR(-ENOSYS);
+
+	table_size = (1 << init_attr->log_ind_tbl_size);
+	rwq_ind_table = device->create_rwq_ind_table(device,
+				init_attr, NULL);
+	if (IS_ERR(rwq_ind_table))
+		return rwq_ind_table;
+
+	rwq_ind_table->ind_tbl = init_attr->ind_tbl;
+	rwq_ind_table->log_ind_tbl_size = init_attr->log_ind_tbl_size;
+	rwq_ind_table->device = device;
+	rwq_ind_table->uobject = NULL;
+	atomic_set(&rwq_ind_table->usecnt, 0);
+
+	for (i = 0; i < table_size; i++)
+		atomic_inc(&rwq_ind_table->ind_tbl[i]->usecnt);
+
+	return rwq_ind_table;
+}
+EXPORT_SYMBOL(ib_create_rwq_ind_table);
+
+/*
+ * ib_destroy_rwq_ind_table - Destroys the specified Indirection Table.
+ * @wq_ind_table: The Indirection Table to destroy.
+*/
+int ib_destroy_rwq_ind_table(struct ib_rwq_ind_table *rwq_ind_table)
+{
+	int err, i;
+	u32 table_size = (1 << rwq_ind_table->log_ind_tbl_size);
+	struct ib_wq **ind_tbl = rwq_ind_table->ind_tbl;
+
+	if (atomic_read(&rwq_ind_table->usecnt))
+		return -EBUSY;
+
+	err = rwq_ind_table->device->destroy_rwq_ind_table(rwq_ind_table);
+	if (!err) {
+		for (i = 0; i < table_size; i++)
+			atomic_dec(&ind_tbl[i]->usecnt);
+	}
+
+	return err;
+}
+EXPORT_SYMBOL(ib_destroy_rwq_ind_table);
 
 struct ib_flow *ib_create_flow(struct ib_qp *qp,
 			       struct ib_flow_attr *flow_attr,

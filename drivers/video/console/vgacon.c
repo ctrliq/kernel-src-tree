@@ -564,7 +564,7 @@ static void vgacon_init(struct vc_data *c, int init)
 static void vgacon_deinit(struct vc_data *c)
 {
 	/* When closing the active console, reset video origin */
-	if (CON_IS_VISIBLE(c)) {
+	if (con_is_visible(c)) {
 		c->vc_visible_origin = vga_vram_base;
 		vga_set_mem_top(c);
 	}
@@ -835,7 +835,7 @@ static void vgacon_set_palette(struct vc_data *vc, const unsigned char *table)
 {
 #ifdef CAN_LOAD_PALETTE
 	if (vga_video_type != VIDEO_TYPE_VGAC || vga_palette_blanked
-	    || !CON_IS_VISIBLE(vc))
+	    || !con_is_visible(vc))
 		return;
 	vga_set_palette(vc, table);
 #endif
@@ -1215,7 +1215,7 @@ static int vgacon_adjust_height(struct vc_data *vc, unsigned fontheight)
 		struct vc_data *c = vc_cons[i].d;
 
 		if (c && c->vc_sw == &vga_con) {
-			if (CON_IS_VISIBLE(c)) {
+			if (con_is_visible(c)) {
 			        /* void size to cause regs to be rewritten */
 				cursor_size_lastfrom = 0;
 				cursor_size_lastto = 0;
@@ -1279,7 +1279,7 @@ static int vgacon_resize(struct vc_data *c, unsigned int width,
 		   return success */
 		return (user) ? 0 : -EINVAL;
 
-	if (CON_IS_VISIBLE(c) && !vga_is_gfx) /* who knows */
+	if (con_is_visible(c) && !vga_is_gfx) /* who knows */
 		vgacon_doresize(c, width, height);
 	return 0;
 }
@@ -1388,7 +1388,6 @@ const struct consw vga_con = {
 	.con_putcs = DUMMY,
 	.con_cursor = vgacon_cursor,
 	.con_scroll = vgacon_scroll,
-	.con_bmove = DUMMY,
 	.con_switch = vgacon_switch,
 	.con_blank = vgacon_blank,
 	.con_font_set = vgacon_font_set,

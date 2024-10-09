@@ -387,6 +387,6 @@
 #define __NR_execveat		362
 #define __NR_switch_endian	363
 #define __NR_userfaultfd	364
-
+#define __NR_copy_file_range	379
 
 #endif /* _UAPI_ASM_POWERPC_UNISTD_H_ */

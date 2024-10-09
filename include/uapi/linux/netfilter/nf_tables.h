@@ -180,6 +180,7 @@ enum nft_chain_attributes {
 	NFTA_CHAIN_USE,
 	NFTA_CHAIN_TYPE,
 	NFTA_CHAIN_COUNTERS,
+	NFTA_CHAIN_PAD,
 	__NFTA_CHAIN_MAX
 };
 #define NFTA_CHAIN_MAX		(__NFTA_CHAIN_MAX - 1)
@@ -204,6 +205,7 @@ enum nft_rule_attributes {
 	NFTA_RULE_COMPAT,
 	NFTA_RULE_POSITION,
 	NFTA_RULE_USERDATA,
+	NFTA_RULE_PAD,
 	__NFTA_RULE_MAX
 };
 #define NFTA_RULE_MAX		(__NFTA_RULE_MAX - 1)
@@ -306,6 +308,7 @@ enum nft_set_attributes {
 	NFTA_SET_TIMEOUT,
 	NFTA_SET_GC_INTERVAL,
 	NFTA_SET_USERDATA,
+	NFTA_SET_PAD,
 	__NFTA_SET_MAX
 };
 #define NFTA_SET_MAX		(__NFTA_SET_MAX - 1)
@@ -339,6 +342,7 @@ enum nft_set_elem_attributes {
 	NFTA_SET_ELEM_EXPIRATION,
 	NFTA_SET_ELEM_USERDATA,
 	NFTA_SET_ELEM_EXPR,
+	NFTA_SET_ELEM_PAD,
 	__NFTA_SET_ELEM_MAX
 };
 #define NFTA_SET_ELEM_MAX	(__NFTA_SET_ELEM_MAX - 1)
@@ -544,6 +548,35 @@ enum nft_lookup_flags {
 };
 
 /**
+ * enum nft_range_ops - nf_tables range operator
+ *
+ * @NFT_RANGE_EQ: equal
+ * @NFT_RANGE_NEQ: not equal
+ */
+enum nft_range_ops {
+	NFT_RANGE_EQ,
+	NFT_RANGE_NEQ,
+};
+
+/**
+ * enum nft_range_attributes - nf_tables range expression netlink attributes
+ *
+ * @NFTA_RANGE_SREG: source register of data to compare (NLA_U32: nft_registers)
+ * @NFTA_RANGE_OP: cmp operation (NLA_U32: nft_cmp_ops)
+ * @NFTA_RANGE_FROM_DATA: data range from (NLA_NESTED: nft_data_attributes)
+ * @NFTA_RANGE_TO_DATA: data range to (NLA_NESTED: nft_data_attributes)
+ */
+enum nft_range_attributes {
+	NFTA_RANGE_UNSPEC,
+	NFTA_RANGE_SREG,
+	NFTA_RANGE_OP,
+	NFTA_RANGE_FROM_DATA,
+	NFTA_RANGE_TO_DATA,
+	__NFTA_RANGE_MAX
+};
+#define NFTA_RANGE_MAX		(__NFTA_RANGE_MAX - 1)
+
+/**
  * enum nft_lookup_attributes - nf_tables set lookup expression netlink attributes
  *
  * @NFTA_LOOKUP_SET: name of the set where to look for (NLA_STRING)
@@ -588,6 +621,7 @@ enum nft_dynset_attributes {
 	NFTA_DYNSET_SREG_DATA,
 	NFTA_DYNSET_TIMEOUT,
 	NFTA_DYNSET_EXPR,
+	NFTA_DYNSET_PAD,
 	__NFTA_DYNSET_MAX,
 };
 #define NFTA_DYNSET_MAX		(__NFTA_DYNSET_MAX - 1)
@@ -808,6 +842,7 @@ enum nft_limit_attributes {
 	NFTA_LIMIT_BURST,
 	NFTA_LIMIT_TYPE,
 	NFTA_LIMIT_FLAGS,
+	NFTA_LIMIT_PAD,
 	__NFTA_LIMIT_MAX
 };
 #define NFTA_LIMIT_MAX		(__NFTA_LIMIT_MAX - 1)
@@ -822,6 +857,7 @@ enum nft_counter_attributes {
 	NFTA_COUNTER_UNSPEC,
 	NFTA_COUNTER_BYTES,
 	NFTA_COUNTER_PACKETS,
+	NFTA_COUNTER_PAD,
 	__NFTA_COUNTER_MAX
 };
 #define NFTA_COUNTER_MAX	(__NFTA_COUNTER_MAX - 1)
@@ -1045,6 +1081,7 @@ enum nft_trace_attibutes {
 	NFTA_TRACE_MARK,
 	NFTA_TRACE_NFPROTO,
 	NFTA_TRACE_POLICY,
+	NFTA_TRACE_PAD,
 	__NFTA_TRACE_MAX
 };
 #define NFTA_TRACE_MAX (__NFTA_TRACE_MAX - 1)

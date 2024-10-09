@@ -52,22 +52,20 @@ struct iscsi_cls_session *beiscsi_session_create(struct iscsi_endpoint *ep,
 
 
 	if (!ep) {
-		printk(KERN_ERR
-		       "beiscsi_session_create: invalid ep\n");
+		pr_err("beiscsi_session_create: invalid ep\n");
 		return NULL;
 	}
 	beiscsi_ep = ep->dd_data;
 	phba = beiscsi_ep->phba;
 
-	if (phba->state & BE_ADAPTER_PCI_ERR) {
-		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG,
-			    "BS_%d : PCI_ERROR Recovery\n");
-		return NULL;
-	} else {
+	if (!beiscsi_hba_is_online(phba)) {
 		beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
-			    "BS_%d : In beiscsi_session_create\n");
+			    "BS_%d : HBA in error 0x%lx\n", phba->state);
+		return NULL;
 	}
 
+	beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
+		    "BS_%d : In beiscsi_session_create\n");
 	if (cmds_max > beiscsi_ep->phba->params.wrbs_per_cxn) {
 		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG,
 			    "BS_%d : Cannot handle %d cmds."
@@ -118,6 +116,16 @@ void beiscsi_session_destroy(struct iscsi_cls_session *cls_session)
 	pci_pool_destroy(beiscsi_sess->bhs_pool);
 	iscsi_session_teardown(cls_session);
 }
+
+/**
+ * beiscsi_session_fail(): Closing session with appropriate error
+ * @cls_session: ptr to session
+ **/
+void beiscsi_session_fail(struct iscsi_cls_session *cls_session)
+{
+	iscsi_session_failure(cls_session->dd_data, ISCSI_ERR_CONN_FAILED);
+}
+
 
 /**
  * beiscsi_conn_create - create an instance of iscsi connection
@@ -424,9 +432,9 @@ int beiscsi_iface_set_param(struct Scsi_Host *shost,
 	uint32_t rm_len = dt_len;
 	int ret;
 
-	if (phba->state & BE_ADAPTER_PCI_ERR) {
-		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG,
-			    "BS_%d : In PCI_ERROR Recovery\n");
+	if (!beiscsi_hba_is_online(phba)) {
+		beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
+			    "BS_%d : HBA in error 0x%lx\n", phba->state);
 		return -EBUSY;
 	}
 
@@ -567,9 +575,9 @@ int beiscsi_iface_get_param(struct iscsi_iface *iface,
 
 	if (param_type != ISCSI_NET_PARAM)
 		return 0;
-	if (phba->state & BE_ADAPTER_PCI_ERR) {
-		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG,
-			    "BS_%d : In PCI_ERROR Recovery\n");
+	if (!beiscsi_hba_is_online(phba)) {
+		beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
+			    "BS_%d : HBA in error 0x%lx\n", phba->state);
 		return -EBUSY;
 	}
 
@@ -725,7 +733,7 @@ static void beiscsi_get_port_state(struct Scsi_Host *shost)
 	struct beiscsi_hba *phba = iscsi_host_priv(shost);
 	struct iscsi_cls_host *ihost = shost->shost_data;
 
-	ihost->port_state = (phba->state & BE_ADAPTER_LINK_UP) ?
+	ihost->port_state = test_bit(BEISCSI_HBA_LINK_UP, &phba->state) ?
 		ISCSI_PORT_STATE_UP : ISCSI_PORT_STATE_DOWN;
 }
 
@@ -777,16 +785,13 @@ int beiscsi_get_host_param(struct Scsi_Host *shost,
 	struct beiscsi_hba *phba = iscsi_host_priv(shost);
 	int status = 0;
 
-
-	if (phba->state & BE_ADAPTER_PCI_ERR) {
-		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG,
-			    "BS_%d : In PCI_ERROR Recovery\n");
-		return -EBUSY;
-	} else {
+	if (!beiscsi_hba_is_online(phba)) {
 		beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
-			    "BS_%d : In beiscsi_get_host_param,"
-			    " param = %d\n", param);
+			    "BS_%d : HBA in error 0x%lx\n", phba->state);
+		return -EBUSY;
 	}
+	beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
+		    "BS_%d : In beiscsi_get_host_param, param = %d\n", param);
 
 	switch (param) {
 	case ISCSI_HOST_PARAM_HWADDRESS:
@@ -928,15 +933,13 @@ int beiscsi_conn_start(struct iscsi_cls_conn *cls_conn)
 
 	phba = ((struct beiscsi_conn *)conn->dd_data)->phba;
 
-	if (phba->state & BE_ADAPTER_PCI_ERR) {
-		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG,
-			    "BS_%d : In PCI_ERROR Recovery\n");
+	if (!beiscsi_hba_is_online(phba)) {
+		beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
+			    "BS_%d : HBA in error 0x%lx\n", phba->state);
 		return -EBUSY;
-	} else {
-		beiscsi_log(beiscsi_conn->phba, KERN_INFO,
-			    BEISCSI_LOG_CONFIG,
-			    "BS_%d : In beiscsi_conn_start\n");
 	}
+	beiscsi_log(beiscsi_conn->phba, KERN_INFO, BEISCSI_LOG_CONFIG,
+		    "BS_%d : In beiscsi_conn_start\n");
 
 	memset(&params, 0, sizeof(struct beiscsi_offload_params));
 	beiscsi_ep = beiscsi_conn->ep;
@@ -1117,7 +1120,7 @@ static int beiscsi_open_conn(struct iscsi_endpoint *ep,
 	nonemb_cmd.size = req_memsize;
 	memset(nonemb_cmd.va, 0, nonemb_cmd.size);
 	tag = mgmt_open_connection(phba, dst_addr, beiscsi_ep, &nonemb_cmd);
-	if (tag <= 0) {
+	if (!tag) {
 		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG,
 			    "BS_%d : mgmt_open_connection Failed for cid=%d\n",
 			    beiscsi_ep->ep_cid);
@@ -1171,28 +1174,20 @@ beiscsi_ep_connect(struct Scsi_Host *shost, struct sockaddr *dst_addr,
 	struct iscsi_endpoint *ep;
 	int ret;
 
-	if (shost)
-		phba = iscsi_host_priv(shost);
-	else {
+	if (!shost) {
 		ret = -ENXIO;
-		printk(KERN_ERR
-		       "beiscsi_ep_connect shost is NULL\n");
+		pr_err("beiscsi_ep_connect shost is NULL\n");
 		return ERR_PTR(ret);
 	}
 
-	if (beiscsi_error(phba)) {
+	phba = iscsi_host_priv(shost);
+	if (!beiscsi_hba_is_online(phba)) {
 		ret = -EIO;
-		beiscsi_log(phba, KERN_WARNING, BEISCSI_LOG_CONFIG,
-			    "BS_%d : The FW state Not Stable!!!\n");
+		beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
+			    "BS_%d : HBA in error 0x%lx\n", phba->state);
 		return ERR_PTR(ret);
 	}
-
-	if (phba->state & BE_ADAPTER_PCI_ERR) {
-		ret = -EBUSY;
-		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG,
-			    "BS_%d : In PCI_ERROR Recovery\n");
-		return ERR_PTR(ret);
-	} else if (phba->state & BE_ADAPTER_LINK_DOWN) {
+	if (!test_bit(BEISCSI_HBA_LINK_UP, &phba->state)) {
 		ret = -EBUSY;
 		beiscsi_log(phba, KERN_WARNING, BEISCSI_LOG_CONFIG,
 			    "BS_%d : The Adapter Port state is Down!!!\n");
@@ -1268,31 +1263,58 @@ static void beiscsi_flush_cq(struct beiscsi_hba *phba)
 }
 
 /**
- * beiscsi_close_conn - Upload the  connection
+ * beiscsi_conn_close - Invalidate and upload connection
  * @ep: The iscsi endpoint
- * @flag: The type of connection closure
+ *
+ * Returns 0 on success,  -1 on failure.
  */
-static int beiscsi_close_conn(struct  beiscsi_endpoint *beiscsi_ep, int flag)
+static int beiscsi_conn_close(struct beiscsi_endpoint *beiscsi_ep)
 {
-	int ret = 0;
-	unsigned int tag;
 	struct beiscsi_hba *phba = beiscsi_ep->phba;
+	unsigned int tag, attempts;
+	int ret;
 
-	tag = mgmt_upload_connection(phba, beiscsi_ep->ep_cid, flag);
-	if (!tag) {
-		beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
-			    "BS_%d : upload failed for cid 0x%x\n",
-			    beiscsi_ep->ep_cid);
-
-		ret = -EAGAIN;
+	/**
+	 * Without successfully invalidating and uploading connection
+	 * driver can't reuse the CID so attempt more than once.
+	 */
+	attempts = 0;
+	while (attempts++ < 3) {
+		tag = beiscsi_invalidate_cxn(phba, beiscsi_ep);
+		if (tag) {
+			ret = beiscsi_mccq_compl_wait(phba, tag, NULL, NULL);
+			if (!ret)
+				break;
+			beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
+				    "BS_%d : invalidate conn failed cid %d\n",
+				    beiscsi_ep->ep_cid);
+		}
 	}
 
-	ret = beiscsi_mccq_compl_wait(phba, tag, NULL, NULL);
-
-	/* Flush the CQ entries */
+	/* wait for all completions to arrive, then process them */
+	msleep(250);
+	/* flush CQ entries */
 	beiscsi_flush_cq(phba);
 
-	return ret;
+	if (attempts > 3)
+		return -1;
+
+	attempts = 0;
+	while (attempts++ < 3) {
+		tag = beiscsi_upload_cxn(phba, beiscsi_ep);
+		if (tag) {
+			ret = beiscsi_mccq_compl_wait(phba, tag, NULL, NULL);
+			if (!ret)
+				break;
+			beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
+				    "BS_%d : upload conn failed cid %d\n",
+				    beiscsi_ep->ep_cid);
+		}
+	}
+	if (attempts > 3)
+		return -1;
+
+	return 0;
 }
 
 /**
@@ -1303,12 +1325,9 @@ static int beiscsi_close_conn(struct  beiscsi_endpoint *beiscsi_ep, int flag)
  */
 void beiscsi_ep_disconnect(struct iscsi_endpoint *ep)
 {
-	struct beiscsi_conn *beiscsi_conn;
 	struct beiscsi_endpoint *beiscsi_ep;
+	struct beiscsi_conn *beiscsi_conn;
 	struct beiscsi_hba *phba;
-	unsigned int tag;
-	uint8_t mgmt_invalidate_flag, tcp_upload_flag;
-	unsigned short savecfg_flag = CMD_ISCSI_SESSION_SAVE_CFG_ON_FLASH;
 	uint16_t cri_index;
 
 	beiscsi_ep = ep->dd_data;
@@ -1329,39 +1348,27 @@ void beiscsi_ep_disconnect(struct iscsi_endpoint *ep)
 	if (beiscsi_ep->conn) {
 		beiscsi_conn = beiscsi_ep->conn;
 		iscsi_suspend_queue(beiscsi_conn->conn);
-		mgmt_invalidate_flag = ~BEISCSI_NO_RST_ISSUE;
-		tcp_upload_flag = CONNECTION_UPLOAD_GRACEFUL;
+	}
+
+	if (!beiscsi_hba_is_online(phba)) {
+		beiscsi_log(phba, KERN_INFO, BEISCSI_LOG_CONFIG,
+			    "BS_%d : HBA in error 0x%lx\n", phba->state);
 	} else {
-		mgmt_invalidate_flag = BEISCSI_NO_RST_ISSUE;
-		tcp_upload_flag = CONNECTION_UPLOAD_ABORT;
+		/**
+		 * Make CID available even if close fails.
+		 * If not freed, FW might fail open using the CID.
+		 */
+		if (beiscsi_conn_close(beiscsi_ep) < 0)
+			__beiscsi_log(phba, KERN_ERR,
+				      "BS_%d : close conn failed cid %d\n",
+				      beiscsi_ep->ep_cid);
 	}
 
-	if (phba->state & BE_ADAPTER_PCI_ERR) {
-		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG,
-			    "BS_%d : PCI_ERROR Recovery\n");
-		goto free_ep;
-	}
-
-	tag = mgmt_invalidate_connection(phba, beiscsi_ep,
-					  beiscsi_ep->ep_cid,
-					  mgmt_invalidate_flag,
-					  savecfg_flag);
-	if (!tag) {
-		beiscsi_log(phba, KERN_ERR, BEISCSI_LOG_CONFIG,
-			    "BS_%d : mgmt_invalidate_connection Failed for cid=%d\n",
-			    beiscsi_ep->ep_cid);
-	}
-
-	beiscsi_mccq_compl_wait(phba, tag, NULL, NULL);
-	beiscsi_close_conn(beiscsi_ep, tcp_upload_flag);
-free_ep:
-	msleep(BEISCSI_LOGOUT_SYNC_DELAY);
 	beiscsi_free_ep(beiscsi_ep);
 	if (!phba->conn_table[cri_index])
 		__beiscsi_log(phba, KERN_ERR,
-				"BS_%d : conn_table empty at %u: cid %u\n",
-				cri_index,
-				beiscsi_ep->ep_cid);
+			      "BS_%d : conn_table empty at %u: cid %u\n",
+			      cri_index, beiscsi_ep->ep_cid);
 	phba->conn_table[cri_index] = NULL;
 	iscsi_destroy_endpoint(beiscsi_ep->openiscsi_ep);
 }

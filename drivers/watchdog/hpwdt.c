@@ -39,7 +39,7 @@
 #endif /* CONFIG_HPWDT_NMI_DECODING */
 #include <asm/nmi.h>
 
-#define HPWDT_VERSION			"1.3.3"
+#define HPWDT_VERSION			"1.4.0"
 #define SECS_TO_TICKS(secs)		((secs) * 1000 / 128)
 #define TICKS_TO_SECS(ticks)		((ticks) * 128 / 1000)
 #define HPWDT_MAX_TIMER			TICKS_TO_SECS(65535)
@@ -804,13 +804,6 @@ static int hpwdt_init_one(struct pci_dev *dev,
 {
 	int retval;
 
-
-	/*
-	 * Ignore all auxilary iLO devices with the following PCI ID
-	 */
-	if (dev->subsystem_device == 0x1979)
-		return -ENODEV;
-
 	/*
 	 * Check if we can do NMI decoding or not
 	 */
@@ -821,11 +814,19 @@ static int hpwdt_init_one(struct pci_dev *dev,
 	 * not run on a legacy ASM box.
 	 * So we only support the G5 ProLiant servers and higher.
 	 */
-	if (dev->subsystem_vendor != PCI_VENDOR_ID_HP) {
+	if (dev->subsystem_vendor != PCI_VENDOR_ID_HP &&
+	    dev->subsystem_vendor != PCI_VENDOR_ID_HP_3PAR) {
 		dev_warn(&dev->dev,
 			"This server does not have an iLO2+ ASIC.\n");
 		return -ENODEV;
 	}
+
+	/*
+	 * Ignore all auxilary iLO devices with the following PCI ID
+	 */
+	if (dev->subsystem_vendor == PCI_VENDOR_ID_HP &&
+	    dev->subsystem_device == 0x1979)
+		return -ENODEV;
 
 	if (pci_enable_device(dev)) {
 		dev_warn(&dev->dev,

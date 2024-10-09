@@ -45,6 +45,7 @@
 #include <linux/swap.h>
 #include <linux/highmem.h>
 #include <linux/pagemap.h>
+#include <linux/memremap.h>
 #include <linux/ksm.h>
 #include <linux/rmap.h>
 #include <linux/export.h>
@@ -61,6 +62,7 @@
 #include <linux/migrate.h>
 #include <linux/string.h>
 #include <linux/userfaultfd_k.h>
+#include <linux/dax.h>
 
 #include <asm/io.h>
 #include <asm/pgalloc.h>
@@ -872,12 +874,27 @@ copy_one_pte(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 						pte = pte_swp_mksoft_dirty(pte);
 					set_pte_at(src_mm, addr, src_pte, pte);
 				}
-			} else
+			} else if (is_hmm_entry(entry)) {
+				page = hmm_entry_to_page(entry);
+
 				/*
-				 * This can not happen because HMM migration holds
-				 * mmap_sem in read mode.
+				 * Update rss count even for un-addressable
+				 * page as they should be consider just like
+				 * any other page.
 				 */
-				VM_BUG_ON(is_hmm_entry(entry));
+				get_page(page);
+				rss[mm_counter(page)]++;
+				page_dup_rmap(page);
+
+				if (is_write_hmm_entry(entry) &&
+				    is_cow_mapping(vm_flags)) {
+					make_hmm_entry_read(&entry);
+					pte = swp_entry_to_pte(entry);
+					if (pte_swp_soft_dirty(*src_pte))
+						pte = pte_swp_mksoft_dirty(pte);
+					set_pte_at(src_mm, addr, src_pte, pte);
+				}
+			}
 		}
 		goto out_set_pte;
 	}
@@ -1116,6 +1133,7 @@ again:
 	pte = start_pte;
 	arch_enter_lazy_mmu_mode();
 	do {
+		swp_entry_t entry;
 		pte_t ptent = *pte;
 		if (pte_none(ptent)) {
 			continue;
@@ -1172,6 +1190,7 @@ again:
 				break;
 			continue;
 		}
+
 		/*
 		 * If details->check_mapping, we leave swap entries;
 		 * if details->nonlinear_vma, we leave file entries.
@@ -1182,11 +1201,25 @@ again:
 			if (unlikely(!(vma->vm_flags & VM_NONLINEAR)))
 				print_bad_pte(vma, addr, ptent, NULL);
 		} else {
-			swp_entry_t entry = pte_to_swp_entry(ptent);
+			entry = pte_to_swp_entry(ptent);
 
 			if (!non_swap_entry(entry))
 				rss[MM_SWAPENTS]--;
-			else if (is_migration_entry(entry)) {
+			else if (is_hmm_entry(entry)) {
+				/*
+				 * Un-addressable page must always be check
+				 * that are not like other swap entries and
+				 * thus should be check no matter what
+				 * details value is.
+				 */
+				struct page *page = hmm_entry_to_page(entry);
+
+				pte_clear_not_present_full(mm, addr, pte, tlb->fullmm);
+				rss[mm_counter(page)]--;
+				page_remove_rmap(page);
+				put_page(page);
+				continue;
+			} else if (is_migration_entry(entry)) {
 				struct page *page;
 
 				page = migration_entry_to_page(entry);
@@ -2498,8 +2531,6 @@ void unmap_mapping_range(struct address_space *mapping,
 	if (details.last_index < details.first_index)
 		details.last_index = ULONG_MAX;
 
-
-	/* DAX uses i_mmap_lock to serialise file truncate vs page fault */
 	mutex_lock(&mapping->i_mmap_mutex);
 	if (unlikely(!RB_EMPTY_ROOT(&mapping->i_mmap)))
 		unmap_mapping_range_tree(&mapping->i_mmap, &details);
@@ -2534,10 +2565,16 @@ static int do_swap_page(struct mm_struct *mm, struct vm_area_struct *vma,
 	if (unlikely(non_swap_entry(entry))) {
 		if (is_migration_entry(entry)) {
 			migration_entry_wait(mm, pmd, address);
+		} else if (is_hmm_entry(entry)) {
+			/*
+			 * For un-addressable device memory we call the pgmap
+			 * fault handler callback. The callback must migrate
+			 * the page back to some CPU accessible page.
+			 */
+			ret = hmm_entry_fault(vma, address, entry,
+						 flags, pmd);
 		} else if (is_hwpoison_entry(entry)) {
 			ret = VM_FAULT_HWPOISON;
-		} else if (is_hmm_entry(entry)) {
-			ret = hmm_migrate_fault(vma, address, entry, pmd);
 		} else {
 			print_bad_pte(vma, address, orig_pte, NULL);
 			ret = VM_FAULT_SIGBUS;
@@ -2697,40 +2734,6 @@ out_release:
 }
 
 /*
- * This is like a special single-page "expand_{down|up}wards()",
- * except we must first make sure that 'address{-|+}PAGE_SIZE'
- * doesn't hit another vma.
- */
-static inline int check_stack_guard_page(struct vm_area_struct *vma, unsigned long address)
-{
-	address &= PAGE_MASK;
-	if ((vma->vm_flags & VM_GROWSDOWN) && address == vma->vm_start) {
-		struct vm_area_struct *prev = vma->vm_prev;
-
-		/*
-		 * Is there a mapping abutting this one below?
-		 *
-		 * That's only ok if it's the same stack mapping
-		 * that has gotten split..
-		 */
-		if (prev && prev->vm_end == address)
-			return prev->vm_flags & VM_GROWSDOWN ? 0 : -ENOMEM;
-
-		expand_downwards(vma, address - PAGE_SIZE);
-	}
-	if ((vma->vm_flags & VM_GROWSUP) && address + PAGE_SIZE == vma->vm_end) {
-		struct vm_area_struct *next = vma->vm_next;
-
-		/* As VM_GROWSDOWN but s/below/above/ */
-		if (next && next->vm_start == address + PAGE_SIZE)
-			return next->vm_flags & VM_GROWSUP ? 0 : -ENOMEM;
-
-		expand_upwards(vma, address + PAGE_SIZE);
-	}
-	return 0;
-}
-
-/*
  * We enter with non-exclusive mmap_sem (to exclude vma changes,
  * but allow concurrent faults), and pte mapped but not yet locked.
  * We return with mmap_sem still held, but pte unmapped and unlocked.
@@ -2747,10 +2750,6 @@ static int do_anonymous_page(struct mm_struct *mm, struct vm_area_struct *vma,
 
 	/* File mapping without ->vm_ops ? */
 	if (vma->vm_flags & VM_SHARED)
-		return VM_FAULT_SIGBUS;
-
-	/* Check if we need to add a guard page to the stack */
-	if (check_stack_guard_page(vma, address) < 0)
 		return VM_FAULT_SIGBUS;
 
 	/* Use the zero-page for reads */
@@ -2824,7 +2823,8 @@ oom:
 
 static int __do_fault(struct vm_area_struct *vma, unsigned long address,
 			pgoff_t pgoff, unsigned int flags,
-			struct page *cow_page, struct page **page)
+			struct page *cow_page, struct page **page,
+			void **entry)
 {
 	struct vm_fault vmf;
 	int ret;
@@ -2838,8 +2838,10 @@ static int __do_fault(struct vm_area_struct *vma, unsigned long address,
 	ret = vma->vm_ops->fault(vma, &vmf);
 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
 		return ret;
-	if (!vmf.page)
-		goto out;
+	if (ret & VM_FAULT_DAX_LOCKED) {
+		*entry = vmf.entry;
+		return ret;
+	}
 
 	if (unlikely(PageHWPoison(vmf.page))) {
 		if (ret & VM_FAULT_LOCKED)
@@ -2853,7 +2855,6 @@ static int __do_fault(struct vm_area_struct *vma, unsigned long address,
 	else
 		VM_BUG_ON_PAGE(!PageLocked(vmf.page), vmf.page);
 
- out:
 	*page = vmf.page;
 	return ret;
 }
@@ -2891,7 +2892,7 @@ static int do_read_fault(struct mm_struct *mm, struct vm_area_struct *vma,
 	pte_t *pte;
 	int ret;
 
-	ret = __do_fault(vma, address, pgoff, flags, NULL, &fault_page);
+	ret = __do_fault(vma, address, pgoff, flags, NULL, &fault_page, NULL);
 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
 		return ret;
 
@@ -2913,6 +2914,7 @@ static int do_cow_fault(struct mm_struct *mm, struct vm_area_struct *vma,
 		pgoff_t pgoff, unsigned int flags, pte_t orig_pte)
 {
 	struct page *fault_page, *new_page;
+	void *fault_entry;
 	spinlock_t *ptl;
 	pte_t *pte;
 	int ret;
@@ -2929,40 +2931,34 @@ static int do_cow_fault(struct mm_struct *mm, struct vm_area_struct *vma,
 		return VM_FAULT_OOM;
 	}
 
-	ret = __do_fault(vma, address, pgoff, flags, new_page, &fault_page);
+	ret = __do_fault(vma, address, pgoff, flags, new_page, &fault_page,
+			 &fault_entry);
 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
 		goto uncharge_out;
 
-	if (fault_page)
+	if (!(ret & VM_FAULT_DAX_LOCKED))
 		copy_user_highpage(new_page, fault_page, address, vma);
 	__SetPageUptodate(new_page);
 
 	pte = pte_offset_map_lock(mm, pmd, address, &ptl);
 	if (unlikely(!pte_same(*pte, orig_pte))) {
 		pte_unmap_unlock(pte, ptl);
-		if (fault_page) {
+		if (!(ret & VM_FAULT_DAX_LOCKED)) {
 			unlock_page(fault_page);
 			page_cache_release(fault_page);
 		} else {
-			/*
-			 * The fault handler has no page to lock, so it holds
-			 * i_mmap_mutex for read to protect against truncate.
-			 */
-			mutex_unlock(&vma->vm_file->f_mapping->i_mmap_mutex);
+			dax_unlock_mapping_entry(vma->vm_file->f_mapping,
+						 pgoff);
 		}
 		goto uncharge_out;
 	}
 	do_set_pte(vma, address, new_page, pte, true, true);
 	pte_unmap_unlock(pte, ptl);
-	if (fault_page) {
+	if (!(ret & VM_FAULT_DAX_LOCKED)) {
 		unlock_page(fault_page);
 		page_cache_release(fault_page);
 	} else {
-		/*
-		 * The fault handler has no page to lock, so it holds
-		 * i_mmap_mutex for read to protect against truncate.
-		 */
-		mutex_unlock(&vma->vm_file->f_mapping->i_mmap_mutex);
+		dax_unlock_mapping_entry(vma->vm_file->f_mapping, pgoff);
 	}
 	return ret;
 uncharge_out:
@@ -2982,7 +2978,7 @@ static int do_shared_fault(struct mm_struct *mm, struct vm_area_struct *vma,
 	int dirtied = 0;
 	int ret, tmp;
 
-	ret = __do_fault(vma, address, pgoff, flags, NULL, &fault_page);
+	ret = __do_fault(vma, address, pgoff, flags, NULL, &fault_page, NULL);
 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
 		return ret;
 
@@ -3221,7 +3217,7 @@ static int handle_pte_fault(struct mm_struct *mm,
 	entry = *pte;
 	if (!pte_present(entry)) {
 		if (pte_none(entry)) {
-			if (vma->vm_ops)
+			if (!vma_is_anonymous(vma))
 				return do_linear_fault(mm, vma, address,
 						pte, pmd, flags, entry);
 			return do_anonymous_page(mm, vma, address,
@@ -3865,7 +3861,7 @@ long copy_huge_page_from_user(struct page *dst_page,
 				(const void __user *)(src + i * PAGE_SIZE),
 				PAGE_SIZE);
 		if (allow_pagefault)
-			kunmap(dst_page + i);
+			kunmap(page_kaddr);
 		else
 			kunmap_atomic(page_kaddr);
 
@@ -3903,3 +3899,20 @@ void ptlock_free(struct page *page)
 	kfree(page->ptl);
 }
 #endif
+
+#ifndef CONFIG_ARCH_HAS_ADD_PAGES
+int add_pages(int nid, unsigned long start,
+	      unsigned long size, bool for_device)
+{
+	struct pglist_data *pgdat = NODE_DATA(nid);
+	int zoneid = zone_for_memory(nid, start, size, ZONE_NORMAL, for_device);
+	struct zone *zone = pgdat->node_zones + zoneid;
+
+#ifdef CONFIG_ZONE_DEVICE
+	if (zoneid == ZONE_DEVICE)
+		zone = pgdat->zone_device;
+#endif
+
+	return __add_pages(nid, zone, start >> PAGE_SHIFT, size >> PAGE_SHIFT);
+}
+#endif /* ARCH_HAS_ADD_PAGES */

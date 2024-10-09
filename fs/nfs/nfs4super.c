@@ -29,7 +29,7 @@ static struct file_system_type nfs4_remote_fs_type = {
 	.name		= "nfs4",
 	.mount		= nfs4_remote_mount,
 	.kill_sb	= nfs_kill_super,
-	.fs_flags	= FS_RENAME_DOES_D_MOVE|FS_BINARY_MOUNTDATA|FS_HAS_INVALIDATE_RANGE,
+	.fs_flags	= FS_RENAME_DOES_D_MOVE|FS_BINARY_MOUNTDATA|FS_HAS_INVALIDATE_RANGE|FS_HAS_FO_EXTEND,
 };
 
 static struct file_system_type nfs4_remote_referral_fs_type = {
@@ -37,7 +37,7 @@ static struct file_system_type nfs4_remote_referral_fs_type = {
 	.name		= "nfs4",
 	.mount		= nfs4_remote_referral_mount,
 	.kill_sb	= nfs_kill_super,
-	.fs_flags	= FS_RENAME_DOES_D_MOVE|FS_BINARY_MOUNTDATA|FS_HAS_INVALIDATE_RANGE,
+	.fs_flags	= FS_RENAME_DOES_D_MOVE|FS_BINARY_MOUNTDATA|FS_HAS_INVALIDATE_RANGE|FS_HAS_FO_EXTEND,
 };
 
 struct file_system_type nfs4_referral_fs_type = {
@@ -45,7 +45,7 @@ struct file_system_type nfs4_referral_fs_type = {
 	.name		= "nfs4",
 	.mount		= nfs4_referral_mount,
 	.kill_sb	= nfs_kill_super,
-	.fs_flags	= FS_RENAME_DOES_D_MOVE|FS_BINARY_MOUNTDATA|FS_HAS_INVALIDATE_RANGE,
+	.fs_flags	= FS_RENAME_DOES_D_MOVE|FS_BINARY_MOUNTDATA|FS_HAS_INVALIDATE_RANGE|FS_HAS_FO_EXTEND,
 };
 
 static const struct super_operations nfs4_sops = {

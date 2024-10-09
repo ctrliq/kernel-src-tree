@@ -105,7 +105,7 @@ static u8 qede_dcbnl_getpfcstate(struct net_device *netdev)
 	return edev->ops->dcb->getpfcstate(edev->cdev);
 }
 
-static int qede_dcbnl_getapp(struct net_device *netdev, u8 idtype, u16 id)
+static u8 qede_dcbnl_getapp(struct net_device *netdev, u8 idtype, u16 id)
 {
 	struct qede_dev *edev = netdev_priv(netdev);
 
@@ -174,8 +174,8 @@ static void qede_dcbnl_setpfcstate(struct net_device *netdev, u8 state)
 	return edev->ops->dcb->setpfcstate(edev->cdev, state);
 }
 
-static int qede_dcbnl_setapp(struct net_device *netdev, u8 idtype, u16 idval,
-			     u8 up)
+static u8 qede_dcbnl_setapp(struct net_device *netdev, u8 idtype, u16 idval,
+			    u8 up)
 {
 	struct qede_dev *edev = netdev_priv(netdev);
 

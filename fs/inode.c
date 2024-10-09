@@ -1508,16 +1508,33 @@ sector_t bmap(struct inode *inode, sector_t block)
 EXPORT_SYMBOL(bmap);
 
 /*
+ * Update times in overlayed inode from underlying real inode
+ */
+static void update_ovl_inode_times(struct dentry *dentry, struct inode *inode)
+{
+	struct inode *realinode = d_real_inode(dentry);
+
+	if (unlikely(inode != realinode) &&
+	    (!timespec_equal(&inode->i_mtime, &realinode->i_mtime) ||
+	     !timespec_equal(&inode->i_ctime, &realinode->i_ctime))) {
+		inode->i_mtime = realinode->i_mtime;
+		inode->i_ctime = realinode->i_ctime;
+	}
+}
+
+/*
  * With relative atime, only update atime if the previous atime is
  * earlier than either the ctime or mtime or if at least a day has
  * passed since the last atime update.
  */
-static int relatime_need_update(struct vfsmount *mnt, struct inode *inode,
-			     struct timespec now)
+static int relatime_need_update(const struct path *path, struct inode *inode,
+				struct timespec now)
 {
 
-	if (!(mnt->mnt_flags & MNT_RELATIME))
+	if (!(path->mnt->mnt_flags & MNT_RELATIME))
 		return 1;
+
+	update_ovl_inode_times(path->dentry, inode);
 	/*
 	 * Is mtime younger than atime? If yes, update atime:
 	 */
@@ -1590,7 +1607,7 @@ void touch_atime(struct path *path)
 
 	now = current_fs_time(inode->i_sb);
 
-	if (!relatime_need_update(mnt, inode, now))
+	if (!relatime_need_update(path, inode, now))
 		return;
 
 	if (timespec_equal(&inode->i_atime, &now))

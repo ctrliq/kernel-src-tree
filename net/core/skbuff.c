@@ -3122,11 +3122,11 @@ struct sk_buff *skb_segment(struct sk_buff *head_skb,
 	struct sk_buff *frag_skb = head_skb;
 	unsigned int offset = doffset;
 	unsigned int tnl_hlen = skb_tnl_header_len(head_skb);
+	unsigned int partial_segs = 0;
 	unsigned int headroom;
-	unsigned int len;
+	unsigned int len = head_skb->len;
 	__be16 proto;
-	bool csum;
-	int sg = !!(features & NETIF_F_SG);
+	bool csum, sg;
 	int nfrags = skb_shinfo(head_skb)->nr_frags;
 	int err = -ENOMEM;
 	int i = 0;
@@ -3138,8 +3138,42 @@ struct sk_buff *skb_segment(struct sk_buff *head_skb,
 	if (unlikely(!proto))
 		return ERR_PTR(-EINVAL);
 
+	sg = !!(features & NETIF_F_SG);
 	csum = !!can_checksum_protocol(features, proto);
 
+	if (sg && csum && (mss != GSO_BY_FRAGS))  {
+		if (!(features & NETIF_F_GSO_PARTIAL)) {
+			struct sk_buff *iter;
+
+			if (!list_skb ||
+			    !net_gso_ok(features, skb_shinfo(head_skb)->gso_type))
+				goto normal;
+
+			/* Split the buffer at the frag_list pointer.
+			 * This is based on the assumption that all
+			 * buffers in the chain excluding the last
+			 * containing the same amount of data.
+			 */
+			skb_walk_frags(head_skb, iter) {
+				if (skb_headlen(iter))
+					goto normal;
+
+				len -= iter->len;
+			}
+		}
+
+		/* GSO partial only requires that we trim off any excess that
+		 * doesn't fit into an MSS sized block, so take care of that
+		 * now.
+		 */
+		partial_segs = len / mss;
+		if (partial_segs > 1)
+			mss *= partial_segs;
+		else
+			partial_segs = 0;
+	}
+
+normal:
 	headroom = skb_headroom(head_skb);
 	pos = skb_headlen(head_skb);
 
@@ -3325,6 +3359,46 @@ perform_csum_check:
 		}
 	} while ((offset += len) < head_skb->len);
 
+	/* Some callers want to get the end of the list.
+	 * Put it in segs->prev to avoid walking the list.
+	 * (see validate_xmit_skb_list() for example)
+	 */
+	segs->prev = tail;
+
+	if (partial_segs) {
+		struct sk_buff *iter;
+		int type = skb_shinfo(head_skb)->gso_type;
+		unsigned short gso_size = skb_shinfo(head_skb)->gso_size;
+
+		/* Update type to add partial and then remove dodgy if set */
+		type |= (features & NETIF_F_GSO_PARTIAL) / NETIF_F_GSO_PARTIAL * SKB_GSO_PARTIAL;
+		type &= ~SKB_GSO_DODGY;
+
+		/* Update GSO info and prepare to start updating headers on
+		 * our way back down the stack of protocols.
+		 */
+		for (iter = segs; iter; iter = iter->next) {
+			skb_shinfo(iter)->gso_size = gso_size;
+			skb_shinfo(iter)->gso_segs = partial_segs;
+			skb_shinfo(iter)->gso_type = type;
+			SKB_GSO_CB(iter)->data_offset = skb_headroom(iter) + doffset;
+		}
+
+		if (tail->len - doffset <= gso_size)
+			skb_shinfo(tail)->gso_size = 0;
+		else if (tail != segs)
+			skb_shinfo(tail)->gso_segs = DIV_ROUND_UP(tail->len - doffset, gso_size);
+	}
+
+	/* Following permits correct backpressure, for protocols
+	 * using skb_set_owner_w().
+	 * Idea is to tranfert ownership from head_skb to last segment.
+	 */
+	if (head_skb->destructor == sock_wfree) {
+		swap(tail->truesize, head_skb->truesize);
+		swap(tail->destructor, head_skb->destructor);
+		swap(tail->sk, head_skb->sk);
+	}
 	return segs;
 
 err:
@@ -3739,6 +3813,7 @@ void skb_tstamp_tx(struct sk_buff *orig_skb,
 	memset(serr, 0, sizeof(*serr));
 	serr->ee.ee_errno = ENOMSG;
 	serr->ee.ee_origin = SO_EE_ORIGIN_TIMESTAMPING;
+	serr->ee.ee_info = SCM_TSTAMP_SND;
 
 	err = sock_queue_err_skb(sk, skb);
 
@@ -3795,6 +3870,92 @@ bool skb_partial_csum_set(struct sk_buff *skb, u16 start, u16 off)
 	return true;
 }
 EXPORT_SYMBOL_GPL(skb_partial_csum_set);
+
+/**
+ * skb_checksum_maybe_trim - maybe trims the given skb
+ * @skb: the skb to check
+ * @transport_len: the data length beyond the network header
+ *
+ * Checks whether the given skb has data beyond the given transport length.
+ * If so, returns a cloned skb trimmed to this transport length.
+ * Otherwise returns the provided skb. Returns NULL in error cases
+ * (e.g. transport_len exceeds skb length or out-of-memory).
+ *
+ * Caller needs to set the skb transport header and free any returned skb if it
+ * differs from the provided skb.
+ */
+static struct sk_buff *skb_checksum_maybe_trim(struct sk_buff *skb,
+					       unsigned int transport_len)
+{
+	struct sk_buff *skb_chk;
+	unsigned int len = skb_transport_offset(skb) + transport_len;
+	int ret;
+
+	if (skb->len < len)
+		return NULL;
+	else if (skb->len == len)
+		return skb;
+
+	skb_chk = skb_clone(skb, GFP_ATOMIC);
+	if (!skb_chk)
+		return NULL;
+
+	ret = pskb_trim_rcsum(skb_chk, len);
+	if (ret) {
+		kfree_skb(skb_chk);
+		return NULL;
+	}
+
+	return skb_chk;
+}
+
+/**
+ * skb_checksum_trimmed - validate checksum of an skb
+ * @skb: the skb to check
+ * @transport_len: the data length beyond the network header
+ * @skb_chkf: checksum function to use
+ *
+ * Applies the given checksum function skb_chkf to the provided skb.
+ * Returns a checked and maybe trimmed skb. Returns NULL on error.
+ *
+ * If the skb has data beyond the given transport length, then a
+ * trimmed & cloned skb is checked and returned.
+ *
+ * Caller needs to set the skb transport header and free any returned skb if it
+ * differs from the provided skb.
+ */
+struct sk_buff *skb_checksum_trimmed(struct sk_buff *skb,
+				     unsigned int transport_len,
+				     __sum16(*skb_chkf)(struct sk_buff *skb))
+{
+	struct sk_buff *skb_chk;
+	unsigned int offset = skb_transport_offset(skb);
+	__sum16 ret;
+
+	skb_chk = skb_checksum_maybe_trim(skb, transport_len);
+	if (!skb_chk)
+		goto err;
+
+	if (!pskb_may_pull(skb_chk, offset))
+		goto err;
+
+	skb_pull_rcsum(skb_chk, offset);
+	ret = skb_chkf(skb_chk);
+	skb_push_rcsum(skb_chk, offset);
+
+	if (ret)
+		goto err;
+
+	return skb_chk;
+
+err:
+	if (skb_chk && skb_chk != skb)
+		kfree_skb(skb_chk);
+
+	return NULL;
+
+}
+EXPORT_SYMBOL(skb_checksum_trimmed);
 
 void __skb_warn_lro_forwarding(const struct sk_buff *skb)
 {
@@ -4150,3 +4311,81 @@ int skb_vlan_push(struct sk_buff *skb, __be16 vlan_proto, u16 vlan_tci)
 	return 0;
 }
 EXPORT_SYMBOL(skb_vlan_push);
+
+/**
+ * alloc_skb_with_frags - allocate skb with page frags
+ *
+ * header_len: size of linear part
+ * data_len: needed length in frags
+ * max_page_order: max page order desired.
+ * errcode: pointer to error code if any
+ * gfp_mask: allocation mask
+ *
+ * This can be used to allocate a paged skb, given a maximal order for frags.
+ */
+struct sk_buff *alloc_skb_with_frags(unsigned long header_len,
+				     unsigned long data_len,
+				     int max_page_order,
+				     int *errcode,
+				     gfp_t gfp_mask)
+{
+	int npages = (data_len + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
+	unsigned long chunk;
+	struct sk_buff *skb;
+	struct page *page;
+	gfp_t gfp_head;
+	int i;
+
+	*errcode = -EMSGSIZE;
+	/* Note this test could be relaxed, if we succeed to allocate
+	 * high order pages...
+	 */
+	if (npages > MAX_SKB_FRAGS)
+		return NULL;
+
+	gfp_head = gfp_mask;
+	if (gfp_head & __GFP_WAIT)
+		gfp_head |= __GFP_REPEAT;
+
+	*errcode = -ENOBUFS;
+	skb = alloc_skb(header_len, gfp_head);
+	if (!skb)
+		return NULL;
+
+	skb->truesize += npages << PAGE_SHIFT;
+
+	for (i = 0; npages > 0; i++) {
+		int order = max_page_order;
+
+		while (order) {
+			if (npages >= 1 << order) {
+				page = alloc_pages(gfp_mask |
+						   __GFP_COMP |
+						   __GFP_NOWARN |
+						   __GFP_NORETRY,
+						   order);
+				if (page)
+					goto fill_page;
+				/* Do not retry other high order allocations */
+				order = 1;
+				max_page_order = 0;
+			}
+			order--;
+		}
+		page = alloc_page(gfp_mask);
+		if (!page)
+			goto failure;
+fill_page:
+		chunk = min_t(unsigned long, data_len,
+			      PAGE_SIZE << order);
+		skb_fill_page_desc(skb, i, page, 0, chunk);
+		data_len -= chunk;
+		npages -= 1 << order;
+	}
+	return skb;
+
+failure:
+	kfree_skb(skb);
+	return NULL;
+}
+EXPORT_SYMBOL(alloc_skb_with_frags);

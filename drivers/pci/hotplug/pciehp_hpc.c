@@ -109,19 +109,7 @@ static int pcie_poll_cmd(struct controller *ctrl, int timeout)
 	struct pci_dev *pdev = ctrl_dev(ctrl);
 	u16 slot_status;
 
-	pcie_capability_read_word(pdev, PCI_EXP_SLTSTA, &slot_status);
-	if (slot_status == (u16) ~0) {
-		ctrl_info(ctrl, "%s: no response from device\n", __func__);
-		return 0;
-	}
-	if (slot_status & PCI_EXP_SLTSTA_CC) {
-		pcie_capability_write_word(pdev, PCI_EXP_SLTSTA,
-					   PCI_EXP_SLTSTA_CC);
-		return 1;
-	}
-	while (timeout > 0) {
-		msleep(10);
-		timeout -= 10;
+	while (true) {
 		pcie_capability_read_word(pdev, PCI_EXP_SLTSTA, &slot_status);
 		if (slot_status == (u16) ~0) {
 			ctrl_info(ctrl, "%s: no response from device\n",
@@ -134,6 +122,10 @@ static int pcie_poll_cmd(struct controller *ctrl, int timeout)
 						   PCI_EXP_SLTSTA_CC);
 			return 1;
 		}
+		if (timeout < 0)
+			break;
+		msleep(10);
+		timeout -= 10;
 	}
 	return 0;	/* timeout */
 }
@@ -363,6 +355,18 @@ static int pciehp_link_enable(struct controller *ctrl)
 	return __pciehp_link_set(ctrl, true);
 }
 
+int pciehp_get_raw_indicator_status(struct hotplug_slot *hotplug_slot,
+				    u8 *status)
+{
+	struct slot *slot = hotplug_slot->private;
+	struct pci_dev *pdev = ctrl_dev(slot->ctrl);
+	u16 slot_ctrl;
+
+	pcie_capability_read_word(pdev, PCI_EXP_SLTCTL, &slot_ctrl);
+	*status = (slot_ctrl & (PCI_EXP_SLTCTL_AIC | PCI_EXP_SLTCTL_PIC)) >> 6;
+	return 0;
+}
+
 void pciehp_get_attention_status(struct slot *slot, u8 *status)
 {
 	struct controller *ctrl = slot->ctrl;
@@ -437,6 +441,17 @@ int pciehp_query_power_fault(struct slot *slot)
 
 	pcie_capability_read_word(pdev, PCI_EXP_SLTSTA, &slot_status);
 	return !!(slot_status & PCI_EXP_SLTSTA_PFD);
+}
+
+int pciehp_set_raw_indicator_status(struct hotplug_slot *hotplug_slot,
+				    u8 status)
+{
+	struct slot *slot = hotplug_slot->private;
+	struct controller *ctrl = slot->ctrl;
+
+	pcie_write_cmd_nowait(ctrl, status << 6,
+			      PCI_EXP_SLTCTL_AIC | PCI_EXP_SLTCTL_PIC);
+	return 0;
 }
 
 void pciehp_set_attention_status(struct slot *slot, u8 value)
@@ -825,6 +840,10 @@ struct controller *pcie_init(struct pcie_device *dev)
 	}
 	ctrl->pcie = dev;
 	pcie_capability_read_dword(pdev, PCI_EXP_SLTCAP, &slot_cap);
+
+	if (pdev->hotplug_user_indicators)
+		slot_cap &= ~(PCI_EXP_SLTCAP_AIP | PCI_EXP_SLTCAP_PIP);
+
 	ctrl->slot_cap = slot_cap;
 	mutex_init(&ctrl->ctrl_lock);
 	init_waitqueue_head(&ctrl->queue);

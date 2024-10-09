@@ -36,6 +36,9 @@ struct dst_ops {
 
 	struct kmem_cache	*kmem_cachep;
 
+	RH_KABI_FILL_HOLE(void	(*confirm_neigh)(const struct dst_entry *dst,
+						 const void *daddr))
+
 	struct percpu_counter	pcpuc_entries ____cacheline_aligned_in_smp;
 };
 

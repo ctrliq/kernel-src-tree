@@ -216,6 +216,7 @@ struct perf_sched {
 	/* options for timehist command */
 	bool		summary;
 	bool		summary_only;
+	bool		idle_hist;
 	bool		show_callchain;
 	unsigned int	max_stack;
 	bool		show_cpu_visual;
@@ -570,7 +571,7 @@ force_again:
 		}
 		pr_err("Error: sys_perf_event_open() syscall returned "
 		       "with %d (%s)\n%s", fd,
-		       strerror_r(errno, sbuf, sizeof(sbuf)), info);
+		       str_error_r(errno, sbuf, sizeof(sbuf)), info);
 		exit(EXIT_FAILURE);
 	}
 	return fd;
@@ -1266,6 +1267,7 @@ static void output_lat_thread(struct perf_sched *sched, struct work_atoms *work_
 	int i;
 	int ret;
 	u64 avg;
+	char max_lat_at[32];
 
 	if (!work_list->nb_atoms)
 		return;
@@ -1287,12 +1289,13 @@ static void output_lat_thread(struct perf_sched *sched, struct work_atoms *work_
 		printf(" ");
 
 	avg = work_list->total_lat / work_list->nb_atoms;
+	timestamp__scnprintf_usec(work_list->max_lat_at, max_lat_at, sizeof(max_lat_at));
 
-	printf("|%11.3f ms |%9" PRIu64 " | avg:%9.3f ms | max:%9.3f ms | max at: %13.6f s\n",
+	printf("|%11.3f ms |%9" PRIu64 " | avg:%9.3f ms | max:%9.3f ms | max at: %13s s\n",
 	      (double)work_list->total_runtime / NSEC_PER_MSEC,
 		 work_list->nb_atoms, (double)avg / NSEC_PER_MSEC,
 		 (double)work_list->max_lat / NSEC_PER_MSEC,
-		 (double)work_list->max_lat_at / NSEC_PER_SEC);
+		 max_lat_at);
 }
 
 static int pid_cmp(struct work_atoms *l, struct work_atoms *r)
@@ -1477,6 +1480,7 @@ static int map_switch_event(struct perf_sched *sched, struct perf_evsel *evsel,
 	int cpus_nr;
 	bool new_cpu = false;
 	const char *color = PERF_COLOR_NORMAL;
+	char stimestamp[32];
 
 	BUG_ON(this_cpu >= MAX_CPUS || this_cpu < 0);
 
@@ -1567,7 +1571,8 @@ static int map_switch_event(struct perf_sched *sched, struct perf_evsel *evsel,
 	if (sched->map.cpus && !cpu_map__has(sched->map.cpus, this_cpu))
 		goto out;
 
-	color_fprintf(stdout, color, "  %12.6f secs ", (double)timestamp / NSEC_PER_SEC);
+	timestamp__scnprintf_usec(timestamp, stimestamp, sizeof(stimestamp));
+	color_fprintf(stdout, color, "  %12s secs ", stimestamp);
 	if (new_shortname || (verbose && sched_in->tid)) {
 		const char *pid_color = color;
 
@@ -1943,7 +1948,8 @@ static void timehist_print_sample(struct perf_sched *sched,
 
 	sample__fprintf_sym(sample, al, 0,
 			    EVSEL__PRINT_SYM | EVSEL__PRINT_ONELINE |
-			    EVSEL__PRINT_CALLCHAIN_ARROW,
+			    EVSEL__PRINT_CALLCHAIN_ARROW |
+			    EVSEL__PRINT_SKIP_IGNORED,
 			    &callchain_cursor, stdout);
 
 out:
@@ -2014,42 +2020,62 @@ static void timehist_update_runtime_stats(struct thread_runtime *r,
 	r->total_preempt_time += r->dt_preempt;
 }
 
-static bool is_idle_sample(struct perf_sched *sched,
-			   struct perf_sample *sample,
-			   struct perf_evsel *evsel,
-			   struct machine *machine)
+static bool is_idle_sample(struct perf_sample *sample,
+			   struct perf_evsel *evsel)
 {
-	struct thread *thread;
-	struct callchain_cursor *cursor = &callchain_cursor;
-
 	/* pid 0 == swapper == idle task */
-	if (sample->pid == 0)
-		return true;
+	if (strcmp(perf_evsel__name(evsel), "sched:sched_switch") == 0)
+		return perf_evsel__intval(evsel, sample, "prev_pid") == 0;
 
-	if (strcmp(perf_evsel__name(evsel), "sched:sched_switch") == 0) {
-		if (perf_evsel__intval(evsel, sample, "prev_pid") == 0)
-			return true;
-	}
+	return sample->pid == 0;
+}
+
+static void save_task_callchain(struct perf_sched *sched,
+				struct perf_sample *sample,
+				struct perf_evsel *evsel,
+				struct machine *machine)
+{
+	struct callchain_cursor *cursor = &callchain_cursor;
+	struct thread *thread;
 
 	/* want main thread for process - has maps */
 	thread = machine__findnew_thread(machine, sample->pid, sample->pid);
 	if (thread == NULL) {
 		pr_debug("Failed to get thread for pid %d.\n", sample->pid);
-		return false;
+		return;
 	}
 
 	if (!symbol_conf.use_callchain || sample->callchain == NULL)
-		return false;
+		return;
 
 	if (thread__resolve_callchain(thread, cursor, evsel, sample,
 				      NULL, NULL, sched->max_stack + 2) != 0) {
 		if (verbose)
 			error("Failed to resolve callchain. Skipping\n");
 
-		return false;
+		return;
 	}
+
 	callchain_cursor_commit(cursor);
-	return false;
+
+	while (true) {
+		struct callchain_cursor_node *node;
+		struct symbol *sym;
+
+		node = callchain_cursor_current(cursor);
+		if (node == NULL)
+			break;
+
+		sym = node->sym;
+		if (sym && sym->name) {
+			if (!strcmp(sym->name, "schedule") ||
+			    !strcmp(sym->name, "__schedule") ||
+			    !strcmp(sym->name, "preempt_schedule"))
+				sym->ignore = 1;
+		}
+
+		callchain_cursor_advance(cursor);
+	}
 }
 
 static int init_idle_thread(struct thread *thread)
@@ -2147,6 +2173,15 @@ static struct thread *get_idle_thread(int cpu)
 	return idle_threads[cpu];
 }
 
+static void save_idle_callchain(struct idle_thread_runtime *itr,
+				struct perf_sample *sample)
+{
+	if (!symbol_conf.use_callchain || sample->callchain == NULL)
+		return;
+
+	callchain_cursor__copy(&itr->cursor, &callchain_cursor);
+}
+
 /*
  * handle runtime stats saved per thread
  */
@@ -2185,7 +2220,7 @@ static struct thread *timehist_get_thread(struct perf_sched *sched,
 {
 	struct thread *thread;
 
-	if (is_idle_sample(sched, sample, evsel, machine)) {
+	if (is_idle_sample(sample, evsel)) {
 		thread = get_idle_thread(sample->cpu);
 		if (thread == NULL)
 			pr_err("Failed to get idle thread for cpu %d.\n", sample->cpu);
@@ -2197,6 +2232,28 @@ static struct thread *timehist_get_thread(struct perf_sched *sched,
 		if (thread == NULL) {
 			pr_debug("Failed to get thread for tid %d. skipping sample.\n",
 				 sample->tid);
+		}
+
+		save_task_callchain(sched, sample, evsel, machine);
+		if (sched->idle_hist) {
+			struct thread *idle;
+			struct idle_thread_runtime *itr;
+
+			idle = get_idle_thread(sample->cpu);
+			if (idle == NULL) {
+				pr_err("Failed to get idle thread for cpu %d.\n", sample->cpu);
+				return NULL;
+			}
+
+			itr = thread__priv(idle);
+			if (itr == NULL)
+				return NULL;
+
+			itr->last_thread = thread;
+
+			/* copy task callchain when entering to idle */
+			if (perf_evsel__intval(evsel, sample, "next_pid") == 0)
+				save_idle_callchain(itr, sample);
 		}
 	}
 

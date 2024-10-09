@@ -26,10 +26,9 @@
 
 #include <linux/slab.h>
 #include <linux/err.h>
-#include <linux/cacheinfo.h>
-#include <linux/cpuhotplug.h>
+#include <linux/cpu.h>
+#include <asm/processor.h>
 
-#include <asm/intel_rdt_common.h>
 #include <asm/intel-family.h>
 #include <asm/intel_rdt.h>
 
@@ -190,15 +189,7 @@ static inline bool get_rdt_resources(void)
 
 static int get_cache_id(int cpu, int level)
 {
-	struct cpu_cacheinfo *ci = get_cpu_cacheinfo(cpu);
-	int i;
-
-	for (i = 0; i < ci->num_leaves; i++) {
-		if (ci->info_list[i].level == level)
-			return ci->info_list[i].id;
-	}
-
-	return -1;
+	return get_cpu_cache_id(cpu, level);
 }
 
 void rdt_cbm_update(void *arg)
@@ -272,7 +263,7 @@ static struct rdt_domain *rdt_find_domain(struct rdt_resource *r, int id,
  * in the schemata file and schemata input is validated to have the same order
  * as this list.
  */
-static void domain_add_cpu(int cpu, struct rdt_resource *r)
+static void domain_add_cpu(int cpu, struct rdt_resource *r, bool notifier)
 {
 	int i, id = get_cache_id(cpu, r->cache_level);
 	struct list_head *add_pos = NULL;
@@ -305,7 +296,8 @@ static void domain_add_cpu(int cpu, struct rdt_resource *r)
 		int idx = cbm_idx(r, i);
 
 		d->cbm[i] = r->max_cbm;
-		wrmsrl(r->msr_base + idx, d->cbm[i]);
+		if (notifier)
+			wrmsrl(r->msr_base + idx, d->cbm[i]);
 	}
 
 	cpumask_set_cpu(cpu, &d->cpu_mask);
@@ -342,16 +334,19 @@ static void clear_closid(int cpu)
 	wrmsr(MSR_IA32_PQR_ASSOC, state->rmid, 0);
 }
 
-static int intel_rdt_online_cpu(unsigned int cpu)
+static int intel_rdt_online_cpu(unsigned int cpu, bool notifier)
 {
 	struct rdt_resource *r;
 
 	mutex_lock(&rdtgroup_mutex);
 	for_each_capable_rdt_resource(r)
-		domain_add_cpu(cpu, r);
+		domain_add_cpu(cpu, r, notifier);
+
 	/* The cpu is set in default rdtgroup after online. */
 	cpumask_set_cpu(cpu, &rdtgroup_default.cpu_mask);
-	clear_closid(cpu);
+	if (notifier)
+		clear_closid(cpu);
+
 	mutex_unlock(&rdtgroup_mutex);
 
 	return 0;
@@ -375,6 +370,70 @@ static int intel_rdt_offline_cpu(unsigned int cpu)
 	return 0;
 }
 
+static int
+rdt_cpu_notify(struct notifier_block *self, unsigned long action, void *hcpu)
+{
+       unsigned int cpu = (long)hcpu;
+
+       switch (action & ~CPU_TASKS_FROZEN) {
+
+       case CPU_ONLINE:
+       case CPU_DOWN_FAILED:
+               intel_rdt_online_cpu(cpu, true);
+               break;
+
+       case CPU_UP_CANCELED:
+       case CPU_DOWN_PREPARE:
+               intel_rdt_offline_cpu(cpu);
+               break;
+       default:
+               break;
+       }
+
+       return NOTIFY_OK;
+}
+
+static void __init rdt_cpu_setup(void *dummy)
+{
+	struct rdt_resource *r;
+	int i;
+
+	clear_closid(smp_processor_id());
+
+	for_each_capable_rdt_resource(r) {
+		for (i = 0; i < r->num_closid; i++) {
+			int idx = cbm_idx(r, i);
+
+			wrmsrl(r->msr_base + idx, r->max_cbm);
+		}
+	}
+}
+
+static struct notifier_block rdt_cpu_nb = {
+	.notifier_call  = rdt_cpu_notify,
+	.priority	= -INT_MAX,
+};
+
+static int __init rdt_notifier_init(void)
+{
+	unsigned int cpu;
+
+	for_each_online_cpu(cpu) {
+		intel_rdt_online_cpu(cpu, false);
+		/*
+		 * RHEL7 - The upstream hotplug notification invokes the
+		 *         callbacks on related cpus, but that's not the
+		 *         case of the RHEL7 notification support.
+		 *         Following call ensures we run all the msr
+		 *         initialization setup on related cpus.
+		 */
+		smp_call_function_single(cpu, rdt_cpu_setup, NULL, 1);
+	}
+
+	__register_cpu_notifier(&rdt_cpu_nb);
+	return 0;
+}
+
 static int __init intel_rdt_late_init(void)
 {
 	struct rdt_resource *r;
@@ -383,15 +442,16 @@ static int __init intel_rdt_late_init(void)
 	if (!get_rdt_resources())
 		return -ENODEV;
 
-	state = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN,
-				  "x86/rdt/cat:online:",
-				  intel_rdt_online_cpu, intel_rdt_offline_cpu);
+	cpu_notifier_register_begin();
+	state = rdt_notifier_init();
+	cpu_notifier_register_done();
+
 	if (state < 0)
 		return state;
 
 	ret = rdtgroup_init();
 	if (ret) {
-		cpuhp_remove_state(state);
+		unregister_cpu_notifier(&rdt_cpu_nb);
 		return ret;
 	}
 

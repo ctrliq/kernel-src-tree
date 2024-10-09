@@ -35,24 +35,100 @@ static inline struct vmem_altmap *to_vmem_altmap(unsigned long memmap_start)
 }
 #endif
 
+/*
+ * Specialize ZONE_DEVICE memory into multiple types each having differents
+ * usage.
+ *
+ * MEMORY_DEVICE_PUBLIC:
+ * Persistent device memory (pmem): struct page might be allocated in different
+ * memory and architecture might want to perform special actions. It is similar
+ * to regular memory, in that the CPU can access it transparently. However,
+ * it is likely to have different bandwidth and latency than regular memory.
+ * See Documentation/nvdimm/nvdimm.txt for more information.
+ *
+ * MEMORY_HMM:
+ * Device memory that is not directly addressable by the CPU: CPU can neither
+ * read nor write _UNADDRESSABLE memory. In this case, we do still have struct
+ * pages backing the device memory. Doing so simplifies the implementation, but
+ * it is important to remember that there are certain points at which the struct
+ * page must be treated as an opaque object, rather than a "normal" struct page.
+ * A more complete discussion of unaddressable memory may be found in
+ * include/linux/hmm.h and Documentation/vm/hmm.txt.
+ */
+enum memory_type {
+	MEMORY_DEVICE_PUBLIC = 0,
+	MEMORY_HMM,
+};
+
+/*
+ * For MEMORY_HMM we use ZONE_DEVICE and extend it with two callbacks:
+ *   page_fault()
+ *   page_free()
+ *
+ * Additional notes about MEMORY_DEVICE_PRIVATE may be found in
+ * include/linux/hmm.h and Documentation/vm/hmm.txt. There is also a brief
+ * explanation in include/linux/memory_hotplug.h.
+ *
+ * The page_fault() callback must migrate page back, from device memory to
+ * system memory, so that the CPU can access it. This might fail for various
+ * reasons (device issues,  device have been unplugged, ...). When such error
+ * conditions happen, the page_fault() callback must return VM_FAULT_SIGBUS and
+ * set the CPU page table entry to "poisoned".
+ *
+ * Note that because memory cgroup charges are transferred to the device memory,
+ * this should never fail due to memory restrictions. However, allocation
+ * of a regular system page might still fail because we are out of memory. If
+ * that happens, the page_fault() callback must return VM_FAULT_OOM.
+ *
+ * The page_fault() callback can also try to migrate back multiple pages in one
+ * chunk, as an optimization. It must, however, prioritize the faulting address
+ * over all the others.
+ *
+ *
+ * The page_free() callback is called once the page refcount reaches 1
+ * (ZONE_DEVICE pages never reach 0 refcount unless there is a refcount bug.
+ * This allows the device driver to implement its own memory management.)
+ */
+typedef int (*dev_page_fault_t)(struct vm_area_struct *vma,
+				unsigned long addr,
+				struct page *page,
+				unsigned int flags,
+				pmd_t *pmdp);
+typedef void (*dev_page_free_t)(struct page *page, void *data);
+
 /**
  * struct dev_pagemap - metadata for ZONE_DEVICE mappings
  * @altmap: pre-allocated/reserved memory for vmemmap allocations
+ * @page_fault: callback when CPU fault on an un-addressable device page
+ * @page_free: free page callback when page refcount reach 1
  * @res: physical address range covered by @ref
  * @ref: reference count that pins the devm_memremap_pages() mapping
  * @dev: host device of the mapping for debug
+ * @data: privata data pointer for page_free
+ * @type: memory type: see MEMORY_* above
  */
 struct dev_pagemap {
 	struct vmem_altmap *altmap;
+	dev_page_fault_t page_fault;
+	dev_page_free_t page_free;
 	const struct resource *res;
 	struct percpu_ref *ref;
 	struct device *dev;
+	void *data;
+	enum memory_type type;
 };
 
 #ifdef CONFIG_ZONE_DEVICE
 void *devm_memremap_pages(struct device *dev, struct resource *res,
 		struct percpu_ref *ref, struct vmem_altmap *altmap);
 struct dev_pagemap *find_dev_pagemap(resource_size_t phys);
+
+static inline bool is_hmm_page(const struct page *page)
+{
+	/* See MEMORY_DEVICE_PRIVATE in include/linux/memory_hotplug.h */
+	return ((page_zonenum(page) == ZONE_DEVICE) &&
+		(page->pgmap->type == MEMORY_HMM));
+}
 #else
 static inline void *devm_memremap_pages(struct device *dev,
 		struct resource *res, struct percpu_ref *ref,
@@ -70,6 +146,11 @@ static inline void *devm_memremap_pages(struct device *dev,
 static inline struct dev_pagemap *find_dev_pagemap(resource_size_t phys)
 {
 	return NULL;
+}
+
+static inline bool is_hmm_page(const struct page *page)
+{
+	return false;
 }
 #endif
 

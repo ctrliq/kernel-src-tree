@@ -623,7 +623,7 @@ int __netpoll_setup(struct netpoll *np, struct net_device *ndev)
 
 		ops = np->dev->netdev_ops;
 		if (ops->ndo_netpoll_setup) {
-			err = ops->ndo_netpoll_setup(ndev, npinfo);
+			err = ops->ndo_netpoll_setup(ndev, npinfo, GFP_KERNEL);
 			if (err)
 				goto free_npinfo;
 		}

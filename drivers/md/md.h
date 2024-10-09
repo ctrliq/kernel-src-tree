@@ -28,6 +28,16 @@
 #define MaxSector (~(sector_t)0)
 
 /*
+ * These flags should really be called "NO_RETRY" rather than
+ * "FAILFAST" because they don't make any promise about time lapse,
+ * only about the number of retries, which will be zero.
+ * REQ_FAILFAST_DRIVER is not included because
+ * Commit: 4a27446f3e39 ("[SCSI] modify scsi to handle new fail fast flags.")
+ * seems to suggest that the errors it avoids retrying should usually
+ * be retried.
+ */
+#define	MD_FAILFAST	(REQ_FAILFAST_DEV | REQ_FAILFAST_TRANSPORT)
+/*
  * MD's 'extended' device
  */
 struct md_rdev {
@@ -110,6 +120,13 @@ struct md_rdev {
 					   * sysfs entry */
 
 	struct badblocks badblocks;
+
+	struct {
+		short offset;	/* Offset from superblock to start of PPL.
+				 * Not used by external metadata. */
+		unsigned int size;	/* Size in sectors of the PPL space */
+		sector_t sector;	/* First sector of the PPL space */
+	} ppl;
 };
 enum flag_bits {
 	Faulty,			/* device is known to have a fault */
@@ -163,6 +180,25 @@ enum flag_bits {
 				 * Usually, this device should be faster
 				 * than other devices in the array
 				 */
+	__ReservedClusterRemove,
+	RemoveSynchronized,	/* synchronize_rcu() was called after
+				 * this device was known to be faulty,
+				 * so it is safe to remove without
+				 * another synchronize_rcu() call.
+				 */
+	ExternalBbl,            /* External metadata provides bad
+				 * block management for a disk
+				 */
+	FailFast,		/* Minimal retries should be attempted on
+				 * this device, so use REQ_FAILFAST_DEV.
+				 * Also don't try to repair failed reads.
+				 * It is expects that no bad block log
+				 * is present.
+				 */
+	LastDev,		/* Seems to be the last working dev as
+				 * it didn't fail, so don't use FailFast
+				 * any more for metadata
+				 */
 };
 
 static inline int is_badblock(struct md_rdev *rdev, sector_t s, int sectors,
@@ -182,6 +218,14 @@ extern int rdev_set_badblocks(struct md_rdev *rdev, sector_t s, int sectors,
 			      int is_new);
 extern int rdev_clear_badblocks(struct md_rdev *rdev, sector_t s, int sectors,
 				int is_new);
+struct md_cluster_info;
+
+enum mddev_sb_flags {
+	MD_SB_CHANGE_DEVS,		/* Some device status has changed */
+	MD_SB_CHANGE_CLEAN,	/* transition to or from 'clean' */
+	MD_SB_CHANGE_PENDING,	/* switch from 'clean' to 'active' in progress */
+	MD_SB_NEED_REWRITE,	/* metadata write needs to be repeated */
+};
 
 struct mddev {
 	void				*private;
@@ -190,15 +234,17 @@ struct mddev {
 	int				md_minor;
 	struct list_head		disks;
 	unsigned long			flags;
-#define MD_CHANGE_DEVS	0	/* Some device status has changed */
-#define MD_CHANGE_CLEAN 1	/* transition to or from 'clean' */
-#define MD_CHANGE_PENDING 2	/* switch from 'clean' to 'active' in progress */
-#define MD_UPDATE_SB_FLAGS (1 | 2 | 4)	/* If these are set, md_update_sb needed */
 #define MD_ARRAY_FIRST_USE 3    /* First use of array, needs initialization */
 #define MD_CLOSING	4	/* If set, we are closing the array, do not open
 				 * it then */
 #define MD_JOURNAL_CLEAN 5	/* A raid with journal is already clean */
 #define MD_HAS_JOURNAL	6	/* The raid array has journal feature set */
+#define	MD_FAILFAST_SUPPORTED 7	/* Using MD_FAILFAST on metadata writes is
+				 * supported as calls to md_error() will
+				 * never cause the array to become failed.
+				 */
+#define	MD_NEED_REWRITE	8	/* metadata write needs to be repeated */
+	unsigned long			sb_flags;
 
 	int				suspended;
 	atomic_t			active_io;
@@ -211,6 +257,7 @@ struct mddev {
 
 	struct kobject			kobj;
 	int				hold_active;
+#define MD_HAS_PPL 9           /* The raid array has PPL feature set */
 #define	UNTIL_IOCTL	1
 #define	UNTIL_STOP	2
 
@@ -465,7 +512,7 @@ struct md_personality
 	int level;
 	struct list_head list;
 	struct module *owner;
-	void (*make_request)(struct mddev *mddev, struct bio *bio);
+	bool (*make_request)(struct mddev *mddev, struct bio *bio);
 	int (*run)(struct mddev *mddev);
 	void (*free)(struct mddev *mddev, void *priv);
 	void (*status)(struct seq_file *seq, struct mddev *mddev);
@@ -505,6 +552,8 @@ struct md_personality
 	int (*mergeable_bvec)(struct mddev *mddev,
 			      struct bvec_merge_data *bvm,
 			      struct bio_vec *biovec);
+	/* Changes the consistency policy of an active array. */
+	int (*change_consistency_policy)(struct mddev *mddev, const char *buf);
 };
 
 struct md_sysfs_entry {
@@ -600,7 +649,7 @@ extern void md_unregister_thread(struct md_thread **threadp);
 extern void md_wakeup_thread(struct md_thread *thread);
 extern void md_check_recovery(struct mddev *mddev);
 extern void md_reap_sync_thread(struct mddev *mddev);
-extern void md_write_start(struct mddev *mddev, struct bio *bi);
+extern bool md_write_start(struct mddev *mddev, struct bio *bi);
 extern void md_write_end(struct mddev *mddev);
 extern void md_done_sync(struct mddev *mddev, int blocks, int ok);
 extern void md_error(struct mddev *mddev, struct md_rdev *rdev);
@@ -610,7 +659,7 @@ extern int mddev_congested(struct mddev *mddev, int bits);
 extern void md_flush_request(struct mddev *mddev, struct bio *bio);
 extern void md_super_write(struct mddev *mddev, struct md_rdev *rdev,
 			   sector_t sector, int size, struct page *page);
-extern void md_super_wait(struct mddev *mddev);
+extern int md_super_wait(struct mddev *mddev);
 extern int sync_page_io(struct md_rdev *rdev, sector_t sector, int size,
 			struct page *page, int rw, bool metadata_op);
 extern void md_do_sync(struct md_thread *thread);

@@ -110,13 +110,12 @@ void exit_probe_symbol_maps(void)
 static struct symbol *__find_kernel_function_by_name(const char *name,
 						     struct map **mapp)
 {
-	return machine__find_kernel_function_by_name(host_machine, name, mapp,
-						     NULL);
+	return machine__find_kernel_function_by_name(host_machine, name, mapp);
 }
 
 static struct symbol *__find_kernel_function(u64 addr, struct map **mapp)
 {
-	return machine__find_kernel_function(host_machine, addr, mapp, NULL);
+	return machine__find_kernel_function(host_machine, addr, mapp);
 }
 
 static struct ref_reloc_sym *kernel_get_ref_reloc_sym(void)
@@ -125,7 +124,7 @@ static struct ref_reloc_sym *kernel_get_ref_reloc_sym(void)
 	struct kmap *kmap;
 	struct map *map = machine__kernel_map(host_machine);
 
-	if (map__load(map, NULL) < 0)
+	if (map__load(map) < 0)
 		return NULL;
 
 	kmap = map__kmap(map);
@@ -347,9 +346,9 @@ static int kernel_get_module_dso(const char *module, struct dso **pdso)
 	vmlinux_name = symbol_conf.vmlinux_name;
 	dso->load_errno = 0;
 	if (vmlinux_name)
-		ret = dso__load_vmlinux(dso, map, vmlinux_name, false, NULL);
+		ret = dso__load_vmlinux(dso, map, vmlinux_name, false);
 	else
-		ret = dso__load_vmlinux_path(dso, map, NULL);
+		ret = dso__load_vmlinux_path(dso, map);
 found:
 	*pdso = dso;
 	return ret;
@@ -466,7 +465,7 @@ static struct debuginfo *open_debuginfo(const char *module, bool silent)
 		err = kernel_get_module_dso(module, &dso);
 		if (err < 0) {
 			if (!dso || dso->load_errno == 0) {
-				if (!strerror_r(-err, reason, STRERR_BUFSIZE))
+				if (!str_error_r(-err, reason, STRERR_BUFSIZE))
 					strcpy(reason, "(unknown)");
 			} else
 				dso__strerror_load(dso, reason, STRERR_BUFSIZE);
@@ -903,7 +902,7 @@ static int __show_one_line(FILE *fp, int l, bool skip, bool show_num)
 error:
 	if (ferror(fp)) {
 		pr_warning("File read error: %s\n",
-			   strerror_r(errno, sbuf, sizeof(sbuf)));
+			   str_error_r(errno, sbuf, sizeof(sbuf)));
 		return -1;
 	}
 	return 0;
@@ -983,7 +982,7 @@ static int __show_line_range(struct line_range *lr, const char *module,
 	fp = fopen(lr->path, "r");
 	if (fp == NULL) {
 		pr_warning("Failed to open %s: %s\n", lr->path,
-			   strerror_r(errno, sbuf, sizeof(sbuf)));
+			   str_error_r(errno, sbuf, sizeof(sbuf)));
 		return -errno;
 	}
 	/* Skip to starting line number */
@@ -2070,7 +2069,7 @@ static int find_perf_probe_point_from_map(struct probe_trace_point *tp,
 		map = dso__new_map(tp->module);
 		if (!map)
 			goto out;
-		sym = map__find_symbol(map, addr, NULL);
+		sym = map__find_symbol(map, addr);
 	} else {
 		if (tp->symbol && !addr) {
 			if (kernel_get_symbol_address_by_name(tp->symbol,
@@ -2772,7 +2771,7 @@ static int find_probe_functions(struct map *map, char *name,
 	struct symbol *sym;
 	struct rb_node *tmp;
 
-	if (map__load(map, NULL) < 0)
+	if (map__load(map) < 0)
 		return 0;
 
 	map__for_each_symbol(map, sym, tmp) {
@@ -3430,7 +3429,7 @@ int show_available_funcs(const char *target, struct strfilter *_filter,
 		return -EINVAL;
 	}
 
-	ret = map__load(map, NULL);
+	ret = map__load(map);
 	if (ret) {
 		if (ret == -2) {
 			char *str = strfilter__string(_filter);

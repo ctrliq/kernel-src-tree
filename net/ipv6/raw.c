@@ -476,11 +476,11 @@ static int rawv6_recvmsg(struct kiocb *iocb, struct sock *sk,
 	}
 
 	if (skb_csum_unnecessary(skb)) {
-		err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
+		err = skb_copy_datagram_msg(skb, 0, msg, copied);
 	} else if (msg->msg_flags&MSG_TRUNC) {
 		if (__skb_checksum_complete(skb))
 			goto csum_copy_err;
-		err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
+		err = skb_copy_datagram_msg(skb, 0, msg, copied);
 	} else {
 		err = skb_copy_and_csum_datagram_iovec(skb, 0, msg->msg_iov, copied);
 		if (err == -EINVAL)
@@ -636,6 +636,9 @@ static int rawv6_send_hdrinc(struct sock *sk, void *from, int length,
 	iph = ipv6_hdr(skb);
 
 	skb->ip_summed = CHECKSUM_NONE;
+
+	if (flags & MSG_CONFIRM)
+		skb_set_dst_pending_confirm(skb, 1);
 
 	skb->transport_header = skb->network_header;
 	err = memcpy_fromiovecend((void *)iph, from, 0, length);
@@ -908,7 +911,8 @@ out:
 	txopt_put(opt_to_free);
 	return err<0?err:len;
 do_confirm:
-	dst_confirm(dst);
+	if (msg->msg_flags & MSG_PROBE)
+		dst_confirm_neigh(dst, &fl6.daddr);
 	if (!(msg->msg_flags & MSG_PROBE) || len)
 		goto back_from_confirm;
 	err = 0;

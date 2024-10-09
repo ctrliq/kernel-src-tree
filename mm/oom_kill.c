@@ -444,7 +444,7 @@ void oom_kill_process(struct task_struct *p, gfp_t gfp_mask, int order,
 	 * parent.  This attempts to lose the minimal amount of work done while
 	 * still freeing memory.
 	 */
-	read_lock(&tasklist_lock);
+	qread_lock(&tasklist_lock);
 	for_each_thread(p, t) {
 		list_for_each_entry(child, &t->children, sibling) {
 			unsigned int child_points;
@@ -464,7 +464,7 @@ void oom_kill_process(struct task_struct *p, gfp_t gfp_mask, int order,
 			}
 		}
 	}
-	read_unlock(&tasklist_lock);
+	qread_unlock(&tasklist_lock);
 
 	p = find_lock_task_mm(victim);
 	if (!p) {

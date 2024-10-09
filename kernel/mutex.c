@@ -25,7 +25,7 @@
 #include <linux/spinlock.h>
 #include <linux/interrupt.h>
 #include <linux/debug_locks.h>
-#include "mcs_spinlock.h"
+#include <linux/osq_lock.h>
 
 /*
  * In the DEBUG case we are using the "NULL fastpath" for mutexes,
@@ -60,7 +60,7 @@ __mutex_init(struct mutex *lock, const char *name, struct lock_class_key *key)
 	INIT_LIST_HEAD(&lock->wait_list);
 	mutex_clear_owner(lock);
 #ifdef CONFIG_MUTEX_SPIN_ON_OWNER
-	lock->osq = NULL;
+	osq_lock_init(&lock->osq);
 #endif
 
 	debug_mutex_init(lock, name, key);
@@ -260,7 +260,7 @@ static inline int __sched
 __mutex_lock_check_stamp(struct mutex *lock, struct ww_acquire_ctx *ctx)
 {
 	struct ww_mutex *ww = container_of(lock, struct ww_mutex, base);
-	struct ww_acquire_ctx *hold_ctx = ACCESS_ONCE(ww->ctx);
+	struct ww_acquire_ctx *hold_ctx = READ_ONCE(ww->ctx);
 
 	if (!hold_ctx)
 		return 0;
@@ -425,7 +425,7 @@ __mutex_lock_common(struct mutex *lock, long state, unsigned int subclass,
 			 * As such, when deadlock detection needs to be
 			 * performed the optimistic spinning cannot be done.
 			 */
-			if (ACCESS_ONCE(ww->ctx))
+			if (READ_ONCE(ww->ctx))
 				break;
 		}
 
@@ -433,7 +433,7 @@ __mutex_lock_common(struct mutex *lock, long state, unsigned int subclass,
 		 * If there's an owner, wait for it to either
 		 * release the lock or go to sleep.
 		 */
-		owner = ACCESS_ONCE(lock->owner);
+		owner = READ_ONCE(lock->owner);
 		if (owner && !mutex_spin_on_owner(lock, owner))
 			break;
 

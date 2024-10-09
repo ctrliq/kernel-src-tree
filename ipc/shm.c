@@ -1172,7 +1172,7 @@ long do_shmat(int shmid, char __user *shmaddr, int shmflg, ulong *raddr,
 			goto invalid;
 	}
 
-	addr = do_mmap_pgoff(file, addr, size, prot, flags, 0, &populate);
+	addr = do_mmap_pgoff(file, addr, size, prot, flags, 0, &populate, NULL);
 	*raddr = addr;
 	err = 0;
 	if (IS_ERR_VALUE(addr))
@@ -1271,7 +1271,7 @@ SYSCALL_DEFINE1(shmdt, char __user *, shmaddr)
 
 
 			size = file_inode(vma->vm_file)->i_size;
-			do_munmap(mm, vma->vm_start, vma->vm_end - vma->vm_start);
+			do_munmap(mm, vma->vm_start, vma->vm_end - vma->vm_start, NULL);
 			/*
 			 * We discovered the size of the shm segment, so
 			 * break out of here and fall through to the next
@@ -1298,7 +1298,7 @@ SYSCALL_DEFINE1(shmdt, char __user *, shmaddr)
 		if ((vma->vm_ops == &shm_vm_ops) &&
 			(vma->vm_start - addr)/PAGE_SIZE == vma->vm_pgoff)
 
-			do_munmap(mm, vma->vm_start, vma->vm_end - vma->vm_start);
+			do_munmap(mm, vma->vm_start, vma->vm_end - vma->vm_start, NULL);
 		vma = next;
 	}
 
@@ -1306,7 +1306,7 @@ SYSCALL_DEFINE1(shmdt, char __user *, shmaddr)
 	/* under NOMMU conditions, the exact address to be destroyed must be
 	 * given */
 	if (vma && vma->vm_start == addr && vma->vm_ops == &shm_vm_ops) {
-		do_munmap(mm, vma->vm_start, vma->vm_end - vma->vm_start);
+		do_munmap(mm, vma->vm_start, vma->vm_end - vma->vm_start, NULL);
 		retval = 0;
 	}
 

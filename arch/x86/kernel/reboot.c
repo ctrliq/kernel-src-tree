@@ -637,12 +637,28 @@ static void native_machine_emergency_restart(void)
 
 void native_machine_shutdown(void)
 {
-	/* Stop the cpus and apics */
 #ifdef CONFIG_SMP
-
 	/* The boot cpu is always logical cpu 0 */
 	int reboot_cpu_id = 0;
+#endif
 
+	/* Stop the cpus and apics */
+#ifdef CONFIG_X86_IO_APIC
+	/*
+	 * Disabling IO APIC before local APIC is a workaround for
+	 * erratum AVR31 in "Intel Atom Processor C2000 Product Family
+	 * Specification Update". In this situation, interrupts that target
+	 * a Logical Processor whose Local APIC is either in the process of
+	 * being hardware disabled or software disabled are neither delivered
+	 * nor discarded. When this erratum occurs, the processor may hang.
+	 *
+	 * Even without the erratum, it still makes sense to quiet IO APIC
+	 * before disabling Local APIC.
+	 */
+	disable_IO_APIC();
+#endif
+
+#ifdef CONFIG_SMP
 	/* See if there has been given a command line override */
 	if ((reboot_cpu != -1) && (reboot_cpu < nr_cpu_ids) &&
 		cpu_online(reboot_cpu))
@@ -665,10 +681,6 @@ void native_machine_shutdown(void)
 #endif
 
 	lapic_shutdown();
-
-#ifdef CONFIG_X86_IO_APIC
-	disable_IO_APIC();
-#endif
 
 #ifdef CONFIG_HPET_TIMER
 	hpet_disable();
@@ -721,7 +733,7 @@ struct machine_ops machine_ops = {
 	.emergency_restart = native_machine_emergency_restart,
 	.restart = native_machine_restart,
 	.halt = native_machine_halt,
-#ifdef CONFIG_KEXEC
+#ifdef CONFIG_KEXEC_CORE
 	.crash_shutdown = native_machine_crash_shutdown,
 #endif
 };
@@ -751,7 +763,7 @@ void machine_halt(void)
 	machine_ops.halt();
 }
 
-#ifdef CONFIG_KEXEC
+#ifdef CONFIG_KEXEC_CORE
 void machine_crash_shutdown(struct pt_regs *regs)
 {
 	machine_ops.crash_shutdown(regs);
@@ -759,10 +771,11 @@ void machine_crash_shutdown(struct pt_regs *regs)
 #endif
 
 
+/* This is the CPU performing the emergency shutdown work. */
+int crashing_cpu = -1;
+
 #if defined(CONFIG_SMP)
 
-/* This keeps a track of which one is crashing cpu. */
-static int crashing_cpu;
 static nmi_shootdown_cb shootdown_callback;
 
 static atomic_t waiting_for_crash_ipi;

@@ -435,18 +435,19 @@ static int qlcnic_fdb_add(struct ndmsg *ndm, struct nlattr *tb[],
 
 static int qlcnic_fdb_dump(struct sk_buff *skb, struct netlink_callback *ncb,
 			struct net_device *netdev,
-			struct net_device *filter_dev, int idx)
+			struct net_device *filter_dev, int *idx)
 {
 	struct qlcnic_adapter *adapter = netdev_priv(netdev);
+	int err = 0;
 
 	if (!adapter->fdb_mac_learn)
 		return ndo_dflt_fdb_dump(skb, ncb, netdev, filter_dev, idx);
 
 	if ((adapter->flags & QLCNIC_ESWITCH_ENABLED) ||
 	    qlcnic_sriov_check(adapter))
-		idx = ndo_dflt_fdb_dump(skb, ncb, netdev, filter_dev, idx);
+		err = ndo_dflt_fdb_dump(skb, ncb, netdev, filter_dev, idx);
 
-	return idx;
+	return err;
 }
 
 static void qlcnic_82xx_cancel_idc_work(struct qlcnic_adapter *adapter)
@@ -553,7 +554,7 @@ static const struct net_device_ops qlcnic_netdev_ops = {
 	.ndo_set_vf_mac		= qlcnic_sriov_set_vf_mac,
 	.ndo_set_vf_rate	= qlcnic_sriov_set_vf_tx_rate,
 	.ndo_get_vf_config	= qlcnic_sriov_get_vf_config,
-	.ndo_set_vf_vlan	= qlcnic_sriov_set_vf_vlan,
+	.extended.ndo_set_vf_vlan	= qlcnic_sriov_set_vf_vlan,
 	.ndo_set_vf_spoofchk	= qlcnic_sriov_set_vf_spoofchk,
 #endif
 };
@@ -4197,7 +4198,7 @@ void qlcnic_restore_indev_addr(struct net_device *netdev, unsigned long event)
 
 	rcu_read_lock();
 	for_each_set_bit(vid, adapter->vlans, VLAN_N_VID) {
-		dev = __vlan_find_dev_deep(netdev, htons(ETH_P_8021Q), vid);
+		dev = __vlan_find_dev_deep_rcu(netdev, htons(ETH_P_8021Q), vid);
 		if (!dev)
 			continue;
 		qlcnic_config_indev_addr(adapter, dev, event);

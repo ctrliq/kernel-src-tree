@@ -31,6 +31,7 @@
 #include <asm/div64.h>
 #include <asm/msr.h>
 #include <asm/cpu_device_id.h>
+#include <asm/intel-family.h>
 
 #define ATOM_RATIOS		0x66a
 #define ATOM_VIDS		0x66b
@@ -534,6 +535,25 @@ static void intel_pstate_hwp_enable(struct cpudata *cpudata)
 	wrmsrl_on_cpu(cpudata->cpu, MSR_PM_ENABLE, 0x1);
 }
 
+#define MSR_IA32_POWER_CTL_BIT_EE	19
+
+/* Disable energy efficiency optimization */
+static void intel_pstate_disable_ee(int cpu)
+{
+	u64 power_ctl;
+	int ret;
+
+	ret = rdmsrl_on_cpu(cpu, MSR_IA32_POWER_CTL, &power_ctl);
+	if (ret)
+		return;
+
+	if (!(power_ctl & BIT(MSR_IA32_POWER_CTL_BIT_EE))) {
+		pr_info("Disabling energy efficiency optimization\n");
+		power_ctl |= BIT(MSR_IA32_POWER_CTL_BIT_EE);
+		wrmsrl_on_cpu(cpu, MSR_IA32_POWER_CTL, power_ctl);
+	}
+}
+
 static int atom_get_min_pstate(void)
 {
 	u64 value;
@@ -1002,28 +1022,34 @@ static void intel_pstate_timer_func(unsigned long __data)
 			(unsigned long)&policy }
 
 static const struct x86_cpu_id intel_pstate_cpu_ids[] = {
-	ICPU(0x2a, core_params),
-	ICPU(0x2d, core_params),
-	ICPU(0x37, atom_params),
-	ICPU(0x3a, core_params),
-	ICPU(0x3c, core_params),
-	ICPU(0x3d, core_params),
-	ICPU(0x3e, core_params),
-	ICPU(0x3f, core_params),
-	ICPU(0x45, core_params),
-	ICPU(0x46, core_params),
-	ICPU(0x47, core_params),
-	ICPU(0x4e, core_params),
-	ICPU(0x4f, core_params),
-	ICPU(0x5e, core_params),
-	ICPU(0x56, core_params),
-	ICPU(0x57, knl_params),
+	ICPU(INTEL_FAM6_SANDYBRIDGE, 		core_params),
+	ICPU(INTEL_FAM6_SANDYBRIDGE_X,		core_params),
+	ICPU(INTEL_FAM6_ATOM_SILVERMONT1,	atom_params),
+	ICPU(INTEL_FAM6_IVYBRIDGE,		core_params),
+	ICPU(INTEL_FAM6_HASWELL_CORE,		core_params),
+	ICPU(INTEL_FAM6_BROADWELL_CORE,		core_params),
+	ICPU(INTEL_FAM6_IVYBRIDGE_X,		core_params),
+	ICPU(INTEL_FAM6_HASWELL_X,		core_params),
+	ICPU(INTEL_FAM6_HASWELL_ULT,		core_params),
+	ICPU(INTEL_FAM6_HASWELL_GT3E,		core_params),
+	ICPU(INTEL_FAM6_BROADWELL_GT3E,		core_params),
+	ICPU(INTEL_FAM6_SKYLAKE_MOBILE,		core_params),
+	ICPU(INTEL_FAM6_BROADWELL_X,		core_params),
+	ICPU(INTEL_FAM6_SKYLAKE_DESKTOP,	core_params),
+	ICPU(INTEL_FAM6_BROADWELL_XEON_D,	core_params),
+	ICPU(INTEL_FAM6_XEON_PHI_KNL,		knl_params),
+	ICPU(INTEL_FAM6_XEON_PHI_KNM,		knl_params),
 	{}
 };
 MODULE_DEVICE_TABLE(x86cpu, intel_pstate_cpu_ids);
 
 static const struct x86_cpu_id intel_pstate_cpu_oob_ids[] = {
-	ICPU(0x56, core_params),
+	ICPU(INTEL_FAM6_BROADWELL_XEON_D, core_params),
+	{}
+};
+
+static const struct x86_cpu_id intel_pstate_cpu_ee_disable_ids[] = {
+	ICPU(INTEL_FAM6_KABYLAKE_DESKTOP, core_params),
 	{}
 };
 
@@ -1041,8 +1067,15 @@ static int intel_pstate_init_cpu(unsigned int cpunum)
 
 	cpu->cpu = cpunum;
 
-	if (hwp_active)
+	if (hwp_active) {
+		const struct x86_cpu_id *id;
+
+		id = x86_match_cpu(intel_pstate_cpu_ee_disable_ids);
+		if (id)
+			intel_pstate_disable_ee(cpunum);
+
 		intel_pstate_hwp_enable(cpu);
+	}
 
 	intel_pstate_get_cpu_pstates(cpu);
 
@@ -1082,6 +1115,9 @@ static int intel_pstate_set_policy(struct cpufreq_policy *policy)
 	if (!policy->cpuinfo.max_freq)
 		return -ENODEV;
 
+	pr_debug("set_policy cpuinfo.max %u policy->max %u\n",
+		 policy->cpuinfo.max_freq, policy->max);
+
 	if (policy->policy == CPUFREQ_POLICY_PERFORMANCE &&
 	    policy->max >= policy->cpuinfo.max_freq) {
 		pr_debug("intel_pstate: set performance\n");
@@ -1108,7 +1144,6 @@ static int intel_pstate_set_policy(struct cpufreq_policy *policy)
 				   limits->max_sysfs_pct);
 	limits->max_perf_pct = max(limits->min_policy_pct,
 				   limits->max_perf_pct);
-	limits->max_perf = round_up(limits->max_perf, FRAC_BITS);
 
 	/* Make sure min_perf_pct <= max_perf_pct */
 	limits->min_perf_pct = min(limits->max_perf_pct, limits->min_perf_pct);
@@ -1117,6 +1152,7 @@ static int intel_pstate_set_policy(struct cpufreq_policy *policy)
 				  int_tofp(100));
 	limits->max_perf = div_fp(int_tofp(limits->max_perf_pct),
 				  int_tofp(100));
+	limits->max_perf = round_up(limits->max_perf, FRAC_BITS);
 
 	if (hwp_active)
 		intel_pstate_hwp_set(policy->cpus);

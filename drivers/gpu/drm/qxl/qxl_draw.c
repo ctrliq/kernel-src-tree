@@ -57,11 +57,8 @@ static struct qxl_rect *drawable_set_clipping(struct qxl_device *qdev,
 static int
 alloc_drawable(struct qxl_device *qdev, struct qxl_release **release)
 {
-	int ret;
-	ret = qxl_alloc_release_reserved(qdev, sizeof(struct qxl_drawable),
-					 QXL_RELEASE_DRAWABLE, release,
-					 NULL);
-	return ret;
+	return qxl_alloc_release_reserved(qdev, sizeof(struct qxl_drawable),
+					  QXL_RELEASE_DRAWABLE, release, NULL);
 }
 
 static void
@@ -135,6 +132,8 @@ static int qxl_palette_create_1bit(struct qxl_bo *palette_bo,
 				 * correctly globaly, since that would require
 				 * tracking all of our palettes. */
 	ret = qxl_bo_kmap(palette_bo, (void **)&pal);
+	if (ret)
+		return ret;
 	pal->num_ents = 2;
 	pal->unique = unique++;
 	if (visual == FB_VISUAL_TRUECOLOR || visual == FB_VISUAL_DIRECTCOLOR) {

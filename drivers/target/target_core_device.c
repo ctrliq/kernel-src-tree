@@ -49,7 +49,6 @@
 
 DEFINE_MUTEX(g_device_mutex);
 LIST_HEAD(g_device_list);
-static DEFINE_IDR(devices_idr);
 
 static struct se_hba *lun0_hba;
 /* not static, needed by tpg.c */
@@ -528,7 +527,8 @@ static void core_export_port(
 	list_add_tail(&port->sep_list, &dev->dev_sep_list);
 	spin_unlock(&dev->se_port_lock);
 
-	if (!(dev->transport->transport_flags & TRANSPORT_FLAG_PASSTHROUGH) &&
+	if (!(dev->transport->transport_flags &
+	      TRANSPORT_FLAG_PASSTHROUGH_ALUA) &&
 	    !(dev->se_hba->hba_flags & HBA_FLAGS_INTERNAL_USE)) {
 		tg_pt_gp_mem = core_alua_allocate_tg_pt_gp_mem(port);
 		if (IS_ERR(tg_pt_gp_mem) || !tg_pt_gp_mem) {
@@ -1550,7 +1550,7 @@ struct se_device *target_alloc_device(struct se_hba *hba, const char *name)
 int target_configure_device(struct se_device *dev)
 {
 	struct se_hba *hba = dev->se_hba;
-	int ret, id;
+	int ret;
 
 	if (dev->dev_flags & DF_CONFIGURED) {
 		pr_err("se_dev->se_dev_ptr already set for storage"
@@ -1558,26 +1558,9 @@ int target_configure_device(struct se_device *dev)
 		return -EEXIST;
 	}
 
-	/*
-	 * Add early so modules like tcmu can use during its
-	 * configuration.
-	 */
-	mutex_lock(&g_device_mutex);
-	/*
-	 * Use cyclic to try and avoid collisions with devices
-	 * that were recently removed.
-	 */
-	id = idr_alloc_cyclic(&devices_idr, dev, 0, INT_MAX, GFP_KERNEL);
-	mutex_unlock(&g_device_mutex);
-	if (id < 0) {
-		ret = -ENOMEM;
-		goto out;
-	}
-	dev->dev_index = id;
-
 	ret = dev->transport->configure_device(dev);
 	if (ret)
-		goto out_free_index;
+		goto out;
 	/*
 	 * XXX: there is not much point to have two different values here..
 	 */
@@ -1592,11 +1575,12 @@ int target_configure_device(struct se_device *dev)
 					 dev->dev_attrib.hw_block_size);
 	dev->dev_attrib.optimal_sectors = dev->dev_attrib.hw_max_sectors;
 
+	dev->dev_index = scsi_get_new_index(SCSI_DEVICE_INDEX);
 	dev->creation_time = get_jiffies_64();
 
 	ret = core_setup_alua(dev);
 	if (ret)
-		goto out_free_index;
+		goto out;
 
 	/*
 	 * Startup the struct se_device processing thread
@@ -1644,10 +1628,6 @@ int target_configure_device(struct se_device *dev)
 
 out_free_alua:
 	core_alua_free_lu_gp_mem(dev);
-out_free_index:
-	mutex_lock(&g_device_mutex);
-	idr_remove(&devices_idr, dev->dev_index);
-	mutex_unlock(&g_device_mutex);
 out:
 	se_release_vpd_for_dev(dev);
 	return ret;
@@ -1662,8 +1642,10 @@ void target_free_device(struct se_device *dev)
 	if (dev->dev_flags & DF_CONFIGURED) {
 		destroy_workqueue(dev->tmr_wq);
 
+		if (dev->transport->destroy_device)
+			dev->transport->destroy_device(dev);
+
 		mutex_lock(&g_device_mutex);
-		idr_remove(&devices_idr, dev->dev_index);
 		list_del(&dev->g_dev_node);
 		mutex_unlock(&g_device_mutex);
 

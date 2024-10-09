@@ -81,17 +81,25 @@ static int inotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)
 	struct inode *inode;
 	int ret = 0;
 
-	if (!(mark->flags & (FSNOTIFY_MARK_FLAG_ALIVE | FSNOTIFY_MARK_FLAG_INODE)))
+	if (!(mark->flags & FSNOTIFY_MARK_FLAG_ALIVE) ||
+	    !(mark->flags & FSNOTIFY_MARK_FLAG_INODE))
 		return 0;
 
 	inode_mark = container_of(mark, struct inotify_inode_mark, fsn_mark);
-	inode = igrab(mark->i.inode);
+	inode = igrab(mark->inode);
 	if (inode) {
+		/*
+		 * IN_ALL_EVENTS represents all of the mask bits
+		 * that we expose to userspace.  There is at
+		 * least one bit (FS_EVENT_ON_CHILD) which is
+		 * used only internally to the kernel.
+		 */
+		u32 mask = mark->mask & IN_ALL_EVENTS;
 		ret = seq_printf(m, "inotify wd:%x ino:%lx sdev:%x "
 				 "mask:%x ignored_mask:%x ",
 				 inode_mark->wd, inode->i_ino,
 				 inode->i_sb->s_dev,
-				 mark->mask, mark->ignored_mask);
+				 mask, mark->ignored_mask);
 		ret |= show_mark_fhandle(m, inode);
 		ret |= seq_putc(m, '\n');
 		iput(inode);
@@ -122,7 +130,7 @@ static int fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)
 		mflags |= FAN_MARK_IGNORED_SURV_MODIFY;
 
 	if (mark->flags & FSNOTIFY_MARK_FLAG_INODE) {
-		inode = igrab(mark->i.inode);
+		inode = igrab(mark->inode);
 		if (!inode)
 			goto out;
 		ret = seq_printf(m, "fanotify ino:%lx sdev:%x "
@@ -133,7 +141,7 @@ static int fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)
 		ret |= seq_putc(m, '\n');
 		iput(inode);
 	} else if (mark->flags & FSNOTIFY_MARK_FLAG_VFSMOUNT) {
-		struct mount *mnt = real_mount(mark->m.mnt);
+		struct mount *mnt = real_mount(mark->mnt);
 
 		ret = seq_printf(m, "fanotify mnt_id:%x mflags:%x mask:%x "
 				 "ignored_mask:%x\n", mnt->mnt_id, mflags,

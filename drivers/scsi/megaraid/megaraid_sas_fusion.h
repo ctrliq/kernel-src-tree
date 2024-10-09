@@ -59,6 +59,8 @@
 #define	MR_RL_FLAGS_GRANT_DESTINATION_CPU1	    0x10
 #define	MR_RL_FLAGS_GRANT_DESTINATION_CUDA	    0x80
 #define MR_RL_FLAGS_SEQ_NUM_ENABLE		    0x8
+#define MR_RL_WRITE_THROUGH_MODE		    0x00
+#define MR_RL_WRITE_BACK_MODE			    0x01
 
 /* T10 PI defines */
 #define MR_PROT_INFO_TYPE_CONTROLLER                0x8
@@ -81,6 +83,11 @@
 enum MR_RAID_FLAGS_IO_SUB_TYPE {
 	MR_RAID_FLAGS_IO_SUB_TYPE_NONE = 0,
 	MR_RAID_FLAGS_IO_SUB_TYPE_SYSTEM_PD = 1,
+	MR_RAID_FLAGS_IO_SUB_TYPE_RMW_DATA     = 2,
+	MR_RAID_FLAGS_IO_SUB_TYPE_RMW_P        = 3,
+	MR_RAID_FLAGS_IO_SUB_TYPE_RMW_Q        = 4,
+	MR_RAID_FLAGS_IO_SUB_TYPE_CACHE_BYPASS = 6,
+	MR_RAID_FLAGS_IO_SUB_TYPE_LDIO_BW_LIMIT = 7
 };
 
 /*
@@ -110,29 +117,29 @@ enum MR_FUSION_ADAPTER_TYPE {
 
 struct RAID_CONTEXT {
 #if   defined(__BIG_ENDIAN_BITFIELD)
-	u8	nseg:4;
-	u8	Type:4;
+	u8 nseg:4;
+	u8 type:4;
 #else
-	u8	Type:4;
-	u8	nseg:4;
+	u8 type:4;
+	u8 nseg:4;
 #endif
-	u8	resvd0;
-	__le16	timeoutValue;
-	u8      regLockFlags;
-	u8      resvd1;
-	__le16	VirtualDiskTgtId;
-	__le64	regLockRowLBA;
-	__le32	regLockLength;
-	__le16	nextLMId;
-	u8      exStatus;
-	u8      status;
-	u8      RAIDFlags;
-	u8      numSGE;
-	__le16	configSeqNum;
-	u8      spanArm;
-	u8      priority;
-	u8	numSGEExt;
-	u8      resvd2;
+	u8 resvd0;
+	__le16 timeout_value;
+	u8 reg_lock_flags;
+	u8 resvd1;
+	__le16 virtual_disk_tgt_id;
+	__le64 reg_lock_row_lba;
+	__le32 reg_lock_length;
+	__le16 next_lmid;
+	u8 ex_status;
+	u8 status;
+	u8 raid_flags;
+	u8 num_sge;
+	__le16 config_seq_num;
+	u8 span_arm;
+	u8 priority;
+	u8 num_sge_ext;
+	u8 resvd2;
 };
 
 /*
@@ -141,44 +148,13 @@ struct RAID_CONTEXT {
  * starts in MPT IO Frames
  */
 struct RAID_CONTEXT_G35 {
-#if   defined(__BIG_ENDIAN_BITFIELD)
-	u16	resvd0:8;
-	u16	nseg:4;
-	u16	type:4;
-#else
-	u16	type:4;		    /* 0x00 */
-	u16	nseg:4;		    /* 0x00 */
-	u16 resvd0:8;
-#endif
+	#define RAID_CONTEXT_NSEG_MASK	0x00F0
+	#define RAID_CONTEXT_NSEG_SHIFT	4
+	#define RAID_CONTEXT_TYPE_MASK	0x000F
+	#define RAID_CONTEXT_TYPE_SHIFT	0
+	u16		nseg_type;
 	u16 timeout_value; /* 0x02 -0x03 */
-	union {
-		struct {
-#if	defined(__BIG_ENDIAN_BITFIELD)
-		u16	set_divert:4;
-		u16	cpu_sel:4;
-		u16	log:1;
-		u16	rw:1;
-		u16	sbs:1;
-		u16	sqn:1;
-		u16	fwn:1;
-		u16	c2f:1;
-		u16	sld:1;
-		u16	reserved:1;
-#else
-		u16	reserved:1;
-		u16	sld:1;
-		u16	c2f:1;
-		u16	fwn:1;
-		u16	sqn:1;
-		u16	sbs:1;
-		u16	rw:1;
-		u16	log:1;
-		u16	cpu_sel:4;
-		u16	set_divert:4;
-#endif
-			} bits;
-		u16 s;
-	} routing_flags;	/* 0x04 -0x05 routing flags */
+	u16		routing_flags;	// 0x04 -0x05 routing flags
 	u16 virtual_disk_tgt_id;   /* 0x06 -0x07 */
 	u64 reg_lock_row_lba;      /* 0x08 - 0x0F */
 	u32 reg_lock_length;      /* 0x10 - 0x13 */
@@ -188,22 +164,82 @@ struct RAID_CONTEXT_G35 {
 	} smid;
 	u8 ex_status;       /* 0x16 : OUT */
 	u8 status;          /* 0x17 status */
-	u8 RAIDFlags;		/* 0x18 resvd[7:6], ioSubType[5:4],
+	u8 raid_flags;		/* 0x18 resvd[7:6], ioSubType[5:4],
 				 * resvd[3:1], preferredCpu[0]
 				 */
 	u8 span_arm;            /* 0x1C span[7:5], arm[4:0] */
 	u16	config_seq_num;           /* 0x1A -0x1B */
+	union {
+		/*
+		 * Bit format:
+		 *	 ---------------------------------
+		 *	 | 7 | 6 | 5 | 4 | 3 | 2 | 1 | 0 |
+		 *	 ---------------------------------
+		 * Byte0 |    numSGE[7]- numSGE[0]	 |
+		 *	 ---------------------------------
+		 * Byte1 |SD | resvd     | numSGE 8-11   |
+		 *        --------------------------------
+		 */
+		#define NUM_SGE_MASK_LOWER	0xFF
+		#define NUM_SGE_MASK_UPPER	0x0F
+		#define NUM_SGE_SHIFT_UPPER	8
+		#define STREAM_DETECT_SHIFT	7
+		#define STREAM_DETECT_MASK	0x80
+		struct {
 #if   defined(__BIG_ENDIAN_BITFIELD) /* 0x1C - 0x1D */
-	u16 stream_detected:1;
-	u16 reserved:3;
-	u16 num_sge:12;
+			u16 stream_detected:1;
+			u16 reserved:3;
+			u16 num_sge:12;
 #else
-	u16 num_sge:12;
-	u16 reserved:3;
-	u16 stream_detected:1;
+			u16 num_sge:12;
+			u16 reserved:3;
+			u16 stream_detected:1;
 #endif
+		} bits;
+		u8 bytes[2];
+	} u;
 	u8 resvd2[2];          /* 0x1E-0x1F */
 };
+
+#define MR_RAID_CTX_ROUTINGFLAGS_SLD_SHIFT	1
+#define MR_RAID_CTX_ROUTINGFLAGS_C2D_SHIFT	2
+#define MR_RAID_CTX_ROUTINGFLAGS_FWD_SHIFT	3
+#define MR_RAID_CTX_ROUTINGFLAGS_SQN_SHIFT	4
+#define MR_RAID_CTX_ROUTINGFLAGS_SBS_SHIFT	5
+#define MR_RAID_CTX_ROUTINGFLAGS_RW_SHIFT	6
+#define MR_RAID_CTX_ROUTINGFLAGS_LOG_SHIFT	7
+#define MR_RAID_CTX_ROUTINGFLAGS_CPUSEL_SHIFT	8
+#define MR_RAID_CTX_ROUTINGFLAGS_CPUSEL_MASK	0x0F00
+#define MR_RAID_CTX_ROUTINGFLAGS_SETDIVERT_SHIFT	12
+#define MR_RAID_CTX_ROUTINGFLAGS_SETDIVERT_MASK	0xF000
+
+static inline void set_num_sge(struct RAID_CONTEXT_G35 *rctx_g35,
+			       u16 sge_count)
+{
+	rctx_g35->u.bytes[0] = (u8)(sge_count & NUM_SGE_MASK_LOWER);
+	rctx_g35->u.bytes[1] |= (u8)((sge_count >> NUM_SGE_SHIFT_UPPER)
+							& NUM_SGE_MASK_UPPER);
+}
+
+static inline u16 get_num_sge(struct RAID_CONTEXT_G35 *rctx_g35)
+{
+	u16 sge_count;
+
+	sge_count = (u16)(((rctx_g35->u.bytes[1] & NUM_SGE_MASK_UPPER)
+			<< NUM_SGE_SHIFT_UPPER) | (rctx_g35->u.bytes[0]));
+	return sge_count;
+}
+
+#define SET_STREAM_DETECTED(rctx_g35) \
+	(rctx_g35.u.bytes[1] |= STREAM_DETECT_MASK)
+
+#define CLEAR_STREAM_DETECTED(rctx_g35) \
+	(rctx_g35.u.bytes[1] &= ~(STREAM_DETECT_MASK))
+
+static inline bool is_stream_detected(struct RAID_CONTEXT_G35 *rctx_g35)
+{
+	return ((rctx_g35->u.bytes[1] & STREAM_DETECT_MASK));
+}
 
 union RAID_CONTEXT_UNION {
 	struct RAID_CONTEXT raid_context;
@@ -650,7 +686,7 @@ struct MPI2_IOC_INIT_REQUEST {
 	__le16			HeaderVersion;                  /* 0x0E */
 	u32                     Reserved5;                      /* 0x10 */
 	__le16			Reserved6;                      /* 0x14 */
-	u8                      Reserved7;                      /* 0x16 */
+	u8                      HostPageSize;                   /* 0x16 */
 	u8                      HostMSIxVectors;                /* 0x17 */
 	__le16			Reserved8;                      /* 0x18 */
 	__le16			SystemRequestFrameSize;         /* 0x1A */
@@ -666,6 +702,7 @@ struct MPI2_IOC_INIT_REQUEST {
 
 /* mrpriv defines */
 #define MR_PD_INVALID 0xFFFF
+#define MR_DEVHANDLE_INVALID 0xFFFF
 #define MAX_SPAN_DEPTH 8
 #define MAX_QUAD_DEPTH	MAX_SPAN_DEPTH
 #define MAX_RAIDMAP_SPAN_DEPTH (MAX_SPAN_DEPTH)
@@ -673,16 +710,20 @@ struct MPI2_IOC_INIT_REQUEST {
 #define MAX_RAIDMAP_ROW_SIZE (MAX_ROW_SIZE)
 #define MAX_LOGICAL_DRIVES 64
 #define MAX_LOGICAL_DRIVES_EXT 256
+#define MAX_LOGICAL_DRIVES_DYN 512
 #define MAX_RAIDMAP_LOGICAL_DRIVES (MAX_LOGICAL_DRIVES)
 #define MAX_RAIDMAP_VIEWS (MAX_LOGICAL_DRIVES)
 #define MAX_ARRAYS 128
 #define MAX_RAIDMAP_ARRAYS (MAX_ARRAYS)
 #define MAX_ARRAYS_EXT	256
 #define MAX_API_ARRAYS_EXT (MAX_ARRAYS_EXT)
+#define MAX_API_ARRAYS_DYN 512
 #define MAX_PHYSICAL_DEVICES 256
 #define MAX_RAIDMAP_PHYSICAL_DEVICES (MAX_PHYSICAL_DEVICES)
+#define MAX_RAIDMAP_PHYSICAL_DEVICES_DYN 512
 #define MR_DCMD_LD_MAP_GET_INFO             0x0300e101
 #define MR_DCMD_SYSTEM_PD_MAP_GET_INFO      0x0200e102
+#define MR_DCMD_DRV_GET_TARGET_PROP         0x0200e103
 #define MR_DCMD_CTRL_SHARED_HOST_MEM_ALLOC  0x010e8485   /* SR-IOV HB alloc*/
 #define MR_DCMD_LD_VF_MAP_GET_ALL_LDS_111   0x03200200
 #define MR_DCMD_LD_VF_MAP_GET_ALL_LDS       0x03150200
@@ -690,7 +731,7 @@ struct MPI2_IOC_INIT_REQUEST {
 struct MR_DEV_HANDLE_INFO {
 	__le16	curDevHdl;
 	u8      validHandles;
-	u8      reserved;
+	u8      interfaceType;
 	__le16	devHandle[2];
 };
 
@@ -727,12 +768,56 @@ struct MR_SPAN_BLOCK_INFO {
 	struct MR_SPAN_INFO block_span_info;
 };
 
+#define MR_RAID_CTX_CPUSEL_0		0
+#define MR_RAID_CTX_CPUSEL_1		1
+#define MR_RAID_CTX_CPUSEL_2		2
+#define MR_RAID_CTX_CPUSEL_3		3
+#define MR_RAID_CTX_CPUSEL_FCFS		0xF
+
+struct MR_CPU_AFFINITY_MASK {
+	union {
+		struct {
+#ifndef MFI_BIG_ENDIAN
+		u8 hw_path:1;
+		u8 cpu0:1;
+		u8 cpu1:1;
+		u8 cpu2:1;
+		u8 cpu3:1;
+		u8 reserved:3;
+#else
+		u8 reserved:3;
+		u8 cpu3:1;
+		u8 cpu2:1;
+		u8 cpu1:1;
+		u8 cpu0:1;
+		u8 hw_path:1;
+#endif
+		};
+		u8 core_mask;
+	};
+};
+
+struct MR_IO_AFFINITY {
+	union {
+		struct {
+			struct MR_CPU_AFFINITY_MASK pdRead;
+			struct MR_CPU_AFFINITY_MASK pdWrite;
+			struct MR_CPU_AFFINITY_MASK ldRead;
+			struct MR_CPU_AFFINITY_MASK ldWrite;
+			};
+		u32 word;
+		};
+	u8 maxCores;    /* Total cores + HW Path in ROC */
+	u8 reserved[3];
+};
+
 struct MR_LD_RAID {
 	struct {
 #if   defined(__BIG_ENDIAN_BITFIELD)
-		u32     reserved4:3;
-		u32     fp_cache_bypass_capable:1;
-		u32     fp_rmw_capable:1;
+		u32 reserved4:2;
+		u32 fp_cache_bypass_capable:1;
+		u32 fp_rmw_capable:1;
+		u32 disable_coalescing:1;
 		u32     fpBypassRegionLock:1;
 		u32     tmCapable:1;
 		u32	fpNonRWCapable:1;
@@ -760,9 +845,10 @@ struct MR_LD_RAID {
 		u32	fpNonRWCapable:1;
 		u32     tmCapable:1;
 		u32     fpBypassRegionLock:1;
-		u32     fp_rmw_capable:1;
-		u32     fp_cache_bypass_capable:1;
-		u32     reserved4:3;
+		u32 disable_coalescing:1;
+		u32 fp_rmw_capable:1;
+		u32 fp_cache_bypass_capable:1;
+		u32 reserved4:2;
 #endif
 	} capability;
 	__le32     reserved6;
@@ -789,7 +875,36 @@ struct MR_LD_RAID {
 
 	u8	LUN[8]; /* 0x24 8 byte LUN field used for SCSI IO's */
 	u8	fpIoTimeoutForLd;/*0x2C timeout value used by driver in FP IO*/
-	u8      reserved3[0x80-0x2D]; /* 0x2D */
+	/* Ox2D This LD accept priority boost of this type */
+	u8 ld_accept_priority_type;
+	u8 reserved2[2];	        /* 0x2E - 0x2F */
+	/* 0x30 - 0x33, Logical block size for the LD */
+	u32 logical_block_length;
+	struct {
+#ifndef MFI_BIG_ENDIAN
+	/* 0x34, P_I_EXPONENT from READ CAPACITY 16 */
+	u32 ld_pi_exp:4;
+	/* 0x34, LOGICAL BLOCKS PER PHYSICAL
+	 *  BLOCK EXPONENT from READ CAPACITY 16
+	 */
+	u32 ld_logical_block_exp:4;
+	u32 reserved1:24;           /* 0x34 */
+#else
+	u32 reserved1:24;           /* 0x34 */
+	/* 0x34, LOGICAL BLOCKS PER PHYSICAL
+	 *  BLOCK EXPONENT from READ CAPACITY 16
+	 */
+	u32 ld_logical_block_exp:4;
+	/* 0x34, P_I_EXPONENT from READ CAPACITY 16 */
+	u32 ld_pi_exp:4;
+#endif
+	};                               /* 0x34 - 0x37 */
+	 /* 0x38 - 0x3f, This will determine which
+	  *  core will process LD IO and PD IO.
+	  */
+	struct MR_IO_AFFINITY cpuAffinity;
+     /* Bit definiations are specified by MR_IO_AFFINITY */
+	u8 reserved3[0x80 - 0x40];    /* 0x40 - 0x7f */
 };
 
 struct MR_LD_SPAN_MAP {
@@ -828,6 +943,7 @@ struct IO_REQUEST_INFO {
 	u16 ldTgtId;
 	u8 isRead;
 	__le16 devHandle;
+	u8 pd_interface;
 	u64 pdBlock;
 	u8 fpOkForIo;
 	u8 IoforUnevenSpan;
@@ -837,7 +953,6 @@ struct IO_REQUEST_INFO {
 	u8  span_arm;	/* span[7:5], arm[4:0] */
 	u8  pd_after_lb;
 	u16 r1_alt_dev_handle; /* raid 1/10 only */
-	bool is_raid_1_fp_write;
 	bool ra_capable;
 };
 
@@ -847,6 +962,91 @@ struct MR_LD_TARGET_SYNC {
 	__le16 seqNum;
 };
 
+/*
+ * RAID Map descriptor Types.
+ * Each element should uniquely idetify one data structure in the RAID map
+ */
+enum MR_RAID_MAP_DESC_TYPE {
+	/* MR_DEV_HANDLE_INFO data */
+	RAID_MAP_DESC_TYPE_DEVHDL_INFO    = 0x0,
+	/* target to Ld num Index map */
+	RAID_MAP_DESC_TYPE_TGTID_INFO     = 0x1,
+	/* MR_ARRAY_INFO data */
+	RAID_MAP_DESC_TYPE_ARRAY_INFO     = 0x2,
+	/* MR_LD_SPAN_MAP data */
+	RAID_MAP_DESC_TYPE_SPAN_INFO      = 0x3,
+	RAID_MAP_DESC_TYPE_COUNT,
+};
+
+/*
+ * This table defines the offset, size and num elements  of each descriptor
+ * type in the RAID Map buffer
+ */
+struct MR_RAID_MAP_DESC_TABLE {
+	/* Raid map descriptor type */
+	u32 raid_map_desc_type;
+	/* Offset into the RAID map buffer where
+	 *  descriptor data is saved
+	 */
+	u32 raid_map_desc_offset;
+	/* total size of the
+	 * descriptor buffer
+	 */
+	u32 raid_map_desc_buffer_size;
+	/* Number of elements contained in the
+	 *  descriptor buffer
+	 */
+	u32 raid_map_desc_elements;
+};
+
+/*
+ * Dynamic Raid Map Structure.
+ */
+struct MR_FW_RAID_MAP_DYNAMIC {
+	u32 raid_map_size;   /* total size of RAID Map structure */
+	u32 desc_table_offset;/* Offset of desc table into RAID map*/
+	u32 desc_table_size;  /* Total Size of desc table */
+	/* Total Number of elements in the desc table */
+	u32 desc_table_num_elements;
+	u64	reserved1;
+	u32	reserved2[3];	/*future use */
+	/* timeout value used by driver in FP IOs */
+	u8 fp_pd_io_timeout_sec;
+	u8 reserved3[3];
+	/* when this seqNum increments, driver needs to
+	 *  release RMW buffers asap
+	 */
+	u32 rmw_fp_seq_num;
+	u16 ld_count;	/* count of lds. */
+	u16 ar_count;   /* count of arrays */
+	u16 span_count; /* count of spans */
+	u16 reserved4[3];
+/*
+ * The below structure of pointers is only to be used by the driver.
+ * This is added in the ,API to reduce the amount of code changes
+ * needed in the driver to support dynamic RAID map Firmware should
+ * not update these pointers while preparing the raid map
+ */
+	union {
+		struct {
+			struct MR_DEV_HANDLE_INFO  *dev_hndl_info;
+			u16 *ld_tgt_id_to_ld;
+			struct MR_ARRAY_INFO *ar_map_info;
+			struct MR_LD_SPAN_MAP *ld_span_map;
+			};
+		u64 ptr_structure_size[RAID_MAP_DESC_TYPE_COUNT];
+		};
+/*
+ * RAID Map descriptor table defines the layout of data in the RAID Map.
+ * The size of the descriptor table itself could change.
+ */
+	/* Variable Size descriptor Table. */
+	struct MR_RAID_MAP_DESC_TABLE
+			raid_map_desc_table[RAID_MAP_DESC_TYPE_COUNT];
+	/* Variable Size buffer containing all data */
+	u32 raid_map_desc_data[1];
+}; /* Dynamicaly sized RAID MAp structure */
+
 #define IEEE_SGE_FLAGS_ADDR_MASK            (0x03)
 #define IEEE_SGE_FLAGS_SYSTEM_ADDR          (0x00)
 #define IEEE_SGE_FLAGS_IOCDDR_ADDR          (0x01)
@@ -854,6 +1054,16 @@ struct MR_LD_TARGET_SYNC {
 #define IEEE_SGE_FLAGS_IOCPLBNTA_ADDR       (0x03)
 #define IEEE_SGE_FLAGS_CHAIN_ELEMENT        (0x80)
 #define IEEE_SGE_FLAGS_END_OF_LIST          (0x40)
+
+#define MPI2_SGE_FLAGS_SHIFT                (0x02)
+#define IEEE_SGE_FLAGS_FORMAT_MASK          (0xC0)
+#define IEEE_SGE_FLAGS_FORMAT_IEEE          (0x00)
+#define IEEE_SGE_FLAGS_FORMAT_NVME          (0x02)
+
+#define MPI26_IEEE_SGE_FLAGS_NSF_MASK           (0x1C)
+#define MPI26_IEEE_SGE_FLAGS_NSF_MPI_IEEE       (0x00)
+#define MPI26_IEEE_SGE_FLAGS_NSF_NVME_PRP       (0x08)
+#define MPI26_IEEE_SGE_FLAGS_NSF_NVME_SGL       (0x10)
 
 struct megasas_register_set;
 struct megasas_instance;
@@ -891,7 +1101,7 @@ struct megasas_cmd_fusion {
 	u32 index;
 	u8 pd_r1_lb;
 	struct completion done;
-	bool is_raid_1_fp_write;
+	u8 pd_interface;
 	u16 r1_alt_dev_handle; /* raid 1/10 only*/
 	bool cmd_completed;  /* raid 1/10 fp writes status holder */
 
@@ -956,9 +1166,10 @@ struct MR_DRV_RAID_MAP {
 	__le16                 spanCount;
 	__le16                 reserve3;
 
-	struct MR_DEV_HANDLE_INFO  devHndlInfo[MAX_RAIDMAP_PHYSICAL_DEVICES];
-	u8                  ldTgtIdToLd[MAX_LOGICAL_DRIVES_EXT];
-	struct MR_ARRAY_INFO       arMapInfo[MAX_API_ARRAYS_EXT];
+	struct MR_DEV_HANDLE_INFO
+		devHndlInfo[MAX_RAIDMAP_PHYSICAL_DEVICES_DYN];
+	u16 ldTgtIdToLd[MAX_LOGICAL_DRIVES_DYN];
+	struct MR_ARRAY_INFO arMapInfo[MAX_API_ARRAYS_DYN];
 	struct MR_LD_SPAN_MAP      ldSpanMap[1];
 
 };
@@ -970,7 +1181,7 @@ struct MR_DRV_RAID_MAP {
 struct MR_DRV_RAID_MAP_ALL {
 
 	struct MR_DRV_RAID_MAP raidMap;
-	struct MR_LD_SPAN_MAP      ldSpanMap[MAX_LOGICAL_DRIVES_EXT - 1];
+	struct MR_LD_SPAN_MAP ldSpanMap[MAX_LOGICAL_DRIVES_DYN - 1];
 } __packed;
 
 
@@ -1019,7 +1230,8 @@ struct MR_PD_CFG_SEQ {
 		u8     reserved:7;
 #endif
 	} capability;
-	u8  reserved[3];
+	u8  reserved;
+	u16 pd_target_id;
 } __packed;
 
 struct MR_PD_CFG_SEQ_NUM_SYNC {
@@ -1089,7 +1301,7 @@ struct fusion_context {
 	u8	chain_offset_io_request;
 	u8	chain_offset_mfi_pthru;
 
-	struct MR_FW_RAID_MAP_ALL *ld_map[2];
+	struct MR_FW_RAID_MAP_DYNAMIC *ld_map[2];
 	dma_addr_t ld_map_phys[2];
 
 	/*Non dma-able memory. Driver local copy.*/
@@ -1097,12 +1309,15 @@ struct fusion_context {
 
 	u32 max_map_sz;
 	u32 current_map_sz;
+	u32 old_map_sz;
+	u32 new_map_sz;
 	u32 drv_map_sz;
 	u32 drv_map_pages;
 	struct MR_PD_CFG_SEQ_NUM_SYNC	*pd_seq_sync[JBOD_MAPS_COUNT];
 	dma_addr_t pd_seq_phys[JBOD_MAPS_COUNT];
 	u8 fast_path_io;
-	struct LD_LOAD_BALANCE_INFO load_balance_info[MAX_LOGICAL_DRIVES_EXT];
+	struct LD_LOAD_BALANCE_INFO *load_balance_info;
+	u32 load_balance_info_pages;
 	LD_SPAN_INFO log_to_span[MAX_LOGICAL_DRIVES_EXT];
 	u8 adapter_type;
 	struct LD_STREAM_DETECT **stream_detect_by_ld;

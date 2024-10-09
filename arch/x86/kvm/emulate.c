@@ -3971,6 +3971,7 @@ static int check_fxsr(struct x86_emulate_ctxt *ctxt)
  * Note: Guest and host CPUID.(EAX=07H,ECX=0H):EBX[bit 13] (deprecate FPU CS
  * and FPU DS) should match.
  */
+#define fxregs_state i387_fxsave_struct
 static int em_fxsave(struct x86_emulate_ctxt *ctxt)
 {
 	struct fxregs_state fx_state;

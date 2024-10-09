@@ -58,7 +58,7 @@ static int nvdimm_map_flush(struct device *dev, struct nvdimm *nvdimm, int dimm,
 					& PAGE_MASK);
 		else
 			flush_page = devm_nvdimm_ioremap(dev,
-					PHYS_PFN(pfn), PAGE_SIZE);
+					PFN_PHYS(pfn), PAGE_SIZE);
 		if (!flush_page)
 			return -ENXIO;
 		ndrd_set_flush_wpq(ndrd, dimm, i, flush_page

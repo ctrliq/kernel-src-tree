@@ -339,9 +339,18 @@ struct arch_spinlock;
 typedef u16 __ticket_t;
 #endif
 
+struct qspinlock;
+
 struct pv_lock_ops {
 	struct paravirt_callee_save lock_spinning;
 	void (*unlock_kick)(struct arch_spinlock *lock, __ticket_t ticket);
+#if defined(CONFIG_QUEUED_SPINLOCKS) && !defined(__GENKSYMS__)
+	struct paravirt_callee_save queued_spin_unlock;
+	void (*queued_spin_lock_slowpath)(struct qspinlock *lock, u32 val);
+
+	void (*wait)(u8 *ptr, u8 val);
+	void (*kick)(int cpu);
+#endif /* !CONFIG_QUEUED_SPINLOCKS || __GENKSYMS__ */
 };
 
 /* This contains all the paravirt structures: we get a convenient

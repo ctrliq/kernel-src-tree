@@ -826,6 +826,8 @@ void load_ucode_intel_ap(void)
 		 */
 		start += PAGE_OFFSET - __PAGE_OFFSET_BASE;
 	}
+	if (initrd_start)
+		start = initrd_start;
 
 	collect_cpu_info_early(&uci);
 	ret = load_microcode(mcs, ptrs, start, &uci);

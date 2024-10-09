@@ -4,15 +4,15 @@ SUBLEVEL = 0
 EXTRAVERSION =
 NAME = Unicycling Gorilla
 RHEL_MAJOR = 7
-RHEL_MINOR = 3
-RHEL_RELEASE = 514
+RHEL_MINOR = 4
+RHEL_RELEASE = 693
 
 #
 # DRM backport version
 #
 RHEL_DRM_VERSION = 4
-RHEL_DRM_PATCHLEVEL = 6
-RHEL_DRM_SUBLEVEL = 5
+RHEL_DRM_PATCHLEVEL = 10
+RHEL_DRM_SUBLEVEL = 13
 
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"
@@ -549,7 +549,7 @@ ifeq ($(KBUILD_EXTMOD),)
 # in parallel
 PHONY += scripts
 scripts: scripts_basic include/config/auto.conf include/config/tristate.conf \
-	 asm-generic
+	 asm-generic $(version_h)
 	$(Q)$(MAKE) $(build)=$(@)
 
 # Objects we will link into vmlinux / subdirs we need to visit
@@ -865,6 +865,11 @@ include/config/kernel.release: include/config/auto.conf FORCE
 # Listed in dependency order
 PHONY += prepare archprepare prepare0 prepare1 prepare2 prepare3
 
+#
+# Generate qrwlock specific files
+#
+include $(srctree)/Makefile.qlock
+
 # prepare3 is used to check if we are building in a separate output directory,
 # and if so do:
 # 1) Check that make has not been executed in the kernel src $(srctree)
@@ -887,7 +892,7 @@ prepare1: prepare2 $(version_h) include/generated/utsrelease.h \
 
 archprepare: archheaders archscripts prepare1 scripts_basic
 
-prepare0: archprepare FORCE
+prepare0: archprepare $(qlock_files) FORCE
 	$(Q)$(MAKE) $(build)=.
 
 # All the preparing..

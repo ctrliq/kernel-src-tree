@@ -153,8 +153,13 @@ enum {
 	IFLA_CARRIER,
 	IFLA_PHYS_PORT_ID,
 	IFLA_CARRIER_CHANGES,
-	__RH_RESERVED_IFLA_PHYS_SWITCH_ID,
+	IFLA_PHYS_SWITCH_ID,
 	IFLA_LINK_NETNSID,
+	IFLA_PHYS_PORT_NAME,
+	IFLA_PROTO_DOWN,
+	IFLA_GSO_MAX_SEGS,
+	IFLA_GSO_MAX_SIZE,
+	IFLA_PAD,
 	__IFLA_MAX
 };
 
@@ -223,6 +228,8 @@ enum {
 enum in6_addr_gen_mode {
 	IN6_ADDR_GEN_MODE_EUI64,
 	IN6_ADDR_GEN_MODE_NONE,
+	IN6_ADDR_GEN_MODE_STABLE_PRIVACY,
+	IN6_ADDR_GEN_MODE_RANDOM,
 };
 
 /* Bridge section */
@@ -232,10 +239,54 @@ enum {
 	IFLA_BR_FORWARD_DELAY,
 	IFLA_BR_HELLO_TIME,
 	IFLA_BR_MAX_AGE,
+	IFLA_BR_AGEING_TIME,
+	IFLA_BR_STP_STATE,
+	IFLA_BR_PRIORITY,
+	IFLA_BR_VLAN_FILTERING,
+	IFLA_BR_VLAN_PROTOCOL,
+	IFLA_BR_GROUP_FWD_MASK,
+	IFLA_BR_ROOT_ID,
+	IFLA_BR_BRIDGE_ID,
+	IFLA_BR_ROOT_PORT,
+	IFLA_BR_ROOT_PATH_COST,
+	IFLA_BR_TOPOLOGY_CHANGE,
+	IFLA_BR_TOPOLOGY_CHANGE_DETECTED,
+	IFLA_BR_HELLO_TIMER,
+	IFLA_BR_TCN_TIMER,
+	IFLA_BR_TOPOLOGY_CHANGE_TIMER,
+	IFLA_BR_GC_TIMER,
+	IFLA_BR_GROUP_ADDR,
+	IFLA_BR_FDB_FLUSH,
+	IFLA_BR_MCAST_ROUTER,
+	IFLA_BR_MCAST_SNOOPING,
+	IFLA_BR_MCAST_QUERY_USE_IFADDR,
+	IFLA_BR_MCAST_QUERIER,
+	IFLA_BR_MCAST_HASH_ELASTICITY,
+	IFLA_BR_MCAST_HASH_MAX,
+	IFLA_BR_MCAST_LAST_MEMBER_CNT,
+	IFLA_BR_MCAST_STARTUP_QUERY_CNT,
+	IFLA_BR_MCAST_LAST_MEMBER_INTVL,
+	IFLA_BR_MCAST_MEMBERSHIP_INTVL,
+	IFLA_BR_MCAST_QUERIER_INTVL,
+	IFLA_BR_MCAST_QUERY_INTVL,
+	IFLA_BR_MCAST_QUERY_RESPONSE_INTVL,
+	IFLA_BR_MCAST_STARTUP_QUERY_INTVL,
+	IFLA_BR_NF_CALL_IPTABLES,
+	IFLA_BR_NF_CALL_IP6TABLES,
+	IFLA_BR_NF_CALL_ARPTABLES,
+	IFLA_BR_VLAN_DEFAULT_PVID,
+	IFLA_BR_PAD,
+	IFLA_BR_VLAN_STATS_ENABLED,
+	IFLA_BR_MCAST_STATS_ENABLED,
 	__IFLA_BR_MAX,
 };
 
 #define IFLA_BR_MAX	(__IFLA_BR_MAX - 1)
+
+struct ifla_bridge_id {
+	__u8	prio[2];
+	__u8	addr[6]; /* ETH_ALEN */
+};
 
 enum {
 	BRIDGE_MODE_UNSPEC,
@@ -253,9 +304,24 @@ enum {
 	IFLA_BRPORT_FAST_LEAVE,	/* multicast fast leave    */
 	IFLA_BRPORT_LEARNING,	/* mac learning */
 	IFLA_BRPORT_UNICAST_FLOOD, /* flood unicast traffic */
-	/* RHEL: IFLA_BRPORT_PROXYARP not fully supported yet */
-	RESERVED_IFLA_BRPORT_PROXYARP,	/* proxy ARP */
+	IFLA_BRPORT_PROXYARP,	/* proxy ARP */
 	IFLA_BRPORT_LEARNING_SYNC, /* mac learning sync from device */
+	IFLA_BRPORT_PROXYARP_WIFI, /* proxy ARP for Wi-Fi */
+	IFLA_BRPORT_ROOT_ID,	/* designated root */
+	IFLA_BRPORT_BRIDGE_ID,	/* designated bridge */
+	IFLA_BRPORT_DESIGNATED_PORT,
+	IFLA_BRPORT_DESIGNATED_COST,
+	IFLA_BRPORT_ID,
+	IFLA_BRPORT_NO,
+	IFLA_BRPORT_TOPOLOGY_CHANGE_ACK,
+	IFLA_BRPORT_CONFIG_PENDING,
+	IFLA_BRPORT_MESSAGE_AGE_TIMER,
+	IFLA_BRPORT_FORWARD_DELAY_TIMER,
+	IFLA_BRPORT_HOLD_TIMER,
+	IFLA_BRPORT_FLUSH,
+	IFLA_BRPORT_MULTICAST_ROUTER,
+	IFLA_BRPORT_PAD,
+	IFLA_BRPORT_MCAST_FLOOD,
 	__IFLA_BRPORT_MAX
 };
 #define IFLA_BRPORT_MAX (__IFLA_BRPORT_MAX - 1)
@@ -346,6 +412,7 @@ enum {
 	IFLA_MACSEC_SCB,
 	IFLA_MACSEC_REPLAY_PROTECT,
 	IFLA_MACSEC_VALIDATION,
+	IFLA_MACSEC_PAD,
 	__IFLA_MACSEC_MAX,
 };
 
@@ -492,7 +559,7 @@ enum {
 enum {
 	IFLA_VF_UNSPEC,
 	IFLA_VF_MAC,		/* Hardware queue specific attributes */
-	IFLA_VF_VLAN,
+	IFLA_VF_VLAN,		/* VLAN ID and QoS */
 	IFLA_VF_TX_RATE,	/* Max TX Bandwidth Allocation */
 	IFLA_VF_SPOOFCHK,	/* Spoof Checking on/off switch */
 	IFLA_VF_LINK_STATE,	/* link state enable/disable/auto switch */
@@ -504,6 +571,7 @@ enum {
 	IFLA_VF_TRUST,		/* Trust VF */
 	IFLA_VF_IB_NODE_GUID,	/* VF Infiniband node GUID */
 	IFLA_VF_IB_PORT_GUID,	/* VF Infiniband port GUID */
+	IFLA_VF_VLAN_LIST,	/* nested list of vlans, option for QinQ */
 	__IFLA_VF_MAX,
 };
 
@@ -518,6 +586,22 @@ struct ifla_vf_vlan {
 	__u32 vf;
 	__u32 vlan; /* 0 - 4095, 0 disables VLAN filter */
 	__u32 qos;
+};
+
+enum {
+	IFLA_VF_VLAN_INFO_UNSPEC,
+	IFLA_VF_VLAN_INFO,	/* VLAN ID, QoS and VLAN protocol */
+	__IFLA_VF_VLAN_INFO_MAX,
+};
+
+#define IFLA_VF_VLAN_INFO_MAX (__IFLA_VF_VLAN_INFO_MAX - 1)
+#define MAX_VLAN_LIST_LEN 1
+
+struct ifla_vf_vlan_info {
+	__u32 vf;
+	__u32 vlan; /* 0 - 4095, 0 disables VLAN filter */
+	__u32 qos;
+	__be16 vlan_proto; /* VLAN protocol either 802.1Q or 802.1ad */
 };
 
 struct ifla_vf_tx_rate {
@@ -565,6 +649,7 @@ enum {
 	IFLA_VF_STATS_TX_BYTES,
 	IFLA_VF_STATS_BROADCAST,
 	IFLA_VF_STATS_MULTICAST,
+	IFLA_VF_STATS_PAD,
 	__IFLA_VF_STATS_MAX,
 };
 
@@ -664,5 +749,51 @@ enum {
 };
 
 #define IFLA_IPOIB_MAX (__IFLA_IPOIB_MAX - 1)
+
+/* STATS section */
+
+struct if_stats_msg {
+	__u8  family;
+	__u8  pad1;
+	__u16 pad2;
+	__u32 ifindex;
+	__u32 filter_mask;
+};
+
+/* A stats attribute can be netdev specific or a global stat.
+ * For netdev stats, lets use the prefix IFLA_STATS_LINK_*
+ */
+enum {
+	IFLA_STATS_UNSPEC, /* also used as 64bit pad attribute */
+	IFLA_STATS_LINK_64,
+	IFLA_STATS_LINK_XSTATS,
+	IFLA_STATS_LINK_XSTATS_SLAVE,
+	IFLA_STATS_LINK_OFFLOAD_XSTATS,
+	__IFLA_STATS_MAX,
+};
+
+#define IFLA_STATS_MAX (__IFLA_STATS_MAX - 1)
+
+#define IFLA_STATS_FILTER_BIT(ATTR)	(1 << (ATTR - 1))
+
+/* These are embedded into IFLA_STATS_LINK_XSTATS:
+ * [IFLA_STATS_LINK_XSTATS]
+ * -> [LINK_XSTATS_TYPE_xxx]
+ *    -> [rtnl link type specific attributes]
+ */
+enum {
+	LINK_XSTATS_TYPE_UNSPEC,
+	LINK_XSTATS_TYPE_BRIDGE,
+	__LINK_XSTATS_TYPE_MAX
+};
+#define LINK_XSTATS_TYPE_MAX (__LINK_XSTATS_TYPE_MAX - 1)
+
+/* These are stats embedded into IFLA_STATS_LINK_OFFLOAD_XSTATS */
+enum {
+	IFLA_OFFLOAD_XSTATS_UNSPEC,
+	IFLA_OFFLOAD_XSTATS_CPU_HIT, /* struct rtnl_link_stats64 */
+	__IFLA_OFFLOAD_XSTATS_MAX
+};
+#define IFLA_OFFLOAD_XSTATS_MAX (__IFLA_OFFLOAD_XSTATS_MAX - 1)
 
 #endif /* _UAPI_LINUX_IF_LINK_H */

@@ -142,7 +142,7 @@ no_valid_dev_replace_entry_found:
 		 * missing
 		 */
 		if (!dev_replace->srcdev &&
-		    !btrfs_test_opt(dev_root, DEGRADED)) {
+		    !btrfs_test_opt(dev_root->fs_info, DEGRADED)) {
 			ret = -EIO;
 			btrfs_warn(fs_info,
 			   "cannot mount because device replace operation is ongoing and");
@@ -151,7 +151,7 @@ no_valid_dev_replace_entry_found:
 			   src_devid);
 		}
 		if (!dev_replace->tgtdev &&
-		    !btrfs_test_opt(dev_root, DEGRADED)) {
+		    !btrfs_test_opt(dev_root->fs_info, DEGRADED)) {
 			ret = -EIO;
 			btrfs_warn(fs_info,
 			   "cannot mount because device replace operation is ongoing and");
@@ -218,8 +218,9 @@ int btrfs_run_dev_replace(struct btrfs_trans_handle *trans,
 	}
 	ret = btrfs_search_slot(trans, dev_root, &key, path, -1, 1);
 	if (ret < 0) {
-		btrfs_warn(fs_info, "error %d while searching for dev_replace item!",
-			ret);
+		btrfs_warn(fs_info,
+			   "error %d while searching for dev_replace item!",
+			   ret);
 		goto out;
 	}
 
@@ -238,8 +239,9 @@ int btrfs_run_dev_replace(struct btrfs_trans_handle *trans,
 		 */
 		ret = btrfs_del_item(trans, dev_root, path);
 		if (ret != 0) {
-			btrfs_warn(fs_info, "delete too small dev_replace item failed %d!",
-				ret);
+			btrfs_warn(fs_info,
+				   "delete too small dev_replace item failed %d!",
+				   ret);
 			goto out;
 		}
 		ret = 1;
@@ -251,8 +253,8 @@ int btrfs_run_dev_replace(struct btrfs_trans_handle *trans,
 		ret = btrfs_insert_empty_item(trans, dev_root, path,
 					      &key, sizeof(*ptr));
 		if (ret < 0) {
-			btrfs_warn(fs_info, "insert dev_replace item failed %d!",
-				ret);
+			btrfs_warn(fs_info,
+				   "insert dev_replace item failed %d!", ret);
 			goto out;
 		}
 	}
@@ -385,7 +387,7 @@ int btrfs_dev_replace_start(struct btrfs_root *root, char *tgtdev_name,
 	if (ret)
 		btrfs_err(fs_info, "kobj add dev failed %d\n", ret);
 
-	btrfs_wait_ordered_roots(fs_info, -1);
+	btrfs_wait_ordered_roots(root->fs_info, -1, 0, (u64)-1);
 
 	/* force writing the updated state information to disk */
 	trans = btrfs_start_transaction(root, 0);
@@ -504,7 +506,7 @@ static int btrfs_dev_replace_finishing(struct btrfs_fs_info *fs_info,
 		mutex_unlock(&dev_replace->lock_finishing_cancel_unmount);
 		return ret;
 	}
-	btrfs_wait_ordered_roots(root->fs_info, -1);
+	btrfs_wait_ordered_roots(root->fs_info, -1, 0, (u64)-1);
 
 	trans = btrfs_start_transaction(root, 0);
 	if (IS_ERR(trans)) {
@@ -772,9 +774,10 @@ int btrfs_resume_dev_replace_async(struct btrfs_fs_info *fs_info)
 		break;
 	}
 	if (!dev_replace->tgtdev || !dev_replace->tgtdev->bdev) {
-		btrfs_info(fs_info, "cannot continue dev_replace, tgtdev is missing");
 		btrfs_info(fs_info,
-			"you may cancel the operation after 'mount -o degraded'");
+			   "cannot continue dev_replace, tgtdev is missing");
+		btrfs_info(fs_info,
+			   "you may cancel the operation after 'mount -o degraded'");
 		btrfs_dev_replace_unlock(dev_replace, 1);
 		return 0;
 	}
@@ -793,7 +796,7 @@ static int btrfs_dev_replace_kthread(void *data)
 	struct btrfs_ioctl_dev_replace_args *status_args;
 	u64 progress;
 
-	status_args = kzalloc(sizeof(*status_args), GFP_NOFS);
+	status_args = kzalloc(sizeof(*status_args), GFP_KERNEL);
 	if (status_args) {
 		btrfs_dev_replace_status(fs_info, status_args);
 		progress = status_args->status.progress_1000;

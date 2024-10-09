@@ -654,6 +654,7 @@ static void qat_alg_free_bufl(struct qat_crypto_instance *inst,
 	size_t sz_out = qat_req->buf.sz_out;
 	int i;
 
+	kfree(qat_req->buf.iv);
 	for (i = 0; i < bl->num_bufs; i++)
 		dma_unmap_single(dev, bl->bufers[i].addr,
 				 bl->bufers[i].len, DMA_BIDIRECTIONAL);
@@ -691,6 +692,7 @@ static int qat_alg_sgl_to_bufl(struct qat_crypto_instance *inst,
 	struct scatterlist *sg;
 	size_t sz_out, sz = sizeof(struct qat_alg_buf_list) +
 			((1 + n + assoc_n) * sizeof(struct qat_alg_buf));
+	u8 *civ = NULL;
 
 	if (unlikely(!n))
 		return -EINVAL;
@@ -723,12 +725,19 @@ static int qat_alg_sgl_to_bufl(struct qat_crypto_instance *inst,
 	}
 
 	if (ivlen) {
-		bufl->bufers[bufs].addr = dma_map_single(dev, iv, ivlen,
+		civ = kmalloc_node(ivlen, GFP_ATOMIC,
+				  dev_to_node(&GET_DEV(inst->accel_dev)));
+		if (!civ)
+			goto err;
+		memcpy(civ, iv, ivlen);
+
+		bufl->bufers[bufs].addr = dma_map_single(dev, civ, ivlen,
 							 DMA_BIDIRECTIONAL);
 		bufl->bufers[bufs].len = ivlen;
 		if (unlikely(dma_mapping_error(dev, bufl->bufers[bufs].addr)))
 			goto err;
 		bufs++;
+		qat_req->buf.copyback = 1;
 	}
 
 	for_each_sg(sgl, sg, n, i) {
@@ -749,6 +758,9 @@ static int qat_alg_sgl_to_bufl(struct qat_crypto_instance *inst,
 	qat_req->buf.bl = bufl;
 	qat_req->buf.blp = blp;
 	qat_req->buf.sz = sz;
+	qat_req->buf.initial_iv = iv;
+	qat_req->buf.iv = civ;
+	qat_req->buf.ivlen = ivlen;
 	/* Handle out of place operation */
 	if (sgl != sglout) {
 		struct qat_alg_buf *bufers;
@@ -798,6 +810,7 @@ static int qat_alg_sgl_to_bufl(struct qat_crypto_instance *inst,
 	return 0;
 err:
 	dev_err(dev, "Failed to map buf for dma\n");
+	kfree(civ);
 	sg_nctr = 0;
 	for (i = 0; i < n + bufs; i++)
 		if (!dma_mapping_error(dev, bufl->bufers[i].addr))
@@ -830,6 +843,10 @@ static void qat_aead_alg_callback(struct icp_qat_fw_la_resp *qat_resp,
 	struct aead_request *areq = qat_req->aead_req;
 	uint8_t stat_filed = qat_resp->comn_resp.comn_status;
 	int res = 0, qat_res = ICP_QAT_FW_COMN_RESP_CRYPTO_STAT_GET(stat_filed);
+
+	if (qat_req->buf.copyback)
+		memcpy(qat_req->buf.initial_iv, qat_req->buf.iv,
+		       qat_req->buf.ivlen);
 
 	qat_alg_free_bufl(inst, qat_req);
 	if (unlikely(qat_res != ICP_QAT_FW_COMN_STATUS_FLAG_OK))
@@ -1145,10 +1162,8 @@ static int qat_alg_aead_init(struct crypto_tfm *tfm,
 		return -EFAULT;
 	spin_lock_init(&ctx->lock);
 	ctx->qat_hash_alg = hash;
-	crypto_aead_set_reqsize(__crypto_aead_cast(tfm),
-		sizeof(struct aead_request) +
-		sizeof(struct qat_crypto_request));
 	ctx->tfm = tfm;
+	crypto_aead_set_reqsize(__crypto_aead_cast(tfm), sizeof(struct qat_crypto_request));
 	return 0;
 }
 
@@ -1198,8 +1213,7 @@ static int qat_alg_ablkcipher_init(struct crypto_tfm *tfm)
 	struct qat_alg_ablkcipher_ctx *ctx = crypto_tfm_ctx(tfm);
 
 	spin_lock_init(&ctx->lock);
-	tfm->crt_ablkcipher.reqsize = sizeof(struct ablkcipher_request) +
-					sizeof(struct qat_crypto_request);
+	tfm->crt_ablkcipher.reqsize = sizeof(struct qat_crypto_request);
 	ctx->tfm = tfm;
 	return 0;
 }
@@ -1358,8 +1372,8 @@ static struct crypto_alg qat_algs[] = { {
 			.setkey = qat_alg_ablkcipher_xts_setkey,
 			.decrypt = qat_alg_ablkcipher_decrypt,
 			.encrypt = qat_alg_ablkcipher_encrypt,
-			.min_keysize = AES_MIN_KEY_SIZE,
-			.max_keysize = AES_MAX_KEY_SIZE,
+			.min_keysize = 2 * AES_MIN_KEY_SIZE,
+			.max_keysize = 2 * AES_MAX_KEY_SIZE,
 			.ivsize = AES_BLOCK_SIZE,
 		},
 	},

@@ -4,6 +4,10 @@
 #include <linux/kobject.h>
 #include <linux/list.h>
 
+#ifndef msi_controller
+#define msi_controller	msi_chip
+#endif
+
 struct msi_msg {
 	u32	address_lo;	/* low 32 bits of msi message address */
 	u32	address_hi;	/* high 32 bits of msi message address */
@@ -70,16 +74,16 @@ void default_restore_msi_irqs(struct pci_dev *dev);
 u32 default_msi_mask_irq(struct msi_desc *desc, u32 mask, u32 flag);
 u32 default_msix_mask_irq(struct msi_desc *desc, u32 flag);
 
-struct msi_chip {
+struct msi_controller {
 	struct module *owner;
 	struct device *dev;
 	struct device_node *of_node;
 	struct list_head list;
 
-	int (*setup_irq)(struct msi_chip *chip, struct pci_dev *dev,
+	int (*setup_irq)(struct msi_controller *chip, struct pci_dev *dev,
 			 struct msi_desc *desc);
-	void (*teardown_irq)(struct msi_chip *chip, unsigned int irq);
-	int (*check_device)(struct msi_chip *chip, struct pci_dev *dev,
+	void (*teardown_irq)(struct msi_controller *chip, unsigned int irq);
+	int (*check_device)(struct msi_controller *chip, struct pci_dev *dev,
 			    int nvec, int type);  /* Deprecated - do not use */
 };
 

@@ -32,6 +32,7 @@
 #define KVM_PRIVATE_MEM_SLOTS 4
 #define KVM_COALESCED_MMIO_PAGE_OFFSET 1
 #define KVM_HAVE_ONE_REG
+#define KVM_HALT_POLL_NS_DEFAULT 500000
 
 #define KVM_VCPU_MAX_FEATURES 1
 
@@ -140,13 +141,13 @@ struct kvm_vcpu_arch {
 };
 
 struct kvm_vm_stat {
-	u32 remote_tlb_flush;
+	ulong remote_tlb_flush;
 };
 
 struct kvm_vcpu_stat {
-	u32 halt_successful_poll;
-	u32 halt_attempted_poll;
-	u32 halt_wakeup;
+	u64 halt_successful_poll;
+	u64 halt_attempted_poll;
+	u64 halt_wakeup;
 };
 
 int kvm_vcpu_set_target(struct kvm_vcpu *vcpu,
@@ -227,5 +228,8 @@ static inline int kvm_arch_dev_ioctl_check_extension(long ext)
 
 int kvm_perf_init(void);
 int kvm_perf_teardown(void);
+
+static inline void kvm_arch_vcpu_blocking(struct kvm_vcpu *vcpu) {}
+static inline void kvm_arch_vcpu_unblocking(struct kvm_vcpu *vcpu) {}
 
 #endif /* __ARM_KVM_HOST_H__ */

@@ -118,6 +118,12 @@ void udp_tunnel_push_rx_port(struct net_device *dev, struct socket *sock,
 void udp_tunnel_notify_add_rx_port(struct socket *sock, unsigned short type);
 void udp_tunnel_notify_del_rx_port(struct socket *sock, unsigned short type);
 
+static inline void udp_tunnel_get_rx_info(struct net_device *dev)
+{
+	ASSERT_RTNL();
+	call_netdevice_notifiers(NETDEV_UDP_TUNNEL_PUSH_INFO, dev);
+}
+
 /* Transmit the skb using UDP encapsulation. */
 void udp_tunnel_xmit_skb(struct rtable *rt, struct sock *sk, struct sk_buff *skb,
 			 __be32 src, __be32 dst, __u8 tos, __u8 ttl,
@@ -139,14 +145,14 @@ struct metadata_dst *udp_tun_rx_dst(struct sk_buff *skb, unsigned short family,
 				    __be16 flags, __be64 tunnel_id,
 				    int md_size);
 
-static inline struct sk_buff *udp_tunnel_handle_offloads(struct sk_buff *skb,
-							 bool udp_csum)
+#ifdef CONFIG_INET
+static inline int udp_tunnel_handle_offloads(struct sk_buff *skb, bool udp_csum)
 {
 	int type = udp_csum ? SKB_GSO_UDP_TUNNEL_CSUM : SKB_GSO_UDP_TUNNEL;
 
-	/* As we're a UDP tunnel, we support LCO, so don't need csum_help */
-	return iptunnel_handle_offloads(skb, false, type);
+	return iptunnel_handle_offloads(skb, type);
 }
+#endif
 
 static inline void udp_tunnel_encap_enable(struct socket *sock)
 {

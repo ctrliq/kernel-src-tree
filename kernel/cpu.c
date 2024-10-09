@@ -282,7 +282,7 @@ static inline void check_for_tasks(int cpu)
 	struct task_struct *p;
 	cputime_t utime, stime;
 
-	write_lock_irq(&tasklist_lock);
+	qwrite_lock_irq(&tasklist_lock);
 	for_each_process(p) {
 		task_cputime(p, &utime, &stime);
 		if (task_cpu(p) == cpu && p->state == TASK_RUNNING &&
@@ -292,7 +292,7 @@ static inline void check_for_tasks(int cpu)
 				p->comm, task_pid_nr(p), cpu,
 				p->state, p->flags);
 	}
-	write_unlock_irq(&tasklist_lock);
+	qwrite_unlock_irq(&tasklist_lock);
 }
 
 struct take_cpu_down_param {
@@ -743,6 +743,11 @@ void set_cpu_active(unsigned int cpu, bool active)
 		cpumask_set_cpu(cpu, to_cpumask(cpu_active_bits));
 	else
 		cpumask_clear_cpu(cpu, to_cpumask(cpu_active_bits));
+}
+
+void reset_cpu_possible_mask(void)
+{
+	bitmap_zero(cpu_possible_bits, NR_CPUS);
 }
 
 void init_cpu_present(const struct cpumask *src)

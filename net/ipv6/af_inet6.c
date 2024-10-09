@@ -91,6 +91,12 @@ MODULE_PARM_DESC(disable_ipv6, "Disable IPv6 on all interfaces");
 module_param_named(autoconf, ipv6_defaults.autoconf, int, 0444);
 MODULE_PARM_DESC(autoconf, "Enable IPv6 address autoconfiguration on all interfaces");
 
+bool ipv6_mod_enabled(void)
+{
+	return disable_ipv6_mod == 0;
+}
+EXPORT_SYMBOL_GPL(ipv6_mod_enabled);
+
 static __inline__ struct ipv6_pinfo *inet6_sk_generic(struct sock *sk)
 {
 	const int offset = sk->sk_prot->obj_size - sizeof(struct ipv6_pinfo);
@@ -367,7 +373,8 @@ int inet6_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 		np->saddr = addr->sin6_addr;
 
 	/* Make sure we are allowed to bind here. */
-	if (sk->sk_prot->get_port(sk, snum)) {
+	if ((snum || !inet->bind_address_no_port) &&
+	    sk->sk_prot->get_port(sk, snum)) {
 		inet_reset_saddr(sk);
 		err = -EADDRINUSE;
 		goto out;
@@ -769,6 +776,8 @@ static int __net_init inet6_net_init(struct net *net)
 
 	net->ipv6.sysctl.bindv6only = 0;
 	net->ipv6.sysctl.icmpv6_time = 1*HZ;
+	net->idgen_retries = 3;
+	net->idgen_delay = 1 * HZ;
 
 	err = ipv6_init_mibs(net);
 	if (err)

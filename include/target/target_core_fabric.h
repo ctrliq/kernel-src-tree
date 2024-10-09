@@ -184,6 +184,10 @@ u32	iscsi_get_pr_transport_id_len(struct se_portal_group *, struct se_node_acl *
 char	*iscsi_parse_pr_out_transport_id(struct se_portal_group *, const char *,
 		u32 *, char **);
 
+int	target_alloc_sgl(struct scatterlist **sgl, unsigned int *nents,
+		u32 length, bool zero_page, bool chainable);
+void	target_free_sgl(struct scatterlist *sgl, int nents);
+
 /*
  * The LIO target core uses DMA_TO_DEVICE to mean that data is going
  * to the target (eg handling a WRITE) and DMA_FROM_DEVICE to mean

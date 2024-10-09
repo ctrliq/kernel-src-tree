@@ -30,13 +30,13 @@
 
 struct amdgpu_acp {
 	struct device *parent;
-	void *cgs_device;
+	struct cgs_device *cgs_device;
 	struct amd_acp_private *private;
 	struct mfd_cell *acp_cell;
 	struct resource *acp_res;
 	struct acp_pm_domain *acp_genpd;
 };
 
-extern const struct amd_ip_funcs acp_ip_funcs;
+extern const struct amdgpu_ip_block_version acp_ip_block;
 
 #endif /* __AMDGPU_ACP_H__ */

@@ -286,7 +286,7 @@ static const struct neigh_ops clip_neigh_ops = {
 	.connected_output =	neigh_direct_output,
 };
 
-static int clip_constructor(struct neighbour *neigh)
+static int clip_constructor(struct net_device *dev, struct neighbour *neigh)
 {
 	struct atmarp_entry *entry = neighbour_priv(neigh);
 
@@ -484,8 +484,9 @@ static int clip_setentry(struct atm_vcc *vcc, __be32 ip)
 }
 
 static const struct net_device_ops clip_netdev_ops = {
+	.ndo_size		= sizeof(struct net_device_ops),
 	.ndo_start_xmit		= clip_start_xmit,
-	.ndo_neigh_construct	= clip_constructor,
+	.extended.ndo_neigh_construct	= clip_constructor,
 };
 
 static void clip_setup(struct net_device *dev)

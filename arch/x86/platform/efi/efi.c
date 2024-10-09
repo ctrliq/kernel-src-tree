@@ -812,11 +812,15 @@ void __init efi_init(void)
 	}
 #endif
 	print_efi_memmap();
+
+	efi_esrt_init();
 }
 
 void __init efi_late_init(void)
 {
-	efi_bgrt_init();
+	/* RHEL7: Do not run on kdump kernel */
+	if (!efi_setup)
+		efi_bgrt_init();
 }
 
 void __init efi_set_executable(efi_memory_desc_t *md, bool executable)
@@ -951,7 +955,7 @@ static void __init get_systab_virt_addr(efi_memory_desc_t *md)
 
 static void __init save_runtime_map(void)
 {
-#ifdef CONFIG_KEXEC
+#ifdef CONFIG_KEXEC_CORE
 	efi_memory_desc_t *md;
 	void *tmp, *p, *q = NULL;
 	int count = 0;
@@ -1005,6 +1009,46 @@ out:
 	return ret;
 }
 
+static bool should_map_region(efi_memory_desc_t *md)
+{
+	/*
+	 * Runtime regions always require runtime mappings (obviously).
+	 */
+	if (md->attribute & EFI_MEMORY_RUNTIME)
+		return true;
+
+	/*
+	 * 32-bit EFI doesn't suffer from the bug that requires us to
+	 * reserve boot services regions, and mixed mode support
+	 * doesn't exist for 32-bit kernels.
+	 */
+	if (IS_ENABLED(CONFIG_X86_32))
+		return false;
+
+	/*
+	 * Map all of RAM so that we can access arguments in the 1:1
+	 * mapping when making EFI runtime calls.
+	 */
+	if (IS_ENABLED(CONFIG_EFI_MIXED) && !efi_is_native()) {
+		if (md->type == EFI_CONVENTIONAL_MEMORY ||
+		    md->type == EFI_LOADER_DATA ||
+		    md->type == EFI_LOADER_CODE)
+			return true;
+	}
+
+	/*
+	 * Map boot services regions as a workaround for buggy
+	 * firmware that accesses them even when they shouldn't.
+	 *
+	 * See efi_{reserve,free}_boot_services().
+	 */
+	if (md->type == EFI_BOOT_SERVICES_CODE ||
+	    md->type == EFI_BOOT_SERVICES_DATA)
+		return true;
+
+	return false;
+}
+
 /*
  * Map the efi memory ranges of the runtime services and update new_mmap with
  * virtual addresses.
@@ -1017,13 +1061,9 @@ static void * __init efi_map_regions(int *count, int *pg_shift)
 
 	for (p = memmap.map; p < memmap.map_end; p += memmap.desc_size) {
 		md = p;
-		if (!(md->attribute & EFI_MEMORY_RUNTIME)) {
-#ifdef CONFIG_X86_64
-			if (md->type != EFI_BOOT_SERVICES_CODE &&
-			    md->type != EFI_BOOT_SERVICES_DATA)
-#endif
-				continue;
-		}
+
+		if (!should_map_region(md))
+			continue;
 
 		efi_map_region(md);
 		get_systab_virt_addr(md);
@@ -1049,7 +1089,7 @@ static void * __init efi_map_regions(int *count, int *pg_shift)
 
 static void __init kexec_enter_virtual_mode(void)
 {
-#ifdef CONFIG_KEXEC
+#ifdef CONFIG_KEXEC_CORE
 	efi_memory_desc_t *md;
 	void *p;
 

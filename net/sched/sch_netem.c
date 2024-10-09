@@ -169,7 +169,7 @@ static inline struct netem_skb_cb *netem_skb_cb(struct sk_buff *skb)
 static void init_crandom(struct crndstate *state, unsigned long rho)
 {
 	state->rho = rho;
-	state->last = net_random();
+	state->last = prandom_u32();
 }
 
 /* get_crandom - correlated random number generator
@@ -182,9 +182,9 @@ static u32 get_crandom(struct crndstate *state)
 	unsigned long answer;
 
 	if (state->rho == 0)	/* no correlation */
-		return net_random();
+		return prandom_u32();
 
-	value = net_random();
+	value = prandom_u32();
 	rho = (u64)state->rho + 1;
 	answer = (value * ((1ull<<32) - rho) + state->last * rho) >> 32;
 	state->last = answer;
@@ -198,7 +198,7 @@ static u32 get_crandom(struct crndstate *state)
 static bool loss_4state(struct netem_sched_data *q)
 {
 	struct clgstate *clg = &q->clg;
-	u32 rnd = net_random();
+	u32 rnd = prandom_u32();
 
 	/*
 	 * Makes a comparison between rnd and the transition
@@ -265,15 +265,15 @@ static bool loss_gilb_ell(struct netem_sched_data *q)
 
 	switch (clg->state) {
 	case 1:
-		if (net_random() < clg->a1)
+		if (prandom_u32() < clg->a1)
 			clg->state = 2;
-		if (net_random() < clg->a4)
+		if (prandom_u32() < clg->a4)
 			return true;
 		break;
 	case 2:
-		if (net_random() < clg->a2)
+		if (prandom_u32() < clg->a2)
 			clg->state = 1;
-		if (net_random() > clg->a3)
+		if (prandom_u32() > clg->a3)
 			return true;
 	}
 
@@ -412,7 +412,7 @@ static int netem_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 	struct netem_skb_cb *cb;
 	struct sk_buff *skb2;
 	struct sk_buff *segs = NULL;
-	unsigned int len = 0, last_len;
+	unsigned int len = 0, last_len, prev_len = qdisc_pkt_len(skb);
 	int nb = 0;
 	int count = 1;
 	int rc = NET_XMIT_SUCCESS;
@@ -482,7 +482,8 @@ static int netem_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 			goto finish_segs;
 		}
 
-		skb->data[net_random() % skb_headlen(skb)] ^= 1<<(net_random() % 8);
+		skb->data[prandom_u32() % skb_headlen(skb)] ^=
+			1<<(prandom_u32() % 8);
 	}
 
 	if (unlikely(skb_queue_len(&sch->q) >= sch->limit))
@@ -558,7 +559,7 @@ finish_segs:
 		}
 		sch->q.qlen += nb;
 		if (nb > 1)
-			qdisc_tree_decrease_qlen(sch, 1 - nb);
+			qdisc_tree_reduce_backlog(sch, 1 - nb, prev_len - len);
 	}
 	return NET_XMIT_SUCCESS;
 }
@@ -637,13 +638,14 @@ deliver:
 #endif
 
 			if (q->qdisc) {
+				unsigned int pkt_len = qdisc_pkt_len(skb);
 				int err = qdisc_enqueue(skb, q->qdisc);
 
-				if (unlikely(err != NET_XMIT_SUCCESS)) {
-					if (net_xmit_drop_count(err)) {
-						qdisc_qstats_drop(sch);
-						qdisc_tree_decrease_qlen(sch, 1);
-					}
+				if (err != NET_XMIT_SUCCESS &&
+				    net_xmit_drop_count(err)) {
+					qdisc_qstats_drop(sch);
+					qdisc_tree_reduce_backlog(sch, 1,
+								  pkt_len);
 				}
 				goto tfifo_dequeue;
 			}

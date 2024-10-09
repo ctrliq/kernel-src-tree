@@ -155,6 +155,7 @@ struct _cpuid4_info_regs {
 	union _cpuid4_leaf_eax eax;
 	union _cpuid4_leaf_ebx ebx;
 	union _cpuid4_leaf_ecx ecx;
+	unsigned int id;
 	unsigned long size;
 	struct amd_northbridge *nb;
 };
@@ -862,6 +863,36 @@ static void free_cache_attributes(unsigned int cpu)
 	per_cpu(ici_cpuid4_info, cpu) = NULL;
 }
 
+/*
+ * The max shared threads number comes from CPUID.4:EAX[25-14] with input
+ * ECX as cache index. Then right shift apicid by the number's order to get
+ * cache id for this cache node.
+ */
+static void get_cache_id(int cpu, struct _cpuid4_info_regs *id4_regs)
+{
+	struct cpuinfo_x86 *c = &cpu_data(cpu);
+	unsigned long num_threads_sharing;
+	int index_msb;
+
+	num_threads_sharing = 1 + id4_regs->eax.split.num_threads_sharing;
+	index_msb = get_count_order(num_threads_sharing);
+	id4_regs->id = c->apicid >> index_msb;
+}
+
+int get_cpu_cache_id(int cpu, int level)
+{
+	int i;
+
+	for (i = 0; i < num_cache_leaves; i++) {
+		struct _cpuid4_info *this_leaf = CPUID4_INFO_IDX(cpu, i);
+
+		if (this_leaf->base.eax.split.level == level)
+			return this_leaf->base.id;
+	}
+
+	return -1;
+}
+
 static void get_cpu_leaves(void *_retval)
 {
 	int j, *retval = _retval, cpu = smp_processor_id();
@@ -879,6 +910,7 @@ static void get_cpu_leaves(void *_retval)
 			break;
 		}
 		cache_shared_cpu_map_setup(cpu, j);
+		get_cache_id(cpu, &this_leaf->base);
 	}
 }
 
@@ -932,6 +964,12 @@ show_one_plus(coherency_line_size, base.ebx.split.coherency_line_size, 1);
 show_one_plus(physical_line_partition, base.ebx.split.physical_line_partition, 1);
 show_one_plus(ways_of_associativity, base.ebx.split.ways_of_associativity, 1);
 show_one_plus(number_of_sets, base.ecx.split.number_of_sets, 1);
+
+static ssize_t show_id(struct _cpuid4_info *this_leaf, char *buf,
+		       unsigned int cpu)
+{
+	return sprintf(buf, "%u\n", this_leaf->base.id);
+}
 
 static ssize_t show_size(struct _cpuid4_info *this_leaf, char *buf,
 			 unsigned int cpu)
@@ -992,6 +1030,7 @@ static ssize_t show_type(struct _cpuid4_info *this_leaf, char *buf,
 static struct _cache_attr _name = \
 	__ATTR(_name, 0444, show_##_name, NULL)
 
+define_one_ro(id);
 define_one_ro(level);
 define_one_ro(type);
 define_one_ro(coherency_line_size);
@@ -1003,6 +1042,7 @@ define_one_ro(shared_cpu_map);
 define_one_ro(shared_cpu_list);
 
 static struct attribute *default_attrs[] = {
+	&id.attr,
 	&type.attr,
 	&level.attr,
 	&coherency_line_size.attr,

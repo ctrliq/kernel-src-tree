@@ -1570,7 +1570,7 @@ int xfrm_alloc_spi(struct xfrm_state *x, u32 low, u32 high)
 	} else {
 		u32 spi = 0;
 		for (h=0; h<high-low+1; h++) {
-			spi = low + net_random()%(high-low+1);
+			spi = low + prandom_u32()%(high-low+1);
 			x0 = xfrm_state_lookup(net, mark, &x->id.daddr, htonl(spi), x->id.proto, x->props.family);
 			if (x0 == NULL) {
 				x->id.spi = htonl(spi);
@@ -2097,7 +2097,7 @@ void xfrm_state_fini(struct net *net)
 
 	flush_work(&net->xfrm.state_hash_work);
 	audit_info.loginuid = INVALID_UID;
-	audit_info.sessionid = -1;
+	audit_info.sessionid = (unsigned int)-1;
 	audit_info.secid = 0;
 	xfrm_state_flush(net, IPSEC_PROTO_ANY, &audit_info);
 	flush_work(&net->xfrm.state_gc_work);
@@ -2163,7 +2163,7 @@ static void xfrm_audit_helper_pktinfo(struct sk_buff *skb, u16 family,
 }
 
 void xfrm_audit_state_add(struct xfrm_state *x, int result,
-			  kuid_t auid, u32 sessionid, u32 secid)
+			  kuid_t auid, unsigned int sessionid, u32 secid)
 {
 	struct audit_buffer *audit_buf;
 
@@ -2178,7 +2178,7 @@ void xfrm_audit_state_add(struct xfrm_state *x, int result,
 EXPORT_SYMBOL_GPL(xfrm_audit_state_add);
 
 void xfrm_audit_state_delete(struct xfrm_state *x, int result,
-			     kuid_t auid, u32 sessionid, u32 secid)
+			     kuid_t auid, unsigned int sessionid, u32 secid)
 {
 	struct audit_buffer *audit_buf;
 

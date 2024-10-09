@@ -68,6 +68,7 @@ static void svc_rdma_detach(struct svc_xprt *xprt);
 static void svc_rdma_free(struct svc_xprt *xprt);
 static int svc_rdma_has_wspace(struct svc_xprt *xprt);
 static int svc_rdma_secure_port(struct svc_rqst *);
+static void svc_rdma_kill_temp_xprt(struct svc_xprt *);
 
 static struct svc_xprt_ops svc_rdma_ops = {
 	.xpo_create = svc_rdma_create,
@@ -80,6 +81,7 @@ static struct svc_xprt_ops svc_rdma_ops = {
 	.xpo_has_wspace = svc_rdma_has_wspace,
 	.xpo_accept = svc_rdma_accept,
 	.xpo_secure_port = svc_rdma_secure_port,
+	.xpo_kill_temp_xprt = svc_rdma_kill_temp_xprt,
 };
 
 struct svc_xprt_class svc_rdma_class = {
@@ -1019,7 +1021,7 @@ static struct svc_xprt *svc_rdma_accept(struct svc_xprt *xprt)
 	newxprt->sc_ord = min_t(size_t, dev->attrs.max_qp_rd_atom, newxprt->sc_ord);
 	newxprt->sc_ord = min_t(size_t,	svcrdma_ord, newxprt->sc_ord);
 
-	newxprt->sc_pd = ib_alloc_pd(dev);
+	newxprt->sc_pd = ib_alloc_pd(dev, 0);
 	if (IS_ERR(newxprt->sc_pd)) {
 		dprintk("svcrdma: error creating PD for connect request\n");
 		goto errout;
@@ -1289,6 +1291,10 @@ static int svc_rdma_has_wspace(struct svc_xprt *xprt)
 static int svc_rdma_secure_port(struct svc_rqst *rqstp)
 {
 	return 1;
+}
+
+static void svc_rdma_kill_temp_xprt(struct svc_xprt *xprt)
+{
 }
 
 int svc_rdma_send(struct svcxprt_rdma *xprt, struct ib_send_wr *wr)

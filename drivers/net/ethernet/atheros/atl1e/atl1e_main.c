@@ -1880,7 +1880,7 @@ static netdev_tx_t atl1e_xmit_frame(struct sk_buff *skb,
 
 	atl1e_tx_queue(adapter, tpd_req, tpd);
 
-	netdev->trans_start = jiffies; /* NETIF_F_LLTX driver :( */
+	netif_trans_update(netdev); /* NETIF_F_LLTX driver :( */
 out:
 	spin_unlock_irqrestore(&adapter->tx_lock, flags);
 	return NETDEV_TX_OK;

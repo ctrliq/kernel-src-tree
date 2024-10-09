@@ -454,7 +454,8 @@ __acquires(&gl->gl_spin)
 	unsigned int lck_flags = (unsigned int)(gh ? gh->gh_flags : 0);
 	int ret;
 
-	if (unlikely(test_bit(SDF_SHUTDOWN, &sdp->sd_flags)))
+	if (unlikely(test_bit(SDF_SHUTDOWN, &sdp->sd_flags)) &&
+	    target != LM_ST_UNLOCKED)
 		return;
 	lck_flags &= (LM_FLAG_TRY | LM_FLAG_TRY_1CB | LM_FLAG_NOEXP |
 		      LM_FLAG_PRIORITY);
@@ -491,7 +492,8 @@ __acquires(&gl->gl_spin)
 		}
 		else if (ret) {
 			printk(KERN_ERR "GFS2: lm_lock ret %d\n", ret);
-			GLOCK_BUG_ON(gl, 1);
+			GLOCK_BUG_ON(gl, !test_bit(SDF_SHUTDOWN,
+						   &sdp->sd_flags));
 		}
 	} else { /* lock_nolock */
 		finish_xmote(gl, target);
@@ -1930,7 +1932,7 @@ static int gfs2_glocks_open(struct inode *inode, struct file *file)
 		if (seq->buf)
 			seq->size = GFS2_SEQ_GOODSIZE;
 		gi->gl = NULL;
-		ret = rhashtable_walk_init(&gl_hash_table, &gi->hti);
+		ret = rhashtable_walk_init(&gl_hash_table, &gi->hti, GFP_KERNEL);
 	}
 	return ret;
 }
@@ -1958,7 +1960,7 @@ static int gfs2_glstats_open(struct inode *inode, struct file *file)
 		if (seq->buf)
 			seq->size = GFS2_SEQ_GOODSIZE;
 		gi->gl = NULL;
-		ret = rhashtable_walk_init(&gl_hash_table, &gi->hti);
+		ret = rhashtable_walk_init(&gl_hash_table, &gi->hti, GFP_KERNEL);
 	}
 	return ret;
 }

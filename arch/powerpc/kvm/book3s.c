@@ -52,8 +52,12 @@ struct kvm_stats_debugfs_item debugfs_entries[] = {
 	{ "dec",         VCPU_STAT(dec_exits) },
 	{ "ext_intr",    VCPU_STAT(ext_intr_exits) },
 	{ "queue_intr",  VCPU_STAT(queue_intr) },
+	{ "halt_poll_success_ns",	VCPU_STAT(halt_poll_success_ns) },
+	{ "halt_poll_fail_ns",		VCPU_STAT(halt_poll_fail_ns) },
+	{ "halt_wait_ns",		VCPU_STAT(halt_wait_ns) },
 	{ "halt_successful_poll", VCPU_STAT(halt_successful_poll), },
 	{ "halt_attempted_poll", VCPU_STAT(halt_attempted_poll), },
+	{ "halt_successful_wait",	VCPU_STAT(halt_successful_wait) },
 	{ "halt_wakeup", VCPU_STAT(halt_wakeup) },
 	{ "pf_storage",  VCPU_STAT(pf_storage) },
 	{ "sp_storage",  VCPU_STAT(sp_storage) },
@@ -63,6 +67,9 @@ struct kvm_stats_debugfs_item debugfs_entries[] = {
 	{ "ld_slow",     VCPU_STAT(ld_slow) },
 	{ "st",          VCPU_STAT(st) },
 	{ "st_slow",     VCPU_STAT(st_slow) },
+	{ "pthru_all",       VCPU_STAT(pthru_all) },
+	{ "pthru_host",      VCPU_STAT(pthru_host) },
+	{ "pthru_bad_aff",   VCPU_STAT(pthru_bad_aff) },
 	{ NULL }
 };
 
@@ -618,9 +625,6 @@ int kvm_vcpu_ioctl_get_one_reg(struct kvm_vcpu *vcpu, struct kvm_one_reg *reg)
 		case KVM_REG_PPC_BESCR:
 			val = get_reg_val(reg->id, vcpu->arch.bescr);
 			break;
-		case KVM_REG_PPC_VTB:
-			val = get_reg_val(reg->id, vcpu->arch.vtb);
-			break;
 		case KVM_REG_PPC_IC:
 			val = get_reg_val(reg->id, vcpu->arch.ic);
 			break;
@@ -727,9 +731,6 @@ int kvm_vcpu_ioctl_set_one_reg(struct kvm_vcpu *vcpu, struct kvm_one_reg *reg)
 			break;
 		case KVM_REG_PPC_BESCR:
 			vcpu->arch.bescr = set_reg_val(reg->id, val);
-			break;
-		case KVM_REG_PPC_VTB:
-			vcpu->arch.vtb = set_reg_val(reg->id, val);
 			break;
 		case KVM_REG_PPC_IC:
 			vcpu->arch.ic = set_reg_val(reg->id, val);

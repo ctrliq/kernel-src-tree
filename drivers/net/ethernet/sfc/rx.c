@@ -851,7 +851,7 @@ int efx_filter_rfs(struct net_device *net_dev, const struct sk_buff *skb,
 		 * together, so just strip the vlan header and filter
 		 * on the IP part.
 		 */
-		EFX_BUG_ON_PARANOID(skb_headlen(skb) < sizeof(*vh));
+		EFX_WARN_ON_ONCE_PARANOID(skb_headlen(skb) < sizeof(*vh));
 		ether_type = vh->h_vlan_encapsulated_proto;
 		nhoff = sizeof(struct vlan_hdr);
 	} else {
@@ -875,20 +875,20 @@ int efx_filter_rfs(struct net_device *net_dev, const struct sk_buff *skb,
 		const struct iphdr *ip =
 			(const struct iphdr *)(skb->data + nhoff);
 
-		EFX_BUG_ON_PARANOID(skb_headlen(skb) < nhoff + sizeof(*ip));
+		EFX_WARN_ON_ONCE_PARANOID(skb_headlen(skb) < nhoff + sizeof(*ip));
 		if (ip_is_fragment(ip))
 			return -EPROTONOSUPPORT;
 		spec.ip_proto = ip->protocol;
 		spec.rem_host[0] = ip->saddr;
 		spec.loc_host[0] = ip->daddr;
-		EFX_BUG_ON_PARANOID(skb_headlen(skb) < nhoff + 4 * ip->ihl + 4);
+		EFX_WARN_ON_ONCE_PARANOID(skb_headlen(skb) < nhoff + 4 * ip->ihl + 4);
 		ports = (const __be16 *)(skb->data + nhoff + 4 * ip->ihl);
 	} else {
 		const struct ipv6hdr *ip6 =
 			(const struct ipv6hdr *)(skb->data + nhoff);
 
-		EFX_BUG_ON_PARANOID(skb_headlen(skb) <
-				    nhoff + sizeof(*ip6) + 4);
+		EFX_WARN_ON_ONCE_PARANOID(skb_headlen(skb) <
+					  nhoff + sizeof(*ip6) + 4);
 		spec.ip_proto = ip6->nexthdr;
 		memcpy(spec.rem_host, &ip6->saddr, sizeof(ip6->saddr));
 		memcpy(spec.loc_host, &ip6->daddr, sizeof(ip6->daddr));

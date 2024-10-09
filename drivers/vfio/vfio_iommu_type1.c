@@ -37,6 +37,7 @@
 #include <linux/vfio.h>
 #include <linux/workqueue.h>
 #include <linux/mdev.h>
+#include <linux/notifier.h>
 
 #define DRIVER_VERSION  "0.2"
 #define DRIVER_AUTHOR   "Alex Williamson <alex.williamson@redhat.com>"
@@ -59,6 +60,7 @@ struct vfio_iommu {
 	struct vfio_domain	*external_domain; /* domain for external user */
 	struct mutex		lock;
 	struct rb_root		dma_list;
+	struct blocking_notifier_head notifier;
 	bool v2;
 };
 
@@ -244,7 +246,7 @@ static int vfio_lock_acct(struct task_struct *task, long npage, bool *lock_cap)
 {
 	struct mm_struct *mm;
 	bool is_current;
-	int ret;
+	int ret = 0;
 
 	if (!npage)
 		return 0;
@@ -255,26 +257,24 @@ static int vfio_lock_acct(struct task_struct *task, long npage, bool *lock_cap)
 	if (!mm)
 		return -ESRCH; /* process exited */
 
-	ret = down_write_killable(&mm->mmap_sem);
-	if (!ret) {
-		if (npage > 0) {
-			if (lock_cap ? !*lock_cap :
-			    !has_capability(task, CAP_IPC_LOCK)) {
-				unsigned long limit;
+	down_write(&mm->mmap_sem);
+	if (npage > 0) {
+		if (lock_cap ? !*lock_cap :
+		    !has_capability(task, CAP_IPC_LOCK)) {
+			unsigned long limit;
 
-				limit = task_rlimit(task,
-						RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+			limit = task_rlimit(task,
+					RLIMIT_MEMLOCK) >> PAGE_SHIFT;
 
-				if (mm->locked_vm + npage > limit)
-					ret = -ENOMEM;
-			}
+			if (mm->locked_vm + npage > limit)
+				ret = -ENOMEM;
 		}
-
-		if (!ret)
-			mm->locked_vm += npage;
-
-		up_write(&mm->mmap_sem);
 	}
+
+	if (!ret)
+		mm->locked_vm += npage;
+
+	up_write(&mm->mmap_sem);
 
 	if (!is_current)
 		mmput(mm);
@@ -344,8 +344,8 @@ static int vaddr_get_pfn(struct mm_struct *mm, unsigned long vaddr,
 			flags |= FOLL_WRITE;
 
 		down_read(&mm->mmap_sem);
-		ret = get_user_pages_remote(NULL, mm, vaddr, 1, flags, page,
-					    NULL);
+		ret = get_user_pages(NULL, mm, vaddr, 1,
+				     prot & IOMMU_WRITE, 0, page, NULL);
 		up_read(&mm->mmap_sem);
 	}
 
@@ -537,7 +537,8 @@ static int vfio_iommu_type1_pin_pages(void *iommu_data,
 
 	mutex_lock(&iommu->lock);
 
-	if (!iommu->external_domain) {
+	/* Fail if notifier list is empty */
+	if ((!iommu->external_domain) || (!iommu->notifier.head)) {
 		ret = -EINVAL;
 		goto pin_done;
 	}
@@ -737,9 +738,9 @@ static int vfio_dma_do_unmap(struct vfio_iommu *iommu,
 			     struct vfio_iommu_type1_dma_unmap *unmap)
 {
 	uint64_t mask;
-	struct vfio_dma *dma;
+	struct vfio_dma *dma, *dma_last = NULL;
 	size_t unmapped = 0;
-	int ret = 0;
+	int ret = 0, retries = 0;
 
 	mask = ((uint64_t)1 << __ffs(vfio_pgsize_bitmap(iommu))) - 1;
 
@@ -749,7 +750,7 @@ static int vfio_dma_do_unmap(struct vfio_iommu *iommu,
 		return -EINVAL;
 
 	WARN_ON(mask & PAGE_MASK);
-
+again:
 	mutex_lock(&iommu->lock);
 
 	/*
@@ -805,6 +806,32 @@ static int vfio_dma_do_unmap(struct vfio_iommu *iommu,
 		 */
 		if (dma->task->mm != current->mm)
 			break;
+
+		if (!RB_EMPTY_ROOT(&dma->pfn_list)) {
+			struct vfio_iommu_type1_dma_unmap nb_unmap;
+
+			if (dma_last == dma) {
+				BUG_ON(++retries > 10);
+			} else {
+				dma_last = dma;
+				retries = 0;
+			}
+
+			nb_unmap.iova = dma->iova;
+			nb_unmap.size = dma->size;
+
+			/*
+			 * Notify anyone (mdev vendor drivers) to invalidate and
+			 * unmap iovas within the range we're about to unmap.
+			 * Vendor drivers MUST unpin pages in response to an
+			 * invalidation.
+			 */
+			mutex_unlock(&iommu->lock);
+			blocking_notifier_call_chain(&iommu->notifier,
+						    VFIO_IOMMU_NOTIFY_DMA_UNMAP,
+						    &nb_unmap);
+			goto again;
+		}
 		unmapped += dma->size;
 		vfio_remove_dma(iommu, dma);
 	}
@@ -1369,6 +1396,7 @@ static void *vfio_iommu_type1_open(unsigned long arg)
 	iommu->dma_list = RB_ROOT;
 	mutex_init(&iommu->lock);
 	iommu->v2 = (arg == VFIO_TYPE1v2_IOMMU);
+	BLOCKING_INIT_NOTIFIER_HEAD(&iommu->notifier);
 
 	return iommu;
 }
@@ -1502,16 +1530,42 @@ static long vfio_iommu_type1_ioctl(void *iommu_data,
 	return -ENOTTY;
 }
 
+static int vfio_iommu_type1_register_notifier(void *iommu_data,
+					      unsigned long *events,
+					      struct notifier_block *nb)
+{
+	struct vfio_iommu *iommu = iommu_data;
+
+	/* clear known events */
+	*events &= ~VFIO_IOMMU_NOTIFY_DMA_UNMAP;
+
+	/* refuse to register if still events remaining */
+	if (*events)
+		return -EINVAL;
+
+	return blocking_notifier_chain_register(&iommu->notifier, nb);
+}
+
+static int vfio_iommu_type1_unregister_notifier(void *iommu_data,
+						struct notifier_block *nb)
+{
+	struct vfio_iommu *iommu = iommu_data;
+
+	return blocking_notifier_chain_unregister(&iommu->notifier, nb);
+}
+
 static const struct vfio_iommu_driver_ops vfio_iommu_driver_ops_type1 = {
-	.name		= "vfio-iommu-type1",
-	.owner		= THIS_MODULE,
-	.open		= vfio_iommu_type1_open,
-	.release	= vfio_iommu_type1_release,
-	.ioctl		= vfio_iommu_type1_ioctl,
-	.attach_group	= vfio_iommu_type1_attach_group,
-	.detach_group	= vfio_iommu_type1_detach_group,
-	.pin_pages	= vfio_iommu_type1_pin_pages,
-	.unpin_pages	= vfio_iommu_type1_unpin_pages,
+	.name			= "vfio-iommu-type1",
+	.owner			= THIS_MODULE,
+	.open			= vfio_iommu_type1_open,
+	.release		= vfio_iommu_type1_release,
+	.ioctl			= vfio_iommu_type1_ioctl,
+	.attach_group		= vfio_iommu_type1_attach_group,
+	.detach_group		= vfio_iommu_type1_detach_group,
+	.pin_pages		= vfio_iommu_type1_pin_pages,
+	.unpin_pages		= vfio_iommu_type1_unpin_pages,
+	.register_notifier	= vfio_iommu_type1_register_notifier,
+	.unregister_notifier	= vfio_iommu_type1_unregister_notifier,
 };
 
 static int __init vfio_iommu_type1_init(void)

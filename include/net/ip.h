@@ -31,7 +31,7 @@
 #include <net/route.h>
 #include <net/snmp.h>
 #include <net/flow.h>
-#include <net/flow_keys.h>
+#include <net/flow_dissector.h>
 
 struct sock;
 
@@ -66,6 +66,7 @@ struct ipcm_cookie {
 };
 
 #define IPCB(skb) ((struct inet_skb_parm*)((skb)->cb))
+#define PKTINFO_SKB_CB(skb) ((struct in_pktinfo *)((skb)->cb))
 
 struct ip_ra_chain {
 	struct ip_ra_chain __rcu *next;
@@ -161,6 +162,7 @@ static inline __u8 get_rtconn_flags(struct ipcm_cookie* ipc, struct sock* sk)
 }
 
 /* datagram.c */
+int __ip4_datagram_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len);
 int ip4_datagram_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len);
 
 void ip4_datagram_release_cb(struct sock *sk);
@@ -357,17 +359,18 @@ static inline __wsum inet_compute_pseudo(struct sk_buff *skb, int proto)
 				  skb->len, proto, 0);
 }
 
-static inline void inet_set_txhash(struct sock *sk)
+/* copy IPv4 saddr & daddr to flow_keys, possibly using 64bit load/store
+ * Equivalent to :	flow->v4addrs.src = iph->saddr;
+ *			flow->v4addrs.dst = iph->daddr;
+ */
+static inline void iph_to_flow_copy_v4addrs(struct flow_keys *flow,
+					    const struct iphdr *iph)
 {
-	struct inet_sock *inet = inet_sk(sk);
-	struct flow_keys keys;
-
-	keys.src = inet->inet_saddr;
-	keys.dst = inet->inet_daddr;
-	keys.port16[0] = inet->inet_sport;
-	keys.port16[1] = inet->inet_dport;
-
-	sk->sk_txhash = flow_hash_from_keys(&keys);
+	BUILD_BUG_ON(offsetof(typeof(flow->addrs), v4addrs.dst) !=
+		     offsetof(typeof(flow->addrs), v4addrs.src) +
+			      sizeof(flow->addrs.v4addrs.src));
+	memcpy(&flow->addrs.v4addrs, &iph->saddr, sizeof(flow->addrs.v4addrs));
+	flow->control.addr_type = FLOW_DISSECTOR_KEY_IPV4_ADDRS;
 }
 
 static inline __wsum inet_gro_compute_pseudo(struct sk_buff *skb, int proto)
@@ -528,7 +531,7 @@ int ip_options_rcv_srr(struct sk_buff *skb);
  */
 
 void ipv4_pktinfo_prepare(const struct sock *sk, struct sk_buff *skb);
-void ip_cmsg_recv(struct msghdr *msg, struct sk_buff *skb);
+void ip_cmsg_recv_sk(struct msghdr *msg, struct sock *sk, struct sk_buff *skb);
 int ip_cmsg_send(struct net *net, struct msghdr *msg, struct ipcm_cookie *ipc);
 int ip_setsockopt(struct sock *sk, int level, int optname, char __user *optval,
 		  unsigned int optlen);
@@ -546,6 +549,15 @@ void ip_icmp_error(struct sock *sk, struct sk_buff *skb, int err, __be16 port,
 		   u32 info, u8 *payload);
 void ip_local_error(struct sock *sk, int err, __be32 daddr, __be16 dport,
 		    u32 info);
+
+static inline void ip_cmsg_recv(struct msghdr *msg, struct sk_buff *skb)
+{
+	ip_cmsg_recv_sk(msg, skb->sk, skb);
+}
+
+bool icmp_global_allow(void);
+extern int sysctl_icmp_msgs_per_sec;
+extern int sysctl_icmp_msgs_burst;
 
 #ifdef CONFIG_PROC_FS
 int ip_misc_proc_init(void);

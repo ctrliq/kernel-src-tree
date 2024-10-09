@@ -46,13 +46,16 @@
 #include <linux/random.h>
 #include "hyperv_vmbus.h"
 
+struct vmbus_dynid {
+	struct list_head node;
+	struct hv_vmbus_device_id id;
+};
 
 static struct acpi_device  *hv_acpi_dev;
 
 static struct completion probe_event;
 static int irq;
 
-static int hyperv_cpuhp_online;
 
 static void hyperv_report_panic(struct pt_regs *regs)
 {
@@ -109,8 +112,8 @@ static struct notifier_block hyperv_panic_block = {
 
 static const char *fb_mmio_name = "fb_range";
 static struct resource *fb_mmio;
-struct resource *hyperv_mmio;
-DEFINE_SEMAPHORE(hyperv_mmio_lock);
+static struct resource *hyperv_mmio;
+static DEFINE_SEMAPHORE(hyperv_mmio_lock);
 
 struct hv_device_info {
 	struct hv_ring_buffer_debug_info inbound;
@@ -509,7 +512,7 @@ static ssize_t device_show(struct device *dev,
 static DEVICE_ATTR_RO(device);
 
 /* Set up per device attributes in /sys/bus/vmbus/devices/<bus device> */
-static struct attribute *vmbus_attrs[] = {
+static struct attribute *vmbus_dev_attrs[] = {
 	&dev_attr_id.attr,
 	&dev_attr_state.attr,
 	&dev_attr_monitor_id.attr,
@@ -537,7 +540,7 @@ static struct attribute *vmbus_attrs[] = {
 	&dev_attr_device.attr,
 	NULL,
 };
-ATTRIBUTE_GROUPS(vmbus);
+ATTRIBUTE_GROUPS(vmbus_dev);
 
 /*
  * vmbus_uevent - add uevent for our device
@@ -574,10 +577,29 @@ static inline bool is_null_guid(const uuid_le *guid)
  * Return a matching hv_vmbus_device_id pointer.
  * If there is no match, return NULL.
  */
-static const struct hv_vmbus_device_id *hv_vmbus_get_id(
-					const struct hv_vmbus_device_id *id,
+static const struct hv_vmbus_device_id *hv_vmbus_get_id(struct hv_driver *drv,
 					const uuid_le *guid)
 {
+	const struct hv_vmbus_device_id *id = NULL;
+	struct vmbus_dynid *dynid;
+
+	/* Look at the dynamic ids first, before the static ones */
+	spin_lock(&drv->dynids.lock);
+	list_for_each_entry(dynid, &drv->dynids.list, node) {
+		if (!uuid_le_cmp(dynid->id.guid, *guid)) {
+			id = &dynid->id;
+			break;
+		}
+	}
+	spin_unlock(&drv->dynids.lock);
+
+	if (id)
+		return id;
+
+	id = drv->id_table;
+	if (id == NULL)
+		return NULL; /* empty device table */
+
 	for (; !is_null_guid(&id->guid); id++)
 		if (!uuid_le_cmp(id->guid, *guid))
 			return id;
@@ -585,6 +607,134 @@ static const struct hv_vmbus_device_id *hv_vmbus_get_id(
 	return NULL;
 }
 
+/* vmbus_add_dynid - add a new device ID to this driver and re-probe devices */
+static int vmbus_add_dynid(struct hv_driver *drv, uuid_le *guid)
+{
+	struct vmbus_dynid *dynid;
+
+	dynid = kzalloc(sizeof(*dynid), GFP_KERNEL);
+	if (!dynid)
+		return -ENOMEM;
+
+	dynid->id.guid = *guid;
+
+	spin_lock(&drv->dynids.lock);
+	list_add_tail(&dynid->node, &drv->dynids.list);
+	spin_unlock(&drv->dynids.lock);
+
+	return driver_attach(&drv->driver);
+}
+
+static void vmbus_free_dynids(struct hv_driver *drv)
+{
+	struct vmbus_dynid *dynid, *n;
+
+	spin_lock(&drv->dynids.lock);
+	list_for_each_entry_safe(dynid, n, &drv->dynids.list, node) {
+		list_del(&dynid->node);
+		kfree(dynid);
+	}
+	spin_unlock(&drv->dynids.lock);
+}
+
+/* Parse string of form: 1b4e28ba-2fa1-11d2-883f-b9a761bde3f */
+static int get_uuid_le(const char *str, uuid_le *uu)
+{
+	unsigned int b[16];
+	int i;
+
+	if (strlen(str) < 37)
+		return -1;
+
+	for (i = 0; i < 36; i++) {
+		switch (i) {
+		case 8: case 13: case 18: case 23:
+			if (str[i] != '-')
+				return -1;
+			break;
+		default:
+			if (!isxdigit(str[i]))
+				return -1;
+		}
+	}
+
+	/* unparse little endian output byte order */
+	if (sscanf(str,
+		   "%2x%2x%2x%2x-%2x%2x-%2x%2x-%2x%2x-%2x%2x%2x%2x%2x%2x",
+		   &b[3], &b[2], &b[1], &b[0],
+		   &b[5], &b[4], &b[7], &b[6], &b[8], &b[9],
+		   &b[10], &b[11], &b[12], &b[13], &b[14], &b[15]) != 16)
+		return -1;
+
+	for (i = 0; i < 16; i++)
+		uu->b[i] = b[i];
+	return 0;
+}
+
+/*
+ * store_new_id - sysfs frontend to vmbus_add_dynid()
+ *
+ * Allow GUIDs to be added to an existing driver via sysfs.
+ */
+static ssize_t new_id_store(struct device_driver *driver, const char *buf,
+			    size_t count)
+{
+	struct hv_driver *drv = drv_to_hv_drv(driver);
+	uuid_le guid = NULL_UUID_LE;
+	ssize_t retval;
+
+	if (get_uuid_le(buf, &guid) != 0)
+		return -EINVAL;
+
+	if (hv_vmbus_get_id(drv, &guid))
+		return -EEXIST;
+
+	retval = vmbus_add_dynid(drv, &guid);
+	if (retval)
+		return retval;
+	return count;
+}
+static DRIVER_ATTR_WO(new_id);
+
+/*
+ * store_remove_id - remove a PCI device ID from this driver
+ *
+ * Removes a dynamic pci device ID to this driver.
+ */
+static ssize_t remove_id_store(struct device_driver *driver, const char *buf,
+			       size_t count)
+{
+	struct hv_driver *drv = drv_to_hv_drv(driver);
+	struct vmbus_dynid *dynid, *n;
+	uuid_le guid = NULL_UUID_LE;
+	size_t retval = -ENODEV;
+
+	if (get_uuid_le(buf, &guid))
+		return -EINVAL;
+
+	spin_lock(&drv->dynids.lock);
+	list_for_each_entry_safe(dynid, n, &drv->dynids.list, node) {
+		struct hv_vmbus_device_id *id = &dynid->id;
+
+		if (!uuid_le_cmp(id->guid, guid)) {
+			list_del(&dynid->node);
+			kfree(dynid);
+			retval = count;
+			break;
+		}
+	}
+	spin_unlock(&drv->dynids.lock);
+
+	return retval;
+}
+static DRIVER_ATTR_WO(remove_id);
+
+static struct attribute *vmbus_drv_attrs[] = {
+	&driver_attr_new_id.attr,
+	&driver_attr_remove_id.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(vmbus_drv);
 
 
 /*
@@ -599,7 +749,7 @@ static int vmbus_match(struct device *device, struct device_driver *driver)
 	if (is_hvsock_channel(hv_dev->channel))
 		return drv->hvsock;
 
-	if (hv_vmbus_get_id(drv->id_table, &hv_dev->dev_type))
+	if (hv_vmbus_get_id(drv, &hv_dev->dev_type))
 		return 1;
 
 	return 0;
@@ -616,7 +766,7 @@ static int vmbus_probe(struct device *child_device)
 	struct hv_device *dev = device_to_hv_device(child_device);
 	const struct hv_vmbus_device_id *dev_id;
 
-	dev_id = hv_vmbus_get_id(drv->id_table, &dev->dev_type);
+	dev_id = hv_vmbus_get_id(drv, &dev->dev_type);
 	if (drv->probe) {
 		ret = drv->probe(dev, dev_id);
 		if (ret != 0)
@@ -693,7 +843,8 @@ static struct bus_type  hv_bus = {
 	.remove =		vmbus_remove,
 	.probe =		vmbus_probe,
 	.uevent =		vmbus_uevent,
-	.dev_groups =		vmbus_groups,
+	.dev_groups =		vmbus_dev_groups,
+	.drv_groups =		vmbus_drv_groups,
 };
 
 struct onmessage_work_context {
@@ -820,38 +971,49 @@ static void vmbus_isr(void)
 	add_interrupt_randomness(HYPERVISOR_CALLBACK_VECTOR, 0);
 }
 
-#ifdef CONFIG_HOTPLUG_CPU
-static int hyperv_cpu_disable(void)
+static void hv_synic_init_oncpu(void *arg)
 {
-	return -ENOSYS;
+	int cpu = get_cpu();
+	hv_synic_init(cpu);
+	put_cpu();
 }
 
-static void hv_cpu_hotplug_quirk(bool vmbus_loaded)
+static void hv_synic_cleanup_oncpu(void *arg)
 {
-	static void *previous_cpu_disable;
-
-	/*
-	 * Offlining a CPU when running on newer hypervisors (WS2012R2, Win8,
-	 * ...) is not supported at this moment as channel interrupts are
-	 * distributed across all of them.
-	 */
-
-	if ((vmbus_proto_version == VERSION_WS2008) ||
-	    (vmbus_proto_version == VERSION_WIN7))
-		return;
-
-	if (vmbus_loaded) {
-		previous_cpu_disable = smp_ops.cpu_disable;
-		smp_ops.cpu_disable = hyperv_cpu_disable;
-		pr_notice("CPU offlining is not supported by hypervisor\n");
-	} else if (previous_cpu_disable)
-		smp_ops.cpu_disable = previous_cpu_disable;
+	int cpu = get_cpu();
+	hv_synic_cleanup(cpu);
+	put_cpu();
 }
-#else
-static void hv_cpu_hotplug_quirk(bool vmbus_loaded)
+
+static int hv_cpuhp_callback(struct notifier_block *nfb,
+			     unsigned long action, void *hcpu)
 {
+	unsigned int cpu = (unsigned long) hcpu;
+
+	switch (action & ~CPU_TASKS_FROZEN) {
+	case CPU_STARTING:
+		hv_synic_init(cpu);
+		break;
+	case CPU_DYING:
+		hv_synic_cleanup(cpu);
+		break;
+	case CPU_DOWN_PREPARE:
+		if (hv_synic_cpu_used(cpu))
+			return NOTIFY_BAD;
+		hv_clockevents_unbind(cpu);
+		break;
+	case CPU_DOWN_FAILED:
+		hv_clockevents_bind(cpu);
+		break;
+	}
+
+	return NOTIFY_OK;
 }
-#endif
+
+static struct notifier_block hv_cpuhp_notifier __refdata = {
+       .notifier_call = hv_cpuhp_callback,
+       .priority = INT_MAX,
+};
 
 /*
  * vmbus_bus_init -Main vmbus driver initialization routine.
@@ -864,7 +1026,7 @@ static void hv_cpu_hotplug_quirk(bool vmbus_loaded)
  */
 static int vmbus_bus_init(int irq)
 {
-	int ret;
+	int ret, cpu;
 
 	/* Hypervisor initialization...setup hypercall page..etc */
 	ret = hv_init();
@@ -886,17 +1048,14 @@ static int vmbus_bus_init(int irq)
 	 * Initialize the per-cpu interrupt state and
 	 * connect to the host.
 	 */
-	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "x86/hyperv:online",
-				hv_synic_init, hv_synic_cleanup);
-	if (ret < 0)
-		goto err_alloc;
-	hyperv_cpuhp_online = ret;
+	cpu_notifier_register_begin();
+	on_each_cpu(hv_synic_init_oncpu, NULL, 1);
+	__register_hotcpu_notifier(&hv_cpuhp_notifier);
+	cpu_notifier_register_done();
 
 	ret = vmbus_connect();
 	if (ret)
 		goto err_connect;
-
-	hv_cpu_hotplug_quirk(true);
 
 	/*
 	 * Only register if the crash MSRs are available
@@ -912,7 +1071,13 @@ static int vmbus_bus_init(int irq)
 	return 0;
 
 err_connect:
-	cpuhp_remove_state(hyperv_cpuhp_online);
+	cpu_notifier_register_begin();
+	__unregister_hotcpu_notifier(&hv_cpuhp_notifier);
+	for_each_online_cpu(cpu) {
+		hv_clockevents_unbind(cpu);
+		smp_call_function_single(cpu, hv_synic_cleanup_oncpu, NULL, 1);
+	}
+	cpu_notifier_register_done();
 err_alloc:
 	hv_synic_free();
 	hv_remove_vmbus_irq();
@@ -951,6 +1116,9 @@ int __vmbus_driver_register(struct hv_driver *hv_driver, struct module *owner, c
 	hv_driver->driver.mod_name = mod_name;
 	hv_driver->driver.bus = &hv_bus;
 
+	spin_lock_init(&hv_driver->dynids.lock);
+	INIT_LIST_HEAD(&hv_driver->dynids.list);
+
 	ret = driver_register(&hv_driver->driver);
 
 	return ret;
@@ -969,8 +1137,10 @@ void vmbus_driver_unregister(struct hv_driver *hv_driver)
 {
 	pr_info("unregistering driver %s\n", hv_driver->name);
 
-	if (!vmbus_exists())
+	if (!vmbus_exists()) {
 		driver_unregister(&hv_driver->driver);
+		vmbus_free_dynids(hv_driver);
+	}
 }
 EXPORT_SYMBOL_GPL(vmbus_driver_unregister);
 
@@ -1007,8 +1177,8 @@ int vmbus_device_register(struct hv_device *child_device_obj)
 {
 	int ret = 0;
 
-	dev_set_name(&child_device_obj->device, "vmbus_%d",
-		     child_device_obj->channel->id);
+	dev_set_name(&child_device_obj->device, "%pUl",
+		     child_device_obj->channel->offermsg.offer.if_instance.b);
 
 	child_device_obj->device.bus = &hv_bus;
 	child_device_obj->device.parent = &hv_acpi_dev->dev;
@@ -1369,21 +1539,31 @@ static struct acpi_driver vmbus_acpi_driver = {
 
 static void hv_kexec_handler(void)
 {
+	int cpu;
+
 	hv_synic_clockevents_cleanup();
 	vmbus_initiate_unload(false);
-	cpuhp_remove_state(hyperv_cpuhp_online);
+	vmbus_connection.conn_state = DISCONNECTED;
+	/* Make sure conn_state is set as hv_synic_cleanup checks for it */
+	mb();
+	for_each_online_cpu(cpu)
+		smp_call_function_single(cpu, hv_synic_cleanup_oncpu, NULL, 1);
 	hv_cleanup(false);
 };
 
 static void hv_crash_handler(struct pt_regs *regs)
 {
+	int cpu = smp_processor_id();
+
 	vmbus_initiate_unload(true);
 	/*
 	 * In crash handler we can't schedule synic cleanup for all CPUs,
 	 * doing the cleanup for current CPU only. This should be sufficient
 	 * for kdump.
 	 */
-	hv_synic_cleanup(smp_processor_id());
+	vmbus_connection.conn_state = DISCONNECTED;
+	hv_clockevents_unbind(cpu);
+	hv_synic_cleanup(cpu);
 	hv_cleanup(true);
 };
 
@@ -1450,13 +1630,15 @@ static void __exit vmbus_exit(void)
 	}
 	bus_unregister(&hv_bus);
 	hv_cleanup(false);
+	cpu_notifier_register_begin();
+	__unregister_hotcpu_notifier(&hv_cpuhp_notifier);
 	for_each_online_cpu(cpu) {
 		tasklet_kill(hv_context.event_dpc[cpu]);
+		smp_call_function_single(cpu, hv_synic_cleanup_oncpu, NULL, 1);
 	}
-	cpuhp_remove_state(hyperv_cpuhp_online);
+	cpu_notifier_register_done();
 	hv_synic_free();
 	acpi_bus_unregister_driver(&vmbus_acpi_driver);
-	hv_cpu_hotplug_quirk(false);
 }
 
 

@@ -514,6 +514,7 @@ struct hfi1_msix_entry {
 	void *arg;
 	char name[MAX_NAME_SIZE];
 	cpumask_t mask;
+	struct irq_affinity_notify notify;
 };
 
 /* per-SL CCA information */
@@ -1172,7 +1173,6 @@ struct hfi1_devdata {
 	/* Used to wait for outstanding user space clients before dev removal */
 	struct completion user_comp;
 
-	struct hfi1_affinity *affinity;
 	bool eprom_available;	/* true if EPROM is available for this device */
 	bool aspm_supported;	/* Does HW support ASPM */
 	bool aspm_enabled;	/* ASPM state: enabled/disabled */
@@ -1244,6 +1244,8 @@ int handle_receive_interrupt(struct hfi1_ctxtdata *, int);
 int handle_receive_interrupt_nodma_rtail(struct hfi1_ctxtdata *, int);
 int handle_receive_interrupt_dma_rtail(struct hfi1_ctxtdata *, int);
 void set_all_slowpath(struct hfi1_devdata *dd);
+
+extern const struct pci_device_id hfi1_pci_tbl[];
 
 /* receive packet handler dispositions */
 #define RCV_PKT_OK      0x0 /* keep going */

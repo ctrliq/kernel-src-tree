@@ -976,8 +976,8 @@ static int musb_gadget_enable(struct usb_ep *ep,
 		goto fail;
 
 	/* REVISIT this rules out high bandwidth periodic transfers */
-	tmp = usb_endpoint_maxp_mult(desc) - 1;
-	if (tmp) {
+	tmp = usb_endpoint_maxp(desc);
+	if (tmp & ~0x07ff) {
 		int ok;
 
 		if (usb_endpoint_dir_in(desc))
@@ -989,12 +989,12 @@ static int musb_gadget_enable(struct usb_ep *ep,
 			dev_dbg(musb->controller, "no support for high bandwidth ISO\n");
 			goto fail;
 		}
-		musb_ep->hb_mult = tmp;
+		musb_ep->hb_mult = (tmp >> 11) & 3;
 	} else {
 		musb_ep->hb_mult = 0;
 	}
 
-	musb_ep->packet_sz = usb_endpoint_maxp(desc);
+	musb_ep->packet_sz = tmp & 0x7ff;
 	tmp = musb_ep->packet_sz * (musb_ep->hb_mult + 1);
 
 	/* enable the interrupts for the endpoint, set the endpoint

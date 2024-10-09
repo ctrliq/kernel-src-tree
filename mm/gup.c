@@ -167,11 +167,6 @@ split_fallthrough:
 			pte_unmap_unlock(ptep, ptl);
 			migration_entry_wait(mm, pmd, address);
 			goto split_fallthrough;
-		} else if (is_hmm_entry(entry)) {
-			pte_unmap_unlock(ptep, ptl);
-			if (hmm_migrate_fault(vma, address, entry, pmd))
-				goto no_page;
-			goto split_fallthrough;
 		}
 		goto no_page;
 	}
@@ -274,12 +269,6 @@ no_page_table:
 	    (!vma->vm_ops || !vma->vm_ops->fault))
 		return ERR_PTR(-EFAULT);
 	return page;
-}
-
-static inline int stack_guard_page(struct vm_area_struct *vma, unsigned long addr)
-{
-	return stack_guard_page_start(vma, addr) ||
-	       stack_guard_page_end(vma, addr+PAGE_SIZE);
 }
 
 /**
@@ -427,7 +416,8 @@ long __get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
 
 		if (is_vm_hugetlb_page(vma)) {
 			i = follow_hugetlb_page(mm, vma, pages, vmas,
-					&start, &nr_pages, i, gup_flags);
+					&start, &nr_pages, i,
+					gup_flags, nonblocking);
 			continue;
 		}
 
@@ -449,11 +439,6 @@ long __get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
 				int ret;
 				unsigned int fault_flags = 0;
 
-				/* For mlock, just skip the stack guard page. */
-				if (foll_flags & FOLL_MLOCK) {
-					if (stack_guard_page(vma, start))
-						goto next_page;
-				}
 				if (foll_flags & FOLL_WRITE)
 					fault_flags |= FAULT_FLAG_WRITE;
 				if (nonblocking)

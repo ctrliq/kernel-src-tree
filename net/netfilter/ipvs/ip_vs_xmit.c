@@ -872,8 +872,7 @@ ip_vs_tunnel_xmit(struct sk_buff *skb, struct ip_vs_conn *cp,
 	/* fix old IP header checksum */
 	ip_send_check(old_iph);
 
-	skb = iptunnel_handle_offloads(skb, false, SKB_GSO_IPIP);
-	if (IS_ERR(skb))
+	if (iptunnel_handle_offloads(skb, SKB_GSO_IPIP))
 		goto tx_error;
 
 	skb->transport_header = skb->network_header;
@@ -965,9 +964,7 @@ ip_vs_tunnel_xmit_v6(struct sk_buff *skb, struct ip_vs_conn *cp,
 		old_iph = ipv6_hdr(skb);
 	}
 
-	/* GSO: we need to provide proper SKB_GSO_ value for IPv6 */
-	skb = iptunnel_handle_offloads(skb, false, 0); /* SKB_GSO_SIT/IPV6 */
-	if (IS_ERR(skb))
+	if (iptunnel_handle_offloads(skb, 0)) /* SKB_GSO_SIT/IPV6 */
 		goto tx_error;
 
 	skb->transport_header = skb->network_header;

@@ -156,6 +156,7 @@ static int __init x86_xsave_setup(char *s)
 	setup_clear_cpu_cap(X86_FEATURE_AVX);
 	setup_clear_cpu_cap(X86_FEATURE_AVX2);
 	setup_clear_cpu_cap(X86_FEATURE_AVX512F);
+	setup_clear_cpu_cap(X86_FEATURE_AVX512IFMA);
 	setup_clear_cpu_cap(X86_FEATURE_AVX512PF);
 	setup_clear_cpu_cap(X86_FEATURE_AVX512ER);
 	setup_clear_cpu_cap(X86_FEATURE_AVX512CD);
@@ -163,6 +164,10 @@ static int __init x86_xsave_setup(char *s)
 	setup_clear_cpu_cap(X86_FEATURE_AVX512BW);
 	setup_clear_cpu_cap(X86_FEATURE_AVX512VL);
 	setup_clear_cpu_cap(X86_FEATURE_MPX);
+	setup_clear_cpu_cap(X86_FEATURE_AVX512VBMI);
+	setup_clear_cpu_cap(X86_FEATURE_AVX512_4VNNIW);
+	setup_clear_cpu_cap(X86_FEATURE_AVX512_4FMAPS);
+	setup_clear_cpu_cap(X86_FEATURE_AVX512_VPOPCNTDQ);
 	return 1;
 }
 __setup("noxsave", x86_xsave_setup);
@@ -642,53 +647,51 @@ void cpu_detect(struct cpuinfo_x86 *c)
 
 void get_cpu_cap(struct cpuinfo_x86 *c)
 {
-	u32 tfms, xlvl;
-	u32 ebx;
+	u32 eax, ebx, ecx, edx;
 
 	/* Intel-defined flags: level 0x00000001 */
 	if (c->cpuid_level >= 0x00000001) {
-		u32 capability, excap;
+		cpuid(0x00000001, &eax, &ebx, &ecx, &edx);
 
-		cpuid(0x00000001, &tfms, &ebx, &excap, &capability);
-		c->x86_capability[0] = capability;
-		c->x86_capability[4] = excap;
+		c->x86_capability[CPUID_1_ECX] = ecx;
+		c->x86_capability[CPUID_1_EDX] = edx;
 	}
 
 	/* Additional Intel-defined flags: level 0x00000007 */
 	if (c->cpuid_level >= 0x00000007) {
-		u32 eax, ebx, ecx, edx;
-
 		cpuid_count(0x00000007, 0, &eax, &ebx, &ecx, &edx);
 
-		c->x86_capability[9] = ebx;
+		c->x86_capability[CPUID_7_0_EBX] = ebx;
+
+		c->x86_capability[CPUID_6_EAX] = cpuid_eax(0x00000006);
+		c->x86_capability[CPUID_7_ECX] = ecx;
 	}
 
 	/* Extended state features: level 0x0000000d */
 	if (c->cpuid_level >= 0x0000000d) {
-		u32 eax, ebx, ecx, edx;
-
 		cpuid_count(0x0000000d, 1, &eax, &ebx, &ecx, &edx);
 
-		c->x86_capability[10] = eax;
+		c->x86_capability[CPUID_D_1_EAX] = eax;
 	}
 
 	/* Additional Intel-defined flags: level 0x0000000F */
 	if (c->cpuid_level >= 0x0000000F) {
-		u32 eax, ebx, ecx, edx;
 		struct rh_cpuinfo_x86 *rh_c =
 			(c == &boot_cpu_data) ? &rh_boot_cpu_data
 			: &rh_cpu_data(c->cpu_index);
 
 		/* QoS sub-leaf, EAX=0Fh, ECX=0 */
 		cpuid_count(0x0000000F, 0, &eax, &ebx, &ecx, &edx);
-		c->x86_capability[11] = edx;
+		c->x86_capability[CPUID_F_0_EDX] = edx;
+
 		if (cpu_has(c, X86_FEATURE_CQM_LLC)) {
 			/* will be overridden if occupancy monitoring exists */
 			rh_c->x86_cache_max_rmid = ebx;
 
 			/* QoS sub-leaf, EAX=0Fh, ECX=1 */
 			cpuid_count(0x0000000F, 1, &eax, &ebx, &ecx, &edx);
-			c->x86_capability[12] = edx;
+			c->x86_capability[CPUID_F_1_EDX] = edx;
+
 			if ((cpu_has(c, X86_FEATURE_CQM_OCCUP_LLC)) ||
 			      ((cpu_has(c, X86_FEATURE_CQM_MBM_TOTAL)) ||
 			       (cpu_has(c, X86_FEATURE_CQM_MBM_LOCAL)))) {
@@ -702,18 +705,27 @@ void get_cpu_cap(struct cpuinfo_x86 *c)
 	}
 
 	/* AMD-defined flags: level 0x80000001 */
-	xlvl = cpuid_eax(0x80000000);
-	c->extended_cpuid_level = xlvl;
+	eax = cpuid_eax(0x80000000);
+	c->extended_cpuid_level = eax;
 
-	if ((xlvl & 0xffff0000) == 0x80000000) {
-		if (xlvl >= 0x80000001) {
-			c->x86_capability[1] = cpuid_edx(0x80000001);
-			c->x86_capability[6] = cpuid_ecx(0x80000001);
+	if ((eax & 0xffff0000) == 0x80000000) {
+		if (eax >= 0x80000001) {
+			cpuid(0x80000001, &eax, &ebx, &ecx, &edx);
+
+			c->x86_capability[CPUID_8000_0001_ECX] = ecx;
+			c->x86_capability[CPUID_8000_0001_EDX] = edx;
 		}
 	}
 
+	if (c->extended_cpuid_level >= 0x80000007) {
+		cpuid(0x80000007, &eax, &ebx, &ecx, &edx);
+
+		c->x86_capability[CPUID_8000_0007_EBX] = ebx;
+		c->x86_power = edx;
+	}
+
 	if (c->extended_cpuid_level >= 0x80000008) {
-		u32 eax = cpuid_eax(0x80000008);
+		cpuid(0x80000008, &eax, &ebx, &ecx, &edx);
 
 		c->x86_virt_bits = (eax >> 8) & 0xff;
 		c->x86_phys_bits = eax & 0xff;
@@ -723,8 +735,8 @@ void get_cpu_cap(struct cpuinfo_x86 *c)
 		c->x86_phys_bits = 36;
 #endif
 
-	if (c->extended_cpuid_level >= 0x80000007)
-		c->x86_power = cpuid_edx(0x80000007);
+	if (c->extended_cpuid_level >= 0x8000000a)
+		c->x86_capability[15] = cpuid_edx(0x8000000a);
 
 	init_scattered_cpuid_features(c);
 }
@@ -792,6 +804,8 @@ static void __init early_identify_cpu(struct cpuinfo_x86 *c)
 	get_cpu_vendor(c);
 
 	get_cpu_cap(c);
+
+	get_model_name(c); /* RHEL7: get default name for unsupported check */
 
 	if (this_cpu->c_early_init)
 		this_cpu->c_early_init(c);
@@ -905,13 +919,30 @@ static void x86_init_cache_qos(struct cpuinfo_x86 *c)
 }
 
 /*
+ * Validate that ACPI/mptables have the same information about the
+ * effective APIC id and update the package map.
+ */
+static void validate_apic_and_package_id(struct cpuinfo_x86 *c)
+{
+#ifdef CONFIG_SMP
+	unsigned int apicid, cpu = smp_processor_id();
+
+	apicid = apic->cpu_present_to_apicid(cpu);
+	if (apicid != c->apicid) {
+		pr_err(FW_BUG "CPU%u: APIC id mismatch. Firmware: %x APIC: %x\n",
+		       cpu, apicid, c->initial_apicid);
+	}
+	BUG_ON(topology_update_package_map(c->phys_proc_id, cpu));
+#else
+	c->logical_proc_id = 0;
+#endif
+}
+
+/*
  * This does the hard work of actually picking apart the CPU stuff...
  */
 static void identify_cpu(struct cpuinfo_x86 *c)
 {
-	struct rh_cpuinfo_x86 *rh_c = (c == &boot_cpu_data) ?
-				      &rh_boot_cpu_data :
-				      &rh_cpu_data(c->cpu_index);
 	int i;
 
 	c->loops_per_jiffy = loops_per_jiffy;
@@ -1031,9 +1062,6 @@ static void identify_cpu(struct cpuinfo_x86 *c)
 #ifdef CONFIG_NUMA
 	numa_add_cpu(smp_processor_id());
 #endif
-	/* The boot/hotplug time assigment got cleared, restore it */
-	rh_c->logical_proc_id = topology_phys_to_logical_pkg(c->phys_proc_id);
-
 }
 
 #ifdef CONFIG_X86_64
@@ -1067,6 +1095,7 @@ void identify_secondary_cpu(struct cpuinfo_x86 *c)
 	enable_sep_cpu();
 #endif
 	mtrr_ap_init();
+	validate_apic_and_package_id(c);
 }
 
 struct msr_range {

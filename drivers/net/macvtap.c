@@ -21,6 +21,7 @@
 #include <net/rtnetlink.h>
 #include <net/sock.h>
 #include <linux/virtio_net.h>
+#include <linux/skb_array.h>
 
 /*
  * A macvtap queue is the central object of this driver, it connects
@@ -43,6 +44,7 @@ struct macvtap_queue {
 	u16 queue_index;
 	bool enabled;
 	struct list_head next;
+	struct skb_array skb_array;
 };
 
 #define MACVTAP_FEATURES (IFF_VNET_HDR | IFF_MULTI_QUEUE)
@@ -357,7 +359,7 @@ static rx_handler_result_t macvtap_handle_frame(struct sk_buff **pskb)
 	if (!q)
 		return RX_HANDLER_PASS;
 
-	if (skb_queue_len(&q->sk.sk_receive_queue) >= dev->tx_queue_len)
+	if (__skb_array_full(&q->skb_array))
 		goto drop;
 
 	skb_push(skb, ETH_HLEN);
@@ -375,7 +377,8 @@ static rx_handler_result_t macvtap_handle_frame(struct sk_buff **pskb)
 			goto drop;
 
 		if (!segs) {
-			skb_queue_tail(&q->sk.sk_receive_queue, skb);
+			if (skb_array_produce(&q->skb_array, skb))
+				goto drop;
 			goto wake_up;
 		}
 
@@ -384,7 +387,11 @@ static rx_handler_result_t macvtap_handle_frame(struct sk_buff **pskb)
 			struct sk_buff *nskb = segs->next;
 
 			segs->next = NULL;
-			skb_queue_tail(&q->sk.sk_receive_queue, segs);
+			if (skb_array_produce(&q->skb_array, segs)) {
+				kfree_skb(segs);
+				kfree_skb_list(nskb);
+				break;
+			}
 			segs = nskb;
 		}
 	} else {
@@ -397,7 +404,8 @@ static rx_handler_result_t macvtap_handle_frame(struct sk_buff **pskb)
 		    !(features & NETIF_F_CSUM_MASK) &&
 		    skb_checksum_help(skb))
 			goto drop;
-		skb_queue_tail(&q->sk.sk_receive_queue, skb);
+		if (skb_array_produce(&q->skb_array, skb))
+			goto drop;
 	}
 
 wake_up:
@@ -514,7 +522,9 @@ static void macvtap_sock_write_space(struct sock *sk)
 
 static void macvtap_sock_destruct(struct sock *sk)
 {
-	skb_queue_purge(&sk->sk_receive_queue);
+	struct macvtap_queue *q = container_of(sk, struct macvtap_queue, sk);
+
+	skb_array_cleanup(&q->skb_array);
 }
 
 static int macvtap_open(struct inode *inode, struct file *file)
@@ -527,13 +537,13 @@ static int macvtap_open(struct inode *inode, struct file *file)
 	rtnl_lock();
 	dev = dev_get_by_macvtap_minor(iminor(inode));
 	if (!dev)
-		goto out;
+		goto err;
 
 	err = -ENOMEM;
 	q = (struct macvtap_queue *)sk_alloc(net, AF_UNSPEC, GFP_KERNEL,
 					     &macvtap_proto);
 	if (!q)
-		goto out;
+		goto err;
 
 	RCU_INIT_POINTER(q->sock.wq, &q->wq);
 	init_waitqueue_head(&q->wq.wait);
@@ -557,11 +567,24 @@ static int macvtap_open(struct inode *inode, struct file *file)
 	if ((dev->features & NETIF_F_HIGHDMA) && (dev->features & NETIF_F_SG))
 		sock_set_flag(&q->sk, SOCK_ZEROCOPY);
 
+	err = -ENOMEM;
+	if (skb_array_init(&q->skb_array, dev->tx_queue_len, GFP_KERNEL))
+		goto err_array;
+
 	err = macvtap_set_queue(dev, file, q);
 	if (err)
-		sock_put(&q->sk);
+		goto err_queue;
 
-out:
+	dev_put(dev);
+
+	rtnl_unlock();
+	return err;
+
+err_queue:
+	skb_array_cleanup(&q->skb_array);
+err_array:
+	sock_put(&q->sk);
+err:
 	if (dev)
 		dev_put(dev);
 
@@ -587,7 +610,7 @@ static unsigned int macvtap_poll(struct file *file, poll_table * wait)
 	mask = 0;
 	poll_wait(file, &q->wq.wait, wait);
 
-	if (!skb_queue_empty(&q->sk.sk_receive_queue))
+	if (!skb_array_empty(&q->skb_array))
 		mask |= POLLIN | POLLRDNORM;
 
 	if (sock_writeable(&q->sk) ||
@@ -1033,7 +1056,7 @@ static ssize_t macvtap_do_read(struct macvtap_queue *q, struct kiocb *iocb,
 					TASK_INTERRUPTIBLE);
 
 		/* Read frames from the queue */
-		skb = skb_dequeue(&q->sk.sk_receive_queue);
+		skb = skb_array_consume(&q->skb_array);
 		if (!skb) {
 			if (noblock) {
 				ret = -EAGAIN;
@@ -1333,10 +1356,18 @@ static int macvtap_recvmsg(struct kiocb *iocb, struct socket *sock,
 	return ret;
 }
 
+static int macvtap_peek_len(struct socket *sock)
+{
+	struct macvtap_queue *q = container_of(sock, struct macvtap_queue,
+					       sock);
+	return skb_array_peek_len(&q->skb_array);
+}
+
 /* Ops structure to mimic raw sockets with tun */
 static const struct proto_ops macvtap_socket_ops = {
 	.sendmsg = macvtap_sendmsg,
 	.recvmsg = macvtap_recvmsg,
+	.peek_len = macvtap_peek_len,
 };
 
 /* Get an underlying socket object from tun file.  Returns error unless file is
@@ -1354,6 +1385,28 @@ struct socket *macvtap_get_socket(struct file *file)
 	return &q->sock;
 }
 EXPORT_SYMBOL_GPL(macvtap_get_socket);
+
+static int macvtap_queue_resize(struct macvlan_dev *vlan)
+{
+	struct net_device *dev = vlan->dev;
+	struct macvtap_queue *q;
+	struct skb_array **arrays;
+	int n = vlan->numqueues;
+	int ret, i = 0;
+
+	arrays = kmalloc(sizeof *arrays * n, GFP_KERNEL);
+	if (!arrays)
+		return -ENOMEM;
+
+	list_for_each_entry(q, &vlan->queue_list, next)
+		arrays[i++] = &q->skb_array;
+
+	ret = skb_array_resize_multiple(arrays, n,
+					dev->tx_queue_len, GFP_KERNEL);
+
+	kfree(arrays);
+	return ret;
+}
 
 static int macvtap_device_event(struct notifier_block *unused,
 				unsigned long event, void *ptr)
@@ -1391,6 +1444,10 @@ static int macvtap_device_event(struct notifier_block *unused,
 		devt = MKDEV(MAJOR(macvtap_major), vlan->minor);
 		device_destroy(macvtap_class, devt);
 		macvtap_free_minor(vlan);
+		break;
+	case NETDEV_CHANGE_TX_QUEUE_LEN:
+		if (macvtap_queue_resize(vlan))
+			return NOTIFY_BAD;
 		break;
 	}
 

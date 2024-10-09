@@ -471,7 +471,7 @@ static int __inet_insert_ifa(struct in_ifaddr *ifa, struct nlmsghdr *nlh,
 	}
 
 	if (!(ifa->ifa_flags & IFA_F_SECONDARY)) {
-		net_srandom(ifa->ifa_local);
+		prandom_seed((__force u32) ifa->ifa_local);
 		ifap = last_primary;
 	}
 
@@ -1647,7 +1647,8 @@ errout:
 		rtnl_set_sk_err(net, RTNLGRP_IPV4_IFADDR, err);
 }
 
-static size_t inet_get_link_af_size(const struct net_device *dev)
+static size_t inet_get_link_af_size(const struct net_device *dev,
+				    u32 ext_filter_mask)
 {
 	struct in_device *in_dev = rcu_dereference_rtnl(dev->ip_ptr);
 
@@ -2334,7 +2335,7 @@ static __net_initdata struct pernet_operations devinet_ops = {
 	.exit = devinet_exit_net,
 };
 
-static struct rtnl_af_ops inet_af_ops = {
+static struct rtnl_af_ops inet_af_ops __read_mostly = {
 	.family		  = AF_INET,
 	.fill_link_af	  = inet_fill_link_af,
 	.get_link_af_size = inet_get_link_af_size,
@@ -2364,4 +2365,3 @@ void __init devinet_init(void)
 	rtnl_register(PF_INET, RTM_GETNETCONF, inet_netconf_get_devconf,
 		      inet_netconf_dump_devconf, NULL);
 }
-

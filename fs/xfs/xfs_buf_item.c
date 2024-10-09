@@ -493,7 +493,7 @@ xfs_buf_item_unpin(
 		xfs_buf_hold(bp);
 		bp->b_flags |= XBF_ASYNC;
 		xfs_buf_ioerror(bp, -EIO);
-		XFS_BUF_UNDONE(bp);
+		bp->b_flags &= ~XBF_DONE;
 		xfs_buf_stale(bp);
 		xfs_buf_ioend(bp);
 	}
@@ -1133,7 +1133,7 @@ permanent_error:
 	xfs_force_shutdown(mp, SHUTDOWN_META_IO_ERROR);
 out_stale:
 	xfs_buf_stale(bp);
-	XFS_BUF_DONE(bp);
+	bp->b_flags |= XBF_DONE;
 	trace_xfs_buf_error_relse(bp, _RET_IP_);
 	return false;
 }

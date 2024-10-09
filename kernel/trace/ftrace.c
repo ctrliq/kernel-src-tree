@@ -4971,7 +4971,7 @@ static int alloc_retstack_tasklist(struct ftrace_ret_stack **ret_stack_list)
 		}
 	}
 
-	read_lock_irqsave(&tasklist_lock, flags);
+	qread_lock_irqsave(&tasklist_lock, flags);
 	do_each_thread(g, t) {
 		if (start == end) {
 			ret = -EAGAIN;
@@ -4989,7 +4989,7 @@ static int alloc_retstack_tasklist(struct ftrace_ret_stack **ret_stack_list)
 	} while_each_thread(g, t);
 
 unlock:
-	read_unlock_irqrestore(&tasklist_lock, flags);
+	qread_unlock_irqrestore(&tasklist_lock, flags);
 free:
 	for (i = start; i < end; i++)
 		kfree(ret_stack_list[i]);

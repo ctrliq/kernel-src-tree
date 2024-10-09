@@ -7,17 +7,18 @@
 struct tcf_gact {
 	struct tcf_common	common;
 #ifdef CONFIG_GACT_PROB
-        u16			tcfg_ptype;
-        u16			tcfg_pval;
-        int			tcfg_paction;
+	u16			tcfg_ptype;
+	u16			tcfg_pval;
+	int			tcfg_paction;
+	atomic_t		packets;
 #endif
 };
-#define to_gact(pc) \
-	container_of(pc, struct tcf_gact, common)
+#define to_gact(a) \
+	container_of(a->priv, struct tcf_gact, common)
 
-#ifdef CONFIG_NET_CLS_ACT
 static inline bool is_tcf_gact_shot(const struct tc_action *a)
 {
+#ifdef CONFIG_NET_CLS_ACT
 	struct tcf_gact *gact;
 
 	if (a->ops && a->ops->type != TCA_ACT_GACT)
@@ -27,7 +28,7 @@ static inline bool is_tcf_gact_shot(const struct tc_action *a)
 	if (gact->tcf_action == TC_ACT_SHOT)
 		return true;
 
+#endif
 	return false;
 }
-#endif
 #endif /* __NET_TC_GACT_H */

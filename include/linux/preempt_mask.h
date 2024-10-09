@@ -2,7 +2,10 @@
 #define LINUX_PREEMPT_MASK_H
 
 #include <linux/preempt.h>
-#include <asm/hardirq.h>
+
+#ifdef CONFIG_S390
+# include <asm/hardirq.h>
+#endif
 
 /*
  * We put the hardirq and softirq counter into the preemption

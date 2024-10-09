@@ -209,6 +209,7 @@ struct pci_dn {
 #define IODA_INVALID_PE		(-1)
 #ifdef CONFIG_PPC_POWERNV
 	int	pe_number;
+	int     vf_index;		/* VF index in the PF */
 #ifdef CONFIG_PCI_IOV
 	u16     vfs_expanded;		/* number of VFs IOV BAR expanded */
 	u16     num_vfs;		/* number of VFs enabled*/
@@ -217,6 +218,7 @@ struct pci_dn {
 #define IODA_INVALID_M64        (-1)
 	int     (*m64_map)[PCI_SRIOV_NUM_BARS];
 #endif /* CONFIG_PCI_IOV */
+	int	mps;			/* Maximum Payload Size */
 #endif
 	struct list_head child_list;
 	struct list_head list;

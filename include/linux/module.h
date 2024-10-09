@@ -314,6 +314,10 @@ struct module
 	/* Arch-specific module values */
 	struct mod_arch_specific arch;
 
+	/*
+	 * RHEL7 note - to preserve kABI, leave as an unsigned int, which
+	 * is wide enough to handle current TAINT_FLAGS_COUNT(32) bits
+	 */
 	unsigned int taints;	/* same bits as kernel:tainted */
 
 #ifdef CONFIG_GENERIC_BUG

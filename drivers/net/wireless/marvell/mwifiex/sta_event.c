@@ -723,7 +723,7 @@ int mwifiex_process_sta_event(struct mwifiex_private *priv)
 	case EVENT_RSSI_LOW:
 		cfg80211_cqm_rssi_notify(priv->netdev,
 					 NL80211_CQM_RSSI_THRESHOLD_EVENT_LOW,
-					 GFP_KERNEL);
+					 0, GFP_KERNEL);
 		mwifiex_send_cmd(priv, HostCmd_CMD_RSSI_INFO,
 				 HostCmd_ACT_GEN_GET, 0, NULL, false);
 		priv->subsc_evt_rssi_state = RSSI_LOW_RECVD;
@@ -738,7 +738,7 @@ int mwifiex_process_sta_event(struct mwifiex_private *priv)
 	case EVENT_RSSI_HIGH:
 		cfg80211_cqm_rssi_notify(priv->netdev,
 					 NL80211_CQM_RSSI_THRESHOLD_EVENT_HIGH,
-					 GFP_KERNEL);
+					 0, GFP_KERNEL);
 		mwifiex_send_cmd(priv, HostCmd_CMD_RSSI_INFO,
 				 HostCmd_ACT_GEN_GET, 0, NULL, false);
 		priv->subsc_evt_rssi_state = RSSI_HIGH_RECVD;

@@ -163,6 +163,7 @@ done:
  *	__skb_try_recv_datagram - Receive a datagram skbuff
  *	@sk: socket
  *	@flags: MSG_ flags
+ *	@destructor: invoked under the receive lock on successful dequeue
  *	@peeked: returns non-zero if this packet has been seen before
  *	@off: an offset in bytes to peek skb from. Returns an offset
  *	      within an skb where data actually starts
@@ -195,6 +196,8 @@ done:
  *	the standard around please.
  */
 struct sk_buff *__skb_try_recv_datagram(struct sock *sk, unsigned int flags,
+					void (*destructor)(struct sock *sk,
+							   struct sk_buff *skb),
 					int *peeked, int *off, int *err,
 					struct sk_buff **last)
 {
@@ -239,9 +242,11 @@ struct sk_buff *__skb_try_recv_datagram(struct sock *sk, unsigned int flags,
 				}
 
 				atomic_inc(&skb->users);
-			} else
+			} else {
 				__skb_unlink(skb, queue);
-
+				if (destructor)
+					destructor(sk, skb);
+			}
 			spin_unlock_irqrestore(&queue->lock, cpu_flags);
 			*off = _off;
 			return skb;
@@ -260,6 +265,8 @@ no_packet:
 EXPORT_SYMBOL(__skb_try_recv_datagram);
 
 struct sk_buff *__skb_recv_datagram(struct sock *sk, unsigned int flags,
+				    void (*destructor)(struct sock *sk,
+						       struct sk_buff *skb),
 				    int *peeked, int *off, int *err)
 {
 	struct sk_buff *skb, *last;
@@ -268,8 +275,8 @@ struct sk_buff *__skb_recv_datagram(struct sock *sk, unsigned int flags,
 	timeo = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
 
 	do {
-		skb = __skb_try_recv_datagram(sk, flags, peeked, off, err,
-					      &last);
+		skb = __skb_try_recv_datagram(sk, flags, destructor, peeked,
+					      off, err, &last);
 		if (skb)
 			return skb;
 
@@ -288,7 +295,7 @@ struct sk_buff *skb_recv_datagram(struct sock *sk, unsigned int flags,
 	int peeked, off = 0;
 
 	return __skb_recv_datagram(sk, flags | (noblock ? MSG_DONTWAIT : 0),
-				   &peeked, &off, err);
+				   NULL, &peeked, &off, err);
 }
 EXPORT_SYMBOL(skb_recv_datagram);
 
@@ -318,6 +325,31 @@ void skb_free_datagram_locked(struct sock *sk, struct sk_buff *skb)
 }
 EXPORT_SYMBOL(skb_free_datagram_locked);
 
+int __sk_queue_drop_skb(struct sock *sk, struct sk_buff *skb,
+			unsigned int flags,
+			void (*destructor)(struct sock *sk,
+					   struct sk_buff *skb))
+{
+	int err = 0;
+
+	if (flags & MSG_PEEK) {
+		err = -ENOENT;
+		spin_lock_bh(&sk->sk_receive_queue.lock);
+		if (skb == skb_peek(&sk->sk_receive_queue)) {
+			__skb_unlink(skb, &sk->sk_receive_queue);
+			atomic_dec(&skb->users);
+			if (destructor)
+				destructor(sk, skb);
+			err = 0;
+		}
+		spin_unlock_bh(&sk->sk_receive_queue.lock);
+	}
+
+	atomic_inc(&sk->sk_drops);
+	return err;
+}
+EXPORT_SYMBOL(__sk_queue_drop_skb);
+
 /**
  *	skb_kill_datagram - Free a datagram skbuff forcibly
  *	@sk: socket
@@ -341,23 +373,10 @@ EXPORT_SYMBOL(skb_free_datagram_locked);
 
 int skb_kill_datagram(struct sock *sk, struct sk_buff *skb, unsigned int flags)
 {
-	int err = 0;
-
-	if (flags & MSG_PEEK) {
-		err = -ENOENT;
-		spin_lock_bh(&sk->sk_receive_queue.lock);
-		if (skb == skb_peek(&sk->sk_receive_queue)) {
-			__skb_unlink(skb, &sk->sk_receive_queue);
-			atomic_dec(&skb->users);
-			err = 0;
-		}
-		spin_unlock_bh(&sk->sk_receive_queue.lock);
-	}
+	int err = __sk_queue_drop_skb(sk, skb, flags, NULL);
 
 	kfree_skb(skb);
-	atomic_inc(&sk->sk_drops);
 	sk_mem_reclaim_partial(sk);
-
 	return err;
 }
 EXPORT_SYMBOL(skb_kill_datagram);

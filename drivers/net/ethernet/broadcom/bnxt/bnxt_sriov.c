@@ -1,6 +1,7 @@
 /* Broadcom NetXtreme-C/E network driver.
  *
  * Copyright (c) 2014-2016 Broadcom Corporation
+ * Copyright (c) 2016-2017 Broadcom Limited
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -15,6 +16,7 @@
 #include <linux/etherdevice.h>
 #include "bnxt_hsi.h"
 #include "bnxt.h"
+#include "bnxt_ulp.h"
 #include "bnxt_sriov.h"
 #include "bnxt_ethtool.h"
 
@@ -83,6 +85,9 @@ int bnxt_set_vf_spoofchk(struct net_device *dev, int vf_id, bool setting)
 	u32 func_flags;
 	int rc;
 
+	if (bp->hwrm_spec_code < 0x10701)
+		return -ENOTSUPP;
+
 	rc = bnxt_vf_ndo_prep(bp, vf_id);
 	if (rc)
 		return rc;
@@ -95,9 +100,9 @@ int bnxt_set_vf_spoofchk(struct net_device *dev, int vf_id, bool setting)
 
 	func_flags = vf->func_flags;
 	if (setting)
-		func_flags |= FUNC_CFG_REQ_FLAGS_SRC_MAC_ADDR_CHECK;
+		func_flags |= FUNC_CFG_REQ_FLAGS_SRC_MAC_ADDR_CHECK_ENABLE;
 	else
-		func_flags &= ~FUNC_CFG_REQ_FLAGS_SRC_MAC_ADDR_CHECK;
+		func_flags |= FUNC_CFG_REQ_FLAGS_SRC_MAC_ADDR_CHECK_DISABLE;
 	/*TODO: if the driver supports VLAN filter on guest VLAN,
 	 * the spoof check should also include vlan anti-spoofing
 	 */
@@ -176,13 +181,20 @@ int bnxt_set_vf_mac(struct net_device *dev, int vf_id, u8 *mac)
 	return hwrm_send_message(bp, &req, sizeof(req), HWRM_CMD_TIMEOUT);
 }
 
-int bnxt_set_vf_vlan(struct net_device *dev, int vf_id, u16 vlan_id, u8 qos)
+int bnxt_set_vf_vlan(struct net_device *dev, int vf_id, u16 vlan_id, u8 qos,
+		     __be16 vlan_proto)
 {
 	struct hwrm_func_cfg_input req = {0};
 	struct bnxt *bp = netdev_priv(dev);
 	struct bnxt_vf_info *vf;
 	u16 vlan_tag;
 	int rc;
+
+	if (bp->hwrm_spec_code < 0x10201)
+		return -ENOTSUPP;
+
+	if (vlan_proto != htons(ETH_P_8021Q))
+		return -EPROTONOSUPPORT;
 
 	rc = bnxt_vf_ndo_prep(bp, vf_id);
 	if (rc)
@@ -411,19 +423,12 @@ static int bnxt_hwrm_func_cfg(struct bnxt *bp, int num_vfs)
 	u16 vf_ring_grps;
 	struct hwrm_func_cfg_input req = {0};
 	struct bnxt_pf_info *pf = &bp->pf;
+	int total_vf_tx_rings = 0;
 
 	bnxt_hwrm_cmd_hdr_init(bp, &req, HWRM_FUNC_CFG, -1, -1);
 
 	/* Remaining rings are distributed equally amongs VF's for now */
-	/* TODO: the following workaroud is needed to restrict total number
-	 * of vf_cp_rings not exceed number of HW ring groups. This WA should
-	 * be removed once new HWRM provides HW ring groups capability in
-	 * hwrm_func_qcap.
-	 */
-	vf_cp_rings = min_t(u16, pf->max_cp_rings, pf->max_stat_ctxs);
-	vf_cp_rings = (vf_cp_rings - bp->cp_nr_rings) / num_vfs;
-	/* TODO: restore this logic below once the WA above is removed */
-	/* vf_cp_rings = (pf->max_cp_rings - bp->cp_nr_rings) / num_vfs; */
+	vf_cp_rings = (pf->max_cp_rings - bp->cp_nr_rings) / num_vfs;
 	vf_stat_ctx = (pf->max_stat_ctxs - bp->num_stat_ctxs) / num_vfs;
 	if (bp->flags & BNXT_FLAG_AGG_RINGS)
 		vf_rx_rings = (pf->max_rx_rings - bp->rx_nr_rings * 2) /
@@ -463,6 +468,8 @@ static int bnxt_hwrm_func_cfg(struct bnxt *bp, int num_vfs)
 
 	mutex_lock(&bp->hwrm_cmd_lock);
 	for (i = 0; i < num_vfs; i++) {
+		int vf_tx_rsvd = vf_tx_rings;
+
 		req.fid = cpu_to_le16(pf->first_vf_id + i);
 		rc = _hwrm_send_message(bp, &req, sizeof(req),
 					HWRM_CMD_TIMEOUT);
@@ -470,10 +477,15 @@ static int bnxt_hwrm_func_cfg(struct bnxt *bp, int num_vfs)
 			break;
 		pf->active_vfs = i + 1;
 		pf->vf[i].fw_fid = le16_to_cpu(req.fid);
+		rc = __bnxt_hwrm_get_tx_rings(bp, pf->vf[i].fw_fid,
+					      &vf_tx_rsvd);
+		if (rc)
+			break;
+		total_vf_tx_rings += vf_tx_rsvd;
 	}
 	mutex_unlock(&bp->hwrm_cmd_lock);
 	if (!rc) {
-		pf->max_tx_rings -= vf_tx_rings * num_vfs;
+		pf->max_tx_rings -= total_vf_tx_rings;
 		pf->max_rx_rings -= vf_rx_rings * num_vfs;
 		pf->max_hw_ring_grps -= vf_ring_grps * num_vfs;
 		pf->max_cp_rings -= vf_cp_rings * num_vfs;
@@ -550,6 +562,8 @@ static int bnxt_sriov_enable(struct bnxt *bp, int *num_vfs)
 	if (rc)
 		goto err_out2;
 
+	bnxt_ulp_sriov_cfg(bp, *num_vfs);
+
 	rc = pci_enable_sriov(bp->pdev, *num_vfs);
 	if (rc)
 		goto err_out2;
@@ -588,7 +602,11 @@ void bnxt_sriov_disable(struct bnxt *bp)
 
 	bp->pf.active_vfs = 0;
 	/* Reclaim all resources for the PF. */
-	bnxt_hwrm_func_qcaps(bp);
+	rtnl_lock();
+	bnxt_restore_pf_fw_resources(bp);
+	rtnl_unlock();
+
+	bnxt_ulp_sriov_cfg(bp, 0);
 }
 
 int bnxt_sriov_configure(struct pci_dev *pdev, int num_vfs)

@@ -83,7 +83,7 @@ static bool perf_session__has_comm_exec(struct perf_session *session)
 {
 	struct perf_evsel *evsel;
 
-	evlist__for_each(session->evlist, evsel) {
+	evlist__for_each_entry(session->evlist, evsel) {
 		if (evsel->attr.comm_exec)
 			return true;
 	}
@@ -559,7 +559,7 @@ static u8 revbyte(u8 b)
 
 /*
  * XXX this is hack in attempt to carry flags bitfield
- * throught endian village. ABI says:
+ * through endian village. ABI says:
  *
  * Bit-fields are allocated from right to left (least to most significant)
  * on little-endian implementations and from left to right (most to least
@@ -909,7 +909,7 @@ static void callchain__printf(struct perf_evsel *evsel,
 	unsigned int i;
 	struct ip_callchain *callchain = sample->callchain;
 
-	if (has_branch_callstack(evsel))
+	if (perf_evsel__has_branch_callstack(evsel))
 		callchain__lbr_callstack_printf(sample);
 
 	printf("... FP chain: nr:%" PRIu64 "\n", callchain->nr);
@@ -1083,7 +1083,7 @@ static void dump_sample(struct perf_evsel *evsel, union perf_event *event,
 	if (sample_type & PERF_SAMPLE_CALLCHAIN)
 		callchain__printf(evsel, sample);
 
-	if ((sample_type & PERF_SAMPLE_BRANCH_STACK) && !has_branch_callstack(evsel))
+	if ((sample_type & PERF_SAMPLE_BRANCH_STACK) && !perf_evsel__has_branch_callstack(evsel))
 		branch_stack__printf(sample);
 
 	if (sample_type & PERF_SAMPLE_REGS_USER)
@@ -1886,7 +1886,7 @@ bool perf_session__has_traces(struct perf_session *session, const char *msg)
 {
 	struct perf_evsel *evsel;
 
-	evlist__for_each(session->evlist, evsel) {
+	evlist__for_each_entry(session->evlist, evsel) {
 		if (evsel->attr.type == PERF_TYPE_TRACEPOINT)
 			return true;
 	}
@@ -1968,117 +1968,11 @@ struct perf_evsel *perf_session__find_first_evtype(struct perf_session *session,
 {
 	struct perf_evsel *pos;
 
-	evlist__for_each(session->evlist, pos) {
+	evlist__for_each_entry(session->evlist, pos) {
 		if (pos->attr.type == type)
 			return pos;
 	}
 	return NULL;
-}
-
-void perf_evsel__print_ip(struct perf_evsel *evsel, struct perf_sample *sample,
-			  struct addr_location *al, int left_alignment,
-			  unsigned int print_opts, unsigned int stack_depth,
-			  FILE *fp)
-{
-	struct callchain_cursor_node *node;
-	int print_ip = print_opts & PRINT_IP_OPT_IP;
-	int print_sym = print_opts & PRINT_IP_OPT_SYM;
-	int print_dso = print_opts & PRINT_IP_OPT_DSO;
-	int print_symoffset = print_opts & PRINT_IP_OPT_SYMOFFSET;
-	int print_oneline = print_opts & PRINT_IP_OPT_ONELINE;
-	int print_srcline = print_opts & PRINT_IP_OPT_SRCLINE;
-	char s = print_oneline ? ' ' : '\t';
-
-	if (symbol_conf.use_callchain && sample->callchain) {
-		struct addr_location node_al;
-
-		if (thread__resolve_callchain(al->thread, evsel,
-					      sample, NULL, NULL,
-					      stack_depth) != 0) {
-			if (verbose)
-				error("Failed to resolve callchain. Skipping\n");
-			return;
-		}
-		callchain_cursor_commit(&callchain_cursor);
-
-		if (print_symoffset)
-			node_al = *al;
-
-		while (stack_depth) {
-			u64 addr = 0;
-
-			node = callchain_cursor_current(&callchain_cursor);
-			if (!node)
-				break;
-
-			if (node->sym && node->sym->ignore)
-				goto next;
-
-			fprintf(fp, "%-*.*s", left_alignment, left_alignment, " ");
-
-			if (print_ip)
-				fprintf(fp, "%c%16" PRIx64, s, node->ip);
-
-			if (node->map)
-				addr = node->map->map_ip(node->map, node->ip);
-
-			if (print_sym) {
-				fprintf(fp, " ");
-				if (print_symoffset) {
-					node_al.addr = addr;
-					node_al.map  = node->map;
-					symbol__fprintf_symname_offs(node->sym,
-								     &node_al,
-								     fp);
-				} else
-					symbol__fprintf_symname(node->sym, fp);
-			}
-
-			if (print_dso) {
-				fprintf(fp, " (");
-				map__fprintf_dsoname(node->map, fp);
-				fprintf(fp, ")");
-			}
-
-			if (print_srcline)
-				map__fprintf_srcline(node->map, addr, "\n  ",
-						     fp);
-
-			if (!print_oneline)
-				fprintf(fp, "\n");
-
-			stack_depth--;
-next:
-			callchain_cursor_advance(&callchain_cursor);
-		}
-
-	} else {
-		if (al->sym && al->sym->ignore)
-			return;
-
-		fprintf(fp, "%-*.*s", left_alignment, left_alignment, " ");
-
-		if (print_ip)
-			fprintf(fp, "%16" PRIx64, sample->ip);
-
-		if (print_sym) {
-			fprintf(fp, " ");
-			if (print_symoffset)
-				symbol__fprintf_symname_offs(al->sym, al,
-							     fp);
-			else
-				symbol__fprintf_symname(al->sym, fp);
-		}
-
-		if (print_dso) {
-			fprintf(fp, " (");
-			map__fprintf_dsoname(al->map, fp);
-			fprintf(fp, ")");
-		}
-
-		if (print_srcline)
-			map__fprintf_srcline(al->map, al->addr, "\n  ", fp);
-	}
 }
 
 int perf_session__cpu_bitmap(struct perf_session *session,
@@ -2219,7 +2113,7 @@ int perf_event__synthesize_id_index(struct perf_tool *tool,
 	max_nr = (UINT16_MAX - sizeof(struct id_index_event)) /
 		 sizeof(struct id_index_entry);
 
-	evlist__for_each(evlist, evsel)
+	evlist__for_each_entry(evlist, evsel)
 		nr += evsel->ids;
 
 	n = nr > max_nr ? max_nr : nr;
@@ -2232,7 +2126,7 @@ int perf_event__synthesize_id_index(struct perf_tool *tool,
 	ev->id_index.header.size = sz;
 	ev->id_index.nr = n;
 
-	evlist__for_each(evlist, evsel) {
+	evlist__for_each_entry(evlist, evsel) {
 		u32 j;
 
 		for (j = 0; j < evsel->ids; j++) {

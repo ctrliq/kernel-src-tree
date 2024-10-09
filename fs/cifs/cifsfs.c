@@ -54,10 +54,10 @@
 #endif
 
 int cifsFYI = 0;
-int traceSMB = 0;
+bool traceSMB;
 bool enable_oplocks = true;
-unsigned int linuxExtEnabled = 1;
-unsigned int lookupCacheEnabled = 1;
+bool linuxExtEnabled = true;
+bool lookupCacheEnabled = true;
 unsigned int global_secflags = CIFSSEC_DEF;
 /* unsigned int ntlmv2_support = 0; */
 unsigned int sign_CIFS_PDUs = 1;
@@ -86,6 +86,7 @@ extern mempool_t *cifs_req_poolp;
 extern mempool_t *cifs_mid_poolp;
 
 struct workqueue_struct	*cifsiod_wq;
+__u32 cifs_lock_secret;
 
 /*
  * Bumps refcount for cifs super block.
@@ -646,9 +647,7 @@ cifs_get_root(struct smb_vol *vol, struct super_block *sb)
 		while (*s && *s != sep)
 			s++;
 
-		mutex_lock(&dir->i_mutex);
-		child = lookup_one_len(p, dentry, s - p);
-		mutex_unlock(&dir->i_mutex);
+		child = lookup_one_len_unlocked(p, dentry, s - p);
 		dput(dentry);
 		dentry = child;
 	} while (!IS_ERR(dentry));
@@ -689,18 +688,14 @@ cifs_do_mount(struct file_system_type *fs_type,
 	cifs_sb->mountdata = kstrndup(data, PAGE_SIZE, GFP_KERNEL);
 	if (cifs_sb->mountdata == NULL) {
 		root = ERR_PTR(-ENOMEM);
-		goto out_cifs_sb;
+		goto out_free;
 	}
 
-	if (volume_info->prepath) {
-		cifs_sb->prepath = kstrdup(volume_info->prepath, GFP_KERNEL);
-		if (cifs_sb->prepath == NULL) {
-			root = ERR_PTR(-ENOMEM);
-			goto out_cifs_sb;
-		}
+	rc = cifs_setup_cifs_sb(volume_info, cifs_sb);
+	if (rc) {
+		root = ERR_PTR(rc);
+		goto out_free;
 	}
-
-	cifs_setup_cifs_sb(volume_info, cifs_sb);
 
 	rc = cifs_mount(cifs_sb, volume_info);
 	if (rc) {
@@ -708,7 +703,7 @@ cifs_do_mount(struct file_system_type *fs_type,
 			cifs_dbg(VFS, "cifs_mount failed w/return code = %d\n",
 				 rc);
 		root = ERR_PTR(rc);
-		goto out_mountdata;
+		goto out_free;
 	}
 
 	mnt_data.vol = volume_info;
@@ -751,9 +746,9 @@ out:
 	cifs_cleanup_volume_info(volume_info);
 	return root;
 
-out_mountdata:
+out_free:
+	kfree(cifs_sb->prepath);
 	kfree(cifs_sb->mountdata);
-out_cifs_sb:
 	kfree(cifs_sb);
 out_nls:
 	unload_nls(volume_info->local_nls);
@@ -768,7 +763,7 @@ cifs_loose_read(struct kiocb *iocb, const struct iovec *iov,
 	struct inode *inode = file_inode(iocb->ki_filp);
 
 	if (iocb->ki_filp->f_flags & O_DIRECT)
-		return cifs_user_readv(iocb, iter);
+		return cifs_user_readv_wrapper(iocb, iov, nr_segs, pos);
 
 	rc = cifs_revalidate_mapping(inode);
 	if (rc)
@@ -786,7 +781,7 @@ static ssize_t cifs_file_aio_write(struct kiocb *iocb, const struct iovec *iov,
 	int rc;
 
 	if (iocb->ki_filp->f_flags & O_DIRECT) {
-		written = cifs_user_writev(iocb, from);
+		written = cifs_user_writev(iocb, iov, nr_segs, pos);
 		if (written > 0 && CIFS_CACHE_READ(cinode)) {
 			cifs_zap_mapping(inode);
 			cifs_dbg(FYI,
@@ -911,7 +906,6 @@ const struct inode_operations_wrapper cifs_dir_inode_ops = {
 	.rmdir = cifs_rmdir,
 	.rename = cifs_rename,
 	.permission = cifs_permission,
-/*	revalidate:cifs_revalidate,   */
 	.setattr = cifs_setattr,
 	.symlink = cifs_symlink,
 	.mknod   = cifs_mknod,
@@ -926,9 +920,8 @@ const struct inode_operations_wrapper cifs_dir_inode_ops = {
 };
 
 const struct inode_operations cifs_file_inode_ops = {
-/*	revalidate:cifs_revalidate, */
 	.setattr = cifs_setattr,
-	.getattr = cifs_getattr, /* do we need this anymore? */
+	.getattr = cifs_getattr,
 	.permission = cifs_permission,
 #ifdef CONFIG_CIFS_XATTR
 	.setxattr = cifs_setxattr,
@@ -943,9 +936,6 @@ const struct inode_operations cifs_symlink_inode_ops = {
 	.follow_link = cifs_follow_link,
 	.put_link = kfree_put_link,
 	.permission = cifs_permission,
-	/* BB add the following two eventually */
-	/* revalidate: cifs_revalidate,
-	   setattr:    cifs_notify_change, *//* BB do we need notify change */
 #ifdef CONFIG_CIFS_XATTR
 	.setxattr = cifs_setxattr,
 	.getxattr = cifs_getxattr,
@@ -1251,6 +1241,8 @@ init_cifs(void)
 	GlobalMaxActiveXid = 0;
 	spin_lock_init(&cifs_tcp_ses_lock);
 	spin_lock_init(&GlobalMid_Lock);
+
+	get_random_bytes(&cifs_lock_secret, sizeof(cifs_lock_secret));
 
 	if (cifs_max_pending < 2) {
 		cifs_max_pending = 2;

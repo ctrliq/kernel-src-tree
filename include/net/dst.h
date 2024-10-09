@@ -62,6 +62,7 @@ struct dst_entry {
 #define DST_XFRM_QUEUE		0x0100
 #define DST_METADATA		0x0200
 
+	RH_KABI_DEPRECATE(unsigned short, pending_confirm)
 	short			error;
 
 	/* A non-zero value of dst->obsolete forces by-hand validation
@@ -79,8 +80,6 @@ struct dst_entry {
 #define DST_OBSOLETE_KILL	-2
 	unsigned short		header_len;	/* more space at head required */
 	unsigned short		trailer_len;	/* space to reserve at tail */
-	unsigned short		__pad3;
-
 #ifdef CONFIG_IP_ROUTE_CLASSID
 	__u32			tclassid;
 #else
@@ -484,6 +483,13 @@ static inline struct neighbour *dst_neigh_lookup_skb(const struct dst_entry *dst
 {
 	struct neighbour *n =  dst->ops->neigh_lookup(dst, skb, NULL);
 	return IS_ERR(n) ? NULL : n;
+}
+
+static inline void dst_confirm_neigh(const struct dst_entry *dst,
+				     const void *daddr)
+{
+	if (dst->ops->confirm_neigh)
+		dst->ops->confirm_neigh(dst, daddr);
 }
 
 static inline void dst_link_failure(struct sk_buff *skb)

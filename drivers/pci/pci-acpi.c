@@ -13,9 +13,6 @@
 #include <linux/pci_hotplug.h>
 #include <linux/module.h>
 #include <linux/pci-aspm.h>
-#include <acpi/acpi.h>
-#include <acpi/acpi_bus.h>
-
 #include <linux/pci-acpi.h>
 #include <linux/pm_runtime.h>
 #include <linux/pm_qos.h>
@@ -29,92 +26,6 @@ const u8 pci_acpi_dsm_uuid[] = {
 	0xd0, 0x37, 0xc9, 0xe5, 0x53, 0x35, 0x7a, 0x4d,
 	0x91, 0x17, 0xea, 0x4d, 0x19, 0xc3, 0x43, 0x4d
 };
-
-/**
- * pci_acpi_wake_bus - Wake-up notification handler for root buses.
- * @handle: ACPI handle of a device the notification is for.
- * @event: Type of the signaled event.
- * @context: PCI root bus to wake up devices on.
- */
-static void pci_acpi_wake_bus(acpi_handle handle, u32 event, void *context)
-{
-	struct pci_bus *pci_bus = context;
-
-	if (event == ACPI_NOTIFY_DEVICE_WAKE && pci_bus)
-		pci_pme_wakeup_bus(pci_bus);
-}
-
-/**
- * pci_acpi_wake_dev - Wake-up notification handler for PCI devices.
- * @handle: ACPI handle of a device the notification is for.
- * @event: Type of the signaled event.
- * @context: PCI device object to wake up.
- */
-static void pci_acpi_wake_dev(acpi_handle handle, u32 event, void *context)
-{
-	struct pci_dev *pci_dev = context;
-
-	if (event != ACPI_NOTIFY_DEVICE_WAKE || !pci_dev)
-		return;
-
-	if (pci_dev->pme_poll)
-		pci_dev->pme_poll = false;
-
-	if (pci_dev->current_state == PCI_D3cold) {
-		pci_wakeup_event(pci_dev);
-		pm_runtime_resume(&pci_dev->dev);
-		return;
-	}
-
-	/* Clear PME Status if set. */
-	if (pci_dev->pme_support)
-		pci_check_pme_status(pci_dev);
-
-	pci_wakeup_event(pci_dev);
-	pm_runtime_resume(&pci_dev->dev);
-
-	pci_pme_wakeup_bus(pci_dev->subordinate);
-}
-
-/**
- * pci_acpi_add_bus_pm_notifier - Register PM notifier for given PCI bus.
- * @dev: ACPI device to add the notifier for.
- * @pci_bus: PCI bus to walk checking for PME status if an event is signaled.
- */
-acpi_status pci_acpi_add_bus_pm_notifier(struct acpi_device *dev,
-					 struct pci_bus *pci_bus)
-{
-	return acpi_add_pm_notifier(dev, pci_acpi_wake_bus, pci_bus);
-}
-
-/**
- * pci_acpi_remove_bus_pm_notifier - Unregister PCI bus PM notifier.
- * @dev: ACPI device to remove the notifier from.
- */
-acpi_status pci_acpi_remove_bus_pm_notifier(struct acpi_device *dev)
-{
-	return acpi_remove_pm_notifier(dev, pci_acpi_wake_bus);
-}
-
-/**
- * pci_acpi_add_pm_notifier - Register PM notifier for given PCI device.
- * @dev: ACPI device to add the notifier for.
- * @pci_dev: PCI device to check for the PME status if an event is signaled.
- */
-acpi_status pci_acpi_add_pm_notifier(struct acpi_device *dev,
-				     struct pci_dev *pci_dev)
-{
-	return acpi_add_pm_notifier(dev, pci_acpi_wake_dev, pci_dev);
-}
-
-/**
- * pci_acpi_remove_pm_notifier - Unregister PCI device PM notifier.
- * @dev: ACPI device to remove the notifier from.
- */
-acpi_status pci_acpi_remove_pm_notifier(struct acpi_device *dev)
-{
-	return acpi_remove_pm_notifier(dev, pci_acpi_wake_dev);
-}
 
 phys_addr_t acpi_pci_root_get_mcfg_addr(acpi_handle handle)
 {
@@ -379,6 +290,96 @@ int pci_get_hp_params(struct pci_dev *dev, struct hotplug_params *hpp)
 	return -ENODEV;
 }
 EXPORT_SYMBOL_GPL(pci_get_hp_params);
+
+/**
+ * pciehp_is_native - Check whether a hotplug port is handled by the OS
+ * @pdev: Hotplug port to check
+ *
+ * Walk up from @pdev to the host bridge, obtain its cached _OSC Control Field
+ * and return the value of the "PCI Express Native Hot Plug control" bit.
+ * On failure to obtain the _OSC Control Field return %false.
+ */
+bool pciehp_is_native(struct pci_dev *pdev)
+{
+	struct acpi_pci_root *root;
+	acpi_handle handle;
+
+	handle = acpi_find_root_bridge_handle(pdev);
+	if (!handle)
+		return false;
+
+	root = acpi_pci_find_root(handle);
+	if (!root)
+		return false;
+
+	return root->osc_control_set & OSC_PCI_EXPRESS_NATIVE_HP_CONTROL;
+}
+
+/**
+ * pci_acpi_wake_bus - Root bus wakeup notification fork function.
+ * @work: Work item to handle.
+ */
+static void pci_acpi_wake_bus(struct work_struct *work)
+{
+	struct acpi_device *adev;
+	struct acpi_pci_root *root;
+
+	adev = container_of(work, struct acpi_device, wakeup.context.work);
+	root = acpi_driver_data(adev);
+	pci_pme_wakeup_bus(root->bus);
+}
+
+/**
+ * pci_acpi_wake_dev - PCI device wakeup notification work function.
+ * @handle: ACPI handle of a device the notification is for.
+ * @work: Work item to handle.
+ */
+static void pci_acpi_wake_dev(struct work_struct *work)
+{
+	struct acpi_device_wakeup_context *context;
+	struct pci_dev *pci_dev;
+
+	context = container_of(work, struct acpi_device_wakeup_context, work);
+	pci_dev = to_pci_dev(context->dev);
+
+	if (pci_dev->pme_poll)
+		pci_dev->pme_poll = false;
+
+	if (pci_dev->current_state == PCI_D3cold) {
+		pci_wakeup_event(pci_dev);
+		pm_runtime_resume(&pci_dev->dev);
+		return;
+	}
+
+	/* Clear PME Status if set. */
+	if (pci_dev->pme_support)
+		pci_check_pme_status(pci_dev);
+
+	pci_wakeup_event(pci_dev);
+	pm_runtime_resume(&pci_dev->dev);
+
+	pci_pme_wakeup_bus(pci_dev->subordinate);
+}
+
+/**
+ * pci_acpi_add_bus_pm_notifier - Register PM notifier for root PCI bus.
+ * @dev: PCI root bridge ACPI device.
+ */
+acpi_status pci_acpi_add_bus_pm_notifier(struct acpi_device *dev)
+{
+	return acpi_add_pm_notifier(dev, NULL, pci_acpi_wake_bus);
+}
+
+/**
+ * pci_acpi_add_pm_notifier - Register PM notifier for given PCI device.
+ * @dev: ACPI device to add the notifier for.
+ * @pci_dev: PCI device to check for the PME status if an event is signaled.
+ */
+acpi_status pci_acpi_add_pm_notifier(struct acpi_device *dev,
+				     struct pci_dev *pci_dev)
+{
+	return acpi_add_pm_notifier(dev, &pci_dev->dev, pci_acpi_wake_dev);
+}
 
 /*
  * _SxD returns the D-state with the highest power

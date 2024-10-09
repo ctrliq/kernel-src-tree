@@ -942,7 +942,6 @@ DECLARE_EVENT_CLASS(xfs_loggrant_class,
 	TP_ARGS(log, tic),
 	TP_STRUCT__entry(
 		__field(dev_t, dev)
-		__field(unsigned, trans_type)
 		__field(char, ocnt)
 		__field(char, cnt)
 		__field(int, curr_res)
@@ -960,7 +959,6 @@ DECLARE_EVENT_CLASS(xfs_loggrant_class,
 	),
 	TP_fast_assign(
 		__entry->dev = log->l_mp->m_super->s_dev;
-		__entry->trans_type = tic->t_trans_type;
 		__entry->ocnt = tic->t_ocnt;
 		__entry->cnt = tic->t_cnt;
 		__entry->curr_res = tic->t_curr_res;
@@ -978,14 +976,13 @@ DECLARE_EVENT_CLASS(xfs_loggrant_class,
 		__entry->curr_block = log->l_curr_block;
 		__entry->tail_lsn = atomic64_read(&log->l_tail_lsn);
 	),
-	TP_printk("dev %d:%d type %s t_ocnt %u t_cnt %u t_curr_res %u "
+	TP_printk("dev %d:%d t_ocnt %u t_cnt %u t_curr_res %u "
 		  "t_unit_res %u t_flags %s reserveq %s "
 		  "writeq %s grant_reserve_cycle %d "
 		  "grant_reserve_bytes %d grant_write_cycle %d "
 		  "grant_write_bytes %d curr_cycle %d curr_block %d "
 		  "tail_cycle %d tail_block %d",
 		  MAJOR(__entry->dev), MINOR(__entry->dev),
-		  __print_symbolic(__entry->trans_type, XFS_TRANS_TYPES),
 		  __entry->ocnt,
 		  __entry->cnt,
 		  __entry->curr_res,
@@ -1136,15 +1133,14 @@ TRACE_EVENT(xfs_log_assign_tail_lsn,
 )
 
 DECLARE_EVENT_CLASS(xfs_file_class,
-	TP_PROTO(struct xfs_inode *ip, size_t count, loff_t offset, int flags),
-	TP_ARGS(ip, count, offset, flags),
+	TP_PROTO(struct xfs_inode *ip, size_t count, loff_t offset),
+	TP_ARGS(ip, count, offset),
 	TP_STRUCT__entry(
 		__field(dev_t, dev)
 		__field(xfs_ino_t, ino)
 		__field(xfs_fsize_t, size)
 		__field(loff_t, offset)
 		__field(size_t, count)
-		__field(int, flags)
 	),
 	TP_fast_assign(
 		__entry->dev = VFS_I(ip)->i_sb->s_dev;
@@ -1152,25 +1148,25 @@ DECLARE_EVENT_CLASS(xfs_file_class,
 		__entry->size = ip->i_d.di_size;
 		__entry->offset = offset;
 		__entry->count = count;
-		__entry->flags = flags;
 	),
-	TP_printk("dev %d:%d ino 0x%llx size 0x%llx "
-		  "offset 0x%llx count 0x%zx ioflags %s",
+	TP_printk("dev %d:%d ino 0x%llx size 0x%llx offset 0x%llx count 0x%zx",
 		  MAJOR(__entry->dev), MINOR(__entry->dev),
 		  __entry->ino,
 		  __entry->size,
 		  __entry->offset,
-		  __entry->count,
-		  __print_flags(__entry->flags, "|", XFS_IO_FLAGS))
+		  __entry->count)
 )
 
 #define DEFINE_RW_EVENT(name)		\
 DEFINE_EVENT(xfs_file_class, name,	\
-	TP_PROTO(struct xfs_inode *ip, size_t count, loff_t offset, int flags),	\
-	TP_ARGS(ip, count, offset, flags))
-DEFINE_RW_EVENT(xfs_file_read);
+	TP_PROTO(struct xfs_inode *ip, size_t count, loff_t offset),	\
+	TP_ARGS(ip, count, offset))
+DEFINE_RW_EVENT(xfs_file_buffered_read);
+DEFINE_RW_EVENT(xfs_file_direct_read);
+DEFINE_RW_EVENT(xfs_file_dax_read);
 DEFINE_RW_EVENT(xfs_file_buffered_write);
 DEFINE_RW_EVENT(xfs_file_direct_write);
+DEFINE_RW_EVENT(xfs_file_dax_write);
 DEFINE_RW_EVENT(xfs_file_splice_read);
 DEFINE_RW_EVENT(xfs_file_splice_write);
 

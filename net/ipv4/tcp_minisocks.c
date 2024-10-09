@@ -336,9 +336,6 @@ void tcp_time_wait(struct sock *sk, int state, int timeo)
 		} while (0);
 #endif
 
-		/* Linkage updates. */
-		__inet_twsk_hashdance(tw, sk, &tcp_hashinfo);
-
 		/* Get the TIME_WAIT timeout firing. */
 		if (timeo < rto)
 			timeo = rto;
@@ -350,6 +347,9 @@ void tcp_time_wait(struct sock *sk, int state, int timeo)
 			if (state == TCP_TIME_WAIT)
 				timeo = TCP_TIMEWAIT_LEN;
 		}
+
+		/* Linkage updates. */
+		__inet_twsk_hashdance(tw, sk, &tcp_hashinfo);
 
 		inet_twsk_schedule(tw, &tcp_death_row, timeo,
 				   TCP_TIMEWAIT_LEN);
@@ -550,6 +550,7 @@ struct sock *tcp_create_openreq_child(struct sock *sk, struct request_sock *req,
 			newicsk->icsk_ack.last_seg_size = skb->len - newtp->tcp_header_len;
 		newtp->rx_opt.mss_clamp = req->mss;
 		TCP_ECN_openreq_child(newtp, req);
+		newtp->fastopen_req = NULL;
 		newtp->fastopen_rsk = NULL;
 		newtp->syn_data_acked = 0;
 

@@ -36,7 +36,7 @@ unsigned long __read_mostly sysctl_hung_task_check_count = PID_MAX_LIMIT;
  */
 unsigned long __read_mostly sysctl_hung_task_timeout_secs = CONFIG_DEFAULT_HUNG_TASK_TIMEOUT;
 
-unsigned long __read_mostly sysctl_hung_task_warnings = 10;
+int __read_mostly sysctl_hung_task_warnings = 10;
 
 static int __read_mostly did_panic;
 
@@ -95,20 +95,23 @@ static void check_hung_task(struct task_struct *t, unsigned long timeout)
 
 	trace_sched_process_hang(t);
 
-	if (!sysctl_hung_task_warnings)
+	if (!sysctl_hung_task_warnings && !sysctl_hung_task_panic)
 		return;
-	sysctl_hung_task_warnings--;
 
 	/*
 	 * Ok, the task did not get scheduled for more than 2 minutes,
 	 * complain:
 	 */
-	printk(KERN_ERR "INFO: task %s:%d blocked for more than "
-			"%ld seconds.\n", t->comm, t->pid, timeout);
-	printk(KERN_ERR "\"echo 0 > /proc/sys/kernel/hung_task_timeout_secs\""
-			" disables this message.\n");
-	sched_show_task(t);
-	debug_show_held_locks(t);
+	if (sysctl_hung_task_warnings) {
+		if (sysctl_hung_task_warnings > 0)
+			sysctl_hung_task_warnings--;
+		printk(KERN_ERR "INFO: task %s:%d blocked for more than "
+				"%ld seconds.\n", t->comm, t->pid, timeout);
+		printk(KERN_ERR "\"echo 0 > /proc/sys/kernel/hung_task_timeout_secs\""
+				" disables this message.\n");
+		sched_show_task(t);
+		debug_show_held_locks(t);
+	}
 
 	touch_nmi_watchdog();
 

@@ -2041,7 +2041,7 @@ static ssize_t target_core_alua_tg_pt_gp_show_attr_alua_access_state(
 	char *page)
 {
 	return sprintf(page, "%d\n",
-		atomic_read(&tg_pt_gp->tg_pt_gp_alua_access_state));
+		       tg_pt_gp->tg_pt_gp_alua_access_state);
 }
 
 static ssize_t target_core_alua_tg_pt_gp_store_attr_alua_access_state(

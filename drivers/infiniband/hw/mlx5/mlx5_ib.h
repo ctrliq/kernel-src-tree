@@ -44,6 +44,7 @@
 #include <linux/types.h>
 #include <linux/mlx5/transobj.h>
 #include <rdma/ib_user_verbs.h>
+#include <rdma/mlx5-abi.h>
 
 #define mlx5_ib_dbg(dev, format, arg...)				\
 pr_debug("%s:%s:%d:(pid %d): " format, (dev)->ib_dev.name, __func__,	\
@@ -154,12 +155,13 @@ struct mlx5_ib_flow_handler {
 	struct list_head		list;
 	struct ib_flow			ibflow;
 	struct mlx5_ib_flow_prio	*prio;
-	struct mlx5_flow_rule	*rule;
+	struct mlx5_flow_handle		*rule;
 };
 
 struct mlx5_ib_flow_db {
 	struct mlx5_ib_flow_prio	prios[MLX5_IB_NUM_FLOW_FT];
 	struct mlx5_ib_flow_prio	sniffer[MLX5_IB_NUM_SNIFFER_FTS];
+	struct mlx5_flow_table		*lag_demux_ft;
 	/* Protect flow steering bypass flow tables
 	 * when add/del flow rules.
 	 * only single add/removal of flow steering rule could be done
@@ -389,6 +391,10 @@ struct mlx5_ib_qp {
 	spinlock_t              disable_page_faults_lock;
 	struct mlx5_ib_pfault	pagefaults[MLX5_IB_PAGEFAULT_CONTEXTS];
 #endif
+	struct list_head	qps_list;
+	struct list_head	cq_recv_list;
+	struct list_head	cq_send_list;
+	u32			rate_limit;
 };
 
 struct mlx5_ib_cq_buf {
@@ -452,6 +458,8 @@ struct mlx5_ib_cq {
 	struct mlx5_ib_cq_buf  *resize_buf;
 	struct ib_umem	       *resize_umem;
 	int			cqe_size;
+	struct list_head	list_send_qp;
+	struct list_head	list_recv_qp;
 	u32			create_flags;
 	struct list_head	wc_list;
 	enum ib_cq_notify_flags notify_flags;
@@ -510,7 +518,7 @@ struct mlx5_ib_mr {
 	int			umred;
 	int			npages;
 	struct mlx5_ib_dev     *dev;
-	struct mlx5_create_mkey_mbox_out out;
+	u32 out[MLX5_ST_SZ_DW(create_mkey_out)];
 	struct mlx5_core_sig_ctx    *sig;
 	int			live;
 	void			*descs_alloc;
@@ -608,6 +616,7 @@ struct mlx5_roce {
 	rwlock_t		netdev_lock;
 	struct net_device	*netdev;
 	struct notifier_block	nb;
+	atomic_t		next_port;
 };
 
 struct mlx5_ib_dev {
@@ -739,7 +748,8 @@ void mlx5_ib_free_srq_wqe(struct mlx5_ib_srq *srq, int wqe_index);
 int mlx5_MAD_IFC(struct mlx5_ib_dev *dev, int ignore_mkey, int ignore_bkey,
 		 u8 port, const struct ib_wc *in_wc, const struct ib_grh *in_grh,
 		 const void *in_mad, void *response_mad);
-struct ib_ah *mlx5_ib_create_ah(struct ib_pd *pd, struct ib_ah_attr *ah_attr);
+struct ib_ah *mlx5_ib_create_ah(struct ib_pd *pd, struct ib_ah_attr *ah_attr,
+				struct ib_udata *udata);
 int mlx5_ib_query_ah(struct ib_ah *ibah, struct ib_ah_attr *ah_attr);
 int mlx5_ib_destroy_ah(struct ib_ah *ah);
 struct ib_srq *mlx5_ib_create_srq(struct ib_pd *pd,
@@ -960,5 +970,41 @@ static inline int verify_assign_uidx(u8 cqe_version, u32 cmd_uidx,
 	}
 
 	return 0;
+}
+
+static inline int get_qp_user_index(struct mlx5_ib_ucontext *ucontext,
+				    struct mlx5_ib_create_qp *ucmd,
+				    int inlen,
+				    u32 *user_index)
+{
+	u8 cqe_version = ucontext->cqe_version;
+
+	if (field_avail(struct mlx5_ib_create_qp, uidx, inlen) &&
+	    !cqe_version && (ucmd->uidx == MLX5_IB_DEFAULT_UIDX))
+		return 0;
+
+	if (!!(field_avail(struct mlx5_ib_create_qp, uidx, inlen) !=
+	       !!cqe_version))
+		return -EINVAL;
+
+	return verify_assign_uidx(cqe_version, ucmd->uidx, user_index);
+}
+
+static inline int get_srq_user_index(struct mlx5_ib_ucontext *ucontext,
+				     struct mlx5_ib_create_srq *ucmd,
+				     int inlen,
+				     u32 *user_index)
+{
+	u8 cqe_version = ucontext->cqe_version;
+
+	if (field_avail(struct mlx5_ib_create_srq, uidx, inlen) &&
+	    !cqe_version && (ucmd->uidx == MLX5_IB_DEFAULT_UIDX))
+		return 0;
+
+	if (!!(field_avail(struct mlx5_ib_create_srq, uidx, inlen) !=
+	       !!cqe_version))
+		return -EINVAL;
+
+	return verify_assign_uidx(cqe_version, ucmd->uidx, user_index);
 }
 #endif /* MLX5_IB_H */

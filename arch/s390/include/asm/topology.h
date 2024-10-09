@@ -13,9 +13,11 @@ struct cpu_topology_s390 {
 	unsigned short core_id;
 	unsigned short socket_id;
 	unsigned short book_id;
+	unsigned short drawer_id;
 	cpumask_t thread_mask;
 	cpumask_t core_mask;
 	cpumask_t book_mask;
+	cpumask_t drawer_mask;
 };
 
 extern struct cpu_topology_s390 cpu_topology[NR_CPUS];
@@ -27,6 +29,8 @@ extern struct cpu_topology_s390 cpu_topology[NR_CPUS];
 #define topology_core_cpumask(cpu)		(&cpu_topology[cpu].core_mask)
 #define topology_book_id(cpu)			(cpu_topology[cpu].book_id)
 #define topology_book_cpumask(cpu)		(&cpu_topology[cpu].book_mask)
+#define topology_drawer_id(cpu)			(cpu_topology[cpu].drawer_id)
+#define topology_drawer_cpumask(cpu)		(&cpu_topology[cpu].drawer_mask)
 
 #define mc_capable() 1
 
@@ -38,6 +42,11 @@ static inline const struct cpumask *cpu_coregroup_mask(int cpu)
 static inline const struct cpumask *cpu_book_mask(int cpu)
 {
 	return &cpu_topology[cpu].book_mask;
+}
+
+static inline const struct cpumask *cpu_drawer_mask(int cpu)
+{
+	return &cpu_topology[cpu].drawer_mask;
 }
 
 int topology_cpu_init(struct cpu *);

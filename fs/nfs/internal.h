@@ -187,6 +187,8 @@ extern struct nfs_server *nfs_clone_server(struct nfs_server *,
 					   struct nfs_fh *,
 					   struct nfs_fattr *,
 					   rpc_authflavor_t);
+extern bool nfs_client_init_is_complete(const struct nfs_client *clp);
+extern int nfs_client_init_status(const struct nfs_client *clp);
 extern int nfs_wait_client_init_complete(const struct nfs_client *clp);
 extern void nfs_mark_client_ready(struct nfs_client *clp, int state);
 extern struct nfs_client *nfs4_set_ds_client(struct nfs_server *mds_srv,
@@ -243,7 +245,7 @@ extern void nfs_pgheader_init(struct nfs_pageio_descriptor *desc,
 			      struct nfs_pgio_header *hdr,
 			      void (*release)(struct nfs_pgio_header *hdr));
 void nfs_set_pgio_error(struct nfs_pgio_header *hdr, int error, loff_t pos);
-int nfs_iocounter_wait(struct nfs_io_counter *c);
+int nfs_iocounter_wait(struct nfs_lock_context *l_ctx);
 
 extern const struct nfs_pageio_ops nfs_pgio_rw_ops;
 struct nfs_pgio_header *nfs_pgio_header_alloc(const struct nfs_rw_ops *);
@@ -256,12 +258,6 @@ int nfs_initiate_pgio(struct rpc_clnt *clnt, struct nfs_pgio_header *hdr,
 void nfs_free_request(struct nfs_page *req);
 struct nfs_pgio_mirror *
 nfs_pgio_current_mirror(struct nfs_pageio_descriptor *desc);
-
-static inline void nfs_iocounter_init(struct nfs_io_counter *c)
-{
-	c->flags = 0;
-	atomic_set(&c->io_count, 0);
-}
 
 static inline bool nfs_pgio_has_mirroring(struct nfs_pageio_descriptor *desc)
 {
@@ -354,6 +350,7 @@ extern struct nfs_client *nfs_init_client(struct nfs_client *clp,
 /* dir.c */
 extern int nfs_access_cache_shrinker(struct shrinker *shrink,
 					struct shrink_control *sc);
+extern void nfs_advise_use_readdirplus(struct inode *dir);
 extern void nfs_force_use_readdirplus(struct inode *dir);
 struct dentry *nfs_lookup(struct inode *, struct dentry *, unsigned int);
 int nfs_create(struct inode *, struct dentry *, umode_t, bool);
@@ -391,6 +388,7 @@ extern void nfs_clear_inode(struct inode *);
 extern void nfs_evict_inode(struct inode *);
 void nfs_zap_acl_cache(struct inode *inode);
 extern int nfs_wait_bit_killable(struct wait_bit_key *key, int mode);
+extern int nfs_wait_atomic_killable(atomic_t *p);
 
 /* super.c */
 extern const struct super_operations nfs_sops;
@@ -506,8 +504,11 @@ void nfs_init_cinfo(struct nfs_commit_info *cinfo,
 		    struct inode *inode,
 		    struct nfs_direct_req *dreq);
 int nfs_key_timeout_notify(struct file *filp, struct inode *inode);
-bool nfs_ctx_key_to_expire(struct nfs_open_context *ctx);
+bool nfs_ctx_key_to_expire(struct nfs_open_context *ctx, struct inode *inode);
 void nfs_pageio_stop_mirroring(struct nfs_pageio_descriptor *pgio);
+
+int nfs_filemap_write_and_wait_range(struct address_space *mapping,
+		loff_t lstart, loff_t lend);
 
 #ifdef CONFIG_NFS_V4_1
 static inline

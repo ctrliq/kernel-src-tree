@@ -9,11 +9,6 @@
 #include <asm/paravirt.h>
 #include <asm/bitops.h>
 
-static __always_inline int arch_spin_value_unlocked(arch_spinlock_t lock)
-{
-	return lock.tickets.head == lock.tickets.tail;
-}
-
 /*
  * Your basic SMP spinlocks, allowing only a single CPU anywhere
  *
@@ -47,6 +42,10 @@ static __always_inline int arch_spin_value_unlocked(arch_spinlock_t lock)
 extern struct static_key paravirt_ticketlocks_enabled;
 static __always_inline bool static_key_false(struct static_key *key);
 
+#ifdef CONFIG_QUEUED_SPINLOCKS
+#include <asm/qspinlock.h>
+#else
+
 #ifdef CONFIG_PARAVIRT_SPINLOCKS
 
 static inline void __ticket_enter_slowpath(arch_spinlock_t *lock)
@@ -65,6 +64,11 @@ static inline void __ticket_unlock_kick(arch_spinlock_t *lock,
 }
 
 #endif /* CONFIG_PARAVIRT_SPINLOCKS */
+
+static __always_inline int arch_spin_value_unlocked(arch_spinlock_t lock)
+{
+	return lock.tickets.head == lock.tickets.tail;
+}
 
 /*
  * Ticket locks are conceptually two parts, one indicating the current head of
@@ -186,8 +190,8 @@ static inline void arch_spin_unlock_wait(arch_spinlock_t *lock)
 	while (arch_spin_is_locked(lock))
 		cpu_relax();
 }
+#endif /* CONFIG_QUEUED_SPINLOCKS */
 
-#ifndef CONFIG_QUEUE_RWLOCK
 /*
  * Read-write spinlocks, allowing multiple readers
  * but only one writer.
@@ -270,7 +274,8 @@ static inline void arch_write_unlock(arch_rwlock_t *rw)
 	asm volatile(LOCK_PREFIX WRITE_LOCK_ADD(%1) "%0"
 		     : "+m" (rw->write) : "i" (RW_LOCK_BIAS) : "memory");
 }
-#else
+
+#ifdef CONFIG_QUEUE_RWLOCK
 #include <asm/qrwlock.h>
 #endif /* CONFIG_QUEUE_RWLOCK */
 

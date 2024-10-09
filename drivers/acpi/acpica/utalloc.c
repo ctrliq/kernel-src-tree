@@ -181,7 +181,7 @@ acpi_status acpi_ut_delete_caches(void)
 	char buffer[7];
 
 	if (acpi_gbl_display_final_mem_stats) {
-		ACPI_STRCPY(buffer, "MEMORY");
+		strcpy(buffer, "MEMORY");
 		(void)acpi_db_display_statistics(buffer);
 	}
 #endif
@@ -333,6 +333,6 @@ acpi_ut_initialize_buffer(struct acpi_buffer * buffer,
 
 	/* Have a valid buffer, clear it */
 
-	ACPI_MEMSET(buffer->pointer, 0, required_length);
+	memset(buffer->pointer, 0, required_length);
 	return (AE_OK);
 }

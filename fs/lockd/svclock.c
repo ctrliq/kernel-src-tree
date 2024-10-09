@@ -678,7 +678,7 @@ nlmsvc_update_deferred_block(struct nlm_block *block, struct file_lock *conf,
 		block->b_flags |= B_TIMED_OUT;
 	if (conf) {
 		if (block->b_fl)
-			__locks_copy_lock(block->b_fl, conf);
+			locks_copy_conflock(block->b_fl, conf);
 	}
 }
 

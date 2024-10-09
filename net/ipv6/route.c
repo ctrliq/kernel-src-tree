@@ -215,6 +215,21 @@ static struct neighbour *ip6_neigh_lookup(const struct dst_entry *dst,
 	return neigh_create(&nd_tbl, daddr, dst->dev);
 }
 
+static void ip6_confirm_neigh(const struct dst_entry *dst, const void *daddr)
+{
+	struct net_device *dev = dst->dev;
+	struct rt6_info *rt = (struct rt6_info *)dst;
+
+	daddr = choose_neigh_daddr(rt, NULL, daddr);
+	if (!daddr)
+		return;
+	if (dev->flags & (IFF_NOARP | IFF_LOOPBACK))
+		return;
+	if (ipv6_addr_is_multicast((const struct in6_addr *)daddr))
+		return;
+	__ipv6_confirm_neigh(dev, daddr);
+}
+
 static struct dst_ops ip6_dst_ops_template = {
 	.family			=	AF_INET6,
 	.protocol		=	cpu_to_be16(ETH_P_IPV6),
@@ -232,6 +247,7 @@ static struct dst_ops ip6_dst_ops_template = {
 	.redirect		=	rt6_do_redirect,
 	.local_out		=	__ip6_local_out,
 	.neigh_lookup		=	ip6_neigh_lookup,
+	.confirm_neigh		=	ip6_confirm_neigh,
 };
 
 static unsigned int ip6_blackhole_mtu(const struct dst_entry *dst)
@@ -1359,6 +1375,7 @@ static bool rt6_cache_allowed_for_pmtu(const struct rt6_info *rt)
 static void __ip6_rt_update_pmtu(struct dst_entry *dst, const struct sock *sk,
 				 const struct ipv6hdr *iph, u32 mtu)
 {
+	const struct in6_addr *daddr, *saddr;
 	struct rt6_info *rt6 = (struct rt6_info *)dst;
 
 	if (rt6->rt6i_flags & RTF_LOCAL)
@@ -1367,26 +1384,26 @@ static void __ip6_rt_update_pmtu(struct dst_entry *dst, const struct sock *sk,
 	if (dst_metric_locked(dst, RTAX_MTU))
 		return;
 
-	dst_confirm(dst);
+	if (iph) {
+		daddr = &iph->daddr;
+		saddr = &iph->saddr;
+	} else if (sk) {
+		daddr = &sk->sk_v6_daddr;
+		saddr = &inet6_sk(sk)->saddr;
+	} else {
+		daddr = NULL;
+		saddr = NULL;
+	}
+	dst_confirm_neigh(dst, daddr);
 	mtu = max_t(u32, mtu, IPV6_MIN_MTU);
 	if (mtu >= dst_mtu(dst))
 		return;
 
 	if (!rt6_cache_allowed_for_pmtu(rt6)) {
 		rt6_do_update_pmtu(rt6, mtu);
-	} else {
-		const struct in6_addr *daddr, *saddr;
+	} else if (daddr) {
 		struct rt6_info *nrt6;
 
-		if (iph) {
-			daddr = &iph->daddr;
-			saddr = &iph->saddr;
-		} else if (sk) {
-			daddr = &sk->sk_v6_daddr;
-			saddr = &inet6_sk(sk)->saddr;
-		} else {
-			return;
-		}
 		nrt6 = ip6_rt_cache_alloc(rt6, daddr, saddr);
 		if (nrt6) {
 			rt6_do_update_pmtu(nrt6, mtu);
@@ -2177,7 +2194,7 @@ static void rt6_do_redirect(struct dst_entry *dst, struct sock *sk, struct sk_bu
 	 *	first-hop router for the specified ICMP Destination Address.
 	 */
 
-	if (!ndisc_parse_options(msg->opt, optlen, &ndopts)) {
+	if (!ndisc_parse_options(skb->dev, msg->opt, optlen, &ndopts)) {
 		net_dbg_ratelimited("rt6_redirect: invalid ND options\n");
 		return;
 	}
@@ -2202,7 +2219,7 @@ static void rt6_do_redirect(struct dst_entry *dst, struct sock *sk, struct sk_bu
 	 * Look, redirects are sent only in response to data packets,
 	 * so that this nexthop apparently is reachable. --ANK
 	 */
-	dst_confirm(&rt->dst);
+	dst_confirm_neigh(&rt->dst, &ipv6_hdr(skb)->saddr);
 
 	neigh = __neigh_lookup(&nd_tbl, &msg->target, skb->dev, 1);
 	if (!neigh)
@@ -2212,12 +2229,12 @@ static void rt6_do_redirect(struct dst_entry *dst, struct sock *sk, struct sk_bu
 	 *	We have finally decided to accept it.
 	 */
 
-	neigh_update(neigh, lladdr, NUD_STALE,
+	ndisc_update(skb->dev, neigh, lladdr, NUD_STALE,
 		     NEIGH_UPDATE_F_WEAK_OVERRIDE|
 		     NEIGH_UPDATE_F_OVERRIDE|
 		     (on_link ? 0 : (NEIGH_UPDATE_F_OVERRIDE_ISROUTER|
-				     NEIGH_UPDATE_F_ISROUTER))
-		     );
+				     NEIGH_UPDATE_F_ISROUTER)),
+		     NDISC_REDIRECT, &ndopts);
 
 	nrt = ip6_rt_cache_alloc(rt, &msg->dest, NULL);
 	if (!nrt)

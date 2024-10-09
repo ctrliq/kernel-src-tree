@@ -8,6 +8,7 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/dax.h>
 #include <linux/fs.h>
 #include <linux/gfp.h>
 #include <linux/mm.h>
@@ -568,6 +569,14 @@ do_readahead(struct address_space *mapping, struct file *filp,
 {
 	if (!mapping || !mapping->a_ops || !mapping->a_ops->readpage)
 		return -EINVAL;
+
+	/*
+	 * Readahead doesn't make sense for DAX inodes, but we don't want it
+	 * to report a failure either.  Instead, we just return success and
+	 * don't do any work.
+	 */
+	 if (dax_mapping(mapping))
+		return 0;
 
 	force_page_cache_readahead(mapping, filp, index, nr);
 	return 0;

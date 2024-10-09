@@ -705,6 +705,21 @@ out_sem:
 		ret = check_block_validity(inode, map);
 		if (ret != 0)
 			return ret;
+
+		/*
+		 * Inodes with freshly allocated blocks where contents will be
+		 * visible after transaction commit must be on transaction's
+		 * ordered data list.
+		 */
+		if (map->m_flags & EXT4_MAP_NEW &&
+		    !(map->m_flags & EXT4_MAP_UNWRITTEN) &&
+		    !(flags & EXT4_GET_BLOCKS_ZERO) &&
+		    !IS_NOQUOTA(inode) &&
+		    ext4_should_order_data(inode)) {
+			ret = ext4_jbd2_file_inode(handle, inode);
+			if (ret)
+				return ret;
+		}
 	}
 	return retval;
 }
@@ -746,6 +761,7 @@ static int _ext4_get_block(struct inode *inode, sector_t iblock,
 	handle_t *handle = ext4_journal_current_handle();
 	struct ext4_map_blocks map;
 	int ret = 0, started = 0;
+	int retries = 0;
 	int dio_credits;
 
 	if (ext4_has_inline_data(inode))
@@ -759,6 +775,7 @@ static int _ext4_get_block(struct inode *inode, sector_t iblock,
 		if (map.m_len > DIO_MAX_BLOCKS)
 			map.m_len = DIO_MAX_BLOCKS;
 		dio_credits = ext4_chunk_trans_blocks(inode, map.m_len);
+retry:
 		handle = ext4_journal_start(inode, EXT4_HT_MAP_BLOCKS,
 					    dio_credits);
 		if (IS_ERR(handle)) {
@@ -769,6 +786,11 @@ static int _ext4_get_block(struct inode *inode, sector_t iblock,
 	}
 
 	ret = ext4_map_blocks(handle, inode, &map, flags);
+	if (started) {
+		ext4_journal_stop(handle);
+		if (ret == -ENOSPC && ext4_should_retry_alloc(inode->i_sb, &retries))
+			goto retry;
+	}
 	if (ret > 0) {
 		ext4_io_end_t *io_end = ext4_inode_aio(inode);
 
@@ -782,8 +804,6 @@ static int _ext4_get_block(struct inode *inode, sector_t iblock,
 		/* hole case, need to fill in bh->b_size */
 		bh->b_size = inode->i_sb->s_blocksize * map.m_len;
 	}
-	if (started)
-		ext4_journal_stop(handle);
 	return ret;
 }
 
@@ -1099,14 +1119,6 @@ static int ext4_write_end(struct file *file,
 	int i_size_changed = 0;
 
 	trace_ext4_write_end(inode, pos, len, copied);
-	if (ext4_test_inode_state(inode, EXT4_STATE_ORDERED_MODE)) {
-		ret = ext4_jbd2_file_inode(handle, inode);
-		if (ret) {
-			unlock_page(page);
-			page_cache_release(page);
-			goto errout;
-		}
-	}
 
 	if (ext4_has_inline_data(inode)) {
 		ret = ext4_write_inline_data_end(inode, pos, len,
@@ -1418,6 +1430,8 @@ static void mpage_release_unused_pages(struct mpage_da_data *mpd,
 			BUG_ON(!PageLocked(page));
 			BUG_ON(PageWriteback(page));
 			if (invalidate) {
+				if (page_mapped(page))
+					clear_page_dirty_for_io(page);
 				block_invalidatepage_range(page, 0,
 							   PAGE_CACHE_SIZE);
 				ClearPageUptodate(page);
@@ -3042,39 +3056,69 @@ static int ext4_get_block_overwrite(struct inode *inode, sector_t iblock,
 }
 
 #ifdef CONFIG_FS_DAX
-int ext4_dax_mmap_get_block(struct inode *inode, sector_t iblock,
-			    struct buffer_head *bh_result, int create)
+/*
+ * Get block function for DAX IO and mmap faults. It takes care of converting
+ * unwritten extents to written ones and initializes new / converted blocks
+ * to zeros.
+ */
+int ext4_dax_get_block(struct inode *inode, sector_t iblock,
+		       struct buffer_head *bh_result, int create)
 {
-	int ret;
+	int ret, err;
+	int credits;
+	struct ext4_map_blocks map;
+	handle_t *handle = NULL;
+	int retries = 0;
+	int flags = 0;
 
-	ext4_debug("ext4_dax_mmap_get_block: inode %lu, create flag %d\n",
-		   inode->i_ino, create);
-	if (!create)
-		return _ext4_get_block(inode, iblock, bh_result, 0);
-
-	ret = ext4_get_block_trans(inode, iblock, bh_result,
-				   EXT4_GET_BLOCKS_PRE_IO |
-				   EXT4_GET_BLOCKS_CREATE_ZERO);
-	if (ret < 0)
-		return ret;
-
-	if (buffer_unwritten(bh_result)) {
-		/*
-		 * We are protected by i_mmap_sem so we know block cannot go
-		 * away from under us even though we dropped i_data_sem.
-		 * Convert extent to written and write zeros there.
-		 */
-		ret = ext4_get_block_trans(inode, iblock, bh_result,
-					   EXT4_GET_BLOCKS_CONVERT |
-					   EXT4_GET_BLOCKS_CREATE_ZERO);
-		if (ret < 0)
+	ext4_debug("inode %lu, create flag %d\n", inode->i_ino, create);
+	map.m_lblk = iblock;
+	map.m_len = bh_result->b_size >> inode->i_blkbits;
+	credits = ext4_chunk_trans_blocks(inode, map.m_len);
+retry:
+	if (create) {
+		flags |= EXT4_GET_BLOCKS_CREATE_ZERO;
+		handle = ext4_journal_start(inode, EXT4_HT_MAP_BLOCKS, credits);
+		if (IS_ERR(handle)) {
+			ret = PTR_ERR(handle);
 			return ret;
+		}
 	}
-	/*
-	 * At least for now we have to clear BH_New so that DAX code
-	 * doesn't attempt to zero blocks again in a racy way.
-	 */
-	clear_buffer_new(bh_result);
+
+	ret = ext4_map_blocks(handle, inode, &map, flags);
+	if (create) {
+		err = ext4_journal_stop(handle);
+		if (ret == -ENOSPC && ext4_should_retry_alloc(inode->i_sb, &retries))
+			goto retry;
+		if (ret >= 0 && err < 0)
+			ret = err;
+	}
+	if (ret <= 0)
+		goto out;
+out:
+	WARN_ON_ONCE(ret == 0 && create);
+	if (ret > 0) {
+		map_bh(bh_result, inode->i_sb, map.m_pblk);
+		/*
+		 * At least for now we have to clear BH_New so that DAX code
+		 * doesn't attempt to zero blocks again in a racy way.
+		 */
+		map.m_flags &= ~EXT4_MAP_NEW;
+		ext4_update_bh_state(bh_result, map.m_flags);
+		bh_result->b_size = map.m_len << inode->i_blkbits;
+		ret = 0;
+	} else if (ret == 0) {
+		/* hole case, need to fill in bh->b_size */
+		bh_result->b_size = map.m_len << inode->i_blkbits;
+	}
+	return ret;
+}
+#else
+/* Just define empty function, it will never get called. */
+int ext4_dax_get_block(struct inode *inode, sector_t iblock,
+		       struct buffer_head *bh_result, int create)
+{
+	BUG();
 	return 0;
 }
 #endif
@@ -3196,13 +3240,25 @@ static ssize_t ext4_ext_direct_IO(int rw, struct kiocb *iocb,
 
 	if (overwrite) {
 		get_block_func = ext4_get_block_overwrite;
+	} else if (IS_DAX(inode)) {
+		/*
+		 * We can avoid zeroing for aligned DAX writes beyond EOF. Other
+		 * writes need zeroing either because they can race with page
+		 * faults or because they use partial blocks.
+		 */
+		if (round_down(offset, 1<<inode->i_blkbits) >= inode->i_size &&
+		    ext4_aligned_io(inode, offset, count))
+			get_block_func = ext4_get_block;
+		else
+			get_block_func = ext4_dax_get_block;
+		dio_flags = DIO_LOCKING;
 	} else {
 		get_block_func = ext4_get_block_write;
 		dio_flags = DIO_LOCKING;
 	}
 	if (IS_DAX(inode))
 		ret = dax_do_io(rw, iocb, inode, iov, offset, nr_segs,
-				ext4_get_block, ext4_end_io_dio, dio_flags);
+				get_block_func, ext4_end_io_dio, dio_flags);
 	else
 		ret = __blockdev_direct_IO(rw, iocb, inode,
 					   inode->i_sb->s_bdev, iov, offset,
@@ -4039,7 +4095,8 @@ void ext4_set_inode_flags(struct inode *inode)
 		new_fl |= S_NOATIME;
 	if (flags & EXT4_DIRSYNC_FL)
 		new_fl |= S_DIRSYNC;
-	if (test_opt(inode->i_sb, DAX) && S_ISREG(inode->i_mode))
+	if (test_opt(inode->i_sb, DAX) && S_ISREG(inode->i_mode) &&
+	    !ext4_should_journal_data(inode) && !ext4_has_inline_data(inode))
 		new_fl |= S_DAX;
 	inode_set_flags(inode, new_fl,
 			S_SYNC|S_APPEND|S_IMMUTABLE|S_NOATIME|S_DIRSYNC|S_DAX);
@@ -5198,6 +5255,11 @@ int ext4_change_inode_journal_flag(struct inode *inode, int val)
 		ext4_clear_inode_flag(inode, EXT4_INODE_JOURNAL_DATA);
 	}
 	ext4_set_aops(inode);
+	/*
+	 * Update inode->i_flags after EXT4_INODE_JOURNAL_DATA was updated.
+	 * E.g. S_DAX may get cleared / set.
+	 */
+	ext4_set_inode_flags(inode);
 
 	jbd2_journal_unlock_updates(journal);
 	ext4_inode_resume_unlocked_dio(inode);

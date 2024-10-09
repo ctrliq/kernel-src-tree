@@ -648,7 +648,7 @@ unsigned int hists__sort_list_width(struct hists *hists)
 		ret += fmt->width(fmt, &dummy_hpp, hists);
 	}
 
-	if (verbose && sort__has_sym) /* Addr + origin */
+	if (verbose && hists__has(hists, sym)) /* Addr + origin */
 		ret += 3 + BITS_PER_LONG / 4;
 
 	return ret;
@@ -793,7 +793,7 @@ int perf_hpp__setup_hists_formats(struct perf_hpp_list *list,
 	if (!symbol_conf.report_hierarchy)
 		return 0;
 
-	evlist__for_each(evlist, evsel) {
+	evlist__for_each_entry(evlist, evsel) {
 		hists = evsel__hists(evsel);
 
 		perf_hpp_list__for_each_sort_list(list, fmt) {

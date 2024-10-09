@@ -234,7 +234,7 @@ void sctp_transport_pmtu(struct sctp_transport *transport, struct sock *sk)
 {
 	/* If we don't have a fresh route, look one up */
 	if (!transport->dst || transport->dst->obsolete) {
-		dst_release(transport->dst);
+		sctp_transport_dst_release(transport);
 		transport->af_specific->get_dst(transport, &transport->saddr,
 						&transport->fl, sk);
 	}
@@ -245,14 +245,13 @@ void sctp_transport_pmtu(struct sctp_transport *transport, struct sock *sk)
 		transport->pathmtu = SCTP_DEFAULT_MAXSEGMENT;
 }
 
-void sctp_transport_update_pmtu(struct sock *sk, struct sctp_transport *t, u32 pmtu)
+void sctp_transport_update_pmtu(struct sctp_transport *t, u32 pmtu)
 {
-	struct dst_entry *dst;
+	struct dst_entry *dst = sctp_transport_dst_check(t);
 
 	if (unlikely(pmtu < SCTP_DEFAULT_MINSEGMENT)) {
 		pr_warn("%s: Reported pmtu %d too low, using default minimum of %d\n",
-			__func__, pmtu,
-			SCTP_DEFAULT_MINSEGMENT);
+			__func__, pmtu, SCTP_DEFAULT_MINSEGMENT);
 		/* Use default minimum segment size and disable
 		 * pmtu discovery on this transport.
 		 */
@@ -261,17 +260,13 @@ void sctp_transport_update_pmtu(struct sock *sk, struct sctp_transport *t, u32 p
 		t->pathmtu = pmtu;
 	}
 
-	dst = sctp_transport_dst_check(t);
-	if (!dst)
-		t->af_specific->get_dst(t, &t->saddr, &t->fl, sk);
-
 	if (dst) {
-		dst->ops->update_pmtu(dst, sk, NULL, pmtu);
-
+		dst->ops->update_pmtu(dst, t->asoc->base.sk, NULL, pmtu);
 		dst = sctp_transport_dst_check(t);
-		if (!dst)
-			t->af_specific->get_dst(t, &t->saddr, &t->fl, sk);
 	}
+
+	if (!dst)
+		t->af_specific->get_dst(t, &t->saddr, &t->fl, t->asoc->base.sk);
 }
 
 /* Caches the dst entry and source address for a transport's destination
@@ -666,4 +661,18 @@ void sctp_transport_immediate_rtx(struct sctp_transport *t)
 			sctp_transport_hold(t);
 	}
 	return;
+}
+
+/* Drop dst */
+void sctp_transport_dst_release(struct sctp_transport *t)
+{
+	dst_release(t->dst);
+	t->dst = NULL;
+	t->dst_pending_confirm = 0;
+}
+
+/* Schedule neighbour confirm */
+void sctp_transport_dst_confirm(struct sctp_transport *t)
+{
+	t->dst_pending_confirm = 1;
 }

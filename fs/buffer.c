@@ -525,35 +525,12 @@ repeat:
 	return err;
 }
 
-static void do_thaw_one(struct super_block *sb, void *unused)
+void emergency_thaw_bdev(struct super_block *sb)
 {
 	char b[BDEVNAME_SIZE];
 	while (sb->s_bdev && !thaw_bdev(sb->s_bdev, sb))
 		printk(KERN_WARNING "Emergency Thaw on %s\n",
 		       bdevname(sb->s_bdev, b));
-}
-
-static void do_thaw_all(struct work_struct *work)
-{
-	iterate_supers(do_thaw_one, NULL);
-	kfree(work);
-	printk(KERN_WARNING "Emergency Thaw complete\n");
-}
-
-/**
- * emergency_thaw_all -- forcibly thaw every frozen filesystem
- *
- * Used for emergency unfreeze of all filesystems via SysRq
- */
-void emergency_thaw_all(void)
-{
-	struct work_struct *work;
-
-	work = kmalloc(sizeof(*work), GFP_ATOMIC);
-	if (work) {
-		INIT_WORK(work, do_thaw_all);
-		schedule_work(work);
-	}
 }
 
 /**
@@ -2931,7 +2908,7 @@ static void end_bio_bh_io_sync(struct bio *bio, int err)
 
 /*
  * This allows us to do IO even on the odd last sectors
- * of a device, even if the bh block size is some multiple
+ * of a device, even if the block size is some multiple
  * of the physical sector size.
  *
  * We'll just truncate the bio to the size of the device,
@@ -2941,10 +2918,11 @@ static void end_bio_bh_io_sync(struct bio *bio, int err)
  * errors, this only handles the "we need to be able to
  * do IO at the final sector" case.
  */
-static void guard_bh_eod(int rw, struct bio *bio, struct buffer_head *bh)
+void guard_bio_eod(int rw, struct bio *bio)
 {
 	sector_t maxsector;
-	unsigned bytes;
+	struct bio_vec *bvec = &bio->bi_io_vec[bio->bi_vcnt - 1];
+	unsigned truncated_bytes;
 
 	maxsector = i_size_read(bio->bi_bdev->bd_inode) >> 9;
 	if (!maxsector)
@@ -2959,23 +2937,20 @@ static void guard_bh_eod(int rw, struct bio *bio, struct buffer_head *bh)
 		return;
 
 	maxsector -= bio->bi_sector;
-	bytes = bio->bi_size;
-	if (likely((bytes >> 9) <= maxsector))
+	if (likely((bio->bi_size >> 9) <= maxsector))
 		return;
 
-	/* Uhhuh. We've got a bh that straddles the device size! */
-	bytes = maxsector << 9;
+	/* Uhhuh. We've got a bio that straddles the device size! */
+	truncated_bytes = bio->bi_size - (maxsector << 9);
 
 	/* Truncate the bio.. */
-	bio->bi_size = bytes;
-	bio->bi_io_vec[0].bv_len = bytes;
+	bio->bi_size -= truncated_bytes;
+	bvec->bv_len -= truncated_bytes;
 
 	/* ..and clear the end of the buffer for reads */
 	if ((rw & RW_MASK) == READ) {
-		void *kaddr = kmap_atomic(bh->b_page);
-		memset(kaddr + bh_offset(bh) + bytes, 0, bh->b_size - bytes);
-		kunmap_atomic(kaddr);
-		flush_dcache_page(bh->b_page);
+		zero_user(bvec->bv_page, bvec->bv_offset + bvec->bv_len,
+				truncated_bytes);
 	}
 }
 
@@ -3016,7 +2991,7 @@ int _submit_bh(int rw, struct buffer_head *bh, unsigned long bio_flags)
 	bio->bi_flags |= bio_flags;
 
 	/* Take care of bh's that straddle the end of the device */
-	guard_bh_eod(rw, bio, bh);
+	guard_bio_eod(rw, bio);
 
 	if (buffer_meta(bh))
 		rw |= REQ_META;

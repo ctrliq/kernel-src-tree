@@ -1911,7 +1911,8 @@ static int be_clear_vf_tvt(struct be_adapter *adapter, int vf)
 	return 0;
 }
 
-static int be_set_vf_vlan(struct net_device *netdev, int vf, u16 vlan, u8 qos)
+static int be_set_vf_vlan(struct net_device *netdev, int vf, u16 vlan, u8 qos,
+			  __be16 vlan_proto)
 {
 	struct be_adapter *adapter = netdev_priv(netdev);
 	struct be_vf_cfg *vf_cfg = &adapter->vf_cfg[vf];
@@ -1922,6 +1923,9 @@ static int be_set_vf_vlan(struct net_device *netdev, int vf, u16 vlan, u8 qos)
 
 	if (vf >= adapter->num_vfs || vlan > 4095 || qos > 7)
 		return -EINVAL;
+
+	if (vlan_proto != htons(ETH_P_8021Q))
+		return -EPROTONOSUPPORT;
 
 	if (vlan || qos) {
 		vlan |= qos << VLAN_PRIO_SHIFT;
@@ -3235,7 +3239,7 @@ int be_poll(struct napi_struct *napi, int budget)
 		be_process_mcc(adapter);
 
 	if (max_work < budget) {
-		napi_complete(napi);
+		napi_complete_done(napi, max_work);
 
 		/* Skyhawk EQ_DB has a provision to set the rearm to interrupt
 		 * delay via a delay multiplier encoding value
@@ -4936,7 +4940,7 @@ static int be_ndo_bridge_getlink(struct sk_buff *skb, u32 pid, u32 seq,
 	return ndo_dflt_bridge_getlink(skb, pid, seq, dev,
 				       hsw_mode == PORT_FWD_TYPE_VEPA ?
 				       BRIDGE_MODE_VEPA : BRIDGE_MODE_VEB,
-				       0, 0, nlflags);
+				       0, 0, nlflags, filter_mask, NULL);
 }
 
 static struct be_cmd_work *be_alloc_work(struct be_adapter *adapter,
@@ -5174,6 +5178,7 @@ static void be_set_rx_mode(struct net_device *dev)
 }
 
 static const struct net_device_ops be_netdev_ops = {
+	.ndo_size		= sizeof(struct net_device_ops),
 	.ndo_open		= be_open,
 	.ndo_stop		= be_close,
 	.ndo_start_xmit		= be_xmit,
@@ -5185,7 +5190,7 @@ static const struct net_device_ops be_netdev_ops = {
 	.ndo_vlan_rx_add_vid	= be_vlan_add_vid,
 	.ndo_vlan_rx_kill_vid	= be_vlan_rem_vid,
 	.ndo_set_vf_mac		= be_set_vf_mac,
-	.ndo_set_vf_vlan	= be_set_vf_vlan,
+	.extended.ndo_set_vf_vlan	= be_set_vf_vlan,
 	.ndo_set_vf_rate	= be_set_vf_tx_rate,
 	.ndo_get_vf_config	= be_get_vf_config,
 	.ndo_set_vf_link_state  = be_set_vf_link_state,
@@ -5195,8 +5200,8 @@ static const struct net_device_ops be_netdev_ops = {
 #endif
 	.ndo_bridge_setlink	= be_ndo_bridge_setlink,
 	.ndo_bridge_getlink	= be_ndo_bridge_getlink,
-	.ndo_udp_tunnel_add	= be_add_vxlan_port,
-	.ndo_udp_tunnel_del	= be_del_vxlan_port,
+	.extended.ndo_udp_tunnel_add	= be_add_vxlan_port,
+	.extended.ndo_udp_tunnel_del	= be_del_vxlan_port,
 	.ndo_features_check	= be_features_check,
 	.ndo_get_phys_port_id   = be_get_phys_port_id,
 };

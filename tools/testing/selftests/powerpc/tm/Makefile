@@ -5,7 +5,7 @@ all: $(PROGS)
 $(PROGS):
 
 tm-syscall: tm-syscall-asm.S
-tm-syscall: CFLAGS += -mhtm
+tm-syscall: CFLAGS += -mhtm -I../../../../../usr/include
 
 run_tests: all
 	@-for PROG in $(PROGS); do \

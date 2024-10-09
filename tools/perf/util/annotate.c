@@ -130,6 +130,12 @@ static struct arch architectures[] = {
 		.name = "powerpc",
 		.init = powerpc__annotate_init,
 	},
+	{
+		.name = "s390",
+		.objdump =  {
+			.comment_char = '#',
+		},
+	},
 };
 
 static void ins__delete(struct ins_operands *ops)
@@ -1225,7 +1231,7 @@ static int symbol__parse_objdump_line(struct symbol *sym, struct map *map,
 			.addr = dl->ops.target.addr,
 		};
 
-		if (!map_groups__find_ams(&target, NULL) &&
+		if (!map_groups__find_ams(&target) &&
 		    target.sym->start == target.al_addr)
 			dl->ops.target.name = strdup(target.sym->name);
 	}
@@ -1903,5 +1909,5 @@ int symbol__tty_annotate(struct symbol *sym, struct map *map,
 
 bool ui__has_annotation(void)
 {
-	return use_browser == 1 && sort__has_sym;
+	return use_browser == 1 && perf_hpp_list.sym;
 }

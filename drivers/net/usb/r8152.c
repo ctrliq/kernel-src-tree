@@ -32,7 +32,7 @@
 #define NETNEXT_VERSION		"08"
 
 /* Information for net */
-#define NET_VERSION		"4"
+#define NET_VERSION		"8"
 
 #define DRIVER_VERSION		"v1." NETNEXT_VERSION "." NET_VERSION
 #define DRIVER_AUTHOR "Realtek linux nic maintainers <nic_swsd@realtek.com>"
@@ -625,6 +625,7 @@ struct r8152 {
 		int (*eee_get)(struct r8152 *, struct ethtool_eee *);
 		int (*eee_set)(struct r8152 *, struct ethtool_eee *);
 		bool (*in_nway)(struct r8152 *);
+		void (*autosuspend_en)(struct r8152 *tp, bool enable);
 		void (*hw_phy_cfg)(struct r8152 *);
 	} rtl_ops;
 
@@ -2475,9 +2476,6 @@ static void rtl_runtime_suspend_enable(struct r8152 *tp, bool enable)
 	if (enable) {
 		u32 ocp_data;
 
-		r8153_u1u2en(tp, false);
-		r8153_u2p3en(tp, false);
-
 		__rtl_set_wol(tp, WAKE_ANY);
 
 		ocp_write_byte(tp, MCU_TYPE_PLA, PLA_CRWECR, CRWECR_CONFIG);
@@ -2499,7 +2497,17 @@ static void rtl_runtime_suspend_enable(struct r8152 *tp, bool enable)
 		ocp_write_word(tp, MCU_TYPE_PLA, PLA_CONFIG34, ocp_data);
 
 		ocp_write_byte(tp, MCU_TYPE_PLA, PLA_CRWECR, CRWECR_NORAML);
+	}
+}
 
+static void rtl8153_runtime_enable(struct r8152 *tp, bool enable)
+{
+	rtl_runtime_suspend_enable(tp, enable);
+
+	if (enable) {
+		r8153_u1u2en(tp, false);
+		r8153_u2p3en(tp, false);
+	} else {
 		r8153_u2p3en(tp, true);
 		r8153_u1u2en(tp, true);
 	}
@@ -2528,6 +2536,77 @@ static void r8152_aldps_en(struct r8152 *tp, bool enable)
 						    DIS_SDSAVE);
 		msleep(20);
 	}
+}
+
+static inline void r8152_mmd_indirect(struct r8152 *tp, u16 dev, u16 reg)
+{
+	ocp_reg_write(tp, OCP_EEE_AR, FUN_ADDR | dev);
+	ocp_reg_write(tp, OCP_EEE_DATA, reg);
+	ocp_reg_write(tp, OCP_EEE_AR, FUN_DATA | dev);
+}
+
+static u16 r8152_mmd_read(struct r8152 *tp, u16 dev, u16 reg)
+{
+	u16 data;
+
+	r8152_mmd_indirect(tp, dev, reg);
+	data = ocp_reg_read(tp, OCP_EEE_DATA);
+	ocp_reg_write(tp, OCP_EEE_AR, 0x0000);
+
+	return data;
+}
+
+static void r8152_mmd_write(struct r8152 *tp, u16 dev, u16 reg, u16 data)
+{
+	r8152_mmd_indirect(tp, dev, reg);
+	ocp_reg_write(tp, OCP_EEE_DATA, data);
+	ocp_reg_write(tp, OCP_EEE_AR, 0x0000);
+}
+
+static void r8152_eee_en(struct r8152 *tp, bool enable)
+{
+	u16 config1, config2, config3;
+	u32 ocp_data;
+
+	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_EEE_CR);
+	config1 = ocp_reg_read(tp, OCP_EEE_CONFIG1) & ~sd_rise_time_mask;
+	config2 = ocp_reg_read(tp, OCP_EEE_CONFIG2);
+	config3 = ocp_reg_read(tp, OCP_EEE_CONFIG3) & ~fast_snr_mask;
+
+	if (enable) {
+		ocp_data |= EEE_RX_EN | EEE_TX_EN;
+		config1 |= EEE_10_CAP | EEE_NWAY_EN | TX_QUIET_EN | RX_QUIET_EN;
+		config1 |= sd_rise_time(1);
+		config2 |= RG_DACQUIET_EN | RG_LDVQUIET_EN;
+		config3 |= fast_snr(42);
+	} else {
+		ocp_data &= ~(EEE_RX_EN | EEE_TX_EN);
+		config1 &= ~(EEE_10_CAP | EEE_NWAY_EN | TX_QUIET_EN |
+			     RX_QUIET_EN);
+		config1 |= sd_rise_time(7);
+		config2 &= ~(RG_DACQUIET_EN | RG_LDVQUIET_EN);
+		config3 |= fast_snr(511);
+	}
+
+	ocp_write_word(tp, MCU_TYPE_PLA, PLA_EEE_CR, ocp_data);
+	ocp_reg_write(tp, OCP_EEE_CONFIG1, config1);
+	ocp_reg_write(tp, OCP_EEE_CONFIG2, config2);
+	ocp_reg_write(tp, OCP_EEE_CONFIG3, config3);
+}
+
+static void r8152b_enable_eee(struct r8152 *tp)
+{
+	r8152_eee_en(tp, true);
+	r8152_mmd_write(tp, MDIO_MMD_AN, MDIO_AN_EEE_ADV, MDIO_EEE_100TX);
+}
+
+static void r8152b_enable_fc(struct r8152 *tp)
+{
+	u16 anar;
+
+	anar = r8152_mdio_read(tp, MII_ADVERTISE);
+	anar |= ADVERTISE_PAUSE_CAP | ADVERTISE_PAUSE_ASYM;
+	r8152_mdio_write(tp, MII_ADVERTISE, anar);
 }
 
 static void rtl8152_disable(struct r8152 *tp)
@@ -2675,10 +2754,52 @@ static void r8152b_enter_oob(struct r8152 *tp)
 	ocp_write_dword(tp, MCU_TYPE_PLA, PLA_RCR, ocp_data);
 }
 
+static void r8153_aldps_en(struct r8152 *tp, bool enable)
+{
+	u16 data;
+
+	data = ocp_reg_read(tp, OCP_POWER_CFG);
+	if (enable) {
+		data |= EN_ALDPS;
+		ocp_reg_write(tp, OCP_POWER_CFG, data);
+	} else {
+		data &= ~EN_ALDPS;
+		ocp_reg_write(tp, OCP_POWER_CFG, data);
+		msleep(20);
+	}
+}
+
+static void r8153_eee_en(struct r8152 *tp, bool enable)
+{
+	u32 ocp_data;
+	u16 config;
+
+	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_EEE_CR);
+	config = ocp_reg_read(tp, OCP_EEE_CFG);
+
+	if (enable) {
+		ocp_data |= EEE_RX_EN | EEE_TX_EN;
+		config |= EEE10_EN;
+	} else {
+		ocp_data &= ~(EEE_RX_EN | EEE_TX_EN);
+		config &= ~EEE10_EN;
+	}
+
+	ocp_write_word(tp, MCU_TYPE_PLA, PLA_EEE_CR, ocp_data);
+	ocp_reg_write(tp, OCP_EEE_CFG, config);
+}
+
 static void r8153_hw_phy_cfg(struct r8152 *tp)
 {
 	u32 ocp_data;
 	u16 data;
+
+	/* disable ALDPS before updating the PHY parameters */
+	r8153_aldps_en(tp, false);
+
+	/* disable EEE before updating the PHY parameters */
+	r8153_eee_en(tp, false);
+	ocp_reg_write(tp, OCP_EEE_ADV, 0);
 
 	if (tp->version == RTL_VER_03) {
 		data = ocp_reg_read(tp, OCP_EEE_CFG);
@@ -2709,7 +2830,9 @@ static void r8153_hw_phy_cfg(struct r8152 *tp)
 	sram_write(tp, SRAM_10M_AMP1, 0x00af);
 	sram_write(tp, SRAM_10M_AMP2, 0x0208);
 
-	r8153_enable_eee(tp);
+	r8153_eee_en(tp, true);
+	ocp_reg_write(tp, OCP_EEE_ADV, MDIO_EEE_1000T | MDIO_EEE_100TX);
+
 	r8153_aldps_en(tp, true);
 	r8152b_enable_fc(tp);
 
@@ -2830,21 +2953,6 @@ static void r8153_enter_oob(struct r8152 *tp)
 	ocp_data = ocp_read_dword(tp, MCU_TYPE_PLA, PLA_RCR);
 	ocp_data |= RCR_APM | RCR_AM | RCR_AB;
 	ocp_write_dword(tp, MCU_TYPE_PLA, PLA_RCR, ocp_data);
-}
-
-static void r8153_aldps_en(struct r8152 *tp, bool enable)
-{
-	u16 data;
-
-	data = ocp_reg_read(tp, OCP_POWER_CFG);
-	if (enable) {
-		data |= EN_ALDPS;
-		ocp_reg_write(tp, OCP_POWER_CFG, data);
-	} else {
-		data &= ~EN_ALDPS;
-		ocp_reg_write(tp, OCP_POWER_CFG, data);
-		msleep(20);
-	}
 }
 
 static void rtl8153_disable(struct r8152 *tp)
@@ -3218,103 +3326,6 @@ static int rtl8152_close(struct net_device *netdev)
 	return res;
 }
 
-static inline void r8152_mmd_indirect(struct r8152 *tp, u16 dev, u16 reg)
-{
-	ocp_reg_write(tp, OCP_EEE_AR, FUN_ADDR | dev);
-	ocp_reg_write(tp, OCP_EEE_DATA, reg);
-	ocp_reg_write(tp, OCP_EEE_AR, FUN_DATA | dev);
-}
-
-static u16 r8152_mmd_read(struct r8152 *tp, u16 dev, u16 reg)
-{
-	u16 data;
-
-	r8152_mmd_indirect(tp, dev, reg);
-	data = ocp_reg_read(tp, OCP_EEE_DATA);
-	ocp_reg_write(tp, OCP_EEE_AR, 0x0000);
-
-	return data;
-}
-
-static void r8152_mmd_write(struct r8152 *tp, u16 dev, u16 reg, u16 data)
-{
-	r8152_mmd_indirect(tp, dev, reg);
-	ocp_reg_write(tp, OCP_EEE_DATA, data);
-	ocp_reg_write(tp, OCP_EEE_AR, 0x0000);
-}
-
-static void r8152_eee_en(struct r8152 *tp, bool enable)
-{
-	u16 config1, config2, config3;
-	u32 ocp_data;
-
-	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_EEE_CR);
-	config1 = ocp_reg_read(tp, OCP_EEE_CONFIG1) & ~sd_rise_time_mask;
-	config2 = ocp_reg_read(tp, OCP_EEE_CONFIG2);
-	config3 = ocp_reg_read(tp, OCP_EEE_CONFIG3) & ~fast_snr_mask;
-
-	if (enable) {
-		ocp_data |= EEE_RX_EN | EEE_TX_EN;
-		config1 |= EEE_10_CAP | EEE_NWAY_EN | TX_QUIET_EN | RX_QUIET_EN;
-		config1 |= sd_rise_time(1);
-		config2 |= RG_DACQUIET_EN | RG_LDVQUIET_EN;
-		config3 |= fast_snr(42);
-	} else {
-		ocp_data &= ~(EEE_RX_EN | EEE_TX_EN);
-		config1 &= ~(EEE_10_CAP | EEE_NWAY_EN | TX_QUIET_EN |
-			     RX_QUIET_EN);
-		config1 |= sd_rise_time(7);
-		config2 &= ~(RG_DACQUIET_EN | RG_LDVQUIET_EN);
-		config3 |= fast_snr(511);
-	}
-
-	ocp_write_word(tp, MCU_TYPE_PLA, PLA_EEE_CR, ocp_data);
-	ocp_reg_write(tp, OCP_EEE_CONFIG1, config1);
-	ocp_reg_write(tp, OCP_EEE_CONFIG2, config2);
-	ocp_reg_write(tp, OCP_EEE_CONFIG3, config3);
-}
-
-static void r8152b_enable_eee(struct r8152 *tp)
-{
-	r8152_eee_en(tp, true);
-	r8152_mmd_write(tp, MDIO_MMD_AN, MDIO_AN_EEE_ADV, MDIO_EEE_100TX);
-}
-
-static void r8153_eee_en(struct r8152 *tp, bool enable)
-{
-	u32 ocp_data;
-	u16 config;
-
-	ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_EEE_CR);
-	config = ocp_reg_read(tp, OCP_EEE_CFG);
-
-	if (enable) {
-		ocp_data |= EEE_RX_EN | EEE_TX_EN;
-		config |= EEE10_EN;
-	} else {
-		ocp_data &= ~(EEE_RX_EN | EEE_TX_EN);
-		config &= ~EEE10_EN;
-	}
-
-	ocp_write_word(tp, MCU_TYPE_PLA, PLA_EEE_CR, ocp_data);
-	ocp_reg_write(tp, OCP_EEE_CFG, config);
-}
-
-static void r8153_enable_eee(struct r8152 *tp)
-{
-	r8153_eee_en(tp, true);
-	ocp_reg_write(tp, OCP_EEE_ADV, MDIO_EEE_1000T | MDIO_EEE_100TX);
-}
-
-static void r8152b_enable_fc(struct r8152 *tp)
-{
-	u16 anar;
-
-	anar = r8152_mdio_read(tp, MII_ADVERTISE);
-	anar |= ADVERTISE_PAUSE_CAP | ADVERTISE_PAUSE_ASYM;
-	r8152_mdio_write(tp, MII_ADVERTISE, anar);
-}
-
 static void rtl_tally_reset(struct r8152 *tp)
 {
 	u32 ocp_data;
@@ -3376,7 +3387,6 @@ static void r8153_init(struct r8152 *tp)
 	if (test_bit(RTL8152_UNPLUG, &tp->flags))
 		return;
 
-	r8153_aldps_en(tp, false);
 	r8153_u1u2en(tp, false);
 
 	for (i = 0; i < 500; i++) {
@@ -3532,6 +3542,9 @@ static int rtl8152_post_reset(struct usb_interface *intf)
 	netif_wake_queue(netdev);
 	usb_submit_urb(tp->intr_urb, GFP_KERNEL);
 
+	if (!list_empty(&tp->rx_done))
+		napi_schedule(&tp->napi);
+
 	return 0;
 }
 
@@ -3552,43 +3565,98 @@ static bool delay_autosuspend(struct r8152 *tp)
 	 */
 	if (!sw_linking && tp->rtl_ops.in_nway(tp))
 		return true;
+	else if (!skb_queue_empty(&tp->tx_queue))
+		return true;
 	else
 		return false;
 }
 
-static int rtl8152_suspend(struct usb_interface *intf, pm_message_t message)
+static int rtl8152_rumtime_suspend(struct r8152 *tp)
 {
-	struct r8152 *tp = usb_get_intfdata(intf);
 	struct net_device *netdev = tp->netdev;
 	int ret = 0;
 
-	mutex_lock(&tp->control);
+	set_bit(SELECTIVE_SUSPEND, &tp->flags);
+	smp_mb__after_atomic();
 
-	if (PMSG_IS_AUTO(message)) {
-		if (netif_running(netdev) && delay_autosuspend(tp)) {
+	if (netif_running(netdev) && test_bit(WORK_ENABLE, &tp->flags)) {
+		u32 rcr = 0;
+
+		if (delay_autosuspend(tp)) {
+			clear_bit(SELECTIVE_SUSPEND, &tp->flags);
+			smp_mb__after_atomic();
 			ret = -EBUSY;
 			goto out1;
 		}
 
-		set_bit(SELECTIVE_SUSPEND, &tp->flags);
-	} else {
-		netif_device_detach(netdev);
+		if (netif_carrier_ok(netdev)) {
+			u32 ocp_data;
+
+			rcr = ocp_read_dword(tp, MCU_TYPE_PLA, PLA_RCR);
+			ocp_data = rcr & ~RCR_ACPT_ALL;
+			ocp_write_dword(tp, MCU_TYPE_PLA, PLA_RCR, ocp_data);
+			rxdy_gated_en(tp, true);
+			ocp_data = ocp_read_byte(tp, MCU_TYPE_PLA,
+						 PLA_OOB_CTRL);
+			if (!(ocp_data & RXFIFO_EMPTY)) {
+				rxdy_gated_en(tp, false);
+				ocp_write_dword(tp, MCU_TYPE_PLA, PLA_RCR, rcr);
+				clear_bit(SELECTIVE_SUSPEND, &tp->flags);
+				smp_mb__after_atomic();
+				ret = -EBUSY;
+				goto out1;
+			}
+		}
+
+		clear_bit(WORK_ENABLE, &tp->flags);
+		usb_kill_urb(tp->intr_urb);
+
+		tp->rtl_ops.autosuspend_en(tp, true);
+
+		if (netif_carrier_ok(netdev)) {
+			napi_disable(&tp->napi);
+			rtl_stop_rx(tp);
+			rxdy_gated_en(tp, false);
+			ocp_write_dword(tp, MCU_TYPE_PLA, PLA_RCR, rcr);
+			napi_enable(&tp->napi);
+		}
 	}
+
+out1:
+	return ret;
+}
+
+static int rtl8152_system_suspend(struct r8152 *tp)
+{
+	struct net_device *netdev = tp->netdev;
+	int ret = 0;
+
+	netif_device_detach(netdev);
 
 	if (netif_running(netdev) && test_bit(WORK_ENABLE, &tp->flags)) {
 		clear_bit(WORK_ENABLE, &tp->flags);
 		usb_kill_urb(tp->intr_urb);
 		napi_disable(&tp->napi);
-		if (test_bit(SELECTIVE_SUSPEND, &tp->flags)) {
-			rtl_stop_rx(tp);
-			rtl_runtime_suspend_enable(tp, true);
-		} else {
-			cancel_delayed_work_sync(&tp->schedule);
-			tp->rtl_ops.down(tp);
-		}
+		cancel_delayed_work_sync(&tp->schedule);
+		tp->rtl_ops.down(tp);
 		napi_enable(&tp->napi);
 	}
-out1:
+
+	return ret;
+}
+
+static int rtl8152_suspend(struct usb_interface *intf, pm_message_t message)
+{
+	struct r8152 *tp = usb_get_intfdata(intf);
+	int ret;
+
+	mutex_lock(&tp->control);
+
+	if (PMSG_IS_AUTO(message))
+		ret = rtl8152_rumtime_suspend(tp);
+	else
+		ret = rtl8152_system_suspend(tp);
+
 	mutex_unlock(&tp->control);
 
 	return ret;
@@ -3608,13 +3676,16 @@ static int rtl8152_resume(struct usb_interface *intf)
 
 	if (netif_running(tp->netdev) && tp->netdev->flags & IFF_UP) {
 		if (test_bit(SELECTIVE_SUSPEND, &tp->flags)) {
-			rtl_runtime_suspend_enable(tp, false);
-			clear_bit(SELECTIVE_SUSPEND, &tp->flags);
+			tp->rtl_ops.autosuspend_en(tp, false);
 			napi_disable(&tp->napi);
 			set_bit(WORK_ENABLE, &tp->flags);
 			if (netif_carrier_ok(tp->netdev))
 				rtl_start_rx(tp);
 			napi_enable(&tp->napi);
+			clear_bit(SELECTIVE_SUSPEND, &tp->flags);
+			smp_mb__after_atomic();
+			if (!list_empty(&tp->rx_done))
+				napi_schedule(&tp->napi);
 		} else {
 			tp->rtl_ops.up(tp);
 			netif_carrier_off(tp->netdev);
@@ -3623,7 +3694,7 @@ static int rtl8152_resume(struct usb_interface *intf)
 		usb_submit_urb(tp->intr_urb, GFP_KERNEL);
 	} else if (test_bit(SELECTIVE_SUSPEND, &tp->flags)) {
 		if (tp->netdev->flags & IFF_UP)
-			rtl_runtime_suspend_enable(tp, false);
+			tp->rtl_ops.autosuspend_en(tp, false);
 		clear_bit(SELECTIVE_SUSPEND, &tp->flags);
 	}
 
@@ -4208,6 +4279,7 @@ static int rtl_ops_init(struct r8152 *tp)
 		ops->eee_get		= r8152_get_eee;
 		ops->eee_set		= r8152_set_eee;
 		ops->in_nway		= rtl8152_in_nway;
+		ops->autosuspend_en	= rtl_runtime_suspend_enable;
 		ops->hw_phy_cfg		= r8152b_hw_phy_cfg;
 		break;
 
@@ -4224,6 +4296,7 @@ static int rtl_ops_init(struct r8152 *tp)
 		ops->eee_get		= r8153_get_eee;
 		ops->eee_set		= r8153_set_eee;
 		ops->in_nway		= rtl8153_in_nway;
+		ops->autosuspend_en	= rtl8153_runtime_enable;
 		ops->hw_phy_cfg		= r8153_hw_phy_cfg;
 		break;
 

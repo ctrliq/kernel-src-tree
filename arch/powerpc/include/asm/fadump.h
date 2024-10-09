@@ -77,6 +77,8 @@
 	reg_entry++;							\
 })
 
+extern int crashing_cpu;
+
 /* Kernel Dump section info */
 struct fadump_section {
 	__be32	request_flag;
@@ -206,12 +208,16 @@ extern int early_init_dt_scan_fw_dump(unsigned long node,
 		const char *uname, int depth, void *data);
 extern int fadump_reserve_mem(void);
 extern int setup_fadump(void);
+extern unsigned long long fadump_default_reserve_size(void);
+extern int is_fadump_enabled(void);
 extern int is_fadump_active(void);
 extern void crash_fadump(struct pt_regs *, const char *);
 extern void fadump_cleanup(void);
 
 extern void vmcore_cleanup(void);
 #else	/* CONFIG_FA_DUMP */
+static inline unsigned long long fadump_default_reserve_size(void) { return 0; }
+static inline int is_fadump_enabled(void) { return 0; }
 static inline int is_fadump_active(void) { return 0; }
 static inline void crash_fadump(struct pt_regs *regs, const char *str) { }
 #endif

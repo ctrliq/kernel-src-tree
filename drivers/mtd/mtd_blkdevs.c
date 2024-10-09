@@ -113,7 +113,7 @@ static int do_blktrans_request(struct mtd_blktrans_ops *tr,
 				return -EIO;
 		return 0;
 	default:
-		printk(KERN_NOTICE "Unknown request %u\n", rq_data_dir(req));
+		printk(KERN_NOTICE "Unknown request %llu\n", rq_data_dir(req));
 		return -EIO;
 	}
 }

@@ -45,6 +45,7 @@ struct intel_uncore_type {
 	unsigned perf_ctr;
 	unsigned event_ctl;
 	unsigned event_mask;
+	unsigned event_mask_ext;
 	unsigned fixed_ctr;
 	unsigned fixed_ctl;
 	unsigned box_ctl;
@@ -368,6 +369,7 @@ int bdw_uncore_pci_init(void);
 int skl_uncore_pci_init(void);
 void snb_uncore_cpu_init(void);
 void nhm_uncore_cpu_init(void);
+void skl_uncore_cpu_init(void);
 int snb_pci2phy_map_init(int devid);
 
 /* perf_event_intel_uncore_snbep.c */
@@ -381,6 +383,8 @@ int bdx_uncore_pci_init(void);
 void bdx_uncore_cpu_init(void);
 int knl_uncore_pci_init(void);
 void knl_uncore_cpu_init(void);
+int skx_uncore_pci_init(void);
+void skx_uncore_cpu_init(void);
 
 /* perf_event_intel_uncore_nhmex.c */
 void nhmex_uncore_cpu_init(void);

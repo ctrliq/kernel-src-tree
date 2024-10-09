@@ -200,16 +200,10 @@ static void virtio_gpu_3d_imageblit(struct fb_info *info,
 
 static struct fb_ops virtio_gpufb_ops = {
 	.owner = THIS_MODULE,
-	.fb_check_var = drm_fb_helper_check_var,
-	.fb_set_par = drm_fb_helper_set_par, /* TODO: copy vmwgfx */
+	DRM_FB_HELPER_DEFAULT_OPS,
 	.fb_fillrect = virtio_gpu_3d_fillrect,
 	.fb_copyarea = virtio_gpu_3d_copyarea,
 	.fb_imageblit = virtio_gpu_3d_imageblit,
-	.fb_pan_display = drm_fb_helper_pan_display,
-	.fb_blank = drm_fb_helper_blank,
-	.fb_setcmap = drm_fb_helper_setcmap,
-	.fb_debug_enter = drm_fb_helper_debug_enter,
-	.fb_debug_leave = drm_fb_helper_debug_leave,
 };
 
 static int virtio_gpu_vmap_fb(struct virtio_gpu_device *vgdev,
@@ -237,63 +231,9 @@ static int virtio_gpufb_create(struct drm_fb_helper *helper,
 	mode_cmd.pitches[0] = mode_cmd.width * 4;
 	mode_cmd.pixel_format = drm_mode_legacy_fb_format(32, 24);
 
-	switch (mode_cmd.pixel_format) {
-#ifdef __BIG_ENDIAN
-	case DRM_FORMAT_XRGB8888:
-		format = VIRTIO_GPU_FORMAT_X8R8G8B8_UNORM;
-		break;
-	case DRM_FORMAT_ARGB8888:
-		format = VIRTIO_GPU_FORMAT_A8R8G8B8_UNORM;
-		break;
-	case DRM_FORMAT_BGRX8888:
-		format = VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM;
-		break;
-	case DRM_FORMAT_BGRA8888:
-		format = VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
-		break;
-	case DRM_FORMAT_RGBX8888:
-		format = VIRTIO_GPU_FORMAT_R8G8B8X8_UNORM;
-		break;
-	case DRM_FORMAT_RGBA8888:
-		format = VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM;
-		break;
-	case DRM_FORMAT_XBGR8888:
-		format = VIRTIO_GPU_FORMAT_X8B8G8R8_UNORM;
-		break;
-	case DRM_FORMAT_ABGR8888:
-		format = VIRTIO_GPU_FORMAT_A8B8G8R8_UNORM;
-		break;
-#else
-	case DRM_FORMAT_XRGB8888:
-		format = VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM;
-		break;
-	case DRM_FORMAT_ARGB8888:
-		format = VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
-		break;
-	case DRM_FORMAT_BGRX8888:
-		format = VIRTIO_GPU_FORMAT_X8R8G8B8_UNORM;
-		break;
-	case DRM_FORMAT_BGRA8888:
-		format = VIRTIO_GPU_FORMAT_A8R8G8B8_UNORM;
-		break;
-	case DRM_FORMAT_RGBX8888:
-		format = VIRTIO_GPU_FORMAT_X8B8G8R8_UNORM;
-		break;
-	case DRM_FORMAT_RGBA8888:
-		format = VIRTIO_GPU_FORMAT_A8B8G8R8_UNORM;
-		break;
-	case DRM_FORMAT_XBGR8888:
-		format = VIRTIO_GPU_FORMAT_R8G8B8X8_UNORM;
-		break;
-	case DRM_FORMAT_ABGR8888:
-		format = VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM;
-		break;
-#endif
-	default:
-		DRM_ERROR("failed to find virtio gpu format for %d\n",
-			  mode_cmd.pixel_format);
+	format = virtio_gpu_translate_format(mode_cmd.pixel_format);
+	if (format == 0)
 		return -EINVAL;
-	}
 
 	size = mode_cmd.pitches[0] * mode_cmd.height;
 	obj = virtio_gpu_alloc_object(dev, size, false, true);

@@ -139,6 +139,11 @@ enum {
 	RTM_GETNSID = 90,
 #define RTM_GETNSID RTM_GETNSID
 
+	RTM_NEWSTATS = 92,
+#define RTM_NEWSTATS RTM_NEWSTATS
+	RTM_GETSTATS = 94,
+#define RTM_GETSTATS RTM_GETSTATS
+
 	__RTM_MAX,
 #define RTM_MAX		(((__RTM_MAX + 3) & ~3) - 1)
 };
@@ -340,7 +345,7 @@ struct rtnexthop {
 #define RTNH_F_DEAD		1	/* Nexthop is dead (used by multipath)	*/
 #define RTNH_F_PERVASIVE	2	/* Do recursive gateway lookup	*/
 #define RTNH_F_ONLINK		4	/* Gateway is forced on link	*/
-#define RTNH_F_EXTERNAL		8	/* Route installed externally	*/
+#define RTNH_F_OFFLOAD		8	/* offloaded route */
 
 /* Macros to handle hexthops */
 
@@ -533,6 +538,7 @@ enum {
 	TCA_FCNT,
 	TCA_STATS2,
 	TCA_STAB,
+	TCA_PAD,
 	__TCA_MAX
 };
 

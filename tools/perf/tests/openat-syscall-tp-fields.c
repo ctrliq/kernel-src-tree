@@ -51,21 +51,21 @@ int test__syscall_openat_tp_fields(int subtest __maybe_unused)
 		goto out_delete_evlist;
 	}
 
-	perf_evsel__config(evsel, &opts);
+	perf_evsel__config(evsel, &opts, NULL);
 
 	thread_map__set_pid(evlist->threads, 0, getpid());
 
 	err = perf_evlist__open(evlist);
 	if (err < 0) {
 		pr_debug("perf_evlist__open: %s\n",
-			 strerror_r(errno, sbuf, sizeof(sbuf)));
+			 str_error_r(errno, sbuf, sizeof(sbuf)));
 		goto out_delete_evlist;
 	}
 
 	err = perf_evlist__mmap(evlist, UINT_MAX, false);
 	if (err < 0) {
 		pr_debug("perf_evlist__mmap: %s\n",
-			 strerror_r(errno, sbuf, sizeof(sbuf)));
+			 str_error_r(errno, sbuf, sizeof(sbuf)));
 		goto out_delete_evlist;
 	}
 

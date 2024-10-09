@@ -53,6 +53,26 @@ static int str(yyscan_t scanner, int token)
 	return token;
 }
 
+/*
+ * This function is called when the parser gets two kind of input:
+ *
+ * 	@cfg1 or @cfg2=config
+ *
+ * The leading '@' is stripped off before 'cfg1' and 'cfg2=config' are given to
+ * bison.  In the latter case it is necessary to keep the string intact so that
+ * the PMU kernel driver can determine what configurable is associated to
+ * 'config'.
+ */
+static int drv_str(yyscan_t scanner, int token)
+{
+	YYSTYPE *yylval = parse_events_get_lval(scanner);
+	char *text = parse_events_get_text(scanner);
+
+	/* Strip off the '@' */
+	yylval->str = strdup(text + 1);
+	return token;
+}
+
 #define REWIND(__alloc)				\
 do {								\
 	YYSTYPE *__yylval = parse_events_get_lval(yyscanner);	\
@@ -121,6 +141,7 @@ num_hex		0x[a-fA-F0-9]+
 num_raw_hex	[a-fA-F0-9]+
 name		[a-zA-Z_*?][a-zA-Z0-9_*?.]*
 name_minus	[a-zA-Z_*?][a-zA-Z0-9\-_*?.]*
+drv_cfg_term	[a-zA-Z0-9_\.]+(=[a-zA-Z0-9_*?\.:]+)?
 /* If you add a modifier you need to update check_modifier() */
 modifier_event	[ukhpPGHSDI]+
 modifier_bp	[rwx]{1,3}
@@ -188,9 +209,12 @@ call-graph		{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_CALLGRAPH); }
 stack-size		{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_STACKSIZE); }
 inherit			{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_INHERIT); }
 no-inherit		{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_NOINHERIT); }
+overwrite		{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_OVERWRITE); }
+no-overwrite		{ return term(yyscanner, PARSE_EVENTS__TERM_TYPE_NOOVERWRITE); }
 ,			{ return ','; }
 "/"			{ BEGIN(INITIAL); return '/'; }
 {name_minus}		{ return str(yyscanner, PE_NAME); }
+@{drv_cfg_term}		{ return drv_str(yyscanner, PE_DRV_CFG_TERM); }
 }
 
 <mem>{

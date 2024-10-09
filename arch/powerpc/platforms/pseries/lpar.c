@@ -26,6 +26,8 @@
 #include <linux/dma-mapping.h>
 #include <linux/console.h>
 #include <linux/export.h>
+#include <linux/delay.h>
+#include <linux/stop_machine.h>
 #include <asm/processor.h>
 #include <asm/mmu.h>
 #include <asm/page.h>
@@ -220,7 +222,7 @@ static long pSeries_lpar_hpte_remove(unsigned long hpte_group)
 	return -1;
 }
 
-static void pSeries_lpar_hptab_clear(void)
+static void manual_hpte_clear_all(void)
 {
 	unsigned long size_bytes = 1UL << ppc64_pft_size;
 	unsigned long hpte_count = size_bytes >> 4;
@@ -248,6 +250,26 @@ static void pSeries_lpar_hptab_clear(void)
 					&(ptes[j].pteh), &(ptes[j].ptel));
 		}
 	}
+}
+
+static int hcall_hpte_clear_all(void)
+{
+	int rc;
+
+	do {
+		rc = plpar_hcall_norets(H_CLEAR_HPT);
+	} while (rc == H_CONTINUE);
+
+	return rc;
+}
+
+static void pseries_hpte_clear_all(void)
+{
+	int rc;
+
+	rc = hcall_hpte_clear_all();
+	if (rc != H_SUCCESS)
+		manual_hpte_clear_all();
 
 #ifdef __LITTLE_ENDIAN__
 	/*
@@ -591,6 +613,112 @@ static int __init disable_bulk_remove(char *str)
 
 __setup("bulk_remove=", disable_bulk_remove);
 
+#define HPT_RESIZE_TIMEOUT	10000 /* ms */
+
+struct hpt_resize_state {
+	unsigned long shift;
+	int commit_rc;
+};
+
+static int pseries_lpar_resize_hpt_commit(void *data)
+{
+	struct hpt_resize_state *state = data;
+
+	state->commit_rc = plpar_resize_hpt_commit(0, state->shift);
+	if (state->commit_rc != H_SUCCESS)
+		return -EIO;
+
+	/* Hypervisor has transitioned the HTAB, update our globals */
+	ppc64_pft_size = state->shift;
+	htab_size_bytes = 1UL << ppc64_pft_size;
+	htab_hash_mask = (htab_size_bytes >> 7) - 1;
+
+	return 0;
+}
+
+/* Must be called in user context */
+static int pseries_lpar_resize_hpt(unsigned long shift)
+{
+	struct hpt_resize_state state = {
+		.shift = shift,
+		.commit_rc = H_FUNCTION,
+	};
+	unsigned int delay, total_delay = 0;
+	int rc;
+	ktime_t t0, t1, t2;
+
+	might_sleep();
+
+	if (!firmware_has_feature(FW_FEATURE_HPT_RESIZE))
+		return -ENODEV;
+
+	printk(KERN_INFO "lpar: Attempting to resize HPT to shift %lu\n",
+	       shift);
+
+	t0 = ktime_get();
+
+	rc = plpar_resize_hpt_prepare(0, shift);
+	while (H_IS_LONG_BUSY(rc)) {
+		delay = get_longbusy_msecs(rc);
+		total_delay += delay;
+		if (total_delay > HPT_RESIZE_TIMEOUT) {
+			/* prepare with shift==0 cancels an in-progress resize */
+			rc = plpar_resize_hpt_prepare(0, 0);
+			if (rc != H_SUCCESS)
+				printk(KERN_WARNING
+				       "lpar: Unexpected error %d cancelling timed out HPT resize\n",
+				       rc);
+			return -ETIMEDOUT;
+		}
+		msleep(delay);
+		rc = plpar_resize_hpt_prepare(0, shift);
+	};
+
+	switch (rc) {
+	case H_SUCCESS:
+		/* Continue on */
+		break;
+
+	case H_PARAMETER:
+		return -EINVAL;
+	case H_RESOURCE:
+		return -EPERM;
+	default:
+		printk(KERN_WARNING
+		       "lpar: Unexpected error %d from H_RESIZE_HPT_PREPARE\n",
+		       rc);
+		return -EIO;
+	}
+
+	t1 = ktime_get();
+
+	rc = stop_machine(pseries_lpar_resize_hpt_commit, &state, NULL);
+
+	t2 = ktime_get();
+
+	if (rc != 0) {
+		switch (state.commit_rc) {
+		case H_PTEG_FULL:
+			printk(KERN_WARNING
+			       "lpar: Hash collision while resizing HPT\n");
+			return -ENOSPC;
+
+		default:
+			printk(KERN_WARNING
+			       "lpar: Unexpected error %d from H_RESIZE_HPT_COMMIT\n",
+			       state.commit_rc);
+			return -EIO;
+		};
+	}
+
+	printk(KERN_INFO
+	       "lpar: HPT resize to shift %lu complete (%lld ms / %lld ms)\n",
+	       shift, (long long) ktime_ms_delta(t1, t0),
+	       (long long) ktime_ms_delta(t2, t1));
+
+	return 0;
+}
+
 void __init hpte_init_lpar(void)
 {
 	ppc_md.hpte_invalidate	= pSeries_lpar_hpte_invalidate;
@@ -600,8 +728,11 @@ void __init hpte_init_lpar(void)
 	ppc_md.hpte_remove	= pSeries_lpar_hpte_remove;
 	ppc_md.hpte_removebolted = pSeries_lpar_hpte_removebolted;
 	ppc_md.flush_hash_range	= pSeries_lpar_flush_hash_range;
-	ppc_md.hpte_clear_all   = pSeries_lpar_hptab_clear;
+	ppc_md.hpte_clear_all   = pseries_hpte_clear_all;
 	ppc_md.hugepage_invalidate = pSeries_lpar_hugepage_invalidate;
+
+	if (firmware_has_feature(FW_FEATURE_HPT_RESIZE))
+		ppc_md.resize_hpt =  pseries_lpar_resize_hpt;
 }
 
 #ifdef CONFIG_PPC_SMLPAR

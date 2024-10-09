@@ -51,7 +51,7 @@
 #include "ocrdma.h"
 #include "ocrdma_hw.h"
 #include "ocrdma_verbs.h"
-#include "ocrdma_abi.h"
+#include <rdma/ocrdma-abi.h>
 
 int ocrdma_query_pkey(struct ib_device *ibdev, u8 port, u16 index, u16 *pkey)
 {
@@ -1494,9 +1494,7 @@ int _ocrdma_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 	 */
 	if (status < 0)
 		return status;
-	status = ocrdma_mbx_modify_qp(dev, qp, attr, attr_mask);
-
-	return status;
+	return ocrdma_mbx_modify_qp(dev, qp, attr, attr_mask);
 }
 
 int ocrdma_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,

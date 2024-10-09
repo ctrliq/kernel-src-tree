@@ -14,11 +14,13 @@
 #include <drm/drm_crtc_helper.h>
 #include "mgag200_drv.h"
 
+extern int mgag200_preferred_depth __read_mostly;
+
 static void mga_user_framebuffer_destroy(struct drm_framebuffer *fb)
 {
 	struct mga_framebuffer *mga_fb = to_mga_framebuffer(fb);
-	if (mga_fb->obj)
-		drm_gem_object_unreference_unlocked(mga_fb->obj);
+
+	drm_gem_object_unreference_unlocked(mga_fb->obj);
 	drm_framebuffer_cleanup(fb);
 	kfree(fb);
 }
@@ -53,7 +55,7 @@ mgag200_user_framebuffer_create(struct drm_device *dev,
 	struct mga_framebuffer *mga_fb;
 	int ret;
 
-	obj = drm_gem_object_lookup(dev, filp, mode_cmd->handles[0]);
+	obj = drm_gem_object_lookup(filp, mode_cmd->handles[0]);
 	if (obj == NULL)
 		return ERR_PTR(-ENOENT);
 
@@ -135,7 +137,7 @@ static int mga_vram_init(struct mga_device *mdev)
 	aper->ranges[0].base = mdev->mc.vram_base;
 	aper->ranges[0].size = mdev->mc.vram_window;
 
-	remove_conflicting_framebuffers(aper, "mgafb", true);
+	drm_fb_helper_remove_conflicting_framebuffers(aper, "mgafb", true);
 	kfree(aper);
 
 	if (!devm_request_mem_region(mdev->dev->dev, mdev->mc.vram_base, mdev->mc.vram_window,
@@ -224,10 +226,14 @@ int mgag200_driver_load(struct drm_device *dev, unsigned long flags)
 
 	drm_mode_config_init(dev);
 	dev->mode_config.funcs = (void *)&mga_mode_funcs;
-	if (IS_G200_SE(mdev) && mdev->mc.vram_size < (2048*1024))
-		dev->mode_config.preferred_depth = 16;
-	else
-		dev->mode_config.preferred_depth = 24;
+	if (mgag200_preferred_depth == 0) {
+		if (IS_G200_SE(mdev) && mdev->mc.vram_size < (2048*1024))
+			dev->mode_config.preferred_depth = 16;
+		else
+			dev->mode_config.preferred_depth = 24;
+	} else {
+		dev->mode_config.preferred_depth = mgag200_preferred_depth;
+	}
 	dev->mode_config.prefer_shadow = 1;
 
 	r = mgag200_modeset_init(mdev);
@@ -358,7 +364,7 @@ mgag200_dumb_mmap_offset(struct drm_file *file,
 	struct drm_gem_object *obj;
 	struct mgag200_bo *bo;
 
-	obj = drm_gem_object_lookup(dev, file, handle);
+	obj = drm_gem_object_lookup(file, handle);
 	if (obj == NULL)
 		return -ENOENT;
 

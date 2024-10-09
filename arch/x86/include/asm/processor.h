@@ -140,6 +140,17 @@ struct cpuinfo_x86 {
 	u32			microcode;
 } __attribute__((__aligned__(SMP_CACHE_BYTES)));
 
+struct cpuid_regs {
+	u32 eax, ebx, ecx, edx;
+};
+
+enum cpuid_regs_idx {
+	CPUID_EAX = 0,
+	CPUID_EBX,
+	CPUID_ECX,
+	CPUID_EDX,
+};
+
 #define X86_VENDOR_INTEL	0
 #define X86_VENDOR_CYRIX	1
 #define X86_VENDOR_AMD		2
@@ -184,12 +195,16 @@ extern void identify_secondary_cpu(struct cpuinfo_x86 *);
 extern void print_cpu_info(struct cpuinfo_x86 *);
 void print_cpu_msr(struct cpuinfo_x86 *);
 extern void init_scattered_cpuid_features(struct cpuinfo_x86 *c);
+extern u32 get_scattered_cpuid_leaf(unsigned int level,
+				    unsigned int sub_leaf,
+				    enum cpuid_regs_idx reg);
 extern unsigned int init_intel_cacheinfo(struct cpuinfo_x86 *c);
 extern void init_amd_cacheinfo(struct cpuinfo_x86 *c);
 
 extern void detect_extended_topology(struct cpuinfo_x86 *c);
 extern void detect_ht(struct cpuinfo_x86 *c);
 
+extern int get_cpu_cache_id(int cpu, int level);
 #ifdef CONFIG_X86_32
 extern int have_cpuid_p(void);
 #else

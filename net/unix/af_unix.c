@@ -2123,7 +2123,7 @@ static int unix_dgram_recvmsg(struct kiocb *iocb, struct socket *sock,
 
 	skip = sk_peek_offset(sk, flags);
 
-	skb = __skb_recv_datagram(sk, flags, &peeked, &skip, &err);
+	skb = __skb_recv_datagram(sk, flags, NULL, &peeked, &skip, &err);
 	if (!skb) {
 		unix_state_lock(sk);
 		/* Signal EOF on disconnected non-blocking SEQPACKET socket. */
@@ -2145,7 +2145,7 @@ static int unix_dgram_recvmsg(struct kiocb *iocb, struct socket *sock,
 	else if (size < skb->len - skip)
 		msg->msg_flags |= MSG_TRUNC;
 
-	err = skb_copy_datagram_iovec(skb, skip, msg->msg_iov, size);
+	err = skb_copy_datagram_msg(skb, skip, msg, size);
 	if (err)
 		goto out_free;
 
@@ -2454,8 +2454,8 @@ static int unix_stream_read_actor(struct sk_buff *skb,
 {
 	int ret;
 
-	ret = skb_copy_datagram_iovec(skb, UNIXCB(skb).consumed + skip,
-				      state->msg->msg_iov, chunk);
+	ret = skb_copy_datagram_msg(skb, UNIXCB(skb).consumed + skip,
+				    state->msg, chunk);
 	return ret ?: chunk;
 }
 

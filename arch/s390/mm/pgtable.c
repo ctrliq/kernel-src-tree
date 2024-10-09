@@ -467,6 +467,9 @@ static int gmap_connect_pgtable(unsigned long address, unsigned long segment,
 	pud = pud_alloc(mm, pgd, vmaddr);
 	if (!pud)
 		return -ENOMEM;
+	/* large puds cannot yet be handled */
+	if (pud_large(*pud))
+		return -EFAULT;
 	pmd = pmd_alloc(mm, pud, vmaddr);
 	if (!pmd)
 		return -ENOMEM;

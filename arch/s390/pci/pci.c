@@ -198,7 +198,7 @@ int zpci_fmb_enable_device(struct zpci_dev *zdev)
 {
 	struct mod_pci_args args = { 0, 0, 0, 0 };
 
-	if (zdev->fmb)
+	if (zdev->fmb || sizeof(*zdev->fmb) < zdev->fmb_length)
 		return -EINVAL;
 
 	zdev->fmb = kmem_cache_zalloc(zdev_fmb_cache, GFP_KERNEL);
@@ -754,8 +754,12 @@ int pcibios_add_device(struct pci_dev *pdev)
 	int i;
 
 	pdev->dev.groups = zpci_attr_groups;
-	pdev->dev.archdata.dma_ops = &s390_pci_dma_ops;
 	zpci_map_resources(pdev);
+
+	if (!pdev->dev.device_rh)
+		device_rh_alloc(&pdev->dev);
+
+	pdev->dev.device_rh->dma_ops = &s390_pci_dma_ops;
 
 	for (i = 0; i < PCI_BAR_COUNT; i++) {
 		res = &pdev->resource[i];

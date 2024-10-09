@@ -431,7 +431,7 @@ redo:
 			if (h != h0)
 				continue;
 			hlist_del(&pol->bydst);
-			hlist_add_after(entry0, &pol->bydst);
+			hlist_add_behind(&pol->bydst, entry0);
 		}
 		entry0 = &pol->bydst;
 	}
@@ -635,7 +635,7 @@ static void xfrm_hash_rebuild(struct work_struct *work)
 				break;
 		}
 		if (newpos)
-			hlist_add_after(newpos, &policy->bydst);
+			hlist_add_behind(&policy->bydst, newpos);
 		else
 			hlist_add_head(&policy->bydst, chain);
 	}
@@ -770,7 +770,7 @@ int xfrm_policy_insert(int dir, struct xfrm_policy *policy, int excl)
 			break;
 	}
 	if (newpos)
-		hlist_add_after(newpos, &policy->bydst);
+		hlist_add_behind(&policy->bydst, newpos);
 	else
 		hlist_add_head(&policy->bydst, chain);
 	xfrm_pol_hold(policy);
@@ -2796,6 +2796,23 @@ static struct neighbour *xfrm_neigh_lookup(const struct dst_entry *dst,
 	return dst->path->ops->neigh_lookup(dst, skb, daddr);
 }
 
+static void xfrm_confirm_neigh(const struct dst_entry *dst, const void *daddr)
+{
+	const struct dst_entry *path = dst->path;
+
+	for (; dst != path; dst = dst->child) {
+		const struct xfrm_state *xfrm = dst->xfrm;
+
+		if (xfrm->props.mode == XFRM_MODE_TRANSPORT)
+			continue;
+		if (xfrm->type->flags & XFRM_TYPE_REMOTE_COADDR)
+			daddr = xfrm->coaddr;
+		else if (!(xfrm->type->flags & XFRM_TYPE_LOCAL_COADDR))
+			daddr = &xfrm->id.daddr;
+	}
+	path->ops->confirm_neigh(path, daddr);
+}
+
 int xfrm_policy_register_afinfo(struct xfrm_policy_afinfo *afinfo)
 {
 	int err = 0;
@@ -2822,6 +2839,8 @@ int xfrm_policy_register_afinfo(struct xfrm_policy_afinfo *afinfo)
 			dst_ops->link_failure = xfrm_link_failure;
 		if (likely(dst_ops->neigh_lookup == NULL))
 			dst_ops->neigh_lookup = xfrm_neigh_lookup;
+		if (likely(!dst_ops->confirm_neigh))
+			dst_ops->confirm_neigh = xfrm_confirm_neigh;
 		if (likely(afinfo->garbage_collect == NULL))
 			afinfo->garbage_collect = xfrm_garbage_collect_deferred;
 		rcu_assign_pointer(xfrm_policy_afinfo[afinfo->family], afinfo);
@@ -2981,12 +3000,12 @@ static void xfrm_policy_fini(struct net *net)
 	flush_work(&net->xfrm.policy_hash_work);
 #ifdef CONFIG_XFRM_SUB_POLICY
 	audit_info.loginuid = INVALID_UID;
-	audit_info.sessionid = -1;
+	audit_info.sessionid = (unsigned int)-1;
 	audit_info.secid = 0;
 	xfrm_policy_flush(net, XFRM_POLICY_TYPE_SUB, &audit_info);
 #endif
 	audit_info.loginuid = INVALID_UID;
-	audit_info.sessionid = -1;
+	audit_info.sessionid = (unsigned int)-1;
 	audit_info.secid = 0;
 	xfrm_policy_flush(net, XFRM_POLICY_TYPE_MAIN, &audit_info);
 
@@ -3103,7 +3122,7 @@ static void xfrm_audit_common_policyinfo(struct xfrm_policy *xp,
 }
 
 void xfrm_audit_policy_add(struct xfrm_policy *xp, int result,
-			   kuid_t auid, u32 sessionid, u32 secid)
+			   kuid_t auid, unsigned int sessionid, u32 secid)
 {
 	struct audit_buffer *audit_buf;
 
@@ -3118,7 +3137,7 @@ void xfrm_audit_policy_add(struct xfrm_policy *xp, int result,
 EXPORT_SYMBOL_GPL(xfrm_audit_policy_add);
 
 void xfrm_audit_policy_delete(struct xfrm_policy *xp, int result,
-			      kuid_t auid, u32 sessionid, u32 secid)
+			      kuid_t auid, unsigned int sessionid, u32 secid)
 {
 	struct audit_buffer *audit_buf;
 

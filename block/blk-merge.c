@@ -314,7 +314,6 @@ int ll_back_merge_fn(struct request_queue *q, struct request *req,
 int ll_front_merge_fn(struct request_queue *q, struct request *req,
 		      struct bio *bio)
 {
-
 	if (req_gap_front_merge(req, bio))
 		return 0;
 	if (blk_rq_sectors(req) + bio_sectors(bio) >

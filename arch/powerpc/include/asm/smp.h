@@ -115,6 +115,9 @@ extern int cpu_to_core_id(int cpu);
 #define PPC_MSG_TICK_BROADCAST	2
 #define PPC_MSG_DEBUGGER_BREAK  3
 
+/* This is only used by the powernv kernel */
+#define PPC_MSG_RM_HOST_ACTION	4
+
 /* for irq controllers that have dedicated ipis per message (4) */
 extern int smp_request_message_ipi(int virq, int message);
 extern const char *smp_ipi_name[];
@@ -127,7 +130,6 @@ extern irqreturn_t smp_ipi_demux(void);
 
 void smp_init_pSeries(void);
 void smp_init_cell(void);
-void smp_init_celleb(void);
 void smp_setup_cpu_maps(void);
 
 extern int __cpu_disable(void);

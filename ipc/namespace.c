@@ -16,29 +16,44 @@
 
 #include "util.h"
 
+static struct ucounts *inc_ipc_namespaces(struct user_namespace *ns)
+{
+	return inc_ucount(ns, current_euid(), UCOUNT_IPC_NAMESPACES);
+}
+
+static void dec_ipc_namespaces(struct ucounts *ucounts)
+{
+	dec_ucount(ucounts, UCOUNT_IPC_NAMESPACES);
+}
+
 static struct ipc_namespace *create_ipc_ns(struct user_namespace *user_ns,
 					   struct ipc_namespace *old_ns)
 {
 	struct ipc_namespace *ns;
+	struct ucounts *ucounts;
 	int err;
 
+	err = -ENOSPC;
+	ucounts = inc_ipc_namespaces(user_ns);
+	if (!ucounts)
+		goto fail;
+
+	err = -ENOMEM;
 	ns = kmalloc(sizeof(struct ipc_namespace), GFP_KERNEL);
 	if (ns == NULL)
-		return ERR_PTR(-ENOMEM);
+		goto fail_dec;
 
 	err = proc_alloc_inum(&ns->proc_inum);
-	if (err) {
-		kfree(ns);
-		return ERR_PTR(err);
-	}
+	if (err)
+		goto fail_free;
 
 	atomic_set(&ns->count, 1);
+	ns->user_ns = get_user_ns(user_ns);
+	ns->ucounts = ucounts;
+
 	err = mq_init_ns(ns);
-	if (err) {
-		proc_free_inum(ns->proc_inum);
-		kfree(ns);
-		return ERR_PTR(err);
-	}
+	if (err)
+		goto fail_put;
 	atomic_inc(&nr_ipc_ns);
 
 	sem_init_ns(ns);
@@ -53,9 +68,17 @@ static struct ipc_namespace *create_ipc_ns(struct user_namespace *user_ns,
 	ipcns_notify(IPCNS_CREATED);
 	register_ipcns_notifier(ns);
 
-	ns->user_ns = get_user_ns(user_ns);
-
 	return ns;
+
+fail_put:
+	put_user_ns(ns->user_ns);
+	proc_free_inum(ns->proc_inum);
+fail_free:
+	kfree(ns);
+fail_dec:
+	dec_ipc_namespaces(ucounts);
+fail:
+	return ERR_PTR(err);
 }
 
 struct ipc_namespace *copy_ipcs(unsigned long flags,
@@ -118,6 +141,7 @@ static void free_ipc_ns(struct ipc_namespace *ns)
 	 * order to have a correct value when recomputing msgmni.
 	 */
 	ipcns_notify(IPCNS_REMOVED);
+	dec_ipc_namespaces(ns->ucounts);
 	put_user_ns(ns->user_ns);
 	proc_free_inum(ns->proc_inum);
 	kfree(ns);

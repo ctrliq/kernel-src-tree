@@ -11,7 +11,7 @@ obj-y :=	open.o read_write.o file_table.o super.o \
 		attr.o bad_inode.o file.o filesystems.o namespace.o \
 		seq_file.o xattr.o libfs.o fs-writeback.o \
 		pnode.o splice.o sync.o utimes.o \
-		stack.o fs_struct.o statfs.o
+		stack.o fs_struct.o statfs.o fs_pin.o
 
 ifeq ($(CONFIG_BLOCK),y)
 obj-y +=	buffer.o bio.o block_dev.o direct-io.o mpage.o ioprio.o
@@ -55,7 +55,8 @@ obj-$(CONFIG_FHANDLE)		+= fhandle.o
 obj-y				+= quota/
 
 obj-$(CONFIG_PROC_FS)		+= proc/
-obj-$(CONFIG_SYSFS)		+= sysfs/ kernfs/
+obj-$(CONFIG_SYSFS)		+= sysfs/
+obj-$(CONFIG_KERNFS)		+= kernfs/
 obj-$(CONFIG_CONFIGFS_FS)	+= configfs/
 obj-y				+= devpts/
 

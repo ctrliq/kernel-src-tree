@@ -34,7 +34,7 @@
 #include <asm/intel_rdt.h>
 #include <asm/intel_rdt_common.h>
 
-DEFINE_STATIC_KEY_FALSE(rdt_enable_key);
+struct static_key rdt_enable_key;
 struct kernfs_root *rdt_root;
 struct rdtgroup rdtgroup_default;
 LIST_HEAD(rdt_all_groups);
@@ -111,7 +111,7 @@ static int rdtgroup_add_file(struct kernfs_node *parent_kn, struct rftype *rft)
 	int ret;
 
 	kn = __kernfs_create_file(parent_kn, rft->name, rft->mode,
-				  0, rft->kf_ops, rft, NULL, NULL);
+				  0, rft->kf_ops, rft, NULL, true, NULL);
 	if (IS_ERR(kn))
 		return PTR_ERR(kn);
 
@@ -324,6 +324,11 @@ static void move_myself(struct callback_head *head)
 		current->closid = 0;
 		kfree(rdtgrp);
 	}
+
+	preempt_disable();
+	/* update PQR_ASSOC MSR to make resource group go into effect */
+	intel_rdt_sched_in();
+	preempt_enable();
 
 	kfree(callback);
 }
@@ -739,7 +744,7 @@ static struct dentry *rdt_mount(struct file_system_type *fs_type,
 	/*
 	 * resctrl file system can only be mounted once.
 	 */
-	if (static_branch_unlikely(&rdt_enable_key)) {
+	if (static_key_false(&rdt_enable_key)) {
 		dentry = ERR_PTR(-EBUSY);
 		goto out;
 	}
@@ -763,7 +768,7 @@ static struct dentry *rdt_mount(struct file_system_type *fs_type,
 	if (IS_ERR(dentry))
 		goto out_cdp;
 
-	static_branch_enable(&rdt_enable_key);
+	static_key_slow_inc(&rdt_enable_key);
 	goto out;
 
 out_cdp:
@@ -825,7 +830,7 @@ static void rdt_move_group_tasks(struct rdtgroup *from, struct rdtgroup *to,
 {
 	struct task_struct *p, *t;
 
-	read_lock(&tasklist_lock);
+	qread_lock(&tasklist_lock);
 	for_each_process_thread(p, t) {
 		if (!from || t->closid == from->closid) {
 			t->closid = to->closid;
@@ -844,7 +849,7 @@ static void rdt_move_group_tasks(struct rdtgroup *from, struct rdtgroup *to,
 #endif
 		}
 	}
-	read_unlock(&tasklist_lock);
+	qread_unlock(&tasklist_lock);
 }
 
 /*
@@ -893,7 +898,7 @@ static void rdt_kill_sb(struct super_block *sb)
 		reset_all_cbms(r);
 	cdp_disable();
 	rmdir_all_sub();
-	static_branch_disable(&rdt_enable_key);
+	static_key_slow_dec(&rdt_enable_key);
 	kernfs_kill_sb(sb);
 	mutex_unlock(&rdtgroup_mutex);
 }
@@ -1084,14 +1089,15 @@ out:
  */
 int __init rdtgroup_init(void)
 {
+	struct kobject *kobj;
 	int ret = 0;
 
 	ret = rdtgroup_setup_root();
 	if (ret)
 		return ret;
 
-	ret = sysfs_create_mount_point(fs_kobj, "resctrl");
-	if (ret)
+	kobj = kobject_create_and_add("resctrl", fs_kobj);
+	if (!kobj)
 		goto cleanup_root;
 
 	ret = register_filesystem(&rdt_fs_type);
@@ -1101,7 +1107,7 @@ int __init rdtgroup_init(void)
 	return 0;
 
 cleanup_mountpoint:
-	sysfs_remove_mount_point(fs_kobj, "resctrl");
+	kobject_put(kobj);
 cleanup_root:
 	kernfs_destroy_root(rdt_root);
 

@@ -300,9 +300,22 @@ static ssize_t flags_store(struct device *dev, struct device_attribute *attr,
 }
 NETDEVICE_SHOW_RW(flags, fmt_hex);
 
-static int change_tx_queue_len(struct net_device *net, unsigned long new_len)
+static int change_tx_queue_len(struct net_device *dev, unsigned long new_len)
 {
-	net->tx_queue_len = new_len;
+	int res, orig_len = dev->tx_queue_len;
+
+	if (new_len != orig_len) {
+		dev->tx_queue_len = new_len;
+		res = call_netdevice_notifiers(NETDEV_CHANGE_TX_QUEUE_LEN, dev);
+		res = notifier_to_errno(res);
+		if (res) {
+			netdev_err(dev,
+				   "refused to change device tx_queue_len\n");
+			dev->tx_queue_len = orig_len;
+			return -EFAULT;
+		}
+	}
+
 	return 0;
 }
 
@@ -386,6 +399,19 @@ static ssize_t group_store(struct device *dev, struct device_attribute *attr,
 NETDEVICE_SHOW(group, fmt_dec);
 static DEVICE_ATTR(netdev_group, S_IRUGO | S_IWUSR, group_show, group_store);
 
+static int change_proto_down(struct net_device *dev, unsigned long proto_down)
+{
+	return dev_change_proto_down(dev, (bool) proto_down);
+}
+
+static ssize_t proto_down_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t len)
+{
+	return netdev_store(dev, attr, buf, len, change_proto_down);
+}
+NETDEVICE_SHOW_RW(proto_down, fmt_dec);
+
 static ssize_t phys_port_id_show(struct device *dev,
 				 struct device_attribute *attr, char *buf)
 {
@@ -408,6 +434,28 @@ static ssize_t phys_port_id_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(phys_port_id);
 
+static ssize_t phys_port_name_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct net_device *netdev = to_net_dev(dev);
+	ssize_t ret = -EINVAL;
+
+	if (!rtnl_trylock())
+		return restart_syscall();
+
+	if (dev_isalive(netdev)) {
+		char name[IFNAMSIZ];
+
+		ret = dev_get_phys_port_name(netdev, name, sizeof(name));
+		if (!ret)
+			ret = sprintf(buf, "%s\n", name);
+	}
+	rtnl_unlock();
+
+	return ret;
+}
+static DEVICE_ATTR_RO(phys_port_name);
+
 static ssize_t phys_switch_id_show(struct device *dev,
 				   struct device_attribute *attr, char *buf)
 {
@@ -418,11 +466,16 @@ static ssize_t phys_switch_id_show(struct device *dev,
 		return restart_syscall();
 
 	if (dev_isalive(netdev)) {
-		struct netdev_phys_item_id ppid;
+		struct switchdev_attr attr = {
+			.orig_dev = netdev,
+			.id = SWITCHDEV_ATTR_ID_PORT_PARENT_ID,
+			.flags = SWITCHDEV_F_NO_RECURSE,
+		};
 
-		ret = netdev_switch_parent_id_get(netdev, &ppid);
+		ret = switchdev_port_attr_get(netdev, &attr);
 		if (!ret)
-			ret = sprintf(buf, "%*phN\n", ppid.id_len, ppid.id);
+			ret = sprintf(buf, "%*phN\n", attr.u.ppid.id_len,
+				      attr.u.ppid.id);
 	}
 	rtnl_unlock();
 
@@ -454,7 +507,9 @@ static struct attribute *net_class_attrs[] = {
 	&dev_attr_tx_queue_len.attr,
 	&dev_attr_gro_flush_timeout.attr,
 	&dev_attr_phys_port_id.attr,
+	&dev_attr_phys_port_name.attr,
 	&dev_attr_phys_switch_id.attr,
+	&dev_attr_proto_down.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(net_class);

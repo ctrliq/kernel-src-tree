@@ -71,7 +71,7 @@ nvkm_perfdom_find(struct nvkm_pm *pm, int di)
 	return NULL;
 }
 
-struct nvkm_perfsig *
+static struct nvkm_perfsig *
 nvkm_perfsig_find(struct nvkm_pm *pm, u8 di, u8 si, struct nvkm_perfdom **pdom)
 {
 	struct nvkm_perfdom *dom = *pdom;
@@ -699,7 +699,7 @@ nvkm_pm_oclass_get(struct nvkm_oclass *oclass, int index,
 	return 1;
 }
 
-int
+static int
 nvkm_perfsrc_new(struct nvkm_pm *pm, struct nvkm_perfsig *sig,
 		 const struct nvkm_specsrc *spec)
 {
@@ -863,5 +863,5 @@ nvkm_pm_ctor(const struct nvkm_pm_func *func, struct nvkm_device *device,
 	pm->func = func;
 	INIT_LIST_HEAD(&pm->domains);
 	INIT_LIST_HEAD(&pm->sources);
-	return nvkm_engine_ctor(&nvkm_pm, device, index, 0, true, &pm->engine);
+	return nvkm_engine_ctor(&nvkm_pm, device, index, true, &pm->engine);
 }

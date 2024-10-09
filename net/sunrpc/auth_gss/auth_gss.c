@@ -1022,6 +1022,7 @@ gss_create_new(struct rpc_auth_create_args *args, struct rpc_clnt *clnt)
 	auth = &gss_auth->rpc_auth;
 	auth->au_cslack = GSS_CRED_SLACK >> 2;
 	auth->au_rslack = GSS_VERF_SLACK >> 2;
+	auth->au_flags = 0;
 	auth->au_ops = &authgss_ops;
 	auth->au_flavor = flavor;
 	if (gss_pseudoflavor_to_datatouch(gss_auth->mech, flavor))
@@ -1621,7 +1622,7 @@ gss_validate(struct rpc_task *task, __be32 *p)
 {
 	struct rpc_cred *cred = task->tk_rqstp->rq_cred;
 	struct gss_cl_ctx *ctx = gss_cred_get_ctx(cred);
-	__be32		seq;
+	__be32		*seq = NULL;
 	struct kvec	iov;
 	struct xdr_buf	verf_buf;
 	struct xdr_netobj mic;
@@ -1636,9 +1637,12 @@ gss_validate(struct rpc_task *task, __be32 *p)
 		goto out_bad;
 	if (flav != RPC_AUTH_GSS)
 		goto out_bad;
-	seq = htonl(task->tk_rqstp->rq_seqno);
-	iov.iov_base = &seq;
-	iov.iov_len = sizeof(seq);
+	seq = kmalloc(4, GFP_NOFS);
+	if (!seq)
+		goto out_bad;
+	*seq = htonl(task->tk_rqstp->rq_seqno);
+	iov.iov_base = seq;
+	iov.iov_len = 4;
 	xdr_buf_from_iov(&iov, &verf_buf);
 	mic.data = (u8 *)p;
 	mic.len = len;
@@ -1658,11 +1662,13 @@ gss_validate(struct rpc_task *task, __be32 *p)
 	gss_put_ctx(ctx);
 	dprintk("RPC: %5u %s: gss_verify_mic succeeded.\n",
 			task->tk_pid, __func__);
+	kfree(seq);
 	return p + XDR_QUADLEN(len);
 out_bad:
 	gss_put_ctx(ctx);
 	dprintk("RPC: %5u %s failed ret %ld.\n", task->tk_pid, __func__,
 		PTR_ERR(ret));
+	kfree(seq);
 	return ret;
 }
 

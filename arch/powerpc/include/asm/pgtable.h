@@ -321,6 +321,9 @@ static inline pte_t *find_linux_pte_or_hugepte(pgd_t *pgdir, unsigned long ea,
 	}
 	return __find_linux_pte_or_hugepte(pgdir, ea, is_thp, shift);
 }
+
+unsigned long vmalloc_to_phys(void *vmalloc_addr);
+
 #endif /* __ASSEMBLY__ */
 
 #endif /* __KERNEL__ */

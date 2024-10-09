@@ -45,37 +45,9 @@ struct ttm_bo_device;
 
 struct drm_mm_node;
 
-/**
- * struct ttm_place
- *
- * @fpfn:	first valid page frame number to put the object
- * @lpfn:	last valid page frame number to put the object
- * @flags:	memory domain and caching flags for the object
- *
- * Structure indicating a possible place to put an object.
- */
-struct ttm_place {
-	unsigned	fpfn;
-	unsigned	lpfn;
-	uint32_t	flags;
-};
+struct ttm_placement;
 
-/**
- * struct ttm_placement
- *
- * @num_placement:	number of preferred placements
- * @placement:		preferred placements
- * @num_busy_placement:	number of preferred placements when need to evict buffer
- * @busy_placement:	preferred placements when need to evict buffer
- *
- * Structure indicating the placement you request for an object.
- */
-struct ttm_placement {
-	unsigned		num_placement;
-	const struct ttm_place	*placement;
-	unsigned		num_busy_placement;
-	const struct ttm_place	*busy_placement;
-};
+struct ttm_place;
 
 /**
  * struct ttm_bus_placement
@@ -173,7 +145,7 @@ struct ttm_tt;
  * @lru: List head for the lru list.
  * @ddestroy: List head for the delayed destroy list.
  * @swap: List head for swap LRU list.
- * @priv_flags: Flags describing buffer object internal state.
+ * @moving: Fence set when BO is moving
  * @vma_node: Address space manager node.
  * @offset: The current GPU offset, which can have different meanings
  * depending on the memory type. For SYSTEM type memory, it should be 0.
@@ -239,7 +211,7 @@ struct ttm_buffer_object {
 	 * Members protected by a bo reservation.
 	 */
 
-	unsigned long priv_flags;
+	struct dma_fence *moving;
 
 	struct drm_vma_offset_node vma_node;
 
@@ -314,7 +286,7 @@ ttm_bo_reference(struct ttm_buffer_object *bo)
  * Returns -EBUSY if no_wait is true and the buffer is busy.
  * Returns -ERESTARTSYS if interrupted by a signal.
  */
-extern int ttm_bo_wait(struct ttm_buffer_object *bo, bool lazy,
+extern int ttm_bo_wait(struct ttm_buffer_object *bo,
 		       bool interruptible, bool no_wait);
 
 /**
@@ -424,6 +396,17 @@ extern int ttm_bo_lock_delayed_workqueue(struct ttm_bo_device *bdev);
  */
 extern void ttm_bo_unlock_delayed_workqueue(struct ttm_bo_device *bdev,
 					    int resched);
+
+/**
+ * ttm_bo_eviction_valuable
+ *
+ * @bo: The buffer object to evict
+ * @place: the placement we need to make room for
+ *
+ * Check if it is valuable to evict the BO to make room for the given placement.
+ */
+bool ttm_bo_eviction_valuable(struct ttm_buffer_object *bo,
+			      const struct ttm_place *place);
 
 /**
  * ttm_bo_synccpu_write_grab

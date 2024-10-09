@@ -111,9 +111,9 @@ static int __kprobes nmi_handle(unsigned int type, struct pt_regs *regs, bool b2
 		u64 before, delta, whole_msecs;
 		int decimal_msecs;
 
-		before = local_clock();
+		before = sched_clock();
 		handled += a->handler(type, regs);
-		delta = local_clock() - before;
+		delta = sched_clock() - before;
 
 		if (delta < nmi_longest_ns)
 			continue;

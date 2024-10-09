@@ -52,7 +52,7 @@ static struct sk_buff *mpls_gso_segment(struct sk_buff *skb,
 	return segs;
 }
 
-static struct packet_offload mpls_mc_offload = {
+static struct packet_offload mpls_mc_offload __read_mostly = {
 	.type = cpu_to_be16(ETH_P_MPLS_MC),
 	.priority = 15,
 	.callbacks = {
@@ -60,7 +60,7 @@ static struct packet_offload mpls_mc_offload = {
 	},
 };
 
-static struct packet_offload mpls_uc_offload = {
+static struct packet_offload mpls_uc_offload __read_mostly = {
 	.type = cpu_to_be16(ETH_P_MPLS_UC),
 	.priority = 15,
 	.callbacks = {

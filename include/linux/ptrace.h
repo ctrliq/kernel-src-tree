@@ -5,7 +5,9 @@
 #include <linux/sched.h>		/* For struct task_struct.  */
 #include <linux/err.h>			/* for IS_ERR_VALUE */
 #include <linux/bug.h>			/* For BUG_ON.  */
+#ifndef __GENKSYMS__
 #include <linux/pid_namespace.h>	/* For task_active_pid_ns.  */
+#endif
 #include <uapi/linux/ptrace.h>
 
 /*

@@ -42,21 +42,11 @@ int cifs_removexattr(struct dentry *direntry, const char *ea_name)
 	int rc = -EOPNOTSUPP;
 #ifdef CONFIG_CIFS_XATTR
 	unsigned int xid;
-	struct cifs_sb_info *cifs_sb;
+	struct cifs_sb_info *cifs_sb = CIFS_SB(direntry->d_sb);
 	struct tcon_link *tlink;
 	struct cifs_tcon *pTcon;
-	struct super_block *sb;
 	char *full_path = NULL;
 
-	if (direntry == NULL)
-		return -EIO;
-	if (d_really_is_negative(direntry))
-		return -EIO;
-	sb = d_inode(direntry)->i_sb;
-	if (sb == NULL)
-		return -EIO;
-
-	cifs_sb = CIFS_SB(sb);
 	tlink = cifs_sb_tlink(cifs_sb);
 	if (IS_ERR(tlink))
 		return PTR_ERR(tlink);
@@ -111,21 +101,12 @@ int cifs_setxattr(struct dentry *direntry, const char *ea_name,
 	int rc = -EOPNOTSUPP;
 #ifdef CONFIG_CIFS_XATTR
 	unsigned int xid;
-	struct cifs_sb_info *cifs_sb;
+	struct super_block *sb = direntry->d_sb;
+	struct cifs_sb_info *cifs_sb = CIFS_SB(sb);
 	struct tcon_link *tlink;
 	struct cifs_tcon *pTcon;
-	struct super_block *sb;
 	char *full_path;
 
-	if (direntry == NULL)
-		return -EIO;
-	if (d_really_is_negative(direntry))
-		return -EIO;
-	sb = d_inode(direntry)->i_sb;
-	if (sb == NULL)
-		return -EIO;
-
-	cifs_sb = CIFS_SB(sb);
 	tlink = cifs_sb_tlink(cifs_sb);
 	if (IS_ERR(tlink))
 		return PTR_ERR(tlink);
@@ -156,7 +137,7 @@ int cifs_setxattr(struct dentry *direntry, const char *ea_name,
 		   == 0) {
 		if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_NO_XATTR)
 			goto set_ea_exit;
-		if (strncmp(ea_name, CIFS_XATTR_DOS_ATTRIB, 14) == 0)
+		if (strcmp(ea_name, CIFS_XATTR_DOS_ATTRIB) == 0)
 			cifs_dbg(FYI, "attempt to set cifs inode metadata\n");
 
 		ea_name += XATTR_USER_PREFIX_LEN; /* skip past user. prefix */
@@ -174,8 +155,7 @@ int cifs_setxattr(struct dentry *direntry, const char *ea_name,
 			rc = pTcon->ses->server->ops->set_EA(xid, pTcon,
 				full_path, ea_name, ea_value, (__u16)value_size,
 				cifs_sb->local_nls, cifs_remap(cifs_sb));
-	} else if (strncmp(ea_name, CIFS_XATTR_CIFS_ACL,
-			strlen(CIFS_XATTR_CIFS_ACL)) == 0) {
+	} else if (strcmp(ea_name, CIFS_XATTR_CIFS_ACL) == 0) {
 #ifdef CONFIG_CIFS_ACL
 		struct cifs_ntsd *pacl;
 		pacl = kmalloc(value_size, GFP_KERNEL);
@@ -197,10 +177,7 @@ int cifs_setxattr(struct dentry *direntry, const char *ea_name,
 		cifs_dbg(FYI, "Set CIFS ACL not supported yet\n");
 #endif /* CONFIG_CIFS_ACL */
 	} else {
-		int temp;
-		temp = strncmp(ea_name, POSIX_ACL_XATTR_ACCESS,
-			strlen(POSIX_ACL_XATTR_ACCESS));
-		if (temp == 0) {
+		if (strcmp(ea_name, XATTR_NAME_POSIX_ACL_ACCESS) == 0) {
 #ifdef CONFIG_CIFS_POSIX
 			if (sb->s_flags & MS_POSIXACL)
 				rc = CIFSSMBSetPosixACL(xid, pTcon, full_path,
@@ -211,8 +188,7 @@ int cifs_setxattr(struct dentry *direntry, const char *ea_name,
 #else
 			cifs_dbg(FYI, "set POSIX ACL not supported\n");
 #endif
-		} else if (strncmp(ea_name, POSIX_ACL_XATTR_DEFAULT,
-				   strlen(POSIX_ACL_XATTR_DEFAULT)) == 0) {
+		} else if (strcmp(ea_name, XATTR_NAME_POSIX_ACL_DEFAULT) == 0) {
 #ifdef CONFIG_CIFS_POSIX
 			if (sb->s_flags & MS_POSIXACL)
 				rc = CIFSSMBSetPosixACL(xid, pTcon, full_path,
@@ -246,21 +222,12 @@ ssize_t cifs_getxattr(struct dentry *direntry, const char *ea_name,
 	ssize_t rc = -EOPNOTSUPP;
 #ifdef CONFIG_CIFS_XATTR
 	unsigned int xid;
-	struct cifs_sb_info *cifs_sb;
+	struct super_block *sb = direntry->d_sb;
+	struct cifs_sb_info *cifs_sb = CIFS_SB(sb);
 	struct tcon_link *tlink;
 	struct cifs_tcon *pTcon;
-	struct super_block *sb;
 	char *full_path;
 
-	if (direntry == NULL)
-		return -EIO;
-	if (d_really_is_negative(direntry))
-		return -EIO;
-	sb = d_inode(direntry)->i_sb;
-	if (sb == NULL)
-		return -EIO;
-
-	cifs_sb = CIFS_SB(sb);
 	tlink = cifs_sb_tlink(cifs_sb);
 	if (IS_ERR(tlink))
 		return PTR_ERR(tlink);
@@ -282,7 +249,7 @@ ssize_t cifs_getxattr(struct dentry *direntry, const char *ea_name,
 		if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_NO_XATTR)
 			goto get_ea_exit;
 
-		if (strncmp(ea_name, CIFS_XATTR_DOS_ATTRIB, 14) == 0) {
+		if (strcmp(ea_name, CIFS_XATTR_DOS_ATTRIB) == 0) {
 			cifs_dbg(FYI, "attempt to query cifs inode metadata\n");
 			/* revalidate/getattr then populate from inode */
 		} /* BB add else when above is implemented */
@@ -300,8 +267,7 @@ ssize_t cifs_getxattr(struct dentry *direntry, const char *ea_name,
 			rc = pTcon->ses->server->ops->query_all_EAs(xid, pTcon,
 				full_path, ea_name, ea_value, buf_size,
 				cifs_sb->local_nls, cifs_remap(cifs_sb));
-	} else if (strncmp(ea_name, POSIX_ACL_XATTR_ACCESS,
-			  strlen(POSIX_ACL_XATTR_ACCESS)) == 0) {
+	} else if (strcmp(ea_name, XATTR_NAME_POSIX_ACL_ACCESS) == 0) {
 #ifdef CONFIG_CIFS_POSIX
 		if (sb->s_flags & MS_POSIXACL)
 			rc = CIFSSMBGetPosixACL(xid, pTcon, full_path,
@@ -311,8 +277,7 @@ ssize_t cifs_getxattr(struct dentry *direntry, const char *ea_name,
 #else
 		cifs_dbg(FYI, "Query POSIX ACL not supported yet\n");
 #endif /* CONFIG_CIFS_POSIX */
-	} else if (strncmp(ea_name, POSIX_ACL_XATTR_DEFAULT,
-			  strlen(POSIX_ACL_XATTR_DEFAULT)) == 0) {
+	} else if (strcmp(ea_name, XATTR_NAME_POSIX_ACL_DEFAULT) == 0) {
 #ifdef CONFIG_CIFS_POSIX
 		if (sb->s_flags & MS_POSIXACL)
 			rc = CIFSSMBGetPosixACL(xid, pTcon, full_path,
@@ -322,8 +287,7 @@ ssize_t cifs_getxattr(struct dentry *direntry, const char *ea_name,
 #else
 		cifs_dbg(FYI, "Query POSIX default ACL not supported yet\n");
 #endif /* CONFIG_CIFS_POSIX */
-	} else if (strncmp(ea_name, CIFS_XATTR_CIFS_ACL,
-				strlen(CIFS_XATTR_CIFS_ACL)) == 0) {
+	} else if (strcmp(ea_name, CIFS_XATTR_CIFS_ACL) == 0) {
 #ifdef CONFIG_CIFS_ACL
 			u32 acllen;
 			struct cifs_ntsd *pacl;
@@ -382,21 +346,11 @@ ssize_t cifs_listxattr(struct dentry *direntry, char *data, size_t buf_size)
 	ssize_t rc = -EOPNOTSUPP;
 #ifdef CONFIG_CIFS_XATTR
 	unsigned int xid;
-	struct cifs_sb_info *cifs_sb;
+	struct cifs_sb_info *cifs_sb = CIFS_SB(direntry->d_sb);
 	struct tcon_link *tlink;
 	struct cifs_tcon *pTcon;
-	struct super_block *sb;
 	char *full_path;
 
-	if (direntry == NULL)
-		return -EIO;
-	if (d_really_is_negative(direntry))
-		return -EIO;
-	sb = d_inode(direntry)->i_sb;
-	if (sb == NULL)
-		return -EIO;
-
-	cifs_sb = CIFS_SB(sb);
 	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_NO_XATTR)
 		return -EOPNOTSUPP;
 

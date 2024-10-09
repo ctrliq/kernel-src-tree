@@ -188,6 +188,7 @@ struct tpm_chip *tpm_chip_alloc(struct device *dev,
 	chip->cdev.owner = THIS_MODULE;
 	chip->cdev.kobj.parent = &chip->dev.kobj;
 
+	chip->locality = -1;
 	return chip;
 
 out:

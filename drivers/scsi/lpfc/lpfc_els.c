@@ -3303,6 +3303,12 @@ lpfc_els_retry(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 						     FC_VPORT_FABRIC_REJ_WWN);
 			}
 			break;
+		case LSRJT_VENDOR_UNIQUE:
+			if ((stat.un.b.vendorUnique == 0x45) &&
+			    (cmd == ELS_CMD_FLOGI)) {
+				goto out_retry;
+			}
+			break;
 		}
 		break;
 
@@ -3348,6 +3354,7 @@ lpfc_els_retry(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	if ((vport->load_flag & FC_UNLOADING) != 0)
 		retry = 0;
 
+out_retry:
 	if (retry) {
 		if ((cmd == ELS_CMD_PLOGI) || (cmd == ELS_CMD_FDISC)) {
 			/* Stop retrying PLOGI and FDISC if in FCF discovery */
@@ -4616,7 +4623,7 @@ lpfc_els_disc_plogi(struct lpfc_vport *vport)
 	return sentplogi;
 }
 
-uint32_t
+static uint32_t
 lpfc_rdp_res_link_service(struct fc_rdp_link_service_desc *desc,
 		uint32_t word0)
 {
@@ -4628,7 +4635,7 @@ lpfc_rdp_res_link_service(struct fc_rdp_link_service_desc *desc,
 	return sizeof(struct fc_rdp_link_service_desc);
 }
 
-uint32_t
+static uint32_t
 lpfc_rdp_res_sfp_desc(struct fc_rdp_sfp_desc *desc,
 		uint8_t *page_a0, uint8_t *page_a2)
 {
@@ -4693,7 +4700,7 @@ lpfc_rdp_res_sfp_desc(struct fc_rdp_sfp_desc *desc,
 	return sizeof(struct fc_rdp_sfp_desc);
 }
 
-uint32_t
+static uint32_t
 lpfc_rdp_res_link_error(struct fc_rdp_link_error_status_desc *desc,
 		READ_LNK_VAR *stat)
 {
@@ -4722,7 +4729,7 @@ lpfc_rdp_res_link_error(struct fc_rdp_link_error_status_desc *desc,
 	return sizeof(struct fc_rdp_link_error_status_desc);
 }
 
-uint32_t
+static uint32_t
 lpfc_rdp_res_bbc_desc(struct fc_rdp_bbc_desc *desc, READ_LNK_VAR *stat,
 		      struct lpfc_vport *vport)
 {
@@ -4747,7 +4754,7 @@ lpfc_rdp_res_bbc_desc(struct fc_rdp_bbc_desc *desc, READ_LNK_VAR *stat,
 	return sizeof(struct fc_rdp_bbc_desc);
 }
 
-uint32_t
+static uint32_t
 lpfc_rdp_res_oed_temp_desc(struct lpfc_hba *phba,
 			   struct fc_rdp_oed_sfp_desc *desc, uint8_t *page_a2)
 {
@@ -4775,7 +4782,7 @@ lpfc_rdp_res_oed_temp_desc(struct lpfc_hba *phba,
 	return sizeof(struct fc_rdp_oed_sfp_desc);
 }
 
-uint32_t
+static uint32_t
 lpfc_rdp_res_oed_voltage_desc(struct lpfc_hba *phba,
 			      struct fc_rdp_oed_sfp_desc *desc,
 			      uint8_t *page_a2)
@@ -4804,7 +4811,7 @@ lpfc_rdp_res_oed_voltage_desc(struct lpfc_hba *phba,
 	return sizeof(struct fc_rdp_oed_sfp_desc);
 }
 
-uint32_t
+static uint32_t
 lpfc_rdp_res_oed_txbias_desc(struct lpfc_hba *phba,
 			     struct fc_rdp_oed_sfp_desc *desc,
 			     uint8_t *page_a2)
@@ -4833,7 +4840,7 @@ lpfc_rdp_res_oed_txbias_desc(struct lpfc_hba *phba,
 	return sizeof(struct fc_rdp_oed_sfp_desc);
 }
 
-uint32_t
+static uint32_t
 lpfc_rdp_res_oed_txpower_desc(struct lpfc_hba *phba,
 			      struct fc_rdp_oed_sfp_desc *desc,
 			      uint8_t *page_a2)
@@ -4863,7 +4870,7 @@ lpfc_rdp_res_oed_txpower_desc(struct lpfc_hba *phba,
 }
 
 
-uint32_t
+static uint32_t
 lpfc_rdp_res_oed_rxpower_desc(struct lpfc_hba *phba,
 			      struct fc_rdp_oed_sfp_desc *desc,
 			      uint8_t *page_a2)
@@ -4892,7 +4899,7 @@ lpfc_rdp_res_oed_rxpower_desc(struct lpfc_hba *phba,
 	return sizeof(struct fc_rdp_oed_sfp_desc);
 }
 
-uint32_t
+static uint32_t
 lpfc_rdp_res_opd_desc(struct fc_rdp_opd_sfp_desc *desc,
 		      uint8_t *page_a0, struct lpfc_vport *vport)
 {
@@ -4906,7 +4913,7 @@ lpfc_rdp_res_opd_desc(struct fc_rdp_opd_sfp_desc *desc,
 	return sizeof(struct fc_rdp_opd_sfp_desc);
 }
 
-uint32_t
+static uint32_t
 lpfc_rdp_res_fec_desc(struct fc_fec_rdp_desc *desc, READ_LNK_VAR *stat)
 {
 	if (bf_get(lpfc_read_link_stat_gec2, stat) == 0)
@@ -4923,7 +4930,7 @@ lpfc_rdp_res_fec_desc(struct fc_fec_rdp_desc *desc, READ_LNK_VAR *stat)
 	return sizeof(struct fc_fec_rdp_desc);
 }
 
-uint32_t
+static uint32_t
 lpfc_rdp_res_speed(struct fc_rdp_port_speed_desc *desc, struct lpfc_hba *phba)
 {
 	uint16_t rdp_cap = 0;
@@ -4985,24 +4992,24 @@ lpfc_rdp_res_speed(struct fc_rdp_port_speed_desc *desc, struct lpfc_hba *phba)
 	return sizeof(struct fc_rdp_port_speed_desc);
 }
 
-uint32_t
+static uint32_t
 lpfc_rdp_res_diag_port_names(struct fc_rdp_port_name_desc *desc,
-		struct lpfc_hba *phba)
+		struct lpfc_vport *vport)
 {
 
 	desc->tag = cpu_to_be32(RDP_PORT_NAMES_DESC_TAG);
 
-	memcpy(desc->port_names.wwnn, phba->wwnn,
+	memcpy(desc->port_names.wwnn, &vport->fc_nodename,
 			sizeof(desc->port_names.wwnn));
 
-	memcpy(desc->port_names.wwpn, &phba->wwpn,
+	memcpy(desc->port_names.wwpn, &vport->fc_portname,
 			sizeof(desc->port_names.wwpn));
 
 	desc->length = cpu_to_be32(sizeof(desc->port_names));
 	return sizeof(struct fc_rdp_port_name_desc);
 }
 
-uint32_t
+static uint32_t
 lpfc_rdp_res_attach_port_names(struct fc_rdp_port_name_desc *desc,
 		struct lpfc_vport *vport, struct lpfc_nodelist *ndlp)
 {
@@ -5026,7 +5033,7 @@ lpfc_rdp_res_attach_port_names(struct fc_rdp_port_name_desc *desc,
 	return sizeof(struct fc_rdp_port_name_desc);
 }
 
-void
+static void
 lpfc_els_rdp_cmpl(struct lpfc_hba *phba, struct lpfc_rdp_context *rdp_context,
 		int status)
 {
@@ -5089,7 +5096,7 @@ lpfc_els_rdp_cmpl(struct lpfc_hba *phba, struct lpfc_rdp_context *rdp_context,
 	len += lpfc_rdp_res_link_error((struct fc_rdp_link_error_status_desc *)
 				       (len + pcmd), &rdp_context->link_stat);
 	len += lpfc_rdp_res_diag_port_names((struct fc_rdp_port_name_desc *)
-					     (len + pcmd), phba);
+					     (len + pcmd), vport);
 	len += lpfc_rdp_res_attach_port_names((struct fc_rdp_port_name_desc *)
 					(len + pcmd), vport, ndlp);
 	len += lpfc_rdp_res_fec_desc((struct fc_fec_rdp_desc *)(len + pcmd),
@@ -5164,7 +5171,7 @@ free_rdp_context:
 	kfree(rdp_context);
 }
 
-int
+static int
 lpfc_get_rdp_info(struct lpfc_hba *phba, struct lpfc_rdp_context *rdp_context)
 {
 	LPFC_MBOXQ_t *mbox = NULL;
@@ -7994,7 +8001,7 @@ lpfc_els_unsol_event(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 	}
 }
 
-void
+static void
 lpfc_start_fdmi(struct lpfc_vport *vport)
 {
 	struct lpfc_hba *phba = vport->phba;
@@ -8176,17 +8183,11 @@ lpfc_cmpl_reg_new_vport(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
 			spin_lock_irq(shost->host_lock);
 			vport->fc_flag |= FC_VPORT_NEEDS_REG_VPI;
 			spin_unlock_irq(shost->host_lock);
-			if (mb->mbxStatus == MBX_NOT_FINISHED)
-				break;
-			if ((vport->port_type == LPFC_PHYSICAL_PORT) &&
-			    !(vport->fc_flag & FC_LOGO_RCVD_DID_CHNG)) {
-				if (phba->sli_rev == LPFC_SLI_REV4)
-					lpfc_issue_init_vfi(vport);
-				else
-					lpfc_initial_flogi(vport);
-			} else {
+			if (vport->port_type == LPFC_PHYSICAL_PORT
+				&& !(vport->fc_flag & FC_LOGO_RCVD_DID_CHNG))
+				lpfc_issue_init_vfi(vport);
+			else
 				lpfc_initial_fdisc(vport);
-			}
 			break;
 		}
 	} else {

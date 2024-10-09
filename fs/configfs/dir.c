@@ -719,10 +719,28 @@ static int populate_groups(struct config_group *group)
 				break;
 			}
 		}
+	} else if (!list_empty(&group->default_groups_list)) {
+		list_for_each_entry(new_group, &group->default_groups_list, group_entry) {
+			ret = create_default_group(group, new_group);
+			if (ret) {
+				detach_groups(group);
+				break;
+			}
+		}
 	}
-
 	return ret;
 }
+
+void configfs_remove_default_groups(struct config_group *group)
+{
+	struct config_group *g, *n;
+
+	list_for_each_entry_safe(g, n, &group->default_groups_list, group_entry) {
+		list_del(&g->group_entry);
+		config_item_put(&g->cg_item);
+	}
+}
+EXPORT_SYMBOL(configfs_remove_default_groups);
 
 /*
  * All of link_obj/unlink_obj/link_group/unlink_group require that
@@ -780,7 +798,9 @@ static void unlink_group(struct config_group *group)
 			new_group = group->default_groups[i];
 			unlink_group(new_group);
 		}
-	}
+	} else if (!list_empty(&group->default_groups_list))
+		list_for_each_entry(new_group, &group->default_groups_list, group_entry)
+			unlink_group(new_group);
 
 	group->cg_subsys = NULL;
 	unlink_obj(&group->cg_item);
@@ -807,7 +827,10 @@ static void link_group(struct config_group *parent_group, struct config_group *g
 			new_group = group->default_groups[i];
 			link_group(group, new_group);
 		}
-	}
+	} else if (!list_empty(&group->default_groups_list))
+		list_for_each_entry(new_group, &group->default_groups_list, group_entry)
+			link_group(group, new_group);
+
 }
 
 /*

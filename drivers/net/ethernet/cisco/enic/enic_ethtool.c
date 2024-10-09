@@ -23,6 +23,7 @@
 #include "enic.h"
 #include "enic_dev.h"
 #include "enic_clsf.h"
+#include "vnic_rss.h"
 #include "vnic_stats.h"
 
 struct enic_stat {
@@ -102,25 +103,29 @@ static void enic_intr_coal_set_rx(struct enic *enic, u32 timer)
 	}
 }
 
-static int enic_get_settings(struct net_device *netdev,
-	struct ethtool_cmd *ecmd)
+static int enic_get_ksettings(struct net_device *netdev,
+			      struct ethtool_link_ksettings *ecmd)
 {
 	struct enic *enic = netdev_priv(netdev);
+	struct ethtool_link_settings *base = &ecmd->base;
 
-	ecmd->supported = (SUPPORTED_10000baseT_Full | SUPPORTED_FIBRE);
-	ecmd->advertising = (ADVERTISED_10000baseT_Full | ADVERTISED_FIBRE);
-	ecmd->port = PORT_FIBRE;
-	ecmd->transceiver = XCVR_EXTERNAL;
+	ethtool_link_ksettings_add_link_mode(ecmd, supported,
+					     10000baseT_Full);
+	ethtool_link_ksettings_add_link_mode(ecmd, supported, FIBRE);
+	ethtool_link_ksettings_add_link_mode(ecmd, advertising,
+					     10000baseT_Full);
+	ethtool_link_ksettings_add_link_mode(ecmd, advertising, FIBRE);
+	base->port = PORT_FIBRE;
 
 	if (netif_carrier_ok(netdev)) {
-		ethtool_cmd_speed_set(ecmd, vnic_dev_port_speed(enic->vdev));
-		ecmd->duplex = DUPLEX_FULL;
+		base->speed = vnic_dev_port_speed(enic->vdev);
+		base->duplex = DUPLEX_FULL;
 	} else {
-		ethtool_cmd_speed_set(ecmd, SPEED_UNKNOWN);
-		ecmd->duplex = DUPLEX_UNKNOWN;
+		base->speed = SPEED_UNKNOWN;
+		base->duplex = DUPLEX_UNKNOWN;
 	}
 
-	ecmd->autoneg = AUTONEG_DISABLE;
+	base->autoneg = AUTONEG_DISABLE;
 
 	return 0;
 }
@@ -364,7 +369,7 @@ static int enic_grxclsrule(struct enic *enic, struct ethtool_rxnfc *cmd)
 	n = htbl_fltr_search(enic, (u16)fsp->location);
 	if (!n)
 		return -EINVAL;
-	switch (n->keys.ip_proto) {
+	switch (n->keys.basic.ip_proto) {
 	case IPPROTO_TCP:
 		fsp->flow_type = TCP_V4_FLOW;
 		break;
@@ -376,16 +381,16 @@ static int enic_grxclsrule(struct enic *enic, struct ethtool_rxnfc *cmd)
 		break;
 	}
 
-	fsp->h_u.tcp_ip4_spec.ip4src = n->keys.src;
+	fsp->h_u.tcp_ip4_spec.ip4src = flow_get_u32_src(&n->keys);
 	fsp->m_u.tcp_ip4_spec.ip4src = (__u32)~0;
 
-	fsp->h_u.tcp_ip4_spec.ip4dst = n->keys.dst;
+	fsp->h_u.tcp_ip4_spec.ip4dst = flow_get_u32_dst(&n->keys);
 	fsp->m_u.tcp_ip4_spec.ip4dst = (__u32)~0;
 
-	fsp->h_u.tcp_ip4_spec.psrc = n->keys.port16[0];
+	fsp->h_u.tcp_ip4_spec.psrc = n->keys.ports.src;
 	fsp->m_u.tcp_ip4_spec.psrc = (__u16)~0;
 
-	fsp->h_u.tcp_ip4_spec.pdst = n->keys.port16[1];
+	fsp->h_u.tcp_ip4_spec.pdst = n->keys.ports.dst;
 	fsp->m_u.tcp_ip4_spec.pdst = (__u16)~0;
 
 	fsp->ring_cookie = n->rq_id;
@@ -464,8 +469,41 @@ static int enic_set_tunable(struct net_device *dev,
 	return ret;
 }
 
+static u32 enic_get_rxfh_key_size(struct net_device *netdev)
+{
+	return ENIC_RSS_LEN;
+}
+
+static int enic_get_rxfh(struct net_device *netdev, u32 *indir, u8 *hkey,
+			 u8 *hfunc)
+{
+	struct enic *enic = netdev_priv(netdev);
+
+	if (hkey)
+		memcpy(hkey, enic->rss_key, ENIC_RSS_LEN);
+
+	if (hfunc)
+		*hfunc = ETH_RSS_HASH_TOP;
+
+	return 0;
+}
+
+static int enic_set_rxfh(struct net_device *netdev, const u32 *indir,
+			 const u8 *hkey, const u8 hfunc)
+{
+	struct enic *enic = netdev_priv(netdev);
+
+	if ((hfunc != ETH_RSS_HASH_NO_CHANGE && hfunc != ETH_RSS_HASH_TOP) ||
+	    indir)
+		return -EINVAL;
+
+	if (hkey)
+		memcpy(enic->rss_key, hkey, ENIC_RSS_LEN);
+
+	return __enic_set_rsskey(enic);
+}
+
 static const struct ethtool_ops enic_ethtool_ops = {
-	.get_settings = enic_get_settings,
 	.get_drvinfo = enic_get_drvinfo,
 	.get_msglevel = enic_get_msglevel,
 	.set_msglevel = enic_set_msglevel,
@@ -478,6 +516,10 @@ static const struct ethtool_ops enic_ethtool_ops = {
 	.get_rxnfc = enic_get_rxnfc,
 	.get_tunable = enic_get_tunable,
 	.set_tunable = enic_set_tunable,
+	.get_rxfh_key_size = enic_get_rxfh_key_size,
+	.get_rxfh = enic_get_rxfh,
+	.set_rxfh = enic_set_rxfh,
+	.get_link_ksettings = enic_get_ksettings,
 };
 
 void enic_set_ethtool_ops(struct net_device *netdev)

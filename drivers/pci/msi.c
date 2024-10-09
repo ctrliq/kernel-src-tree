@@ -32,7 +32,7 @@ static int pci_msi_enable = 1;
 #if defined(CONFIG_GENERIC_HARDIRQS)
 int __weak arch_setup_msi_irq(struct pci_dev *dev, struct msi_desc *desc)
 {
-	struct msi_chip *chip = dev->bus->msi;
+	struct msi_controller *chip = dev->bus->msi;
 	int err;
 
 	if (!chip || !chip->setup_irq)
@@ -49,7 +49,7 @@ int __weak arch_setup_msi_irq(struct pci_dev *dev, struct msi_desc *desc)
 
 void __weak arch_teardown_msi_irq(unsigned int irq)
 {
-	struct msi_chip *chip = irq_get_chip_data(irq);
+	struct msi_controller *chip = irq_get_chip_data(irq);
 
 	if (!chip || !chip->teardown_irq)
 		return;
@@ -96,19 +96,13 @@ int __weak arch_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
  */
 void default_teardown_msi_irqs(struct pci_dev *dev)
 {
+	int i;
 	struct msi_desc *entry;
 
-	list_for_each_entry(entry, &dev->msi_list, list) {
-		int i, nvec;
-		if (entry->irq == 0)
-			continue;
-		if (entry->nvec_used)
-			nvec = entry->nvec_used;
-		else
-			nvec = 1 << entry->msi_attrib.multiple;
-		for (i = 0; i < nvec; i++)
-			arch_teardown_msi_irq(entry->irq + i);
-	}
+	list_for_each_entry(entry, &dev->msi_list, list)
+		if (entry->irq)
+			for (i = 0; i < entry->nvec_used; i++)
+				arch_teardown_msi_irq(entry->irq + i);
 }
 
 void __weak arch_teardown_msi_irqs(struct pci_dev *dev)
@@ -347,21 +341,14 @@ static void free_msi_irqs(struct pci_dev *dev)
 	struct msi_desc *entry, *tmp;
 	struct attribute **msi_attrs;
 	struct device_attribute *dev_attr;
-	int count = 0;
+	int i, count = 0;
 
-	list_for_each_entry(entry, &dev->msi_list, list) {
-		int i, nvec;
-		if (!entry->irq)
-			continue;
-		if (entry->nvec_used)
-			nvec = entry->nvec_used;
-		else
-			nvec = 1 << entry->msi_attrib.multiple;
 #ifdef CONFIG_GENERIC_HARDIRQS
-		for (i = 0; i < nvec; i++)
-			BUG_ON(irq_has_action(entry->irq + i));
+	list_for_each_entry(entry, &dev->msi_list, list)
+		if (entry->irq)
+			for (i = 0; i < entry->nvec_used; i++)
+				BUG_ON(irq_has_action(entry->irq + i));
 #endif
-	}
 
 	arch_teardown_msi_irqs(dev);
 
@@ -489,10 +476,11 @@ static int populate_msi_sysfs(struct pci_dev *pdev)
 	int ret = -ENOMEM;
 	int num_msi = 0;
 	int count = 0;
+	int i;
 
 	/* Determine how many msi entries we have */
 	list_for_each_entry(entry, &pdev->msi_list, list)
-		++num_msi;
+		num_msi += entry->nvec_used;
 	if (!num_msi)
 		return 0;
 
@@ -501,19 +489,21 @@ static int populate_msi_sysfs(struct pci_dev *pdev)
 	if (!msi_attrs)
 		return -ENOMEM;
 	list_for_each_entry(entry, &pdev->msi_list, list) {
-		msi_dev_attr = kzalloc(sizeof(*msi_dev_attr), GFP_KERNEL);
-		if (!msi_dev_attr)
-			goto error_attrs;
-		msi_attrs[count] = &msi_dev_attr->attr;
+		for (i = 0; i < entry->nvec_used; i++) {
+			msi_dev_attr = kzalloc(sizeof(*msi_dev_attr), GFP_KERNEL);
+			if (!msi_dev_attr)
+				goto error_attrs;
+			msi_attrs[count] = &msi_dev_attr->attr;
 
-		sysfs_attr_init(&msi_dev_attr->attr);
-		msi_dev_attr->attr.name = kasprintf(GFP_KERNEL, "%d",
-						    entry->irq);
-		if (!msi_dev_attr->attr.name)
-			goto error_attrs;
-		msi_dev_attr->attr.mode = S_IRUGO;
-		msi_dev_attr->show = msi_mode_show;
-		++count;
+			sysfs_attr_init(&msi_dev_attr->attr);
+			msi_dev_attr->attr.name = kasprintf(GFP_KERNEL, "%d",
+							    entry->irq + i);
+			if (!msi_dev_attr->attr.name)
+				goto error_attrs;
+			msi_dev_attr->attr.mode = S_IRUGO;
+			msi_dev_attr->show = msi_mode_show;
+			++count;
+		}
 	}
 
 	msi_irq_group = kzalloc(sizeof(*msi_irq_group), GFP_KERNEL);
@@ -552,7 +542,7 @@ error_attrs:
 	return ret;
 }
 
-static struct msi_desc *msi_setup_entry(struct pci_dev *dev)
+static struct msi_desc *msi_setup_entry(struct pci_dev *dev, int nvec)
 {
 	u16 control;
 	struct msi_desc *entry;
@@ -571,6 +561,8 @@ static struct msi_desc *msi_setup_entry(struct pci_dev *dev)
 	entry->msi_attrib.default_irq	= dev->irq;	/* Save IOAPIC IRQ */
 	entry->msi_attrib.pos		= dev->msi_cap;
 	entry->multi_cap		= (control & PCI_MSI_FLAGS_QMASK) >> 1;
+	entry->msi_attrib.multiple	= ilog2(__roundup_pow_of_two(nvec));
+	entry->nvec_used		= nvec;
 
 	if (control & PCI_MSI_FLAGS_64BIT)
 		entry->mask_pos = dev->msi_cap + PCI_MSI_MASK_64;
@@ -617,7 +609,7 @@ static int msi_capability_init(struct pci_dev *dev, int nvec)
 
 	pci_msi_set_enable(dev, 0);	/* Disable MSI during set up */
 
-	entry = msi_setup_entry(dev);
+	entry = msi_setup_entry(dev, nvec);
 	if (!entry)
 		return -ENOMEM;
 
@@ -701,6 +693,7 @@ static int msix_setup_entries(struct pci_dev *dev, void __iomem *base,
 		entry->msi_attrib.entry_nr	= entries[i].entry;
 		entry->msi_attrib.default_irq	= dev->irq;
 		entry->mask_base		= base;
+		entry->nvec_used		= 1;
 
 		list_add_tail(&entry->list, &dev->msi_list);
 	}

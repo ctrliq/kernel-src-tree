@@ -232,7 +232,10 @@ static struct amdgpu_mn *amdgpu_mn_get(struct amdgpu_device *adev)
 	int r;
 
 	mutex_lock(&adev->mn_lock);
-	down_write(&mm->mmap_sem);
+	if (down_write_killable(&mm->mmap_sem)) {
+		mutex_unlock(&adev->mn_lock);
+		return ERR_PTR(-EINTR);
+	}
 
 	hash_for_each_possible(adev->mn_hash, rmn, node, (unsigned long)mm)
 		if (rmn->mm == mm)
@@ -282,7 +285,7 @@ free_rmn:
 int amdgpu_mn_register(struct amdgpu_bo *bo, unsigned long addr)
 {
 	unsigned long end = addr + amdgpu_bo_size(bo) - 1;
-	struct amdgpu_device *adev = bo->adev;
+	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
 	struct amdgpu_mn *rmn;
 	struct amdgpu_mn_node *node = NULL;
 	struct list_head bos;
@@ -337,7 +340,7 @@ int amdgpu_mn_register(struct amdgpu_bo *bo, unsigned long addr)
  */
 void amdgpu_mn_unregister(struct amdgpu_bo *bo)
 {
-	struct amdgpu_device *adev = bo->adev;
+	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
 	struct amdgpu_mn *rmn;
 	struct list_head *head;
 

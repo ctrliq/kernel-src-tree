@@ -319,6 +319,16 @@ static inline void security_free_mnt_opts(struct security_mnt_opts *opts)
  *	@name name of the last path component used to create file
  *	@ctx pointer to place the pointer to the resulting context in.
  *	@ctxlen point to place the length of the resulting context.
+ * @dentry_create_files_as:
+ *	Compute a context for a dentry as the inode is not yet available
+ *	and set that context in passed in creds so that new files are
+ *	created using that context. Context is calculated using the
+ *	passed in creds and not the creds of the caller.
+ *	@dentry dentry to use in calculating the context.
+ *	@mode mode used to determine resource type.
+ *	@name name of the last path component used to create file
+ *	@old creds which should be used for context calculation
+ *	@new creds to modify
  *
  *
  * Security hooks for inode operations.
@@ -563,6 +573,23 @@ static inline void security_free_mnt_opts(struct security_mnt_opts *opts)
  *	@inode contains a pointer to the inode.
  *	@secid contains a pointer to the location where result will be saved.
  *	In case of failure, @secid will be set to zero.
+ * @inode_copy_up:
+ *	A file is about to be copied up from lower layer to upper layer of
+ *	overlay filesystem. Security module can prepare a set of new creds
+ *	and modify as need be and return new creds. Caller will switch to
+ *	new creds temporarily to create new file and release newly allocated
+ *	creds.
+ *	@src indicates the union dentry of file that is being copied up.
+ *	@new pointer to pointer to return newly allocated creds.
+ *	Returns 0 on success or a negative error code on error.
+ * @inode_copy_up_xattr:
+ *	Filter the xattrs being copied up when a unioned file is copied
+ *	up from a lower layer to the union/overlay layer.
+ *	@name indicates the name of the xattr.
+ *	Returns 0 to accept the xattr, 1 to discard the xattr, -EOPNOTSUPP if
+ *	security module does not know about attribute or a negative error code
+ *	to abort the copy up. Note that the caller is responsible for reading
+ *	and writing the xattrs as this hook is merely a filter.
  *
  * Security hooks for file operations
  *
@@ -1383,6 +1410,10 @@ static inline void security_free_mnt_opts(struct security_mnt_opts *opts)
  *	audit_rule_init.
  *	@rule contains the allocated rule
  *
+ * @inode_invalidate_secctx:
+ *	Notify the security module that it must revalidate the security context
+ *	of an inode.
+ *
  * @inode_notifysecctx:
  *	Notify the security module of what the security context of an inode
  *	should be.  Initializes the incore security context managed by the
@@ -1464,11 +1495,17 @@ struct security_operations {
 				unsigned long kern_flags,
 				unsigned long *set_kern_flags);
 	int (*sb_clone_mnt_opts) (const struct super_block *oldsb,
-				   struct super_block *newsb);
+				   struct super_block *newsb,
+				   unsigned long kern_flags,
+				   unsigned long *set_kern_flags);
 	int (*sb_parse_opts_str) (char *options, struct security_mnt_opts *opts);
 	int (*dentry_init_security) (struct dentry *dentry, int mode,
 					struct qstr *name, void **ctx,
 					u32 *ctxlen);
+	int (*dentry_create_files_as)(struct dentry *dentry, int mode,
+					struct qstr *name,
+					const struct cred *old,
+					struct cred *new);
 
 
 #ifdef CONFIG_SECURITY_PATH
@@ -1521,10 +1558,12 @@ struct security_operations {
 	int (*inode_removexattr) (struct dentry *dentry, const char *name);
 	int (*inode_need_killpriv) (struct dentry *dentry);
 	int (*inode_killpriv) (struct dentry *dentry);
-	int (*inode_getsecurity) (const struct inode *inode, const char *name, void **buffer, bool alloc);
+	int (*inode_getsecurity) (struct inode *inode, const char *name, void **buffer, bool alloc);
 	int (*inode_setsecurity) (struct inode *inode, const char *name, const void *value, size_t size, int flags);
 	int (*inode_listsecurity) (struct inode *inode, char *buffer, size_t buffer_size);
-	void (*inode_getsecid) (const struct inode *inode, u32 *secid);
+	void (*inode_getsecid) (struct inode *inode, u32 *secid);
+	int (*inode_copy_up)(struct dentry *src, struct cred **new);
+	int (*inode_copy_up_xattr)(const char *name);
 
 	int (*file_permission) (struct file *file, int mask);
 	int (*file_alloc_security) (struct file *file);
@@ -1622,6 +1661,7 @@ struct security_operations {
 	int (*secctx_to_secid) (const char *secdata, u32 seclen, u32 *secid);
 	void (*release_secctx) (char *secdata, u32 seclen);
 
+	void (*inode_invalidate_secctx)(struct inode *inode);
 	int (*inode_notifysecctx)(struct inode *inode, void *ctx, u32 ctxlen);
 	int (*inode_setsecctx)(struct dentry *dentry, void *ctx, u32 ctxlen);
 	int (*inode_getsecctx)(struct inode *inode, void **ctx, u32 *ctxlen);
@@ -1758,11 +1798,17 @@ int security_sb_set_mnt_opts(struct super_block *sb,
 				unsigned long kern_flags,
 				unsigned long *set_kern_flags);
 int security_sb_clone_mnt_opts(const struct super_block *oldsb,
-				struct super_block *newsb);
+				struct super_block *newsb,
+				unsigned long kern_flags,
+				unsigned long *set_kern_flags);
 int security_sb_parse_opts_str(char *options, struct security_mnt_opts *opts);
 int security_dentry_init_security(struct dentry *dentry, int mode,
 					struct qstr *name, void **ctx,
 					u32 *ctxlen);
+int security_dentry_create_files_as(struct dentry *dentry, int mode,
+					struct qstr *name,
+					const struct cred *old,
+					struct cred *new);
 
 int security_inode_alloc(struct inode *inode);
 void security_inode_free(struct inode *inode);
@@ -1798,10 +1844,12 @@ int security_inode_listxattr(struct dentry *dentry);
 int security_inode_removexattr(struct dentry *dentry, const char *name);
 int security_inode_need_killpriv(struct dentry *dentry);
 int security_inode_killpriv(struct dentry *dentry);
-int security_inode_getsecurity(const struct inode *inode, const char *name, void **buffer, bool alloc);
+int security_inode_getsecurity(struct inode *inode, const char *name, void **buffer, bool alloc);
 int security_inode_setsecurity(struct inode *inode, const char *name, const void *value, size_t size, int flags);
 int security_inode_listsecurity(struct inode *inode, char *buffer, size_t buffer_size);
-void security_inode_getsecid(const struct inode *inode, u32 *secid);
+void security_inode_getsecid(struct inode *inode, u32 *secid);
+int security_inode_copy_up(struct dentry *src, struct cred **new);
+int security_inode_copy_up_xattr(const char *name);
 int security_file_permission(struct file *file, int mask);
 int security_file_alloc(struct file *file);
 void security_file_free(struct file *file);
@@ -1880,6 +1928,7 @@ int security_secid_to_secctx(u32 secid, char **secdata, u32 *seclen);
 int security_secctx_to_secid(const char *secdata, u32 seclen, u32 *secid);
 void security_release_secctx(char *secdata, u32 seclen);
 
+void security_inode_invalidate_secctx(struct inode *inode);
 int security_inode_notifysecctx(struct inode *inode, void *ctx, u32 ctxlen);
 int security_inode_setsecctx(struct dentry *dentry, void *ctx, u32 ctxlen);
 int security_inode_getsecctx(struct inode *inode, void **ctx, u32 *ctxlen);
@@ -2055,7 +2104,9 @@ static inline int security_sb_set_mnt_opts(struct super_block *sb,
 }
 
 static inline int security_sb_clone_mnt_opts(const struct super_block *oldsb,
-					      struct super_block *newsb)
+					      struct super_block *newsb,
+					      unsigned long kern_flags,
+					      unsigned long *set_kern_flags)
 {
 	return 0;
 }
@@ -2080,6 +2131,14 @@ static inline int security_dentry_init_security(struct dentry *dentry,
 						 u32 *ctxlen)
 {
 	return -EOPNOTSUPP;
+}
+
+static inline int security_dentry_create_files_as(struct dentry *dentry,
+						  int mode, struct qstr *name,
+						  const struct cred *old,
+						  struct cred *new)
+{
+	return 0;
 }
 
 
@@ -2222,7 +2281,7 @@ static inline int security_inode_killpriv(struct dentry *dentry)
 	return cap_inode_killpriv(dentry);
 }
 
-static inline int security_inode_getsecurity(const struct inode *inode, const char *name, void **buffer, bool alloc)
+static inline int security_inode_getsecurity(struct inode *inode, const char *name, void **buffer, bool alloc)
 {
 	return -EOPNOTSUPP;
 }
@@ -2237,9 +2296,19 @@ static inline int security_inode_listsecurity(struct inode *inode, char *buffer,
 	return 0;
 }
 
-static inline void security_inode_getsecid(const struct inode *inode, u32 *secid)
+static inline void security_inode_getsecid(struct inode *inode, u32 *secid)
 {
 	*secid = 0;
+}
+
+static inline int security_inode_copy_up(struct dentry *src, struct cred **new)
+{
+	return 0;
+}
+
+static inline int security_inode_copy_up_xattr(const char *name)
+{
+	return -EOPNOTSUPP;
 }
 
 static inline int security_file_permission(struct file *file, int mask)
@@ -2587,6 +2656,10 @@ static inline int security_secctx_to_secid(const char *secdata,
 }
 
 static inline void security_release_secctx(char *secdata, u32 seclen)
+{
+}
+
+static inline void security_inode_invalidate_secctx(struct inode *inode)
 {
 }
 

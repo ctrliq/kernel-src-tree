@@ -1359,7 +1359,8 @@ tree_mod_log_rewind(struct btrfs_fs_info *fs_info, struct btrfs_path *path,
 
 	if (tm->op == MOD_LOG_KEY_REMOVE_WHILE_FREEING) {
 		BUG_ON(tm->slot != 0);
-		eb_rewin = alloc_dummy_extent_buffer(fs_info, eb->start);
+		eb_rewin = alloc_dummy_extent_buffer(fs_info, eb->start,
+						eb->len);
 		if (!eb_rewin) {
 			btrfs_tree_read_unlock_blocking(eb);
 			free_extent_buffer(eb);
@@ -1440,7 +1441,8 @@ get_old_root(struct btrfs_root *root, u64 time_seq)
 	} else if (old_root) {
 		btrfs_tree_read_unlock(eb_root);
 		free_extent_buffer(eb_root);
-		eb = alloc_dummy_extent_buffer(root->fs_info, logical);
+		eb = alloc_dummy_extent_buffer(root->fs_info, logical,
+					root->nodesize);
 	} else {
 		btrfs_set_lock_blocking_rw(eb_root, BTRFS_READ_LOCK);
 		eb = btrfs_clone_extent_buffer(eb_root);
@@ -1489,7 +1491,7 @@ static inline int should_cow_block(struct btrfs_trans_handle *trans,
 				   struct btrfs_root *root,
 				   struct extent_buffer *buf)
 {
-	if (btrfs_test_is_dummy_root(root))
+	if (btrfs_is_testing(root->fs_info))
 		return 0;
 
 	/* ensure we can see the force_cow */
@@ -1543,7 +1545,7 @@ noinline int btrfs_cow_block(struct btrfs_trans_handle *trans,
 		return 0;
 	}
 
-	search_start = buf->start & ~((u64)(1024 * 1024 * 1024) - 1);
+	search_start = buf->start & ~((u64)SZ_1G - 1);
 
 	if (parent)
 		btrfs_set_lock_blocking(parent);
@@ -1711,20 +1713,6 @@ int btrfs_realloc_node(struct btrfs_trans_handle *trans,
 		free_extent_buffer(cur);
 	}
 	return err;
-}
-
-/*
- * The leaf data grows from end-to-front in the node.
- * this returns the address of the start of the last item,
- * which is the stop of the leaf data stack
- */
-static inline unsigned int leaf_data_end(struct btrfs_root *root,
-					 struct extent_buffer *leaf)
-{
-	u32 nr = btrfs_header_nritems(leaf);
-	if (nr == 0)
-		return BTRFS_LEAF_DATA_SIZE(root);
-	return btrfs_item_offset_nr(leaf, nr - 1);
 }
 
 
@@ -2252,8 +2240,6 @@ static void reada_for_search(struct btrfs_root *root,
 	u64 search;
 	u64 target;
 	u64 nread = 0;
-	u64 gen;
-	int direction = path->reada;
 	struct extent_buffer *eb;
 	u32 nr;
 	u32 blocksize;
@@ -2281,16 +2267,16 @@ static void reada_for_search(struct btrfs_root *root,
 	nr = slot;
 
 	while (1) {
-		if (direction < 0) {
+		if (path->reada == READA_BACK) {
 			if (nr == 0)
 				break;
 			nr--;
-		} else if (direction > 0) {
+		} else if (path->reada == READA_FORWARD) {
 			nr++;
 			if (nr >= nritems)
 				break;
 		}
-		if (path->reada < 0 && objectid) {
+		if (path->reada == READA_BACK && objectid) {
 			btrfs_node_key(node, &disk_key, nr);
 			if (btrfs_disk_key_objectid(&disk_key) != objectid)
 				break;
@@ -2298,7 +2284,6 @@ static void reada_for_search(struct btrfs_root *root,
 		search = btrfs_node_blockptr(node, nr);
 		if ((search <= target && target - search <= 65536) ||
 		    (search > target && search - target <= 65536)) {
-			gen = btrfs_node_ptr_generation(node, nr);
 			readahead_tree_block(root, search);
 			nread += blocksize;
 		}
@@ -2498,7 +2483,7 @@ read_block_for_search(struct btrfs_trans_handle *trans,
 	btrfs_set_path_blocking(p);
 
 	free_extent_buffer(tmp);
-	if (p->reada)
+	if (p->reada != READA_NONE)
 		reada_for_search(root, p, level, slot, key->objectid);
 
 	btrfs_release_path(p);
@@ -4761,8 +4746,9 @@ void setup_items_for_insert(struct btrfs_root *root, struct btrfs_path *path,
 
 	if (btrfs_leaf_free_space(root, leaf) < total_size) {
 		btrfs_print_leaf(root, leaf);
-		btrfs_crit(root->fs_info, "not enough freespace need %u have %d",
-		       total_size, btrfs_leaf_free_space(root, leaf));
+		btrfs_crit(root->fs_info,
+			   "not enough freespace need %u have %d",
+			   total_size, btrfs_leaf_free_space(root, leaf));
 		BUG();
 	}
 
@@ -4771,8 +4757,9 @@ void setup_items_for_insert(struct btrfs_root *root, struct btrfs_path *path,
 
 		if (old_data < data_end) {
 			btrfs_print_leaf(root, leaf);
-			btrfs_crit(root->fs_info, "slot %d old_data %d data_end %d",
-			       slot, old_data, data_end);
+			btrfs_crit(root->fs_info,
+				   "slot %d old_data %d data_end %d",
+				   slot, old_data, data_end);
 			BUG_ON(1);
 		}
 		/*

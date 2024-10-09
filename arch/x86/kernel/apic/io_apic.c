@@ -64,6 +64,8 @@
 
 #include <asm/apic.h>
 
+#include <asm/hypervisor.h>
+
 #define __apicdebuginit(type) static type __init
 
 #define	for_each_ioapic(idx)		\
@@ -2616,6 +2618,18 @@ static void ack_apic_level(struct irq_data *data)
 		atomic_inc(&irq_mis_count);
 
 		eoi_ioapic_irq(irq, cfg);
+	}
+
+	/*
+	 * RHEL-only: clear IRR bit in IO_APIC manually for Hyper-V Gen1 on irq
+	 * migration.
+	 */
+	if (unlikely(masked && x86_hyper == &x86_hyper_ms_hyperv)) {
+		unsigned long flags;
+
+		raw_spin_lock_irqsave(&ioapic_lock, flags);
+		io_apic_modify_irq(cfg, ~IO_APIC_REDIR_REMOTE_IRR, 0, &io_apic_sync);
+		raw_spin_unlock_irqrestore(&ioapic_lock, flags);
 	}
 
 	ioapic_irqd_unmask(data, cfg, masked);

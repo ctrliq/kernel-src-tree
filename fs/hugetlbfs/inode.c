@@ -204,7 +204,7 @@ hugetlb_get_unmapped_area(struct file *file, unsigned long addr,
 		addr = ALIGN(addr, huge_page_size(h));
 		vma = find_vma(mm, addr);
 		if (TASK_SIZE - len >= addr &&
-		    (!vma || addr + len <= vma->vm_start))
+		    (!vma || addr + len <= vm_start_gap(vma)))
 			return addr;
 	}
 
@@ -356,68 +356,25 @@ static int hugetlbfs_write_end(struct file *file, struct address_space *mapping,
 	return -EINVAL;
 }
 
-static void truncate_huge_page(struct page *page)
+static void remove_huge_page(struct page *page)
 {
 	cancel_dirty_page(page, /* No IO accounting for huge pages? */0);
 	ClearPageUptodate(page);
 	delete_from_page_cache(page);
 }
 
-static void truncate_hugepages(struct inode *inode, loff_t lstart)
-{
-	struct hstate *h = hstate_inode(inode);
-	struct address_space *mapping = &inode->i_data;
-	const pgoff_t start = lstart >> huge_page_shift(h);
-	struct pagevec pvec;
-	pgoff_t next;
-	int i, freed = 0;
-
-	pagevec_init(&pvec, 0);
-	next = start;
-	while (1) {
-		if (!pagevec_lookup(&pvec, mapping, next, PAGEVEC_SIZE)) {
-			if (next == start)
-				break;
-			next = start;
-			continue;
-		}
-
-		for (i = 0; i < pagevec_count(&pvec); ++i) {
-			struct page *page = pvec.pages[i];
-
-			lock_page(page);
-			if (page->index > next)
-				next = page->index;
-			++next;
-			truncate_huge_page(page);
-			unlock_page(page);
-			freed++;
-		}
-		huge_pagevec_release(&pvec);
-	}
-	BUG_ON(!lstart && mapping->nrpages);
-	hugetlb_unreserve_pages(inode, start, freed);
-}
-
-static void hugetlbfs_evict_inode(struct inode *inode)
-{
-	struct resv_map *resv_map;
-
-	truncate_hugepages(inode, 0);
-	resv_map = (struct resv_map *)inode->i_mapping->private_data;
-	/* root inode doesn't have the resv_map, so we should check it */
-	if (resv_map)
-		resv_map_release(&resv_map->refs);
-	clear_inode(inode);
-}
-
-static inline void
-hugetlb_vmtruncate_list(struct rb_root *root, pgoff_t pgoff)
+static void
+hugetlb_vmdelete_list(struct rb_root *root, pgoff_t start, pgoff_t end)
 {
 	struct vm_area_struct *vma;
 
-	vma_interval_tree_foreach(vma, root, pgoff, ULONG_MAX) {
+	/*
+	 * end == 0 indicates that the entire range after
+	 * start should be unmapped.
+	 */
+	vma_interval_tree_foreach(vma, root, start, end ? end : ULONG_MAX) {
 		unsigned long v_offset;
+		unsigned long v_end;
 
 		/*
 		 * Can the expression below overflow on 32-bit arches?
@@ -425,14 +382,155 @@ hugetlb_vmtruncate_list(struct rb_root *root, pgoff_t pgoff)
 		 * which overlap the truncated area starting at pgoff,
 		 * and no vma on a 32-bit arch can span beyond the 4GB.
 		 */
-		if (vma->vm_pgoff < pgoff)
-			v_offset = (pgoff - vma->vm_pgoff) << PAGE_SHIFT;
+		if (vma->vm_pgoff < start)
+			v_offset = (start - vma->vm_pgoff) << PAGE_SHIFT;
 		else
 			v_offset = 0;
 
-		unmap_hugepage_range(vma, vma->vm_start + v_offset,
-				     vma->vm_end, NULL);
+		if (!end)
+			v_end = vma->vm_end;
+		else {
+			v_end = ((end - vma->vm_pgoff) << PAGE_SHIFT)
+							+ vma->vm_start;
+			if (v_end > vma->vm_end)
+				v_end = vma->vm_end;
+		}
+
+		unmap_hugepage_range(vma, vma->vm_start + v_offset, v_end,
+									NULL);
 	}
+}
+
+/*
+ * remove_inode_hugepages handles two distinct cases: truncation and hole
+ * punch.  There are subtle differences in operation for each case.
+ *
+ * truncation is indicated by end of range being LLONG_MAX
+ *	In this case, we first scan the range and release found pages.
+ *	After releasing pages, hugetlb_unreserve_pages cleans up region/reserv
+ *	maps and global counts.  Page faults can not race with truncation
+ *	in this routine.  hugetlb_no_page() prevents page faults in the
+ *	truncated range.  It checks i_size before allocation, and again after
+ *	with the page table lock for the page held.  The same lock must be
+ *	acquired to unmap a page.
+ * hole punch is indicated if end is not LLONG_MAX
+ *	In the hole punch case we scan the range and release found pages.
+ *	Only when releasing a page is the associated region/reserv map
+ *	deleted.  The region/reserv map for ranges without associated
+ *	pages are not modified.  Page faults can race with hole punch.
+ *	This is indicated if we find a mapped page.
+ * Note: If the passed end of range value is beyond the end of file, but
+ * not LLONG_MAX this routine still performs a hole punch operation.
+ */
+static void remove_inode_hugepages(struct inode *inode, loff_t lstart,
+				   loff_t lend)
+{
+	struct hstate *h = hstate_inode(inode);
+	struct address_space *mapping = &inode->i_data;
+	const pgoff_t start = lstart >> huge_page_shift(h);
+	const pgoff_t end = lend >> huge_page_shift(h);
+	struct vm_area_struct pseudo_vma;
+	struct pagevec pvec;
+	pgoff_t next;
+	int i, freed = 0;
+	long lookup_nr = PAGEVEC_SIZE;
+	bool truncate_op = (lend == LLONG_MAX);
+
+	memset(&pseudo_vma, 0, sizeof(struct vm_area_struct));
+	pseudo_vma.vm_flags = (VM_HUGETLB | VM_MAYSHARE | VM_SHARED);
+	pagevec_init(&pvec, 0);
+	next = start;
+	while (next < end) {
+		/*
+		 * Don't grab more pages than the number left in the range.
+		 */
+		if (end - next < lookup_nr)
+			lookup_nr = end - next;
+
+		/*
+		 * When no more pages are found, we are done.
+		 */
+		if (!pagevec_lookup(&pvec, mapping, next, lookup_nr))
+			break;
+
+		for (i = 0; i < pagevec_count(&pvec); ++i) {
+			struct page *page = pvec.pages[i];
+			u32 hash;
+
+			/*
+			 * The page (index) could be beyond end.  This is
+			 * only possible in the punch hole case as end is
+			 * max page offset in the truncate case.
+			 */
+			next = page->index;
+			if (next >= end)
+				break;
+
+			hash = hugetlb_fault_mutex_hash(h, current->mm,
+							&pseudo_vma,
+							mapping, next, 0);
+			mutex_lock(&hugetlb_fault_mutex_table[hash]);
+
+			/*
+			 * If page is mapped, it was faulted in after being
+			 * unmapped in caller.  Unmap (again) now after taking
+			 * the fault mutex.  The mutex will prevent faults
+			 * until we finish removing the page.
+			 *
+			 * This race can only happen in the hole punch case.
+			 * Getting here in a truncate operation is a bug.
+			 */
+			if (unlikely(page_mapped(page))) {
+				BUG_ON(truncate_op);
+
+				mutex_lock(&mapping->i_mmap_mutex);
+				hugetlb_vmdelete_list(&mapping->i_mmap,
+					next * pages_per_huge_page(h),
+					(next + 1) * pages_per_huge_page(h));
+				mutex_unlock(&mapping->i_mmap_mutex);
+			}
+
+			lock_page(page);
+			/*
+			 * We must free the huge page and remove from page
+			 * cache (remove_huge_page) BEFORE removing the
+			 * region/reserve map (hugetlb_unreserve_pages).  In
+			 * rare out of memory conditions, removal of the
+			 * region/reserve map could fail. Correspondingly,
+			 * the subpool and global reserve usage count can need
+			 * to be adjusted.
+			 */
+			VM_BUG_ON(PagePrivate(page));
+			remove_huge_page(page);
+			freed++;
+			if (!truncate_op) {
+				if (unlikely(hugetlb_unreserve_pages(inode,
+							next, next + 1, 1)))
+					hugetlb_fix_reserve_counts(inode);
+			}
+
+			unlock_page(page);
+			mutex_unlock(&hugetlb_fault_mutex_table[hash]);
+		}
+		++next;
+		huge_pagevec_release(&pvec);
+		cond_resched();
+	}
+
+	if (truncate_op)
+		(void)hugetlb_unreserve_pages(inode, start, LONG_MAX, freed);
+}
+
+static void hugetlbfs_evict_inode(struct inode *inode)
+{
+	struct resv_map *resv_map;
+
+	remove_inode_hugepages(inode, 0, LLONG_MAX);
+	resv_map = (struct resv_map *)inode->i_mapping->private_data;
+	/* root inode doesn't have the resv_map, so we should check it */
+	if (resv_map)
+		resv_map_release(&resv_map->refs);
+	clear_inode(inode);
 }
 
 static int hugetlb_vmtruncate(struct inode *inode, loff_t offset)
@@ -447,9 +545,9 @@ static int hugetlb_vmtruncate(struct inode *inode, loff_t offset)
 	i_size_write(inode, offset);
 	mutex_lock(&mapping->i_mmap_mutex);
 	if (!RB_EMPTY_ROOT(&mapping->i_mmap))
-		hugetlb_vmtruncate_list(&mapping->i_mmap, pgoff);
+		hugetlb_vmdelete_list(&mapping->i_mmap, pgoff, 0);
 	mutex_unlock(&mapping->i_mmap_mutex);
-	truncate_hugepages(inode, offset);
+	remove_inode_hugepages(inode, offset, LLONG_MAX);
 	return 0;
 }
 
@@ -470,12 +568,12 @@ static long hugetlbfs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 		struct address_space *mapping = inode->i_mapping;
 
 		mutex_lock(&inode->i_mutex);
-		i_mmap_lock_write(mapping);
+		mutex_lock(&mapping->i_mmap_mutex);
 		if (!RB_EMPTY_ROOT(&mapping->i_mmap))
 			hugetlb_vmdelete_list(&mapping->i_mmap,
 						hole_start >> PAGE_SHIFT,
 						hole_end  >> PAGE_SHIFT);
-		i_mmap_unlock_write(mapping);
+		mutex_unlock(&mapping->i_mmap_mutex);
 		remove_inode_hugepages(inode, hole_start, hole_end);
 		mutex_unlock(&inode->i_mutex);
 	}
@@ -597,9 +695,6 @@ static long hugetlbfs_fallocate(struct file *file, int mode, loff_t offset,
 	if (!(mode & FALLOC_FL_KEEP_SIZE) && offset + len > inode->i_size)
 		i_size_write(inode, offset + len);
 	inode->i_ctime = CURRENT_TIME;
-	spin_lock(&inode->i_lock);
-	inode->i_private = NULL;
-	spin_unlock(&inode->i_lock);
 out:
 	mutex_unlock(&inode->i_mutex);
 	return error;
@@ -639,14 +734,11 @@ static struct inode *hugetlbfs_get_root(struct super_block *sb,
 
 	inode = new_inode(sb);
 	if (inode) {
-		struct hugetlbfs_inode_info *info;
 		inode->i_ino = get_next_ino();
 		inode->i_mode = S_IFDIR | config->mode;
 		inode->i_uid = config->uid;
 		inode->i_gid = config->gid;
 		inode->i_atime = inode->i_mtime = inode->i_ctime = CURRENT_TIME;
-		info = HUGETLBFS_I(inode);
-		mpol_shared_policy_init(&info->policy, NULL);
 		inode->i_op = &hugetlbfs_dir_inode_operations;
 		inode->i_fop = &simple_dir_operations;
 		/* directory inodes start off with i_nlink == 2 (for "." entry) */
@@ -659,7 +751,7 @@ static struct inode *hugetlbfs_get_root(struct super_block *sb,
 /*
  * Hugetlbfs is not reclaimable; therefore its i_mmap_mutex will never
  * be taken from reclaim -- unlike regular filesystems. This needs an
- * annotation because huge_pmd_share() does an allocation under
+ * annotation because huge_pmd_share() does an allocation under hugetlb's
  * i_mmap_mutex.
  */
 struct lock_class_key hugetlbfs_i_mmap_mutex_key;
@@ -677,7 +769,6 @@ static struct inode *hugetlbfs_get_inode(struct super_block *sb,
 
 	inode = new_inode(sb);
 	if (inode) {
-		struct hugetlbfs_inode_info *info;
 		inode->i_ino = get_next_ino();
 		inode_init_owner(inode, dir, mode);
 		lockdep_set_class(&inode->i_mapping->i_mmap_mutex,
@@ -686,15 +777,6 @@ static struct inode *hugetlbfs_get_inode(struct super_block *sb,
 		inode->i_mapping->backing_dev_info =&hugetlbfs_backing_dev_info;
 		inode->i_atime = inode->i_mtime = inode->i_ctime = CURRENT_TIME;
 		inode->i_mapping->private_data = resv_map;
-		info = HUGETLBFS_I(inode);
-		/*
-		 * The policy is initialized here even if we are creating a
-		 * private inode because initialization simply creates an
-		 * an empty rb tree and calls rwlock_init(), later when we
-		 * call mpol_free_shared_policy() it will just return because
-		 * the rb tree will still be empty.
-		 */
-		mpol_shared_policy_init(&info->policy, NULL);
 		switch (mode & S_IFMT) {
 		default:
 			init_special_inode(inode, mode, dev);
@@ -794,7 +876,10 @@ static int hugetlbfs_migrate_page(struct address_space *mapping,
 	rc = migrate_huge_page_move_mapping(mapping, newpage, page);
 	if (rc != MIGRATEPAGE_SUCCESS)
 		return rc;
-	migrate_page_copy(newpage, page);
+	if (mode != MIGRATE_SYNC_NO_COPY)
+		migrate_page_copy(newpage, page);
+	else
+		migrate_page_states(newpage, page);
 
 	return MIGRATEPAGE_SUCCESS;
 }
@@ -881,6 +966,18 @@ static struct inode *hugetlbfs_alloc_inode(struct super_block *sb)
 		hugetlbfs_inc_free_inodes(sbinfo);
 		return NULL;
 	}
+
+	/*
+	 * Any time after allocation, hugetlbfs_destroy_inode can be called
+	 * for the inode.  mpol_free_shared_policy is unconditionally called
+	 * as part of hugetlbfs_destroy_inode.  So, initialize policy here
+	 * in case of a quick call to destroy.
+	 *
+	 * Note that the policy is initialized even if we are creating a
+	 * private inode.  This simplifies hugetlbfs_destroy_inode.
+	 */
+	mpol_shared_policy_init(&p->policy, NULL);
+
 	return &p->vfs_inode;
 }
 

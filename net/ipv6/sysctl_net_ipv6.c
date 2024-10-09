@@ -40,6 +40,20 @@ static struct ctl_table ipv6_table_template[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec
 	},
+	{
+		.procname	= "idgen_retries",
+		.data		= &init_net.idgen_retries,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+	{
+		.procname	= "idgen_delay",
+		.data		= &init_net.idgen_delay,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_jiffies,
+	},
 	{ }
 };
 
@@ -77,6 +91,8 @@ static int __net_init ipv6_sysctl_net_init(struct net *net)
 	ipv6_table[0].data = &net->ipv6.sysctl.bindv6only;
 	ipv6_table[1].data = &net->ipv6_sysctl_ip_nonlocal_bind;
 	ipv6_table[2].data = &net->ipv6_anycast_src_echo_reply;
+	ipv6_table[3].data = &net->idgen_retries;
+	ipv6_table[4].data = &net->idgen_delay;
 
 	ipv6_route_table = ipv6_route_sysctl_init(net);
 	if (!ipv6_route_table)

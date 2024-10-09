@@ -20,7 +20,6 @@
 #include <linux/module.h>
 #include <linux/acpi.h>
 #include <linux/slab.h>
-#include <acpi/acpi_bus.h>
 
 struct ioapic {
 	acpi_handle	handle;
@@ -39,7 +38,7 @@ static int ioapic_probe(struct pci_dev *dev, const struct pci_device_id *ent)
 
 	handle = ACPI_HANDLE(&dev->dev);
 	if (!handle)
-		return -EINVAL;
+		return -ENODEV; /* rhel only - avoid reporting errors */
 
 	status = acpi_evaluate_integer(handle, "_GSB", NULL, &gsb);
 	if (ACPI_FAILURE(status))

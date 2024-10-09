@@ -332,7 +332,7 @@ static int flakey_map(struct dm_target *ti, struct bio *bio)
 			return DM_MAPIO_SUBMITTED;
 		}
 		else if (test_bit(ERROR_WRITES, &fc->flags)) {
-			bio_io_error(bio);
+			bio_endio(bio, -EIO);
 			return DM_MAPIO_SUBMITTED;
 		}
 

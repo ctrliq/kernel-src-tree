@@ -795,7 +795,8 @@ void exit_pi_state_list(struct task_struct *curr)
  */
 static int
 lookup_pi_state(u32 uval, struct futex_hash_bucket *hb,
-		union futex_key *key, struct futex_pi_state **ps)
+		union futex_key *key, struct futex_pi_state **ps,
+		struct task_struct *task)
 {
 	struct futex_pi_state *pi_state = NULL;
 	struct futex_q *this, *next;
@@ -1038,7 +1039,7 @@ retry:
 	 * We dont have the lock. Look up the PI state (or create it if
 	 * we are the first waiter):
 	 */
-	ret = lookup_pi_state(uval, hb, key, ps);
+	ret = lookup_pi_state(uval, hb, key, ps, task);
 
 	if (unlikely(ret)) {
 		switch (ret) {
@@ -1094,9 +1095,11 @@ static void __unqueue_futex(struct futex_q *q)
 
 /*
  * The hash bucket lock must be held when this is called.
- * Afterwards, the futex_q must not be accessed.
+ * Afterwards, the futex_q must not be accessed. Callers
+ * must ensure to later call wake_up_q() for the actual
+ * wakeups to occur.
  */
-static void wake_futex(struct futex_q *q)
+static void mark_wake_futex(struct wake_q_head *wake_q, struct futex_q *q)
 {
 	struct task_struct *p = q->task;
 
@@ -1104,14 +1107,10 @@ static void wake_futex(struct futex_q *q)
 		return;
 
 	/*
-	 * We set q->lock_ptr = NULL _before_ we wake up the task. If
-	 * a non-futex wake up happens on another CPU then the task
-	 * might exit and p would dereference a non-existing task
-	 * struct. Prevent this by holding a reference on p across the
-	 * wake up.
+	 * Queue the task for later wakeup for after we've released
+	 * the hb->lock. wake_q_add() grabs reference to p.
 	 */
-	get_task_struct(p);
-
+	wake_q_add(wake_q, p);
 	__unqueue_futex(q);
 	/*
 	 * The waiting task can free the futex_q as soon as
@@ -1121,9 +1120,6 @@ static void wake_futex(struct futex_q *q)
 	 */
 	smp_wmb();
 	q->lock_ptr = NULL;
-
-	wake_up_state(p, TASK_NORMAL);
-	put_task_struct(p);
 }
 
 static int wake_futex_pi(u32 __user *uaddr, u32 uval, struct futex_q *this)
@@ -1237,6 +1233,7 @@ futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 	struct futex_q *this, *next;
 	union futex_key key = FUTEX_KEY_INIT;
 	int ret;
+	WAKE_Q(wake_q);
 
 	if (!bitset)
 		return -EINVAL;
@@ -1264,13 +1261,14 @@ futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 			if (!(this->bitset & bitset))
 				continue;
 
-			wake_futex(this);
+			mark_wake_futex(&wake_q, this);
 			if (++ret >= nr_wake)
 				break;
 		}
 	}
 
 	spin_unlock(&hb->lock);
+	wake_up_q(&wake_q);
 out_put_key:
 	put_futex_key(&key);
 out:
@@ -1289,6 +1287,7 @@ futex_wake_op(u32 __user *uaddr1, unsigned int flags, u32 __user *uaddr2,
 	struct futex_hash_bucket *hb1, *hb2;
 	struct futex_q *this, *next;
 	int ret, op_ret;
+	WAKE_Q(wake_q);
 
 retry:
 	ret = get_futex_key(uaddr1, flags & FLAGS_SHARED, &key1, VERIFY_READ);
@@ -1340,7 +1339,7 @@ retry_private:
 				ret = -EINVAL;
 				goto out_unlock;
 			}
-			wake_futex(this);
+			mark_wake_futex(&wake_q, this);
 			if (++ret >= nr_wake)
 				break;
 		}
@@ -1354,7 +1353,7 @@ retry_private:
 					ret = -EINVAL;
 					goto out_unlock;
 				}
-				wake_futex(this);
+				mark_wake_futex(&wake_q, this);
 				if (++op_ret >= nr_wake2)
 					break;
 			}
@@ -1364,6 +1363,7 @@ retry_private:
 
 out_unlock:
 	double_unlock_hb(hb1, hb2);
+	wake_up_q(&wake_q);
 out_put_keys:
 	put_futex_key(&key2);
 out_put_key1:
@@ -1447,7 +1447,7 @@ void requeue_pi_wake_futex(struct futex_q *q, union futex_key *key,
  *
  * Return:
  *  0 - failed to acquire the lock atomically;
- *  1 - acquired the lock;
+ * >0 - acquired the lock, return value is vpid of the top_waiter
  * <0 - error
  */
 static int futex_proxy_trylock_atomic(u32 __user *pifutex,
@@ -1458,7 +1458,7 @@ static int futex_proxy_trylock_atomic(u32 __user *pifutex,
 {
 	struct futex_q *top_waiter = NULL;
 	u32 curval;
-	int ret;
+	int ret, vpid;
 
 	if (get_futex_value_locked(&curval, pifutex))
 		return -EFAULT;
@@ -1486,11 +1486,13 @@ static int futex_proxy_trylock_atomic(u32 __user *pifutex,
 	 * the contended case or if set_waiters is 1.  The pi_state is returned
 	 * in ps in contended cases.
 	 */
+	vpid = task_pid_vnr(top_waiter->task);
 	ret = futex_lock_pi_atomic(pifutex, hb2, key2, ps, top_waiter->task,
 				   set_waiters);
-	if (ret == 1)
+	if (ret == 1) {
 		requeue_pi_wake_futex(top_waiter, key2, hb2);
-
+		return vpid;
+	}
 	return ret;
 }
 
@@ -1521,7 +1523,7 @@ static int futex_requeue(u32 __user *uaddr1, unsigned int flags,
 	struct futex_pi_state *pi_state = NULL;
 	struct futex_hash_bucket *hb1, *hb2;
 	struct futex_q *this, *next;
-	u32 curval2;
+	WAKE_Q(wake_q);
 
 	if (requeue_pi) {
 		/*
@@ -1625,16 +1627,25 @@ retry_private:
 		 * At this point the top_waiter has either taken uaddr2 or is
 		 * waiting on it.  If the former, then the pi_state will not
 		 * exist yet, look it up one more time to ensure we have a
-		 * reference to it.
+		 * reference to it. If the lock was taken, ret contains the
+		 * vpid of the top waiter task.
 		 */
-		if (ret == 1) {
+		if (ret > 0) {
 			WARN_ON(pi_state);
 			drop_count++;
 			task_count++;
-			ret = get_futex_value_locked(&curval2, uaddr2);
-			if (!ret)
-				ret = lookup_pi_state(curval2, hb2, &key2,
-						      &pi_state);
+			/*
+			 * If we acquired the lock, then the user
+			 * space value of uaddr2 should be vpid. It
+			 * cannot be changed by the top waiter as it
+			 * is blocked on hb2 lock if it tries to do
+			 * so. If something fiddled with it behind our
+			 * back the pi state lookup might unearth
+			 * it. So we rather use the known value than
+			 * rereading and handing potential crap to
+			 * lookup_pi_state.
+			 */
+			ret = lookup_pi_state(ret, hb2, &key2, &pi_state, NULL);
 		}
 
 		switch (ret) {
@@ -1689,7 +1700,7 @@ retry_private:
 		 * woken by futex_unlock_pi().
 		 */
 		if (++task_count <= nr_wake && !requeue_pi) {
-			wake_futex(this);
+			mark_wake_futex(&wake_q, this);
 			continue;
 		}
 
@@ -1728,6 +1739,7 @@ retry_private:
 
 out_unlock:
 	double_unlock_hb(hb1, hb2);
+	wake_up_q(&wake_q);
 	hb_waiters_dec(hb2);
 
 	/*

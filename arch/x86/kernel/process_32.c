@@ -54,6 +54,7 @@
 #include <asm/syscalls.h>
 #include <asm/debugreg.h>
 #include <asm/switch_to.h>
+#include <asm/intel_rdt.h>
 
 asmlinkage void ret_from_fork(void) __asm__("ret_from_fork");
 asmlinkage void ret_from_kernel_thread(void) __asm__("ret_from_kernel_thread");
@@ -310,6 +311,9 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 	switch_fpu_finish(next_p, fpu);
 
 	this_cpu_write(current_task, next_p);
+
+	/* Load the Intel cache allocation PQR MSR. */
+	intel_rdt_sched_in();
 
 	return prev_p;
 }

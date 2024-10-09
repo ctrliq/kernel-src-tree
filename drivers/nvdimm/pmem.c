@@ -47,22 +47,52 @@ static struct nd_region *to_region(struct pmem_device *pmem)
 	return to_nd_region(to_dev(pmem)->parent);
 }
 
-static void pmem_clear_poison(struct pmem_device *pmem, phys_addr_t offset,
+static int pmem_clear_poison(struct pmem_device *pmem, phys_addr_t offset,
 		unsigned int len)
 {
 	struct device *dev = to_dev(pmem);
-	sector_t sector, cleared;
+	sector_t sector;
+	long cleared;
+	int rc = 0;
 
 	sector = (offset - pmem->data_offset) / 512;
-	cleared = nvdimm_clear_poison(dev, pmem->phys_addr + offset, len) / 512;
 
-	if (cleared) {
-		dev_dbg(dev, "%s: %#llx clear %ld sector%s\n",
-				__func__, (unsigned long long) sector,
-				cleared, cleared > 1 ? "s" : "");
+	cleared = nvdimm_clear_poison(dev, pmem->phys_addr + offset, len);
+	if (cleared < len)
+		rc = -EIO;
+	if (cleared > 0 && cleared / 512) {
+		cleared /= 512;
+		dev_dbg(dev, "%s: %#llx clear %ld sector%s\n", __func__,
+				(unsigned long long) sector, cleared,
+				cleared > 1 ? "s" : "");
+
 		badblocks_clear(&pmem->bb, sector, cleared);
 	}
+
 	invalidate_pmem(pmem->virt_addr + offset, len);
+	return rc;
+}
+
+static void write_pmem(void *pmem_addr, struct page *page,
+		unsigned int off, unsigned int len)
+{
+	void *mem = kmap_atomic(page);
+
+	memcpy_to_pmem(pmem_addr, mem + off, len);
+	kunmap_atomic(mem);
+}
+
+static int read_pmem(struct page *page, unsigned int off,
+		void *pmem_addr, unsigned int len)
+{
+	int rc;
+	void *mem = kmap_atomic(page);
+
+	rc = memcpy_from_pmem(mem + off, pmem_addr, len);
+	kunmap_atomic(mem);
+	if (rc)
+		return -EIO;
+	return 0;
 }
 
 static int pmem_do_bvec(struct pmem_device *pmem, struct page *page,
@@ -71,7 +101,6 @@ static int pmem_do_bvec(struct pmem_device *pmem, struct page *page,
 {
 	int rc = 0;
 	bool bad_pmem = false;
-	void *mem = kmap_atomic(page);
 	phys_addr_t pmem_off = sector * 512 + pmem->data_offset;
 	void *pmem_addr = pmem->virt_addr + pmem_off;
 
@@ -82,7 +111,7 @@ static int pmem_do_bvec(struct pmem_device *pmem, struct page *page,
 		if (unlikely(bad_pmem))
 			rc = -EIO;
 		else {
-			memcpy_from_pmem(mem + off, pmem_addr, len);
+			rc = read_pmem(page, off, pmem_addr, len);
 			flush_dcache_page(page);
 		}
 	} else {
@@ -101,14 +130,13 @@ static int pmem_do_bvec(struct pmem_device *pmem, struct page *page,
 		 * after clear poison.
 		 */
 		flush_dcache_page(page);
-		memcpy_to_pmem(pmem_addr, mem + off, len);
+		write_pmem(pmem_addr, page, off, len);
 		if (unlikely(bad_pmem)) {
-			pmem_clear_poison(pmem, pmem_off, len);
-			memcpy_to_pmem(pmem_addr, mem + off, len);
+			rc = pmem_clear_poison(pmem, pmem_off, len);
+			write_pmem(pmem_addr, page, off, len);
 		}
 	}
 
-	kunmap_atomic(mem);
 	return rc;
 }
 
@@ -166,14 +194,22 @@ static int pmem_rw_page(struct block_device *bdev, sector_t sector,
 
 /* see "strong" declaration in tools/testing/nvdimm/pmem-dax.c */
 __weak long pmem_direct_access(struct block_device *bdev, sector_t sector,
-		      void **kaddr, pfn_t *pfn)
+			void **kaddr, pfn_t *pfn, long size)
 {
 	struct pmem_device *pmem = bdev->bd_queue->queuedata;
 	resource_size_t offset = sector * 512 + pmem->data_offset;
 
+	if (unlikely(is_bad_pmem(&pmem->bb, sector, size)))
+		return -EIO;
 	*kaddr = pmem->virt_addr + offset;
 	*pfn = phys_to_pfn_t(pmem->phys_addr + offset, pmem->pfn_flags);
 
+	/*
+	 * If badblocks are present, limit known good range to the
+	 * requested range.
+	 */
+	if (unlikely(pmem->bb.count))
+		return size;
 	return pmem->size - pmem->pfn_pad - offset;
 }
 
@@ -233,7 +269,7 @@ static int pmem_attach_disk(struct device *dev,
 		dev_warn(dev, "unable to guarantee persistence of writes\n");
 
 	if (!devm_request_mem_region(dev, res->start, resource_size(res),
-				dev_name(dev))) {
+				dev_name(&ndns->dev))) {
 		dev_warn(dev, "could not reserve region %pR\n", res);
 		return -EBUSY;
 	}
@@ -279,6 +315,7 @@ static int pmem_attach_disk(struct device *dev,
 	blk_queue_max_hw_sectors(q, UINT_MAX);
 	blk_queue_bounce_limit(q, BLK_BOUNCE_ANY);
 	queue_flag_set_unlocked(QUEUE_FLAG_NONROT, q);
+	queue_flag_set_unlocked(QUEUE_FLAG_DAX, q);
 	q->queuedata = pmem;
 
 	disk = alloc_disk_node(0, nid);

@@ -56,7 +56,6 @@
 /*
  *	SOL_IP control messages.
  */
-#define PKTINFO_SKB_CB(__skb) ((struct in_pktinfo *)((__skb)->cb))
 
 static void ip_cmsg_recv_pktinfo(struct msghdr *msg, struct sk_buff *skb)
 {
@@ -145,9 +144,9 @@ static void ip_cmsg_recv_dstaddr(struct msghdr *msg, struct sk_buff *skb)
 	put_cmsg(msg, SOL_IP, IP_ORIGDSTADDR, sizeof(sin), &sin);
 }
 
-void ip_cmsg_recv(struct msghdr *msg, struct sk_buff *skb)
+void ip_cmsg_recv_sk(struct msghdr *msg, struct sock *sk, struct sk_buff *skb)
 {
-	struct inet_sock *inet = inet_sk(skb->sk);
+	struct inet_sock *inet = inet_sk(sk);
 	unsigned int flags = inet->cmsg_flags;
 
 	/* Ordered by supposed usage frequency */
@@ -185,7 +184,7 @@ void ip_cmsg_recv(struct msghdr *msg, struct sk_buff *skb)
 		ip_cmsg_recv_dstaddr(msg, skb);
 
 }
-EXPORT_SYMBOL(ip_cmsg_recv);
+EXPORT_SYMBOL(ip_cmsg_recv_sk);
 
 int ip_cmsg_send(struct net *net, struct msghdr *msg, struct ipcm_cookie *ipc)
 {
@@ -383,6 +382,22 @@ void ip_local_error(struct sock *sk, int err, __be32 daddr, __be16 port, u32 inf
 		kfree_skb(skb);
 }
 
+static bool ipv4_pktinfo_prepare_errqueue(const struct sock *sk,
+					  const struct sk_buff *skb,
+					  int ee_origin)
+{
+	struct in_pktinfo *info = PKTINFO_SKB_CB(skb);
+
+	if ((ee_origin != SO_EE_ORIGIN_TIMESTAMPING) ||
+	    (!(sk->sk_tsflags & SOF_TIMESTAMPING_OPT_CMSG)) ||
+	    (!skb->dev))
+		return false;
+
+	info->ipi_spec_dst.s_addr = ip_hdr(skb)->saddr;
+	info->ipi_ifindex = skb->dev->ifindex;
+	return true;
+}
+
 /*
  *	Handle MSG_ERRQUEUE
  */
@@ -408,7 +423,7 @@ int ip_recv_error(struct sock *sk, struct msghdr *msg, int len, int *addr_len)
 		msg->msg_flags |= MSG_TRUNC;
 		copied = len;
 	}
-	err = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
+	err = skb_copy_datagram_msg(skb, 0, msg, copied);
 	if (err)
 		goto out_free_skb;
 
@@ -429,7 +444,9 @@ int ip_recv_error(struct sock *sk, struct msghdr *msg, int len, int *addr_len)
 	memcpy(&errhdr.ee, &serr->ee, sizeof(struct sock_extended_err));
 	sin = &errhdr.offender;
 	sin->sin_family = AF_UNSPEC;
-	if (serr->ee.ee_origin == SO_EE_ORIGIN_ICMP) {
+
+	if (serr->ee.ee_origin == SO_EE_ORIGIN_ICMP ||
+	    ipv4_pktinfo_prepare_errqueue(sk, skb, serr->ee.ee_origin)) {
 		struct inet_sock *inet = inet_sk(sk);
 
 		sin->sin_family = AF_INET;
@@ -515,6 +532,7 @@ static int do_ip_setsockopt(struct sock *sk, int level,
 	case IP_TRANSPARENT:
 	case IP_MINTTL:
 	case IP_NODEFRAG:
+	case IP_BIND_ADDRESS_NO_PORT:
 	case IP_UNICAST_IF:
 	case IP_MULTICAST_TTL:
 	case IP_MULTICAST_ALL:
@@ -650,6 +668,9 @@ static int do_ip_setsockopt(struct sock *sk, int level,
 			break;
 		}
 		inet->nodefrag = val ? 1 : 0;
+		break;
+	case IP_BIND_ADDRESS_NO_PORT:
+		inet->bind_address_no_port = val ? 1 : 0;
 		break;
 	case IP_MTU_DISCOVER:
 		if (val < IP_PMTUDISC_DONT || val > IP_PMTUDISC_OMIT)
@@ -1073,7 +1094,7 @@ e_inval:
 }
 
 /**
- * ipv4_pktinfo_prepare - transfert some info from rtable to skb
+ * ipv4_pktinfo_prepare - transfer some info from rtable to skb
  * @sk: socket
  * @skb: buffer
  *
@@ -1084,9 +1105,10 @@ e_inval:
 void ipv4_pktinfo_prepare(const struct sock *sk, struct sk_buff *skb)
 {
 	struct in_pktinfo *pktinfo = PKTINFO_SKB_CB(skb);
+	bool prepare = (inet_sk(sk)->cmsg_flags & IP_CMSG_PKTINFO) ||
+		       ipv6_sk_rxinfo(sk);
 
-	if ((inet_sk(sk)->cmsg_flags & IP_CMSG_PKTINFO) &&
-	    skb_rtable(skb)) {
+	if (prepare && skb_rtable(skb)) {
 		pktinfo->ipi_ifindex = inet_iif(skb);
 		pktinfo->ipi_spec_dst.s_addr = fib_compute_spec_dst(skb);
 	} else {
@@ -1245,6 +1267,9 @@ static int do_ip_getsockopt(struct sock *sk, int level, int optname,
 		break;
 	case IP_NODEFRAG:
 		val = inet->nodefrag;
+		break;
+	case IP_BIND_ADDRESS_NO_PORT:
+		val = inet->bind_address_no_port;
 		break;
 	case IP_MTU_DISCOVER:
 		val = inet->pmtudisc;

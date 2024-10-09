@@ -908,10 +908,91 @@ int dm_set_target_max_io_len(struct dm_target *ti, sector_t len)
 }
 EXPORT_SYMBOL_GPL(dm_set_target_max_io_len);
 
+static long dm_blk_direct_access(struct block_device *bdev, sector_t sector,
+				 void **kaddr, pfn_t *pfn, long size)
+{
+	struct mapped_device *md = bdev->bd_disk->private_data;
+	struct dm_table *map;
+	struct dm_target *ti;
+	int srcu_idx;
+	long len, ret = -EIO;
+
+	map = dm_get_live_table(md, &srcu_idx);
+	if (!map)
+		goto out;
+
+	ti = dm_table_find_target(map, sector);
+	if (!dm_target_is_valid(ti))
+		goto out;
+
+	len = max_io_len(sector, ti) << SECTOR_SHIFT;
+	size = min(len, size);
+
+	if (ti->type->direct_access)
+		ret = ti->type->direct_access(ti, sector, kaddr, pfn, size);
+out:
+	dm_put_live_table(md, srcu_idx);
+	return min(ret, size);
+}
+
+/*
+ * Flush current->bio_list when the target map method blocks.
+ * This fixes deadlocks in snapshot and possibly in other targets.
+ */
+struct dm_offload {
+	struct blk_plug plug;
+	struct blk_plug_cb cb;
+};
+
+static void flush_current_bio_list(struct blk_plug_cb *cb, bool from_schedule)
+{
+	struct dm_offload *o = container_of(cb, struct dm_offload, cb);
+	struct bio_list list;
+	struct bio *bio;
+	int i;
+
+	INIT_LIST_HEAD(&o->cb.list);
+
+	if (unlikely(!current->bio_list))
+		return;
+
+	for (i = 0; i < 2; i++) {
+		list = current->bio_list[i];
+		bio_list_init(&current->bio_list[i]);
+
+		while ((bio = bio_list_pop(&list))) {
+			struct bio_set *bs = bio->bi_pool;
+			if (unlikely(!bs) || bs == fs_bio_set) {
+				bio_list_add(&current->bio_list[i], bio);
+				continue;
+			}
+
+			spin_lock(&bs->rescue_lock);
+			bio_list_add(&bs->rescue_list, bio);
+			queue_work(bs->rescue_workqueue, &bs->rescue_work);
+			spin_unlock(&bs->rescue_lock);
+		}
+	}
+}
+
+static void dm_offload_start(struct dm_offload *o)
+{
+	blk_start_plug(&o->plug);
+	o->cb.callback = flush_current_bio_list;
+	list_add(&o->cb.list, &current->plug->cb_list);
+}
+
+static void dm_offload_end(struct dm_offload *o)
+{
+	list_del(&o->cb.list);
+	blk_finish_plug(&o->plug);
+}
+
 static void __map_bio(struct dm_target_io *tio)
 {
 	int r;
 	sector_t sector;
+	struct dm_offload o;
 	struct bio *clone = &tio->clone;
 	struct dm_target *ti = tio->ti;
 
@@ -924,7 +1005,11 @@ static void __map_bio(struct dm_target_io *tio)
 	 */
 	atomic_inc(&tio->io->io_count);
 	sector = clone->bi_sector;
+
+	dm_offload_start(&o);
 	r = ti->type->map(ti, clone);
+	dm_offload_end(&o);
+
 	if (r == DM_MAPIO_REMAPPED) {
 		/* the bio has been remapped so dispatch it */
 
@@ -1689,10 +1774,6 @@ static void free_dev(struct mapped_device *md)
 	if (md->bs)
 		bioset_free(md->bs);
 
-	cleanup_srcu_struct(&md->io_barrier);
-	free_table_devices(&md->table_devices);
-	dm_stats_cleanup(&md->stats);
-
 	spin_lock(&_minor_lock);
 	md->disk->private_data = NULL;
 	spin_unlock(&_minor_lock);
@@ -1701,6 +1782,11 @@ static void free_dev(struct mapped_device *md)
 	del_gendisk(md->disk);
 	put_disk(md->disk);
 	blk_cleanup_queue(md->queue);
+
+	cleanup_srcu_struct(&md->io_barrier);
+	free_table_devices(&md->table_devices);
+	dm_stats_cleanup(&md->stats);
+
 	dm_mq_cleanup_mapped_device(md);
 	bdput(md->bdev);
 	free_minor(minor);
@@ -1715,7 +1801,7 @@ static void __bind_mempools(struct mapped_device *md, struct dm_table *t)
 
 	if (md->bs) {
 		/* The md already has necessary mempools. */
-		if (dm_table_get_type(t) == DM_TYPE_BIO_BASED) {
+		if (dm_table_bio_based(t)) {
 			/*
 			 * Reload bioset because front_pad may have changed
 			 * because a different table was loaded.
@@ -1967,23 +2053,15 @@ struct queue_limits *dm_get_queue_limits(struct mapped_device *md)
 }
 EXPORT_SYMBOL_GPL(dm_get_queue_limits);
 
-static unsigned filter_md_type(unsigned type, struct mapped_device *md)
-{
-	if (type == DM_TYPE_BIO_BASED)
-		return type;
-
-	return !md->use_blk_mq ? DM_TYPE_REQUEST_BASED : DM_TYPE_MQ_REQUEST_BASED;
-}
-
 /*
  * Setup the DM device's queue based on md's type
  */
 int dm_setup_md_queue(struct mapped_device *md, struct dm_table *t)
 {
 	int r;
-	unsigned md_type = filter_md_type(dm_get_md_type(md), md);
+	unsigned type = dm_get_md_type(md);
 
-	switch (md_type) {
+	switch (type) {
 	case DM_TYPE_REQUEST_BASED:
 		r = dm_old_init_request_queue(md);
 		if (r) {
@@ -1992,16 +2070,20 @@ int dm_setup_md_queue(struct mapped_device *md, struct dm_table *t)
 		}
 		break;
 	case DM_TYPE_MQ_REQUEST_BASED:
-		r = dm_mq_init_request_queue(md, dm_table_get_immutable_target(t));
+		r = dm_mq_init_request_queue(md, t);
 		if (r) {
 			DMERR("Cannot initialize queue for request-based dm-mq mapped device");
 			return r;
 		}
 		break;
 	case DM_TYPE_BIO_BASED:
+	case DM_TYPE_DAX_BIO_BASED:
 		dm_init_normal_md_queue(md);
 		blk_queue_make_request(md->queue, dm_make_request);
 		blk_queue_merge_bvec(md->queue, dm_merge_bvec);
+
+		if (type == DM_TYPE_DAX_BIO_BASED)
+			queue_flag_set_unlocked(QUEUE_FLAG_DAX, md->queue);
 		break;
 	}
 
@@ -2708,10 +2790,9 @@ struct dm_md_mempools *dm_alloc_md_mempools(struct mapped_device *md, unsigned t
 	if (!pools)
 		return NULL;
 
-	type = filter_md_type(type, md);
-
 	switch (type) {
 	case DM_TYPE_BIO_BASED:
+	case DM_TYPE_DAX_BIO_BASED:
 		cachep = _io_cache;
 		pool_size = dm_get_reserved_bio_based_ios();
 		front_pad = roundup(per_io_data_size, __alignof__(struct dm_target_io)) + offsetof(struct dm_target_io, clone);
@@ -2938,6 +3019,7 @@ static const struct block_device_operations dm_blk_dops = {
 	.open = dm_blk_open,
 	.release = dm_blk_close,
 	.ioctl = dm_blk_ioctl,
+	.direct_access = dm_blk_direct_access,
 	.getgeo = dm_blk_getgeo,
 	.pr_ops = &dm_pr_ops,
 	.owner = THIS_MODULE

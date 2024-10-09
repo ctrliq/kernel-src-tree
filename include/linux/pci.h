@@ -36,6 +36,10 @@
 
 #include <linux/rh_kabi.h>
 
+#ifndef msi_controller
+#define msi_controller	msi_chip
+#endif
+
 /*
  * The PCI interface treats multi-function devices as independent
  * devices.  The slot/function address of each device is encoded
@@ -182,6 +186,8 @@ enum pci_dev_flags {
 	PCI_DEV_FLAGS_NO_PM_RESET = (__force pci_dev_flags_t) (1 << 7),
 	/* Get VPD from function 0 VPD */
 	PCI_DEV_FLAGS_VPD_REF_F0 = (__force pci_dev_flags_t) (1 << 8),
+	/* Do not use FLR even if device advertises PCI_AF_CAP */
+	PCI_DEV_FLAGS_NO_FLR_RESET = (__force pci_dev_flags_t) (1 << 10),
 };
 
 enum pci_irq_reroute_variant {
@@ -304,7 +310,6 @@ struct pci_dev {
 	unsigned int	d2_support:1;	/* Low power state D2 is supported */
 	unsigned int	no_d1d2:1;	/* D1 and D2 are forbidden */
 	unsigned int	no_d3cold:1;	/* D3cold is forbidden */
-	unsigned int	bridge_d3:1;	/* Allow D3 for bridge */
 	unsigned int	d3cold_allowed:1;	/* D3cold is allowed by user */
 	unsigned int	mmio_always_on:1;	/* disallow turning off io/mem
 						   decoding during bar sizing */
@@ -314,6 +319,8 @@ struct pci_dev {
 						   powered on/off by the
 						   corresponding bridge */
 	RH_KABI_FILL_HOLE(unsigned int  ignore_hotplug:1)
+	RH_KABI_FILL_HOLE(unsigned int  hotplug_user_indicators:1)
+	RH_KABI_FILL_HOLE(unsigned int  bridge_d3:1)  /* Allow D3 for bridge*/
 	unsigned int	d3_delay;	/* D3->D0 transition time in ms */
 	unsigned int	d3cold_delay;	/* D3cold->D0 transition time in ms */
 
@@ -437,9 +444,18 @@ struct pci_host_bridge {
 	void (*release_fn)(struct pci_host_bridge *);
 	void *release_data;
 	unsigned int ignore_reset_delay:1;	/* for entire hierarchy */
+	/* Resource alignment requirements */
+	resource_size_t (*align_resource)(struct pci_dev *dev,
+			const struct resource *res,
+			resource_size_t start,
+			resource_size_t size,
+			resource_size_t align);
 };
 
 #define	to_pci_host_bridge(n) container_of(n, struct pci_host_bridge, dev)
+
+struct pci_host_bridge *pci_find_host_bridge(struct pci_bus *bus);
+
 void pci_set_host_bridge_release(struct pci_host_bridge *bridge,
 		     void (*release_fn)(struct pci_host_bridge *),
 		     void *release_data);
@@ -482,7 +498,7 @@ struct pci_bus {
 	struct resource busn_res;	/* bus numbers routed to this bus */
 
 	struct pci_ops	*ops;		/* configuration access functions */
-	struct msi_chip	*msi;		/* MSI controller */
+	struct msi_controller *msi;	/* MSI controller */
 	void		*sysdata;	/* hook for sys-specific extension */
 	struct proc_dir_entry *procdir;	/* directory entry in /proc/bus/pci */
 
@@ -1765,6 +1781,8 @@ int pci_iov_virtfn_devfn(struct pci_dev *dev, int id);
 
 int pci_enable_sriov(struct pci_dev *dev, int nr_virtfn);
 void pci_disable_sriov(struct pci_dev *dev);
+int pci_iov_add_virtfn(struct pci_dev *dev, int id, int reset);
+void pci_iov_remove_virtfn(struct pci_dev *dev, int id, int reset);
 int pci_num_vf(struct pci_dev *dev);
 int pci_vfs_assigned(struct pci_dev *dev);
 int pci_sriov_set_totalvfs(struct pci_dev *dev, u16 numvfs);
@@ -1781,6 +1799,12 @@ static inline int pci_iov_virtfn_devfn(struct pci_dev *dev, int id)
 }
 static inline int pci_enable_sriov(struct pci_dev *dev, int nr_virtfn)
 { return -ENODEV; }
+static inline int pci_iov_add_virtfn(struct pci_dev *dev, int id, int reset)
+{
+	return -ENOSYS;
+}
+static inline void pci_iov_remove_virtfn(struct pci_dev *dev,
+					 int id, int reset) { }
 static inline void pci_disable_sriov(struct pci_dev *dev) { }
 static inline int pci_num_vf(struct pci_dev *dev) { return 0; }
 static inline int pci_vfs_assigned(struct pci_dev *dev)
@@ -1811,6 +1835,20 @@ static inline u16 pcie_caps_reg(const struct pci_dev *dev)
 }
 
 int pci_pcie_type(const struct pci_dev *dev);
+static inline struct pci_dev *pcie_find_root_port(struct pci_dev *dev)
+{
+	while (1) {
+		if (!pci_is_pcie(dev))
+			break;
+		if (pci_pcie_type(dev) == PCI_EXP_TYPE_ROOT_PORT)
+			return dev;
+		if (!dev->bus->self)
+			break;
+		dev = dev->bus->self;
+	}
+	return NULL;
+}
+
 void pci_request_acs(void);
 bool pci_acs_enabled(struct pci_dev *pdev, u16 acs_flags);
 bool pci_acs_path_enabled(struct pci_dev *start,

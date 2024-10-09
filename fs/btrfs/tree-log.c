@@ -2771,7 +2771,7 @@ int btrfs_sync_log(struct btrfs_trans_handle *trans,
 	while (1) {
 		int batch = atomic_read(&root->log_batch);
 		/* when we're on an ssd, just kick the log commit out */
-		if (!btrfs_test_opt(root, SSD) &&
+		if (!btrfs_test_opt(root->fs_info, SSD) &&
 		    test_bit(BTRFS_ROOT_MULTI_LOG_TASKS, &root->state)) {
 			mutex_unlock(&root->log_mutex);
 			schedule_timeout_uninterruptible(1);
@@ -3010,7 +3010,7 @@ static void free_log_tree(struct btrfs_trans_handle *trans,
 			break;
 
 		clear_extent_bits(&log->dirty_log_pages, start, end,
-				  EXTENT_DIRTY | EXTENT_NEW, GFP_NOFS);
+				  EXTENT_DIRTY | EXTENT_NEW);
 	}
 
 	/*
@@ -3953,7 +3953,7 @@ static int wait_ordered_extents(struct btrfs_trans_handle *trans,
 			 * i_mapping flags, so that the next fsync won't get
 			 * an outdated io error too.
 			 */
-			btrfs_inode_check_errors(inode);
+			filemap_check_errors(inode->i_mapping);
 			*ordered_io_error = true;
 			break;
 		}
@@ -4150,6 +4150,7 @@ static int btrfs_log_changed_extents(struct btrfs_trans_handle *trans,
 
 	INIT_LIST_HEAD(&extents);
 
+	down_write(&BTRFS_I(inode)->dio_sem);
 	write_lock(&tree->lock);
 	test_gen = root->fs_info->last_trans_committed;
 
@@ -4178,13 +4179,20 @@ static int btrfs_log_changed_extents(struct btrfs_trans_handle *trans,
 	}
 
 	list_sort(NULL, &extents, extent_cmp);
-	/*
-	 * Collect any new ordered extents within the range. This is to
-	 * prevent logging file extent items without waiting for the disk
-	 * location they point to being written. We do this only to deal
-	 * with races against concurrent lockless direct IO writes.
-	 */
 	btrfs_get_logged_extents(inode, logged_list, start, end);
+	/*
+	 * Some ordered extents started by fsync might have completed
+	 * before we could collect them into the list logged_list, which
+	 * means they're gone, not in our logged_list nor in the inode's
+	 * ordered tree. We want the application/user space to know an
+	 * error happened while attempting to persist file data so that
+	 * it can take proper action. If such error happened, we leave
+	 * without writing to the log tree and the fsync must report the
+	 * file data write error and not commit the current transaction.
+	 */
+	ret = filemap_check_errors(inode->i_mapping);
+	if (ret)
+		ctx->io_err = ret;
 process:
 	while (!list_empty(&extents)) {
 		em = list_entry(extents.next, struct extent_map, list);
@@ -4211,6 +4219,7 @@ process:
 	}
 	WARN_ON(!list_empty(&extents));
 	write_unlock(&tree->lock);
+	up_write(&BTRFS_I(inode)->dio_sem);
 
 	btrfs_release_path(path);
 	return ret;
@@ -4648,23 +4657,6 @@ static int btrfs_log_inode(struct btrfs_trans_handle *trans,
 	}
 
 	/*
-	 * Collect ordered extents only if we are logging data. This is to
-	 * ensure a subsequent request to log this inode in LOG_INODE_ALL mode
-	 * will process the ordered extents if they still exists at the time,
-	 * because when we collect them we test and set for the flag
-	 * BTRFS_ORDERED_LOGGED to prevent multiple log requests to process the
-	 * same ordered extents. The consequence for the LOG_INODE_ALL log mode
-	 * not processing the ordered extents is that we end up logging the
-	 * corresponding file extent items, based on the extent maps in the
-	 * inode's extent_map_tree's modified_list, without logging the
-	 * respective checksums (since the may still be only attached to the
-	 * ordered extents and have not been inserted in the csum tree by
-	 * btrfs_finish_ordered_io() yet).
-	 */
-	if (inode_only == LOG_INODE_ALL)
-		btrfs_get_logged_extents(inode, &logged_list, start, end);
-
-	/*
 	 * a brute force approach to making sure we get the most uptodate
 	 * copies of everything.
 	 */
@@ -4931,21 +4923,6 @@ log_extents:
 			goto out_unlock;
 	}
 	if (fast_search) {
-		/*
-		 * Some ordered extents started by fsync might have completed
-		 * before we collected the ordered extents in logged_list, which
-		 * means they're gone, not in our logged_list nor in the inode's
-		 * ordered tree. We want the application/user space to know an
-		 * error happened while attempting to persist file data so that
-		 * it can take proper action. If such error happened, we leave
-		 * without writing to the log tree and the fsync must report the
-		 * file data write error and not commit the current transaction.
-		 */
-		err = btrfs_inode_check_errors(inode);
-		if (err) {
-			ctx->io_err = err;
-			goto out_unlock;
-		}
 		ret = btrfs_log_changed_extents(trans, root, inode, dst_path,
 						&logged_list, ctx, start, end);
 		if (ret) {
@@ -5413,7 +5390,7 @@ static int btrfs_log_inode_parent(struct btrfs_trans_handle *trans,
 
 	sb = inode->i_sb;
 
-	if (btrfs_test_opt(root, NOTREELOG)) {
+	if (btrfs_test_opt(root->fs_info, NOTREELOG)) {
 		ret = 1;
 		goto end_no_trans;
 	}
@@ -5600,7 +5577,7 @@ int btrfs_recover_log_trees(struct btrfs_root *log_root_tree)
 	if (!path)
 		return -ENOMEM;
 
-	fs_info->log_root_recovering = 1;
+	set_bit(BTRFS_FS_LOG_RECOVERING, &fs_info->flags);
 
 	trans = btrfs_start_transaction(fs_info->tree_root, 0);
 	if (IS_ERR(trans)) {
@@ -5613,8 +5590,8 @@ int btrfs_recover_log_trees(struct btrfs_root *log_root_tree)
 
 	ret = walk_log_tree(trans, log_root_tree, &wc);
 	if (ret) {
-		btrfs_handle_fs_error(fs_info, ret, "Failed to pin buffers while "
-			    "recovering log root tree.");
+		btrfs_handle_fs_error(fs_info, ret,
+			"Failed to pin buffers while recovering log root tree.");
 		goto error;
 	}
 
@@ -5660,8 +5637,8 @@ again:
 			free_extent_buffer(log->node);
 			free_extent_buffer(log->commit_root);
 			kfree(log);
-			btrfs_handle_fs_error(fs_info, ret, "Couldn't read target root "
-				    "for tree log recovery.");
+			btrfs_handle_fs_error(fs_info, ret,
+				"Couldn't read target root for tree log recovery.");
 			goto error;
 		}
 
@@ -5710,7 +5687,7 @@ again:
 
 	free_extent_buffer(log_root_tree->node);
 	log_root_tree->log_root = NULL;
-	fs_info->log_root_recovering = 0;
+	clear_bit(BTRFS_FS_LOG_RECOVERING, &fs_info->flags);
 	kfree(log_root_tree);
 
 	return 0;

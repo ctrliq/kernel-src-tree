@@ -394,9 +394,8 @@ static void sock_disable_timestamp(struct sock *sk, unsigned long flags)
 }
 
 
-int sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
+int __sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 {
-	int err;
 	int skb_len;
 	unsigned long flags;
 	struct sk_buff_head *list = &sk->sk_receive_queue;
@@ -406,10 +405,6 @@ int sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 		trace_sock_rcvqueue_full(sk, skb);
 		return -ENOMEM;
 	}
-
-	err = sk_filter(sk, skb);
-	if (err)
-		return err;
 
 	if (!sk_rmem_schedule(sk, skb, skb->truesize)) {
 		atomic_inc(&sk->sk_drops);
@@ -432,13 +427,25 @@ int sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 	skb_dst_force(skb);
 
 	spin_lock_irqsave(&list->lock, flags);
-	skb->dropcount = atomic_read(&sk->sk_drops);
+	sock_skb_set_dropcount(sk, skb);
 	__skb_queue_tail(list, skb);
 	spin_unlock_irqrestore(&list->lock, flags);
 
 	if (!sock_flag(sk, SOCK_DEAD))
 		sk->sk_data_ready(sk, skb_len);
 	return 0;
+}
+EXPORT_SYMBOL(__sock_queue_rcv_skb);
+
+int sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
+{
+	int err;
+
+	err = sk_filter(sk, skb);
+	if (err)
+		return err;
+
+	return __sock_queue_rcv_skb(sk, skb);
 }
 EXPORT_SYMBOL(sock_queue_rcv_skb);
 
@@ -496,6 +503,7 @@ struct dst_entry *__sk_dst_check(struct sock *sk, u32 cookie)
 
 	if (dst && dst->obsolete && dst->ops->check(dst, cookie) == NULL) {
 		sk_tx_queue_clear(sk);
+		sk->sk_dst_pending_confirm = 0;
 		RCU_INIT_POINTER(sk->sk_dst_cache, NULL);
 		dst_release(dst);
 		return NULL;
@@ -829,28 +837,20 @@ set_rcvbuf:
 		break;
 
 	case SO_TIMESTAMPING:
-		if (val & ~SOF_TIMESTAMPING_MASK) {
+		if (val & ~SOF_TIMESTAMPING_MASK ||
+		    val & __RH_RESERVED_SOF_TIMESTAMPING_OPT_ID ||
+		    val & __RH_RESERVED_SOF_TIMESTAMPING_TX_SCHED ||
+		    val & __RH_RESERVED_SOF_TIMESTAMPING_TX_ACK) {
 			ret = -EINVAL;
 			break;
 		}
-		sock_valbool_flag(sk, SOCK_TIMESTAMPING_TX_HARDWARE,
-				  val & SOF_TIMESTAMPING_TX_HARDWARE);
-		sock_valbool_flag(sk, SOCK_TIMESTAMPING_TX_SOFTWARE,
-				  val & SOF_TIMESTAMPING_TX_SOFTWARE);
-		sock_valbool_flag(sk, SOCK_TIMESTAMPING_RX_HARDWARE,
-				  val & SOF_TIMESTAMPING_RX_HARDWARE);
+		sk->sk_tsflags = val;
 		if (val & SOF_TIMESTAMPING_RX_SOFTWARE)
 			sock_enable_timestamp(sk,
 					      SOCK_TIMESTAMPING_RX_SOFTWARE);
 		else
 			sock_disable_timestamp(sk,
 					       (1UL << SOCK_TIMESTAMPING_RX_SOFTWARE));
-		sock_valbool_flag(sk, SOCK_TIMESTAMPING_SOFTWARE,
-				  val & SOF_TIMESTAMPING_SOFTWARE);
-		sock_valbool_flag(sk, SOCK_TIMESTAMPING_SYS_HARDWARE,
-				  val & SOF_TIMESTAMPING_SYS_HARDWARE);
-		sock_valbool_flag(sk, SOCK_TIMESTAMPING_RAW_HARDWARE,
-				  val & SOF_TIMESTAMPING_RAW_HARDWARE);
 		break;
 
 	case SO_RCVLOWAT:
@@ -1077,21 +1077,7 @@ int sock_getsockopt(struct socket *sock, int level, int optname,
 		break;
 
 	case SO_TIMESTAMPING:
-		v.val = 0;
-		if (sock_flag(sk, SOCK_TIMESTAMPING_TX_HARDWARE))
-			v.val |= SOF_TIMESTAMPING_TX_HARDWARE;
-		if (sock_flag(sk, SOCK_TIMESTAMPING_TX_SOFTWARE))
-			v.val |= SOF_TIMESTAMPING_TX_SOFTWARE;
-		if (sock_flag(sk, SOCK_TIMESTAMPING_RX_HARDWARE))
-			v.val |= SOF_TIMESTAMPING_RX_HARDWARE;
-		if (sock_flag(sk, SOCK_TIMESTAMPING_RX_SOFTWARE))
-			v.val |= SOF_TIMESTAMPING_RX_SOFTWARE;
-		if (sock_flag(sk, SOCK_TIMESTAMPING_SOFTWARE))
-			v.val |= SOF_TIMESTAMPING_SOFTWARE;
-		if (sock_flag(sk, SOCK_TIMESTAMPING_SYS_HARDWARE))
-			v.val |= SOF_TIMESTAMPING_SYS_HARDWARE;
-		if (sock_flag(sk, SOCK_TIMESTAMPING_RAW_HARDWARE))
-			v.val |= SOF_TIMESTAMPING_RAW_HARDWARE;
+		v.val = sk->sk_tsflags;
 		break;
 
 	case SO_RCVTIMEO:
@@ -1505,6 +1491,7 @@ struct sock *sk_clone_lock(const struct sock *sk, const gfp_t priority)
 				af_family_clock_key_strings[newsk->sk_family]);
 
 		newsk->sk_dst_cache	= NULL;
+		newsk->sk_dst_pending_confirm = 0;
 		newsk->sk_wmem_queued	= 0;
 		newsk->sk_forward_alloc = 0;
 		newsk->sk_send_head	= NULL;
@@ -1769,21 +1756,12 @@ struct sk_buff *sock_alloc_send_pskb(struct sock *sk, unsigned long header_len,
 				     unsigned long data_len, int noblock,
 				     int *errcode, int max_page_order)
 {
-	struct sk_buff *skb = NULL;
-	unsigned long chunk;
-	gfp_t gfp_mask;
+	struct sk_buff *skb;
 	long timeo;
 	int err;
-	int npages = (data_len + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
-	struct page *page;
-	int i;
-
-	err = -EMSGSIZE;
-	if (npages > MAX_SKB_FRAGS)
-		goto failure;
 
 	timeo = sock_sndtimeo(sk, noblock);
-	while (!skb) {
+	for (;;) {
 		err = sock_error(sk);
 		if (err != 0)
 			goto failure;
@@ -1792,66 +1770,27 @@ struct sk_buff *sock_alloc_send_pskb(struct sock *sk, unsigned long header_len,
 		if (sk->sk_shutdown & SEND_SHUTDOWN)
 			goto failure;
 
-		if (atomic_read(&sk->sk_wmem_alloc) >= sk->sk_sndbuf) {
-			set_bit(SOCK_ASYNC_NOSPACE, &sk->sk_socket->flags);
-			set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
-			err = -EAGAIN;
-			if (!timeo)
-				goto failure;
-			if (signal_pending(current))
-				goto interrupted;
-			timeo = sock_wait_for_wmem(sk, timeo);
-			continue;
-		}
+		if (sk_wmem_alloc_get(sk) < sk->sk_sndbuf)
+			break;
 
-		err = -ENOBUFS;
-		gfp_mask = sk->sk_allocation;
-		if (gfp_mask & __GFP_WAIT)
-			gfp_mask |= __GFP_REPEAT;
-
-		skb = alloc_skb(header_len, gfp_mask);
-		if (!skb)
+		set_bit(SOCK_ASYNC_NOSPACE, &sk->sk_socket->flags);
+		set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
+		err = -EAGAIN;
+		if (!timeo)
 			goto failure;
-
-		skb->truesize += data_len;
-
-		for (i = 0; npages > 0; i++) {
-			int order = max_page_order;
-
-			while (order) {
-				if (npages >= 1 << order) {
-					page = alloc_pages(sk->sk_allocation |
-							   __GFP_COMP |
-							   __GFP_NOWARN |
-							   __GFP_NORETRY,
-							   order);
-					if (page)
-						goto fill_page;
-					/* Do not retry other high order allocations */
-					order = 1;
-					max_page_order = 0;
-				}
-				order--;
-			}
-			page = alloc_page(sk->sk_allocation);
-			if (!page)
-				goto failure;
-fill_page:
-			chunk = min_t(unsigned long, data_len,
-				      PAGE_SIZE << order);
-			skb_fill_page_desc(skb, i, page, 0, chunk);
-			data_len -= chunk;
-			npages -= 1 << order;
-		}
+		if (signal_pending(current))
+			goto interrupted;
+		timeo = sock_wait_for_wmem(sk, timeo);
 	}
-
-	skb_set_owner_w(skb, sk);
+	skb = alloc_skb_with_frags(header_len, data_len, max_page_order,
+				   errcode, sk->sk_allocation);
+	if (skb)
+		skb_set_owner_w(skb, sk);
 	return skb;
 
 interrupted:
 	err = sock_intr_errno(timeo);
 failure:
-	kfree_skb(skb);
 	*errcode = err;
 	return NULL;
 }
@@ -2002,25 +1941,19 @@ int sk_wait_data(struct sock *sk, long *timeo, const struct sk_buff *skb)
 EXPORT_SYMBOL(sk_wait_data);
 
 /**
- *	__sk_mem_schedule - increase sk_forward_alloc and memory_allocated
+ *	__sk_mem_raise_allocated - increase memory_allocated
  *	@sk: socket
  *	@size: memory size to allocate
+ *	@amt: pages to allocate
  *	@kind: allocation type
  *
- *	If kind is SK_MEM_SEND, it means wmem allocation. Otherwise it means
- *	rmem allocation. This function assumes that protocols which have
- *	memory_pressure use sk_wmem_queued as write buffer accounting.
+ *	Similar to __sk_mem_schedule(), but does not update sk_forward_alloc
  */
-int __sk_mem_schedule(struct sock *sk, int size, int kind)
+int __sk_mem_raise_allocated(struct sock *sk, int size, int amt, int kind)
 {
 	struct proto *prot = sk->sk_prot;
-	int amt = sk_mem_pages(size);
-	long allocated;
 	int parent_status = UNDER_LIMIT;
-
-	sk->sk_forward_alloc += amt * SK_MEM_QUANTUM;
-
-	allocated = sk_memory_allocated_add(sk, amt, &parent_status);
+	long allocated = sk_memory_allocated_add(sk, amt, &parent_status);
 
 	/* Under limit. */
 	if (parent_status == UNDER_LIMIT &&
@@ -2080,29 +2013,61 @@ suppress_allocation:
 
 	trace_sock_exceed_buf_limit(sk, prot, allocated);
 
-	/* Alas. Undo changes. */
-	sk->sk_forward_alloc -= amt * SK_MEM_QUANTUM;
-
 	sk_memory_allocated_sub(sk, amt);
 
 	return 0;
 }
+EXPORT_SYMBOL(__sk_mem_raise_allocated);
+
+/**
+ *	__sk_mem_schedule - increase sk_forward_alloc and memory_allocated
+ *	@sk: socket
+ *	@size: memory size to allocate
+ *	@kind: allocation type
+ *
+ *	If kind is SK_MEM_SEND, it means wmem allocation. Otherwise it means
+ *	rmem allocation. This function assumes that protocols which have
+ *	memory_pressure use sk_wmem_queued as write buffer accounting.
+ */
+int __sk_mem_schedule(struct sock *sk, int size, int kind)
+{
+	int ret, amt = sk_mem_pages(size);
+
+	sk->sk_forward_alloc += amt << SK_MEM_QUANTUM_SHIFT;
+	ret = __sk_mem_raise_allocated(sk, size, amt, kind);
+	if (!ret)
+		sk->sk_forward_alloc -= amt << SK_MEM_QUANTUM_SHIFT;
+	return ret;
+}
 EXPORT_SYMBOL(__sk_mem_schedule);
 
 /**
- *	__sk_reclaim - reclaim memory_allocated
+ *	__sk_mem_reduce_allocated - reclaim memory_allocated
+ *	@sk: socket
+ *	@amount: number of quanta
+ *
+ *	Similar to __sk_mem_reclaim(), but does not update sk_forward_alloc
+ */
+void __sk_mem_reduce_allocated(struct sock *sk, int amount)
+{
+	sk_memory_allocated_sub(sk, amount);
+
+	if (sk_under_memory_pressure(sk) &&
+	    (sk_memory_allocated(sk) < sk_prot_mem_limits(sk, 0)))
+		sk_leave_memory_pressure(sk);
+}
+EXPORT_SYMBOL(__sk_mem_reduce_allocated);
+
+/**
+ *	__sk_mem_reclaim - reclaim sk_forward_alloc and memory_allocated
  *	@sk: socket
  *	@amount: number of bytes (rounded down to a SK_MEM_QUANTUM multiple)
  */
 void __sk_mem_reclaim(struct sock *sk, int amount)
 {
 	amount >>= SK_MEM_QUANTUM_SHIFT;
-	sk_memory_allocated_sub(sk, amount);
 	sk->sk_forward_alloc -= amount << SK_MEM_QUANTUM_SHIFT;
-
-	if (sk_under_memory_pressure(sk) &&
-	    (sk_memory_allocated(sk) < sk_prot_mem_limits(sk, 0)))
-		sk_leave_memory_pressure(sk);
+	__sk_mem_reduce_allocated(sk, amount);
 }
 EXPORT_SYMBOL(__sk_mem_reclaim);
 

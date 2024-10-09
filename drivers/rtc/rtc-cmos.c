@@ -697,6 +697,8 @@ cmos_do_probe(struct device *dev, struct resource *ports, int rtc_irq)
 		goto cleanup1;
 	}
 
+	hpet_rtc_timer_init();
+
 	if (is_valid_irq(rtc_irq)) {
 		irq_handler_t rtc_cmos_int_handler;
 
@@ -706,6 +708,7 @@ cmos_do_probe(struct device *dev, struct resource *ports, int rtc_irq)
 			rtc_cmos_int_handler = hpet_rtc_interrupt;
 			err = hpet_register_irq_handler(cmos_interrupt);
 			if (err != 0) {
+				hpet_mask_rtc_irq_bit(RTC_IRQMASK);
 				dev_warn(dev, "hpet_register_irq_handler "
 						" failed in rtc_init().");
 				goto cleanup1;
@@ -721,7 +724,6 @@ cmos_do_probe(struct device *dev, struct resource *ports, int rtc_irq)
 			goto cleanup1;
 		}
 	}
-	hpet_rtc_timer_init();
 
 	/* export at least the first block of NVRAM */
 	nvram.size = address_space - NVRAM_OFFSET;

@@ -137,7 +137,7 @@ static void fib_flush(struct net *net)
 		struct fib_table *tb;
 
 		hlist_for_each_entry_safe(tb, tmp, head, tb_hlist)
-			flushed += fib_table_flush(tb);
+			flushed += fib_table_flush(net, tb);
 	}
 
 	if (flushed)
@@ -499,13 +499,13 @@ int ip_rt_ioctl(struct net *net, unsigned int cmd, void __user *arg)
 			if (cmd == SIOCDELRT) {
 				tb = fib_get_table(net, cfg.fc_table);
 				if (tb)
-					err = fib_table_delete(tb, &cfg);
+					err = fib_table_delete(net, tb, &cfg);
 				else
 					err = -ESRCH;
 			} else {
 				tb = fib_new_table(net, cfg.fc_table);
 				if (tb)
-					err = fib_table_insert(tb, &cfg);
+					err = fib_table_insert(net, tb, &cfg);
 				else
 					err = -ENOBUFS;
 			}
@@ -628,7 +628,7 @@ static int inet_rtm_delroute(struct sk_buff *skb, struct nlmsghdr *nlh)
 		goto errout;
 	}
 
-	err = fib_table_delete(tb, &cfg);
+	err = fib_table_delete(net, tb, &cfg);
 errout:
 	return err;
 }
@@ -650,7 +650,7 @@ static int inet_rtm_newroute(struct sk_buff *skb, struct nlmsghdr *nlh)
 		goto errout;
 	}
 
-	err = fib_table_insert(tb, &cfg);
+	err = fib_table_insert(net, tb, &cfg);
 errout:
 	return err;
 }
@@ -737,9 +737,9 @@ static void fib_magic(int cmd, int type, __be32 dst, int dst_len, struct in_ifad
 		cfg.fc_scope = RT_SCOPE_HOST;
 
 	if (cmd == RTM_NEWROUTE)
-		fib_table_insert(tb, &cfg);
+		fib_table_insert(net, tb, &cfg);
 	else
-		fib_table_delete(tb, &cfg);
+		fib_table_delete(net, tb, &cfg);
 }
 
 void fib_add_ifaddr(struct in_ifaddr *ifa)
@@ -1112,6 +1112,8 @@ static int __net_init ip_fib_net_init(struct net *net)
 	int err;
 	size_t size = sizeof(struct hlist_head) * FIB_TABLE_HASHSZ;
 
+	net->ipv4.fib_seq = 0;
+
 	/* Avoid false sharing : Use at least a full cache line */
 	size = max_t(size_t, size, L1_CACHE_BYTES);
 
@@ -1149,7 +1151,7 @@ static void ip_fib_net_exit(struct net *net)
 		 * tnodes at the root as the table shrinks.
 		 */
 		hlist_for_each_entry_safe(tb, tmp, head, tb_hlist)
-			fib_table_flush(tb);
+			fib_table_flush(net, tb);
 
 		hlist_for_each_entry_safe(tb, tmp, head, tb_hlist) {
 #ifdef CONFIG_IP_MULTIPLE_TABLES

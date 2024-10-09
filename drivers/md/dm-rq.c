@@ -98,9 +98,7 @@ static void dm_mq_stop_queue(struct request_queue *q)
 	if (blk_mq_queue_stopped(q))
 		return;
 
-	/* Avoid that requeuing could restart the queue. */
-	blk_mq_cancel_requeue_work(q);
-	blk_mq_stop_hw_queues(q);
+	blk_mq_quiesce_queue(q);
 }
 
 void dm_stop_queue(struct request_queue *q)
@@ -241,7 +239,14 @@ static void free_rq_clone(struct request *clone)
 
 	blk_rq_unprep_clone(clone);
 
-	if (md->type == DM_TYPE_MQ_REQUEST_BASED)
+	/*
+	 * It is possible for a clone_old_rq() allocated clone to
+	 * get passed in -- it may not yet have a request_queue.
+	 * This is known to occur if the error target replaces
+	 * a multipath target that has a request_fn queue stacked
+	 * on blk-mq queue(s).
+	 */
+	if (clone->q && clone->q->mq_ops)
 		/* stacked on blk-mq queue(s) */
 		tio->ti->type->release_clone_rq(clone);
 	else if (!md->queue->mq_ops)
@@ -318,12 +323,7 @@ static void dm_old_requeue_request(struct request *rq)
 
 static void __dm_mq_kick_requeue_list(struct request_queue *q, unsigned long msecs)
 {
-	unsigned long flags;
-
-	spin_lock_irqsave(q->queue_lock, flags);
-	if (!blk_queue_stopped(q))
-		blk_mq_delay_kick_requeue_list(q, msecs);
-	spin_unlock_irqrestore(q->queue_lock, flags);
+	blk_mq_delay_kick_requeue_list(q, msecs);
 }
 
 void dm_mq_kick_requeue_list(struct mapped_device *md)
@@ -334,7 +334,7 @@ EXPORT_SYMBOL(dm_mq_kick_requeue_list);
 
 static void dm_mq_delay_requeue_request(struct request *rq, unsigned long msecs)
 {
-	blk_mq_requeue_request(rq);
+	blk_mq_requeue_request(rq, false);
 	__dm_mq_kick_requeue_list(rq->q, msecs);
 }
 
@@ -350,7 +350,7 @@ static void dm_requeue_original_request(struct dm_rq_target_io *tio, bool delay_
 	if (!rq->q->mq_ops)
 		dm_old_requeue_request(rq);
 	else
-		dm_mq_delay_requeue_request(rq, delay_requeue ? 5000 : 0);
+		dm_mq_delay_requeue_request(rq, delay_requeue ? 100/*ms*/ : 0);
 
 	rq_completed(md, rw, false);
 }
@@ -584,7 +584,7 @@ static struct dm_rq_target_io *dm_old_prep_tio(struct request *rq,
 	 * Must clone a request if this .request_fn DM device
 	 * is stacked on .request_fn device(s).
 	 */
-	if (!dm_table_mq_request_based(table)) {
+	if (!dm_table_all_blk_mq_devices(table)) {
 		if (!clone_old_rq(rq, md, tio, gfp_mask)) {
 			dm_put_live_table(md, srcu_idx);
 			free_old_rq_tio(tio);
@@ -735,7 +735,7 @@ ssize_t dm_attr_rq_based_seq_io_merge_deadline_store(struct mapped_device *md,
 {
 	unsigned deadline;
 
-	if (!dm_request_based(md) || md->use_blk_mq)
+	if (dm_get_md_type(md) != DM_TYPE_REQUEST_BASED)
 		return count;
 
 	if (kstrtouint(buf, 10, &deadline))
@@ -888,17 +888,6 @@ static int dm_mq_queue_rq(struct blk_mq_hw_ctx *hctx,
 		dm_put_live_table(md, srcu_idx);
 	}
 
-	/*
-	 * On suspend dm_stop_queue() handles stopping the blk-mq
-	 * request_queue BUT: even though the hw_queues are marked
-	 * BLK_MQ_S_STOPPED at that point there is still a race that
-	 * is allowing block/blk-mq.c to call ->queue_rq against a
-	 * hctx that it really shouldn't.  The following check guards
-	 * against this rarity (albeit _not_ race-free).
-	 */
-	if (unlikely(test_bit(BLK_MQ_S_STOPPED, &hctx->state)))
-		return BLK_MQ_RQ_QUEUE_BUSY;
-
 	if (ti->type->busy && ti->type->busy(ti))
 		return BLK_MQ_RQ_QUEUE_BUSY;
 
@@ -930,12 +919,13 @@ static struct blk_mq_ops dm_mq_ops = {
 	.init_request = dm_mq_init_request,
 };
 
-int dm_mq_init_request_queue(struct mapped_device *md, struct dm_target *immutable_tgt)
+int dm_mq_init_request_queue(struct mapped_device *md, struct dm_table *t)
 {
 	struct request_queue *q;
+	struct dm_target *immutable_tgt;
 	int err;
 
-	if (dm_get_md_type(md) == DM_TYPE_REQUEST_BASED) {
+	if (!dm_table_all_blk_mq_devices(t)) {
 		DMERR("request-based dm-mq may only be stacked on blk-mq device(s)");
 		return -EINVAL;
 	}
@@ -952,6 +942,7 @@ int dm_mq_init_request_queue(struct mapped_device *md, struct dm_target *immutab
 	md->tag_set->driver_data = md;
 
 	md->tag_set->cmd_size = sizeof(struct dm_rq_target_io);
+	immutable_tgt = dm_table_get_immutable_target(t);
 	if (immutable_tgt && immutable_tgt->per_io_data_size) {
 		/* any target-specific per-io data is immediately after the tio */
 		md->tag_set->cmd_size += immutable_tgt->per_io_data_size;

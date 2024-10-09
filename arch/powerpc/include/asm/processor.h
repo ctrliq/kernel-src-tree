@@ -44,6 +44,7 @@
 #include <asm/ptrace.h>
 #include <asm/types.h>
 #include <asm/hw_breakpoint.h>
+#include <linux/rh_kabi.h>
 
 /* We do _not_ want to define new machine types at all, those must die
  * in favor of using the device-tree
@@ -310,6 +311,7 @@ struct thread_struct {
 	u64		tm_tfhar;	/* Transaction fail handler addr */
 	u64		tm_texasr;	/* Transaction exception & summary */
 	u64		tm_tfiar;	/* Transaction fail instr address reg */
+	RH_KABI_DEPRECATE(unsigned long, tm_orig_msr)	/* Thread's MSR on ctx switch */
 	struct pt_regs	ckpt_regs;	/* Checkpointed registers */
 
 	unsigned long	tm_tar;

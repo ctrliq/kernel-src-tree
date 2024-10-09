@@ -12,6 +12,7 @@
 #include <linux/hw_breakpoint.h>
 #include <linux/trace_seq.h>
 #include <linux/ftrace_event.h>
+#include <linux/compiler.h>
 
 #ifdef CONFIG_FTRACE_SYSCALLS
 #include <asm/unistd.h>		/* For NR_SYSCALLS	     */
@@ -35,6 +36,7 @@ enum trace_type {
 	TRACE_USER_STACK,
 	TRACE_BLK,
 	TRACE_BPUTS,
+	TRACE_HWLAT,
 
 	__TRACE_LAST_TYPE,
 };
@@ -195,6 +197,9 @@ struct trace_array {
 	struct trace_buffer	max_buffer;
 	bool			allocated_snapshot;
 #endif
+#if defined(CONFIG_TRACER_MAX_TRACE) || defined(CONFIG_HWLAT_TRACER)
+	unsigned long		max_latency;
+#endif
 	int			buffer_disabled;
 	struct trace_cpu	trace_cpu;	/* place holder */
 #ifdef CONFIG_FTRACE_SYSCALLS
@@ -215,6 +220,7 @@ struct trace_array {
 	struct list_head	systems;
 	struct list_head	events;
 	struct task_struct	*waiter;
+	cpumask_var_t		tracing_cpumask; /* only trace on set CPUs */
 	int			ref;
 };
 
@@ -279,6 +285,7 @@ extern void __ftrace_bad_type(void);
 		IF_ASSIGN(var, ent, struct print_entry, TRACE_PRINT);	\
 		IF_ASSIGN(var, ent, struct bprint_entry, TRACE_BPRINT);	\
 		IF_ASSIGN(var, ent, struct bputs_entry, TRACE_BPUTS);	\
+		IF_ASSIGN(var, ent, struct hwlat_entry, TRACE_HWLAT);	\
 		IF_ASSIGN(var, ent, struct trace_mmiotrace_rw,		\
 			  TRACE_MMIO_RW);				\
 		IF_ASSIGN(var, ent, struct trace_mmiotrace_map,		\
@@ -370,6 +377,7 @@ struct tracer {
 	struct tracer_flags	*flags;
 	bool			print_max;
 	bool			enabled;
+	bool			allow_instances;
 #ifdef CONFIG_TRACER_MAX_TRACE
 	bool			use_max_tr;
 #endif
@@ -523,6 +531,7 @@ void tracing_reset_online_cpus(struct trace_buffer *buf);
 void tracing_reset_current(int cpu);
 void tracing_reset_all_online_cpus(void);
 int tracing_open_generic(struct inode *inode, struct file *filp);
+int tracer_tracing_is_on(struct trace_array *tr);
 struct dentry *trace_create_file(const char *name,
 				 umode_t mode,
 				 struct dentry *parent,
@@ -609,8 +618,6 @@ extern unsigned long nsecs_to_usecs(unsigned long nsecs);
 extern unsigned long tracing_thresh;
 
 #ifdef CONFIG_TRACER_MAX_TRACE
-extern unsigned long tracing_max_latency;
-
 void update_max_tr(struct trace_array *tr, struct task_struct *tsk, int cpu);
 void update_max_tr_single(struct trace_array *tr,
 			  struct task_struct *tsk, int cpu);
@@ -1052,7 +1059,7 @@ int set_tracer_flag(struct trace_array *tr, unsigned int mask, int enabled);
 #undef FTRACE_ENTRY
 #define FTRACE_ENTRY(call, struct_name, id, tstruct, print, filter)	\
 	extern struct ftrace_event_call					\
-	__attribute__((__aligned__(4))) event_##call;
+	__aligned(4) event_##call;
 #undef FTRACE_ENTRY_DUP
 #define FTRACE_ENTRY_DUP(call, struct_name, id, tstruct, print, filter)	\
 	FTRACE_ENTRY(call, struct_name, id, PARAMS(tstruct), PARAMS(print), \

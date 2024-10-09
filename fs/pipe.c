@@ -418,7 +418,7 @@ pipe_read(struct kiocb *iocb, const struct iovec *_iov,
 				break;
 			}
 
-			atomic = !iov_fault_in_pages_write(iov, chars);
+			atomic = IS_ENABLED(CONFIG_HIGHMEM) && !iov_fault_in_pages_write(iov, chars);
 			remaining = chars;
 			offset = buf->offset;
 redo:
@@ -542,7 +542,7 @@ pipe_write(struct kiocb *iocb, const struct iovec *_iov,
 		int offset = buf->offset + buf->len;
 
 		if (ops->can_merge && offset + chars <= PAGE_SIZE) {
-			int error, atomic = 1;
+			int error, atomic = IS_ENABLED(CONFIG_HIGHMEM);
 			void *addr;
 			size_t remaining = chars;
 
@@ -550,7 +550,8 @@ pipe_write(struct kiocb *iocb, const struct iovec *_iov,
 			if (error)
 				goto out;
 
-			iov_fault_in_pages_read(iov, chars);
+			if (IS_ENABLED(CONFIG_HIGHMEM))
+				iov_fault_in_pages_read(iov, chars);
 redo1:
 			addr = ops->map(pipe, buf, atomic);
 			error = pipe_iov_copy_from_user(addr, &offset, iov,
@@ -588,7 +589,7 @@ redo1:
 			struct pipe_buffer *buf = pipe->bufs + newbuf;
 			struct page *page = pipe->tmp_page;
 			char *src;
-			int error, atomic = 1;
+			int error, atomic = IS_ENABLED(CONFIG_HIGHMEM);
 			int offset = 0;
 			size_t remaining;
 
@@ -610,7 +611,8 @@ redo1:
 			if (chars > total_len)
 				chars = total_len;
 
-			iov_fault_in_pages_read(iov, chars);
+			if (IS_ENABLED(CONFIG_HIGHMEM))
+				iov_fault_in_pages_read(iov, chars);
 			remaining = chars;
 redo2:
 			if (atomic)

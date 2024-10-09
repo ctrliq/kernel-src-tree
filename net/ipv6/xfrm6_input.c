@@ -61,7 +61,6 @@ int xfrm6_rcv(struct sk_buff *skb)
 {
 	return xfrm6_rcv_tnl(skb, NULL);
 }
-
 EXPORT_SYMBOL(xfrm6_rcv);
 int xfrm6_input_addr(struct sk_buff *skb, xfrm_address_t *daddr,
 		     xfrm_address_t *saddr, u8 proto)

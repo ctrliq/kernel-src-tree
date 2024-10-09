@@ -154,8 +154,8 @@ make_checksum_hmac_md5(struct krb5_ctx *kctx, char *header, int hdrlen,
 {
 	struct hash_desc                desc;
 	struct scatterlist              sg[1];
-	int err;
-	u8 checksumdata[GSS_KRB5_MAX_CKSUM_LEN];
+	int err = -1;
+	u8 *checksumdata;
 	u8 rc4salt[4];
 	struct crypto_hash *md5;
 	struct crypto_hash *hmac_md5;
@@ -174,16 +174,18 @@ make_checksum_hmac_md5(struct krb5_ctx *kctx, char *header, int hdrlen,
 		return GSS_S_FAILURE;
 	}
 
-	md5 = crypto_alloc_hash("md5", 0, CRYPTO_ALG_ASYNC);
-	if (IS_ERR(md5))
+	checksumdata = kmalloc(GSS_KRB5_MAX_CKSUM_LEN, GFP_NOFS);
+	if (!checksumdata)
 		return GSS_S_FAILURE;
 
+	md5 = crypto_alloc_hash("md5", 0, CRYPTO_ALG_ASYNC);
+	if (IS_ERR(md5))
+		goto out_free_cksum;
+
 	hmac_md5 = crypto_alloc_hash(kctx->gk5e->cksum_name, 0,
-				     CRYPTO_ALG_ASYNC);
-	if (IS_ERR(hmac_md5)) {
-		crypto_free_hash(md5);
-		return GSS_S_FAILURE;
-	}
+				      CRYPTO_ALG_ASYNC);
+	if (IS_ERR(hmac_md5))
+		goto out_free_md5;
 
 	desc.tfm = md5;
 	desc.flags = CRYPTO_TFM_REQ_MAY_SLEEP;
@@ -227,8 +229,11 @@ make_checksum_hmac_md5(struct krb5_ctx *kctx, char *header, int hdrlen,
 	memcpy(cksumout->data, checksumdata, kctx->gk5e->cksumlength);
 	cksumout->len = kctx->gk5e->cksumlength;
 out:
-	crypto_free_hash(md5);
 	crypto_free_hash(hmac_md5);
+out_free_md5:
+	crypto_free_hash(md5);
+out_free_cksum:
+	kfree(checksumdata);
 	return err ? GSS_S_FAILURE : 0;
 }
 
@@ -244,8 +249,8 @@ make_checksum(struct krb5_ctx *kctx, char *header, int hdrlen,
 {
 	struct hash_desc                desc;
 	struct scatterlist              sg[1];
-	int err;
-	u8 checksumdata[GSS_KRB5_MAX_CKSUM_LEN];
+	int err = -1;
+	u8 *checksumdata;
 	unsigned int checksumlen;
 
 	if (kctx->gk5e->ctype == CKSUMTYPE_HMAC_MD5_ARCFOUR)
@@ -259,9 +264,13 @@ make_checksum(struct krb5_ctx *kctx, char *header, int hdrlen,
 		return GSS_S_FAILURE;
 	}
 
+	checksumdata = kmalloc(GSS_KRB5_MAX_CKSUM_LEN, GFP_NOFS);
+	if (checksumdata == NULL)
+		return GSS_S_FAILURE;
+
 	desc.tfm = crypto_alloc_hash(kctx->gk5e->cksum_name, 0, CRYPTO_ALG_ASYNC);
 	if (IS_ERR(desc.tfm))
-		return GSS_S_FAILURE;
+		goto out_free_cksum;
 	desc.flags = CRYPTO_TFM_REQ_MAY_SLEEP;
 
 	checksumlen = crypto_hash_digestsize(desc.tfm);
@@ -308,6 +317,8 @@ make_checksum(struct krb5_ctx *kctx, char *header, int hdrlen,
 	cksumout->len = kctx->gk5e->cksumlength;
 out:
 	crypto_free_hash(desc.tfm);
+out_free_cksum:
+	kfree(checksumdata);
 	return err ? GSS_S_FAILURE : 0;
 }
 
@@ -325,8 +336,8 @@ make_checksum_v2(struct krb5_ctx *kctx, char *header, int hdrlen,
 {
 	struct hash_desc desc;
 	struct scatterlist sg[1];
-	int err;
-	u8 checksumdata[GSS_KRB5_MAX_CKSUM_LEN];
+	int err = -1;
+	u8 *checksumdata;
 	unsigned int checksumlen;
 
 	if (kctx->gk5e->keyed_cksum == 0) {
@@ -340,10 +351,14 @@ make_checksum_v2(struct krb5_ctx *kctx, char *header, int hdrlen,
 		return GSS_S_FAILURE;
 	}
 
+	checksumdata = kmalloc(GSS_KRB5_MAX_CKSUM_LEN, GFP_NOFS);
+	if (!checksumdata)
+		return GSS_S_FAILURE;
+
 	desc.tfm = crypto_alloc_hash(kctx->gk5e->cksum_name, 0,
 							CRYPTO_ALG_ASYNC);
 	if (IS_ERR(desc.tfm))
-		return GSS_S_FAILURE;
+		goto out_free_cksum;
 	checksumlen = crypto_hash_digestsize(desc.tfm);
 	desc.flags = CRYPTO_TFM_REQ_MAY_SLEEP;
 
@@ -382,6 +397,8 @@ make_checksum_v2(struct krb5_ctx *kctx, char *header, int hdrlen,
 	}
 out:
 	crypto_free_hash(desc.tfm);
+out_free_cksum:
+	kfree(checksumdata);
 	return err ? GSS_S_FAILURE : 0;
 }
 
@@ -600,14 +617,17 @@ gss_krb5_cts_crypt(struct crypto_blkcipher *cipher, struct xdr_buf *buf,
 	u32 ret;
 	struct scatterlist sg[1];
 	struct blkcipher_desc desc = { .tfm = cipher, .info = iv };
-	u8 data[GSS_KRB5_MAX_BLOCKSIZE * 2];
+	u8 *data;
 	struct page **save_pages;
 	u32 len = buf->len - offset;
 
-	if (len > ARRAY_SIZE(data)) {
+	if (len > GSS_KRB5_MAX_BLOCKSIZE * 2) {
 		WARN_ON(0);
 		return -ENOMEM;
 	}
+	data = kmalloc(GSS_KRB5_MAX_BLOCKSIZE * 2, GFP_NOFS);
+	if (!data)
+		return -ENOMEM;
 
 	/*
 	 * For encryption, we want to read from the cleartext
@@ -636,6 +656,7 @@ gss_krb5_cts_crypt(struct crypto_blkcipher *cipher, struct xdr_buf *buf,
 	ret = write_bytes_to_xdr_buf(buf, offset, data, len);
 
 out:
+	kfree(data);
 	return ret;
 }
 

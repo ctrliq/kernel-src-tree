@@ -44,6 +44,9 @@
 #define BIO_MAX_SIZE		(BIO_MAX_PAGES << PAGE_CACHE_SHIFT)
 #define BIO_MAX_SECTORS		(BIO_MAX_SIZE >> 9)
 
+#define bio_op(bio)				(op_from_rq_bits((bio)->bi_rw))
+#define bio_set_op_attrs(bio, op, flags)	((bio)->bi_rw |= (op | flags))
+
 /*
  * upper 16 bits of bi_rw define the io priority of this bio
  */
@@ -261,6 +264,7 @@ extern int submit_bio_wait(int rw, struct bio *bio);
 extern void bio_advance(struct bio *, unsigned);
 
 extern void bio_init(struct bio *);
+extern void bio_init_aux(struct bio *bio, struct bio_aux *bio_aux);
 extern void bio_reset(struct bio *);
 void bio_chain(struct bio *, struct bio *);
 

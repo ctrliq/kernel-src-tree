@@ -22,6 +22,8 @@
 #include <linux/err.h>
 #include <linux/slab.h>
 #include <linux/of.h>
+#include <linux/gpio.h>
+#include <linux/idr.h>
 
 #define MII_REGS_NUM 29
 
@@ -38,6 +40,7 @@ struct fixed_phy {
 	struct fixed_phy_status status;
 	int (*link_update)(struct net_device *, struct fixed_phy_status *);
 	struct list_head node;
+	int link_gpio;
 };
 
 static struct platform_device *pdev;
@@ -51,6 +54,9 @@ static int fixed_phy_update_regs(struct fixed_phy *fp)
 	u16 bmcr = 0;
 	u16 lpagb = 0;
 	u16 lpa = 0;
+
+	if (gpio_is_valid(fp->link_gpio))
+		fp->status.link = !!gpio_get_value_cansleep(fp->link_gpio);
 
 	if (!fp->status.link)
 		goto done;
@@ -215,7 +221,8 @@ int fixed_phy_update_state(struct phy_device *phydev,
 EXPORT_SYMBOL(fixed_phy_update_state);
 
 int fixed_phy_add(unsigned int irq, int phy_addr,
-		  struct fixed_phy_status *status)
+		  struct fixed_phy_status *status,
+		  int link_gpio)
 {
 	int ret;
 	struct fixed_mdio_bus *fmb = &platform_fmb;
@@ -231,22 +238,35 @@ int fixed_phy_add(unsigned int irq, int phy_addr,
 
 	fp->addr = phy_addr;
 	fp->status = *status;
+	fp->link_gpio = link_gpio;
+
+	if (gpio_is_valid(fp->link_gpio)) {
+		ret = gpio_request_one(fp->link_gpio, GPIOF_DIR_IN,
+				       "fixed-link-gpio-link");
+		if (ret)
+			goto err_regs;
+	}
 
 	ret = fixed_phy_update_regs(fp);
 	if (ret)
-		goto err_regs;
+		goto err_gpio;
 
 	list_add_tail(&fp->node, &fmb->phys);
 
 	return 0;
 
+err_gpio:
+	if (gpio_is_valid(fp->link_gpio))
+		gpio_free(fp->link_gpio);
 err_regs:
 	kfree(fp);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(fixed_phy_add);
 
-void fixed_phy_del(int phy_addr)
+static DEFINE_IDA(phy_fixed_ida);
+
+static void fixed_phy_del(int phy_addr)
 {
 	struct fixed_mdio_bus *fmb = &platform_fmb;
 	struct fixed_phy *fp, *tmp;
@@ -254,19 +274,19 @@ void fixed_phy_del(int phy_addr)
 	list_for_each_entry_safe(fp, tmp, &fmb->phys, node) {
 		if (fp->addr == phy_addr) {
 			list_del(&fp->node);
+			if (gpio_is_valid(fp->link_gpio))
+				gpio_free(fp->link_gpio);
 			kfree(fp);
+			ida_simple_remove(&phy_fixed_ida, phy_addr);
 			return;
 		}
 	}
 }
-EXPORT_SYMBOL_GPL(fixed_phy_del);
 
-static int phy_fixed_addr;
-static DEFINE_SPINLOCK(phy_fixed_addr_lock);
-
-int fixed_phy_register(unsigned int irq,
-		       struct fixed_phy_status *status,
-		       struct device_node *np)
+struct phy_device *fixed_phy_register(unsigned int irq,
+				      struct fixed_phy_status *status,
+				      int link_gpio,
+				      struct device_node *np)
 {
 	struct fixed_mdio_bus *fmb = &platform_fmb;
 	struct phy_device *phy;
@@ -274,22 +294,20 @@ int fixed_phy_register(unsigned int irq,
 	int ret;
 
 	/* Get the next available PHY address, up to PHY_MAX_ADDR */
-	spin_lock(&phy_fixed_addr_lock);
-	if (phy_fixed_addr == PHY_MAX_ADDR) {
-		spin_unlock(&phy_fixed_addr_lock);
-		return -ENOSPC;
-	}
-	phy_addr = phy_fixed_addr++;
-	spin_unlock(&phy_fixed_addr_lock);
+	phy_addr = ida_simple_get(&phy_fixed_ida, 0, PHY_MAX_ADDR, GFP_KERNEL);
+	if (phy_addr < 0)
+		return ERR_PTR(phy_addr);
 
-	ret = fixed_phy_add(PHY_POLL, phy_addr, status);
-	if (ret < 0)
-		return ret;
+	ret = fixed_phy_add(irq, phy_addr, status, link_gpio);
+	if (ret < 0) {
+		ida_simple_remove(&phy_fixed_ida, phy_addr);
+		return ERR_PTR(ret);
+	}
 
 	phy = get_phy_device(fmb->mii_bus, phy_addr, false);
 	if (!phy || IS_ERR(phy)) {
 		fixed_phy_del(phy_addr);
-		return -EINVAL;
+		return ERR_PTR(-EINVAL);
 	}
 
 	of_node_get(np);
@@ -300,12 +318,20 @@ int fixed_phy_register(unsigned int irq,
 		phy_device_free(phy);
 		of_node_put(np);
 		fixed_phy_del(phy_addr);
-		return ret;
+		return ERR_PTR(ret);
 	}
 
-	return 0;
+	return phy;
 }
 EXPORT_SYMBOL_GPL(fixed_phy_register);
+
+void fixed_phy_unregister(struct phy_device *phy)
+{
+	phy_device_remove(phy);
+	of_node_put(phy->dev.of_node);
+	fixed_phy_del(phy->addr);
+}
+EXPORT_SYMBOL_GPL(fixed_phy_unregister);
 
 static int __init fixed_mdio_bus_init(void)
 {
@@ -360,6 +386,7 @@ static void __exit fixed_mdio_bus_exit(void)
 		list_del(&fp->node);
 		kfree(fp);
 	}
+	ida_destroy(&phy_fixed_ida);
 }
 module_exit(fixed_mdio_bus_exit);
 

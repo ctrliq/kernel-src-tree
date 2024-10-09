@@ -37,7 +37,7 @@
 
 struct dsmark_qdisc_data {
 	struct Qdisc		*q;
-	struct tcf_proto	*filter_list;
+	struct tcf_proto __rcu	*filter_list;
 	u8			*mask;	/* "owns" the array */
 	u8			*value;
 	u16			indices;
@@ -179,8 +179,8 @@ ignore:
 	}
 }
 
-static inline struct tcf_proto **dsmark_find_tcf(struct Qdisc *sch,
-						 unsigned long cl)
+static inline struct tcf_proto __rcu **dsmark_find_tcf(struct Qdisc *sch,
+						       unsigned long cl)
 {
 	struct dsmark_qdisc_data *p = qdisc_priv(sch);
 	return &p->filter_list;
@@ -196,7 +196,7 @@ static int dsmark_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 	pr_debug("dsmark_enqueue(skb %p,sch %p,[qdisc %p])\n", skb, sch, p);
 
 	if (p->set_tc_index) {
-		switch (skb->protocol) {
+		switch (tc_skb_protocol(skb)) {
 		case htons(ETH_P_IP):
 			if (skb_cow_head(skb, sizeof(struct iphdr)))
 				goto drop;
@@ -222,7 +222,8 @@ static int dsmark_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 		skb->tc_index = TC_H_MIN(skb->priority);
 	else {
 		struct tcf_result res;
-		int result = tc_classify(skb, p->filter_list, &res);
+		struct tcf_proto *fl = rcu_dereference_bh(p->filter_list);
+		int result = tc_classify(skb, fl, &res);
 
 		pr_debug("result %d class 0x%04x\n", result, res.classid);
 
@@ -283,7 +284,7 @@ static struct sk_buff *dsmark_dequeue(struct Qdisc *sch)
 	index = skb->tc_index & (p->indices - 1);
 	pr_debug("index %d->%d\n", skb->tc_index, index);
 
-	switch (skb->protocol) {
+	switch (tc_skb_protocol(skb)) {
 	case htons(ETH_P_IP):
 		ipv4_change_dsfield(ip_hdr(skb), p->mask[index],
 				    p->value[index]);
@@ -299,8 +300,8 @@ static struct sk_buff *dsmark_dequeue(struct Qdisc *sch)
 		 * and don't need yet another qdisc as a bypass.
 		 */
 		if (p->mask[index] != 0xff || p->value[index])
-			pr_warning("dsmark_dequeue: unsupported protocol %d\n",
-				   ntohs(skb->protocol));
+			pr_warn("%s: unsupported protocol %d\n",
+				__func__, ntohs(tc_skb_protocol(skb)));
 		break;
 	}
 

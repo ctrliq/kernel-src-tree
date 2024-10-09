@@ -239,8 +239,8 @@ struct rpc_task *rpc_wake_up_first(struct rpc_wait_queue *,
 					void *);
 void		rpc_wake_up_status(struct rpc_wait_queue *, int);
 void		rpc_delay(struct rpc_task *, unsigned long);
-void *		rpc_malloc(struct rpc_task *, size_t);
-void		rpc_free(void *);
+int		rpc_malloc(struct rpc_task *);
+void		rpc_free(struct rpc_task *);
 int		rpciod_up(void);
 void		rpciod_down(void);
 int		__rpc_wait_for_completion_task(struct rpc_task *task, wait_bit_action_f *);
@@ -251,6 +251,7 @@ void		rpc_show_tasks(struct net *);
 int		rpc_init_mempool(void);
 void		rpc_destroy_mempool(void);
 extern struct workqueue_struct *rpciod_workqueue;
+extern struct workqueue_struct *xprtiod_workqueue;
 void		rpc_prepare_task(struct rpc_task *task);
 
 static inline int rpc_wait_for_completion_task(struct rpc_task *task)

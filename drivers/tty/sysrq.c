@@ -333,7 +333,7 @@ static void send_sig_all(int sig)
 {
 	struct task_struct *p;
 
-	read_lock(&tasklist_lock);
+	qread_lock(&tasklist_lock);
 	for_each_process(p) {
 		if (p->flags & PF_KTHREAD)
 			continue;
@@ -342,7 +342,7 @@ static void send_sig_all(int sig)
 
 		do_send_sig_info(sig, SEND_SIG_FORCED, p, true);
 	}
-	read_unlock(&tasklist_lock);
+	qread_unlock(&tasklist_lock);
 }
 
 static void sysrq_handle_term(int key)

@@ -22,14 +22,14 @@
 #include <linux/virtio.h>
 #include <linux/virtio_balloon.h>
 #include <linux/swap.h>
-#include <linux/kthread.h>
-#include <linux/freezer.h>
+#include <linux/workqueue.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
 #include <linux/module.h>
 #include <linux/balloon_compaction.h>
 #include <linux/oom.h>
 #include <linux/mm.h>
+#include <linux/wait.h>
 
 /*
  * Balloon device works in 4K page units.  So each page is pointed to by
@@ -49,11 +49,13 @@ struct virtio_balloon {
 	struct virtio_device *vdev;
 	struct virtqueue *inflate_vq, *deflate_vq, *stats_vq;
 
-	/* Where the ballooning thread waits for config to change. */
-	wait_queue_head_t config_change;
+	/* The balloon servicing is delegated to a freezable workqueue. */
+	struct work_struct update_balloon_stats_work;
+	struct work_struct update_balloon_size_work;
 
-	/* The thread servicing the balloon. */
-	struct task_struct *thread;
+	/* Prevent updating balloon when it is being canceled. */
+	spinlock_t stop_update_lock;
+	bool stop_update;
 
 	/* Waiting for host to ack the pages we released. */
 	wait_queue_head_t acked;
@@ -76,7 +78,6 @@ struct virtio_balloon {
 	__virtio32 pfns[VIRTIO_BALLOON_ARRAY_PFNS_MAX];
 
 	/* Memory statistics */
-	int need_stats_update;
 	struct virtio_balloon_stat stats[VIRTIO_BALLOON_S_NR];
 
 	/* To register callback in oom notifier call chain */
@@ -123,6 +124,7 @@ static void tell_host(struct virtio_balloon *vb, struct virtqueue *vq)
 
 	/* When host has read buffer, this completes via balloon_ack */
 	wait_event(vb->acked, virtqueue_get_buf(vq, &len));
+
 }
 
 static void set_page_pfns(struct virtio_balloon *vb,
@@ -137,9 +139,10 @@ static void set_page_pfns(struct virtio_balloon *vb,
 					  page_to_balloon_pfn(page) + i);
 }
 
-static void fill_balloon(struct virtio_balloon *vb, size_t num)
+static unsigned fill_balloon(struct virtio_balloon *vb, size_t num)
 {
 	struct balloon_dev_info *vb_dev_info = &vb->vb_dev_info;
+	unsigned num_allocated_pages;
 
 	/* We can only do one array worth at a time. */
 	num = min(num, ARRAY_SIZE(vb->pfns));
@@ -164,10 +167,13 @@ static void fill_balloon(struct virtio_balloon *vb, size_t num)
 			adjust_managed_page_count(page, -1);
 	}
 
+	num_allocated_pages = vb->num_pfns;
 	/* Did we get any? */
 	if (vb->num_pfns != 0)
 		tell_host(vb, vb->inflate_vq);
 	mutex_unlock(&vb->balloon_lock);
+
+	return num_allocated_pages;
 }
 
 static void release_pages_balloon(struct virtio_balloon *vb)
@@ -230,11 +236,11 @@ static inline void update_stat(struct virtio_balloon *vb, int idx,
 
 #define pages_to_bytes(x) ((u64)(x) << PAGE_SHIFT)
 
-static void update_balloon_stats(struct virtio_balloon *vb)
+static unsigned int update_balloon_stats(struct virtio_balloon *vb)
 {
 	unsigned long events[NR_VM_EVENT_ITEMS];
 	struct sysinfo i;
-	int idx = 0;
+	unsigned int idx = 0;
 	long available;
 
 	all_vm_events(events);
@@ -256,6 +262,8 @@ static void update_balloon_stats(struct virtio_balloon *vb)
 				pages_to_bytes(i.totalram));
 	update_stat(vb, idx++, VIRTIO_BALLOON_S_AVAIL,
 				pages_to_bytes(available));
+
+	return idx;
 }
 
 /*
@@ -264,29 +272,31 @@ static void update_balloon_stats(struct virtio_balloon *vb)
  * with a single buffer.  From that point forward, all conversations consist of
  * a hypervisor request (a call to this function) which directs us to refill
  * the virtqueue with a fresh stats buffer.  Since stats collection can sleep,
- * we notify our kthread which does the actual work via stats_handle_request().
+ * we delegate the job to a freezable workqueue that will do the actual work via
+ * stats_handle_request().
  */
 static void stats_request(struct virtqueue *vq)
 {
 	struct virtio_balloon *vb = vq->vdev->priv;
 
-	vb->need_stats_update = 1;
-	wake_up(&vb->config_change);
+	spin_lock(&vb->stop_update_lock);
+	if (!vb->stop_update)
+		queue_work(system_freezable_wq, &vb->update_balloon_stats_work);
+	spin_unlock(&vb->stop_update_lock);
 }
 
 static void stats_handle_request(struct virtio_balloon *vb)
 {
 	struct virtqueue *vq;
 	struct scatterlist sg;
-	unsigned int len;
+	unsigned int len, num_stats;
 
-	vb->need_stats_update = 0;
-	update_balloon_stats(vb);
+	num_stats = update_balloon_stats(vb);
 
 	vq = vb->stats_vq;
 	if (!virtqueue_get_buf(vq, &len))
 		return;
-	sg_init_one(&sg, vb->stats, sizeof(vb->stats));
+	sg_init_one(&sg, vb->stats, sizeof(vb->stats[0]) * num_stats);
 	virtqueue_add_outbuf(vq, &sg, 1, vb, GFP_KERNEL);
 	virtqueue_kick(vq);
 }
@@ -294,8 +304,12 @@ static void stats_handle_request(struct virtio_balloon *vb)
 static void virtballoon_changed(struct virtio_device *vdev)
 {
 	struct virtio_balloon *vb = vdev->priv;
+	unsigned long flags;
 
-	wake_up(&vb->config_change);
+	spin_lock_irqsave(&vb->stop_update_lock, flags);
+	if (!vb->stop_update)
+		queue_work(system_freezable_wq, &vb->update_balloon_size_work);
+	spin_unlock_irqrestore(&vb->stop_update_lock, flags);
 }
 
 static inline s64 towards_target(struct virtio_balloon *vb)
@@ -358,42 +372,39 @@ static int virtballoon_oom_notify(struct notifier_block *self,
 	return NOTIFY_OK;
 }
 
-static int balloon(void *_vballoon)
+static void update_balloon_stats_func(struct work_struct *work)
 {
-	struct virtio_balloon *vb = _vballoon;
+	struct virtio_balloon *vb;
 
-	set_freezable();
-	while (!kthread_should_stop()) {
-		s64 diff;
+	vb = container_of(work, struct virtio_balloon,
+			  update_balloon_stats_work);
+	stats_handle_request(vb);
+}
 
-		try_to_freeze();
-		wait_event_interruptible(vb->config_change,
-					 (diff = towards_target(vb)) != 0
-					 || vb->need_stats_update
-					 || kthread_should_stop()
-					 || freezing(current));
-		if (vb->need_stats_update)
-			stats_handle_request(vb);
-		if (diff > 0)
-			fill_balloon(vb, diff);
-		else if (diff < 0)
-			leak_balloon(vb, -diff);
-		update_balloon_size(vb);
+static void update_balloon_size_func(struct work_struct *work)
+{
+	struct virtio_balloon *vb;
+	s64 diff;
 
-		/*
-		 * For large balloon changes, we could spend a lot of time
-		 * and always have work to do.  Be nice if preempt disabled.
-		 */
-		cond_resched();
-	}
-	return 0;
+	vb = container_of(work, struct virtio_balloon,
+			  update_balloon_size_work);
+	diff = towards_target(vb);
+
+	if (diff > 0)
+		diff -= fill_balloon(vb, diff);
+	else if (diff < 0)
+		diff += leak_balloon(vb, -diff);
+	update_balloon_size(vb);
+
+	if (diff)
+		queue_work(system_freezable_wq, work);
 }
 
 static int init_vqs(struct virtio_balloon *vb)
 {
 	struct virtqueue *vqs[3];
 	vq_callback_t *callbacks[] = { balloon_ack, balloon_ack, stats_request };
-	const char *names[] = { "inflate", "deflate", "stats" };
+	static const char * const names[] = { "inflate", "deflate", "stats" };
 	int err, nvqs;
 
 	/*
@@ -409,15 +420,16 @@ static int init_vqs(struct virtio_balloon *vb)
 	vb->deflate_vq = vqs[1];
 	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_STATS_VQ)) {
 		struct scatterlist sg;
+		unsigned int num_stats;
 		vb->stats_vq = vqs[2];
 
 		/*
 		 * Prime this virtqueue with one buffer so the hypervisor can
 		 * use it to signal us later (it can't be broken yet!).
 		 */
-		update_balloon_stats(vb);
+		num_stats = update_balloon_stats(vb);
 
-		sg_init_one(&sg, vb->stats, sizeof vb->stats);
+		sg_init_one(&sg, vb->stats, sizeof(vb->stats[0]) * num_stats);
 		if (virtqueue_add_outbuf(vb->stats_vq, &sg, 1, vb, GFP_KERNEL)
 		    < 0)
 			BUG();
@@ -506,12 +518,14 @@ static int virtballoon_probe(struct virtio_device *vdev)
 		goto out;
 	}
 
+	INIT_WORK(&vb->update_balloon_stats_work, update_balloon_stats_func);
+	INIT_WORK(&vb->update_balloon_size_work, update_balloon_size_func);
+	spin_lock_init(&vb->stop_update_lock);
+	vb->stop_update = false;
 	vb->num_pages = 0;
 	mutex_init(&vb->balloon_lock);
-	init_waitqueue_head(&vb->config_change);
 	init_waitqueue_head(&vb->acked);
 	vb->vdev = vdev;
-	vb->need_stats_update = 0;
 
 	balloon_devinfo_init(&vb->vb_dev_info);
 #ifdef CONFIG_BALLOON_COMPACTION
@@ -530,16 +544,10 @@ static int virtballoon_probe(struct virtio_device *vdev)
 
 	virtio_device_ready(vdev);
 
-	vb->thread = kthread_run(balloon, vb, "vballoon");
-	if (IS_ERR(vb->thread)) {
-		err = PTR_ERR(vb->thread);
-		goto out_del_vqs;
-	}
-
+	if (towards_target(vb))
+		virtballoon_changed(vdev);
 	return 0;
 
-out_del_vqs:
-	unregister_oom_notifier(&vb->nb);
 out_oom_notify:
 	vdev->config->del_vqs(vdev);
 out_free_vb:
@@ -566,7 +574,13 @@ static void virtballoon_remove(struct virtio_device *vdev)
 	struct virtio_balloon *vb = vdev->priv;
 
 	unregister_oom_notifier(&vb->nb);
-	kthread_stop(vb->thread);
+
+	spin_lock_irq(&vb->stop_update_lock);
+	vb->stop_update = true;
+	spin_unlock_irq(&vb->stop_update_lock);
+	cancel_work_sync(&vb->update_balloon_size_work);
+	cancel_work_sync(&vb->update_balloon_stats_work);
+
 	remove_common(vb);
 	kfree(vb);
 }
@@ -577,10 +591,9 @@ static int virtballoon_freeze(struct virtio_device *vdev)
 	struct virtio_balloon *vb = vdev->priv;
 
 	/*
-	 * The kthread is already frozen by the PM core before this
+	 * The workqueue is already frozen by the PM core before this
 	 * function is called.
 	 */
-
 	remove_common(vb);
 	return 0;
 }
@@ -596,7 +609,8 @@ static int virtballoon_restore(struct virtio_device *vdev)
 
 	virtio_device_ready(vdev);
 
-	fill_balloon(vb, towards_target(vb));
+	if (towards_target(vb))
+		virtballoon_changed(vdev);
 	update_balloon_size(vb);
 	return 0;
 }

@@ -28,6 +28,7 @@
 #include <linux/reset.h>
 #include <linux/iommu.h>
 #include <linux/of_device.h>
+#include <linux/ctype.h>
 
 #include <asm/unaligned.h>
 

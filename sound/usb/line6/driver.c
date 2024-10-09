@@ -17,6 +17,7 @@
 
 #include <sound/core.h>
 #include <sound/initval.h>
+#include <sound/hwdep.h>
 
 #include "capture.h"
 #include "driver.h"
@@ -303,7 +304,7 @@ static void line6_data_received(struct urb *urb)
 		for (;;) {
 			done =
 				line6_midibuf_read(mb, line6->buffer_message,
-						LINE6_MESSAGE_MAXLEN);
+						LINE6_MIDI_MESSAGE_MAXLEN);
 
 			if (done == 0)
 				break;
@@ -315,8 +316,11 @@ static void line6_data_received(struct urb *urb)
 				line6->process_message(line6);
 		}
 	} else {
+		line6->buffer_message = urb->transfer_buffer;
+		line6->message_length = urb->actual_length;
 		if (line6->process_message)
 			line6->process_message(line6);
+		line6->buffer_message = NULL;
 	}
 
 	line6_start_listen(line6);
@@ -473,53 +477,191 @@ static void line6_destruct(struct snd_card *card)
 	struct usb_line6 *line6 = card->private_data;
 	struct usb_device *usbdev = line6->usbdev;
 
-	/* free buffer memory first: */
-	if (line6->properties->capabilities & LINE6_CAP_CONTROL_MIDI)
-		kfree(line6->buffer_message);
+	/* Free buffer memory first. We cannot depend on the existence of private
+	 * data from the (podhd) module, it may be gone already during this call
+	 */
+	kfree(line6->buffer_message);
 
 	kfree(line6->buffer_listen);
 
 	/* then free URBs: */
 	usb_free_urb(line6->urb_listen);
+	line6->urb_listen = NULL;
 
 	/* decrement reference counters: */
 	usb_put_dev(usbdev);
 }
 
-/* get data from endpoint descriptor (see usb_maxpacket): */
-static void line6_get_interval(struct usb_line6 *line6)
+static void line6_get_usb_properties(struct usb_line6 *line6)
 {
 	struct usb_device *usbdev = line6->usbdev;
 	const struct line6_properties *properties = line6->properties;
 	int pipe;
-	struct usb_host_endpoint *ep;
+	struct usb_host_endpoint *ep = NULL;
 
-	if (properties->capabilities & LINE6_CAP_CONTROL_MIDI) {
-		pipe =
-			usb_rcvintpipe(line6->usbdev, line6->properties->ep_ctrl_r);
-	} else {
-		pipe =
-			usb_rcvbulkpipe(line6->usbdev, line6->properties->ep_ctrl_r);
+	if (properties->capabilities & LINE6_CAP_CONTROL) {
+		if (properties->capabilities & LINE6_CAP_CONTROL_MIDI) {
+			pipe = usb_rcvintpipe(line6->usbdev,
+				line6->properties->ep_ctrl_r);
+		} else {
+			pipe = usb_rcvbulkpipe(line6->usbdev,
+				line6->properties->ep_ctrl_r);
+		}
+		ep = usbdev->ep_in[usb_pipeendpoint(pipe)];
 	}
-	ep = usbdev->ep_in[usb_pipeendpoint(pipe)];
 
+	/* Control data transfer properties */
 	if (ep) {
 		line6->interval = ep->desc.bInterval;
-		if (usbdev->speed == USB_SPEED_LOW) {
-			line6->intervals_per_second = USB_LOW_INTERVALS_PER_SECOND;
-			line6->iso_buffers = USB_LOW_ISO_BUFFERS;
-		} else {
-			line6->intervals_per_second = USB_HIGH_INTERVALS_PER_SECOND;
-			line6->iso_buffers = USB_HIGH_ISO_BUFFERS;
-		}
-
 		line6->max_packet_size = le16_to_cpu(ep->desc.wMaxPacketSize);
 	} else {
-		dev_err(line6->ifcdev,
-			"endpoint not available, using fallback values");
+		if (properties->capabilities & LINE6_CAP_CONTROL) {
+			dev_err(line6->ifcdev,
+				"endpoint not available, using fallback values");
+		}
 		line6->interval = LINE6_FALLBACK_INTERVAL;
 		line6->max_packet_size = LINE6_FALLBACK_MAXPACKETSIZE;
 	}
+
+	/* Isochronous transfer properties */
+	if (usbdev->speed == USB_SPEED_LOW) {
+		line6->intervals_per_second = USB_LOW_INTERVALS_PER_SECOND;
+		line6->iso_buffers = USB_LOW_ISO_BUFFERS;
+	} else {
+		line6->intervals_per_second = USB_HIGH_INTERVALS_PER_SECOND;
+		line6->iso_buffers = USB_HIGH_ISO_BUFFERS;
+	}
+}
+
+/* Enable buffering of incoming messages, flush the buffer */
+static int line6_hwdep_open(struct snd_hwdep *hw, struct file *file)
+{
+	struct usb_line6 *line6 = hw->private_data;
+
+	/* NOTE: hwdep layer provides atomicity here */
+
+	line6->messages.active = 1;
+
+	return 0;
+}
+
+/* Stop buffering */
+static int line6_hwdep_release(struct snd_hwdep *hw, struct file *file)
+{
+	struct usb_line6 *line6 = hw->private_data;
+
+	line6->messages.active = 0;
+
+	return 0;
+}
+
+/* Read from circular buffer, return to user */
+static long
+line6_hwdep_read(struct snd_hwdep *hwdep, char __user *buf, long count,
+					loff_t *offset)
+{
+	struct usb_line6 *line6 = hwdep->private_data;
+	long rv = 0;
+	unsigned int out_count;
+
+	if (mutex_lock_interruptible(&line6->messages.read_lock))
+		return -ERESTARTSYS;
+
+	while (kfifo_len(&line6->messages.fifo) == 0) {
+		mutex_unlock(&line6->messages.read_lock);
+
+		rv = wait_event_interruptible(
+			line6->messages.wait_queue,
+			kfifo_len(&line6->messages.fifo) != 0);
+		if (rv < 0)
+			return rv;
+
+		if (mutex_lock_interruptible(&line6->messages.read_lock))
+			return -ERESTARTSYS;
+	}
+
+	if (kfifo_peek_len(&line6->messages.fifo) > count) {
+		/* Buffer too small; allow re-read of the current item... */
+		rv = -EINVAL;
+	} else {
+		rv = kfifo_to_user(&line6->messages.fifo, buf, count, &out_count);
+		if (rv == 0)
+			rv = out_count;
+	}
+
+	mutex_unlock(&line6->messages.read_lock);
+	return rv;
+}
+
+/* Write directly (no buffering) to device by user*/
+static long
+line6_hwdep_write(struct snd_hwdep *hwdep, const char __user *data, long count,
+					loff_t *offset)
+{
+	struct usb_line6 *line6 = hwdep->private_data;
+	int rv;
+	char *data_copy;
+
+	if (count > line6->max_packet_size * LINE6_RAW_MESSAGES_MAXCOUNT) {
+		/* This is an arbitrary limit - still better than nothing... */
+		return -EINVAL;
+	}
+
+	data_copy = memdup_user(data, count);
+	if (IS_ERR(data_copy))
+		return PTR_ERR(data_copy);
+
+	rv = line6_send_raw_message(line6, data_copy, count);
+
+	kfree(data_copy);
+	return rv;
+}
+
+static const struct snd_hwdep_ops hwdep_ops = {
+	.open    = line6_hwdep_open,
+	.release = line6_hwdep_release,
+	.read    = line6_hwdep_read,
+	.write   = line6_hwdep_write,
+};
+
+/* Insert into circular buffer */
+static void line6_hwdep_push_message(struct usb_line6 *line6)
+{
+	if (!line6->messages.active)
+		return;
+
+	if (kfifo_avail(&line6->messages.fifo) >= line6->message_length) {
+		/* No race condition here, there's only one writer */
+		kfifo_in(&line6->messages.fifo,
+			line6->buffer_message, line6->message_length);
+	} /* else TODO: signal overflow */
+
+	wake_up_interruptible(&line6->messages.wait_queue);
+}
+
+static int line6_hwdep_init(struct usb_line6 *line6)
+{
+	int err;
+	struct snd_hwdep *hwdep;
+
+	/* TODO: usb_driver_claim_interface(); */
+	line6->process_message = line6_hwdep_push_message;
+	line6->messages.active = 0;
+	init_waitqueue_head(&line6->messages.wait_queue);
+	mutex_init(&line6->messages.read_lock);
+	INIT_KFIFO(line6->messages.fifo);
+
+	err = snd_hwdep_new(line6->card, "config", 0, &hwdep);
+	if (err < 0)
+		goto end;
+	strcpy(hwdep->name, "config");
+	hwdep->iface = SNDRV_HWDEP_IFACE_LINE6;
+	hwdep->ops = hwdep_ops;
+	hwdep->private_data = line6;
+	hwdep->exclusive = true;
+
+end:
+	return err;
 }
 
 static int line6_init_cap_control(struct usb_line6 *line6)
@@ -536,9 +678,13 @@ static int line6_init_cap_control(struct usb_line6 *line6)
 		return -ENOMEM;
 
 	if (line6->properties->capabilities & LINE6_CAP_CONTROL_MIDI) {
-		line6->buffer_message = kmalloc(LINE6_MESSAGE_MAXLEN, GFP_KERNEL);
+		line6->buffer_message = kmalloc(LINE6_MIDI_MESSAGE_MAXLEN, GFP_KERNEL);
 		if (!line6->buffer_message)
 			return -ENOMEM;
+	} else {
+		ret = line6_hwdep_init(line6);
+		if (ret < 0)
+			return ret;
 	}
 
 	ret = line6_start_listen(line6);
@@ -612,7 +758,7 @@ int line6_probe(struct usb_interface *interface,
 		goto error;
 	}
 
-	line6_get_interval(line6);
+	line6_get_usb_properties(line6);
 
 	if (properties->capabilities & LINE6_CAP_CONTROL) {
 		ret = line6_init_cap_control(line6);
@@ -717,3 +863,4 @@ EXPORT_SYMBOL_GPL(line6_resume);
 MODULE_AUTHOR(DRIVER_AUTHOR);
 MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_LICENSE("GPL");
+

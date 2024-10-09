@@ -71,18 +71,24 @@ nfs_fattr_to_ino_t(struct nfs_fattr *fattr)
 	return nfs_fileid_to_ino_t(fattr->fileid);
 }
 
-/**
- * nfs_wait_bit_killable - helper for functions that are sleeping on bit locks
- * @word: long word containing the bit lock
- */
-int nfs_wait_bit_killable(struct wait_bit_key *key, int mode)
+static int nfs_wait_killable(int mode)
 {
 	freezable_schedule_unsafe();
 	if (signal_pending_state(mode, current))
 		return -ERESTARTSYS;
 	return 0;
 }
+
+int nfs_wait_bit_killable(struct wait_bit_key *key, int mode)
+{
+	return nfs_wait_killable(mode);
+}
 EXPORT_SYMBOL_GPL(nfs_wait_bit_killable);
+
+int nfs_wait_atomic_killable(atomic_t *p)
+{
+	return nfs_wait_killable(TASK_KILLABLE);
+}
 
 /**
  * nfs_compat_user_ino64 - returns the user-visible inode number
@@ -628,12 +634,25 @@ void nfs_setattr_update_inode(struct inode *inode, struct iattr *attr,
 }
 EXPORT_SYMBOL_GPL(nfs_setattr_update_inode);
 
-static void nfs_request_parent_use_readdirplus(struct dentry *dentry)
+static void nfs_readdirplus_parent_cache_miss(struct dentry *dentry)
 {
 	struct dentry *parent;
 
+	if (!nfs_server_capable(d_inode(dentry), NFS_CAP_READDIRPLUS))
+		return;
 	parent = dget_parent(dentry);
 	nfs_force_use_readdirplus(parent->d_inode);
+	dput(parent);
+}
+
+static void nfs_readdirplus_parent_cache_hit(struct dentry *dentry)
+{
+	struct dentry *parent;
+
+	if (!nfs_server_capable(d_inode(dentry), NFS_CAP_READDIRPLUS))
+		return;
+	parent = dget_parent(dentry);
+	nfs_advise_use_readdirplus(d_inode(parent));
 	dput(parent);
 }
 
@@ -679,10 +698,10 @@ int nfs_getattr(struct vfsmount *mnt, struct dentry *dentry, struct kstat *stat)
 	if (need_atime || nfs_need_revalidate_inode(inode)) {
 		struct nfs_server *server = NFS_SERVER(inode);
 
-		if (server->caps & NFS_CAP_READDIRPLUS)
-			nfs_request_parent_use_readdirplus(dentry);
+		nfs_readdirplus_parent_cache_miss(dentry);
 		err = __nfs_revalidate_inode(server, inode);
-	}
+	} else
+		nfs_readdirplus_parent_cache_hit(dentry);
 	if (!err) {
 		generic_fillattr(inode, stat);
 		stat->ino = nfs_compat_user_ino64(NFS_FILEID(inode));
@@ -701,7 +720,7 @@ static void nfs_init_lock_context(struct nfs_lock_context *l_ctx)
 	l_ctx->lockowner.l_owner = current->files;
 	l_ctx->lockowner.l_pid = current->tgid;
 	INIT_LIST_HEAD(&l_ctx->list);
-	nfs_iocounter_init(&l_ctx->io_count);
+	atomic_set(&l_ctx->io_count, 0);
 }
 
 static struct nfs_lock_context *__nfs_find_lock_context(struct nfs_open_context *ctx)

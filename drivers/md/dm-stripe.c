@@ -305,6 +305,29 @@ static int stripe_map(struct dm_target *ti, struct bio *bio)
 	return DM_MAPIO_REMAPPED;
 }
 
+static long stripe_direct_access(struct dm_target *ti, sector_t sector,
+				 void **kaddr, pfn_t *pfn, long size)
+{
+	struct stripe_c *sc = ti->private;
+	uint32_t stripe;
+	struct block_device *bdev;
+	struct blk_dax_ctl dax = {
+		.size = size,
+	};
+	long ret;
+
+	stripe_map_sector(sc, sector, &stripe, &dax.sector);
+
+	dax.sector += sc->stripe[stripe].physical_start;
+	bdev = sc->stripe[stripe].dev->bdev;
+
+	ret = bdev_direct_access(bdev, &dax);
+	*kaddr = dax.addr;
+	*pfn = dax.pfn;
+
+	return ret;
+}
+
 /*
  * Stripe status:
  *
@@ -433,7 +456,7 @@ static int stripe_merge(struct dm_target *ti, struct bvec_merge_data *bvm,
 
 static struct target_type stripe_target = {
 	.name   = "striped",
-	.version = {1, 5, 1},
+	.version = {1, 6, 0},
 	.module = THIS_MODULE,
 	.ctr    = stripe_ctr,
 	.dtr    = stripe_dtr,
@@ -443,6 +466,7 @@ static struct target_type stripe_target = {
 	.iterate_devices = stripe_iterate_devices,
 	.io_hints = stripe_io_hints,
 	.merge  = stripe_merge,
+	.direct_access = stripe_direct_access,
 };
 
 int __init dm_stripe_init(void)

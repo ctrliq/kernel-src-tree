@@ -255,7 +255,6 @@ struct hci_dev {
 	__u8		dev_name[HCI_MAX_NAME_LENGTH];
 	__u8		short_name[HCI_MAX_SHORT_NAME_LENGTH];
 	__u8		eir[HCI_MAX_EIR_LENGTH];
-	__u16		appearance;
 	__u8		dev_class[3];
 	__u8		major_class;
 	__u8		minor_class;
@@ -396,8 +395,6 @@ struct hci_dev {
 
 	atomic_t		promisc;
 
-	const char		*hw_info;
-	const char		*fw_info;
 	struct dentry		*debugfs;
 
 	struct device		dev;
@@ -505,7 +502,12 @@ struct hci_dev {
 	int (*set_diag)(struct hci_dev *hdev, bool enable);
 	int (*set_bdaddr)(struct hci_dev *hdev, const bdaddr_t *bdaddr);
 #endif
+#if IS_ENABLED(CONFIG_BT_LEDS)
 	RH_KABI_EXTEND( struct led_trigger	*power_led)
+#endif
+	RH_KABI_EXTEND( const char		*hw_info)
+	RH_KABI_EXTEND( const char		*fw_info)
+	RH_KABI_EXTEND( __u16			appearance)
 
 };
 

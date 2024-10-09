@@ -86,4 +86,15 @@ static inline long shmem_fcntl(struct file *f, unsigned int c, unsigned long a)
 
 #endif
 
+#ifdef CONFIG_SHMEM
+extern int shmem_mcopy_atomic_pte(struct mm_struct *dst_mm, pmd_t *dst_pmd,
+				  struct vm_area_struct *dst_vma,
+				  unsigned long dst_addr,
+				  unsigned long src_addr,
+				  struct page **pagep);
+#else
+#define shmem_mcopy_atomic_pte(dst_mm, dst_pte, dst_vma, dst_addr, \
+			       src_addr, pagep)        ({ BUG(); 0; })
+#endif
+
 #endif

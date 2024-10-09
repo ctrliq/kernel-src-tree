@@ -24,67 +24,84 @@
 #include <net/net_namespace.h>
 #include <net/sock.h>
 #include <net/sch_generic.h>
+#include <net/pkt_cls.h>
 #include <net/act_api.h>
 #include <net/netlink.h>
 
-void tcf_hash_destroy(struct tcf_common *p, struct tcf_hashinfo *hinfo)
+static void free_tcf(struct rcu_head *head)
 {
-	unsigned int h = tcf_hash(p->tcfc_index, hinfo->hmask);
-	struct tcf_common **p1p;
+	struct tcf_common *p = container_of(head, struct tcf_common, tcfc_rcu);
 
-	for (p1p = &hinfo->htab[h]; *p1p; p1p = &(*p1p)->tcfc_next) {
-		if (*p1p == p) {
-			write_lock_bh(hinfo->lock);
-			*p1p = p->tcfc_next;
-			write_unlock_bh(hinfo->lock);
-			gen_kill_estimator(&p->tcfc_bstats,
-					   &p->tcfc_rate_est);
-			/*
-			 * gen_estimator est_timer() might access p->tcfc_lock
-			 * or bstats, wait a RCU grace period before freeing p
-			 */
-			kfree_rcu(p, tcfc_rcu);
-			return;
-		}
+	free_percpu(p->cpu_bstats);
+	free_percpu(p->cpu_qstats);
+
+	if (p->act_cookie) {
+		kfree(p->act_cookie->data);
+		kfree(p->act_cookie);
 	}
-	WARN_ON(1);
+
+	kfree(p);
+}
+
+void tcf_hash_destroy(struct tc_action *a)
+{
+	struct tcf_common *p = a->priv;
+	struct tcf_hashinfo *hinfo = a->ops->hinfo;
+
+	spin_lock_bh(&hinfo->lock);
+	hlist_del(&p->tcfc_head);
+	spin_unlock_bh(&hinfo->lock);
+	gen_kill_estimator(&p->tcfc_bstats,
+			   &p->tcfc_rate_est);
+	/*
+	 * gen_estimator est_timer() might access p->tcfc_lock
+	 * or bstats, wait a RCU grace period before freeing p
+	 */
+	call_rcu(&p->tcfc_rcu, free_tcf);
 }
 EXPORT_SYMBOL(tcf_hash_destroy);
 
-int tcf_hash_release(struct tcf_common *p, int bind,
-		     struct tcf_hashinfo *hinfo)
+int __tcf_hash_release(struct tc_action *a, bool bind, bool strict)
 {
+	struct tcf_common *p = a->priv;
 	int ret = 0;
 
 	if (p) {
 		if (bind)
 			p->tcfc_bindcnt--;
+		else if (strict && p->tcfc_bindcnt > 0)
+			return -EPERM;
 
 		p->tcfc_refcnt--;
 		if (p->tcfc_bindcnt <= 0 && p->tcfc_refcnt <= 0) {
-			tcf_hash_destroy(p, hinfo);
+			if (a->ops->cleanup)
+				a->ops->cleanup(a, bind);
+			tcf_hash_destroy(a);
 			ret = 1;
 		}
 	}
+
 	return ret;
 }
-EXPORT_SYMBOL(tcf_hash_release);
+EXPORT_SYMBOL(__tcf_hash_release);
 
 static int tcf_dump_walker(struct sk_buff *skb, struct netlink_callback *cb,
-			   struct tc_action *a, struct tcf_hashinfo *hinfo)
+			   struct tc_action *a)
 {
+	struct tcf_hashinfo *hinfo = a->ops->hinfo;
+	struct hlist_head *head;
 	struct tcf_common *p;
 	int err = 0, index = -1, i = 0, s_i = 0, n_i = 0;
 	struct nlattr *nest;
 
-	read_lock_bh(hinfo->lock);
+	spin_lock_bh(&hinfo->lock);
 
 	s_i = cb->args[0];
 
 	for (i = 0; i < (hinfo->hmask + 1); i++) {
-		p = hinfo->htab[tcf_hash(i, hinfo->hmask)];
+		head = &hinfo->htab[tcf_hash(i, hinfo->hmask)];
 
-		for (; p; p = p->tcfc_next) {
+		hlist_for_each_entry_rcu(p, head, tcfc_head) {
 			index++;
 			if (index < s_i)
 				continue;
@@ -107,7 +124,7 @@ static int tcf_dump_walker(struct sk_buff *skb, struct netlink_callback *cb,
 		}
 	}
 done:
-	read_unlock_bh(hinfo->lock);
+	spin_unlock_bh(&hinfo->lock);
 	if (n_i)
 		cb->args[0] += n_i;
 	return n_i;
@@ -117,12 +134,15 @@ nla_put_failure:
 	goto done;
 }
 
-static int tcf_del_walker(struct sk_buff *skb, struct tc_action *a,
-			  struct tcf_hashinfo *hinfo)
+static int tcf_del_walker(struct sk_buff *skb, struct tc_action *a)
 {
-	struct tcf_common *p, *s_p;
+	struct tcf_hashinfo *hinfo = a->ops->hinfo;
+	struct hlist_head *head;
+	struct hlist_node *n;
+	struct tcf_common *p;
 	struct nlattr *nest;
 	int i = 0, n_i = 0;
+	int ret = -EINVAL;
 
 	nest = nla_nest_start(skb, a->order);
 	if (nest == NULL)
@@ -130,14 +150,15 @@ static int tcf_del_walker(struct sk_buff *skb, struct tc_action *a,
 	if (nla_put_string(skb, TCA_KIND, a->ops->kind))
 		goto nla_put_failure;
 	for (i = 0; i < (hinfo->hmask + 1); i++) {
-		p = hinfo->htab[tcf_hash(i, hinfo->hmask)];
-
-		while (p != NULL) {
-			s_p = p->tcfc_next;
-			if (ACT_P_DELETED == tcf_hash_release(p, 0, hinfo))
+		head = &hinfo->htab[tcf_hash(i, hinfo->hmask)];
+		hlist_for_each_entry_safe(p, n, head, tcfc_head) {
+			a->priv = p;
+			ret = __tcf_hash_release(a, false, true);
+			if (ret == ACT_P_DELETED) {
 				module_put(a->ops->owner);
-			n_i++;
-			p = s_p;
+				n_i++;
+			} else if (ret < 0)
+				goto nla_put_failure;
 		}
 	}
 	if (nla_put_u32(skb, TCA_FCNT, n_i))
@@ -147,55 +168,52 @@ static int tcf_del_walker(struct sk_buff *skb, struct tc_action *a,
 	return n_i;
 nla_put_failure:
 	nla_nest_cancel(skb, nest);
-	return -EINVAL;
+	return ret;
 }
 
 static int tcf_generic_walker(struct sk_buff *skb, struct netlink_callback *cb,
 			      int type, struct tc_action *a)
 {
-	struct tcf_hashinfo *hinfo = a->ops->hinfo;
-
 	if (type == RTM_DELACTION) {
-		return tcf_del_walker(skb, a, hinfo);
+		return tcf_del_walker(skb, a);
 	} else if (type == RTM_GETACTION) {
-		return tcf_dump_walker(skb, cb, a, hinfo);
+		return tcf_dump_walker(skb, cb, a);
 	} else {
 		WARN(1, "tcf_generic_walker: unknown action %d\n", type);
 		return -EINVAL;
 	}
 }
 
-struct tcf_common *tcf_hash_lookup(u32 index, struct tcf_hashinfo *hinfo)
+static struct tcf_common *tcf_hash_lookup(u32 index, struct tcf_hashinfo *hinfo)
 {
-	struct tcf_common *p;
+	struct tcf_common *p = NULL;
+	struct hlist_head *head;
 
-	read_lock_bh(hinfo->lock);
-	for (p = hinfo->htab[tcf_hash(index, hinfo->hmask)]; p;
-	     p = p->tcfc_next) {
+	spin_lock_bh(&hinfo->lock);
+	head = &hinfo->htab[tcf_hash(index, hinfo->hmask)];
+	hlist_for_each_entry_rcu(p, head, tcfc_head)
 		if (p->tcfc_index == index)
 			break;
-	}
-	read_unlock_bh(hinfo->lock);
+	spin_unlock_bh(&hinfo->lock);
 
 	return p;
 }
-EXPORT_SYMBOL(tcf_hash_lookup);
 
-u32 tcf_hash_new_index(u32 *idx_gen, struct tcf_hashinfo *hinfo)
+u32 tcf_hash_new_index(struct tcf_hashinfo *hinfo)
 {
-	u32 val = *idx_gen;
+	u32 val = hinfo->index;
 
 	do {
 		if (++val == 0)
 			val = 1;
 	} while (tcf_hash_lookup(val, hinfo));
 
-	*idx_gen = val;
+	hinfo->index = val;
 	return val;
 }
 EXPORT_SYMBOL(tcf_hash_new_index);
 
-static int tcf_hash_search(struct tc_action *a, u32 index)
+int tcf_hash_search(struct tc_action *a, u32 index)
 {
 	struct tcf_hashinfo *hinfo = a->ops->hinfo;
 	struct tcf_common *p = tcf_hash_lookup(index, hinfo);
@@ -206,71 +224,103 @@ static int tcf_hash_search(struct tc_action *a, u32 index)
 	}
 	return 0;
 }
+EXPORT_SYMBOL(tcf_hash_search);
 
-struct tcf_common *tcf_hash_check(u32 index, struct tc_action *a, int bind,
-				  struct tcf_hashinfo *hinfo)
+int tcf_hash_check(u32 index, struct tc_action *a, int bind)
 {
+	struct tcf_hashinfo *hinfo = a->ops->hinfo;
 	struct tcf_common *p = NULL;
 	if (index && (p = tcf_hash_lookup(index, hinfo)) != NULL) {
 		if (bind)
 			p->tcfc_bindcnt++;
 		p->tcfc_refcnt++;
 		a->priv = p;
+		return 1;
 	}
-	return p;
+	return 0;
 }
 EXPORT_SYMBOL(tcf_hash_check);
 
-struct tcf_common *tcf_hash_create(u32 index, struct nlattr *est,
-				   struct tc_action *a, int size, int bind,
-				   u32 *idx_gen, struct tcf_hashinfo *hinfo)
+void tcf_hash_cleanup(struct tc_action *a, struct nlattr *est)
 {
+	struct tcf_common *pc = a->priv;
+	if (est)
+		gen_kill_estimator(&pc->tcfc_bstats,
+				   &pc->tcfc_rate_est);
+	call_rcu(&pc->tcfc_rcu, free_tcf);
+}
+EXPORT_SYMBOL(tcf_hash_cleanup);
+
+int tcf_hash_create(u32 index, struct nlattr *est, struct tc_action *a,
+		    int size, int bind, bool cpustats)
+{
+	struct tcf_hashinfo *hinfo = a->ops->hinfo;
 	struct tcf_common *p = kzalloc(size, GFP_KERNEL);
+	int err = -ENOMEM;
 
 	if (unlikely(!p))
-		return ERR_PTR(-ENOMEM);
+		return -ENOMEM;
 	p->tcfc_refcnt = 1;
 	if (bind)
 		p->tcfc_bindcnt = 1;
 
+	if (cpustats) {
+		p->cpu_bstats = netdev_alloc_pcpu_stats(struct gnet_stats_basic_cpu);
+		if (!p->cpu_bstats) {
+err1:
+			kfree(p);
+			return err;
+		}
+		p->cpu_qstats = alloc_percpu(struct gnet_stats_queue);
+		if (!p->cpu_qstats) {
+err2:
+			free_percpu(p->cpu_bstats);
+			goto err1;
+		}
+	}
 	spin_lock_init(&p->tcfc_lock);
-	p->tcfc_index = index ? index : tcf_hash_new_index(idx_gen, hinfo);
+	INIT_HLIST_NODE(&p->tcfc_head);
+	p->tcfc_index = index ? index : tcf_hash_new_index(hinfo);
 	p->tcfc_tm.install = jiffies;
 	p->tcfc_tm.lastuse = jiffies;
+	p->tcfc_tm.firstuse = 0;
 	if (est) {
-		int err = gen_new_estimator(&p->tcfc_bstats, &p->tcfc_rate_est,
-					    &p->tcfc_lock, est);
+		err = gen_new_estimator(&p->tcfc_bstats, p->cpu_bstats,
+					&p->tcfc_rate_est,
+					&p->tcfc_lock, est);
 		if (err) {
-			kfree(p);
-			return ERR_PTR(err);
+			free_percpu(p->cpu_qstats);
+			goto err2;
 		}
 	}
 
 	a->priv = (void *) p;
-	return p;
+	return 0;
 }
 EXPORT_SYMBOL(tcf_hash_create);
 
-void tcf_hash_insert(struct tcf_common *p, struct tcf_hashinfo *hinfo)
+void tcf_hash_insert(struct tc_action *a)
 {
+	struct tcf_common *p = a->priv;
+	struct tcf_hashinfo *hinfo = a->ops->hinfo;
 	unsigned int h = tcf_hash(p->tcfc_index, hinfo->hmask);
 
-	write_lock_bh(hinfo->lock);
-	p->tcfc_next = hinfo->htab[h];
-	hinfo->htab[h] = p;
-	write_unlock_bh(hinfo->lock);
+	spin_lock_bh(&hinfo->lock);
+	hlist_add_head(&p->tcfc_head, &hinfo->htab[h]);
+	spin_unlock_bh(&hinfo->lock);
 }
 EXPORT_SYMBOL(tcf_hash_insert);
 
 static LIST_HEAD(act_base);
 static DEFINE_RWLOCK(act_mod_lock);
 
-int tcf_register_action(struct tc_action_ops *act)
+int tcf_register_action(struct tc_action_ops *act, unsigned int mask)
 {
 	struct tc_action_ops *a;
+	int err;
 
-	/* Must supply act, dump, cleanup and init */
-	if (!act->act || !act->dump || !act->cleanup || !act->init)
+	/* Must supply act, dump and init */
+	if (!act->act || !act->dump || !act->init)
 		return -EINVAL;
 
 	/* Supply defaults */
@@ -279,10 +329,21 @@ int tcf_register_action(struct tc_action_ops *act)
 	if (!act->walk)
 		act->walk = tcf_generic_walker;
 
+	act->hinfo = kmalloc(sizeof(struct tcf_hashinfo), GFP_KERNEL);
+	if (!act->hinfo)
+		return -ENOMEM;
+	err = tcf_hashinfo_init(act->hinfo, mask);
+	if (err) {
+		kfree(act->hinfo);
+		return err;
+	}
+
 	write_lock(&act_mod_lock);
 	list_for_each_entry(a, &act_base, head) {
 		if (act->type == a->type || (strcmp(act->kind, a->kind) == 0)) {
 			write_unlock(&act_mod_lock);
+			tcf_hashinfo_destroy(act->hinfo);
+			kfree(act->hinfo);
 			return -EEXIST;
 		}
 	}
@@ -301,6 +362,8 @@ int tcf_unregister_action(struct tc_action_ops *act)
 	list_for_each_entry(a, &act_base, head) {
 		if (a == act) {
 			list_del(&act->head);
+			tcf_hashinfo_destroy(act->hinfo);
+			kfree(act->hinfo);
 			err = 0;
 			break;
 		}
@@ -372,16 +435,21 @@ exec_done:
 }
 EXPORT_SYMBOL(tcf_action_exec);
 
-void tcf_action_destroy(struct list_head *actions, int bind)
+int tcf_action_destroy(struct list_head *actions, int bind)
 {
 	struct tc_action *a, *tmp;
+	int ret = 0;
 
 	list_for_each_entry_safe(a, tmp, actions, list) {
-		if (a->ops->cleanup(a, bind) == ACT_P_DELETED)
+		ret = __tcf_hash_release(a, bind, true);
+		if (ret == ACT_P_DELETED)
 			module_put(a->ops->owner);
+		else if (ret < 0)
+			return ret;
 		list_del(&a->list);
 		kfree(a);
 	}
+	return ret;
 }
 
 int
@@ -396,11 +464,21 @@ tcf_action_dump_1(struct sk_buff *skb, struct tc_action *a, int bind, int ref)
 	int err = -EINVAL;
 	unsigned char *b = skb_tail_pointer(skb);
 	struct nlattr *nest;
+	struct tcf_common *p = a->priv;
+
+	if (!p)
+		return -1;
 
 	if (nla_put_string(skb, TCA_KIND, a->ops->kind))
 		goto nla_put_failure;
 	if (tcf_action_copy_stats(skb, a, 0))
 		goto nla_put_failure;
+	if (p->act_cookie) {
+		if (nla_put(skb, TCA_ACT_COOKIE, p->act_cookie->len,
+			    p->act_cookie->data))
+			goto nla_put_failure;
+	}
+
 	nest = nla_nest_start(skb, TCA_OPTIONS);
 	if (nest == NULL)
 		goto nla_put_failure;
@@ -416,8 +494,8 @@ nla_put_failure:
 }
 EXPORT_SYMBOL(tcf_action_dump_1);
 
-int
-tcf_action_dump(struct sk_buff *skb, struct list_head *actions, int bind, int ref)
+int tcf_action_dump(struct sk_buff *skb, struct list_head *actions,
+		    int bind, int ref)
 {
 	struct tc_action *a;
 	int err = -EINVAL;
@@ -442,12 +520,29 @@ errout:
 	return err;
 }
 
+static struct tc_cookie *nla_memdup_cookie(struct nlattr **tb)
+{
+	struct tc_cookie *c = kzalloc(sizeof(*c), GFP_KERNEL);
+	if (!c)
+		return NULL;
+
+	c->data = nla_memdup(tb[TCA_ACT_COOKIE], GFP_KERNEL);
+	if (!c->data) {
+		kfree(c);
+		return NULL;
+	}
+	c->len = nla_len(tb[TCA_ACT_COOKIE]);
+
+	return c;
+}
+
 struct tc_action *tcf_action_init_1(struct net *net, struct nlattr *nla,
 				    struct nlattr *est, char *name, int ovr,
 				    int bind)
 {
 	struct tc_action *a;
 	struct tc_action_ops *a_o;
+	struct tc_cookie *cookie = NULL;
 	char act_name[IFNAMSIZ];
 	struct nlattr *tb[TCA_ACT_MAX + 1];
 	struct nlattr *kind;
@@ -463,6 +558,18 @@ struct tc_action *tcf_action_init_1(struct net *net, struct nlattr *nla,
 			goto err_out;
 		if (nla_strlcpy(act_name, kind, IFNAMSIZ) >= IFNAMSIZ)
 			goto err_out;
+		if (tb[TCA_ACT_COOKIE]) {
+			int cklen = nla_len(tb[TCA_ACT_COOKIE]);
+
+			if (cklen > TC_COOKIE_MAX_SIZE)
+				goto err_out;
+
+			cookie = nla_memdup_cookie(tb);
+			if (!cookie) {
+				err = -ENOMEM;
+				goto err_out;
+			}
+		}
 	} else {
 		err = -EINVAL;
 		if (strlcpy(act_name, name, IFNAMSIZ) >= IFNAMSIZ)
@@ -498,6 +605,7 @@ struct tc_action *tcf_action_init_1(struct net *net, struct nlattr *nla,
 	if (a == NULL)
 		goto err_mod;
 
+	a->ops = a_o;
 	INIT_LIST_HEAD(&a->list);
 	/* backward compatibility for policer */
 	if (name == NULL)
@@ -507,13 +615,22 @@ struct tc_action *tcf_action_init_1(struct net *net, struct nlattr *nla,
 	if (err < 0)
 		goto err_free;
 
+	if (name == NULL && tb[TCA_ACT_COOKIE]) {
+		struct tcf_common *p = a->priv;
+
+		if (p->act_cookie) {
+			kfree(p->act_cookie->data);
+			kfree(p->act_cookie);
+		}
+		p->act_cookie = cookie;
+	}
+
 	/* module count goes up only when brand new policy is created
 	 * if it exists and is only bound to in a_o->init() then
 	 * ACT_P_CREATED is not returned (a zero is).
 	 */
 	if (err != ACT_P_CREATED)
 		module_put(a_o->owner);
-	a->ops = a_o;
 
 	return a;
 
@@ -522,12 +639,15 @@ err_free:
 err_mod:
 	module_put(a_o->owner);
 err_out:
+	if (cookie) {
+		kfree(cookie->data);
+		kfree(cookie);
+	}
 	return ERR_PTR(err);
 }
 
-int tcf_action_init(struct net *net, struct nlattr *nla,
-				  struct nlattr *est, char *name, int ovr,
-				  int bind, struct list_head *actions)
+int tcf_action_init(struct net *net, struct nlattr *nla, struct nlattr *est,
+		    char *name, int ovr, int bind, struct list_head *actions)
 {
 	struct nlattr *tb[TCA_ACT_MAX_PRIO + 1];
 	struct tc_action *act;
@@ -570,20 +690,25 @@ int tcf_action_copy_stats(struct sk_buff *skb, struct tc_action *a,
 	if (compat_mode) {
 		if (a->type == TCA_OLD_COMPAT)
 			err = gnet_stats_start_copy_compat(skb, 0,
-				TCA_STATS, TCA_XSTATS, &p->tcfc_lock, &d);
+							   TCA_STATS,
+							   TCA_XSTATS,
+							   &p->tcfc_lock, &d,
+							   TCA_PAD);
 		else
 			return 0;
 	} else
 		err = gnet_stats_start_copy(skb, TCA_ACT_STATS,
-					    &p->tcfc_lock, &d);
+					    &p->tcfc_lock, &d, TCA_ACT_PAD);
 
 	if (err < 0)
 		goto errout;
 
-	if (gnet_stats_copy_basic(&d, &p->tcfc_bstats) < 0 ||
+	if (gnet_stats_copy_basic(&d, p->cpu_bstats, &p->tcfc_bstats) < 0 ||
 	    gnet_stats_copy_rate_est(&d, &p->tcfc_bstats,
 				     &p->tcfc_rate_est) < 0 ||
-	    gnet_stats_copy_queue(&d, &p->tcfc_qstats) < 0)
+	    gnet_stats_copy_queue(&d, p->cpu_qstats,
+				  &p->tcfc_qstats,
+				  p->tcfc_qstats.qlen) < 0)
 		goto errout;
 
 	if (gnet_stats_finish_copy(&d) < 0)
@@ -595,9 +720,9 @@ errout:
 	return -1;
 }
 
-static int
-tca_get_fill(struct sk_buff *skb, struct list_head *actions, u32 portid, u32 seq,
-	     u16 flags, int event, int bind, int ref)
+static int tca_get_fill(struct sk_buff *skb, struct list_head *actions,
+			u32 portid, u32 seq, u16 flags, int event, int bind,
+			int ref)
 {
 	struct tcamsg *t;
 	struct nlmsghdr *nlh;
@@ -638,7 +763,8 @@ act_get_notify(struct net *net, u32 portid, struct nlmsghdr *n,
 	skb = alloc_skb(NLMSG_GOODSIZE, GFP_KERNEL);
 	if (!skb)
 		return -ENOBUFS;
-	if (tca_get_fill(skb, actions, portid, n->nlmsg_seq, 0, event, 0, 0) <= 0) {
+	if (tca_get_fill(skb, actions, portid, n->nlmsg_seq, 0, event,
+			 0, 0) <= 0) {
 		kfree_skb(skb);
 		return -EINVAL;
 	}
@@ -746,7 +872,8 @@ static int tca_action_flush(struct net *net, struct nlattr *nla,
 	if (a.ops == NULL) /*some idjot trying to flush unknown action */
 		goto err_out;
 
-	nlh = nlmsg_put(skb, portid, n->nlmsg_seq, RTM_DELACTION, sizeof(*t), 0);
+	nlh = nlmsg_put(skb, portid, n->nlmsg_seq, RTM_DELACTION,
+			sizeof(*t), 0);
 	if (!nlh)
 		goto out_module_put;
 	t = nlmsg_data(nlh);
@@ -802,7 +929,11 @@ tcf_del_notify(struct net *net, struct nlmsghdr *n, struct list_head *actions,
 	}
 
 	/* now do the delete */
-	tcf_action_destroy(actions, 0);
+	ret = tcf_action_destroy(actions, 0);
+	if (ret < 0) {
+		kfree_skb(skb);
+		return ret;
+	}
 
 	ret = rtnetlink_send(skb, net, portid, RTNLGRP_TC,
 			     n->nlmsg_flags & NLM_F_ECHO);
@@ -878,9 +1009,8 @@ tcf_add_notify(struct net *net, struct nlmsghdr *n, struct list_head *actions,
 	return err;
 }
 
-static int
-tcf_action_add(struct net *net, struct nlattr *nla, struct nlmsghdr *n,
-	       u32 portid, int ovr)
+static int tcf_action_add(struct net *net, struct nlattr *nla,
+			  struct nlmsghdr *n, u32 portid, int ovr)
 {
 	int ret = 0;
 	LIST_HEAD(actions);
@@ -905,7 +1035,8 @@ static int tc_ctl_action(struct sk_buff *skb, struct nlmsghdr *n)
 	u32 portid = skb ? NETLINK_CB(skb).portid : 0;
 	int ret = 0, ovr = 0;
 
-	if ((n->nlmsg_type != RTM_GETACTION) && !netlink_capable(skb, CAP_NET_ADMIN))
+	if ((n->nlmsg_type != RTM_GETACTION) &&
+	    !netlink_capable(skb, CAP_NET_ADMIN))
 		return -EPERM;
 
 	ret = nlmsg_parse(n, sizeof(struct tcamsg), tca, TCA_ACT_MAX, NULL);
@@ -948,8 +1079,7 @@ replay:
 	return ret;
 }
 
-static struct nlattr *
-find_dump_kind(const struct nlmsghdr *n)
+static struct nlattr *find_dump_kind(const struct nlmsghdr *n)
 {
 	struct nlattr *tb1, *tb2[TCA_ACT_MAX + 1];
 	struct nlattr *tb[TCA_ACT_MAX_PRIO + 1];
@@ -976,8 +1106,7 @@ find_dump_kind(const struct nlmsghdr *n)
 	return kind;
 }
 
-static int
-tc_dump_action(struct sk_buff *skb, struct netlink_callback *cb)
+static int tc_dump_action(struct sk_buff *skb, struct netlink_callback *cb)
 {
 	struct nlmsghdr *nlh;
 	unsigned char *b = skb_tail_pointer(skb);

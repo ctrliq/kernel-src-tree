@@ -110,7 +110,10 @@ struct vring_virtqueue {
 #define to_vvq(_vq) container_of(_vq, struct vring_virtqueue, vq)
 
 /*
- * The interaction between virtio and a possible IOMMU is a mess.
+ * Modern virtio devices have feature bits to specify whether they need a
+ * quirk and bypass the IOMMU. If not there, just use the DMA API.
+ *
+ * If there, the interaction between virtio and DMA API is messy.
  *
  * On most systems with virtio, physical addresses match bus addresses,
  * and it doesn't particularly matter whether we use the DMA API.
@@ -126,10 +129,17 @@ struct vring_virtqueue {
  *
  * For the time being, we preserve historic behavior and bypass the DMA
  * API.
+ *
+ * TODO: install a per-device DMA ops structure that does the right thing
+ * taking into account all the above quirks, and use the DMA API
+ * unconditionally on data path.
  */
 
 static bool vring_use_dma_api(struct virtio_device *vdev)
 {
+	if (!virtio_has_iommu_quirk(vdev))
+		return true;
+
 	return false;
 }
 
@@ -969,7 +979,7 @@ struct virtqueue *vring_create_virtqueue(
 	const char *name)
 {
 	struct virtqueue *vq;
-	void *queue;
+	void *queue = NULL;
 	dma_addr_t dma_addr;
 	size_t queue_size_in_bytes;
 	struct vring vring;
@@ -1061,6 +1071,8 @@ void vring_transport_features(struct virtio_device *vdev)
 		case VIRTIO_RING_F_EVENT_IDX:
 			break;
 		case VIRTIO_F_VERSION_1:
+			break;
+		case VIRTIO_F_IOMMU_PLATFORM:
 			break;
 		default:
 			/* We don't understand this bit. */

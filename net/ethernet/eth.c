@@ -62,6 +62,7 @@
 #include <net/ipv6.h>
 #include <net/ip.h>
 #include <net/dsa.h>
+#include <net/flow_dissector.h>
 #include <asm/uaccess.h>
 
 __setup("ether=", netdev_boot_setup);
@@ -159,6 +160,7 @@ EXPORT_SYMBOL(eth_rebuild_header);
  */
 u32 eth_get_headlen(void *data, unsigned int len)
 {
+	const unsigned int flags = FLOW_DISSECTOR_F_PARSE_1ST_FRAG;
 	const struct ethhdr *eth = (const struct ethhdr *)data;
 	struct flow_keys keys;
 
@@ -167,9 +169,9 @@ u32 eth_get_headlen(void *data, unsigned int len)
 		return len;
 
 	/* parse any remaining L2/L3 headers, check for L4 */
-	if (!__skb_flow_dissect(NULL, &keys, data,
-				eth->h_proto, sizeof(*eth), len))
-		return max_t(u32, keys.thoff, sizeof(*eth));
+	if (!skb_flow_dissect_flow_keys_buf(&keys, data, eth->h_proto,
+					    sizeof(*eth), len, flags))
+		return max_t(u32, keys.control.thoff, sizeof(*eth));
 
 	/* parse for any L4 headers */
 	return min_t(u32, __skb_get_poff(NULL, data, &keys, len), len);
@@ -221,11 +223,8 @@ __be16 eth_type_trans(struct sk_buff *skb, struct net_device *dev)
 	 * variants has been configured on the receiving interface,
 	 * and if so, set skb->protocol without looking at the packet.
 	 */
-	if (unlikely(netdev_uses_dsa_tags(dev)))
-		return htons(ETH_P_DSA);
-
-	if (unlikely(netdev_uses_trailer_tags(dev)))
-		return htons(ETH_P_TRAILER);
+	if (unlikely(netdev_uses_dsa(dev)))
+		return htons(ETH_P_XDSA);
 
 	if (likely(eth_proto_is_802_3(eth->h_proto)))
 		return eth->h_proto;

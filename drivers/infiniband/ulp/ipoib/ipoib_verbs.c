@@ -147,7 +147,7 @@ int ipoib_transport_dev_init(struct net_device *dev, struct ib_device *ca)
 	int ret, size;
 	int i;
 
-	priv->pd = ib_alloc_pd(priv->ca);
+	priv->pd = ib_alloc_pd(priv->ca, 0);
 	if (IS_ERR(priv->pd)) {
 		printk(KERN_WARNING "%s: failed to allocate PD\n", ca->name);
 		return -ENODEV;
@@ -307,5 +307,8 @@ void ipoib_event(struct ib_event_handler *handler,
 		queue_work(ipoib_workqueue, &priv->flush_normal);
 	} else if (record->event == IB_EVENT_PKEY_CHANGE) {
 		queue_work(ipoib_workqueue, &priv->flush_heavy);
+	} else if (record->event == IB_EVENT_GID_CHANGE &&
+		   !test_bit(IPOIB_FLAG_DEV_ADDR_SET, &priv->flags)) {
+		queue_work(ipoib_workqueue, &priv->flush_light);
 	}
 }

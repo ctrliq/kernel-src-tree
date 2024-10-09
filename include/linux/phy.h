@@ -1,6 +1,4 @@
 /*
- * include/linux/phy.h
- *
  * Framework and drivers for configuring and reading different PHYs
  * Based on code in sungem_phy.c and gianfar_phy.c
  *
@@ -69,8 +67,9 @@ typedef enum {
 	PHY_INTERFACE_MODE_SMII,
 } phy_interface_t;
 
+#define PHY_INTERFACE_MODE_XGMII	(PHY_INTERFACE_MODE_SMII+1)
 #define PHY_INTERFACE_MODE_MAX \
-	(PHY_INTERFACE_MODE_SMII - PHY_INTERFACE_MODE_NA + 1)
+	(PHY_INTERFACE_MODE_XGMII - PHY_INTERFACE_MODE_NA + 1)
 
 /**
  * It maps 'enum phy_interface_t' found in include/linux/phy.h
@@ -138,7 +137,6 @@ struct sk_buff;
  * PHYs should register using this structure
  */
 struct mii_bus {
-	struct module *owner;
 	const char *name;
 	char id[MII_BUS_ID_SIZE];
 	void *priv;
@@ -172,6 +170,7 @@ struct mii_bus {
 	 * interrupt at the index matching its address
 	 */
 	int *irq;
+	RH_KABI_EXTEND(struct module *owner)
 };
 #define to_mii_bus(d) container_of(d, struct mii_bus, dev)
 
@@ -185,6 +184,13 @@ int __mdiobus_register(struct mii_bus *bus, struct module *owner);
 #define mdiobus_register(bus) __mdiobus_register(bus, THIS_MODULE)
 void mdiobus_unregister(struct mii_bus *bus);
 void mdiobus_free(struct mii_bus *bus);
+struct mii_bus *devm_mdiobus_alloc_size(struct device *dev, int sizeof_priv);
+static inline struct mii_bus *devm_mdiobus_alloc(struct device *dev)
+{
+	return devm_mdiobus_alloc_size(dev, 0);
+}
+
+void devm_mdiobus_free(struct device *dev, struct mii_bus *bus);
 struct phy_device *mdiobus_scan(struct mii_bus *bus, int addr);
 
 #define PHY_INTERRUPT_DISABLED	0x0
@@ -271,7 +277,7 @@ struct phy_device *mdiobus_scan(struct mii_bus *bus, int addr);
  * - phy_stop moves to HALTED
  */
 enum phy_state {
-	PHY_DOWN=0,
+	PHY_DOWN = 0,
 	PHY_STARTING,
 	PHY_READY,
 	PHY_PENDING,
@@ -315,8 +321,6 @@ struct phy_c45_device_ids {
  * attached_dev: The attached enet driver's device instance ptr
  * adjust_link: Callback for the enet controller to respond to
  * changes in the link state.
- * adjust_state: Callback for the enet driver to respond to
- * changes in the state machine.
  *
  * speed, duplex, pause, supported, advertising, and
  * autoneg are used like in mii_if_info
@@ -341,7 +345,8 @@ struct phy_device {
 
 	struct phy_c45_device_ids c45_ids;
 	bool is_c45;
-	bool is_internal;
+	RH_KABI_FILL_HOLE(bool is_internal)
+	/* there is 2-bytes hole on all platforms */
 
 	enum phy_state state;
 
@@ -396,8 +401,7 @@ struct phy_device {
 	struct net_device *attached_dev;
 
 	void (*adjust_link)(struct net_device *dev);
-
-	void (*adjust_state)(struct net_device *dev);
+	RH_KABI_DEPRECATE_FN(void, adjust_state, struct net_device *dev)
 };
 #define to_phy_device(d) container_of(d, struct phy_device, dev)
 
@@ -451,9 +455,6 @@ struct phy_driver {
 	 * if phydev->autoneg is off
 	 */
 	int (*config_aneg)(struct phy_device *phydev);
-
-	/* Determines the auto negotiation result */
-	int (*aneg_done)(struct phy_device *phydev);
 
 	/* Determines the negotiated speed and duplex */
 	int (*read_status)(struct phy_device *phydev);
@@ -511,6 +512,13 @@ struct phy_driver {
 	void (*get_wol)(struct phy_device *dev, struct ethtool_wolinfo *wol);
 
 	struct device_driver driver;
+
+	/* Determines the auto negotiation result */
+	RH_KABI_EXTEND(int (*aneg_done)(struct phy_device *phydev))
+
+	/* PHY API is not on symbol whitelist now so we can extend
+	 * this structure directly via simple RH_KABI_EXTEND.
+	 */
 };
 #define to_phy_driver(d) container_of(d, struct phy_driver, driver)
 
@@ -616,24 +624,25 @@ static inline int phy_write_mmd(struct phy_device *phydev, int devad,
 }
 
 struct phy_device *phy_device_create(struct mii_bus *bus, int addr, int phy_id,
-		bool is_c45, struct phy_c45_device_ids *c45_ids);
+				     bool is_c45,
+				     struct phy_c45_device_ids *c45_ids);
 struct phy_device *get_phy_device(struct mii_bus *bus, int addr, bool is_c45);
 int phy_device_register(struct phy_device *phy);
 void phy_device_remove(struct phy_device *phydev);
 int phy_init_hw(struct phy_device *phydev);
 int phy_suspend(struct phy_device *phydev);
 int phy_resume(struct phy_device *phydev);
-struct phy_device * phy_attach(struct net_device *dev,
-		const char *bus_id, phy_interface_t interface);
+struct phy_device *phy_attach(struct net_device *dev, const char *bus_id,
+			      phy_interface_t interface);
 struct phy_device *phy_find_first(struct mii_bus *bus);
 int phy_attach_direct(struct net_device *dev, struct phy_device *phydev,
 		      u32 flags, phy_interface_t interface);
 int phy_connect_direct(struct net_device *dev, struct phy_device *phydev,
-		void (*handler)(struct net_device *),
-		phy_interface_t interface);
-struct phy_device * phy_connect(struct net_device *dev, const char *bus_id,
-		void (*handler)(struct net_device *),
-		phy_interface_t interface);
+		       void (*handler)(struct net_device *),
+		       phy_interface_t interface);
+struct phy_device *phy_connect(struct net_device *dev, const char *bus_id,
+			       void (*handler)(struct net_device *),
+			       phy_interface_t interface);
 void phy_disconnect(struct phy_device *phydev);
 void phy_detach(struct phy_device *phydev);
 void phy_start(struct phy_device *phydev);
@@ -643,7 +652,8 @@ int phy_aneg_done(struct phy_device *phydev);
 
 int phy_stop_interrupts(struct phy_device *phydev);
 
-static inline int phy_read_status(struct phy_device *phydev) {
+static inline int phy_read_status(struct phy_device *phydev)
+{
 	return phydev->drv->read_status(phydev);
 }
 
@@ -661,31 +671,29 @@ int phy_drivers_register(struct phy_driver *new_driver, int n);
 void phy_state_machine(struct work_struct *work);
 void phy_change(struct work_struct *work);
 void phy_mac_interrupt(struct phy_device *phydev, int new_link);
-void phy_start_machine(struct phy_device *phydev,
-		void (*handler)(struct net_device *));
+void phy_start_machine(struct phy_device *phydev);
 void phy_stop_machine(struct phy_device *phydev);
 int phy_ethtool_sset(struct phy_device *phydev, struct ethtool_cmd *cmd);
 int phy_ethtool_gset(struct phy_device *phydev, struct ethtool_cmd *cmd);
-int phy_mii_ioctl(struct phy_device *phydev,
-		struct ifreq *ifr, int cmd);
+int phy_mii_ioctl(struct phy_device *phydev, struct ifreq *ifr, int cmd);
 int phy_start_interrupts(struct phy_device *phydev);
 void phy_print_status(struct phy_device *phydev);
 void phy_device_free(struct phy_device *phydev);
 
 int phy_register_fixup(const char *bus_id, u32 phy_uid, u32 phy_uid_mask,
-		int (*run)(struct phy_device *));
+		       int (*run)(struct phy_device *));
 int phy_register_fixup_for_id(const char *bus_id,
-		int (*run)(struct phy_device *));
+			      int (*run)(struct phy_device *));
 int phy_register_fixup_for_uid(u32 phy_uid, u32 phy_uid_mask,
-		int (*run)(struct phy_device *));
-int phy_scan_fixups(struct phy_device *phydev);
+			       int (*run)(struct phy_device *));
 
 int phy_init_eee(struct phy_device *phydev, bool clk_stop_enable);
 int phy_get_eee_err(struct phy_device *phydev);
 int phy_ethtool_set_eee(struct phy_device *phydev, struct ethtool_eee *data);
 int phy_ethtool_get_eee(struct phy_device *phydev, struct ethtool_eee *data);
 int phy_ethtool_set_wol(struct phy_device *phydev, struct ethtool_wolinfo *wol);
-void phy_ethtool_get_wol(struct phy_device *phydev, struct ethtool_wolinfo *wol);
+void phy_ethtool_get_wol(struct phy_device *phydev,
+			 struct ethtool_wolinfo *wol);
 
 int __init mdio_bus_init(void);
 void mdio_bus_exit(void);

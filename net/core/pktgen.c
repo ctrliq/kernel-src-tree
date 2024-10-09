@@ -160,6 +160,8 @@
 #include <net/net_namespace.h>
 #include <net/checksum.h>
 #include <net/ipv6.h>
+#include <net/udp.h>
+#include <net/ip6_checksum.h>
 #include <net/addrconf.h>
 #ifdef CONFIG_XFRM
 #include <net/xfrm.h>
@@ -198,6 +200,7 @@
 #define F_QUEUE_MAP_RND (1<<13)	/* queue map Random */
 #define F_QUEUE_MAP_CPU (1<<14)	/* queue map mirrors smp_processor_id() */
 #define F_NODE          (1<<15)	/* Node memory alloc*/
+#define F_UDPCSUM       (1<<16)	/* Include UDP checksum */
 #define F_NO_TIMESTAMP  (1<<17)	/* Don't timestamp packets (default TS) */
 
 /* Thread control flag bits */
@@ -635,6 +638,9 @@ static int pktgen_if_show(struct seq_file *seq, void *v)
 
 	if (pkt_dev->flags & F_UDPDST_RND)
 		seq_printf(seq, "UDPDST_RND  ");
+
+	if (pkt_dev->flags & F_UDPCSUM)
+		seq_printf(seq, "UDPCSUM  ");
 
 	if (pkt_dev->flags & F_NO_TIMESTAMP)
 		seq_puts(seq, "NO_TIMESTAMP  ");
@@ -1248,6 +1254,12 @@ static ssize_t pktgen_if_write(struct file *file,
 
 		else if (strcmp(f, "!NODE_ALLOC") == 0)
 			pkt_dev->flags &= ~F_NODE;
+
+		else if (strcmp(f, "UDPCSUM") == 0)
+			pkt_dev->flags |= F_UDPCSUM;
+
+		else if (strcmp(f, "!UDPCSUM") == 0)
+			pkt_dev->flags &= ~F_UDPCSUM;
 
 		else if (strcmp(f, "NO_TIMESTAMP") == 0)
 			pkt_dev->flags |= F_NO_TIMESTAMP;
@@ -2775,7 +2787,7 @@ static struct sk_buff *fill_packet_ipv4(struct net_device *odev,
 	udph->source = htons(pkt_dev->cur_udp_src);
 	udph->dest = htons(pkt_dev->cur_udp_dst);
 	udph->len = htons(datalen + 8);	/* DATA + udphdr */
-	udph->check = 0;	/* No checksum */
+	udph->check = 0;
 
 	iph->ihl = 5;
 	iph->version = 4;
@@ -2794,7 +2806,25 @@ static struct sk_buff *fill_packet_ipv4(struct net_device *odev,
 	skb->protocol = protocol;
 	skb->dev = odev;
 	skb->pkt_type = PACKET_HOST;
+
 	pktgen_finalize_skb(pkt_dev, skb, datalen);
+
+	if (!(pkt_dev->flags & F_UDPCSUM)) {
+		skb->ip_summed = CHECKSUM_NONE;
+	} else if (odev->features & (NETIF_F_HW_CSUM | NETIF_F_IP_CSUM)) {
+		skb->ip_summed = CHECKSUM_PARTIAL;
+		skb->csum = 0;
+		udp4_hwcsum(skb, iph->saddr, iph->daddr);
+	} else {
+		__wsum csum = skb_checksum(skb, skb_transport_offset(skb), datalen + 8, 0);
+
+		/* add protocol-dependent pseudo-header */
+		udph->check = csum_tcpudp_magic(iph->saddr, iph->daddr,
+						datalen + 8, IPPROTO_UDP, csum);
+
+		if (udph->check == 0)
+			udph->check = CSUM_MANGLED_0;
+	}
 
 #ifdef CONFIG_XFRM
 	if (!process_ipsec(pkt_dev, skb, protocol))
@@ -2810,7 +2840,7 @@ static struct sk_buff *fill_packet_ipv6(struct net_device *odev,
 	struct sk_buff *skb = NULL;
 	__u8 *eth;
 	struct udphdr *udph;
-	int datalen;
+	int datalen, udplen;
 	struct ipv6hdr *iph;
 	__be16 protocol = htons(ETH_P_IPV6);
 	__be32 *mpls;
@@ -2886,10 +2916,11 @@ static struct sk_buff *fill_packet_ipv6(struct net_device *odev,
 		net_info_ratelimited("increased datalen to %d\n", datalen);
 	}
 
+	udplen = datalen + sizeof(struct udphdr);
 	udph->source = htons(pkt_dev->cur_udp_src);
 	udph->dest = htons(pkt_dev->cur_udp_dst);
-	udph->len = htons(datalen + sizeof(struct udphdr));
-	udph->check = 0;	/* No checksum */
+	udph->len = htons(udplen);
+	udph->check = 0;
 
 	*(__be32 *) iph = htonl(0x60000000);	/* Version + flow */
 
@@ -2900,7 +2931,7 @@ static struct sk_buff *fill_packet_ipv6(struct net_device *odev,
 
 	iph->hop_limit = 32;
 
-	iph->payload_len = htons(sizeof(struct udphdr) + datalen);
+	iph->payload_len = htons(udplen);
 	iph->nexthdr = IPPROTO_UDP;
 
 	iph->daddr = pkt_dev->cur_in6_daddr;
@@ -2911,6 +2942,23 @@ static struct sk_buff *fill_packet_ipv6(struct net_device *odev,
 	skb->pkt_type = PACKET_HOST;
 
 	pktgen_finalize_skb(pkt_dev, skb, datalen);
+
+	if (!(pkt_dev->flags & F_UDPCSUM)) {
+		skb->ip_summed = CHECKSUM_NONE;
+	} else if (odev->features & (NETIF_F_HW_CSUM | NETIF_F_IPV6_CSUM)) {
+		skb->ip_summed = CHECKSUM_PARTIAL;
+		skb->csum_start = skb_transport_header(skb) - skb->head;
+		skb->csum_offset = offsetof(struct udphdr, check);
+		udph->check = ~csum_ipv6_magic(&iph->saddr, &iph->daddr, udplen, IPPROTO_UDP, 0);
+	} else {
+		__wsum csum = skb_checksum(skb, skb_transport_offset(skb), udplen, 0);
+
+		/* add protocol-dependent pseudo-header */
+		udph->check = csum_ipv6_magic(&iph->saddr, &iph->daddr, udplen, IPPROTO_UDP, csum);
+
+		if (udph->check == 0)
+			udph->check = CSUM_MANGLED_0;
+	}
 
 	return skb;
 }

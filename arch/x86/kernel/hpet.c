@@ -11,7 +11,6 @@
 #include <linux/cpu.h>
 #include <linux/pm.h>
 #include <linux/io.h>
-#include <linux/dmi.h>
 
 #include <asm/fixmap.h>
 #include <asm/hpet.h>
@@ -894,9 +893,6 @@ int __init hpet_enable(void)
 	u32 hpet_period, cfg, id;
 	u64 freq;
 	unsigned int i, last;
-
-	if (boot_cpu_data.x86_model == 85 && dmi_socket_count > 2)
-		boot_hpet_disable = 1;
 
 	if (!is_hpet_capable())
 		return 0;

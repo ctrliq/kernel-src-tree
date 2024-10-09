@@ -15,8 +15,8 @@ extern struct dma_map_ops s390_pci_dma_ops;
 
 static inline struct dma_map_ops *get_dma_ops(struct device *dev)
 {
-	if (dev && dev->archdata.dma_ops)
-		return dev->archdata.dma_ops;
+	if (dev && dev->device_rh->dma_ops)
+		return dev->device_rh->dma_ops;
 	return &dma_noop_ops;
 }
 

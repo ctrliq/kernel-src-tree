@@ -345,7 +345,7 @@ static int intel_bts_get_next_insn(struct intel_bts_queue *btsq, u64 ip)
 		goto out_put;
 
 	/* Load maps to ensure dso->is_64_bit has been updated */
-	map__load(al.map, NULL);
+	map__load(al.map);
 
 	x86_64 = al.map->dso->is_64_bit;
 
@@ -784,7 +784,7 @@ static int intel_bts_synth_events(struct intel_bts *bts,
 	u64 id;
 	int err;
 
-	evlist__for_each(evlist, evsel) {
+	evlist__for_each_entry(evlist, evsel) {
 		if (evsel->attr.type == bts->pmu_type && evsel->ids) {
 			found = true;
 			break;

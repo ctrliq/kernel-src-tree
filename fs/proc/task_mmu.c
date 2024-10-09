@@ -139,65 +139,62 @@ static void vma_stop(struct proc_maps_private *priv)
 	mmput(mm);
 }
 
-static void *m_start(struct seq_file *m, loff_t *pos)
+static struct vm_area_struct *
+m_next_vma(struct proc_maps_private *priv, struct vm_area_struct *vma)
+{
+	if (vma == priv->tail_vma)
+		return NULL;
+	return vma->vm_next ?: priv->tail_vma;
+}
+
+static void m_cache_vma(struct seq_file *m, struct vm_area_struct *vma)
+{
+	if (m->count < m->size)	/* vma is copied successfully */
+		m->version = m_next_vma(m->private, vma) ? vma->vm_start : -1UL;
+}
+
+static void *m_start(struct seq_file *m, loff_t *ppos)
 {
 	struct proc_maps_private *priv = m->private;
 	unsigned long last_addr = m->version;
 	struct mm_struct *mm;
-	struct vm_area_struct *vma, *tail_vma = NULL;
-	loff_t l = *pos;
+	struct vm_area_struct *vma;
+	unsigned int pos = *ppos;
 
-	/*
-	 * We remember last_addr rather than next_addr to hit with
-	 * mmap_cache most of the time. We have zero last_addr at
-	 * the beginning and also after lseek. We will have -1 last_addr
-	 * after the end of the vmas.
-	 */
+	/* See m_cache_vma(). Zero at the start or after lseek. */
 	if (last_addr == -1UL)
 		return NULL;
 
-	priv->task = get_pid_task(priv->pid, PIDTYPE_PID);
+	priv->task = get_proc_task(priv->inode);
 	if (!priv->task)
 		return ERR_PTR(-ESRCH);
 
 	mm = priv->mm;
 	if (!mm || !atomic_inc_not_zero(&mm->mm_users))
 		return NULL;
+
 	down_read(&mm->mmap_sem);
-
-	tail_vma = get_gate_vma(mm);
-	priv->tail_vma = tail_vma;
 	hold_task_mempolicy(priv);
-	/* Start with last addr hint */
-	vma = find_vma(mm, last_addr);
-	if (last_addr && vma) {
-		vma = vma->vm_next;
-		goto out;
+	priv->tail_vma = get_gate_vma(mm);
+
+	if (last_addr) {
+		vma = find_vma(mm, last_addr);
+		if (vma && (vma = m_next_vma(priv, vma)))
+			return vma;
 	}
 
-	/*
-	 * Check the vma index is within the range and do
-	 * sequential scan until m_index.
-	 */
-	vma = NULL;
-	if ((unsigned long)l < mm->map_count) {
-		vma = mm->mmap;
-		while (l-- && vma)
+	m->version = 0;
+	if (pos < mm->map_count) {
+		for (vma = mm->mmap; pos; pos--) {
+			m->version = vma->vm_start;
 			vma = vma->vm_next;
-		goto out;
+		}
+		return vma;
 	}
 
-	if (l != mm->map_count)
-		tail_vma = NULL; /* After gate vma */
-
-out:
-	if (vma)
-		return vma;
-
-	/* End of vmas has been reached */
-	m->version = (tail_vma != NULL)? 0: -1UL;
-	if (tail_vma)
-		return tail_vma;
+	/* we do not bother to update m->version in this case */
+	if (pos == mm->map_count && priv->tail_vma)
+		return priv->tail_vma;
 
 	vma_stop(priv);
 	return NULL;
@@ -206,13 +203,10 @@ out:
 static void *m_next(struct seq_file *m, void *v, loff_t *pos)
 {
 	struct proc_maps_private *priv = m->private;
-	struct vm_area_struct *tail_vma = priv->tail_vma;
-	struct vm_area_struct *vma = v, *next = NULL;
+	struct vm_area_struct *next;
 
 	(*pos)++;
-	if (vma != tail_vma)
-		next = vma->vm_next ?: tail_vma;
-
+	next = m_next_vma(priv, v);
 	if (!next)
 		vma_stop(priv);
 	return next;
@@ -238,7 +232,7 @@ static int proc_maps_open(struct inode *inode, struct file *file,
 	if (!priv)
 		return -ENOMEM;
 
-	priv->pid = proc_pid(inode);
+	priv->inode = inode;
 	priv->mm = proc_mem_open(inode, PTRACE_MODE_READ);
 	if (IS_ERR(priv->mm)) {
 		int err = PTR_ERR(priv->mm);
@@ -268,13 +262,31 @@ static int do_maps_open(struct inode *inode, struct file *file,
 				sizeof(struct proc_maps_private));
 }
 
+static pid_t pid_of_stack(struct proc_maps_private *priv,
+				struct vm_area_struct *vma, bool is_pid)
+{
+	struct inode *inode = priv->inode;
+	struct task_struct *task;
+	pid_t ret = 0;
+
+	rcu_read_lock();
+	task = pid_task(proc_pid(inode), PIDTYPE_PID);
+	if (task) {
+		task = task_of_stack(task, vma, is_pid);
+		if (task)
+			ret = task_pid_nr_ns(task, inode->i_sb->s_fs_info);
+	}
+	rcu_read_unlock();
+
+	return ret;
+}
+
 static void
 show_map_vma(struct seq_file *m, struct vm_area_struct *vma, int is_pid)
 {
 	struct mm_struct *mm = vma->vm_mm;
 	struct file *file = vma->vm_file;
 	struct proc_maps_private *priv = m->private;
-	struct task_struct *task = priv->task;
 	vm_flags_t flags = vma->vm_flags;
 	unsigned long ino = 0;
 	unsigned long long pgoff = 0;
@@ -292,11 +304,7 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma, int is_pid)
 
 	/* We don't show the stack guard page in /proc/maps */
 	start = vma->vm_start;
-	if (stack_guard_page_start(vma, start))
-		start += PAGE_SIZE;
 	end = vma->vm_end;
-	if (stack_guard_page_end(vma, end))
-		end -= PAGE_SIZE;
 
 	seq_printf(m, "%08lx-%08lx %c%c%c%c %08llx %02x:%02x %lu %n",
 			start,
@@ -333,8 +341,7 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma, int is_pid)
 			goto done;
 		}
 
-		tid = vm_is_stack(task, vma, is_pid);
-
+		tid = pid_of_stack(priv, vma, is_pid);
 		if (tid != 0) {
 			/*
 			 * Thread stack in /proc/PID/task/TID/maps or
@@ -361,14 +368,8 @@ done:
 
 static int show_map(struct seq_file *m, void *v, int is_pid)
 {
-	struct vm_area_struct *vma = v;
-	struct proc_maps_private *priv = m->private;
-
-	show_map_vma(m, vma, is_pid);
-
-	if (m->count < m->size)  /* vma is copied successfully */
-		m->version = (vma != priv->tail_vma)
-			? vma->vm_start : 0;
+	show_map_vma(m, v, is_pid);
+	m_cache_vma(m, v);
 	return 0;
 }
 
@@ -487,6 +488,8 @@ static void smaps_pte_entry(pte_t ptent, unsigned long addr,
 			mss->swap += ptent_size;
 		else if (is_migration_entry(swpent))
 			page = migration_entry_to_page(swpent);
+		else if (is_hmm_entry(swpent))
+			page = hmm_entry_to_page(swpent);
 	} else if (pte_file(ptent)) {
 		if (pte_to_pgoff(ptent) != pgoff)
 			mss->nonlinear += ptent_size;
@@ -627,7 +630,6 @@ static void show_smap_vma_flags(struct seq_file *m, struct vm_area_struct *vma)
 
 static int show_smap(struct seq_file *m, void *v, int is_pid)
 {
-	struct proc_maps_private *priv = m->private;
 	struct vm_area_struct *vma = v;
 	struct mem_size_stats mss;
 	struct mm_walk smaps_walk = {
@@ -705,10 +707,7 @@ static int show_smap(struct seq_file *m, void *v, int is_pid)
 				mss.nonlinear >> 10);
 
 	show_smap_vma_flags(m, vma);
-
-	if (m->count < m->size)  /* vma is copied successfully */
-		m->version = (vma != priv->tail_vma)
-			? vma->vm_start : 0;
+	m_cache_vma(m, vma);
 	return 0;
 }
 
@@ -1037,6 +1036,8 @@ static void pte_to_pagemap_entry(pagemap_entry_t *pme, struct pagemapread *pm,
 		flags = PM_SWAP;
 		if (is_migration_entry(entry))
 			page = migration_entry_to_page(entry);
+		else if (is_hmm_entry(entry))
+			page = hmm_entry_to_page(entry);
 	} else {
 		if (vma->vm_flags & VM_SOFTDIRTY)
 			flags2 |= __PM_SOFT_DIRTY;
@@ -1503,7 +1504,7 @@ static int show_numa_map(struct seq_file *m, void *v, int is_pid)
 	} else if (vma->vm_start <= mm->brk && vma->vm_end >= mm->start_brk) {
 		seq_printf(m, " heap");
 	} else {
-		pid_t tid = vm_is_stack(task, vma, is_pid);
+		pid_t tid = pid_of_stack(proc_priv, vma, is_pid);
 		if (tid != 0) {
 			/*
 			 * Thread stack in /proc/PID/task/TID/maps or
@@ -1553,9 +1554,7 @@ static int show_numa_map(struct seq_file *m, void *v, int is_pid)
 	seq_printf(m, " kernelpagesize_kB=%lu", vma_kernel_pagesize(vma) >> 10);
 out:
 	seq_putc(m, '\n');
-
-	if (m->count < m->size)
-		m->version = (vma != proc_priv->tail_vma) ? vma->vm_start : 0;
+	m_cache_vma(m, vma);
 	return 0;
 }
 

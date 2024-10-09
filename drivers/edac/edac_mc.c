@@ -234,6 +234,20 @@ static void _edac_mc_free(struct mem_ctl_info *mci)
 	kfree(mci);
 }
 
+bool edac_has_mcs(void)
+{
+	bool ret;
+
+	mutex_lock(&mem_ctls_mutex);
+
+	ret = list_empty(&mc_devices);
+
+	mutex_unlock(&mem_ctls_mutex);
+
+	return !ret;
+}
+EXPORT_SYMBOL_GPL(edac_has_mcs);
+
 /**
  * edac_mc_alloc: Allocate and partially fill a struct mem_ctl_info structure
  * @mc_num:		Memory controller number

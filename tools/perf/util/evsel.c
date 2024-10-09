@@ -28,14 +28,20 @@
 #include "debug.h"
 #include "trace-event.h"
 #include "stat.h"
+#include "util/parse-branch-options.h"
 
 static struct {
 	bool sample_id_all;
 	bool exclude_guest;
 	bool mmap2;
 	bool cloexec;
+	bool clockid;
+	bool clockid_wrong;
 	bool lbr_flags;
+	bool write_backward;
 } perf_missing_features;
+
+static clockid_t clockid;
 
 static int perf_evsel__no_extra_init(struct perf_evsel *evsel __maybe_unused)
 {
@@ -597,10 +603,9 @@ int perf_evsel__group_desc(struct perf_evsel *evsel, char *buf, size_t size)
 	return ret;
 }
 
-static void
-perf_evsel__config_callgraph(struct perf_evsel *evsel,
-			     struct record_opts *opts,
-			     struct callchain_param *param)
+void perf_evsel__config_callchain(struct perf_evsel *evsel,
+				  struct record_opts *opts,
+				  struct callchain_param *param)
 {
 	bool function = perf_evsel__is_function_event(evsel);
 	struct perf_event_attr *attr = &evsel->attr;
@@ -694,6 +699,14 @@ static void apply_config_terms(struct perf_evsel *evsel,
 		case PERF_EVSEL__CONFIG_TERM_CALLGRAPH:
 			callgraph_buf = term->val.callgraph;
 			break;
+		case PERF_EVSEL__CONFIG_TERM_BRANCH:
+			if (term->val.branch && strcmp(term->val.branch, "no")) {
+				perf_evsel__set_sample_bit(evsel, BRANCH_STACK);
+				parse_branch_str(term->val.branch,
+						 &attr->branch_sample_type);
+			} else
+				perf_evsel__reset_sample_bit(evsel, BRANCH_STACK);
+			break;
 		case PERF_EVSEL__CONFIG_TERM_STACK_USER:
 			dump_size = term->val.stack_user;
 			break;
@@ -705,6 +718,9 @@ static void apply_config_terms(struct perf_evsel *evsel,
 			 * opt->no_inherit setting.
 			 */
 			attr->inherit = term->val.inherit ? 1 : 0;
+			break;
+		case PERF_EVSEL__CONFIG_TERM_OVERWRITE:
+			attr->write_backward = term->val.overwrite ? 1 : 0;
 			break;
 		default:
 			break;
@@ -740,7 +756,7 @@ static void apply_config_terms(struct perf_evsel *evsel,
 
 		/* set perf-event callgraph */
 		if (param.enabled)
-			perf_evsel__config_callgraph(evsel, opts, &param);
+			perf_evsel__config_callchain(evsel, opts, &param);
 	}
 }
 
@@ -772,7 +788,8 @@ static void apply_config_terms(struct perf_evsel *evsel,
  *     enable/disable events specifically, as there's no
  *     initial traced exec call.
  */
-void perf_evsel__config(struct perf_evsel *evsel, struct record_opts *opts)
+void perf_evsel__config(struct perf_evsel *evsel, struct record_opts *opts,
+			struct callchain_param *callchain)
 {
 	struct perf_evsel *leader = evsel->leader;
 	struct perf_event_attr *attr = &evsel->attr;
@@ -781,6 +798,7 @@ void perf_evsel__config(struct perf_evsel *evsel, struct record_opts *opts)
 
 	attr->sample_id_all = perf_missing_features.sample_id_all ? 0 : 1;
 	attr->inherit	    = !opts->no_inherit;
+	attr->write_backward = opts->overwrite ? 1 : 0;
 
 	perf_evsel__set_sample_bit(evsel, IP);
 	perf_evsel__set_sample_bit(evsel, TID);
@@ -847,22 +865,22 @@ void perf_evsel__config(struct perf_evsel *evsel, struct record_opts *opts)
 	if (perf_evsel__is_function_event(evsel))
 		evsel->attr.exclude_callchain_user = 1;
 
-	if (callchain_param.enabled && !evsel->no_aux_samples)
-		perf_evsel__config_callgraph(evsel, opts, &callchain_param);
+	if (callchain && callchain->enabled && !evsel->no_aux_samples)
+		perf_evsel__config_callchain(evsel, opts, callchain);
 
 	if (opts->sample_intr_regs) {
 		attr->sample_regs_intr = opts->sample_intr_regs;
 		perf_evsel__set_sample_bit(evsel, REGS_INTR);
 	}
 
-	if (target__has_cpu(&opts->target))
+	if (target__has_cpu(&opts->target) || opts->sample_cpu)
 		perf_evsel__set_sample_bit(evsel, CPU);
 
 	if (opts->period)
 		perf_evsel__set_sample_bit(evsel, PERIOD);
 
 	/*
-	 * When the user explicitely disabled time don't force it here.
+	 * When the user explicitly disabled time don't force it here.
 	 */
 	if (opts->sample_time &&
 	    (!perf_missing_features.sample_id_all &&
@@ -930,6 +948,12 @@ void perf_evsel__config(struct perf_evsel *evsel, struct record_opts *opts)
 		attr->enable_on_exec = 0;
 	}
 
+	clockid = opts->clockid;
+	if (opts->use_clockid) {
+		attr->use_clockid = 1;
+		attr->clockid = opts->clockid;
+	}
+
 	if (evsel->precise_max)
 		perf_event_attr__set_max_precise_ip(attr);
 
@@ -948,18 +972,19 @@ void perf_evsel__config(struct perf_evsel *evsel, struct record_opts *opts)
 	 * it overloads any global configuration.
 	 */
 	apply_config_terms(evsel, opts);
+
+	evsel->ignore_missing_thread = opts->ignore_missing_thread;
 }
 
 static int perf_evsel__alloc_fd(struct perf_evsel *evsel, int ncpus, int nthreads)
 {
-	int cpu, thread;
-
 	if (evsel->system_wide)
 		nthreads = 1;
 
 	evsel->fd = xyarray__new(ncpus, nthreads, sizeof(int));
 
 	if (evsel->fd) {
+		int cpu, thread;
 		for (cpu = 0; cpu < ncpus; cpu++) {
 			for (thread = 0; thread < nthreads; thread++) {
 				FD(evsel, cpu, thread) = -1;
@@ -1353,6 +1378,7 @@ int perf_event_attr__fprintf(FILE *fp, struct perf_event_attr *attr,
 	PRINT_ATTRf(exclude_callchain_user, p_unsigned);
 	PRINT_ATTRf(mmap2, p_unsigned);
 	PRINT_ATTRf(comm_exec, p_unsigned);
+	PRINT_ATTRf(use_clockid, p_unsigned);
 	PRINT_ATTRf(context_switch, p_unsigned);
 	PRINT_ATTRf(write_backward, p_unsigned);
 
@@ -1363,6 +1389,7 @@ int perf_event_attr__fprintf(FILE *fp, struct perf_event_attr *attr,
 	PRINT_ATTRf(branch_sample_type, p_branch_sample_type);
 	PRINT_ATTRf(sample_regs_user, p_hex);
 	PRINT_ATTRf(sample_stack_user, p_unsigned);
+	PRINT_ATTRf(clockid, p_signed);
 	PRINT_ATTRf(sample_regs_intr, p_hex);
 	PRINT_ATTRf(aux_watermark, p_unsigned);
 
@@ -1375,6 +1402,33 @@ static int __open_attr__fprintf(FILE *fp, const char *name, const char *val,
 	return fprintf(fp, "  %-32s %s\n", name, val);
 }
 
+static bool ignore_missing_thread(struct perf_evsel *evsel,
+				  struct thread_map *threads,
+				  int thread, int err)
+{
+	if (!evsel->ignore_missing_thread)
+		return false;
+
+	/* The system wide setup does not work with threads. */
+	if (evsel->system_wide)
+		return false;
+
+	/* The -ESRCH is perf event syscall errno for pid's not found. */
+	if (err != -ESRCH)
+		return false;
+
+	/* If there's only one thread, let it fail. */
+	if (threads->nr == 1)
+		return false;
+
+	if (thread_map__remove(threads, thread))
+		return false;
+
+	pr_warning("WARNING: Ignored open failure for pid %d\n",
+		   thread_map__pid(threads, thread));
+	return true;
+}
+
 static int __perf_evsel__open(struct perf_evsel *evsel, struct cpu_map *cpus,
 			      struct thread_map *threads)
 {
@@ -1382,6 +1436,9 @@ static int __perf_evsel__open(struct perf_evsel *evsel, struct cpu_map *cpus,
 	unsigned long flags = PERF_FLAG_FD_CLOEXEC;
 	int pid = -1, err;
 	enum { NO_CHANGE, SET_TO_MAX, INCREASED_MAX } set_rlimit = NO_CHANGE;
+
+	if (perf_missing_features.write_backward && evsel->attr.write_backward)
+		return -EINVAL;
 
 	if (evsel->system_wide)
 		nthreads = 1;
@@ -1398,6 +1455,12 @@ static int __perf_evsel__open(struct perf_evsel *evsel, struct cpu_map *cpus,
 	}
 
 fallback_missing_features:
+	if (perf_missing_features.clockid_wrong)
+		evsel->attr.clockid = CLOCK_MONOTONIC; /* should always work */
+	if (perf_missing_features.clockid) {
+		evsel->attr.use_clockid = 0;
+		evsel->attr.clockid = 0;
+	}
 	if (perf_missing_features.cloexec)
 		flags &= ~(unsigned long)PERF_FLAG_FD_CLOEXEC;
 	if (perf_missing_features.mmap2)
@@ -1421,27 +1484,57 @@ retry_sample_id:
 	for (cpu = 0; cpu < cpus->nr; cpu++) {
 
 		for (thread = 0; thread < nthreads; thread++) {
-			int group_fd;
+			int fd, group_fd;
 
 			if (!evsel->cgrp && !evsel->system_wide)
 				pid = thread_map__pid(threads, thread);
 
 			group_fd = get_group_fd(evsel, cpu, thread);
 retry_open:
-			pr_debug2("sys_perf_event_open: pid %d  cpu %d  group_fd %d  flags %#lx\n",
+			pr_debug2("sys_perf_event_open: pid %d  cpu %d  group_fd %d  flags %#lx",
 				  pid, cpus->map[cpu], group_fd, flags);
 
-			FD(evsel, cpu, thread) = sys_perf_event_open(&evsel->attr,
-								     pid,
-								     cpus->map[cpu],
-								     group_fd, flags);
-			if (FD(evsel, cpu, thread) < 0) {
+			fd = sys_perf_event_open(&evsel->attr, pid, cpus->map[cpu],
+						 group_fd, flags);
+
+			FD(evsel, cpu, thread) = fd;
+
+			if (fd < 0) {
 				err = -errno;
-				pr_debug2("sys_perf_event_open failed, error %d\n",
+
+				if (ignore_missing_thread(evsel, threads, thread, err)) {
+					/*
+					 * We just removed 1 thread, so take a step
+					 * back on thread index and lower the upper
+					 * nthreads limit.
+					 */
+					nthreads--;
+					thread--;
+
+					/* ... and pretend like nothing have happened. */
+					err = 0;
+					continue;
+				}
+
+				pr_debug2("\nsys_perf_event_open failed, error %d\n",
 					  err);
 				goto try_fallback;
 			}
+
+			pr_debug2(" = %d\n", fd);
+
 			set_rlimit = NO_CHANGE;
+
+			/*
+			 * If we succeeded but had to kill clockid, fail and
+			 * have perf_evsel__open_strerror() print us a nice
+			 * error.
+			 */
+			if (perf_missing_features.clockid ||
+			    perf_missing_features.clockid_wrong) {
+				err = -EINVAL;
+				goto out_close;
+			}
 		}
 	}
 
@@ -1475,7 +1568,20 @@ try_fallback:
 	if (err != -EINVAL || cpu > 0 || thread > 0)
 		goto out_close;
 
-	if (!perf_missing_features.cloexec && (flags & PERF_FLAG_FD_CLOEXEC)) {
+	/*
+	 * Must probe features in the order they were added to the
+	 * perf_event_attr interface.
+	 */
+	if (!perf_missing_features.write_backward && evsel->attr.write_backward) {
+		perf_missing_features.write_backward = true;
+		goto out_close;
+	} else if (!perf_missing_features.clockid_wrong && evsel->attr.use_clockid) {
+		perf_missing_features.clockid_wrong = true;
+		goto fallback_missing_features;
+	} else if (!perf_missing_features.clockid && evsel->attr.use_clockid) {
+		perf_missing_features.clockid = true;
+		goto fallback_missing_features;
+	} else if (!perf_missing_features.cloexec && (flags & PERF_FLAG_FD_CLOEXEC)) {
 		perf_missing_features.cloexec = true;
 		goto fallback_missing_features;
 	} else if (!perf_missing_features.mmap2 && evsel->attr.mmap2) {
@@ -1495,7 +1601,6 @@ try_fallback:
 		perf_missing_features.lbr_flags = true;
 		goto fallback_missing_features;
 	}
-
 out_close:
 	do {
 		while (--thread >= 0) {
@@ -2218,17 +2323,11 @@ void *perf_evsel__rawptr(struct perf_evsel *evsel, struct perf_sample *sample,
 	return sample->raw_data + offset;
 }
 
-u64 perf_evsel__intval(struct perf_evsel *evsel, struct perf_sample *sample,
-		       const char *name)
+u64 format_field__intval(struct format_field *field, struct perf_sample *sample,
+			 bool needs_swap)
 {
-	struct format_field *field = perf_evsel__field(evsel, name);
-	void *ptr;
 	u64 value;
-
-	if (!field)
-		return 0;
-
-	ptr = sample->raw_data + field->offset;
+	void *ptr = sample->raw_data + field->offset;
 
 	switch (field->size) {
 	case 1:
@@ -2246,7 +2345,7 @@ u64 perf_evsel__intval(struct perf_evsel *evsel, struct perf_sample *sample,
 		return 0;
 	}
 
-	if (!evsel->needs_swap)
+	if (!needs_swap)
 		return value;
 
 	switch (field->size) {
@@ -2263,93 +2362,15 @@ u64 perf_evsel__intval(struct perf_evsel *evsel, struct perf_sample *sample,
 	return 0;
 }
 
-static int comma_fprintf(FILE *fp, bool *first, const char *fmt, ...)
+u64 perf_evsel__intval(struct perf_evsel *evsel, struct perf_sample *sample,
+		       const char *name)
 {
-	va_list args;
-	int ret = 0;
+	struct format_field *field = perf_evsel__field(evsel, name);
 
-	if (!*first) {
-		ret += fprintf(fp, ",");
-	} else {
-		ret += fprintf(fp, ":");
-		*first = false;
-	}
+	if (!field)
+		return 0;
 
-	va_start(args, fmt);
-	ret += vfprintf(fp, fmt, args);
-	va_end(args);
-	return ret;
-}
-
-static int __print_attr__fprintf(FILE *fp, const char *name, const char *val, void *priv)
-{
-	return comma_fprintf(fp, (bool *)priv, " %s: %s", name, val);
-}
-
-int perf_evsel__fprintf(struct perf_evsel *evsel,
-			struct perf_attr_details *details, FILE *fp)
-{
-	bool first = true;
-	int printed = 0;
-
-	if (details->event_group) {
-		struct perf_evsel *pos;
-
-		if (!perf_evsel__is_group_leader(evsel))
-			return 0;
-
-		if (evsel->nr_members > 1)
-			printed += fprintf(fp, "%s{", evsel->group_name ?: "");
-
-		printed += fprintf(fp, "%s", perf_evsel__name(evsel));
-		for_each_group_member(pos, evsel)
-			printed += fprintf(fp, ",%s", perf_evsel__name(pos));
-
-		if (evsel->nr_members > 1)
-			printed += fprintf(fp, "}");
-		goto out;
-	}
-
-	printed += fprintf(fp, "%s", perf_evsel__name(evsel));
-
-	if (details->verbose) {
-		printed += perf_event_attr__fprintf(fp, &evsel->attr,
-						    __print_attr__fprintf, &first);
-	} else if (details->freq) {
-		const char *term = "sample_freq";
-
-		if (!evsel->attr.freq)
-			term = "sample_period";
-
-		printed += comma_fprintf(fp, &first, " %s=%" PRIu64,
-					 term, (u64)evsel->attr.sample_freq);
-	}
-
-	if (details->trace_fields) {
-		struct format_field *field;
-
-		if (evsel->attr.type != PERF_TYPE_TRACEPOINT) {
-			printed += comma_fprintf(fp, &first, " (not a tracepoint)");
-			goto out;
-		}
-
-		field = evsel->tp_format->format.fields;
-		if (field == NULL) {
-			printed += comma_fprintf(fp, &first, " (no trace field)");
-			goto out;
-		}
-
-		printed += comma_fprintf(fp, &first, " trace_fields: %s", field->name);
-
-		field = field->next;
-		while (field) {
-			printed += comma_fprintf(fp, &first, "%s", field->name);
-			field = field->next;
-		}
-	}
-out:
-	fputc('\n', fp);
-	return ++printed;
+	return field ? format_field__intval(field, sample, evsel->needs_swap) : 0;
 }
 
 bool perf_evsel__fallback(struct perf_evsel *evsel, int err,
@@ -2459,6 +2480,14 @@ int perf_evsel__open_strerror(struct perf_evsel *evsel, struct target *target,
 	"The PMU counters are busy/taken by another profiler.\n"
 	"We found oprofile daemon running, please stop it and try again.");
 		break;
+	case EINVAL:
+		if (evsel->attr.write_backward && perf_missing_features.write_backward)
+			return scnprintf(msg, size, "Reading from overwrite event is not supported by this kernel.");
+		if (perf_missing_features.clockid)
+			return scnprintf(msg, size, "clockid feature not supported.");
+		if (perf_missing_features.clockid_wrong)
+			return scnprintf(msg, size, "wrong clockid (%d).", clockid);
+		break;
 	default:
 		break;
 	}
@@ -2467,7 +2496,7 @@ int perf_evsel__open_strerror(struct perf_evsel *evsel, struct target *target,
 	"The sys_perf_event_open() syscall returned with %d (%s) for event (%s).\n"
 	"/bin/dmesg may provide additional information.\n"
 	"No CONFIG_PERF_EVENTS=y kernel support configured?",
-			 err, strerror_r(err, sbuf, sizeof(sbuf)),
+			 err, str_error_r(err, sbuf, sizeof(sbuf)),
 			 perf_evsel__name(evsel));
 }
 

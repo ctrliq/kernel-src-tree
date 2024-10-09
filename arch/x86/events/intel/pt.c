@@ -36,13 +36,6 @@ static DEFINE_PER_CPU(struct pt, pt_ctx);
 
 static struct pt_pmu pt_pmu;
 
-enum cpuid_regs {
-	CR_EAX = 0,
-	CR_ECX,
-	CR_EDX,
-	CR_EBX
-};
-
 /*
  * Capabilities of Intel PT hardware, such as number of address bits or
  * supported output schemes, are cached and exported to userspace as "caps"
@@ -64,21 +57,21 @@ static struct pt_cap_desc {
 	u8		reg;
 	u32		mask;
 } pt_caps[] = {
-	PT_CAP(max_subleaf,		0, CR_EAX, 0xffffffff),
-	PT_CAP(cr3_filtering,		0, CR_EBX, BIT(0)),
-	PT_CAP(psb_cyc,			0, CR_EBX, BIT(1)),
-	PT_CAP(ip_filtering,		0, CR_EBX, BIT(2)),
-	PT_CAP(mtc,			0, CR_EBX, BIT(3)),
-	PT_CAP(ptwrite,			0, CR_EBX, BIT(4)),
-	PT_CAP(power_event_trace,	0, CR_EBX, BIT(5)),
-	PT_CAP(topa_output,		0, CR_ECX, BIT(0)),
-	PT_CAP(topa_multiple_entries,	0, CR_ECX, BIT(1)),
-	PT_CAP(single_range_output,	0, CR_ECX, BIT(2)),
-	PT_CAP(payloads_lip,		0, CR_ECX, BIT(31)),
-	PT_CAP(num_address_ranges,	1, CR_EAX, 0x3),
-	PT_CAP(mtc_periods,		1, CR_EAX, 0xffff0000),
-	PT_CAP(cycle_thresholds,	1, CR_EBX, 0xffff),
-	PT_CAP(psb_periods,		1, CR_EBX, 0xffff0000),
+	PT_CAP(max_subleaf,		0, CPUID_EAX, 0xffffffff),
+	PT_CAP(cr3_filtering,		0, CPUID_EBX, BIT(0)),
+	PT_CAP(psb_cyc,			0, CPUID_EBX, BIT(1)),
+	PT_CAP(ip_filtering,		0, CPUID_EBX, BIT(2)),
+	PT_CAP(mtc,			0, CPUID_EBX, BIT(3)),
+	PT_CAP(ptwrite,			0, CPUID_EBX, BIT(4)),
+	PT_CAP(power_event_trace,	0, CPUID_EBX, BIT(5)),
+	PT_CAP(topa_output,		0, CPUID_ECX, BIT(0)),
+	PT_CAP(topa_multiple_entries,	0, CPUID_ECX, BIT(1)),
+	PT_CAP(single_range_output,	0, CPUID_ECX, BIT(2)),
+	PT_CAP(payloads_lip,		0, CPUID_ECX, BIT(31)),
+	PT_CAP(num_address_ranges,	1, CPUID_EAX, 0x3),
+	PT_CAP(mtc_periods,		1, CPUID_EAX, 0xffff0000),
+	PT_CAP(cycle_thresholds,	1, CPUID_EBX, 0xffff),
+	PT_CAP(psb_periods,		1, CPUID_EBX, 0xffff0000),
 };
 
 static u32 pt_cap_get(enum pt_capabilities cap)
@@ -219,10 +212,10 @@ static int __init pt_pmu_hw_init(void)
 
 	for (i = 0; i < PT_CPUID_LEAVES; i++) {
 		cpuid_count(20, i,
-			    &pt_pmu.caps[CR_EAX + i*PT_CPUID_REGS_NUM],
-			    &pt_pmu.caps[CR_EBX + i*PT_CPUID_REGS_NUM],
-			    &pt_pmu.caps[CR_ECX + i*PT_CPUID_REGS_NUM],
-			    &pt_pmu.caps[CR_EDX + i*PT_CPUID_REGS_NUM]);
+			    &pt_pmu.caps[CPUID_EAX + i*PT_CPUID_REGS_NUM],
+			    &pt_pmu.caps[CPUID_EBX + i*PT_CPUID_REGS_NUM],
+			    &pt_pmu.caps[CPUID_ECX + i*PT_CPUID_REGS_NUM],
+			    &pt_pmu.caps[CPUID_EDX + i*PT_CPUID_REGS_NUM]);
 	}
 
 	ret = -ENOMEM;
@@ -1162,26 +1155,6 @@ static void pt_event_addr_filters_sync(struct perf_event *event)
 }
 
 /**
- * pt_buffer_is_full() - check if the buffer is full
- * @buf:	PT buffer.
- * @pt:		Per-cpu pt handle.
- *
- * If the user hasn't read data from the output region that aux_head
- * points to, the buffer is considered full: the user needs to read at
- * least this region and update aux_tail to point past it.
- */
-static bool pt_buffer_is_full(struct pt_buffer *buf, struct pt *pt)
-{
-	if (buf->snapshot)
-		return false;
-
-	if (local_read(&buf->data_size) >= pt->handle.size)
-		return true;
-
-	return false;
-}
-
-/**
  * intel_pt_interrupt() - PT PMI handler
  */
 void intel_pt_interrupt(void)
@@ -1195,7 +1168,7 @@ void intel_pt_interrupt(void)
 	 * after PT has been disabled by pt_event_stop(). Make sure we don't
 	 * do anything (particularly, re-enable) for this event here.
 	 */
-	if (!ACCESS_ONCE(pt->handle_nmi))
+	if (!READ_ONCE(pt->handle_nmi))
 		return;
 
 	/*
@@ -1280,23 +1253,36 @@ EXPORT_SYMBOL_GPL(intel_pt_handle_vmx);
 
 static void pt_event_start(struct perf_event *event, int mode)
 {
+	struct hw_perf_event *hwc = &event->hw;
 	struct pt *pt = this_cpu_ptr(&pt_ctx);
-	struct pt_buffer *buf = perf_get_aux(&pt->handle);
+	struct pt_buffer *buf;
 
 	if (READ_ONCE(pt->vmx_on))
 		return;
 
-	if (!buf || pt_buffer_is_full(buf, pt)) {
-		event->hw.state = PERF_HES_STOPPED;
-		return;
+	buf = perf_aux_output_begin(&pt->handle, event);
+	if (!buf)
+		goto fail_stop;
+
+	pt_buffer_reset_offsets(buf, pt->handle.head);
+	if (!buf->snapshot) {
+		if (pt_buffer_reset_markers(buf, &pt->handle))
+			goto fail_end_stop;
 	}
 
-	ACCESS_ONCE(pt->handle_nmi) = 1;
-	event->hw.state = 0;
+	WRITE_ONCE(pt->handle_nmi, 1);
+	hwc->state = 0;
 
 	pt_config_buffer(buf->cur->table, buf->cur_idx,
 			 buf->output_off);
 	pt_config(event);
+
+	return;
+
+fail_end_stop:
+	perf_aux_output_end(&pt->handle, 0, true);
+fail_stop:
+	hwc->state = PERF_HES_STOPPED;
 }
 
 static void pt_event_stop(struct perf_event *event, int mode)
@@ -1307,7 +1293,7 @@ static void pt_event_stop(struct perf_event *event, int mode)
 	 * Protect against the PMI racing with disabling wrmsr,
 	 * see comment in intel_pt_interrupt().
 	 */
-	ACCESS_ONCE(pt->handle_nmi) = 0;
+	WRITE_ONCE(pt->handle_nmi, 0);
 
 	pt_config_stop(event);
 
@@ -1330,19 +1316,7 @@ static void pt_event_stop(struct perf_event *event, int mode)
 		pt_handle_status(pt);
 
 		pt_update_head(pt);
-	}
-}
 
-static void pt_event_del(struct perf_event *event, int mode)
-{
-	struct pt *pt = this_cpu_ptr(&pt_ctx);
-	struct pt_buffer *buf;
-
-	pt_event_stop(event, PERF_EF_UPDATE);
-
-	buf = perf_get_aux(&pt->handle);
-
-	if (buf) {
 		if (buf->snapshot)
 			pt->handle.head =
 				local_xchg(&buf->data_size,
@@ -1352,9 +1326,13 @@ static void pt_event_del(struct perf_event *event, int mode)
 	}
 }
 
+static void pt_event_del(struct perf_event *event, int mode)
+{
+	pt_event_stop(event, PERF_EF_UPDATE);
+}
+
 static int pt_event_add(struct perf_event *event, int mode)
 {
-	struct pt_buffer *buf;
 	struct pt *pt = this_cpu_ptr(&pt_ctx);
 	struct hw_perf_event *hwc = &event->hw;
 	int ret = -EBUSY;
@@ -1362,34 +1340,18 @@ static int pt_event_add(struct perf_event *event, int mode)
 	if (pt->handle.event)
 		goto fail;
 
-	buf = perf_aux_output_begin(&pt->handle, event);
-	ret = -EINVAL;
-	if (!buf)
-		goto fail_stop;
-
-	pt_buffer_reset_offsets(buf, pt->handle.head);
-	if (!buf->snapshot) {
-		ret = pt_buffer_reset_markers(buf, &pt->handle);
-		if (ret)
-			goto fail_end_stop;
-	}
-
 	if (mode & PERF_EF_START) {
 		pt_event_start(event, 0);
-		ret = -EBUSY;
+		ret = -EINVAL;
 		if (hwc->state == PERF_HES_STOPPED)
-			goto fail_end_stop;
+			goto fail;
 	} else {
 		hwc->state = PERF_HES_STOPPED;
 	}
 
-	return 0;
-
-fail_end_stop:
-	perf_aux_output_end(&pt->handle, 0, true);
-fail_stop:
-	hwc->state = PERF_HES_STOPPED;
+	ret = 0;
 fail:
+
 	return ret;
 }
 

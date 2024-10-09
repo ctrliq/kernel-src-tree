@@ -26,7 +26,7 @@
 #include <net/pkt_cls.h>
 #include <net/ip.h>
 #include <net/route.h>
-#include <net/flow_keys.h>
+#include <net/flow_dissector.h>
 
 #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
 #include <net/netfilter/nf_conntrack.h>
@@ -68,37 +68,46 @@ static inline u32 addr_fold(void *addr)
 
 static u32 flow_get_src(const struct sk_buff *skb, const struct flow_keys *flow)
 {
-	if (flow->src)
-		return ntohl(flow->src);
+	__be32 src = flow_get_u32_src(flow);
+
+	if (src)
+		return ntohl(src);
+
 	return addr_fold(skb->sk);
 }
 
 static u32 flow_get_dst(const struct sk_buff *skb, const struct flow_keys *flow)
 {
-	if (flow->dst)
-		return ntohl(flow->dst);
-	return addr_fold(skb_dst(skb)) ^ (__force u16)skb->protocol;
+	__be32 dst = flow_get_u32_dst(flow);
+
+	if (dst)
+		return ntohl(dst);
+
+	return addr_fold(skb_dst(skb)) ^ (__force u16) tc_skb_protocol(skb);
 }
 
-static u32 flow_get_proto(const struct sk_buff *skb, const struct flow_keys *flow)
+static u32 flow_get_proto(const struct sk_buff *skb,
+			  const struct flow_keys *flow)
 {
-	return flow->ip_proto;
+	return flow->basic.ip_proto;
 }
 
-static u32 flow_get_proto_src(const struct sk_buff *skb, const struct flow_keys *flow)
+static u32 flow_get_proto_src(const struct sk_buff *skb,
+			      const struct flow_keys *flow)
 {
-	if (flow->ports)
-		return ntohs(flow->port16[0]);
+	if (flow->ports.ports)
+		return ntohs(flow->ports.src);
 
 	return addr_fold(skb->sk);
 }
 
-static u32 flow_get_proto_dst(const struct sk_buff *skb, const struct flow_keys *flow)
+static u32 flow_get_proto_dst(const struct sk_buff *skb,
+			      const struct flow_keys *flow)
 {
-	if (flow->ports)
-		return ntohs(flow->port16[1]);
+	if (flow->ports.ports)
+		return ntohs(flow->ports.dst);
 
-	return addr_fold(skb_dst(skb)) ^ (__force u16)skb->protocol;
+	return addr_fold(skb_dst(skb)) ^ (__force u16) tc_skb_protocol(skb);
 }
 
 static u32 flow_get_iif(const struct sk_buff *skb)
@@ -142,9 +151,10 @@ static u32 flow_get_nfct(const struct sk_buff *skb)
 })
 #endif
 
-static u32 flow_get_nfct_src(const struct sk_buff *skb, const struct flow_keys *flow)
+static u32 flow_get_nfct_src(const struct sk_buff *skb,
+			     const struct flow_keys *flow)
 {
-	switch (skb->protocol) {
+	switch (tc_skb_protocol(skb)) {
 	case htons(ETH_P_IP):
 		return ntohl(CTTUPLE(skb, src.u3.ip));
 	case htons(ETH_P_IPV6):
@@ -154,9 +164,10 @@ fallback:
 	return flow_get_src(skb, flow);
 }
 
-static u32 flow_get_nfct_dst(const struct sk_buff *skb, const struct flow_keys *flow)
+static u32 flow_get_nfct_dst(const struct sk_buff *skb,
+			     const struct flow_keys *flow)
 {
-	switch (skb->protocol) {
+	switch (tc_skb_protocol(skb)) {
 	case htons(ETH_P_IP):
 		return ntohl(CTTUPLE(skb, dst.u3.ip));
 	case htons(ETH_P_IPV6):
@@ -166,14 +177,16 @@ fallback:
 	return flow_get_dst(skb, flow);
 }
 
-static u32 flow_get_nfct_proto_src(const struct sk_buff *skb, const struct flow_keys *flow)
+static u32 flow_get_nfct_proto_src(const struct sk_buff *skb,
+				   const struct flow_keys *flow)
 {
 	return ntohs(CTTUPLE(skb, src.u.all));
 fallback:
 	return flow_get_proto_src(skb, flow);
 }
 
-static u32 flow_get_nfct_proto_dst(const struct sk_buff *skb, const struct flow_keys *flow)
+static u32 flow_get_nfct_proto_dst(const struct sk_buff *skb,
+				   const struct flow_keys *flow)
 {
 	return ntohs(CTTUPLE(skb, dst.u.all));
 fallback:
@@ -295,7 +308,7 @@ static int flow_classify(struct sk_buff *skb, const struct tcf_proto *tp,
 
 		keymask = f->keymask;
 		if (keymask & FLOW_KEYS_NEEDED)
-			skb_flow_dissect(skb, &flow_keys);
+			skb_flow_dissect_flow_keys(skb, &flow_keys, 0);
 
 		for (n = 0; n < f->nkeys; n++) {
 			key = ffs(keymask) - 1;
@@ -355,7 +368,7 @@ static void flow_destroy_filter(struct rcu_head *head)
 
 	del_timer_sync(&f->perturb_timer);
 	tcf_exts_destroy(&f->exts);
-	tcf_em_tree_destroy(f->tp, &f->ematches);
+	tcf_em_tree_destroy(&f->ematches);
 	kfree(f);
 }
 
@@ -530,7 +543,7 @@ static int flow_change(struct net *net, struct sk_buff *in_skb,
 	return 0;
 
 err2:
-	tcf_em_tree_destroy(tp, &t);
+	tcf_em_tree_destroy(&t);
 	kfree(fnew);
 err1:
 	tcf_exts_destroy(&e);
@@ -558,17 +571,20 @@ static int flow_init(struct tcf_proto *tp)
 	return 0;
 }
 
-static void flow_destroy(struct tcf_proto *tp)
+static bool flow_destroy(struct tcf_proto *tp, bool force)
 {
 	struct flow_head *head = rtnl_dereference(tp->root);
 	struct flow_filter *f, *next;
+
+	if (!force && !list_empty(&head->filters))
+		return false;
 
 	list_for_each_entry_safe(f, next, &head->filters, list) {
 		list_del_rcu(&f->list);
 		call_rcu(&f->rcu, flow_destroy_filter);
 	}
-	RCU_INIT_POINTER(tp->root, NULL);
 	kfree_rcu(head, rcu);
+	return true;
 }
 
 static unsigned long flow_get(struct tcf_proto *tp, u32 handle)

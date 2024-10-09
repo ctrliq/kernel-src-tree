@@ -52,6 +52,7 @@
 #endif
 #include <asm/vdso.h>
 #include <asm/debug.h>
+#include <asm/kexec.h>
 
 #ifdef DEBUG
 #include <asm/udbg.h>
@@ -205,7 +206,7 @@ int smp_request_message_ipi(int virq, int msg)
 
 #ifdef CONFIG_PPC_SMP_MUXED_IPI
 struct cpu_messages {
-	int messages;			/* current messages */
+	long messages;			/* current messages */
 	unsigned long data;		/* data for cause ipi */
 };
 static DEFINE_PER_CPU_SHARED_ALIGNED(struct cpu_messages, ipi_message);
@@ -242,20 +243,31 @@ void smp_muxed_ipi_message_pass(int cpu, int msg)
 }
 
 #ifdef __BIG_ENDIAN__
-#define IPI_MESSAGE(A) (1 << (24 - 8 * (A)))
+#define IPI_MESSAGE(A) (1uL << ((BITS_PER_LONG - 8) - 8 * (A)))
 #else
-#define IPI_MESSAGE(A) (1 << (8 * (A)))
+#define IPI_MESSAGE(A) (1uL << (8 * (A)))
 #endif
 
 irqreturn_t smp_ipi_demux(void)
 {
-	struct cpu_messages *info = &__get_cpu_var(ipi_message);
-	unsigned int all;
+	struct cpu_messages *info = this_cpu_ptr(&ipi_message);
+	unsigned long all;
 
 	mb();	/* order any irq clear */
 
 	do {
 		all = xchg(&info->messages, 0);
+#if defined(CONFIG_KVM_XICS) && defined(CONFIG_KVM_BOOK3S_HV_POSSIBLE)
+		/*
+		 * Must check for PPC_MSG_RM_HOST_ACTION messages
+		 * before PPC_MSG_CALL_FUNCTION messages because when
+		 * a VM is destroyed, we call kick_all_cpus_sync()
+		 * to ensure that any pending PPC_MSG_RM_HOST_ACTION
+		 * messages have completed before we free any VCPUs.
+		 */
+		if (all & IPI_MESSAGE(PPC_MSG_RM_HOST_ACTION))
+			kvmppc_xics_ipi_action();
+#endif
 		if (all & IPI_MESSAGE(PPC_MSG_CALL_FUNCTION))
 			generic_smp_call_function_interrupt();
 		if (all & IPI_MESSAGE(PPC_MSG_RESCHEDULE))

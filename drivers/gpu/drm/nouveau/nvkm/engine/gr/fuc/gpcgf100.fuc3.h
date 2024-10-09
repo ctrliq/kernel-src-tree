@@ -1,4 +1,4 @@
-uint32_t gf100_grgpc_data[] = {
+static uint32_t gf100_grgpc_data[] = {
 /* 0x0000: gpc_mmio_list_head */
 	0x00000064,
 /* 0x0004: gpc_mmio_list_tail */
@@ -36,7 +36,7 @@ uint32_t gf100_grgpc_data[] = {
 	0x00000000,
 };
 
-uint32_t gf100_grgpc_code[] = {
+static uint32_t gf100_grgpc_code[] = {
 	0x03a10ef5,
 /* 0x0004: queue_put */
 	0x9800d898,
@@ -370,9 +370,10 @@ uint32_t gf100_grgpc_code[] = {
 	0xf11f29f0,
 	0xf0080007,
 	0x02d00203,
-/* 0x04bb: main */
+/* 0x04bb: wait */
 	0xf404bd00,
-	0x28f40031,
+	0x31f40028,
+/* 0x04c1: main */
 	0x1cd7f000,
 	0xf43921f4,
 	0xe4b0f401,
@@ -384,10 +385,10 @@ uint32_t gf100_grgpc_code[] = {
 	0x0018fe05,
 	0x05b421f5,
 /* 0x04eb: main_not_ctx_xfer */
-	0x94d30ef4,
+	0x94d90ef4,
 	0xf5f010ef,
 	0x7e21f501,
-	0xc60ef403,
+	0xcc0ef403,
 /* 0x04f8: ih */
 	0x80f900f9,
 	0xf90188fe,

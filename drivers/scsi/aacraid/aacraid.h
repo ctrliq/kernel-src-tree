@@ -97,7 +97,7 @@ enum {
 #define	PMC_GLOBAL_INT_BIT0		0x00000001
 
 #ifndef AAC_DRIVER_BUILD
-# define AAC_DRIVER_BUILD 50740
+# define AAC_DRIVER_BUILD 50792
 # define AAC_DRIVER_BRANCH "-custom"
 #endif
 #define MAXIMUM_NUM_CONTAINERS	32
@@ -118,6 +118,7 @@ enum {
 #define AAC_MAX_BUSES			5
 #define AAC_MAX_TARGETS		256
 #define AAC_MAX_NATIVE_SIZE		2048
+#define FW_ERROR_BUFFER_SIZE		512
 
 /* Thor AIF events */
 #define SA_AIF_HOTPLUG			(1<<1)
@@ -126,6 +127,189 @@ enum {
 #define SA_AIF_LDEV_CHANGE		(1<<5)
 #define SA_AIF_BPSTAT_CHANGE		(1<<30)
 #define SA_AIF_BPCFG_CHANGE		(1<<31)
+
+#define HBA_MAX_SG_EMBEDDED		28
+#define HBA_MAX_SG_SEPARATE		90
+#define HBA_SENSE_DATA_LEN_MAX		32
+#define HBA_REQUEST_TAG_ERROR_FLAG	0x00000002
+#define HBA_SGL_FLAGS_EXT		0x80000000UL
+
+struct aac_hba_sgl {
+	u32		addr_lo; /* Lower 32-bits of SGL element address */
+	u32		addr_hi; /* Upper 32-bits of SGL element address */
+	u32		len;	/* Length of SGL element in bytes */
+	u32		flags;	/* SGL element flags */
+};
+
+enum {
+	HBA_IU_TYPE_SCSI_CMD_REQ		= 0x40,
+	HBA_IU_TYPE_SCSI_TM_REQ			= 0x41,
+	HBA_IU_TYPE_SATA_REQ			= 0x42,
+	HBA_IU_TYPE_RESP			= 0x60,
+	HBA_IU_TYPE_COALESCED_RESP		= 0x61,
+	HBA_IU_TYPE_INT_COALESCING_CFG_REQ	= 0x70
+};
+
+enum {
+	HBA_CMD_BYTE1_DATA_DIR_IN		= 0x1,
+	HBA_CMD_BYTE1_DATA_DIR_OUT		= 0x2,
+	HBA_CMD_BYTE1_DATA_TYPE_DDR		= 0x4,
+	HBA_CMD_BYTE1_CRYPTO_ENABLE		= 0x8
+};
+
+enum {
+	HBA_CMD_BYTE1_BITOFF_DATA_DIR_IN	= 0x0,
+	HBA_CMD_BYTE1_BITOFF_DATA_DIR_OUT,
+	HBA_CMD_BYTE1_BITOFF_DATA_TYPE_DDR,
+	HBA_CMD_BYTE1_BITOFF_CRYPTO_ENABLE
+};
+
+enum {
+	HBA_RESP_DATAPRES_NO_DATA		= 0x0,
+	HBA_RESP_DATAPRES_RESPONSE_DATA,
+	HBA_RESP_DATAPRES_SENSE_DATA
+};
+
+enum {
+	HBA_RESP_SVCRES_TASK_COMPLETE		= 0x0,
+	HBA_RESP_SVCRES_FAILURE,
+	HBA_RESP_SVCRES_TMF_COMPLETE,
+	HBA_RESP_SVCRES_TMF_SUCCEEDED,
+	HBA_RESP_SVCRES_TMF_REJECTED,
+	HBA_RESP_SVCRES_TMF_LUN_INVALID
+};
+
+enum {
+	HBA_RESP_STAT_IO_ERROR			= 0x1,
+	HBA_RESP_STAT_IO_ABORTED,
+	HBA_RESP_STAT_NO_PATH_TO_DEVICE,
+	HBA_RESP_STAT_INVALID_DEVICE,
+	HBA_RESP_STAT_HBAMODE_DISABLED		= 0xE,
+	HBA_RESP_STAT_UNDERRUN			= 0x51,
+	HBA_RESP_STAT_OVERRUN			= 0x75
+};
+
+struct aac_hba_cmd_req {
+	u8	iu_type;	/* HBA information unit type */
+	/*
+	 * byte1:
+	 * [1:0] DIR - 0=No data, 0x1 = IN, 0x2 = OUT
+	 * [2]   TYPE - 0=PCI, 1=DDR
+	 * [3]   CRYPTO_ENABLE - 0=Crypto disabled, 1=Crypto enabled
+	 */
+	u8	byte1;
+	u8	reply_qid;	/* Host reply queue to post response to */
+	u8	reserved1;
+	__le32	it_nexus;	/* Device handle for the request */
+	__le32	request_id;	/* Sender context */
+	/* Lower 32-bits of tweak value for crypto enabled IOs */
+	__le32	tweak_value_lo;
+	u8	cdb[16];	/* SCSI CDB of the command */
+	u8	lun[8];		/* SCSI LUN of the command */
+
+	/* Total data length in bytes to be read/written (if any) */
+	__le32	data_length;
+
+	/* [2:0] Task Attribute, [6:3] Command Priority */
+	u8	attr_prio;
+
+	/* Number of SGL elements embedded in the HBA req */
+	u8	emb_data_desc_count;
+
+	__le16	dek_index;	/* DEK index for crypto enabled IOs */
+
+	/* Lower 32-bits of reserved error data target location on the host */
+	__le32	error_ptr_lo;
+
+	/* Upper 32-bits of reserved error data target location on the host */
+	__le32	error_ptr_hi;
+
+	/* Length of reserved error data area on the host in bytes */
+	__le32	error_length;
+
+	/* Upper 32-bits of tweak value for crypto enabled IOs */
+	__le32	tweak_value_hi;
+
+	struct aac_hba_sgl sge[HBA_MAX_SG_SEPARATE+2]; /* SG list space */
+
+	/*
+	 * structure must not exceed
+	 * AAC_MAX_NATIVE_SIZE-FW_ERROR_BUFFER_SIZE
+	 */
+};
+
+/* Task Management Functions (TMF) */
+#define HBA_TMF_ABORT_TASK	0x01
+#define HBA_TMF_LUN_RESET	0x08
+
+struct aac_hba_tm_req {
+	u8	iu_type;	/* HBA information unit type */
+	u8	reply_qid;	/* Host reply queue to post response to */
+	u8	tmf;		/* Task management function */
+	u8	reserved1;
+
+	__le32	it_nexus;	/* Device handle for the command */
+
+	u8	lun[8];		/* SCSI LUN */
+
+	/* Used to hold sender context. */
+	__le32	request_id;	/* Sender context */
+	__le32	reserved2;
+
+	/* Request identifier of managed task */
+	__le32	managed_request_id;	/* Sender context being managed */
+	__le32	reserved3;
+
+	/* Lower 32-bits of reserved error data target location on the host */
+	__le32	error_ptr_lo;
+	/* Upper 32-bits of reserved error data target location on the host */
+	__le32	error_ptr_hi;
+	/* Length of reserved error data area on the host in bytes */
+	__le32	error_length;
+};
+
+struct aac_hba_reset_req {
+	u8	iu_type;	/* HBA information unit type */
+	/* 0 - reset specified device, 1 - reset all devices */
+	u8	reset_type;
+	u8	reply_qid;	/* Host reply queue to post response to */
+	u8	reserved1;
+
+	__le32	it_nexus;	/* Device handle for the command */
+	__le32	request_id;	/* Sender context */
+	/* Lower 32-bits of reserved error data target location on the host */
+	__le32	error_ptr_lo;
+	/* Upper 32-bits of reserved error data target location on the host */
+	__le32	error_ptr_hi;
+	/* Length of reserved error data area on the host in bytes */
+	__le32	error_length;
+};
+
+struct aac_hba_resp {
+	u8	iu_type;		/* HBA information unit type */
+	u8	reserved1[3];
+	__le32	request_identifier;	/* sender context */
+	__le32	reserved2;
+	u8	service_response;	/* SCSI service response */
+	u8	status;			/* SCSI status */
+	u8	datapres;	/* [1:0] - data present, [7:2] - reserved */
+	u8	sense_response_data_len;	/* Sense/response data length */
+	__le32	residual_count;		/* Residual data length in bytes */
+	/* Sense/response data */
+	u8	sense_response_buf[HBA_SENSE_DATA_LEN_MAX];
+};
+
+struct aac_native_hba {
+	union {
+		struct aac_hba_cmd_req cmd;
+		struct aac_hba_tm_req tmr;
+		u8 cmd_bytes[AAC_MAX_NATIVE_SIZE-FW_ERROR_BUFFER_SIZE];
+	} cmd;
+	union {
+		struct aac_hba_resp err;
+		u8 resp_bytes[FW_ERROR_BUFFER_SIZE];
+	} resp;
+};
 
 #define CISS_REPORT_PHYSICAL_LUNS	0xc3
 #define WRITE_HOST_WELLNESS		0xa5
@@ -500,10 +684,10 @@ enum aac_queue_types {
 
 /* transport FIB header (PMC) */
 struct aac_fib_xporthdr {
-	u64	HostAddress;	/* FIB host address w/o xport header */
-	u32	Size;		/* FIB size excluding xport header */
-	u32	Handle;		/* driver handle to reference the FIB */
-	u64	Reserved[2];
+	__le64	HostAddress;	/* FIB host address w/o xport header */
+	__le32	Size;		/* FIB size excluding xport header */
+	__le32	Handle;		/* driver handle to reference the FIB */
+	__le64	Reserved[2];
 };
 
 #define		ALIGN32		32
@@ -528,7 +712,7 @@ struct aac_fibhdr {
 		__le32 SenderFibAddressHigh;/* upper 32bit of phys. FIB address */
 		__le32 TimeStamp;	/* otherwise timestamp for FW internal use */
 	} u;
-	u32 Handle;		/* FIB handle used for MSGU commnunication */
+	__le32 Handle;		/* FIB handle used for MSGU commnunication */
 	u32 Previous;		/* FW internal use */
 	u32 Next;		/* FW internal use */
 };
@@ -726,7 +910,7 @@ struct adapter_ops
 	void (*adapter_enable_int)(struct aac_dev *dev);
 	int  (*adapter_sync_cmd)(struct aac_dev *dev, u32 command, u32 p1, u32 p2, u32 p3, u32 p4, u32 p5, u32 p6, u32 *status, u32 *r1, u32 *r2, u32 *r3, u32 *r4);
 	int  (*adapter_check_health)(struct aac_dev *dev);
-	int  (*adapter_restart)(struct aac_dev *dev, int bled);
+	int  (*adapter_restart)(struct aac_dev *dev, int bled, u8 reset_type);
 	void (*adapter_start)(struct aac_dev *dev);
 	/* Transport operations */
 	int  (*adapter_ioremap)(struct aac_dev * dev, u32 size);
@@ -993,32 +1177,37 @@ struct rkt_registers {
 #define src_inbound rx_inbound
 
 struct src_mu_registers {
-				/*	PCI*| Name */
-	__le32	reserved0[6];	/*	00h | Reserved */
-	__le32	IOAR[2];	/*	18h | IOA->host interrupt register */
-	__le32	IDR;		/*	20h | Inbound Doorbell Register */
-	__le32	IISR;		/*	24h | Inbound Int. Status Register */
-	__le32	reserved1[3];	/*	28h | Reserved */
-	__le32	OIMR;		/*	34h | Outbound Int. Mask Register */
-	__le32	reserved2[25];	/*	38h | Reserved */
-	__le32	ODR_R;		/*	9ch | Outbound Doorbell Read */
-	__le32	ODR_C;		/*	a0h | Outbound Doorbell Clear */
-	__le32	reserved3[6];	/*	a4h | Reserved */
-	__le32	OMR;		/*	bch | Outbound Message Register */
+				/*  PCI*| Name */
+	__le32	reserved0[6];	/*  00h | Reserved */
+	__le32	IOAR[2];	/*  18h | IOA->host interrupt register */
+	__le32	IDR;		/*  20h | Inbound Doorbell Register */
+	__le32	IISR;		/*  24h | Inbound Int. Status Register */
+	__le32	reserved1[3];	/*  28h | Reserved */
+	__le32	OIMR;		/*  34h | Outbound Int. Mask Register */
+	__le32	reserved2[25];  /*  38h | Reserved */
+	__le32	ODR_R;		/*  9ch | Outbound Doorbell Read */
+	__le32	ODR_C;		/*  a0h | Outbound Doorbell Clear */
+	__le32	reserved3[3];	/*  a4h | Reserved */
+	__le32	SCR0;		/*  b0h | Scratchpad 0 */
+	__le32	reserved4[2];	/*  b4h | Reserved */
+	__le32	OMR;		/*  bch | Outbound Message Register */
 	__le32	IQ_L;		/*  c0h | Inbound Queue (Low address) */
 	__le32	IQ_H;		/*  c4h | Inbound Queue (High address) */
 	__le32	ODR_MSI;	/*  c8h | MSI register for sync./AIF */
+	__le32  reserved5;	/*  cch | Reserved */
+	__le32	IQN_L;		/*  d0h | Inbound (native cmd) low  */
+	__le32	IQN_H;		/*  d4h | Inbound (native cmd) high */
 };
 
 struct src_registers {
 	struct src_mu_registers MUnit;	/* 00h - cbh */
 	union {
 		struct {
-			__le32 reserved1[130789];	/* cch - 7fc5fh */
+			__le32 reserved1[130786];	/* d8h - 7fc5fh */
 			struct src_inbound IndexRegs;	/* 7fc60h */
 		} tupelo;
 		struct {
-			__le32 reserved1[973];		/* cch - fffh */
+			__le32 reserved1[970];		/* d8h - fffh */
 			struct src_inbound IndexRegs;	/* 1000h */
 		} denali;
 	} u;
@@ -1103,6 +1292,7 @@ struct fsa_dev_info {
 	char		devname[8];
 	struct sense_data sense_data;
 	u32		block_size;
+	u8		identifier[16];
 };
 
 struct fib {
@@ -1131,8 +1321,11 @@ struct fib {
 	struct list_head	fiblink;
 	void			*data;
 	u32			vector_no;
-	struct hw_fib		*hw_fib_va;		/* Actual shared object */
-	dma_addr_t		hw_fib_pa;		/* physical address of hw_fib*/
+	struct hw_fib		*hw_fib_va;	/* also used for native */
+	dma_addr_t		hw_fib_pa;	/* physical address of hw_fib*/
+	dma_addr_t		hw_sgl_pa;	/* extra sgl for native */
+	dma_addr_t		hw_error_pa;	/* error buffer for native */
+	u32			hbacmd_size;	/* cmd size for native */
 };
 
 #define AAC_INIT			0
@@ -1187,57 +1380,57 @@ struct aac_adapter_info
 
 struct aac_supplement_adapter_info
 {
-	u8	AdapterTypeText[17+1];
-	u8	Pad[2];
-	__le32	FlashMemoryByteSize;
-	__le32	FlashImageId;
-	__le32	MaxNumberPorts;
-	__le32	Version;
-	__le32	FeatureBits;
-	u8	SlotNumber;
-	u8	ReservedPad0[3];
-	u8	BuildDate[12];
-	__le32	CurrentNumberPorts;
+	u8	adapter_type_text[17+1];
+	u8	pad[2];
+	__le32	flash_memory_byte_size;
+	__le32	flash_image_id;
+	__le32	max_number_ports;
+	__le32	version;
+	__le32	feature_bits;
+	u8	slot_number;
+	u8	reserved_pad0[3];
+	u8	build_date[12];
+	__le32	current_number_ports;
 	struct {
-		u8	AssemblyPn[8];
-		u8	FruPn[8];
-		u8	BatteryFruPn[8];
-		u8	EcVersionString[8];
-		u8	Tsid[12];
-	}	VpdInfo;
-	__le32	FlashFirmwareRevision;
-	__le32	FlashFirmwareBuild;
-	__le32	RaidTypeMorphOptions;
-	__le32	FlashFirmwareBootRevision;
-	__le32	FlashFirmwareBootBuild;
-	u8	MfgPcbaSerialNo[12];
-	u8	MfgWWNName[8];
-	__le32	SupportedOptions2;
-	__le32	StructExpansion;
+		u8	assembly_pn[8];
+		u8	fru_pn[8];
+		u8	battery_fru_pn[8];
+		u8	ec_version_string[8];
+		u8	tsid[12];
+	}	vpd_info;
+	__le32	flash_firmware_revision;
+	__le32	flash_firmware_build;
+	__le32	raid_type_morph_options;
+	__le32	flash_firmware_boot_revision;
+	__le32	flash_firmware_boot_build;
+	u8	mfg_pcba_serial_no[12];
+	u8	mfg_wwn_name[8];
+	__le32	supported_options2;
+	__le32	struct_expansion;
 	/* StructExpansion == 1 */
-	__le32	FeatureBits3;
-	__le32	SupportedPerformanceModes;
-	u8	HostBusType;		/* uses HOST_BUS_TYPE_xxx defines */
-	u8	HostBusWidth;		/* actual width in bits or links */
-	u16	HostBusSpeed;		/* actual bus speed/link rate in MHz */
-	u8	MaxRRCDrives;		/* max. number of ITP-RRC drives/pool */
-	u8	MaxDiskXtasks;		/* max. possible num of DiskX Tasks */
+	__le32	feature_bits3;
+	__le32	supported_performance_modes;
+	u8	host_bus_type;		/* uses HOST_BUS_TYPE_xxx defines */
+	u8	host_bus_width;		/* actual width in bits or links */
+	u16	host_bus_speed;		/* actual bus speed/link rate in MHz */
+	u8	max_rrc_drives;		/* max. number of ITP-RRC drives/pool */
+	u8	max_disk_xtasks;	/* max. possible num of DiskX Tasks */
 
-	u8	CpldVerLoaded;
-	u8	CpldVerInFlash;
+	u8	cpld_ver_loaded;
+	u8	cpld_ver_in_flash;
 
-	__le64	MaxRRCCapacity;
-	__le32	CompiledMaxHistLogLevel;
-	u8	CustomBoardName[12];
-	u16	SupportedCntlrMode;	/* identify supported controller mode */
-	u16	ReservedForFuture16;
-	__le32	SupportedOptions3;	/* reserved for future options */
+	__le64	max_rrc_capacity;
+	__le32	compiled_max_hist_log_level;
+	u8	custom_board_name[12];
+	u16	supported_cntlr_mode;	/* identify supported controller mode */
+	u16	reserved_for_future16;
+	__le32	supported_options3;	/* reserved for future options */
 
-	__le16	VirtDeviceBus;		/* virt. SCSI device for Thor */
-	__le16	VirtDeviceTarget;
-	__le16	VirtDeviceLUN;
-	__le16	Unused;
-	__le32	ReservedForFutureGrowth[68];
+	__le16	virt_device_bus;		/* virt. SCSI device for Thor */
+	__le16	virt_device_target;
+	__le16	virt_device_lun;
+	__le16	unused;
+	__le32	reserved_for_future_growth[68];
 
 };
 #define AAC_FEATURE_FALCON	cpu_to_le32(0x00000010)
@@ -1251,6 +1444,10 @@ struct aac_supplement_adapter_info
 #define AAC_OPTION_VARIABLE_BLOCK_SIZE	cpu_to_le32(0x00040000)
 /* 240 simple volume support */
 #define AAC_OPTION_SUPPORTED_240_VOLUMES cpu_to_le32(0x10000000)
+/*
+ * Supports FIB dump sync command send prior to IOP_RESET
+ */
+#define AAC_OPTION_SUPPORTED3_IOP_RESET_FIB_DUMP	cpu_to_le32(0x00004000)
 #define AAC_SIS_VERSION_V3	3
 #define AAC_SIS_SLOT_UNKNOWN	0xFF
 
@@ -1313,6 +1510,7 @@ struct aac_bus_info_response {
 #define AAC_OPT_NEW_COMM		cpu_to_le32(1<<17)
 #define AAC_OPT_NEW_COMM_64		cpu_to_le32(1<<18)
 #define AAC_OPT_EXTENDED		cpu_to_le32(1<<23)
+#define AAC_OPT_NATIVE_HBA		cpu_to_le32(1<<25)
 #define AAC_OPT_NEW_COMM_TYPE1		cpu_to_le32(1<<28)
 #define AAC_OPT_NEW_COMM_TYPE2		cpu_to_le32(1<<29)
 #define AAC_OPT_NEW_COMM_TYPE3		cpu_to_le32(1<<30)
@@ -1341,15 +1539,17 @@ struct aac_dev
 	/*
 	 *	negotiated FIB settings
 	 */
-	unsigned		max_fib_size;
-	unsigned		sg_tablesize;
-	unsigned		max_num_aif;
+	unsigned int		max_fib_size;
+	unsigned int		sg_tablesize;
+	unsigned int		max_num_aif;
+
+	unsigned int		max_cmd_size;	/* max_fib_size or MAX_NATIVE */
 
 	/*
 	 *	Map for 128 fib objects (64k)
 	 */
-	dma_addr_t		hw_fib_pa;
-	struct hw_fib		*hw_fib_va;
+	dma_addr_t		hw_fib_pa;	/* also used for native cmd */
+	struct hw_fib		*hw_fib_va;	/* also used for native cmd */
 	struct hw_fib		*aif_base_va;
 	/*
 	 *	Fib Headers
@@ -1385,18 +1585,17 @@ struct aac_dev
 	 */
 	union aac_init		*init;
 	dma_addr_t		init_pa;	/* Holds physical address of the init struct */
-
-	u32			*host_rrq;	/* response queue
-						 * if AAC_COMM_MESSAGE_TYPE1 */
-
+	/* response queue (if AAC_COMM_MESSAGE_TYPE1) */
+	__le32			*host_rrq;
 	dma_addr_t		host_rrq_pa;	/* phys. address */
 	/* index into rrq buffer */
 	u32			host_rrq_idx[AAC_MAX_MSIX];
 	atomic_t		rrq_outstanding[AAC_MAX_MSIX];
 	u32			fibs_pushed_no;
 	struct pci_dev		*pdev;		/* Our PCI interface */
-	void *			printfbuf;	/* pointer to buffer used for printf's from the adapter */
-	void *			comm_addr;	/* Base address of Comm area */
+	/* pointer to buffer used for printf's from the adapter */
+	void			*printfbuf;
+	void			*comm_addr;	/* Base address of Comm area */
 	dma_addr_t		comm_phys;	/* Physical Address of Comm area */
 	size_t			comm_size;
 
@@ -1468,6 +1667,7 @@ struct aac_dev
 	u32			max_msix;	/* max. MSI-X vectors */
 	u32			vector_cap;	/* MSI-X vector capab.*/
 	int			msi_enabled;	/* MSI/MSI-X enabled */
+	atomic_t		msix_counter;
 	struct msix_entry	msixentry[AAC_MAX_MSIX];
 	struct aac_msix_ctx	aac_msix[AAC_MAX_MSIX]; /* context */
 	struct aac_hba_map_info	hba_map[AAC_MAX_BUSES][AAC_MAX_TARGETS];
@@ -1493,8 +1693,8 @@ struct aac_dev
 #define aac_adapter_check_health(dev) \
 	(dev)->a_ops.adapter_check_health(dev)
 
-#define aac_adapter_restart(dev,bled) \
-	(dev)->a_ops.adapter_restart(dev,bled)
+#define aac_adapter_restart(dev, bled, reset_type) \
+	((dev)->a_ops.adapter_restart(dev, bled, reset_type))
 
 #define aac_adapter_start(dev) \
 	((dev)->a_ops.adapter_start(dev))
@@ -1524,6 +1724,8 @@ struct aac_dev
 #define FIB_CONTEXT_FLAG			(0x00000002)
 #define FIB_CONTEXT_FLAG_WAIT			(0x00000004)
 #define FIB_CONTEXT_FLAG_FASTRESP		(0x00000008)
+#define FIB_CONTEXT_FLAG_NATIVE_HBA		(0x00000010)
+#define FIB_CONTEXT_FLAG_NATIVE_HBA_TMF	(0x00000020)
 
 /*
  *	Define the command values
@@ -2167,6 +2369,15 @@ struct revision
 #define FSACTL_FORCE_DELETE_DISK		CTL_CODE(2120, METHOD_NEITHER)
 #define FSACTL_GET_CONTAINERS			2131
 #define FSACTL_SEND_LARGE_FIB			CTL_CODE(2138, METHOD_BUFFERED)
+#define FSACTL_RESET_IOP			CTL_CODE(2140, METHOD_BUFFERED)
+#define FSACTL_GET_HBA_INFO			CTL_CODE(2150, METHOD_BUFFERED)
+/* flags defined for IOP & HW SOFT RESET */
+#define HW_IOP_RESET				0x01
+#define HW_SOFT_RESET				0x02
+#define IOP_HWSOFT_RESET			(HW_IOP_RESET | HW_SOFT_RESET)
+/* HW Soft Reset register offset */
+#define IBW_SWR_OFFSET				0x4000
+#define SOFT_RESET_TIME			60
 
 
 struct aac_common
@@ -2185,6 +2396,8 @@ struct aac_common
 #ifdef DBG
 	u32 FibsSent;
 	u32 FibRecved;
+	u32 NativeSent;
+	u32 NativeRecved;
 	u32 NoResponseSent;
 	u32 NoResponseRecved;
 	u32 AsyncSent;
@@ -2196,6 +2409,56 @@ struct aac_common
 
 extern struct aac_common aac_config;
 
+/*
+ * This is for management ioctl purpose only.
+ */
+struct aac_hba_info {
+
+	u8	driver_name[50];
+	u8	adapter_number;
+	u8	system_io_bus_number;
+	u8	device_number;
+	u32	function_number;
+	u32	vendor_id;
+	u32	device_id;
+	u32	sub_vendor_id;
+	u32	sub_system_id;
+	u32	mapped_base_address_size;
+	u32	base_physical_address_high_part;
+	u32	base_physical_address_low_part;
+
+	u32	max_command_size;
+	u32	max_fib_size;
+	u32	max_scatter_gather_from_os;
+	u32	max_scatter_gather_to_fw;
+	u32	max_outstanding_fibs;
+
+	u32	queue_start_threshold;
+	u32	queue_dump_threshold;
+	u32	max_io_size_queued;
+	u32	outstanding_io;
+
+	u32	firmware_build_number;
+	u32	bios_build_number;
+	u32	driver_build_number;
+	u32	serial_number_high_part;
+	u32	serial_number_low_part;
+	u32	supported_options;
+	u32	feature_bits;
+	u32	currentnumber_ports;
+
+	u8	new_comm_interface:1;
+	u8	new_commands_supported:1;
+	u8	disable_passthrough:1;
+	u8	expose_non_dasd:1;
+	u8	queue_allowed:1;
+	u8	bled_check_enabled:1;
+	u8	reserved1:1;
+	u8	reserted2:1;
+
+	u32	reserved3[10];
+
+};
 
 /*
  *	The following macro is used when sending and receiving FIBs. It is
@@ -2224,6 +2487,7 @@ extern struct aac_common aac_config;
 #define GET_DRIVER_BUFFER_PROPERTIES	0x00000023
 #define RCV_TEMP_READINGS		0x00000025
 #define GET_COMM_PREFERRED_SETTINGS	0x00000026
+#define IOP_RESET_FW_FIB_DUMP		0x00000034
 #define IOP_RESET			0x00001000
 #define IOP_RESET_ALWAYS		0x00001001
 #define RE_INIT_ADAPTER			0x000000ee
@@ -2323,9 +2587,10 @@ extern struct aac_common aac_config;
 
 /* PMC NEW COMM: Request the event data */
 #define		AifReqEvent		200
+#define		AifRawDeviceRemove	203	/* RAW device deleted */
+#define		AifNativeDeviceAdd	204	/* native HBA device added */
+#define		AifNativeDeviceRemove	205	/* native HBA device removed */
 
-/* RAW device deleted */
-#define		AifRawDeviceRemove	203
 
 /*
  *	Adapter Initiated FIB command structures. Start with the adapter
@@ -2370,12 +2635,16 @@ void aac_fib_free(struct fib * context);
 void aac_fib_init(struct fib * context);
 void aac_printf(struct aac_dev *dev, u32 val);
 int aac_fib_send(u16 command, struct fib * context, unsigned long size, int priority, int wait, int reply, fib_callback callback, void *ctxt);
+int aac_hba_send(u8 command, struct fib *context,
+		fib_callback callback, void *ctxt);
 int aac_consumer_get(struct aac_dev * dev, struct aac_queue * q, struct aac_entry **entry);
 void aac_consumer_free(struct aac_dev * dev, struct aac_queue * q, u32 qnum);
 int aac_fib_complete(struct fib * context);
+void aac_hba_callback(void *context, struct fib *fibptr);
 #define fib_data(fibctx) ((void *)(fibctx)->hw_fib_va->data)
 struct aac_dev *aac_init_adapter(struct aac_dev *dev);
 void aac_src_access_devreg(struct aac_dev *dev, int mode);
+void aac_set_intx_mode(struct aac_dev *dev);
 int aac_get_config_status(struct aac_dev *dev, int commit_flag);
 int aac_get_containers(struct aac_dev *dev);
 int aac_scsi_cmd(struct scsi_cmnd *cmd);
@@ -2398,7 +2667,7 @@ unsigned int aac_command_normal(struct aac_queue * q);
 unsigned int aac_intr_normal(struct aac_dev *dev, u32 Index,
 			int isAif, int isFastResponse,
 			struct hw_fib *aif_fib);
-int aac_reset_adapter(struct aac_dev * dev, int forced);
+int aac_reset_adapter(struct aac_dev *dev, int forced, u8 reset_type);
 int aac_check_health(struct aac_dev * dev);
 int aac_command_thread(void *data);
 int aac_close_fib_context(struct aac_dev * dev, struct aac_fib_context *fibctx);
@@ -2412,7 +2681,6 @@ int aac_rx_select_comm(struct aac_dev *dev, int comm);
 int aac_rx_deliver_producer(struct fib * fib);
 char * get_container_type(unsigned type);
 extern int numacb;
-extern int acbsize;
 extern char aac_driver_version[];
 extern int startup_timeout;
 extern int aif_timeout;
@@ -2423,4 +2691,5 @@ extern int aac_commit;
 extern int update_interval;
 extern int check_interval;
 extern int aac_check_reset;
+extern int aac_fib_dump;
 #endif

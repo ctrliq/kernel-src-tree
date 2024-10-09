@@ -1,4 +1,5 @@
 ccflags-y := -Iinclude/drm
+ccflags-y += -include drm/drm_backport.h
 mgag200-y   := mgag200_main.o mgag200_mode.o mgag200_cursor.o \
 	mgag200_drv.o mgag200_fb.o mgag200_i2c.o mgag200_ttm.o
 

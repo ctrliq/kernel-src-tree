@@ -9,25 +9,9 @@
  * 2 of the License, or (at your option) any later version.
  */
 
-/*
- * This is a version of ip_compute_csum() optimized for IP headers,
- * which always checksum on 4 octet boundaries.  ihl is the number
- * of 32-bit words and is always >= 5.
- */
 #ifdef CONFIG_GENERIC_CSUM
 #include <asm-generic/checksum.h>
 #else
-extern __sum16 ip_fast_csum(const void *iph, unsigned int ihl);
-
-/*
- * computes the checksum of the TCP/UDP pseudo-header
- * returns a 16-bit checksum, already complemented
- */
-extern __sum16 csum_tcpudp_magic(__be32 saddr, __be32 daddr,
-					unsigned short len,
-					unsigned short proto,
-					__wsum sum);
-
 /*
  * computes the checksum of a memory block at buff, length len,
  * and adds in "sum" (32-bit)
@@ -92,19 +76,29 @@ static inline __sum16 ip_compute_csum(const void *buff, int len)
 	return csum_fold(csum_partial(buff, len, 0));
 }
 
-static inline __wsum csum_tcpudp_nofold(__be32 saddr, __be32 daddr,
-                                     unsigned short len,
-                                     unsigned short proto,
-                                     __wsum sum)
+static inline u32 from64to32(u64 x)
+{
+	/* add up 32-bit and 32-bit for 32+c bit */
+	x = (x & 0xffffffff) + (x >> 32);
+	/* add up carry.. */
+	x = (x & 0xffffffff) + (x >> 32);
+	return (u32)x;
+}
+
+static inline __wsum csum_tcpudp_nofold(__be32 saddr, __be32 daddr, __u32 len,
+					__u8 proto, __wsum sum)
 {
 #ifdef __powerpc64__
-	unsigned long s = (__force u32)sum;
+	u64 s = (__force u32)sum;
 
 	s += (__force u32)saddr;
 	s += (__force u32)daddr;
+#ifdef __BIG_ENDIAN__
 	s += proto + len;
-	s += (s >> 32);
-	return (__force __wsum) s;
+#else
+	s += (proto + len) << 8;
+#endif
+	return (__force __wsum) from64to32(s);
 #else
     __asm__("\n\
 	addc %0,%0,%1 \n\
@@ -116,6 +110,75 @@ static inline __wsum csum_tcpudp_nofold(__be32 saddr, __be32 daddr,
 	: "r" (daddr), "r"(saddr), "r"(proto + len), "0"(sum));
 	return sum;
 #endif
+}
+
+/*
+ * computes the checksum of the TCP/UDP pseudo-header
+ * returns a 16-bit checksum, already complemented
+ */
+static inline __sum16 csum_tcpudp_magic(__be32 saddr, __be32 daddr, __u32 len,
+					__u8 proto, __wsum sum)
+{
+	return csum_fold(csum_tcpudp_nofold(saddr, daddr, len, proto, sum));
+}
+
+#define HAVE_ARCH_CSUM_ADD
+static inline __wsum csum_add(__wsum csum, __wsum addend)
+{
+#ifdef __powerpc64__
+	u64 res = (__force u64)csum;
+#endif
+	if (__builtin_constant_p(csum) && csum == 0)
+		return addend;
+	if (__builtin_constant_p(addend) && addend == 0)
+		return csum;
+
+#ifdef __powerpc64__
+	res += (__force u64)addend;
+	return (__force __wsum) from64to32(res);
+#else
+	asm("addc %0,%0,%1;"
+	    "addze %0,%0;"
+	    : "+r" (csum) : "r" (addend) : "xer");
+	return csum;
+#endif
+}
+
+/*
+ * This is a version of ip_compute_csum() optimized for IP headers,
+ * which always checksum on 4 octet boundaries.  ihl is the number
+ * of 32-bit words and is always >= 5.
+ */
+static inline __wsum ip_fast_csum_nofold(const void *iph, unsigned int ihl)
+{
+	const u32 *ptr = (const u32 *)iph + 1;
+#ifdef __powerpc64__
+	unsigned int i;
+	u64 s = *(const u32 *)iph;
+
+	for (i = 0; i < ihl - 1; i++, ptr++)
+		s += *ptr;
+	return (__force __wsum)from64to32(s);
+#else
+	__wsum sum, tmp;
+
+	asm("mtctr %3;"
+	    "addc %0,%4,%5;"
+	    "1: lwzu %1, 4(%2);"
+	    "adde %0,%0,%1;"
+	    "bdnz 1b;"
+	    "addze %0,%0;"
+	    : "=r" (sum), "=r" (tmp), "+b" (ptr)
+	    : "r" (ihl - 2), "r" (*(const u32 *)iph), "r" (*ptr)
+	    : "ctr", "xer", "memory");
+
+	return sum;
+#endif
+}
+
+static inline __sum16 ip_fast_csum(const void *iph, unsigned int ihl)
+{
+	return csum_fold(ip_fast_csum_nofold(iph, ihl));
 }
 
 #endif

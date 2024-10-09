@@ -39,11 +39,11 @@
 #define BUILD_TIMESTAMP
 #endif
 
-#define DRIVER_VERSION		"0.9.13-370"
+#define DRIVER_VERSION		"0.9.14-100"
 #define DRIVER_MAJOR		0
 #define DRIVER_MINOR		9
-#define DRIVER_RELEASE		13
-#define DRIVER_REVISION		370
+#define DRIVER_RELEASE		14
+#define DRIVER_REVISION		100
 
 #define DRIVER_NAME		"Microsemi PQI Driver (v" DRIVER_VERSION ")"
 #define DRIVER_NAME_SHORT	"smartpqi"
@@ -4119,8 +4119,12 @@ static void pqi_calculate_io_resources(struct pqi_ctrl_info *ctrl_info)
 	ctrl_info->error_buffer_length =
 		ctrl_info->max_io_slots * PQI_ERROR_BUFFER_ELEMENT_LENGTH;
 
-	max_transfer_size =
-		min(ctrl_info->max_transfer_size, PQI_MAX_TRANSFER_SIZE);
+	if (reset_devices)
+		max_transfer_size = min(ctrl_info->max_transfer_size,
+			PQI_MAX_TRANSFER_SIZE_KDUMP);
+	else
+		max_transfer_size = min(ctrl_info->max_transfer_size,
+			PQI_MAX_TRANSFER_SIZE);
 
 	max_sg_entries = max_transfer_size / PAGE_SIZE;
 
@@ -4139,19 +4143,24 @@ static void pqi_calculate_io_resources(struct pqi_ctrl_info *ctrl_info)
 
 static void pqi_calculate_queue_resources(struct pqi_ctrl_info *ctrl_info)
 {
-	int num_cpus;
-	int max_queue_groups;
 	int num_queue_groups;
 	u16 num_elements_per_iq;
 	u16 num_elements_per_oq;
 
-	max_queue_groups = min(ctrl_info->max_inbound_queues / 2,
-		ctrl_info->max_outbound_queues - 1);
-	max_queue_groups = min(max_queue_groups, PQI_MAX_QUEUE_GROUPS);
+	if (reset_devices) {
+		num_queue_groups = 1;
+	} else {
+		int num_cpus;
+		int max_queue_groups;
 
-	num_cpus = num_online_cpus();
-	num_queue_groups = min(num_cpus, ctrl_info->max_msix_vectors);
-	num_queue_groups = min(num_queue_groups, max_queue_groups);
+		max_queue_groups = min(ctrl_info->max_inbound_queues / 2,
+			ctrl_info->max_outbound_queues - 1);
+		max_queue_groups = min(max_queue_groups, PQI_MAX_QUEUE_GROUPS);
+
+		num_cpus = num_online_cpus();
+		num_queue_groups = min(num_cpus, ctrl_info->max_msix_vectors);
+		num_queue_groups = min(num_queue_groups, max_queue_groups);
+	}
 
 	ctrl_info->num_queue_groups = num_queue_groups;
 
@@ -5346,9 +5355,17 @@ static int pqi_ctrl_init(struct pqi_ctrl_info *ctrl_info)
 		return rc;
 	}
 
-	if (ctrl_info->max_outstanding_requests > PQI_MAX_OUTSTANDING_REQUESTS)
-		ctrl_info->max_outstanding_requests =
-			PQI_MAX_OUTSTANDING_REQUESTS;
+	if (reset_devices) {
+		if (ctrl_info->max_outstanding_requests >
+			PQI_MAX_OUTSTANDING_REQUESTS_KDUMP)
+			ctrl_info->max_outstanding_requests =
+					PQI_MAX_OUTSTANDING_REQUESTS_KDUMP;
+	} else {
+		if (ctrl_info->max_outstanding_requests >
+			PQI_MAX_OUTSTANDING_REQUESTS)
+			ctrl_info->max_outstanding_requests =
+					PQI_MAX_OUTSTANDING_REQUESTS;
+	}
 
 	pqi_calculate_io_resources(ctrl_info);
 
@@ -6321,4 +6338,6 @@ static void __attribute__((unused)) verify_structures(void)
 		PQI_QUEUE_ELEMENT_LENGTH_ALIGNMENT != 0);
 
 	BUILD_BUG_ON(PQI_RESERVED_IO_SLOTS >= PQI_MAX_OUTSTANDING_REQUESTS);
+	BUILD_BUG_ON(PQI_RESERVED_IO_SLOTS >=
+		PQI_MAX_OUTSTANDING_REQUESTS_KDUMP);
 }

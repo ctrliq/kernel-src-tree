@@ -19,7 +19,8 @@
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
  */
 
 #include <linux/init.h>
@@ -1270,7 +1271,7 @@ static int pxa168_eth_start_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	stats->tx_bytes += length;
 	stats->tx_packets++;
-	dev->trans_start = jiffies;
+	netif_trans_update(dev);
 	if (pep->tx_ring_size - pep->tx_desc_count <= 1) {
 		/* We handled the current skb, but now we are out of space.*/
 		netif_stop_queue(dev);

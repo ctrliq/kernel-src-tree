@@ -3,6 +3,7 @@
 
 #include <linux/types.h>
 #include <linux/interrupt.h>
+#include <linux/clocksource.h>
 #include <asm/hyperv.h>
 
 struct ms_hyperv_info {
@@ -12,6 +13,7 @@ struct ms_hyperv_info {
 };
 
 extern struct ms_hyperv_info ms_hyperv;
+extern struct clocksource *hyperv_cs;
 
 void hyperv_callback_vector(void);
 #ifdef CONFIG_TRACING

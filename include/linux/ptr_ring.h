@@ -111,6 +111,11 @@ static inline int __ptr_ring_produce(struct ptr_ring *r, void *ptr)
 	return 0;
 }
 
+/*
+ * Note: resize (below) nests producer lock within consumer lock, so if you
+ * consume in interrupt or BH context, you must disable interrupts/BH when
+ * calling this.
+ */
 static inline int ptr_ring_produce(struct ptr_ring *r, void *ptr)
 {
 	int ret;
@@ -242,6 +247,11 @@ static inline void *__ptr_ring_consume(struct ptr_ring *r)
 	return ptr;
 }
 
+/*
+ * Note: resize (below) nests producer lock within consumer lock, so if you
+ * call this in interrupt or BH context, you must disable interrupts/BH when
+ * producing.
+ */
 static inline void *ptr_ring_consume(struct ptr_ring *r)
 {
 	void *ptr;
@@ -349,21 +359,15 @@ static inline int ptr_ring_init(struct ptr_ring *r, int size, gfp_t gfp)
 	return 0;
 }
 
-static inline int ptr_ring_resize(struct ptr_ring *r, int size, gfp_t gfp,
-				  void (*destroy)(void *))
+static inline void **__ptr_ring_swap_queue(struct ptr_ring *r, void **queue,
+					   int size, gfp_t gfp,
+					   void (*destroy)(void *))
 {
-	unsigned long flags;
 	int producer = 0;
-	void **queue = __ptr_ring_init_queue_alloc(size, gfp);
 	void **old;
 	void *ptr;
 
-	if (!queue)
-		return -ENOMEM;
-
-	spin_lock_irqsave(&(r)->producer_lock, flags);
-
-	while ((ptr = ptr_ring_consume(r)))
+	while ((ptr = __ptr_ring_consume(r)))
 		if (producer < size)
 			queue[producer++] = ptr;
 		else if (destroy)
@@ -375,11 +379,86 @@ static inline int ptr_ring_resize(struct ptr_ring *r, int size, gfp_t gfp,
 	old = r->queue;
 	r->queue = queue;
 
-	spin_unlock_irqrestore(&(r)->producer_lock, flags);
+	return old;
+}
+
+/*
+ * Note: producer lock is nested within consumer lock, so if you
+ * resize you must make sure all uses nest correctly.
+ * In particular if you consume ring in interrupt or BH context, you must
+ * disable interrupts/BH when doing so.
+ */
+static inline int ptr_ring_resize(struct ptr_ring *r, int size, gfp_t gfp,
+				  void (*destroy)(void *))
+{
+	unsigned long flags;
+	void **queue = __ptr_ring_init_queue_alloc(size, gfp);
+	void **old;
+
+	if (!queue)
+		return -ENOMEM;
+
+	spin_lock_irqsave(&(r)->consumer_lock, flags);
+	spin_lock(&(r)->producer_lock);
+
+	old = __ptr_ring_swap_queue(r, queue, size, gfp, destroy);
+
+	spin_unlock(&(r)->producer_lock);
+	spin_unlock_irqrestore(&(r)->consumer_lock, flags);
 
 	kfree(old);
 
 	return 0;
+}
+
+/*
+ * Note: producer lock is nested within consumer lock, so if you
+ * resize you must make sure all uses nest correctly.
+ * In particular if you consume ring in interrupt or BH context, you must
+ * disable interrupts/BH when doing so.
+ */
+static inline int ptr_ring_resize_multiple(struct ptr_ring **rings, int nrings,
+					   int size,
+					   gfp_t gfp, void (*destroy)(void *))
+{
+	unsigned long flags;
+	void ***queues;
+	int i;
+
+	queues = kmalloc(nrings * sizeof *queues, gfp);
+	if (!queues)
+		goto noqueues;
+
+	for (i = 0; i < nrings; ++i) {
+		queues[i] = __ptr_ring_init_queue_alloc(size, gfp);
+		if (!queues[i])
+			goto nomem;
+	}
+
+	for (i = 0; i < nrings; ++i) {
+		spin_lock_irqsave(&(rings[i])->consumer_lock, flags);
+		spin_lock(&(rings[i])->producer_lock);
+		queues[i] = __ptr_ring_swap_queue(rings[i], queues[i],
+						  size, gfp, destroy);
+		spin_unlock(&(rings[i])->producer_lock);
+		spin_unlock_irqrestore(&(rings[i])->consumer_lock, flags);
+	}
+
+	for (i = 0; i < nrings; ++i)
+		kfree(queues[i]);
+
+	kfree(queues);
+
+	return 0;
+
+nomem:
+	while (--i >= 0)
+		kfree(queues[i]);
+
+	kfree(queues);
+
+noqueues:
+	return -ENOMEM;
 }
 
 static inline void ptr_ring_cleanup(struct ptr_ring *r, void (*destroy)(void *))

@@ -134,7 +134,7 @@ static void i40e_dbg_dump_vsi_seid(struct i40e_pf *pf, int seid)
 	struct rtnl_link_stats64 *nstat;
 	struct i40e_mac_filter *f;
 	struct i40e_vsi *vsi;
-	int i;
+	int i, bkt;
 
 	vsi = i40e_dbg_find_vsi(pf, seid);
 	if (!vsi) {
@@ -166,11 +166,11 @@ static void i40e_dbg_dump_vsi_seid(struct i40e_pf *pf, int seid)
 			 pf->hw.mac.addr,
 			 pf->hw.mac.san_addr,
 			 pf->hw.mac.port_addr);
-	list_for_each_entry(f, &vsi->mac_filter_list, list) {
+	hash_for_each(vsi->mac_filter_hash, bkt, f, hlist) {
 		dev_info(&pf->pdev->dev,
-			 "    mac_filter_list: %pM vid=%d, is_netdev=%d is_vf=%d counter=%d, state %s\n",
-			 f->macaddr, f->vlan, f->is_netdev, f->is_vf,
-			 f->counter, i40e_filter_state_string[f->state]);
+			 "    mac_filter_hash: %pM vid=%d, state %s\n",
+			 f->macaddr, f->vlan,
+			 i40e_filter_state_string[f->state]);
 	}
 	dev_info(&pf->pdev->dev, "    active_filters %u, promisc_threshold %u, overflow promisc %s\n",
 		 vsi->active_filters, vsi->promisc_threshold,
@@ -280,9 +280,8 @@ static void i40e_dbg_dump_vsi_seid(struct i40e_pf *pf, int seid)
 			 rx_ring->queue_index,
 			 rx_ring->reg_idx);
 		dev_info(&pf->pdev->dev,
-			 "    rx_rings[%i]: rx_hdr_len = %d, rx_buf_len = %d\n",
-			 i, rx_ring->rx_hdr_len,
-			 rx_ring->rx_buf_len);
+			 "    rx_rings[%i]: rx_buf_len = %d\n",
+			 i, rx_ring->rx_buf_len);
 		dev_info(&pf->pdev->dev,
 			 "    rx_rings[%i]: next_to_use = %d, next_to_clean = %d, ring_active = %i\n",
 			 i,
@@ -373,8 +372,8 @@ static void i40e_dbg_dump_vsi_seid(struct i40e_pf *pf, int seid)
 		 "    work_limit = %d\n",
 		 vsi->work_limit);
 	dev_info(&pf->pdev->dev,
-		 "    max_frame = %d, rx_hdr_len = %d, rx_buf_len = %d dtype = %d\n",
-		 vsi->max_frame, vsi->rx_hdr_len, vsi->rx_buf_len, vsi->dtype);
+		 "    max_frame = %d, rx_buf_len = %d dtype = %d\n",
+		 vsi->max_frame, vsi->rx_buf_len, 0);
 	dev_info(&pf->pdev->dev,
 		 "    num_q_vectors = %i, base_vector = %i\n",
 		 vsi->num_q_vectors, vsi->base_vector);
@@ -599,13 +598,6 @@ static void i40e_dbg_dump_desc(int cnt, int vsi_seid, int ring_id, int desc_n,
 					 "   d[%03x] = 0x%016llx 0x%016llx\n",
 					 i, txd->buffer_addr,
 					 txd->cmd_type_offset_bsz);
-			} else if (sizeof(union i40e_rx_desc) ==
-				   sizeof(union i40e_16byte_rx_desc)) {
-				rxd = I40E_RX_DESC(ring, i);
-				dev_info(&pf->pdev->dev,
-					 "   d[%03x] = 0x%016llx 0x%016llx\n",
-					 i, rxd->read.pkt_addr,
-					 rxd->read.hdr_addr);
 			} else {
 				rxd = I40E_RX_DESC(ring, i);
 				dev_info(&pf->pdev->dev,
@@ -627,13 +619,6 @@ static void i40e_dbg_dump_desc(int cnt, int vsi_seid, int ring_id, int desc_n,
 				 "vsi = %02i tx ring = %02i d[%03x] = 0x%016llx 0x%016llx\n",
 				 vsi_seid, ring_id, desc_n,
 				 txd->buffer_addr, txd->cmd_type_offset_bsz);
-		} else if (sizeof(union i40e_rx_desc) ==
-			   sizeof(union i40e_16byte_rx_desc)) {
-			rxd = I40E_RX_DESC(ring, desc_n);
-			dev_info(&pf->pdev->dev,
-				 "vsi = %02i rx ring = %02i d[%03x] = 0x%016llx 0x%016llx\n",
-				 vsi_seid, ring_id, desc_n,
-				 rxd->read.pkt_addr, rxd->read.hdr_addr);
 		} else {
 			rxd = I40E_RX_DESC(ring, desc_n);
 			dev_info(&pf->pdev->dev,
@@ -882,86 +867,6 @@ static ssize_t i40e_dbg_command_write(struct file *filp,
 
 		dev_info(&pf->pdev->dev, "deleting relay %d\n", veb_seid);
 		i40e_veb_release(pf->veb[i]);
-
-	} else if (strncmp(cmd_buf, "add macaddr", 11) == 0) {
-		struct i40e_mac_filter *f;
-		int vlan = 0;
-		u8 ma[6];
-		int ret;
-
-		cnt = sscanf(&cmd_buf[11],
-			     "%i %hhx:%hhx:%hhx:%hhx:%hhx:%hhx %i",
-			     &vsi_seid,
-			     &ma[0], &ma[1], &ma[2], &ma[3], &ma[4], &ma[5],
-			     &vlan);
-		if (cnt == 7) {
-			vlan = 0;
-		} else if (cnt != 8) {
-			dev_info(&pf->pdev->dev,
-				 "add macaddr: bad command string, cnt=%d\n",
-				 cnt);
-			goto command_write_done;
-		}
-
-		vsi = i40e_dbg_find_vsi(pf, vsi_seid);
-		if (!vsi) {
-			dev_info(&pf->pdev->dev,
-				 "add macaddr: VSI %d not found\n", vsi_seid);
-			goto command_write_done;
-		}
-
-		spin_lock_bh(&vsi->mac_filter_list_lock);
-		f = i40e_add_filter(vsi, ma, vlan, false, false);
-		spin_unlock_bh(&vsi->mac_filter_list_lock);
-		ret = i40e_sync_vsi_filters(vsi);
-		if (f && !ret)
-			dev_info(&pf->pdev->dev,
-				 "add macaddr: %pM vlan=%d added to VSI %d\n",
-				 ma, vlan, vsi_seid);
-		else
-			dev_info(&pf->pdev->dev,
-				 "add macaddr: %pM vlan=%d to VSI %d failed, f=%p ret=%d\n",
-				 ma, vlan, vsi_seid, f, ret);
-
-	} else if (strncmp(cmd_buf, "del macaddr", 11) == 0) {
-		int vlan = 0;
-		u8 ma[6];
-		int ret;
-
-		cnt = sscanf(&cmd_buf[11],
-			     "%i %hhx:%hhx:%hhx:%hhx:%hhx:%hhx %i",
-			     &vsi_seid,
-			     &ma[0], &ma[1], &ma[2], &ma[3], &ma[4], &ma[5],
-			     &vlan);
-		if (cnt == 7) {
-			vlan = 0;
-		} else if (cnt != 8) {
-			dev_info(&pf->pdev->dev,
-				 "del macaddr: bad command string, cnt=%d\n",
-				 cnt);
-			goto command_write_done;
-		}
-
-		vsi = i40e_dbg_find_vsi(pf, vsi_seid);
-		if (!vsi) {
-			dev_info(&pf->pdev->dev,
-				 "del macaddr: VSI %d not found\n", vsi_seid);
-			goto command_write_done;
-		}
-
-		spin_lock_bh(&vsi->mac_filter_list_lock);
-		i40e_del_filter(vsi, ma, vlan, false, false);
-		spin_unlock_bh(&vsi->mac_filter_list_lock);
-		ret = i40e_sync_vsi_filters(vsi);
-		if (!ret)
-			dev_info(&pf->pdev->dev,
-				 "del macaddr: %pM vlan=%d removed from VSI %d\n",
-				 ma, vlan, vsi_seid);
-		else
-			dev_info(&pf->pdev->dev,
-				 "del macaddr: %pM vlan=%d from VSI %d failed, ret=%d\n",
-				 ma, vlan, vsi_seid, ret);
-
 	} else if (strncmp(cmd_buf, "add pvid", 8) == 0) {
 		i40e_status ret;
 		u16 vid;
@@ -1631,8 +1536,6 @@ static ssize_t i40e_dbg_command_write(struct file *filp,
 		dev_info(&pf->pdev->dev, "  del vsi [vsi_seid]\n");
 		dev_info(&pf->pdev->dev, "  add relay <uplink_seid> <vsi_seid>\n");
 		dev_info(&pf->pdev->dev, "  del relay <relay_seid>\n");
-		dev_info(&pf->pdev->dev, "  add macaddr <vsi_seid> <aa:bb:cc:dd:ee:ff> [vlan]\n");
-		dev_info(&pf->pdev->dev, "  del macaddr <vsi_seid> <aa:bb:cc:dd:ee:ff> [vlan]\n");
 		dev_info(&pf->pdev->dev, "  add pvid <vsi_seid> <vid>\n");
 		dev_info(&pf->pdev->dev, "  del pvid <vsi_seid>\n");
 		dev_info(&pf->pdev->dev, "  dump switch\n");

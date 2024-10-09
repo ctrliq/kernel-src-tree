@@ -728,7 +728,7 @@ lpfc_sli4_fcp_xri_aborted(struct lpfc_hba *phba,
 }
 
 /**
- * lpfc_sli4_post_scsi_sgl_list - Psot blocks of scsi buffer sgls from a list
+ * lpfc_sli4_post_scsi_sgl_list - Post blocks of scsi buffer sgls from a list
  * @phba: pointer to lpfc hba data structure.
  * @post_sblist: pointer to the scsi buffer list.
  *
@@ -857,7 +857,7 @@ lpfc_sli4_post_scsi_sgl_list(struct lpfc_hba *phba,
 }
 
 /**
- * lpfc_sli4_repost_scsi_sgl_list - Repsot all the allocated scsi buffer sgls
+ * lpfc_sli4_repost_scsi_sgl_list - Repost all the allocated scsi buffer sgls
  * @phba: pointer to lpfc hba data structure.
  *
  * This routine walks the list of scsi buffers that have been allocated and
@@ -978,7 +978,7 @@ lpfc_new_scsi_buf_s4(struct lpfc_vport *vport, int num_to_alloc)
 				psb->data, psb->dma_handle);
 			kfree(psb);
 			lpfc_printf_log(phba, KERN_ERR, LOG_FCP,
-					"3368 Failed to allocated IOTAG for"
+					"3368 Failed to allocate IOTAG for"
 					" XRI:0x%x\n", lxri);
 			lpfc_sli4_free_xri(phba, lxri);
 			break;
@@ -1257,7 +1257,7 @@ lpfc_release_scsi_buf(struct lpfc_hba *phba, struct lpfc_scsi_buf *psb)
  *
  * This routine does the pci dma mapping for scatter-gather list of scsi cmnd
  * field of @lpfc_cmd for device with SLI-3 interface spec. This routine scans
- * through sg elements and format the bdea. This routine also initializes all
+ * through sg elements and format the bde. This routine also initializes all
  * IOCB fields which are dependent on scsi command request buffer.
  *
  * Return codes:
@@ -1390,13 +1390,16 @@ lpfc_scsi_prep_dma_buf_s3(struct lpfc_hba *phba, struct lpfc_scsi_buf *lpfc_cmd)
 
 #ifdef CONFIG_SCSI_LPFC_DEBUG_FS
 
-/* Return if if error injection is detected by Initiator */
+/* Return BG_ERR_INIT if error injection is detected by Initiator */
 #define BG_ERR_INIT	0x1
-/* Return if if error injection is detected by Target */
+/* Return BG_ERR_TGT if error injection is detected by Target */
 #define BG_ERR_TGT	0x2
-/* Return if if swapping CSUM<-->CRC is required for error injection */
+/* Return BG_ERR_SWAP if swapping CSUM<-->CRC is required for error injection */
 #define BG_ERR_SWAP	0x10
-/* Return if disabling Guard/Ref/App checking is required for error injection */
+/**
+ * Return BG_ERR_CHECK if disabling Guard/Ref/App checking is required for
+ * error injection
+ **/
 #define BG_ERR_CHECK	0x20
 
 /**
@@ -4957,7 +4960,7 @@ wait_for_cmpl:
 		ret = FAILED;
 		lpfc_printf_vlog(vport, KERN_ERR, LOG_FCP,
 				 "0748 abort handler timed out waiting "
-				 "for abortng I/O (xri:x%x) to complete: "
+				 "for aborting I/O (xri:x%x) to complete: "
 				 "ret %#x, ID %d, LUN %d\n",
 				 iocb->sli4_xritag, ret,
 				 cmnd->device->id, cmnd->device->lun);
@@ -5080,26 +5083,30 @@ lpfc_check_fcp_rsp(struct lpfc_vport *vport, struct lpfc_scsi_buf *lpfc_cmd)
  *   0x2002 - Success.
  **/
 static int
-lpfc_send_taskmgmt(struct lpfc_vport *vport, struct lpfc_rport_data *rdata,
-		    unsigned  tgt_id, unsigned int lun_id,
-		    uint8_t task_mgmt_cmd)
+lpfc_send_taskmgmt(struct lpfc_vport *vport, struct scsi_cmnd *cmnd,
+		   unsigned int tgt_id, unsigned int lun_id,
+		   uint8_t task_mgmt_cmd)
 {
 	struct lpfc_hba   *phba = vport->phba;
 	struct lpfc_scsi_buf *lpfc_cmd;
 	struct lpfc_iocbq *iocbq;
 	struct lpfc_iocbq *iocbqrsp;
-	struct lpfc_nodelist *pnode = rdata->pnode;
+	struct lpfc_rport_data *rdata;
+	struct lpfc_nodelist *pnode;
 	int ret;
 	int status;
 
-	if (!pnode || !NLP_CHK_NODE_ACT(pnode))
+	rdata = lpfc_rport_data_from_scsi_device(cmnd->device);
+	if (!rdata || !rdata->pnode || !NLP_CHK_NODE_ACT(rdata->pnode))
 		return FAILED;
+	pnode = rdata->pnode;
 
-	lpfc_cmd = lpfc_get_scsi_buf(phba, rdata->pnode);
+	lpfc_cmd = lpfc_get_scsi_buf(phba, pnode);
 	if (lpfc_cmd == NULL)
 		return FAILED;
 	lpfc_cmd->timeout = phba->cfg_task_mgmt_tmo;
 	lpfc_cmd->rdata = rdata;
+	lpfc_cmd->pCmd = cmnd;
 
 	status = lpfc_scsi_prep_task_mgmt_cmd(vport, lpfc_cmd, lun_id,
 					   task_mgmt_cmd);
@@ -5127,13 +5134,16 @@ lpfc_send_taskmgmt(struct lpfc_vport *vport, struct lpfc_rport_data *rdata,
 					  iocbq, iocbqrsp, lpfc_cmd->timeout);
 	if ((status != IOCB_SUCCESS) ||
 	    (iocbqrsp->iocb.ulpStatus != IOSTAT_SUCCESS)) {
-		lpfc_printf_vlog(vport, KERN_ERR, LOG_FCP,
-			 "0727 TMF %s to TGT %d LUN %d failed (%d, %d) "
-			 "iocb_flag x%x\n",
-			 lpfc_taskmgmt_name(task_mgmt_cmd),
-			 tgt_id, lun_id, iocbqrsp->iocb.ulpStatus,
-			 iocbqrsp->iocb.un.ulpWord[4],
-			 iocbq->iocb_flag);
+		if (status != IOCB_SUCCESS ||
+		    iocbqrsp->iocb.ulpStatus != IOSTAT_FCP_RSP_ERROR)
+			lpfc_printf_vlog(vport, KERN_ERR, LOG_FCP,
+					 "0727 TMF %s to TGT %d LUN %d "
+					 "failed (%d, %d) iocb_flag x%x\n",
+					 lpfc_taskmgmt_name(task_mgmt_cmd),
+					 tgt_id, lun_id,
+					 iocbqrsp->iocb.ulpStatus,
+					 iocbqrsp->iocb.un.ulpWord[4],
+					 iocbq->iocb_flag);
 		/* if ulpStatus != IOCB_SUCCESS, then status == IOCB_SUCCESS */
 		if (status == IOCB_SUCCESS) {
 			if (iocbqrsp->iocb.ulpStatus == IOSTAT_FCP_RSP_ERROR)
@@ -5147,7 +5157,6 @@ lpfc_send_taskmgmt(struct lpfc_vport *vport, struct lpfc_rport_data *rdata,
 		} else {
 			ret = FAILED;
 		}
-		lpfc_cmd->status = IOSTAT_DRIVER_REJECT;
 	} else
 		ret = SUCCESS;
 
@@ -5304,7 +5313,7 @@ lpfc_device_reset_handler(struct scsi_cmnd *cmnd)
 	fc_host_post_vendor_event(shost, fc_get_event_number(),
 		sizeof(scsi_event), (char *)&scsi_event, LPFC_NL_VENDOR_ID);
 
-	status = lpfc_send_taskmgmt(vport, rdata, tgt_id, lun_id,
+	status = lpfc_send_taskmgmt(vport, cmnd, tgt_id, lun_id,
 						FCP_LUN_RESET);
 
 	lpfc_printf_vlog(vport, KERN_ERR, LOG_FCP,
@@ -5382,7 +5391,7 @@ lpfc_target_reset_handler(struct scsi_cmnd *cmnd)
 	fc_host_post_vendor_event(shost, fc_get_event_number(),
 		sizeof(scsi_event), (char *)&scsi_event, LPFC_NL_VENDOR_ID);
 
-	status = lpfc_send_taskmgmt(vport, rdata, tgt_id, lun_id,
+	status = lpfc_send_taskmgmt(vport, cmnd, tgt_id, lun_id,
 					FCP_TARGET_RESET);
 
 	lpfc_printf_vlog(vport, KERN_ERR, LOG_FCP,
@@ -5461,7 +5470,7 @@ lpfc_bus_reset_handler(struct scsi_cmnd *cmnd)
 		if (!match)
 			continue;
 
-		status = lpfc_send_taskmgmt(vport, ndlp->rport->dd_data,
+		status = lpfc_send_taskmgmt(vport, cmnd,
 					i, 0, FCP_TARGET_RESET);
 
 		if (status != SUCCESS) {
@@ -6030,7 +6039,7 @@ lpfc_disable_oas_lun(struct lpfc_hba *phba, struct lpfc_name *vport_wwpn,
 	return false;
 }
 
-struct scsi_host_template lpfc_template_s3 = {
+struct scsi_host_template lpfc_template_no_hr = {
 	.module			= THIS_MODULE,
 	.name			= LPFC_DRIVER_NAME,
 	.proc_name		= LPFC_DRIVER_NAME,
@@ -6074,6 +6083,7 @@ struct scsi_host_template lpfc_template = {
 	.sg_tablesize		= LPFC_DEFAULT_SG_SEG_CNT,
 	.cmd_per_lun		= LPFC_CMD_PER_LUN,
 	.use_clustering		= ENABLE_CLUSTERING,
+	.use_host_wide_tags	= 1,
 	.shost_attrs		= lpfc_hba_attrs,
 	.max_sectors		= 0xFFFF,
 	.vendor_id		= LPFC_NL_VENDOR_ID,
@@ -6090,7 +6100,6 @@ struct scsi_host_template lpfc_vport_template = {
 	.eh_abort_handler	= lpfc_abort_handler,
 	.eh_device_reset_handler = lpfc_device_reset_handler,
 	.eh_target_reset_handler = lpfc_target_reset_handler,
-	.eh_bus_reset_handler	= lpfc_bus_reset_handler,
 	.slave_alloc		= lpfc_slave_alloc,
 	.slave_configure	= lpfc_slave_configure,
 	.slave_destroy		= lpfc_slave_destroy,
@@ -6099,6 +6108,7 @@ struct scsi_host_template lpfc_vport_template = {
 	.sg_tablesize		= LPFC_DEFAULT_SG_SEG_CNT,
 	.cmd_per_lun		= LPFC_CMD_PER_LUN,
 	.use_clustering		= ENABLE_CLUSTERING,
+	.use_host_wide_tags	= 1,
 	.shost_attrs		= lpfc_vport_attrs,
 	.max_sectors		= 0xFFFF,
 	.change_queue_depth	= lpfc_change_queue_depth,

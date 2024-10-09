@@ -289,6 +289,7 @@ static void qedf_link_recovery(struct work_struct *work)
 	int retries = 30;
 	int rval, i;
 	struct list_head rdata_login_list;
+	struct fc_lport *lport = qedf->lport;
 
 	INIT_LIST_HEAD(&rdata_login_list);
 
@@ -373,8 +374,8 @@ static void qedf_link_recovery(struct work_struct *work)
 	list_for_each_entry_safe(rdata_item, tmp_rdata_item, &rdata_login_list,
 	    list) {
 		list_del(&rdata_item->list);
-		fc_rport_login(rdata_item->rdata);
-		kref_put(&rdata_item->rdata->kref, fc_rport_destroy);
+		lport->tt.rport_login(rdata_item->rdata);
+		kref_put(&rdata_item->rdata->kref, lport->tt.rport_destroy);
 		kfree(rdata_item);
 	}
 }
@@ -678,7 +679,10 @@ static int qedf_eh_host_reset(struct scsi_cmnd *sc_cmd)
 static int qedf_slave_configure(struct scsi_device *sdev)
 {
 	if (qedf_queue_depth) {
-		scsi_change_queue_depth(sdev, qedf_queue_depth);
+		if (sdev->tagged_supported)
+			scsi_activate_tcq(sdev, qedf_queue_depth);
+		else
+			scsi_deactivate_tcq(sdev, qedf_queue_depth);
 	}
 
 	return 0;
@@ -810,7 +814,7 @@ static int qedf_xmit(struct fc_lport *lport, struct fc_frame *fp)
 		QEDF_INFO(&(qedf->dbg_ctx), QEDF_LOG_LL2,
 		    "Dropping FCoE frame to %06x.\n", ntoh24(fh->fh_d_id));
 		kfree_skb(skb);
-		rdata = fc_rport_lookup(lport, ntoh24(fh->fh_d_id));
+		rdata = lport->tt.rport_lookup(lport, ntoh24(fh->fh_d_id));
 		if (rdata)
 			rdata->retries = lport->max_rport_retry_count;
 		return -EINVAL;

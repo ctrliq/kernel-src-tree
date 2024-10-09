@@ -44,7 +44,7 @@ static int try_to_freeze_tasks(bool user_only)
 
 	while (true) {
 		todo = 0;
-		read_lock(&tasklist_lock);
+		qread_lock(&tasklist_lock);
 		do_each_thread(g, p) {
 			if (p == current || !freeze_task(p))
 				continue;
@@ -52,7 +52,7 @@ static int try_to_freeze_tasks(bool user_only)
 			if (!freezer_should_skip(p))
 				todo++;
 		} while_each_thread(g, p);
-		read_unlock(&tasklist_lock);
+		qread_unlock(&tasklist_lock);
 
 		if (!user_only) {
 			wq_busy = freeze_workqueues_busy();
@@ -91,13 +91,13 @@ static int try_to_freeze_tasks(bool user_only)
 		       todo - wq_busy, wq_busy);
 
 		if (!wakeup) {
-			read_lock(&tasklist_lock);
+			qread_lock(&tasklist_lock);
 			do_each_thread(g, p) {
 				if (p != current && !freezer_should_skip(p)
 				    && freezing(p) && !frozen(p))
 					sched_show_task(p);
 			} while_each_thread(g, p);
-			read_unlock(&tasklist_lock);
+			qread_unlock(&tasklist_lock);
 		}
 	} else {
 		printk("(elapsed %d.%03d seconds) ", elapsed_msecs / 1000,
@@ -187,13 +187,13 @@ void thaw_processes(void)
 	__usermodehelper_set_disable_depth(UMH_FREEZING);
 	thaw_workqueues();
 
-	read_lock(&tasklist_lock);
+	qread_lock(&tasklist_lock);
 	do_each_thread(g, p) {
 		/* No other threads should have PF_SUSPEND_TASK set */
 		WARN_ON((p != curr) && (p->flags & PF_SUSPEND_TASK));
 		__thaw_task(p);
 	} while_each_thread(g, p);
-	read_unlock(&tasklist_lock);
+	qread_unlock(&tasklist_lock);
 
 	WARN_ON(!(curr->flags & PF_SUSPEND_TASK));
 	curr->flags &= ~PF_SUSPEND_TASK;
@@ -213,12 +213,12 @@ void thaw_kernel_threads(void)
 
 	thaw_workqueues();
 
-	read_lock(&tasklist_lock);
+	qread_lock(&tasklist_lock);
 	do_each_thread(g, p) {
 		if (p->flags & (PF_KTHREAD | PF_WQ_WORKER))
 			__thaw_task(p);
 	} while_each_thread(g, p);
-	read_unlock(&tasklist_lock);
+	qread_unlock(&tasklist_lock);
 
 	schedule();
 	printk("done.\n");

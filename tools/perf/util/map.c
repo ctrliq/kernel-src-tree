@@ -281,7 +281,7 @@ void map__fixup_end(struct map *map)
 
 #define DSO__DELETED "(deleted)"
 
-int map__load(struct map *map, symbol_filter_t filter)
+int map__load(struct map *map)
 {
 	const char *name = map->dso->long_name;
 	int nr;
@@ -289,7 +289,7 @@ int map__load(struct map *map, symbol_filter_t filter)
 	if (dso__loaded(map->dso, map->type))
 		return 0;
 
-	nr = dso__load(map->dso, map, filter);
+	nr = dso__load(map->dso, map);
 	if (nr < 0) {
 		if (map->dso->has_build_id) {
 			char sbuild_id[SBUILD_ID_SIZE];
@@ -314,9 +314,6 @@ int map__load(struct map *map, symbol_filter_t filter)
 			pr_warning("%.*s was updated (is prelink enabled?). "
 				"Restart the long running apps that use it!\n",
 				   (int)real_len, name);
-		} else if (filter) {
-			pr_warning("no symbols passed the given filter.\n");
-			return -2;	/* Empty but maybe by the filter */
 		} else {
 			pr_warning("no symbols found in %s, maybe install "
 				   "a debug package?\n", name);
@@ -333,19 +330,17 @@ int __weak arch__compare_symbol_names(const char *namea, const char *nameb)
 	return strcmp(namea, nameb);
 }
 
-struct symbol *map__find_symbol(struct map *map, u64 addr,
-				symbol_filter_t filter)
+struct symbol *map__find_symbol(struct map *map, u64 addr)
 {
-	if (map__load(map, filter) < 0)
+	if (map__load(map) < 0)
 		return NULL;
 
 	return dso__find_symbol(map->dso, map->type, addr);
 }
 
-struct symbol *map__find_symbol_by_name(struct map *map, const char *name,
-					symbol_filter_t filter)
+struct symbol *map__find_symbol_by_name(struct map *map, const char *name)
 {
-	if (map__load(map, filter) < 0)
+	if (map__load(map) < 0)
 		return NULL;
 
 	if (!dso__sorted_by_name(map->dso, map->type))
@@ -437,6 +432,13 @@ u64 map__rip_2objdump(struct map *map, u64 rip)
 	if (map->dso->rel)
 		return rip - map->pgoff;
 
+	/*
+	 * kernel modules also have DSO_TYPE_USER in dso->kernel,
+	 * but all kernel modules are ET_REL, so won't get here.
+	 */
+	if (map->dso->kernel == DSO_TYPE_USER)
+		return rip + map->dso->text_offset;
+
 	return map->unmap_ip(map, rip) - map->reloc;
 }
 
@@ -459,6 +461,13 @@ u64 map__objdump_2mem(struct map *map, u64 ip)
 
 	if (map->dso->rel)
 		return map->unmap_ip(map, ip + map->pgoff);
+
+	/*
+	 * kernel modules also have DSO_TYPE_USER in dso->kernel,
+	 * but all kernel modules are ET_REL, so won't get here.
+	 */
+	if (map->dso->kernel == DSO_TYPE_USER)
+		return map->unmap_ip(map, ip - map->dso->text_offset);
 
 	return ip + map->reloc;
 }
@@ -544,23 +553,22 @@ void map_groups__put(struct map_groups *mg)
 
 struct symbol *map_groups__find_symbol(struct map_groups *mg,
 				       enum map_type type, u64 addr,
-				       struct map **mapp,
-				       symbol_filter_t filter)
+				       struct map **mapp)
 {
 	struct map *map = map_groups__find(mg, type, addr);
 
 	/* Ensure map is loaded before using map->map_ip */
-	if (map != NULL && map__load(map, filter) >= 0) {
+	if (map != NULL && map__load(map) >= 0) {
 		if (mapp != NULL)
 			*mapp = map;
-		return map__find_symbol(map, map->map_ip(map, addr), filter);
+		return map__find_symbol(map, map->map_ip(map, addr));
 	}
 
 	return NULL;
 }
 
 struct symbol *maps__find_symbol_by_name(struct maps *maps, const char *name,
-					 struct map **mapp, symbol_filter_t filter)
+					 struct map **mapp)
 {
 	struct symbol *sym;
 	struct rb_node *nd;
@@ -570,7 +578,7 @@ struct symbol *maps__find_symbol_by_name(struct maps *maps, const char *name,
 	for (nd = rb_first(&maps->entries); nd; nd = rb_next(nd)) {
 		struct map *pos = rb_entry(nd, struct map, rb_node);
 
-		sym = map__find_symbol_by_name(pos, name, filter);
+		sym = map__find_symbol_by_name(pos, name);
 
 		if (sym == NULL)
 			continue;
@@ -588,15 +596,14 @@ out:
 struct symbol *map_groups__find_symbol_by_name(struct map_groups *mg,
 					       enum map_type type,
 					       const char *name,
-					       struct map **mapp,
-					       symbol_filter_t filter)
+					       struct map **mapp)
 {
-	struct symbol *sym = maps__find_symbol_by_name(&mg->maps[type], name, mapp, filter);
+	struct symbol *sym = maps__find_symbol_by_name(&mg->maps[type], name, mapp);
 
 	return sym;
 }
 
-int map_groups__find_ams(struct addr_map_symbol *ams, symbol_filter_t filter)
+int map_groups__find_ams(struct addr_map_symbol *ams)
 {
 	if (ams->addr < ams->map->start || ams->addr >= ams->map->end) {
 		if (ams->map->groups == NULL)
@@ -608,7 +615,7 @@ int map_groups__find_ams(struct addr_map_symbol *ams, symbol_filter_t filter)
 	}
 
 	ams->al_addr = ams->map->map_ip(ams->map, ams->addr);
-	ams->sym = map__find_symbol(ams->map, ams->al_addr, filter);
+	ams->sym = map__find_symbol(ams->map, ams->al_addr);
 
 	return ams->sym ? 0 : -1;
 }

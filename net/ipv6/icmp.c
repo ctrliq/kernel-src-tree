@@ -100,11 +100,10 @@ static const struct inet6_protocol icmpv6_protocol = {
 	.flags		=	INET6_PROTO_NOPOLICY|INET6_PROTO_FINAL,
 };
 
+/* Called with BH disabled */
 static __inline__ struct sock *icmpv6_xmit_lock(struct net *net)
 {
 	struct sock *sk;
-
-	local_bh_disable();
 
 	sk = icmpv6_sk(net);
 	if (unlikely(!spin_trylock(&sk->sk_lock.slock))) {
@@ -112,7 +111,6 @@ static __inline__ struct sock *icmpv6_xmit_lock(struct net *net)
 		 * ip6ip6 tunnel) signals dst_link_failure() for an
 		 * outgoing ICMP6 packet.
 		 */
-		local_bh_enable();
 		return NULL;
 	}
 	return sk;
@@ -120,7 +118,7 @@ static __inline__ struct sock *icmpv6_xmit_lock(struct net *net)
 
 static __inline__ void icmpv6_xmit_unlock(struct sock *sk)
 {
-	spin_unlock_bh(&sk->sk_lock.slock);
+	spin_unlock(&sk->sk_lock.slock);
 }
 
 /*
@@ -159,22 +157,41 @@ static bool is_ineligible(const struct sk_buff *skb)
 	return false;
 }
 
-/*
- * Check the ICMP output rate limit
- */
-static inline bool icmpv6_xrlim_allow(struct sock *sk, u8 type,
-				      struct flowi6 *fl6)
+static bool icmpv6_mask_allow(int type)
 {
-	struct dst_entry *dst;
-	struct net *net = sock_net(sk);
-	bool res = false;
-
 	/* Informational messages are not limited. */
 	if (type & ICMPV6_INFOMSG_MASK)
 		return true;
 
 	/* Do not limit pmtu discovery, it would break it. */
 	if (type == ICMPV6_PKT_TOOBIG)
+		return true;
+
+	return false;
+}
+
+static bool icmpv6_global_allow(int type)
+{
+	if (icmpv6_mask_allow(type))
+		return true;
+
+	if (icmp_global_allow())
+		return true;
+
+	return false;
+}
+
+/*
+ * Check the ICMP output rate limit
+ */
+static bool icmpv6_xrlim_allow(struct sock *sk, u8 type,
+			       struct flowi6 *fl6)
+{
+	struct net *net = sock_net(sk);
+	struct dst_entry *dst;
+	bool res = false;
+
+	if (icmpv6_mask_allow(type))
 		return true;
 
 	/*
@@ -449,6 +466,13 @@ static void icmp6_send(struct sk_buff *skb, u8 type, u8 code, __u32 info)
 		return;
 	}
 
+	/* Needed by both icmp_global_allow and icmpv6_xmit_lock */
+	local_bh_disable();
+
+	/* Check global sysctl_icmp_msgs_per_sec ratelimit */
+	if (!icmpv6_global_allow(type))
+		goto out_bh_enable;
+
 	mip6_addr_swap(skb);
 
 	memset(&fl6, 0, sizeof(fl6));
@@ -462,8 +486,9 @@ static void icmp6_send(struct sk_buff *skb, u8 type, u8 code, __u32 info)
 	security_skb_classify_flow(skb, flowi6_to_flowi(&fl6));
 
 	sk = icmpv6_xmit_lock(net);
-	if (sk == NULL)
-		return;
+	if (!sk)
+		goto out_bh_enable;
+
 	np = inet6_sk(sk);
 
 	if (!icmpv6_xrlim_allow(sk, type, &fl6))
@@ -521,6 +546,8 @@ out_dst_release:
 	dst_release(dst);
 out:
 	icmpv6_xmit_unlock(sk);
+out_bh_enable:
+	local_bh_enable();
 }
 
 /* Slightly more convenient version of icmp6_send.
@@ -565,9 +592,10 @@ static void icmpv6_echo_reply(struct sk_buff *skb)
 	fl6.fl6_icmp_type = ICMPV6_ECHO_REPLY;
 	security_skb_classify_flow(skb, flowi6_to_flowi(&fl6));
 
+	local_bh_disable();
 	sk = icmpv6_xmit_lock(net);
-	if (sk == NULL)
-		return;
+	if (!sk)
+		goto out_bh_enable;
 	np = inet6_sk(sk);
 
 	if (!fl6.flowi6_oif && ipv6_addr_is_multicast(&fl6.daddr))
@@ -610,6 +638,8 @@ static void icmpv6_echo_reply(struct sk_buff *skb)
 	dst_release(dst);
 out:
 	icmpv6_xmit_unlock(sk);
+out_bh_enable:
+	local_bh_enable();
 }
 
 void icmpv6_notify(struct sk_buff *skb, u8 type, u8 code, __be32 info)

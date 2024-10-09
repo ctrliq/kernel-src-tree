@@ -61,11 +61,12 @@ static struct sk_buff *ipv6_gso_segment(struct sk_buff *skb,
 	const struct net_offload *ops;
 	int proto;
 	struct frag_hdr *fptr;
-	unsigned int unfrag_ip6hlen;
+	unsigned int payload_len;
 	u8 *prevhdr;
 	int offset = 0;
 	bool encap, udpfrag;
 	int nhoff;
+	bool gso_partial;
 
 	skb_reset_network_header(skb);
 	nhoff = skb_network_header(skb) - skb_mac_header(skb);
@@ -74,7 +75,7 @@ static struct sk_buff *ipv6_gso_segment(struct sk_buff *skb,
 
 	encap = SKB_GSO_CB(skb)->encap_level > 0;
 	if (encap)
-		features = skb->dev->hw_enc_features;
+		features &= skb->dev->hw_enc_features;
 	SKB_GSO_CB(skb)->encap_level += sizeof(*ipv6h);
 
 	ipv6h = ipv6_hdr(skb);
@@ -98,16 +99,26 @@ static struct sk_buff *ipv6_gso_segment(struct sk_buff *skb,
 	if (IS_ERR_OR_NULL(segs))
 		goto out;
 
+	gso_partial = !!(skb_shinfo(segs)->gso_type & SKB_GSO_PARTIAL);
+
 	for (skb = segs; skb; skb = skb->next) {
 		ipv6h = (struct ipv6hdr *)(skb_mac_header(skb) + nhoff);
-		ipv6h->payload_len = htons(skb->len - nhoff - sizeof(*ipv6h));
+		if (gso_partial)
+			payload_len = skb_shinfo(skb)->gso_size +
+				      SKB_GSO_CB(skb)->data_offset +
+				      skb->head - (unsigned char *)(ipv6h + 1);
+		else
+			payload_len = skb->len - nhoff - sizeof(*ipv6h);
+		ipv6h->payload_len = htons(payload_len);
 		skb->network_header = (u8 *)ipv6h - skb->head;
 
 		if (udpfrag) {
-			unfrag_ip6hlen = ip6_find_1stfragopt(skb, &prevhdr);
-			if (unfrag_ip6hlen < 0)
-				return ERR_PTR(unfrag_ip6hlen);
-			fptr = (struct frag_hdr *)((u8 *)ipv6h + unfrag_ip6hlen);
+			int err = ip6_find_1stfragopt(skb, &prevhdr);
+			if (err < 0) {
+				kfree_skb_list(segs);
+				return ERR_PTR(err);
+			}
+			fptr = (struct frag_hdr *)((u8 *)ipv6h + err);
 			fptr->frag_off = htons(offset);
 			if (skb->next != NULL)
 				fptr->frag_off |= htons(IP6_MF);
@@ -225,10 +236,14 @@ static struct sk_buff **ipv6_gro_receive(struct sk_buff **head,
 		NAPI_GRO_CB(p)->flush |= !!(first_word & htonl(0x0FF00000));
 		NAPI_GRO_CB(p)->flush |= flush;
 
-		/* Clear flush_id, there's really no concept of ID in IPv6. */
-		NAPI_GRO_CB(p)->flush_id = 0;
+		/* If the previous IP ID value was based on an atomic
+		 * datagram we can overwrite the value and ignore it.
+		 */
+		if (NAPI_GRO_CB(skb)->is_atomic)
+			NAPI_GRO_CB(p)->flush_id = 0;
 	}
 
+	NAPI_GRO_CB(skb)->is_atomic = true;
 	NAPI_GRO_CB(skb)->flush |= flush;
 
 	skb_gro_postpull_rcsum(skb, iph, nlen);

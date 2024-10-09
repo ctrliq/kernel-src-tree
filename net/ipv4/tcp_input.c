@@ -121,6 +121,25 @@ int sysctl_tcp_invalid_ratelimit __read_mostly = HZ/2;
 #define TCP_REMNANT (TCP_FLAG_FIN|TCP_FLAG_URG|TCP_FLAG_SYN|TCP_FLAG_PSH)
 #define TCP_HP_BITS (~(TCP_RESERVED_BITS|TCP_FLAG_PSH))
 
+static void tcp_gro_dev_warn(struct sock *sk, const struct sk_buff *skb,
+			     unsigned int len)
+{
+	static bool __once __read_mostly;
+
+	if (!__once) {
+		struct net_device *dev;
+
+		__once = true;
+
+		rcu_read_lock();
+		dev = dev_get_by_index_rcu(sock_net(sk), skb->skb_iif);
+		if (!dev || len >= dev->mtu)
+			pr_warn("%s: Driver has suspect GRO implementation, TCP performance may be compromised.\n",
+				dev ? dev->name : "Unknown driver");
+		rcu_read_unlock();
+	}
+}
+
 /* Adapt the MSS value used to make delayed ack decision to the
  * real world.
  */
@@ -137,7 +156,12 @@ static void tcp_measure_rcv_mss(struct sock *sk, const struct sk_buff *skb)
 	 */
 	len = skb_shinfo(skb)->gso_size ? : skb->len;
 	if (len >= icsk->icsk_ack.rcv_mss) {
-		icsk->icsk_ack.rcv_mss = len;
+		icsk->icsk_ack.rcv_mss = min_t(unsigned int, len,
+					       tcp_sk(sk)->advmss);
+		/* Account for possibly-removed options */
+		if (unlikely(len > icsk->icsk_ack.rcv_mss +
+				   MAX_TCP_OPTION_SPACE))
+			tcp_gro_dev_warn(sk, skb, len);
 	} else {
 		/* Otherwise, we make more careful check taking into account,
 		 * that SACKs block is variable.
@@ -3560,11 +3584,8 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 	if (tp->tlp_high_seq)
 		tcp_process_tlp_ack(sk, ack, flag);
 
-	if ((flag & FLAG_FORWARD_PROGRESS) || !(flag & FLAG_NOT_DUP)) {
-		struct dst_entry *dst = __sk_dst_get(sk);
-		if (dst)
-			dst_confirm(dst);
-	}
+	if ((flag & FLAG_FORWARD_PROGRESS) || !(flag & FLAG_NOT_DUP))
+		sk_dst_confirm(sk);
 
 	if (icsk->icsk_pending == ICSK_TIME_RETRANS)
 		tcp_schedule_loss_probe(sk);
@@ -4429,7 +4450,7 @@ int tcp_send_rcvq(struct sock *sk, struct msghdr *msg, size_t size)
 	if (tcp_try_rmem_schedule(sk, skb, skb->truesize))
 		goto err_free;
 
-	if (memcpy_fromiovec(skb_put(skb, size), msg->msg_iov, size))
+	if (memcpy_from_msg(skb_put(skb, size), msg, size))
 		goto err_free;
 
 	TCP_SKB_CB(skb)->seq = tcp_sk(sk)->rcv_nxt;
@@ -5804,7 +5825,6 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 		break;
 
 	case TCP_FIN_WAIT1: {
-		struct dst_entry *dst;
 		int tmo;
 
 		/* If we enter the TCP_FIN_WAIT1 state and we are a
@@ -5831,9 +5851,7 @@ int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
 		tcp_set_state(sk, TCP_FIN_WAIT2);
 		sk->sk_shutdown |= SEND_SHUTDOWN;
 
-		dst = __sk_dst_get(sk);
-		if (dst)
-			dst_confirm(dst);
+		sk_dst_confirm(sk);
 
 		if (!sock_flag(sk, SOCK_DEAD)) {
 			/* Wake up lingering close() */

@@ -842,6 +842,7 @@ struct device_rh {
 	RH_KABI_EXTEND(struct dev_pin_info *pins)
 #endif
 	RH_KABI_EXTEND(struct fwnode_handle *fwnode)
+	RH_KABI_EXTEND(struct dma_map_ops *dma_ops)
 };
 /* allocator for device_rh */
 extern void device_rh_alloc(struct device *dev);
@@ -994,6 +995,7 @@ static inline bool device_supports_offline(struct device *dev)
 extern void lock_device_hotplug(void);
 extern void unlock_device_hotplug(void);
 extern int lock_device_hotplug_sysfs(void);
+void assert_held_device_hotplug(void);
 extern int device_offline(struct device *dev);
 extern int device_online(struct device *dev);
 extern void set_primary_fwnode(struct device *dev, struct fwnode_handle *fwnode);

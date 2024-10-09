@@ -856,7 +856,7 @@ mlxsw_sp_port_get_sw_stats64(const struct net_device *dev,
 	return 0;
 }
 
-static bool mlxsw_sp_port_has_offload_stats(int attr_id)
+static bool mlxsw_sp_port_has_offload_stats(const struct net_device *dev, int attr_id)
 {
 	switch (attr_id) {
 	case IFLA_OFFLOAD_XSTATS_CPU_HIT:
@@ -1162,8 +1162,8 @@ static int mlxsw_sp_port_get_phys_port_name(struct net_device *dev, char *name,
 }
 
 static struct mlxsw_sp_port_mall_tc_entry *
-mlxsw_sp_port_mirror_entry_find(struct mlxsw_sp_port *port,
-				unsigned long cookie) {
+mlxsw_sp_port_mall_tc_entry_find(struct mlxsw_sp_port *port,
+				 unsigned long cookie) {
 	struct mlxsw_sp_port_mall_tc_entry *mall_tc_entry;
 
 	list_for_each_entry(mall_tc_entry, &port->mall_tc_list, list)
@@ -1175,17 +1175,15 @@ mlxsw_sp_port_mirror_entry_find(struct mlxsw_sp_port *port,
 
 static int
 mlxsw_sp_port_add_cls_matchall_mirror(struct mlxsw_sp_port *mlxsw_sp_port,
-				      struct tc_cls_matchall_offload *cls,
+				      struct mlxsw_sp_port_mall_mirror_tc_entry *mirror,
 				      const struct tc_action *a,
 				      bool ingress)
 {
-	struct mlxsw_sp_port_mall_tc_entry *mall_tc_entry;
 	struct net *net = dev_net(mlxsw_sp_port->dev);
 	enum mlxsw_sp_span_type span_type;
 	struct mlxsw_sp_port *to_port;
 	struct net_device *to_dev;
 	int ifindex;
-	int err;
 
 	ifindex = tcf_mirred_ifindex(a);
 	to_dev = __dev_get_by_index(net, ifindex);
@@ -1200,26 +1198,24 @@ mlxsw_sp_port_add_cls_matchall_mirror(struct mlxsw_sp_port *mlxsw_sp_port,
 	}
 	to_port = netdev_priv(to_dev);
 
-	mall_tc_entry = kzalloc(sizeof(*mall_tc_entry), GFP_KERNEL);
-	if (!mall_tc_entry)
-		return -ENOMEM;
-
-	mall_tc_entry->cookie = cls->cookie;
-	mall_tc_entry->type = MLXSW_SP_PORT_MALL_MIRROR;
-	mall_tc_entry->mirror.to_local_port = to_port->local_port;
-	mall_tc_entry->mirror.ingress = ingress;
-	list_add_tail(&mall_tc_entry->list, &mlxsw_sp_port->mall_tc_list);
-
+	mirror->to_local_port = to_port->local_port;
+	mirror->ingress = ingress;
 	span_type = ingress ? MLXSW_SP_SPAN_INGRESS : MLXSW_SP_SPAN_EGRESS;
-	err = mlxsw_sp_span_mirror_add(mlxsw_sp_port, to_port, span_type);
-	if (err)
-		goto err_mirror_add;
-	return 0;
+	return mlxsw_sp_span_mirror_add(mlxsw_sp_port, to_port, span_type);
+}
 
-err_mirror_add:
-	list_del(&mall_tc_entry->list);
-	kfree(mall_tc_entry);
-	return err;
+static void
+mlxsw_sp_port_del_cls_matchall_mirror(struct mlxsw_sp_port *mlxsw_sp_port,
+				      struct mlxsw_sp_port_mall_mirror_tc_entry *mirror)
+{
+	struct mlxsw_sp *mlxsw_sp = mlxsw_sp_port->mlxsw_sp;
+	enum mlxsw_sp_span_type span_type;
+	struct mlxsw_sp_port *to_port;
+
+	to_port = mlxsw_sp->ports[mirror->to_local_port];
+	span_type = mirror->ingress ?
+			MLXSW_SP_SPAN_INGRESS : MLXSW_SP_SPAN_EGRESS;
+	mlxsw_sp_span_mirror_remove(mlxsw_sp_port, to_port, span_type);
 }
 
 static int mlxsw_sp_port_add_cls_matchall(struct mlxsw_sp_port *mlxsw_sp_port,
@@ -1227,56 +1223,66 @@ static int mlxsw_sp_port_add_cls_matchall(struct mlxsw_sp_port *mlxsw_sp_port,
 					  struct tc_cls_matchall_offload *cls,
 					  bool ingress)
 {
-	struct tcf_exts *exts = cls->exts;
+	struct mlxsw_sp_port_mall_tc_entry *mall_tc_entry;
 	const struct tc_action *a;
 	int err;
 
-	if (!list_is_singular(&exts->actions)) {
+	if (!tc_single_action(cls->exts)) {
 		netdev_err(mlxsw_sp_port->dev, "only singular actions are supported\n");
 		return -EOPNOTSUPP;
 	}
 
-	a = list_first_entry(&exts->actions, struct tc_action, list);
-	if (is_tcf_mirred_mirror(a) && protocol == htons(ETH_P_ALL)) {
-		err = mlxsw_sp_port_add_cls_matchall_mirror(mlxsw_sp_port, cls,
-							    a, ingress);
-		if (err)
-			return err;
+	mall_tc_entry = kzalloc(sizeof(*mall_tc_entry), GFP_KERNEL);
+	if (!mall_tc_entry)
+		return -ENOMEM;
+	mall_tc_entry->cookie = cls->cookie;
+
+	a = list_first_entry(&cls->exts->actions, struct tc_action, list);
+
+	if (is_tcf_mirred_egress_mirror(a) && protocol == htons(ETH_P_ALL)) {
+		struct mlxsw_sp_port_mall_mirror_tc_entry *mirror;
+
+		mall_tc_entry->type = MLXSW_SP_PORT_MALL_MIRROR;
+		mirror = &mall_tc_entry->mirror;
+		err = mlxsw_sp_port_add_cls_matchall_mirror(mlxsw_sp_port,
+							    mirror, a, ingress);
 	} else {
-		return -ENOTSUPP;
+		err = -EOPNOTSUPP;
 	}
 
+	if (err)
+		goto err_add_action;
+
+	list_add_tail(&mall_tc_entry->list, &mlxsw_sp_port->mall_tc_list);
 	return 0;
+
+err_add_action:
+	kfree(mall_tc_entry);
+	return err;
 }
 
 static void mlxsw_sp_port_del_cls_matchall(struct mlxsw_sp_port *mlxsw_sp_port,
 					   struct tc_cls_matchall_offload *cls)
 {
-	struct mlxsw_sp *mlxsw_sp = mlxsw_sp_port->mlxsw_sp;
 	struct mlxsw_sp_port_mall_tc_entry *mall_tc_entry;
-	enum mlxsw_sp_span_type span_type;
-	struct mlxsw_sp_port *to_port;
 
-	mall_tc_entry = mlxsw_sp_port_mirror_entry_find(mlxsw_sp_port,
-							cls->cookie);
+	mall_tc_entry = mlxsw_sp_port_mall_tc_entry_find(mlxsw_sp_port,
+							 cls->cookie);
 	if (!mall_tc_entry) {
 		netdev_dbg(mlxsw_sp_port->dev, "tc entry not found on port\n");
 		return;
 	}
+	list_del(&mall_tc_entry->list);
 
 	switch (mall_tc_entry->type) {
 	case MLXSW_SP_PORT_MALL_MIRROR:
-		to_port = mlxsw_sp->ports[mall_tc_entry->mirror.to_local_port];
-		span_type = mall_tc_entry->mirror.ingress ?
-				MLXSW_SP_SPAN_INGRESS : MLXSW_SP_SPAN_EGRESS;
-
-		mlxsw_sp_span_mirror_remove(mlxsw_sp_port, to_port, span_type);
+		mlxsw_sp_port_del_cls_matchall_mirror(mlxsw_sp_port,
+						      &mall_tc_entry->mirror);
 		break;
 	default:
 		WARN_ON(1);
 	}
 
-	list_del(&mall_tc_entry->list);
 	kfree(mall_tc_entry);
 }
 
@@ -1286,7 +1292,8 @@ static int mlxsw_sp_setup_tc(struct net_device *dev, u32 handle,
 	struct mlxsw_sp_port *mlxsw_sp_port = netdev_priv(dev);
 	bool ingress = TC_H_MAJ(handle) == TC_H_MAJ(TC_H_INGRESS);
 
-	if (tc->type == TC_SETUP_MATCHALL) {
+	switch (tc->type) {
+	case TC_SETUP_MATCHALL:
 		switch (tc->cls_mall->command) {
 		case TC_CLSMATCHALL_REPLACE:
 			return mlxsw_sp_port_add_cls_matchall(mlxsw_sp_port,
@@ -1300,12 +1307,25 @@ static int mlxsw_sp_setup_tc(struct net_device *dev, u32 handle,
 		default:
 			return -EINVAL;
 		}
+	case TC_SETUP_CLSFLOWER:
+		switch (tc->cls_flower->command) {
+		case TC_CLSFLOWER_REPLACE:
+			return mlxsw_sp_flower_replace(mlxsw_sp_port, ingress,
+						       proto, tc->cls_flower);
+		case TC_CLSFLOWER_DESTROY:
+			mlxsw_sp_flower_destroy(mlxsw_sp_port, ingress,
+						tc->cls_flower);
+			return 0;
+		default:
+			return -EOPNOTSUPP;
+		}
 	}
 
 	return -EOPNOTSUPP;
 }
 
 static const struct net_device_ops mlxsw_sp_port_netdev_ops = {
+	.ndo_size		= sizeof(struct net_device_ops),
 	.ndo_open		= mlxsw_sp_port_open,
 	.ndo_stop		= mlxsw_sp_port_stop,
 	.ndo_start_xmit		= mlxsw_sp_port_xmit,
@@ -1314,17 +1334,17 @@ static const struct net_device_ops mlxsw_sp_port_netdev_ops = {
 	.ndo_set_mac_address	= mlxsw_sp_port_set_mac_address,
 	.ndo_change_mtu		= mlxsw_sp_port_change_mtu,
 	.ndo_get_stats64	= mlxsw_sp_port_get_stats64,
-	.ndo_has_offload_stats	= mlxsw_sp_port_has_offload_stats,
-	.ndo_get_offload_stats	= mlxsw_sp_port_get_offload_stats,
+	.extended.ndo_has_offload_stats	= mlxsw_sp_port_has_offload_stats,
+	.extended.ndo_get_offload_stats	= mlxsw_sp_port_get_offload_stats,
 	.ndo_vlan_rx_add_vid	= mlxsw_sp_port_add_vid,
 	.ndo_vlan_rx_kill_vid	= mlxsw_sp_port_kill_vid,
 	.ndo_fdb_add		= switchdev_port_fdb_add,
 	.ndo_fdb_del		= switchdev_port_fdb_del,
-	.ndo_fdb_dump		= switchdev_port_fdb_dump,
+	.extended.ndo_fdb_dump	= switchdev_port_fdb_dump,
 	.ndo_bridge_setlink	= switchdev_port_bridge_setlink,
 	.ndo_bridge_getlink	= switchdev_port_bridge_getlink,
 	.ndo_bridge_dellink	= switchdev_port_bridge_dellink,
-	.ndo_get_phys_port_name	= mlxsw_sp_port_get_phys_port_name,
+	.extended.ndo_get_phys_port_name	= mlxsw_sp_port_get_phys_port_name,
 };
 
 static void mlxsw_sp_port_get_drvinfo(struct net_device *dev,
@@ -4776,7 +4796,7 @@ static int __init mlxsw_sp_module_init(void)
 {
 	int err;
 
-	register_netdevice_notifier(&mlxsw_sp_netdevice_nb);
+	register_netdevice_notifier_rh(&mlxsw_sp_netdevice_nb);
 	register_inetaddr_notifier(&mlxsw_sp_inetaddr_nb);
 	register_netevent_notifier(&mlxsw_sp_router_netevent_nb);
 
@@ -4795,7 +4815,7 @@ err_pci_driver_register:
 err_core_driver_register:
 	unregister_netevent_notifier(&mlxsw_sp_router_netevent_nb);
 	unregister_inetaddr_notifier(&mlxsw_sp_inetaddr_nb);
-	unregister_netdevice_notifier(&mlxsw_sp_netdevice_nb);
+	unregister_netdevice_notifier_rh(&mlxsw_sp_netdevice_nb);
 	return err;
 }
 
@@ -4805,7 +4825,7 @@ static void __exit mlxsw_sp_module_exit(void)
 	mlxsw_core_driver_unregister(&mlxsw_sp_driver);
 	unregister_netevent_notifier(&mlxsw_sp_router_netevent_nb);
 	unregister_inetaddr_notifier(&mlxsw_sp_inetaddr_nb);
-	unregister_netdevice_notifier(&mlxsw_sp_netdevice_nb);
+	unregister_netdevice_notifier_rh(&mlxsw_sp_netdevice_nb);
 }
 
 module_init(mlxsw_sp_module_init);

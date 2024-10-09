@@ -53,6 +53,13 @@
 
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]) + __must_be_array(arr))
 
+#define u64_to_user_ptr(x) (		\
+{					\
+	typecheck(u64, x);		\
+	(void __user *)(uintptr_t)x;	\
+}					\
+)
+
 /*
  * This looks more complex than it should be. But we need to
  * get the type for the ~ right in round_down (it needs to be
@@ -365,6 +372,7 @@ int __must_check kstrtou16_from_user(const char __user *s, size_t count, unsigne
 int __must_check kstrtos16_from_user(const char __user *s, size_t count, unsigned int base, s16 *res);
 int __must_check kstrtou8_from_user(const char __user *s, size_t count, unsigned int base, u8 *res);
 int __must_check kstrtos8_from_user(const char __user *s, size_t count, unsigned int base, s8 *res);
+int __must_check kstrtobool_from_user(const char __user *s, size_t count, bool *res);
 
 static inline int __must_check kstrtou64_from_user(const char __user *s, size_t count, unsigned int base, u64 *res)
 {
@@ -414,6 +422,8 @@ int vscnprintf(char *buf, size_t size, const char *fmt, va_list args);
 extern __printf(2, 3)
 char *kasprintf(gfp_t gfp, const char *fmt, ...);
 extern char *kvasprintf(gfp_t gfp, const char *fmt, va_list args);
+extern __printf(2, 0)
+const char *kvasprintf_const(gfp_t gfp, const char *fmt, va_list args);
 
 extern __scanf(2, 3)
 int sscanf(const char *, const char *, ...);
@@ -444,7 +454,11 @@ extern int panic_on_oops;
 extern int panic_on_unrecovered_nmi;
 extern int panic_on_io_nmi;
 extern int panic_on_warn;
+extern int sysctl_panic_on_rcu_stall;
 extern int sysctl_panic_on_stackoverflow;
+
+extern bool crash_kexec_post_notifiers;
+
 /*
  * panic_cpu is used for synchronizing panic() and crash_kexec() execution. It
  * holds a CPU number which is executing panic() currently. A value of
@@ -517,8 +531,15 @@ extern enum system_states {
 /* Bits 30 - 31 are reserved for Red Hat use only */
 #define TAINT_RESERVED30		30
 #define TAINT_RESERVED31		31
+#define TAINT_FLAGS_COUNT		32
 
+struct taint_flag {
+	char c_true;	/* character printed when tainted */
+	char c_false;	/* character printed when not tainted */
+	bool module;	/* also show as a per-module taint flag */
+};
 
+extern const struct taint_flag taint_flags[TAINT_FLAGS_COUNT];
 
 extern const char hex_asc[];
 #define hex_asc_lo(x)	hex_asc[((x) & 0x0f)]

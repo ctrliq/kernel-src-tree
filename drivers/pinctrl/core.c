@@ -1714,14 +1714,14 @@ struct pinctrl_dev *pinctrl_register(struct pinctrl_desc *pctldesc,
 	int ret;
 
 	if (!pctldesc)
-		return NULL;
+		return ERR_PTR(-EINVAL);
 	if (!pctldesc->name)
-		return NULL;
+		return ERR_PTR(-EINVAL);
 
 	pctldev = kzalloc(sizeof(*pctldev), GFP_KERNEL);
 	if (pctldev == NULL) {
 		dev_err(dev, "failed to alloc struct pinctrl_dev\n");
-		return NULL;
+		return ERR_PTR(-ENOMEM);
 	}
 
 	/* Initialize pin control device struct */
@@ -1734,20 +1734,23 @@ struct pinctrl_dev *pinctrl_register(struct pinctrl_desc *pctldesc,
 	mutex_init(&pctldev->mutex);
 
 	/* check core ops for sanity */
-	if (pinctrl_check_ops(pctldev)) {
+	ret = pinctrl_check_ops(pctldev);
+	if (ret) {
 		dev_err(dev, "pinctrl ops lacks necessary functions\n");
 		goto out_err;
 	}
 
 	/* If we're implementing pinmuxing, check the ops for sanity */
 	if (pctldesc->pmxops) {
-		if (pinmux_check_ops(pctldev))
+		ret = pinmux_check_ops(pctldev);
+		if (ret)
 			goto out_err;
 	}
 
 	/* If we're implementing pinconfig, check the ops for sanity */
 	if (pctldesc->confops) {
-		if (pinconf_check_ops(pctldev))
+		ret = pinconf_check_ops(pctldev);
+		if (ret)
 			goto out_err;
 	}
 
@@ -1793,7 +1796,7 @@ struct pinctrl_dev *pinctrl_register(struct pinctrl_desc *pctldesc,
 out_err:
 	mutex_destroy(&pctldev->mutex);
 	kfree(pctldev);
-	return NULL;
+	return ERR_PTR(ret);
 }
 EXPORT_SYMBOL_GPL(pinctrl_register);
 
@@ -1844,7 +1847,7 @@ static int devm_pinctrl_dev_match(struct device *dev, void *res, void *data)
 {
 	struct pctldev **r = res;
 
-	if (WARN_ON(!r || !*r)
+	if (WARN_ON(!r || !*r))
 		return 0;
 
 	return *r == data;

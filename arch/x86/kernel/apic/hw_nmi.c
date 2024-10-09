@@ -16,6 +16,7 @@
 #include <linux/notifier.h>
 #include <linux/kprobes.h>
 #include <linux/nmi.h>
+#include <linux/cpu.h>
 #include <linux/module.h>
 #include <linux/delay.h>
 #include <linux/seq_buf.h>
@@ -161,8 +162,13 @@ arch_trigger_all_cpu_backtrace_handler(unsigned int cmd, struct pt_regs *regs)
 
 		/* Replace printk to write into the NMI seq */
 		this_cpu_write(printk_func, nmi_vprintk);
-		printk(KERN_WARNING "NMI backtrace for cpu %d\n", cpu);
-		show_regs(regs);
+		if (regs && cpu_in_idle(instruction_pointer(regs))) {
+			pr_warn("NMI backtrace for cpu %d skipped: idling at pc %#lx\n",
+				cpu, instruction_pointer(regs));
+		} else {
+			printk(KERN_WARNING "NMI backtrace for cpu %d\n", cpu);
+			show_regs(regs);
+		}
 		this_cpu_write(printk_func, printk_func_save);
 
 		cpumask_clear_cpu(cpu, to_cpumask(backtrace_mask));

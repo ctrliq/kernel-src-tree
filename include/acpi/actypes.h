@@ -126,6 +126,7 @@
 typedef unsigned char u8;
 typedef unsigned char u8;
 typedef unsigned short u16;
+typedef short s16;
 typedef COMPILER_DEPENDENT_UINT64 u64;
 typedef COMPILER_DEPENDENT_INT64 s64;
 
@@ -265,6 +266,14 @@ typedef u32 acpi_physical_address;
 #define acpi_mutex                      void *
 #endif
 
+/*
+ * Compiler/Clibrary-dependent debug initialization. Used for ACPICA
+ * utilities only.
+ */
+#ifndef ACPI_DEBUG_INITIALIZE
+#define ACPI_DEBUG_INITIALIZE()
+#endif
+
 /*******************************************************************************
  *
  * Compiler-dependent types
@@ -304,14 +313,6 @@ typedef u32 acpi_physical_address;
  */
 #ifndef ACPI_EXPORT_SYMBOL
 #define ACPI_EXPORT_SYMBOL(symbol)
-#endif
-
-/*
- * Compiler/Clibrary-dependent debug initialization. Used for ACPICA
- * utilities only.
- */
-#ifndef ACPI_DEBUG_INITIALIZE
-#define ACPI_DEBUG_INITIALIZE()
 #endif
 
 /*******************************************************************************
@@ -505,10 +506,14 @@ typedef u64 acpi_integer;
 #define ACPI_COMPARE_NAME(a,b)          (*ACPI_CAST_PTR (u32, (a)) == *ACPI_CAST_PTR (u32, (b)))
 #define ACPI_MOVE_NAME(dest,src)        (*ACPI_CAST_PTR (u32, (dest)) = *ACPI_CAST_PTR (u32, (src)))
 #else
-#define ACPI_COMPARE_NAME(a,b)          (!ACPI_STRNCMP (ACPI_CAST_PTR (char, (a)), ACPI_CAST_PTR (char, (b)), ACPI_NAME_SIZE))
-#define ACPI_MOVE_NAME(dest,src)        (ACPI_STRNCPY (ACPI_CAST_PTR (char, (dest)), ACPI_CAST_PTR (char, (src)), ACPI_NAME_SIZE))
+#define ACPI_COMPARE_NAME(a,b)          (!strncmp (ACPI_CAST_PTR (char, (a)), ACPI_CAST_PTR (char, (b)), ACPI_NAME_SIZE))
+#define ACPI_MOVE_NAME(dest,src)        (strncpy (ACPI_CAST_PTR (char, (dest)), ACPI_CAST_PTR (char, (src)), ACPI_NAME_SIZE))
 #endif
 
+/* Support for the special RSDP signature (8 characters) */
+
+#define ACPI_VALIDATE_RSDP_SIG(a)       (!strncmp (ACPI_CAST_PTR (char, (a)), ACPI_SIG_RSDP, 8))
+#define ACPI_MAKE_RSDP_SIG(dest)        (memcpy (ACPI_CAST_PTR (char, (dest)), ACPI_SIG_RSDP, 8))
 /*******************************************************************************
  *
  * Miscellaneous constants
@@ -969,11 +974,15 @@ struct acpi_system_info {
 	u32 debug_layer;
 };
 
-/* Table Event Types */
-
-#define ACPI_TABLE_EVENT_LOAD           0x0
-#define ACPI_TABLE_EVENT_UNLOAD         0x1
-#define ACPI_NUM_TABLE_EVENTS           2
+/*
+ * System statistics returned by acpi_get_statistics()
+ */
+struct acpi_statistics {
+	u32 sci_count;
+	u32 gpe_count;
+	u32 fixed_event_count[ACPI_NUM_FIXED_EVENTS];
+	u32 method_count;
+};
 
 /*
  * Types specific to the OS service interfaces
@@ -1022,9 +1031,13 @@ acpi_status(*acpi_exception_handler) (acpi_status aml_status,
 typedef
 acpi_status(*acpi_table_handler) (u32 event, void *table, void *context);
 
-#define ACPI_TABLE_LOAD             0x0
-#define ACPI_TABLE_UNLOAD           0x1
-#define ACPI_NUM_TABLE_EVENTS       2
+/* Table Event Types */
+
+#define ACPI_TABLE_EVENT_LOAD           0x0
+#define ACPI_TABLE_EVENT_UNLOAD         0x1
+#define ACPI_TABLE_EVENT_INSTALL        0x2
+#define ACPI_TABLE_EVENT_UNINSTALL      0x3
+#define ACPI_NUM_TABLE_EVENTS           4
 
 /* Address Spaces (For Operation Regions) */
 
@@ -1195,13 +1208,8 @@ struct acpi_memory_list {
 #define ACPI_OSI_WIN_8                  0x0C
 #define ACPI_OSI_WIN_10                 0x0D
 
-/* Definitions of file IO */
+/* Definitions of getopt */
 
-#define ACPI_FILE_READING               0x01
-#define ACPI_FILE_WRITING               0x02
-#define ACPI_FILE_BINARY                0x04
-
-#define ACPI_FILE_BEGIN                 0x01
-#define ACPI_FILE_END                   0x02
+#define ACPI_OPT_END                    -1
 
 #endif				/* __ACTYPES_H__ */

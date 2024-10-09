@@ -3052,7 +3052,7 @@ static void mgsl_set_termios(struct tty_struct *tty, struct ktermios *old_termio
 	    tty->termios.c_cflag & CBAUD) {
 		info->serial_signals |= SerialSignal_DTR;
  		if (!(tty->termios.c_cflag & CRTSCTS) || 
- 		    !test_bit(TTY_THROTTLED, &tty->flags)) {
+ 		    !tty_throttled(tty)) {
 			info->serial_signals |= SerialSignal_RTS;
  		}
 		spin_lock_irqsave(&info->irq_spinlock,flags);
@@ -7712,7 +7712,7 @@ static netdev_tx_t hdlcdev_xmit(struct sk_buff *skb,
 	dev_kfree_skb(skb);
 
 	/* save start time for transmit timeout detection */
-	dev->trans_start = jiffies;
+	netif_trans_update(dev);
 
 	/* start hardware transmitter if necessary */
 	spin_lock_irqsave(&info->irq_spinlock,flags);
@@ -7767,7 +7767,7 @@ static int hdlcdev_open(struct net_device *dev)
 	mgsl_program_hw(info);
 
 	/* enable network layer transmit */
-	dev->trans_start = jiffies;
+	netif_trans_update(dev);
 	netif_start_queue(dev);
 
 	/* inform generic HDLC layer of current DCD status */

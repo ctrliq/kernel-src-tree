@@ -64,13 +64,15 @@
 
 #define TCMU_TIME_OUT (30 * MSEC_PER_SEC)
 
-#define DATA_BLOCK_BITS 256
+#define DATA_BLOCK_BITS 2048
 #define DATA_BLOCK_SIZE 4096
 
 #define CMDR_SIZE (16 * 4096)
 #define DATA_SIZE (DATA_BLOCK_BITS * DATA_BLOCK_SIZE)
 
 #define TCMU_RING_SIZE (CMDR_SIZE + DATA_SIZE)
+
+static u8 tcmu_kern_cmd_reply_supported;
 
 static struct device *tcmu_root_device;
 
@@ -80,8 +82,16 @@ struct tcmu_hba {
 
 #define TCMU_CONFIG_LEN 256
 
+struct tcmu_nl_cmd {
+	/* wake up thread waiting for reply */
+	struct completion complete;
+	int cmd;
+	int status;
+};
+
 struct tcmu_dev {
 	struct se_device se_dev;
+	int dev_index;
 
 	char *name;
 	struct se_hba *hba;
@@ -113,6 +123,11 @@ struct tcmu_dev {
 	struct timer_list timeout;
 	unsigned int cmd_time_out;
 
+	spinlock_t nl_cmd_lock;
+	struct tcmu_nl_cmd curr_nl_cmd;
+	/* wake up threads waiting on curr_nl_cmd */
+	wait_queue_head_t nl_cmd_wq;
+
 	char dev_config[TCMU_CONFIG_LEN];
 };
 
@@ -138,6 +153,9 @@ struct tcmu_cmd {
 
 static struct kmem_cache *tcmu_cmd_cache;
 
+static DEFINE_IDR(devices_idr);
+static DEFINE_MUTEX(device_mutex);
+
 /* multicast group */
 enum tcmu_multicast_groups {
 	TCMU_MCGRP_CONFIG,
@@ -147,16 +165,127 @@ static const struct genl_multicast_group tcmu_mcgrps[] = {
 	[TCMU_MCGRP_CONFIG] = { .name = "config", },
 };
 
+static struct nla_policy tcmu_attr_policy[TCMU_ATTR_MAX+1] = {
+	[TCMU_ATTR_DEVICE]	= { .type = NLA_STRING },
+	[TCMU_ATTR_MINOR]	= { .type = NLA_U32 },
+	[TCMU_ATTR_CMD_STATUS]	= { .type = NLA_S32 },
+	[TCMU_ATTR_DEVICE_ID]	= { .type = NLA_U32 },
+	[TCMU_ATTR_SUPP_KERN_CMD_REPLY] = { .type = NLA_U8 },
+};
+
+static int tcmu_genl_cmd_done(struct genl_info *info, int completed_cmd)
+{
+	struct se_device *dev;
+	struct tcmu_dev *udev;
+	struct tcmu_nl_cmd *nl_cmd;
+	int dev_id, rc, ret = 0;
+
+	if (!info->attrs[TCMU_ATTR_CMD_STATUS] ||
+	    !info->attrs[TCMU_ATTR_DEVICE_ID]) {
+		printk(KERN_ERR "TCMU_ATTR_CMD_STATUS or TCMU_ATTR_DEVICE_ID not set, doing nothing\n");
+		return -EINVAL;
+	}
+
+	dev_id = nla_get_u32(info->attrs[TCMU_ATTR_DEVICE_ID]);
+	rc = nla_get_s32(info->attrs[TCMU_ATTR_CMD_STATUS]);
+
+	mutex_lock(&device_mutex);
+	dev = idr_find(&devices_idr, dev_id);
+	mutex_unlock(&device_mutex);
+	if (!dev) {
+		printk(KERN_ERR "tcmu nl cmd %u/%u completion could not find device with dev id %u.\n",
+		       completed_cmd, rc, dev_id);
+		return -ENODEV;
+	}
+	udev = TCMU_DEV(dev);
+
+	spin_lock(&udev->nl_cmd_lock);
+	nl_cmd = &udev->curr_nl_cmd;
+
+	pr_debug("genl cmd done got id %d curr %d done %d rc %d\n", dev_id,
+		 nl_cmd->cmd, completed_cmd, rc);
+
+	if (nl_cmd->cmd != completed_cmd) {
+		printk(KERN_ERR "Mismatched commands (Expecting reply for %d. Current %d).\n",
+		       completed_cmd, nl_cmd->cmd);
+		ret = -EINVAL;
+	} else {
+		nl_cmd->status = rc;
+	}
+
+	spin_unlock(&udev->nl_cmd_lock);
+	if (!ret)
+		complete(&nl_cmd->complete);
+	return ret;
+}
+
+static int tcmu_genl_rm_dev_done(struct sk_buff *skb, struct genl_info *info)
+{
+	return tcmu_genl_cmd_done(info, TCMU_CMD_REMOVED_DEVICE);
+}
+
+static int tcmu_genl_add_dev_done(struct sk_buff *skb, struct genl_info *info)
+{
+	return tcmu_genl_cmd_done(info, TCMU_CMD_ADDED_DEVICE);
+}
+
+static int tcmu_genl_reconfig_dev_done(struct sk_buff *skb,
+				       struct genl_info *info)
+{
+	return tcmu_genl_cmd_done(info, TCMU_CMD_RECONFIG_DEVICE);
+}
+
+static int tcmu_genl_set_features(struct sk_buff *skb, struct genl_info *info)
+{
+	if (info->attrs[TCMU_ATTR_SUPP_KERN_CMD_REPLY]) {
+		tcmu_kern_cmd_reply_supported  =
+			nla_get_u8(info->attrs[TCMU_ATTR_SUPP_KERN_CMD_REPLY]);
+		printk(KERN_INFO "tcmu daemon: command reply support %u.\n",
+		       tcmu_kern_cmd_reply_supported);
+	}
+
+	return 0;
+}
+
+static const struct genl_ops tcmu_genl_ops[] = {
+	{
+		.cmd	= TCMU_CMD_SET_FEATURES,
+		.flags	= GENL_ADMIN_PERM,
+		.policy	= tcmu_attr_policy,
+		.doit	= tcmu_genl_set_features,
+	},
+	{
+		.cmd	= TCMU_CMD_ADDED_DEVICE_DONE,
+		.flags	= GENL_ADMIN_PERM,
+		.policy	= tcmu_attr_policy,
+		.doit	= tcmu_genl_add_dev_done,
+	},
+	{
+		.cmd	= TCMU_CMD_REMOVED_DEVICE_DONE,
+		.flags	= GENL_ADMIN_PERM,
+		.policy	= tcmu_attr_policy,
+		.doit	= tcmu_genl_rm_dev_done,
+	},
+	{
+		.cmd	= TCMU_CMD_RECONFIG_DEVICE_DONE,
+		.flags	= GENL_ADMIN_PERM,
+		.policy	= tcmu_attr_policy,
+		.doit	= tcmu_genl_reconfig_dev_done,
+	},
+};
+
 /* Our generic netlink family */
 static struct genl_family tcmu_genl_family = {
 	.id = GENL_ID_GENERATE,
 	.hdrsize = 0,
 	.name = "TCM-USER",
-	.version = 1,
+	.version = 2,
 	.maxattr = TCMU_ATTR_MAX,
 	.mcgrps = tcmu_mcgrps,
 	.n_mcgrps = ARRAY_SIZE(tcmu_mcgrps),
 	.netnsok = true,
+	.ops = tcmu_genl_ops,
+	.n_ops = ARRAY_SIZE(tcmu_genl_ops),
 };
 
 static struct tcmu_cmd *tcmu_alloc_cmd(struct se_cmd *se_cmd)
@@ -762,6 +891,9 @@ static struct se_device *tcmu_alloc_device(struct se_hba *hba, const char *name)
 	setup_timer(&udev->timeout, tcmu_device_timedout,
 		(unsigned long)udev);
 
+	init_waitqueue_head(&udev->nl_cmd_wq);
+	spin_lock_init(&udev->nl_cmd_lock);
+
 	return &udev->se_dev;
 }
 
@@ -863,7 +995,53 @@ static int tcmu_release(struct uio_info *info, struct inode *inode)
 	return 0;
 }
 
-static int tcmu_netlink_event(enum tcmu_genl_cmd cmd, const char *name, int minor)
+static void tcmu_init_genl_cmd_reply(struct tcmu_dev *udev, int cmd)
+{
+	struct tcmu_nl_cmd *nl_cmd = &udev->curr_nl_cmd;
+
+	if (!tcmu_kern_cmd_reply_supported)
+		return;
+relock:
+	spin_lock(&udev->nl_cmd_lock);
+
+	if (nl_cmd->cmd != TCMU_CMD_UNSPEC) {
+		spin_unlock(&udev->nl_cmd_lock);
+		pr_debug("sleeping for open nl cmd\n");
+		wait_event(udev->nl_cmd_wq, (nl_cmd->cmd == TCMU_CMD_UNSPEC));
+		goto relock;
+	}
+
+	memset(nl_cmd, 0, sizeof(*nl_cmd));
+	nl_cmd->cmd = cmd;
+	init_completion(&nl_cmd->complete);
+
+	spin_unlock(&udev->nl_cmd_lock);
+}
+
+static int tcmu_wait_genl_cmd_reply(struct tcmu_dev *udev)
+{
+	struct tcmu_nl_cmd *nl_cmd = &udev->curr_nl_cmd;
+	int ret;
+	DEFINE_WAIT(__wait);
+
+	if (!tcmu_kern_cmd_reply_supported)
+		return 0;
+
+	pr_debug("sleeping for nl reply\n");
+	wait_for_completion(&nl_cmd->complete);
+
+	spin_lock(&udev->nl_cmd_lock);
+	nl_cmd->cmd = TCMU_CMD_UNSPEC;
+	ret = nl_cmd->status;
+	nl_cmd->status = 0;
+	spin_unlock(&udev->nl_cmd_lock);
+
+	wake_up_all(&udev->nl_cmd_wq);
+
+       return ret;;
+}
+
+static int tcmu_netlink_event(struct tcmu_dev *udev, enum tcmu_genl_cmd cmd)
 {
 	struct sk_buff *skb;
 	void *msg_header;
@@ -877,22 +1055,29 @@ static int tcmu_netlink_event(enum tcmu_genl_cmd cmd, const char *name, int mino
 	if (!msg_header)
 		goto free_skb;
 
-	ret = nla_put_string(skb, TCMU_ATTR_DEVICE, name);
+	ret = nla_put_string(skb, TCMU_ATTR_DEVICE, udev->uio_info.name);
 	if (ret < 0)
 		goto free_skb;
 
-	ret = nla_put_u32(skb, TCMU_ATTR_MINOR, minor);
+	ret = nla_put_u32(skb, TCMU_ATTR_MINOR, udev->uio_info.uio_dev->minor);
+	if (ret < 0)
+		goto free_skb;
+
+	ret = nla_put_u32(skb, TCMU_ATTR_DEVICE_ID, udev->dev_index);
 	if (ret < 0)
 		goto free_skb;
 
 	genlmsg_end(skb, msg_header);
 
+	tcmu_init_genl_cmd_reply(udev, cmd);
+
 	ret = genlmsg_multicast_allns(&tcmu_genl_family, skb, 0,
 				TCMU_MCGRP_CONFIG, GFP_KERNEL);
-
 	/* We don't care if no one is listening */
 	if (ret == -ESRCH)
 		ret = 0;
+	if (!ret)
+		ret = tcmu_wait_genl_cmd_reply(udev);
 
 	return ret;
 free_skb:
@@ -908,8 +1093,15 @@ static int tcmu_configure_device(struct se_device *dev)
 	struct tcmu_mailbox *mb;
 	size_t size;
 	size_t used;
-	int ret = 0;
+	int id, ret = 0;
 	char *str;
+
+	mutex_lock(&device_mutex);
+	id = idr_alloc_cyclic(&devices_idr, dev, 0, INT_MAX, GFP_KERNEL);
+	mutex_unlock(&device_mutex);
+	if (id < 0)
+		return -ENOMEM;
+	udev->dev_index = id;
 
 	info = &udev->uio_info;
 
@@ -917,8 +1109,10 @@ static int tcmu_configure_device(struct se_device *dev)
 			udev->dev_config);
 	size += 1; /* for \0 */
 	str = kmalloc(size, GFP_KERNEL);
-	if (!str)
-		return -ENOMEM;
+	if (!str) {
+		ret = -ENOMEM;
+		goto err_kmalloc;
+	}
 
 	used = snprintf(str, size, "tcm-user/%u/%s", hba->host_id, udev->name);
 
@@ -974,8 +1168,7 @@ static int tcmu_configure_device(struct se_device *dev)
 		dev->dev_attrib.hw_max_sectors = 128;
 	dev->dev_attrib.hw_queue_depth = 128;
 
-	ret = tcmu_netlink_event(TCMU_CMD_ADDED_DEVICE, udev->uio_info.name,
-				 udev->uio_info.uio_dev->minor);
+	ret = tcmu_netlink_event(udev, TCMU_CMD_ADDED_DEVICE);
 	if (ret)
 		goto err_netlink;
 
@@ -987,6 +1180,10 @@ err_register:
 	vfree(udev->mb_addr);
 err_vzalloc:
 	kfree(info->name);
+err_kmalloc:
+	mutex_lock(&device_mutex);
+	idr_remove(&devices_idr, udev->dev_index);
+	mutex_unlock(&device_mutex);
 
 	return ret;
 }
@@ -1001,6 +1198,18 @@ static int tcmu_check_and_free_pending_cmd(struct tcmu_cmd *cmd)
 }
 
 static void tcmu_free_device(struct se_device *dev)
+{
+	struct tcmu_dev *udev = TCMU_DEV(dev);
+
+	kfree(udev);
+}
+
+static bool tcmu_dev_configured(struct tcmu_dev *udev)
+{
+	return udev->uio_info.uio_dev ? true : false;
+}
+
+static void tcmu_destroy_device(struct se_device *dev)
 {
 	struct tcmu_dev *udev = TCMU_DEV(dev);
 	struct tcmu_cmd *cmd;
@@ -1021,22 +1230,22 @@ static void tcmu_free_device(struct se_device *dev)
 	spin_unlock_irq(&udev->commands_lock);
 	WARN_ON(!all_expired);
 
-	/* Device was configured */
-	if (udev->uio_info.uio_dev) {
-		tcmu_netlink_event(TCMU_CMD_REMOVED_DEVICE, udev->uio_info.name,
-				   udev->uio_info.uio_dev->minor);
+	if (tcmu_dev_configured(udev)) {
+		tcmu_netlink_event(udev, TCMU_CMD_REMOVED_DEVICE);
 
 		uio_unregister_device(&udev->uio_info);
 		kfree(udev->uio_info.name);
 		kfree(udev->name);
-	}
 
-	kfree(udev);
+		mutex_lock(&device_mutex);
+		idr_remove(&devices_idr, udev->dev_index);
+		mutex_unlock(&device_mutex);
+	}
 }
 
 enum {
 	Opt_dev_config, Opt_dev_size, Opt_hw_block_size, Opt_hw_max_sectors,
-	Opt_cmd_time_out, Opt_err,
+	Opt_err,
 };
 
 static match_table_t tokens = {
@@ -1044,7 +1253,6 @@ static match_table_t tokens = {
 	{Opt_dev_size, "dev_size=%u"},
 	{Opt_hw_block_size, "hw_block_size=%u"},
 	{Opt_hw_max_sectors, "hw_max_sectors=%u"},
-	{Opt_cmd_time_out, "cmd_time_out=%u"},
 	{Opt_err, NULL}
 };
 
@@ -1111,23 +1319,6 @@ static ssize_t tcmu_set_configfs_dev_params(struct se_device *dev,
 			if (ret < 0)
 				pr_err("kstrtoul() failed for dev_size=\n");
 			break;
-		case Opt_cmd_time_out:
-			if (tcmu_dev_configured(udev)) {
-				pr_err("Can not update cmd_time_out after device has been configured.\n");
-				ret = -EINVAL;
-				break;
-			}
-			arg_p = match_strdup(&args[0]);
-			if (!arg_p) {
-				ret = -ENOMEM;
-				break;
-			}
-			ret = kstrtouint(arg_p, 0, &udev->cmd_time_out);
-			kfree(arg_p);
-			if (ret < 0)
-				pr_err("kstrtouint() failed for cmd_time_out=\n");
-			udev->cmd_time_out *= MSEC_PER_SEC;
-			break;
 		case Opt_hw_block_size:
 			ret = tcmu_set_dev_attrib(&args[0],
 					&(dev->dev_attrib.hw_block_size));
@@ -1155,9 +1346,7 @@ static ssize_t tcmu_show_configfs_dev_params(struct se_device *dev, char *b)
 
 	bl = sprintf(b + bl, "Config: %s ",
 		     udev->dev_config[0] ? udev->dev_config : "NULL");
-	bl += sprintf(b + bl, "Size: %zu ", udev->dev_size);
-	bl += sprintf(b + bl, "Cmd Time Out: %lu\n",
-		      udev->cmd_time_out / MSEC_PER_SEC);
+	bl += sprintf(b + bl, "Size: %zu\n", udev->dev_size);
 
 	return bl;
 }
@@ -1238,6 +1427,37 @@ tcmu_parse_cdb(struct se_cmd *cmd)
 	return TCM_NO_SENSE;
 }
 
+static ssize_t tcmu_dev_show_attr_cmd_time_out(struct se_dev_attrib *da,
+					       char *page)
+{
+	struct tcmu_dev *udev = container_of(da->da_dev,
+					struct tcmu_dev, se_dev);
+
+	return snprintf(page, PAGE_SIZE, "%lu\n", udev->cmd_time_out / MSEC_PER_SEC);
+}
+
+static ssize_t tcmu_dev_store_attr_cmd_time_out(struct se_dev_attrib *da,
+						const char *page, size_t count)
+{
+	struct tcmu_dev *udev = container_of(da->da_dev,
+					struct tcmu_dev, se_dev);
+	u32 val;
+	int ret;
+
+	if (da->da_dev->export_count) {
+		pr_err("Unable to set tcmu cmd_time_out while exports exist\n");
+		return -EINVAL;
+	}
+
+	ret = kstrtou32(page, 0, &val);
+	if (ret < 0)
+		return ret;
+
+	udev->cmd_time_out = val * MSEC_PER_SEC;
+	return count;
+}
+TB_DEV_ATTR(tcmu, cmd_time_out, S_IRUGO | S_IWUSR);
+
 DEF_TB_DEV_ATTRIB_RO(tcmu, hw_pi_prot_type);
 TB_DEV_ATTR_RO(tcmu, hw_pi_prot_type);
 
@@ -1255,6 +1475,7 @@ static struct configfs_attribute *tcmu_backend_dev_attrs[] = {
 	&tcmu_dev_attrib_hw_block_size.attr,
 	&tcmu_dev_attrib_hw_max_sectors.attr,
 	&tcmu_dev_attrib_hw_queue_depth.attr,
+	&tcmu_dev_attrib_cmd_time_out.attr,
 	NULL,
 };
 
@@ -1266,6 +1487,7 @@ static struct se_subsystem_api tcmu_template = {
 	.detach_hba		= tcmu_detach_hba,
 	.alloc_device		= tcmu_alloc_device,
 	.configure_device	= tcmu_configure_device,
+	.destroy_device		= tcmu_destroy_device,
 	.free_device		= tcmu_free_device,
 	.parse_cdb		= tcmu_parse_cdb,
 	.set_configfs_dev_params = tcmu_set_configfs_dev_params,
@@ -1306,6 +1528,8 @@ static int __init tcmu_module_init(void)
 	if (ret)
 		goto out_unreg_genl;
 
+	idr_init(&devices_idr);
+
 	return 0;
 
 out_unreg_genl:
@@ -1320,6 +1544,7 @@ out_free_cache:
 
 static void __exit tcmu_module_exit(void)
 {
+	idr_destroy(&devices_idr);
 	transport_subsystem_release(&tcmu_template);
 	genl_unregister_family(&tcmu_genl_family);
 	root_device_unregister(tcmu_root_device);

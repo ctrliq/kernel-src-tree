@@ -176,7 +176,7 @@ static void cls_cgroup_destroy_rcu(struct rcu_head *root)
 						    rcu);
 
 	tcf_exts_destroy(&head->exts);
-	tcf_em_tree_destroy(head->tp, &head->ematches);
+	tcf_em_tree_destroy(&head->ematches);
 	kfree(head);
 }
 
@@ -236,16 +236,17 @@ errout:
 	return err;
 }
 
-static void cls_cgroup_destroy(struct tcf_proto *tp)
+static bool cls_cgroup_destroy(struct tcf_proto *tp, bool force)
 {
 	struct cls_cgroup_head *head = rtnl_dereference(tp->root);
 
-	if (head) {
-		tcf_exts_destroy(&head->exts);
-		tcf_em_tree_destroy(tp, &head->ematches);
-		RCU_INIT_POINTER(tp->root, NULL);
-		kfree_rcu(head, rcu);
-	}
+	if (!force)
+		return false;
+
+	/* Head can still be NULL due to cls_cgroup_init(). */
+	if (head)
+		call_rcu(&head->rcu, cls_cgroup_destroy_rcu);
+	return true;
 }
 
 static int cls_cgroup_delete(struct tcf_proto *tp, unsigned long arg)

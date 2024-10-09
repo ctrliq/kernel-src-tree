@@ -239,29 +239,27 @@ static int nsio_rw_bytes(struct nd_namespace_common *ndns,
 	if (rw == READ) {
 		if (unlikely(is_bad_pmem(&nsio->bb, sector, sz_align)))
 			return -EIO;
-		memcpy_from_pmem(buf, nsio->addr + offset, size);
-	} else {
-
-		if (unlikely(is_bad_pmem(&nsio->bb, sector, sz_align))) {
-			if (IS_ALIGNED(offset, 512) && IS_ALIGNED(size, 512)) {
-				long cleared;
-
-				cleared = nvdimm_clear_poison(&ndns->dev,
-							      offset, size);
-				if (cleared != size) {
-					size = cleared;
-					rc = -EIO;
-				}
-
-				badblocks_clear(&nsio->bb, sector,
-						cleared >> 9);
-			} else
-				rc = -EIO;
-		}
-
-		memcpy_to_pmem(nsio->addr + offset, buf, size);
-		nvdimm_flush(to_nd_region(ndns->dev.parent));
+		return memcpy_from_pmem(buf, nsio->addr + offset, size);
 	}
+
+	if (unlikely(is_bad_pmem(&nsio->bb, sector, sz_align))) {
+		if (IS_ALIGNED(offset, 512) && IS_ALIGNED(size, 512)) {
+			long cleared;
+
+			cleared = nvdimm_clear_poison(&ndns->dev, offset, size);
+			if (cleared < size)
+				rc = -EIO;
+			if (cleared > 0 && cleared / 512) {
+				cleared /= 512;
+				badblocks_clear(&nsio->bb, sector, cleared);
+			}
+			invalidate_pmem(nsio->addr + offset, size);
+		} else
+			rc = -EIO;
+	}
+
+	memcpy_to_pmem(nsio->addr + offset, buf, size);
+	nvdimm_flush(to_nd_region(ndns->dev.parent));
 
 	return rc;
 }
@@ -273,7 +271,7 @@ int devm_nsio_enable(struct device *dev, struct nd_namespace_io *nsio)
 
 	nsio->size = resource_size(res);
 	if (!devm_request_mem_region(dev, res->start, resource_size(res),
-				dev_name(dev))) {
+				dev_name(&ndns->dev))) {
 		dev_warn(dev, "could not reserve region %pR\n", res);
 		return -EBUSY;
 	}

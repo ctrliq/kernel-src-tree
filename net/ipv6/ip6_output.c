@@ -110,6 +110,7 @@ static int ip6_finish_output2(struct sock *sk, struct sk_buff *skb)
 	if (unlikely(!neigh))
 		neigh = __neigh_create(&nd_tbl, nexthop, dst->dev, false);
 	if (!IS_ERR(neigh)) {
+		sock_confirm_neigh(skb, neigh);
 		ret = dst_neigh_output(dst, neigh, skb);
 		rcu_read_unlock_bh();
 		return ret;
@@ -536,11 +537,10 @@ int ip6_fragment(struct sock *sk, struct sk_buff *skb,
 	u8 *prevhdr, nexthdr = 0;
 	struct net *net = dev_net(skb_dst(skb)->dev);
 
-	hlen = ip6_find_1stfragopt(skb, &prevhdr);
-	if (hlen < 0) {
-		err = hlen;
+	err = ip6_find_1stfragopt(skb, &prevhdr);
+	if (err < 0)
 		goto fail;
-	}
+	hlen = err;
 	nexthdr = *prevhdr;
 
 	mtu = ip6_skb_dst_mtu(skb);
@@ -710,14 +710,15 @@ slow_path:
 	 *	Fragment the datagram.
 	 */
 
-	*prevhdr = NEXTHDR_FRAGMENT;
 	hroom = LL_RESERVED_SPACE(rt->dst.dev);
 	troom = rt->dst.dev->needed_tailroom;
 
 	/*
 	 *	Keep copying data until we run out.
 	 */
-	while(left > 0)	{
+	while (left > 0)	{
+		u8 *fragnexthdr_offset;
+
 		len = left;
 		/* IF: it doesn't fit, use 'mtu' - the data space left */
 		if (len > mtu)
@@ -763,6 +764,10 @@ slow_path:
 		 *	Copy the packet header into the new buffer.
 		 */
 		skb_copy_from_linear_data(skb, skb_network_header(frag), hlen);
+
+		fragnexthdr_offset = skb_network_header(frag);
+		fragnexthdr_offset += prevhdr - skb_network_header(skb);
+		*fragnexthdr_offset = NEXTHDR_FRAGMENT;
 
 		/*
 		 *	Build fragment header.
@@ -1060,6 +1065,9 @@ static inline int ip6_ufo_append_data(struct sock *sk,
 
 		skb->csum = 0;
 
+		if (flags & MSG_CONFIRM)
+			skb_set_dst_pending_confirm(skb, 1);
+
 		__skb_queue_tail(queue, skb);
 	} else if (skb_is_gso(skb)) {
 		goto append;
@@ -1287,7 +1295,7 @@ emsgsize:
 	if ((((length + fragheaderlen) > mtu) ||
 	     (skb && skb_is_gso(skb))) &&
 	    (sk->sk_protocol == IPPROTO_UDP) &&
-	    (rt->dst.dev->features & NETIF_F_UFO) &&
+	    (rt->dst.dev->features & NETIF_F_UFO) && !rt->dst.header_len &&
 	    (sk->sk_type == SOCK_DGRAM) && !udp_get_no_check6_tx(sk)) {
 		err = ip6_ufo_append_data(sk, queue, getfrag, from, length,
 					  hh_len, fragheaderlen, exthdrlen,
@@ -1429,6 +1437,9 @@ alloc_new_skb:
 			transhdrlen = 0;
 			exthdrlen = 0;
 			dst_exthdrlen = 0;
+
+			if ((flags & MSG_CONFIRM) && !skb_prev)
+				skb_set_dst_pending_confirm(skb, 1);
 
 			/*
 			 * Put the packet on the pending queue

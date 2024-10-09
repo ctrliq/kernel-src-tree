@@ -1921,7 +1921,7 @@ void task_numa_work(struct callback_head *work)
 		vma = mm->mmap;
 	}
 	for (; vma; vma = vma->vm_next) {
-		if (!vma_migratable(vma) || !vma_policy_mof(p, vma) ||
+		if (!vma_migratable(vma) || !vma_policy_mof(vma) ||
 			is_vm_hugetlb_page(vma)) {
 			continue;
 		}
@@ -2922,7 +2922,7 @@ check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
 	ideal_runtime = sched_slice(cfs_rq, curr);
 	delta_exec = curr->sum_exec_runtime - curr->prev_sum_exec_runtime;
 	if (delta_exec > ideal_runtime) {
-		resched_task(rq_of(cfs_rq)->curr);
+		resched_curr(rq_of(cfs_rq));
 		/*
 		 * The current task ran long enough, ensure it doesn't get
 		 * re-elected due to buddy favours.
@@ -2946,7 +2946,7 @@ check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
 		return;
 
 	if (delta > ideal_runtime)
-		resched_task(rq_of(cfs_rq)->curr);
+		resched_curr(rq_of(cfs_rq));
 }
 
 static void
@@ -3072,7 +3072,7 @@ entity_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr, int queued)
 	 * validating it and just reschedule.
 	 */
 	if (queued) {
-		resched_task(rq_of(cfs_rq)->curr);
+		resched_curr(rq_of(cfs_rq));
 		return;
 	}
 	/*
@@ -3263,7 +3263,7 @@ static void __account_cfs_rq_runtime(struct cfs_rq *cfs_rq, u64 delta_exec)
 	 * hierarchy can be throttled
 	 */
 	if (!assign_cfs_rq_runtime(cfs_rq) && likely(cfs_rq->curr))
-		resched_task(rq_of(cfs_rq)->curr);
+		resched_curr(rq_of(cfs_rq));
 }
 
 static __always_inline
@@ -3421,7 +3421,7 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 
 	/* determine whether we need to wake up potentially idle cpu */
 	if (rq->curr == rq->idle && rq->cfs.nr_running)
-		resched_task(rq->curr);
+		resched_curr(rq);
 }
 
 static u64 distribute_cfs_runtime(struct cfs_bandwidth *cfs_b,
@@ -3881,7 +3881,7 @@ static void hrtick_start_fair(struct rq *rq, struct task_struct *p)
 
 		if (delta < 0) {
 			if (rq->curr == p)
-				resched_task(p);
+				resched_curr(rq);
 			return;
 		}
 		hrtick_start(rq, delta);
@@ -4487,9 +4487,6 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_f
 	int want_affine = 0;
 	int sync = wake_flags & WF_SYNC;
 
-	if (p->nr_cpus_allowed == 1)
-		return prev_cpu;
-
 	if (sd_flag & SD_BALANCE_WAKE) {
 		if (cpumask_test_cpu(cpu, tsk_cpus_allowed(p)))
 			want_affine = 1;
@@ -4742,7 +4739,7 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 	return;
 
 preempt:
-	resched_task(curr);
+	resched_curr(rq);
 	/*
 	 * Only set the backward buddy when the current task is still
 	 * on the rq. This can happen when a wakeup gets interleaved
@@ -6277,13 +6274,14 @@ static struct sched_group *find_busiest_group(struct lb_env *env)
 
 	if (env->idle == CPU_IDLE) {
 		/*
-		 * This cpu is idle. If the busiest group load doesn't
-		 * have more tasks than the number of available cpu's and
-		 * there is no imbalance between this and busiest group
-		 * wrt to idle cpu's, it is balanced.
+		 * This cpu is idle. If the busiest group is not overloaded
+		 * and there is no imbalance between this and busiest group
+		 * wrt idle cpus, it is balanced. The imbalance becomes
+		 * significant if the diff is greater than 1 otherwise we
+		 * might end up to just move the imbalance on another group
 		 */
-		if ((local->idle_cpus <= busiest->idle_cpus + 1) &&
-		    busiest->sum_nr_running <= busiest->group_weight)
+		if ((busiest->group_type != group_overloaded) &&
+				(local->idle_cpus <= (busiest->idle_cpus + 1)))
 			goto out_balanced;
 	} else {
 		/*
@@ -6999,10 +6997,10 @@ void update_max_interval(void)
  *
  * Balancing parameters are set up in init_sched_domains.
  */
-static void rebalance_domains(int cpu, enum cpu_idle_type idle)
+static void rebalance_domains(struct rq *rq, enum cpu_idle_type idle)
 {
 	int continue_balancing = 1;
-	struct rq *rq = cpu_rq(cpu);
+	int cpu = rq->cpu;
 	unsigned long interval;
 	struct sched_domain *sd;
 	/* Earliest time when we have to do rebalance again */
@@ -7143,7 +7141,7 @@ static void nohz_idle_balance(struct rq *this_rq, enum cpu_idle_type idle)
 			update_rq_clock(rq);
 			update_idle_cpu_load(rq);
 			raw_spin_unlock_irq(&rq->lock);
-			rebalance_domains(balance_cpu, CPU_IDLE);
+			rebalance_domains(rq, CPU_IDLE);
 		}
 
 		if (time_after(next_balance, rq->next_balance)) {
@@ -7241,14 +7239,16 @@ static void run_rebalance_domains(struct softirq_action *h)
 	enum cpu_idle_type idle = this_rq->idle_balance ?
 						CPU_IDLE : CPU_NOT_IDLE;
 
-	rebalance_domains(this_cpu, idle);
-
 	/*
 	 * If this cpu has a pending nohz_balance_kick, then do the
 	 * balancing on behalf of the other idle cpus whose ticks are
-	 * stopped.
+	 * stopped. Do nohz_idle_balance *before* rebalance_domains to
+	 * give the idle cpus a chance to load balance. Else we may
+	 * load balance only within the local sched_domain hierarchy
+	 * and abort nohz_idle_balance altogether if we pull some load.
 	 */
 	nohz_idle_balance(this_rq, idle);
+	rebalance_domains(this_rq, idle);
 }
 
 static inline int on_null_domain(int cpu)
@@ -7347,7 +7347,7 @@ static void task_fork_fair(struct task_struct *p)
 		 * 'current' within the tree based on its new key value.
 		 */
 		swap(curr->vruntime, se->vruntime);
-		resched_task(rq->curr);
+		resched_curr(rq);
 	}
 
 	se->vruntime -= cfs_rq->min_vruntime;
@@ -7372,7 +7372,7 @@ prio_changed_fair(struct rq *rq, struct task_struct *p, int oldprio)
 	 */
 	if (rq->curr == p) {
 		if (p->prio > oldprio)
-			resched_task(rq->curr);
+			resched_curr(rq);
 	} else
 		check_preempt_curr(rq, p, 0);
 }
@@ -7429,7 +7429,7 @@ static void switched_to_fair(struct rq *rq, struct task_struct *p)
 	 * if we can still preempt the current task.
 	 */
 	if (rq->curr == p)
-		resched_task(rq->curr);
+		resched_curr(rq);
 	else
 		check_preempt_curr(rq, p, 0);
 }

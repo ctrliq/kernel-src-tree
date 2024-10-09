@@ -849,7 +849,7 @@ _base_async_event(struct MPT3SAS_ADAPTER *ioc, u8 msix_index, u32 reply)
 	ack_request->EventContext = mpi_reply->EventContext;
 	ack_request->VF_ID = 0;  /* TODO */
 	ack_request->VP_ID = 0;
-	mpt3sas_base_put_smid_default(ioc, smid);
+	ioc->put_smid_default(ioc, smid);
 
  out:
 
@@ -2060,7 +2060,7 @@ _base_enable_msix(struct MPT3SAS_ADAPTER *ioc)
  * mpt3sas_base_unmap_resources - free controller resources
  * @ioc: per adapter object
  */
-void
+static void
 mpt3sas_base_unmap_resources(struct MPT3SAS_ADAPTER *ioc)
 {
 	struct pci_dev *pdev = ioc->pdev;
@@ -2483,15 +2483,15 @@ _base_writeq(__u64 b, volatile void __iomem *addr, spinlock_t *writeq_lock)
 #endif
 
 /**
- * mpt3sas_base_put_smid_scsi_io - send SCSI_IO request to firmware
+ * _base_put_smid_scsi_io - send SCSI_IO request to firmware
  * @ioc: per adapter object
  * @smid: system request message index
  * @handle: device handle
  *
  * Return nothing.
  */
-void
-mpt3sas_base_put_smid_scsi_io(struct MPT3SAS_ADAPTER *ioc, u16 smid, u16 handle)
+static void
+_base_put_smid_scsi_io(struct MPT3SAS_ADAPTER *ioc, u16 smid, u16 handle)
 {
 	Mpi2RequestDescriptorUnion_t descriptor;
 	u64 *request = (u64 *)&descriptor;
@@ -2507,15 +2507,15 @@ mpt3sas_base_put_smid_scsi_io(struct MPT3SAS_ADAPTER *ioc, u16 smid, u16 handle)
 }
 
 /**
- * mpt3sas_base_put_smid_fast_path - send fast path request to firmware
+ * _base_put_smid_fast_path - send fast path request to firmware
  * @ioc: per adapter object
  * @smid: system request message index
  * @handle: device handle
  *
  * Return nothing.
  */
-void
-mpt3sas_base_put_smid_fast_path(struct MPT3SAS_ADAPTER *ioc, u16 smid,
+static void
+_base_put_smid_fast_path(struct MPT3SAS_ADAPTER *ioc, u16 smid,
 	u16 handle)
 {
 	Mpi2RequestDescriptorUnion_t descriptor;
@@ -2532,14 +2532,14 @@ mpt3sas_base_put_smid_fast_path(struct MPT3SAS_ADAPTER *ioc, u16 smid,
 }
 
 /**
- * mpt3sas_base_put_smid_hi_priority - send Task Managment request to firmware
+ * _base_put_smid_hi_priority - send Task Management request to firmware
  * @ioc: per adapter object
  * @smid: system request message index
  * @msix_task: msix_task will be same as msix of IO incase of task abort else 0.
  * Return nothing.
  */
-void
-mpt3sas_base_put_smid_hi_priority(struct MPT3SAS_ADAPTER *ioc, u16 smid,
+static void
+_base_put_smid_hi_priority(struct MPT3SAS_ADAPTER *ioc, u16 smid,
 	u16 msix_task)
 {
 	Mpi2RequestDescriptorUnion_t descriptor;
@@ -2556,14 +2556,14 @@ mpt3sas_base_put_smid_hi_priority(struct MPT3SAS_ADAPTER *ioc, u16 smid,
 }
 
 /**
- * mpt3sas_base_put_smid_default - Default, primarily used for config pages
+ * _base_put_smid_default - Default, primarily used for config pages
  * @ioc: per adapter object
  * @smid: system request message index
  *
  * Return nothing.
  */
-void
-mpt3sas_base_put_smid_default(struct MPT3SAS_ADAPTER *ioc, u16 smid)
+static void
+_base_put_smid_default(struct MPT3SAS_ADAPTER *ioc, u16 smid)
 {
 	Mpi2RequestDescriptorUnion_t descriptor;
 	u64 *request = (u64 *)&descriptor;
@@ -2575,6 +2575,95 @@ mpt3sas_base_put_smid_default(struct MPT3SAS_ADAPTER *ioc, u16 smid)
 	descriptor.Default.DescriptorTypeDependent = 0;
 	_base_writeq(*request, &ioc->chip->RequestDescriptorPostLow,
 	    &ioc->scsi_lookup_lock);
+}
+
+/**
+* _base_put_smid_scsi_io_atomic - send SCSI_IO request to firmware using
+*   Atomic Request Descriptor
+* @ioc: per adapter object
+* @smid: system request message index
+* @handle: device handle, unused in this function, for function type match
+*
+* Return nothing.
+*/
+static void
+_base_put_smid_scsi_io_atomic(struct MPT3SAS_ADAPTER *ioc, u16 smid,
+	u16 handle)
+{
+	Mpi26AtomicRequestDescriptor_t descriptor;
+	u32 *request = (u32 *)&descriptor;
+
+	descriptor.RequestFlags = MPI2_REQ_DESCRIPT_FLAGS_SCSI_IO;
+	descriptor.MSIxIndex = _base_get_msix_index(ioc);
+	descriptor.SMID = cpu_to_le16(smid);
+
+	writel(cpu_to_le32(*request), &ioc->chip->AtomicRequestDescriptorPost);
+}
+
+/**
+ * _base_put_smid_fast_path_atomic - send fast path request to firmware
+ * using Atomic Request Descriptor
+ * @ioc: per adapter object
+ * @smid: system request message index
+ * @handle: device handle, unused in this function, for function type match
+ * Return nothing
+ */
+static void
+_base_put_smid_fast_path_atomic(struct MPT3SAS_ADAPTER *ioc, u16 smid,
+	u16 handle)
+{
+	Mpi26AtomicRequestDescriptor_t descriptor;
+	u32 *request = (u32 *)&descriptor;
+
+	descriptor.RequestFlags = MPI25_REQ_DESCRIPT_FLAGS_FAST_PATH_SCSI_IO;
+	descriptor.MSIxIndex = _base_get_msix_index(ioc);
+	descriptor.SMID = cpu_to_le16(smid);
+
+	writel(cpu_to_le32(*request), &ioc->chip->AtomicRequestDescriptorPost);
+}
+
+/**
+ * _base_put_smid_hi_priority_atomic - send Task Management request to
+ * firmware using Atomic Request Descriptor
+ * @ioc: per adapter object
+ * @smid: system request message index
+ * @msix_task: msix_task will be same as msix of IO incase of task abort else 0
+ *
+ * Return nothing.
+ */
+static void
+_base_put_smid_hi_priority_atomic(struct MPT3SAS_ADAPTER *ioc, u16 smid,
+	u16 msix_task)
+{
+	Mpi26AtomicRequestDescriptor_t descriptor;
+	u32 *request = (u32 *)&descriptor;
+
+	descriptor.RequestFlags = MPI2_REQ_DESCRIPT_FLAGS_HIGH_PRIORITY;
+	descriptor.MSIxIndex = msix_task;
+	descriptor.SMID = cpu_to_le16(smid);
+
+	writel(cpu_to_le32(*request), &ioc->chip->AtomicRequestDescriptorPost);
+}
+
+/**
+ * _base_put_smid_default - Default, primarily used for config pages
+ * use Atomic Request Descriptor
+ * @ioc: per adapter object
+ * @smid: system request message index
+ *
+ * Return nothing.
+ */
+static void
+_base_put_smid_default_atomic(struct MPT3SAS_ADAPTER *ioc, u16 smid)
+{
+	Mpi26AtomicRequestDescriptor_t descriptor;
+	u32 *request = (u32 *)&descriptor;
+
+	descriptor.RequestFlags = MPI2_REQ_DESCRIPT_FLAGS_DEFAULT_TYPE;
+	descriptor.MSIxIndex = _base_get_msix_index(ioc);
+	descriptor.SMID = cpu_to_le16(smid);
+
+	writel(cpu_to_le32(*request), &ioc->chip->AtomicRequestDescriptorPost);
 }
 
 /**
@@ -3916,7 +4005,6 @@ _base_handshake_req_reply_wait(struct MPT3SAS_ADAPTER *ioc, int request_bytes,
 	MPI2DefaultReply_t *default_reply = (MPI2DefaultReply_t *)reply;
 	int i;
 	u8 failed;
-	u16 dummy;
 	__le32 *mfp;
 
 	/* make sure doorbell is not in use */
@@ -3996,7 +4084,7 @@ _base_handshake_req_reply_wait(struct MPT3SAS_ADAPTER *ioc, int request_bytes,
 			return -EFAULT;
 		}
 		if (i >=  reply_bytes/2) /* overflow case */
-			dummy = readl(&ioc->chip->Doorbell);
+			readl(&ioc->chip->Doorbell);
 		else
 			reply[i] = le16_to_cpu(readl(&ioc->chip->Doorbell)
 			    & MPI2_DOORBELL_DATA_MASK);
@@ -4041,7 +4129,6 @@ mpt3sas_base_sas_iounit_control(struct MPT3SAS_ADAPTER *ioc,
 {
 	u16 smid;
 	u32 ioc_state;
-	unsigned long timeleft;
 	bool issue_reset = false;
 	int rc;
 	void *request;
@@ -4093,8 +4180,8 @@ mpt3sas_base_sas_iounit_control(struct MPT3SAS_ADAPTER *ioc,
 	    mpi_request->Operation == MPI2_SAS_OP_PHY_LINK_RESET)
 		ioc->ioc_link_reset_in_progress = 1;
 	init_completion(&ioc->base_cmds.done);
-	mpt3sas_base_put_smid_default(ioc, smid);
-	timeleft = wait_for_completion_timeout(&ioc->base_cmds.done,
+	ioc->put_smid_default(ioc, smid);
+	wait_for_completion_timeout(&ioc->base_cmds.done,
 	    msecs_to_jiffies(10000));
 	if ((mpi_request->Operation == MPI2_SAS_OP_PHY_HARD_RESET ||
 	    mpi_request->Operation == MPI2_SAS_OP_PHY_LINK_RESET) &&
@@ -4144,7 +4231,6 @@ mpt3sas_base_scsi_enclosure_processor(struct MPT3SAS_ADAPTER *ioc,
 {
 	u16 smid;
 	u32 ioc_state;
-	unsigned long timeleft;
 	bool issue_reset = false;
 	int rc;
 	void *request;
@@ -4194,8 +4280,8 @@ mpt3sas_base_scsi_enclosure_processor(struct MPT3SAS_ADAPTER *ioc,
 	ioc->base_cmds.smid = smid;
 	memcpy(request, mpi_request, sizeof(Mpi2SepReply_t));
 	init_completion(&ioc->base_cmds.done);
-	mpt3sas_base_put_smid_default(ioc, smid);
-	timeleft = wait_for_completion_timeout(&ioc->base_cmds.done,
+	ioc->put_smid_default(ioc, smid);
+	wait_for_completion_timeout(&ioc->base_cmds.done,
 	    msecs_to_jiffies(10000));
 	if (!(ioc->base_cmds.status & MPT3_CMD_COMPLETE)) {
 		pr_err(MPT3SAS_FMT "%s: timeout\n",
@@ -4379,6 +4465,8 @@ _base_get_ioc_facts(struct MPT3SAS_ADAPTER *ioc)
 	if ((facts->IOCCapabilities &
 	      MPI2_IOCFACTS_CAPABILITY_RDPQ_ARRAY_CAPABLE))
 		ioc->rdpq_array_capable = 1;
+	if (facts->IOCCapabilities & MPI26_IOCFACTS_CAPABILITY_ATOMIC_REQ)
+		ioc->atomic_desc_capable = 1;
 	facts->FWVersion.Word = le32_to_cpu(mpi_reply.FWVersion.Word);
 	facts->IOCRequestFrameSize =
 	    le16_to_cpu(mpi_reply.IOCRequestFrameSize);
@@ -4580,7 +4668,6 @@ _base_send_port_enable(struct MPT3SAS_ADAPTER *ioc)
 {
 	Mpi2PortEnableRequest_t *mpi_request;
 	Mpi2PortEnableReply_t *mpi_reply;
-	unsigned long timeleft;
 	int r = 0;
 	u16 smid;
 	u16 ioc_status;
@@ -4607,9 +4694,8 @@ _base_send_port_enable(struct MPT3SAS_ADAPTER *ioc)
 	mpi_request->Function = MPI2_FUNCTION_PORT_ENABLE;
 
 	init_completion(&ioc->port_enable_cmds.done);
-	mpt3sas_base_put_smid_default(ioc, smid);
-	timeleft = wait_for_completion_timeout(&ioc->port_enable_cmds.done,
-	    300*HZ);
+	ioc->put_smid_default(ioc, smid);
+	wait_for_completion_timeout(&ioc->port_enable_cmds.done, 300*HZ);
 	if (!(ioc->port_enable_cmds.status & MPT3_CMD_COMPLETE)) {
 		pr_err(MPT3SAS_FMT "%s: timeout\n",
 		    ioc->name, __func__);
@@ -4671,7 +4757,7 @@ mpt3sas_port_enable(struct MPT3SAS_ADAPTER *ioc)
 	memset(mpi_request, 0, sizeof(Mpi2PortEnableRequest_t));
 	mpi_request->Function = MPI2_FUNCTION_PORT_ENABLE;
 
-	mpt3sas_base_put_smid_default(ioc, smid);
+	ioc->put_smid_default(ioc, smid);
 	return 0;
 }
 
@@ -4760,7 +4846,6 @@ static int
 _base_event_notification(struct MPT3SAS_ADAPTER *ioc)
 {
 	Mpi2EventNotificationRequest_t *mpi_request;
-	unsigned long timeleft;
 	u16 smid;
 	int r = 0;
 	int i;
@@ -4791,8 +4876,8 @@ _base_event_notification(struct MPT3SAS_ADAPTER *ioc)
 		mpi_request->EventMasks[i] =
 		    cpu_to_le32(ioc->event_masks[i]);
 	init_completion(&ioc->base_cmds.done);
-	mpt3sas_base_put_smid_default(ioc, smid);
-	timeleft = wait_for_completion_timeout(&ioc->base_cmds.done, 30*HZ);
+	ioc->put_smid_default(ioc, smid);
+	wait_for_completion_timeout(&ioc->base_cmds.done, 30*HZ);
 	if (!(ioc->base_cmds.status & MPT3_CMD_COMPLETE)) {
 		pr_err(MPT3SAS_FMT "%s: timeout\n",
 		    ioc->name, __func__);
@@ -5307,8 +5392,22 @@ mpt3sas_base_attach(struct MPT3SAS_ADAPTER *ioc)
 		ioc->build_sg = &_base_build_sg_ieee;
 		ioc->build_zero_len_sge = &_base_build_zero_len_sge_ieee;
 		ioc->sge_size_ieee = sizeof(Mpi2IeeeSgeSimple64_t);
+
 		break;
 	}
+
+	if (ioc->atomic_desc_capable) {
+		ioc->put_smid_default = &_base_put_smid_default_atomic;
+		ioc->put_smid_scsi_io = &_base_put_smid_scsi_io_atomic;
+		ioc->put_smid_fast_path = &_base_put_smid_fast_path_atomic;
+		ioc->put_smid_hi_priority = &_base_put_smid_hi_priority_atomic;
+	} else {
+		ioc->put_smid_default = &_base_put_smid_default;
+		ioc->put_smid_scsi_io = &_base_put_smid_scsi_io;
+		ioc->put_smid_fast_path = &_base_put_smid_fast_path;
+		ioc->put_smid_hi_priority = &_base_put_smid_hi_priority;
+	}
+
 
 	/*
 	 * These function pointers for other requests that don't

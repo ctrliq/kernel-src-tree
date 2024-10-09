@@ -19,7 +19,7 @@ obj-y				+= video/
 obj-y				+= idle/
 
 # IPMI must come before ACPI in order to provide IPMI opregion support
-obj-$(CONFIG_IPMI_HANDLER)	+= char/ipmi/
+obj-y				+= char/ipmi/
 
 obj-$(CONFIG_ACPI)		+= acpi/
 obj-$(CONFIG_SFI)		+= sfi/
@@ -57,6 +57,8 @@ obj-$(CONFIG_FB_INTEL)          += video/intelfb/
 obj-$(CONFIG_PARPORT)		+= parport/
 obj-y				+= base/ block/ misc/ mfd/ nfc/
 obj-$(CONFIG_LIBNVDIMM)		+= nvdimm/
+obj-$(CONFIG_DEV_DAX)		+= dax/
+obj-$(CONFIG_DMA_SHARED_BUFFER)	+= dma-buf/
 obj-$(CONFIG_NUBUS)		+= nubus/
 obj-y				+= macintosh/
 obj-$(CONFIG_IDE)		+= ide/

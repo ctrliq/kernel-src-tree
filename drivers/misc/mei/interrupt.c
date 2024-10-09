@@ -102,27 +102,25 @@ int mei_cl_irq_read_msg(struct mei_cl *cl,
 {
 	struct mei_device *dev = cl->dev;
 	struct mei_cl_cb *cb;
-	unsigned char *buffer = NULL;
 	size_t buf_sz;
 
 	cb = list_first_entry_or_null(&cl->rd_pending, struct mei_cl_cb, list);
 	if (!cb) {
-		cl_err(dev, cl, "pending read cb not found\n");
-		goto out;
+		if (!mei_cl_is_fixed_address(cl)) {
+			cl_err(dev, cl, "pending read cb not found\n");
+			goto discard;
+		}
+		cb = mei_cl_alloc_cb(cl, mei_cl_mtu(cl), MEI_FOP_READ, cl->fp);
+		if (!cb)
+			goto discard;
+		list_add_tail(&cb->list, &cl->rd_pending);
 	}
 
 	if (!mei_cl_is_connected(cl)) {
 		cl_dbg(dev, cl, "not connected\n");
 		list_move_tail(&cb->list, &complete_list->list);
 		cb->status = -ENODEV;
-		goto out;
-	}
-
-	if (cb->buf.size == 0 || cb->buf.data == NULL) {
-		cl_err(dev, cl, "response buffer is not allocated.\n");
-		list_move_tail(&cb->list, &complete_list->list);
-		cb->status = -ENOMEM;
-		goto out;
+		goto discard;
 	}
 
 	buf_sz = mei_hdr->length + cb->buf_idx;
@@ -133,25 +131,19 @@ int mei_cl_irq_read_msg(struct mei_cl *cl,
 
 		list_move_tail(&cb->list, &complete_list->list);
 		cb->status = -EMSGSIZE;
-		goto out;
+		goto discard;
 	}
 
 	if (cb->buf.size < buf_sz) {
 		cl_dbg(dev, cl, "message overflow. size %zu len %d idx %zu\n",
 			cb->buf.size, mei_hdr->length, cb->buf_idx);
-		buffer = krealloc(cb->buf.data, buf_sz, GFP_KERNEL);
 
-		if (!buffer) {
-			cb->status = -ENOMEM;
-			list_move_tail(&cb->list, &complete_list->list);
-			goto out;
-		}
-		cb->buf.data = buffer;
-		cb->buf.size = buf_sz;
+		list_move_tail(&cb->list, &complete_list->list);
+		cb->status = -EMSGSIZE;
+		goto discard;
 	}
 
-	buffer = cb->buf.data + cb->buf_idx;
-	mei_read_slots(dev, buffer, mei_hdr->length);
+	mei_read_slots(dev, cb->buf.data + cb->buf_idx, mei_hdr->length);
 
 	cb->buf_idx += mei_hdr->length;
 
@@ -163,10 +155,10 @@ int mei_cl_irq_read_msg(struct mei_cl *cl,
 		pm_request_autosuspend(dev->dev);
 	}
 
-out:
-	if (!buffer)
-		mei_irq_discard_msg(dev, mei_hdr);
+	return 0;
 
+discard:
+	mei_irq_discard_msg(dev, mei_hdr);
 	return 0;
 }
 
@@ -216,6 +208,9 @@ static int mei_cl_irq_read(struct mei_cl *cl, struct mei_cl_cb *cb,
 	u32 msg_slots;
 	int slots;
 	int ret;
+
+	if (!list_empty(&cl->rd_pending))
+		return 0;
 
 	msg_slots = mei_data2slots(sizeof(struct hbm_flow_control));
 	slots = mei_hbuf_empty_slots(dev);
@@ -383,21 +378,6 @@ int mei_irq_write_handler(struct mei_device *dev, struct mei_cl_cb *cmpl_list)
 		cl_dbg(dev, cl, "MEI WRITE COMPLETE\n");
 		cl->writing_state = MEI_WRITE_COMPLETE;
 		list_move_tail(&cb->list, &cmpl_list->list);
-	}
-
-	if (dev->wd_state == MEI_WD_STOPPING) {
-		dev->wd_state = MEI_WD_IDLE;
-		wake_up(&dev->wait_stop_wd);
-	}
-
-	if (mei_cl_is_connected(&dev->wd_cl)) {
-		if (dev->wd_pending &&
-		    mei_cl_flow_ctrl_creds(&dev->wd_cl) > 0) {
-			ret = mei_wd_send(dev);
-			if (ret)
-				return ret;
-			dev->wd_pending = false;
-		}
 	}
 
 	/* complete control write list CB */

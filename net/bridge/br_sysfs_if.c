@@ -26,7 +26,7 @@ struct brport_attribute {
 	int (*store)(struct net_bridge_port *, unsigned long);
 };
 
-#define BRPORT_ATTR(_name,_mode,_show,_store)		        \
+#define BRPORT_ATTR(_name, _mode, _show, _store)		\
 const struct brport_attribute brport_attr_##_name = { 	        \
 	.attr = {.name = __stringify(_name), 			\
 		 .mode = _mode },				\
@@ -169,6 +169,9 @@ BRPORT_ATTR_FLAG(bpdu_guard, BR_BPDU_GUARD);
 BRPORT_ATTR_FLAG(root_block, BR_ROOT_BLOCK);
 BRPORT_ATTR_FLAG(learning, BR_LEARNING);
 BRPORT_ATTR_FLAG(unicast_flood, BR_FLOOD);
+BRPORT_ATTR_FLAG(proxyarp, BR_PROXYARP);
+BRPORT_ATTR_FLAG(proxyarp_wifi, BR_PROXYARP_WIFI);
+BRPORT_ATTR_FLAG(multicast_flood, BR_MCAST_FLOOD);
 
 #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
 static ssize_t show_multicast_router(struct net_bridge_port *p, char *buf)
@@ -212,6 +215,9 @@ static const struct brport_attribute *brport_attrs[] = {
 	&brport_attr_multicast_router,
 	&brport_attr_multicast_fast_leave,
 #endif
+	&brport_attr_proxyarp,
+	&brport_attr_proxyarp_wifi,
+	&brport_attr_multicast_flood,
 	NULL
 };
 

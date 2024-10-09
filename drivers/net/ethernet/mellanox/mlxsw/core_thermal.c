@@ -140,8 +140,7 @@ static int mlxsw_thermal_bind(struct thermal_zone_device *tzdev,
 
 		err = thermal_zone_bind_cooling_device(tzdev, i, cdev,
 						       trip->max_state,
-						       trip->min_state,
-						       THERMAL_WEIGHT_DEFAULT);
+						       trip->min_state);
 		if (err < 0) {
 			dev_err(dev, "Failed to bind cooling device to trip %d\n", i);
 			return err;
@@ -197,13 +196,13 @@ static int mlxsw_thermal_set_mode(struct thermal_zone_device *tzdev,
 	mutex_unlock(&tzdev->lock);
 
 	thermal->mode = mode;
-	thermal_zone_device_update(tzdev, THERMAL_EVENT_UNSPECIFIED);
+	thermal_zone_device_update(tzdev);
 
 	return 0;
 }
 
 static int mlxsw_thermal_get_temp(struct thermal_zone_device *tzdev,
-				  int *p_temp)
+				  unsigned long *p_temp)
 {
 	struct mlxsw_thermal *thermal = tzdev->devdata;
 	struct device *dev = thermal->bus_info->dev;
@@ -238,7 +237,7 @@ static int mlxsw_thermal_get_trip_type(struct thermal_zone_device *tzdev,
 }
 
 static int mlxsw_thermal_get_trip_temp(struct thermal_zone_device *tzdev,
-				       int trip, int *p_temp)
+				       int trip, unsigned long *p_temp)
 {
 	struct mlxsw_thermal *thermal = tzdev->devdata;
 
@@ -250,7 +249,7 @@ static int mlxsw_thermal_get_trip_temp(struct thermal_zone_device *tzdev,
 }
 
 static int mlxsw_thermal_set_trip_temp(struct thermal_zone_device *tzdev,
-				       int trip, int temp)
+				       int trip, unsigned long temp)
 {
 	struct mlxsw_thermal *thermal = tzdev->devdata;
 

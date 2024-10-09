@@ -91,7 +91,6 @@ EXPORT_SYMBOL_GPL(mei_fw_status2str);
  */
 void mei_cancel_work(struct mei_device *dev)
 {
-	cancel_work_sync(&dev->init_work);
 	cancel_work_sync(&dev->reset_work);
 	cancel_work_sync(&dev->bus_rescan_work);
 
@@ -152,8 +151,7 @@ int mei_reset(struct mei_device *dev)
 		mei_cl_all_disconnect(dev);
 
 		/* remove entry if already in list */
-		dev_dbg(dev->dev, "remove iamthif and wd from the file list.\n");
-		mei_cl_unlink(&dev->wd_cl);
+		dev_dbg(dev->dev, "remove iamthif from the file list.\n");
 		mei_cl_unlink(&dev->iamthif_cl);
 		mei_amthif_reset_params(dev);
 	}
@@ -161,7 +159,6 @@ int mei_reset(struct mei_device *dev)
 	mei_hbm_reset(dev);
 
 	dev->rd_msg_hdr = 0;
-	dev->wd_pending = false;
 
 	if (ret) {
 		dev_err(dev->dev, "hw_reset failed ret = %d\n", ret);
@@ -331,14 +328,10 @@ void mei_stop(struct mei_device *dev)
 
 	mutex_lock(&dev->device_lock);
 
-	mei_wd_stop(dev);
-
 	dev->dev_state = MEI_DEV_POWER_DOWN;
 	mei_reset(dev);
 
 	mutex_unlock(&dev->device_lock);
-
-	mei_watchdog_unregister(dev);
 }
 EXPORT_SYMBOL_GPL(mei_stop);
 
@@ -388,7 +381,6 @@ void mei_device_init(struct mei_device *dev,
 	init_waitqueue_head(&dev->wait_hw_ready);
 	init_waitqueue_head(&dev->wait_pg);
 	init_waitqueue_head(&dev->wait_hbm_start);
-	init_waitqueue_head(&dev->wait_stop_wd);
 	dev->dev_state = MEI_DEV_INITIALIZING;
 	dev->reset_count = 0;
 
@@ -398,11 +390,9 @@ void mei_device_init(struct mei_device *dev,
 	mei_io_list_init(&dev->ctrl_rd_list);
 
 	INIT_DELAYED_WORK(&dev->timer_work, mei_timer);
-	INIT_WORK(&dev->init_work, mei_host_client_init);
 	INIT_WORK(&dev->reset_work, mei_reset_work);
 	INIT_WORK(&dev->bus_rescan_work, mei_cl_bus_rescan_work);
 
-	INIT_LIST_HEAD(&dev->wd_cl.link);
 	INIT_LIST_HEAD(&dev->iamthif_cl.link);
 	mei_io_list_init(&dev->amthif_cmd_list);
 

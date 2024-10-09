@@ -89,7 +89,7 @@ static inline struct inode *VFS_I(struct xfs_inode *ip)
  */
 static inline xfs_fsize_t XFS_ISIZE(struct xfs_inode *ip)
 {
-	if (S_ISREG(ip->i_d.di_mode))
+	if (S_ISREG(VFS_I(ip)->i_mode))
 		return i_size_read(VFS_I(ip));
 	return ip->i_d.di_size;
 }
@@ -231,6 +231,11 @@ xfs_get_initial_prid(struct xfs_inode *dp)
  * Synchronize processes attempting to flush the in-core inode back to disk.
  */
 
+static inline int xfs_isiflocked(struct xfs_inode *ip)
+{
+	return xfs_iflags_test(ip, XFS_IFLOCK);
+}
+
 extern void __xfs_iflock(struct xfs_inode *ip);
 
 static inline int xfs_iflock_nowait(struct xfs_inode *ip)
@@ -246,14 +251,10 @@ static inline void xfs_iflock(struct xfs_inode *ip)
 
 static inline void xfs_ifunlock(struct xfs_inode *ip)
 {
+	ASSERT(xfs_isiflocked(ip));
 	xfs_iflags_clear(ip, XFS_IFLOCK);
 	smp_mb();
 	wake_up_bit(&ip->i_flags, __XFS_IFLOCK_BIT);
-}
-
-static inline int xfs_isiflocked(struct xfs_inode *ip)
-{
-	return xfs_iflags_test(ip, XFS_IFLOCK);
 }
 
 /*
@@ -370,7 +371,7 @@ static inline int xfs_isiflocked(struct xfs_inode *ip)
  */
 #define XFS_INHERIT_GID(pip)	\
 	(((pip)->i_mount->m_flags & XFS_MOUNT_GRPID) || \
-	 ((pip)->i_d.di_mode & S_ISGID))
+	 (VFS_I(pip)->i_mode & S_ISGID))
 
 int		xfs_release(struct xfs_inode *ip);
 void		xfs_inactive(struct xfs_inode *ip);
@@ -440,6 +441,9 @@ loff_t	__xfs_seek_hole_data(struct inode *inode, loff_t start,
 			     loff_t eof, int whence);
 
 /* from xfs_iops.c */
+extern void xfs_setup_inode(struct xfs_inode *ip);
+extern void xfs_setup_iops(struct xfs_inode *ip);
+
 /*
  * When setting up a newly allocated inode, we need to call
  * xfs_finish_inode_setup() once the inode is fully instantiated at
@@ -447,7 +451,6 @@ loff_t	__xfs_seek_hole_data(struct inode *inode, loff_t start,
  * before we've completed instantiation. Otherwise we can do it
  * the moment the inode lookup is complete.
  */
-extern void xfs_setup_inode(struct xfs_inode *ip);
 static inline void xfs_finish_inode_setup(struct xfs_inode *ip)
 {
 	xfs_iflags_clear(ip, XFS_INEW);
@@ -458,6 +461,7 @@ static inline void xfs_finish_inode_setup(struct xfs_inode *ip)
 static inline void xfs_setup_existing_inode(struct xfs_inode *ip)
 {
 	xfs_setup_inode(ip);
+	xfs_setup_iops(ip);
 	xfs_finish_inode_setup(ip);
 }
 
@@ -475,15 +479,5 @@ do { \
 } while (0)
 
 extern struct kmem_zone	*xfs_inode_zone;
-
-/*
- * Flags for read/write calls
- */
-#define XFS_IO_ISDIRECT	0x00001		/* bypass page cache */
-#define XFS_IO_INVIS	0x00002		/* don't update inode timestamps */
-
-#define XFS_IO_FLAGS \
-	{ XFS_IO_ISDIRECT,	"DIRECT" }, \
-	{ XFS_IO_INVIS,		"INVIS"}
 
 #endif	/* __XFS_INODE_H__ */

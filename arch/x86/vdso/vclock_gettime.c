@@ -95,8 +95,10 @@ static notrace cycle_t vread_pvclock(int *mode)
 		 */
 
 		pvti = get_pvti(cpu);
+		version = pvclock_read_begin(&pvti->pvti);
+		flags = pvti->pvti.flags;
 
-		version = __pvclock_read_cycles(&pvti->pvti, &ret, &flags);
+		ret = __pvclock_read_cycles(&pvti->pvti, rdtsc_ordered());
 
 		/*
 		 * Test we're still on the cpu as well as the version.
@@ -106,8 +108,7 @@ static notrace cycle_t vread_pvclock(int *mode)
 		 */
 		cpu1 = __getcpu() & VGETCPU_CPU_MASK;
 	} while (unlikely(cpu != cpu1 ||
-			  (pvti->pvti.version & 1) ||
-			  pvti->pvti.version != version));
+			 pvclock_read_retry(&pvti->pvti, version)));
 
 	if (unlikely(!(flags & PVCLOCK_TSC_STABLE_BIT)))
 		*mode = VCLOCK_NONE;

@@ -308,7 +308,7 @@ ip_vs_sched_persist(struct ip_vs_service *svc,
 		if (sched) {
 			/* read svc->sched_data after svc->scheduler */
 			smp_rmb();
-			dest = sched->schedule(svc, skb);
+			dest = sched->schedule(svc, skb, iph);
 		} else {
 			dest = NULL;
 		}
@@ -461,7 +461,7 @@ ip_vs_schedule(struct ip_vs_service *svc, struct sk_buff *skb,
 	if (sched) {
 		/* read svc->sched_data after svc->scheduler */
 		smp_rmb();
-		dest = sched->schedule(svc, skb);
+		dest = sched->schedule(svc, skb, iph);
 	} else {
 		dest = NULL;
 	}

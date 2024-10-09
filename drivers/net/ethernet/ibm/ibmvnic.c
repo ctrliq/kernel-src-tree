@@ -3239,7 +3239,7 @@ static void ibmvnic_xport_event(struct work_struct *work)
 						       struct ibmvnic_adapter,
 						       ibmvnic_xport);
 	struct device *dev = &adapter->vdev->dev;
-	int rc;
+	long rc;
 
 	ibmvnic_free_inflight(adapter);
 	release_sub_crqs(adapter);

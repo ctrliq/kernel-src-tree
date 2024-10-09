@@ -48,13 +48,12 @@
 #define NVME_AQ_DEPTH		256
 #define SQ_SIZE(depth)		(depth * sizeof(struct nvme_command))
 #define CQ_SIZE(depth)		(depth * sizeof(struct nvme_completion))
-		
+
 /*
  * We handle AEN commands ourselves and don't even let the
  * block layer know about them.
  */
-#define NVME_NR_AEN_COMMANDS	1
-#define NVME_AQ_BLKMQ_DEPTH	(NVME_AQ_DEPTH - NVME_NR_AEN_COMMANDS)
+#define NVME_AQ_BLKMQ_DEPTH	(NVME_AQ_DEPTH - NVME_NR_AERS)
 
 static int use_threaded_interrupts;
 module_param(use_threaded_interrupts, int, 0);
@@ -91,9 +90,7 @@ struct nvme_dev {
 	struct msix_entry *entry;
 	void __iomem *bar;
 	struct work_struct reset_work;
-	struct work_struct scan_work;
 	struct work_struct remove_work;
-	struct work_struct async_work;
 	struct timer_list watchdog_timer;
 	struct mutex shutdown_lock;
 	bool subsystem;
@@ -101,11 +98,7 @@ struct nvme_dev {
 	dma_addr_t cmb_dma_addr;
 	u64 cmb_size;
 	u32 cmbsz;
-	unsigned long flags;
-
-#define NVME_CTRL_RESETTING    0
-#define NVME_CTRL_REMOVING     1
-
+	u32 cmbloc;
 	struct nvme_ctrl ctrl;
 	struct completion ioq_wait;
 };
@@ -147,6 +140,7 @@ struct nvme_queue {
  * allocated to store the PRP list.
  */
 struct nvme_iod {
+	struct nvme_request req;
 	struct nvme_queue *nvmeq;
 	int aborted;
 	int npages;		/* In the PRP list. 0 means small pool in use */
@@ -270,40 +264,6 @@ static int nvme_init_request(void *data, struct request *req,
 	return 0;
 }
 
-static void nvme_queue_scan(struct nvme_dev *dev)
-{
-	/*
-	 * Do not queue new scan work when a controller is reset during
-	 * removal.
-	 */
-	if (test_bit(NVME_CTRL_REMOVING, &dev->flags))
-		return;
-	queue_work(nvme_workq, &dev->scan_work);
-}
-
-static void nvme_complete_async_event(struct nvme_dev *dev,
-		struct nvme_completion *cqe)
-{
-	u16 status = le16_to_cpu(cqe->status) >> 1;
-	u32 result = le32_to_cpu(cqe->result);
-
-	if (status == NVME_SC_SUCCESS || status == NVME_SC_ABORT_REQ) {
-		++dev->ctrl.event_limit;
-		queue_work(nvme_workq, &dev->async_work);
-	}
-
-	if (status != NVME_SC_SUCCESS)
-		return;
-
-	switch (result & 0xff07) {
-	case NVME_AER_NOTICE_NS_CHANGED:
-		dev_info(dev->dev, "rescanning\n");
-		nvme_queue_scan(dev);
-	default:
-		dev_warn(dev->dev, "async event result %08x\n", result);
-	}
-}
-
 /**
  * __nvme_submit_cmd() - Copy a command into a queue and ring the doorbell
  * @nvmeq: The queue to use
@@ -333,16 +293,11 @@ static __le64 **iod_list(struct request *req)
 	return (__le64 **)(iod->sg + req->nr_phys_segments);
 }
 
-static int nvme_init_iod(struct request *rq, struct nvme_dev *dev)
+static int nvme_init_iod(struct request *rq, unsigned size,
+		struct nvme_dev *dev)
 {
 	struct nvme_iod *iod = blk_mq_rq_to_pdu(rq);
 	int nseg = rq->nr_phys_segments;
-	unsigned size;
-
-	if (rq->cmd_flags & REQ_DISCARD)
-		size = sizeof(struct nvme_dsm_range);
-	else
-		size = blk_rq_bytes(rq);
 
 	if (nseg > NVME_INT_PAGES || size > NVME_INT_BYTES(dev)) {
 		iod->sg = kmalloc(nvme_iod_alloc_size(dev, size, nseg), GFP_ATOMIC);
@@ -356,7 +311,12 @@ static int nvme_init_iod(struct request *rq, struct nvme_dev *dev)
 	iod->npages = -1;
 	iod->nents = 0;
 	iod->length = size;
-	return 0;
+
+	if (!(rq->cmd_flags & REQ_DONTPREP)) {
+		rq->retries = 0;
+		rq->cmd_flags |= REQ_DONTPREP;
+	}
+	return BLK_MQ_RQ_QUEUE_OK;
 }
 
 static void nvme_free_iod(struct nvme_dev *dev, struct request *req)
@@ -496,8 +456,8 @@ static int nvme_map_data(struct nvme_dev *dev, struct request *req,
 			goto out_unmap;
 	}
 
-	cmnd->rw.prp1 = cpu_to_le64(sg_dma_address(iod->sg));
-	cmnd->rw.prp2 = cpu_to_le64(iod->first_dma);
+	cmnd->rw.dptr.prp1 = cpu_to_le64(sg_dma_address(iod->sg));
+	cmnd->rw.dptr.prp2 = cpu_to_le64(iod->first_dma);
 	if (blk_integrity_rq(req))
 		cmnd->rw.metadata = cpu_to_le64(sg_dma_address(iod->meta_sg));
 	return BLK_MQ_RQ_QUEUE_OK;
@@ -524,43 +484,6 @@ static void nvme_unmap_data(struct nvme_dev *dev, struct request *req)
 	nvme_free_iod(dev, req);
 }
 
-static inline int nvme_setup_discard(struct nvme_ns *ns, struct request *req,
-		struct nvme_command *cmnd)
-{
-	struct nvme_dsm_range *range;
-	struct page *page;
-	int offset;
-	unsigned int nr_bytes = blk_rq_bytes(req);
-
-	range = kmalloc(sizeof(*range), GFP_ATOMIC);
-	if (!range)
-		return BLK_MQ_RQ_QUEUE_BUSY;
-
-	range->cattr = cpu_to_le32(0);
-	range->nlb = cpu_to_le32(nr_bytes >> ns->lba_shift);
-	range->slba = cpu_to_le64(nvme_block_nr(ns, blk_rq_pos(req)));
-
-	memset(cmnd, 0, sizeof(*cmnd));
-	cmnd->dsm.opcode = nvme_cmd_dsm;
-	cmnd->dsm.nsid = cpu_to_le32(ns->ns_id);
-	cmnd->dsm.nr = 0;
-	cmnd->dsm.attributes = cpu_to_le32(NVME_DSMGMT_AD);
-
-	req->completion_data = range;
-	page = virt_to_page(range);
-	offset = offset_in_page(range);
-	blk_add_request_payload(req, page, offset, sizeof(*range));
-
-	/*
-	 * we set __data_len back to the size of the area to be discarded
-	 * on disk. This allows us to report completion on the full amount
-	 * of blocks described by the request.
-	 */
-	req->__data_len = nr_bytes;
-
-	return 0;
-}
-
 /*
  * NOTE: ns is NULL when called on the admin queue.
  */
@@ -572,6 +495,7 @@ static int nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 	struct nvme_dev *dev = nvmeq->dev;
 	struct request *req = bd->rq;
 	struct nvme_command cmnd;
+	unsigned map_len;
 	int ret = BLK_MQ_RQ_QUEUE_OK;
 
 	/*
@@ -587,29 +511,21 @@ static int nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
 		}
 	}
 
-	ret = nvme_init_iod(req, dev);
-	if (ret)
+	map_len = nvme_map_len(req);
+	ret = nvme_init_iod(req, map_len, dev);
+	if (ret != BLK_MQ_RQ_QUEUE_OK)
 		return ret;
 
-	if (req->cmd_type == REQ_TYPE_DRV_PRIV)
-		memcpy(&cmnd, req->cmd, sizeof(cmnd));
-	else if (req->cmd_flags & REQ_FLUSH)
-		nvme_setup_flush(ns, &cmnd);
-	else if (req->cmd_flags & REQ_DISCARD)
-		ret = nvme_setup_discard(ns, req, &cmnd);
-	else
-		nvme_setup_rw(ns, req, &cmnd);
-
-	if (ret)
+	ret = nvme_setup_cmd(ns, req, &cmnd);
+	if (ret != BLK_MQ_RQ_QUEUE_OK)
 		goto out;
 
 	if (req->nr_phys_segments)
 		ret = nvme_map_data(dev, req, map_len, &cmnd);
 
-	if (ret)
+	if (ret != BLK_MQ_RQ_QUEUE_OK)
 		goto out;
 
-	cmnd.common.command_id = req->tag;
 	blk_mq_start_request(req);
 
 	spin_lock_irq(&nvmeq->q_lock);
@@ -640,6 +556,7 @@ static void nvme_complete_rq(struct request *req)
 
 	if (unlikely(req->errors)) {
 		if (nvme_req_needs_retry(req, req->errors)) {
+			req->retries++;
 			nvme_requeue_req(req);
 			return;
 		}
@@ -651,12 +568,19 @@ static void nvme_complete_rq(struct request *req)
 	}
 
 	if (unlikely(iod->aborted)) {
-		dev_warn(dev->dev,
+		dev_warn(dev->ctrl.device,
 			"completing aborted command with status: %04x\n",
 			req->errors);
 	}
 
 	blk_mq_end_request(req, error);
+}
+
+/* We read the CQE phase first to check if the rest of the entry is valid */
+static inline bool nvme_cqe_valid(struct nvme_queue *nvmeq, u16 head,
+		u16 phase)
+{
+	return (le16_to_cpu(nvmeq->cqes[head].status) & 1) == phase;
 }
 
 static int nvme_process_cq(struct nvme_queue *nvmeq)
@@ -666,13 +590,10 @@ static int nvme_process_cq(struct nvme_queue *nvmeq)
 	head = nvmeq->cq_head;
 	phase = nvmeq->cq_phase;
 
-	for (;;) {
+	while (nvme_cqe_valid(nvmeq, head, phase)) {
 		struct nvme_completion cqe = nvmeq->cqes[head];
-		u16 status = le16_to_cpu(cqe.status);
 		struct request *req;
 
-		if ((status & 1) != phase)
-			break;
 		if (++head == nvmeq->q_depth) {
 			head = 0;
 			phase = !phase;
@@ -680,7 +601,7 @@ static int nvme_process_cq(struct nvme_queue *nvmeq)
 
 
 		if (unlikely(cqe.command_id >= nvmeq->q_depth)) {
-			dev_warn(nvmeq->q_dmadev,
+			dev_warn(nvmeq->dev->ctrl.device,
 				"invalid id %d completed on queue %d\n",
 				cqe.command_id, le16_to_cpu(cqe.sq_id));
 			continue;
@@ -694,25 +615,16 @@ static int nvme_process_cq(struct nvme_queue *nvmeq)
 		 */
 		if (unlikely(nvmeq->qid == 0 &&
 				cqe.command_id >= NVME_AQ_BLKMQ_DEPTH)) {
-			nvme_complete_async_event(nvmeq->dev, &cqe);
+			nvme_complete_async_event(&nvmeq->dev->ctrl,
+					cqe.status, &cqe.result);
 			continue;
 		}
 
 		req = blk_mq_tag_to_rq(*nvmeq->tags, cqe.command_id);
-		if (req->cmd_type == REQ_TYPE_DRV_PRIV) {
-			u32 result = le32_to_cpu(cqe.result);
-			req->special = (void *)(uintptr_t)result;
-		}
-		blk_mq_complete_request(req, status >> 1);
-
+		nvme_req(req)->result = cqe.result;
+		blk_mq_complete_request(req, le16_to_cpu(cqe.status) >> 1);
 	}
 
-	/* If the controller ignores the cq head doorbell and continuously
-	 * writes to the queue, it is theoretically possible to wrap around
-	 * the queue twice and mistakenly return IRQ_NONE.  Linux only
-	 * requires that 0.1% of your interrupts are handled, so this isn't
-	 * a big problem.
-	 */
 	if (head == nvmeq->cq_head && phase == nvmeq->cq_phase)
 		return 0;
 
@@ -740,27 +652,23 @@ static irqreturn_t nvme_irq(int irq, void *data)
 static irqreturn_t nvme_irq_check(int irq, void *data)
 {
 	struct nvme_queue *nvmeq = data;
-	struct nvme_completion cqe = nvmeq->cqes[nvmeq->cq_head];
-	if ((le16_to_cpu(cqe.status) & 1) != nvmeq->cq_phase)
-		return IRQ_NONE;
-	return IRQ_WAKE_THREAD;
+	if (nvme_cqe_valid(nvmeq, nvmeq->cq_head, nvmeq->cq_phase))
+		return IRQ_WAKE_THREAD;
+	return IRQ_NONE;
 }
 
-static void nvme_async_event_work(struct work_struct *work)
+static void nvme_pci_submit_async_event(struct nvme_ctrl *ctrl, int aer_idx)
 {
-	struct nvme_dev *dev = container_of(work, struct nvme_dev, async_work);
+	struct nvme_dev *dev = to_nvme_dev(ctrl);
 	struct nvme_queue *nvmeq = dev->queues[0];
 	struct nvme_command c;
 
 	memset(&c, 0, sizeof(c));
 	c.common.opcode = nvme_admin_async_event;
+	c.common.command_id = NVME_AQ_BLKMQ_DEPTH + aer_idx;
 
 	spin_lock_irq(&nvmeq->q_lock);
-	while (dev->ctrl.event_limit > 0) {
-		c.common.command_id = NVME_AQ_BLKMQ_DEPTH +
-			--dev->ctrl.event_limit;
-		__nvme_submit_cmd(nvmeq, &c);
-	}
+	__nvme_submit_cmd(nvmeq, &c);
 	spin_unlock_irq(&nvmeq->q_lock);
 }
 
@@ -831,12 +739,10 @@ static void abort_endio(struct request *req, int error)
 {
 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
 	struct nvme_queue *nvmeq = iod->nvmeq;
-	u32 result = (u32)(uintptr_t)req->special;
 	u16 status = req->errors;
 
-	dev_warn(nvmeq->q_dmadev, "Abort status:%x result:%x", status, result);
+	dev_warn(nvmeq->dev->ctrl.device, "Abort status: 0x%x", status);
 	atomic_inc(&nvmeq->dev->ctrl.abort_limit);
-
 	blk_mq_free_request(req);
 }
 
@@ -854,8 +760,8 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
 	 * cancellation error. All outstanding requests are completed on
 	 * shutdown, so we return BLK_EH_HANDLED.
 	 */
-	if (test_bit(NVME_CTRL_RESETTING, &dev->flags)) {
-		dev_warn(dev->dev,
+	if (dev->ctrl.state == NVME_CTRL_RESETTING) {
+		dev_warn(dev->ctrl.device,
 			 "I/O %d QID %d timeout, disable controller\n",
 			 req->tag, nvmeq->qid);
 		nvme_dev_disable(dev, false);
@@ -869,8 +775,8 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
  	 * returned to the driver, or if this is the admin queue.
 	 */
 	if (!nvmeq->qid || iod->aborted) {
-		dev_warn(dev->dev,
-			 "I/O %d QID %d timeout, reset controller\n",
+		dev_warn(dev->ctrl.device,
+ 			 "I/O %d QID %d timeout, reset controller\n",
 			 req->tag, nvmeq->qid);
 		nvme_dev_disable(dev, false);
 		nvme_reset(dev);
@@ -895,11 +801,12 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
 	cmd.abort.cid = req->tag;
 	cmd.abort.sqid = cpu_to_le16(nvmeq->qid);
 
-	dev_warn(nvmeq->q_dmadev, "I/O %d QID %d timeout, aborting\n",
-				 req->tag, nvmeq->qid);
+	dev_warn(nvmeq->dev->ctrl.device,
+		"I/O %d QID %d timeout, aborting\n",
+		 req->tag, nvmeq->qid);
 
-	abort_req = blk_mq_alloc_request(dev->ctrl.admin_q, WRITE, GFP_ATOMIC,
-									false);
+	abort_req = nvme_alloc_request(dev->ctrl.admin_q, &cmd,
+			BLK_MQ_REQ_NOWAIT, NVME_QID_ANY);
 	if (IS_ERR(abort_req)) {
 		atomic_inc(&dev->ctrl.abort_limit);
 		return BLK_EH_RESET_TIMER;
@@ -915,23 +822,6 @@ static enum blk_eh_timer_return nvme_timeout(struct request *req, bool reserved)
 	 * as the device then is in a faulty state.
 	 */
 	return BLK_EH_RESET_TIMER;
-}
-
-static void nvme_cancel_queue_ios(struct request *req, void *data, bool reserved)
-{
-	struct nvme_queue *nvmeq = data;
-	int status;
-
-	if (!blk_mq_request_started(req))
-		return;
-
-	dev_dbg_ratelimited(nvmeq->q_dmadev,
-		 "Cancelling I/O %d QID %d\n", req->tag, nvmeq->qid);
-
-	status = NVME_SC_ABORT_REQ;
-	if (blk_queue_dying(req->q))
-		status |= NVME_SC_DNR;
-	blk_mq_complete_request(req, status);
 }
 
 static void nvme_free_queue(struct nvme_queue *nvmeq)
@@ -981,14 +871,6 @@ static int nvme_suspend_queue(struct nvme_queue *nvmeq)
 	free_irq(vector, nvmeq);
 
 	return 0;
-}
-
-static void nvme_clear_queue(struct nvme_queue *nvmeq)
-{
-	spin_lock_irq(&nvmeq->q_lock);
-	if (nvmeq->tags && *nvmeq->tags)
-		blk_mq_all_tag_busy_iter(*nvmeq->tags, nvme_cancel_queue_ios, nvmeq);
-	spin_unlock_irq(&nvmeq->q_lock);
 }
 
 static void nvme_disable_admin_queue(struct nvme_dev *dev, bool shutdown)
@@ -1222,7 +1104,7 @@ static int nvme_configure_admin_queue(struct nvme_dev *dev)
 	u64 cap = lo_hi_readq(dev->bar + NVME_REG_CAP);
 	struct nvme_queue *nvmeq;
 
-	dev->subsystem = readl(dev->bar + NVME_REG_VS) >= NVME_VS(1, 1) ?
+	dev->subsystem = readl(dev->bar + NVME_REG_VS) >= NVME_VS(1, 1, 0) ?
 						NVME_CAP_NSSRC(cap) : 0;
 
 	if (dev->subsystem &&
@@ -1349,28 +1231,37 @@ static int nvme_create_io_queues(struct nvme_dev *dev)
 	return ret >= 0 ? 0 : ret;
 }
 
+static ssize_t nvme_cmb_show(struct device *dev,
+			     struct device_attribute *attr,
+			     char *buf)
+{
+	struct nvme_dev *ndev = to_nvme_dev(dev_get_drvdata(dev));
+
+	return scnprintf(buf, PAGE_SIZE, "cmbloc : x%08x\ncmbsz  : x%08x\n",
+		       ndev->cmbloc, ndev->cmbsz);
+}
+static DEVICE_ATTR(cmb, S_IRUGO, nvme_cmb_show, NULL);
+
 static void __iomem *nvme_map_cmb(struct nvme_dev *dev)
 {
 	u64 szu, size, offset;
-	u32 cmbloc;
 	resource_size_t bar_size;
 	struct pci_dev *pdev = to_pci_dev(dev->dev);
 	void __iomem *cmb;
 	dma_addr_t dma_addr;
 
-	if (!use_cmb_sqes)
-		return NULL;
-
 	dev->cmbsz = readl(dev->bar + NVME_REG_CMBSZ);
 	if (!(NVME_CMB_SZ(dev->cmbsz)))
 		return NULL;
+	dev->cmbloc = readl(dev->bar + NVME_REG_CMBLOC);
 
-	cmbloc = readl(dev->bar + NVME_REG_CMBLOC);
+	if (!use_cmb_sqes)
+		return NULL;
 
 	szu = (u64)1 << (12 + 4 * NVME_CMB_SZU(dev->cmbsz));
 	size = szu * NVME_CMB_SZ(dev->cmbsz);
-	offset = szu * NVME_CMB_OFST(cmbloc);
-	bar_size = pci_resource_len(pdev, NVME_CMB_BIR(cmbloc));
+	offset = szu * NVME_CMB_OFST(dev->cmbloc);
+	bar_size = pci_resource_len(pdev, NVME_CMB_BIR(dev->cmbloc));
 
 	if (offset > bar_size)
 		return NULL;
@@ -1383,7 +1274,7 @@ static void __iomem *nvme_map_cmb(struct nvme_dev *dev)
 	if (size > bar_size - offset)
 		size = bar_size - offset;
 
-	dma_addr = pci_resource_start(pdev, NVME_CMB_BIR(cmbloc)) + offset;
+	dma_addr = pci_resource_start(pdev, NVME_CMB_BIR(dev->cmbloc)) + offset;
 	cmb = ioremap_wc(dma_addr, size);
 	if (!cmb)
 		return NULL;
@@ -1417,15 +1308,8 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 	if (result < 0)
 		return result;
 
-	/*
-	 * Degraded controllers might return an error when setting the queue
-	 * count.  We still want to be able to bring them online and offer
-	 * access to the admin queue, as that might be only way to fix them up.
-	 */
-	if (result > 0) {
-		dev_err(dev->dev, "Could not set queue count (%d)\n", result);
+	if (nr_io_queues == 0)
 		return 0;
-	}
 
 	if (dev->cmb && NVME_CMB_SQS(dev->cmbsz)) {
 		result = nvme_cmb_qdepth(dev, nr_io_queues,
@@ -1493,8 +1377,9 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
 	return nvme_create_io_queues(dev);
 }
 
-static void nvme_set_irq_hints(struct nvme_dev *dev)
+static void nvme_pci_post_scan(struct nvme_ctrl *ctrl)
 {
+	struct nvme_dev *dev = to_nvme_dev(ctrl);
 	struct nvme_queue *nvmeq;
 	int i;
 
@@ -1507,16 +1392,6 @@ static void nvme_set_irq_hints(struct nvme_dev *dev)
 		irq_set_affinity_hint(dev->entry[nvmeq->cq_vector].vector,
 					blk_mq_tags_cpumask(*nvmeq->tags));
 	}
-}
-
-static void nvme_dev_scan(struct work_struct *work)
-{
-	struct nvme_dev *dev = container_of(work, struct nvme_dev, scan_work);
-
-	if (!dev->tagset.tags)
-		return;
-	nvme_scan_namespaces(&dev->ctrl);
-	nvme_set_irq_hints(dev);
 }
 
 static void nvme_del_queue_end(struct request *req, int error)
@@ -1558,7 +1433,7 @@ static int nvme_delete_queue(struct nvme_queue *nvmeq, u8 opcode)
 	cmd.delete_queue.opcode = opcode;
 	cmd.delete_queue.qid = cpu_to_le16(nvmeq->qid);
 
-	req = nvme_alloc_request(nvmeq->dev->ctrl.admin_q, &cmd, 0);
+	req = nvme_alloc_request(q, &cmd, BLK_MQ_REQ_NOWAIT, NVME_QID_ANY);
 	if (IS_ERR(req))
 		return PTR_ERR(req);
 
@@ -1627,7 +1502,6 @@ static int nvme_dev_add(struct nvme_dev *dev)
 		nvme_free_queues(dev, dev->online_queues);
 	}
 
-	nvme_queue_scan(dev);
 	return 0;
 }
 
@@ -1671,8 +1545,24 @@ static int nvme_pci_enable(struct nvme_dev *dev)
 	dev->q_depth = min_t(int, NVME_CAP_MQES(cap) + 1, NVME_Q_DEPTH);
 	dev->db_stride = 1 << NVME_CAP_STRIDE(cap);
 	dev->dbs = dev->bar + 4096;
-	if (readl(dev->bar + NVME_REG_VS) >= NVME_VS(1, 2))
+	/*
+	 * CMBs can currently only exist on >=1.2 PCIe devices. We only
+	 * populate sysfs if a CMB is implemented. Note that we add the
+	 * CMB attribute to the nvme_ctrl kobj which removes the need to remove
+	 * it on exit. Since nvme_dev_attrs_group has no name we can pass
+	 * NULL as final argument to sysfs_add_file_to_group.
+	 */
+
+	if (readl(dev->bar + NVME_REG_VS) >= NVME_VS(1, 2, 0)) {
 		dev->cmb = nvme_map_cmb(dev);
+
+		if (dev->cmbsz) {
+			if (sysfs_add_file_to_group(&dev->ctrl.device->kobj,
+						    &dev_attr_cmb.attr, NULL))
+				dev_warn(dev->dev,
+					 "failed to add sysfs attribute for CMB\n");
+		}
+	}
 
 	pci_enable_pcie_error_reporting(pdev);
 	pci_save_state(pdev);
@@ -1713,21 +1603,34 @@ static void nvme_pci_disable(struct nvme_dev *dev)
 static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
 {
 	int i, queues;
-	u32 csts = -1;
+	bool dead = true;
+	struct pci_dev *pdev = to_pci_dev(dev->dev);
 
 	del_timer_sync(&dev->watchdog_timer);
 
 	mutex_lock(&dev->shutdown_lock);
-	if (pci_is_enabled(to_pci_dev(dev->dev))) {
-		nvme_stop_queues(&dev->ctrl);
-		csts = readl(dev->bar + NVME_REG_CSTS);
+	if (pci_is_enabled(pdev)) {
+		u32 csts = readl(dev->bar + NVME_REG_CSTS);
+
+		if (dev->ctrl.state == NVME_CTRL_LIVE)
+			nvme_start_freeze(&dev->ctrl);
+		dead = !!((csts & NVME_CSTS_CFS) || !(csts & NVME_CSTS_RDY) ||
+			pdev->error_state  != pci_channel_io_normal);
 	}
+
+	/*
+	 * Give the controller a chance to complete all entered requests if
+	 * doing a safe shutdown.
+	 */
+	if (!dead && shutdown)
+		nvme_wait_freeze_timeout(&dev->ctrl, NVME_IO_TIMEOUT);
+	nvme_stop_queues(&dev->ctrl);
 
 	queues = dev->online_queues - 1;
 	for (i = dev->queue_count - 1; i > 0; i--)
 		nvme_suspend_queue(dev->queues[i]);
 
-	if (csts & NVME_CSTS_CFS || !(csts & NVME_CSTS_RDY)) {
+	if (dead) {
 		/* A device might become IO incapable very soon during
 		 * probe, before the admin queue is configured. Thus,
 		 * queue_count can be 0 here.
@@ -1740,8 +1643,16 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
 	}
 	nvme_pci_disable(dev);
 
-	for (i = dev->queue_count - 1; i >= 0; i--)
-		nvme_clear_queue(dev->queues[i]);
+	blk_mq_tagset_busy_iter(&dev->tagset, nvme_cancel_request, &dev->ctrl);
+	blk_mq_tagset_busy_iter(&dev->admin_tagset, nvme_cancel_request, &dev->ctrl);
+
+	/*
+	 * The driver will not be starting up queues again if shutting down so
+	 * must flush all entered requests to their failed completion to avoid
+	 * deadlocking blk-mq hot-cpu notifier.
+	 */
+	if (shutdown)
+		nvme_start_queues(&dev->ctrl);
 	mutex_unlock(&dev->shutdown_lock);
 }
 
@@ -1784,7 +1695,7 @@ static void nvme_pci_free_ctrl(struct nvme_ctrl *ctrl)
 
 static void nvme_remove_dead_ctrl(struct nvme_dev *dev, int status)
 {
-	dev_warn(dev->dev, "Removing after probe failure status: %d\n", status);
+	dev_warn(dev->ctrl.device, "Removing after probe failure status: %d\n", status);
 
 	kref_get(&dev->ctrl.kref);
 	nvme_dev_disable(dev, false);
@@ -1797,7 +1708,7 @@ static void nvme_reset_work(struct work_struct *work)
 	struct nvme_dev *dev = container_of(work, struct nvme_dev, reset_work);
 	int result = -ENODEV;
 
-	if (WARN_ON(test_bit(NVME_CTRL_RESETTING, &dev->flags)))
+	if (WARN_ON(dev->ctrl.state == NVME_CTRL_RESETTING))
 		goto out;
 
 	/*
@@ -1807,10 +1718,8 @@ static void nvme_reset_work(struct work_struct *work)
 	if (dev->ctrl.ctrl_config & NVME_CC_ENABLE)
 		nvme_dev_disable(dev, false);
 
-	if (test_bit(NVME_CTRL_REMOVING, &dev->flags))
+	if (!nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_RESETTING))
 		goto out;
-
-	set_bit(NVME_CTRL_RESETTING, &dev->flags);
 
 	result = nvme_pci_enable(dev);
 	if (result)
@@ -1839,10 +1748,8 @@ static void nvme_reset_work(struct work_struct *work)
 	 * should not submit commands the user did not request, so skip
 	 * registering for asynchronous event notification on this condition.
 	 */
-	if (dev->online_queues > 1) {
-		dev->ctrl.event_limit = NVME_NR_AEN_COMMANDS;
-		queue_work(nvme_workq, &dev->async_work);
-	}
+	if (dev->online_queues > 1)
+		nvme_queue_async_events(&dev->ctrl);
 
 	mod_timer(&dev->watchdog_timer, round_jiffies(jiffies + HZ));
 
@@ -1851,14 +1758,23 @@ static void nvme_reset_work(struct work_struct *work)
 	 * any working I/O queue.
 	 */
 	if (dev->online_queues < 2) {
-		dev_warn(dev->dev, "IO queues not created\n");
+		dev_warn(dev->ctrl.device, "IO queues not created\n");
+		nvme_kill_queues(&dev->ctrl);
 		nvme_remove_namespaces(&dev->ctrl);
 	} else {
 		nvme_start_queues(&dev->ctrl);
+		nvme_wait_freeze(&dev->ctrl);
 		nvme_dev_add(dev);
+		nvme_unfreeze(&dev->ctrl);
 	}
 
-	clear_bit(NVME_CTRL_RESETTING, &dev->flags);
+	if (!nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_LIVE)) {
+		dev_warn(dev->ctrl.device, "failed to mark controller live\n");
+		goto out;
+	}
+
+	if (dev->online_queues > 1)
+		nvme_queue_scan(&dev->ctrl);
 	return;
 
  out:
@@ -1916,12 +1832,15 @@ static int nvme_pci_reset_ctrl(struct nvme_ctrl *ctrl)
 }
 
 static const struct nvme_ctrl_ops nvme_pci_ctrl_ops = {
+	.name			= "pcie",
 	.module			= THIS_MODULE,
 	.reg_read32		= nvme_pci_reg_read32,
 	.reg_write32		= nvme_pci_reg_write32,
 	.reg_read64		= nvme_pci_reg_read64,
 	.reset_ctrl		= nvme_pci_reset_ctrl,
 	.free_ctrl		= nvme_pci_free_ctrl,
+	.post_scan		= nvme_pci_post_scan,
+	.submit_async_event	= nvme_pci_submit_async_event,
 };
 
 static int nvme_dev_map(struct nvme_dev *dev)
@@ -1973,10 +1892,8 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (result)
 		goto free;
 
-	INIT_WORK(&dev->scan_work, nvme_dev_scan);
 	INIT_WORK(&dev->reset_work, nvme_reset_work);
 	INIT_WORK(&dev->remove_work, nvme_remove_dead_ctrl_work);
-	INIT_WORK(&dev->async_work, nvme_async_event_work);
 	setup_timer(&dev->watchdog_timer, nvme_watchdog_timer,
 		(unsigned long)dev);
 	mutex_init(&dev->shutdown_lock);
@@ -1990,6 +1907,8 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 			id->driver_data);
 	if (result)
 		goto release_pools;
+
+	dev_info(dev->ctrl.device, "pci function %s\n", dev_name(&pdev->dev));
 
 	queue_work(nvme_workq, &dev->reset_work);
 	return 0;
@@ -2031,12 +1950,14 @@ static void nvme_remove(struct pci_dev *pdev)
 {
 	struct nvme_dev *dev = pci_get_drvdata(pdev);
 
-	set_bit(NVME_CTRL_REMOVING, &dev->flags);
+	nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_DELETING);
+
 	pci_set_drvdata(pdev, NULL);
-	flush_work(&dev->async_work);
+
+	if (!pci_device_is_present(pdev))
+		nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_DEAD);
+
 	flush_work(&dev->reset_work);
-	flush_work(&dev->scan_work);
-	nvme_remove_namespaces(&dev->ctrl);
 	nvme_uninit_ctrl(&dev->ctrl);
 	nvme_dev_disable(dev, true);
 	flush_work(&dev->reset_work);
@@ -2046,6 +1967,24 @@ static void nvme_remove(struct pci_dev *pdev)
 	nvme_release_prp_pools(dev);
 	nvme_dev_unmap(dev);
 	nvme_put_ctrl(&dev->ctrl);
+}
+
+static int nvme_pci_sriov_configure(struct pci_dev *pdev, int numvfs)
+{
+	int ret = 0;
+
+	if (numvfs == 0) {
+		if (pci_vfs_assigned(pdev)) {
+			dev_warn(&pdev->dev,
+				"Cannot disable SR-IOV VFs while assigned\n");
+			return -EPERM;
+		}
+		pci_disable_sriov(pdev);
+		return 0;
+	}
+
+	ret = pci_enable_sriov(pdev, numvfs);
+	return ret ? ret : numvfs;
 }
 
 static int nvme_suspend(struct device *dev)
@@ -2078,14 +2017,17 @@ static pci_ers_result_t nvme_error_detected(struct pci_dev *pdev,
 	 * shutdown the controller to quiesce. The controller will be restarted
 	 * after the slot reset through driver's slot_reset callback.
 	 */
-	dev_warn(&pdev->dev, "error detected: state:%d\n", state);
 	switch (state) {
 	case pci_channel_io_normal:
 		return PCI_ERS_RESULT_CAN_RECOVER;
 	case pci_channel_io_frozen:
+		dev_warn(dev->ctrl.device,
+			"frozen state error detected, reset controller\n");
 		nvme_dev_disable(dev, false);
 		return PCI_ERS_RESULT_NEED_RESET;
 	case pci_channel_io_perm_failure:
+		dev_warn(dev->ctrl.device,
+			"failure state error detected, request disconnect\n");
 		return PCI_ERS_RESULT_DISCONNECT;
 	}
 	return PCI_ERS_RESULT_NEED_RESET;
@@ -2095,7 +2037,7 @@ static pci_ers_result_t nvme_slot_reset(struct pci_dev *pdev)
 {
 	struct nvme_dev *dev = pci_get_drvdata(pdev);
 
-	dev_info(&pdev->dev, "restart after slot reset\n");
+	dev_info(dev->ctrl.device, "restart after slot reset\n");
 	pci_restore_state(pdev);
 	nvme_reset(dev);
 	return PCI_ERS_RESULT_RECOVERED;
@@ -2147,6 +2089,7 @@ static struct pci_driver nvme_driver = {
 	.driver		= {
 		.pm	= &nvme_dev_pm_ops,
 	},
+	.sriov_configure = nvme_pci_sriov_configure,
 	.err_handler	= &nvme_err_handler,
 	.pci_driver_rh	= &nvme_driver_rh
 };
@@ -2159,26 +2102,15 @@ static int __init nvme_init(void)
 	if (!nvme_workq)
 		return -ENOMEM;
 
-	result = nvme_core_init();
-	if (result < 0)
-		goto kill_workq;
-
 	result = pci_register_driver(&nvme_driver);
 	if (result)
-		goto core_exit;
-	return 0;
-
- core_exit:
-	nvme_core_exit();
- kill_workq:
-	destroy_workqueue(nvme_workq);
+		destroy_workqueue(nvme_workq);
 	return result;
 }
 
 static void __exit nvme_exit(void)
 {
 	pci_unregister_driver(&nvme_driver);
-	nvme_core_exit();
 	destroy_workqueue(nvme_workq);
 	_nvme_check_size();
 }

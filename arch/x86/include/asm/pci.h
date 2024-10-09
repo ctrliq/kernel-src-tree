@@ -23,6 +23,9 @@ struct pci_sysdata {
 #ifdef CONFIG_PCI_MSI
 	struct x86_msi_ops *msi_ops;
 #endif
+#if IS_ENABLED(CONFIG_VMD)
+	bool vmd_domain;		/* True if in Intel VMD domain */
+#endif
 };
 
 extern int pci_routeirq;
@@ -43,6 +46,17 @@ static inline int pci_proc_domain(struct pci_bus *bus)
 	return pci_domain_nr(bus);
 }
 #endif
+
+static inline bool is_vmd(struct pci_bus *bus)
+{
+#if IS_ENABLED(CONFIG_VMD)
+	struct pci_sysdata *sd = bus->sysdata;
+
+	return sd->vmd_domain;
+#else
+	return false;
+#endif
+}
 
 /* Can be used to override the logic in pci_scan_bus for skipping
    already-configured bus numbers - to be used for buggy BIOSes

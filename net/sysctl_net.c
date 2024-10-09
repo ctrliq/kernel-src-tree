@@ -29,7 +29,7 @@
 static struct ctl_table_set *
 net_ctl_header_lookup(struct ctl_table_root *root, struct nsproxy *namespaces)
 {
-	return &namespaces->net_ns->sysctls;
+	return &current->nsproxy->net_ns->sysctls;
 }
 
 static int is_seen(struct ctl_table_set *set)

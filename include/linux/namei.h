@@ -20,6 +20,7 @@ struct nameidata {
 	int		last_type;
 	unsigned	depth;
 	char *saved_names[MAX_NESTED_LINKS + 1];
+	RH_KABI_EXTEND(unsigned  m_seq)
 };
 
 /*
@@ -74,9 +75,6 @@ extern int kern_path_mountpoint(int, const char *, struct path *, unsigned int);
 
 extern struct dentry *lookup_one_len(const char *, struct dentry *, int);
 extern struct dentry *lookup_one_len_unlocked(const char *, struct dentry *, int);
-struct qstr;
-extern struct dentry *lookup_hash(struct qstr *, struct dentry *);
-
 
 extern int follow_down_one(struct path *);
 extern int follow_down(struct path *);

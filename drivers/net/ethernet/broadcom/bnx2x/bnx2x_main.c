@@ -12082,8 +12082,7 @@ static int bnx2x_get_hwinfo(struct bnx2x *bp)
 					   mtu_size, mtu);
 
 					/* if valid: update device mtu */
-					if (((mtu_size + ETH_HLEN) >=
-					     ETH_MIN_PACKET_SIZE) &&
+					if ((mtu_size >= ETH_MIN_PACKET_SIZE) &&
 					    (mtu_size <=
 					     ETH_MAX_JUMBO_PACKET_SIZE))
 						bp->dev->mtu = mtu_size;
@@ -13064,6 +13063,7 @@ static int bnx2x_vlan_rx_kill_vid(struct net_device *dev, __be16 proto, u16 vid)
 }
 
 static const struct net_device_ops bnx2x_netdev_ops = {
+	.ndo_size		= sizeof(struct net_device_ops),
 	.ndo_open		= bnx2x_open,
 	.ndo_stop		= bnx2x_close,
 	.ndo_start_xmit		= bnx2x_start_xmit,
@@ -13084,7 +13084,7 @@ static const struct net_device_ops bnx2x_netdev_ops = {
 	.ndo_setup_tc		= __bnx2x_setup_tc,
 #ifdef CONFIG_BNX2X_SRIOV
 	.ndo_set_vf_mac		= bnx2x_set_vf_mac,
-	.ndo_set_vf_vlan	= bnx2x_set_vf_vlan,
+	.extended.ndo_set_vf_vlan	= bnx2x_set_vf_vlan,
 	.ndo_get_vf_config	= bnx2x_get_vf_config,
 #endif
 #ifdef NETDEV_FCOE_WWNN
@@ -13094,8 +13094,8 @@ static const struct net_device_ops bnx2x_netdev_ops = {
 	.ndo_get_phys_port_id	= bnx2x_get_phys_port_id,
 	.ndo_set_vf_link_state	= bnx2x_set_vf_link_state,
 	.ndo_features_check	= bnx2x_features_check,
-	.ndo_udp_tunnel_add	= bnx2x_udp_tunnel_add,
-	.ndo_udp_tunnel_del	= bnx2x_udp_tunnel_del,
+	.extended.ndo_udp_tunnel_add	= bnx2x_udp_tunnel_add,
+	.extended.ndo_udp_tunnel_del	= bnx2x_udp_tunnel_del,
 };
 
 static int bnx2x_set_coherency_mask(struct bnx2x *bp)
@@ -13274,14 +13274,23 @@ static int bnx2x_init_dev(struct bnx2x *bp, struct pci_dev *pdev,
 		NETIF_F_RXCSUM | NETIF_F_LRO | NETIF_F_GRO |
 		NETIF_F_RXHASH | NETIF_F_HW_VLAN_CTAG_TX;
 	if (!chip_is_e1x) {
-		dev->hw_features |= NETIF_F_GSO_GRE | NETIF_F_GSO_UDP_TUNNEL |
-				    NETIF_F_GSO_IPIP | NETIF_F_GSO_SIT;
+		dev->hw_features |= NETIF_F_GSO_GRE | NETIF_F_GSO_GRE_CSUM |
+				    NETIF_F_GSO_IPIP | NETIF_F_GSO_SIT |
+				    NETIF_F_GSO_UDP_TUNNEL |
+				    NETIF_F_GSO_UDP_TUNNEL_CSUM |
+				    NETIF_F_GSO_PARTIAL;
+
 		dev->hw_enc_features =
 			NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM | NETIF_F_SG |
 			NETIF_F_TSO | NETIF_F_TSO_ECN | NETIF_F_TSO6 |
 			NETIF_F_GSO_IPIP |
 			NETIF_F_GSO_SIT |
-			NETIF_F_GSO_GRE | NETIF_F_GSO_UDP_TUNNEL;
+			NETIF_F_GSO_GRE | NETIF_F_GSO_GRE_CSUM |
+			NETIF_F_GSO_UDP_TUNNEL | NETIF_F_GSO_UDP_TUNNEL_CSUM |
+			NETIF_F_GSO_PARTIAL;
+
+		dev->gso_partial_features = NETIF_F_GSO_GRE_CSUM |
+					    NETIF_F_GSO_UDP_TUNNEL_CSUM;
 	}
 
 	dev->vlan_features = NETIF_F_SG | NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
@@ -13305,6 +13314,12 @@ static int bnx2x_init_dev(struct bnx2x *bp, struct pci_dev *pdev,
 
 #ifdef BCM_DCBNL
 	dev->dcbnl_ops = &bnx2x_dcbnl_ops;
+#endif
+
+#if 0  /* Not in RHEL 7.4. mtu range check remains in bnx2x_change_mtu(). */
+	/* MTU range, 46 - 9600 */
+	dev->min_mtu = ETH_MIN_PACKET_SIZE;
+	dev->max_mtu = ETH_MAX_JUMBO_PACKET_SIZE;
 #endif
 
 	/* get_port_hwinfo() will set prtad and mmds properly */

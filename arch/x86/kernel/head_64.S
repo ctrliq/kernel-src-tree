@@ -37,7 +37,7 @@
 
 #define pud_index(x)	(((x) >> PUD_SHIFT) & (PTRS_PER_PUD-1))
 
-L4_PAGE_OFFSET = pgd_index(__PAGE_OFFSET)
+L4_PAGE_OFFSET = pgd_index(__PAGE_OFFSET_BASE)
 L4_START_KERNEL = pgd_index(__START_KERNEL_map)
 L3_START_KERNEL = pud_index(__START_KERNEL_map)
 
@@ -328,26 +328,28 @@ bad_address:
 	jmp bad_address
 
 	__INIT
-	.globl early_idt_handlers
-early_idt_handlers:
+ENTRY(early_idt_handler_array)
 	# 104(%rsp) %rflags
 	#  96(%rsp) %cs
 	#  88(%rsp) %rip
 	#  80(%rsp) error code
 	i = 0
 	.rept NUM_EXCEPTION_VECTORS
-	.if (EXCEPTION_ERRCODE_MASK >> i) & 1
-	ASM_NOP2
-	.else
+	.ifeq (EXCEPTION_ERRCODE_MASK >> i) & 1
 	pushq $0		# Dummy error code, to make stack frame uniform
 	.endif
 	pushq $i		# 72(%rsp) Vector number
-	jmp early_idt_handler
+	jmp early_idt_handler_common
 	i = i + 1
+	.fill early_idt_handler_array + i*EARLY_IDT_HANDLER_SIZE - ., 1, 0xcc
 	.endr
+ENDPROC(early_idt_handler_array)
 
-/* This is global to keep gas from relaxing the jumps */
-ENTRY(early_idt_handler)
+early_idt_handler_common:
+	/*
+	 * The stack is the hardware frame, an error code or zero, and the
+	 * vector number.
+	 */
 	cld
 
 	cmpl $2,(%rsp)		# X86_TRAP_NMI
@@ -419,7 +421,7 @@ ENTRY(early_idt_handler)
 is_nmi:
 	addq $16,%rsp		# drop vector number and error code
 	INTERRUPT_RETURN
-ENDPROC(early_idt_handler)
+ENDPROC(early_idt_handler_common)
 
 	__INITDATA
 
@@ -523,21 +525,6 @@ ENTRY(phys_base)
 
 #include "../../x86/xen/xen-head.S"
 	
-	.section .bss, "aw", @nobits
-	.align PAGE_SIZE
-ENTRY(idt_table)
-	.skip IDT_ENTRIES * 16
-
-	.align L1_CACHE_BYTES
-ENTRY(debug_idt_table)
-	.skip IDT_ENTRIES * 16
-
-#ifdef CONFIG_TRACING
-	.align L1_CACHE_BYTES
-ENTRY(trace_idt_table)
-	.skip IDT_ENTRIES * 16
-#endif
-
 	__PAGE_ALIGNED_BSS
 NEXT_PAGE(empty_zero_page)
 	.skip PAGE_SIZE

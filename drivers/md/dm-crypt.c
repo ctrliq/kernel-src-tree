@@ -1451,7 +1451,7 @@ static int crypt_alloc_tfms(struct crypt_config *cc, char *ciphermode)
 	unsigned i;
 	int err;
 
-	cc->tfms = kmalloc(cc->tfms_count * sizeof(struct crypto_ablkcipher *),
+	cc->tfms = kzalloc(cc->tfms_count * sizeof(struct crypto_ablkcipher *),
 			   GFP_KERNEL);
 	if (!cc->tfms)
 		return -ENOMEM;
@@ -1519,10 +1519,14 @@ out:
 
 static int crypt_wipe_key(struct crypt_config *cc)
 {
+	int r;
+
 	clear_bit(DM_CRYPT_KEY_VALID, &cc->flags);
+	get_random_bytes(&cc->key, cc->key_size);
+	r = crypt_setkey(cc);
 	memset(&cc->key, 0, cc->key_size * sizeof(u8));
 
-	return crypt_setkey(cc);
+	return r;
 }
 
 static void crypt_dtr(struct dm_target *ti)

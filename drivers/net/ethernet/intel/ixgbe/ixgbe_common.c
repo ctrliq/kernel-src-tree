@@ -100,6 +100,8 @@ bool ixgbe_device_supports_autoneg_fc(struct ixgbe_hw *hw)
 		case IXGBE_DEV_ID_X550T1:
 		case IXGBE_DEV_ID_X550EM_X_10G_T:
 		case IXGBE_DEV_ID_X550EM_A_10G_T:
+		case IXGBE_DEV_ID_X550EM_A_1G_T:
+		case IXGBE_DEV_ID_X550EM_A_1G_T_L:
 			supported = true;
 			break;
 		default:
@@ -278,6 +280,7 @@ s32 ixgbe_start_hw_generic(struct ixgbe_hw *hw)
 {
 	s32 ret_val;
 	u32 ctrl_ext;
+	u16 device_caps;
 
 	/* Set the media type */
 	hw->phy.media_type = hw->mac.ops.get_media_type(hw);
@@ -302,6 +305,22 @@ s32 ixgbe_start_hw_generic(struct ixgbe_hw *hw)
 		ret_val = hw->mac.ops.setup_fc(hw);
 		if (ret_val)
 			return ret_val;
+	}
+
+	/* Cashe bit indicating need for crosstalk fix */
+	switch (hw->mac.type) {
+	case ixgbe_mac_82599EB:
+	case ixgbe_mac_X550EM_x:
+	case ixgbe_mac_x550em_a:
+		hw->mac.ops.get_device_caps(hw, &device_caps);
+		if (device_caps & IXGBE_DEVICE_CAPS_NO_CROSSTALK_WR)
+			hw->need_crosstalk_fix = false;
+		else
+			hw->need_crosstalk_fix = true;
+		break;
+	default:
+		hw->need_crosstalk_fix = false;
+		break;
 	}
 
 	/* Clear adapter stopped flag */
@@ -3251,6 +3270,31 @@ s32 ixgbe_clear_vfta_generic(struct ixgbe_hw *hw)
 }
 
 /**
+ *  ixgbe_need_crosstalk_fix - Determine if we need to do cross talk fix
+ *  @hw: pointer to hardware structure
+ *
+ *  Contains the logic to identify if we need to verify link for the
+ *  crosstalk fix
+ **/
+static bool ixgbe_need_crosstalk_fix(struct ixgbe_hw *hw)
+{
+	/* Does FW say we need the fix */
+	if (!hw->need_crosstalk_fix)
+		return false;
+
+	/* Only consider SFP+ PHYs i.e. media type fiber */
+	switch (hw->mac.ops.get_media_type(hw)) {
+	case ixgbe_media_type_fiber:
+	case ixgbe_media_type_fiber_qsfp:
+		break;
+	default:
+		return false;
+	}
+
+	return true;
+}
+
+/**
  *  ixgbe_check_mac_link_generic - Determine link and speed status
  *  @hw: pointer to hardware structure
  *  @speed: pointer to link speed
@@ -3264,6 +3308,35 @@ s32 ixgbe_check_mac_link_generic(struct ixgbe_hw *hw, ixgbe_link_speed *speed,
 {
 	u32 links_reg, links_orig;
 	u32 i;
+
+	/* If Crosstalk fix enabled do the sanity check of making sure
+	 * the SFP+ cage is full.
+	 */
+	if (ixgbe_need_crosstalk_fix(hw)) {
+		u32 sfp_cage_full;
+
+		switch (hw->mac.type) {
+		case ixgbe_mac_82599EB:
+			sfp_cage_full = IXGBE_READ_REG(hw, IXGBE_ESDP) &
+					IXGBE_ESDP_SDP2;
+			break;
+		case ixgbe_mac_X550EM_x:
+		case ixgbe_mac_x550em_a:
+			sfp_cage_full = IXGBE_READ_REG(hw, IXGBE_ESDP) &
+					IXGBE_ESDP_SDP0;
+			break;
+		default:
+			/* sanity check - No SFP+ devices here */
+			sfp_cage_full = false;
+			break;
+		}
+
+		if (!sfp_cage_full) {
+			*link_up = false;
+			*speed = IXGBE_LINK_SPEED_UNKNOWN;
+			return 0;
+		}
+	}
 
 	/* clear the old state */
 	links_orig = IXGBE_READ_REG(hw, IXGBE_LINKS);
@@ -3310,6 +3383,13 @@ s32 ixgbe_check_mac_link_generic(struct ixgbe_hw *hw, ixgbe_link_speed *speed,
 			*speed = IXGBE_LINK_SPEED_5GB_FULL;
 		else
 			*speed = IXGBE_LINK_SPEED_100_FULL;
+		break;
+	case IXGBE_LINKS_SPEED_10_X550EM_A:
+		*speed = IXGBE_LINK_SPEED_UNKNOWN;
+		if (hw->device_id == IXGBE_DEV_ID_X550EM_A_1G_T ||
+		    hw->device_id == IXGBE_DEV_ID_X550EM_A_1G_T_L) {
+			*speed = IXGBE_LINK_SPEED_10_FULL;
+		}
 		break;
 	default:
 		*speed = IXGBE_LINK_SPEED_UNKNOWN;

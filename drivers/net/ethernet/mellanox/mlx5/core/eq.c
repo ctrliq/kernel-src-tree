@@ -88,14 +88,10 @@ static int mlx5_cmd_destroy_eq(struct mlx5_core_dev *dev, u8 eqn)
 {
 	u32 out[MLX5_ST_SZ_DW(destroy_eq_out)] = {0};
 	u32 in[MLX5_ST_SZ_DW(destroy_eq_in)]   = {0};
-	int err;
 
 	MLX5_SET(destroy_eq_in, in, opcode, MLX5_CMD_OP_DESTROY_EQ);
 	MLX5_SET(destroy_eq_in, in, eq_number, eqn);
-
-	err = mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
-	return err ? : mlx5_cmd_status_to_err_v2(out);
-
+	return mlx5_cmd_exec(dev, in, sizeof(in), out, sizeof(out));
 }
 
 static struct mlx5_eqe *get_eqe(struct mlx5_eq *eq, u32 entry)
@@ -143,6 +139,8 @@ static const char *eqe_type_str(u8 type)
 		return "MLX5_EVENT_TYPE_PORT_CHANGE";
 	case MLX5_EVENT_TYPE_GPIO_EVENT:
 		return "MLX5_EVENT_TYPE_GPIO_EVENT";
+	case MLX5_EVENT_TYPE_PORT_MODULE_EVENT:
+		return "MLX5_EVENT_TYPE_PORT_MODULE_EVENT";
 	case MLX5_EVENT_TYPE_REMOTE_CONFIG:
 		return "MLX5_EVENT_TYPE_REMOTE_CONFIG";
 	case MLX5_EVENT_TYPE_DB_BF_CONGESTION:
@@ -155,6 +153,8 @@ static const char *eqe_type_str(u8 type)
 		return "MLX5_EVENT_TYPE_PAGE_REQUEST";
 	case MLX5_EVENT_TYPE_PAGE_FAULT:
 		return "MLX5_EVENT_TYPE_PAGE_FAULT";
+	case MLX5_EVENT_TYPE_PPS_EVENT:
+		return "MLX5_EVENT_TYPE_PPS_EVENT";
 	default:
 		return "Unrecognized event";
 	}
@@ -289,6 +289,15 @@ static int mlx5_eq_int(struct mlx5_core_dev *dev, struct mlx5_eq *eq)
 			mlx5_eswitch_vport_event(dev->priv.eswitch, eqe);
 			break;
 #endif
+
+		case MLX5_EVENT_TYPE_PORT_MODULE_EVENT:
+			mlx5_port_module_event(dev, eqe);
+			break;
+
+		case MLX5_EVENT_TYPE_PPS_EVENT:
+			if (dev->event)
+				dev->event(dev, MLX5_DEV_EVENT_PPS, (unsigned long)eqe);
+			break;
 		default:
 			mlx5_core_warn(dev, "Unhandled event 0x%x on EQ 0x%x\n",
 				       eqe->type, eq->eqn);
@@ -383,7 +392,6 @@ int mlx5_create_map_eq(struct mlx5_core_dev *dev, struct mlx5_eq *eq, u8 vecidx,
 		 eq->buf.page_shift - MLX5_ADAPTER_PAGE_SHIFT);
 
 	err = mlx5_cmd_exec(dev, in, inlen, out, sizeof(out));
-	err = err ? : mlx5_cmd_status_to_err_v2(out);
 	if (err)
 		goto err_in;
 
@@ -485,6 +493,14 @@ int mlx5_start_eqs(struct mlx5_core_dev *dev)
 	    mlx5_core_is_pf(dev))
 		async_event_mask |= (1ull << MLX5_EVENT_TYPE_NIC_VPORT_CHANGE);
 
+	if (MLX5_CAP_GEN(dev, port_module_event))
+		async_event_mask |= (1ull << MLX5_EVENT_TYPE_PORT_MODULE_EVENT);
+	else
+		mlx5_core_dbg(dev, "port_module_event is not set\n");
+
+	if (MLX5_CAP_GEN(dev, pps))
+		async_event_mask |= (1ull << MLX5_EVENT_TYPE_PPS_EVENT);
+
 	err = mlx5_create_map_eq(dev, &table->cmd_eq, MLX5_EQ_VEC_CMD,
 				 MLX5_NUM_CMD_EQE, 1ull << MLX5_EVENT_TYPE_CMD,
 				 "mlx5_cmd_eq", &dev->priv.uuari.uars[0]);
@@ -547,12 +563,9 @@ int mlx5_core_eq_query(struct mlx5_core_dev *dev, struct mlx5_eq *eq,
 		       u32 *out, int outlen)
 {
 	u32 in[MLX5_ST_SZ_DW(query_eq_in)] = {0};
-	int err;
 
 	MLX5_SET(query_eq_in, in, opcode, MLX5_CMD_OP_QUERY_EQ);
 	MLX5_SET(query_eq_in, in, eq_number, eq->eqn);
-
-	err = mlx5_cmd_exec(dev, in, sizeof(in), out, outlen);
-	return err ? : mlx5_cmd_status_to_err_v2(out);
+	return mlx5_cmd_exec(dev, in, sizeof(in), out, outlen);
 }
 EXPORT_SYMBOL_GPL(mlx5_core_eq_query);

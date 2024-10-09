@@ -8,7 +8,7 @@
 #include "builtin.h"
 
 #include "util/util.h"
-#include "util/cache.h"
+#include "util/config.h"
 
 #include "util/annotate.h"
 #include "util/color.h"
@@ -246,7 +246,7 @@ static int report__setup_sample_type(struct report *rep)
 		sample_type |= PERF_SAMPLE_BRANCH_STACK;
 
 	if (!is_pipe && !(sample_type & PERF_SAMPLE_CALLCHAIN)) {
-		if (sort__has_parent) {
+		if (perf_hpp_list.parent) {
 			ui__error("Selected --sort parent, but no "
 				    "callchain data. Did you call "
 				    "'perf record' without -g?\n");
@@ -373,7 +373,7 @@ static int perf_evlist__tty_browse_hists(struct perf_evlist *evlist,
 	struct perf_evsel *pos;
 
 	fprintf(stdout, "#\n# Total Lost Samples: %" PRIu64 "\n#\n", evlist->stats.total_lost_samples);
-	evlist__for_each(evlist, pos) {
+	evlist__for_each_entry(evlist, pos) {
 		struct hists *hists = evsel__hists(pos);
 		const char *evname = perf_evsel__name(pos);
 
@@ -490,7 +490,7 @@ static int report__collapse_hists(struct report *rep)
 
 	ui_progress__init(&prog, rep->nr_entries, "Merging related events...");
 
-	evlist__for_each(rep->session->evlist, pos) {
+	evlist__for_each_entry(rep->session->evlist, pos) {
 		struct hists *hists = evsel__hists(pos);
 
 		if (pos->idx == 0)
@@ -523,7 +523,7 @@ static void report__output_resort(struct report *rep)
 
 	ui_progress__init(&prog, rep->nr_entries, "Sorting events for output...");
 
-	evlist__for_each(rep->session->evlist, pos)
+	evlist__for_each_entry(rep->session->evlist, pos)
 		perf_evsel__output_resort(pos, &prog);
 
 	ui_progress__finish();
@@ -567,7 +567,7 @@ static int __cmd_report(struct report *rep)
 
 	report__warn_kptr_restrict(rep);
 
-	evlist__for_each(session->evlist, pos)
+	evlist__for_each_entry(session->evlist, pos)
 		rep->nr_entries += evsel__hists(pos)->nr_entries;
 
 	if (use_browser == 0) {
@@ -598,7 +598,7 @@ static int __cmd_report(struct report *rep)
 	 * might be changed during the collapse phase.
 	 */
 	rep->nr_entries = 0;
-	evlist__for_each(session->evlist, pos)
+	evlist__for_each_entry(session->evlist, pos)
 		rep->nr_entries += evsel__hists(pos)->nr_entries;
 
 	if (rep->nr_entries == 0) {
@@ -707,7 +707,7 @@ int cmd_report(int argc, const char **argv, const char *prefix __maybe_unused)
 			.ordered_events	 = true,
 			.ordering_requires_timestamps = true,
 		},
-		.max_stack		 = PERF_MAX_STACK_DEPTH,
+		.max_stack		 = sysctl_perf_event_max_stack,
 		.pretty_printing_style	 = "normal",
 		.socket_filter		 = -1,
 	};
@@ -760,7 +760,7 @@ int cmd_report(int argc, const char **argv, const char *prefix __maybe_unused)
 	OPT_INTEGER(0, "max-stack", &report.max_stack,
 		    "Set the maximum stack depth when parsing the callchain, "
 		    "anything beyond the specified depth will be ignored. "
-		    "Default: " __stringify(PERF_MAX_STACK_DEPTH)),
+		    "Default: kernel.perf_event_max_stack or " __stringify(PERF_MAX_STACK_DEPTH)),
 	OPT_BOOLEAN('G', "inverted", &report.inverted_callchain,
 		    "alias for inverted call graph"),
 	OPT_CALLBACK(0, "ignore-callees", NULL, "regex",
@@ -847,7 +847,9 @@ int cmd_report(int argc, const char **argv, const char *prefix __maybe_unused)
 	if (ret < 0)
 		return ret;
 
-	perf_config(report__config, &report);
+	ret = perf_config(report__config, &report);
+	if (ret)
+		return ret;
 
 	argc = parse_options(argc, argv, options, report_usage, 0);
 	if (argc) {

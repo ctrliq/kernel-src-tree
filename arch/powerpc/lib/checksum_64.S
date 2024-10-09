@@ -18,54 +18,6 @@
 #include <asm/ppc_asm.h>
 
 /*
- * ip_fast_csum(r3=buf, r4=len) -- Optimized for IP header
- * len is in words and is always >= 5.
- *
- * In practice len == 5, but this is not guaranteed.  So this code does not
- * attempt to use doubleword instructions.
- */
-_GLOBAL(ip_fast_csum)
-	lwz	r0,0(r3)
-	lwzu	r5,4(r3)
-	addic.	r4,r4,-2
-	addc	r0,r0,r5
-	mtctr	r4
-	blelr-
-1:	lwzu	r4,4(r3)
-	adde	r0,r0,r4
-	bdnz	1b
-	addze	r0,r0		/* add in final carry */
-        rldicl  r4,r0,32,0      /* fold two 32-bit halves together */
-        add     r0,r0,r4
-        srdi    r0,r0,32
-	rlwinm	r3,r0,16,0,31	/* fold two halves together */
-	add	r3,r0,r3
-	not	r3,r3
-	srwi	r3,r3,16
-	blr
-
-/*
- * Compute checksum of TCP or UDP pseudo-header:
- *   csum_tcpudp_magic(r3=saddr, r4=daddr, r5=len, r6=proto, r7=sum)
- * No real gain trying to do this specially for 64 bit, but
- * the 32 bit addition may spill into the upper bits of
- * the doubleword so we still must fold it down from 64.
- */	
-_GLOBAL(csum_tcpudp_magic)
-	rlwimi	r5,r6,16,0,15	/* put proto in upper half of len */
-	addc	r0,r3,r4	/* add 4 32-bit words together */
-	adde	r0,r0,r5
-	adde	r0,r0,r7
-        rldicl  r4,r0,32,0      /* fold 64 bit value */
-        add     r0,r4,r0
-        srdi    r0,r0,32
-	rlwinm	r3,r0,16,0,31	/* fold two halves together */
-	add	r3,r0,r3
-	not	r3,r3
-	srwi	r3,r3,16
-	blr
-
-/*
  * Computes the checksum of a memory block at buff, length len,
  * and adds in "sum" (32-bit).
  *
@@ -83,7 +35,7 @@ _GLOBAL(csum_partial)
 	 * work to calculate the correct checksum, we ignore that case
 	 * and take the potential slowdown of unaligned loads.
 	 */
-	rldicl. r6,r3,64-1,64-2		/* r6 = (r3 & 0x3) >> 1 */
+	rldicl. r6,r3,64-1,64-2		/* r6 = (r3 >> 1) & 0x3 */
 	beq	.Lcsum_aligned
 
 	li	r7,4
@@ -215,8 +167,12 @@ _GLOBAL(csum_partial)
 	beq	.Lcsum_finish
 
 	lbz	r6,0(r3)
+#ifdef __BIG_ENDIAN__
 	sldi	r9,r6,8			/* Pad the byte out to 16 bits */
 	adde	r0,r0,r9
+#else
+	adde	r0,r0,r6
+#endif
 
 .Lcsum_finish:
 	addze	r0,r0			/* add in final carry */
@@ -282,7 +238,7 @@ _GLOBAL(csum_partial_copy_generic)
 	 * If the source and destination are relatively unaligned we only
 	 * align the source. This keeps things simple.
 	 */
-	rldicl. r6,r3,64-1,64-2		/* r6 = (r3 & 0x3) >> 1 */
+	rldicl. r6,r3,64-1,64-2		/* r6 = (r3 >> 1) & 0x3 */
 	beq	.Lcopy_aligned
 
 	li	r9,4
@@ -444,8 +400,12 @@ dstnr;	sth	r6,0(r4)
 	beq	.Lcopy_finish
 
 srcnr;	lbz	r6,0(r3)
+#ifdef __BIG_ENDIAN__
 	sldi	r9,r6,8			/* Pad the byte out to 16 bits */
 	adde	r0,r0,r9
+#else
+	adde	r0,r0,r6
+#endif
 dstnr;	stb	r6,0(r4)
 
 .Lcopy_finish:

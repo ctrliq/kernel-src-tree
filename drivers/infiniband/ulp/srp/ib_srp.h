@@ -91,7 +91,6 @@ struct srp_device {
 	struct list_head	dev_list;
 	struct ib_device       *dev;
 	struct ib_pd	       *pd;
-	struct ib_mr	       *global_mr;
 	u64			mr_page_mask;
 	int			mr_page_size;
 	int			mr_max_size;
@@ -165,6 +164,7 @@ struct srp_rdma_ch {
 	int			max_ti_iu_len;
 	int			comp_vector;
 
+	u64			tsk_mgmt_tag;
 	struct completion	tsk_mgmt_done;
 	u8			tsk_mgmt_status;
 	bool			connected;
@@ -181,7 +181,7 @@ struct srp_target_port {
 
 	/* read only in the hot path */
 	struct srp_rdma_ch	*ch;
-	struct ib_mr		*global_mr;
+	struct ib_pd		*pd;
 	u32			ch_count;
 	u32			lkey;
 	enum srp_target_state	state;

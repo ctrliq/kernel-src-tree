@@ -1731,14 +1731,14 @@ static int do_device_access(struct scsi_cmnd *scmd,
 
 	ret = sg_copy_buffer(sdb->table.sgl, sdb->table.nents,
 		   fake_storep + (block * scsi_debug_sector_size),
-		   (num - rest) * scsi_debug_sector_size, 0, do_write);
+		   (num - rest) * scsi_debug_sector_size, 0, write);
 	if (ret != (num - rest) * scsi_debug_sector_size)
 		return ret;
 
 	if (rest) {
 		ret += sg_copy_buffer(sdb->table.sgl, sdb->table.nents,
 			    fake_storep, rest * scsi_debug_sector_size,
-			    (num - rest) * scsi_debug_sector_size, do_write);
+			    (num - rest) * scsi_debug_sector_size, write);
 	}
 
 	return ret;

@@ -92,6 +92,8 @@
 #define IXGBE_DEV_ID_X550EM_A_SGMII_L	0x15C7
 #define IXGBE_DEV_ID_X550EM_A_10G_T	0x15C8
 #define IXGBE_DEV_ID_X550EM_A_SFP	0x15CE
+#define IXGBE_DEV_ID_X550EM_A_1G_T	0x15E4
+#define IXGBE_DEV_ID_X550EM_A_1G_T_L	0x15E5
 
 /* VF Device IDs */
 #define IXGBE_DEV_ID_82599_VF		0x10ED
@@ -487,6 +489,13 @@ struct ixgbe_thermal_sensor_data {
 #define IXGBE_FHFT(_n)	(0x09000 + ((_n) * 0x100)) /* Flex host filter table */
 #define IXGBE_FHFT_EXT(_n)	(0x09800 + ((_n) * 0x100)) /* Ext Flexible Host
 							    * Filter Table */
+
+/* masks for accessing VXLAN and GENEVE UDP ports */
+#define IXGBE_VXLANCTRL_VXLAN_UDPPORT_MASK     0x0000ffff /* VXLAN port */
+#define IXGBE_VXLANCTRL_GENEVE_UDPPORT_MASK    0xffff0000 /* GENEVE port */
+#define IXGBE_VXLANCTRL_ALL_UDPPORT_MASK       0xffffffff /* GENEVE/VXLAN */
+
+#define IXGBE_VXLANCTRL_GENEVE_UDPPORT_SHIFT   16
 
 #define IXGBE_FLEXIBLE_FILTER_COUNT_MAX         4
 #define IXGBE_EXT_FLEXIBLE_FILTER_COUNT_MAX     2
@@ -1909,6 +1918,7 @@ enum {
 #define IXGBE_LINKS_SPEED_10G_82599 0x30000000
 #define IXGBE_LINKS_SPEED_1G_82599  0x20000000
 #define IXGBE_LINKS_SPEED_100_82599 0x10000000
+#define IXGBE_LINKS_SPEED_10_X550EM_A 0
 #define IXGBE_LINK_UP_TIME      90 /* 9.0 Seconds */
 #define IXGBE_AUTO_NEG_TIME     45 /* 4.5 Seconds */
 
@@ -2921,6 +2931,7 @@ typedef u32 ixgbe_autoneg_advertised;
 /* Link speed */
 typedef u32 ixgbe_link_speed;
 #define IXGBE_LINK_SPEED_UNKNOWN	0
+#define IXGBE_LINK_SPEED_10_FULL	0x0002
 #define IXGBE_LINK_SPEED_100_FULL	0x0008
 #define IXGBE_LINK_SPEED_1GB_FULL	0x0020
 #define IXGBE_LINK_SPEED_2_5GB_FULL	0x0400
@@ -3136,6 +3147,7 @@ enum ixgbe_phy_type {
 	ixgbe_phy_qsfp_unknown,
 	ixgbe_phy_sfp_unsupported,
 	ixgbe_phy_sgmii,
+	ixgbe_phy_fw,
 	ixgbe_phy_generic
 };
 
@@ -3550,6 +3562,8 @@ struct ixgbe_phy_info {
 	bool                            reset_disable;
 	ixgbe_autoneg_advertised        autoneg_advertised;
 	ixgbe_link_speed		speeds_supported;
+	ixgbe_link_speed		eee_speeds_supported;
+	ixgbe_link_speed		eee_speeds_advertised;
 	enum ixgbe_smart_speed          smart_speed;
 	bool                            smart_speed_active;
 	bool                            multispeed_fiber;
@@ -3610,6 +3624,7 @@ struct ixgbe_hw {
 	bool				force_full_reset;
 	bool				allow_unsupported_sfp;
 	bool				wol_enabled;
+	bool				need_crosstalk_fix;
 };
 
 struct ixgbe_info {

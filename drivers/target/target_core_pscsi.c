@@ -1192,7 +1192,8 @@ static struct configfs_attribute *pscsi_backend_dev_attrs[] = {
 static struct se_subsystem_api pscsi_template = {
 	.name			= "pscsi",
 	.owner			= THIS_MODULE,
-	.transport_flags	= TRANSPORT_FLAG_PASSTHROUGH,
+	.transport_flags	= TRANSPORT_FLAG_PASSTHROUGH |
+				  TRANSPORT_FLAG_PASSTHROUGH_ALUA,
 	.attach_hba		= pscsi_attach_hba,
 	.detach_hba		= pscsi_detach_hba,
 	.pmode_enable_hba	= pscsi_pmode_enable_hba,

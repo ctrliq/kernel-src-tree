@@ -136,7 +136,7 @@ static void kdump_nmi_callback(int cpu, struct pt_regs *regs)
 	disable_local_APIC();
 }
 
-static void kdump_nmi_shootdown_cpus(void)
+void kdump_nmi_shootdown_cpus(void)
 {
 	in_crash_kexec = 1;
 	nmi_shootdown_cpus(kdump_nmi_callback);
@@ -144,8 +144,24 @@ static void kdump_nmi_shootdown_cpus(void)
 	disable_local_APIC();
 }
 
+/* Override the weak function in kernel/panic.c */
+void crash_smp_send_stop(void)
+{
+	static int cpus_stopped;
+
+	if (cpus_stopped)
+		return;
+
+	if (smp_ops.crash_stop_other_cpus)
+		smp_ops.crash_stop_other_cpus();
+	else
+		smp_send_stop();
+
+	cpus_stopped = 1;
+}
+
 #else
-static void kdump_nmi_shootdown_cpus(void)
+void crash_smp_send_stop(void)
 {
 	/* There are no cpus to shootdown */
 }
@@ -164,7 +180,7 @@ void native_machine_crash_shutdown(struct pt_regs *regs)
 	/* The kernel is broken so disable interrupts */
 	local_irq_disable();
 
-	kdump_nmi_shootdown_cpus();
+	crash_smp_send_stop();
 
 	/*
 	 * VMCLEAR VMCSs loaded on this cpu if needed.
@@ -183,12 +199,12 @@ void native_machine_crash_shutdown(struct pt_regs *regs)
 	 */
 	cpu_emergency_stop_pt();
 
-	lapic_shutdown();
 #ifdef CONFIG_X86_IO_APIC
 	/* Prevent crash_kexec() from deadlocking on ioapic_lock. */
 	ioapic_zap_locks();
 	disable_IO_APIC();
 #endif
+	lapic_shutdown();
 #ifdef CONFIG_HPET_TIMER
 	hpet_disable();
 #endif

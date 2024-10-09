@@ -1,7 +1,7 @@
 /*
  * This file is part of the Chelsio T4 Ethernet driver for Linux.
  *
- * Copyright (c) 2003-2014 Chelsio Communications, Inc. All rights reserved.
+ * Copyright (c) 2003-2016 Chelsio Communications, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -285,6 +285,7 @@ int t4_wr_mbox_meat_timeout(struct adapter *adap, int mbox, const void *cmd,
 		1, 1, 3, 5, 10, 10, 20, 50, 100, 200
 	};
 
+	struct mbox_list entry;
 	u16 access = 0;
 	u16 execute = 0;
 	u32 v;
@@ -312,11 +313,62 @@ int t4_wr_mbox_meat_timeout(struct adapter *adap, int mbox, const void *cmd,
 		timeout = -timeout;
 	}
 
+	/* Queue ourselves onto the mailbox access list.  When our entry is at
+	 * the front of the list, we have rights to access the mailbox.  So we
+	 * wait [for a while] till we're at the front [or bail out with an
+	 * EBUSY] ...
+	 */
+	spin_lock(&adap->mbox_lock);
+	list_add_tail(&entry.list, &adap->mlist.list);
+	spin_unlock(&adap->mbox_lock);
+
+	delay_idx = 0;
+	ms = delay[0];
+
+	for (i = 0; ; i += ms) {
+		/* If we've waited too long, return a busy indication.  This
+		 * really ought to be based on our initial position in the
+		 * mailbox access list but this is a start.  We very rearely
+		 * contend on access to the mailbox ...
+		 */
+		pcie_fw = t4_read_reg(adap, PCIE_FW_A);
+		if (i > FW_CMD_MAX_TIMEOUT || (pcie_fw & PCIE_FW_ERR_F)) {
+			spin_lock(&adap->mbox_lock);
+			list_del(&entry.list);
+			spin_unlock(&adap->mbox_lock);
+			ret = (pcie_fw & PCIE_FW_ERR_F) ? -ENXIO : -EBUSY;
+			t4_record_mbox(adap, cmd, size, access, ret);
+			return ret;
+		}
+
+		/* If we're at the head, break out and start the mailbox
+		 * protocol.
+		 */
+		if (list_first_entry(&adap->mlist.list, struct mbox_list,
+				     list) == &entry)
+			break;
+
+		/* Delay for a bit before checking again ... */
+		if (sleep_ok) {
+			ms = delay[delay_idx];  /* last element may repeat */
+			if (delay_idx < ARRAY_SIZE(delay) - 1)
+				delay_idx++;
+			msleep(ms);
+		} else {
+			mdelay(ms);
+		}
+	}
+
+	/* Loop trying to get ownership of the mailbox.  Return an error
+	 * if we can't gain ownership.
+	 */
 	v = MBOWNER_G(t4_read_reg(adap, ctl_reg));
 	for (i = 0; v == MBOX_OWNER_NONE && i < 3; i++)
 		v = MBOWNER_G(t4_read_reg(adap, ctl_reg));
-
 	if (v != MBOX_OWNER_DRV) {
+		spin_lock(&adap->mbox_lock);
+		list_del(&entry.list);
+		spin_unlock(&adap->mbox_lock);
 		ret = (v == MBOX_OWNER_FW) ? -EBUSY : -ETIMEDOUT;
 		t4_record_mbox(adap, cmd, MBOX_LEN, access, ret);
 		return ret;
@@ -367,6 +419,9 @@ int t4_wr_mbox_meat_timeout(struct adapter *adap, int mbox, const void *cmd,
 			execute = i + ms;
 			t4_record_mbox(adap, cmd_rpl,
 				       MBOX_LEN, access, execute);
+			spin_lock(&adap->mbox_lock);
+			list_del(&entry.list);
+			spin_unlock(&adap->mbox_lock);
 			return -FW_CMD_RETVAL_G((int)res);
 		}
 	}
@@ -376,6 +431,10 @@ int t4_wr_mbox_meat_timeout(struct adapter *adap, int mbox, const void *cmd,
 	dev_err(adap->pdev_dev, "command %#x in mailbox %d timed out\n",
 		*(const u8 *)cmd, mbox);
 	t4_report_fw_error(adap);
+	spin_lock(&adap->mbox_lock);
+	list_del(&entry.list);
+	spin_unlock(&adap->mbox_lock);
+	t4_fatal_err(adap);
 	return ret;
 }
 
@@ -2730,7 +2789,7 @@ int t4_get_raw_vpd_params(struct adapter *adapter, struct vpd_params *p)
 
 out:
 	vfree(vpd);
-	return ret;
+	return ret < 0 ? ret : 0;
 }
 
 /**
@@ -7591,6 +7650,38 @@ int t4_prep_adapter(struct adapter *adapter)
 }
 
 /**
+ *	t4_shutdown_adapter - shut down adapter, host & wire
+ *	@adapter: the adapter
+ *
+ *	Perform an emergency shutdown of the adapter and stop it from
+ *	continuing any further communication on the ports or DMA to the
+ *	host.  This is typically used when the adapter and/or firmware
+ *	have crashed and we want to prevent any further accidental
+ *	communication with the rest of the world.  This will also force
+ *	the port Link Status to go down -- if register writes work --
+ *	which should help our peers figure out that we're down.
+ */
+int t4_shutdown_adapter(struct adapter *adapter)
+{
+	int port;
+
+	t4_intr_disable(adapter);
+	t4_write_reg(adapter, DBG_GPIO_EN_A, 0);
+	for_each_port(adapter, port) {
+		u32 a_port_cfg = is_t4(adapter->params.chip) ?
+				       PORT_REG(port, XGMAC_PORT_CFG_A) :
+				       T5_PORT_REG(port, MAC_PORT_CFG_A);
+
+		t4_write_reg(adapter, a_port_cfg,
+			     t4_read_reg(adapter, a_port_cfg)
+			     & ~SIGNAL_DET_V(1));
+	}
+	t4_set_reg_field(adapter, SGE_CONTROL_A, GLOBALENABLE_F, 0);
+
+	return 0;
+}
+
+/**
  *	t4_bar2_sge_qregs - return BAR2 SGE Queue register information
  *	@adapter: the adapter
  *	@qid: the Queue ID
@@ -7966,7 +8057,6 @@ int t4_port_init(struct adapter *adap, int mbox, int pf, int vf)
 			return ret;
 
 		memcpy(adap->port[i]->dev_addr, addr, ETH_ALEN);
-		adap->port[i]->dev_port = j;
 		j++;
 	}
 	return 0;
@@ -8424,4 +8514,33 @@ int t4_set_vf_mac_acl(struct adapter *adapter, unsigned int vf,
 	}
 
 	return t4_wr_mbox(adapter, adapter->mbox, &cmd, sizeof(cmd), &cmd);
+}
+
+int t4_sched_params(struct adapter *adapter, int type, int level, int mode,
+		    int rateunit, int ratemode, int channel, int class,
+		    int minrate, int maxrate, int weight, int pktsize)
+{
+	struct fw_sched_cmd cmd;
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.op_to_write = cpu_to_be32(FW_CMD_OP_V(FW_SCHED_CMD) |
+				      FW_CMD_REQUEST_F |
+				      FW_CMD_WRITE_F);
+	cmd.retval_len16 = cpu_to_be32(FW_LEN16(cmd));
+
+	cmd.u.params.sc = FW_SCHED_SC_PARAMS;
+	cmd.u.params.type = type;
+	cmd.u.params.level = level;
+	cmd.u.params.mode = mode;
+	cmd.u.params.ch = channel;
+	cmd.u.params.cl = class;
+	cmd.u.params.unit = rateunit;
+	cmd.u.params.rate = ratemode;
+	cmd.u.params.min = cpu_to_be32(minrate);
+	cmd.u.params.max = cpu_to_be32(maxrate);
+	cmd.u.params.weight = cpu_to_be16(weight);
+	cmd.u.params.pktsize = cpu_to_be16(pktsize);
+
+	return t4_wr_mbox_meat(adapter, adapter->mbox, &cmd, sizeof(cmd),
+			       NULL, 1);
 }

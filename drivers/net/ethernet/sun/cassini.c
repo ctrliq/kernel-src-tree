@@ -14,7 +14,9 @@
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
+ * 02111-1307, USA.
  *
  * This driver uses the sungem driver (c) David Miller
  * (davem@redhat.com) as its basis.
@@ -3352,7 +3354,7 @@ use_random_mac_addr:
 #if defined(CONFIG_SPARC)
 	addr = of_get_property(cp->of_node, "local-mac-address", NULL);
 	if (addr != NULL) {
-		memcpy(dev_addr, addr, 6);
+		memcpy(dev_addr, addr, ETH_ALEN);
 		goto done;
 	}
 #endif

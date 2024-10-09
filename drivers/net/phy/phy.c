@@ -407,21 +407,15 @@ EXPORT_SYMBOL(phy_start_aneg);
 /**
  * phy_start_machine - start PHY state machine tracking
  * @phydev: the phy_device struct
- * @handler: callback function for state change notifications
  *
  * Description: The PHY infrastructure can run a state machine
  *   which tracks whether the PHY is starting up, negotiating,
  *   etc.  This function starts the timer which tracks the state
- *   of the PHY.  If you want to be notified when the state changes,
- *   pass in the callback @handler, otherwise, pass NULL.  If you
- *   want to maintain your own state machine, do not call this
- *   function.
+ *   of the PHY.  If you want to maintain your own state machine,
+ *   do not call this function.
  */
-void phy_start_machine(struct phy_device *phydev,
-		       void (*handler)(struct net_device *))
+void phy_start_machine(struct phy_device *phydev)
 {
-	phydev->adjust_state = handler;
-
 	queue_delayed_work(system_power_efficient_wq, &phydev->state_queue, HZ);
 }
 
@@ -441,8 +435,6 @@ void phy_stop_machine(struct phy_device *phydev)
 	if (phydev->state > PHY_UP)
 		phydev->state = PHY_UP;
 	mutex_unlock(&phydev->lock);
-
-	phydev->adjust_state = NULL;
 }
 
 /**
@@ -712,9 +704,6 @@ void phy_state_machine(struct work_struct *work)
 
 	mutex_lock(&phydev->lock);
 
-	if (phydev->adjust_state)
-		phydev->adjust_state(phydev->attached_dev);
-
 	switch (phydev->state) {
 	case PHY_DOWN:
 	case PHY_STARTING:
@@ -792,10 +781,10 @@ void phy_state_machine(struct work_struct *work)
 		phydev->adjust_link(phydev->attached_dev);
 		break;
 	case PHY_RUNNING:
-		/* Only register a CHANGE if we are polling or ignoring
-		 * interrupts and link changed since latest checking.
+		/* Only register a CHANGE if we are polling and link changed
+		 * since latest checking.
 		 */
-		if (!phy_interrupt_is_valid(phydev)) {
+		if (phydev->irq == PHY_POLL) {
 			old_link = phydev->link;
 			err = phy_read_status(phydev);
 			if (err)
@@ -894,8 +883,13 @@ void phy_state_machine(struct work_struct *work)
 	if (err < 0)
 		phy_error(phydev);
 
-	queue_delayed_work(system_power_efficient_wq, &phydev->state_queue,
-			   PHY_STATE_TIME * HZ);
+	/* Only re-schedule a PHY state machine change if we are polling the
+	 * PHY, if PHY_IGNORE_INTERRUPT is set, then we will be moving
+	 * between states from phy_mac_interrupt()
+	 */
+	if (phydev->irq == PHY_POLL)
+		queue_delayed_work(system_power_efficient_wq, &phydev->state_queue,
+				   PHY_STATE_TIME * HZ);
 }
 
 void phy_mac_interrupt(struct phy_device *phydev, int new_link)

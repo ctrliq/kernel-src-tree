@@ -113,6 +113,11 @@ struct ast_private {
 	struct ttm_bo_kmap_obj cache_kmap;
 	int next_cursor;
 	bool support_wide_screen;
+	enum {
+		ast_use_p2a,
+		ast_use_dt,
+		ast_use_defaults
+	} config_mode;
 
 	enum ast_tx_chip tx_chip_type;
 	u8 dp501_maxclk;
@@ -367,7 +372,7 @@ static inline int ast_bo_reserve(struct ast_bo *bo, bool no_wait)
 {
 	int ret;
 
-	ret = ttm_bo_reserve(&bo->bo, true, no_wait, false, NULL);
+	ret = ttm_bo_reserve(&bo->bo, true, no_wait, NULL);
 	if (ret) {
 		if (ret != -ERESTARTSYS && ret != -EBUSY)
 			DRM_ERROR("reserve failed %p\n", bo);

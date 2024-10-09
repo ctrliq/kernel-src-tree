@@ -45,6 +45,7 @@
 #include <linux/if_bridge.h>
 #include <linux/workqueue.h>
 #include <linux/jiffies.h>
+#include <linux/rtnetlink.h>
 #include <net/switchdev.h>
 
 #include "spectrum.h"
@@ -1544,19 +1545,19 @@ static void mlxsw_sp_fdb_notify_work(struct work_struct *work)
 
 	mlxsw_sp = container_of(work, struct mlxsw_sp, fdb_notify.dw.work);
 
-	do {
-		mlxsw_reg_sfn_pack(sfn_pl);
-		err = mlxsw_reg_query(mlxsw_sp->core, MLXSW_REG(sfn), sfn_pl);
-		if (err) {
-			dev_err_ratelimited(mlxsw_sp->bus_info->dev, "Failed to get FDB notifications\n");
-			break;
-		}
-		num_rec = mlxsw_reg_sfn_num_rec_get(sfn_pl);
-		for (i = 0; i < num_rec; i++)
-			mlxsw_sp_fdb_notify_rec_process(mlxsw_sp, sfn_pl, i);
+	rtnl_lock();
+	mlxsw_reg_sfn_pack(sfn_pl);
+	err = mlxsw_reg_query(mlxsw_sp->core, MLXSW_REG(sfn), sfn_pl);
+	if (err) {
+		dev_err_ratelimited(mlxsw_sp->bus_info->dev, "Failed to get FDB notifications\n");
+		goto out;
+	}
+	num_rec = mlxsw_reg_sfn_num_rec_get(sfn_pl);
+	for (i = 0; i < num_rec; i++)
+		mlxsw_sp_fdb_notify_rec_process(mlxsw_sp, sfn_pl, i);
 
-	} while (num_rec);
-
+out:
+	rtnl_unlock();
 	kfree(sfn_pl);
 	mlxsw_sp_fdb_notify_work_schedule(mlxsw_sp);
 }

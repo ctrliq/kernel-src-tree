@@ -79,8 +79,17 @@ include ../scripts/utilities.mak
 #
 # Define NO_AUXTRACE if you do not want AUX area tracing support
 #
+# Define NO_SDT if you do not want to define SDT event in perf tools,
+# note that it doesn't disable SDT scanning support.
+#
 # Define FEATURES_DUMP to provide features detection dump file
 # and bypass the feature detection
+#
+# Define NO_JVMTI if you do not want jvmti agent built
+#
+# Define LIBCLANGLLVM if you DO want builtin clang and llvm support.
+# When selected, pass LLVM_CONFIG=/path/to/llvm-config to `make' if
+# llvm-config is not in $PATH.
 
 # As per kernel Makefile, avoid funny character set dependencies
 unexport LC_ALL
@@ -89,7 +98,7 @@ LC_NUMERIC=C
 export LC_COLLATE LC_NUMERIC
 
 ifeq ($(srctree),)
-srctree := $(patsubst %/,%,$(dir $(shell pwd)))
+srctree := $(patsubst %/,%,$(dir $(CURDIR)))
 srctree := $(patsubst %/,%,$(dir $(srctree)))
 #$(info Determined 'srctree' to be $(srctree))
 endif
@@ -132,10 +141,16 @@ endef
 $(call allow-override,CC,$(CROSS_COMPILE)gcc)
 $(call allow-override,AR,$(CROSS_COMPILE)ar)
 $(call allow-override,LD,$(CROSS_COMPILE)ld)
+$(call allow-override,CXX,$(CROSS_COMPILE)g++)
 
 LD += $(EXTRA_LDFLAGS)
 
+HOSTCC  ?= gcc
+HOSTLD  ?= ld
+HOSTAR  ?= ar
+
 PKG_CONFIG = $(CROSS_COMPILE)pkg-config
+LLVM_CONFIG ?= llvm-config
 
 RM      = rm -f
 LN      = ln -f
@@ -146,10 +161,6 @@ FLEX    = flex
 BISON   = bison
 STRIP   = strip
 AWK     = awk
-
-LIB_DIR		= $(srctree)/tools/lib/api/
-TRACE_EVENT_DIR = $(srctree)/tools/lib/traceevent/
-SUBCMD_DIR	= $(srctree)/tools/lib/subcmd/
 
 # include Makefile.config by default and rule out
 # non-config cases
@@ -163,6 +174,40 @@ ifeq ($(filter-out $(NON_CONFIG_TARGETS),$(MAKECMDGOALS)),)
 endif
 endif
 
+# The fixdep build - we force fixdep tool to be built as
+# the first target in the separate make session not to be
+# disturbed by any parallel make jobs. Once fixdep is done
+# we issue the requested build with FIXDEP=1 variable.
+#
+# The fixdep build is disabled for $(NON_CONFIG_TARGETS)
+# targets, because it's not necessary.
+
+ifdef FIXDEP
+  force_fixdep := 0
+else
+  force_fixdep := $(config)
+endif
+
+export srctree OUTPUT RM CC CXX LD AR CFLAGS CXXFLAGS V BISON FLEX AWK
+export HOSTCC HOSTLD HOSTAR
+
+include $(srctree)/tools/build/Makefile.include
+
+ifeq ($(force_fixdep),1)
+goals := $(filter-out all sub-make, $(MAKECMDGOALS))
+
+$(goals) all: sub-make
+
+sub-make: fixdep
+	@./check-headers.sh
+	$(Q)$(MAKE) FIXDEP=1 -f Makefile.perf $(goals)
+
+else # force_fixdep
+
+LIB_DIR         = $(srctree)/tools/lib/api/
+TRACE_EVENT_DIR = $(srctree)/tools/lib/traceevent/
+SUBCMD_DIR      = $(srctree)/tools/lib/subcmd/
+
 # Set FEATURE_TESTS to 'all' so all possible feature checkers are executed.
 # Without this setting the output feature dump file misses some features, for
 # example, liberty. Select all checkers so we won't get an incomplete feature
@@ -174,6 +219,11 @@ FEATURE_TESTS := all
 endif
 endif
 include Makefile.config
+endif
+
+ifeq ($(config),0)
+include $(srctree)/tools/scripts/Makefile.arch
+-include arch/$(ARCH)/Makefile
 endif
 
 # The FEATURE_DUMP_EXPORT holds location of the actual
@@ -249,6 +299,12 @@ ifndef NO_PERF_READ_VDSOX32
 PROGRAMS += $(OUTPUT)perf-read-vdsox32
 endif
 
+LIBJVMTI = libperf-jvmti.so
+
+ifndef NO_JVMTI
+PROGRAMS += $(OUTPUT)$(LIBJVMTI)
+endif
+
 # what 'all' will build and 'install' will install, in perfexecdir
 ALL_PROGRAMS = $(PROGRAMS) $(SCRIPTS)
 
@@ -288,6 +344,21 @@ endif
 
 LIBS = -Wl,--whole-archive $(PERFLIBS) -Wl,--no-whole-archive -Wl,--start-group $(EXTLIBS) -Wl,--end-group
 
+ifeq ($(USE_CLANG), 1)
+  CLANGLIBS_LIST = AST Basic CodeGen Driver Frontend Lex Tooling Edit Sema Analysis Parse Serialization
+  LIBCLANG = $(foreach l,$(CLANGLIBS_LIST),$(wildcard $(shell $(LLVM_CONFIG) --libdir)/libclang$(l).a))
+  LIBS += -Wl,--start-group $(LIBCLANG) -Wl,--end-group
+endif
+
+ifeq ($(USE_LLVM), 1)
+  LIBLLVM = $(shell $(LLVM_CONFIG) --libs all) $(shell $(LLVM_CONFIG) --system-libs)
+  LIBS += -L$(shell $(LLVM_CONFIG) --libdir) $(LIBLLVM)
+endif
+
+ifeq ($(USE_CXX), 1)
+  LIBS += -lstdc++
+endif
+
 export INSTALL SHELL_PATH
 
 ### Build rules
@@ -314,17 +385,32 @@ strip: $(PROGRAMS) $(OUTPUT)perf
 
 PERF_IN := $(OUTPUT)perf-in.o
 
-export srctree OUTPUT RM CC LD AR CFLAGS V BISON FLEX AWK
-include $(srctree)/tools/build/Makefile.include
+JEVENTS       := $(OUTPUT)pmu-events/jevents
+JEVENTS_IN    := $(OUTPUT)pmu-events/jevents-in.o
+
+PMU_EVENTS_IN := $(OUTPUT)pmu-events/pmu-events-in.o
+
+export JEVENTS
+
+build := -f $(srctree)/tools/build/Makefile.build dir=. obj
 
 $(PERF_IN): prepare FORCE
 	$(Q)$(MAKE) $(build)=perf
 
-$(OUTPUT)perf: $(PERFLIBS) $(PERF_IN) $(LIBTRACEEVENT_DYNAMIC_LIST)
-	$(QUIET_LINK)$(CC) $(CFLAGS) $(LDFLAGS) $(LIBTRACEEVENT_DYNAMIC_LIST_LDFLAGS) \
-		$(PERF_IN) $(LIBS) -o $@
+$(JEVENTS_IN): FORCE
+	$(Q)$(MAKE) -f $(srctree)/tools/build/Makefile.build dir=pmu-events obj=jevents
 
-$(GTK_IN): fixdep FORCE
+$(JEVENTS): $(JEVENTS_IN)
+	$(QUIET_LINK)$(HOSTCC) $(JEVENTS_IN) -o $@
+
+$(PMU_EVENTS_IN): $(JEVENTS) FORCE
+	$(Q)$(MAKE) -f $(srctree)/tools/build/Makefile.build dir=pmu-events obj=pmu-events
+
+$(OUTPUT)perf: $(PERFLIBS) $(PERF_IN) $(PMU_EVENTS_IN) $(LIBTRACEEVENT_DYNAMIC_LIST)
+	$(QUIET_LINK)$(CC) $(CFLAGS) $(LDFLAGS) $(LIBTRACEEVENT_DYNAMIC_LIST_LDFLAGS) \
+		$(PERF_IN) $(PMU_EVENTS_IN) $(LIBS) -o $@
+
+$(GTK_IN): FORCE
 	$(Q)$(MAKE) $(build)=gtk
 
 $(OUTPUT)libperf-gtk.so: $(GTK_IN) $(PERFLIBS)
@@ -355,6 +441,8 @@ perf.spec $(SCRIPTS) \
 ifneq ($(OUTPUT),)
 %.o: $(OUTPUT)%.o
 	@echo "    # Redirected target $@ => $(OUTPUT)$@"
+pmu-events/%.o: $(OUTPUT)pmu-events/%.o
+	@echo "    # Redirected target $@ => $(OUTPUT)$@"
 util/%.o: $(OUTPUT)util/%.o
 	@echo "    # Redirected target $@ => $(OUTPUT)$@"
 bench/%.o: $(OUTPUT)bench/%.o
@@ -371,7 +459,7 @@ endif
 __build-dir = $(subst $(OUTPUT),,$(dir $@))
 build-dir   = $(if $(__build-dir),$(__build-dir),.)
 
-prepare: $(OUTPUT)PERF-VERSION-FILE $(OUTPUT)common-cmds.h fixdep
+prepare: $(OUTPUT)PERF-VERSION-FILE $(OUTPUT)common-cmds.h archheaders
 
 $(OUTPUT)%.o: %.c prepare FORCE
 	$(Q)$(MAKE) -f $(srctree)/tools/build/Makefile.build dir=$(build-dir) $@
@@ -407,11 +495,21 @@ $(OUTPUT)perf-read-vdsox32: perf-read-vdso.c util/find-vdso-map.c
 	$(QUIET_CC)$(CC) -mx32 $(filter -static,$(LDFLAGS)) -Wall -Werror -o $@ perf-read-vdso.c
 endif
 
+ifndef NO_JVMTI
+LIBJVMTI_IN := $(OUTPUT)jvmti/jvmti-in.o
+
+$(LIBJVMTI_IN): FORCE
+	$(Q)$(MAKE) -f $(srctree)/tools/build/Makefile.build dir=jvmti obj=jvmti
+
+$(OUTPUT)$(LIBJVMTI): $(LIBJVMTI_IN)
+	$(QUIET_LINK)$(CC) -shared -Wl,-soname -Wl,$(LIBJVMTI) -o $@ $< -lelf -lrt
+endif
+
 $(patsubst perf-%,%.o,$(PROGRAMS)): $(wildcard */*.h)
 
 LIBPERF_IN := $(OUTPUT)libperf-in.o
 
-$(LIBPERF_IN): fixdep FORCE
+$(LIBPERF_IN): prepare FORCE
 	$(Q)$(MAKE) $(build)=libperf
 
 $(LIB_FILE): $(LIBPERF_IN)
@@ -419,10 +517,10 @@ $(LIB_FILE): $(LIBPERF_IN)
 
 LIBTRACEEVENT_FLAGS += plugin_dir=$(plugindir_SQ)
 
-$(LIBTRACEEVENT): fixdep FORCE
+$(LIBTRACEEVENT): FORCE
 	$(Q)$(MAKE) -C $(TRACE_EVENT_DIR) $(LIBTRACEEVENT_FLAGS) O=$(OUTPUT) $(OUTPUT)libtraceevent.a
 
-libtraceevent_plugins: fixdep FORCE
+libtraceevent_plugins: FORCE
 	$(Q)$(MAKE) -C $(TRACE_EVENT_DIR) $(LIBTRACEEVENT_FLAGS) O=$(OUTPUT) plugins
 
 $(LIBTRACEEVENT_DYNAMIC_LIST): libtraceevent_plugins
@@ -435,14 +533,14 @@ $(LIBTRACEEVENT)-clean:
 install-traceevent-plugins: libtraceevent_plugins
 	$(Q)$(MAKE) -C $(TRACE_EVENT_DIR) $(LIBTRACEEVENT_FLAGS) O=$(OUTPUT) install_plugins
 
-$(LIBAPI): fixdep FORCE
+$(LIBAPI): FORCE
 	$(Q)$(MAKE) -C $(LIB_DIR) O=$(OUTPUT) $(OUTPUT)libapi.a
 
 $(LIBAPI)-clean:
 	$(call QUIET_CLEAN, libapi)
 	$(Q)$(MAKE) -C $(LIB_DIR) O=$(OUTPUT) clean >/dev/null
 
-$(LIBSUBCMD): fixdep FORCE
+$(LIBSUBCMD): FORCE
 	$(Q)$(MAKE) -C $(SUBCMD_DIR) O=$(OUTPUT) $(OUTPUT)libsubcmd.a
 
 $(LIBSUBCMD)-clean:
@@ -544,6 +642,11 @@ ifndef NO_PERF_READ_VDSOX32
 	$(call QUIET_INSTALL, perf-read-vdsox32) \
 		$(INSTALL) $(OUTPUT)perf-read-vdsox32 '$(DESTDIR_SQ)$(bindir_SQ)';
 endif
+ifndef NO_JVMTI
+	$(call QUIET_INSTALL, $(LIBJVMTI)) \
+		$(INSTALL) -d -m 755 '$(DESTDIR_SQ)$(libdir_SQ)'; \
+		$(INSTALL) $(OUTPUT)$(LIBJVMTI) '$(DESTDIR_SQ)$(libdir_SQ)';
+endif
 	$(call QUIET_INSTALL, libexec) \
 		$(INSTALL) -d -m 755 '$(DESTDIR_SQ)$(perfexec_instdir_SQ)'
 	$(call QUIET_INSTALL, perf-archive) \
@@ -606,14 +709,15 @@ config-clean:
 	$(call QUIET_CLEAN, config)
 	$(Q)$(MAKE) -C $(srctree)/tools/build/feature/ $(if $(OUTPUT),OUTPUT=$(OUTPUT)feature/,) clean >/dev/null
 
-clean: $(LIBTRACEEVENT)-clean $(LIBAPI)-clean $(LIBSUBCMD)-clean config-clean
+clean:: $(LIBTRACEEVENT)-clean $(LIBAPI)-clean $(LIBSUBCMD)-clean config-clean
 	$(call QUIET_CLEAN, core-objs)  $(RM) $(LIB_FILE) $(OUTPUT)perf-archive $(OUTPUT)perf-with-kcore $(LANG_BINDINGS)
 	$(Q)find $(if $(OUTPUT),$(OUTPUT),.) -name '*.o' -delete -o -name '\.*.cmd' -delete -o -name '\.*.d' -delete
 	$(Q)$(RM) $(OUTPUT).config-detected
-	$(call QUIET_CLEAN, core-progs) $(RM) $(ALL_PROGRAMS) perf perf-read-vdso32 perf-read-vdsox32
+	$(call QUIET_CLEAN, core-progs) $(RM) $(ALL_PROGRAMS) perf perf-read-vdso32 perf-read-vdsox32 $(OUTPUT)pmu-events/jevents $(OUTPUT)$(LIBJVMTI).so
 	$(call QUIET_CLEAN, core-gen)   $(RM)  *.spec *.pyc *.pyo */*.pyc */*.pyo $(OUTPUT)common-cmds.h TAGS tags cscope* $(OUTPUT)PERF-VERSION-FILE $(OUTPUT)FEATURE-DUMP $(OUTPUT)util/*-bison* $(OUTPUT)util/*-flex* \
 		$(OUTPUT)util/intel-pt-decoder/inat-tables.c $(OUTPUT)fixdep \
-		$(OUTPUT)tests/llvm-src-{base,kbuild,prologue}.c
+		$(OUTPUT)tests/llvm-src-{base,kbuild,prologue}.c \
+		$(OUTPUT)pmu-events/pmu-events.c
 	$(QUIET_SUBDIR0)Documentation $(QUIET_SUBDIR1) clean
 	$(python-clean)
 
@@ -643,5 +747,6 @@ FORCE:
 .PHONY: all install clean config-clean strip install-gtk
 .PHONY: shell_compatibility_test please_set_SHELL_PATH_to_a_more_modern_shell
 .PHONY: $(GIT-HEAD-PHONY) TAGS tags cscope FORCE prepare
-.PHONY: libtraceevent_plugins
+.PHONY: libtraceevent_plugins archheaders
 
+endif # force_fixdep

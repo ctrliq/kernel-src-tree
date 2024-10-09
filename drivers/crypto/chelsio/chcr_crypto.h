@@ -129,7 +129,7 @@ struct ablk_ctx {
 
 
 struct hmac_ctx {
-	struct shash_desc *desc;
+	struct crypto_shash *base_hash;
 	u8 ipad[CHCR_HASH_MAX_BLOCK_SIZE_128];
 	u8 opad[CHCR_HASH_MAX_BLOCK_SIZE_128];
 };
@@ -141,7 +141,8 @@ struct __crypto_ctx {
 
 struct chcr_context {
 	struct chcr_dev *dev;
-	unsigned char tx_channel_id;
+	unsigned char tx_qidx;
+	unsigned char rx_qidx;
 	struct __crypto_ctx crypto_ctx[0];
 };
 

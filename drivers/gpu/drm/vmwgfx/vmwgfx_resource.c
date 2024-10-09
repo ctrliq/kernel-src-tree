@@ -129,7 +129,7 @@ static void vmw_resource_release(struct kref *kref)
 	if (res->backup) {
 		struct ttm_buffer_object *bo = &res->backup->base;
 
-		ttm_bo_reserve(bo, false, false, false, NULL);
+		ttm_bo_reserve(bo, false, false, NULL);
 		if (!list_empty(&res->mob_head) &&
 		    res->func->unbind != NULL) {
 			struct ttm_validate_buffer val_buf;
@@ -574,10 +574,8 @@ static int vmw_user_dmabuf_synccpu_grab(struct vmw_user_dma_buffer *user_bo,
 		bool nonblock = !!(flags & drm_vmw_synccpu_dontblock);
 		long lret;
 
-		if (nonblock)
-			return reservation_object_test_signaled_rcu(bo->resv, true) ? 0 : -EBUSY;
-
-		lret = reservation_object_wait_timeout_rcu(bo->resv, true, true, MAX_SCHEDULE_TIMEOUT);
+		lret = reservation_object_wait_timeout_rcu(bo->resv, true, true,
+							   nonblock ? 0 : MAX_SCHEDULE_TIMEOUT);
 		if (!lret)
 			return -EBUSY;
 		else if (lret < 0)
@@ -1456,7 +1454,7 @@ void vmw_fence_single_bo(struct ttm_buffer_object *bo,
 	if (fence == NULL) {
 		vmw_execbuf_fence_commands(NULL, dev_priv, &fence, NULL);
 		reservation_object_add_excl_fence(bo->resv, &fence->base);
-		fence_put(&fence->base);
+		dma_fence_put(&fence->base);
 	} else
 		reservation_object_add_excl_fence(bo->resv, &fence->base);
 }
@@ -1512,7 +1510,7 @@ void vmw_resource_move_notify(struct ttm_buffer_object *bo,
 			list_del_init(&res->mob_head);
 		}
 
-		(void) ttm_bo_wait(bo, false, false, false);
+		(void) ttm_bo_wait(bo, false, false);
 	}
 }
 
@@ -1605,7 +1603,7 @@ void vmw_query_move_notify(struct ttm_buffer_object *bo,
 		if (fence != NULL)
 			vmw_fence_obj_unreference(&fence);
 
-		(void) ttm_bo_wait(bo, false, false, false);
+		(void) ttm_bo_wait(bo, false, false);
 	} else
 		mutex_unlock(&dev_priv->binding_mutex);
 
@@ -1717,8 +1715,7 @@ int vmw_resource_pin(struct vmw_resource *res, bool interruptible)
 		if (res->backup) {
 			vbo = res->backup;
 
-			ttm_bo_reserve(&vbo->base, interruptible, false, false,
-				       NULL);
+			ttm_bo_reserve(&vbo->base, interruptible, false, NULL);
 			if (!vbo->pin_count) {
 				ret = ttm_bo_validate
 					(&vbo->base,
@@ -1773,7 +1770,7 @@ void vmw_resource_unpin(struct vmw_resource *res)
 	if (--res->pin_count == 0 && res->backup) {
 		struct vmw_dma_buffer *vbo = res->backup;
 
-		ttm_bo_reserve(&vbo->base, false, false, false, NULL);
+		ttm_bo_reserve(&vbo->base, false, false, NULL);
 		vmw_bo_pin_reserved(vbo, false);
 		ttm_bo_unreserve(&vbo->base);
 	}

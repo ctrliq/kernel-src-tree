@@ -35,7 +35,7 @@ struct drr_class {
 
 struct drr_sched {
 	struct list_head		active;
-	struct tcf_proto		*filter_list;
+	struct tcf_proto __rcu		*filter_list;
 	struct Qdisc_class_hash		clhash;
 };
 
@@ -53,9 +53,10 @@ static struct drr_class *drr_find_class(struct Qdisc *sch, u32 classid)
 static void drr_purge_queue(struct drr_class *cl)
 {
 	unsigned int len = cl->qdisc->q.qlen;
+	unsigned int backlog = cl->qdisc->qstats.backlog;
 
 	qdisc_reset(cl->qdisc);
-	qdisc_tree_decrease_qlen(cl->qdisc, len);
+	qdisc_tree_reduce_backlog(cl->qdisc, len, backlog);
 }
 
 static const struct nla_policy drr_policy[TCA_DRR_MAX + 1] = {
@@ -88,7 +89,8 @@ static int drr_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 
 	if (cl != NULL) {
 		if (tca[TCA_RATE]) {
-			err = gen_replace_estimator(&cl->bstats, &cl->rate_est,
+			err = gen_replace_estimator(&cl->bstats, NULL,
+						    &cl->rate_est,
 						    qdisc_root_sleeping_lock(sch),
 						    tca[TCA_RATE]);
 			if (err)
@@ -116,7 +118,7 @@ static int drr_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
 		cl->qdisc = &noop_qdisc;
 
 	if (tca[TCA_RATE]) {
-		err = gen_replace_estimator(&cl->bstats, &cl->rate_est,
+		err = gen_replace_estimator(&cl->bstats, NULL, &cl->rate_est,
 					    qdisc_root_sleeping_lock(sch),
 					    tca[TCA_RATE]);
 		if (err) {
@@ -184,7 +186,8 @@ static void drr_put_class(struct Qdisc *sch, unsigned long arg)
 		drr_destroy_class(sch, cl);
 }
 
-static struct tcf_proto **drr_tcf_chain(struct Qdisc *sch, unsigned long cl)
+static struct tcf_proto __rcu **drr_tcf_chain(struct Qdisc *sch,
+					      unsigned long cl)
 {
 	struct drr_sched *q = qdisc_priv(sch);
 
@@ -269,17 +272,16 @@ static int drr_dump_class_stats(struct Qdisc *sch, unsigned long arg,
 				struct gnet_dump *d)
 {
 	struct drr_class *cl = (struct drr_class *)arg;
+	__u32 qlen = cl->qdisc->q.qlen;
 	struct tc_drr_stats xstats;
 
 	memset(&xstats, 0, sizeof(xstats));
-	if (cl->qdisc->q.qlen) {
+	if (qlen)
 		xstats.deficit = cl->deficit;
-		cl->qdisc->qstats.qlen = cl->qdisc->q.qlen;
-	}
 
-	if (gnet_stats_copy_basic(d, &cl->bstats) < 0 ||
+	if (gnet_stats_copy_basic(d, NULL, &cl->bstats) < 0 ||
 	    gnet_stats_copy_rate_est(d, &cl->bstats, &cl->rate_est) < 0 ||
-	    gnet_stats_copy_queue(d, &cl->qdisc->qstats) < 0)
+	    gnet_stats_copy_queue(d, NULL, &cl->qdisc->qstats, qlen) < 0)
 		return -1;
 
 	return gnet_stats_copy_app(d, &xstats, sizeof(xstats));
@@ -315,6 +317,7 @@ static struct drr_class *drr_classify(struct sk_buff *skb, struct Qdisc *sch,
 	struct drr_sched *q = qdisc_priv(sch);
 	struct drr_class *cl;
 	struct tcf_result res;
+	struct tcf_proto *fl;
 	int result;
 
 	if (TC_H_MAJ(skb->priority ^ sch->handle) == 0) {
@@ -324,7 +327,8 @@ static struct drr_class *drr_classify(struct sk_buff *skb, struct Qdisc *sch,
 	}
 
 	*qerr = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
-	result = tc_classify(skb, q->filter_list, &res);
+	fl = rcu_dereference_bh(q->filter_list);
+	result = tc_classify(skb, fl, &res);
 	if (result >= 0) {
 #ifdef CONFIG_NET_CLS_ACT
 		switch (result) {

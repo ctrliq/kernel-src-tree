@@ -8,7 +8,7 @@
 struct mei_cl_device;
 struct mei_device;
 
-typedef void (*mei_cldev_event_cb_t)(struct mei_cl_device *device,
+typedef void (*mei_cldev_event_cb_t)(struct mei_cl_device *cldev,
 			       u32 events, void *context);
 
 /**
@@ -62,22 +62,34 @@ struct mei_cl_driver {
 
 	const struct mei_cl_device_id *id_table;
 
-	int (*probe)(struct mei_cl_device *dev,
+	int (*probe)(struct mei_cl_device *cldev,
 		     const struct mei_cl_device_id *id);
-	int (*remove)(struct mei_cl_device *dev);
+	int (*remove)(struct mei_cl_device *cldev);
 };
 
-int __mei_cldev_driver_register(struct mei_cl_driver *cldrv,
-				struct module *owner);
+int __mei_cldev_driver_register(struct mei_cl_driver *cldrv, struct module *owner);
 #define mei_cldev_driver_register(cldrv)	\
 	__mei_cldev_driver_register(cldrv, THIS_MODULE)
 
 void mei_cldev_driver_unregister(struct mei_cl_driver *cldrv);
 
-ssize_t mei_cldrv_send(struct mei_cl_device *cldev, u8 *buf, size_t length);
-ssize_t  mei_cldrv_recv(struct mei_cl_device *cldev, u8 *buf, size_t length);
+/**
+ * module_mei_cl_driver - Helper macro for registering mei cl driver
+ *
+ * @__mei_cldrv mei_cl_driver structure
+ *
+ *  Helper macro for mei cl drivers which do not do anything special in module
+ *  init/exit, for eliminating a boilerplate code.
+ */
+#define module_mei_cl_driver(__mei_cldrv) \
+	module_driver(__mei_cldrv, \
+		      mei_cldev_driver_register,\
+		      mei_cldev_driver_unregister)
 
-int mei_cldrv_register_event_cb(struct mei_cl_device *cldev,
+ssize_t mei_cldev_send(struct mei_cl_device *cldev, u8 *buf, size_t length);
+ssize_t  mei_cldev_recv(struct mei_cl_device *cldev, u8 *buf, size_t length);
+
+int mei_cldev_register_event_cb(struct mei_cl_device *cldev,
 			  unsigned long event_mask,
 			  mei_cldev_event_cb_t read_cb, void *context);
 
@@ -91,8 +103,8 @@ u8 mei_cldev_ver(const struct mei_cl_device *cldev);
 void *mei_cldev_get_drvdata(const struct mei_cl_device *cldev);
 void mei_cldev_set_drvdata(struct mei_cl_device *cldev, void *data);
 
-int mei_cldev_enable_device(struct mei_cl_device *cldev);
-int mei_cldev_disable_device(struct mei_cl_device *cldev);
+int mei_cldev_enable(struct mei_cl_device *cldev);
+int mei_cldev_disable(struct mei_cl_device *cldev);
 bool mei_cldev_enabled(struct mei_cl_device *cldev);
 
 #endif /* _LINUX_MEI_CL_BUS_H */

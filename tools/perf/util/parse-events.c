@@ -21,6 +21,7 @@
 #include "cpumap.h"
 #include "probe-file.h"
 #include "asm/bug.h"
+#include "util/parse-branch-options.h"
 
 #define MAX_NAME_LEN 100
 
@@ -675,6 +676,9 @@ static const char *config_term_names[__PARSE_EVENTS__TERM_TYPE_NR] = {
 	[PARSE_EVENTS__TERM_TYPE_STACKSIZE]		= "stack-size",
 	[PARSE_EVENTS__TERM_TYPE_NOINHERIT]		= "no-inherit",
 	[PARSE_EVENTS__TERM_TYPE_INHERIT]		= "inherit",
+	[PARSE_EVENTS__TERM_TYPE_OVERWRITE]		= "overwrite",
+	[PARSE_EVENTS__TERM_TYPE_NOOVERWRITE]		= "no-overwrite",
+	[PARSE_EVENTS__TERM_TYPE_DRV_CFG]		= "driver-config",
 };
 
 static bool config_term_shrinked;
@@ -743,10 +747,13 @@ do {									   \
 		CHECK_TYPE_VAL(NUM);
 		break;
 	case PARSE_EVENTS__TERM_TYPE_BRANCH_SAMPLE_TYPE:
-		/*
-		 * TODO uncomment when the field is available
-		 * attr->branch_sample_type = term->val.num;
-		 */
+		CHECK_TYPE_VAL(STR);
+		if (strcmp(term->val.str, "no") &&
+		    parse_branch_str(term->val.str, &attr->branch_sample_type)) {
+			err->str = strdup("invalid branch sample type");
+			err->idx = term->err_val;
+			return -EINVAL;
+		}
 		break;
 	case PARSE_EVENTS__TERM_TYPE_TIME:
 		CHECK_TYPE_VAL(NUM);
@@ -766,6 +773,12 @@ do {									   \
 		CHECK_TYPE_VAL(NUM);
 		break;
 	case PARSE_EVENTS__TERM_TYPE_NOINHERIT:
+		CHECK_TYPE_VAL(NUM);
+		break;
+	case PARSE_EVENTS__TERM_TYPE_OVERWRITE:
+		CHECK_TYPE_VAL(NUM);
+		break;
+	case PARSE_EVENTS__TERM_TYPE_NOOVERWRITE:
 		CHECK_TYPE_VAL(NUM);
 		break;
 	case PARSE_EVENTS__TERM_TYPE_NAME:
@@ -797,7 +810,8 @@ static int config_term_pmu(struct perf_event_attr *attr,
 			   struct parse_events_term *term,
 			   struct parse_events_error *err)
 {
-	if (term->type_term == PARSE_EVENTS__TERM_TYPE_USER)
+	if (term->type_term == PARSE_EVENTS__TERM_TYPE_USER ||
+	    term->type_term == PARSE_EVENTS__TERM_TYPE_DRV_CFG)
 		/*
 		 * Always succeed for sysfs terms, as we dont know
 		 * at this point what type they need to have.
@@ -816,6 +830,8 @@ static int config_term_tracepoint(struct perf_event_attr *attr,
 	case PARSE_EVENTS__TERM_TYPE_STACKSIZE:
 	case PARSE_EVENTS__TERM_TYPE_INHERIT:
 	case PARSE_EVENTS__TERM_TYPE_NOINHERIT:
+	case PARSE_EVENTS__TERM_TYPE_OVERWRITE:
+	case PARSE_EVENTS__TERM_TYPE_NOOVERWRITE:
 		return config_term_common(attr, term, err);
 	default:
 		if (err) {
@@ -876,6 +892,9 @@ do {								\
 		case PARSE_EVENTS__TERM_TYPE_CALLGRAPH:
 			ADD_CONFIG_TERM(CALLGRAPH, callgraph, term->val.str);
 			break;
+		case PARSE_EVENTS__TERM_TYPE_BRANCH_SAMPLE_TYPE:
+			ADD_CONFIG_TERM(BRANCH, branch, term->val.str);
+			break;
 		case PARSE_EVENTS__TERM_TYPE_STACKSIZE:
 			ADD_CONFIG_TERM(STACK_USER, stack_user, term->val.num);
 			break;
@@ -884,6 +903,15 @@ do {								\
 			break;
 		case PARSE_EVENTS__TERM_TYPE_NOINHERIT:
 			ADD_CONFIG_TERM(INHERIT, inherit, term->val.num ? 0 : 1);
+			break;
+		case PARSE_EVENTS__TERM_TYPE_OVERWRITE:
+			ADD_CONFIG_TERM(OVERWRITE, overwrite, term->val.num ? 1 : 0);
+			break;
+		case PARSE_EVENTS__TERM_TYPE_NOOVERWRITE:
+			ADD_CONFIG_TERM(OVERWRITE, overwrite, term->val.num ? 0 : 1);
+			break;
+		case PARSE_EVENTS__TERM_TYPE_DRV_CFG:
+			ADD_CONFIG_TERM(DRV_CFG, drv_cfg, term->val.str);
 			break;
 		default:
 			break;
@@ -1164,7 +1192,7 @@ int parse_events__modifier_event(struct list_head *list, char *str, bool add)
 	if (!add && get_event_modifier(&mod, str, NULL))
 		return -EINVAL;
 
-	__evlist__for_each(list, evsel) {
+	__evlist__for_each_entry(list, evsel) {
 		if (add && get_event_modifier(&mod, str, evsel))
 			return -EINVAL;
 
@@ -1190,7 +1218,7 @@ int parse_events_name(struct list_head *list, char *name)
 {
 	struct perf_evsel *evsel;
 
-	__evlist__for_each(list, evsel) {
+	__evlist__for_each_entry(list, evsel) {
 		if (!evsel->name)
 			evsel->name = strdup(name);
 	}
@@ -1424,7 +1452,7 @@ static void parse_events_print_error(struct parse_events_error *err,
 
 		buf = _buf;
 
-		/* We're cutting from the beggining. */
+		/* We're cutting from the beginning. */
 		if (err->idx > max_err_idx)
 			cut = err->idx - max_err_idx;
 
@@ -2201,9 +2229,9 @@ static void config_terms_list(char *buf, size_t buf_sz)
 char *parse_events_formats_error_string(char *additional_terms)
 {
 	char *str;
-	/* "branch_type" is the longest name */
+	/* "no-overwrite" is the longest name */
 	char static_terms[__PARSE_EVENTS__TERM_TYPE_NR *
-			  (sizeof("branch_type") - 1)];
+			  (sizeof("no-overwrite") - 1)];
 
 	config_terms_list(static_terms, sizeof(static_terms));
 	/* valid terms */

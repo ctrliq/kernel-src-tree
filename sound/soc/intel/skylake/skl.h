@@ -72,7 +72,7 @@ struct skl {
 	struct platform_device *i2s_dev;
 	struct snd_soc_platform *platform;
 
-	void __iomem *nhlt; /* nhlt ptr */
+	struct nhlt_acpi_table *nhlt; /* nhlt ptr */
 	struct skl_sst *skl_sst; /* sst skl ctx */
 
 	struct skl_dsp_resource resource;
@@ -115,8 +115,8 @@ struct skl_dsp_ops {
 int skl_platform_unregister(struct device *dev);
 int skl_platform_register(struct device *dev);
 
-void __iomem *skl_nhlt_init(struct device *dev);
-void skl_nhlt_free(void __iomem *addr);
+struct nhlt_acpi_table *skl_nhlt_init(struct device *dev);
+void skl_nhlt_free(struct nhlt_acpi_table *addr);
 struct nhlt_specific_cfg *skl_get_ep_blob(struct skl *skl, u32 instance,
 			u8 link_type, u8 s_fmt, u8 no_ch, u32 s_rate, u8 dirn);
 

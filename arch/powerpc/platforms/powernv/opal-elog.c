@@ -251,6 +251,7 @@ static void elog_work_fn(struct work_struct *work)
 	uint64_t elog_type;
 	int rc;
 	char name[2+16+1];
+	struct kobject *kobj;
 
 	rc = opal_get_elog_size(&id, &size, &type);
 	if (rc != OPAL_SUCCESS) {
@@ -273,8 +274,12 @@ static void elog_work_fn(struct work_struct *work)
 	 * that gracefully and not create two conflicting
 	 * entries.
 	 */
-	if (kset_find_obj(elog_kset, name))
+	kobj = kset_find_obj(elog_kset, name);
+	if (kobj) {
+		/* Drop reference added by kset_find_obj() */
+		kobject_put(kobj);
 		return;
+	}
 
 	create_elog_obj(log_id, elog_size, elog_type);
 }

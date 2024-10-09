@@ -126,6 +126,9 @@ struct hv_ring_buffer_info {
 
 	u32 ring_datasize;		/* < ring_size */
 	u32 ring_data_startoffset;
+	u32 priv_write_index;
+	u32 priv_read_index;
+	u32 cached_read_index;
 };
 
 /*
@@ -178,6 +181,19 @@ static inline u32 hv_get_bytes_to_write(struct hv_ring_buffer_info *rbi)
 	return write;
 }
 
+static inline u32 hv_get_cached_bytes_to_write(
+	const struct hv_ring_buffer_info *rbi)
+{
+	u32 read_loc, write_loc, dsize, write;
+
+	dsize = rbi->ring_datasize;
+	read_loc = rbi->cached_read_index;
+	write_loc = rbi->ring_buffer->write_index;
+
+	write = write_loc >= read_loc ? dsize - (write_loc - read_loc) :
+		read_loc - write_loc;
+	return write;
+}
 /*
  * VMBUS version is 32 bit entity broken up into
  * two 16 bit quantities: major_number. minor_number.
@@ -704,9 +720,6 @@ struct vmbus_device {
 };
 
 struct vmbus_channel {
-	/* Unique channel id */
-	int id;
-
 	struct list_head listentry;
 
 	struct hv_device *device_obj;
@@ -796,6 +809,12 @@ struct vmbus_channel {
 	 * The guest can open the sub-channel in the context of this callback.
 	 */
 	void (*sc_creation_callback)(struct vmbus_channel *new_sc);
+
+	/*
+	 * Channel rescind callback. Some channels (the hvsock ones), need to
+	 * register a callback which is invoked in vmbus_onoffer_rescind().
+	 */
+	void (*chn_rescind_callback)(struct vmbus_channel *channel);
 
 	/*
 	 * The spinlock to protect the structure. It is being used to protect
@@ -951,6 +970,9 @@ int vmbus_request_offers(void);
 
 void vmbus_set_sc_create_callback(struct vmbus_channel *primary_channel,
 			void (*sc_cr_cb)(struct vmbus_channel *new_sc));
+
+void vmbus_set_chn_rescind_callback(struct vmbus_channel *channel,
+		void (*chn_rescind_cb)(struct vmbus_channel *));
 
 /*
  * Retrieve the (sub) channel on which to send an outgoing request.
@@ -1111,6 +1133,12 @@ struct hv_driver {
 
 	struct device_driver driver;
 
+	/* dynamic device GUID's */
+	struct  {
+		spinlock_t lock;
+		struct list_head list;
+	} dynids;
+
 	int (*probe)(struct hv_device *, const struct hv_vmbus_device_id *);
 	int (*remove)(struct hv_device *);
 	void (*shutdown)(struct hv_device *);
@@ -1160,6 +1188,8 @@ int __must_check __vmbus_driver_register(struct hv_driver *hv_driver,
 					 struct module *owner,
 					 const char *mod_name);
 void vmbus_driver_unregister(struct hv_driver *hv_driver);
+
+void vmbus_hvsock_device_unregister(struct vmbus_channel *channel);
 
 int vmbus_allocate_mmio(struct resource **new, struct hv_device *device_obj,
 			resource_size_t min, resource_size_t max,
@@ -1450,6 +1480,7 @@ void hv_event_tasklet_enable(struct vmbus_channel *channel);
 
 void hv_process_channel_removal(struct vmbus_channel *channel, u32 relid);
 
+void vmbus_setevent(struct vmbus_channel *channel);
 /*
  * Negotiated version with the Host.
  */
@@ -1459,4 +1490,146 @@ extern __u32 vmbus_proto_version;
 int vmbus_send_tl_connect_request(const uuid_le *shv_guest_servie_id,
 				  const uuid_le *shv_host_servie_id);
 void vmbus_set_event(struct vmbus_channel *channel);
+
+/* Get the start of the ring buffer. */
+static inline void *
+hv_get_ring_buffer(struct hv_ring_buffer_info *ring_info)
+{
+	return (void *)ring_info->ring_buffer->buffer;
+}
+
+/*
+ * To optimize the flow management on the send-side,
+ * when the sender is blocked because of lack of
+ * sufficient space in the ring buffer, potential the
+ * consumer of the ring buffer can signal the producer.
+ * This is controlled by the following parameters:
+ *
+ * 1. pending_send_sz: This is the size in bytes that the
+ *    producer is trying to send.
+ * 2. The feature bit feat_pending_send_sz set to indicate if
+ *    the consumer of the ring will signal when the ring
+ *    state transitions from being full to a state where
+ *    there is room for the producer to send the pending packet.
+ */
+
+static inline  void hv_signal_on_read(struct vmbus_channel *channel)
+{
+	u32 cur_write_sz, cached_write_sz;
+	u32 pending_sz;
+	struct hv_ring_buffer_info *rbi = &channel->inbound;
+
+	/*
+	 * Issue a full memory barrier before making the signaling decision.
+	 * Here is the reason for having this barrier:
+	 * If the reading of the pend_sz (in this function)
+	 * were to be reordered and read before we commit the new read
+	 * index (in the calling function)  we could
+	 * have a problem. If the host were to set the pending_sz after we
+	 * have sampled pending_sz and go to sleep before we commit the
+	 * read index, we could miss sending the interrupt. Issue a full
+	 * memory barrier to address this.
+	 */
+	mb();
+
+	pending_sz = READ_ONCE(rbi->ring_buffer->pending_send_sz);
+	/* If the other end is not blocked on write don't bother. */
+	if (pending_sz == 0)
+		return;
+
+	cur_write_sz = hv_get_bytes_to_write(rbi);
+
+	if (cur_write_sz < pending_sz)
+		return;
+
+	cached_write_sz = hv_get_cached_bytes_to_write(rbi);
+	if (cached_write_sz < pending_sz)
+		vmbus_setevent(channel);
+
+	return;
+}
+
+static inline void
+init_cached_read_index(struct vmbus_channel *channel)
+{
+	struct hv_ring_buffer_info *rbi = &channel->inbound;
+
+	rbi->cached_read_index = rbi->ring_buffer->read_index;
+}
+
+/*
+ * An API to support in-place processing of incoming VMBUS packets.
+ */
+#define VMBUS_PKT_TRAILER	8
+
+static inline struct vmpacket_descriptor *
+get_next_pkt_raw(struct vmbus_channel *channel)
+{
+	struct hv_ring_buffer_info *ring_info = &channel->inbound;
+	u32 priv_read_loc = ring_info->priv_read_index;
+	void *ring_buffer = hv_get_ring_buffer(ring_info);
+	u32 dsize = ring_info->ring_datasize;
+	/*
+	 * delta is the difference between what is available to read and
+	 * what was already consumed in place. We commit read index after
+	 * the whole batch is processed.
+	 */
+	u32 delta = priv_read_loc >= ring_info->ring_buffer->read_index ?
+		priv_read_loc - ring_info->ring_buffer->read_index :
+		(dsize - ring_info->ring_buffer->read_index) + priv_read_loc;
+	u32 bytes_avail_toread = (hv_get_bytes_to_read(ring_info) - delta);
+
+	if (bytes_avail_toread < sizeof(struct vmpacket_descriptor))
+		return NULL;
+
+	return ring_buffer + priv_read_loc;
+}
+
+/*
+ * A helper function to step through packets "in-place"
+ * This API is to be called after each successful call
+ * get_next_pkt_raw().
+ */
+static inline void put_pkt_raw(struct vmbus_channel *channel,
+				struct vmpacket_descriptor *desc)
+{
+	struct hv_ring_buffer_info *ring_info = &channel->inbound;
+	u32 packetlen = desc->len8 << 3;
+	u32 dsize = ring_info->ring_datasize;
+
+	/*
+	 * Include the packet trailer.
+	 */
+	ring_info->priv_read_index += packetlen + VMBUS_PKT_TRAILER;
+	ring_info->priv_read_index %= dsize;
+}
+
+/*
+ * This call commits the read index and potentially signals the host.
+ * Here is the pattern for using the "in-place" consumption APIs:
+ *
+ * init_cached_read_index();
+ *
+ * while (get_next_pkt_raw() {
+ *	process the packet "in-place";
+ *	put_pkt_raw();
+ * }
+ * if (packets processed in place)
+ *	commit_rd_index();
+ */
+static inline void commit_rd_index(struct vmbus_channel *channel)
+{
+	struct hv_ring_buffer_info *ring_info = &channel->inbound;
+	/*
+	 * Make sure all reads are done before we update the read index since
+	 * the writer may start writing to the read area once the read index
+	 * is updated.
+	 */
+	rmb();
+	ring_info->ring_buffer->read_index = ring_info->priv_read_index;
+
+	hv_signal_on_read(channel);
+}
+
+
 #endif /* _HYPERV_H */

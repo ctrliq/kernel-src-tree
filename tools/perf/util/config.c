@@ -373,7 +373,7 @@ int perf_config_bool(const char *name, const char *value)
 	return !!perf_config_bool_or_int(name, value, &discard);
 }
 
-const char *perf_config_dirname(const char *name, const char *value)
+static const char *perf_config_dirname(const char *name, const char *value)
 {
 	if (!name)
 		return NULL;
@@ -386,8 +386,10 @@ static int perf_buildid_config(const char *var, const char *value)
 	if (!strcmp(var, "buildid.dir")) {
 		const char *dir = perf_config_dirname(var, value);
 
-		if (!dir)
+		if (!dir) {
+			pr_err("Invalid buildid directory!\n");
 			return -1;
+		}
 		strncpy(buildid_dir, dir, MAXPATHLEN-1);
 		buildid_dir[MAXPATHLEN-1] = '\0';
 	}
@@ -405,10 +407,9 @@ static int perf_default_core_config(const char *var __maybe_unused,
 static int perf_ui_config(const char *var, const char *value)
 {
 	/* Add other config variables here. */
-	if (!strcmp(var, "ui.show-headers")) {
+	if (!strcmp(var, "ui.show-headers"))
 		symbol_conf.show_hist_headers = perf_config_bool(var, value);
-		return 0;
-	}
+
 	return 0;
 }
 

@@ -9,13 +9,13 @@ struct tcf_mirred {
 	int			tcfm_eaction;
 	int			tcfm_ifindex;
 	int			tcfm_ok_push;
-	struct net_device	*tcfm_dev;
+	struct net_device __rcu	*tcfm_dev;
 	struct list_head	tcfm_list;
 };
-#define to_mirred(pc) \
-	container_of(pc, struct tcf_mirred, common)
+#define to_mirred(a) \
+	container_of(a->priv, struct tcf_mirred, common)
 
-static inline bool is_tcf_mirred_redirect(const struct tc_action *a)
+static inline bool is_tcf_mirred_egress_redirect(const struct tc_action *a)
 {
 #ifdef CONFIG_NET_CLS_ACT
 	if (a->ops && a->ops->type == TCA_ACT_MIRRED)
@@ -24,7 +24,7 @@ static inline bool is_tcf_mirred_redirect(const struct tc_action *a)
 	return false;
 }
 
-static inline bool is_tcf_mirred_mirror(const struct tc_action *a)
+static inline bool is_tcf_mirred_egress_mirror(const struct tc_action *a)
 {
 #ifdef CONFIG_NET_CLS_ACT
 	if (a->ops && a->ops->type == TCA_ACT_MIRRED)

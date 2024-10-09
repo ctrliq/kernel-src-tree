@@ -21,6 +21,9 @@
 #include <asm/pgalloc.h>
 #include <asm/prom.h>
 #include <asm/sections.h>
+#ifdef CONFIG_KEXEC_AUTO_RESERVE
+#include <asm/fadump.h>
+#endif
 
 void machine_kexec_mask_interrupts(void) {
 	unsigned int i;
@@ -123,6 +126,13 @@ unsigned long long __init arch_default_crash_base(void)
 
 unsigned long long __init arch_default_crash_size(unsigned long long total_size)
 {
+	/*
+	 * 'crashkernel=' can be used for fadump memory reservation as well.
+	 * So, if fadump is enabled, calculate auto value for it accordingly.
+	 */
+	if (is_fadump_enabled())
+		return fadump_default_reserve_size();
+
 	if (total_size < KEXEC_AUTO_THRESHOLD)
 		return 0;
 

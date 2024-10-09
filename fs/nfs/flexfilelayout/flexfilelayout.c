@@ -753,7 +753,7 @@ ff_layout_alloc_commit_info(struct pnfs_layout_segment *lseg,
 	else {
 		int i;
 
-		spin_lock(cinfo->lock);
+		spin_lock(&cinfo->inode->i_lock);
 		if (cinfo->ds->nbuckets != 0)
 			kfree(buckets);
 		else {
@@ -767,7 +767,7 @@ ff_layout_alloc_commit_info(struct pnfs_layout_segment *lseg,
 					NFS_INVALID_STABLE_HOW;
 			}
 		}
-		spin_unlock(cinfo->lock);
+		spin_unlock(&cinfo->inode->i_lock);
 		return 0;
 	}
 }
@@ -779,11 +779,14 @@ ff_layout_choose_best_ds_for_read(struct pnfs_layout_segment *lseg,
 {
 	struct nfs4_ff_layout_segment *fls = FF_LAYOUT_LSEG(lseg);
 	struct nfs4_pnfs_ds *ds;
+	bool fail_return = false;
 	int idx;
 
 	/* mirrors are sorted by efficiency */
 	for (idx = start_idx; idx < fls->mirror_array_cnt; idx++) {
-		ds = nfs4_ff_layout_prepare_ds(lseg, idx, false);
+		if (idx+1 == fls->mirror_array_cnt)
+			fail_return = true;
+		ds = nfs4_ff_layout_prepare_ds(lseg, idx, fail_return);
 		if (ds) {
 			*best_idx = idx;
 			return ds;
@@ -791,6 +794,36 @@ ff_layout_choose_best_ds_for_read(struct pnfs_layout_segment *lseg,
 	}
 
 	return NULL;
+}
+
+static void
+ff_layout_pg_get_read(struct nfs_pageio_descriptor *pgio,
+		      struct nfs_page *req,
+		      bool strict_iomode)
+{
+retry_strict:
+	pnfs_put_lseg(pgio->pg_lseg);
+	pgio->pg_lseg = pnfs_update_layout(pgio->pg_inode,
+					   req->wb_context,
+					   0,
+					   NFS4_MAX_UINT64,
+					   IOMODE_READ,
+					   strict_iomode,
+					   GFP_KERNEL);
+	if (IS_ERR(pgio->pg_lseg)) {
+		pgio->pg_error = PTR_ERR(pgio->pg_lseg);
+		pgio->pg_lseg = NULL;
+	}
+
+	/* If we don't have checking, do get a IOMODE_RW
+	 * segment, and the server wants to avoid READs
+	 * there, then retry!
+	 */
+	if (pgio->pg_lseg && !strict_iomode &&
+	    ff_layout_avoid_read_on_rw(pgio->pg_lseg)) {
+		strict_iomode = true;
+		goto retry_strict;
+	}
 }
 
 static void
@@ -802,20 +835,12 @@ ff_layout_pg_init_read(struct nfs_pageio_descriptor *pgio,
 	struct nfs4_pnfs_ds *ds;
 	int ds_idx;
 
+retry:
 	/* Use full layout for now */
-	if (!pgio->pg_lseg || ff_layout_avoid_read_on_rw(pgio->pg_lseg)) {
-		pnfs_put_lseg(pgio->pg_lseg);
-		pgio->pg_lseg = pnfs_update_layout(pgio->pg_inode,
-						   req->wb_context,
-						   0,
-						   NFS4_MAX_UINT64,
-						   IOMODE_READ,
-						   GFP_KERNEL);
-		if (IS_ERR(pgio->pg_lseg)) {
-			pgio->pg_error = PTR_ERR(pgio->pg_lseg);
-			pgio->pg_lseg = NULL;
-		}
-	}
+	if (!pgio->pg_lseg)
+		ff_layout_pg_get_read(pgio, req, false);
+	else if (ff_layout_avoid_read_on_rw(pgio->pg_lseg))
+		ff_layout_pg_get_read(pgio, req, true);
 
 	/* If no lseg, fall back to read through mds */
 	if (pgio->pg_lseg == NULL)
@@ -823,10 +848,13 @@ ff_layout_pg_init_read(struct nfs_pageio_descriptor *pgio,
 
 	ds = ff_layout_choose_best_ds_for_read(pgio->pg_lseg, 0, &ds_idx);
 	if (!ds) {
-		if (ff_layout_no_fallback_to_mds(pgio->pg_lseg))
-			goto out_pnfs;
-		else
+		if (!ff_layout_no_fallback_to_mds(pgio->pg_lseg))
 			goto out_mds;
+		pnfs_put_lseg(pgio->pg_lseg);
+		pgio->pg_lseg = NULL;
+		/* Sleep for 1 second before retrying */
+		ssleep(1);
+		goto retry;
 	}
 
 	mirror = FF_LAYOUT_COMP(pgio->pg_lseg, ds_idx);
@@ -842,12 +870,6 @@ out_mds:
 	pnfs_put_lseg(pgio->pg_lseg);
 	pgio->pg_lseg = NULL;
 	nfs_pageio_reset_read_mds(pgio);
-	return;
-
-out_pnfs:
-	pnfs_set_lo_fail(pgio->pg_lseg);
-	pnfs_put_lseg(pgio->pg_lseg);
-	pgio->pg_lseg = NULL;
 }
 
 static void
@@ -861,12 +883,14 @@ ff_layout_pg_init_write(struct nfs_pageio_descriptor *pgio,
 	int i;
 	int status;
 
+retry:
 	if (!pgio->pg_lseg) {
 		pgio->pg_lseg = pnfs_update_layout(pgio->pg_inode,
 						   req->wb_context,
 						   0,
 						   NFS4_MAX_UINT64,
 						   IOMODE_RW,
+						   false,
 						   GFP_NOFS);
 		if (IS_ERR(pgio->pg_lseg)) {
 			pgio->pg_error = PTR_ERR(pgio->pg_lseg);
@@ -891,10 +915,13 @@ ff_layout_pg_init_write(struct nfs_pageio_descriptor *pgio,
 	for (i = 0; i < pgio->pg_mirror_count; i++) {
 		ds = nfs4_ff_layout_prepare_ds(pgio->pg_lseg, i, true);
 		if (!ds) {
-			if (ff_layout_no_fallback_to_mds(pgio->pg_lseg))
-				goto out_pnfs;
-			else
+			if (!ff_layout_no_fallback_to_mds(pgio->pg_lseg))
 				goto out_mds;
+			pnfs_put_lseg(pgio->pg_lseg);
+			pgio->pg_lseg = NULL;
+			/* Sleep for 1 second before retrying */
+			ssleep(1);
+			goto retry;
 		}
 		pgm = &pgio->pg_mirrors[i];
 		mirror = FF_LAYOUT_COMP(pgio->pg_lseg, i);
@@ -907,12 +934,6 @@ out_mds:
 	pnfs_put_lseg(pgio->pg_lseg);
 	pgio->pg_lseg = NULL;
 	nfs_pageio_reset_write_mds(pgio);
-	return;
-
-out_pnfs:
-	pnfs_set_lo_fail(pgio->pg_lseg);
-	pnfs_put_lseg(pgio->pg_lseg);
-	pgio->pg_lseg = NULL;
 }
 
 static unsigned int
@@ -925,6 +946,7 @@ ff_layout_pg_get_mirror_count_write(struct nfs_pageio_descriptor *pgio,
 						   0,
 						   NFS4_MAX_UINT64,
 						   IOMODE_RW,
+						   false,
 						   GFP_NOFS);
 		if (IS_ERR(pgio->pg_lseg)) {
 			pgio->pg_error = PTR_ERR(pgio->pg_lseg);
@@ -1244,8 +1266,6 @@ static int ff_layout_read_done_cb(struct rpc_task *task,
 					hdr->pgio_mirror_idx + 1,
 					&hdr->pgio_mirror_idx))
 			goto out_eagain;
-		set_bit(NFS_LAYOUT_RETURN_BEFORE_CLOSE,
-			&hdr->lseg->pls_layout->plh_flags);
 		pnfs_read_resend_pnfs(hdr);
 		return task->tk_status;
 	case -NFS4ERR_RESET_TO_MDS:
@@ -2254,7 +2274,6 @@ static int __init nfs4flexfilelayout_init(void)
 {
 	printk(KERN_INFO "%s: NFSv4 Flexfile Layout Driver Registering...\n",
 	       __func__);
-	mark_tech_preview("NFSv4 Flexfile Layout Driver", NULL);
 	if (!ff_zero_group) {
 		ff_zero_group = groups_alloc(0);
 		if (!ff_zero_group)

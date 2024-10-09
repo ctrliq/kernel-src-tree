@@ -143,8 +143,8 @@ static struct linear_conf *linear_conf(struct mddev *mddev, int raid_disks)
 		sector_t sectors;
 
 		if (j < 0 || j >= raid_disks || disk->rdev) {
-			printk(KERN_ERR "md/linear:%s: disk numbering problem. Aborting!\n",
-			       mdname(mddev));
+			pr_warn("md/linear:%s: disk numbering problem. Aborting!\n",
+				mdname(mddev));
 			goto out;
 		}
 
@@ -165,8 +165,8 @@ static struct linear_conf *linear_conf(struct mddev *mddev, int raid_disks)
 			discard_supported = true;
 	}
 	if (cnt != raid_disks) {
-		printk(KERN_ERR "md/linear:%s: not enough drives present. Aborting!\n",
-		       mdname(mddev));
+		pr_warn("md/linear:%s: not enough drives present. Aborting!\n",
+			mdname(mddev));
 		goto out;
 	}
 
@@ -256,14 +256,14 @@ static void linear_free(struct mddev *mddev, void *priv)
 	kfree(conf);
 }
 
-static void linear_make_request(struct mddev *mddev, struct bio *bio)
+static bool linear_make_request(struct mddev *mddev, struct bio *bio)
 {
 	struct dev_info *tmp_dev;
 	sector_t start_sector;
 
 	if (unlikely(bio->bi_rw & REQ_FLUSH)) {
 		md_flush_request(mddev, bio);
-		return;
+		return true;
 	}
 
 	tmp_dev = which_dev(mddev, bio->bi_sector);
@@ -274,16 +274,14 @@ static void linear_make_request(struct mddev *mddev, struct bio *bio)
 		     || (bio->bi_sector < start_sector))) {
 		char b[BDEVNAME_SIZE];
 
-		printk(KERN_ERR
-		       "md/linear:%s: make_request: Sector %llu out of bounds on "
-		       "dev %s: %llu sectors, offset %llu\n",
+		pr_err("md/linear:%s: make_request: Sector %llu out of bounds on dev %s: %llu sectors, offset %llu\n",
 		       mdname(mddev),
 		       (unsigned long long)bio->bi_sector,
 		       bdevname(tmp_dev->rdev->bdev, b),
 		       (unsigned long long)tmp_dev->rdev->sectors,
 		       (unsigned long long)start_sector);
 		bio_io_error(bio);
-		return;
+		return true;
 	}
 	if (unlikely(bio_end_sector(bio) > tmp_dev->end_sector)) {
 		/* This bio crosses a device boundary, so we have to
@@ -297,7 +295,7 @@ static void linear_make_request(struct mddev *mddev, struct bio *bio)
 		linear_make_request(mddev, &bp->bio1);
 		linear_make_request(mddev, &bp->bio2);
 		bio_pair_release(bp);
-		return;
+		return true;
 	}
 		    
 	bio->bi_bdev = tmp_dev->rdev->bdev;
@@ -308,15 +306,15 @@ static void linear_make_request(struct mddev *mddev, struct bio *bio)
 		     !blk_queue_discard(bdev_get_queue(bio->bi_bdev)))) {
 		/* Just ignore it */
 		bio_endio(bio, 0);
-		return;
+		return true;
 	}
 
 	generic_make_request(bio);
+	return true;
 }
 
 static void linear_status (struct seq_file *seq, struct mddev *mddev)
 {
-
 	seq_printf(seq, " %dk rounding", mddev->chunk_sectors / 2);
 }
 

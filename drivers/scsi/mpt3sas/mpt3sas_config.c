@@ -285,7 +285,6 @@ _config_request(struct MPT3SAS_ADAPTER *ioc, Mpi2ConfigRequest_t
 {
 	u16 smid;
 	u32 ioc_state;
-	unsigned long timeleft;
 	Mpi2ConfigRequest_t *config_request;
 	int r;
 	u8 retry_count, issue_host_reset = 0;
@@ -385,9 +384,8 @@ _config_request(struct MPT3SAS_ADAPTER *ioc, Mpi2ConfigRequest_t
 	memcpy(config_request, mpi_request, sizeof(Mpi2ConfigRequest_t));
 	_config_display_some_debug(ioc, smid, "config_request", NULL);
 	init_completion(&ioc->config_cmds.done);
-	mpt3sas_base_put_smid_default(ioc, smid);
-	timeleft = wait_for_completion_timeout(&ioc->config_cmds.done,
-	    timeout*HZ);
+	ioc->put_smid_default(ioc, smid);
+	wait_for_completion_timeout(&ioc->config_cmds.done, timeout*HZ);
 	if (!(ioc->config_cmds.status & MPT3_CMD_COMPLETE)) {
 		pr_err(MPT3SAS_FMT "%s: timeout\n",
 		    ioc->name, __func__);

@@ -261,29 +261,6 @@ xfs_set_mode(struct inode *inode, umode_t mode)
 	return error;
 }
 
-static int
-xfs_acl_exists(struct inode *inode, unsigned char *name)
-{
-	int len = XFS_ACL_MAX_SIZE(XFS_M(inode->i_sb));
-
-	return (xfs_attr_get(XFS_I(inode), name, NULL, &len,
-			    ATTR_ROOT|ATTR_KERNOVAL) == 0);
-}
-
-int
-posix_acl_access_exists(struct inode *inode)
-{
-	return xfs_acl_exists(inode, SGI_ACL_FILE);
-}
-
-int
-posix_acl_default_exists(struct inode *inode)
-{
-	if (!S_ISDIR(inode->i_mode))
-		return 0;
-	return xfs_acl_exists(inode, SGI_ACL_DEFAULT);
-}
-
 /*
  * No need for i_mutex because the inode is not yet exposed to the VFS.
  */
@@ -369,7 +346,7 @@ xfs_xattr_acl_set(struct dentry *dentry, const char *name,
 		const void *value, size_t size, int flags, int type)
 {
 	struct inode *inode = dentry->d_inode;
-	struct posix_acl *acl = NULL;
+	struct posix_acl *acl = NULL, *real_acl = NULL;
 	int error = 0;
 
 	if (flags & XATTR_CREATE)
@@ -403,17 +380,13 @@ xfs_xattr_acl_set(struct dentry *dentry, const char *name,
 	if (acl->a_count > XFS_ACL_MAX_ENTRIES(XFS_M(inode->i_sb)))
 		goto out_release;
 
+	real_acl = acl;
 	if (type == ACL_TYPE_ACCESS) {
-		umode_t mode = inode->i_mode;
-		error = posix_acl_equiv_mode(acl, &mode);
+		umode_t mode;
 
-		if (error <= 0) {
-			posix_acl_release(acl);
-			acl = NULL;
-
-			if (error < 0)
-				return error;
-		}
+		error = posix_acl_update_mode(inode, &mode, &real_acl);
+		if (error)
+			goto out_release;
 
 		error = xfs_set_mode(inode, mode);
 		if (error)
@@ -421,7 +394,7 @@ xfs_xattr_acl_set(struct dentry *dentry, const char *name,
 	}
 
  set_acl:
-	error = xfs_set_acl(inode, type, acl);
+	error = xfs_set_acl(inode, type, real_acl);
  out_release:
 	posix_acl_release(acl);
  out:

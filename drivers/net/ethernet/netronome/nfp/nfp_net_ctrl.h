@@ -50,7 +50,7 @@
 /**
  * Configuration BAR size.
  *
- * The configuration BAR is 8K in size, but on the NFP6000, due to
+ * The configuration BAR is 8K in size, but due to
  * THB-350, 32k needs to be reserved.
  */
 #define NFP_NET_CFG_BAR_SZ              (32 * 1024)
@@ -177,18 +177,13 @@
 #define NFP_NET_CFG_START_RXQ           0x004c
 
 /**
- * NFP-3200 workaround (0x0050 - 0x0058)
- * @NFP_NET_CFG_SPARE_ADDR:  DMA address for ME code to use (e.g. YDS-155 fix)
- */
-#define NFP_NET_CFG_SPARE_ADDR          0x0050
-/**
- * NFP6000/NFP4000 - Prepend configuration
+ * Prepend configuration
  */
 #define NFP_NET_CFG_RX_OFFSET		0x0050
 #define NFP_NET_CFG_RX_OFFSET_DYNAMIC		0	/* Prepend mode */
 
 /**
- * NFP6000/NFP4000 - VXLAN/UDP encap configuration
+ * VXLAN/UDP encap configuration
  * @NFP_NET_CFG_VXLAN_PORT:	Base address of table of tunnels' UDP dst ports
  * @NFP_NET_CFG_VXLAN_SZ:	Size of the UDP port table in bytes
  */

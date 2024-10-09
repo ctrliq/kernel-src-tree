@@ -338,28 +338,6 @@ extern int xfs_buf_delwri_submit_nowait(struct list_head *);
 extern int xfs_buf_init(void);
 extern void xfs_buf_terminate(void);
 
-#define XFS_BUF_ZEROFLAGS(bp) \
-	((bp)->b_flags &= ~(XBF_READ|XBF_WRITE|XBF_ASYNC| \
-			    XBF_SYNCIO|XBF_FUA|XBF_FLUSH| \
-			    XBF_WRITE_FAIL))
-
-
-#define XFS_BUF_DONE(bp)	((bp)->b_flags |= XBF_DONE)
-#define XFS_BUF_UNDONE(bp)	((bp)->b_flags &= ~XBF_DONE)
-#define XFS_BUF_ISDONE(bp)	((bp)->b_flags & XBF_DONE)
-
-#define XFS_BUF_ASYNC(bp)	((bp)->b_flags |= XBF_ASYNC)
-#define XFS_BUF_UNASYNC(bp)	((bp)->b_flags &= ~XBF_ASYNC)
-#define XFS_BUF_ISASYNC(bp)	((bp)->b_flags & XBF_ASYNC)
-
-#define XFS_BUF_READ(bp)	((bp)->b_flags |= XBF_READ)
-#define XFS_BUF_UNREAD(bp)	((bp)->b_flags &= ~XBF_READ)
-#define XFS_BUF_ISREAD(bp)	((bp)->b_flags & XBF_READ)
-
-#define XFS_BUF_WRITE(bp)	((bp)->b_flags |= XBF_WRITE)
-#define XFS_BUF_UNWRITE(bp)	((bp)->b_flags &= ~XBF_WRITE)
-#define XFS_BUF_ISWRITE(bp)	((bp)->b_flags & XBF_WRITE)
-
 /*
  * These macros use the IO block map rather than b_bn. b_bn is now really
  * just for the buffer cache index for cached buffers. As IO does not use b_bn

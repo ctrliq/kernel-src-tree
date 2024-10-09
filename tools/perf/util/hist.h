@@ -262,6 +262,12 @@ struct perf_hpp_list {
 
 	int nr_header_lines;
 	int need_collapse;
+	int parent;
+	int sym;
+	int dso;
+	int socket;
+	int thread;
+	int comm;
 };
 
 extern struct perf_hpp_list perf_hpp_list;

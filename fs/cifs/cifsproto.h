@@ -105,7 +105,7 @@ extern int SendReceiveBlockingLock(const unsigned int xid,
 			struct smb_hdr *out_buf,
 			int *bytes_returned);
 extern int cifs_reconnect(struct TCP_Server_Info *server);
-extern int checkSMB(char *buf, unsigned int length);
+extern int checkSMB(char *buf, unsigned int len, struct TCP_Server_Info *srvr);
 extern bool is_valid_oplock_break(char *, struct TCP_Server_Info *);
 extern bool backup_cred(struct cifs_sb_info *);
 extern bool is_size_safe_to_change(struct cifsInodeInfo *, __u64 eof);
@@ -188,7 +188,7 @@ extern int cifs_read_from_socket(struct TCP_Server_Info *server, char *buf,
 extern int cifs_readv_from_socket(struct TCP_Server_Info *server,
 		struct kvec *iov_orig, unsigned int nr_segs,
 		unsigned int to_read);
-extern void cifs_setup_cifs_sb(struct smb_vol *pvolume_info,
+extern int cifs_setup_cifs_sb(struct smb_vol *pvolume_info,
 			       struct cifs_sb_info *cifs_sb);
 extern int cifs_match_super(struct super_block *, void *);
 extern void cifs_cleanup_volume_info(struct smb_vol *pvolume_info);
@@ -210,6 +210,9 @@ extern void cifs_add_pending_open_locked(struct cifs_fid *fid,
 					 struct tcon_link *tlink,
 					 struct cifs_pending_open *open);
 extern void cifs_del_pending_open(struct cifs_pending_open *open);
+extern void cifs_put_tcp_session(struct TCP_Server_Info *server,
+				 int from_reconnect);
+extern void cifs_put_tcon(struct cifs_tcon *tcon);
 
 #if IS_ENABLED(CONFIG_CIFS_DFS_UPCALL)
 extern void cifs_dfs_release_automount_timer(void);
@@ -443,7 +446,8 @@ extern int setup_ntlm_response(struct cifs_ses *, const struct nls_table *);
 extern int setup_ntlmv2_rsp(struct cifs_ses *, const struct nls_table *);
 extern void cifs_crypto_shash_release(struct TCP_Server_Info *);
 extern int calc_seckey(struct cifs_ses *);
-extern int generate_smb3signingkey(struct cifs_ses *);
+extern int generate_smb30signingkey(struct cifs_ses *);
+extern int generate_smb311signingkey(struct cifs_ses *);
 
 #ifdef CONFIG_CIFS_WEAK_PW_HASH
 extern int calc_lanman_hash(const char *password, const char *cryptkey,

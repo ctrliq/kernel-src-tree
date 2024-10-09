@@ -719,10 +719,26 @@ retry:
 		inode_dio_end(inode);
 	} else {
 locked:
-		if (IS_DAX(inode))
+		if (IS_DAX(inode)) {
+			get_block_t *get_block_func = NULL;
+
+			/*
+			 * We can avoid zeroing for aligned DAX writes beyond
+			 * EOF. Other writes need zeroing either because they
+			 * can race with page faults or because they use partial
+			 * blocks.
+			 */
+			if (rw == READ)
+				get_block_func = ext4_get_block;
+			else if (round_down(offset, 1<<inode->i_blkbits) >=
+								inode->i_size &&
+			    ext4_aligned_io(inode, offset, count))
+				get_block_func = ext4_get_block;
+			else
+				get_block_func = ext4_dax_get_block;
 			ret = dax_do_io(rw, iocb, inode, iov, offset, nr_segs,
-					ext4_get_block, NULL, DIO_LOCKING);
-		else
+					get_block_func, NULL, DIO_LOCKING);
+		} else
 			ret = blockdev_direct_IO(rw, iocb, inode, iov,
 					offset, nr_segs, ext4_get_block);
 

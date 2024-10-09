@@ -316,6 +316,9 @@ enum scsi_target_state {
 	STARGET_CREATED = 1,
 	STARGET_RUNNING,
 	STARGET_DEL,
+#ifndef __GENKSYMS__
+	STARGET_REMOVE,
+#endif
 };
 
 /*
@@ -555,7 +558,8 @@ static inline int scsi_device_created(struct scsi_device *sdev)
 		sdev->sdev_state == SDEV_CREATED_BLOCK;
 }
 
-int scsi_internal_device_block(struct scsi_device *sdev, bool wait);
+int scsi_internal_device_block(struct scsi_device *sdev);
+int scsi_internal_device_block_nowait(struct scsi_device *sdev);
 int scsi_internal_device_unblock(struct scsi_device *sdev,
 				 enum scsi_device_state new_state);
 

@@ -1013,7 +1013,7 @@ no_mem:
 
 /* Helper to create ABORT with a SCTP_ERROR_USER_ABORT error.  */
 struct sctp_chunk *sctp_make_abort_user(const struct sctp_association *asoc,
-					const struct msghdr *msg,
+					struct msghdr *msg,
 					size_t paylen)
 {
 	struct sctp_chunk *retval;
@@ -1030,7 +1030,7 @@ struct sctp_chunk *sctp_make_abort_user(const struct sctp_association *asoc,
 		if (!payload)
 			goto err_payload;
 
-		err = memcpy_fromiovec(payload, msg->msg_iov, paylen);
+		err = memcpy_from_msg(payload, msg, paylen);
 		if (err < 0)
 			goto err_copy;
 	}
@@ -2463,21 +2463,13 @@ int sctp_process_init(struct sctp_association *asoc, struct sctp_chunk *chunk,
 	 * stream sequence number shall be set to 0.
 	 */
 
-	/* Allocate storage for the negotiated streams if it is not a temporary
-	 * association.
-	 */
-	if (!asoc->temp) {
-		int error;
+	asoc->ssnmap = sctp_ssnmap_new(asoc->c.sinit_max_instreams,
+				       asoc->c.sinit_num_ostreams, gfp);
+	if (!asoc->ssnmap)
+		goto clean_up;
 
-		asoc->ssnmap = sctp_ssnmap_new(asoc->c.sinit_max_instreams,
-					       asoc->c.sinit_num_ostreams, gfp);
-		if (!asoc->ssnmap)
-			goto clean_up;
-
-		error = sctp_assoc_set_id(asoc, gfp);
-		if (error)
-			goto clean_up;
-	}
+	if (!asoc->temp && sctp_assoc_set_id(asoc, gfp))
+		goto clean_up;
 
 	/* ADDIP Section 4.1 ASCONF Chunk Procedures
 	 *
@@ -3342,8 +3334,7 @@ static void sctp_asconf_param_success(struct sctp_association *asoc,
 		local_bh_enable();
 		list_for_each_entry(transport, &asoc->peer.transport_addr_list,
 				transports) {
-			dst_release(transport->dst);
-			transport->dst = NULL;
+			sctp_transport_dst_release(transport);
 		}
 		break;
 	case SCTP_PARAM_DEL_IP:
@@ -3357,8 +3348,7 @@ static void sctp_asconf_param_success(struct sctp_association *asoc,
 		local_bh_enable();
 		list_for_each_entry(transport, &asoc->peer.transport_addr_list,
 				transports) {
-			dst_release(transport->dst);
-			transport->dst = NULL;
+			sctp_transport_dst_release(transport);
 		}
 		break;
 	default:

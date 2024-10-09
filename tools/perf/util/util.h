@@ -179,12 +179,6 @@ static inline void *zalloc(size_t size)
 #undef tolower
 #undef toupper
 
-#ifndef NSEC_PER_MSEC
-#define NSEC_PER_MSEC	1000000L
-#endif
-
-int parse_nsec_time(const char *str, u64 *ptime);
-
 extern unsigned char sane_ctype[256];
 #define GIT_SPACE		0x01
 #define GIT_DIGIT		0x02
@@ -261,6 +255,7 @@ void sighandler_dump_stack(int sig);
 
 extern unsigned int page_size;
 extern int cacheline_size;
+extern unsigned int sysctl_perf_event_max_stack;
 
 struct parse_tag {
 	char tag;
@@ -350,4 +345,14 @@ typedef void (*print_binary_t)(enum binary_printer_ops,
 void print_binary(unsigned char *data, size_t len,
 		  size_t bytes_per_line, print_binary_t printer,
 		  void *extra);
+
+#if !defined(__GLIBC__) && !defined(__ANDROID__)
+extern int sched_getcpu(void);
+#endif
+
+int is_printable_array(char *p, unsigned int len);
+
+int timestamp__scnprintf_usec(u64 timestamp, char *buf, size_t sz);
+
+int unit_number__scnprintf(char *buf, size_t size, u64 n);
 #endif /* GIT_COMPAT_UTIL_H */

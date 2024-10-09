@@ -609,7 +609,7 @@ static void queue_limits_init_aux(struct request_queue *q, struct queue_limits_a
 	q->limits.limits_aux = limits_aux;
 }
 
-int blk_queue_enter(struct request_queue *q, gfp_t gfp)
+int blk_queue_enter(struct request_queue *q, bool nowait)
 {
 	while (true) {
 		int ret;
@@ -617,11 +617,11 @@ int blk_queue_enter(struct request_queue *q, gfp_t gfp)
 		if (percpu_ref_tryget_live(&q->q_usage_counter))
 			return 0;
 
-		if (!(gfp & __GFP_WAIT))
+		if (nowait)
 			return -EBUSY;
 
 		/*
-		 * read pair of barrier in blk_mq_freeze_queue_start(),
+		 * read pair of barrier in blk_freeze_queue_start(),
 		 * we need to order reading __PERCPU_REF_DEAD flag of
 		 * .q_usage_counter and reading .mq_freeze_depth or
 		 * queue dying flag, otherwise the following wait may
@@ -1280,7 +1280,9 @@ static struct request *blk_old_get_request(struct request_queue *q, int rw,
 struct request *blk_get_request(struct request_queue *q, int rw, gfp_t gfp_mask)
 {
 	if (q->mq_ops)
-		return blk_mq_alloc_request(q, rw, gfp_mask, false);
+		return blk_mq_alloc_request(q, rw,
+			(gfp_mask & __GFP_WAIT) ?
+				0 : BLK_MQ_REQ_NOWAIT);
 	else
 		return blk_old_get_request(q, rw, gfp_mask);
 }
@@ -1501,6 +1503,7 @@ EXPORT_SYMBOL(blk_put_request);
  * blk_add_request_payload - add a payload to a request
  * @rq: request to update
  * @page: page backing the payload
+ * @offset: offset in page
  * @len: length of the payload.
  *
  * This allows to later add a payload to an already submitted request by
@@ -1511,12 +1514,12 @@ EXPORT_SYMBOL(blk_put_request);
  * discard requests should ever use it.
  */
 void blk_add_request_payload(struct request *rq, struct page *page,
-		unsigned int len)
+		int offset, unsigned int len)
 {
 	struct bio *bio = rq->bio;
 
 	bio->bi_io_vec->bv_page = page;
-	bio->bi_io_vec->bv_offset = 0;
+	bio->bi_io_vec->bv_offset = offset;
 	bio->bi_io_vec->bv_len = len;
 
 	bio->bi_size = len;
@@ -1988,7 +1991,14 @@ end_io:
  */
 void generic_make_request(struct bio *bio)
 {
-	struct bio_list bio_list_on_stack;
+	/*
+	 * bio_list_on_stack[0] contains bios submitted by the current
+	 * make_request_fn.
+	 * bio_list_on_stack[1] contains bios that were submitted before
+	 * the current make_request_fn, but that haven't been processed
+	 * yet.
+	 */
+	struct bio_list bio_list_on_stack[2];
 
 	if (!generic_make_request_checks(bio))
 		return;
@@ -2004,7 +2014,7 @@ void generic_make_request(struct bio *bio)
 	 * should be added at the tail
 	 */
 	if (current->bio_list) {
-		bio_list_add(current->bio_list, bio);
+		bio_list_add(&current->bio_list[0], bio);
 		return;
 	}
 
@@ -2023,24 +2033,39 @@ void generic_make_request(struct bio *bio)
 	 * bio_list, and call into ->make_request() again.
 	 */
 	BUG_ON(bio->bi_next);
-	bio_list_init(&bio_list_on_stack);
-	current->bio_list = &bio_list_on_stack;
+	bio_list_init(&bio_list_on_stack[0]);
+	current->bio_list = bio_list_on_stack;
 	do {
 		struct request_queue *q = bdev_get_queue(bio->bi_bdev);
 
-		if (likely(blk_queue_enter(q, __GFP_WAIT) == 0)) {
+		if (likely(blk_queue_enter(q, false) == 0)) {
+			struct bio_list lower, same;
 
+			/* Create a fresh bio_list for all subordinate requests */
+			bio_list_on_stack[1] = bio_list_on_stack[0];
+			bio_list_init(&bio_list_on_stack[0]);
 			q->make_request_fn(q, bio);
 
 			blk_queue_exit(q);
 
-			bio = bio_list_pop(current->bio_list);
+			/* sort new bios into those for a lower level
+			 * and those for the same level
+			 */
+			bio_list_init(&lower);
+			bio_list_init(&same);
+			while ((bio = bio_list_pop(&bio_list_on_stack[0])) != NULL)
+				if (q == bdev_get_queue(bio->bi_bdev))
+					bio_list_add(&same, bio);
+				else
+					bio_list_add(&lower, bio);
+			/* now assemble so we handle the lowest level first */
+			bio_list_merge(&bio_list_on_stack[0], &lower);
+			bio_list_merge(&bio_list_on_stack[0], &same);
+			bio_list_merge(&bio_list_on_stack[0], &bio_list_on_stack[1]);
 		} else {
-			struct bio *bio_next = bio_list_pop(current->bio_list);
-
 			bio_io_error(bio);
-			bio = bio_next;
 		}
+		bio = bio_list_pop(&bio_list_on_stack[0]);
 	} while (bio);
 	current->bio_list = NULL; /* deactivate */
 }

@@ -95,19 +95,47 @@ static struct rds_connection *rds_conn_lookup(struct net *net,
  * and receiving over this connection again in the future.  It is up to
  * the transport to have serialized this call with its send and recv.
  */
-static void rds_conn_reset(struct rds_connection *conn)
+static void rds_conn_path_reset(struct rds_conn_path *cp)
 {
+	struct rds_connection *conn = cp->cp_conn;
+
 	rdsdebug("connection %pI4 to %pI4 reset\n",
 	  &conn->c_laddr, &conn->c_faddr);
 
 	rds_stats_inc(s_conn_reset);
-	rds_send_reset(conn);
-	conn->c_flags = 0;
+	rds_send_path_reset(cp);
+	cp->cp_flags = 0;
 
 	/* Do not clear next_rx_seq here, else we cannot distinguish
 	 * retransmitted packets from new packets, and will hand all
 	 * of them to the application. That is not consistent with the
 	 * reliability guarantees of RDS. */
+}
+
+static void __rds_conn_path_init(struct rds_connection *conn,
+				 struct rds_conn_path *cp, bool is_outgoing)
+{
+	spin_lock_init(&cp->cp_lock);
+	cp->cp_next_tx_seq = 1;
+	init_waitqueue_head(&cp->cp_waitq);
+	INIT_LIST_HEAD(&cp->cp_send_queue);
+	INIT_LIST_HEAD(&cp->cp_retrans);
+
+	cp->cp_conn = conn;
+	atomic_set(&cp->cp_state, RDS_CONN_DOWN);
+	cp->cp_send_gen = 0;
+	/* cp_outgoing is per-path. So we can only set it here
+	 * for the single-path transports.
+	 */
+	if (!conn->c_trans->t_mp_capable)
+		cp->cp_outgoing = (is_outgoing ? 1 : 0);
+	cp->cp_reconnect_jiffies = 0;
+	INIT_DELAYED_WORK(&cp->cp_send_w, rds_send_worker);
+	INIT_DELAYED_WORK(&cp->cp_recv_w, rds_recv_worker);
+	INIT_DELAYED_WORK(&cp->cp_conn_w, rds_connect_worker);
+	INIT_WORK(&cp->cp_down_w, rds_shutdown_worker);
+	mutex_init(&cp->cp_cm_lock);
+	cp->cp_flags = 0;
 }
 
 /*
@@ -127,7 +155,7 @@ static struct rds_connection *__rds_conn_create(struct net *net,
 	struct hlist_head *head = rds_conn_bucket(laddr, faddr);
 	struct rds_transport *loop_trans;
 	unsigned long flags;
-	int ret;
+	int ret, i;
 	struct rds_transport *otrans = trans;
 
 	if (!is_outgoing && otrans->t_type == RDS_TRANS_TCP)
@@ -157,13 +185,8 @@ new_conn:
 	INIT_HLIST_NODE(&conn->c_hash_node);
 	conn->c_laddr = laddr;
 	conn->c_faddr = faddr;
-	spin_lock_init(&conn->c_lock);
-	conn->c_next_tx_seq = 1;
-	rds_conn_net_set(conn, net);
 
-	init_waitqueue_head(&conn->c_waitq);
-	INIT_LIST_HEAD(&conn->c_send_queue);
-	INIT_LIST_HEAD(&conn->c_retrans);
+	rds_conn_net_set(conn, net);
 
 	ret = rds_cong_get_maps(conn);
 	if (ret) {
@@ -192,23 +215,18 @@ new_conn:
 
 	conn->c_trans = trans;
 
+	init_waitqueue_head(&conn->c_hs_waitq);
+	for (i = 0; i < RDS_MPATH_WORKERS; i++) {
+		__rds_conn_path_init(conn, &conn->c_path[i],
+				     is_outgoing);
+		conn->c_path[i].cp_index = i;
+	}
 	ret = trans->conn_alloc(conn, gfp);
 	if (ret) {
 		kmem_cache_free(rds_conn_slab, conn);
 		conn = ERR_PTR(ret);
 		goto out;
 	}
-
-	atomic_set(&conn->c_state, RDS_CONN_DOWN);
-	conn->c_send_gen = 0;
-	conn->c_outgoing = (is_outgoing ? 1 : 0);
-	conn->c_reconnect_jiffies = 0;
-	INIT_DELAYED_WORK(&conn->c_send_w, rds_send_worker);
-	INIT_DELAYED_WORK(&conn->c_recv_w, rds_recv_worker);
-	INIT_DELAYED_WORK(&conn->c_conn_w, rds_connect_worker);
-	INIT_WORK(&conn->c_down_w, rds_shutdown_worker);
-	mutex_init(&conn->c_cm_lock);
-	conn->c_flags = 0;
 
 	rdsdebug("allocated conn %p for %pI4 -> %pI4 over %s %s\n",
 	  conn, &laddr, &faddr,
@@ -226,7 +244,7 @@ new_conn:
 	if (parent) {
 		/* Creating passive conn */
 		if (parent->c_passive) {
-			trans->conn_free(conn->c_transport_data);
+			trans->conn_free(conn->c_path[0].cp_transport_data);
 			kmem_cache_free(rds_conn_slab, conn);
 			conn = parent->c_passive;
 		} else {
@@ -240,10 +258,23 @@ new_conn:
 
 		found = rds_conn_lookup(net, head, laddr, faddr, trans);
 		if (found) {
-			trans->conn_free(conn->c_transport_data);
+			struct rds_conn_path *cp;
+			int i;
+
+			for (i = 0; i < RDS_MPATH_WORKERS; i++) {
+				cp = &conn->c_path[i];
+				/* The ->conn_alloc invocation may have
+				 * allocated resource for all paths, so all
+				 * of them may have to be freed here.
+				 */
+				if (cp->cp_transport_data)
+					trans->conn_free(cp->cp_transport_data);
+			}
 			kmem_cache_free(rds_conn_slab, conn);
 			conn = found;
 		} else {
+			conn->c_my_gen_num = rds_gen_num;
+			conn->c_peer_gen_num = 0;
 			hlist_add_head_rcu(&conn->c_hash_node, head);
 			rds_cong_add_conn(conn);
 			rds_conn_count++;
@@ -271,10 +302,12 @@ struct rds_connection *rds_conn_create_outgoing(struct net *net,
 }
 EXPORT_SYMBOL_GPL(rds_conn_create_outgoing);
 
-void rds_conn_shutdown(struct rds_connection *conn)
+void rds_conn_shutdown(struct rds_conn_path *cp)
 {
+	struct rds_connection *conn = cp->cp_conn;
+
 	/* shut it down unless it's down already */
-	if (!rds_conn_transition(conn, RDS_CONN_DOWN, RDS_CONN_DOWN)) {
+	if (!rds_conn_path_transition(cp, RDS_CONN_DOWN, RDS_CONN_DOWN)) {
 		/*
 		 * Quiesce the connection mgmt handlers before we start tearing
 		 * things down. We don't hold the mutex for the entire
@@ -282,35 +315,38 @@ void rds_conn_shutdown(struct rds_connection *conn)
 		 * deadlocking with the CM handler. Instead, the CM event
 		 * handler is supposed to check for state DISCONNECTING
 		 */
-		mutex_lock(&conn->c_cm_lock);
-		if (!rds_conn_transition(conn, RDS_CONN_UP, RDS_CONN_DISCONNECTING)
-		 && !rds_conn_transition(conn, RDS_CONN_ERROR, RDS_CONN_DISCONNECTING)) {
-			rds_conn_error(conn, "shutdown called in state %d\n",
-					atomic_read(&conn->c_state));
-			mutex_unlock(&conn->c_cm_lock);
+		mutex_lock(&cp->cp_cm_lock);
+		if (!rds_conn_path_transition(cp, RDS_CONN_UP,
+					      RDS_CONN_DISCONNECTING) &&
+		    !rds_conn_path_transition(cp, RDS_CONN_ERROR,
+					      RDS_CONN_DISCONNECTING)) {
+			rds_conn_path_error(cp,
+					    "shutdown called in state %d\n",
+					    atomic_read(&cp->cp_state));
+			mutex_unlock(&cp->cp_cm_lock);
 			return;
 		}
-		mutex_unlock(&conn->c_cm_lock);
+		mutex_unlock(&cp->cp_cm_lock);
 
-		wait_event(conn->c_waitq,
-			   !test_bit(RDS_IN_XMIT, &conn->c_flags));
-		wait_event(conn->c_waitq,
-			   !test_bit(RDS_RECV_REFILL, &conn->c_flags));
+		wait_event(cp->cp_waitq,
+			   !test_bit(RDS_IN_XMIT, &cp->cp_flags));
+		wait_event(cp->cp_waitq,
+			   !test_bit(RDS_RECV_REFILL, &cp->cp_flags));
 
-		conn->c_trans->conn_shutdown(conn);
-		rds_conn_reset(conn);
+		conn->c_trans->conn_path_shutdown(cp);
+		rds_conn_path_reset(cp);
 
-		if (!rds_conn_transition(conn, RDS_CONN_DISCONNECTING, RDS_CONN_DOWN)) {
+		if (!rds_conn_path_transition(cp, RDS_CONN_DISCONNECTING,
+					      RDS_CONN_DOWN)) {
 			/* This can happen - eg when we're in the middle of tearing
 			 * down the connection, and someone unloads the rds module.
 			 * Quite reproduceable with loopback connections.
 			 * Mostly harmless.
 			 */
-			rds_conn_error(conn,
-				"%s: failed to transition to state DOWN, "
-				"current state is %d\n",
-				__func__,
-				atomic_read(&conn->c_state));
+			rds_conn_path_error(cp, "%s: failed to transition "
+					    "to state DOWN, current state "
+					    "is %d\n", __func__,
+					    atomic_read(&cp->cp_state));
 			return;
 		}
 	}
@@ -319,13 +355,11 @@ void rds_conn_shutdown(struct rds_connection *conn)
 	 * The passive side of an IB loopback connection is never added
 	 * to the conn hash, so we never trigger a reconnect on this
 	 * conn - the reconnect is always triggered by the active peer. */
-	cancel_delayed_work_sync(&conn->c_conn_w);
+	cancel_delayed_work_sync(&cp->cp_conn_w);
 	rcu_read_lock();
 	if (!hlist_unhashed(&conn->c_hash_node)) {
 		rcu_read_unlock();
-		if (conn->c_trans->t_type != RDS_TRANS_TCP ||
-		    conn->c_outgoing == 1)
-			rds_queue_reconnect(conn);
+		rds_queue_reconnect(cp);
 	} else {
 		rcu_read_unlock();
 	}
@@ -337,6 +371,9 @@ void rds_conn_shutdown(struct rds_connection *conn)
 static void rds_conn_path_destroy(struct rds_conn_path *cp)
 {
 	struct rds_message *rm, *rtmp;
+
+	if (!cp->cp_transport_data)
+		return;
 
 	rds_conn_path_drop(cp);
 	flush_work(&cp->cp_down_w);
@@ -369,6 +406,8 @@ static void rds_conn_path_destroy(struct rds_conn_path *cp)
 void rds_conn_destroy(struct rds_connection *conn)
 {
 	unsigned long flags;
+	int i;
+	struct rds_conn_path *cp;
 
 	rdsdebug("freeing conn %p for %pI4 -> "
 		 "%pI4\n", conn, &conn->c_laddr,
@@ -381,18 +420,10 @@ void rds_conn_destroy(struct rds_connection *conn)
 	synchronize_rcu();
 
 	/* shut the connection down */
-	if (!conn->c_trans->t_mp_capable) {
-		rds_conn_path_destroy(&conn->c_path[0]);
-		BUG_ON(!list_empty(&conn->c_path[0].cp_retrans));
-	} else {
-		int i;
-		struct rds_conn_path *cp;
-
-		for (i = 0; i < RDS_MPATH_WORKERS; i++) {
-			cp = &conn->c_path[i];
-			rds_conn_path_destroy(cp);
-			BUG_ON(!list_empty(&cp->cp_retrans));
-		}
+	for (i = 0; i < RDS_MPATH_WORKERS; i++) {
+		cp = &conn->c_path[i];
+		rds_conn_path_destroy(cp);
+		BUG_ON(!list_empty(&cp->cp_retrans));
 	}
 
 	/*
@@ -632,10 +663,17 @@ void rds_conn_exit(void)
 /*
  * Force a disconnect
  */
+void rds_conn_path_drop(struct rds_conn_path *cp)
+{
+	atomic_set(&cp->cp_state, RDS_CONN_ERROR);
+	queue_work(rds_wq, &cp->cp_down_w);
+}
+EXPORT_SYMBOL_GPL(rds_conn_path_drop);
+
 void rds_conn_drop(struct rds_connection *conn)
 {
-	atomic_set(&conn->c_state, RDS_CONN_ERROR);
-	queue_work(rds_wq, &conn->c_down_w);
+	WARN_ON(conn->c_trans->t_mp_capable);
+	rds_conn_path_drop(&conn->c_path[0]);
 }
 EXPORT_SYMBOL_GPL(rds_conn_drop);
 
@@ -649,6 +687,7 @@ void rds_conn_path_connect_if_down(struct rds_conn_path *cp)
 	    !test_and_set_bit(RDS_RECONNECT_PENDING, &cp->cp_flags))
 		queue_delayed_work(rds_wq, &cp->cp_conn_w, 0);
 }
+EXPORT_SYMBOL_GPL(rds_conn_path_connect_if_down);
 
 void rds_conn_connect_if_down(struct rds_connection *conn)
 {

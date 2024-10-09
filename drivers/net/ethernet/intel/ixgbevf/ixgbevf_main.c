@@ -56,7 +56,7 @@ const char ixgbevf_driver_name[] = "ixgbevf";
 static const char ixgbevf_driver_string[] =
 	"Intel(R) 10 Gigabit PCI Express Virtual Function Network Driver";
 
-#define DRV_VERSION "2.12.1-k-rh7.3"
+#define DRV_VERSION "3.2.2-k-rh7.4"
 const char ixgbevf_driver_version[] = DRV_VERSION;
 static char ixgbevf_copyright[] =
 	"Copyright (c) 2009 - 2015 Intel Corporation.";
@@ -1930,6 +1930,16 @@ static void ixgbevf_set_rx_mode(struct net_device *netdev)
 		     (flags & (IFF_BROADCAST | IFF_MULTICAST)) ?
 		     IXGBEVF_XCAST_MODE_MULTI : IXGBEVF_XCAST_MODE_NONE;
 
+	/* request the most inclusive mode we need */
+	if (flags & IFF_PROMISC)
+		xcast_mode = IXGBEVF_XCAST_MODE_PROMISC;
+	else if (flags & IFF_ALLMULTI)
+		xcast_mode = IXGBEVF_XCAST_MODE_ALLMULTI;
+	else if (flags & (IFF_BROADCAST | IFF_MULTICAST))
+		xcast_mode = IXGBEVF_XCAST_MODE_MULTI;
+	else
+		xcast_mode = IXGBEVF_XCAST_MODE_NONE;
+
 	spin_lock_bh(&adapter->mbx_lock);
 
 	hw->mac.ops.update_xcast_mode(hw, xcast_mode);
@@ -2071,7 +2081,8 @@ static void ixgbevf_init_last_counter_stats(struct ixgbevf_adapter *adapter)
 static void ixgbevf_negotiate_api(struct ixgbevf_adapter *adapter)
 {
 	struct ixgbe_hw *hw = &adapter->hw;
-	int api[] = { ixgbe_mbox_api_12,
+	int api[] = { ixgbe_mbox_api_13,
+		      ixgbe_mbox_api_12,
 		      ixgbe_mbox_api_11,
 		      ixgbe_mbox_api_10,
 		      ixgbe_mbox_api_unknown };
@@ -2373,6 +2384,7 @@ static void ixgbevf_set_num_queues(struct ixgbevf_adapter *adapter)
 		switch (hw->api_version) {
 		case ixgbe_mbox_api_11:
 		case ixgbe_mbox_api_12:
+		case ixgbe_mbox_api_13:
 			adapter->num_rx_queues = rss;
 			adapter->num_tx_queues = rss;
 		default:
@@ -3774,6 +3786,7 @@ static int ixgbevf_change_mtu(struct net_device *netdev, int new_mtu)
 	switch (adapter->hw.api_version) {
 	case ixgbe_mbox_api_11:
 	case ixgbe_mbox_api_12:
+	case ixgbe_mbox_api_13:
 		max_possible_frame = IXGBE_MAX_JUMBO_FRAME_SIZE;
 		break;
 	default:
@@ -3867,6 +3880,8 @@ static int ixgbevf_resume(struct pci_dev *pdev)
 		dev_err(&pdev->dev, "Cannot enable PCI device from suspend\n");
 		return err;
 	}
+
+	adapter->hw.hw_addr = adapter->io_addr;
 	smp_mb__before_clear_bit();
 	clear_bit(__IXGBEVF_DISABLED, &adapter->state);
 	pci_set_master(pdev);
@@ -4284,6 +4299,7 @@ static pci_ers_result_t ixgbevf_io_slot_reset(struct pci_dev *pdev)
 		return PCI_ERS_RESULT_DISCONNECT;
 	}
 
+	adapter->hw.hw_addr = adapter->io_addr;
 	smp_mb__before_clear_bit();
 	clear_bit(__IXGBEVF_DISABLED, &adapter->state);
 	pci_set_master(pdev);

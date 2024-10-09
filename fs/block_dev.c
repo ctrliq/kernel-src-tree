@@ -28,7 +28,6 @@
 #include <linux/log2.h>
 #include <linux/cleancache.h>
 #include <linux/dax.h>
-#include <linux/badblocks.h>
 #include <linux/aio.h>
 #include <asm/uaccess.h>
 #include "internal.h"
@@ -303,14 +302,11 @@ int thaw_bdev(struct block_device *bdev, struct super_block *sb)
 		goto out;
 
 	error = thaw_super(sb);
-	if (error) {
+	if (error)
 		bdev->bd_fsfreeze_count++;
-		mutex_unlock(&bdev->bd_fsfreeze_mutex);
-		return error;
-	}
 out:
 	mutex_unlock(&bdev->bd_fsfreeze_mutex);
-	return 0;
+	return error;
 }
 EXPORT_SYMBOL(thaw_bdev);
 
@@ -379,7 +375,7 @@ long bdev_direct_access(struct block_device *bdev, struct blk_dax_ctl *dax)
 
 	if (size < 0)
 		return size;
-	if (!ops->direct_access)
+	if (!blk_queue_dax(bdev_get_queue(bdev)) || !ops->direct_access)
 		return -EOPNOTSUPP;
 	if ((sector + DIV_ROUND_UP(size, 512)) >
 					part_nr_sects_read(bdev->bd_part))
@@ -387,7 +383,7 @@ long bdev_direct_access(struct block_device *bdev, struct blk_dax_ctl *dax)
 	sector += get_start_sect(bdev);
 	if (sector % (PAGE_SIZE / 512))
 		return -EINVAL;
-	avail = ops->direct_access(bdev, sector, &dax->addr, &dax->pfn);
+	avail = ops->direct_access(bdev, sector, &dax->addr, &dax->pfn, size);
 	if (!avail)
 		return -ERANGE;
 	if (avail > 0 && avail & ~PAGE_MASK)
@@ -481,7 +477,7 @@ int bdev_read_page(struct block_device *bdev, sector_t sector,
 	if (!ops->rw_page || bdev_get_integrity(bdev))
 		return result;
 
-	result = blk_queue_enter(bdev->bd_queue, GFP_KERNEL);
+	result = blk_queue_enter(bdev->bd_queue, false);
 	if (result)
 		return result;
 	result = ops->rw_page(bdev, sector + get_start_sect(bdev), page, READ);
@@ -518,7 +514,7 @@ int bdev_write_page(struct block_device *bdev, sector_t sector,
 
 	if (!ops->rw_page || bdev_get_integrity(bdev))
 		return -EOPNOTSUPP;
-	result = blk_queue_enter(bdev->bd_queue, GFP_KERNEL);
+	result = blk_queue_enter(bdev->bd_queue, false);
 	if (result)
 		return result;
 
@@ -553,11 +549,6 @@ int bdev_dax_supported(struct super_block *sb, int blocksize)
 
 	if (blocksize != PAGE_SIZE) {
 		vfs_msg(sb, KERN_ERR, "error: unsupported blocksize for dax");
-		return -EINVAL;
-	}
-
-	if (sb->s_bdev->bd_disk->bb && sb->s_bdev->bd_disk->bb->count) {
-		vfs_msg(sb, KERN_ERR, "error: media errors detected");
 		return -EINVAL;
 	}
 
@@ -1298,7 +1289,8 @@ static int __blkdev_get(struct block_device *bdev, fmode_t mode, int for_part)
 		bdev->bd_disk = disk;
 		bdev->bd_queue = disk->queue;
 		bdev->bd_contains = bdev;
-		if (IS_ENABLED(CONFIG_BLK_DEV_DAX) && disk->fops->direct_access)
+		if (IS_ENABLED(CONFIG_BLK_DEV_DAX) &&
+		    blk_queue_dax(disk->queue))
 			bdev->bd_inode->i_flags = S_DAX;
 		else
 			bdev->bd_inode->i_flags = 0;

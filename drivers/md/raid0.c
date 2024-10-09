@@ -527,7 +527,7 @@ static inline int is_io_in_chunk_boundary(struct mddev *mddev,
 	}
 }
 
-static void raid0_make_request(struct mddev *mddev, struct bio *bio)
+static bool raid0_make_request(struct mddev *mddev, struct bio *bio)
 {
 	unsigned int chunk_sects;
 	sector_t sector_offset;
@@ -536,7 +536,7 @@ static void raid0_make_request(struct mddev *mddev, struct bio *bio)
 
 	if (unlikely(bio->bi_rw & REQ_FLUSH)) {
 		md_flush_request(mddev, bio);
-		return;
+		return true;
 	}
 
 	chunk_sects = mddev->chunk_sectors;
@@ -558,7 +558,7 @@ static void raid0_make_request(struct mddev *mddev, struct bio *bio)
 		raid0_make_request(mddev, &bp->bio1);
 		raid0_make_request(mddev, &bp->bio2);
 		bio_pair_release(bp);
-		return;
+		return true;
 	}
 
 	sector_offset = bio->bi_sector;
@@ -573,11 +573,11 @@ static void raid0_make_request(struct mddev *mddev, struct bio *bio)
 		     !blk_queue_discard(bdev_get_queue(bio->bi_bdev)))) {
 		/* Just ignore it */
 		bio_endio(bio, 0);
-		return;
+		return true;
 	}
 
 	generic_make_request(bio);
-	return;
+	return true;
 
 bad_map:
 	printk("md/raid0:%s: make_request bug: can't convert block across chunks"
@@ -586,7 +586,7 @@ bad_map:
 	       (unsigned long long)bio->bi_sector, bio_sectors(bio) / 2);
 
 	bio_io_error(bio);
-	return;
+	return true;
 }
 
 static void raid0_status(struct seq_file *seq, struct mddev *mddev)

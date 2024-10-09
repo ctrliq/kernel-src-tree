@@ -435,8 +435,7 @@ xfs_log_reserve(
 	int		 	cnt,
 	struct xlog_ticket	**ticp,
 	__uint8_t	 	client,
-	bool			permanent,
-	uint		 	t_type)
+	bool			permanent)
 {
 	struct xlog		*log = mp->m_log;
 	struct xlog_ticket	*tic;
@@ -456,7 +455,6 @@ xfs_log_reserve(
 	if (!tic)
 		return -ENOMEM;
 
-	tic->t_trans_type = t_type;
 	*ticp = tic;
 
 	xlog_grant_push_ail(log, tic->t_cnt ? tic->t_unit_res * tic->t_cnt
@@ -823,8 +821,7 @@ xfs_log_unmount_write(xfs_mount_t *mp)
 	} while (iclog != first_iclog);
 #endif
 	if (! (XLOG_FORCED_SHUTDOWN(log))) {
-		error = xfs_log_reserve(mp, 600, 1, &tic,
-					XFS_LOG, 0, XLOG_UNMOUNT_REC_TYPE);
+		error = xfs_log_reserve(mp, 600, 1, &tic, XFS_LOG, 0);
 		if (!error) {
 			/* the data section must be 32 bit size aligned */
 			struct {
@@ -1212,7 +1209,7 @@ xlog_iodone(xfs_buf_t *bp)
 	}
 
 	/* log I/O is always issued ASYNC */
-	ASSERT(XFS_BUF_ISASYNC(bp));
+	ASSERT(bp->b_flags & XBF_ASYNC);
 	xlog_state_done_syncing(iclog, aborted);
 
 	/*
@@ -1865,9 +1862,8 @@ xlog_sync(
 
 	bp->b_io_length = BTOBB(count);
 	bp->b_fspriv = iclog;
-	XFS_BUF_ZEROFLAGS(bp);
-	XFS_BUF_ASYNC(bp);
-	bp->b_flags |= XBF_SYNCIO;
+	bp->b_flags &= ~(XBF_FUA | XBF_FLUSH);
+	bp->b_flags |= (XBF_ASYNC | XBF_SYNCIO | XBF_WRITE);
 
 	if (log->l_mp->m_flags & XFS_MOUNT_BARRIER) {
 		bp->b_flags |= XBF_FUA;
@@ -1894,12 +1890,11 @@ xlog_sync(
 
 	/* account for log which doesn't start at block #0 */
 	XFS_BUF_SET_ADDR(bp, XFS_BUF_ADDR(bp) + log->l_logBBstart);
+
 	/*
 	 * Don't call xfs_bwrite here. We do log-syncs even when the filesystem
 	 * is shutting down.
 	 */
-	XFS_BUF_WRITE(bp);
-
 	error = xlog_bdstrat(bp);
 	if (error) {
 		xfs_buf_ioerror_alert(bp, "xlog_sync");
@@ -1911,9 +1906,8 @@ xlog_sync(
 		xfs_buf_associate_memory(bp,
 				(char *)&iclog->ic_header + count, split);
 		bp->b_fspriv = iclog;
-		XFS_BUF_ZEROFLAGS(bp);
-		XFS_BUF_ASYNC(bp);
-		bp->b_flags |= XBF_SYNCIO;
+		bp->b_flags &= ~(XBF_FUA | XBF_FLUSH);
+		bp->b_flags |= (XBF_ASYNC | XBF_SYNCIO | XBF_WRITE);
 		if (log->l_mp->m_flags & XFS_MOUNT_BARRIER)
 			bp->b_flags |= XBF_FUA;
 
@@ -1922,7 +1916,6 @@ xlog_sync(
 
 		/* account for internal log which doesn't start at block #0 */
 		XFS_BUF_SET_ADDR(bp, XFS_BUF_ADDR(bp) + log->l_logBBstart);
-		XFS_BUF_WRITE(bp);
 		error = xlog_bdstrat(bp);
 		if (error) {
 			xfs_buf_ioerror_alert(bp, "xlog_sync (split)");
@@ -2037,58 +2030,8 @@ xlog_print_tic_res(
 	    REG_TYPE_STR(ICREATE, "inode create")
 	};
 #undef REG_TYPE_STR
-#define TRANS_TYPE_STR(type)	[XFS_TRANS_##type] = #type
-	static char *trans_type_str[XFS_TRANS_TYPE_MAX] = {
-	    TRANS_TYPE_STR(SETATTR_NOT_SIZE),
-	    TRANS_TYPE_STR(SETATTR_SIZE),
-	    TRANS_TYPE_STR(INACTIVE),
-	    TRANS_TYPE_STR(CREATE),
-	    TRANS_TYPE_STR(CREATE_TRUNC),
-	    TRANS_TYPE_STR(TRUNCATE_FILE),
-	    TRANS_TYPE_STR(REMOVE),
-	    TRANS_TYPE_STR(LINK),
-	    TRANS_TYPE_STR(RENAME),
-	    TRANS_TYPE_STR(MKDIR),
-	    TRANS_TYPE_STR(RMDIR),
-	    TRANS_TYPE_STR(SYMLINK),
-	    TRANS_TYPE_STR(SET_DMATTRS),
-	    TRANS_TYPE_STR(GROWFS),
-	    TRANS_TYPE_STR(STRAT_WRITE),
-	    TRANS_TYPE_STR(DIOSTRAT),
-	    TRANS_TYPE_STR(WRITEID),
-	    TRANS_TYPE_STR(ADDAFORK),
-	    TRANS_TYPE_STR(ATTRINVAL),
-	    TRANS_TYPE_STR(ATRUNCATE),
-	    TRANS_TYPE_STR(ATTR_SET),
-	    TRANS_TYPE_STR(ATTR_RM),
-	    TRANS_TYPE_STR(ATTR_FLAG),
-	    TRANS_TYPE_STR(CLEAR_AGI_BUCKET),
-	    TRANS_TYPE_STR(SB_CHANGE),
-	    TRANS_TYPE_STR(DUMMY1),
-	    TRANS_TYPE_STR(DUMMY2),
-	    TRANS_TYPE_STR(QM_QUOTAOFF),
-	    TRANS_TYPE_STR(QM_DQALLOC),
-	    TRANS_TYPE_STR(QM_SETQLIM),
-	    TRANS_TYPE_STR(QM_DQCLUSTER),
-	    TRANS_TYPE_STR(QM_QINOCREATE),
-	    TRANS_TYPE_STR(QM_QUOTAOFF_END),
-	    TRANS_TYPE_STR(FSYNC_TS),
-	    TRANS_TYPE_STR(GROWFSRT_ALLOC),
-	    TRANS_TYPE_STR(GROWFSRT_ZERO),
-	    TRANS_TYPE_STR(GROWFSRT_FREE),
-	    TRANS_TYPE_STR(SWAPEXT),
-	    TRANS_TYPE_STR(CHECKPOINT),
-	    TRANS_TYPE_STR(ICREATE),
-	    TRANS_TYPE_STR(CREATE_TMPFILE)
-	};
-#undef TRANS_TYPE_STR
 
 	xfs_warn(mp, "xlog_write: reservation summary:");
-	xfs_warn(mp, "  trans type  = %s (%u)",
-		 ((ticket->t_trans_type <= 0 ||
-		   ticket->t_trans_type > XFS_TRANS_TYPE_MAX) ?
-		  "bad-trans-type" : trans_type_str[ticket->t_trans_type]),
-		 ticket->t_trans_type);
 	xfs_warn(mp, "  unit res    = %d bytes",
 		 ticket->t_unit_res);
 	xfs_warn(mp, "  current res = %d bytes",
@@ -3706,7 +3649,6 @@ xlog_ticket_alloc(
 	tic->t_tid		= prandom_u32();
 	tic->t_clientid		= client;
 	tic->t_flags		= XLOG_TIC_INITED;
-	tic->t_trans_type	= 0;
 	if (permanent)
 		tic->t_flags |= XLOG_TIC_PERM_RESERV;
 
@@ -3976,7 +3918,7 @@ xfs_log_force_umount(
 	    log->l_flags & XLOG_ACTIVE_RECOVERY) {
 		mp->m_flags |= XFS_MOUNT_FS_SHUTDOWN;
 		if (mp->m_sb_bp)
-			XFS_BUF_DONE(mp->m_sb_bp);
+			mp->m_sb_bp->b_flags |= XBF_DONE;
 		return 0;
 	}
 
@@ -4006,7 +3948,7 @@ xfs_log_force_umount(
 	spin_lock(&log->l_icloglock);
 	mp->m_flags |= XFS_MOUNT_FS_SHUTDOWN;
 	if (mp->m_sb_bp)
-		XFS_BUF_DONE(mp->m_sb_bp);
+		mp->m_sb_bp->b_flags |= XBF_DONE;
 
 	/*
 	 * Mark the log and the iclogs with IO error flags to prevent any

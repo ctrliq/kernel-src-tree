@@ -101,6 +101,8 @@ static int __ip_local_out_sk(struct sock *sk, struct sk_buff *skb)
 
 	iph->tot_len = htons(skb->len);
 	ip_send_check(iph);
+	skb->protocol = htons(ETH_P_IP);
+
 	return nf_hook(NFPROTO_IPV4, NF_INET_LOCAL_OUT, sk, skb, NULL,
 		       skb_dst(skb)->dev, dst_output_sk);
 }
@@ -207,7 +209,10 @@ static inline int ip_finish_output2(struct sock *sk, struct sk_buff *skb)
 	if (unlikely(!neigh))
 		neigh = __neigh_create(&arp_tbl, &nexthop, dev, false);
 	if (!IS_ERR(neigh)) {
-		int res = dst_neigh_output(dst, neigh, skb);
+		int res;
+
+		sock_confirm_neigh(skb, neigh);
+		res = dst_neigh_output(dst, neigh, skb);
 
 		rcu_read_unlock_bh();
 		return res;
@@ -227,9 +232,8 @@ static int ip_finish_output_gso(struct sock *sk, struct sk_buff *skb,
 	struct sk_buff *segs;
 	int ret = 0;
 
-	/* common case: locally created skb or seglen is <= mtu */
-	if (((IPCB(skb)->flags & IPSKB_FORWARDED) == 0) ||
-	      skb_gso_validate_mtu(skb, mtu))
+	/* common case: seglen is <= mtu */
+	if (skb_gso_validate_mtu(skb, mtu))
 		return ip_finish_output2(sk, skb);
 
 	/* Slowpath -  GSO segment length is exceeding the dst MTU.
@@ -852,6 +856,9 @@ static inline int ip_ufo_append_data(struct sock *sk,
 		skb->csum = 0;
 
 
+		if (flags & MSG_CONFIRM)
+			skb_set_dst_pending_confirm(skb, 1);
+
 		__skb_queue_tail(queue, skb);
 	} else if (skb_is_gso(skb)) {
 		goto append;
@@ -1046,6 +1053,9 @@ alloc_new_skb:
 			transhdrlen = 0;
 			exthdrlen = 0;
 			csummode = CHECKSUM_NONE;
+
+			if ((flags & MSG_CONFIRM) && !skb_prev)
+				skb_set_dst_pending_confirm(skb, 1);
 
 			/*
 			 * Put the packet on the pending queue.

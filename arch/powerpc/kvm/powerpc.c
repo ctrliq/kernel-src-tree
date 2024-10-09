@@ -27,6 +27,8 @@
 #include <linux/slab.h>
 #include <linux/file.h>
 #include <linux/module.h>
+#include <linux/irqbypass.h>
+#include <linux/kvm_irqfd.h>
 #include <asm/cputable.h>
 #include <asm/uaccess.h>
 #include <asm/kvm_ppc.h>
@@ -441,10 +443,30 @@ err_out:
 	return -EINVAL;
 }
 
+bool kvm_arch_has_vcpu_debugfs(void)
+{
+	return false;
+}
+
+int kvm_arch_create_vcpu_debugfs(struct kvm_vcpu *vcpu)
+{
+	return 0;
+}
+
 void kvm_arch_destroy_vm(struct kvm *kvm)
 {
 	unsigned int i;
 	struct kvm_vcpu *vcpu;
+
+#ifdef CONFIG_KVM_XICS
+	/*
+	 * We call kick_all_cpus_sync() to ensure that all
+	 * CPUs have executed any pending IPIs before we
+	 * continue and free VCPUs structures below.
+	 */
+	if (is_kvmppc_hv_enabled(kvm))
+		kick_all_cpus_sync();
+#endif
 
 	kvm_for_each_vcpu(i, vcpu, kvm)
 		kvm_arch_vcpu_free(vcpu);
@@ -577,6 +599,9 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 		break;
 #ifdef CONFIG_PPC_BOOK3S_64
 	case KVM_CAP_PPC_GET_SMMU_INFO:
+		r = 1;
+		break;
+	case KVM_CAP_SPAPR_MULTITCE:
 		r = 1;
 		break;
 #endif
@@ -743,6 +768,42 @@ static void kvmppc_complete_dcr_load(struct kvm_vcpu *vcpu,
                                      struct kvm_run *run)
 {
 	kvmppc_set_gpr(vcpu, vcpu->arch.io_gpr, run->dcr.data);
+}
+
+/*
+ * irq_bypass_add_producer and irq_bypass_del_producer are only
+ * useful if the architecture supports PCI passthrough.
+ * irq_bypass_stop and irq_bypass_start are not needed and so
+ * kvm_ops are not defined for them.
+ */
+bool kvm_arch_has_irq_bypass(void)
+{
+	return ((kvmppc_hv_ops && kvmppc_hv_ops->irq_bypass_add_producer) ||
+		(kvmppc_pr_ops && kvmppc_pr_ops->irq_bypass_add_producer));
+}
+
+int kvm_arch_irq_bypass_add_producer(struct irq_bypass_consumer *cons,
+				     struct irq_bypass_producer *prod)
+{
+	struct kvm_kernel_irqfd *irqfd =
+		container_of(cons, struct kvm_kernel_irqfd, consumer);
+	struct kvm *kvm = irqfd->kvm;
+
+	if (kvm->arch.kvm_ops->irq_bypass_add_producer)
+		return kvm->arch.kvm_ops->irq_bypass_add_producer(cons, prod);
+
+	return 0;
+}
+
+void kvm_arch_irq_bypass_del_producer(struct irq_bypass_consumer *cons,
+				      struct irq_bypass_producer *prod)
+{
+	struct kvm_kernel_irqfd *irqfd =
+		container_of(cons, struct kvm_kernel_irqfd, consumer);
+	struct kvm *kvm = irqfd->kvm;
+
+	if (kvm->arch.kvm_ops->irq_bypass_del_producer)
+		kvm->arch.kvm_ops->irq_bypass_del_producer(cons, prod);
 }
 
 static void kvmppc_complete_mmio_load(struct kvm_vcpu *vcpu,

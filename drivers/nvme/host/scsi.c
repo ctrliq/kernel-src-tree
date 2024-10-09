@@ -606,7 +606,7 @@ static int nvme_fill_device_id_eui64(struct nvme_ns *ns, struct sg_io_hdr *hdr,
 	eui = id_ns->eui64;
 	len = sizeof(id_ns->eui64);
 
-	if (ns->ctrl->vs >= NVME_VS(1, 2)) {
+	if (ns->ctrl->vs >= NVME_VS(1, 2, 0)) {
 		if (bitmap_empty(eui, len * 8)) {
 			eui = id_ns->nguid;
 			len = sizeof(id_ns->nguid);
@@ -679,7 +679,7 @@ static int nvme_trans_device_id_page(struct nvme_ns *ns, struct sg_io_hdr *hdr,
 {
 	int res;
 
-	if (ns->ctrl->vs >= NVME_VS(1, 1)) {
+	if (ns->ctrl->vs >= NVME_VS(1, 1, 0)) {
 		res = nvme_fill_device_id_eui64(ns, hdr, resp, alloc_len);
 		if (res != -EOPNOTSUPP)
 			return res;
@@ -906,7 +906,7 @@ static int nvme_trans_log_temperature(struct nvme_ns *ns, struct sg_io_hdr *hdr,
 	kfree(smart_log);
 
 	/* Get Features for Temp Threshold */
-	res = nvme_get_features(ns->ctrl, NVME_FEAT_TEMP_THRESH, 0, 0,
+	res = nvme_get_features(ns->ctrl, NVME_FEAT_TEMP_THRESH, 0, NULL, 0,
 								&feature_resp);
 	if (res != NVME_SC_SUCCESS)
 		temp_c_thresh = LOG_TEMP_UNKNOWN;
@@ -1039,7 +1039,7 @@ static int nvme_trans_fill_caching_page(struct nvme_ns *ns,
 	if (len < MODE_PAGE_CACHING_LEN)
 		return -EINVAL;
 
-	nvme_sc = nvme_get_features(ns->ctrl, NVME_FEAT_VOLATILE_WC, 0, 0,
+	nvme_sc = nvme_get_features(ns->ctrl, NVME_FEAT_VOLATILE_WC, 0, NULL, 0,
 								&feature_resp);
 	res = nvme_trans_status_code(hdr, nvme_sc);
 	if (res)
@@ -1230,7 +1230,7 @@ static int nvme_trans_send_activate_fw_cmd(struct nvme_ns *ns, struct sg_io_hdr 
 	c.common.opcode = nvme_admin_activate_fw;
 	c.common.cdw10[0] = cpu_to_le32(buffer_id | NVME_FWACT_REPL_ACTV);
 
-	nvme_sc = nvme_submit_sync_cmd(ns->queue, &c, NULL, 0);
+	nvme_sc = nvme_submit_sync_cmd(ns->ctrl->admin_q, &c, NULL, 0);
 	return nvme_trans_status_code(hdr, nvme_sc);
 }
 
@@ -1280,10 +1280,6 @@ static inline void nvme_trans_modesel_get_bd_len(u8 *parm_list, u8 cdb10,
 static void nvme_trans_modesel_save_bd(struct nvme_ns *ns, u8 *parm_list,
 					u16 idx, u16 bd_len, u8 llbaa)
 {
-	u16 bd_num;
-
-	bd_num = bd_len / ((llbaa == 0) ?
-			SHORT_DESC_BLOCK : LONG_DESC_BLOCK);
 	/* Store block descriptor info if a FORMAT UNIT comes later */
 	/* TODO Saving 1st BD info; what to do if multiple BD received? */
 	if (llbaa == 0) {
@@ -1328,7 +1324,7 @@ static int nvme_trans_modesel_get_mp(struct nvme_ns *ns, struct sg_io_hdr *hdr,
 	case MODE_PAGE_CACHING:
 		dword11 = ((mode_page[2] & CACHING_MODE_PAGE_WCE_MASK) ? 1 : 0);
 		nvme_sc = nvme_set_features(ns->ctrl, NVME_FEAT_VOLATILE_WC,
-					    dword11, 0, NULL);
+					    dword11, NULL, 0, NULL);
 		res = nvme_trans_status_code(hdr, nvme_sc);
 		break;
 	case MODE_PAGE_CONTROL:
@@ -1528,7 +1524,7 @@ static int nvme_trans_fmt_send_cmd(struct nvme_ns *ns, struct sg_io_hdr *hdr,
 	int nvme_sc;
 	struct nvme_id_ns *id_ns;
 	u8 i;
-	u8 flbas, nlbaf;
+	u8 nlbaf;
 	u8 selected_lbaf = 0xFF;
 	u32 cdw10 = 0;
 	struct nvme_command c;
@@ -1539,7 +1535,6 @@ static int nvme_trans_fmt_send_cmd(struct nvme_ns *ns, struct sg_io_hdr *hdr,
 	if (res)
 		return res;
 
-	flbas = (id_ns->flbas) & 0x0F;
 	nlbaf = id_ns->nlbaf;
 
 	for (i = 0; i < nlbaf; i++) {
@@ -2165,32 +2160,6 @@ static int nvme_trans_synchronize_cache(struct nvme_ns *ns,
 	return nvme_trans_status_code(hdr, nvme_sc);
 }
 
-static int nvme_trans_start_stop(struct nvme_ns *ns, struct sg_io_hdr *hdr,
-							u8 *cmd)
-{
-	u8 immed, pcmod, no_flush, start;
-
-	immed = cmd[1] & 0x01;
-	pcmod = cmd[3] & 0x0f;
-	no_flush = cmd[4] & 0x04;
-	start = cmd[4] & 0x01;
-
-	if (immed != 0) {
-		return nvme_trans_completion(hdr, SAM_STAT_CHECK_CONDITION,
-					ILLEGAL_REQUEST, SCSI_ASC_INVALID_CDB,
-					SCSI_ASCQ_CAUSE_NOT_REPORTABLE);
-	} else {
-		if (no_flush == 0) {
-			/* Issue NVME FLUSH command prior to START STOP UNIT */
-			int res = nvme_trans_synchronize_cache(ns, hdr);
-			if (res)
-				return res;
-		}
-
-		return 0;
-	}
-}
-
 static int nvme_trans_format_unit(struct nvme_ns *ns, struct sg_io_hdr *hdr,
 							u8 *cmd)
 {
@@ -2445,9 +2414,6 @@ static int nvme_scsi_translate(struct nvme_ns *ns, struct sg_io_hdr *hdr)
 	case SECURITY_PROTOCOL_IN:
 	case SECURITY_PROTOCOL_OUT:
 		retcode = nvme_trans_security_protocol(ns, hdr, cmd);
-		break;
-	case START_STOP:
-		retcode = nvme_trans_start_stop(ns, hdr, cmd);
 		break;
 	case SYNCHRONIZE_CACHE:
 		retcode = nvme_trans_synchronize_cache(ns, hdr);

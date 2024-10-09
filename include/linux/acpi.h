@@ -31,14 +31,6 @@
 #include <linux/device.h>
 #include <linux/property.h>
 
-#ifndef CONFIG_ACPI
-/* RH kernel: build fix for s390 and powerpc */
-typedef u32 acpi_object_type;
-union acpi_object {
-	u32 dummy;
-};
-#endif
-
 #ifndef _LINUX
 #define _LINUX
 #endif
@@ -697,6 +689,15 @@ do {									\
 	0;								\
 })
 #endif
+#endif
+
+#if defined(CONFIG_ACPI) && defined(CONFIG_GPIOLIB)
+int acpi_dev_gpio_irq_get(struct acpi_device *adev, int index);
+#else
+static inline int acpi_dev_gpio_irq_get(struct acpi_device *adev, int index)
+{
+	return -ENXIO;
+}
 #endif
 
 /* Device properties */

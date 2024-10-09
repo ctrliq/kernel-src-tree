@@ -71,6 +71,7 @@
 #include <linux/atomic.h>
 #include <net/dst.h>
 #include <net/checksum.h>
+#include <linux/net_tstamp.h>
 
 #include <linux/rh_kabi.h>
 #include <net/tcp_states.h>
@@ -231,6 +232,7 @@ struct cg_proto;
   *	@sk_wq: sock wait queue and async head
   *	@sk_rx_dst: receive input route used by early demux
   *	@sk_dst_cache: destination cache
+  *	@sk_dst_pending_confirm: need to confirm neighbour
   *	@sk_policy: flow policy
   *	@sk_receive_queue: incoming packets
   *	@sk_wmem_alloc: transmit queue bytes committed
@@ -279,6 +281,7 @@ struct cg_proto;
   *	@sk_protinfo: private area, net family specific, when not using slab
   *	@sk_timer: sock cleanup timer
   *	@sk_stamp: time stamp of last packet received
+  *	@sk_tsflags: SO_TIMESTAMPING socket options
   *	@sk_socket: Identd and reporting IO signals
   *	@sk_user_data: RPC layer private data
   *	@sk_frag: cached page frag
@@ -442,7 +445,7 @@ struct sock {
 	 * additions of your backport.
 	 */
 	RH_KABI_USE2_P(1, __u32	sk_txhash, u32 sk_max_pacing_rate)
-	RH_KABI_RESERVE_P(2)
+	RH_KABI_USE2_P(2, u16 sk_tsflags, __u32 sk_dst_pending_confirm)
 	RH_KABI_RESERVE_P(3)
 	RH_KABI_RESERVE_P(4)
 	RH_KABI_RESERVE_P(5)
@@ -722,13 +725,15 @@ enum sock_flags {
 	SOCK_LOCALROUTE, /* route locally only, %SO_DONTROUTE setting */
 	SOCK_QUEUE_SHRUNK, /* write queue has been shrunk recently */
 	SOCK_MEMALLOC, /* VM depends on this socket for swapping */
-	SOCK_TIMESTAMPING_TX_HARDWARE,  /* %SOF_TIMESTAMPING_TX_HARDWARE */
-	SOCK_TIMESTAMPING_TX_SOFTWARE,  /* %SOF_TIMESTAMPING_TX_SOFTWARE */
-	SOCK_TIMESTAMPING_RX_HARDWARE,  /* %SOF_TIMESTAMPING_RX_HARDWARE */
+	SOCK_RH_RESERVED_1, /* placeholders to avoid shifting the rest of
+			     * the SOCK_* flags
+			     */
+	SOCK_RH_RESERVED_2,
+	SOCK_RH_RESERVED_3,
 	SOCK_TIMESTAMPING_RX_SOFTWARE,  /* %SOF_TIMESTAMPING_RX_SOFTWARE */
-	SOCK_TIMESTAMPING_SOFTWARE,     /* %SOF_TIMESTAMPING_SOFTWARE */
-	SOCK_TIMESTAMPING_RAW_HARDWARE, /* %SOF_TIMESTAMPING_RAW_HARDWARE */
-	SOCK_TIMESTAMPING_SYS_HARDWARE, /* %SOF_TIMESTAMPING_SYS_HARDWARE */
+	SOCK_RH_RESERVED_4,
+	SOCK_RH_RESERVED_5,
+	SOCK_RH_RESERVED_6,
 	SOCK_FASYNC, /* fasync() active */
 	SOCK_RXQ_OVFL,
 	SOCK_ZEROCOPY, /* buffers from userspace */
@@ -1434,7 +1439,9 @@ static inline struct inode *SOCK_INODE(struct socket *socket)
 /*
  * Functions for memory accounting
  */
+int __sk_mem_raise_allocated(struct sock *sk, int size, int amt, int kind);
 extern int __sk_mem_schedule(struct sock *sk, int size, int kind);
+void __sk_mem_reduce_allocated(struct sock *sk, int amount);
 void __sk_mem_reclaim(struct sock *sk, int amount);
 
 #define SK_MEM_QUANTUM ((int)PAGE_SIZE)
@@ -1810,6 +1817,14 @@ static inline void sock_graft(struct sock *sk, struct socket *parent)
 extern kuid_t sock_i_uid(struct sock *sk);
 extern unsigned long sock_i_ino(struct sock *sk);
 
+static inline void sk_set_txhash(struct sock *sk)
+{
+	sk->sk_txhash = prandom_u32();
+
+	if (unlikely(!sk->sk_txhash))
+		sk->sk_txhash = 1;
+}
+
 static inline struct dst_entry *
 __sk_dst_get(struct sock *sk)
 {
@@ -1842,6 +1857,7 @@ static inline void dst_negative_advice(struct sock *sk)
 		if (ndst != dst) {
 			rcu_assign_pointer(sk->sk_dst_cache, ndst);
 			sk_reset_txq(sk);
+			sk->sk_dst_pending_confirm = 0;
 		}
 	}
 }
@@ -1852,6 +1868,7 @@ __sk_dst_set(struct sock *sk, struct dst_entry *dst)
 	struct dst_entry *old_dst;
 
 	sk_tx_queue_clear(sk);
+	sk->sk_dst_pending_confirm = 0;
 	/*
 	 * This can be called while sk is owned by the caller only,
 	 * with no state that can be checked in a rcu_dereference_check() cond
@@ -1867,6 +1884,7 @@ sk_dst_set(struct sock *sk, struct dst_entry *dst)
 	struct dst_entry *old_dst;
 
 	sk_tx_queue_clear(sk);
+	sk->sk_dst_pending_confirm = 0;
 	old_dst = xchg(&sk->sk_dst_cache, dst);
 	dst_release(old_dst);
 }
@@ -1886,6 +1904,26 @@ sk_dst_reset(struct sock *sk)
 extern struct dst_entry *__sk_dst_check(struct sock *sk, u32 cookie);
 
 extern struct dst_entry *sk_dst_check(struct sock *sk, u32 cookie);
+
+static inline void sk_dst_confirm(struct sock *sk)
+{
+	if (!sk->sk_dst_pending_confirm)
+		sk->sk_dst_pending_confirm = 1;
+}
+
+static inline void sock_confirm_neigh(struct sk_buff *skb, struct neighbour *n)
+{
+	if (skb_get_dst_pending_confirm(skb)) {
+		struct sock *sk = skb->sk;
+		unsigned long now = jiffies;
+
+		/* avoid dirtying neighbour */
+		if (n->confirmed != now)
+			n->confirmed = now;
+		if (sk && sk->sk_dst_pending_confirm)
+			sk->sk_dst_pending_confirm = 0;
+	}
+}
 
 bool sk_mc_loop(struct sock *sk);
 
@@ -2121,6 +2159,11 @@ extern void sk_reset_timer(struct sock *sk, struct timer_list *timer,
 
 extern void sk_stop_timer(struct sock *sk, struct timer_list *timer);
 
+int __sk_queue_drop_skb(struct sock *sk, struct sk_buff *skb,
+			unsigned int flags,
+			void (*destructor)(struct sock *sk,
+					   struct sk_buff *skb));
+int __sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb);
 extern int sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb);
 
 extern int sock_queue_err_skb(struct sock *sk, struct sk_buff *skb);
@@ -2229,6 +2272,12 @@ static inline int sock_intr_errno(long timeo)
 	return timeo == MAX_SCHEDULE_TIMEOUT ? -ERESTARTSYS : -EINTR;
 }
 
+static inline void
+sock_skb_set_dropcount(const struct sock *sk, struct sk_buff *skb)
+{
+	skb->dropcount = atomic_read(&sk->sk_drops);
+}
+
 extern void __sock_recv_timestamp(struct msghdr *msg, struct sock *sk,
 	struct sk_buff *skb);
 extern void __sock_recv_wifi_status(struct msghdr *msg, struct sock *sk,
@@ -2242,21 +2291,17 @@ sock_recv_timestamp(struct msghdr *msg, struct sock *sk, struct sk_buff *skb)
 
 	/*
 	 * generate control messages if
-	 * - receive time stamping in software requested (SOCK_RCVTSTAMP
-	 *   or SOCK_TIMESTAMPING_RX_SOFTWARE)
+	 * - receive time stamping in software requested
 	 * - software time stamp available and wanted
-	 *   (SOCK_TIMESTAMPING_SOFTWARE)
 	 * - hardware time stamps available and wanted
-	 *   (SOCK_TIMESTAMPING_SYS_HARDWARE or
-	 *   SOCK_TIMESTAMPING_RAW_HARDWARE)
 	 */
 	if (sock_flag(sk, SOCK_RCVTSTAMP) ||
-	    sock_flag(sk, SOCK_TIMESTAMPING_RX_SOFTWARE) ||
-	    (kt.tv64 && sock_flag(sk, SOCK_TIMESTAMPING_SOFTWARE)) ||
+	    (sk->sk_tsflags & SOF_TIMESTAMPING_RX_SOFTWARE) ||
+	    (kt.tv64 && sk->sk_tsflags & SOF_TIMESTAMPING_SOFTWARE) ||
 	    (hwtstamps->hwtstamp.tv64 &&
-	     sock_flag(sk, SOCK_TIMESTAMPING_RAW_HARDWARE)) ||
+	     (sk->sk_tsflags & SOF_TIMESTAMPING_RAW_HARDWARE)) ||
 	    (hwtstamps->syststamp.tv64 &&
-	     sock_flag(sk, SOCK_TIMESTAMPING_SYS_HARDWARE)))
+	     (sk->sk_tsflags & SOF_TIMESTAMPING_SYS_HARDWARE)))
 		__sock_recv_timestamp(msg, sk, skb);
 	else
 		sk->sk_stamp = kt;
@@ -2272,12 +2317,12 @@ static inline void sock_recv_ts_and_drops(struct msghdr *msg, struct sock *sk,
 					  struct sk_buff *skb)
 {
 #define FLAGS_TS_OR_DROPS ((1UL << SOCK_RXQ_OVFL)			| \
-			   (1UL << SOCK_RCVTSTAMP)			| \
-			   (1UL << SOCK_TIMESTAMPING_SOFTWARE)		| \
-			   (1UL << SOCK_TIMESTAMPING_RAW_HARDWARE)	| \
-			   (1UL << SOCK_TIMESTAMPING_SYS_HARDWARE))
+			   (1UL << SOCK_RCVTSTAMP))
+#define TSFLAGS_ANY	  (SOF_TIMESTAMPING_SOFTWARE			| \
+			   SOF_TIMESTAMPING_RAW_HARDWARE		| \
+			   SOF_TIMESTAMPING_SYS_HARDWARE)
 
-	if (sk->sk_flags & FLAGS_TS_OR_DROPS)
+	if (sk->sk_flags & FLAGS_TS_OR_DROPS || sk->sk_tsflags & TSFLAGS_ANY)
 		__sock_recv_ts_and_drops(msg, sk, skb);
 	else
 		sk->sk_stamp = skb->tstamp;
@@ -2287,8 +2332,6 @@ static inline void sock_recv_ts_and_drops(struct msghdr *msg, struct sock *sk,
  * sock_tx_timestamp - checks whether the outgoing packet is to be time stamped
  * @sk:		socket sending this packet
  * @tx_flags:	filled with instructions for time stamping
- *
- * Currently only depends on SOCK_TIMESTAMPING* flags.
  */
 extern void sock_tx_timestamp(struct sock *sk, __u8 *tx_flags);
 

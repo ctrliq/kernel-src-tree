@@ -39,6 +39,7 @@ static DEFINE_RAW_SPINLOCK(list_lock);
  * @node:	list item for parent traversal.
  * @rcu:	RCU callback item for freeing.
  * @irq:	back pointer to parent.
+ * @enabled:	true if driver enabled IRQ
  * @virq:	the virtual IRQ value provided to the requesting driver.
  *
  * Every MSI/MSI-X IRQ requested for a device in a VMD domain will be mapped to
@@ -48,6 +49,7 @@ struct vmd_irq {
 	struct list_head	node;
 	struct rcu_head		rcu;
 	struct vmd_irq_list	*irq;
+	bool			enabled;
 	unsigned int		virq;
 };
 
@@ -83,6 +85,7 @@ struct vmd_dev {
 
 #ifdef CONFIG_X86_DEV_DMA_OPS
 	struct dma_map_ops	dma_ops;
+	struct dma_domain	dma_domain;
 #endif
 };
 
@@ -98,11 +101,13 @@ static void vmd_irq_enable(struct irq_data *data)
 {
 	struct irq_desc *desc = irq_to_desc(data->irq);
 	struct msi_desc *msidesc = irq_desc_get_msi_desc(desc);
-	struct vmd_irq *vmdirq = data->chip_data;
+	struct vmd_irq *vmdirq = data->handler_data;
 	unsigned long flags;
 
 	raw_spin_lock_irqsave(&list_lock, flags);
+	WARN_ON(vmdirq->enabled);
 	list_add_tail_rcu(&vmdirq->node, &vmdirq->irq->irq_list);
+	vmdirq->enabled = true;
 	raw_spin_unlock_irqrestore(&list_lock, flags);
 
 	data->chip->irq_unmask(data);
@@ -111,13 +116,16 @@ static void vmd_irq_enable(struct irq_data *data)
 
 static void vmd_irq_disable(struct irq_data *data)
 {
-	struct vmd_irq *vmdirq = data->chip_data;
+	struct vmd_irq *vmdirq = data->handler_data;
 	unsigned long flags;
 
 	data->chip->irq_mask(data);
 
 	raw_spin_lock_irqsave(&list_lock, flags);
-	list_del_rcu(&vmdirq->node);
+	if (vmdirq->enabled) {
+		list_del_rcu(&vmdirq->node);
+		vmdirq->enabled = false;
+	}
 	raw_spin_unlock_irqrestore(&list_lock, flags);
 }
 
@@ -199,8 +207,7 @@ static int vmd_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
 
 		irq_set_handler_data(virq, vmdirq);
 		irq_set_chip_and_handler(virq, &vmd_msi_controller,
-					 handle_simple_irq);
-		irq_set_chip_data(virq, vmdirq);
+					 handle_untracked_irq);
 
 		msg.address_hi = MSI_ADDR_BASE_HI;
 		msg.address_lo = MSI_ADDR_BASE_LO | MSI_ADDR_DEST_ID(vmdirq->irq->index);
@@ -219,6 +226,8 @@ static void vmd_teardown_msi_irq(unsigned int irq)
 {
 	struct vmd_irq *vmdirq = irq_get_handler_data(irq);
 	unsigned long flags;
+
+	synchronize_rcu();
 
 	raw_spin_lock_irqsave(&list_lock, flags);
 	vmdirq->irq->count--;
@@ -352,8 +361,10 @@ static u64 vmd_get_required_mask(struct device *dev)
 
 static void vmd_teardown_dma_ops(struct vmd_dev *vmd)
 {
+	struct dma_domain *domain = &vmd->dma_domain;
+
 	if (get_dma_ops(&vmd->dev->dev))
-		vmd->dev->dev.archdata.dma_ops = NULL;
+		del_dma_domain(domain);
 }
 
 #define ASSIGN_VMD_DMA_OPS(source, dest, fn)	\
@@ -366,6 +377,10 @@ static void vmd_setup_dma_ops(struct vmd_dev *vmd)
 {
 	const struct dma_map_ops *source = get_dma_ops(&vmd->dev->dev);
 	struct dma_map_ops *dest = &vmd->dma_ops;
+	struct dma_domain *domain = &vmd->dma_domain;
+
+	domain->domain_nr = vmd->sysdata.domain;
+	domain->dma_ops = dest;
 
 	if (!source)
 		return;
@@ -386,7 +401,7 @@ static void vmd_setup_dma_ops(struct vmd_dev *vmd)
 #ifdef ARCH_HAS_DMA_GET_REQUIRED_MASK
 	ASSIGN_VMD_DMA_OPS(source, dest, get_required_mask);
 #endif
-	vmd->dev->dev.archdata.dma_ops = &vmd->dma_ops;
+	add_dma_domain(domain);
 }
 #undef ASSIGN_VMD_DMA_OPS
 #else
@@ -568,6 +583,7 @@ static int vmd_enable_domain(struct vmd_dev *vmd)
 		.parent = res,
 	};
 
+	sd->vmd_domain = true;
 	sd->domain = vmd_find_free_domain();
 	if (sd->domain < 0)
 		return sd->domain;

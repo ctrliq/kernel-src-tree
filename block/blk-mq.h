@@ -50,9 +50,7 @@ void blk_mq_disable_hotplug(void);
 /*
  * CPU -> queue mappings
  */
-extern unsigned int *blk_mq_make_queue_map(struct blk_mq_tag_set *set);
-extern int blk_mq_update_queue_map(unsigned int *map, unsigned int nr_queues,
-				   const struct cpumask *online_mask);
+int blk_mq_map_queues(struct blk_mq_tag_set *set);
 extern int blk_mq_hw_queue_to_node(unsigned int *map, unsigned int);
 
 /*
@@ -100,8 +98,7 @@ static inline void blk_mq_put_ctx(struct blk_mq_ctx *ctx)
 struct blk_mq_alloc_data {
 	/* input parameter */
 	struct request_queue *q;
-	gfp_t gfp;
-	bool reserved;
+	unsigned int flags;
 
 	/* input & output parameter */
 	struct blk_mq_ctx *ctx;
@@ -109,15 +106,18 @@ struct blk_mq_alloc_data {
 };
 
 static inline void blk_mq_set_alloc_data(struct blk_mq_alloc_data *data,
-		struct request_queue *q, gfp_t gfp, bool reserved,
-		struct blk_mq_ctx *ctx,
-		struct blk_mq_hw_ctx *hctx)
+		struct request_queue *q, unsigned int flags,
+		struct blk_mq_ctx *ctx, struct blk_mq_hw_ctx *hctx)
 {
 	data->q = q;
-	data->gfp = gfp;
-	data->reserved = reserved;
+	data->flags = flags;
 	data->ctx = ctx;
 	data->hctx = hctx;
+}
+
+static inline bool blk_mq_hctx_stopped(struct blk_mq_hw_ctx *hctx)
+{
+	return test_bit(BLK_MQ_S_STOPPED, &hctx->state);
 }
 
 static inline bool blk_mq_hw_queue_mapped(struct blk_mq_hw_ctx *hctx)

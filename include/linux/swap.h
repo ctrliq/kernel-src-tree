@@ -73,11 +73,12 @@ static inline int current_is_kswapd(void)
 #endif
 
 /*
- * HMM (heterogeneous memory management) used when data is in remote memory.
+ * HMM (heterogeneous memory management) used when data is in device memory.
  */
-#ifdef CONFIG_HMM_MIGRATE
-#define SWP_HMM_NUM 1
-#define SWP_HMM		(MAX_SWAPFILES + SWP_MIGRATION_NUM + SWP_HWPOISON_NUM)
+#ifdef CONFIG_HMM
+#define SWP_HMM_NUM 2
+#define SWP_HMM_WRITE	(MAX_SWAPFILES+SWP_MIGRATION_NUM+SWP_HWPOISON_NUM)
+#define SWP_HMM_READ	(MAX_SWAPFILES+SWP_MIGRATION_NUM+SWP_HWPOISON_NUM+1)
 #else
 #define SWP_HMM_NUM 0
 #endif
@@ -464,8 +465,8 @@ static inline void show_swap_cache_info(void)
 {
 }
 
-#define free_swap_and_cache(swp)	is_migration_entry(swp)
-#define swapcache_prepare(swp)		is_migration_entry(swp)
+#define free_swap_and_cache(e) (is_migration_entry(e) || is_hmm_entry(e))
+#define swapcache_prepare(e) (is_migration_entry(e) || is_hmm_entry(e))
 
 static inline int add_swap_count_continuation(swp_entry_t swp, gfp_t gfp_mask)
 {

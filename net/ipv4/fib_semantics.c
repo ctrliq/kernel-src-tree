@@ -1271,6 +1271,47 @@ int fib_sync_down_addr(struct net *net, __be32 local)
 	return ret;
 }
 
+static int call_fib_nh_notifiers(struct fib_nh *fib_nh,
+				 enum fib_event_type event_type)
+{
+#ifdef RTNH_F_LINKDOWN
+#error RTNH_F_LINKDOWN has been backported, fix me please!
+	struct in_device *in_dev = __in_dev_get_rtnl(fib_nh->nh_dev);
+#endif
+	struct fib_nh_notifier_info info = {
+		.fib_nh = fib_nh,
+	};
+
+	switch (event_type) {
+	case FIB_EVENT_NH_ADD:
+		if (fib_nh->nh_flags & RTNH_F_DEAD)
+			break;
+#ifdef RTNH_F_LINKDOWN
+#error RTNH_F_LINKDOWN has been backported, fix me please!
+		if (IN_DEV_IGNORE_ROUTES_WITH_LINKDOWN(in_dev) &&
+		    fib_nh->nh_flags & RTNH_F_LINKDOWN)
+			break;
+#endif
+		return call_fib_notifiers(dev_net(fib_nh->nh_dev), event_type,
+					  &info.info);
+	case FIB_EVENT_NH_DEL:
+#ifdef RTNH_F_LINKDOWN
+#error RTNH_F_LINKDOWN has been backported, fix me please!
+		if ((IN_DEV_IGNORE_ROUTES_WITH_LINKDOWN(in_dev) &&
+		     fib_nh->nh_flags & RTNH_F_LINKDOWN) ||
+		    (fib_nh->nh_flags & RTNH_F_DEAD))
+#else
+		if (fib_nh->nh_flags & RTNH_F_DEAD)
+#endif
+			return call_fib_notifiers(dev_net(fib_nh->nh_dev),
+						  event_type, &info.info);
+	default:
+		break;
+	}
+
+	return NOTIFY_DONE;
+}
+
 int fib_sync_down_dev(struct net_device *dev, int force)
 {
 	int ret = 0;
@@ -1298,6 +1339,8 @@ int fib_sync_down_dev(struct net_device *dev, int force)
 			else if (nexthop_nh->nh_dev == dev &&
 				 nexthop_nh->nh_scope != scope) {
 				nexthop_nh->nh_flags |= RTNH_F_DEAD;
+				call_fib_nh_notifiers(nexthop_nh,
+						      FIB_EVENT_NH_DEL);
 				dead++;
 			}
 #ifdef CONFIG_IP_ROUTE_MULTIPATH
@@ -1419,6 +1462,7 @@ int fib_sync_up(struct net_device *dev)
 				continue;
 			alive++;
 			nexthop_nh->nh_flags &= ~RTNH_F_DEAD;
+			call_fib_nh_notifiers(nexthop_nh, FIB_EVENT_NH_ADD);
 		} endfor_nexthops(fi)
 
 		if (alive > 0) {

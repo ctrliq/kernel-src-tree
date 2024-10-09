@@ -49,6 +49,7 @@ void __rwlock_init(rwlock_t *lock, const char *name,
 
 EXPORT_SYMBOL(__rwlock_init);
 
+/* BEGIN_SPINLOCK */
 static void spin_dump(raw_spinlock_t *lock, const char *msg)
 {
 	struct task_struct *owner = NULL;
@@ -134,7 +135,9 @@ void do_raw_spin_unlock(raw_spinlock_t *lock)
 	debug_spin_unlock(lock);
 	arch_spin_unlock(&lock->raw_lock);
 }
+/* END_SPINLOCK */
 
+/* BEGIN_RWLOCK */
 static void rwlock_bug(rwlock_t *lock, const char *msg)
 {
 	if (!debug_locks_off())
@@ -224,3 +227,4 @@ void do_raw_write_unlock(rwlock_t *lock)
 	debug_write_unlock(lock);
 	arch_write_unlock(&lock->raw_lock);
 }
+/* END_RWLOCK */

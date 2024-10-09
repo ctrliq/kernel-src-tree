@@ -5,6 +5,7 @@
 #include <linux/lockdep.h>
 #include <linux/ftrace_irq.h>
 #include <linux/vtime.h>
+#include <asm/hardirq.h>
 
 
 #if defined(CONFIG_SMP) || defined(CONFIG_GENERIC_HARDIRQS)

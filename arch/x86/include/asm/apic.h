@@ -708,6 +708,12 @@ static inline void entering_ack_irq(void)
 	ack_APIC_irq();
 }
 
+static inline void ipi_entering_ack_irq(void)
+{
+	irq_enter();
+	ack_APIC_irq();
+}
+
 static inline void exiting_irq(void)
 {
 	irq_exit();
@@ -715,9 +721,8 @@ static inline void exiting_irq(void)
 
 static inline void exiting_ack_irq(void)
 {
-	irq_exit();
-	/* Ack only at the end to avoid potential reentry */
 	ack_APIC_irq();
+	irq_exit();
 }
 
 extern void ioapic_zap_locks(void);

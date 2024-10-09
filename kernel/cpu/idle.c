@@ -13,6 +13,9 @@
 
 #include "../sched/sched.h"
 
+/* Linker adds these: start and end of __cpuidle functions */
+extern char __cpuidle_text_start[], __cpuidle_text_end[];
+
 static int __read_mostly cpu_idle_force_poll;
 
 void cpu_idle_poll_ctrl(bool enable)
@@ -41,13 +44,14 @@ static int __init cpu_idle_nopoll_setup(char *__unused)
 __setup("hlt", cpu_idle_nopoll_setup);
 #endif
 
-static inline int cpu_idle_poll(void)
+static noinline int __cpuidle cpu_idle_poll(void)
 {
 	rcu_idle_enter();
 	trace_cpu_idle_rcuidle(0, smp_processor_id());
 	local_irq_enable();
 	stop_critical_timings();
-	while (!tif_need_resched())
+	while (!tif_need_resched() &&
+		(cpu_idle_force_poll || tick_check_broadcast_expired()))
 		cpu_relax();
 	start_critical_timings();
 	trace_cpu_idle_rcuidle(PWR_EVENT_EXIT, smp_processor_id());
@@ -137,6 +141,12 @@ static void cpu_idle_loop(void)
 		sched_ttwu_pending();
 		schedule_preempt_disabled();
 	}
+}
+
+bool cpu_in_idle(unsigned long pc)
+{
+	return pc >= (unsigned long)__cpuidle_text_start &&
+		pc < (unsigned long)__cpuidle_text_end;
 }
 
 void cpu_startup_entry(enum cpuhp_state state)

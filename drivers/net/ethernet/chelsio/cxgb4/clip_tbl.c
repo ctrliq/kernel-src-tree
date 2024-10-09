@@ -234,7 +234,7 @@ int cxgb4_update_root_dev_clip(struct net_device *dev)
 	}
 
 	for (i = 0; i < VLAN_N_VID; i++) {
-		root_dev = __vlan_find_dev_deep(dev, htons(ETH_P_8021Q), i);
+		root_dev = __vlan_find_dev_deep_rcu(dev, htons(ETH_P_8021Q), i);
 		if (!root_dev)
 			continue;
 

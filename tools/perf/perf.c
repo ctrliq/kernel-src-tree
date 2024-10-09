@@ -10,12 +10,13 @@
 
 #include "util/env.h"
 #include <subcmd/exec-cmd.h>
-#include "util/cache.h"
+#include "util/config.h"
 #include "util/quote.h"
 #include <subcmd/run-command.h>
 #include "util/parse-events.h"
 #include <subcmd/parse-options.h>
 #include "util/debug.h"
+#include <api/fs/fs.h>
 #include <api/fs/tracing_path.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -88,11 +89,12 @@ static int pager_command_config(const char *var, const char *value, void *data)
 /* returns 0 for "no pager", 1 for "use pager", and -1 for "not specified" */
 int check_pager_config(const char *cmd)
 {
+	int err;
 	struct pager_config c;
 	c.cmd = cmd;
 	c.val = -1;
-	perf_config(pager_command_config, &c);
-	return c.val;
+	err = perf_config(pager_command_config, &c);
+	return err ?: c.val;
 }
 
 static int browser_command_config(const char *var, const char *value, void *data)
@@ -111,11 +113,12 @@ static int browser_command_config(const char *var, const char *value, void *data
  */
 static int check_browser_config(const char *cmd)
 {
+	int err;
 	struct pager_config c;
 	c.cmd = cmd;
 	c.val = -1;
-	perf_config(browser_command_config, &c);
-	return c.val;
+	err = perf_config(browser_command_config, &c);
+	return err ?: c.val;
 }
 
 static void commit_pager_choice(void)
@@ -371,7 +374,7 @@ static int run_builtin(struct cmd_struct *p, int argc, const char **argv)
 	/* Check for ENOSPC and EIO errors.. */
 	if (fflush(stdout)) {
 		fprintf(stderr, "write failure on standard output: %s",
-			strerror_r(errno, sbuf, sizeof(sbuf)));
+			str_error_r(errno, sbuf, sizeof(sbuf)));
 		goto out;
 	}
 	if (ferror(stdout)) {
@@ -380,7 +383,7 @@ static int run_builtin(struct cmd_struct *p, int argc, const char **argv)
 	}
 	if (fclose(stdout)) {
 		fprintf(stderr, "close failed on standard output: %s",
-			strerror_r(errno, sbuf, sizeof(sbuf)));
+			str_error_r(errno, sbuf, sizeof(sbuf)));
 		goto out;
 	}
 	status = 0;
@@ -506,8 +509,10 @@ static void cache_line_size(int *cacheline_sizep)
 
 int main(int argc, const char **argv)
 {
+	int err;
 	const char *cmd;
 	char sbuf[STRERR_BUFSIZE];
+	int value;
 
 	/* libsubcmd init */
 	exec_cmd_init("perf", PREFIX, PERF_EXEC_PATH, EXEC_PATH_ENVIRONMENT);
@@ -517,6 +522,9 @@ int main(int argc, const char **argv)
 	page_size = sysconf(_SC_PAGE_SIZE);
 	cache_line_size(&cacheline_size);
 
+	if (sysctl__read_int("kernel/perf_event_max_stack", &value) == 0)
+		sysctl_perf_event_max_stack = value;
+
 	cmd = extract_argv0_path(argv[0]);
 	if (!cmd)
 		cmd = "perf-help";
@@ -524,7 +532,9 @@ int main(int argc, const char **argv)
 	srandom(time(NULL));
 
 	perf_config__init();
-	perf_config(perf_default_config, NULL);
+	err = perf_config(perf_default_config, NULL);
+	if (err)
+		return err;
 	set_buildid_dir(NULL);
 
 	/* get debugfs/tracefs mount point from /proc/mounts */
@@ -615,7 +625,7 @@ int main(int argc, const char **argv)
 	}
 
 	fprintf(stderr, "Failed to run command '%s': %s\n",
-		cmd, strerror_r(errno, sbuf, sizeof(sbuf)));
+		cmd, str_error_r(errno, sbuf, sizeof(sbuf)));
 out:
 	return 1;
 }

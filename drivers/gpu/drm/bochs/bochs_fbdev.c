@@ -22,14 +22,10 @@ static int bochsfb_mmap(struct fb_info *info,
 
 static struct fb_ops bochsfb_ops = {
 	.owner = THIS_MODULE,
-	.fb_check_var = drm_fb_helper_check_var,
-	.fb_set_par = drm_fb_helper_set_par,
+	DRM_FB_HELPER_DEFAULT_OPS,
 	.fb_fillrect = drm_fb_helper_sys_fillrect,
 	.fb_copyarea = drm_fb_helper_sys_copyarea,
 	.fb_imageblit = drm_fb_helper_sys_imageblit,
-	.fb_pan_display = drm_fb_helper_pan_display,
-	.fb_blank = drm_fb_helper_blank,
-	.fb_setcmap = drm_fb_helper_setcmap,
 	.fb_mmap = bochsfb_mmap,
 };
 
@@ -82,7 +78,7 @@ static int bochsfb_create(struct drm_fb_helper *helper,
 
 	bo = gem_to_bochs_bo(gobj);
 
-	ret = ttm_bo_reserve(&bo->bo, true, false, false, NULL);
+	ret = ttm_bo_reserve(&bo->bo, true, false, NULL);
 	if (ret)
 		return ret;
 
@@ -162,22 +158,7 @@ static int bochs_fbdev_destroy(struct bochs_device *bochs)
 	return 0;
 }
 
-void bochs_fb_gamma_set(struct drm_crtc *crtc, u16 red, u16 green,
-			u16 blue, int regno)
-{
-}
-
-void bochs_fb_gamma_get(struct drm_crtc *crtc, u16 *red, u16 *green,
-			u16 *blue, int regno)
-{
-	*red   = regno;
-	*green = regno;
-	*blue  = regno;
-}
-
 static const struct drm_fb_helper_funcs bochs_fb_helper_funcs = {
-	.gamma_set = bochs_fb_gamma_set,
-	.gamma_get = bochs_fb_gamma_get,
 	.fb_probe = bochsfb_create,
 };
 

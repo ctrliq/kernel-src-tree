@@ -1470,9 +1470,9 @@ void perf_events_lapic_init(void)
 static int __kprobes
 perf_event_nmi_handler(unsigned int cmd, struct pt_regs *regs)
 {
-	int ret;
 	u64 start_clock;
 	u64 finish_clock;
+	int ret;
 
 	/*
 	 * All PMUs/events that share this PMI handler should make sure to
@@ -1481,9 +1481,9 @@ perf_event_nmi_handler(unsigned int cmd, struct pt_regs *regs)
 	if (!atomic_read(&active_events))
 		return NMI_DONE;
 
-	start_clock = local_clock();
+	start_clock = sched_clock();
 	ret = x86_pmu.handle_irq(regs);
-	finish_clock = local_clock();
+	finish_clock = sched_clock();
 
 	perf_sample_event_took(finish_clock - start_clock);
 
@@ -2151,13 +2151,23 @@ void arch_perf_update_userpage(struct perf_event *event,
 
 	data = cyc2ns_read_begin();
 
+	/*
+	 * Internal timekeeping for enabled/running/stopped times
+	 * is always in the local_clock domain.
+	 */
 	userpg->cap_user_time = 1;
 	userpg->time_mult = data->cyc2ns_mul;
 	userpg->time_shift = data->cyc2ns_shift;
 	userpg->time_offset = data->cyc2ns_offset - now;
 
-	userpg->cap_user_time_zero = 1;
-	userpg->time_zero = data->cyc2ns_offset;
+	/*
+	 * cap_user_time_zero doesn't make sense when we're using a different
+	 * time base for the records.
+	 */
+	if (event->clock == &local_clock) {
+		userpg->cap_user_time_zero = 1;
+		userpg->time_zero = data->cyc2ns_offset;
+	}
 
 	cyc2ns_read_end(data);
 }

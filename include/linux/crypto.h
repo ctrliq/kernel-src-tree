@@ -52,6 +52,7 @@
 #define CRYPTO_ALG_TYPE_HASH		0x00000008
 #define CRYPTO_ALG_TYPE_SHASH		0x00000009
 #define CRYPTO_ALG_TYPE_AHASH		0x0000000a
+#define CRYPTO_ALG_TYPE_KPP		0x0000000e
 #define CRYPTO_ALG_TYPE_RNG		0x0000000c
 #define CRYPTO_ALG_TYPE_AKCIPHER	0x0000000d
 #define CRYPTO_ALG_TYPE_PCOMPRESS	0x0000000f
@@ -846,7 +847,7 @@ static inline struct aead_request *aead_request_alloc(struct crypto_aead *tfm,
 {
 	struct aead_request *req;
 
-	req = kmalloc(sizeof(*req) + crypto_aead_reqsize(tfm), gfp);
+	req = kzalloc(sizeof(*req) + crypto_aead_reqsize(tfm), gfp);
 
 	if (likely(req))
 		aead_request_set_tfm(req, tfm);

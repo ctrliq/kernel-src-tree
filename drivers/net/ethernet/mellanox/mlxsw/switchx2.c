@@ -428,12 +428,13 @@ static int mlxsw_sx_port_get_phys_port_name(struct net_device *dev, char *name,
 }
 
 static const struct net_device_ops mlxsw_sx_port_netdev_ops = {
+	.ndo_size		= sizeof(struct net_device_ops),
 	.ndo_open		= mlxsw_sx_port_open,
 	.ndo_stop		= mlxsw_sx_port_stop,
 	.ndo_start_xmit		= mlxsw_sx_port_xmit,
 	.ndo_change_mtu		= mlxsw_sx_port_change_mtu,
 	.ndo_get_stats64	= mlxsw_sx_port_get_stats64,
-	.ndo_get_phys_port_name = mlxsw_sx_port_get_phys_port_name,
+	.extended.ndo_get_phys_port_name = mlxsw_sx_port_get_phys_port_name,
 };
 
 static void mlxsw_sx_port_get_drvinfo(struct net_device *dev,
@@ -932,7 +933,7 @@ static int mlxsw_sx_port_attr_get(struct net_device *dev,
 	struct mlxsw_sx *mlxsw_sx = mlxsw_sx_port->mlxsw_sx;
 
 	switch (attr->id) {
-	case SWITCHDEV_ATTR_PORT_PARENT_ID:
+	case SWITCHDEV_ATTR_ID_PORT_PARENT_ID:
 		attr->u.ppid.id_len = sizeof(mlxsw_sx->hw_id);
 		memcpy(&attr->u.ppid.id, &mlxsw_sx->hw_id, attr->u.ppid.id_len);
 		break;

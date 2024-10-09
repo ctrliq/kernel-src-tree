@@ -2419,7 +2419,7 @@ static int sky2_change_mtu(struct net_device *dev, int new_mtu)
 	imask = sky2_read32(hw, B0_IMSK);
 	sky2_write32(hw, B0_IMSK, 0);
 
-	dev->trans_start = jiffies;	/* prevent tx timeout */
+	netif_trans_update(dev);	/* prevent tx timeout */
 	napi_disable(&hw->napi);
 	netif_tx_disable(dev);
 

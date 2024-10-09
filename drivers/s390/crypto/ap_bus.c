@@ -1512,6 +1512,9 @@ static void ap_scan_bus(struct work_struct *unused)
 			ap_dev->device_type = device_type;
 		}
 		ap_dev->raw_hwtype = device_type;
+		/* CEX6 toleration: map to CEX5 */
+		if (device_type == AP_DEVICE_TYPE_CEX6)
+			ap_dev->device_type = AP_DEVICE_TYPE_CEX5;
 
 		rc = ap_query_functions(qid, &device_functions);
 		if (!rc)
@@ -1783,8 +1786,10 @@ void ap_queue_message(struct ap_device *ap_dev, struct ap_message *ap_msg)
 			rc = __ap_queue_message(ap_dev, ap_msg);
 		if (!rc)
 			wake_up(&ap_poll_wait);
-		if (rc == -ENODEV)
+		if (rc == -ENODEV) {
 			ap_dev->unregistered = AP_DEV_UNREGISTERED;
+			ap_msg->receive(ap_dev, ap_msg, ERR_PTR(-ENODEV));
+		}
 	} else if (ap_dev->unregistered == AP_DEV_UNREGISTERED) {
 		ap_msg->receive(ap_dev, ap_msg, ERR_PTR(-ENODEV));
 		rc = -ENODEV;
@@ -1793,8 +1798,8 @@ void ap_queue_message(struct ap_device *ap_dev, struct ap_message *ap_msg)
 		rc = -EBUSY;
 	}
 	spin_unlock_bh(&ap_dev->lock);
-	if (rc == -ENODEV)
-		device_unregister(&ap_dev->device);
+
+	/* no device_unregister(), let ap_scan_bus() do the job */
 }
 EXPORT_SYMBOL(ap_queue_message);
 

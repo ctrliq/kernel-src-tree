@@ -24,6 +24,7 @@
 #include <linux/slab.h>
 #include <net/sock.h>
 #include <linux/if_vlan.h>
+#include <net/switchdev.h>
 
 #include "br_private.h"
 
@@ -278,6 +279,8 @@ static void del_nbp(struct net_bridge_port *p)
 
 	nbp_vlan_flush(p);
 	br_fdb_delete_by_port(br, p, 0, 1);
+	switchdev_deferred_process();
+
 	nbp_update_port_count(br);
 
 	netdev_upper_dev_unlink(dev, br->dev);
@@ -308,8 +311,6 @@ void br_dev_delete(struct net_device *dev, struct list_head *head)
 
 	br_fdb_delete_by_port(br, NULL, 0, 1);
 
-	br_vlan_flush(br);
-	br_multicast_dev_del(br);
 	del_timer_sync(&br->gc_timer);
 
 	br_sysfs_delbr(br->dev);
@@ -342,8 +343,8 @@ static int find_portno(struct net_bridge *br)
 static struct net_bridge_port *new_nbp(struct net_bridge *br,
 				       struct net_device *dev)
 {
-	int index;
 	struct net_bridge_port *p;
+	int index, err;
 
 	index = find_portno(br);
 	if (index < 0)
@@ -359,11 +360,16 @@ static struct net_bridge_port *new_nbp(struct net_bridge *br,
 	p->path_cost = port_cost(dev);
 	p->priority = 0x8000 >> BR_PORT_BITS;
 	p->port_no = index;
-	p->flags = BR_LEARNING | BR_FLOOD;
+	p->flags = BR_LEARNING | BR_FLOOD | BR_MCAST_FLOOD;
 	br_init_port(p);
 	br_set_state(p, BR_STATE_DISABLED);
 	br_stp_port_timer_init(p);
-	br_multicast_add_port(p);
+	err = br_multicast_add_port(p);
+	if (err) {
+		dev_put(dev);
+		kfree(p);
+		p = ERR_PTR(err);
+	}
 
 	return p;
 }
@@ -533,9 +539,13 @@ int br_add_if(struct net_bridge *br, struct net_device *dev)
 
 	dev->priv_flags |= IFF_BRIDGE_PORT;
 
-	err = netdev_master_upper_dev_link(dev, br->dev);
+	err = netdev_master_upper_dev_link(dev, br->dev, NULL, NULL);
 	if (err)
 		goto err5;
+
+	err = nbp_switchdev_mark_set(p);
+	if (err)
+		goto err6;
 
 	dev_disable_lro(dev);
 
@@ -555,6 +565,12 @@ int br_add_if(struct net_bridge *br, struct net_device *dev)
 	if (br_fdb_insert(br, p, dev->dev_addr, 0))
 		netdev_err(dev, "failed insert local address bridge forwarding table\n");
 
+	err = nbp_vlan_init(p);
+	if (err) {
+		netdev_err(dev, "failed to initialize vlan filtering on this port\n");
+		goto err7;
+	}
+
 	spin_lock_bh(&br->lock);
 	changed_addr = br_stp_recalculate_bridge_id(br);
 
@@ -571,13 +587,16 @@ int br_add_if(struct net_bridge *br, struct net_device *dev)
 	dev_set_mtu(br->dev, br_min_mtu(br));
 	br_set_gso_limits(br);
 
-	if (nbp_vlan_init(p))
-		netdev_err(dev, "failed to initialize vlan filtering on this port\n");
-
 	kobject_uevent(&p->kobj, KOBJ_ADD);
 
 	return 0;
 
+err7:
+	list_del_rcu(&p->list);
+	br_fdb_delete_by_port(br, p, 0, 1);
+	nbp_update_port_count(br);
+err6:
+	netdev_upper_dev_unlink(dev, br->dev);
 err5:
 	dev->priv_flags &= ~IFF_BRIDGE_PORT;
 	netdev_rx_handler_unregister(dev);
@@ -633,19 +652,4 @@ void br_port_flags_change(struct net_bridge_port *p, unsigned long mask)
 
 	if (mask & BR_AUTO_MASK)
 		nbp_update_port_count(br);
-}
-
-void __net_exit br_net_exit(struct net *net)
-{
-	struct net_device *dev;
-	LIST_HEAD(list);
-
-	rtnl_lock();
-	for_each_netdev(net, dev)
-		if (dev->priv_flags & IFF_EBRIDGE)
-			br_dev_delete(dev, &list);
-
-	unregister_netdevice_many(&list);
-	rtnl_unlock();
-
 }

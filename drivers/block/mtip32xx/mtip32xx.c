@@ -176,7 +176,7 @@ static struct mtip_cmd *mtip_get_int_command(struct driver_data *dd)
 	if (mtip_check_surprise_removal(dd->pdev))
 		return NULL;
 
-	rq = blk_mq_alloc_request(dd->queue, 0, __GFP_WAIT, true);
+	rq = blk_mq_alloc_request(dd->queue, 0, BLK_MQ_REQ_RESERVED);
 	if (IS_ERR(rq))
 		return NULL;
 
@@ -4171,7 +4171,7 @@ static int mtip_block_remove(struct driver_data *dd)
 		dev_info(&dd->pdev->dev, "device %s surprise removal\n",
 						dd->disk->disk_name);
 
-	blk_mq_freeze_queue_start(dd->queue);
+	blk_freeze_queue_start(dd->queue);
 	blk_mq_stop_hw_queues(dd->queue);
 	blk_mq_tagset_busy_iter(&dd->tags, mtip_no_dev_cleanup, dd);
 

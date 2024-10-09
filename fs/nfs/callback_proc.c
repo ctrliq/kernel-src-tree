@@ -239,7 +239,8 @@ static u32 initiate_file_draining(struct nfs_client *clp,
 	}
 
 	if (pnfs_mark_matching_lsegs_return(lo, &free_me_list,
-					&args->cbl_range)) {
+				&args->cbl_range,
+				be32_to_cpu(args->cbl_stateid.seqid))) {
 		rv = NFS4_OK;
 		goto unlock;
 	}
@@ -251,10 +252,11 @@ static u32 initiate_file_draining(struct nfs_client *clp,
 		NFS_SERVER(ino)->pnfs_curr_ld->return_range(lo,
 			&args->cbl_range);
 	}
-	pnfs_mark_layout_returned_if_empty(lo);
 unlock:
 	spin_unlock(&ino->i_lock);
 	pnfs_free_lseg_list(&free_me_list);
+	/* Free all lsegs that are attached to commit buckets */
+	nfs_commit_inode(ino, 0);
 	pnfs_put_layout_hdr(lo);
 	trace_nfs4_cb_layoutrecall_file(clp, &args->cbl_fh, ino,
 			&args->cbl_stateid, -rv);
@@ -635,6 +637,10 @@ __be32 nfs4_callback_notify_lock(struct cb_notify_lock_args *args, void *dummy,
 
 	dprintk_rcu("NFS: CB_NOTIFY_LOCK request from %s\n",
 		rpc_peeraddr2str(cps->clp->cl_rpcclient, RPC_DISPLAY_ADDR));
+
+	/* Don't wake anybody if the string looked bogus */
+	if (args->cbnl_valid)
+		__wake_up(&cps->clp->cl_lock_waitq, TASK_NORMAL, 0, args);
 
 	return htonl(NFS4_OK);
 }

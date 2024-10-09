@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2015 Netronome Systems, Inc.
+ * Copyright (C) 2015-2017 Netronome Systems, Inc.
  *
  * This software is dual licensed under the GNU General License Version 2,
  * June 1991 as shown in the file COPYING in the top-level directory of this
@@ -43,6 +43,7 @@
 #define _NFP_NET_H_
 
 #include <linux/interrupt.h>
+#include <linux/list.h>
 #include <linux/netdevice.h>
 #include <linux/pci.h>
 #include <asm-generic/io-64-nonatomic-hi-lo.h>
@@ -72,7 +73,6 @@
 
 /* Default size for MTU and freelist buffer sizes */
 #define NFP_NET_DEFAULT_MTU		1500
-#define NFP_NET_DEFAULT_RX_BUFSZ	2048
 
 /* Maximum number of bytes prepended to a packet */
 #define NFP_NET_MAX_PREPEND		64
@@ -81,6 +81,7 @@
 #define NFP_NET_NON_Q_VECTORS		2
 #define NFP_NET_IRQ_LSC_IDX		0
 #define NFP_NET_IRQ_EXN_IDX		1
+#define NFP_NET_MIN_PORT_IRQS		(NFP_NET_NON_Q_VECTORS + 1)
 
 /* Queue/Ring definitions */
 #define NFP_NET_MAX_TX_RINGS	64	/* Max. # of Tx rings per device */
@@ -102,7 +103,12 @@
 /* Offload definitions */
 #define NFP_NET_N_VXLAN_PORTS	(NFP_NET_CFG_VXLAN_SZ / sizeof(__be16))
 
+#define NFP_NET_RX_BUF_HEADROOM	(NET_SKB_PAD + NET_IP_ALIGN)
+#define NFP_NET_RX_BUF_NON_DATA	(NFP_NET_RX_BUF_HEADROOM +		\
+				 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
+
 /* Forward declarations */
+struct nfp_cpp;
 struct nfp_net;
 struct nfp_net_r_vector;
 
@@ -276,11 +282,11 @@ struct nfp_net_rx_hash {
 
 /**
  * struct nfp_net_rx_buf - software RX buffer descriptor
- * @skb:	sk_buff associated with this buffer
+ * @frag:	page fragment buffer
  * @dma_addr:	DMA mapping address of the buffer
  */
 struct nfp_net_rx_buf {
-	struct sk_buff *skb;
+	void *frag;
 	dma_addr_t dma_addr;
 };
 
@@ -334,6 +340,7 @@ struct nfp_net_rx_ring {
  * @tx_ring:        Pointer to TX ring
  * @rx_ring:        Pointer to RX ring
  * @irq_idx:        Index into MSI-X table
+ * @irq_entry:      MSI-X table entry (use for talking to the device)
  * @rx_sync:	    Seqlock for atomic updates of RX stats
  * @rx_pkts:        Number of received packets
  * @rx_bytes:	    Number of received bytes
@@ -350,6 +357,7 @@ struct nfp_net_rx_ring {
  * @tx_lso:	    Counter of LSO packets sent
  * @tx_errors:	    How many TX errors were encountered
  * @tx_busy:        How often was TX busy (no space)?
+ * @irq_vector:     Interrupt vector number (use for talking to the OS)
  * @handler:        Interrupt handler for this ring vector
  * @name:           Name of the interrupt vector
  * @affinity_mask:  SMP affinity mask for this vector
@@ -366,7 +374,7 @@ struct nfp_net_r_vector {
 	struct nfp_net_tx_ring *tx_ring;
 	struct nfp_net_rx_ring *rx_ring;
 
-	int irq_idx;
+	u16 irq_entry;
 
 	struct u64_stats_sync rx_sync;
 	u64 rx_pkts;
@@ -386,6 +394,7 @@ struct nfp_net_r_vector {
 	u64 tx_errors;
 	u64 tx_busy;
 
+	u32 irq_vector;
 	irq_handler_t handler;
 	char name[IFNAMSIZ + 8];
 	cpumask_t affinity_mask;
@@ -412,18 +421,11 @@ static inline bool nfp_net_fw_ver_eq(struct nfp_net_fw_version *fw_ver,
  * struct nfp_net - NFP network device structure
  * @pdev:               Backpointer to PCI device
  * @netdev:             Backpointer to net_device structure
- * @nfp_fallback:       Is the driver used in fallback mode?
  * @is_vf:              Is the driver attached to a VF?
- * @is_nfp3200:         Is the driver for a NFP-3200 card?
  * @fw_loaded:          Is the firmware loaded?
  * @ctrl:               Local copy of the control register/word.
  * @fl_bufsz:           Currently configured size of the freelist buffers
  * @rx_offset:		Offset in the RX buffers where packet data starts
- * @cpp:                Pointer to the CPP handle
- * @nfp_dev_cpp:        Pointer to the NFP Device handle
- * @ctrl_area:          Pointer to the CPP area for the control BAR
- * @tx_area:            Pointer to the CPP area for the TX queues
- * @rx_area:            Pointer to the CPP area for the FL/RX queues
  * @fw_ver:             Firmware version
  * @cap:                Capabilities advertised by the Firmware
  * @max_mtu:            Maximum support MTU advertised by the Firmware
@@ -438,7 +440,7 @@ static inline bool nfp_net_fw_ver_eq(struct nfp_net_fw_version *fw_ver,
  * @rxd_cnt:            Size of the RX ring in number of descriptors
  * @tx_rings:           Array of pre-allocated TX ring structures
  * @rx_rings:           Array of pre-allocated RX ring structures
- * @num_irqs:	        Number of allocated interrupt vectors
+ * @max_r_vecs:	        Number of allocated interrupt vectors for RX/TX
  * @num_r_vecs:         Number of used ring vectors
  * @r_vecs:             Pre-allocated array of ring vectors
  * @irq_entries:        Pre-allocated array of MSI-X entries
@@ -467,14 +469,15 @@ static inline bool nfp_net_fw_ver_eq(struct nfp_net_fw_version *fw_ver,
  * @tx_bar:             Pointer to mapped TX queues
  * @rx_bar:             Pointer to mapped FL/RX queues
  * @debugfs_dir:	Device directory in debugfs
+ * @ethtool_dump_flag:	Ethtool dump flag
+ * @port_list:		Entry on device port list
+ * @cpp:		CPP device handle if available
  */
 struct nfp_net {
 	struct pci_dev *pdev;
 	struct net_device *netdev;
 
-	unsigned nfp_fallback:1;
 	unsigned is_vf:1;
-	unsigned is_nfp3200:1;
 	unsigned fw_loaded:1;
 
 	u32 ctrl;
@@ -485,18 +488,6 @@ struct nfp_net {
 	struct nfp_net_tx_ring *tx_rings;
 	struct nfp_net_rx_ring *rx_rings;
 
-#ifdef CONFIG_PCI_IOV
-	unsigned int num_vfs;
-	struct vf_data_storage *vfinfo;
-	int vf_rate_link_speed;
-#endif
-
-	struct nfp_cpp *cpp;
-	struct platform_device *nfp_dev_cpp;
-	struct nfp_cpp_area *ctrl_area;
-	struct nfp_cpp_area *tx_area;
-	struct nfp_cpp_area *rx_area;
-
 	struct nfp_net_fw_version fw_ver;
 	u32 cap;
 	u32 max_mtu;
@@ -505,11 +496,11 @@ struct nfp_net {
 	u8 rss_key[NFP_NET_CFG_RSS_KEY_SZ];
 	u8 rss_itbl[NFP_NET_CFG_RSS_ITBL_SZ];
 
-	int max_tx_rings;
-	int max_rx_rings;
+	unsigned int max_tx_rings;
+	unsigned int max_rx_rings;
 
-	int num_tx_rings;
-	int num_rx_rings;
+	unsigned int num_tx_rings;
+	unsigned int num_rx_rings;
 
 	int stride_tx;
 	int stride_rx;
@@ -517,8 +508,8 @@ struct nfp_net {
 	int txd_cnt;
 	int rxd_cnt;
 
-	u8 num_irqs;
-	u8 num_r_vecs;
+	unsigned int max_r_vecs;
+	unsigned int num_r_vecs;
 	struct nfp_net_r_vector r_vecs[NFP_NET_MAX_R_VECS];
 	struct msix_entry irq_entries[NFP_NET_MAX_IRQS];
 
@@ -553,22 +544,46 @@ struct nfp_net {
 	u8 __iomem *qcp_cfg;
 
 	u8 __iomem *ctrl_bar;
-	u8 __iomem *q_bar;
 	u8 __iomem *tx_bar;
 	u8 __iomem *rx_bar;
 
 	struct dentry *debugfs_dir;
+	u32 ethtool_dump_flag;
+
+	struct list_head port_list;
+
+	struct nfp_cpp *cpp;
+};
+
+struct nfp_net_ring_set {
+	unsigned int n_rings;
+	unsigned int mtu;
+	unsigned int dcnt;
+	void *rings;
 };
 
 /* Functions to read/write from/to a BAR
  * Performs any endian conversion necessary.
  */
+static inline u16 nn_readb(struct nfp_net *nn, int off)
+{
+	return readb(nn->ctrl_bar + off);
+}
+
 static inline void nn_writeb(struct nfp_net *nn, int off, u8 val)
 {
 	writeb(val, nn->ctrl_bar + off);
 }
 
-/* NFP-3200 can't handle 16-bit accesses too well - hence no readw/writew */
+static inline u16 nn_readw(struct nfp_net *nn, int off)
+{
+	return readw(nn->ctrl_bar + off);
+}
+
+static inline void nn_writew(struct nfp_net *nn, int off, u16 val)
+{
+	writew(val, nn->ctrl_bar + off);
+}
 
 static inline u32 nn_readl(struct nfp_net *nn, int off)
 {
@@ -614,7 +629,7 @@ static inline void nn_pci_flush(struct nfp_net *nn)
 #define NFP_QCP_QUEUE_STS_HI			0x000c
 #define NFP_QCP_QUEUE_STS_HI_WRITEPTR_mask	0x3ffff
 
-/* The offset of a QCP queues in the PCIe Target (same on NFP3200 and NFP6000 */
+/* The offset of a QCP queues in the PCIe Target */
 #define NFP_PCIE_QUEUE(_q) (0x80000 + (NFP_QCP_QUEUE_ADDR_SZ * ((_q) & 0xff)))
 
 /* nfp_qcp_ptr - Read or Write Pointer of a queue */
@@ -714,15 +729,15 @@ static inline u32 nfp_qcp_wr_ptr_read(u8 __iomem *q)
 }
 
 /* Globals */
-extern const char nfp_net_driver_name[];
-extern const char nfp_net_driver_version[];
+extern const char nfp_driver_version[];
 
 /* Prototypes */
 void nfp_net_get_fw_version(struct nfp_net_fw_version *fw_ver,
 			    void __iomem *ctrl_bar);
 
-struct nfp_net *nfp_net_netdev_alloc(struct pci_dev *pdev,
-				     int max_tx_rings, int max_rx_rings);
+struct nfp_net *
+nfp_net_netdev_alloc(struct pci_dev *pdev,
+		     unsigned int max_tx_rings, unsigned int max_rx_rings);
 void nfp_net_netdev_free(struct nfp_net *nn);
 int nfp_net_netdev_init(struct net_device *netdev);
 void nfp_net_netdev_clean(struct net_device *netdev);
@@ -732,15 +747,24 @@ int nfp_net_reconfig(struct nfp_net *nn, u32 update);
 void nfp_net_rss_write_itbl(struct nfp_net *nn);
 void nfp_net_rss_write_key(struct nfp_net *nn);
 void nfp_net_coalesce_write_cfg(struct nfp_net *nn);
-int nfp_net_irqs_alloc(struct nfp_net *nn);
-void nfp_net_irqs_disable(struct nfp_net *nn);
-int nfp_net_set_ring_size(struct nfp_net *nn, u32 rxd_cnt, u32 txd_cnt);
 
-#ifdef CONFIG_NFP_NET_DEBUG
+unsigned int
+nfp_net_irqs_alloc(struct pci_dev *pdev, struct msix_entry *irq_entries,
+		   unsigned int min_irqs, unsigned int want_irqs);
+void nfp_net_irqs_disable(struct pci_dev *pdev);
+void
+nfp_net_irqs_assign(struct nfp_net *nn, struct msix_entry *irq_entries,
+		    unsigned int n);
+int
+nfp_net_ring_reconfig(struct nfp_net *nn, struct nfp_net_ring_set *rx,
+		      struct nfp_net_ring_set *tx);
+
+#ifdef CONFIG_NFP_DEBUG
 void nfp_net_debugfs_create(void);
 void nfp_net_debugfs_destroy(void);
-void nfp_net_debugfs_adapter_add(struct nfp_net *nn);
-void nfp_net_debugfs_adapter_del(struct nfp_net *nn);
+struct dentry *nfp_net_debugfs_device_add(struct pci_dev *pdev);
+void nfp_net_debugfs_port_add(struct nfp_net *nn, struct dentry *ddir, int id);
+void nfp_net_debugfs_dir_clean(struct dentry **dir);
 #else
 static inline void nfp_net_debugfs_create(void)
 {
@@ -750,13 +774,19 @@ static inline void nfp_net_debugfs_destroy(void)
 {
 }
 
-static inline void nfp_net_debugfs_adapter_add(struct nfp_net *nn)
+static inline struct dentry *nfp_net_debugfs_device_add(struct pci_dev *pdev)
+{
+	return NULL;
+}
+
+static inline void
+nfp_net_debugfs_port_add(struct nfp_net *nn, struct dentry *ddir, int id)
 {
 }
 
-static inline void nfp_net_debugfs_adapter_del(struct nfp_net *nn)
+static inline void nfp_net_debugfs_dir_clean(struct dentry **dir)
 {
 }
-#endif /* CONFIG_NFP_NET_DEBUG */
+#endif /* CONFIG_NFP_DEBUG */
 
 #endif /* _NFP_NET_H_ */

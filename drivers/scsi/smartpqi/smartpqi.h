@@ -629,8 +629,10 @@ struct pqi_encryption_info {
 	u32	encrypt_tweak_upper;
 };
 
-#define PQI_MAX_OUTSTANDING_REQUESTS	((u32)~0)
-#define PQI_MAX_TRANSFER_SIZE		(4 * 1024U * 1024U)
+#define PQI_MAX_OUTSTANDING_REQUESTS		((u32)~0)
+#define PQI_MAX_OUTSTANDING_REQUESTS_KDUMP	32
+#define PQI_MAX_TRANSFER_SIZE			(4 * 1024U * 1024U)
+#define PQI_MAX_TRANSFER_SIZE_KDUMP		(512 * 1024U)
 
 #define RAID_MAP_MAX_ENTRIES		1024
 

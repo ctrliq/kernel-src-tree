@@ -18,7 +18,7 @@
 #include <net/pkt_sched.h>
 #include <net/inet_ecn.h>
 #include <net/red.h>
-#include <net/flow_keys.h>
+#include <net/flow_dissector.h>
 
 /*
    CHOKe stateless AQM for fair bandwidth allocation
@@ -57,7 +57,7 @@ struct choke_sched_data {
 
 /* Variables */
 	struct red_vars  vars;
-	struct tcf_proto *filter_list;
+	struct tcf_proto __rcu *filter_list;
 	struct {
 		u32	prob_drop;	/* Early probability drops */
 		u32	prob_mark;	/* Early probability marks */
@@ -128,8 +128,8 @@ static void choke_drop_by_idx(struct Qdisc *sch, unsigned int idx)
 		choke_zap_tail_holes(q);
 
 	qdisc_qstats_backlog_dec(sch, skb);
+	qdisc_tree_reduce_backlog(sch, 1, qdisc_pkt_len(skb));
 	qdisc_drop(skb, sch);
-	qdisc_tree_decrease_qlen(sch, 1);
 	--sch->q.qlen;
 }
 
@@ -170,13 +170,13 @@ static bool choke_match_flow(struct sk_buff *skb1,
 
 	if (!choke_skb_cb(skb1)->keys_valid) {
 		choke_skb_cb(skb1)->keys_valid = 1;
-		skb_flow_dissect(skb1, &temp);
+		skb_flow_dissect_flow_keys(skb1, &temp, 0);
 		make_flow_keys_digest(&choke_skb_cb(skb1)->keys, &temp);
 	}
 
 	if (!choke_skb_cb(skb2)->keys_valid) {
 		choke_skb_cb(skb2)->keys_valid = 1;
-		skb_flow_dissect(skb2, &temp);
+		skb_flow_dissect_flow_keys(skb2, &temp, 0);
 		make_flow_keys_digest(&choke_skb_cb(skb2)->keys, &temp);
 	}
 
@@ -197,9 +197,11 @@ static bool choke_classify(struct sk_buff *skb,
 {
 	struct choke_sched_data *q = qdisc_priv(sch);
 	struct tcf_result res;
+	struct tcf_proto *fl;
 	int result;
 
-	result = tc_classify(skb, q->filter_list, &res);
+	fl = rcu_dereference_bh(q->filter_list);
+	result = tc_classify(skb, fl, &res);
 	if (result >= 0) {
 #ifdef CONFIG_NET_CLS_ACT
 		switch (result) {
@@ -253,7 +255,7 @@ static bool choke_match_random(const struct choke_sched_data *q,
 		return false;
 
 	oskb = choke_peek_random(q, pidx);
-	if (q->filter_list)
+	if (rcu_access_pointer(q->filter_list))
 		return choke_get_classid(nskb) == choke_get_classid(oskb);
 
 	return choke_match_flow(oskb, nskb);
@@ -261,11 +263,11 @@ static bool choke_match_random(const struct choke_sched_data *q,
 
 static int choke_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 {
+	int ret = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
 	struct choke_sched_data *q = qdisc_priv(sch);
 	const struct red_parms *p = &q->parms;
-	int ret = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
 
-	if (q->filter_list) {
+	if (rcu_access_pointer(q->filter_list)) {
 		/* If using external classifiers, get result and record it. */
 		if (!choke_classify(skb, sch, &ret))
 			goto other_drop;	/* Packet was eaten by filter */
@@ -445,6 +447,7 @@ static int choke_change(struct Qdisc *sch, struct nlattr *opt)
 		old = q->tab;
 		if (old) {
 			unsigned int oqlen = sch->q.qlen, tail = 0;
+			unsigned dropped = 0;
 
 			while (q->head != q->tail) {
 				struct sk_buff *skb = q->tab[q->head];
@@ -456,11 +459,12 @@ static int choke_change(struct Qdisc *sch, struct nlattr *opt)
 					ntab[tail++] = skb;
 					continue;
 				}
+				dropped += qdisc_pkt_len(skb);
 				qdisc_qstats_backlog_dec(sch, skb);
 				--sch->q.qlen;
 				qdisc_drop(skb, sch);
 			}
-			qdisc_tree_decrease_qlen(sch, oqlen - sch->q.qlen);
+			qdisc_tree_reduce_backlog(sch, oqlen - sch->q.qlen, dropped);
 			q->head = 0;
 			q->tail = tail;
 		}
@@ -562,7 +566,8 @@ static unsigned long choke_bind(struct Qdisc *sch, unsigned long parent,
 	return 0;
 }
 
-static struct tcf_proto **choke_find_tcf(struct Qdisc *sch, unsigned long cl)
+static struct tcf_proto __rcu **choke_find_tcf(struct Qdisc *sch,
+					       unsigned long cl)
 {
 	struct choke_sched_data *q = qdisc_priv(sch);
 

@@ -31,12 +31,11 @@
 #include <linux/slab.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
-#include <acpi/acpi_bus.h>
 #include <linux/sysfs.h>
 #include <linux/kobject.h>
-#include <asm/uaccess.h>
 #include <linux/moduleparam.h>
 #include <linux/pci.h>
+#include <asm/uaccess.h>
 
 #include "acpiphp.h"
 #include "../pci.h"
@@ -327,7 +326,7 @@ static int ibm_get_table_from_acpi(char **bufp)
 	}
 
 	size = 0;
-	for (i=0; i<package->package.count; i++) {
+	for (i = 0; i < package->package.count; i++) {
 		memcpy(&lbuf[size],
 				package->package.elements[i].buffer.pointer,
 				package->package.elements[i].buffer.length);

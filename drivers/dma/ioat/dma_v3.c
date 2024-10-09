@@ -206,10 +206,29 @@ static bool is_hsw_ioat(struct pci_dev *pdev)
 
 }
 
+static bool is_bdx_ioat(struct pci_dev *pdev)
+{
+	switch (pdev->device) {
+	case PCI_DEVICE_ID_INTEL_IOAT_BDX0:
+	case PCI_DEVICE_ID_INTEL_IOAT_BDX1:
+	case PCI_DEVICE_ID_INTEL_IOAT_BDX2:
+	case PCI_DEVICE_ID_INTEL_IOAT_BDX3:
+	case PCI_DEVICE_ID_INTEL_IOAT_BDX4:
+	case PCI_DEVICE_ID_INTEL_IOAT_BDX5:
+	case PCI_DEVICE_ID_INTEL_IOAT_BDX6:
+	case PCI_DEVICE_ID_INTEL_IOAT_BDX7:
+	case PCI_DEVICE_ID_INTEL_IOAT_BDX8:
+	case PCI_DEVICE_ID_INTEL_IOAT_BDX9:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static bool is_xeon_cb32(struct pci_dev *pdev)
 {
 	return is_jf_ioat(pdev) || is_snb_ioat(pdev) || is_ivb_ioat(pdev) ||
-		is_hsw_ioat(pdev);
+		is_hsw_ioat(pdev) || is_bdx_ioat(pdev);
 }
 
 static bool is_bwd_ioat(struct pci_dev *pdev)
@@ -572,6 +591,7 @@ static void __cleanup(struct ioat2_dma_chan *ioat, dma_addr_t phys_complete)
 		tx = &desc->txd;
 		if (tx->cookie) {
 			dma_cookie_complete(tx);
+			dma_descriptor_unmap(tx);
 			ioat3_dma_unmap(ioat, desc, idx + i);
 			if (tx->callback) {
 				tx->callback(tx->callback_param);

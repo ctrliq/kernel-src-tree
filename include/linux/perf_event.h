@@ -164,6 +164,15 @@ struct hw_perf_event {
 
 	RH_KABI_EXTEND(struct event_constraint *constraint)
 	RH_KABI_EXTEND(struct task_struct	*target)
+
+	/*
+	 * PMU would store hardware filter configuration
+	 * here.
+	 */
+	RH_KABI_EXTEND(void			*addr_filters)
+
+	/* Last sync'ed generation of filters */
+	RH_KABI_EXTEND(unsigned long		addr_filters_gen)
 #endif
 };
 
@@ -186,6 +195,7 @@ struct perf_event;
  * pmu::capabilities flags
  */
 #define PERF_PMU_CAP_NO_INTERRUPT		0x01
+#define PERF_PMU_CAP_NO_NMI			0x02
 #define PERF_PMU_CAP_AUX_NO_SG			0x04
 #define PERF_PMU_CAP_AUX_SW_DOUBLEBUF		0x08
 #define PERF_PMU_CAP_EXCLUSIVE			0x10
@@ -324,6 +334,68 @@ struct pmu {
 	 */
 	RH_KABI_EXTEND(void (*free_aux)		(void *aux)) /* optional */
 	RH_KABI_EXTEND(atomic_t			exclusive_cnt) /* < 0: cpu; > 0: tsk */
+
+
+	/*
+	 * Validate address range filters: make sure the HW supports the
+	 * requested configuration and number of filters; return 0 if the
+	 * supplied filters are valid, -errno otherwise.
+	 *
+	 * Runs in the context of the ioctl()ing process and is not serialized
+	 * with the rest of the PMU callbacks.
+	 */
+	RH_KABI_EXTEND(int (*addr_filters_validate)	(struct list_head *filters))
+
+	/*
+	 * Synchronize address range filter configuration:
+	 * translate hw-agnostic filters into hardware configuration in
+	 * event::hw::addr_filters.
+	 *
+	 * Runs as a part of filter sync sequence that is done in ->start()
+	 * callback by calling perf_event_addr_filters_sync().
+	 *
+	 * May (and should) traverse event::addr_filters::list, for which its
+	 * caller provides necessary serialization.
+	 */
+	RH_KABI_EXTEND(void (*addr_filters_sync)	(struct perf_event *event))
+					/* optional */
+
+	/* number of address filters this PMU can do */
+	RH_KABI_EXTEND(unsigned int			nr_addr_filters)
+};
+
+/**
+ * struct perf_addr_filter - address range filter definition
+ * @entry:	event's filter list linkage
+ * @inode:	object file's inode for file-based filters
+ * @offset:	filter range offset
+ * @size:	filter range size
+ * @range:	1: range, 0: address
+ * @filter:	1: filter/start, 0: stop
+ *
+ * This is a hardware-agnostic filter configuration as specified by the user.
+ */
+struct perf_addr_filter {
+	struct list_head	entry;
+	struct inode		*inode;
+	unsigned long		offset;
+	unsigned long		size;
+	unsigned int		range	: 1,
+				filter	: 1;
+};
+
+/**
+ * struct perf_addr_filters_head - container for address range filters
+ * @list:	list of filters for this event
+ * @lock:	spinlock that serializes accesses to the @list and event's
+ *		(and its children's) filter generations.
+ *
+ * A child event will use parent's @list (and therefore @lock), so they are
+ * bundled together; see perf_event_addr_filters().
+ */
+struct perf_addr_filters_head {
+	struct list_head	list;
+	raw_spinlock_t		lock;
 };
 
 /**
@@ -347,9 +419,15 @@ typedef void (*perf_overflow_handler_t)(struct perf_event *,
 					struct perf_sample_data *,
 					struct pt_regs *regs);
 
-enum perf_group_flag {
-	PERF_GROUP_SOFTWARE		= 0x1,
-};
+/*
+ * Event capabilities. For event_caps and groups caps.
+ *
+ * PERF_EV_CAP_SOFTWARE: Is a software event.
+ * PERF_EV_CAP_READ_ACTIVE_PKG: A CPU event (or cgroup event) that can be read
+ * from any CPU in the package where it is active.
+ */
+#define PERF_EV_CAP_SOFTWARE		BIT(0)
+#define PERF_EV_CAP_READ_ACTIVE_PKG	BIT(1)
 
 #define SWEVENT_HLIST_BITS		8
 #define SWEVENT_HLIST_SIZE		(1 << SWEVENT_HLIST_BITS)
@@ -366,6 +444,11 @@ struct swevent_hlist {
 
 struct perf_cgroup;
 struct ring_buffer;
+
+struct pmu_event_list {
+	raw_spinlock_t		lock;
+	struct list_head	list;
+};
 
 /**
  * struct perf_event - performance event kernel representation:
@@ -390,7 +473,10 @@ struct perf_event {
 	struct list_head		sibling_list;
 	struct hlist_node		hlist_entry;
 	int				nr_siblings;
-	int				group_flags;
+
+	/* Not serialized. Only written during event initialization. */
+	RH_KABI_RENAME(int group_flags, int event_caps);
+
 	struct perf_event		*group_leader;
 	struct pmu			*pmu;
 
@@ -516,6 +602,15 @@ struct perf_event {
 #if defined(CONFIG_FUNCTION_TRACER) && defined(CONFIG_S390)
 	RH_KABI_EXTEND(struct ftrace_ops	 ftrace_ops)
 #endif
+	/* address range filters */
+	RH_KABI_EXTEND(struct perf_addr_filters_head	 addr_filters)
+	/* vma address array for file-based filders */
+	RH_KABI_EXTEND(unsigned long			*addr_filters_offs)
+	RH_KABI_EXTEND(unsigned long			 addr_filters_gen)
+	RH_KABI_EXTEND(struct list_head			 sb_list)
+	RH_KABI_EXTEND(u64				(*clock)(void))
+	/* The cumulative AND of all event_caps for events in this group. */
+	RH_KABI_EXTEND(int				group_caps)
 #endif /* CONFIG_PERF_EVENTS */
 };
 
@@ -772,14 +867,24 @@ extern int perf_event_overflow(struct perf_event *event,
 				 struct perf_sample_data *data,
 				 struct pt_regs *regs);
 
+extern void perf_event_output_forward(struct perf_event *event,
+				     struct perf_sample_data *data,
+				     struct pt_regs *regs);
+extern void perf_event_output_backward(struct perf_event *event,
+				       struct perf_sample_data *data,
+				       struct pt_regs *regs);
 extern void perf_event_output(struct perf_event *event,
-				struct perf_sample_data *data,
-				struct pt_regs *regs);
+			      struct perf_sample_data *data,
+			      struct pt_regs *regs);
 
 static inline bool
 is_default_overflow_handler(struct perf_event *event)
 {
-	return (event->overflow_handler == perf_event_output);
+	if (likely(event->overflow_handler == perf_event_output_forward))
+		return true;
+	if (unlikely(event->overflow_handler == perf_event_output_backward))
+		return true;
+	return false;
 }
 
 extern void
@@ -804,7 +909,7 @@ static inline bool is_sampling_event(struct perf_event *event)
  */
 static inline int is_software_event(struct perf_event *event)
 {
-	return event->pmu->task_ctx_nr == perf_sw_context;
+	return event->event_caps & PERF_EV_CAP_SOFTWARE;
 }
 
 extern struct static_key perf_swevent_enabled[PERF_COUNT_SW_MAX];
@@ -956,8 +1061,41 @@ static inline bool has_aux(struct perf_event *event)
 	return event->pmu->setup_aux;
 }
 
+static inline bool is_write_backward(struct perf_event *event)
+{
+	return !!event->attr.write_backward;
+}
+
+static inline bool has_addr_filter(struct perf_event *event)
+{
+	return event->pmu->nr_addr_filters;
+}
+
+/*
+ * An inherited event uses parent's filters
+ */
+static inline struct perf_addr_filters_head *
+perf_event_addr_filters(struct perf_event *event)
+{
+	struct perf_addr_filters_head *ifh = &event->addr_filters;
+
+	if (event->parent)
+		ifh = &event->parent->addr_filters;
+
+	return ifh;
+}
+
+extern void perf_event_addr_filters_sync(struct perf_event *event);
+
 extern int perf_output_begin(struct perf_output_handle *handle,
 			     struct perf_event *event, unsigned int size);
+extern int perf_output_begin_forward(struct perf_output_handle *handle,
+				    struct perf_event *event,
+				    unsigned int size);
+extern int perf_output_begin_backward(struct perf_output_handle *handle,
+				      struct perf_event *event,
+				      unsigned int size);
+
 extern void perf_output_end(struct perf_output_handle *handle);
 extern unsigned int perf_output_copy(struct perf_output_handle *handle,
 			     const void *buf, unsigned int len);

@@ -30,9 +30,11 @@
 #include <linux/err.h>
 #include <linux/spinlock.h>
 #include <linux/export.h>
+#include <linux/hugetlb.h>
 #include <asm/mman.h>
 #include <asm/mmu.h>
 #include <asm/copro.h>
+#include <asm/hugetlb.h>
 
 /* some sanity checks */
 #if (PGTABLE_RANGE >> 43) > SLICE_MASK_SIZE
@@ -103,7 +105,7 @@ static int slice_area_is_free(struct mm_struct *mm, unsigned long addr,
 	if ((mm->task_size - len) < addr)
 		return 0;
 	vma = find_vma(mm, addr);
-	return (!vma || (addr + len) <= vma->vm_start);
+	return (!vma || (addr + len) <= vm_start_gap(vma));
 }
 
 static int slice_low_has_vma(struct mm_struct *mm, unsigned long slice)

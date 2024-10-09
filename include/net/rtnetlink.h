@@ -48,6 +48,9 @@ static inline int rtnl_msg_family(const struct nlmsghdr *nlh)
  *	@get_num_rx_queues: Function to determine number of receive queues
  *			    to create when creating a new device.
  *	@get_link_net: Function to get the i/o netns of the device
+ *	@get_linkxstats_size: Function to calculate the required room for
+ *			      dumping device-specific extended link stats
+ *	@fill_linkxstats: Function to dump device-specific extended link stats
  */
 struct rtnl_link_ops {
 	struct list_head	list;
@@ -101,8 +104,11 @@ struct rtnl_link_ops {
 	RH_KABI_USE_P(7, int	(*fill_slave_info)(struct sk_buff *skb,
 						   const struct net_device *dev,
 						   const struct net_device *slave_dev))
-	RH_KABI_RESERVE_P(8)
-	RH_KABI_RESERVE_P(9)
+	RH_KABI_USE_P(8, size_t	(*get_linkxstats_size)(const struct net_device *dev,
+						       int attr))
+	RH_KABI_USE_P(9, int	(*fill_linkxstats)(struct sk_buff *skb,
+						   const struct net_device *dev,
+						   int *prividx, int attr))
 	RH_KABI_RESERVE_P(10)
 	RH_KABI_RESERVE_P(11)
 	RH_KABI_RESERVE_P(12)
@@ -138,7 +144,8 @@ struct rtnl_af_ops {
 
 	int			(*fill_link_af)(struct sk_buff *skb,
 						const struct net_device *dev);
-	size_t			(*get_link_af_size)(const struct net_device *dev);
+	size_t			(*get_link_af_size)(const struct net_device *dev,
+						    u32 ext_filter_mask);
 
 	int			(*validate_link_af)(const struct net_device *dev,
 						    const struct nlattr *attr);
@@ -146,10 +153,9 @@ struct rtnl_af_ops {
 					       const struct nlattr *attr);
 };
 
-int __rtnl_af_register(struct rtnl_af_ops *ops);
 void __rtnl_af_unregister(struct rtnl_af_ops *ops);
 
-int rtnl_af_register(struct rtnl_af_ops *ops);
+void rtnl_af_register(struct rtnl_af_ops *ops);
 void rtnl_af_unregister(struct rtnl_af_ops *ops);
 
 struct net *rtnl_link_get_net(struct net *src_net, struct nlattr *tb[]);

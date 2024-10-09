@@ -1239,5 +1239,3 @@ static int __init cell_iommu_init(void)
 	return 0;
 }
 machine_arch_initcall(cell, cell_iommu_init);
-machine_arch_initcall(celleb_native, cell_iommu_init);
-

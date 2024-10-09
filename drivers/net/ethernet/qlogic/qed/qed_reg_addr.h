@@ -1,9 +1,33 @@
 /* QLogic qed NIC Driver
- * Copyright (c) 2015 QLogic Corporation
+ * Copyright (c) 2015-2017  QLogic Corporation
  *
- * This software is available under the terms of the GNU General Public License
- * (GPL) Version 2, available from the file COPYING in the main directory of
- * this source tree.
+ * This software is available to you under a choice of one of two
+ * licenses.  You may choose to be licensed under the terms of the GNU
+ * General Public License (GPL) Version 2, available from the file
+ * COPYING in the main directory of this source tree, or the
+ * OpenIB.org BSD license below:
+ *
+ *     Redistribution and use in source and binary forms, with or
+ *     without modification, are permitted provided that the following
+ *     conditions are met:
+ *
+ *      - Redistributions of source code must retain the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer.
+ *
+ *      - Redistributions in binary form must reproduce the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer in the documentation and /or other materials
+ *        provided with the distribution.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  */
 
 #ifndef REG_ADDR_H
@@ -82,8 +106,12 @@
 	0x1c80000UL
 #define BAR0_MAP_REG_XSDM_RAM \
 	0x1e00000UL
+#define BAR0_MAP_REG_YSDM_RAM \
+	0x1e80000UL
 #define  NIG_REG_RX_LLH_BRB_GATE_DNTFWD_PERPF \
 	0x5011f4UL
+#define PRS_REG_SEARCH_RESP_INITIATOR_TYPE \
+	0x1f0164UL
 #define  PRS_REG_SEARCH_TCP \
 	0x1f0400UL
 #define  PRS_REG_SEARCH_UDP \
@@ -94,6 +122,12 @@
 	0x1f040cUL
 #define  PRS_REG_SEARCH_OPENFLOW	\
 	0x1f0434UL
+#define PRS_REG_SEARCH_TAG1 \
+	0x1f0444UL
+#define PRS_REG_PKT_LEN_STAT_TAGS_NOT_COUNTED_FIRST \
+	0x1f0a0cUL
+#define PRS_REG_SEARCH_TCP_FIRST_FRAG \
+	0x1f0410UL
 #define  TM_REG_PF_ENABLE_CONN \
 	0x2c043cUL
 #define  TM_REG_PF_ENABLE_TASK \
@@ -126,13 +160,13 @@
 	0x2e0704UL
 #define  CCFC_REG_STRONG_ENABLE_PF \
 	0x2e0708UL
-#define  PGLUE_B_REG_PGL_ADDR_88_F0 \
+#define  PGLUE_B_REG_PGL_ADDR_88_F0_BB \
 	0x2aa404UL
-#define  PGLUE_B_REG_PGL_ADDR_8C_F0 \
+#define  PGLUE_B_REG_PGL_ADDR_8C_F0_BB \
 	0x2aa408UL
-#define  PGLUE_B_REG_PGL_ADDR_90_F0 \
+#define  PGLUE_B_REG_PGL_ADDR_90_F0_BB \
 	0x2aa40cUL
-#define  PGLUE_B_REG_PGL_ADDR_94_F0 \
+#define  PGLUE_B_REG_PGL_ADDR_94_F0_BB \
 	0x2aa410UL
 #define  PGLUE_B_REG_WAS_ERROR_PF_31_0_CLR \
 	0x2aa138UL
@@ -322,6 +356,10 @@
 	0x238804UL
 #define  RDIF_REG_STOP_ON_ERROR \
 	0x300040UL
+#define RDIF_REG_DEBUG_ERROR_INFO \
+	0x300400UL
+#define RDIF_REG_DEBUG_ERROR_INFO_SIZE \
+	64
 #define  SRC_REG_SOFT_RST \
 	0x23874cUL
 #define  TCFC_REG_ACTIVITY_COUNTER \
@@ -336,6 +374,10 @@
 	0x1700004UL
 #define  TDIF_REG_STOP_ON_ERROR \
 	0x310040UL
+#define TDIF_REG_DEBUG_ERROR_INFO \
+	0x310400UL
+#define TDIF_REG_DEBUG_ERROR_INFO_SIZE \
+	64
 #define  UCM_REG_INIT \
 	0x1280000UL
 #define  UMAC_REG_IPG_HD_BKP_CNTL_BB_B0 \
@@ -1202,6 +1244,26 @@
 	0x1901534UL
 #define USEM_REG_DBG_FORCE_FRAME \
 	0x1901538UL
+#define NWS_REG_DBG_SELECT \
+	0x700128UL
+#define NWS_REG_DBG_DWORD_ENABLE \
+	0x70012cUL
+#define NWS_REG_DBG_SHIFT \
+	0x700130UL
+#define NWS_REG_DBG_FORCE_VALID	\
+	0x700134UL
+#define NWS_REG_DBG_FORCE_FRAME	\
+	0x700138UL
+#define MS_REG_DBG_SELECT \
+	0x6a0228UL
+#define MS_REG_DBG_DWORD_ENABLE \
+	0x6a022cUL
+#define MS_REG_DBG_SHIFT \
+	0x6a0230UL
+#define MS_REG_DBG_FORCE_VALID \
+	0x6a0234UL
+#define MS_REG_DBG_FORCE_FRAME \
+	0x6a0238UL
 #define PCIE_REG_DBG_COMMON_SELECT \
 	0x054398UL
 #define PCIE_REG_DBG_COMMON_DWORD_ENABLE \
@@ -1414,6 +1476,8 @@
 	0x000b48UL
 #define RSS_REG_RSS_RAM_DATA \
 	0x238c20UL
+#define RSS_REG_RSS_RAM_DATA_SIZE \
+	4
 #define MISC_REG_BLOCK_256B_EN \
 	0x008c14UL
 #define NWS_REG_NWS_CMU	\
@@ -1455,4 +1519,13 @@
 #define DORQ_REG_PF_ICID_BIT_SHIFT_NORM	0x100448UL
 #define DORQ_REG_PF_MIN_ADDR_REG1 0x100400UL
 #define DORQ_REG_PF_DPI_BIT_SHIFT 0x100450UL
+#define NIG_REG_PTP_LATCH_OSTS_PKT_TIME 0x509040UL
+
+#define PGLUE_B_REG_PGL_ADDR_E8_F0_K2 0x2aaf98UL
+#define PGLUE_B_REG_PGL_ADDR_EC_F0_K2 0x2aaf9cUL
+#define PGLUE_B_REG_PGL_ADDR_F0_F0_K2 0x2aafa0UL
+#define PGLUE_B_REG_PGL_ADDR_F4_F0_K2 0x2aafa4UL
+#define NIG_REG_TSGEN_FREECNT_UPDATE_K2 0x509008UL
+#define CNIG_REG_NIG_PORT0_CONF_K2 0x218200UL
+
 #endif

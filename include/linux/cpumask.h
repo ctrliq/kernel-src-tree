@@ -744,6 +744,7 @@ void set_cpu_active(unsigned int cpu, bool active);
 void init_cpu_present(const struct cpumask *src);
 void init_cpu_possible(const struct cpumask *src);
 void init_cpu_online(const struct cpumask *src);
+void reset_cpu_possible_mask(void);
 
 /**
  * to_cpumask - convert an NR_CPUS bitmap to a struct cpumask *
@@ -797,6 +798,23 @@ static inline const struct cpumask *get_cpu_mask(unsigned int cpu)
 	[BITS_TO_LONGS(NR_CPUS)-1] = CPU_MASK_LAST_WORD		\
 }
 #endif /* NR_CPUS > BITS_PER_LONG */
+
+/**
+ * cpumap_print_to_pagebuf  - copies the cpumask into the buffer either
+ *	as comma-separated list of cpus or hex values of cpumask
+ * @list: indicates whether the cpumap must be list
+ * @mask: the cpumask to copy
+ * @buf: the buffer to copy into
+ *
+ * Returns the length of the (null-terminated) @buf string, zero if
+ * nothing is copied.
+ */
+static inline ssize_t
+cpumap_print_to_pagebuf(bool list, char *buf, const struct cpumask *mask)
+{
+	return bitmap_print_to_pagebuf(list, buf, cpumask_bits(mask),
+				      nr_cpumask_bits);
+}
 
 /*
  *

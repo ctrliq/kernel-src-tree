@@ -371,11 +371,9 @@ void tcp_update_metrics(struct sock *sk)
 	u32 val;
 	int m;
 
+	sk_dst_confirm(sk);
 	if (sysctl_tcp_nometrics_save || !dst)
 		return;
-
-	if (dst->flags & DST_HOST)
-		dst_confirm(dst);
 
 	rcu_read_lock();
 	if (icsk->icsk_backoff || !tp->srtt_us) {
@@ -489,10 +487,9 @@ void tcp_init_metrics(struct sock *sk)
 	struct tcp_metrics_block *tm;
 	u32 val, crtt = 0; /* cached RTT scaled by 8 */
 
+	sk_dst_confirm(sk);
 	if (dst == NULL)
 		goto reset;
-
-	dst_confirm(dst);
 
 	rcu_read_lock();
 	tm = tcp_get_metrics(sk, dst, true);
@@ -796,7 +793,8 @@ static int tcp_metrics_fill_info(struct sk_buff *msg,
 	}
 
 	if (nla_put_msecs(msg, TCP_METRICS_ATTR_AGE,
-			  jiffies - tm->tcpm_stamp) < 0)
+			  jiffies - tm->tcpm_stamp,
+			  TCP_METRICS_ATTR_PAD) < 0)
 		goto nla_put_failure;
 	if (tm->tcpm_ts_stamp) {
 		if (nla_put_s32(msg, TCP_METRICS_ATTR_TW_TS_STAMP,
@@ -860,7 +858,8 @@ static int tcp_metrics_fill_info(struct sk_buff *msg,
 		    (nla_put_u16(msg, TCP_METRICS_ATTR_FOPEN_SYN_DROPS,
 				tfom->syn_loss) < 0 ||
 		     nla_put_msecs(msg, TCP_METRICS_ATTR_FOPEN_SYN_DROP_TS,
-				jiffies - tfom->last_syn_loss) < 0))
+				jiffies - tfom->last_syn_loss,
+				TCP_METRICS_ATTR_PAD) < 0))
 			goto nla_put_failure;
 		if (tfom->cookie.len > 0 &&
 		    nla_put(msg, TCP_METRICS_ATTR_FOPEN_COOKIE,

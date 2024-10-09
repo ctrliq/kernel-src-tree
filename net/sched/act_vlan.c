@@ -29,7 +29,7 @@ static int tcf_vlan(struct sk_buff *skb, const struct tc_action *a,
 	int err;
 
 	spin_lock(&v->tcf_lock);
-	v->tcf_tm.lastuse = jiffies;
+	tcf_lastuse_update(&v->tcf_tm);
 	bstats_update(&v->tcf_bstats, skb);
 	action = v->tcf_action;
 
@@ -40,7 +40,8 @@ static int tcf_vlan(struct sk_buff *skb, const struct tc_action *a,
 			goto drop;
 		break;
 	case TCA_VLAN_ACT_PUSH:
-		err = skb_vlan_push(skb, v->tcfv_push_proto, v->tcfv_push_vid);
+		err = skb_vlan_push(skb, v->tcfv_push_proto, v->tcfv_push_vid |
+				    (v->tcfv_push_prio << VLAN_PRIO_SHIFT));
 		if (err)
 			goto drop;
 		break;
@@ -62,6 +63,7 @@ static const struct nla_policy vlan_policy[TCA_VLAN_MAX + 1] = {
 	[TCA_VLAN_PARMS]		= { .len = sizeof(struct tc_vlan) },
 	[TCA_VLAN_PUSH_VLAN_ID]		= { .type = NLA_U16 },
 	[TCA_VLAN_PUSH_VLAN_PROTOCOL]	= { .type = NLA_U16 },
+	[TCA_VLAN_PUSH_VLAN_PRIORITY]	= { .type = NLA_U8 },
 };
 
 static int tcf_vlan_init(struct net *net, struct nlattr *nla,
@@ -74,6 +76,7 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
 	int action;
 	__be16 push_vid = 0;
 	__be16 push_proto = 0;
+	u8 push_prio = 0;
 	int ret = 0;
 	int err;
 
@@ -109,6 +112,9 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
 		} else {
 			push_proto = htons(ETH_P_8021Q);
 		}
+
+		if (tb[TCA_VLAN_PUSH_VLAN_PRIORITY])
+			push_prio = nla_get_u8(tb[TCA_VLAN_PUSH_VLAN_PRIORITY]);
 		break;
 	default:
 		return -EINVAL;
@@ -116,7 +122,8 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
 	action = parm->v_action;
 
 	if (!tcf_hash_check(parm->index, a, bind)) {
-		ret = tcf_hash_create(parm->index, est, a, sizeof(*v), bind);
+		ret = tcf_hash_create(parm->index, est, a, sizeof(*v),
+				      bind, false);
 		if (ret)
 			return ret;
 
@@ -135,6 +142,7 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
 
 	v->tcfv_action = action;
 	v->tcfv_push_vid = push_vid;
+	v->tcfv_push_prio = push_prio;
 	v->tcfv_push_proto = push_proto;
 
 	v->tcf_action = parm->action;
@@ -165,13 +173,14 @@ static int tcf_vlan_dump(struct sk_buff *skb, struct tc_action *a,
 
 	if (v->tcfv_action == TCA_VLAN_ACT_PUSH &&
 	    (nla_put_u16(skb, TCA_VLAN_PUSH_VLAN_ID, v->tcfv_push_vid) ||
-	     nla_put_be16(skb, TCA_VLAN_PUSH_VLAN_PROTOCOL, v->tcfv_push_proto)))
+	     nla_put_be16(skb, TCA_VLAN_PUSH_VLAN_PROTOCOL,
+			  v->tcfv_push_proto) ||
+	     (nla_put_u8(skb, TCA_VLAN_PUSH_VLAN_PRIORITY,
+					      v->tcfv_push_prio))))
 		goto nla_put_failure;
 
-	t.install = jiffies_to_clock_t(jiffies - v->tcf_tm.install);
-	t.lastuse = jiffies_to_clock_t(jiffies - v->tcf_tm.lastuse);
-	t.expires = jiffies_to_clock_t(v->tcf_tm.expires);
-	if (nla_put(skb, TCA_VLAN_TM, sizeof(t), &t))
+	tcf_tm_dump(&t, &v->tcf_tm);
+	if (nla_put_64bit(skb, TCA_VLAN_TM, sizeof(t), &t, TCA_VLAN_PAD))
 		goto nla_put_failure;
 	return skb->len;
 

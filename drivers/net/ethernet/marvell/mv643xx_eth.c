@@ -33,7 +33,8 @@
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program; if not, see <http://www.gnu.org/licenses/>.
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -2537,7 +2538,7 @@ static void set_params(struct mv643xx_eth_private *mp,
 	struct net_device *dev = mp->dev;
 
 	if (is_valid_ether_addr(pd->mac_addr))
-		memcpy(dev->dev_addr, pd->mac_addr, 6);
+		memcpy(dev->dev_addr, pd->mac_addr, ETH_ALEN);
 	else
 		uc_addr_get(mp, dev->dev_addr);
 

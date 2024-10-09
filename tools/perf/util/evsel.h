@@ -44,6 +44,9 @@ enum {
 	PERF_EVSEL__CONFIG_TERM_CALLGRAPH,
 	PERF_EVSEL__CONFIG_TERM_STACK_USER,
 	PERF_EVSEL__CONFIG_TERM_INHERIT,
+	PERF_EVSEL__CONFIG_TERM_OVERWRITE,
+	PERF_EVSEL__CONFIG_TERM_DRV_CFG,
+	PERF_EVSEL__CONFIG_TERM_BRANCH,
 	PERF_EVSEL__CONFIG_TERM_MAX,
 };
 
@@ -55,8 +58,11 @@ struct perf_evsel_config_term {
 		u64	freq;
 		bool	time;
 		char	*callgraph;
+		char	*drv_cfg;
 		u64	stack_user;
 		bool	inherit;
+		bool	overwrite;
+		char	*branch;
 	} val;
 };
 
@@ -112,6 +118,7 @@ struct perf_evsel {
 	bool			tracking;
 	bool			per_pkg;
 	bool			precise_max;
+	bool			ignore_missing_thread;
 	/* parse modifier helper */
 	int			exclude_GH;
 	int			nr_members;
@@ -179,8 +186,14 @@ void perf_evsel__init(struct perf_evsel *evsel,
 void perf_evsel__exit(struct perf_evsel *evsel);
 void perf_evsel__delete(struct perf_evsel *evsel);
 
+struct callchain_param;
+
 void perf_evsel__config(struct perf_evsel *evsel,
-			struct record_opts *opts);
+			struct record_opts *opts,
+			struct callchain_param *callchain);
+void perf_evsel__config_callchain(struct perf_evsel *evsel,
+				  struct record_opts *opts,
+				  struct callchain_param *callchain);
 
 int __perf_evsel__sample_size(u64 sample_type);
 void perf_evsel__calc_id_pos(struct perf_evsel *evsel);
@@ -253,6 +266,8 @@ static inline char *perf_evsel__strval(struct perf_evsel *evsel,
 }
 
 struct format_field;
+
+u64 format_field__intval(struct format_field *field, struct perf_sample *sample, bool needs_swap);
 
 struct format_field *perf_evsel__field(struct perf_evsel *evsel, const char *name);
 
@@ -359,6 +374,26 @@ struct perf_attr_details {
 int perf_evsel__fprintf(struct perf_evsel *evsel,
 			struct perf_attr_details *details, FILE *fp);
 
+#define EVSEL__PRINT_IP			(1<<0)
+#define EVSEL__PRINT_SYM		(1<<1)
+#define EVSEL__PRINT_DSO		(1<<2)
+#define EVSEL__PRINT_SYMOFFSET		(1<<3)
+#define EVSEL__PRINT_ONELINE		(1<<4)
+#define EVSEL__PRINT_SRCLINE		(1<<5)
+#define EVSEL__PRINT_UNKNOWN_AS_ADDR	(1<<6)
+#define EVSEL__PRINT_CALLCHAIN_ARROW	(1<<7)
+#define EVSEL__PRINT_SKIP_IGNORED	(1<<8)
+
+struct callchain_cursor;
+
+int sample__fprintf_callchain(struct perf_sample *sample, int left_alignment,
+			      unsigned int print_opts,
+			      struct callchain_cursor *cursor, FILE *fp);
+
+int sample__fprintf_sym(struct perf_sample *sample, struct addr_location *al,
+			int left_alignment, unsigned int print_opts,
+			struct callchain_cursor *cursor, FILE *fp);
+
 bool perf_evsel__fallback(struct perf_evsel *evsel, int err,
 			  char *msg, size_t msgsize);
 int perf_evsel__open_strerror(struct perf_evsel *evsel, struct target *target,
@@ -374,7 +409,7 @@ for ((_evsel) = list_entry((_leader)->node.next, struct perf_evsel, node); 	\
      (_evsel) && (_evsel)->leader == (_leader);					\
      (_evsel) = list_entry((_evsel)->node.next, struct perf_evsel, node))
 
-static inline bool has_branch_callstack(struct perf_evsel *evsel)
+static inline bool perf_evsel__has_branch_callstack(const struct perf_evsel *evsel)
 {
 	return evsel->attr.branch_sample_type & PERF_SAMPLE_BRANCH_CALL_STACK;
 }

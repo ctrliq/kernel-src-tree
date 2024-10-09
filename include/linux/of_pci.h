@@ -15,13 +15,13 @@ int of_pci_get_devfn(struct device_node *np);
 int of_pci_parse_bus_range(struct device_node *node, struct resource *res);
 
 #if defined(CONFIG_OF) && defined(CONFIG_PCI_MSI)
-int of_pci_msi_chip_add(struct msi_chip *chip);
-void of_pci_msi_chip_remove(struct msi_chip *chip);
-struct msi_chip *of_pci_find_msi_chip_by_node(struct device_node *of_node);
+int of_pci_msi_chip_add(struct msi_controller *chip);
+void of_pci_msi_chip_remove(struct msi_controller *chip);
+struct msi_controller *of_pci_find_msi_chip_by_node(struct device_node *of_node);
 #else
-static inline int of_pci_msi_chip_add(struct msi_chip *chip) { return -EINVAL; }
-static inline void of_pci_msi_chip_remove(struct msi_chip *chip) { }
-static inline struct msi_chip *
+static inline int of_pci_msi_chip_add(struct msi_controller *chip) { return -EINVAL; }
+static inline void of_pci_msi_chip_remove(struct msi_controller *chip) { }
+static inline struct msi_controller *
 of_pci_find_msi_chip_by_node(struct device_node *of_node) { return NULL; }
 #endif
 

@@ -89,6 +89,16 @@ int ipv6_rcv_saddr_equal(const struct sock *sk, const struct sock *sk2);
 void addrconf_join_solict(struct net_device *dev, const struct in6_addr *addr);
 void addrconf_leave_solict(struct inet6_dev *idev, const struct in6_addr *addr);
 
+void addrconf_add_linklocal(struct inet6_dev *idev,
+			    const struct in6_addr *addr, u32 flags);
+
+int addrconf_prefix_rcv_add_addr(struct net *net, struct net_device *dev,
+				 const struct prefix_info *pinfo,
+				 struct inet6_dev *in6_dev,
+				 const struct in6_addr *addr, int addr_type,
+				 u32 addr_flags, bool sllao, bool tokenized,
+				 __u32 valid_lft, u32 prefered_lft);
+
 static inline int addrconf_ifid_eui48(u8 *eui, struct net_device *dev)
 {
 	if (dev->addr_len != ETH_ALEN)
@@ -171,6 +181,7 @@ void ipv6_mc_unmap(struct inet6_dev *idev);
 void ipv6_mc_remap(struct inet6_dev *idev);
 void ipv6_mc_init_dev(struct inet6_dev *idev);
 void ipv6_mc_destroy_dev(struct inet6_dev *idev);
+int ipv6_mc_check_mld(struct sk_buff *skb, struct sk_buff **skb_trimmed);
 void addrconf_dad_failure(struct inet6_ifaddr *ifp);
 
 bool ipv6_chk_mcast_addr(struct net_device *dev, const struct in6_addr *group,

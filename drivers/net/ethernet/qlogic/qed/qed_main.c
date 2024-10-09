@@ -1,9 +1,33 @@
 /* QLogic qed NIC Driver
- * Copyright (c) 2015 QLogic Corporation
+ * Copyright (c) 2015-2017  QLogic Corporation
  *
- * This software is available under the terms of the GNU General Public License
- * (GPL) Version 2, available from the file COPYING in the main directory of
- * this source tree.
+ * This software is available to you under a choice of one of two
+ * licenses.  You may choose to be licensed under the terms of the GNU
+ * General Public License (GPL) Version 2, available from the file
+ * COPYING in the main directory of this source tree, or the
+ * OpenIB.org BSD license below:
+ *
+ *     Redistribution and use in source and binary forms, with or
+ *     without modification, are permitted provided that the following
+ *     conditions are met:
+ *
+ *      - Redistributions of source code must retain the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer.
+ *
+ *      - Redistributions in binary form must reproduce the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer in the documentation and /or other materials
+ *        provided with the distribution.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  */
 
 #include <linux/stddef.h>
@@ -29,14 +53,14 @@
 #include "qed_sp.h"
 #include "qed_dev_api.h"
 #include "qed_ll2.h"
+#include "qed_fcoe.h"
 #include "qed_mcp.h"
 #include "qed_hw.h"
 #include "qed_selftest.h"
+#include "qed_debug.h"
 
-#if IS_ENABLED(CONFIG_INFINIBAND_QEDR)
 #define QED_ROCE_QPS			(8192)
 #define QED_ROCE_DPIS			(8)
-#endif
 
 static char version[] =
 	"QLogic FastLinQ 4xxxx Core Module qed " DRV_MODULE_VERSION "\n";
@@ -58,8 +82,6 @@ MODULE_FIRMWARE(QED_FW_FILE_NAME);
 
 static int __init qed_init(void)
 {
-	pr_notice("qed_init called\n");
-
 	pr_info("%s", version);
 
 	return 0;
@@ -216,6 +238,7 @@ int qed_fill_dev_info(struct qed_dev *cdev,
 	dev_info->rdma_supported = (cdev->hwfns[0].hw_info.personality ==
 				    QED_PCI_ETH_ROCE);
 	dev_info->is_mf_default = IS_MF_DEFAULT(&cdev->hwfns[0]);
+	dev_info->dev_type = cdev->type;
 	ether_addr_copy(dev_info->hw_mac, cdev->hwfns[0].hw_info.hw_mac_addr);
 
 	if (IS_PF(cdev)) {
@@ -225,6 +248,10 @@ int qed_fill_dev_info(struct qed_dev *cdev,
 		dev_info->fw_eng = FW_ENGINEERING_VERSION;
 		dev_info->mf_mode = cdev->mf_mode;
 		dev_info->tx_switching = true;
+
+		if (QED_LEADING_HWFN(cdev)->hw_info.b_wol_support ==
+		    QED_WOL_SUPPORT_PME)
+			dev_info->wol_support = true;
 	} else {
 		qed_vf_get_fw_version(&cdev->hwfns[0], &dev_info->fw_major,
 				      &dev_info->fw_minor, &dev_info->fw_rev,
@@ -246,6 +273,8 @@ int qed_fill_dev_info(struct qed_dev *cdev,
 		qed_mcp_get_mfw_ver(QED_LEADING_HWFN(cdev), NULL,
 				    &dev_info->mfw_rev, NULL);
 	}
+
+	dev_info->mtu = QED_LEADING_HWFN(cdev)->hw_info.mtu;
 
 	return 0;
 }
@@ -444,6 +473,11 @@ static int qed_set_int_mode(struct qed_dev *cdev, bool force_mode)
 	}
 
 out:
+	if (!rc)
+		DP_INFO(cdev, "Using %s interrupts\n",
+			int_params->out.int_mode == QED_INT_MODE_INTA ?
+			"INTa" : int_params->out.int_mode == QED_INT_MODE_MSI ?
+			"MSI" : "MSIX");
 	cdev->int_coalescing_mode = QED_COAL_MODE_ENABLE;
 
 	return rc;
@@ -519,19 +553,18 @@ static irqreturn_t qed_single_int(int irq, void *dev_instance)
 int qed_slowpath_irq_req(struct qed_hwfn *hwfn)
 {
 	struct qed_dev *cdev = hwfn->cdev;
+	u32 int_mode;
 	int rc = 0;
 	u8 id;
 
-	if (cdev->int_params.out.int_mode == QED_INT_MODE_MSIX) {
+	int_mode = cdev->int_params.out.int_mode;
+	if (int_mode == QED_INT_MODE_MSIX) {
 		id = hwfn->my_id;
 		snprintf(hwfn->name, NAME_SIZE, "sp-%d-%02x:%02x.%02x",
 			 id, cdev->pdev->bus->number,
 			 PCI_SLOT(cdev->pdev->devfn), hwfn->abs_pf_id);
 		rc = request_irq(cdev->int_params.msix_table[id].vector,
 				 qed_msix_sp_int, 0, hwfn->name, hwfn->sp_dpc);
-		if (!rc)
-			DP_VERBOSE(hwfn, (NETIF_MSG_INTR | QED_MSG_SP),
-				   "Requested slowpath MSI-X\n");
 	} else {
 		unsigned long flags = 0;
 
@@ -545,6 +578,13 @@ int qed_slowpath_irq_req(struct qed_hwfn *hwfn)
 		rc = request_irq(cdev->pdev->irq, qed_single_int,
 				 flags, cdev->name, cdev);
 	}
+
+	if (rc)
+		DP_NOTICE(cdev, "request_irq failed, rc = %d\n", rc);
+	else
+		DP_VERBOSE(hwfn, (NETIF_MSG_INTR | QED_MSG_SP),
+			   "Requested slowpath %s\n",
+			   (int_mode == QED_INT_MODE_MSIX) ? "MSI-X" : "IRQ");
 
 	return rc;
 }
@@ -673,9 +713,7 @@ static int qed_slowpath_setup_int(struct qed_dev *cdev,
 				  enum qed_int_mode int_mode)
 {
 	struct qed_sb_cnt_info sb_cnt_info;
-#if IS_ENABLED(CONFIG_INFINIBAND_QEDR)
-	int num_l2_queues;
-#endif
+	int num_l2_queues = 0;
 	int rc;
 	int i;
 
@@ -706,8 +744,10 @@ static int qed_slowpath_setup_int(struct qed_dev *cdev,
 	cdev->int_params.fp_msix_cnt = cdev->int_params.out.num_vectors -
 				       cdev->num_hwfns;
 
-#if IS_ENABLED(CONFIG_INFINIBAND_QEDR)
-	num_l2_queues = 0;
+	if (!IS_ENABLED(CONFIG_QED_RDMA) ||
+	    QED_LEADING_HWFN(cdev)->hw_info.personality != QED_PCI_ETH_ROCE)
+		return 0;
+
 	for_each_hwfn(cdev, i)
 		num_l2_queues += FEAT_NUM(&cdev->hwfns[i], QED_PF_L2_QUE);
 
@@ -729,7 +769,6 @@ static int qed_slowpath_setup_int(struct qed_dev *cdev,
 	DP_VERBOSE(cdev, QED_MSG_RDMA, "roce_msix_cnt=%d roce_msix_base=%d\n",
 		   cdev->int_params.rdma_msix_cnt,
 		   cdev->int_params.rdma_msix_base);
-#endif
 
 	return 0;
 }
@@ -834,13 +873,25 @@ static void qed_update_pf_params(struct qed_dev *cdev,
 {
 	int i;
 
-#if IS_ENABLED(CONFIG_INFINIBAND_QEDR)
-	params->rdma_pf_params.num_qps = QED_ROCE_QPS;
-	params->rdma_pf_params.min_dpis = QED_ROCE_DPIS;
-	/* divide by 3 the MRs to avoid MF ILT overflow */
-	params->rdma_pf_params.num_mrs = RDMA_MAX_TIDS;
-	params->rdma_pf_params.gl_pi = QED_ROCE_PROTOCOL_INDEX;
-#endif
+	if (IS_ENABLED(CONFIG_QED_RDMA)) {
+		params->rdma_pf_params.num_qps = QED_ROCE_QPS;
+		params->rdma_pf_params.min_dpis = QED_ROCE_DPIS;
+		/* divide by 3 the MRs to avoid MF ILT overflow */
+		params->rdma_pf_params.num_mrs = RDMA_MAX_TIDS;
+		params->rdma_pf_params.gl_pi = QED_ROCE_PROTOCOL_INDEX;
+	}
+
+	/* In case we might support RDMA, don't allow qede to be greedy
+	 * with the L2 contexts. Allow for 64 queues [rx, tx] per hwfn.
+	 */
+	if (QED_LEADING_HWFN(cdev)->hw_info.personality ==
+	    QED_PCI_ETH_ROCE) {
+		u16 *num_cons;
+
+		num_cons = &params->eth_pf_params.num_cons;
+		*num_cons = min_t(u16, *num_cons, 128);
+	}
+
 	for (i = 0; i < cdev->num_hwfns; i++) {
 		struct qed_hwfn *p_hwfn = &cdev->hwfns[i];
 
@@ -886,10 +937,8 @@ static int qed_slowpath_start(struct qed_dev *cdev,
 	if (IS_PF(cdev)) {
 		/* Allocate stream for unzipping */
 		rc = qed_alloc_stream_mem(cdev);
-		if (rc) {
-			DP_NOTICE(cdev, "Failed to allocate stream memory\n");
+		if (rc)
 			goto err2;
-		}
 
 		/* First Dword used to diffrentiate between various sources */
 		data = cdev->firmware->data + sizeof(u32);
@@ -1159,6 +1208,7 @@ static int qed_get_port_type(u32 media_type)
 	case MEDIA_SFPP_10G_FIBER:
 	case MEDIA_SFP_1G_FIBER:
 	case MEDIA_XFP_FIBER:
+	case MEDIA_MODULE_FIBER:
 	case MEDIA_KR:
 		port_type = PORT_FIBRE;
 		break;
@@ -1425,6 +1475,100 @@ static int qed_set_led(struct qed_dev *cdev, enum qed_led_mode mode)
 	return status;
 }
 
+static int qed_update_wol(struct qed_dev *cdev, bool enabled)
+{
+	struct qed_hwfn *hwfn = QED_LEADING_HWFN(cdev);
+	struct qed_ptt *ptt;
+	int rc = 0;
+
+	if (IS_VF(cdev))
+		return 0;
+
+	ptt = qed_ptt_acquire(hwfn);
+	if (!ptt)
+		return -EAGAIN;
+
+	rc = qed_mcp_ov_update_wol(hwfn, ptt, enabled ? QED_OV_WOL_ENABLED
+				   : QED_OV_WOL_DISABLED);
+	if (rc)
+		goto out;
+	rc = qed_mcp_ov_update_current_config(hwfn, ptt, QED_OV_CLIENT_DRV);
+
+out:
+	qed_ptt_release(hwfn, ptt);
+	return rc;
+}
+
+static int qed_update_drv_state(struct qed_dev *cdev, bool active)
+{
+	struct qed_hwfn *hwfn = QED_LEADING_HWFN(cdev);
+	struct qed_ptt *ptt;
+	int status = 0;
+
+	if (IS_VF(cdev))
+		return 0;
+
+	ptt = qed_ptt_acquire(hwfn);
+	if (!ptt)
+		return -EAGAIN;
+
+	status = qed_mcp_ov_update_driver_state(hwfn, ptt, active ?
+						QED_OV_DRIVER_STATE_ACTIVE :
+						QED_OV_DRIVER_STATE_DISABLED);
+
+	qed_ptt_release(hwfn, ptt);
+
+	return status;
+}
+
+static int qed_update_mac(struct qed_dev *cdev, u8 *mac)
+{
+	struct qed_hwfn *hwfn = QED_LEADING_HWFN(cdev);
+	struct qed_ptt *ptt;
+	int status = 0;
+
+	if (IS_VF(cdev))
+		return 0;
+
+	ptt = qed_ptt_acquire(hwfn);
+	if (!ptt)
+		return -EAGAIN;
+
+	status = qed_mcp_ov_update_mac(hwfn, ptt, mac);
+	if (status)
+		goto out;
+
+	status = qed_mcp_ov_update_current_config(hwfn, ptt, QED_OV_CLIENT_DRV);
+
+out:
+	qed_ptt_release(hwfn, ptt);
+	return status;
+}
+
+static int qed_update_mtu(struct qed_dev *cdev, u16 mtu)
+{
+	struct qed_hwfn *hwfn = QED_LEADING_HWFN(cdev);
+	struct qed_ptt *ptt;
+	int status = 0;
+
+	if (IS_VF(cdev))
+		return 0;
+
+	ptt = qed_ptt_acquire(hwfn);
+	if (!ptt)
+		return -EAGAIN;
+
+	status = qed_mcp_ov_update_mtu(hwfn, ptt, mtu);
+	if (status)
+		goto out;
+
+	status = qed_mcp_ov_update_current_config(hwfn, ptt, QED_OV_CLIENT_DRV);
+
+out:
+	qed_ptt_release(hwfn, ptt);
+	return status;
+}
+
 static struct qed_selftest_ops qed_selftest_ops_pass = {
 	.selftest_memory = &qed_selftest_memory,
 	.selftest_interrupt = &qed_selftest_interrupt,
@@ -1448,6 +1592,8 @@ const struct qed_common_ops qed_common_ops_pass = {
 	.sb_release = &qed_sb_release,
 	.simd_handler_config = &qed_simd_handler_config,
 	.simd_handler_clean = &qed_simd_handler_clean,
+	.dbg_grc = &qed_dbg_grc,
+	.dbg_grc_size = &qed_dbg_grc_size,
 	.can_link_change = &qed_can_link_change,
 	.set_link = &qed_set_link,
 	.get_link = &qed_get_current_link,
@@ -1460,6 +1606,10 @@ const struct qed_common_ops qed_common_ops_pass = {
 	.get_coalesce = &qed_get_coalesce,
 	.set_coalesce = &qed_set_coalesce,
 	.set_led = &qed_set_led,
+	.update_drv_state = &qed_update_drv_state,
+	.update_mac = &qed_update_mac,
+	.update_mtu = &qed_update_mtu,
+	.update_wol = &qed_update_wol,
 };
 
 void qed_get_protocol_stats(struct qed_dev *cdev,
@@ -1473,9 +1623,14 @@ void qed_get_protocol_stats(struct qed_dev *cdev,
 	switch (type) {
 	case QED_MCP_LAN_STATS:
 		qed_get_vport_stats(cdev, &eth_stats);
-		stats->lan_stats.ucast_rx_pkts = eth_stats.rx_ucast_pkts;
-		stats->lan_stats.ucast_tx_pkts = eth_stats.tx_ucast_pkts;
+		stats->lan_stats.ucast_rx_pkts =
+					eth_stats.common.rx_ucast_pkts;
+		stats->lan_stats.ucast_tx_pkts =
+					eth_stats.common.tx_ucast_pkts;
 		stats->lan_stats.fcs_err = -1;
+		break;
+	case QED_MCP_FCOE_STATS:
+		qed_get_protocol_stats_fcoe(cdev, &stats->fcoe_stats);
 		break;
 	default:
 		DP_VERBOSE(cdev, QED_MSG_SP,

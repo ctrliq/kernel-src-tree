@@ -44,6 +44,7 @@ DEFINE_PER_CPU(int, x2apic_extra_bits);
 #define PR_DEVEL(fmt, args...)	pr_devel("%s: " fmt, __func__, args)
 
 static enum uv_system_type uv_system_type;
+static bool uv_hubless_system;
 static u64 gru_start_paddr, gru_end_paddr;
 static u64 gru_dist_base, gru_first_node_paddr = -1LL, gru_last_node_paddr;
 static u64 gru_dist_lmask, gru_dist_umask;
@@ -222,8 +223,14 @@ static int __init uv_acpi_madt_oem_check(char *oem_id, char *oem_table_id)
 	int pnodeid;
 	int uv_apic;
 
-	if (strncmp(oem_id, "SGI", 3) != 0)
+	if (strncmp(oem_id, "SGI", 3) != 0) {
+		if (strncmp(oem_id, "NSGI", 4) == 0) {
+			uv_hubless_system = true;
+			pr_info("UV: OEM IDs %s/%s, HUBLESS\n",
+				oem_id, oem_table_id);
+		}
 		return 0;
+	}
 
 	if (numa_off) {
 		pr_err("UV: NUMA is off, disabling UV support\n");
@@ -295,6 +302,12 @@ int is_uv_system(void)
 	return uv_system_type != UV_NONE;
 }
 EXPORT_SYMBOL_GPL(is_uv_system);
+
+int is_uv_hubless(void)
+{
+	return uv_hubless_system;
+}
+EXPORT_SYMBOL_GPL(is_uv_hubless);
 
 void **__uv_hub_info_list;
 EXPORT_SYMBOL_GPL(__uv_hub_info_list);
@@ -1114,8 +1127,8 @@ void __init uv_init_hub_info(struct uv_hub_info_s *hub_info)
 	hub_info->gnode_extra =
 		(node_id.s.node_id & ~((1 << uv_cpuid.gnode_shift) - 1)) >> 1;
 
-	hub_info->gnode_upper =
-		((unsigned long)hub_info->gnode_extra << mn.m_val);
+	if (mn.m_val)
+		hub_info->gnode_upper = (u64)hub_info->gnode_extra << mn.m_val;
 
 	if (uv_gp_table) {
 		hub_info->global_mmr_base = uv_gp_table->mmr_base;
@@ -1398,7 +1411,7 @@ static void __init build_socket_tables(void)
 	}
 }
 
-void __init uv_system_init(void)
+static void __init uv_system_init_hub(void)
 {
 	struct uv_hub_info_s hub_info = {0};
 	int bytes, cpu, nodeid;
@@ -1532,6 +1545,21 @@ void __init uv_system_init(void)
 	 */
 	if (is_kdump_kernel())
 		reboot_type = BOOT_ACPI;
+}
+
+/*
+ * There is a small amount of UV specific code needed to initialize a
+ * UV system that does not have a "UV HUB" (referred to as "hubless").
+ */
+void __init uv_system_init(void)
+{
+	if (likely(!is_uv_system() && !is_uv_hubless()))
+		return;
+
+	if (is_uv_system())
+		uv_system_init_hub();
+	else
+		uv_nmi_setup_hubless();
 }
 
 apic_driver(apic_x2apic_uv_x);

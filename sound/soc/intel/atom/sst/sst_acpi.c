@@ -257,7 +257,7 @@ static int is_byt_cr(struct device *dev, bool *bytcr)
 		}
 
 		status = iosf_mbi_read(BT_MBI_UNIT_PMC, /* 0x04 PUNIT */
-				       MBI_REG_READ, /* 0x10 */
+				       0x10, /* MBI_REG_READ */
 				       0x006, /* BIOS_CONFIG */
 				       &bios_status);
 

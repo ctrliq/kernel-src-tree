@@ -29,6 +29,7 @@
 #include <linux/etherdevice.h>
 #include <linux/ethtool.h>
 #include <net/arp.h>
+#include <net/switchdev.h>
 
 #include "vlan.h"
 #include "vlanproc.h"
@@ -278,6 +279,17 @@ void vlan_dev_get_realdev_name(const struct net_device *dev, char *result)
 	strncpy(result, vlan_dev_priv(dev)->real_dev->name, 23);
 }
 
+bool vlan_dev_inherit_address(struct net_device *dev,
+			      struct net_device *real_dev)
+{
+	if (dev->addr_assign_type != NET_ADDR_STOLEN)
+		return false;
+
+	ether_addr_copy(dev->dev_addr, real_dev->dev_addr);
+	call_netdevice_notifiers(NETDEV_CHANGEADDR, dev);
+	return true;
+}
+
 static int vlan_dev_open(struct net_device *dev)
 {
 	struct vlan_dev_priv *vlan = vlan_dev_priv(dev);
@@ -288,7 +300,8 @@ static int vlan_dev_open(struct net_device *dev)
 	    !(vlan->flags & VLAN_FLAG_LOOSE_BINDING))
 		return -ENETDOWN;
 
-	if (!ether_addr_equal(dev->dev_addr, real_dev->dev_addr)) {
+	if (!ether_addr_equal(dev->dev_addr, real_dev->dev_addr) &&
+	    !vlan_dev_inherit_address(dev, real_dev)) {
 		err = dev_uc_add(real_dev, dev->dev_addr);
 		if (err < 0)
 			goto out;
@@ -582,8 +595,10 @@ static int vlan_dev_init(struct net_device *dev)
 	/* ipv6 shared card related stuff */
 	dev->dev_id = real_dev->dev_id;
 
-	if (is_zero_ether_addr(dev->dev_addr))
+	if (is_zero_ether_addr(dev->dev_addr)) {
 		memcpy(dev->dev_addr, real_dev->dev_addr, dev->addr_len);
+		dev->addr_assign_type = NET_ADDR_STOLEN;
+	}
 	if (is_zero_ether_addr(dev->broadcast))
 		memcpy(dev->broadcast, real_dev->broadcast, dev->addr_len);
 
@@ -707,7 +722,8 @@ static void vlan_dev_poll_controller(struct net_device *dev)
 	return;
 }
 
-static int vlan_dev_netpoll_setup(struct net_device *dev, struct netpoll_info *npinfo)
+static int vlan_dev_netpoll_setup(struct net_device *dev, struct netpoll_info *npinfo,
+				  gfp_t gfp)
 {
 	struct vlan_dev_priv *vlan = vlan_dev_priv(dev);
 	struct net_device *real_dev = vlan->real_dev;
@@ -759,6 +775,7 @@ static const struct ethtool_ops vlan_ethtool_ops = {
 };
 
 static const struct net_device_ops vlan_netdev_ops = {
+	.ndo_size		= sizeof(struct net_device_ops),
 	.ndo_change_mtu		= vlan_dev_change_mtu,
 	.ndo_init		= vlan_dev_init,
 	.ndo_uninit		= vlan_dev_uninit,
@@ -786,6 +803,14 @@ static const struct net_device_ops vlan_netdev_ops = {
 	.ndo_netpoll_cleanup	= vlan_dev_netpoll_cleanup,
 #endif
 	.ndo_fix_features	= vlan_dev_fix_features,
+	.extended.ndo_neigh_construct	= netdev_default_l2upper_neigh_construct,
+	.extended.ndo_neigh_destroy	= netdev_default_l2upper_neigh_destroy,
+	.ndo_fdb_add		= switchdev_port_fdb_add,
+	.ndo_fdb_del		= switchdev_port_fdb_del,
+	.extended.ndo_fdb_dump	= switchdev_port_fdb_dump,
+	.ndo_bridge_setlink	= switchdev_port_bridge_setlink,
+	.ndo_bridge_getlink	= switchdev_port_bridge_getlink,
+	.ndo_bridge_dellink	= switchdev_port_bridge_dellink,
 	.ndo_get_iflink		= vlan_dev_get_iflink,
 };
 

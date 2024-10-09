@@ -304,9 +304,12 @@ int security_sb_set_mnt_opts(struct super_block *sb,
 EXPORT_SYMBOL(security_sb_set_mnt_opts);
 
 int security_sb_clone_mnt_opts(const struct super_block *oldsb,
-				struct super_block *newsb)
+				struct super_block *newsb,
+				unsigned long kern_flags,
+				unsigned long *set_kern_flags)
 {
-	return security_ops->sb_clone_mnt_opts(oldsb, newsb);
+	return security_ops->sb_clone_mnt_opts(oldsb, newsb,
+				kern_flags, set_kern_flags);
 }
 EXPORT_SYMBOL(security_sb_clone_mnt_opts);
 
@@ -336,6 +339,15 @@ int security_dentry_init_security(struct dentry *dentry, int mode,
 							ctx, ctxlen);
 }
 EXPORT_SYMBOL(security_dentry_init_security);
+
+int security_dentry_create_files_as(struct dentry *dentry, int mode,
+				    struct qstr *name,
+				    const struct cred *old, struct cred *new)
+{
+	return security_ops->dentry_create_files_as(dentry, mode, name, old,
+							new);
+}
+EXPORT_SYMBOL(security_dentry_create_files_as);
 
 int security_inode_init_security(struct inode *inode, struct inode *dir,
 				 const struct qstr *qstr,
@@ -658,7 +670,7 @@ int security_inode_killpriv(struct dentry *dentry)
 	return security_ops->inode_killpriv(dentry);
 }
 
-int security_inode_getsecurity(const struct inode *inode, const char *name, void **buffer, bool alloc)
+int security_inode_getsecurity(struct inode *inode, const char *name, void **buffer, bool alloc)
 {
 	if (unlikely(IS_PRIVATE(inode)))
 		return -EOPNOTSUPP;
@@ -680,10 +692,22 @@ int security_inode_listsecurity(struct inode *inode, char *buffer, size_t buffer
 }
 EXPORT_SYMBOL(security_inode_listsecurity);
 
-void security_inode_getsecid(const struct inode *inode, u32 *secid)
+void security_inode_getsecid(struct inode *inode, u32 *secid)
 {
 	security_ops->inode_getsecid(inode, secid);
 }
+
+int security_inode_copy_up(struct dentry *src, struct cred **new)
+{
+	return security_ops->inode_copy_up(src, new);
+}
+EXPORT_SYMBOL(security_inode_copy_up);
+
+int security_inode_copy_up_xattr(const char *name)
+{
+	return security_ops->inode_copy_up_xattr(name);
+}
+EXPORT_SYMBOL(security_inode_copy_up_xattr);
 
 int security_file_permission(struct file *file, int mask)
 {
@@ -1102,6 +1126,12 @@ void security_release_secctx(char *secdata, u32 seclen)
 	security_ops->release_secctx(secdata, seclen);
 }
 EXPORT_SYMBOL(security_release_secctx);
+
+void security_inode_invalidate_secctx(struct inode *inode)
+{
+	security_ops->inode_invalidate_secctx(inode);
+}
+EXPORT_SYMBOL(security_inode_invalidate_secctx);
 
 int security_inode_notifysecctx(struct inode *inode, void *ctx, u32 ctxlen)
 {

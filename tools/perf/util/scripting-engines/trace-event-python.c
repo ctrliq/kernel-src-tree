@@ -27,6 +27,7 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <linux/bitmap.h>
+#include <linux/time64.h>
 
 #include "../../perf.h"
 #include "../debug.h"
@@ -324,7 +325,7 @@ static PyObject *python_process_callchain(struct perf_sample *sample,
 	if (!symbol_conf.use_callchain || !sample->callchain)
 		goto exit;
 
-	if (thread__resolve_callchain(al->thread, evsel,
+	if (thread__resolve_callchain(al->thread, &callchain_cursor, evsel,
 				      sample, NULL, NULL,
 				      scripting_max_stack) != 0) {
 		pr_err("Failed to resolve callchain. Skipping\n");
@@ -386,22 +387,6 @@ exit:
 	return pylist;
 }
 
-static int is_printable_array(char *p, unsigned int len)
-{
-	unsigned int i;
-
-	if (!p || !len || p[len - 1] != 0)
-		return 0;
-
-	len--;
-
-	for (i = 0; i < len; i++) {
-		if (!isprint(p[i]) && !isspace(p[i]))
-			return 0;
-	}
-	return 1;
-}
-
 static void python_process_tracepoint(struct perf_sample *sample,
 				      struct perf_evsel *evsel,
 				      struct addr_location *al)
@@ -442,8 +427,8 @@ static void python_process_tracepoint(struct perf_sample *sample,
 		if (!dict)
 			Py_FatalError("couldn't create Python dict");
 	}
-	s = nsecs / NSECS_PER_SEC;
-	ns = nsecs - s * NSECS_PER_SEC;
+	s = nsecs / NSEC_PER_SEC;
+	ns = nsecs - s * NSEC_PER_SEC;
 
 	scripting_context->event_data = data;
 	scripting_context->pevent = evsel->tp_format->pevent;

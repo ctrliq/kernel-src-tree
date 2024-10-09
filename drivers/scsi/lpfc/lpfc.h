@@ -95,6 +95,7 @@ struct lpfc_sli2_slim;
 #define FC_MAX_ADPTMSG		64
 
 #define MAX_HBAEVT	32
+#define MAX_HBAS_NO_RESET 16
 
 /* Number of MSI-X vectors the driver uses */
 #define LPFC_MSIX_VECTORS	2
@@ -699,10 +700,13 @@ struct lpfc_hba {
 	uint8_t  wwnn[8];
 	uint8_t  wwpn[8];
 	uint32_t RandomData[7];
+	uint8_t  fcp_embed_io;
+	uint8_t  mds_diags_support;
 
 	/* HBA Config Parameters */
 	uint32_t cfg_ack0;
 	uint32_t cfg_enable_npiv;
+	uint32_t cfg_use_blk_mq;
 	uint32_t cfg_enable_rrq;
 	uint32_t cfg_topology;
 	uint32_t cfg_link_speed;
@@ -725,7 +729,6 @@ struct lpfc_hba {
 	uint32_t cfg_fcp_io_channel;
 	uint32_t cfg_total_seg_cnt;
 	uint32_t cfg_sg_seg_cnt;
-	uint32_t cfg_prot_sg_seg_cnt;
 	uint32_t cfg_sg_dma_buf_size;
 	uint64_t cfg_soft_wwnn;
 	uint64_t cfg_soft_wwpn;
@@ -766,6 +769,7 @@ struct lpfc_hba {
 #define LPFC_FDMI_NO_SUPPORT	0	/* FDMI not supported */
 #define LPFC_FDMI_SUPPORT	1	/* FDMI supported? */
 	uint32_t cfg_enable_SmartSAN;
+	uint32_t cfg_enable_mds_diags;
 	lpfc_vpd_t vpd;		/* vital product data */
 
 	struct pci_dev *pcidev;
@@ -946,7 +950,6 @@ struct lpfc_hba {
 	struct dentry *idiag_ctl_acc;
 	struct dentry *idiag_mbx_acc;
 	struct dentry *idiag_ext_acc;
-	uint8_t lpfc_idiag_last_eq;
 #endif
 
 	/* Used for deferred freeing of ELS data buffers */

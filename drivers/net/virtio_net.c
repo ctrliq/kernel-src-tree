@@ -129,6 +129,9 @@ struct virtnet_info {
 
 	/* CPU hot plug notifier */
 	struct notifier_block nb;
+
+	/* Maximum allowed MTU */
+	u16 max_mtu;
 };
 
 struct padded_vnet_hdr {
@@ -1261,7 +1264,9 @@ static const struct ethtool_ops virtnet_ethtool_ops = {
 
 static int virtnet_change_mtu(struct net_device *dev, int new_mtu)
 {
-	if (new_mtu < MIN_MTU || new_mtu > MAX_MTU)
+	struct virtnet_info *vi = netdev_priv(dev);
+
+	if (new_mtu < MIN_MTU || new_mtu > vi->max_mtu)
 		return -EINVAL;
 	dev->mtu = new_mtu;
 	return 0;
@@ -1305,6 +1310,7 @@ static const struct net_device_ops virtnet_netdev = {
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller = virtnet_netpoll,
 #endif
+	.ndo_features_check	= passthru_features_check,
 };
 
 static void virtnet_config_changed_work(struct work_struct *work)
@@ -1644,12 +1650,15 @@ static int virtnet_probe(struct virtio_device *vdev)
 	if (virtio_has_feature(vdev, VIRTIO_NET_F_CTRL_VQ))
 		vi->has_cvq = true;
 
+	vi->max_mtu = MAX_MTU;
 	if (virtio_has_feature(vdev, VIRTIO_NET_F_MTU)) {
 		mtu = virtio_cread16(vdev,
 				     offsetof(struct virtio_net_config,
 					      mtu));
 		if (virtnet_change_mtu(dev, mtu))
 			__virtio_clear_bit(vdev, VIRTIO_NET_F_MTU);
+		else
+			vi->max_mtu = mtu;
 	}
 
 	if (vi->any_header_sg)

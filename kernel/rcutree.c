@@ -101,6 +101,8 @@ static int num_rcu_lvl[] = {  /* Number of rcu_nodes at specified level. */
 	NUM_RCU_LVL_4,
 };
 int rcu_num_nodes __read_mostly = NUM_RCU_NODES; /* Total # rcu_nodes in use. */
+/* panic() on RCU Stall sysctl. */
+int sysctl_panic_on_rcu_stall __read_mostly;
 
 /*
  * The rcu_scheduler_active variable transitions from zero to one just
@@ -878,6 +880,12 @@ static void rcu_dump_cpu_stacks(struct rcu_state *rsp)
 	}
 }
 
+static inline void panic_on_rcu_stall(void)
+{
+	if (sysctl_panic_on_rcu_stall)
+		panic("RCU Stall\n");
+}
+
 static void print_other_cpu_stall(struct rcu_state *rsp, unsigned long gpnum)
 {
 	int cpu;
@@ -958,6 +966,8 @@ static void print_other_cpu_stall(struct rcu_state *rsp, unsigned long gpnum)
 
 	rcu_print_detail_task_stall(rsp);
 
+	panic_on_rcu_stall();
+
 	force_quiescent_state(rsp);  /* Kick them all. */
 }
 
@@ -1005,6 +1015,8 @@ static void check_cpu_stall(struct rcu_state *rsp, struct rcu_data *rdp)
 	if (rcu_cpu_stall_suppress || !rcu_gp_in_progress(rsp))
 		return;
 	j = ACCESS_ONCE(jiffies);
+
+	panic_on_rcu_stall();
 
 	/*
 	 * Lots of memory barriers to reject false positives.

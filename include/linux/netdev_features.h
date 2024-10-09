@@ -65,29 +65,28 @@ enum {
 	NETIF_F_BUSY_POLL_BIT,		/* Busy poll */
 	NETIF_F_GSO_GRE_CSUM_BIT,	/* ... GRE with csum with TSO */
 	NETIF_F_GSO_UDP_TUNNEL_CSUM_BIT,/* ... UDP TUNNEL with TSO & CSUM */
-	NETIF_F_GSO_TUNNEL_REMCSUM_BIT, /* ... TUNNEL with TSO & REMCSUM */
+	NETIF_F_GSO_PARTIAL_BIT,	/* ... Only segment inner-most L4
+					 *     in hardware and all other
+					 *     headers in software.
+					 */
 	NETIF_F_GSO_SCTP_BIT,		/* ... SCTP fragmentation */
+	NETIF_F_TSO_MANGLEID_BIT,	/* ... IPV4 ID mangling allowed */
 
 	/*
-	 * RHEL only: Make sure to leave space to allow adding new GSO bits
-	 * to this second arena of GSO bits so as not having to add another,
-	 * third, GSO arena. Please add new GSO bits upwards starting
-	 * at __NETIF_F_GSO2_PLACEHOLDER_1.
+	 * RHEL only: There is no more space for new GSO bits.
+	 * skb_shared_info->gso_type has only 16 bits and all of them are
+	 * used. We tried to extend skb_shared_info but that had performance
+	 * impact. Hence, no more GSO bits can be backported.
 	 *
-	 * !!! Make sure to add accompanying SKB flags to SKB_GSO2_MASK !!!
-	 *
-	 * Add non-GSO bits right before NETDEV_FEATURE_COUNT, as long as
-	 * there's space left.  Otherwise add further non-GSO bits starting
-	 * at __NETIF_F_GSO2_PLACEHOLDER_8 downwards.  If we ever need more
-	 * than 64 bits here it requires an upstream change anyway.
+	 * Non-GSO related bits can be still added here. Please add them
+	 * from the top, replacing the placeholder with the highest number.
 	 */
-	__NETIF_F_GSO2_PLACEHOLDER_1,
-	__NETIF_F_GSO2_PLACEHOLDER_2,
-	__NETIF_F_GSO2_PLACEHOLDER_3,
-	__NETIF_F_GSO2_PLACEHOLDER_4,
-	__NETIF_F_GSO2_PLACEHOLDER_5,
-	__NETIF_F_GSO2_PLACEHOLDER_6,
-	__NETIF_F_GSO2_PLACEHOLDER_7,
+	__NETIF_F_PLACEHOLDER_1,
+	__NETIF_F_PLACEHOLDER_2,
+	__NETIF_F_PLACEHOLDER_3,
+	__NETIF_F_PLACEHOLDER_4,
+	__NETIF_F_PLACEHOLDER_5,
+	__NETIF_F_PLACEHOLDER_6,
 
 	NETIF_F_HW_L2FW_DOFFLOAD_BIT,	/* Allow L2 Forwarding in Hardware */
 
@@ -144,8 +143,9 @@ enum {
 #define NETIF_F_GSO_SIT		__NETIF_F(GSO_SIT)
 #define NETIF_F_GSO_UDP_TUNNEL	__NETIF_F(GSO_UDP_TUNNEL)
 #define NETIF_F_GSO_UDP_TUNNEL_CSUM __NETIF_F(GSO_UDP_TUNNEL_CSUM)
+#define NETIF_F_TSO_MANGLEID	__NETIF_F(TSO_MANGLEID)
+#define NETIF_F_GSO_PARTIAL	 __NETIF_F(GSO_PARTIAL)
 #define NETIF_F_GSO_MPLS	__NETIF_F(GSO_MPLS)
-#define NETIF_F_GSO_TUNNEL_REMCSUM __NETIF_F(GSO_TUNNEL_REMCSUM)
 #define NETIF_F_GSO_SCTP	__NETIF_F(GSO_SCTP)
 #define NETIF_F_HW_VLAN_STAG_FILTER __NETIF_F(HW_VLAN_STAG_FILTER)
 #define NETIF_F_HW_VLAN_STAG_RX	__NETIF_F(HW_VLAN_STAG_RX)
@@ -169,7 +169,8 @@ enum {
 
 /* Segmentation offload feature mask */
 #define NETIF_F_GSO2_MASK (NETIF_F_GSO_GRE_CSUM|NETIF_F_GSO_UDP_TUNNEL_CSUM|\
-			   NETIF_F_GSO_TUNNEL_REMCSUM|NETIF_F_GSO_SCTP)
+			   NETIF_F_GSO_PARTIAL|NETIF_F_GSO_SCTP|\
+			   NETIF_F_TSO_MANGLEID)
 #define NETIF_F_GSO_MASK	((__NETIF_F_BIT(NETIF_F_GSO_LAST + 1) - \
 				 __NETIF_F_BIT(NETIF_F_GSO_SHIFT)) | \
 				NETIF_F_GSO2_MASK)
@@ -185,7 +186,8 @@ enum {
 #define NETIF_F_CSUM_MASK	(NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM | \
 				 NETIF_F_HW_CSUM)
 
-#define NETIF_F_ALL_TSO 	(NETIF_F_TSO | NETIF_F_TSO6 | NETIF_F_TSO_ECN)
+#define NETIF_F_ALL_TSO 	(NETIF_F_TSO | NETIF_F_TSO6 | NETIF_F_TSO_ECN | \
+				 NETIF_F_TSO_MANGLEID)
 
 #define NETIF_F_ALL_FCOE	(NETIF_F_FCOE_CRC | NETIF_F_FCOE_MTU | \
 				 NETIF_F_FSO)
@@ -201,6 +203,7 @@ enum {
 #define NETIF_F_ONE_FOR_ALL	(NETIF_F_GSO_SOFTWARE | NETIF_F_GSO_ROBUST | \
 				 NETIF_F_SG | NETIF_F_HIGHDMA |		\
 				 NETIF_F_FRAGLIST | NETIF_F_VLAN_CHALLENGED)
+
 /*
  * If one device doesn't support one of these features, then disable it
  * for all in netdev_increment_features.

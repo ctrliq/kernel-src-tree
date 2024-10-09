@@ -1692,6 +1692,7 @@ call_allocate(struct rpc_task *task)
 	struct rpc_rqst *req = task->tk_rqstp;
 	struct rpc_xprt *xprt = req->rq_xprt;
 	struct rpc_procinfo *proc = task->tk_msg.rpc_proc;
+	int status;
 
 	dprint_status(task);
 
@@ -1717,11 +1718,14 @@ call_allocate(struct rpc_task *task)
 	req->rq_rcvsize = RPC_REPHDRSIZE + slack + proc->p_replen;
 	req->rq_rcvsize <<= 2;
 
-	req->rq_buffer = xprt->ops->buf_alloc(task,
-					req->rq_callsize + req->rq_rcvsize);
-	if (req->rq_buffer != NULL)
-		return;
+	status = xprt->ops->buf_alloc(task);
 	xprt_inject_disconnect(xprt);
+	if (status == 0)
+		return;
+	if (status != -ENOMEM) {
+		rpc_exit(task, status);
+		return;
+	}
 
 	dprintk("RPC: %5u rpc_buffer allocation failed\n", task->tk_pid);
 
@@ -1763,7 +1767,7 @@ rpc_xdr_encode(struct rpc_task *task)
 		     req->rq_buffer,
 		     req->rq_callsize);
 	xdr_buf_init(&req->rq_rcv_buf,
-		     (char *)req->rq_buffer + req->rq_callsize,
+		     req->rq_rbuffer,
 		     req->rq_rcvsize);
 
 	p = rpc_encode_header(task);
@@ -2691,6 +2695,7 @@ int rpc_clnt_add_xprt(struct rpc_clnt *clnt,
 {
 	struct rpc_xprt_switch *xps;
 	struct rpc_xprt *xprt;
+	unsigned long reconnect_timeout;
 	unsigned char resvport;
 	int ret = 0;
 
@@ -2702,6 +2707,7 @@ int rpc_clnt_add_xprt(struct rpc_clnt *clnt,
 		return -EAGAIN;
 	}
 	resvport = xprt->resvport;
+	reconnect_timeout = xprt->max_reconnect_timeout;
 	rcu_read_unlock();
 
 	xprt = xprt_create_transport(xprtargs);
@@ -2710,6 +2716,7 @@ int rpc_clnt_add_xprt(struct rpc_clnt *clnt,
 		goto out_put_switch;
 	}
 	xprt->resvport = resvport;
+	xprt->max_reconnect_timeout = reconnect_timeout;
 
 	rpc_xprt_switch_set_roundrobin(xps);
 	if (setup) {
@@ -2746,6 +2753,37 @@ rpc_cap_max_reconnect_timeout(struct rpc_clnt *clnt, unsigned long timeo)
 			&timeo);
 }
 EXPORT_SYMBOL_GPL(rpc_cap_max_reconnect_timeout);
+
+void rpc_clnt_xprt_switch_put(struct rpc_clnt *clnt)
+{
+	rcu_read_lock();
+	xprt_switch_put(rcu_dereference(clnt->cl_xpi.xpi_xpswitch));
+	rcu_read_unlock();
+}
+EXPORT_SYMBOL_GPL(rpc_clnt_xprt_switch_put);
+
+void rpc_clnt_xprt_switch_add_xprt(struct rpc_clnt *clnt, struct rpc_xprt *xprt)
+{
+	rcu_read_lock();
+	rpc_xprt_switch_add_xprt(rcu_dereference(clnt->cl_xpi.xpi_xpswitch),
+				 xprt);
+	rcu_read_unlock();
+}
+EXPORT_SYMBOL_GPL(rpc_clnt_xprt_switch_add_xprt);
+
+bool rpc_clnt_xprt_switch_has_addr(struct rpc_clnt *clnt,
+				   const struct sockaddr *sap)
+{
+	struct rpc_xprt_switch *xps;
+	bool ret;
+
+	rcu_read_lock();
+	xps = rcu_dereference(clnt->cl_xpi.xpi_xpswitch);
+	ret = rpc_xprt_switch_has_addr(xps, sap);
+	rcu_read_unlock();
+	return ret;
+}
+EXPORT_SYMBOL_GPL(rpc_clnt_xprt_switch_has_addr);
 
 #if IS_ENABLED(CONFIG_SUNRPC_DEBUG)
 static void rpc_show_header(void)

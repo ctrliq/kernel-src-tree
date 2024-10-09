@@ -337,6 +337,7 @@ ssize_t tpm_transmit(struct tpm_chip *chip, const u8 *buf, size_t bufsiz,
 	ssize_t rc;
 	u32 count, ordinal;
 	unsigned long stop;
+	bool need_locality;
 
 	if (bufsiz < TPM_HEADER_SIZE)
 		return -EINVAL;
@@ -357,7 +358,18 @@ ssize_t tpm_transmit(struct tpm_chip *chip, const u8 *buf, size_t bufsiz,
 	if (!(flags & TPM_TRANSMIT_UNLOCKED))
 		mutex_lock(&chip->tpm_mutex);
 
-	pm_runtime_get_sync(chip->dev.parent);
+	if (chip->dev.parent)
+		pm_runtime_get_sync(chip->dev.parent);
+
+	/* Store the decision as chip->locality will be changed. */
+	need_locality = chip->locality == -1;
+
+	if (need_locality && chip->ops->request_locality)  {
+		rc = chip->ops->request_locality(chip, 0);
+		if (rc < 0)
+			goto out_no_locality;
+		chip->locality = rc;
+	}
 
 	rc = chip->ops->send(chip, (u8 *) buf, count);
 	if (rc < 0) {
@@ -400,7 +412,13 @@ out_recv:
 		dev_err(&chip->dev,
 			"tpm_transmit: tpm_recv: error %zd\n", rc);
 out:
-	pm_runtime_put(chip->dev.parent);
+	if (need_locality && chip->ops->relinquish_locality) {
+		chip->ops->relinquish_locality(chip, chip->locality);
+		chip->locality = -1;
+	}
+out_no_locality:
+	if (chip->dev.parent)
+		pm_runtime_put_sync(chip->dev.parent);
 
 	if (!(flags & TPM_TRANSMIT_UNLOCKED))
 		mutex_unlock(&chip->tpm_mutex);

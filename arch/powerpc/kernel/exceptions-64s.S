@@ -640,7 +640,7 @@ END_FTR_SECTION_IFSET(CPU_FTR_CFAR)
 
 	.globl hmi_exception_early
 hmi_exception_early:
-	EXCEPTION_PROLOG_1(PACA_EXGEN, NOTEST, 0xe60)
+	EXCEPTION_PROLOG_1(PACA_EXGEN, KVMTEST, 0xe62)
 	mr	r10,r1			/* Save r1			*/
 	ld	r1,PACAEMERGSP(r13)	/* Use emergency stack		*/
 	subi	r1,r1,INT_FRAME_SIZE	/* alloc stack frame		*/
@@ -770,6 +770,8 @@ _GLOBAL(__replay_interrupt)
 BEGIN_FTR_SECTION
 	cmpwi	r3,0xe80
 	beq	h_doorbell_common
+	cmpwi	r3,0xe60
+	beq	hmi_exception_common
 FTR_SECTION_ELSE
 	cmpwi	r3,0xa00
 	beq	doorbell_super_common

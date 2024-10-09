@@ -414,23 +414,24 @@ static int brcmf_vif_change_validate(struct brcmf_cfg80211_info *cfg,
 				     struct brcmf_cfg80211_vif *vif,
 				     enum nl80211_iftype new_type)
 {
-	int iftype_num[NUM_NL80211_IFTYPES];
 	struct brcmf_cfg80211_vif *pos;
 	bool check_combos = false;
 	int ret = 0;
+	struct iface_combination_params params = {
+		.num_different_channels = 1,
+	};
 
-	memset(&iftype_num[0], 0, sizeof(iftype_num));
 	list_for_each_entry(pos, &cfg->vif_list, list)
 		if (pos == vif) {
-			iftype_num[new_type]++;
+			params.iftype_num[new_type]++;
 		} else {
 			/* concurrent interfaces so need check combinations */
 			check_combos = true;
-			iftype_num[pos->wdev.iftype]++;
+			params.iftype_num[pos->wdev.iftype]++;
 		}
 
 	if (check_combos)
-		ret = cfg80211_check_combinations(cfg->wiphy, 1, 0, iftype_num);
+		ret = cfg80211_check_combinations(cfg->wiphy, &params);
 
 	return ret;
 }
@@ -438,15 +439,16 @@ static int brcmf_vif_change_validate(struct brcmf_cfg80211_info *cfg,
 static int brcmf_vif_add_validate(struct brcmf_cfg80211_info *cfg,
 				  enum nl80211_iftype new_type)
 {
-	int iftype_num[NUM_NL80211_IFTYPES];
 	struct brcmf_cfg80211_vif *pos;
+	struct iface_combination_params params = {
+		.num_different_channels = 1,
+	};
 
-	memset(&iftype_num[0], 0, sizeof(iftype_num));
 	list_for_each_entry(pos, &cfg->vif_list, list)
-		iftype_num[pos->wdev.iftype]++;
+		params.iftype_num[pos->wdev.iftype]++;
 
-	iftype_num[new_type]++;
-	return cfg80211_check_combinations(cfg->wiphy, 1, 0, iftype_num);
+	params.iftype_num[new_type]++;
+	return cfg80211_check_combinations(cfg->wiphy, &params);
 }
 
 static void convert_key_from_CPU(struct brcmf_wsec_key *key,
@@ -756,9 +758,13 @@ s32 brcmf_notify_escan_complete(struct brcmf_cfg80211_info *cfg,
 		if (!aborted)
 			cfg80211_sched_scan_results(cfg_to_wiphy(cfg));
 	} else if (scan_request) {
+		struct cfg80211_scan_info info = {
+			.aborted = aborted,
+		};
+
 		brcmf_dbg(SCAN, "ESCAN Completed scan: %s\n",
 			  aborted ? "Aborted" : "Done");
-		cfg80211_scan_done(scan_request, aborted);
+		cfg80211_scan_done(scan_request, &info);
 	}
 	if (!test_and_clear_bit(BRCMF_SCAN_STATUS_BUSY, &cfg->scan_status))
 		brcmf_dbg(SCAN, "Scan complete, probably P2P scan\n");

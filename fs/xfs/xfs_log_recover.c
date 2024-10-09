@@ -191,7 +191,7 @@ xlog_bread_noalign(
 	ASSERT(nbblks <= bp->b_length);
 
 	XFS_BUF_SET_ADDR(bp, log->l_logBBstart + blk_no);
-	XFS_BUF_READ(bp);
+	bp->b_flags |= XBF_READ;
 	bp->b_io_length = nbblks;
 	bp->b_error = 0;
 
@@ -276,7 +276,6 @@ xlog_bwrite(
 	ASSERT(nbblks <= bp->b_length);
 
 	XFS_BUF_SET_ADDR(bp, log->l_logBBstart + blk_no);
-	XFS_BUF_ZEROFLAGS(bp);
 	xfs_buf_hold(bp);
 	xfs_buf_lock(bp);
 	bp->b_io_length = nbblks;
@@ -4273,10 +4272,9 @@ xlog_recover_process_efi(
 		}
 	}
 
-	tp = xfs_trans_alloc(mp, 0);
-	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_itruncate, 0, 0);
+	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_itruncate, 0, 0, 0, &tp);
 	if (error)
-		goto abort_error;
+		return error;
 	efdp = xfs_trans_get_efd(tp, efip, efip->efi_format.efi_nextents);
 
 	for (i = 0; i < efip->efi_format.efi_nextents; i++) {
@@ -4423,10 +4421,9 @@ xlog_recover_clear_agi_bucket(
 	int		offset;
 	int		error;
 
-	tp = xfs_trans_alloc(mp, XFS_TRANS_CLEAR_AGI_BUCKET);
-	error = xfs_trans_reserve(tp, &M_RES(mp)->tr_clearagi, 0, 0);
+	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_clearagi, 0, 0, 0, &tp);
 	if (error)
-		goto out_abort;
+		goto out_error;
 
 	error = xfs_read_agi(mp, tp, agno, &agibp);
 	if (error)
@@ -4478,7 +4475,7 @@ xlog_recover_process_one_iunlink(
 		goto fail_iput;
 
 	ASSERT(VFS_I(ip)->i_nlink == 0);
-	ASSERT(ip->i_d.di_mode != 0);
+	ASSERT(VFS_I(ip)->i_mode != 0);
 
 	/* setup for the next pass */
 	agino = be32_to_cpu(dip->di_next_unlinked);
@@ -5044,6 +5041,7 @@ xlog_do_recover(
 	xfs_daddr_t	head_blk,
 	xfs_daddr_t	tail_blk)
 {
+	struct xfs_mount *mp = log->l_mp;
 	int		error;
 	xfs_buf_t	*bp;
 	xfs_sb_t	*sbp;
@@ -5058,7 +5056,7 @@ xlog_do_recover(
 	/*
 	 * If IO errors happened during recovery, bail out.
 	 */
-	if (XFS_FORCED_SHUTDOWN(log->l_mp)) {
+	if (XFS_FORCED_SHUTDOWN(mp)) {
 		return -EIO;
 	}
 
@@ -5071,22 +5069,21 @@ xlog_do_recover(
 	 * or iunlinks they will have some entries in the AIL; so we look at
 	 * the AIL to determine how to set the tail_lsn.
 	 */
-	xlog_assign_tail_lsn(log->l_mp);
+	xlog_assign_tail_lsn(mp);
 
 	/*
 	 * Now that we've finished replaying all buffer and inode
 	 * updates, re-read in the superblock and reverify it.
 	 */
-	bp = xfs_getsb(log->l_mp, 0);
-	XFS_BUF_UNDONE(bp);
-	ASSERT(!(XFS_BUF_ISWRITE(bp)));
-	XFS_BUF_READ(bp);
-	XFS_BUF_UNASYNC(bp);
+	bp = xfs_getsb(mp, 0);
+	bp->b_flags &= ~(XBF_DONE | XBF_ASYNC);
+	ASSERT(!(bp->b_flags & XBF_WRITE));
+	bp->b_flags |= XBF_READ;
 	bp->b_ops = &xfs_sb_buf_ops;
 
 	error = xfs_buf_submit_wait(bp);
 	if (error) {
-		if (!XFS_FORCED_SHUTDOWN(log->l_mp)) {
+		if (!XFS_FORCED_SHUTDOWN(mp)) {
 			xfs_buf_ioerror_alert(bp, __func__);
 			ASSERT(0);
 		}
@@ -5095,14 +5092,17 @@ xlog_do_recover(
 	}
 
 	/* Convert superblock from on-disk format */
-	sbp = &log->l_mp->m_sb;
+	sbp = &mp->m_sb;
 	xfs_sb_from_disk(sbp, XFS_BUF_TO_SBP(bp));
-	ASSERT(sbp->sb_magicnum == XFS_SB_MAGIC);
-	ASSERT(xfs_sb_good_version(sbp));
-	xfs_reinit_percpu_counters(log->l_mp);
-
 	xfs_buf_relse(bp);
 
+	/* re-initialise in-core superblock and geometry structures */
+	xfs_reinit_percpu_counters(mp);
+	error = xfs_initialize_perag(mp, sbp->sb_agcount, &mp->m_maxagi);
+	if (error) {
+		xfs_warn(mp, "Failed post-recovery per-ag init: %d", error);
+		return error;
+	}
 
 	xlog_recover_check_summary(log);
 

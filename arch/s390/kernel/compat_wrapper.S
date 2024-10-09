@@ -1435,3 +1435,18 @@ ENTRY(sys_s390_pci_mmio_read_wrapper)
 	llgtr   %r3,%r3                 # void __user *
 	llgfr   %r4,%r4                 # size_t
 	jg      sys_s390_pci_mmio_read
+
+ENTRY(sys_copy_file_range_wrapper)
+	lgfr    %r2,%r2         # int
+	llgtr   %r3,%r3         # loff_t *
+	lgfr    %r4,%r4         # int
+	llgtr   %r5,%r5         # loff_t *
+	llgfr   %r6,%r6         # size_t
+	llgfr   %r7,%r7         # unsigned int
+	jg  sys_copy_file_range
+
+ENTRY(sys_getrandom_wrapper)
+	llgtr	%r2,%r2		# void __user *
+	llgfr	%r3,%r3		# size_t
+	llgfr	%r4,%r4		# unsigned int
+	jg	sys_getrandom

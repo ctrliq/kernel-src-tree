@@ -47,7 +47,7 @@
  * Seven notes plus zero note at the end: prstatus, fpregset, timer,
  * tod_cmp, tod_reg, control regs, and prefix
  */
-#define KEXEC_NOTE_BYTES \
+#define CRASH_CORE_NOTE_BYTES \
 	(ALIGN(sizeof(struct elf_note), 4) * 8 + \
 	 ALIGN(sizeof("CORE"), 4) * 7 + \
 	 ALIGN(sizeof(struct elf_prstatus), 4) + \

@@ -25,6 +25,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <linux/bitmap.h>
+#include <linux/time64.h>
 
 #include "../util.h"
 #include <EXTERN.h>
@@ -263,9 +264,9 @@ static SV *perl_process_callchain(struct perf_sample *sample,
 	if (!symbol_conf.use_callchain || !sample->callchain)
 		goto exit;
 
-	if (thread__resolve_callchain(al->thread, evsel,
+	if (thread__resolve_callchain(al->thread, &callchain_cursor, evsel,
 				      sample, NULL, NULL,
-				      PERF_MAX_STACK_DEPTH) != 0) {
+				      sysctl_perf_event_max_stack) != 0) {
 		pr_err("Failed to resolve callchain. Skipping\n");
 		goto exit;
 	}
@@ -362,8 +363,8 @@ static void perl_process_tracepoint(struct perf_sample *sample,
 	if (!test_and_set_bit(event->id, events_defined))
 		define_event_symbols(event, handler, event->print_fmt.args);
 
-	s = nsecs / NSECS_PER_SEC;
-	ns = nsecs - s * NSECS_PER_SEC;
+	s = nsecs / NSEC_PER_SEC;
+	ns = nsecs - s * NSEC_PER_SEC;
 
 	scripting_context->event_data = data;
 	scripting_context->pevent = evsel->tp_format->pevent;

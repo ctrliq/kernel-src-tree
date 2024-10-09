@@ -402,7 +402,7 @@ static int mmap_vmcore(struct file *file, struct vm_area_struct *vma)
 
 	return 0;
 fail:
-	do_munmap(vma->vm_mm, vma->vm_start, len);
+	do_munmap(vma->vm_mm, vma->vm_start, len, NULL);
 	return -EAGAIN;
 }
 #else

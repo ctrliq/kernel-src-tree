@@ -771,6 +771,8 @@ struct snd_soc_component_driver {
 
 	int (*probe)(struct snd_soc_component *);
 	void (*remove)(struct snd_soc_component *);
+	int (*suspend)(struct snd_soc_component *);
+	int (*resume)(struct snd_soc_component *);
 
 	/* DT */
 	int (*of_xlate_dai_name)(struct snd_soc_component *component,
@@ -796,9 +798,12 @@ struct snd_soc_component {
 
 	unsigned int ignore_pmdown_time:1; /* pmdown_time is ignored at stop */
 	unsigned int registered_as_component:1;
+	unsigned int auxiliary:1; /* for auxiliary component of the card */
+	unsigned int suspended:1; /* is in suspend PM state */
 
 	struct list_head list;
-	struct list_head list_aux; /* for auxiliary component of the card */
+	struct list_head card_aux_list; /* for auxiliary bound components */
+	struct list_head card_list;
 
 	struct snd_soc_dai_driver *dai_drv;
 	int num_dai;
@@ -841,6 +846,8 @@ struct snd_soc_component {
 
 	int (*probe)(struct snd_soc_component *);
 	void (*remove)(struct snd_soc_component *);
+	int (*suspend)(struct snd_soc_component *);
+	int (*resume)(struct snd_soc_component *);
 
 	/* machine specific init */
 	int (*init)(struct snd_soc_component *component);
@@ -857,11 +864,9 @@ struct snd_soc_codec {
 	const struct snd_soc_codec_driver *driver;
 
 	struct list_head list;
-	struct list_head card_list;
 
 	/* runtime */
 	unsigned int cache_bypass:1; /* Suppress access to the cache */
-	unsigned int suspended:1; /* Codec is in suspend PM state */
 	unsigned int cache_init:1; /* codec cache has been initialized */
 
 	/* codec IO */
@@ -1159,7 +1164,7 @@ struct snd_soc_card {
 	struct work_struct deferred_resume_work;
 
 	/* lists of probed devices belonging to this card */
-	struct list_head codec_dev_list;
+	struct list_head component_dev_list;
 
 	struct list_head widgets;
 	struct list_head paths;
@@ -1541,11 +1546,11 @@ static inline void *snd_soc_pcm_get_drvdata(struct snd_soc_pcm_runtime *rtd)
 
 static inline void snd_soc_initialize_card_lists(struct snd_soc_card *card)
 {
-	INIT_LIST_HEAD(&card->codec_dev_list);
 	INIT_LIST_HEAD(&card->widgets);
 	INIT_LIST_HEAD(&card->paths);
 	INIT_LIST_HEAD(&card->dapm_list);
 	INIT_LIST_HEAD(&card->aux_comp_list);
+	INIT_LIST_HEAD(&card->component_dev_list);
 }
 
 static inline bool snd_soc_volsw_is_stereo(struct soc_mixer_control *mc)

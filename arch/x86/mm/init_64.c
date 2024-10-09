@@ -109,10 +109,10 @@ __setup("noexec32=", nonx32_setup);
  */
 void sync_global_pgds(unsigned long start, unsigned long end, int removed)
 {
-	unsigned long address;
+	unsigned long addr;
 
-	for (address = start; address <= end; address += PGDIR_SIZE) {
-		const pgd_t *pgd_ref = pgd_offset_k(address);
+	for (addr = start; addr <= end; addr = ALIGN(addr + 1, PGDIR_SIZE)) {
+		const pgd_t *pgd_ref = pgd_offset_k(addr);
 		struct page *page;
 
 		/*
@@ -128,7 +128,7 @@ void sync_global_pgds(unsigned long start, unsigned long end, int removed)
 			pgd_t *pgd;
 			spinlock_t *pgt_lock;
 
-			pgd = (pgd_t *)page_address(page) + pgd_index(address);
+			pgd = (pgd_t *)page_address(page) + pgd_index(addr);
 			/* the pgt_lock only for Xen */
 			pgt_lock = &pgd_page_get_mm(page)->page_table_lock;
 			spin_lock(pgt_lock);
@@ -663,13 +663,12 @@ static void  update_end_of_memory_vars(u64 start, u64 size)
  * Memory is added always to NORMAL zone. This means you will never get
  * additional DMA/DMA32 memory.
  */
-int arch_add_memory(int nid, u64 start, u64 size, bool for_device)
+int add_pages(int nid, unsigned long start,
+	      unsigned long size, bool for_device)
 {
 	struct pglist_data *pgdat = NODE_DATA(nid);
 	int zoneid = zone_for_memory(nid, start, size, ZONE_NORMAL, for_device);
 	struct zone *zone = pgdat->node_zones + zoneid;
-	unsigned long start_pfn = start >> PAGE_SHIFT;
-	unsigned long nr_pages = size >> PAGE_SHIFT;
 	int ret;
 
 #ifdef CONFIG_ZONE_DEVICE
@@ -677,15 +676,20 @@ int arch_add_memory(int nid, u64 start, u64 size, bool for_device)
 		zone = pgdat->zone_device;
 #endif
 
-	init_memory_mapping(start, start + size);
-
-	ret = __add_pages(nid, zone, start_pfn, nr_pages);
+	ret = __add_pages(nid, zone, start >> PAGE_SHIFT, size >> PAGE_SHIFT);
 	WARN_ON_ONCE(ret);
 
 	/* update max_pfn, max_low_pfn and high_memory */
 	update_end_of_memory_vars(start, size);
 
 	return ret;
+}
+
+int arch_add_memory(int nid, u64 start, u64 size, bool for_device)
+{
+	init_memory_mapping(start, start + size);
+
+	return add_pages(nid, start, size, for_device);
 }
 EXPORT_SYMBOL_GPL(arch_add_memory);
 

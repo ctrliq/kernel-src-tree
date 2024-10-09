@@ -24,6 +24,7 @@
 #include <asm/mmu_context.h>
 #include <asm/debugreg.h>
 #include <asm/kexec-bzimage64.h>
+#include <asm/setup.h>
 
 #ifdef CONFIG_KEXEC_FILE
 static struct kexec_file_ops *kexec_file_loaders[] = {
@@ -325,7 +326,7 @@ void machine_kexec(struct kimage *image)
 
 void arch_crash_save_vmcoreinfo(void)
 {
-	VMCOREINFO_SYMBOL(phys_base);
+	VMCOREINFO_NUMBER(phys_base);
 	VMCOREINFO_SYMBOL(init_level4_pgt);
 
 #ifdef CONFIG_NUMA
@@ -333,7 +334,8 @@ void arch_crash_save_vmcoreinfo(void)
 	VMCOREINFO_LENGTH(node_data, MAX_NUMNODES);
 #endif
 	vmcoreinfo_append_str("KERNELOFFSET=%lx\n",
-			      (unsigned long)&_text - __START_KERNEL);
+			      kaslr_offset());
+	VMCOREINFO_NUMBER(KERNEL_IMAGE_SIZE);
 }
 
 /* arch-dependent functionality related to kexec file-based syscall */
@@ -382,6 +384,7 @@ int arch_kimage_file_post_load_cleanup(struct kimage *image)
 	return image->fops->cleanup(image->image_loader_data);
 }
 
+#ifdef CONFIG_KEXEC_VERIFY_SIG
 int arch_kexec_kernel_verify_sig(struct kimage *image, void *kernel,
 				 unsigned long kernel_len)
 {
@@ -392,6 +395,7 @@ int arch_kexec_kernel_verify_sig(struct kimage *image, void *kernel,
 
 	return image->fops->verify_sig(kernel, kernel_len);
 }
+#endif
 
 /*
  * Apply purgatory relocations.

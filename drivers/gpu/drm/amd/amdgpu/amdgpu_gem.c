@@ -93,7 +93,7 @@ void amdgpu_gem_force_release(struct amdgpu_device *adev)
 	struct drm_device *ddev = adev->ddev;
 	struct drm_file *file;
 
-	mutex_lock(&ddev->struct_mutex);
+	mutex_lock(&ddev->filelist_mutex);
 
 	list_for_each_entry(file, &ddev->filelist, lhead) {
 		struct drm_gem_object *gobj;
@@ -103,38 +103,39 @@ void amdgpu_gem_force_release(struct amdgpu_device *adev)
 		spin_lock(&file->table_lock);
 		idr_for_each_entry(&file->object_idr, gobj, handle) {
 			WARN_ONCE(1, "And also active allocations!\n");
-			drm_gem_object_unreference(gobj);
+			drm_gem_object_unreference_unlocked(gobj);
 		}
 		idr_destroy(&file->object_idr);
 		spin_unlock(&file->table_lock);
 	}
 
-	mutex_unlock(&ddev->struct_mutex);
+	mutex_unlock(&ddev->filelist_mutex);
 }
 
 /*
  * Call from drm_gem_handle_create which appear in both new and open ioctl
  * case.
  */
-int amdgpu_gem_object_open(struct drm_gem_object *obj, struct drm_file *file_priv)
+int amdgpu_gem_object_open(struct drm_gem_object *obj,
+			   struct drm_file *file_priv)
 {
-	struct amdgpu_bo *rbo = gem_to_amdgpu_bo(obj);
-	struct amdgpu_device *adev = rbo->adev;
+	struct amdgpu_bo *abo = gem_to_amdgpu_bo(obj);
+	struct amdgpu_device *adev = amdgpu_ttm_adev(abo->tbo.bdev);
 	struct amdgpu_fpriv *fpriv = file_priv->driver_priv;
 	struct amdgpu_vm *vm = &fpriv->vm;
 	struct amdgpu_bo_va *bo_va;
 	int r;
-	r = amdgpu_bo_reserve(rbo, false);
+	r = amdgpu_bo_reserve(abo, false);
 	if (r)
 		return r;
 
-	bo_va = amdgpu_vm_bo_find(vm, rbo);
+	bo_va = amdgpu_vm_bo_find(vm, abo);
 	if (!bo_va) {
-		bo_va = amdgpu_vm_bo_add(adev, vm, rbo);
+		bo_va = amdgpu_vm_bo_add(adev, vm, abo);
 	} else {
 		++bo_va->ref_count;
 	}
-	amdgpu_bo_unreserve(rbo);
+	amdgpu_bo_unreserve(abo);
 	return 0;
 }
 
@@ -142,7 +143,7 @@ void amdgpu_gem_object_close(struct drm_gem_object *obj,
 			     struct drm_file *file_priv)
 {
 	struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
-	struct amdgpu_device *adev = bo->adev;
+	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
 	struct amdgpu_fpriv *fpriv = file_priv->driver_priv;
 	struct amdgpu_vm *vm = &fpriv->vm;
 
@@ -338,7 +339,7 @@ int amdgpu_mode_dumb_mmap(struct drm_file *filp,
 	struct drm_gem_object *gobj;
 	struct amdgpu_bo *robj;
 
-	gobj = drm_gem_object_lookup(dev, filp, handle);
+	gobj = drm_gem_object_lookup(filp, handle);
 	if (gobj == NULL) {
 		return -ENOENT;
 	}
@@ -402,15 +403,13 @@ int amdgpu_gem_wait_idle_ioctl(struct drm_device *dev, void *data,
 	int r = 0;
 	long ret;
 
-	gobj = drm_gem_object_lookup(dev, filp, handle);
+	gobj = drm_gem_object_lookup(filp, handle);
 	if (gobj == NULL) {
 		return -ENOENT;
 	}
 	robj = gem_to_amdgpu_bo(gobj);
-	if (timeout == 0)
-		ret = reservation_object_test_signaled_rcu(robj->tbo.resv, true);
-	else
-		ret = reservation_object_wait_timeout_rcu(robj->tbo.resv, true, true, timeout);
+	ret = reservation_object_wait_timeout_rcu(robj->tbo.resv, true, true,
+						  timeout);
 
 	/* ret == 0 means not signaled,
 	 * ret > 0 means signaled
@@ -436,7 +435,7 @@ int amdgpu_gem_metadata_ioctl(struct drm_device *dev, void *data,
 	int r = -1;
 
 	DRM_DEBUG("%d \n", args->handle);
-	gobj = drm_gem_object_lookup(dev, filp, args->handle);
+	gobj = drm_gem_object_lookup(filp, args->handle);
 	if (gobj == NULL)
 		return -ENOENT;
 	robj = gem_to_amdgpu_bo(gobj);
@@ -470,6 +469,16 @@ out:
 	return r;
 }
 
+static int amdgpu_gem_va_check(void *param, struct amdgpu_bo *bo)
+{
+	unsigned domain = amdgpu_mem_type_to_domain(bo->tbo.mem.mem_type);
+
+	/* if anything is swapped out don't swap it in here,
+	   just abort and wait for the next CS */
+
+	return domain == AMDGPU_GEM_DOMAIN_CPU ? -ERESTARTSYS : 0;
+}
+
 /**
  * amdgpu_gem_va_update_vm -update the bo_va in its VM
  *
@@ -480,7 +489,8 @@ out:
  * vital here, so they are not reported back to userspace.
  */
 static void amdgpu_gem_va_update_vm(struct amdgpu_device *adev,
-				    struct amdgpu_bo_va *bo_va, uint32_t operation)
+				    struct amdgpu_bo_va *bo_va,
+				    uint32_t operation)
 {
 	struct ttm_validate_buffer tv, *entry;
 	struct amdgpu_bo_list_entry vm_pd;
@@ -503,7 +513,6 @@ static void amdgpu_gem_va_update_vm(struct amdgpu_device *adev,
 	if (r)
 		goto error_print;
 
-	amdgpu_vm_get_pt_bos(bo_va->vm, &duplicates);
 	list_for_each_entry(entry, &list, head) {
 		domain = amdgpu_mem_type_to_domain(entry->bo->mem.mem_type);
 		/* if anything is swapped out don't swap it in here,
@@ -511,13 +520,10 @@ static void amdgpu_gem_va_update_vm(struct amdgpu_device *adev,
 		if (domain == AMDGPU_GEM_DOMAIN_CPU)
 			goto error_unreserve;
 	}
-	list_for_each_entry(entry, &duplicates, head) {
-		domain = amdgpu_mem_type_to_domain(entry->bo->mem.mem_type);
-		/* if anything is swapped out don't swap it in here,
-		   just abort and wait for the next CS */
-		if (domain == AMDGPU_GEM_DOMAIN_CPU)
-			goto error_unreserve;
-	}
+	r = amdgpu_vm_validate_pt_bos(adev, bo_va->vm, amdgpu_gem_va_check,
+				      NULL);
+	if (r)
+		goto error_unreserve;
 
 	r = amdgpu_vm_update_page_directory(adev, bo_va->vm);
 	if (r)
@@ -528,7 +534,7 @@ static void amdgpu_gem_va_update_vm(struct amdgpu_device *adev,
 		goto error_unreserve;
 
 	if (operation == AMDGPU_VA_OP_MAP)
-		r = amdgpu_vm_bo_update(adev, bo_va, &bo_va->bo->tbo.mem);
+		r = amdgpu_vm_bo_update(adev, bo_va, false);
 
 error_unreserve:
 	ttm_eu_backoff_reservation(&ticket, &list);
@@ -538,8 +544,6 @@ error_print:
 		DRM_ERROR("Couldn't update BO_VA (%d)\n", r);
 }
 
-
-
 int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 			  struct drm_file *filp)
 {
@@ -547,9 +551,10 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 	struct drm_gem_object *gobj;
 	struct amdgpu_device *adev = dev->dev_private;
 	struct amdgpu_fpriv *fpriv = filp->driver_priv;
-	struct amdgpu_bo *rbo;
+	struct amdgpu_bo *abo;
 	struct amdgpu_bo_va *bo_va;
-	struct ttm_validate_buffer tv, tv_pd;
+	struct amdgpu_bo_list_entry vm_pd;
+	struct ttm_validate_buffer tv;
 	struct ww_acquire_ctx ticket;
 	struct list_head list, duplicates;
 	uint32_t invalid_flags, va_flags = 0;
@@ -584,19 +589,17 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 		return -EINVAL;
 	}
 
-	gobj = drm_gem_object_lookup(dev, filp, args->handle);
+	gobj = drm_gem_object_lookup(filp, args->handle);
 	if (gobj == NULL)
 		return -ENOENT;
-	rbo = gem_to_amdgpu_bo(gobj);
+	abo = gem_to_amdgpu_bo(gobj);
 	INIT_LIST_HEAD(&list);
 	INIT_LIST_HEAD(&duplicates);
-	tv.bo = &rbo->tbo;
+	tv.bo = &abo->tbo;
 	tv.shared = true;
 	list_add(&tv.head, &list);
 
-	tv_pd.bo = &fpriv->vm.page_directory->tbo;
-	tv_pd.shared = true;
-	list_add(&tv_pd.head, &list);
+	amdgpu_vm_get_pd_bo(&fpriv->vm, &list, &vm_pd);
 
 	r = ttm_eu_reserve_buffers(&ticket, &list, true, &duplicates);
 	if (r) {
@@ -604,7 +607,7 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 		return r;
 	}
 
-	bo_va = amdgpu_vm_bo_find(&fpriv->vm, rbo);
+	bo_va = amdgpu_vm_bo_find(&fpriv->vm, abo);
 	if (!bo_va) {
 		ttm_eu_backoff_reservation(&ticket, &list);
 		drm_gem_object_unreference_unlocked(gobj);
@@ -646,7 +649,7 @@ int amdgpu_gem_op_ioctl(struct drm_device *dev, void *data,
 	struct amdgpu_bo *robj;
 	int r;
 
-	gobj = drm_gem_object_lookup(dev, filp, args->handle);
+	gobj = drm_gem_object_lookup(filp, args->handle);
 	if (gobj == NULL) {
 		return -ENOENT;
 	}
@@ -704,7 +707,8 @@ int amdgpu_mode_dumb_create(struct drm_file *file_priv,
 	uint32_t handle;
 	int r;
 
-	args->pitch = amdgpu_align_pitch(adev, args->width, args->bpp, 0) * ((args->bpp + 1) / 8);
+	args->pitch = amdgpu_align_pitch(adev, args->width,
+					 DIV_ROUND_UP(args->bpp, 8), 0);
 	args->size = (u64)args->pitch * args->height;
 	args->size = ALIGN(args->size, PAGE_SIZE);
 
@@ -769,7 +773,7 @@ static int amdgpu_debugfs_gem_info(struct seq_file *m, void *data)
 	struct drm_file *file;
 	int r;
 
-	r = mutex_lock_interruptible(&dev->struct_mutex);
+	r = mutex_lock_interruptible(&dev->filelist_mutex);
 	if (r)
 		return r;
 
@@ -793,11 +797,11 @@ static int amdgpu_debugfs_gem_info(struct seq_file *m, void *data)
 		spin_unlock(&file->table_lock);
 	}
 
-	mutex_unlock(&dev->struct_mutex);
+	mutex_unlock(&dev->filelist_mutex);
 	return 0;
 }
 
-static struct drm_info_list amdgpu_debugfs_gem_list[] = {
+static const struct drm_info_list amdgpu_debugfs_gem_list[] = {
 	{"amdgpu_gem_info", &amdgpu_debugfs_gem_info, 0, NULL},
 };
 #endif

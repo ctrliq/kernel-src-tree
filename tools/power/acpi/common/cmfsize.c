@@ -5,7 +5,7 @@
  *****************************************************************************/
 
 /*
- * Copyright (C) 2000 - 2014, Intel Corp.
+ * Copyright (C) 2000 - 2016, Intel Corp.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -44,7 +44,6 @@
 #include <acpi/acpi.h>
 #include "accommon.h"
 #include "acapps.h"
-#include <stdio.h>
 
 #define _COMPONENT          ACPI_TOOLS
 ACPI_MODULE_NAME("cmfsize")
@@ -58,14 +57,14 @@ ACPI_MODULE_NAME("cmfsize")
  * RETURN:      File Size. On error, -1 (ACPI_UINT32_MAX)
  *
  * DESCRIPTION: Get the size of a file. Uses seek-to-EOF. File must be open.
- *              Does not disturb the current file pointer. Uses perror for
- *              error messages.
+ *              Does not disturb the current file pointer.
  *
  ******************************************************************************/
-u32 cm_get_file_size(FILE * file)
+u32 cm_get_file_size(ACPI_FILE file)
 {
 	long file_size;
 	long current_offset;
+	acpi_status status;
 
 	/* Save the current file pointer, seek to EOF to obtain file size */
 
@@ -74,7 +73,8 @@ u32 cm_get_file_size(FILE * file)
 		goto offset_error;
 	}
 
-	if (fseek(file, 0, SEEK_END)) {
+	status = fseek(file, 0, SEEK_END);
+	if (ACPI_FAILURE(status)) {
 		goto seek_error;
 	}
 
@@ -85,17 +85,18 @@ u32 cm_get_file_size(FILE * file)
 
 	/* Restore original file pointer */
 
-	if (fseek(file, current_offset, SEEK_SET)) {
+	status = fseek(file, current_offset, SEEK_SET);
+	if (ACPI_FAILURE(status)) {
 		goto seek_error;
 	}
 
 	return ((u32)file_size);
 
 offset_error:
-	perror("Could not get file offset");
+	fprintf(stderr, "Could not get file offset\n");
 	return (ACPI_UINT32_MAX);
 
 seek_error:
-	perror("Could not seek file");
+	fprintf(stderr, "Could not set file offset\n");
 	return (ACPI_UINT32_MAX);
 }

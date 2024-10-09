@@ -54,6 +54,8 @@
 #define CHK_MAC_ERR_BIT(x)	(((x) >> MAC_ERROR_BIT) & 1)
 #define MAX_SALT                4
 
+#define padap(dev) pci_get_drvdata(dev->u_ctx->lldi.pdev)
+
 struct uld_ctx;
 
 struct _key_ctx {
@@ -77,6 +79,7 @@ struct chcr_dev {
 	struct crypto_queue pending_queue;
 	struct uld_ctx *u_ctx;
 	unsigned char tx_channel_id;
+	unsigned char rx_channel_id;
 };
 
 struct uld_ctx {

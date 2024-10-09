@@ -341,8 +341,10 @@ struct perf_event_attr {
 				__reserved_1   : 40;
 #else
 				comm_exec      :  1, /* flag comm events that are due to an exec */
+				use_clockid    :  1, /* use @clockid for time fields */
 				context_switch :  1, /* context switch data */
-				__reserved_1   : 38;
+				write_backward :  1, /* Write ring buffer from end to beginning */
+				__reserved_1   : 36;
 #endif
 
 	union {
@@ -372,8 +374,13 @@ struct perf_event_attr {
 	 */
 	__u32	sample_stack_user;
 
+#ifdef __GENKSYMS__
 	/* Align to u64. */
 	__u32	__reserved_2;
+#else
+	__s32	clockid;
+#endif
+
 	/*
 	 * Defines set of regs to dump for each sample
 	 * state captured on:
@@ -406,6 +413,7 @@ struct perf_event_attr {
 #define PERF_EVENT_IOC_SET_OUTPUT	_IO ('$', 5)
 #define PERF_EVENT_IOC_SET_FILTER	_IOW('$', 6, char *)
 #define PERF_EVENT_IOC_ID		_IOR('$', 7, __u64 *)
+#define PERF_EVENT_IOC_PAUSE_OUTPUT	_IOW('$', 9, __u32)
 
 enum perf_event_ioc_flags {
 	PERF_IOC_FLAG_GROUP		= 1U << 0,

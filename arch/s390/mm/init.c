@@ -183,6 +183,12 @@ void __init free_initrd_mem(unsigned long start, unsigned long end)
 #endif
 
 #ifdef CONFIG_MEMORY_HOTPLUG
+int add_pages(int nid, unsigned long start,
+	      unsigned long size, bool for_device)
+{
+	return -EINVAL;
+}
+
 int arch_add_memory(int nid, u64 start, u64 size, bool for_device)
 {
 	unsigned long zone_start_pfn, zone_end_pfn, nr_pages;

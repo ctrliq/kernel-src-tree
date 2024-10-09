@@ -66,7 +66,7 @@
 #include <linux/kref.h>
 #include <linux/interval_tree.h>
 #include <linux/hashtable.h>
-#include <linux/fence.h>
+#include <linux/dma-fence.h>
 
 #include <ttm/ttm_bo_api.h>
 #include <ttm/ttm_bo_driver.h>
@@ -113,6 +113,8 @@ extern int radeon_bapm;
 extern int radeon_backlight;
 extern int radeon_auxch;
 extern int radeon_mst;
+extern int radeon_uvd;
+extern int radeon_vce;
 
 /*
  * Copy from radeon_drv.h so we don't have to include both and have conflicting
@@ -365,7 +367,7 @@ struct radeon_fence_driver {
 };
 
 struct radeon_fence {
-	struct fence		base;
+	struct dma_fence		base;
 
 	struct radeon_device	*rdev;
 	uint64_t		seq;
@@ -740,10 +742,12 @@ struct radeon_flip_work {
 	struct work_struct		unpin_work;
 	struct radeon_device		*rdev;
 	int				crtc_id;
+	u32				target_vblank;
 	uint64_t			base;
 	struct drm_pending_vblank_event *event;
 	struct radeon_bo		*old_rbo;
-	struct fence			*fence;
+	struct dma_fence		*fence;
+	bool				async;
 };
 
 struct r500_irq_stat_regs {
@@ -1671,14 +1675,18 @@ int radeon_pm_get_type_index(struct radeon_device *rdev,
 /*
  * UVD
  */
-#define RADEON_MAX_UVD_HANDLES	10
-#define RADEON_UVD_STACK_SIZE	(1024*1024)
-#define RADEON_UVD_HEAP_SIZE	(1024*1024)
+#define RADEON_DEFAULT_UVD_HANDLES	10
+#define RADEON_MAX_UVD_HANDLES		30
+#define RADEON_UVD_STACK_SIZE		(200*1024)
+#define RADEON_UVD_HEAP_SIZE		(256*1024)
+#define RADEON_UVD_SESSION_SIZE		(50*1024)
 
 struct radeon_uvd {
+	bool			fw_header_present;
 	struct radeon_bo	*vcpu_bo;
 	void			*cpu_addr;
 	uint64_t		gpu_addr;
+	unsigned		max_handles;
 	atomic_t		handles[RADEON_MAX_UVD_HANDLES];
 	struct drm_file		*filp[RADEON_MAX_UVD_HANDLES];
 	unsigned		img_size[RADEON_MAX_UVD_HANDLES];
@@ -1998,7 +2006,7 @@ struct radeon_asic {
 	} dpm;
 	/* pageflipping */
 	struct {
-		void (*page_flip)(struct radeon_device *rdev, int crtc, u64 crtc_base);
+		void (*page_flip)(struct radeon_device *rdev, int crtc, u64 crtc_base, bool async);
 		bool (*page_flip_pending)(struct radeon_device *rdev, int crtc);
 	} pflip;
 };
@@ -2379,7 +2387,7 @@ struct radeon_device {
 	struct radeon_mman		mman;
 	struct radeon_fence_driver	fence_drv[RADEON_NUM_RINGS];
 	wait_queue_head_t		fence_queue;
-	unsigned			fence_context;
+	u64				fence_context;
 	struct mutex			ring_lock;
 	struct radeon_ring		ring[RADEON_NUM_RINGS];
 	bool				ib_pool_ready;
@@ -2394,7 +2402,6 @@ struct radeon_device {
 	struct radeon_wb		wb;
 	struct radeon_dummy_page	dummy_page;
 	bool				shutdown;
-	bool				suspend;
 	bool				need_dma32;
 	bool				accel_working;
 	bool				fastfb_working; /* IGP feature*/
@@ -2423,6 +2430,7 @@ struct radeon_device {
 	int num_crtc; /* number of crtcs */
 	struct mutex dc_hw_i2c_mutex; /* display controller hw i2c mutex */
 	bool has_uvd;
+	bool has_vce;
 	struct r600_audio audio; /* audio stuff */
 	struct notifier_block acpi_nb;
 	/* only one userspace can use Hyperz features or CMASK at a time */
@@ -2506,9 +2514,9 @@ void cik_mm_wdoorbell(struct radeon_device *rdev, u32 index, u32 v);
 /*
  * Cast helper
  */
-extern const struct fence_ops radeon_fence_ops;
+extern const struct dma_fence_ops radeon_fence_ops;
 
-static inline struct radeon_fence *to_radeon_fence(struct fence *f)
+static inline struct radeon_fence *to_radeon_fence(struct dma_fence *f)
 {
 	struct radeon_fence *__f = container_of(f, struct radeon_fence, base);
 
@@ -2775,7 +2783,7 @@ static inline void radeon_ring_write(struct radeon_ring *ring, uint32_t v)
 #define radeon_pm_finish(rdev) (rdev)->asic->pm.finish((rdev))
 #define radeon_pm_init_profile(rdev) (rdev)->asic->pm.init_profile((rdev))
 #define radeon_pm_get_dynpm_state(rdev) (rdev)->asic->pm.get_dynpm_state((rdev))
-#define radeon_page_flip(rdev, crtc, base) (rdev)->asic->pflip.page_flip((rdev), (crtc), (base))
+#define radeon_page_flip(rdev, crtc, base, async) (rdev)->asic->pflip.page_flip((rdev), (crtc), (base), (async))
 #define radeon_page_flip_pending(rdev, crtc) (rdev)->asic->pflip.page_flip_pending((rdev), (crtc))
 #define radeon_wait_for_vblank(rdev, crtc) (rdev)->asic->display.wait_for_vblank((rdev), (crtc))
 #define radeon_mc_wait_for_idle(rdev) (rdev)->asic->mc_wait_for_idle((rdev))
