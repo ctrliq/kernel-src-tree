@@ -1,0 +1,107 @@
+inotify: hide internal kernel bits from fdinfo
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Dave Hansen <dave.hansen@linux.intel.com>
+commit 6933599697c96c3213c95f5f1fc7cb6abfd08c54
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/69335996.failed
+
+There was a report that my patch:
+
+    inotify: actually check for invalid bits in sys_inotify_add_watch()
+
+broke CRIU.
+
+The reason is that CRIU looks up raw flags in /proc/$pid/fdinfo/* to
+figure out how to rebuild inotify watches and then passes those flags
+directly back in to the inotify API.  One of those flags
+(FS_EVENT_ON_CHILD) is set in mark->mask, but is not part of the inotify
+API.  It is used inside the kernel to _implement_ inotify but it is not
+and has never been part of the API.
+
+My patch above ensured that we only allow bits which are part of the API
+(IN_ALL_EVENTS).  This broke CRIU.
+
+FS_EVENT_ON_CHILD is really internal to the kernel.  It is set _anyway_ on
+all inotify marks.  So, CRIU was really just trying to set a bit that was
+already set.
+
+This patch hides that bit from fdinfo.  CRIU will not see the bit, not try
+to set it, and should work as before.  We should not have been exposing
+this bit in the first place, so this is a good patch independent of the
+CRIU problem.
+
+	Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Reported-by: Andrey Wagin <avagin@gmail.com>
+	Acked-by: Andrey Vagin <avagin@openvz.org>
+	Acked-by: Cyrill Gorcunov <gorcunov@openvz.org>
+	Acked-by: Eric Paris <eparis@redhat.com>
+	Cc: Pavel Emelyanov <xemul@parallels.com>
+	Cc: John McCutchan <john@johnmccutchan.com>
+	Cc: Robert Love <rlove@rlove.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 6933599697c96c3213c95f5f1fc7cb6abfd08c54)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/fdinfo.c
+diff --cc fs/notify/fdinfo.c
+index 9d7e2b9659cb,fd98e5100cab..000000000000
+--- a/fs/notify/fdinfo.c
++++ b/fs/notify/fdinfo.c
+@@@ -79,30 -75,33 +79,45 @@@ static int inotify_fdinfo(struct seq_fi
+  {
+  	struct inotify_inode_mark *inode_mark;
+  	struct inode *inode;
+ +	int ret = 0;
+  
+ -	if (!(mark->flags & FSNOTIFY_MARK_FLAG_ALIVE) ||
+ -	    !(mark->flags & FSNOTIFY_MARK_FLAG_INODE))
+ -		return;
+ +	if (!(mark->flags & (FSNOTIFY_MARK_FLAG_ALIVE | FSNOTIFY_MARK_FLAG_INODE)))
+ +		return 0;
+  
+  	inode_mark = container_of(mark, struct inotify_inode_mark, fsn_mark);
+ -	inode = igrab(mark->inode);
+ +	inode = igrab(mark->i.inode);
+  	if (inode) {
+++<<<<<<< HEAD
+ +		ret = seq_printf(m, "inotify wd:%x ino:%lx sdev:%x "
+ +				 "mask:%x ignored_mask:%x ",
+ +				 inode_mark->wd, inode->i_ino,
+ +				 inode->i_sb->s_dev,
+ +				 mark->mask, mark->ignored_mask);
+ +		ret |= show_mark_fhandle(m, inode);
+ +		ret |= seq_putc(m, '\n');
+++=======
++ 		/*
++ 		 * IN_ALL_EVENTS represents all of the mask bits
++ 		 * that we expose to userspace.  There is at
++ 		 * least one bit (FS_EVENT_ON_CHILD) which is
++ 		 * used only internally to the kernel.
++ 		 */
++ 		u32 mask = mark->mask & IN_ALL_EVENTS;
++ 		seq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:%x ",
++ 			   inode_mark->wd, inode->i_ino, inode->i_sb->s_dev,
++ 			   mask, mark->ignored_mask);
++ 		show_mark_fhandle(m, inode);
++ 		seq_putc(m, '\n');
+++>>>>>>> 6933599697c9 (inotify: hide internal kernel bits from fdinfo)
+  		iput(inode);
+  	}
+ +
+ +	return ret;
+  }
+  
+ -void inotify_show_fdinfo(struct seq_file *m, struct file *f)
+ +int inotify_show_fdinfo(struct seq_file *m, struct file *f)
+  {
+ -	show_fdinfo(m, f, inotify_fdinfo);
+ +	return show_fdinfo(m, f, inotify_fdinfo);
+  }
+  
+  #endif /* CONFIG_INOTIFY_USER */
+* Unmerged path fs/notify/fdinfo.c
