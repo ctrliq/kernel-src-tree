@@ -952,6 +952,7 @@ int btrfs_ordered_update_i_size(struct inode *inode, u64 offset,
 	struct rb_node *prev = NULL;
 	struct btrfs_ordered_extent *test;
 	int ret = 1;
+	u64 orig_offset = offset;
 
 	spin_lock_irq(&tree->lock);
 	if (ordered) {
@@ -967,7 +968,7 @@ int btrfs_ordered_update_i_size(struct inode *inode, u64 offset,
 
 	/* truncate file */
 	if (disk_i_size > i_size) {
-		BTRFS_I(inode)->disk_i_size = i_size;
+		BTRFS_I(inode)->disk_i_size = orig_offset;
 		ret = 0;
 		goto out;
 	}
