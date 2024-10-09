@@ -332,9 +332,6 @@ struct posix_acl *ovl_get_acl(struct inode *inode, int type)
 	if (!IS_POSIXACL(realinode))
 		return NULL;
 
-	if (!realinode->i_op->get_acl)
-		return NULL;
-
 	old_cred = ovl_override_creds(inode->i_sb);
 	acl = realinode->i_op->get_acl(realinode, type);
 	revert_creds(old_cred);
