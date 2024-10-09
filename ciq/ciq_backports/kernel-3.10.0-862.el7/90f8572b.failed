@@ -1,0 +1,407 @@
+vfs: Commit to never having exectuables on proc and sysfs.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [fs] vfs: Commit to never having exectuables on proc and sysfs ("Eric W. Biederman") [1487751]
+Rebuild_FUZZ: 99.13%
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit 90f8572b0f021fdd1baa68e00a8c30482ee9e5f4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/90f8572b.failed
+
+Today proc and sysfs do not contain any executable files.  Several
+applications today mount proc or sysfs without noexec and nosuid and
+then depend on there being no exectuables files on proc or sysfs.
+Having any executable files show on proc or sysfs would cause
+a user space visible regression, and most likely security problems.
+
+Therefore commit to never allowing executables on proc and sysfs by
+adding a new flag to mark them as filesystems without executables and
+enforce that flag.
+
+Test the flag where MNT_NOEXEC is tested today, so that the only user
+visible effect will be that exectuables will be treated as if the
+execute bit is cleared.
+
+The filesystems proc and sysfs do not currently incoporate any
+executable files so this does not result in any user visible effects.
+
+This makes it unnecessary to vet changes to proc and sysfs tightly for
+adding exectuable files or changes to chattr that would modify
+existing files, as no matter what the individual file say they will
+not be treated as exectuable files by the vfs.
+
+Not having to vet changes to closely is important as without this we
+are only one proc_create call (or another goof up in the
+implementation of notify_change) from having problematic executables
+on proc.  Those mistakes are all too easy to make and would create
+a situation where there are security issues or the assumptions of
+some program having to be broken (and cause userspace regressions).
+
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit 90f8572b0f021fdd1baa68e00a8c30482ee9e5f4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/exec.c
+#	fs/sysfs/mount.c
+#	include/linux/fs.h
+diff --cc fs/exec.c
+index 9ca6d51722de,b06623a9347f..000000000000
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@@ -96,6 -98,13 +96,16 @@@ static inline void put_binfmt(struct li
+  	module_put(fmt->module);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ bool path_noexec(const struct path *path)
++ {
++ 	return (path->mnt->mnt_flags & MNT_NOEXEC) ||
++ 	       (path->mnt->mnt_sb->s_iflags & SB_I_NOEXEC);
++ }
++ 
++ #ifdef CONFIG_USELIB
+++>>>>>>> 90f8572b0f02 (vfs: Commit to never having exectuables on proc and sysfs.)
+  /*
+   * Note that a shared library must be both readable and executable due to
+   * security reasons.
+@@@ -767,11 -783,9 +777,11 @@@ static struct file *do_open_exec(struc
+  	if (!S_ISREG(file_inode(file)->i_mode))
+  		goto exit;
+  
+- 	if (file->f_path.mnt->mnt_flags & MNT_NOEXEC)
++ 	if (path_noexec(&file->f_path))
+  		goto exit;
+  
+ +	fsnotify_open(file);
+ +
+  	err = deny_write_access(file);
+  	if (err)
+  		goto exit;
+diff --cc fs/sysfs/mount.c
+index 59ee03fe48e1,f3db82071cfb..000000000000
+--- a/fs/sysfs/mount.c
++++ b/fs/sysfs/mount.c
+@@@ -23,121 -20,31 +23,134 @@@
+  
+  #include "sysfs.h"
+  
+ -static struct kernfs_root *sysfs_root;
+ -struct kernfs_node *sysfs_root_kn;
+  
+ -static struct dentry *sysfs_mount(struct file_system_type *fs_type,
+ -	int flags, const char *dev_name, void *data)
+ +struct kmem_cache *sysfs_dir_cachep;
+ +
+ +static const struct super_operations sysfs_ops = {
+ +	.statfs		= simple_statfs,
+ +	.drop_inode	= generic_delete_inode,
+ +	.evict_inode	= sysfs_evict_inode,
+ +};
+ +
+ +static struct sysfs_dirent sysfs_root = {
+ +	.s_name		= "",
+ +	.s_count	= ATOMIC_INIT(1),
+ +	.s_flags	= SYSFS_DIR | (KOBJ_NS_TYPE_NONE << SYSFS_NS_TYPE_SHIFT),
+ +	.s_mode		= S_IFDIR | S_IRUGO | S_IXUGO,
+ +	.s_ino		= 1,
+ +};
+ +
+ +struct sysfs_dirent *sysfs_root_sd = &sysfs_root;
+ +
+ +static int sysfs_fill_super(struct super_block *sb)
+  {
+ +	struct inode *inode;
+  	struct dentry *root;
+ -	void *ns;
+ -	bool new_sb;
+  
+ -	if (!(flags & MS_KERNMOUNT)) {
+ -		if (!kobj_ns_current_may_mount(KOBJ_NS_TYPE_NET))
+ -			return ERR_PTR(-EPERM);
+ +	sb->s_blocksize = PAGE_CACHE_SIZE;
+ +	sb->s_blocksize_bits = PAGE_CACHE_SHIFT;
+ +	sb->s_magic = SYSFS_MAGIC;
+ +	sb->s_op = &sysfs_ops;
+ +	sb->s_time_gran = 1;
+ +
+ +	/* get root inode, initialize and unlock it */
+ +	mutex_lock(&sysfs_mutex);
+ +	inode = sysfs_get_inode(sb, sysfs_root_sd);
+ +	mutex_unlock(&sysfs_mutex);
+ +	if (!inode) {
+ +		pr_debug("sysfs: could not get root inode\n");
+ +		return -ENOMEM;
+ +	}
+ +
+ +	/* instantiate and link root dentry */
+ +	root = d_make_root(inode);
+ +	if (!root) {
+ +		pr_debug("%s: could not get root dentry!\n",__func__);
+ +		return -ENOMEM;
+ +	}
+ +	root->d_fsdata = sysfs_root_sd;
+ +	sb->s_root = root;
+ +	sb->s_d_op = &sysfs_dentry_ops;
+ +	return 0;
+ +}
+ +
+ +static int sysfs_test_super(struct super_block *sb, void *data)
+ +{
+ +	struct sysfs_super_info *sb_info = sysfs_info(sb);
+ +	struct sysfs_super_info *info = data;
+ +	enum kobj_ns_type type;
+ +	int found = 1;
+ +
+ +	for (type = KOBJ_NS_TYPE_NONE; type < KOBJ_NS_TYPES; type++) {
+ +		if (sb_info->ns[type] != info->ns[type])
+ +			found = 0;
+ +	}
+ +	return found;
+ +}
+ +
+ +static int sysfs_set_super(struct super_block *sb, void *data)
+ +{
+ +	int error;
+ +	error = set_anon_super(sb, data);
+ +	if (!error)
+ +		sb->s_fs_info = data;
+ +	return error;
+ +}
+ +
+ +static void free_sysfs_super_info(struct sysfs_super_info *info)
+ +{
+ +	int type;
+ +	for (type = KOBJ_NS_TYPE_NONE; type < KOBJ_NS_TYPES; type++)
+ +		kobj_ns_drop(type, info->ns[type]);
+ +	kfree(info);
+ +}
+ +
+ +static struct dentry *sysfs_mount(struct file_system_type *fs_type,
+ +	int flags, const char *dev_name, void *data)
+ +{
+ +	struct sysfs_super_info *info;
+ +	enum kobj_ns_type type;
+ +	struct super_block *sb;
+ +	int error;
+ +
+ +	if (!(flags & MS_KERNMOUNT) && !current_user_ns()->may_mount_sysfs)
+ +		return ERR_PTR(-EPERM);
+ +
+ +	info = kzalloc(sizeof(*info), GFP_KERNEL);
+ +	if (!info)
+ +		return ERR_PTR(-ENOMEM);
+ +
+ +	for (type = KOBJ_NS_TYPE_NONE; type < KOBJ_NS_TYPES; type++)
+ +		info->ns[type] = kobj_ns_grab_current(type);
+ +
+ +	sb = sget(fs_type, sysfs_test_super, sysfs_set_super, flags, info);
+ +	if (IS_ERR(sb) || sb->s_fs_info != info)
+ +		free_sysfs_super_info(info);
+ +	if (IS_ERR(sb))
+ +		return ERR_CAST(sb);
+ +	if (!sb->s_root) {
+ +		error = sysfs_fill_super(sb);
+ +		if (error) {
+ +			deactivate_locked_super(sb);
+ +			return ERR_PTR(error);
+ +		}
+ +		sb->s_flags |= MS_ACTIVE;
+  	}
+  
+++<<<<<<< HEAD
+ +	return dget(sb->s_root);
+++=======
++ 	ns = kobj_ns_grab_current(KOBJ_NS_TYPE_NET);
++ 	root = kernfs_mount_ns(fs_type, flags, sysfs_root,
++ 				SYSFS_MAGIC, &new_sb, ns);
++ 	if (IS_ERR(root) || !new_sb)
++ 		kobj_ns_drop(KOBJ_NS_TYPE_NET, ns);
++ 	else if (new_sb)
++ 		/* Userspace would break if executables appear on sysfs */
++ 		root->d_sb->s_iflags |= SB_I_NOEXEC;
++ 
++ 	return root;
+++>>>>>>> 90f8572b0f02 (vfs: Commit to never having exectuables on proc and sysfs.)
+  }
+  
+  static void sysfs_kill_sb(struct super_block *sb)
+diff --cc include/linux/fs.h
+index ecd81bb56cab,42912f8d286e..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -1396,8 -1242,9 +1396,14 @@@ struct mm_struct
+  #define UMOUNT_NOFOLLOW	0x00000008	/* Don't follow symlink on umount */
+  #define UMOUNT_UNUSED	0x80000000	/* Flag guaranteed to be unused */
+  
+++<<<<<<< HEAD
+ +extern struct list_head super_blocks;
+ +extern spinlock_t sb_lock;
+++=======
++ /* sb->s_iflags */
++ #define SB_I_CGROUPWB	0x00000001	/* cgroup-aware writeback enabled */
++ #define SB_I_NOEXEC	0x00000002	/* Ignore executables on this fs */
+++>>>>>>> 90f8572b0f02 (vfs: Commit to never having exectuables on proc and sysfs.)
+  
+  /* Possible states of 'frozen' field */
+  enum {
+@@@ -3237,29 -2989,48 +3243,31 @@@ static inline void inode_has_no_xattr(s
+  		inode->i_flags |= S_NOSEC;
+  }
+  
+ -static inline bool is_root_inode(struct inode *inode)
+ +static inline const struct inode_operations_wrapper *get_iop_wrapper(struct inode *inode,
+ +								     unsigned version)
+  {
+ -	return inode == inode->i_sb->s_root->d_inode;
+ +	const struct inode_operations_wrapper *wrapper;
+ +		
+ +	if (!IS_IOPS_WRAPPER(inode))
+ +		return NULL;
+ +	wrapper = container_of(inode->i_op, const struct inode_operations_wrapper, ops);
+ +	if (wrapper->version < version)
+ +		return NULL;
+ +	return wrapper;
+  }
+  
+ -static inline bool dir_emit(struct dir_context *ctx,
+ -			    const char *name, int namelen,
+ -			    u64 ino, unsigned type)
+ -{
+ -	return ctx->actor(ctx, name, namelen, ctx->pos, ino, type) == 0;
+ -}
+ -static inline bool dir_emit_dot(struct file *file, struct dir_context *ctx)
+ +static inline iop_rename2_t get_rename2_iop(struct inode *inode)
+  {
+ -	return ctx->actor(ctx, ".", 1, ctx->pos,
+ -			  file->f_path.dentry->d_inode->i_ino, DT_DIR) == 0;
+ +	const struct inode_operations_wrapper *wrapper = get_iop_wrapper(inode, 0);
+ +	return wrapper ? wrapper->rename2 : NULL;
+  }
+ -static inline bool dir_emit_dotdot(struct file *file, struct dir_context *ctx)
+ -{
+ -	return ctx->actor(ctx, "..", 2, ctx->pos,
+ -			  parent_ino(file->f_path.dentry), DT_DIR) == 0;
+ -}
+ -static inline bool dir_emit_dots(struct file *file, struct dir_context *ctx)
+ -{
+ -	if (ctx->pos == 0) {
+ -		if (!dir_emit_dot(file, ctx))
+ -			return false;
+ -		ctx->pos = 1;
+ -	}
+ -	if (ctx->pos == 1) {
+ -		if (!dir_emit_dotdot(file, ctx))
+ -			return false;
+ -		ctx->pos = 2;
+ -	}
+ -	return true;
+ -}
+ -static inline bool dir_relax(struct inode *inode)
+ +
+ +static inline iop_dentry_open_t get_dentry_open_iop(struct inode *inode)
+  {
+ -	mutex_unlock(&inode->i_mutex);
+ -	mutex_lock(&inode->i_mutex);
+ -	return !IS_DEADDIR(inode);
+ +	const struct inode_operations_wrapper *wrapper = get_iop_wrapper(inode, 0);
+ +	return wrapper ? wrapper->dentry_open : NULL;
+  }
+  
++ extern bool path_noexec(const struct path *path);
++ 
+  #endif /* _LINUX_FS_H */
+* Unmerged path fs/exec.c
+diff --git a/fs/open.c b/fs/open.c
+index 6b92616b6787..10ae1ea84d21 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -377,7 +377,7 @@ retry:
+ 		 * with the "noexec" flag.
+ 		 */
+ 		res = -EACCES;
+-		if (path.mnt->mnt_flags & MNT_NOEXEC)
++		if (path_noexec(&path))
+ 			goto out_path_release;
+ 	}
+ 
+diff --git a/fs/proc/root.c b/fs/proc/root.c
+index 3a48c1b05b1a..3a4d30d306bc 100644
+--- a/fs/proc/root.c
++++ b/fs/proc/root.c
+@@ -132,6 +132,8 @@ static struct dentry *proc_mount(struct file_system_type *fs_type,
+ 		}
+ 
+ 		sb->s_flags |= MS_ACTIVE;
++		/* User space would break if executables appear on proc */
++		sb->s_iflags |= SB_I_NOEXEC;
+ 	}
+ 
+ 	return dget(sb->s_root);
+* Unmerged path fs/sysfs/mount.c
+* Unmerged path include/linux/fs.h
+diff --git a/kernel/sys.c b/kernel/sys.c
+index 20c59a4e34c9..a2bc899ec647 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -1917,8 +1917,7 @@ static int prctl_set_mm_exe_file(struct mm_struct *mm, unsigned int fd)
+ 	 * overall picture.
+ 	 */
+ 	err = -EACCES;
+-	if (!S_ISREG(inode->i_mode)	||
+-	    exe.file->f_path.mnt->mnt_flags & MNT_NOEXEC)
++	if (!S_ISREG(inode->i_mode) || path_noexec(&exe.file->f_path))
+ 		goto exit;
+ 
+ 	err = inode_permission(inode, MAY_EXEC);
+diff --git a/mm/mmap.c b/mm/mmap.c
+index e69a736f3cf3..e26fc84c08c8 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -1415,7 +1415,7 @@ unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
+ 	 *  mounted, in which case we dont add PROT_EXEC.)
+ 	 */
+ 	if ((prot & PROT_READ) && (current->personality & READ_IMPLIES_EXEC))
+-		if (!(file && (file->f_path.mnt->mnt_flags & MNT_NOEXEC)))
++		if (!(file && path_noexec(&file->f_path)))
+ 			prot |= PROT_EXEC;
+ 
+ 	if (!len)
+@@ -1495,7 +1495,7 @@ unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
+ 		case MAP_PRIVATE:
+ 			if (!(file->f_mode & FMODE_READ))
+ 				return -EACCES;
+-			if (file->f_path.mnt->mnt_flags & MNT_NOEXEC) {
++			if (path_noexec(&file->f_path)) {
+ 				if (vm_flags & VM_EXEC)
+ 					return -EPERM;
+ 				vm_flags &= ~VM_MAYEXEC;
+diff --git a/mm/nommu.c b/mm/nommu.c
+index 9b6c2b5a762b..a47733bb2f48 100644
+--- a/mm/nommu.c
++++ b/mm/nommu.c
+@@ -1063,7 +1063,7 @@ static int validate_mmap_request(struct file *file,
+ 
+ 		/* handle executable mappings and implied executable
+ 		 * mappings */
+-		if (file->f_path.mnt->mnt_flags & MNT_NOEXEC) {
++		if (path_noexec(&file->f_path)) {
+ 			if (prot & PROT_EXEC)
+ 				return -EPERM;
+ 		}
+diff --git a/security/security.c b/security/security.c
+index 576b8827705a..d54607e09918 100644
+--- a/security/security.c
++++ b/security/security.c
+@@ -754,7 +754,7 @@ static inline unsigned long mmap_prot(struct file *file, unsigned long prot)
+ 	 * ditto if it's not on noexec mount, except that on !MMU we need
+ 	 * BDI_CAP_EXEC_MMAP (== VM_MAYEXEC) in this case
+ 	 */
+-	if (!(file->f_path.mnt->mnt_flags & MNT_NOEXEC)) {
++	if (!path_noexec(&file->f_path)) {
+ #ifndef CONFIG_MMU
+ 		unsigned long caps = 0;
+ 		struct address_space *mapping = file->f_mapping;
