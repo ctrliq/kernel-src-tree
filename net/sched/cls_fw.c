@@ -150,7 +150,6 @@ static bool fw_destroy(struct tcf_proto *tp, bool force)
 			call_rcu(&f->rcu, fw_delete_filter);
 		}
 	}
-	RCU_INIT_POINTER(tp->root, NULL);
 	kfree_rcu(head, rcu);
 	return true;
 }
