@@ -1,0 +1,236 @@
+x86/asm/memcpy_mcsafe: Return bytes remaining
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [x86] asm/memcpy_mcsafe: Return bytes remaining (Jeff Moyer) [1608674]
+Rebuild_FUZZ: 95.35%
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 60622d68227d6d71fdfba5fb39f7f3d44cdd8815
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/60622d68.failed
+
+Machine check safe memory copies are currently deployed in the pmem
+driver whenever reading from persistent memory media, so that -EIO is
+returned rather than triggering a kernel panic. While this protects most
+pmem accesses, it is not complete in the filesystem-dax case. When
+filesystem-dax is enabled reads may bypass the block layer and the
+driver via dax_iomap_actor() and its usage of copy_to_iter().
+
+In preparation for creating a copy_to_iter() variant that can handle
+machine checks, teach memcpy_mcsafe() to return the number of bytes
+remaining rather than -EFAULT when an exception occurs.
+
+Co-developed-by: Tony Luck <tony.luck@intel.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andy Lutomirski <luto@amacapital.net>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Tony Luck <tony.luck@intel.com>
+	Cc: hch@lst.de
+	Cc: linux-fsdevel@vger.kernel.org
+	Cc: linux-nvdimm@lists.01.org
+Link: http://lkml.kernel.org/r/152539238119.31796.14318473522414462886.stgit@dwillia2-desk3.amr.corp.intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 60622d68227d6d71fdfba5fb39f7f3d44cdd8815)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/string_64.h
+#	arch/x86/lib/memcpy_64.S
+#	drivers/nvdimm/pmem.c
+diff --cc arch/x86/include/asm/string_64.h
+index 7616dbb1c4ae,d33f92b9fa22..000000000000
+--- a/arch/x86/include/asm/string_64.h
++++ b/arch/x86/include/asm/string_64.h
+@@@ -64,9 -97,29 +64,16 @@@ char *strcpy(char *dest, const char *sr
+  char *strcat(char *dest, const char *src);
+  int strcmp(const char *cs, const char *ct);
+  
+ -#if defined(CONFIG_KASAN) && !defined(__SANITIZE_ADDRESS__)
+ -
+ -/*
+ - * For files that not instrumented (e.g. mm/slub.c) we
+ - * should use not instrumented version of mem* functions.
+ - */
+ -
+ -#undef memcpy
+ -#define memcpy(dst, src, len) __memcpy(dst, src, len)
+ -#define memmove(dst, src, len) __memmove(dst, src, len)
+ -#define memset(s, c, n) __memset(s, c, n)
+ -
+ -#ifndef __NO_FORTIFY
+ -#define __NO_FORTIFY /* FORTIFY_SOURCE uses __builtin_memcpy, etc. */
+ -#endif
+ -
+ -#endif
+ -
+  #define __HAVE_ARCH_MEMCPY_MCSAFE 1
+++<<<<<<< HEAD
+ +extern struct static_key mcsafe_key;
+ +__must_check int memcpy_mcsafe_unrolled(void *dst, const void *src, size_t cnt);
+++=======
++ __must_check unsigned long __memcpy_mcsafe(void *dst, const void *src,
++ 		size_t cnt);
++ DECLARE_STATIC_KEY_FALSE(mcsafe_key);
++ 
+++>>>>>>> 60622d68227d (x86/asm/memcpy_mcsafe: Return bytes remaining)
+  /**
+   * memcpy_mcsafe - copy memory with indication if a machine check happened
+   *
+diff --cc arch/x86/lib/memcpy_64.S
+index 36b962df086c,f01a88391c98..000000000000
+--- a/arch/x86/lib/memcpy_64.S
++++ b/arch/x86/lib/memcpy_64.S
+@@@ -299,25 -248,26 +299,39 @@@ ENTRY(memcpy_mcsafe_unrolled
+  .L_done_memcpy_trap:
+  	xorq %rax, %rax
+  	ret
+ -ENDPROC(__memcpy_mcsafe)
+ -EXPORT_SYMBOL_GPL(__memcpy_mcsafe)
+ +ENDPROC(memcpy_mcsafe_unrolled)
+  
+  	.section .fixup, "ax"
+- 	/* Return -EFAULT for any failure */
+- .L_memcpy_mcsafe_fail:
+- 	mov	$-EFAULT, %rax
++ 	/*
++ 	 * Return number of bytes not copied for any failure. Note that
++ 	 * there is no "tail" handling since the source buffer is 8-byte
++ 	 * aligned and poison is cacheline aligned.
++ 	 */
++ .E_read_words:
++ 	shll	$3, %ecx
++ .E_leading_bytes:
++ 	addl	%edx, %ecx
++ .E_trailing_bytes:
++ 	mov	%ecx, %eax
+  	ret
+  
+  	.previous
+  
+++<<<<<<< HEAD
+ +	_ASM_EXTABLE_FAULT(.L_copy_leading_bytes, .L_memcpy_mcsafe_fail)
+ +	_ASM_EXTABLE_FAULT(.L_cache_w0, .L_memcpy_mcsafe_fail)
+ +	_ASM_EXTABLE_FAULT(.L_cache_w1, .L_memcpy_mcsafe_fail)
+ +	_ASM_EXTABLE_FAULT(.L_cache_w2, .L_memcpy_mcsafe_fail)
+ +	_ASM_EXTABLE_FAULT(.L_cache_w3, .L_memcpy_mcsafe_fail)
+ +	_ASM_EXTABLE_FAULT(.L_cache_w4, .L_memcpy_mcsafe_fail)
+ +	_ASM_EXTABLE_FAULT(.L_cache_w5, .L_memcpy_mcsafe_fail)
+ +	_ASM_EXTABLE_FAULT(.L_cache_w6, .L_memcpy_mcsafe_fail)
+ +	_ASM_EXTABLE_FAULT(.L_cache_w7, .L_memcpy_mcsafe_fail)
+ +	_ASM_EXTABLE_FAULT(.L_copy_trailing_words, .L_memcpy_mcsafe_fail)
+ +	_ASM_EXTABLE_FAULT(.L_copy_trailing_bytes, .L_memcpy_mcsafe_fail)
+++=======
++ 	_ASM_EXTABLE_FAULT(.L_read_leading_bytes, .E_leading_bytes)
++ 	_ASM_EXTABLE_FAULT(.L_read_words, .E_read_words)
++ 	_ASM_EXTABLE_FAULT(.L_read_trailing_bytes, .E_trailing_bytes)
+++>>>>>>> 60622d68227d (x86/asm/memcpy_mcsafe: Return bytes remaining)
+  #endif
+diff --cc drivers/nvdimm/pmem.c
+index 3cb343008661,e023d6aa22b5..000000000000
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@@ -79,30 -82,48 +79,50 @@@ static int pmem_clear_poison(struct pme
+  static void write_pmem(void *pmem_addr, struct page *page,
+  		unsigned int off, unsigned int len)
+  {
+ -	unsigned int chunk;
+ -	void *mem;
+ +	void *mem = kmap_atomic(page);
+  
+ -	while (len) {
+ -		mem = kmap_atomic(page);
+ -		chunk = min_t(unsigned int, len, PAGE_SIZE);
+ -		memcpy_flushcache(pmem_addr, mem + off, chunk);
+ -		kunmap_atomic(mem);
+ -		len -= chunk;
+ -		off = 0;
+ -		page++;
+ -		pmem_addr += PAGE_SIZE;
+ -	}
+ +	memcpy_flushcache(pmem_addr, mem + off, len);
+ +	kunmap_atomic(mem);
+  }
+  
+ -static blk_status_t read_pmem(struct page *page, unsigned int off,
+ +static int read_pmem(struct page *page, unsigned int off,
+  		void *pmem_addr, unsigned int len)
+  {
+++<<<<<<< HEAD
+ +	int rc;
+ +	void *mem = kmap_atomic(page);
+ +
+ +	rc = memcpy_mcsafe(mem + off, pmem_addr, len);
+ +	kunmap_atomic(mem);
+ +	if (rc)
+ +		return -EIO;
+ +	return 0;
+++=======
++ 	unsigned int chunk;
++ 	unsigned long rem;
++ 	void *mem;
++ 
++ 	while (len) {
++ 		mem = kmap_atomic(page);
++ 		chunk = min_t(unsigned int, len, PAGE_SIZE);
++ 		rem = memcpy_mcsafe(mem + off, pmem_addr, chunk);
++ 		kunmap_atomic(mem);
++ 		if (rem)
++ 			return BLK_STS_IOERR;
++ 		len -= chunk;
++ 		off = 0;
++ 		page++;
++ 		pmem_addr += PAGE_SIZE;
++ 	}
++ 	return BLK_STS_OK;
+++>>>>>>> 60622d68227d (x86/asm/memcpy_mcsafe: Return bytes remaining)
+  }
+  
+ -static blk_status_t pmem_do_bvec(struct pmem_device *pmem, struct page *page,
+ -			unsigned int len, unsigned int off, bool is_write,
+ +static int pmem_do_bvec(struct pmem_device *pmem, struct page *page,
+ +			unsigned int len, unsigned int off, int rw,
+  			sector_t sector)
+  {
+ -	blk_status_t rc = BLK_STS_OK;
+ +	int rc = 0;
+  	bool bad_pmem = false;
+  	phys_addr_t pmem_off = sector * 512 + pmem->data_offset;
+  	void *pmem_addr = pmem->virt_addr + pmem_off;
+* Unmerged path arch/x86/include/asm/string_64.h
+* Unmerged path arch/x86/lib/memcpy_64.S
+diff --git a/drivers/nvdimm/claim.c b/drivers/nvdimm/claim.c
+index ef22921e03bd..08662eafa533 100644
+--- a/drivers/nvdimm/claim.c
++++ b/drivers/nvdimm/claim.c
+@@ -276,7 +276,8 @@ static int nsio_rw_bytes(struct nd_namespace_common *ndns,
+ 	if (rw == READ) {
+ 		if (unlikely(is_bad_pmem(&nsio->bb, sector, sz_align)))
+ 			return -EIO;
+-		return memcpy_mcsafe(buf, nsio->addr + offset, size);
++		if (memcpy_mcsafe(buf, nsio->addr + offset, size) != 0)
++			return -EIO;
+ 	}
+ 
+ 	if (unlikely(is_bad_pmem(&nsio->bb, sector, sz_align))) {
+* Unmerged path drivers/nvdimm/pmem.c
+diff --git a/include/linux/string.h b/include/linux/string.h
+index 36392cc2986b..31c64befcec8 100644
+--- a/include/linux/string.h
++++ b/include/linux/string.h
+@@ -145,8 +145,8 @@ extern int memcmp(const void *,const void *,__kernel_size_t);
+ extern void * memchr(const void *,int,__kernel_size_t);
+ #endif
+ #ifndef __HAVE_ARCH_MEMCPY_MCSAFE
+-static inline __must_check int memcpy_mcsafe(void *dst, const void *src,
+-		size_t cnt)
++static inline __must_check unsigned long memcpy_mcsafe(void *dst,
++		const void *src, size_t cnt)
+ {
+ 	memcpy(dst, src, cnt);
+ 	return 0;
