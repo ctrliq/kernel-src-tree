@@ -1,0 +1,256 @@
+perf test: Test the BPF prologue adding infrastructure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Wang Nan <wangnan0@huawei.com>
+commit bbb7d4925a05ecd5bbfdbc1147d402b0db203a5a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/bbb7d492.failed
+
+This patch introduces a new BPF script to test the BPF prologue adding
+routines. The new script probes at null_lseek, which is the function pointer
+used when we try to lseek on '/dev/null'.
+
+The null_lseek function is chosen because it is used by function pointers, so
+we don't need to consider inlining and LTO.
+
+By extracting file->f_mode, bpf-script-test-prologue.c should know whether the
+file is writable or readonly. According to llseek_loop() and
+bpf-script-test-prologue.c, one fourth of total lseeks should be collected.
+
+Committer note:
+
+Testing it:
+
+  # perf test -v BPF
+  <SNIP>
+  Kernel build dir is set to /lib/modules/4.3.0+/build
+  set env: KBUILD_DIR=/lib/modules/4.3.0+/build
+  unset env: KBUILD_OPTS
+  include option is set to  -nostdinc -isystem /usr/lib/gcc/x86_64-redhat-linux/4.9.2/include -I/home/git/linux/arch/x86/include -Iarch/x86/include/generated/uapi -Iarch/x86/include/generated  -I/home/git/linux/include -Iinclude -I/home/git/linux/arch/x86/include/uapi -Iarch/x86/include/generated/uapi -I/home/git/linux/include/uapi -Iinclude/generated/uapi -include /home/git/linux/include/linux/kconfig.h
+  set env: NR_CPUS=4
+  set env: LINUX_VERSION_CODE=0x40300
+  set env: CLANG_EXEC=/usr/libexec/icecc/bin/clang
+  set env: CLANG_OPTIONS=-xc
+  set env: KERNEL_INC_OPTIONS= -nostdinc -isystem /usr/lib/gcc/x86_64-redhat-linux/4.9.2/include -I/home/git/linux/arch/x86/include -Iarch/x86/include/generated/uapi -Iarch/x86/include/generated  -I/home/git/linux/include -Iinclude -I/home/git/linux/arch/x86/include/uapi -Iarch/x86/include/generated/uapi -I/home/git/linux/include/uapi -Iinclude/generated/uapi -include /home/git/linux/include/linux/kconfig.h
+  set env: WORKING_DIR=/lib/modules/4.3.0+/build
+  set env: CLANG_SOURCE=-
+  llvm compiling command template: echo '/*
+   * bpf-script-test-prologue.c
+   * Test BPF prologue
+   */
+  #ifndef LINUX_VERSION_CODE
+  # error Need LINUX_VERSION_CODE
+  # error Example: for 4.2 kernel, put 'clang-opt="-DLINUX_VERSION_CODE=0x40200" into llvm section of ~/.perfconfig'
+  #endif
+  #define SEC(NAME) __attribute__((section(NAME), used))
+
+  #include <uapi/linux/fs.h>
+
+  #define FMODE_READ		0x1
+  #define FMODE_WRITE		0x2
+
+  static void (*bpf_trace_printk)(const char *fmt, int fmt_size, ...) =
+	  (void *) 6;
+
+  SEC("func=null_lseek file->f_mode offset orig")
+  int bpf_func__null_lseek(void *ctx, int err, unsigned long f_mode,
+			   unsigned long offset, unsigned long orig)
+  {
+	  if (err)
+		  return 0;
+	  if (f_mode & FMODE_WRITE)
+		  return 0;
+	  if (offset & 1)
+		  return 0;
+	  if (orig == SEEK_CUR)
+		  return 0;
+	  return 1;
+  }
+
+  char _license[] SEC("license") = "GPL";
+  int _version SEC("version") = LINUX_VERSION_CODE;
+  ' | $CLANG_EXEC -D__KERNEL__ -D__NR_CPUS__=$NR_CPUS -DLINUX_VERSION_CODE=$LINUX_VERSION_CODE $CLANG_OPTIONS $KERNEL_INC_OPTIONS -Wno-unused-value -Wno-pointer-sign -working-directory $WORKING_DIR -c "$CLANG_SOURCE" -target bpf -O2 -o -
+  libbpf: loading object '[bpf_prologue_test]' from buffer
+  libbpf: section .strtab, size 135, link 0, flags 0, type=3
+  libbpf: section .text, size 0, link 0, flags 6, type=1
+  libbpf: section .data, size 0, link 0, flags 3, type=1
+  libbpf: section .bss, size 0, link 0, flags 3, type=8
+  libbpf: section func=null_lseek file->f_mode offset orig, size 112, link 0, flags 6, type=1
+  libbpf: found program func=null_lseek file->f_mode offset orig
+  libbpf: section license, size 4, link 0, flags 3, type=1
+  libbpf: license of [bpf_prologue_test] is GPL
+  libbpf: section version, size 4, link 0, flags 3, type=1
+  libbpf: kernel version of [bpf_prologue_test] is 40300
+  libbpf: section .symtab, size 168, link 1, flags 0, type=2
+  bpf: config program 'func=null_lseek file->f_mode offset orig'
+  symbol:null_lseek file:(null) line:0 offset:0 return:0 lazy:(null)
+  parsing arg: file->f_mode into file, f_mode(1)
+  parsing arg: offset into offset
+  parsing arg: orig into orig
+  bpf: config 'func=null_lseek file->f_mode offset orig' is ok
+  Looking at the vmlinux_path (7 entries long)
+  Using /lib/modules/4.3.0+/build/vmlinux for symbols
+  Open Debuginfo file: /lib/modules/4.3.0+/build/vmlinux
+  Try to find probe point from debuginfo.
+  Matched function: null_lseek
+  Probe point found: null_lseek+0
+  Searching 'file' variable in context.
+  Converting variable file into trace event.
+  converting f_mode in file
+  f_mode type is unsigned int.
+  Searching 'offset' variable in context.
+  Converting variable offset into trace event.
+  offset type is long long int.
+  Searching 'orig' variable in context.
+  Converting variable orig into trace event.
+  orig type is int.
+  Found 1 probe_trace_events.
+  Opening /sys/kernel/debug/tracing//kprobe_events write=1
+  Writing event: p:perf_bpf_probe/func _text+4840528 f_mode=+68(%di):u32 offset=%si:s64 orig=%dx:s32
+  libbpf: don't need create maps for [bpf_prologue_test]
+  prologue: pass validation
+  prologue: slow path
+  prologue: fetch arg 0, base reg is %di
+  prologue: arg 0: offset 68
+  prologue: fetch arg 1, base reg is %si
+  prologue: fetch arg 2, base reg is %dx
+  add bpf event perf_bpf_probe:func and attach bpf program 3
+  adding perf_bpf_probe:func
+  adding perf_bpf_probe:func to 0x51672c0
+  mmap size 1052672B
+  Opening /sys/kernel/debug/tracing//kprobe_events write=1
+  Opening /sys/kernel/debug/tracing//uprobe_events write=1
+  Parsing probe_events: p:perf_bpf_probe/func _text+4840528 f_mode=+68(%di):u32 offset=%si:s64 orig=%dx:s32
+  Group:perf_bpf_probe Event:func probe:p
+  Writing event: -:perf_bpf_probe/func
+  test child finished with 0
+  ---- end ----
+  Test BPF filter: Ok
+  #
+
+	Signed-off-by: Wang Nan <wangnan0@huawei.com>
+	Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Alexei Starovoitov <ast@kernel.org>
+	Cc: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+	Cc: Zefan Li <lizefan@huawei.com>
+	Cc: pi3orama@163.com
+Link: http://lkml.kernel.org/r/1447675815-166222-13-git-send-email-wangnan0@huawei.com
+[ Added tools/perf/tests/llvm-src-prologue.c to .gitignore ]
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit bbb7d4925a05ecd5bbfdbc1147d402b0db203a5a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/tests/.gitignore
+#	tools/perf/tests/Build
+#	tools/perf/tests/bpf.c
+#	tools/perf/tests/llvm.c
+#	tools/perf/tests/llvm.h
+diff --cc tools/perf/tests/Build
+index 40bdfc01aafe,0ff8a973b81c..000000000000
+--- a/tools/perf/tests/Build
++++ b/tools/perf/tests/Build
+@@@ -31,21 -31,32 +31,51 @@@ perf-y += sample-parsing.
+  perf-y += parse-no-sample-id-all.o
+  perf-y += kmod-path.o
+  perf-y += thread-map.o
+++<<<<<<< HEAD
+++=======
++ perf-y += llvm.o llvm-src-base.o llvm-src-kbuild.o llvm-src-prologue.o
++ perf-y += bpf.o
+++>>>>>>> bbb7d4925a05 (perf test: Test the BPF prologue adding infrastructure)
+  perf-y += topology.o
+ +perf-y += mem.o
+ +perf-y += cpumap.o
+ +perf-y += stat.o
+ +perf-y += event_update.o
+ +perf-y += event-times.o
+ +perf-y += expr.o
+ +perf-y += backward-ring-buffer.o
+ +perf-y += sdt.o
+ +perf-y += is_printable_array.o
+ +perf-y += bitmap.o
+ +perf-y += perf-hooks.o
+ +perf-y += unit_number__scnprintf.o
+  
+++<<<<<<< HEAD
+ +ifeq ($(SRCARCH),$(filter $(SRCARCH),x86 arm arm64 powerpc))
+++=======
++ $(OUTPUT)tests/llvm-src-base.c: tests/bpf-script-example.c
++ 	$(call rule_mkdir)
++ 	$(Q)echo '#include <tests/llvm.h>' > $@
++ 	$(Q)echo 'const char test_llvm__bpf_base_prog[] =' >> $@
++ 	$(Q)sed -e 's/"/\\"/g' -e 's/\(.*\)/"\1\\n"/g' $< >> $@
++ 	$(Q)echo ';' >> $@
++ 
++ $(OUTPUT)tests/llvm-src-kbuild.c: tests/bpf-script-test-kbuild.c
++ 	$(call rule_mkdir)
++ 	$(Q)echo '#include <tests/llvm.h>' > $@
++ 	$(Q)echo 'const char test_llvm__bpf_test_kbuild_prog[] =' >> $@
++ 	$(Q)sed -e 's/"/\\"/g' -e 's/\(.*\)/"\1\\n"/g' $< >> $@
++ 	$(Q)echo ';' >> $@
++ 
++ $(OUTPUT)tests/llvm-src-prologue.c: tests/bpf-script-test-prologue.c
++ 	$(call rule_mkdir)
++ 	$(Q)echo '#include <tests/llvm.h>' > $@
++ 	$(Q)echo 'const char test_llvm__bpf_test_prologue_prog[] =' >> $@
++ 	$(Q)sed -e 's/"/\\"/g' -e 's/\(.*\)/"\1\\n"/g' $< >> $@
++ 	$(Q)echo ';' >> $@
++ 
++ ifeq ($(ARCH),$(filter $(ARCH),x86 arm arm64))
+++>>>>>>> bbb7d4925a05 (perf test: Test the BPF prologue adding infrastructure)
+  perf-$(CONFIG_DWARF_UNWIND) += dwarf-unwind.o
+  endif
+  
+* Unmerged path tools/perf/tests/.gitignore
+* Unmerged path tools/perf/tests/bpf.c
+* Unmerged path tools/perf/tests/llvm.c
+* Unmerged path tools/perf/tests/llvm.h
+* Unmerged path tools/perf/tests/.gitignore
+* Unmerged path tools/perf/tests/Build
+diff --git a/tools/perf/tests/bpf-script-test-prologue.c b/tools/perf/tests/bpf-script-test-prologue.c
+new file mode 100644
+index 000000000000..7230e62c70fc
+--- /dev/null
++++ b/tools/perf/tests/bpf-script-test-prologue.c
+@@ -0,0 +1,35 @@
++/*
++ * bpf-script-test-prologue.c
++ * Test BPF prologue
++ */
++#ifndef LINUX_VERSION_CODE
++# error Need LINUX_VERSION_CODE
++# error Example: for 4.2 kernel, put 'clang-opt="-DLINUX_VERSION_CODE=0x40200" into llvm section of ~/.perfconfig'
++#endif
++#define SEC(NAME) __attribute__((section(NAME), used))
++
++#include <uapi/linux/fs.h>
++
++#define FMODE_READ		0x1
++#define FMODE_WRITE		0x2
++
++static void (*bpf_trace_printk)(const char *fmt, int fmt_size, ...) =
++	(void *) 6;
++
++SEC("func=null_lseek file->f_mode offset orig")
++int bpf_func__null_lseek(void *ctx, int err, unsigned long f_mode,
++			 unsigned long offset, unsigned long orig)
++{
++	if (err)
++		return 0;
++	if (f_mode & FMODE_WRITE)
++		return 0;
++	if (offset & 1)
++		return 0;
++	if (orig == SEEK_CUR)
++		return 0;
++	return 1;
++}
++
++char _license[] SEC("license") = "GPL";
++int _version SEC("version") = LINUX_VERSION_CODE;
+* Unmerged path tools/perf/tests/bpf.c
+* Unmerged path tools/perf/tests/llvm.c
+* Unmerged path tools/perf/tests/llvm.h
