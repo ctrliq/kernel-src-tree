@@ -1,0 +1,286 @@
+amd-xgbe: Request IRQs only after driver is fully setup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Lendacky, Thomas <Thomas.Lendacky@amd.com>
+commit c30e76a728beb5bbfff0ddeb573e28927853d4b8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/c30e76a7.failed
+
+It is possible that the hardware may not have been properly shutdown
+before this driver gets control, through use by firmware, for example.
+Until the driver is loaded, interrupts associated with the hardware
+could go pending. When the IRQs are requested napi support has not
+been initialized yet, but the ISR will get control and schedule napi
+processing resulting in a kernel panic because the poll routine has not
+been set.
+
+Adjust the code so that the driver is fully ready to handle and process
+interrupts as soon as the IRQs are requested. This involves requesting
+and freeing IRQs during start and stop processing and ordering the napi
+add and delete calls appropriately.
+
+Also adjust the powerup and powerdown routines to match the start and
+stop routines in regards to the ordering of tasks, including napi
+related calls.
+
+	Signed-off-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c30e76a728beb5bbfff0ddeb573e28927853d4b8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+diff --cc drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index add1b5ac7b5d,885b02b5be07..000000000000
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@@ -408,12 -590,87 +408,74 @@@ static void xgbe_napi_enable(struct xgb
+  
+  static void xgbe_napi_disable(struct xgbe_prv_data *pdata, unsigned int del)
+  {
+ -	struct xgbe_channel *channel;
+ -	unsigned int i;
+ -
+ -	if (pdata->per_channel_irq) {
+ -		channel = pdata->channel;
+ -		for (i = 0; i < pdata->channel_count; i++, channel++) {
+ -			napi_disable(&channel->napi);
+ -
+ -			if (del)
+ -				netif_napi_del(&channel->napi);
+ -		}
+ -	} else {
+ -		napi_disable(&pdata->napi);
+ +	napi_disable(&pdata->napi);
+  
+ -		if (del)
+ -			netif_napi_del(&pdata->napi);
+ -	}
+ +	if (del)
+ +		netif_napi_del(&pdata->napi);
+  }
+  
++ static int xgbe_request_irqs(struct xgbe_prv_data *pdata)
++ {
++ 	struct xgbe_channel *channel;
++ 	struct net_device *netdev = pdata->netdev;
++ 	unsigned int i;
++ 	int ret;
++ 
++ 	ret = devm_request_irq(pdata->dev, pdata->dev_irq, xgbe_isr, 0,
++ 			       netdev->name, pdata);
++ 	if (ret) {
++ 		netdev_alert(netdev, "error requesting irq %d\n",
++ 			     pdata->dev_irq);
++ 		return ret;
++ 	}
++ 
++ 	if (!pdata->per_channel_irq)
++ 		return 0;
++ 
++ 	channel = pdata->channel;
++ 	for (i = 0; i < pdata->channel_count; i++, channel++) {
++ 		snprintf(channel->dma_irq_name,
++ 			 sizeof(channel->dma_irq_name) - 1,
++ 			 "%s-TxRx-%u", netdev_name(netdev),
++ 			 channel->queue_index);
++ 
++ 		ret = devm_request_irq(pdata->dev, channel->dma_irq,
++ 				       xgbe_dma_isr, 0,
++ 				       channel->dma_irq_name, channel);
++ 		if (ret) {
++ 			netdev_alert(netdev, "error requesting irq %d\n",
++ 				     channel->dma_irq);
++ 			goto err_irq;
++ 		}
++ 	}
++ 
++ 	return 0;
++ 
++ err_irq:
++ 	/* Using an unsigned int, 'i' will go to UINT_MAX and exit */
++ 	for (i--, channel--; i < pdata->channel_count; i--, channel--)
++ 		devm_free_irq(pdata->dev, channel->dma_irq, channel);
++ 
++ 	devm_free_irq(pdata->dev, pdata->dev_irq, pdata);
++ 
++ 	return ret;
++ }
++ 
++ static void xgbe_free_irqs(struct xgbe_prv_data *pdata)
++ {
++ 	struct xgbe_channel *channel;
++ 	unsigned int i;
++ 
++ 	devm_free_irq(pdata->dev, pdata->dev_irq, pdata);
++ 
++ 	if (!pdata->per_channel_irq)
++ 		return;
++ 
++ 	channel = pdata->channel;
++ 	for (i = 0; i < pdata->channel_count; i++, channel++)
++ 		devm_free_irq(pdata->dev, channel->dma_irq, channel);
++ }
++ 
+  void xgbe_init_tx_coalesce(struct xgbe_prv_data *pdata)
+  {
+  	struct xgbe_hw_if *hw_if = &pdata->hw_if;
+@@@ -611,13 -991,28 +685,36 @@@ static void xgbe_stop(struct xgbe_prv_d
+  	hw_if->disable_tx(pdata);
+  	hw_if->disable_rx(pdata);
+  
+++<<<<<<< HEAD
+++=======
++ 	xgbe_free_irqs(pdata);
++ 
++ 	xgbe_napi_disable(pdata, 1);
++ 
++ 	phy_stop(pdata->phydev);
++ 
++ 	hw_if->exit(pdata);
++ 
++ 	channel = pdata->channel;
++ 	for (i = 0; i < pdata->channel_count; i++, channel++) {
++ 		if (!channel->tx_ring)
++ 			continue;
++ 
++ 		txq = netdev_get_tx_queue(netdev, channel->queue_index);
++ 		netdev_tx_reset_queue(txq);
++ 	}
++ 
+++>>>>>>> c30e76a728be (amd-xgbe: Request IRQs only after driver is fully setup)
+  	DBGPR("<--xgbe_stop\n");
+  }
+  
+  static void xgbe_restart_dev(struct xgbe_prv_data *pdata)
+  {
+++<<<<<<< HEAD
+ +	struct xgbe_hw_if *hw_if = &pdata->hw_if;
+ +
+++=======
+++>>>>>>> c30e76a728be (amd-xgbe: Request IRQs only after driver is fully setup)
+  	DBGPR("-->xgbe_restart_dev\n");
+  
+  	/* If not running, "restart" will happen on open */
+@@@ -625,14 -1020,10 +722,14 @@@
+  		return;
+  
+  	xgbe_stop(pdata);
+++<<<<<<< HEAD
+ +	synchronize_irq(pdata->irq_number);
+++=======
+++>>>>>>> c30e76a728be (amd-xgbe: Request IRQs only after driver is fully setup)
+  
+ -	xgbe_free_tx_data(pdata);
+ -	xgbe_free_rx_data(pdata);
+ +	xgbe_free_tx_skbuff(pdata);
+ +	xgbe_free_rx_skbuff(pdata);
+  
+- 	/* Issue software reset to device */
+- 	hw_if->exit(pdata);
+- 
+  	xgbe_start(pdata);
+  
+  	DBGPR("<--xgbe_restart_dev\n");
+@@@ -775,40 -1384,39 +871,47 @@@ static int xgbe_open(struct net_device 
+  	/* Allocate the ring descriptors and buffers */
+  	ret = desc_if->alloc_ring_resources(pdata);
+  	if (ret)
+ -		goto err_channels;
+ +		goto err_clk;
+  
+ -	/* Initialize the device restart and Tx timestamp work struct */
+ +	/* Initialize the device restart work struct */
+  	INIT_WORK(&pdata->restart_work, xgbe_restart);
+ -	INIT_WORK(&pdata->tx_tstamp_work, xgbe_tx_tstamp);
+  
+++<<<<<<< HEAD
+ +	/* Request interrupts */
+ +	ret = devm_request_irq(pdata->dev, netdev->irq, xgbe_isr, 0,
+ +			       netdev->name, pdata);
+ +	if (ret) {
+ +		netdev_alert(netdev, "error requesting irq %d\n",
+ +			     pdata->irq_number);
+ +		goto err_irq;
+ +	}
+ +	pdata->irq_number = netdev->irq;
+ +
+++=======
+++>>>>>>> c30e76a728be (amd-xgbe: Request IRQs only after driver is fully setup)
+  	ret = xgbe_start(pdata);
+  	if (ret)
+- 		goto err_start;
++ 		goto err_rings;
+  
+  	DBGPR("<--xgbe_open\n");
+  
+  	return 0;
+  
+ -err_rings:
+ -	desc_if->free_ring_resources(pdata);
+ -
+ -err_channels:
+ -	xgbe_free_channels(pdata);
+++<<<<<<< HEAD
+ +err_start:
+ +	hw_if->exit(pdata);
+  
+ -err_ptpclk:
+ -	clk_disable_unprepare(pdata->ptpclk);
+ +	devm_free_irq(pdata->dev, pdata->irq_number, pdata);
+ +	pdata->irq_number = 0;
+  
+ -err_sysclk:
+ -	clk_disable_unprepare(pdata->sysclk);
+ +err_irq:
+++=======
+++err_rings:
+++>>>>>>> c30e76a728be (amd-xgbe: Request IRQs only after driver is fully setup)
+ +	desc_if->free_ring_resources(pdata);
+  
+ -err_phy_init:
+ -	xgbe_phy_exit(pdata);
+ +err_clk:
+ +	clk_disable_unprepare(pdata->sysclock);
+  
+  	return ret;
+  }
+@@@ -824,20 -1431,18 +926,35 @@@ static int xgbe_close(struct net_devic
+  	/* Stop the device */
+  	xgbe_stop(pdata);
+  
+++<<<<<<< HEAD
+ +	/* Issue software reset to device */
+ +	hw_if->exit(pdata);
+ +
+ +	/* Free all the ring data */
+ +	desc_if->free_ring_resources(pdata);
+ +
+ +	/* Release the interrupt */
+ +	if (pdata->irq_number != 0) {
+ +		devm_free_irq(pdata->dev, pdata->irq_number, pdata);
+ +		pdata->irq_number = 0;
+ +	}
+ +
+ +	/* Disable the clock */
+ +	clk_disable_unprepare(pdata->sysclock);
+++=======
++ 	/* Free the ring descriptors and buffers */
++ 	desc_if->free_ring_resources(pdata);
++ 
++ 	/* Free the channel and ring structures */
++ 	xgbe_free_channels(pdata);
++ 
++ 	/* Disable the clocks */
++ 	clk_disable_unprepare(pdata->ptpclk);
++ 	clk_disable_unprepare(pdata->sysclk);
++ 
++ 	/* Release the phy */
++ 	xgbe_phy_exit(pdata);
+++>>>>>>> c30e76a728be (amd-xgbe: Request IRQs only after driver is fully setup)
+  
+  	DBGPR("<--xgbe_close\n");
+  
+* Unmerged path drivers/net/ethernet/amd/xgbe/xgbe-drv.c
