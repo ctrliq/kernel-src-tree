@@ -1,0 +1,165 @@
+KVM: s390: Limit sthyi execution
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Janosch Frank <frankja@linux.vnet.ibm.com>
+commit 7d0a5e62411a9223512c6af2e4c08a2d7c00fa2e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/7d0a5e62.failed
+
+Store hypervisor information is a valid instruction not only in
+supervisor state but also in problem state, i.e. the guest's
+userspace. Its execution is not only computational and memory
+intensive, but also has to get hold of the ipte lock to write to the
+guest's memory.
+
+This lock is not intended to be held often and long, especially not
+from the untrusted guest userspace. Therefore we apply rate limiting
+of sthyi executions per VM.
+
+	Signed-off-by: Janosch Frank <frankja@linux.vnet.ibm.com>
+	Acked-by: David Hildenbrand <dahi@linux.vnet.ibm.com>
+	Signed-off-by: Christian Borntraeger <borntraeger@de.ibm.com>
+(cherry picked from commit 7d0a5e62411a9223512c6af2e4c08a2d7c00fa2e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/kvm_host.h
+#	arch/s390/kvm/kvm-s390.c
+#	arch/s390/kvm/sthyi.c
+diff --cc arch/s390/include/asm/kvm_host.h
+index 0aaab12c8aec,bcc20dc91ea8..000000000000
+--- a/arch/s390/include/asm/kvm_host.h
++++ b/arch/s390/include/asm/kvm_host.h
+@@@ -273,12 -571,93 +273,30 @@@ struct kvm_vm_stat 
+  struct kvm_arch_memory_slot {
+  };
+  
+ -struct s390_map_info {
+ -	struct list_head list;
+ -	__u64 guest_addr;
+ -	__u64 addr;
+ -	struct page *page;
+ -};
+ -
+ -struct s390_io_adapter {
+ -	unsigned int id;
+ -	int isc;
+ -	bool maskable;
+ -	bool masked;
+ -	bool swap;
+ -	struct rw_semaphore maps_lock;
+ -	struct list_head maps;
+ -	atomic_t nr_maps;
+ -};
+ -
+ -#define MAX_S390_IO_ADAPTERS ((MAX_ISC + 1) * 8)
+ -#define MAX_S390_ADAPTER_MAPS 256
+ -
+ -/* maximum size of facilities and facility mask is 2k bytes */
+ -#define S390_ARCH_FAC_LIST_SIZE_BYTE (1<<11)
+ -#define S390_ARCH_FAC_LIST_SIZE_U64 \
+ -	(S390_ARCH_FAC_LIST_SIZE_BYTE / sizeof(u64))
+ -#define S390_ARCH_FAC_MASK_SIZE_BYTE S390_ARCH_FAC_LIST_SIZE_BYTE
+ -#define S390_ARCH_FAC_MASK_SIZE_U64 \
+ -	(S390_ARCH_FAC_MASK_SIZE_BYTE / sizeof(u64))
+ -
+ -struct kvm_s390_cpu_model {
+ -	/* facility mask supported by kvm & hosting machine */
+ -	__u64 fac_mask[S390_ARCH_FAC_LIST_SIZE_U64];
+ -	/* facility list requested by guest (in dma page) */
+ -	__u64 *fac_list;
+ -	u64 cpuid;
+ -	unsigned short ibc;
+ -};
+ -
+ -struct kvm_s390_crypto {
+ -	struct kvm_s390_crypto_cb *crycb;
+ -	__u32 crycbd;
+ -	__u8 aes_kw;
+ -	__u8 dea_kw;
+ -};
+ -
+ -struct kvm_s390_crypto_cb {
+ -	__u8    reserved00[72];                 /* 0x0000 */
+ -	__u8    dea_wrapping_key_mask[24];      /* 0x0048 */
+ -	__u8    aes_wrapping_key_mask[32];      /* 0x0060 */
+ -	__u8    reserved80[128];                /* 0x0080 */
+ -};
+ -
+ -/*
+ - * sie_page2 has to be allocated as DMA because fac_list and crycb need
+ - * 31bit addresses in the sie control block.
+ - */
+ -struct sie_page2 {
+ -	__u64 fac_list[S390_ARCH_FAC_LIST_SIZE_U64];	/* 0x0000 */
+ -	struct kvm_s390_crypto_cb crycb;		/* 0x0800 */
+ -	u8 reserved900[0x1000 - 0x900];			/* 0x0900 */
+ -} __packed;
+ -
+  struct kvm_arch{
+ -	void *sca;
+ -	int use_esca;
+ -	rwlock_t sca_lock;
+ +	struct sca_block *sca;
+  	debug_info_t *dbf;
+  	struct kvm_s390_float_interrupt float_int;
+ -	struct kvm_device *flic;
+  	struct gmap *gmap;
+ -	unsigned long mem_limit;
+  	int css_support;
+++<<<<<<< HEAD
+++=======
++ 	int use_irqchip;
++ 	int use_cmma;
++ 	int user_cpu_state_ctrl;
++ 	int user_sigp;
++ 	int user_stsi;
++ 	struct s390_io_adapter *adapters[MAX_S390_IO_ADAPTERS];
++ 	wait_queue_head_t ipte_wq;
++ 	int ipte_lock_count;
++ 	struct mutex ipte_mutex;
++ 	struct ratelimit_state sthyi_limit;
++ 	spinlock_t start_stop_lock;
++ 	struct sie_page2 *sie_page2;
++ 	struct kvm_s390_cpu_model model;
++ 	struct kvm_s390_crypto crypto;
++ 	u64 epoch;
+++>>>>>>> 7d0a5e62411a (KVM: s390: Limit sthyi execution)
+  };
+  
+  #define KVM_HVA_ERR_BAD		(-1UL)
+diff --cc arch/s390/kvm/kvm-s390.c
+index 9b2d6973d202,44297ff53b44..000000000000
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@@ -257,9 -1151,20 +257,17 @@@ int kvm_arch_init_vm(struct kvm *kvm, u
+  
+  	rc = -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	kvm->arch.sca = (struct sca_block *) get_zeroed_page(GFP_KERNEL);
+++=======
++ 	ratelimit_state_init(&kvm->arch.sthyi_limit, 5 * HZ, 500);
++ 
++ 	kvm->arch.use_esca = 0; /* start with basic SCA */
++ 	rwlock_init(&kvm->arch.sca_lock);
++ 	kvm->arch.sca = (struct bsca_block *) get_zeroed_page(GFP_KERNEL);
+++>>>>>>> 7d0a5e62411a (KVM: s390: Limit sthyi execution)
+  	if (!kvm->arch.sca)
+  		goto out_err;
+ -	spin_lock(&kvm_lock);
+ -	sca_offset += 16;
+ -	if (sca_offset + sizeof(struct bsca_block) > PAGE_SIZE)
+ -		sca_offset = 0;
+ -	kvm->arch.sca = (struct bsca_block *)
+ -			((char *) kvm->arch.sca + sca_offset);
+ -	spin_unlock(&kvm_lock);
+  
+  	sprintf(debug_name, "kvm-%u", current->pid);
+  
+* Unmerged path arch/s390/kvm/sthyi.c
+* Unmerged path arch/s390/include/asm/kvm_host.h
+* Unmerged path arch/s390/kvm/kvm-s390.c
+* Unmerged path arch/s390/kvm/sthyi.c
