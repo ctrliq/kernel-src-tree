@@ -1,5 +1,6 @@
 #include <linux/io.h>
 #include <linux/memblock.h>
+#include <linux/mem_encrypt.h>
 
 #include <asm/cacheflush.h>
 #include <asm/pgtable.h>
@@ -46,6 +47,13 @@ void __init setup_real_mode(void)
 #endif
 
 	base = (unsigned char *)real_mode_header;
+
+	/*
+	 * If SME is active, the trampoline area will need to be in
+	 * decrypted memory in order to bring up other processors
+	 * successfully.
+	 */
+	set_memory_decrypted((unsigned long)base, size >> PAGE_SHIFT);
 
 	memcpy(base, real_mode_blob, size);
 
