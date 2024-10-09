@@ -1,0 +1,259 @@
+liquidio: prevent rx queues from getting stalled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Raghu Vatsavayi <raghu.vatsavayi@cavium.com>
+commit ccdd0b4c35f2adb7434ed69a89bc68bb6e9089ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/ccdd0b4c.failed
+
+This commit has fix for RX traffic issues when we stress test the driver
+with continuous ifconfig up/down under very high traffic conditions.
+
+Reason for the issue is that, in existing liquidio_stop function NAPI is
+disabled even before actual FW/HW interface is brought down via
+send_rx_ctrl_cmd(lio, 0). Between time frame of NAPI disable and actual
+interface down in firmware, firmware continuously enqueues rx traffic to
+host. When interrupt happens for new packets, host irq handler fails in
+scheduling NAPI as the NAPI is already disabled.
+
+After "ifconfig <iface> up", Host re-enables NAPI but cannot schedule it
+until it receives another Rx interrupt. Host never receives Rx interrupt as
+it never cleared the Rx interrupt it received during interface down
+operation. NIC Rx interrupt gets cleared only when Host processes queue and
+clears the queue counts. Above anomaly leads to other issues like packet
+overflow in FW/HW queues, backpressure.
+
+Fix:
+This commit fixes this issue by disabling NAPI only after informing
+firmware to stop queueing packets to host via send_rx_ctrl_cmd(lio, 0).
+send_rx_ctrl_cmd is not visible in the patch as it is already there in the
+code. The DOWN command also waits for any pending packets to be processed
+by NAPI so that the deadlock will not occur.
+
+	Signed-off-by: Raghu Vatsavayi <raghu.vatsavayi@cavium.com>
+	Acked-by: Derek Chickles <derek.chickles@cavium.com>
+	Signed-off-by: Felix Manlunas <felix.manlunas@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ccdd0b4c35f2adb7434ed69a89bc68bb6e9089ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/cavium/liquidio/lio_core.c
+diff --cc drivers/net/ethernet/cavium/liquidio/lio_core.c
+index 5c6599c797a0,2a94eee943b2..000000000000
+--- a/drivers/net/ethernet/cavium/liquidio/lio_core.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_core.c
+@@@ -1070,3 -1061,111 +1070,114 @@@ int octeon_setup_interrupt(struct octeo
+  	}
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static void liquidio_change_mtu_completion(struct octeon_device *oct,
++ 					   u32 status, void *buf)
++ {
++ 	struct octeon_soft_command *sc = (struct octeon_soft_command *)buf;
++ 	struct liquidio_if_cfg_context *ctx;
++ 
++ 	ctx  = (struct liquidio_if_cfg_context *)sc->ctxptr;
++ 
++ 	if (status) {
++ 		dev_err(&oct->pci_dev->dev, "MTU change failed. Status: %llx\n",
++ 			CVM_CAST64(status));
++ 		WRITE_ONCE(ctx->cond, LIO_CHANGE_MTU_FAIL);
++ 	} else {
++ 		WRITE_ONCE(ctx->cond, LIO_CHANGE_MTU_SUCCESS);
++ 	}
++ 
++ 	/* This barrier is required to be sure that the response has been
++ 	 * written fully before waking up the handler
++ 	 */
++ 	wmb();
++ 
++ 	wake_up_interruptible(&ctx->wc);
++ }
++ 
++ /**
++  * \brief Net device change_mtu
++  * @param netdev network device
++  */
++ int liquidio_change_mtu(struct net_device *netdev, int new_mtu)
++ {
++ 	struct lio *lio = GET_LIO(netdev);
++ 	struct octeon_device *oct = lio->oct_dev;
++ 	struct liquidio_if_cfg_context *ctx;
++ 	struct octeon_soft_command *sc;
++ 	union octnet_cmd *ncmd;
++ 	int ctx_size;
++ 	int ret = 0;
++ 
++ 	ctx_size = sizeof(struct liquidio_if_cfg_context);
++ 	sc = (struct octeon_soft_command *)
++ 		octeon_alloc_soft_command(oct, OCTNET_CMD_SIZE, 16, ctx_size);
++ 
++ 	ncmd = (union octnet_cmd *)sc->virtdptr;
++ 	ctx  = (struct liquidio_if_cfg_context *)sc->ctxptr;
++ 
++ 	WRITE_ONCE(ctx->cond, 0);
++ 	ctx->octeon_id = lio_get_device_id(oct);
++ 	init_waitqueue_head(&ctx->wc);
++ 
++ 	ncmd->u64 = 0;
++ 	ncmd->s.cmd = OCTNET_CMD_CHANGE_MTU;
++ 	ncmd->s.param1 = new_mtu;
++ 
++ 	octeon_swap_8B_data((u64 *)ncmd, (OCTNET_CMD_SIZE >> 3));
++ 
++ 	sc->iq_no = lio->linfo.txpciq[0].s.q_no;
++ 
++ 	octeon_prepare_soft_command(oct, sc, OPCODE_NIC,
++ 				    OPCODE_NIC_CMD, 0, 0, 0);
++ 
++ 	sc->callback = liquidio_change_mtu_completion;
++ 	sc->callback_arg = sc;
++ 	sc->wait_time = 100;
++ 
++ 	ret = octeon_send_soft_command(oct, sc);
++ 	if (ret == IQ_SEND_FAILED) {
++ 		netif_info(lio, rx_err, lio->netdev, "Failed to change MTU\n");
++ 		return -EINVAL;
++ 	}
++ 	/* Sleep on a wait queue till the cond flag indicates that the
++ 	 * response arrived or timed-out.
++ 	 */
++ 	if (sleep_cond(&ctx->wc, &ctx->cond) == -EINTR ||
++ 	    ctx->cond == LIO_CHANGE_MTU_FAIL) {
++ 		octeon_free_soft_command(oct, sc);
++ 		return -EINVAL;
++ 	}
++ 
++ 	netdev->mtu = new_mtu;
++ 	lio->mtu = new_mtu;
++ 
++ 	octeon_free_soft_command(oct, sc);
++ 	return 0;
++ }
++ 
++ int lio_wait_for_clean_oq(struct octeon_device *oct)
++ {
++ 	int retry = 100, pending_pkts = 0;
++ 	int idx;
++ 
++ 	do {
++ 		pending_pkts = 0;
++ 
++ 		for (idx = 0; idx < MAX_OCTEON_OUTPUT_QUEUES(oct); idx++) {
++ 			if (!(oct->io_qmask.oq & BIT_ULL(idx)))
++ 				continue;
++ 			pending_pkts +=
++ 				atomic_read(&oct->droq[idx]->pkts_pending);
++ 		}
++ 
++ 		if (pending_pkts > 0)
++ 			schedule_timeout_uninterruptible(1);
++ 
++ 	} while (retry-- && pending_pkts);
++ 
++ 	return pending_pkts;
++ }
+++>>>>>>> ccdd0b4c35f2 (liquidio: prevent rx queues from getting stalled)
+* Unmerged path drivers/net/ethernet/cavium/liquidio/lio_core.c
+diff --git a/drivers/net/ethernet/cavium/liquidio/lio_main.c b/drivers/net/ethernet/cavium/liquidio/lio_main.c
+index 79aa2567224f..16cf3c56bcbf 100644
+--- a/drivers/net/ethernet/cavium/liquidio/lio_main.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_main.c
+@@ -2071,16 +2071,6 @@ static int liquidio_stop(struct net_device *netdev)
+ 	struct octeon_device *oct = lio->oct_dev;
+ 	struct napi_struct *napi, *n;
+ 
+-	if (oct->props[lio->ifidx].napi_enabled) {
+-		list_for_each_entry_safe(napi, n, &netdev->napi_list, dev_list)
+-			napi_disable(napi);
+-
+-		oct->props[lio->ifidx].napi_enabled = 0;
+-
+-		if (OCTEON_CN23XX_PF(oct))
+-			oct->droq[0]->ops.poll_mode = 0;
+-	}
+-
+ 	ifstate_reset(lio, LIO_IFSTATE_RUNNING);
+ 
+ 	netif_tx_disable(netdev);
+@@ -2106,6 +2096,21 @@ static int liquidio_stop(struct net_device *netdev)
+ 		lio->ptp_clock = NULL;
+ 	}
+ 
++	/* Wait for any pending Rx descriptors */
++	if (lio_wait_for_clean_oq(oct))
++		netif_info(lio, rx_err, lio->netdev,
++			   "Proceeding with stop interface after partial RX desc processing\n");
++
++	if (oct->props[lio->ifidx].napi_enabled == 1) {
++		list_for_each_entry_safe(napi, n, &netdev->napi_list, dev_list)
++			napi_disable(napi);
++
++		oct->props[lio->ifidx].napi_enabled = 0;
++
++		if (OCTEON_CN23XX_PF(oct))
++			oct->droq[0]->ops.poll_mode = 0;
++	}
++
+ 	dev_info(&oct->pci_dev->dev, "%s interface is stopped\n", netdev->name);
+ 
+ 	return 0;
+diff --git a/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c b/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
+index 75996d8e9970..0ad33735eccd 100644
+--- a/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
+@@ -1163,15 +1163,6 @@ static int liquidio_stop(struct net_device *netdev)
+ 	/* tell Octeon to stop forwarding packets to host */
+ 	send_rx_ctrl_cmd(lio, 0);
+ 
+-	if (oct->props[lio->ifidx].napi_enabled) {
+-		list_for_each_entry_safe(napi, n, &netdev->napi_list, dev_list)
+-			napi_disable(napi);
+-
+-		oct->props[lio->ifidx].napi_enabled = 0;
+-
+-		oct->droq[0]->ops.poll_mode = 0;
+-	}
+-
+ 	netif_info(lio, ifdown, lio->netdev, "Stopping interface!\n");
+ 	/* Inform that netif carrier is down */
+ 	lio->intf_open = 0;
+@@ -1184,6 +1175,20 @@ static int liquidio_stop(struct net_device *netdev)
+ 
+ 	stop_txqs(netdev);
+ 
++	/* Wait for any pending Rx descriptors */
++	if (lio_wait_for_clean_oq(oct))
++		netif_info(lio, rx_err, lio->netdev,
++			   "Proceeding with stop interface after partial RX desc processing\n");
++
++	if (oct->props[lio->ifidx].napi_enabled == 1) {
++		list_for_each_entry_safe(napi, n, &netdev->napi_list, dev_list)
++			napi_disable(napi);
++
++		oct->props[lio->ifidx].napi_enabled = 0;
++
++		oct->droq[0]->ops.poll_mode = 0;
++	}
++
+ 	dev_info(&oct->pci_dev->dev, "%s interface is stopped\n", netdev->name);
+ 
+ 	return 0;
+diff --git a/drivers/net/ethernet/cavium/liquidio/octeon_network.h b/drivers/net/ethernet/cavium/liquidio/octeon_network.h
+index 7f5286059b2c..88e3c97f816a 100644
+--- a/drivers/net/ethernet/cavium/liquidio/octeon_network.h
++++ b/drivers/net/ethernet/cavium/liquidio/octeon_network.h
+@@ -178,6 +178,7 @@ irqreturn_t liquidio_msix_intr_handler(int irq __attribute__((unused)),
+ 
+ int octeon_setup_interrupt(struct octeon_device *oct, u32 num_ioqs);
+ 
++int lio_wait_for_clean_oq(struct octeon_device *oct);
+ /**
+  * \brief Register ethtool operations
+  * @param netdev    pointer to network device
