@@ -49,6 +49,7 @@ static inline int dev_requeue_skb(struct sk_buff *skb, struct Qdisc *q)
 {
 	q->gso_skb = skb;
 	q->qstats.requeues++;
+	qdisc_qstats_backlog_inc(q, skb);
 	q->q.qlen++;	/* it's still part of the queue */
 	__netif_schedule(q);
 
@@ -94,6 +95,7 @@ static inline struct sk_buff *dequeue_skb(struct Qdisc *q)
 		txq = skb_get_tx_queue(txq->dev, skb);
 		if (!netif_xmit_frozen_or_stopped(txq)) {
 			q->gso_skb = NULL;
+			qdisc_qstats_backlog_dec(q, skb);
 			q->q.qlen--;
 		} else
 			skb = NULL;
