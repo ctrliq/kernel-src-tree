@@ -1,0 +1,399 @@
+s390/zcrypt: fix memory leak with ap configuration data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [s390] zcrypt: fix memory leak with ap configuration data (Hendrik Brueckner) [1380349]
+Rebuild_FUZZ: 95.24%
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit 889875a14f0a3205e78613b3e78ecc4efc187d74
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/889875a1.failed
+
+The ap_query_configuration function allocates the ap_config_info
+structure, but there is no code to free the structure.
+Allocate the structure in the module_init function and free it
+again in module_exit.
+
+While we are at it simplify a few functions in regard to the
+ap configuration data.
+
+	Reviewed-by: Ingo Tuchscherer <ingo.tuchscherer@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 889875a14f0a3205e78613b3e78ecc4efc187d74)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/ap_bus.c
+diff --cc drivers/s390/crypto/ap_bus.c
+index 5386d81f8cd3,689f46cbf594..000000000000
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@@ -266,31 -242,13 +267,40 @@@ ap_queue_interruption_control(ap_qid_t 
+  		: "cc" );
+  	return reg1_out;
+  }
+ +#endif
+ +
+++<<<<<<< HEAD
+ +#ifdef CONFIG_64BIT
+ +static inline struct ap_queue_status
+ +__ap_query_functions(ap_qid_t qid, unsigned int *functions)
+ +{
+ +	register unsigned long reg0 asm ("0") = 0UL | qid | (1UL << 23);
+ +	register struct ap_queue_status reg1 asm ("1") = AP_QUEUE_STATUS_INVALID;
+ +	register unsigned long reg2 asm ("2");
+ +
+ +	asm volatile(
+ +		".long 0xb2af0000\n"		/* PQAP(TAPQ) */
+ +		"0:\n"
+ +		EX_TABLE(0b, 0b)
+ +		: "+d" (reg0), "+d" (reg1), "=d" (reg2)
+ +		:
+ +		: "cc");
+ +
+ +	*functions = (unsigned int)(reg2 >> 32);
+ +	return reg1;
+ +}
+ +#endif
+  
+ +#ifdef CONFIG_64BIT
+ +static inline int __ap_query_configuration(struct ap_config_info *config)
+++=======
++ /**
++  * ap_query_configuration(): Get AP configuration data
++  *
++  * Returns 0 on success, or -EOPNOTSUPP.
++  */
++ static inline int ap_query_configuration(void)
+++>>>>>>> 889875a14f0a (s390/zcrypt: fix memory leak with ap configuration data)
+  {
+  	register unsigned long reg0 asm ("0") = 0x04000000UL;
+  	register unsigned long reg1 asm ("1") = -EINVAL;
+@@@ -307,48 -267,64 +319,105 @@@
+  
+  	return reg1;
+  }
+ +#endif
+ +
+ +/**
+ + * ap_query_functions(): Query supported functions.
+ + * @qid: The AP queue number
+ + * @functions: Pointer to functions field.
+ + *
+ + * Returns
+ + *   0	     on success.
+ + *   -ENODEV  if queue not valid.
+ + *   -EBUSY   if device busy.
+ + *   -EINVAL  if query function is not supported
+ + */
+ +static int ap_query_functions(ap_qid_t qid, unsigned int *functions)
+ +{
+ +#ifdef CONFIG_64BIT
+ +	struct ap_queue_status status;
+ +
+ +	status = __ap_query_functions(qid, functions);
+ +
+ +	if (ap_queue_status_invalid_test(&status))
+ +		return -ENODEV;
+ +
+ +	switch (status.response_code) {
+ +	case AP_RESPONSE_NORMAL:
+ +		return 0;
+ +	case AP_RESPONSE_Q_NOT_AVAIL:
+ +	case AP_RESPONSE_DECONFIGURED:
+ +	case AP_RESPONSE_CHECKSTOPPED:
+ +	case AP_RESPONSE_INVALID_ADDRESS:
+ +		return -ENODEV;
+ +	case AP_RESPONSE_RESET_IN_PROGRESS:
+ +	case AP_RESPONSE_BUSY:
+ +	case AP_RESPONSE_OTHERWISE_CHANGED:
+ +	default:
+ +		return -EBUSY;
+ +	}
+ +#else
+ +	return -EINVAL;
+ +#endif
+ +}
+  
++ /**
++  * ap_init_configuration(): Allocate and query configuration array.
++  */
++ static void ap_init_configuration(void)
++ {
++ 	if (!ap_configuration_available())
++ 		return;
++ 
++ 	ap_configuration = kzalloc(sizeof(*ap_configuration), GFP_KERNEL);
++ 	if (!ap_configuration)
++ 		return;
++ 	if (ap_query_configuration() != 0) {
++ 		kfree(ap_configuration);
++ 		ap_configuration = NULL;
++ 		return;
++ 	}
++ }
++ 
++ /*
++  * ap_test_config(): helper function to extract the nrth bit
++  *		     within the unsigned int array field.
++  */
++ static inline int ap_test_config(unsigned int *field, unsigned int nr)
++ {
++ 	return ap_test_bit((field + (nr >> 5)), (nr & 0x1f));
++ }
++ 
++ /*
++  * ap_test_config_card_id(): Test, whether an AP card ID is configured.
++  * @id AP card ID
++  *
++  * Returns 0 if the card is not configured
++  *	   1 if the card is configured or
++  *	     if the configuration information is not available
++  */
++ static inline int ap_test_config_card_id(unsigned int id)
++ {
++ 	if (!ap_configuration)	/* QCI not supported */
++ 		return 1;
++ 	return ap_test_config(ap_configuration->apm, id);
++ }
++ 
++ /*
++  * ap_test_config_domain(): Test, whether an AP usage domain is configured.
++  * @domain AP usage domain ID
++  *
++  * Returns 0 if the usage domain is not configured
++  *	   1 if the usage domain is configured or
++  *	     if the configuration information is not available
++  */
++ static inline int ap_test_config_domain(unsigned int domain)
++ {
++ 	if (!ap_configuration)	/* QCI not supported */
++ 		return domain < 16;
++ 	return ap_test_config(ap_configuration->aqm, domain);
++ }
++ 
+  /**
+   * ap_queue_enable_interruption(): Enable interruption on an AP.
+   * @qid: The AP queue number
+@@@ -536,17 -508,28 +605,35 @@@ static inline void ap_schedule_poll_tim
+   * @qid: The AP queue number
+   * @queue_depth: Pointer to queue depth value
+   * @device_type: Pointer to device type value
+ - * @facilities: Pointer to facility indicator
+   */
+ -static int ap_query_queue(ap_qid_t qid, int *queue_depth, int *device_type,
+ -			  unsigned int *facilities)
+ +static int ap_query_queue(ap_qid_t qid, int *queue_depth, int *device_type)
+  {
+  	struct ap_queue_status status;
+++<<<<<<< HEAD
+ +	int t_depth, t_device_type;
+++=======
++ 	unsigned long info;
++ 	int nd;
++ 
++ 	if (!ap_test_config_card_id(AP_QID_DEVICE(qid)))
++ 		return -ENODEV;
+++>>>>>>> 889875a14f0a (s390/zcrypt: fix memory leak with ap configuration data)
+  
+ -	status = ap_test_queue(qid, &info);
+ +	status = ap_test_queue(qid, &t_depth, &t_device_type);
+  	switch (status.response_code) {
+  	case AP_RESPONSE_NORMAL:
+++<<<<<<< HEAD
+ +		*queue_depth = t_depth + 1;
+ +		*device_type = t_device_type;
+++=======
++ 		*queue_depth = (int)(info & 0xff);
++ 		*device_type = (int)((info >> 24) & 0xff);
++ 		*facilities = (unsigned int)(info >> 32);
++ 		/* Update maximum domain id */
++ 		nd = (info >> 16) & 0xff;
++ 		if ((info & (1UL << 57)) && nd > 0)
++ 			ap_max_domain_id = nd;
+++>>>>>>> 889875a14f0a (s390/zcrypt: fix memory leak with ap configuration data)
+  		return 0;
+  	case AP_RESPONSE_Q_NOT_AVAIL:
+  	case AP_RESPONSE_DECONFIGURED:
+@@@ -1043,51 -1026,6 +1130,54 @@@ void ap_bus_force_rescan(void
+  EXPORT_SYMBOL(ap_bus_force_rescan);
+  
+  /*
+++<<<<<<< HEAD
+ + * ap_test_config(): helper function to extract the nrth bit
+ + *                   within the unsigned int array field.
+ + */
+ +static inline int ap_test_config(unsigned int *field, unsigned int nr)
+ +{
+ +	if (nr > 0xFFu)
+ +		return 0;
+ +	return ap_test_bit((field + (nr >> 5)), (nr & 0x1f));
+ +}
+ +
+ +/*
+ + * ap_test_config_card_id(): Test, whether an AP card ID is configured.
+ + * @id AP card ID
+ + *
+ + * Returns 0 if the card is not configured
+ + *	   1 if the card is configured or
+ + *	     if the configuration information is not available
+ + */
+ +static inline int ap_test_config_card_id(unsigned int id)
+ +{
+ +	if (!ap_configuration)
+ +		return 1;
+ +	return ap_test_config(ap_configuration->apm, id);
+ +}
+ +
+ +/*
+ + * ap_test_config_domain(): Test, whether an AP usage domain is configured.
+ + * @domain AP usage domain ID
+ + *
+ + * Returns 0 if the usage domain is not configured
+ + *	   1 if the usage domain is configured or
+ + *	     if the configuration information is not available
+ + */
+ +static inline int ap_test_config_domain(unsigned int domain)
+ +{
+ +	if (!ap_configuration)	  /* QCI not supported */
+ +		if (domain < 16)
+ +			return 1; /* then domains 0...15 are configured */
+ +		else
+ +			return 0;
+ +	else
+ +		return ap_test_config(ap_configuration->aqm, domain);
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> 889875a14f0a (s390/zcrypt: fix memory leak with ap configuration data)
+   * AP bus attributes.
+   */
+  static ssize_t ap_domain_show(struct bus_type *bus, char *buf)
+@@@ -1204,35 -1142,12 +1293,42 @@@ static BUS_ATTR(poll_timeout, 0644, pol
+  
+  static ssize_t ap_max_domain_id_show(struct bus_type *bus, char *buf)
+  {
+++<<<<<<< HEAD
+ +	ap_qid_t qid;
+ +	int i, nd, max_domain_id = -1;
+ +	unsigned long fbits;
+ +
+ +	if (ap_configuration) {
+ +		if (ap_domain_index >= 0 && ap_domain_index < AP_DOMAINS) {
+ +			for (i = 0; i < AP_DEVICES; i++) {
+ +				if (!ap_test_config_card_id(i))
+ +					continue;
+ +				qid = AP_MKQID(i, ap_domain_index);
+ +				fbits = ap_query_facilities(qid);
+ +				if (fbits & (1UL << 57)) {
+ +					/* the N bit is 0, Nd field is filled */
+ +					nd = (int)((fbits & 0x00FF0000UL)>>16);
+ +					if (nd > 0)
+ +						max_domain_id = nd;
+ +					else
+ +						max_domain_id = 15;
+ +				} else {
+ +					/* N bit is 1, max 16 domains */
+ +					max_domain_id = 15;
+ +				}
+ +				break;
+ +			}
+ +		}
+ +	} else {
+ +		/* no APXA support, older machines with max 16 domains */
+++=======
++ 	int max_domain_id;
++ 
++ 	if (ap_configuration)
++ 		max_domain_id = ap_max_domain_id ? : -1;
++ 	else
+++>>>>>>> 889875a14f0a (s390/zcrypt: fix memory leak with ap configuration data)
+  		max_domain_id = 15;
+- 	}
+  	return snprintf(buf, PAGE_SIZE, "%d\n", max_domain_id);
+  }
+  
+@@@ -1250,42 -1165,16 +1346,41 @@@ static struct bus_attribute *const ap_b
+  };
+  
+  /**
+++<<<<<<< HEAD
+ + * ap_query_configuration(): Query AP configuration information.
+ + *
+ + * Query information of installed cards and configured domains from AP.
+ + */
+ +static void ap_query_configuration(void)
+ +{
+ +#ifdef CONFIG_64BIT
+ +	if (ap_configuration_available()) {
+ +		if (!ap_configuration)
+ +			ap_configuration =
+ +				kzalloc(sizeof(struct ap_config_info),
+ +					GFP_KERNEL);
+ +		if (ap_configuration)
+ +			__ap_query_configuration(ap_configuration);
+ +	} else
+ +		ap_configuration = NULL;
+ +#else
+ +	ap_configuration = NULL;
+ +#endif
+ +}
+ +
+ +/**
+++=======
+++>>>>>>> 889875a14f0a (s390/zcrypt: fix memory leak with ap configuration data)
+   * ap_select_domain(): Select an AP domain.
+   *
+   * Pick one of the 16 AP domains.
+   */
+  static int ap_select_domain(void)
+  {
+ -	int count, max_count, best_domain;
+ -	struct ap_queue_status status;
+ -	int i, j;
+ +	int queue_depth, device_type, count, max_count, best_domain;
+ +	ap_qid_t qid;
+ +	int rc, i, j;
+  
+- 	/* IF APXA isn't installed, only 16 domains could be defined */
+- 	if (!ap_configuration->ap_extended && (ap_domain_index > 15))
+- 		return -EINVAL;
+- 
+  	/*
+  	 * We want to use a single domain. Either the one specified with
+  	 * the "domain=" parameter or the domain with the maximum number
+@@@ -1461,10 -1350,8 +1557,15 @@@ static void ap_scan_bus(struct work_str
+  		dev = bus_find_device(&ap_bus_type, NULL,
+  				      (void *)(unsigned long)qid,
+  				      __ap_scan_bus);
+++<<<<<<< HEAD
+ +		if (ap_test_config_card_id(i))
+ +			rc = ap_query_queue(qid, &queue_depth, &device_type);
+ +		else
+ +			rc = -ENODEV;
+++=======
++ 		rc = ap_query_queue(qid, &queue_depth, &device_type,
++ 				    &device_functions);
+++>>>>>>> 889875a14f0a (s390/zcrypt: fix memory leak with ap configuration data)
+  		if (dev) {
+  			ap_dev = to_ap_dev(dev);
+  			spin_lock_bh(&ap_dev->lock);
+* Unmerged path drivers/s390/crypto/ap_bus.c
+diff --git a/drivers/s390/crypto/ap_bus.h b/drivers/s390/crypto/ap_bus.h
+index 2da8ecdc7a5f..f5ca1557c1b9 100644
+--- a/drivers/s390/crypto/ap_bus.h
++++ b/drivers/s390/crypto/ap_bus.h
+@@ -86,11 +86,8 @@ int ap_queue_status_invalid_test(struct ap_queue_status *status)
+ 	return !(memcmp(status, &invalid, sizeof(struct ap_queue_status)));
+ }
+ 
+-#define AP_MAX_BITS 31
+ static inline int ap_test_bit(unsigned int *ptr, unsigned int nr)
+ {
+-	if (nr > AP_MAX_BITS)
+-		return 0;
+ 	return (*ptr & (0x80000000u >> nr)) != 0;
+ }
+ 
