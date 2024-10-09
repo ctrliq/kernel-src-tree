@@ -487,7 +487,6 @@ static int journal_clean_one_cp_list(struct journal_head *jh)
 	struct journal_head *last_jh;
 	struct journal_head *next_jh = jh;
 	int ret;
-	int freed = 0;
 
 	if (!jh)
 		return 0;
@@ -498,10 +497,9 @@ static int journal_clean_one_cp_list(struct journal_head *jh)
 		next_jh = jh->b_cpnext;
 		ret = __try_to_free_cp_buf(jh);
 		if (!ret)
-			return freed;
+			return 0;
 		if (ret == 2)
 			return 1;
-		freed = 1;
 		/*
 		 * This function only frees up some memory
 		 * if possible so we dont have an obligation
@@ -509,10 +507,10 @@ static int journal_clean_one_cp_list(struct journal_head *jh)
 		 * requested:
 		 */
 		if (need_resched())
-			return freed;
+			return 0;
 	} while (jh != last_jh);
 
-	return freed;
+	return 0;
 }
 
 /*
