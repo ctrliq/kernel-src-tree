@@ -1,0 +1,99 @@
+target: Add support for TMR percpu reference counting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [target] Add support for TMR percpu reference counting (Maurizio Lombardi) [1585081]
+Rebuild_FUZZ: 91.84%
+commit-author Nicholas Bellinger <nab@linux-iscsi.org>
+commit eeb64d239ea664592ff8f1bce5546209a6593df5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/eeb64d23.failed
+
+This patch introduces TMR percpu reference counting using
+se_lun->lun_ref in transport_lookup_tmr_lun(), following
+how existing non TMR per se_lun reference counting works
+within transport_lookup_cmd_lun().
+
+It also adds explicit transport_lun_remove_cmd() calls to
+drop the reference in the three tmr related locations that
+invoke transport_cmd_check_stop_to_fabric();
+
+   - target_tmr_work() during normal ->queue_tm_rsp()
+   - target_complete_tmr_failure() during error ->queue_tm_rsp()
+   - transport_generic_handle_tmr() during early failure
+
+Also, note the exception paths in transport_generic_free_cmd()
+and transport_cmd_finish_abort() already check SCF_SE_LUN_CMD,
+and will invoke transport_lun_remove_cmd() when necessary.
+
+	Reviewed-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Reviewed-by: Quinn Tran <quinn.tran@cavium.com>
+	Cc: Mike Christie <mchristi@redhat.com>
+	Cc: Hannes Reinecke <hare@suse.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit eeb64d239ea664592ff8f1bce5546209a6593df5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_device.c
+diff --cc drivers/target/target_core_device.c
+index fee34a17ddfa,bf7a57953fa4..000000000000
+--- a/drivers/target/target_core_device.c
++++ b/drivers/target/target_core_device.c
+@@@ -167,12 -168,20 +167,25 @@@ int transport_lookup_tmr_lun(struct se_
+  	rcu_read_lock();
+  	deve = target_nacl_find_deve(nacl, unpacked_lun);
+  	if (deve) {
+++<<<<<<< HEAD
+ +		se_tmr->tmr_lun = rcu_dereference(deve->se_lun);
+ +		se_cmd->se_lun = rcu_dereference(deve->se_lun);
+++=======
+++>>>>>>> eeb64d239ea6 (target: Add support for TMR percpu reference counting)
+  		se_lun = rcu_dereference(deve->se_lun);
++ 
++ 		if (!percpu_ref_tryget_live(&se_lun->lun_ref)) {
++ 			se_lun = NULL;
++ 			goto out_unlock;
++ 		}
++ 
++ 		se_cmd->se_lun = rcu_dereference(deve->se_lun);
+  		se_cmd->pr_res_key = deve->pr_res_key;
+  		se_cmd->orig_fe_lun = unpacked_lun;
++ 		se_cmd->se_cmd_flags |= SCF_SE_LUN_CMD;
++ 		se_cmd->lun_ref_active = true;
+  	}
++ out_unlock:
+  	rcu_read_unlock();
+  
+  	if (!se_lun) {
+* Unmerged path drivers/target/target_core_device.c
+diff --git a/drivers/target/target_core_transport.c b/drivers/target/target_core_transport.c
+index edbde1321a00..2992aa640427 100644
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -1622,6 +1622,7 @@ static void target_complete_tmr_failure(struct work_struct *work)
+ 	se_cmd->se_tmr_req->response = TMR_LUN_DOES_NOT_EXIST;
+ 	se_cmd->se_tfo->queue_tm_rsp(se_cmd);
+ 
++	transport_lun_remove_cmd(se_cmd);
+ 	transport_cmd_check_stop_to_fabric(se_cmd);
+ }
+ 
+@@ -3229,6 +3230,7 @@ static void target_tmr_work(struct work_struct *work)
+ 	cmd->se_tfo->queue_tm_rsp(cmd);
+ 
+ check_stop:
++	transport_lun_remove_cmd(cmd);
+ 	transport_cmd_check_stop_to_fabric(cmd);
+ }
+ 
+@@ -3251,6 +3253,7 @@ int transport_generic_handle_tmr(
+ 		pr_warn_ratelimited("handle_tmr caught CMD_T_ABORTED TMR %d"
+ 			"ref_tag: %llu tag: %llu\n", cmd->se_tmr_req->function,
+ 			cmd->se_tmr_req->ref_task_tag, cmd->tag);
++		transport_lun_remove_cmd(cmd);
+ 		transport_cmd_check_stop_to_fabric(cmd);
+ 		return 0;
+ 	}
