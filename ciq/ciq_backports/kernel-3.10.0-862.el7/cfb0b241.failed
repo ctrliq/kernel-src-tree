@@ -1,0 +1,186 @@
+s390/mm: make use of ipte range facility
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [s390] mm: make use of ipte range facility (Hendrik Brueckner) [1489742]
+Rebuild_FUZZ: 93.33%
+commit-author Heiko Carstens <heiko.carstens@de.ibm.com>
+commit cfb0b24143b4f587ff3e3bd829f9f471285d097b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/cfb0b241.failed
+
+Invalidate several pte entries at once if the ipte range facility
+is available. Currently this works only for DEBUG_PAGE_ALLOC where
+several up to 2 ^ MAX_ORDER may be invalidated at once.
+
+	Signed-off-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit cfb0b24143b4f587ff3e3bd829f9f471285d097b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/pgtable.h
+diff --cc arch/s390/include/asm/pgtable.h
+index cff6ed1e6f32,2de229c1b467..000000000000
+--- a/arch/s390/include/asm/pgtable.h
++++ b/arch/s390/include/asm/pgtable.h
+@@@ -1007,6 -1025,84 +1007,87 @@@ static inline pte_t pte_mkhuge(pte_t pt
+  }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ static inline void __ptep_ipte(unsigned long address, pte_t *ptep)
++ {
++ 	unsigned long pto = (unsigned long) ptep;
++ 
++ #ifndef CONFIG_64BIT
++ 	/* pto in ESA mode must point to the start of the segment table */
++ 	pto &= 0x7ffffc00;
++ #endif
++ 	/* Invalidation + global TLB flush for the pte */
++ 	asm volatile(
++ 		"	ipte	%2,%3"
++ 		: "=m" (*ptep) : "m" (*ptep), "a" (pto), "a" (address));
++ }
++ 
++ static inline void __ptep_ipte_local(unsigned long address, pte_t *ptep)
++ {
++ 	unsigned long pto = (unsigned long) ptep;
++ 
++ #ifndef CONFIG_64BIT
++ 	/* pto in ESA mode must point to the start of the segment table */
++ 	pto &= 0x7ffffc00;
++ #endif
++ 	/* Invalidation + local TLB flush for the pte */
++ 	asm volatile(
++ 		"	.insn rrf,0xb2210000,%2,%3,0,1"
++ 		: "=m" (*ptep) : "m" (*ptep), "a" (pto), "a" (address));
++ }
++ 
++ static inline void __ptep_ipte_range(unsigned long address, int nr, pte_t *ptep)
++ {
++ 	unsigned long pto = (unsigned long) ptep;
++ 
++ #ifndef CONFIG_64BIT
++ 	/* pto in ESA mode must point to the start of the segment table */
++ 	pto &= 0x7ffffc00;
++ #endif
++ 	/* Invalidate a range of ptes + global TLB flush of the ptes */
++ 	do {
++ 		asm volatile(
++ 			"	.insn rrf,0xb2210000,%2,%0,%1,0"
++ 			: "+a" (address), "+a" (nr) : "a" (pto) : "memory");
++ 	} while (nr != 255);
++ }
++ 
++ static inline void ptep_flush_direct(struct mm_struct *mm,
++ 				     unsigned long address, pte_t *ptep)
++ {
++ 	int active, count;
++ 
++ 	if (pte_val(*ptep) & _PAGE_INVALID)
++ 		return;
++ 	active = (mm == current->active_mm) ? 1 : 0;
++ 	count = atomic_add_return(0x10000, &mm->context.attach_count);
++ 	if (MACHINE_HAS_TLB_LC && (count & 0xffff) <= active &&
++ 	    cpumask_equal(mm_cpumask(mm), cpumask_of(smp_processor_id())))
++ 		__ptep_ipte_local(address, ptep);
++ 	else
++ 		__ptep_ipte(address, ptep);
++ 	atomic_sub(0x10000, &mm->context.attach_count);
++ }
++ 
++ static inline void ptep_flush_lazy(struct mm_struct *mm,
++ 				   unsigned long address, pte_t *ptep)
++ {
++ 	int active, count;
++ 
++ 	if (pte_val(*ptep) & _PAGE_INVALID)
++ 		return;
++ 	active = (mm == current->active_mm) ? 1 : 0;
++ 	count = atomic_add_return(0x10000, &mm->context.attach_count);
++ 	if ((count & 0xffff) <= active) {
++ 		pte_val(*ptep) |= _PAGE_INVALID;
++ 		mm->context.flush_mm = 1;
++ 	} else
++ 		__ptep_ipte(address, ptep);
++ 	atomic_sub(0x10000, &mm->context.attach_count);
++ }
++ 
+++>>>>>>> cfb0b24143b4 (s390/mm: make use of ipte range facility)
+  /*
+   * Get (and clear) the user dirty bit for a pte.
+   */
+* Unmerged path arch/s390/include/asm/pgtable.h
+diff --git a/arch/s390/mm/pageattr.c b/arch/s390/mm/pageattr.c
+index 8400f494623f..3fef3b299665 100644
+--- a/arch/s390/mm/pageattr.c
++++ b/arch/s390/mm/pageattr.c
+@@ -6,6 +6,7 @@
+ #include <linux/module.h>
+ #include <linux/mm.h>
+ #include <asm/cacheflush.h>
++#include <asm/facility.h>
+ #include <asm/pgtable.h>
+ #include <asm/page.h>
+ 
+@@ -103,27 +104,50 @@ int set_memory_x(unsigned long addr, int numpages)
+ }
+ 
+ #ifdef CONFIG_DEBUG_PAGEALLOC
++
++static void ipte_range(pte_t *pte, unsigned long address, int nr)
++{
++	int i;
++
++	if (test_facility(13) && IS_ENABLED(CONFIG_64BIT)) {
++		__ptep_ipte_range(address, nr - 1, pte);
++		return;
++	}
++	for (i = 0; i < nr; i++) {
++		__ptep_ipte(address, pte);
++		address += PAGE_SIZE;
++		pte++;
++	}
++}
++
+ void kernel_map_pages(struct page *page, int numpages, int enable)
+ {
+ 	unsigned long address;
++	int nr, i, j;
+ 	pgd_t *pgd;
+ 	pud_t *pud;
+ 	pmd_t *pmd;
+ 	pte_t *pte;
+-	int i;
+ 
+-	for (i = 0; i < numpages; i++) {
++	for (i = 0; i < numpages;) {
+ 		address = page_to_phys(page + i);
+ 		pgd = pgd_offset_k(address);
+ 		pud = pud_offset(pgd, address);
+ 		pmd = pmd_offset(pud, address);
+ 		pte = pte_offset_kernel(pmd, address);
+-		if (!enable) {
+-			__ptep_ipte(address, pte);
+-			pte_val(*pte) = _PAGE_INVALID;
+-			continue;
++		nr = (unsigned long)pte >> ilog2(sizeof(long));
++		nr = PTRS_PER_PTE - (nr & (PTRS_PER_PTE - 1));
++		nr = min(numpages - i, nr);
++		if (enable) {
++			for (j = 0; j < nr; j++) {
++				pte_val(*pte) = __pa(address);
++				address += PAGE_SIZE;
++				pte++;
++			}
++		} else {
++			ipte_range(pte, address, nr);
+ 		}
+-		pte_val(*pte) = __pa(address);
++		i += nr;
+ 	}
+ }
+ 
