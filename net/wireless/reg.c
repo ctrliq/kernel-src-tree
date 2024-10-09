@@ -946,6 +946,7 @@ static int regdb_query_country(const struct fwdb_header *db,
 
 			if (!tmp_rd) {
 				kfree(regdom);
+				kfree(wmm_ptrs);
 				return -ENOMEM;
 			}
 			regdom = tmp_rd;
