@@ -1,0 +1,378 @@
+scsi: qla2xxx: Add FC-NVMe command handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] qla2xxx: Add FC-NVMe command handling (Himanshu Madhani) [1316281]
+Rebuild_FUZZ: 92.50%
+commit-author Duane Grigsby <duane.grigsby@cavium.com>
+commit 7401bc18d1ee39e46b668341097e0183975c02eb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/7401bc18.failed
+
+This patch adds logic to handle the completion of FC-NVMe commands and
+creates a sub-command in the SRB command structure to manage NVMe
+commands.
+
+	Signed-off-by: Darren Trapp <darren.trapp@cavium.com>
+	Signed-off-by: Duane Grigsby <duane.grigsby@cavium.com>
+	Signed-off-by: Anil Gurumurthy <anil.gurumurhty@cavium.com>
+	Signed-off-by: Giridhar Malavali <giridhar.malavali@cavium.com>
+	Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 7401bc18d1ee39e46b668341097e0183975c02eb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_def.h
+#	drivers/scsi/qla2xxx/qla_isr.c
+#	drivers/scsi/qla2xxx/qla_os.c
+diff --cc drivers/scsi/qla2xxx/qla_def.h
+index 3f28536dc812,4d889eb2993e..000000000000
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@@ -363,6 -398,34 +363,37 @@@ struct srb_iocb 
+  			__le16 comp_status;
+  			struct completion comp;
+  		} abt;
+++<<<<<<< HEAD
+++=======
++ 		struct ct_arg ctarg;
++ #define MAX_IOCB_MB_REG 28
++ #define SIZEOF_IOCB_MB_REG (MAX_IOCB_MB_REG * sizeof(uint16_t))
++ 		struct {
++ 			__le16 in_mb[MAX_IOCB_MB_REG];	/* from FW */
++ 			__le16 out_mb[MAX_IOCB_MB_REG];	/* to FW */
++ 			void *out, *in;
++ 			dma_addr_t out_dma, in_dma;
++ 			struct completion comp;
++ 			int rc;
++ 		} mbx;
++ 		struct {
++ 			struct imm_ntfy_from_isp *ntfy;
++ 		} nack;
++ 		struct {
++ 			__le16 comp_status;
++ 			uint16_t rsp_pyld_len;
++ 			uint8_t	aen_op;
++ 			void *desc;
++ 
++ 			/* These are only used with ls4 requests */
++ 			int cmd_len;
++ 			int rsp_len;
++ 			dma_addr_t cmd_dma;
++ 			dma_addr_t rsp_dma;
++ 			uint32_t dl;
++ 			uint32_t timeout_sec;
++ 		} nvme;
+++>>>>>>> 7401bc18d1ee (scsi: qla2xxx: Add FC-NVMe command handling)
+  	} u;
+  
+  	struct timer_list timer;
+@@@ -382,11 -445,30 +413,22 @@@
+  #define SRB_FXIOCB_DCMD	10
+  #define SRB_FXIOCB_BCMD	11
+  #define SRB_ABT_CMD	12
+++<<<<<<< HEAD
+++=======
++ #define SRB_ELS_DCMD	13
++ #define SRB_MB_IOCB	14
++ #define SRB_CT_PTHRU_CMD 15
++ #define SRB_NACK_PLOGI	16
++ #define SRB_NACK_PRLI	17
++ #define SRB_NACK_LOGO	18
++ #define SRB_NVME_CMD	19
++ #define SRB_PRLI_CMD	21
+++>>>>>>> 7401bc18d1ee (scsi: qla2xxx: Add FC-NVMe command handling)
+  
+ -enum {
+ -	TYPE_SRB,
+ -	TYPE_TGT_CMD,
+ -};
+  
+  typedef struct srb {
+ -	/*
+ -	 * Do not move cmd_type field, it needs to
+ -	 * line up with qla_tgt_cmd->cmd_type
+ -	 */
+ -	uint8_t cmd_type;
+ -	uint8_t pad[3];
+  	atomic_t ref_count;
+  	struct fc_port *fcport;
+ -	struct scsi_qla_host *vha;
+  	uint32_t handle;
+  	uint16_t flags;
+  	uint16_t type;
+@@@ -3654,6 -4122,12 +3696,15 @@@ typedef struct scsi_qla_host 
+  	uint8_t		port_name[WWN_SIZE];
+  	uint8_t		fabric_node_name[WWN_SIZE];
+  
+++<<<<<<< HEAD
+++=======
++ 	struct		nvme_fc_local_port *nvme_local_port;
++ 	atomic_t	nvme_ref_count;
++ 	struct list_head nvme_rport_list;
++ 	atomic_t 	nvme_active_aen_cnt;
++ 	uint16_t	nvme_last_rptd_aen;
++ 
+++>>>>>>> 7401bc18d1ee (scsi: qla2xxx: Add FC-NVMe command handling)
+  	uint16_t	fcoe_vlan_id;
+  	uint16_t	fcoe_fcf_idx;
+  	uint8_t		fcoe_vn_port_mac[6];
+diff --cc drivers/scsi/qla2xxx/qla_isr.c
+index 99f5a88cc283,477aea7c9a88..000000000000
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@@ -1635,9 -1796,82 +1635,82 @@@ qla24xx_tm_iocb_entry(scsi_qla_host_t *
+  		ql_dump_buffer(ql_dbg_async + ql_dbg_buffer, vha, 0x5055,
+  		    (uint8_t *)sts, sizeof(*sts));
+  
+ -	sp->done(sp, 0);
+ +	sp->done(vha, sp, 0);
+  }
+  
++ static void
++ qla24xx_nvme_iocb_entry(scsi_qla_host_t *vha, struct req_que *req, void *tsk)
++ {
++ 	const char func[] = "NVME-IOCB";
++ 	fc_port_t *fcport;
++ 	srb_t *sp;
++ 	struct srb_iocb *iocb;
++ 	struct sts_entry_24xx *sts = (struct sts_entry_24xx *)tsk;
++ 	uint16_t        state_flags;
++ 	struct nvmefc_fcp_req *fd;
++ 	uint16_t        ret = 0;
++ 	struct srb_iocb *nvme;
++ 
++ 	sp = qla2x00_get_sp_from_handle(vha, func, req, tsk);
++ 	if (!sp)
++ 		return;
++ 
++ 	iocb = &sp->u.iocb_cmd;
++ 	fcport = sp->fcport;
++ 	iocb->u.nvme.comp_status = le16_to_cpu(sts->comp_status);
++ 	state_flags  = le16_to_cpu(sts->state_flags);
++ 	fd = iocb->u.nvme.desc;
++ 	nvme = &sp->u.iocb_cmd;
++ 
++ 	if (unlikely(nvme->u.nvme.aen_op))
++ 		atomic_dec(&sp->vha->nvme_active_aen_cnt);
++ 
++ 	/*
++ 	 * State flags: Bit 6 and 0.
++ 	 * If 0 is set, we don't care about 6.
++ 	 * both cases resp was dma'd to host buffer
++ 	 * if both are 0, that is good path case.
++ 	 * if six is set and 0 is clear, we need to
++ 	 * copy resp data from status iocb to resp buffer.
++ 	 */
++ 	if (!(state_flags & (SF_FCP_RSP_DMA | SF_NVME_ERSP))) {
++ 		iocb->u.nvme.rsp_pyld_len = 0;
++ 	} else if ((state_flags & SF_FCP_RSP_DMA)) {
++ 		iocb->u.nvme.rsp_pyld_len = le16_to_cpu(sts->nvme_rsp_pyld_len);
++ 	} else if (state_flags & SF_NVME_ERSP) {
++ 		uint32_t *inbuf, *outbuf;
++ 		uint16_t iter;
++ 
++ 		inbuf = (uint32_t *)&sts->nvme_ersp_data;
++ 		outbuf = (uint32_t *)fd->rspaddr;
++ 		iocb->u.nvme.rsp_pyld_len = le16_to_cpu(sts->nvme_rsp_pyld_len);
++ 		iter = iocb->u.nvme.rsp_pyld_len >> 2;
++ 		for (; iter; iter--)
++ 			*outbuf++ = swab32(*inbuf++);
++ 	} else { /* unhandled case */
++ 	    ql_log(ql_log_warn, fcport->vha, 0x503a,
++ 		"NVME-%s error. Unhandled state_flags of %x\n",
++ 		sp->name, state_flags);
++ 	}
++ 
++ 	fd->transferred_length = fd->payload_length -
++ 	    le32_to_cpu(sts->residual_len);
++ 
++ 	if (sts->entry_status) {
++ 		ql_log(ql_log_warn, fcport->vha, 0x5038,
++ 		    "NVME-%s error - hdl=%x entry-status(%x).\n",
++ 		    sp->name, sp->handle, sts->entry_status);
++ 		ret = QLA_FUNCTION_FAILED;
++ 	} else if (sts->comp_status != cpu_to_le16(CS_COMPLETE)) {
++ 		ql_log(ql_log_warn, fcport->vha, 0x5039,
++ 		    "NVME-%s error - hdl=%x completion status(%x) resid=%x  ox_id=%x\n",
++ 		    sp->name, sp->handle, sts->comp_status,
++ 		    le32_to_cpu(sts->residual_len), sts->ox_id);
++ 		ret = QLA_FUNCTION_FAILED;
++ 	}
++ 	sp->done(sp, ret);
++ }
++ 
+  /**
+   * qla2x00_process_response_queue() - Process response queue entries.
+   * @ha: SCSI driver HA context
+@@@ -2115,6 -2354,20 +2188,23 @@@ qla2x00_status_entry(scsi_qla_host_t *v
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (sp->cmd_type != TYPE_SRB) {
++ 		req->outstanding_cmds[handle] = NULL;
++ 		ql_dbg(ql_dbg_io, vha, 0x3015,
++ 		    "Unknown sp->cmd_type %x %p).\n",
++ 		    sp->cmd_type, sp);
++ 		return;
++ 	}
++ 
++ 	/* NVME completion. */
++ 	if (sp->type == SRB_NVME_CMD) {
++ 		qla24xx_nvme_iocb_entry(vha, req, pkt);
++ 		return;
++ 	}
++ 
+++>>>>>>> 7401bc18d1ee (scsi: qla2xxx: Add FC-NVMe command handling)
+  	if (unlikely((state_flags & BIT_1) && (sp->type == SRB_BIDI_CMD))) {
+  		qla25xx_process_bidir_status_iocb(vha, pkt, req, handle);
+  		return;
+diff --cc drivers/scsi/qla2xxx/qla_os.c
+index c724f888aca6,5ad6328e5c33..000000000000
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@@ -584,7 -649,83 +584,87 @@@ qla24xx_fw_version_str(struct scsi_qla_
+  }
+  
+  void
+++<<<<<<< HEAD
+ +qla2x00_sp_free_dma(void *vha, void *ptr)
+++=======
++ qla2x00_sp_free_dma(void *ptr)
++ {
++ 	srb_t *sp = ptr;
++ 	struct qla_hw_data *ha = sp->vha->hw;
++ 	struct scsi_cmnd *cmd = GET_CMD_SP(sp);
++ 	void *ctx = GET_CMD_CTX_SP(sp);
++ 
++ 	if (sp->flags & SRB_DMA_VALID) {
++ 		scsi_dma_unmap(cmd);
++ 		sp->flags &= ~SRB_DMA_VALID;
++ 	}
++ 
++ 	if (sp->flags & SRB_CRC_PROT_DMA_VALID) {
++ 		dma_unmap_sg(&ha->pdev->dev, scsi_prot_sglist(cmd),
++ 		    scsi_prot_sg_count(cmd), cmd->sc_data_direction);
++ 		sp->flags &= ~SRB_CRC_PROT_DMA_VALID;
++ 	}
++ 
++ 	if (!ctx)
++ 		goto end;
++ 
++ 	if (sp->flags & SRB_CRC_CTX_DSD_VALID) {
++ 		/* List assured to be having elements */
++ 		qla2x00_clean_dsd_pool(ha, ctx);
++ 		sp->flags &= ~SRB_CRC_CTX_DSD_VALID;
++ 	}
++ 
++ 	if (sp->flags & SRB_CRC_CTX_DMA_VALID) {
++ 		struct crc_context *ctx0 = ctx;
++ 
++ 		dma_pool_free(ha->dl_dma_pool, ctx0, ctx0->crc_ctx_dma);
++ 		sp->flags &= ~SRB_CRC_CTX_DMA_VALID;
++ 	}
++ 
++ 	if (sp->flags & SRB_FCP_CMND_DMA_VALID) {
++ 		struct ct6_dsd *ctx1 = ctx;
++ 
++ 		dma_pool_free(ha->fcp_cmnd_dma_pool, ctx1->fcp_cmnd,
++ 		    ctx1->fcp_cmnd_dma);
++ 		list_splice(&ctx1->dsd_list, &ha->gbl_dsd_list);
++ 		ha->gbl_dsd_inuse -= ctx1->dsd_use_cnt;
++ 		ha->gbl_dsd_avail += ctx1->dsd_use_cnt;
++ 		mempool_free(ctx1, ha->ctx_mempool);
++ 	}
++ 
++ end:
++ 	if (sp->type != SRB_NVME_CMD) {
++ 		CMD_SP(cmd) = NULL;
++ 		qla2x00_rel_sp(sp);
++ 	}
++ }
++ 
++ void
++ qla2x00_sp_compl(void *ptr, int res)
++ {
++ 	srb_t *sp = ptr;
++ 	struct scsi_cmnd *cmd = GET_CMD_SP(sp);
++ 
++ 	cmd->result = res;
++ 
++ 	if (atomic_read(&sp->ref_count) == 0) {
++ 		ql_dbg(ql_dbg_io, sp->vha, 0x3015,
++ 		    "SP reference-count to ZERO -- sp=%p cmd=%p.\n",
++ 		    sp, GET_CMD_SP(sp));
++ 		if (ql2xextended_error_logging & ql_dbg_io)
++ 			WARN_ON(atomic_read(&sp->ref_count) == 0);
++ 		return;
++ 	}
++ 	if (!atomic_dec_and_test(&sp->ref_count))
++ 		return;
++ 
++ 	qla2x00_sp_free_dma(sp);
++ 	cmd->scsi_done(cmd);
++ }
++ 
++ void
++ qla2xxx_qpair_sp_free_dma(void *ptr)
+++>>>>>>> 7401bc18d1ee (scsi: qla2xxx: Add FC-NVMe command handling)
+  {
+  	srb_t *sp = (srb_t *)ptr;
+  	struct scsi_cmnd *cmd = GET_CMD_SP(sp);
+* Unmerged path drivers/scsi/qla2xxx/qla_def.h
+diff --git a/drivers/scsi/qla2xxx/qla_fw.h b/drivers/scsi/qla2xxx/qla_fw.h
+index 8a2368b32dec..d9409edb4af0 100644
+--- a/drivers/scsi/qla2xxx/qla_fw.h
++++ b/drivers/scsi/qla2xxx/qla_fw.h
+@@ -7,6 +7,9 @@
+ #ifndef __QLA_FW_H
+ #define __QLA_FW_H
+ 
++#include <linux/nvme.h>
++#include <linux/nvme-fc.h>
++
+ #define MBS_CHECKSUM_ERROR	0x4010
+ #define MBS_INVALID_PRODUCT_KEY	0x4020
+ 
+@@ -562,9 +565,14 @@ struct sts_entry_24xx {
+ 
+ 	uint32_t residual_len;		/* FW calc residual transfer length. */
+ 
+-	uint16_t reserved_1;
++	union {
++		uint16_t reserved_1;
++		uint16_t nvme_rsp_pyld_len;
++	};
++
+ 	uint16_t state_flags;		/* State flags. */
+ #define SF_TRANSFERRED_DATA	BIT_11
++#define SF_NVME_ERSP            BIT_6
+ #define SF_FCP_RSP_DMA		BIT_0
+ 
+ 	uint16_t retry_delay;
+@@ -574,8 +582,16 @@ struct sts_entry_24xx {
+ 	uint32_t rsp_residual_count;	/* FCP RSP residual count. */
+ 
+ 	uint32_t sense_len;		/* FCP SENSE length. */
+-	uint32_t rsp_data_len;		/* FCP response data length. */
+-	uint8_t data[28];		/* FCP response/sense information. */
++
++	union {
++		struct {
++			uint32_t rsp_data_len;	/* FCP response data length  */
++			uint8_t data[28];	/* FCP rsp/sense information */
++		};
++		struct nvme_fc_ersp_iu nvme_ersp;
++		uint8_t nvme_ersp_data[32];
++	};
++
+ 	/*
+ 	 * If DIF Error is set in comp_status, these additional fields are
+ 	 * defined:
+* Unmerged path drivers/scsi/qla2xxx/qla_isr.c
+* Unmerged path drivers/scsi/qla2xxx/qla_os.c
