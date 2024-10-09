@@ -1,0 +1,321 @@
+xfs: add full xfs_dqblk verifier
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Eric Sandeen <sandeen@sandeen.net>
+commit 7224fa482a6daa0558792e03a209e08d34690a26
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/7224fa48.failed
+
+Add an xfs_dqblk verifier so that it can check the uuid on V5 filesystems;
+it calls the existing xfs_dquot_verify verifier to validate the
+xfs_disk_dquot_t contained inside it.  This lets us move the uuid
+verification out of the crc verifier, which makes little sense.
+
+	Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit 7224fa482a6daa0558792e03a209e08d34690a26)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_dquot_buf.c
+#	fs/xfs/libxfs/xfs_quota_defs.h
+#	fs/xfs/xfs_dquot.c
+#	fs/xfs/xfs_qm.c
+diff --cc fs/xfs/libxfs/xfs_dquot_buf.c
+index 74b0867f3ece,83bebb57d0da..000000000000
+--- a/fs/xfs/libxfs/xfs_dquot_buf.c
++++ b/fs/xfs/libxfs/xfs_dquot_buf.c
+@@@ -41,9 -41,14 +41,19 @@@ xfs_calc_dquots_per_chunk
+  
+  /*
+   * Do some primitive error checking on ondisk dquot data structures.
++  *
++  * The xfs_dqblk structure /contains/ the xfs_disk_dquot structure;
++  * we verify them separately because at some points we have only the
++  * smaller xfs_disk_dquot structure available.
+   */
+++<<<<<<< HEAD
+ +int
+ +xfs_dqcheck(
+++=======
++ 
++ xfs_failaddr_t
++ xfs_dquot_verify(
+++>>>>>>> 7224fa482a6d (xfs: add full xfs_dqblk verifier)
+  	struct xfs_mount *mp,
+  	xfs_disk_dquot_t *ddq,
+  	xfs_dqid_t	 id,
+@@@ -68,79 -69,56 +78,93 @@@
+  	 * This is all fine; things are still consistent, and we haven't lost
+  	 * any quota information. Just don't complain about bad dquot blks.
+  	 */
+ -	if (ddq->d_magic != cpu_to_be16(XFS_DQUOT_MAGIC))
+ -		return __this_address;
+ -	if (ddq->d_version != XFS_DQUOT_VERSION)
+ -		return __this_address;
+ +	if (ddq->d_magic != cpu_to_be16(XFS_DQUOT_MAGIC)) {
+ +		if (flags & XFS_QMOPT_DOWARN)
+ +			xfs_alert(mp,
+ +			"%s : XFS dquot ID 0x%x, magic 0x%x != 0x%x",
+ +			str, id, be16_to_cpu(ddq->d_magic), XFS_DQUOT_MAGIC);
+ +		errs++;
+ +	}
+ +	if (ddq->d_version != XFS_DQUOT_VERSION) {
+ +		if (flags & XFS_QMOPT_DOWARN)
+ +			xfs_alert(mp,
+ +			"%s : XFS dquot ID 0x%x, version 0x%x != 0x%x",
+ +			str, id, ddq->d_version, XFS_DQUOT_VERSION);
+ +		errs++;
+ +	}
+  
+ -	if (type && ddq->d_flags != type)
+ -		return __this_address;
+  	if (ddq->d_flags != XFS_DQ_USER &&
+  	    ddq->d_flags != XFS_DQ_PROJ &&
+ -	    ddq->d_flags != XFS_DQ_GROUP)
+ -		return __this_address;
+ -
+ -	if (id != -1 && id != be32_to_cpu(ddq->d_id))
+ -		return __this_address;
+ -
+ -	if (!ddq->d_id)
+ -		return NULL;
+ -
+ -	if (ddq->d_blk_softlimit &&
+ -	    be64_to_cpu(ddq->d_bcount) > be64_to_cpu(ddq->d_blk_softlimit) &&
+ -	    !ddq->d_btimer)
+ -		return __this_address;
+ +	    ddq->d_flags != XFS_DQ_GROUP) {
+ +		if (flags & XFS_QMOPT_DOWARN)
+ +			xfs_alert(mp,
+ +			"%s : XFS dquot ID 0x%x, unknown flags 0x%x",
+ +			str, id, ddq->d_flags);
+ +		errs++;
+ +	}
+  
+ -	if (ddq->d_ino_softlimit &&
+ -	    be64_to_cpu(ddq->d_icount) > be64_to_cpu(ddq->d_ino_softlimit) &&
+ -	    !ddq->d_itimer)
+ -		return __this_address;
+ +	if (id != -1 && id != be32_to_cpu(ddq->d_id)) {
+ +		if (flags & XFS_QMOPT_DOWARN)
+ +			xfs_alert(mp,
+ +			"%s : ondisk-dquot 0x%p, ID mismatch: "
+ +			"0x%x expected, found id 0x%x",
+ +			str, ddq, id, be32_to_cpu(ddq->d_id));
+ +		errs++;
+ +	}
+  
+ -	if (ddq->d_rtb_softlimit &&
+ -	    be64_to_cpu(ddq->d_rtbcount) > be64_to_cpu(ddq->d_rtb_softlimit) &&
+ -	    !ddq->d_rtbtimer)
+ -		return __this_address;
+ +	if (!errs && ddq->d_id) {
+ +		if (ddq->d_blk_softlimit &&
+ +		    be64_to_cpu(ddq->d_bcount) >
+ +				be64_to_cpu(ddq->d_blk_softlimit)) {
+ +			if (!ddq->d_btimer) {
+ +				if (flags & XFS_QMOPT_DOWARN)
+ +					xfs_alert(mp,
+ +			"%s : Dquot ID 0x%x (0x%p) BLK TIMER NOT STARTED",
+ +					str, (int)be32_to_cpu(ddq->d_id), ddq);
+ +				errs++;
+ +			}
+ +		}
+ +		if (ddq->d_ino_softlimit &&
+ +		    be64_to_cpu(ddq->d_icount) >
+ +				be64_to_cpu(ddq->d_ino_softlimit)) {
+ +			if (!ddq->d_itimer) {
+ +				if (flags & XFS_QMOPT_DOWARN)
+ +					xfs_alert(mp,
+ +			"%s : Dquot ID 0x%x (0x%p) INODE TIMER NOT STARTED",
+ +					str, (int)be32_to_cpu(ddq->d_id), ddq);
+ +				errs++;
+ +			}
+ +		}
+ +		if (ddq->d_rtb_softlimit &&
+ +		    be64_to_cpu(ddq->d_rtbcount) >
+ +				be64_to_cpu(ddq->d_rtb_softlimit)) {
+ +			if (!ddq->d_rtbtimer) {
+ +				if (flags & XFS_QMOPT_DOWARN)
+ +					xfs_alert(mp,
+ +			"%s : Dquot ID 0x%x (0x%p) RTBLK TIMER NOT STARTED",
+ +					str, (int)be32_to_cpu(ddq->d_id), ddq);
+ +				errs++;
+ +			}
+ +		}
+ +	}
+  
+ -	return NULL;
+ +	return errs;
+  }
+  
++ xfs_failaddr_t
++ xfs_dqblk_verify(
++ 	struct xfs_mount	*mp,
++ 	struct xfs_dqblk	*dqb,
++ 	xfs_dqid_t	 	id,
++ 	uint		 	type)	/* used only during quotacheck */
++ {
++ 	if (xfs_sb_version_hascrc(&mp->m_sb) &&
++ 	    !uuid_equal(&dqb->dd_uuid, &mp->m_sb.sb_meta_uuid))
++ 		return __this_address;
++ 
++ 	return xfs_dquot_verify(mp, &dqb->dd_diskdq, id, type);
++ }
++ 
+  /*
+   * Do some primitive error checking on ondisk dquot data structures.
+   */
+@@@ -206,13 -179,13 +228,18 @@@ xfs_dquot_buf_verify_crc
+  	return true;
+  }
+  
+ -STATIC xfs_failaddr_t
+ +STATIC bool
+  xfs_dquot_buf_verify(
+  	struct xfs_mount	*mp,
+ -	struct xfs_buf		*bp)
+ +	struct xfs_buf		*bp,
+ +	int			warn)
+  {
+++<<<<<<< HEAD
+ +	struct xfs_dqblk	*d = (struct xfs_dqblk *)bp->b_addr;
+++=======
++ 	struct xfs_dqblk	*dqb = bp->b_addr;
++ 	xfs_failaddr_t		fa;
+++>>>>>>> 7224fa482a6d (xfs: add full xfs_dqblk verifier)
+  	xfs_dqid_t		id = 0;
+  	int			ndquots;
+  	int			i;
+@@@ -236,18 -209,27 +263,24 @@@
+  	 */
+  	for (i = 0; i < ndquots; i++) {
+  		struct xfs_disk_dquot	*ddq;
+ +		int			error;
+  
+- 		ddq = &d[i].dd_diskdq;
++ 		ddq = &dqb[i].dd_diskdq;
+  
+  		if (i == 0)
+  			id = be32_to_cpu(ddq->d_id);
+  
+++<<<<<<< HEAD
+ +		error = xfs_dqcheck(mp, ddq, id + i, 0, warn, __func__);
+ +		if (error)
+ +			return false;
+++=======
++ 		fa = xfs_dqblk_verify(mp, &dqb[i], id + i, 0);
++ 		if (fa)
++ 			return fa;
+++>>>>>>> 7224fa482a6d (xfs: add full xfs_dqblk verifier)
+  	}
+ -
+ -	return NULL;
+ -}
+ -
+ -static xfs_failaddr_t
+ -xfs_dquot_buf_verify_struct(
+ -	struct xfs_buf		*bp)
+ -{
+ -	struct xfs_mount	*mp = bp->b_target->bt_mount;
+ -
+ -	return xfs_dquot_buf_verify(mp, bp);
+ +	return true;
+  }
+  
+  static void
+diff --cc fs/xfs/libxfs/xfs_quota_defs.h
+index 7187ec93fc76,1aac52d7fef4..000000000000
+--- a/fs/xfs/libxfs/xfs_quota_defs.h
++++ b/fs/xfs/libxfs/xfs_quota_defs.h
+@@@ -152,10 -151,12 +152,17 @@@ typedef uint16_t	xfs_qwarncnt_t
+  		(XFS_QMOPT_UQUOTA | XFS_QMOPT_PQUOTA | XFS_QMOPT_GQUOTA)
+  #define XFS_QMOPT_RESBLK_MASK	(XFS_QMOPT_RES_REGBLKS | XFS_QMOPT_RES_RTBLKS)
+  
+++<<<<<<< HEAD
+ +extern int xfs_dqcheck(struct xfs_mount *mp, xfs_disk_dquot_t *ddq,
+ +		       xfs_dqid_t id, uint type, uint flags, const char *str);
+++=======
++ extern xfs_failaddr_t xfs_dquot_verify(struct xfs_mount *mp,
++ 		struct xfs_disk_dquot *ddq, xfs_dqid_t id, uint type);
++ extern xfs_failaddr_t xfs_dqblk_verify(struct xfs_mount *mp,
++ 		struct xfs_dqblk *dqb, xfs_dqid_t id, uint type);
+++>>>>>>> 7224fa482a6d (xfs: add full xfs_dqblk verifier)
+  extern int xfs_calc_dquots_per_chunk(unsigned int nbblks);
+ -extern int xfs_dqblk_repair(struct xfs_mount *mp, struct xfs_dqblk *dqb,
+ +extern int xfs_dquot_repair(struct xfs_mount *mp, struct xfs_disk_dquot *ddq,
+  		xfs_dqid_t id, uint type);
+  
+  #endif	/* __XFS_QUOTA_H__ */
+diff --cc fs/xfs/xfs_dquot.c
+index 7f1b77dc77fa,d0880c1add41..000000000000
+--- a/fs/xfs/xfs_dquot.c
++++ b/fs/xfs/xfs_dquot.c
+@@@ -963,7 -953,9 +963,8 @@@ xfs_qm_dqflush
+  {
+  	struct xfs_mount	*mp = dqp->q_mount;
+  	struct xfs_buf		*bp;
++ 	struct xfs_dqblk	*dqb;
+  	struct xfs_disk_dquot	*ddqp;
+ -	xfs_failaddr_t		fa;
+  	int			error;
+  
+  	ASSERT(XFS_DQ_IS_LOCKED(dqp));
+@@@ -1005,14 -997,16 +1006,22 @@@
+  	/*
+  	 * Calculate the location of the dquot inside the buffer.
+  	 */
+- 	ddqp = bp->b_addr + dqp->q_bufoffset;
++ 	dqb = bp->b_addr + dqp->q_bufoffset;
++ 	ddqp = &dqb->dd_diskdq;
+  
+  	/*
+- 	 * A simple sanity check in case we got a corrupted dquot..
++ 	 * A simple sanity check in case we got a corrupted dquot.
+  	 */
+++<<<<<<< HEAD
+ +	error = xfs_dqcheck(mp, &dqp->q_core, be32_to_cpu(ddqp->d_id), 0,
+ +			   XFS_QMOPT_DOWARN, "dqflush (incore copy)");
+ +	if (error) {
+++=======
++ 	fa = xfs_dqblk_verify(mp, dqb, be32_to_cpu(ddqp->d_id), 0);
++ 	if (fa) {
++ 		xfs_alert(mp, "corrupt dquot ID 0x%x in memory at %pS",
++ 				be32_to_cpu(ddqp->d_id), fa);
+++>>>>>>> 7224fa482a6d (xfs: add full xfs_dqblk verifier)
+  		xfs_buf_relse(bp);
+  		xfs_dqfunlock(dqp);
+  		xfs_force_shutdown(mp, SHUTDOWN_CORRUPT_INCORE);
+diff --cc fs/xfs/xfs_qm.c
+index f3f3d4e5a473,c72a8da55703..000000000000
+--- a/fs/xfs/xfs_qm.c
++++ b/fs/xfs/xfs_qm.c
+@@@ -725,11 -862,12 +725,17 @@@ xfs_qm_reset_dqcounts
+  		/*
+  		 * Do a sanity check, and if needed, repair the dqblk. Don't
+  		 * output any warnings because it's perfectly possible to
+ -		 * find uninitialised dquot blks. See comment in
+ -		 * xfs_dquot_verify.
+ +		 * find uninitialised dquot blks. See comment in xfs_dqcheck.
+  		 */
+++<<<<<<< HEAD
+ +		error = xfs_dqcheck(mp, ddq, id+j, type, 0, "xfs_quotacheck");
+ +		if (error)
+ +			xfs_dquot_repair(mp, ddq, id + j, type);
+++=======
++ 		fa = xfs_dqblk_verify(mp, &dqb[j], id + j, type);
++ 		if (fa)
++ 			xfs_dqblk_repair(mp, &dqb[j], id + j, type);
+++>>>>>>> 7224fa482a6d (xfs: add full xfs_dqblk verifier)
+  
+  		/*
+  		 * Reset type in case we are reusing group quota file for
+* Unmerged path fs/xfs/libxfs/xfs_dquot_buf.c
+* Unmerged path fs/xfs/libxfs/xfs_quota_defs.h
+* Unmerged path fs/xfs/xfs_dquot.c
+* Unmerged path fs/xfs/xfs_qm.c
