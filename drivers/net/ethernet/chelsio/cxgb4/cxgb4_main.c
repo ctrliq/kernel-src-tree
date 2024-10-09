@@ -2918,7 +2918,6 @@ EXPORT_SYMBOL(cxgb4_create_server_filter);
 int cxgb4_remove_server_filter(const struct net_device *dev, unsigned int stid,
 		unsigned int queue, bool ipv6)
 {
-	int ret;
 	struct filter_entry *f;
 	struct adapter *adap;
 
@@ -2932,11 +2931,7 @@ int cxgb4_remove_server_filter(const struct net_device *dev, unsigned int stid,
 	/* Unlock the filter */
 	f->locked = 0;
 
-	ret = delete_filter(adap, stid);
-	if (ret)
-		return ret;
-
-	return 0;
+	return delete_filter(adap, stid);
 }
 EXPORT_SYMBOL(cxgb4_remove_server_filter);
 
