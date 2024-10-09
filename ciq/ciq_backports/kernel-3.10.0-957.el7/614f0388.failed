@@ -1,0 +1,193 @@
+mmc: block: move single ioctl() commands to block requests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+Rebuild_CHGLOG: - [mmc] block: move single ioctl() commands to block requests (Gopal Tiwari) [1456570]
+Rebuild_FUZZ: 95.50%
+commit-author Linus Walleij <linus.walleij@linaro.org>
+commit 614f0388f580c436d2cf6dc0855de91d13ddc23d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/614f0388.failed
+
+This wraps single ioctl() commands into block requests using
+the custom block layer request types REQ_OP_DRV_IN and
+REQ_OP_DRV_OUT.
+
+By doing this we are loosening the grip on the big host lock,
+since two calls to mmc_get_card()/mmc_put_card() are removed.
+
+We are storing the ioctl() in/out argument as a pointer in
+the per-request struct mmc_blk_request container. Since we
+now let the block layer allocate this data, blk_get_request()
+will allocate it for us and we can immediately dereference
+it and use it to pass the argument into the block layer.
+
+We refactor the if/else/if/else ladder in mmc_blk_issue_rq()
+as part of the job, keeping some extra attention to the
+case when a NULL req is passed into this function and
+making that pipeline flush more explicit.
+
+Tested on the ux500 with the userspace:
+mmc extcsd read /dev/mmcblk3
+resulting in a successful EXTCSD info dump back to the
+console.
+
+This commit fixes a starvation issue in the MMC/SD stack
+that can be easily provoked in the following way by
+issueing the following commands in sequence:
+
+> dd if=/dev/mmcblk3 of=/dev/null bs=1M &
+> mmc extcs read /dev/mmcblk3
+
+Before this patch, the extcsd read command would hang
+(starve) while waiting for the dd command to finish since
+the block layer was holding the card/host lock.
+
+After this patch, the extcsd ioctl() command is nicely
+interpersed with the rest of the block commands and we
+can issue a bunch of ioctl()s from userspace while there
+is some busy block IO going on without any problems.
+
+Conversely userspace ioctl()s can no longer starve
+the block layer by holding the card/host lock.
+
+	Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+	Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+	Tested-by: Avri Altman <Avri.Altman@sandisk.com>
+(cherry picked from commit 614f0388f580c436d2cf6dc0855de91d13ddc23d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/core/block.c
+#	drivers/mmc/core/queue.h
+diff --cc drivers/mmc/core/block.c
+index 97e814713e97,9fb2bd529156..000000000000
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@@ -1802,22 -1882,55 +1830,74 @@@ int mmc_blk_issue_rq(struct mmc_queue *
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	mq->flags &= ~MMC_QUEUE_NEW_REQUEST;
+ +	if (cmd_flags & REQ_DISCARD) {
+ +		/* complete ongoing async transfer before issuing discard */
+ +		if (card->host->areq)
+ +			mmc_blk_issue_rw_rq(mq, NULL);
+ +		if (req->cmd_flags & REQ_SECURE)
+ +			ret = mmc_blk_issue_secdiscard_rq(mq, req);
+ +		else
+ +			ret = mmc_blk_issue_discard_rq(mq, req);
+ +	} else if (cmd_flags & REQ_FLUSH) {
+ +		/* complete ongoing async transfer before issuing flush */
+ +		if (card->host->areq)
+ +			mmc_blk_issue_rw_rq(mq, NULL);
+ +		ret = mmc_blk_issue_flush(mq, req);
+ +	} else {
+ +		ret = mmc_blk_issue_rw_rq(mq, req);
+++=======
++ 	if (req) {
++ 		switch (req_op(req)) {
++ 		case REQ_OP_DRV_IN:
++ 		case REQ_OP_DRV_OUT:
++ 			/*
++ 			 * Complete ongoing async transfer before issuing
++ 			 * ioctl()s
++ 			 */
++ 			if (mq->qcnt)
++ 				mmc_blk_issue_rw_rq(mq, NULL);
++ 			mmc_blk_ioctl_cmd_issue(mq, req);
++ 			break;
++ 		case REQ_OP_DISCARD:
++ 			/*
++ 			 * Complete ongoing async transfer before issuing
++ 			 * discard.
++ 			 */
++ 			if (mq->qcnt)
++ 				mmc_blk_issue_rw_rq(mq, NULL);
++ 			mmc_blk_issue_discard_rq(mq, req);
++ 			break;
++ 		case REQ_OP_SECURE_ERASE:
++ 			/*
++ 			 * Complete ongoing async transfer before issuing
++ 			 * secure erase.
++ 			 */
++ 			if (mq->qcnt)
++ 				mmc_blk_issue_rw_rq(mq, NULL);
++ 			mmc_blk_issue_secdiscard_rq(mq, req);
++ 			break;
++ 		case REQ_OP_FLUSH:
++ 			/*
++ 			 * Complete ongoing async transfer before issuing
++ 			 * flush.
++ 			 */
++ 			if (mq->qcnt)
++ 				mmc_blk_issue_rw_rq(mq, NULL);
++ 			mmc_blk_issue_flush(mq, req);
++ 			break;
++ 		default:
++ 			/* Normal request, just issue it */
++ 			mmc_blk_issue_rw_rq(mq, req);
++ 			card->host->context_info.is_waiting_last_req = false;
++ 			break;
++ 		};
++ 	} else {
++ 		/* No request, flushing the pipeline with NULL */
++ 		mmc_blk_issue_rw_rq(mq, NULL);
++ 		card->host->context_info.is_waiting_last_req = false;
+++>>>>>>> 614f0388f580 (mmc: block: move single ioctl() commands to block requests)
+  	}
+  
+  out:
+diff --cc drivers/mmc/core/queue.h
+index a61f88199573,005ece9ac7cb..000000000000
+--- a/drivers/mmc/core/queue.h
++++ b/drivers/mmc/core/queue.h
+@@@ -1,11 -1,28 +1,12 @@@
+  #ifndef MMC_QUEUE_H
+  #define MMC_QUEUE_H
+  
+ -#include <linux/types.h>
+ -#include <linux/blkdev.h>
+ -#include <linux/blk-mq.h>
+ -#include <linux/mmc/core.h>
+ -#include <linux/mmc/host.h>
+ -
+ -static inline struct mmc_queue_req *req_to_mmc_queue_req(struct request *rq)
+ -{
+ -	return blk_mq_rq_to_pdu(rq);
+ -}
+ -
+ -static inline bool mmc_req_is_special(struct request *req)
+ -{
+ -	return req &&
+ -		(req_op(req) == REQ_OP_FLUSH ||
+ -		 req_op(req) == REQ_OP_DISCARD ||
+ -		 req_op(req) == REQ_OP_SECURE_ERASE);
+ -}
+ +#define MMC_REQ_SPECIAL_MASK	(REQ_DISCARD | REQ_FLUSH)
+  
+ +struct request;
+  struct task_struct;
+  struct mmc_blk_data;
++ struct mmc_blk_ioc_data;
+  
+  struct mmc_blk_request {
+  	struct mmc_request	mrq;
+@@@ -23,7 -40,9 +24,13 @@@ struct mmc_queue_req 
+  	char			*bounce_buf;
+  	struct scatterlist	*bounce_sg;
+  	unsigned int		bounce_sg_len;
+++<<<<<<< HEAD
+ +	struct mmc_async_req	mmc_active;
+++=======
++ 	struct mmc_async_req	areq;
++ 	int			ioc_result;
++ 	struct mmc_blk_ioc_data	*idata;
+++>>>>>>> 614f0388f580 (mmc: block: move single ioctl() commands to block requests)
+  };
+  
+  struct mmc_queue {
+* Unmerged path drivers/mmc/core/block.c
+* Unmerged path drivers/mmc/core/queue.h
