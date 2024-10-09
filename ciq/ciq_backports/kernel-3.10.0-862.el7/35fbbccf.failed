@@ -1,0 +1,254 @@
+netvsc: save pointer to parent netvsc_device in channel table
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author stephen hemminger <stephen@networkplumber.org>
+commit 35fbbccfb417385c1c8cc6f799154ea1ebdc22ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/35fbbccf.failed
+
+Keep back pointer in the per-channel data structure to
+avoid any possible RCU related issues when napi poll is
+called but netvsc_device is in RCU limbo.
+
+	Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 35fbbccfb417385c1c8cc6f799154ea1ebdc22ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hyperv/hyperv_net.h
+#	drivers/net/hyperv/netvsc.c
+diff --cc drivers/net/hyperv/hyperv_net.h
+index a32d7f1b2505,d13572879e7e..000000000000
+--- a/drivers/net/hyperv/hyperv_net.h
++++ b/drivers/net/hyperv/hyperv_net.h
+@@@ -717,6 -724,20 +717,23 @@@ struct net_device_context 
+  	bool datapath;	/* 0 - synthetic, 1 - VF nic */
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* Per channel data */
++ struct netvsc_channel {
++ 	struct vmbus_channel *channel;
++ 	struct netvsc_device *net_device;
++ 	const struct vmpacket_descriptor *desc;
++ 	struct napi_struct napi;
++ 	struct multi_send_data msd;
++ 	struct multi_recv_comp mrc;
++ 	atomic_t queue_sends;
++ 
++ 	struct netvsc_stats tx_stats;
++ 	struct netvsc_stats rx_stats;
++ };
++ 
+++>>>>>>> 35fbbccfb417 (netvsc: save pointer to parent netvsc_device in channel table)
+  /* Per netvsc device */
+  struct netvsc_device {
+  	u32 nvsp_version;
+diff --cc drivers/net/hyperv/netvsc.c
+index 3170ba757106,c15640c6fd83..000000000000
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@@ -1238,101 -1202,74 +1238,155 @@@ static void netvsc_process_raw_pkt(stru
+  
+  	default:
+  		netdev_err(ndev, "unhandled packet type %d, tid %llx\n",
+ -			   desc->type, desc->trans_id);
+ +			   desc->type, request_id);
+  		break;
+  	}
+ -
+ -	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct hv_device *netvsc_channel_to_device(struct vmbus_channel *channel)
++ {
++ 	struct vmbus_channel *primary = channel->primary_channel;
++ 
++ 	return primary ? primary->device_obj : channel->device_obj;
++ }
++ 
++ /* Network processing softirq
++  * Process data in incoming ring buffer from host
++  * Stops when ring is empty or budget is met or exceeded.
++  */
++ int netvsc_poll(struct napi_struct *napi, int budget)
++ {
++ 	struct netvsc_channel *nvchan
++ 		= container_of(napi, struct netvsc_channel, napi);
++ 	struct netvsc_device *net_device = nvchan->net_device;
++ 	struct vmbus_channel *channel = nvchan->channel;
++ 	struct hv_device *device = netvsc_channel_to_device(channel);
++ 	u16 q_idx = channel->offermsg.offer.sub_channel_index;
++ 	struct net_device *ndev = hv_get_drvdata(device);
++ 	int work_done = 0;
++ 
++ 	/* If starting a new interval */
++ 	if (!nvchan->desc)
++ 		nvchan->desc = hv_pkt_iter_first(channel);
++ 
++ 	while (nvchan->desc && work_done < budget) {
++ 		work_done += netvsc_process_raw_pkt(device, channel, net_device,
++ 						    ndev, nvchan->desc, budget);
++ 		nvchan->desc = hv_pkt_iter_next(channel, nvchan->desc);
++ 	}
++ 
++ 	/* If receive ring was exhausted
++ 	 * and not doing busy poll
++ 	 * then re-enable host interrupts
++ 	 *  and reschedule if ring is not empty.
++ 	 */
++ 	if (work_done < budget &&
++ 	    napi_complete_done(napi, work_done) &&
++ 	    hv_end_read(&channel->inbound) != 0)
++ 		napi_reschedule(napi);
++ 
++ 	netvsc_chk_recv_comp(net_device, channel, q_idx);
++ 
++ 	/* Driver may overshoot since multiple packets per descriptor */
++ 	return min(work_done, budget);
++ }
++ 
++ /* Call back when data is available in host ring buffer.
++  * Processing is deferred until network softirq (NAPI)
++  */
+++>>>>>>> 35fbbccfb417 (netvsc: save pointer to parent netvsc_device in channel table)
+  void netvsc_channel_cb(void *context)
+  {
+ -	struct netvsc_channel *nvchan = context;
+ +	int ret;
+ +	struct vmbus_channel *channel = (struct vmbus_channel *)context;
+ +	u16 q_idx = channel->offermsg.offer.sub_channel_index;
+ +	struct hv_device *device;
+ +	struct netvsc_device *net_device;
+ +	u32 bytes_recvd;
+ +	u64 request_id;
+ +	struct vmpacket_descriptor *desc;
+ +	unsigned char *buffer;
+ +	int bufferlen = NETVSC_PACKET_SIZE;
+ +	struct net_device *ndev;
+ +	bool need_to_commit = false;
+  
+ -	if (napi_schedule_prep(&nvchan->napi)) {
+ -		/* disable interupts from host */
+ -		hv_begin_read(&nvchan->channel->inbound);
+ +	if (channel->primary_channel != NULL)
+ +		device = channel->primary_channel->device_obj;
+ +	else
+ +		device = channel->device_obj;
+  
+ -		__napi_schedule(&nvchan->napi);
+ -	}
+ +	net_device = get_inbound_net_device(device);
+ +	if (!net_device)
+ +		return;
+ +	ndev = hv_get_drvdata(device);
+ +	buffer = get_per_channel_state(channel);
+ +
+ +	/* commit_rd_index() -> hv_signal_on_read() needs this. */
+ +	init_cached_read_index(channel);
+ +
+ +	do {
+ +		desc = get_next_pkt_raw(channel);
+ +		if (desc != NULL) {
+ +			netvsc_process_raw_pkt(device,
+ +					       channel,
+ +					       net_device,
+ +					       ndev,
+ +					       desc->trans_id,
+ +					       desc);
+ +
+ +			put_pkt_raw(channel, desc);
+ +			need_to_commit = true;
+ +			continue;
+ +		}
+ +		if (need_to_commit) {
+ +			need_to_commit = false;
+ +			commit_rd_index(channel);
+ +		}
+ +
+ +		ret = vmbus_recvpacket_raw(channel, buffer, bufferlen,
+ +					   &bytes_recvd, &request_id);
+ +		if (ret == 0) {
+ +			if (bytes_recvd > 0) {
+ +				desc = (struct vmpacket_descriptor *)buffer;
+ +				netvsc_process_raw_pkt(device,
+ +						       channel,
+ +						       net_device,
+ +						       ndev,
+ +						       request_id,
+ +						       desc);
+ +			} else {
+ +				/*
+ +				 * We are done for this pass.
+ +				 */
+ +				break;
+ +			}
+ +
+ +		} else if (ret == -ENOBUFS) {
+ +			if (bufferlen > NETVSC_PACKET_SIZE)
+ +				kfree(buffer);
+ +			/* Handle large packet */
+ +			buffer = kmalloc(bytes_recvd, GFP_ATOMIC);
+ +			if (buffer == NULL) {
+ +				/* Try again next time around */
+ +				netdev_err(ndev,
+ +					   "unable to allocate buffer of size "
+ +					   "(%d)!!\n", bytes_recvd);
+ +				break;
+ +			}
+ +
+ +			bufferlen = bytes_recvd;
+ +		}
+ +
+ +		init_cached_read_index(channel);
+ +
+ +	} while (1);
+ +
+ +	if (bufferlen > NETVSC_PACKET_SIZE)
+ +		kfree(buffer);
+ +
+ +	netvsc_chk_recv_comp(net_device, channel, q_idx);
+  }
+  
+  /*
+@@@ -1354,7 -1291,28 +1408,32 @@@ int netvsc_device_add(struct hv_device 
+  
+  	net_device->ring_size = ring_size;
+  
+++<<<<<<< HEAD
+ +	set_per_channel_state(device->channel, net_device->cb_buffer);
+++=======
++ 	/* Because the device uses NAPI, all the interrupt batching and
++ 	 * control is done via Net softirq, not the channel handling
++ 	 */
++ 	set_channel_read_mode(device->channel, HV_CALL_ISR);
++ 
++ 	/* If we're reopening the device we may have multiple queues, fill the
++ 	 * chn_table with the default channel to use it before subchannels are
++ 	 * opened.
++ 	 * Initialize the channel state before we open;
++ 	 * we can be interrupted as soon as we open the channel.
++ 	 */
++ 
++ 	for (i = 0; i < VRSS_CHANNEL_MAX; i++) {
++ 		struct netvsc_channel *nvchan = &net_device->chan_table[i];
++ 
++ 		nvchan->channel = device->channel;
++ 		nvchan->net_device = net_device;
++ 	}
++ 
++ 	/* Enable NAPI handler before init callbacks */
++ 	netif_napi_add(ndev, &net_device->chan_table[0].napi,
++ 		       netvsc_poll, NAPI_POLL_WEIGHT);
+++>>>>>>> 35fbbccfb417 (netvsc: save pointer to parent netvsc_device in channel table)
+  
+  	/* Open the channel */
+  	ret = vmbus_open(device->channel, ring_size * PAGE_SIZE,
+* Unmerged path drivers/net/hyperv/hyperv_net.h
+* Unmerged path drivers/net/hyperv/netvsc.c
