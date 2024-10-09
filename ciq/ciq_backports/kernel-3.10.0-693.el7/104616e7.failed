@@ -1,0 +1,159 @@
+switchdev: don't support custom ip rules, for now
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Scott Feldman <sfeldma@gmail.com>
+commit 104616e74e0b464d449fdd2ee2f547d2fad71610
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/104616e7.failed
+
+Keep switchdev FIB offload model simple for now and don't allow custom ip
+rules.
+
+	Signed-off-by: Scott Feldman <sfeldma@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 104616e74e0b464d449fdd2ee2f547d2fad71610)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/switchdev/switchdev.c
+* Unmerged path net/switchdev/switchdev.c
+diff --git a/include/net/ip_fib.h b/include/net/ip_fib.h
+index bd39ad070a71..9a00b98ddda8 100644
+--- a/include/net/ip_fib.h
++++ b/include/net/ip_fib.h
+@@ -199,6 +199,7 @@ int fib_table_delete(struct fib_table *, struct fib_config *);
+ int fib_table_dump(struct fib_table *table, struct sk_buff *skb,
+ 		   struct netlink_callback *cb);
+ int fib_table_flush(struct fib_table *table);
++void fib_table_flush_external(struct fib_table *table);
+ void fib_free_table(struct fib_table *tb);
+ 
+ 
+@@ -325,6 +326,7 @@ static inline int fib_num_tclassid_users(struct net *net)
+ 	return 0;
+ }
+ #endif
++void fib_flush_external(struct net *net);
+ 
+ /* Exported by fib_semantics.c */
+ int ip_fib_check_default(__be32 gw, struct net_device *dev);
+diff --git a/net/ipv4/fib_frontend.c b/net/ipv4/fib_frontend.c
+index b7cf82681a4f..d3c53161116c 100644
+--- a/net/ipv4/fib_frontend.c
++++ b/net/ipv4/fib_frontend.c
+@@ -144,6 +144,19 @@ static void fib_flush(struct net *net)
+ 		rt_cache_flush(net);
+ }
+ 
++void fib_flush_external(struct net *net)
++{
++	struct fib_table *tb;
++	struct hlist_head *head;
++	unsigned int h;
++
++	for (h = 0; h < FIB_TABLE_HASHSZ; h++) {
++		head = &net->ipv4.fib_table_hash[h];
++		hlist_for_each_entry(tb, head, tb_hlist)
++			fib_table_flush_external(tb);
++	}
++}
++
+ /*
+  * Find address type as if only "dev" was present in the system. If
+  * on_dev is NULL then all interfaces are taken into consideration.
+diff --git a/net/ipv4/fib_rules.c b/net/ipv4/fib_rules.c
+index 87cf295c5f91..7d69a6b1f6cb 100644
+--- a/net/ipv4/fib_rules.c
++++ b/net/ipv4/fib_rules.c
+@@ -182,6 +182,8 @@ static int fib4_rule_configure(struct fib_rule *rule, struct sk_buff *skb,
+ 	rule4->tos = frh->tos;
+ 
+ 	net->ipv4.fib_has_custom_rules = true;
++	fib_flush_external(rule->fr_net);
++
+ 	err = 0;
+ errout:
+ 	return err;
+@@ -197,6 +199,7 @@ static void fib4_rule_delete(struct fib_rule *rule)
+ 		net->ipv4.fib_num_tclassid_users--;
+ #endif
+ 	net->ipv4.fib_has_custom_rules = true;
++	fib_flush_external(rule->fr_net);
+ }
+ 
+ static int fib4_rule_compare(struct fib_rule *rule, struct fib_rule_hdr *frh,
+diff --git a/net/ipv4/fib_trie.c b/net/ipv4/fib_trie.c
+index 9511456e5325..7b1473c336e8 100644
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@ -1554,6 +1554,67 @@ found:
+ 	return n;
+ }
+ 
++/* Caller must hold RTNL */
++void fib_table_flush_external(struct fib_table *tb)
++{
++	struct trie *t = (struct trie *)tb->tb_data;
++	struct fib_alias *fa;
++	struct tnode *n, *pn;
++	unsigned long cindex;
++	unsigned char slen;
++	int found = 0;
++
++	n = rcu_dereference(t->trie);
++	if (!n)
++		return;
++
++	pn = NULL;
++	cindex = 0;
++
++	while (IS_TNODE(n)) {
++		/* record pn and cindex for leaf walking */
++		pn = n;
++		cindex = 1ul << n->bits;
++backtrace:
++		/* walk trie in reverse order */
++		do {
++			while (!(cindex--)) {
++				t_key pkey = pn->key;
++
++				n = pn;
++				pn = node_parent(n);
++
++				/* resize completed node */
++				resize(t, n);
++
++				/* if we got the root we are done */
++				if (!pn)
++					return;
++
++				cindex = get_index(pkey, pn);
++			}
++
++			/* grab the next available node */
++			n = tnode_get_child(pn, cindex);
++		} while (!n);
++	}
++
++	hlist_for_each_entry(fa, &n->leaf, fa_list) {
++		struct fib_info *fi = fa->fa_info;
++
++		if (fi && (fi->fib_flags & RTNH_F_EXTERNAL)) {
++			netdev_switch_fib_ipv4_del(n->key,
++						   KEYLENGTH - fa->fa_slen,
++						   fi, fa->fa_tos,
++						   fa->fa_type, tb->tb_id);
++		}
++	}
++
++	/* if trie is leaf only loop is completed */
++	if (pn)
++		goto backtrace;
++}
++
+ /* Caller must hold RTNL. */
+ int fib_table_flush(struct fib_table *tb)
+ {
+* Unmerged path net/switchdev/switchdev.c
