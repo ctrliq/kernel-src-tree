@@ -1,0 +1,153 @@
+s390/scm_block: allocate aidaw pages only when necessary
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+Rebuild_CHGLOG: - [s390] scm_block: allocate aidaw pages only when necessary (Hendrik Brueckner) [1274409]
+Rebuild_FUZZ: 95.33%
+commit-author Sebastian Ott <sebott@linux.vnet.ibm.com>
+commit de88d0d28fe932637eb5b7ebf9e638256cf07979
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/de88d0d2.failed
+
+AOBs (the structure describing the HW request) need to be 4K
+aligned but very little of that page is actually used. With
+this patch we place aidaws at the end of the AOB page and only
+allocate a separate page for aidaws when we have to (lists of
+aidaws must not cross page boundaries).
+
+	Signed-off-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit de88d0d28fe932637eb5b7ebf9e638256cf07979)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/block/scm_blk.c
+#	drivers/s390/block/scm_blk.h
+#	drivers/s390/block/scm_blk_cluster.c
+diff --cc drivers/s390/block/scm_blk.c
+index b2ecdc8a0df9,f5c369ce7e73..000000000000
+--- a/drivers/s390/block/scm_blk.c
++++ b/drivers/s390/block/scm_blk.c
+@@@ -111,8 -117,14 +111,15 @@@ out
+  
+  static void scm_request_done(struct scm_request *scmrq)
+  {
+ -	struct msb *msb = &scmrq->aob->msb[0];
+ -	u64 aidaw = msb->data_addr;
+  	unsigned long flags;
+  
+++<<<<<<< HEAD
+++=======
++ 	if ((msb->flags & MSB_FLAG_IDA) && aidaw &&
++ 	    IS_ALIGNED(aidaw, PAGE_SIZE))
++ 		mempool_free(virt_to_page(aidaw), aidaw_pool);
++ 
+++>>>>>>> de88d0d28fe9 (s390/scm_block: allocate aidaw pages only when necessary)
+  	spin_lock_irqsave(&list_lock, flags);
+  	list_add(&scmrq->list, &inactive_requests);
+  	spin_unlock_irqrestore(&list_lock, flags);
+@@@ -123,15 -135,47 +130,59 @@@ static bool scm_permit_request(struct s
+  	return rq_data_dir(req) != WRITE || bdev->state != SCM_WR_PROHIBIT;
+  }
+  
+++<<<<<<< HEAD
+ +static void scm_request_prepare(struct scm_request *scmrq)
+ +{
+ +	struct scm_blk_dev *bdev = scmrq->bdev;
+ +	struct scm_device *scmdev = bdev->gendisk->private_data;
+ +	struct aidaw *aidaw = scmrq->aidaw;
+ +	struct msb *msb = &scmrq->aob->msb[0];
+ +	struct req_iterator iter;
+ +	struct bio_vec *bv;
+ +
+++=======
++ static inline struct aidaw *scm_aidaw_alloc(void)
++ {
++ 	struct page *page = mempool_alloc(aidaw_pool, GFP_ATOMIC);
++ 
++ 	return page ? page_address(page) : NULL;
++ }
++ 
++ static inline unsigned long scm_aidaw_bytes(struct aidaw *aidaw)
++ {
++ 	unsigned long _aidaw = (unsigned long) aidaw;
++ 	unsigned long bytes = ALIGN(_aidaw, PAGE_SIZE) - _aidaw;
++ 
++ 	return (bytes / sizeof(*aidaw)) * PAGE_SIZE;
++ }
++ 
++ struct aidaw *scm_aidaw_fetch(struct scm_request *scmrq, unsigned int bytes)
++ {
++ 	struct aidaw *aidaw;
++ 
++ 	if (scm_aidaw_bytes(scmrq->next_aidaw) >= bytes)
++ 		return scmrq->next_aidaw;
++ 
++ 	aidaw = scm_aidaw_alloc();
++ 	if (aidaw)
++ 		memset(aidaw, 0, PAGE_SIZE);
++ 	return aidaw;
++ }
++ 
++ static int scm_request_prepare(struct scm_request *scmrq)
++ {
++ 	struct scm_blk_dev *bdev = scmrq->bdev;
++ 	struct scm_device *scmdev = bdev->gendisk->private_data;
++ 	struct msb *msb = &scmrq->aob->msb[0];
++ 	struct req_iterator iter;
++ 	struct aidaw *aidaw;
++ 	struct bio_vec bv;
++ 
++ 	aidaw = scm_aidaw_fetch(scmrq, blk_rq_bytes(scmrq->request));
++ 	if (!aidaw)
++ 		return -ENOMEM;
++ 
+++>>>>>>> de88d0d28fe9 (s390/scm_block: allocate aidaw pages only when necessary)
+  	msb->bs = MSB_BS_4K;
+  	scmrq->aob->request.msb_count = 1;
+  	msb->scm_addr = scmdev->address +
+diff --cc drivers/s390/block/scm_blk.h
+index 8b387b32fd62,6334e1609208..000000000000
+--- a/drivers/s390/block/scm_blk.h
++++ b/drivers/s390/block/scm_blk.h
+@@@ -30,8 -30,8 +30,9 @@@ struct scm_blk_dev 
+  
+  struct scm_request {
+  	struct scm_blk_dev *bdev;
++ 	struct aidaw *next_aidaw;
+  	struct request *request;
+ +	struct aidaw *aidaw;
+  	struct aob *aob;
+  	struct list_head list;
+  	u8 retries;
+@@@ -55,6 -55,8 +56,11 @@@ void scm_blk_irq(struct scm_device *, v
+  void scm_request_finish(struct scm_request *);
+  void scm_request_requeue(struct scm_request *);
+  
+++<<<<<<< HEAD
+++=======
++ struct aidaw *scm_aidaw_fetch(struct scm_request *scmrq, unsigned int bytes);
++ 
+++>>>>>>> de88d0d28fe9 (s390/scm_block: allocate aidaw pages only when necessary)
+  int scm_drv_init(void);
+  void scm_drv_cleanup(void);
+  
+diff --cc drivers/s390/block/scm_blk_cluster.c
+index 27f930cd657f,2fd01320b978..000000000000
+--- a/drivers/s390/block/scm_blk_cluster.c
++++ b/drivers/s390/block/scm_blk_cluster.c
+@@@ -131,7 -131,6 +131,10 @@@ static void scm_prepare_cluster_request
+  		scmrq->cluster.state = CLUSTER_READ;
+  		/* fall through */
+  	case CLUSTER_READ:
+++<<<<<<< HEAD
+ +		scmrq->aob->request.msb_count = 1;
+++=======
+++>>>>>>> de88d0d28fe9 (s390/scm_block: allocate aidaw pages only when necessary)
+  		msb->bs = MSB_BS_4K;
+  		msb->oc = MSB_OC_READ;
+  		msb->flags = MSB_FLAG_IDA;
+* Unmerged path drivers/s390/block/scm_blk.c
+* Unmerged path drivers/s390/block/scm_blk.h
+* Unmerged path drivers/s390/block/scm_blk_cluster.c
