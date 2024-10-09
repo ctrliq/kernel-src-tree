@@ -134,6 +134,7 @@ static void reg_mr_callback(int status, void *context)
 		return;
 	}
 
+	mr->mmkey.type = MLX5_MKEY_MR;
 	spin_lock_irqsave(&dev->mdev->priv.mkey_lock, flags);
 	key = dev->mdev->priv.mkey_key++;
 	spin_unlock_irqrestore(&dev->mdev->priv.mkey_lock, flags);
@@ -732,6 +733,7 @@ struct ib_mr *mlx5_ib_get_dma_mr(struct ib_pd *pd, int acc)
 		goto err_in;
 
 	kfree(in);
+	mr->mmkey.type = MLX5_MKEY_MR;
 	mr->ibmr.lkey = mr->mmkey.key;
 	mr->ibmr.rkey = mr->mmkey.key;
 	mr->umem = NULL;
@@ -1160,6 +1162,7 @@ static struct mlx5_ib_mr *reg_create(struct ib_mr *ibmr, struct ib_pd *pd,
 		mlx5_ib_warn(dev, "create mkey failed\n");
 		goto err_2;
 	}
+	mr->mmkey.type = MLX5_MKEY_MR;
 	mr->umem = umem;
 	mr->dev = dev;
 	mr->live = 1;
@@ -1660,6 +1663,7 @@ struct ib_mr *mlx5_ib_alloc_mr(struct ib_pd *pd,
 	if (err)
 		goto err_destroy_psv;
 
+	mr->mmkey.type = MLX5_MKEY_MR;
 	mr->ibmr.lkey = mr->mmkey.key;
 	mr->ibmr.rkey = mr->mmkey.key;
 	mr->umem = NULL;
@@ -1740,6 +1744,7 @@ struct ib_mw *mlx5_ib_alloc_mw(struct ib_pd *pd, enum ib_mw_type type,
 	if (err)
 		goto free;
 
+	mw->mmkey.type = MLX5_MKEY_MW;
 	mw->ibmw.rkey = mw->mmkey.key;
 
 	resp.response_length = min(offsetof(typeof(resp), response_length) +
