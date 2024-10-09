@@ -1,0 +1,969 @@
+list: fix order of arguments for hlist_add_after(_rcu)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Ken Helias <kenhelias@firemail.de>
+commit 1d023284c31a4e40a94d5bbcb7dbb7a35ee0bcbc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/1d023284.failed
+
+All other add functions for lists have the new item as first argument
+and the position where it is added as second argument.  This was changed
+for no good reason in this function and makes using it unnecessary
+confusing.
+
+The name was changed to hlist_add_behind() to cause unconverted code to
+generate a compile error instead of using the wrong parameter order.
+
+[akpm@linux-foundation.org: coding-style fixes]
+	Signed-off-by: Ken Helias <kenhelias@firemail.de>
+	Cc: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+	Acked-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>	[intel driver bits]
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Christoph Hellwig <hch@infradead.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 1d023284c31a4e40a94d5bbcb7dbb7a35ee0bcbc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/RCU/whatisRCU.txt
+#	drivers/staging/lustre/lustre/libcfs/hash.c
+#	fs/namespace.c
+#	net/batman-adv/fragmentation.c
+#	net/ipv4/fib_trie.c
+diff --cc Documentation/RCU/whatisRCU.txt
+index 10df0b82f459,e48c57f1943b..000000000000
+--- a/Documentation/RCU/whatisRCU.txt
++++ b/Documentation/RCU/whatisRCU.txt
+@@@ -806,12 -818,20 +806,16 @@@ RCU pointer/list update
+  	list_add_tail_rcu
+  	list_del_rcu
+  	list_replace_rcu
+++<<<<<<< HEAD
+ +	hlist_del_rcu
+ +	hlist_add_after_rcu
+++=======
++ 	hlist_add_behind_rcu
+++>>>>>>> 1d023284c31a (list: fix order of arguments for hlist_add_after(_rcu))
+  	hlist_add_before_rcu
+  	hlist_add_head_rcu
+ -	hlist_del_rcu
+ -	hlist_del_init_rcu
+  	hlist_replace_rcu
+  	list_splice_init_rcu()
+ -	hlist_nulls_del_init_rcu
+ -	hlist_nulls_del_rcu
+ -	hlist_nulls_add_head_rcu
+ -	hlist_bl_add_head_rcu
+ -	hlist_bl_del_init_rcu
+ -	hlist_bl_del_rcu
+ -	hlist_bl_set_first_rcu
+  
+  RCU:	Critical sections	Grace period		Barrier
+  
+diff --cc fs/namespace.c
+index 9440b6a5a3d4,2a1447c946e7..000000000000
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@@ -738,8 -797,11 +738,16 @@@ static void commit_tree(struct mount *m
+  
+  	list_splice(&head, n->list.prev);
+  
+++<<<<<<< HEAD
+ +	list_add_tail(&mnt->mnt_hash, mount_hashtable +
+ +				hash(&parent->mnt, mnt->mnt_mountpoint));
+++=======
++ 	if (shadows)
++ 		hlist_add_behind_rcu(&mnt->mnt_hash, &shadows->mnt_hash);
++ 	else
++ 		hlist_add_head_rcu(&mnt->mnt_hash,
++ 				m_hash(&parent->mnt, mnt->mnt_mountpoint));
+++>>>>>>> 1d023284c31a (list: fix order of arguments for hlist_add_after(_rcu))
+  	list_add_tail(&mnt->mnt_child, &parent->mnt_mounts);
+  	touch_mnt_namespace(n);
+  }
+diff --cc net/ipv4/fib_trie.c
+index 9511456e5325,e9cb2588e416..000000000000
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@@ -605,479 -838,342 +605,486 @@@ static struct key_vector *halve(struct 
+  
+  	pr_debug("In halve\n");
+  
+ -	tn = tnode_new(oldtnode->key, oldtnode->pos, oldtnode->bits - 1);
+ -
+ +	tn = tnode_new(oldtnode->key, oldtnode->pos + 1, oldtnode->bits - 1);
+  	if (!tn)
+ -		return ERR_PTR(-ENOMEM);
+ +		goto notnode;
+  
+ -	/*
+ -	 * Preallocate and store tnodes before the actual work so we
+ -	 * don't get into an inconsistent state if memory allocation
+ -	 * fails. In case of failure we return the oldnode and halve
+ -	 * of tnode is ignored.
+ +	/* prepare oldtnode to be freed */
+ +	tnode_free_init(oldtnode);
+ +
+ +	/* Assemble all of the pointers in our cluster, in this case that
+ +	 * represents all of the pointers out of our allocated nodes that
+ +	 * point to existing tnodes and the links between our allocated
+ +	 * nodes.
+  	 */
+ +	for (i = child_length(oldtnode); i;) {
+ +		struct key_vector *node1 = get_child(oldtnode, --i);
+ +		struct key_vector *node0 = get_child(oldtnode, --i);
+ +		struct key_vector *inode;
+  
+ -	for (i = 0; i < olen; i += 2) {
+ -		left = tnode_get_child(oldtnode, i);
+ -		right = tnode_get_child(oldtnode, i+1);
+ +		/* At least one of the children is empty */
+ +		if (!node1 || !node0) {
+ +			put_child(tn, i / 2, node1 ? : node0);
+ +			continue;
+ +		}
+  
+  		/* Two nonempty children */
+ -		if (left && right) {
+ -			struct tnode *newn;
+ +		inode = tnode_new(node0->key, oldtnode->pos, 1);
+ +		if (!inode)
+ +			goto nomem;
+ +		tnode_free_append(tn, inode);
+ +
+ +		/* initialize pointers out of node */
+ +		put_child(inode, 1, node1);
+ +		put_child(inode, 0, node0);
+ +		NODE_INIT_PARENT(inode, tn);
+ +
+ +		/* link parent to node */
+ +		put_child(tn, i / 2, inode);
+ +	}
+ +
+ +	/* setup the parent pointers into and out of this node */
+ +	return replace(t, oldtnode, tn);
+ +nomem:
+ +	/* all pointers should be clean so we are done */
+ +	tnode_free(tn);
+ +notnode:
+ +	return NULL;
+ +}
+  
+ -			newn = tnode_new(left->key, tn->pos + tn->bits, 1);
+ +static struct key_vector *collapse(struct trie *t,
+ +				   struct key_vector *oldtnode)
+ +{
+ +	struct key_vector *n, *tp;
+ +	unsigned long i;
+  
+ -			if (!newn)
+ -				goto nomem;
+ +	/* scan the tnode looking for that one child that might still exist */
+ +	for (n = NULL, i = child_length(oldtnode); !n && i;)
+ +		n = get_child(oldtnode, --i);
+  
+ -			put_child(tn, i/2, (struct rt_trie_node *)newn);
+ -		}
+ +	/* compress one level */
+ +	tp = node_parent(oldtnode);
+ +	put_child_root(tp, oldtnode->key, n);
+ +	node_set_parent(n, tp);
+  
+ -	}
+ +	/* drop dead node */
+ +	node_free(oldtnode);
+  
+ -	for (i = 0; i < olen; i += 2) {
+ -		struct tnode *newBinNode;
+ +	return tp;
+ +}
+  
+ -		left = tnode_get_child(oldtnode, i);
+ -		right = tnode_get_child(oldtnode, i+1);
+ +static unsigned char update_suffix(struct key_vector *tn)
+ +{
+ +	unsigned char slen = tn->pos;
+ +	unsigned long stride, i;
+  
+ -		/* At least one of the children is empty */
+ -		if (left == NULL) {
+ -			if (right == NULL)    /* Both are empty */
+ -				continue;
+ -			put_child(tn, i/2, right);
+ -			continue;
+ -		}
+ +	/* search though the list of children looking for nodes that might
+ +	 * have a suffix greater than the one we currently have.  This is
+ +	 * why we start with a stride of 2 since a stride of 1 would
+ +	 * represent the nodes with suffix length equal to tn->pos
+ +	 */
+ +	for (i = 0, stride = 0x2ul ; i < child_length(tn); i += stride) {
+ +		struct key_vector *n = get_child(tn, i);
+  
+ -		if (right == NULL) {
+ -			put_child(tn, i/2, left);
+ +		if (!n || (n->slen <= slen))
+  			continue;
+ -		}
+  
+ -		/* Two nonempty children */
+ -		newBinNode = (struct tnode *) tnode_get_child(tn, i/2);
+ -		put_child(tn, i/2, NULL);
+ -		put_child(newBinNode, 0, left);
+ -		put_child(newBinNode, 1, right);
+ -		put_child(tn, i/2, resize(t, newBinNode));
+ +		/* update stride and slen based on new value */
+ +		stride <<= (n->slen - slen);
+ +		slen = n->slen;
+ +		i &= ~(stride - 1);
+ +
+ +		/* if slen covers all but the last bit we can stop here
+ +		 * there will be nothing longer than that since only node
+ +		 * 0 and 1 << (bits - 1) could have that as their suffix
+ +		 * length.
+ +		 */
+ +		if ((slen + 1) >= (tn->pos + tn->bits))
+ +			break;
+  	}
+ -	tnode_free_safe(oldtnode);
+ -	return tn;
+ -nomem:
+ -	tnode_clean_free(tn);
+ -	return ERR_PTR(-ENOMEM);
+ -}
+  
+ -/* readside must use rcu_read_lock currently dump routines
+ - via get_fa_head and dump */
+ +	tn->slen = slen;
+ +
+ +	return slen;
+ +}
+  
+ -static struct leaf_info *find_leaf_info(struct leaf *l, int plen)
+ +/* From "Implementing a dynamic compressed trie" by Stefan Nilsson of
+ + * the Helsinki University of Technology and Matti Tikkanen of Nokia
+ + * Telecommunications, page 6:
+ + * "A node is doubled if the ratio of non-empty children to all
+ + * children in the *doubled* node is at least 'high'."
+ + *
+ + * 'high' in this instance is the variable 'inflate_threshold'. It
+ + * is expressed as a percentage, so we multiply it with
+ + * child_length() and instead of multiplying by 2 (since the
+ + * child array will be doubled by inflate()) and multiplying
+ + * the left-hand side by 100 (to handle the percentage thing) we
+ + * multiply the left-hand side by 50.
+ + *
+ + * The left-hand side may look a bit weird: child_length(tn)
+ + * - tn->empty_children is of course the number of non-null children
+ + * in the current node. tn->full_children is the number of "full"
+ + * children, that is non-null tnodes with a skip value of 0.
+ + * All of those will be doubled in the resulting inflated tnode, so
+ + * we just count them one extra time here.
+ + *
+ + * A clearer way to write this would be:
+ + *
+ + * to_be_doubled = tn->full_children;
+ + * not_to_be_doubled = child_length(tn) - tn->empty_children -
+ + *     tn->full_children;
+ + *
+ + * new_child_length = child_length(tn) * 2;
+ + *
+ + * new_fill_factor = 100 * (not_to_be_doubled + 2*to_be_doubled) /
+ + *      new_child_length;
+ + * if (new_fill_factor >= inflate_threshold)
+ + *
+ + * ...and so on, tho it would mess up the while () loop.
+ + *
+ + * anyway,
+ + * 100 * (not_to_be_doubled + 2*to_be_doubled) / new_child_length >=
+ + *      inflate_threshold
+ + *
+ + * avoid a division:
+ + * 100 * (not_to_be_doubled + 2*to_be_doubled) >=
+ + *      inflate_threshold * new_child_length
+ + *
+ + * expand not_to_be_doubled and to_be_doubled, and shorten:
+ + * 100 * (child_length(tn) - tn->empty_children +
+ + *    tn->full_children) >= inflate_threshold * new_child_length
+ + *
+ + * expand new_child_length:
+ + * 100 * (child_length(tn) - tn->empty_children +
+ + *    tn->full_children) >=
+ + *      inflate_threshold * child_length(tn) * 2
+ + *
+ + * shorten again:
+ + * 50 * (tn->full_children + child_length(tn) -
+ + *    tn->empty_children) >= inflate_threshold *
+ + *    child_length(tn)
+ + *
+ + */
+ +static inline bool should_inflate(struct key_vector *tp, struct key_vector *tn)
+  {
+ -	struct hlist_head *head = &l->list;
+ -	struct leaf_info *li;
+ +	unsigned long used = child_length(tn);
+ +	unsigned long threshold = used;
+  
+ -	hlist_for_each_entry_rcu(li, head, hlist)
+ -		if (li->plen == plen)
+ -			return li;
+ +	/* Keep root node larger */
+ +	threshold *= IS_TRIE(tp) ? inflate_threshold_root : inflate_threshold;
+ +	used -= tn_info(tn)->empty_children;
+ +	used += tn_info(tn)->full_children;
+  
+ -	return NULL;
+ +	/* if bits == KEYLENGTH then pos = 0, and will fail below */
+ +
+ +	return (used > 1) && tn->pos && ((50 * used) >= threshold);
+  }
+  
+ -static inline struct list_head *get_fa_head(struct leaf *l, int plen)
+ +static inline bool should_halve(struct key_vector *tp, struct key_vector *tn)
+  {
+ -	struct leaf_info *li = find_leaf_info(l, plen);
+ +	unsigned long used = child_length(tn);
+ +	unsigned long threshold = used;
+  
+ -	if (!li)
+ -		return NULL;
+ +	/* Keep root node larger */
+ +	threshold *= IS_TRIE(tp) ? halve_threshold_root : halve_threshold;
+ +	used -= tn_info(tn)->empty_children;
+  
+ -	return &li->falh;
+ +	/* if bits == KEYLENGTH then used = 100% on wrap, and will fail below */
+ +
+ +	return (used > 1) && (tn->bits > 1) && ((100 * used) < threshold);
+  }
+  
+ -static void insert_leaf_info(struct hlist_head *head, struct leaf_info *new)
+ +static inline bool should_collapse(struct key_vector *tn)
+  {
+ -	struct leaf_info *li = NULL, *last = NULL;
+ +	unsigned long used = child_length(tn);
+  
+ -	if (hlist_empty(head)) {
+ -		hlist_add_head_rcu(&new->hlist, head);
+ -	} else {
+ -		hlist_for_each_entry(li, head, hlist) {
+ -			if (new->plen > li->plen)
+ -				break;
+ +	used -= tn_info(tn)->empty_children;
+  
+ -			last = li;
+ -		}
+ -		if (last)
+ -			hlist_add_behind_rcu(&new->hlist, &last->hlist);
+ -		else
+ -			hlist_add_before_rcu(&new->hlist, &li->hlist);
+ -	}
+ -}
+ +	/* account for bits == KEYLENGTH case */
+ +	if ((tn->bits == KEYLENGTH) && tn_info(tn)->full_children)
+ +		used -= KEY_MAX;
+  
+ -/* rcu_read_lock needs to be hold by caller from readside */
+ +	/* One child or none, time to drop us from the trie */
+ +	return used < 2;
+ +}
+  
+ -static struct leaf *
+ -fib_find_node(struct trie *t, u32 key)
+ +#define MAX_WORK 10
+ +static struct key_vector *resize(struct trie *t, struct key_vector *tn)
+  {
+ -	int pos;
+ -	struct tnode *tn;
+ -	struct rt_trie_node *n;
+ -
+ -	pos = 0;
+ -	n = rcu_dereference_rtnl(t->trie);
+ +#ifdef CONFIG_IP_FIB_TRIE_STATS
+ +	struct trie_use_stats __percpu *stats = t->stats;
+ +#endif
+ +	struct key_vector *tp = node_parent(tn);
+ +	unsigned long cindex = get_index(tn->key, tp);
+ +	int max_work = MAX_WORK;
+  
+ -	while (n != NULL &&  NODE_TYPE(n) == T_TNODE) {
+ -		tn = (struct tnode *) n;
+ +	pr_debug("In tnode_resize %p inflate_threshold=%d threshold=%d\n",
+ +		 tn, inflate_threshold, halve_threshold);
+  
+ -		check_tnode(tn);
+ +	/* track the tnode via the pointer from the parent instead of
+ +	 * doing it ourselves.  This way we can let RCU fully do its
+ +	 * thing without us interfering
+ +	 */
+ +	BUG_ON(tn != get_child(tp, cindex));
+  
+ -		if (tkey_sub_equals(tn->key, pos, tn->pos-pos, key)) {
+ -			pos = tn->pos + tn->bits;
+ -			n = tnode_get_child_rcu(tn,
+ -						tkey_extract_bits(key,
+ -								  tn->pos,
+ -								  tn->bits));
+ -		} else
+ +	/* Double as long as the resulting node has a number of
+ +	 * nonempty nodes that are above the threshold.
+ +	 */
+ +	while (should_inflate(tp, tn) && max_work) {
+ +		tp = inflate(t, tn);
+ +		if (!tp) {
+ +#ifdef CONFIG_IP_FIB_TRIE_STATS
+ +			this_cpu_inc(stats->resize_node_skipped);
+ +#endif
+  			break;
+ +		}
+++<<<<<<< HEAD
+ +
+ +		max_work--;
+ +		tn = get_child(tp, cindex);
+  	}
+ -	/* Case we have found a leaf. Compare prefixes */
+  
+ -	if (n != NULL && IS_LEAF(n) && tkey_equals(key, n->key))
+ -		return (struct leaf *)n;
+ +	/* update parent in case inflate failed */
+ +	tp = node_parent(tn);
+  
+ -	return NULL;
+ -}
+ +	/* Return if at least one inflate is run */
+ +	if (max_work != MAX_WORK)
+ +		return tp;
+  
+ -static void trie_rebalance(struct trie *t, struct tnode *tn)
+ -{
+ -	int wasfull;
+ -	t_key cindex, key;
+ -	struct tnode *tp;
+ +	/* Halve as long as the number of empty children in this
+ +	 * node is above threshold.
+ +	 */
+ +	while (should_halve(tp, tn) && max_work) {
+ +		tp = halve(t, tn);
+ +		if (!tp) {
+ +#ifdef CONFIG_IP_FIB_TRIE_STATS
+ +			this_cpu_inc(stats->resize_node_skipped);
+ +#endif
+ +			break;
+ +		}
+  
+ -	key = tn->key;
+ +		max_work--;
+ +		tn = get_child(tp, cindex);
+ +	}
+  
+ -	while (tn != NULL && (tp = node_parent((struct rt_trie_node *)tn)) != NULL) {
+ -		cindex = tkey_extract_bits(key, tp->pos, tp->bits);
+ -		wasfull = tnode_full(tp, tnode_get_child(tp, cindex));
+ -		tn = (struct tnode *)resize(t, tn);
+ +	/* Only one child remains */
+ +	if (should_collapse(tn))
+ +		return collapse(t, tn);
+  
+ -		tnode_put_child_reorg(tp, cindex,
+ -				      (struct rt_trie_node *)tn, wasfull);
+ +	/* update parent in case halve failed */
+ +	tp = node_parent(tn);
+  
+ -		tp = node_parent((struct rt_trie_node *) tn);
+ -		if (!tp)
+ -			rcu_assign_pointer(t->trie, (struct rt_trie_node *)tn);
+ +	/* Return if at least one deflate was run */
+ +	if (max_work != MAX_WORK)
+ +		return tp;
+  
+ -		tnode_free_flush();
+ -		if (!tp)
+ -			break;
+ -		tn = tp;
+ -	}
+ +	/* push the suffix length to the parent node */
+ +	if (tn->slen > tn->pos) {
+ +		unsigned char slen = update_suffix(tn);
+  
+ -	/* Handle last (top) tnode */
+ -	if (IS_TNODE(tn))
+ -		tn = (struct tnode *)resize(t, tn);
+ +		if (slen > tp->slen)
+ +			tp->slen = slen;
+ +	}
+  
+ -	rcu_assign_pointer(t->trie, (struct rt_trie_node *)tn);
+ -	tnode_free_flush();
+ +	return tp;
+  }
+  
+ -/* only used from updater-side */
+ -
+ -static struct list_head *fib_insert_node(struct trie *t, u32 key, int plen)
+ +static void leaf_pull_suffix(struct key_vector *tp, struct key_vector *l)
+  {
+ -	int pos, newpos;
+ -	struct tnode *tp = NULL, *tn = NULL;
+ -	struct rt_trie_node *n;
+ -	struct leaf *l;
+ -	int missbit;
+ -	struct list_head *fa_head = NULL;
+ -	struct leaf_info *li;
+ -	t_key cindex;
+ -
+ -	pos = 0;
+ -	n = rtnl_dereference(t->trie);
+ +	while ((tp->slen > tp->pos) && (tp->slen > l->slen)) {
+ +		if (update_suffix(tp) > l->slen)
+ +			break;
+ +		tp = node_parent(tp);
+ +	}
+ +}
+  
+ -	/* If we point to NULL, stop. Either the tree is empty and we should
+ -	 * just put a new leaf in if, or we have reached an empty child slot,
+ -	 * and we should just put our new leaf in that.
+ -	 * If we point to a T_TNODE, check if it matches our key. Note that
+ -	 * a T_TNODE might be skipping any number of bits - its 'pos' need
+ -	 * not be the parent's 'pos'+'bits'!
+ -	 *
+ -	 * If it does match the current key, get pos/bits from it, extract
+ -	 * the index from our key, push the T_TNODE and walk the tree.
+ -	 *
+ -	 * If it doesn't, we have to replace it with a new T_TNODE.
+ -	 *
+ -	 * If we point to a T_LEAF, it might or might not have the same key
+ -	 * as we do. If it does, just change the value, update the T_LEAF's
+ -	 * value, and return it.
+ -	 * If it doesn't, we need to replace it with a T_TNODE.
+ +static void leaf_push_suffix(struct key_vector *tn, struct key_vector *l)
+ +{
+ +	/* if this is a new leaf then tn will be NULL and we can sort
+ +	 * out parent suffix lengths as a part of trie_rebalance
+  	 */
+ +	while (tn->slen < l->slen) {
+ +		tn->slen = l->slen;
+ +		tn = node_parent(tn);
+++=======
+++		if (last)
+++			hlist_add_behind_rcu(&new->hlist, &last->hlist);
+++		else
+++			hlist_add_before_rcu(&new->hlist, &li->hlist);
+++>>>>>>> 1d023284c31a (list: fix order of arguments for hlist_add_after(_rcu))
+ +	}
+ +}
+  
+ -	while (n != NULL &&  NODE_TYPE(n) == T_TNODE) {
+ -		tn = (struct tnode *) n;
+ +/* rcu_read_lock needs to be hold by caller from readside */
+ +static struct key_vector *fib_find_node(struct trie *t,
+ +					struct key_vector **tp, u32 key)
+ +{
+ +	struct key_vector *pn, *n = t->kv;
+ +	unsigned long index = 0;
+  
+ -		check_tnode(tn);
+ +	do {
+ +		pn = n;
+ +		n = get_child_rcu(n, index);
+  
+ -		if (tkey_sub_equals(tn->key, pos, tn->pos-pos, key)) {
+ -			tp = tn;
+ -			pos = tn->pos + tn->bits;
+ -			n = tnode_get_child(tn,
+ -					    tkey_extract_bits(key,
+ -							      tn->pos,
+ -							      tn->bits));
+ +		if (!n)
+ +			break;
+  
+ -			BUG_ON(n && node_parent(n) != tn);
+ -		} else
+ +		index = get_cindex(key, n);
+ +
+ +		/* This bit of code is a bit tricky but it combines multiple
+ +		 * checks into a single check.  The prefix consists of the
+ +		 * prefix plus zeros for the bits in the cindex. The index
+ +		 * is the difference between the key and this value.  From
+ +		 * this we can actually derive several pieces of data.
+ +		 *   if (index >= (1ul << bits))
+ +		 *     we have a mismatch in skip bits and failed
+ +		 *   else
+ +		 *     we know the value is cindex
+ +		 *
+ +		 * This check is safe even if bits == KEYLENGTH due to the
+ +		 * fact that we can only allocate a node with 32 bits if a
+ +		 * long is greater than 32 bits.
+ +		 */
+ +		if (index >= (1ul << n->bits)) {
+ +			n = NULL;
+  			break;
+ -	}
+ +		}
+  
+ -	/*
+ -	 * n  ----> NULL, LEAF or TNODE
+ -	 *
+ -	 * tp is n's (parent) ----> NULL or TNODE
+ -	 */
+ +		/* keep searching until we find a perfect match leaf or NULL */
+ +	} while (IS_TNODE(n));
+  
+ -	BUG_ON(tp && IS_LEAF(tp));
+ +	*tp = pn;
+  
+ -	/* Case 1: n is a leaf. Compare prefixes */
+ +	return n;
+ +}
+  
+ -	if (n != NULL && IS_LEAF(n) && tkey_equals(key, n->key)) {
+ -		l = (struct leaf *) n;
+ -		li = leaf_info_new(plen);
+ +/* Return the first fib alias matching TOS with
+ + * priority less than or equal to PRIO.
+ + */
+ +static struct fib_alias *fib_find_alias(struct hlist_head *fah, u8 slen,
+ +					u8 tos, u32 prio)
+ +{
+ +	struct fib_alias *fa;
+  
+ -		if (!li)
+ -			return NULL;
+ +	if (!fah)
+ +		return NULL;
+  
+ -		fa_head = &li->falh;
+ -		insert_leaf_info(&l->list, li);
+ -		goto done;
+ +	hlist_for_each_entry(fa, fah, fa_list) {
+ +		if (fa->fa_slen < slen)
+ +			continue;
+ +		if (fa->fa_slen != slen)
+ +			break;
+ +		if (fa->fa_tos > tos)
+ +			continue;
+ +		if (fa->fa_info->fib_priority >= prio || fa->fa_tos < tos)
+ +			return fa;
+  	}
+ -	l = leaf_new();
+  
+ +	return NULL;
+ +}
+ +
+ +static void trie_rebalance(struct trie *t, struct key_vector *tn)
+ +{
+ +	while (!IS_TRIE(tn))
+ +		tn = resize(t, tn);
+ +}
+ +
+ +static int fib_insert_node(struct trie *t, struct key_vector *tp,
+ +			   struct fib_alias *new, t_key key)
+ +{
+ +	struct key_vector *n, *l;
+ +
+ +	l = leaf_new(key, new);
+  	if (!l)
+ -		return NULL;
+ +		goto noleaf;
+  
+ -	l->key = key;
+ -	li = leaf_info_new(plen);
+ +	/* retrieve child from parent node */
+ +	n = get_child(tp, get_index(key, tp));
+  
+ -	if (!li) {
+ -		free_leaf(l);
+ -		return NULL;
+ -	}
+ +	/* Case 2: n is a LEAF or a TNODE and the key doesn't match.
+ +	 *
+ +	 *  Add a new tnode here
+ +	 *  first tnode need some special handling
+ +	 *  leaves us in position for handling as case 3
+ +	 */
+ +	if (n) {
+ +		struct key_vector *tn;
+  
+ -	fa_head = &li->falh;
+ -	insert_leaf_info(&l->list, li);
+ +		tn = tnode_new(key, __fls(key ^ n->key), 1);
+ +		if (!tn)
+ +			goto notnode;
+  
+ -	if (t->trie && n == NULL) {
+ -		/* Case 2: n is NULL, and will just insert a new leaf */
+ +		/* initialize routes out of node */
+ +		NODE_INIT_PARENT(tn, tp);
+ +		put_child(tn, get_index(key, tn) ^ 1, n);
+  
+ -		node_set_parent((struct rt_trie_node *)l, tp);
+ +		/* start adding routes into the node */
+ +		put_child_root(tp, key, tn);
+ +		node_set_parent(n, tn);
+  
+ -		cindex = tkey_extract_bits(key, tp->pos, tp->bits);
+ -		put_child(tp, cindex, (struct rt_trie_node *)l);
+ -	} else {
+ -		/* Case 3: n is a LEAF or a TNODE and the key doesn't match. */
+ -		/*
+ -		 *  Add a new tnode here
+ -		 *  first tnode need some special handling
+ -		 */
+ +		/* parent now has a NULL spot where the leaf can go */
+ +		tp = tn;
+ +	}
+  
+ -		if (n) {
+ -			pos = tp ? tp->pos+tp->bits : 0;
+ -			newpos = tkey_mismatch(key, pos, n->key);
+ -			tn = tnode_new(n->key, newpos, 1);
+ -		} else {
+ -			newpos = 0;
+ -			tn = tnode_new(key, newpos, 1); /* First tnode */
+ -		}
+ +	/* Case 3: n is NULL, and will just insert a new leaf */
+ +	NODE_INIT_PARENT(l, tp);
+ +	put_child_root(tp, key, l);
+ +	trie_rebalance(t, tp);
+  
+ -		if (!tn) {
+ -			free_leaf_info(li);
+ -			free_leaf(l);
+ -			return NULL;
+ -		}
+ +	return 0;
+ +notnode:
+ +	node_free(l);
+ +noleaf:
+ +	return -ENOMEM;
+ +}
+  
+ -		node_set_parent((struct rt_trie_node *)tn, tp);
+ +static int fib_insert_alias(struct trie *t, struct key_vector *tp,
+ +			    struct key_vector *l, struct fib_alias *new,
+ +			    struct fib_alias *fa, t_key key)
+ +{
+ +	if (!l)
+ +		return fib_insert_node(t, tp, new, key);
+  
+ -		missbit = tkey_extract_bits(key, newpos, 1);
+ -		put_child(tn, missbit, (struct rt_trie_node *)l);
+ -		put_child(tn, 1-missbit, n);
+ +	if (fa) {
+ +		hlist_add_before_rcu(&new->fa_list, &fa->fa_list);
+ +	} else {
+ +		struct fib_alias *last;
+  
+ -		if (tp) {
+ -			cindex = tkey_extract_bits(key, tp->pos, tp->bits);
+ -			put_child(tp, cindex, (struct rt_trie_node *)tn);
+ -		} else {
+ -			rcu_assign_pointer(t->trie, (struct rt_trie_node *)tn);
+ -			tp = tn;
+ +		hlist_for_each_entry(last, &l->leaf, fa_list) {
+ +			if (new->fa_slen < last->fa_slen)
+ +				break;
+ +			fa = last;
+  		}
+ -	}
+  
+ -	if (tp && tp->pos + tp->bits > 32)
+ -		pr_warn("fib_trie tp=%p pos=%d, bits=%d, key=%0x plen=%d\n",
+ -			tp, tp->pos, tp->bits, key, plen);
+ +		if (fa)
+ +			hlist_add_after_rcu(&fa->fa_list, &new->fa_list);
+ +		else
+ +			hlist_add_head_rcu(&new->fa_list, &l->leaf);
+ +	}
+  
+ -	/* Rebalance the trie */
+ +	/* if we added to the tail node then we need to update slen */
+ +	if (l->slen < new->fa_slen) {
+ +		l->slen = new->fa_slen;
+ +		leaf_push_suffix(tp, l);
+ +	}
+  
+ -	trie_rebalance(t, tp);
+ -done:
+ -	return fa_head;
+ +	return 0;
+  }
+  
+ -/*
+ - * Caller must hold RTNL.
+ - */
+ +/* Caller must hold RTNL. */
+  int fib_table_insert(struct fib_table *tb, struct fib_config *cfg)
+  {
+ -	struct trie *t = (struct trie *) tb->tb_data;
+ +	struct trie *t = (struct trie *)tb->tb_data;
+  	struct fib_alias *fa, *new_fa;
+ -	struct list_head *fa_head = NULL;
+ +	struct key_vector *l, *tp;
+  	struct fib_info *fi;
+ -	int plen = cfg->fc_dst_len;
+ +	u8 plen = cfg->fc_dst_len;
+ +	u8 slen = KEYLENGTH - plen;
+  	u8 tos = cfg->fc_tos;
+ -	u32 key, mask;
+ +	u32 key;
+  	int err;
+ -	struct leaf *l;
+  
+ -	if (plen > 32)
+ +	if (plen > KEYLENGTH)
+  		return -EINVAL;
+  
+  	key = ntohl(cfg->fc_dst);
+* Unmerged path drivers/staging/lustre/lustre/libcfs/hash.c
+* Unmerged path net/batman-adv/fragmentation.c
+* Unmerged path Documentation/RCU/whatisRCU.txt
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_ethtool.c b/drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+index 05c315980e44..8e56c43c4104 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_ethtool.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_ethtool.c
+@@ -2445,7 +2445,7 @@ static int i40e_update_ethtool_fdir_entry(struct i40e_vsi *vsi,
+ 
+ 	/* add filter to the list */
+ 	if (parent)
+-		hlist_add_after(&parent->fdir_node, &input->fdir_node);
++		hlist_add_behind(&input->fdir_node, &parent->fdir_node);
+ 	else
+ 		hlist_add_head(&input->fdir_node,
+ 			       &pf->fdir_filter_list);
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_ethtool.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_ethtool.c
+index d93bd41da9dd..069a8f035731 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_ethtool.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_ethtool.c
+@@ -2569,7 +2569,7 @@ static int ixgbe_update_ethtool_fdir_entry(struct ixgbe_adapter *adapter,
+ 
+ 	/* add filter to the list */
+ 	if (parent)
+-		hlist_add_after(&parent->fdir_node, &input->fdir_node);
++		hlist_add_behind(&input->fdir_node, &parent->fdir_node);
+ 	else
+ 		hlist_add_head(&input->fdir_node,
+ 			       &adapter->fdir_filter_list);
+* Unmerged path drivers/staging/lustre/lustre/libcfs/hash.c
+* Unmerged path fs/namespace.c
+diff --git a/fs/notify/inode_mark.c b/fs/notify/inode_mark.c
+index 77838b0a60de..dfbf5447eea4 100644
+--- a/fs/notify/inode_mark.c
++++ b/fs/notify/inode_mark.c
+@@ -230,7 +230,7 @@ int fsnotify_add_inode_mark(struct fsnotify_mark *mark,
+ 
+ 	BUG_ON(last == NULL);
+ 	/* mark should be the last entry.  last is the current last entry */
+-	hlist_add_after_rcu(&last->i.i_list, &mark->i.i_list);
++	hlist_add_behind_rcu(&mark->i.i_list, &last->i.i_list);
+ out:
+ 	fsnotify_recalc_inode_mask_locked(inode);
+ 	spin_unlock(&inode->i_lock);
+diff --git a/fs/notify/vfsmount_mark.c b/fs/notify/vfsmount_mark.c
+index 03bc12158105..faefa72a11eb 100644
+--- a/fs/notify/vfsmount_mark.c
++++ b/fs/notify/vfsmount_mark.c
+@@ -189,7 +189,7 @@ int fsnotify_add_vfsmount_mark(struct fsnotify_mark *mark,
+ 
+ 	BUG_ON(last == NULL);
+ 	/* mark should be the last entry.  last is the current last entry */
+-	hlist_add_after_rcu(&last->m.m_list, &mark->m.m_list);
++	hlist_add_behind_rcu(&mark->m.m_list, &last->m.m_list);
+ out:
+ 	fsnotify_recalc_vfsmount_mask_locked(mnt);
+ 	spin_unlock(&mnt->mnt_root->d_lock);
+diff --git a/include/linux/list.h b/include/linux/list.h
+index da04c8f863be..01ba2448e746 100644
+--- a/include/linux/list.h
++++ b/include/linux/list.h
+@@ -665,8 +665,8 @@ static inline void hlist_add_before(struct hlist_node *n,
+ 	*(n->pprev) = n;
+ }
+ 
+-static inline void hlist_add_after(struct hlist_node *prev,
+-				   struct hlist_node *n)
++static inline void hlist_add_behind(struct hlist_node *n,
++				    struct hlist_node *prev)
+ {
+ 	n->next = prev->next;
+ 	prev->next = n;
+diff --git a/include/linux/rculist.h b/include/linux/rculist.h
+index f5672f682781..24fcbc8265a0 100644
+--- a/include/linux/rculist.h
++++ b/include/linux/rculist.h
+@@ -467,9 +467,9 @@ static inline void hlist_add_before_rcu(struct hlist_node *n,
+ }
+ 
+ /**
+- * hlist_add_after_rcu
+- * @prev: the existing element to add the new element after.
++ * hlist_add_behind_rcu
+  * @n: the new element to add to the hash list.
++ * @prev: the existing element to add the new element after.
+  *
+  * Description:
+  * Adds the specified element to the specified hlist
+@@ -484,8 +484,8 @@ static inline void hlist_add_before_rcu(struct hlist_node *n,
+  * hlist_for_each_entry_rcu(), used to prevent memory-consistency
+  * problems on Alpha CPUs.
+  */
+-static inline void hlist_add_after_rcu(struct hlist_node *prev,
+-				       struct hlist_node *n)
++static inline void hlist_add_behind_rcu(struct hlist_node *n,
++					struct hlist_node *prev)
+ {
+ 	n->next = prev->next;
+ 	n->pprev = &prev->next;
+* Unmerged path net/batman-adv/fragmentation.c
+diff --git a/net/bridge/br_multicast.c b/net/bridge/br_multicast.c
+index e267dc359e3a..3267c134bd2b 100644
+--- a/net/bridge/br_multicast.c
++++ b/net/bridge/br_multicast.c
+@@ -1107,7 +1107,7 @@ static void br_multicast_add_router(struct net_bridge *br,
+ 	}
+ 
+ 	if (slot)
+-		hlist_add_after_rcu(slot, &port->rlist);
++		hlist_add_behind_rcu(&port->rlist, slot);
+ 	else
+ 		hlist_add_head_rcu(&port->rlist, &br->router_list);
+ }
+* Unmerged path net/ipv4/fib_trie.c
+diff --git a/net/ipv6/addrlabel.c b/net/ipv6/addrlabel.c
+index 6bc7234d62a7..acd0a76537e1 100644
+--- a/net/ipv6/addrlabel.c
++++ b/net/ipv6/addrlabel.c
+@@ -271,7 +271,7 @@ static int __ip6addrlbl_add(struct ip6addrlbl_entry *newp, int replace)
+ 		last = p;
+ 	}
+ 	if (last)
+-		hlist_add_after_rcu(&last->list, &newp->list);
++		hlist_add_behind_rcu(&newp->list, &last->list);
+ 	else
+ 		hlist_add_head_rcu(&newp->list, &ip6addrlbl_table.head);
+ out:
+diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
+index a5c3c9b30fff..b01611c5c7a8 100644
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@ -431,7 +431,7 @@ redo:
+ 			if (h != h0)
+ 				continue;
+ 			hlist_del(&pol->bydst);
+-			hlist_add_after(entry0, &pol->bydst);
++			hlist_add_behind(&pol->bydst, entry0);
+ 		}
+ 		entry0 = &pol->bydst;
+ 	}
+@@ -770,7 +770,7 @@ int xfrm_policy_insert(int dir, struct xfrm_policy *policy, int excl)
+ 			break;
+ 	}
+ 	if (newpos)
+-		hlist_add_after(newpos, &policy->bydst);
++		hlist_add_behind(&policy->bydst, newpos);
+ 	else
+ 		hlist_add_head(&policy->bydst, chain);
+ 	xfrm_pol_hold(policy);
