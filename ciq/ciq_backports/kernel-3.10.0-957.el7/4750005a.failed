@@ -1,0 +1,538 @@
+netfilter: ipset: Fix "don't update counters" mode when counters used at the matching
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+commit 4750005a85f76b3df1e5df19c283dde96b071515
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/4750005a.failed
+
+The matching of the counters was not taken into account, fixed.
+
+	Signed-off-by: Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 4750005a85f76b3df1e5df19c283dde96b071515)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netfilter/ipset/ip_set.h
+#	include/linux/netfilter/ipset/ip_set_counter.h
+#	net/netfilter/ipset/ip_set_bitmap_gen.h
+#	net/netfilter/ipset/ip_set_core.c
+#	net/netfilter/ipset/ip_set_hash_gen.h
+#	net/netfilter/ipset/ip_set_list_set.c
+#	net/netfilter/xt_set.c
+diff --cc include/linux/netfilter/ipset/ip_set.h
+index 3e9c90cf5227,34fc80f3eb90..000000000000
+--- a/include/linux/netfilter/ipset/ip_set.h
++++ b/include/linux/netfilter/ipset/ip_set.h
+@@@ -68,10 -77,53 +68,12 @@@ enum ip_set_ext_id 
+  	IPSET_EXT_ID_MAX,
+  };
+  
+ -struct ip_set;
+ -
+ -/* Extension type */
+ -struct ip_set_ext_type {
+ -	/* Destroy extension private data (can be NULL) */
+ -	void (*destroy)(struct ip_set *set, void *ext);
+ -	enum ip_set_extension type;
+ -	enum ipset_cadt_flags flag;
+ -	/* Size and minimal alignment */
+ -	u8 len;
+ -	u8 align;
+ -};
+ -
+ -extern const struct ip_set_ext_type ip_set_extensions[];
+ -
+ -struct ip_set_counter {
+ -	atomic64_t bytes;
+ -	atomic64_t packets;
+ -};
+ -
+ -struct ip_set_comment_rcu {
+ -	struct rcu_head rcu;
+ -	char str[0];
+ -};
+ -
+ -struct ip_set_comment {
+ -	struct ip_set_comment_rcu __rcu *c;
+ -};
+ -
+ -struct ip_set_skbinfo {
+ -	u32 skbmark;
+ -	u32 skbmarkmask;
+ -	u32 skbprio;
+ -	u16 skbqueue;
+ -	u16 __pad;
+ -};
+ -
+  struct ip_set_ext {
+ -	struct ip_set_skbinfo skbinfo;
+  	u64 packets;
+  	u64 bytes;
+ -	char *comment;
+  	u32 timeout;
++ 	u8 packets_op;
++ 	u8 bytes_op;
+  };
+  
+  struct ip_set;
+@@@ -281,8 -335,16 +283,17 @@@ extern void *ip_set_alloc(size_t size)
+  extern void ip_set_free(void *members);
+  extern int ip_set_get_ipaddr4(struct nlattr *nla,  __be32 *ipaddr);
+  extern int ip_set_get_ipaddr6(struct nlattr *nla, union nf_inet_addr *ipaddr);
+ -extern size_t ip_set_elem_len(struct ip_set *set, struct nlattr *tb[],
+ -			      size_t len, size_t align);
+  extern int ip_set_get_extensions(struct ip_set *set, struct nlattr *tb[],
+  				 struct ip_set_ext *ext);
+++<<<<<<< HEAD
+++=======
++ extern int ip_set_put_extensions(struct sk_buff *skb, const struct ip_set *set,
++ 				 const void *e, bool active);
++ extern bool ip_set_match_extensions(struct ip_set *set,
++ 				    const struct ip_set_ext *ext,
++ 				    struct ip_set_ext *mext,
++ 				    u32 flags, void *data);
+++>>>>>>> 4750005a85f7 (netfilter: ipset: Fix "don't update counters" mode when counters used at the matching)
+  
+  static inline int
+  ip_set_get_hostipaddr4(struct nlattr *nla, u32 *ipaddr)
+diff --cc net/netfilter/ipset/ip_set_bitmap_gen.h
+index 01a340ce9e94,257ca393e6f2..000000000000
+--- a/net/netfilter/ipset/ip_set_bitmap_gen.h
++++ b/net/netfilter/ipset/ip_set_bitmap_gen.h
+@@@ -113,12 -127,7 +113,16 @@@ mtype_test(struct ip_set *set, void *va
+  
+  	if (ret <= 0)
+  		return ret;
+++<<<<<<< HEAD
+ +	if (SET_WITH_TIMEOUT(set) &&
+ +	    ip_set_timeout_expired(ext_timeout(x, map)))
+ +		return 0;
+ +	if (SET_WITH_COUNTER(set))
+ +		ip_set_update_counter(ext_counter(x, map), ext, mext, flags);
+ +	return 1;
+++=======
++ 	return ip_set_match_extensions(set, ext, mext, flags, x);
+++>>>>>>> 4750005a85f7 (netfilter: ipset: Fix "don't update counters" mode when counters used at the matching)
+  }
+  
+  static int
+diff --cc net/netfilter/ipset/ip_set_core.c
+index 8f5256a53627,e00299051e79..000000000000
+--- a/net/netfilter/ipset/ip_set_core.c
++++ b/net/netfilter/ipset/ip_set_core.c
+@@@ -347,8 -447,57 +347,62 @@@ ip_set_get_extensions(struct ip_set *se
+  }
+  EXPORT_SYMBOL_GPL(ip_set_get_extensions);
+  
+++<<<<<<< HEAD
+ +/*
+ + * Creating/destroying/renaming/swapping affect the existence and
+++=======
++ int
++ ip_set_put_extensions(struct sk_buff *skb, const struct ip_set *set,
++ 		      const void *e, bool active)
++ {
++ 	if (SET_WITH_TIMEOUT(set)) {
++ 		unsigned long *timeout = ext_timeout(e, set);
++ 
++ 		if (nla_put_net32(skb, IPSET_ATTR_TIMEOUT,
++ 			htonl(active ? ip_set_timeout_get(timeout)
++ 				: *timeout)))
++ 			return -EMSGSIZE;
++ 	}
++ 	if (SET_WITH_COUNTER(set) &&
++ 	    ip_set_put_counter(skb, ext_counter(e, set)))
++ 		return -EMSGSIZE;
++ 	if (SET_WITH_COMMENT(set) &&
++ 	    ip_set_put_comment(skb, ext_comment(e, set)))
++ 		return -EMSGSIZE;
++ 	if (SET_WITH_SKBINFO(set) &&
++ 	    ip_set_put_skbinfo(skb, ext_skbinfo(e, set)))
++ 		return -EMSGSIZE;
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(ip_set_put_extensions);
++ 
++ bool
++ ip_set_match_extensions(struct ip_set *set, const struct ip_set_ext *ext,
++ 			struct ip_set_ext *mext, u32 flags, void *data)
++ {
++ 	if (SET_WITH_TIMEOUT(set) &&
++ 	    ip_set_timeout_expired(ext_timeout(data, set)))
++ 		return false;
++ 	if (SET_WITH_COUNTER(set)) {
++ 		struct ip_set_counter *counter = ext_counter(data, set);
++ 
++ 		if (flags & IPSET_FLAG_MATCH_COUNTERS &&
++ 		    !(ip_set_match_counter(ip_set_get_packets(counter),
++ 				mext->packets, mext->packets_op) &&
++ 		      ip_set_match_counter(ip_set_get_bytes(counter),
++ 				mext->bytes, mext->bytes_op)))
++ 			return false;
++ 		ip_set_update_counter(counter, ext, flags);
++ 	}
++ 	if (SET_WITH_SKBINFO(set))
++ 		ip_set_get_skbinfo(ext_skbinfo(data, set),
++ 				   ext, mext, flags);
++ 	return true;
++ }
++ EXPORT_SYMBOL_GPL(ip_set_match_extensions);
++ 
++ /* Creating/destroying/renaming/swapping affect the existence and
+++>>>>>>> 4750005a85f7 (netfilter: ipset: Fix "don't update counters" mode when counters used at the matching)
+   * the properties of a set. All of these can be executed from userspace
+   * only and serialized by the nfnl mutex indirectly from nfnetlink.
+   *
+diff --cc net/netfilter/ipset/ip_set_hash_gen.h
+index 9ce28af662bf,bbad940c0137..000000000000
+--- a/net/netfilter/ipset/ip_set_hash_gen.h
++++ b/net/netfilter/ipset/ip_set_hash_gen.h
+@@@ -727,10 -917,9 +727,16 @@@ static inline in
+  mtype_data_match(struct mtype_elem *data, const struct ip_set_ext *ext,
+  		 struct ip_set_ext *mext, struct ip_set *set, u32 flags)
+  {
+++<<<<<<< HEAD
+ +	if (SET_WITH_COUNTER(set))
+ +		ip_set_update_counter(ext_counter(data,
+ +						  (struct htype *)(set->data)),
+ +				      ext, mext, flags);
+++=======
++ 	if (!ip_set_match_extensions(set, ext, mext, flags, data))
++ 		return 0;
++ 	/* nomatch entries return -ENOTEMPTY */
+++>>>>>>> 4750005a85f7 (netfilter: ipset: Fix "don't update counters" mode when counters used at the matching)
+  	return mtype_do_data_match(data);
+  }
+  
+@@@ -743,35 -933,50 +749,48 @@@ mtype_test_cidrs(struct ip_set *set, st
+  		 struct ip_set_ext *mext, u32 flags)
+  {
+  	struct htype *h = set->data;
+ -	struct htable *t = rcu_dereference_bh(h->table);
+ +	struct htable *t = h->table;
+  	struct hbucket *n;
+  	struct mtype_elem *data;
+++<<<<<<< HEAD
+ +	int i, j = 0;
+++=======
++ #if IPSET_NET_COUNT == 2
++ 	struct mtype_elem orig = *d;
++ 	int ret, i, j = 0, k;
++ #else
++ 	int ret, i, j = 0;
++ #endif
+++>>>>>>> 4750005a85f7 (netfilter: ipset: Fix "don't update counters" mode when counters used at the matching)
+  	u32 key, multi = 0;
+ +	u8 nets_length = NETS_LENGTH(set->family);
+  
+  	pr_debug("test by nets\n");
+ -	for (; j < NLEN && h->nets[j].cidr[0] && !multi; j++) {
+ -#if IPSET_NET_COUNT == 2
+ -		mtype_data_reset_elem(d, &orig);
+ -		mtype_data_netmask(d, NCIDR_GET(h->nets[j].cidr[0]), false);
+ -		for (k = 0; k < NLEN && h->nets[k].cidr[1] && !multi;
+ -		     k++) {
+ -			mtype_data_netmask(d, NCIDR_GET(h->nets[k].cidr[1]),
+ -					   true);
+ -#else
+ -		mtype_data_netmask(d, NCIDR_GET(h->nets[j].cidr[0]));
+ -#endif
+ +	for (; j < nets_length && h->nets[j].nets && !multi; j++) {
+ +		mtype_data_netmask(d, h->nets[j].cidr);
+  		key = HKEY(d, h->initval, t->htable_bits);
+ -		n =  rcu_dereference_bh(hbucket(t, key));
+ -		if (!n)
+ -			continue;
+ +		n = hbucket(t, key);
+  		for (i = 0; i < n->pos; i++) {
+ -			if (!test_bit(i, n->used))
+ -				continue;
+ -			data = ahash_data(n, i, set->dsize);
+ +			data = ahash_data(n, i, h->dsize);
+  			if (!mtype_data_equal(data, d, &multi))
+  				continue;
+++<<<<<<< HEAD
+ +			if (SET_WITH_TIMEOUT(set)) {
+ +				if (!ip_set_timeout_expired(
+ +							ext_timeout(data, h)))
+ +					return mtype_data_match(data, ext,
+ +								mext, set,
+ +								flags);
+++=======
++ 			ret = mtype_data_match(data, ext, mext, set, flags);
++ 			if (ret != 0)
++ 				return ret;
+++>>>>>>> 4750005a85f7 (netfilter: ipset: Fix "don't update counters" mode when counters used at the matching)
+  #ifdef IP_SET_HASH_WITH_MULTI
+- 				multi = 0;
++ 			/* No match, reset multiple match flag */
++ 			multi = 0;
+  #endif
+- 			} else
+- 				return mtype_data_match(data, ext,
+- 							mext, set, flags);
+  		}
+ -#if IPSET_NET_COUNT == 2
+ -		}
+ -#endif
+  	}
+  	return 0;
+  }
+@@@ -798,15 -1010,23 +817,26 @@@ mtype_test(struct ip_set *set, void *va
+  #endif
+  
+  	key = HKEY(d, h->initval, t->htable_bits);
+ -	n = rcu_dereference_bh(hbucket(t, key));
+ -	if (!n) {
+ -		ret = 0;
+ -		goto out;
+ -	}
+ +	n = hbucket(t, key);
+  	for (i = 0; i < n->pos; i++) {
+++<<<<<<< HEAD
+ +		data = ahash_data(n, i, h->dsize);
+ +		if (mtype_data_equal(data, d, &multi) &&
+ +		    !(SET_WITH_TIMEOUT(set) &&
+ +		      ip_set_timeout_expired(ext_timeout(data, h))))
+ +			return mtype_data_match(data, ext, mext, set, flags);
+++=======
++ 		if (!test_bit(i, n->used))
++ 			continue;
++ 		data = ahash_data(n, i, set->dsize);
++ 		if (!mtype_data_equal(data, d, &multi))
++ 			continue;
++ 		ret = mtype_data_match(data, ext, mext, set, flags);
++ 		if (ret != 0)
++ 			goto out;
+++>>>>>>> 4750005a85f7 (netfilter: ipset: Fix "don't update counters" mode when counters used at the matching)
+  	}
+ -out:
+ -	return ret;
+ +	return 0;
+  }
+  
+  /* Reply a HEADER request: fill out the header part of the set */
+diff --cc net/netfilter/ipset/ip_set_list_set.c
+index a9a97c07ecb4,072a658fde04..000000000000
+--- a/net/netfilter/ipset/ip_set_list_set.c
++++ b/net/netfilter/ipset/ip_set_list_set.c
+@@@ -84,29 -55,21 +84,43 @@@ list_set_ktest(struct ip_set *set, cons
+  	       struct ip_set_adt_opt *opt, const struct ip_set_ext *ext)
+  {
+  	struct list_set *map = set->data;
++ 	struct ip_set_ext *mext = &opt->ext;
+  	struct set_elem *e;
+++<<<<<<< HEAD
+ +	u32 i, cmdflags = opt->cmdflags;
+++=======
++ 	u32 flags = opt->cmdflags;
+++>>>>>>> 4750005a85f7 (netfilter: ipset: Fix "don't update counters" mode when counters used at the matching)
+  	int ret;
+  
+  	/* Don't lookup sub-counters at all */
+  	opt->cmdflags &= ~IPSET_FLAG_MATCH_COUNTERS;
+  	if (opt->cmdflags & IPSET_FLAG_SKIP_SUBCOUNTER_UPDATE)
+  		opt->cmdflags &= ~IPSET_FLAG_SKIP_COUNTER_UPDATE;
+++<<<<<<< HEAD
+ +	for (i = 0; i < map->size; i++) {
+ +		e = list_set_elem(map, i);
+ +		if (e->id == IPSET_INVALID_ID)
+ +			return 0;
+ +		if (SET_WITH_TIMEOUT(set) &&
+ +		    ip_set_timeout_expired(ext_timeout(e, map)))
+ +			continue;
+ +		ret = ip_set_test(e->id, skb, par, opt);
+ +		if (ret > 0) {
+ +			if (SET_WITH_COUNTER(set))
+ +				ip_set_update_counter(ext_counter(e, map),
+ +						      ext, &opt->ext,
+ +						      cmdflags);
+ +			return ret;
+ +		}
+++=======
++ 	list_for_each_entry_rcu(e, &map->members, list) {
++ 		ret = ip_set_test(e->id, skb, par, opt);
++ 		if (ret <= 0)
++ 			continue;
++ 		if (ip_set_match_extensions(set, ext, mext, flags, e))
++ 			return 1;
+++>>>>>>> 4750005a85f7 (netfilter: ipset: Fix "don't update counters" mode when counters used at the matching)
+  	}
+  	return 0;
+  }
+diff --cc net/netfilter/xt_set.c
+index 6cc2d6757ad8,16b6b11ee83f..000000000000
+--- a/net/netfilter/xt_set.c
++++ b/net/netfilter/xt_set.c
+@@@ -53,8 -58,10 +57,15 @@@ static boo
+  set_match_v0(const struct sk_buff *skb, struct xt_action_param *par)
+  {
+  	const struct xt_set_info_match_v0 *info = par->matchinfo;
+++<<<<<<< HEAD
+ +	ADT_OPT(opt, par->family, info->match_set.u.compat.dim,
+ +		info->match_set.u.compat.flags, 0, UINT_MAX);
+++=======
++ 
++ 	ADT_OPT(opt, xt_family(par), info->match_set.u.compat.dim,
++ 		info->match_set.u.compat.flags, 0, UINT_MAX,
++ 		0, 0, 0, 0);
+++>>>>>>> 4750005a85f7 (netfilter: ipset: Fix "don't update counters" mode when counters used at the matching)
+  
+  	return match_set(info->match_set.index, skb, par, &opt,
+  			 info->match_set.u.compat.flags & IPSET_INV_MATCH);
+@@@ -116,8 -122,10 +127,15 @@@ static boo
+  set_match_v1(const struct sk_buff *skb, struct xt_action_param *par)
+  {
+  	const struct xt_set_info_match_v1 *info = par->matchinfo;
+++<<<<<<< HEAD
+ +	ADT_OPT(opt, par->family, info->match_set.dim,
+ +		info->match_set.flags, 0, UINT_MAX);
+++=======
++ 
++ 	ADT_OPT(opt, xt_family(par), info->match_set.dim,
++ 		info->match_set.flags, 0, UINT_MAX,
++ 		0, 0, 0, 0);
+++>>>>>>> 4750005a85f7 (netfilter: ipset: Fix "don't update counters" mode when counters used at the matching)
+  
+  	if (opt.flags & IPSET_RETURN_NOMATCH)
+  		opt.cmdflags |= IPSET_FLAG_RETURN_NOMATCH;
+@@@ -181,9 -170,11 +181,17 @@@ static boo
+  set_match_v3(const struct sk_buff *skb, struct xt_action_param *par)
+  {
+  	const struct xt_set_info_match_v3 *info = par->matchinfo;
+++<<<<<<< HEAD
+ +	ADT_OPT(opt, par->family, info->match_set.dim,
+ +		info->match_set.flags, info->flags, UINT_MAX);
+ +	int ret;
+++=======
++ 
++ 	ADT_OPT(opt, xt_family(par), info->match_set.dim,
++ 		info->match_set.flags, info->flags, UINT_MAX,
++ 		info->packets.value, info->bytes.value,
++ 		info->packets.op, info->bytes.op);
+++>>>>>>> 4750005a85f7 (netfilter: ipset: Fix "don't update counters" mode when counters used at the matching)
+  
+  	if (info->packets.op != IPSET_COUNTER_NONE ||
+  	    info->bytes.op != IPSET_COUNTER_NONE)
+@@@ -227,9 -193,11 +210,17 @@@ static boo
+  set_match_v4(const struct sk_buff *skb, struct xt_action_param *par)
+  {
+  	const struct xt_set_info_match_v4 *info = par->matchinfo;
+++<<<<<<< HEAD
+ +	ADT_OPT(opt, par->family, info->match_set.dim,
+ +		info->match_set.flags, info->flags, UINT_MAX);
+ +	int ret;
+++=======
++ 
++ 	ADT_OPT(opt, xt_family(par), info->match_set.dim,
++ 		info->match_set.flags, info->flags, UINT_MAX,
++ 		info->packets.value, info->bytes.value,
++ 		info->packets.op, info->bytes.op);
+++>>>>>>> 4750005a85f7 (netfilter: ipset: Fix "don't update counters" mode when counters used at the matching)
+  
+  	if (info->packets.op != IPSET_COUNTER_NONE ||
+  	    info->bytes.op != IPSET_COUNTER_NONE)
+@@@ -255,10 -216,13 +239,20 @@@ static unsigned in
+  set_target_v0(struct sk_buff *skb, const struct xt_action_param *par)
+  {
+  	const struct xt_set_info_target_v0 *info = par->targinfo;
+++<<<<<<< HEAD
+ +	ADT_OPT(add_opt, par->family, info->add_set.u.compat.dim,
+ +		info->add_set.u.compat.flags, 0, UINT_MAX);
+ +	ADT_OPT(del_opt, par->family, info->del_set.u.compat.dim,
+ +		info->del_set.u.compat.flags, 0, UINT_MAX);
+++=======
++ 
++ 	ADT_OPT(add_opt, xt_family(par), info->add_set.u.compat.dim,
++ 		info->add_set.u.compat.flags, 0, UINT_MAX,
++ 		0, 0, 0, 0);
++ 	ADT_OPT(del_opt, xt_family(par), info->del_set.u.compat.dim,
++ 		info->del_set.u.compat.flags, 0, UINT_MAX,
++ 		0, 0, 0, 0);
+++>>>>>>> 4750005a85f7 (netfilter: ipset: Fix "don't update counters" mode when counters used at the matching)
+  
+  	if (info->add_set.index != IPSET_INVALID_ID)
+  		ip_set_add(info->add_set.index, skb, par, &add_opt);
+@@@ -328,10 -291,13 +322,20 @@@ static unsigned in
+  set_target_v1(struct sk_buff *skb, const struct xt_action_param *par)
+  {
+  	const struct xt_set_info_target_v1 *info = par->targinfo;
+++<<<<<<< HEAD
+ +	ADT_OPT(add_opt, par->family, info->add_set.dim,
+ +		info->add_set.flags, 0, UINT_MAX);
+ +	ADT_OPT(del_opt, par->family, info->del_set.dim,
+ +		info->del_set.flags, 0, UINT_MAX);
+++=======
++ 
++ 	ADT_OPT(add_opt, xt_family(par), info->add_set.dim,
++ 		info->add_set.flags, 0, UINT_MAX,
++ 		0, 0, 0, 0);
++ 	ADT_OPT(del_opt, xt_family(par), info->del_set.dim,
++ 		info->del_set.flags, 0, UINT_MAX,
++ 		0, 0, 0, 0);
+++>>>>>>> 4750005a85f7 (netfilter: ipset: Fix "don't update counters" mode when counters used at the matching)
+  
+  	if (info->add_set.index != IPSET_INVALID_ID)
+  		ip_set_add(info->add_set.index, skb, par, &add_opt);
+@@@ -397,10 -362,13 +401,20 @@@ static unsigned in
+  set_target_v2(struct sk_buff *skb, const struct xt_action_param *par)
+  {
+  	const struct xt_set_info_target_v2 *info = par->targinfo;
+++<<<<<<< HEAD
+ +	ADT_OPT(add_opt, par->family, info->add_set.dim,
+ +		info->add_set.flags, info->flags, info->timeout);
+ +	ADT_OPT(del_opt, par->family, info->del_set.dim,
+ +		info->del_set.flags, 0, UINT_MAX);
+++=======
++ 
++ 	ADT_OPT(add_opt, xt_family(par), info->add_set.dim,
++ 		info->add_set.flags, info->flags, info->timeout,
++ 		0, 0, 0, 0);
++ 	ADT_OPT(del_opt, xt_family(par), info->del_set.dim,
++ 		info->del_set.flags, 0, UINT_MAX,
++ 		0, 0, 0, 0);
+++>>>>>>> 4750005a85f7 (netfilter: ipset: Fix "don't update counters" mode when counters used at the matching)
+  
+  	/* Normalize to fit into jiffies */
+  	if (add_opt.ext.timeout != IPSET_NO_TIMEOUT &&
+@@@ -423,14 -393,17 +437,28 @@@ static unsigned in
+  set_target_v3(struct sk_buff *skb, const struct xt_action_param *par)
+  {
+  	const struct xt_set_info_target_v3 *info = par->targinfo;
+++<<<<<<< HEAD
+ +	ADT_OPT(add_opt, par->family, info->add_set.dim,
+ +		info->add_set.flags, info->flags, info->timeout);
+ +	ADT_OPT(del_opt, par->family, info->del_set.dim,
+ +		info->del_set.flags, 0, UINT_MAX);
+ +	ADT_OPT(map_opt, par->family, info->map_set.dim,
+ +		info->map_set.flags, 0, UINT_MAX);
+++=======
++ 	int ret;
++ 
++ 	ADT_OPT(add_opt, xt_family(par), info->add_set.dim,
++ 		info->add_set.flags, info->flags, info->timeout,
++ 		0, 0, 0, 0);
++ 	ADT_OPT(del_opt, xt_family(par), info->del_set.dim,
++ 		info->del_set.flags, 0, UINT_MAX,
++ 		0, 0, 0, 0);
++ 	ADT_OPT(map_opt, xt_family(par), info->map_set.dim,
++ 		info->map_set.flags, 0, UINT_MAX,
++ 		0, 0, 0, 0);
+++>>>>>>> 4750005a85f7 (netfilter: ipset: Fix "don't update counters" mode when counters used at the matching)
+ +
+ +	int ret;
+  
+  	/* Normalize to fit into jiffies */
+  	if (add_opt.ext.timeout != IPSET_NO_TIMEOUT &&
+* Unmerged path include/linux/netfilter/ipset/ip_set_counter.h
+* Unmerged path include/linux/netfilter/ipset/ip_set.h
+* Unmerged path include/linux/netfilter/ipset/ip_set_counter.h
+* Unmerged path net/netfilter/ipset/ip_set_bitmap_gen.h
+* Unmerged path net/netfilter/ipset/ip_set_core.c
+* Unmerged path net/netfilter/ipset/ip_set_hash_gen.h
+* Unmerged path net/netfilter/ipset/ip_set_list_set.c
+* Unmerged path net/netfilter/xt_set.c
