@@ -1,0 +1,240 @@
+ovl: mark upper merge dir with type origin entries "impure"
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit f3a1568582cc207663a4d5e37da790334372855b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/f3a15685.failed
+
+An upper dir is marked "impure" to let ovl_iterate() know that this
+directory may contain non pure upper entries whose d_ino may need to be
+read from the origin inode.
+
+We already mark a non-merge dir "impure" when moving a non-pure child
+entry inside it, to let ovl_iterate() know not to iterate the non-merge
+dir directly.
+
+Mark also a merge dir "impure" when moving a non-pure child entry inside
+it and when copying up a child entry inside it.
+
+This can be used to optimize ovl_iterate() to perform a "pure merge" of
+upper and lower directories, merging the content of the directories,
+without having to read d_ino from origin inodes.
+
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit f3a1568582cc207663a4d5e37da790334372855b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/overlayfs/copy_up.c
+#	fs/overlayfs/dir.c
+#	fs/overlayfs/namei.c
+#	fs/overlayfs/overlayfs.h
+#	fs/overlayfs/util.c
+diff --cc fs/overlayfs/copy_up.c
+index 6e96b99a973d,7a44533f4bbf..000000000000
+--- a/fs/overlayfs/copy_up.c
++++ b/fs/overlayfs/copy_up.c
+@@@ -389,7 -459,13 +389,17 @@@ static int ovl_copy_up_one(struct dentr
+  	ovl_path_upper(parent, &parentpath);
+  	upperdir = parentpath.dentry;
+  
+++<<<<<<< HEAD
+ +	err = vfs_getattr(&parentpath, &pstat);
+++=======
++ 	/* Mark parent "impure" because it may now contain non-pure upper */
++ 	err = ovl_set_impure(parent, upperdir);
++ 	if (err)
++ 		return err;
++ 
++ 	err = vfs_getattr(&parentpath, &pstat,
++ 			  STATX_ATIME | STATX_MTIME, AT_STATX_SYNC_AS_STAT);
+++>>>>>>> f3a1568582cc (ovl: mark upper merge dir with type origin entries "impure")
+  	if (err)
+  		return err;
+  
+diff --cc fs/overlayfs/dir.c
+index 09ee239b1762,a63a71656e9b..000000000000
+--- a/fs/overlayfs/dir.c
++++ b/fs/overlayfs/dir.c
+@@@ -121,38 -127,26 +121,49 @@@ int ovl_create_real(struct inode *dir, 
+  	return err;
+  }
+  
+ -static int ovl_set_opaque_xerr(struct dentry *dentry, struct dentry *upper,
+ -			       int xerr)
+ +static int ovl_set_opaque(struct dentry *upperdentry)
+ +{
+ +	return ovl_do_setxattr(upperdentry, OVL_XATTR_OPAQUE, "y", 1, 0);
+ +}
+ +
+++<<<<<<< HEAD
+ +static int ovl_dir_getattr(struct vfsmount *mnt, struct dentry *dentry,
+ +			 struct kstat *stat)
+  {
+  	int err;
+ +	enum ovl_path_type type;
+ +	struct path realpath;
+ +	const struct cred *old_cred;
+  
+ -	err = ovl_check_setxattr(dentry, upper, OVL_XATTR_OPAQUE, "y", 1, xerr);
+ -	if (!err)
+ -		ovl_dentry_set_opaque(dentry);
+ +	type = ovl_path_real(dentry, &realpath);
+ +	old_cred = ovl_override_creds(dentry->d_sb);
+ +	err = vfs_getattr(&realpath, stat);
+ +	revert_creds(old_cred);
+ +	if (err)
+ +		return err;
+  
+ -	return err;
+ -}
+ +	stat->dev = dentry->d_sb->s_dev;
+ +	stat->ino = dentry->d_inode->i_ino;
+  
+ +	/*
+ +	 * It's probably not worth it to count subdirs to get the
+ +	 * correct link count.  nlink=1 seems to pacify 'find' and
+ +	 * other utilities.
+ +	 */
+ +	if (OVL_TYPE_MERGE(type))
+ +		stat->nlink = 1;
+ +
+ +	return 0;
+++=======
++ static int ovl_set_opaque(struct dentry *dentry, struct dentry *upperdentry)
++ {
++ 	/*
++ 	 * Fail with -EIO when trying to create opaque dir and upper doesn't
++ 	 * support xattrs. ovl_rename() calls ovl_set_opaque_xerr(-EXDEV) to
++ 	 * return a specific error for noxattr case.
++ 	 */
++ 	return ovl_set_opaque_xerr(dentry, upperdentry, -EIO);
+++>>>>>>> f3a1568582cc (ovl: mark upper merge dir with type origin entries "impure")
+  }
+  
+  /* Common operations required to be done after creation of file on upper */
+@@@ -912,9 -957,27 +923,31 @@@ static int ovl_rename(struct inode *old
+  	old_upperdir = ovl_dentry_upper(old->d_parent);
+  	new_upperdir = ovl_dentry_upper(new->d_parent);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!samedir) {
++ 		/*
++ 		 * When moving a merge dir or non-dir with copy up origin into
++ 		 * a new parent, we are marking the new parent dir "impure".
++ 		 * When ovl_iterate() iterates an "impure" upper dir, it will
++ 		 * lookup the origin inodes of the entries to fill d_ino.
++ 		 */
++ 		if (ovl_type_origin(old)) {
++ 			err = ovl_set_impure(new->d_parent, new_upperdir);
++ 			if (err)
++ 				goto out_revert_creds;
++ 		}
++ 		if (!overwrite && ovl_type_origin(new)) {
++ 			err = ovl_set_impure(old->d_parent, old_upperdir);
++ 			if (err)
++ 				goto out_revert_creds;
++ 		}
++ 	}
++ 
+++>>>>>>> f3a1568582cc (ovl: mark upper merge dir with type origin entries "impure")
+  	trap = lock_rename(new_upperdir, old_upperdir);
+  
+ +
+  	olddentry = lookup_one_len(old->d_name.name, old_upperdir,
+  				   old->d_name.len);
+  	err = PTR_ERR(olddentry);
+diff --cc fs/overlayfs/overlayfs.h
+index 952ccab31629,0623cebeefff..000000000000
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@@ -151,27 -201,41 +151,61 @@@ int ovl_path_next(int idx, struct dentr
+  struct dentry *ovl_dentry_upper(struct dentry *dentry);
+  struct dentry *ovl_dentry_lower(struct dentry *dentry);
+  struct dentry *ovl_dentry_real(struct dentry *dentry);
+ +struct vfsmount *ovl_entry_mnt_real(struct ovl_entry *oe, struct inode *inode,
+ +				    bool is_upper);
+  struct ovl_dir_cache *ovl_dir_cache(struct dentry *dentry);
+  void ovl_set_dir_cache(struct dentry *dentry, struct ovl_dir_cache *cache);
+ +struct dentry *ovl_workdir(struct dentry *dentry);
+ +int ovl_want_write(struct dentry *dentry);
+ +void ovl_drop_write(struct dentry *dentry);
+  bool ovl_dentry_is_opaque(struct dentry *dentry);
+++<<<<<<< HEAD
+++=======
++ bool ovl_dentry_is_impure(struct dentry *dentry);
++ bool ovl_dentry_is_whiteout(struct dentry *dentry);
++ void ovl_dentry_set_opaque(struct dentry *dentry);
++ bool ovl_redirect_dir(struct super_block *sb);
++ const char *ovl_dentry_get_redirect(struct dentry *dentry);
++ void ovl_dentry_set_redirect(struct dentry *dentry, const char *redirect);
++ void ovl_dentry_update(struct dentry *dentry, struct dentry *upperdentry);
++ void ovl_inode_init(struct inode *inode, struct inode *realinode,
++ 		    bool is_upper);
++ void ovl_inode_update(struct inode *inode, struct inode *upperinode);
++ void ovl_dentry_version_inc(struct dentry *dentry);
++ u64 ovl_dentry_version_get(struct dentry *dentry);
++ bool ovl_is_whiteout(struct dentry *dentry);
++ struct file *ovl_path_open(struct path *path, int flags);
++ int ovl_copy_up_start(struct dentry *dentry);
++ void ovl_copy_up_end(struct dentry *dentry);
++ bool ovl_check_dir_xattr(struct dentry *dentry, const char *name);
++ int ovl_check_setxattr(struct dentry *dentry, struct dentry *upperdentry,
++ 		       const char *name, const void *value, size_t size,
++ 		       int xerr);
++ int ovl_set_impure(struct dentry *dentry, struct dentry *upperdentry);
++ 
++ static inline bool ovl_is_impuredir(struct dentry *dentry)
++ {
++ 	return ovl_check_dir_xattr(dentry, OVL_XATTR_IMPURE);
++ }
++ 
++ 
++ /* namei.c */
++ int ovl_path_next(int idx, struct dentry *dentry, struct path *path);
++ struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags);
+++>>>>>>> f3a1568582cc (ovl: mark upper merge dir with type origin entries "impure")
+  bool ovl_lower_positive(struct dentry *dentry);
+ +bool ovl_dentry_is_whiteout(struct dentry *dentry);
+ +void ovl_dentry_set_opaque(struct dentry *dentry, bool opaque);
+ +bool ovl_is_whiteout(struct dentry *dentry);
+ +const struct cred *ovl_override_creds(struct super_block *sb);
+ +void ovl_dentry_update(struct dentry *dentry, struct dentry *upperdentry);
+ +void ovl_inode_update(struct inode *inode, struct inode *upperinode);
+ +struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry,
+ +			  unsigned int flags);
+ +struct file *ovl_path_open(struct path *path, int flags);
+ +
+ +struct dentry *ovl_upper_create(struct dentry *upperdir, struct dentry *dentry,
+ +				struct kstat *stat, const char *link);
+  
+  /* readdir.c */
+  extern const struct file_operations ovl_dir_operations;
+* Unmerged path fs/overlayfs/namei.c
+* Unmerged path fs/overlayfs/util.c
+* Unmerged path fs/overlayfs/copy_up.c
+* Unmerged path fs/overlayfs/dir.c
+* Unmerged path fs/overlayfs/namei.c
+* Unmerged path fs/overlayfs/overlayfs.h
+diff --git a/fs/overlayfs/super.c b/fs/overlayfs/super.c
+index aaf06952d88f..d33b4c1fd0a0 100644
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@ -1468,7 +1468,10 @@ static int ovl_fill_super(struct super_block *sb, void *data, int silent)
+ 	path_put(&workpath);
+ 	kfree(lowertmp);
+ 
+-	oe->__upperdentry = upperpath.dentry;
++	if (upperpath.dentry) {
++		oe->__upperdentry = upperpath.dentry;
++		oe->impure = ovl_is_impuredir(upperpath.dentry);
++	}
+ 	for (i = 0; i < numlower; i++) {
+ 		oe->lowerstack[i].dentry = stack[i].dentry;
+ 		oe->lowerstack[i].mnt = ufs->lower_mnt[i];
+* Unmerged path fs/overlayfs/util.c
