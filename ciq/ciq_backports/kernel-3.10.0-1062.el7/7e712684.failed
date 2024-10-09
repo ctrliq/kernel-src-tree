@@ -1,0 +1,185 @@
+kvm: nVMX: fix entry with pending interrupt if APICv is enabled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1062.el7
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 7e7126846c95a34f98a1524d5c473af1f0783735
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1062.el7/7e712684.failed
+
+Commit b5861e5cf2fcf83031ea3e26b0a69d887adf7d21 introduced a check on
+the interrupt-window and NMI-window CPU execution controls in order to
+inject an external interrupt vmexit before the first guest instruction
+executes.  However, when APIC virtualization is enabled the host does not
+need a vmexit in order to inject an interrupt at the next interrupt window;
+instead, it just places the interrupt vector in RVI and the processor will
+inject it as soon as possible.  Therefore, on machines with APICv it is
+not enough to check the CPU execution controls: the same scenario can also
+happen if RVI>vPPR.
+
+Fixes: b5861e5cf2fcf83031ea3e26b0a69d887adf7d21
+	Reviewed-by: Nikita Leshchenko <nikita.leshchenko@oracle.com>
+	Cc: Sean Christopherson <sean.j.christopherson@intel.com>
+	Cc: Liran Alon <liran.alon@oracle.com>
+	Cc: Radim Krčmář <rkrcmar@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 7e7126846c95a34f98a1524d5c473af1f0783735)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 5501a1957de2,612fd17be635..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -5082,6 -6162,32 +5082,35 @@@ static void vmx_complete_nested_posted_
+  	nested_mark_vmcs12_pages_dirty(vcpu);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static u8 vmx_get_rvi(void)
++ {
++ 	return vmcs_read16(GUEST_INTR_STATUS) & 0xff;
++ }
++ 
++ static bool vmx_guest_apic_has_interrupt(struct kvm_vcpu *vcpu)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 	void *vapic_page;
++ 	u32 vppr;
++ 	int rvi;
++ 
++ 	if (WARN_ON_ONCE(!is_guest_mode(vcpu)) ||
++ 		!nested_cpu_has_vid(get_vmcs12(vcpu)) ||
++ 		WARN_ON_ONCE(!vmx->nested.virtual_apic_page))
++ 		return false;
++ 
++ 	rvi = vmx_get_rvi();
++ 
++ 	vapic_page = kmap(vmx->nested.virtual_apic_page);
++ 	vppr = *((u32 *)(vapic_page + APIC_PROCPRI));
++ 	kunmap(vmx->nested.virtual_apic_page);
++ 
++ 	return ((rvi & 0xf0) > (vppr & 0xf0));
++ }
++ 
+++>>>>>>> 7e7126846c95 (kvm: nVMX: fix entry with pending interrupt if APICv is enabled)
+  static inline bool kvm_vcpu_trigger_posted_interrupt(struct kvm_vcpu *vcpu,
+  						     bool nested)
+  {
+@@@ -8851,9 -10354,16 +8880,21 @@@ static int vmx_sync_pir_to_irr(struct k
+  	return max_irr;
+  }
+  
+++<<<<<<< HEAD
+ +static void vmx_load_eoi_exitmap(struct kvm_vcpu *vcpu)
+++=======
++ static u8 vmx_has_apicv_interrupt(struct kvm_vcpu *vcpu)
++ {
++ 	u8 rvi = vmx_get_rvi();
++ 	u8 vppr = kvm_lapic_get_reg(vcpu->arch.apic, APIC_PROCPRI);
++ 
++ 	return ((rvi & 0xf0) > (vppr & 0xf0));
++ }
++ 
++ static void vmx_load_eoi_exitmap(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap)
+++>>>>>>> 7e7126846c95 (kvm: nVMX: fix entry with pending interrupt if APICv is enabled)
+  {
+ +	u64 *eoi_exit_bitmap = vcpu->arch.eoi_exit_bitmap;
+  	if (!kvm_vcpu_apicv_active(vcpu))
+  		return;
+  
+@@@ -10736,8 -12604,15 +10777,20 @@@ static int enter_vmx_non_root_mode(stru
+  {
+  	struct vcpu_vmx *vmx = to_vmx(vcpu);
+  	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+++<<<<<<< HEAD
+ +	u32 msr_entry_idx;
+ +	u32 exit_qual;
+++=======
++ 	bool from_vmentry = !!exit_qual;
++ 	u32 dummy_exit_qual;
++ 	bool evaluate_pending_interrupts;
++ 	int r = 0;
++ 
++ 	evaluate_pending_interrupts = vmcs_read32(CPU_BASED_VM_EXEC_CONTROL) &
++ 		(CPU_BASED_VIRTUAL_INTR_PENDING | CPU_BASED_VIRTUAL_NMI_PENDING);
++ 	if (likely(!evaluate_pending_interrupts) && kvm_vcpu_apicv_active(vcpu))
++ 		evaluate_pending_interrupts |= vmx_has_apicv_interrupt(vcpu);
+++>>>>>>> 7e7126846c95 (kvm: nVMX: fix entry with pending interrupt if APICv is enabled)
+  
+  	enter_guest_mode(vcpu);
+  
+@@@ -10747,26 -12625,49 +10800,45 @@@
+  	vmx_switch_vmcs(vcpu, &vmx->nested.vmcs02);
+  	vmx_segment_cache_clear(vmx);
+  
+ -	if (vmcs12->cpu_based_vm_exec_control & CPU_BASED_USE_TSC_OFFSETING)
+ -		vcpu->arch.tsc_offset += vmcs12->tsc_offset;
+ -
+ -	r = EXIT_REASON_INVALID_STATE;
+ -	if (prepare_vmcs02(vcpu, vmcs12, from_vmentry ? exit_qual : &dummy_exit_qual))
+ -		goto fail;
+ +	if (prepare_vmcs02(vcpu, vmcs12, from_vmentry, &exit_qual)) {
+ +		leave_guest_mode(vcpu);
+ +		vmx_switch_vmcs(vcpu, &vmx->vmcs01);
+ +		nested_vmx_entry_failure(vcpu, vmcs12,
+ +					 EXIT_REASON_INVALID_STATE, exit_qual);
+ +		return 1;
+ +	}
+  
+ -	if (from_vmentry) {
+ -		nested_get_vmcs12_pages(vcpu);
+++<<<<<<< HEAD
+ +	nested_get_vmcs12_pages(vcpu, vmcs12);
+  
+ -		r = EXIT_REASON_MSR_LOAD_FAIL;
+ -		*exit_qual = nested_vmx_load_msr(vcpu,
+ -	     					 vmcs12->vm_entry_msr_load_addr,
+ -					      	 vmcs12->vm_entry_msr_load_count);
+ -		if (*exit_qual)
+ -			goto fail;
+ -	} else {
+ -		/*
+ -		 * The MMU is not initialized to point at the right entities yet and
+ -		 * "get pages" would need to read data from the guest (i.e. we will
+ -		 * need to perform gpa to hpa translation). Request a call
+ -		 * to nested_get_vmcs12_pages before the next VM-entry.  The MSRs
+ -		 * have already been set at vmentry time and should not be reset.
+ -		 */
+ -		kvm_make_request(KVM_REQ_GET_VMCS12_PAGES, vcpu);
+ +	msr_entry_idx = nested_vmx_load_msr(vcpu,
+ +					    vmcs12->vm_entry_msr_load_addr,
+ +					    vmcs12->vm_entry_msr_load_count);
+ +	if (msr_entry_idx) {
+ +		leave_guest_mode(vcpu);
+ +		vmx_switch_vmcs(vcpu, &vmx->vmcs01);
+ +		nested_vmx_entry_failure(vcpu, vmcs12,
+ +				EXIT_REASON_MSR_LOAD_FAIL, msr_entry_idx);
+ +		return 1;
+  	}
+ -
+++=======
++ 	/*
++ 	 * If L1 had a pending IRQ/NMI until it executed
++ 	 * VMLAUNCH/VMRESUME which wasn't delivered because it was
++ 	 * disallowed (e.g. interrupts disabled), L0 needs to
++ 	 * evaluate if this pending event should cause an exit from L2
++ 	 * to L1 or delivered directly to L2 (e.g. In case L1 don't
++ 	 * intercept EXTERNAL_INTERRUPT).
++ 	 *
++ 	 * Usually this would be handled by the processor noticing an
++ 	 * IRQ/NMI window request, or checking RVI during evaluation of
++ 	 * pending virtual interrupts.  However, this setting was done
++ 	 * on VMCS01 and now VMCS02 is active instead. Thus, we force L0
++ 	 * to perform pending event evaluation by requesting a KVM_REQ_EVENT.
++ 	 */
++ 	if (unlikely(evaluate_pending_interrupts))
++ 		kvm_make_request(KVM_REQ_EVENT, vcpu);
+++>>>>>>> 7e7126846c95 (kvm: nVMX: fix entry with pending interrupt if APICv is enabled)
+  
+  	/*
+  	 * Note no nested_vmx_succeed or nested_vmx_fail here. At this point
+* Unmerged path arch/x86/kvm/vmx.c
