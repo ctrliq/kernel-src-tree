@@ -1,0 +1,484 @@
+scsi: lpfc: Separate NVMET data buffer pool fir ELS/CT.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+Rebuild_CHGLOG: - [scsi] lpfc: Separate NVMET data buffer pool fir ELS/CT (Dick Kennedy) [1385844 1461977 1387768]
+Rebuild_FUZZ: 93.20%
+commit-author James Smart <jsmart2021@gmail.com>
+commit 3c603be9798758dde794daa622e0f7017dbff3a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/3c603be9.failed
+
+Using 2048 byte buffer and onle 128 bytes is needed.
+
+Create nee LFPC_NVMET_DATA_BUF_SIZE define to use for NVMET RQ/MRQs.
+
+	Signed-off-by: Dick Kennedy <dick.kennedy@broadcom.com>
+	Signed-off-by: James Smart <james.smart@broadcom.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 3c603be9798758dde794daa622e0f7017dbff3a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc_init.c
+#	drivers/scsi/lpfc/lpfc_mem.c
+#	drivers/scsi/lpfc/lpfc_sli.c
+diff --cc drivers/scsi/lpfc/lpfc_init.c
+index 4d8c754a14fe,26b6a843d32d..000000000000
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@@ -5516,6 -5924,59 +5516,62 @@@ lpfc_sli4_driver_resource_setup(struct 
+  		goto out_free_bsmbx;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Check for NVMET being configured */
++ 	phba->nvmet_support = 0;
++ 	if (lpfc_enable_nvmet_cnt) {
++ 
++ 		/* First get WWN of HBA instance */
++ 		lpfc_read_nv(phba, mboxq);
++ 		rc = lpfc_sli_issue_mbox(phba, mboxq, MBX_POLL);
++ 		if (rc != MBX_SUCCESS) {
++ 			lpfc_printf_log(phba, KERN_ERR, LOG_SLI,
++ 					"6016 Mailbox failed , mbxCmd x%x "
++ 					"READ_NV, mbxStatus x%x\n",
++ 					bf_get(lpfc_mqe_command, &mboxq->u.mqe),
++ 					bf_get(lpfc_mqe_status, &mboxq->u.mqe));
++ 			mempool_free(mboxq, phba->mbox_mem_pool);
++ 			rc = -EIO;
++ 			goto out_free_bsmbx;
++ 		}
++ 		mb = &mboxq->u.mb;
++ 		memcpy(&wwn, (char *)mb->un.varRDnvp.nodename,
++ 		       sizeof(uint64_t));
++ 		wwn = cpu_to_be64(wwn);
++ 		phba->sli4_hba.wwnn.u.name = wwn;
++ 		memcpy(&wwn, (char *)mb->un.varRDnvp.portname,
++ 		       sizeof(uint64_t));
++ 		/* wwn is WWPN of HBA instance */
++ 		wwn = cpu_to_be64(wwn);
++ 		phba->sli4_hba.wwpn.u.name = wwn;
++ 
++ 		/* Check to see if it matches any module parameter */
++ 		for (i = 0; i < lpfc_enable_nvmet_cnt; i++) {
++ 			if (wwn == lpfc_enable_nvmet[i]) {
++ #if (IS_ENABLED(CONFIG_NVME_TARGET_FC))
++ 				if (lpfc_nvmet_mem_alloc(phba))
++ 					break;
++ 
++ 				phba->nvmet_support = 1; /* a match */
++ 
++ 				lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
++ 						"6017 NVME Target %016llx\n",
++ 						wwn);
++ #else
++ 				lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
++ 						"6021 Can't enable NVME Target."
++ 						" NVME_TARGET_FC infrastructure"
++ 						" is not in kernel\n");
++ #endif
++ 				break;
++ 			}
++ 		}
++ 	}
++ 
++ 	lpfc_nvme_mod_param_dep(phba);
++ 
+++>>>>>>> 3c603be97987 (scsi: lpfc: Separate NVMET data buffer pool fir ELS/CT.)
+  	/* Get the Supported Pages if PORT_CAPABILITIES is supported by port. */
+  	lpfc_supported_pages(mboxq);
+  	rc = lpfc_sli_issue_mbox(phba, mboxq, MBX_POLL);
+diff --cc drivers/scsi/lpfc/lpfc_mem.c
+index 3fa65338d3f5,91060afc9721..000000000000
+--- a/drivers/scsi/lpfc/lpfc_mem.c
++++ b/drivers/scsi/lpfc/lpfc_mem.c
+@@@ -540,7 -610,135 +558,139 @@@ lpfc_sli4_rb_free(struct lpfc_hba *phba
+  	pci_pool_free(phba->lpfc_hrb_pool, dmab->hbuf.virt, dmab->hbuf.phys);
+  	pci_pool_free(phba->lpfc_drb_pool, dmab->dbuf.virt, dmab->dbuf.phys);
+  	kfree(dmab);
+++<<<<<<< HEAD
+ +	return;
+++=======
++ }
++ 
++ /**
++  * lpfc_sli4_nvmet_alloc - Allocate an SLI4 Receive buffer
++  * @phba: HBA to allocate a receive buffer for
++  *
++  * Description: Allocates a DMA-mapped receive buffer from the lpfc_hrb_pool PCI
++  * pool along a non-DMA-mapped container for it.
++  *
++  * Notes: Not interrupt-safe.  Must be called with no locks held.
++  *
++  * Returns:
++  *   pointer to HBQ on success
++  *   NULL on failure
++  **/
++ struct rqb_dmabuf *
++ lpfc_sli4_nvmet_alloc(struct lpfc_hba *phba)
++ {
++ 	struct rqb_dmabuf *dma_buf;
++ 	struct lpfc_iocbq *nvmewqe;
++ 	union lpfc_wqe128 *wqe;
++ 
++ 	dma_buf = kzalloc(sizeof(struct rqb_dmabuf), GFP_KERNEL);
++ 	if (!dma_buf)
++ 		return NULL;
++ 
++ 	dma_buf->hbuf.virt = pci_pool_alloc(phba->lpfc_hrb_pool, GFP_KERNEL,
++ 					    &dma_buf->hbuf.phys);
++ 	if (!dma_buf->hbuf.virt) {
++ 		kfree(dma_buf);
++ 		return NULL;
++ 	}
++ 	dma_buf->dbuf.virt = pci_pool_alloc(phba->lpfc_nvmet_drb_pool,
++ 					    GFP_KERNEL, &dma_buf->dbuf.phys);
++ 	if (!dma_buf->dbuf.virt) {
++ 		pci_pool_free(phba->lpfc_hrb_pool, dma_buf->hbuf.virt,
++ 			      dma_buf->hbuf.phys);
++ 		kfree(dma_buf);
++ 		return NULL;
++ 	}
++ 	dma_buf->total_size = LPFC_NVMET_DATA_BUF_SIZE;
++ 
++ 	dma_buf->context = kzalloc(sizeof(struct lpfc_nvmet_rcv_ctx),
++ 				   GFP_KERNEL);
++ 	if (!dma_buf->context) {
++ 		pci_pool_free(phba->lpfc_nvmet_drb_pool, dma_buf->dbuf.virt,
++ 			      dma_buf->dbuf.phys);
++ 		pci_pool_free(phba->lpfc_hrb_pool, dma_buf->hbuf.virt,
++ 			      dma_buf->hbuf.phys);
++ 		kfree(dma_buf);
++ 		return NULL;
++ 	}
++ 
++ 	dma_buf->iocbq = lpfc_sli_get_iocbq(phba);
++ 	if (!dma_buf->iocbq) {
++ 		kfree(dma_buf->context);
++ 		pci_pool_free(phba->lpfc_nvmet_drb_pool, dma_buf->dbuf.virt,
++ 			      dma_buf->dbuf.phys);
++ 		pci_pool_free(phba->lpfc_hrb_pool, dma_buf->hbuf.virt,
++ 			      dma_buf->hbuf.phys);
++ 		kfree(dma_buf);
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_NVME,
++ 				"2621 Ran out of nvmet iocb/WQEs\n");
++ 		return NULL;
++ 	}
++ 	dma_buf->iocbq->iocb_flag = LPFC_IO_NVMET;
++ 	nvmewqe = dma_buf->iocbq;
++ 	wqe = (union lpfc_wqe128 *)&nvmewqe->wqe;
++ 	/* Initialize WQE */
++ 	memset(wqe, 0, sizeof(union lpfc_wqe));
++ 	/* Word 7 */
++ 	bf_set(wqe_ct, &wqe->generic.wqe_com, SLI4_CT_RPI);
++ 	bf_set(wqe_class, &wqe->generic.wqe_com, CLASS3);
++ 	bf_set(wqe_pu, &wqe->generic.wqe_com, 1);
++ 	/* Word 10 */
++ 	bf_set(wqe_nvme, &wqe->fcp_tsend.wqe_com, 1);
++ 	bf_set(wqe_ebde_cnt, &wqe->generic.wqe_com, 0);
++ 	bf_set(wqe_qosd, &wqe->generic.wqe_com, 0);
++ 
++ 	dma_buf->iocbq->context1 = NULL;
++ 	spin_lock(&phba->sli4_hba.sgl_list_lock);
++ 	dma_buf->sglq = __lpfc_sli_get_nvmet_sglq(phba, dma_buf->iocbq);
++ 	spin_unlock(&phba->sli4_hba.sgl_list_lock);
++ 	if (!dma_buf->sglq) {
++ 		lpfc_sli_release_iocbq(phba, dma_buf->iocbq);
++ 		kfree(dma_buf->context);
++ 		pci_pool_free(phba->lpfc_nvmet_drb_pool, dma_buf->dbuf.virt,
++ 			      dma_buf->dbuf.phys);
++ 		pci_pool_free(phba->lpfc_hrb_pool, dma_buf->hbuf.virt,
++ 			      dma_buf->hbuf.phys);
++ 		kfree(dma_buf);
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_NVME,
++ 				"6132 Ran out of nvmet XRIs\n");
++ 		return NULL;
++ 	}
++ 	return dma_buf;
++ }
++ 
++ /**
++  * lpfc_sli4_nvmet_free - Frees a receive buffer
++  * @phba: HBA buffer was allocated for
++  * @dmab: DMA Buffer container returned by lpfc_sli4_rbq_alloc
++  *
++  * Description: Frees both the container and the DMA-mapped buffers returned by
++  * lpfc_sli4_nvmet_alloc.
++  *
++  * Notes: Can be called with or without locks held.
++  *
++  * Returns: None
++  **/
++ void
++ lpfc_sli4_nvmet_free(struct lpfc_hba *phba, struct rqb_dmabuf *dmab)
++ {
++ 	unsigned long flags;
++ 
++ 	__lpfc_clear_active_sglq(phba, dmab->sglq->sli4_lxritag);
++ 	dmab->sglq->state = SGL_FREED;
++ 	dmab->sglq->ndlp = NULL;
++ 
++ 	spin_lock_irqsave(&phba->sli4_hba.sgl_list_lock, flags);
++ 	list_add_tail(&dmab->sglq->list, &phba->sli4_hba.lpfc_nvmet_sgl_list);
++ 	spin_unlock_irqrestore(&phba->sli4_hba.sgl_list_lock, flags);
++ 
++ 	lpfc_sli_release_iocbq(phba, dmab->iocbq);
++ 	kfree(dmab->context);
++ 	pci_pool_free(phba->lpfc_hrb_pool, dmab->hbuf.virt, dmab->hbuf.phys);
++ 	pci_pool_free(phba->lpfc_nvmet_drb_pool,
++ 		      dmab->dbuf.virt, dmab->dbuf.phys);
++ 	kfree(dmab);
+++>>>>>>> 3c603be97987 (scsi: lpfc: Separate NVMET data buffer pool fir ELS/CT.)
+  }
+  
+  /**
+diff --cc drivers/scsi/lpfc/lpfc_sli.c
+index c54385fd9058,49d5c4700054..000000000000
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@@ -14107,6 -15173,199 +14118,202 @@@ out
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * lpfc_mrq_create - Create MRQ Receive Queues on the HBA
++  * @phba: HBA structure that indicates port to create a queue on.
++  * @hrqp: The queue structure array to use to create the header receive queues.
++  * @drqp: The queue structure array to use to create the data receive queues.
++  * @cqp: The completion queue array to bind these receive queues to.
++  *
++  * This function creates a receive buffer queue pair , as detailed in @hrq and
++  * @drq, on a port, described by @phba by sending a RQ_CREATE mailbox command
++  * to the HBA.
++  *
++  * The @phba struct is used to send mailbox command to HBA. The @drq and @hrq
++  * struct is used to get the entry count that is necessary to determine the
++  * number of pages to use for this queue. The @cq is used to indicate which
++  * completion queue to bind received buffers that are posted to these queues to.
++  * This function will send the RQ_CREATE mailbox command to the HBA to setup the
++  * receive queue pair. This function is asynchronous and will wait for the
++  * mailbox command to finish before continuing.
++  *
++  * On success this function will return a zero. If unable to allocate enough
++  * memory this function will return -ENOMEM. If the queue create mailbox command
++  * fails this function will return -ENXIO.
++  **/
++ int
++ lpfc_mrq_create(struct lpfc_hba *phba, struct lpfc_queue **hrqp,
++ 		struct lpfc_queue **drqp, struct lpfc_queue **cqp,
++ 		uint32_t subtype)
++ {
++ 	struct lpfc_queue *hrq, *drq, *cq;
++ 	struct lpfc_mbx_rq_create_v2 *rq_create;
++ 	struct lpfc_dmabuf *dmabuf;
++ 	LPFC_MBOXQ_t *mbox;
++ 	int rc, length, alloclen, status = 0;
++ 	int cnt, idx, numrq, page_idx = 0;
++ 	uint32_t shdr_status, shdr_add_status;
++ 	union lpfc_sli4_cfg_shdr *shdr;
++ 	uint32_t hw_page_size = phba->sli4_hba.pc_sli4_params.if_page_sz;
++ 
++ 	numrq = phba->cfg_nvmet_mrq;
++ 	/* sanity check on array memory */
++ 	if (!hrqp || !drqp || !cqp || !numrq)
++ 		return -ENODEV;
++ 	if (!phba->sli4_hba.pc_sli4_params.supported)
++ 		hw_page_size = SLI4_PAGE_SIZE;
++ 
++ 	mbox = mempool_alloc(phba->mbox_mem_pool, GFP_KERNEL);
++ 	if (!mbox)
++ 		return -ENOMEM;
++ 
++ 	length = sizeof(struct lpfc_mbx_rq_create_v2);
++ 	length += ((2 * numrq * hrqp[0]->page_count) *
++ 		   sizeof(struct dma_address));
++ 
++ 	alloclen = lpfc_sli4_config(phba, mbox, LPFC_MBOX_SUBSYSTEM_FCOE,
++ 				    LPFC_MBOX_OPCODE_FCOE_RQ_CREATE, length,
++ 				    LPFC_SLI4_MBX_NEMBED);
++ 	if (alloclen < length) {
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_SLI,
++ 				"3099 Allocated DMA memory size (%d) is "
++ 				"less than the requested DMA memory size "
++ 				"(%d)\n", alloclen, length);
++ 		status = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 
++ 
++ 	rq_create = mbox->sge_array->addr[0];
++ 	shdr = (union lpfc_sli4_cfg_shdr *)&rq_create->cfg_shdr;
++ 
++ 	bf_set(lpfc_mbox_hdr_version, &shdr->request, LPFC_Q_CREATE_VERSION_2);
++ 	cnt = 0;
++ 
++ 	for (idx = 0; idx < numrq; idx++) {
++ 		hrq = hrqp[idx];
++ 		drq = drqp[idx];
++ 		cq  = cqp[idx];
++ 
++ 		/* sanity check on queue memory */
++ 		if (!hrq || !drq || !cq) {
++ 			status = -ENODEV;
++ 			goto out;
++ 		}
++ 
++ 		if (hrq->entry_count != drq->entry_count) {
++ 			status = -EINVAL;
++ 			goto out;
++ 		}
++ 
++ 		if (idx == 0) {
++ 			bf_set(lpfc_mbx_rq_create_num_pages,
++ 			       &rq_create->u.request,
++ 			       hrq->page_count);
++ 			bf_set(lpfc_mbx_rq_create_rq_cnt,
++ 			       &rq_create->u.request, (numrq * 2));
++ 			bf_set(lpfc_mbx_rq_create_dnb, &rq_create->u.request,
++ 			       1);
++ 			bf_set(lpfc_rq_context_base_cq,
++ 			       &rq_create->u.request.context,
++ 			       cq->queue_id);
++ 			bf_set(lpfc_rq_context_data_size,
++ 			       &rq_create->u.request.context,
++ 			       LPFC_NVMET_DATA_BUF_SIZE);
++ 			bf_set(lpfc_rq_context_hdr_size,
++ 			       &rq_create->u.request.context,
++ 			       LPFC_HDR_BUF_SIZE);
++ 			bf_set(lpfc_rq_context_rqe_count_1,
++ 			       &rq_create->u.request.context,
++ 			       hrq->entry_count);
++ 			bf_set(lpfc_rq_context_rqe_size,
++ 			       &rq_create->u.request.context,
++ 			       LPFC_RQE_SIZE_8);
++ 			bf_set(lpfc_rq_context_page_size,
++ 			       &rq_create->u.request.context,
++ 			       (PAGE_SIZE/SLI4_PAGE_SIZE));
++ 		}
++ 		rc = 0;
++ 		list_for_each_entry(dmabuf, &hrq->page_list, list) {
++ 			memset(dmabuf->virt, 0, hw_page_size);
++ 			cnt = page_idx + dmabuf->buffer_tag;
++ 			rq_create->u.request.page[cnt].addr_lo =
++ 					putPaddrLow(dmabuf->phys);
++ 			rq_create->u.request.page[cnt].addr_hi =
++ 					putPaddrHigh(dmabuf->phys);
++ 			rc++;
++ 		}
++ 		page_idx += rc;
++ 
++ 		rc = 0;
++ 		list_for_each_entry(dmabuf, &drq->page_list, list) {
++ 			memset(dmabuf->virt, 0, hw_page_size);
++ 			cnt = page_idx + dmabuf->buffer_tag;
++ 			rq_create->u.request.page[cnt].addr_lo =
++ 					putPaddrLow(dmabuf->phys);
++ 			rq_create->u.request.page[cnt].addr_hi =
++ 					putPaddrHigh(dmabuf->phys);
++ 			rc++;
++ 		}
++ 		page_idx += rc;
++ 
++ 		hrq->db_format = LPFC_DB_RING_FORMAT;
++ 		hrq->db_regaddr = phba->sli4_hba.RQDBregaddr;
++ 		hrq->type = LPFC_HRQ;
++ 		hrq->assoc_qid = cq->queue_id;
++ 		hrq->subtype = subtype;
++ 		hrq->host_index = 0;
++ 		hrq->hba_index = 0;
++ 		hrq->entry_repost = LPFC_RQ_REPOST;
++ 
++ 		drq->db_format = LPFC_DB_RING_FORMAT;
++ 		drq->db_regaddr = phba->sli4_hba.RQDBregaddr;
++ 		drq->type = LPFC_DRQ;
++ 		drq->assoc_qid = cq->queue_id;
++ 		drq->subtype = subtype;
++ 		drq->host_index = 0;
++ 		drq->hba_index = 0;
++ 		drq->entry_repost = LPFC_RQ_REPOST;
++ 
++ 		list_add_tail(&hrq->list, &cq->child_list);
++ 		list_add_tail(&drq->list, &cq->child_list);
++ 	}
++ 
++ 	rc = lpfc_sli_issue_mbox(phba, mbox, MBX_POLL);
++ 	/* The IOCTL status is embedded in the mailbox subheader. */
++ 	shdr_status = bf_get(lpfc_mbox_hdr_status, &shdr->response);
++ 	shdr_add_status = bf_get(lpfc_mbox_hdr_add_status, &shdr->response);
++ 	if (shdr_status || shdr_add_status || rc) {
++ 		lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
++ 				"3120 RQ_CREATE mailbox failed with "
++ 				"status x%x add_status x%x, mbx status x%x\n",
++ 				shdr_status, shdr_add_status, rc);
++ 		status = -ENXIO;
++ 		goto out;
++ 	}
++ 	rc = bf_get(lpfc_mbx_rq_create_q_id, &rq_create->u.response);
++ 	if (rc == 0xFFFF) {
++ 		status = -ENXIO;
++ 		goto out;
++ 	}
++ 
++ 	/* Initialize all RQs with associated queue id */
++ 	for (idx = 0; idx < numrq; idx++) {
++ 		hrq = hrqp[idx];
++ 		hrq->queue_id = rc + (2 * idx);
++ 		drq = drqp[idx];
++ 		drq->queue_id = rc + (2 * idx) + 1;
++ 	}
++ 
++ out:
++ 	lpfc_sli4_mbox_cmd_free(phba, mbox);
++ 	return status;
++ }
++ 
++ /**
+++>>>>>>> 3c603be97987 (scsi: lpfc: Separate NVMET data buffer pool fir ELS/CT.)
+   * lpfc_eq_destroy - Destroy an event Queue on the HBA
+   * @eq: The queue structure associated with the queue to destroy.
+   *
+diff --git a/drivers/scsi/lpfc/lpfc.h b/drivers/scsi/lpfc/lpfc.h
+index 61c6751c0584..4fc547f56a0d 100644
+--- a/drivers/scsi/lpfc/lpfc.h
++++ b/drivers/scsi/lpfc/lpfc.h
+@@ -868,6 +868,7 @@ struct lpfc_hba {
+ 	struct pci_pool *lpfc_mbuf_pool;
+ 	struct pci_pool *lpfc_hrb_pool;	/* header receive buffer pool */
+ 	struct pci_pool *lpfc_drb_pool; /* data receive buffer pool */
++	struct pci_pool *lpfc_nvmet_drb_pool; /* data receive buffer pool */
+ 	struct pci_pool *lpfc_hbq_pool;	/* SLI3 hbq buffer pool */
+ 	struct lpfc_dma_pool lpfc_mbuf_safety_pool;
+ 
+diff --git a/drivers/scsi/lpfc/lpfc_crtn.h b/drivers/scsi/lpfc/lpfc_crtn.h
+index 5c660beb66e2..dc2660d2ff78 100644
+--- a/drivers/scsi/lpfc/lpfc_crtn.h
++++ b/drivers/scsi/lpfc/lpfc_crtn.h
+@@ -247,6 +247,7 @@ int lpfc_sli4_fcf_rr_next_proc(struct lpfc_vport *, uint16_t);
+ void lpfc_sli4_clear_fcf_rr_bmask(struct lpfc_hba *);
+ 
+ int lpfc_mem_alloc(struct lpfc_hba *, int align);
++int lpfc_nvmet_mem_alloc(struct lpfc_hba *phba);
+ int lpfc_mem_alloc_active_rrq_pool_s4(struct lpfc_hba *);
+ void lpfc_mem_free(struct lpfc_hba *);
+ void lpfc_mem_free_all(struct lpfc_hba *);
+diff --git a/drivers/scsi/lpfc/lpfc_hw4.h b/drivers/scsi/lpfc/lpfc_hw4.h
+index 3567b6a0d2ee..45a6ac57522b 100644
+--- a/drivers/scsi/lpfc/lpfc_hw4.h
++++ b/drivers/scsi/lpfc/lpfc_hw4.h
+@@ -1235,6 +1235,7 @@ struct lpfc_mbx_wq_destroy {
+ 
+ #define LPFC_HDR_BUF_SIZE 128
+ #define LPFC_DATA_BUF_SIZE 2048
++#define LPFC_NVMET_DATA_BUF_SIZE 128
+ struct rq_context {
+ 	uint32_t word0;
+ #define lpfc_rq_context_rqe_count_SHIFT	16	/* Version 0 Only */
+* Unmerged path drivers/scsi/lpfc/lpfc_init.c
+* Unmerged path drivers/scsi/lpfc/lpfc_mem.c
+* Unmerged path drivers/scsi/lpfc/lpfc_sli.c
