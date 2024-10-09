@@ -1,0 +1,258 @@
+btrfs: introduce tickets_id to determine whether asynchronous metadata reclaim work makes progress
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Wang Xiaoguang <wangxg.fnst@cn.fujitsu.com>
+commit ce129655c9d9aaa7b3bcc46529db1b36693575ed
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/ce129655.failed
+
+In btrfs_async_reclaim_metadata_space(), we use ticket's address to
+determine whether asynchronous metadata reclaim work is making progress.
+
+	ticket = list_first_entry(&space_info->tickets,
+				  struct reserve_ticket, list);
+	if (last_ticket == ticket) {
+		flush_state++;
+	} else {
+		last_ticket = ticket;
+		flush_state = FLUSH_DELAYED_ITEMS_NR;
+		if (commit_cycles)
+			commit_cycles--;
+	}
+
+But indeed it's wrong, we should not rely on local variable's address to
+do this check, because addresses may be same. In my test environment, I
+dd one 168MB file in a 256MB fs, found that for this file, every time
+wait_reserve_ticket() called, local variable ticket's address is same,
+
+For above codes, assume a previous ticket's address is addrA, last_ticket
+is addrA. Btrfs_async_reclaim_metadata_space() finished this ticket and
+wake up it, then another ticket is added, but with the same address addrA,
+now last_ticket will be same to current ticket, then current ticket's flush
+work will start from current flush_state, not initial FLUSH_DELAYED_ITEMS_NR,
+which may result in some enospc issues(I have seen this in my test machine).
+
+	Signed-off-by: Wang Xiaoguang <wangxg.fnst@cn.fujitsu.com>
+	Reviewed-by: Josef Bacik <jbacik@fb.com>
+	Signed-off-by: David Sterba <dsterba@suse.com>
+(cherry picked from commit ce129655c9d9aaa7b3bcc46529db1b36693575ed)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/ctree.h
+#	fs/btrfs/extent-tree.c
+diff --cc fs/btrfs/ctree.h
+index 48f38b765f55,146d1c7078ed..000000000000
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@@ -419,6 -425,9 +419,12 @@@ struct btrfs_space_info 
+  	struct list_head list;
+  	/* Protected by the spinlock 'lock'. */
+  	struct list_head ro_bgs;
+++<<<<<<< HEAD
+++=======
++ 	struct list_head priority_tickets;
++ 	struct list_head tickets;
++ 	u64 tickets_id;
+++>>>>>>> ce129655c9d9 (btrfs: introduce tickets_id to determine whether asynchronous metadata reclaim work makes progress)
+  
+  	struct rw_semaphore groups_sem;
+  	/* for block groups in our same type */
+diff --cc fs/btrfs/extent-tree.c
+index b627133218e7,d09cf7aa083b..000000000000
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@@ -4895,24 -4970,60 +4895,63 @@@ static void btrfs_async_reclaim_metadat
+  	struct btrfs_space_info *space_info;
+  	u64 to_reclaim;
+  	int flush_state;
+++<<<<<<< HEAD
+++=======
++ 	int commit_cycles = 0;
++ 	u64 last_tickets_id;
+++>>>>>>> ce129655c9d9 (btrfs: introduce tickets_id to determine whether asynchronous metadata reclaim work makes progress)
+  
+  	fs_info = container_of(work, struct btrfs_fs_info, async_reclaim_work);
+  	space_info = __find_space_info(fs_info, BTRFS_BLOCK_GROUP_METADATA);
+  
+ -	spin_lock(&space_info->lock);
+  	to_reclaim = btrfs_calc_reclaim_metadata_size(fs_info->fs_root,
+  						      space_info);
+ -	if (!to_reclaim) {
+ -		space_info->flush = 0;
+ -		spin_unlock(&space_info->lock);
+ +	if (!to_reclaim)
+  		return;
+++<<<<<<< HEAD
+++=======
++ 	}
++ 	last_tickets_id = space_info->tickets_id;
++ 	spin_unlock(&space_info->lock);
+++>>>>>>> ce129655c9d9 (btrfs: introduce tickets_id to determine whether asynchronous metadata reclaim work makes progress)
+  
+  	flush_state = FLUSH_DELAYED_ITEMS_NR;
+  	do {
+ -		struct reserve_ticket *ticket;
+ -		int ret;
+ -
+ -		ret = flush_space(fs_info->fs_root, space_info, to_reclaim,
+ +		flush_space(fs_info->fs_root, space_info, to_reclaim,
+  			    to_reclaim, flush_state);
+ -		spin_lock(&space_info->lock);
+ -		if (list_empty(&space_info->tickets)) {
+ -			space_info->flush = 0;
+ -			spin_unlock(&space_info->lock);
+ +		flush_state++;
+ +		if (!btrfs_need_do_async_reclaim(space_info, fs_info,
+ +						 flush_state))
+  			return;
+++<<<<<<< HEAD
+ +	} while (flush_state < COMMIT_TRANS);
+++=======
++ 		}
++ 		to_reclaim = btrfs_calc_reclaim_metadata_size(fs_info->fs_root,
++ 							      space_info);
++ 		ticket = list_first_entry(&space_info->tickets,
++ 					  struct reserve_ticket, list);
++ 		if (last_tickets_id == space_info->tickets_id) {
++ 			flush_state++;
++ 		} else {
++ 			last_tickets_id = space_info->tickets_id;
++ 			flush_state = FLUSH_DELAYED_ITEMS_NR;
++ 			if (commit_cycles)
++ 				commit_cycles--;
++ 		}
++ 
++ 		if (flush_state > COMMIT_TRANS) {
++ 			commit_cycles++;
++ 			if (commit_cycles > 2) {
++ 				wake_all_tickets(&space_info->tickets);
++ 				space_info->flush = 0;
++ 			} else {
++ 				flush_state = FLUSH_DELAYED_ITEMS_NR;
++ 			}
++ 		}
++ 		spin_unlock(&space_info->lock);
++ 	} while (flush_state <= COMMIT_TRANS);
+++>>>>>>> ce129655c9d9 (btrfs: introduce tickets_id to determine whether asynchronous metadata reclaim work makes progress)
+  }
+  
+  void btrfs_init_async_reclaim_work(struct work_struct *work)
+@@@ -5162,6 -5340,110 +5201,113 @@@ int btrfs_cond_migrate_bytes(struct btr
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * This is for space we already have accounted in space_info->bytes_may_use, so
++  * basically when we're returning space from block_rsv's.
++  */
++ static void space_info_add_old_bytes(struct btrfs_fs_info *fs_info,
++ 				     struct btrfs_space_info *space_info,
++ 				     u64 num_bytes)
++ {
++ 	struct reserve_ticket *ticket;
++ 	struct list_head *head;
++ 	u64 used;
++ 	enum btrfs_reserve_flush_enum flush = BTRFS_RESERVE_NO_FLUSH;
++ 	bool check_overcommit = false;
++ 
++ 	spin_lock(&space_info->lock);
++ 	head = &space_info->priority_tickets;
++ 
++ 	/*
++ 	 * If we are over our limit then we need to check and see if we can
++ 	 * overcommit, and if we can't then we just need to free up our space
++ 	 * and not satisfy any requests.
++ 	 */
++ 	used = space_info->bytes_used + space_info->bytes_reserved +
++ 		space_info->bytes_pinned + space_info->bytes_readonly +
++ 		space_info->bytes_may_use;
++ 	if (used - num_bytes >= space_info->total_bytes)
++ 		check_overcommit = true;
++ again:
++ 	while (!list_empty(head) && num_bytes) {
++ 		ticket = list_first_entry(head, struct reserve_ticket,
++ 					  list);
++ 		/*
++ 		 * We use 0 bytes because this space is already reserved, so
++ 		 * adding the ticket space would be a double count.
++ 		 */
++ 		if (check_overcommit &&
++ 		    !can_overcommit(fs_info->extent_root, space_info, 0,
++ 				    flush))
++ 			break;
++ 		if (num_bytes >= ticket->bytes) {
++ 			list_del_init(&ticket->list);
++ 			num_bytes -= ticket->bytes;
++ 			ticket->bytes = 0;
++ 			space_info->tickets_id++;
++ 			wake_up(&ticket->wait);
++ 		} else {
++ 			ticket->bytes -= num_bytes;
++ 			num_bytes = 0;
++ 		}
++ 	}
++ 
++ 	if (num_bytes && head == &space_info->priority_tickets) {
++ 		head = &space_info->tickets;
++ 		flush = BTRFS_RESERVE_FLUSH_ALL;
++ 		goto again;
++ 	}
++ 	space_info->bytes_may_use -= num_bytes;
++ 	trace_btrfs_space_reservation(fs_info, "space_info",
++ 				      space_info->flags, num_bytes, 0);
++ 	spin_unlock(&space_info->lock);
++ }
++ 
++ /*
++  * This is for newly allocated space that isn't accounted in
++  * space_info->bytes_may_use yet.  So if we allocate a chunk or unpin an extent
++  * we use this helper.
++  */
++ static void space_info_add_new_bytes(struct btrfs_fs_info *fs_info,
++ 				     struct btrfs_space_info *space_info,
++ 				     u64 num_bytes)
++ {
++ 	struct reserve_ticket *ticket;
++ 	struct list_head *head = &space_info->priority_tickets;
++ 
++ again:
++ 	while (!list_empty(head) && num_bytes) {
++ 		ticket = list_first_entry(head, struct reserve_ticket,
++ 					  list);
++ 		if (num_bytes >= ticket->bytes) {
++ 			trace_btrfs_space_reservation(fs_info, "space_info",
++ 						      space_info->flags,
++ 						      ticket->bytes, 1);
++ 			list_del_init(&ticket->list);
++ 			num_bytes -= ticket->bytes;
++ 			space_info->bytes_may_use += ticket->bytes;
++ 			ticket->bytes = 0;
++ 			space_info->tickets_id++;
++ 			wake_up(&ticket->wait);
++ 		} else {
++ 			trace_btrfs_space_reservation(fs_info, "space_info",
++ 						      space_info->flags,
++ 						      num_bytes, 1);
++ 			space_info->bytes_may_use += num_bytes;
++ 			ticket->bytes -= num_bytes;
++ 			num_bytes = 0;
++ 		}
++ 	}
++ 
++ 	if (num_bytes && head == &space_info->priority_tickets) {
++ 		head = &space_info->tickets;
++ 		goto again;
++ 	}
++ }
++ 
+++>>>>>>> ce129655c9d9 (btrfs: introduce tickets_id to determine whether asynchronous metadata reclaim work makes progress)
+  static void block_rsv_release_bytes(struct btrfs_fs_info *fs_info,
+  				    struct btrfs_block_rsv *block_rsv,
+  				    struct btrfs_block_rsv *dest, u64 num_bytes)
+* Unmerged path fs/btrfs/ctree.h
+* Unmerged path fs/btrfs/extent-tree.c
