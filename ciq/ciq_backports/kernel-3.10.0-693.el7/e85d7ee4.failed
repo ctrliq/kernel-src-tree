@@ -1,0 +1,209 @@
+pNFS: Separate handling of NFS4ERR_LAYOUTTRYLATER and RECALLCONFLICT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Trond Myklebust <trond.myklebust@primarydata.com>
+commit e85d7ee42003314652ab3ae2c60e3b8cd793b65f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/e85d7ee4.failed
+
+They are not the same error, and need to be handled differently.
+
+Fixes: 183d9e7b112aa ("pnfs: rework LAYOUTGET retry handling")
+	Cc: stable@vger.kernel.org # 4.7
+	Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+	Reviewed-by: Jeff Layton <jlayton@redhat.com>
+(cherry picked from commit e85d7ee42003314652ab3ae2c60e3b8cd793b65f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4proc.c
+#	fs/nfs/pnfs.c
+diff --cc fs/nfs/nfs4proc.c
+index 7856a039a425,ee8efe0a5202..000000000000
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@@ -433,6 -437,8 +433,11 @@@ static int nfs4_do_handle_exception(str
+  		case -NFS4ERR_DELAY:
+  			nfs_inc_server_stats(server, NFSIOS_DELAY);
+  		case -NFS4ERR_GRACE:
+++<<<<<<< HEAD
+++=======
++ 		case -NFS4ERR_LAYOUTTRYLATER:
++ 		case -NFS4ERR_RECALLCONFLICT:
+++>>>>>>> e85d7ee42003 (pNFS: Separate handling of NFS4ERR_LAYOUTTRYLATER and RECALLCONFLICT)
+  			exception->delay = 1;
+  			return 0;
+  
+@@@ -7994,15 -7874,22 +7999,24 @@@ static void nfs4_layoutget_done(struct 
+  	struct inode *inode = lgp->args.inode;
+  	struct nfs_server *server = NFS_SERVER(inode);
+  	struct pnfs_layout_hdr *lo;
+++<<<<<<< HEAD
+ +	struct nfs4_state *state = NULL;
+ +	unsigned long timeo, now, giveup;
+ +
+ +	dprintk("--> %s tk_status => %d\n", __func__, -task->tk_status);
+ +
+ +	if (!nfs41_sequence_done(task, &lgp->res.seq_res))
+ +		goto out;
+ +
+ +	switch (task->tk_status) {
+++=======
++ 	int nfs4err = task->tk_status;
++ 	int err, status = 0;
++ 
++ 	dprintk("--> %s tk_status => %d\n", __func__, -task->tk_status);
++ 
++ 	switch (nfs4err) {
+++>>>>>>> e85d7ee42003 (pNFS: Separate handling of NFS4ERR_LAYOUTTRYLATER and RECALLCONFLICT)
+  	case 0:
+  		goto out;
+  
+@@@ -8024,36 -7912,19 +8038,47 @@@
+  	 * NFS4ERR_LAYOUTTRYLATER is a conflict with another client
+  	 * (or clients) writing to the same RAID stripe except when
+  	 * the minlength argument is 0 (see RFC5661 section 18.43.3).
+ -	 *
+ -	 * Treat it like we would RECALLCONFLICT -- we retry for a little
+ -	 * while, and then eventually give up.
+  	 */
+  	case -NFS4ERR_LAYOUTTRYLATER:
+++<<<<<<< HEAD
+ +		if (lgp->args.minlength == 0)
+ +			goto out_overflow;
+ +	/*
+ +	 * NFS4ERR_RECALLCONFLICT is when conflict with self (must recall
+ +	 * existing layout before getting a new one).
+ +	 */
+ +	case -NFS4ERR_RECALLCONFLICT:
+ +		timeo = rpc_get_timeout(task->tk_client);
+ +		giveup = lgp->args.timestamp + timeo;
+ +		now = jiffies;
+ +		if (time_after(giveup, now)) {
+ +			unsigned long delay;
+ +
+ +			/* Delay for:
+ +			 * - Not less then NFS4_POLL_RETRY_MIN.
+ +			 * - One last time a jiffie before we give up
+ +			 * - exponential backoff (time_now minus start_attempt)
+ +			 */
+ +			delay = max_t(unsigned long, NFS4_POLL_RETRY_MIN,
+ +				    min((giveup - now - 1),
+ +					now - lgp->args.timestamp));
+ +
+ +			dprintk("%s: NFS4ERR_RECALLCONFLICT waiting %lu\n",
+ +				__func__, delay);
+ +			rpc_delay(task, delay);
+ +			/* Do not call nfs4_async_handle_error() */
+ +			goto out_restart;
+ +		}
+++=======
++ 		if (lgp->args.minlength == 0) {
++ 			status = -EOVERFLOW;
++ 			goto out;
++ 		}
++ 		status = -EBUSY;
++ 		break;
++ 	case -NFS4ERR_RECALLCONFLICT:
++ 		status = -ERECALLCONFLICT;
+++>>>>>>> e85d7ee42003 (pNFS: Separate handling of NFS4ERR_LAYOUTTRYLATER and RECALLCONFLICT)
+  		break;
+  	case -NFS4ERR_EXPIRED:
+  	case -NFS4ERR_BAD_STATEID:
+@@@ -8075,25 -7947,25 +8100,36 @@@
+  			 * with the current stateid.
+  			 */
+  			set_bit(NFS_LAYOUT_INVALID_STID, &lo->plh_flags);
+ -			pnfs_mark_matching_lsegs_invalid(lo, &head, NULL, 0);
+ +			pnfs_mark_matching_lsegs_invalid(lo, &head, NULL);
+  			spin_unlock(&inode->i_lock);
+  			pnfs_free_lseg_list(&head);
+ -			status = -EAGAIN;
+ -			goto out;
+  		} else
+  			spin_unlock(&inode->i_lock);
+ +		goto out_restart;
+  	}
+++<<<<<<< HEAD
+ +	if (nfs4_async_handle_error(task, server, state, &lgp->timeout) == -EAGAIN)
+ +		goto out_restart;
+++=======
++ 
++ 	err = nfs4_handle_exception(server, nfs4err, exception);
++ 	if (!status) {
++ 		if (exception->retry)
++ 			status = -EAGAIN;
++ 		else
++ 			status = err;
++ 	}
+++>>>>>>> e85d7ee42003 (pNFS: Separate handling of NFS4ERR_LAYOUTTRYLATER and RECALLCONFLICT)
+  out:
+  	dprintk("<-- %s\n", __func__);
+ -	return status;
+ +	return;
+ +out_restart:
+ +	task->tk_status = 0;
+ +	rpc_restart_call_prepare(task);
+ +	return;
+ +out_overflow:
+ +	task->tk_status = -EOVERFLOW;
+ +	goto out;
+  }
+  
+  static size_t max_response_pages(struct nfs_server *server)
+diff --cc fs/nfs/pnfs.c
+index fe569dd6f6b9,c50d4ebab5c5..000000000000
+--- a/fs/nfs/pnfs.c
++++ b/fs/nfs/pnfs.c
+@@@ -1631,12 -1640,40 +1631,43 @@@ lookup_again
+  		arg.length += pg_offset;
+  	}
+  	if (arg.length != NFS4_MAX_UINT64)
+ -		arg.length = PAGE_ALIGN(arg.length);
+ +		arg.length = PAGE_CACHE_ALIGN(arg.length);
+  
+ -	lseg = send_layoutget(lo, ctx, &stateid, &arg, &timeout, gfp_flags);
+ -	trace_pnfs_update_layout(ino, pos, count, iomode, lo, lseg,
+ -				 PNFS_UPDATE_LAYOUT_SEND_LAYOUTGET);
+ +	lseg = send_layoutget(lo, ctx, &arg, gfp_flags);
+  	atomic_dec(&lo->plh_outstanding);
+++<<<<<<< HEAD
+ +	trace_pnfs_update_layout(ino, pos, count, iomode, lo,
+ +				 PNFS_UPDATE_LAYOUT_SEND_LAYOUTGET);
+++=======
++ 	if (IS_ERR(lseg)) {
++ 		switch(PTR_ERR(lseg)) {
++ 		case -EBUSY:
++ 		case -ERECALLCONFLICT:
++ 			if (time_after(jiffies, giveup))
++ 				lseg = NULL;
++ 			/* Fallthrough */
++ 		case -EAGAIN:
++ 			break;
++ 		default:
++ 			if (!nfs_error_is_fatal(PTR_ERR(lseg))) {
++ 				pnfs_layout_clear_fail_bit(lo, pnfs_iomode_to_fail_bit(iomode));
++ 				lseg = NULL;
++ 			}
++ 			goto out_put_layout_hdr;
++ 		}
++ 		if (lseg) {
++ 			if (first)
++ 				pnfs_clear_first_layoutget(lo);
++ 			trace_pnfs_update_layout(ino, pos, count,
++ 				iomode, lo, lseg, PNFS_UPDATE_LAYOUT_RETRY);
++ 			pnfs_put_layout_hdr(lo);
++ 			goto lookup_again;
++ 		}
++ 	} else {
++ 		pnfs_layout_clear_fail_bit(lo, pnfs_iomode_to_fail_bit(iomode));
++ 	}
++ 
+++>>>>>>> e85d7ee42003 (pNFS: Separate handling of NFS4ERR_LAYOUTTRYLATER and RECALLCONFLICT)
+  out_put_layout_hdr:
+  	if (first)
+  		pnfs_clear_first_layoutget(lo);
+* Unmerged path fs/nfs/nfs4proc.c
+* Unmerged path fs/nfs/pnfs.c
