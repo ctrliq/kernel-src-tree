@@ -1,0 +1,173 @@
+xprtrdma: Make FRWR send queue entry accounting more accurate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 8d38de65644d900199f035277aa5f3da4aa9fc17
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/8d38de65.failed
+
+Verbs providers may perform house-keeping on the Send Queue during
+each signaled send completion. It is necessary therefore for a verbs
+consumer (like xprtrdma) to occasionally force a signaled send
+completion if it runs unsignaled most of the time.
+
+xprtrdma does not require signaled completions for Send or FastReg
+Work Requests, but does signal some LocalInv Work Requests. To
+ensure that Send Queue house-keeping can run before the Send Queue
+is more than half-consumed, xprtrdma forces a signaled completion
+on occasion by counting the number of Send Queue Entries it
+consumes. It currently does this by counting each ib_post_send as
+one Entry.
+
+Commit c9918ff56dfb ("xprtrdma: Add ro_unmap_sync method for FRWR")
+introduced the ability for frwr_op_unmap_sync to post more than one
+Work Request with a single post_send. Thus the underlying assumption
+of one Send Queue Entry per ib_post_send is no longer true.
+
+Also, FastReg Work Requests are currently never signaled. They
+should be signaled once in a while, just as Send is, to keep the
+accounting of consumed SQEs accurate.
+
+While we're here, convert the CQCOUNT macros to the currently
+preferred kernel coding style, which is inline functions.
+
+Fixes: c9918ff56dfb ("xprtrdma: Add ro_unmap_sync method for FRWR")
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 8d38de65644d900199f035277aa5f3da4aa9fc17)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/frwr_ops.c
+#	net/sunrpc/xprtrdma/verbs.c
+diff --cc net/sunrpc/xprtrdma/frwr_ops.c
+index cba1269d30ef,adbf52c6df83..000000000000
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@@ -516,11 -482,11 +516,11 @@@ static voi
+  frwr_op_unmap_sync(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req)
+  {
+  	struct ib_send_wr *invalidate_wrs, *pos, *prev, *bad_wr;
+ -	struct rpcrdma_rep *rep = req->rl_reply;
+  	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
+ -	struct rpcrdma_mw *mw, *tmp;
+ +	struct rpcrdma_mr_seg *seg;
+ +	unsigned int i, nchunks;
+  	struct rpcrdma_frmr *f;
+- 	int rc;
++ 	int count, rc;
+  
+  	dprintk("RPC:       %s: req %p\n", __func__, req);
+  
+@@@ -529,12 -495,18 +529,22 @@@
+  	 * Chain the LOCAL_INV Work Requests and post them with
+  	 * a single ib_post_send() call.
+  	 */
+++<<<<<<< HEAD
+++=======
++ 	f = NULL;
++ 	count = 0;
+++>>>>>>> 8d38de65644d (xprtrdma: Make FRWR send queue entry accounting more accurate)
+  	invalidate_wrs = pos = prev = NULL;
+ -	list_for_each_entry(mw, &req->rl_registered, mw_list) {
+ -		if ((rep->rr_wc_flags & IB_WC_WITH_INVALIDATE) &&
+ -		    (mw->mw_handle == rep->rr_inv_rkey)) {
+ -			mw->frmr.fr_state = FRMR_IS_INVALID;
+ -			continue;
+ -		}
+ +	seg = NULL;
+ +	for (i = 0, nchunks = req->rl_nchunks; nchunks; nchunks--) {
+ +		seg = &req->rl_segments[i];
+  
+++<<<<<<< HEAD
+ +		pos = __frwr_prepare_linv_wr(seg);
+++=======
++ 		pos = __frwr_prepare_linv_wr(mw);
++ 		count++;
+++>>>>>>> 8d38de65644d (xprtrdma: Make FRWR send queue entry accounting more accurate)
+  
+  		if (!invalidate_wrs)
+  			invalidate_wrs = pos;
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index dc48dad17dcd,451f5f27d8af..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -1197,31 -1308,18 +1197,36 @@@ rpcrdma_ep_post(struct rpcrdma_ia *ia
+  		req->rl_reply = NULL;
+  	}
+  
+ +	send_wr.next = NULL;
+ +	send_wr.wr_cqe = &req->rl_cqe;
+ +	send_wr.sg_list = iov;
+ +	send_wr.num_sge = req->rl_niovs;
+ +	send_wr.opcode = IB_WR_SEND;
+ +
+ +	for (i = 0; i < send_wr.num_sge; i++)
+ +		ib_dma_sync_single_for_device(device, iov[i].addr,
+ +					      iov[i].length, DMA_TO_DEVICE);
+  	dprintk("RPC:       %s: posting %d s/g entries\n",
+ -		__func__, send_wr->num_sge);
+ +		__func__, send_wr.num_sge);
+ +
+++<<<<<<< HEAD
+ +	if (DECR_CQCOUNT(ep) > 0)
+ +		send_wr.send_flags = 0;
+ +	else { /* Provider must take a send completion every now and then */
+ +		INIT_CQCOUNT(ep);
+ +		send_wr.send_flags = IB_SEND_SIGNALED;
+ +	}
+  
+ +	rc = ib_post_send(ia->ri_id->qp, &send_wr, &send_wr_fail);
+++=======
++ 	rpcrdma_set_signaled(ep, send_wr);
++ 	rc = ib_post_send(ia->ri_id->qp, send_wr, &send_wr_fail);
+++>>>>>>> 8d38de65644d (xprtrdma: Make FRWR send queue entry accounting more accurate)
+  	if (rc)
+ -		goto out_postsend_err;
+ -	return 0;
+ -
+ -out_postsend_err:
+ -	pr_err("rpcrdma: RDMA Send ib_post_send returned %i\n", rc);
+ -	return -ENOTCONN;
+ +		dprintk("RPC:       %s: ib_post_send returned %i\n", __func__,
+ +			rc);
+ +out:
+ +	return rc;
+  }
+  
+  int
+* Unmerged path net/sunrpc/xprtrdma/frwr_ops.c
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index ae3921a9fec6..a6f40d32fd37 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -95,8 +95,24 @@ struct rpcrdma_ep {
+ 	struct delayed_work	rep_connect_worker;
+ };
+ 
+-#define INIT_CQCOUNT(ep) atomic_set(&(ep)->rep_cqcount, (ep)->rep_cqinit)
+-#define DECR_CQCOUNT(ep) atomic_sub_return(1, &(ep)->rep_cqcount)
++static inline void
++rpcrdma_init_cqcount(struct rpcrdma_ep *ep, int count)
++{
++	atomic_set(&ep->rep_cqcount, ep->rep_cqinit - count);
++}
++
++/* To update send queue accounting, provider must take a
++ * send completion every now and then.
++ */
++static inline void
++rpcrdma_set_signaled(struct rpcrdma_ep *ep, struct ib_send_wr *send_wr)
++{
++	send_wr->send_flags = 0;
++	if (unlikely(atomic_sub_return(1, &ep->rep_cqcount) <= 0)) {
++		rpcrdma_init_cqcount(ep, 0);
++		send_wr->send_flags = IB_SEND_SIGNALED;
++	}
++}
+ 
+ /* Pre-allocate extra Work Requests for handling backward receives
+  * and sends. This is a fixed value because the Work Queues are
