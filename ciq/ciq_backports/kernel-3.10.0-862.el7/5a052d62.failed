@@ -1,0 +1,216 @@
+qede: Honor user request for Tx buffers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-862.el7
+commit-author Sudarsana Reddy Kalluru <Sudarsana.Kalluru@cavium.com>
+commit 5a052d62ab01cc95446f47cb1f41c3bd99546051
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-862.el7/5a052d62.failed
+
+Driver always allocates the maximal number of tx-buffers irrespective of
+actual Tx ring config.
+
+	Signed-off-by: Sudarsana Reddy Kalluru <Sudarsana.Kalluru@cavium.com>
+	Signed-off-by: Yuval Mintz <Yuval.Mintz@cavium.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5a052d62ab01cc95446f47cb1f41c3bd99546051)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qede/qede_ethtool.c
+#	drivers/net/ethernet/qlogic/qede/qede_fp.c
+#	drivers/net/ethernet/qlogic/qede/qede_main.c
+diff --cc drivers/net/ethernet/qlogic/qede/qede_ethtool.c
+index f5e0cf472316,47ec4f3cfe79..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede_ethtool.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_ethtool.c
+@@@ -1291,8 -1297,8 +1291,13 @@@ static int qede_selftest_transmit_traff
+  	}
+  
+  	/* Fill the entry in the SW ring and the BDs in the FW ring */
+++<<<<<<< HEAD
+ +	idx = txq->sw_tx_prod & NUM_TX_BDS_MAX;
+ +	txq->sw_tx_ring[idx].skb = skb;
+++=======
++ 	idx = txq->sw_tx_prod;
++ 	txq->sw_tx_ring.skbs[idx].skb = skb;
+++>>>>>>> 5a052d62ab01 (qede: Honor user request for Tx buffers)
+  	first_bd = qed_chain_produce(&txq->tx_pbl);
+  	memset(first_bd, 0, sizeof(*first_bd));
+  	val = 1 << ETH_TX_1ST_BD_FLAGS_START_BD_SHIFT;
+@@@ -1345,8 -1351,8 +1350,13 @@@
+  	first_bd = (struct eth_tx_1st_bd *)qed_chain_consume(&txq->tx_pbl);
+  	dma_unmap_single(&edev->pdev->dev, BD_UNMAP_ADDR(first_bd),
+  			 BD_UNMAP_LEN(first_bd), DMA_TO_DEVICE);
+++<<<<<<< HEAD
+ +	txq->sw_tx_cons++;
+ +	txq->sw_tx_ring[idx].skb = NULL;
+++=======
++ 	txq->sw_tx_cons = (txq->sw_tx_cons + 1) % txq->num_tx_buffers;
++ 	txq->sw_tx_ring.skbs[idx].skb = NULL;
+++>>>>>>> 5a052d62ab01 (qede: Honor user request for Tx buffers)
+  
+  	return 0;
+  }
+diff --cc drivers/net/ethernet/qlogic/qede/qede_fp.c
+index f9574e2b30d3,38c82658e5bd..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede_fp.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_fp.c
+@@@ -97,8 -99,8 +97,13 @@@ int qede_alloc_rx_buffer(struct qede_rx
+  /* Unmap the data and free skb */
+  int qede_free_tx_pkt(struct qede_dev *edev, struct qede_tx_queue *txq, int *len)
+  {
+++<<<<<<< HEAD
+ +	u16 idx = txq->sw_tx_cons & NUM_TX_BDS_MAX;
+ +	struct sk_buff *skb = txq->sw_tx_ring[idx].skb;
+++=======
++ 	u16 idx = txq->sw_tx_cons;
++ 	struct sk_buff *skb = txq->sw_tx_ring.skbs[idx].skb;
+++>>>>>>> 5a052d62ab01 (qede: Honor user request for Tx buffers)
+  	struct eth_tx_1st_bd *first_bd;
+  	struct eth_tx_bd *tx_data_bd;
+  	int bds_consumed = 0;
+@@@ -154,8 -156,8 +159,13 @@@ static void qede_free_failed_tx_pkt(str
+  				    struct eth_tx_1st_bd *first_bd,
+  				    int nbd, bool data_split)
+  {
+++<<<<<<< HEAD
+ +	u16 idx = txq->sw_tx_prod & NUM_TX_BDS_MAX;
+ +	struct sk_buff *skb = txq->sw_tx_ring[idx].skb;
+++=======
++ 	u16 idx = txq->sw_tx_prod;
++ 	struct sk_buff *skb = txq->sw_tx_ring.skbs[idx].skb;
+++>>>>>>> 5a052d62ab01 (qede: Honor user request for Tx buffers)
+  	struct eth_tx_bd *tx_data_bd;
+  	int i, split_bd_len = 0;
+  
+@@@ -327,6 -329,48 +337,51 @@@ static inline void qede_update_tx_produ
+  	mmiowb();
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int qede_xdp_xmit(struct qede_dev *edev, struct qede_fastpath *fp,
++ 			 struct sw_rx_data *metadata, u16 padding, u16 length)
++ {
++ 	struct qede_tx_queue *txq = fp->xdp_tx;
++ 	struct eth_tx_1st_bd *first_bd;
++ 	u16 idx = txq->sw_tx_prod;
++ 
++ 	if (!qed_chain_get_elem_left(&txq->tx_pbl)) {
++ 		txq->stopped_cnt++;
++ 		return -ENOMEM;
++ 	}
++ 
++ 	first_bd = (struct eth_tx_1st_bd *)qed_chain_produce(&txq->tx_pbl);
++ 
++ 	memset(first_bd, 0, sizeof(*first_bd));
++ 	first_bd->data.bd_flags.bitfields =
++ 	    BIT(ETH_TX_1ST_BD_FLAGS_START_BD_SHIFT);
++ 	first_bd->data.bitfields |=
++ 	    (length & ETH_TX_DATA_1ST_BD_PKT_LEN_MASK) <<
++ 	    ETH_TX_DATA_1ST_BD_PKT_LEN_SHIFT;
++ 	first_bd->data.nbds = 1;
++ 
++ 	/* We can safely ignore the offset, as it's 0 for XDP */
++ 	BD_SET_UNMAP_ADDR_LEN(first_bd, metadata->mapping + padding, length);
++ 
++ 	/* Synchronize the buffer back to device, as program [probably]
++ 	 * has changed it.
++ 	 */
++ 	dma_sync_single_for_device(&edev->pdev->dev,
++ 				   metadata->mapping + padding,
++ 				   length, PCI_DMA_TODEVICE);
++ 
++ 	txq->sw_tx_ring.xdp[idx].page = metadata->data;
++ 	txq->sw_tx_ring.xdp[idx].mapping = metadata->mapping;
++ 	txq->sw_tx_prod = (txq->sw_tx_prod + 1) % txq->num_tx_buffers;
++ 
++ 	/* Mark the fastpath for future XDP doorbell */
++ 	fp->xdp_xmit = 1;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 5a052d62ab01 (qede: Honor user request for Tx buffers)
+  int qede_txq_has_work(struct qede_tx_queue *txq)
+  {
+  	u16 hw_bd_cons;
+@@@ -340,6 -384,27 +395,30 @@@
+  	return hw_bd_cons != qed_chain_get_cons_idx(&txq->tx_pbl);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void qede_xdp_tx_int(struct qede_dev *edev, struct qede_tx_queue *txq)
++ {
++ 	u16 hw_bd_cons, idx;
++ 
++ 	hw_bd_cons = le16_to_cpu(*txq->hw_cons_ptr);
++ 	barrier();
++ 
++ 	while (hw_bd_cons != qed_chain_get_cons_idx(&txq->tx_pbl)) {
++ 		qed_chain_consume(&txq->tx_pbl);
++ 		idx = txq->sw_tx_cons;
++ 
++ 		dma_unmap_page(&edev->pdev->dev,
++ 			       txq->sw_tx_ring.xdp[idx].mapping,
++ 			       PAGE_SIZE, DMA_BIDIRECTIONAL);
++ 		__free_page(txq->sw_tx_ring.xdp[idx].page);
++ 
++ 		txq->sw_tx_cons = (txq->sw_tx_cons + 1) % txq->num_tx_buffers;
++ 		txq->xmit_pkts++;
++ 	}
++ }
++ 
+++>>>>>>> 5a052d62ab01 (qede: Honor user request for Tx buffers)
+  static int qede_tx_int(struct qede_dev *edev, struct qede_tx_queue *txq)
+  {
+  	struct netdev_queue *netdev_txq;
+@@@ -1299,8 -1455,8 +1378,13 @@@ netdev_tx_t qede_start_xmit(struct sk_b
+  #endif
+  
+  	/* Fill the entry in the SW ring and the BDs in the FW ring */
+++<<<<<<< HEAD
+ +	idx = txq->sw_tx_prod & NUM_TX_BDS_MAX;
+ +	txq->sw_tx_ring[idx].skb = skb;
+++=======
++ 	idx = txq->sw_tx_prod;
++ 	txq->sw_tx_ring.skbs[idx].skb = skb;
+++>>>>>>> 5a052d62ab01 (qede: Honor user request for Tx buffers)
+  	first_bd = (struct eth_tx_1st_bd *)
+  		   qed_chain_produce(&txq->tx_pbl);
+  	memset(first_bd, 0, sizeof(*first_bd));
+diff --cc drivers/net/ethernet/qlogic/qede/qede_main.c
+index fdfb29d35877,766bd373fa99..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede_main.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_main.c
+@@@ -1239,11 -1303,16 +1239,24 @@@ static int qede_alloc_mem_txq(struct qe
+  	txq->num_tx_buffers = edev->q_num_tx_buffers;
+  
+  	/* Allocate the parallel driver ring for Tx buffers */
+++<<<<<<< HEAD
+ +	size = sizeof(*txq->sw_tx_ring) * TX_RING_SIZE;
+ +	txq->sw_tx_ring = kzalloc(size, GFP_KERNEL);
+ +	if (!txq->sw_tx_ring) {
+ +		DP_NOTICE(edev, "Tx buffers ring allocation failed\n");
+ +		goto err;
+++=======
++ 	if (txq->is_xdp) {
++ 		size = sizeof(*txq->sw_tx_ring.xdp) * txq->num_tx_buffers;
++ 		txq->sw_tx_ring.xdp = kzalloc(size, GFP_KERNEL);
++ 		if (!txq->sw_tx_ring.xdp)
++ 			goto err;
++ 	} else {
++ 		size = sizeof(*txq->sw_tx_ring.skbs) * txq->num_tx_buffers;
++ 		txq->sw_tx_ring.skbs = kzalloc(size, GFP_KERNEL);
++ 		if (!txq->sw_tx_ring.skbs)
++ 			goto err;
+++>>>>>>> 5a052d62ab01 (qede: Honor user request for Tx buffers)
+  	}
+  
+  	rc = edev->ops->common->chain_alloc(edev->cdev,
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_ethtool.c
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_fp.c
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_main.c
