@@ -1,0 +1,153 @@
+gfs2: Another gfs2_find_jhead fix
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1160.el7
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit eed0f953b90e86e765197a1dad06bb48aedc27fe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1160.el7/eed0f953.failed
+
+On filesystems with a block size smaller than the page size,
+gfs2_find_jhead can split a page across two bios (for example, when
+blocks are not allocated consecutively).  When that happens, the first
+bio that completes will unlock the page in its bi_end_io handler even
+though the page hasn't been read completely yet.  Fix that by using a
+chained bio for the rest of the page.
+
+While at it, clean up the sector calculation logic in
+gfs2_log_alloc_bio.  In gfs2_find_jhead, simplify the disk block and
+offset calculation logic and fix a variable name.
+
+Fixes: f4686c26ecc3 ("gfs2: read journal in large chunks")
+	Cc: stable@vger.kernel.org # v5.2+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit eed0f953b90e86e765197a1dad06bb48aedc27fe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/lops.c
+diff --cc fs/gfs2/lops.c
+index 13eb06ebcf6c,aa0359b7e2ac..000000000000
+--- a/fs/gfs2/lops.c
++++ b/fs/gfs2/lops.c
+@@@ -263,20 -257,10 +263,25 @@@ static struct bio *gfs2_log_alloc_bio(s
+  				      bio_end_io_t *end_io)
+  {
+  	struct super_block *sb = sdp->sd_vfs;
+ -	struct bio *bio = bio_alloc(GFP_NOIO, BIO_MAX_PAGES);
+ +	unsigned nrvecs = bio_get_nr_vecs(sb->s_bdev);
+ +	struct bio *bio;
+ +
+++<<<<<<< HEAD
+ +	BUG_ON(sdp->sd_log_bio);
+  
+ +	while (1) {
+ +		bio = bio_alloc(GFP_NOIO, nrvecs);
+ +		if (likely(bio))
+ +			break;
+ +		nrvecs = max(nrvecs/2, 1U);
+ +	}
+ +
+ +	bio->bi_sector = blkno * (sb->s_blocksize >> 9);
+ +	bio->bi_bdev = sb->s_bdev;
+++=======
++ 	bio->bi_iter.bi_sector = blkno << (sb->s_blocksize_bits - 9);
++ 	bio_set_dev(bio, sb->s_bdev);
+++>>>>>>> eed0f953b90e (gfs2: Another gfs2_find_jhead fix)
+  	bio->bi_end_io = end_io;
+  	bio->bi_private = sdp;
+  
+@@@ -503,16 -510,18 +522,21 @@@ int gfs2_find_jhead(struct gfs2_jdesc *
+  	int sz, ret = 0;
+  	struct bio *bio = NULL;
+  	struct page *page = NULL;
+++<<<<<<< HEAD
+ +	bool done = false;
+++=======
++ 	bool bio_chained = false, done = false;
++ 	errseq_t since;
+++>>>>>>> eed0f953b90e (gfs2: Another gfs2_find_jhead fix)
+  
+  	memset(head, 0, sizeof(*head));
+  	if (list_empty(&jd->extent_list))
+  		gfs2_map_journal_extents(sdp, jd);
+  
+ -	since = filemap_sample_wb_err(mapping);
+  	list_for_each_entry(je, &jd->extent_list, list) {
+- 		for (; block < je->lblock + je->blocks; block++) {
+- 			u64 dblock;
++ 		u64 dblock = je->dblock;
+  
++ 		for (; block < je->lblock + je->blocks; block++, dblock++) {
+  			if (!page) {
+  				page = find_or_create_page(mapping,
+  						block >> shift, GFP_NOFS);
+@@@ -521,34 -530,41 +545,52 @@@
+  					done = true;
+  					goto out;
+  				}
++ 				off = 0;
+  			}
+  
+- 			if (bio) {
+- 				unsigned int off;
+- 
+- 				off = (block << bsize_shift) & ~PAGE_MASK;
++ 			if (!bio || (bio_chained && !off)) {
++ 				/* start new bio */
++ 			} else {
+  				sz = bio_add_page(bio, page, bsize, off);
+- 				if (sz == bsize) { /* block added */
+- 					if (off + bsize == PAGE_SIZE) {
+- 						page = NULL;
+- 						goto page_added;
+- 					}
+- 					continue;
++ 				if (sz == bsize)
++ 					goto block_added;
++ 				if (off) {
++ 					unsigned int blocks =
++ 						(PAGE_SIZE - off) >> bsize_shift;
++ 
++ 					bio = gfs2_chain_bio(bio, blocks);
++ 					bio_chained = true;
++ 					goto add_block_to_new_bio;
+  				}
++ 			}
++ 
++ 			if (bio) {
+  				blocks_submitted = block + 1;
+++<<<<<<< HEAD
+ +				submit_bio(READ, bio);
+ +				bio = NULL;
+++=======
++ 				submit_bio(bio);
+++>>>>>>> eed0f953b90e (gfs2: Another gfs2_find_jhead fix)
+  			}
+  
+- 			dblock = je->dblock + (block - je->lblock);
+  			bio = gfs2_log_alloc_bio(sdp, dblock, gfs2_end_log_read);
+++<<<<<<< HEAD
+ +			sz = bio_add_page(bio, page, bsize, 0);
+ +			gfs2_assert_warn(sdp, sz == bsize);
+ +			if (bsize == PAGE_SIZE)
+++=======
++ 			bio->bi_opf = REQ_OP_READ;
++ 			bio_chained = false;
++ add_block_to_new_bio:
++ 			sz = bio_add_page(bio, page, bsize, off);
++ 			BUG_ON(sz != bsize);
++ block_added:
++ 			off += bsize;
++ 			if (off == PAGE_SIZE)
+++>>>>>>> eed0f953b90e (gfs2: Another gfs2_find_jhead fix)
+  				page = NULL;
+- 
+- page_added:
+- 			if (blocks_submitted < blocks_read + readhead_blocks) {
++ 			if (blocks_submitted < blocks_read + readahead_blocks) {
+  				/* Keep at least one bio in flight */
+  				continue;
+  			}
+* Unmerged path fs/gfs2/lops.c
