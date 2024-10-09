@@ -1,0 +1,209 @@
+codel: generalize the implementation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Michal Kazior <michal.kazior@tieto.com>
+commit 79bdc4c862af7cf11a135a6fdf8093622043c862
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/79bdc4c8.failed
+
+This strips out qdisc specific bits from the code
+and makes it slightly more reusable. Codel will be
+used by wireless/mac80211 in the future.
+
+	Signed-off-by: Michal Kazior <michal.kazior@tieto.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 79bdc4c862af7cf11a135a6fdf8093622043c862)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/codel.h
+diff --cc include/net/codel.h
+index 1e18005f7f65,06ac687b4909..000000000000
+--- a/include/net/codel.h
++++ b/include/net/codel.h
+@@@ -165,15 -169,18 +165,25 @@@ struct codel_vars 
+  struct codel_stats {
+  	u32		maxpacket;
+  	u32		drop_count;
+ -	u32		drop_len;
+  	u32		ecn_mark;
+ -	u32		ce_mark;
+  };
+  
+++<<<<<<< HEAD
+ +static void codel_params_init(struct codel_params *params,
+ +			      const struct Qdisc *sch)
+ +{
+ +	params->interval = MS2TIME(100);
+ +	params->target = MS2TIME(5);
+ +	params->mtu = psched_mtu(qdisc_dev(sch));
+++=======
++ #define CODEL_DISABLED_THRESHOLD INT_MAX
++ 
++ static void codel_params_init(struct codel_params *params)
++ {
++ 	params->interval = MS2TIME(100);
++ 	params->target = MS2TIME(5);
++ 	params->ce_threshold = CODEL_DISABLED_THRESHOLD;
+++>>>>>>> 79bdc4c862af (codel: generalize the implementation)
+  	params->ecn = false;
+  }
+  
+@@@ -301,11 -320,15 +323,19 @@@ static struct sk_buff *codel_dequeue(vo
+  								  vars->rec_inv_sqrt);
+  					goto end;
+  				}
+++<<<<<<< HEAD
+ +				qdisc_drop(skb, sch);
+++=======
++ 				stats->drop_len += skb_len_func(skb);
++ 				drop_func(skb, ctx);
+++>>>>>>> 79bdc4c862af (codel: generalize the implementation)
+  				stats->drop_count++;
+- 				skb = dequeue_func(vars, sch);
+- 				if (!codel_should_drop(skb, sch,
+- 						       vars, params, stats, now)) {
++ 				skb = dequeue_func(vars, ctx);
++ 				if (!codel_should_drop(skb, ctx,
++ 						       vars, params, stats,
++ 						       skb_len_func,
++ 						       skb_time_func,
++ 						       backlog, now)) {
+  					/* leave dropping state */
+  					vars->dropping = false;
+  				} else {
+@@@ -323,12 -346,14 +353,18 @@@
+  		if (params->ecn && INET_ECN_set_ce(skb)) {
+  			stats->ecn_mark++;
+  		} else {
+++<<<<<<< HEAD
+ +			qdisc_drop(skb, sch);
+++=======
++ 			stats->drop_len += skb_len_func(skb);
++ 			drop_func(skb, ctx);
+++>>>>>>> 79bdc4c862af (codel: generalize the implementation)
+  			stats->drop_count++;
+  
+- 			skb = dequeue_func(vars, sch);
+- 			drop = codel_should_drop(skb, sch, vars, params,
+- 						 stats, now);
++ 			skb = dequeue_func(vars, ctx);
++ 			drop = codel_should_drop(skb, ctx, vars, params,
++ 						 stats, skb_len_func,
++ 						 skb_time_func, backlog, now);
+  		}
+  		vars->dropping = true;
+  		/* if min went above target close to when we last went below it
+* Unmerged path include/net/codel.h
+diff --git a/net/sched/sch_codel.c b/net/sched/sch_codel.c
+index 7a0bdb16ac92..fbe39d543e2f 100644
+--- a/net/sched/sch_codel.c
++++ b/net/sched/sch_codel.c
+@@ -64,20 +64,33 @@ struct codel_sched_data {
+  * to dequeue a packet from queue. Note: backlog is handled in
+  * codel, we dont need to reduce it here.
+  */
+-static struct sk_buff *dequeue(struct codel_vars *vars, struct Qdisc *sch)
++static struct sk_buff *dequeue_func(struct codel_vars *vars, void *ctx)
+ {
++	struct Qdisc *sch = ctx;
+ 	struct sk_buff *skb = __skb_dequeue(&sch->q);
+ 
++	if (skb)
++		sch->qstats.backlog -= qdisc_pkt_len(skb);
++
+ 	prefetch(&skb->end); /* we'll need skb_shinfo() */
+ 	return skb;
+ }
+ 
++static void drop_func(struct sk_buff *skb, void *ctx)
++{
++	struct Qdisc *sch = ctx;
++
++	qdisc_drop(skb, sch);
++}
++
+ static struct sk_buff *codel_qdisc_dequeue(struct Qdisc *sch)
+ {
+ 	struct codel_sched_data *q = qdisc_priv(sch);
+ 	struct sk_buff *skb;
+ 
+-	skb = codel_dequeue(sch, &q->params, &q->vars, &q->stats, dequeue);
++	skb = codel_dequeue(sch, &sch->qstats.backlog, &q->params, &q->vars,
++			    &q->stats, qdisc_pkt_len, codel_get_enqueue_time,
++			    drop_func, dequeue_func);
+ 
+ 	/* We cant call qdisc_tree_decrease_qlen() if our qlen is 0,
+ 	 * or HTB crashes. Defer it for next round.
+@@ -164,9 +177,10 @@ static int codel_init(struct Qdisc *sch, struct nlattr *opt)
+ 
+ 	sch->limit = DEFAULT_CODEL_LIMIT;
+ 
+-	codel_params_init(&q->params, sch);
++	codel_params_init(&q->params);
+ 	codel_vars_init(&q->vars);
+ 	codel_stats_init(&q->stats);
++	q->params.mtu = psched_mtu(qdisc_dev(sch));
+ 
+ 	if (opt) {
+ 		int err = codel_change(sch, opt);
+diff --git a/net/sched/sch_fq_codel.c b/net/sched/sch_fq_codel.c
+index 03125323e5e3..5d8fd4644138 100644
+--- a/net/sched/sch_fq_codel.c
++++ b/net/sched/sch_fq_codel.c
+@@ -215,8 +215,9 @@ static int fq_codel_enqueue(struct sk_buff *skb, struct Qdisc *sch)
+  * to dequeue a packet from queue. Note: backlog is handled in
+  * codel, we dont need to reduce it here.
+  */
+-static struct sk_buff *dequeue(struct codel_vars *vars, struct Qdisc *sch)
++static struct sk_buff *dequeue_func(struct codel_vars *vars, void *ctx)
+ {
++	struct Qdisc *sch = ctx;
+ 	struct fq_codel_sched_data *q = qdisc_priv(sch);
+ 	struct fq_codel_flow *flow;
+ 	struct sk_buff *skb = NULL;
+@@ -226,10 +227,18 @@ static struct sk_buff *dequeue(struct codel_vars *vars, struct Qdisc *sch)
+ 		skb = dequeue_head(flow);
+ 		q->backlogs[flow - q->flows] -= qdisc_pkt_len(skb);
+ 		sch->q.qlen--;
++		sch->qstats.backlog -= qdisc_pkt_len(skb);
+ 	}
+ 	return skb;
+ }
+ 
++static void drop_func(struct sk_buff *skb, void *ctx)
++{
++	struct Qdisc *sch = ctx;
++
++	qdisc_drop(skb, sch);
++}
++
+ static struct sk_buff *fq_codel_dequeue(struct Qdisc *sch)
+ {
+ 	struct fq_codel_sched_data *q = qdisc_priv(sch);
+@@ -256,8 +265,9 @@ begin:
+ 	prev_drop_count = q->cstats.drop_count;
+ 	prev_ecn_mark = q->cstats.ecn_mark;
+ 
+-	skb = codel_dequeue(sch, &q->cparams, &flow->cvars, &q->cstats,
+-			    dequeue);
++	skb = codel_dequeue(sch, &sch->qstats.backlog, &q->cparams,
++			    &flow->cvars, &q->cstats, qdisc_pkt_len,
++			    codel_get_enqueue_time, drop_func, dequeue_func);
+ 
+ 	flow->dropped += q->cstats.drop_count - prev_drop_count;
+ 	flow->dropped += q->cstats.ecn_mark - prev_ecn_mark;
+@@ -394,9 +404,10 @@ static int fq_codel_init(struct Qdisc *sch, struct nlattr *opt)
+ 	q->perturbation = net_random();
+ 	INIT_LIST_HEAD(&q->new_flows);
+ 	INIT_LIST_HEAD(&q->old_flows);
+-	codel_params_init(&q->cparams, sch);
++	codel_params_init(&q->cparams);
+ 	codel_stats_init(&q->cstats);
+ 	q->cparams.ecn = true;
++	q->cparams.mtu = psched_mtu(qdisc_dev(sch));
+ 
+ 	if (opt) {
+ 		int err = fq_codel_change(sch, opt);
