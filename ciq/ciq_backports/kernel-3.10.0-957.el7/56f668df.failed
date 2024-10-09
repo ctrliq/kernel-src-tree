@@ -1,0 +1,262 @@
+bpf: Add array of maps support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit 56f668dfe00dcf086734f1c42ea999398fad6572
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/56f668df.failed
+
+This patch adds a few helper funcs to enable map-in-map
+support (i.e. outer_map->inner_map).  The first outer_map type
+BPF_MAP_TYPE_ARRAY_OF_MAPS is also added in this patch.
+The next patch will introduce a hash of maps type.
+
+Any bpf map type can be acted as an inner_map.  The exception
+is BPF_MAP_TYPE_PROG_ARRAY because the extra level of
+indirection makes it harder to verify the owner_prog_type
+and owner_jited.
+
+Multi-level map-in-map is not supported (i.e. map->map is ok
+but not map->map->map).
+
+When adding an inner_map to an outer_map, it currently checks the
+map_type, key_size, value_size, map_flags, max_entries and ops.
+The verifier also uses those map's properties to do static analysis.
+map_flags is needed because we need to ensure BPF_PROG_TYPE_PERF_EVENT
+is using a preallocated hashtab for the inner_hash also.  ops and
+max_entries are needed to generate inlined map-lookup instructions.
+For simplicity reason, a simple '==' test is used for both map_flags
+and max_entries.  The equality of ops is implied by the equality of
+map_type.
+
+During outer_map creation time, an inner_map_fd is needed to create an
+outer_map.  However, the inner_map_fd's life time does not depend on the
+outer_map.  The inner_map_fd is merely used to initialize
+the inner_map_meta of the outer_map.
+
+Also, for the outer_map:
+
+* It allows element update and delete from syscall
+* It allows element lookup from bpf_prog
+
+The above is similar to the current fd_array pattern.
+
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 56f668dfe00dcf086734f1c42ea999398fad6572)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	include/uapi/linux/bpf.h
+#	kernel/bpf/Makefile
+#	kernel/bpf/arraymap.c
+#	kernel/bpf/syscall.c
+#	kernel/bpf/verifier.c
+diff --cc include/linux/bpf.h
+index d4c1f9049ad3,3f3cdf9b15e8..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -32,8 -44,13 +32,13 @@@ struct bpf_map 
+  	u32 key_size;
+  	u32 value_size;
+  	u32 max_entries;
+ -	u32 map_flags;
+ -	u32 pages;
+ -	struct user_struct *user;
+ -	const struct bpf_map_ops *ops;
+ +	struct bpf_map_ops *ops;
+  	struct work_struct work;
+++<<<<<<< HEAD
+++=======
++ 	atomic_t usercnt;
++ 	struct bpf_map *inner_map_meta;
+++>>>>>>> 56f668dfe00d (bpf: Add array of maps support)
+  };
+  
+  struct bpf_map_type_list {
+diff --cc include/uapi/linux/bpf.h
+index e369860b690e,1701ec1e7de3..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -110,7 -85,18 +110,22 @@@ enum bpf_cmd 
+  
+  enum bpf_map_type {
+  	BPF_MAP_TYPE_UNSPEC,
+++<<<<<<< HEAD
+ +	BPF_PROG_TYPE_XDP,
+++=======
++ 	BPF_MAP_TYPE_HASH,
++ 	BPF_MAP_TYPE_ARRAY,
++ 	BPF_MAP_TYPE_PROG_ARRAY,
++ 	BPF_MAP_TYPE_PERF_EVENT_ARRAY,
++ 	BPF_MAP_TYPE_PERCPU_HASH,
++ 	BPF_MAP_TYPE_PERCPU_ARRAY,
++ 	BPF_MAP_TYPE_STACK_TRACE,
++ 	BPF_MAP_TYPE_CGROUP_ARRAY,
++ 	BPF_MAP_TYPE_LRU_HASH,
++ 	BPF_MAP_TYPE_LRU_PERCPU_HASH,
++ 	BPF_MAP_TYPE_LPM_TRIE,
++ 	BPF_MAP_TYPE_ARRAY_OF_MAPS,
+++>>>>>>> 56f668dfe00d (bpf: Add array of maps support)
+  };
+  
+  enum bpf_prog_type {
+@@@ -123,6 -152,8 +138,11 @@@ union bpf_attr 
+  		__u32	key_size;	/* size of key in bytes */
+  		__u32	value_size;	/* size of value in bytes */
+  		__u32	max_entries;	/* max number of entries in a map */
+++<<<<<<< HEAD
+++=======
++ 		__u32	map_flags;	/* prealloc or not */
++ 		__u32	inner_map_fd;	/* fd pointing to the inner map */
+++>>>>>>> 56f668dfe00d (bpf: Add array of maps support)
+  	};
+  
+  	struct { /* anonymous struct used by BPF_MAP_*_ELEM commands */
+* Unmerged path kernel/bpf/Makefile
+* Unmerged path kernel/bpf/arraymap.c
+* Unmerged path kernel/bpf/syscall.c
+* Unmerged path kernel/bpf/verifier.c
+* Unmerged path include/linux/bpf.h
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path kernel/bpf/Makefile
+* Unmerged path kernel/bpf/arraymap.c
+diff --git a/kernel/bpf/map_in_map.c b/kernel/bpf/map_in_map.c
+new file mode 100644
+index 000000000000..59bcdf821ae4
+--- /dev/null
++++ b/kernel/bpf/map_in_map.c
+@@ -0,0 +1,97 @@
++/* Copyright (c) 2017 Facebook
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of version 2 of the GNU General Public
++ * License as published by the Free Software Foundation.
++ */
++#include <linux/slab.h>
++#include <linux/bpf.h>
++
++#include "map_in_map.h"
++
++struct bpf_map *bpf_map_meta_alloc(int inner_map_ufd)
++{
++	struct bpf_map *inner_map, *inner_map_meta;
++	struct fd f;
++
++	f = fdget(inner_map_ufd);
++	inner_map = __bpf_map_get(f);
++	if (IS_ERR(inner_map))
++		return inner_map;
++
++	/* prog_array->owner_prog_type and owner_jited
++	 * is a runtime binding.  Doing static check alone
++	 * in the verifier is not enough.
++	 */
++	if (inner_map->map_type == BPF_MAP_TYPE_PROG_ARRAY) {
++		fdput(f);
++		return ERR_PTR(-ENOTSUPP);
++	}
++
++	/* Does not support >1 level map-in-map */
++	if (inner_map->inner_map_meta) {
++		fdput(f);
++		return ERR_PTR(-EINVAL);
++	}
++
++	inner_map_meta = kzalloc(sizeof(*inner_map_meta), GFP_USER);
++	if (!inner_map_meta) {
++		fdput(f);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	inner_map_meta->map_type = inner_map->map_type;
++	inner_map_meta->key_size = inner_map->key_size;
++	inner_map_meta->value_size = inner_map->value_size;
++	inner_map_meta->map_flags = inner_map->map_flags;
++	inner_map_meta->ops = inner_map->ops;
++	inner_map_meta->max_entries = inner_map->max_entries;
++
++	fdput(f);
++	return inner_map_meta;
++}
++
++void bpf_map_meta_free(struct bpf_map *map_meta)
++{
++	kfree(map_meta);
++}
++
++bool bpf_map_meta_equal(const struct bpf_map *meta0,
++			const struct bpf_map *meta1)
++{
++	/* No need to compare ops because it is covered by map_type */
++	return meta0->map_type == meta1->map_type &&
++		meta0->key_size == meta1->key_size &&
++		meta0->value_size == meta1->value_size &&
++		meta0->map_flags == meta1->map_flags &&
++		meta0->max_entries == meta1->max_entries;
++}
++
++void *bpf_map_fd_get_ptr(struct bpf_map *map,
++			 struct file *map_file /* not used */,
++			 int ufd)
++{
++	struct bpf_map *inner_map;
++	struct fd f;
++
++	f = fdget(ufd);
++	inner_map = __bpf_map_get(f);
++	if (IS_ERR(inner_map))
++		return inner_map;
++
++	if (bpf_map_meta_equal(map->inner_map_meta, inner_map))
++		inner_map = bpf_map_inc(inner_map, false);
++	else
++		inner_map = ERR_PTR(-EINVAL);
++
++	fdput(f);
++	return inner_map;
++}
++
++void bpf_map_fd_put_ptr(void *ptr)
++{
++	/* ptr->ops->map_free() has to go through one
++	 * rcu grace period by itself.
++	 */
++	bpf_map_put(ptr);
++}
+diff --git a/kernel/bpf/map_in_map.h b/kernel/bpf/map_in_map.h
+new file mode 100644
+index 000000000000..177fadb689dc
+--- /dev/null
++++ b/kernel/bpf/map_in_map.h
+@@ -0,0 +1,23 @@
++/* Copyright (c) 2017 Facebook
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of version 2 of the GNU General Public
++ * License as published by the Free Software Foundation.
++ */
++#ifndef __MAP_IN_MAP_H__
++#define __MAP_IN_MAP_H__
++
++#include <linux/types.h>
++
++struct file;
++struct bpf_map;
++
++struct bpf_map *bpf_map_meta_alloc(int inner_map_ufd);
++void bpf_map_meta_free(struct bpf_map *map_meta);
++bool bpf_map_meta_equal(const struct bpf_map *meta0,
++			const struct bpf_map *meta1);
++void *bpf_map_fd_get_ptr(struct bpf_map *map, struct file *map_file,
++			 int ufd);
++void bpf_map_fd_put_ptr(void *ptr);
++
++#endif
+* Unmerged path kernel/bpf/syscall.c
+* Unmerged path kernel/bpf/verifier.c
