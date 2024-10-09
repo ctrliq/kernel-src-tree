@@ -992,21 +992,17 @@ static int multipath_ctr(struct dm_target *ti, unsigned int argc,
 
 static void multipath_wait_for_pg_init_completion(struct multipath *m)
 {
-	DECLARE_WAITQUEUE(wait, current);
-
-	add_wait_queue(&m->pg_init_wait, &wait);
+	DEFINE_WAIT(wait);
 
 	while (1) {
-		set_current_state(TASK_UNINTERRUPTIBLE);
+		prepare_to_wait(&m->pg_init_wait, &wait, TASK_UNINTERRUPTIBLE);
 
 		if (!atomic_read(&m->pg_init_in_progress))
 			break;
 
 		io_schedule();
 	}
-	set_current_state(TASK_RUNNING);
-
-	remove_wait_queue(&m->pg_init_wait, &wait);
+	finish_wait(&m->pg_init_wait, &wait);
 }
 
 static void flush_multipath_work(struct multipath *m)
