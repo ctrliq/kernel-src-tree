@@ -1,0 +1,118 @@
+perf python: Fix pyrf_evlist__read_on_cpu() interface
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jiri Olsa <jolsa@kernel.org>
+commit 721f0dfc3ce821c6a32820ab63edfb48ed4af075
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/721f0dfc.failed
+
+Jaroslav reported errors from valgrind over perf python script:
+
+  # echo 0 > /sys/devices/system/cpu/cpu4/online
+  # valgrind ./test.py
+  ==7524== Memcheck, a memory error detector
+  ...
+  ==7524== Command: ./test.py
+  ==7524==
+  pid 7526 exited
+  ==7524== Invalid read of size 8
+  ==7524==    at 0xCC2C2B3: perf_mmap__read_forward (evlist.c:780)
+  ==7524==    by 0xCC2A681: pyrf_evlist__read_on_cpu (python.c:959)
+  ...
+  ==7524==  Address 0x65c4868 is 16 bytes after a block of size 459,36..
+  ==7524==    at 0x4C2B955: calloc (vg_replace_malloc.c:711)
+  ==7524==    by 0xCC2F484: zalloc (util.h:35)
+  ==7524==    by 0xCC2F484: perf_evlist__alloc_mmap (evlist.c:978)
+  ...
+
+The reason for this is in the python interface, that allows a script to
+pass arbitrary cpu number, which is then used to access struct
+perf_evlist::mmap array. That's obviously wrong and works only when if
+all cpus are available and fails if some cpu is missing, like in the
+example above.
+
+This patch makes pyrf_evlist__read_on_cpu() search the evlist's maps
+array for the proper map to access.
+
+It's linear search at the moment. Based on the way how is the
+read_on_cpu used, I don't think we need to be fast in here.  But we
+could add some hash in the middle to make it fast/er.
+
+We don't allow python interface to set write_backward event attribute,
+so it's safe to check only evlist's mmaps.
+
+	Reported-by: Jaroslav Škarvada <jskarvad@redhat.com>
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: David Ahern <dsahern@gmail.com>
+	Cc: Joe Mario <jmario@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/20180817114556.28000-3-jolsa@kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 721f0dfc3ce821c6a32820ab63edfb48ed4af075)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/python.c
+diff --cc tools/perf/util/python.c
+index 7f9ffdf67d9a,ce501ba14b08..000000000000
+--- a/tools/perf/util/python.c
++++ b/tools/perf/util/python.c
+@@@ -10,7 -11,32 +10,8 @@@
+  #include "cpumap.h"
+  #include "print_binary.h"
+  #include "thread_map.h"
++ #include "mmap.h"
+  
+ -#if PY_MAJOR_VERSION < 3
+ -#define _PyUnicode_FromString(arg) \
+ -  PyString_FromString(arg)
+ -#define _PyUnicode_AsString(arg) \
+ -  PyString_AsString(arg)
+ -#define _PyUnicode_FromFormat(...) \
+ -  PyString_FromFormat(__VA_ARGS__)
+ -#define _PyLong_FromLong(arg) \
+ -  PyInt_FromLong(arg)
+ -
+ -#else
+ -
+ -#define _PyUnicode_FromString(arg) \
+ -  PyUnicode_FromString(arg)
+ -#define _PyUnicode_FromFormat(...) \
+ -  PyUnicode_FromFormat(__VA_ARGS__)
+ -#define _PyLong_FromLong(arg) \
+ -  PyLong_FromLong(arg)
+ -#endif
+ -
+ -#ifndef Py_TYPE
+ -#define Py_TYPE(ob) (((PyObject*)(ob))->ob_type)
+ -#endif
+ -
+  /*
+   * Provide these two so that we don't have to link against callchain.c and
+   * start dragging hist.c, etc.
+@@@ -958,11 -1005,14 +973,19 @@@ static PyObject *pyrf_evlist__read_on_c
+  					 &cpu, &sample_id_all))
+  		return NULL;
+  
+++<<<<<<< HEAD
+ +	md = &evlist->mmap[cpu];
+ +	if (perf_mmap__read_init(md, false, &start, &end) < 0)
+++=======
++ 	md = get_md(evlist, cpu);
++ 	if (!md)
++ 		return NULL;
++ 
++ 	if (perf_mmap__read_init(md) < 0)
+++>>>>>>> 721f0dfc3ce8 (perf python: Fix pyrf_evlist__read_on_cpu() interface)
+  		goto end;
+  
+ -	event = perf_mmap__read_event(md);
+ +	event = perf_mmap__read_event(md, false, &start, end);
+  	if (event != NULL) {
+  		PyObject *pyevent = pyrf_event__new(event);
+  		struct pyrf_event *pevent = (struct pyrf_event *)pyevent;
+* Unmerged path tools/perf/util/python.c
