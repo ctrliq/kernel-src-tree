@@ -1,0 +1,910 @@
+HID: wacom: implement generic HID handling for pen generic devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Benjamin Tissoires <benjamin.tissoires@redhat.com>
+commit 7704ac937345d4b502062952657027234aa86a37
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/7704ac93.failed
+
+ISDv4 and v5 are plain HID devices. We can directly implement a generic
+HID parsing/handling and remove the need to manually add those PID in
+the list of supported devices.
+
+This patch implements the pen support only. The finger part will come in
+a later patch.
+
+To be properly notified of an .event() and a .report(), we need to force
+hid-core to go through the HID parsing. By default, wacom.ko binds only
+hidraw, so the hid parsing is not done by hid-core. When a true HID device
+is there, we add the flag HID_CLAIMED_DRIVER to hid->claimed which will
+force hid-core to parse the incoming reports.
+(Note that this can be easily backported by directly setting the .claimed
+flag to HID_CLAIMED_DRIVER even if hid-core does not support
+HID_CONNECT_DRIVER)
+
+	Signed-off-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+	Acked-by: Jason Gerecke <killertofu@gmail.com>
+	Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+(cherry picked from commit 7704ac937345d4b502062952657027234aa86a37)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hid/wacom.h
+#	drivers/hid/wacom_sys.c
+#	drivers/hid/wacom_wac.c
+#	drivers/hid/wacom_wac.h
+diff --cc drivers/hid/wacom.h
+index 87d2c48e3adc,0cc53440543a..000000000000
+--- a/drivers/hid/wacom.h
++++ b/drivers/hid/wacom.h
+@@@ -89,7 -89,7 +89,11 @@@
+  #include <linux/slab.h>
+  #include <linux/module.h>
+  #include <linux/mod_devicetable.h>
+++<<<<<<< HEAD
+ +#include <linux/init.h>
+++=======
++ #include <linux/hid.h>
+++>>>>>>> 7704ac937345 (HID: wacom: implement generic HID handling for pen generic devices)
+  #include <linux/usb/input.h>
+  #include <linux/power_supply.h>
+  #include <asm/unaligned.h>
+@@@ -141,4 -142,11 +145,14 @@@ void wacom_wac_irq(struct wacom_wac *wa
+  void wacom_setup_device_quirks(struct wacom_features *features);
+  int wacom_setup_input_capabilities(struct input_dev *input_dev,
+  				   struct wacom_wac *wacom_wac);
+++<<<<<<< HEAD
+++=======
++ int wacom_setup_pad_input_capabilities(struct input_dev *input_dev,
++ 				       struct wacom_wac *wacom_wac);
++ void wacom_wac_usage_mapping(struct hid_device *hdev,
++ 		struct hid_field *field, struct hid_usage *usage);
++ int wacom_wac_event(struct hid_device *hdev, struct hid_field *field,
++ 		struct hid_usage *usage, __s32 value);
++ void wacom_wac_report(struct hid_device *hdev, struct hid_report *report);
+++>>>>>>> 7704ac937345 (HID: wacom: implement generic HID handling for pen generic devices)
+  #endif
+diff --cc drivers/hid/wacom_sys.c
+index 527bf559d1db,dd288b2fbfe8..000000000000
+--- a/drivers/hid/wacom_sys.c
++++ b/drivers/hid/wacom_sys.c
+@@@ -290,248 -160,103 +290,308 @@@ static void wacom_retrieve_report_data(
+   * interfaces haven't supported pressure or distance, this is enough
+   * information to override invalid values in the wacom_features table.
+   *
+ - * Intuos5 touch interface and 3rd gen Bamboo Touch do not contain useful
+ - * data. We deal with them after returning from this function.
+ + * 3rd gen Bamboo Touch no longer define a Digitizer-Finger Pysical
+ + * Collection. Instead they define a Logical Collection with a single
+ + * Logical Maximum for both X and Y.
+ + *
+ + * Intuos5 touch interface does not contain useful data. We deal with
+ + * this after returning from this function.
+   */
+++<<<<<<< HEAD
+ +static int wacom_parse_hid(struct usb_interface *intf,
+ +			   struct hid_descriptor *hid_desc,
+++=======
++ static void wacom_usage_mapping(struct hid_device *hdev,
++ 		struct hid_field *field, struct hid_usage *usage)
++ {
++ 	struct wacom *wacom = hid_get_drvdata(hdev);
++ 	struct wacom_features *features = &wacom->wacom_wac.features;
++ 	bool finger = (field->logical == HID_DG_FINGER) ||
++ 		      (field->physical == HID_DG_FINGER);
++ 	bool pen = (field->logical == HID_DG_STYLUS) ||
++ 		   (field->physical == HID_DG_STYLUS);
++ 
++ 	/*
++ 	* Requiring Stylus Usage will ignore boot mouse
++ 	* X/Y values and some cases of invalid Digitizer X/Y
++ 	* values commonly reported.
++ 	*/
++ 	if (!pen && !finger)
++ 		return;
++ 
++ 	if (finger && !features->touch_max)
++ 		/* touch device at least supports one touch point */
++ 		features->touch_max = 1;
++ 
++ 	switch (usage->hid) {
++ 	case HID_GD_X:
++ 		features->x_max = field->logical_maximum;
++ 		if (finger) {
++ 			features->device_type = BTN_TOOL_FINGER;
++ 			features->x_phy = field->physical_maximum;
++ 			if (features->type != BAMBOO_PT) {
++ 				features->unit = field->unit;
++ 				features->unitExpo = field->unit_exponent;
++ 			}
++ 		} else {
++ 			features->device_type = BTN_TOOL_PEN;
++ 		}
++ 		break;
++ 	case HID_GD_Y:
++ 		features->y_max = field->logical_maximum;
++ 		if (finger) {
++ 			features->y_phy = field->physical_maximum;
++ 			if (features->type != BAMBOO_PT) {
++ 				features->unit = field->unit;
++ 				features->unitExpo = field->unit_exponent;
++ 			}
++ 		}
++ 		break;
++ 	case HID_DG_TIPPRESSURE:
++ 		if (pen)
++ 			features->pressure_max = field->logical_maximum;
++ 		break;
++ 	}
++ 
++ 	if (features->type == HID_GENERIC)
++ 		wacom_wac_usage_mapping(hdev, field, usage);
++ }
++ 
++ static void wacom_parse_hid(struct hid_device *hdev,
+++>>>>>>> 7704ac937345 (HID: wacom: implement generic HID handling for pen generic devices)
+  			   struct wacom_features *features)
+  {
+ -	struct hid_report_enum *rep_enum;
+ -	struct hid_report *hreport;
+ -	int i, j;
+ -
+ -	/* check features first */
+ -	rep_enum = &hdev->report_enum[HID_FEATURE_REPORT];
+ -	list_for_each_entry(hreport, &rep_enum->report_list, list) {
+ -		for (i = 0; i < hreport->maxfield; i++) {
+ -			/* Ignore if report count is out of bounds. */
+ -			if (hreport->field[i]->report_count < 1)
+ -				continue;
+ -
+ -			for (j = 0; j < hreport->field[i]->maxusage; j++) {
+ -				wacom_feature_mapping(hdev, hreport->field[i],
+ -						hreport->field[i]->usage + j);
+ +	struct usb_device *dev = interface_to_usbdev(intf);
+ +	char limit = 0;
+ +	/* result has to be defined as int for some devices */
+ +	int result = 0;
+ +	int i = 0, usage = WCM_UNDEFINED, finger = 0, pen = 0;
+ +	unsigned char *report;
+ +
+ +	report = kzalloc(hid_desc->wDescriptorLength, GFP_KERNEL);
+ +	if (!report)
+ +		return -ENOMEM;
+ +
+ +	/* retrive report descriptors */
+ +	do {
+ +		result = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0),
+ +			USB_REQ_GET_DESCRIPTOR,
+ +			USB_RECIP_INTERFACE | USB_DIR_IN,
+ +			HID_DEVICET_REPORT << 8,
+ +			intf->altsetting[0].desc.bInterfaceNumber, /* interface */
+ +			report,
+ +			hid_desc->wDescriptorLength,
+ +			5000); /* 5 secs */
+ +	} while (result < 0 && limit++ < WAC_MSG_RETRIES);
+ +
+ +	/* No need to parse the Descriptor. It isn't an error though */
+ +	if (result < 0)
+ +		goto out;
+ +
+ +	for (i = 0; i < hid_desc->wDescriptorLength; i++) {
+ +
+ +		switch (report[i]) {
+ +		case HID_USAGE_PAGE:
+ +			switch (report[i + 1]) {
+ +			case HID_USAGE_PAGE_DIGITIZER:
+ +				usage = WCM_DIGITIZER;
+ +				i++;
+ +				break;
+ +
+ +			case HID_USAGE_PAGE_DESKTOP:
+ +				usage = WCM_DESKTOP;
+ +				i++;
+ +				break;
+  			}
+ -		}
+ -	}
+ +			break;
+ +
+ +		case HID_USAGE:
+ +			switch (report[i + 1]) {
+ +			case HID_USAGE_X:
+ +				if (usage == WCM_DESKTOP) {
+ +					if (finger) {
+ +						features->device_type = BTN_TOOL_FINGER;
+ +
+ +						switch (features->type) {
+ +						case TABLETPC2FG:
+ +							features->pktlen = WACOM_PKGLEN_TPC2FG;
+ +							break;
+ +
+ +						case MTSCREEN:
+ +						case WACOM_24HDT:
+ +							features->pktlen = WACOM_PKGLEN_MTOUCH;
+ +							break;
+ +
+ +						case MTTPC:
+ +							features->pktlen = WACOM_PKGLEN_MTTPC;
+ +							break;
+ +
+ +						case BAMBOO_PT:
+ +							features->pktlen = WACOM_PKGLEN_BBTOUCH;
+ +							break;
+ +
+ +						default:
+ +							features->pktlen = WACOM_PKGLEN_GRAPHIRE;
+ +							break;
+ +						}
+ +
+ +						switch (features->type) {
+ +						case BAMBOO_PT:
+ +							features->x_phy =
+ +								get_unaligned_le16(&report[i + 5]);
+ +							features->x_max =
+ +								get_unaligned_le16(&report[i + 8]);
+ +							i += 15;
+ +							break;
+ +
+ +						case WACOM_24HDT:
+ +							features->x_max =
+ +								get_unaligned_le16(&report[i + 3]);
+ +							features->x_phy =
+ +								get_unaligned_le16(&report[i + 8]);
+ +							features->unit = report[i - 1];
+ +							features->unitExpo = report[i - 3];
+ +							i += 12;
+ +							break;
+ +
+ +						case WACOM_27QHDT:
+ +							if (!features->x_max) {
+ +								features->x_max =
+ +									get_unaligned_le16(&report[i - 4]);
+ +								features->x_phy =
+ +									get_unaligned_le16(&report[i - 7]);
+ +								features->unit = report[i - 13];
+ +								features->unitExpo = report[i - 11];
+ +							}
+ +							i += 9;
+ +							break;
+ +
+ +						default:
+ +							features->x_max =
+ +								get_unaligned_le16(&report[i + 3]);
+ +							features->x_phy =
+ +								get_unaligned_le16(&report[i + 6]);
+ +							features->unit = report[i + 9];
+ +							features->unitExpo = report[i + 11];
+ +							i += 12;
+ +							break;
+ +						}
+ +					} else if (pen) {
+ +						/* penabled only accepts exact bytes of data */
+ +						if (features->type >= TABLETPC)
+ +							features->pktlen = WACOM_PKGLEN_GRAPHIRE;
+ +						features->device_type = BTN_TOOL_PEN;
+ +						features->x_max =
+ +							get_unaligned_le16(&report[i + 3]);
+ +						i += 4;
+ +					}
+ +				}
+ +				break;
+  
+ -	/* now check the input usages */
+ -	rep_enum = &hdev->report_enum[HID_INPUT_REPORT];
+ -	list_for_each_entry(hreport, &rep_enum->report_list, list) {
+ +			case HID_USAGE_Y:
+ +				if (usage == WCM_DESKTOP) {
+ +					if (finger) {
+ +						switch (features->type) {
+ +						case TABLETPC2FG:
+ +						case MTSCREEN:
+ +						case MTTPC:
+ +							features->y_max =
+ +								get_unaligned_le16(&report[i + 3]);
+ +							features->y_phy =
+ +								get_unaligned_le16(&report[i + 6]);
+ +							i += 7;
+ +							break;
+ +
+ +						case WACOM_24HDT:
+ +							features->y_max =
+ +								get_unaligned_le16(&report[i + 3]);
+ +							features->y_phy =
+ +								get_unaligned_le16(&report[i - 2]);
+ +							i += 7;
+ +							break;
+ +
+ +						case BAMBOO_PT:
+ +							features->y_phy =
+ +								get_unaligned_le16(&report[i + 3]);
+ +							features->y_max =
+ +								get_unaligned_le16(&report[i + 6]);
+ +							i += 12;
+ +							break;
+ +
+ +						case WACOM_27QHDT:
+ +							if (!features->y_max) {
+ +								features->y_max =
+ +									get_unaligned_le16(&report[i - 2]);
+ +								features->y_phy =
+ +									get_unaligned_le16(&report[i - 5]);
+ +							}
+ +							i += 2;
+ +							break;
+ +
+ +						default:
+ +							features->y_max =
+ +								features->x_max;
+ +							features->y_phy =
+ +								get_unaligned_le16(&report[i + 3]);
+ +							i += 4;
+ +							break;
+ +						}
+ +					} else if (pen) {
+ +						features->y_max =
+ +							get_unaligned_le16(&report[i + 3]);
+ +						i += 4;
+ +					}
+ +				}
+ +				break;
+  
+ -		if (!hreport->maxfield)
+ -			continue;
+ +			case HID_USAGE_FINGER:
+ +				finger = 1;
+ +				i++;
+ +				break;
+ +
+ +			/*
+ +			 * Requiring Stylus Usage will ignore boot mouse
+ +			 * X/Y values and some cases of invalid Digitizer X/Y
+ +			 * values commonly reported.
+ +			 */
+ +			case HID_USAGE_STYLUS:
+ +				pen = 1;
+ +				i++;
+ +				break;
+ +
+ +			case HID_USAGE_CONTACTMAX:
+ +				/* leave touch_max as is if predefined */
+ +				if (!features->touch_max)
+ +					wacom_retrieve_report_data(intf, features);
+ +				i++;
+ +				break;
+ +			}
+ +			break;
+  
+ -		for (i = 0; i < hreport->maxfield; i++)
+ -			for (j = 0; j < hreport->field[i]->maxusage; j++)
+ -				wacom_usage_mapping(hdev, hreport->field[i],
+ -						hreport->field[i]->usage + j);
+ +		case HID_COLLECTION_END:
+ +			/* reset UsagePage and Finger */
+ +			finger = usage = 0;
+ +			break;
+ +
+ +		case HID_COLLECTION:
+ +			i++;
+ +			switch (report[i]) {
+ +			case HID_COLLECTION_LOGICAL:
+ +				i += wacom_parse_logical_collection(&report[i],
+ +								    features);
+ +				break;
+ +			}
+ +			break;
+ +		}
+  	}
+ +
+ + out:
+ +	result = 0;
+ +	kfree(report);
+ +	return result;
+  }
+  
+ -static int wacom_set_device_mode(struct hid_device *hdev, int report_id,
+ -		int length, int mode)
+ +static int wacom_set_device_mode(struct usb_interface *intf, int report_id, int length, int mode)
+  {
+  	unsigned char *rep_data;
+  	int error = -ENOMEM, limit = 0;
+@@@ -1301,10 -1320,13 +1361,11 @@@ static int wacom_probe(struct usb_inter
+  	struct wacom_wac *wacom_wac;
+  	struct wacom_features *features;
+  	int error;
++ 	unsigned int connect_mask = HID_CONNECT_HIDRAW;
+  
+ -	if (!id->driver_data)
+ +	if (!id->driver_info)
+  		return -EINVAL;
+  
+ -	hdev->quirks |= HID_QUIRK_NO_INIT_REPORTS;
+ -
+  	wacom = kzalloc(sizeof(struct wacom), GFP_KERNEL);
+  	if (!wacom)
+  		return -ENOMEM;
+@@@ -1412,15 -1452,24 +1473,27 @@@
+  	}
+  
+  	/* Note that if query fails it is not a hard failure */
+ -	wacom_query_tablet_data(hdev, features);
+ +	wacom_query_tablet_data(intf, features);
+  
+++<<<<<<< HEAD
+ +	usb_set_intfdata(intf, wacom);
+++=======
++ 	if (features->type == HID_GENERIC)
++ 		connect_mask |= HID_CONNECT_DRIVER;
++ 
++ 	/* Regular HID work starts now */
++ 	error = hid_hw_start(hdev, connect_mask);
++ 	if (error) {
++ 		hid_err(hdev, "hw start failed\n");
++ 		goto fail_hw_start;
++ 	}
+++>>>>>>> 7704ac937345 (HID: wacom: implement generic HID handling for pen generic devices)
+  
+ -	if (features->quirks & WACOM_QUIRK_MONITOR)
+ -		error = hid_hw_open(hdev);
+ -
+ -	if (wacom_wac->features.type == INTUOSHT && wacom_wac->features.touch_max) {
+ -		if (wacom_wac->features.device_type == BTN_TOOL_FINGER)
+ -			wacom_wac->shared->touch_input = wacom_wac->input;
+ +	if (features->quirks & WACOM_QUIRK_MONITOR) {
+ +		if (usb_submit_urb(wacom->irq, GFP_KERNEL)) {
+ +			error = -EIO;
+ +			goto fail5;
+ +		}
+  	}
+  
+  	return 0;
+@@@ -1493,11 -1537,18 +1566,18 @@@ static struct usb_driver wacom_driver 
+  	.name =		"wacom",
+  	.id_table =	wacom_ids,
+  	.probe =	wacom_probe,
+++<<<<<<< HEAD
+ +	.disconnect =	wacom_disconnect,
+ +	.suspend =	wacom_suspend,
+++=======
++ 	.remove =	wacom_remove,
++ 	.event =	wacom_wac_event,
++ 	.report =	wacom_wac_report,
++ #ifdef CONFIG_PM
+++>>>>>>> 7704ac937345 (HID: wacom: implement generic HID handling for pen generic devices)
+  	.resume =	wacom_resume,
+  	.reset_resume =	wacom_reset_resume,
+ -#endif
+ -	.raw_event =	wacom_raw_event,
+ +	.supports_autosuspend = 1,
+  };
+ -module_hid_driver(wacom_driver);
+  
+ -MODULE_VERSION(DRIVER_VERSION);
+ -MODULE_AUTHOR(DRIVER_AUTHOR);
+ -MODULE_DESCRIPTION(DRIVER_DESC);
+ -MODULE_LICENSE(DRIVER_LICENSE);
+ +module_usb_driver(wacom_driver);
+diff --cc drivers/hid/wacom_wac.c
+index 01ec753fea53,e77d46d85a11..000000000000
+--- a/drivers/hid/wacom_wac.c
++++ b/drivers/hid/wacom_wac.c
+@@@ -2112,136 -2602,181 +2286,145 @@@ static const struct wacom_features waco
+  	  .oVid = USB_VENDOR_ID_WACOM, .oPid = 0x5e };
+  static const struct wacom_features wacom_features_0x5E =
+  	{ "Wacom Cintiq 22HDT", .type = WACOM_24HDT,
+ -	  .oVid = USB_VENDOR_ID_WACOM, .oPid = 0x5b, .touch_max = 10,
+ -	  .check_for_hid_type = true, .hid_type = HID_TYPE_USBNONE };
+ +	  .oVid = USB_VENDOR_ID_WACOM, .oPid = 0x5b, .touch_max = 10 };
+  static const struct wacom_features wacom_features_0x90 =
+ -	{ "Wacom ISDv4 90", 26202, 16325, 255, 0,
+ -	  TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 90",       WACOM_PKGLEN_GRAPHIRE,  26202, 16325,  255,
+ +	  0, TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0x93 =
+ -	{ "Wacom ISDv4 93", 26202, 16325, 255, 0,
+ -	  TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 93",       WACOM_PKGLEN_GRAPHIRE,  26202, 16325,  255,
+ +	  0, TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0x97 =
+ -	{ "Wacom ISDv4 97", 26202, 16325, 511, 0,
+ -	  TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 97",       WACOM_PKGLEN_GRAPHIRE,  26202, 16325,  511,
+ +	  0, TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0x9A =
+ -	{ "Wacom ISDv4 9A", 26202, 16325, 255, 0,
+ -	  TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 9A",       WACOM_PKGLEN_GRAPHIRE,  26202, 16325,  255,
+ +	  0, TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0x9F =
+ -	{ "Wacom ISDv4 9F", 26202, 16325, 255, 0,
+ -	  TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 9F",       WACOM_PKGLEN_GRAPHIRE,  26202, 16325,  255,
+ +	  0, TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0xE2 =
+ -	{ "Wacom ISDv4 E2", 26202, 16325, 255, 0,
+ -	  TABLETPC2FG, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ +	{ "Wacom ISDv4 E2",       WACOM_PKGLEN_TPC2FG,    26202, 16325,  255,
+ +	  0, TABLETPC2FG, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+  static const struct wacom_features wacom_features_0xE3 =
+ -	{ "Wacom ISDv4 E3", 26202, 16325, 255, 0,
+ -	  TABLETPC2FG, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ +	{ "Wacom ISDv4 E3",       WACOM_PKGLEN_TPC2FG,    26202, 16325,  255,
+ +	  0, TABLETPC2FG, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+  static const struct wacom_features wacom_features_0xE5 =
+ -	{ "Wacom ISDv4 E5", 26202, 16325, 255, 0,
+ -	  MTSCREEN, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 E5",       WACOM_PKGLEN_MTOUCH,    26202, 16325,  255,
+ +	  0, MTSCREEN, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0xE6 =
+ -	{ "Wacom ISDv4 E6", 27760, 15694, 255, 0,
+ -	  TABLETPC2FG, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ +	{ "Wacom ISDv4 E6",       WACOM_PKGLEN_TPC2FG,    27760, 15694,  255,
+ +	  0, TABLETPC2FG, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+  static const struct wacom_features wacom_features_0xEC =
+ -	{ "Wacom ISDv4 EC", 25710, 14500, 255, 0,
+ -	  TABLETPC,    WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 EC",       WACOM_PKGLEN_GRAPHIRE,  25710, 14500,  255,
+ +	  0, TABLETPC,    WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0xED =
+ -	{ "Wacom ISDv4 ED", 26202, 16325, 255, 0,
+ -	  TABLETPCE, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 ED",       WACOM_PKGLEN_GRAPHIRE,  26202, 16325,  255,
+ +	  0, TABLETPCE, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0xEF =
+ -	{ "Wacom ISDv4 EF", 26202, 16325, 255, 0,
+ -	  TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 EF",       WACOM_PKGLEN_GRAPHIRE,  26202, 16325,  255,
+ +	  0, TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0x100 =
+ -	{ "Wacom ISDv4 100", 26202, 16325, 255, 0,
+ -	  MTTPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 100",      WACOM_PKGLEN_MTTPC,     26202, 16325,  255,
+ +	  0, MTTPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0x101 =
+ -	{ "Wacom ISDv4 101", 26202, 16325, 255, 0,
+ -	  MTTPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 101",      WACOM_PKGLEN_MTTPC,     26202, 16325,  255,
+ +	  0, MTTPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0x10D =
+ -	{ "Wacom ISDv4 10D", 26202, 16325, 255, 0,
+ -	  MTTPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ -static const struct wacom_features wacom_features_0x10E =
+ -	{ "Wacom ISDv4 10E", 27760, 15694, 255, 0,
+ -	  MTTPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ -static const struct wacom_features wacom_features_0x10F =
+ -	{ "Wacom ISDv4 10F", 27760, 15694, 255, 0,
+ -	  MTTPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ -static const struct wacom_features wacom_features_0x116 =
+ -	{ "Wacom ISDv4 116", 26202, 16325, 255, 0,
+ -	  TABLETPCE, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ -static const struct wacom_features wacom_features_0x12C =
+ -	{ "Wacom ISDv4 12C", 27848, 15752, 2047, 0,
+ -	  TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 10D",      WACOM_PKGLEN_MTTPC,     26202, 16325,  255,
+ +	  0, MTTPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0x4001 =
+ -	{ "Wacom ISDv4 4001", 26202, 16325, 255, 0,
+ -	  MTTPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ -static const struct wacom_features wacom_features_0x4004 =
+ -	{ "Wacom ISDv4 4004", 11060, 6220, 255, 0,
+ -	  MTTPC_B, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ -static const struct wacom_features wacom_features_0x5000 =
+ -	{ "Wacom ISDv4 5000", 27848, 15752, 1023, 0,
+ -	  MTTPC_B, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ -static const struct wacom_features wacom_features_0x5002 =
+ -	{ "Wacom ISDv4 5002", 29576, 16724, 1023, 0,
+ -	  MTTPC_B, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom ISDv4 4001",      WACOM_PKGLEN_MTTPC,     26202, 16325,  255,
+ +	  0, MTTPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0x47 =
+ -	{ "Wacom Intuos2 6x8", 20320, 16240, 1023, 31,
+ -	  INTUOS, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom Intuos2 6x8",    WACOM_PKGLEN_INTUOS,    20320, 16240, 1023,
+ +	  31, INTUOS, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0x84 =
+ -	{ "Wacom Wireless Receiver", 0, 0, 0, 0,
+ -	  WIRELESS, 0, 0, .touch_max = 16 };
+ +	{ "Wacom Wireless Receiver", WACOM_PKGLEN_WIRELESS, 0, 0, 0,
+ +	  0, WIRELESS, 0, 0, .touch_max = 16 };
+  static const struct wacom_features wacom_features_0xD0 =
+ -	{ "Wacom Bamboo 2FG", 14720, 9200, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ +	{ "Wacom Bamboo 2FG",     WACOM_PKGLEN_BBFUN,     14720,  9200, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+  static const struct wacom_features wacom_features_0xD1 =
+ -	{ "Wacom Bamboo 2FG 4x5", 14720, 9200, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ +	{ "Wacom Bamboo 2FG 4x5", WACOM_PKGLEN_BBFUN,     14720,  9200, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+  static const struct wacom_features wacom_features_0xD2 =
+ -	{ "Wacom Bamboo Craft", 14720, 9200, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ +	{ "Wacom Bamboo Craft",   WACOM_PKGLEN_BBFUN,     14720,  9200, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+  static const struct wacom_features wacom_features_0xD3 =
+ -	{ "Wacom Bamboo 2FG 6x8", 21648, 13700, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ +	{ "Wacom Bamboo 2FG 6x8", WACOM_PKGLEN_BBFUN,     21648, 13700, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+  static const struct wacom_features wacom_features_0xD4 =
+ -	{ "Wacom Bamboo Pen", 14720, 9200, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom Bamboo Pen",     WACOM_PKGLEN_BBFUN,     14720,  9200, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0xD5 =
+ -	{ "Wacom Bamboo Pen 6x8", 21648, 13700, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +	{ "Wacom Bamboo Pen 6x8",     WACOM_PKGLEN_BBFUN, 21648, 13700, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0xD6 =
+ -	{ "Wacom BambooPT 2FG 4x5", 14720, 9200, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ +	{ "Wacom BambooPT 2FG 4x5", WACOM_PKGLEN_BBFUN,   14720,  9200, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+  static const struct wacom_features wacom_features_0xD7 =
+ -	{ "Wacom BambooPT 2FG Small", 14720, 9200, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ +	{ "Wacom BambooPT 2FG Small", WACOM_PKGLEN_BBFUN, 14720,  9200, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+  static const struct wacom_features wacom_features_0xD8 =
+ -	{ "Wacom Bamboo Comic 2FG", 21648, 13700, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ +	{ "Wacom Bamboo Comic 2FG", WACOM_PKGLEN_BBFUN,   21648, 13700, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+  static const struct wacom_features wacom_features_0xDA =
+ -	{ "Wacom Bamboo 2FG 4x5 SE", 14720, 9200, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ -static const struct wacom_features wacom_features_0xDB =
+ -	{ "Wacom Bamboo 2FG 6x8 SE", 21648, 13700, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 2 };
+ +	{ "Wacom Bamboo 2FG 4x5 SE", WACOM_PKGLEN_BBFUN,  14720,  9200, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+ +static struct wacom_features wacom_features_0xDB =
+ +	{ "Wacom Bamboo 2FG 6x8 SE", WACOM_PKGLEN_BBFUN,  21648, 13700, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 2 };
+  static const struct wacom_features wacom_features_0xDD =
+ -        { "Wacom Bamboo Connect", 14720, 9200, 1023, 31,
+ -          BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +        { "Wacom Bamboo Connect", WACOM_PKGLEN_BBPEN,     14720,  9200, 1023,
+ +          31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+  static const struct wacom_features wacom_features_0xDE =
+ -        { "Wacom Bamboo 16FG 4x5", 14720, 9200, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 16 };
+ +        { "Wacom Bamboo 16FG 4x5", WACOM_PKGLEN_BBPEN,    14720,  9200, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 16 };
+  static const struct wacom_features wacom_features_0xDF =
+ -        { "Wacom Bamboo 16FG 6x8", 21648, 13700, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 16 };
+ -static const struct wacom_features wacom_features_0x300 =
+ -	{ "Wacom Bamboo One S", 14720, 9225, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ -static const struct wacom_features wacom_features_0x301 =
+ -	{ "Wacom Bamboo One M", 21648, 13530, 1023, 31,
+ -	  BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ -static const struct wacom_features wacom_features_0x302 =
+ -	{ "Wacom Intuos PT S", 15200, 9500, 1023, 31,
+ -	  INTUOSHT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 16,
+ -	  .check_for_hid_type = true, .hid_type = HID_TYPE_USBNONE };
+ -static const struct wacom_features wacom_features_0x303 =
+ -	{ "Wacom Intuos PT M", 21600, 13500, 1023, 31,
+ -	  INTUOSHT, WACOM_INTUOS_RES, WACOM_INTUOS_RES, .touch_max = 16,
+ -	  .check_for_hid_type = true, .hid_type = HID_TYPE_USBNONE };
+ -static const struct wacom_features wacom_features_0x30E =
+ -	{ "Wacom Intuos S", 15200, 9500, 1023, 31,
+ -	  INTUOSHT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ -	  .check_for_hid_type = true, .hid_type = HID_TYPE_USBNONE };
+ +        { "Wacom Bamboo 16FG 6x8", WACOM_PKGLEN_BBPEN,    21648, 13700, 1023,
+ +	  31, BAMBOO_PT, WACOM_INTUOS_RES, WACOM_INTUOS_RES,
+ +	  .touch_max = 16 };
+  static const struct wacom_features wacom_features_0x6004 =
+ -	{ "ISD-V4", 12800, 8000, 255, 0,
+ -	  TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ -static const struct wacom_features wacom_features_0x307 =
+ -	{ "Wacom ISDv5 307", 59352, 33648, 2047, 63,
+ -	  CINTIQ_HYBRID, WACOM_INTUOS3_RES, WACOM_INTUOS3_RES, 200, 200,
+ -	  .oVid = USB_VENDOR_ID_WACOM, .oPid = 0x309 };
+ -static const struct wacom_features wacom_features_0x309 =
+ -	{ "Wacom ISDv5 309", .type = WACOM_24HDT, /* Touch */
+ -	  .oVid = USB_VENDOR_ID_WACOM, .oPid = 0x0307, .touch_max = 10,
+ -	  .check_for_hid_type = true, .hid_type = HID_TYPE_USBNONE };
+ -static const struct wacom_features wacom_features_0x30A =
+ -	{ "Wacom ISDv5 30A", 59352, 33648, 2047, 63,
+ -	  CINTIQ_HYBRID, WACOM_INTUOS3_RES, WACOM_INTUOS3_RES, 200, 200,
+ -	  .oVid = USB_VENDOR_ID_WACOM, .oPid = 0x30C };
+ -static const struct wacom_features wacom_features_0x30C =
+ -	{ "Wacom ISDv5 30C", .type = WACOM_24HDT, /* Touch */
+ -	  .oVid = USB_VENDOR_ID_WACOM, .oPid = 0x30A, .touch_max = 10,
+ -	  .check_for_hid_type = true, .hid_type = HID_TYPE_USBNONE };
+ -
+ +	{ "ISD-V4",               WACOM_PKGLEN_GRAPHIRE,  12800,  8000,  255,
+ +	  0, TABLETPC, WACOM_INTUOS_RES, WACOM_INTUOS_RES };
+ +
+++<<<<<<< HEAD
+ +#define USB_DEVICE_WACOM(prod)					\
+ +	USB_DEVICE(USB_VENDOR_ID_WACOM, prod),			\
+ +	.driver_info = (kernel_ulong_t)&wacom_features_##prod
+++=======
++ static const struct wacom_features wacom_features_HID_ANY_ID =
++ 	{ "Wacom HID", .type = HID_GENERIC };
++ 
++ #define USB_DEVICE_WACOM(prod)						\
++ 	HID_DEVICE(BUS_USB, HID_GROUP_WACOM, USB_VENDOR_ID_WACOM, prod),\
++ 	.driver_data = (kernel_ulong_t)&wacom_features_##prod
+++>>>>>>> 7704ac937345 (HID: wacom: implement generic HID handling for pen generic devices)
+  
+ -#define BT_DEVICE_WACOM(prod)						\
+ -	HID_DEVICE(BUS_BLUETOOTH, HID_GROUP_WACOM, USB_VENDOR_ID_WACOM, prod),\
+ -	.driver_data = (kernel_ulong_t)&wacom_features_##prod
+ +#define USB_DEVICE_DETAILED(prod, class, sub, proto)			\
+ +	USB_DEVICE_AND_INTERFACE_INFO(USB_VENDOR_ID_WACOM, prod, class,	\
+ +				      sub, proto),			\
+ +	.driver_info = (kernel_ulong_t)&wacom_features_##prod
+  
+  #define USB_DEVICE_LENOVO(prod)					\
+ -	HID_USB_DEVICE(USB_VENDOR_ID_LENOVO, prod),			\
+ -	.driver_data = (kernel_ulong_t)&wacom_features_##prod
+ +	USB_DEVICE(USB_VENDOR_ID_LENOVO, prod),			\
+ +	.driver_info = (kernel_ulong_t)&wacom_features_##prod
+  
+ -const struct hid_device_id wacom_ids[] = {
+ +const struct usb_device_id wacom_ids[] = {
+  	{ USB_DEVICE_WACOM(0x00) },
+ -	{ USB_DEVICE_WACOM(0x03) },
+  	{ USB_DEVICE_WACOM(0x10) },
+  	{ USB_DEVICE_WACOM(0x11) },
+  	{ USB_DEVICE_WACOM(0x12) },
+@@@ -2349,20 -2879,35 +2532,28 @@@
+  	{ USB_DEVICE_WACOM(0x100) },
+  	{ USB_DEVICE_WACOM(0x101) },
+  	{ USB_DEVICE_WACOM(0x10D) },
+ -	{ USB_DEVICE_WACOM(0x10E) },
+ -	{ USB_DEVICE_WACOM(0x10F) },
+ -	{ USB_DEVICE_WACOM(0x116) },
+ -	{ USB_DEVICE_WACOM(0x12C) },
+ -	{ USB_DEVICE_WACOM(0x300) },
+ -	{ USB_DEVICE_WACOM(0x301) },
+ -	{ USB_DEVICE_WACOM(0x302) },
+ -	{ USB_DEVICE_WACOM(0x303) },
+  	{ USB_DEVICE_WACOM(0x304) },
+ -	{ USB_DEVICE_WACOM(0x307) },
+ -	{ USB_DEVICE_WACOM(0x309) },
+ -	{ USB_DEVICE_WACOM(0x30A) },
+ -	{ USB_DEVICE_WACOM(0x30C) },
+ -	{ USB_DEVICE_WACOM(0x30E) },
+ -	{ USB_DEVICE_WACOM(0x314) },
+ -	{ USB_DEVICE_WACOM(0x315) },
+ -	{ USB_DEVICE_WACOM(0x317) },
+ +	{ USB_DEVICE_DETAILED(0x314, USB_CLASS_HID, 0, 0) },
+ +	{ USB_DEVICE_DETAILED(0x315, USB_CLASS_HID, 0, 0) },
+ +	{ USB_DEVICE_DETAILED(0x317, USB_CLASS_HID, 0, 0) },
+ +	{ USB_DEVICE_WACOM(0x32A) },
+ +	{ USB_DEVICE_WACOM(0x32B) },
+ +	{ USB_DEVICE_WACOM(0x32C) },
+  	{ USB_DEVICE_WACOM(0x4001) },
+++<<<<<<< HEAD
+ +	{ USB_DEVICE_WACOM(0x47) },
+ +	{ USB_DEVICE_WACOM(0xF4) },
+ +	{ USB_DEVICE_WACOM(0xF8) },
+ +	{ USB_DEVICE_DETAILED(0xF6, USB_CLASS_HID, 0, 0) },
+ +	{ USB_DEVICE_WACOM(0xFA) },
+ +	{ USB_DEVICE_LENOVO(0x6004) },
+++=======
++ 	{ USB_DEVICE_WACOM(0x4004) },
++ 	{ USB_DEVICE_WACOM(0x5000) },
++ 	{ USB_DEVICE_WACOM(0x5002) },
++ 
++ 	{ USB_DEVICE_WACOM(HID_ANY_ID) },
+++>>>>>>> 7704ac937345 (HID: wacom: implement generic HID handling for pen generic devices)
+  	{ }
+  };
+ -MODULE_DEVICE_TABLE(hid, wacom_ids);
+ +MODULE_DEVICE_TABLE(usb, wacom_ids);
+diff --cc drivers/hid/wacom_wac.h
+index d220d069f329,f472eac292d5..000000000000
+--- a/drivers/hid/wacom_wac.h
++++ b/drivers/hid/wacom_wac.h
+@@@ -102,6 -112,8 +102,11 @@@ enum 
+  	TABLETPC2FG,
+  	MTSCREEN,
+  	MTTPC,
+++<<<<<<< HEAD
+++=======
++ 	MTTPC_B,
++ 	HID_GENERIC,
+++>>>>>>> 7704ac937345 (HID: wacom: implement generic HID handling for pen generic devices)
+  	MAX_TYPE
+  };
+  
+@@@ -135,11 -149,24 +140,17 @@@ struct wacom_features 
+  struct wacom_shared {
+  	bool stylus_in_proximity;
+  	bool touch_down;
+ -	/* for wireless device to access USB interfaces */
+ -	unsigned touch_max;
+ -	int type;
+ -	struct input_dev *touch_input;
+  };
+  
++ struct hid_data {
++ 	bool inrange_state;
++ 	bool invert_state;
++ 	bool tipswitch;
++ };
++ 
+  struct wacom_wac {
+  	char name[WACOM_NAME_MAX];
+ -	char pad_name[WACOM_NAME_MAX];
+ -	char bat_name[WACOM_NAME_MAX];
+ -	char ac_name[WACOM_NAME_MAX];
+ -	unsigned char data[WACOM_PKGLEN_MAX];
+ +	unsigned char *data;
+  	int tool[2];
+  	int id[2];
+  	__u32 serial[2];
+@@@ -149,6 -176,13 +160,14 @@@
+  	int pid;
+  	int battery_capacity;
+  	int num_contacts_left;
+++<<<<<<< HEAD
+++=======
++ 	int bat_charging;
++ 	int ps_connected;
++ 	u8 bt_features;
++ 	u8 bt_high_speed;
++ 	struct hid_data hid_data;
+++>>>>>>> 7704ac937345 (HID: wacom: implement generic HID handling for pen generic devices)
+  };
+  
+  #endif
+diff --git a/drivers/hid/hid-core.c b/drivers/hid/hid-core.c
+index 41a4a456d195..dfc883cbb6b2 100644
+--- a/drivers/hid/hid-core.c
++++ b/drivers/hid/hid-core.c
+@@ -1655,6 +1655,9 @@ int hid_connect(struct hid_device *hdev, unsigned int connect_mask)
+ 	if ((connect_mask & HID_CONNECT_HIDRAW) && !hidraw_connect(hdev))
+ 		hdev->claimed |= HID_CLAIMED_HIDRAW;
+ 
++	if (connect_mask & HID_CONNECT_DRIVER)
++		hdev->claimed |= HID_CLAIMED_DRIVER;
++
+ 	/* Drivers with the ->raw_event callback set are not required to connect
+ 	 * to any other listener. */
+ 	if (!hdev->claimed && !hdev->driver->raw_event) {
+* Unmerged path drivers/hid/wacom.h
+* Unmerged path drivers/hid/wacom_sys.c
+* Unmerged path drivers/hid/wacom_wac.c
+* Unmerged path drivers/hid/wacom_wac.h
+diff --git a/include/linux/hid.h b/include/linux/hid.h
+index 2277fc55debd..7b44e877d126 100644
+--- a/include/linux/hid.h
++++ b/include/linux/hid.h
+@@ -263,6 +263,7 @@ struct hid_item {
+ #define HID_CONNECT_HIDDEV		0x08
+ #define HID_CONNECT_HIDDEV_FORCE	0x10
+ #define HID_CONNECT_FF			0x20
++#define HID_CONNECT_DRIVER		0x40
+ #define HID_CONNECT_DEFAULT	(HID_CONNECT_HIDINPUT|HID_CONNECT_HIDRAW| \
+ 		HID_CONNECT_HIDDEV|HID_CONNECT_FF)
+ 
+@@ -436,6 +437,7 @@ struct hid_output_fifo {
+ #define HID_CLAIMED_INPUT	1
+ #define HID_CLAIMED_HIDDEV	2
+ #define HID_CLAIMED_HIDRAW	4
++#define HID_CLAIMED_DRIVER	8
+ 
+ #define HID_STAT_ADDED		1
+ #define HID_STAT_PARSED		2
