@@ -1,0 +1,218 @@
+alx: switch to per queue data structures
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-693.el7
+commit-author Tobias Regnery <tobias.regnery@gmail.com>
+commit 702e84185f472457912c641d8c0cc0cc786310eb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-693.el7/702e8418.failed
+
+Remove the tx and rx queue structures from the alx_priv structure and switch
+everything over to the queue pointers in the alx_napi structure.
+
+Based on the downstream driver at github.com/qca/alx
+
+	Signed-off-by: Tobias Regnery <tobias.regnery@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 702e84185f472457912c641d8c0cc0cc786310eb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/atheros/alx/alx.h
+#	drivers/net/ethernet/atheros/alx/main.c
+diff --cc drivers/net/ethernet/atheros/alx/alx.h
+index bdb9597f4474,d4a409139ea2..000000000000
+--- a/drivers/net/ethernet/atheros/alx/alx.h
++++ b/drivers/net/ethernet/atheros/alx/alx.h
+@@@ -135,14 -134,6 +134,17 @@@ struct alx_priv 
+  	unsigned int rx_ringsz;
+  	unsigned int rxbuf_size;
+  
+++<<<<<<< HEAD
+ +	struct page  *rx_page;
+ +	unsigned int rx_page_offset;
+ +	unsigned int rx_frag_size;
+ +
+ +	struct napi_struct napi;
+ +	struct alx_tx_queue txq;
+ +	struct alx_rx_queue rxq;
+ +
+++=======
+++>>>>>>> 702e84185f47 (alx: switch to per queue data structures)
+  	struct work_struct link_check_wk;
+  	struct work_struct reset_wk;
+  
+diff --cc drivers/net/ethernet/atheros/alx/main.c
+index b165b9e58ad3,a9fc44611b8a..000000000000
+--- a/drivers/net/ethernet/atheros/alx/main.c
++++ b/drivers/net/ethernet/atheros/alx/main.c
+@@@ -73,38 -73,9 +73,38 @@@ static void alx_free_txbuf(struct alx_t
+  	}
+  }
+  
+ +static struct sk_buff *alx_alloc_skb(struct alx_priv *alx, gfp_t gfp)
+ +{
+ +	struct sk_buff *skb;
+ +	struct page *page;
+ +
+ +	if (alx->rx_frag_size > PAGE_SIZE)
+ +		return __netdev_alloc_skb(alx->dev, alx->rxbuf_size, gfp);
+ +
+ +	page = alx->rx_page;
+ +	if (!page) {
+ +		alx->rx_page = page = alloc_page(gfp);
+ +		if (unlikely(!page))
+ +			return NULL;
+ +		alx->rx_page_offset = 0;
+ +	}
+ +
+ +	skb = build_skb(page_address(page) + alx->rx_page_offset,
+ +			alx->rx_frag_size);
+ +	if (likely(skb)) {
+ +		alx->rx_page_offset += alx->rx_frag_size;
+ +		if (alx->rx_page_offset >= PAGE_SIZE)
+ +			alx->rx_page = NULL;
+ +		else
+ +			get_page(page);
+ +	}
+ +	return skb;
+ +}
+ +
+ +
+  static int alx_refill_rx_ring(struct alx_priv *alx, gfp_t gfp)
+  {
+- 	struct alx_rx_queue *rxq = &alx->rxq;
++ 	struct alx_rx_queue *rxq = alx->qnapi[0]->rxq;
+  	struct sk_buff *skb;
+  	struct alx_buffer *cur_buf;
+  	dma_addr_t dma;
+@@@ -646,23 -631,18 +648,23 @@@ static int alx_alloc_rings(struct alx_p
+  	BUILD_BUG_ON(sizeof(struct alx_txd) % 8);
+  	BUILD_BUG_ON(sizeof(struct alx_rrd) % 8);
+  
+- 	offset = alx_alloc_tx_ring(alx, &alx->txq, offset);
++ 	offset = alx_alloc_tx_ring(alx, alx->qnapi[0]->txq, offset);
+  	if (offset < 0) {
+  		netdev_err(alx->dev, "Allocation of tx buffer failed!\n");
+ -		return -ENOMEM;
+ +		goto out_free;
+  	}
+  
+- 	offset = alx_alloc_rx_ring(alx, &alx->rxq, offset);
++ 	offset = alx_alloc_rx_ring(alx, alx->qnapi[0]->rxq, offset);
+  	if (offset < 0) {
+  		netdev_err(alx->dev, "Allocation of rx buffer failed!\n");
+ -		return -ENOMEM;
+ +		goto out_free;
+  	}
+  
+ +	alx->int_mask &= ~ALX_ISR_ALL_QUEUES;
+ +	alx->int_mask |= ALX_ISR_TX_Q0 | ALX_ISR_RX_Q0;
+ +
+ +	netif_napi_add(alx->dev, &alx->napi, alx_poll, 64);
+ +
+  	alx_reinit_rings(alx);
+  
+  	return 0;
+@@@ -678,21 -650,81 +680,90 @@@ out_free
+  
+  static void alx_free_rings(struct alx_priv *alx)
+  {
+++<<<<<<< HEAD
+ +	netif_napi_del(&alx->napi);
+++=======
++ 
+++>>>>>>> 702e84185f47 (alx: switch to per queue data structures)
+  	alx_free_buffers(alx);
+  
+- 	kfree(alx->txq.bufs);
+- 	kfree(alx->rxq.bufs);
++ 	kfree(alx->qnapi[0]->txq->bufs);
++ 	kfree(alx->qnapi[0]->rxq->bufs);
+  
+ -	if (!alx->descmem.virt)
+ -		dma_free_coherent(&alx->hw.pdev->dev,
+ -				  alx->descmem.size,
+ -				  alx->descmem.virt,
+ -				  alx->descmem.dma);
+ -}
+ +	if (alx->rx_page) {
+ +		put_page(alx->rx_page);
+ +		alx->rx_page = NULL;
+ +	}
+  
+++<<<<<<< HEAD
+ +	dma_free_coherent(&alx->hw.pdev->dev,
+ +			  alx->descmem.size,
+ +			  alx->descmem.virt,
+ +			  alx->descmem.dma);
+++=======
++ static void alx_free_napis(struct alx_priv *alx)
++ {
++ 	struct alx_napi *np;
++ 
++ 	np = alx->qnapi[0];
++ 	if (!np)
++ 		return;
++ 
++ 	netif_napi_del(&np->napi);
++ 	kfree(np->txq);
++ 	kfree(np->rxq);
++ 	kfree(np);
++ 	alx->qnapi[0] = NULL;
++ }
++ 
++ static int alx_alloc_napis(struct alx_priv *alx)
++ {
++ 	struct alx_napi *np;
++ 	struct alx_rx_queue *rxq;
++ 	struct alx_tx_queue *txq;
++ 
++ 	alx->int_mask &= ~ALX_ISR_ALL_QUEUES;
++ 	alx->int_mask |= ALX_ISR_TX_Q0 | ALX_ISR_RX_Q0;
++ 
++ 	/* allocate alx_napi structures */
++ 	np = kzalloc(sizeof(struct alx_napi), GFP_KERNEL);
++ 	if (!np)
++ 		goto err_out;
++ 
++ 	np->alx = alx;
++ 	netif_napi_add(alx->dev, &np->napi, alx_poll, 64);
++ 	alx->qnapi[0] = np;
++ 
++ 	/* allocate tx queues */
++ 	np = alx->qnapi[0];
++ 	txq = kzalloc(sizeof(*txq), GFP_KERNEL);
++ 	if (!txq)
++ 		goto err_out;
++ 
++ 	np->txq = txq;
++ 	txq->count = alx->tx_ringsz;
++ 	txq->netdev = alx->dev;
++ 	txq->dev = &alx->hw.pdev->dev;
++ 
++ 	/* allocate rx queues */
++ 	np = alx->qnapi[0];
++ 	rxq = kzalloc(sizeof(*rxq), GFP_KERNEL);
++ 	if (!rxq)
++ 		goto err_out;
++ 
++ 	np->rxq = rxq;
++ 	rxq->np = alx->qnapi[0];
++ 	rxq->count = alx->rx_ringsz;
++ 	rxq->netdev = alx->dev;
++ 	rxq->dev = &alx->hw.pdev->dev;
++ 
++ 	return 0;
++ 
++ err_out:
++ 	netdev_err(alx->dev, "error allocating internal structures\n");
++ 	alx_free_napis(alx);
++ 	return -ENOMEM;
+++>>>>>>> 702e84185f47 (alx: switch to per queue data structures)
+  }
+  
+  static void alx_config_vector_mapping(struct alx_priv *alx)
+* Unmerged path drivers/net/ethernet/atheros/alx/alx.h
+* Unmerged path drivers/net/ethernet/atheros/alx/main.c
