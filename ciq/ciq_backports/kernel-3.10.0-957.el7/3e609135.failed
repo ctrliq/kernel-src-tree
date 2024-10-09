@@ -1,0 +1,157 @@
+tcmu: clean up the scatter helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Xiubo Li <lixiubo@cmss.chinamobile.com>
+commit 3e60913579b2fefa74eeb3269426e864f4afa7e7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/3e609135.failed
+
+Add some comments to make the scatter code to be more readable,
+and drop unused arg to new_iov.
+
+	Signed-off-by: Xiubo Li <lixiubo@cmss.chinamobile.com>
+	Signed-off-by: Mike Christie <mchristi@redhat.com>
+	Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+(cherry picked from commit 3e60913579b2fefa74eeb3269426e864f4afa7e7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/target/target_core_user.c
+diff --cc drivers/target/target_core_user.c
+index 2ac4515b6a67,8d0dc471fce8..000000000000
+--- a/drivers/target/target_core_user.c
++++ b/drivers/target/target_core_user.c
+@@@ -444,51 -536,95 +443,92 @@@ static void alloc_and_scatter_data_area
+  		from = kmap_atomic(sg_page(sg)) + sg->offset;
+  		while (sg_remaining > 0) {
+  			if (block_remaining == 0) {
+ -				if (to)
+ -					kunmap_atomic(to);
+ -
+ +				block = find_first_zero_bit(udev->data_bitmap,
+ +							    udev->max_blocks);
+  				block_remaining = DATA_BLOCK_SIZE;
+ -				dbi = tcmu_cmd_get_dbi(tcmu_cmd);
+ -				page = tcmu_get_block_page(udev, dbi);
+ -				to = kmap_atomic(page);
+ +				set_bit(block, udev->data_bitmap);
+ +				set_bit(block, cmd_bitmap);
+  			}
+++<<<<<<< HEAD
+ +			copy_bytes = min_t(size_t, sg_remaining,
+ +					block_remaining);
+ +			to_offset = get_block_offset(udev, block,
+ +					block_remaining);
+ +			to = (void *)udev->mb_addr + to_offset;
+ +			if (*iov_cnt != 0 &&
+ +			    to_offset == iov_tail(udev, *iov)) {
+ +				(*iov)->iov_len += copy_bytes;
+ +			} else {
+ +				new_iov(iov, iov_cnt, udev);
+ +				(*iov)->iov_base = (void __user *) to_offset;
+++=======
++ 
++ 			/*
++ 			 * Covert to virtual offset of the ring data area.
++ 			 */
++ 			to_offset = get_block_offset_user(udev, dbi,
++ 					block_remaining);
++ 
++ 			/*
++ 			 * The following code will gather and map the blocks
++ 			 * to the same iovec when the blocks are all next to
++ 			 * each other.
++ 			 */
++ 			copy_bytes = min_t(size_t, sg_remaining,
++ 					block_remaining);
++ 			if (*iov_cnt != 0 &&
++ 			    to_offset == iov_tail(*iov)) {
++ 				/*
++ 				 * Will append to the current iovec, because
++ 				 * the current block page is next to the
++ 				 * previous one.
++ 				 */
++ 				(*iov)->iov_len += copy_bytes;
++ 			} else {
++ 				/*
++ 				 * Will allocate a new iovec because we are
++ 				 * first time here or the current block page
++ 				 * is not next to the previous one.
++ 				 */
++ 				new_iov(iov, iov_cnt);
++ 				(*iov)->iov_base = (void __user *)to_offset;
+++>>>>>>> 3e60913579b2 (tcmu: clean up the scatter helper)
+  				(*iov)->iov_len = copy_bytes;
+  			}
++ 
+  			if (copy_data) {
+ -				offset = DATA_BLOCK_SIZE - block_remaining;
+ -				memcpy(to + offset,
+ -				       from + sg->length - sg_remaining,
+ -				       copy_bytes);
+ +				memcpy(to, from + sg->length - sg_remaining,
+ +					copy_bytes);
+  				tcmu_flush_dcache_range(to, copy_bytes);
+  			}
++ 
+  			sg_remaining -= copy_bytes;
+  			block_remaining -= copy_bytes;
+  		}
+  		kunmap_atomic(from - sg->offset);
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (to)
++ 		kunmap_atomic(to);
+++>>>>>>> 3e60913579b2 (tcmu: clean up the scatter helper)
+  }
+  
+ -static void gather_data_area(struct tcmu_dev *udev, struct tcmu_cmd *cmd,
+ -			     bool bidi)
+ +static void free_data_area(struct tcmu_dev *udev, struct tcmu_cmd *cmd)
+  {
+ -	struct se_cmd *se_cmd = cmd->se_cmd;
+ -	int i, dbi;
+ -	int block_remaining = 0;
+ -	void *from = NULL, *to;
+ -	size_t copy_bytes, offset;
+ -	struct scatterlist *sg, *data_sg;
+ -	struct page *page;
+ -	unsigned int data_nents;
+ -	uint32_t count = 0;
+ -
+ -	if (!bidi) {
+ -		data_sg = se_cmd->t_data_sg;
+ -		data_nents = se_cmd->t_data_nents;
+ -	} else {
+ -
+ -		/*
+ -		 * For bidi case, the first count blocks are for Data-Out
+ -		 * buffer blocks, and before gathering the Data-In buffer
+ -		 * the Data-Out buffer blocks should be discarded.
+ -		 */
+ -		count = DIV_ROUND_UP(se_cmd->data_length, DATA_BLOCK_SIZE);
+ -
+ -		data_sg = se_cmd->t_bidi_data_sg;
+ -		data_nents = se_cmd->t_bidi_data_nents;
+ -	}
+ +	bitmap_xor(udev->data_bitmap, udev->data_bitmap, cmd->data_bitmap,
+ +		   udev->max_blocks);
+ +}
+  
+ -	tcmu_cmd_set_dbi_cur(cmd, count);
+ +static void gather_data_area(struct tcmu_dev *udev, unsigned long *cmd_bitmap,
+ +		struct scatterlist *data_sg, unsigned int data_nents)
+ +{
+ +	int i, block;
+ +	int block_remaining = 0;
+ +	void *from, *to;
+ +	size_t copy_bytes, from_offset;
+ +	struct scatterlist *sg;
+  
+  	for_each_sg(data_sg, sg, data_nents, i) {
+  		int sg_remaining = sg->length;
+* Unmerged path drivers/target/target_core_user.c
