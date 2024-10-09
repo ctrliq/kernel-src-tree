@@ -1,0 +1,364 @@
+net/mlx5e: Support LAG TX port affinity distribution
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-1127.el7
+commit-author Maxim Mikityanskiy <maximmi@mellanox.com>
+commit 45f171b1182b9c4ab6d854d6f7fd7dd771fed591
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-1127.el7/45f171b1.failed
+
+When the VF LAG is in use, round-robin the TX affinity of channels among
+the different ports, if supported by the firmware. Create a set of TISes
+per port, while doing round-robin of the channels over the different
+sets. Let all SQs of a channel share the same set of TISes.
+
+If lag_tx_port_affinity HCA cap bit is supported, num_lag_ports > 1 and
+we aren't the LACP owner (PF in the regular use), assign the affinities,
+otherwise use tx_affinity == 0 in TIS context to let the FW assign the
+affinities itself. The TISes of the LACP owner are mapped only to the
+native physical port.
+
+For VFs, the starting port for round-robin is determined by its vhca_id,
+because a VF may have only one channel if attached to a single-core VM.
+
+	Signed-off-by: Maxim Mikityanskiy <maximmi@mellanox.com>
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Mark Bloch <markb@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 45f171b1182b9c4ab6d854d6f7fd7dd771fed591)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index d37dec6676a5,2786f5b8057d..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -1806,12 -1687,12 +1806,12 @@@ static int mlx5e_open_sqs(struct mlx5e_
+  			  struct mlx5e_channel_param *cparam)
+  {
+  	struct mlx5e_priv *priv = c->priv;
+ -	int err, tc;
+ +	int err, tc, max_nch = mlx5e_get_netdev_max_channels(priv->netdev);
+  
+  	for (tc = 0; tc < params->num_tc; tc++) {
+ -		int txq_ix = c->ix + tc * priv->max_nch;
+ +		int txq_ix = c->ix + tc * max_nch;
+  
+- 		err = mlx5e_open_txqsq(c, c->priv->tisn[tc], txq_ix,
++ 		err = mlx5e_open_txqsq(c, c->priv->tisn[c->lag_port][tc], txq_ix,
+  				       params, &cparam->sq, &c->sq[tc], tc);
+  		if (err)
+  			goto err_close_sqs;
+@@@ -1915,6 -1796,143 +1915,146 @@@ static int mlx5e_set_tx_maxrate(struct 
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int mlx5e_alloc_xps_cpumask(struct mlx5e_channel *c,
++ 				   struct mlx5e_params *params)
++ {
++ 	int num_comp_vectors = mlx5_comp_vectors_count(c->mdev);
++ 	int irq;
++ 
++ 	if (!zalloc_cpumask_var(&c->xps_cpumask, GFP_KERNEL))
++ 		return -ENOMEM;
++ 
++ 	for (irq = c->ix; irq < num_comp_vectors; irq += params->num_channels) {
++ 		int cpu = cpumask_first(mlx5_comp_irq_get_affinity_mask(c->mdev, irq));
++ 
++ 		cpumask_set_cpu(cpu, c->xps_cpumask);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void mlx5e_free_xps_cpumask(struct mlx5e_channel *c)
++ {
++ 	free_cpumask_var(c->xps_cpumask);
++ }
++ 
++ static int mlx5e_open_queues(struct mlx5e_channel *c,
++ 			     struct mlx5e_params *params,
++ 			     struct mlx5e_channel_param *cparam)
++ {
++ 	struct dim_cq_moder icocq_moder = {0, 0};
++ 	int err;
++ 
++ 	err = mlx5e_open_cq(c, icocq_moder, &cparam->icosq_cq, &c->icosq.cq);
++ 	if (err)
++ 		return err;
++ 
++ 	err = mlx5e_open_tx_cqs(c, params, cparam);
++ 	if (err)
++ 		goto err_close_icosq_cq;
++ 
++ 	err = mlx5e_open_cq(c, params->tx_cq_moderation, &cparam->tx_cq, &c->xdpsq.cq);
++ 	if (err)
++ 		goto err_close_tx_cqs;
++ 
++ 	err = mlx5e_open_cq(c, params->rx_cq_moderation, &cparam->rx_cq, &c->rq.cq);
++ 	if (err)
++ 		goto err_close_xdp_tx_cqs;
++ 
++ 	/* XDP SQ CQ params are same as normal TXQ sq CQ params */
++ 	err = c->xdp ? mlx5e_open_cq(c, params->tx_cq_moderation,
++ 				     &cparam->tx_cq, &c->rq_xdpsq.cq) : 0;
++ 	if (err)
++ 		goto err_close_rx_cq;
++ 
++ 	napi_enable(&c->napi);
++ 
++ 	err = mlx5e_open_icosq(c, params, &cparam->icosq, &c->icosq);
++ 	if (err)
++ 		goto err_disable_napi;
++ 
++ 	err = mlx5e_open_sqs(c, params, cparam);
++ 	if (err)
++ 		goto err_close_icosq;
++ 
++ 	if (c->xdp) {
++ 		err = mlx5e_open_xdpsq(c, params, &cparam->xdp_sq, NULL,
++ 				       &c->rq_xdpsq, false);
++ 		if (err)
++ 			goto err_close_sqs;
++ 	}
++ 
++ 	err = mlx5e_open_rq(c, params, &cparam->rq, NULL, NULL, &c->rq);
++ 	if (err)
++ 		goto err_close_xdp_sq;
++ 
++ 	err = mlx5e_open_xdpsq(c, params, &cparam->xdp_sq, NULL, &c->xdpsq, true);
++ 	if (err)
++ 		goto err_close_rq;
++ 
++ 	return 0;
++ 
++ err_close_rq:
++ 	mlx5e_close_rq(&c->rq);
++ 
++ err_close_xdp_sq:
++ 	if (c->xdp)
++ 		mlx5e_close_xdpsq(&c->rq_xdpsq);
++ 
++ err_close_sqs:
++ 	mlx5e_close_sqs(c);
++ 
++ err_close_icosq:
++ 	mlx5e_close_icosq(&c->icosq);
++ 
++ err_disable_napi:
++ 	napi_disable(&c->napi);
++ 
++ 	if (c->xdp)
++ 		mlx5e_close_cq(&c->rq_xdpsq.cq);
++ 
++ err_close_rx_cq:
++ 	mlx5e_close_cq(&c->rq.cq);
++ 
++ err_close_xdp_tx_cqs:
++ 	mlx5e_close_cq(&c->xdpsq.cq);
++ 
++ err_close_tx_cqs:
++ 	mlx5e_close_tx_cqs(c);
++ 
++ err_close_icosq_cq:
++ 	mlx5e_close_cq(&c->icosq.cq);
++ 
++ 	return err;
++ }
++ 
++ static void mlx5e_close_queues(struct mlx5e_channel *c)
++ {
++ 	mlx5e_close_xdpsq(&c->xdpsq);
++ 	mlx5e_close_rq(&c->rq);
++ 	if (c->xdp)
++ 		mlx5e_close_xdpsq(&c->rq_xdpsq);
++ 	mlx5e_close_sqs(c);
++ 	mlx5e_close_icosq(&c->icosq);
++ 	napi_disable(&c->napi);
++ 	if (c->xdp)
++ 		mlx5e_close_cq(&c->rq_xdpsq.cq);
++ 	mlx5e_close_cq(&c->rq.cq);
++ 	mlx5e_close_cq(&c->xdpsq.cq);
++ 	mlx5e_close_tx_cqs(c);
++ 	mlx5e_close_cq(&c->icosq.cq);
++ }
++ 
++ static u8 mlx5e_enumerate_lag_port(struct mlx5_core_dev *mdev, int ix)
++ {
++ 	u16 port_aff_bias = mlx5_core_is_pf(mdev) ? 0 : MLX5_CAP_GEN(mdev, vhca_id);
++ 
++ 	return (ix + port_aff_bias) % mlx5e_get_num_lag_ports(mdev);
++ }
++ 
+++>>>>>>> 45f171b1182b (net/mlx5e: Support LAG TX port affinity distribution)
+  static int mlx5e_open_channel(struct mlx5e_priv *priv, int ix,
+  			      struct mlx5e_params *params,
+  			      struct mlx5e_channel_param *cparam,
+@@@ -1947,10 -1966,12 +2087,15 @@@
+  	c->num_tc   = params->num_tc;
+  	c->xdp      = !!params->xdp_prog;
+  	c->stats    = &priv->channel_stats[ix].ch;
+++<<<<<<< HEAD
+++=======
++ 	c->irq_desc = irq_to_desc(irq);
++ 	c->lag_port = mlx5e_enumerate_lag_port(priv->mdev, ix);
+++>>>>>>> 45f171b1182b (net/mlx5e: Support LAG TX port affinity distribution)
+  
+ -	err = mlx5e_alloc_xps_cpumask(c, params);
+ -	if (err)
+ -		goto err_free_channel;
+ +#ifdef CONFIG_GENERIC_HARDIRQS
+ +	c->irq_desc = irq_to_desc(irq);
+ +#endif
+  
+  	netif_napi_add(netdev, &c->napi, mlx5e_napi_poll, 64);
+  
+@@@ -3137,22 -3187,41 +3282,44 @@@ void mlx5e_destroy_tis(struct mlx5_core
+  	mlx5_core_destroy_tis(mdev, tisn);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void mlx5e_destroy_tises(struct mlx5e_priv *priv)
++ {
++ 	int tc, i;
++ 
++ 	for (i = 0; i < mlx5e_get_num_lag_ports(priv->mdev); i++)
++ 		for (tc = 0; tc < priv->profile->max_tc; tc++)
++ 			mlx5e_destroy_tis(priv->mdev, priv->tisn[i][tc]);
++ }
++ 
++ static bool mlx5e_lag_should_assign_affinity(struct mlx5_core_dev *mdev)
++ {
++ 	return MLX5_CAP_GEN(mdev, lag_tx_port_affinity) && mlx5e_get_num_lag_ports(mdev) > 1;
++ }
++ 
+++>>>>>>> 45f171b1182b (net/mlx5e: Support LAG TX port affinity distribution)
+  int mlx5e_create_tises(struct mlx5e_priv *priv)
+  {
++ 	int tc, i;
+  	int err;
+- 	int tc;
+  
+- 	for (tc = 0; tc < priv->profile->max_tc; tc++) {
+- 		u32 in[MLX5_ST_SZ_DW(create_tis_in)] = {};
+- 		void *tisc;
++ 	for (i = 0; i < mlx5e_get_num_lag_ports(priv->mdev); i++) {
++ 		for (tc = 0; tc < priv->profile->max_tc; tc++) {
++ 			u32 in[MLX5_ST_SZ_DW(create_tis_in)] = {};
++ 			void *tisc;
+  
+- 		tisc = MLX5_ADDR_OF(create_tis_in, in, ctx);
++ 			tisc = MLX5_ADDR_OF(create_tis_in, in, ctx);
+  
+- 		MLX5_SET(tisc, tisc, prio, tc << 1);
++ 			MLX5_SET(tisc, tisc, prio, tc << 1);
+  
+- 		err = mlx5e_create_tis(priv->mdev, in, &priv->tisn[tc]);
+- 		if (err)
+- 			goto err_close_tises;
++ 			if (mlx5e_lag_should_assign_affinity(priv->mdev))
++ 				MLX5_SET(tisc, tisc, lag_tx_port_affinity, i + 1);
++ 
++ 			err = mlx5e_create_tis(priv->mdev, in, &priv->tisn[i][tc]);
++ 			if (err)
++ 				goto err_close_tises;
++ 		}
+  	}
+  
+  	return 0;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 5744af51d8f5..6b1aa990944e 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -163,6 +163,14 @@ do {                                                            \
+ } while (0)
+ 
+ 
++static inline u8 mlx5e_get_num_lag_ports(struct mlx5_core_dev *mdev)
++{
++	if (mlx5_lag_is_lacp_owner(mdev))
++		return 1;
++
++	return clamp_t(u8, MLX5_CAP_GEN(mdev, num_lag_ports), 1, MLX5_MAX_PORTS);
++}
++
+ static inline u16 mlx5_min_rx_wqes(int wq_type, u32 wq_size)
+ {
+ 	switch (wq_type) {
+@@ -603,6 +611,7 @@ struct mlx5e_channel {
+ 	struct net_device         *netdev;
+ 	__be32                     mkey_be;
+ 	u8                         num_tc;
++	u8                         lag_port;
+ 
+ 	/* XDP_REDIRECT */
+ 	struct mlx5e_xdpsq         xdpsq;
+@@ -671,7 +680,7 @@ struct mlx5e_priv {
+ 	struct mlx5e_rq            drop_rq;
+ 
+ 	struct mlx5e_channels      channels;
+-	u32                        tisn[MLX5E_MAX_NUM_TC];
++	u32                        tisn[MLX5_MAX_PORTS][MLX5E_MAX_NUM_TC];
+ 	struct mlx5e_rqt           indir_rqt;
+ 	struct mlx5e_tir           indir_tir[MLX5E_NUM_INDIR_TIRS];
+ 	struct mlx5e_tir           inner_indir_tir[MLX5E_NUM_INDIR_TIRS];
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+index 3e220e38926e..5eed54ad60da 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+@@ -282,7 +282,7 @@ static int mlx5i_init_tx(struct mlx5e_priv *priv)
+ 		return err;
+ 	}
+ 
+-	err = mlx5i_create_tis(priv->mdev, ipriv->qp.qpn, &priv->tisn[0]);
++	err = mlx5i_create_tis(priv->mdev, ipriv->qp.qpn, &priv->tisn[0][0]);
+ 	if (err) {
+ 		mlx5_core_warn(priv->mdev, "create tis failed, %d\n", err);
+ 		goto err_destroy_underlay_qp;
+@@ -299,7 +299,7 @@ static void mlx5i_cleanup_tx(struct mlx5e_priv *priv)
+ {
+ 	struct mlx5i_priv *ipriv = priv->ppriv;
+ 
+-	mlx5e_destroy_tis(priv->mdev, priv->tisn[0]);
++	mlx5e_destroy_tis(priv->mdev, priv->tisn[0][0]);
+ 	mlx5i_destroy_underlay_qp(priv->mdev, &ipriv->qp);
+ }
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c
+index 2092f303a761..4645ef448244 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c
+@@ -210,7 +210,7 @@ static int mlx5i_pkey_open(struct net_device *netdev)
+ 		goto err_unint_underlay_qp;
+ 	}
+ 
+-	err = mlx5i_create_tis(mdev, ipriv->qp.qpn, &epriv->tisn[0]);
++	err = mlx5i_create_tis(mdev, ipriv->qp.qpn, &epriv->tisn[0][0]);
+ 	if (err) {
+ 		mlx5_core_warn(mdev, "create child tis failed, %d\n", err);
+ 		goto err_remove_rx_uderlay_qp;
+@@ -228,7 +228,7 @@ static int mlx5i_pkey_open(struct net_device *netdev)
+ 	return 0;
+ 
+ err_clear_state_opened_flag:
+-	mlx5e_destroy_tis(mdev, epriv->tisn[0]);
++	mlx5e_destroy_tis(mdev, epriv->tisn[0][0]);
+ err_remove_rx_uderlay_qp:
+ 	mlx5_fs_remove_rx_underlay_qpn(mdev, ipriv->qp.qpn);
+ err_unint_underlay_qp:
+@@ -257,7 +257,7 @@ static int mlx5i_pkey_close(struct net_device *netdev)
+ 	mlx5i_uninit_underlay_qp(priv);
+ 	mlx5e_deactivate_priv_channels(priv);
+ 	mlx5e_close_channels(&priv->channels);
+-	mlx5e_destroy_tis(mdev, priv->tisn[0]);
++	mlx5e_destroy_tis(mdev, priv->tisn[0][0]);
+ unlock:
+ 	mutex_unlock(&priv->state_lock);
+ 	return 0;
