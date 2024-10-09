@@ -1,0 +1,417 @@
+netfilter: ipset: Fix reported memory size for hash:* types
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-3.10.0-957.el7
+commit-author Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+commit a71bdbfa99272f0beb92b669d2bbc626871e00e5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-3.10.0-957.el7/a71bdbfa.failed
+
+The calculation of the full allocated memory did not take
+into account the size of the base hash bucket structure at some
+places.
+
+	Signed-off-by: Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+(cherry picked from commit a71bdbfa99272f0beb92b669d2bbc626871e00e5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/ipset/ip_set_hash_gen.h
+diff --cc net/netfilter/ipset/ip_set_hash_gen.h
+index 9ce28af662bf,88b70fcc5ac5..000000000000
+--- a/net/netfilter/ipset/ip_set_hash_gen.h
++++ b/net/netfilter/ipset/ip_set_hash_gen.h
+@@@ -71,11 -78,19 +71,21 @@@ struct hbucket 
+  
+  /* The hash table: the table size stored here in order to make resizing easy */
+  struct htable {
+ -	atomic_t ref;		/* References for resizing */
+ -	atomic_t uref;		/* References for dumping */
+  	u8 htable_bits;		/* size of hash table == 2^htable_bits */
+ -	struct hbucket __rcu *bucket[0]; /* hashtable buckets */
+ +	struct hbucket bucket[0]; /* hashtable buckets */
+  };
+  
+++<<<<<<< HEAD
+ +#define hbucket(h, i)		(&((h)->bucket[i]))
+++=======
++ #define hbucket(h, i)		((h)->bucket[i])
++ #define ext_size(n, dsize)	\
++ 	(sizeof(struct hbucket) + (n) * (dsize))
++ 
++ #ifndef IPSET_NET_COUNT
++ #define IPSET_NET_COUNT		1
++ #endif
+++>>>>>>> a71bdbfa9927 (netfilter: ipset: Fix reported memory size for hash:* types)
+  
+  /* Book-keeping of the prefixes added to the set */
+  struct net_prefixes {
+@@@ -473,10 -511,19 +483,26 @@@ mtype_expire(struct htype *h, u8 nets_l
+  			if (!tmp)
+  				/* Still try to delete expired elements */
+  				continue;
+++<<<<<<< HEAD
+ +			n->size -= AHASH_INIT_SIZE;
+ +			memcpy(tmp, n->value, n->size * dsize);
+ +			kfree(n->value);
+ +			n->value = tmp;
+++=======
++ 			tmp->size = n->size - AHASH_INIT_SIZE;
++ 			for (j = 0, d = 0; j < n->pos; j++) {
++ 				if (!test_bit(j, n->used))
++ 					continue;
++ 				data = ahash_data(n, j, dsize);
++ 				memcpy(tmp->value + d * dsize, data, dsize);
++ 				set_bit(d, tmp->used);
++ 				d++;
++ 			}
++ 			tmp->pos = d;
++ 			set->ext_size -= ext_size(AHASH_INIT_SIZE, dsize);
++ 			rcu_assign_pointer(hbucket(t, i), tmp);
++ 			kfree_rcu(n, rcu);
+++>>>>>>> a71bdbfa9927 (netfilter: ipset: Fix reported memory size for hash:* types)
+  		}
+  	}
+  }
+@@@ -528,43 -577,84 +554,81 @@@ mtype_resize(struct ip_set *set, bool r
+  retry:
+  	ret = 0;
+  	htable_bits++;
+ +	pr_debug("attempt to resize set %s from %u to %u, t %p\n",
+ +		 set->name, orig->htable_bits, htable_bits, orig);
+  	if (!htable_bits) {
+  		/* In case we have plenty of memory :-) */
+ -		pr_warn("Cannot increase the hashsize of set %s further\n",
+ -			set->name);
+ -		ret = -IPSET_ERR_HASH_FULL;
+ -		goto out;
+ -	}
+ -	t = ip_set_alloc(htable_size(htable_bits));
+ -	if (!t) {
+ -		ret = -ENOMEM;
+ -		goto out;
+ +		pr_warning("Cannot increase the hashsize of set %s further\n",
+ +			   set->name);
+ +		return -IPSET_ERR_HASH_FULL;
+  	}
+ +	t = ip_set_alloc(sizeof(*t)
+ +			 + jhash_size(htable_bits) * sizeof(struct hbucket));
+ +	if (!t)
+ +		return -ENOMEM;
+  	t->htable_bits = htable_bits;
+  
+ -	spin_lock_bh(&set->lock);
+ -	orig = __ipset_dereference_protected(h->table, 1);
+ -	/* There can't be another parallel resizing, but dumping is possible */
+ -	atomic_set(&orig->ref, 1);
+ -	atomic_inc(&orig->uref);
+ -	extsize = 0;
+ -	pr_debug("attempt to resize set %s from %u to %u, t %p\n",
+ -		 set->name, orig->htable_bits, htable_bits, orig);
+ +	read_lock_bh(&set->lock);
+  	for (i = 0; i < jhash_size(orig->htable_bits); i++) {
+ -		n = __ipset_dereference_protected(hbucket(orig, i), 1);
+ -		if (!n)
+ -			continue;
+ +		n = hbucket(orig, i);
+  		for (j = 0; j < n->pos; j++) {
+ -			if (!test_bit(j, n->used))
+ -				continue;
+ -			data = ahash_data(n, j, dsize);
+ +			data = ahash_data(n, j, h->dsize);
+  #ifdef IP_SET_HASH_WITH_NETS
+ -			/* We have readers running parallel with us,
+ -			 * so the live data cannot be modified.
+ -			 */
+  			flags = 0;
+ -			memcpy(tmp, data, dsize);
+ -			data = tmp;
+  			mtype_data_reset_flags(data, &flags);
+  #endif
+++<<<<<<< HEAD
+ +			m = hbucket(t, HKEY(data, h->initval, htable_bits));
+ +			ret = hbucket_elem_add(m, AHASH_MAX(h), h->dsize);
+ +			if (ret < 0) {
+ +#ifdef IP_SET_HASH_WITH_NETS
+ +				mtype_data_reset_flags(data, &flags);
+ +#endif
+ +				read_unlock_bh(&set->lock);
+ +				ahash_destroy(t);
+ +				if (ret == -EAGAIN)
+ +					goto retry;
+ +				return ret;
+++=======
++ 			key = HKEY(data, h->initval, htable_bits);
++ 			m = __ipset_dereference_protected(hbucket(t, key), 1);
++ 			if (!m) {
++ 				m = kzalloc(sizeof(*m) +
++ 					    AHASH_INIT_SIZE * dsize,
++ 					    GFP_ATOMIC);
++ 				if (!m) {
++ 					ret = -ENOMEM;
++ 					goto cleanup;
++ 				}
++ 				m->size = AHASH_INIT_SIZE;
++ 				extsize = ext_size(AHASH_INIT_SIZE, dsize);
++ 				RCU_INIT_POINTER(hbucket(t, key), m);
++ 			} else if (m->pos >= m->size) {
++ 				struct hbucket *ht;
++ 
++ 				if (m->size >= AHASH_MAX(h)) {
++ 					ret = -EAGAIN;
++ 				} else {
++ 					ht = kzalloc(sizeof(*ht) +
++ 						(m->size + AHASH_INIT_SIZE)
++ 						* dsize,
++ 						GFP_ATOMIC);
++ 					if (!ht)
++ 						ret = -ENOMEM;
++ 				}
++ 				if (ret < 0)
++ 					goto cleanup;
++ 				memcpy(ht, m, sizeof(struct hbucket) +
++ 					      m->size * dsize);
++ 				ht->size = m->size + AHASH_INIT_SIZE;
++ 				extsize += ext_size(AHASH_INIT_SIZE, dsize);
++ 				kfree(m);
++ 				m = ht;
++ 				RCU_INIT_POINTER(hbucket(t, key), ht);
+++>>>>>>> a71bdbfa9927 (netfilter: ipset: Fix reported memory size for hash:* types)
+  			}
+ -			d = ahash_data(m, m->pos, dsize);
+ -			memcpy(d, data, dsize);
+ -			set_bit(m->pos++, m->used);
+ +			d = ahash_data(m, m->pos++, h->dsize);
+ +			memcpy(d, data, h->dsize);
+  #ifdef IP_SET_HASH_WITH_NETS
+  			mtype_data_reset_flags(d, &flags);
+  #endif
+@@@ -594,29 -703,45 +658,45 @@@ mtype_add(struct ip_set *set, void *val
+  	struct htable *t;
+  	const struct mtype_elem *d = value;
+  	struct mtype_elem *data;
+ -	struct hbucket *n, *old = ERR_PTR(-ENOENT);
+ -	int i, j = -1;
+ +	struct hbucket *n;
+ +	int i, ret = 0;
+ +	int j = AHASH_MAX(h) + 1;
+  	bool flag_exist = flags & IPSET_FLAG_EXIST;
+ -	bool deleted = false, forceadd = false, reuse = false;
+  	u32 key, multi = 0;
+  
+ -	if (set->elements >= h->maxelem) {
+ -		if (SET_WITH_TIMEOUT(set))
+ -			/* FIXME: when set is full, we slow down here */
+ -			mtype_expire(set, h);
+ -		if (set->elements >= h->maxelem && SET_WITH_FORCEADD(set))
+ -			forceadd = true;
+ +	if (SET_WITH_TIMEOUT(set) && h->elements >= h->maxelem)
+ +		/* FIXME: when set is full, we slow down here */
+ +		mtype_expire(h, NETS_LENGTH(set->family), h->dsize);
+ +
+ +	if (h->elements >= h->maxelem) {
+ +		if (net_ratelimit())
+ +			pr_warning("Set %s is full, maxelem %u reached\n",
+ +				   set->name, h->maxelem);
+ +		return -IPSET_ERR_HASH_FULL;
+  	}
+  
+ -	t = ipset_dereference_protected(h->table, set);
+ +	rcu_read_lock_bh();
+ +	t = rcu_dereference_bh(h->table);
+  	key = HKEY(value, h->initval, t->htable_bits);
+++<<<<<<< HEAD
+ +	n = hbucket(t, key);
+++=======
++ 	n = __ipset_dereference_protected(hbucket(t, key), 1);
++ 	if (!n) {
++ 		if (forceadd || set->elements >= h->maxelem)
++ 			goto set_full;
++ 		old = NULL;
++ 		n = kzalloc(sizeof(*n) + AHASH_INIT_SIZE * set->dsize,
++ 			    GFP_ATOMIC);
++ 		if (!n)
++ 			return -ENOMEM;
++ 		n->size = AHASH_INIT_SIZE;
++ 		set->ext_size += ext_size(AHASH_INIT_SIZE, set->dsize);
++ 		goto copy_elem;
++ 	}
+++>>>>>>> a71bdbfa9927 (netfilter: ipset: Fix reported memory size for hash:* types)
+  	for (i = 0; i < n->pos; i++) {
+ -		if (!test_bit(i, n->used)) {
+ -			/* Reuse first deleted entry */
+ -			if (j == -1) {
+ -				deleted = reuse = true;
+ -				j = i;
+ -			}
+ -			continue;
+ -		}
+ -		data = ahash_data(n, i, set->dsize);
+ +		data = ahash_data(n, i, h->dsize);
+  		if (mtype_data_equal(data, d, &multi)) {
+  			if (flag_exist ||
+  			    (SET_WITH_TIMEOUT(set) &&
+@@@ -631,34 -753,60 +711,54 @@@
+  		}
+  		/* Reuse first timed out entry */
+  		if (SET_WITH_TIMEOUT(set) &&
+ -		    ip_set_timeout_expired(ext_timeout(data, set)) &&
+ -		    j == -1) {
+ +		    ip_set_timeout_expired(ext_timeout(data, h)) &&
+ +		    j != AHASH_MAX(h) + 1)
+  			j = i;
+ -			reuse = true;
+ -		}
+  	}
+ -	if (reuse || forceadd) {
+ -		data = ahash_data(n, j, set->dsize);
+ -		if (!deleted) {
+ +reuse_slot:
+ +	if (j != AHASH_MAX(h) + 1) {
+ +		/* Fill out reused slot */
+ +		data = ahash_data(n, j, h->dsize);
+  #ifdef IP_SET_HASH_WITH_NETS
+ -			for (i = 0; i < IPSET_NET_COUNT; i++)
+ -				mtype_del_cidr(h,
+ -					NCIDR_PUT(DCIDR_GET(data->cidr, i)),
+ -					i);
+ +		mtype_del_cidr(h, CIDR(data->cidr), NETS_LENGTH(set->family));
+ +		mtype_add_cidr(h, CIDR(d->cidr), NETS_LENGTH(set->family));
+  #endif
+ -			ip_set_ext_destroy(set, data);
+ -			set->elements--;
+ -		}
+ -		goto copy_data;
+ -	}
+ -	if (set->elements >= h->maxelem)
+ -		goto set_full;
+ -	/* Create a new slot */
+ -	if (n->pos >= n->size) {
+ +	} else {
+ +		/* Use/create a new slot */
+  		TUNE_AHASH_MAX(h, multi);
+ -		if (n->size >= AHASH_MAX(h)) {
+ -			/* Trigger rehashing */
+ -			mtype_data_next(&h->next, d);
+ -			return -EAGAIN;
+ +		ret = hbucket_elem_add(n, AHASH_MAX(h), h->dsize);
+ +		if (ret != 0) {
+ +			if (ret == -EAGAIN)
+ +				mtype_data_next(&h->next, d);
+ +			goto out;
+  		}
+++<<<<<<< HEAD
+ +		data = ahash_data(n, n->pos++, h->dsize);
+++=======
++ 		old = n;
++ 		n = kzalloc(sizeof(*n) +
++ 			    (old->size + AHASH_INIT_SIZE) * set->dsize,
++ 			    GFP_ATOMIC);
++ 		if (!n)
++ 			return -ENOMEM;
++ 		memcpy(n, old, sizeof(struct hbucket) +
++ 		       old->size * set->dsize);
++ 		n->size = old->size + AHASH_INIT_SIZE;
++ 		set->ext_size += ext_size(AHASH_INIT_SIZE, set->dsize);
++ 	}
++ 
++ copy_elem:
++ 	j = n->pos++;
++ 	data = ahash_data(n, j, set->dsize);
++ copy_data:
++ 	set->elements++;
+++>>>>>>> a71bdbfa9927 (netfilter: ipset: Fix reported memory size for hash:* types)
+  #ifdef IP_SET_HASH_WITH_NETS
+ -	for (i = 0; i < IPSET_NET_COUNT; i++)
+ -		mtype_add_cidr(h, NCIDR_PUT(DCIDR_GET(d->cidr, i)), i);
+ +		mtype_add_cidr(h, CIDR(d->cidr), NETS_LENGTH(set->family));
+  #endif
+ +		h->elements++;
+ +	}
+  	memcpy(data, d, sizeof(struct mtype_elem));
+ -overwrite_extensions:
+  #ifdef IP_SET_HASH_WITH_NETS
+  	mtype_data_set_flags(data, flags);
+  #endif
+@@@ -694,33 -864,55 +794,65 @@@ mtype_del(struct ip_set *set, void *val
+  		if (!mtype_data_equal(data, d, &multi))
+  			continue;
+  		if (SET_WITH_TIMEOUT(set) &&
+ -		    ip_set_timeout_expired(ext_timeout(data, set)))
+ -			goto out;
+ +		    ip_set_timeout_expired(ext_timeout(data, h)))
+ +			return -IPSET_ERR_EXIST;
+ +		if (i != n->pos - 1)
+ +			/* Not last one */
+ +			memcpy(data, ahash_data(n, n->pos - 1, h->dsize),
+ +			       h->dsize);
+  
+ -		ret = 0;
+ -		clear_bit(i, n->used);
+ -		smp_mb__after_atomic();
+ -		if (i + 1 == n->pos)
+ -			n->pos--;
+ -		set->elements--;
+ +		n->pos--;
+ +		h->elements--;
+  #ifdef IP_SET_HASH_WITH_NETS
+ -		for (j = 0; j < IPSET_NET_COUNT; j++)
+ -			mtype_del_cidr(h, NCIDR_PUT(DCIDR_GET(d->cidr, j)),
+ -				       j);
+ +		mtype_del_cidr(h, CIDR(d->cidr), NETS_LENGTH(set->family));
+  #endif
+++<<<<<<< HEAD
+ +		if (n->pos + AHASH_INIT_SIZE < n->size) {
+ +			void *tmp = kzalloc((n->size - AHASH_INIT_SIZE)
+ +					    * h->dsize,
+ +					    GFP_ATOMIC);
+ +			if (!tmp)
+ +				return 0;
+ +			n->size -= AHASH_INIT_SIZE;
+ +			memcpy(tmp, n->value, n->size * h->dsize);
+ +			kfree(n->value);
+ +			n->value = tmp;
+++=======
++ 		ip_set_ext_destroy(set, data);
++ 
++ 		for (; i < n->pos; i++) {
++ 			if (!test_bit(i, n->used))
++ 				k++;
++ 		}
++ 		if (n->pos == 0 && k == 0) {
++ 			set->ext_size -= ext_size(n->size, dsize);
++ 			rcu_assign_pointer(hbucket(t, key), NULL);
++ 			kfree_rcu(n, rcu);
++ 		} else if (k >= AHASH_INIT_SIZE) {
++ 			struct hbucket *tmp = kzalloc(sizeof(*tmp) +
++ 					(n->size - AHASH_INIT_SIZE) * dsize,
++ 					GFP_ATOMIC);
++ 			if (!tmp)
++ 				goto out;
++ 			tmp->size = n->size - AHASH_INIT_SIZE;
++ 			for (j = 0, k = 0; j < n->pos; j++) {
++ 				if (!test_bit(j, n->used))
++ 					continue;
++ 				data = ahash_data(n, j, dsize);
++ 				memcpy(tmp->value + k * dsize, data, dsize);
++ 				set_bit(j, tmp->used);
++ 				k++;
++ 			}
++ 			tmp->pos = k;
++ 			set->ext_size -= ext_size(AHASH_INIT_SIZE, dsize);
++ 			rcu_assign_pointer(hbucket(t, key), tmp);
++ 			kfree_rcu(n, rcu);
+++>>>>>>> a71bdbfa9927 (netfilter: ipset: Fix reported memory size for hash:* types)
+  		}
+ -		goto out;
+ +		return 0;
+  	}
+  
+ -out:
+ -	return ret;
+ +	return -IPSET_ERR_EXIST;
+  }
+  
+  static inline int
+* Unmerged path net/netfilter/ipset/ip_set_hash_gen.h
